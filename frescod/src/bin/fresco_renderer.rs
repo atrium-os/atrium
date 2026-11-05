@@ -361,6 +361,9 @@ fn from_broker(
             Msg::CloseRequested { .. } => {
                 comp.lock().unwrap().request_close(local as u16);
             }
+            Msg::Scale { scale_milli, .. } => {
+                comp.lock().unwrap().set_window_dpi(local as u16, scale_milli as f32 / 1000.0);
+            }
             Msg::Input { input, .. } => {
                 let window_id = local;
                 let _ = events.send(match input {

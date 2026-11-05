@@ -44,6 +44,41 @@ pub struct Viewport {
     pub refresh_mhz: u32,
 }
 
+/// The monitor's picture size in millimetres, from its EDID: the preferred
+/// detailed timing's image size, else the base block's (whole centimetres).
+/// None when the EDID gives none (a projector, a sim monitor without one) or
+/// only an aspect ratio.
+pub fn size_mm(edid: &[u8]) -> Option<(u32, u32)> {
+    if edid.len() < 128 {
+        return None;
+    }
+    let d = &edid[54..72];
+    if d[0] != 0 || d[1] != 0 {
+        let w = u32::from(d[12]) | (u32::from(d[14] >> 4) << 8);
+        let h = u32::from(d[13]) | (u32::from(d[14] & 0xf) << 8);
+        if w >= 10 && h >= 10 {
+            return Some((w, h));
+        }
+    }
+    let (w, h) = (u32::from(edid[21]), u32::from(edid[22]));
+    (w > 0 && h > 0).then_some((w * 10, h * 10))
+}
+
+/// The scale a monitor gets unless the session sets one, in thousandths:
+/// its pixel density over 110 ppi, in quarter steps, from 1.0 to 3.0. 110
+/// ppi is a desktop monitor at arm's length shown at 1.0: a 24" 1080p or a
+/// 27" 1440p stays at 1.0, a 27" 4K gets 1.5, a 13" 2560x1600 laptop 2.0.
+/// Without a physical size, 1.0.
+pub fn auto_scale(edid: &[u8], width: u32, height: u32) -> u32 {
+    let Some((wmm, hmm)) = size_mm(edid) else { return 1000 };
+    /* Pixels per inch along the diagonal. */
+    let px = f64::from(width).hypot(f64::from(height));
+    let inch = f64::from(wmm).hypot(f64::from(hmm)) / 25.4;
+    let ppi = px / inch;
+    let quarters = (ppi / 110.0 * 4.0).round().clamp(4.0, 12.0);
+    (quarters * 250.0) as u32
+}
+
 impl Viewport {
     pub fn right(&self) -> u32 { self.x + self.width }
     pub fn bottom(&self) -> u32 { self.y + self.height }
@@ -334,5 +369,37 @@ mod tests {
         let mut out = vec![7u8; 2 * 3 * 4];
         crop(&d, 4, &vp(1, 1, 0, 0, 2, 3), &mut out);
         assert!(out[16..].iter().all(|&b| b == 0));
+    }
+
+    /// A base block with a detailed timing (pixel clock set) of `dtd_mm`
+    /// image size and `cm` in bytes 21-22.
+    fn edid(dtd_mm: (u32, u32), cm: (u8, u8)) -> Vec<u8> {
+        let mut e = vec![0u8; 128];
+        e[54] = 1;
+        e[66] = (dtd_mm.0 & 0xff) as u8;
+        e[67] = (dtd_mm.1 & 0xff) as u8;
+        e[68] = (((dtd_mm.0 >> 8) << 4) | (dtd_mm.1 >> 8)) as u8;
+        (e[21], e[22]) = cm;
+        e
+    }
+
+    #[test]
+    fn size_comes_from_the_timing_else_the_base_block() {
+        assert_eq!(size_mm(&edid((597, 336), (60, 34))), Some((597, 336)));
+        assert_eq!(size_mm(&edid((0, 0), (53, 30))), Some((530, 300)));
+        assert_eq!(size_mm(&edid((0, 0), (0, 0))), None);
+        assert_eq!(size_mm(&[0u8; 16]), None);
+    }
+
+    #[test]
+    fn automatic_scale_follows_pixel_density() {
+        // 27" 4K, 24" 1080p, 27" 1440p, 13.3" 2560x1600, no size.
+        assert_eq!(auto_scale(&edid((597, 336), (0, 0)), 3840, 2160), 1500);
+        assert_eq!(auto_scale(&edid((531, 299), (0, 0)), 1920, 1080), 1000);
+        assert_eq!(auto_scale(&edid((597, 336), (0, 0)), 2560, 1440), 1000);
+        assert_eq!(auto_scale(&edid((286, 179), (0, 0)), 2560, 1600), 2000);
+        assert_eq!(auto_scale(&edid((0, 0), (0, 0)), 3840, 2160), 1000);
+        // A tiny 4K panel stops at 3.0.
+        assert_eq!(auto_scale(&edid((60, 34), (0, 0)), 3840, 2160), 3000);
     }
 }

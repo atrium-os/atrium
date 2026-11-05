@@ -306,6 +306,9 @@ pub struct EnvelopeFrontend {
     /// frescod's frame loop takes and applies.
     outputs: fresco_protocol::WmOutputsReply,
     arrange_request: Option<Vec<fresco_protocol::WmOutputPlacement>>,
+    /// Monitor scales `OP_WM_SET_OUTPUT_SCALE` asked for, in order, which
+    /// frescod's frame loop takes and applies.
+    scale_requests: Vec<fresco_protocol::WmSetOutputScalePayload>,
 }
 
 impl EnvelopeFrontend {
@@ -336,6 +339,7 @@ impl EnvelopeFrontend {
             mode_request: None,
             outputs: fresco_protocol::WmOutputsReply { outputs: Vec::new() },
             arrange_request: None,
+            scale_requests: Vec::new(),
         }
     }
 
@@ -367,6 +371,51 @@ impl EnvelopeFrontend {
     /// The monitors of the desktop, for `OP_WM_OUTPUTS`.
     pub fn set_outputs(&mut self, outputs: Vec<fresco_protocol::WmOutput>) {
         self.outputs = fresco_protocol::WmOutputsReply { outputs };
+        self.update_window_scales();
+    }
+
+    /// Scales the WM asked for since the last call.
+    pub fn take_scale_requests(&mut self) -> Vec<fresco_protocol::WmSetOutputScalePayload> {
+        std::mem::take(&mut self.scale_requests)
+    }
+
+    /// Tell each window the scale of the monitor it is (mostly) on, when
+    /// that differs from what it was last told (`EV_WINDOW_DPI_CHANGED`).
+    /// A window on no present monitor keeps its scale.
+    fn update_window_scales(&mut self) {
+        let present: Vec<&fresco_protocol::WmOutput> =
+            self.outputs.outputs.iter().filter(|o| o.present).collect();
+        if present.is_empty() {
+            return;
+        }
+        let mut comp = self.compositor.lock().unwrap();
+        let mut changed: Vec<(u16, u32)> = Vec::new();
+        for (&id, w) in comp.windows.iter() {
+            if id == 0 {
+                continue;
+            }
+            let (x, y, ww, wh) = (w.pos.0 as i64, w.pos.1 as i64, w.size.0 as i64, w.size.1 as i64);
+            let best = present
+                .iter()
+                .map(|o| {
+                    let r = &o.rect;
+                    let ox = (x + ww).min(i64::from(r.x + r.w)) - x.max(i64::from(r.x));
+                    let oy = (y + wh).min(i64::from(r.y + r.h)) - y.max(i64::from(r.y));
+                    (ox.max(0) * oy.max(0), o.scale_milli)
+                })
+                .max_by_key(|&(area, _)| area);
+            if let Some((area, scale)) = best {
+                if area > 0 && scale != w.scale_milli {
+                    changed.push((id, scale));
+                }
+            }
+        }
+        for (id, scale) in changed {
+            if let Some(w) = comp.windows.get_mut(&id) {
+                w.scale_milli = scale;
+            }
+            comp.set_window_dpi(id, scale as f32 / 1000.0);
+        }
     }
 
     /// An arrangement a WM asked for, if any (taken once).
@@ -529,6 +578,7 @@ impl EnvelopeFrontend {
             control::OP_WM_SET_DISPLAY_MODE  => self.handle_wm_set_display_mode(msg),
             control::OP_WM_OUTPUTS           => self.handle_wm_outputs(),
             control::OP_WM_ARRANGE_OUTPUTS   => self.handle_wm_arrange_outputs(msg),
+            control::OP_WM_SET_OUTPUT_SCALE  => self.handle_wm_set_output_scale(msg),
 
             op => Err(DispatchError::UnknownOp(op)),
         }
@@ -869,6 +919,23 @@ impl EnvelopeFrontend {
         Ok(vec![Outbound { op: control::OP_WM_ARRANGE_OUTPUTS, flags: flag::IS_RESPONSE, payload: Vec::new() }])
     }
 
+    /// `OP_WM_SET_OUTPUT_SCALE` — queue a monitor's scale (WM only): a
+    /// monitor on the desktop, 0 (automatic) or within the range.
+    fn handle_wm_set_output_scale(&mut self, msg: &Message) -> Result<Vec<Outbound>, DispatchError> {
+        if !self.wm_capable.contains(&self.current_client) {
+            return Err(DispatchError::Forbidden);
+        }
+        let p: fresco_protocol::WmSetOutputScalePayload =
+            decode(&msg.payload).map_err(|_| DispatchError::BadPayload)?;
+        let in_range = p.scale_milli == 0
+            || (fresco_protocol::OUTPUT_SCALE_MIN..=fresco_protocol::OUTPUT_SCALE_MAX).contains(&p.scale_milli);
+        if !in_range || !self.outputs.outputs.iter().any(|o| o.identity == p.identity) {
+            return Err(DispatchError::BadPayload);
+        }
+        self.scale_requests.push(p);
+        Ok(vec![Outbound { op: control::OP_WM_SET_OUTPUT_SCALE, flags: flag::IS_RESPONSE, payload: Vec::new() }])
+    }
+
     /// `OP_WM_SET_DISPLAY_MODE` — queue a switch to a listed mode (WM only).
     /// The reply is an empty IS_RESPONSE once the request is accepted; the
     /// switch itself lands at the next frame, announced by EV_DISPLAY_CHANGED.
@@ -1092,6 +1159,8 @@ impl EnvelopeFrontend {
             && comp.windows.contains_key(&(layout.focus as u16)))
             .then_some(layout.focus as u16);
         comp.set_focus_no_raise(new_focus);
+        drop(comp);
+        self.update_window_scales();
 
         Ok(Vec::new()) // atomic apply; no reply
     }
@@ -1497,6 +1566,49 @@ mod tests {
     }
 
     #[test]
+    fn windows_are_told_the_scale_of_the_monitor_they_land_on() {
+        use fresco_protocol::{WmOutput, WmRect, WmSlot};
+        let mut f = fixture();
+        let (tx, rx) = std::sync::mpsc::channel();
+        f.compositor_arc().lock().unwrap().set_event_sink(tx);
+        let a = make_window(&mut f, 1, 100, 100);
+        let out = |output, identity, x, scale_milli| WmOutput {
+            output, identity, rect: WmRect { x, y: 0, w: 1920, h: 1080 },
+            refresh_mhz: 60000, present: true, scale_milli, scale_auto: true,
+        };
+        f.set_outputs(vec![out(0, 10, 0, 1000), out(1, 20, 1920, 1500)]);
+        let dpi = |rx: &std::sync::mpsc::Receiver<crate::window::DisplayEvent>| -> Vec<(u32, f32)> {
+            rx.try_iter().filter_map(|e| match e {
+                crate::window::DisplayEvent::WindowDpiChanged { window_id, scale_factor } => Some((window_id, scale_factor)),
+                _ => None,
+            }).collect()
+        };
+        assert!(dpi(&rx).is_empty(), "on the 1.0 monitor: nothing to tell");
+        f.grant_window_management(9);
+        // Mostly on the second monitor: told 1.5, once.
+        let to = |x| WmDeclareLayoutPayload {
+            slots: vec![WmSlot { surface_id: a, rect: WmRect { x, y: 0, w: 800, h: 600 }, layer: 4 }],
+            focus: a,
+        };
+        f.dispatch(&msg(control::OP_WM_DECLARE_LAYOUT, 0, encode(&to(1800)).unwrap()), 9).unwrap();
+        assert_eq!(dpi(&rx), vec![(a, 1.5)]);
+        f.dispatch(&msg(control::OP_WM_DECLARE_LAYOUT, 0, encode(&to(2000)).unwrap()), 9).unwrap();
+        assert!(dpi(&rx).is_empty());
+        // Its monitor's scale changes: told again.
+        f.set_outputs(vec![out(0, 10, 0, 1000), out(1, 20, 1920, 2000)]);
+        assert_eq!(dpi(&rx), vec![(a, 2.0)]);
+        // A scale request is checked and queued for frescod.
+        let ok = WmSetOutputScalePayload { identity: 20, scale_milli: 1250 };
+        f.dispatch(&msg(control::OP_WM_SET_OUTPUT_SCALE, 0, encode(&ok).unwrap()), 9).unwrap();
+        let bad = WmSetOutputScalePayload { identity: 99, scale_milli: 1250 };
+        assert!(f.dispatch(&msg(control::OP_WM_SET_OUTPUT_SCALE, 0, encode(&bad).unwrap()), 9).is_err());
+        let tiny = WmSetOutputScalePayload { identity: 20, scale_milli: 100 };
+        assert!(f.dispatch(&msg(control::OP_WM_SET_OUTPUT_SCALE, 0, encode(&tiny).unwrap()), 9).is_err());
+        assert!(f.dispatch(&msg(control::OP_WM_SET_OUTPUT_SCALE, 0, encode(&ok).unwrap()), 1).is_err(), "WM only");
+        assert_eq!(f.take_scale_requests(), vec![ok]);
+    }
+
+    #[test]
     fn wm_declare_layout_applies_geometry_z_and_focus() {
         use fresco_protocol::{WmSlot, WmRect};
         let mut f = fixture();
@@ -1597,6 +1709,26 @@ mod tests {
                 self.dispatch(control::OP_WM_SET_RENDERING, encode(d).unwrap())?;
             }
             Ok(())
+        }
+        fn display_modes(&mut self) -> std::io::Result<WmDisplayModesReply> {
+            let out = self.dispatch(control::OP_WM_DISPLAY_MODES, Vec::new())?;
+            Ok(decode(&out[0].payload).unwrap())
+        }
+        fn set_display_mode(&mut self, width: u32, height: u32, refresh_mhz: u32) -> std::io::Result<()> {
+            let p = WmSetDisplayModePayload { width, height, refresh_mhz };
+            self.dispatch(control::OP_WM_SET_DISPLAY_MODE, encode(&p).unwrap()).map(|_| ())
+        }
+        fn outputs(&mut self) -> std::io::Result<Vec<WmOutput>> {
+            let out = self.dispatch(control::OP_WM_OUTPUTS, Vec::new())?;
+            Ok(decode::<WmOutputsReply>(&out[0].payload).unwrap().outputs)
+        }
+        fn arrange_outputs(&mut self, placements: Vec<WmOutputPlacement>) -> std::io::Result<()> {
+            let p = WmArrangeOutputsPayload { placements };
+            self.dispatch(control::OP_WM_ARRANGE_OUTPUTS, encode(&p).unwrap()).map(|_| ())
+        }
+        fn set_output_scale(&mut self, identity: u64, scale_milli: u32) -> std::io::Result<()> {
+            let p = WmSetOutputScalePayload { identity, scale_milli };
+            self.dispatch(control::OP_WM_SET_OUTPUT_SCALE, encode(&p).unwrap()).map(|_| ())
         }
     }
 

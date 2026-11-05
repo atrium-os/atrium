@@ -289,6 +289,180 @@ fn subtract(r: &WmRect, cut: &WmRect) -> Vec<WmRect> {
 
 /// The daemon reconcile loop. The WM core's job each time the surface set or focus
 /// changes: enumerate → arrange → declare the layout + the rendering decisions.
+/// What the session remembers about its monitors across restarts (of
+/// frescod, the WM, or the machine): where each set of monitors sat, and the
+/// scale set for a monitor. frescod remembers the same while it runs; this
+/// is what puts it back after it starts again. Kept per user in
+/// `/var/db/atrium/<user>/forum-displays.state` (`$FORUM_DISPLAYS`), a text
+/// file of lines
+///
+/// ```text
+/// scale <identity> <thousandths>
+/// set <identity>@<x>,<y>:<w>x<h> ...
+/// ```
+pub mod displays {
+    use fresco_protocol::{WmOutput, WmOutputPlacement};
+    use std::collections::HashMap;
+
+    /// One monitor's remembered place and the size it had there.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub struct Place {
+        pub identity: u64,
+        pub x: i32,
+        pub y: i32,
+        pub w: i32,
+        pub h: i32,
+    }
+
+    #[derive(Debug, Clone, Default, PartialEq, Eq)]
+    pub struct DisplayMemory {
+        /// By set of monitors (sorted identities): where each one sat.
+        pub sets: HashMap<Vec<u64>, Vec<Place>>,
+        /// Scales the session set, by monitor (thousandths).
+        pub scales: HashMap<u64, u32>,
+    }
+
+    /// The set a list of monitors makes, as `sets` keys it: every monitor
+    /// on the desktop, present or within its grace.
+    pub fn set_of(outputs: &[WmOutput]) -> Vec<u64> {
+        let mut v: Vec<u64> = outputs.iter().map(|o| o.identity).collect();
+        v.sort_unstable();
+        v.dedup();
+        v
+    }
+
+    /// The places, shifted so the desktop starts at (0, 0) (as frescod
+    /// keeps it), in identity order.
+    pub fn places_of(outputs: &[WmOutput]) -> Vec<Place> {
+        let mx = outputs.iter().map(|o| o.rect.x).min().unwrap_or(0);
+        let my = outputs.iter().map(|o| o.rect.y).min().unwrap_or(0);
+        let mut v: Vec<Place> = outputs
+            .iter()
+            .map(|o| Place { identity: o.identity, x: o.rect.x - mx, y: o.rect.y - my, w: o.rect.w, h: o.rect.h })
+            .collect();
+        v.sort_by_key(|p| p.identity);
+        v
+    }
+
+    impl DisplayMemory {
+        /// Remember where this set sits now. Returns whether that changed.
+        pub fn remember(&mut self, outputs: &[WmOutput]) -> bool {
+            if outputs.is_empty() {
+                return false;
+            }
+            let places = places_of(outputs);
+            let key = set_of(outputs);
+            if self.sets.get(&key) == Some(&places) {
+                return false;
+            }
+            self.sets.insert(key, places);
+            true
+        }
+
+        /// The arrangement to ask for so this set sits where it was left:
+        /// `None` when it is there already, was never seen, or its monitors
+        /// now run at other sizes (the old places would not fit).
+        pub fn restore(&self, outputs: &[WmOutput]) -> Option<Vec<WmOutputPlacement>> {
+            let saved = self.sets.get(&set_of(outputs))?;
+            let now = places_of(outputs);
+            if *saved == now {
+                return None;
+            }
+            let sizes_match = saved.iter().all(|p| now.iter().any(|n| n.identity == p.identity && (n.w, n.h) == (p.w, p.h)));
+            if !sizes_match {
+                return None;
+            }
+            Some(saved.iter().map(|p| WmOutputPlacement { identity: p.identity, x: p.x, y: p.y }).collect())
+        }
+
+        pub fn to_text(&self) -> String {
+            let mut lines: Vec<String> = Vec::new();
+            let mut scales: Vec<(&u64, &u32)> = self.scales.iter().collect();
+            scales.sort();
+            for (id, s) in scales {
+                lines.push(format!("scale {id:016x} {s}"));
+            }
+            let mut sets: Vec<&Vec<Place>> = self.sets.values().collect();
+            sets.sort_by_key(|v| v.iter().map(|p| p.identity).collect::<Vec<_>>());
+            for v in sets {
+                let ps: Vec<String> = v.iter().map(|p| format!("{:016x}@{},{}:{}x{}", p.identity, p.x, p.y, p.w, p.h)).collect();
+                lines.push(format!("set {}", ps.join(" ")));
+            }
+            let mut t = String::from("# forum-wm: where each set of monitors sat, and monitor scales\n");
+            for l in lines {
+                t.push_str(&l);
+                t.push('\n');
+            }
+            t
+        }
+
+        /// Parse what [`Self::to_text`] wrote; a line it can't read is
+        /// skipped (a damaged file loses that line, not the rest).
+        pub fn from_text(t: &str) -> Self {
+            let mut m = DisplayMemory::default();
+            for line in t.lines() {
+                let w: Vec<&str> = line.split_whitespace().collect();
+                match w.first() {
+                    Some(&"scale") if w.len() == 3 => {
+                        if let (Ok(id), Ok(s)) = (u64::from_str_radix(w[1], 16), w[2].parse::<u32>()) {
+                            m.scales.insert(id, s);
+                        }
+                    }
+                    Some(&"set") if w.len() > 1 => {
+                        let places: Option<Vec<Place>> = w[1..].iter().map(|p| parse_place(p)).collect();
+                        if let Some(mut v) = places {
+                            v.sort_by_key(|p| p.identity);
+                            let key: Vec<u64> = v.iter().map(|p| p.identity).collect();
+                            m.sets.insert(key, v);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            m
+        }
+    }
+
+    fn parse_place(s: &str) -> Option<Place> {
+        let (id, rest) = s.split_once('@')?;
+        let (xy, wh) = rest.split_once(':')?;
+        let (x, y) = xy.split_once(',')?;
+        let (w, h) = wh.split_once('x')?;
+        Some(Place {
+            identity: u64::from_str_radix(id, 16).ok()?,
+            x: x.parse().ok()?,
+            y: y.parse().ok()?,
+            w: w.parse().ok()?,
+            h: h.parse().ok()?,
+        })
+    }
+
+    /// `$FORUM_DISPLAYS` → `/var/db/atrium/<user>/forum-displays.state`.
+    pub fn default_path() -> std::path::PathBuf {
+        if let Some(p) = std::env::var_os("FORUM_DISPLAYS") {
+            return p.into();
+        }
+        let user = std::env::var("USER").unwrap_or_else(|_| "root".into());
+        format!("/var/db/atrium/{user}/forum-displays.state").into()
+    }
+
+    /// Load the memory (empty when there is none or it can't be read).
+    pub fn load(path: &std::path::Path) -> DisplayMemory {
+        std::fs::read_to_string(path).map(|t| DisplayMemory::from_text(&t)).unwrap_or_default()
+    }
+
+    /// Write it whole: a temporary file renamed over the old one, so a
+    /// crash leaves the old memory or the new, never half of one.
+    pub fn save(path: &std::path::Path, m: &DisplayMemory) -> std::io::Result<()> {
+        if let Some(dir) = path.parent() {
+            std::fs::create_dir_all(dir)?;
+        }
+        let tmp = path.with_extension("tmp");
+        std::fs::write(&tmp, m.to_text())?;
+        std::fs::rename(&tmp, path)
+    }
+}
+
 pub mod daemon {
     use super::{arrange, arrange_for, arrange_snapped, rendering_decisions, resolve_focus, Screen, Snap};
     use fresco_protocol::{WmDeclareLayoutPayload, WmOutput, WmOutputPlacement, WmRect, WmRole, WmSetRenderingPayload, WmSlot, WmSurfaceInfo};
@@ -358,6 +532,9 @@ pub mod daemon {
         /// Move monitors on the desktop (OP_WM_ARRANGE_OUTPUTS); frescod
         /// applies it at its next frame and broadcasts EV_DISPLAY_CHANGED.
         fn arrange_outputs(&mut self, placements: Vec<WmOutputPlacement>) -> io::Result<()>;
+        /// Set a monitor's scale, thousandths, 0 = automatic
+        /// (OP_WM_SET_OUTPUT_SCALE); EV_DISPLAY_CHANGED follows.
+        fn set_output_scale(&mut self, identity: u64, scale_milli: u32) -> io::Result<()>;
     }
 
     /// The WM core state: output geometry, the human's focus intent, and the
@@ -407,6 +584,10 @@ pub mod daemon {
         /// The document last on top of each monitor, so focusing a window on
         /// one monitor doesn't change what another one shows.
         pub top: RefCell<HashMap<u64, u32>>,
+        /// Where each set of monitors sat and the scales set, kept across
+        /// restarts in `display_store` (None: in memory only, as in tests).
+        pub displays: super::displays::DisplayMemory,
+        pub display_store: Option<std::path::PathBuf>,
     }
 
     pub use forum_ctl::Side;
@@ -428,6 +609,8 @@ pub mod daemon {
                 outputs: Vec::new(),
                 home: HashMap::new(),
                 top: RefCell::new(HashMap::new()),
+                displays: Default::default(),
+                display_store: None,
             }
         }
 
@@ -477,6 +660,12 @@ pub mod daemon {
             if outputs == self.outputs {
                 return Ok(None);
             }
+            // The same monitors as before, moved: the session moved them, so
+            // remember it. Another set: put it back where it was last left
+            // (frescod knows only what it has seen since it started); what
+            // it was then lands with the next EV_DISPLAY_CHANGED.
+            let same_set = super::displays::set_of(&outputs) == super::displays::set_of(&self.outputs);
+            self.apply_remembered_displays(conn, &outputs, !same_set)?;
             // Windows with no home yet (opened while there was one monitor)
             // belong to the monitor they are on now, so a new monitor
             // becoming the primary doesn't pull them over to it.
@@ -491,6 +680,55 @@ pub mod daemon {
             }
             self.outputs = outputs;
             self.reconcile(conn).map(Some)
+        }
+
+        /// Bring monitors back as the session left them: a remembered scale
+        /// for each one frescod has on automatic, and, with `restore`, the
+        /// remembered arrangement for this set. Otherwise (or when it is
+        /// already in place) remember the arrangement as it is.
+        pub fn apply_remembered_displays(&mut self, conn: &mut impl FrescoConn, outputs: &[WmOutput], restore: bool)
+            -> io::Result<()>
+        {
+            for o in outputs {
+                match self.displays.scales.get(&o.identity) {
+                    Some(&s) if o.scale_auto || o.scale_milli != s => conn.set_output_scale(o.identity, s)?,
+                    _ => {}
+                }
+            }
+            if restore {
+                if let Some(p) = self.displays.restore(outputs) {
+                    eprintln!("forum-wm: putting {} monitor(s) back where they were", p.len());
+                    return conn.arrange_outputs(p);
+                }
+            }
+            if self.displays.remember(outputs) {
+                self.save_displays();
+            }
+            Ok(())
+        }
+
+        /// Set output `which`'s scale (thousandths; 0 = automatic) and
+        /// remember it for that monitor.
+        pub fn set_scale(&mut self, conn: &mut impl FrescoConn, which: u32, scale_milli: u32) -> io::Result<()> {
+            let Some(o) = self.outputs.iter().find(|o| o.output == which).copied() else {
+                return Err(io::Error::new(io::ErrorKind::NotFound, "no such output"));
+            };
+            conn.set_output_scale(o.identity, scale_milli)?;
+            if scale_milli == 0 {
+                self.displays.scales.remove(&o.identity);
+            } else {
+                self.displays.scales.insert(o.identity, scale_milli);
+            }
+            self.save_displays();
+            Ok(())
+        }
+
+        fn save_displays(&self) {
+            if let Some(p) = &self.display_store {
+                if let Err(e) = super::displays::save(p, &self.displays) {
+                    eprintln!("forum-wm: {}: {e}", p.display());
+                }
+            }
         }
 
         /// Send the focused window to the next monitor (in the primary-first
@@ -980,6 +1218,10 @@ pub mod control {
                 Ok(()) => Reply::Ack,
                 Err(e) => Reply::Err { message: e.to_string() },
             },
+            Intent::SetOutputScale { output, scale_milli } => match wm.set_scale(conn, output, scale_milli) {
+                Ok(()) => Reply::Ack,
+                Err(e) => Reply::Err { message: e.to_string() },
+            },
             Intent::MoveToNextMonitor => match wm.move_focused_to_next_monitor(conn) {
                 Ok(Some(_)) => Reply::Ack,
                 Ok(None) => Reply::Err { message: "nothing to move, or only one monitor".into() },
@@ -1189,6 +1431,7 @@ mod tests {
         mode_set: Option<(u32, u32, u32)>,
         outputs: Vec<fresco_protocol::WmOutput>,
         arranged: Option<Vec<fresco_protocol::WmOutputPlacement>>,
+        scaled: Vec<(u64, u32)>,
     }
     impl FrescoConn for MockConn {
         fn enumerate(&mut self) -> io::Result<Vec<WmSurfaceInfo>> {
@@ -1217,6 +1460,10 @@ mod tests {
         }
         fn arrange_outputs(&mut self, p: Vec<fresco_protocol::WmOutputPlacement>) -> io::Result<()> {
             self.arranged = Some(p);
+            Ok(())
+        }
+        fn set_output_scale(&mut self, identity: u64, scale_milli: u32) -> io::Result<()> {
+            self.scaled.push((identity, scale_milli));
             Ok(())
         }
     }
@@ -1518,6 +1765,7 @@ mod tests {
     fn mon(output: u32, identity: u64, x: i32, w: i32, h: i32) -> fresco_protocol::WmOutput {
         fresco_protocol::WmOutput {
             output, identity, rect: WmRect { x, y: 0, w, h }, refresh_mhz: 60000, present: true,
+            scale_milli: 1000, scale_auto: true,
         }
     }
 
@@ -1530,6 +1778,59 @@ mod tests {
         let mut wm = Wm::new(Screen { rect: WmRect { x: 0, y: 0, w: 4480, h: 1440 }, bar_h: 24, dock_h: 48 });
         wm.set_outputs(&mut conn, vec![mon(0, 10, 0, 1920, 1080), mon(1, 20, 1920, 2560, 1440)]).unwrap();
         (wm, conn)
+    }
+
+    #[test]
+    fn display_memory_round_trips_and_skips_damaged_lines() {
+        use crate::displays::{DisplayMemory, Place};
+        let mut m = DisplayMemory::default();
+        m.remember(&[mon(0, 10, 1920, 1920, 1080), mon(1, 20, 0, 1920, 1080)]);
+        m.scales.insert(20, 1500);
+        let t = m.to_text();
+        assert_eq!(DisplayMemory::from_text(&t), m);
+        assert_eq!(m.sets[&vec![10, 20]][0], Place { identity: 10, x: 1920, y: 0, w: 1920, h: 1080 });
+        let damaged = format!("{t}set zz@1,2:3x4\nscale 14\ngarbage\n");
+        assert_eq!(DisplayMemory::from_text(&damaged), m);
+    }
+
+    #[test]
+    fn a_set_comes_back_as_it_was_left_even_after_a_restart() {
+        // Monitor 20 was put left of 10, then the WM (and frescod) restarted:
+        // frescod lays them out left to right again; the WM puts them back.
+        let mut wm = Wm::new(screen());
+        wm.displays.remember(&[mon(0, 10, 1920, 1920, 1080), mon(1, 20, 0, 1920, 1080)]);
+        wm.displays.scales.insert(20, 1500);
+        let mut conn = MockConn { surfaces: vec![surf(1, WmRole::Document)], ..Default::default() };
+        let fresh = vec![mon(0, 10, 0, 1920, 1080), mon(1, 20, 1920, 1920, 1080)];
+        wm.apply_remembered_displays(&mut conn, &fresh, true).unwrap();
+        let p = conn.arranged.take().expect("asked to put them back");
+        assert!(p.iter().any(|p| p.identity == 20 && p.x == 0) && p.iter().any(|p| p.identity == 10 && p.x == 1920));
+        assert_eq!(conn.scaled, vec![(20, 1500)], "the scale set for 20 comes back");
+        // Once in place nothing more is asked, and moving them by hand (same
+        // set) is remembered, not undone.
+        wm.outputs = fresh;
+        let moved = vec![mon(0, 10, 0, 1920, 1080), mon(1, 20, 1920, 1920, 1080)];
+        wm.set_outputs(&mut conn, vec![mon(0, 10, 1920, 1920, 1080), mon(1, 20, 0, 1920, 1080)]).unwrap();
+        assert!(conn.arranged.is_none());
+        wm.set_outputs(&mut conn, moved).unwrap();
+        assert!(conn.arranged.is_none(), "a move of the same set is the user's: kept");
+        assert_eq!(wm.displays.sets[&vec![10, 20]][0].x, 0, "and remembered");
+        // A monitor running another size now: its old place may not fit, so
+        // frescod's layout stands.
+        let other = vec![mon(0, 10, 0, 1920, 1080), mon(1, 20, 1920, 2560, 1440)];
+        wm.displays.remember(&[mon(0, 10, 2560, 1920, 1080), mon(1, 20, 0, 1920, 1080)]);
+        assert!(wm.displays.restore(&other).is_none());
+    }
+
+    #[test]
+    fn setting_a_scale_reaches_fresco_and_is_remembered() {
+        let (mut wm, mut conn) = two_monitors();
+        wm.set_scale(&mut conn, 1, 1750).unwrap();
+        assert_eq!(conn.scaled, vec![(20, 1750)]);
+        assert_eq!(wm.displays.scales.get(&20), Some(&1750));
+        wm.set_scale(&mut conn, 1, 0).unwrap();
+        assert_eq!(wm.displays.scales.get(&20), None, "automatic again");
+        assert!(wm.set_scale(&mut conn, 7, 1000).is_err());
     }
 
     #[test]

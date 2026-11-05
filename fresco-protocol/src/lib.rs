@@ -145,6 +145,8 @@ pub mod control {
     // and moving them. The desktop (DisplayInfoResponse) is their bounding box.
     pub const OP_WM_OUTPUTS:            u16 = 0x0525; // → WmOutputsReply
     pub const OP_WM_ARRANGE_OUTPUTS:    u16 = 0x0526; // WmArrangeOutputsPayload
+    // A monitor's scale (its UI size): windows on it get EV_WINDOW_DPI_CHANGED.
+    pub const OP_WM_SET_OUTPUT_SCALE:   u16 = 0x0527; // WmSetOutputScalePayload
 
     // Async events (server → client). Sent with envelope flag
     // ASYNC_EVENT (aqueduct::envelope::flags::ASYNC_EVENT).
@@ -307,7 +309,27 @@ pub struct WmOutput {
     /// false while the monitor is gone but keeps its place (a dropout of a
     /// few seconds); nothing shows there meanwhile.
     pub present: bool,
+    /// Its scale in thousandths (1000 = 1.0, 1500 = 1.5): what a window on
+    /// it is told by `EV_WINDOW_DPI_CHANGED`. From its pixel density
+    /// (EDID physical size) unless set with `OP_WM_SET_OUTPUT_SCALE`.
+    pub scale_milli: u32,
+    /// `scale_milli` is the automatic one (not set by the session).
+    pub scale_auto: bool,
 }
+
+/// `OP_WM_SET_OUTPUT_SCALE` — set a monitor's scale, by identity, in
+/// thousandths: 500 to 4000, or 0 for the automatic one. Kept for that
+/// monitor wherever it is plugged. `EV_DISPLAY_CHANGED` follows, and each
+/// window on it whose scale changes gets `EV_WINDOW_DPI_CHANGED`.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub struct WmSetOutputScalePayload {
+    pub identity: u64,
+    pub scale_milli: u32,
+}
+
+/// The scale range `OP_WM_SET_OUTPUT_SCALE` accepts (thousandths).
+pub const OUTPUT_SCALE_MIN: u32 = 500;
+pub const OUTPUT_SCALE_MAX: u32 = 4000;
 
 /// Reply to `OP_WM_OUTPUTS`: every monitor of the desktop, by output.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

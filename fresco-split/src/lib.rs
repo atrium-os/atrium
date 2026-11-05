@@ -29,6 +29,9 @@ pub const MSG_BYTES: usize = 96;
 pub const TITLE_BYTES: usize = 64;
 /// Largest window edge a renderer may ask for.
 pub const MAX_WINDOW_DIM: u32 = fresco_compute::MAX_DIM;
+/// The window scales a [`Msg::Scale`] may carry, thousandths.
+pub const SCALE_MIN: u32 = 500;
+pub const SCALE_MAX: u32 = 4000;
 /// Most windows one renderer may have open.
 pub const MAX_WINDOWS: u32 = 64;
 
@@ -102,6 +105,9 @@ pub enum Msg {
     Focus { window: u32, gained: bool },
     /// The user asked to close the window.
     CloseRequested { window: u32 },
+    /// The window is on a monitor of this scale (thousandths, 500..=4000):
+    /// the client should render at it.
+    Scale { window: u32, scale_milli: u32 },
     /// Input routed to `window` by the layer list.
     Input { window: u32, input: Input },
 }
@@ -121,6 +127,7 @@ mod kind {
     pub const GEOMETRY: u32 = 0x103;
     pub const FOCUS: u32 = 0x104;
     pub const CLOSE: u32 = 0x105;
+    pub const SCALE: u32 = 0x106;
     pub const KEY: u32 = 0x110;
     pub const MOTION: u32 = 0x111;
     pub const BUTTON: u32 = 0x112;
@@ -178,6 +185,7 @@ impl Msg {
             | Msg::Geometry { window, .. }
             | Msg::Focus { window, .. }
             | Msg::CloseRequested { window }
+            | Msg::Scale { window, .. }
             | Msg::Input { window, .. } => window,
             Msg::Client { .. } => 0,
         }
@@ -242,6 +250,11 @@ impl Msg {
                 r
             }
             Msg::CloseRequested { window } => Rec::new(CLOSE, *window),
+            Msg::Scale { window, scale_milli } => {
+                let mut r = Rec::new(SCALE, *window);
+                r.put(2, *scale_milli);
+                r
+            }
             Msg::Input { window, input } => match *input {
                 Input::Key { usage, pressed, modifiers } => {
                     let mut r = Rec::new(KEY, *window);
@@ -293,7 +306,7 @@ impl Msg {
             WINDOW_TITLE => (0, true),
             WINDOW_DESTROY | CLOSE => (0, false),
             FRAME_READY | GEOMETRY | MOTION | SCROLL => (2, false),
-            SLOTS | FRAME_DONE | FOCUS => (1, false),
+            SLOTS | FRAME_DONE | FOCUS | SCALE => (1, false),
             KEY => (3, false),
             CLIENT => (4, false),
             BUTTON => (5, false),
@@ -343,6 +356,13 @@ impl Msg {
             GEOMETRY => Msg::Geometry { window, width: dim(r.get(2))?, height: dim(r.get(3))? },
             FOCUS => Msg::Focus { window, gained: flag(r.get(2))? },
             CLOSE => Msg::CloseRequested { window },
+            SCALE => {
+                let scale_milli = r.get(2);
+                if !(SCALE_MIN..=SCALE_MAX).contains(&scale_milli) {
+                    return Err(Refused("scale out of range"));
+                }
+                Msg::Scale { window, scale_milli }
+            }
             KEY => {
                 let usage = u16::try_from(r.get(2)).map_err(|_| Refused("key usage"))?;
                 let modifiers = u8::try_from(r.get(4)).map_err(|_| Refused("modifiers"))?;

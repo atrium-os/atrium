@@ -245,9 +245,12 @@ atomically, checked first against the display's bandwidth (a refused part
 is named with its reason, a half-applied change is rolled back). frescod
 runs one desktop across them, remembers arrangements per set of monitors,
 and rides out hotplug bursts and short dropouts
-([§7.5](spec/atrium-display-architecture.md)). The GPU driver gives a
-client's freed VRAM back to that client (the device allocator doesn't take
-VRAM back yet; a scrubbing allocator is in progress).
+([§7.5](spec/atrium-display-architecture.md)). Each monitor has a scale
+from its pixel density (or set by the session), and a window is told the
+scale of the monitor it is on (`EV_WINDOW_DPI_CHANGED`). Forum lays out each
+monitor on its own, rescues windows from a monitor that leaves and puts them
+back when it returns, and keeps arrangements and scales per user across
+restarts.
 
 ## 6. Userspace bindings and protocols
 

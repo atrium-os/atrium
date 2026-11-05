@@ -205,6 +205,10 @@ pub struct Window {
     /// the app, reported over `WM_ENUMERATE` so the WM can resolve it to an
     /// app-id (launch registry) for workspace assignment. 0 = unresolved.
     pub owner_uid: u32,
+    /// The scale (thousandths) its client was last told with
+    /// `EV_WINDOW_DPI_CHANGED`: 1000 until the window lands on a monitor
+    /// with another one.
+    pub scale_milli: u32,
 }
 
 impl Window {
@@ -223,6 +227,7 @@ impl Window {
             title_glyphs: Vec::new(),
             role:  WmRole::Document,
             owner_uid: 0,
+            scale_milli: 1000,
         }
     }
 
@@ -238,6 +243,7 @@ impl Window {
             title_glyphs: Vec::new(),
             role:  WmRole::Document,
             owner_uid: 0,
+            scale_milli: 1000,
         }
     }
 }

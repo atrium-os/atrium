@@ -8,12 +8,13 @@
 //!   forum-ctl outputs             list the monitors and where they sit
 //!   forum-ctl arrange A SIDE B    put output A right-of / left-of / above / below output B
 //!   forum-ctl move-monitor        send the focused window to the next monitor
+//!   forum-ctl scale N F|auto      show output N at scale F (e.g. 1.5), or the automatic one
 
 use forum_ctl::{default_socket_path, request, Intent, Reply};
 
 fn usage() -> ! {
     eprintln!("usage: forum-ctl surfaces | focus ID | modes | mode WxH[@Hz] | outputs \
-               | arrange A right-of|left-of|above|below B | move-monitor");
+               | arrange A right-of|left-of|above|below B | move-monitor | scale N F|auto");
     std::process::exit(2)
 }
 
@@ -47,6 +48,12 @@ fn main() {
             of: b.parse().unwrap_or_else(|_| usage()),
         },
         ["move-monitor"] => Intent::MoveToNextMonitor,
+        ["scale", n, f] => Intent::SetOutputScale {
+            output: n.parse().unwrap_or_else(|_| usage()),
+            scale_milli: if *f == "auto" { 0 } else {
+                (f.parse::<f64>().unwrap_or_else(|_| usage()) * 1000.0).round() as u32
+            },
+        },
         _ => usage(),
     };
     let sock = default_socket_path();
@@ -70,8 +77,9 @@ fn main() {
         Ok(Reply::Outputs { outputs }) => {
             if outputs.is_empty() { println!("no monitor"); }
             for o in outputs {
-                println!("output {} {}x{}@{:.2} at {},{} monitor {:016x}{}", o.output, o.rect.w, o.rect.h,
-                         o.refresh_mhz as f64 / 1000.0, o.rect.x, o.rect.y, o.identity,
+                println!("output {} {}x{}@{:.2} at {},{} scale {:.2}{} monitor {:016x}{}", o.output, o.rect.w, o.rect.h,
+                         o.refresh_mhz as f64 / 1000.0, o.rect.x, o.rect.y,
+                         o.scale_milli as f64 / 1000.0, if o.scale_auto { "" } else { " (set)" }, o.identity,
                          if o.present { "" } else { " (gone, place kept)" });
             }
         }

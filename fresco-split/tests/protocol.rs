@@ -18,6 +18,7 @@ fn samples() -> Vec<Msg> {
         Msg::Geometry { window: 2, width: 1920, height: 1080 },
         Msg::Focus { window: 2, gained: true },
         Msg::CloseRequested { window: 2 },
+        Msg::Scale { window: 2, scale_milli: 1500 },
         Msg::Input { window: 4, input: Input::Key { usage: 0x04, pressed: true, modifiers: 2 } },
         Msg::Input { window: 4, input: Input::Motion { x: 1.5, y: -2.0 } },
         Msg::Input { window: 4, input: Input::Button { x: 3.0, y: 4.0, button: 1, pressed: false, modifiers: 0 } },
@@ -29,6 +30,15 @@ fn samples() -> Vec<Msg> {
 fn records_round_trip() {
     for m in samples() {
         assert_eq!(Msg::decode(&m.encode()), Ok(m.clone()), "{m:?}");
+    }
+}
+
+#[test]
+fn a_scale_out_of_range_is_refused() {
+    for bad in [0, 499, 4001, u32::MAX] {
+        let mut b = Msg::Scale { window: 2, scale_milli: 1000 }.encode();
+        b[8..12].copy_from_slice(&bad.to_le_bytes());
+        assert!(Msg::decode(&b).is_err(), "{bad}");
     }
 }
 

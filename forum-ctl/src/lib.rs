@@ -80,6 +80,9 @@ pub enum Intent {
     PlaceOutput { output: u32, side: Side, of: u32 },
     /// "Send the focused window to the next monitor."
     MoveToNextMonitor,
+    /// "Show output `output` at this scale" (thousandths; 0 = automatic,
+    /// from its pixel density). Remembered for that monitor.
+    SetOutputScale { output: u32, scale_milli: u32 },
 }
 
 /// The core's answer to an `Intent`.
@@ -149,6 +152,7 @@ mod tests {
         for i in [Intent::ListSurfaces, Intent::Focus { surface_id: 7 }, Intent::ListDisplayModes,
                   Intent::SetDisplayMode { width: 2560, height: 1440, refresh_mhz: 59951 },
                   Intent::ListOutputs, Intent::MoveToNextMonitor,
+                  Intent::SetOutputScale { output: 2, scale_milli: 1500 },
                   Intent::PlaceOutput { output: 1, side: "left-of".parse().unwrap(), of: 0 }] {
             let b = encode(&i).unwrap();
             assert_eq!(decode::<Intent>(&b).unwrap(), i);

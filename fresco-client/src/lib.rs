@@ -513,6 +513,14 @@ impl Connection {
         self.wm_response(control::OP_WM_ARRANGE_OUTPUTS).map(|_| ())
     }
 
+    /// Set a monitor's scale in thousandths (0 = automatic), by identity
+    /// (WM only; `OP_WM_SET_OUTPUT_SCALE`).
+    pub fn wm_set_output_scale(&mut self, identity: u64, scale_milli: u32) -> io::Result<()> {
+        let p = fresco_protocol::WmSetOutputScalePayload { identity, scale_milli };
+        self.send_window_managed(control::OP_WM_SET_OUTPUT_SCALE, &p)?;
+        self.wm_response(control::OP_WM_SET_OUTPUT_SCALE).map(|_| ())
+    }
+
     /// Wait for the IS_RESPONSE to WM op `op`, turning an IS_ERROR into an
     /// error. Other messages in between are skipped, as `wm_enumerate` does.
     fn wm_response(&mut self, op: u16) -> io::Result<Message> {

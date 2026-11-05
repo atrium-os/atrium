@@ -764,6 +764,13 @@ fn event_record(r: &Renderer, ev: &DisplayEvent) -> Option<Msg> {
     let (global, input) = match *ev {
         E::WindowFocusChanged { window_id, gained } => return Some(Msg::Focus { window: r.local_of(window_id)?, gained }),
         E::WindowCloseRequested { window_id } => return Some(Msg::CloseRequested { window: r.local_of(window_id)? }),
+        E::WindowDpiChanged { window_id, scale_factor } => {
+            let scale_milli = (scale_factor * 1000.0).round() as u32; /* NaN -> 0 */
+            if !(fresco_split::SCALE_MIN..=fresco_split::SCALE_MAX).contains(&scale_milli) {
+                return None;
+            }
+            return Some(Msg::Scale { window: r.local_of(window_id)?, scale_milli });
+        }
         E::InputKey { window_id, hid_usage, pressed, modifiers } => (window_id, Input::Key { usage: hid_usage, pressed, modifiers }),
         E::InputPointerMotion { window_id, x, y } => (window_id, Input::Motion { x, y }),
         E::InputPointerButton { window_id, x, y, button, pressed, modifiers } => {

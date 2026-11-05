@@ -5279,11 +5279,21 @@ display free, so stop frescod first: `pkill -x atrium-frescod`, then
 dev.atrium_gpu_amd_display.0.sim_plug_at=N:MODE` plugs output N (0–3; MODE
 as above plus 4 a 1440p office monitor, 5 a twin of the desktop monitor; -1
 unplugs), and `sim_bw_budget_khz` sets the display's pixel-rate budget
-(default 2400000). `display_multi` holds ~110 MB of VRAM until it exits and
-the device doesn't reuse VRAM across clients yet, so give it its own boot.
-With Forum running: `forum-ctl outputs` lists the monitors and where they
-sit, `forum-ctl arrange 1 left-of 0` moves one, `forum-ctl move-monitor`
-sends the focused window to the next monitor (Super+Shift+Right). After changing gpusim's QEMU device, copy `qemu-device/gpusim.c`
+(default 2400000). The VRAM allocator frees and scrubs what a client
+held when it exits, so `display_multi` can share a boot with the rest.
+With Forum running: `forum-ctl outputs` lists the monitors, where they
+sit and their scale, `forum-ctl arrange 1 left-of 0` moves one,
+`forum-ctl scale 1 1.5` (or `auto`) sets a monitor's scale, `forum-ctl
+move-monitor` sends the focused window to the next monitor
+(Super+Shift+Right). Forum remembers arrangements and scales in
+`/var/db/atrium/<user>/forum-displays.state` (`$FORUM_DISPLAYS`); delete it
+to forget them. gpusim's monitors carry physical sizes: code 1 a 24"
+1080p, 2 a 27" 4K (scale 1.5), 3 and 5 a 24" desktop, 4 a 27" 1440p.
+`scripts/vm-multimonitor-chaos.sh` (copy to /root/s in the guest) runs a
+seeded storm of plugs, unplugs, dropouts, bursts and arrangements and checks
+after each step that frescod and forum-wm live, every plugged monitor is
+shown, no window is off-screen, and a set of monitors comes back as it was
+left; it ends with `chaos: N steps, M failed` (~25 min for 60 steps). After changing gpusim's QEMU device, copy `qemu-device/gpusim.c`
 into the QEMU fork and rebuild it, then restart the VM and gpusim-server. Don't
 `kldunload` the GPU modules while frescod or a renderer runs; reboot.
 

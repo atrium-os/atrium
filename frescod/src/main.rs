@@ -113,6 +113,8 @@ fn main() -> std::io::Result<()> {
     let cx = heads::Ctx { gpu: &gpu, vm: &vm, dpy: &dpy };
     let mut heads: Vec<heads::Head> = Vec::new();
     let mut remembered: HashMap<outputs::DisplaySet, outputs::Arrangement> = HashMap::new();
+    /* Monitor scales the session set (OP_WM_SET_OUTPUT_SCALE), by identity. */
+    let mut scales: HashMap<u64, u32> = HashMap::new();
     let mut tracker = outputs::Tracker::default();
     /* The gpu renderer can't encode HDR; corrected below once it exists. */
     let guess_hdr = std::env::var("FRESCOD_RENDERER").map_or(true, |v| v != "gpu");
@@ -172,7 +174,7 @@ fn main() -> std::io::Result<()> {
      * rather than each assuming a screen size, and output 0's modes. */
     frontend.lock().unwrap().set_display_mode(dw, dh, refresh);
     publish_output0(&frontend, &dpy, &heads);
-    publish_outputs(&frontend, &heads);
+    publish_outputs(&frontend, &heads, &scales);
 
     /* ── Socket server ───────────────────────────────────────────── */
     let sock_path = std::env::var("FRESCOD_SOCK")
@@ -337,7 +339,7 @@ fn main() -> std::io::Result<()> {
             hotplug_pending = true;
             if let Ok(seen) = seen_outputs(&dpy) {
                 mark_present(&mut heads, &seen);
-                publish_outputs(&frontend, &heads);
+                publish_outputs(&frontend, &heads, &scales);
             }
         }
         let request = frontend.lock().unwrap().take_mode_request();
@@ -358,6 +360,18 @@ fn main() -> std::io::Result<()> {
                 Err(e) => eprintln!("frescod: display reconfiguration failed ({e}); staying"),
             }
             publish_output0(&frontend, &dpy, &heads);
+        }
+        /* A WM setting a monitor's scale (OP_WM_SET_OUTPUT_SCALE): kept
+         * by monitor, wherever it is plugged; 0 goes back to automatic. */
+        for r in frontend.lock().unwrap().take_scale_requests() {
+            if r.scale_milli == 0 {
+                scales.remove(&r.identity);
+            } else {
+                scales.insert(r.identity, r.scale_milli);
+            }
+            eprintln!("frescod: monitor {:016x} scale {}", r.identity,
+                if r.scale_milli == 0 { "automatic".to_string() } else { format!("{:.2}", f64::from(r.scale_milli) / 1000.0) });
+            changed = true;
         }
         /* A WM moving monitors on the desktop (OP_WM_ARRANGE_OUTPUTS). */
         let placements = frontend.lock().unwrap().take_arrange_request();
@@ -391,7 +405,7 @@ fn main() -> std::io::Result<()> {
             }
             remember(&heads, &mut remembered);
             screen::set(dw, dh, refresh);
-            publish_outputs(&frontend, &heads);
+            publish_outputs(&frontend, &heads, &scales);
             let info = {
                 let mut f = frontend.lock().unwrap();
                 f.set_display_mode(dw, dh, refresh);
@@ -607,15 +621,22 @@ fn present_head(
 }
 
 /// Tell the WM side where each monitor sits (`OP_WM_OUTPUTS`).
-fn publish_outputs(frontend: &Arc<Mutex<EnvelopeFrontend>>, heads: &[heads::Head<'_>]) {
+/// Each monitor's scale is the one the session set for it, else the
+/// automatic one from its pixel density.
+fn publish_outputs(frontend: &Arc<Mutex<EnvelopeFrontend>>, heads: &[heads::Head<'_>], scales: &HashMap<u64, u32>) {
     let list = heads
         .iter()
-        .map(|h| fresco_protocol::WmOutput {
-            output: h.output,
-            identity: h.identity,
-            rect: fresco_protocol::WmRect { x: h.vp.x as i32, y: h.vp.y as i32, w: h.vp.width as i32, h: h.vp.height as i32 },
-            refresh_mhz: h.mode.refresh_mhz,
-            present: h.present,
+        .map(|h| {
+            let set = scales.get(&h.identity).copied();
+            fresco_protocol::WmOutput {
+                output: h.output,
+                identity: h.identity,
+                rect: fresco_protocol::WmRect { x: h.vp.x as i32, y: h.vp.y as i32, w: h.vp.width as i32, h: h.vp.height as i32 },
+                refresh_mhz: h.mode.refresh_mhz,
+                present: h.present,
+                scale_milli: set.unwrap_or_else(|| outputs::auto_scale(&h.conn.edid, h.mode.width, h.mode.height)),
+                scale_auto: set.is_none(),
+            }
         })
         .collect();
     frontend.lock().unwrap().set_outputs(list);

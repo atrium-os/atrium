@@ -89,6 +89,9 @@ impl FrescoConn for ClientConn {
     fn arrange_outputs(&mut self, placements: Vec<fresco_protocol::WmOutputPlacement>) -> io::Result<()> {
         self.conn.wm_arrange_outputs(placements)
     }
+    fn set_output_scale(&mut self, identity: u64, scale_milli: u32) -> io::Result<()> {
+        self.conn.wm_set_output_scale(identity, scale_milli)
+    }
 }
 
 
@@ -153,8 +156,17 @@ fn main() -> io::Result<()> {
     let mut wm = Wm::new(screen(&mut io_conn.conn));
     wm.workspaces = cfg.workspaces;
     // The monitors (display 3.0); the first reconcile lays out on them.
+    // and how the session last left them (arrangement per set, scales).
+    let store = forum_wm::displays::default_path();
+    wm.displays = forum_wm::displays::load(&store);
+    wm.display_store = Some(store);
     match io_conn.conn.wm_outputs() {
-        Ok(r) => wm.outputs = r.outputs,
+        Ok(r) => {
+            wm.outputs = r.outputs.clone();
+            if let Err(e) = wm.apply_remembered_displays(&mut io_conn, &r.outputs, true) {
+                eprintln!("forum-wm: restoring the monitors: {e}");
+            }
+        }
         Err(e) => eprintln!("forum-wm: outputs: {e} (one screen)"),
     }
     wm.names = cfg.names;

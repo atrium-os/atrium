@@ -332,8 +332,17 @@ the 2.x ioctls act on output 0.
   opened (the monitor of the window you were working in) or where it was
   sent (Super+Shift+Right, `forum-ctl move-monitor`). If its monitor
   leaves, the window shows on the primary; when the monitor comes back, on
-  any output, the window goes back. Not yet: per-monitor scale, and keeping
-  arrangements across a frescod restart.
+  any output, the window goes back. Forum keeps each set's arrangement
+  and each monitor's scale per user (`/var/db/atrium/<user>/forum-displays.state`)
+  and puts them back when frescod, the WM or the machine starts again.
+- **Scale.** Each monitor has a scale (`WmOutput.scale_milli`): its pixel
+  density over 110 ppi in quarter steps from 1.0 to 3.0 (EDID physical
+  size; 1.0 without one), so a 24" 1080p or a 27" 1440p shows at 1.0 and a
+  27" 4K at 1.5. `OP_WM_SET_OUTPUT_SCALE` (`forum-ctl scale N F|auto`)
+  overrides it per monitor. A window is told the scale of the monitor it
+  mostly covers with `EV_WINDOW_DPI_CHANGED` whenever that changes (moved
+  to another monitor, or the monitor's scale set); it renders at that
+  scale. Window geometry stays in desktop pixels.
 
 ## 8. The output topology — connectors, encoders, PHYs (HDMI / DP / USB-C)
 
