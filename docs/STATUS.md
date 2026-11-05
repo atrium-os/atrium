@@ -104,6 +104,7 @@ compute route chosen; security conditions F1–F6 in
 | F4f secure password input to frescod | waits on F5 + Navigator C0 | — |
 | F5 | deferred (Shankar) | — |
 | Display lease: only frescod's jail and uid may open `/dev/atrium-display0` (jaild writes the lease; devfs ruleset 23 pinned to frescod) | done; host root and other jails get EPERM in the VM | `1441356` and the jaild commit after it |
+| Flip on the in-fence signal (the display watches its in-fence syncobj; a failed render drops the commit and fails its out-fence) | done; fenced async flips land 8–11 ms after the signal in the VM, before they waited for vblank (18 ms) | `c613251` |
 | Recovery from a device reset: `NOTE_RESET` kqueue event + `STATUS_CONTENT_LOST` (GPU ABI v2.1 §10.3); frescod re-presents at once, gpu renderer falls back to Tier-2 for 5 s | done; screen back within 2 s on both renderers in the VM (black without frescod) | `7cc2939`, `6e2b92d` |
 | D4 real DCN 4.0.1 scanout/flip/vblank registers in gpusim + display kmod (modeset still `regDISP_*`) | done; display tests, `atrium_gpu_test`, `test_gpu_isolation`, jailed frescod pass on gpusim | gpusim `3f37036`, `e3b0658` |
 | D5 silicon display (inherit GOP mode first) | not started (needs native boot on the R9700; it has no monitor) | — |
