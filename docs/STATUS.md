@@ -4,7 +4,7 @@ What is being worked on right now, where it stands, and where to read more.
 This is the index; the specs and the run book hold the detail. How to run
 anything named here is in [RUNBOOK.md §13](../RUNBOOK.md#13-cloud-and-remote-workflows-2026-11).
 
-**Last refreshed: 2026-11-04 21:45 UTC** (HEAD `c4bbf2e`). Kept current by the
+**Last refreshed: 2026-11-05 03:10 UTC** (HEAD `da65060`). Kept current by the
 project's docs thread; if a row is wrong, the commit log wins — fix the row.
 
 Commit hashes are atrium unless prefixed: `fbsd:` = atrium-os/freebsd-src
@@ -14,12 +14,12 @@ branch `atrium-os`, `gpusim:` = atrium-os/gpusim.
 
 | Workstream | State | Latest | Next |
 |---|---|---|---|
-| [Native RDNA4 backend + gpusim](#1-native-rdna4-gpu-stack) | R9700 oracle v19: **54/54 jobs, 82 MATCH, 0 MISMATCH**; bench v5 ours ≤ RADV | spilling stage 3 `4bf3191`; VA reuse `2dac848` | bench v7 staged on the box (atrium16), waiting for an idle GPU; F6 driver half committing |
-| [GPU driver isolation (F1/F6)](#2-gpu-driver-isolation) | F1 done; isolation 50/50, driver suite 28/28 on gpusim | `73a94ec`, `2dac848`, re-attest `9ae14a0` | warm-reboot fix (gpusim `bf008f1`), silicon run before production grant |
-| [Fresco display pipeline](#3-fresco-display-pipeline) | D1–D3 done; GPU renderer on gpusim; F2, F4a–F4d done | F4d trusted chrome `a9bf150` | tell forum-wm about the 24 px strip; then F4f (secure password input) |
+| [Native RDNA4 backend + gpusim](#1-native-rdna4-gpu-stack) | R9700 oracle v19: **54/54 jobs, 82 MATCH, 0 MISMATCH**; bench v5 ours ≤ RADV | spilling stage 3 `4bf3191`; VA reuse `2dac848` | bench v7 staged on the box (atrium16), waiting for an idle GPU |
+| [GPU driver isolation (F1/F6)](#2-gpu-driver-isolation) | F1 done; F6 G1–G4 done (watchdog, VM-fault → EIO, read-only binds, app GPU channel, hostile-ISA fuzz); `CAP_ISA` (ABI rev 4) | `622693d`, `bb3f7ba`, `8023c92`, `a8a595d` | G5; silicon run of `test_gpu_isolation` before a production grant |
+| [Fresco display pipeline](#3-fresco-display-pipeline) | compute is the default renderer; split mode on by default, renderers jailed as `_fresco-render`; F2, F3, F4a–F4d done; F5 deferred | `3ccac5d`, `1455488`, `da65060` | F4f (secure password input), F4e (GPU VM per window) |
 | [Compressed memory](#4-compressed-memory) | zram v2 increments 0–6 done; design A (swap fast path) **kept**, B shelved | spec `3da0acb` | — (closed 2026-11-04) |
-| [Navigator security](#5-navigator-threat-model-fixes) | P0/P1 rows verified on FreeBSD; jail limits verified | `c23c266` (§6.5.2e) | P2: total fetched-bytes budget per conversion |
-| [Navigator exploration coverage](#6-navigator-exploration-coverage) | baseline 14.6% of 2,045 handlers; re-measure 298 → 324 covered elements | probes `c57631b`, budget `c4bbf2e` | finish write-up, flags unchanged; then P2 byte budget |
+| [Navigator security](#5-navigator-threat-model-fixes) | P0/P1 rows verified on FreeBSD; jail limits verified; P2 byte budget, link activation, image decoding in the worker done | `b0927c0`, `4995101`, `7b74432`, `ceead6a` | credentials C0 (vault + per-origin fetcher) |
+| [Navigator exploration coverage](#6-navigator-exploration-coverage) | covered handler elements 298 → 324 → **754 (45.2 %)** with sibling templates (recording format /4) | `78c50e9`, `3e98a25`, `493f5d6` | `el.id` at load; 6 pre-existing replay failures |
 | [Navigator document lane](#9-navigator-document-lane-normalizer--renderer) | corpus layout work: grid, flex, tables, RTL, UAX #14 line breaking | grid/box-alignment batch `36a341f`…`d715d05` | keep driving corpus flags down (thread "Fix Navigator corpus render flags") |
 | [Navigator backend](#10-navigator-backend) | M3 forward/back passed; M4 jailed save/restore passes in a real jail | `a168de8`, `0841678`, `b9edfe3` | — |
 | [x86_64 port](#7-x86_64-port) | A done, C done (amd64 VM, Tessera root, gpusim, navigator e2e) | `801a762`, `6273d0d`, `108098c`, `991db65` | B (Ubuntu userspace), D (driver on R9700 via VFIO), E (IPMI boot) |
@@ -65,13 +65,17 @@ header `include/atrium/gpu_abi_v2.h` is normative).
 - VA reuse, reject overlapping/misaligned binds (`2dac848`).
 - jaild policy lists atrium-gpu-amd as **experimental (passed, not granted)**;
   a silicon run of `test_gpu_isolation` is required before production.
-- **F6 (in progress):** driver half = per-queue completion tracking + hang
-  watchdog (gpusim: isolation 50/50, suite 28/28). A warm-reboot panic
-  (gpusim kept DMA-ing after reset) is fixed in gpusim `bf008f1` and the
-  driver now clears Bus Master on shutdown. App half (broker submits validated
-  app code, apps hold no device fd) follows with Fresco F4.
-- Known open: a parked/faulted ring holds its shared queue until close or ctl
-  reset (DoS, not leak) until per-VM MES queues; review §A2.2, §A2.6.
+- Per-queue completions and a hang watchdog (`hang_ms`, default 5000) close
+  review §A2.2/§A2.6; lost work fails with EIO; Bus Master is cleared on
+  shutdown so warm reboots are clean (with gpusim `bf008f1`) (`622693d`).
+- **F6, the app GPU path** ([spec/gpu-app-path-f6.md](spec/gpu-app-path-f6.md)):
+  - Option A recorded: app machine code is untrusted and confined by its VMID (`a8587af`).
+  - G1: a VM fault fails that queue's work at once; read-only binds, ABI rev 3 (`bb3f7ba`, isolation Part D `e48e89b`).
+  - G2: frescod's GPU channel (`FRESCOD_GPU_SOCK`), one context and VM per connection, arch-neutral (`4cf6395`, review fixes `5f6bd11`).
+  - G3: `atrium-gpu-app` checks every field and writes every PM4 packet itself (`6dcd221`).
+  - G4: hostile machine code (infinite loop, wild stores) is lost with EIO while other apps' work completes (`a8a595d`).
+  - `CAP_ISA` (ABI rev 4): the ISA family comes from the driver, not the vendor string (`8023c92`).
+  - jaild stanza re-attested at each driver change (latest `e572532`), still experimental.
 
 ## 3. Fresco display pipeline
 
@@ -84,21 +88,23 @@ compute route chosen; security conditions F1–F6 in
 | D1 display ABI v2 on gpusim (`include/atrium/display_abi_v2.h`, fenced commits, vblank pacing) | done | `4205742` |
 | D2/D3 `fresco-compute` bin + raster kernels, Tier-2 matches reference; `FRESCOD_RENDERER=compute` | done | `ce1d804`, golden `6ca05f0` |
 | GPU renderer: `FRESCOD_RENDERER=gpu` draws via RDNA4 kernels on gpusim; architecture behind `fresco_compute::gpu::Arch` (RDNA4 the one built in) | done | `7c1ec1b` |
-| `compute` is frescod's default renderer (Vulkan opt-in) | done | |
+| `compute` is frescod's default renderer (Vulkan opt-in); gpu renderer arch from `CAP_ISA` | done | `1455488`, `da65060` |
 | Damage tracking (only dirty tiles re-rastered; 15 s → 0.4 s/frame on gpusim) | done | `57035bc` |
 | F2 bounds hardening + differential fuzzer | done | `9323062` |
 | F4a per-window surfaces + compose kernel | done | `a20492f`, `797a3e5` |
-| F4b one jailed renderer per client (portcullisd jail, `_fresco-render`; frescod as `_frescod`) | done, on by default with compute/gpu | `a46ec90`, `0a864bd` |
+| F4b one jailed renderer per client (portcullisd jail, `_fresco-render`; frescod as `_frescod`) | done, on by default with compute/gpu; frescod starts renderers via portcullisd and fails closed; fonts + 512 MiB cap in the bundle; 32 connections per uid | `a46ec90`, `0a864bd`, `a43f23f`, `3754439`, `3ccac5d` |
 | F4c input routed by the composed layer list; window 0 = WM | done | `1c87e2d` |
 | F4c′ click-through on alpha < 16 (anti-clickjacking) | done | `2cf9231` |
 | F4d trusted chrome: 24 px origin strip only frescod draws, focus ring | done | `a9bf150` |
-| forum-wm aware of the strip | next | — |
-| F4e one GPU VM per window | waits on F6 | — |
+| forum-wm lays out below the strip (`DISPLAY_INFO.reserved_top`) | done | `11984d2` |
+| F3 broker fuzzing (`atrium-split-fuzz`, `scripts/fresco-split-fuzz.sh`; broker never blocks on a renderer) | done | `9d8429a` |
+| App GPU channel in frescod (F6 G2–G4) | done | `4cf6395`, `a8a595d` |
+| F4e one GPU VM per window | next (F6 done) | — |
 | F4f secure password input to frescod | waits on F5 + Navigator C0 | — |
-| F3, F5 | not started | — |
+| F5 | deferred (Shankar) | — |
 | D4 gpusim toward real DCN4 regs, D5 silicon display | not started (R9700 has no monitor) | — |
 
-Slice detail: [spec/fresco-f4-split.md](spec/fresco-f4-split.md). Screenshots
+Slice detail: [spec/fresco-f4-split.md](spec/fresco-f4-split.md). The whole display stack as it stands: [GRAPHICS-STACK.md §0](GRAPHICS-STACK.md#0-the-display-stack-now-updated-2026-11-05). Screenshots
 in `/mnt/project-files/graphics/frescod-*.png`.
 
 ## 4. Compressed memory
@@ -126,9 +132,11 @@ Spec [spec/atrium-zram-v2.md](spec/atrium-zram-v2.md).
 | P1 no LAN/loopback filter in fetch | filter after resolution + pin `4a99a56` | yes, `9880f2b` — 23-row M1 gate unjailed and jailed |
 | P1 `require_confinement()` unused | `PRERENDER_REQUIRE_CONFINEMENT=1` | yes |
 | Jail limits (rctl memory/pcpu, memfed pools) | `f26f8ad`; SetRctl replaces instead of stacks `c23c266` | yes, §6.5.2e |
-| P1 production image decoding home | open | — |
-| P1 shared-store poisoning (per-user dedup) | open | — |
-| P2 total fetched-bytes budget per conversion | next (coverage thread) | — |
+| P1 production image decoding home | images decode in the document's worker; broker validates address, budget and reply (§2.4) `ceead6a` | — |
+| P1 shared-store poisoning (per-user dedup, reproduce-to-share) | conversions reproduce 123/123 offline, host locale pinned (§2.6) `c92d16e` | — |
+| P2 total fetched-bytes budget per conversion | enforced in the trusted fetch relay `b0927c0` | — |
+| P2 link activation | broker decides every activation, scheme allowlist, only hrefs the recording carries (§2.10) `4995101`, `7b74432` | — |
+| Portcullis snags from the FreeBSD run | deploy keeps `[resource_control]`, etc. (§6.5.2e′) `13ed962` | yes, `fec41a1` |
 | Credentials design (§6: vault + per-origin fetcher, C0) | designed; no logins before C0 | — |
 
 Also settled: islands + DRM approach (legacy-web §8.1); honest UA, never solve

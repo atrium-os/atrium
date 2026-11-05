@@ -1,7 +1,7 @@
 # The Atrium graphics stack, as built
 
 > **What this is.** A map of the graphics stack as the code stands on
-> 2026-11-03: kernel drivers, the ABIs above them, the dispatch protocol, the
+> 2026-11-03 (§0 updates the display path to 2026-11-05): kernel drivers, the ABIs above them, the dispatch protocol, the
 > renderers, the compositor, and how a 2D app and a 3D app each reach the
 > screen. Written from the code first, with the specs as secondary evidence.
 > Where the two disagree, the code wins here, and §9 lists the disagreements.
@@ -12,7 +12,111 @@
 > `spec/aqueduct-gpu.md`, `spec/carillon.md`, `spec/tier2-renderer.md`,
 > `spec/fresco-rendering-stack.md`.
 
+## 0. The display stack now (updated 2026-11-05)
+
+Sections 1–11 are the 2026-11-03 snapshot. Since then the display path was
+rebuilt end to end (plan: [reviews/2026-11-04-fresco-display-pipeline.md](reviews/2026-11-04-fresco-display-pipeline.md);
+security conditions F1–F6: [spec/atrium-navigator-threat-model.md §2.5](spec/atrium-navigator-threat-model.md)).
+Where this section and the older ones disagree, this one is current.
+
+**What changed, in one paragraph.** frescod no longer needs Vulkan or Mesa.
+Its default renderer is two of our own compute kernels (bin + raster, from
+`fresco-compute`), compiled in-process by Tier-2 on the CPU, or by our RDNA4
+compiler for the GPU. Each client's scene is packed by its **own jailed
+renderer process**; frescod (the broker) only validates a fixed-size frame
+header and runs a fixed **compose** kernel over a layer list it controls. It
+draws a trusted **chrome strip** no app can paint, routes input by what is
+actually on screen, and presents through **display ABI v2** (commit a BO fd
+with fences, paced by flip-done). Apps that bring their own GPU code get a
+separate, architecture-neutral **GPU channel** where the broker writes every
+packet and the GPU MMU confines the app's machine code.
+
+### 0.1 Processes and trust
+
+```mermaid
+flowchart TB
+  subgraph APP["App jail (per app uid)"]
+    C["client: fresco-protocol scene"]
+    G["own GPU code (optional)"]
+  end
+  subgraph REND["Renderer jail (_fresco-render, one per client connection)"]
+    R["fresco-renderer: scene → packed frame<br/>in a sealed memfd slot"]
+  end
+  subgraph BROKER["frescod (_frescod)"]
+    S["socket_server: ids, caps per uid"]
+    V["Frame::validate (64 B header only)"]
+    K["compose + chrome + input routing"]
+    GA["gpu_app: one VM per GPU context<br/>atrium-gpu-app checks + PM4 builder"]
+  end
+  subgraph KERN["atrium-gpu-amd"]
+    A["'A' /dev/atrium-gpu0: VMs, BOs, queues,<br/>per-queue completions, hang watchdog, VM-fault → EIO"]
+    D["'D' /dev/atrium-display0 v2: COMMIT(bo_fd, in/out syncobj)"]
+  end
+  NAV["Navigator broker"] -- "FRESCOD_CHROME_SOCK: OPEN_CLIENT, SET_ORIGIN" --> K
+  C -- "Unix socket" --> S
+  S -- "ExecInstance via portcullisd" --> R
+  R -- "96 B records (SEQPACKET) + slot" --> V --> K
+  G -- "FRESCOD_GPU_SOCK records" --> GA
+  K --> A
+  GA --> A
+  K --> D
+```
+
+| Piece | What it does | Code | Landed |
+|---|---|---|---|
+| Display ABI v2 | `COMMIT` names a BO by fd, waits on an in-syncobj, signals an out-syncobj when on screen and the old buffer is free; exclusive node; last frame held across close; a second outstanding commit is EBUSY. Retires `SET_MODE`/`PAGE_FLIP`/`BO_EXPORT_SCANOUT`. frescod double-buffers and is paced by flip-done (the 30 fps timer is gone) | `include/atrium/display_abi_v2.h`, `atrium-gpu-amd/display/` | `b3d298e`, `4205742` |
+| Compute renderer | `bin.comp` + `raster.comp` over storage buffers, a Rust reference that matches statement for statement, lavapipe golden | `fresco-compute/` | `ce1d804`, `6ca05f0` |
+| `FRESCOD_RENDERER=compute` | **the default.** Kernels compiled in-process by Tier-2 (Cranelift is a default feature) | `frescod` | `1455488` |
+| `FRESCOD_RENDERER=gpu` | same kernels on the GPU. Arch-neutral behind `fresco_compute::gpu::{Arch, Stream}`; RDNA4 is one `Arch`. Picked from the driver's `CAP_ISA` (or `FRESCOD_GPU_ARCH`). Damage tracking rasters only changed tiles | `fresco-compute/src/gpu`, `rdna4` | `7c1ec1b`, `57035bc`, `1455488`, `da65060` |
+| `FRESCOD_RENDERER=vulkan` | the old `HeadlessRenderer` path (lavapipe in the VM); opt-in; split mode stays off with it | `fresco-vulkan` | — |
+| Bounds (F2) | broker checks only the header; kernels bound every index read from content and are NaN-safe; differential fuzzer (Tier-2, GIR, gpusim) | `fresco-compute/tests/fuzz.rs` | `9323062` |
+| Per-window surfaces + compose (F4a) | one surface per window; fixed compose kernel over the broker's layer list | `fresco-compute`, `frescod` | `a20492f`, `797a3e5` |
+| Process split (F4b) | one renderer per client connection; records over SEQPACKET, memfd slots sealed against resize. **On by default** with compute/gpu (`FRESCOD_SPLIT=0` turns it off). frescod sends `ExecInstance` to portcullisd itself and fails closed (no portcullisd → client refused). Renderer runs as `_fresco-render` (65011), frescod as `_frescod` (65010); 512 MiB / 100 % CPU caps; fonts in the bundle (`scripts/fresco-renderer-bundle.sh`). portcullisd kills a worker whose caller hangs up | `fresco-split/`, `frescod`, `portcullis` | `a46ec90`, `0a864bd`, `a43f23f`, `3754439`, `3ccac5d` |
+| Input routing (F4c, F4c′) | pointer hits the layers last composed; window 0 is the WM's; clicks pass through pixels with alpha < 16 | `frescod` | `1c87e2d`, `2cf9231` |
+| Trusted chrome (F4d) | 24 px top strip only frescod draws (built-in font, origin charset only), focus ring; origin set over the chrome socket, never by the renderer. `DISPLAY_INFO.reserved_top` tells forum-wm to lay out below it | `frescod`, `forum-wm` | `a9bf150`, `11984d2` |
+| Broker fuzzing (F3) | `atrium-split-fuzz` plays hostile renderers and a hostile Navigator; broker sends non-blocking and retires a renderer whose channel is full; per-renderer rate budgets | `atrium-split-fuzz`, `scripts/fresco-split-fuzz.sh` | `9d8429a` |
+| Connection limits | 32 connections per uid; last 64 client ids at most 2 per uid | `fresco-scene-server` | `a43f23f`, `da65060` |
+| App GPU channel (F6) | `FRESCOD_GPU_SOCK`, one GPU context (thread + VM) per connection, ≤ 4 per uid, last 8 of 32 one per uid. Apps send a code header + machine code + closed-set records (bind code, user SGPRs, dispatch, barrier); `atrium-gpu-app` checks every field and writes every PM4 packet; the ring is read-only to the GPU; code mapped read-only. **Option A:** app code is untrusted, the VMID confines it. Hostile ISA (infinite loop, wild stores) is lost with EIO while other apps' work completes | `atrium-gpu-app/`, `frescod/src/gpu_app.rs`, `atrium-gpu-fuzz` | `6dcd221`, `4cf6395`, `a8a595d`, `5f6bd11`, `a8587af`; spec [spec/gpu-app-path-f6.md](spec/gpu-app-path-f6.md) |
+| Driver isolation (F1, F6 G1) | the five §A3 breaks closed; per-queue completions; hang watchdog (`hang_ms`, default 5000); VM fault fails that queue's work at once; read-only binds (ABI rev 3); `CAP_ISA` (ABI rev 4); Bus Master cleared on shutdown | `atrium-gpu-amd/` | `73a94ec`, `2dac848`, `622693d`, `bb3f7ba`, `8023c92` |
+
+Still not done: F4e (one GPU VM per window), F4f (secure password input to
+frescod), F5 (deferred by Shankar), D4 (gpusim toward real DCN4 registers;
+the display kmod still programs gpusim's `regDISP_*` only), D5 (silicon
+display; the R9700 has no monitor). The driver is jaild-attested as
+**experimental** until `test_gpu_isolation` runs on silicon.
+
+### 0.2 The frame path now
+
+```
+app ──fresco-protocol──▶ frescod socket_server (per-uid caps)
+                              │ ExecInstance → portcullisd → renderer jail (_fresco-render)
+                              ▼
+          renderer: scene → packed frame in its memfd slot ──96 B record──▶ frescod
+                              │ Frame::validate (header only)
+                              ▼
+          compose kernel over frescod's layer list + chrome strip
+                              │ compute: Tier-2 on the CPU   gpu: RDNA4 dispatches
+                              │ (damage: only changed tiles)  (bin → CS_PARTIAL_FLUSH → raster)
+                              ▼
+          scanout BO ──COMMIT(bo_fd, in-fence, out-fence)──▶ display v2 ──▶ gpusim scanout
+                              pacing: flip-done (out-fence), double-buffered
+```
+
+### 0.3 Run configurations now
+
+| Configuration | Renderer | Where verified |
+|---|---|---|
+| amd64 VM + gpusim, default frescod | compute (Tier-2), split on, renderers jailed | cloud VM (`1455488`, `3ccac5d`) |
+| amd64 VM + gpusim, `FRESCOD_RENDERER=gpu` | RDNA4 kernels on gpusim; whole guest freezes per GPU frame | cloud VM (`7c1ec1b`); kernels pixel-exact on the R9700 (oracle v14+, v19 incl. `fresco_compose`) |
+| `FRESCOD_HEADLESS_PNG` | compute, no display | quickest check |
+| `FRESCOD_RENDERER=vulkan` | lavapipe | legacy; no split |
+
+How to run each: [RUNBOOK.md §13.3–13.4](../RUNBOOK.md#134-fresco-frescod-modes).
+Screenshots: `/mnt/project-files/graphics/frescod-*.png`.
+
 ## 1. Summary
+
+*(2026-11-03 snapshot; the frescod and display bullets are superseded by §0.)*
 
 - **Apps never touch the GPU.** A 2D app sends a retained, content-addressed
   scenegraph (`fresco-protocol`, the `CLASS_DISPLAY` vocabulary on the
@@ -103,7 +207,7 @@ flowchart TB
   T2 -- "present: blob → slot texture<br/>(atrium-tier2-fresco-bridge)" --> FP
 ```
 
-The canonical native frame path, step by step (frescod `main.rs`):
+The native frame path as it was on 2026-11-03 (frescod `main.rs`; **superseded**, see §0.2):
 
 ```
 app ──fresco-protocol──▶ frescod: EnvelopeFrontend → SceneGraph/Compositor
@@ -144,7 +248,7 @@ Atrium's patched `freebsd-src`, not stock FreeBSD.
 | **Display, `'D'` (offset model)** | `atrium-gpu-amd/atrium_display_abi.h` | `atrium-display-architecture.md` | atrium-gpu-amd display kmod | `atrium-gpu-rs::amd::Display`, frescod |
 | **Legacy GPU `'G'` + display `'D'`** | `atrium-kmod/atrium_gpu.h` | `gpu-abi.md` (v0.1, superseded) | atrium_virtio_gpu | `atrium-gpu-rs` top level, `frescod-aqueduct`, `aqueduct_smoke`, `carillon-guest/scanout.rs`, the C tests in `atrium-kmod/` |
 
-Display ABI today is the "interim" shape: `SET_MODE`/`PAGE_FLIP` taking
+**Superseded 2026-11-04 by display ABI v2 (§0.1).** On 2026-11-03 the display ABI was the "interim" shape: `SET_MODE`/`PAGE_FLIP` taking
 `{vram_offset,size}`, a `STATUS` poll, and kqueue vblank on the display fd.
 The target (atomic commit, syncobj in/out fences on flips, multi-connector) is
 specified but not built.
@@ -229,6 +333,8 @@ is installed (§7).
 
 ### Run configurations that actually exist
 
+*(2026-11-03; current ones in §0.3.)*
+
 | `run-vm.sh` profile | Kernel driver | Compositor binary | Vulkan under the compositor | Status |
 |---|---|---|---|---|
 | `--gpusim` | atrium-gpu-amd | `frescod` (main) | lavapipe | Canonical native path |
@@ -290,6 +396,8 @@ native graphics path. It runs only on the Mac host through MoltenVK. Keep it
 apart when judging Atrium progress.
 
 ## 9. Gaps and inconsistencies
+
+*(2026-11-03. Closed since: item 1 for frescod (compute/gpu renderers, §0), the 30 fps unfenced flip (display ABI v2), the five isolation breaks (F1). Check §0 before acting on an item here.)*
 
 Architecture gaps (things that block a real graphics stack):
 

@@ -5240,6 +5240,9 @@ In the guest:
 | `FRESCOD_INPUT_SOCK` | input injection socket (F4c routing) |
 | `FRESCOD_CHROME_SOCK` | trusted chrome: `OPEN_CLIENT` then `SET_ORIGIN` (F4d strip) |
 | `FRESCOD_DAMAGE_THRESHOLD` | damage tracking tuning (gpu backend rasters only dirty tiles) |
+| `FRESCOD_GPU_SOCK` | F6 app GPU channel: one GPU context + VM per connection (≤ 4 per uid); `FRESCOD_GPU_ONLY=1` serves only this channel. Test with `atrium-gpu-fuzz` (honest / hostile / isa) |
+
+Broker fuzzing (F3): `scripts/fresco-split-fuzz.sh` in the guest runs `atrium-split-fuzz` (hostile renderers + Navigator) against an animated probe client; `FUZZ_GPU=1` adds `atrium-gpu-fuzz` against the GPU channel. Kill leftover fuzz renderers between runs.
 
 Demos (crate `atrium-test-client`): `atrium-surfaces-demo <sock> <wm-sock>`
 (three windows; `SURFACES_STILL=1` prints which client got each input),
