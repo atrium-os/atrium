@@ -19,7 +19,7 @@ use std::io;
 use std::os::unix::io::AsRawFd;
 use std::ptr;
 
-use atrium_gpu::amd::{gpu_reset, Display, Gpu, GpuCtl, Scanout};
+use atrium_gpu::amd::{gpu_reset, Display, Gpu, GpuCtl, ResetWatch, Scanout, STATUS_CONTENT_LOST};
 
 fn main() {
     match run() {
@@ -73,6 +73,15 @@ fn run() -> io::Result<()> {
         return Err(io::Error::last_os_error());
     }
 
+    // A reset-only watch: vblanks must not wake it.
+    let watch = ResetWatch::new(&dpy)?;
+    if let Some(g) = watch.wait(Some(std::time::Duration::from_millis(300)))? {
+        return Err(io::Error::other(format!("NOTE_RESET watch fired with no reset (gen {g})")));
+    }
+    if dpy.status_v2()?.flags & STATUS_CONTENT_LOST != 0 {
+        return Err(io::Error::other("CONTENT_LOST set before any reset"));
+    }
+
     // Vblanks flowing before the reset.
     wait_vblanks(kq, &dpy, 5)?;
     eprintln!("display vblank flowing before reset");
@@ -87,6 +96,31 @@ fn run() -> io::Result<()> {
     wait_vblanks(kq, &dpy, 5)?;
     unsafe { libc::close(kq) };
     eprintln!("display vblank STILL flowing after the GPU reset — not collateral damage");
+
+    // The holder is told (GPU ABI v2.1 §10.3): a NOTE_RESET event with the
+    // device's new reset generation, and STATUS_CONTENT_LOST until it commits
+    // a fresh frame.
+    let gen = watch.wait(Some(std::time::Duration::from_secs(2)))?
+        .ok_or_else(|| io::Error::other("no NOTE_RESET event after the reset"))?;
+    if gen == 0 {
+        return Err(io::Error::other("NOTE_RESET carried reset generation 0"));
+    }
+    if dpy.status_v2()?.flags & STATUS_CONTENT_LOST == 0 {
+        return Err(io::Error::other("CONTENT_LOST not set after the reset"));
+    }
+    eprintln!("NOTE_RESET delivered (reset generation {gen}); STATUS says content lost");
+    let f = dpy.commit(scan.buffer(0), 0, 0, None, None)?;
+    if f != 0 {
+        return Err(io::Error::other(format!("post-reset commit fault {f}")));
+    }
+    let t0 = std::time::Instant::now();
+    while dpy.status_v2()?.flags & STATUS_CONTENT_LOST != 0 {
+        if t0.elapsed() > std::time::Duration::from_secs(2) {
+            return Err(io::Error::other("CONTENT_LOST still set after a fresh commit landed"));
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    eprintln!("a fresh commit clears CONTENT_LOST");
 
     eprintln!("coordinated reset confirmed: a device-lost GPU reset preserves the display");
     Ok(())

@@ -105,8 +105,10 @@ It can never receive another VM's writes.
   its own exclusive queue, and gives it back when it closes the device.
 - Retirement counts EOPs per queue rather than reading a kernel-owned
   `(queue, seqno)` fence word (review §A2.2's full design). The seqno form
-  would drop the one-EOP-per-signalled-submit contract above. There is no
-  device-lost generation counter yet either.
+  would drop the one-EOP-per-signalled-submit contract above. The base
+  counts device resets (`sc->reset_gen`), and the display reports it with
+  `NOTE_RESET` (GPU ABI v2.1 §10.3), but `QUERY_CAPS` does not expose a
+  device-lost generation to GPU clients yet.
 - On gpusim a queue stop and a TLB invalidate take effect at the register
   write. Real silicon needs the HQD dequeue handshake and the invalidate
   acknowledgement before pages are freed. Both are marked in `cp.c` and

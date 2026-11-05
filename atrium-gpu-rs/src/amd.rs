@@ -191,6 +191,11 @@ pub const FAULT_BAD_PITCH: u32 = 6;
 /// STATUS flags.
 pub const STATUS_COMMIT_PENDING: u32 = 0x1;
 pub const STATUS_MODE_SET: u32 = 0x2;
+/// A device reset may have wiped the screen; cleared when a commit made after
+/// it reaches the screen (GPU ABI v2.1 §10.3).
+pub const STATUS_CONTENT_LOST: u32 = 0x4;
+/// kqueue fflags on the display fd: reset-only registration / reset seen.
+pub const NOTE_RESET: u32 = 0x1;
 
 fn open_rdwr(path: &str) -> io::Result<RawFd> {
     let c = CString::new(path).unwrap();
@@ -793,6 +798,58 @@ impl Display {
 }
 
 impl AsRawFd for Display { fn as_raw_fd(&self) -> RawFd { self.fd } }
+
+/// A kqueue that wakes only on device resets of a [`Display`] (registered with
+/// `NOTE_RESET`, so vblanks never wake it). Borrows the display's fd: keep the
+/// `Display` open for as long as this is used.
+pub struct ResetWatch { kq: RawFd }
+
+impl ResetWatch {
+    pub fn new(dpy: &Display) -> io::Result<Self> {
+        let kq = unsafe { libc::kqueue() };
+        if kq < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        let chg = libc::kevent {
+            ident: dpy.fd as libc::uintptr_t,
+            filter: libc::EVFILT_READ,
+            flags: libc::EV_ADD | libc::EV_CLEAR,
+            fflags: NOTE_RESET,
+            data: 0,
+            udata: std::ptr::null_mut(),
+            ext: [0; 4],
+        };
+        if unsafe { libc::kevent(kq, &chg, 1, std::ptr::null_mut(), 0, std::ptr::null()) } != 0 {
+            let e = io::Error::last_os_error();
+            unsafe { libc::close(kq) };
+            return Err(e);
+        }
+        Ok(Self { kq })
+    }
+
+    /// Block until the next device reset (or `timeout`, if given); returns the
+    /// device's reset generation, or None on timeout.
+    pub fn wait(&self, timeout: Option<std::time::Duration>) -> io::Result<Option<u64>> {
+        let ts = timeout.map(|t| libc::timespec {
+            tv_sec: t.as_secs() as libc::time_t,
+            tv_nsec: t.subsec_nanos() as libc::c_long,
+        });
+        let tsp = ts.as_ref().map_or(std::ptr::null(), |t| t as *const libc::timespec);
+        let mut ev: libc::kevent = unsafe { std::mem::zeroed() };
+        loop {
+            let r = unsafe { libc::kevent(self.kq, std::ptr::null(), 0, &mut ev, 1, tsp) };
+            if r < 0 {
+                let e = io::Error::last_os_error();
+                if e.kind() == io::ErrorKind::Interrupted { continue; }
+                return Err(e);
+            }
+            if r == 0 { return Ok(None); }
+            if ev.fflags & NOTE_RESET != 0 { return Ok(Some(ev.data as u64)); }
+        }
+    }
+}
+
+impl Drop for ResetWatch { fn drop(&mut self) { unsafe { libc::close(self.kq) }; } }
 
 impl Drop for Display { fn drop(&mut self) { unsafe { libc::close(self.fd) }; } }
 

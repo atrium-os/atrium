@@ -686,6 +686,7 @@ struct atrium_amd_softc {
 	 * Device-reset coordination (owned by the base): each IP module registers a
 	 * prepare/restore pair so a device-wide FLR quiesces + re-inits every block.
 	 */
+	uint64_t	 reset_gen;	/* device resets (FLRs) since attach; base reset.c */
 	struct atrium_amd_reset_hooks reset_hooks[ATRIUM_AMD_IP_COUNT];
 	int		 display_vblank_armed;	/* display module: mode set + vblank IRQ on */
 
@@ -706,7 +707,9 @@ struct atrium_amd_softc {
 		uint64_t	 size;
 		uint32_t	 pitch;
 		uint32_t	 format;
+		uint64_t	 reset_gen;	/* sc->reset_gen when committed */
 	} display_on_screen, display_next;
+	int		 display_content_lost;	/* STATUS_CONTENT_LOST */
 	int		 display_next_state;	/* 0 none, 1 waiting on in-fence, 2 flipped */
 	int		 display_next_vsync;
 	uint64_t	 display_flips_landed;	/* commits that reached the screen */

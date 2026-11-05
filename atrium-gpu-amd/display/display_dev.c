@@ -290,6 +290,9 @@ display_landed(struct atrium_amd_softc *sc)
 	display_park(sc, sc->display_on_screen.bo_fp);
 	sc->display_on_screen = sc->display_next;
 	sc->display_flips_landed++;
+	/* A frame rendered after the last reset repaints the screen. */
+	if (sc->display_on_screen.reset_gen == sc->reset_gen)
+		sc->display_content_lost = 0;
 	memset(&sc->display_next, 0, sizeof(sc->display_next));
 	sc->display_next_state = 0;
 	display_drop_in(sc);
@@ -453,6 +456,8 @@ display_commit(struct atrium_amd_softc *sc, struct atrium_display_commit *c,
 		goto out;	/* the fds resolve and the BO is scannable */
 
 	fb.bo_fp = bo_fp;
+	fb.reset_gen = sc->reset_gen;	/* unlocked read: a racing reset only
+					 * makes this frame count as stale */
 	fb.vram_offset = off;
 	fb.size = size;
 	fb.pitch = c->pitch;
@@ -723,13 +728,29 @@ display_filt_detach(struct knote *kn)
 	mtx_unlock(&sc->lock);
 }
 
+/* KNOTE hint for a device reset (any real vblank hint is a small count). */
+#define DISPLAY_HINT_RESET	LONG_MIN
+
 static int
 display_filt_vblank(struct knote *kn, long hint)
 {
+	struct atrium_amd_softc *sc = kn->kn_hook;
+	int reset_only = (kn->kn_sfflags & ATRIUM_DISPLAY_NOTE_RESET) != 0;
+
 	/* Called under sc->lock (the knlist lock) by KNOTE_LOCKED / the kqueue
-	 * scan. hint = vblanks this interrupt drained (0 on a bare readiness scan). */
-	if (hint != 0)
+	 * scan. hint = vblanks this interrupt drained (0 on a bare readiness
+	 * scan), or DISPLAY_HINT_RESET from the reset restore hook. EV_CLEAR
+	 * zeroes kn_data and kn_fflags after each delivery. */
+	if (hint == DISPLAY_HINT_RESET) {
+		kn->kn_fflags |= ATRIUM_DISPLAY_NOTE_RESET;
+		if (reset_only)
+			kn->kn_data = (int64_t)sc->reset_gen;
+		else
+			kn->kn_data += 1;
+	} else if (hint != 0 && !reset_only)
 		kn->kn_data += hint;
+	if (reset_only)
+		return ((kn->kn_fflags & ATRIUM_DISPLAY_NOTE_RESET) != 0);
 	return (kn->kn_data != 0);
 }
 
@@ -774,7 +795,7 @@ amd_display_reset_prepare(struct atrium_amd_softc *sc)
  * was in flight when the FLR hit was lost with the hardware queue; count it as
  * landed, since its buffer is the newest one the compositor gave us. The
  * buffer's contents were in VRAM the FLR may have wiped; the compositor's next
- * commit repaints them. (The NOTE_RESET kqueue event is a follow-up.)
+ * commit repaints them; NOTE_RESET and STATUS_CONTENT_LOST tell it to.
  */
 static void
 amd_display_reset_restore(struct atrium_amd_softc *sc)
@@ -783,6 +804,13 @@ amd_display_reset_restore(struct atrium_amd_softc *sc)
 	if (sc->display_next_state == 2)
 		display_landed(sc);
 	display_frames_rebase(sc);
+	/*
+	 * VRAM may not have survived the FLR (§10.3): whatever we re-apply below
+	 * may be garbage until the holder commits a fresh frame. Say so in STATUS
+	 * and wake the holder's NOTE_RESET (and vblank) knotes.
+	 */
+	sc->display_content_lost = 1;
+	KNOTE_LOCKED(&sc->display_sel.si_note, DISPLAY_HINT_RESET);
 	if (sc->display_mode_set && sc->display_on_screen.bo_fp != NULL) {
 		display_program_surface(sc, &sc->display_on_screen, 1);
 		display_set_mode(sc);
@@ -837,7 +865,8 @@ display_kqfilter(struct cdev *cdev, struct knote *kn)
 {
 	struct atrium_amd_softc *sc = display_softc(cdev);
 
-	if (kn->kn_filter != EVFILT_READ)
+	if (kn->kn_filter != EVFILT_READ ||
+	    (kn->kn_sfflags & ~ATRIUM_DISPLAY_NOTE_RESET) != 0)
 		return (EINVAL);
 	kn->kn_fop = &display_vblank_filtops;
 	kn->kn_hook = sc;
@@ -885,7 +914,9 @@ display_ioctl(struct cdev *cdev, u_long cmd, caddr_t data, int fflag,
 		display_reap(sc);	/* also the poll-mode (no MSI-X) path */
 		st->out_flags = (sc->display_next_state != 0 ?
 		    ATRIUM_DISPLAY_STATUS_COMMIT_PENDING : 0) |
-		    (sc->display_mode_set ? ATRIUM_DISPLAY_STATUS_MODE_SET : 0);
+		    (sc->display_mode_set ? ATRIUM_DISPLAY_STATUS_MODE_SET : 0) |
+		    (sc->display_content_lost ?
+		    ATRIUM_DISPLAY_STATUS_CONTENT_LOST : 0);
 		st->out_vblank_count = display_frames(sc);
 		st->out_flips_done = sc->display_flips_landed;
 		st->out_dropped_flips = amd_mmio_read32(sc, regDISP_DROPPED_FLIPS);

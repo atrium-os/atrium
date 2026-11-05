@@ -76,6 +76,9 @@ amd_device_reset(struct atrium_amd_softc *sc)
 			hooks[i].prepare(sc);
 
 	err = amd_flr(sc);
+	mtx_lock(&sc->lock);
+	sc->reset_gen++;	/* the restore hooks report the new generation */
+	mtx_unlock(&sc->lock);
 	/* The FLR forgot the IH ring; give it back before any block restarts. */
 	if (sc->ih_kva != NULL)
 		amd_ih_rearm(sc);

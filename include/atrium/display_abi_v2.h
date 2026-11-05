@@ -118,6 +118,21 @@ struct atrium_display_commit {
 /* STATUS flags. */
 #define ATRIUM_DISPLAY_STATUS_COMMIT_PENDING	0x1u  /* a commit hasn't reached the screen yet */
 #define ATRIUM_DISPLAY_STATUS_MODE_SET		0x2u  /* the CRTC is lit */
+#define ATRIUM_DISPLAY_STATUS_CONTENT_LOST	0x4u  /* a device reset (GPU ABI v2.1
+						 * §10.3) may have wiped what is on
+						 * screen; cleared when a commit made
+						 * after the reset reaches the screen */
+
+/*
+ * kqueue fflags on EVFILT_READ (GPU ABI v2.1 §10.3). Register with
+ * fflags = ATRIUM_DISPLAY_NOTE_RESET for a reset-only event: it fires once per
+ * device reset, with data = the device's reset generation, and never for a
+ * vblank. A plain vblank registration (fflags 0) also sees NOTE_RESET in the
+ * returned fflags when a reset happened since its last event. Either way the
+ * holder should re-render and commit: VRAM, the on-screen buffer included,
+ * may not have survived.
+ */
+#define ATRIUM_DISPLAY_NOTE_RESET		0x1u
 
 /* STATUS: refresh and flip telemetry for frame pacing and tests. */
 struct atrium_display_status_v2 {
