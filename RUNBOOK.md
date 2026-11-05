@@ -5276,7 +5276,10 @@ dev.atrium_gpu_amd_display.0.sim_plug_at=N:MODE` plugs output N (0–3; MODE
 as above plus 4 a 1440p office monitor, 5 a twin of the desktop monitor; -1
 unplugs), and `sim_bw_budget_khz` sets the display's pixel-rate budget
 (default 2400000). `display_multi` holds ~110 MB of VRAM until it exits and
-the device doesn't reuse VRAM across clients yet, so give it its own boot. After changing gpusim's QEMU device, copy `qemu-device/gpusim.c`
+the device doesn't reuse VRAM across clients yet, so give it its own boot.
+With Forum running: `forum-ctl outputs` lists the monitors and where they
+sit, `forum-ctl arrange 1 left-of 0` moves one, `forum-ctl move-monitor`
+sends the focused window to the next monitor (Super+Shift+Right). After changing gpusim's QEMU device, copy `qemu-device/gpusim.c`
 into the QEMU fork and rebuild it, then restart the VM and gpusim-server. Don't
 `kldunload` the GPU modules while frescod or a renderer runs; reboot.
 

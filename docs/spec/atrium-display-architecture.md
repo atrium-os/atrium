@@ -323,7 +323,17 @@ the 2.x ioctls act on output 0.
   the bandwidth runs short the refused output steps down to its next mode,
   the same choice every time, and stays dark only if none fits, with the
   reason logged. With several monitors the gpu renderer gives way to
-  Tier-2. Forum's display sets, window rescue and per-monitor scale are next.
+  Tier-2. `OP_WM_OUTPUTS` tells the WM where each monitor sits;
+  `OP_WM_ARRANGE_OUTPUTS` moves them (checked, then remembered for that set
+  of monitors).
+- **Policy: Forum.** Each monitor is laid out on its own: chrome, bar and
+  dock on the primary (the top-left monitor), each window on its home
+  monitor, zoom / split / snap per monitor. A window's home is where it
+  opened (the monitor of the window you were working in) or where it was
+  sent (Super+Shift+Right, `forum-ctl move-monitor`). If its monitor
+  leaves, the window shows on the primary; when the monitor comes back, on
+  any output, the window goes back. Not yet: per-monitor scale, and keeping
+  arrangements across a frescod restart.
 
 ## 8. The output topology — connectors, encoders, PHYs (HDMI / DP / USB-C)
 
