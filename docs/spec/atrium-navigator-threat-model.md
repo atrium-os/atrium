@@ -531,6 +531,25 @@ source of browser RCE.
   something does. Transforms are not in the painted size: a `scale(2)` ancestor
   under-samples by 2. SVG is still not decoded.
 
+**Images after the first display (2026-11-05, legacy-web §5.4.5.7).** The first
+artifact no longer waits for its images: it names each one `pending`, with no address,
+and an images artifact (`atrium-navigator-images/1`) follows. Nothing in this section
+changes because of that:
+- *Where they decode.* Still only in the document's worker, through the same
+  `Request::Image`, at the painted size, against the same per-document budget.
+- *What may be asked for.* The broker's image bound (`Carried`) is the first
+  document's until an images artifact arrives, so before it no image address is named
+  and every request is refused. After it, the bound is the MERGED recording's (the
+  first document with that images block), built from bytes the broker was handed.
+- *Binding.* An images artifact is bound to the first document by the BLAKE3 of its
+  bytes, and refused for another document, after the complete one, after a swap
+  replaced the first document, or when it calls itself complete with an image still
+  pending. Every entry is checked (a `src` once, dimensions `null` or `u32`, an
+  address empty or `blake3:<64 hex>`), and the merged recording is ingested again.
+- *What the broker parses.* JSON: the converter's envelope and the images block, as
+  `compose` already did for tables. Never HTML: the document does not change, and the
+  worker is not told.
+
 **Rating now: low.** What stays open: SVG; the transient natural frame (DCT scaling or
 row streaming); re-decode on zoom; and the third-party image residual above.
 

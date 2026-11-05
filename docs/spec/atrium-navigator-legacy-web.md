@@ -1745,11 +1745,104 @@ of the matches, in the same order, so the output cannot change, and it does not:
 - The warm "after" row above predates this index, so the warm first display is better
   than the table says by an amount not yet measured on a quiet machine.
 
+**Then built, cut 1: a first display that does not wait for images** (2026-11-05).
+- *Converter* (`subresource::collect_first`, `Stage::Images`). The first artifact
+  fetches the document's stylesheets and no image. Each `<img>` is written `pending`:
+  - `declared`: the page gives both `width` and `height`, and the box is that size;
+  - `placeholder`: it does not. No natural size is claimed (`null`, ratio `none`), so
+    the box is what the page's CSS makes it, else the default object size, 300 × 150.
+    The image is not dropped, as the normalizer drops an image it has no entry for,
+    because then its arrival would insert a box.
+- *The images artifact* (`atrium-navigator-images/1`, `IMAGES` frames). The images are
+  then fetched (fetchd already has them hinted), before any script is fetched, so the
+  scripted conversion finds every one in the memo and is no later than before.
+  - Each frame is bound to the first artifact by the BLAKE3 of its bytes and carries
+    the whole images block so far. Partial frames go at most every 250 ms, at most 32,
+    then one complete frame. A page with nothing pending sends none.
+  - `artifact::merge_images` splices the block into the first artifact. For the
+    complete frame that is, byte for byte, the first artifact a conversion that waited
+    for its images writes. The driver writes it (`<stem>.first-images.json`), and fails
+    a conversion that ended with an image pending and no complete frame.
+- *Broker* (`Images`, `ImagesAttached { arrived, resized, complete }`;
+  `progressive::FirstImages`; backend spec "Images after the first display").
+  - The session's recording becomes the merged one, so what it carries names the
+    arrived addresses, and only then may their pixels be asked for. Decoding is
+    unchanged: the per-document worker, the painted size, the per-document budget.
+  - `resized` lists the boxes that may change. Empty, the pixels fill boxes already
+    laid out. Otherwise the UI lays out again at an idle moment at the reader's anchor
+    (the element mechanism of step 2: on an unchanged document, the same element at
+    the same offset), in one frame.
+  - Refused: another document's images, any after the complete one or after a swap,
+    a "complete" frame with an image still pending, and a malformed entry.
+- *Layout shift, measured* (`examples/layout_shift.rs`: the first artifact and the
+  merged one, normalized and rendered at 800 × 600, text runs matched in order, a run
+  moved if its origin moved more than half a pixel; warm run, all 92 pages with an
+  image pending). 3,468 images were pending: 2,055 declared and 1,413 placeholders.
+  2,353 arrived at a sizing different from the one shown, or failed.
+
+  | pages | any text moved | text in the first screen moved | worst |
+  |---|---|---|---|
+  | 19 whose pending images were all declared | 1 (edX, below the first screen) | **0** | — |
+  | 73 with a placeholder | 50 | 18 | bbcgoodfood: 12 of 33 first-screen runs, up to 511 px |
+
+  - Declared sizes hold. A declared box changes only where the page's CSS takes the
+    height from the image's own ratio (`height: auto`) and the real ratio differs;
+    that happened once, below the fold.
+  - The text-run shift score (moved runs' area in the first screen, before ∪ after,
+    times the largest move as a share of its height) is at most 0.050, and 0.045 or
+    less on every other page. It counts text, not element boxes, so it understates CLS
+    as a browser computes it; read it as a ranking.
+  - The 18 first-screen shifts happen once, when the images arrive, while the reader
+    is at the top: cold, a median 0.6–1.8 s after the first display (per run), and at
+    p90 5.5–6.2 s.
+- *Kept* (warm, offline, all 122, against the 05e8d960 binary): whole recordings
+  identical **122/122**; first plus complete images identical to the first artifact
+  that waited **122/122** (the raw first artifact differs on exactly the 92 with an
+  image pending); readable and transitions parts identical 122/122; two runs identical
+  in every part, 122/122 (images artifacts 92/92); the same blob sets. Suites:
+  converter 414, backend 226, renderer 152, normalizer 72, fetch 32 tests, all passing.
+
+**Re-measured, cut 1** (ms; the same 122 pages, method and machine). The network
+differs from the morning's, so each new arm ran beside a base arm (the 05e8d960
+binary). The order was base, new, new, base, batch by batch, and both pairs are given.
+None timed out, and fetch failures were in the usual range (54–415 per arm).
+
+| arm | what the reader first sees | p50 | p90 | p99 | under 1 s | from main-document arrival p50 / p90 / p99 | under 1 s |
+|---|---|---|---|---|---|---|---|
+| cold, base (steps 2 + 4), pair 1 | FIRST, with images | 3,683 | 10,420 | 21,791 | 2% | 2,702 / 7,395 / 20,265 | 11% |
+| **cold, cut 1, pair 1** | **FIRST, images pending** | **2,581** | **7,054** | **13,289** | 7% | **1,638 / 4,715 / 7,792** | **23%** |
+| · the same, all its images in | | 3,602 | 10,612 | 22,656 | 4% | 2,501 / 7,070 / 15,059 | 15% |
+| **cold, cut 1, pair 2** | **FIRST, images pending** | **2,668** | **6,215** | **12,530** | 7% | **1,582 / 3,956 / 7,151** | **26%** |
+| cold, base, pair 2 | FIRST, with images | 3,643 | 10,635 | 23,698 | 3% | 2,546 / 6,681 / 22,563 | 19% |
+| cold, scripted document (readable), base / cut 1 | readable | | | | | 4,590 / 17,282 / 48,133 ; 4,492 / 17,229 / 39,941 | |
+| warm, base | FIRST | 1,325 | 3,833 | 10,636 | 36% | 256 / 2,100 / 4,131 | 80% |
+| warm, cut 1 | FIRST | 1,295 | 3,829 | 10,607 | 37% | 258 / 2,149 / 4,115 | 80% |
+
+- *Cold.* From the main document's arrival, p90 falls 7.4 s → 4.7 s (pair 1) and
+  6.7 s → 4.0 s (pair 2), and p99 falls about 20 s → 7–8 s. Under 1 s goes 11% → 23% and
+  19% → 26%. corriere's first display is no longer the slowest: the cold maximum went
+  from 25 s to 13–15 s (spiegel.de, 11.5 s from arrival, is now the slowest). The scripted document is not later (p90 17.2 vs 17.3 s); it
+  waited for the images before, and still does.
+- *All images in* lands where the first display used to be (p90 7.1 vs 7.4 s). Images
+  now arrive into a page the reader already has.
+- *Warm* is unchanged, as it should be: offline, images cost milliseconds. Warm under
+  1 s from arrival is now 80% (74% this morning). That is the rule index (1ee0c748),
+  which the morning's warm row predates, measured on a quiet machine.
+- *The goal is still not met.* Cold, 23–26% of pages show something within 1 s of
+  their main document. What is left is the stylesheets, which the first display does
+  wait for, and normalize.
+- Data: `~/src/navigator-corpus/ttfd-images-2026-11-05/` (`final.sh` reproduces the
+  table, `check.py` the identities, `shift-warm-new.tsv` the layout shift, `bin.sha256`
+  the binaries). The first timing run stopped at 21:20 when the session's process
+  exited. Its unfinished batch 2 of pair 2 was re-run into fresh directories (`*-2r`),
+  and the partial one is not read.
+
 **Open, and the next cuts, in order of what they would move.**
-1. **A first artifact that does not wait for images.** Cold, this is 75% of what is
-   left. Image sizes come from attributes where the page gives them; otherwise a box
-   whose size arrives with the readable artifact. The images themselves follow, so the
-   swap of step 2 carries them.
+1. **Stylesheets.** Cold, they are now what a first display waits for. Next: fetch a
+   page's sheets ahead of its body's other subresources (they already lead the hints),
+   HTTP/2 to their origins, and a stylesheet cache across conversions. The
+   placeholder shift (18 pages in the first screen) is the price of not waiting; a
+   page that wants none declares its images' sizes.
 2. **Normalize**, the warm remainder: profile after the index, then the
    declaration-expansion path.
 3. **More concurrency per origin than six HTTP/1.1 connections** (HTTP/2), and DNS

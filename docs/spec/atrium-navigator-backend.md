@@ -478,6 +478,24 @@ anchor mapping and the digest binding live in `progressive.rs`; both hosts imple
 them, the jailed one over the worker wire (`UPGR`, `SWAP`, `ATCH`), with the broker
 keeping its own copy of what it staged so what a session carries follows what it shows.
 
+**Images after the first display (2026-11-05).** The first document is shown before its
+images are fetched: each `<img>` is `pending` in its recording, sized from the page's
+own `width` and `height` (`declared`), or claiming no natural size (`placeholder`: the
+box is what the page's CSS makes it, else 300 × 150). `Images { session, images }`
+hands the broker an images artifact as they arrive: bound to the first document by
+digest, carrying the whole images list so far, partial at most every 250 ms, then
+complete. The answer is `ImagesAttached { arrived, resized, complete }`. `arrived` are
+the addresses the session's recording now names, so their pixels may be asked for.
+`resized` are the `src`s whose box may change: their natural size differs from the one
+the shown layout used, or they failed and are gone. With `resized` empty the pixels
+fill boxes already laid out, and nothing moves. Otherwise the UI lays the document out
+again at an idle moment at the reader's anchor, which on an unchanged document is the
+same element at the same offset, and presents it in one frame, as for a swap. What the
+session carries, and what the store keeps, becomes the merged recording. Both hosts
+implement it on the broker's side only (`progressive::FirstImages`); the worker's
+document does not change. Refused: another document's images, any after the complete
+one or after a swap, and a "complete" one with an image still pending.
+
 `Image { session, address }` asks for one image's pixels. The broker checks that the
 recording names the address and reads the blob from its store. The document's worker
 decodes it, and the broker validates the RGBA8 buffer before it becomes
