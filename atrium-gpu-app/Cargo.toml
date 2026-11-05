@@ -1,0 +1,13 @@
+[package]
+name        = "atrium-gpu-app"
+version     = "0.1.0"
+edition     = "2021"
+license     = "MIT OR Apache-2.0"
+publish     = false
+description = "The broker side of the app GPU path (F6, docs/spec/gpu-app-path-f6.md): validates app code headers and dispatch records and builds every PM4 packet itself."
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+atrium-rdna4-cmd = { path = "../atrium-rdna4-cmd" }
