@@ -19,6 +19,11 @@ pub trait Fetcher {
     }
     /// Bytes actually pulled over the wire, for the report.
     fn bytes_fetched(&self) -> u64 { 0 }
+    /// ★ The converter is about to ask for `url` (legacy-web §5.4.5.7, step
+    /// 4): a fetcher that can fetch in parallel starts it now. Nothing is
+    /// answered, nothing is charged here; the request, when it comes, is the
+    /// same request as before. Ignored by default.
+    fn hint(&mut self, _url: &str) {}
 }
 
 /// A fetcher that fetches nothing — the default for tests, so no test can
@@ -211,6 +216,8 @@ pub struct FetchdFetcher {
     prefix: &'static str,
     bytes: u64,
     pub requests: u64,
+    /// Hints passed on (`send_hint`).
+    pub hints: u64,
     /// Set once the stream is out of step; every later request fails fast
     /// instead of reading another request's bytes as its own.
     broken: Option<String>,
@@ -251,7 +258,7 @@ impl FetchdFetcher {
         let stdin: Box<dyn std::io::Write> = Box::new(child.stdin.take().expect("piped"));
         let stdout: Box<dyn std::io::Read> = Box::new(child.stdout.take().expect("piped"));
         Ok(FetchdFetcher { child: Some(child), stdin: Some(stdin), stdout: std::io::BufReader::new(stdout),
-                           prefix: "", bytes: 0, requests: 0, broken: None })
+                           prefix: "", bytes: 0, requests: 0, hints: 0, broken: None })
     }
 
     /// The same protocol over descriptors this process already holds — the
@@ -259,7 +266,7 @@ impl FetchdFetcher {
     /// (replies). Its parent relays each request to a real fetchd.
     pub fn over(w: Box<dyn std::io::Write>, r: Box<dyn std::io::Read>, prefix: &'static str) -> Self {
         FetchdFetcher { child: None, stdin: Some(w), stdout: std::io::BufReader::new(r),
-                        prefix, bytes: 0, requests: 0, broken: None }
+                        prefix, bytes: 0, requests: 0, hints: 0, broken: None }
     }
 
     fn fail<T>(&mut self, why: String) -> Result<T, String> {
@@ -325,7 +332,34 @@ pub fn read_line_bounded(r: &mut impl std::io::BufRead, max: usize) -> Result<Op
     }
 }
 
+impl FetchdFetcher {
+    /// Tell fetchd the most its hints may pull: `B <bytes>`, no answer.
+    pub fn send_budget(&mut self, bytes: u64) {
+        use std::io::Write;
+        if self.broken.is_some() { return }
+        if let Some(stdin) = self.stdin.as_mut() {
+            if write!(stdin, "B {bytes}\n").and_then(|_| stdin.flush()).is_err() {
+                self.broken = Some("fetcher went away".into());
+            }
+        }
+    }
+
+    /// Pass a hint on: `H <url>`, no answer (fetchd's prefetcher). A URL
+    /// with a line break, or a fetcher already out of step, is not hinted.
+    pub fn send_hint(&mut self, url: &str) {
+        use std::io::Write;
+        if self.broken.is_some() || url.contains(['\n', '\r']) { return }
+        if let Some(stdin) = self.stdin.as_mut() {
+            if write!(stdin, "H {url}\n").and_then(|_| stdin.flush()).is_err() {
+                self.broken = Some("fetcher went away".into());
+            }
+        }
+        self.hints += 1;
+    }
+}
+
 impl Fetcher for FetchdFetcher {
+    fn hint(&mut self, url: &str) { self.send_hint(url) }
     fn get(&mut self, url: &str) -> Result<String, String> {
         crate::timing::fetch(|| self.get_raw(url), |b| b.len() as u64).map(|b| String::from_utf8_lossy(&b).into_owned())
     }
@@ -432,6 +466,7 @@ impl FetchBudget {
 pub struct SharedFetcher(pub std::rc::Rc<std::cell::RefCell<FetchdFetcher>>);
 impl Fetcher for SharedFetcher {
     fn get(&mut self, url: &str) -> Result<String, String> { self.0.borrow_mut().get(url) }
+    fn hint(&mut self, url: &str) { self.0.borrow_mut().hint(url) }
     fn get_bytes(&mut self, url: &str) -> Result<Vec<u8>, String> { self.0.borrow_mut().get_bytes(url) }
     fn bytes_fetched(&self) -> u64 { self.0.borrow().bytes_fetched() }
 }

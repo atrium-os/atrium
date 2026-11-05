@@ -44,3 +44,39 @@ fn it_is_reproducible() {
     let p = TierPolicy::default();
     assert_eq!(artifact::emit(Some("https://a.example/"), &a, &p), artifact::emit(Some("https://a.example/"), &b, &p));
 }
+
+/// ★ Step 4's hints: every stylesheet, image and script of the parsed
+/// document, each once, before the first fetch — in the order the
+/// conversion needs them.
+#[derive(Default)]
+struct Hinted { hints: Vec<String>, asked: Vec<String> }
+impl Fetcher for Hinted {
+    fn get(&mut self, url: &str) -> Result<String, String> { self.asked.push(url.into()); Err("404".into()) }
+    fn hint(&mut self, url: &str) { assert!(self.asked.is_empty(), "hint after a fetch: {url}"); self.hints.push(url.into()) }
+}
+
+const NAMES: &str = r#"<html><head><script src="/a.js"></script><link rel=stylesheet href="/s.css">
+<link rel=icon href="/i.ico"></head><body><img src="/p.png"><img src="/p.png"><img src="data:x">
+<script src="https://cdn.example/b.js"></script></body></html>"#;
+
+#[test]
+fn a_tier_one_conversion_hints_sheets_and_images_only() {
+    let mut f = Hinted::default();
+    convert_tier1(NAMES, Some("https://a.example/"), &mut f);
+    assert_eq!(f.hints, vec!["https://a.example/s.css", "https://a.example/p.png"]);
+}
+
+#[test]
+fn a_scripted_conversion_hints_scripts_before_images() {
+    let mut f = Hinted::default();
+    navigator_prerender::convert_with(NAMES, Some("https://a.example/"), &mut navigator_prerender::boa_impl::BoaEngine::default(), &mut f);
+    assert_eq!(f.hints, vec!["https://a.example/s.css", "https://a.example/a.js", "https://cdn.example/b.js", "https://a.example/p.png"]);
+}
+
+#[test]
+fn a_progressive_conversion_hints_once_for_both_in_first_display_order() {
+    let mut f = Hinted::default();
+    let mut eng = navigator_prerender::boa_impl::BoaEngine::default();
+    navigator_prerender::convert_progressive(NAMES, Some("https://a.example/"), &mut eng, &mut f, false, &mut |_, _| {});
+    assert_eq!(f.hints, vec!["https://a.example/s.css", "https://a.example/p.png", "https://a.example/a.js", "https://cdn.example/b.js"]);
+}

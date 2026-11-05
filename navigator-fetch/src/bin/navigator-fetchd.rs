@@ -18,16 +18,42 @@
 //! Output frame per URL: `ok <status> <redirects> <body-len> <final-url>\n`
 //! then exactly body-len bytes; or `err <reason>\n`.
 //!
+//! `H <url>` is a hint, answered with nothing: the URL is fetched on a pool
+//! (`--workers N`, default 6; `0` ignores hints) and kept until asked for.
+//! Connections are kept and reused per origin (`--no-reuse`: one per
+//! request, as before). See `navigator_fetch::serve` and `prefetch`.
+//!
 //! ★ It enters capability mode BEFORE reading its first request, so no URL a
 //! caller sends is ever handled by a process that can open a file.
 
-use navigator_fetch::{addr::Policy, fetch, tls_config, Conversation};
-use std::io::{BufRead, Write};
+use navigator_fetch::{addr::Policy, tls_config, Conversation};
+#[cfg(target_os = "freebsd")]
+use navigator_fetch::fetch;
 
+/// ★ Off FreeBSD there is no Capsicum, so there is no sandboxed fetcher:
+/// it refuses, unless asked by name for what it then is — the same serve
+/// loop, protocol, address rule and pins, with NO sandbox — for measuring
+/// the real fetch path on a developer's machine (legacy-web §5.4.5.7).
 #[cfg(not(target_os = "freebsd"))]
 fn main() {
-    eprintln!("navigator-fetchd runs sandboxed only on FreeBSD (Capsicum); the library's fetch() is portable");
-    std::process::exit(2);
+    let args: Vec<String> = std::env::args().collect();
+    if !args.iter().any(|a| a == "--unconfined-for-testing") {
+        eprintln!("navigator-fetchd runs sandboxed only on FreeBSD (Capsicum); the library's fetch() is portable \
+                   (--unconfined-for-testing serves without a sandbox)");
+        std::process::exit(2);
+    }
+    let trust = args.iter().position(|a| a == "--trust").and_then(|i| args.get(i + 1).cloned())
+        .unwrap_or_else(|| "/etc/ssl/cert.pem".into());
+    let mut policy = Policy::from_env();
+    if args.iter().any(|a| a == "--grant-private-network") { policy.grant_private_network = true }
+    let tls = match std::fs::read(&trust).map_err(|e| e.to_string()).and_then(|p| tls_config(&p)) {
+        Ok(t) => t,
+        Err(e) => { eprintln!("navigator-fetchd: {trust}: {e}"); std::process::exit(1) }
+    };
+    eprintln!("navigator-fetchd: ★ UNCONFINED, for testing: no sandbox");
+    let (workers, reuse) = navigator_fetch::serve_options(&args);
+    let conv = Conversation::new(&navigator_fetch::Direct, tls, policy).with_reuse(reuse);
+    navigator_fetch::serve(&conv, workers, std::io::stdin().lock(), std::io::stdout().lock(), &mut |_| {});
 }
 
 #[cfg(target_os = "freebsd")]
@@ -80,32 +106,26 @@ fn main() {
         std::process::exit(1);
     }
 
-    if gate { std::process::exit(run_gate(&net, &tls, &trust, before)) }
-
-    let stdin = std::io::stdin();
-    let mut out = std::io::stdout().lock();
-    let mut conv = Conversation::new(&net, tls.clone(), policy);
-    for line in stdin.lock().lines() {
-        let Ok(url) = line else { break };
-        let url = url.trim();
-        if url.is_empty() { continue }
-        // The gate, on request, from the serving process itself — so it can
-        // be run where the fetcher actually runs (a jail launches the entry
-        // with no arguments).
-        if url == "--gate" { let _ = out.flush(); run_gate(&net, &tls, &trust, before); continue }
-        match conv.fetch(url) {
-            Ok(f) => {
-                let _ = writeln!(out, "ok {} {} {} {}", f.response.status, f.redirects, f.response.body.len(), f.url);
-                let _ = out.write_all(&f.response.body);
-            }
-            Err(e) => { let _ = writeln!(out, "err {e}"); }
-        }
-        let _ = out.flush();
-    }
+    // ★ Requests in parallel (legacy-web §5.4.5.7, step 4): `H <url>` is a
+    // HINT — the converter is about to ask for it — fetched on a bounded
+    // pool (`--workers N`, default 6; 0 turns hints off) with connections
+    // kept and reused per origin (`--no-reuse` turns that off). A plain URL
+    // line is a request, answered in order, as always. Casper's channel is
+    // used by one thread at a time (`Locked`); the address rule and the pins
+    // are the one Conversation's, shared by every worker.
+    let (workers, reuse) = navigator_fetch::serve_options(&args);
+    let locked = navigator_fetch::Locked(std::sync::Mutex::new(net));
+    if gate { std::process::exit(run_gate(&locked, &tls, &trust, before)) }
+    let conv = Conversation::new(&locked, tls.clone(), policy).with_reuse(reuse);
+    // The gate, on request, from the serving process itself — so it can be
+    // run where the fetcher actually runs (a jail launches the entry with no
+    // arguments).
+    navigator_fetch::serve(&conv, workers, std::io::stdin().lock(), std::io::stdout().lock(),
+        &mut |_| { run_gate(&locked, &tls, &trust, before); });
 }
 
 #[cfg(target_os = "freebsd")]
-fn run_gate(net: &navigator_fetch::sandbox::Net, tls: &std::sync::Arc<rustls::ClientConfig>, trust: &str, before: bool) -> i32 {
+fn run_gate(net: &navigator_fetch::Locked<navigator_fetch::sandbox::Net>, tls: &std::sync::Arc<rustls::ClientConfig>, trust: &str, before: bool) -> i32 {
     use std::ffi::CString;
     let mut fails = 0;
     let mut row = |what: &str, ok: bool, detail: String| {
@@ -143,7 +163,7 @@ fn run_gate(net: &navigator_fetch::sandbox::Net, tls: &std::sync::Arc<rustls::Cl
     let de = direct.as_ref().err().and_then(|e| e.raw_os_error()).unwrap_or(0);
     row("direct connect() refused with ECAPMODE", direct.is_err() && de == libc::ECAPMODE, format!("errno={de}"));
     // Through casper, an address it did not resolve is refused (CONNECTDNS).
-    let r = net.connect_unresolved("1.1.1.1:443".parse().unwrap());
+    let r = net.0.lock().unwrap().connect_unresolved("1.1.1.1:443".parse().unwrap());
     row("casper refuses an address it did not resolve", r.is_err(), format!("{:?}", r.err().map(|e| e.to_string())));
 
     // And what the fetcher IS for still works.
@@ -154,7 +174,7 @@ fn run_gate(net: &navigator_fetch::sandbox::Net, tls: &std::sync::Arc<rustls::Cl
     }
     // Casper's OWN limit, not just ours: ask it to resolve on a port it was
     // never allowed.
-    let r = net.resolve("example.com", 8443);
+    let r = net.0.lock().unwrap().resolve("example.com", 8443);
     row("casper refuses to resolve on a port outside its limit", r.is_err(), format!("{:?}", r.err().map(|e| e.to_string())));
     match fetch(net, tls, "https://example.com:8443/") {
         Err(navigator_fetch::FetchError::Refused(r)) => row("port outside 80/443 refused before connecting", true, r),

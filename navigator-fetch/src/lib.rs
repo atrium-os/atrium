@@ -8,9 +8,11 @@
 
 pub mod addr;
 pub mod http;
+pub mod prefetch;
 #[cfg(target_os = "freebsd")]
 pub mod sandbox;
 
+#[cfg(test)]
 use std::io::{Read, Write};
 use std::collections::{BTreeSet, HashMap};
 use std::net::{IpAddr, SocketAddr, TcpStream};
@@ -107,7 +109,7 @@ pub fn tls_config(pem: &[u8]) -> Result<Arc<rustls::ClientConfig>, String> {
 }
 
 /// One-shot: a fresh conversation for a single URL. Pins nothing beyond it.
-pub fn fetch(net: &dyn Connect, tls: &Arc<rustls::ClientConfig>, url: &str) -> Result<Fetched, FetchError> {
+pub fn fetch(net: &(dyn Connect + Sync), tls: &Arc<rustls::ClientConfig>, url: &str) -> Result<Fetched, FetchError> {
     Conversation::new(net, tls.clone(), addr::Policy::default()).fetch(url)
 }
 
@@ -121,37 +123,80 @@ pub fn fetch(net: &dyn Connect, tls: &Arc<rustls::ClientConfig>, url: &str) -> R
 /// 127.0.0.1 next gets the second answer refused twice over: by the range
 /// check, and — were the private network granted — by the pin.
 pub struct Conversation<'a> {
-    net: &'a dyn Connect,
+    net: &'a (dyn Connect + Sync),
     tls: Arc<rustls::ClientConfig>,
     policy: addr::Policy,
-    /// (host, port) → the checked addresses to connect to.
+    /// ★ Shared by every SIBLING of this conversation (`sibling`): the pins
+    /// (§2.1 — one conversation, one answer per name, whichever thread asked
+    /// first) and the idle connections. Concurrency must not become a way
+    /// to get two answers for one name.
+    shared: Arc<std::sync::Mutex<Shared>>,
+    /// Keep connections open and reuse them (legacy-web §5.4.5.7, step 4).
+    reuse: bool,
+}
+
+#[derive(Default)]
+struct Shared {
     pins: HashMap<(String, u16), Vec<SocketAddr>>,
-    /// host → every IP pinned for it on any port.
     hosts: HashMap<String, BTreeSet<IpAddr>>,
-    /// Resolver calls made, for the tests that prove a pin is not re-asked.
-    pub resolutions: usize,
+    resolutions: usize,
+    idle: HashMap<(String, u16, bool), Vec<Conn>>,
+    connects: usize,
+    reused: usize,
+}
+
+/// Idle connections kept per origin, at most.
+pub const MAX_IDLE_PER_ORIGIN: usize = 6;
+
+enum Conn {
+    Plain(TcpStream),
+    Tls(Box<rustls::StreamOwned<rustls::ClientConnection, TcpStream>>),
+}
+
+impl Conn {
+    fn exchange(&mut self, host_header: &str, path: &str, keep: bool) -> Result<(http::Response, bool), FetchError> {
+        match self {
+            Conn::Plain(s) => {
+                http::write_request_conn(s, host_header, path, keep).map_err(|e| FetchError::Connect(e.to_string()))?;
+                http::read_response_framed(s).map_err(FetchError::Http)
+            }
+            Conn::Tls(s) => {
+                http::write_request_conn(s, host_header, path, keep).map_err(|e| FetchError::Tls(e.to_string()))?;
+                http::read_response_framed(s).map_err(FetchError::Http)
+            }
+        }
+    }
 }
 
 impl<'a> Conversation<'a> {
-    pub fn new(net: &'a dyn Connect, tls: Arc<rustls::ClientConfig>, policy: addr::Policy) -> Self {
-        Conversation { net, tls, policy, pins: HashMap::new(), hosts: HashMap::new(), resolutions: 0 }
+    pub fn new(net: &'a (dyn Connect + Sync), tls: Arc<rustls::ClientConfig>, policy: addr::Policy) -> Self {
+        Conversation { net, tls, policy, shared: Default::default(), reuse: false }
+    }
+
+    /// Keep connections open between requests to the same origin, and
+    /// reuse them. Off by default: one connection per request, as before.
+    pub fn with_reuse(mut self, on: bool) -> Self { self.reuse = on; self }
+
+    /// ★ Another handle on THIS conversation, for another thread: the same
+    /// pins, the same idle connections, the same policy.
+    pub fn sibling(&self) -> Conversation<'a> {
+        Conversation { net: self.net, tls: self.tls.clone(), policy: self.policy, shared: self.shared.clone(), reuse: self.reuse }
     }
 
     pub fn policy(&self) -> addr::Policy { self.policy }
 
+    /// Names resolved so far (a pinned name is resolved once).
+    pub fn resolutions(&self) -> usize { self.shared.lock().unwrap().resolutions }
+    /// Connections opened, and requests that reused one.
+    pub fn connections(&self) -> (usize, usize) { let s = self.shared.lock().unwrap(); (s.connects, s.reused) }
+
     pub fn fetch(&mut self, url: &str) -> Result<Fetched, FetchError> {
         let mut current = url::Url::parse(url).map_err(|e| FetchError::BadUrl(e.to_string()))?;
         for redirects in 0..=MAX_REDIRECTS {
-            // ★ Every hop goes through `get_once`, so a redirect target gets
-            // exactly the scheme, port, address and pin checks the first URL
-            // got — a public page redirecting to http://192.168.1.1/ is
-            // refused at the hop, not followed.
             let response = self.get_once(&current)?;
             if matches!(response.status, 301 | 302 | 303 | 307 | 308) {
                 let loc = response.header("location").ok_or(FetchError::Http(http::HttpError::Malformed("redirect without Location")))?;
                 let next = current.join(loc).map_err(|e| FetchError::BadUrl(e.to_string()))?;
-                // ★ Never downgrade: a redirect from https to http would hand a
-                // network attacker the rest of the chain.
                 if current.scheme() == "https" && next.scheme() != "https" {
                     return Err(FetchError::Refused(format!("redirect downgrades to {next}")));
                 }
@@ -163,23 +208,24 @@ impl<'a> Conversation<'a> {
         Err(FetchError::TooManyRedirects)
     }
 
-    /// The addresses `host:port` may be connected to, checked and pinned.
+    /// ★★ THE ADDRESS RULE (threat model §2.1), in its one home. Every
+    /// answer is checked against the policy; the first answer for a name is
+    /// PINNED for the rest of the conversation, and a later answer that
+    /// shares none of the pinned addresses is rebinding. Held under the
+    /// conversation's lock, so two siblings asking at once get one answer.
     pub fn resolve_checked(&mut self, host: &str, port: u16) -> Result<Vec<SocketAddr>, FetchError> {
         let key = (host.to_ascii_lowercase(), port);
-        if let Some(p) = self.pins.get(&key) { return Ok(p.clone()) }
-        self.resolutions += 1;
+        let mut sh = self.shared.lock().unwrap();
+        if let Some(p) = sh.pins.get(&key) { return Ok(p.clone()) }
+        sh.resolutions += 1;
         let answers = self.net.resolve(host, port).map_err(|e| FetchError::Connect(e.to_string()))?;
         if answers.is_empty() { return Err(FetchError::Connect(format!("no address for {host}"))) }
-        // ★ ANY non-public answer refuses the host, rather than being filtered
-        // out while the rest are used. A mixed answer is what a rebinding
-        // attacker sends to race the check, and no honest public site needs
-        // its users to connect to 10.x.
         for a in &answers {
             if let Err(range) = self.policy.admit(a.ip()) {
                 return Err(FetchError::NonPublicAddress { host: host.to_string(), addr: a.ip(), range });
             }
         }
-        let chosen: Vec<SocketAddr> = match self.hosts.get(&key.0) {
+        let chosen: Vec<SocketAddr> = match sh.hosts.get(&key.0) {
             None => answers,
             Some(pinned) => {
                 let keep: Vec<SocketAddr> = answers.iter().copied().filter(|a| pinned.contains(&a.ip())).collect();
@@ -190,9 +236,32 @@ impl<'a> Conversation<'a> {
                 keep
             }
         };
-        self.hosts.entry(key.0.clone()).or_default().extend(chosen.iter().map(|a| a.ip()));
-        self.pins.insert(key, chosen.clone());
+        sh.hosts.entry(key.0.clone()).or_default().extend(chosen.iter().map(|a| a.ip()));
+        sh.pins.insert(key, chosen.clone());
         Ok(chosen)
+    }
+
+    fn connect(&mut self, lookup: &str, port: u16, https: bool, host: &str) -> Result<Conn, FetchError> {
+        let addrs = self.resolve_checked(lookup, port)?;
+        let mut last = None;
+        let mut tcp = None;
+        for a in &addrs {
+            match self.net.connect_addr(*a) {
+                Ok(s) => { tcp = Some(s); break }
+                Err(e) => last = Some(format!("connect {a}: {e}")),
+            }
+        }
+        let tcp = tcp.ok_or_else(|| FetchError::Connect(last.unwrap_or_else(|| format!("no address for {host}"))))?;
+        tcp.set_read_timeout(Some(TIMEOUT)).ok();
+        tcp.set_write_timeout(Some(TIMEOUT)).ok();
+        self.shared.lock().unwrap().connects += 1;
+        if https {
+            let name = rustls_pki_types::ServerName::try_from(lookup.to_string()).map_err(|e| FetchError::Tls(e.to_string()))?;
+            let conn = rustls::ClientConnection::new(self.tls.clone(), name).map_err(|e| FetchError::Tls(e.to_string()))?;
+            Ok(Conn::Tls(Box::new(rustls::StreamOwned::new(conn, tcp))))
+        } else {
+            Ok(Conn::Plain(tcp))
+        }
     }
 
     fn get_once(&mut self, u: &url::Url) -> Result<http::Response, FetchError> {
@@ -203,10 +272,6 @@ impl<'a> Conversation<'a> {
         let host = u.host_str().ok_or_else(|| FetchError::BadUrl("no host".into()))?.to_string();
         let port = u.port_or_known_default().unwrap_or(0);
         if port != 80 && port != 443 { return Err(FetchError::Refused(format!("port {port}"))) }
-        // ★ A literal address is refused here, before any resolver is asked:
-        // the URL parser has already normalised the obfuscated spellings
-        // (http://2130706433/, http://0x7f.1/, http://[::ffff:7f00:1]/) to
-        // the address they mean, so this sees the real one.
         let literal = match u.host() {
             Some(url::Host::Ipv4(a)) => Some(IpAddr::V4(a)),
             Some(url::Host::Ipv6(a)) => Some(IpAddr::V6(a)),
@@ -219,40 +284,92 @@ impl<'a> Conversation<'a> {
         let mut path = u.path().to_string();
         if let Some(q) = u.query() { path.push('?'); path.push_str(q) }
 
-        // The resolver sees the bare address for a bracketed IPv6 literal.
         let lookup = host.trim_start_matches('[').trim_end_matches(']').to_string();
-        let addrs = self.resolve_checked(&lookup, port)?;
-        let mut last = None;
-        let mut tcp = None;
-        for a in &addrs {
-            match self.net.connect_addr(*a) {
-                Ok(s) => { tcp = Some(s); break }
-                Err(e) => last = Some(format!("connect {a}: {e}")),
+        let key = (lookup.to_ascii_lowercase(), port, https);
+        // ★ A reused connection was opened to an address this conversation
+        // pinned and checked; it is reused only for the same origin. If the
+        // server closed it while idle, the request fails before any response
+        // byte, and a GET is retried ONCE on a fresh connection.
+        if self.reuse {
+            let idle = self.shared.lock().unwrap().idle.get_mut(&key).and_then(Vec::pop);
+            if let Some(mut c) = idle {
+                match c.exchange(&host_header, &path, true) {
+                    Ok((resp, again)) => {
+                        let mut sh = self.shared.lock().unwrap();
+                        sh.reused += 1;
+                        if again { let v = sh.idle.entry(key).or_default(); if v.len() < MAX_IDLE_PER_ORIGIN { v.push(c) } }
+                        return Ok(resp);
+                    }
+                    Err(FetchError::Http(http::HttpError::Malformed("connection closed inside headers")))
+                    | Err(FetchError::Http(http::HttpError::Io(_)))
+                    | Err(FetchError::Connect(_)) | Err(FetchError::Tls(_)) => {}
+                    Err(e) => return Err(e),
+                }
             }
         }
-        let tcp = tcp.ok_or_else(|| FetchError::Connect(last.unwrap_or_else(|| format!("no address for {host}"))))?;
-        tcp.set_read_timeout(Some(TIMEOUT)).ok();
-        tcp.set_write_timeout(Some(TIMEOUT)).ok();
-        if https {
-            let name = rustls_pki_types::ServerName::try_from(lookup.clone()).map_err(|e| FetchError::Tls(e.to_string()))?;
-            let conn = rustls::ClientConnection::new(self.tls.clone(), name).map_err(|e| FetchError::Tls(e.to_string()))?;
-            let mut s = rustls::StreamOwned::new(conn, tcp);
-            http::write_request(&mut s, &host_header, &path).map_err(|e| FetchError::Tls(e.to_string()))?;
-            read(&mut s)
-        } else {
-            let mut s = tcp;
-            http::write_request(&mut s, &host_header, &path).map_err(|e| FetchError::Connect(e.to_string()))?;
-            read(&mut s)
+        let mut c = self.connect(&lookup, port, https, &host)?;
+        let (resp, again) = c.exchange(&host_header, &path, self.reuse)?;
+        if self.reuse && again {
+            let mut sh = self.shared.lock().unwrap();
+            let v = sh.idle.entry(key).or_default();
+            if v.len() < MAX_IDLE_PER_ORIGIN { v.push(c) }
         }
+        Ok(resp)
     }
 }
 
-fn read(s: &mut (impl Read + Write)) -> Result<http::Response, FetchError> {
-    // A peer closing without TLS close_notify surfaces as UnexpectedEof from
-    // rustls; for a Connection: close response whose framing is already
-    // complete that is not an error, so the reader decides by framing.
-    http::read_response(s).map_err(FetchError::Http)
+/// fetchd's options for the serve loop: `--workers N` (default
+/// `prefetch::DEFAULT_WORKERS`; 0 ignores hints) and `--no-reuse`.
+pub fn serve_options(args: &[String]) -> (usize, bool) {
+    let workers = args.iter().position(|a| a == "--workers").and_then(|i| args.get(i + 1))
+        .and_then(|v| v.parse().ok()).unwrap_or(prefetch::DEFAULT_WORKERS);
+    (workers, !args.iter().any(|a| a == "--no-reuse"))
 }
+
+/// ★ fetchd's serve loop, portable so it is tested where it is written
+/// (the FreeBSD binary wraps it in capability mode). One line in per
+/// request, one frame out per request, in order:
+/// - `<url>`: fetched (from a prefetch if hinted), answered
+///   `ok <status> <redirects> <len> <final-url>\n` + body, or `err <why>\n`;
+/// - `H <url>`: a hint, no answer (`prefetch`);
+/// - `B <bytes>`: the most hints may pull, no answer;
+/// - `--gate`: `gate` is called (fetchd prints its M1 gate).
+pub fn serve(conv: &Conversation<'_>, workers: usize, input: impl std::io::BufRead, mut out: impl std::io::Write,
+             gate: &mut dyn FnMut(&mut dyn std::io::Write)) {
+    std::thread::scope(|scope| {
+        let mut pf = prefetch::Prefetcher::start(scope, conv, workers.max(1));
+        for line in input.lines() {
+            let Ok(url) = line else { break };
+            let url = url.trim();
+            if url.is_empty() { continue }
+            if let Some(h) = url.strip_prefix("H ") { if workers > 0 { pf.hint(h.trim()) } continue }
+            // `B <bytes>`: the caller's byte budget, which bounds what hints
+            // may pull (prefetch::DEFAULT_BUDGET until told).
+            if let Some(b) = url.strip_prefix("B ") { if let Ok(n) = b.trim().parse() { pf.set_budget(n) } continue }
+            if url == "--gate" { let _ = out.flush(); gate(&mut out); continue }
+            match pf.fetch(url) {
+                Ok(f) => {
+                    let _ = writeln!(out, "ok {} {} {} {}", f.response.status, f.redirects, f.response.body.len(), f.url);
+                    let _ = out.write_all(&f.response.body);
+                }
+                Err(e) => { let _ = writeln!(out, "err {e}"); }
+            }
+            let _ = out.flush();
+        }
+        pf.close();
+    });
+}
+
+/// A `Connect` that is used from one thread at a time, made shareable by a
+/// lock: casper's channel (`sandbox::Net`) is a descriptor that must not be
+/// used by two threads at once. Lookups and connects are serialized; the
+/// transfers, which are the time, are not.
+pub struct Locked<C: Connect + Send>(pub std::sync::Mutex<C>);
+impl<C: Connect + Send> Connect for Locked<C> {
+    fn resolve(&self, host: &str, port: u16) -> std::io::Result<Vec<SocketAddr>> { self.0.lock().unwrap().resolve(host, port) }
+    fn connect_addr(&self, addr: SocketAddr) -> std::io::Result<TcpStream> { self.0.lock().unwrap().connect_addr(addr) }
+}
+
 
 #[cfg(test)]
 mod policy_tests {
@@ -264,15 +381,15 @@ mod policy_tests {
     //! the policy judges the ANSWERED address, and the test can watch it do so
     //! without the machine's real DNS or a real LAN.
     use super::*;
-    use std::cell::RefCell;
+    use std::sync::Mutex;
     use std::collections::VecDeque;
     use std::net::TcpListener;
 
     struct Scripted {
         /// One answer per resolver call, in order.
-        answers: RefCell<VecDeque<Vec<IpAddr>>>,
-        resolved: RefCell<Vec<(String, u16)>>,
-        connected: RefCell<Vec<SocketAddr>>,
+        answers: Mutex<VecDeque<Vec<IpAddr>>>,
+        resolved: Mutex<Vec<(String, u16)>>,
+        connected: Mutex<Vec<SocketAddr>>,
         /// Where every connect really goes: a server speaking `responses`.
         server: SocketAddr,
     }
@@ -302,20 +419,20 @@ mod policy_tests {
     impl Scripted {
         fn new(answers: Vec<Vec<&str>>, responses: Vec<&'static str>) -> Self {
             Scripted {
-                answers: RefCell::new(answers.into_iter().map(|v| v.into_iter().map(|s| s.parse().unwrap()).collect()).collect()),
-                resolved: RefCell::default(), connected: RefCell::default(), server: server(responses),
+                answers: std::sync::Mutex::new(answers.into_iter().map(|v| v.into_iter().map(|s| s.parse().unwrap()).collect()).collect()),
+                resolved: Default::default(), connected: Default::default(), server: server(responses),
             }
         }
     }
 
     impl Connect for Scripted {
         fn resolve(&self, host: &str, port: u16) -> std::io::Result<Vec<SocketAddr>> {
-            self.resolved.borrow_mut().push((host.to_string(), port));
-            let ips = self.answers.borrow_mut().pop_front().ok_or_else(|| std::io::Error::other("unscripted lookup"))?;
+            self.resolved.lock().unwrap().push((host.to_string(), port));
+            let ips = self.answers.lock().unwrap().pop_front().ok_or_else(|| std::io::Error::other("unscripted lookup"))?;
             Ok(ips.into_iter().map(|ip| SocketAddr::new(ip, port)).collect())
         }
         fn connect_addr(&self, addr: SocketAddr) -> std::io::Result<TcpStream> {
-            self.connected.borrow_mut().push(addr);
+            self.connected.lock().unwrap().push(addr);
             TcpStream::connect(self.server)
         }
     }
@@ -335,7 +452,7 @@ mod policy_tests {
         let mut c = Conversation::new(&net, tls(), addr::Policy::default());
         let f = c.fetch("http://example.com/").unwrap();
         assert_eq!(f.response.body, b"ok");
-        assert_eq!(*net.connected.borrow(), vec![SocketAddr::new(PUBLIC.parse().unwrap(), 80)]);
+        assert_eq!(*net.connected.lock().unwrap(), vec![SocketAddr::new(PUBLIC.parse().unwrap(), 80)]);
     }
 
     #[test]
@@ -359,8 +476,8 @@ mod policy_tests {
                 Err(FetchError::NonPublicAddress { .. }) => {}
                 other => panic!("{url}: {other:?}"),
             }
-            assert!(net.resolved.borrow().is_empty(), "{url} reached the resolver");
-            assert!(net.connected.borrow().is_empty(), "{url} reached connect");
+            assert!(net.resolved.lock().unwrap().is_empty(), "{url} reached the resolver");
+            assert!(net.connected.lock().unwrap().is_empty(), "{url} reached connect");
         }
     }
 
@@ -376,7 +493,7 @@ mod policy_tests {
                 Err(FetchError::NonPublicAddress { addr, .. }) => assert_eq!(addr, ip.parse::<IpAddr>().unwrap()),
                 other => panic!("{ip}: {other:?}"),
             }
-            assert!(net.connected.borrow().is_empty(), "{ip} reached connect");
+            assert!(net.connected.lock().unwrap().is_empty(), "{ip} reached connect");
         }
     }
 
@@ -386,7 +503,7 @@ mod policy_tests {
         let net = Scripted::new(vec![vec![PUBLIC, "127.0.0.1"]], vec![]);
         let mut c = Conversation::new(&net, tls(), addr::Policy::default());
         assert!(matches!(c.fetch("http://evil.example/"), Err(FetchError::NonPublicAddress { .. })));
-        assert!(net.connected.borrow().is_empty());
+        assert!(net.connected.lock().unwrap().is_empty());
     }
 
     #[test]
@@ -398,7 +515,7 @@ mod policy_tests {
             Err(FetchError::NonPublicAddress { addr, .. }) => assert_eq!(addr, "192.168.1.1".parse::<IpAddr>().unwrap()),
             other => panic!("{other:?}"),
         }
-        assert_eq!(net.connected.borrow().len(), 1, "only the public hop connected");
+        assert_eq!(net.connected.lock().unwrap().len(), 1, "only the public hop connected");
     }
 
     #[test]
@@ -407,7 +524,7 @@ mod policy_tests {
             vec!["HTTP/1.1 301 Moved\r\nLocation: http://router.example/\r\nContent-Length: 0\r\n\r\n"]);
         let mut c = Conversation::new(&net, tls(), addr::Policy::default());
         assert!(matches!(c.fetch("http://example.com/"), Err(FetchError::NonPublicAddress { .. })));
-        assert_eq!(net.connected.borrow().len(), 1);
+        assert_eq!(net.connected.lock().unwrap().len(), 1);
     }
 
     #[test]
@@ -417,9 +534,9 @@ mod policy_tests {
         let mut c = Conversation::new(&net, tls(), addr::Policy::default());
         c.fetch("http://evil.example/a").unwrap();
         c.fetch("http://evil.example/b").unwrap();
-        assert_eq!(c.resolutions, 1);
+        assert_eq!(c.resolutions(), 1);
         let want = SocketAddr::new(PUBLIC.parse().unwrap(), 80);
-        assert_eq!(*net.connected.borrow(), vec![want, want]);
+        assert_eq!(*net.connected.lock().unwrap(), vec![want, want]);
     }
 
     #[test]

@@ -308,6 +308,14 @@ fn convert_impl(
     // made of it.
     let profile_violations = profile::check(&dom, html.len());
     let origin_refusal = detect_origin_refusal(&dom);
+    // ★ Say what is coming (§5.4.5.7, step 4): every stylesheet, image and
+    // script the parsed document names, so a fetcher that can work in
+    // parallel starts them now instead of one by one as each is asked for.
+    // The order is the order they will be needed in: a conversion that
+    // shows tier 1 first needs its sheets and images before any script.
+    if flow.fresh {
+        for u in hints(&dom, base, scripts_held, flow.keep_after) { fetcher.hint(&u) }
+    }
     // ★ Always recorded, because ANCHORING needs it too: a transition is
     // replayable against tier 1 only if its trigger came from the parser.
     // Protection is the separate, opt-in thing.
@@ -449,6 +457,30 @@ fn convert_impl(
     if !flow.keep_after { subresource::forget_fetched() }
     let _s = timing::span("serialize");
     assemble(&dom, rep, subresources, pre)
+}
+
+/// The URLs a conversion of `dom` will ask for, in the order it will:
+/// stylesheets, then (tier 1 first) images and scripts, or (scripts first)
+/// scripts and images. Scripts are left out of a tier-1 conversion that no
+/// scripted one follows. At most 512, http(s) only, each once.
+fn hints(dom: &dom::Dom, base: Option<&str>, tier1_first: bool, scripted_follows: bool) -> Vec<String> {
+    let attr_urls = |tag: &str, attr: &str, keep: &dyn Fn(navigator_dom::Handle) -> bool| -> Vec<String> {
+        dom.by_tag_anywhere(tag).into_iter().filter(|&h| keep(h))
+            .filter_map(|h| dom.attr(h, attr).and_then(|v| resolve(base, v))).collect()
+    };
+    let sheets = attr_urls("link", "href", &|h| dom.attr(h, "rel").is_some_and(|r| r.split_ascii_whitespace()
+        .any(|x| x.eq_ignore_ascii_case("stylesheet"))));
+    let images = attr_urls("img", "src", &|_| true);
+    let scripts = attr_urls("script", "src", &|_| true);
+    let order: Vec<Vec<String>> = match (tier1_first, scripted_follows) {
+        (true, true) => vec![sheets, images, scripts],
+        (true, false) => vec![sheets, images],
+        (false, _) => vec![sheets, scripts, images],
+    };
+    let mut seen = HashSet::new();
+    order.into_iter().flatten()
+        .filter(|u| (u.starts_with("https://") || u.starts_with("http://")) && u.len() <= serve::MAX_URL && !u.contains(['\n', '\r']))
+        .filter(|u| seen.insert(u.clone())).take(512).collect()
 }
 
 /// Resolve a `src` against the document base. Absolute URLs pass through;

@@ -812,6 +812,12 @@ enum Upstream {
 }
 
 impl Upstream {
+    fn hint(&mut self, url: &str) {
+        if let Upstream::Fetchd(f) = self { f.send_hint(url) }
+    }
+    fn budget(&mut self, bytes: u64) {
+        if let Upstream::Fetchd(f) = self { f.send_budget(bytes) }
+    }
     fn reply(&mut self, url: &str) -> navigator_prerender::fetch::Reply {
         use navigator_prerender::fetch::Reply;
         match self {
@@ -893,19 +899,33 @@ fn convert_in_child(
         // ★ The per-conversion byte budget is applied HERE, in the relay,
         // where the converter cannot reach it.
         let relay_start = std::time::Instant::now();
-        let r = serve::drive(&mut out, &stdin_d, &mut |u| {
-            budget_d.lock().unwrap().admit(u, |u| up.reply(u)).to_frame()
+        let up = std::cell::RefCell::new(up);
+        let mut told_budget = false;
+        let r = serve::drive_streaming(&mut out, &stdin_d, &mut |u| {
+            budget_d.lock().unwrap().admit(u, |u| up.borrow_mut().reply(u)).to_frame()
+        }, &mut |u| {
+            // ★ Passed on only while the budget has room: a hint is a URL
+            // the converter is about to ask for, and its bytes are charged
+            // when it does, as every request's are.
+            // ★ And fetchd is told the budget before the first one, so what
+            // hints make it pull is bounded too: at most the budget, beside
+            // the budget the requests are charged against.
+            let b = budget_d.lock().unwrap();
+            if b.pulled >= budget_limit { return }
+            let mut up = up.borrow_mut();
+            if !told_budget { up.budget(budget_limit.saturating_sub(b.pulled)); told_budget = true }
+            up.hint(u)
         }, &mut |addr, bytes| {
             let (Some(dir), Some(hex)) = (&blob_dir, addr.strip_prefix("blake3:")) else { return };
             let _ = fs::create_dir_all(dir);
             let p = dir.join(hex);
             if !p.exists() { let _ = fs::write(p, bytes); }
-        });
+        }, &mut |_, _| {});
         // ★ End of input first: the child (and through it its launcher) is
         // asked to exit, never killed while it still could.
         drop(stdin_d.lock().unwrap().take());
         let _ = emit;
-        let log = match &up { Upstream::Curl(h) => h.log.clone(), _ => vec![] };
+        let log = match &*up.borrow() { Upstream::Curl(h) => h.log.clone(), _ => vec![] };
         r.map(|o| (o, log, relay_start.elapsed()))
     });
 

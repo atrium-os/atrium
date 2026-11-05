@@ -43,9 +43,16 @@ impl From<io::Error> for HttpError {
 /// Authorization, no client hints — the origin learns the resource was
 /// fetched and nothing about by whom or from where.
 pub fn write_request(w: &mut impl Write, host_header: &str, path_and_query: &str) -> io::Result<()> {
+    write_request_conn(w, host_header, path_and_query, false)
+}
+
+/// `write_request`, asking to keep the connection open (`keep_alive`) for
+/// the next request to the same origin (legacy-web §5.4.5.7, step 4).
+pub fn write_request_conn(w: &mut impl Write, host_header: &str, path_and_query: &str, keep_alive: bool) -> io::Result<()> {
+    let conn = if keep_alive { "keep-alive" } else { "close" };
     write!(w, "GET {path_and_query} HTTP/1.1\r\nHost: {host_header}\r\n\
                User-Agent: atrium-navigator-fetch/0.1\r\nAccept: */*\r\n\
-               Accept-Encoding: identity\r\nConnection: close\r\n\r\n")?;
+               Accept-Encoding: identity\r\nConnection: {conn}\r\n\r\n")?;
     w.flush()
 }
 
@@ -65,6 +72,16 @@ fn read_until_headers_end(r: &mut impl Read) -> Result<(Vec<u8>, Vec<u8>), HttpE
 }
 
 pub fn read_response(r: &mut impl Read) -> Result<Response, HttpError> {
+    read_response_framed(r).map(|(resp, _)| resp)
+}
+
+/// `read_response`, and whether the connection may carry another request:
+/// ★ only when the body's end was DELIMITED (a length, or chunked with its
+/// trailers read), nothing past it was read, the server did not say
+/// `close`, and it speaks HTTP/1.1. Anything else is read to its end and
+/// the connection is not reused — a byte left over would become the start
+/// of the next response.
+pub fn read_response_framed(r: &mut impl Read) -> Result<(Response, bool), HttpError> {
     let (head, mut rest) = read_until_headers_end(r)?;
     let head = std::str::from_utf8(&head).map_err(|_| HttpError::Malformed("non-UTF-8 header"))?;
     let mut lines = head.split("\r\n");
@@ -83,16 +100,45 @@ pub fn read_response(r: &mut impl Read) -> Result<Response, HttpError> {
         if !enc.eq_ignore_ascii_case("identity") { return Err(HttpError::Encoded(enc)) }
     }
     let chunked = resp_hdr("transfer-encoding").is_some_and(|t| t.to_ascii_lowercase().contains("chunked"));
-    let body = if chunked {
-        read_chunked(&mut rest, r)?
+    let keep = version == "HTTP/1.1"
+        && !resp_hdr("connection").is_some_and(|c| c.to_ascii_lowercase().split(',').any(|t| t.trim() == "close"));
+    // A response that has no body by its status (RFC 9112 §6.3): reading one
+    // to the end of the connection would wait out the timeout on a
+    // connection the server is keeping open.
+    let (body, delimited) = if (100..200).contains(&status) || status == 204 || status == 304 {
+        (vec![], rest.is_empty())
+    } else if chunked {
+        let b = read_chunked(&mut rest, r)?;
+        let clean = read_trailers(&mut rest, r)? && rest.is_empty();
+        (b, clean)
     } else if let Some(cl) = resp_hdr("content-length") {
         let n: usize = cl.parse().map_err(|_| HttpError::Malformed("bad content-length"))?;
         if n > MAX_BODY_BYTES { return Err(HttpError::BodyTooLarge) }
-        read_exact_from(&mut rest, r, n)?
+        fill(&mut rest, r, n)?;
+        let clean = rest.len() == n;
+        rest.truncate(n);
+        (std::mem::take(&mut rest), clean)
     } else {
-        read_to_limit(&mut rest, r)?
+        (read_to_limit(&mut rest, r)?, false)
     };
-    Ok(Response { status, headers, body })
+    Ok((Response { status, headers, body }, keep && delimited))
+}
+
+/// After a chunked body's last chunk: the trailer section, up to its empty
+/// line. False if it could not be read cleanly.
+fn read_trailers(rest: &mut Vec<u8>, r: &mut impl Read) -> Result<bool, HttpError> {
+    for _ in 0..64 {
+        let end = loop {
+            if let Some(i) = rest.windows(2).position(|w| w == b"\r\n") { break i }
+            if rest.len() > 8 * 1024 { return Ok(false) }
+            let want = rest.len() + 1;
+            if fill(rest, r, want).is_err() { return Ok(false) }
+        };
+        let empty = end == 0;
+        rest.drain(..end + 2);
+        if empty { return Ok(true) }
+    }
+    Ok(false)
 }
 
 fn fill(rest: &mut Vec<u8>, r: &mut impl Read, want: usize) -> Result<(), HttpError> {
@@ -104,12 +150,6 @@ fn fill(rest: &mut Vec<u8>, r: &mut impl Read, want: usize) -> Result<(), HttpEr
         if rest.len() > MAX_BODY_BYTES + MAX_HEADER_BYTES { return Err(HttpError::BodyTooLarge) }
     }
     Ok(())
-}
-
-fn read_exact_from(rest: &mut Vec<u8>, r: &mut impl Read, n: usize) -> Result<Vec<u8>, HttpError> {
-    fill(rest, r, n)?;
-    rest.truncate(n);
-    Ok(std::mem::take(rest))
 }
 
 fn read_to_limit(rest: &mut Vec<u8>, r: &mut impl Read) -> Result<Vec<u8>, HttpError> {

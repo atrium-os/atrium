@@ -155,7 +155,8 @@ fn the_relay_enforces_a_per_conversion_byte_budget() {
     let log = d.join("upstream.log");
     let fake = d.join("fetchd.sh");
     std::fs::write(&fake, format!(
-        "while read u; do echo \"$u\" >> {log}; printf 'ok 200 0 100000 %s\\n' \"$u\"; \
+        "while read u; do case \"$u\" in 'H '*|'B '*) echo \"$u\" >> {log}.hints; continue;; esac; \
+         echo \"$u\" >> {log}; printf 'ok 200 0 100000 %s\\n' \"$u\"; \
          head -c 100000 /dev/zero | tr '\\0' ' '; done\n", log = log.display())).unwrap();
     let docs = d.join("docs");
     std::fs::create_dir_all(&docs).unwrap();
@@ -171,6 +172,10 @@ fn the_relay_enforces_a_per_conversion_byte_budget() {
                           3 request(s) refused, first https://a.example/s2.js)"), "{out}");
     let asked = std::fs::read_to_string(&log).unwrap();
     assert_eq!(asked.lines().count(), 3, "upstream is not asked once the budget is spent: {asked}");
+    // ★ Hinted, all five, after the budget — which bounds what hints pull.
+    let hints = std::fs::read_to_string(format!("{}.hints", log.display())).unwrap();
+    assert_eq!(hints.lines().next(), Some("B 250000"), "{hints}");
+    assert_eq!(hints.lines().filter(|l| l.starts_with("H https://a.example/s")).count(), 5, "{hints}");
     // Unbounded by a large budget, nothing is refused.
     let _ = std::fs::remove_file(&log);
     let (_, out, _) = driver(&docs, &[("PRERENDER_NET", "1"), ("PRERENDER_FETCHD", &fetchd)]);

@@ -156,6 +156,7 @@ pub struct Outcome {
     pub transitions_at: Option<std::time::Duration>,
     pub blobs: usize,
     pub fetches: usize,
+    pub hints: usize,
     pub timed_out: bool,
     pub ended: bool,
 }
@@ -193,7 +194,7 @@ pub fn drive(
     fetch: &mut dyn FnMut(&str) -> Vec<u8>,
     blob: &mut dyn FnMut(&str, &[u8]),
 ) -> Result<Outcome, String> {
-    drive_streaming(out, stdin, fetch, blob, &mut |_, _| {})
+    drive_streaming(out, stdin, fetch, &mut |_| {}, blob, &mut |_, _| {})
 }
 
 /// An artifact the child delivered, as it arrived.
@@ -207,6 +208,7 @@ pub fn drive_streaming(
     out: &mut impl BufRead,
     stdin: &Mutex<Option<Box<dyn Write + Send>>>,
     fetch: &mut dyn FnMut(&str) -> Vec<u8>,
+    hint: &mut dyn FnMut(&str),
     blob: &mut dyn FnMut(&str, &[u8]),
     artifact: &mut dyn FnMut(Artifact, &[u8]),
 ) -> Result<Outcome, String> {
@@ -218,7 +220,12 @@ pub fn drive_streaming(
     let mut child_gone = false;
     loop {
         let Some(line) = crate::fetch::read_line_bounded(out, MAX_LINE)? else { break };
-        if let Some(url) = line.strip_prefix("F ") {
+        if let Some(url) = line.strip_prefix("H ") {
+            // A hint (§5.4.5.7, step 4): passed on, never answered. An
+            // over-long one is dropped; its request, if it comes, fails then.
+            o.hints += 1;
+            if url.len() <= MAX_URL && !child_gone { hint(url) }
+        } else if let Some(url) = line.strip_prefix("F ") {
             o.fetches += 1;
             if child_gone { continue }
             // ★ An oversized URL fails THAT FETCH, not the conversion. Real pages
@@ -379,11 +386,25 @@ mod tests {
         let (_, stdin) = stdin_sink();
         let mut seen = vec![];
         let o = drive_streaming(&mut &b"FIRST 2\nt1F https://a.example/s.css\nRECORDING 2\nt2TRANSITIONS 2\ntxR\t1\nEND\n"[..], &stdin,
-            &mut |_| b"ok 200 0 2 https://a.example/\nhi".to_vec(), &mut |_, _| {},
+            &mut |_| b"ok 200 0 2 https://a.example/\nhi".to_vec(), &mut |_| {}, &mut |_, _| {},
             &mut |a, b| seen.push((a, b.to_vec()))).unwrap();
         assert_eq!(seen, vec![(Artifact::First, b"t1".to_vec()), (Artifact::Recording, b"t2".to_vec()),
                               (Artifact::Transitions, b"tx".to_vec())]);
         assert!(o.ended && o.first_at.unwrap() <= o.recording_at.unwrap() && o.recording_at.unwrap() <= o.transitions_at.unwrap());
+    }
+
+    #[test]
+    fn hints_are_passed_on_and_never_answered() {
+        let (buf, stdin) = stdin_sink();
+        let mut hinted = vec![];
+        let long = format!("H https://a.example/{}\n", "a".repeat(MAX_URL));
+        let child = format!("H https://a.example/s.css\n{long}F https://a.example/s.css\nEND\n");
+        let o = drive_streaming(&mut child.as_bytes(), &stdin, &mut |_| b"ok 200 0 2 https://a.example/\nhi".to_vec(),
+            &mut |u| hinted.push(u.to_string()), &mut |_, _| {}, &mut |_, _| {}).unwrap();
+        assert_eq!(hinted, vec!["https://a.example/s.css".to_string()]);
+        assert_eq!((o.hints, o.fetches), (2, 1));
+        // One answer, for the request; nothing for either hint.
+        assert_eq!(buf.lock().unwrap().as_slice(), b"ok 200 0 2 https://a.example/\nhi");
     }
 
     #[test]
