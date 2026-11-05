@@ -874,3 +874,112 @@ fn pack_unpack_half_sweep() {
     assert_eq!(r[0], 0xc000_3c00);
     assert_eq!([f32::from_bits(r[1]), f32::from_bits(r[2])], [-2.0, 1.0]);
 }
+
+/// Packed vector math: vec4/vec3/vec2 varyings loaded packed, lane-wise
+/// mul/add/div/min/max/sub with scalar broadcasts, lanes extracted and
+/// mixed back with scalar code, bit for bit against Cranelift.
+#[test]
+fn packed_vector_ops() {
+    use rspirv::dr::Operand::{self, LiteralBit32};
+    use rspirv::spirv::{
+        AddressingModel, Capability, Decoration, ExecutionMode, ExecutionModel, FunctionControl,
+        MemoryModel, StorageClass as SC,
+    };
+    if !cfg!(target_arch = "x86_64") {
+        return;
+    }
+    let mut b = Builder::new();
+    b.set_version(1, 0);
+    b.capability(Capability::Shader);
+    let glsl = b.ext_inst_import("GLSL.std.450");
+    b.memory_model(AddressingModel::Logical, MemoryModel::GLSL450);
+    let void = b.type_void();
+    let f = b.type_float(32, None);
+    let v2 = b.type_vector(f, 2);
+    let v3 = b.type_vector(f, 3);
+    let v4 = b.type_vector(f, 4);
+    let void_fn = b.type_function(void, vec![]);
+    let pin4 = b.type_pointer(None, SC::Input, v4);
+    let pin3 = b.type_pointer(None, SC::Input, v3);
+    let pin2 = b.type_pointer(None, SC::Input, v2);
+    let pout4 = b.type_pointer(None, SC::Output, v4);
+    let i0 = b.variable(pin4, None, SC::Input, None);
+    b.decorate(i0, Decoration::Location, vec![LiteralBit32(0)]);
+    let i1 = b.variable(pin4, None, SC::Input, None);
+    b.decorate(i1, Decoration::Location, vec![LiteralBit32(1)]);
+    let i2 = b.variable(pin3, None, SC::Input, None);
+    b.decorate(i2, Decoration::Location, vec![LiteralBit32(2)]);
+    let i3 = b.variable(pin2, None, SC::Input, None);
+    b.decorate(i3, Decoration::Location, vec![LiteralBit32(3)]);
+    let out = b.variable(pout4, None, SC::Output, None);
+    b.decorate(out, Decoration::Location, vec![LiteralBit32(0)]);
+    let two = b.constant_bit32(f, 2.0f32.to_bits());
+    let main = b.begin_function(void, None, FunctionControl::NONE, void_fn).unwrap();
+    b.begin_block(None).unwrap();
+    let a = b.load(v4, None, i0, None, vec![]).unwrap();
+    let c = b.load(v4, None, i1, None, vec![]).unwrap();
+    let e = b.load(v3, None, i2, None, vec![]).unwrap();
+    let g = b.load(v2, None, i3, None, vec![]).unwrap();
+    // (GLSL Fma on vectors types its product as a scalar in the frontend,
+    // so spell it out.)
+    let ac = b.f_mul(v4, None, a, c).unwrap();
+    let r = b.f_add(v4, None, ac, a).unwrap();
+    let r2 = b.vector_times_scalar(v4, None, r, two).unwrap();
+    let m = b.ext_inst(v4, None, glsl, 37, vec![Operand::IdRef(r2), Operand::IdRef(c)]).unwrap();
+    let mx = b.ext_inst(v4, None, glsl, 40, vec![Operand::IdRef(r), Operand::IdRef(a)]).unwrap();
+    let q = b.f_div(v4, None, c, a).unwrap();
+    let s = b.f_sub(v4, None, a, q).unwrap();
+    let e2 = b.f_mul(v3, None, e, e).unwrap();
+    let ey = b.composite_extract(f, None, e2, vec![1]).unwrap();
+    let g2 = b.f_add(v2, None, g, g).unwrap();
+    let gx = b.composite_extract(f, None, g2, vec![1]).unwrap();
+    let mxw = b.composite_extract(f, None, m, vec![0]).unwrap();
+    let mw = b.composite_extract(f, None, m, vec![3]).unwrap();
+    let l0 = b.f_add(f, None, mxw, mw).unwrap();
+    let l1 = b.composite_extract(f, None, mx, vec![2]).unwrap();
+    let sx = b.composite_extract(f, None, s, vec![1]).unwrap();
+    let l2 = b.f_add(f, None, sx, ey).unwrap();
+    let col = b.composite_construct(v4, None, vec![l0, l1, l2, gx]).unwrap();
+    let fin = b.f_add(v4, None, col, s).unwrap();
+    b.store(out, fin, None, vec![]).unwrap();
+    b.ret().unwrap();
+    b.end_function().unwrap();
+    b.entry_point(ExecutionModel::Fragment, main, "main", vec![i0, i1, i2, i3, out]);
+    b.execution_mode(main, ExecutionMode::OriginUpperLeft, vec![]);
+    let spirv = assemble(b);
+    let module = atrium_spv_frontend::translate(&spirv).expect("frontend");
+    let objs = [
+        atrium_spv_backend_cranelift::compile(&module, atrium_spv_backend_cranelift::Target::host())
+            .expect("cranelift").object,
+        atrium_spv_backend_bespoke_x86::compile(&module, atrium_spv_backend_bespoke_x86::Target::host())
+            .expect("bespoke-x86").object,
+    ];
+    let dir = tempfile::tempdir().unwrap();
+    let libs: Vec<libloading::Library> = objs.iter().enumerate().map(|(k, obj)| {
+        let o = dir.path().join(format!("s{k}.o"));
+        let so = dir.path().join(format!("s{k}.so"));
+        std::fs::write(&o, obj).unwrap();
+        assert!(std::process::Command::new("cc").arg("-shared").arg("-o").arg(&so).arg(&o)
+            .status().unwrap().success());
+        unsafe { libloading::Library::new(&so) }.unwrap()
+    }).collect();
+    type FsMain = unsafe extern "C" fn(
+        *const u8, *const u8, *const u8, f32, f32, f32, f32, u32, *mut f32, *mut f32, u32, u32,
+    );
+    let fs: Vec<FsMain> = libs.iter().map(|l| unsafe { *l.get::<FsMain>(b"atrium_fs_main").unwrap() }).collect();
+    let vals = [1.5f32, -2.25, 0.0, -0.0, f32::NAN, f32::INFINITY, 3e-39, 7.0, -1e30, 0.333];
+    for k in 0..40 {
+        // The varying block: four vec4 slots (Location n at 16n).
+        let vary: Vec<f32> = (0..16).map(|i| vals[(k * 7 + i * 3 + i / 4) % vals.len()]).collect();
+        let res: Vec<[u32; 4]> = fs.iter().map(|&f| {
+            let mut c = [0f32; 4];
+            let mut d = 0f32;
+            unsafe {
+                f(vary.as_ptr() as *const u8, std::ptr::null(), std::ptr::null(), 0.0, 0.0, 0.0, 1.0, 1,
+                  c.as_mut_ptr(), &mut d, 1, 0);
+            }
+            c.map(f32::to_bits)
+        }).collect();
+        assert_eq!(res[1], res[0], "inputs {vary:?}");
+    }
+}

@@ -534,6 +534,7 @@ impl<'a> Emit<'a> {
                 }
             },
             M::XMov { d, s } => self.xmov(*d, *s)?,
+            M::XBin { op: op @ (XOp::Min | XOp::Max), d, a, b } => self.min_max(matches!(op, XOp::Min), *d, *a, *b)?,
             M::XBin { op, d, a, b } => {
                 let ra = self.x_reg(*a, XS0)?;
                 let rd = self.x_dst(*d);
@@ -552,6 +553,13 @@ impl<'a> Emit<'a> {
                 self.x_fin(*d, rd)?;
             }
             M::XFma { d, a, b, c } => self.fma(*d, *a, *b, *c)?,
+            M::VLoad { .. }
+            | M::VStore { .. }
+            | M::VBin { .. }
+            | M::VFma { .. }
+            | M::VBroadcast { .. }
+            | M::VPack { .. }
+            | M::XExtract { .. } => self.packed(inst)?,
             M::XUn { op, d, a } => {
                 let ra = self.x_reg(*a, XS0)?;
                 let rd = self.x_dst(*d);
@@ -1158,6 +1166,168 @@ impl<'a> Emit<'a> {
 
     /// d = a * b + c, picking the FMA form that needs no copy when d
     /// shares a register with an operand.
+    // ── packed f32 (class V) ──────────────────────────────────────────
+
+    fn v_reg(&mut self, v: VReg, scratch: AsmRegisterXmm) -> Result<AsmRegisterXmm, BackendError> {
+        match self.loc(v) {
+            Loc::Reg(PReg::X(r)) => Ok(XMM[r as usize]),
+            Loc::Slot(k) => {
+                self.a.vmovups(scratch, self.slot_x(k)).map_err(enc)?;
+                Ok(scratch)
+            }
+            Loc::Reg(PReg::G(_)) => unreachable!(),
+        }
+    }
+
+    fn v_fin(&mut self, v: VReg, r: AsmRegisterXmm) -> Result<(), BackendError> {
+        match self.loc(v) {
+            Loc::Reg(PReg::X(d)) if XMM[d as usize] == r => Ok(()),
+            Loc::Reg(PReg::X(d)) => self.a.vmovaps(XMM[d as usize], r).map_err(enc),
+            Loc::Slot(k) => self.a.vmovups(self.slot_x(k), r).map_err(enc),
+            Loc::Reg(PReg::G(_)) => unreachable!(),
+        }
+    }
+
+    fn packed(&mut self, inst: &MInst) -> Result<(), BackendError> {
+        match inst {
+            MInst::VLoad { d, addr, n } => {
+                let (b, disp) = self.base(addr.base)?;
+                let at = b + (disp + addr.off);
+                let rd = self.x_dst(*d);
+                match n {
+                    4 => self.a.vmovups(rd, xmmword_ptr(at)).map_err(enc)?,
+                    _ => {
+                        self.a.vmovsd(rd, qword_ptr(at)).map_err(enc)?;
+                        if *n == 3 {
+                            self.a.vinsertps(rd, rd, dword_ptr(b + (disp + addr.off + 8)), 0x20).map_err(enc)?;
+                        }
+                    }
+                }
+                self.v_fin(*d, rd)
+            }
+            MInst::VStore { addr, s, n } => {
+                let rs = self.v_reg(*s, XS0)?;
+                let (b, disp) = self.base(addr.base)?;
+                let at = b + (disp + addr.off);
+                match n {
+                    4 => self.a.vmovups(xmmword_ptr(at), rs).map_err(enc),
+                    _ => {
+                        self.a.vmovsd(qword_ptr(at), rs).map_err(enc)?;
+                        if *n == 3 {
+                            self.a.vextractps(dword_ptr(b + (disp + addr.off + 8)), rs, 2).map_err(enc)?;
+                        }
+                        Ok(())
+                    }
+                }
+            }
+            MInst::VBin { op, d, a, b } => {
+                let ra = self.v_reg(*a, XS0)?;
+                let rd = self.x_dst(*d);
+                let rb = self.x_ps(*b);
+                let a = &mut self.a;
+                match op {
+                    XOp::Add => x3!(a, vaddps, rd, ra, rb)?,
+                    XOp::Sub => x3!(a, vsubps, rd, ra, rb)?,
+                    XOp::Mul => x3!(a, vmulps, rd, ra, rb)?,
+                    XOp::Div => x3!(a, vdivps, rd, ra, rb)?,
+                    XOp::Min => x3!(a, vminps, rd, ra, rb)?,
+                    XOp::Max => x3!(a, vmaxps, rd, ra, rb)?,
+                    XOp::And => x3!(a, vandps, rd, ra, rb)?,
+                    XOp::Xor => x3!(a, vxorps, rd, ra, rb)?,
+                }
+                self.v_fin(*d, rd)
+            }
+            MInst::VFma { d, a, b, c } => {
+                // XS1 = c; XS1 += a * b.
+                match self.loc(*c) {
+                    Loc::Reg(PReg::X(r)) => self.a.vmovaps(XS1, XMM[r as usize]).map_err(enc)?,
+                    Loc::Slot(k) => self.a.vmovups(XS1, self.slot_x(k)).map_err(enc)?,
+                    Loc::Reg(PReg::G(_)) => unreachable!(),
+                }
+                let ra = self.v_reg(*a, XS0)?;
+                x3!(self.a, vfmadd231ps, XS1, ra, self.x_ps(*b))?;
+                self.v_fin(*d, XS1)
+            }
+            MInst::VBroadcast { d, s } => {
+                let rd = self.x_dst(*d);
+                match self.x_ss(*s) {
+                    X::R(r) => self.a.vbroadcastss(rd, r).map_err(enc)?,
+                    X::M(m) => self.a.vbroadcastss(rd, m).map_err(enc)?,
+                }
+                self.v_fin(*d, rd)
+            }
+            MInst::VPack { d, lanes } => {
+                match self.x_ss(lanes[0]) {
+                    X::R(r) => self.a.vmovaps(XS0, r).map_err(enc)?,
+                    X::M(m) => self.a.vmovss(XS0, m).map_err(enc)?,
+                }
+                for (k, &l) in lanes.iter().enumerate().skip(1) {
+                    let imm = (k as i32) << 4;
+                    match self.x_ss(l) {
+                        X::R(r) => self.a.vinsertps(XS0, XS0, r, imm).map_err(enc)?,
+                        X::M(m) => self.a.vinsertps(XS0, XS0, m, imm).map_err(enc)?,
+                    }
+                }
+                self.v_fin(*d, XS0)
+            }
+            MInst::XExtract { d, s, lane } => {
+                let rd = self.x_dst(*d);
+                match self.loc(*s) {
+                    Loc::Slot(k) => {
+                        self.a.vmovss(rd, dword_ptr(rsp + (16 * k as i32 + 4 * *lane as i32))).map_err(enc)?
+                    }
+                    Loc::Reg(PReg::X(r)) => {
+                        let rs = XMM[r as usize];
+                        if *lane != 0 {
+                            self.a.vpermilps(rd, rs, 0x55 * *lane as i32).map_err(enc)?;
+                        } else if rs != rd {
+                            self.a.vmovaps(rd, rs).map_err(enc)?;
+                        }
+                    }
+                    Loc::Reg(PReg::G(_)) => unreachable!(),
+                }
+                self.x_fin(*d, rd)
+            }
+            _ => unreachable!(),
+        }
+    }
+
+    /// Cranelift's scalar fmin/fmax (`XmmMinMaxSeq`), so NaN and ±0
+    /// results agree bit for bit: with t = b,
+    ///   ucomiss t, a; jne mm; jp nan; {or,and}ps t, a; jmp done
+    ///   nan: addss t, a; jmp done      (a NaN operand, quieted, b first)
+    ///   mm:  {min,max}ss t, a          (ordered and different)
+    fn min_max(&mut self, is_min: bool, d: VReg, a: VReg, b: VReg) -> Result<(), BackendError> {
+        match self.x_ss(b) {
+            X::R(r) => self.a.vmovaps(XS1, r).map_err(enc)?,
+            X::M(m) => self.a.vmovss(XS1, m).map_err(enc)?,
+        }
+        let ra = self.x_reg(a, XS0)?;
+        let mut mm = self.a.create_label();
+        let mut nan = self.a.create_label();
+        let mut done = self.a.create_label();
+        self.a.vucomiss(XS1, ra).map_err(enc)?;
+        self.a.jne(mm).map_err(enc)?;
+        self.a.jp(nan).map_err(enc)?;
+        if is_min {
+            self.a.vorps(XS1, XS1, ra).map_err(enc)?;
+        } else {
+            self.a.vandps(XS1, XS1, ra).map_err(enc)?;
+        }
+        self.a.jmp(done).map_err(enc)?;
+        self.a.set_label(&mut nan).map_err(enc)?;
+        self.a.vaddss(XS1, XS1, ra).map_err(enc)?;
+        self.a.jmp(done).map_err(enc)?;
+        self.a.set_label(&mut mm).map_err(enc)?;
+        if is_min {
+            self.a.vminss(XS1, XS1, ra).map_err(enc)?;
+        } else {
+            self.a.vmaxss(XS1, XS1, ra).map_err(enc)?;
+        }
+        self.a.set_label(&mut done).map_err(enc)?;
+        self.x_fin(d, XS1)
+    }
+
     fn fma(&mut self, d: VReg, a: VReg, b: VReg, c: VReg) -> Result<(), BackendError> {
         let rd = self.x_dst(d);
         let reg_is = |e: &Self, v: VReg| e.x_preg(v) == Some(rd) && e.x_preg(d).is_some();

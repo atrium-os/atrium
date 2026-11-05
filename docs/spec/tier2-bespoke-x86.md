@@ -1,6 +1,6 @@
 # Tier-2 bespoke backend for x86_64
 
-Status: phases 1-8 landed 2026-11-05 (phase 5 scalarised only; packed forms move to phase 9); phase 9 first run on a cloud Xeon passes the bar (§6), the R9700 run is pending. Owner: the x86_64 port thread. Companion to
+Status: phases 1-8 landed 2026-11-05 (phase 5 scalarised only; packed forms move to phase 9); phase 9 run on a cloud Xeon passes the bar (§6); packed vectors landed. Owner: the x86_64 port thread. Companion to
 [x86_64-port.md](x86_64-port.md) §1 and the arm64 backend in
 `atrium-spv-backend-bespoke/`.
 
@@ -92,7 +92,14 @@ two runs:
 | bespoke-x86 | 421-424 | 118-122 |
 | Cranelift-x86 | 458-481 | 107-109 |
 
-Bespoke-x86 clears the 90% bar and is 8-12% faster than Cranelift-x86. Unlike on arm64, cc
+Update, same day: those bespoke numbers used a bare `vminss` for FMin, which differs from
+Cranelift (and the arm64 backend) on NaN and ±0 inputs. With Cranelift's exact sequence
+(compare, then min / or / add) bespoke-x86 measures 474-478 ns/pixel, 106-112% of cc and level
+with Cranelift on this min-heavy kernel. The vector work (packed loads/stores, lane-wise
+add/sub/mul/div, matrix × vector) doesn't show here, since this kernel is a scalar chain; a
+matrix-times-vector vertex shader shrank from 305 to 108 bytes.
+
+Originally: bespoke-x86 clears the 90% bar and is 8-12% faster than Cranelift-x86. Unlike on arm64, cc
 is not a true ceiling here: without `-ffast-math`, `fminf` stays a libm call on x86, so the
 C reference pays a call per step that the shader backends lower to `vminss` sequences.
 Outputs agree across backends. Compile time (debug `atrium-spv-compile`, wall clock per

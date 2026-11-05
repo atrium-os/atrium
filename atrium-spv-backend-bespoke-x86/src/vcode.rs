@@ -40,12 +40,14 @@ pub(crate) enum Class {
     G,
     /// General-purpose register holding a 64-bit pointer.
     P,
+    /// XMM register, packed f32 lanes (2-4 of them; the rest undefined).
+    V,
 }
 
 impl Class {
     /// Register file: XMM or GPR.
     pub fn is_xmm(self) -> bool {
-        matches!(self, Class::X)
+        matches!(self, Class::X | Class::V)
     }
 }
 
@@ -274,6 +276,19 @@ pub(crate) enum MInst {
     GUn { op: GUnOp, d: VReg, a: VReg },
     GDiv { kind: DivKind, d: VReg, a: VReg, b: VReg },
     GCmp { cc: ICond, d: VReg, a: VReg, b: VReg },
+    /// Packed f32 (class V): load or store `n` (2-4) lanes.
+    VLoad { d: VReg, addr: Addr, n: u8 },
+    VStore { addr: Addr, s: VReg, n: u8 },
+    /// Lane-wise add/sub/mul/div/min/max.
+    VBin { op: XOp, d: VReg, a: VReg, b: VReg },
+    /// d = a * b + c lane-wise, fused.
+    VFma { d: VReg, a: VReg, b: VReg, c: VReg },
+    /// Every lane = the scalar s.
+    VBroadcast { d: VReg, s: VReg },
+    /// Packed from scalar lanes.
+    VPack { d: VReg, lanes: Vec<VReg> },
+    /// Scalar d = lane `lane` of packed s.
+    XExtract { d: VReg, s: VReg, lane: u8 },
     /// GBin, GShift and GCmp with a constant right operand.
     GBinI { op: GOp, d: VReg, a: VReg, imm: i32 },
     GShiftI { op: ShiftOp, d: VReg, a: VReg, imm: u8 },
@@ -358,6 +373,21 @@ impl MInst {
             XUn { a, .. } | GUn { a, .. } | GBinI { a, .. } | GShiftI { a, .. } | GCmpI { a, .. } => {
                 out.push(*a)
             }
+            VLoad { addr, .. } => {
+                if let Base::V(b) = addr.base {
+                    out.push(b);
+                }
+            }
+            VStore { addr, s, .. } => {
+                if let Base::V(b) = addr.base {
+                    out.push(b);
+                }
+                out.push(*s);
+            }
+            VBin { a, b, .. } => out.extend([*a, *b]),
+            VFma { a, b, c, .. } => out.extend([*a, *b, *c]),
+            VBroadcast { s, .. } | XExtract { s, .. } => out.push(*s),
+            VPack { lanes, .. } => out.extend(lanes.iter().copied()),
             CvtSToF { a, .. } | CvtUToF { a, .. } | CvtFToS { a, .. } | CvtFToU { a, .. } => {
                 out.push(*a)
             }
@@ -404,6 +434,12 @@ impl MInst {
             | GDiv { d, .. }
             | GCmp { d, .. }
             | GBinI { d, .. }
+            | VLoad { d, .. }
+            | VBin { d, .. }
+            | VFma { d, .. }
+            | VBroadcast { d, .. }
+            | VPack { d, .. }
+            | XExtract { d, .. }
             | GShiftI { d, .. }
             | GCmpI { d, .. }
             | FCmp { d, .. }
@@ -561,6 +597,11 @@ struct Lower<'f> {
     fixed: HashMap<VReg, PReg>,
     hints: HashMap<VReg, VReg>,
     lanes: HashMap<ValueId, Vec<VReg>>,
+    /// Values that also have a packed (class V) form, defined where the
+    /// value is, so it dominates every use.
+    packed: HashMap<ValueId, VReg>,
+    /// Mat4 values loaded from memory: their columns, packed.
+    packed_mat: HashMap<ValueId, Vec<VReg>>,
     ptrs: HashMap<ValueId, Ptr>,
     args: HashMap<Arg, VReg>,
     /// Precoloured argument vregs, defined by Entry.
@@ -646,6 +687,8 @@ pub(crate) fn lower(func: &Function) -> Result<VCode, BackendError> {
         fixed: HashMap::new(),
         hints: HashMap::new(),
         lanes: HashMap::new(),
+        packed: HashMap::new(),
+        packed_mat: HashMap::new(),
         ptrs: HashMap::new(),
         args: HashMap::new(),
         raw_args: Vec::new(),
@@ -717,6 +760,7 @@ impl<'f> Lower<'f> {
                     Class::X => MInst::XMov { d: v, s: raw },
                     Class::G => MInst::GMov { d: v, s: raw },
                     Class::P => MInst::PMov { d: v, s: raw },
+                    Class::V => unreachable!("no packed ABI arguments"),
                 });
             }
             ArgSrc::Stack(off) => {
@@ -882,7 +926,7 @@ impl<'f> Lower<'f> {
             lb = vec![lb[0]; n];
         }
         if la.len() != n || lb.len() != n {
-            return unsupported(format!("{}: lane counts", op_name(&inst.op)));
+            return unsupported(format!("{}: lane counts {} {} -> {n}", op_name(&inst.op), la.len(), lb.len()));
         }
         if la.iter().chain(&lb).any(|v| self.class_of(*v) != want) {
             return unsupported(format!("{} on {:?}", op_name(&inst.op), a.ty));
@@ -918,7 +962,59 @@ impl<'f> Lower<'f> {
     }
 
     fn xbin(&mut self, inst: &Inst, a: &Value, b: &Value, op: XOp) -> Result<(), BackendError> {
+        let res = Self::result(inst)?;
+        // Min/Max stay scalar: matching Cranelift's NaN and ±0 rules takes
+        // a compare-and-branch per lane (see the emitter).
+        let lanewise_exact = matches!(op, XOp::Add | XOp::Sub | XOp::Mul | XOp::Div);
+        if let (Some(n), true) = (packable(&res.ty), lanewise_exact) {
+            if self.packed.contains_key(&a.id) || self.packed.contains_key(&b.id) {
+                if let (Some(pa), Some(pb)) = (self.as_packed(a, n)?, self.as_packed(b, n)?) {
+                    let d = self.vreg(Class::V);
+                    self.code.push(MInst::VBin { op, d, a: pa, b: pb });
+                    return self.define_packed(res, d, n);
+                }
+            }
+        }
         self.lanewise2(inst, a, b, Class::X, |d, a, b| MInst::XBin { op, d, a, b })
+    }
+
+    /// The packed form of `v` with `n` lanes: its own, a broadcast of a
+    /// scalar, or packed from its lanes here (not cached: this point need
+    /// not dominate later uses). None if `v` isn't f32 lanes.
+    fn as_packed(&mut self, v: &Value, n: usize) -> Result<Option<VReg>, BackendError> {
+        if let Some(&p) = self.packed.get(&v.id) {
+            return Ok(Some(p));
+        }
+        let l = self.lanes_of(v)?;
+        if l.iter().any(|&r| self.class_of(r) != Class::X) {
+            return Ok(None);
+        }
+        let d = self.vreg(Class::V);
+        if l.len() == 1 {
+            self.code.push(MInst::VBroadcast { d, s: l[0] });
+        } else if l.len() == n {
+            self.code.push(MInst::VPack { d, lanes: l });
+        } else {
+            return Ok(None);
+        }
+        Ok(Some(d))
+    }
+
+    /// Define `res` from packed `p`: record it, and extract every lane
+    /// right here (DCE drops the extracts nobody reads).
+    fn define_packed(&mut self, res: &Value, p: VReg, n: usize) -> Result<(), BackendError> {
+        let mut lanes = Vec::with_capacity(n);
+        for k in 0..n {
+            let d = self.vreg(Class::X);
+            if k == 0 {
+                self.hints.insert(d, p);
+            }
+            self.code.push(MInst::XExtract { d, s: p, lane: k as u8 });
+            lanes.push(d);
+        }
+        self.lanes.insert(res.id, lanes);
+        self.packed.insert(res.id, p);
+        Ok(())
     }
 
     fn gbin(&mut self, inst: &Inst, a: &Value, b: &Value, op: GOp) -> Result<(), BackendError> {
@@ -998,6 +1094,7 @@ impl<'f> Lower<'f> {
             Class::X => MInst::XMov { d, s },
             Class::G => MInst::GMov { d, s },
             Class::P => MInst::PMov { d, s },
+            Class::V => unreachable!("packed values never flow through phis"),
         };
         // Sequentialise the parallel copy: emit a move once nothing still
         // pending reads its destination; break a cycle by saving one
@@ -1082,6 +1179,17 @@ impl<'f> Lower<'f> {
             Op::FMax(a, b) => self.xbin(inst, a, b, XOp::Max)?,
             Op::Fma(a, b, c) => {
                 let res = Self::result(inst)?;
+                if let Some(n) = packable(&res.ty) {
+                    if [a, b, c].iter().any(|v| self.packed.contains_key(&v.id)) {
+                        if let (Some(pa), Some(pb), Some(pc)) =
+                            (self.as_packed(a, n)?, self.as_packed(b, n)?, self.as_packed(c, n)?)
+                        {
+                            let d = self.vreg(Class::V);
+                            self.code.push(M::VFma { d, a: pa, b: pb, c: pc });
+                            return self.define_packed(res, d, n);
+                        }
+                    }
+                }
                 let (la, lb, lc) = (self.lanes_of(a)?, self.lanes_of(b)?, self.lanes_of(c)?);
                 let d = self.define(res)?;
                 let n = d.len();
@@ -1372,9 +1480,29 @@ impl<'f> Lower<'f> {
                 let p = self.ptr_of(ptr)?;
                 let d = self.define(res)?;
                 self.load_lanes(p, &d);
+                // Also the packed load; DCE keeps whichever form is used.
+                if matches!(res.ty, Type::Mat4(VecElement::F32)) {
+                    let c: Vec<VReg> = (0..4)
+                        .map(|j| {
+                            let v = self.vreg(Class::V);
+                            self.code.push(M::VLoad { d: v, addr: Addr { base: p.base, off: p.off + 16 * j }, n: 4 });
+                            v
+                        })
+                        .collect();
+                    self.packed_mat.insert(res.id, c);
+                }
+                if let Some(n) = packable(&res.ty) {
+                    let v = self.vreg(Class::V);
+                    self.code.push(M::VLoad { d: v, addr: Addr { base: p.base, off: p.off }, n: n as u8 });
+                    self.packed.insert(res.id, v);
+                }
             }
             Op::Store { ptr, value } => {
                 let p = self.ptr_of(ptr)?;
+                if let (Some(n), Some(&v)) = (packable(&value.ty), self.packed.get(&value.id)) {
+                    self.code.push(M::VStore { addr: Addr { base: p.base, off: p.off }, s: v, n: n as u8 });
+                    return Ok(());
+                }
                 for (i, v) in self.lanes_of(value)?.into_iter().enumerate() {
                     let addr = Addr { base: p.base, off: p.off + 4 * i as i32 };
                     self.code.push(match self.class_of(v) {
@@ -1400,20 +1528,60 @@ impl<'f> Lower<'f> {
                 if cols.len() != 16 || v.len() != 4 || lane_classes(&res.ty)?.len() != 4 {
                     return unsupported("MatrixTimesVector shape");
                 }
-                let mut out = Vec::new();
-                for i in 0..4 {
-                    let mut acc = self.vreg(Class::X);
-                    self.code.push(M::XBin { op: XOp::Mul, d: acc, a: cols[i], b: v[0] });
-                    for j in 1..4 {
-                        let p = self.vreg(Class::X);
-                        self.code.push(M::XBin { op: XOp::Mul, d: p, a: cols[4 * j + i], b: v[j] });
-                        let s = self.vreg(Class::X);
-                        self.code.push(M::XBin { op: XOp::Add, d: s, a: acc, b: p });
-                        acc = s;
+                // Packed: acc = c0 * v0; acc += c_j * v_j, multiply then add,
+                // in Cranelift's order per lane.
+                {
+                    let pcols: Vec<VReg> = match &matrix.ty {
+                        Type::Pointer(..) => {
+                            let p = self.ptr_of(matrix)?;
+                            (0..4)
+                                .map(|j| {
+                                    let d = self.vreg(Class::V);
+                                    let addr = Addr { base: p.base, off: p.off + 16 * j };
+                                    self.code.push(M::VLoad { d, addr, n: 4 });
+                                    d
+                                })
+                                .collect()
+                        }
+                        _ => match self.packed_mat.get(&matrix.id) {
+                            Some(c) => c.clone(),
+                            None => {
+                                // Only lanes: the scalar form, no packing.
+                                let mut out = Vec::new();
+                                for i in 0..4 {
+                                    let mut acc = self.vreg(Class::X);
+                                    self.code.push(M::XBin { op: XOp::Mul, d: acc, a: cols[i], b: v[0] });
+                                    for j in 1..4 {
+                                        let p = self.vreg(Class::X);
+                                        self.code.push(M::XBin { op: XOp::Mul, d: p, a: cols[4 * j + i], b: v[j] });
+                                        let s = self.vreg(Class::X);
+                                        self.code.push(M::XBin { op: XOp::Add, d: s, a: acc, b: p });
+                                        acc = s;
+                                    }
+                                    out.push(acc);
+                                }
+                                self.lanes.insert(res.id, out);
+                                return Ok(());
+                            }
+                        },
+                    };
+                    let mut acc = None;
+                    for j in 0..4 {
+                        let b = self.vreg(Class::V);
+                        self.code.push(M::VBroadcast { d: b, s: v[j] });
+                        let p = self.vreg(Class::V);
+                        self.code.push(M::VBin { op: XOp::Mul, d: p, a: pcols[j], b });
+                        acc = Some(match acc {
+                            None => p,
+                            Some(a) => {
+                                let s = self.vreg(Class::V);
+                                self.code.push(M::VBin { op: XOp::Add, d: s, a, b: p });
+                                s
+                            }
+                        });
                     }
-                    out.push(acc);
+                    return self.define_packed(res, acc.unwrap(), 4);
                 }
-                self.lanes.insert(res.id, out);
             }
 
             // ── compute: atomics and barriers ─────────────────────────
@@ -2192,5 +2360,15 @@ pub(crate) fn fold_immediates(vc: &mut VCode) {
         if let Some(n) = new {
             *inst = n;
         }
+    }
+}
+
+/// Lane count of an f32 vector type worth packing.
+fn packable(ty: &Type) -> Option<usize> {
+    match ty {
+        Type::Vec2(VecElement::F32) => Some(2),
+        Type::Vec3(VecElement::F32) => Some(3),
+        Type::Vec4(VecElement::F32) => Some(4),
+        _ => None,
     }
 }
