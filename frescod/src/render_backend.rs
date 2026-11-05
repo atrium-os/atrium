@@ -186,6 +186,27 @@ impl<'a> Backend<'a> {
         }
     }
 
+    /// After a device reset (GPU ABI v2.1 §10.3) the gpu renderer's GPU state
+    /// may be gone: switch to Tier-2, which needs nothing from the GPU but the
+    /// scanout copy, so the screen comes back at once. Returns whether it
+    /// switched. Tier-2 takes frames as well, so split mode's renderers keep
+    /// working unchanged.
+    pub fn fall_back_to_cpu(&mut self, width: u32, height: u32) -> Result<bool> {
+        if !matches!(self, Backend::Gpu(_)) {
+            return Ok(false);
+        }
+        *self = Backend::Compute(Box::new(Compute::new(width, height)?));
+        Ok(true)
+    }
+
+    /// Go back to the gpu renderer once the GPU has stayed up (see
+    /// `fall_back_to_cpu`). A failure leaves Tier-2 in place.
+    pub fn back_to_gpu(&mut self, vm: &'a Vm<'a>, width: u32, height: u32) -> Result<()> {
+        let arch = gpu_arch(vm)?;
+        *self = Backend::Gpu(Box::new(GpuCompute::new(vm, arch, width, height)?));
+        Ok(())
+    }
+
     pub fn name(&self) -> &'static str {
         match self {
             Backend::Vulkan(_) => "vulkan",

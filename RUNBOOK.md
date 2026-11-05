@@ -5218,6 +5218,10 @@ In the guest:
   jaild has started frescod, the display is leased to it and host root's
   open gets `EPERM`: stop frescod and `sysctl
   dev.atrium_gpu_amd_display.0.lease=""` before running the display tests.
+  `atrium-gpu-rs`'s `gpu_reset` triggers one device reset (FLR) for recovery
+  tests: with frescod running, the screen should come back within a frame or
+  two (frescod logs "device reset (generation N)"); without it the screen goes
+  black, since gpusim wipes VRAM. `reset_coord` checks the kernel side.
   frescod's jail needs devfs ruleset 23 loaded (`service devfs restart` after
   installing `etc/atrium.devfs.rules`). Expected as of 2026-11-04:
   suite 28/28, isolation 50/50.

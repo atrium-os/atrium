@@ -42,7 +42,7 @@ mod split;
 mod gpu_app;
 mod chrome;
 
-use atrium_gpu::amd::{Display, Gpu, Scanout, COMMIT_MODESET};
+use atrium_gpu::amd::{Display, Gpu, ResetWatch, Scanout, COMMIT_MODESET};
 
 use fresco_scene_server::cas::store::CasStore;
 use fresco_scene_server::command::envelope_frontend::EnvelopeFrontend;
@@ -198,6 +198,37 @@ fn main() -> std::io::Result<()> {
         injector_reader::spawn(ev_tx, comp.clone(), mode.width, mode.height, sock);
     }
 
+    /* ── Device resets (GPU ABI v2.1 §10.3) ──────────────────────────
+     * A device reset can wipe VRAM, the frame on screen included. The
+     * display tells us with a NOTE_RESET kqueue event; a thread waits on it
+     * and wakes the frame loop, which re-presents at once instead of at the
+     * next heartbeat. The gpu renderer falls back to Tier-2 for the
+     * recovery, since its GPU state may be gone, and goes back to the GPU
+     * once no reset has come for GPU_BACK_AFTER. */
+    const GPU_BACK_AFTER: Duration = Duration::from_secs(5);
+    let reset_gen = Arc::new(std::sync::atomic::AtomicU64::new(0));
+    match ResetWatch::new(&dpy) {
+        Ok(watch) => {
+            let (gen, rd) = (reset_gen.clone(), redraw.clone());
+            std::thread::Builder::new().name("reset-watch".into()).spawn(move || loop {
+                match watch.wait(None) {
+                    Ok(Some(g)) => {
+                        gen.store(g, std::sync::atomic::Ordering::SeqCst);
+                        rd.wake();
+                    }
+                    Ok(None) => {}
+                    Err(e) => {
+                        eprintln!("frescod: reset watch stopped: {e}");
+                        return;
+                    }
+                }
+            })?;
+        }
+        Err(e) => eprintln!("frescod: no NOTE_RESET from the display ({e}); a reset repaints at the next heartbeat"),
+    }
+    let mut handled_gen: u64 = 0;
+    let mut gpu_back_at: Option<Instant> = None;
+
     /* ── Frame loop ─────────────────────────────────────────────── */
     /* Frame 1 lights the CRTC with buffer 0 (MODESET is immediate). */
     let mut frame: u64 = 1;
@@ -244,16 +275,44 @@ fn main() -> std::io::Result<()> {
         .checked_sub(IDLE_HEARTBEAT)
         .unwrap_or_else(Instant::now);
     loop {
+        let gen = reset_gen.load(std::sync::atomic::Ordering::SeqCst);
+        let reset_due = gen != handled_gen;
+        if reset_due {
+            handled_gen = gen;
+            eprintln!("frescod: device reset (generation {gen}): re-presenting the screen");
+            match renderer.fall_back_to_cpu(mode.width, mode.height) {
+                Ok(true) => {
+                    eprintln!("frescod: renderer -> {} until the GPU stays up", renderer.name());
+                    gpu_back_at = Some(Instant::now() + GPU_BACK_AFTER);
+                }
+                Ok(false) => {
+                    if gpu_back_at.is_some() {
+                        gpu_back_at = Some(Instant::now() + GPU_BACK_AFTER);
+                    }
+                }
+                Err(e) => return Err(io_other(format!("Tier-2 fallback after reset: {e}"))),
+            }
+        }
+        if gpu_back_at.is_some_and(|t| Instant::now() >= t) {
+            gpu_back_at = None;
+            match renderer.back_to_gpu(&vm, mode.width, mode.height) {
+                Ok(()) => eprintln!("frescod: GPU stayed up; renderer -> {}", renderer.name()),
+                Err(e) => eprintln!("frescod: GPU renderer not back ({e}); staying on Tier-2"),
+            }
+        }
         let cur = redraw.current();
         let heartbeat_due = last_render.elapsed() >= heartbeat;
-        if cur == last_gen && !heartbeat_due {
+        if cur == last_gen && !heartbeat_due && !reset_due {
             /* Nothing changed since the last present — sleep until the
              * next damage signal, or until the heartbeat comes due,
              * consuming no CPU meanwhile. The bounded wait is the safety
              * net: even a damage source not wired to `redraw` refreshes
              * within `heartbeat`. */
-            let until_beat =
+            let mut until_beat =
                 heartbeat.saturating_sub(last_render.elapsed());
+            if let Some(t) = gpu_back_at {
+                until_beat = until_beat.min(t.saturating_duration_since(Instant::now()));
+            }
             redraw.wait_past(last_gen, until_beat);
             continue;
         }
@@ -262,7 +321,14 @@ fn main() -> std::io::Result<()> {
          * this one starts, both because its flip released the buffer we are
          * about to fill and because nothing presents faster than the
          * refresh. Damage that lands meanwhile coalesces into this frame. */
-        flip_done.wait(frame, flip_timeout_ms())?;
+        if let Err(e) = flip_done.wait(frame, flip_timeout_ms()) {
+            /* The reset may have taken the last flip's copy with it; the
+             * display kept its buffer, so go on and commit a fresh frame. */
+            if !reset_due {
+                return Err(e);
+            }
+            eprintln!("frescod: frame {frame} did not land across the reset ({e}); presenting anew");
+        }
 
         /* Snapshot the generation AFTER the wait so damage during it is
          * folded into this present rather than triggering an extra one. */
