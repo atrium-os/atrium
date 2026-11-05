@@ -318,6 +318,65 @@ pub fn has_pseudo_element(c: &Complex) -> bool {
 /// how the visually-hidden idiom (`.skip-link:not(:focus)`) keeps its link
 /// out of the masthead. The cost: the rule stays on in the state too, so a
 /// focused skip link stays hidden. A document has no focus ring to show it.
+/// ★★ WHICH ELEMENTS A SELECTOR COULD MATCH, without asking each one
+/// (legacy-web §5.4.5.7). Every rule used to be tried on every element:
+/// spiegel.de, 514 KB of CSS over 8,714 elements, made 48.7 M compound tests.
+/// As browsers do, elements are indexed by id, class and tag, and a selector
+/// is tried only on the elements its SUBJECT compound requires — its id if
+/// it names one, else its rarest class, else its tag, else all. Only simple
+/// selectors directly in the subject compound are used (never inside
+/// `:not()`/`:is()`), and the matcher's own tests are exact (`id`, a class
+/// token, an ASCII-case-insensitive tag), so each bucket is a SUPERSET of the
+/// matches. Buckets keep document order, so the matches are the same
+/// elements in the same order as the full scan's.
+pub struct RuleIndex {
+    ids: std::collections::HashMap<String, Vec<Handle>>,
+    classes: std::collections::HashMap<String, Vec<Handle>>,
+    tags: std::collections::HashMap<String, Vec<Handle>>,
+    all: Vec<Handle>,
+}
+
+impl RuleIndex {
+    pub fn new(dom: &Dom, els: &[Handle]) -> Self {
+        let mut ix = RuleIndex { ids: Default::default(), classes: Default::default(), tags: Default::default(), all: els.to_vec() };
+        for &h in els {
+            if let Some(i) = dom.attr(h, "id") { ix.ids.entry(i.to_string()).or_default().push(h) }
+            if let Some(c) = dom.attr(h, "class") {
+                let mut seen: Vec<&str> = vec![];
+                for t in c.split_ascii_whitespace() {
+                    if !seen.contains(&t) { seen.push(t); ix.classes.entry(t.to_string()).or_default().push(h) }
+                }
+            }
+            ix.tags.entry(dom.tag(h).unwrap_or("").to_ascii_lowercase()).or_default().push(h);
+        }
+        ix
+    }
+
+    /// Every indexed element, in document order.
+    pub fn all(&self) -> &[Handle] { &self.all }
+
+    /// The elements `c` could match, in document order.
+    pub fn candidates(&self, c: &Complex) -> &[Handle] {
+        const NONE: &[Handle] = &[];
+        let Some((_, subject)) = c.0.last() else { return NONE };
+        if let Some(i) = subject.iter().find_map(|s| if let Simple::Id(i) = s { Some(i) } else { None }) {
+            return self.ids.get(i).map(Vec::as_slice).unwrap_or(NONE);
+        }
+        let mut best: Option<&[Handle]> = None;
+        for s in subject {
+            if let Simple::Class(k) = s {
+                let v = self.classes.get(k).map(Vec::as_slice).unwrap_or(NONE);
+                if best.is_none_or(|b| v.len() < b.len()) { best = Some(v) }
+            }
+        }
+        if let Some(b) = best { return b }
+        if let Some(t) = subject.iter().find_map(|s| if let Simple::Type(t) = s { Some(t) } else { None }) {
+            return self.tags.get(&t.to_ascii_lowercase()).map(Vec::as_slice).unwrap_or(NONE);
+        }
+        &self.all
+    }
+}
+
 pub struct Matcher<'a> { pub dom: &'a Dom, negated: std::cell::Cell<u32>, steps: std::cell::Cell<u64>, limit: u64 }
 
 impl<'a> Matcher<'a> {

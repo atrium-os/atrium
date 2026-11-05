@@ -208,6 +208,7 @@ pub fn normalize(html: &str, inputs: &Inputs) -> (String, Report) {
         .filter(|h| matches!(dom.get(*h).map(|n| &n.kind), Some(Kind::Element(_)))).collect();
     let matcher_dom = navigator_dom::parse(html); // a stable copy to match against
     let m = sel::Matcher::new(&matcher_dom).with_budget(budget.match_steps);
+    let index = sel::RuleIndex::new(&matcher_dom, &els);
     // Past the element budget the cascade is not attempted: every rule
     // would be matched against every element. The text is kept.
     if els.len() > budget.elements {
@@ -221,7 +222,7 @@ pub fn normalize(html: &str, inputs: &Inputs) -> (String, Report) {
     // `@media (prefers-color-scheme: dark)` block set, and renders every
     // page in its dark palette no matter the environment. That is what the
     // first version did, and the render is what showed it.
-    let custom = resolve_customs(&sheet, &els, &m, &dom);
+    let custom = resolve_customs(&sheet, &index, &m, &dom);
 
     // key: (element, state, media) -> property -> (priority, value)
     type Key = (Handle, String, String);
@@ -268,7 +269,7 @@ pub fn normalize(html: &str, inputs: &Inputs) -> (String, Report) {
                 continue;
             }
             let state = states.join(":");
-            for h in &els {
+            for h in index.candidates(c) {
                 if !m.matches(*h, c) { continue }
                 let key = (*h, state.clone(), media.clone());
                 let slot = resolved.entry(key).or_default();
@@ -621,7 +622,7 @@ pub fn normalize(html: &str, inputs: &Inputs) -> (String, Report) {
     // context, because padding and width change at breakpoints. The UA's own
     // padding counts too — a `<ul>`'s 40 px is padding like any other.
     {
-        let ua = ua_values(&els, &m);
+        let ua = ua_values(&index, &m);
         let get = |h: Handle, ctx: &str, p: &str| -> Option<String> {
             resolved.get(&(h, String::new(), ctx.to_string())).and_then(|x| x.get(p)).map(|(_, v)| v.clone())
                 .or_else(|| resolved.get(&(h, String::new(), String::new())).and_then(|x| x.get(p)).map(|(_, v)| v.clone()))
@@ -705,7 +706,7 @@ pub fn normalize(html: &str, inputs: &Inputs) -> (String, Report) {
     }
 
     // ★ MARGIN COLLAPSING, compiled into literal margins (see `collapse`).
-    collapse::compile(&mut resolved, &dom, &ua_values(&els, &m), &mut report);
+    collapse::compile(&mut resolved, &dom, &ua_values(&index, &m), &mut report);
 
     // ★ Resolve named areas into the numeric lines the profile admits —
     // PER MEDIA CONTEXT. A responsive page keeps its whole layout in the
@@ -1000,7 +1001,7 @@ fn detach(dom: &mut Dom, h: Handle) {
 /// An element's custom properties: name -> value tokens, shared.
 type Customs = BTreeMap<String, Rc<Vec<Token>>>;
 
-fn resolve_customs(sheet: &css::Sheet, els: &[Handle], m: &sel::Matcher, dom: &Dom)
+fn resolve_customs(sheet: &css::Sheet, index: &sel::RuleIndex, m: &sel::Matcher, dom: &Dom)
     -> BTreeMap<(Handle, String), Rc<Customs>> {
     // Winners per (element, media), by the same priority rule as any property.
     let mut own: BTreeMap<(Handle, String), BTreeMap<String, (Priority, Rc<Vec<Token>>)>> = BTreeMap::new();
@@ -1013,7 +1014,7 @@ fn resolve_customs(sheet: &css::Sheet, els: &[Handle], m: &sel::Matcher, dom: &D
         for c in &list {
             if sel::has_pseudo_element(c) { continue }
             let spec = sel::specificity(c);
-            for h in els {
+            for h in index.candidates(c) {
                 if !m.matches(*h, c) { continue }
                 let slot = own.entry((*h, media.clone())).or_default();
                 for d in rule.decls.iter().filter(|d| d.name.starts_with("--")) {
@@ -1044,7 +1045,7 @@ fn resolve_customs(sheet: &css::Sheet, els: &[Handle], m: &sel::Matcher, dom: &D
         if !media.is_empty() { ctxs.push(media.clone()) }
         let mut memo: BTreeMap<Handle, Rc<Customs>> = BTreeMap::new();
         let empty: Rc<Customs> = Rc::new(BTreeMap::new());
-        for h in els {
+        for h in index.all() {
             // Walk up to the nearest ancestor already resolved (or the root).
             let mut chain = vec![];
             let mut cur = Some(*h);
@@ -1076,17 +1077,21 @@ fn resolve_customs(sheet: &css::Sheet, els: &[Handle], m: &sel::Matcher, dom: &D
 
 /// Every UA-sheet declaration that applies to each element, by source order
 /// (the UA sheet is simple enough that order alone decides).
-fn ua_values(els: &[Handle], m: &sel::Matcher) -> BTreeMap<Handle, BTreeMap<String, String>> {
+fn ua_values(index: &sel::RuleIndex, m: &sel::Matcher) -> BTreeMap<Handle, BTreeMap<String, String>> {
     let mut ua_sheet = css::Sheet::default();
     let mut ua_order = 0usize;
     css::parse(navigator_style::cascade::UA_CSS, &mut ua_order, &mut ua_sheet);
     let mut ua: BTreeMap<Handle, BTreeMap<String, String>> = BTreeMap::new();
     for rule in &ua_sheet.rules {
         let Ok(list) = sel::parse_list(&rule.selector) else { continue };
-        for h in els {
-            if !list.iter().any(|c| m.matches(*h, c)) { continue }
-            for d in &rule.decls {
-                ua.entry(*h).or_default().insert(d.name.clone(), css::write_tokens(&d.value).trim().to_string());
+        // An element matched by two of the list's selectors gets the same
+        // declarations twice: the same values, so the same map.
+        for c in &list {
+            for h in index.candidates(c) {
+                if !m.matches(*h, c) { continue }
+                for d in &rule.decls {
+                    ua.entry(*h).or_default().insert(d.name.clone(), css::write_tokens(&d.value).trim().to_string());
+                }
             }
         }
     }
