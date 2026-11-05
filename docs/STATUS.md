@@ -89,6 +89,7 @@ compute route chosen; security conditions F1–F6 in
 | D2/D3 `fresco-compute` bin + raster kernels, Tier-2 matches reference; `FRESCOD_RENDERER=compute` | done | `ce1d804`, golden `6ca05f0` |
 | GPU renderer: `FRESCOD_RENDERER=gpu` draws via RDNA4 kernels on gpusim; architecture behind `fresco_compute::gpu::Arch` (RDNA4 the one built in) | done | `7c1ec1b` |
 | `compute` is frescod's default renderer (Vulkan opt-in); gpu renderer arch from `CAP_ISA` | done | `1455488`, `da65060` |
+| F4e one GPU VM per window (gpu renderer); compose maps surfaces read-only | done | |
 | Damage tracking (only dirty tiles re-rastered; 15 s → 0.4 s/frame on gpusim) | done | `57035bc` |
 | F2 bounds hardening + differential fuzzer | done | `9323062` |
 | F4a per-window surfaces + compose kernel | done | `a20492f`, `797a3e5` |

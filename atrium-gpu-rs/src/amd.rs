@@ -410,6 +410,25 @@ impl<'a> Vm<'a> {
         Ok(Bo { gpu: self.gpu, fd: a.bo_fd as RawFd, gpu_va: b.va, size })
     }
 
+    /// Map `bo`, which another VM of the same device allocated, into this
+    /// one as well: read-only to the GPU here if `readonly` (VM_BIND2,
+    /// ABI rev 3). The returned [`Bo`] holds its own fd (a dup), so either
+    /// handle may be dropped first; the pages live until both are gone and
+    /// no queue can still touch them.
+    pub fn share(&self, bo: &Bo<'_>, readonly: bool) -> io::Result<Bo<'a>> {
+        let fd = unsafe { libc::fcntl(bo.fd, libc::F_DUPFD_CLOEXEC, 0) };
+        if fd < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        let flags = if readonly { BIND_READONLY } else { 0 };
+        let mut b = VmBind2 { vm_fd: self.fd as u32, bo_fd: fd as u32, flags, ..Default::default() };
+        if let Err(e) = unsafe { call(self.gpu.fd, iowr(G, 27, std::mem::size_of::<VmBind2>()), &mut b) } {
+            unsafe { libc::close(fd) };
+            return Err(e);
+        }
+        Ok(Bo { gpu: self.gpu, fd, gpu_va: b.va, size: bo.size })
+    }
+
     pub fn alloc(&self, size: u64, flags: u32) -> io::Result<Bo<'a>> {
         let mut a = BoAlloc { size, flags, ..Default::default() };
         unsafe { call(self.gpu.fd, iowr(G, 0, std::mem::size_of::<BoAlloc>()), &mut a)? };

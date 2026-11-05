@@ -133,11 +133,14 @@ Still open:
 - `FUZZ_GPU=1` adds the app GPU channel (F6 G2): `atrium-gpu-fuzz hostile` for the whole run, then `honest`. On gpusim 3d3700d plus the ABI rev 4 driver, a 60 s run passed except honest's VM-fault check (the work came back done, not EIO), because that gpusim predates VM-fault reporting (354fffb). The RDNA4 thread's run on 354fffb passes it.
 - The WM socket still speaks the full envelope protocol. The WM is trusted (F3 allows it as "equally trusted"), so it is not fuzzed here.
 
-### F4e. One GPU VM per window (waits on F1)
+### F4e. One GPU VM per window. Done (gpu renderer, 2026-11-05)
 
-- Each window's `bin` and `raster` run in a VM that maps only that window's data and surface BOs.
-- Compose runs in a VM that maps every surface read-only, plus the scanout. The surface heap becomes per-window BOs mapped back to back there.
-- This needs the driver to map one BO into two VMs, and the isolation breaks of the 11-03 review fixed first.
+- Each window's `bin` and `raster` run in a VM of its own (`GpuCompute`'s `WinVm`), which maps only the kernels' code (read-only), that window's inputs, staging and ring (staging read-only to the GPU), and its surface.
+- Compose runs in frescod's VM, which maps every window's surface read-only (`Vm::share`, VM_BIND2 `BIND_READONLY`; no driver change was needed) plus the scanout buffers. The compose heap is the span of those mappings: each layer's offset is its surface's VA minus the lowest, in words, so `compose.comp` is unchanged; frescod refuses a span over 16 GiB.
+- Ordering: one submission per drawn window in its VM, each signalling that window's syncobj, then compose. The driver starts another VM's work on a queue only once the queue is idle, so compose sees every raster; if that wait times out (EBUSY), frescod waits on the windows' syncobjs and submits again.
+- A window that is resized or new gets a fresh VM and surface; a closed window's VM goes with it.
+- Verified on gpusim 354fffb with the ABI rev 4 driver: three windows draw (`frescod-f4e-per-window-vms.png`). With `FRESCOD_GPU_ISOLATION_PROBE=1`, windows 2 and 3 raster to the address window 1's surface has in frescod's VM: both fault (EIO, `isolation.vm_faults` 2), and window 1 is drawn intact (`frescod-f4e-isolation-probe.png`). In the one-VM design that write would have landed in window 1.
+- Not covered: the compute (Tier-2) renderer runs all windows in frescod's address space on the CPU; its protection is F2's bounds checks.
 
 ### F4f. Secure input for passwords (waits on F5 and Navigator C0)
 
@@ -146,7 +149,7 @@ Still open:
 
 ## Order
 
-F4b, then F4c (and F4c′), then F4d. F4f follows once F5 and the vault exist. F4e follows F1.
+F4b, then F4c (and F4c′), then F4d. F4f follows once F5 and the vault exist. F4e is done.
 
 ## Decisions taken (recommended; say if you want otherwise)
 
