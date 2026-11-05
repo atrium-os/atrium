@@ -5218,9 +5218,11 @@ In the guest:
   suite 28/28, isolation 50/50.
 - After changing gpusim: rebuild `gpusim-server`, then `cloud-vm.sh down`/`up`
   (and the nextboot/kldload/devctl steps again).
-- gpusim runs dispatches synchronously inside the doorbell MMIO, so the
+- gpusim has run dispatches synchronously inside the doorbell MMIO, so the
   **whole guest freezes for each GPU frame** (ssh times out). If a demo is
-  hogging it, restart the VM rather than trying to ssh in.
+  hogging it, restart the VM rather than trying to ssh in. gpusim `3d31e61`
+  makes the doorbell asynchronous; it is **not yet verified in the VM**, so
+  until it is, assume the freeze.
 - `GPUSIM_RDNA4_BUDGET` (default 2^30 wave instructions) bounds a dispatch;
   `GPUSIM_RDNA4_STATS=1` logs each dispatch's time to `gpusim-server.log`.
   Screenshot the scanout: `screendump f.ppm gpusim0` on the QEMU monitor socket.
@@ -5240,6 +5242,7 @@ In the guest:
 | `FRESCOD_INPUT_SOCK` | input injection socket (F4c routing) |
 | `FRESCOD_CHROME_SOCK` | trusted chrome: `OPEN_CLIENT` then `SET_ORIGIN` (F4d strip) |
 | `FRESCOD_DAMAGE_THRESHOLD` | damage tracking tuning (gpu backend rasters only dirty tiles) |
+| `FRESCOD_GPU_ISOLATION_PROBE=1` | F4e check (gpu renderer): every window after the first rasters to the first window's surface address; expect EIO faults (`isolation.vm_faults`) and window 1 intact |
 | `FRESCOD_GPU_SOCK` | F6 app GPU channel: one GPU context + VM per connection (≤ 4 per uid); `FRESCOD_GPU_ONLY=1` serves only this channel. Test with `atrium-gpu-fuzz` (honest / hostile / isa) |
 
 Broker fuzzing (F3): `scripts/fresco-split-fuzz.sh` in the guest runs `atrium-split-fuzz` (hostile renderers + Navigator) against an animated probe client; `FUZZ_GPU=1` adds `atrium-gpu-fuzz` against the GPU channel. Kill leftover fuzz renderers between runs.

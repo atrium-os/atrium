@@ -161,6 +161,7 @@ flowchart TB
 | Broker fuzzing (F3) | `atrium-split-fuzz` plays hostile renderers and a hostile Navigator; broker sends non-blocking and retires a renderer whose channel is full; per-renderer rate budgets | `atrium-split-fuzz`, `scripts/fresco-split-fuzz.sh` | `9d8429a` |
 | Connection limits | 32 connections per uid; last 64 client ids at most 2 per uid | `fresco-scene-server` | `a43f23f`, `da65060` |
 | App GPU channel (F6) | `FRESCOD_GPU_SOCK`, one GPU context (thread + VM) per connection, ≤ 4 per uid, last 8 of 32 one per uid. Apps send a code header + machine code + closed-set records (bind code, user SGPRs, dispatch, barrier); `atrium-gpu-app` checks every field and writes every PM4 packet; the ring is read-only to the GPU; code mapped read-only. **Option A:** app code is untrusted, the VMID confines it. Hostile ISA (infinite loop, wild stores) is lost with EIO while other apps' work completes | `atrium-gpu-app/`, `frescod/src/gpu_app.rs`, `atrium-gpu-fuzz` | `6dcd221`, `4cf6395`, `a8a595d`, `5f6bd11`, `a8587af`; spec [spec/gpu-app-path-f6.md](spec/gpu-app-path-f6.md) |
+| One GPU VM per window (F4e) | with `FRESCOD_RENDERER=gpu`, each window's bin and raster run in their own VM (code and staging read-only, its own inputs, ring and surface); compose runs in frescod's VM, which maps every surface read-only plus the scanout. `FRESCOD_GPU_ISOLATION_PROBE=1` makes later windows write the first window's surface: both writes fault (EIO). Not applied to the compute renderer | `frescod`, `atrium-gpu-rs` (`Vm::share`) | `e7c3187` |
 | Driver isolation (F1, F6 G1) | the five §A3 breaks closed; per-queue completions; hang watchdog (`hang_ms`, default 5000); VM fault fails that queue's work at once; read-only binds (ABI rev 3); `CAP_ISA` (ABI rev 4); Bus Master cleared on shutdown | `atrium-gpu-amd/` | `73a94ec`, `2dac848`, `622693d`, `bb3f7ba`, `8023c92` |
 
 What is still missing: §11.
@@ -285,7 +286,7 @@ commit is EBUSY. Pacing is by flip-done.
 | Configuration | Renderer | Where verified |
 |---|---|---|
 | amd64 VM + gpusim, default frescod | compute (Tier-2), split on, renderers jailed | cloud VM (`1455488`, `3ccac5d`) |
-| amd64 VM + gpusim, `FRESCOD_RENDERER=gpu` | RDNA4 kernels on gpusim; whole guest freezes per GPU frame | cloud VM (`7c1ec1b`); kernels pixel-exact on the R9700 (oracle v14+, v19 incl. `fresco_compose`) |
+| amd64 VM + gpusim, `FRESCOD_RENDERER=gpu` | RDNA4 kernels on gpusim, one GPU VM per window; the guest freezes per GPU frame until gpusim's async doorbell (gpusim `3d31e61`) is checked in the VM | cloud VM (`7c1ec1b`); kernels pixel-exact on the R9700 (oracle v14+, v19 incl. `fresco_compose`) |
 | `FRESCOD_HEADLESS_PNG` | compute, no display | quickest check |
 | `FRESCOD_RENDERER=vulkan` | lavapipe | legacy; no split |
 
@@ -315,8 +316,9 @@ Tier-2 or our RDNA4 compiler. Mesa appears in three places only:
   graphics-pipeline (NGG/raster/blend) backend has nothing to run on yet.
 - **No native Vulkan driver** for third-party apps on `'A'`; they run on
   Tier-2 or the Mac host.
-- **Fresco security items left:** F4e (one GPU VM per window), F4f (secure
-  password input to frescod), F5 (deferred).
+- **Fresco security items left:** F4f (secure password input to frescod),
+  F5 (deferred). F4e's per-window GPU VMs protect only the gpu renderer: the
+  default compute renderer composes all windows in one CPU address space.
 - **`'A'` is not all of v2.1:** no `QUEUE_CREATE`/queue fds, cross-device
   `share_fd` or `QUERY_TELEMETRY` yet (see the ABI spec's §18 list).
 - **Legacy paths remain:** `frescod-aqueduct` on `'G'`, Carillon has no
