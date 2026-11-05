@@ -939,6 +939,103 @@ fuzzer, which has a `/4` seed and must reach `TemplateInstancesTruncated`.
 
 ---
 
+### 4.8 Big documents: bounded memory and smooth scrolling (proposed 2026-11-05)
+
+*Asked by the user, 2026-11-05: "memory management for pages with or without js or other
+scripting that are super big — we don't want an OOM. Scrolling a 1000 page document
+shouldn't choke the navigator too or feel laggy." Not built.*
+
+**Today, a big page is safe, but by refusal.** Checked against the tree on 2026-11-05:
+
+| stage | what bounds it today | what scales with document size |
+|---|---|---|
+| converter | `RLIMIT_AS` and CPU (§4.7d); a 128 MiB byte budget per conversion; jaild rctl `memoryuse` | the DOM and the JS heap |
+| profile | refuses a document over **8 MiB**, **131,072 elements** or depth 256 (`navigator-dom` `profile.rs`) | n/a: a bigger document never reaches the reader |
+| worker | one process per document; jail limits | **all of it**: the whole DOM, the whole layout, and **one scene for the whole page** (`nsg` emits `viewport w h` with h the full extent), plus every image decoded, up to 256 MiB |
+| broker | 16 sessions and 64 MiB of session state (§4.4a) | a whole-tree copy per applied transition (§4.3) |
+| Fresco | the window's scene buffer | the whole page's scene |
+
+So the machine is not at risk: every process that touches a page is jailed with a hard
+memory limit, and the profile turns a huge page away. But the cost is that a 1000-page
+document is refused, or, just under the ceilings, it is laid out, painted and decoded in
+full before anything shows. Memory then grows with the document instead of with the
+screen.
+
+**The goal.** Memory and per-frame work follow **what is on screen**, plus a margin, not
+what is in the document. A 10-page and a 1000-page document cost about the same to scroll.
+The ceilings can then rise to what we can measure, not what fits whole.
+
+**The design: six parts.**
+
+1. **Lay out progressively; paint in bands.**
+   - The worker lays out the first screen first and publishes it. That is the same shape as
+     progressive delivery (§5.4.5.7 of the legacy-web spec).
+   - It then lays out the rest in the background, in block-flow order. The scroll extent
+     is an estimate until layout finishes, and the scrollbar settles once.
+   - Layout is kept as compact geometry: boxes and line runs. A display list is not kept
+     for the whole page.
+   - The scene is cut into **bands** of about one viewport height each. The worker emits a
+     band's scene only when asked for it.
+2. **The UI keeps a window of bands.**
+   - The UI holds the bands for the screen plus about two screens either way, and more
+     ahead in the direction of a fling.
+   - Bands far from the viewport are dropped from Fresco and from the worker's caches;
+     their geometry stays.
+   - **Scrolling never waits on the worker.** Fresco moves bands it already has. A band
+     that isn't ready yet is drawn as its background colour, with text first where there
+     is time, never as a frozen frame.
+3. **Images form a working set, not a document total.**
+   - Header sizes (cut A) give layout without decoding.
+   - Pixels are decoded only for bands in the window and evicted as they leave it.
+   - The 256 MiB ceiling becomes a working-set ceiling, so a photo-heavy 1000-page document
+     can still show every image as the reader reaches it.
+4. **Find, links and accessibility read the compact layout, never the scene.** So they work
+   across the whole document without painting it.
+5. **Scripted and endless pages are bounded by recording, not by luck.**
+   - The converter's JS heap stays under its hard limit. The exploration budget already
+     limits how many "load more" steps a recording holds.
+   - At view time an endless feed is a data binding (legacy-web §5.4.5.1). The document
+     lane owns the layout, so it can keep a window of items and unload the oldest. That's
+     list virtualisation, and the page doesn't have to do it itself.
+   - A tier-4 island has its own jail limit. When it hits the limit, the island is replaced
+     by a "stopped, reload" panel, and the rest of the page is untouched.
+6. **The Navigator answers memory pressure** through the memory-pressure trim channel
+   ([atrium-memory-pressure.md](atrium-memory-pressure.md) §4). The cheapest step comes
+   first:
+   - off-screen bands;
+   - decoded images outside the window;
+   - undo states beyond the current one;
+   - then background pages' workers. A background page keeps its recording and scroll
+     anchor and re-renders when shown, at about 25 ms for the jail (§4.7c) plus layout.
+
+**Hard limits stay, as the last line.** Each process keeps its jail limit. Exceeding it
+ends that page's process, never the machine, and the reader keeps what was already
+delivered, as with a timeout (legacy-web §5.4.5.7). Once the working set is bounded, the
+profile ceilings can be raised by measurement.
+
+**Measure first, then build.** The test set:
+- the HTML Living Standard as one page (about 13 MB);
+- a 1000-page book from Project Gutenberg;
+- a table of 100,000 rows;
+- a forum thread with thousands of comments;
+- an endless feed;
+- a photo-heavy gallery.
+
+For each, measure:
+- peak memory per process, against document size (the target is flat past a few screens);
+- time to first display;
+- frame time while flinging, p50 and p99, at 60 and 120 Hz;
+- time to reach the end with a single jump.
+
+**Decisions to settle:**
+1. Raise the profile ceilings once bands and the image working set are in? *Recommend yes,*
+   to levels measured on the set above, keeping a hard cap.
+2. Lay out the rest of the document in the background after the first screen, with a
+   scroll extent that settles once? *Recommend yes;* the alternative is waiting for the
+   whole layout before showing anything.
+3. Virtualise very long tables and feeds in the document lane? *Recommend yes,* only above
+   a measured size, so small pages keep the simple path.
+
 ## 5. The store is Tessera
 
 `atrium-doc://<hash>` *is* a content address in the root filesystem's CAS. This is what
