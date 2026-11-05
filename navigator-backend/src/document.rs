@@ -61,27 +61,13 @@ impl Document {
     /// stale, tampered with, or was recorded against a different tier — all
     /// of which the caller needs to know BEFORE it starts applying effects.
     pub fn resolve(&self, trigger: &str) -> Option<navigator_dom::Handle> {
-        if let Some(id) = trigger.strip_prefix('#') {
-            return self.dom.by_id(id);
-        }
-        // Positional paths (`tag:n>tag:n`) address the tree by shape, which
-        // survives re-parsing only if the document is byte-identical — true
-        // for tier 2, since that is the document the paths were recorded
-        // against.
-        let mut cur = self.dom.root();
-        for step in trigger.split('>') {
-            let (tag, nth) = step.rsplit_once(':')?;
-            let nth: usize = nth.parse().ok()?;
-            let mut seen = 0;
-            let mut found = None;
-            for c in self.dom.children_of(cur) {
-                if self.dom.tag(c).map(|t| t.eq_ignore_ascii_case(tag)).unwrap_or(false) {
-                    if seen == nth { found = Some(c); break }
-                    seen += 1;
-                }
-            }
-            cur = found?;
-        }
-        Some(cur)
+        // ★ `navigator_dom::Dom::resolve_path` is the inverse of the
+        // `node_path` the converter wrote the address with — one function on
+        // each side of the same crate. This used to be a walk of its own that
+        // matched element tags only, so a text node's `node:N` never
+        // resolved (chinadaily). Positional paths survive re-parsing only if
+        // the document is byte-identical, which is true for tier 2: it is the
+        // document the paths were recorded against.
+        self.dom.resolve_path(trigger)
     }
 }

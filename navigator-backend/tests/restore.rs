@@ -102,7 +102,7 @@ fn a_step_not_in_the_recording_makes_a_session_unsaveable_and_says_so() {
     let (mut s, r) = sessions();
     let a = s.open(&r, NOW).unwrap();
     let foreign = Transition { trigger: "#menu".into(), event: "click".into(), anchored: true,
-        effects: vec![navigator_backend::Effect::Attribute { target: "#nav".into(), name: "data-y".into(), from: None, to: Some("1".into()) }] };
+        effects: vec![navigator_backend::Effect::Attribute { target: "#nav".into(), name: "data-y".into(), from: None, to: Some("1".into()), at: None }] };
     s.get_mut(a, NOW).unwrap().go(&foreign).unwrap();
     assert_eq!(s.get(a).unwrap().saved("x"), Err(NotRestorable::UnrecordedStep));
 }

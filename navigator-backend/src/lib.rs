@@ -69,6 +69,18 @@ impl Transition {
     /// flag; a consumer that believed it could be told a transition carries
     /// no content while it carries an Insert, and size its work accordingly.
     /// A derived field in untrusted input is a claim, not a fact.
+    /// Whether a reader can be offered this step: anchored to the published
+    /// document, and recorded whole.
+    ///
+    /// ★ The broker used to offer every anchored trigger and then refuse the
+    /// incomplete ones when clicked — doc13's sidebar toggle, whose probe
+    /// dropped 82 effects, was a control that could only ever say no. Replay
+    /// already refuses an incomplete step (`ApplyError::Incomplete`), so the
+    /// offer has to agree with it.
+    pub fn is_offerable(&self) -> bool {
+        self.anchored && !self.effects.iter().any(|e| matches!(e, Effect::Truncated { .. }))
+    }
+
     pub fn is_attribute_only(&self) -> bool {
         !self.effects.is_empty()
             && self.effects.iter().all(|e| matches!(e, Effect::Attribute { .. }))
@@ -77,7 +89,11 @@ impl Transition {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Effect {
-    Attribute { target: String, name: String, from: Option<String>, to: Option<String> },
+    /// `at` is where among the element's attributes a value the element does
+    /// not yet hold is put. Recordings never carry it (`None`: append, which
+    /// is what `setAttribute` does); an UNDO restoring a removed attribute
+    /// does, so going back restores the bytes and not merely the meaning.
+    Attribute { target: String, name: String, from: Option<String>, to: Option<String>, at: Option<usize> },
     /// ★ `index` is the position the markup occupies among the parent's
     /// children. `None` means a version 1 recording, which did not carry it —
     /// replay can only append, and says so rather than guessing a position.

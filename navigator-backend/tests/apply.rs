@@ -34,7 +34,7 @@ fn an_attribute_effect_applies() {
     let mut d = doc();
     d.apply(&transition(vec![Effect::Attribute {
         target: "#m".into(), name: "aria-expanded".into(),
-        from: Some("false".into()), to: Some("true".into()),
+        from: Some("false".into()), to: Some("true".into()), at: None,
     }])).expect("must apply");
     let m = d.dom.by_id("m").unwrap();
     assert_eq!(d.dom.attr(m, "aria-expanded"), Some("true"));
@@ -47,7 +47,7 @@ fn an_attribute_effect_with_no_new_value_removes_it() {
     let mut d = doc();
     d.apply(&transition(vec![Effect::Attribute {
         target: "#m".into(), name: "aria-expanded".into(),
-        from: Some("false".into()), to: None,
+        from: Some("false".into()), to: None, at: None,
     }])).expect("must apply");
     let m = d.dom.by_id("m").unwrap();
     assert_eq!(d.dom.attr(m, "aria-expanded"), None);
@@ -79,7 +79,7 @@ fn an_attribute_effect_whose_precondition_fails_is_refused() {
     let e = d.apply(&transition(vec![Effect::Attribute {
         target: "#m".into(), name: "aria-expanded".into(),
         from: Some("true".into()), // the document says "false"
-        to: Some("false".into()),
+        to: Some("false".into()), at: None,
     }])).expect_err("must be refused");
     match e {
         ApplyError::PreconditionFailed { expected, found, .. } => {
@@ -100,7 +100,7 @@ fn a_transition_that_fails_part_way_changes_nothing() {
     let err = d.apply(&transition(vec![
         Effect::Attribute {
             target: "#m".into(), name: "aria-expanded".into(),
-            from: Some("false".into()), to: Some("true".into()),
+            from: Some("false".into()), to: Some("true".into()), at: None,
         },
         Effect::Remove { target: "#does-not-exist".into() },
     ])).expect_err("must be refused");
@@ -117,7 +117,7 @@ fn a_failed_precondition_also_leaves_the_document_untouched() {
         Effect::Insert { parent: "#m".into(), index: None, html: "<b>first</b>".into() },
         Effect::Attribute {
             target: "#m".into(), name: "aria-expanded".into(),
-            from: Some("wrong".into()), to: Some("true".into()),
+            from: Some("wrong".into()), to: Some("true".into()), at: None,
         },
     ])).expect_err("must be refused");
     assert_eq!(d.dom.serialize(), before);
@@ -149,7 +149,7 @@ fn an_incomplete_transition_is_refused() {
     let e = d.apply(&transition(vec![
         Effect::Attribute {
             target: "#m".into(), name: "aria-expanded".into(),
-            from: Some("false".into()), to: Some("true".into()),
+            from: Some("false".into()), to: Some("true".into()), at: None,
         },
         Effect::Truncated { dropped: 12 },
     ])).expect_err("must be refused");
@@ -180,7 +180,7 @@ fn applied_does_not_touch_the_original() {
     let before = d.dom.serialize();
     let next = d.applied(&transition(vec![Effect::Attribute {
         target: "#m".into(), name: "aria-expanded".into(),
-        from: Some("false".into()), to: Some("true".into()),
+        from: Some("false".into()), to: Some("true".into()), at: None,
     }])).expect("applicable");
     assert_eq!(d.dom.serialize(), before, "applied() mutated its receiver");
     assert_ne!(next.dom.serialize(), before, "and it must actually differ");
@@ -195,7 +195,7 @@ fn positional_paths_resolve_as_effect_targets() {
         trigger: "html:0>body:0>ul:0>li:1".into(),
         effects: vec![Effect::Attribute {
             target: "html:0>body:0>ul:0>li:1".into(), name: "data-on".into(),
-            from: None, to: Some("1".into()),
+            from: None, to: Some("1".into()), at: None,
         }],
         anchored: true, event: "click".into(),
     };

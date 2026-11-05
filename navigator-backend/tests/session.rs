@@ -42,7 +42,7 @@ fn step(from: &str, to: &str) -> Transition {
         trigger: "#t".into(), event: "click".into(), anchored: true,
         effects: vec![Effect::Attribute {
             target: "#m".into(), name: "data-n".into(),
-            from: Some(from.into()), to: Some(to.into()),
+            from: Some(from.into()), to: Some(to.into()), at: None,
         }],
     }
 }

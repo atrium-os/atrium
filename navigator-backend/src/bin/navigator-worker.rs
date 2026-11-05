@@ -49,7 +49,7 @@ impl Worker {
 
     fn triggers(&self) -> String {
         let Some(s) = self.id.and_then(|id| self.sessions.get(id)) else { return String::new() };
-        s.transitions().iter().filter(|t| t.anchored)
+        s.transitions().iter().filter(|t| t.is_offerable())
             .map(|t| t.trigger.as_str()).collect::<Vec<_>>().join("\n")
     }
 

@@ -370,7 +370,7 @@ impl DocumentHost for InProcessHost {
 
     fn triggers(&self, id: SessionId) -> Vec<String> {
         self.sessions.get(id)
-            .map(|s| s.transitions().iter().filter(|t| t.anchored)
+            .map(|s| s.transitions().iter().filter(|t| t.is_offerable())
                  .map(|t| t.trigger.clone()).collect())
             .unwrap_or_default()
     }

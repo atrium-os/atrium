@@ -124,6 +124,25 @@ impl Dom {
         }
     }
 
+    /// The position of an attribute among the element's attributes.
+    pub fn attr_index(&self, h: Handle, name: &str) -> Option<usize> {
+        let want = self.attr_name(h, name);
+        self.get(h)?.attrs.iter().position(|(k, _)| *k == want)
+    }
+
+    /// `set_attr`, except that an attribute the element does not hold is put
+    /// at `index` (clamped) rather than appended. An undo restoring a removed
+    /// attribute needs this: appending is what `setAttribute` does, and it
+    /// leaves a document that means the same but serializes differently —
+    /// gov.uk's menu toggle "undid to a DIFFERENT document" over exactly that.
+    pub fn set_attr_at(&mut self, h: Handle, name: &str, val: &str, index: usize) {
+        let name = self.attr_name(h, name);
+        if let Some(n) = self.get_mut(h) {
+            if let Some(a) = n.attrs.iter_mut().find(|(k, _)| *k == name) { a.1 = val.to_string(); }
+            else { let i = index.min(n.attrs.len()); n.attrs.insert(i, (name, val.to_string())); }
+        }
+    }
+
     /// Removal has to normalize the same way, or `removeAttribute('tabIndex')`
     /// would silently miss the `tabindex` that `setAttribute('tabIndex')`
     /// stored — the asymmetry is exactly the silent-drop shape.
@@ -480,6 +499,70 @@ impl Dom {
         }
         parts.reverse();
         parts.join(">")
+    }
+
+    /// [`node_path`](Self::node_path) without the id shortcut at the start:
+    /// every step positional. For a node whose id does not address it alone.
+    pub fn positional_path(&self, h: Handle) -> String {
+        let mut parts: Vec<String> = vec![];
+        let mut cur = h;
+        while let Some(p) = self.get(cur).and_then(|n| n.parent) {
+            let tag = self.tag(cur).unwrap_or("node").to_string();
+            let nth = self.get(p).map(|n| n.children.iter()
+                .filter(|&&c| self.tag(c) == self.tag(cur))
+                .position(|&c| c == cur).unwrap_or(0)).unwrap_or(0);
+            parts.push(format!("{tag}:{nth}"));
+            cur = p;
+            if parts.len() > 32 { break }
+        }
+        parts.reverse();
+        parts.join(">")
+    }
+
+    /// A path that [`resolve_path`](Self::resolve_path) maps back to `h`:
+    /// `node_path` when it does (the id form survives re-parsing), the
+    /// positional form when the id is shared or the node is not connected.
+    pub fn exact_path(&self, h: Handle) -> String {
+        let p = self.node_path(h);
+        if self.resolve_path(&p) == Some(h) { p } else { self.positional_path(h) }
+    }
+
+    /// ★★ THE INVERSE OF `node_path`, AND THE ONLY ONE. The converter writes
+    /// paths with `node_path`; whoever replays them resolves them here, so the
+    /// two cannot drift apart. They did: the backend had its own walk that
+    /// matched element tags only, so `node:N` — the step `node_path` writes
+    /// for a TEXT or comment node — never resolved, and chinadaily's search
+    /// tabs (which rewrite a label's text) were unreplayable.
+    ///
+    /// Refuses rather than guesses, in the two places `node_path` is
+    /// ambiguous:
+    ///   - `#id` when more than one connected element holds the id (by_id
+    ///     answers the first in ARENA order, which after a script or a replay
+    ///     is not document order — so it may be a different element than the
+    ///     writer meant);
+    ///   - `node:N` under a parent that also has a `<node>` element child,
+    ///     since `node_path` writes the same step for both.
+    pub fn resolve_path(&self, path: &str) -> Option<Handle> {
+        if let Some(id) = path.strip_prefix('#') {
+            let mut hits = (0..self.nodes.len() as Handle)
+                .filter(|&h| self.attr(h, "id") == Some(id) && self.connected(h));
+            let first = hits.next()?;
+            return if hits.next().is_none() { Some(first) } else { None };
+        }
+        let mut cur = self.root();
+        for step in path.split('>') {
+            let (tag, nth) = step.rsplit_once(':')?;
+            let nth: usize = nth.parse().ok()?;
+            let kids = &self.get(cur)?.children;
+            let want: Option<&str> = if tag == "node" {
+                if kids.iter().any(|&c| self.tag(c) == Some("node")) { return None }
+                None
+            } else {
+                Some(tag)
+            };
+            cur = *kids.iter().filter(|&&c| self.tag(c) == want).nth(nth)?;
+        }
+        Some(cur)
     }
 
     /// Element count, the headline metric for a conversion.

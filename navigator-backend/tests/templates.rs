@@ -25,9 +25,9 @@ fn a_template_expands_into_its_instances() {
     assert_eq!(t.event, "click");
     assert_eq!(t.effects, vec![
         Effect::Attribute { target: "html:0>body:0>ul:0>li:1>a:0".into(), name: "aria-selected".into(),
-            from: None, to: Some("true".into()) },
+            from: None, to: Some("true".into()), at: None },
         Effect::Attribute { target: "html:0>body:0>div:0>div:1".into(), name: "class".into(),
-            from: Some("panel".into()), to: Some("panel shown".into()) },
+            from: Some("panel".into()), to: Some("panel shown".into()), at: None },
     ]);
 }
 

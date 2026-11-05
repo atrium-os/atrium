@@ -308,6 +308,34 @@ fn an_insert_records_the_position_it_landed_at() {
         "the insert went between the first and second item, not at the end: {inserts:?}");
 }
 
+/// ★★ The index counts only the nodes the recording CARRIES. Whitespace-only
+/// inserted text is not recorded (it is layout noise, and an effect apiece
+/// would crowd real content out of the 32-effect cap), so counting it put
+/// every later insert one place too far right: here the item would replay
+/// AFTER `a`, below the list it was put in front of.
+#[test]
+fn an_insert_index_does_not_count_whitespace_it_did_not_record() {
+    let c = explore(r#"<html><body><ul id="l"><li>a</li></ul>
+      <button id="go">go</button><script>
+        document.getElementById('go').addEventListener('click', function () {
+          var ul = document.getElementById('l');
+          var li = document.createElement('li');
+          li.textContent = 'first';
+          ul.insertBefore(document.createTextNode('\n   '), ul.firstChild);
+          ul.insertBefore(li, ul.children[0]);
+        });
+      </script></body></html>"#);
+    let inserts: Vec<(&usize, &str)> = c.transitions.iter()
+        .flat_map(|t| &t.effects)
+        .filter_map(|e| match e {
+            Effect::Insert { index, html, .. } => Some((index, html.as_str())),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(inserts.len(), 1, "the whitespace is not recorded: {inserts:?}");
+    assert_eq!(*inserts[0].0, 0, "the item is the list's first carried child: {inserts:?}");
+}
+
 /// ★ A probe drains the timers ITS handler scheduled, on bounds relative to
 /// the probe. They were absolute (50 callbacks and 500 ms of virtual time
 /// since load), so one load-time timer past 500 ms made every delayed effect

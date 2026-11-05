@@ -31,7 +31,7 @@ fn t(effects: Vec<Effect>) -> Transition {
 fn attr(name: &str, from: Option<&str>, to: Option<&str>) -> Effect {
     Effect::Attribute {
         target: "#m".into(), name: name.into(),
-        from: from.map(str::to_string), to: to.map(str::to_string),
+        from: from.map(str::to_string), to: to.map(str::to_string), at: None,
     }
 }
 
@@ -286,7 +286,7 @@ fn a_trimmed_history_reports_forgotten_not_at_start() {
             .map(str::to_string);
         h.go(&t(vec![Effect::Attribute {
             target: "#m".into(), name: "data-n".into(),
-            from: prev, to: Some(v.into()),
+            from: prev, to: Some(v.into()), at: None,
         }])).expect("goes");
     }
     assert_eq!(h.depth(), 2, "the bound must cap the history");
@@ -323,7 +323,7 @@ fn the_byte_bound_drops_the_oldest_steps() {
             .map(str::to_string);
         h.go(&t(vec![Effect::Attribute {
             target: "#m".into(), name: "data-n".into(),
-            from: prev, to: Some(v.into()),
+            from: prev, to: Some(v.into()), at: None,
         }])).expect("goes");
     }
     assert!(h.depth() < 3, "the byte bound did not engage: {:?}", h.cost());
@@ -342,7 +342,7 @@ fn an_ordinary_session_is_never_trimmed() {
             .map(str::to_string);
         h.go(&t(vec![Effect::Attribute {
             target: "#m".into(), name: "data-n".into(),
-            from: prev, to: Some(i.to_string()),
+            from: prev, to: Some(i.to_string()), at: None,
         }])).expect("goes");
     }
     assert_eq!(h.forgotten(), 0, "the default bound trimmed an ordinary session");

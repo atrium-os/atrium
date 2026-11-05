@@ -1119,6 +1119,28 @@ So case 1 is 18 elements in 4 documents, and still waits.
   Every expanded transition applies, reverses and goes forward exactly, except 6
   failures: gov.uk 2, chinadaily 2, yahoo.jp 1 and ynet 1. The oracle's recordings
   give the same 6, so they predate this change. They are listed for their own fix.
+  - *Fixed 2026-11-05,* all in replay, not in the recordings. chinadaily: the backend
+    had its own path walk, and it matched element tags only, so the `node:N` step that
+    `node_path` writes for a text node never resolved. Paths now resolve through
+    `Dom::resolve_path`, the inverse of `node_path` in the same crate. ynet and yahoo.jp:
+    the converter addresses every effect against the document *before* the step, but
+    replay resolved each effect after the earlier ones had run. ynet renames two ids, and
+    its undo named them by the old ids. yahoo.jp inserts a `<div>` ahead of the `div:1`
+    that a later effect addresses. Replay now resolves every address first, then applies
+    the step: attributes, then removals, then inserts in ascending index. The undo is
+    addressed against the document it will be applied to. gov.uk: undoing a removed
+    `hidden` appended it, which gives the same meaning in different bytes, so the undo
+    now puts it back where it was.
+  - A seventh failure was hidden behind them: the broker offered doc13's sidebar toggle,
+    whose probe dropped 82 effects, and then refused it as incomplete. It now offers only
+    complete, anchored steps.
+  - Found while reading the converter's side: an insert's index counted inserted
+    whitespace text that the recording does not carry, which put later inserts one place
+    too far right.
+  - After the fix, all 2,241 anchored, complete transitions apply, reverse, go forward
+    again and drive the broker. The 105 unanchored and 16 incomplete ones are skipped by
+    design. r2's 693 are also clean. The cases are in
+    `navigator-backend/tests/replay_contract.rs`; 7 of its 8 fail on the code before.
 
 **Cost.**
 - 7,422 budgeted probes (the same as before) and 469 verification probes.

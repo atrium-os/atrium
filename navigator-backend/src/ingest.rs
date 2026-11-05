@@ -161,8 +161,8 @@ fn expand_templates(list: &Value, limits: &Limits, transitions: &mut Vec<Transit
                 }
             };
             let effects: Vec<Effect> = effects.iter().map(|e| match e {
-                Effect::Attribute { target, name, from, to } => Effect::Attribute {
-                    target: resolve(target), name: name.clone(), from: from.clone(), to: to.clone() },
+                Effect::Attribute { target, name, from, to, at } => Effect::Attribute {
+                    target: resolve(target), name: name.clone(), from: from.clone(), to: to.clone(), at: *at },
                 Effect::Insert { parent, index, html } => Effect::Insert {
                     parent: resolve(parent), index: *index, html: html.clone() },
                 Effect::RemoveRange { parent, index, count } => Effect::RemoveRange {
@@ -196,7 +196,7 @@ fn address(e: &Effect) -> Option<&str> {
 
 fn transition_bytes(t: &Transition) -> usize {
     t.trigger.len() + t.event.len() + t.effects.iter().map(|e| match e {
-        Effect::Attribute { target, name, from, to } =>
+        Effect::Attribute { target, name, from, to, .. } =>
             target.len() + name.len() + from.as_ref().map_or(0, String::len) + to.as_ref().map_or(0, String::len),
         Effect::Insert { parent, html, .. } => parent.len() + html.len(),
         Effect::RemoveRange { parent, .. } => parent.len() + 16,
@@ -279,6 +279,7 @@ fn effect(v: &Value, limits: &Limits, notes: &mut Vec<Note>)
                 .ok_or(Reject::MissingField("name"))?,
             from: bounded_str(o.get("from"), "from", limits)?,
             to: bounded_str(o.get("to"), "to", limits)?,
+            at: None,
         }),
         "insert" => {
             let html = bounded_str(o.get("html"), "html", limits)?

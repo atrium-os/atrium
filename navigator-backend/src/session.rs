@@ -196,7 +196,7 @@ pub type SessionId = u64;
 fn effect_bytes(e: &crate::Effect) -> usize {
     use crate::Effect::*;
     match e {
-        Attribute { target, name, from, to } => target.len() + name.len()
+        Attribute { target, name, from, to, .. } => target.len() + name.len()
             + from.as_ref().map_or(0, String::len) + to.as_ref().map_or(0, String::len),
         Insert { parent, html, .. } => parent.len() + html.len(),
         Remove { target } => target.len(),
@@ -414,18 +414,18 @@ impl Session {
 
     /// The transition a trigger names, if this recording has one.
     ///
-    /// ★ ANCHORED ONLY. An unanchored transition addresses a node the page's
+    /// ★ OFFERABLE ONLY (anchored and complete). An unanchored transition addresses a node the page's
     /// own scripts created, which is not in the published document — the
     /// converter reports them so the loss is visible, and offering one to a
     /// reader would produce a refusal at apply time for a reason the reader
     /// could do nothing about.
     pub fn transition_for(&self, trigger: &str) -> Option<&Transition> {
-        self.transitions.iter().find(|t| t.anchored && t.trigger == trigger)
+        self.transitions.iter().find(|t| t.is_offerable() && t.trigger == trigger)
     }
 
     /// Take the transition a trigger names.
     pub fn navigate(&mut self, trigger: &str) -> Result<(), NavigateError> {
-        let i = self.transitions.iter().position(|t| t.anchored && t.trigger == trigger)
+        let i = self.transitions.iter().position(|t| t.is_offerable() && t.trigger == trigger)
             .ok_or_else(|| NavigateError::NoSuchTrigger { trigger: trigger.to_string() })?;
         self.go_index(i).map_err(NavigateError::Refused)
     }

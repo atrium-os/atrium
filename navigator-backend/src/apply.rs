@@ -140,16 +140,123 @@ impl Document {
             }
         }
 
-        let mut next = Document { dom: self.dom.clone() };
-        let mut undo: Vec<Effect> = vec![];
+        // ★★★ EVERY ADDRESS NAMES A NODE IN THE DOCUMENT AS IT WAS BEFORE THE
+        // STEP — this one — and is resolved here, before anything changes.
+        //
+        // That is how the converter writes them: it diffs the pre-probe tree
+        // against the post-probe tree and names every node by its pre-probe
+        // path (`diff_effects`). Replay used to resolve each effect against
+        // the document as the EARLIER effects of the same step had left it,
+        // and the two readings part as soon as one effect moves an address:
+        // ynet renames two ids and its undo named them by the old ones;
+        // yahoo.jp inserts a `<div>` before the `div:1` a later effect
+        // addresses, which then named a different node, or none. Handles are
+        // stable across the copy below, so resolving once and acting on
+        // handles reads every address the way it was written.
+        let mut ops: Vec<Op> = Vec::with_capacity(t.effects.len());
         for e in &t.effects {
-            next.apply_one(e, &mut undo)?;
+            ops.push(match e {
+                Effect::Attribute { target, name, from, to, at } => Op::Attr {
+                    h: self.target(target)?, target, name, from, to, at: *at,
+                },
+                Effect::Remove { target } => {
+                    let h = self.target(target)?;
+                    if self.dom.get(h).and_then(|n| n.parent).is_none() {
+                        return Err(ApplyError::TargetUnresolved { path: target.clone() });
+                    }
+                    Op::Remove(vec![h])
+                }
+                Effect::RemoveRange { parent, index, count } => {
+                    let p = self.target(parent)?;
+                    let kids = self.dom.children_of(p);
+                    if index + count > kids.len() {
+                        return Err(ApplyError::TargetUnresolved {
+                            path: format!("{parent}[{index}..{}]", index + count),
+                        });
+                    }
+                    Op::Remove(kids[*index..index + count].to_vec())
+                }
+                Effect::Insert { parent, index, html } =>
+                    Op::Insert { p: self.target(parent)?, parent, index: *index, html },
+                Effect::Truncated { dropped } =>
+                    return Err(ApplyError::Incomplete { dropped: *dropped }),
+            });
         }
-        // ★ Undone last-first. The forward effects ran in an order the
-        // converter chose — attributes, then removals, then insertions — and
-        // reversing it is what makes the positional paths in the earlier
-        // effects mean again what they meant when they were recorded.
-        undo.reverse();
+
+        let mut next = Document { dom: self.dom.clone() };
+        let mut removed: Vec<Handle> = vec![];
+        let mut inserted: Vec<Handle> = vec![];
+
+        // Attributes, in the order recorded. The precondition is read from
+        // the copy, so two effects on one attribute compose.
+        let mut touched: Vec<(Handle, &str, &Option<String>, Option<usize>)> = vec![];
+        for op in &ops {
+            let Op::Attr { h, target, name, from, to, at } = op else { continue };
+            let found = next.dom.attr(*h, name).map(str::to_string);
+            if &found != *from {
+                return Err(ApplyError::PreconditionFailed {
+                    path: (*target).clone(), name: (*name).clone(),
+                    expected: (*from).clone(), found,
+                });
+            }
+            touched.push((*h, name.as_str(), *from, next.dom.attr_index(*h, name)));
+            match (to, at) {
+                (Some(v), Some(i)) => next.dom.set_attr_at(*h, name, v, *i),
+                (Some(v), None) => next.dom.set_attr(*h, name, v),
+                (None, _) => next.dom.remove_attr(*h, name),
+            }
+        }
+
+        // Removals. A node already gone — named twice, or inside a subtree
+        // this step removes — is not a node of the document being edited.
+        for op in &ops {
+            let Op::Remove(hs) = op else { continue };
+            for &h in hs {
+                if !next.dom.connected(h) {
+                    return Err(ApplyError::TargetUnresolved { path: self.dom.exact_path(h) });
+                }
+                // `detach`, not `detach_for_move`: this IS a removal, and the
+                // distinction is what the protected-subtree experiment turned
+                // on. Reusing the move path here would quietly exempt replay
+                // from a rule the converter enforces.
+                next.dom.detach(h);
+                removed.push(h);
+            }
+        }
+
+        // ★ Insertions, in ascending index. An index is the markup's position
+        // among the parent's children AFTER the step, so inserting lowest
+        // first is what puts each one where it was observed, whatever order
+        // the recording lists them in.
+        let mut ins: Vec<(Handle, &String, Option<usize>, &String)> = ops.iter()
+            .filter_map(|op| match op {
+                Op::Insert { p, parent, index, html } => Some((*p, *parent, *index, *html)),
+                _ => None,
+            }).collect();
+        ins.sort_by_key(|&(_, _, index, _)| index.unwrap_or(usize::MAX));
+        for (p, parent, index, html) in ins {
+            if !next.dom.connected(p) {
+                return Err(ApplyError::TargetUnresolved { path: parent.clone() });
+            }
+            // ★ Through the shared parser, like every other piece of
+            // markup in this system. Inserted HTML is the most hostile
+            // input the backend handles and is exactly where a second,
+            // more forgiving parser would get written.
+            let frag = parse_fragment(html);
+            let roots = frag.children_of(frag.root());
+            // ★ An out-of-range index is CLAMPED, not refused. The index
+            // is a position in a tree the recording describes and this
+            // document need not match it exactly; appending is what a
+            // version 1 recording does anyway, so a nonsensical index
+            // degrades to the older behaviour rather than losing content.
+            let at = index.unwrap_or(usize::MAX).min(next.dom.children_of(p).len());
+            for (i, c) in roots.into_iter().enumerate() {
+                let g = next.dom.graft(&frag, c);
+                let before = next.dom.children_of(p).get(at + i).copied();
+                next.dom.insert_before(p, g, before);
+                inserted.push(g);
+            }
+        }
 
         // ★ Re-checked on the RESULT, not on the inserted markup alone. An
         // insert that is individually small can still be the one that pushes
@@ -165,6 +272,36 @@ impl Document {
         // reader's path. The clone above is the next cost (19%).
         let v = profile::check(&next.dom, next.dom.serialized_len());
         if !v.is_empty() { return Err(ApplyError::OutsideProfile(v)) }
+
+        // ★★ THE UNDO IS BUILT FROM THE TWO DOCUMENTS, NOT THE RECORDING, and
+        // is itself addressed the way every transition is: against the
+        // document it will be applied to — `next` — by paths that resolve
+        // there (`exact_path` checks that, falling back to position when an
+        // id is shared or was just renamed away). Removed content is taken
+        // from `self`, before this step's attribute writes touched it.
+        let mut undo = vec![];
+        for (h, name, from, index) in touched.into_iter().rev() {
+            // A node this step removed comes back whole, from `self`.
+            if !next.dom.connected(h) { continue }
+            let now = next.dom.attr(h, name).map(str::to_string);
+            undo.push(Effect::Attribute {
+                target: next.dom.exact_path(h), name: name.to_string(),
+                from: now, to: from.clone(),
+                at: if from.is_some() { index } else { None },
+            });
+        }
+        for &g in &inserted {
+            let p = next.dom.get(g).and_then(|n| n.parent).expect("just inserted");
+            let index = next.dom.children_of(p).iter().position(|&c| c == g).expect("a child");
+            undo.push(Effect::RemoveRange { parent: next.dom.exact_path(p), index, count: 1 });
+        }
+        for &h in &removed {
+            let p = self.dom.get(h).and_then(|n| n.parent).expect("checked above");
+            let index = self.dom.children_of(p).iter().position(|&c| c == h).unwrap_or(0);
+            undo.push(Effect::Insert {
+                parent: next.dom.exact_path(p), index: Some(index), html: self.dom.outer_html(h),
+            });
+        }
         let inverse = Transition {
             trigger: t.trigger.clone(), event: t.event.clone(),
             anchored: t.anchored, effects: undo,
@@ -175,100 +312,12 @@ impl Document {
     fn target(&self, path: &str) -> Result<Handle, ApplyError> {
         self.resolve(path).ok_or_else(|| ApplyError::TargetUnresolved { path: path.to_string() })
     }
+}
 
-    fn apply_one(&mut self, e: &Effect, undo: &mut Vec<Effect>) -> Result<(), ApplyError> {
-        match e {
-            Effect::Attribute { target, name, from, to } => {
-                let h = self.target(target)?;
-                let found = self.dom.attr(h, name).map(str::to_string);
-                if &found != from {
-                    return Err(ApplyError::PreconditionFailed {
-                        path: target.clone(), name: name.clone(),
-                        expected: from.clone(), found,
-                    });
-                }
-                undo.push(Effect::Attribute {
-                    target: target.clone(), name: name.clone(),
-                    from: to.clone(), to: from.clone(),
-                });
-                match to {
-                    Some(v) => self.dom.set_attr(h, name, v),
-                    None => self.dom.remove_attr(h, name),
-                }
-            }
-            Effect::Remove { target } => {
-                let h = self.target(target)?;
-                // ★★ THE INVERSE COMES FROM THE DOCUMENT, NOT THE RECORDING.
-                //
-                // Restoring a removal needs the subtree, its parent and its
-                // position — and all three are RIGHT HERE, in the document
-                // about to lose them. Recording them in the file as well
-                // would put a second copy of a derivable fact into untrusted
-                // input, where it can disagree with the document and leave a
-                // consumer to decide which to believe. Read it from the one
-                // that cannot be wrong.
-                let Some(p) = self.dom.get(h).and_then(|n| n.parent) else {
-                    return Err(ApplyError::TargetUnresolved { path: target.clone() });
-                };
-                let index = self.dom.children_of(p).iter().position(|&c| c == h).unwrap_or(0);
-                undo.push(Effect::Insert {
-                    parent: self.dom.node_path(p),
-                    index: Some(index),
-                    html: self.dom.outer_html(h),
-                });
-                // `detach`, not `detach_for_move`: this IS a removal, and the
-                // distinction is what the protected-subtree experiment turned
-                // on. Reusing the move path here would quietly exempt replay
-                // from a rule the converter enforces.
-                self.dom.detach(h);
-            }
-            Effect::Insert { parent, index, html } => {
-                let p = self.target(parent)?;
-                // ★ Through the shared parser, like every other piece of
-                // markup in this system. Inserted HTML is the most hostile
-                // input the backend handles and is exactly where a second,
-                // more forgiving parser would get written.
-                let frag = parse_fragment(html);
-                let roots = frag.children_of(frag.root());
-                let count = roots.len();
-                // ★ An out-of-range index is CLAMPED, not refused. The index
-                // is a position in a tree the recording describes and this
-                // document need not match it exactly; appending is what a
-                // version 1 recording does anyway, so a nonsensical index
-                // degrades to the older behaviour rather than losing content.
-                let at = index.unwrap_or(usize::MAX).min(self.dom.children_of(p).len());
-                for (i, c) in roots.into_iter().enumerate() {
-                    let g = self.dom.graft(&frag, c);
-                    let before = self.dom.children_of(p).get(at + i).copied();
-                    self.dom.insert_before(p, g, before);
-                }
-                undo.push(Effect::RemoveRange {
-                    parent: self.dom.node_path(p), index: at, count,
-                });
-            }
-            Effect::RemoveRange { parent, index, count } => {
-                let p = self.target(parent)?;
-                let kids = self.dom.children_of(p);
-                if index + count > kids.len() {
-                    return Err(ApplyError::TargetUnresolved {
-                        path: format!("{parent}[{index}..{}]", index + count),
-                    });
-                }
-                for &h in kids[*index..index + count].iter().rev() {
-                    undo.push(Effect::Insert {
-                        parent: parent.clone(),
-                        index: Some(*index),
-                        html: self.dom.outer_html(h),
-                    });
-                    self.dom.detach(h);
-                }
-            }
-            // Handled before application begins; unreachable here, and
-            // written as a refusal rather than a `_ => {}` so a new effect
-            // kind cannot be silently ignored by this match.
-            Effect::Truncated { dropped } =>
-                return Err(ApplyError::Incomplete { dropped: *dropped }),
-        }
-        Ok(())
-    }
+/// One effect, its addresses resolved against the pre-step document.
+enum Op<'a> {
+    Attr { h: Handle, target: &'a String, name: &'a String, from: &'a Option<String>,
+           to: &'a Option<String>, at: Option<usize> },
+    Remove(Vec<Handle>),
+    Insert { p: Handle, parent: &'a String, index: Option<usize>, html: &'a String },
 }

@@ -2351,6 +2351,10 @@ fn diff_effects(before: &Dom, after: &Dom) -> (Vec<crate::engine::Effect>, Vec<H
     }
 
     // Nodes inserted under a tier 1 node, serialized as content.
+    // Whitespace-only inserted text is not recorded: layout noise, and an
+    // effect apiece would crowd real content out of the cap.
+    let unrecorded = |c: Handle| c >= old_len && after.tag(c).is_none()
+        && after.outer_html(c).trim().is_empty();
     for h in old_len..after.nodes.len() as Handle {
         if !after.connected(h) { continue }
         let Some(p) = after.get(h).and_then(|n| n.parent) else { continue };
@@ -2358,12 +2362,16 @@ fn diff_effects(before: &Dom, after: &Dom) -> (Vec<crate::engine::Effect>, Vec<H
         // travels inside its parent's HTML.
         if p >= old_len { continue }
         let html = after.outer_html(h);
-        if html.trim().is_empty() { continue }
+        if unrecorded(h) { continue }
         if out.len() >= MAX_EFFECTS || html.len() > MAX_INSERT_BYTES {
             dropped += 1;
             continue;
         }
-        let index = after.children_of(p).iter().position(|&c| c == h).unwrap_or(0);
+        // ★ The position among the children the replay will HAVE: the
+        // whitespace skipped above is not among them, and counting it put
+        // every later insert one place too far right.
+        let index = after.children_of(p).iter().take_while(|&&c| c != h)
+            .filter(|&&c| !unrecorded(c)).count();
         out.push(Effect::Insert { parent: before.node_path(p), index, html });
         at.push(p);
     }
