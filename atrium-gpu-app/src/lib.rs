@@ -31,10 +31,18 @@ use atrium_rdna4_cmd::{emit_dispatch_at, Blob, Dispatch, Scratch};
 pub const CODE_MAGIC: [u8; 4] = *b"AGPC";
 /// The only header version so far.
 pub const CODE_VERSION: u32 = 1;
+/// Architecture ids, as the GPU channel's `HELLO` reports the broker's GPU
+/// and each code header names the GPU it was built for. The record set and
+/// the channel are the same for every architecture; the code header layout
+/// and the packet builder are per architecture (see [`session::Arch`]).
+pub const ARCH_RDNA4: u32 = 1;
 /// Size of [`CodeHeader`] on the wire.
 pub const CODE_HEADER_SIZE: usize = 64;
 /// Size of one work record on the wire.
 pub const OP_RECORD: usize = 80;
+
+/// One app's GPU context, broker side (F6 G2).
+pub mod session;
 
 /// Hardware and policy limits the broker enforces.
 pub mod limits {
@@ -71,6 +79,8 @@ pub enum Refusal {
     BadMagic,
     /// Unknown header version.
     BadVersion(u32),
+    /// Code built for another GPU architecture than the broker's.
+    WrongArch(u32),
     /// A reserved field or flag bit is not zero.
     Reserved,
     /// Code size is zero, not a multiple of 4, or over the limit.
@@ -142,7 +152,8 @@ impl CodeHeader {
     /// | 24 | scratch_dwords |
     /// | 28 | threads x, y, z |
     /// | 40 | flags: bit 0 wave32, the rest zero |
-    /// | 44..64 | reserved, zero |
+    /// | 44 | architecture ([`ARCH_RDNA4`]) |
+    /// | 48..64 | reserved, zero |
     ///
     /// Parses and checks a code slot, returning the header and the code.
     pub fn parse(slot: &[u8]) -> Result<(CodeHeader, &[u8]), Refusal> {
@@ -158,7 +169,10 @@ impl CodeHeader {
             return Err(Refusal::BadVersion(version));
         }
         let flags = le32(slot, 40);
-        if flags & !1 != 0 || slot[44..64].iter().any(|&b| b != 0) {
+        if le32(slot, 44) != ARCH_RDNA4 {
+            return Err(Refusal::WrongArch(le32(slot, 44)));
+        }
+        if flags & !1 != 0 || slot[48..64].iter().any(|&b| b != 0) {
             return Err(Refusal::Reserved);
         }
         let h = CodeHeader {
@@ -214,6 +228,7 @@ impl CodeHeader {
         put(&mut v, 32, self.threads[1]);
         put(&mut v, 36, self.threads[2]);
         put(&mut v, 40, self.wave32 as u32);
+        put(&mut v, 44, ARCH_RDNA4);
         v.extend_from_slice(code);
         v
     }
@@ -240,8 +255,11 @@ pub struct CodeBinding {
 pub mod op {
     /// `[op, code_id]`: later dispatches run this code.
     pub const BIND_CODE: u32 = 1;
-    /// `[op, count, values[16]]`: user SGPRs for later dispatches.
+    /// `[op, count, values[16]]`: user data words for later dispatches
+    /// (on RDNA4, preloaded into s0.. as user SGPRs).
     pub const USER_SGPRS: u32 = 2;
+    /// The architecture-neutral name for [`USER_SGPRS`].
+    pub const USER_DATA: u32 = USER_SGPRS;
     /// `[op, groups x y z, start x y z]`.
     pub const DISPATCH: u32 = 3;
     /// `[op]`: wait for earlier dispatches and make their writes visible.

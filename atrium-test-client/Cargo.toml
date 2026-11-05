@@ -11,6 +11,10 @@ name = "atrium-test-client"
 path = "src/main.rs"
 
 [[bin]]
+name = "atrium-gpu-fuzz"
+path = "src/gpu_fuzz.rs"
+
+[[bin]]
 name = "atrium-rect-bouncer"
 path = "src/bouncer.rs"
 
@@ -79,5 +83,7 @@ path = "src/partial_stress.rs"
 fresco-client   = { path = "../fresco-client" }
 fresco-protocol = { path = "../fresco-protocol" }
 fresco-split    = { path = "../fresco-split" }
+atrium-gpu-app  = { path = "../atrium-gpu-app" }
+atrium-rdna4-isa = { path = "../atrium-rdna4-isa" }
 fresco-compute  = { path = "../fresco-compute" }
 fresco-text     = { path = "../fresco-text" }

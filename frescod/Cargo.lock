@@ -196,6 +196,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "atrium-gpu-app"
+version = "0.1.0"
+dependencies = [
+ "atrium-gpu-rs",
+ "atrium-rdna4-cmd",
+ "libc",
+]
+
+[[package]]
 name = "atrium-gpu-rs"
 version = "0.1.0"
 dependencies = [
@@ -898,6 +907,7 @@ dependencies = [
  "aqueduct-gpu-client",
  "aqueduct-gpu-host",
  "atrium-devevents",
+ "atrium-gpu-app",
  "atrium-gpu-rs",
  "atrium-spv-loader",
  "atrium-trace",

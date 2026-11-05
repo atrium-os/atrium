@@ -1,6 +1,6 @@
 # F6: the app GPU path
 
-*Status 2026-11-05: option A chosen (Shankar). G3's library is built (`atrium-gpu-app`) and runs an app's own kernel end to end on gpusim (`app-path-e2e`). G1 is done (bb3f7ba4): VM faults fail their work with EIO at once, and app code is bound read-only (ABI rev 3). Threat model §2.5.3 and §2.5.4 row F6. Owner: the GPU driver
+*Status 2026-11-05: option A chosen (Shankar). G3's library is built (`atrium-gpu-app`), G2's channel runs on gpusim (`atrium-gpu-fuzz`), and runs an app's own kernel end to end on gpusim (`app-path-e2e`). G1 is done (bb3f7ba4): VM faults fail their work with EIO at once, and app code is bound read-only (ABI rev 3). Threat model §2.5.3 and §2.5.4 row F6. Owner: the GPU driver
 thread, with Fresco for the broker wiring.*
 
 ## What F6 must end with
@@ -67,17 +67,33 @@ Options:
   queue, not per app. Real per-app weights wait for per-VM MES queues (review §A2.3), which is
   also what removes the brief `EBUSY` one app's work can cause another.
 
-### G2. The broker protocol for app GPU work (with Fresco)
-Fixed-size records over the existing `fresco_split` channel, fuzzed with F3's harness:
-- `GPU_CODE(slot)`: one memfd slot holding a code header and ISA. The broker checks the header
-  against hardware limits and copies the code into a code BO in the app's VM.
-- `GPU_BUFFER(id, size)`: create a buffer in the app's VM, backed by a sealed memfd slot the
-  broker made. This starts as a staging copy and becomes a zero-copy import later (as F4e
-  plans).
-- `GPU_SUBMIT(slot, fence)`: an aqueduct-gpu frame body restricted to a closed set: bind code,
-  bind buffers, push constants, dispatch, barrier, copy buffer. Every id is resolved in that
-  app's own table, and dims and counts are bounded.
-- `GPU_DONE(fence)` / `GPU_LOST(fence, EIO)` back to the app.
+### G2. The broker protocol for app GPU work (built, in review with Fresco)
+Each app context is its own `SOCK_SEQPACKET` connection to frescod's GPU socket
+(`FRESCOD_GPU_SOCK`), separate from the renderer channel. Reaching the socket is the grant (the
+TCB mounts it only for jails with `gpu.access`), and a uid holds at most 4 contexts. Records are
+the split's 96-byte framing in their own kind range (`fresco_split::gpu`):
+- `HELLO(arch, upload, work)` with two broker-made slots: the broker's GPU architecture id, and
+  shared memory for code uploads and work records.
+- `CODE(id, bytes)`: a code header and machine code from the upload slot. The broker copies it
+  out, checks the header for that architecture, and loads it read-only into the app's VM.
+- `BUFFER(id, size)` → `BUFFER_OK(id, va)` with a staging slot; `WRITE` and `READ` copy
+  between the staging slot and the buffer (a copy for now; F4e's zero-copy import replaces
+  it); `FREE(id)`.
+- `SUBMIT(fence, bytes)`: work records from the work slot (bind code, user data, dispatch,
+  barrier), built into a ring that is read-only to the GPU, so the app's own dispatches cannot
+  rewrite the packets after theirs. Answered `DONE(fence)`, or `LOST(fence, EIO)` after which
+  the connection closes and the VM goes with it.
+- Anything refused gets `REFUSED(reason, detail)` and the connection closes.
+
+The broker side is `atrium_gpu_app::session`: a `Session` written against an `Arch` trait (code
+header checks and the packet builder; `Rdna4` is the one implemented) and a `Backend` trait (the
+driver; `AmdBackend` drives atrium-gpu-amd), so another GPU slots in without changing the
+channel or the records. Tests: `atrium-gpu-fuzz honest` (8 checks) and `atrium-gpu-fuzz
+hostile` against `frescod` with `FRESCOD_GPU_ONLY=1` on gpusim.
+
+Open: a global GPU memory budget across contexts (today one app can use up to 256 MiB, and
+gpusim answers ENOSPC once the pool is full), and folding the hostile run into
+`scripts/fresco-split-fuzz.sh`.
 
 ### G3. Broker PM4 builder (library done)
 - `atrium-gpu-app` (6dcd221f): code header checks, the closed record set (bind code, user

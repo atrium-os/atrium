@@ -39,6 +39,7 @@ mod redraw;
 mod render_backend;
 mod socket_server;
 mod split;
+mod gpu_app;
 mod chrome;
 
 use atrium_gpu::amd::{Display, Gpu, Scanout, COMMIT_MODESET};
@@ -69,6 +70,18 @@ fn flip_timeout_ms() -> u32 {
 
 fn main() -> std::io::Result<()> {
     let _ = env_logger::try_init();
+
+    // The app GPU channel alone, with no display or renderer: for testing
+    // the channel (atrium-gpu-fuzz) on a machine that cannot compose.
+    if std::env::var_os("FRESCOD_GPU_ONLY").is_some() {
+        let p = std::env::var("FRESCOD_GPU_SOCK").map(PathBuf::from)
+            .unwrap_or_else(|_| PathBuf::from("/atrium/sockets/fresco-gpu/fresco-gpu.sock"));
+        eprintln!("frescod: WARNING: FRESCOD_GPU_ONLY: serving only the GPU channel, no display");
+        gpu_app::serve(&p)?;
+        loop {
+            std::thread::park();
+        }
+    }
 
     // Headless compositor mode: same multi-window pipeline, but read the composited
     // frame back to a PNG instead of scanning out — captures the assembled (jailed)
@@ -166,6 +179,9 @@ fn main() -> std::io::Result<()> {
         if let Ok(p) = std::env::var("FRESCOD_CHROME_SOCK") {
             b.serve_chrome(Path::new(&p))?;
         }
+    }
+    if let Ok(p) = std::env::var("FRESCOD_GPU_SOCK") {
+        gpu_app::serve(Path::new(&p))?;
     }
     socket_server::spawn_event_fanout(ev_rx, event_subs, redraw.clone(), comp.clone());
 
@@ -327,6 +343,9 @@ fn run_headless(png: &str) -> std::io::Result<()> {
         if let Ok(p) = std::env::var("FRESCOD_CHROME_SOCK") {
             b.serve_chrome(Path::new(&p))?;
         }
+    }
+    if let Ok(p) = std::env::var("FRESCOD_GPU_SOCK") {
+        gpu_app::serve(Path::new(&p))?;
     }
     socket_server::spawn_event_fanout(ev_rx, subs, redraw2.clone(), comp.clone());
     eprintln!("frescod-headless: {W}x{H} on {} → {png}.png", sock.display());

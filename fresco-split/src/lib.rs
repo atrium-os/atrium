@@ -20,6 +20,7 @@
 
 pub mod chan;
 pub mod chrome;
+pub mod gpu;
 pub mod slot;
 
 /// Bytes in every record.

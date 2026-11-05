@@ -139,6 +139,11 @@ impl Chan {
         self.send_bytes(rec, fds, 0)
     }
 
+    /// [`Chan::send_raw`] without waiting, as [`Chan::send_now`].
+    pub fn send_now_raw(&self, rec: &[u8; MSG_BYTES], fds: &[RawFd]) -> io::Result<()> {
+        self.send_bytes(rec, fds, libc::MSG_DONTWAIT)
+    }
+
     /// Wait for one record, unparsed.
     pub fn recv_raw(&self) -> io::Result<Raw> {
         let mut rec = [0u8; MSG_BYTES];

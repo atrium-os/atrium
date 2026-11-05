@@ -20,6 +20,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "atrium-gpu-app"
+version = "0.1.0"
+dependencies = [
+ "atrium-rdna4-cmd",
+]
+
+[[package]]
+name = "atrium-rdna4-cmd"
+version = "0.1.0"
+
+[[package]]
+name = "atrium-rdna4-isa"
+version = "0.1.0"
+
+[[package]]
 name = "atrium-spv-blob"
 version = "0.1.0"
 
@@ -51,6 +66,8 @@ version = "0.1.0"
 name = "atrium-test-client"
 version = "0.1.0"
 dependencies = [
+ "atrium-gpu-app",
+ "atrium-rdna4-isa",
  "fresco-client",
  "fresco-compute",
  "fresco-protocol",

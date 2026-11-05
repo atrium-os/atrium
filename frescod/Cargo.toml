@@ -70,6 +70,8 @@ aqueduct-gpu-host   = { path = "../aqueduct-gpu-host" }
 fresco-aqueduct-bridge = { path = "../fresco-aqueduct-bridge" }
 fresco-text         = { path = "../fresco-text" }
 fresco-split        = { path = "../fresco-split" }
+# The app GPU channel (F6 G2): checks and builds app GPU work.
+atrium-gpu-app      = { path = "../atrium-gpu-app", features = ["device"] }
 # Split mode asks portcullisd (ExecInstance) to start each renderer; the
 # wire types only, no policy logic.
 portcullis-ipc      = { path = "../portcullis/portcullis-ipc" }

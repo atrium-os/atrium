@@ -9,6 +9,7 @@ dependencies = [
  "atrium-gpu-rs",
  "atrium-rdna4-cmd",
  "atrium-rdna4-isa",
+ "libc",
 ]
 
 [[package]]

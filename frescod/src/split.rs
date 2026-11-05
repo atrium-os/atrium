@@ -671,7 +671,7 @@ const CREATES_PER_S: f64 = 2.0;
 const CREATE_BURST: f64 = 16.0;
 
 /// A token bucket that waits when empty.
-struct Bucket {
+pub(crate) struct Bucket {
     rate: f64,
     cap: f64,
     tokens: f64,
@@ -679,11 +679,11 @@ struct Bucket {
 }
 
 impl Bucket {
-    fn new(rate: f64, cap: f64) -> Bucket {
+    pub(crate) fn new(rate: f64, cap: f64) -> Bucket {
         Bucket { rate, cap, tokens: cap, at: std::time::Instant::now() }
     }
 
-    fn take(&mut self) {
+    pub(crate) fn take(&mut self) {
         let now = std::time::Instant::now();
         self.tokens = (self.tokens + now.duration_since(self.at).as_secs_f64() * self.rate).min(self.cap);
         self.at = now;
