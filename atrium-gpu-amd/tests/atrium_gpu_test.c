@@ -763,7 +763,9 @@ test_caps(int fd)
 	uint32_t feat = 0;
 	size_t off = 0;
 	int saw_ver = 0;
+	struct atrium_gpu_isa_info isa;
 
+	memset(&isa, 0, sizeof(isa));
 	memset(&q, 0, sizeof(q));
 	q.caps_ptr = (uint64_t)(uintptr_t)buf;
 	q.caps_size = sizeof(buf);
@@ -783,8 +785,11 @@ test_caps(int fd)
 		case ATRIUM_GPU_CAP_VENDOR:
 			vendor = (const char *)data;
 			break;
-		case ATRIUM_GPU_CAP_FEATURES:
+		case ATRIUM_GPU_CAP_FEATURES_V1:
 			memcpy(&feat, data, sizeof(feat));
+			break;
+		case ATRIUM_GPU_CAP_ISA:
+			memcpy(&isa, data, sizeof(isa));
 			break;
 		default:
 			break;	/* unknown cap — skip it (forward compat) */
@@ -793,14 +798,17 @@ test_caps(int fd)
 		off = (off + 3u) & ~(size_t)3u;
 	}
 	if (!saw_ver || vendor == NULL ||
+	    isa.family != ATRIUM_GPU_ISA_AMD_RDNA4 ||
+	    strcmp(isa.name, "gfx1201") != 0 ||
 	    !(feat & ATRIUM_GPU_FEAT_USER_QUEUES) ||
 	    !(feat & ATRIUM_GPU_FEAT_SYNCOBJ)) {
-		printf("caps FAILED: vendor=%s feat=0x%x\n",
-		    vendor ? vendor : "(none)", feat);
+		printf("caps FAILED: vendor=%s feat=0x%x isa=%u/%.24s\n",
+		    vendor ? vendor : "(none)", feat, isa.family, isa.name);
 		return (1);
 	}
 	printf("caps OK: \"%s\", features 0x%x (graphics+compute+UMQ+syncobj+"
-	    "vm_bind)\n", vendor, feat);
+	    "vm_bind), ISA family %u %.24s\n", vendor, feat, isa.family,
+	    isa.name);
 	return (0);
 }
 

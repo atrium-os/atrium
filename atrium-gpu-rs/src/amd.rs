@@ -227,7 +227,23 @@ pub struct Caps {
     pub va_align: u64,
     /// Device-local VRAM heap size in bytes (CAP_HEAPS, the DEVICE heap).
     pub vram_bytes: u64,
+    /// CAP_BIND_FEATURES (`BIND_FEAT_*`).
+    pub bind_features: u64,
+    /// CAP_ISA: the instruction set family (`ISA_*`), the architecture's own
+    /// revision number (0x1201 for gfx1201) and its name. Pick compilers
+    /// and packet builders by this, not by the vendor string. 0 = the
+    /// driver does not report one (before ABI rev 4).
+    pub isa_family: u32,
+    pub isa_revision: u32,
+    pub isa_name: String,
 }
+
+/// CAP_ISA families.
+pub const ISA_AMD_RDNA4: u32 = 1;
+pub const ISA_AMD_RDNA3: u32 = 2;
+pub const ISA_INTEL_XE2: u32 = 3;
+/// CAP_BIND_FEATURES: read-only binds (`Vm::alloc_readonly`).
+pub const BIND_FEAT_READ_ONLY: u64 = 0x2;
 
 impl Gpu {
     pub fn open() -> io::Result<Self> {
@@ -259,15 +275,16 @@ impl Gpu {
                     let n = data.iter().position(|&b| b == 0).unwrap_or(data.len());
                     caps.vendor = String::from_utf8_lossy(&data[..n]).into_owned();
                 }
-                3 if data.len() >= 4 => {
+                // Ids as include/atrium/gpu_abi_v2.h numbers them (ABI rev 4).
+                0x100 if data.len() >= 4 => {
                     caps.features = u32::from_le_bytes(data[0..4].try_into().unwrap());
                 }
-                4 if data.len() >= 24 => {
+                5 if data.len() >= 24 => {
                     caps.va_base = u64::from_le_bytes(data[0..8].try_into().unwrap());
                     caps.va_size = u64::from_le_bytes(data[8..16].try_into().unwrap());
                     caps.va_align = u64::from_le_bytes(data[16..24].try_into().unwrap());
                 }
-                5 => {
+                3 => {
                     // array of heap_info { u32 kind, u32 flags, u64 size }; take
                     // the DEVICE (VRAM) heap's size.
                     for h in data.chunks_exact(16) {
@@ -276,6 +293,16 @@ impl Gpu {
                             caps.vram_bytes = u64::from_le_bytes(h[8..16].try_into().unwrap());
                         }
                     }
+                }
+                9 if data.len() >= 8 => {
+                    caps.bind_features = u64::from_le_bytes(data[0..8].try_into().unwrap());
+                }
+                18 if data.len() >= 32 => {
+                    caps.isa_family = u32::from_le_bytes(data[0..4].try_into().unwrap());
+                    caps.isa_revision = u32::from_le_bytes(data[4..8].try_into().unwrap());
+                    let name = &data[8..32];
+                    let n = name.iter().position(|&b| b == 0).unwrap_or(name.len());
+                    caps.isa_name = String::from_utf8_lossy(&name[..n]).into_owned();
                 }
                 _ => {}
             }

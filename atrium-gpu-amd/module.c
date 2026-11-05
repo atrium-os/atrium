@@ -82,6 +82,11 @@ amd_get_caps(struct atrium_amd_softc *sc, struct atrium_gpu_backend_caps *c)
 	c->va_size = (uint64_t)ATRIUM_AMD_VM_MAX_BO * PAGE_SIZE;
 	c->va_align = PAGE_SIZE;
 	c->vram_bytes = ATRIUM_AMD_VRAM_BYTES;
+	c->bind_features = ATRIUM_GPU_BIND_FEAT_READ_ONLY;
+	/* gpusim models the R9700 (Navi 48, gfx1201). */
+	c->isa_family = ATRIUM_GPU_ISA_AMD_RDNA4;
+	c->isa_revision = 0x1201;
+	c->isa_name = "gfx1201";
 }
 
 /*
@@ -129,7 +134,7 @@ amd_gpu_reset(struct atrium_amd_softc *sc)
 static const char amd_build_id[] = ATRIUM_BUILD_ID;
 /* Bumped when the client-visible rules change: 2 = isolation (control node,
  * exclusive queue ownership, owner-only doorbell mmap). */
-#define ATRIUM_AMD_ABI_REV	3	/* 3: VM_BIND2 (read-only binds) */
+#define ATRIUM_AMD_ABI_REV	4	/* 3: VM_BIND2 (read-only binds); 4: v2 cap ids, CAP_ISA */
 
 static const struct atrium_gpu_backend_ops amd_backend = {
 	.name = "amd",

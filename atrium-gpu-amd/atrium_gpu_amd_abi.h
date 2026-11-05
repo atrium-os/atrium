@@ -39,11 +39,37 @@ struct atrium_gpu_cap_record {
 	/* uint8_t cap_data[cap_size]; then padded to a 4-byte boundary */
 };
 
+/*
+ * Cap ids follow include/atrium/gpu_abi_v2.h, which is normative (ABI rev 4;
+ * before it HEAPS was 5 and ADDRESS_SPACE 4). Ids from 0x100 are this
+ * driver's own and transitional: FEATURES_V1 goes once QUEUE_FAMILIES and
+ * SUBMIT_FEATURES are emitted.
+ */
 #define ATRIUM_GPU_CAP_ABI_VERSION	1	/* data: u32 major, u32 minor */
 #define ATRIUM_GPU_CAP_VENDOR		2	/* data: NUL-terminated string */
-#define ATRIUM_GPU_CAP_FEATURES		3	/* data: u32 ATRIUM_GPU_FEAT_* bitmap */
-#define ATRIUM_GPU_CAP_ADDRESS_SPACE	4	/* data: struct atrium_gpu_cap_address_space */
-#define ATRIUM_GPU_CAP_HEAPS		5	/* data: struct atrium_gpu_heap_info[] */
+#define ATRIUM_GPU_CAP_HEAPS		3	/* data: struct atrium_gpu_heap_info[] */
+#define ATRIUM_GPU_CAP_ADDRESS_SPACE	5	/* data: struct atrium_gpu_cap_address_space */
+#define ATRIUM_GPU_CAP_BIND_FEATURES	9	/* data: u64 ATRIUM_GPU_BIND_FEAT_* */
+#define ATRIUM_GPU_CAP_ISA		18	/* data: struct atrium_gpu_isa_info */
+#define ATRIUM_GPU_CAP_FEATURES_V1	0x100	/* data: u32 ATRIUM_GPU_FEAT_* bitmap */
+
+#define ATRIUM_GPU_BIND_FEAT_SPARSE	0x1u
+#define ATRIUM_GPU_BIND_FEAT_READ_ONLY	0x2u	/* VM_BIND2 + BIND_READONLY */
+
+/*
+ * ISA — which instruction set the device runs, so userspace picks its
+ * compiler backend and packet builder from this instead of the vendor
+ * string. family is ATRIUM_GPU_ISA_*; revision the architecture's own
+ * number (0x1201 for gfx1201); name the same as text, NUL padded.
+ */
+#define ATRIUM_GPU_ISA_AMD_RDNA4	1
+#define ATRIUM_GPU_ISA_AMD_RDNA3	2
+#define ATRIUM_GPU_ISA_INTEL_XE2	3
+struct atrium_gpu_isa_info {
+	uint32_t	family;
+	uint32_t	revision;
+	char		name[24];
+};
 
 /*
  * ADDRESS_SPACE — the per-VM GPU virtual-address window a BO can be bound into,

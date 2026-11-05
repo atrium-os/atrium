@@ -32,7 +32,8 @@ pub const CODE_MAGIC: [u8; 4] = *b"AGPC";
 /// The only header version so far.
 pub const CODE_VERSION: u32 = 1;
 /// Architecture ids, as the GPU channel's `HELLO` reports the broker's GPU
-/// and each code header names the GPU it was built for. The record set and
+/// and each code header names the GPU it was built for. They are the
+/// driver's CAP_ISA families (`ATRIUM_GPU_ISA_*` in gpu_abi_v2.h). The record set and
 /// the channel are the same for every architecture; the code header layout
 /// and the packet builder are per architecture (see [`session::Arch`]).
 pub const ARCH_RDNA4: u32 = 1;

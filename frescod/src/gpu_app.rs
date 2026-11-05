@@ -164,6 +164,16 @@ fn context(c: &Chan) -> String {
         refuse(c, reason::DEVICE, 0);
         return "no GPU".into();
     };
+    // The architecture comes from the driver's CAP_ISA, never the vendor
+    // string. Only RDNA4 has an app-path Arch so far; another family gets
+    // its own `Arch` and a match arm here.
+    match gpu.caps().map(|c| c.isa_family) {
+        Ok(f) if f == Rdna4::ID => {}
+        other => {
+            refuse(c, reason::DEVICE, 0);
+            return format!("no app-path architecture for this GPU (ISA family {other:?})");
+        }
+    }
     let session = AmdBackend::new(gpu, WAIT_MS).and_then(Session::<Rdna4, _>::new);
     let mut s = match session {
         Ok(s) => s,

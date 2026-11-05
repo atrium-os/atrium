@@ -385,6 +385,7 @@ atrium_amd_ioctl(struct cdev *cdev, u_long cmd, caddr_t data, int fflag,
 		struct atrium_gpu_backend_caps bc;
 		struct atrium_gpu_cap_address_space as;
 		struct atrium_gpu_heap_info heaps[2];
+		struct atrium_gpu_isa_info isa;
 		uint8_t buf[256];
 		size_t off = 0;
 
@@ -405,12 +406,21 @@ atrium_amd_ioctl(struct cdev *cdev, u_long cmd, caddr_t data, int fflag,
 		    sizeof(ver));
 		off = amd_put_cap(buf, off, ATRIUM_GPU_CAP_VENDOR, bc.vendor,
 		    strlen(bc.vendor) + 1);
-		off = amd_put_cap(buf, off, ATRIUM_GPU_CAP_FEATURES, &bc.features,
-		    sizeof(bc.features));
+		off = amd_put_cap(buf, off, ATRIUM_GPU_CAP_FEATURES_V1,
+		    &bc.features, sizeof(bc.features));
 		off = amd_put_cap(buf, off, ATRIUM_GPU_CAP_ADDRESS_SPACE, &as,
 		    sizeof(as));
 		off = amd_put_cap(buf, off, ATRIUM_GPU_CAP_HEAPS, heaps,
 		    sizeof(heaps));
+		off = amd_put_cap(buf, off, ATRIUM_GPU_CAP_BIND_FEATURES,
+		    &bc.bind_features, sizeof(bc.bind_features));
+		memset(&isa, 0, sizeof(isa));
+		isa.family = bc.isa_family;
+		isa.revision = bc.isa_revision;
+		if (bc.isa_name != NULL)
+			strlcpy(isa.name, bc.isa_name, sizeof(isa.name));
+		off = amd_put_cap(buf, off, ATRIUM_GPU_CAP_ISA, &isa,
+		    sizeof(isa));
 
 		if (q->caps_size < off) {
 			q->caps_size = off;	/* tell userspace the size needed */

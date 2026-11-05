@@ -71,6 +71,7 @@ mechanism in this driver, and records how the five breaks from the
   queue that is still running at once instead of after `hang_ms`. A runaway
   shader stops only its own queue, which the watchdog then reclaims.
   Counter: `isolation.vm_faults`.
+- **CAP_ISA and v2 cap ids (ABI rev 4).** QUERY_CAPS reports the ISA family (RDNA4 = 1, gfx1201) so userspace picks compilers and packet builders by architecture, not vendor string; HEAPS is 3 and ADDRESS_SPACE 5 as gpu_abi_v2.h numbers them, BIND_FEATURES (9) says read-only binds work, and the v1 feature bitmap moved to the driver-private id 0x100.
 - **Read-only binds (ABI rev 3).** `VM_BIND2` with `ATRIUM_GPU_BIND_READONLY`
   maps a BO without `PTE_WRITE`, and the GMC enforces it (`VM_CNTL`, set at
   init and after every reset). The broker maps an app's code and constants

@@ -80,6 +80,26 @@ struct atrium_gpu_cap_record {
 #define ATRIUM_GPU_CAP_CLOCK		15  /* atrium_gpu_clock_info */
 #define ATRIUM_GPU_CAP_PREEMPTION	16  /* atrium_gpu_preemption_info */
 #define ATRIUM_GPU_CAP_PERF_COUNTERS	17  /* atrium_gpu_perf_counter_info[] */
+#define ATRIUM_GPU_CAP_ISA		18  /* atrium_gpu_isa_info */
+/* Ids from 0x100 are a driver's own and transitional (atrium-gpu-amd's
+ * FEATURES_V1 is 0x100); clients skip ids they do not know. */
+
+/*
+ * ISA: the instruction set the device runs. Userspace picks its compiler
+ * backend and packet builder by family, never by the vendor string, so a
+ * new GPU family slots in behind the same interfaces (the app path's
+ * atrium_gpu_app::session::Arch, Fresco's fresco_compute::gpu::Arch).
+ * revision is the family's own number (0x1201 for gfx1201); name the same
+ * as text, NUL padded.
+ */
+#define ATRIUM_GPU_ISA_AMD_RDNA4	1
+#define ATRIUM_GPU_ISA_AMD_RDNA3	2
+#define ATRIUM_GPU_ISA_INTEL_XE2	3
+struct atrium_gpu_isa_info {
+	uint32_t family;
+	uint32_t revision;
+	char     name[24];
+};
 
 #define ATRIUM_GPU_HEAP_DEVICE_LOCAL	0x1u
 #define ATRIUM_GPU_HEAP_CPU_VISIBLE	0x2u  /* mappable with BO_MMAP_INFO */

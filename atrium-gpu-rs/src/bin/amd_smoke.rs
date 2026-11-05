@@ -49,8 +49,8 @@ fn run() -> io::Result<()> {
     // 1. Caps (TLV).
     let caps = gpu.caps()?;
     eprintln!(
-        "caps OK: \"{}\" abi {}.{} features {:#x}",
-        caps.vendor, caps.abi_major, caps.abi_minor, caps.features
+        "caps OK: \"{}\" abi {}.{} features {:#x} isa {} {:#x} {}",
+        caps.vendor, caps.abi_major, caps.abi_minor, caps.features, caps.isa_family, caps.isa_revision, caps.isa_name
     );
     eprintln!(
         "  address-space: va_base={:#x} va_size={} MiB va_align={}; vram={} MiB",

@@ -300,11 +300,15 @@ struct atrium_gpu_powergate;
  */
 struct atrium_gpu_backend_caps {
 	const char *vendor;	/* CAP_VENDOR */
-	uint32_t    features;	/* CAP_FEATURES bitmap */
+	uint32_t    features;	/* CAP_FEATURES_V1 bitmap */
 	uint64_t    va_base;	/* CAP_ADDRESS_SPACE */
 	uint64_t    va_size;
 	uint64_t    va_align;
 	uint64_t    vram_bytes;	/* CAP_HEAPS device heap size */
+	uint64_t    bind_features; /* CAP_BIND_FEATURES */
+	uint32_t    isa_family;	/* CAP_ISA */
+	uint32_t    isa_revision;
+	const char *isa_name;
 };
 
 /*
