@@ -87,7 +87,7 @@ compute route chosen; security conditions F1–F6 in
 | Damage tracking (only dirty tiles re-rastered; 15 s → 0.4 s/frame on gpusim) | done | `57035bc` |
 | F2 bounds hardening + differential fuzzer | done | `9323062` |
 | F4a per-window surfaces + compose kernel | done | `a20492f`, `797a3e5` |
-| F4b one jailed renderer per client (`FRESCOD_SPLIT=1`, portcullis jail) | done, off by default | `a46ec90`, `0a864bd` |
+| F4b one jailed renderer per client (portcullisd jail, `_fresco-render`; frescod as `_frescod`) | done, on by default with compute/gpu | `a46ec90`, `0a864bd` |
 | F4c input routed by the composed layer list; window 0 = WM | done | `1c87e2d` |
 | F4c′ click-through on alpha < 16 (anti-clickjacking) | done | `2cf9231` |
 | F4d trusted chrome: 24 px origin strip only frescod draws, focus ring | done | `a9bf150` |

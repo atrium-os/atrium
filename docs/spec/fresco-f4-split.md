@@ -39,23 +39,32 @@ Before this change, frescod's event fan-out sent every event to every connection
 
 ### F4b. The process split
 
-Done, renderer jailed (atrium a46ec90 and the commit after it). frescod runs as `_frescod` and has portcullisd start each renderer, which runs as `_fresco-render` under the system policy's worker rule (portcullis.md §6.5.2g): launcher `portcullis exec --daemon --require-memory-limit --instance fresco{client} org.atrium.fresco.renderer`, set up by `scripts/fresco-renderer-bundle.sh`. `FRESCOD_SPLIT=1` hands every connection on `fresco.sock` to its own `fresco-renderer`; the WM socket stays in the broker. The renderer's stdin is the record channel, and the client's socket arrives over it in the first record (`CLIENT`), because a jail from `portcullis exec` gets only its three stdio fds. `FRESCOD_RENDERER_LAUNCHER` runs it confined, e.g. `portcullis exec --require-memory-limit --user <unprivileged> --instance fresco{client} org.atrium.fresco.renderer` (a signed bundle with no capabilities).
+Done, renderer jailed, and on by default (atrium a46ec90 and later). Split mode hands every connection on `fresco.sock` to its own `fresco-renderer`; the WM socket stays in the broker. The renderer's stdin is the record channel, and the client's socket arrives over it in the first record (`CLIENT`), because a one-shot jail gets only its three stdio fds.
+
+Starting renderers (2026-11-05):
+- frescod runs as `_frescod`, not root. For each connection it asks portcullisd itself (`ExecInstance` over the portcullisd socket, as `portcullis exec --daemon` does, so frescod's jail needs no CLI) for a one-shot jail of `org.atrium.fresco.renderer` (`FRESCOD_RENDERER_APP`), instance `fresco<handle>`, with `require_memory_limit`.
+- The system policy's worker rule (portcullis.md §6.5.2g) runs it as `_fresco-render` with the bundle's 512 MiB / 100 % CPU caps. `scripts/fresco-renderer-bundle.sh` builds the signed bundle and sets up the users and the rule.
+- It fails closed: if portcullisd is not there or refuses, the client is refused and logged; frescod never falls back to an unconfined renderer.
+- Split mode is on unless `FRESCOD_SPLIT=0`, when the renderer can show renderer frames (`compute`, `gpu`). With Vulkan, still the default renderer, it stays off and frescod warns; making `compute` the default renderer is a follow-up.
+- `FRESCOD_RENDERER_LAUNCHER=<command>` replaces portcullisd with a command (`{client}` is the client id; the fuzz harness uses it), and `FRESCOD_RENDERER_LAUNCHER=unconfined` runs `FRESCOD_RENDERER_BIN` directly, for development.
 
 Verified in the amd64 VM with `atrium-surfaces-demo`:
 - Unconfined: headless on Tier-2, and on gpusim with the GPU renderer (screenshot `frescod-f4b-split-gpu.png`).
 - Jailed: the renderer ran in its own jail as an unprivileged user, and drew all three windows (`frescod-f4b-jailed-renderer.png`). A probe bundle in the same jail configuration saw only its own tree, a /dev of null, zero, random, urandom, stdio and fd, no /etc, no GPU, display or HID node, and no network (connections to the host and to loopback refused).
 - When the client quits, or frescod is killed, the renderer exits and its jail and mounts are gone.
+- Native launch, frescod as `_frescod` with no launcher set: the renderer ran as `_fresco-render` in jail `app-org-atrium-fresco-renderer--fresco1` with `memoryuse:sigkill=536870912` and `pcpu:deny=100`, and the text demo drew. With portcullisd stopped the client was refused and no renderer started. A renderer stopped with SIGSTOP (so it ignores end-of-file) was gone 5 s after its client hung up: frescod hangs up on portcullisd, which kills the jail. `fresco-split-fuzz.sh 60 11` still passes.
 
 How it works:
 - Records and fds go over `fresco_split::chan` (SOCK_SEQPACKET; a record of the wrong size, a truncated one, or one with too many fds is refused).
 - Slots are memfds the broker creates sealed against shrinking and growing, so a renderer cannot truncate one under the broker's mapping; a renderer refuses slots that are not sealed.
 - The broker sends `GEOMETRY` whenever the WM's size for a window differs from the last one it sent, and accepts only frames of that size. A frame drawn at the old size is dropped and the renderer draws again.
-- Retiring a renderer closes its channel first, so `portcullis exec` can tear its jail down; a kill after 5 s is only the backstop.
+- Retiring a renderer closes its channel first, so it exits and its jail goes. The backstop after 5 s: a child is killed; a portcullisd jail is ended by hanging up the `ExecInstance` connection, on which portcullisd kills the worker and removes the jail (portcullis.md §6.5.2g).
 
 Known gaps:
 - Fonts: the bundle carries them (`scripts/fresco-renderer-bundle.sh`), at the path the renderer's text looks in.
 - A client drawing on window 0 draws only in its renderer's own window 0, which the broker does not show. Clients that want a desktop draw in a window of role Background, as forum-dock does.
-- `FRESCOD_SPLIT` is off by default, and the Vulkan backend does not take pre-packed frames.
+- The Vulkan backend does not take renderer frames, so with it (still the default renderer) split mode is off.
+- frescod has no services.d manifest yet: it should run jailed as `_frescod` with the portcullisd socket mounted (the `[services.frescod]` jaild stanza already names `_frescod`).
 
 Plan as written:
 

@@ -170,6 +170,12 @@ impl<'a> Backend<'a> {
         }
     }
 
+    /// Whether it can composite frames a split-mode renderer drew
+    /// (`ScreenInput::frames`): the compute paths can, Vulkan cannot.
+    pub fn takes_frames(&self) -> bool {
+        !matches!(self, Backend::Vulkan(_))
+    }
+
     pub fn render(&mut self, f: ScreenInput) -> Result<()> {
         match self {
             Backend::Vulkan(r) => {

@@ -147,7 +147,7 @@ fn main() -> std::io::Result<()> {
      * input, compositor events) and consumed by the display loop so it
      * recomposes on change instead of spinning at TARGET_FPS. */
     let redraw = redraw::RedrawSignal::new();
-    let split = split::Broker::from_env(comp.clone(), redraw.clone(), (mode.width, mode.height, mode.refresh_mhz));
+    let split = split::Broker::from_env(comp.clone(), redraw.clone(), (mode.width, mode.height, mode.refresh_mhz), renderer.takes_frames());
 
     let event_subs = socket_server::spawn(
         socket_server::Shared {
@@ -311,7 +311,7 @@ fn run_headless(png: &str) -> std::io::Result<()> {
     let wm_sock = Some(std::env::var("FRESCOD_WM_SOCK").map(PathBuf::from)
         .unwrap_or_else(|_| PathBuf::from("/atrium/sockets/fresco-wm/fresco-wm.sock")));
     let redraw2 = redraw::RedrawSignal::new();
-    let split = split::Broker::from_env(comp.clone(), redraw2.clone(), (W, H, 0));
+    let split = split::Broker::from_env(comp.clone(), redraw2.clone(), (W, H, 0), renderer.takes_frames());
     let subs = socket_server::spawn(
         socket_server::Shared {
             frontend: frontend.clone(),

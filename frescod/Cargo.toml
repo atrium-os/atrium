@@ -67,6 +67,9 @@ aqueduct-gpu-host   = { path = "../aqueduct-gpu-host" }
 fresco-aqueduct-bridge = { path = "../fresco-aqueduct-bridge" }
 fresco-text         = { path = "../fresco-text" }
 fresco-split        = { path = "../fresco-split" }
+# Split mode asks portcullisd (ExecInstance) to start each renderer; the
+# wire types only, no policy logic.
+portcullis-ipc      = { path = "../portcullis/portcullis-ipc" }
 atrium-trace        = { path = "../atrium-trace/rust" }
 # Note: frescod no longer depends on portcullis-peer/policy. window-management is
 # granted by REACHABILITY of the dedicated wm socket (the TCB mounts it only for

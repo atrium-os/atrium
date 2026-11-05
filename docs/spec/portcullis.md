@@ -1525,6 +1525,13 @@ started through portcullisd (`portcullis exec --daemon`). Each runs as `_fresco-
 in its own jail with the bundle's 512 MiB cap. The same request from `navtest` runs as
 `navtest`.
 
+A worker does not outlive its caller. The caller holds the `ExecInstance` connection for
+the worker's whole life; if it hangs up first, portcullisd SIGKILLs the jail's processes
+and removes the jail. That is how frescod ends a renderer that ignores end-of-file: it
+runs as another uid, so frescod cannot signal it. frescod now speaks `ExecInstance`
+itself rather than running `portcullis exec --daemon`. Verified in the VM with a renderer
+held in SIGSTOP: gone right after the hang-up.
+
 ### 6.5.2d One copy of the mount mechanics
 
 Three lanes had three copies of "unmount everything under this root", at **three different

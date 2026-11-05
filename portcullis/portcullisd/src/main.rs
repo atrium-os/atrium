@@ -579,6 +579,14 @@ fn handle_exec_instance(
         // inside portcullis_oneshot — see Spec::user_name.
         user_name: rule.as_ref().map(|r| r.run_as.clone()).unwrap_or_else(|| user.to_string()),
     };
+    /* ★ A worker does not outlive its caller. The caller holds this
+     * connection for the jail's whole life; if it hangs up (it exited, or it
+     * is ending a worker that ignored end-of-file on its stdin, as frescod
+     * does for a renderer), the jail is removed. Without this the caller had
+     * no way to end a worker that runs as another uid (a worker rule). */
+    let watch = jail_name_for(&spec).and_then(|name| {
+        reader.get_ref().try_clone().ok().map(|c| end_jail_on_hangup(c, name))
+    });
     let resp = match portcullis_oneshot::run_with_stdio(&spec, Some(stdio)) {
         // The worker's own status (jaild reaps it); None = killed by a signal.
         portcullis_oneshot::OneShot::Exit { code, .. } =>
@@ -592,7 +600,45 @@ fn handle_exec_instance(
     // until the entry exits — and released here, or by the guard's Drop on
     // any early return or panic above.
     drop(slot);
+    if let Some(done) = watch { done.store(true, std::sync::atomic::Ordering::Release) }
     write_response(writer, &resp)
+}
+
+fn jail_name_for(spec: &portcullis_oneshot::Spec) -> Option<String> {
+    portcullis_jail::jaild_instance_name(&spec.target, spec.instance.as_deref())
+}
+
+/// Watch `caller` until `done` is set; if it hangs up first, remove the
+/// jail `name` (its processes are killed, and `run_with_stdio` returns).
+fn end_jail_on_hangup(caller: UnixStream, name: String) -> Arc<std::sync::atomic::AtomicBool> {
+    use std::sync::atomic::Ordering;
+    let done = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let d = done.clone();
+    let _ = std::thread::Builder::new().name("portcullisd-exec-hup".into()).spawn(move || {
+        while !d.load(Ordering::Acquire) {
+            let mut p = libc::pollfd { fd: caller.as_raw_fd(), events: libc::POLLIN, revents: 0 };
+            let n = unsafe { libc::poll(&mut p, 1, 250) };
+            if n <= 0 || d.load(Ordering::Acquire) { continue }
+            let hung_up = p.revents & (libc::POLLHUP | libc::POLLERR) != 0 || {
+                let mut b = [0u8; 1];
+                let r = unsafe { libc::recv(caller.as_raw_fd(), b.as_mut_ptr().cast(), 1, libc::MSG_PEEK | libc::MSG_DONTWAIT) };
+                r == 0
+            };
+            if hung_up {
+                eprintln!("portcullisd: caller hung up; removing worker jail {name}");
+                // SIGKILL first: `jail -r` alone sends SIGTERM and waits ten
+                // seconds for a worker that may be ignoring it (or stopped).
+                let _ = std::process::Command::new("pkill").args(["-9", "-j", &name])
+                    .stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null()).status();
+                let _ = std::process::Command::new("jail").arg("-r").arg(&name)
+                    .stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null()).status();
+                return;
+            }
+            // The caller wrote something it should not have; do not spin on it.
+            std::thread::sleep(std::time::Duration::from_millis(250));
+        }
+    });
+    done
 }
 
 /// Monotonic milliseconds for the limiter. ★ Monotonic, not wall clock: a

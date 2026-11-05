@@ -14,11 +14,12 @@
 
 use std::collections::HashMap;
 use std::io;
-use std::os::fd::AsRawFd;
+use std::os::fd::{AsRawFd, OwnedFd};
 use std::os::unix::net::UnixStream;
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
 use std::sync::mpsc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use fresco_protocol::WmRole;
@@ -55,7 +56,7 @@ struct Renderer {
     gone: std::sync::atomic::AtomicBool,
     /// Its windows, by its own (local) ids.
     wins: Mutex<HashMap<u32, Win>>,
-    child: Mutex<Child>,
+    proc_: Mutex<Proc>,
 }
 
 impl Renderer {
@@ -86,8 +87,7 @@ pub struct Broker {
     comp: Arc<Mutex<Compositor>>,
     redraw: Redraw,
     screen: (u32, u32, u32),
-    bin: PathBuf,
-    launcher: Option<String>,
+    launch: Launch,
     /// The last good frame of every renderer-drawn window, by global id.
     frames: Mutex<HashMap<u32, Arc<fresco_compute::Frame>>>,
     renderers: Mutex<HashMap<u8, Arc<Renderer>>>,
@@ -99,30 +99,70 @@ pub struct Broker {
 const MAX_OPENED: usize = 64;
 
 impl Broker {
-    /// `FRESCOD_SPLIT=1` turns split mode on. `FRESCOD_RENDERER_BIN` names
-    /// the renderer (default: `fresco-renderer` beside frescod), and
-    /// `FRESCOD_RENDERER_LAUNCHER`, if set, is a command line that runs it
-    /// confined, with `{client}` replaced by the client id, e.g.
-    /// `portcullis exec --require-memory-limit --user navtest --instance fresco{client} org.atrium.fresco.renderer`.
-    pub fn from_env(comp: Arc<Mutex<Compositor>>, redraw: Redraw, screen: (u32, u32, u32)) -> Option<Arc<Broker>> {
-        if std::env::var("FRESCOD_SPLIT").ok().as_deref() != Some("1") {
-            return None;
+    /// Split mode is ON unless `FRESCOD_SPLIT=0`, when the renderer can
+    /// take renderer-drawn frames (`takes_frames`: compute and gpu; Vulkan
+    /// cannot, so with it split mode stays off unless `FRESCOD_SPLIT=1`
+    /// forces it, and frescod says so).
+    ///
+    /// How a renderer is started:
+    /// - by default frescod asks portcullisd for a one-shot jail of
+    ///   `FRESCOD_RENDERER_APP` (default `org.atrium.fresco.renderer`); the
+    ///   system policy's worker rule runs it as `_fresco-render` with the
+    ///   bundle's memory cap. If portcullisd cannot start it, the client is
+    ///   refused: it fails closed, never falls back to an unconfined
+    ///   renderer.
+    /// - `FRESCOD_RENDERER_LAUNCHER=<command>` runs that command instead,
+    ///   with `{client}` replaced by the client id (the fuzz harness);
+    /// - `FRESCOD_RENDERER_LAUNCHER=unconfined` runs `FRESCOD_RENDERER_BIN`
+    ///   (default: `fresco-renderer` beside frescod) directly, for
+    ///   development only.
+    pub fn from_env(comp: Arc<Mutex<Compositor>>, redraw: Redraw, screen: (u32, u32, u32), takes_frames: bool) -> Option<Arc<Broker>> {
+        match std::env::var("FRESCOD_SPLIT").ok().as_deref() {
+            Some("0") => {
+                eprintln!("frescod: WARNING: split mode off (FRESCOD_SPLIT=0): clients are parsed inside frescod");
+                return None;
+            }
+            Some("1") => {
+                if !takes_frames {
+                    eprintln!("frescod: WARNING: FRESCOD_SPLIT=1 with a renderer that cannot draw renderer frames; their windows stay blank");
+                }
+            }
+            _ if !takes_frames => {
+                eprintln!("frescod: WARNING: split mode off: this renderer cannot draw renderer frames \
+                           (use FRESCOD_RENDERER=compute or gpu); clients are parsed inside frescod");
+                return None;
+            }
+            _ => {}
         }
         let bin = std::env::var_os("FRESCOD_RENDERER_BIN").map(PathBuf::from).unwrap_or_else(|| {
             let me = std::env::current_exe().unwrap_or_default();
             me.with_file_name("fresco-renderer")
         });
-        let launcher = std::env::var("FRESCOD_RENDERER_LAUNCHER").ok().filter(|s| !s.trim().is_empty());
-        match &launcher {
-            Some(l) => eprintln!("frescod: split mode, renderer launched by: {l}"),
-            None => eprintln!("frescod: split mode, renderer {} (not confined)", bin.display()),
-        }
+        let launch = match std::env::var("FRESCOD_RENDERER_LAUNCHER").ok().filter(|s| !s.trim().is_empty()) {
+            Some(l) if l.trim() == "unconfined" => {
+                eprintln!("frescod: WARNING: split mode, renderer {} NOT confined (FRESCOD_RENDERER_LAUNCHER=unconfined)", bin.display());
+                Launch::Bin(bin)
+            }
+            Some(l) => {
+                eprintln!("frescod: split mode, renderer launched by: {l}");
+                Launch::Command(l)
+            }
+            None => {
+                let app = std::env::var("FRESCOD_RENDERER_APP").ok().filter(|s| !s.is_empty())
+                    .unwrap_or_else(|| RENDERER_APP.to_string());
+                match portcullis_ipc::resolve_socket_path() {
+                    Some(p) => eprintln!("frescod: split mode, renderers are {app} jails from portcullisd ({p})"),
+                    None => eprintln!("frescod: WARNING: split mode, but portcullisd's socket is missing: \
+                                       every client will be refused until it is there"),
+                }
+                Launch::Portcullisd { app }
+            }
+        };
         Some(Arc::new(Broker {
             comp,
             redraw,
             screen,
-            bin,
-            launcher,
+            launch,
             frames: Mutex::new(HashMap::new()),
             renderers: Mutex::new(HashMap::new()),
             subs: Mutex::new(None),
@@ -291,28 +331,42 @@ impl Broker {
         // has stopped reading fills it and is retired (`Renderer::tell`).
         ours.set_buffer(256 << 10)?;
         theirs.set_buffer(256 << 10)?;
-        let mut cmd = match &self.launcher {
-            Some(l) => {
-                let l = l.replace("{client}", &client_id.to_string());
-                let mut words = l.split_whitespace();
-                let mut c = Command::new(words.next().unwrap_or_default());
-                c.args(words);
-                c
+        let handle = self.next_handle.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let proc_ = match &self.launch {
+            Launch::Portcullisd { app } => {
+                // Named by the handle, not the client id: an id is reused as
+                // soon as it is freed, a handle never is, so a jail that is
+                // slow to go cannot block the next client given its id.
+                Proc::jail(app, &format!("fresco{handle}"), theirs.into_fd()).map_err(|e| {
+                    log::error!("frescod: client {client_id}: REFUSED, portcullisd did not start a renderer: {e}");
+                    e
+                })?
             }
-            None => Command::new(&self.bin),
+            l => {
+                let mut cmd = match l {
+                    Launch::Command(l) => {
+                        let l = l.replace("{client}", &client_id.to_string());
+                        let mut words = l.split_whitespace();
+                        let mut c = Command::new(words.next().unwrap_or_default());
+                        c.args(words);
+                        c
+                    }
+                    Launch::Bin(b) => Command::new(b),
+                    Launch::Portcullisd { .. } => unreachable!(),
+                };
+                // stdout carries nothing (a launcher's chatter must not reach
+                // the channel); stderr is inherited so a failing renderer is heard.
+                cmd.stdin(Stdio::from(theirs.into_fd())).stdout(Stdio::null());
+                Proc::Child(cmd.spawn()?)
+            }
         };
-        // stdout carries nothing (a launcher's chatter must not reach the
-        // channel); stderr is inherited so a failing renderer is heard.
-        cmd.stdin(Stdio::from(theirs.into_fd())).stdout(Stdio::null());
-        let child = cmd.spawn()?;
         ours.send(&Msg::Client { width: self.screen.0, height: self.screen.1, refresh_mhz: self.screen.2 }, &[stream.as_raw_fd()])?;
         // The broker keeps a copy of the client's socket, never read, only
         // to see the client hang up: a renderer that ignores its client's
         // hang-up must not keep its client id and windows forever.
         let hangup = stream;
-        log::info!("frescod: client {client_id} (uid {uid:?}) -> renderer pid {}", child.id());
+        log::info!("frescod: client {client_id} (uid {uid:?}) -> renderer {}", proc_.describe());
 
-        let handle = self.next_handle.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let r = Arc::new(Renderer {
             client_id,
             handle,
@@ -321,7 +375,7 @@ impl Broker {
             chan: ours,
             gone: std::sync::atomic::AtomicBool::new(false),
             wins: Mutex::new(HashMap::new()),
-            child: Mutex::new(child),
+            proc_: Mutex::new(proc_),
         });
         self.renderers.lock().unwrap().insert(client_id, r.clone());
 
@@ -465,21 +519,21 @@ impl Broker {
     fn reap(&self, r: &Arc<Renderer>, subs: &EventSubs) {
         r.gone.store(true, std::sync::atomic::Ordering::Relaxed);
         {
-            // End the channel first: the renderer exits on end-of-file, and a
-            // launcher (portcullis exec) then tears its jail down. Killing the
-            // launcher outright would leave the jail behind; the kill is
-            // only the backstop for one that does not go.
+            // End the channel first: the renderer exits on end-of-file and
+            // its jail goes with it. The kill is only the backstop for one
+            // that does not go: a child is killed; a portcullisd jail is
+            // ended by hanging up on portcullisd, which then removes it.
             r.chan.shutdown();
-            let mut c = r.child.lock().unwrap();
+            let mut p = r.proc_.lock().unwrap();
             let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-            while matches!(c.try_wait(), Ok(None)) && std::time::Instant::now() < deadline {
+            while !p.exited() && std::time::Instant::now() < deadline {
                 std::thread::sleep(std::time::Duration::from_millis(50));
             }
-            if matches!(c.try_wait(), Ok(None)) {
+            if !p.exited() {
                 log::warn!("frescod: client {}: renderer did not exit; killing it", r.client_id);
-                let _ = c.kill();
+                p.kill();
             }
-            let _ = c.wait();
+            p.wait();
         }
         subs.lock().unwrap().retain(|s| s.wm || s.client_id != r.client_id);
         let wins: Vec<Win> = r.wins.lock().unwrap().drain().map(|(_, w)| w).collect();
@@ -488,6 +542,120 @@ impl Broker {
         }
         self.renderers.lock().unwrap().remove(&r.client_id);
         socket_server::free_client_id(r.client_id);
+    }
+}
+
+/// The renderer app frescod asks portcullisd for by default.
+pub const RENDERER_APP: &str = "org.atrium.fresco.renderer";
+
+/// How a renderer is started (see [`Broker::from_env`]).
+enum Launch {
+    /// A one-shot jail from portcullisd: the production path.
+    Portcullisd { app: String },
+    /// A command line, `{client}` replaced by the client id.
+    Command(String),
+    /// The renderer binary, run directly: not confined.
+    Bin(PathBuf),
+}
+
+/// A running renderer.
+enum Proc {
+    Child(Child),
+    /// A jail portcullisd runs for us. `sock` is the ExecInstance
+    /// connection: portcullisd answers on it when the jail ends, and ends the
+    /// jail if we hang up on it.
+    Jail { name: String, sock: UnixStream, exited: Arc<AtomicBool> },
+}
+
+impl Proc {
+    /// Ask portcullisd to run `app` as instance `instance`, on our channel
+    /// end as its stdin. It returns once the jail is being started; whether
+    /// it then ran is read off the connection by a thread of its own.
+    fn jail(app: &str, instance: &str, stdin: OwnedFd) -> io::Result<Proc> {
+        use portcullis_ipc::{read_response, round_trip, send_fds, write_request, Request, Response};
+        let path = portcullis_ipc::resolve_socket_path()
+            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "portcullisd's socket is not there"))?;
+        let mut s = UnixStream::connect(path).map_err(|e| io::Error::new(e.kind(), format!("{path}: {e}")))?;
+        // A wedged portcullisd must not wedge the accept path for long.
+        s.set_read_timeout(Some(std::time::Duration::from_secs(10)))?;
+        match round_trip(&mut s, &Request::Hello { version: portcullis_ipc::PROTO_VERSION })? {
+            Response::Hello { .. } => {}
+            other => return Err(io::Error::other(format!("hello: {other:?}"))),
+        }
+        write_request(&mut s, &Request::ExecInstance {
+            app_id: app.to_string(),
+            instance: Some(instance.to_string()),
+            // The CLI's default scratch space.
+            tmpfs_mb: 64,
+            // The bundle's [resources] set the caps; requiring one means a
+            // machine without racct refuses rather than runs it uncapped.
+            memory_mb: None,
+            cpu_pct: None,
+            require_memory_limit: true,
+        })?;
+        match read_response(&mut s)? {
+            Response::ReadyForFds => {}
+            Response::LaunchFailed { stage, message } => return Err(io::Error::other(format!("{stage}: {message}"))),
+            Response::Error { message } => return Err(io::Error::other(message)),
+            other => return Err(io::Error::other(format!("unexpected reply: {other:?}"))),
+        }
+        // stdin is the channel; stdout goes nowhere (nothing a renderer
+        // prints may reach the channel); stderr is ours, so it is heard.
+        let null = std::fs::OpenOptions::new().write(true).open("/dev/null")?;
+        send_fds(&s, &[stdin.as_raw_fd(), null.as_raw_fd(), 2])?;
+        drop(stdin);
+        s.set_read_timeout(None)?;
+        let exited = Arc::new(AtomicBool::new(false));
+        let name = format!("{app}/{instance}");
+        {
+            let (mut r, exited, name) = (s.try_clone()?, exited.clone(), name.clone());
+            std::thread::Builder::new().name(format!("frescod-jail-{instance}")).spawn(move || {
+                match read_response(&mut r) {
+                    Ok(Response::LaunchExit { code }) => log::info!("frescod: renderer {name} exited ({code:?})"),
+                    Ok(Response::LaunchFailed { stage, message }) => log::error!("frescod: renderer {name} failed: {stage}: {message}"),
+                    Ok(other) => log::error!("frescod: renderer {name}: unexpected reply {other:?}"),
+                    Err(e) => log::info!("frescod: renderer {name}: portcullisd connection: {e}"),
+                }
+                exited.store(true, Ordering::Release);
+            })?;
+        }
+        Ok(Proc::Jail { name, sock: s, exited })
+    }
+
+    fn describe(&self) -> String {
+        match self {
+            Proc::Child(c) => format!("pid {}", c.id()),
+            Proc::Jail { name, .. } => format!("jail {name}"),
+        }
+    }
+
+    fn exited(&mut self) -> bool {
+        match self {
+            Proc::Child(c) => !matches!(c.try_wait(), Ok(None)),
+            Proc::Jail { exited, .. } => exited.load(Ordering::Acquire),
+        }
+    }
+
+    fn kill(&mut self) {
+        match self {
+            Proc::Child(c) => { let _ = c.kill(); }
+            Proc::Jail { sock, .. } => { let _ = sock.shutdown(std::net::Shutdown::Both); }
+        }
+    }
+
+    fn wait(&mut self) {
+        match self {
+            Proc::Child(c) => { let _ = c.wait(); }
+            Proc::Jail { name, exited, .. } => {
+                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+                while !exited.load(Ordering::Acquire) && std::time::Instant::now() < deadline {
+                    std::thread::sleep(std::time::Duration::from_millis(50));
+                }
+                if !exited.load(Ordering::Acquire) {
+                    log::error!("frescod: renderer {name}: portcullisd has not reported it gone");
+                }
+            }
+        }
     }
 }
 

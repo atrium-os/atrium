@@ -5232,8 +5232,9 @@ In the guest:
 | `FRESCOD_RENDERER=compute` | CPU (Tier-2) compute renderer (`fresco-compute` bin + raster kernels) |
 | `FRESCOD_RENDERER=gpu` | same kernels compiled by atrium-rdna4, run on the GPU (gpusim or silicon); set `FRESCOD_FLIP_TIMEOUT_MS=900000` on gpusim |
 | `FRESCOD_HEADLESS_PNG=/tmp/x` | headless, writes PNGs; test here first |
-| `FRESCOD_SPLIT=1` | F4b: one renderer process per client |
-| `FRESCOD_RENDERER_LAUNCHER="portcullis exec --user navtest --instance fresco{client} org.atrium.fresco.renderer"` | run each renderer in a Portcullis jail |
+| (default) | F4b split mode with `compute`/`gpu`: one jailed renderer per client, started by portcullisd (needs the bundle and worker rule from `scripts/fresco-renderer-bundle.sh`; refuses clients if portcullisd is down) |
+| `FRESCOD_SPLIT=0` / `=1` | force split mode off / on (on is the default unless the renderer is Vulkan) |
+| `FRESCOD_RENDERER_LAUNCHER=<cmd>` | start renderers with a command instead (`{client}` = client id); `unconfined` runs `FRESCOD_RENDERER_BIN` directly |
 | `FRESCOD_INPUT_SOCK` | input injection socket (F4c routing) |
 | `FRESCOD_CHROME_SOCK` | trusted chrome: `OPEN_CLIENT` then `SET_ORIGIN` (F4d strip) |
 | `FRESCOD_DAMAGE_THRESHOLD` | damage tracking tuning (gpu backend rasters only dirty tiles) |
