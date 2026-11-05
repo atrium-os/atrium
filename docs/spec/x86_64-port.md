@@ -65,7 +65,7 @@ Remaining:
 - `aqueduct-gpu-host` lib tests `include_bytes!` SPIR-V from `bundles/*/build.sh`, which
   needs `slangc`. Install the Slang release on the box. (The cloud container can't reach
   GitHub releases.)
-- Two vk-icd failures that predate this work and are not x86-specific:
+- **Fixed (affaa3e):** two vk-icd failures that predated this work and were not x86-specific:
   `enumerate_instance_extensions_lists_atrium_surface` expects 4 extensions and gets 5,
   and `loader_contract` can't find the cdylib. Cargo's new build-dir layout no longer
   copies it next to test binaries.
@@ -88,8 +88,9 @@ Remaining:
 
 ### 3.2 Kernel modules
 All of them build with the stock FreeBSD kmod framework, `TARGET=amd64`. Known items:
-- **Tessera**: BLAKE3 NEON is aarch64-only. amd64 falls back to the portable C path, which
-  works, just slower. Later, add the SSE4.1/AVX2 BLAKE3 kernels with `fpu_kern_enter`.
+- **Tessera**: BLAKE3 NEON is aarch64-only. **Done (e78c59d):** amd64 now has SSE4.1/AVX2
+  (upstream backends vendored, runtime CPUID/XSAVE dispatch, sliced `fpu_kern` regions):
+  2x/3.3x the portable path, with digests byte-identical (`test_b3_simd`).
   The `#ifdef __aarch64__` FPU bench is arm64-only. The Makefile's stack-overflow note is
   arm64-specific. amd64 has a guard page.
 - `atrium-kmod/atrium_virtio_gpu.c` uses `pmap_kextract`. It's legacy ('G' ABI), so it
