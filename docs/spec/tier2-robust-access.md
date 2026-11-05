@@ -126,6 +126,9 @@ App access: a manifest with `graphics = "vulkan"` gets the broker's socket dir m
 `/atrium/sockets/aqueduct-gpu/aqueduct-gpu.sock` when it exists (`ATRIUM_VK_ICD_SOCKET`
 still overrides).
 
-Not done yet: the old shared listener (`--transport socket`) still
-exists for development and the Mac host, and the arm64 bespoke backend still declines
-SSBO shaders (they use Cranelift).
+The shared listener (`--transport socket`, development and the Mac host) runs every
+client in one process, so it serves only its own uid: the socket is mode 0600 and a peer
+with another uid is refused (`aqueduct-gpu-host/tests/end_to_end.rs`,
+`shared_listener_refuses_other_uids`). Other users go through the broker.
+
+Not done yet: the arm64 bespoke backend still declines SSBO shaders (they use Cranelift).

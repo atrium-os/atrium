@@ -5,6 +5,12 @@
 //! per session — backends are designed to be `Send + Sync` so the
 //! shared MoltenVK device (or stub state) is safely accessible
 //! across sessions.
+//!
+//! All sessions share one executor (and, with Tier-2, run app shader
+//! code in this process), so this listener serves only its own user:
+//! the socket is mode 0600 and a peer with another uid is refused.
+//! Multi-app hosts use the broker (`--transport broker`, one jail per
+//! connection; docs/spec/tier2-robust-access.md §4) instead.
 
 use std::os::unix::net::UnixListener;
 use std::path::{Path, PathBuf};
@@ -51,7 +57,12 @@ impl Listener {
         let _ = std::fs::remove_file(&socket_path);
         let listener = UnixListener::bind(&socket_path)
             .with_context(|| format!("bind {}", socket_path.display()))?;
-        log::info!("listening on {}", socket_path.display());
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&socket_path, std::fs::Permissions::from_mode(0o600))
+                .with_context(|| format!("chmod {}", socket_path.display()))?;
+        }
+        log::info!("listening on {} (own uid only)", socket_path.display());
         Ok(Self {
             socket_path, listener, backend,
             shader_cache: None,
@@ -102,6 +113,16 @@ impl Listener {
         for incoming in self.listener.incoming() {
             match incoming {
                 Ok(stream) => {
+                    // SAFETY: geteuid has no failure mode.
+                    let me = unsafe { libc::geteuid() };
+                    match crate::broker::peer_uid(&stream) {
+                        Some(uid) if uid == me => {}
+                        other => {
+                            log::warn!("REFUSED client uid {other:?}: the shared \
+                                        listener serves only uid {me}; use the broker");
+                            continue;
+                        }
+                    }
                     let conn = Connection::wrap(stream)
                         .context("wrap accepted stream")?;
                     let backend = Arc::clone(&self.backend);

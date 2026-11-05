@@ -177,7 +177,7 @@ fn jail(app: &str, instance: &str, stdin: OwnedFd) -> io::Result<Proc> {
 }
 
 /// The connecting process's uid.
-fn peer_uid(s: &UnixStream) -> Option<u32> {
+pub(crate) fn peer_uid(s: &UnixStream) -> Option<u32> {
     #[cfg(target_os = "linux")]
     {
         let mut cred: libc::ucred = unsafe { std::mem::zeroed() };

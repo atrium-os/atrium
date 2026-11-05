@@ -918,3 +918,51 @@ fn software_backend_scissor_no_clear_partial_redraw() {
     let _ = server_thread;
     let _ = std::fs::remove_file(&sock);
 }
+
+/// Run by `shared_listener_refuses_other_uids` as another uid: try a
+/// handshake on `AQUEDUCT_UID_TEST_SOCK`. Does nothing otherwise.
+#[test]
+fn uid_probe_helper() {
+    let Some(sock) = std::env::var_os("AQUEDUCT_UID_TEST_SOCK") else { return };
+    let ok = Connection::connect(&sock).ok()
+        .map(GpuClient::new)
+        .is_some_and(|mut c| c.handshake(ClientKind::FrescodRenderer).is_ok());
+    assert!(!ok, "a peer with another uid got a session");
+}
+
+/// The shared listener serves only its own uid (other users go
+/// through the broker's per-connection jails). Needs root to run a
+/// peer as another uid; skips otherwise.
+#[cfg(unix)]
+#[test]
+fn shared_listener_refuses_other_uids() {
+    use std::os::unix::fs::PermissionsExt;
+    use std::os::unix::process::CommandExt;
+    if unsafe { libc::geteuid() } != 0 {
+        eprintln!("skipping: needs root");
+        return;
+    }
+    let dir = std::env::temp_dir().join(format!("aqueduct-uid-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o777)).unwrap();
+    let sock = dir.join("gpu.sock");
+    let listener = Listener::bind(&sock, Arc::new(StubBackend::new())).unwrap();
+    assert_eq!(std::fs::metadata(&sock).unwrap().permissions().mode() & 0o777, 0o600);
+    // Open the socket up so only the uid check stands in the way.
+    std::fs::set_permissions(&sock, std::fs::Permissions::from_mode(0o666)).unwrap();
+    thread::spawn(move || { let _ = listener.accept_loop(); });
+    thread::sleep(Duration::from_millis(50));
+
+    let st = std::process::Command::new(std::env::current_exe().unwrap())
+        .args(["--exact", "uid_probe_helper", "--test-threads=1"])
+        .env("AQUEDUCT_UID_TEST_SOCK", &sock)
+        .uid(65534).gid(65534)
+        .stdout(std::process::Stdio::null())
+        .status().unwrap();
+    assert!(st.success(), "other-uid peer was served (or the probe failed to run)");
+
+    // Our own uid still gets a session.
+    let mut c = GpuClient::new(Connection::connect(&sock).unwrap());
+    c.handshake(ClientKind::FrescodRenderer).unwrap();
+    let _ = std::fs::remove_dir_all(&dir);
+}
