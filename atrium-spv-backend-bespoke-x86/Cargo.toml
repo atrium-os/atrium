@@ -1,0 +1,23 @@
+[package]
+name        = "atrium-spv-backend-bespoke-x86"
+version     = "0.1.0"
+edition     = "2021"
+license     = "MIT OR Apache-2.0"
+publish     = false
+description = "Bespoke x86_64 backend for tier-2 software Vulkan: atrium-spv-ir straight to x86-64-v3 machine code via iced-x86's assembler, bypassing Cranelift. Same surface as atrium-spv-backend-bespoke (arm64); Unsupported means fall back to Cranelift. Plan: docs/spec/tier2-bespoke-x86.md."
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+atrium-spv-ir       = { path = "../atrium-spv-ir" }
+atrium-spv-pcmap    = { path = "../atrium-spv-pcmap" }
+atrium-spv-blob     = { path = "../atrium-spv-blob" }
+# Assembler only (code_asm + block_encoder); the decoder stays for the
+# round-trip check in tests and debug builds.
+iced-x86            = { version = "1.21", default-features = false, features = ["std", "code_asm", "decoder", "intel"] }
+object              = { version = "0.36", features = ["write"] }
+thiserror           = "1"
+
+[dev-dependencies]
+atrium-spv-frontend = { path = "../atrium-spv-frontend" }

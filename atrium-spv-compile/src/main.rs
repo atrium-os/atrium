@@ -60,6 +60,10 @@ use atrium_spv_backend_bespoke::{
     compile_blob as bespoke_compile_blob, BackendError as BespokeError,
     Target as BespokeTarget,
 };
+use atrium_spv_backend_bespoke_x86::{
+    compile_blob as bespoke_x86_compile_blob, BackendError as BespokeX86Error,
+    Target as BespokeX86Target,
+};
 use atrium_spv_backend_cranelift::{
     compile_blob as cranelift_compile_blob, Target,
 };
@@ -360,13 +364,24 @@ fn run(args: &Args) -> Result<CompileReport, CompileError> {
     // `Internal` error is a real bug, not a fallback
     // signal — it surfaces as a compile failure.
     //
-    // The bespoke backend is ARM64-only by charter; for an
-    // x86_64 target there is no bespoke target to map to,
-    // so we go straight to Cranelift.
-    let bespoke_target: Option<BespokeTarget> = match args.target {
-        Target::Aarch64FreeBSD => Some(BespokeTarget::Aarch64FreeBSD),
-        Target::Aarch64Darwin  => Some(BespokeTarget::Aarch64Darwin),
-        Target::X86_64FreeBSD | Target::X86_64Linux => None,
+    // Each target family has its own bespoke backend:
+    // pptk-codegen-arm64 on aarch64, iced-x86 on x86_64
+    // (docs/spec/tier2-bespoke-x86.md). Both return
+    // `Unsupported` for anything outside their landed op set.
+    let bespoke_probe = || -> Option<Result<(Vec<u8>, Vec<u8>), BespokeError>> {
+        let arm = |t| bespoke_compile_blob(&module, t).map(|o| (o.blob, o.pcmap));
+        let x86 = |t| bespoke_x86_compile_blob(&module, t)
+            .map(|o| (o.blob, o.pcmap))
+            .map_err(|e| match e {
+                BespokeX86Error::Unsupported(m) => BespokeError::Unsupported(m),
+                BespokeX86Error::Internal(m) => BespokeError::Internal(m),
+            });
+        Some(match args.target {
+            Target::Aarch64FreeBSD => arm(BespokeTarget::Aarch64FreeBSD),
+            Target::Aarch64Darwin  => arm(BespokeTarget::Aarch64Darwin),
+            Target::X86_64FreeBSD  => x86(BespokeX86Target::X86_64FreeBSD),
+            Target::X86_64Linux    => x86(BespokeX86Target::X86_64Linux),
+        })
     };
 
     // Both backends now emit a flat `atrium-spv-blob`
@@ -391,36 +406,30 @@ fn run(args: &Args) -> Result<CompileReport, CompileError> {
 
     let t_backend = Instant::now();
     let (blob, pcmap, backend_name): (Vec<u8>, Vec<u8>, &'static str) =
-        match (args.force_backend, bespoke_target) {
+        match args.force_backend {
             // --force-backend=cranelift: skip bespoke probe.
-            (Some(ForceBackend::Cranelift), _) => cranelift_path()?,
+            Some(ForceBackend::Cranelift) => cranelift_path()?,
             // --force-backend=bespoke: bespoke or bust (no
-            // Cranelift fallback).  Errors out if the target
-            // doesn't have a bespoke port or bespoke can't
-            // handle the shader.
-            (Some(ForceBackend::Bespoke), Some(bt)) =>
-                match bespoke_compile_blob(&module, bt) {
-                    Ok(o) => (o.blob, o.pcmap, "bespoke"),
-                    Err(BespokeError::Unsupported(m)) =>
-                        return Err(CompileError::Unsupported(
-                            format!("bespoke (forced): {m}"))),
-                    Err(BespokeError::Internal(m)) =>
-                        return Err(CompileError::Internal(
-                            format!("bespoke: {m}"))),
-                },
-            (Some(ForceBackend::Bespoke), None) =>
-                return Err(CompileError::Unsupported(
-                    "--force-backend=bespoke but target has no bespoke port".into())),
+            // Cranelift fallback).
+            Some(ForceBackend::Bespoke) => match bespoke_probe() {
+                Some(Ok((b, p))) => (b, p, "bespoke"),
+                Some(Err(BespokeError::Unsupported(m))) =>
+                    return Err(CompileError::Unsupported(
+                        format!("bespoke (forced): {m}"))),
+                Some(Err(BespokeError::Internal(m))) =>
+                    return Err(CompileError::Internal(format!("bespoke: {m}"))),
+                None =>
+                    return Err(CompileError::Unsupported(
+                        "--force-backend=bespoke but target has no bespoke port".into())),
+            },
             // Default selection: try bespoke, fall back to
             // Cranelift on Unsupported.
-            (None, Some(bt)) => match bespoke_compile_blob(&module, bt) {
-                Ok(o) => (o.blob, o.pcmap, "bespoke"),
-                Err(BespokeError::Unsupported(_)) => cranelift_path()?,
-                Err(BespokeError::Internal(m)) =>
-                    return Err(CompileError::Internal(
-                        format!("bespoke: {m}"))),
+            None => match bespoke_probe() {
+                Some(Ok((b, p))) => (b, p, "bespoke"),
+                Some(Err(BespokeError::Unsupported(_))) | None => cranelift_path()?,
+                Some(Err(BespokeError::Internal(m))) =>
+                    return Err(CompileError::Internal(format!("bespoke: {m}"))),
             },
-            (None, None) => cranelift_path()?,
         };
     // Includes the bespoke probe-then-fallback when it
     // happens — that's the real production cost, so time

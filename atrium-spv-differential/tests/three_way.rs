@@ -2,7 +2,7 @@
 //! bespoke must all agree on the pixel output for the same
 //! SPIR-V shader.
 
-use atrium_spv_differential::{BespokeRunner, CraneliftRunner};
+use atrium_spv_differential::{BespokeRunner, BespokeX86Runner, CraneliftRunner};
 use atrium_spv_tests::harness::{
     assert_shader_agrees_all, InterpreterRunner, ShaderRunner,
 };
@@ -1528,4 +1528,57 @@ fn three_way_if_else_else_branch() {
         ColorTolerance::Exact,
         &refs,
     );
+}
+
+/// Bespoke x86 coverage (docs/spec/tier2-bespoke-x86.md). Every
+/// shader here is run through bespoke-x86. The ones in
+/// `MUST_COMPILE` are inside the landed phases and must compile and
+/// agree with the interpreter and Cranelift. The rest may return
+/// `Unsupported` (Cranelift takes them in production), but if they
+/// compile they must agree too.
+#[test]
+fn bespoke_x86_coverage() {
+    if !cfg!(target_arch = "x86_64") {
+        return;
+    }
+    let cases: Vec<(&str, Vec<u8>, ShaderInputs)> = vec![
+        ("constant_color", build_constant_color_spirv([0.4, 0.5, 0.6, 1.0]), ShaderInputs::default()),
+        ("fp_arith", build_arith_shader(3.0, 1.5), ShaderInputs::default()),
+        ("vec_arith", build_vec_arith_shader([1.0, 2.0, 3.0, 4.0], [0.5, -1.0, 2.5, 8.0]), ShaderInputs::default()),
+        ("swizzle_bgra", build_swizzle_shader([2, 1, 0, 3]), ShaderInputs::default()),
+        ("swizzle_cross", build_swizzle_shader([0, 5, 2, 7]), ShaderInputs::default()),
+        ("composite_extract", build_composite_extract_shader(), ShaderInputs::default()),
+        ("dot_vts", build_dot_vts_shader(), ShaderInputs::default()),
+        ("heavy", build_heavy_shader(), ShaderInputs::default()),
+        ("heavy4", build_heavy4_shader(), ShaderInputs::default()),
+        ("heavyvec", build_heavyvec_shader(), ShaderInputs::default()),
+        ("int_arith", build_int_arith_shader(), ShaderInputs::default()),
+        ("select", build_select_shader(), ShaderInputs::default()),
+        ("loop_sum", build_loop_sum_shader(), ShaderInputs::default()),
+    ];
+    const MUST_COMPILE: &[&str] = &[
+        "constant_color", "fp_arith", "vec_arith", "swizzle_bgra",
+        "swizzle_cross", "composite_extract", "dot_vts",
+    ];
+    let x86 = BespokeX86Runner;
+    let interp = InterpreterRunner::default();
+    let cl = CraneliftRunner;
+    let mut report = Vec::new();
+    for (name, spirv, inputs) in &cases {
+        match x86.run(spirv, inputs) {
+            Ok(_) => {
+                assert_shader_agrees_all(spirv, inputs, ColorTolerance::Exact,
+                                         &[&interp, &cl, &x86]);
+                report.push(format!("{name}: compiled, agrees"));
+            }
+            Err(e) => {
+                let s = format!("{e}");
+                assert!(!MUST_COMPILE.contains(name),
+                        "{name} must compile on bespoke-x86, got {s}");
+                assert!(s.contains("nsupported"), "{name}: hard error {s}");
+                report.push(format!("{name}: unsupported ({s})"));
+            }
+        }
+    }
+    eprintln!("bespoke-x86 coverage:\n  {}", report.join("\n  "));
 }

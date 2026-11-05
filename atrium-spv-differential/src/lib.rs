@@ -59,9 +59,12 @@ impl ShaderRunner for BespokeRunner {
         inputs: &ShaderInputs,
     ) -> Result<ShaderOutputs, BackendError> {
         use atrium_spv_backend_bespoke::{compile, Target};
-        // The bespoke backend emits AArch64 only; on any other
-        // host its code can't run here, so it sits the
-        // comparison out (interpreter ↔ Cranelift remains).
+        // On x86_64 hosts "bespoke" means the x86 bespoke
+        // backend; anything else sits the comparison out
+        // (interpreter ↔ Cranelift remains).
+        if cfg!(target_arch = "x86_64") {
+            return BespokeX86Runner.run(spirv, inputs);
+        }
         if !cfg!(target_arch = "aarch64") {
             return Err(BackendError::Unsupported(
                 "bespoke backend is aarch64-only".into()));
@@ -73,6 +76,38 @@ impl ShaderRunner for BespokeRunner {
                 atrium_spv_backend_bespoke::BackendError::Unsupported(s) =>
                     BackendError::Unsupported(s),
                 atrium_spv_backend_bespoke::BackendError::Internal(s) =>
+                    BackendError::CompileFailed(s),
+            })?;
+        run_via_dlopen(&out.object, inputs)
+    }
+}
+
+/// Bespoke x86_64 backend runner (docs/spec/tier2-bespoke-x86.md).
+/// Returns `Unsupported` for anything outside the phases landed
+/// so far, so in tolerant comparisons it simply sits out.
+#[derive(Debug, Default)]
+pub struct BespokeX86Runner;
+
+impl ShaderRunner for BespokeX86Runner {
+    fn name(&self) -> &'static str { "bespoke-x86" }
+
+    fn run(
+        &self,
+        spirv: &[u8],
+        inputs: &ShaderInputs,
+    ) -> Result<ShaderOutputs, BackendError> {
+        use atrium_spv_backend_bespoke_x86::{compile, Target};
+        if !cfg!(target_arch = "x86_64") {
+            return Err(BackendError::Unsupported(
+                "bespoke-x86 backend is x86_64-only".into()));
+        }
+        let module = atrium_spv_frontend::translate(spirv)
+            .map_err(|e| map_unsupported_or_compile(format!("{e:?}")))?;
+        let out = compile(&module, Target::host())
+            .map_err(|e| match e {
+                atrium_spv_backend_bespoke_x86::BackendError::Unsupported(s) =>
+                    BackendError::Unsupported(s),
+                atrium_spv_backend_bespoke_x86::BackendError::Internal(s) =>
                     BackendError::CompileFailed(s),
             })?;
         run_via_dlopen(&out.object, inputs)

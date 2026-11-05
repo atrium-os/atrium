@@ -272,13 +272,16 @@ fn binary_emits_metrics_json_on_stderr() {
 
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(stderr.contains("\"shader_hash\":"));
-    // A constant-colour store is fully within the bespoke
-    // ARM64 backend's opcode surface, and atrium-spv-compile
-    // tries bespoke first (spec §2 production order), so the
-    // metrics line must report the bespoke backend — not the
-    // Cranelift fallback. On x86_64 hosts there is no
-    // bespoke port, so Cranelift is the only backend.
-    let want = if cfg!(target_arch = "aarch64") { "bespoke" } else { "cranelift" };
+    // A constant-colour store is within both bespoke
+    // backends' opcode surface (ARM64, and x86_64 phase 1),
+    // and atrium-spv-compile tries bespoke first (spec §2
+    // production order), so the metrics line must report the
+    // bespoke backend, not the Cranelift fallback.
+    let want = if cfg!(any(target_arch = "aarch64", target_arch = "x86_64")) {
+        "bespoke"
+    } else {
+        "cranelift"
+    };
     assert!(stderr.contains(&format!("\"backend\":\"{want}\"")),
             "expected {want} backend, got: {stderr}");
     // Microsecond resolution: with `cc` gone the whole

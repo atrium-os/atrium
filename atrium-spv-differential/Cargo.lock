@@ -40,6 +40,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "atrium-spv-backend-bespoke-x86"
+version = "0.1.0"
+dependencies = [
+ "atrium-spv-blob",
+ "atrium-spv-ir",
+ "atrium-spv-pcmap",
+ "iced-x86",
+ "object 0.36.7",
+ "thiserror 1.0.69",
+]
+
+[[package]]
 name = "atrium-spv-backend-cranelift"
 version = "0.1.0"
 dependencies = [
@@ -64,6 +76,7 @@ name = "atrium-spv-differential"
 version = "0.1.0"
 dependencies = [
  "atrium-spv-backend-bespoke",
+ "atrium-spv-backend-bespoke-x86",
  "atrium-spv-backend-cranelift",
  "atrium-spv-frontend",
  "atrium-spv-runtime",

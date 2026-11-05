@@ -14,6 +14,7 @@ atrium-spv-tests             = { path = "../atrium-spv-tests" }
 atrium-spv-frontend          = { path = "../atrium-spv-frontend" }
 atrium-spv-backend-cranelift = { path = "../atrium-spv-backend-cranelift" }
 atrium-spv-backend-bespoke   = { path = "../atrium-spv-backend-bespoke" }
+atrium-spv-backend-bespoke-x86 = { path = "../atrium-spv-backend-bespoke-x86" }
 libloading                   = "0.8"
 tempfile                     = "3"
 
