@@ -105,3 +105,125 @@ fn raster_size(b: &[u8]) -> Option<(u32, u32)> {
     }
     None
 }
+
+/// The most leading bytes of an image `header_size` will ask for. An image
+/// whose size is not known within them stays unsized until it arrives.
+/// (Both corpora, 2,737 images: 16 KiB answers 2,720 of them, 64 KiB all
+/// but one — a JPEG whose EXIF puts its frame header at 84 KiB.)
+pub const MAX_HEADER_BYTES: usize = 64 * 1024;
+
+/// What an image's LEADING bytes say about its natural size
+/// (legacy-web §5.4.5.7, cut A: sizing a pending image from its header).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum Header {
+    /// ★ Exactly what `natural_size` will say of the whole image, however
+    /// it continues: every byte that answer depends on is in hand.
+    Sized(Natural),
+    /// Not known yet: the first `n` bytes would say more (`n` is more than
+    /// was given, and at most `MAX_HEADER_BYTES`).
+    More(usize),
+    /// Not from this header: not a format read here, malformed, over the
+    /// dimension cap, or the answer lies past `MAX_HEADER_BYTES`. The image
+    /// stays unsized until its bytes arrive.
+    Unreadable(&'static str),
+}
+
+/// ★★ AN IMAGE'S SIZE FROM ITS FIRST BYTES, ON HOSTILE INPUT. `prefix` is
+/// the start of the image; `complete` says it is the whole image.
+///
+/// The contract, which the tests check differentially against
+/// `natural_size` on every prefix of real and mutated images: `Sized(n)`
+/// only when `natural_size` of ANY image that starts with `prefix` (of
+/// `prefix` itself, when `complete`) is `Some(n)`. So a box sized from the
+/// header is the box the whole image will be given, and its arrival moves
+/// nothing. Anything this cannot promise is `More` or `Unreadable`, never
+/// a guess.
+///
+/// Strict where `natural_size` is lenient: zero dimensions, either side over
+/// `profile::MAX_IMAGE_DIMENSION`, or a decoded frame over
+/// `profile::MAX_DECODED_IMAGE_BYTES` are `Unreadable` — the decoder would
+/// refuse that image, so its box is not sized from a claim it will not honour.
+/// Reads nothing past `prefix`, allocates nothing but `natural_size`'s
+/// bounded text view of an SVG's first 4 KiB, and walks a JPEG in at most
+/// one step per byte.
+pub fn header_size(prefix: &[u8], complete: bool) -> Header {
+    use crate::profile::{MAX_DECODED_IMAGE_BYTES, MAX_IMAGE_DIMENSION};
+    let b = &prefix[..prefix.len().min(MAX_HEADER_BYTES)];
+    // Bytes past the cap are never read, so a prefix cut at the cap is not
+    // the whole image.
+    let complete = complete && b.len() == prefix.len();
+    let more = |n: usize| -> Header {
+        if complete { Header::Unreadable("the image ends inside its header") }
+        else if n > MAX_HEADER_BYTES { Header::Unreadable("the header runs past 64 KiB") }
+        else { Header::More(n) }
+    };
+    // Every magic below is in the first 16 bytes and every fixed-position
+    // header in the first 30; under 32, ask for 32.
+    if b.len() < 32 && !complete { return Header::More(32) }
+    let sized = |n: Option<Natural>| -> Header {
+        let Some(n) = n else { return Header::Unreadable("no size in the header") };
+        let dims = [n.width, n.height];
+        if dims.contains(&Some(0)) { return Header::Unreadable("a zero dimension") }
+        if dims.iter().flatten().any(|d| *d > MAX_IMAGE_DIMENSION) { return Header::Unreadable("over the dimension cap") }
+        if let (Some(w), Some(h)) = (n.width, n.height) {
+            if w as usize * h as usize * 4 > MAX_DECODED_IMAGE_BYTES { return Header::Unreadable("over the decode budget") }
+        }
+        Header::Sized(n)
+    };
+    let png = b.starts_with(b"\x89PNG\r\n\x1a\n");
+    let jpeg = b.starts_with(&[0xFF, 0xD8]);
+    let gif = b.starts_with(b"GIF87a") || b.starts_with(b"GIF89a");
+    let riff = b.starts_with(b"RIFF");
+    // `natural_size` reads each format's fields at fixed offsets, except
+    // JPEG's; when they are in hand it reads nothing else, so its answer on
+    // the prefix is its answer on the whole.
+    if png {
+        if b.len() < 24 { return more(24) }
+        if b.get(12..16) != Some(b"IHDR") { return Header::Unreadable("a PNG without IHDR first") }
+        return sized(natural_size(&b[..24]));
+    }
+    if gif {
+        return if b.len() < 10 { more(10) } else { sized(natural_size(&b[..10])) };
+    }
+    if riff {
+        if b.len() < 16 { return more(16) }
+        if b.get(8..12) != Some(b"WEBP") { return Header::Unreadable("RIFF, not WebP") }
+        let need = match b.get(12..16) { Some(b"VP8X") | Some(b"VP8 ") => 30, Some(b"VP8L") => 25,
+                                         _ => return Header::Unreadable("a WebP chunk not read here") };
+        return if b.len() < need { more(need) } else { sized(natural_size(&b[..need])) };
+    }
+    if jpeg {
+        // `raster_size`'s own walk, stopping where it would read past the
+        // prefix. Each step advances `i` by at least one.
+        let mut i = 2usize;
+        loop {
+            if i + 9 > b.len() { return more(i + 9) }
+            if b[i] != 0xFF { i += 1; continue }
+            let marker = b[i + 1];
+            if (0xC0..=0xCF).contains(&marker) && ![0xC4, 0xC8, 0xCC].contains(&marker) {
+                return sized(natural_size(&b[..i + 9]));
+            }
+            let seg = u16::from_be_bytes([b[i + 2], b[i + 3]]) as usize;
+            if seg < 2 { return Header::Unreadable("a JPEG segment shorter than its length field") }
+            i += 2 + seg;
+        }
+    }
+    // An SVG is read from its first 4 KiB alone (`natural_size`), once no
+    // raster reading can apply: none of the magics above starts it.
+    if b.len() < 4096 && !complete { return more(4096) }
+    let head = &b[..b.len().min(4096)];
+    if !String::from_utf8_lossy(head).contains("<svg") { return Header::Unreadable("not an image read here") }
+    sized(natural_size(head))
+}
+
+/// The first read of an image's header: 16 KiB answers 99.4% of the
+/// corpus's images in one request.
+pub const FIRST_HEADER_READ: usize = 16 * 1024;
+
+/// How many leading bytes to have after `have`, when `header_size` said
+/// `More(want)`: at least `want`, at least double, never past the cap. So
+/// an image is asked for at most four times (16, 32, 64 KiB, or fewer when
+/// it ends), however many small segments a hostile JPEG strings together.
+pub fn next_header_read(have: usize, want: usize) -> usize {
+    want.max(have.saturating_mul(2)).max(FIRST_HEADER_READ).min(MAX_HEADER_BYTES)
+}

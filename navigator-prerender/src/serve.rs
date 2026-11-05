@@ -10,6 +10,8 @@
 //! parent → child   atrium-prerender/1 \t key=value … \t len=<n> \n  <n document bytes>
 //!                  then one fetchd reply frame per `F` request
 //! child → parent   F <url> \n                      a fetch, relayed by the parent
+//!                  H <url> \n / HH <url> \n         a hint / a header hint, passed on, never answered
+//!                  P <start> <len> <url> \n        a peek: bytes of a body (an image's header), relayed
 //!                  <TAG> \t …  \n                  the report (R, L, O, … as `--one` prints)
 //!                  BLOB <blake3:hex> <n> \n <n>    an image, by content address
 //!                  FIRST <n> \n <n>                progressive: the first display
@@ -195,6 +197,39 @@ fn len_of(s: &str, max: usize, what: &str) -> Result<usize, String> {
     Ok(n)
 }
 
+/// What the child asked the relay for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Ask<'a> {
+    /// `F <url>`: the whole body.
+    Fetch(&'a str),
+    /// `P <start> <len> <url>`: bytes `start .. start + len` of the body
+    /// (legacy-web §5.4.5.7, cut A), `start + len` at most `MAX_PEEK`.
+    Peek { url: &'a str, start: usize, len: usize },
+}
+
+impl Ask<'_> {
+    pub fn url(&self) -> &str { match self { Ask::Fetch(u) | Ask::Peek { url: u, .. } => u } }
+}
+
+impl std::fmt::Display for Ask<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self { Ask::Fetch(u) => write!(f, "{u}"), Ask::Peek { url, start, len } => write!(f, "P {start} {len} {url}") }
+    }
+}
+
+/// A hint the child gave: a body (`H`) or a header (`HH`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Hint<'a> { Body(&'a str), Header(&'a str) }
+
+impl std::fmt::Display for Hint<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self { Hint::Body(u) => write!(f, "{u}"), Hint::Header(u) => write!(f, "HH {u}") }
+    }
+}
+
+/// The most bytes from a body's start a peek may ask for: the header cap.
+pub const MAX_PEEK: usize = navigator_dom::natural::MAX_HEADER_BYTES;
+
 /// The parent's side: read everything the child says until `END`, relaying
 /// each fetch through `fetch` (which returns a fetchd reply frame) and
 /// handing each verified blob to `blob`.
@@ -205,7 +240,7 @@ fn len_of(s: &str, max: usize, what: &str) -> Result<usize, String> {
 pub fn drive(
     out: &mut impl BufRead,
     stdin: &Mutex<Option<Box<dyn Write + Send>>>,
-    fetch: &mut dyn FnMut(&str) -> Vec<u8>,
+    fetch: &mut dyn FnMut(Ask) -> Vec<u8>,
     blob: &mut dyn FnMut(&str, &[u8]),
 ) -> Result<Outcome, String> {
     drive_streaming(out, stdin, fetch, &mut |_| {}, blob, &mut |_, _| {})
@@ -221,8 +256,8 @@ pub enum Artifact { First, Images, Recording, Transitions }
 pub fn drive_streaming(
     out: &mut impl BufRead,
     stdin: &Mutex<Option<Box<dyn Write + Send>>>,
-    fetch: &mut dyn FnMut(&str) -> Vec<u8>,
-    hint: &mut dyn FnMut(&str),
+    fetch: &mut dyn FnMut(Ask) -> Vec<u8>,
+    hint: &mut dyn FnMut(Hint),
     blob: &mut dyn FnMut(&str, &[u8]),
     artifact: &mut dyn FnMut(Artifact, &[u8]),
 ) -> Result<Outcome, String> {
@@ -238,7 +273,28 @@ pub fn drive_streaming(
             // A hint (§5.4.5.7, step 4): passed on, never answered. An
             // over-long one is dropped; its request, if it comes, fails then.
             o.hints += 1;
-            if url.len() <= MAX_URL && !child_gone { hint(url) }
+            if url.len() <= MAX_URL && !child_gone { hint(Hint::Body(url)) }
+        } else if let Some(url) = line.strip_prefix("HH ") {
+            o.hints += 1;
+            if url.len() <= MAX_URL && !child_gone { hint(Hint::Header(url)) }
+        } else if let Some(p) = line.strip_prefix("P ") {
+            // A peek (cut A): answered with one frame, as a fetch is. ★ Its
+            // numbers are bounded here, before anything is asked upstream:
+            // past the header cap it is refused, not truncated.
+            o.fetches += 1;
+            if child_gone { continue }
+            let f: Vec<&str> = p.splitn(3, ' ').collect();
+            let num = |i: usize| f.get(i).and_then(|v| v.parse::<usize>().ok());
+            let frame = match (num(0), num(1), f.get(2)) {
+                (Some(start), Some(len), Some(url)) if url.len() <= MAX_URL && len > 0 && start.checked_add(len).is_some_and(|e| e <= MAX_PEEK) =>
+                    fetch(Ask::Peek { url, start, len }),
+                (Some(_), Some(_), Some(url)) if url.len() > MAX_URL =>
+                    crate::fetch::Reply::Err(format!("refused: a {}-byte URL, over the {MAX_URL}-byte limit", url.len())).to_frame(),
+                _ => crate::fetch::Reply::Err(format!("refused: a peek past {MAX_PEEK} bytes, or malformed")).to_frame(),
+            };
+            let mut g = stdin.lock().map_err(|_| "stdin lock poisoned")?;
+            let Some(w) = g.as_mut() else { return Err("fetch after the child's input was closed".into()) };
+            if w.write_all(&frame).and_then(|_| w.flush()).is_err() { child_gone = true }
         } else if let Some(url) = line.strip_prefix("F ") {
             o.fetches += 1;
             if child_gone { continue }
@@ -249,7 +305,7 @@ pub fn drive_streaming(
             let frame = if url.len() > MAX_URL {
                 crate::fetch::Reply::Err(format!("refused: a {}-byte URL, over the {MAX_URL}-byte limit", url.len())).to_frame()
             } else {
-                fetch(url)
+                fetch(Ask::Fetch(url))
             };
             let mut g = stdin.lock().map_err(|_| "stdin lock poisoned")?;
             let Some(w) = g.as_mut() else { return Err("fetch after the child's input was closed".into()) };
@@ -456,6 +512,23 @@ mod tests {
         assert_eq!((o.hints, o.fetches), (2, 1));
         // One answer, for the request; nothing for either hint.
         assert_eq!(buf.lock().unwrap().as_slice(), b"ok 200 0 2 https://a.example/\nhi");
+    }
+
+    #[test]
+    fn peeks_and_header_hints_are_relayed_and_bounded() {
+        let (buf, stdin) = stdin_sink();
+        let (mut asked, mut hinted) = (vec![], vec![]);
+        let child = format!("HH https://a.example/i.png\nP 0 16384 https://a.example/i.png\nP 16384 49152 https://a.example/i.png\n\
+                             P 0 {} https://a.example/i.png\nP 0 0 https://a.example/i.png\nP x 1 https://a.example/\nEND\n", MAX_PEEK + 1);
+        let o = drive_streaming(&mut child.as_bytes(), &stdin, &mut |a| { asked.push(a.to_string()); b"ok 206 0 2 https://a.example/i.png\nhi".to_vec() },
+            &mut |h| hinted.push(h.to_string()), &mut |_, _| {}, &mut |_, _| {}).unwrap();
+        assert_eq!(hinted, vec!["HH https://a.example/i.png".to_string()]);
+        assert_eq!(asked, vec!["P 0 16384 https://a.example/i.png".to_string(), "P 16384 49152 https://a.example/i.png".to_string()]);
+        assert_eq!(o.fetches, 5);
+        // Every peek is answered: two relayed, three refused here.
+        let sent = String::from_utf8_lossy(&buf.lock().unwrap()).to_string();
+        assert_eq!(sent.matches("ok 206").count(), 2);
+        assert_eq!(sent.matches("err refused: a peek past").count(), 3);
     }
 
     #[test]

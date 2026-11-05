@@ -47,6 +47,9 @@ struct State {
     totals: BTreeMap<String, Totals>,
     fetches: Vec<FetchRec>,
     marks: Vec<(String, Duration)>,
+    counts: BTreeMap<String, u32>,
+    /// `checkpoint`s: the exclusive totals and fetch kinds at that moment.
+    checkpoints: Vec<(String, BTreeMap<String, Duration>, BTreeMap<String, (u32, u64, Duration, u32)>)>,
 }
 
 thread_local! {
@@ -146,6 +149,32 @@ pub fn mark(name: &str) {
     });
 }
 
+/// `mark(name)`, and keep the phase totals as they stand (cut B): the report
+/// gives `<name>.x.<phase>` and `<name>.f.<kind>` — e.g. where the time to
+/// the FIRST artifact went, apart from what came after it. Open spans are
+/// charged up to now.
+pub fn checkpoint(name: &str) {
+    mark(name);
+    let now = Instant::now();
+    T.with(|t| {
+        let mut t = t.borrow_mut();
+        let mut x: BTreeMap<String, Duration> = t.totals.iter().map(|(k, v)| (k.clone(), v.exclusive)).collect();
+        if let Some((n, _, resumed)) = t.stack.last() { *x.entry(n.clone()).or_default() += now - *resumed }
+        let mut f: BTreeMap<String, (u32, u64, Duration, u32)> = BTreeMap::new();
+        for r in &t.fetches {
+            let e = f.entry(r.kind.clone()).or_default();
+            e.0 += 1; e.1 += r.bytes; e.2 += r.dur; if !r.ok { e.3 += 1 }
+        }
+        t.checkpoints.push((name.to_string(), x, f));
+    });
+}
+
+/// Count one `name` (`c.<name>` in the report): what happened, where a
+/// time does not say it — e.g. how a pending image's header turned out.
+pub fn count(name: &str) {
+    T.with(|t| *t.borrow_mut().counts.entry(name.to_string()).or_default() += 1);
+}
+
 /// The innermost open span's name, or "".
 pub fn current() -> String {
     T.with(|t| t.borrow().stack.last().map(|s| s.0.clone()).unwrap_or_default())
@@ -208,6 +237,11 @@ pub fn report_line() -> String {
     let ms = |d: Duration| format!("{:.1}", d.as_secs_f64() * 1000.0);
     let mut o = format!("TM\twall={}", ms(wall));
     for (k, at) in T.with(|t| t.borrow().marks.clone()) { o.push_str(&format!("\tat.{k}={}", ms(at))) }
+    for (k, n) in T.with(|t| t.borrow().counts.clone()) { o.push_str(&format!("\tc.{k}={n}")) }
+    for (name, x, f) in T.with(|t| t.borrow().checkpoints.clone()) {
+        for (k, v) in x { o.push_str(&format!("\t{name}.x.{k}={}", ms(v))) }
+        for (k, (n, b, d, failed)) in f { o.push_str(&format!("\t{name}.f.{k}={n}/{b}/{}/{failed}", ms(d))) }
+    }
     let mut covered = Duration::ZERO;
     for (k, v) in &totals {
         covered += v.exclusive;

@@ -45,11 +45,77 @@ pub enum Pending {
     /// size (300 × 150, CSS Images 3 §5.3). Its arrival may move the layout,
     /// and that is measured, not assumed away.
     Placeholder,
+    /// ★ It does not, and its natural size was read from the image's own
+    /// leading bytes (cut A, `navigator_dom::natural::header_size`): exactly
+    /// the size the whole image will be given, so its box is laid out as it
+    /// will be and the image's arrival moves nothing.
+    Header,
 }
 
 impl Pending {
     pub fn as_str(self) -> &'static str {
-        match self { Pending::Declared => "declared", Pending::Placeholder => "placeholder" }
+        match self { Pending::Declared => "declared", Pending::Placeholder => "placeholder", Pending::Header => "header" }
+    }
+}
+
+/// Whether the first display would size `<img>` `h` with no fetch at all
+/// (both `width` and `height` given): the rule `collect_first` applies, and
+/// the one the converter's header hints follow.
+pub fn declares_size(dom: &Dom, h: navigator_dom::Handle) -> bool {
+    let declared = |n: &str| dom.attr(h, n).and_then(|v| v.trim().parse::<u32>().ok());
+    declared("width").is_some() && declared("height").is_some()
+}
+
+/// A header miss, for the report: `late` (not in hand when the header
+/// window closed), `fetch` (the request failed), or what the parser said.
+fn miss_kind(why: &str) -> String {
+    if why.contains("not in time") { return "late".into() }
+    if why.starts_with("fetch ") || why.starts_with("peek ") || why.contains("HTTP ") || why.contains("refused") || why.contains("offline") { return "fetch".into() }
+    why.split_whitespace().take(4).collect::<Vec<_>>().join("_").replace(|c: char| !c.is_ascii_alphanumeric() && c != '_', "")
+}
+
+/// ★ Whether a header miss PROVES the image will fail when its body is
+/// fetched — so the first display leaves it out, as the final recording
+/// will, instead of giving it a box that will collapse:
+/// - the parser saw enough to know `natural_size` will say nothing (no
+///   raster magic, no `<svg` in the first 4 KiB: `header_size`'s "not an
+///   image read here" is decided on exactly what `natural_size` reads);
+/// - the server answered an error status, the address rule or the budget
+///   refused it, or (the measurement instrument) it is not in the offline
+///   cache: the body's request is the same request and is answered the same.
+/// A late header, a timeout, or a connection that failed is not proof.
+fn miss_proves_failure(why: &str) -> bool {
+    let lower = why.to_ascii_lowercase();
+    why == "not an image read here"
+        || why.contains(": HTTP 4") || why.contains(": HTTP 5")
+        || lower.contains("refused") || why.contains("offline, not cached")
+}
+
+/// ★ An image's natural size from its leading bytes, asked for as
+/// `header_size` asks (at most `MAX_HEADER_BYTES`, at most four reads), or
+/// `None` with the reason. The bytes are hostile and are read by the strict
+/// parser only; they are never stored, hashed or kept.
+pub fn size_from_header(url: &str, fetcher: &mut dyn Fetcher) -> Result<Natural, String> {
+    use navigator_dom::natural::{header_size, next_header_read, Header};
+    let mut have: Vec<u8> = Vec::new();
+    let mut ended = false;
+    let mut want = next_header_read(0, 0);
+    loop {
+        let ask = want - have.len();
+        let got = fetcher.peek(url, have.len(), ask)?;
+        if got.len() > ask { return Err("a peek answered more than was asked".into()) }
+        ended = ended || got.len() < ask;
+        have.extend_from_slice(&got);
+        match header_size(&have, ended) {
+            Header::Sized(n) => return Ok(n),
+            Header::Unreadable(why) => return Err(why.to_string()),
+            Header::More(n) => {
+                if ended { return Err("the image ends inside its header".into()) }
+                let next = next_header_read(have.len(), n);
+                if next <= have.len() { return Err("the header runs past 64 KiB".into()) }
+                want = next;
+            }
+        }
     }
 }
 
@@ -192,6 +258,16 @@ impl Fetcher for Remembering<'_> {
         FETCHED.with(|f| f.borrow_mut().1.insert(url.to_string(), r.clone()));
         r.map(|b| (*b).clone())
     }
+    /// From the whole body when this conversion has it; otherwise asked of
+    /// the fetcher, and NOT remembered: a header is not the body, and the
+    /// request for the body, when it comes, is the same request as before.
+    fn peek(&mut self, url: &str, start: usize, len: usize) -> Result<Vec<u8>, String> {
+        if let Some(Ok(b)) = FETCHED.with(|f| f.borrow().1.get(url).cloned()) {
+            let a = start.min(b.len());
+            return Ok(b[a..(a + len).min(b.len())].to_vec());
+        }
+        self.inner.peek(url, start, len)
+    }
 }
 
 type Progress<'a> = &'a mut dyn FnMut(&Subresources, &std::collections::HashSet<String>);
@@ -244,9 +320,29 @@ fn collect_inner(dom: &Dom, base: Option<&str>, fetcher: &mut dyn Fetcher, mode:
         let declared = |n: &str| dom.attr(h, n).and_then(|v| v.trim().parse::<u32>().ok());
         let Some(abs) = resolve(&src) else { out.failed.push((src, "cannot resolve".into())); continue };
         if mode == Mode::First {
+            // ★ Cut A: an image the page does not size is sized from its
+            // own header, when its leading bytes are in hand in time (the
+            // fetcher hinted them with the stylesheets). Otherwise it stays
+            // a placeholder, and the reason is reported.
             let (natural, pending) = match declared("width").zip(declared("height")) {
                 Some((w, ht)) => (Natural::sized(w, ht), Pending::Declared),
-                None => (Natural { width: None, height: None, ratio: None }, Pending::Placeholder),
+                None => {
+                    let _s = crate::timing::span("header");
+                    match size_from_header(&abs, fetcher) {
+                        Ok(n) => { crate::timing::count("header.sized"); (n, Pending::Header) }
+                        Err(why) if miss_proves_failure(&why) => {
+                            // Left out, as the final recording will leave it.
+                            crate::timing::count(&format!("header.fails.{}", miss_kind(&why)));
+                            out.failed.push((src, format!("header: {why}")));
+                            continue;
+                        }
+                        Err(why) => {
+                            crate::timing::count(&format!("header.{}", miss_kind(&why)));
+                            out.failed.push((src.clone(), format!("header: {why}")));
+                            (Natural { width: None, height: None, ratio: None }, Pending::Placeholder)
+                        }
+                    }
+                }
             };
             out.images.push(Image { src, natural, address: String::new(), pending: Some(pending) });
             continue;

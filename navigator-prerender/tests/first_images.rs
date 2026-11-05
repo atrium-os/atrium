@@ -36,7 +36,7 @@ const PAGE: &str = r#"<!doctype html><html><head><link rel=stylesheet href="/s.c
 /// `Stage` the conversion reaches, in the same log, so the order of the two
 /// can be checked. `delay` slows every image.
 #[derive(Clone, Default)]
-struct Site { log: Rc<RefCell<Vec<String>>>, delay: std::time::Duration }
+struct Site { log: Rc<RefCell<Vec<String>>>, delay: std::time::Duration, no_headers: bool, http_errors: bool }
 impl Fetcher for Site {
     fn get(&mut self, url: &str) -> Result<String, String> {
         self.log.borrow_mut().push(url.to_string());
@@ -46,6 +46,20 @@ impl Fetcher for Site {
         if !url.ends_with(".png") { return self.get(url).map(String::into_bytes) }
         self.log.borrow_mut().push(url.to_string());
         std::thread::sleep(self.delay);
+        Site::image(url)
+    }
+    /// A header (cut A): logged apart from the bodies, never slowed.
+    fn peek(&mut self, url: &str, start: usize, len: usize) -> Result<Vec<u8>, String> {
+        self.log.borrow_mut().push(format!("peek {url} {start} {len}"));
+        if self.no_headers { return Err("not in time".into()) }
+        if self.http_errors && url.ends_with("/missing.png") { return Err(format!("fetch {url}: HTTP 404")) }
+        let b = Site::image(url)?;
+        Ok(b[start.min(b.len())..(start + len).min(b.len())].to_vec())
+    }
+}
+
+impl Site {
+    fn image(url: &str) -> Result<Vec<u8>, String> {
         if url.ends_with("/declared.png") { Ok(png(400, 300)) }
         else if url.ends_with("/bare.png") { Ok(png(64, 32)) }
         else { Err(format!("404 {url}")) }
@@ -85,6 +99,11 @@ fn the_first_artifact_fetches_its_sheets_and_no_image() {
     let at = p.log.iter().position(|l| l == "First").unwrap();
     assert!(p.log[..at].iter().any(|u| u.ends_with("/s.css")), "{:?}", p.log);
     assert!(!p.log[..at].iter().any(|u| u.ends_with(".png")), "an image was fetched before the first display: {:?}", p.log);
+    // Only the undeclared images' headers were asked for, each once, from
+    // their first byte, 16 KiB at a time.
+    let peeks: Vec<&String> = p.log[..at].iter().filter(|u| u.starts_with("peek ")).collect();
+    assert_eq!(peeks, vec!["peek https://a.example/bare.png 0 16384", "peek https://a.example/missing.png 0 16384"], "{:?}", p.log);
+    assert!(!p.log[at..].iter().any(|u| u.starts_with("peek ")));
     assert_eq!(p.stages, vec![Stage::First, Stage::Images { complete: true }, Stage::Settled, Stage::Done]);
     // Every image is fetched before any script runs the page, and once.
     let images = p.log.iter().position(|l| l.starts_with("Images")).unwrap();
@@ -96,9 +115,11 @@ fn the_first_artifact_fetches_its_sheets_and_no_image() {
 fn pending_images_say_how_their_box_is_sized() {
     let p = parts(Site::default());
     assert!(p.first.contains(r#"{ "src": "/declared.png", "width": 40, "height": 20, "ratio": "40/20", "address": "", "pending": "declared" }"#), "{}", p.first);
-    assert!(p.first.contains(r#"{ "src": "/bare.png", "width": null, "height": null, "ratio": "none", "address": "", "pending": "placeholder" }"#));
-    // A failed image is not known to have failed yet: it keeps its box too.
-    assert!(p.first.contains(r#""src": "/missing.png""#));
+    // Cut A: sized from its header — the size the whole image will have.
+    assert!(p.first.contains(r#"{ "src": "/bare.png", "width": 64, "height": 32, "ratio": "64/32", "address": "", "pending": "header" }"#), "{}", p.first);
+    // A failed image is not known to have failed yet: it keeps its box too,
+    // a placeholder, since its header could not be had.
+    assert!(p.first.contains(r#"{ "src": "/missing.png", "width": null, "height": null, "ratio": "none", "address": "", "pending": "placeholder" }"#));
     assert!(!p.first.contains("blake3:"), "the first artifact names no image bytes");
 }
 
@@ -152,8 +173,28 @@ fn slow_images_stream_partial_artifacts_each_the_whole_list_so_far() {
     // are still pending exactly as the first artifact wrote them.
     let m = artifact::merge_images(&p.first, partial).unwrap();
     assert!(m.contains(r#"{ "src": "/declared.png", "width": 400, "height": 300, "ratio": "400/300", "address": "blake3:"#), "{m}");
-    assert!(m.contains(r#""pending": "placeholder""#));
+    assert!(m.contains(r#""pending": "header""#) && m.contains(r#""pending": "placeholder""#));
     assert_eq!(artifact::merge_images(&p.first, last).unwrap(), waited());
+}
+
+#[test]
+fn an_image_whose_header_proves_it_will_fail_is_left_out_as_the_final_leaves_it() {
+    let p = parts(Site { http_errors: true, ..Default::default() });
+    // No entry: the normalizer leaves out an `<img>` it has no entry for,
+    // as it will once the images are in.
+    assert!(!p.first.contains(r#"{ "src": "/missing.png""#), "{}", p.first);
+    let last = p.images.last().unwrap();
+    assert!(!last.contains(r#"{ "src": "/missing.png""#));
+    assert_eq!(artifact::merge_images(&p.first, last).unwrap(), waited());
+}
+
+#[test]
+fn a_header_not_in_hand_leaves_a_placeholder_and_changes_nothing_else() {
+    let p = parts(Site { no_headers: true, ..Default::default() });
+    assert!(p.first.contains(r#"{ "src": "/bare.png", "width": null, "height": null, "ratio": "none", "address": "", "pending": "placeholder" }"#));
+    assert_eq!(artifact::merge_images(&p.first, p.images.last().unwrap()).unwrap(), waited());
+    let q = parts(Site::default());
+    assert_eq!((p.readable, p.trans), (q.readable, q.trans));
 }
 
 #[test]

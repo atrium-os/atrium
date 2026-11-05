@@ -812,21 +812,30 @@ enum Upstream {
 }
 
 impl Upstream {
-    fn hint(&mut self, url: &str) {
-        if let Upstream::Fetchd(f) = self { f.send_hint(url) }
+    fn hint(&mut self, h: navigator_prerender::serve::Hint) {
+        use navigator_prerender::serve::Hint;
+        if let Upstream::Fetchd(f) = self {
+            match h { Hint::Body(u) => f.send_hint(u), Hint::Header(u) => f.send_hint_header(u) }
+        }
     }
     fn budget(&mut self, bytes: u64) {
         if let Upstream::Fetchd(f) = self { f.send_budget(bytes) }
     }
-    fn reply(&mut self, url: &str) -> navigator_prerender::fetch::Reply {
-        use navigator_prerender::fetch::Reply;
-        match self {
-            Upstream::Fetchd(f) => f.exchange(url).unwrap_or_else(Reply::Err),
-            Upstream::Curl(h) => match h.get_bytes(url) {
-                Ok(b) => Reply::Ok { status: 200, rest: format!("0 {} {url}", b.len()), body: b },
+    fn reply(&mut self, ask: navigator_prerender::serve::Ask) -> navigator_prerender::fetch::Reply {
+        use navigator_prerender::{fetch::Reply, serve::Ask};
+        match (self, ask) {
+            (Upstream::Fetchd(f), Ask::Fetch(url)) => f.exchange(url).unwrap_or_else(Reply::Err),
+            (Upstream::Fetchd(f), Ask::Peek { url, start, len }) => f.exchange_peek(url, start, len).unwrap_or_else(Reply::Err),
+            // The measurement instrument has no ranges: a peek is the slice
+            // of the whole body (from its cache, offline).
+            (Upstream::Curl(h), ask) => match h.get_bytes(ask.url()) {
+                Ok(b) => {
+                    let b = match ask { Ask::Peek { start, len, .. } => { let a = start.min(b.len()); b[a..(a + len).min(b.len())].to_vec() } _ => b };
+                    Reply::Ok { status: 200, rest: format!("0 {} {}", b.len(), ask.url()), body: b }
+                }
                 Err(e) => Reply::Err(e),
             },
-            Upstream::None => Reply::Err("no network".into()),
+            (Upstream::None, _) => Reply::Err("no network".into()),
         }
     }
 }
@@ -901,8 +910,9 @@ fn convert_in_child(
         let relay_start = std::time::Instant::now();
         let up = std::cell::RefCell::new(up);
         let mut told_budget = false;
-        let r = serve::drive_streaming(&mut out, &stdin_d, &mut |u| {
-            budget_d.lock().unwrap().admit(u, |u| up.borrow_mut().reply(u)).to_frame()
+        let r = serve::drive_streaming(&mut out, &stdin_d, &mut |ask| {
+            // ★ A peek's bytes are charged as a fetch's are (cut A).
+            budget_d.lock().unwrap().admit(ask.url(), |_| up.borrow_mut().reply(ask)).to_frame()
         }, &mut |u| {
             // ★ Passed on only while the budget has room: a hint is a URL
             // the converter is about to ask for, and its bytes are charged

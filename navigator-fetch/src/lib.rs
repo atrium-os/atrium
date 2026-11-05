@@ -154,15 +154,17 @@ enum Conn {
 }
 
 impl Conn {
-    fn exchange(&mut self, host_header: &str, path: &str, keep: bool) -> Result<(http::Response, bool), FetchError> {
+    /// One request and its response; with `range`, the request asks for
+    /// `(start, len)` and at most `cap` body bytes are read.
+    fn exchange(&mut self, host_header: &str, path: &str, keep: bool, range: Option<(u64, u64)>, cap: Option<usize>) -> Result<(http::Response, bool), FetchError> {
         match self {
             Conn::Plain(s) => {
-                http::write_request_conn(s, host_header, path, keep).map_err(|e| FetchError::Connect(e.to_string()))?;
-                http::read_response_framed(s).map_err(FetchError::Http)
+                http::write_request_range(s, host_header, path, keep, range).map_err(|e| FetchError::Connect(e.to_string()))?;
+                http::read_response_capped(s, cap).map_err(FetchError::Http)
             }
             Conn::Tls(s) => {
-                http::write_request_conn(s, host_header, path, keep).map_err(|e| FetchError::Tls(e.to_string()))?;
-                http::read_response_framed(s).map_err(FetchError::Http)
+                http::write_request_range(s, host_header, path, keep, range).map_err(|e| FetchError::Tls(e.to_string()))?;
+                http::read_response_capped(s, cap).map_err(FetchError::Http)
             }
         }
     }
@@ -191,9 +193,25 @@ impl<'a> Conversation<'a> {
     pub fn connections(&self) -> (usize, usize) { let s = self.shared.lock().unwrap(); (s.connects, s.reused) }
 
     pub fn fetch(&mut self, url: &str) -> Result<Fetched, FetchError> {
+        self.fetch_inner(url, None)
+    }
+
+    /// ★ Bytes `start .. start + len` of the resource and no more
+    /// (legacy-web §5.4.5.7, cut A: an image's header): asked for with
+    /// `Range`, and read to at most `len` bytes whatever the server sends.
+    /// The same request otherwise — the address rule, the pins, the
+    /// redirects. A server that ignores `Range` answers 200 with the body
+    /// from its start, so for `start > 0` the first `start + len` bytes are
+    /// read and the caller takes its slice (`Ranged::bytes`).
+    pub fn fetch_range(&mut self, url: &str, start: u64, len: u64) -> Result<Ranged, FetchError> {
+        let f = self.fetch_inner(url, Some((start, len)))?;
+        Ranged::from(f, start, len)
+    }
+
+    fn fetch_inner(&mut self, url: &str, range: Option<(u64, u64)>) -> Result<Fetched, FetchError> {
         let mut current = url::Url::parse(url).map_err(|e| FetchError::BadUrl(e.to_string()))?;
         for redirects in 0..=MAX_REDIRECTS {
-            let response = self.get_once(&current)?;
+            let response = self.get_once(&current, range)?;
             if matches!(response.status, 301 | 302 | 303 | 307 | 308) {
                 let loc = response.header("location").ok_or(FetchError::Http(http::HttpError::Malformed("redirect without Location")))?;
                 let next = current.join(loc).map_err(|e| FetchError::BadUrl(e.to_string()))?;
@@ -264,7 +282,12 @@ impl<'a> Conversation<'a> {
         }
     }
 
-    fn get_once(&mut self, u: &url::Url) -> Result<http::Response, FetchError> {
+    /// One request. With `range` `(start, len)`, a `Range` request whose
+    /// body is read to at most `start + len` bytes: a 206 sends at most
+    /// `len`, and a 200 (the server ignored the range) is the body from its
+    /// start, of which the range is the slice.
+    fn get_once(&mut self, u: &url::Url, range: Option<(u64, u64)>) -> Result<http::Response, FetchError> {
+        let cap = range.map(|(s, n)| (s + n) as usize);
         let https = match u.scheme() { "https" => true, "http" => false, s => return Err(FetchError::Refused(format!("scheme {s}"))) };
         if !u.username().is_empty() || u.password().is_some() {
             return Err(FetchError::Refused("credentials in URL".into()));
@@ -293,7 +316,7 @@ impl<'a> Conversation<'a> {
         if self.reuse {
             let idle = self.shared.lock().unwrap().idle.get_mut(&key).and_then(Vec::pop);
             if let Some(mut c) = idle {
-                match c.exchange(&host_header, &path, true) {
+                match c.exchange(&host_header, &path, true, range, cap) {
                     Ok((resp, again)) => {
                         let mut sh = self.shared.lock().unwrap();
                         sh.reused += 1;
@@ -308,13 +331,62 @@ impl<'a> Conversation<'a> {
             }
         }
         let mut c = self.connect(&lookup, port, https, &host)?;
-        let (resp, again) = c.exchange(&host_header, &path, self.reuse)?;
+        let (resp, again) = c.exchange(&host_header, &path, self.reuse, range, cap)?;
         if self.reuse && again {
             let mut sh = self.shared.lock().unwrap();
             let v = sh.idle.entry(key).or_default();
             if v.len() < MAX_IDLE_PER_ORIGIN { v.push(c) }
         }
         Ok(resp)
+    }
+}
+
+/// What a ranged fetch got: bytes `start ..` of the body, at most the
+/// length asked for, and whether the body ends within them.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Ranged {
+    pub url: String,
+    pub status: u16,
+    pub redirects: usize,
+    pub bytes: Vec<u8>,
+    /// The resource ends at the last of `bytes`.
+    pub end: bool,
+}
+
+impl Ranged {
+    /// ★ The answer is checked against the question, not believed: a 206
+    /// must say (`Content-Range`) that it starts where it was asked to; a
+    /// 200 is the body from its start, and is cut to the range here.
+    fn from(f: Fetched, start: u64, len: u64) -> Result<Ranged, FetchError> {
+        let bad = |why| Err(FetchError::Http(http::HttpError::Malformed(why)));
+        let r = f.response;
+        let (bytes, end) = match r.status {
+            206 => {
+                let cr = r.header("content-range").unwrap_or("").to_string();
+                // `bytes <first>-<last>/<total or *>`
+                let spec = cr.strip_prefix("bytes ").unwrap_or("");
+                let (span, total) = spec.split_once('/').unwrap_or(("", ""));
+                let (first, last) = span.split_once('-').unwrap_or(("", ""));
+                let (Ok(first), Ok(last)) = (first.trim().parse::<u64>(), last.trim().parse::<u64>()) else { return bad("206 without a readable Content-Range") };
+                if first != start || last < first { return bad("206 for another range") }
+                let mut b = r.body;
+                b.truncate(len as usize);
+                // The resource ends here when the total says so, or, with
+                // no total, when fewer bytes came than were asked for.
+                let end = match total.trim().parse::<u64>() { Ok(t) => last + 1 >= t, Err(_) => (b.len() as u64) < len };
+                (b, end)
+            }
+            200..=299 => {
+                let whole = r.body;
+                let from = (start as usize).min(whole.len());
+                let to = (from + len as usize).min(whole.len());
+                // Read to at most start + len: fewer means the body ended.
+                let end = (whole.len() as u64) < start + len;
+                (whole[from..to].to_vec(), end)
+            }
+            _ => return Ok(Ranged { url: f.url, status: r.status, redirects: f.redirects, bytes: vec![], end: true }),
+        };
+        Ok(Ranged { url: f.url, status: r.status, redirects: f.redirects, bytes, end })
     }
 }
 
@@ -326,16 +398,40 @@ pub fn serve_options(args: &[String]) -> (usize, bool) {
     (workers, !args.iter().any(|a| a == "--no-reuse"))
 }
 
+/// `--peek-window-ms N`: the header window (`prefetch::PEEK_WINDOW` by default).
+pub fn peek_window_option(args: &[String]) -> Duration {
+    args.iter().position(|a| a == "--peek-window-ms").and_then(|i| args.get(i + 1))
+        .and_then(|v| v.parse().ok()).map(Duration::from_millis).unwrap_or(prefetch::PEEK_WINDOW)
+}
+
 /// ★ fetchd's serve loop, portable so it is tested where it is written
 /// (the FreeBSD binary wraps it in capability mode). One line in per
 /// request, one frame out per request, in order:
 /// - `<url>`: fetched (from a prefetch if hinted), answered
 ///   `ok <status> <redirects> <len> <final-url>\n` + body, or `err <why>\n`;
 /// - `H <url>`: a hint, no answer (`prefetch`);
+/// - `HH <url>`: a header hint, no answer: the first `prefetch::HEAD_BYTES`
+///   are fetched ahead of every body (legacy-web §5.4.5.7, cut A);
+/// - `P <start> <len> <url>`: bytes `start .. start + len` of the body
+///   (`prefetch::Prefetcher::peek`), framed as a fetch is: exactly `len`
+///   bytes, or fewer only where the body ends; `err <why>` past
+///   `prefetch::MAX_PEEK`, or once the HEADER WINDOW has closed with the
+///   bytes not in hand. ★ The window (`peek_window`, from the first peek
+///   of the conversion) is how long a first display may wait for its
+///   images' headers. It is kept HERE, with the network's other timeouts,
+///   so the converter's decisions read no clock (threat model §2.6): to the
+///   converter a header not in time is a fetch that failed;
 /// - `B <bytes>`: the most hints may pull, no answer;
 /// - `--gate`: `gate` is called (fetchd prints its M1 gate).
-pub fn serve(conv: &Conversation<'_>, workers: usize, input: impl std::io::BufRead, mut out: impl std::io::Write,
+pub fn serve(conv: &Conversation<'_>, workers: usize, input: impl std::io::BufRead, out: impl std::io::Write,
              gate: &mut dyn FnMut(&mut dyn std::io::Write)) {
+    serve_with(conv, workers, prefetch::PEEK_WINDOW, input, out, gate)
+}
+
+/// `serve`, with the header window given (`--peek-window-ms`).
+pub fn serve_with(conv: &Conversation<'_>, workers: usize, peek_window: Duration, input: impl std::io::BufRead,
+                  mut out: impl std::io::Write, gate: &mut dyn FnMut(&mut dyn std::io::Write)) {
+    let mut window_end: Option<std::time::Instant> = None;
     std::thread::scope(|scope| {
         let mut pf = prefetch::Prefetcher::start(scope, conv, workers.max(1));
         for line in input.lines() {
@@ -343,6 +439,26 @@ pub fn serve(conv: &Conversation<'_>, workers: usize, input: impl std::io::BufRe
             let url = url.trim();
             if url.is_empty() { continue }
             if let Some(h) = url.strip_prefix("H ") { if workers > 0 { pf.hint(h.trim()) } continue }
+            if let Some(h) = url.strip_prefix("HH ") { if workers > 0 { pf.hint_header(h.trim()) } continue }
+            if let Some(p) = url.strip_prefix("P ") {
+                let now = std::time::Instant::now();
+                let end = *window_end.get_or_insert(now + peek_window);
+                let f: Vec<&str> = p.splitn(3, ' ').collect();
+                let num = |i: usize| f.get(i).and_then(|v| v.parse::<u64>().ok());
+                let r = match (num(0), num(1), f.get(2)) {
+                    (Some(start), Some(len), Some(u)) => pf.peek(u.trim(), start, len, end.saturating_duration_since(now)),
+                    _ => Err("malformed peek".into()),
+                };
+                match r {
+                    Ok(pk) => {
+                        let _ = writeln!(out, "ok {} {} {} {}", pk.status, pk.redirects, pk.bytes.len(), pk.url);
+                        let _ = out.write_all(&pk.bytes);
+                    }
+                    Err(e) => { let _ = writeln!(out, "err {}", e.replace(['\n', '\r'], " ")); }
+                }
+                let _ = out.flush();
+                continue;
+            }
             // `B <bytes>`: the caller's byte budget, which bounds what hints
             // may pull (prefetch::DEFAULT_BUDGET until told).
             if let Some(b) = url.strip_prefix("B ") { if let Ok(n) = b.trim().parse() { pf.set_budget(n) } continue }

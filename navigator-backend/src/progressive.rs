@@ -393,7 +393,8 @@ pub struct ImageEntry {
     pub ratio: String,
     /// `blake3:<hex>`, or empty: the bytes are not in hand.
     pub address: String,
-    /// `declared` or `placeholder`: not fetched yet.
+    /// `declared`, `placeholder` or `header` (sized from the image's own
+    /// leading bytes, legacy-web §5.4.5.7 cut A): not fetched yet.
     pub pending: Option<String>,
 }
 
@@ -407,7 +408,7 @@ fn bad(field: &'static str, why: &'static str) -> crate::Reject { crate::Reject:
 
 /// Read an `images` array, bounded and checked: every `src` a bounded
 /// string and each once, every dimension `null` or a `u32`, every address
-/// empty or `blake3:<64 hex>`, `pending` absent or one of its two words.
+/// empty or `blake3:<64 hex>`, `pending` absent or one of its three words.
 pub fn image_entries(v: Option<&serde_json::Value>, limits: &Limits) -> Result<Vec<ImageEntry>, crate::Reject> {
     use serde_json::Value;
     let Some(v) = v else { return Ok(vec![]) };
@@ -438,8 +439,8 @@ pub fn image_entries(v: Option<&serde_json::Value>, limits: &Limits) -> Result<V
             return Err(bad("images", "an address is not blake3:<64 hex>"));
         }
         let pending = s("pending")?;
-        if pending.as_deref().is_some_and(|p| p != "declared" && p != "placeholder") {
-            return Err(bad("images", "pending is neither declared nor placeholder"));
+        if pending.as_deref().is_some_and(|p| !matches!(p, "declared" | "placeholder" | "header")) {
+            return Err(bad("images", "pending is not declared, placeholder or header"));
         }
         if pending.is_some() && !address.is_empty() { return Err(bad("images", "a pending image names bytes")) }
         out.push(ImageEntry { src, width: dim("width")?, height: dim("height")?, ratio: s("ratio")?.unwrap_or_default(), address, pending });

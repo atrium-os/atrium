@@ -7,10 +7,11 @@
 //! by run: a run is matched to the next run with the same text, and it moved
 //! if its origin moved by more than half a pixel. One TSV line per document:
 //!
-//! `doc  declared  placeholder  resized  runs  moved  screen_runs  screen_moved  max_dy_px  cls  height_before  height_after  painted_after`
+//! `doc  declared  placeholder  header  resized  runs  moved  screen_runs  screen_moved  max_dy_px  cls  height_before  height_after  painted_after`
 //!
-//! - `declared` / `placeholder`: the first artifact's pending images by how
-//!   their box was sized; `resized`: images whose sizing differs once they
+//! - `declared` / `placeholder` / `header`: the first artifact's pending
+//!   images by how their box was sized (`header`: from the image's own
+//!   leading bytes, cut A); `resized`: images whose sizing differs once they
 //!   arrived (or which failed, and are gone);
 //! - `screen_*`: runs in the first screen (top 600 px of the first layout),
 //!   where a reader shown the first display is;
@@ -52,7 +53,7 @@ fn main() {
     let fonts = FontSet::load().expect("fonts");
     let env = Env::default();
     let (vw, vh) = (env.width_px as i64, env.height_px as i64);
-    println!("doc\tdeclared\tplaceholder\tresized\truns\tmoved\tscreen_runs\tscreen_moved\tmax_dy_px\tcls\theight_before\theight_after\tpainted_after");
+    println!("doc\tdeclared\tplaceholder\theader\tresized\truns\tmoved\tscreen_runs\tscreen_moved\tmax_dy_px\tcls\theight_before\theight_after\tpainted_after");
     for dir in std::env::args().skip(1) {
         let mut stems: Vec<String> = std::fs::read_dir(&dir).expect("parts dir").flatten()
             .filter_map(|e| e.file_name().to_string_lossy().strip_suffix(".first-images.json").map(str::to_string)).collect();
@@ -62,6 +63,7 @@ fn main() {
             let (Ok(a), Ok(b)) = (std::fs::read_to_string(p("first")), std::fs::read_to_string(p("first-images"))) else { continue };
             let declared = a.matches("\"pending\": \"declared\"").count();
             let placeholder = a.matches("\"pending\": \"placeholder\"").count();
+            let header = a.matches("\"pending\": \"header\"").count();
             let after: std::collections::HashMap<String, String> = entries(&b).into_iter().collect();
             let resized = entries(&a).iter().filter(|(src, sizing)| {
                 let before = sizing.split(", \"pending\"").next().unwrap_or("");
@@ -102,7 +104,7 @@ fn main() {
             let cls = impact * (max_dy.min(vh) as f64 / vh as f64);
             // `painted_after`: image nodes the layout with images paints —
             // the positive control that the images did arrive in it.
-            println!("{stem}\t{declared}\t{placeholder}\t{resized}\t{}\t{moved}\t{screen}\t{screen_moved}\t{max_dy}\t{cls:.4}\t{}\t{}\t{}",
+            println!("{stem}\t{declared}\t{placeholder}\t{header}\t{resized}\t{}\t{moved}\t{screen}\t{screen_moved}\t{max_dy}\t{cls:.4}\t{}\t{}\t{}",
                 s0.runs.len(), s0.height / 64, s1.height / 64, s1.images.len());
         }
     }

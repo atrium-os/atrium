@@ -53,7 +53,8 @@ fn main() {
     eprintln!("navigator-fetchd: ★ UNCONFINED, for testing: no sandbox");
     let (workers, reuse) = navigator_fetch::serve_options(&args);
     let conv = Conversation::new(&navigator_fetch::Direct, tls, policy).with_reuse(reuse);
-    navigator_fetch::serve(&conv, workers, std::io::stdin().lock(), std::io::stdout().lock(), &mut |_| {});
+    navigator_fetch::serve_with(&conv, workers, navigator_fetch::peek_window_option(&args),
+                                std::io::stdin().lock(), std::io::stdout().lock(), &mut |_| {});
 }
 
 #[cfg(target_os = "freebsd")]

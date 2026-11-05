@@ -190,7 +190,7 @@ pub fn convert_progressive(
         let _s = timing::span("first");
         convert_impl(html, base, None, fetcher, false, Flow { fresh: true, keep_after: true, defer_images: true }, None)
     };
-    timing::mark("first");
+    timing::checkpoint("first");
     on(Stage::First, &first);
     // ★ Then its images, as they arrive — before any script is fetched, so
     // the scripted conversion that follows finds every one in the memo and
@@ -348,7 +348,14 @@ fn convert_impl(
     // The order is the order they will be needed in: a conversion that
     // shows tier 1 first needs its sheets and images before any script.
     if flow.fresh {
-        for u in hints(&dom, base, scripts_held, flow.keep_after) { fetcher.hint(&u) }
+        let (sheets, rest) = hints(&dom, base, scripts_held, flow.keep_after);
+        for u in sheets { fetcher.hint(&u) }
+        // ★ Cut A: a first display that does not wait for its images sizes
+        // the ones the page leaves unsized from their headers, so their
+        // first bytes are asked for next — after the stylesheets, ahead of
+        // every image's body.
+        if flow.defer_images { for u in header_hints(&dom, base) { fetcher.hint_header(&u) } }
+        for u in rest { fetcher.hint(&u) }
     }
     // ★ Always recorded, because ANCHORING needs it too: a transition is
     // replayable against tier 1 only if its trigger came from the parser.
@@ -497,7 +504,30 @@ fn convert_impl(
 /// stylesheets, then (tier 1 first) images and scripts, or (scripts first)
 /// scripts and images. Scripts are left out of a tier-1 conversion that no
 /// scripted one follows. At most 512, http(s) only, each once.
-fn hints(dom: &dom::Dom, base: Option<&str>, tier1_first: bool, scripted_follows: bool) -> Vec<String> {
+/// The images whose headers a first display will ask for: every `<img>`
+/// that does not declare both its width and height, in document order,
+/// http(s) only, each once, at most 512.
+fn header_hints(dom: &dom::Dom, base: Option<&str>) -> Vec<String> {
+    let mut seen = HashSet::new();
+    dom.by_tag_anywhere("img").into_iter().filter(|&h| !subresource::declares_size(dom, h))
+        .filter_map(|h| dom.attr(h, "src").and_then(|v| resolve(base, v)))
+        .filter(|u| (u.starts_with("https://") || u.starts_with("http://")) && u.len() <= serve::MAX_URL && !u.contains(['\n', '\r']))
+        .filter(|u| seen.insert(u.clone())).take(512).collect()
+}
+
+/// (the stylesheets, then everything else) — see `hints_in_order`.
+fn hints(dom: &dom::Dom, base: Option<&str>, tier1_first: bool, scripted_follows: bool) -> (Vec<String>, Vec<String>) {
+    let all = hints_in_order(dom, base, tier1_first, scripted_follows);
+    let sheets: HashSet<String> = dom.by_tag_anywhere("link").into_iter()
+        .filter(|&h| dom.attr(h, "rel").is_some_and(|r| r.split_ascii_whitespace().any(|x| x.eq_ignore_ascii_case("stylesheet"))))
+        .filter_map(|h| dom.attr(h, "href").and_then(|v| resolve(base, v))).collect();
+    let n = all.iter().take_while(|u| sheets.contains(*u)).count();
+    let mut all = all;
+    let rest = all.split_off(n);
+    (all, rest)
+}
+
+fn hints_in_order(dom: &dom::Dom, base: Option<&str>, tier1_first: bool, scripted_follows: bool) -> Vec<String> {
     let attr_urls = |tag: &str, attr: &str, keep: &dyn Fn(navigator_dom::Handle) -> bool| -> Vec<String> {
         dom.by_tag_anywhere(tag).into_iter().filter(|&h| keep(h))
             .filter_map(|h| dom.attr(h, attr).and_then(|v| resolve(base, v))).collect()

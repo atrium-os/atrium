@@ -49,10 +49,21 @@ pub fn write_request(w: &mut impl Write, host_header: &str, path_and_query: &str
 /// `write_request`, asking to keep the connection open (`keep_alive`) for
 /// the next request to the same origin (legacy-web §5.4.5.7, step 4).
 pub fn write_request_conn(w: &mut impl Write, host_header: &str, path_and_query: &str, keep_alive: bool) -> io::Result<()> {
+    write_request_range(w, host_header, path_and_query, keep_alive, None)
+}
+
+/// `write_request_conn`, asking for bytes `start .. start + len` of the
+/// resource only (`Range`, RFC 9110 §14), when `range` is given: an image's
+/// header (legacy-web §5.4.5.7, cut A). A server may ignore it and send the
+/// whole body; `read_response_capped` reads no more than it was asked for
+/// either way.
+pub fn write_request_range(w: &mut impl Write, host_header: &str, path_and_query: &str, keep_alive: bool,
+                           range: Option<(u64, u64)>) -> io::Result<()> {
     let conn = if keep_alive { "keep-alive" } else { "close" };
+    let range = match range { Some((s, n)) if n > 0 => format!("Range: bytes={s}-{}\r\n", s + n - 1), _ => String::new() };
     write!(w, "GET {path_and_query} HTTP/1.1\r\nHost: {host_header}\r\n\
                User-Agent: atrium-navigator-fetch/0.1\r\nAccept: */*\r\n\
-               Accept-Encoding: identity\r\nConnection: {conn}\r\n\r\n")?;
+               Accept-Encoding: identity\r\n{range}Connection: {conn}\r\n\r\n")?;
     w.flush()
 }
 
@@ -82,6 +93,14 @@ pub fn read_response(r: &mut impl Read) -> Result<Response, HttpError> {
 /// the connection is not reused — a byte left over would become the start
 /// of the next response.
 pub fn read_response_framed(r: &mut impl Read) -> Result<(Response, bool), HttpError> {
+    read_response_capped(r, None)
+}
+
+/// `read_response_framed`, reading at most `cap` bytes of the body when a
+/// cap is given: what a header request needs, however much the server
+/// sends (it may ignore `Range`). A body cut at the cap ends the
+/// connection's reuse — the rest of it is still on the wire.
+pub fn read_response_capped(r: &mut impl Read, cap: Option<usize>) -> Result<(Response, bool), HttpError> {
     let (head, mut rest) = read_until_headers_end(r)?;
     let head = std::str::from_utf8(&head).map_err(|_| HttpError::Malformed("non-UTF-8 header"))?;
     let mut lines = head.split("\r\n");
@@ -108,18 +127,31 @@ pub fn read_response_framed(r: &mut impl Read) -> Result<(Response, bool), HttpE
     let (body, delimited) = if (100..200).contains(&status) || status == 204 || status == 304 {
         (vec![], rest.is_empty())
     } else if chunked {
-        let b = read_chunked(&mut rest, r)?;
+        let (b, whole) = read_chunked(&mut rest, r, cap.unwrap_or(MAX_BODY_BYTES))?;
+        if !whole { return Ok((Response { status, headers, body: b }, false)) }
         let clean = read_trailers(&mut rest, r)? && rest.is_empty();
         (b, clean)
     } else if let Some(cl) = resp_hdr("content-length") {
         let n: usize = cl.parse().map_err(|_| HttpError::Malformed("bad content-length"))?;
+        match cap {
+            Some(c) if n > c => {
+                // Only the asked-for bytes: the stated length is not read.
+                fill(&mut rest, r, c)?;
+                rest.truncate(c);
+                return Ok((Response { status, headers, body: std::mem::take(&mut rest) }, false));
+            }
+            _ => {}
+        }
         if n > MAX_BODY_BYTES { return Err(HttpError::BodyTooLarge) }
         fill(&mut rest, r, n)?;
         let clean = rest.len() == n;
         rest.truncate(n);
         (std::mem::take(&mut rest), clean)
     } else {
-        (read_to_limit(&mut rest, r)?, false)
+        match cap {
+            Some(c) => { let b = read_to_cap(&mut rest, r, c)?; return Ok((Response { status, headers, body: b }, false)) }
+            None => (read_to_limit(&mut rest, r)?, false),
+        }
     };
     Ok((Response { status, headers, body }, keep && delimited))
 }
@@ -162,9 +194,26 @@ fn read_to_limit(rest: &mut Vec<u8>, r: &mut impl Read) -> Result<Vec<u8>, HttpE
     }
 }
 
-fn read_chunked(rest: &mut Vec<u8>, r: &mut impl Read) -> Result<Vec<u8>, HttpError> {
+/// At most `cap` bytes of a close-delimited body.
+fn read_to_cap(rest: &mut Vec<u8>, r: &mut impl Read, cap: usize) -> Result<Vec<u8>, HttpError> {
+    let mut chunk = [0u8; 16 * 1024];
+    while rest.len() < cap {
+        let n = r.read(&mut chunk)?;
+        if n == 0 { break }
+        rest.extend_from_slice(&chunk[..n]);
+    }
+    rest.truncate(cap);
+    Ok(std::mem::take(rest))
+}
+
+/// A chunked body, and whether it was read to its last chunk: reading stops
+/// once `cap` bytes are in hand (`cap` is at most `MAX_BODY_BYTES`, the
+/// refusal limit when there is no cap).
+fn read_chunked(rest: &mut Vec<u8>, r: &mut impl Read, cap: usize) -> Result<(Vec<u8>, bool), HttpError> {
     let mut body = vec![];
+    let capped = cap < MAX_BODY_BYTES;
     loop {
+        if capped && body.len() >= cap { body.truncate(cap); return Ok((body, false)) }
         // Chunk-size line.
         let line_end = loop {
             if let Some(i) = rest.windows(2).position(|w| w == b"\r\n") { break i }
@@ -176,7 +225,14 @@ fn read_chunked(rest: &mut Vec<u8>, r: &mut impl Read) -> Result<Vec<u8>, HttpEr
         let size = usize::from_str_radix(line.split(';').next().unwrap_or("").trim(), 16)
             .map_err(|_| HttpError::Malformed("chunk size"))?;
         rest.drain(..line_end + 2);
-        if size == 0 { return Ok(body) } // trailers ignored
+        if size == 0 { return Ok((body, true)) } // trailers ignored
+        if capped && body.len() + size > cap {
+            // Only what the cap still admits of this chunk.
+            let take = cap - body.len();
+            fill(rest, r, take)?;
+            body.extend_from_slice(&rest[..take]);
+            return Ok((body, false));
+        }
         if body.len() + size > MAX_BODY_BYTES { return Err(HttpError::BodyTooLarge) }
         fill(rest, r, size + 2)?;
         body.extend_from_slice(&rest[..size]);
@@ -231,6 +287,34 @@ mod tests {
     fn a_compressed_body_is_refused_not_decoded() {
         let r = parse(b"HTTP/1.1 200 OK\r\nContent-Encoding: gzip\r\nContent-Length: 1\r\n\r\nx");
         assert_eq!(r, Err(HttpError::Encoded("gzip".into())));
+    }
+
+    fn capped(raw: &[u8], cap: usize) -> (Response, bool) { read_response_capped(&mut &raw[..], Some(cap)).unwrap() }
+
+    #[test]
+    fn a_capped_read_takes_only_the_asked_for_bytes_whatever_the_framing() {
+        // A server that ignored Range and states a length past the limit: not refused, cut.
+        let big = format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\nabcdefghij", MAX_BODY_BYTES * 4);
+        assert_eq!(capped(big.as_bytes(), 4), (Response { status: 200, headers: vec![("content-length".into(), (MAX_BODY_BYTES * 4).to_string())], body: b"abcd".to_vec() }, false));
+        // A body within the cap is read whole and keeps the connection.
+        let (r, keep) = capped(b"HTTP/1.1 206 Partial\r\nContent-Length: 3\r\n\r\nabc", 16);
+        assert_eq!((r.body.as_slice(), keep), (&b"abc"[..], true));
+        let (r, keep) = capped(b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n4\r\nWiki\r\n5\r\npedia\r\n0\r\n\r\n", 6);
+        assert_eq!((r.body.as_slice(), keep), (&b"Wikipe"[..], false));
+        let (r, keep) = capped(b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n4\r\nWiki\r\n0\r\n\r\n", 6);
+        assert_eq!((r.body.as_slice(), keep), (&b"Wiki"[..], true));
+        let (r, keep) = capped(b"HTTP/1.0 200 OK\r\n\r\nto the end", 2);
+        assert_eq!((r.body.as_slice(), keep), (&b"to"[..], false));
+        // A huge chunk under a cap is cut, not refused.
+        let raw = format!("HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n{:x}\r\nxyz", MAX_BODY_BYTES + 1);
+        assert_eq!(capped(raw.as_bytes(), 2).0.body, b"xy");
+    }
+
+    #[test]
+    fn a_range_request_says_which_bytes() {
+        let mut out = vec![];
+        write_request_range(&mut out, "example.com", "/i.jpg", true, Some((16384, 16384))).unwrap();
+        assert!(String::from_utf8(out).unwrap().contains("\r\nRange: bytes=16384-32767\r\nConnection: keep-alive\r\n\r\n"));
     }
 
     #[test]

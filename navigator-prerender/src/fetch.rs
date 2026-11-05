@@ -24,6 +24,19 @@ pub trait Fetcher {
     /// answered, nothing is charged here; the request, when it comes, is the
     /// same request as before. Ignored by default.
     fn hint(&mut self, _url: &str) {}
+    /// ★ The converter will want `url`'s HEADER (legacy-web §5.4.5.7, cut
+    /// A): a fetcher that can fetch ahead fetches its first bytes now,
+    /// ahead of every body it was hinted. Ignored by default.
+    fn hint_header(&mut self, _url: &str) {}
+    /// Bytes `start .. start + len` of `url`'s body: exactly `len` of them,
+    /// or fewer only where the body ends. `start + len` is at most
+    /// `navigator_dom::natural::MAX_HEADER_BYTES`. The default fetches the
+    /// whole body and takes the slice; a fetcher that can ask for less does.
+    fn peek(&mut self, url: &str, start: usize, len: usize) -> Result<Vec<u8>, String> {
+        let b = self.get_bytes(url)?;
+        let a = start.min(b.len());
+        Ok(b[a..(a + len).min(b.len())].to_vec())
+    }
 }
 
 /// A fetcher that fetches nothing — the default for tests, so no test can
@@ -277,15 +290,26 @@ impl FetchdFetcher {
     /// Send one URL and read one reply, bounded. `Err` means the STREAM is
     /// unusable (and stays so); an `err` frame is `Ok(Reply::Err)`.
     pub fn exchange(&mut self, url: &str) -> Result<Reply, String> {
+        let prefix = self.prefix;
+        self.exchange_line(url, prefix, "")
+    }
+
+    /// `P <start> <len> <url>`: a peek, answered with one frame as a fetch
+    /// is (`navigator_fetch::serve`). The same line whether this side talks
+    /// to fetchd or to the relay, which passes it on.
+    pub fn exchange_peek(&mut self, url: &str, start: usize, len: usize) -> Result<Reply, String> {
+        self.exchange_line(url, "", &format!("P {start} {len} "))
+    }
+
+    fn exchange_line(&mut self, url: &str, prefix: &str, verb: &str) -> Result<Reply, String> {
         use std::io::{Read, Write};
         if let Some(b) = &self.broken { return Err(format!("fetcher unusable: {b}")) }
         // ★ One request per line, so a URL that carries a line break would
         // smuggle a second request of the page's choosing. Refused here.
         if url.contains(['\n', '\r']) { return Ok(Reply::Err(format!("refused: line break in URL {url:?}"))) }
         self.requests += 1;
-        let prefix = self.prefix;
         let Some(stdin) = self.stdin.as_mut() else { return Err("fetcher input closed".into()) };
-        if let Err(e) = write!(stdin, "{prefix}{url}\n").and_then(|_| stdin.flush()) {
+        if let Err(e) = write!(stdin, "{prefix}{verb}{url}\n").and_then(|_| stdin.flush()) {
             return self.fail(format!("fetcher went away: {e}"));
         }
         let line = match read_line_bounded(&mut self.stdout, Self::MAX_HEADER) {
@@ -309,7 +333,12 @@ impl FetchdFetcher {
 
     /// The body as it came off the wire. `get` is this, decoded.
     fn get_raw(&mut self, url: &str) -> Result<Vec<u8>, String> {
-        match self.exchange(url)? {
+        let r = self.exchange(url)?;
+        Self::body_of(url, r)
+    }
+
+    fn body_of(url: &str, r: Reply) -> Result<Vec<u8>, String> {
+        match r {
             Reply::Err(reason) => Err(format!("fetch {url}: {reason}")),
             // Same contract as HttpFetcher's `curl -f`: an HTTP error is a failure.
             Reply::Ok { status, .. } if !(200..300).contains(&status) => Err(format!("fetch {url}: HTTP {status}")),
@@ -356,10 +385,32 @@ impl FetchdFetcher {
         }
         self.hints += 1;
     }
+
+    /// Pass a header hint on: `HH <url>`, no answer.
+    pub fn send_hint_header(&mut self, url: &str) {
+        use std::io::Write;
+        if self.broken.is_some() || url.contains(['\n', '\r']) { return }
+        if let Some(stdin) = self.stdin.as_mut() {
+            if write!(stdin, "HH {url}\n").and_then(|_| stdin.flush()).is_err() {
+                self.broken = Some("fetcher went away".into());
+            }
+        }
+    }
 }
 
 impl Fetcher for FetchdFetcher {
     fn hint(&mut self, url: &str) { self.send_hint(url) }
+    fn hint_header(&mut self, url: &str) { self.send_hint_header(url) }
+    fn peek(&mut self, url: &str, start: usize, len: usize) -> Result<Vec<u8>, String> {
+        crate::timing::fetch(|| {
+            let r = self.exchange_peek(url, start, len)?;
+            let b = Self::body_of(url, r)?;
+            // ★ Bounded before it is believed: more than was asked for is
+            // a fetcher out of step, not a longer header.
+            if b.len() > len { return Err(format!("peek {url}: {} bytes for a {len}-byte ask", b.len())) }
+            Ok(b)
+        }, |b| b.len() as u64)
+    }
     fn get(&mut self, url: &str) -> Result<String, String> {
         crate::timing::fetch(|| self.get_raw(url), |b| b.len() as u64).map(|b| String::from_utf8_lossy(&b).into_owned())
     }
@@ -467,6 +518,8 @@ pub struct SharedFetcher(pub std::rc::Rc<std::cell::RefCell<FetchdFetcher>>);
 impl Fetcher for SharedFetcher {
     fn get(&mut self, url: &str) -> Result<String, String> { self.0.borrow_mut().get(url) }
     fn hint(&mut self, url: &str) { self.0.borrow_mut().hint(url) }
+    fn hint_header(&mut self, url: &str) { self.0.borrow_mut().hint_header(url) }
+    fn peek(&mut self, url: &str, start: usize, len: usize) -> Result<Vec<u8>, String> { self.0.borrow_mut().peek(url, start, len) }
     fn get_bytes(&mut self, url: &str) -> Result<Vec<u8>, String> { self.0.borrow_mut().get_bytes(url) }
     fn bytes_fetched(&self) -> u64 { self.0.borrow().bytes_fetched() }
 }

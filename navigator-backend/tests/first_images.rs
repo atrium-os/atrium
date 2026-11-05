@@ -87,6 +87,24 @@ fn images_arrive_in_their_boxes_and_only_then_can_be_painted() {
 }
 
 #[test]
+fn an_image_sized_from_its_header_arrives_without_moving_anything() {
+    // Cut A: `/b.png` was sized from its leading bytes, 4 × 4, so its box
+    // is already the box the whole image gets.
+    let f = fixture();
+    let mut n = Navigatord::unconfined_for_testing($host()).with_blobs(Box::new(f.blobs));
+    n.tick(1000);
+    let header_first = String::from_utf8(first()).unwrap().replace(
+        r#"{"src":"/b.png","width":null,"height":null,"ratio":"none","address":"","pending":"placeholder"}"#,
+        r#"{"src":"/b.png","width":4,"height":4,"ratio":"4/4","address":"","pending":"header"}"#).into_bytes();
+    assert_ne!(header_first, first());
+    let s = open(&mut n, header_first.clone());
+    let (a, b) = (address(&f.a), address(&f.b));
+    let ev = n.handle(Request::Images { session: s, images: images_for(&header_first, true, &[entry("/a.png", 3, 2, &a), entry("/b.png", 4, 4, &b)]) });
+    assert_eq!(ev, vec![Event::ImagesAttached { session: s, arrived: vec![a, b.clone()], resized: vec![], complete: true }]);
+    assert!(matches!(pixels(&mut n, s, &b), Event::Image { .. }));
+}
+
+#[test]
 fn a_declared_image_whose_real_size_differs_is_resized_and_a_failed_one_is_gone() {
     let f = fixture();
     let mut n = Navigatord::unconfined_for_testing($host()).with_blobs(Box::new(f.blobs));
