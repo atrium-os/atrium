@@ -15,7 +15,7 @@ use iced_x86::BlockEncoderOptions;
 
 use crate::regalloc::{Allocation, Loc};
 use crate::vcode::{
-    gpr, Addr, Base, DivKind, FCond, GOp, GUnOp, ICond, Label, MInst, PReg, ShiftOp, VCode, VReg, XOp,
+    gpr, Addr, AtomicOp, Base, DivKind, FCond, GOp, GUnOp, ICond, Label, MInst, PReg, ShiftOp, VCode, VReg, XOp,
     XUnOp,
 };
 use crate::BackendError;
@@ -98,7 +98,10 @@ pub(crate) fn emit(vc: &VCode, alloc: &Allocation) -> Result<(Vec<u8>, Vec<(u32,
     // 16-aligned after the frame.
     let locals = 16 * alloc.num_slots as i32;
     let local_bytes = vc.local_bytes.div_ceil(16) as i32 * 16;
-    let frame = if locals + local_bytes == 0 {
+    let has_calls = vc.insts.iter().any(|i| i.is_call());
+    // A call needs rsp 16-aligned, so a function with calls always
+    // aligns; a leaf with no frame skips it.
+    let frame = if locals + local_bytes == 0 && !has_calls {
         0
     } else {
         let mut f = locals + local_bytes;
@@ -346,6 +349,43 @@ impl<'a> Emit<'a> {
                 self.p_fin(*d, r)?;
             }
             M::PtrAdd { d, base, idx, stride } => self.ptr_add(*d, *base, *idx, *stride)?,
+            M::PMov { d, s } => match (self.loc(*d), self.loc(*s)) {
+                (a, b) if a == b => {}
+                (Loc::Reg(PReg::G(rd)), Loc::Reg(PReg::G(rs))) => {
+                    self.a.mov(G64[rd as usize], G64[rs as usize]).map_err(enc)?
+                }
+                (_, _) => {
+                    let r = self.g64(*s)?;
+                    self.p_fin(*d, r)?;
+                }
+            },
+            M::Call { table, off } => {
+                let t = self.g64(*table)?;
+                self.a.mov(rax, qword_ptr(t + *off)).map_err(enc)?;
+                self.a.call(rax).map_err(enc)?;
+            }
+            M::AtomicStore { addr, s } => {
+                let m = self.mem(*addr)?;
+                g2!(self.a, mov, eax, self.g(*s))?;
+                self.a.xchg(m, eax).map_err(enc)?;
+            }
+            M::AtomicRmw { op, d, addr, v } => self.atomic_rmw(*op, *d, *addr, *v)?,
+            M::AtomicCas { d, addr, expected, desired } => {
+                let m = self.mem(*addr)?;
+                g2!(self.a, mov, eax, self.g(*expected))?;
+                match self.g(*desired) {
+                    G::R(r) => {
+                        self.a.lock().cmpxchg(m, r).map_err(enc)?;
+                    }
+                    G::M(md) => {
+                        let t = self.red_zone_temp(&[addr.base_reg(&self.al.locs)])?;
+                        self.a.mov(G32[t as usize], md).map_err(enc)?;
+                        self.a.lock().cmpxchg(m, G32[t as usize]).map_err(enc)?;
+                        self.a.mov(G64[t as usize], qword_ptr(rsp - 8)).map_err(enc)?;
+                    }
+                }
+                self.g_fin(*d, eax)?;
+            }
             M::Ret => {
                 if self.frame > 0 {
                     self.a.add(rsp, self.frame).map_err(enc)?;
@@ -456,6 +496,20 @@ impl<'a> Emit<'a> {
                 let rd = self.g_dst(*d);
                 match op {
                     GUnOp::Lzcnt => g2!(self.a, lzcnt, rd, self.g(*a))?,
+                    GUnOp::Rbit => {
+                        g2!(self.a, mov, eax, self.g(*a))?;
+                        self.a.bswap(eax).map_err(enc)?;
+                        for (sh, mask) in [(4, 0x0f0f_0f0fu32), (2, 0x3333_3333), (1, 0x5555_5555)] {
+                            // eax = ((eax >> sh) & m) | ((eax & m) << sh)
+                            self.a.mov(r11d, eax).map_err(enc)?;
+                            self.a.shr(eax, sh).map_err(enc)?;
+                            self.a.and(eax, mask as i32).map_err(enc)?;
+                            self.a.and(r11d, mask as i32).map_err(enc)?;
+                            self.a.shl(r11d, sh).map_err(enc)?;
+                            self.a.or(eax, r11d).map_err(enc)?;
+                        }
+                        self.a.mov(rd, eax).map_err(enc)?;
+                    }
                     GUnOp::Neg | GUnOp::Not => {
                         if self.g(*a).reg() != Some(rd) {
                             g2!(self.a, mov, rd, self.g(*a))?;
@@ -665,6 +719,73 @@ impl<'a> Emit<'a> {
             }
         }
         Ok(())
+    }
+
+    /// Borrow a GPR not in `avoid` as a temporary, saving it in the red
+    /// zone (the 128 bytes below rsp that SysV leaves to leaf code; no
+    /// call happens while it is borrowed). Restore with
+    /// `mov r64, [rsp - 8]`.
+    fn red_zone_temp(&mut self, avoid: &[Option<u8>]) -> Result<u8, BackendError> {
+        let t = [1u8, 2, 6, 7, 8, 9, 10]
+            .into_iter()
+            .find(|r| !avoid.contains(&Some(*r)))
+            .expect("a free temporary");
+        self.a.mov(qword_ptr(rsp - 8), G64[t as usize]).map_err(enc)?;
+        Ok(t)
+    }
+
+    /// d = old *addr; *addr = op(old, v). Add and exchange have single
+    /// instructions; the rest are a `lock cmpxchg` loop.
+    fn atomic_rmw(&mut self, op: AtomicOp, d: VReg, addr: Addr, v: VReg) -> Result<(), BackendError> {
+        let m = self.mem(addr)?;
+        let gv = self.g(v);
+        match op {
+            AtomicOp::Add => {
+                g2!(self.a, mov, eax, gv)?;
+                self.a.lock().xadd(m, eax).map_err(enc)?;
+            }
+            AtomicOp::Xchg => {
+                g2!(self.a, mov, eax, gv)?;
+                self.a.xchg(m, eax).map_err(enc)?;
+            }
+            _ => {
+                let vreg_idx = match self.loc(v) {
+                    Loc::Reg(PReg::G(r)) => Some(r),
+                    _ => None,
+                };
+                let t = self.red_zone_temp(&[addr.base_reg(&self.al.locs), vreg_idx])?;
+                let t32 = G32[t as usize];
+                let mut retry = self.a.create_label();
+                self.a.mov(eax, m).map_err(enc)?;
+                self.a.set_label(&mut retry).map_err(enc)?;
+                match op {
+                    AtomicOp::And | AtomicOp::Or | AtomicOp::Xor => {
+                        self.a.mov(t32, eax).map_err(enc)?;
+                        match op {
+                            AtomicOp::And => g2!(self.a, and, t32, gv)?,
+                            AtomicOp::Or => g2!(self.a, or, t32, gv)?,
+                            _ => g2!(self.a, xor, t32, gv)?,
+                        }
+                    }
+                    _ => {
+                        // t = v; if old is the min/max already, t = old.
+                        g2!(self.a, mov, t32, gv)?;
+                        g2!(self.a, cmp, eax, gv)?;
+                        match op {
+                            AtomicOp::SMin => self.a.cmovl(t32, eax),
+                            AtomicOp::SMax => self.a.cmovg(t32, eax),
+                            AtomicOp::UMin => self.a.cmovb(t32, eax),
+                            _ => self.a.cmova(t32, eax),
+                        }
+                        .map_err(enc)?;
+                    }
+                }
+                self.a.lock().cmpxchg(m, t32).map_err(enc)?;
+                self.a.jne(retry).map_err(enc)?;
+                self.a.mov(G64[t as usize], qword_ptr(rsp - 8)).map_err(enc)?;
+            }
+        }
+        self.g_fin(d, eax)
     }
 
     /// d = base + zext(idx) * stride. A 32-bit GPR value is already

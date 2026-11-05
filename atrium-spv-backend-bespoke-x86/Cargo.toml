@@ -20,4 +20,5 @@ object              = { version = "0.36", features = ["write"] }
 thiserror           = "1"
 
 [dev-dependencies]
+atrium-spv-runtime  = { path = "../atrium-spv-runtime" }
 atrium-spv-frontend = { path = "../atrium-spv-frontend" }

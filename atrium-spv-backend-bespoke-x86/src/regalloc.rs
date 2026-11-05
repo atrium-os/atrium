@@ -36,6 +36,8 @@ pub(crate) struct Allocation {
 /// Allocatable GPRs, in preference order: caller-saved first. rax and r11
 /// are scratch; rsp is the stack pointer.
 pub(crate) const GPR_ORDER: [u8; 13] = [10, 9, 1, 8, 2, 6, 7, 3, 5, 12, 13, 14, 15];
+/// GPRs a call preserves (SysV): rbx, rbp, r12-r15.
+const CALLEE_SAVED_ORDER: [u8; 6] = [3, 5, 12, 13, 14, 15];
 /// Allocatable XMM registers. High first, so the frag-coord argument
 /// registers xmm0-3 are taken last.
 pub(crate) const XMM_ORDER: [u8; 14] = [13, 12, 11, 10, 9, 8, 7, 6, 5, 4, 3, 2, 1, 0];
@@ -184,6 +186,21 @@ pub(crate) fn allocate(vc: &VCode) -> Allocation {
     let n = vc.classes.len();
     let force = force_spill();
 
+    // Positions where a call clobbers the caller-saved registers. An
+    // interval live across one may only use a callee-saved GPR; an XMM
+    // value live across one spills (SysV has no callee-saved XMM).
+    let calls: Vec<u32> = vc
+        .insts
+        .iter()
+        .enumerate()
+        .filter(|(_, i)| i.is_call())
+        .map(|(i, _)| 2 * i as u32 + 1)
+        .collect();
+    let crosses_call = |s: u32, e: u32| {
+        let k = calls.partition_point(|&p| p <= s);
+        k < calls.len() && calls[k] < e
+    };
+
     let mut order: Vec<usize> = (0..n).filter(|&v| iv[v].is_some()).collect();
     // By start; precoloured first on ties.
     order.sort_by_key(|&v| (iv[v].unwrap().0, !vc.fixed.contains_key(&VReg(v as u32)), v));
@@ -237,7 +254,16 @@ pub(crate) fn allocate(vc: &VCode) -> Allocation {
 
         let class = vc.classes[v];
         let mk = |i: u8| if class.is_xmm() { PReg::X(i) } else { PReg::G(i) };
-        let candidates: &[u8] = if class.is_xmm() { &XMM_ORDER } else { &GPR_ORDER };
+        let across = crosses_call(start, end);
+        if across && class.is_xmm() {
+            locs[v] = Loc::Slot(new_slot(start, end, &mut free_after));
+            continue;
+        }
+        let candidates: &[u8] = match (class.is_xmm(), across) {
+            (true, _) => &XMM_ORDER,
+            (false, false) => &GPR_ORDER,
+            (false, true) => &CALLEE_SAVED_ORDER,
+        };
         // Hint first: the register of the hinted vreg, if free now.
         let hinted = vc.hints.get(&VReg(v as u32)).and_then(|h| match locs[h.0 as usize] {
             Loc::Reg(r) if !held.contains_key(&r) && candidates.iter().any(|&c| mk(c) == r) => Some(r),
@@ -255,7 +281,9 @@ pub(crate) fn allocate(vc: &VCode) -> Allocation {
         let victim = active
             .iter()
             .filter(|&&(_, u)| {
-                vc.classes[u].is_xmm() == class.is_xmm() && !vc.fixed.contains_key(&VReg(u as u32))
+                vc.classes[u].is_xmm() == class.is_xmm()
+                    && !vc.fixed.contains_key(&VReg(u as u32))
+                    && matches!(locs[u], Loc::Reg(r) if candidates.iter().any(|&c| mk(c) == r))
             })
             .max_by_key(|&&(e, _)| e)
             .copied();

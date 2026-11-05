@@ -170,9 +170,6 @@ fn exported_symbol_name(func: &Function) -> String {
 /// Lower one function. Returns its machine code and the PC-map entries
 /// `(body offset, SPIR-V offset)`.
 fn emit_function(func: &Function) -> Result<(Vec<u8>, Vec<(u32, u32)>), BackendError> {
-    if func.stage == ShaderStage::Compute {
-        return unsupported("compute stage (phase 6)");
-    }
     let mut vc = vcode::lower(func)?;
     vcode::thread_jumps(&mut vc);
     vcode::dce(&mut vc);
@@ -219,3 +216,14 @@ pub fn roundtrip_check(code: &[u8]) -> Result<(), BackendError> {
     Ok(())
 }
 
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn barrier_slot_matches_runtime() {
+        assert_eq!(
+            crate::vcode::IMG_TABLE_BARRIER_OFFSET as usize,
+            atrium_spv_runtime::IMG_TABLE_BARRIER_OFFSET
+        );
+    }
+}

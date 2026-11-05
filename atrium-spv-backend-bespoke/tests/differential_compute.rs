@@ -40,6 +40,33 @@ fn link_to_shared_library(obj: &Path, out: &Path) -> Result<(), String> {
 /// pinned expected values check the x86_64 code.
 const HOST_HAS_BESPOKE: bool = cfg!(target_arch = "aarch64");
 
+/// Object for the "bespoke" side of a diff: the arm64 backend on aarch64,
+/// the x86_64 backend on x86_64 (falling back to Cranelift for shaders it
+/// returns Unsupported for, as atrium-spv-compile does; set
+/// ATRIUM_SPV_X86_COVERAGE=1 to list those), Cranelift elsewhere.
+fn bespoke_or_cranelift(module: &atrium_spv_ir::Module, use_bespoke: bool) -> Vec<u8> {
+    if use_bespoke && HOST_HAS_BESPOKE {
+        let t = if cfg!(target_os = "macos") {
+            BespokeTarget::Aarch64Darwin
+        } else { BespokeTarget::Aarch64FreeBSD };
+        return bespoke_compile(module, t).expect("bespoke compile").object;
+    }
+    if use_bespoke && cfg!(target_arch = "x86_64") {
+        use atrium_spv_backend_bespoke_x86 as x86;
+        match x86::compile(module, x86::Target::host()) {
+            Ok(o) => return o.object,
+            Err(x86::BackendError::Unsupported(m)) => {
+                if std::env::var_os("ATRIUM_SPV_X86_COVERAGE").is_some() {
+                    eprintln!("bespoke-x86 unsupported: {m}");
+                }
+            }
+            Err(e) => panic!("bespoke-x86: {e}"),
+        }
+    }
+    cranelift_compile(module, CraneliftTarget::host())
+        .expect("cranelift compile").object
+}
+
 type CsMain = unsafe extern "C" fn(
     *const u8, *const u8, *mut u8,
     u32, u32, u32, u32, u32, u32, *mut u8);
@@ -65,15 +92,7 @@ fn invoke_with_gids(spv: &[u8], use_bespoke: bool, dir: &Path, name: &str,
     // that declare no Workgroup-storage variables).
     let wg_bytes = module.functions.first()
         .map(|f| f.workgroup_size as usize).unwrap_or(0);
-    let obj = if use_bespoke && HOST_HAS_BESPOKE {
-        let t = if cfg!(target_os = "macos") {
-            BespokeTarget::Aarch64Darwin
-        } else { BespokeTarget::Aarch64FreeBSD };
-        bespoke_compile(&module, t).expect("bespoke compile").object
-    } else {
-        cranelift_compile(&module, CraneliftTarget::host())
-            .expect("cranelift compile").object
-    };
+    let obj = bespoke_or_cranelift(&module, use_bespoke);
     let obj_path = dir.join(format!("{name}.o"));
     std::fs::write(&obj_path, &obj).unwrap();
     let ext = if cfg!(target_os = "macos") { "dylib" } else { "so" };
@@ -2749,15 +2768,7 @@ fn lse_atomics_are_race_safe_under_concurrent_threads() {
     let module = translate(&spv).expect("frontend");
     // aarch64: bespoke's LSE atomics. x86_64: Cranelift's
     // LOCK-prefixed atomics, same race-safety bar.
-    let obj = if HOST_HAS_BESPOKE {
-        let target = if cfg!(target_os = "macos") {
-            BespokeTarget::Aarch64Darwin
-        } else { BespokeTarget::Aarch64FreeBSD };
-        bespoke_compile(&module, target).expect("compile").object
-    } else {
-        cranelift_compile(&module, CraneliftTarget::host())
-            .expect("cranelift compile").object
-    };
+    let obj = bespoke_or_cranelift(&module, true);
     let obj_path = dir.path().join("atomic_race.o");
     std::fs::write(&obj_path, &obj).unwrap();
     let ext = if cfg!(target_os = "macos") { "dylib" } else { "so" };
@@ -5082,15 +5093,7 @@ fn invoke_compute_image(
         atrium_img_read_3d_lod, atrium_img_write_3d_lod,
     };
     let module = translate(spv).expect("frontend");
-    let obj = if use_bespoke && HOST_HAS_BESPOKE {
-        let t = if cfg!(target_os = "macos") {
-            BespokeTarget::Aarch64Darwin
-        } else { BespokeTarget::Aarch64FreeBSD };
-        bespoke_compile(&module, t).expect("bespoke compile").object
-    } else {
-        cranelift_compile(&module, CraneliftTarget::host())
-            .expect("cranelift compile").object
-    };
+    let obj = bespoke_or_cranelift(&module, use_bespoke);
     let obj_path = dir.join(format!("{name}.o"));
     std::fs::write(&obj_path, &obj).unwrap();
     let ext = if cfg!(target_os = "macos") { "dylib" } else { "so" };
@@ -5802,15 +5805,7 @@ fn differential_storage_image_mip_lod_read_write() {
     let run_one = |use_bespoke: bool, name: &str| -> [f32; 2] {
         let dir = TempDir::new().unwrap();
         let module = translate(&spv).expect("frontend");
-        let obj = if use_bespoke && HOST_HAS_BESPOKE {
-            let t = if cfg!(target_os = "macos") {
-                BespokeTarget::Aarch64Darwin
-            } else { BespokeTarget::Aarch64FreeBSD };
-            bespoke_compile(&module, t).expect("bespoke compile").object
-        } else {
-            cranelift_compile(&module, CraneliftTarget::host())
-                .expect("cranelift compile").object
-        };
+        let obj = bespoke_or_cranelift(&module, use_bespoke);
         let obj_path = dir.path().join(format!("{name}.o"));
         std::fs::write(&obj_path, &obj).unwrap();
         let ext = if cfg!(target_os = "macos") { "dylib" } else { "so" };
@@ -6704,15 +6699,7 @@ fn differential_spec_constant_op() {
         let dir = TempDir::new().unwrap();
         let module = atrium_spv_frontend::translate_with_spec_overrides(
             &spv, &overrides).expect("frontend");
-        let obj = if use_bespoke && HOST_HAS_BESPOKE {
-            let t = if cfg!(target_os = "macos") {
-                BespokeTarget::Aarch64Darwin
-            } else { BespokeTarget::Aarch64FreeBSD };
-            bespoke_compile(&module, t).expect("bespoke compile").object
-        } else {
-            cranelift_compile(&module, CraneliftTarget::host())
-                .expect("cranelift compile").object
-        };
+        let obj = bespoke_or_cranelift(&module, use_bespoke);
         let obj_path = dir.path().join(format!("{name}.o"));
         std::fs::write(&obj_path, &obj).unwrap();
         let ext = if cfg!(target_os = "macos") { "dylib" } else { "so" };
@@ -6824,15 +6811,7 @@ fn differential_spec_constants_host_overrides() {
         let dir = TempDir::new().unwrap();
         let module = atrium_spv_frontend::translate_with_spec_overrides(
             &spv, &overrides).expect("frontend");
-        let obj = if use_bespoke && HOST_HAS_BESPOKE {
-            let t = if cfg!(target_os = "macos") {
-                BespokeTarget::Aarch64Darwin
-            } else { BespokeTarget::Aarch64FreeBSD };
-            bespoke_compile(&module, t).expect("bespoke compile").object
-        } else {
-            cranelift_compile(&module, CraneliftTarget::host())
-                .expect("cranelift compile").object
-        };
+        let obj = bespoke_or_cranelift(&module, use_bespoke);
         let obj_path = dir.path().join(format!("{name}.o"));
         std::fs::write(&obj_path, &obj).unwrap();
         let ext = if cfg!(target_os = "macos") { "dylib" } else { "so" };
@@ -8201,15 +8180,7 @@ fn differential_local_invocation_index_linearises() {
 fn invoke_cs_main_with_lids(spv: &[u8], use_bespoke: bool, dir: &Path, name: &str,
                             out_ptr: *mut u8, lids: &[(u32, u32, u32)]) {
     let module = translate(spv).expect("frontend");
-    let obj = if use_bespoke && HOST_HAS_BESPOKE {
-        let t = if cfg!(target_os = "macos") {
-            BespokeTarget::Aarch64Darwin
-        } else { BespokeTarget::Aarch64FreeBSD };
-        bespoke_compile(&module, t).expect("bespoke compile").object
-    } else {
-        cranelift_compile(&module, CraneliftTarget::host())
-            .expect("cranelift compile").object
-    };
+    let obj = bespoke_or_cranelift(&module, use_bespoke);
     let obj_path = dir.join(format!("{name}.o"));
     std::fs::write(&obj_path, &obj).unwrap();
     let ext = if cfg!(target_os = "macos") { "dylib" } else { "so" };

@@ -24,6 +24,8 @@ object              = { version = "0.36", features = ["write"] }
 thiserror           = "1"
 
 [dev-dependencies]
+atrium-spv-backend-bespoke-x86 = { path = "../atrium-spv-backend-bespoke-x86" }
+atrium-spv-ir                 = { path = "../atrium-spv-ir" }
 atrium-spv-frontend           = { path = "../atrium-spv-frontend" }
 atrium-spv-backend-cranelift  = { path = "../atrium-spv-backend-cranelift" }
 atrium-spv-runtime            = { path = "../atrium-spv-runtime" }

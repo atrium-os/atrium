@@ -21,6 +21,10 @@ use atrium_spv_ir::{
 
 use crate::{unsupported, BackendError};
 
+/// `atrium_spv_runtime::IMG_TABLE_BARRIER_OFFSET`: the image table's slot
+/// for the workgroup barrier function. Pinned by a unit test.
+pub(crate) const IMG_TABLE_BARRIER_OFFSET: i32 = 64;
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub(crate) struct VReg(pub u32);
 
@@ -76,6 +80,20 @@ pub(crate) struct Addr {
     pub off: i32,
 }
 
+impl Addr {
+    /// The GPR the base lives in, if it is a register-allocated vreg.
+    /// A spilled base is reloaded into r11, which is never a temporary.
+    pub fn base_reg(&self, locs: &[crate::regalloc::Loc]) -> Option<u8> {
+        match self.base {
+            Base::V(v) => match locs[v.0 as usize] {
+                crate::regalloc::Loc::Reg(PReg::G(r)) => Some(r),
+                _ => None,
+            },
+            Base::Locals => None,
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug)]
 pub(crate) enum XOp {
     Add,
@@ -111,6 +129,19 @@ impl GOp {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum AtomicOp {
+    Add,
+    And,
+    Or,
+    Xor,
+    SMin,
+    SMax,
+    UMin,
+    UMax,
+    Xchg,
+}
+
 #[derive(Clone, Copy, Debug)]
 pub(crate) enum ShiftOp {
     Shl,
@@ -123,6 +154,8 @@ pub(crate) enum GUnOp {
     Neg,
     Not,
     Lzcnt,
+    /// Bit reverse (bswap, then swap nibbles, pairs and bits).
+    Rbit,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -180,6 +213,17 @@ pub(crate) enum MInst {
     PtrAdd { d: VReg, base: Base, idx: VReg, stride: u32 },
     /// Load a 64-bit pointer.
     PLoad { d: VReg, addr: Addr },
+    /// 64-bit register move.
+    PMov { d: VReg, s: VReg },
+    /// `call [table + off]`, a runtime helper taking no arguments.
+    /// Clobbers every caller-saved register.
+    Call { table: VReg, off: i32 },
+    /// d = old *addr; *addr = op(old, v), atomically.
+    AtomicRmw { op: AtomicOp, d: VReg, addr: Addr, v: VReg },
+    /// d = old *addr; if old == expected { *addr = desired }, atomically.
+    AtomicCas { d: VReg, addr: Addr, expected: VReg, desired: VReg },
+    /// Sequentially consistent store.
+    AtomicStore { addr: Addr, s: VReg },
 
     XConst { d: VReg, bits: u32 },
     XMov { d: VReg, s: VReg },
@@ -230,6 +274,27 @@ impl MInst {
         match self {
             Mark(_) | Label(_) | Entry { .. } | StackArg { .. } | XConst { .. } | GConst { .. }
             | Jmp(_) | Ret => {}
+            PMov { s, .. } => out.push(*s),
+            Call { table, .. } => out.push(*table),
+            AtomicRmw { addr, v, .. } => {
+                if let Base::V(b) = addr.base {
+                    out.push(b);
+                }
+                out.push(*v);
+            }
+            AtomicCas { addr, expected, desired, .. } => {
+                if let Base::V(b) = addr.base {
+                    out.push(b);
+                }
+                out.push(*expected);
+                out.push(*desired);
+            }
+            AtomicStore { addr, s } => {
+                if let Base::V(b) = addr.base {
+                    out.push(b);
+                }
+                out.push(*s);
+            }
             PtrAdd { base, idx, .. } => {
                 if let Base::V(b) = base {
                     out.push(*b);
@@ -272,7 +337,12 @@ impl MInst {
         use MInst::*;
         match self {
             Entry { defs } => out.extend(defs.iter().copied()),
-            StackArg { d, .. } | PtrAdd { d, .. } | PLoad { d, .. } => out.push(*d),
+            StackArg { d, .. }
+            | PtrAdd { d, .. }
+            | PLoad { d, .. }
+            | PMov { d, .. }
+            | AtomicRmw { d, .. }
+            | AtomicCas { d, .. } => out.push(*d),
             XConst { d, .. }
             | XMov { d, .. }
             | XBin { d, .. }
@@ -298,6 +368,15 @@ impl MInst {
             | MovGToX { d, .. } => out.push(*d),
             _ => {}
         }
+    }
+
+    pub fn is_call(&self) -> bool {
+        matches!(self, MInst::Call { .. })
+    }
+
+    /// Has side effects beyond its result (kept by DCE).
+    pub fn has_effects(&self) -> bool {
+        matches!(self, MInst::Call { .. } | MInst::AtomicRmw { .. } | MInst::AtomicCas { .. })
     }
 
     pub fn targets(&self, out: &mut Vec<Label>) {
@@ -346,6 +425,16 @@ enum Arg {
     VsOutPosition,
     VsOutVaryings,
     VsSsboTable,
+    // CsMain(uniforms rdi (also the image table), push_constants rsi,
+    //        out_buffer rdx (SSBO, or SSBO table with >= 2 bindings),
+    //        workgroup_id ecx r8d r9d, local_id [8] [16] [24],
+    //        workgroup_buf [32])
+    CsUniforms,
+    CsPush,
+    CsOut,
+    CsWg(u8),
+    CsLid(u8),
+    CsWgBuf,
 }
 
 enum ArgSrc {
@@ -358,9 +447,12 @@ impl Arg {
     fn class(self) -> Class {
         match self {
             Arg::FsFragCoord(_) => Class::X,
-            Arg::FsFrontFacing | Arg::FsPrimitiveId | Arg::VsVertexIndex | Arg::VsInstanceIndex => {
-                Class::G
-            }
+            Arg::FsFrontFacing
+            | Arg::FsPrimitiveId
+            | Arg::VsVertexIndex
+            | Arg::VsInstanceIndex
+            | Arg::CsWg(_)
+            | Arg::CsLid(_) => Class::G,
             _ => Class::P,
         }
     }
@@ -384,6 +476,14 @@ impl Arg {
             Arg::VsOutPosition => Stack(8),
             Arg::VsOutVaryings => Stack(16),
             Arg::VsSsboTable => Stack(32),
+            Arg::CsUniforms => Reg(PReg::G(gpr::RDI)),
+            Arg::CsPush => Reg(PReg::G(gpr::RSI)),
+            Arg::CsOut => Reg(PReg::G(gpr::RDX)),
+            Arg::CsWg(0) => Reg(PReg::G(gpr::RCX)),
+            Arg::CsWg(1) => Reg(PReg::G(gpr::R8)),
+            Arg::CsWg(_) => Reg(PReg::G(gpr::R9)),
+            Arg::CsLid(i) => Stack(8 + 8 * i as i32),
+            Arg::CsWgBuf => Stack(32),
         }
     }
 }
@@ -409,9 +509,14 @@ struct Lower<'f> {
     lanes: HashMap<ValueId, Vec<VReg>>,
     ptrs: HashMap<ValueId, Ptr>,
     args: HashMap<Arg, VReg>,
+    /// Precoloured argument vregs, defined by Entry.
+    raw_args: Vec<VReg>,
     block_labels: HashMap<BlockId, Label>,
     num_labels: u32,
-    /// Stack-passed arguments, loaded right after the prologue.
+    /// Copies of register arguments into ordinary vregs, placed right
+    /// after the prologue.
+    arg_copies: Vec<MInst>,
+    /// Stack-passed arguments and other entry loads, after the copies.
     stack_args: Vec<MInst>,
     local_bytes: u32,
 }
@@ -486,8 +591,10 @@ pub(crate) fn lower(func: &Function) -> Result<VCode, BackendError> {
         lanes: HashMap::new(),
         ptrs: HashMap::new(),
         args: HashMap::new(),
+        raw_args: Vec::new(),
         block_labels: HashMap::new(),
         num_labels: 0,
+        arg_copies: Vec::new(),
         stack_args: Vec::new(),
         local_bytes: func.scratch_bytes,
     };
@@ -504,11 +611,10 @@ pub(crate) fn lower(func: &Function) -> Result<VCode, BackendError> {
             l.lower_inst(b, inst)?;
         }
     }
-    let mut defs: Vec<(Arg, VReg)> = l.args.iter().map(|(a, v)| (*a, *v)).collect();
-    defs.sort_by_key(|(_, v)| *v);
-    l.code[0] = MInst::Entry { defs: defs.iter().map(|(_, v)| *v).collect() };
-    let stack_args = std::mem::take(&mut l.stack_args);
-    l.code.splice(1..1, stack_args);
+    l.code[0] = MInst::Entry { defs: l.raw_args.clone() };
+    let mut entry = std::mem::take(&mut l.arg_copies);
+    entry.append(&mut l.stack_args);
+    l.code.splice(1..1, entry);
     Ok(VCode {
         insts: l.code,
         classes: l.classes,
@@ -539,7 +645,19 @@ impl<'f> Lower<'f> {
         let v = self.vreg(a.class());
         match a.src() {
             ArgSrc::Reg(r) => {
-                self.fixed.insert(v, r);
+                // The precoloured register lives only until this copy,
+                // so the value itself is free to move (to a callee-saved
+                // register across a call, say). The hint makes the copy
+                // vanish when it doesn't need to.
+                let raw = self.vreg(a.class());
+                self.fixed.insert(raw, r);
+                self.raw_args.push(raw);
+                self.hints.insert(v, raw);
+                self.arg_copies.push(match a.class() {
+                    Class::X => MInst::XMov { d: v, s: raw },
+                    Class::G => MInst::GMov { d: v, s: raw },
+                    Class::P => MInst::PMov { d: v, s: raw },
+                });
             }
             ArgSrc::Stack(off) => {
                 self.stack_args.push(MInst::StackArg { d: v, off, wide: a.class() == Class::P });
@@ -650,7 +768,27 @@ impl<'f> Lower<'f> {
                 }
                 other => unsupported(format!("vertex storage class {other:?}")),
             },
-            ShaderStage::Compute => unsupported("compute stage"),
+            ShaderStage::Compute => match sc {
+                StorageClass::Uniform => at(self, Arg::CsUniforms, 0),
+                StorageClass::PushConstant => at(self, Arg::CsPush, 0),
+                StorageClass::StorageBuffer if func.ssbo_bindings.len() >= 2 => {
+                    let Some(&(_set, binding)) = func.ssbo_bindings.get(&v.id.0) else {
+                        return unsupported("StorageBuffer without a binding");
+                    };
+                    let table = self.arg(Arg::CsOut);
+                    let d = self.vreg(Class::P);
+                    let off = i32::try_from(binding * 8)
+                        .map_err(|_| BackendError::Unsupported("binding".into()))?;
+                    self.stack_args.push(MInst::PLoad { d, addr: Addr { base: Base::V(table), off } });
+                    Ok(Ptr { base: Base::V(d), off: 0 })
+                }
+                StorageClass::StorageBuffer => at(self, Arg::CsOut, 0),
+                StorageClass::Workgroup => match func.workgroup_var_offset.get(&v.id) {
+                    Some(&off) => at(self, Arg::CsWgBuf, off),
+                    None => unsupported("Workgroup variable without an offset"),
+                },
+                other => unsupported(format!("compute storage class {other:?}")),
+            },
         }
     }
 
@@ -800,7 +938,8 @@ impl<'f> Lower<'f> {
         let overlap = moves.iter().any(|(d, s)| d != s && dsts.contains(s));
         let mv = |d: VReg, s: VReg, c: Class| match c {
             Class::X => MInst::XMov { d, s },
-            Class::G | Class::P => MInst::GMov { d, s },
+            Class::G => MInst::GMov { d, s },
+            Class::P => MInst::PMov { d, s },
         };
         if overlap {
             let mut temps = Vec::new();
@@ -946,6 +1085,7 @@ impl<'f> Lower<'f> {
                 self.hint_last(inst);
             }
             Op::Clz(a) => self.lanewise1(inst, a, Class::G, |d, a| M::GUn { op: GUnOp::Lzcnt, d, a })?,
+            Op::Rbit(a) => self.lanewise1(inst, a, Class::G, |d, a| M::GUn { op: GUnOp::Rbit, d, a })?,
 
             // ── comparisons ───────────────────────────────────────────
             Op::IEq(a, b) => self.icmp(inst, a, b, ICond::Eq)?,
@@ -1083,6 +1223,56 @@ impl<'f> Lower<'f> {
                         self.code.push(M::GConst { d, imm: 0 });
                         vec![d]
                     }
+                    (ShaderStage::Compute, BuiltinKind::WorkgroupId) => {
+                        (0..3).map(|i| self.arg(Arg::CsWg(i))).collect()
+                    }
+                    (ShaderStage::Compute, BuiltinKind::LocalInvocationId) => {
+                        (0..3).map(|i| self.arg(Arg::CsLid(i))).collect()
+                    }
+                    (ShaderStage::Compute, BuiltinKind::GlobalInvocationId) => {
+                        // WorkgroupId * LocalSize + LocalInvocationId.
+                        let ls = self.func.local_size.unwrap_or((1, 1, 1));
+                        let ls = [ls.0, ls.1, ls.2];
+                        let mut out = Vec::new();
+                        for i in 0..3 {
+                            let (wg, lid) = (self.arg(Arg::CsWg(i as u8)), self.arg(Arg::CsLid(i as u8)));
+                            let scaled = if ls[i] == 1 {
+                                wg
+                            } else {
+                                let c = self.gconst(ls[i] as i32);
+                                let m = self.vreg(Class::G);
+                                self.code.push(M::GBin { op: GOp::Mul, d: m, a: wg, b: c });
+                                m
+                            };
+                            let d = self.vreg(Class::G);
+                            self.code.push(M::GBin { op: GOp::Add, d, a: scaled, b: lid });
+                            out.push(d);
+                        }
+                        out
+                    }
+                    (ShaderStage::Compute, BuiltinKind::WorkgroupSize) => {
+                        let ls = self.func.local_size.unwrap_or((1, 1, 1));
+                        [ls.0, ls.1, ls.2].iter().map(|&v| self.gconst(v as i32)).collect()
+                    }
+                    (ShaderStage::Compute, BuiltinKind::LocalInvocationIndex) => {
+                        // lz * (sx * sy) + ly * sx + lx
+                        let ls = self.func.local_size.unwrap_or((1, 1, 1));
+                        let (lx, ly, lz) = (self.arg(Arg::CsLid(0)), self.arg(Arg::CsLid(1)), self.arg(Arg::CsLid(2)));
+                        let mut terms = vec![lx];
+                        for (l, scale) in [(ly, ls.0), (lz, ls.0.saturating_mul(ls.1))] {
+                            let c = self.gconst(scale as i32);
+                            let m = self.vreg(Class::G);
+                            self.code.push(M::GBin { op: GOp::Mul, d: m, a: l, b: c });
+                            terms.push(m);
+                        }
+                        let mut acc = terms[0];
+                        for &t in &terms[1..] {
+                            let d = self.vreg(Class::G);
+                            self.code.push(M::GBin { op: GOp::Add, d, a: acc, b: t });
+                            acc = d;
+                        }
+                        vec![acc]
+                    }
                     (s, k) => return unsupported(format!("LoadBuiltin({k:?}) in {s:?}")),
                 };
                 self.lanes.insert(res.id, regs);
@@ -1162,6 +1352,58 @@ impl<'f> Lower<'f> {
                 self.lanes.insert(res.id, out);
             }
 
+            // ── compute: atomics and barriers ─────────────────────────
+            Op::Barrier => {
+                if self.func.stage != ShaderStage::Compute {
+                    return unsupported("Barrier outside compute");
+                }
+                // The image table (the uniforms argument) holds the
+                // runtime's barrier function at IMG_TABLE_BARRIER_OFFSET.
+                let table = self.arg(Arg::CsUniforms);
+                self.code.push(M::Call { table, off: IMG_TABLE_BARRIER_OFFSET });
+            }
+            Op::AtomicLoad(ptr) => {
+                let res = Self::result(inst)?;
+                let p = self.ptr_of(ptr)?;
+                let d = self.define(res)?;
+                if d.len() != 1 || self.class_of(d[0]) != Class::G {
+                    return unsupported("AtomicLoad type");
+                }
+                self.load_lanes(p, &d);
+            }
+            Op::AtomicStore { ptr, value } => {
+                let p = self.ptr_of(ptr)?;
+                let s = self.lanes_of(value)?;
+                if s.len() != 1 || self.class_of(s[0]) != Class::G {
+                    return unsupported("AtomicStore type");
+                }
+                self.code.push(M::AtomicStore { addr: Addr { base: p.base, off: p.off }, s: s[0] });
+            }
+            Op::AtomicIAdd { ptr, value } => self.atomic(inst, ptr, value, AtomicOp::Add)?,
+            Op::AtomicAnd { ptr, value } => self.atomic(inst, ptr, value, AtomicOp::And)?,
+            Op::AtomicOr { ptr, value } => self.atomic(inst, ptr, value, AtomicOp::Or)?,
+            Op::AtomicXor { ptr, value } => self.atomic(inst, ptr, value, AtomicOp::Xor)?,
+            Op::AtomicSMin { ptr, value } => self.atomic(inst, ptr, value, AtomicOp::SMin)?,
+            Op::AtomicSMax { ptr, value } => self.atomic(inst, ptr, value, AtomicOp::SMax)?,
+            Op::AtomicUMin { ptr, value } => self.atomic(inst, ptr, value, AtomicOp::UMin)?,
+            Op::AtomicUMax { ptr, value } => self.atomic(inst, ptr, value, AtomicOp::UMax)?,
+            Op::AtomicExchange { ptr, value } => self.atomic(inst, ptr, value, AtomicOp::Xchg)?,
+            Op::AtomicCompareExchange { ptr, expected, desired } => {
+                let res = Self::result(inst)?;
+                let p = self.ptr_of(ptr)?;
+                let (e, w) = (self.lanes_of(expected)?, self.lanes_of(desired)?);
+                let d = self.define(res)?;
+                if [&e, &w, &d].iter().any(|l| l.len() != 1 || self.class_of(l[0]) != Class::G) {
+                    return unsupported("AtomicCompareExchange type");
+                }
+                self.code.push(M::AtomicCas {
+                    d: d[0],
+                    addr: Addr { base: p.base, off: p.off },
+                    expected: e[0],
+                    desired: w[0],
+                });
+            }
+
             // ── control flow ──────────────────────────────────────────
             Op::Phi(_) => {
                 // Destinations are written by the edge copies.
@@ -1224,6 +1466,24 @@ impl<'f> Lower<'f> {
 
             other => return unsupported(op_name(other)),
         }
+        Ok(())
+    }
+
+    fn gconst(&mut self, imm: i32) -> VReg {
+        let d = self.vreg(Class::G);
+        self.code.push(MInst::GConst { d, imm });
+        d
+    }
+
+    fn atomic(&mut self, inst: &Inst, ptr: &Value, value: &Value, op: AtomicOp) -> Result<(), BackendError> {
+        let res = Self::result(inst)?;
+        let p = self.ptr_of(ptr)?;
+        let v = self.lanes_of(value)?;
+        let d = self.define(res)?;
+        if v.len() != 1 || d.len() != 1 || self.class_of(v[0]) != Class::G || self.class_of(d[0]) != Class::G {
+            return unsupported(format!("{} type", op_name(&inst.op)));
+        }
+        self.code.push(MInst::AtomicRmw { op, d: d[0], addr: Addr { base: p.base, off: p.off }, v: v[0] });
         Ok(())
     }
 
@@ -1337,7 +1597,7 @@ pub(crate) fn dce(vc: &mut VCode) {
             }
             let mut defs = Vec::new();
             inst.defs(&mut defs);
-            defs.is_empty() || defs.iter().any(|v| used[v.0 as usize])
+            defs.is_empty() || inst.has_effects() || defs.iter().any(|v| used[v.0 as usize])
         });
         if vc.insts.len() == before {
             break;
