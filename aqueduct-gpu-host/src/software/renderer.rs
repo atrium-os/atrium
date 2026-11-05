@@ -317,7 +317,10 @@ impl PathOpParams {
         ) as usize;
         // bytes[24..28] reserved
 
-        let mut commands = Vec::with_capacity(command_count);
+        // command_count comes off the wire: every command takes at
+        // least one byte, so the body length bounds the capacity.
+        let mut commands = Vec::with_capacity(
+            command_count.min(bytes.len().saturating_sub(Self::HEADER_LEN)));
         let mut cursor = Self::HEADER_LEN;
         for _ in 0..command_count {
             if cursor >= bytes.len() {

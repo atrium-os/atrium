@@ -2155,3 +2155,35 @@ fn tier2_backend_scanout_nested_squares_via_scissor() {
     let bg = px(1, 1);
     assert!(bg[0] < 40 && bg[1] < 40 && bg[2] < 40, "corner should be dark clear, got {bg:?}");
 }
+
+/// Wire sizes are capped: a hostile client can't make the host
+/// allocate without bound (docs/spec/tier2-robust-access.md §4).
+#[test]
+fn tier2_backend_refuses_oversized_images() {
+    let cache_dir = TempDir::new().unwrap();
+    let registry = Arc::new(Tier2Registry::new(LoaderConfig {
+        cache_root: cache_dir.path().to_path_buf(),
+        abi_version: atrium_spv_ir::TIER2_SHADER_ABI_VERSION,
+        compile_binary: locate_compile_binary(),
+    }));
+    let backend = Tier2Backend::new(registry);
+    let id = |n| ResourceId::new(IdNamespace::IcdRuntime, n);
+    // 16K x 16K x 4 billion layers would be ~4 EiB.
+    backend.image_created_layered(id(0x3000), 16384, 16384, u32::MAX);
+    assert!(backend.read_image_pixels(id(0x3000)).is_none());
+    // Within each per-axis cap but over the per-image byte cap.
+    backend.image_created_layered(id(0x3001), 16384, 16384, 8);
+    assert!(backend.read_image_pixels(id(0x3001)).is_none());
+    backend.image_created_layered(id(0x3002), 64, 64, 4);
+    assert!(backend.read_image_pixels(id(0x3002)).is_some());
+}
+
+/// A path op whose command count says 4 billion but whose body holds
+/// none fails to decode instead of reserving ~100 GiB.
+#[test]
+fn tier1_path_with_huge_command_count_is_rejected() {
+    use aqueduct_gpu_host::software::PathOpParams;
+    let mut b = vec![0u8; PathOpParams::HEADER_LEN];
+    b[20..24].copy_from_slice(&u32::MAX.to_le_bytes());
+    assert!(PathOpParams::from_bytes(&b).is_err());
+}

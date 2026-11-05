@@ -1641,7 +1641,8 @@ impl Tier2Backend {
                     if body.len() >= 4 {
                         let count = u32::from_le_bytes(
                             body[0..4].try_into().unwrap()) as usize;
-                        let mut ids = Vec::with_capacity(count);
+                        let mut ids = Vec::with_capacity(
+                            count.min((body.len() - 4) / 4));
                         for i in 0..count {
                             let off = 4 + i * 4;
                             if off + 4 > body.len() { break; }
@@ -3566,6 +3567,14 @@ impl Tier2Backend {
             // image_subresource (16 B): aspect_mask + mip_level
             // + base_array_layer + layer_count.
             let mip_level = u32::from_le_bytes(region[20..24].try_into().unwrap());
+            // A 16K image has 15 levels; anything past the image's own
+            // chain would make the lazy mip allocation below push
+            // billions of levels.
+            if mip_level > 31 - base_w.max(base_h).max(1).leading_zeros() {
+                log::warn!("CopyBufToImg: region {r} mip level {mip_level} \
+                            past the image's mip chain");
+                continue;
+            }
             let base_array_layer = u32::from_le_bytes(region[24..28].try_into().unwrap());
             let img_x = i32::from_le_bytes(region[32..36].try_into().unwrap()).max(0) as u32;
             let img_y = i32::from_le_bytes(region[36..40].try_into().unwrap()).max(0) as u32;
@@ -4101,8 +4110,19 @@ impl Backend for Tier2Backend {
     ) {
         if width == 0 || height == 0 { return; }
         const MAX_DIM: u32 = 16 * 1024;
-        if width > MAX_DIM || height > MAX_DIM { return; }
+        // Vulkan's typical maxImageArrayLayers, and a 1 GiB ceiling on
+        // one image (16-byte texels included) so a client can't make
+        // the host allocate without bound.
+        const MAX_LAYERS: u32 = 2048;
+        const MAX_IMAGE_BYTES: u64 = 1 << 30;
         let layers = array_layers.max(1);
+        if width > MAX_DIM || height > MAX_DIM || layers > MAX_LAYERS
+            || width as u64 * height as u64 * 16 * layers as u64 > MAX_IMAGE_BYTES
+        {
+            log::warn!("Tier2Backend: image {image_id} {width}x{height}x{layers} \
+                        exceeds the size caps");
+            return;
+        }
         let pixels = vec![0u8;
             (width as usize) * (height as usize) * 4 * (layers as usize)];
         self.images.lock().unwrap().insert(image_id.raw() as u64, ImageStorage {
