@@ -364,6 +364,13 @@ only to validate `tmpfs` requests against `kind`.
 
 - `provision`: returns a sentinel host_path ("tmpfs::<jail>/<vol>");
   jaild interprets this in its mount path.
+- `mode`, `owner_uid`, `owner_gid` reach jaild as the mount's `owner`
+  (`MountSpec.owner`, tmpfs(4)'s `mode`/`uid`/`gid` options), so a non-root
+  service can write its own tmpfs. Until 2026-11-05 they were dropped and
+  every tmpfs volume was root:wheel 0755. jaild takes an owner of root or
+  the jail's own exec uid/gid only, permission bits only (no setuid/setgid),
+  and a world-writable mode only with the sticky bit; a runtime attach
+  takes root only.
 - `destroy`: nothing.
 - `snapshot`: `Unsupported`.
 - `features`: `[]`.

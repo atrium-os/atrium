@@ -464,6 +464,7 @@ fn handle_attach_mount(
         dest:    req.dest.clone(),
         kind:    req.mount_kind,
         size_mb: req.size_mb,
+        owner: None,
     };
     if let Err(e) = validator::validate_mount_for_runtime(policy, &mount) {
         return match e {
@@ -513,7 +514,7 @@ fn handle_attach_mount(
         MountKind::RoNullfs => ffi::nullfs_mount(&req.source, &host_dest_str, true),
         MountKind::RwNullfs => ffi::nullfs_mount(&req.source, &host_dest_str, false),
         MountKind::Tmpfs    => ffi::tmpfs_mount(
-            &host_dest_str, req.size_mb.unwrap_or(policy.mount_sources.max_tmpfs_mb)),
+            &host_dest_str, req.size_mb.unwrap_or(policy.mount_sources.max_tmpfs_mb), None),
     };
     if let Err(e) = mount_res {
         return Response::SyscallFailed {
@@ -1199,7 +1200,7 @@ fn handle_create_with_exec(
     // ★ The effective tmpfs size is resolved HERE, in the parent, from the
     // policy the request was validated against — the child only has the
     // request, and must not decide a resource ceiling on its own.
-    let resolved_mounts: Vec<(String, String, MountKind, u64)> = req.mounts.iter()
+    let resolved_mounts: Vec<(String, String, MountKind, u64, Option<crate::protocol::TmpfsOwner>)> = req.mounts.iter()
         .map(|m| {
             /* ALWAYS under the jail root. A leading '/' used to mean a
              * HOST path, so a real-root jail's capability socket mount
@@ -1213,7 +1214,7 @@ fn handle_create_with_exec(
              * this way; create time now matches it. */
             let dest = PathBuf::from(&req.path).join(m.dest.trim_start_matches('/'));
             (m.source.clone(), dest.to_string_lossy().into_owned(), m.kind,
-             m.size_mb.unwrap_or(tmpfs_ceiling))
+             m.size_mb.unwrap_or(tmpfs_ceiling), m.owner)
         })
         .collect();
 
@@ -1246,7 +1247,7 @@ fn handle_create_with_exec(
             }
         }
 
-        for (src, dst, kind, size_mb) in &resolved_mounts {
+        for (src, dst, kind, size_mb, owner) in &resolved_mounts {
             /* nullfs / tmpfs need the destination dir to exist —
              * otherwise mount(2) returns ENOENT. We create it
              * pre-jail_attach with mode 0755 (the mount overlays
@@ -1261,7 +1262,7 @@ fn handle_create_with_exec(
             let res = match kind {
                 MountKind::RoNullfs => ffi::nullfs_mount(src, dst, true),
                 MountKind::RwNullfs => ffi::nullfs_mount(src, dst, false),
-                MountKind::Tmpfs    => ffi::tmpfs_mount(dst, *size_mb),
+                MountKind::Tmpfs    => ffi::tmpfs_mount(dst, *size_mb, *owner),
             };
             if let Err(e) = res {
                 eprintln!("jaild-child: mount {kind:?} {src} -> {dst}: {e}");

@@ -318,6 +318,20 @@ pub struct MountSpec {
     /// nullfs, which has no size of its own.
     #[serde(default)]
     pub size_mb: Option<u64>,
+    /// tmpfs only: the root directory's mode and owner. `None` is root:wheel
+    /// 0755 (tmpfs's default), which a non-root service cannot write. jaild
+    /// takes only the jail's own exec uid/gid (or root) and no setuid,
+    /// setgid or sticky-less world-writable mode. Ignored for nullfs.
+    #[serde(default)]
+    pub owner: Option<TmpfsOwner>,
+}
+
+/// A tmpfs mount's root: `mode` (permission bits only), `uid`, `gid`.
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq)]
+pub struct TmpfsOwner {
+    pub mode: u32,
+    pub uid:  u32,
+    pub gid:  u32,
 }
 
 #[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq)]

@@ -31,6 +31,7 @@ pub fn validate_create(
     validate_network(&req.network, &req.name, policy)?;
     for m in &req.mounts {
         validate_mount(m, policy)?;
+        validate_tmpfs_owner(m, req.exec.as_ref())?;
     }
     if let Some(exec) = &req.exec {
         validate_exec(exec, policy, is_instance_root(req, policy))?;
@@ -281,10 +282,37 @@ fn validate_children_max(n: u32, policy: &Policy) -> Result<(), JaildError> {
     Ok(())
 }
 
+/// A tmpfs mount's owner may be root or the jail's own exec uid/gid, nothing
+/// else: a manifest must not hand a scratch directory to some other account.
+/// The mode is permission bits only (no setuid/setgid), and a world-writable
+/// one must be sticky, as /tmp is.
+fn validate_tmpfs_owner(m: &MountSpec, exec: Option<&ExecSpec>) -> Result<(), JaildError> {
+    let Some(o) = m.owner else { return Ok(()) };
+    let bad = |rule: &'static str, detail: String| Err(JaildError::PolicyViolation { rule, detail });
+    if m.kind != MountKind::Tmpfs {
+        return bad("mount.owner.not_tmpfs", format!("{:?} at {:?}: only a tmpfs takes an owner", m.kind, m.dest));
+    }
+    if o.mode & !0o1777 != 0 {
+        return bad("mount.tmpfs.mode", format!("tmpfs at {:?}: mode {:o} has bits beyond 1777", m.dest, o.mode));
+    }
+    if o.mode & 0o002 != 0 && o.mode & 0o1000 == 0 {
+        return bad("mount.tmpfs.mode", format!("tmpfs at {:?}: mode {:o} is world-writable but not sticky", m.dest, o.mode));
+    }
+    let (uid, gid) = exec.map(|e| (e.uid, e.gid)).unwrap_or((0, 0));
+    if o.uid != 0 && o.uid != uid {
+        return bad("mount.tmpfs.owner", format!("tmpfs at {:?}: owner uid {} is neither root nor the jail's uid {uid}", m.dest, o.uid));
+    }
+    if o.gid != 0 && o.gid != gid {
+        return bad("mount.tmpfs.owner", format!("tmpfs at {:?}: group {} is neither wheel nor the jail's gid {gid}", m.dest, o.gid));
+    }
+    Ok(())
+}
+
 /// Public re-export so AttachMount handlers can validate a single
 /// runtime mount against the same allow-list used at create time.
 pub fn validate_mount_for_runtime(policy: &Policy, m: &MountSpec) -> Result<(), JaildError> {
-    validate_mount(m, policy)
+    validate_mount(m, policy)?;
+    validate_tmpfs_owner(m, None)
 }
 
 fn validate_mount(m: &MountSpec, policy: &Policy) -> Result<(), JaildError> {
@@ -779,6 +807,7 @@ mod tests {
             dest:   "usr/local/lib".into(),
             kind:   MountKind::RoNullfs,
             size_mb: None,
+            owner: None,
         });
         validate_create(&r, &p).unwrap();
     }
@@ -792,6 +821,7 @@ mod tests {
             dest:   "etc".into(),
             kind:   MountKind::RoNullfs,
             size_mb: None,
+            owner: None,
         });
         let err = validate_create(&r, &p).unwrap_err();
         match err {
@@ -809,6 +839,7 @@ mod tests {
             dest:   "../escape".into(),
             kind:   MountKind::RoNullfs,
             size_mb: None,
+            owner: None,
         });
         let err = validate_create(&r, &p).unwrap_err();
         assert!(matches!(err,
@@ -824,6 +855,7 @@ mod tests {
             dest:   "tmp".into(),
             kind:   MountKind::Tmpfs,
             size_mb: None,
+            owner: None,
         });
         validate_create(&r, &p).unwrap();
     }
@@ -838,6 +870,7 @@ mod tests {
             dest:   "var/db/mysql".into(),
             kind:   MountKind::RwNullfs,
             size_mb: None,
+            owner: None,
         });
         validate_create(&r, &p).unwrap();
 
@@ -848,6 +881,7 @@ mod tests {
             dest:   "x".into(),
             kind:   MountKind::RwNullfs,
             size_mb: None,
+            owner: None,
         });
         assert!(validate_create(&r2, &p).is_err());
     }
@@ -861,6 +895,7 @@ mod tests {
             dest:   "home/girivs".into(),
             kind:   MountKind::RwNullfs,
             size_mb: None,
+            owner: None,
         });
         validate_create(&r, &p).unwrap();
     }
@@ -1150,7 +1185,54 @@ mod tests {
 
     fn tmpfs(size_mb: Option<u64>) -> MountSpec {
         MountSpec { source: "tmpfs".into(), dest: "tmp".into(),
-                    kind: MountKind::Tmpfs, size_mb }
+                    kind: MountKind::Tmpfs, size_mb, owner: None }
+    }
+
+    fn owned_tmpfs(mode: u32, uid: u32, gid: u32) -> MountSpec {
+        MountSpec { owner: Some(crate::protocol::TmpfsOwner { mode, uid, gid }), ..tmpfs(None) }
+    }
+
+    /// A service's tmpfs may belong to the service (or root), so a non-root
+    /// service can write its own scratch; never to another account.
+    #[test]
+    fn a_tmpfs_belongs_to_root_or_the_jails_own_uid() {
+        let p = load_sample_policy();
+        for (m, ok) in [
+            (owned_tmpfs(0o700, 1001, 1001), true),
+            (owned_tmpfs(0o1777, 0, 0), true),
+            (owned_tmpfs(0o700, 1002, 1001), false),
+            (owned_tmpfs(0o700, 1001, 5), false),
+        ] {
+            let mut r = exec_as(1001, 1001);
+            r.mounts = vec![m.clone()];
+            assert_eq!(validate_create(&r, &p).is_ok(), ok, "{m:?}");
+        }
+        // No exec, or a runtime attach: only root.
+        assert!(validate_mount_for_runtime(&p, &owned_tmpfs(0o700, 1001, 1001)).is_err());
+        validate_mount_for_runtime(&p, &owned_tmpfs(0o755, 0, 0)).expect("root-owned");
+    }
+
+    /// Permission bits only, and world-writable means sticky, as /tmp is.
+    #[test]
+    fn a_tmpfs_mode_has_no_setid_bits_and_world_write_is_sticky() {
+        let p = load_sample_policy();
+        for mode in [0o4700, 0o2700, 0o777, 0o10700] {
+            let mut r = exec_as(1001, 1001);
+            r.mounts = vec![owned_tmpfs(mode, 1001, 1001)];
+            let err = validate_create(&r, &p).unwrap_err();
+            assert!(matches!(err, JaildError::PolicyViolation { rule: "mount.tmpfs.mode", .. }), "{mode:o}: {err:?}");
+        }
+    }
+
+    /// An owner on a nullfs mount means nothing, so it is refused.
+    #[test]
+    fn only_a_tmpfs_takes_an_owner() {
+        let p = load_sample_policy();
+        let mut r = exec_as(1001, 1001);
+        r.mounts = vec![MountSpec { source: "/lib".into(), dest: "lib".into(), kind: MountKind::RoNullfs,
+                                    size_mb: None, owner: Some(crate::protocol::TmpfsOwner { mode: 0o755, uid: 0, gid: 0 }) }];
+        assert!(matches!(validate_create(&r, &p).unwrap_err(),
+            JaildError::PolicyViolation { rule: "mount.owner.not_tmpfs", .. }));
     }
 
     /// ★★ tmpfs is RAM, and had no check at all. A per-jail rctl does not

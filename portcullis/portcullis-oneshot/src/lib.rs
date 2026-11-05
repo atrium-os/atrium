@@ -478,6 +478,7 @@ fn jaild_mounts(jc: &portcullis_jail::JailConfig, root: &Path)
             dest:    format!("/{}", rel.display()),
             kind:    if m.opts.iter().any(|o| o == "ro") { MountKind::RoNullfs } else { MountKind::RwNullfs },
             size_mb: None,
+            owner: None,
         })
     }).collect()
 }

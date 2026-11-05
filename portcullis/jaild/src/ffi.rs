@@ -598,41 +598,30 @@ pub fn nullfs_mount(source: &str, target: &str, read_only: bool) -> io::Result<(
 /// Apply a tmpfs mount of `size_mb` MiB at `target`. ★ Always sized: see
 /// `MountKind::Tmpfs`.
 #[cfg(target_os = "freebsd")]
-pub fn tmpfs_mount(target: &str, size_mb: u64) -> io::Result<()> {
-    let c_fstype = c_string("tmpfs")?;
-    let c_fspath = c_string(target)?;
-    let c_size   = c_string(&format!("{size_mb}m"))?;
-
-    let key_fstype = c_string("fstype")?;
-    let key_fspath = c_string("fspath")?;
-    let key_size   = c_string("size")?;
-
-    let mut iov: [libc::iovec; 6] = [libc::iovec {
-        iov_base: std::ptr::null_mut(),
-        iov_len:  0,
-    }; 6];
-
-    // SAFETY: each iov_base points into a CString that outlives nmount.
-    unsafe {
-        iov[0].iov_base = key_fstype.as_ptr() as *mut _;
-        iov[0].iov_len  = key_fstype.as_bytes_with_nul().len();
-        iov[1].iov_base = c_fstype.as_ptr() as *mut _;
-        iov[1].iov_len  = c_fstype.as_bytes_with_nul().len();
-
-        iov[2].iov_base = key_fspath.as_ptr() as *mut _;
-        iov[2].iov_len  = key_fspath.as_bytes_with_nul().len();
-        iov[3].iov_base = c_fspath.as_ptr() as *mut _;
-        iov[3].iov_len  = c_fspath.as_bytes_with_nul().len();
-
-        iov[4].iov_base = key_size.as_ptr() as *mut _;
-        iov[4].iov_len  = key_size.as_bytes_with_nul().len();
-        iov[5].iov_base = c_size.as_ptr() as *mut _;
-        iov[5].iov_len  = c_size.as_bytes_with_nul().len();
-
-        let rc = libc::nmount(iov.as_mut_ptr(), iov.len() as u32, 0);
-        if rc < 0 {
-            return Err(io::Error::last_os_error());
-        }
+pub fn tmpfs_mount(target: &str, size_mb: u64, owner: Option<crate::protocol::TmpfsOwner>) -> io::Result<()> {
+    let mut opts: Vec<(&str, String)> = vec![
+        ("fstype", "tmpfs".into()),
+        ("fspath", target.into()),
+        ("size", format!("{size_mb}m")),
+    ];
+    if let Some(o) = owner {
+        // tmpfs(4) takes the root's mode (octal) and owner as mount options.
+        opts.push(("mode", format!("{:o}", o.mode)));
+        opts.push(("uid", o.uid.to_string()));
+        opts.push(("gid", o.gid.to_string()));
+    }
+    let strs: Vec<std::ffi::CString> = opts
+        .iter()
+        .flat_map(|(k, v)| [c_string(k), c_string(v)])
+        .collect::<io::Result<_>>()?;
+    let mut iov: Vec<libc::iovec> = strs
+        .iter()
+        .map(|c| libc::iovec { iov_base: c.as_ptr() as *mut _, iov_len: c.as_bytes_with_nul().len() })
+        .collect();
+    // SAFETY: each iov_base points into a CString in `strs`, which outlives nmount.
+    let rc = unsafe { libc::nmount(iov.as_mut_ptr(), iov.len() as u32, 0) };
+    if rc < 0 {
+        return Err(io::Error::last_os_error());
     }
     Ok(())
 }
@@ -709,7 +698,7 @@ pub fn nullfs_mount(_s: &str, _t: &str, _ro: bool) -> io::Result<()> {
     Err(io::Error::new(io::ErrorKind::Unsupported, "nmount: FreeBSD only"))
 }
 #[cfg(not(target_os = "freebsd"))]
-pub fn tmpfs_mount(_t: &str, _size_mb: u64) -> io::Result<()> {
+pub fn tmpfs_mount(_t: &str, _size_mb: u64, _owner: Option<crate::protocol::TmpfsOwner>) -> io::Result<()> {
     Err(io::Error::new(io::ErrorKind::Unsupported, "nmount: FreeBSD only"))
 }
 #[cfg(not(target_os = "freebsd"))]

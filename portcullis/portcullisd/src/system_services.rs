@@ -450,6 +450,7 @@ impl ServiceManifest {
                 dest:   m.dest.clone(),
                 kind:   m.kind.into(),
                 size_mb: None,
+                owner: None,
             }).collect(),
             exec: self.exec.as_ref().map(|e| ExecSpec {
                 path: e.path.clone(),

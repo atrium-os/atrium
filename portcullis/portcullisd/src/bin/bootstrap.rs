@@ -29,7 +29,7 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 use std::time::Duration;
 
-use jaild::protocol::{EnvPair, ExecSpec, MountKind, MountSpec, Request, Response};
+use jaild::protocol::{EnvPair, ExecSpec, MountKind, MountSpec, Request, Response, TmpfsOwner};
 use log::{error, info, warn};
 use portcullisd::host_mount;
 use portcullisd::init_phase::{self, InitOutcome};
@@ -398,6 +398,7 @@ fn capability_mounts(m: &ServiceManifest) -> Vec<MountSpec> {
             dest:   "/atrium/sockets/portcullisd/".into(),
             kind:   MountKind::RoNullfs,
             size_mb: None,
+            owner: None,
         });
     }
     out
@@ -428,6 +429,9 @@ fn resolve_volumes(
                     // all of RAM. A per-volume `size_mb` in the manifest is
                     // the natural next step once a service needs less.
                     size_mb: None,
+                    // The manifest's mode and owner: the service's own
+                    // uid, so a non-root service can write its scratch.
+                    owner: Some(TmpfsOwner { mode: v.mode, uid: v.owner_uid, gid: v.owner_gid }),
                 });
             }
             ManifestVolumeKind::Persistent => {
@@ -463,6 +467,7 @@ fn resolve_volumes(
                     dest:   v.mount_at.clone(),
                     kind:   MountKind::RwNullfs,
                     size_mb: None,
+                    owner: None,
                 });
                 host_paths.push((v.name.clone(), host_path));
             }
