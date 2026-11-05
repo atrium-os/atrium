@@ -41,12 +41,15 @@
  * shared softc as sc->display_state. Guarded by sc->lock.
  *   sink         the monitor as last probed (raw EDID and its modes)
  *   sink_gen     sc->display_conn_gen when it was probed (0 = never)
+ *   sink_epoch   bumped by display_sink_invalidate: a probe that began
+ *                before it is not cached
  *   timing       the timing of the lit mode, re-applied after a device reset
  *   vrr_min_hz   its variable refresh floor (0 = fixed refresh), ditto
  */
 struct atrium_amd_display_state {
 	struct atrium_display_sink	sink;
 	uint32_t			sink_gen;
+	uint32_t			sink_epoch;
 	struct atrium_display_timing	timing;
 	int				timing_valid;
 	uint32_t			vrr_min_hz;
@@ -187,7 +190,7 @@ static uint32_t
 display_sink_get(struct atrium_amd_softc *sc, struct atrium_display_sink *out)
 {
 	struct atrium_amd_display_state *ds = sc->display_state;
-	uint32_t gen;
+	uint32_t gen, epoch;
 
 	mtx_lock(&sc->lock);
 	gen = sc->display_conn_gen;
@@ -196,15 +199,31 @@ display_sink_get(struct atrium_amd_softc *sc, struct atrium_display_sink *out)
 		mtx_unlock(&sc->lock);
 		return (gen);
 	}
+	epoch = ds->sink_epoch;
 	mtx_unlock(&sc->lock);
 	(void)atrium_display_probe_sink(&amd_display_hw_ops, sc, out);
 	mtx_lock(&sc->lock);
-	if (sc->display_conn_gen == gen) {
+	if (sc->display_conn_gen == gen && ds->sink_epoch == epoch) {
 		ds->sink = *out;
 		ds->sink_gen = gen;
 	}
 	mtx_unlock(&sc->lock);
 	return (gen);
+}
+
+/*
+ * The kernel itself just changed the monitor (the simulator's CONFIG, USB-C
+ * and sim_plug knobs): probe it afresh on the next use rather than wait for
+ * the hotplug interrupt to say so, which may land after the caller's next
+ * ioctl. The generation is left to the interrupt.
+ */
+static void
+display_sink_invalidate(struct atrium_amd_softc *sc)
+{
+	mtx_lock(&sc->lock);
+	sc->display_state->sink_gen = 0;
+	sc->display_state->sink_epoch++;
+	mtx_unlock(&sc->lock);
 }
 
 /*
@@ -902,6 +921,7 @@ display_sim_plug_sysctl(SYSCTL_HANDLER_ARGS)
 		amd_mmio_write32(sc, regDISP_CFG_PLUG_MODE, mode);
 	else
 		return (EINVAL);
+	display_sink_invalidate(sc);
 	return (0);
 }
 
@@ -1276,6 +1296,7 @@ display_ioctl(struct cdev *cdev, u_long cmd, caddr_t data, int fflag,
 			amd_mmio_write32(sc, regDISP_CFG_UNPLUG, 1);
 		else
 			amd_mmio_write32(sc, regDISP_CFG_PLUG_MODE, c->plug_mode);
+		display_sink_invalidate(sc);
 		return (0);
 	}
 
@@ -1284,6 +1305,7 @@ display_ioctl(struct cdev *cdev, u_long cmd, caddr_t data, int fflag,
 		    (struct atrium_display_usbc *)data;
 
 		amd_mmio_write32(sc, regDISP_CFG_USBC, u->lanes);
+		display_sink_invalidate(sc);
 		return (0);
 	}
 
