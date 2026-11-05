@@ -614,6 +614,8 @@ break4(void)
 	c.pitch = 256;	/* a row shorter than 640 pixels */
 	err = ioctl(dfd, ATRIUM_DISPLAY_IOC_COMMIT, &c) == 0 ? 0 : errno;
 	CHECK(err == EINVAL, "a pitch shorter than the mode's row is refused");
+	cfg.plug_mode = 3;	/* back to the power-on desktop monitor */
+	ioctl(dfd, ATRIUM_DISPLAY_IOC_CONFIG, &cfg);
 	close(small);
 	close(dfd);
 	close(fd);
