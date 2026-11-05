@@ -246,12 +246,38 @@ fn error_reply(op: u16, e: &DispatchError) -> Outbound {
 static LIVE_CLIENTS: Mutex<[bool; 256]> = Mutex::new([false; 256]);
 static NEXT_CLIENT_ID: AtomicU8 = AtomicU8::new(1);
 
+/// The peer uid each live client id was given to (`None`: not known, or a
+/// connection frescod opened itself for the chrome channel).
+static CLIENT_UID: Mutex<[Option<u32>; 256]> = Mutex::new([None; 256]);
+
+/// Most connections one peer uid may hold on a Fresco socket. Every app runs
+/// under its own uid (portcullis.md §9.0), so this is a per-app limit: one
+/// app holding connections cannot take every client id from the rest (F3).
+pub const MAX_CLIENTS_PER_UID: usize = 32;
+
 pub fn alloc_client_id() -> Option<u8> {
+    alloc(None)
+}
+
+/// A client id for a connection from `uid`, unless that uid already holds
+/// [`MAX_CLIENTS_PER_UID`] of them.
+pub fn alloc_client_id_for(uid: Option<u32>) -> Result<u8, &'static str> {
+    if let Some(u) = uid {
+        let uids = CLIENT_UID.lock().unwrap();
+        if uids.iter().filter(|&&x| x == Some(u)).count() >= MAX_CLIENTS_PER_UID {
+            return Err("this uid holds too many connections");
+        }
+    }
+    alloc(uid).ok_or("255 clients connected")
+}
+
+fn alloc(uid: Option<u32>) -> Option<u8> {
     let mut live = LIVE_CLIENTS.lock().unwrap();
     for _ in 0..255 {
         let id = NEXT_CLIENT_ID.fetch_add(1, Ordering::Relaxed).max(1);
         if !live[id as usize] {
             live[id as usize] = true;
+            CLIENT_UID.lock().unwrap()[id as usize] = uid;
             return Some(id);
         }
     }
@@ -259,19 +285,24 @@ pub fn alloc_client_id() -> Option<u8> {
 }
 
 pub fn free_client_id(id: u8) {
-    LIVE_CLIENTS.lock().unwrap()[id as usize] = false;
+    let mut live = LIVE_CLIENTS.lock().unwrap();
+    live[id as usize] = false;
+    CLIENT_UID.lock().unwrap()[id as usize] = None;
 }
 
 fn accept_loop(listener: UnixListener, shared: Shared, event_subs: EventSubs, wm_grant: bool) {
     for conn in listener.incoming() {
         match conn {
             Ok(stream) => {
-                let Some(client_id) = alloc_client_id() else {
-                    eprintln!("frescod: 255 clients connected; refusing another");
-                    continue;
+                let uid = peer_xucred(&stream).map(|(_, uid)| uid);
+                let client_id = match alloc_client_id_for(uid) {
+                    Ok(id) => id,
+                    Err(why) => {
+                        eprintln!("frescod: refusing a connection from uid {uid:?}: {why}");
+                        continue;
+                    }
                 };
                 if let (false, Some(h)) = (wm_grant, &shared.hand_off) {
-                    let uid = peer_xucred(&stream).map(|(_, uid)| uid);
                     h(stream, client_id, uid, event_subs.clone());
                     continue;
                 }

@@ -103,7 +103,7 @@ impl Broker {
     /// the renderer (default: `fresco-renderer` beside frescod), and
     /// `FRESCOD_RENDERER_LAUNCHER`, if set, is a command line that runs it
     /// confined, with `{client}` replaced by the client id, e.g.
-    /// `portcullis exec --daemon --instance fresco{client} org.atrium.fresco.renderer`.
+    /// `portcullis exec --require-memory-limit --user navtest --instance fresco{client} org.atrium.fresco.renderer`.
     pub fn from_env(comp: Arc<Mutex<Compositor>>, redraw: Redraw, screen: (u32, u32, u32)) -> Option<Arc<Broker>> {
         if std::env::var("FRESCOD_SPLIT").ok().as_deref() != Some("1") {
             return None;

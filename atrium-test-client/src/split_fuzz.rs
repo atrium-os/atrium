@@ -31,6 +31,11 @@ const BENIGN_FLAG: &str = "/tmp/split-fuzz-benign";
 
 fn main() {
     let a: Vec<String> = std::env::args().collect();
+    // Installed in a jail as `split-fuzz-hog`, with no arguments (a jail
+    // gets neither): the renderer that fills every slot it is given.
+    if a.first().is_some_and(|p| p.ends_with("split-fuzz-hog")) {
+        hog();
+    }
     let seed = |i: usize| a.get(i).and_then(|s| s.parse::<u64>().ok()).unwrap_or(1);
     match a.get(1).map(String::as_str) {
         Some("renderer") => {
@@ -45,9 +50,10 @@ fn main() {
             let t = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos() as u64;
             renderer(seed(2) ^ t)
         }
+        Some("hoard") if a.len() >= 4 => hoard(&a[2], seed(3) as usize),
         Some("drive") if a.len() >= 6 => drive(&a[2], &a[3], seed(4), seed(5)),
         _ => {
-            eprintln!("usage: atrium-split-fuzz renderer <seed> [real-renderer] | drive <fresco.sock> <chrome.sock|-> <seconds> <seed>");
+            eprintln!("usage: atrium-split-fuzz renderer <seed> [real-renderer] | hoard <fresco.sock> <n> | drive <fresco.sock> <chrome.sock|-> <seconds> <seed>");
             std::process::exit(2);
         }
     }
@@ -408,4 +414,66 @@ fn hostile_navigator(path: &str, seed: u64, end: Instant) -> String {
         }
     }
     format!("{conns} connections, {opened} documents opened, {refused} ended by frescod")
+}
+
+/// Hold `n` connections from one uid and count how many frescod keeps:
+/// at most `MAX_CLIENTS_PER_UID` (32) may stay open.
+fn hoard(fresco: &str, n: usize) {
+    use std::io::Read;
+    let mut held = Vec::new();
+    for _ in 0..n {
+        match std::os::unix::net::UnixStream::connect(fresco) {
+            Ok(s) => held.push(s),
+            Err(e) => eprintln!("split-fuzz: connect: {e}"),
+        }
+    }
+    std::thread::sleep(Duration::from_secs(3));
+    let mut open = 0;
+    for s in &mut held {
+        s.set_nonblocking(true).unwrap();
+        let mut b = [0u8; 1];
+        match s.read(&mut b) {
+            Ok(0) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => open += 1,
+            _ => open += 1,
+        }
+    }
+    println!("split-fuzz: {} connections made, {open} kept open by frescod", held.len());
+}
+
+/// Opens windows and writes every byte of their slots: 48 MiB a window of
+/// memory frescod created. Its jail's memory cap must stop it, and frescod
+/// must clean up after it.
+fn hog() -> ! {
+    // SAFETY: stdin is the broker channel.
+    let broker = Chan::from_fd(unsafe { OwnedFd::from_raw_fd(0) });
+    let _client = match broker.recv() {
+        Ok(chan::Recv::Msg(Msg::Client { .. }, mut fds)) if fds.len() == 1 => fds.pop().unwrap(),
+        _ => std::process::exit(1),
+    };
+    let mut slots = Vec::new();
+    for w in 1..=40u32 {
+        let create = Msg::WindowCreate { window: w, width: 64, height: 64, role: Role::Document, pos: None, title: "hog".into() };
+        if broker.send(&create, &[]).is_err() {
+            std::process::exit(0);
+        }
+        loop {
+            match broker.recv() {
+                Ok(chan::Recv::Msg(Msg::Slots { bytes, .. }, fds)) if fds.len() == 2 => {
+                    for fd in fds {
+                        let mut s = Shm::open(fd, bytes as usize).unwrap();
+                        s.as_mut_slice().iter_mut().step_by(4096).for_each(|b| *b = 1);
+                        slots.push(s);
+                    }
+                    eprintln!("split-fuzz-hog: {} MiB of slots touched", slots.len() * bytes as usize >> 20);
+                    break;
+                }
+                Ok(chan::Recv::Msg(..)) => continue,
+                _ => std::process::exit(0),
+            }
+        }
+    }
+    eprintln!("split-fuzz-hog: not stopped");
+    std::thread::sleep(Duration::from_secs(30));
+    std::process::exit(0);
 }

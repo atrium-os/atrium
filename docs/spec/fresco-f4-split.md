@@ -39,7 +39,7 @@ Before this change, frescod's event fan-out sent every event to every connection
 
 ### F4b. The process split
 
-Done, renderer jailed (atrium a46ec90 and the commit after it). `FRESCOD_SPLIT=1` hands every connection on `fresco.sock` to its own `fresco-renderer`; the WM socket stays in the broker. The renderer's stdin is the record channel, and the client's socket arrives over it in the first record (`CLIENT`), because a jail from `portcullis exec` gets only its three stdio fds. `FRESCOD_RENDERER_LAUNCHER` runs it confined, e.g. `portcullis exec --user <unprivileged> --instance fresco{client} org.atrium.fresco.renderer` (a signed bundle with no capabilities).
+Done, renderer jailed (atrium a46ec90 and the commit after it). `FRESCOD_SPLIT=1` hands every connection on `fresco.sock` to its own `fresco-renderer`; the WM socket stays in the broker. The renderer's stdin is the record channel, and the client's socket arrives over it in the first record (`CLIENT`), because a jail from `portcullis exec` gets only its three stdio fds. `FRESCOD_RENDERER_LAUNCHER` runs it confined, e.g. `portcullis exec --require-memory-limit --user <unprivileged> --instance fresco{client} org.atrium.fresco.renderer` (a signed bundle with no capabilities).
 
 Verified in the amd64 VM with `atrium-surfaces-demo`:
 - Unconfined: headless on Tier-2, and on gpusim with the GPU renderer (screenshot `frescod-f4b-split-gpu.png`).
@@ -53,7 +53,7 @@ How it works:
 - Retiring a renderer closes its channel first, so `portcullis exec` can tear its jail down; a kill after 5 s is only the backstop.
 
 Known gaps:
-- Fonts: the renderer's server-side text looks in `/usr/local/share/fonts`, which a jail does not have. The bundle must carry the fonts (not done yet).
+- Fonts: the bundle carries them (`scripts/fresco-renderer-bundle.sh`), at the path the renderer's text looks in.
 - A client drawing on window 0 draws only in its renderer's own window 0, which the broker does not show. Clients that want a desktop draw in a window of role Background, as forum-dock does.
 - `FRESCOD_SPLIT` is off by default, and the Vulkan backend does not take pre-packed frames.
 
@@ -118,8 +118,8 @@ What it found, all fixed:
 Measured in the amd64 VM (TCG), 150 s mixed run with the Navigator: 261 hostile renderers and 2,527 Navigator-opened documents. Frame gap at most 4 s, at most 8 renderers alive at once, frescod's fds back to their baseline, no panic, and the client at the end was served.
 
 Still open:
-- **Connections are not limited per peer.** Anyone who can reach `fresco.sock` can hold all 255 client ids by holding 255 connections. It needs a per-uid cap, which needs to know how Portcullis assigns uids to apps.
-- **Slot memory is the renderer jail's to bound.** Each window has two 24 MiB slots the broker creates, so a renderer can make the broker hold up to 3 GiB of virtual memory. The pages it touches are charged to its own RSS, so the jail's `memoryuse` limit (memfed) bounds them, but the renderer bundle does not declare one yet. The fuzz runs unconfined.
+- **Connections per peer: capped.** One peer uid may hold 32 connections on a Fresco socket (`MAX_CLIENTS_PER_UID`). Every app has its own uid (portcullis.md §9.0), so this is a per-app limit. Verified in the VM: 40 connections from one uid, 32 kept, the rest refused. Eight colluding app uids could still take all 255 ids, because the client id is a `u8` on the wire. Connections the Navigator opens over the chrome channel are capped per chrome connection instead (64).
+- **Renderer memory: capped by its jail.** `scripts/fresco-renderer-bundle.sh` builds the renderer's bundle with `[resources] memory = "512M"` and `cpu = 100`, plus the fonts its server-side text needs (the jail had none, so text failed there before). The launcher should pass `--require-memory-limit`, so a machine booted without `kern.racct.enable=1` refuses to start renderers instead of running them uncapped. A renderer touches its slots through its own mappings, so the slots count against its cap. Verified in the VM: a renderer that writes every slot it gets was killed at about 512 MiB, frescod reaped it, its jail went, and frescod's fds were back to baseline.
 - frescod's RSS rose from 23 to 48 MiB over the 150 s run. That is not yet known to be a leak; a longer run will tell.
 - The WM socket still speaks the full envelope protocol. The WM is trusted (F3 allows it as "equally trusted"), so it is not fuzzed here.
 
