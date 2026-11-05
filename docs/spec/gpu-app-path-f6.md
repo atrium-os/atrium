@@ -107,7 +107,7 @@ gpusim answers ENOSPC once the pool is full), and folding the hostile run into
 - On EIO the app's GPU context is lost: the broker reports it, drops the app's VM, and the app
   starts again with a fresh one.
 
-### G4. Tests on gpusim (hostile apps)
+### G4. Tests on gpusim (hostile apps) (passing: `atrium-gpu-fuzz isa` and `hostile`)
 - An honest app's compute shader fills a buffer that it then reads back.
 - Hostile ISA:
   - an infinite loop: the watchdog fails it with EIO, and another app's dispatch runs within
@@ -115,6 +115,14 @@ gpusim answers ENOSPC once the pool is full), and folding the hostile run into
   - loads and stores at another app's VAs: they fault in the hostile app's VM, and nothing leaks;
   - huge dims and bad headers: the broker refuses them.
 - The broker records are fuzzed (an F3 extension).
+
+Status 2026-11-05 on gpusim 354fffb: all of the above pass through frescod (`atrium-gpu-fuzz isa`:
+a self-branching kernel is lost with EIO while another app's dispatch completes in 5 s; stores
+at VA 0, a high VA and past the app's buffer are each lost with EIO; an honest app is served
+afterwards). The spinning kernel took about 20 s to be failed instead of `hang_ms` (5 s),
+because gpusim runs a dispatch inside the doorbell write, so the guest vCPU is held until the
+simulator's own per-dispatch budget runs out. Real hardware queues are asynchronous, so G5 has
+to measure the real time to fail.
 
 ### G5. On silicon (needs Shankar's OK)
 `test_gpu_isolation` and the hostile-ISA test on the R9700. They deliberately cause VM faults

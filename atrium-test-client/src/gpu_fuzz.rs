@@ -5,6 +5,10 @@
 //!   broker must pass: a store outside its buffers loses its work (and a
 //!   fresh context works), bad headers and oversized dispatches are
 //!   refused, and a uid can't hold more than its share of contexts.
+//! - `atrium-gpu-fuzz isa <gpu.sock>`: hostile machine code (F6 G4): a
+//!   kernel that never ends is stopped by the driver's watchdog and its
+//!   work lost, while another app's work runs; stores at addresses outside
+//!   the app's buffers fault in its own VM and are lost.
 //! - `atrium-gpu-fuzz hostile <gpu.sock> <seconds> <seed>`: hostile apps
 //!   send malformed and mutated records, random slot contents, work aimed
 //!   at random addresses, and connection storms. Prints PASS if an honest
@@ -24,9 +28,10 @@ fn main() {
     let a: Vec<String> = std::env::args().collect();
     let ok = match a.get(1).map(String::as_str) {
         Some("honest") if a.len() == 3 => honest(&a[2]),
+        Some("isa") if a.len() == 3 => hostile_isa(&a[2]),
         Some("hostile") if a.len() == 5 => hostile(&a[2], a[3].parse().unwrap_or(30), a[4].parse().unwrap_or(1)),
         _ => {
-            eprintln!("usage: atrium-gpu-fuzz honest <gpu.sock> | hostile <gpu.sock> <seconds> <seed>");
+            eprintln!("usage: atrium-gpu-fuzz honest <gpu.sock> | isa <gpu.sock> | hostile <gpu.sock> <seconds> <seed>");
             std::process::exit(2);
         }
     };
@@ -119,6 +124,66 @@ fn work(code: u32, va: u64, groups: [u32; 3]) -> Vec<u8> {
         record(op::DISPATCH, &[groups[0], groups[1], groups[2], 0, 0, 0]),
     ]
     .concat()
+}
+
+/// A kernel that branches to itself forever.
+fn spin_code(arch: u32) -> Vec<u8> {
+    let mut w: Vec<u32> = Vec::new();
+    w.extend(encode("S_BRANCH", "ENC_SOPP", "default", &[("SIMM16", 0xffff)]).unwrap());
+    w.extend(encode("S_ENDPGM", "ENC_SOPP", "default", &[]).unwrap());
+    let code: Vec<u8> = w.iter().flat_map(|d| d.to_le_bytes()).collect();
+    let mut slot = CodeHeader { code_bytes: code.len() as u32, vgprs: 1, user_sgprs: 2, lds_bytes: 0, scratch_dwords: 0, threads: [64, 1, 1], wave32: true }
+        .encode(&code);
+    slot[44..48].copy_from_slice(&arch.to_le_bytes());
+    slot
+}
+
+fn hostile_isa(sock: &str) -> bool {
+    let mut failures = 0;
+    let mut check = |ok: bool, what: String| {
+        println!("  {} {what}", if ok { "ok  " } else { failures += 1; "FAIL" });
+    };
+    println!("F6 G4: hostile machine code through frescod's GPU channel");
+    // App A: a kernel that never ends, on its own thread.
+    let spinner = {
+        let sock = sock.to_string();
+        std::thread::spawn(move || -> (Result<GpuMsg, String>, Duration) {
+            let t = Instant::now();
+            let r = (|| {
+                let mut a = App::open(&sock)?;
+                let slot = spin_code(a.arch);
+                a.code(0, &slot)?;
+                a.submit(1, &work(0, 0, [1, 1, 1]))
+            })();
+            (r, t.elapsed())
+        })
+    };
+    std::thread::sleep(Duration::from_millis(500));
+    // App B meanwhile: honest work, timed.
+    let t = Instant::now();
+    let b = honest_once(sock, 0x0b0b);
+    let b_took = t.elapsed();
+    let (a, a_took) = spinner.join().unwrap();
+    check(matches!(a, Ok(GpuMsg::Lost { errno: 5, .. })), format!("a kernel that never ends is lost with EIO after {:.1} s ({a:?})", a_took.as_secs_f64()));
+    check(b.is_ok() && b_took < Duration::from_secs(20), format!("another app's work ran meanwhile, in {:.1} s ({b:?})", b_took.as_secs_f64()));
+
+    // Stores at addresses the app has no buffer at: low memory, the top of
+    // the VA window, and just past its own buffer.
+    for (what, target) in [("VA 0", 0u64), ("high VA", 0x7f00_0000_0000), ("past its buffer", u64::MAX)] {
+        let r = (|| -> Result<GpuMsg, String> {
+            let mut a = App::open(sock)?;
+            let slot = app_code(a.arch, 0xbad);
+            a.code(0, &slot)?;
+            let (va, _st) = a.buffer(0, 4096)?;
+            let t = if target == u64::MAX { va + 0x10_0000 } else { target };
+            a.submit(1, &work(0, t, [1, 1, 1]))
+        })();
+        check(matches!(r, Ok(GpuMsg::Lost { errno: 5, .. })), format!("a store at {what} is lost with EIO ({r:?})"));
+    }
+    let r = honest_once(sock, 0x600d);
+    check(r.is_ok(), format!("an honest app is served afterwards ({r:?})"));
+    println!("{}", if failures == 0 { "ALL OK".to_string() } else { format!("{failures} FAILURES") });
+    failures == 0
 }
 
 /// One honest run: load, fill, dispatch, read back.
