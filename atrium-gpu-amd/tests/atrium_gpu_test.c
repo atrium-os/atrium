@@ -1852,9 +1852,10 @@ test_display_link(int fd, int dfd)
 		rc = 1;
 	}
 
-	/* restore the default monitor (HDMI 2.1 / VGA) so re-runs start clean. */
+	/* restore the power-on monitor (HDMI 2.1, the desktop one) so later
+	 * tests and frescod see what they would after boot. */
 	cfg.connector_type = 2;
-	cfg.plug_mode = 0;
+	cfg.plug_mode = 3;
 	ioctl(dfd, ATRIUM_DISPLAY_IOC_CONFIG, &cfg);
 
 	if (rc == 0)
@@ -1933,12 +1934,12 @@ test_display_usbc(int fd, int dfd)
 		rc = 1;
 	}
 
-	/* restore the default monitor (HDMI 2.1 / VGA, not USB-C). */
+	/* restore the power-on monitor (HDMI 2.1 desktop, not USB-C). */
 	uc.lanes = 0;
 	ioctl(dfd, ATRIUM_DISPLAY_IOC_USBC, &uc);
 	memset(&cfg, 0, sizeof(cfg));
 	cfg.connector_type = 2;
-	cfg.plug_mode = 0;
+	cfg.plug_mode = 3;
 	ioctl(dfd, ATRIUM_DISPLAY_IOC_CONFIG, &cfg);
 
 	if (rc == 0)

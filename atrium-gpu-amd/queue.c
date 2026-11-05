@@ -319,13 +319,20 @@ static int
 amd_hwq_wait_idle(struct atrium_amd_softc *sc, struct atrium_amd_hwq *q,
     uint16_t vmid)
 {
-	int waited = 0, ms;
+	int waited = 0, n, start = ticks;
+	int limit = MAX(1, (ATRIUM_AMD_QUEUE_WAIT_MS * hz) / 1000);
 
+	/*
+	 * Bounded by the clock, not by counting 1 ms pauses: a pause can run
+	 * long on a loaded or emulated machine, and 2000 of them then outlast
+	 * the hang limit, so the parked owner is stopped as hung instead of
+	 * the waiter being refused.
+	 */
 	sx_assert(&q->lock, SA_XLOCKED);
-	for (ms = 0; amd_hwq_blocks(sc, q, vmid); ms++) {
-		if (ms % 10 == 0 && amd_hwq_check_hang(sc, q))
+	for (n = 0; amd_hwq_blocks(sc, q, vmid); n++) {
+		if (n % 10 == 0 && amd_hwq_check_hang(sc, q))
 			break;
-		if (ms >= ATRIUM_AMD_QUEUE_WAIT_MS)
+		if (ticks - start >= limit)
 			return (EBUSY);
 		if (!waited) {
 			waited = 1;
