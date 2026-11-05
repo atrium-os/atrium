@@ -601,6 +601,9 @@ impl<'a> Emit<'a> {
             | M::VFma { .. }
             | M::VBroadcast { .. }
             | M::VPack { .. }
+            | M::VUn { .. }
+            | M::VBinC { .. }
+            | M::VDot { .. }
             | M::XExtract { .. } => self.packed(inst)?,
             M::XUn { op, d, a } => {
                 let ra = self.x_reg(*a, XS0)?;
@@ -1322,6 +1325,60 @@ impl<'a> Emit<'a> {
                     XOp::Xor => x3!(a, vxorps, rd, ra, rb)?,
                 }
                 self.v_fin(*d, rd)
+            }
+            MInst::VUn { op, d, a } => {
+                let ra = self.v_reg(*a, XS0)?;
+                let rd = self.x_dst(*d);
+                match op {
+                    XUnOp::Sqrt => self.a.vsqrtps(rd, ra).map_err(enc)?,
+                    XUnOp::Round(imm) => self.a.vroundps(rd, ra, *imm as i32).map_err(enc)?,
+                }
+                self.v_fin(*d, rd)
+            }
+            MInst::VBinC { op, d, a, bits } => {
+                let ra = self.v_reg(*a, XS0)?;
+                let rd = self.x_dst(*d);
+                let m = xmmword_ptr(self.pool_label(*bits));
+                let a = &mut self.a;
+                match op {
+                    XOp::Add => a.vaddps(rd, ra, m),
+                    XOp::Sub => a.vsubps(rd, ra, m),
+                    XOp::Mul => a.vmulps(rd, ra, m),
+                    XOp::Div => a.vdivps(rd, ra, m),
+                    XOp::And => a.vandps(rd, ra, m),
+                    XOp::Xor => a.vxorps(rd, ra, m),
+                    XOp::Min | XOp::Max => unreachable!("min/max are never folded"),
+                }
+                .map_err(enc)?;
+                self.v_fin(*d, rd)
+            }
+            MInst::VDot { d, a, b, n } => {
+                // XS0 = a * b; then lane 0 + lane 1 (+ lane 2) (+ lane 3),
+                // in that order.
+                let ra = self.v_reg(*a, XS0)?;
+                x3!(self.a, vmulps, XS0, ra, self.x_ps(*b))?;
+                match self.x_preg(*d) {
+                    Some(rd) => {
+                        self.a.vmovshdup(XS1, XS0).map_err(enc)?;
+                        self.a.vaddss(rd, XS0, XS1).map_err(enc)?;
+                        for lane in 2..*n as i32 {
+                            self.a.vpermilps(XS1, XS0, lane).map_err(enc)?;
+                            self.a.vaddss(rd, rd, XS1).map_err(enc)?;
+                        }
+                    }
+                    None => {
+                        // d's 16-byte slot holds the products meanwhile.
+                        let Loc::Slot(k) = self.loc(*d) else { unreachable!() };
+                        let at = 16 * k as i32;
+                        self.a.vmovups(xmmword_ptr(rsp + at), XS0).map_err(enc)?;
+                        self.a.vmovss(XS1, dword_ptr(rsp + at)).map_err(enc)?;
+                        for lane in 1..*n as i32 {
+                            self.a.vaddss(XS1, XS1, dword_ptr(rsp + (at + 4 * lane))).map_err(enc)?;
+                        }
+                        self.a.vmovss(dword_ptr(rsp + at), XS1).map_err(enc)?;
+                    }
+                }
+                Ok(())
             }
             MInst::VFma { d, a, b, c } => {
                 // XS1 = c; XS1 += a * b.

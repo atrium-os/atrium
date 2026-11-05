@@ -291,6 +291,13 @@ pub(crate) enum MInst {
     VPack { d: VReg, lanes: Vec<VReg> },
     /// Scalar d = lane `lane` of packed s.
     XExtract { d: VReg, s: VReg, lane: u8 },
+    /// Lane-wise sqrt or round.
+    VUn { op: XUnOp, d: VReg, a: VReg },
+    /// VBin with a constant in every lane of `b`, from the constant pool.
+    VBinC { op: XOp, d: VReg, a: VReg, bits: u32 },
+    /// Scalar d = dot product of the first `n` lanes of a and b, summed in
+    /// lane order like the scalar sequence (no FMA).
+    VDot { d: VReg, a: VReg, b: VReg, n: u8 },
     /// GBin, GShift and GCmp with a constant right operand.
     GBinI { op: GOp, d: VReg, a: VReg, imm: i32 },
     GShiftI { op: ShiftOp, d: VReg, a: VReg, imm: u8 },
@@ -386,7 +393,8 @@ impl MInst {
                 }
                 out.push(*s);
             }
-            VBin { a, b, .. } => out.extend([*a, *b]),
+            VBin { a, b, .. } | VDot { a, b, .. } => out.extend([*a, *b]),
+            VUn { a, .. } | VBinC { a, .. } => out.push(*a),
             VFma { a, b, c, .. } => out.extend([*a, *b, *c]),
             VBroadcast { s, .. } | XExtract { s, .. } => out.push(*s),
             VPack { lanes, .. } => out.extend(lanes.iter().copied()),
@@ -439,6 +447,9 @@ impl MInst {
             | GBinI { d, .. }
             | VLoad { d, .. }
             | VBin { d, .. }
+            | VUn { d, .. }
+            | VBinC { d, .. }
+            | VDot { d, .. }
             | VFma { d, .. }
             | VBroadcast { d, .. }
             | VPack { d, .. }
@@ -1041,9 +1052,30 @@ impl<'f> Lower<'f> {
     }
 
     fn xmask(&mut self, inst: &Inst, a: &Value, bits: u32, op: XOp) -> Result<(), BackendError> {
+        let res = Self::result(inst)?;
+        if let (Some(n), true) = (packable(&res.ty), self.packed.contains_key(&a.id)) {
+            if let Some(pa) = self.as_packed(a, n)? {
+                let d = self.vreg(Class::V);
+                self.code.push(MInst::VBinC { op, d, a: pa, bits });
+                return self.define_packed(res, d, n);
+            }
+        }
         let m = self.vreg(Class::X);
         self.code.push(MInst::XConst { d: m, bits });
         self.lanewise1(inst, a, Class::X, |d, a| MInst::XBin { op, d, a, b: m })
+    }
+
+    /// Sqrt and rounding: packed when the operand already is.
+    fn xun(&mut self, inst: &Inst, a: &Value, op: XUnOp) -> Result<(), BackendError> {
+        let res = Self::result(inst)?;
+        if let (Some(n), true) = (packable(&res.ty), self.packed.contains_key(&a.id)) {
+            if let Some(pa) = self.as_packed(a, n)? {
+                let d = self.vreg(Class::V);
+                self.code.push(MInst::VUn { op, d, a: pa });
+                return self.define_packed(res, d, n);
+            }
+        }
+        self.lanewise1(inst, a, Class::X, |d, a| MInst::XUn { op, d, a })
     }
 
     fn icmp(&mut self, inst: &Inst, a: &Value, b: &Value, cc: ICond) -> Result<(), BackendError> {
@@ -1214,18 +1246,12 @@ impl<'f> Lower<'f> {
             }
             Op::FNeg(a) => self.xmask(inst, a, 0x8000_0000, XOp::Xor)?,
             Op::FAbs(a) => self.xmask(inst, a, 0x7fff_ffff, XOp::And)?,
-            Op::FSqrt(a) => self.lanewise1(inst, a, Class::X, |d, a| M::XUn { op: XUnOp::Sqrt, d, a })?,
+            Op::FSqrt(a) => self.xun(inst, a, XUnOp::Sqrt)?,
             // vroundss imm: 8 = suppress precision exception; 1 floor,
             // 2 ceil, 3 trunc.
-            Op::FFloor(a) => {
-                self.lanewise1(inst, a, Class::X, |d, a| M::XUn { op: XUnOp::Round(9), d, a })?
-            }
-            Op::FCeil(a) => {
-                self.lanewise1(inst, a, Class::X, |d, a| M::XUn { op: XUnOp::Round(10), d, a })?
-            }
-            Op::FTrunc(a) => {
-                self.lanewise1(inst, a, Class::X, |d, a| M::XUn { op: XUnOp::Round(11), d, a })?
-            }
+            Op::FFloor(a) => self.xun(inst, a, XUnOp::Round(9))?,
+            Op::FCeil(a) => self.xun(inst, a, XUnOp::Round(10))?,
+            Op::FTrunc(a) => self.xun(inst, a, XUnOp::Round(11))?,
             Op::Dot(a, b) => {
                 // Multiply and add separately (no FMA): the interpreter and
                 // Cranelift round after each step and tests compare exactly.
@@ -1233,6 +1259,15 @@ impl<'f> Lower<'f> {
                 let (la, lb) = (self.lanes_of(a)?, self.lanes_of(b)?);
                 if la.len() != lb.len() || la.is_empty() || res.ty != Type::F32 {
                     return unsupported("Dot shape");
+                }
+                let n = la.len();
+                if n >= 2 && (self.packed.contains_key(&a.id) || self.packed.contains_key(&b.id)) {
+                    if let (Some(pa), Some(pb)) = (self.as_packed(a, n)?, self.as_packed(b, n)?) {
+                        let d = self.vreg(Class::X);
+                        self.code.push(M::VDot { d, a: pa, b: pb, n: n as u8 });
+                        self.lanes.insert(res.id, vec![d]);
+                        return Ok(());
+                    }
                 }
                 let mut acc = self.vreg(Class::X);
                 self.code.push(M::XBin { op: XOp::Mul, d: acc, a: la[0], b: lb[0] });
@@ -2342,6 +2377,7 @@ pub(crate) fn fold_immediates(vc: &mut VCode) {
     let mut defs = vec![0u32; vc.classes.len()];
     let mut consts: HashMap<VReg, i32> = HashMap::new();
     let mut xconsts: HashMap<VReg, u32> = HashMap::new();
+    let mut bcasts: HashMap<VReg, VReg> = HashMap::new();
     let mut tmp = Vec::new();
     for inst in &vc.insts {
         tmp.clear();
@@ -2355,11 +2391,16 @@ pub(crate) fn fold_immediates(vc: &mut VCode) {
         if let MInst::XConst { d, bits } = inst {
             xconsts.insert(*d, *bits);
         }
+        if let MInst::VBroadcast { d, s } = inst {
+            bcasts.insert(*d, *s);
+        }
     }
     consts.retain(|v, _| defs[v.0 as usize] == 1);
     xconsts.retain(|v, _| defs[v.0 as usize] == 1);
     let k = |v: &VReg| consts.get(v).copied();
     let xk = |v: &VReg| xconsts.get(v).copied();
+    bcasts.retain(|v, _| defs[v.0 as usize] == 1);
+    let vk = |v: &VReg| bcasts.get(v).and_then(|s| xk(s));
     for inst in vc.insts.iter_mut() {
         let new = match *inst {
             MInst::GBin { op, d, a, b } => match (k(&a), k(&b)) {
@@ -2378,6 +2419,18 @@ pub(crate) fn fold_immediates(vc: &mut VCode) {
                     match op {
                         XOp::And | XOp::Xor => Some(MInst::XBinC { op, d, a: b, bits }),
                         XOp::Add | XOp::Mul if !nan => Some(MInst::XBinC { op, d, a: b, bits }),
+                        _ => None,
+                    }
+                }
+                _ => None,
+            },
+            MInst::VBin { op, d, a, b } if !matches!(op, XOp::Min | XOp::Max) => match (vk(&a), vk(&b)) {
+                (_, Some(bits)) => Some(MInst::VBinC { op, d, a, bits }),
+                (Some(bits), None) => {
+                    let nan = f32::from_bits(bits).is_nan();
+                    match op {
+                        XOp::And | XOp::Xor => Some(MInst::VBinC { op, d, a: b, bits }),
+                        XOp::Add | XOp::Mul if !nan => Some(MInst::VBinC { op, d, a: b, bits }),
                         _ => None,
                     }
                 }

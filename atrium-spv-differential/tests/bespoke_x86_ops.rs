@@ -984,6 +984,111 @@ fn packed_vector_ops() {
     }
 }
 
+/// Packed neg/abs (pool masks), sqrt, floor/ceil/trunc, dot of 2-4
+/// lanes, and a broadcast constant, bit-exact against Cranelift.
+#[test]
+fn packed_unary_dot_and_constants() {
+    use rspirv::dr::Operand::{self, LiteralBit32};
+    use rspirv::spirv::{
+        AddressingModel, Capability, Decoration, ExecutionMode, ExecutionModel, FunctionControl,
+        MemoryModel, StorageClass as SC,
+    };
+    if !cfg!(target_arch = "x86_64") {
+        return;
+    }
+    let mut b = Builder::new();
+    b.set_version(1, 0);
+    b.capability(Capability::Shader);
+    let glsl = b.ext_inst_import("GLSL.std.450");
+    b.memory_model(AddressingModel::Logical, MemoryModel::GLSL450);
+    let void = b.type_void();
+    let f = b.type_float(32, None);
+    let v2 = b.type_vector(f, 2);
+    let v3 = b.type_vector(f, 3);
+    let v4 = b.type_vector(f, 4);
+    let void_fn = b.type_function(void, vec![]);
+    let pin4 = b.type_pointer(None, SC::Input, v4);
+    let pin3 = b.type_pointer(None, SC::Input, v3);
+    let pin2 = b.type_pointer(None, SC::Input, v2);
+    let pout4 = b.type_pointer(None, SC::Output, v4);
+    let i0 = b.variable(pin4, None, SC::Input, None);
+    b.decorate(i0, Decoration::Location, vec![LiteralBit32(0)]);
+    let i1 = b.variable(pin4, None, SC::Input, None);
+    b.decorate(i1, Decoration::Location, vec![LiteralBit32(1)]);
+    let i2 = b.variable(pin3, None, SC::Input, None);
+    b.decorate(i2, Decoration::Location, vec![LiteralBit32(2)]);
+    let i3 = b.variable(pin2, None, SC::Input, None);
+    b.decorate(i3, Decoration::Location, vec![LiteralBit32(3)]);
+    let out = b.variable(pout4, None, SC::Output, None);
+    b.decorate(out, Decoration::Location, vec![LiteralBit32(0)]);
+    let two = b.constant_bit32(f, 2.0f32.to_bits());
+    let main = b.begin_function(void, None, FunctionControl::NONE, void_fn).unwrap();
+    b.begin_block(None).unwrap();
+    let a = b.load(v4, None, i0, None, vec![]).unwrap();
+    let c = b.load(v4, None, i1, None, vec![]).unwrap();
+    let e = b.load(v3, None, i2, None, vec![]).unwrap();
+    let g = b.load(v2, None, i3, None, vec![]).unwrap();
+    let ext = |b: &mut Builder, op: u32, x: u32| b.ext_inst(v4, None, glsl, op, vec![Operand::IdRef(x)]).unwrap();
+    let n = b.f_negate(v4, None, a).unwrap();
+    let n2 = b.vector_times_scalar(v4, None, n, two).unwrap();
+    let ab = ext(&mut b, 4, c); // FAbs
+    let sq = ext(&mut b, 31, ab); // Sqrt
+    let fl = ext(&mut b, 8, a); // Floor
+    let ce = ext(&mut b, 9, c); // Ceil
+    let tr = ext(&mut b, 3, a); // Trunc
+    let t1 = b.f_add(v4, None, n2, sq).unwrap();
+    let t2 = b.f_add(v4, None, fl, ce).unwrap();
+    let t3 = b.f_sub(v4, None, t2, tr).unwrap();
+    let u = b.f_add(v4, None, t1, t3).unwrap();
+    let d4 = b.dot(f, None, a, c).unwrap();
+    let d3 = b.dot(f, None, e, e).unwrap();
+    let d2 = b.dot(f, None, g, g).unwrap();
+    let e1 = b.composite_extract(f, None, e, vec![1]).unwrap();
+    let col = b.composite_construct(v4, None, vec![d4, d3, d2, e1]).unwrap();
+    let fin = b.f_add(v4, None, u, col).unwrap();
+    b.store(out, fin, None, vec![]).unwrap();
+    b.ret().unwrap();
+    b.end_function().unwrap();
+    b.entry_point(ExecutionModel::Fragment, main, "main", vec![i0, i1, i2, i3, out]);
+    b.execution_mode(main, ExecutionMode::OriginUpperLeft, vec![]);
+    let spirv = assemble(b);
+    let module = atrium_spv_frontend::translate(&spirv).expect("frontend");
+    let objs = [
+        atrium_spv_backend_cranelift::compile(&module, atrium_spv_backend_cranelift::Target::host())
+            .expect("cranelift").object,
+        atrium_spv_backend_bespoke_x86::compile(&module, atrium_spv_backend_bespoke_x86::Target::host())
+            .expect("bespoke-x86").object,
+    ];
+    let dir = tempfile::tempdir().unwrap();
+    let libs: Vec<libloading::Library> = objs.iter().enumerate().map(|(k, obj)| {
+        let o = dir.path().join(format!("s{k}.o"));
+        let so = dir.path().join(format!("s{k}.so"));
+        std::fs::write(&o, obj).unwrap();
+        assert!(std::process::Command::new("cc").arg("-shared").arg("-o").arg(&so).arg(&o)
+            .status().unwrap().success());
+        unsafe { libloading::Library::new(&so) }.unwrap()
+    }).collect();
+    type FsMain = unsafe extern "C" fn(
+        *const u8, *const u8, *const u8, f32, f32, f32, f32, u32, *mut f32, *mut f32, u32, u32,
+    );
+    let fs: Vec<FsMain> = libs.iter().map(|l| unsafe { *l.get::<FsMain>(b"atrium_fs_main").unwrap() }).collect();
+    let vals = [1.5f32, -2.25, 0.0, -0.0, f32::NAN, f32::INFINITY, 3e-39, 7.0, -1e30, 0.333];
+    for k in 0..60 {
+        // The varying block: four vec4 slots (Location n at 16n).
+        let vary: Vec<f32> = (0..16).map(|i| vals[(k * 7 + i * 3 + i / 4) % vals.len()]).collect();
+        let res: Vec<[u32; 4]> = fs.iter().map(|&f| {
+            let mut c = [0f32; 4];
+            let mut d = 0f32;
+            unsafe {
+                f(vary.as_ptr() as *const u8, std::ptr::null(), std::ptr::null(), 0.0, 0.0, 0.0, 1.0, 1,
+                  c.as_mut_ptr(), &mut d, 1, 0);
+            }
+            c.map(f32::to_bits)
+        }).collect();
+        assert_eq!(res[1], res[0], "inputs {vary:?}");
+    }
+}
+
 /// Every component-wise GLSL.std.450 op that the frontend expands into
 /// several IR ops, on vec4 operands (Slang emits these for its built-ins):
 /// the host's bespoke backend (x86_64 or arm64) must compile each one and

@@ -47,8 +47,10 @@
 //!
 //! Fragment shaders in the span subset also get `atrium_fs_main_span`
 //! ([`span`]). PackHalf2x16/UnpackHalf2x16 copy Cranelift's integer sequence
-//! rather than F16C, so NaN payloads agree. Not yet: f64, and packed vector
-//! forms (phase 9).
+//! rather than F16C, so NaN payloads agree. f32 vectors also get packed
+//! forms (lane-wise arithmetic, fma, neg/abs/sqrt/rounding, dot, matrix ×
+//! vector), and float constants are read from a constant pool placed after
+//! each function's code. Not yet: f64.
 
 mod emit;
 mod regalloc;

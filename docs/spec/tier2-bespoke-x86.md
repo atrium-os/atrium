@@ -99,6 +99,17 @@ with Cranelift on this min-heavy kernel. The vector work (packed loads/stores, l
 add/sub/mul/div, matrix × vector) doesn't show here, since this kernel is a scalar chain; a
 matrix-times-vector vertex shader shrank from 305 to 108 bytes.
 
+Speed round, 2026-11-05 (after the above): helper-call arguments go straight to their ABI
+registers as a parallel move; float constants with one definition become RIP-relative
+constant-pool operands (`XBinC`/`VBinC`), so abs/neg masks and broadcast constants no longer
+cost `mov`+`vmovd`; FMin/FMax work in the destination register; and neg/abs/sqrt/floor/ceil/
+trunc and dot (lane-ordered sum, no FMA) have packed forms. One step of the bench kernel is now
+10 instructions on the common path against Cranelift's 12, and the function shrank from 4669
+to 4529 bytes (+64 bytes of pool). The bench can't resolve that on the shared cloud VM:
+run-to-run spread is about ±10% (bespoke 398-485 ns/pixel, Cranelift 394-485 over five runs).
+Note the bench loads shaders through the debug `atrium-spv-compile` binary, so rebuild it
+after any backend change or the numbers come from stale code.
+
 Originally: bespoke-x86 clears the 90% bar and is 8-12% faster than Cranelift-x86. Unlike on arm64, cc
 is not a true ceiling here: without `-ffast-math`, `fminf` stays a libm call on x86, so the
 C reference pays a call per step that the shader backends lower to `vminss` sequences.
