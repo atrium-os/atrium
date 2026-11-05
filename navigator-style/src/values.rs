@@ -489,7 +489,19 @@ fn atom(a: A, cvs: &[Cv], webfonts: &[String]) -> R<V> {
                 if matches!(f.as_str(), "calc" | "min" | "max" | "clamp") {
                     // `min(…)` is a value in its own right, not only inside
                     // `calc()`; wrapping it lets one parser serve both.
-                    return Ok(V::Calc(Box::new(calc(std::slice::from_ref(c), 1)?)));
+                    let e = calc(std::slice::from_ref(c), 1)?;
+                    // ★ A property that admits no negative length CLAMPS a
+                    // calc() that resolves below zero (Values 4 §10.12: range
+                    // checking happens on the result, at used-value time,
+                    // since a percentage may be in it). `max(e, 0)` is that
+                    // clamp, evaluated wherever the value is. Unclamped,
+                    // LWN's `padding-left: calc(50% * 0 - 65em / 2)` was
+                    // -520 px and pulled the whole middle column off the
+                    // left edge.
+                    if a == A::LenNonNeg {
+                        return Ok(V::Calc(Box::new(Calc::Max(vec![e, Calc::Len(Length { v: 0.0, unit: Unit::Px })]))));
+                    }
+                    return Ok(V::Calc(Box::new(e)));
                 }
             }
             let l = length(c)?; if a == A::LenNonNeg && l.v < 0.0 { return Err("negative value not admitted".into()) } Ok(V::Len(l)) }
@@ -692,6 +704,13 @@ mod tests {
         assert!(matches!(val("width", "max(10px, 2em)"), V::Calc(_)));
         assert!(matches!(val("width", "clamp(10px, 50%, 100px)"), V::Calc(_)));
         assert!(matches!(val("width", "calc(min(300px, 80vw) + 4px)"), V::Calc(_)));
+        // ★ Where no negative length is admitted, a calc() is clamped at
+        // zero on its result (Values 4 §10.12) — a plain `-5px` is refused,
+        // but `calc(0px - 5px)` is valid and used as 0.
+        assert!(matches!(val("padding-left", "calc(0px - 520px)"),
+            V::Calc(c) if matches!(&*c, Calc::Max(v) if v.len() == 2 && v[1] == Calc::Len(Length { v: 0.0, unit: Unit::Px }))));
+        assert!(matches!(val("margin-left", "calc(0px - 520px)"), V::Calc(c) if !matches!(&*c, Calc::Max(_))),
+            "a margin may be negative: no clamp");
         // Type checking still applies: a number is not a length.
         assert!(p("width", "min(10px, 2)").unwrap_err().contains("compares"));
         assert!(p("width", "clamp(10px, 2, 100px)").unwrap_err().contains("compares"));
