@@ -1,6 +1,6 @@
 # F6: the app GPU path
 
-*Status 2026-11-05: option A chosen (Shankar). G3's library is built (`atrium-gpu-app`) and runs an app's own kernel end to end on gpusim (`app-path-e2e`). Threat model §2.5.3 and §2.5.4 row F6. Owner: the GPU driver
+*Status 2026-11-05: option A chosen (Shankar). G3's library is built (`atrium-gpu-app`) and runs an app's own kernel end to end on gpusim (`app-path-e2e`). G1 is done (bb3f7ba4): VM faults fail their work with EIO at once, and app code is bound read-only (ABI rev 3). Threat model §2.5.3 and §2.5.4 row F6. Owner: the GPU driver
 thread, with Fresco for the broker wiring.*
 
 ## What F6 must end with
@@ -56,14 +56,14 @@ Options:
 
 ## Slices (written for option A)
 
-### G1. Driver: what a broker needs to host app VMs
+### G1. Driver: what a broker needs to host app VMs (done, bb3f7ba4)
 - The broker creates one VM per app on its own device fd. The ABI already supports this.
 - Code BOs: today a VM's PTEs are always writable. Add a read-only bind flag so app code and
   constant buffers can't be overwritten by the app's own dispatches. This is hygiene, not
   isolation, since the app can only damage itself.
 - Fault reporting: a VM fault should fail that VM's outstanding work with EIO at once, instead
   of waiting `hang_ms` for the watchdog.
-- Per-app scheduling weight: with two shared hardware queues, the `SCHED` weights are per
+- Per-app scheduling weight (deferred): with two shared hardware queues, the `SCHED` weights are per
   queue, not per app. Real per-app weights wait for per-VM MES queues (review §A2.3), which is
   also what removes the brief `EBUSY` one app's work can cause another.
 
@@ -106,5 +106,5 @@ and hangs on a shared GPU, so they run only when it is quiet and Shankar says so
 is what lets the stanza go to `production`.
 
 ## Order
-G1 (driver), then G3 (library, testable without the broker), then G2 (with Fresco), then G4,
+G1 (driver, done 37148ed4), then G3 (library, testable without the broker), then G2 (with Fresco), then G4,
 then G5.
