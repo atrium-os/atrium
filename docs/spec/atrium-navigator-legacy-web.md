@@ -410,6 +410,79 @@ it is the same shape as the page-network rule rather than an exception to it.
 blocklist; the tree has none and deliberately so. Adding one on top is a separate
 decision.)
 
+### 5.4.1e Proposed: anonymous cookies, before Arca (2026-11-05)
+
+*Asked by the user, 2026-11-05: "I'm not sure we designed cookies and cookie store for
+Navigator. We may need it before Arca." Not built.*
+
+**Today there are no cookies at all.** `navigator-fetch` sends no `Cookie` header and drops
+every `Set-Cookie` (`http.rs`). The converter's `document.cookie` reads `""` and discards
+writes (`boa_impl.rs`), and `navigator.cookieEnabled` is `false`. That was right for
+anonymous, shareable conversions, but some pages need a cookie to show anything:
+
+1. **Cookie checks.** A redirect sets a cookie and points back to the page, expecting the
+   cookie on return. Without a jar, that's a redirect loop or a "please enable cookies" page.
+2. **Consent and interstitial walls.** The reader's "accept" or "continue" is stored as a
+   cookie, and the content appears only on the next request that carries it.
+3. **State within one visit**, such as a region choice, a basket or a paywall meter.
+4. **Challenge clearance** (`cf_clearance` and similar). This is **out of scope:** §5.4.1b
+   says challenges are never solved automatically, and a jar must not become a way round
+   that.
+
+[Arca](arca.md) is the long-term home for cookies (Arca §8.1), and logins wait for its
+phase A2. So the question here is narrower: **is there an anonymous, non-persistent jar we
+can ship now, and does it rescue enough pages to be worth it?** §5.4.1c's method applies:
+measure before deciding.
+
+**The design, if the measurement says yes.**
+
+- **Cookies are off by default and turned on per view.** A view's first conversion stays
+  anonymous and shareable. A view switches to *cookied* when either:
+  - the site needs it: a redirect sets a cookie and returns to the same origin, or the
+    response says cookies are required; or
+  - the reader acts: they press a consent or continue control, which the document lane
+    replays as a transition.
+
+  From then on, that view's conversions are **private to the user and never shared**, the
+  same rule as credentialed conversions (threat model §6.7).
+- **The jar lives only in memory, for one view.** It is never written to disk and never
+  kept past the view's close. Nothing persists across visits until Arca (phase A2) exists,
+  so a consent choice is asked again on the next visit. That cost is deliberate: a
+  persistent per-site store is a tracking store, and it needs Arca's encryption and
+  clearing rules.
+- **The fetcher holds the jar.** The view's `navigator-fetchd`, jailed and with no files,
+  keeps it across that view's conversions instead of exiting after each one. The broker,
+  converter and worker never see `HttpOnly` cookies. The converter's `document.cookie`
+  gets that origin's non-`HttpOnly` cookies, and its writes go back to the jar. That is the
+  web's own contract (Arca §12, decision 4).
+- **Cookies go only to the page's origin.** The page network is same-origin GET (§5.4.1c),
+  and §5.4.1d's cross-origin stylesheets and fonts stay cookieless. In effect, the jar
+  holds one origin per view.
+- **The rules are Arca's.** Parsing, the public suffix list, `__Host-` and `__Secure-`,
+  `Secure`, `SameSite=Lax` by default and the size limits are one crate,
+  `navigator-cookie`. Arca's web profile reuses it unchanged, so nothing here is throwaway.
+- **No logins.** Form POSTs stay refused. A GET that logs the reader in (a magic link)
+  produces a cookie that dies with the view and is never stored. The trusted UI shows that
+  a view is cookied.
+
+**What a compromise reaches.** A compromised converter reads that view's non-`HttpOnly`
+cookies, which the site's own scripts read anyway. A compromised fetcher reads that one
+view's jar, which holds no login. That is far below Arca's bar, which is why logins still
+wait for Arca.
+
+**The measurement to run first (both corpora, offline replay where possible):**
+
+| question | how it is counted |
+|---|---|
+| how many documents hit a cookie check | a redirect chain that sets a cookie and returns to the same origin; "enable cookies" text that isn't a §5.4.1b challenge |
+| how many gain content with a jar | text and node counts with and without the jar, for those documents only |
+| how many consent walls clear on replaying "accept" | documents whose content appears only after a consent transition plus its cookie |
+| what sharing it costs | the share of views that turn cookied, and so become private |
+| what it must not change | documents with no cookie check stay byte-identical with the jar on; challenge pages stay REFUSED-BY-ORIGIN |
+
+If the jar rescues only a handful of documents, it waits for Arca, as same-site did in
+§5.4.1c.
+
 ### 5.4.2 Never emit an artifact worse than the input
 
 Because tier 2 is tier 1's DOM plus whatever the scripts changed, both artifacts are in
