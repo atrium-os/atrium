@@ -133,17 +133,17 @@ fn frame_of(scene: &SceneState, w: &WindowFrame, s: Surface) -> Arc<fresco_compu
     }
 }
 
-/// The GPU's architecture: `FRESCOD_GPU_ARCH` if set, else what the device
-/// reports about itself.
+/// The GPU's architecture: `FRESCOD_GPU_ARCH` if set, else the device's
+/// `CAP_ISA` family.
 fn gpu_arch(vm: &Vm<'_>) -> Result<Box<dyn fresco_compute::gpu::Arch>> {
     use fresco_compute::gpu;
     let name = match std::env::var("FRESCOD_GPU_ARCH") {
         Ok(n) if !n.is_empty() => n,
         _ => {
-            let vendor = vm.gpu().caps()?.vendor;
-            gpu::for_device(&vendor).ok_or_else(|| format!(
-                "no built-in GPU architecture matches device {vendor:?} (have: {}); set FRESCOD_GPU_ARCH",
-                gpu::names().join(", ")))?.to_string()
+            let c = vm.gpu().caps()?;
+            gpu::for_isa(c.isa_family).ok_or_else(|| format!(
+                "device {:?} reports ISA family {} ({:?}), which frescod does not know (have: {}); set FRESCOD_GPU_ARCH",
+                c.vendor, c.isa_family, c.isa_name, gpu::names().join(", ")))?.to_string()
         }
     };
     gpu::by_name(&name).map_err(|e| format!("{name}: {e}").into())

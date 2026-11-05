@@ -439,6 +439,11 @@ fn hoard(fresco: &str, n: usize) {
         }
     }
     println!("split-fuzz: {} connections made, {open} kept open by frescod", held.len());
+    // SPLIT_FUZZ_HOLD_S: keep them for that long after counting, so several
+    // hoarders (one per uid) can be measured together.
+    if let Some(t) = std::env::var("SPLIT_FUZZ_HOLD_S").ok().and_then(|v| v.parse().ok()) {
+        std::thread::sleep(Duration::from_secs(t));
+    }
 }
 
 /// Opens windows and writes every byte of their slots: 48 MiB a window of

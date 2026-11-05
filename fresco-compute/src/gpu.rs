@@ -7,7 +7,7 @@
 //! signals the end of a frame. That is [`Arch`] and [`Stream`]. RDNA4 is
 //! the first ([`crate::rdna4::Rdna4Arch`]); an RDNA3 or Intel Xe backend
 //! is another implementation of the same two traits, plus an entry in
-//! [`by_name`] and [`for_device`].
+//! [`by_name`] and [`for_isa`].
 //!
 //! Addresses are GPU virtual addresses in the caller's address space; the
 //! caller allocates, uploads and submits (frescod on the `'A'` ABI, which is
@@ -81,22 +81,34 @@ pub fn by_name(name: &str) -> Result<Box<dyn Arch>, Error> {
     }
 }
 
-/// The architecture a device is, from what the driver reports about
-/// itself. The `'A'` ABI has no ISA field yet, so this reads the vendor
-/// string; `None` when nothing built in matches (frescod then needs
-/// `FRESCOD_GPU_ARCH`).
-pub fn for_device(vendor: &str) -> Option<&'static str> {
-    let v = vendor.to_ascii_lowercase();
-    names().iter().copied().find(|n| v.contains(n))
+/// ISA families as the `'A'` ABI's `CAP_ISA` numbers them
+/// (`include/atrium/gpu_abi_v2.h`, `ATRIUM_GPU_ISA_*`).
+pub mod isa {
+    pub const AMD_RDNA4: u32 = 1;
+    pub const AMD_RDNA3: u32 = 2;
+    pub const INTEL_XE2: u32 = 3;
+}
+
+/// The architecture for a device's `CAP_ISA` family, by name. The name is
+/// returned even when that architecture is not built in, so the error can
+/// say what is missing; `None` for a family nobody has named.
+pub fn for_isa(family: u32) -> Option<&'static str> {
+    match family {
+        isa::AMD_RDNA4 => Some("rdna4"),
+        isa::AMD_RDNA3 => Some("rdna3"),
+        isa::INTEL_XE2 => Some("xe2"),
+        _ => None,
+    }
 }
 
 #[cfg(test)]
 mod tests {
     #[test]
-    fn a_vendor_string_names_its_architecture() {
+    fn an_isa_family_names_its_architecture() {
+        assert_eq!(super::for_isa(super::isa::AMD_RDNA4), Some("rdna4"));
+        assert_eq!(super::for_isa(0), None);
         #[cfg(feature = "rdna4")]
-        assert_eq!(super::for_device("Atrium AMD RDNA4 (gpusim)"), Some("rdna4"));
-        assert_eq!(super::for_device("Intel Xe2"), None);
+        assert!(super::by_name("rdna4").is_ok());
         assert!(super::by_name("xe2").is_err());
     }
 }

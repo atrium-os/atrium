@@ -255,20 +255,83 @@ static CLIENT_UID: Mutex<[Option<u32>; 256]> = Mutex::new([None; 256]);
 /// app holding connections cannot take every client id from the rest (F3).
 pub const MAX_CLIENTS_PER_UID: usize = 32;
 
+/// The last client ids are a reserve: once only this many are free, a uid
+/// may take one only while it holds fewer than [`MAX_CLIENTS_IN_RESERVE`].
+/// Without it eight colluding apps at 32 each take all 255 ids; with it they
+/// stop at 191, and the rest go two at a time to apps that hold few, so a
+/// newly started app still connects unless 32 more apps collude.
+pub const RESERVE_IDS: usize = 64;
+pub const MAX_CLIENTS_IN_RESERVE: usize = 2;
+
+/// Whether a uid holding `held` client ids may take another while `free`
+/// ids are free.
+fn may_take(held: usize, free: usize) -> bool {
+    if free == 0 || held >= MAX_CLIENTS_PER_UID {
+        return false;
+    }
+    free > RESERVE_IDS || held < MAX_CLIENTS_IN_RESERVE
+}
+
 pub fn alloc_client_id() -> Option<u8> {
     alloc(None)
 }
 
 /// A client id for a connection from `uid`, unless that uid already holds
-/// [`MAX_CLIENTS_PER_UID`] of them.
+/// its share ([`may_take`]).
 pub fn alloc_client_id_for(uid: Option<u32>) -> Result<u8, &'static str> {
     if let Some(u) = uid {
-        let uids = CLIENT_UID.lock().unwrap();
-        if uids.iter().filter(|&&x| x == Some(u)).count() >= MAX_CLIENTS_PER_UID {
-            return Err("this uid holds too many connections");
+        let free = LIVE_CLIENTS.lock().unwrap()[1..].iter().filter(|&&l| !l).count();
+        let held = CLIENT_UID.lock().unwrap().iter().filter(|&&x| x == Some(u)).count();
+        if !may_take(held, free) {
+            return Err(if held >= MAX_CLIENTS_PER_UID || free > RESERVE_IDS {
+                "this uid holds too many connections"
+            } else {
+                "client ids are scarce and this uid already holds its share"
+            });
         }
     }
     alloc(uid).ok_or("255 clients connected")
+}
+
+#[cfg(test)]
+mod id_share_tests {
+    use super::*;
+
+    /// Apps (uids) take ids greedily, in turn; returns what each got.
+    fn run(apps: usize) -> Vec<usize> {
+        let mut held = vec![0usize; apps];
+        let mut free = 255usize;
+        loop {
+            let mut took = false;
+            for h in held.iter_mut() {
+                if may_take(*h, free) {
+                    *h += 1;
+                    free -= 1;
+                    took = true;
+                }
+            }
+            if !took {
+                return held;
+            }
+        }
+    }
+
+    #[test]
+    fn eight_colluding_apps_leave_the_reserve() {
+        let held = run(8);
+        assert_eq!(held.iter().sum::<usize>(), 255 - RESERVE_IDS);
+        // A ninth app still gets in.
+        assert!(may_take(0, RESERVE_IDS));
+    }
+
+    #[test]
+    fn the_reserve_goes_two_at_a_time() {
+        assert!(may_take(1, 10));
+        assert!(!may_take(2, 10));
+        assert!(may_take(31, RESERVE_IDS + 1));
+        assert!(!may_take(32, 200));
+        assert!(!may_take(0, 0));
+    }
 }
 
 fn alloc(uid: Option<u32>) -> Option<u8> {

@@ -5230,7 +5230,7 @@ In the guest:
 | env | effect |
 |---|---|
 | `FRESCOD_RENDERER=compute` (default) | CPU (Tier-2) compute renderer (`fresco-compute` bin + raster + compose kernels; built with Cranelift by default) |
-| `FRESCOD_RENDERER=gpu` | same kernels compiled for the GPU's architecture (`fresco_compute::gpu::Arch`; `rdna4` built in, picked from the device's vendor string), run on gpusim or silicon; set `FRESCOD_FLIP_TIMEOUT_MS=900000` on gpusim |
+| `FRESCOD_RENDERER=gpu` | same kernels compiled for the GPU's architecture (`fresco_compute::gpu::Arch`; `rdna4` built in, picked from the device's `CAP_ISA` family), run on gpusim or silicon; set `FRESCOD_FLIP_TIMEOUT_MS=900000` on gpusim |
 | `FRESCOD_GPU_ARCH=rdna4` | override the gpu renderer's architecture |
 | `FRESCOD_RENDERER=vulkan` | the old Vulkan/lavapipe renderer; split mode stays off with it |
 | `FRESCOD_HEADLESS_PNG=/tmp/x` | headless, writes PNGs; test here first |

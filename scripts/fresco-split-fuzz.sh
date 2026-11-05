@@ -12,12 +12,19 @@
 # the frame loop runs. The verdicts: frescod alive, no panic, the frame loop
 # never quiet for more than GAP_MAX seconds, and a well-behaved client served
 # at the end.
+#
+# FUZZ_GPU=1 also serves the app GPU channel (F6 G2) and runs atrium-gpu-fuzz
+# hostile against it for the same time, then honest, which must pass. It needs
+# /dev/atrium-gpu0 and atrium-gpu-fuzz beside the rest. On gpusim every
+# dispatch freezes the guest, so raise GAP_MAX there; honest's VM-fault check
+# needs gpusim 354fffb or later.
 SECS=${1:-60} SEED=${2:-1} PERSONA=${3:-mixed} GAP_MAX=${GAP_MAX:-15}
 CHROME=-; [ "$4" = chrome ] && CHROME=/tmp/chrome.sock
+GPUSOCK=; [ "$FUZZ_GPU" = 1 ] && GPUSOCK=/tmp/fz-gpu.sock
 pkill -x frescod forum-wm atrium-rect-bouncer 2>/dev/null; pkill -f split-fuzz; sleep 1
 rm -f /tmp/fz.png /tmp/fz-*.sock /tmp/split-fuzz-benign
 env RUST_LOG=info SPLIT_FUZZ_PERSONA=$PERSONA FRESCOD_HEADLESS_PNG=/tmp/fz FRESCOD_RENDERER=compute \
-  FRESCOD_SPLIT=1 FRESCOD_CHROME_SOCK=/tmp/fz-chrome.sock FRESCOD_SOCK=/tmp/fz-fresco.sock FRESCOD_WM_SOCK=/tmp/fz-wm.sock \
+  ${GPUSOCK:+FRESCOD_GPU_SOCK=$GPUSOCK} FRESCOD_SPLIT=1 FRESCOD_CHROME_SOCK=/tmp/fz-chrome.sock FRESCOD_SOCK=/tmp/fz-fresco.sock FRESCOD_WM_SOCK=/tmp/fz-wm.sock \
   FRESCOD_RENDERER_LAUNCHER="$PWD/atrium-split-fuzz renderer {client} $PWD/fresco-renderer" \
   ./frescod >/tmp/fz-frescod.log 2>&1 &
 P=$!
@@ -29,6 +36,7 @@ touch /tmp/split-fuzz-benign
 sleep 3; rm -f /tmp/split-fuzz-benign
 ./atrium-split-fuzz drive /tmp/fz-fresco.sock $CHROME $SECS $SEED >/tmp/fz-drive.log 2>&1 &
 D=$!
+[ -n "$GPUSOCK" ] && { ./atrium-gpu-fuzz hostile $GPUSOCK $SECS $SEED >/tmp/fz-gpu.log 2>&1 & }
 GAP=0
 while kill -0 $D 2>/dev/null; do
   sleep 5
@@ -38,6 +46,11 @@ done
 cat /tmp/fz-drive.log; pkill atrium-rect-bouncer
 FAIL=0
 grep -q PASS /tmp/fz-drive.log || FAIL=1
+if [ -n "$GPUSOCK" ]; then
+  pkill -f "atrium-gpu-fuzz hostile"; sleep 2; tail -2 /tmp/fz-gpu.log
+  ./atrium-gpu-fuzz honest $GPUSOCK >/tmp/fz-gpu-honest.log 2>&1 && echo "GPU channel: honest app served after the hostile run" \
+    || { echo "GPU channel: honest app FAILED"; tail -5 /tmp/fz-gpu-honest.log; FAIL=1; }
+fi
 kill -0 $P 2>/dev/null || { echo "frescod DIED"; tail -20 /tmp/fz-frescod.log; FAIL=1; }
 N=$(grep -ci panic /tmp/fz-frescod.log); [ "$N" -eq 0 ] || { echo "$N panics"; FAIL=1; }
 [ $GAP -le $GAP_MAX ] || { echo "frame loop quiet for ${GAP}s"; FAIL=1; }
