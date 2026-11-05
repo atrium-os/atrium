@@ -6,7 +6,7 @@ use crate::{Frame, Op, KIND_PATH, KIND_RECT, KIND_TEXTURE, TILE};
 /// Branch counters (feature `coverage`): what a corpus actually exercised.
 pub mod coverage {
     /// The branches counted, by index.
-    pub const NAMES: [&str; 16] = [
+    pub const NAMES: [&str; 22] = [
         "bin: empty bbox",
         "bin: bbox clipped to the target",
         "bin: bbox inside the target",
@@ -23,6 +23,12 @@ pub mod coverage {
         "texel past texel_words",
         "texel: rgba8",
         "texel: r8",
+        "fill: outside its clip",
+        "fill: block header past texel_words",
+        "fill: tile outside its grid",
+        "fill: list word past texel_words",
+        "fill: line index past its lines",
+        "fill: drawn",
     ];
     #[cfg(feature = "coverage")]
     static HITS: [std::sync::atomic::AtomicU64; NAMES.len()] =
@@ -144,9 +150,69 @@ fn inside(r: [f32; 4], pc: [f32; 2]) -> bool {
     pc[0] >= r[0] && pc[0] < r[0] + r[2] && pc[1] >= r[1] && pc[1] < r[1] + r[3]
 }
 
+/// `raster.comp`'s `fill_shade`: a filled path's colour at `pc`.
+fn fill_shade(f: &Frame, o: &Op, pc: [f32; 2]) -> [f32; 4] {
+    use crate::fill::{coverage, fill_line, ENTRY_WORDS, HEADER_WORDS, MAX_GRID, MAX_TILE_SEGMENTS};
+    let c = o.p0;
+    if !(pc[0] >= c[0] && pc[0] < c[2] && pc[1] >= c[1] && pc[1] < c[3]) {
+        hit(16);
+        return [0.0; 4];
+    }
+    let tw_ = f.header.texel_words;
+    let t = |i: u32| f.texels[i as usize];
+    let b = o.meta[1];
+    if b >= tw_ || tw_ - b < HEADER_WORDS {
+        hit(17);
+        return [0.0; 4];
+    }
+    let (tx0, ty0, gw, gh) = (t(b), t(b + 1), t(b + 2), t(b + 3));
+    let (sbase, scount, rule) = (t(b + 4), t(b + 5), t(b + 6));
+    let px = pc[0] - 0.5;
+    let py = pc[1] - 0.5;
+    let (x, y) = (px as u32, py as u32);
+    let tx = (x / TILE).wrapping_sub(tx0);
+    let ty = (y / TILE).wrapping_sub(ty0);
+    if gw > MAX_GRID || gh > MAX_GRID || tx >= gw || ty >= gh || sbase > tw_ || scount > (tw_ - sbase) / 4 {
+        hit(18);
+        return [0.0; 4];
+    }
+    let idx = ty * gw + tx;
+    if idx >= (tw_ - b - HEADER_WORDS) / ENTRY_WORDS {
+        hit(18);
+        return [0.0; 4];
+    }
+    let e = b + HEADER_WORDS + idx * ENTRY_WORDS;
+    let ls = t(e);
+    let mut lc = t(e + 1);
+    if lc > MAX_TILE_SEGMENTS {
+        lc = MAX_TILE_SEGMENTS;
+    }
+    let mut acc = f32::from_bits(t(e + 2 + y % TILE));
+    if ls > tw_ || lc > tw_ - ls {
+        hit(19);
+        lc = 0;
+    }
+    for k in 0..lc {
+        let si = t(ls + k);
+        if si >= scount {
+            hit(20);
+            continue;
+        }
+        let w = sbase + si * 4;
+        let s = [f32::from_bits(t(w)), f32::from_bits(t(w + 1)), f32::from_bits(t(w + 2)), f32::from_bits(t(w + 3))];
+        acc += fill_line(s, px, py);
+    }
+    hit(21);
+    let cov = coverage(acc, rule == 1);
+    [o.p1[0], o.p1[1], o.p1[2], o.p1[3] * cov]
+}
+
 /// One op's straight-alpha colour at pixel centre `pc`.
 pub fn shade(f: &Frame, o: &Op, pc: [f32; 2]) -> [f32; 4] {
     let kind = o.meta[0];
+    if kind == crate::KIND_FILL {
+        return fill_shade(f, o, pc);
+    }
     if kind == KIND_PATH {
         let v = [pc[0] - o.p0[0], pc[1] - o.p0[1]];
         let lx = o.p2[0] * v[0] + o.p2[1] * v[1];

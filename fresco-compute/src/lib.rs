@@ -22,10 +22,12 @@
 //! `rdna4::Rdna4` (feature `rdna4`) records it for an RDNA4 GPU.
 //!
 //! Draw order matches `fresco_vulkan::HeadlessRenderer`: all rects, then all
-//! paths, then texture batches, then glyph batches, each in list order.
+//! paths, then filled paths ([`fill`]), then texture batches, then glyph
+//! batches, each in list order.
 
 pub mod compose;
 pub mod damage;
+pub mod fill;
 pub mod fuzz;
 pub mod gpu;
 #[cfg(feature = "rdna4")]
@@ -67,6 +69,8 @@ pub const KIND_RECT: u32 = 0;
 pub const KIND_PATH: u32 = 1;
 pub const KIND_TEXTURE: u32 = 2;
 pub const KIND_GLYPH: u32 = 3;
+/// A filled path ([`fill`]).
+pub const KIND_FILL: u32 = 4;
 
 /// The default clear colour, linear RGB (encodes to `#0A808C`), the same as
 /// `fresco_vulkan::HeadlessRenderer`.
@@ -167,6 +171,8 @@ pub struct GlyphBatch {
 pub struct Scene {
     pub rects: Vec<Rect>,
     pub paths: Vec<Path>,
+    /// Filled paths, drawn after `paths`.
+    pub fills: Vec<fill::Fill>,
     pub textures: Vec<Texture>,
     pub texture_batches: Vec<TextureBatch>,
     pub glyph_batches: Vec<GlyphBatch>,
@@ -302,6 +308,31 @@ impl Frame {
                 })),
             }
         }
+        // Filled paths: each one's tiled block in `texels` (see `fill`).
+        let mut fill_ops = Vec::new();
+        let (mut lines_total, mut indices_total) = (0usize, 0usize);
+        for fl in &scene.fills {
+            let Some(lines) = fill::flatten(fl) else { continue };
+            if lines_total + lines.len() > fill::MAX_FRAME_SEGMENTS {
+                continue;
+            }
+            let Some(p) = fill::pack(&lines, fl.rule, fl.clip, width, height, texels.len() as u32) else { continue };
+            if indices_total + p.indices > fill::MAX_FRAME_INDICES {
+                continue;
+            }
+            lines_total += p.lines;
+            indices_total += p.indices;
+            fill_ops.push(Op {
+                p0: p.clip,
+                p1: fl.color,
+                p2: [0.0; 4],
+                p3: p.bbox,
+                meta: [KIND_FILL, texels.len() as u32, 0, 0],
+            });
+            texels.extend_from_slice(&p.block);
+        }
+        // Fills draw after paths, before textures.
+        ops.extend(fill_ops);
         if texels.is_empty() {
             texels.push(0); // a binding may not be empty
         }

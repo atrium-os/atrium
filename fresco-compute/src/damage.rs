@@ -7,7 +7,7 @@
 //! buffer holds re-rasters only the tiles whose signature changed.
 //! [`rects`] groups the dirty tiles into a few rectangles to dispatch.
 
-use crate::{Frame, KIND_GLYPH, KIND_TEXTURE, TILE};
+use crate::{Frame, KIND_FILL, KIND_GLYPH, KIND_TEXTURE, TILE};
 
 const K: u64 = 0x9e37_79b9_7f4a_7c15;
 
@@ -56,6 +56,14 @@ pub fn tile_signatures(f: &Frame) -> Vec<u64> {
         oh = hash_words(oh, &o.meta);
         if o.meta[0] == KIND_TEXTURE || o.meta[0] == KIND_GLYPH {
             oh = mix(oh, tex_hash.get(o.meta[1] as usize).copied().unwrap_or(0));
+        }
+        if o.meta[0] == KIND_FILL {
+            // Its whole block (header word 7 = its length): any change
+            // dirties every tile the path touches.
+            let lo = (o.meta[1] as usize).min(f.texels.len());
+            let n = f.texels.get(lo + 7).copied().unwrap_or(0) as usize;
+            let hi = lo.saturating_add(n.max(crate::fill::HEADER_WORDS as usize)).min(f.texels.len());
+            oh = hash_words(oh, &f.texels[lo..hi]);
         }
         let (tx0, ty0) = (x0 as u32 / TILE, y0 as u32 / TILE);
         let (tx1, ty1) = ((x1 - 1) as u32 / TILE, (y1 - 1) as u32 / TILE);

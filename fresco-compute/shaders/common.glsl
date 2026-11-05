@@ -2,11 +2,12 @@
 // these buffers byte for byte (std430, set 0).
 
 // An op is five vec4s (80 bytes):
-//   p0  RECT/TEXTURE/GLYPH: x, y, w, h.  PATH: cx, cy, length, width
+//   p0  RECT/TEXTURE/GLYPH: x, y, w, h.  PATH: cx, cy, length, width.
+//       FILL: clip x0, y0, x1, y1
 //   p1  colour, linear RGB, straight alpha (RECT, PATH, GLYPH)
 //   p2  RECT: radius.  PATH: cos, sin.  GLYPH: atlas u0, v0, u1, v1
 //   p3  bounding box x0, y0, x1, y1 in whole pixels (x1/y1 exclusive)
-//   p4  as uint bits: kind, texture index, 0, 0
+//   p4  as uint bits: kind, texture index (FILL: its block's first texel word), 0, 0
 // The buffers are flat arrays indexed by hand: the Tier-2 frontend takes a
 // dynamic index only as the last step into a runtime array.
 //
@@ -34,6 +35,7 @@ float clamp_(float v, float lo, float hi) { return v >= lo ? (v <= hi ? v : hi) 
 #define KIND_PATH    1u
 #define KIND_TEXTURE 2u
 #define KIND_GLYPH   3u
+#define KIND_FILL    4u
 
 #define TILE 16u
 

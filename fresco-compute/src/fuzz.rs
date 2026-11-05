@@ -52,6 +52,52 @@ impl Rng {
     }
 }
 
+/// The fixed test scene's filled paths (tests/kernels.rs, the RDNA4
+/// oracle): a star (even-odd and nonzero), a circle of cubics with a
+/// hole, a quad blob crossing the target edge, a clipped triangle.
+pub fn fills() -> Vec<fill::Fill> {
+    use crate::fill::*;
+    let star: Vec<[f32; 2]> = (0..5).map(|i| {
+        let a = i as f32 * 4.0 * std::f32::consts::PI / 5.0 - 1.5;
+        [a.cos() * 9.0, a.sin() * 9.0]
+    }).collect();
+    let star_verbs = vec![VERB_MOVE, VERB_LINE, VERB_LINE, VERB_LINE, VERB_LINE, VERB_CLOSE];
+    let k = 0.5523;
+    let circle = |cx: f32, cy: f32, r: f32, rev: bool| -> (Vec<u8>, Vec<[f32; 2]>) {
+        let mut p = vec![[cx + r, cy]];
+        let q = [[1.0, 0.0], [0.0, 1.0], [-1.0, 0.0], [0.0, -1.0], [1.0, 0.0]];
+        for i in 0..4 {
+            let (a, b) = (q[i], q[i + 1]);
+            p.push([cx + r * (a[0] + k * b[0]), cy + r * (a[1] + k * b[1])]);
+            p.push([cx + r * (b[0] + k * a[0]), cy + r * (b[1] + k * a[1])]);
+            p.push([cx + r * b[0], cy + r * b[1]]);
+        }
+        if rev {
+            p.reverse();
+        }
+        (vec![VERB_MOVE, VERB_CUBIC, VERB_CUBIC, VERB_CUBIC, VERB_CUBIC, VERB_CLOSE], p)
+    };
+    let (mut v, mut p) = circle(0.0, 0.0, 12.0, false);
+    let (v2, p2) = circle(0.0, 0.0, 5.0, true);
+    v.extend(v2);
+    p.extend(p2);
+    vec![
+        Fill { verbs: star_verbs.clone(), points: star.clone(), transform: [1.0, 0.0, 0.0, 1.0, 14.0, 14.0], rule: FillRule::EvenOdd, color: [0.9, 0.9, 0.1, 0.9], clip: None },
+        Fill { verbs: star_verbs, points: star, transform: [1.5, 0.3, -0.3, 1.5, 58.0, 26.0], rule: FillRule::NonZero, color: [0.2, 0.1, 0.8, 0.8], clip: None },
+        Fill { verbs: v, points: p, transform: [1.0, 0.0, 0.0, 1.0, 40.3, 22.7], rule: FillRule::NonZero, color: [0.1, 0.7, 0.6, 0.7], clip: None },
+        Fill {
+            verbs: vec![VERB_MOVE, VERB_QUAD, VERB_QUAD, VERB_QUAD],
+            points: vec![[60.0, -6.0], [90.0, 5.0], [70.0, 20.0], [50.0, 30.0], [55.0, 10.0], [40.0, 0.0], [60.0, -6.0]],
+            transform: IDENTITY, rule: FillRule::NonZero, color: [1.0, 0.4, 0.4, 0.6], clip: None,
+        },
+        Fill {
+            verbs: vec![VERB_MOVE, VERB_LINE, VERB_LINE],
+            points: vec![[0.0, 39.0], [30.0, 20.0], [33.0, 40.0]],
+            transform: IDENTITY, rule: FillRule::NonZero, color: [0.3, 1.0, 0.3, 1.0], clip: Some([5.0, 25.5, 28.0, 38.0]),
+        },
+    ]
+}
+
 /// A well-formed scene, as a renderer following the protocol would pack.
 pub fn scene(r: &mut Rng, w: u32, h: u32) -> Scene {
     let (fw, fh) = (w as f32, h as f32);
@@ -76,6 +122,22 @@ pub fn scene(r: &mut Rng, w: u32, h: u32) -> Scene {
         let format = if r.chance(50) { TexFormat::R8 } else { TexFormat::Rgba8Srgb };
         let data = (0..(tw * th) as usize * format.bytes_per_texel()).map(|_| r.next() as u8).collect();
         s.textures.push(Texture { width: tw, height: th, format, data });
+    }
+    for _ in 0..r.below(4) {
+        use crate::fill::*;
+        let mut verbs = vec![VERB_MOVE];
+        let mut points = vec![[r.f(-5.0, fw + 5.0), r.f(-5.0, fh + 5.0)]];
+        for _ in 0..1 + r.below(6) {
+            let v = [VERB_LINE, VERB_QUAD, VERB_CUBIC, VERB_CLOSE, VERB_MOVE][r.below(5) as usize];
+            verbs.push(v);
+            for _ in 0..verb_points(v).unwrap() {
+                points.push([r.f(-5.0, fw + 5.0), r.f(-5.0, fh + 5.0)]);
+            }
+        }
+        let transform = if r.chance(50) { IDENTITY } else { [r.f(0.5, 1.5), r.f(-0.5, 0.5), r.f(-0.5, 0.5), r.f(0.5, 1.5), r.f(-5.0, 5.0), r.f(-5.0, 5.0)] };
+        let clip = r.chance(30).then(|| [r.f(-2.0, fw), r.f(-2.0, fh), r.f(0.0, fw + 2.0), r.f(0.0, fh + 2.0)]);
+        let rule = if r.chance(50) { FillRule::NonZero } else { FillRule::EvenOdd };
+        s.fills.push(Fill { verbs, points, transform, rule, color: r.color(), clip });
     }
     let nt = s.textures.len() as u32;
     if nt > 0 {
@@ -112,7 +174,7 @@ pub fn corrupt(r: &mut Rng, f: &mut Frame) {
     // Extra ops past the scene's, then rewrite some fields of any op.
     for _ in 0..r.below(4) {
         let mut o = f.ops[r.below(f.ops.len() as u32) as usize];
-        o.meta[0] = r.below(4);
+        o.meta[0] = r.below(5);
         f.ops.push(o);
     }
     for o in f.ops.iter_mut() {
@@ -120,7 +182,7 @@ pub fn corrupt(r: &mut Rng, f: &mut Frame) {
             continue;
         }
         match r.below(6) {
-            0 => o.meta[0] = if r.chance(70) { r.below(4) } else { r.word(8) },
+            0 => o.meta[0] = if r.chance(70) { r.below(5) } else { r.word(8) },
             1 => o.meta[1] = r.word(n_tex + 2),
             2 => {
                 let k = r.below(4) as usize;
@@ -132,6 +194,20 @@ pub fn corrupt(r: &mut Rng, f: &mut Frame) {
         }
     }
     let nw = f.texels.len() as u32;
+    // Fill blocks: rewrite header words, entries, list words and lines.
+    let blocks: Vec<u32> = f.ops.iter().filter(|o| o.meta[0] == KIND_FILL).map(|o| o.meta[1]).collect();
+    for b in blocks {
+        for _ in 0..r.below(4) {
+            let k = match r.below(4) {
+                0 => b as u64 + r.below(fill::HEADER_WORDS) as u64,
+                1 => b as u64 + fill::HEADER_WORDS as u64 + r.below(fill::ENTRY_WORDS * 4) as u64,
+                _ => b as u64 + r.below(nw.saturating_sub(b).max(1)) as u64,
+            };
+            if let Some(w) = f.texels.get_mut(k as usize) {
+                *w = if r.chance(50) { r.word(nw + 8) } else { r.wild(-20.0, fw + 20.0).to_bits() };
+            }
+        }
+    }
     for t in f.tex.iter_mut() {
         if r.chance(30) {
             match r.below(4) {

@@ -64,6 +64,109 @@ bool inside(vec4 r, vec2 pc) {
     return pc.x >= r.x && pc.x < r.x + r.z && pc.y >= r.y && pc.y < r.y + r.w;
 }
 
+// Filled paths (src/fill.rs has the normative rule and block layout).
+#define FILL_HEADER 8u
+#define FILL_ENTRY 18u
+#define FILL_MAX_GRID 1024u
+#define FILL_MAX_TILE_SEGS 4096u
+
+float fill_g(float t) {
+    if (t <= 0.0) {
+        return t;
+    }
+    if (t >= 1.0) {
+        return 0.5;
+    }
+    return t - 0.5 * t * t;
+}
+
+// One line's signed area in pixel (px, py): fill::fill_line.
+float fill_line(vec4 s, float px, float py) {
+    if (s.w == s.y) {
+        return 0.0;
+    }
+    float sy0 = s.y < s.w ? s.y : s.w;
+    float sy1 = s.y < s.w ? s.w : s.y;
+    float ylo = py;
+    float yhi = py + 1.0;
+    if (!(sy1 > ylo && sy0 < yhi)) {
+        return 0.0;
+    }
+    float dxdy = (s.z - s.x) / (s.w - s.y);
+    float ya = sy0 > ylo ? sy0 : ylo;
+    float yb = sy1 < yhi ? sy1 : yhi;
+    float ta = (s.x + (ya - s.y) * dxdy) - px;
+    float tb = (s.x + (yb - s.y) * dxdy) - px;
+    float dy = yb - ya;
+    float a;
+    if (abs(tb - ta) < 1e-5) {
+        a = clamp_(1.0 - 0.5 * (ta + tb), 0.0, 1.0);
+    } else {
+        a = (fill_g(tb) - fill_g(ta)) / (tb - ta);
+    }
+    a = dy * a;
+    return s.w > s.y ? a : -a;
+}
+
+vec4 fill_shade(vec4 c, vec4 color, uint b, vec2 pc) {
+    if (!(pc.x >= c.x && pc.x < c.z && pc.y >= c.y && pc.y < c.w)) {
+        return vec4(0.0);
+    }
+    uint tw_ = F.texel_words;
+    if (b >= tw_ || tw_ - b < FILL_HEADER) {
+        return vec4(0.0);
+    }
+    uint tx0 = texels[b];
+    uint ty0 = texels[b + 1u];
+    uint gw = texels[b + 2u];
+    uint gh = texels[b + 3u];
+    uint sbase = texels[b + 4u];
+    uint scount = texels[b + 5u];
+    uint rule = texels[b + 6u];
+    float px = pc.x - 0.5;
+    float py = pc.y - 0.5;
+    uint x = uint(px);
+    uint y = uint(py);
+    uint tx = x / TILE - tx0;
+    uint ty = y / TILE - ty0;
+    if (gw > FILL_MAX_GRID || gh > FILL_MAX_GRID || tx >= gw || ty >= gh || sbase > tw_ || scount > (tw_ - sbase) / 4u) {
+        return vec4(0.0);
+    }
+    uint idx = ty * gw + tx;
+    if (idx >= (tw_ - b - FILL_HEADER) / FILL_ENTRY) {
+        return vec4(0.0);
+    }
+    uint e = b + FILL_HEADER + idx * FILL_ENTRY;
+    uint ls = texels[e];
+    uint lc = texels[e + 1u];
+    if (lc > FILL_MAX_TILE_SEGS) {
+        lc = FILL_MAX_TILE_SEGS;
+    }
+    float acc = uintBitsToFloat(texels[e + 2u + y % TILE]);
+    if (ls > tw_ || lc > tw_ - ls) {
+        lc = 0u;
+    }
+    for (uint k = 0u; k < lc; k++) {
+        uint si = texels[ls + k];
+        if (si >= scount) {
+            continue;
+        }
+        uint w = sbase + si * 4u;
+        vec4 s = vec4(uintBitsToFloat(texels[w]), uintBitsToFloat(texels[w + 1u]),
+                      uintBitsToFloat(texels[w + 2u]), uintBitsToFloat(texels[w + 3u]));
+        acc = acc + fill_line(s, px, py);
+    }
+    float a = abs(acc);
+    if (rule == 1u) {
+        a = a - 2.0 * floor(a * 0.5);
+        if (a > 1.0) {
+            a = 2.0 - a;
+        }
+    }
+    float cov = clamp_(a, 0.0, 1.0);
+    return vec4(color.rgb, color.a * cov);
+}
+
 vec4 shade(uint oi, vec2 pc) {
     uint base = oi * OP_VEC4S;
     vec4 p0 = opv[base];
@@ -71,6 +174,9 @@ vec4 shade(uint oi, vec2 pc) {
     vec4 p2 = opv[base + 2u];
     uvec4 meta = floatBitsToUint(opv[base + 4u]);
     uint kind = meta.x;
+    if (kind == KIND_FILL) {
+        return fill_shade(p0, p1, meta.y, pc);
+    }
     if (kind == KIND_PATH) {
         vec2 v = pc - p0.xy;
         float lx = p2.x * v.x + p2.y * v.y;

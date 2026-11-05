@@ -20,6 +20,7 @@ pub fn scene() -> Scene {
             Path { model: [50.0, 20.0, 30.0, 3.0], angle: 0.6, color: [0.0, 0.8, 0.2, 1.0] },
             Path { model: [36.0, 5.0, 20.0, 2.0], angle: 0.0, color: [0.8, 0.8, 0.0, 0.6] },
         ],
+        fills: fuzz::fills(),
         textures: vec![
             Texture { width: 4, height: 4, format: TexFormat::Rgba8Srgb, data: rgba },
             Texture { width: 8, height: 8, format: TexFormat::R8, data: atlas },
