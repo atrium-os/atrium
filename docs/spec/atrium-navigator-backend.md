@@ -1036,6 +1036,71 @@ For each, measure:
 - frame time while flinging, p50 and p99, at 60 and 120 Hz;
 - time to reach the end with a single jump.
 
+**Measured (2026-11-06).** The test set, plus the GNU coreutils manual, through today's
+pipeline (e23e712d). Inputs are in `~/src/navigator-corpus/bigdocs-2026-11-06/`, outside
+the repo; two of them are synthetic, generated there.
+- *Converter.* The driver as in the time-to-first-display arms: online through fetchd,
+  progressive, with exploration. The converter child ran under `/usr/bin/time -l`, which
+  gives its peak resident set.
+- *Worker.* `examples/bigdoc_measure` ran the display path (ingest, normalize, layout,
+  scene) as the per-document worker does, one process per stage, so each stage's peak is
+  its own. These are the readable recordings; the first artifacts measure within a few
+  percent of them.
+
+| document | HTML | elements | profile ceiling | converter peak | worker peak (ingest → normalize → layout + scene) | normalize / layout / scene ms | first display from arrival | scene: runs · extent · NSG | whole page as RGBA |
+|---|---|---|---|---|---|---|---|---|---|
+| HTML Living Standard (one page) | 16.0 MB | 339,742 | **bytes and elements** | 957 MiB (47 s) | 671 → 3,941 → 4,007 MiB | 3,802 / 2,549 / 214 | 8.8 s | 794k runs · 2.64M px · 78 MB | 7.9 GiB |
+| 100,000-row table (synthetic) | 7.1 MB | 500,015 | **elements** | 440 MiB | 463 → 5,180 → 5,469 MiB | 5,643 / 4,730 / 116 | 10.4 s | 400k runs · 2.80M px · 42 MB | 8.3 GiB |
+| HN thread, 2,540 comments | 3.5 MB | 78,585 | — | 227 MiB | 155 → 1,166 → 1,256 MiB | 4,105 / 1,152 / 35 | 6.6 s | 125k runs · 320k px · 12 MB | 975 MiB |
+| coreutils manual | 2.1 MB | 48,322 | — | 90 MiB | 107 → 692 → 742 MiB | 1,617 / 457 / 36 | 4.4 s | 136k runs · 537k px · 13 MB | 1.6 GiB |
+| War and Peace (Gutenberg, about 1,400 printed pages) | 3.8 MB | 14,941 | — | 81 MiB | 123 → 242 → 410 MiB | 281 / 715 / 139 | 1.3 s | 573k runs · 1.43M px · 49 MB | 4.3 GiB |
+| photo gallery (Commons, 111 images) | 0.15 MB | 1,195 | — | 32 MiB | 19 → 52 → 53 MiB | 97 / 15 / 0 | 1.1 s | 397 runs · 2.6k px · 79 kB | 8 MiB |
+| endless feed (synthetic: "Load more" never ends) | 4 kB | 29 | — | 24 MiB | 16 → 18 → 18 MiB | 1 / 1 / 0 | 5 ms | 663 runs · 1.1k px · 53 kB | 3 MiB |
+
+*What it says.*
+- **Worker memory grows with the document, and steeply.** Peak resident memory is about
+  10–15 KiB per element: HN 1.2 GiB for 3.5 MB of HTML, the table 5.5 GiB. A worker jail
+  with a 4 GiB limit would end the table and the HTML standard, but they are refused by the
+  profile first.
+- **Where it goes** (peak RSS after each normalize phase, HN / table):
+  - cascade, resolve and collapse add 340 / 560 MiB together;
+  - **table pre-measure adds 665 MiB / 4.1 GiB, the largest single step.** HN lays its
+    comments out with tables.
+
+  The likeliest cause: the renderer's cascade keeps a full computed-style vector (every
+  longhand) for every element, in pre-measure and again in layout. A normalized document
+  has one class per distinct block, so most elements' computed styles are identical.
+  **Sharing computed styles** between identical elements, as browsers do, is the first
+  memory fix to try. It is independent of bands, and cheaper.
+- **The profile refusal works as the last line.** The two documents over its ceilings are
+  converted, and the broker refuses them before any reader sees them. Raising the ceilings
+  (decision 1) must wait for style sharing and bands. Today, admitting the table would cost
+  a 5.5 GiB worker.
+- **The scene is whole-page** (`viewport w h` with h the full extent). The scene for War
+  and Peace is 49 MB of NSG, 573,000 runs over 1.43 million px (about 2,400 screens). As
+  one RGBA surface it would be 4.3 GiB. Fresco holds the scene, not pixels, so the
+  surface figure is the bound that bands make unnecessary, not today's cost.
+- **Time to first display** for the big documents is display-bound: 4.4–10.4 s from
+  arrival, almost all of it normalize and layout of the whole document. A first band
+  would need only the first screen's share of that.
+- **Script and endless pages are bounded by recording.** The endless feed's exploration
+  recorded one "Load more" (50 items) and stopped. The converter peaked at 24 MiB, and
+  the HTML standard's at 957 MiB, under its jail limits.
+- **Not compared: the first display versus later scripted versions on these documents.**
+  Their first and readable artifacts measure the same within a few percent.
+- **Frame time while scrolling: no harness exists.** Fresco accepts scroll input
+  (`InputPointerScroll`), but no Navigator UI drives scrolling yet, so the frame-time row
+  of the test set (p50/p99 at 60 and 120 Hz, time to jump to the end) cannot be measured
+  today. Because the whole scene is resident, a jump costs no layout today. The price of
+  that is the memory above. The harness is a prerequisite for building bands, so their
+  cost and benefit can be measured.
+- Cut B (e23e712d) is not the cause. The same tool built at 0beab757 gives the same
+  normalize peaks within 1% (coreutils 690 vs 697 MiB, HN 1,159 vs 1,166 MiB), with
+  normalize 2.1–2.4× slower.
+
+Data: `~/src/navigator-corpus/bigdocs-2026-11-06/`. `convert.sh` produces `convert.txt`
+and `timing.tsv`; `worker.sh` produces `worker.tsv`; both tool builds are kept beside them.
+
 **Decisions to settle:**
 1. Raise the profile ceilings once bands and the image working set are in, or split very
    large documents into chapters at conversion? *Recommend raising them,* to levels
