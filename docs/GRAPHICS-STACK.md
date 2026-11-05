@@ -99,7 +99,7 @@ flowchart LR
 | Layer | Typical Linux desktop | Atrium | Why ours differs |
 |---|---|---|---|
 | What an app sends | pixels it rendered itself (dmabuf), plus GPU work it submits directly | a retained scene (`fresco-protocol`); GPU work only as checked code + closed-set records through frescod | apps hold no GPU fd in production (GPU ABI v2.1); a hostile page cannot reach the driver |
-| Who renders an app's window | the app, with its own Vulkan/GL driver | a per-client jailed renderer packs the scene; frescod's own kernels draw it | the renderer is sacrificial; frescod trusts only a 64 B header |
+| Who renders an app's window | the app, with its own Vulkan/GL driver | a per-client jailed renderer, running our kernels: on the CPU it rasters the window itself (default); on the GPU frescod rasters it in that window's own GPU VM | the renderer is sacrificial; frescod trusts only a header and composes |
 | Userspace driver | Mesa RADV (Vulkan), radeonsi (GL), inside every app | none in apps. frescod runs our compiler's output; third-party Vulkan goes through `atrium-vk-icd` → aqueduct-gpu → Tier-2/Tier-3 | no driver code in untrusted processes; one compiler we control |
 | Shader compiler | NIR → ACO (or LLVM), in the app process | frontend IR → GIR → RDNA4 machine layer, built from AMD's public ISA docs only | public-sources rule; layered for more GPU families; RADV kept only as the speed yardstick on the R9700 |
 | CPU fallback | lavapipe/llvmpipe (Mesa) | Tier-2: AOT SPIR-V → native code (bespoke ARM64 and x86_64, Cranelift fallback); it is frescod's default renderer | no Mesa at runtime; lavapipe survives only as a golden-test oracle and `FRESCOD_RENDERER=vulkan` |
