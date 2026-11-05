@@ -52,16 +52,20 @@ sized array is a compile error.
 **Storage-image texel pointers.** `OpImageTexelPointer` coordinates clamp per axis
 (`c < dim ? c : 0`), so image atomics stay inside the image.
 
-**Backends.** x86 bespoke and Cranelift implement the check. The arm64 bespoke backend
-returns `Unsupported` for StorageBuffer access until it has the check, so those shaders use
-Cranelift (it compiles few real shaders anyway; see the real-shader test).
+**Backends.** All three implement the check. The arm64 bespoke backend keeps each
+binding's base in a reserved register and, at each access, computes `end = addr - base +
+n`, loads `size` and the sink from the table at X2 and picks the address with `csel`
+(`guard_ssbo`). It still declines SSBO loads it would defer (integer vectors, `mat4`),
+which go to Cranelift. The arm64 tests run on the Mac or, on x86 Linux, under qemu-user
+(`--target aarch64-unknown-linux-gnu` with `aarch64-linux-gnu-gcc` as linker and as the
+`cc` the tests link shaders with).
 
 **Tests.** Differential tests with in-bounds indices stay bit-exact (116 in
 `atrium-spv-backend-bespoke/tests/differential_compute.rs`, also with forced spills). The
 `robust_*` tests there index far out of bounds (loads, stores and atomics; dynamic,
 constant, u32-wrapping; empty and unaligned buffers; texel pointers) on both backends, with
 the buffer inside a canary-filled allocation, and require no crash and no write outside
-it. Disabling the Cranelift guard makes all of them fail.
+it. Disabling the Cranelift guard makes all of them fail; so does disabling the arm64 guard or texel clamp.
 
 ## 3. Jail the compiler (step 2): done
 
@@ -131,4 +135,3 @@ client in one process, so it serves only its own uid: the socket is mode 0600 an
 with another uid is refused (`aqueduct-gpu-host/tests/end_to_end.rs`,
 `shared_listener_refuses_other_uids`). Other users go through the broker.
 
-Not done yet: the arm64 bespoke backend still declines SSBO shaders (they use Cranelift).

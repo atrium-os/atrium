@@ -23,20 +23,6 @@ use std::process::Command;
 
 /// Locate the just-built atrium-spv-compile binary alongside
 /// this test's deps/ dir.
-/// ABI v5 (docs/spec/tier2-robust-access.md): the arm64 backend doesn't
-/// bounds-check StorageBuffer accesses yet, so it must decline every SSBO
-/// shader (Cranelift compiles them, with the checks). When it gains the
-/// checks, these tests go back to expecting a blob.
-fn assert_declined_until_bounds_checked(
-    r: Result<atrium_spv_backend_bespoke::BlobOutput, atrium_spv_backend_bespoke::BackendError>,
-) {
-    match r {
-        Err(atrium_spv_backend_bespoke::BackendError::Unsupported(m)) if m.contains("bounds checks") => {}
-        Ok(_) => panic!("arm64 bespoke compiled an SSBO shader without bounds checks"),
-        Err(e) => panic!("expected the bounds-check Unsupported, got {e}"),
-    }
-}
-
 fn locate_spv_compile() -> PathBuf {
     let here = std::env::current_exe().expect("current_exe");
     let mut p = here;
@@ -179,7 +165,11 @@ fn bespoke_compiles_ssbo_vec4_store() {
     } else {
         Target::Aarch64FreeBSD
     };
-    assert_declined_until_bounds_checked(compile_blob(&module, target));
+    let out = compile_blob(&module, target)
+        .expect("bespoke should compile a vec4 SSBO write -- this exercises \
+                 OpAccessChain + OpStore through the (Compute, StorageBuffer) \
+                 -> X2 path");
+    assert!(!out.blob.is_empty());
 }
 
 /// Compute SPIR-V that reads gl_LocalInvocationID.x, multiplies
@@ -248,7 +238,12 @@ fn bespoke_compiles_lid_mul_ssbo_write() {
     } else {
         Target::Aarch64FreeBSD
     };
-    assert_declined_until_bounds_checked(compile_blob(&module, target));
+    let out = compile_blob(&module, target)
+        .expect("bespoke should compile a CS reading gl_LocalInvocationID + \
+                 writing a scalar u32 via SSBO -- exercises Op::LoadBuiltin \
+                 (Compute, LocalInvocationId) + Op::VectorExtract (int lane) \
+                 + Op::IMul + Op::Store (scalar u32 path)");
+    assert!(!out.blob.is_empty());
 }
 
 /// Compute SPIR-V that reads gl_GlobalInvocationID.x and
@@ -312,7 +307,11 @@ fn bespoke_compiles_gid_with_local_size_4() {
     } else {
         Target::Aarch64FreeBSD
     };
-    assert_declined_until_bounds_checked(compile_blob(&module, target));
+    let out = compile_blob(&module, target)
+        .expect("bespoke should compile a CS reading gl_GlobalInvocationID \
+                 with LocalSize=4 -- exercises the mul+add path that folds \
+                 LocalSize into the GID formula");
+    assert!(!out.blob.is_empty());
 }
 
 #[test]
@@ -365,12 +364,8 @@ fn spv_compile_picks_bespoke_for_supported_compute_shaders() {
     ] {
         let backend = invoked_backend(&spv)
             .unwrap_or_else(|e| panic!("compile failed for {name}: {e}"));
-        // Every shader here but `empty` writes a storage buffer, which
-        // the arm64 backend declines until it has bounds checks
-        // (docs/spec/tier2-robust-access.md): those go to Cranelift.
-        let want = if name == "empty" { "bespoke" } else { "cranelift" };
-        assert_eq!(backend, want,
-            "{name} should compile through {want}, got {backend}");
+        assert_eq!(backend, "bespoke",
+            "{name} should compile through bespoke, got {backend}");
     }
 }
 
@@ -437,7 +432,9 @@ fn bespoke_compiles_ssbo_read_modify_write() {
     } else {
         Target::Aarch64FreeBSD
     };
-    assert_declined_until_bounds_checked(compile_blob(&module, target));
+    let out = compile_blob(&module, target)
+        .expect("bespoke should compile a CS that reads SSBO[a]+7 -> SSBO[b]");
+    assert!(!out.blob.is_empty());
 }
 
 /// Compute SPIR-V with a conditional branch + phi:
@@ -521,7 +518,11 @@ fn bespoke_compiles_conditional_compute() {
     } else {
         Target::Aarch64FreeBSD
     };
-    assert_declined_until_bounds_checked(compile_blob(&module, target));
+    let out = compile_blob(&module, target)
+        .expect("bespoke should compile a CS with a conditional branch + phi \
+                 -- exercises Op::ULessThan + Op::BranchCond + Op::Phi \
+                 through the compute codegen path");
+    assert!(!out.blob.is_empty());
 }
 
 /// Compute SPIR-V with a counted loop:
@@ -619,7 +620,10 @@ fn bespoke_compiles_loop_compute() {
     } else {
         Target::Aarch64FreeBSD
     };
-    assert_declined_until_bounds_checked(compile_blob(&module, target));
+    let out = compile_blob(&module, target)
+        .expect("bespoke should compile a counted-loop CS -- exercises \
+                 the loop-header + back-edge + Phi-as-loop-carried path");
+    assert!(!out.blob.is_empty());
 }
 
 /// Compute SPIR-V doing scalar float arithmetic:
@@ -689,7 +693,11 @@ fn bespoke_compiles_float_arith_compute() {
     } else {
         Target::Aarch64FreeBSD
     };
-    assert_declined_until_bounds_checked(compile_blob(&module, target));
+    let out = compile_blob(&module, target)
+        .expect("bespoke should compile a CS doing scalar float arith \
+                 -- exercises Op::ConvertUToF + Op::FMul + Op::FAdd + \
+                 scalar f32 SSBO store through the compute path");
+    assert!(!out.blob.is_empty());
 }
 
 /// Compute SPIR-V doing vec4 float arithmetic:
@@ -758,7 +766,11 @@ fn bespoke_compiles_float_vec4_arith_compute() {
     } else {
         Target::Aarch64FreeBSD
     };
-    assert_declined_until_bounds_checked(compile_blob(&module, target));
+    let out = compile_blob(&module, target)
+        .expect("bespoke should compile a CS doing vec4 float arith \
+                 -- exercises FMul + FAdd on the NEON SIMD path \
+                 through compute");
+    assert!(!out.blob.is_empty());
 }
 
 /// Compute SPIR-V with two SSBO bindings:
@@ -883,7 +895,10 @@ fn bespoke_compiles_four_binding_ssbo() {
     } else {
         Target::Aarch64FreeBSD
     };
-    assert_declined_until_bounds_checked(compile_blob(&module, target));
+    let out = compile_blob(&module, target)
+        .expect("bespoke should compile a CS with 4 SSBO bindings -- \
+                 exercises the X12-X17 binding-register pool");
+    assert!(!out.blob.is_empty());
 }
 
 #[test]
@@ -901,7 +916,10 @@ fn bespoke_compiles_multi_binding_ssbo() {
     // pointer) and X17=tbl[1] (binding 1 pointer).
     // Subsequent SSBO accesses route through the per-binding
     // X-reg rather than aliasing X2.
-    assert_declined_until_bounds_checked(compile_blob(&module, target));
+    let out = compile_blob(&module, target)
+        .expect("bespoke should compile a CS with 2 SSBO bindings -- \
+                 exercises the multi-binding descriptor-table path");
+    assert!(!out.blob.is_empty());
 }
 
 #[test]
@@ -992,7 +1010,9 @@ fn bespoke_compiles_dynamic_ssbo_index() {
     } else {
         Target::Aarch64FreeBSD
     };
-    assert_declined_until_bounds_checked(compile_blob(&module, target));
+    let out = compile_blob(&module, target)
+        .expect("bespoke should compile ssbo.data[gid.x] = gid.x");
+    assert!(!out.blob.is_empty());
 }
 
 /// CS that does `atomicAdd(ssbo.counter, gid_x)` -- the
@@ -1058,5 +1078,8 @@ fn bespoke_compiles_atomic_iadd() {
     } else {
         Target::Aarch64FreeBSD
     };
-    assert_declined_until_bounds_checked(compile_blob(&module, target));
+    let out = compile_blob(&module, target)
+        .expect("bespoke should compile atomicAdd through the load+add+store \
+                 lowering on the serial dispatcher");
+    assert!(!out.blob.is_empty());
 }

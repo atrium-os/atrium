@@ -112,7 +112,9 @@ impl Target {
     /// The host's target (from cargo's target triple at
     /// compile time).
     pub fn host() -> Self {
-        #[cfg(all(target_arch = "aarch64", target_os = "freebsd"))]
+        // Linux arm64 (development, e.g. qemu-user) loads the same
+        // ELF objects.
+        #[cfg(all(target_arch = "aarch64", any(target_os = "freebsd", target_os = "linux")))]
         { return Target::Aarch64FreeBSD; }
         #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
         { return Target::Aarch64Darwin; }
@@ -123,7 +125,7 @@ impl Target {
         // Fallback for other dev platforms — Darwin's the
         // most useful for "does it build at all".
         #[cfg(not(any(
-            all(target_arch = "aarch64", target_os = "freebsd"),
+            all(target_arch = "aarch64", any(target_os = "freebsd", target_os = "linux")),
             all(target_arch = "aarch64", target_os = "macos"),
             all(target_arch = "x86_64",  target_os = "freebsd"),
             all(target_arch = "x86_64",  target_os = "linux"),

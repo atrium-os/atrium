@@ -49,12 +49,15 @@ fn bespoke_or_cranelift(module: &atrium_spv_ir::Module, use_bespoke: bool) -> Ve
         let t = if cfg!(target_os = "macos") {
             BespokeTarget::Aarch64Darwin
         } else { BespokeTarget::Aarch64FreeBSD };
-        // Shaders the arm64 backend declines (SSBO and texel-pointer
-        // access, until it has bounds checks) fall back to Cranelift,
-        // as atrium-spv-compile does.
+        // Shaders the arm64 backend declines fall back to Cranelift,
+        // as atrium-spv-compile does (ATRIUM_SPV_COVERAGE=1 lists them).
         match bespoke_compile(module, t) {
             Ok(o) => return o.object,
-            Err(atrium_spv_backend_bespoke::BackendError::Unsupported(_)) => {}
+            Err(atrium_spv_backend_bespoke::BackendError::Unsupported(m)) => {
+                if std::env::var_os("ATRIUM_SPV_COVERAGE").is_some() {
+                    eprintln!("bespoke-arm64 unsupported: {m}");
+                }
+            }
             Err(e) => panic!("bespoke compile: {e}"),
         }
     }
@@ -8816,6 +8819,15 @@ fn run_oob(idx: OobIdx, use_bespoke: bool, n_bytes: usize,
         x86::compile(&module, x86::Target::host())
             .expect("bespoke-x86 compiles the bounds-checked shader");
     }
+    if use_bespoke && HOST_HAS_BESPOKE {
+        // Likewise the arm64 backend's own code.
+        let module = translate(&spv).expect("frontend");
+        let t = if cfg!(target_os = "macos") {
+            BespokeTarget::Aarch64Darwin
+        } else { BespokeTarget::Aarch64FreeBSD };
+        bespoke_compile(&module, t)
+            .expect("bespoke-arm64 compiles the bounds-checked shader");
+    }
     let dir = TempDir::new().unwrap();
     let mut arena = vec![CANARY; PAD + n_bytes + PAD];
     for (w, chunk) in arena[PAD..PAD + n_bytes].chunks_exact_mut(4).enumerate() {
@@ -8909,6 +8921,13 @@ fn robust_image_texel_pointer_out_of_range_is_contained() {
     // Coordinates outside the image clamp to 0 on that axis (spec §2),
     // so the atomic lands inside the image, never past it.
     let spv = build_image_atomic_add_cs();
+    if HOST_HAS_BESPOKE {
+        let module = translate(&spv).expect("frontend");
+        let t = if cfg!(target_os = "macos") {
+            BespokeTarget::Aarch64Darwin
+        } else { BespokeTarget::Aarch64FreeBSD };
+        bespoke_compile(&module, t).expect("bespoke-arm64 compiles the texel-pointer shader");
+    }
     let (w, h) = (2u32, 2u32);
     let n = (w * h * 4) as usize;
     let gids = [(2, 0, 0), (0, 2, 0), (0xFFFF_FFFF, 1, 0), (1, 0x8000_0000, 0),

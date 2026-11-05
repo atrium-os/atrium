@@ -87,12 +87,14 @@ impl Target {
     /// The host's target, panicking on x86_64 (the bespoke
     /// backend doesn't target it).
     pub fn host() -> Self {
-        #[cfg(all(target_arch = "aarch64", target_os = "freebsd"))]
+        // Linux arm64 (development, e.g. qemu-user) loads the same
+        // ELF objects.
+        #[cfg(all(target_arch = "aarch64", any(target_os = "freebsd", target_os = "linux")))]
         { return Target::Aarch64FreeBSD; }
         #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
         { return Target::Aarch64Darwin; }
         #[cfg(not(any(
-            all(target_arch = "aarch64", target_os = "freebsd"),
+            all(target_arch = "aarch64", any(target_os = "freebsd", target_os = "linux")),
             all(target_arch = "aarch64", target_os = "macos"),
         )))]
         { return Target::Aarch64Darwin; }
@@ -284,37 +286,6 @@ pub fn compile_blob(module: &Module, target: Target)
 fn emit_function_auto(
     func: &Function,
 ) -> Result<(Vec<u8>, Vec<(u32, u32)>), BackendError> {
-    // Robust access (docs/spec/tier2-robust-access.md, ABI v5): this
-    // backend doesn't bounds-check StorageBuffer accesses or image
-    // texel pointers yet, so such shaders go to Cranelift, which does.
-    let unchecked_memory = !func.ssbo_bindings.is_empty()
-        || func.blocks.values().flat_map(|b| &b.insts).any(|i| match &i.op {
-            Op::ImageTexelPointer { .. } => true,
-            Op::Load(p)
-            | Op::Store { ptr: p, .. }
-            | Op::AccessChain { base: p, .. }
-            | Op::PtrOffsetDynamic { base: p, .. }
-            | Op::AtomicLoad(p)
-            | Op::AtomicStore { ptr: p, .. }
-            | Op::AtomicIAdd { ptr: p, .. }
-            | Op::AtomicAnd { ptr: p, .. }
-            | Op::AtomicOr { ptr: p, .. }
-            | Op::AtomicXor { ptr: p, .. }
-            | Op::AtomicSMin { ptr: p, .. }
-            | Op::AtomicSMax { ptr: p, .. }
-            | Op::AtomicUMin { ptr: p, .. }
-            | Op::AtomicUMax { ptr: p, .. }
-            | Op::AtomicExchange { ptr: p, .. }
-            | Op::AtomicCompareExchange { ptr: p, .. } => {
-                matches!(p.ty, Type::Pointer(StorageClass::StorageBuffer, _))
-            }
-            _ => false,
-        });
-    if unchecked_memory {
-        return Err(BackendError::Unsupported(
-            "StorageBuffer or image texel pointer: no bounds checks in the arm64 backend yet".into(),
-        ));
-    }
     // Testing lever: force spill mode so SMALL kernels (the
     // whole differential suite) exercise the spill machinery.
     if std::env::var("ATRIUM_SPV_FORCE_SPILL").is_ok() {
@@ -416,6 +387,10 @@ fn emit_function(
     let mut image_handles: HashMap<ValueId, (u32, u32)> = HashMap::new();
     // Pointer-typed Values: (base X-reg, byte offset).
     let mut pointers: HashMap<ValueId, (asm::Xreg, i32)> = HashMap::new();
+    // SSBO-derived pointers: (the binding's base X-reg, binding).
+    // Every access through one is bounds-checked against the
+    // binding's size (docs/spec/tier2-robust-access.md, ABI v5).
+    let mut ssbo_ptr: HashMap<ValueId, (asm::Xreg, u32)> = HashMap::new();
     // Bool-typed Values (results of FOrd*/FUnord*): held
     // in a W-reg as i32 0/1 per constraint B4.  Pool is
     // W10..W12 (3 slots, separate from the int pool which
@@ -1429,10 +1404,10 @@ fn emit_function(
     // X19..X28) and pre-populate `pointers` so subsequent
     // resolve_or_make_pointer calls return the cached reg.
     //
-    // Single-SSBO compute shaders keep the legacy X2-direct
-    // mapping so the host (atrium-vk-icd / tier2 backend)
-    // doesn't have to build a table for the common case.
-    if func.stage == ShaderStage::Compute && func.ssbo_bindings.len() >= 2 {
+    // ABI v5: X2 is always the SSBO table (16-byte entries
+    // `{base, size}`, the sink 16 bytes before entry 0), even
+    // for one binding.
+    if func.stage == ShaderStage::Compute && !func.ssbo_bindings.is_empty() {
         let mut sorted: Vec<(u32, (u32, u32))> = func.ssbo_bindings.iter()
             .map(|(vid, sb)| (*vid, *sb)).collect();
         sorted.sort_by_key(|(_, (_, binding))| *binding);
@@ -1464,8 +1439,13 @@ fn emit_function(
         }
         for (i, (vid, (_set, binding))) in sorted.iter().enumerate() {
             let dst = asm::Xreg(SSBO_BASE_REGS[i]);
-            a.emit(asm::ldr_x_offset(dst, asm::Xreg(2), (binding * 8) as u16));
+            if *binding > 2046 {
+                return Err(BackendError::Unsupported(format!(
+                    "SSBO binding {binding} too large for the table's imm12 offsets")));
+            }
+            a.emit(asm::ldr_x_offset(dst, asm::Xreg(2), (binding * 16) as u16));
             pointers.insert(ValueId(*vid), (dst, 0));
+            ssbo_ptr.insert(ValueId(*vid), (dst, *binding));
             ssbo_base_reloads.push((dst, *binding));
         }
     }
@@ -3028,6 +3008,8 @@ fn emit_function(
                 // path, as do fragment/vertex Output stores).
                 let (ptr_param, base_off) =
                     resolve_ptr_spill(&mut a, &deferred_ptr, &ints, &phi_const_val, &inst.op, ptr, &mut pointers, func.stage)?;
+                let (ptr_param, base_off) = guard_ssbo(&mut a, &ssbo_ptr, ptr,
+                    (ptr_param, base_off), access_bytes(&value.ty)?)?;
                 let base_off_u16: u16 = u16::try_from(base_off)
                     .map_err(|_| BackendError::Unsupported(format!(
                         "Op::Store byte offset {base_off} out of u16 range")))?;
@@ -3200,6 +3182,7 @@ fn emit_function(
                     resolve_ptr_spill(&mut a, &deferred_ptr, &ints, &phi_const_val, &inst.op, base, &mut pointers, func.stage)?;
                 let new_off = base_off.saturating_add(*byte_offset as i32);
                 pointers.insert(result.id, (param, new_off));
+                if let Some(&e) = ssbo_ptr.get(&base.id) { ssbo_ptr.insert(result.id, e); }
             }
             Op::AtomicLoad(ptr) => {
                 let result = inst.result.as_ref().ok_or_else(||
@@ -3207,6 +3190,8 @@ fn emit_function(
                         "AtomicLoad without result".into()))?;
                 let (x_base, base_off) =
                     resolve_ptr_spill(&mut a, &deferred_ptr, &ints, &phi_const_val, &inst.op, ptr, &mut pointers, func.stage)?;
+                let (x_base, base_off) =
+                    guard_ssbo(&mut a, &ssbo_ptr, ptr, (x_base, base_off), 4)?;
                 if base_off < 0 || base_off > u16::MAX as i32 {
                     return Err(BackendError::Unsupported(format!(
                         "AtomicLoad ptr offset {base_off} outside imm12 range")));
@@ -3218,6 +3203,8 @@ fn emit_function(
             Op::AtomicStore { ptr, value } => {
                 let (x_base, base_off) =
                     resolve_ptr_spill(&mut a, &deferred_ptr, &ints, &phi_const_val, &inst.op, ptr, &mut pointers, func.stage)?;
+                let (x_base, base_off) =
+                    guard_ssbo(&mut a, &ssbo_ptr, ptr, (x_base, base_off), 4)?;
                 if base_off < 0 || base_off > u16::MAX as i32 {
                     return Err(BackendError::Unsupported(format!(
                         "AtomicStore ptr offset {base_off} outside imm12 range")));
@@ -3233,6 +3220,8 @@ fn emit_function(
                         "AtomicCompareExchange without result".into()))?;
                 let (x_base, base_off) =
                     resolve_ptr_spill(&mut a, &deferred_ptr, &ints, &phi_const_val, &inst.op, ptr, &mut pointers, func.stage)?;
+                let (x_base, base_off) =
+                    guard_ssbo(&mut a, &ssbo_ptr, ptr, (x_base, base_off), 4)?;
                 if base_off < 0 {
                     return Err(BackendError::Unsupported(format!(
                         "AtomicCompareExchange ptr offset {base_off} negative")));
@@ -3253,7 +3242,12 @@ fn emit_function(
                 // scratch, then mov the result into a fresh
                 // int-pool reg for the IR result.
                 let w_scratch = asm::Wreg(9);
-                let addr_x = if base_off == 0 {
+                let addr_x = if base_off == 0 && x_base.0 == 9 {
+                    // Deferred pointer in X9, which W9 (the
+                    // operand scratch below) would clobber.
+                    a.emit(asm::add_imm_x(asm::Xreg(10), x_base, 0));
+                    asm::Xreg(10)
+                } else if base_off == 0 {
                     x_base
                 } else {
                     // We need W9 for both the address computation
@@ -3293,6 +3287,8 @@ fn emit_function(
                         "Atomic op without result".into()))?;
                 let (x_base, base_off) =
                     resolve_ptr_spill(&mut a, &deferred_ptr, &ints, &phi_const_val, &inst.op, ptr, &mut pointers, func.stage)?;
+                let (x_base, base_off) =
+                    guard_ssbo(&mut a, &ssbo_ptr, ptr, (x_base, base_off), 4)?;
                 if base_off < 0 {
                     return Err(BackendError::Unsupported(format!(
                         "Atomic ptr offset {base_off} negative")));
@@ -3303,48 +3299,25 @@ fn emit_function(
                 // LSE atomic instructions take a register-only
                 // address operand: build Xn = x_base + base_off
                 // (or just reuse x_base when base_off==0).
-                let addr_x = if base_off == 0 {
+                let addr_x = if base_off == 0 && x_base.0 == 9 {
+                    // Deferred pointer in X9, which W9 (the
+                    // operand scratch below) would clobber.
+                    a.emit(asm::add_imm_x(asm::Xreg(10), x_base, 0));
+                    asm::Xreg(10)
+                } else if base_off == 0 {
                     x_base
                 } else {
-                    // Use Xreg(9) as scratch -- same scratch
-                    // ConstFloat materialisation uses.  Lifetime
-                    // is the single LSE instruction below; no
-                    // overlap with W9-as-int-scratch since
-                    // atomic codegen here never touches the int
-                    // arithmetic path.
-                    let scratch_x = asm::Xreg(9);
-                    materialise_u32_into_w(&mut a, asm::Wreg(9), base_off as u32);
+                    // X10, not X9: AtomicAnd needs W9 for the
+                    // inverted operand.
+                    let scratch_x = asm::Xreg(10);
+                    materialise_u32_into_w(&mut a, asm::Wreg(10), base_off as u32);
                     a.emit(asm::add_x(scratch_x, x_base, scratch_x));
                     scratch_x
                 };
                 let w_old = int_pool.alloc(result.id)?;
-                // For AtomicAnd we need to invert the operand
-                // because ARM's LDCLR does *X &= ~Rs.  Use the
-                // scratch W9 as the inverted value holder.
-                // Note: when base_off != 0 above we've already
-                // overwritten W9 with the offset and then used
-                // it; the add_x above sets X9 (the same reg).
-                // For And we still need W9 for the inversion --
-                // safe because by this point the address is in
-                // X9 (used only by the LDCLR below); but we'd
-                // overwrite X9 if we MVN to it.  Use a
-                // different temporary: the W_value source then
-                // MVN through W9 only if there's no conflict.
-                // Simpler: do MVN before computing addr_x so
-                // the scratch is reusable.  But for clarity,
-                // when AND requires inversion AND base_off!=0,
-                // we just bail to load-op-store (rare case).
-                let is_and = matches!(&inst.op, Op::AtomicAnd { .. });
-                if is_and && base_off != 0 {
-                    // Conflict: scratch W9 is taken by address.
-                    // Fall back to non-atomic seq (legacy path).
-                    let w_new = asm::Wreg(9);
-                    a.emit(asm::ldr_w_offset(w_old, x_base, base_off as u16));
-                    a.emit(asm::and_w(w_new, w_old, w_value));
-                    a.emit(asm::str_w_offset(w_new, x_base, base_off as u16));
-                    ints.insert(result.id, w_old);
-                    continue;
-                }
+                // AtomicAnd inverts the operand into W9 below
+                // (LDCLR does *X &= ~Rs); the address is never in
+                // X9 here (X10 above, or the guard's X10).
                 match &inst.op {
                     Op::AtomicIAdd { .. } =>
                         a.emit(asm::ldaddal_w(w_value, w_old, addr_x)),
@@ -3424,6 +3397,7 @@ fn emit_function(
                     // VALUE as an address — SIGSEGV).
                     deferred_ptr.insert(result.id,
                         (x_base, base_off, index.id, log2));
+                    if let Some(&e) = ssbo_ptr.get(&base.id) { ssbo_ptr.insert(result.id, e); }
                     let ptr_lu = flat_insts.iter().enumerate().rev()
                         .find(|(_, fi)| op_reads(&fi.op, result.id))
                         .map(|(j, _)| j)
@@ -3469,6 +3443,7 @@ fn emit_function(
                 // AccessChain accumulated (the load/store
                 // imm12 will fold it).
                 pointers.insert(result.id, (dst_x, eff_off));
+                if let Some(&e) = ssbo_ptr.get(&base.id) { ssbo_ptr.insert(result.id, e); }
             }
             Op::LoadBuiltin(kind) => {
                 use atrium_spv_ir::BuiltinKind as BK;
@@ -3810,6 +3785,20 @@ fn emit_function(
                     other => return Err(BackendError::Unsupported(format!(
                         "Op::Load ptr {other:?} is not a Pointer type"))),
                 };
+                // SSBO memory is mutable, so the deferred int-vector
+                // and Mat4 loads (which read at the use) don't apply.
+                let is_ssbo = matches!(ptr.ty, Type::Pointer(StorageClass::StorageBuffer, _));
+                if is_ssbo && matches!(&pointee, Type::Mat4(_)
+                    | Type::Vec2(atrium_spv_ir::VecElement::I32 | atrium_spv_ir::VecElement::U32)
+                    | Type::Vec3(atrium_spv_ir::VecElement::I32 | atrium_spv_ir::VecElement::U32)
+                    | Type::Vec4(atrium_spv_ir::VecElement::I32 | atrium_spv_ir::VecElement::U32))
+                {
+                    return Err(BackendError::Unsupported(format!(
+                        "Op::Load of {pointee:?} from a StorageBuffer")));
+                }
+                let (param, off) = if is_ssbo {
+                    guard_ssbo(&mut a, &ssbo_ptr, ptr, (param, off), access_bytes(&pointee)?)?
+                } else { (param, off) };
                 match &pointee {
                     Type::F32 => {
                         let v = valloc_impl(&mut free_pool, &mut owners, &mut used_callee_saved_v, &mut scalars, &mut spilled, &spill_slot, &vectors, &last_use, &phi_pinned, &loop_spans, &value_def_flat_idx, &read_pos, i, spill_mode, &inst.op, result.id)?;
@@ -4996,20 +4985,37 @@ fn emit_function(
                 a.emit(asm::ldr_x_offset(x9, asm::Xreg(19), desc_off));
                 // dst = data pointer (ImageDesc.data @ #0)
                 a.emit(asm::ldr_x_offset(dst_x, x9, 0));
-                // image3D: dst += z * slice_bytes (field @28).
+                // Bounds: a coordinate outside the image (width
+                // @8, height @12, depth @24) addresses texel 0 on
+                // that axis (docs/spec/tier2-robust-access.md).
+                // w = c < dim ? c : 0, into a scratch (the coord
+                // regs stay intact).
+                let w11 = asm::Wreg(11);
+                let x11 = asm::Xreg(11);
+                let wzr = asm::Wreg(31);
+                // image3D: dst += cz * slice_bytes (field @28).
                 if let Some(z_w) = z_w {
-                    a.emit(asm::ldr_w_offset(w10, x9, 28));
-                    a.emit(asm::mul_w(w10, z_w, w10));
+                    a.emit(asm::ldr_w_offset(w10, x9, 24));
+                    a.emit(asm::cmp_w(z_w, w10));
+                    a.emit(asm::csel_w(w10, z_w, wzr, asm::Cond::Cc));
+                    a.emit(asm::ldr_w_offset(w11, x9, 28));
+                    a.emit(asm::mul_w(w10, w10, w11));
                     a.emit(asm::add_x(dst_x, dst_x, x10));
                 }
-                // w10 = stride_bytes (ImageDesc.stride_bytes @ #16)
-                a.emit(asm::ldr_w_offset(w10, x9, 16));
-                // w10 = y * stride_bytes
-                a.emit(asm::mul_w(w10, y_w, w10));
-                // w9 = x * 4 (one rgba8/r32 texel is 4 bytes)
-                a.emit(asm::lsl_imm_w(w9, x_w, 2));
-                // w10 = y*stride + x*4 (32-bit op zero-extends X10)
-                a.emit(asm::add_w(w10, w10, w9));
+                // w10 = cy * stride_bytes (@16)
+                a.emit(asm::ldr_w_offset(w10, x9, 12));
+                a.emit(asm::cmp_w(y_w, w10));
+                a.emit(asm::csel_w(w10, y_w, wzr, asm::Cond::Cc));
+                a.emit(asm::ldr_w_offset(w11, x9, 16));
+                a.emit(asm::mul_w(w10, w10, w11));
+                // w11 = cx * 4 (one rgba8/r32 texel is 4 bytes)
+                a.emit(asm::ldr_w_offset(w11, x9, 8));
+                a.emit(asm::cmp_w(x_w, w11));
+                a.emit(asm::csel_w(w11, x_w, wzr, asm::Cond::Cc));
+                a.emit(asm::lsl_imm_w(w11, w11, 2));
+                let _ = (w9, x11);
+                // w10 = cy*stride + cx*4 (32-bit op zero-extends X10)
+                a.emit(asm::add_w(w10, w10, w11));
                 // dst += offset
                 a.emit(asm::add_x(dst_x, dst_x, x10));
                 pointers.insert(result.id, (dst_x, 0));
@@ -5344,7 +5350,7 @@ fn emit_function(
                 // restored, so re-load each binding from it.
                 for &(base_reg, binding) in &ssbo_base_reloads {
                     a.emit(asm::ldr_x_offset(
-                        base_reg, x2, (binding * 8) as u16));
+                        base_reg, x2, (binding * 16) as u16));
                 }
 
                 if !is_write {
@@ -5762,6 +5768,65 @@ fn resolve_ptr_spill(
     resolve_or_make_pointer(v, pointers, stage)
 }
 
+/// Bytes a load or store of `ty` touches.
+fn access_bytes(ty: &Type) -> Result<u32, BackendError> {
+    Ok(match ty {
+        Type::F32 | Type::I32 | Type::U32 => 4,
+        Type::Vec2(_) => 8,
+        Type::Vec3(_) => 12,
+        Type::Vec4(_) => 16,
+        Type::Mat4(_) => 64,
+        other => return Err(BackendError::Unsupported(format!(
+            "access size of {other:?}"))),
+    })
+}
+
+/// The bounds-checked address for a `bytes`-wide access through `v`
+/// at `(reg, off)` (docs/spec/tier2-robust-access.md, ABI v5):
+///
+/// ```text
+/// x10 = reg + off
+/// end = x10 - base + bytes          (doff + off + n)
+/// x10 = end <= size ? x10 : sink    (size, sink from the X2 table)
+/// ```
+///
+/// Returns `(X10, 0)`. Clobbers X9 (the deferred-pointer scratch,
+/// consumed by then), X11 and the flags. Non-SSBO pointers pass
+/// through unchanged; an SSBO pointer whose binding isn't known is
+/// refused rather than left unchecked.
+fn guard_ssbo(
+    a: &mut asm::Asm,
+    ssbo_ptr: &HashMap<ValueId, (asm::Xreg, u32)>,
+    v: &Value,
+    (reg, off): (asm::Xreg, i32),
+    bytes: u32,
+) -> Result<(asm::Xreg, i32), BackendError> {
+    if !matches!(v.ty, Type::Pointer(StorageClass::StorageBuffer, _)) {
+        return Ok((reg, off));
+    }
+    let &(base, binding) = ssbo_ptr.get(&v.id).ok_or_else(||
+        BackendError::Unsupported(format!(
+            "StorageBuffer pointer {:?} not traced to a binding", v.id)))?;
+    if off < 0 || reg.0 == 31 {
+        return Err(BackendError::Unsupported(format!(
+            "StorageBuffer access at offset {off} from x{}", reg.0)));
+    }
+    let (x9, x10, x11) = (asm::Xreg(9), asm::Xreg(10), asm::Xreg(11));
+    if off < 4096 {
+        a.emit(asm::add_imm_x(x10, reg, off as u16));
+    } else {
+        materialise_u32_into_w(a, asm::Wreg(11), off as u32);
+        a.emit(asm::add_x(x10, reg, x11));
+    }
+    a.emit(asm::sub_x(x11, x10, base));
+    a.emit(asm::add_imm_x(x11, x11, bytes as u16));
+    a.emit(asm::ldr_x_offset(x9, asm::Xreg(2), (binding * 16 + 8) as u16));
+    a.emit(asm::cmp_x(x11, x9));
+    a.emit(asm::ldur_x(x9, asm::Xreg(2), -16));
+    a.emit(asm::csel_x(x10, x10, x9, asm::Cond::Ls));
+    Ok((x10, 0))
+}
+
 fn resolve_or_make_pointer(
     v: &Value,
     pointers: &mut HashMap<ValueId, (asm::Xreg, i32)>,
@@ -5789,7 +5854,8 @@ fn resolve_or_make_pointer(
         // shader writes through via StorageBuffer pointers.
         (ShaderStage::Compute,  StorageClass::Uniform)       => asm::Xreg(0),
         (ShaderStage::Compute,  StorageClass::PushConstant)  => asm::Xreg(1),
-        (ShaderStage::Compute,  StorageClass::StorageBuffer) => asm::Xreg(2),
+        // StorageBuffer roots come from the prologue's SSBO table
+        // loads (X2 is the table, not a buffer).
 
         (stage, other) => return Err(BackendError::Unsupported(format!(
             "stage={stage:?} storage class={other:?} not mapped to an \
