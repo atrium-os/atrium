@@ -258,13 +258,13 @@ M4 Max. See docs/spec/gpu-isolation.md.
 status                  = "experimental"
 isolation_test_passed   = true
 isolation_test_date     = "2026-11-05"
-isolation_test_commit   = "bb3f7ba4b3cf"
-abi_rev                 = 3
+isolation_test_commit   = "e2fe35b16e50"
+abi_rev                 = 4
 notes = """
 RDNA4 driver against gpusim 354fffb. The five 2026-11-03 isolation breaks
 are fixed, plus per-queue completions and the hang watchdog (review A2.2,
 A2.6; atrium-gpu-amd/ISOLATION.md), VM faults that fail their work at
-once and read-only binds (F6 G1). Shared gfx/compute queues until per-VM
+once and read-only binds (F6 G1), CAP_ISA (ABI rev 4). Shared gfx/compute queues until per-VM
 MES queues land.
 """
 
