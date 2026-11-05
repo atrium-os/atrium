@@ -66,6 +66,7 @@
 #![feature(portable_simd)]
 
 pub mod backend;
+pub mod broker;
 /// Carillon doorbell-driven GPU VM transport core, re-exported from the
 /// pure `carillon-transport` crate (shared with the FreeBSD guest pump).
 #[cfg(unix)]

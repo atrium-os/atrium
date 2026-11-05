@@ -1,6 +1,6 @@
 # Tier-2: robust memory access for untrusted shaders
 
-Status: steps 1 (bounds checks, ABI v5) and 2 (compiler sandbox) done 2026-11-05; step 3 next. Owner: the Tier-2 thread. Asked for by Shankar: Tier-2 runs
+Status: all three steps done 2026-11-05 (bounds checks, compiler sandbox, per-app executor jails); verified in the amd64 FreeBSD VM. Owner: the Tier-2 thread. Asked for by Shankar: Tier-2 runs
 app-supplied SPIR-V as native code, which is arbitrary code execution, so it has to be
 bounded in the code and jailed around it.
 
@@ -87,9 +87,41 @@ hand back unchecked code; the executor jail (step 3) is the backstop for that. T
 app SPIR-V unsandboxed and should stay a development option. Not yet run on FreeBSD
 (cross-checked only); the first run is part of step 3's VM test.
 
-## 4. Jail the executor (step 3)
+(Update: in the amd64 VM, `--sandbox-check` exits 0 and the per-app workers compile through the sandboxed compiler.)
 
-App shaders (Tier-2) and app draw records (Tier-1) run in a jailed `aqueduct-gpu-host`
-with its own user and no writable mounts but its socket and shader cache, through a
-services.d manifest like frescod's. Tier-1 also gets size limits on wire data (texture and
-path dimensions), so a client can't make it allocate without bound.
+## 4. Jail the executor (step 3): done, one jail per app
+
+One `aqueduct-gpu-host` used to serve every app, and frames name resources by raw,
+client-chosen ids, so one app could read another's images. Shankar chose one executor
+jail per app (2026-11-05).
+
+- **Broker** (`--transport broker`, `aqueduct-gpu-host/src/broker.rs`): the endpoint apps
+  connect to. It reads nothing from a client. Each connection is handed, as stdin, to a
+  one-shot jail of the bundle `org.atrium.aqueduct.gpu` that portcullisd starts
+  (ExecInstance, like Fresco's renderers). No portcullisd, no worker: the client is
+  refused (fail closed). At most 64 workers, 16 per client uid.
+  `AQUEDUCT_GPU_WORKER_LAUNCHER=unconfined` runs workers as plain child processes, for
+  development and tests only. Runs as `_aqueduct-gpu` (65014) from
+  `aqueduct-gpu-host/etc/services.d/45-atrium-aqueduct-gpu.toml`.
+- **Worker** (`--transport stdin`; the binary named `aqueduct-gpu-worker` starts in this
+  mode with Tier-2 defaults): serves one session on fd 0 and exits on hang-up, which ends
+  the jail. Runs as `_aqueduct-gpu-app` (65015) under the system policy's worker rule,
+  with the bundle's 1 GiB memory cap (racct required). It writes no files: an empty
+  `--cache-root` makes the loader map blobs straight from the compiler's reply and keep
+  them in memory, so compiled code is per app.
+- **Install**: `scripts/aqueduct-gpu-bundle.sh` (users, signed bundle, policy rule, broker
+  binary, socket dir). The broker's socket is mode 0666; who can reach it is decided by
+  which jails mount `/atrium/sockets/aqueduct-gpu`.
+- **Size limits** (0da3967): Tier-1 path command counts and Tier-2 colour-attachment
+  counts are bounded by the record length, mip levels by the image's chain, images by
+  2048 layers and 1 GiB. A per-app memory cap is the jail's rctl limit.
+- **Tests**: `aqueduct-gpu-host/tests/broker.rs` (one worker per connection, a hang-up
+  ends only its worker, refused without portcullisd). `examples/tier2_probe.rs` runs a
+  compute shader through any endpoint and checks a far out-of-bounds store lands nowhere.
+  VM run (amd64, racct on): four probes as an ordinary user, each in its own
+  `app-org-atrium-aqueduct-gpu--gpuN` jail as `_aqueduct-gpu-app`, all `PROBE OK`.
+
+Not done yet: no app jail mounts the broker's socket dir (third-party Vulkan apps need a
+graphics capability that grants it), the old shared listener (`--transport socket`) still
+exists for development and the Mac host, and the arm64 bespoke backend still declines
+SSBO shaders (they use Cranelift).

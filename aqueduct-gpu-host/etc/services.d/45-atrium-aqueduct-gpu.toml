@@ -1,0 +1,61 @@
+# /etc/atrium/services.d/45-atrium-aqueduct-gpu.toml
+#
+# The aqueduct-gpu BROKER: the endpoint third-party Vulkan apps (atrium-vk-icd)
+# connect to. It reads nothing from a client. Each connection is handed, as
+# stdin, to a one-shot worker jail of org.atrium.aqueduct.gpu that portcullisd
+# starts for it (docs/spec/tier2-robust-access.md §4): Tier-1 draw records and
+# Tier-2 shaders, which run as native code, execute there, one jail per app,
+# as _aqueduct-gpu-app, with the bundle's memory cap and its own tmpfs shader
+# cache. If portcullisd can't start a worker the client is refused.
+#
+# REQUIRES (commission once per host): scripts/aqueduct-gpu-bundle.sh, which
+# creates _aqueduct-gpu (65014, this broker) and _aqueduct-gpu-app (65015, the
+# workers), installs and signs the worker bundle, adds the system policy's
+# worker rule, installs the broker as /usr/local/bin/atrium-aqueduct-gpu and
+# creates /atrium/sockets/aqueduct-gpu owned by _aqueduct-gpu. 65014/65015 are
+# in jaild.policy's allowed_system_uids. Plus the rootfs mountpoint dirs:
+# <path>/{dev,libexec,lib,usr/lib,usr/local/bin,atrium/sockets}.
+
+enabled       = true
+name          = "atrium-aqueduct-gpu"
+path          = "/var/lib/atrium/jails/aqueduct-gpu"
+children_max  = 0
+devfs_ruleset = 0
+
+[[mounts]]
+source = "/libexec"
+dest   = "libexec"
+kind   = "ro_nullfs"
+[[mounts]]
+source = "/lib"
+dest   = "lib"
+kind   = "ro_nullfs"
+[[mounts]]
+source = "/usr/lib"
+dest   = "usr/lib"
+kind   = "ro_nullfs"
+[[mounts]]
+source = "/usr/local/bin"
+dest   = "usr/local/bin"
+kind   = "ro_nullfs"
+[[mounts]]
+source = "/atrium/sockets"                        # rw: binds aqueduct-gpu/, reaches portcullisd
+dest   = "atrium/sockets"
+kind   = "rw_nullfs"
+
+[exec]
+path = "/usr/local/bin/atrium-aqueduct-gpu"
+argv = ["atrium-aqueduct-gpu",
+        "--transport", "broker",
+        "--socket", "/atrium/sockets/aqueduct-gpu/aqueduct-gpu.sock"]
+uid  = 65014   # _aqueduct-gpu
+gid  = 65014
+
+[[exec.env]]
+key   = "PATH"
+value = "/bin:/usr/bin"
+
+[supervision]
+restart                       = "always"
+failure_budget_secs           = 60
+min_lifetime_for_success_secs = 5

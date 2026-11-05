@@ -57,6 +57,10 @@ pub struct LoaderConfig {
     /// Root cache directory (e.g. `/var/atrium/shaders`).
     /// The version subdirectory `v{N}/` is appended
     /// internally per the path-based versioning policy.
+    ///
+    /// Empty means no disk cache: compiled blobs are mapped straight
+    /// from the compiler's reply and kept only in memory (the per-app
+    /// executor jail, which has no writable filesystem).
     pub cache_root: PathBuf,
     /// Shader ABI version. Bumped when the daemon and the
     /// compiled-shader function signatures get out of sync.
@@ -209,11 +213,26 @@ impl ShaderCache {
         // compiler writes one of two artifacts: a flat
         // `.afblob` (bespoke backend, the JIT-emit path) or
         // a `.so` (Cranelift fallback, until phase 4).
+        if self.config.cache_root.as_os_str().is_empty() {
+            let (blob, pcmap) = self.compile(spirv, overrides)?;
+            let shader = Arc::new(jitmap::open(&blob, Some(&pcmap))?);
+            let mut loaded = self.loaded.lock().map_err(|_| LoadError::Internal(
+                "loaded-shader mutex poisoned".to_string(),
+            ))?;
+            return Ok(loaded.entry(hash).or_insert(shader).clone());
+        }
         let blob_path = self.blob_path(&hash);
         let so_path = self.so_path(&hash);
         let pcmap_path = self.pcmap_path(&hash);
         if !blob_path.exists() && !so_path.exists() {
-            self.compile(spirv, &hash, overrides)?;
+            let version_dir = self.version_dir();
+            std::fs::create_dir_all(&version_dir).map_err(|e|
+                LoadError::Internal(format!(
+                    "creating cache dir {}: {e}", version_dir.display(),
+                )))?;
+            let (blob, pcmap) = self.compile(spirv, overrides)?;
+            write_atomically(&blob_path, &blob)?;
+            write_atomically(&pcmap_path, &pcmap)?;
             if !blob_path.exists() && !so_path.exists() {
                 return Err(LoadError::Internal(format!(
                     "atrium-spv-compile exited 0 but neither {} nor {} exists",
@@ -263,23 +282,16 @@ impl ShaderCache {
     }
 
     /// Run the compile binary as a sandboxed subprocess
-    /// (`--stdio`) and write its output into the cache. When
+    /// (`--stdio`) and return its `(blob, pcmap)`. When
     /// `overrides` is non-empty, each entry is forwarded as a
     /// `--spec-const SPECID=VALUE` arg (hex-encoded).
     fn compile(
         &self,
         spirv: &[u8],
-        hash: &str,
         overrides: &[(u32, u32)],
-    ) -> Result<(), LoadError> {
+    ) -> Result<(Vec<u8>, Vec<u8>), LoadError> {
         use std::io::{Read as _, Write as _};
         use std::process::Stdio;
-
-        let version_dir = self.version_dir();
-        std::fs::create_dir_all(&version_dir).map_err(|e|
-            LoadError::Internal(format!(
-                "creating cache dir {}: {e}", version_dir.display(),
-            )))?;
 
         let mut cmd = Command::new(&self.config.compile_binary);
         cmd.arg("--stdio")
@@ -329,9 +341,7 @@ impl ShaderCache {
                 "atrium-spv-compile output exceeds {MAX_COMPILER_OUTPUT} bytes")));
         }
         let (blob, pcmap) = parse_stdio_reply(&stdout)?;
-        write_atomically(&self.blob_path(hash), blob)?;
-        write_atomically(&self.pcmap_path(hash), pcmap)?;
-        Ok(())
+        Ok((blob.to_vec(), pcmap.to_vec()))
     }
 }
 

@@ -68,6 +68,12 @@ enum Transport {
     /// an `IvshmemServer`, wait for QEMU, and run `serve_ivshmem` against
     /// the selected backend. See docs/spec/carillon.md.
     Carillon,
+    /// Per-app jails: accept, and hand each connection to a worker of
+    /// its own (`aqueduct_gpu_host::broker`). Reads nothing itself.
+    Broker,
+    /// Worker: serve one session on fd 0 (the client socket the broker
+    /// passed), then exit.
+    Stdin,
 }
 
 /// Backend kind selected at daemon startup. Cannot change mid-run
@@ -174,7 +180,25 @@ fn parse_args() -> Result<Args> {
     let mut calibrate = false;
     let mut trust_tiers = false;
     let mut auto_certify = false;
-    let mut iter = std::env::args().skip(1);
+    let mut iter: Box<dyn Iterator<Item = String>> = Box::new(std::env::args().skip(1));
+    // Installed as `aqueduct-gpu-worker` (the per-app jail's entry,
+    // which portcullisd starts with no arguments): a Tier-2 worker on
+    // fd 0, its shader cache in the jail's own tmpfs, the compiler
+    // beside it.
+    if is_worker_argv0() {
+        let compiler = std::env::current_exe().ok()
+            .map(|e| e.with_file_name("atrium-spv-compile"))
+            .unwrap_or_else(|| PathBuf::from("/bin/atrium-spv-compile"));
+        let defaults = vec![
+            "--transport".into(), "stdin".into(),
+            "--backend".into(), "tier2".into(), "--tier2".into(),
+            // No disk cache: the jail has no writable filesystem, and
+            // compiled code stays per app, in memory.
+            "--cache-root".into(), "".into(),
+            "--compile-binary".into(), compiler.to_string_lossy().into_owned(),
+        ];
+        iter = Box::new(defaults.into_iter().chain(std::env::args().skip(1)));
+    }
     while let Some(a) = iter.next() {
         match a.as_str() {
             "--socket" => {
@@ -187,8 +211,10 @@ fn parse_args() -> Result<Args> {
                 transport = match v.as_str() {
                     "socket"   => Transport::Socket,
                     "carillon" => Transport::Carillon,
+                    "broker"   => Transport::Broker,
+                    "stdin"    => Transport::Stdin,
                     other => return Err(anyhow!(
-                        "unknown --transport {other:?}; valid: socket | carillon")),
+                        "unknown --transport {other:?}; valid: socket | carillon | broker | stdin")),
                 };
             }
             "--carillon-sock" => {
@@ -251,7 +277,7 @@ fn parse_args() -> Result<Args> {
             }
             "--help" | "-h" => {
                 println!("usage: aqueduct-gpu-host [--socket PATH] \
-                    [--transport socket|carillon] \
+                    [--transport socket|carillon|broker|stdin] \
                     [--carillon-sock PATH] [--carillon-shm PATH] \
                     [--backend stub|software|moltenvk|tier2|routing] \
                     [--tier2] [--cache-root PATH] [--compile-binary PATH] \
@@ -324,6 +350,27 @@ fn parse_args() -> Result<Args> {
     })
 }
 
+fn is_worker_argv0() -> bool {
+    std::env::args().next().map(|a| {
+        std::path::Path::new(&a).file_name().map(|f| f == "aqueduct-gpu-worker").unwrap_or(false)
+    }).unwrap_or(false)
+}
+
+/// The broker's own arguments with the transport switched to `stdin`:
+/// what an unconfined worker runs with.
+fn worker_args() -> Vec<String> {
+    let mut out = Vec::new();
+    let mut it = std::env::args().skip(1);
+    while let Some(a) = it.next() {
+        if a == "--transport" { it.next(); continue; }
+        if a == "--socket" { it.next(); continue; }
+        out.push(a);
+    }
+    out.push("--transport".into());
+    out.push("stdin".into());
+    out
+}
+
 /// Build the [`Tier2Registry`] from a base [`LoaderConfig::production`]
 /// with any CLI overrides applied.  Ensures the cache directory exists
 /// (the loader requires it on first compile) and reports the chosen
@@ -335,11 +382,15 @@ fn make_tier2_registry(
     let mut cfg = LoaderConfig::production();
     if let Some(p) = cache_root { cfg.cache_root = p; }
     if let Some(p) = compile_binary { cfg.compile_binary = p; }
-    std::fs::create_dir_all(&cfg.cache_root)
-        .with_context(|| format!(
-            "tier-2 cache-root {} not creatable",
-            cfg.cache_root.display(),
-        ))?;
+    if cfg.cache_root.as_os_str().is_empty() {
+        log::info!("tier-2: no disk cache (compiled shaders stay in memory)");
+    } else {
+        std::fs::create_dir_all(&cfg.cache_root)
+            .with_context(|| format!(
+                "tier-2 cache-root {} not creatable",
+                cfg.cache_root.display(),
+            ))?;
+    }
     if !cfg.compile_binary.exists() {
         // Not fatal at startup -- the binary might be installed
         // after the daemon launches, and tier-2 compile failure
@@ -471,6 +522,11 @@ fn main() -> Result<()> {
         .init();
 
     let args = parse_args()?;
+    // The broker builds no backend and parses no client data.
+    if args.transport == Transport::Broker {
+        let launch = aqueduct_gpu_host::broker::WorkerLaunch::from_env(worker_args())?;
+        return aqueduct_gpu_host::broker::run(&args.socket, launch);
+    }
     log::info!(
         "aqueduct-gpu-host starting (backend: {:?}, tier2: {})",
         args.backend, args.tier2,
@@ -509,6 +565,10 @@ fn main() -> Result<()> {
         }
     }
 
+    if args.transport == Transport::Stdin {
+        return serve_stdin(backend, registry, args.spirv_opt_binary);
+    }
+
     let mut listener = Listener::bind(&args.socket, backend)?;
     if let Some(reg) = registry {
         listener = listener.with_tier2_registry(reg);
@@ -528,6 +588,30 @@ fn main() -> Result<()> {
         listener = listener.with_spirv_opt_binary(p);
     }
     listener.accept_loop()?;
+    Ok(())
+}
+
+/// Worker mode: one session on fd 0, which must be the client's socket.
+fn serve_stdin(
+    backend: Arc<dyn Backend>,
+    registry: Option<Arc<Tier2Registry>>,
+    spirv_opt: Option<PathBuf>,
+) -> Result<()> {
+    use std::os::fd::FromRawFd;
+    use std::os::unix::net::UnixStream;
+    // SAFETY: fd 0 is ours for the life of the process; it is the
+    // client socket the broker handed over (a non-socket fails the
+    // first read and the session ends).
+    let stream = unsafe { UnixStream::from_raw_fd(0) };
+    let conn = aqueduct::Connection::wrap(stream).context("wrap stdin")?;
+    let mut sess = aqueduct_gpu_host::Session::new(conn, backend);
+    if let Some(r) = registry { sess.set_tier2_registry(r); }
+    if let Some(b) = spirv_opt { sess.set_spirv_opt_binary(b); }
+    log::info!("worker: serving one session on stdin");
+    match sess.run() {
+        Ok(()) => log::info!("worker: session ended cleanly"),
+        Err(e) => log::warn!("worker: session ended with error: {e}"),
+    }
     Ok(())
 }
 

@@ -5273,6 +5273,20 @@ Shader tools in cloud sessions (GitHub release downloads are blocked):
 - GLSL: `apt-get install -y glslang-tools spirv-tools`. Write loops break-first (`for (;k<n;)` merge-less blocks are rejected).
 - lavapipe (golden oracle only): `apt install mesa-vulkan-drivers`, `VK_DRIVER_FILES=/usr/share/vulkan/icd.d/lvp_icd.json`.
 
+### 13.4a Per-app GPU executor jails (aqueduct-gpu broker) in the VM
+
+Spec: `docs/spec/tier2-robust-access.md` §4. Cross-build `aqueduct-gpu-host` (bin and
+`--example tier2_probe`) and `atrium-spv-compile` with `CROSS_RUSTFLAGS`, plus the
+portcullis workspace (deploy with `TARGET=x86_64-unknown-freebsd ALLOW_RCTL=true`). The
+guest needs `kern.racct.enable=1` and `portcullisd` running (`sysrc portcullisd_enable=YES`).
+In the guest: `sh aqueduct-gpu-bundle.sh <host> <compiler> /root/e2e-key.pem /root/opifex`,
+then start the broker manifest with `atrium-portcullisd-bootstrap --services-dir <dir>`
+(start it with `</dev/null` or the ssh session hangs). Check as an ordinary user:
+`tier2_probe /atrium/sockets/aqueduct-gpu/aqueduct-gpu.sock [index]` prints `PROBE OK`;
+the broker log is `/var/log/atrium/atrium-aqueduct-gpu.log`. Gotchas: opifex resets
+directory modes to 0755 (a worker has no writable dir, hence the in-memory shader cache),
+and the broker's jail has no `/dev/null`.
+
 ### 13.5 RDNA4 oracle: gpusim locally, R9700 remotely
 
 The `atrium-rdna4-oracle` crate holds the cases. Its binaries:

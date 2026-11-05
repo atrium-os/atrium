@@ -213,6 +213,9 @@ allowed_system_uids = [
              # portcullisd under the system policy's worker rule
     # 65012 = _atrium-devevents   (reserved)
     # 65013 = _atrium-portcullisd (reserved)
+    65014,   # _aqueduct-gpu: the GPU broker (aqueduct-gpu-bundle.sh creates it)
+    65015,   # _aqueduct-gpu-app: per-app GPU executors, started for it by
+             # portcullisd under the system policy's worker rule
 ]
 
 [gid]
@@ -220,6 +223,8 @@ allowed_system_gids = [
     # mirrors uid table
     65010,   # _frescod
     65011,   # _fresco-render
+    65014,   # _aqueduct-gpu
+    65015,   # _aqueduct-gpu-app
 ]
 
 

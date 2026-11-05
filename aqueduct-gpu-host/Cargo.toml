@@ -86,6 +86,10 @@ libc           = "0.2"
 # pump; the host re-exports it as `aqueduct_gpu_host::carillon`.
 carillon-transport = { path = "../carillon-transport" }
 
+# Per-app executor jails: the broker asks portcullisd (ExecInstance) for
+# one worker jail per connection, like frescod's renderers.
+portcullis-ipc = { path = "../portcullis/portcullis-ipc" }
+
 
 [dev-dependencies]
 aqueduct-gpu-client = { path = "../aqueduct-gpu-client" }
