@@ -77,6 +77,12 @@ impl FrescoConn for ClientConn {
         }
         Ok(())
     }
+    fn display_modes(&mut self) -> io::Result<fresco_protocol::WmDisplayModesReply> {
+        self.conn.wm_display_modes()
+    }
+    fn set_display_mode(&mut self, width: u32, height: u32, refresh_mhz: u32) -> io::Result<()> {
+        self.conn.wm_set_display_mode(width, height, refresh_mhz)
+    }
 }
 
 
@@ -97,16 +103,26 @@ fn screen(conn: &mut Connection) -> Screen {
         })
         .map(|(w, h)| (w, h, 0))
         .or_else(|| match conn.display_info() {
-            Ok(d) if d.width > 0 && d.height > 0 => {
-                eprintln!("forum-wm: screen {}x{} @ {} mHz, top {} rows frescod's (from frescod)",
-                          d.width, d.height, d.refresh_mhz, d.reserved_top);
-                let top = (d.reserved_top as i32).min(d.height as i32 / 2);
-                Some((d.width as i32, d.height as i32, top))
-            }
-            Ok(_)  => { eprintln!("forum-wm: frescod reports no mode"); None }
+            Ok(d) => screen_geometry(&d),
             Err(e) => { eprintln!("forum-wm: display_info failed: {e}"); None }
         })
         .unwrap_or((1920, 1080, 0));
+    screen_from(w, h, top)
+}
+
+/// frescod's reported mode → (w, h, top rows reserved), or None if no mode.
+fn screen_geometry(d: &fresco_protocol::DisplayInfoResponse) -> Option<(i32, i32, i32)> {
+    if d.width == 0 || d.height == 0 {
+        eprintln!("forum-wm: frescod reports no mode");
+        return None;
+    }
+    eprintln!("forum-wm: screen {}x{} @ {} mHz, top {} rows frescod's (from frescod)",
+              d.width, d.height, d.refresh_mhz, d.reserved_top);
+    let top = (d.reserved_top as i32).min(d.height as i32 / 2);
+    Some((d.width as i32, d.height as i32, top))
+}
+
+fn screen_from(w: i32, h: i32, top: i32) -> Screen {
     /* frescod's trusted strip (F4d) covers the top `top` rows: the session's
      * screen, bar included, starts below it. */
     Screen { rect: WmRect { x: 0, y: top, w, h: h - top }, bar_h: 24, dock_h: 48 }
@@ -225,6 +241,7 @@ fn spawn_input_poller(core: Core) {
             let mut zoom = false;
             let mut snap_dir: Option<Snap> = None;
             let mut unsnap = false;
+            let mut display: Option<fresco_protocol::DisplayInfoResponse> = None;
             {
                 let mut g = core.lock().unwrap();
                 loop {
@@ -237,6 +254,9 @@ fn spawn_input_poller(core: Core) {
                             created = Some(window_id); // a new doc opens focused
                         }
                         Ok(Some(Event::WindowDestroyed { .. })) => surfaces_changed = true,
+                        // The output changed (a mode switch or a monitor swap):
+                        // keep the latest, re-lay out once below.
+                        Ok(Some(Event::DisplayChanged(d))) => display = Some(d),
                         // The switcher hotkey (Super+Tab): cycle document focus.
                         // The WM sees every key (it's a subscriber); this one is
                         // a window-management gesture, not app text input.
@@ -286,6 +306,23 @@ fn spawn_input_poller(core: Core) {
                         Err(e) => {
                             eprintln!("forum-wm: input poll error: {e}");
                             break;
+                        }
+                    }
+                }
+            }
+
+            // A new screen size: re-place every surface for it, unless
+            // FORUM_SCREEN pins the layout to a screen the hardware isn't showing.
+            if let Some(d) = display {
+                if std::env::var_os("FORUM_SCREEN").is_none() {
+                    if let Some((w, h, top)) = screen_geometry(&d) {
+                        let mut g = core.lock().unwrap();
+                        let (wm, conn) = { let c = &mut *g; (&mut c.0, &mut c.1) };
+                        match wm.set_screen(conn, screen_from(w, h, top)) {
+                            Ok(Some(l)) => eprintln!(
+                                "forum-wm: display now {w}x{h} — re-laid out {} surface(s)", l.slots.len()),
+                            Ok(None) => {}       // same geometry (a refresh-only switch)
+                            Err(e) => eprintln!("forum-wm: relayout on display change: {e}"),
                         }
                     }
                 }

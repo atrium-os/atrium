@@ -168,6 +168,7 @@ fn print_or_focus(args: &[String]) -> std::io::Result<()> {
         }
         Reply::Ack => println!("forum-overview: focus applied"),
         Reply::Err { message } => { eprintln!("forum-overview: core refused: {message}"); std::process::exit(1); }
+        other => eprintln!("forum-overview: unexpected reply {other:?}"),
     }
     Ok(())
 }

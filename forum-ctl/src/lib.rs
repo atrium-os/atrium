@@ -12,7 +12,7 @@
 
 use serde::{Deserialize, Serialize};
 
-pub use fresco_protocol::WmSurfaceInfo;
+pub use fresco_protocol::{WmDisplayMode, WmSurfaceInfo};
 
 /// The canonical forum-ctl socket inside a Portcullis jail. Portcullis nullfs-mounts
 /// the per-service directory `/atrium/sockets/forum-ctl/` (for both `window-management`,
@@ -48,6 +48,13 @@ pub enum Intent {
     /// drives input routing + the deadline lane + GPU power, §2.5) and re-declares
     /// the layout to Fresco.
     Focus { surface_id: u32 },
+    /// "Which modes does the monitor offer, and which is lit?" — a display
+    /// settings panel needs the list. Read-only.
+    ListDisplayModes,
+    /// "Switch the display to this mode." `refresh_mhz` 0 takes the first
+    /// listed refresh at that size. The core asks frescod, which switches at
+    /// its next frame and broadcasts the new geometry; the WM then re-lays out.
+    SetDisplayMode { width: u32, height: u32, refresh_mhz: u32 },
 }
 
 /// The core's answer to an `Intent`.
@@ -59,6 +66,9 @@ pub enum Reply {
     Ack,
     /// The intent failed or was refused.
     Err { message: String },
+    /// The monitor's modes and the lit one's index (`u32::MAX` if none or no
+    /// monitor) — answer to `ListDisplayModes`.
+    DisplayModes { modes: Vec<WmDisplayMode>, current: u32 },
 }
 
 /// Encode a message for the wire.
@@ -109,7 +119,8 @@ mod tests {
 
     #[test]
     fn intents_round_trip() {
-        for i in [Intent::ListSurfaces, Intent::Focus { surface_id: 7 }] {
+        for i in [Intent::ListSurfaces, Intent::Focus { surface_id: 7 }, Intent::ListDisplayModes,
+                  Intent::SetDisplayMode { width: 2560, height: 1440, refresh_mhz: 59951 }] {
             let b = encode(&i).unwrap();
             assert_eq!(decode::<Intent>(&b).unwrap(), i);
         }
@@ -120,5 +131,8 @@ mod tests {
         let r = Reply::Surfaces { surfaces: Vec::new(), focus: 3 };
         assert_eq!(decode::<Reply>(&encode(&r).unwrap()).unwrap(), r);
         assert_eq!(decode::<Reply>(&encode(&Reply::Ack).unwrap()).unwrap(), Reply::Ack);
+        let m = WmDisplayMode { width: 1920, height: 1080, refresh_mhz: 60000, preferred: true };
+        let r = Reply::DisplayModes { modes: vec![m], current: 0 };
+        assert_eq!(decode::<Reply>(&encode(&r).unwrap()).unwrap(), r);
     }
 }

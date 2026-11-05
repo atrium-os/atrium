@@ -42,6 +42,8 @@ pub fn translate(ev: &fresco_client::Event) -> Option<Event> {
         // Window lifecycle (create/destroy) is a WM concern, not app input.
         | fresco_client::Event::WindowCreated { .. }
         | fresco_client::Event::WindowDestroyed { .. }
+        // The output changed mode: the App's window keeps its size.
+        | fresco_client::Event::DisplayChanged(_)
         | fresco_client::Event::Unknown { .. } => None,
     }
 }

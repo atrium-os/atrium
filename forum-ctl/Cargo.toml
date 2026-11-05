@@ -14,3 +14,7 @@ path = "src/lib.rs"
 fresco-protocol = { path = "../fresco-protocol" }
 serde = { version = "1", features = ["derive"] }
 postcard = { version = "1", features = ["alloc"], default-features = false }
+
+[[bin]]
+name = "forum-ctl"
+path = "src/bin/forum-ctl.rs"

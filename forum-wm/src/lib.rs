@@ -18,7 +18,7 @@ use fresco_protocol::{
 
 /// The output region: the screen plus the chrome-reserved edges (a top bar, a
 /// bottom dock). Documents get the work area; chrome reserves the edges.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Screen {
     pub rect: WmRect,
     pub bar_h: i32,
@@ -341,6 +341,12 @@ pub mod daemon {
         fn enumerate(&mut self) -> io::Result<Vec<WmSurfaceInfo>>;
         fn declare_layout(&mut self, layout: &WmDeclareLayoutPayload) -> io::Result<()>;
         fn set_rendering(&mut self, decisions: &[WmSetRenderingPayload]) -> io::Result<()>;
+        /// The monitor's modes + the lit one (OP_WM_DISPLAY_MODES).
+        fn display_modes(&mut self) -> io::Result<fresco_protocol::WmDisplayModesReply>;
+        /// Ask frescod to switch mode (OP_WM_SET_DISPLAY_MODE). It switches
+        /// at its next frame and broadcasts EV_DISPLAY_CHANGED, on which the
+        /// WM adopts the new screen ([`Wm::set_screen`]).
+        fn set_display_mode(&mut self, width: u32, height: u32, refresh_mhz: u32) -> io::Result<()>;
     }
 
     /// The WM core state: output geometry, the human's focus intent, and the
@@ -603,6 +609,20 @@ pub mod daemon {
         /// arrange the visible surfaces, declare the atomic layout, gate the
         /// occluded ones + every inactive-workspace surface. Returns the
         /// declared (active-workspace) layout.
+        /// The output changed size (a mode switch or a monitor swap): adopt the
+        /// new screen and re-lay out every surface for it. A screen of zero
+        /// area (monitor unplugged) keeps the old layout: there is nothing to
+        /// place windows on, and the next plug brings a real size.
+        pub fn set_screen(&mut self, conn: &mut impl FrescoConn, screen: Screen)
+            -> io::Result<Option<WmDeclareLayoutPayload>>
+        {
+            if screen.rect.w <= 0 || screen.rect.h <= 0 || screen == self.screen {
+                return Ok(None);
+            }
+            self.screen = screen;
+            self.reconcile(conn).map(Some)
+        }
+
         pub fn reconcile(&self, conn: &mut impl FrescoConn) -> io::Result<WmDeclareLayoutPayload> {
             let surfaces = conn.enumerate()?;
             self.declare(conn, &surfaces)
@@ -746,6 +766,18 @@ pub mod control {
                     Err(e) => Reply::Err { message: e.to_string() },
                 }
             }
+            Intent::ListDisplayModes => match conn.display_modes() {
+                Ok(r) => Reply::DisplayModes { modes: r.modes, current: r.current },
+                Err(e) => Reply::Err { message: e.to_string() },
+            },
+            // frescod validates the mode against the monitor's list; the WM
+            // re-lays out when frescod's EV_DISPLAY_CHANGED arrives, not here,
+            // so a refused or failed switch leaves the layout alone.
+            Intent::SetDisplayMode { width, height, refresh_mhz } =>
+                match conn.set_display_mode(width, height, refresh_mhz) {
+                    Ok(()) => Reply::Ack,
+                    Err(e) => Reply::Err { message: e.to_string() },
+                },
         }
     }
 }
@@ -938,6 +970,8 @@ mod tests {
         surfaces: Vec<WmSurfaceInfo>,
         declared: Option<WmDeclareLayoutPayload>,
         rendering: Vec<WmSetRenderingPayload>,
+        modes: Vec<fresco_protocol::WmDisplayMode>,
+        mode_set: Option<(u32, u32, u32)>,
     }
     impl FrescoConn for MockConn {
         fn enumerate(&mut self) -> io::Result<Vec<WmSurfaceInfo>> {
@@ -951,6 +985,51 @@ mod tests {
             self.rendering = decisions.to_vec();
             Ok(())
         }
+        fn display_modes(&mut self) -> io::Result<fresco_protocol::WmDisplayModesReply> {
+            Ok(fresco_protocol::WmDisplayModesReply { modes: self.modes.clone(), current: 0 })
+        }
+        fn set_display_mode(&mut self, w: u32, h: u32, r: u32) -> io::Result<()> {
+            if !self.modes.iter().any(|m| m.width == w && m.height == h) {
+                return Err(io::Error::new(io::ErrorKind::InvalidInput, "no such mode"));
+            }
+            self.mode_set = Some((w, h, r));
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn display_mode_intents_reach_fresco_and_a_new_screen_relays_out() {
+        use fresco_protocol::WmDisplayMode;
+        let mut conn = MockConn {
+            surfaces: vec![surf(1, WmRole::Document)],
+            modes: vec![
+                WmDisplayMode { width: 1920, height: 1080, refresh_mhz: 60000, preferred: true },
+                WmDisplayMode { width: 1280, height: 720, refresh_mhz: 60000, preferred: false },
+            ],
+            ..Default::default()
+        };
+        let mut wm = Wm::new(screen());
+        match handle_intent(&mut wm, &mut conn, Intent::ListDisplayModes) {
+            Reply::DisplayModes { modes, current } => { assert_eq!(modes.len(), 2); assert_eq!(current, 0); }
+            r => panic!("{r:?}"),
+        }
+        let r = handle_intent(&mut wm, &mut conn, Intent::SetDisplayMode { width: 1280, height: 720, refresh_mhz: 0 });
+        assert_eq!(r, Reply::Ack);
+        assert_eq!(conn.mode_set, Some((1280, 720, 0)));
+        assert!(conn.declared.is_none(), "the WM waits for frescod's event before re-laying out");
+        let r = handle_intent(&mut wm, &mut conn, Intent::SetDisplayMode { width: 800, height: 600, refresh_mhz: 0 });
+        assert!(matches!(r, Reply::Err { .. }));
+
+        // frescod's EV_DISPLAY_CHANGED → the WM adopts the screen and re-places.
+        let small = Screen { rect: WmRect { x: 0, y: 0, w: 1280, h: 720 }, bar_h: 24, dock_h: 48 };
+        let l = wm.set_screen(&mut conn, small).unwrap().expect("relaid out");
+        let doc = &l.slots[0];
+        assert!(doc.rect.x + doc.rect.w <= 1280 && doc.rect.y + doc.rect.h <= 720, "{:?}", doc.rect);
+        // The same screen again, or an unplugged (empty) one, changes nothing.
+        assert!(wm.set_screen(&mut conn, small).unwrap().is_none());
+        let none = Screen { rect: WmRect { x: 0, y: 0, w: 0, h: 0 }, bar_h: 24, dock_h: 48 };
+        assert!(wm.set_screen(&mut conn, none).unwrap().is_none());
+        assert_eq!(wm.screen, small);
     }
 
     #[test]
