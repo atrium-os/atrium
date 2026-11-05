@@ -31,6 +31,72 @@ with fences, paced by flip-done). Apps that bring their own GPU code get a
 separate, architecture-neutral **GPU channel** where the broker writes every
 packet and the GPU MMU confines the app's machine code.
 
+### Side by side: a typical Linux desktop vs Atrium
+
+The left column is the stack a Linux desktop on an AMD GPU uses today
+(Wayland compositor, Mesa RADV, libdrm, the DRM `amdgpu` driver). FreeBSD
+gets the same stack by porting it: drm-kmod runs the Linux driver through
+linuxkpi. The right column is Atrium. Every box on the right is our own code
+except the device itself and AMD's firmware blobs, which load unmodified
+(binary redistribution only, see `graphics/rdna4/LICENSE.amdgpu.txt`).
+
+```mermaid
+flowchart LR
+  subgraph LNX["Typical Linux / drm-kmod desktop"]
+    direction TB
+    LA["App process<br/>holds its own GPU fd"]
+    LV["Vulkan loader + Mesa RADV<br/>(in the app process)<br/>NIR → ACO compiler, builds PM4 itself"]
+    LD["libdrm_amdgpu"]
+    LW["Wayland compositor<br/>imports client dmabufs,<br/>composes with GL/Vulkan (Mesa)"]
+    LK["DRM: amdgpu.ko<br/>GEM/TTM buffers, amdgpu_cs submit,<br/>render node /dev/dri/renderD128"]
+    LM["KMS atomic commit<br/>/dev/dri/card0"]
+    LH["GPU + amdgpu firmware"]
+    LA --> LV --> LD --> LK
+    LA -- "wl_surface + dmabuf<br/>(app renders its own pixels)" --> LW
+    LW --> LK
+    LW --> LM --> LH
+    LK --> LH
+  end
+
+  subgraph ATR["Atrium"]
+    direction TB
+    AA["App jail<br/>holds NO GPU fd"]
+    AR["Renderer jail, one per client<br/>(_fresco-render): scene → packed frame"]
+    AF["frescod broker (_frescod)<br/>validates header, compose + chrome,<br/>input routing, writes every PM4 packet"]
+    AC["Our compiler: frontend IR → GIR → RDNA4<br/>(atrium-spv-* / atrium-gir / atrium-rdna4-*)<br/>only signed kernels or checked app code"]
+    AT["Tier-2: same kernels on the CPU<br/>(default renderer, no Mesa)"]
+    AK["atrium-gpu-amd (native FreeBSD, C)<br/>'A' /dev/atrium-gpu0: VMs, BOs by fd, queues,<br/>watchdog, VM fault → EIO. No DRM/GEM/TTM/linuxkpi"]
+    AD["'D' /dev/atrium-display0 v2<br/>COMMIT(bo_fd, in/out syncobj)"]
+    AH["GPU + amdgpu firmware<br/>(gpusim today, R9700 next)"]
+    AA -- "fresco-protocol scene<br/>(app never renders pixels on the GPU)" --> AR
+    AA -. "own GPU code: code + closed-set records<br/>FRESCOD_GPU_SOCK (F6)" .-> AF
+    AR -- "96 B records + sealed memfd" --> AF
+    AF --> AC
+    AF --> AT
+    AF --> AK --> AH
+    AF --> AD --> AH
+  end
+```
+
+| Layer | Typical Linux desktop | Atrium | Why ours differs |
+|---|---|---|---|
+| What an app sends | pixels it rendered itself (dmabuf), plus GPU work it submits directly | a retained scene (`fresco-protocol`); GPU work only as checked code + closed-set records through frescod | apps hold no GPU fd in production (GPU ABI v2.1); a hostile page cannot reach the driver |
+| Who renders an app's window | the app, with its own Vulkan/GL driver | a per-client jailed renderer packs the scene; frescod's own kernels draw it | the renderer is sacrificial; frescod trusts only a 64 B header |
+| Userspace driver | Mesa RADV (Vulkan), radeonsi (GL), inside every app | none in apps. frescod runs our compiler's output; third-party Vulkan goes through `atrium-vk-icd` → aqueduct-gpu → Tier-2/Tier-3 | no driver code in untrusted processes; one compiler we control |
+| Shader compiler | NIR → ACO (or LLVM), in the app process | frontend IR → GIR → RDNA4 machine layer, built from AMD's public ISA docs only | public-sources rule; layered for more GPU families; RADV kept only as the speed yardstick on the R9700 |
+| CPU fallback | lavapipe/llvmpipe (Mesa) | Tier-2: AOT SPIR-V → native code (bespoke ARM64, Cranelift x86_64); it is frescod's default renderer | no Mesa at runtime; lavapipe survives only as a golden-test oracle and `FRESCOD_RENDERER=vulkan` |
+| Command submission | userspace builds IBs; kernel `amdgpu_cs` checks BOs, not packets | the broker (`atrium-gpu-app`, frescod) writes every packet; the ring is read-only to the GPU; app code is mapped read-only and confined by its VMID | packets come from one trusted writer |
+| Buffers | GEM handles, TTM placement, dmabuf export | BOs named by fd; sealed buffers for content-addressed sharing (GPU ABI v2.1 §5.13) | fds pass like any capability; no global GEM names |
+| Kernel driver | DRM `amdgpu.ko` (Linux), or drm-kmod via linuxkpi on FreeBSD | `atrium-gpu-amd`, written for FreeBSD from scratch (newbus, bus_dma, kqueue) | no DRM, no linuxkpi; per-VM isolation, watchdog and fault handling designed in |
+| Display | KMS atomic commit on the card node | display ABI v2: commit a BO fd with in/out syncobj fences, exclusive node, flip-done pacing | smaller surface; only frescod opens it |
+| Compositor | Wayland compositor (Mutter, KWin, …) compositing client buffers | frescod: compose kernel over a layer list it owns, plus a trusted chrome strip no app can draw | origin indicator and input routing cannot be spoofed by a window |
+| Isolation unit | process + render node permissions | jail per app, jail per renderer, GPU VM per context | matches Portcullis's one-jail-per-app model |
+| Test target | the real GPU | gpusim (our clean-room RDNA4 model in QEMU), checked against the R9700 by the oracle corpus (v19: 54/54) | develop without the card; silicon decides |
+
+The thing to take away: on Linux the GPU driver, its compiler and the
+right to submit work all live **inside each app**. In Atrium they live in
+**one trusted broker**, and apps send either a scene or checked code.
+
 ### 0.1 Processes and trust
 
 ```mermaid
