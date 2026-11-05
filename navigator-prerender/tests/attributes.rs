@@ -114,3 +114,15 @@ fn an_element_without_attributes_has_an_empty_map() {
     </script></body></html>"#);
     assert_eq!(r(&c), "false|0|true");
 }
+
+/// ★ `el.id` is answered AT LOAD (legacy-web §5.4.5.6d), not only while
+/// exploring: a page building its table of contents from heading ids wrote
+/// `href="#undefined"` into every link (go.dev's Effective Go, 214 of them).
+#[test]
+fn el_id_is_read_at_load() {
+    let c = run(r#"<html><body><h2 id="intro">Intro</h2><h2>no id</h2><script>
+      var h = document.getElementsByTagName('h2');
+      document.body.setAttribute('data-r', '#' + h[0].id + '|' + h[1].id + '|');
+    </script></body></html>"#);
+    assert_eq!(r(&c), "#intro||");
+}

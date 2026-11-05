@@ -156,22 +156,20 @@ fn probe_get(_this: &JsValue, args: &[JsValue], ctx: &mut Context) -> JsResult<J
     if target.has_property(key.clone(), ctx)? {
         return target.get(key, ctx);
     }
+    // ★ `el.id`, READ — at load and while exploring. The load pass never
+    // reflected it: the missing-API report counted `element.id` 4,690 times
+    // in 24 documents, and a page computing `byId(this.id + '-panel')` or
+    // `state[el.id]` got "undefined". §5.4.5.6c answered it while exploring
+    // only, scoped like `closest`; answering it at load is §5.4.5.6d, with
+    // its own corpus diff.
+    if key.to_string() == "id" && target.has_property(js_string!("__h"), ctx)? {
+        if let Some(h) = handle_of(&target.clone().into(), ctx) {
+            let v = with(|d| d.attr(h, "id").unwrap_or("").to_string());
+            return Ok(JsValue::from(js_string!(v)));
+        }
+    }
     if EXPLORING.with(|e| *e.borrow()) {
         let n = key.to_string();
-        // ★ `el.id`, READ while exploring (§5.4.5.6c step 2). The load pass
-        // has never reflected it: the missing-API report counts
-        // `element.id` 4,690 times in 24 documents. A handler written
-        // `panel = byId(this.id + '-panel')` or `state[e.target.id]` then
-        // computed with "undefined" — and every element of a group did the
-        // SAME wrong thing, which a template would faithfully generalise.
-        // Scoped like `closest`: answering it at load changes what pages
-        // build, a separate change with its own corpus diff.
-        if n == "id" && target.has_property(js_string!("__h"), ctx)? {
-            if let Some(h) = handle_of(&target.clone().into(), ctx) {
-                let v = with(|d| d.attr(h, "id").unwrap_or("").to_string());
-                return Ok(JsValue::from(js_string!(v)));
-            }
-        }
         let f: Option<fn(&JsValue, &[JsValue], &mut Context) -> JsResult<JsValue>> = match n.as_str() {
             "matches" | "webkitMatchesSelector" | "msMatchesSelector" => Some(el_matches),
             "closest" => Some(el_closest),

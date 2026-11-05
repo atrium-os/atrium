@@ -1031,7 +1031,8 @@ is kept.
   `"undefined"`, and every element of a group did the *same* wrong thing, which a
   template would have generalised faithfully. It is now answered while exploring.
   Like `closest` and `matches`, the load pass still does not answer it: that changes
-  what pages build, and is a separate change with its own corpus diff (listed below).
+  what pages build, and is a separate change with its own corpus diff (listed below;
+  done since, §5.4.5.6d).
 - **Two report-only counters per probe:** navigations it attempted
   (`location.assign/replace/reload`, all refused), and the host of each request it
   was refused. They separate "did nothing" from "did something exploration refuses",
@@ -1157,7 +1158,7 @@ So case 1 is 18 elements in 4 documents, and still waits.
   static checks (address resolves, start value matches, diff order) catch only the
   visible kinds.
 - `el.id` is answered while exploring only. **Next:** answer it at load too, with its
-  own corpus diff (24 documents read it).
+  own corpus diff (24 documents read it). *Done: §5.4.5.6d.*
 - Case 3's remaining 55 are mixed groups. A template per *behaviour class* within a
   handler group (split the siblings by whether their probe recorded) would take them.
   It needs a structural predicate for the split, and has not been tried.
@@ -1170,6 +1171,72 @@ Raw tables are outside the repo, at `~/src/navigator-corpus/coverage-2026-11-05-
 - the pipeline outputs;
 - two superseded runs: `step1/`, before the step 2 fixes, and `second-742b96/`, before
   the two counters.
+
+#### 5.4.5.6d `el.id` answered at load too (2026-11-05)
+
+§5.4.5.6c answered `el.id` while exploring only, so that its effect on what pages
+*build* could be measured on its own. This is that measurement.
+
+**The change.** `probe_get` now answers `id` on any element wrapper at load and while
+exploring, from the `id` attribute. Writes are unchanged: `el.id = x` still sets a
+script property that never reaches the attribute. Reflecting writes is a separate
+change, with its own diff.
+
+**Instrument.**
+- Both corpora, exploring, as the corpora were recorded, with one change: offline.
+  `PRERENDER_OFFLINE=1` answers every fetch from the fetch caches and fails a miss.
+  With the network open, a miss goes back out to the live site, and failures are never
+  cached, so a re-run can be fed different bytes.
+- Two binaries that differ in this one change: before (`f2fc5755…`, main at af478f30
+  plus the offline switch) and after (`e31a5b17…`).
+- Each binary ran twice, in separate processes. Then navigator-normalize and nsg-flag
+  ran over every run.
+- *Noise floor:* each binary reproduces itself on 123/123 recordings, normalized
+  documents and flag rows. So every difference below is the change.
+
+**What changed.** Of 123 recordings, 7 differ (wikihow is in both corpora). The
+normalized output differs in 6 documents. nsg-flag's rows are identical in all 123.
+After the change, `element.id` no longer appears in the missing-API report; before, it
+was there, 286 hits in 10 batch 2 documents.
+- **wikihow** (both corpora): 28 step images go from `id="img-undefined"` to their real
+  ids (`img-mvid-83d286d09e`, …). Better: the ids were duplicates before.
+- **go.dev Effective Go:** 214 table-of-contents links go from `href="#undefined"` to
+  the headings they name (`#introduction`, …). Better: every one was dead before.
+- **doc13** (Rust book, mdbook): 12 sidebar header links get their real anchors.
+  Better. But the `current-header` highlight moves from the first header to "Return
+  Values and Scope". mdbook marks the last header whose `getBoundingClientRect().top`
+  is at or above a threshold. Our rects are all at 0, so the last header wins, where a
+  browser at scroll 0 marks the first. Before, every href was `#undefined`, so the
+  lookup found the first link: right, by accident. The raster differs in one 14-pixel
+  band (two links' colour), at the same height. The fault is the rect stub; it is
+  listed below.
+- **walgreens:** a "See more" button's `aria-controls` names `.wag-groupicon-4140`,
+  which two elements carry as their id. Before, it named an id no element had.
+- **El País:** a load-time handler now writes `style="display: none"` on 7 classified
+  lists itself. The probe used to write it, so the same effects leave its transitions
+  (16 transitions, as before). 52 interactive elements found, against 43. Normalized
+  output identical.
+- **The Hindu:** one load-time script stopped failing (`scripts_failed` 1 → 0), and it
+  shows one JW Player container (`display: none` → `block`). The container is empty:
+  the normalized tree is the same 3,495 tokens, and the raster is byte-identical.
+
+**Geometry.** No document's layout moved. The flag rows are identical; the two rasters
+that could move are identical (The Hindu) or recoloured only (doc13); the rest differ
+in `id`, `href` and `aria-*` values only. So there was nothing for the Chrome oracle to
+arbitrate, and it was not run.
+
+**Kept:** six documents improve, and the one detail that got worse (doc13's highlight)
+was right only by accident before.
+
+**Next:**
+- `getBoundingClientRect` reports 0 for everything, so "last header above the line"
+  logic picks the last header. Answering it from the normalizer's layout is the real
+  fix; a first-match rule would be a guess.
+- Reflect `el.id` writes into the attribute.
+
+Raw data, outside the repo, at `~/src/navigator-corpus/eid-2026-11-05/`: `bin/` (both
+binaries), `before-{1,2}/` and `after-{1,2}/` (recordings, blobs, reports, coverage,
+normalize and flag outputs), and `run.sh`, `pipeline.sh` and `compare.py`.
 
 ### 5.5 WebAssembly is a better cage, not a translation
 

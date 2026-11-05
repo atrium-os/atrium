@@ -65,12 +65,19 @@ pub struct HttpFetcher {
     pub fetched: u64,
     pub from_cache: u64,
     bytes: u64,
+    /// `PRERENDER_OFFLINE=1`: answer from the cache only, a miss is a failed
+    /// fetch. For MEASURING conversions from fixed inputs (threat model 2.6):
+    /// with the network open, every miss — and failures are never cached —
+    /// goes back out to the live site, so two runs of one page can be fed
+    /// different bytes and the difference looks like the converter's.
+    cache_only: bool,
 }
 
 impl HttpFetcher {
     pub fn new(cache: PathBuf) -> Self {
         let _ = fs::create_dir_all(&cache);
-        Self { cache, max_bytes: 8_000_000, timeout_s: 20, fetched: 0, from_cache: 0, bytes: 0 }
+        let cache_only = std::env::var("PRERENDER_OFFLINE").ok().as_deref() == Some("1");
+        Self { cache, max_bytes: 8_000_000, timeout_s: 20, fetched: 0, from_cache: 0, bytes: 0, cache_only }
     }
     fn key_ext(url: &str, ext: &str) -> String {
         let mut h: u64 = 0xcbf29ce484222325;
@@ -96,6 +103,7 @@ impl Fetcher for HttpFetcher {
             self.from_cache += 1;
             return Ok(s);
         }
+        if self.cache_only { return Err(format!("offline, not cached: {url}")) }
         let out = Command::new("curl")
             .args(["-fsSL", "--max-time", &self.timeout_s.to_string(),
                    "--max-filesize", &self.max_bytes.to_string(),
@@ -115,6 +123,7 @@ impl Fetcher for HttpFetcher {
         }
         let path = self.cache.join(Self::key_ext(url, "bin"));
         if let Ok(b) = fs::read(&path) { self.from_cache += 1; return Ok(b) }
+        if self.cache_only { return Err(format!("offline, not cached: {url}")) }
         let out = Command::new("curl")
             .args(["-fsSL", "--max-time", &self.timeout_s.to_string(),
                    "--max-filesize", &self.max_bytes.to_string(),
