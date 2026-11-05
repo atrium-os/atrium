@@ -13,7 +13,7 @@ use std::time::Instant;
 
 fn main() {
     let dir = std::env::args().nth(1).expect("recordings directory");
-    let (mut go_ms, mut back_ms) = (vec![], vec![]);
+    let (mut go_ms, mut back_ms, mut first_ms) = (vec![], vec![], vec![]);
     let mut files: Vec<_> = std::fs::read_dir(&dir).expect("readable").flatten()
         .map(|e| e.path()).filter(|p| p.extension().is_some_and(|x| x == "json")).collect();
     files.sort();
@@ -22,20 +22,24 @@ fn main() {
         let Ok(r) = ingest(&bytes, &Limits::default()) else { continue };
         let Ok(doc) = Document::accept(&r.document) else { continue };
         let mut h = History::new(doc);
+        let mut first = true;
         for t in r.transitions.iter().filter(|t| t.anchored) {
             let s = Instant::now();
             if h.go(t).is_err() { continue }
-            go_ms.push(s.elapsed().as_secs_f64() * 1e3);
+            // A document's first step also compiles its state (the profile
+            // stats and the id index), once: reported apart.
+            let took = s.elapsed().as_secs_f64() * 1e3;
+            if first { first_ms.push(took); first = false } else { go_ms.push(took) }
             let s = Instant::now();
             h.back().expect("back after a successful go");
             back_ms.push(s.elapsed().as_secs_f64() * 1e3);
         }
     }
-    for (name, v) in [("go", &mut go_ms), ("back", &mut back_ms)] {
+    for (name, v) in [("go", &mut go_ms), ("back", &mut back_ms), ("first_go", &mut first_ms)] {
         v.sort_by(|a, b| a.partial_cmp(b).unwrap());
         if v.is_empty() { println!("{name}_ms n=0"); continue }
         let q = |p: f64| v[((v.len() - 1) as f64 * p).round() as usize];
-        println!("{name}_ms n={} p50={:.2} p90={:.2} p99={:.2} max={:.2} mean={:.2}",
+        println!("{name}_ms n={} p50={:.4} p90={:.4} p99={:.4} max={:.4} mean={:.4}",
                  v.len(), q(0.5), q(0.9), q(0.99), v[v.len() - 1], v.iter().sum::<f64>() / v.len() as f64);
     }
 }

@@ -112,8 +112,17 @@ impl Dom {
     }
 
     pub fn attr(&self, h: Handle, name: &str) -> Option<&str> {
+        let n = self.get(h)?;
+        // ★ No allocation when the name needs no lowercasing (it is already
+        // lowercase, or the node is foreign and keeps its case): the same
+        // comparison `attr_name` would make, without building the string.
+        // `resolve_path("#id")` asks every node of the arena for `id`, so
+        // the allocation was most of a replay's path resolution.
+        if n.foreign || !name.bytes().any(|b| b.is_ascii_uppercase()) {
+            return n.attrs.iter().find(|(k, _)| k == name).map(|(_, v)| v.as_str());
+        }
         let want = self.attr_name(h, name);
-        self.get(h)?.attrs.iter().find(|(k, _)| *k == want).map(|(_, v)| v.as_str())
+        n.attrs.iter().find(|(k, _)| *k == want).map(|(_, v)| v.as_str())
     }
 
     pub fn set_attr(&mut self, h: Handle, name: &str, val: &str) {

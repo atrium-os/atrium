@@ -404,6 +404,67 @@ Measured: all 264 anchored transitions in the main corpus and both in the advers
 apply cleanly to the documents they were recorded against — every precondition holds,
 every path resolves, and no result leaves the profile.
 
+**Near-native replay, part 1 (2026-11-06; approved by the user).** The copy above made
+every step cost a whole-document clone and a whole-tree profile walk. The same result is
+now reached without either. The clone path stays as the reference; `History` uses the new
+one.
+- *Applied in place, refusals first.* `apply_in_place_with_undo` runs every check that
+  can refuse before the first write:
+  - trigger and target resolution;
+  - attribute preconditions, on an overlay, so two effects on one attribute compose as
+    they did on the copy;
+  - that each removed node and each insert's parent is still connected, given the step's
+    own earlier removals;
+  - fragment parsing;
+  - the profile.
+
+  Only then are the writes made, in the same order and by the same calls. Nothing after
+  the first write can fail. The undo is built from the same facts at the same moments
+  (removed markup, parent and index taken before the writes; paths after them). So the
+  all-or-nothing rule above holds without a copy, and it is not an undo log: no rollback
+  code exists to be wrong.
+- *The profile, incrementally* (`document::Stats`).
+  - The element count changes by exactly what is removed and inserted.
+  - Bytes, depth and stylesheets are kept as UPPER bounds, grown by bounds computed from
+    the step: escaped attribute values; inserted markup at 8 bytes per byte plus 64;
+    parent depth plus fragment depth; the fragment's sheets.
+  - A step proven inside every ceiling skips the whole-tree walk.
+  - A step that is not is applied by the copy path itself. So a refusal carries the exact
+    measurement it always did, and the bounds are refreshed exactly.
+- *Addresses compiled per document state* (`Document::ids`).
+  - `#id` resolution scanned the whole arena for every address. A document state now
+    resolves them through an index of the connected nodes that hold an id, built once
+    and giving exactly `resolve_path`'s answer (the one such node, or none if several).
+  - Positional paths still walk the tree. Path resolution remains the validation: an
+    address that does not resolve refuses the step as before.
+  - The index is dropped by any write that can change what a path names (a structural
+    change, or an `id` written), and is rebuilt on next use. Only the apply paths write.
+- *And one allocation removed* (`Dom::attr`): a name that needs no lowercasing is
+  compared without building a lowercased copy. The `#id` scan made that copy for every
+  node. This is shared with the converter, and its outputs are unchanged.
+
+*Kept, byte for byte* (`tests/apply_in_place.rs`):
+- every anchored transition of the 2026-11-05 recordings (31 documents), each applied
+  and rewound from the base, then all as one long chain and rewound: **2,885 steps and
+  2,885 rewinds**, the same document and the same undo as the clone path;
+- 4,000 mutated transitions refusing identically, reaching every refusal (trigger,
+  target, precondition, incomplete); and the outside-the-profile refusal through the
+  exact path;
+- a planted byte difference is caught.
+
+*Measured* (`examples/nav_cost`, in-process, the same 2,242 steps; M4 Max):
+
+| | go p50 / p99 | back p50 / p99 |
+|---|---|---|
+| clone (0beab757) | 3.47 / ~6–10 ms | 3.05 / ~5–12 ms |
+| in place | 1.19 / 2.06 ms | 0.80 / 1.5 ms |
+| + `attr` without allocation | 0.28 / 0.46 ms | 0.19 / 0.33 ms |
+| **+ compiled addresses** | **0.6 / 22 µs** | **0.5 / 22 µs** |
+
+A document's first step also compiles its state (the stats and the id index), once: p50
+0.2 ms, p99 2 ms. Part 2 (incremental restyle and relayout, repainting affected bands,
+the 16 ms click) follows bands and checkpoints (§4.8).
+
 ### 4.4 Going back
 
 A reader moving back through states needs the state they were actually in, not one
@@ -432,6 +493,10 @@ one exception: the trigger is not required to resolve. That check asks whether a
 was recorded against this document, which is already answered for an undo built from it, and
 a step that removes its own trigger (a tab control replaced by the panel it opens) must
 still be undoable.
+
+Since 2026-11-06 the history goes back IN PLACE (`undo_in_place`, §4.3 part 1): the same
+checks before any write, the same result byte for byte as `undone` (2,885 rewinds checked),
+at p50 0.5 µs instead of 3 ms.
 
 Reversal is verified by **byte equality** on the serialized document, at corpus scale:
 259/259 on the main corpus, 2/2 on the adversarial one, and 264/264 on the older version 1

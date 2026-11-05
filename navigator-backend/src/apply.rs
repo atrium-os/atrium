@@ -183,7 +183,7 @@ impl Document {
             });
         }
 
-        let mut next = Document { dom: self.dom.clone() };
+        let mut next = Document { dom: self.dom.clone(), stats: None, ids: Default::default() };
         let mut removed: Vec<Handle> = vec![];
         let mut inserted: Vec<Handle> = vec![];
 
@@ -307,6 +307,189 @@ impl Document {
             anchored: t.anchored, effects: undo,
         };
         Ok((next, inverse))
+    }
+
+    /// ★★ THE SAME STEP, APPLIED IN PLACE (backend §4.3, replay part 1).
+    ///
+    /// `applied_with_undo` clones the whole arena so that a refusal leaves
+    /// nothing behind. This reaches the same all-or-nothing result without
+    /// the copy: EVERY check that can refuse runs before the first write —
+    /// trigger and target resolution, attribute preconditions (on an overlay,
+    /// so two effects on one attribute compose exactly as on the copy), that
+    /// every removed node and every insert's parent is still connected given
+    /// the step's own earlier removals, and the profile — and only then are
+    /// the writes made, in the same order and by the same calls as on the
+    /// copy. Nothing after the first write can fail.
+    ///
+    /// The profile re-check is INCREMENTAL: the element count changes by
+    /// exactly what is removed and inserted, and bytes, depth and stylesheets
+    /// by at most bounds computed from the step (`Stats`). A step proven inside
+    /// every ceiling skips the whole-tree walk; one that is not is applied by
+    /// `applied_with_undo` itself, so a refusal carries the exact measurement
+    /// it always did.
+    ///
+    /// The result — document and undo — is byte for byte what
+    /// `applied_with_undo` returns; `tests/apply_in_place.rs` holds every
+    /// corpus step and rewind to that.
+    pub fn apply_in_place_with_undo(&mut self, t: &Transition) -> Result<Transition, ApplyError> {
+        self.apply_in_place(t, true)
+    }
+
+    /// `undone`, in place.
+    pub fn undo_in_place(&mut self, undo: &Transition) -> Result<(), ApplyError> {
+        self.apply_in_place(undo, false).map(|_| ())
+    }
+
+    fn apply_in_place(&mut self, t: &Transition, check_trigger: bool) -> Result<Transition, ApplyError> {
+        use crate::document::Stats;
+        if check_trigger && self.resolve(&t.trigger).is_none() {
+            return Err(ApplyError::TriggerUnresolved { trigger: t.trigger.clone() });
+        }
+        for e in &t.effects {
+            if let Effect::Truncated { dropped } = e { return Err(ApplyError::Incomplete { dropped: *dropped }) }
+        }
+        let mut ops: Vec<Op> = Vec::with_capacity(t.effects.len());
+        for e in &t.effects {
+            ops.push(match e {
+                Effect::Attribute { target, name, from, to, at } => Op::Attr { h: self.target(target)?, target, name, from, to, at: *at },
+                Effect::Remove { target } => {
+                    let h = self.target(target)?;
+                    if self.dom.get(h).and_then(|n| n.parent).is_none() { return Err(ApplyError::TargetUnresolved { path: target.clone() }) }
+                    Op::Remove(vec![h])
+                }
+                Effect::RemoveRange { parent, index, count } => {
+                    let p = self.target(parent)?;
+                    let kids = self.dom.children_of(p);
+                    if index + count > kids.len() {
+                        return Err(ApplyError::TargetUnresolved { path: format!("{parent}[{index}..{}]", index + count) });
+                    }
+                    Op::Remove(kids[*index..index + count].to_vec())
+                }
+                Effect::Insert { parent, index, html } => Op::Insert { p: self.target(parent)?, parent, index: *index, html },
+                Effect::Truncated { dropped } => return Err(ApplyError::Incomplete { dropped: *dropped }),
+            });
+        }
+        // Attribute preconditions, on an overlay: (node, name) -> value now.
+        let mut overlay: std::collections::HashMap<(Handle, &str), Option<String>> = Default::default();
+        let mut attr_growth = 0usize;
+        for op in &ops {
+            let Op::Attr { h, target, name, from, to, .. } = op else { continue };
+            let found = match overlay.get(&(*h, name.as_str())) { Some(v) => v.clone(), None => self.dom.attr(*h, name).map(str::to_string) };
+            if &found != *from {
+                return Err(ApplyError::PreconditionFailed { path: (*target).clone(), name: (*name).clone(), expected: (*from).clone(), found });
+            }
+            // An attribute serializes as ` name="value"`, value escaped (at
+            // most 6 bytes per byte, `&quot;`).
+            attr_growth += to.as_ref().map(|v| v.len() * 6 + name.len() + 4).unwrap_or(0);
+            overlay.insert((*h, name.as_str()), (*to).clone());
+        }
+        // Removals: each node still connected, given the step's own earlier
+        // removals (a node inside a subtree already removed is not a node of
+        // the document being edited).
+        let mut removed_order: Vec<Handle> = vec![];
+        let gone = |dom: &navigator_dom::Dom, removed: &[Handle], h: Handle| -> bool {
+            if !dom.connected(h) { return true }
+            let mut cur = Some(h);
+            while let Some(c) = cur { if removed.contains(&c) { return true } cur = dom.get(c).and_then(|n| n.parent) }
+            false
+        };
+        for op in &ops {
+            let Op::Remove(hs) = op else { continue };
+            for &h in hs {
+                if gone(&self.dom, &removed_order, h) { return Err(ApplyError::TargetUnresolved { path: self.dom.exact_path(h) }) }
+                removed_order.push(h);
+            }
+        }
+        // Inserts, in ascending index (as on the copy), parents connected,
+        // fragments parsed before anything is written.
+        let mut ins: Vec<(Handle, &String, Option<usize>, &String)> = ops.iter()
+            .filter_map(|op| match op { Op::Insert { p, parent, index, html } => Some((*p, *parent, *index, *html)), _ => None }).collect();
+        ins.sort_by_key(|&(_, _, index, _)| index.unwrap_or(usize::MAX));
+        for &(p, parent, _, _) in &ins {
+            if gone(&self.dom, &removed_order, p) { return Err(ApplyError::TargetUnresolved { path: parent.clone() }) }
+        }
+        let frags: Vec<navigator_dom::Dom> = ins.iter().map(|&(_, _, _, html)| parse_fragment(html)).collect();
+        // ★ The profile, incrementally: exact elements, bounded the rest.
+        let stats = match self.stats { Some(s) => s, None => Stats::exact(&self.dom) };
+        let count_elements = |dom: &navigator_dom::Dom, h: Handle| -> usize {
+            let mut n = 0; let mut st = vec![h];
+            while let Some(x) = st.pop() { if matches!(dom.get(x).map(|n| &n.kind), Some(navigator_dom::Kind::Element(_))) { n += 1 } st.extend(dom.children_of(x)) }
+            n
+        };
+        let depth_of = |dom: &navigator_dom::Dom, h: Handle| -> usize { let (mut d, mut c) = (0, dom.get(h).and_then(|n| n.parent)); while let Some(x) = c { d += 1; c = dom.get(x).and_then(|n| n.parent) } d };
+        let removed_elements: usize = removed_order.iter().map(|&h| count_elements(&self.dom, h)).sum();
+        let mut inserted_elements = 0usize;
+        let (mut depth_ub, mut bytes_ub, mut sheets_ub) = (stats.depth_ub, stats.bytes_ub + attr_growth, stats.sheets_ub);
+        for (k, &(p, _, _, html)) in ins.iter().enumerate() {
+            let f = &frags[k];
+            inserted_elements += count_elements(f, f.root());
+            depth_ub = depth_ub.max(depth_of(&self.dom, p) + 1 + f.max_depth());
+            // Serialized fragment markup: escaping and implied tags, bounded.
+            bytes_ub += html.len() * 8 + 64;
+            sheets_ub += profile::stylesheet_count(f);
+        }
+        let elements = stats.elements + inserted_elements - removed_elements.min(stats.elements + inserted_elements);
+        let within = bytes_ub <= profile::MAX_DOCUMENT_BYTES && elements <= profile::MAX_ELEMENTS
+            && depth_ub <= profile::MAX_DEPTH && sheets_ub <= profile::MAX_STYLESHEETS;
+        if !within {
+            // Not provably inside: the exact path, whose refusal carries the
+            // exact measurement; its result refreshes the bounds.
+            let (mut next, undo) = self.apply_inner(t, check_trigger)?;
+            next.stats = Some(Stats::exact(&next.dom));
+            *self = next;
+            return Ok(undo);
+        }
+        // ---- Nothing below can fail. ----
+        // What the undo needs from the document BEFORE the step.
+        let removed_before: Vec<(Handle, Handle, usize, String)> = removed_order.iter().map(|&h| {
+            let p = self.dom.get(h).and_then(|n| n.parent).expect("checked above");
+            let index = self.dom.children_of(p).iter().position(|&c| c == h).unwrap_or(0);
+            (h, p, index, self.dom.outer_html(h))
+        }).collect();
+        let mut touched: Vec<(Handle, &str, &Option<String>, Option<usize>)> = vec![];
+        for op in &ops {
+            let Op::Attr { h, name, from, to, at, .. } = op else { continue };
+            touched.push((*h, name.as_str(), *from, self.dom.attr_index(*h, name)));
+            match (to, at) {
+                (Some(v), Some(i)) => self.dom.set_attr_at(*h, name, v, *i),
+                (Some(v), None) => self.dom.set_attr(*h, name, v),
+                (None, _) => self.dom.remove_attr(*h, name),
+            }
+        }
+        for &h in &removed_order { self.dom.detach(h); }
+        let mut inserted: Vec<Handle> = vec![];
+        for (k, &(p, _, index, _)) in ins.iter().enumerate() {
+            let frag = &frags[k];
+            let roots = frag.children_of(frag.root());
+            let at = index.unwrap_or(usize::MAX).min(self.dom.children_of(p).len());
+            for (i, c) in roots.into_iter().enumerate() {
+                let g = self.dom.graft(frag, c);
+                let before = self.dom.children_of(p).get(at + i).copied();
+                self.dom.insert_before(p, g, before);
+                inserted.push(g);
+            }
+        }
+        self.stats = Some(Stats { elements, bytes_ub, depth_ub, sheets_ub });
+        if !removed_order.is_empty() || !inserted.is_empty() || touched.iter().any(|(_, name, _, _)| *name == "id") {
+            self.invalidate_addresses();
+        }
+        // The undo, built as `apply_inner` builds it.
+        let mut undo = vec![];
+        for (h, name, from, index) in touched.into_iter().rev() {
+            if !self.dom.connected(h) { continue }
+            let now = self.dom.attr(h, name).map(str::to_string);
+            undo.push(Effect::Attribute { target: self.exact_path(h), name: name.to_string(), from: now, to: from.clone(),
+                                          at: if from.is_some() { index } else { None } });
+        }
+        for &g in &inserted {
+            let p = self.dom.get(g).and_then(|n| n.parent).expect("just inserted");
+            let index = self.dom.children_of(p).iter().position(|&c| c == g).expect("a child");
+            undo.push(Effect::RemoveRange { parent: self.exact_path(p), index, count: 1 });
+        }
+        for (_, p, index, html) in removed_before {
+            undo.push(Effect::Insert { parent: self.exact_path(p), index: Some(index), html });
+        }
+        Ok(Transition { trigger: t.trigger.clone(), event: t.event.clone(), anchored: t.anchored, effects: undo })
     }
 
     fn target(&self, path: &str) -> Result<Handle, ApplyError> {

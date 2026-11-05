@@ -187,8 +187,9 @@ impl History {
     }
 
     fn step(&mut self, t: &Transition) -> Result<(), ApplyError> {
-        let (next, undo) = self.current.applied_with_undo(t)?;
-        self.current = next;
+        // In place, without cloning the document (§4.3): all-or-nothing as
+        // before, the same document and undo byte for byte.
+        let undo = self.current.apply_in_place_with_undo(t)?;
         self.undo_bytes += weight(&undo);
         self.past.push_back((t.clone(), undo));
         self.trim();
@@ -213,9 +214,8 @@ impl History {
         let Some((taken, undo)) = self.past.pop_back() else {
             return Ok(if self.forgotten > 0 { Back::Forgotten } else { Back::AtStart });
         };
-        match self.current.undone(&undo) {
-            Ok(prev) => {
-                self.current = prev;
+        match self.current.undo_in_place(&undo) {
+            Ok(()) => {
                 self.undo_bytes -= weight(&undo).min(self.undo_bytes);
                 self.future.push(taken);
                 Ok(Back::Stepped)

@@ -13,6 +13,31 @@ pub use navigator_dom::profile::Violation;
 #[derive(Debug)]
 pub struct Document {
     pub dom: Dom,
+    /// ★ What the profile ceilings measure, kept across in-place steps
+    /// (`apply::apply_in_place_with_undo`): the element count exactly, and
+    /// UPPER BOUNDS on serialized bytes, depth and stylesheets. A step proven
+    /// inside every ceiling by these skips the whole-tree re-check; one that
+    /// is not takes the exact path, which refreshes them. `None` until first
+    /// needed.
+    pub(crate) stats: Option<Stats>,
+    /// ★ THE COMPILED FORM OF THIS STATE'S ADDRESSES (backend §4.3, replay
+    /// part 1): every connected node holding an `id`, by id, in arena order —
+    /// what `resolve_path("#id")` finds by scanning the whole arena, once per
+    /// document state instead of once per address. Dropped by any write that
+    /// can change what a path means (a structural change, or an `id`
+    /// written), and rebuilt on next use; only the apply paths write.
+    pub(crate) ids: std::cell::RefCell<Option<std::collections::HashMap<String, Vec<navigator_dom::Handle>>>>,
+}
+
+/// See `Document::stats`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct Stats { pub elements: usize, pub bytes_ub: usize, pub depth_ub: usize, pub sheets_ub: usize }
+
+impl Stats {
+    pub(crate) fn exact(dom: &Dom) -> Stats {
+        Stats { elements: dom.element_count(), bytes_ub: dom.serialized_len(), depth_ub: dom.max_depth(),
+                sheets_ub: profile::stylesheet_count(dom) }
+    }
 }
 
 impl Document {
@@ -24,7 +49,7 @@ impl Document {
     /// store want `accept`; this stays for tests and for tools that need to
     /// look at a document precisely because it is out of bounds.
     pub fn parse(html: &str) -> Self {
-        Document { dom: parse(html) }
+        Document { dom: parse(html), stats: None, ids: Default::default() }
     }
 
     /// ★★ THE PROFILE IS A RENDERER'S REFUSAL, NOT A CONVERTER'S WARNING.
@@ -49,7 +74,7 @@ impl Document {
     pub fn accept(html: &str) -> Result<Self, Vec<Violation>> {
         let dom = parse(html);
         let v = profile::check(&dom, html.len());
-        if v.is_empty() { Ok(Document { dom }) } else { Err(v) }
+        if v.is_empty() { Ok(Document { dom, stats: None, ids: Default::default() }) } else { Err(v) }
     }
 
     /// Resolve a transition's trigger against this document.
@@ -68,6 +93,34 @@ impl Document {
         // resolved (chinadaily). Positional paths survive re-parsing only if
         // the document is byte-identical, which is true for tier 2: it is the
         // document the paths were recorded against.
-        self.dom.resolve_path(trigger)
+        match trigger.strip_prefix('#') {
+            // Exactly `resolve_path`'s answer: the one connected node holding
+            // that id, or nothing if none or several do.
+            Some(id) => match self.ids_index().get(id) { Some(v) if v.len() == 1 => Some(v[0]), _ => None },
+            None => self.dom.resolve_path(trigger),
+        }
     }
+
+    fn ids_index(&self) -> std::cell::Ref<'_, std::collections::HashMap<String, Vec<navigator_dom::Handle>>> {
+        if self.ids.borrow().is_none() {
+            let mut m: std::collections::HashMap<String, Vec<navigator_dom::Handle>> = Default::default();
+            for h in 0..self.dom.nodes.len() as navigator_dom::Handle {
+                if let Some(id) = self.dom.attr(h, "id") {
+                    if self.dom.connected(h) { m.entry(id.to_string()).or_default().push(h) }
+                }
+            }
+            *self.ids.borrow_mut() = Some(m);
+        }
+        std::cell::Ref::map(self.ids.borrow(), |o| o.as_ref().expect("built"))
+    }
+
+    /// `Dom::exact_path`, with the id step checked through the index.
+    pub fn exact_path(&self, h: navigator_dom::Handle) -> String {
+        let p = self.dom.node_path(h);
+        if self.resolve(&p) == Some(h) { p } else { self.dom.positional_path(h) }
+    }
+
+    /// Forget the compiled addresses: the tree changed in a way that can
+    /// change what a path names.
+    pub(crate) fn invalidate_addresses(&self) { *self.ids.borrow_mut() = None }
 }
