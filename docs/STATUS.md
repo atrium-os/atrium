@@ -63,6 +63,7 @@ header `include/atrium/gpu_abi_v2.h` is normative).
   [reviews/2026-11-03 §A3](reviews/2026-11-03-gpu-kernel-and-tier2-review.md)
   are closed. Map in [atrium-gpu-amd/ISOLATION.md](../atrium-gpu-amd/ISOLATION.md).
 - VA reuse, reject overlapping/misaligned binds (`2dac848`).
+- VRAM: a real device allocator (`vram.c`) that frees VRAM and scrubs it with a kernel-owned GPU fill (`clear.c`) before anyone else can have it; sized from the device, small-BAR aware; isolation part F (`89a0237`, gpusim `8c6f712`).
 - jaild policy lists atrium-gpu-amd as **experimental (passed, not granted)**;
   a silicon run of `test_gpu_isolation` is required before production.
 - Per-queue completions and a hang watchdog (`hang_ms`, default 5000) close

@@ -5223,8 +5223,12 @@ In the guest:
   two (frescod logs "device reset (generation N)"); without it the screen goes
   black, since gpusim wipes VRAM. `reset_coord` checks the kernel side.
   frescod's jail needs devfs ruleset 23 loaded (`service devfs restart` after
-  installing `etc/atrium.devfs.rules`). Expected as of 2026-11-04:
-  suite 28/28, isolation 50/50.
+  installing `etc/atrium.devfs.rules`). Expected as of 2026-11-05:
+  suite ALL OK, isolation 71/71. Isolation part F (VRAM scrubbing) needs
+  gpusim `8c6f712` or later (`DMA_DATA` fill, `CONFIG_MEMSIZE`); its 9 GiB
+  VRAM churn takes ~4 min under TCG. Parts C/D need MSI-X
+  (`hw.pci.honor_msi_blacklist=0`): in polling mode five checks fail.
+  VRAM counters: `sysctl dev.atrium_gpu_amd_pci.0.vram`.
 - After changing gpusim: rebuild `gpusim-server`, then `cloud-vm.sh down`/`up`
   (and the nextboot/kldload/devctl steps again).
 - Use gpusim `3d31e61` or later: its doorbell is asynchronous, so the guest
