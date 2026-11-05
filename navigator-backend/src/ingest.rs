@@ -93,6 +93,53 @@ pub fn ingest(bytes: &[u8], limits: &Limits) -> Result<Recording, Reject> {
     Ok(Recording { url, tier, tier_reason, measurements, transitions, document, notes })
 }
 
+/// A transitions artifact, ingested: the table, the readable recording it
+/// was recorded against, and what a single recording would have reported.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Transitions {
+    pub url: String,
+    /// `blake3:<hex>` of the readable recording's bytes.
+    pub readable: String,
+    pub transitions: Vec<Transition>,
+    pub interactive_found: u64,
+    pub transitions_dropped: u64,
+    pub notes: Vec<Note>,
+}
+
+/// ★ Ingest a transitions artifact, under the SAME bounds and the same
+/// transition and template readers as a recording's own table: a table
+/// that arrives separately is not a second, laxer path into a session.
+pub fn ingest_transitions(bytes: &[u8], limits: &Limits) -> Result<Transitions, Reject> {
+    if bytes.len() > limits.max_total_bytes {
+        return Err(Reject::TooLarge { what: "transitions", measured: bytes.len(), allowed: limits.max_total_bytes });
+    }
+    let v: Value = serde_json::from_slice(bytes).map_err(|e| Reject::NotJson(e.to_string()))?;
+    let obj = v.as_object().ok_or(Reject::NotAnObject)?;
+    match obj.get("format").and_then(Value::as_str) {
+        Some(crate::TRANSITIONS_FORMAT) => {}
+        Some(other) => return Err(Reject::WrongFormat { found: other.to_string() }),
+        None => return Err(Reject::MissingField("format")),
+    }
+    let url = bounded_str(obj.get("url"), "url", limits)?.unwrap_or_default();
+    let readable = bounded_str(obj.get("readable"), "readable", limits)?.ok_or(Reject::MissingField("readable"))?;
+    if crate::image::address_hex(&readable).is_none() {
+        return Err(Reject::BadField { field: "readable", why: "not a blake3:<64 hex> address" });
+    }
+    let mut notes = vec![];
+    let mut transitions = vec![];
+    let list = obj.get("transitions").ok_or(Reject::MissingField("transitions"))?;
+    let arr = list.as_array().ok_or(Reject::BadField { field: "transitions", why: "not an array" })?;
+    let keep = arr.len().min(limits.max_transitions);
+    if arr.len() > keep { notes.push(Note::TransitionsTruncated { kept: keep, discarded: arr.len() - keep }) }
+    for t in &arr[..keep] {
+        if let Some(tr) = transition(t, limits, &mut notes)? { transitions.push(tr) }
+    }
+    if let Some(list) = obj.get("templates") { expand_templates(list, limits, &mut transitions, &mut notes)? }
+    let g = |k: &str| obj.get(k).and_then(Value::as_u64).unwrap_or(0);
+    Ok(Transitions { url, readable, transitions, interactive_found: g("interactive_found"),
+                     transitions_dropped: g("transitions_dropped"), notes })
+}
+
 /// ★★ A TEMPLATE IS EXPANDED HERE, NOT CARRIED. Each instance becomes the
 /// ordinary transition it stands for: its trigger, the template's event and
 /// effects, every `$t` replaced by the trigger and every `$N` by the

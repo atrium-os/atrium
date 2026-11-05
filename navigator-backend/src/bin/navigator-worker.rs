@@ -27,6 +27,7 @@ use std::io::{BufReader, Write};
 struct Worker {
     sessions: Sessions,
     id: Option<SessionId>,
+    progress: navigator_backend::progressive::Progress,
 }
 
 impl Worker {
@@ -39,6 +40,7 @@ impl Worker {
         }
         let r = ingest(recording, &Limits::default()).map_err(|e| e.to_string())?;
         self.id = Some(self.sessions.open(&r, 0).map_err(|e| e.to_string())?);
+        self.progress = navigator_backend::progressive::Progress::opened(recording);
         Ok(self.triggers())
     }
 
@@ -118,6 +120,36 @@ impl Worker {
         Ok(out)
     }
 
+    fn upgrade(&mut self, recording: &[u8]) -> Result<String, String> {
+        use navigator_backend::progressive::Upgrade;
+        let id = self.id.ok_or("no document")?;
+        Ok(match self.progress.upgrade(&mut self.sessions, id, recording, &Limits::default(), 0)? {
+            Upgrade::Ready(d) => format!("ready {}", d.why()),
+            Upgrade::Kept(d) => format!("kept {}", d.why()),
+        })
+    }
+
+    fn swap(&mut self, payload: &str) -> Result<String, String> {
+        use navigator_backend::progressive::{Anchor, How};
+        let id = self.id.ok_or("no document")?;
+        let (offset, path) = payload.split_once('\n').ok_or("swap request is not `<offset>\\n<path>`")?;
+        let offset: i64 = offset.parse().map_err(|_| "swap offset is not a number")?;
+        let sw = self.progress.swap(&mut self.sessions, id, &Anchor { path: path.to_string(), offset }, &Limits::default(), 0)?;
+        let how = match sw.mapped.how { How::Same => "same", How::Nearest => "nearest", How::Top => "top" };
+        let path = if sw.mapped.anchor.path.contains('\n') { String::new() } else { sw.mapped.anchor.path };
+        Ok(format!("{how} {}\n{path}\n{}", sw.mapped.anchor.offset, self.triggers()))
+    }
+
+    fn attach(&mut self, payload: &[u8]) -> Result<String, String> {
+        use navigator_backend::progressive::Attached;
+        let id = self.id.ok_or("no document")?;
+        Ok(match self.progress.attach(&mut self.sessions, id, payload, &Limits::default(), 0)? {
+            Attached::Now => format!("now\n{}", self.triggers()),
+            Attached::WithSwap => "with-swap".into(),
+            Attached::NeedsSwap => "needs-swap".into(),
+        })
+    }
+
     fn links_to(&mut self, href: &str) -> Result<bool, String> {
         Ok(navigator_backend::links::document_carries(&self.session()?.document().dom, href))
     }
@@ -132,7 +164,8 @@ impl Worker {
 }
 
 fn main() {
-    let mut w = Worker { sessions: Sessions::new(SessionLimits { max_sessions: 1, ..SessionLimits::default() }), id: None };
+    let mut w = Worker { sessions: Sessions::new(SessionLimits { max_sessions: 1, ..SessionLimits::default() }), id: None,
+                         progress: Default::default() };
     let mut input = BufReader::new(std::io::stdin());
     let mut output = std::io::stdout();
     loop {
@@ -160,6 +193,9 @@ fn main() {
             REQ_BYTES => Ok(w.size().into_bytes()),
             REQ_URL => w.url().map(String::into_bytes),
             REQ_IMAGE => w.image(&f.payload),
+            REQ_UPGRADE => w.upgrade(&f.payload).map(String::into_bytes),
+            REQ_SWAP => w.swap(&f.text()).map(String::into_bytes),
+            REQ_ATTACH => w.attach(&f.payload).map(String::into_bytes),
             REQ_HREF => w.links_to(&f.text()).map(|y| if y { "yes" } else { "no" }.into()),
             other => Err(format!("unknown request {other:?}")),
         };

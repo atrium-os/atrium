@@ -137,5 +137,14 @@ pub const REQ_IMAGE: &str = "IMG";
 /// Whether the current document has an `<a>`/`<area>` with this href:
 /// answers `yes` or `no`.
 pub const REQ_HREF: &str = "HREF";
+/// Progressive display (legacy-web §5.4.5.7; `progressive`). The scripted
+/// conversion's readable recording: answers `ready <why>` or `kept <why>`.
+pub const REQ_UPGRADE: &str = "UPGR";
+/// Swap the held document in. Payload `<offset>\n<anchor path>`; answers
+/// `<same|nearest|top> <offset>\n<path>` and then one offered trigger per line.
+pub const REQ_SWAP: &str = "SWAP";
+/// A transitions artifact. Answers `now` and one offered trigger per line,
+/// `with-swap`, or `needs-swap`.
+pub const REQ_ATTACH: &str = "ATCH";
 pub const RSP_OK: &str = "OK";
 pub const RSP_ERR: &str = "ERR";

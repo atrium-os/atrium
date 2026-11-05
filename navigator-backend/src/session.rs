@@ -144,6 +144,8 @@ pub enum OpenError {
     WouldExceedMemory { needed: usize, available: usize },
     /// The recording's document is outside the Document Profile.
     OutsideProfile(Vec<navigator_dom::profile::Violation>),
+    /// `replace` named a session that is not open.
+    NoSuchSession,
 }
 
 impl std::fmt::Display for OpenError {
@@ -161,6 +163,7 @@ impl std::fmt::Display for OpenError {
                 }
                 Ok(())
             }
+            OpenError::NoSuchSession => write!(f, "no such session"),
         }
     }
 }
@@ -203,6 +206,10 @@ fn effect_bytes(e: &crate::Effect) -> usize {
         RemoveRange { parent, .. } => parent.len(),
         Truncated { .. } => 0,
     }
+}
+
+fn transitions_bytes(ts: &[Transition]) -> usize {
+    ts.iter().map(|t| t.trigger.len() + t.event.len() + t.effects.iter().map(effect_bytes).sum::<usize>()).sum()
 }
 
 /// One recording being read.
@@ -412,6 +419,27 @@ impl Session {
 
     pub fn transitions(&self) -> &[Transition] { &self.transitions }
 
+    /// ★ Give a session the transition table that arrived after its
+    /// document (legacy-web §5.4.5.7: exploration off the reader's path).
+    /// Only onto a session that has none and has taken no step: a trail
+    /// indexes the table, and a table swapped under a trail would make it
+    /// name other transitions.
+    pub fn attach_transitions(&mut self, transitions: Vec<Transition>) -> Result<(), String> {
+        if !self.transitions.is_empty() { return Err("this session already has its transition table".into()) }
+        if self.depth() > 0 || !self.ahead.is_empty() || self.trail.as_ref().map_or(true, |t| !t.is_empty()) {
+            return Err("this session has already taken a step".into());
+        }
+        self.transitions_bytes = transitions_bytes(&transitions);
+        self.transitions = transitions;
+        Ok(())
+    }
+
+    /// Whether the reader has changed the published document: a step taken
+    /// (or one backed out of, which is still a history).
+    pub fn at_published(&self) -> bool {
+        self.depth() == 0 && self.ahead.is_empty() && self.trail.as_ref().is_ok_and(|t| t.is_empty())
+    }
+
     /// The transition a trigger names, if this recording has one.
     ///
     /// ★ OFFERABLE ONLY (anchored and complete). An unanchored transition addresses a node the page's
@@ -538,21 +566,42 @@ impl Sessions {
         // never going to open.
         let doc = Document::accept(&r.document).map_err(OpenError::OutsideProfile)?;
 
+        let id = self.next;
+        let session = self.build(r, doc, now, 0)?;
+        self.next += 1;
+        self.open.insert(id, session);
+        Ok(id)
+    }
+
+    /// ★ REPLACE A SESSION'S DOCUMENT IN PLACE (legacy-web §5.4.5.7): the
+    /// scripted conversion arrived for the document a reader is already
+    /// reading at tier 1. Same id, same age; a new document, history and
+    /// table. Checked as `open` checks — the profile, then the budget, with
+    /// the session's own current charge given back — and refused while the
+    /// reader has changed the published document, whose state would be lost.
+    pub fn replace(&mut self, id: SessionId, r: &Recording, now: Millis) -> Result<(), OpenError> {
+        let doc = Document::accept(&r.document).map_err(OpenError::OutsideProfile)?;
+        let (old_bytes, opened_at) = match self.open.get(&id) {
+            Some(s) => (s.bytes(), s.opened_at),
+            None => return Err(OpenError::NoSuchSession),
+        };
+        let mut session = self.build(r, doc, now, old_bytes)?;
+        session.opened_at = opened_at;
+        self.open.insert(id, session);
+        Ok(())
+    }
+
+    /// A session for `r`, charged against the budget less `give_back`.
+    fn build(&self, r: &Recording, doc: Document, now: Millis, give_back: usize) -> Result<Session, OpenError> {
         // Charged at twice the document: the published copy and the reader's.
-        let transitions_bytes: usize = r.transitions.iter()
-            .map(|t| t.trigger.len() + t.event.len()
-                 + t.effects.iter().map(effect_bytes).sum::<usize>())
-            .sum();
+        let transitions_bytes = transitions_bytes(&r.transitions);
         let needed = r.document.len() * 2 + transitions_bytes;
-        let used = self.bytes();
+        let used = self.bytes().saturating_sub(give_back);
         let available = self.limits.max_total_bytes.saturating_sub(used);
         if needed > available {
             return Err(OpenError::WouldExceedMemory { needed, available });
         }
-
-        let id = self.next;
-        self.next += 1;
-        self.open.insert(id, Session {
+        Ok(Session {
             url: r.url.clone(),
             base_bytes: r.document.len(),
             // The reader's document starts as the published one. Its
@@ -566,8 +615,7 @@ impl Sessions {
             last_seen: now,
             trail: Ok(vec![]),
             ahead: vec![],
-        });
-        Ok(id)
+        })
     }
 
     /// ★ RESTORE BY REPLAY, CHECKED BY DIGEST. The saved record is untrusted

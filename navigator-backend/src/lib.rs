@@ -21,6 +21,7 @@ pub mod jailed;
 pub mod limits;
 pub mod links;
 pub mod navigatord;
+pub mod progressive;
 pub mod resample;
 pub mod reverse;
 pub mod session;
@@ -177,3 +178,9 @@ pub const FORMAT_V3: &str = "atrium-navigator-recording/3";
 /// a `templates` field is refused, since a `/3` reader would have replayed a
 /// subset of it with nothing to say so.
 pub const FORMAT_V4: &str = "atrium-navigator-recording/4";
+
+/// ★ A transition table delivered APART from its document (legacy-web
+/// §5.4.5.7): exploration's output, which arrives after the reader already
+/// has the readable recording. Bound to that recording by `readable`, the
+/// BLAKE3 of its bytes; `ingest_transitions` reads it.
+pub const TRANSITIONS_FORMAT: &str = "atrium-navigator-transitions/1";

@@ -33,6 +33,16 @@ impl Carried {
     /// The recording names this image address (`blake3:<hex>`).
     pub fn image(&self, address: &str) -> bool { self.images.contains(address) }
 
+    /// ★ Add bytes delivered apart from the recording — a transitions
+    /// artifact (legacy-web §5.4.5.7) — to what the session carries. An
+    /// inserted effect's links and images are the document's, and the bound
+    /// must know them; it still names only bytes the BROKER was handed.
+    pub fn extend(&mut self, more: &[u8]) {
+        self.images.extend(image_addresses(more));
+        self.bytes.push(0);
+        self.bytes.extend_from_slice(more);
+    }
+
     /// Every image address the recording names.
     pub fn images(&self) -> &BTreeSet<String> { &self.images }
 

@@ -157,6 +157,14 @@ struct Worker {
     reply_limit: Arc<AtomicUsize>,
     /// What the recording carries, from the bytes the broker was handed.
     carried: Carried,
+    /// ★ The broker's own copy of what progressive display handed the
+    /// worker (legacy-web §5.4.5.7), so that what the session CARRIES — the
+    /// link and image bounds — follows the shown document from bytes the
+    /// broker holds, never from the worker's word: the held scripted
+    /// recording and its table, and one kept out as not different.
+    staged: Option<Vec<u8>>,
+    staged_table: Option<Vec<u8>>,
+    kept_out: Option<Vec<u8>>,
 }
 
 impl Worker {
@@ -344,6 +352,7 @@ impl DocumentHost for JailedHost {
         self.workers.insert(id, Worker {
             child, stdin: Some(stdin), frames, charged, opened_at: now, last_seen: now,
             triggers: vec![], reply_limit, carried: Carried::new(recording),
+            staged: None, staged_table: None, kept_out: None,
         });
 
         match self.ask(id, Frame::new(REQ_OPEN, recording), now) {
@@ -501,6 +510,114 @@ impl DocumentHost for JailedHost {
 
     fn triggers(&self, id: SessionId) -> Vec<String> {
         self.workers.get(&id).map(|w| w.triggers.clone()).unwrap_or_default()
+    }
+
+    fn upgrade(&mut self, id: SessionId, recording: &[u8], now: Millis) -> Result<crate::progressive::Upgrade, String> {
+        use crate::progressive::{Difference, Upgrade};
+        // ★ Charged before the worker sees it, as `open` charges: the held
+        // document will replace this session's, so the budget is checked
+        // with this session's own charge given back.
+        let mine = self.workers.get(&id).map(|w| w.charged).ok_or("no such session")?;
+        let used: usize = self.workers.values().map(|w| w.charged).sum::<usize>() - mine;
+        let need = recording.len() * 2;
+        if need > self.limits.max_total_bytes.saturating_sub(used) {
+            return Err(format!("the scripted document needs {need} bytes, over the budget"));
+        }
+        let reply = self.ask(id, Frame::new(REQ_UPGRADE, recording), now)?;
+        // The difference itself stays in the worker, which parsed both; the
+        // broker hears the decision and a sentence for a person.
+        let d = |why: &str| Difference { words_old: 0, words_new: 0, words_changed: 0, images_changed: 0,
+                                         meaningful: false, said: None }.with_why(why);
+        let w = self.workers.get_mut(&id).ok_or("no such session")?;
+        if let Some(why) = reply.strip_prefix("ready ") { w.staged = Some(recording.to_vec()); return Ok(Upgrade::Ready(d(why))) }
+        if let Some(why) = reply.strip_prefix("kept ") { w.kept_out = Some(recording.to_vec()); return Ok(Upgrade::Kept(d(why))) }
+        let why = format!("worker sent an unknown upgrade result {:?}", reply.chars().take(40).collect::<String>());
+        self.retire(id, Status::Failed);
+        Err(why)
+    }
+
+    fn swap(&mut self, id: SessionId, anchor: &crate::progressive::Anchor, now: Millis) -> Result<crate::progressive::Mapped, String> {
+        use crate::progressive::{Anchor, How, Mapped};
+        if anchor.path.contains('\n') || anchor.path.len() > crate::links::MAX_HREF {
+            return Err("an anchor path must be one line and bounded".into());
+        }
+        if self.workers.get(&id).ok_or("no such session")?.staged.is_none() {
+            return Err("there is no scripted document to swap in".into());
+        }
+        let reply = self.ask(id, Frame::new(REQ_SWAP, format!("{}\n{}", anchor.offset, anchor.path)), now)?;
+        // ★ The answer is untrusted: a shape that does not parse retires the
+        // worker. A path that parses but is wrong can only misplace the
+        // reader in their own document.
+        let mut lines = reply.lines();
+        let parsed = (|| {
+            let (how, offset) = lines.next()?.split_once(' ')?;
+            let how = match how { "same" => How::Same, "nearest" => How::Nearest, "top" => How::Top, _ => return None };
+            let offset: i64 = offset.parse().ok()?;
+            let path = lines.next()?.to_string();
+            (path.len() <= crate::links::MAX_HREF).then_some(Mapped { anchor: Anchor { path, offset }, how })
+        })();
+        let Some(mapped) = parsed else {
+            self.retire(id, Status::Failed);
+            return Err("worker sent a malformed swap answer".into());
+        };
+        let triggers: Vec<String> = lines.filter(|l| !l.is_empty()).map(str::to_string).collect();
+        let w = self.workers.get_mut(&id).expect("asked");
+        let rec = w.staged.take().expect("checked");
+        let mut c = Carried::new(&rec);
+        let table = w.staged_table.take();
+        if let Some(t) = &table { c.extend(t) }
+        w.carried = c;
+        w.charged = rec.len() * 2;
+        w.triggers = triggers;
+        if let Some(store) = &mut self.store {
+            let whole = match &table { Some(t) => crate::progressive::compose(&rec, t)?, None => rec };
+            let a = store.put(&whole).map_err(|e| format!("could not store the recording: {e}"))?;
+            self.recordings.insert(id, a);
+        }
+        Ok(mapped)
+    }
+
+    fn attach(&mut self, id: SessionId, transitions: &[u8], now: Millis) -> Result<crate::progressive::Attached, String> {
+        use crate::progressive::Attached;
+        let reply = self.ask(id, Frame::new(REQ_ATTACH, transitions), now)?;
+        let mut lines = reply.lines();
+        let head = lines.next().unwrap_or("");
+        let w = self.workers.get_mut(&id).ok_or("no such session")?;
+        // ★ Each answer must be one the broker's own copy allows: a worker
+        // that claims a table went with a swap it never staged is lying.
+        let ok = match head {
+            "now" => {
+                w.carried.extend(transitions);
+                w.triggers = lines.filter(|l| !l.is_empty()).map(str::to_string).collect();
+                Some(Attached::Now)
+            }
+            "with-swap" if w.staged.is_some() && w.staged_table.is_none() => {
+                w.staged_table = Some(transitions.to_vec());
+                Some(Attached::WithSwap)
+            }
+            "needs-swap" if w.kept_out.is_some() && w.staged.is_none() => {
+                w.staged = w.kept_out.take();
+                w.staged_table = Some(transitions.to_vec());
+                Some(Attached::NeedsSwap)
+            }
+            _ => None,
+        };
+        match ok {
+            Some(Attached::Now) => {
+                if let (Some(store), Some(addr)) = (&mut self.store, self.recordings.get(&id).cloned()) {
+                    let whole = crate::progressive::compose(&store.get(&addr)?, transitions)?;
+                    let a = store.put(&whole).map_err(|e| format!("could not store the recording: {e}"))?;
+                    self.recordings.insert(id, a);
+                }
+                Ok(Attached::Now)
+            }
+            Some(a) => Ok(a),
+            None => {
+                let why = format!("worker sent an attach result the broker cannot accept: {:?}", head.chars().take(40).collect::<String>());
+                self.retire(id, Status::Failed);
+                Err(why)
+            }
+        }
     }
 
     fn document_url(&mut self, id: SessionId, now: Millis) -> Result<String, String> {

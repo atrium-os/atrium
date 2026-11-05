@@ -95,6 +95,20 @@ pub trait DocumentHost {
     fn links_to(&mut self, _id: SessionId, _href: &str, _now: Millis) -> Result<bool, String> {
         Err("this host cannot say what its document links to".into())
     }
+    /// The scripted conversion's readable recording, for the document the
+    /// session shows at tier 1 (§5.4.5.7). The host compares and holds it.
+    fn upgrade(&mut self, _id: SessionId, _recording: &[u8], _now: Millis) -> Result<crate::progressive::Upgrade, String> {
+        Err("this host does not take a scripted conversion after the first one".into())
+    }
+    /// Replace the shown document with the held one, the reader kept at
+    /// `anchor`; answers where that is in the new document.
+    fn swap(&mut self, _id: SessionId, _anchor: &crate::progressive::Anchor, _now: Millis) -> Result<crate::progressive::Mapped, String> {
+        Err("this host does not swap documents".into())
+    }
+    /// A transitions artifact, delivered after its document.
+    fn attach(&mut self, _id: SessionId, _transitions: &[u8], _now: Millis) -> Result<crate::progressive::Attached, String> {
+        Err("this host does not take a transition table apart from its recording".into())
+    }
     /// ★ Whether each document runs CONFINED, as the host itself states it.
     /// Defaults to false: a host has to claim confinement to get it, so a new
     /// host that forgets is refused by `Navigatord::start`, not trusted.
@@ -132,6 +146,15 @@ pub enum Request {
     /// binds either way. A request at a new size (zoom, a scale change)
     /// decodes again and replaces the charge.
     Image { session: SessionId, address: String, painted: Option<(u32, u32)> },
+    /// ★ PROGRESSIVE DISPLAY (legacy-web §5.4.5.7; `progressive`). The
+    /// scripted conversion of the document this session shows at tier 1:
+    /// its readable recording. Compared and held, never shown by itself.
+    Upgrade { session: SessionId, recording: Vec<u8> },
+    /// The UI is at an idle moment (no scroll, no input, nothing
+    /// animating) and the reader is at `anchor`: swap the held document in.
+    Swap { session: SessionId, anchor: crate::progressive::Anchor },
+    /// The transitions artifact, whenever exploration finished.
+    Attach { session: SessionId, transitions: Vec<u8> },
 }
 
 /// What the UI hears back.
@@ -170,6 +193,19 @@ pub enum Event {
     /// profile's ceilings. This is the only form in which an image reaches
     /// the compositor — Fresco never sees encoded bytes.
     Image { session: SessionId, address: String, pixels: Pixels },
+    /// The scripted document is held: swap it in at the next idle moment
+    /// (`Request::Swap`). `why` says what differs, for a person.
+    UpgradeReady { session: SessionId, why: String },
+    /// The scripted document is not meaningfully different; the reader
+    /// keeps what they have and nothing on screen changes.
+    UpgradeKept { session: SessionId, why: String },
+    /// The document was replaced; present the new scene at `anchor` in ONE
+    /// frame (the old scene stays up until the new one is composed).
+    Replaced { session: SessionId, anchor: crate::progressive::Mapped, triggers: Vec<String> },
+    /// The transition table is on the shown document: these are offered.
+    TransitionsAttached { session: SessionId, triggers: Vec<String> },
+    /// The table belongs to the held document and goes in with the swap.
+    TransitionsHeld { session: SessionId },
 }
 
 /// The broker.
@@ -383,6 +419,42 @@ impl<H: DocumentHost> Navigatord<H> {
                     Err(why) => out.push(Event::Blocked { session: Some(session), why: why.to_string() }),
                 }
             }
+            Request::Upgrade { session, recording } => {
+                if let Some(e) = self.absent(session) { out.push(e); return out }
+                use crate::progressive::Upgrade;
+                match self.host.upgrade(session, &recording, self.now) {
+                    Ok(Upgrade::Ready(d)) => out.push(Event::UpgradeReady { session, why: d.why() }),
+                    Ok(Upgrade::Kept(d)) => out.push(Event::UpgradeKept { session, why: d.why() }),
+                    Err(why) => out.push(Event::Blocked { session: Some(session), why }),
+                }
+            }
+            Request::Swap { session, anchor } => {
+                if let Some(e) = self.absent(session) { out.push(e); return out }
+                match self.host.swap(session, &anchor, self.now) {
+                    Ok(anchor) => {
+                        // A new document names its own images: what the old
+                        // one's decodes cost is given back.
+                        self.decoded.remove(&session);
+                        let triggers = self.host.triggers(session);
+                        out.push(Event::Replaced { session, anchor, triggers });
+                    }
+                    Err(why) => out.push(Event::Blocked { session: Some(session), why }),
+                }
+            }
+            Request::Attach { session, transitions } => {
+                if let Some(e) = self.absent(session) { out.push(e); return out }
+                use crate::progressive::Attached;
+                match self.host.attach(session, &transitions, self.now) {
+                    Ok(Attached::Now) => {
+                        let triggers = self.host.triggers(session);
+                        out.push(Event::TransitionsAttached { session, triggers });
+                    }
+                    Ok(Attached::WithSwap) => out.push(Event::TransitionsHeld { session }),
+                    Ok(Attached::NeedsSwap) => out.push(Event::UpgradeReady { session,
+                        why: "the interactions arrived for the scripted document (no visible change)".into() }),
+                    Err(why) => out.push(Event::Blocked { session: Some(session), why }),
+                }
+            }
             Request::Image { session, address, painted } => {
                 if let Some(e) = self.absent(session) { out.push(e); return out }
                 match self.image(session, address, painted) {
@@ -491,6 +563,8 @@ pub struct InProcessHost {
     /// Each open session's recording address, in `store`.
     recordings: std::collections::HashMap<SessionId, String>,
     carried: std::collections::HashMap<SessionId, Carried>,
+    /// Each session's way from its first document to its scripted one.
+    progress: std::collections::HashMap<SessionId, crate::progressive::Progress>,
 }
 
 impl Default for InProcessHost {
@@ -499,7 +573,8 @@ impl Default for InProcessHost {
 
 impl InProcessHost {
     pub fn new(sessions: SessionLimits, limits: crate::Limits) -> Self {
-        InProcessHost { sessions: Sessions::new(sessions), limits, store: None, recordings: Default::default(), carried: Default::default() }
+        InProcessHost { sessions: Sessions::new(sessions), limits, store: None, recordings: Default::default(), carried: Default::default(),
+                        progress: Default::default() }
     }
 
     /// With a store, so sessions can be saved and restored.
@@ -508,6 +583,19 @@ impl InProcessHost {
         self
     }
     pub fn sessions(&self) -> &Sessions { &self.sessions }
+
+    /// Keep what a session now shows in the store, so it saves and restores
+    /// as that: the recording, with its table composed in when it has one.
+    fn store_parts(&mut self, id: SessionId, recording: &[u8], transitions: Option<&[u8]>) -> Result<(), String> {
+        let Some(store) = &mut self.store else { return Ok(()) };
+        let whole = match transitions {
+            Some(t) => crate::progressive::compose(recording, t)?,
+            None => recording.to_vec(),
+        };
+        let a = store.put(&whole).map_err(|e| format!("could not store the recording: {e}"))?;
+        self.recordings.insert(id, a);
+        Ok(())
+    }
 }
 
 impl DocumentHost for InProcessHost {
@@ -524,7 +612,41 @@ impl DocumentHost for InProcessHost {
             }
         }
         self.carried.insert(id, Carried::new(recording));
+        self.progress.insert(id, crate::progressive::Progress::opened(recording));
         Ok(id)
+    }
+
+    fn upgrade(&mut self, id: SessionId, recording: &[u8], now: Millis) -> Result<crate::progressive::Upgrade, String> {
+        let p = self.progress.get_mut(&id).ok_or("no such session")?;
+        p.upgrade(&mut self.sessions, id, recording, &self.limits, now)
+    }
+
+    fn swap(&mut self, id: SessionId, anchor: &crate::progressive::Anchor, now: Millis) -> Result<crate::progressive::Mapped, String> {
+        let p = self.progress.get_mut(&id).ok_or("no such session")?;
+        let sw = p.swap(&mut self.sessions, id, anchor, &self.limits, now)?;
+        // ★ What the session CARRIES follows what it shows: the link and
+        // image bounds are the new recording's (and its table's), never
+        // still the first one's.
+        let mut c = Carried::new(&sw.recording);
+        if let Some(t) = &sw.transitions { c.extend(t) }
+        self.carried.insert(id, c);
+        self.store_parts(id, &sw.recording, sw.transitions.as_deref())?;
+        Ok(sw.mapped)
+    }
+
+    fn attach(&mut self, id: SessionId, transitions: &[u8], now: Millis) -> Result<crate::progressive::Attached, String> {
+        let p = self.progress.get_mut(&id).ok_or("no such session")?;
+        let a = p.attach(&mut self.sessions, id, transitions, &self.limits, now)?;
+        if a == crate::progressive::Attached::Now {
+            // An inserted effect's links are the document's links too.
+            if let Some(c) = self.carried.get_mut(&id) { c.extend(transitions) }
+            let shown = self.recordings.get(&id).cloned();
+            if let (Some(store), Some(addr)) = (&self.store, shown) {
+                let readable = store.get(&addr)?;
+                self.store_parts(id, &readable, Some(transitions))?;
+            }
+        }
+        Ok(a)
     }
 
     fn save(&mut self, id: SessionId) -> Result<String, String> {
@@ -543,6 +665,7 @@ impl DocumentHost for InProcessHost {
         let id = self.sessions.restore(&r, &record, now).map_err(|e| e.to_string())?;
         self.recordings.insert(id, record.recording);
         self.carried.insert(id, Carried::new(&bytes));
+        self.progress.insert(id, crate::progressive::Progress::opened(&bytes));
         Ok(id)
     }
 
@@ -564,11 +687,12 @@ impl DocumentHost for InProcessHost {
     fn close(&mut self, id: SessionId) -> bool {
         self.recordings.remove(&id);
         self.carried.remove(&id);
+        self.progress.remove(&id);
         self.sessions.close(id)
     }
     fn expire(&mut self, now: Millis) -> Vec<(SessionId, Expiry)> {
         let gone = self.sessions.expire(now);
-        for (id, _) in &gone { self.recordings.remove(id); self.carried.remove(id); }
+        for (id, _) in &gone { self.recordings.remove(id); self.carried.remove(id); self.progress.remove(id); }
         gone
     }
     fn carried(&self, id: SessionId) -> Option<&Carried> { self.carried.get(&id) }
