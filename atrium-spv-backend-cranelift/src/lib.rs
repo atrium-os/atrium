@@ -1442,27 +1442,25 @@ impl FnTranslator {
                 let result = inst.result.as_ref().ok_or_else(||
                     BackendError::Internal(
                         "AtomicLoad without result".to_string()))?;
-                let (ptr_v, ptr_off) = self.checked_pointer(builder, ptr, 4)?;
-                let mflags = cranelift_codegen::ir::MemFlags::new();
-                let v = builder.ins().load(
-                    clif_types::I32, mflags, ptr_v, ptr_off);
+                let addr = self.atomic_addr(builder, ptr)?;
+                let v = builder.ins().atomic_load(
+                    clif_types::I32, atomic_flags(), addr);
                 self.scalars.insert(result.id, v);
                 Ok(())
             }
             Op::AtomicStore { ptr, value } => {
-                let (ptr_v, ptr_off) = self.checked_pointer(builder, ptr, 4)?;
+                let addr = self.atomic_addr(builder, ptr)?;
                 let val = *self.scalars.get(&value.id).ok_or_else(||
                     BackendError::Internal(format!(
                         "AtomicStore value {:?} not in scalars", value.id)))?;
-                let mflags = cranelift_codegen::ir::MemFlags::new();
-                builder.ins().store(mflags, val, ptr_v, ptr_off);
+                builder.ins().atomic_store(atomic_flags(), val, addr);
                 Ok(())
             }
             Op::AtomicCompareExchange { ptr, expected, desired } => {
                 let result = inst.result.as_ref().ok_or_else(||
                     BackendError::Internal(
                         "AtomicCompareExchange without result".to_string()))?;
-                let (ptr_v, ptr_off) = self.checked_pointer(builder, ptr, 4)?;
+                let addr = self.atomic_addr(builder, ptr)?;
                 let exp = *self.scalars.get(&expected.id).ok_or_else(||
                     BackendError::Internal(format!(
                         "AtomicCompareExchange expected {:?} not in scalars",
@@ -1471,14 +1469,10 @@ impl FnTranslator {
                     BackendError::Internal(format!(
                         "AtomicCompareExchange desired {:?} not in scalars",
                         desired.id)))?;
-                let mflags = cranelift_codegen::ir::MemFlags::new();
-                let old = builder.ins().load(
-                    clif_types::I32, mflags, ptr_v, ptr_off);
-                // new = (old == exp) ? des : old
-                let cmp = builder.ins().icmp(
-                    cranelift_codegen::ir::condcodes::IntCC::Equal, old, exp);
-                let new_val = builder.ins().select(cmp, des, old);
-                builder.ins().store(mflags, new_val, ptr_v, ptr_off);
+                // A real compare-and-swap: invocations run on several
+                // threads at once (parallel dispatch), so a load/select/
+                // store sequence loses updates.
+                let old = builder.ins().atomic_cas(atomic_flags(), addr, exp, des);
                 self.scalars.insert(result.id, old);
                 Ok(())
             }
@@ -1494,27 +1488,29 @@ impl FnTranslator {
                 let result = inst.result.as_ref().ok_or_else(||
                     BackendError::Internal(
                         "Atomic op without result".to_string()))?;
-                let (ptr_v, ptr_off) = self.checked_pointer(builder, ptr, 4)?;
+                let addr = self.atomic_addr(builder, ptr)?;
                 let val = *self.scalars.get(&value.id).ok_or_else(||
                     BackendError::Internal(format!(
                         "Atomic value {:?} not in scalars",
                         value.id)))?;
-                let mflags = cranelift_codegen::ir::MemFlags::new();
-                let old = builder.ins().load(
-                    clif_types::I32, mflags, ptr_v, ptr_off);
-                let new_val = match &inst.op {
-                    Op::AtomicIAdd { .. } => builder.ins().iadd(old, val),
-                    Op::AtomicAnd  { .. } => builder.ins().band(old, val),
-                    Op::AtomicOr   { .. } => builder.ins().bor(old, val),
-                    Op::AtomicXor  { .. } => builder.ins().bxor(old, val),
-                    Op::AtomicSMin { .. } => builder.ins().smin(old, val),
-                    Op::AtomicSMax { .. } => builder.ins().smax(old, val),
-                    Op::AtomicUMin { .. } => builder.ins().umin(old, val),
-                    Op::AtomicUMax { .. } => builder.ins().umax(old, val),
-                    Op::AtomicExchange { .. } => val, // write addend as-is
+                use cranelift_codegen::ir::AtomicRmwOp as R;
+                // Real read-modify-write (LSE or LL/SC on aarch64, lock
+                // prefix / cmpxchg loop on x86): invocations run on
+                // several threads at once, so load/op/store loses updates.
+                let op = match &inst.op {
+                    Op::AtomicIAdd { .. } => R::Add,
+                    Op::AtomicAnd  { .. } => R::And,
+                    Op::AtomicOr   { .. } => R::Or,
+                    Op::AtomicXor  { .. } => R::Xor,
+                    Op::AtomicSMin { .. } => R::Smin,
+                    Op::AtomicSMax { .. } => R::Smax,
+                    Op::AtomicUMin { .. } => R::Umin,
+                    Op::AtomicUMax { .. } => R::Umax,
+                    Op::AtomicExchange { .. } => R::Xchg,
                     _ => unreachable!(),
                 };
-                builder.ins().store(mflags, new_val, ptr_v, ptr_off);
+                let old = builder.ins().atomic_rmw(
+                    clif_types::I32, atomic_flags(), op, addr, val);
                 // SPIR-V returns the OLD value.
                 self.scalars.insert(result.id, old);
                 Ok(())
@@ -3321,6 +3317,17 @@ impl FnTranslator {
     /// SSBO pointers get the bounds check: an access that would end
     /// past the binding's size goes to the table's sink instead
     /// (docs/spec/tier2-robust-access.md).
+    /// The bounds-checked address of a 4-byte atomic, as one value
+    /// (Cranelift's atomic instructions take no offset).
+    fn atomic_addr(
+        &mut self,
+        builder: &mut FunctionBuilder,
+        ptr: &atrium_spv_ir::Value,
+    ) -> Result<ClifValue, BackendError> {
+        let (base, off) = self.checked_pointer(builder, ptr, 4)?;
+        Ok(if off == 0 { base } else { builder.ins().iadd_imm(base, off as i64) })
+    }
+
     fn checked_pointer(
         &mut self,
         builder: &mut FunctionBuilder,
@@ -3538,6 +3545,14 @@ fn build_signature(
 /// (`atrium_vs_main` / `atrium_fs_main` / `atrium_cs_main`)
 /// regardless of their atrium-spv-ir `Function.name` —
 /// that's the contract the daemon loads against.
+/// Flags for SPIR-V atomics: always little-endian, aligned and
+/// non-trapping like the rest of our memory accesses.
+fn atomic_flags() -> cranelift_codegen::ir::MemFlags {
+    let mut f = cranelift_codegen::ir::MemFlags::new();
+    f.set_endianness(cranelift_codegen::ir::Endianness::Little);
+    f
+}
+
 fn exported_symbol_name(func: &atrium_spv_ir::Function) -> String {
     match func.stage {
         ShaderStage::Vertex   => "atrium_vs_main".to_string(),

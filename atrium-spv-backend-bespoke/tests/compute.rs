@@ -365,8 +365,12 @@ fn spv_compile_picks_bespoke_for_supported_compute_shaders() {
     ] {
         let backend = invoked_backend(&spv)
             .unwrap_or_else(|e| panic!("compile failed for {name}: {e}"));
-        assert_eq!(backend, "bespoke",
-            "{name} should compile through bespoke, got {backend}");
+        // Every shader here but `empty` writes a storage buffer, which
+        // the arm64 backend declines until it has bounds checks
+        // (docs/spec/tier2-robust-access.md): those go to Cranelift.
+        let want = if name == "empty" { "bespoke" } else { "cranelift" };
+        assert_eq!(backend, want,
+            "{name} should compile through {want}, got {backend}");
     }
 }
 

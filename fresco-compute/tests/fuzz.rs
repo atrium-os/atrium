@@ -55,7 +55,9 @@ struct Guarded {
 
 impl Guarded {
     fn new(bytes: &[u8], at_end: bool) -> Guarded {
-        let page = 4096usize;
+        // 16 KiB on macOS arm64; mprotect needs whole pages.
+        // SAFETY: sysconf has no preconditions.
+        let page = unsafe { libc::sysconf(libc::_SC_PAGESIZE) } as usize;
         let n = bytes.len().max(4);
         let body = n.div_ceil(page) * page;
         let len = body + 2 * page;

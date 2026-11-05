@@ -2781,13 +2781,16 @@ fn lse_atomics_are_race_safe_under_concurrent_threads() {
 
     let dir = TempDir::new().unwrap();
     let module = translate(&spv).expect("frontend");
-    // aarch64: bespoke's LSE atomics. x86_64: Cranelift's
-    // LOCK-prefixed atomics, same race-safety bar.
-    let obj = bespoke_or_cranelift(&module, true);
-    let obj_path = dir.path().join("atomic_race.o");
+    // Both backends: the bespoke side (LSE on aarch64, LOCK on x86;
+    // SSBO shaders fall back to Cranelift on aarch64 for now) and
+    // Cranelift itself (atomic_rmw), which every fallback relies on.
+    for use_bespoke in [true, false] {
+    let who = if use_bespoke { "bespoke" } else { "cranelift" };
+    let obj = bespoke_or_cranelift(&module, use_bespoke);
+    let obj_path = dir.path().join(format!("atomic_race_{who}.o"));
     std::fs::write(&obj_path, &obj).unwrap();
     let ext = if cfg!(target_os = "macos") { "dylib" } else { "so" };
-    let lib_path = dir.path().join(format!("atomic_race.{ext}"));
+    let lib_path = dir.path().join(format!("atomic_race_{who}.{ext}"));
     link_to_shared_library(&obj_path, &lib_path).expect("link");
     let lib = unsafe { libloading::Library::new(&lib_path) }.expect("dlopen");
     let cs_main: libloading::Symbol<CsMain> = unsafe {
@@ -2818,7 +2821,8 @@ fn lse_atomics_are_race_safe_under_concurrent_threads() {
     let counter = u32::from_le_bytes(buf[0..4].try_into().unwrap());
     let expected = (N_THREADS * N_ITERS_PER_THREAD) as u32;
     assert_eq!(counter, expected,
-        "LSE atomic counter raced: got {counter}, want {expected}");
+        "{who}: atomic counter raced: got {counter}, want {expected}");
+    }
 }
 
 #[test]

@@ -139,9 +139,31 @@ pub const HOST_HAS_ANY_BESPOKE: bool =
 /// Tests use it to pin absolute values on any host.
 pub fn native_runner() -> Box<dyn ShaderRunner> {
     if cfg!(target_arch = "aarch64") {
-        Box::new(BespokeRunner)
+        Box::new(ProductionRunner)
     } else {
         Box::new(CraneliftRunner)
+    }
+}
+
+/// atrium-spv-compile's selection: bespoke, and Cranelift for any shader
+/// bespoke returns Unsupported for (on aarch64 today: shadow sampling,
+/// derivatives, and anything touching a storage buffer until the arm64
+/// backend has bounds checks).
+#[derive(Debug)]
+pub struct ProductionRunner;
+
+impl ShaderRunner for ProductionRunner {
+    fn name(&self) -> &'static str { "production" }
+
+    fn run(
+        &self,
+        spirv: &[u8],
+        inputs: &ShaderInputs,
+    ) -> Result<ShaderOutputs, BackendError> {
+        match BespokeRunner.run(spirv, inputs) {
+            Err(BackendError::Unsupported(_)) => CraneliftRunner.run(spirv, inputs),
+            other => other,
+        }
     }
 }
 
