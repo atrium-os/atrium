@@ -9,7 +9,7 @@
 # frescod runs NON-ROOT (_frescod). A compositor needs no root: client buffers
 # cross the jail boundary as fds passed over its socket (SCM_RIGHTS / dma-buf-
 # equiv), and the only privileged thing it touches is the GPU device — granted to
-# _frescod via the atrium_gpu devfs ruleset (21), since the atrium-gpu-amd kmod
+# _frescod via the atrium_display devfs ruleset (23), since the atrium-gpu-amd kmod
 # gates only on device-node perms (no priv_check). Isolated: own rootfs (sees no
 # host fs), per-jail devfs (only basics + gpu0/display0/hidraw*).
 #
@@ -29,9 +29,10 @@
 #      jaild.policy's allowed_system_uids. frescod starts one renderer jail per
 #      client through portcullisd (its socket is under the /atrium/sockets
 #      mount below) and refuses clients if portcullisd is not running.
-#   2. The atrium_gpu devfs ruleset (etc/atrium.devfs.rules, installed and
-#      loaded at boot by scripts/bootstrap-atrium.sh); id 21 in jaild.policy
-#      [devfs_rulesets].allowed_ids.
+#   2. The atrium_display devfs ruleset (etc/atrium.devfs.rules, installed and
+#      loaded at boot by scripts/bootstrap-atrium.sh); id 23 in jaild.policy
+#      [devfs_rulesets].allowed_ids, pinned to this service. jaild writes the
+#      display lease before frescod starts (atrium-gpu-amd/ISOLATION.md).
 #   3. The per-cap socket dirs owned by _frescod so it can bind:
 #      `mkdir -p /atrium/sockets/fresco /atrium/sockets/fresco-wm &&
 #       chown _frescod:_frescod /atrium/sockets/fresco /atrium/sockets/fresco-wm`.
@@ -43,7 +44,7 @@ enabled       = true
 name          = "atrium-frescod"
 path          = "/var/lib/atrium/jails/frescod"
 children_max  = 0
-devfs_ruleset = 21                               # atrium_gpu: basics + gpu/display/hidraw
+devfs_ruleset = 23                               # atrium_display: basics + gpu/display/hidraw (frescod only)
 
 [[mounts]]
 source = "/libexec"

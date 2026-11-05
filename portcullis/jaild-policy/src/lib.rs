@@ -112,6 +112,33 @@ pub struct DevfsRulesets {
     /// host devfs). 0 is always permitted (= "inherit").
     #[serde(default)]
     pub allowed_ids: Vec<u32>,
+    /// Rulesets one service owns. A jail may mount a pinned ruleset only as
+    /// exactly that service (jail name, exec path, uid, no child jails), and
+    /// jaild writes `<jail>:<uid>` to each of its `leases` sysctls before the
+    /// service starts, so the kernel driver behind those nodes accepts opens
+    /// from that jail and uid alone (the display lease, ISOLATION.md).
+    #[serde(default)]
+    pub pinned: Vec<PinnedRuleset>,
+}
+
+#[derive(Debug, Deserialize, Serialize, Clone)]
+pub struct PinnedRuleset {
+    pub id:        u32,
+    pub jail_name: String,
+    pub exec_path: String,
+    pub uid:       u32,
+    /// sysctl OIDs (e.g. `dev.atrium_gpu_amd_display.0.lease`) jaild sets to
+    /// `<jail_name>:<uid>` when it creates the jail. A missing OID (driver not
+    /// loaded) is logged, not fatal: the device then refuses the jail anyway.
+    #[serde(default)]
+    pub leases:    Vec<String>,
+}
+
+impl DevfsRulesets {
+    /// The pin on ruleset `id`, if it has one.
+    pub fn pin(&self, id: u32) -> Option<&PinnedRuleset> {
+        self.pinned.iter().find(|p| p.id == id)
+    }
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -343,7 +370,7 @@ mod tests {
 
         let frescod = p.services.get("frescod")
             .expect("services.frescod missing");
-        assert_eq!(frescod.allowed_devfs_ruleset, "atrium-gpu");
+        assert_eq!(frescod.allowed_devfs_ruleset, "atrium-display");
         assert_eq!(frescod.network, NetworkConfig::Disable);
 
         let supervisor = p.services.get("atrium-supervisor")

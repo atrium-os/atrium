@@ -693,6 +693,24 @@ pub fn devfs_ruleset_has_rules(id: u32) -> io::Result<bool> {
     Ok(out.status.success() && !out.stdout.iter().all(|b| b.is_ascii_whitespace()))
 }
 
+/// Set a string sysctl (root only; jaild runs as root on the host).
+#[cfg(target_os = "freebsd")]
+pub fn sysctl_set_string(name: &str, value: &str) -> io::Result<()> {
+    let n = CString::new(name).map_err(|_| io::Error::from(io::ErrorKind::InvalidInput))?;
+    let v = CString::new(value).map_err(|_| io::Error::from(io::ErrorKind::InvalidInput))?;
+    let bytes = v.as_bytes_with_nul();
+    // SAFETY: n and v are valid NUL-terminated strings that outlive the call.
+    let r = unsafe {
+        libc::sysctlbyname(n.as_ptr(), std::ptr::null_mut(), std::ptr::null_mut(),
+            bytes.as_ptr() as *const libc::c_void, bytes.len())
+    };
+    if r == 0 { Ok(()) } else { Err(io::Error::last_os_error()) }
+}
+#[cfg(not(target_os = "freebsd"))]
+pub fn sysctl_set_string(_name: &str, _value: &str) -> io::Result<()> {
+    Err(io::Error::new(io::ErrorKind::Unsupported, "sysctl: FreeBSD only"))
+}
+
 #[cfg(not(target_os = "freebsd"))]
 pub fn nullfs_mount(_s: &str, _t: &str, _ro: bool) -> io::Result<()> {
     Err(io::Error::new(io::ErrorKind::Unsupported, "nmount: FreeBSD only"))

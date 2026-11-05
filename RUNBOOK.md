@@ -5214,7 +5214,12 @@ In the guest:
 - Kernel headers: download `src.txz` on the host and pipe in only `sys`, `share/mk`, `include`.
   The Atrium-only `<sys/energy_budget.h>` is stubbed by `atrium-gpu-amd/energy_compat.h`.
 - Tests: `atrium-gpu-amd/tests/atrium_gpu_test.c` (suite) and
-  `test_gpu_isolation.c` (F1/F6 isolation). Expected as of 2026-11-04:
+  `test_gpu_isolation.c` (F1/F6 isolation, part E the display lease). Once
+  jaild has started frescod, the display is leased to it and host root's
+  open gets `EPERM`: stop frescod and `sysctl
+  dev.atrium_gpu_amd_display.0.lease=""` before running the display tests.
+  frescod's jail needs devfs ruleset 23 loaded (`service devfs restart` after
+  installing `etc/atrium.devfs.rules`). Expected as of 2026-11-04:
   suite 28/28, isolation 50/50.
 - After changing gpusim: rebuild `gpusim-server`, then `cloud-vm.sh down`/`up`
   (and the nextboot/kldload/devctl steps again).

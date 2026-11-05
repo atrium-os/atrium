@@ -933,6 +933,22 @@ fn handle_create(
         }
         info!("jaild: mounted per-jail devfs at {devdir} ruleset {}",
             req.devfs_ruleset);
+
+        /* A pinned ruleset's device leases (the display lease): name this jail
+         * and uid as the only opener BEFORE the service runs, so it never sees
+         * EPERM at startup and nothing else can open the device meanwhile. The
+         * validator has already checked the request is exactly that service.
+         * Not fatal: if the driver is not loaded there is nothing to lease, and
+         * a lease we failed to write leaves the device refusing this jail. */
+        if let Some(pin) = policy.devfs_rulesets.pin(req.devfs_ruleset) {
+            let holder = format!("{}:{}", pin.jail_name, pin.uid);
+            for oid in &pin.leases {
+                match ffi::sysctl_set_string(oid, &holder) {
+                    Ok(()) => info!("jaild: lease {oid} = {holder}"),
+                    Err(e) => warn!("jaild: lease {oid} = {holder}: {e} (device will refuse the jail)"),
+                }
+            }
+        }
     }
 
     /* ★★ A networked jail's own stack (network.md §0) is built BEFORE anything

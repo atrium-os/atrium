@@ -28,6 +28,7 @@ pub fn validate_create(
     validate_path(&req.path, policy)?;
     validate_children_max(req.children_max, policy)?;
     validate_devfs_ruleset(req.devfs_ruleset, policy)?;
+    validate_devfs_pin(req, policy)?;
     validate_network(&req.network, &req.name, policy)?;
     for m in &req.mounts {
         validate_mount(m, policy)?;
@@ -192,6 +193,31 @@ fn validate_devfs_ruleset(id: u32, policy: &Policy) -> Result<(), JaildError> {
         });
     }
     Ok(())
+}
+
+/// A pinned ruleset (policy `[[devfs_rulesets.pinned]]`) exposes device nodes
+/// that belong to one service, e.g. the display to frescod. Only a request that
+/// IS that service may mount it: same jail name, same binary, same uid, and no
+/// child jails (a child would see the parent's devfs).
+fn validate_devfs_pin(req: &CreateJailRequest, policy: &Policy) -> Result<(), JaildError> {
+    let Some(pin) = policy.devfs_rulesets.pin(req.devfs_ruleset) else { return Ok(()) };
+    let deny = |why: String| Err(JaildError::PolicyViolation {
+        rule:   "devfs_ruleset.pinned",
+        detail: format!("devfs_ruleset {} is pinned to jail {:?} ({} as uid {}): {why}",
+            pin.id, pin.jail_name, pin.exec_path, pin.uid),
+    });
+    if req.name != pin.jail_name {
+        return deny(format!("jail name is {:?}", req.name));
+    }
+    if req.children_max != 0 {
+        return deny(format!("children_max is {}, must be 0", req.children_max));
+    }
+    match &req.exec {
+        None => deny("the request runs nothing".into()),
+        Some(e) if e.path != pin.exec_path => deny(format!("exec path is {:?}", e.path)),
+        Some(e) if e.uid != pin.uid => deny(format!("uid is {}", e.uid)),
+        Some(_) => Ok(()),
+    }
 }
 
 fn validate_name(name: &str) -> Result<(), JaildError> {
@@ -1112,6 +1138,63 @@ mod tests {
         p.devfs_rulesets.allowed_ids = vec![5, 6, 7];
         validate_devfs_ruleset(6, &p).unwrap();
         validate_devfs_ruleset(99, &p).unwrap_err();
+    }
+
+    fn pinned_policy() -> Policy {
+        let mut p = load_sample_policy();
+        p.devfs_rulesets.allowed_ids = vec![21, 23];
+        p.devfs_rulesets.pinned = vec![jaild_policy::PinnedRuleset {
+            id: 23,
+            jail_name: "atrium-frescod".into(),
+            exec_path: "/usr/local/bin/atrium-frescod".into(),
+            uid: 65010,
+            leases: vec!["dev.atrium_gpu_amd_display.0.lease".into()],
+        }];
+        p
+    }
+
+    fn frescod_req(name: &str, path: &str, uid: u32) -> CreateJailRequest {
+        let mut r = req_default();
+        r.name = name.into();
+        r.devfs_ruleset = 23;
+        r.exec = Some(ExecSpec {
+            path: path.into(), argv: vec![path.into()], env: vec![],
+            uid, gid: uid, stdio: false,
+        });
+        r
+    }
+
+    #[test]
+    fn pinned_ruleset_accepts_only_its_service() {
+        let p = pinned_policy();
+        let bin = "/usr/local/bin/atrium-frescod";
+        validate_devfs_pin(&frescod_req("atrium-frescod", bin, 65010), &p).unwrap();
+        let refused = |r: CreateJailRequest| matches!(validate_devfs_pin(&r, &p),
+            Err(JaildError::PolicyViolation { rule: "devfs_ruleset.pinned", .. }));
+        assert!(refused(frescod_req("atrium-other", bin, 65010)), "other jail name");
+        assert!(refused(frescod_req("atrium-frescod", "/usr/local/bin/atrium-evil", 65010)), "other binary");
+        assert!(refused(frescod_req("atrium-frescod", bin, 65011)), "other uid");
+        let mut r = frescod_req("atrium-frescod", bin, 65010);
+        r.children_max = 1;
+        assert!(refused(r), "child jails");
+        let mut r = frescod_req("atrium-frescod", bin, 65010);
+        r.exec = None;
+        assert!(refused(r), "no exec");
+        // An unpinned ruleset is unaffected.
+        let mut r = frescod_req("anything", "/usr/local/bin/atrium-x", 1001);
+        r.devfs_ruleset = 21;
+        validate_devfs_pin(&r, &p).unwrap();
+    }
+
+    #[test]
+    fn shipped_policy_pins_the_display_ruleset_to_frescod() {
+        let p = load_sample_policy();
+        let pin = p.devfs_rulesets.pin(23).expect("ruleset 23 (atrium_display) is pinned");
+        assert_eq!(pin.jail_name, "atrium-frescod");
+        assert_eq!(pin.exec_path, "/usr/local/bin/atrium-frescod");
+        assert_eq!(pin.uid, 65010);
+        assert!(pin.leases.iter().any(|l| l.contains("atrium_gpu_amd_display")));
+        assert!(p.devfs_rulesets.allowed_ids.contains(&23));
     }
 
     #[test]

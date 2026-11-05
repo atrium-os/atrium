@@ -26,14 +26,27 @@ add include $devfsrules_unhide_basic
 add path pressure unhide
 add path pressure mode 0644
 
-# The jailed, NON-ROOT compositor (frescod). Baseline plus the GPU, display and
-# HID input nodes, made openable (0666) inside frescod's own devfs instance so
-# the non-root _frescod uid can use them. The atrium-gpu-amd kmod gates only on
+# GPU + HID input, no display. Baseline plus the GPU and HID input nodes, made
+# openable (0666) inside the jail's own devfs instance so a non-root uid can use
+# them. The atrium-gpu-amd kmod gates only on
 # node permissions (no priv_check), so this grant alone lets frescod run without
 # root. atrium-gpu0ctl (device reset, scheduler, power gating) is deliberately
 # NOT unhidden here or in any jail ruleset: it is the host broker's alone. The host's nodes stay 0600 root:wheel — these rules change only this
 # jail's devfs mount.
 [atrium_gpu=21]
+add include $devfsrules_hide_all
+add include $devfsrules_unhide_basic
+add path 'atrium-gpu0' unhide
+add path 'atrium-gpu0' mode 0666
+add path 'hidraw*' unhide
+add path 'hidraw*' mode 0666
+
+# The jailed, NON-ROOT compositor (frescod): atrium_gpu plus the display. This
+# ruleset is frescod's alone: jaild.policy.toml pins id 23 to the frescod
+# service (jail atrium-frescod, /usr/local/bin/atrium-frescod, uid _frescod),
+# and the display driver additionally refuses any opener but the jail and uid
+# named in its lease, which jaild writes before frescod starts.
+[atrium_display=23]
 add include $devfsrules_hide_all
 add include $devfsrules_unhide_basic
 add path 'atrium-gpu0' unhide
