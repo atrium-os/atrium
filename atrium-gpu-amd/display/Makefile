@@ -4,10 +4,12 @@
 # device_get_softc(device_get_parent(dev)). Depends on the base module,
 # independent of the GPU module.
 KMOD=	atrium_gpu_amd_display
-SRCS=	display_dev.c
+SRCS=	display_dev.c edid.c sink.c
 SRCS+=	device_if.h bus_if.h pci_if.h
 
-.PATH:	${.CURDIR}/..
-CFLAGS+= -I${.CURDIR}/.. -I${.CURDIR}/../../include
+# edid.c / sink.c: the EDID parser and connector probe every display driver
+# shares (atrium-display/).
+.PATH:	${.CURDIR}/.. ${.CURDIR}/../../atrium-display
+CFLAGS+= -I${.CURDIR}/.. -I${.CURDIR}/../../include -I${.CURDIR}/../../atrium-display
 
 .include <bsd.kmod.mk>

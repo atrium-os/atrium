@@ -162,8 +162,33 @@ struct DCommit {
     in_fence_value: u64,
     out_fence_value: u64,
     out_fault: u32,
+    mode_generation: u32,
+}
+#[repr(C)]
+#[derive(Default, Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ModeV2 {
+    pub width: u32,
+    pub height: u32,
+    pub refresh_mhz: u32,
+    pub pixel_clock_khz: u32,
+    pub flags: u32,
     pad: u32,
 }
+#[repr(C)]
+struct DConnectorV2 {
+    struct_size: u32,
+    out_flags: u32,
+    out_connector_type: u32,
+    out_generation: u32,
+    out_edid_len: u32,
+    out_mode_count: u32,
+    out_current_mode: u32,
+    pad: u32,
+    out_edid: [u8; 512],
+    out_modes: [ModeV2; 16],
+}
+#[repr(C)]
+struct DConfig { connector_type: u32, plug_mode: u32 }
 #[repr(C)]
 #[derive(Default)]
 struct DStatusV2 {
@@ -196,6 +221,20 @@ pub const STATUS_MODE_SET: u32 = 0x2;
 pub const STATUS_CONTENT_LOST: u32 = 0x4;
 /// kqueue fflags on the display fd: reset-only registration / reset seen.
 pub const NOTE_RESET: u32 = 0x1;
+/// (2.1) A monitor was plugged, unplugged or swapped.
+pub const NOTE_HOTPLUG: u32 = 0x2;
+/// (2.1) The monitor doesn't offer the programmed timing.
+pub const FAULT_MODE_UNSUPPORTED: u32 = 8;
+/// `ModeV2::flags`: the monitor's preferred mode.
+pub const MODE_PREFERRED: u32 = 0x1;
+/// Interim CONFIG test knob: the simulated monitors (`plug`), and unplug.
+pub const PLUG_VGA: u32 = 0;
+pub const PLUG_1080P: u32 = 1;
+pub const PLUG_4K: u32 = 2;
+pub const PLUG_DESKTOP: u32 = 3;
+pub const UNPLUG: u32 = 0xffff_ffff;
+/// Interim connector type code for HDMI 2.1 (the power-on cable).
+pub const CONN_HDMI21: u32 = 2;
 
 fn open_rdwr(path: &str) -> io::Result<RawFd> {
     let c = CString::new(path).unwrap();
@@ -681,6 +720,19 @@ pub struct StatusV2 {
     pub last_fault: u32,
 }
 
+/// [`Display::connector_v2`] result (display ABI 2.1 CONNECTOR).
+#[derive(Debug, Clone)]
+pub struct ConnectorV2 {
+    pub connected: bool,
+    pub connector_type: u32,
+    /// Hotplug generation; pass it to [`Display::modeset_at`].
+    pub generation: u32,
+    pub edid: Vec<u8>,
+    pub modes: Vec<ModeV2>,
+    /// Index in `modes` of the lit mode, if any.
+    pub current: Option<usize>,
+}
+
 #[derive(Debug, Clone)]
 pub struct Connector {
     pub connected: bool,
@@ -709,6 +761,49 @@ impl Display {
         let mut m = DModes::default();
         unsafe { call(self.fd, ior(D, 2, std::mem::size_of::<DModes>()), &mut m)? };
         Ok(m.modes[..(m.count as usize).min(8)].to_vec())
+    }
+
+    /// The monitor, its raw EDID and every mode it offers (display ABI 2.1).
+    pub fn connector_v2(&self) -> io::Result<ConnectorV2> {
+        let mut c: DConnectorV2 = unsafe { std::mem::zeroed() };
+        c.struct_size = std::mem::size_of::<DConnectorV2>() as u32;
+        unsafe { call(self.fd, iowr(D, 66, std::mem::size_of::<DConnectorV2>()), &mut c)? };
+        let n = (c.out_mode_count as usize).min(16);
+        Ok(ConnectorV2 {
+            connected: c.out_flags & 1 != 0,
+            connector_type: c.out_connector_type,
+            generation: c.out_generation,
+            edid: c.out_edid[..(c.out_edid_len as usize).min(512)].to_vec(),
+            modes: c.out_modes[..n].to_vec(),
+            current: (c.out_current_mode as usize).lt(&n).then_some(c.out_current_mode as usize),
+        })
+    }
+
+    /// Test knob (interim CONFIG): re-plug the simulated monitor (`PLUG_*`)
+    /// on a connector type, or unplug it ([`UNPLUG`]).
+    pub fn sim_plug(&self, connector_type: u32, plug: u32) -> io::Result<()> {
+        let mut c = DConfig { connector_type, plug_mode: plug };
+        unsafe { call(self.fd, iow(D, 6, std::mem::size_of::<DConfig>()), &mut c) }
+    }
+
+    /// MODESET at `connector_v2().modes[index]`, checked against the hotplug
+    /// `generation` it was read from (`ESTALE` if the monitor changed since;
+    /// 0 skips the check). `pitch` 0 = packed.
+    pub fn modeset_at(&self, bo: &Bo<'_>, index: u32, generation: u32, pitch: u32) -> io::Result<u32> {
+        let mut c = DCommit {
+            struct_size: std::mem::size_of::<DCommit>() as u32,
+            flags: COMMIT_MODESET,
+            mode_index: index,
+            format: FORMAT_XRGB8888,
+            bo_fd: bo.fd,
+            pitch,
+            in_fence_fd: -1,
+            out_fence_fd: -1,
+            mode_generation: generation,
+            ..Default::default()
+        };
+        unsafe { call(self.fd, iowr(D, 64, std::mem::size_of::<DCommit>()), &mut c) }?;
+        Ok(c.out_fault)
     }
 
     /// Put `bo` on the primary plane (display ABI v2 `COMMIT`).
@@ -803,6 +898,73 @@ impl AsRawFd for Display { fn as_raw_fd(&self) -> RawFd { self.fd } }
 /// `NOTE_RESET`, so vblanks never wake it). Borrows the display's fd: keep the
 /// `Display` open for as long as this is used.
 pub struct ResetWatch { kq: RawFd }
+
+/// What [`EventWatch::wait`] saw since the last wait. `data` is the
+/// generation of the last event (the reset generation or the connector
+/// generation); read CONNECTOR / STATUS for both when both are set.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DisplayEvents {
+    pub reset: bool,
+    pub hotplug: bool,
+    pub data: u64,
+}
+
+/// A kqueue that wakes on display events (`NOTE_RESET` and/or
+/// `NOTE_HOTPLUG`), never on vblanks. Borrows the display's fd.
+pub struct EventWatch { kq: RawFd, notes: u32 }
+
+impl EventWatch {
+    pub fn new(dpy: &Display, notes: u32) -> io::Result<Self> {
+        let kq = unsafe { libc::kqueue() };
+        if kq < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        let chg = libc::kevent {
+            ident: dpy.fd as libc::uintptr_t,
+            filter: libc::EVFILT_READ,
+            flags: libc::EV_ADD | libc::EV_CLEAR,
+            fflags: notes,
+            data: 0,
+            udata: std::ptr::null_mut(),
+            ext: [0; 4],
+        };
+        if unsafe { libc::kevent(kq, &chg, 1, std::ptr::null_mut(), 0, std::ptr::null()) } != 0 {
+            let e = io::Error::last_os_error();
+            unsafe { libc::close(kq) };
+            return Err(e);
+        }
+        Ok(Self { kq, notes })
+    }
+
+    /// Block until the next event (or `timeout`, then `None`).
+    pub fn wait(&self, timeout: Option<std::time::Duration>) -> io::Result<Option<DisplayEvents>> {
+        let ts = timeout.map(|t| libc::timespec {
+            tv_sec: t.as_secs() as libc::time_t,
+            tv_nsec: t.subsec_nanos() as libc::c_long,
+        });
+        let tsp = ts.as_ref().map_or(std::ptr::null(), |t| t as *const libc::timespec);
+        let mut ev: libc::kevent = unsafe { std::mem::zeroed() };
+        loop {
+            let r = unsafe { libc::kevent(self.kq, std::ptr::null(), 0, &mut ev, 1, tsp) };
+            if r < 0 {
+                let e = io::Error::last_os_error();
+                if e.kind() == io::ErrorKind::Interrupted { continue; }
+                return Err(e);
+            }
+            if r == 0 { return Ok(None); }
+            let f = ev.fflags & self.notes;
+            if f != 0 {
+                return Ok(Some(DisplayEvents {
+                    reset: f & NOTE_RESET != 0,
+                    hotplug: f & NOTE_HOTPLUG != 0,
+                    data: ev.data as u64,
+                }));
+            }
+        }
+    }
+}
+
+impl Drop for EventWatch { fn drop(&mut self) { unsafe { libc::close(self.kq) }; } }
 
 impl ResetWatch {
     pub fn new(dpy: &Display) -> io::Result<Self> {

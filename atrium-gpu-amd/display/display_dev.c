@@ -32,6 +32,29 @@
 #include <sys/sysctl.h>
 #include <sys/ucred.h>
 #include "energy_compat.h"	/* the display's energy-federation member */
+#include "display_hw.h"		/* atrium-display/: shared EDID + connector code */
+
+#include <sys/malloc.h>
+
+/*
+ * The display module's own connector state (display ABI 2.1), hung off the
+ * shared softc as sc->display_state. Guarded by sc->lock.
+ *   sink         the monitor as last probed (raw EDID and its modes)
+ *   sink_gen     sc->display_conn_gen when it was probed (0 = never)
+ *   timing       the timing of the lit mode, re-applied after a device reset
+ */
+struct atrium_amd_display_state {
+	struct atrium_display_sink	sink;
+	uint32_t			sink_gen;
+	struct atrium_display_timing	timing;
+	int				timing_valid;
+};
+
+static MALLOC_DEFINE(M_ATRIUM_DISPLAY, "atrium_display", "Atrium display state");
+
+/* KNOTE hints for events (any real vblank hint is a small count). */
+#define DISPLAY_HINT_RESET	LONG_MIN
+#define DISPLAY_HINT_HOTPLUG	(LONG_MIN + 1)
 
 /*
  * The display block hangs off the shared softc (the base module's). Reach it the
@@ -47,95 +70,208 @@ display_softc(struct cdev *cdev)
 /* --- register helpers (formerly display.c, now (base,size)-based) --------- */
 
 /*
- * ENUM: report HPD + §8 type and read the full EDID base block over the modeled
- * DDC (I2C) — write each byte offset, read its byte. A disconnected connector
- * floats the DDC high (0xff), so the EDID the caller parses then fails its
- * header/checksum (the realistic "unplugged" failure mode).
+ * --- the AMD (DCN 4) side of atrium_display_hw_ops ---------------------------
+ *
+ * Everything below the generic connector code (atrium-display/display_hw.h):
+ * how this hardware senses a monitor (HPD0), reads its EDID (DDC; the SIM
+ * byte port until D5 brings up the real I2C engine) and programs a timing
+ * (OTG0's timing registers, the pixel clock on a SIM register until DCCG is
+ * modelled).
+ */
+static int
+amd_disp_sense(void *hw)
+{
+	struct atrium_amd_softc *sc = hw;
+
+	return ((amd_mmio_read32(sc, regHPD0_DC_HPD_INT_STATUS) &
+	    DCN_HPD_SENSE) != 0);
+}
+
+static int
+amd_disp_read_edid_block(void *hw, uint32_t n, uint8_t *out)
+{
+	struct atrium_amd_softc *sc = hw;
+	uint32_t i;
+
+	for (i = 0; i < ATRIUM_EDID_BLOCK; i++) {
+		amd_mmio_write32(sc, regDISP_DDC_OFFSET, n * ATRIUM_EDID_BLOCK + i);
+		out[i] = (uint8_t)amd_mmio_read32(sc, regDISP_DDC_DATA);
+	}
+	return (0);
+}
+
+/*
+ * OTG timing, with the line starting at the leading edge of sync: TOTAL is
+ * total - 1, SYNC_A runs from 0 to the sync width, BLANK_END is the first
+ * active pixel (sync + back porch) and BLANK_START the first blank one.
+ */
+static void
+amd_disp_program_timing(void *hw, const struct atrium_display_timing *t)
+{
+	struct atrium_amd_softc *sc = hw;
+	uint32_t hb = t->hsync + t->hback, vb = t->vsync + t->vback;
+
+	amd_mmio_write32(sc, regOTG0_OTG_H_TOTAL,
+	    t->hactive + t->hfront + t->hsync + t->hback - 1);
+	amd_mmio_write32(sc, regOTG0_OTG_H_BLANK_START_END,
+	    (hb + t->hactive) | (hb << DCN_OTG_END_SHIFT));
+	amd_mmio_write32(sc, regOTG0_OTG_H_SYNC_A,
+	    t->hsync << DCN_OTG_END_SHIFT);
+	amd_mmio_write32(sc, regOTG0_OTG_V_TOTAL,
+	    t->vactive + t->vfront + t->vsync + t->vback - 1);
+	amd_mmio_write32(sc, regOTG0_OTG_V_BLANK_START_END,
+	    (vb + t->vactive) | (vb << DCN_OTG_END_SHIFT));
+	amd_mmio_write32(sc, regOTG0_OTG_V_SYNC_A,
+	    t->vsync << DCN_OTG_END_SHIFT);
+	amd_mmio_write32(sc, regDISP_PIXEL_CLOCK_KHZ, t->pixel_clock_khz);
+}
+
+/*
+ * HPD0 is a level interrupt that fires while SENSE equals POLARITY: wait for
+ * the opposite of what is there now (a disconnect while a monitor is
+ * present, a connect while none is), then acknowledge.
+ */
+static void
+amd_disp_hpd_rearm(void *hw)
+{
+	struct atrium_amd_softc *sc = hw;
+	int present;
+
+	amd_mmio_write32(sc, regHPD0_DC_HPD_CONTROL, DCN_HPD_EN);
+	present = amd_disp_sense(sc);
+	amd_mmio_write32(sc, regHPD0_DC_HPD_INT_CONTROL, DCN_HPD_INT_EN |
+	    (present ? 0 : DCN_HPD_INT_POLARITY) | DCN_HPD_INT_ACK);
+}
+
+static const struct atrium_display_hw_ops amd_display_hw_ops = {
+	.sense =		amd_disp_sense,
+	.read_edid_block =	amd_disp_read_edid_block,
+	.program_timing =	amd_disp_program_timing,
+	.hpd_rearm =		amd_disp_hpd_rearm,
+};
+
+/*
+ * The monitor as of the current hotplug generation, into `out`; returns that
+ * generation. Probing reads up to four EDID blocks, so it runs unlocked, and
+ * only when a hotplug has happened since the last probe.
+ */
+static uint32_t
+display_sink_get(struct atrium_amd_softc *sc, struct atrium_display_sink *out)
+{
+	struct atrium_amd_display_state *ds = sc->display_state;
+	uint32_t gen;
+
+	mtx_lock(&sc->lock);
+	gen = sc->display_conn_gen;
+	if (ds->sink_gen == gen) {
+		*out = ds->sink;
+		mtx_unlock(&sc->lock);
+		return (gen);
+	}
+	mtx_unlock(&sc->lock);
+	(void)atrium_display_probe_sink(&amd_display_hw_ops, sc, out);
+	mtx_lock(&sc->lock);
+	if (sc->display_conn_gen == gen) {
+		ds->sink = *out;
+		ds->sink_gen = gen;
+	}
+	mtx_unlock(&sc->lock);
+	return (gen);
+}
+
+/*
+ * Interim ENUM: HPD, the §8 type and the EDID base block. A disconnected
+ * connector reads all 0xff, so the caller's parse fails its header (the
+ * realistic "unplugged" failure mode).
  */
 static void
 display_enum(struct atrium_amd_softc *sc, struct atrium_display_connector *c)
 {
-	uint32_t i;
+	struct atrium_display_sink *sink;
 
-	c->connected = amd_mmio_read32(sc, regDISP_CONNECTOR_STATUS) & 1u;
+	sink = malloc(sizeof(*sink), M_ATRIUM_DISPLAY, M_WAITOK);
+	(void)display_sink_get(sc, sink);
+	c->connected = sink->connected;
 	c->connector_type = amd_mmio_read32(sc, regDISP_CONNECTOR_TYPE);
 	c->usbc_lanes = amd_mmio_read32(sc, regDISP_USBC_LANES);
-	for (i = 0; i < ATRIUM_DISPLAY_EDID_LEN; i++) {
-		amd_mmio_write32(sc, regDISP_DDC_OFFSET, i);
-		c->edid[i] = (uint8_t)amd_mmio_read32(sc, regDISP_DDC_DATA);
-	}
+	memset(c->edid, 0xff, sizeof(c->edid));
+	if (sink->edid_len >= ATRIUM_DISPLAY_EDID_LEN)
+		memcpy(c->edid, sink->edid, ATRIUM_DISPLAY_EDID_LEN);
 	c->edid_len = ATRIUM_DISPLAY_EDID_LEN;
+	free(sink, M_ATRIUM_DISPLAY);
 }
 
-/*
- * Decode one 18-byte EDID Detailed Timing Descriptor into a mode. Mirrors the
- * model's edid.rs decode_dtd: pixel clock at 10 kHz granularity (bytes 0-1),
- * active/blanking split high nibbles across bytes 4 and 7. A zero pixel clock is
- * a monitor descriptor (name/range), not a timing — returns 0. Refresh is
- * derived = pixclk / (htotal * vtotal), reported in milli-Hz.
- */
-static int
-display_decode_dtd(const uint8_t *d, struct atrium_display_mode *m)
+static void
+display_mode_v2(const struct atrium_display_timing *t,
+    struct atrium_display_mode_v2 *m)
 {
-	uint32_t pc10k, pixclk, hactive, hblank, vactive, vblank;
-	uint32_t htotal, vtotal;
-
-	pc10k = (uint32_t)d[0] | ((uint32_t)d[1] << 8);
-	if (pc10k == 0)
-		return (0);		/* not a timing descriptor */
-	pixclk = pc10k * 10000u;	/* Hz */
-
-	hactive = (uint32_t)d[2] | (((uint32_t)d[4] >> 4) << 8);
-	hblank = (uint32_t)d[3] | (((uint32_t)(d[4] & 0x0f)) << 8);
-	vactive = (uint32_t)d[5] | (((uint32_t)d[7] >> 4) << 8);
-	vblank = (uint32_t)d[6] | (((uint32_t)(d[7] & 0x0f)) << 8);
-	if (hactive == 0 || vactive == 0)
-		return (0);
-
-	htotal = hactive + hblank;
-	vtotal = vactive + vblank;
-	m->width = hactive;
-	m->height = vactive;
-	/* milli-Hz: pixclk * 1000 / (htotal*vtotal); 64-bit to avoid overflow. */
-	m->refresh_mhz = (uint32_t)(((uint64_t)pixclk * 1000u) /
-	    ((uint64_t)htotal * vtotal));
-	m->pad = 0;
-	return (1);
+	m->width = t->hactive;
+	m->height = t->vactive;
+	m->refresh_mhz = atrium_timing_refresh_mhz(t);
+	m->pixel_clock_khz = t->pixel_clock_khz;
+	m->flags = (t->flags & ATRIUM_TIMING_PREFERRED) ?
+	    ATRIUM_DISPLAY_MODE_PREFERRED : 0;
+	m->_pad = 0;
 }
 
-/*
- * MODES: read the EDID over DDC and decode its 4 Detailed Timing Descriptors
- * (at offsets 54/72/90/108) into mode entries — the preferred timing first,
- * matching EDID order. Skips non-timing descriptors. A disconnected connector's
- * EDID is all-0xff → no valid timings → count 0.
- */
+/* Interim MODES: the first ATRIUM_DISPLAY_MAX_MODES of the connector's. */
 static void
 display_modes(struct atrium_amd_softc *sc, struct atrium_display_modes *out)
 {
-	uint8_t edid[ATRIUM_DISPLAY_EDID_LEN];
-	struct atrium_display_mode m;
+	struct atrium_display_sink *sink;
+	struct atrium_display_mode_v2 m;
 	uint32_t i;
-	int off;
 
-	for (i = 0; i < ATRIUM_DISPLAY_EDID_LEN; i++) {
-		amd_mmio_write32(sc, regDISP_DDC_OFFSET, i);
-		edid[i] = (uint8_t)amd_mmio_read32(sc, regDISP_DDC_DATA);
-	}
-
-	out->count = 0;
+	sink = malloc(sizeof(*sink), M_ATRIUM_DISPLAY, M_WAITOK);
+	(void)display_sink_get(sc, sink);
+	out->count = sink->ntimings;
 	out->pad = 0;
-	/* No sink (DDC reads 0xff) or a bad header: no modes. Decoding 0xff
-	 * bytes as timings would invent a huge mode. */
-	if (edid[0] != 0x00 || edid[1] != 0xff || edid[6] != 0xff ||
-	    edid[7] != 0x00)
-		return;
-	for (off = 54; off + 18 <= ATRIUM_DISPLAY_EDID_LEN; off += 18) {
-		if (!display_decode_dtd(&edid[off], &m))
-			continue;
-		if (out->count < ATRIUM_DISPLAY_MAX_MODES)
-			out->modes[out->count] = m;
-		out->count++;
+	for (i = 0; i < sink->ntimings && i < ATRIUM_DISPLAY_MAX_MODES; i++) {
+		display_mode_v2(&sink->timings[i], &m);
+		out->modes[i].width = m.width;
+		out->modes[i].height = m.height;
+		out->modes[i].refresh_mhz = m.refresh_mhz;
+		out->modes[i].pad = 0;
 	}
+	free(sink, M_ATRIUM_DISPLAY);
+}
+
+/* CONNECTOR (2.1): the monitor, its raw EDID and every mode it offers. */
+static int
+display_connector(struct atrium_amd_softc *sc,
+    struct atrium_display_connector_v2 *c)
+{
+	struct atrium_amd_display_state *ds = sc->display_state;
+	struct atrium_display_sink *sink;
+	uint32_t i, n;
+
+	if (c->struct_size < sizeof(*c))
+		return (EINVAL);
+	sink = malloc(sizeof(*sink), M_ATRIUM_DISPLAY, M_WAITOK);
+	c->out_generation = display_sink_get(sc, sink);
+	c->out_flags = sink->connected ? ATRIUM_DISPLAY_CONNECTOR_CONNECTED : 0;
+	c->out_connector_type = amd_mmio_read32(sc, regDISP_CONNECTOR_TYPE);
+	n = sink->edid_len < ATRIUM_DISPLAY_EDID_MAX ? sink->edid_len :
+	    ATRIUM_DISPLAY_EDID_MAX;
+	memset(c->out_edid, 0, sizeof(c->out_edid));
+	memcpy(c->out_edid, sink->edid, n);
+	c->out_edid_len = n;
+	c->out_mode_count = 0;
+	c->out_current_mode = 0xffffffffu;
+	c->_pad = 0;
+	memset(c->out_modes, 0, sizeof(c->out_modes));
+	mtx_lock(&sc->lock);
+	for (i = 0; i < sink->ntimings && i < ATRIUM_DISPLAY_CONNECTOR_MODES;
+	    i++) {
+		display_mode_v2(&sink->timings[i], &c->out_modes[i]);
+		if (sc->display_mode_set && ds->timing_valid &&
+		    atrium_timing_equal(&ds->timing, &sink->timings[i]))
+			c->out_current_mode = i;
+		c->out_mode_count++;
+	}
+	mtx_unlock(&sc->lock);
+	free(sink, M_ATRIUM_DISPLAY);
+	return (0);
 }
 
 /* --- cdev ioctl dispatch -------------------------------------------------- */
@@ -459,16 +595,18 @@ display_commit(struct atrium_amd_softc *sc, struct atrium_display_commit *c,
 	struct atrium_amd_bo *bo;
 	struct atrium_amd_syncobj *in_so = NULL, *out_so = NULL;
 	struct file *bo_fp = NULL, *in_fp = NULL, *out_fp = NULL;
-	struct atrium_display_modes modes;
+	struct atrium_amd_display_state *ds = sc->display_state;
+	struct atrium_display_sink *sink = NULL;
+	struct atrium_display_timing tm = { 0 };
 	uint64_t off, size;
-	uint32_t fault;
-	int err;
+	uint32_t fault, gen;
+	int err, have_tm = 0;
 
 	c->out_fault = 0;
-	if (c->struct_size < sizeof(*c) || c->_pad != 0 ||
+	if (c->struct_size < sizeof(*c) ||
 	    (c->flags & ~(ATRIUM_DISPLAY_COMMIT_MODESET |
 	    ATRIUM_DISPLAY_COMMIT_ASYNC | ATRIUM_DISPLAY_COMMIT_TEST_ONLY)) != 0 ||
-	    c->mode_index != 0 || c->format != ATRIUM_DISPLAY_FORMAT_XRGB8888 ||
+	    c->format != ATRIUM_DISPLAY_FORMAT_XRGB8888 ||
 	    c->modifier != ATRIUM_DISPLAY_MODIFIER_LINEAR || c->bo_offset != 0 ||
 	    (c->pitch % 256) != 0)
 		return (EINVAL);
@@ -504,13 +642,29 @@ display_commit(struct atrium_amd_softc *sc, struct atrium_display_commit *c,
 	fb.pitch = c->pitch;
 	fb.format = c->format;
 	if (c->flags & ATRIUM_DISPLAY_COMMIT_MODESET) {
-		display_modes(sc, &modes);	/* reads the EDID; not under the lock */
-		/* The kernel checks the buffer covers the mode it will scan out;
-		 * gpusim's referee is the second line, not the first (review
-		 * §A2.5, isolation break 4). */
-		if (modes.count > 0 && !display_fb_fits(&fb,
-		    modes.modes[0].width, modes.modes[0].height)) {
-			err = EINVAL;
+		/* The mode comes from the connector's list (probed unlocked). */
+		sink = malloc(sizeof(*sink), M_ATRIUM_DISPLAY, M_WAITOK);
+		gen = display_sink_get(sc, sink);
+		if (c->mode_generation != 0 && c->mode_generation != gen) {
+			err = ESTALE;	/* the monitor changed since CONNECTOR */
+			goto out;
+		}
+		if (sink->ntimings > 0) {
+			if (c->mode_index >= sink->ntimings) {
+				err = EINVAL;
+				goto out;
+			}
+			tm = sink->timings[c->mode_index];
+			have_tm = 1;
+			/* The kernel checks the buffer covers the mode it will
+			 * scan out; gpusim's referee is the second line, not
+			 * the first (review §A2.5, isolation break 4). */
+			if (!display_fb_fits(&fb, tm.hactive, tm.vactive)) {
+				err = EINVAL;
+				goto out;
+			}
+		} else if (c->mode_index != 0) {
+			err = EINVAL;	/* no monitor: nothing to index */
 			goto out;
 		}
 	}
@@ -532,8 +686,10 @@ display_commit(struct atrium_amd_softc *sc, struct atrium_display_commit *c,
 			goto out;
 		}
 		sc->display_in_so = NULL;
-		if (modes.count > 0)
-			sc->display_width = modes.modes[0].width;
+		if (have_tm) {
+			sc->display_width = tm.hactive;
+			amd_display_hw_ops.program_timing(sc, &tm);
+		}
 		/* The surface goes up with the mode (the SIM mode set takes the
 		 * held surface); the unlock after it then has nothing to flip. */
 		display_program_surface(sc, &fb, 1);
@@ -554,12 +710,13 @@ display_commit(struct atrium_amd_softc *sc, struct atrium_display_commit *c,
 		display_irqs(sc, 1, 1);
 		sc->display_vblank_armed = 1;	/* remembered across a device reset */
 		sc->display_mode_set = 1;
-		sc->display_refresh_mhz = modes.count > 0 ?
-		    modes.modes[0].refresh_mhz : 0;
-		sc->display_mode_width = modes.count > 0 ?
-		    modes.modes[0].width : 0;
-		sc->display_mode_height = modes.count > 0 ?
-		    modes.modes[0].height : 0;
+		ds->timing_valid = have_tm;
+		if (have_tm)
+			ds->timing = tm;
+		sc->display_refresh_mhz = have_tm ?
+		    atrium_timing_refresh_mhz(&tm) : 0;
+		sc->display_mode_width = have_tm ? tm.hactive : 0;
+		sc->display_mode_height = have_tm ? tm.vactive : 0;
 		/* A modeset scans the new buffer out from its first frame. */
 		display_park(sc, sc->display_on_screen.bo_fp);
 		sc->display_on_screen = fb;
@@ -569,6 +726,7 @@ display_commit(struct atrium_amd_softc *sc, struct atrium_display_commit *c,
 		display_park(sc, in_fp);
 		mtx_unlock(&sc->lock);
 		display_drain(sc, td);
+		free(sink, M_ATRIUM_DISPLAY);
 		return (0);
 	}
 
@@ -628,6 +786,7 @@ out:
 	if (in_fp != NULL)
 		fdrop(in_fp, td);
 	fdrop(bo_fp, td);
+	free(sink, M_ATRIUM_DISPLAY);	/* free(NULL) is a no-op */
 	return (err);
 }
 
@@ -776,29 +935,36 @@ display_filt_detach(struct knote *kn)
 	mtx_unlock(&sc->lock);
 }
 
-/* KNOTE hint for a device reset (any real vblank hint is a small count). */
-#define DISPLAY_HINT_RESET	LONG_MIN
-
 static int
 display_filt_vblank(struct knote *kn, long hint)
 {
 	struct atrium_amd_softc *sc = kn->kn_hook;
-	int reset_only = (kn->kn_sfflags & ATRIUM_DISPLAY_NOTE_RESET) != 0;
+	uint32_t notes = kn->kn_sfflags &
+	    (ATRIUM_DISPLAY_NOTE_RESET | ATRIUM_DISPLAY_NOTE_HOTPLUG);
+	uint32_t bit;
 
 	/* Called under sc->lock (the knlist lock) by KNOTE_LOCKED / the kqueue
 	 * scan. hint = vblanks this interrupt drained (0 on a bare readiness
-	 * scan), or DISPLAY_HINT_RESET from the reset restore hook. EV_CLEAR
-	 * zeroes kn_data and kn_fflags after each delivery. */
-	if (hint == DISPLAY_HINT_RESET) {
-		kn->kn_fflags |= ATRIUM_DISPLAY_NOTE_RESET;
-		if (reset_only)
-			kn->kn_data = (int64_t)sc->reset_gen;
-		else
+	 * scan), DISPLAY_HINT_RESET from the reset restore hook or
+	 * DISPLAY_HINT_HOTPLUG from the HPD handler. A registration with notes
+	 * in its fflags hears only those, with data = that event's generation;
+	 * a plain vblank registration hears everything (data += 1 for an
+	 * event). EV_CLEAR zeroes kn_data and kn_fflags after each delivery. */
+	if (hint == DISPLAY_HINT_RESET || hint == DISPLAY_HINT_HOTPLUG) {
+		bit = hint == DISPLAY_HINT_RESET ? ATRIUM_DISPLAY_NOTE_RESET :
+		    ATRIUM_DISPLAY_NOTE_HOTPLUG;
+		if (notes == 0) {
+			kn->kn_fflags |= bit;
 			kn->kn_data += 1;
-	} else if (hint != 0 && !reset_only)
+		} else if (notes & bit) {
+			kn->kn_fflags |= bit;
+			kn->kn_data = hint == DISPLAY_HINT_RESET ?
+			    (int64_t)sc->reset_gen : (int64_t)sc->display_conn_gen;
+		}
+	} else if (hint != 0 && notes == 0)
 		kn->kn_data += hint;
-	if (reset_only)
-		return ((kn->kn_fflags & ATRIUM_DISPLAY_NOTE_RESET) != 0);
+	if (notes != 0)
+		return ((kn->kn_fflags & notes) != 0);
 	return (kn->kn_data != 0);
 }
 
@@ -819,6 +985,22 @@ amd_display_vblank_handler(struct atrium_amd_softc *sc, int count)
 	KNOTE_LOCKED(&sc->display_sel.si_note, count);
 	display_try_fence(sc);	/* a commit waiting on its render */
 	display_reap(sc);
+}
+
+/*
+ * The IH HPD cause handler (sc->lock held): a monitor came or went. Re-arm
+ * for the next change, start a new connector generation (the next CONNECTOR
+ * or MODESET re-reads the EDID) and wake NOTE_HOTPLUG listeners. The EDID is
+ * not read here: that is up to four 128-byte DDC reads, too slow for an
+ * interrupt.
+ */
+static void
+amd_display_hpd_handler(struct atrium_amd_softc *sc, int count __unused)
+{
+	amd_display_hw_ops.hpd_rearm(sc);
+	if (++sc->display_conn_gen == 0)
+		sc->display_conn_gen = 1;
+	KNOTE_LOCKED(&sc->display_sel.si_note, DISPLAY_HINT_HOTPLUG);
 }
 
 /* --- device-reset coordination: the display's prepare/restore hooks --------- */
@@ -859,7 +1041,11 @@ amd_display_reset_restore(struct atrium_amd_softc *sc)
 	 */
 	sc->display_content_lost = 1;
 	KNOTE_LOCKED(&sc->display_sel.si_note, DISPLAY_HINT_RESET);
+	amd_display_hw_ops.hpd_rearm(sc);
 	if (sc->display_mode_set && sc->display_on_screen.bo_fp != NULL) {
+		if (sc->display_state->timing_valid)
+			amd_display_hw_ops.program_timing(sc,
+			    &sc->display_state->timing);
 		display_program_surface(sc, &sc->display_on_screen, 1);
 		display_set_mode(sc);
 		display_unlock(sc, 1);
@@ -914,7 +1100,8 @@ display_kqfilter(struct cdev *cdev, struct knote *kn)
 	struct atrium_amd_softc *sc = display_softc(cdev);
 
 	if (kn->kn_filter != EVFILT_READ ||
-	    (kn->kn_sfflags & ~ATRIUM_DISPLAY_NOTE_RESET) != 0)
+	    (kn->kn_sfflags & ~(ATRIUM_DISPLAY_NOTE_RESET |
+	    ATRIUM_DISPLAY_NOTE_HOTPLUG)) != 0)
 		return (EINVAL);
 	kn->kn_fop = &display_vblank_filtops;
 	kn->kn_hook = sc;
@@ -947,6 +1134,10 @@ display_ioctl(struct cdev *cdev, u_long cmd, caddr_t data, int fflag,
 		display_modes(sc, m);
 		return (0);
 	}
+
+	case ATRIUM_DISPLAY_IOC_CONNECTOR:
+		return (display_connector(sc,
+		    (struct atrium_display_connector_v2 *)data));
 
 	case ATRIUM_DISPLAY_IOC_COMMIT:
 		return (display_commit(sc, (struct atrium_display_commit *)data,
@@ -993,7 +1184,10 @@ display_ioctl(struct cdev *cdev, u_long cmd, caddr_t data, int fflag,
 		    (struct atrium_display_config *)data;
 
 		amd_mmio_write32(sc, regDISP_CFG_CONNECTOR_TYPE, c->connector_type);
-		amd_mmio_write32(sc, regDISP_CFG_PLUG_MODE, c->plug_mode);
+		if (c->plug_mode == ATRIUM_DISPLAY_UNPLUG)
+			amd_mmio_write32(sc, regDISP_CFG_UNPLUG, 1);
+		else
+			amd_mmio_write32(sc, regDISP_CFG_PLUG_MODE, c->plug_mode);
 		return (0);
 	}
 
@@ -1083,6 +1277,9 @@ atrium_display_attach(device_t dev)
 		    device_get_unit(dev));
 		return (ENXIO);
 	}
+	sc->display_state = malloc(sizeof(*sc->display_state), M_ATRIUM_DISPLAY,
+	    M_WAITOK | M_ZERO);
+	sc->display_conn_gen = 1;
 	sc->display_cdev->si_drv1 = sc;
 	TASK_INIT(&sc->display_fence_task, 0, display_fence_task, sc);
 
@@ -1103,6 +1300,11 @@ atrium_display_attach(device_t dev)
 	    amd_display_vblank_handler);
 	amd_ih_set_handler(sc, ATRIUM_AMD_IH_CAUSE_FLIP,
 	    amd_display_flip_handler);
+	amd_ih_set_handler(sc, ATRIUM_AMD_IH_CAUSE_HPD,
+	    amd_display_hpd_handler);
+	mtx_lock(&sc->lock);
+	amd_display_hw_ops.hpd_rearm(sc);	/* hotplug interrupts from now on */
+	mtx_unlock(&sc->lock);
 
 	/*
 	 * Register the display's reset hooks so a coordinated device reset (a
@@ -1143,6 +1345,8 @@ atrium_display_detach(device_t dev)
 	sc->display_vblank_armed = 0;
 	amd_ih_set_handler(sc, ATRIUM_AMD_IH_CAUSE_VBLANK, NULL);
 	amd_ih_set_handler(sc, ATRIUM_AMD_IH_CAUSE_FLIP, NULL);
+	amd_mmio_write32(sc, regHPD0_DC_HPD_INT_CONTROL, DCN_HPD_INT_ACK);
+	amd_ih_set_handler(sc, ATRIUM_AMD_IH_CAUSE_HPD, NULL);
 	amd_reset_register(sc, ATRIUM_AMD_IP_DISPLAY, NULL, NULL);
 	if (sc->display_cdev != NULL) {
 		destroy_dev(sc->display_cdev);
@@ -1164,6 +1368,8 @@ atrium_display_detach(device_t dev)
 	mtx_unlock(&sc->lock);
 	taskqueue_drain(taskqueue_thread, &sc->display_fence_task);
 	display_drain(sc, curthread);
+	free(sc->display_state, M_ATRIUM_DISPLAY);
+	sc->display_state = NULL;
 	return (0);
 }
 

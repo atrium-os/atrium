@@ -22,7 +22,7 @@
 #include <sys/ioccom.h>
 #include <sys/types.h>
 
-#define ATRIUM_DISPLAY_EDID_LEN		128
+#define ATRIUM_DISPLAY_EDID_LEN		128	/* ENUM returns the base block only */
 
 /* §8 connector interface type codes (mirrors the model's connector type). */
 #define ATRIUM_DISPLAY_CONN_HDMI14	1
@@ -81,8 +81,11 @@ struct atrium_display_status {
  */
 struct atrium_display_config {
 	uint32_t connector_type; /* in: ATRIUM_DISPLAY_CONN_* */
-	uint32_t plug_mode;	/* in: re-plug advertising mode (0=VGA 1=1080p 2=4K) */
+	uint32_t plug_mode;	/* in: re-plug a monitor (0=VGA 1=1080p 2=4K, 3=the
+				 * multi-mode desktop monitor), or
+				 * ATRIUM_DISPLAY_UNPLUG to unplug it */
 };
+#define ATRIUM_DISPLAY_UNPLUG	0xffffffffu
 
 /*
  * USB-C DisplayPort Alt Mode (§8 cross-subsystem): the connector is virtual

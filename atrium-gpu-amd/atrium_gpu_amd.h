@@ -172,6 +172,9 @@
 #define regDISP_FLIP_DONE_COUNT	0x30090	/* r: flips that reached the screen */
 #define regDISP_SCANOUT_BASE_LO	0x30094	/* r: VRAM base of the FB on screen now (lo/hi) */
 #define regDISP_SCANOUT_BASE_HI	0x30098
+#define regDISP_CFG_UNPLUG	0x3009c	/* w1: unplug the simulated monitor (test) */
+#define regDISP_PIXEL_CLOCK_KHZ	0x300a0	/* w/r: pixel clock for the next mode set (DCCG not modelled) */
+#define regDISP_FRAME_PERIOD_NS	0x300a4	/* r: the lit mode's frame period, ns */
 
 /*
  * The real DCN 4 (DCN 4.0.1, RDNA4) display registers the scanout path uses,
@@ -194,7 +197,16 @@
 #define regHUBPREQ0_DCSURF_PRIMARY_SURFACE_ADDRESS_HIGH	regDCN2(0x060b)
 #define regHUBPREQ0_DCSURF_FLIP_CONTROL		regDCN2(0x0613)
 #define regHUBPREQ0_DCSURF_SURFACE_FLIP_INTERRUPT	regDCN2(0x0617)
+#define regOTG0_OTG_H_TOTAL			regDCN2(0x1b2a)
+#define regOTG0_OTG_H_BLANK_START_END		regDCN2(0x1b2b)
+#define regOTG0_OTG_H_SYNC_A			regDCN2(0x1b2c)
+#define regOTG0_OTG_V_TOTAL			regDCN2(0x1b2f)
+#define regOTG0_OTG_V_BLANK_START_END		regDCN2(0x1b38)
+#define regOTG0_OTG_V_SYNC_A			regDCN2(0x1b39)
 #define regOTG0_OTG_STATUS_FRAME_COUNT		regDCN2(0x1b4d)
+#define regHPD0_DC_HPD_INT_STATUS		regDCN2(0x175a)
+#define regHPD0_DC_HPD_INT_CONTROL		regDCN2(0x175b)
+#define regHPD0_DC_HPD_CONTROL			regDCN2(0x175c)
 #define regOTG0_OTG_VERTICAL_INTERRUPT0_POSITION	regDCN2(0x1b5f)
 #define regOTG0_OTG_VERTICAL_INTERRUPT0_CONTROL	regDCN2(0x1b60)
 
@@ -210,6 +222,12 @@
 #define DCN_OTG_FRAME_COUNT_MASK	0x00ffffffu
 #define DCN_VINT0_INT_ENABLE		(1u << 8)	/* VERTICAL_INTERRUPT0_CONTROL */
 #define DCN_VINT0_CLEAR			(1u << 20)
+#define DCN_OTG_END_SHIFT		16	/* *_START_END / *_SYNC_A: end in 30:16 */
+#define DCN_HPD_SENSE			(1u << 1)	/* DC_HPD_INT_STATUS */
+#define DCN_HPD_INT_ACK			(1u << 0)	/* DC_HPD_INT_CONTROL */
+#define DCN_HPD_INT_POLARITY		(1u << 8)
+#define DCN_HPD_INT_EN			(1u << 16)
+#define DCN_HPD_EN			(1u << 28)	/* DC_HPD_CONTROL */
 #define ATRIUM_AMD_EDID_LEN	128
 
 /*
@@ -557,7 +575,8 @@ struct atrium_amd_qpend {
 #define ATRIUM_AMD_IH_CAUSE_VBLANK 2	/* IH cookie cause: DCN vertical blank */
 #define ATRIUM_AMD_IH_CAUSE_FLIP 3	/* IH cookie cause: DCN flip landed on screen */
 #define ATRIUM_AMD_IH_CAUSE_VM_FAULT 4	/* GPUVM fault: queue, VMID, page (gpusim 013b62b) */
-#define ATRIUM_AMD_IH_NCAUSE	5	/* dispatch-table size (causes 0..N-1) */
+#define ATRIUM_AMD_IH_CAUSE_HPD 5	/* DCN hot plug detect (HPD0 level interrupt) */
+#define ATRIUM_AMD_IH_NCAUSE	6	/* dispatch-table size (causes 0..N-1) */
 
 /*
  * IH cause handler: the device-global interrupt ring is owned by the BASE
@@ -753,6 +772,13 @@ struct atrium_amd_softc {
 	uint32_t	 display_mode_width;	/* the mode in use, for the kernel's */
 	uint32_t	 display_mode_height;	/* own scanout bounds check */
 	uint32_t	 display_last_fault;	/* fault of the last deferred flip */
+	/*
+	 * Connector (display ABI 2.1): the hotplug generation (never 0; bumped by
+	 * every HPD interrupt) and the display module's own state: the monitor
+	 * as last probed and the timing in use (display_dev.c).
+	 */
+	uint32_t	 display_conn_gen;
+	struct atrium_amd_display_state *display_state;
 
 	/*
 	 * Device-global IH (interrupt-handler) ring + dispatch, owned by the BASE

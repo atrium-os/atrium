@@ -1,0 +1,118 @@
+/*
+ * Host-side tests for atrium-display's EDID parser and connector probe.
+ * Build and run: make -C atrium-display/tests
+ */
+#include <assert.h>
+#include <stdio.h>
+#include <string.h>
+
+#include "../display_hw.h"
+#include "desktop_monitor_edid.h"
+
+static void
+expect(const struct atrium_display_timing *t, uint32_t w, uint32_t h,
+    uint32_t mhz)
+{
+	if (t->hactive != w || t->vactive != h ||
+	    atrium_timing_refresh_mhz(t) != mhz) {
+		fprintf(stderr, "got %ux%u @ %u mHz, want %ux%u @ %u\n",
+		    t->hactive, t->vactive, atrium_timing_refresh_mhz(t), w, h,
+		    mhz);
+		assert(0);
+	}
+}
+
+/* A fake driver whose monitor is `edid`. */
+struct fake {
+	const uint8_t *edid;
+	uint32_t len;
+	int present;
+	int reads;
+};
+
+static int
+fake_sense(void *hw)
+{
+	return (((struct fake *)hw)->present);
+}
+
+static int
+fake_read(void *hw, uint32_t n, uint8_t *out)
+{
+	struct fake *f = hw;
+	uint32_t i;
+
+	f->reads++;
+	for (i = 0; i < ATRIUM_EDID_BLOCK; i++) {
+		uint32_t o = n * ATRIUM_EDID_BLOCK + i;
+		out[i] = o < f->len ? f->edid[o] : 0xff;
+	}
+	return (0);
+}
+
+static const struct atrium_display_hw_ops fake_ops = {
+	.sense = fake_sense,
+	.read_edid_block = fake_read,
+};
+
+int
+main(void)
+{
+	struct atrium_display_timing t[16];
+	struct atrium_display_sink s;
+	struct fake f = { desktop_monitor_edid, 256, 1, 0 };
+	uint8_t bad[256];
+	uint32_t n;
+
+	/* Every mode, preferred first and flagged; VICs then the CTA DTD. */
+	n = atrium_edid_parse(desktop_monitor_edid, 256, t, 16);
+	assert(n == 5);
+	expect(&t[0], 1920, 1080, 60000);
+	assert(t[0].flags & ATRIUM_TIMING_PREFERRED);
+	expect(&t[1], 1920, 1080, 120000);
+	expect(&t[2], 1280, 720, 60000);
+	expect(&t[3], 640, 480, 59940);
+	expect(&t[4], 2560, 1440, 59950);
+	assert(!(t[1].flags & ATRIUM_TIMING_PREFERRED));
+	assert(t[1].pixel_clock_khz == 297000 && t[4].pixel_clock_khz == 241500);
+	assert(t[0].hfront == 88 && t[0].hsync == 44 && t[0].hback == 148);
+	assert(t[0].vfront == 4 && t[0].vsync == 5 && t[0].vback == 36);
+
+	/* A short output array is filled, not overrun. */
+	assert(atrium_edid_parse(desktop_monitor_edid, 256, t, 2) == 2);
+
+	/* A corrupt extension is skipped; a missing one too. */
+	memcpy(bad, desktop_monitor_edid, 256);
+	bad[200] ^= 0x55;
+	assert(atrium_edid_parse(bad, 256, t, 16) == 1);
+	assert(atrium_edid_parse(desktop_monitor_edid, 128, t, 16) == 1);
+	/* A corrupt base block yields nothing. */
+	bad[0] = 0x55;
+	assert(atrium_edid_parse(bad, 256, t, 16) == 0);
+
+	/* The probe reads exactly the blocks the base block announces. */
+	assert(atrium_display_probe_sink(&fake_ops, &f, &s) == 0);
+	assert(s.connected && s.edid_len == 256 && s.ntimings == 5);
+	assert(f.reads == 2);
+	assert(memcmp(s.edid, desktop_monitor_edid, 256) == 0);
+
+	/* No monitor: nothing read. */
+	f.present = 0;
+	f.reads = 0;
+	assert(atrium_display_probe_sink(&fake_ops, &f, &s) == 0);
+	assert(!s.connected && s.ntimings == 0 && f.reads == 0);
+
+	/* A floating bus (all 0xff): connected, no modes. */
+	f.present = 1;
+	f.len = 0;
+	assert(atrium_display_probe_sink(&fake_ops, &f, &s) == 0);
+	assert(s.connected && s.ntimings == 0 && s.edid_len == 128);
+
+	/* Known VICs decode; unknown ones don't. */
+	assert(atrium_cta_vic_timing(97, &t[0]));
+	expect(&t[0], 3840, 2160, 60000);
+	assert(!atrium_cta_vic_timing(5, &t[0]));	/* 1080i: interlaced */
+
+	printf("test_edid: all passed\n");
+	return (0);
+}

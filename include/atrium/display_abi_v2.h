@@ -1,5 +1,5 @@
 /*
- * Atrium display ABI v2.0 — /dev/atrium-display<N>. Normative header.
+ * Atrium display ABI v2.1 — /dev/atrium-display<N>. Normative header.
  *
  * Spec: docs/spec/atrium-display-architecture.md §7 and §7.1, and
  * docs/spec/atrium-gpu-abi-v2.md §7. This header follows the GPU header's
@@ -20,9 +20,12 @@
  * (EV_CLEAR is forced, so a kevent() returns the vblanks since the last one).
  * Flip completion is the commit's out-fence: a syncobj, itself kqueue-able.
  *
- * Connector and mode discovery (ATRIUM_DISPLAY_IOC_ENUM / _MODES) and the
- * simulated-monitor test knobs are still the interim ones in
- * atrium-gpu-amd/atrium_display_abi.h; they carry no fds or addresses. The
+ * Connector and mode discovery is CONNECTOR (2.1): the monitor's raw EDID
+ * and every mode it offers. The same for every GPU: the driver reads the
+ * EDID over its own hardware (DDC, DP AUX) and the shared parser in
+ * atrium-display/ builds the list. The interim ENUM / MODES ioctls and the
+ * simulated-monitor test knobs in atrium-gpu-amd/atrium_display_abi.h remain
+ * for the tests. The
  * interim SET_MODE / PAGE_FLIP ioctls, which took a raw VRAM offset, are
  * retired. v2 ioctls are numbered from 64 so the two headers can coexist.
  *
@@ -43,7 +46,7 @@
 #endif
 
 #define ATRIUM_DISPLAY_ABI_MAJOR	2
-#define ATRIUM_DISPLAY_ABI_MINOR	0
+#define ATRIUM_DISPLAY_ABI_MINOR	1
 
 /* Pixel formats a plane can scan out. */
 #define ATRIUM_DISPLAY_FORMAT_XRGB8888	0  /* 32 bpp, B,G,R,X in memory (Vulkan B8G8R8A8) */
@@ -60,6 +63,8 @@
 #define ATRIUM_DISPLAY_FAULT_EXCEEDS_LINK	5  /* mode needs more than the link carries */
 #define ATRIUM_DISPLAY_FAULT_BAD_PITCH		6  /* pitch < a line, or not 256-byte aligned */
 #define ATRIUM_DISPLAY_FAULT_BAD_FORMAT		7  /* format the plane can't scan out */
+#define ATRIUM_DISPLAY_FAULT_MODE_UNSUPPORTED	8  /* (2.1) the monitor doesn't offer the
+						    * timing that was programmed */
 
 /* Commit flags. */
 #define ATRIUM_DISPLAY_COMMIT_MODESET	0x1u  /* (re)program the CRTC at mode_index; the
@@ -97,7 +102,13 @@
  * The kernel copies an ioctl's struct back only when it returns 0, so a fault
  * reported alongside an errno would never reach the caller.
  *
+ * MODESET programs the timing of CONNECTOR's out_modes[mode_index]: any mode
+ * the monitor offers, at any refresh rate it offers. The buffer must cover
+ * that mode (EINVAL otherwise). Send the out_generation the index came from
+ * in mode_generation so a monitor swapped in between is caught (ESTALE).
+ *
  * Errors: EINVAL for a bad struct, flag, format, modifier, pitch alignment,
+ * mode_index,
  * bo_offset or fd type; EBADF for a closed fd; EBUSY as above; EAGAIN for a
  * MODESET whose in-fence isn't signalled (its error if the in-fence failed);
  * ENXIO if the GPU module isn't
@@ -106,7 +117,7 @@
 struct atrium_display_commit {
 	uint32_t struct_size;
 	uint32_t flags;			/* ATRIUM_DISPLAY_COMMIT_* */
-	uint32_t mode_index;		/* MODESET: index into MODES; must be 0 in 2.0 */
+	uint32_t mode_index;		/* MODESET: index into CONNECTOR's out_modes */
 	uint32_t format;		/* ATRIUM_DISPLAY_FORMAT_* */
 	int32_t  bo_fd;			/* VRAM BO to scan out */
 	uint32_t pitch;			/* bytes per line; 0 = packed (width * 4) */
@@ -117,7 +128,10 @@ struct atrium_display_commit {
 	uint64_t in_fence_value;
 	uint64_t out_fence_value;
 	uint32_t out_fault;		/* ATRIUM_DISPLAY_FAULT_* */
-	uint32_t _pad;
+	uint32_t mode_generation;	/* (2.1) MODESET: CONNECTOR's out_generation the
+					 * mode_index was read from; ESTALE if a
+					 * hotplug has changed it since. 0 = don't
+					 * check (2.0 callers send 0 here) */
 };
 
 /* STATUS flags. */
@@ -139,6 +153,19 @@ struct atrium_display_commit {
  */
 #define ATRIUM_DISPLAY_NOTE_RESET		0x1u
 
+/*
+ * (2.1) Hotplug: a monitor was connected, disconnected or swapped. Register
+ * with fflags = ATRIUM_DISPLAY_NOTE_HOTPLUG for a hotplug-only event with
+ * data = the connector generation (CONNECTOR's out_generation); a vblank
+ * registration also sees it in the returned fflags. NOTE_RESET and
+ * NOTE_HOTPLUG may be registered together; data is then the generation of
+ * whichever fired last, and fflags says which. On hotplug the holder reads
+ * CONNECTOR again and, if the monitor is there, commits a MODESET at one of
+ * its modes. What was on screen stays programmed while no monitor is
+ * attached.
+ */
+#define ATRIUM_DISPLAY_NOTE_HOTPLUG		0x2u
+
 /* STATUS: refresh and flip telemetry for frame pacing and tests. */
 struct atrium_display_status_v2 {
 	uint32_t struct_size;
@@ -153,7 +180,45 @@ struct atrium_display_status_v2 {
 					 * commit returned (ATRIUM_DISPLAY_FAULT_*) */
 };
 
+/* (2.1) CONNECTOR flags and per-mode flags. */
+#define ATRIUM_DISPLAY_CONNECTOR_CONNECTED	0x1u
+#define ATRIUM_DISPLAY_MODE_PREFERRED		0x1u  /* the monitor's native mode */
+
+#define ATRIUM_DISPLAY_EDID_MAX		512	/* base block + 3 extensions */
+#define ATRIUM_DISPLAY_CONNECTOR_MODES	16
+
+struct atrium_display_mode_v2 {
+	uint32_t width;			/* active pixels per line */
+	uint32_t height;		/* active lines */
+	uint32_t refresh_mhz;		/* vertical refresh, milli-Hz (59940 = 59.94 Hz) */
+	uint32_t pixel_clock_khz;
+	uint32_t flags;			/* ATRIUM_DISPLAY_MODE_* */
+	uint32_t _pad;
+};
+
+/*
+ * CONNECTOR (2.1): the monitor and its modes. out_modes lists every mode the
+ * EDID offers that the parser knows, preferred first (flagged), then in EDID
+ * order without duplicates; at most ATRIUM_DISPLAY_CONNECTOR_MODES.
+ * out_generation changes on every hotplug; COMMIT's mode_generation checks
+ * it. Without a monitor, out_flags lacks CONNECTED and there are no modes.
+ */
+struct atrium_display_connector_v2 {
+	uint32_t struct_size;
+	uint32_t out_flags;		/* ATRIUM_DISPLAY_CONNECTOR_* */
+	uint32_t out_connector_type;	/* ATRIUM_DISPLAY_CONN_* (interim header) */
+	uint32_t out_generation;	/* hotplug generation, never 0 */
+	uint32_t out_edid_len;		/* bytes of out_edid filled */
+	uint32_t out_mode_count;
+	uint32_t out_current_mode;	/* index of the lit mode, 0xffffffff = none
+					 * or not in this list */
+	uint32_t _pad;
+	uint8_t  out_edid[ATRIUM_DISPLAY_EDID_MAX];
+	struct atrium_display_mode_v2 out_modes[ATRIUM_DISPLAY_CONNECTOR_MODES];
+};
+
 #define ATRIUM_DISPLAY_IOC_COMMIT	_IOWR('D', 64, struct atrium_display_commit)
 #define ATRIUM_DISPLAY_IOC_STATUS_V2	_IOWR('D', 65, struct atrium_display_status_v2)
+#define ATRIUM_DISPLAY_IOC_CONNECTOR	_IOWR('D', 66, struct atrium_display_connector_v2)
 
 #endif /* _ATRIUM_DISPLAY_ABI_V2_H_ */
