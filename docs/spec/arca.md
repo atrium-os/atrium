@@ -1,6 +1,6 @@
 # Arca — the system secret store
 
-*Proposed 2026-11-05 at the user's request: "it should be in some core area which apps like
+*Proposed 2026-11-05 at the user's request; §12's recommendations accepted the same day: "it should be in some core area which apps like
 navigator can access... keeping it safe and secure and when sharing ensuring it goes only to
 the intended recipient, while avoiding common malicious attacks." Nothing here is built. The
 name is a proposal (Latin* arca*: strongbox).*
@@ -403,7 +403,9 @@ each step.
 | **A5** | slot templates for app APIs and the Navigator's bindings; SSH agent; client certificates | native apps and SPAs with tokens |
 | **A6** | sync and backup through Vestibulum; FedCM and `form_post` continuation | multi-device |
 
-## 12. Decisions for the user, with recommendations
+## 12. Decisions, with recommendations
+
+**Accepted by the user, 2026-11-05: all seven recommendations below.**
 
 1. **Arca is its own daemon, and Vestibulum keeps login and the root key.** *Recommend
    yes.* `vestibulumd` draws the login screen and takes input, so it parses events and
