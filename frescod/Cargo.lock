@@ -124,6 +124,7 @@ dependencies = [
  "env_logger",
  "libc",
  "log",
+ "portcullis-ipc",
  "postcard",
  "rayon",
  "serde",
