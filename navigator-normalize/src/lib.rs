@@ -2425,7 +2425,12 @@ fn alignment_pass(resolved: &mut Slots, dom: &Dom, els: &[Handle], rtl: &BTreeMa
                 }
             }
             // A state slot that says `normal` itself.
-            let states: Vec<(Handle, String, String)> = resolved.keys().filter(|k| k.0 == h && !k.1.is_empty()).cloned().collect();
+            // ★ A RANGE, not a scan: the slots are ordered by handle first, so
+            // `h`'s are contiguous. Filtering every key for every element was
+            // quadratic — 27 s of a 2.1 MB manual's 27 s normalize, 48,322
+            // elements (legacy-web §5.4.5.7). Same keys, same order.
+            let states: Vec<(Handle, String, String)> = resolved.range((h, String::new(), String::new())..)
+                .map(|(k, _)| k).take_while(|k| k.0 == h).filter(|k| !k.1.is_empty()).cloned().collect();
             for k in states {
                 if resolved.get(&k).and_then(|x| x.get(own_p)).is_some_and(|(_, v)| v == "normal") {
                     let v = decide(resolved, &k.2, &Some("normal".into())).unwrap_or("stretch");
