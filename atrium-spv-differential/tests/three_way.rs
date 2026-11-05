@@ -1187,7 +1187,9 @@ fn runners() -> Vec<Box<dyn ShaderRunner>> {
         Box::new(InterpreterRunner::default()),
         Box::new(CraneliftRunner::default()),
     ];
-    if atrium_spv_differential::HOST_HAS_BESPOKE {
+    if atrium_spv_differential::HOST_HAS_BESPOKE
+        || atrium_spv_differential::HOST_HAS_BESPOKE_X86
+    {
         rs.push(Box::new(BespokeRunner::default()));
     }
     rs
@@ -1558,7 +1560,8 @@ fn bespoke_x86_coverage() {
     ];
     const MUST_COMPILE: &[&str] = &[
         "constant_color", "fp_arith", "vec_arith", "swizzle_bgra",
-        "swizzle_cross", "composite_extract", "dot_vts",
+        "swizzle_cross", "composite_extract", "dot_vts", "heavy", "heavy4",
+        "heavyvec", "int_arith", "select", "loop_sum",
     ];
     let x86 = BespokeX86Runner;
     let interp = InterpreterRunner::default();

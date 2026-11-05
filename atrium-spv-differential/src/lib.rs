@@ -129,6 +129,11 @@ pub fn native_runner() -> Box<dyn ShaderRunner> {
 /// Cranelift ↔ bespoke comparison is meaningful.
 pub const HOST_HAS_BESPOKE: bool = cfg!(target_arch = "aarch64");
 
+/// True on x86_64 hosts, where `BespokeRunner` runs the x86 bespoke
+/// backend. It covers a growing subset (docs/spec/tier2-bespoke-x86.md),
+/// so tests opt in per shader rather than through `HOST_HAS_BESPOKE`.
+pub const HOST_HAS_BESPOKE_X86: bool = cfg!(target_arch = "x86_64");
+
 /// Heuristic frontend-error mapping: any `Unsupported(_)`
 /// in the error string downgrades to harness-Unsupported
 /// (skip); anything else is a CompileFailed (hard error).
