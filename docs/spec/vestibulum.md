@@ -157,6 +157,11 @@ switching) is a v2 concern.
 
 ## 3. The keychain
 
+> **Proposed 2026-11-05: the keychain moves to [Arca](arca.md),** a system secret store
+> that every app uses. Vestibulum keeps login, lock, user verification and the user root
+> key, and it unlocks Arca. The item types below become Arca key items; §7.2's API becomes
+> Arca's (Arca §9).
+
 ### 3.1 Structure
 
 ```

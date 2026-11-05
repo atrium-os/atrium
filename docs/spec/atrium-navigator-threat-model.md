@@ -1124,6 +1124,12 @@ one element that needs it.
 
 ## 6. Credentials: cookies, sessions, tokens, SSO
 
+> **Superseded in part, 2026-11-05.** The user asked for secrets to live in a core system
+> service that every app can use, not inside the Navigator. That service is
+> [Arca](arca.md). The vault below is Arca, the per-origin fetcher is Arca's courier (Arca §5),
+> and §6.2–§6.7 are restated as Arca's web profile (Arca §8). §6.8's C0–C3 are replaced by
+> Arca's build plan (Arca §11): phase A2 is now the gate for any login.
+
 *Proposed 2026-11-04 at the user's request ("these are the ones we need to pay particular
 attention to"). None of it is built: the Navigator has no login support today.*
 

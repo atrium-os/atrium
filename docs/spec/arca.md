@@ -1,0 +1,401 @@
+# Arca — the system secret store
+
+*Proposed 2026-11-05 at the user's request: "it should be in some core area which apps like
+navigator can access... keeping it safe and secure and when sharing ensuring it goes only to
+the intended recipient, while avoiding common malicious attacks." Nothing here is built. The
+name is a proposal (Latin* arca*: strongbox).*
+
+**Arca** is one system service that holds every secret a user has: keys, passwords, tokens,
+cookies and API keys. Every app reaches it through the same API, and the Navigator is one
+client among many. It replaces two things that were heading towards separate designs:
+
+- **The keychain inside `vestibulumd`** ([vestibulum.md](vestibulum.md) §3, §5, §7.2).
+  Vestibulum keeps login, lock, user verification and the root key. The items move to Arca.
+- **The Navigator's "credential vault"** ([threat model](atrium-navigator-threat-model.md)
+  §6). Its rules become Arca's web profile (§8 here), and its "per-origin fetcher" becomes
+  Arca's courier (§5).
+
+[Loculus](loculus.md) stays separate. It holds data the user *shares with* an app (addresses,
+profiles). Arca holds data that is *kept from* the app. Loculus's master key is an Arca item.
+
+## 1. The three promises
+
+1. **Use without read.** Wherever the protocol allows, a secret is *used* for the app
+   (sign, decrypt, attach) and never *given* to it. A fully compromised app gets the
+   effect of the secret while it runs, and never the secret itself.
+2. **Only the intended recipient.** Every secret is bound, when it is created, to the one
+   party that may receive it: a network endpoint, an app or the user's own eyes. Arca
+   releases it only to that party, **as the system verified it**, never as the request
+   claims it.
+3. **Useless at rest.** On disk, a secret can be read only after the user unlocks, and
+   only on this machine where hardware allows.
+
+Everything below is how those three hold up against real attacks.
+
+## 2. What Arca holds
+
+Secrets come in two shapes, and the shape decides how they can be handed over.
+
+| shape | examples | how it is used | can the holder be kept from reading it? |
+|---|---|---|---|
+| **key** | passkeys, per-service keypairs ([insula.md](insula.md) §13.3), SSH keys, signing keys, TLS client-certificate keys, device-bound session (DBSC) keys, push keys, the Loculus master key | Arca signs, decrypts or derives on request | **yes, always.** The private half never leaves Arca, or the TPM where one exists |
+| **bearer** | passwords, cookies, OAuth access and refresh tokens, API keys, HTTP auth | whoever presents it is believed | **only if Arca does the presenting.** That is the courier (§5) |
+
+Bearer secrets are the hard case. Whoever holds one *is* the user to the service that
+accepts it. So the design goal for bearer secrets is that they travel only on a connection
+Arca controls, and reach no app's memory unless the user agrees to that weaker class (§4.3).
+
+Each item records:
+
+| field | meaning |
+|---|---|
+| owner | the user and persona ([insula.md](insula.md) §13.6). Personas never share items |
+| shape and kind | key or bearer; password, cookie, passkey and so on |
+| **recipient** | who may receive it or its effect (§3). Set at creation, never widened silently |
+| class | when it is usable: after first unlock, while unlocked, or with user verification (§6.2) |
+| scope | optional narrowing: methods, paths, header name, expiry |
+| provenance | who created it: the user typed it, a server set it, an app minted it |
+| audit | last used, by which client, for which recipient |
+
+## 3. Recipients: "only the intended recipient", made precise
+
+A recipient is something the **system** can verify, never a string an app supplies.
+
+| recipient | verified by | example |
+|---|---|---|
+| **network endpoint**: scheme, host, port, and for web items the partition (§8.2) | the courier's own TLS handshake: WebPKI name check, plus an optional pinned key | the cookie for `https://mail.example`; an API token for `https://api.github.com` |
+| **app**: publisher key plus app id | the signed manifest jaild verified at launch ([jaild-policy.md](jaild-policy.md)); Arca gets the label with the channel (§4.1), not from a message | a database password that a native client must hold itself |
+| **the user** | a Vestibulum-verified presence check, then the trusted UI | "show password", copy to clipboard |
+| **a key operation** | not released at all: Arca does the operation | WebAuthn assertion for RP ID `example.com` |
+
+**The binding rule.** An item is released only to its recipient. A request names a
+recipient, but the release happens only after the system has checked that recipient:
+
+- the courier has completed TLS to the bound endpoint, or
+- the channel belongs to the bound app's jail, or
+- the user has passed Vestibulum's check.
+
+Matching is exact:
+
+- **Endpoint matching is by origin.** Registrable-domain matching is never enough.
+  `https://login.example.com` and `https://example.com` are different recipients unless
+  the item says otherwise, and the trusted UI shows that to the user.
+- **App matching is by publisher key and app id.** A process name, path or claimed bundle
+  id never matches.
+
+A changed recipient is a new item. A server can't move its cookie to another host; an app
+update keeps its items only if the publisher key is unchanged. Moving an item to a new
+recipient is a user action in the trusted UI, never an API call.
+
+## 4. Who talks to Arca, and how Arca knows who they are
+
+### 4.1 Identity is the channel, not the message
+
+Arca never reads "I am app X" from a request. Each client gets its channel at spawn:
+
+1. portcullisd asks jaild to start a jail for a client, labelled with its verified identity
+   (app: publisher key and app id; courier: user, persona, recipient endpoint).
+2. portcullisd asks Arca for a channel for that label. Arca creates a socketpair, keeps one
+   end tagged with the label, and hands the other back.
+3. portcullisd installs that end in the new jail as an inherited descriptor.
+
+So the label is fixed by jaild, portcullisd and Arca together. A compromised app can
+send any bytes it likes on its channel, but the channel's identity is not among them. No
+path, socket name or pid is ever trusted.
+
+### 4.2 The clients
+
+| client | gets | never gets |
+|---|---|---|
+| **an app** (native, ported or the Navigator's parts) | key operations on its own items; courier sends for its items; bearer values only for items of class *app-held* (§4.3) | any other app's items; any bearer item it does not hold itself |
+| **a courier** (§5) | for one connection: the bearer items bound to its endpoint, inserted into that connection | items for any other endpoint |
+| **Vestibulum** | unlocks Arca's root at login and locks it on sign-out and lock (§6); renders the user-verification prompt | item values |
+| **the trusted UI** (part of Arca, drawn as a Pergola surface owned by Arca) | lists, edits, reveals with user verification | n/a, it is Arca |
+
+The Navigator's broker, converter, document worker and island engines are ordinary clients.
+They hold no item values at all. Their requests go through couriers (§8).
+
+### 4.3 Three handover classes for bearer secrets, strongest first
+
+1. **courier-attached** (default). The secret goes only into a connection the courier
+   makes to the bound endpoint. The app sees the response and never the secret.
+2. **slot-filled.** The app builds a request template with a slot, for example
+   `Authorization: Bearer {arca:item/7f3a}`, and the courier fills it. It's the same
+   guarantee as class 1, and it serves apps that build their own requests.
+3. **app-held.** The value goes to the app's own memory. This is for protocols the courier
+   doesn't speak yet: IMAP, a database wire protocol, a legacy app under Insula. It
+   requires a one-time user grant naming the app and the item. It is logged, and it is
+   shown in the trusted UI as weaker. Release is still bound to the app's verified
+   identity (§3).
+
+## 5. The courier: how a bearer secret reaches a server
+
+A courier is a short-lived jail that makes **one connection to one endpoint** on behalf of
+one user and persona. It is the only process that ever holds a bearer secret outside Arca.
+
+**What it does, per request:**
+
+1. It receives a request from its client in a **fixed, length-prefixed schema**: method,
+   path, query, an allowlist of headers, body bytes and slots. There is no free-form
+   header text and no URL parsing beyond the path.
+2. It resolves and connects through the existing fetch rules: the private-address filter
+   and the address pin of threat model §2.1. It completes TLS and checks the name against
+   its bound host.
+3. **Only now** does it ask Arca for the items bound to this endpoint that match the
+   request (§8.1 for cookies). Arca checks the courier's label against each item's
+   recipient.
+4. It attaches the items and sends the request.
+5. It parses the response headers. It sends `Set-Cookie` and any declared token fields to
+   Arca as structured records, removes them, and passes the rest to the client.
+6. It wipes the items from memory. Then it exits, or stays for that endpoint only (§5.2).
+
+**Redirects.** The courier never follows a redirect to another endpoint. It returns the
+redirect to its client, which must start a new courier for the new endpoint. So an open
+redirect on `example.com` can't carry `example.com`'s token to `evil.example`. That's a
+common token-leak route on today's web, and here it is closed by construction.
+
+### 5.1 Why a courier compromise is bounded
+
+The courier parses two hostile inputs, so each one has to be weighed.
+
+- **Response bytes from the server.** TLS ensures only the bound server can send them. If
+  that server exploits its courier, it learns the items bound to *itself*: secrets it
+  issued, or the user's password for it. That is nothing it couldn't get from an honest
+  login.
+- **Request bytes from its client.** This is the real risk. A compromised client could
+  attack its courier to read the secret. That's why the request side is a fixed binary
+  schema, fuzzed and allocation-bounded, with no text grammar. The Navigator's case is
+  sharpest: a mail page's converter parses attacker-written email, then asks the mail
+  origin's courier for requests.
+- **Defence in depth.** The courier receives an item only *after* TLS is up, holds it for
+  one request, and never holds an item for another endpoint. The worst case is one
+  endpoint's items for one user and persona. A browser renderer exploit commonly reaches
+  every site's cookie store.
+
+### 5.2 Cost
+
+One jail per request would add about 47 ms where the jail needs its own vnet
+([network.md](network.md) §0). So couriers are **per endpoint and reused**: kept warm while
+that endpoint has an open view, then recycled after a bounded number of requests or minutes.
+Reuse doesn't widen what a courier holds, because each request still fetches its items fresh
+and wipes them afterwards.
+
+## 6. At rest and in memory
+
+### 6.1 The key hierarchy
+
+```
+user credential (passcode, biometric, recovery key)        — Vestibulum
+   └─ user root key  (Argon2id from the passcode; sealed to the TPM when present)
+        └─ Arca master key            (unwrapped into Arca at unlock, never written in clear)
+             ├─ class key: after-first-unlock
+             ├─ class key: while-unlocked          (evicted at lock)
+             └─ class key: verify-each-use         (unwrapped per use after a Vestibulum check)
+                  └─ per-recipient data key (random; wrapped by its class key)
+                       └─ items  (XChaCha20-Poly1305; AAD = user, persona, class, recipient, item id, version)
+```
+
+- **The AAD binds each record to its recipient.** Copying an encrypted record from one
+  recipient's file to another's makes it fail to decrypt. Recipient binding then holds even
+  against someone who can edit the store.
+- **A per-recipient data key makes clearing real.** "Forget this site" destroys one wrapped
+  key, and every record under it is unreadable. No search through the store is needed.
+- **Hardware.**
+  - *TPM 2.0* (present on most x86_64 machines, including the R9700 box's class): the user
+    root key is sealed to it, and keys of class *device-bound* (DBSC, optionally passkeys)
+    are generated in it and never leave it. The TPM's dictionary-attack lockout limits
+    passcode guessing on a stolen disk.
+  - *No TPM:* the root key comes from the passcode through Argon2id alone. That's weaker
+    against a stolen disk, and the UI says so.
+  - *macOS host adapter:* the Secure Enclave and the Keychain, through vestibulum-macos.
+    Its keystore today keeps `master.key` in clear at mode 0600 (`keystore.rs` header). That
+    is a known gap, and Arca's Phase A closes it.
+- **Rollback.** A store restored from an old copy would bring back sessions the user logged
+  out of. With a TPM, a monotonic NV counter is stored in the header and checked at unlock.
+  Without one, a rollback is detected only across devices that sync.
+- **The store** is a per-user file outside Tessera's CAS. It is never deduplicated and never
+  shared (threat model §2.6).
+
+### 6.2 Classes: when is a secret usable?
+
+| class | usable | default for |
+|---|---|---|
+| after-first-unlock | from the first unlock after boot until shutdown, including while the screen is locked | cookies, tokens, push keys: so background refresh and push work while locked |
+| while-unlocked | only while the session is unlocked; the key is evicted at lock | passwords, refresh tokens, API keys |
+| verify-each-use | each use passes a Vestibulum check (biometric or passcode) | revealing a password, exporting, passkey assertions with user verification, high-value items the user marks |
+
+### 6.3 Arca's own process
+
+- **No network, no parser of anything external.** Arca reads only its own store and the
+  structured records couriers send, under a small fixed schema.
+- **A jail of its own, Capsicum after start.** Its descriptors are its store directory,
+  the channels it creates and its Vestibulum and TPM links.
+- **Memory.**
+  - Every page holding a clear key or item is `mlock`ed, so it never reaches swap or the
+    zram compressor ([atrium-memory-pressure.md](atrium-memory-pressure.md)).
+  - Core dumps and tracing are disabled (`procctl` `PROC_TRACE_CTL`).
+  - Secrets are zeroized after use. Comparisons are constant-time.
+- **Logs never contain values**, only item ids and recipients.
+- **Small and fuzzed.** The request schema, the Set-Cookie record and the store format
+  each have a fuzz target and a positive control.
+
+## 7. Common attacks, and what stops each one
+
+| attack | what stops it |
+|---|---|
+| **phishing**: a lookalike site asks for the password | Fill happens only for the bound origin, matched exactly (§3). Confusable hosts are refused (threat model §2.11). The fill chip is drawn by the trusted UI, not the page. Passkeys can't be phished, because the RP ID is checked against the origin the courier actually reached |
+| **a malicious app asks for another app's secret** | Identity is the channel label from the signed manifest (§4.1). There is no lookup by name |
+| **a compromised app or renderer reads memory** | Keys: never there. Bearer secrets: only in the courier, after TLS, for one request (§5). App-held items are the stated exception (§4.3) |
+| **an open redirect carries a token away** | Couriers never follow a redirect to another endpoint (§5) |
+| **a man in the middle or a downgrade** | The courier attaches only after TLS verifies the bound host. An item from an `https` recipient is never sent over `http`. A user-installed root CA that intercepts is flagged in the trusted UI |
+| **DNS rebinding or hijack** | TLS name check plus the address pin and the private-range filter (threat model §2.1) |
+| **CSRF or a confused deputy**: a page makes the user's session act | SameSite and partitioning for the web (§8.2). Request rate and shape limits per recipient (threat model §6.6). Optional per-item scope (methods, paths) |
+| **a fake prompt or clickjacking** | All prompts are Vestibulum or Arca surfaces with system chrome that no app can draw ([vestibulum.md](vestibulum.md) §4.3). Limen forbids pixel readback |
+| **keylogging the password field** | Keystrokes for a marked password field go from the UI to Arca, never to the app or page (§8.3) |
+| **stolen disk or laptop** | Items are encrypted under a key that needs the passcode, sealed to the TPM where there is one. The TPM lockout limits guessing |
+| **cold boot or memory dump** | `mlock`, no core dumps, while-unlocked keys evicted at lock, zeroize |
+| **a restored old store** | The TPM monotonic counter (§6.1) |
+| **leaks through backup, sync or clipboard** | Backup and sync are end to end under the recovery key ([vestibulum.md](vestibulum.md) §6). Cookies never sync. Clipboard copies are user-initiated, shown and cleared after 60 s |
+| **brute force through the API** | Vestibulum's lockout. Per-client rate limits on verify-each-use |
+| **a supply-chain bug in Arca** | Rust, a minimal dependency set, fuzzed boundaries, and its own jail, with no network to send anything anywhere |
+
+## 8. The web profile: how the Navigator uses Arca
+
+This is threat model §6 restated on Arca. Nothing in it is a Navigator-only mechanism.
+
+### 8.1 Cookies
+
+- **Recipient = (partition, origin).** One item group per pair. The courier for
+  `(news.example, cdn.example)` can never receive `(mail.example, cdn.example)`'s
+  cookies.
+- **Arca does the matching**: domain, path, `Secure`, `SameSite`, expiry and the prefixes.
+  The courier receives only the `Cookie` header value for the request it is about to send.
+- **Set-Cookie** arrives from the courier as a structured record. Arca validates it against
+  the courier's label:
+  - the `Domain` must domain-match the origin and must not be a public suffix (a public
+    suffix list is built into Arca);
+  - `__Host-` and `__Secure-` are enforced;
+  - `Secure` is accepted only from `https`;
+  - size and count limits apply per recipient.
+- **`document.cookie`.** Recommendation: the page's own script sees only that origin's
+  non-`HttpOnly` cookies, in that origin's private, credentialed conversion or its tier-4
+  island. That matches the web's contract, since those cookies are script-readable by
+  design. `HttpOnly` cookies never leave Arca and its couriers. Writes go to Arca through
+  the same validation.
+
+### 8.2 Partitioning and SameSite
+
+These are as in threat model §6.3: no third-party cookies, `SameSite=Lax` by default, and
+first-party IdP cookies at the IdP. Arca needs to know a navigation's initiator site and
+whether a user gesture started it. **The broker supplies that context, not the page.** Arca
+attaches it to the courier's channel for that navigation, so a compromised converter can't
+claim a same-site context.
+
+### 8.3 Passwords
+
+- **Typing.** The UI recognises a password field from the semantic tree (threat model
+  §6.4), and the broker validates the mark. Keystrokes for that field go from the UI to
+  Arca. The page sees a fixed number of bullets, not the real length.
+- **Submitting.** The broker builds the form POST, and the password field holds a slot.
+  The courier for the form's action origin fills the slot only if all of these hold:
+  - the origin is exactly the item's recipient;
+  - the action is same-origin and `https`;
+  - the broker has stamped a user gesture.
+- **Saving.** After a login succeeds, Arca's trusted UI offers to save. Generated passwords
+  are created inside Arca.
+- **Filling** happens only on a user gesture, on the trusted fill chip. It is refused on
+  `http:`, on a confusable host, and in a tier-4 island unless the user confirms.
+
+### 8.4 Passkeys (WebAuthn)
+
+- **The authenticator is Arca.** A passkey is a key item with recipient = RP ID. ES256 is
+  required, because nearly every relying party asks for it; Ed25519 is optional.
+- **The WebAuthn client is the broker.** It computes the RP ID check against the origin
+  the courier actually connected to, and builds `clientDataJSON` from trusted values.
+- **User verification** is Vestibulum's prompt. Arca signs. Pages can request a credential,
+  never read one.
+- Passkeys sync through Vestibulum's end-to-end sync. Hardware security keys over CTAP2
+  come later, through a USB HID helper jail.
+
+### 8.5 Tokens, DBSC, client certificates, HTTP auth
+
+- **OAuth and API tokens:** slot-filled (§4.3). A recorded binding names the response
+  field that sets the token. The courier moves that field to Arca and passes a handle on.
+  Tier 4 is the honest exception: the engine holds what its script reads (threat model
+  §6.5).
+- **DBSC:** a device-bound key, in the TPM where there is one. Arca signs the refresh
+  challenge, so a stolen cookie is useless off this machine.
+- **TLS client certificates:** the courier runs the handshake, and Arca signs
+  `CertificateVerify`. The key never reaches the courier.
+- **HTTP Basic, Digest and Bearer challenges:** a trusted prompt. The answer is stored as a
+  password item bound to the origin and realm.
+
+### 8.6 Lifetime and clearing
+
+- Session cookies die when the origin's last view closes.
+- "Forget this site" destroys the recipient's data key (§6.1).
+- Credentialed conversions stay private to the user and are deleted with the jar (threat
+  model §6.7).
+
+## 9. Native apps and other clients
+
+The same API covers apps that are not browsers:
+
+| use | handover |
+|---|---|
+| an Insula app signing in to its service | per-service keypair, challenge-response ([insula.md](insula.md) §13.3); key class |
+| an app calling a REST API with a token | slot-filled through a courier, or Arca mints a scoped short-lived token ([insula.md](insula.md) §13.5) |
+| `git` over https, package registries | slot-filled through a courier (HTTP) |
+| SSH, `git` over SSH, commit signing | an agent socket backed by Arca key operations, on the `ssh-agent` model |
+| a mail or database client that must hold a password | app-held, with a user grant (§4.3), until a courier speaks its protocol |
+| Loculus | its master key is an Arca item with a key-unwrap release to the Loculus app identity |
+
+**The API** (replaces [vestibulum.md](vestibulum.md) §7.2, same shape):
+`arca_mint`, `arca_sign`, `arca_decrypt`, `arca_derive` for keys; `arca_send` (courier) and
+`arca_template_send` (slots) for bearer items; `arca_release` for app-held items, which fails
+without a grant; `arca_store` for an app saving a secret it was given (the recipient is
+required and shown to the user). There is deliberately no call that lists another app's
+items or reads a value by name.
+
+## 10. Audit
+
+Every release and every operation is logged with the item id, client label, recipient,
+time and whether a user gesture was present. Values are never logged. The trusted UI shows
+it per item ("used by Navigator for mail.example, 14 times today"). Anomalies go to the
+monitor (legacy web §10.5) and, where exact, end the client:
+
+- a courier asks for an item whose recipient isn't its own (exact, so it terminates);
+- items are used for an origin with no open view;
+- a burst of verify-each-use requests.
+
+## 11. Build plan
+
+This replaces threat model §6.8's C0–C3 with a sequence in which every client benefits from
+each step.
+
+| phase | work | gate |
+|---|---|---|
+| **A0** | Arca daemon, store format, key hierarchy, classes, channel identity from portcullisd; Vestibulum unlock and lock; move the keychain items out of `vestibulumd` | a test app gets EACCES on another app's item; the store fails to decrypt a record moved between recipients; the item is unreadable after lock (while-unlocked) |
+| **A1** | the courier for HTTP(S): fixed request schema, TLS-then-attach, no cross-endpoint redirects, Set-Cookie records; fuzz targets | a hostile-client fuzz run finds no read of an item; a redirect test proves no attach crosses endpoints |
+| **A2** | the web profile: cookies, partitioning, SameSite with broker context, private credentialed conversions | **this is the gate for any login in the Navigator** (replaces C0) |
+| **A3** | password secure input, slot-filled form POST, trusted save and fill UI | password login |
+| **A4** | passkeys (Arca authenticator, broker WebAuthn client), DBSC, TPM sealing | phishing-resistant and device-bound sessions |
+| **A5** | slot templates for app APIs and the Navigator's bindings; SSH agent; client certificates | native apps and SPAs with tokens |
+| **A6** | sync and backup through Vestibulum; FedCM and `form_post` continuation | multi-device |
+
+## 12. Decisions for the user, with recommendations
+
+1. **Arca is its own daemon, and Vestibulum keeps login and the root key.** *Recommend
+   yes.* `vestibulumd` draws the login screen and takes input, so it parses events and
+   fonts. Keeping item values out of a UI process, and the cookie traffic out of the login
+   daemon, makes both smaller.
+2. **Bearer secrets default to courier-attached; app-held only by user grant.** *Recommend
+   yes.* It's the only way "only the intended recipient" survives an app compromise.
+3. **Cookies are after-first-unlock, so background refresh and push work while locked;
+   passwords are while-unlocked.** *Recommend yes,* as iOS does.
+4. **`document.cookie` exposes non-`HttpOnly` cookies to the origin's own script** (§8.1).
+   *Recommend yes;* refusing it breaks many sites for no gain, since those cookies are
+   script-readable by design.
+5. **TPM sealing where present, with a visible "weaker without TPM" notice.** *Recommend
+   yes.*
+6. **The name Arca.**
