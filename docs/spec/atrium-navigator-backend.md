@@ -211,8 +211,68 @@ shipped UI fonts. It cannot carry a document.
 
 **The serialization is text**, one node per line, so a golden diff reads as a layout
 change. `nsg 0.2` heads the file, followed by `viewport`, `font`, `clip`, `group`,
-`rect`, `run` and `link` lines. Each run carries its source text too, so a reader of a diff can see what
+`rect`, `run`, `link` and (since 2026-11-06) `path` lines. Each run carries its source text too, so a reader of a diff can see what
 moved.
+
+**The `path` node: vector shapes (2026-11-06, `navigator-render/src/path.rs`).** It is
+one filled path, one to one with Fresco's `ATRIUM_CORE_FILL` (0x1004, fresco-protocol
+`FillParams`; the coverage rule is fresco-compute's `fill`):
+
+```
+path <evenodd 0|1> <a> <b> <c> <d> <e> <f> <rrggbbaa> <opacity 0-255> v<verbs> p<x>,<y> … [c<i>] [g<i>] [x<i>]
+```
+
+The transform's linear part is in 1/65536 and its offset in 1/64 px. The verbs are
+fresco-compute's (0 move, 1 line, 2 quad, 3 cubic, 4 close), the points are in 1/64 of a
+path unit, and the colour is sRGB with straight alpha.
+
+*Where paths come from.* The normalizer keeps a standalone inline SVG's text on its
+replaced element (`atrium-svg`). The renderer turns it into paths (navigator-svg
+`vector`, after the same strict profile as the bitmap path):
+- a stroke, with its dashes, becomes the filled outline it paints (tiny-skia's stroker);
+- a transform becomes the fill's own affine;
+- group opacity over one shape folds into its paint.
+
+*What keeps the bitmap path* (the image node of SVG as an image), with the reason
+counted: a clip path, a mask, a filter, group opacity over several shapes, a pattern,
+an embedded image, text, and a gradient (until Fresco's gradient paints are wired here).
+
+*The checks.*
+- The worker checks each path against Fresco's own limits at the painted scale
+  (`fill::flatten` and `fill::pack`: at most 64K lines a path, at most 4,096 in one
+  16 px tile).
+- A document's SVGs may use at most half of a frame's 512K lines.
+- A path that would pass any of these sends the whole SVG back to the bitmap path.
+- `fill_params` makes a node what frescod takes (colour to linear RGB).
+- `validate` runs fresco-protocol's `FillParams::validate`, the same function frescod
+  runs: bounds, finite values, verbs. The broker calls it before handing a node on.
+- Scroll and zoom move a fill with `ATRIUM_CORE_FILL_TRANSFORM` (0x1005), without
+  re-sending its geometry.
+
+*In the review rasterizer* (`raster`), paths are painted by fresco-compute's own
+coverage functions, so a review shows what frescod would draw.
+
+*Measured* (warm, all 122 pages):
+
+| | inline SVGs drawn |
+|---|---|
+| **as vector shapes** (1,855 path nodes) | **1,502 (70.4%)** |
+| kept as a bitmap: clip path | 525 |
+| kept as a bitmap: external sprite | 67 |
+| kept as a bitmap: filter | 12 |
+| kept as a bitmap: embedded image | 8 |
+| kept as a bitmap: mask | 6 |
+| kept as a bitmap: group opacity over several shapes | 5 |
+| kept as a bitmap: gradient | 4 |
+| kept as a bitmap: animation | 2 |
+| kept as a bitmap: text | 2 |
+
+- *Pages without inline SVG:* their NSG is byte-identical to 0beab757's. All 57 scenes
+  that changed are pages with inline SVG.
+- *The clip paths* are mostly a whole-viewport rectangle (the Figma export pattern). A
+  rectangle clip under an axis-aligned transform could be sent as the fill's own clip
+  rectangle; it stays on the bitmap path for now, as agreed.
+- *Not yet run:* the integration test against frescod itself.
 
 **The M0 gate:** the repo's own Markdown (the corpus) produces **byte-identical NSG over
 3 runs on 2 machines**: macOS (host) and FreeBSD (the VM, Laminar, cross-built).

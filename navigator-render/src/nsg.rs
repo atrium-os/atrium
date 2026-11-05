@@ -17,6 +17,9 @@
 //! shadow <x> <y> <w> <h> <rrggbbaa> <blur> [r<tl>,<tr>,<br>,<bl>] [c<i>] [g<i>] [x<i>]
 //! grad <x> <y> <w> <h> t<tx>,<ty>,<tw>,<th> <repeat> <angle 1/64 deg> <rrggbbaa>@<pos 1/1024> …
 //! image <address> <x> <y> <w> <h> t<tx>,<ty>,<tw>,<th> <repeat> <fit>
+//! path <evenodd 0|1> <a> <b> <c> <d> <e> <f> <rrggbbaa> <opacity 0-255> v<verbs> p<x>,<y> … [c<i>] [g<i>] [x<i>]
+//!      (Fresco's ATRIUM_CORE_FILL one to one: a-d in 1/65536, e f in 1/64 px,
+//!       verbs 0 move 1 line 2 quad 3 cubic 4 close, points in 1/64 path unit)
 //! ```
 
 use crate::fontset::FontSet;
@@ -110,6 +113,16 @@ pub fn write(scene: &Scene, fonts: &FontSet) -> String {
                 let _ = write!(o, "shadow {} {} {} {} {:08x} {}", sh.x, sh.y, sh.w, sh.h, sh.rgba, sh.blur);
                 if sh.radii != [0; 4] { let _ = write!(o, " r{},{},{},{}", sh.radii[0], sh.radii[1], sh.radii[2], sh.radii[3]); }
                 attrs(&mut o, scene.shadow_attrs.get(i));
+                o.push('\n');
+            }
+            6 => {
+                let p = &scene.paths[i];
+                let t = &p.transform;
+                let _ = write!(o, "path {} {} {} {} {} {} {} {:08x} {} v", u8::from(p.even_odd), t[0], t[1], t[2], t[3], t[4], t[5], p.rgba, p.opacity);
+                for v in &p.verbs { let _ = write!(o, "{v}"); }
+                o.push_str(" p");
+                for (k, (x, y)) in p.points.iter().enumerate() { let _ = write!(o, "{}{x},{y}", if k == 0 { "" } else { " " }); }
+                attrs(&mut o, scene.path_attrs.get(i));
                 o.push('\n');
             }
             _ => {

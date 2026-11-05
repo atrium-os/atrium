@@ -16,6 +16,15 @@ blake3 = { version = "1", features = ["pure"] }
 swash = { version = "0.1", optional = true }
 png = { version = "0.17", optional = true }
 unicode-bidi = "0.3.18"
+# ★ Vector SVG (NSG `path` nodes): the shared strict profile and the
+# tree-to-fills conversion; and Fresco's OWN checks, so a path the worker
+# emits is one frescod takes — fresco-protocol's `FillParams::validate`
+# (what the broker runs) and fresco-compute's `fill` (flattening and the
+# per-path and per-tile limits, checked at the painted scale), whose CPU
+# reference also paints paths in the review rasterizer.
+navigator-svg = { path = "../navigator-svg" }
+fresco-protocol = { path = "../fresco-protocol" }
+fresco-compute = { path = "../fresco-compute" }
 # UAX #14 line breaking. Dictionary data only (no `auto`/LSTM): the LSTM
 # runs in floating point, and a render must be byte-identical across ISAs.
 icu_segmenter = { version = "2.3", default-features = false, features = ["compiled_data"] }

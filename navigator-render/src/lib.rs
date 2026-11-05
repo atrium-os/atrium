@@ -16,6 +16,7 @@ pub mod flag;
 pub mod fontset;
 pub mod html;
 pub mod nsg;
+pub mod path;
 #[cfg(feature = "raster")]
 pub mod raster;
 
@@ -158,6 +159,9 @@ pub struct Scene {
     pub shadow_attrs: Vec<Attrs>,
     pub grad_attrs: Vec<Attrs>,
     pub image_attrs: Vec<Attrs>,
+    /// Filled paths (kind 6): an inline SVG as vector shapes (`path`).
+    pub paths: Vec<path::Path>,
+    pub path_attrs: Vec<Attrs>,
     /// The clip and group a node created now belongs to.
     /// Public only so review tooling can build a scene of one node.
     pub cur: Attrs,
@@ -171,6 +175,11 @@ impl Scene {
         self.order.insert(slot, (5, self.images.len()));
         self.images.push(im);
         self.image_attrs.push(self.cur);
+    }
+    pub(crate) fn insert_path(&mut self, slot: usize, p: path::Path) {
+        self.order.insert(slot, (6, self.paths.len()));
+        self.paths.push(p);
+        self.path_attrs.push(self.cur);
     }
     /// A gradient painted into a slot reserved earlier — a background goes
     /// over the box's background colour and under everything else.

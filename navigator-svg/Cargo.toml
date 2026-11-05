@@ -1,0 +1,14 @@
+[package]
+name        = "navigator-svg"
+version     = "0.1.0"
+edition     = "2021"
+license     = "MIT OR Apache-2.0"
+publish     = false
+description = "The Navigator's SVG: one strict profile, then either a bitmap (the worker's image path) or filled paths (NSG path nodes, Fresco's ATRIUM_CORE_FILL)."
+
+[dependencies]
+# LICENCE (2026-11-06, threat model §2.4): usvg Apache-2.0 OR MIT (MPL
+# before 0.36), roxmltree MIT OR Apache-2.0; tiny-skia-path (re-exported by
+# usvg) BSD-3. Default features off: no fonts, no svgz, no raster decoders.
+usvg = { version = "0.49", default-features = false }
+roxmltree = { version = "0.21", default-features = false, features = ["std"] }

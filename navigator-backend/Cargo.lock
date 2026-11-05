@@ -426,9 +426,9 @@ dependencies = [
  "memchr",
  "navigator-backend",
  "navigator-dom",
+ "navigator-svg",
  "png 0.17.16",
  "resvg",
- "roxmltree",
  "serde_json",
  "url",
  "usvg",
@@ -442,6 +442,14 @@ version = "0.1.0"
 dependencies = [
  "html5ever",
  "markup5ever_rcdom",
+]
+
+[[package]]
+name = "navigator-svg"
+version = "0.1.0"
+dependencies = [
+ "roxmltree",
+ "usvg",
 ]
 
 [[package]]

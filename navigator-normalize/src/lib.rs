@@ -173,12 +173,12 @@ pub fn normalize(html: &str, inputs: &Inputs) -> (String, Report) {
     // same function, on the same untouched document and stylesheets, so the
     // bytes — and their address — are the converter's. Only a recording that
     // names a `blake3:` image can have any, so every other document skips it.
-    let inline_svgs: Vec<(Handle, String)> = if inputs.images.keys().any(|k| k.starts_with("blake3:")) {
+    let inline_svgs: Vec<(Handle, String, String)> = if inputs.images.keys().any(|k| k.starts_with("blake3:")) {
         let outers = svg_inline::outer_svgs(&dom);
         let texts = svg_inline::standalone_in(&dom, &outers, inputs);
         outers.into_iter().zip(texts)
-            .map(|(h, t)| (h, format!("blake3:{}", blake3::hash(t.as_bytes()).to_hex())))
-            .filter(|(_, a)| inputs.images.contains_key(a)).collect()
+            .map(|(h, t)| (h, format!("blake3:{}", blake3::hash(t.as_bytes()).to_hex()), t))
+            .filter(|(_, a, _)| inputs.images.contains_key(a)).collect()
     } else { vec![] };
     phases::lap("parse");
     let mut report = Report::default();
@@ -931,11 +931,15 @@ pub fn normalize(html: &str, inputs: &Inputs) -> (String, Report) {
     // An inline SVG made standalone: its box (styled above like any
     // element) becomes a replaced element painting that blob, and its
     // children go — they are in the blob.
-    for (h, address) in &inline_svgs {
+    // ★ The standalone text travels with it (`atrium-svg`), so the renderer
+    // can draw it as vector shapes (NSG `path` nodes, Fresco's fill op)
+    // where it can, and as the blob's bitmap where it cannot.
+    for (h, address, text) in &inline_svgs {
         for c in dom.children_of(*h) { detach(&mut dom, c) }
         dom.set_attr(*h, "src", address);
+        dom.set_attr(*h, "atrium-svg", text);
     }
-    let imgs: Vec<Handle> = dom.by_tag_anywhere("img").into_iter().chain(inline_svgs.iter().map(|(h, _)| *h)).collect();
+    let imgs: Vec<Handle> = dom.by_tag_anywhere("img").into_iter().chain(inline_svgs.iter().map(|(h, _, _)| *h)).collect();
     for h in imgs {
         let src = dom.attr(h, "src").unwrap_or("").to_string();
         match inputs.images.get(&src) {

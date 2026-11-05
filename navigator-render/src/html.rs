@@ -184,6 +184,9 @@ struct Cx<'a> {
     /// `width: 1px; overflow: hidden`, across the page as visible text.
     /// They are placed after the line box that would have held them.
     pending_abs: Vec<Handle>,
+    /// What is left of this document's share of vector lines
+    /// (`path::DOCUMENT_SEGMENT_SHARE`); past it, SVGs keep the bitmap path.
+    vector_budget: usize,
     /// ★ Absolutely positioned boxes whose placement needs the HEIGHT of a
     /// containing block that is still being laid out (`bottom` without
     /// `top`, a percentage `top` or `height`, both offsets with an auto
@@ -352,7 +355,7 @@ fn render_inner(html: &str, fonts: &FontSet, env: &Env, subs: &Subresources, geo
     let mut cx = Cx { dom: &dom, styles: &styled.styles, sh: Shaper::new(fonts), scene: Scene { width: u(env.width_px), ..Default::default() },
                       report: Report::default(), links: vec![], unimplemented: BTreeMap::new(), marker: None, baseline_probe: None, indent: None, iso_paths: vec![vec![]], iso_cur: 0, content_dy: 0, table_part: false, promoted: vec![], boxes: std::env::var_os("NSG_DUMP_BOXES").map(|_| vec![]), geo: None, inl_cur: 0,
                       viewport: (u(env.width_px), Some(u(env.height_px))), pos_cb: (0, 0, u(env.width_px), Some(u(env.height_px))),
-                      subs, placing_abs: false, pending_abs: vec![], deferred_abs: vec![], cb_open: false, canvas_src: None, abs_origin: None, flex_static: None, measured: HashMap::new(), contexts: vec![], hoists: vec![], diagnostics: vec![] };
+                      subs, placing_abs: false, pending_abs: vec![], deferred_abs: vec![], cb_open: false, canvas_src: None, abs_origin: None, flex_static: None, measured: HashMap::new(), contexts: vec![], hoists: vec![], diagnostics: vec![], vector_budget: crate::path::DOCUMENT_SEGMENT_SHARE };
     if geo { cx.geo = Some(GeoLog { inl_paths: vec![vec![]], ..Default::default() }) }
     cx.promoted = promote_block_in_inline(&dom, &styled.styles);
     cx.count_unread_rows();
@@ -420,7 +423,7 @@ pub fn premeasure_tables(html: &str, fonts: &FontSet, env: &Env) -> (String, usi
                       report: Report::default(), links: vec![], unimplemented: BTreeMap::new(), marker: None, baseline_probe: None,
                       indent: None, iso_paths: vec![vec![]], iso_cur: 0, content_dy: 0, table_part: false, promoted: vec![], boxes: std::env::var_os("NSG_DUMP_BOXES").map(|_| vec![]), geo: None, inl_cur: 0, viewport: (u(env.width_px), Some(u(env.height_px))),
                       pos_cb: (0, 0, u(env.width_px), Some(u(env.height_px))), subs: &Subresources::new(),
-                      placing_abs: false, pending_abs: vec![], deferred_abs: vec![], cb_open: false, canvas_src: None, abs_origin: None, flex_static: None, measured: HashMap::new(), contexts: vec![], hoists: vec![], diagnostics: vec![] };
+                      placing_abs: false, pending_abs: vec![], deferred_abs: vec![], cb_open: false, canvas_src: None, abs_origin: None, flex_static: None, measured: HashMap::new(), contexts: vec![], hoists: vec![], diagnostics: vec![], vector_budget: crate::path::DOCUMENT_SEGMENT_SHARE };
     // (table, per-column (min, max), its first row's cells) for every table.
     let mut tables: Vec<(Handle, Vec<(U, U)>, Vec<Handle>)> = vec![];
     for t in 0..dom.nodes.len() as Handle {
@@ -1098,10 +1101,28 @@ impl<'a> Cx<'a> {
             let fit = match kw(s, "object-fit") { "contain" => "contain", "cover" => "cover", "none" => "none", "scale-down" => "scale-down", _ => "fill" };
             let (tx, ty, tw, th) = Self::object_tile(fit, content, (iw, ih));
             if !hidden && content.2 > 0 && content.3 > 0 {
-                self.scene.insert_image(slot, crate::Image {
-                    area: crate::Tiling { x: content.0, y: content.1, w: content.2, h: content.3, tx, ty, tw: tw.max(1), th: th.max(1), repeat: 0 },
-                    address: addr, fit });
-                slot += 1;
+                // ★ An inline SVG as VECTOR SHAPES where all of it can be
+                // (navigator-svg `vector`, Fresco's fill op, its limits at
+                // this painted scale); otherwise its blob's bitmap, as below.
+                let vector = self.dom.attr(h, "atrium-svg").map(|text| {
+                    let mut budget = self.vector_budget;
+                    let r = crate::path::from_svg(text, (tx, ty, tw.max(1), th.max(1)), &mut budget);
+                    if r.is_ok() { self.vector_budget = budget }
+                    r
+                });
+                match vector {
+                    Some(Ok(paths)) => {
+                        self.count("inline svg drawn as vector shapes");
+                        for p in paths { self.scene.insert_path(slot, p); slot += 1 }
+                    }
+                    other => {
+                        if let Some(Err(why)) = other { self.count(kept_as_bitmap(why)) }
+                        self.scene.insert_image(slot, crate::Image {
+                            area: crate::Tiling { x: content.0, y: content.1, w: content.2, h: content.3, tx, ty, tw: tw.max(1), th: th.max(1), repeat: 0 },
+                            address: addr, fit });
+                        slot += 1;
+                    }
+                }
             }
         }
         let painted = slot - bg_slot;
@@ -1625,6 +1646,7 @@ impl<'a> Cx<'a> {
         // still renders correctly, and quietly carries orphan nodes that
         // nothing points at.
         let (sh, gr_n, im) = (self.scene.shadows.len(), self.scene.grads.len(), self.scene.images.len());
+        let (pa, vb) = (self.scene.paths.len(), self.vector_budget);
         let (cl, gr, cur, xf) = (self.scene.clips.len(), self.scene.groups.len(), self.scene.cur, self.scene.xforms.len());
         let diags = self.diagnostics.len();
         let (links, counts, marker, report) = (self.links.len(), self.unimplemented.clone(), self.marker.clone(), self.report.clone());
@@ -1645,6 +1667,7 @@ impl<'a> Cx<'a> {
         self.scene.shadows.truncate(sh); self.scene.shadow_attrs.truncate(sh);
         self.scene.grads.truncate(gr_n); self.scene.grad_attrs.truncate(gr_n);
         self.scene.images.truncate(im); self.scene.image_attrs.truncate(im);
+        self.scene.paths.truncate(pa); self.scene.path_attrs.truncate(pa); self.vector_budget = vb;
         self.scene.clips.truncate(cl); self.scene.groups.truncate(gr); self.scene.cur = cur;
         self.scene.xforms.truncate(xf); self.scene.xform_parents.truncate(xf);
         // A trial layout must leave no diagnostics behind: the real one
@@ -4964,7 +4987,7 @@ mod tests {
                           report: Report::default(), links: vec![], unimplemented: BTreeMap::new(), marker: None,
                           baseline_probe: None, indent: None, iso_paths: vec![vec![]], iso_cur: 0, content_dy: 0, table_part: false, promoted: vec![], boxes: std::env::var_os("NSG_DUMP_BOXES").map(|_| vec![]), geo: None, inl_cur: 0,
                           viewport: (0, None), pos_cb: (0, 0, 0, None), subs: &Subresources::new(),
-                          placing_abs: false, pending_abs: vec![], deferred_abs: vec![], cb_open: false, canvas_src: None, abs_origin: None, flex_static: None, measured: HashMap::new(), contexts: vec![], hoists: vec![], diagnostics: vec![] };
+                          placing_abs: false, pending_abs: vec![], deferred_abs: vec![], cb_open: false, canvas_src: None, abs_origin: None, flex_static: None, measured: HashMap::new(), contexts: vec![], hoists: vec![], diagnostics: vec![], vector_budget: crate::path::DOCUMENT_SEGMENT_SHARE };
         cx.count_rows_outside(&held_out);
         // The non-initial value is counted once; the initial one is not.
         assert_eq!(cx.unimplemented.get("row text-align… (not implemented)"), Some(&1), "{:?}", cx.unimplemented);
@@ -5999,3 +6022,11 @@ fn size_tracks(tracks: &[navigator_style::values::Track], avail: Option<U>, gap:
     sizes
 }
 
+
+/// "inline svg kept as a bitmap: <why>", as a `'static` counter key: the
+/// reasons are a small fixed set (navigator-svg's refusals and the vector
+/// route's), each interned once.
+fn kept_as_bitmap(why: &'static str) -> &'static str {
+    thread_local! { static KEYS: std::cell::RefCell<std::collections::HashMap<&'static str, &'static str>> = Default::default(); }
+    KEYS.with(|k| *k.borrow_mut().entry(why).or_insert_with(|| Box::leak(format!("inline svg kept as a bitmap: {why}").into_boxed_str())))
+}

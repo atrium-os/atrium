@@ -45,8 +45,10 @@ gif = { version = "0.14.2", default-features = false, features = ["std"] }
 # text (v1; see svg.rs). The strict profile is checked on roxmltree's tree
 # BEFORE usvg parses anything.
 resvg = { version = "0.49", default-features = false }
+# The strict profile itself lives in navigator-svg, shared with the vector
+# (NSG path node) route, so bitmap and vector check the same thing.
+navigator-svg = { path = "../navigator-svg" }
 usvg = { version = "0.49", default-features = false }
-roxmltree = { version = "0.21", default-features = false, features = ["std"] }
 # The broker's byte search of a recording (src/carried.rs): a 10 MB miss
 # took 25.6 ms with `windows().any()`, and the broker is single-threaded.
 memchr = "2"
