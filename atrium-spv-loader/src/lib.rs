@@ -98,10 +98,16 @@ impl ShaderCache {
         Self { config, loaded: Mutex::new(HashMap::new()) }
     }
 
-    /// The cache's version subdirectory
-    /// (`<cache_root>/v{N}/`).
+    /// The cache's version subdirectory, per CPU arch
+    /// (`<cache_root>/v{N}/<arch>/`, arch = `aarch64` | `x86_64`).
+    /// Blobs and `.so`s are native code: a cache shared across
+    /// arches (a host share, a copied Tessera tree) must not hand
+    /// one arch's code to the other. The blob loader would refuse
+    /// it, but then every load is a miss that never gets cached.
     pub fn version_dir(&self) -> PathBuf {
-        self.config.cache_root.join(format!("v{}", self.config.abi_version))
+        self.config.cache_root
+            .join(format!("v{}", self.config.abi_version))
+            .join(std::env::consts::ARCH)
     }
 
     /// Compute the content hash for a SPIR-V module.

@@ -9137,30 +9137,35 @@ mod tests {
 
     #[test]
     fn enumerate_instance_extensions_lists_atrium_surface() {
-        // VK_KHR_surface + VK_EXT_atrium_surface + VK_EXT_debug_utils
-        // + VK_KHR_get_surface_capabilities2 — see
-        // ATRIUM_INSTANCE_EXTENSIONS.
+        // Exactly ATRIUM_INSTANCE_EXTENSIONS, in order: VK_KHR_surface,
+        // VK_EXT_atrium_surface, VK_EXT_debug_utils,
+        // VK_KHR_get_surface_capabilities2,
+        // VK_KHR_get_physical_device_properties2.
+        const WANT: [&str; 5] = [
+            "VK_KHR_surface",
+            "VK_EXT_atrium_surface",
+            "VK_EXT_debug_utils",
+            "VK_KHR_get_surface_capabilities2",
+            "VK_KHR_get_physical_device_properties2",
+        ];
         let f = lookup(b"vkEnumerateInstanceExtensionProperties\0").unwrap();
         let typed: unsafe extern "C" fn(*const c_char, *mut u32, *mut VkExtensionProperties) -> VkResult =
             unsafe { std::mem::transmute(f) };
         let mut count: u32 = 99;
         let r = unsafe { typed(std::ptr::null(), &mut count, std::ptr::null_mut()) };
         assert_eq!(r, VK_SUCCESS);
-        assert_eq!(count, 4);
+        assert_eq!(count as usize, WANT.len());
 
         let mut props: [VkExtensionProperties; 8] = unsafe { std::mem::zeroed() };
         let mut cap: u32 = 8;
         let _ = unsafe { typed(std::ptr::null(), &mut cap, props.as_mut_ptr()) };
-        assert_eq!(cap, 4);
-        let names: Vec<String> = (0..4).map(|i| {
+        assert_eq!(cap as usize, WANT.len());
+        let names: Vec<String> = (0..WANT.len()).map(|i| {
             let bytes: Vec<u8> = props[i].extensionName.iter()
                 .take_while(|&&c| c != 0).map(|&c| c as u8).collect();
             String::from_utf8(bytes).unwrap()
         }).collect();
-        assert_eq!(names[0], "VK_KHR_surface");
-        assert_eq!(names[1], "VK_EXT_atrium_surface");
-        assert_eq!(names[2], "VK_EXT_debug_utils");
-        assert_eq!(names[3], "VK_KHR_get_surface_capabilities2");
+        assert_eq!(names, WANT);
     }
 
     #[test]

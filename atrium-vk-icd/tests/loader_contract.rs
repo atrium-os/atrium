@@ -27,14 +27,51 @@ fn locate_cdylib() -> Option<PathBuf> {
     let here = std::env::current_exe().ok()?;
     // current_exe = .../target/{debug,release}/deps/loader_contract-HASH
     // The cdylib lives at .../target/{debug,release}/<lib>.{dylib,so}.
-    let mut p = here;
+    // Cargo's newer build-dir layout keeps test binaries under
+    // target/<profile>/build/... or a separate build dir and no longer puts
+    // the cdylib next to them, so also look in the artifact dir:
+    // $CARGO_TARGET_DIR (or <crate>/target)/<profile>/.
+    let profile = if here.components().any(|c| c.as_os_str() == "release") {
+        "release"
+    } else {
+        "debug"
+    };
+    let mut dirs = Vec::new();
+    let mut p = here.clone();
     p.pop(); p.pop();
-    for name in &[
-        "libatrium_vk_icd.dylib", // macOS
-        "libatrium_vk_icd.so",    // Linux/FreeBSD
-    ] {
-        let candidate = p.join(name);
-        if candidate.exists() { return Some(candidate); }
+    dirs.push(p);
+    let target = std::env::var_os("CARGO_TARGET_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("target"));
+    dirs.push(target.join(profile));
+    // New layout: test binary at build/<pkg>/<hash>/out/, the cdylib in a
+    // sibling build/<pkg>/<hash2>/out/. Take the newest one.
+    let mut pkg_dir = here.clone();
+    pkg_dir.pop(); pkg_dir.pop(); pkg_dir.pop();
+    if let Ok(rd) = std::fs::read_dir(&pkg_dir) {
+        let mut outs: Vec<(std::time::SystemTime, PathBuf)> = rd
+            .filter_map(|e| e.ok())
+            .map(|e| e.path().join("out"))
+            .filter(|d| d.join("libatrium_vk_icd.so").exists()
+                || d.join("libatrium_vk_icd.dylib").exists())
+            .filter_map(|d| {
+                let m = std::fs::metadata(&d).ok()?.modified().ok()?;
+                Some((m, d))
+            })
+            .collect();
+        outs.sort();
+        if let Some((_, d)) = outs.pop() {
+            dirs.push(d);
+        }
+    }
+    for d in &dirs {
+        for name in &[
+            "libatrium_vk_icd.dylib", // macOS
+            "libatrium_vk_icd.so",    // Linux/FreeBSD
+        ] {
+            let candidate = d.join(name);
+            if candidate.exists() { return Some(candidate); }
+        }
     }
     None
 }
