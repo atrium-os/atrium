@@ -466,6 +466,18 @@ absolute links already could. And the href must be one the document carries: spe
 the recording the broker holds, and on an `<a>`/`<area>` of the current document
 (threat model §2.10).
 
+**Progressive display (2026-11-05, legacy-web §5.4.5.7).** Three more requests, so a
+reader never waits for the whole conversion: `Upgrade { session, recording }` hands the
+broker the scripted conversion's readable recording for a session showing the tier-1
+one; `Swap { session, anchor }` comes from the UI at an idle moment, carrying where the
+reader is; `Attach { session, transitions }` hands over the transition table, which
+arrives after exploration. Answers: `UpgradeReady` / `UpgradeKept` (not meaningfully
+different: nothing on screen changes), `Replaced { anchor }` (the same reading position
+in the new document), `TransitionsAttached`, `TransitionsHeld`. The comparison, the
+anchor mapping and the digest binding live in `progressive.rs`; both hosts implement
+them, the jailed one over the worker wire (`UPGR`, `SWAP`, `ATCH`), with the broker
+keeping its own copy of what it staged so what a session carries follows what it shows.
+
 `Image { session, address }` asks for one image's pixels. The broker checks that the
 recording names the address and reads the blob from its store. The document's worker
 decodes it, and the broker validates the RGBA8 buffer before it becomes

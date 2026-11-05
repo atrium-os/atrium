@@ -234,6 +234,24 @@ details and the numbers.
     to 8 MiB) and refused, not delivered.
   - *Bound.* The converter receives at most the budget. Upstream is asked for at most
     the budget plus one response.
+  - *Prefetch hints (2026-11-05, legacy-web §5.4.5.7 step 4).* The converter now
+    hints every stylesheet, image and script of the parsed document, and fetchd
+    fetches hinted URLs in parallel before they are requested. Those bytes are pulled
+    before anyone is charged, so the relay passes hints on only while the budget has
+    room, and tells fetchd the remaining budget (`B <bytes>`) before the first one;
+    fetchd's prefetcher stops starting hinted fetches once it has pulled that much
+    (default 128 MiB if never told). Charging is unchanged: a hinted URL's bytes are
+    charged when the converter asks for it. The bound on what upstream is asked for
+    becomes the budget for requests plus the budget for hints plus one response, at
+    most twice the budget. Tests: `navigator-fetch` `tests/pool.rs`
+    (`hints_stop_at_the_byte_budget`), and the relay's fake fetchd sees `B 250000`
+    before its five hints (`tests/confine.rs`).
+  - *Concurrency and the address rule.* The parallel fetches are `sibling`s of one
+    `Conversation`: one pin table, locked across resolve-and-pin, so concurrent first
+    lookups of a name get one answer, and a rebinding answer is refused exactly as
+    before. A reused (keep-alive) connection is reused only for its own origin and
+    was opened to an address that conversation checked and pinned. Casper's channel
+    is used by one thread at a time (`Locked`).
   - *Reporting.* The batch report prints the relayed-bytes distribution and names
     each document the budget refused, with bytes pulled, the limit, the number of
     requests refused and the first refused URL.
