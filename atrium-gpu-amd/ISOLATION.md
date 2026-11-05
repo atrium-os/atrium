@@ -62,6 +62,19 @@ mechanism in this driver, and records how the five breaks from the
   and kqueue reports `EV_EOF` with `EIO` in `fflags`. `SYNCOBJ_WAIT` also
   sleeps interruptibly now, with an absolute `sbintime` deadline.
   Counters: `isolation.hangs`, `isolation.fences_failed`.
+- **VM faults (F6 G1).** gpusim 013b62b reports each GPU page fault as an
+  IH cookie naming the queue, VMID and page, and no longer stops the engine
+  on a fault (that only happens under `GPUSIM_FAULT_STOP=1`): the bad access
+  is dropped and other VMIDs carry on, as with amdgpu's default. The driver
+  marks the queue's current work as faulted, so its completions fail with
+  `EIO` (even if the work runs on to its fence), and the watchdog stops a
+  queue that is still running at once instead of after `hang_ms`. A runaway
+  shader stops only its own queue, which the watchdog then reclaims.
+  Counter: `isolation.vm_faults`.
+- **Read-only binds (ABI rev 3).** `VM_BIND2` with `ATRIUM_GPU_BIND_READONLY`
+  maps a BO without `PTE_WRITE`, and the GMC enforces it (`VM_CNTL`, set at
+  init and after every reset). The broker maps an app's code and constants
+  this way. This is hygiene within one VM, not isolation between VMs.
 - **Contract.** A ring submitted with a syncobj should raise exactly one
   interrupting EOP. Fewer, and its completion is failed by the watchdog
   (after holding the queue for up to `hang_ms`); more, and the extra EOP

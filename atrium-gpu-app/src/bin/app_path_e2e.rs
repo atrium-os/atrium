@@ -37,11 +37,17 @@ fn app_code(value: u32) -> Vec<u8> {
 /// The broker's half for one app submission: check the code slot, load it
 /// into the app's VM, build the blob from the app's records, fence, submit.
 fn run_app(vm: &Vm<'_>, so: &Syncobj<'_>, value: u64, slot: &[u8], records: &[u8]) -> Result<(), String> {
+    run_app_with(vm, so, value, slot, &|_| records.to_vec())
+}
+
+/// Like `run_app`, with the records built once the code's VA is known.
+fn run_app_with(vm: &Vm<'_>, so: &Syncobj<'_>, value: u64, slot: &[u8], records: &dyn Fn(u64) -> Vec<u8>) -> Result<(), String> {
     let (header, code) = CodeHeader::parse(slot).map_err(|e| format!("code refused: {e:?}"))?;
-    let code_bo = vm.alloc(0x1000, 0).map_err(|e| format!("code BO: {e}"))?;
+    let code_bo = vm.alloc_readonly(0x1000, 0).map_err(|e| format!("code BO: {e}"))?;
     code_bo.write(0, code).map_err(|e| format!("code upload: {e}"))?;
     let binding = CodeBinding { header, va: code_bo.gpu_va(), scratch: None };
-    let mut blob = build(records, &|id| (id == 0).then_some(binding)).map_err(|e| format!("work refused: {e:?}"))?;
+    let records = records(code_bo.gpu_va());
+    let mut blob = build(&records, &|id| (id == 0).then_some(binding)).map_err(|e| format!("work refused: {e:?}"))?;
     let ring = vm.alloc(0x4000, 0).map_err(|e| format!("ring BO: {e}"))?;
     let fence = ring.gpu_va() + FENCE_OFFSET;
     blob.packet(IT_RELEASE_MEM, &[5 << 8, (2 << 29) | (2 << 24), fence as u32, (fence >> 32) as u32, 1, 0]);
@@ -96,6 +102,13 @@ fn main() {
         check(b_own == 0xb0b,
             format!("in B's VM that VA is B's own buffer, which got B's value (0x{b_own:x})"));
     }
+
+    // The broker maps code read-only: a kernel aimed at its own code faults,
+    // its work fails with EIO, and the code is unchanged.
+    let so_c = gpu.create_syncobj().expect("syncobj C");
+    let r = run_app_with(&vm_a, &so_c, 1, &app_code(0xdead), &|code_va| records_for(code_va));
+    check(matches!(&r, Err(e) if e.contains("wait")),
+        format!("app A's kernel storing over its own (read-only) code fails ({r:?})"));
 
     println!("Refusals happen before anything reaches the GPU");
     let mut bad = app_code(1);

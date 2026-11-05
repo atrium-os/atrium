@@ -129,7 +129,7 @@ amd_gpu_reset(struct atrium_amd_softc *sc)
 static const char amd_build_id[] = ATRIUM_BUILD_ID;
 /* Bumped when the client-visible rules change: 2 = isolation (control node,
  * exclusive queue ownership, owner-only doorbell mmap). */
-#define ATRIUM_AMD_ABI_REV	2
+#define ATRIUM_AMD_ABI_REV	3	/* 3: VM_BIND2 (read-only binds) */
 
 static const struct atrium_gpu_backend_ops amd_backend = {
 	.name = "amd",
@@ -168,6 +168,7 @@ amd_teardown(struct atrium_amd_softc *sc)
 	 * this module's text, about to be unloaded).
 	 */
 	amd_ih_set_handler(sc, ATRIUM_AMD_IH_CAUSE_EOP, NULL);
+	amd_ih_set_handler(sc, ATRIUM_AMD_IH_CAUSE_VM_FAULT, NULL);
 	amd_reset_register(sc, ATRIUM_AMD_IP_GPU, NULL, NULL);
 	if (sc->ctl_cdev != NULL) {
 		destroy_dev(sc->ctl_cdev);
@@ -305,6 +306,8 @@ atrium_amd_attach(device_t dev)
 	 * the display module's — the GPU has no part in it.
 	 */
 	amd_ih_set_handler(sc, ATRIUM_AMD_IH_CAUSE_EOP, amd_eop_handler);
+	/* VM faults (queue, VMID, page): fail that queue's work at once. */
+	amd_ih_set_handler(sc, ATRIUM_AMD_IH_CAUSE_VM_FAULT, amd_fault_handler);
 
 	/*
 	 * Register the GFX block's reset hooks so a coordinated device reset re-inits

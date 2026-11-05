@@ -111,6 +111,16 @@ amd_hwq_blocks(struct atrium_amd_softc *sc, struct atrium_amd_hwq *q,
 	return (q->vmid != vmid && amd_hwq_owes(sc, q));
 }
 
+/* Run the watchdog now (from the fault handler: sc->lock may be held). */
+void
+amd_hwq_kick_watchdog(struct atrium_amd_softc *sc)
+{
+	if (!sc->hwq_inited)
+		return;
+	sc->watchdog_armed = 1;
+	taskqueue_enqueue_timeout(taskqueue_thread, &sc->watchdog_task, 1);
+}
+
 /* Make sure the hang watchdog is running (there is kernel-rung work). */
 static void
 amd_hwq_arm_watchdog(struct atrium_amd_softc *sc)
@@ -249,6 +259,7 @@ amd_hwq_dequeue(struct atrium_amd_softc *sc, struct atrium_amd_hwq *q)
 	mtx_lock(&sc->lock);
 	/* The stopped work will raise no EOP: fail what it owed. */
 	amd_pending_fail_locked(sc, q->qid, EIO);
+	sc->qpend[q->qid].faulted = 0;
 	if (busy)
 		sc->iso.dequeues++;
 	mtx_unlock(&sc->lock);
@@ -276,6 +287,14 @@ amd_hwq_check_hang(struct atrium_amd_softc *sc, struct atrium_amd_hwq *q)
 		return (false);
 	rptr = q->vmid != 0 ? amd_hwq_rptr(sc, q) : 0;
 	mtx_lock(&sc->lock);
+	if (qp->faulted) {
+		/* A VM fault: its work is already wrong; stop it now. */
+		mtx_unlock(&sc->lock);
+		device_printf(sc->dev, "queue %u (VMID %u) faulted: stopped\n",
+		    q->qid, q->vmid);
+		amd_hwq_dequeue(sc, q);
+		return (true);
+	}
 	if (rptr != qp->last_rptr) {
 		qp->last_rptr = rptr;
 		qp->progress = ticks;
@@ -557,6 +576,11 @@ amd_hwq_submit(struct atrium_amd_softc *sc, struct atrium_amd_client *client,
 		q->wptr = n_dwords;
 		q->gen++;
 		mtx_lock(&sc->lock);
+		/* New work, possibly another VM's: a fault reported before
+		 * this point belonged to the work before it, unless that work
+		 * still owes completions (same VM), which must still fail. */
+		if (sc->qpend[q->qid].n == 0)
+			sc->qpend[q->qid].faulted = 0;
 		if (so != NULL)
 			(void)amd_pending_push_locked(sc, q->qid, so,
 			    signal_value);
@@ -859,12 +883,16 @@ amd_hwq_init(struct atrium_amd_softc *sc, device_t dev)
 	AMD_ISO_U64("deferred", deferred, "BO frees deferred");
 	AMD_ISO_U64("reaped", reaped, "deferred BO frees completed");
 	AMD_ISO_U64("hangs", hangs, "queues the hang watchdog stopped");
+	AMD_ISO_U64("vm_faults", vm_faults, "GPU VM fault interrupts");
 	AMD_ISO_U64("fences_failed", fences_failed,
 	    "owed completions failed with EIO (queue stopped or reset)");
 	AMD_ISO_INT("deferred_now", deferred_now, "deferred BO frees pending");
 	AMD_ISO_INT("grants_live", grants_live, "doorbell grant objects alive");
 #undef AMD_ISO_U64
 #undef AMD_ISO_INT
+	SYSCTL_ADD_U64(ctx, SYSCTL_CHILDREN(tree), OID_AUTO, "ih_overflows",
+	    CTLFLAG_RD, &sc->ih_overflows, 0,
+	    "interrupt passes where the device lapped the IH ring");
 	SYSCTL_ADD_PROC(ctx, SYSCTL_CHILDREN(tree), OID_AUTO, "hang_ms",
 	    CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_MPSAFE, sc, 0,
 	    amd_iso_sysctl_hang_ms, "I",

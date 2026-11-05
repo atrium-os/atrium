@@ -1041,6 +1041,33 @@ test_fault_reset(int fd, int vm)
 		return (1);
 	}
 
+	/* Interrupts survive the reset: the IH ring was re-armed, so an EOP
+	 * after it still signals a syncobj (the reset clears the device's IH
+	 * base and write pointer). */
+	close(so_fd);
+	memset(&cr, 0, sizeof(cr));
+	if (ioctl(fd, ATRIUM_GPU_IOC_SYNCOBJ_CREATE, &cr) != 0) {
+		printf("fault_reset: syncobj create failed\n");
+		return (1);
+	}
+	so_fd = (int)cr.out_fd;
+	memset(&s, 0, sizeof(s));
+	s.vm_fd = vm;
+	s.ring_fd = ring_h;
+	s.n_dwords = 9;
+	s.engine = ATRIUM_GPU_ENGINE_GFX;
+	s.signal_syncobj_fd = so_fd;
+	s.signal_value = 1;
+	wt.syncobj_fd = so_fd;
+	wt.value = 1;
+	wt.timeout_ms = 2000;
+	if (ioctl(fd, ATRIUM_GPU_IOC_SUBMIT, &s) != 0 ||
+	    ioctl(fd, ATRIUM_GPU_IOC_SYNCOBJ_WAIT, &wt) != 0) {
+		printf("fault_reset FAILED: no EOP interrupt after the reset "
+		    "(%s)\n", strerror(errno));
+		return (1);
+	}
+
 	close(so_fd);
 	printf("fault_reset OK: lost submit timed out, GPU reset recovered the "
 	    "engine (post-reset fence = 0x%llx)\n", (unsigned long long)fb);

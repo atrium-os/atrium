@@ -138,12 +138,20 @@ atrium_amd_ioctl(struct cdev *cdev, u_long cmd, caddr_t data, int fflag,
 		return (0);
 	}
 
-	case ATRIUM_GPU_IOC_VM_BIND: {
+	case ATRIUM_GPU_IOC_VM_BIND:
+	case ATRIUM_GPU_IOC_VM_BIND2: {
 		struct atrium_gpu_vm_bind *b = (struct atrium_gpu_vm_bind *)data;
+		struct atrium_gpu_vm_bind2 *b2 = (struct atrium_gpu_vm_bind2 *)data;
 		struct atrium_amd_vm *vm;
 		struct file *vmfp, *bofp;
-		uint64_t va = b->va;
+		uint64_t va = b->va;	/* va, vm_fd, bo_fd: same layout in both */
+		uint32_t flags = 0;
 
+		if (cmd == ATRIUM_GPU_IOC_VM_BIND2) {
+			if (b2->pad != 0)
+				return (EINVAL);
+			flags = b2->flags;
+		}
 		err = amd_vm_fget(td, b->vm_fd, &vmfp, &vm);
 		if (err != 0)
 			return (err);
@@ -152,7 +160,7 @@ atrium_amd_ioctl(struct cdev *cdev, u_long cmd, caddr_t data, int fflag,
 			fdrop(vmfp, td);
 			return (err);
 		}
-		err = amd_bo_bind(bo, vm, vmfp, &va);
+		err = amd_bo_bind(bo, vm, vmfp, &va, flags);
 		fdrop(bofp, td);
 		if (err != 0) {
 			fdrop(vmfp, td);	/* bind failed: BO did not take it */

@@ -175,6 +175,21 @@ struct atrium_gpu_syncobj_wait {
 	uint32_t	timeout_ms;	/* in: max wait (0 = check once) */
 };
 
+/*
+ * VM_BIND with flags (ABI rev 3). READONLY maps the BO without write access in
+ * that VM: a GPU store to it is a VM fault. The broker maps an app's code and
+ * constants this way (F6, docs/spec/gpu-app-path-f6.md). VM_BIND is VM_BIND2
+ * with no flags.
+ */
+struct atrium_gpu_vm_bind2 {
+	uint64_t	va;		/* in: GPU-VA (0 = auto); out: actual VA */
+	uint32_t	vm_fd;
+	uint32_t	bo_fd;
+	uint32_t	flags;		/* ATRIUM_GPU_BIND_* */
+	uint32_t	pad;		/* must be 0 */
+};
+#define ATRIUM_GPU_BIND_READONLY	0x1
+
 #define ATRIUM_GPU_IOC_BO_ALLOC		_IOWR('A', 0, struct atrium_gpu_bo_alloc)
 #define ATRIUM_GPU_IOC_BO_WRITE		_IOW('A', 1, struct atrium_gpu_bo_xfer)
 #define ATRIUM_GPU_IOC_BO_READ		_IOW('A', 2, struct atrium_gpu_bo_xfer)
@@ -254,5 +269,6 @@ struct atrium_gpu_powergate {
 	uint32_t wake_stall_us;		/* out: next workload's wake stall (0 = pre-woken) */
 };
 #define ATRIUM_GPU_IOC_POWERGATE	_IOWR('A', 26, struct atrium_gpu_powergate)
+#define ATRIUM_GPU_IOC_VM_BIND2		_IOWR('A', 27, struct atrium_gpu_vm_bind2)
 
 #endif /* _ATRIUM_GPU_AMD_ABI_H_ */

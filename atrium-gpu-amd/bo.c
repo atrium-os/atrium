@@ -377,13 +377,15 @@ amd_bo_gpu_va(struct atrium_amd_bo *bo, struct atrium_amd_vm *vm)
 
 int
 amd_bo_bind(struct atrium_amd_bo *bo, struct atrium_amd_vm *vm,
-    struct file *vm_fp, uint64_t *va)
+    struct file *vm_fp, uint64_t *va, uint32_t bind_flags)
 {
 	struct atrium_amd_softc *sc = bo->sc;
 	const uint64_t span = (uint64_t)bo->npages * PAGE_SIZE;
 	vmem_addr_t addr;
 	int i, err;
 
+	if ((bind_flags & ~ATRIUM_GPU_BIND_READONLY) != 0)
+		return (EINVAL);
 	if (bo->n_bindings >= ATRIUM_AMD_BO_MAX_BIND)
 		return (ENOSPC);	/* shared into too many VMs */
 	/* A BO maps at most once per VM: a second bind into the same VM would
@@ -417,7 +419,8 @@ amd_bo_bind(struct atrium_amd_bo *bo, struct atrium_amd_vm *vm,
 	 * same pages can map at independent VAs in different VMs. */
 	for (i = 0; i < bo->npages; i++) {
 		err = sc->backend->map_page(vm, addr + (uint64_t)i * PAGE_SIZE,
-		    bo->pages[i], bo->vram);
+		    bo->pages[i], bo->vram,
+		    (bind_flags & ATRIUM_GPU_BIND_READONLY) == 0);
 		if (err != 0) {
 			while (i-- > 0)
 				sc->backend->unmap_page(vm,

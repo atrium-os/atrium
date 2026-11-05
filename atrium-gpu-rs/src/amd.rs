@@ -85,6 +85,11 @@ struct VmCreate { out_fd: u32, pad: u32 }
 struct VmBind { va: u64, vm_fd: u32, bo_fd: u32 }
 #[repr(C)]
 #[derive(Default)]
+struct VmBind2 { va: u64, vm_fd: u32, bo_fd: u32, flags: u32, pad: u32 }
+/// `VM_BIND2` flag: map without GPU write access (driver ABI rev 3).
+pub const BIND_READONLY: u32 = 0x1;
+#[repr(C)]
+#[derive(Default)]
 struct Submit {
     signal_value: u64,
     vm_fd: u32,
@@ -361,6 +366,20 @@ pub struct Vm<'a> { gpu: &'a Gpu, fd: RawFd }
 
 impl<'a> Vm<'a> {
     /// Allocate a BO and bind it into this VM at an auto-assigned GPU-VA.
+    /// Allocate a BO mapped read-only for the GPU in this VM (`VM_BIND2`,
+    /// `BIND_READONLY`): a GPU store to it is a VM fault. The CPU still fills
+    /// it through [`Bo::write`]. For an app's code and constants (F6).
+    pub fn alloc_readonly(&self, size: u64, flags: u32) -> io::Result<Bo<'a>> {
+        let mut a = BoAlloc { size, flags, ..Default::default() };
+        unsafe { call(self.gpu.fd, iowr(G, 0, std::mem::size_of::<BoAlloc>()), &mut a)? };
+        let mut b = VmBind2 { vm_fd: self.fd as u32, bo_fd: a.bo_fd, flags: BIND_READONLY, ..Default::default() };
+        if let Err(e) = unsafe { call(self.gpu.fd, iowr(G, 27, std::mem::size_of::<VmBind2>()), &mut b) } {
+            unsafe { libc::close(a.bo_fd as RawFd) };
+            return Err(e);
+        }
+        Ok(Bo { gpu: self.gpu, fd: a.bo_fd as RawFd, gpu_va: b.va, size })
+    }
+
     pub fn alloc(&self, size: u64, flags: u32) -> io::Result<Bo<'a>> {
         let mut a = BoAlloc { size, flags, ..Default::default() };
         unsafe { call(self.gpu.fd, iowr(G, 0, std::mem::size_of::<BoAlloc>()), &mut a)? };

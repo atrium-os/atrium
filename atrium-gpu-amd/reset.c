@@ -76,6 +76,9 @@ amd_device_reset(struct atrium_amd_softc *sc)
 			hooks[i].prepare(sc);
 
 	err = amd_flr(sc);
+	/* The FLR forgot the IH ring; give it back before any block restarts. */
+	if (sc->ih_kva != NULL)
+		amd_ih_rearm(sc);
 
 	for (i = 0; i < ATRIUM_AMD_IP_COUNT; i++)
 		if (hooks[i].restore != NULL)

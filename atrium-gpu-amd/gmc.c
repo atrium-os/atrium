@@ -14,5 +14,11 @@ amd_gmc_init(struct atrium_amd_softc *sc)
 {
 	/* Enable GPUVM translation; per-VMID page-directory bases are set per VM. */
 	amd_mmio_write32(sc, regGMC_ENABLE, 1);
+	/*
+	 * Enforce PTE_WRITE: a GPU store to a page mapped without it faults.
+	 * Every bind sets it unless the binder asked for read-only (VM_BIND2).
+	 * Re-run after a reset, so it is never left off.
+	 */
+	amd_mmio_write32(sc, regVM_CNTL, VM_CNTL_WRITE_PROTECT);
 	return (0);
 }

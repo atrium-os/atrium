@@ -66,11 +66,27 @@ amd_ih_init(struct atrium_amd_softc *sc)
 		return (err != 0 ? err : EIO);
 	}
 
-	sc->ih_rptr = 0;
-	amd_mmio_write32(sc, regIH_BASE_LO, (uint32_t)(ih_gpa & 0xffffffff));
-	amd_mmio_write32(sc, regIH_BASE_HI, (uint32_t)(ih_gpa >> 32));
-	amd_mmio_write32(sc, regIH_SIZE, ATRIUM_AMD_IH_ENTRIES);
+	sc->ih_gpa = ih_gpa;
+	amd_ih_rearm(sc);
 	return (0);
+}
+
+/*
+ * Point the device at the IH ring and start reading from slot 0. Called at
+ * init and after every full reset: RESET_REQ clears the device's IH base, size
+ * and write pointer (gpusim bf008f1, as an FLR does on silicon), so without
+ * this a reset leaves the device with no ring (no EOPs, no faults) and our
+ * read pointer ahead of its write pointer.
+ */
+void
+amd_ih_rearm(struct atrium_amd_softc *sc)
+{
+	mtx_lock(&sc->lock);
+	sc->ih_rptr = 0;
+	amd_mmio_write32(sc, regIH_BASE_LO, (uint32_t)(sc->ih_gpa & 0xffffffff));
+	amd_mmio_write32(sc, regIH_BASE_HI, (uint32_t)(sc->ih_gpa >> 32));
+	amd_mmio_write32(sc, regIH_SIZE, ATRIUM_AMD_IH_ENTRIES);
+	mtx_unlock(&sc->lock);
 }
 
 void
@@ -113,9 +129,22 @@ amd_intr(void *arg)
 		counts[c] = 0;
 
 	mtx_lock(&sc->lock);
-	for (c = 0; c < ATRIUM_AMD_NHWQ; c++)
+	for (c = 0; c < ATRIUM_AMD_NHWQ; c++) {
 		sc->ih_eop_ring[c] = 0;
+		sc->ih_fault_ring[c] = 0;
+	}
 	wptr = amd_mmio_read32(sc, regIH_WPTR);
+	/*
+	 * More cookies than the ring holds: the device lapped us, so the oldest
+	 * are gone and the slots hold only the newest ATRIUM_AMD_IH_ENTRIES.
+	 * Read those once rather than walking stale slots for every lost one
+	 * (a fault storm once pushed 33M cookies in one pass). Lost EOPs leave
+	 * completions owed; the hang watchdog fails them.
+	 */
+	if (wptr - sc->ih_rptr > ATRIUM_AMD_IH_ENTRIES) {
+		sc->ih_overflows++;
+		sc->ih_rptr = wptr - ATRIUM_AMD_IH_ENTRIES;
+	}
 	while (sc->ih_rptr != wptr) {
 		idx = sc->ih_rptr % ATRIUM_AMD_IH_ENTRIES;
 		cookie = (const uint32_t *)((const char *)sc->ih_kva +
@@ -128,6 +157,15 @@ amd_intr(void *arg)
 		if (cause == ATRIUM_AMD_IH_CAUSE_EOP &&
 		    cookie[1] < ATRIUM_AMD_NHWQ)
 			sc->ih_eop_ring[cookie[1]]++;
+		/* A VM fault names its queue, VMID and page (dwords 1-3). All
+		 * cookies are tallied before any handler runs, so the EOP
+		 * handler already knows if its queue faulted in this pass. */
+		if (cause == ATRIUM_AMD_IH_CAUSE_VM_FAULT &&
+		    cookie[1] < ATRIUM_AMD_NHWQ) {
+			sc->ih_fault_ring[cookie[1]]++;
+			sc->ih_fault_vmid[cookie[1]] = cookie[2];
+			sc->ih_fault_page[cookie[1]] = cookie[3];
+		}
 		sc->ih_rptr++;
 	}
 	for (c = 0; c < ATRIUM_AMD_IH_NCAUSE; c++) {

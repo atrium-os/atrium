@@ -844,22 +844,46 @@ part_c(void)
  * hostile app's shader or packet stream will touch unmapped VAs; if that
  * wedges the whole engine until a reset, any app can stall every other.
  */
+static int
+submit_so(int fd, int vm, int ring, uint32_t n, uint32_t engine, int so,
+    uint64_t value)
+{
+	struct atrium_gpu_submit s;
+
+	memset(&s, 0, sizeof(s));
+	s.vm_fd = vm;
+	s.ring_fd = ring;
+	s.n_dwords = n;
+	s.engine = engine;
+	s.signal_syncobj_fd = so;
+	s.signal_value = value;
+	return (ioctl(fd, ATRIUM_GPU_IOC_SUBMIT, &s) == 0 ? 0 : errno);
+}
+
 static void
 part_d(void)
 {
-	uint64_t va, rva;
-	uint32_t r[16];
-	int fda, fdb, vma, vmb, ringa, ringb, resb, n, err;
+	struct atrium_gpu_vm_bind2 b2;
+	uint64_t va, rva, fva, faults0, ro_va;
+	uint32_t r[32], v;
+	int fda, fdb, vma, vmb, ringa, ringb, resb, fence, ro, so, n, err;
 
-	printf("Part D: a fault in one VM leaves the others running\n");
+	printf("Part D: faults cost only the VM that made them (F6 G1)\n");
 	fda = xopen(GPU);
 	vma = vm_create(fda);
 	ringa = bo_new(fda, vma, 4096, 0, &rva);
-	/* A: a store far outside anything bound in A's VM. */
+	fence = bo_new(fda, vma, 4096, 0, &fva);
+	so = syncobj_new(fda);
+	faults0 = iso("vm_faults");
+	/* A: a store far outside anything bound in A's VM, then an EOP. */
 	n = emit_write(r, 0x7f0000000000ull, 0xbad);
+	n += emit_eop(r + n, fva, 1);
 	bo_write(fda, ringa, r, n * 4);
-	err = submit(fda, vma, ringa, n, ATRIUM_GPU_ENGINE_COMPUTE);
-	printf("       (A's faulting submit returned %s)\n", strerror(err));
+	err = submit_so(fda, vma, ringa, n, ATRIUM_GPU_ENGINE_COMPUTE, so, 1);
+	CHECK(err == 0 && syncobj_wait(fda, so, 1, 3000) == EIO,
+	    "A's faulting work completes with EIO, not success");
+	CHECK(iso("vm_faults") > faults0, "the fault was reported (%llu)",
+	    (unsigned long long)(iso("vm_faults") - faults0));
 
 	fdb = xopen(GPU);
 	vmb = vm_create(fdb);
@@ -877,6 +901,34 @@ part_d(void)
 	CHECK(err == 0 && bo_read32(fdb, resb) == 0xc0c0,
 	    "B's compute work runs on the queue A faulted on (%s, 0x%x)",
 	    strerror(err), bo_read32(fdb, resb));
+
+	/* A read-only binding (VM_BIND2): GPU stores to it fault. */
+	ro = bo_new(fda, -1, 4096, 0, &ro_va);
+	v = SENTINEL;
+	bo_write(fda, ro, &v, 4);
+	memset(&b2, 0, sizeof(b2));
+	b2.vm_fd = vma;
+	b2.bo_fd = ro;
+	b2.flags = ATRIUM_GPU_BIND_READONLY;
+	CHECK(ioctl(fda, ATRIUM_GPU_IOC_VM_BIND2, &b2) == 0,
+	    "VM_BIND2 maps a BO read-only at 0x%llx", (unsigned long long)b2.va);
+	b2.flags = 0x80;
+	CHECK(ioctl(fda, ATRIUM_GPU_IOC_VM_BIND2, &b2) != 0 && errno == EINVAL,
+	    "an unknown bind flag is refused");
+	close(so);
+	so = syncobj_new(fda);
+	faults0 = iso("vm_faults");
+	n = emit_write(r, b2.va, 0xbad);
+	n += emit_eop(r + n, fva, 2);
+	bo_write(fda, ringa, r, n * 4);
+	err = submit_so(fda, vma, ringa, n, ATRIUM_GPU_ENGINE_COMPUTE, so, 1);
+	CHECK(err == 0 && syncobj_wait(fda, so, 1, 3000) == EIO &&
+	    bo_read32(fda, ro) == SENTINEL && iso("vm_faults") > faults0,
+	    "a GPU store to it faults, leaves it intact, and fails the work");
+
+	close(so);
+	close(ro);
+	close(fence);
 	close(ringb);
 	close(resb);
 	close(vmb);

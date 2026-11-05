@@ -184,7 +184,8 @@ amd_vm_close(struct file *fp, struct thread *td)
  * outside it is EINVAL (the bump allocator never produces one).
  */
 int
-amd_vm_map(struct atrium_amd_vm *vm, uint64_t va, vm_paddr_t phys, int vram)
+amd_vm_map(struct atrium_amd_vm *vm, uint64_t va, vm_paddr_t phys, int vram,
+    int writable)
 {
 	struct atrium_amd_softc *sc = vm->sc;
 	uint64_t pte;
@@ -202,6 +203,8 @@ amd_vm_map(struct atrium_amd_vm *vm, uint64_t va, vm_paddr_t phys, int vram)
 	pte = ((uint64_t)phys & ~0xfffULL) | ATRIUM_AMD_PTE_VALID;
 	if (vram)
 		pte |= ATRIUM_AMD_PTE_VRAM;
+	if (writable)
+		pte |= ATRIUM_AMD_PTE_WRITE;
 	mtx_lock(&sc->lock);
 	pt[pt_i] = pte;
 	amd_mmio_write32(sc, regTLB_INVALIDATE, 1);

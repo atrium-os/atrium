@@ -83,6 +83,8 @@
 #define regPT_BASE_LO		0x5a3c	/* GC: GCVM_CONTEXT0_PAGE_TABLE_BASE_LO32 */
 #define regPT_BASE_HI		0x5a40	/* GC: ..._HI32 */
 #define regTLB_INVALIDATE	0x591c	/* GC: GCVM_INVALIDATE_ENG0_REQ */
+#define regVM_CNTL		0x20088	/* SIM: bit 0 = enforce PTE_WRITE */
+#define VM_CNTL_WRITE_PROTECT	0x1
 #define regIH_SIZE		0x10200	/* OSS: IH_RB_CNTL (ring size in entries) */
 #define regIH_WPTR		0x10208	/* OSS: IH_RB_WPTR (device's write pointer) */
 #define regIH_BASE_LO		0x1020c	/* OSS: IH_RB_BASE */
@@ -227,6 +229,7 @@
  */
 #define ATRIUM_AMD_PTE_VALID	0x1ULL
 #define ATRIUM_AMD_PTE_VRAM	0x2ULL	/* page is device VRAM (else System/GTT) */
+#define ATRIUM_AMD_PTE_WRITE	0x4ULL	/* GPU may write (enforced once VM_CNTL.WP) */
 #define ATRIUM_AMD_VRAM_BYTES	(256ULL << 20)	/* BAR0 VRAM capacity */
 #define ATRIUM_AMD_PD_SHIFT	21
 #define ATRIUM_AMD_PT_SHIFT	12
@@ -331,7 +334,7 @@ struct atrium_gpu_backend_ops {
 	void	(*bo_free)(struct atrium_amd_bo *bo);
 	/* Map / unmap one page of a BO into a VM at a GPU-VA (amd: a GPUVM PTE). */
 	int	(*map_page)(struct atrium_amd_vm *vm, uint64_t va,
-		    vm_paddr_t phys, int vram);
+		    vm_paddr_t phys, int vram, int writable);
 	void	(*unmap_page)(struct atrium_amd_vm *vm, uint64_t va);
 	/* Submit a prepared ring on an engine in a VM (amd: PM4 ring + doorbell,
 	 * under the queue's lock; EBUSY if another client owns the queue or
@@ -494,11 +497,13 @@ struct atrium_amd_qpend {
 	int		 head, n;
 	int		 progress;
 	uint32_t	 last_rptr;
+	int		 faulted;	/* its current work hit a VM fault */
 };
 #define ATRIUM_AMD_IH_CAUSE_EOP	1	/* IH cookie cause: end-of-pipe (device.rs) */
 #define ATRIUM_AMD_IH_CAUSE_VBLANK 2	/* IH cookie cause: DCN vertical blank */
 #define ATRIUM_AMD_IH_CAUSE_FLIP 3	/* IH cookie cause: DCN flip landed on screen */
-#define ATRIUM_AMD_IH_NCAUSE	4	/* dispatch-table size (causes 0..N-1) */
+#define ATRIUM_AMD_IH_CAUSE_VM_FAULT 4	/* GPUVM fault: queue, VMID, page (gpusim 013b62b) */
+#define ATRIUM_AMD_IH_NCAUSE	5	/* dispatch-table size (causes 0..N-1) */
 
 /*
  * IH cause handler: the device-global interrupt ring is owned by the BASE
@@ -602,6 +607,7 @@ struct atrium_amd_isolation_stats {
 	uint64_t	 reaped;	/* deferred BO frees completed */
 	uint64_t	 hangs;		/* queues the watchdog stopped */
 	uint64_t	 fences_failed;	/* completions failed with EIO */
+	uint64_t	 vm_faults;	/* VM fault interrupts */
 	int		 deferred_now;	/* deferred BO frees outstanding */
 	int		 grants_live;	/* grant pager objects alive */
 };
@@ -688,12 +694,17 @@ struct atrium_amd_softc {
 	bus_dma_tag_t	 ih_tag;	/* bus_dma tag for the ring page */
 	bus_dmamap_t	 ih_map;	/* bus_dma map for the ring page */
 	uint32_t	 ih_rptr;	/* our read pointer into the IH ring */
+	uint64_t	 ih_overflows;	/* passes where the device lapped the ring */
+	bus_addr_t	 ih_gpa;	/* the ring's bus address (re-armed on reset) */
 	atrium_amd_ih_handler ih_handler[ATRIUM_AMD_IH_NCAUSE]; /* cause -> handler */
 	u_int		 irq_count;	/* interrupts serviced (atomic vs reader) */
 	struct mtx	 lock;		/* guards fence-wait sleep/wakeup + pending */
 	int		 lock_inited;
 	struct atrium_amd_qpend qpend[ATRIUM_AMD_NHWQ]; /* owed, per queue */
 	uint32_t	 ih_eop_ring[ATRIUM_AMD_NHWQ]; /* this ISR pass's EOPs */
+	uint32_t	 ih_fault_ring[ATRIUM_AMD_NHWQ]; /* ... and VM faults */
+	uint32_t	 ih_fault_vmid[ATRIUM_AMD_NHWQ]; /* last fault's VMID */
+	uint32_t	 ih_fault_page[ATRIUM_AMD_NHWQ]; /* last fault's VA >> 12 */
 
 	uint32_t	 vmid_bitmap;	/* allocated VMIDs (bit N = VMID N in use) */
 	int		 vm_count;	/* live vm_fds */
@@ -780,7 +791,7 @@ int	 amd_bo_fget(struct thread *td, int fd, struct file **out_fp,
  * into several VMs — sharing). On success the binding takes over vm_fp; on error
  * the caller keeps it. */
 int	 amd_bo_bind(struct atrium_amd_bo *bo, struct atrium_amd_vm *vm,
-	    struct file *vm_fp, uint64_t *va);
+	    struct file *vm_fp, uint64_t *va, uint32_t bind_flags);
 /* The BO's base GPU-VA in `vm`, or 0 if it is not bound there. */
 uint64_t amd_bo_gpu_va(struct atrium_amd_bo *bo, struct atrium_amd_vm *vm);
 /* amd backend: allocate/free a BO's backing (bus_dma System pages or a VRAM
@@ -800,7 +811,7 @@ int	 amd_vm_create_fd(struct atrium_amd_softc *sc, struct thread *td,
 int	 amd_vm_fget(struct thread *td, int fd, struct file **out_fp,
 	    struct atrium_amd_vm **out_vm);
 int	 amd_vm_map(struct atrium_amd_vm *vm, uint64_t va, vm_paddr_t phys,
-	    int vram);
+	    int vram, int writable);
 void	 amd_vm_unmap(struct atrium_amd_vm *vm, uint64_t va);
 /* amd backend hardware setup/teardown of a VM's GPUVM (the front-end owns the
  * struct + fd; these own the VMID + page tables + PT base). */
@@ -918,6 +929,7 @@ extern const struct fileops atrium_amd_syncobj_fileops;
 
 /* ih.c (BASE module) — MSI-X interrupt setup + the device-global IH ring ISR */
 int	 amd_irq_setup(struct atrium_amd_softc *sc);
+void	 amd_ih_rearm(struct atrium_amd_softc *sc);
 void	 amd_irq_teardown(struct atrium_amd_softc *sc);
 
 /*
@@ -929,6 +941,8 @@ void	 amd_irq_teardown(struct atrium_amd_softc *sc);
  * its queue is stopped or hangs, and scrubbed by a syncobj's fo_close.
  */
 void	 amd_eop_handler(struct atrium_amd_softc *sc, int count);
+void	 amd_fault_handler(struct atrium_amd_softc *sc, int count);
+void	 amd_hwq_kick_watchdog(struct atrium_amd_softc *sc);
 int	 amd_pending_push_locked(struct atrium_amd_softc *sc, uint32_t qid,
 	    struct atrium_amd_syncobj *so, uint64_t value);
 int	 amd_pending_fail_locked(struct atrium_amd_softc *sc, uint32_t qid,

@@ -50,14 +50,53 @@ amd_eop_handler(struct atrium_amd_softc *sc, int count __unused)
 		if (n == 0)
 			continue;
 		qp->progress = ticks;
+		if (sc->ih_fault_ring[q] != 0)
+			qp->faulted = 1;
 		while (n > 0 && qp->n > 0) {
 			amd_pending_pop_locked(qp, &p);
-			if (p.so != NULL)
+			/* Work that faulted ran with stores dropped and loads
+			 * reading zero: it finished, but not correctly. */
+			if (p.so != NULL && qp->faulted) {
+				amd_syncobj_fail(p.so, EIO);
+				sc->iso.fences_failed++;
+			} else if (p.so != NULL)
 				amd_syncobj_signal(p.so, p.value);
 			n--;
 		}
 	}
 	wakeup(&sc->irq_count);
+}
+
+/*
+ * VM fault cause handler (sc->lock held). Marks the queue's current work as
+ * faulted, so its completions fail with EIO (here or in the EOP handler), and
+ * asks the watchdog to stop the queue now if it is still running: a fault
+ * costs that VM its work at once rather than after hang_ms. gpusim reports
+ * faults on ring fetch, packet DMA and shader loads and stores (013b62b).
+ */
+void
+amd_fault_handler(struct atrium_amd_softc *sc, int count)
+{
+	static struct timeval last;
+	static int pps;
+	int q, any = 0;
+
+	mtx_assert(&sc->lock, MA_OWNED);
+	sc->iso.vm_faults += count;
+	for (q = 0; q < ATRIUM_AMD_NHWQ; q++) {
+		if (sc->ih_fault_ring[q] == 0)
+			continue;
+		sc->qpend[q].faulted = 1;
+		any = 1;
+		if (ppsratecheck(&last, &pps, 5))
+			device_printf(sc->dev, "VM fault: queue %d VMID %u "
+			    "GPU-VA 0x%llx (%u this pass)\n", q,
+			    sc->ih_fault_vmid[q],
+			    (unsigned long long)sc->ih_fault_page[q] << 12,
+			    sc->ih_fault_ring[q]);
+	}
+	if (any)
+		amd_hwq_kick_watchdog(sc);
 }
 
 /*
