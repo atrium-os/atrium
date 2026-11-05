@@ -518,3 +518,50 @@ fn a_worker_is_never_sent_an_unnamed_blob() {
     blocked(image(&mut n, s, &f.unnamed), "does not name");
     assert_eq!(n.host().status(s), Status::Open);
 }
+
+/// ★ AN SVG IMAGE ZOOMS AS A VECTOR (backend §4.9): after each zoom it is
+/// rasterised AGAIN at painted size x device scale x zoom — not a bitmap
+/// scaled up — charged once within the document's decode budget, and a zoom
+/// that would take it past the budget is refused, never clamped.
+fn an_svg_image_is_rasterised_again_at_every_zoom<H: DocumentHost>(n: Navigatord<H>) {
+    let svg = br##"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 40 40"><circle cx="20" cy="20" r="16" fill="#ff0000"/></svg>"##.to_vec();
+    let a = address(&svg);
+    let mut blobs = MemoryStore::default();
+    blobs.put(&svg).unwrap();
+    // 2x device scale, as in the PNG test.
+    let mut n = n.with_blobs(Box::new(blobs)).with_device_scale(128);
+    let s = open(&mut n, &recording_with_images(std::slice::from_ref(&a)));
+    for zoom in [32u32, 48, 64, 96, 128, 160, 192] {
+        n.set_zoom(s, zoom).unwrap();
+        let want = 100 * 2 * zoom / 64;
+        match image_at(&mut n, s, &a, (100, 100)) {
+            Event::Image { pixels, .. } => {
+                assert_eq!((pixels.width, pixels.height), (want, want), "zoom {zoom}/64");
+                // Drawn at that size: the circle's centre is red and opaque,
+                // a corner (outside r = 16/40) is clear.
+                let px = |x: u32, y: u32| { let i = ((y * want + x) * 4) as usize; [pixels.rgba[i], pixels.rgba[i + 1], pixels.rgba[i + 2], pixels.rgba[i + 3]] };
+                assert_eq!(px(want / 2, want / 2), [255, 0, 0, 255], "zoom {zoom}/64: the centre");
+                assert_eq!(px(0, 0)[3], 0, "zoom {zoom}/64: a corner");
+            }
+            other => panic!("zoom {zoom}/64: {other:?}"),
+        }
+        assert_eq!(n.decoded_bytes(s), (want * want * 4) as usize, "zoom {zoom}/64: charged once, at what is kept");
+    }
+    // ★ The budget binds at the zoomed size: 2048 x 2048 CSS px at 2x is
+    // 64 MiB at 100% and 576 MiB at 300% — over the 256 MiB per document.
+    n.set_zoom(s, 64).unwrap();
+    assert!(matches!(image_at(&mut n, s, &a, (2048, 2048)), Event::Image { pixels, .. } if pixels.width == 4096));
+    n.set_zoom(s, 192).unwrap();
+    blocked(image_at(&mut n, s, &a, (2048, 2048)), "budget");
+}
+
+#[test]
+fn the_in_process_broker_rasterises_an_svg_again_at_every_zoom() {
+    an_svg_image_is_rasterised_again_at_every_zoom(Navigatord::unconfined_for_testing(InProcessHost::default()));
+}
+
+#[test]
+fn the_jailed_broker_rasterises_an_svg_again_at_every_zoom() {
+    let host = JailedHost::new(WorkerConfig::unconfined_for_testing(WORKER), SessionLimits::default());
+    an_svg_image_is_rasterised_again_at_every_zoom(Navigatord::unconfined_for_testing(host));
+}
