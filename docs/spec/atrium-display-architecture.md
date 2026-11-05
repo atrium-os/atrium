@@ -253,6 +253,36 @@ bandwidth limits — §8).
   (`FRESCOD_VRR=0` opts out). No pacing change was needed: it already
   renders on damage and commits when the frame is ready.
 
+### 7.4 v2.3 HDR (implemented 2026-11-05)
+
+- **What the monitor offers.** The shared parser reads the CTA-861.3 HDR
+  Static Metadata Data Block (EOTFs, the luminance it wants content
+  mastered for) and the Colorimetry Data Block (BT.2020 RGB)
+  (`atrium_edid_hdr_caps`). The HDR ioctl (`'D', 67`) reports them as bit
+  masks of `EOTF_*` / `COLORIMETRY_*` (SDR and the default always) and
+  decoded luminances; CONNECTOR flags `HDR`, and `HDR_ACTIVE` while an HDR
+  EOTF is signalled.
+- **Signalling.** HDR with `SET` gives the EOTF (SDR, traditional HDR, PQ,
+  HLG), the colorimetry and CTA-861.3 static metadata type 1. It takes
+  effect with the next successful commit, flip or MODESET, so the monitor
+  switches with the first frame rendered for it. `EINVAL` for an EOTF or
+  colorimetry the monitor doesn't offer. A MODESET onto a monitor that no
+  longer takes the signalled state falls back to SDR.
+- **10-bit scanout.** `FORMAT_XRGB2101010` (B 9:0, G 19:10, R 29:20).
+  The format is the commit's; HDR doesn't require it, but 8-bit PQ bands.
+- **Shared infoframes, driver hook.** `atrium-display/` builds the DRM
+  (0x87) and AVI (0x82) infoframes; the optional
+  `send_infoframes(hw, frames, n)` hook sends them every frame (n 0 stops).
+  AMD writes them to VPG0's generic packets and has DIG0 send them, and
+  re-sends them after a device reset. Colour pipeline (degamma, CSC,
+  regamma) is left in bypass: the surface's code values reach the monitor.
+- **Policy.** frescod stays SDR by default. `FRESCOD_HDR=1` on an HDR10
+  monitor switches the stream to HDR10 and re-encodes each frame on the way
+  to scanout: sRGB to linear, BT.709 to BT.2020, SDR white at 203 cd/m²
+  (BT.2408), PQ into 10 bits. The desktop looks as it did; HDR content can
+  later go above white. The gpu renderer draws straight into scanout, so it
+  stays SDR. A hotplug re-decides.
+
 ## 8. The output topology — connectors, encoders, PHYs (HDMI / DP / USB-C)
 
 "How does the driver detect and redirect output to HDMI vs DisplayPort vs

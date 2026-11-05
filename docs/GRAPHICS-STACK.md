@@ -231,6 +231,13 @@ frescod uses it whenever the range covers the mode, so frames go up when
 ready and an idle screen drops to the monitor's floor
 ([§7.3](spec/atrium-display-architecture.md)).
 
+Display 2.3 adds HDR: the monitor's HDR and BT.2020 support from its EDID,
+an HDR ioctl that signals PQ / HLG with static metadata from the next
+commit, and a 10-bit XRGB2101010 scanout format. The infoframes are built
+in `atrium-display/`; the driver only sends them (AMD: VPG generic packets).
+frescod stays SDR unless `FRESCOD_HDR=1`, which runs the desktop as HDR10
+with SDR white at 203 cd/m² ([§7.4](spec/atrium-display-architecture.md)).
+
 ## 6. Userspace bindings and protocols
 
 - **`atrium-gpu-rs`**: Rust binding. `atrium_gpu::amd::{Gpu, Vm, Bo, Syncobj,

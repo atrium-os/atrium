@@ -109,6 +109,7 @@ compute route chosen; security conditions F1–F6 in
 | D4 real DCN 4.0.1 scanout/flip/vblank registers in gpusim + display kmod (modeset still `regDISP_*`) | done; display tests, `atrium_gpu_test`, `test_gpu_isolation`, jailed frescod pass on gpusim | gpusim `3f37036`, `e3b0658` |
 | Modes, EDID and hotplug (display 2.1): shared EDID/CTA-861 parser + per-driver hooks (`atrium-display/`), any listed mode via OTG timing, `NOTE_HOTPLUG`; frescod switches mode on a WM request or hotplug, forum-wm re-lays out, `forum-ctl mode WxH[@Hz]` | done on gpusim; `display_modes` 7/7 in the VM | gpusim `a140c6a`, `192a47a`; atrium `aeca87e` and after |
 | Variable refresh (display 2.2): range from the EDID, `COMMIT_VRR`, OTG `V_TOTAL_MIN/MAX`; frescod turns it on when the monitor's range covers the mode | done on gpusim; `display_vrr` in the VM | gpusim `b972fb2`; atrium `display 2.2` commits |
+| HDR (display 2.3): HDR caps from the EDID, HDR ioctl (PQ / HLG, BT.2020, static metadata, from the next commit), XRGB2101010 scanout, infoframes via VPG; frescod HDR10 desktop with `FRESCOD_HDR=1` | done on gpusim; `display_hdr` 6/6 in the VM | gpusim `ec7a71d`; atrium `display 2.3` commits |
 | D5 silicon display (inherit GOP mode first) | not started (needs native boot on the R9700; it has no monitor) | — |
 
 Slice detail: [spec/fresco-f4-split.md](spec/fresco-f4-split.md). The whole display stack as it stands: [GRAPHICS-STACK.md](GRAPHICS-STACK.md). Screenshots

@@ -5255,6 +5255,7 @@ In the guest:
 | `FRESCOD_CHROME_SOCK` | trusted chrome: `OPEN_CLIENT` then `SET_ORIGIN` (F4d strip) |
 | `FRESCOD_DAMAGE_THRESHOLD` | damage tracking tuning (gpu backend rasters only dirty tiles) |
 | `FRESCOD_GPU_ISOLATION_PROBE=1` | F4e check (gpu renderer): every window after the first rasters to the first window's surface address; expect EIO faults (`isolation.vm_faults`) and window 1 intact |
+| `FRESCOD_HDR=1` | HDR10 desktop on a monitor that takes PQ in BT.2020: frames re-encoded to 10-bit PQ, SDR white at 203 cd/m² (compute and Vulkan renderers; the gpu renderer stays SDR). Off by default |
 | `FRESCOD_VRR=0` | fixed refresh even when the monitor offers variable refresh (on by default when its range covers the mode) |
 | `FRESCOD_MODE=WxH[@Hz]` | start in this mode if the monitor lists it (else its preferred mode); also the pick for a newly plugged monitor |
 | `FRESCOD_GPU_SOCK` | F6 app GPU channel: one GPU context + VM per connection (≤ 4 per uid); `FRESCOD_GPU_ONLY=1` serves only this channel. Test with `atrium-gpu-fuzz` (honest / hostile / isa) |
@@ -5264,9 +5265,12 @@ modes (`*` = lit), `forum-ctl mode 1280x720` or `mode 1920x1080@120`
 switches (`FORUM_CTL_SOCKET` if forum-wm runs bare). Swap the simulated
 monitor under a running frescod with `sysctl
 dev.atrium_gpu_amd_display.0.sim_plug=N` (0 VGA, 1 1080p, 2 4K, 3 the
-five-mode desktop monitor, -1 unplug; host root only). Kernel checks:
-`display_modes` and `display_vrr` (need the display free, so stop frescod
-first). After changing gpusim's QEMU device, copy `qemu-device/gpusim.c`
+five-mode desktop monitor, -1 unplug; host root only); the desktop
+monitor declares HDR, the others don't. `sysctl -n
+dev.atrium_gpu_amd_display.0.sim_sink` shows what the simulated monitor
+decodes (EOTF, BT.2020, MaxCLL/MaxFALL, bits per colour). Kernel checks:
+`display_modes`, `display_vrr` and `display_hdr` (need the display free, so
+stop frescod first). After changing gpusim's QEMU device, copy `qemu-device/gpusim.c`
 into the QEMU fork and rebuild it, then restart the VM and gpusim-server. Don't
 `kldunload` the GPU modules while frescod or a renderer runs; reboot.
 
