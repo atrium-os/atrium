@@ -337,6 +337,21 @@ impl Connection {
         self.scene_node_set(node_id, scene_ops::ATRIUM_CORE_RECT, &params)
     }
 
+    /// Convenience: install a filled path (atrium-core FILL op).
+    pub fn scene_node_fill(&mut self, node_id: u32, params: &fresco_protocol::FillParams)
+        -> io::Result<()>
+    {
+        self.scene_node_set(node_id, scene_ops::ATRIUM_CORE_FILL, params)
+    }
+
+    /// Convenience: move, zoom or re-clip an existing fill without
+    /// re-sending its geometry (atrium-core FILL_TRANSFORM op).
+    pub fn scene_node_fill_transform(&mut self, node_id: u32, params: fresco_protocol::FillTransformParams)
+        -> io::Result<()>
+    {
+        self.scene_node_set(node_id, scene_ops::ATRIUM_CORE_FILL_TRANSFORM, &params)
+    }
+
     /// Convenience: install a texture node (atrium-core TEXTURE op).
     pub fn scene_node_texture(&mut self, node_id: u32, params: TextureParams)
         -> io::Result<()>

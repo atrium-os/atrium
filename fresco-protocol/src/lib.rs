@@ -914,6 +914,12 @@ pub mod scene_ops {
     pub const ATRIUM_CORE_TEXTURE: u32 = 0x1001;
     pub const ATRIUM_CORE_PATH:    u32 = 0x1002;
     pub const ATRIUM_CORE_GLYPH:   u32 = 0x1003;
+    /// A filled path ([`super::FillParams`]).
+    pub const ATRIUM_CORE_FILL:    u32 = 0x1004;
+    /// New transform, opacity and clip for an existing FILL node
+    /// ([`super::FillTransformParams`]): zoom and scroll without
+    /// re-sending the geometry.
+    pub const ATRIUM_CORE_FILL_TRANSFORM: u32 = 0x1005;
 
     // atrium-text (0x2000..=0x2FFF). M6.1 ships atlas-based glyph runs;
     // 0x2001..=0x2FFF reserved for future text ops (color-emoji glyph
@@ -981,6 +987,111 @@ pub struct PathParams {
     pub g: f32,
     pub b: f32,
     pub a: f32,
+}
+
+/// Fill verbs ([`FillParams::verbs`]): move takes 1 point, line 1,
+/// quadratic 2, cubic 3, close 0.
+pub mod fill_verb {
+    pub const MOVE: u8 = 0;
+    pub const LINE: u8 = 1;
+    pub const QUAD: u8 = 2;
+    pub const CUBIC: u8 = 3;
+    pub const CLOSE: u8 = 4;
+}
+
+/// Bound on fill path-space coordinates (before the transform).
+pub const FILL_MAX_COORD: f32 = 32768.0;
+/// Most verbs, and most points, one FILL node may carry.
+pub const FILL_MAX_VERBS: usize = 1 << 18;
+
+/// How a FILL is painted. Colours are linear RGB, straight alpha, like
+/// every other node's. Gradients come as further variants.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub enum FillPaint {
+    Solid { r: f32, g: f32, b: f32, a: f32 },
+}
+
+/// Params for `scene_ops::ATRIUM_CORE_FILL`: one filled path. Fresco
+/// never strokes; a client turns strokes into fills. The coverage rule,
+/// flattening (0.25 px) and limits are fresco-compute's `fill` module's.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct FillParams {
+    /// 0 nonzero, 1 even-odd.
+    pub rule: u8,
+    /// `[a, b, c, d, e, f]`: x' = a x + c y + e, y' = b x + d y + f, path
+    /// space to window pixels. It carries scroll and zoom.
+    pub transform: [f32; 6],
+    pub paint: FillPaint,
+    /// Multiplies the paint's alpha.
+    pub opacity: f32,
+    /// Window pixels `[x0, y0, x1, y1)`; `None`: the whole window.
+    pub clip: Option<[f32; 4]>,
+    /// [`fill_verb`]s; the first is a move.
+    pub verbs: Vec<u8>,
+    /// Path space, within ±[`FILL_MAX_COORD`].
+    pub points: Vec<[f32; 2]>,
+}
+
+/// Params for `scene_ops::ATRIUM_CORE_FILL_TRANSFORM`, sent with the
+/// node id of an existing FILL.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct FillTransformParams {
+    pub transform: [f32; 6],
+    pub opacity: f32,
+    pub clip: Option<[f32; 4]>,
+}
+
+fn finite(v: &[f32]) -> bool {
+    v.iter().all(|c| c.is_finite())
+}
+
+impl FillTransformParams {
+    pub fn validate(&self) -> Result<(), &'static str> {
+        if !finite(&self.transform) || !self.opacity.is_finite() || self.clip.is_some_and(|c| !finite(&c)) {
+            return Err("fill transform, opacity or clip not finite");
+        }
+        Ok(())
+    }
+}
+
+impl FillParams {
+    /// What frescod (and a broker in front of it) checks before taking the
+    /// node: known verbs with the right number of points, a move first,
+    /// every point finite and within ±[`FILL_MAX_COORD`], finite
+    /// transform, paint and clip, a known rule.
+    pub fn validate(&self) -> Result<(), &'static str> {
+        if self.rule > 1 {
+            return Err("unknown fill rule");
+        }
+        if self.verbs.len() > FILL_MAX_VERBS || self.points.len() > FILL_MAX_VERBS {
+            return Err("too many verbs or points");
+        }
+        let FillPaint::Solid { r, g, b, a } = self.paint;
+        if !finite(&[r, g, b, a]) {
+            return Err("paint not finite");
+        }
+        FillTransformParams { transform: self.transform, opacity: self.opacity, clip: self.clip }.validate()?;
+        let mut need = 0usize;
+        for (i, &v) in self.verbs.iter().enumerate() {
+            need += match v {
+                fill_verb::MOVE | fill_verb::LINE => 1,
+                fill_verb::QUAD => 2,
+                fill_verb::CUBIC => 3,
+                fill_verb::CLOSE => 0,
+                _ => return Err("unknown verb"),
+            };
+            if i == 0 && v != fill_verb::MOVE {
+                return Err("a path starts with a move");
+            }
+        }
+        if need != self.points.len() {
+            return Err("points do not match the verbs");
+        }
+        if self.points.iter().flatten().any(|c| !c.is_finite() || c.abs() > FILL_MAX_COORD) {
+            return Err("point not finite or past the coordinate bound");
+        }
+        Ok(())
+    }
 }
 
 /// Params for `scene_ops::ATRIUM_TEXT_GLYPH_RUN`.

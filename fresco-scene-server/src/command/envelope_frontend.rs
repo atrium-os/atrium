@@ -41,7 +41,7 @@ use fresco_protocol::{
     control, decode, encode, scene_ops,
     SceneNodeSetPayload, SceneNodeClearPayload,
     SlotSetPayload, SlotClearPayload, SlotUpdateRegionPayload, SlotKind, TextureFormat,
-    RectParams, TextureParams, PathParams, GlyphRunParams,
+    RectParams, TextureParams, PathParams, GlyphRunParams, FillParams, FillTransformParams,
     WindowCreatePayload, WindowDestroyPayload,
     WindowSetTitlePayload, WindowSetHintsPayload,
     WindowRequestClosePayload, WindowPresentPayload,
@@ -75,6 +75,7 @@ pub struct WindowSceneState {
     pub texture_nodes:   HashMap<u32, TextureParams>,
     pub path_nodes:      HashMap<u32, PathParams>,
     pub glyph_run_nodes: HashMap<u32, GlyphRunParams>,
+    pub fill_nodes:      HashMap<u32, FillParams>,
     pub slot_table:      HashMap<u32, [u8; 32]>,
     pub in_frame:        bool,
 
@@ -630,6 +631,7 @@ impl EnvelopeFrontend {
                 s.texture_nodes.remove(&id);
                 s.path_nodes.remove(&id);
                 s.glyph_run_nodes.remove(&id);
+                s.fill_nodes.remove(&id);
                 s.node_writers.remove(&id);
             }
 
@@ -773,6 +775,7 @@ impl EnvelopeFrontend {
                 s.texture_nodes.remove(&p.node_id);
                 s.path_nodes.remove(&p.node_id);
                 s.glyph_run_nodes.remove(&p.node_id);
+                s.fill_nodes.remove(&p.node_id);
             }
             scene_ops::ATRIUM_CORE_TEXTURE => {
                 let inner: TextureParams = decode(&p.params)
@@ -781,6 +784,7 @@ impl EnvelopeFrontend {
                 s.rect_nodes.remove(&p.node_id);
                 s.path_nodes.remove(&p.node_id);
                 s.glyph_run_nodes.remove(&p.node_id);
+                s.fill_nodes.remove(&p.node_id);
             }
             scene_ops::ATRIUM_CORE_PATH => {
                 let inner: PathParams = decode(&p.params)
@@ -789,6 +793,7 @@ impl EnvelopeFrontend {
                 s.rect_nodes.remove(&p.node_id);
                 s.texture_nodes.remove(&p.node_id);
                 s.glyph_run_nodes.remove(&p.node_id);
+                s.fill_nodes.remove(&p.node_id);
             }
             scene_ops::ATRIUM_TEXT_GLYPH_RUN => {
                 let inner: GlyphRunParams = decode(&p.params)
@@ -797,6 +802,30 @@ impl EnvelopeFrontend {
                 s.rect_nodes.remove(&p.node_id);
                 s.texture_nodes.remove(&p.node_id);
                 s.path_nodes.remove(&p.node_id);
+                s.fill_nodes.remove(&p.node_id);
+            }
+            scene_ops::ATRIUM_CORE_FILL => {
+                let inner: FillParams = decode(&p.params)
+                    .map_err(|_| DispatchError::BadPayload)?;
+                inner.validate().map_err(|e| {
+                    log::debug!("SCENE_NODE_SET fill {}: {e}", p.node_id);
+                    DispatchError::BadPayload
+                })?;
+                s.fill_nodes.insert(p.node_id, inner);
+                s.rect_nodes.remove(&p.node_id);
+                s.texture_nodes.remove(&p.node_id);
+                s.path_nodes.remove(&p.node_id);
+                s.glyph_run_nodes.remove(&p.node_id);
+            }
+            scene_ops::ATRIUM_CORE_FILL_TRANSFORM => {
+                let t: FillTransformParams = decode(&p.params)
+                    .map_err(|_| DispatchError::BadPayload)?;
+                t.validate().map_err(|_| DispatchError::BadPayload)?;
+                /* Only an existing fill changes; geometry is kept. */
+                let f = s.fill_nodes.get_mut(&p.node_id).ok_or(DispatchError::BadPayload)?;
+                f.transform = t.transform;
+                f.opacity = t.opacity;
+                f.clip = t.clip;
             }
             other => {
                 /* Unknown / unbundled op-id. The closed registry per
@@ -820,6 +849,7 @@ impl EnvelopeFrontend {
             s.texture_nodes.remove(&p.node_id);
             s.path_nodes.remove(&p.node_id);
             s.glyph_run_nodes.remove(&p.node_id);
+            s.fill_nodes.remove(&p.node_id);
             s.node_writers.remove(&p.node_id);
         }
         Ok(Vec::new())
@@ -1505,6 +1535,49 @@ mod tests {
         let (uploads, _) = f.take_pending_uploads();
         assert!(!uploads.iter().any(|u|
             matches!(u, UploadRequest::TextureRegion { slot_id: 9, .. })));
+    }
+
+    #[test]
+    fn fill_node_validates_and_takes_transform_updates() {
+        use fresco_protocol::{fill_verb as v, FillPaint};
+        let mut f = fixture();
+        let set = |f: &mut EnvelopeFrontend, node_id: u32, op_id: u32, params: Vec<u8>| {
+            let outer = SceneNodeSetPayload { node_id, op_id, params };
+            f.dispatch(&msg(control::OP_SCENE_NODE_SET, 0, encode(&outer).unwrap()), 1)
+        };
+        let tri = FillParams {
+            rule: 0,
+            transform: [1.0, 0.0, 0.0, 1.0, 0.0, 0.0],
+            paint: FillPaint::Solid { r: 1.0, g: 0.0, b: 0.0, a: 1.0 },
+            opacity: 1.0,
+            clip: None,
+            verbs: vec![v::MOVE, v::LINE, v::LINE, v::CLOSE],
+            points: vec![[0.0, 0.0], [10.0, 0.0], [0.0, 10.0]],
+        };
+        set(&mut f, 3, scene_ops::ATRIUM_CORE_FILL, encode(&tri).unwrap()).expect("fill");
+        assert_eq!(f.window_state(0).unwrap().fill_nodes[&3], tri);
+        // Zoom: the geometry stays, the transform changes.
+        let t = FillTransformParams { transform: [2.0, 0.0, 0.0, 2.0, 5.0, -900.0], opacity: 0.5, clip: Some([0.0, 0.0, 50.0, 50.0]) };
+        set(&mut f, 3, scene_ops::ATRIUM_CORE_FILL_TRANSFORM, encode(&t).unwrap()).expect("transform");
+        let got = &f.window_state(0).unwrap().fill_nodes[&3];
+        assert_eq!((got.transform, got.opacity, got.clip, &got.points), (t.transform, 0.5, t.clip, &tri.points));
+        // Refused: a transform for a node that is not a fill, a point past
+        // the bound, a verb with too few points, NaN.
+        assert!(set(&mut f, 9, scene_ops::ATRIUM_CORE_FILL_TRANSFORM, encode(&t).unwrap()).is_err());
+        let mut bad = tri.clone();
+        bad.points[1] = [40000.0, 0.0];
+        assert!(set(&mut f, 4, scene_ops::ATRIUM_CORE_FILL, encode(&bad).unwrap()).is_err());
+        let mut bad = tri.clone();
+        bad.verbs.push(v::CUBIC);
+        assert!(set(&mut f, 4, scene_ops::ATRIUM_CORE_FILL, encode(&bad).unwrap()).is_err());
+        let mut bad = tri.clone();
+        bad.transform[0] = f32::NAN;
+        assert!(set(&mut f, 4, scene_ops::ATRIUM_CORE_FILL, encode(&bad).unwrap()).is_err());
+        assert!(!f.window_state(0).unwrap().fill_nodes.contains_key(&4));
+        // A rect on the same id replaces the fill.
+        let r = RectParams { x: 0.0, y: 0.0, w: 1.0, h: 1.0, r: 1.0, g: 1.0, b: 1.0, a: 1.0, radius: 0.0 };
+        set(&mut f, 3, scene_ops::ATRIUM_CORE_RECT, encode(&r).unwrap()).expect("rect");
+        assert!(f.window_state(0).unwrap().fill_nodes.is_empty());
     }
 
     #[test]

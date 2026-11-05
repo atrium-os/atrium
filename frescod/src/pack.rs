@@ -29,6 +29,8 @@ pub struct WindowFrame {
     pub paths: Vec<PathNode>,
     pub batches: Vec<TextureBatch>,
     pub glyph_batches: Vec<GlyphRunBatch>,
+    /// Filled paths, in node id order (drawn after `paths`).
+    pub fills: Vec<fresco_compute::fill::Fill>,
 }
 
 /// A window's finished pixels, BGRA8, `width * height` words.
@@ -147,6 +149,7 @@ impl SceneState {
             paths: f.paths.iter().map(|n| fc::Path {
                 model: n.model, angle: n.extra[0], color: n.color,
             }).collect(),
+            fills: f.fills.clone(),
             ..Default::default()
         };
         let mut index: HashMap<u32, usize> = HashMap::new();
@@ -219,6 +222,11 @@ pub fn window_frame(fe: &EnvelopeFrontend, id: u32, pos: (f32, f32), size: (f32,
     for id in path_ids {
         w.paths.push(translate_path(&state.path_nodes[id], 0.0, 0.0));
     }
+    let mut fill_ids: Vec<&u32> = state.fill_nodes.keys().collect();
+    fill_ids.sort_unstable();
+    for id in fill_ids {
+        w.fills.push(translate_fill(&state.fill_nodes[id]));
+    }
     let mut tex_by_slot: std::collections::BTreeMap<u32, Vec<TextureNode>> =
         std::collections::BTreeMap::new();
     let mut tex_ids: Vec<&u32> = state.texture_nodes.keys().collect();
@@ -276,6 +284,19 @@ fn translate_rect(p: &RectParams, ox: f32, oy: f32) -> SceneNode {
         color:    [p.r, p.g, p.b, p.a],
         radius:   p.radius,
         _pad:     [0.0; 3],
+    }
+}
+
+fn translate_fill(p: &fresco_protocol::FillParams) -> fresco_compute::fill::Fill {
+    use fresco_compute::fill::{Fill, FillRule};
+    let fresco_protocol::FillPaint::Solid { r, g, b, a } = p.paint;
+    Fill {
+        verbs: p.verbs.clone(),
+        points: p.points.clone(),
+        transform: p.transform,
+        rule: if p.rule == 1 { FillRule::EvenOdd } else { FillRule::NonZero },
+        color: [r, g, b, a * p.opacity],
+        clip: p.clip,
     }
 }
 
