@@ -274,6 +274,10 @@ pub(crate) enum MInst {
     GUn { op: GUnOp, d: VReg, a: VReg },
     GDiv { kind: DivKind, d: VReg, a: VReg, b: VReg },
     GCmp { cc: ICond, d: VReg, a: VReg, b: VReg },
+    /// GBin, GShift and GCmp with a constant right operand.
+    GBinI { op: GOp, d: VReg, a: VReg, imm: i32 },
+    GShiftI { op: ShiftOp, d: VReg, a: VReg, imm: u8 },
+    GCmpI { cc: ICond, d: VReg, a: VReg, imm: i32 },
     FCmp { cc: FCond, d: VReg, a: VReg, b: VReg },
     GSelect { d: VReg, c: VReg, t: VReg, f: VReg },
     GLoad { d: VReg, addr: Addr },
@@ -351,7 +355,9 @@ impl MInst {
                 out.push(*b);
             }
             XFma { a, b, c, .. } => out.extend([*a, *b, *c]),
-            XUn { a, .. } | GUn { a, .. } => out.push(*a),
+            XUn { a, .. } | GUn { a, .. } | GBinI { a, .. } | GShiftI { a, .. } | GCmpI { a, .. } => {
+                out.push(*a)
+            }
             CvtSToF { a, .. } | CvtUToF { a, .. } | CvtFToS { a, .. } | CvtFToU { a, .. } => {
                 out.push(*a)
             }
@@ -397,6 +403,9 @@ impl MInst {
             | GUn { d, .. }
             | GDiv { d, .. }
             | GCmp { d, .. }
+            | GBinI { d, .. }
+            | GShiftI { d, .. }
+            | GCmpI { d, .. }
             | FCmp { d, .. }
             | GSelect { d, .. }
             | GLoad { d, .. }
@@ -2095,7 +2104,11 @@ pub(crate) fn sink_compares(vc: &mut VCode) {
     let mut i = 0;
     while i < vc.insts.len() {
         let d = match &vc.insts[i] {
-            MInst::GCmp { d, .. } | MInst::FCmp { d, .. } if use_count[d.0 as usize] == 1 => *d,
+            MInst::GCmp { d, .. } | MInst::GCmpI { d, .. } | MInst::FCmp { d, .. }
+                if use_count[d.0 as usize] == 1 =>
+            {
+                *d
+            }
             _ => {
                 i += 1;
                 continue;
@@ -2121,5 +2134,63 @@ pub(crate) fn sink_compares(vc: &mut VCode) {
             }
         }
         i += 1;
+    }
+}
+
+impl ICond {
+    /// The condition with the operands swapped (a < b  ==  b > a).
+    fn swapped(self) -> ICond {
+        use ICond::*;
+        match self {
+            Eq => Eq,
+            Ne => Ne,
+            Ult => Ugt,
+            Ugt => Ult,
+            Ule => Uge,
+            Uge => Ule,
+            Slt => Sgt,
+            Sgt => Slt,
+            Sle => Sge,
+            Sge => Sle,
+        }
+    }
+}
+
+/// Turn integer ops with a constant operand into their immediate forms;
+/// the constants themselves then usually die in DCE.
+pub(crate) fn fold_immediates(vc: &mut VCode) {
+    let mut defs = vec![0u32; vc.classes.len()];
+    let mut consts: HashMap<VReg, i32> = HashMap::new();
+    let mut tmp = Vec::new();
+    for inst in &vc.insts {
+        tmp.clear();
+        inst.defs(&mut tmp);
+        for v in &tmp {
+            defs[v.0 as usize] += 1;
+        }
+        if let MInst::GConst { d, imm } = inst {
+            consts.insert(*d, *imm);
+        }
+    }
+    consts.retain(|v, _| defs[v.0 as usize] == 1);
+    let k = |v: &VReg| consts.get(v).copied();
+    for inst in vc.insts.iter_mut() {
+        let new = match *inst {
+            MInst::GBin { op, d, a, b } => match (k(&a), k(&b)) {
+                (_, Some(imm)) => Some(MInst::GBinI { op, d, a, imm }),
+                (Some(imm), None) if op.commutative() => Some(MInst::GBinI { op, d, a: b, imm }),
+                _ => None,
+            },
+            MInst::GShift { op, d, a, b } => k(&b).map(|imm| MInst::GShiftI { op, d, a, imm: (imm & 31) as u8 }),
+            MInst::GCmp { cc, d, a, b } => match (k(&a), k(&b)) {
+                (_, Some(imm)) => Some(MInst::GCmpI { cc, d, a, imm }),
+                (Some(imm), None) => Some(MInst::GCmpI { cc: cc.swapped(), d, a: b, imm }),
+                _ => None,
+            },
+            _ => None,
+        };
+        if let Some(n) = new {
+            *inst = n;
+        }
     }
 }

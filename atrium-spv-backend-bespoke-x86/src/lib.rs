@@ -216,6 +216,7 @@ fn exported_symbol_name(func: &Function) -> String {
 fn emit_function(func: &Function) -> Result<(Vec<u8>, Vec<(u32, u32)>), BackendError> {
     let mut vc = vcode::lower(func)?;
     vcode::thread_jumps(&mut vc);
+    vcode::fold_immediates(&mut vc);
     vcode::dce(&mut vc);
     vcode::sink_compares(&mut vc);
     let al = regalloc::allocate(&vc);

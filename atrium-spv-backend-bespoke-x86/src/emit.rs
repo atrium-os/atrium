@@ -162,7 +162,7 @@ pub(crate) fn emit(vc: &VCode, alloc: &Allocation) -> Result<(Vec<u8>, Vec<(u32,
                 j += 1;
             }
             let d = match inst {
-                MInst::GCmp { d, .. } | MInst::FCmp { d, .. } => *d,
+                MInst::GCmp { d, .. } | MInst::GCmpI { d, .. } | MInst::FCmp { d, .. } => *d,
                 _ => unreachable!(),
             };
             let consumer = match insts.get(j) {
@@ -242,7 +242,7 @@ impl Cc {
 fn fused_cc(inst: &MInst) -> Option<Cc> {
     use FCond::*;
     Some(match inst {
-        MInst::GCmp { cc, .. } => match cc {
+        MInst::GCmp { cc, .. } | MInst::GCmpI { cc, .. } => match cc {
             ICond::Eq => Cc::E,
             ICond::Ne => Cc::Ne,
             ICond::Ult => Cc::B,
@@ -649,6 +649,30 @@ impl<'a> Emit<'a> {
                 self.g_fin(*d, rd)?;
             }
             M::GDiv { kind, d, a, b } => self.div(*kind, *d, *a, *b)?,
+            M::GCmpI { d, .. } => {
+                self.cmp_flags(inst)?;
+                let cc = fused_cc(inst).expect("integer condition");
+                self.setcc_al(cc)?;
+                self.bool_from_al(*d)?;
+            }
+            M::GBinI { op, d, a, imm } => self.gbin_imm(*op, *d, *a, *imm)?,
+            M::GShiftI { op, d, a, imm } => {
+                let rd = self.g_dst(*d);
+                let ga = self.g(*a);
+                if ga.reg() != Some(rd) {
+                    g2!(self.a, mov, rd, ga)?;
+                }
+                if *imm != 0 {
+                    let i = *imm as u32;
+                    match op {
+                        ShiftOp::Shl => self.a.shl(rd, i),
+                        ShiftOp::LShr => self.a.shr(rd, i),
+                        ShiftOp::AShr => self.a.sar(rd, i),
+                    }
+                    .map_err(enc)?;
+                }
+                self.g_fin(*d, rd)?;
+            }
             M::GCmp { cc, d, a, b } => {
                 let ra = self.g_reg(*a, eax)?;
                 g2!(self.a, cmp, ra, self.g(*b))?;
@@ -854,6 +878,10 @@ impl<'a> Emit<'a> {
                 let ra = self.g_reg(*a, eax)?;
                 g2!(self.a, cmp, ra, self.g(*b))
             }
+            MInst::GCmpI { a, imm, .. } => match self.g(*a) {
+                G::R(r) => self.a.cmp(r, *imm).map_err(enc),
+                G::M(m) => self.a.cmp(m, *imm).map_err(enc),
+            },
             MInst::FCmp { cc, a, b, .. } => {
                 let (x, y) = match cc {
                     OrdLt | OrdLe | UnordGt | UnordGe => (*b, *a),
@@ -1187,6 +1215,49 @@ impl<'a> Emit<'a> {
             g2!(self.a, mov, rd, ga)?;
             apply(&mut self.a, op, rd, gb)
         }
+    }
+
+    fn setcc_al(&mut self, cc: Cc) -> Result<(), BackendError> {
+        let a = &mut self.a;
+        match cc {
+            Cc::E => a.sete(al),
+            Cc::Ne => a.setne(al),
+            Cc::B => a.setb(al),
+            Cc::Be => a.setbe(al),
+            Cc::A => a.seta(al),
+            Cc::Ae => a.setae(al),
+            Cc::L => a.setl(al),
+            Cc::Le => a.setle(al),
+            Cc::G => a.setg(al),
+            Cc::Ge => a.setge(al),
+        }
+        .map_err(enc)
+    }
+
+    fn gbin_imm(&mut self, op: GOp, d: VReg, a: VReg, imm: i32) -> Result<(), BackendError> {
+        let ga = self.g(a);
+        let rd = self.g_dst(d);
+        match (op, ga) {
+            (GOp::Mul, G::R(x)) => self.a.imul_3(rd, x, imm).map_err(enc)?,
+            (GOp::Mul, G::M(m)) => self.a.imul_3(rd, m, imm).map_err(enc)?,
+            (GOp::Add, G::R(x)) if x != rd => self.a.lea(rd, ptr(to64(x) + imm)).map_err(enc)?,
+            _ => {
+                if ga.reg() != Some(rd) {
+                    g2!(self.a, mov, rd, ga)?;
+                }
+                let a = &mut self.a;
+                match op {
+                    GOp::Add => a.add(rd, imm),
+                    GOp::Sub => a.sub(rd, imm),
+                    GOp::And => a.and(rd, imm),
+                    GOp::Or => a.or(rd, imm),
+                    GOp::Xor => a.xor(rd, imm),
+                    GOp::Mul => unreachable!(),
+                }
+                .map_err(enc)?;
+            }
+        }
+        self.g_fin(d, rd)
     }
 
     fn shift(&mut self, op: ShiftOp, d: VReg, a: VReg, b: VReg) -> Result<(), BackendError> {
