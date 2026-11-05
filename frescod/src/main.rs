@@ -256,20 +256,25 @@ fn main() -> std::io::Result<()> {
         .map_err(io_other)?;
     renderer.present(&scan, on_screen, &mut framebuffer, frame_deadline_ns, (&copy_done, frame))
         .map_err(io_other)?;
-    check_fault("modeset", dpy.modeset_fenced(
-        scan.buffer(on_screen), mode_index as u32, conn.generation, 0,
+    let vrr = use_vrr(&conn, &mode);
+    check_fault("modeset", dpy.modeset_vrr(
+        scan.buffer(on_screen), mode_index as u32, conn.generation, 0, vrr,
         Some((&copy_done, frame)), Some((&flip_done, frame)),
     ).or_else(|e| {
         /* MODESET doesn't wait for its in-fence: if the copy is still
          * running, wait for it and retry once. */
         if e.raw_os_error() == Some(libc::EAGAIN) {
             copy_done.wait(frame, flip_timeout_ms())?;
-            dpy.modeset_fenced(scan.buffer(on_screen), mode_index as u32, conn.generation, 0,
+            dpy.modeset_vrr(scan.buffer(on_screen), mode_index as u32, conn.generation, 0, vrr,
                 None, Some((&flip_done, frame)))
         } else {
             Err(e)
         }
     })?)?;
+    if vrr {
+        let (lo, hi) = conn.vrr.unwrap_or_default();
+        eprintln!("frescod: variable refresh on ({lo}-{hi} Hz): a frame goes up as soon as it is ready");
+    }
 
     /* ── Damage-driven present (task #25) ────────────────────────────
      * Recompose + flip only when a producer signalled `redraw`; otherwise
@@ -370,7 +375,8 @@ fn main() -> std::io::Result<()> {
                             match Scanout::with_buffers(&vm, bytes, SCANOUT_BUFFERS) {
                                 Err(e) => Err(e),
                                 Ok(fresh) => {
-                                    let r = dpy.modeset_at(fresh.buffer(0), i as u32, conn.generation, 0);
+                                    let r = dpy.modeset_vrr(fresh.buffer(0), i as u32, conn.generation, 0,
+                                        use_vrr(&conn, &m), None, None);
                                     if matches!(r, Ok(0)) {
                                         renderer.resize(&vm, m.width, m.height, load_bundles).map_err(io_other)?;
                                         scan = fresh;
@@ -381,13 +387,15 @@ fn main() -> std::io::Result<()> {
                                 }
                             }
                         } else {
-                            dpy.modeset_at(scan.buffer(on_screen), i as u32, conn.generation, 0)
+                            dpy.modeset_vrr(scan.buffer(on_screen), i as u32, conn.generation, 0,
+                                use_vrr(&conn, &m), None, None)
                         };
                         match fault {
                             Ok(0) => {
-                                eprintln!("frescod: mode {}x{} @ {} mHz -> {}x{} @ {} mHz{}",
+                                eprintln!("frescod: mode {}x{} @ {} mHz -> {}x{} @ {} mHz{}{}",
                                     mode.width, mode.height, mode.refresh_mhz,
                                     m.width, m.height, m.refresh_mhz,
+                                    if use_vrr(&conn, &m) { ", variable refresh" } else { "" },
                                     if hotplug { " (monitor changed)" } else { "" });
                                 mode = m;
                                 mode_index = i;
@@ -723,6 +731,18 @@ fn parse_mode(v: &str) -> Option<(u32, u32, u32)> {
 
 /// The listed mode matching (width, height, refresh mHz): refresh 0 takes
 /// the first at that size, else the closest within 1 Hz.
+/// Run `mode` with variable refresh: the monitor has a range that covers the
+/// mode's refresh, and FRESCOD_VRR isn't 0. Frames then go up as soon as they
+/// are rendered (no waiting for the next fixed refresh slot), and an idle
+/// screen refreshes at the monitor's floor.
+fn use_vrr(conn: &atrium_gpu::amd::ConnectorV2, mode: &ModeV2) -> bool {
+    if std::env::var("FRESCOD_VRR").is_ok_and(|v| v == "0") {
+        return false;
+    }
+    let hz = (mode.refresh_mhz + 500) / 1000;
+    conn.vrr.is_some_and(|(lo, hi)| (lo..=hi).contains(&hz))
+}
+
 fn find_mode(modes: &[ModeV2], want: Option<(u32, u32, u32)>) -> Option<usize> {
     let (w, h, r) = want?;
     let mut sized = modes.iter().enumerate().filter(|(_, m)| m.width == w && m.height == h);

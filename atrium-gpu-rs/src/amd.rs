@@ -183,7 +183,8 @@ struct DConnectorV2 {
     out_edid_len: u32,
     out_mode_count: u32,
     out_current_mode: u32,
-    pad: u32,
+    out_vrr_min_hz: u16,
+    out_vrr_max_hz: u16,
     out_edid: [u8; 512],
     out_modes: [ModeV2; 16],
 }
@@ -206,6 +207,12 @@ struct DStatusV2 {
 pub const COMMIT_MODESET: u32 = 0x1;
 pub const COMMIT_ASYNC: u32 = 0x2;
 pub const COMMIT_TEST_ONLY: u32 = 0x4;
+/// (2.2) With MODESET: variable refresh across the monitor's range.
+pub const COMMIT_VRR: u32 = 0x8;
+/// CONNECTOR flags (`ATRIUM_DISPLAY_CONNECTOR_*`).
+pub const CONNECTOR_CONNECTED: u32 = 0x1;
+pub const CONNECTOR_VRR: u32 = 0x2;
+pub const CONNECTOR_VRR_ACTIVE: u32 = 0x4;
 /// `ATRIUM_DISPLAY_FORMAT_XRGB8888`: B,G,R,X in memory.
 pub const FORMAT_XRGB8888: u32 = 0;
 /// Display referee faults (`ATRIUM_DISPLAY_FAULT_*`).
@@ -731,6 +738,10 @@ pub struct ConnectorV2 {
     pub modes: Vec<ModeV2>,
     /// Index in `modes` of the lit mode, if any.
     pub current: Option<usize>,
+    /// The variable refresh range `(min_hz, max_hz)`, if the monitor has one.
+    pub vrr: Option<(u32, u32)>,
+    /// The lit mode runs with variable refresh.
+    pub vrr_active: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -776,6 +787,9 @@ impl Display {
             edid: c.out_edid[..(c.out_edid_len as usize).min(512)].to_vec(),
             modes: c.out_modes[..n].to_vec(),
             current: (c.out_current_mode as usize).lt(&n).then_some(c.out_current_mode as usize),
+            vrr: (c.out_flags & CONNECTOR_VRR != 0)
+                .then_some((u32::from(c.out_vrr_min_hz), u32::from(c.out_vrr_max_hz))),
+            vrr_active: c.out_flags & CONNECTOR_VRR_ACTIVE != 0,
         })
     }
 
@@ -804,11 +818,28 @@ impl Display {
         in_fence: Option<(&Syncobj<'_>, u64)>,
         out_fence: Option<(&Syncobj<'_>, u64)>,
     ) -> io::Result<u32> {
+        self.modeset_vrr(bo, index, generation, pitch, false, in_fence, out_fence)
+    }
+
+    /// [`Self::modeset_fenced`], with variable refresh on (`vrr`) or off
+    /// (display ABI 2.2; `EINVAL` if the monitor has no VRR range or the
+    /// mode's refresh is outside it).
+    #[allow(clippy::too_many_arguments)]
+    pub fn modeset_vrr(
+        &self,
+        bo: &Bo<'_>,
+        index: u32,
+        generation: u32,
+        pitch: u32,
+        vrr: bool,
+        in_fence: Option<(&Syncobj<'_>, u64)>,
+        out_fence: Option<(&Syncobj<'_>, u64)>,
+    ) -> io::Result<u32> {
         let (in_fd, in_v) = in_fence.map_or((-1, 0), |(s, v)| (s.fd, v));
         let (out_fd, out_v) = out_fence.map_or((-1, 0), |(s, v)| (s.fd, v));
         let mut c = DCommit {
             struct_size: std::mem::size_of::<DCommit>() as u32,
-            flags: COMMIT_MODESET,
+            flags: COMMIT_MODESET | if vrr { COMMIT_VRR } else { 0 },
             mode_index: index,
             format: FORMAT_XRGB8888,
             bo_fd: bo.fd,
