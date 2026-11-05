@@ -1499,6 +1499,268 @@ needed.** `navigator-prerender/src/geometry.rs`, the geometry natives in `boa_im
   - A faster layout for repeat reads: the 8-layout budget is what bounds Walgreens'
     3,956 reads.
 
+#### 5.4.5.7 Time to first display (2026-11-05: measured, then built)
+
+**The goal**, as agreed: first display in under 1 s for 90% of pages, and no conversion
+makes a reader wait for the whole pipeline. "First display" is the moment a reader can
+see the document: the main document fetched, a recording converted, then normalized and
+rendered. Before this section, the only recording was the whole one: scripts, layouts and
+exploration all ran before anything could be shown.
+
+**Method.**
+- *The instrument* (a1566441, `timing.rs`). The converter times each phase as exclusive
+  spans on a stack, so a fetch inside a layout inside a script is charged once, to the
+  fetch. Each phase is also recorded inclusively. Every fetch is logged with its kind,
+  start, duration and bytes. The driver's relay records curl's own DNS, TCP, TLS,
+  first-byte and total time for each request. The driver times the display path in-process:
+  recording ingest, normalize, and render at the 800 px reading width (fonts loaded once,
+  ~16 ms, not counted). Output is `PRERENDER_TIMING`, one line per document.
+  `PRERENDER_TIER1=1` converts without scripts.
+- *The pages.* Both corpora, 122 pages. Each main document was fetched live once with
+  curl, timed (`main.tsv`). Four pages appear in both batches and are counted in each.
+- *The arms.* All on one machine (M4 Max), on its home network, sequential, one document
+  at a time:
+  - *cold:* online, every cache empty;
+  - *warm:* offline, from the cold arm's cache.
+  - Step 1 used the curl measurement fetcher: fetchd ran only on FreeBSD then. It has
+    the same shape as fetchd (one request at a time, a new connection per request).
+  - The after arms ran through the real fetchd, unconfined on macOS (`--unconfined-for-
+    testing`, step 4): the same serve loop, protocol, address rule and pins.
+- *Two disturbances, stated.*
+  - The network dropped from ~12:40 to 13:10 IST. That made batch 2 of the cold
+    whole-pipeline arm, and both cold after arms, fetch almost nothing; they "finished"
+    in 39 s. Those runs were repeated into new directories with a fresh cache, and only
+    the clean runs are reported. ★ An arm that finishes fast is a finding about the
+    network before it is one about the converter. Per-arm fetch-failure counts are now
+    checked before any arm is read.
+  - Another workload (~5 cores) started at 16:40, after every arm had finished. It
+    overlaps only the normalizer timings at the end, which are therefore given as
+    interleaved ratios.
+- Data, scripts (`analyze.py`, `final.py`, `parts.py`) and the binaries' hashes are in
+  `~/src/navigator-corpus/ttfd-2026-11-05/`, outside the repo.
+
+**Measured: where a cold conversion's time goes** (the whole pipeline, as it was; ms per
+document; 114 converted, 8 timed out at the 180 s deadline).
+
+| phase | docs > 0 | p50 | p90 | p99 | top |
+|---|---|---|---|---|---|
+| main document fetch | 114 | 815 | 2,889 | 9,554 | asahi 10.4 s, th.wikipedia 9.8 s, ynet 8.2 s |
+| · DNS / TCP / TLS (p50) | | 104 / 71 / 95 | 773 / 263 / 305 | | |
+| html parse | 113 | 2.3 | 12 | 33 | |
+| script fetch | 98 | 2,406 | 19,083 | 32,442 | craigslist 42 s, pinterest 33 s |
+| module fetch + mirror | 23 | 0 | 1,048 | 29,273 | mastodon 67 s |
+| subresource fetch (sheets, images) | 79 | 1,908 | 31,448 | 118,137 | ar.wikipedia 177 s, nasa 124 s |
+| page fetch (the page's own XHR/fetch) | 17 | 0 | 517 | 16,996 | |
+| layout fetch (images for geometry) | 33 | 0 | 13,859 | 54,786 | simonwillison 57 s |
+| **all fetches** | 112 | **11,940** | **61,855** | **140,420** | |
+| js parse + compile | 101 | 24 | 730 | 2,635 | doc21 2.8 s, walgreens 2.7 s |
+| js execute (classic) | 97 | 4.9 | 100 | 3,158 | npr 3.6 s, asahi 3.6 s |
+| js modules / events + timers | | 0 / 0.7 | 21 / 105 | 872 / 482 | |
+| layout passes (geometry) | 33 | 0 | 2,420 | 19,132 | ynet 22 s, ikea 19 s |
+| exploration (inclusive) | 100 | 1.4 | 527 | 12,077 | ocw.mit.edu 34 s |
+| serialize + emit | 111 | 1.9 | 7 | 14 | |
+| **conversion** | 114 | **13,517** | **66,196** | **142,213** | ar.wikipedia 178 s |
+| display: normalize | 114 | 302 | 2,915 | 12,483 | coreutils manual 25.6 s, ko.wikipedia 13 s |
+| display: render (800 px) | 114 | 39 | 230 | 978 | |
+
+Warm (offline from that cache), the conversion is 404 / 4,582 / 20,315 ms (p50 / p90 /
+p99). Its tail is layouts (ynet 22 s), exploration (bbcgoodfood 8.6 s) and JS parse +
+compile (p90 728 ms). Display normalize, at p90 3.0 s, is then the largest single phase.
+
+**Findings.**
+1. ★★ **Fetches were strictly serial, one connection each.** The intervals of 0 of 114
+   cold conversions overlapped (union = sum: 2,754 s). Over 4,580 network requests,
+   connection setup (DNS + TCP + TLS) was 1,147 s of 2,709 s fetching. 962 s of that was
+   to a host the same conversion had already connected to. Fetches are ~90% of a cold
+   conversion. **All 8 timeouts are fetch-bound.** Serial subresource fetches alone took
+   19–111 s on them, even with no script run (the tier-1 arm). corriere passed 180 s
+   with its images alone.
+2. **Tier 1 is not cheap cold.** With no script run, time to tier 1 is p50 8.5 s and
+   p90 45 s, because the parsed document's stylesheets and images are fetched serially.
+   Warm, it is p50 1.6 s and p90 7.0 s; that is normalize.
+3. **The network floor from here.** The main document alone is under 1 s for 75 of 122
+   pages (61%), at p50 814 ms and p90 2.9 s; DNS alone has a p90 of 773 ms. So the goal
+   cannot be met for 90% of pages on this connection, however fast the rest is. Every
+   result below is therefore also given **from the main document's arrival**, which is
+   the part the Navigator owns.
+4. **Normalize is the display path's cost**, and it had a quadratic: the coreutils manual
+   took 25.6 s. That was fixed while measuring (below).
+5. Scripts are the smaller cost. JS parse + compile has p90 0.7 s and execution p90
+   0.1 s; their tails (asahi, npr, walgreens: 2.7–3.6 s) are per-library. A bytecode cache
+   for common libraries would help those few pages, not the distribution.
+
+**Built (2026-11-05): steps 2–4, and the normalizer's quadratic.**
+
+*Step 2, progressive display.* The converter delivers the tier-1 conversion first, and the
+broker shows it; the scripted conversion replaces it later, if it is worth replacing.
+- *Converter* (`convert_progressive`, `PRERENDER_PROGRESSIVE=1`, serve header
+  `progressive=1`). The child sends `FIRST` (the tier-1 recording: parsed, its stylesheets
+  and image sizes collected, no script fetched or run, tier 1 with the reason "first
+  display: scripts not run yet") the moment it exists. It then runs the scripted
+  conversion on the same fetch memo, so no stylesheet or image is pulled twice. The driver
+  relay accepts the frames in order only, and `drive_streaming` hands each to its caller
+  as it arrives.
+- *Broker* (`progressive.rs`; `Upgrade`, `Swap`, `Attach`).
+  - `Upgrade { session, recording }` carries the scripted conversion's readable
+    recording. It is ingested, profile-checked and compared with the shown document at
+    once, off the reader's path.
+  - *"Meaningfully different"* is what a reader would see (`difference`): words as a
+    multiset (moved text is not new text) and image sources. Fewer than 8 changed words,
+    or under 1% of the document's words, with the same images, is not meaningful. Then the
+    event is `UpgradeKept`, and nothing on screen changes. Otherwise the document is held
+    and the event is `UpgradeReady`.
+  - *How "replaced" appears.* The UI sends `Swap { session, anchor }` at an idle moment
+    of its choosing: no scroll in progress, no input, nothing animating. The anchor is the
+    element at the top of the viewport and the offset into it. The answer is
+    `Replaced { anchor }`, the same reading position in the new document. The UI keeps the
+    old scene on screen until the new one is composed, scrolled to that anchor, and
+    presents it in one frame. There is no blank frame, no fade and no jump. A page whose
+    scripts inserted content above the reader stays still under them, because the
+    position is an element and not a scroll offset.
+  - *The anchor* (`map_anchor`). The element is found in the new document by identity:
+    its `id`; otherwise its tag, its own text and the attributes that name content.
+    Among elements that share a key, it is matched by ordinal, and only when both
+    documents have the same number of them. If the element did not survive, the nearest
+    one that did is used, searching document order above first, then ancestry, and the
+    reader lands at its top. If nothing near survived, the reader goes to the top
+    (`How::Top`).
+  - *Refused.* A swap while the reader has taken a step is refused: that state would be
+    lost, so the swap waits until they are back at the start. Also refused: an upgrade
+    for a different URL, a second upgrade, and a table recorded against a document the
+    session never held.
+  - *What a session carries* (the link and image bounds) follows what it shows. It is
+    built from bytes the broker was handed. The store keeps the shown recording with its
+    table composed in, so a session saved after its table arrived restores with it.
+  - Both hosts implement this: in process, and jailed over the worker wire (`UPGR`,
+    `SWAP`, `ATCH`). The jailed broker keeps its own copy of what it staged, and refuses
+    a worker answer that its copy does not allow.
+
+*Step 3, exploration off the critical path.*
+- The engine calls back when the scripts have settled (`ScriptEngine::run_settled`).
+  That is after load, lifecycle events, timers and the reader's sweep, and before
+  exploration. The readable artifact is taken there (`artifact::emit_readable`): the
+  recording without a transition table, carrying the measurements a control conversion
+  reports.
+- Exploration's output follows as its own artifact (`atrium-navigator-transitions/1`,
+  `emit_transitions`). It is bound to the readable recording by the BLAKE3 of its bytes.
+- `artifact::merge` splices the two back into the recording `emit` would write, and
+  refuses a table recorded against another document. The driver still writes the whole
+  recording to `PRERENDER_EMIT_DIR` (the merge; a merge that fails fails the document)
+  and keeps the parts in `PRERENDER_PARTS_DIR`.
+- The broker attaches the table when it arrives (`Attach`):
+  - on the shown document at once (`TransitionsAttached`);
+  - on the held one at its swap (`TransitionsHeld`);
+  - if it belongs to a scripted document kept out as not different, that document
+    becomes the held one (`UpgradeReady`). A table may be replayed only on the document
+    it was recorded on, and by definition that swap shows nothing new.
+
+*Step 4, fetches in parallel* (navigator-fetch, which fetchd runs).
+- *HTTP/1.1 keep-alive.* A connection carries another request only when the body was
+  delimited (a length, or chunked with its trailers read), nothing past it was read, the
+  server did not say `close`, and the protocol is 1.1. Up to 6 idle connections are kept
+  per origin. A GET is retried once on a fresh connection if a reused one fails before
+  any response byte.
+- *`Conversation::sibling`.* This gives another thread the same conversation: one pin
+  table, locked across resolve-and-pin (threat model §2.1), and one idle pool.
+- *`prefetch::Prefetcher`.*
+  - Hinted URLs are fetched on a bounded pool, 6 workers by default, and each result is
+    handed over once.
+  - A request never waits behind the queue: a queued hint is taken out and fetched on
+    the asking thread.
+  - It is bounded by count (512) and by bytes: the relay tells fetchd its remaining
+    budget (`B`), and past it queued hints are dropped.
+- *The converter's side.* After the parse, the converter hints every stylesheet, image
+  and script the parsed document names, in the order it will need them. The relay passes
+  the hints to fetchd and never answers them.
+- *fetchd.* fetchd's loop is now `navigator_fetch::serve`, portable and tested on
+  macOS. Off FreeBSD, `--unconfined-for-testing` serves without a sandbox, with the same
+  loop, protocol, address rule and pins, so the real fetch path can be measured on a
+  developer machine.
+
+*Found while measuring, and fixed: the normalizer's quadratic.* The alignment pass
+collected each element's state slots by scanning every slot, for every element. The GNU
+coreutils manual (2.1 MB, 48,322 elements) spent 27 of its 27 s of normalize there. The
+pass now takes a range of the handle-ordered map: the same keys, in the same order. That
+page now takes 3.75 s. Normalized output is byte-identical on 206 documents, and the
+three sets normalize in 87, 80 and 93 s, down to 49, 44 and 47 s (dd697573).
+
+*Timeouts* (2bf7e838).
+- A child that runs out of time now says where it was. Before TIMEOUT, its watchdog
+  writes a partial timing line (`at_deadline=js>js.exec`) with each phase's time so
+  far.
+- The driver keeps the timing line and the parts of a timed-out conversion.
+- A progressive conversion that times out after its readable artifact publishes that
+  artifact, without transitions; one that times out after only its tier-1 artifact
+  publishes that one. The reader already had it.
+
+
+**Re-measured: time to first display, before and after** (ms; 122 pages, timeouts
+counted at the deadline).
+
+| arm | what the reader first sees | p50 | p90 | p99 | under 1 s | from main-document arrival p50 / p90 / p99 | under 1 s |
+|---|---|---|---|---|---|---|---|
+| cold, before (whole pipeline, serial) | the whole conversion | 19,036 | 94,648 | 182,000 | 2% | 18,526 / 93,790 / 180,000 | 6% |
+| cold, tier 1 only (serial) | tier 1 | 8,463 | 45,313 | 105,490 | 3% | 6,830 / 42,211 / 104,521 | 12% |
+| cold, step 2 alone (progressive, fetchd serial) | FIRST | 9,044 | 47,113 | 125,114 | 2% | 8,278 / 45,733 / 124,249 | 9% |
+| **cold, steps 2 + 4 (progressive, fetchd parallel + reuse)** | **FIRST** | **3,295** | **11,355** | **19,902** | 2% | **2,471 / 6,992 / 15,813** | **14%** |
+| · the same, its scripted document | readable | 5,435 | 20,464 | 47,543 | 2% | 4,510 / 16,643 / 46,301 | 7% |
+| warm, before (whole pipeline) | the whole conversion | 2,553 | 11,174 | 29,008 | 16% | 1,198 / 8,471 / 26,442 | 43% |
+| warm, tier 1 only | tier 1 | 1,609 | 6,974 | 16,074 | 30% | 400 / 3,418 / 13,987 | 71% |
+| **warm, after (progressive)** | **FIRST** | **1,421** | **4,408** | **10,946** | 33% | **376 / 2,691 / 4,945** | **74%** |
+
+- *Cold.* From the main document's arrival, p90 is 93.8 s → 7.0 s (13×) and p99 is
+  180 s → 15.8 s. Every page now gets a first display before the deadline: corriere at
+  28 s, the slowest. The child waited 2,877 s in total for fetches with fetchd serial,
+  and 606 s with fetchd parallel. Step 2 alone barely moves the cold distribution
+  (p90 45.7 s): its first artifact still waits for the parsed document's images, one at
+  a time. Step 4 is what moves it.
+- *Warm.* From the main document's arrival, p90 is 8.5 s → 2.7 s, and under-1 s goes
+  from 43% to 74%. The first artifact arrives 8–70 ms after the main document; what
+  remains is display.
+- *The goal is not met.* Warm, 74% (not 90%) are under 1 s from arrival. Cold, it is
+  14%: 75% of the post-arrival time to a first display is the tier-1 artifact waiting
+  for its stylesheets and images, and normalize is 21%.
+
+**Kept: reproducibility and the exploring-vs-control identity** (offline, all 122;
+batch 2 from the clean re-run).
+- Two progressive runs are byte-identical in the whole recording and in all three parts:
+  **122/122**.
+- The readable part equals the recording of a control run (exploration off,
+  non-progressive): **122/122**.
+- The merge of the parts equals the step-1 binary's whole recording: **122/122**.
+
+**Then built, the next cut: an index of rules by subject compound** (1ee0c748). The
+normalizer tried every rule on every element. Elements are now indexed by id, class
+token and tag, in document order, and a selector is tried only on the bucket its subject
+compound requires: its id, else its rarest class, else its tag. Each bucket is a superset
+of the matches, in the same order, so the output cannot change, and it does not:
+- normalized output and reports are identical on **320 documents** (the 85-recording
+  corpus, and both batches' scripted and tier-1 recordings);
+- match steps went from 2.94 B to 0.54 B, and per document from p50 3.1 M / p90 28.5 M
+  to 0.32 M / 4.6 M. spiegel.de went from 48.7 M to 2.4 M.
+- Wall time was measured interleaved, 3 runs each, while the other workload ran, so it
+  is given as ratios: spiegel.de 1.80×, ko.wikipedia 1.69×, the coreutils manual 1.05×.
+- Matching is no longer most of normalize. The rest (declaration expansion,
+  allocation) is the next profile.
+- The warm "after" row above predates this index, so the warm first display is better
+  than the table says by an amount not yet measured on a quiet machine.
+
+**Open, and the next cuts, in order of what they would move.**
+1. **A first artifact that does not wait for images.** Cold, this is 75% of what is
+   left. Image sizes come from attributes where the page gives them; otherwise a box
+   whose size arrives with the readable artifact. The images themselves follow, so the
+   swap of step 2 carries them.
+2. **Normalize**, the warm remainder: profile after the index, then the
+   declaration-expansion path.
+3. **More concurrency per origin than six HTTP/1.1 connections** (HTTP/2), and DNS
+   prefetch for the hinted hosts.
+4. JS: a bytecode cache for the common libraries (the per-library tail above). Layout:
+   incremental relayout for ynet-like pages, whose 8 layouts take 22 s.
+5. The FreeBSD fetchd main is not compile-checked on this machine (there is no FreeBSD
+   sysroot here). Its only new code is the `Locked` wrapper and the call into `serve()`.
+6. The datacenter view: the same arms from a cloud VM, to separate the network from the
+   pipeline. Deferred: the user chose to keep measuring locally for now.
+
 ### 5.5 WebAssembly is a better cage, not a translation
 
 A recurring hope is that WASM offers a way out. It does not, for a simple factual reason:
