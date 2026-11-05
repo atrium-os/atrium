@@ -85,10 +85,15 @@ struct Emit<'a> {
     helper: i32,
     saved: Vec<u8>,
     labels: HashMap<Label, CodeLabel>,
+    /// Constant pool: 16-byte entries (the value in all four lanes, so
+    /// packed ops can read them too), placed after the code.
+    pool: Vec<(u32, CodeLabel)>,
 }
 
 /// Emit a function. Returns code and `(code offset, spirv offset)` marks.
-pub(crate) fn emit(vc: &VCode, alloc: &Allocation) -> Result<(Vec<u8>, Vec<(u32, u32)>), BackendError> {
+/// The third value is the length of the instructions; the constant pool
+/// follows them.
+pub(crate) fn emit(vc: &VCode, alloc: &Allocation) -> Result<(Vec<u8>, Vec<(u32, u32)>, usize), BackendError> {
     let mut used = [false; 16];
     for loc in &alloc.locs {
         if let Loc::Reg(PReg::G(r)) = loc {
@@ -124,6 +129,7 @@ pub(crate) fn emit(vc: &VCode, alloc: &Allocation) -> Result<(Vec<u8>, Vec<(u32,
         helper,
         saved,
         labels: HashMap::new(),
+        pool: Vec::new(),
     };
     for i in 0..vc.num_labels {
         let l = e.a.create_label();
@@ -189,17 +195,25 @@ pub(crate) fn emit(vc: &VCode, alloc: &Allocation) -> Result<(Vec<u8>, Vec<(u32,
         e.inst(inst, next)?;
     }
 
+    // The constant pool goes after the code. VEX memory operands don't
+    // need alignment, so the entries aren't aligned.
+    let code_insts = e.a.instructions().len();
+    for (bits, mut l) in std::mem::take(&mut e.pool) {
+        e.a.set_label(&mut l).map_err(enc)?;
+        e.a.dd(&[bits; 4]).map_err(enc)?;
+    }
     let result = e
         .a
         .assemble_options(0, BlockEncoderOptions::RETURN_NEW_INSTRUCTION_OFFSETS)
         .map_err(enc)?;
     let offsets = result.inner.new_instruction_offsets;
     let code = result.inner.code_buffer;
+    let code_len = offsets.get(code_insts).map_or(code.len(), |&o| o as usize);
     let pcs = marks
         .into_iter()
         .map(|(idx, spirv)| (offsets.get(idx).copied().unwrap_or(code.len() as u32), spirv))
         .collect();
-    Ok((code, pcs))
+    Ok((code, pcs, code_len))
 }
 
 /// The label placed right after position `i`, if only markers come first.
@@ -415,6 +429,16 @@ impl<'a> Emit<'a> {
         }
     }
 
+    /// The pool entry holding `bits`, added on first use.
+    fn pool_label(&mut self, bits: u32) -> CodeLabel {
+        if let Some(&(_, l)) = self.pool.iter().find(|(b, _)| *b == bits) {
+            return l;
+        }
+        let l = self.a.create_label();
+        self.pool.push((bits, l));
+        l
+    }
+
     fn x_dst(&self, v: VReg) -> AsmRegisterXmm {
         self.x_preg(v).unwrap_or(XS1)
     }
@@ -550,6 +574,24 @@ impl<'a> Emit<'a> {
                     XOp::And => x3!(a, vandps, rd, ra, bps)?,
                     XOp::Xor => x3!(a, vxorps, rd, ra, bps)?,
                 }
+                self.x_fin(*d, rd)?;
+            }
+            M::XBinC { op, d, a, bits } => {
+                let ra = self.x_reg(*a, XS0)?;
+                let rd = self.x_dst(*d);
+                let l = self.pool_label(*bits);
+                let (mss, mps) = (dword_ptr(l), xmmword_ptr(l));
+                let a = &mut self.a;
+                match op {
+                    XOp::Add => a.vaddss(rd, ra, mss),
+                    XOp::Sub => a.vsubss(rd, ra, mss),
+                    XOp::Mul => a.vmulss(rd, ra, mss),
+                    XOp::Div => a.vdivss(rd, ra, mss),
+                    XOp::And => a.vandps(rd, ra, mps),
+                    XOp::Xor => a.vxorps(rd, ra, mps),
+                    XOp::Min | XOp::Max => unreachable!("min/max are never folded"),
+                }
+                .map_err(enc)?;
                 self.x_fin(*d, rd)?;
             }
             M::XFma { d, a, b, c } => self.fma(*d, *a, *b, *c)?,
@@ -1342,34 +1384,40 @@ impl<'a> Emit<'a> {
     ///   nan: addss t, a; jmp done      (a NaN operand, quieted, b first)
     ///   mm:  {min,max}ss t, a          (ordered and different)
     fn min_max(&mut self, is_min: bool, d: VReg, a: VReg, b: VReg) -> Result<(), BackendError> {
+        // Work in d's register unless a lives there.
+        let t = match self.x_preg(d) {
+            Some(r) if self.x_preg(a) != Some(r) => r,
+            _ => XS1,
+        };
         match self.x_ss(b) {
-            X::R(r) => self.a.vmovaps(XS1, r).map_err(enc)?,
-            X::M(m) => self.a.vmovss(XS1, m).map_err(enc)?,
+            X::R(r) if r == t => {}
+            X::R(r) => self.a.vmovaps(t, r).map_err(enc)?,
+            X::M(m) => self.a.vmovss(t, m).map_err(enc)?,
         }
         let ra = self.x_reg(a, XS0)?;
         let mut mm = self.a.create_label();
         let mut nan = self.a.create_label();
         let mut done = self.a.create_label();
-        self.a.vucomiss(XS1, ra).map_err(enc)?;
+        self.a.vucomiss(t, ra).map_err(enc)?;
         self.a.jne(mm).map_err(enc)?;
         self.a.jp(nan).map_err(enc)?;
         if is_min {
-            self.a.vorps(XS1, XS1, ra).map_err(enc)?;
+            self.a.vorps(t, t, ra).map_err(enc)?;
         } else {
-            self.a.vandps(XS1, XS1, ra).map_err(enc)?;
+            self.a.vandps(t, t, ra).map_err(enc)?;
         }
         self.a.jmp(done).map_err(enc)?;
         self.a.set_label(&mut nan).map_err(enc)?;
-        self.a.vaddss(XS1, XS1, ra).map_err(enc)?;
+        self.a.vaddss(t, t, ra).map_err(enc)?;
         self.a.jmp(done).map_err(enc)?;
         self.a.set_label(&mut mm).map_err(enc)?;
         if is_min {
-            self.a.vminss(XS1, XS1, ra).map_err(enc)?;
+            self.a.vminss(t, t, ra).map_err(enc)?;
         } else {
-            self.a.vmaxss(XS1, XS1, ra).map_err(enc)?;
+            self.a.vmaxss(t, t, ra).map_err(enc)?;
         }
         self.a.set_label(&mut done).map_err(enc)?;
-        self.x_fin(d, XS1)
+        self.x_fin(d, t)
     }
 
     fn fma(&mut self, d: VReg, a: VReg, b: VReg, c: VReg) -> Result<(), BackendError> {

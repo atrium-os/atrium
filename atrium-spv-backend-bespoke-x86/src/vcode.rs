@@ -260,6 +260,9 @@ pub(crate) enum MInst {
     XConst { d: VReg, bits: u32 },
     XMov { d: VReg, s: VReg },
     XBin { op: XOp, d: VReg, a: VReg, b: VReg },
+    /// XBin with a constant `b`, read from the function's constant pool
+    /// (never Min/Max). Made by [`fold_immediates`].
+    XBinC { op: XOp, d: VReg, a: VReg, bits: u32 },
     /// d = a * b + c, fused.
     XFma { d: VReg, a: VReg, b: VReg, c: VReg },
     XUn { op: XUnOp, d: VReg, a: VReg },
@@ -369,7 +372,7 @@ impl MInst {
                 out.push(*b);
             }
             XFma { a, b, c, .. } => out.extend([*a, *b, *c]),
-            XUn { a, .. } | GUn { a, .. } | GBinI { a, .. } | GShiftI { a, .. } | GCmpI { a, .. } => {
+            XUn { a, .. } | XBinC { a, .. } | GUn { a, .. } | GBinI { a, .. } | GShiftI { a, .. } | GCmpI { a, .. } => {
                 out.push(*a)
             }
             VLoad { addr, .. } => {
@@ -421,6 +424,7 @@ impl MInst {
             XConst { d, .. }
             | XMov { d, .. }
             | XBin { d, .. }
+            | XBinC { d, .. }
             | XFma { d, .. }
             | XUn { d, .. }
             | XLoad { d, .. }
@@ -2337,6 +2341,7 @@ impl ICond {
 pub(crate) fn fold_immediates(vc: &mut VCode) {
     let mut defs = vec![0u32; vc.classes.len()];
     let mut consts: HashMap<VReg, i32> = HashMap::new();
+    let mut xconsts: HashMap<VReg, u32> = HashMap::new();
     let mut tmp = Vec::new();
     for inst in &vc.insts {
         tmp.clear();
@@ -2347,14 +2352,35 @@ pub(crate) fn fold_immediates(vc: &mut VCode) {
         if let MInst::GConst { d, imm } = inst {
             consts.insert(*d, *imm);
         }
+        if let MInst::XConst { d, bits } = inst {
+            xconsts.insert(*d, *bits);
+        }
     }
     consts.retain(|v, _| defs[v.0 as usize] == 1);
+    xconsts.retain(|v, _| defs[v.0 as usize] == 1);
     let k = |v: &VReg| consts.get(v).copied();
+    let xk = |v: &VReg| xconsts.get(v).copied();
     for inst in vc.insts.iter_mut() {
         let new = match *inst {
             MInst::GBin { op, d, a, b } => match (k(&a), k(&b)) {
                 (_, Some(imm)) => Some(MInst::GBinI { op, d, a, imm }),
                 (Some(imm), None) if op.commutative() => Some(MInst::GBinI { op, d, a: b, imm }),
+                _ => None,
+            },
+            // Float constants become constant-pool memory operands. Only
+            // bit ops swap a constant first operand freely; an add or mul
+            // swaps it only when it isn't a NaN (x86 returns the first
+            // operand's NaN, and Cranelift's operand order must hold).
+            MInst::XBin { op, d, a, b } if !matches!(op, XOp::Min | XOp::Max) => match (xk(&a), xk(&b)) {
+                (_, Some(bits)) => Some(MInst::XBinC { op, d, a, bits }),
+                (Some(bits), None) => {
+                    let nan = f32::from_bits(bits).is_nan();
+                    match op {
+                        XOp::And | XOp::Xor => Some(MInst::XBinC { op, d, a: b, bits }),
+                        XOp::Add | XOp::Mul if !nan => Some(MInst::XBinC { op, d, a: b, bits }),
+                        _ => None,
+                    }
+                }
                 _ => None,
             },
             MInst::GShift { op, d, a, b } => k(&b).map(|imm| MInst::GShiftI { op, d, a, imm: (imm & 31) as u8 }),

@@ -221,12 +221,17 @@ fn emit_function(func: &Function) -> Result<(Vec<u8>, Vec<(u32, u32)>), BackendE
     vcode::dce(&mut vc);
     vcode::sink_compares(&mut vc);
     let al = regalloc::allocate(&vc);
-    let (code, pcs) = emit::emit(&vc, &al)?;
+    let (code, pcs, code_len) = emit::emit(&vc, &al)?;
     if cfg!(debug_assertions) {
-        roundtrip_check(&code)?;
+        roundtrip_check(&code[..code_len])?;
     }
     if std::env::var_os("ATRIUM_SPV_X86_DUMP").is_some() {
-        eprintln!("bespoke-x86 {} ({} bytes):\n{}", func.name, code.len(), disassemble(&code));
+        eprintln!(
+            "bespoke-x86 {} ({code_len} bytes + {} pool):\n{}",
+            func.name,
+            code.len() - code_len,
+            disassemble(&code[..code_len])
+        );
     }
     Ok((code, pcs))
 }
