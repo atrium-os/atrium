@@ -55,7 +55,51 @@ thread_local! {
 
 /// Start a conversion's stopwatch, discarding the last one.
 pub fn reset() {
-    T.with(|t| *t.borrow_mut() = State { origin: Some(Instant::now()), ..State::default() });
+    let now = Instant::now();
+    T.with(|t| *t.borrow_mut() = State { origin: Some(now), ..State::default() });
+    *MIRROR.lock().unwrap() = Mirror { origin: Some(now), ..Mirror::default() };
+}
+
+/// ★ A copy of the same accounting where ANOTHER thread can read it: the
+/// serve child's watchdog, which fires at the deadline while the conversion
+/// thread is still inside some phase and says where (§5.4.5.7 — a document
+/// that timed out used to report nothing about why). Last writer wins: with
+/// several conversions on several threads (tests) it is meaningless, and
+/// nothing but the watchdog reads it.
+#[derive(Default)]
+struct Mirror {
+    origin: Option<Instant>,
+    stack: Vec<(String, Instant)>,
+    exclusive: BTreeMap<String, Duration>,
+}
+static MIRROR: std::sync::Mutex<Mirror> = std::sync::Mutex::new(Mirror { origin: None, stack: Vec::new(), exclusive: BTreeMap::new() });
+
+fn mirror_enter(name: &str, now: Instant) {
+    let mut m = MIRROR.lock().unwrap();
+    if let Some((n, resumed)) = m.stack.last().cloned() { *m.exclusive.entry(n).or_default() += now - resumed }
+    m.stack.push((name.to_string(), now));
+}
+
+fn mirror_exit(now: Instant) {
+    let mut m = MIRROR.lock().unwrap();
+    if let Some((n, resumed)) = m.stack.pop() { *m.exclusive.entry(n).or_default() += now - resumed }
+    if let Some(top) = m.stack.last_mut() { top.1 = now }
+}
+
+/// The watchdog's report: `TM` with `partial=1`, the open phases
+/// (`at_deadline=a>b>c`) and the exclusive time of each phase so far,
+/// the open one included.
+pub fn partial_line() -> String {
+    let m = MIRROR.lock().unwrap();
+    let now = Instant::now();
+    let wall = m.origin.map(|o| now - o).unwrap_or_default();
+    let mut ex = m.exclusive.clone();
+    if let Some((n, resumed)) = m.stack.last() { *ex.entry(n.clone()).or_default() += now - *resumed }
+    let ms = |d: Duration| format!("{:.1}", d.as_secs_f64() * 1000.0);
+    let open: Vec<&str> = m.stack.iter().map(|(n, _)| n.as_str()).collect();
+    let mut o = format!("TM\tpartial=1\twall={}\tat_deadline={}", ms(wall), if open.is_empty() { "-".to_string() } else { open.join(">") });
+    for (k, v) in &ex { o.push_str(&format!("\tx.{k}={}", ms(*v))) }
+    o
 }
 
 /// An open span; closing it (drop) charges the time since it last resumed.
@@ -72,6 +116,7 @@ pub fn span(name: &str) -> Span {
         }
         t.stack.push((name.to_string(), now, now));
     });
+    mirror_enter(name, now);
     Span(())
 }
 
@@ -87,6 +132,7 @@ impl Drop for Span {
             e.count += 1;
             if let Some(top) = t.stack.last_mut() { top.2 = now }
         });
+        mirror_exit(now);
     }
 }
 

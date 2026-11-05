@@ -107,12 +107,31 @@ fn launcher_chatter_on_stdout_fails_the_document_loudly() {
 fn a_page_that_never_finishes_is_stopped_by_its_own_deadline() {
     let d = corpus_of_one("spin", "<script>for(;;){}</script>");
     let t = std::time::Instant::now();
-    let (code, out, _) = driver(&d, &[("PRERENDER_DEADLINE", "2")]);
+    let timing = d.join("t.tsv");
+    let (code, out, _) = driver(&d, &[("PRERENDER_DEADLINE", "2"), ("PRERENDER_TIMING", timing.to_str().unwrap())]);
     assert_eq!(code, 0);
     assert!(out.contains("timed out at 2s"), "{out}");
+    // ★ And it says WHERE it was (§5.4.5.7): inside the script.
+    let t_line = std::fs::read_to_string(&timing).unwrap();
+    assert!(t_line.contains("\ttimed_out=1") && t_line.contains("\tpartial=1") && t_line.contains("\tat_deadline=js>js.exec"), "{t_line}");
     // The child's own watchdog fires at 2 s; the driver's backstop would be
     // 2 + 10 + 10.
     assert!(t.elapsed() < std::time::Duration::from_secs(10), "{:?}", t.elapsed());
+}
+
+/// ★ A progressive conversion that runs out of time AFTER its first
+/// artifact still publishes it: the reader already has it, and the
+/// recording written is that one, not nothing.
+#[test]
+fn a_progressive_conversion_that_times_out_keeps_what_it_delivered() {
+    let d = corpus_of_one("spin-late", "<!doctype html><title>t</title><p>served</p><script>for(;;){}</script>");
+    let rec = d.join("rec");
+    let (code, out, _) = driver(&d, &[("PRERENDER_DEADLINE", "2"), ("PRERENDER_PROGRESSIVE", "1"),
+        ("PRERENDER_EMIT_DIR", rec.to_str().unwrap())]);
+    assert_eq!(code, 0);
+    assert!(out.contains("timed out at 2s after its tier-1 artifact"), "{out}");
+    let r = std::fs::read_to_string(rec.join("doc.json")).unwrap();
+    assert!(r.contains("first display: scripts not run yet") && r.contains(">served</p>"), "{r}");
 }
 
 #[test]

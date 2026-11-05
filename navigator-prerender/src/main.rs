@@ -953,8 +953,7 @@ fn convert_in_child(
     let Some(status) = status else { return Err(format!("timed out at {}s (child killed)", deadline.as_secs())) };
     let (o, curl_log, _relay_wall) = outcome.map_err(|e| format!("converter protocol: {e}"))?;
     let child_wall = start.elapsed();
-    if o.timed_out { return Err(format!("timed out at {}s", deadline.as_secs())) }
-    if !o.ended { return Err(crash_reason(start.elapsed().as_secs_f64(), &status.to_string(), &stderr)) }
+    if !o.ended && !o.timed_out { return Err(crash_reason(start.elapsed().as_secs_f64(), &status.to_string(), &stderr)) }
     if d.dump { eprint!("{stderr}") }
     let stem = file.file_stem().map(|s| s.to_string_lossy().to_string()).unwrap_or_else(|| "doc".into());
     if let Some(dir) = &d.parts_dir {
@@ -965,10 +964,14 @@ fn convert_in_child(
     }
     // A progressive conversion's whole recording is its two parts merged;
     // a merge that fails is a converter bug, and fails the document.
+    // ★ One that timed out AFTER its readable artifact arrived still has a
+    // document to publish: the readable one, without transitions — the
+    // exploration it lost is the only thing missing (§5.4.5.7).
     let whole = match (&o.recording, &o.transitions) {
         (Some(r), Some(t)) => Some(navigator_prerender::artifact::merge(&String::from_utf8_lossy(r), &String::from_utf8_lossy(t))
             .map_err(|e| format!("converter protocol: the parts do not merge: {e}"))?.into_bytes()),
-        _ => o.recording.clone(),
+        // …and one that timed out after only its tier-1 artifact, that one.
+        _ => o.recording.clone().or_else(|| o.first.clone().filter(|_| o.timed_out)),
     };
     if let (Some(dir), Some(rec)) = (&d.emit_dir, &whole) {
         let path = dir.join(format!("{stem}.json"));
@@ -1001,7 +1004,8 @@ fn convert_in_child(
     // first frame needs them.
     if let Some(path) = std::env::var_os("PRERENDER_TIMING") {
         let name = file.file_name().map(|s| s.to_string_lossy().to_string()).unwrap_or_default();
-        let mut line = format!("{name}\tchild_wall={:.1}", child_wall.as_secs_f64() * 1e3);
+        let mut line = format!("{name}\tchild_wall={:.1}{}", child_wall.as_secs_f64() * 1e3,
+            if o.timed_out { "\ttimed_out=1" } else { "" });
         if let Some(tm) = o.report.lines().find(|l| l.starts_with("TM\t")) { line.push('\t'); line.push_str(&tm[3..]) }
         line.push_str(&relay_summary(&curl_log));
         let ms = |d: Option<std::time::Duration>| d.map(|d| format!("{:.1}", d.as_secs_f64() * 1e3)).unwrap_or_else(|| "-".into());
@@ -1014,6 +1018,13 @@ fn convert_in_child(
         if let Err(e) = fs::OpenOptions::new().create(true).append(true).open(&path).and_then(|mut f| f.write_all(line.as_bytes())) {
             eprintln!("timing: cannot write {}: {e}", std::path::Path::new(&path).display());
         }
+    }
+    if o.timed_out {
+        return Err(match &o.recording {
+            Some(_) => format!("timed out at {}s after its readable artifact (published without transitions)", deadline.as_secs()),
+            None if o.first.is_some() => format!("timed out at {}s after its tier-1 artifact", deadline.as_secs()),
+            None => format!("timed out at {}s", deadline.as_secs()),
+        })
     }
     let mut c = parse_child(&o.report).ok_or_else(|| crash_reason(start.elapsed().as_secs_f64(), &status.to_string(), &stderr))?;
     c.wall_ms = start.elapsed().as_secs_f64() * 1000.0;
@@ -1105,6 +1116,8 @@ fn serve() -> ! {
     std::thread::spawn(move || {
         std::thread::sleep(deadline);
         let mut o = std::io::stdout().lock();
+        // Where the conversion was when the deadline fired (§5.4.5.7).
+        let _ = writeln!(o, "{}", navigator_prerender::timing::partial_line());
         let _ = o.write_all(b"TIMEOUT\n");
         let _ = o.flush();
         std::process::exit(124);
