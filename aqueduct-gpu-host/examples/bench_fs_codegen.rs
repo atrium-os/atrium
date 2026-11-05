@@ -157,12 +157,14 @@ fn fs_via_cc(tag: &str, extra: &[&str]) -> FsMain {
     std::fs::write(&cfile, HEAVY_FS_C).unwrap();
     let mut cmd = std::process::Command::new("cc");
     cmd.args(["-O3", "-shared", "-fPIC"]).args(extra).arg("-o")
-        .arg(&so).arg(&cfile);
+        .arg(&so).arg(&cfile).arg("-lm"); // fminf etc. on Linux
     let out = cmd.output().expect("spawn cc");
     assert!(out.status.success(), "cc failed: {}", String::from_utf8_lossy(&out.stderr));
     let cpath = std::ffi::CString::new(so.to_str().unwrap()).unwrap();
     let handle = unsafe { libc::dlopen(cpath.as_ptr(), libc::RTLD_NOW) };
-    assert!(!handle.is_null(), "dlopen cc dylib failed");
+    assert!(!handle.is_null(), "dlopen cc dylib failed: {}", unsafe {
+        std::ffi::CStr::from_ptr(libc::dlerror()).to_string_lossy().into_owned()
+    });
     let sym = std::ffi::CString::new("atrium_fs_main").unwrap();
     let p = unsafe { libc::dlsym(handle, sym.as_ptr()) };
     assert!(!p.is_null(), "dlsym atrium_fs_main");

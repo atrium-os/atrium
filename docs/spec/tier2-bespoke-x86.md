@@ -1,6 +1,6 @@
 # Tier-2 bespoke backend for x86_64
 
-Status: phases 1-8 landed 2026-11-05 (phase 5 scalarised only; packed forms move to phase 9). Owner: the x86_64 port thread. Companion to
+Status: phases 1-8 landed 2026-11-05 (phase 5 scalarised only; packed forms move to phase 9); phase 9 first run on a cloud Xeon passes the bar (§6), the R9700 run is pending. Owner: the x86_64 port thread. Companion to
 [x86_64-port.md](x86_64-port.md) §1 and the arm64 backend in
 `atrium-spv-backend-bespoke/`.
 
@@ -79,3 +79,22 @@ phase returns `Unsupported`, so x86 output is never silently wrong.
 - `ATRIUM_SPV_FORCE_SPILL=1` runs everything in spill mode, as on arm64.
 - Encoder bugs are caught twice: by iced's own encoder validation, and by a decoder
   round-trip on every emitted function in debug builds.
+
+## 6. Results
+
+`bench_fs_codegen` (release), 2026-11-05, cloud VM "Intel Xeon Processor @ 2.10GHz", 4 vCPU,
+two runs:
+
+| | ns/pixel | % of cc -O3 |
+|---|---|---|
+| cc -O3 (LLVM, fma) | 499-514 | 100 |
+| cc -O3 (LLVM, no fma) | 491-538 | 96-102 |
+| bespoke-x86 | 421-424 | 118-122 |
+| Cranelift-x86 | 458-481 | 107-109 |
+
+Bespoke-x86 clears the 90% bar and is 8-12% faster than Cranelift-x86. Unlike on arm64, cc
+is not a true ceiling here: without `-ffast-math`, `fminf` stays a libm call on x86, so the
+C reference pays a call per step that the shader backends lower to `vminss` sequences.
+Outputs agree across backends. Compile time (debug `atrium-spv-compile`, wall clock per
+shader): bespoke 25 ms, Cranelift 78 ms, cc 41 ms. The R9700 box's Xeon run is still to do.
+
