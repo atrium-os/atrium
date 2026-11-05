@@ -309,6 +309,8 @@ pub struct EnvelopeFrontend {
     /// Monitor scales `OP_WM_SET_OUTPUT_SCALE` asked for, in order, which
     /// frescod's frame loop takes and applies.
     scale_requests: Vec<fresco_protocol::WmSetOutputScalePayload>,
+    /// Mirrorings `OP_WM_MIRROR_OUTPUT` asked for, in order.
+    mirror_requests: Vec<fresco_protocol::WmMirrorOutputPayload>,
 }
 
 impl EnvelopeFrontend {
@@ -340,6 +342,7 @@ impl EnvelopeFrontend {
             outputs: fresco_protocol::WmOutputsReply { outputs: Vec::new() },
             arrange_request: None,
             scale_requests: Vec::new(),
+            mirror_requests: Vec::new(),
         }
     }
 
@@ -374,6 +377,11 @@ impl EnvelopeFrontend {
         self.update_window_scales();
     }
 
+    /// Mirrorings the WM asked for since the last call.
+    pub fn take_mirror_requests(&mut self) -> Vec<fresco_protocol::WmMirrorOutputPayload> {
+        std::mem::take(&mut self.mirror_requests)
+    }
+
     /// Scales the WM asked for since the last call.
     pub fn take_scale_requests(&mut self) -> Vec<fresco_protocol::WmSetOutputScalePayload> {
         std::mem::take(&mut self.scale_requests)
@@ -384,7 +392,7 @@ impl EnvelopeFrontend {
     /// A window on no present monitor keeps its scale.
     fn update_window_scales(&mut self) {
         let present: Vec<&fresco_protocol::WmOutput> =
-            self.outputs.outputs.iter().filter(|o| o.present).collect();
+            self.outputs.outputs.iter().filter(|o| o.present && o.mirror_of == 0).collect();
         if present.is_empty() {
             return;
         }
@@ -579,6 +587,7 @@ impl EnvelopeFrontend {
             control::OP_WM_OUTPUTS           => self.handle_wm_outputs(),
             control::OP_WM_ARRANGE_OUTPUTS   => self.handle_wm_arrange_outputs(msg),
             control::OP_WM_SET_OUTPUT_SCALE  => self.handle_wm_set_output_scale(msg),
+            control::OP_WM_MIRROR_OUTPUT     => self.handle_wm_mirror_output(msg),
 
             op => Err(DispatchError::UnknownOp(op)),
         }
@@ -917,6 +926,29 @@ impl EnvelopeFrontend {
         }
         self.arrange_request = Some(p.placements);
         Ok(vec![Outbound { op: control::OP_WM_ARRANGE_OUTPUTS, flags: flag::IS_RESPONSE, payload: Vec::new() }])
+    }
+
+    /// `OP_WM_MIRROR_OUTPUT` — queue a mirroring (WM only): both monitors on
+    /// the desktop and different, the source not a mirror, and the mirror
+    /// not a source of another.
+    fn handle_wm_mirror_output(&mut self, msg: &Message) -> Result<Vec<Outbound>, DispatchError> {
+        if !self.wm_capable.contains(&self.current_client) {
+            return Err(DispatchError::Forbidden);
+        }
+        let p: fresco_protocol::WmMirrorOutputPayload =
+            decode(&msg.payload).map_err(|_| DispatchError::BadPayload)?;
+        let outs = &self.outputs.outputs;
+        let find = |id: u64| outs.iter().find(|o| o.identity == id);
+        let Some(_) = find(p.identity) else { return Err(DispatchError::BadPayload) };
+        if p.of != 0 {
+            let Some(src) = find(p.of) else { return Err(DispatchError::BadPayload) };
+            let is_source = outs.iter().any(|o| o.mirror_of == p.identity);
+            if p.of == p.identity || src.mirror_of != 0 || is_source {
+                return Err(DispatchError::BadPayload);
+            }
+        }
+        self.mirror_requests.push(p);
+        Ok(vec![Outbound { op: control::OP_WM_MIRROR_OUTPUT, flags: flag::IS_RESPONSE, payload: Vec::new() }])
     }
 
     /// `OP_WM_SET_OUTPUT_SCALE` — queue a monitor's scale (WM only): a
@@ -1574,7 +1606,7 @@ mod tests {
         let a = make_window(&mut f, 1, 100, 100);
         let out = |output, identity, x, scale_milli| WmOutput {
             output, identity, rect: WmRect { x, y: 0, w: 1920, h: 1080 },
-            refresh_mhz: 60000, present: true, scale_milli, scale_auto: true,
+            refresh_mhz: 60000, present: true, scale_milli, scale_auto: true, mirror_of: 0,
         };
         f.set_outputs(vec![out(0, 10, 0, 1000), out(1, 20, 1920, 1500)]);
         let dpi = |rx: &std::sync::mpsc::Receiver<crate::window::DisplayEvent>| -> Vec<(u32, f32)> {
@@ -1606,6 +1638,29 @@ mod tests {
         assert!(f.dispatch(&msg(control::OP_WM_SET_OUTPUT_SCALE, 0, encode(&tiny).unwrap()), 9).is_err());
         assert!(f.dispatch(&msg(control::OP_WM_SET_OUTPUT_SCALE, 0, encode(&ok).unwrap()), 1).is_err(), "WM only");
         assert_eq!(f.take_scale_requests(), vec![ok]);
+    }
+
+    #[test]
+    fn mirror_requests_are_checked() {
+        use fresco_protocol::{WmOutput, WmRect};
+        let mut f = fixture();
+        f.grant_window_management(9);
+        let out = |output, identity, mirror_of| WmOutput {
+            output, identity, rect: WmRect { x: 0, y: 0, w: 1920, h: 1080 },
+            refresh_mhz: 60000, present: true, scale_milli: 1000, scale_auto: true, mirror_of,
+        };
+        f.set_outputs(vec![out(0, 10, 0), out(1, 20, 10), out(2, 30, 0)]);
+        let ask = |f: &mut EnvelopeFrontend, identity, of| {
+            let p = WmMirrorOutputPayload { identity, of };
+            f.dispatch(&msg(control::OP_WM_MIRROR_OUTPUT, 0, encode(&p).unwrap()), 9).is_ok()
+        };
+        assert!(ask(&mut f, 30, 10), "a plain monitor mirrors a plain one");
+        assert!(ask(&mut f, 20, 0), "a mirror stops");
+        assert!(!ask(&mut f, 30, 30), "not itself");
+        assert!(!ask(&mut f, 30, 20), "not a mirror's mirror");
+        assert!(!ask(&mut f, 10, 30), "a source can't become a mirror");
+        assert!(!ask(&mut f, 99, 10), "not an unknown monitor");
+        assert_eq!(f.take_mirror_requests().len(), 2);
     }
 
     #[test]
@@ -1729,6 +1784,10 @@ mod tests {
         fn set_output_scale(&mut self, identity: u64, scale_milli: u32) -> std::io::Result<()> {
             let p = WmSetOutputScalePayload { identity, scale_milli };
             self.dispatch(control::OP_WM_SET_OUTPUT_SCALE, encode(&p).unwrap()).map(|_| ())
+        }
+        fn mirror_output(&mut self, identity: u64, of: u64) -> std::io::Result<()> {
+            let p = WmMirrorOutputPayload { identity, of };
+            self.dispatch(control::OP_WM_MIRROR_OUTPUT, encode(&p).unwrap()).map(|_| ())
         }
     }
 

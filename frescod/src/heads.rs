@@ -44,6 +44,9 @@ pub struct Head<'a> {
     pub stale: bool,
     /// Its monitor is attached (false while it is gone within the grace).
     pub present: bool,
+    /// The monitor (identity) this head mirrors: it shows that head's part
+    /// of the desktop (its `vp` is the source's) instead of a part of its own.
+    pub mirror_of: Option<u64>,
 }
 
 impl Head<'_> {
@@ -110,8 +113,9 @@ struct Plan {
 /// Change the heads to show `target` (outputs.rs Tracker), in one atomic
 /// commit. A head that keeps its monitor and mode is left alone (no mode
 /// set, no flicker); new monitors get their remembered mode for this set
-/// of monitors, else `want` (output 0, FRESCOD_MODE or a WM request), else
-/// their preferred mode. `request` re-modes output 0. If the outputs
+/// of monitors, else `want` (output 0, FRESCOD_MODE), else their preferred
+/// mode. `requests` re-mode outputs: (output, (width, height, refresh mHz)),
+/// a WM's mode switch for output 0, or a mirror going to its source's size. If the outputs
 /// together need more bandwidth than the display has, the refused output
 /// steps down to its next mode, deterministically, and is left dark only if
 /// none fits; every such choice is logged with its reason.
@@ -122,7 +126,7 @@ pub fn reconfigure<'a>(
     cx: &Ctx<'a>,
     heads: &mut Vec<Head<'a>>,
     target: &[Seen],
-    request: Option<(u32, u32, u32)>,
+    requests: &[(u32, (u32, u32, u32))],
     want0: Option<(u32, u32, u32)>,
     remembered: &HashMap<DisplaySet, Arrangement>,
     can_hdr: bool,
@@ -147,11 +151,10 @@ pub fn reconfigure<'a>(
             continue;
         }
         let cur = held.map(|h| (h.mode.width, h.mode.height, h.mode.refresh_mhz));
-        let pick = if s.output == 0 && request.is_some() {
-            find_mode(&conn.modes, request)
-        } else {
-            None
-        }
+        let pick = requests
+            .iter()
+            .find(|r| r.0 == s.output)
+            .and_then(|r| find_mode(&conn.modes, Some(r.1)))
         .or_else(|| find_mode(&conn.modes, cur))
         .or_else(|| find_mode(&conn.modes, memo.and_then(|a| a.get(&s.identity)).map(|&(_, _, w, h, r)| (w, h, r))))
         .or_else(|| if s.output == 0 { find_mode(&conn.modes, want0) } else { None })
@@ -302,6 +305,7 @@ pub fn reconfigure<'a>(
                     vp: Viewport { output: p.output, identity: p.identity, x: 0, y: 0, width: m.width, height: m.height, refresh_mhz: m.refresh_mhz },
                     stale: true,
                     present: true,
+                    mirror_of: None,
                     conn: p.conn,
                 });
             }
@@ -313,18 +317,59 @@ pub fn reconfigure<'a>(
 }
 
 /// Place the heads: the remembered arrangement of this set of monitors,
-/// else left to right.
+/// else left to right. Mirrors take no place of their own (see
+/// [`place_mirrors`]).
 pub fn arrange(heads: &mut [Head<'_>], remembered: &HashMap<DisplaySet, Arrangement>) {
-    let mons: Vec<(u32, u64, u32, u32, u32)> =
-        heads.iter().map(|h| (h.output, h.identity, h.mode.width, h.mode.height, h.mode.refresh_mhz)).collect();
-    let set = outputs::display_set(mons.iter().map(|m| m.1));
+    drop_orphan_mirrors(heads);
+    let mons: Vec<(u32, u64, u32, u32, u32)> = heads
+        .iter()
+        .filter(|h| h.mirror_of.is_none())
+        .map(|h| (h.output, h.identity, h.mode.width, h.mode.height, h.mode.refresh_mhz))
+        .collect();
+    let set = outputs::display_set(heads.iter().map(|h| h.identity));
     let mut vps = outputs::arrange(&mons, remembered.get(&set));
-    if outputs::validate(&vps).is_err() {
-        vps = outputs::arrange(&mons, None);
+    if outputs::validate(&vps).is_err() || remembered.get(&set).is_none_or(|a| a.len() != mons.len()) {
+        /* Nothing (valid) remembered: keep the monitors where they are if
+         * that still holds together (a mirror leaving the layout), else
+         * left to right. */
+        let cur: Vec<Viewport> = heads.iter().filter(|h| h.mirror_of.is_none()).map(|h| h.vp).collect();
+        let (mx, my) = (cur.iter().map(|v| v.x).min().unwrap_or(0), cur.iter().map(|v| v.y).min().unwrap_or(0));
+        let cur: Vec<Viewport> = cur
+            .iter()
+            .zip(&mons)
+            .map(|(v, m)| Viewport { output: m.0, identity: m.1, x: v.x - mx, y: v.y - my, width: m.2, height: m.3, refresh_mhz: m.4 })
+            .collect();
+        let fresh_heads = heads.iter().any(|h| h.mirror_of.is_none() && h.stale && h.frame == 0);
+        vps = if !fresh_heads && outputs::validate(&cur).is_ok() { cur } else { outputs::arrange(&mons, None) };
     }
     for h in heads.iter_mut() {
         if let Some(v) = vps.iter().find(|v| v.output == h.output) {
             h.vp = *v;
+        }
+    }
+    place_mirrors(heads);
+}
+
+/// A mirror whose source is not a head (or is a mirror itself) shows a
+/// part of its own again.
+fn drop_orphan_mirrors(heads: &mut [Head<'_>]) {
+    let plain: Vec<u64> = heads.iter().filter(|h| h.mirror_of.is_none()).map(|h| h.identity).collect();
+    for h in heads.iter_mut() {
+        if h.mirror_of.is_some_and(|src| !plain.contains(&src)) {
+            eprintln!("frescod: output {} stops mirroring (its source left)", h.output);
+            h.mirror_of = None;
+        }
+    }
+}
+
+/// Each mirror shows its source's part of the desktop.
+pub fn place_mirrors(heads: &mut [Head<'_>]) {
+    let srcs: Vec<(u64, Viewport)> = heads.iter().filter(|h| h.mirror_of.is_none()).map(|h| (h.identity, h.vp)).collect();
+    for h in heads.iter_mut() {
+        if let Some(src) = h.mirror_of {
+            if let Some(&(_, v)) = srcs.iter().find(|(id, _)| *id == src) {
+                h.vp = Viewport { output: h.output, identity: h.identity, refresh_mhz: h.mode.refresh_mhz, ..v };
+            }
         }
     }
 }

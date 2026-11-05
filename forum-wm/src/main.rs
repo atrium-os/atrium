@@ -92,6 +92,9 @@ impl FrescoConn for ClientConn {
     fn set_output_scale(&mut self, identity: u64, scale_milli: u32) -> io::Result<()> {
         self.conn.wm_set_output_scale(identity, scale_milli)
     }
+    fn mirror_output(&mut self, identity: u64, of: u64) -> io::Result<()> {
+        self.conn.wm_mirror_output(identity, of)
+    }
 }
 
 

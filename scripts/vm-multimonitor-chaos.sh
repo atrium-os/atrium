@@ -1,6 +1,6 @@
 #!/bin/sh
 # Multi-monitor chaos test: random plug / unplug / dropout / swap / burst /
-# arrange storms under a running frescod + forum-wm with two window clients,
+# arrange / mirror storms under a running frescod + forum-wm with two window clients,
 # checking invariants after each step settles. Runs IN the FreeBSD guest, from
 # the VM test layout (/root/s: up.sh, modes-run.sh, forum-ctl, demos); see
 # RUNBOOK.md (display tests). STEPS / SEED pick the storm.
@@ -74,7 +74,7 @@ check() {
 
 # The whole storm, drawn up front from one seeded stream: output, action,
 # and a coin for each step.
-awk -v s="$SEED" -v n="$STEPS" 'BEGIN{srand(s); for(i=0;i<n;i++) print int(rand()*3)+1, int(rand()*7), int(rand()*2), int(rand()*3)}' > /tmp/plan
+awk -v s="$SEED" -v n="$STEPS" 'BEGIN{srand(s); for(i=0;i<n;i++) print int(rand()*3)+1, int(rand()*8), int(rand()*2), int(rand()*3)}' > /tmp/plan
 i=0
 exec 3< /tmp/plan
 while read o a coin pick <&3; do
@@ -105,6 +105,14 @@ while read o a coin pick <&3; do
 			s=$( [ $coin = 0 ] && echo left-of || echo below )
 			$C arrange $o $s 0 >/dev/null 2>&1; what="arrange $o $s 0"
 		else what="(arrange empty $o)"; fi ;;
+	7)	# mirror output 0 on it, or stop mirroring
+		if [ "$cur" != -1 ]; then
+			if $C outputs | grep -A1 "^output $o " | grep -q "mirrors monitor"; then
+				$C mirror $o off >/dev/null 2>&1; what="mirror $o off"
+			else
+				$C mirror $o 0 >/dev/null 2>&1; what="mirror $o 0"
+			fi
+		else what="(mirror empty $o)"; fi ;;
 	esac
 	sleep 9
 	echo "step $i: $what"

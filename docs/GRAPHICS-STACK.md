@@ -249,8 +249,9 @@ and rides out hotplug bursts and short dropouts
 from its pixel density (or set by the session), and a window is told the
 scale of the monitor it is on (`EV_WINDOW_DPI_CHANGED`). Forum lays out each
 monitor on its own, rescues windows from a monitor that leaves and puts them
-back when it returns, and keeps arrangements and scales per user across
-restarts.
+back when it returns, and keeps arrangements, scales and mirroring per
+user across restarts. A monitor can mirror another (same size when it
+offers that mode, else scaled to fit).
 
 ## 6. Userspace bindings and protocols
 

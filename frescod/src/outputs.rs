@@ -267,6 +267,40 @@ pub fn crop(desktop: &[u8], desktop_w: u32, vp: &Viewport, out: &mut [u8]) {
     }
 }
 
+/// A mirror's frame: `vp`'s part of the desktop fitted into `out`
+/// (`out_w` x `out_h`), keeping its shape: scaled by the same factor both
+/// ways, centred, black bars on the sides that don't fill. Same size is a
+/// plain [`crop`]. Nearest sample: a mirror is for showing, not for detail.
+pub fn crop_fit(desktop: &[u8], desktop_w: u32, vp: &Viewport, out: &mut [u8], out_w: u32, out_h: u32) {
+    if (vp.width, vp.height) == (out_w, out_h) {
+        return crop(desktop, desktop_w, vp, out);
+    }
+    out.fill(0);
+    if vp.width == 0 || vp.height == 0 || out_w == 0 || out_h == 0 {
+        return;
+    }
+    /* The fitted picture: w x h at (ox, oy), as large as fits. */
+    let (w, h) = if u64::from(out_w) * u64::from(vp.height) <= u64::from(out_h) * u64::from(vp.width) {
+        (out_w, ((u64::from(vp.height) * u64::from(out_w)) / u64::from(vp.width)) as u32)
+    } else {
+        (((u64::from(vp.width) * u64::from(out_h)) / u64::from(vp.height)) as u32, out_h)
+    };
+    let (ox, oy) = ((out_w - w) / 2, (out_h - h) / 2);
+    let stride = desktop_w as usize * 4;
+    let cols: Vec<usize> = (0..w).map(|x| (vp.x + (u64::from(x) * u64::from(vp.width) / u64::from(w)) as u32) as usize * 4).collect();
+    for y in 0..h {
+        let sy = vp.y as usize + (u64::from(y) * u64::from(vp.height) / u64::from(h)) as usize;
+        let row = sy * stride;
+        let dst = ((oy + y) as usize * out_w as usize + ox as usize) * 4;
+        for (x, &c) in cols.iter().enumerate() {
+            let d = dst + x * 4;
+            if let Some(px) = desktop.get(row + c..row + c + 4) {
+                out[d..d + 4].copy_from_slice(px);
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -401,5 +435,22 @@ mod tests {
         assert_eq!(auto_scale(&edid((0, 0), (0, 0)), 3840, 2160), 1000);
         // A tiny 4K panel stops at 3.0.
         assert_eq!(auto_scale(&edid((60, 34), (0, 0)), 3840, 2160), 3000);
+    }
+
+    #[test]
+    fn a_mirror_fits_its_source_and_keeps_the_shape() {
+        // A 4x2 desktop part (each pixel its own value) into 8x8: scaled 2x,
+        // 8x4 centred with 2 black rows above and below.
+        let d: Vec<u8> = (0..4 * 2).flat_map(|i| [i as u8 + 1; 4]).collect();
+        let mut out = vec![9u8; 8 * 8 * 4];
+        crop_fit(&d, 4, &vp(1, 1, 0, 0, 4, 2), &mut out, 8, 8);
+        let px = |x: usize, y: usize| out[(y * 8 + x) * 4];
+        assert_eq!((px(0, 0), px(7, 1), px(0, 6), px(7, 7)), (0, 0, 0, 0), "bars");
+        assert_eq!((px(0, 2), px(1, 2), px(2, 2), px(7, 3)), (1, 1, 2, 4));
+        assert_eq!((px(0, 4), px(7, 5)), (5, 8));
+        // Same size: a plain copy.
+        let mut same = vec![0u8; 4 * 2 * 4];
+        crop_fit(&d, 4, &vp(1, 1, 0, 0, 4, 2), &mut same, 4, 2);
+        assert_eq!(same, d);
     }
 }

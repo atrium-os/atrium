@@ -513,6 +513,14 @@ impl Connection {
         self.wm_response(control::OP_WM_ARRANGE_OUTPUTS).map(|_| ())
     }
 
+    /// Make a monitor mirror another (`of` = 0 stops), by identity (WM
+    /// only; `OP_WM_MIRROR_OUTPUT`).
+    pub fn wm_mirror_output(&mut self, identity: u64, of: u64) -> io::Result<()> {
+        let p = fresco_protocol::WmMirrorOutputPayload { identity, of };
+        self.send_window_managed(control::OP_WM_MIRROR_OUTPUT, &p)?;
+        self.wm_response(control::OP_WM_MIRROR_OUTPUT).map(|_| ())
+    }
+
     /// Set a monitor's scale in thousandths (0 = automatic), by identity
     /// (WM only; `OP_WM_SET_OUTPUT_SCALE`).
     pub fn wm_set_output_scale(&mut self, identity: u64, scale_milli: u32) -> io::Result<()> {

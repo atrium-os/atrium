@@ -5285,13 +5285,15 @@ held when it exits, so `display_multi` can share a boot with the rest.
 With Forum running: `forum-ctl outputs` lists the monitors, where they
 sit and their scale, `forum-ctl arrange 1 left-of 0` moves one,
 `forum-ctl scale 1 1.5` (or `auto`) sets a monitor's scale, `forum-ctl
-move-monitor` sends the focused window to the next monitor
+mirror 1 0` shows output 0's picture on output 1 too (`mirror 1 off`
+stops; `outputs` lists a mirror with the source's rect and a `mirrors
+monitor` line), `forum-ctl move-monitor` sends the focused window to the next monitor
 (Super+Shift+Right). Forum remembers arrangements and scales in
 `/var/db/atrium/<user>/forum-displays.state` (`$FORUM_DISPLAYS`); delete it
 to forget them. gpusim's monitors carry physical sizes: code 1 a 24"
 1080p, 2 a 27" 4K (scale 1.5), 3 and 5 a 24" desktop, 4 a 27" 1440p.
 `scripts/vm-multimonitor-chaos.sh` (copy to /root/s in the guest) runs a
-seeded storm of plugs, unplugs, dropouts, bursts and arrangements and checks
+seeded storm of plugs, unplugs, dropouts, bursts, arrangements and mirroring and checks
 after each step that frescod and forum-wm live, every plugged monitor is
 shown, no window is off-screen, and a set of monitors comes back as it was
 left; it ends with `chaos: N steps, M failed` (~25 min for 60 steps). After changing gpusim's QEMU device, copy `qemu-device/gpusim.c`

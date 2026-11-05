@@ -298,7 +298,7 @@ fn subtract(r: &WmRect, cut: &WmRect) -> Vec<WmRect> {
 ///
 /// ```text
 /// scale <identity> <thousandths>
-/// set <identity>@<x>,<y>:<w>x<h> ...
+/// set <identity>@<x>,<y>:<w>x<h> ... [mirror <identity>=<source> ...]
 /// ```
 pub mod displays {
     use fresco_protocol::{WmOutput, WmOutputPlacement};
@@ -316,8 +316,11 @@ pub mod displays {
 
     #[derive(Debug, Clone, Default, PartialEq, Eq)]
     pub struct DisplayMemory {
-        /// By set of monitors (sorted identities): where each one sat.
+        /// By set of monitors (sorted identities): where each one sat
+        /// (mirrors have no place of their own and are not listed).
         pub sets: HashMap<Vec<u64>, Vec<Place>>,
+        /// By set of monitors: which mirrored which, (mirror, source).
+        pub mirrors: HashMap<Vec<u64>, Vec<(u64, u64)>>,
         /// Scales the session set, by monitor (thousandths).
         pub scales: HashMap<u64, u32>,
     }
@@ -331,13 +334,20 @@ pub mod displays {
         v
     }
 
-    /// The places, shifted so the desktop starts at (0, 0) (as frescod
-    /// keeps it), in identity order.
+    /// The mirrorings, (mirror, source), sorted.
+    pub fn mirrors_of(outputs: &[WmOutput]) -> Vec<(u64, u64)> {
+        let mut v: Vec<(u64, u64)> = outputs.iter().filter(|o| o.mirror_of != 0).map(|o| (o.identity, o.mirror_of)).collect();
+        v.sort_unstable();
+        v
+    }
+
+    /// The places of the monitors that aren't mirrors, shifted so the
+    /// desktop starts at (0, 0) (as frescod keeps it), in identity order.
     pub fn places_of(outputs: &[WmOutput]) -> Vec<Place> {
-        let mx = outputs.iter().map(|o| o.rect.x).min().unwrap_or(0);
-        let my = outputs.iter().map(|o| o.rect.y).min().unwrap_or(0);
-        let mut v: Vec<Place> = outputs
-            .iter()
+        let plain = || outputs.iter().filter(|o| o.mirror_of == 0);
+        let mx = plain().map(|o| o.rect.x).min().unwrap_or(0);
+        let my = plain().map(|o| o.rect.y).min().unwrap_or(0);
+        let mut v: Vec<Place> = plain()
             .map(|o| Place { identity: o.identity, x: o.rect.x - mx, y: o.rect.y - my, w: o.rect.w, h: o.rect.h })
             .collect();
         v.sort_by_key(|p| p.identity);
@@ -351,12 +361,32 @@ pub mod displays {
                 return false;
             }
             let places = places_of(outputs);
+            let mirrors = mirrors_of(outputs);
             let key = set_of(outputs);
-            if self.sets.get(&key) == Some(&places) {
+            if self.sets.get(&key) == Some(&places) && self.mirrors.get(&key).map_or(mirrors.is_empty(), |m| *m == mirrors) {
                 return false;
             }
-            self.sets.insert(key, places);
+            self.sets.insert(key.clone(), places);
+            if mirrors.is_empty() {
+                self.mirrors.remove(&key);
+            } else {
+                self.mirrors.insert(key, mirrors);
+            }
             true
+        }
+
+        /// The mirrorings to change so this set mirrors as it was left:
+        /// (mirror, source), source 0 to stop. Empty when it already does.
+        pub fn restore_mirrors(&self, outputs: &[WmOutput]) -> Vec<(u64, u64)> {
+            let key = set_of(outputs);
+            if !self.sets.contains_key(&key) {
+                return Vec::new();
+            }
+            let want = self.mirrors.get(&key).cloned().unwrap_or_default();
+            let now = mirrors_of(outputs);
+            let mut v: Vec<(u64, u64)> = now.iter().filter(|m| !want.iter().any(|w| w.0 == m.0)).map(|m| (m.0, 0)).collect();
+            v.extend(want.iter().filter(|w| !now.contains(w)).copied());
+            v
         }
 
         /// The arrangement to ask for so this set sits where it was left:
@@ -382,10 +412,14 @@ pub mod displays {
             for (id, s) in scales {
                 lines.push(format!("scale {id:016x} {s}"));
             }
-            let mut sets: Vec<&Vec<Place>> = self.sets.values().collect();
-            sets.sort_by_key(|v| v.iter().map(|p| p.identity).collect::<Vec<_>>());
-            for v in sets {
-                let ps: Vec<String> = v.iter().map(|p| format!("{:016x}@{},{}:{}x{}", p.identity, p.x, p.y, p.w, p.h)).collect();
+            let mut sets: Vec<(&Vec<u64>, &Vec<Place>)> = self.sets.iter().collect();
+            sets.sort_by(|a, b| a.0.cmp(b.0));
+            for (key, v) in sets {
+                let mut ps: Vec<String> = v.iter().map(|p| format!("{:016x}@{},{}:{}x{}", p.identity, p.x, p.y, p.w, p.h)).collect();
+                if let Some(m) = self.mirrors.get(key).filter(|m| !m.is_empty()) {
+                    ps.push("mirror".into());
+                    ps.extend(m.iter().map(|(a, b)| format!("{a:016x}={b:016x}")));
+                }
                 lines.push(format!("set {}", ps.join(" ")));
             }
             let mut t = String::from("# forum-wm: where each set of monitors sat, and monitor scales\n");
@@ -409,11 +443,24 @@ pub mod displays {
                         }
                     }
                     Some(&"set") if w.len() > 1 => {
-                        let places: Option<Vec<Place>> = w[1..].iter().map(|p| parse_place(p)).collect();
-                        if let Some(mut v) = places {
+                        let cut = w.iter().position(|&x| x == "mirror").unwrap_or(w.len());
+                        let places: Option<Vec<Place>> = w[1..cut].iter().map(|p| parse_place(p)).collect();
+                        let mirrors: Option<Vec<(u64, u64)>> = w[cut.min(w.len())..].iter().skip(1).map(|p| {
+                            let (a, b) = p.split_once('=')?;
+                            Some((u64::from_str_radix(a, 16).ok()?, u64::from_str_radix(b, 16).ok()?))
+                        }).collect();
+                        if let (Some(mut v), Some(mut mi)) = (places, mirrors) {
                             v.sort_by_key(|p| p.identity);
-                            let key: Vec<u64> = v.iter().map(|p| p.identity).collect();
-                            m.sets.insert(key, v);
+                            mi.sort_unstable();
+                            let mut key: Vec<u64> = v.iter().map(|p| p.identity).chain(mi.iter().map(|x| x.0)).collect();
+                            key.sort_unstable();
+                            key.dedup();
+                            if !v.is_empty() {
+                                if !mi.is_empty() {
+                                    m.mirrors.insert(key.clone(), mi);
+                                }
+                                m.sets.insert(key, v);
+                            }
                         }
                     }
                     _ => {}
@@ -535,6 +582,9 @@ pub mod daemon {
         /// Set a monitor's scale, thousandths, 0 = automatic
         /// (OP_WM_SET_OUTPUT_SCALE); EV_DISPLAY_CHANGED follows.
         fn set_output_scale(&mut self, identity: u64, scale_milli: u32) -> io::Result<()>;
+        /// Make a monitor mirror another, `of` = 0 stops (OP_WM_MIRROR_OUTPUT);
+        /// EV_DISPLAY_CHANGED follows.
+        fn mirror_output(&mut self, identity: u64, of: u64) -> io::Result<()>;
     }
 
     /// The WM core state: output geometry, the human's focus intent, and the
@@ -618,7 +668,7 @@ pub mod daemon {
         /// primary is the top-left one (top row, then leftmost); it holds the
         /// bar and the dock, and takes the windows whose monitor is gone.
         pub fn monitors(&self) -> Vec<WmOutput> {
-            let mut v: Vec<WmOutput> = self.outputs.iter().filter(|o| o.present).copied().collect();
+            let mut v: Vec<WmOutput> = self.outputs.iter().filter(|o| o.present && o.mirror_of == 0).copied().collect();
             v.sort_by_key(|o| (o.rect.y, o.rect.x, o.output));
             v
         }
@@ -696,6 +746,14 @@ pub mod daemon {
                 }
             }
             if restore {
+                let mirrors = self.displays.restore_mirrors(outputs);
+                for &(m, src) in &mirrors {
+                    conn.mirror_output(m, src)?;
+                }
+                if !mirrors.is_empty() {
+                    eprintln!("forum-wm: mirroring as this set was left");
+                    return Ok(()); // the arrangement follows on the next change
+                }
                 if let Some(p) = self.displays.restore(outputs) {
                     eprintln!("forum-wm: putting {} monitor(s) back where they were", p.len());
                     return conn.arrange_outputs(p);
@@ -705,6 +763,21 @@ pub mod daemon {
                 self.save_displays();
             }
             Ok(())
+        }
+
+        /// Make output `which` mirror output `of` (None: stop). frescod
+        /// checks it; the WM re-lays out on the EV_DISPLAY_CHANGED that
+        /// follows, which also remembers it.
+        pub fn mirror(&mut self, conn: &mut impl FrescoConn, which: u32, of: Option<u32>) -> io::Result<()> {
+            let find = |n: u32| self.outputs.iter().find(|o| o.output == n).copied();
+            let Some(a) = find(which) else {
+                return Err(io::Error::new(io::ErrorKind::NotFound, "no such output"));
+            };
+            let src = match of {
+                None => 0,
+                Some(n) => find(n).ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "no such output"))?.identity,
+            };
+            conn.mirror_output(a.identity, src)
         }
 
         /// Set output `which`'s scale (thousandths; 0 = automatic) and
@@ -1218,6 +1291,10 @@ pub mod control {
                 Ok(()) => Reply::Ack,
                 Err(e) => Reply::Err { message: e.to_string() },
             },
+            Intent::MirrorOutput { output, of } => match wm.mirror(conn, output, of) {
+                Ok(()) => Reply::Ack,
+                Err(e) => Reply::Err { message: e.to_string() },
+            },
             Intent::SetOutputScale { output, scale_milli } => match wm.set_scale(conn, output, scale_milli) {
                 Ok(()) => Reply::Ack,
                 Err(e) => Reply::Err { message: e.to_string() },
@@ -1432,6 +1509,7 @@ mod tests {
         outputs: Vec<fresco_protocol::WmOutput>,
         arranged: Option<Vec<fresco_protocol::WmOutputPlacement>>,
         scaled: Vec<(u64, u32)>,
+        mirrored: Vec<(u64, u64)>,
     }
     impl FrescoConn for MockConn {
         fn enumerate(&mut self) -> io::Result<Vec<WmSurfaceInfo>> {
@@ -1464,6 +1542,10 @@ mod tests {
         }
         fn set_output_scale(&mut self, identity: u64, scale_milli: u32) -> io::Result<()> {
             self.scaled.push((identity, scale_milli));
+            Ok(())
+        }
+        fn mirror_output(&mut self, identity: u64, of: u64) -> io::Result<()> {
+            self.mirrored.push((identity, of));
             Ok(())
         }
     }
@@ -1765,7 +1847,7 @@ mod tests {
     fn mon(output: u32, identity: u64, x: i32, w: i32, h: i32) -> fresco_protocol::WmOutput {
         fresco_protocol::WmOutput {
             output, identity, rect: WmRect { x, y: 0, w, h }, refresh_mhz: 60000, present: true,
-            scale_milli: 1000, scale_auto: true,
+            scale_milli: 1000, scale_auto: true, mirror_of: 0,
         }
     }
 
@@ -1820,6 +1902,37 @@ mod tests {
         let other = vec![mon(0, 10, 0, 1920, 1080), mon(1, 20, 1920, 2560, 1440)];
         wm.displays.remember(&[mon(0, 10, 2560, 1920, 1080), mon(1, 20, 0, 1920, 1080)]);
         assert!(wm.displays.restore(&other).is_none());
+    }
+
+    #[test]
+    fn a_mirror_is_no_monitor_of_its_own_and_comes_back_as_left() {
+        use crate::displays::DisplayMemory;
+        let mirror = |mut o: fresco_protocol::WmOutput, of| { o.mirror_of = of; o.rect.x = 0; o };
+        let (mut wm, mut conn) = two_monitors();
+        wm.mirror(&mut conn, 1, Some(0)).unwrap();
+        assert_eq!(conn.mirrored, vec![(20, 10)]);
+        // frescod applies it: monitor 20 shows 10's part and lays nothing out.
+        let both = vec![mon(0, 10, 0, 1920, 1080), mirror(mon(1, 20, 0, 1920, 1080), 10)];
+        wm.set_outputs(&mut conn, both.clone()).unwrap();
+        assert_eq!(wm.monitors().len(), 1, "a mirror is not a monitor to lay out on");
+        let l = wm.reconcile(&mut conn).unwrap();
+        assert!(l.slots.iter().all(|s| s.rect.x < 1920), "everything on the source");
+        // Remembered with the set, through the file, and put back after a
+        // restart that brought the set up unmirrored.
+        let m = DisplayMemory::from_text(&wm.displays.to_text());
+        assert_eq!(m, wm.displays);
+        assert_eq!(m.mirrors[&vec![10, 20]], vec![(20, 10)]);
+        let mut wm2 = Wm::new(screen());
+        wm2.displays = m;
+        let mut conn2 = MockConn::default();
+        wm2.apply_remembered_displays(&mut conn2, &[mon(0, 10, 0, 1920, 1080), mon(1, 20, 1920, 1920, 1080)], true).unwrap();
+        assert_eq!(conn2.mirrored, vec![(20, 10)]);
+        // Stopping: told to frescod, remembered once it lands.
+        wm.mirror(&mut conn, 1, None).unwrap();
+        assert_eq!(conn.mirrored.last(), Some(&(20, 0)));
+        wm.set_outputs(&mut conn, vec![mon(0, 10, 0, 1920, 1080), mon(1, 20, 1920, 1920, 1080)]).unwrap();
+        assert!(wm.displays.mirrors.get(&vec![10, 20]).is_none());
+        assert_eq!(wm.monitors().len(), 2);
     }
 
     #[test]

@@ -147,6 +147,8 @@ pub mod control {
     pub const OP_WM_ARRANGE_OUTPUTS:    u16 = 0x0526; // WmArrangeOutputsPayload
     // A monitor's scale (its UI size): windows on it get EV_WINDOW_DPI_CHANGED.
     pub const OP_WM_SET_OUTPUT_SCALE:   u16 = 0x0527; // WmSetOutputScalePayload
+    // Show one monitor's part of the desktop on another as well (mirroring).
+    pub const OP_WM_MIRROR_OUTPUT:      u16 = 0x0528; // WmMirrorOutputPayload
 
     // Async events (server → client). Sent with envelope flag
     // ASYNC_EVENT (aqueduct::envelope::flags::ASYNC_EVENT).
@@ -315,6 +317,23 @@ pub struct WmOutput {
     pub scale_milli: u32,
     /// `scale_milli` is the automatic one (not set by the session).
     pub scale_auto: bool,
+    /// The monitor (identity) this one mirrors, 0 for none. A mirror shows
+    /// its source's part of the desktop (`rect` is the source's), scaled to
+    /// fit its own mode when the sizes differ; it is not a place of its own
+    /// to lay windows out on.
+    pub mirror_of: u64,
+}
+
+/// `OP_WM_MIRROR_OUTPUT` — make monitor `identity` mirror monitor `of`, or
+/// stop mirroring with `of` = 0. The source must be on the desktop and not
+/// a mirror itself, and a monitor others mirror cannot become a mirror.
+/// frescod runs the mirror at the source's size when the monitor offers it,
+/// else scales; it is remembered for this set of monitors.
+/// `EV_DISPLAY_CHANGED` follows.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub struct WmMirrorOutputPayload {
+    pub identity: u64,
+    pub of: u64,
 }
 
 /// `OP_WM_SET_OUTPUT_SCALE` — set a monitor's scale, by identity, in

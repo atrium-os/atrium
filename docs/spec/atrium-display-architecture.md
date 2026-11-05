@@ -343,6 +343,17 @@ the 2.x ioctls act on output 0.
   mostly covers with `EV_WINDOW_DPI_CHANGED` whenever that changes (moved
   to another monitor, or the monitor's scale set); it renders at that
   scale. Window geometry stays in desktop pixels.
+- **Mirroring.** `OP_WM_MIRROR_OUTPUT` (`forum-ctl mirror A B|off`) makes a
+  monitor show another's part of the desktop instead of a part of its own.
+  It takes the source's size when its monitor offers that mode (pixel for
+  pixel), else it scales to fit with the shape kept and bars on the sides;
+  stopping puts it back at its preferred mode. A mirror has no place on the
+  desktop (Forum lays nothing out on it, its windows go to the primary) and
+  each output still has its own CRTC, timing and pacing, so a 60 Hz mirror
+  never holds back a 120 Hz source. Only a plain monitor can be a source,
+  and a source cannot become a mirror. Which monitor mirrors which is
+  remembered with the set (frescod while it runs, Forum across restarts);
+  a mirror whose source leaves gets a place of its own again.
 
 ## 8. The output topology — connectors, encoders, PHYs (HDMI / DP / USB-C)
 

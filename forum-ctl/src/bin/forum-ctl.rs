@@ -9,12 +9,13 @@
 //!   forum-ctl arrange A SIDE B    put output A right-of / left-of / above / below output B
 //!   forum-ctl move-monitor        send the focused window to the next monitor
 //!   forum-ctl scale N F|auto      show output N at scale F (e.g. 1.5), or the automatic one
+//!   forum-ctl mirror A B|off      show output B's picture on output A too, or stop
 
 use forum_ctl::{default_socket_path, request, Intent, Reply};
 
 fn usage() -> ! {
     eprintln!("usage: forum-ctl surfaces | focus ID | modes | mode WxH[@Hz] | outputs \
-               | arrange A right-of|left-of|above|below B | move-monitor | scale N F|auto");
+               | arrange A right-of|left-of|above|below B | move-monitor | scale N F|auto | mirror A B|off");
     std::process::exit(2)
 }
 
@@ -48,6 +49,10 @@ fn main() {
             of: b.parse().unwrap_or_else(|_| usage()),
         },
         ["move-monitor"] => Intent::MoveToNextMonitor,
+        ["mirror", a, b] => Intent::MirrorOutput {
+            output: a.parse().unwrap_or_else(|_| usage()),
+            of: if *b == "off" { None } else { Some(b.parse().unwrap_or_else(|_| usage())) },
+        },
         ["scale", n, f] => Intent::SetOutputScale {
             output: n.parse().unwrap_or_else(|_| usage()),
             scale_milli: if *f == "auto" { 0 } else {
@@ -81,6 +86,9 @@ fn main() {
                          o.refresh_mhz as f64 / 1000.0, o.rect.x, o.rect.y,
                          o.scale_milli as f64 / 1000.0, if o.scale_auto { "" } else { " (set)" }, o.identity,
                          if o.present { "" } else { " (gone, place kept)" });
+                if o.mirror_of != 0 {
+                    println!("  mirrors monitor {:016x}", o.mirror_of);
+                }
             }
         }
         Ok(Reply::Err { message }) => { eprintln!("forum-ctl: {message}"); std::process::exit(1) }

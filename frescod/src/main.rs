@@ -115,15 +115,21 @@ fn main() -> std::io::Result<()> {
     let mut remembered: HashMap<outputs::DisplaySet, outputs::Arrangement> = HashMap::new();
     /* Monitor scales the session set (OP_WM_SET_OUTPUT_SCALE), by identity. */
     let mut scales: HashMap<u64, u32> = HashMap::new();
+    /* Which monitor mirrors which, remembered per set of monitors
+     * (OP_WM_MIRROR_OUTPUT): (mirror, source) identities. */
+    let mut mirrors_memo: HashMap<outputs::DisplaySet, Vec<(u64, u64)>> = HashMap::new();
+    /* Re-modes still to do: a mirror going to its source's size, or back
+     * to its own preferred mode. */
+    let mut remodes: Vec<(u32, (u32, u32, u32))> = Vec::new();
     let mut tracker = outputs::Tracker::default();
     /* The gpu renderer can't encode HDR; corrected below once it exists. */
     let guess_hdr = std::env::var("FRESCOD_RENDERER").map_or(true, |v| v != "gpu");
     let seen = seen_outputs(&dpy)?;
-    heads::reconfigure(&cx, &mut heads, &seen, None, wanted_mode(), &remembered, guess_hdr)?;
+    heads::reconfigure(&cx, &mut heads, &seen, &[], wanted_mode(), &remembered, guess_hdr)?;
     if heads.is_empty() {
         return Err(io_other("display: no monitor, or its EDID lists no modes"));
     }
-    remember(&heads, &mut remembered);
+    remember(&heads, &mut remembered, &mut mirrors_memo);
     let (mut dw, mut dh) = desktop_of(&heads);
     let mut refresh = fastest(&heads);
     screen::set(dw, dh, refresh);
@@ -342,19 +348,47 @@ fn main() -> std::io::Result<()> {
                 publish_outputs(&frontend, &heads, &scales);
             }
         }
-        let request = frontend.lock().unwrap().take_mode_request();
         let mut changed = false;
+        /* A WM mirroring a monitor (OP_WM_MIRROR_OUTPUT), or stopping. */
+        for r in frontend.lock().unwrap().take_mirror_requests() {
+            match set_mirror(&mut heads, r.identity, r.of) {
+                Ok(remode) => {
+                    remodes.extend(remode);
+                    heads::arrange(&mut heads, &remembered);
+                    changed = true;
+                }
+                Err(e) => eprintln!("frescod: mirroring refused: {e}"),
+            }
+        }
+        let mut requests: Vec<(u32, (u32, u32, u32))> = std::mem::take(&mut remodes);
+        if let Some(r) = frontend.lock().unwrap().take_mode_request() {
+            requests.retain(|q| q.0 != 0);
+            requests.push((0, r));
+        }
         let settled = hotplug_pending && tracker.settled(now);
         let regrace = recheck_at.is_some_and(|t| now >= t);
-        if settled || regrace || request.is_some() {
+        if settled || regrace || !requests.is_empty() {
             if settled {
                 hotplug_pending = false;
             }
             recheck_at = None;
-            match reconfigure_heads(&cx, &mut heads, &mut tracker, &remembered, request, renderer.can_hdr()) {
+            let before = outputs::display_set(heads.iter().map(|h| h.identity));
+            match reconfigure_heads(&cx, &mut heads, &mut tracker, &remembered, &requests, renderer.can_hdr()) {
                 Ok((true, again)) => {
                     recheck_at = again;
                     changed = true;
+                    /* Another set of monitors: mirror as this set was left. */
+                    let set = outputs::display_set(heads.iter().map(|h| h.identity));
+                    if set != before {
+                        if let Some(pairs) = mirrors_memo.get(&set).cloned() {
+                            for (m, src) in pairs {
+                                if let Ok(remode) = set_mirror(&mut heads, m, src) {
+                                    remodes.extend(remode);
+                                }
+                            }
+                            heads::arrange(&mut heads, &remembered);
+                        }
+                    }
                 }
                 Ok((false, again)) => recheck_at = again,
                 Err(e) => eprintln!("frescod: display reconfiguration failed ({e}); staying"),
@@ -403,7 +437,7 @@ fn main() -> std::io::Result<()> {
                     Err(e) => eprintln!("frescod: GPU renderer not back ({e}); staying on Tier-2"),
                 }
             }
-            remember(&heads, &mut remembered);
+            remember(&heads, &mut remembered, &mut mirrors_memo);
             screen::set(dw, dh, refresh);
             publish_outputs(&frontend, &heads, &scales);
             let info = {
@@ -536,7 +570,7 @@ fn reconfigure_heads<'a>(
     heads: &mut Vec<heads::Head<'a>>,
     tracker: &mut outputs::Tracker,
     remembered: &HashMap<outputs::DisplaySet, outputs::Arrangement>,
-    request: Option<(u32, u32, u32)>,
+    requests: &[(u32, (u32, u32, u32))],
     can_hdr: bool,
 ) -> std::io::Result<(bool, Option<Instant>)> {
     let seen = seen_outputs(cx.dpy)?;
@@ -552,19 +586,65 @@ fn reconfigure_heads<'a>(
     for h in heads.iter() {
         let _ = h.flip_done.wait(h.frame, flip_timeout_ms());
     }
-    let changed = heads::reconfigure(cx, heads, &target.keep, request, wanted_mode(), remembered, can_hdr)?;
-    if !changed && request.is_none() {
+    let changed = heads::reconfigure(cx, heads, &target.keep, requests, wanted_mode(), remembered, can_hdr)?;
+    if !changed && requests.is_empty() {
         let kept: Vec<String> = heads.iter().map(|h| format!("{}x{}@{} mHz", h.mode.width, h.mode.height, h.mode.refresh_mhz)).collect();
         eprintln!("frescod: hotplug settled; the monitors are as they were ({})", kept.join(", "));
     }
     Ok((changed, target.recheck))
 }
 
-/// Remember where this set of monitors sits, for when it comes back.
-fn remember(heads: &[heads::Head<'_>], remembered: &mut HashMap<outputs::DisplaySet, outputs::Arrangement>) {
-    let vps: Vec<outputs::Viewport> = heads.iter().map(|h| h.vp).collect();
-    let (set, arr) = outputs::remember(&vps);
-    remembered.insert(set, arr);
+/// Remember where this set of monitors sits, and which mirror which, for
+/// when it comes back. Mirrors have no place of their own.
+fn remember(
+    heads: &[heads::Head<'_>],
+    remembered: &mut HashMap<outputs::DisplaySet, outputs::Arrangement>,
+    mirrors: &mut HashMap<outputs::DisplaySet, Vec<(u64, u64)>>,
+) {
+    let set = outputs::display_set(heads.iter().map(|h| h.identity));
+    let vps: Vec<outputs::Viewport> = heads.iter().filter(|h| h.mirror_of.is_none()).map(|h| h.vp).collect();
+    let (_, arr) = outputs::remember(&vps);
+    remembered.insert(set.clone(), arr);
+    mirrors.insert(set, heads.iter().filter_map(|h| h.mirror_of.map(|src| (h.identity, src))).collect());
+}
+
+/// Make monitor `identity` mirror monitor `of` (0: stop). Returns the
+/// re-mode it wants: a new mirror goes to its source's size if its monitor
+/// offers that (a pixel for a pixel, no scaling), a former mirror back to
+/// its preferred mode.
+fn set_mirror(heads: &mut [heads::Head<'_>], identity: u64, of: u64) -> Result<Option<(u32, (u32, u32, u32))>, String> {
+    let k = heads.iter().position(|h| h.identity == identity).ok_or("no such monitor")?;
+    if of == 0 {
+        if heads[k].mirror_of.take().is_none() {
+            return Ok(None);
+        }
+        let h = &heads[k];
+        eprintln!("frescod: output {} stops mirroring", h.output);
+        let pref = heads::preferred_mode(&h.conn.modes).map(|i| h.conn.modes[i]);
+        return Ok(pref
+            .filter(|m| (m.width, m.height, m.refresh_mhz) != (h.mode.width, h.mode.height, h.mode.refresh_mhz))
+            .map(|m| (h.output, (m.width, m.height, m.refresh_mhz))));
+    }
+    let src = heads.iter().find(|h| h.identity == of).ok_or("no such source monitor")?;
+    if of == identity || src.mirror_of.is_some() || heads.iter().any(|h| h.mirror_of == Some(identity)) {
+        return Err("a monitor mirrors a plain one, not itself or a mirror".into());
+    }
+    let (sw, sh, sr) = (src.mode.width, src.mode.height, src.mode.refresh_mhz);
+    let src_out = src.output;
+    let h = &mut heads[k];
+    h.mirror_of = Some(of);
+    let want = heads::find_mode(&h.conn.modes, Some((sw, sh, sr))).or_else(|| heads::find_mode(&h.conn.modes, Some((sw, sh, 0))));
+    let remode = want
+        .map(|i| h.conn.modes[i])
+        .filter(|m| (m.width, m.height, m.refresh_mhz) != (h.mode.width, h.mode.height, h.mode.refresh_mhz))
+        .map(|m| (h.output, (m.width, m.height, m.refresh_mhz)));
+    eprintln!(
+        "frescod: output {} mirrors output {}{}",
+        h.output,
+        src_out,
+        if want.is_some() { "" } else { " (scaled to fit: its monitor has no mode of that size)" }
+    );
+    Ok(remode)
 }
 
 fn desktop_of(heads: &[heads::Head<'_>]) -> (u32, u32) {
@@ -597,7 +677,7 @@ fn present_head(
             .present(&h.scan, back, desktop, deadline_ns, (&h.copy_done, next), h.hdr_on.then_some(enc))
             .map_err(io_other)?,
         None => {
-            outputs::crop(desktop, desktop_w, &h.vp, &mut h.staging);
+            outputs::crop_fit(desktop, desktop_w, &h.vp, &mut h.staging, h.mode.width, h.mode.height);
             if h.hdr_on {
                 enc.encode(&mut h.staging);
             }
@@ -636,6 +716,7 @@ fn publish_outputs(frontend: &Arc<Mutex<EnvelopeFrontend>>, heads: &[heads::Head
                 present: h.present,
                 scale_milli: set.unwrap_or_else(|| outputs::auto_scale(&h.conn.edid, h.mode.width, h.mode.height)),
                 scale_auto: set.is_none(),
+                mirror_of: h.mirror_of.unwrap_or(0),
             }
         })
         .collect();
@@ -647,9 +728,12 @@ fn publish_outputs(frontend: &Arc<Mutex<EnvelopeFrontend>>, heads: &[heads::Head
 /// result must keep every monitor touching another with no overlap
 /// (outputs::validate), else nothing changes.
 fn place_outputs(heads: &mut [heads::Head<'_>], placements: &[fresco_protocol::WmOutputPlacement]) -> Result<(), String> {
-    let mut at: Vec<(i64, i64)> = heads
+    /* Mirrors have no place of their own: they follow their source. */
+    let plain: Vec<usize> = (0..heads.len()).filter(|&k| heads[k].mirror_of.is_none()).collect();
+    let mut at: Vec<(i64, i64)> = plain
         .iter()
-        .map(|h| {
+        .map(|&k| {
+            let h = &heads[k];
             placements
                 .iter()
                 .find(|p| p.identity == h.identity)
@@ -663,15 +747,16 @@ fn place_outputs(heads: &mut [heads::Head<'_>], placements: &[fresco_protocol::W
     if at.iter().any(|a| a.0 > i64::from(u16::MAX) || a.1 > i64::from(u16::MAX)) {
         return Err("too far apart".into());
     }
-    let vps: Vec<outputs::Viewport> = heads
+    let vps: Vec<outputs::Viewport> = plain
         .iter()
         .zip(&at)
-        .map(|(h, a)| outputs::Viewport { x: a.0 as u32, y: a.1 as u32, ..h.vp })
+        .map(|(&k, a)| outputs::Viewport { x: a.0 as u32, y: a.1 as u32, ..heads[k].vp })
         .collect();
     outputs::validate(&vps)?;
-    for (h, v) in heads.iter_mut().zip(vps) {
-        h.vp = v;
+    for (&k, v) in plain.iter().zip(vps) {
+        heads[k].vp = v;
     }
+    heads::place_mirrors(heads);
     Ok(())
 }
 
