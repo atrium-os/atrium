@@ -224,6 +224,13 @@ registers, HPD). frescod switches mode when the WM asks or a monitor
 changes and tells clients with `EV_DISPLAY_CHANGED`; forum-wm re-lays out.
 Spec: [atrium-display-architecture.md §7.2](spec/atrium-display-architecture.md).
 
+Display 2.2 adds variable refresh: CONNECTOR reports the monitor's range
+(from its EDID), `COMMIT_VRR` on a modeset turns it on, and the driver's
+optional `set_vrr` hook programs the CRTC (AMD: OTG `V_TOTAL_MIN/MAX`).
+frescod uses it whenever the range covers the mode, so frames go up when
+ready and an idle screen drops to the monitor's floor
+([§7.3](spec/atrium-display-architecture.md)).
+
 ## 6. Userspace bindings and protocols
 
 - **`atrium-gpu-rs`**: Rust binding. `atrium_gpu::amd::{Gpu, Vm, Bo, Syncobj,

@@ -5255,6 +5255,7 @@ In the guest:
 | `FRESCOD_CHROME_SOCK` | trusted chrome: `OPEN_CLIENT` then `SET_ORIGIN` (F4d strip) |
 | `FRESCOD_DAMAGE_THRESHOLD` | damage tracking tuning (gpu backend rasters only dirty tiles) |
 | `FRESCOD_GPU_ISOLATION_PROBE=1` | F4e check (gpu renderer): every window after the first rasters to the first window's surface address; expect EIO faults (`isolation.vm_faults`) and window 1 intact |
+| `FRESCOD_VRR=0` | fixed refresh even when the monitor offers variable refresh (on by default when its range covers the mode) |
 | `FRESCOD_MODE=WxH[@Hz]` | start in this mode if the monitor lists it (else its preferred mode); also the pick for a newly plugged monitor |
 | `FRESCOD_GPU_SOCK` | F6 app GPU channel: one GPU context + VM per connection (≤ 4 per uid); `FRESCOD_GPU_ONLY=1` serves only this channel. Test with `atrium-gpu-fuzz` (honest / hostile / isa) |
 
@@ -5263,8 +5264,10 @@ modes (`*` = lit), `forum-ctl mode 1280x720` or `mode 1920x1080@120`
 switches (`FORUM_CTL_SOCKET` if forum-wm runs bare). Swap the simulated
 monitor under a running frescod with `sysctl
 dev.atrium_gpu_amd_display.0.sim_plug=N` (0 VGA, 1 1080p, 2 4K, 3 the
-five-mode desktop monitor, -1 unplug; host root only). Kernel check:
-`display_modes` (needs the display free, so stop frescod first). Don't
+five-mode desktop monitor, -1 unplug; host root only). Kernel checks:
+`display_modes` and `display_vrr` (need the display free, so stop frescod
+first). After changing gpusim's QEMU device, copy `qemu-device/gpusim.c`
+into the QEMU fork and rebuild it, then restart the VM and gpusim-server. Don't
 `kldunload` the GPU modules while frescod or a renderer runs; reboot.
 
 Broker fuzzing (F3): `scripts/fresco-split-fuzz.sh` in the guest runs `atrium-split-fuzz` (hostile renderers + Navigator) against an animated probe client; `FUZZ_GPU=1` adds `atrium-gpu-fuzz` against the GPU channel. Kill leftover fuzz renderers between runs.

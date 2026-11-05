@@ -230,6 +230,29 @@ bandwidth limits — §8).
   on which forum-wm re-lays out. `forum-ctl modes` / `forum-ctl mode WxH[@Hz]`
   drive it by hand.
 
+### 7.3 v2.2 variable refresh (implemented 2026-11-05)
+
+- **Range.** The shared parser reads a monitor's VRR range from E-EDID 1.4:
+  the continuous-frequency feature bit plus a display range limits
+  descriptor at least 10 Hz wide (`atrium_edid_vrr_range`). CONNECTOR
+  reports it in `out_vrr_min_hz` / `out_vrr_max_hz` with flag `VRR`, and
+  `VRR_ACTIVE` while the lit mode runs with it. HDMI's VRR data block and
+  DisplayID's adaptive-sync block are not read yet.
+- **Turning it on.** `COMMIT_VRR` with `MODESET` runs that mode with
+  variable refresh; a `MODESET` without it turns VRR off. `EINVAL` without
+  `MODESET`, on a monitor without a range, or for a mode whose refresh is
+  outside the range. Commits after that are unchanged: a vsync'd flip ends
+  the frame it waits on as soon as the shortest frame (the mode's own
+  period) allows, and with nothing to show the monitor refreshes at its
+  floor.
+- **Driver hook.** `set_vrr(hw, timing, min_hz)` is optional in
+  `atrium_display_hw_ops`. AMD programs OTG `V_TOTAL_MIN` (the mode's total)
+  and `V_TOTAL_MAX` (stretched to `min_hz`, `atrium_timing_vtotal_at`) and
+  selects both in `V_TOTAL_CONTROL`.
+- **Policy.** frescod turns VRR on for any mode the range covers
+  (`FRESCOD_VRR=0` opts out). No pacing change was needed: it already
+  renders on damage and commits when the frame is ready.
+
 ## 8. The output topology — connectors, encoders, PHYs (HDMI / DP / USB-C)
 
 "How does the driver detect and redirect output to HDMI vs DisplayPort vs
