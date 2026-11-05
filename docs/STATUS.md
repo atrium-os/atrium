@@ -103,7 +103,7 @@ compute route chosen; security conditions F1–F6 in
 | App GPU channel in frescod (F6 G2–G4) | done | `4cf6395`, `a8a595d` |
 | F4f secure password input to frescod | waits on F5 + Navigator C0 | — |
 | F5 | deferred (Shankar) | — |
-| D4 real DCN 4.0.1 scanout/flip/vblank registers in gpusim + display kmod (modeset still `regDISP_*`) | done; display tests, `atrium_gpu_test`, `test_gpu_isolation`, jailed frescod pass on gpusim | gpusim `3f37036`, `60948e9` |
+| D4 real DCN 4.0.1 scanout/flip/vblank registers in gpusim + display kmod (modeset still `regDISP_*`) | done; display tests, `atrium_gpu_test`, `test_gpu_isolation`, jailed frescod pass on gpusim | gpusim `3f37036`, `e3b0658` |
 | D5 silicon display (inherit GOP mode first) | not started (needs native boot on the R9700; it has no monitor) | — |
 
 Slice detail: [spec/fresco-f4-split.md](spec/fresco-f4-split.md). The whole display stack as it stands: [GRAPHICS-STACK.md](GRAPHICS-STACK.md). Screenshots
