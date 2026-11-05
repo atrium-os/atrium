@@ -196,7 +196,7 @@ for stock-source builds).
 
 | Module | Source | Device | Surface | Status |
 |---|---|---|---|---|
-| `atrium_gpu_amd_pci.ko` + `atrium_gpu_amd.ko` + `atrium_gpu_amd_display.ko` | `atrium-gpu-amd/` | gpusim in QEMU (`run-vm.sh --gpusim`, or `GPUSIM=1 cloud-vm.sh`); RDNA4 silicon next | `/dev/atrium-gpu0` (`'A'`), `/dev/atrium-display0` (`'D'` v2) | **The driver.** Firmware/MES bring-up, GPUVM with one VM per client, fd-named BOs/VMs/syncobjs, `VM_BIND`/`VM_BIND2` (read-only binds), doorbell queues, TLV caps incl. `CAP_ISA`, per-queue completions, hang watchdog, VM-fault → EIO, reset, powergating, DCN-style display on gpusim's `regDISP_*`. Isolation map: `atrium-gpu-amd/ISOLATION.md`. jaild-attested **experimental** until `test_gpu_isolation` passes on silicon |
+| `atrium_gpu_amd_pci.ko` + `atrium_gpu_amd.ko` + `atrium_gpu_amd_display.ko` | `atrium-gpu-amd/` | gpusim in QEMU (`run-vm.sh --gpusim`, or `GPUSIM=1 cloud-vm.sh`); RDNA4 silicon next | `/dev/atrium-gpu0` (`'A'`), `/dev/atrium-display0` (`'D'` v2) | **The driver.** Firmware/MES bring-up, GPUVM with one VM per client, fd-named BOs/VMs/syncobjs, `VM_BIND`/`VM_BIND2` (read-only binds), doorbell queues, TLV caps incl. `CAP_ISA`, per-queue completions, hang watchdog, VM-fault → EIO, reset, powergating, display scanout, flips and vblank/flip interrupts on the real DCN 4.0.1 registers (HUBP0, OTG0, IH client DCE; gpusim models them), with modeset, connector and EDID still on gpusim's `regDISP_*`. Isolation map: `atrium-gpu-amd/ISOLATION.md`. jaild-attested **experimental** until `test_gpu_isolation` passes on silicon |
 | `atrium_virtio_gpu.ko` | `atrium-kmod/atrium_virtio_gpu.c` | QEMU `virtio-gpu-gl-pci` | `'G'` + legacy `'D'` | **Legacy**, kept for the old `frescod-aqueduct` path |
 | `carillon.ko` | `carillon-kmod/` | QEMU `ivshmem-doorbell` | `/dev/carillon0` rings + MSI-X | Byte transport for the aqueduct-gpu wire to the Mac host. Not a GPU driver |
 | `atrium_bootfb.ko` | `atrium-kmod/bootfb/` | EFI GOP framebuffer | mmap cdev | Boot splash; exits when `/dev/atrium-display0` appears |
@@ -318,9 +318,11 @@ Tier-2 or our RDNA4 compiler. Mesa appears in three places only:
 - **No silicon yet.** `atrium-gpu-amd` has run only on gpusim. Phase D of the
   x86_64 port (VFIO passthrough of the R9700 into a FreeBSD VM) is the next
   step; the driver stays experimental until `test_gpu_isolation` passes there.
-- **Display is gpusim-shaped.** The display module programs gpusim's
-  `regDISP_*`, not DCN4 registers (D4), and nothing has driven a real monitor
-  (D5; the R9700 has none attached).
+- **Modeset is gpusim-shaped.** Since D4 the display module scans out and
+  flips through the real DCN 4.0.1 HUBP/OTG registers and takes its
+  interrupts by real IH source ids, but modeset, connector detection and EDID
+  are still gpusim's `regDISP_*`. Nothing has driven a real monitor yet (D5;
+  the R9700 has none attached; D5 step 1 inherits the GOP mode instead).
 - **gpusim has no graphics pipeline.** Its RDNA4 core is compute-only, so a
   graphics-pipeline (NGG/raster/blend) backend has nothing to run on yet.
 - **No native Vulkan driver** for third-party apps on `'A'`; they run on

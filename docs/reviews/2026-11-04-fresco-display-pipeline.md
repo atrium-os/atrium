@@ -220,7 +220,15 @@ the CI oracle). Removes Mesa from the runtime. If D3 is chosen, D2 shrinks to
 4. frescod submits them through `atrium-gpu-rs` on `'A'`, writing the
    scanout BO from D1. First GPU-drawn desktop, on gpusim.
 
-**Phase D4: gpusim fidelity toward DCN** (review §A5 applied to display)
+**Phase D4: gpusim fidelity toward DCN** (review §A5 applied to display).
+*Done 2026-11-05*: gpusim `3f37036` models the DCN 4.0.1 subset below
+(segment 2 at REGS BAR byte 0x60000; on the R9700 segment 2 starts at dword
+0x34c0 per its IP discovery). The display kmod programs HUBP0 surface
+address, pitch, swizzle (linear) and format, flips under the OTG master
+update lock, reads PENDING to reap flips, and takes HUBP0_FLIP (0x4f) and
+OTG0 VERTICAL_INTERRUPT0 (0x1e) from IH client DCE (4). Modeset, connector
+and EDID stay on `regDISP_*` until D5. All display tests, `atrium_gpu_test`,
+`test_gpu_isolation` and the jailed frescod pass on it.
 
 Replace the `regDISP_*` block with the real DCN 4 registers for the subset
 we use: HUBP primary surface address, pitch and swizzle; the flip and update
