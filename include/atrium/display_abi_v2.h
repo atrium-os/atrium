@@ -74,7 +74,11 @@
  *
  * Without MODESET the flip latches at the next vblank (or at once with ASYNC).
  * With in_fence_fd set, the flip waits until that syncobj reaches
- * in_fence_value. With out_fence_fd set, that syncobj is signalled to
+ * in_fence_value, and is programmed as soon as it does (an ASYNC flip then
+ * lands at once, a vsync'd one at the following vblank). If the in-fence
+ * fails instead (its render was lost to a hang, fault or reset), the commit
+ * is dropped: the previous buffer stays up and the out-fence fails with the
+ * same error. With out_fence_fd set, that syncobj is signalled to
  * out_fence_value once this buffer is on screen, which is also the moment the
  * previous buffer is released and may be rendered into again.
  *
@@ -95,7 +99,8 @@
  *
  * Errors: EINVAL for a bad struct, flag, format, modifier, pitch alignment,
  * bo_offset or fd type; EBADF for a closed fd; EBUSY as above; EAGAIN for a
- * MODESET whose in-fence isn't signalled; ENXIO if the GPU module isn't
+ * MODESET whose in-fence isn't signalled (its error if the in-fence failed);
+ * ENXIO if the GPU module isn't
  * loaded (no BO can be resolved).
  */
 struct atrium_display_commit {

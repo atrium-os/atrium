@@ -137,6 +137,8 @@ amd_syncobj_signal(struct atrium_amd_syncobj *so, uint64_t value)
 		so->value = value;
 	wakeup(&so->value);
 	KNOTE_LOCKED(&so->sel.si_note, 0);
+	if (so->watch != NULL)
+		so->watch(so->watch_arg);
 	mtx_unlock(&so->lock);
 }
 
@@ -155,6 +157,21 @@ amd_syncobj_fail(struct atrium_amd_syncobj *so, int error)
 		so->error = error;
 	wakeup(&so->value);
 	KNOTE_LOCKED(&so->sel.si_note, 0);
+	if (so->watch != NULL)
+		so->watch(so->watch_arg);
+	mtx_unlock(&so->lock);
+}
+
+/*
+ * The display's in-fence watch: it learns of the signal at once instead of
+ * at the next vblank. One watcher per syncobj; a later install replaces it.
+ */
+void
+amd_syncobj_watch(struct atrium_amd_syncobj *so, void (*fn)(void *), void *arg)
+{
+	mtx_lock(&so->lock);
+	so->watch = fn;
+	so->watch_arg = arg;
 	mtx_unlock(&so->lock);
 }
 

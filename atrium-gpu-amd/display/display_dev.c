@@ -276,6 +276,8 @@ display_signal_out(struct atrium_amd_softc *sc)
 static void
 display_drop_in(struct atrium_amd_softc *sc)
 {
+	if (sc->display_in_so != NULL && sc->backend != NULL)
+		sc->backend->syncobj_watch(sc->display_in_so, NULL, NULL);
 	display_park(sc, sc->display_in_fp);
 	sc->display_in_fp = NULL;
 	sc->display_in_so = NULL;
@@ -355,31 +357,70 @@ display_in_fence_ready(struct atrium_amd_softc *sc)
 	if (so == NULL)
 		return (1);
 	mtx_lock(&so->lock);
-	ready = so->value >= sc->display_in_value;
+	if (so->value >= sc->display_in_value)
+		ready = 1;
+	else if (so->error != 0)
+		ready = -so->error;	/* the render will never finish */
+	else
+		ready = 0;
 	mtx_unlock(&so->lock);
 	return (ready);
 }
 
 /*
- * A commit waiting on its in-fence is retried at every vblank (and when the
- * next commit comes in). A render that finishes mid-frame therefore flips at
- * the vblank after it, which is the frame it could have made anyway for a
- * vsync'd flip programmed then; an ASYNC flip may land up to a frame late.
- * Waking on the syncobj's own signal is the follow-up that removes that.
+ * A commit waiting on its in-fence flips as soon as the fence signals: the
+ * syncobj's watch (display_fence_kick) queues display_fence_task, which runs
+ * this. Vblank and the next commit retry it too, as a backstop. An in-fence
+ * that fails (its render was lost to a hang, fault or reset) drops the
+ * commit: the old buffer stays up and the out-fence fails with the same
+ * error, so the holder knows the frame never showed (GPU ABI v2.1 §10.3).
  */
 static void
 display_try_fence(struct atrium_amd_softc *sc)
 {
 	uint32_t fault;
+	int ready;
 
 	mtx_assert(&sc->lock, MA_OWNED);
-	if (sc->display_next_state != 1 || !display_in_fence_ready(sc))
+	if (sc->display_next_state != 1)
+		return;
+	ready = display_in_fence_ready(sc);
+	if (ready < 0) {
+		if (sc->display_out_so != NULL && sc->backend != NULL)
+			sc->backend->syncobj_fail(sc->display_out_so, -ready);
+		display_park(sc, sc->display_out_fp);
+		sc->display_out_fp = NULL;
+		sc->display_out_so = NULL;
+		display_abandon(sc);
+		return;
+	}
+	if (ready == 0)
 		return;
 	fault = display_flip_next(sc);
 	if (fault != 0) {
 		sc->display_last_fault = fault;
 		display_abandon(sc);
 	}
+}
+
+/* The in-fence's watch: called under the syncobj's lock, so only queue. */
+static void
+display_fence_kick(void *arg)
+{
+	struct atrium_amd_softc *sc = arg;
+
+	taskqueue_enqueue(taskqueue_thread, &sc->display_fence_task);
+}
+
+static void
+display_fence_task(void *arg, int pending __unused)
+{
+	struct atrium_amd_softc *sc = arg;
+
+	mtx_lock(&sc->lock);
+	display_try_fence(sc);
+	mtx_unlock(&sc->lock);
+	display_drain(sc, curthread);
 }
 
 /* IH FLIP cause: a flip reached the screen. sc->lock held. */
@@ -484,10 +525,10 @@ display_commit(struct atrium_amd_softc *sc, struct atrium_display_commit *c,
 
 	if (c->flags & ATRIUM_DISPLAY_COMMIT_MODESET) {
 		sc->display_in_so = in_so;
-		if (!display_in_fence_ready(sc)) {
+		if ((err = display_in_fence_ready(sc)) <= 0) {
 			sc->display_in_so = NULL;
 			mtx_unlock(&sc->lock);
-			err = EAGAIN;
+			err = err < 0 ? -err : EAGAIN;	/* failed render: its error */
 			goto out;
 		}
 		sc->display_in_so = NULL;
@@ -553,13 +594,19 @@ display_commit(struct atrium_amd_softc *sc, struct atrium_display_commit *c,
 	sc->display_out_so = out_so;
 	sc->display_out_value = c->out_fence_value;
 	sc->display_next_state = 1;
-	if (display_in_fence_ready(sc)) {
+	/* Flip the moment the render signals (display_fence_kick), installed
+	 * before the check so a signal in between is not missed. */
+	if (in_so != NULL)
+		ops->syncobj_watch(in_so, display_fence_kick, sc);
+	if (display_in_fence_ready(sc) > 0) {
 		fault = display_flip_next(sc);
 		if (fault != 0) {
 			/* Refused now: report it to the caller, keep its references
 			 * for it to release, and leave the screen as it was. */
 			memset(&sc->display_next, 0, sizeof(sc->display_next));
 			sc->display_next_state = 0;
+			if (in_so != NULL)
+				ops->syncobj_watch(in_so, NULL, NULL);
 			sc->display_in_fp = NULL;
 			sc->display_in_so = NULL;
 			sc->display_out_fp = NULL;
@@ -569,7 +616,8 @@ display_commit(struct atrium_amd_softc *sc, struct atrium_display_commit *c,
 			err = 0;
 			goto out;
 		}
-	}
+	} else
+		display_try_fence(sc);	/* a failed in-fence drops it now */
 	mtx_unlock(&sc->lock);
 	display_drain(sc, td);
 	return (0);	/* the display owns the references now */
@@ -1036,6 +1084,7 @@ atrium_display_attach(device_t dev)
 		return (ENXIO);
 	}
 	sc->display_cdev->si_drv1 = sc;
+	TASK_INIT(&sc->display_fence_task, 0, display_fence_task, sc);
 
 	/* Who may open it (display_lease_check); jaild sets it for frescod. */
 	SYSCTL_ADD_PROC(device_get_sysctl_ctx(dev),
@@ -1105,7 +1154,7 @@ atrium_display_detach(device_t dev)
 	 */
 	mtx_lock(&sc->lock);
 	if (sc->display_next_state != 0)
-		display_abandon(sc);
+		display_abandon(sc);	/* clears the in-fence watch */
 	display_park(sc, sc->display_on_screen.bo_fp);
 	memset(&sc->display_on_screen, 0, sizeof(sc->display_on_screen));
 	sc->display_mode_set = 0;
@@ -1113,6 +1162,7 @@ atrium_display_detach(device_t dev)
 	sc->display_mode_height = 0;
 	sc->display_opened = 0;
 	mtx_unlock(&sc->lock);
+	taskqueue_drain(taskqueue_thread, &sc->display_fence_task);
 	display_drain(sc, curthread);
 	return (0);
 }

@@ -167,6 +167,31 @@ fn run() -> io::Result<()> {
     }
     eprintln!("7 async flip landed at once");
 
+    // 7b. A fenced ASYNC flip lands when its in-fence signals, not at the
+    // next vblank: the display watches the syncobj (GPU ABI v2.1 §5 flips).
+    let refresh_mhz = dpy.status_v2()?.refresh_mhz.max(1);
+    let frame_period = Duration::from_micros(1_000_000_000 / u64::from(refresh_mhz));
+    let mut worst = Duration::ZERO;
+    for i in 0..5u64 {
+        let (inv, outv) = (3 + i, 5 + i);
+        let f = dpy.commit(if i % 2 == 0 { b } else { a }, COMMIT_ASYNC, 0, Some((&inf, inv)), Some((&out, outv)))?;
+        if f != 0 {
+            return Err(fail(format!("fenced async flip fault={f}")));
+        }
+        std::thread::sleep(Duration::from_millis(7 + 3 * i)); // land mid-frame
+        let t = Instant::now();
+        inf.signal(inv)?;
+        if !reached(&out, outv, 500)? {
+            return Err(fail("fenced async flip never landed".into()));
+        }
+        worst = worst.max(t.elapsed());
+    }
+    if worst >= frame_period {
+        return Err(fail(format!(
+            "fenced async flip took {worst:?} after its fence (frame {frame_period:?}): waited for vblank")));
+    }
+    eprintln!("7b fenced async flips land on the fence signal: worst {worst:?} (frame {frame_period:?})");
+
     // 8. Referee + fd checks.
     let f = dpy.commit(b, 0, w as u32 * 4 + 256 + 1, None, None);
     match f {

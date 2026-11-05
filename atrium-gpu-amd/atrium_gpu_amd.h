@@ -403,6 +403,10 @@ struct atrium_gpu_backend_ops {
 	int	(*syncobj_fget)(struct thread *td, int fd, struct file **out_fp,
 		    struct atrium_amd_syncobj **out_so);
 	void	(*syncobj_signal)(struct atrium_amd_syncobj *so, uint64_t value);
+	void	(*syncobj_fail)(struct atrium_amd_syncobj *so, int error);
+	/* Install (fn != NULL) or clear the syncobj's one watcher. */
+	void	(*syncobj_watch)(struct atrium_amd_syncobj *so,
+		    void (*fn)(void *), void *arg);
 	/* mmap a device aperture into userspace (amd: the doorbell page of a queue
 	 * this client owns, as a revocable managed-pager object). */
 	int	(*mmap_single)(struct atrium_amd_softc *sc,
@@ -511,6 +515,14 @@ struct atrium_amd_syncobj {
 	struct selinfo	 sel;	/* sel.si_note = the kqueue knlist */
 	uint64_t	 value;
 	int		 error;	/* sticky: a completion owed here was lost (EIO) */
+	/*
+	 * One in-kernel watcher (the display's in-fence): called under `lock`
+	 * after every signal or failure. It must not sleep or take sc->lock
+	 * (the order is sc->lock, then this lock); the display only enqueues a
+	 * task. Set and cleared under `lock` (amd_syncobj_watch).
+	 */
+	void		(*watch)(void *);
+	void		*watch_arg;
 };
 
 /*
@@ -710,6 +722,7 @@ struct atrium_amd_softc {
 		uint64_t	 reset_gen;	/* sc->reset_gen when committed */
 	} display_on_screen, display_next;
 	int		 display_content_lost;	/* STATUS_CONTENT_LOST */
+	struct task	 display_fence_task;	/* in-fence signalled: try to flip */
 	int		 display_next_state;	/* 0 none, 1 waiting on in-fence, 2 flipped */
 	int		 display_next_vsync;
 	uint64_t	 display_flips_landed;	/* commits that reached the screen */
@@ -982,6 +995,8 @@ int	 amd_syncobj_fget(struct thread *td, int fd, struct file **out_fp,
 	    struct atrium_amd_syncobj **out_so);
 void	 amd_syncobj_signal(struct atrium_amd_syncobj *so, uint64_t value);
 void	 amd_syncobj_fail(struct atrium_amd_syncobj *so, int error);
+void	 amd_syncobj_watch(struct atrium_amd_syncobj *so, void (*fn)(void *),
+	    void *arg);
 extern const struct fileops atrium_amd_syncobj_fileops;
 
 /* ih.c (BASE module) — MSI-X interrupt setup + the device-global IH ring ISR */
