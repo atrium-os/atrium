@@ -8,8 +8,9 @@ sh /root/s/up.sh >/dev/null 2>&1
 sysctl -n dev.atrium_gpu_amd.0.build_id
 cd /root/s
 ./fresco-renderer --seed-kernels /usr/local/share/atrium/fresco-kernels >/dev/null 2>&1
+rm -f /var/db/atrium/root/forum-displays.state
 : > /var/log/atrium/atrium-frescod.log; service atrium-jaild start >/dev/null 2>&1; sleep 2
-sed -i '' 's/timeout 400 .\/forum-wm/timeout 3000 .\/forum-wm/' /root/s/modes-run.sh
+sed -i '' 's/timeout [0-9]* .\/forum-wm/timeout 3000 .\/forum-wm/' /root/s/modes-run.sh
 sh /root/s/modes-run.sh >/dev/null 2>&1
 for i in 1 2; do (timeout 3000 ./atrium-window-demo /atrium/sockets/fresco/fresco.sock >/tmp/w$i.log 2>&1 &); sleep 5; done
 sleep 10

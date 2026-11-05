@@ -638,6 +638,9 @@ pub mod daemon {
         /// restarts in `display_store` (None: in memory only, as in tests).
         pub displays: super::displays::DisplayMemory,
         pub display_store: Option<std::path::PathBuf>,
+        /// Mirrorings were asked for to put a set back: when they land
+        /// (same set), its arrangement is put back too, not overwritten.
+        pub restoring: bool,
     }
 
     pub use forum_ctl::Side;
@@ -661,6 +664,7 @@ pub mod daemon {
                 top: RefCell::new(HashMap::new()),
                 displays: Default::default(),
                 display_store: None,
+                restoring: false,
             }
         }
 
@@ -715,7 +719,8 @@ pub mod daemon {
             // (frescod knows only what it has seen since it started); what
             // it was then lands with the next EV_DISPLAY_CHANGED.
             let same_set = super::displays::set_of(&outputs) == super::displays::set_of(&self.outputs);
-            self.apply_remembered_displays(conn, &outputs, !same_set)?;
+            let restore = !same_set || std::mem::take(&mut self.restoring);
+            self.apply_remembered_displays(conn, &outputs, restore)?;
             // Windows with no home yet (opened while there was one monitor)
             // belong to the monitor they are on now, so a new monitor
             // becoming the primary doesn't pull them over to it.
@@ -752,7 +757,8 @@ pub mod daemon {
                 }
                 if !mirrors.is_empty() {
                     eprintln!("forum-wm: mirroring as this set was left");
-                    return Ok(()); // the arrangement follows on the next change
+                    self.restoring = true; // the arrangement follows once they land
+                    return Ok(());
                 }
                 if let Some(p) = self.displays.restore(outputs) {
                     eprintln!("forum-wm: putting {} monitor(s) back where they were", p.len());
@@ -1925,8 +1931,14 @@ mod tests {
         let mut wm2 = Wm::new(screen());
         wm2.displays = m;
         let mut conn2 = MockConn::default();
-        wm2.apply_remembered_displays(&mut conn2, &[mon(0, 10, 0, 1920, 1080), mon(1, 20, 1920, 1920, 1080)], true).unwrap();
+        wm2.outputs = vec![mon(0, 10, 0, 1920, 1080), mon(1, 20, 1920, 1920, 1080)];
+        let unmirrored = wm2.outputs.clone();
+        wm2.apply_remembered_displays(&mut conn2, &unmirrored, true).unwrap();
         assert_eq!(conn2.mirrored, vec![(20, 10)]);
+        assert!(wm2.restoring);
+        // It lands (same set): not remembered over, and nothing more asked.
+        wm2.set_outputs(&mut conn2, both.clone()).unwrap();
+        assert!(!wm2.restoring && conn2.mirrored.len() == 1 && conn2.arranged.is_none());
         // Stopping: told to frescod, remembered once it lands.
         wm.mirror(&mut conn, 1, None).unwrap();
         assert_eq!(conn.mirrored.last(), Some(&(20, 0)));

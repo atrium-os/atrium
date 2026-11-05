@@ -380,10 +380,24 @@ fn main() -> std::io::Result<()> {
                     /* Another set of monitors: mirror as this set was left. */
                     let set = outputs::display_set(heads.iter().map(|h| h.identity));
                     if set != before {
+                        /* Exactly as remembered: mirrors this set didn't
+                         * have stop (first, so a former mirror can be a
+                         * source again), then the remembered ones start. */
                         if let Some(pairs) = mirrors_memo.get(&set).cloned() {
-                            for (m, src) in pairs {
-                                if let Ok(remode) = set_mirror(&mut heads, m, src) {
-                                    remodes.extend(remode);
+                            let ids: Vec<(u64, Option<u64>)> = heads.iter().map(|h| (h.identity, h.mirror_of)).collect();
+                            for &(id, cur) in &ids {
+                                let want = pairs.iter().find(|p| p.0 == id).map(|p| p.1);
+                                if cur.is_some() && cur != want {
+                                    if let Ok(remode) = set_mirror(&mut heads, id, 0) {
+                                        remodes.extend(remode);
+                                    }
+                                }
+                            }
+                            for &(m, src) in &pairs {
+                                if heads.iter().any(|h| h.identity == m && h.mirror_of != Some(src)) {
+                                    if let Ok(remode) = set_mirror(&mut heads, m, src) {
+                                        remodes.extend(remode);
+                                    }
                                 }
                             }
                             heads::arrange(&mut heads, &remembered);
