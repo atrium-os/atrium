@@ -111,8 +111,33 @@ It can never receive another VM's writes.
   write. Real silicon needs the HQD dequeue handshake and the invalidate
   acknowledgement before pages are freed. Both are marked in `cp.c` and
   `queue.c`.
-- The display node still has no lease: any opener can modeset (review
-  §A2.4, display half). That is the Fresco display pipeline's to settle.
+
+## Display lease (review §A2.4, display half)
+
+Only frescod drives the display. Three layers keep everyone else off it:
+
+1. **The node.** `/dev/atrium-display0` is 0600 root on the host. Only devfs
+   ruleset 23 (`atrium_display`, `etc/atrium.devfs.rules`) shows it in a
+   jail. Ruleset 21 (`atrium_gpu`) no longer does, and app and worker jails
+   (22) never did.
+2. **The ruleset is frescod's.** `etc/jaild.policy.toml`
+   `[[devfs_rulesets.pinned]]` lets jaild mount ruleset 23 only for jail
+   `atrium-frescod`, running `/usr/local/bin/atrium-frescod` as uid 65010,
+   with no child jails (`validate_devfs_pin`).
+3. **The lease.** Before frescod starts, jaild writes
+   `dev.atrium_gpu_amd_display.0.lease = "atrium-frescod:65010"`. The driver's
+   open then admits only a process in that jail with that uid
+   (`display_lease_check`); everyone else gets `EPERM`, root on the host
+   included, so nothing can grab the screen while frescod restarts. Without a
+   lease only host processes may open it (bring-up and the display tests). The
+   sysctl is not `CTLFLAG_PRISON`, so no jailed process can write it.
+
+The node stays exclusive (`EBUSY` for a second opener), and changing the lease
+does not evict the current holder. Tests: `test_gpu_isolation` part E (host
+half); the jail half (frescod admitted, another jail and host root refused)
+was run by hand in the amd64 VM on 2026-11-05. To run the display tests on the
+host while frescod holds the lease, stop frescod and clear it:
+`sysctl dev.atrium_gpu_amd_display.0.lease=""`.
 
 ## Build identity
 

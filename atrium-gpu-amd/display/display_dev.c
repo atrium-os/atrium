@@ -27,6 +27,10 @@
 
 #include <sys/module.h>
 #include <sys/kernel.h>
+#include <sys/jail.h>
+#include <sys/limits.h>
+#include <sys/sysctl.h>
+#include <sys/ucred.h>
 #include "energy_compat.h"	/* the display's energy-federation member */
 
 /*
@@ -574,11 +578,100 @@ out:
 	return (err);
 }
 
+/*
+ * May this credential open the display? The node's permissions decide who can
+ * reach it at all (devfs: 0600 root on the host, visible only in frescod's
+ * jail); the lease then names the one jail and uid that may hold it, so no
+ * other process, root on the host included, can grab the screen while frescod
+ * restarts. Without a lease only host processes may open it (bring-up and the
+ * display tests); a jailed opener needs a lease naming its jail.
+ */
+static int
+display_lease_check(struct atrium_amd_softc *sc, struct ucred *cr)
+{
+	char jail[sizeof(sc->display_lease_jail)];
+	struct prison *pr = cr->cr_prison;
+	uid_t uid;
+	int set, match;
+
+	mtx_lock(&sc->lock);
+	set = sc->display_lease_set;
+	uid = sc->display_lease_uid;
+	strlcpy(jail, sc->display_lease_jail, sizeof(jail));
+	mtx_unlock(&sc->lock);
+
+	if (!set)
+		return (pr == &prison0 ? 0 : EPERM);
+	if (pr == &prison0 || cr->cr_uid != uid)
+		return (EPERM);
+	prison_lock(pr);
+	match = strcmp(pr->pr_name, jail) == 0;
+	prison_unlock(pr);
+	return (match ? 0 : EPERM);
+}
+
+/*
+ * dev.atrium_gpu_amd_display.N.lease: "<jail name>:<uid>", or "" for none.
+ * Root on the host only: the sysctl is not CTLFLAG_PRISON, so a jailed
+ * process cannot write it whatever its uid. Changing the lease does not evict
+ * the current holder; it decides the next open.
+ */
+static int
+display_lease_sysctl(SYSCTL_HANDLER_ARGS)
+{
+	struct atrium_amd_softc *sc = arg1;
+	char buf[MAXHOSTNAMELEN + 16];
+	char *colon, *end;
+	u_long uid;
+	int err;
+
+	mtx_lock(&sc->lock);
+	if (sc->display_lease_set)
+		snprintf(buf, sizeof(buf), "%s:%u", sc->display_lease_jail,
+		    (unsigned)sc->display_lease_uid);
+	else
+		buf[0] = '\0';
+	mtx_unlock(&sc->lock);
+
+	err = sysctl_handle_string(oidp, buf, sizeof(buf), req);
+	if (err != 0 || req->newptr == NULL)
+		return (err);
+
+	if (buf[0] == '\0') {
+		mtx_lock(&sc->lock);
+		sc->display_lease_set = 0;
+		sc->display_lease_jail[0] = '\0';
+		mtx_unlock(&sc->lock);
+		printf("atrium-display: lease cleared (host only)\n");
+		return (0);
+	}
+	colon = strrchr(buf, ':');
+	if (colon == NULL || colon == buf ||
+	    (size_t)(colon - buf) >= sizeof(sc->display_lease_jail))
+		return (EINVAL);
+	*colon = '\0';
+	uid = strtoul(colon + 1, &end, 10);
+	if (end == colon + 1 || *end != '\0' || uid > UID_MAX)
+		return (EINVAL);
+
+	mtx_lock(&sc->lock);
+	strlcpy(sc->display_lease_jail, buf, sizeof(sc->display_lease_jail));
+	sc->display_lease_uid = (uid_t)uid;
+	sc->display_lease_set = 1;
+	mtx_unlock(&sc->lock);
+	printf("atrium-display: leased to jail %s uid %lu\n", buf, uid);
+	return (0);
+}
+
 static int
 display_open(struct cdev *cdev, int oflags, int devtype, struct thread *td)
 {
 	struct atrium_amd_softc *sc = cdev->si_drv1;
-	int err = 0;
+	int err;
+
+	err = display_lease_check(sc, td->td_ucred);
+	if (err != 0)
+		return (err);
 
 	/* Exclusive: one holder (the broker) drives the display at a time. */
 	mtx_lock(&sc->lock);
@@ -912,6 +1005,13 @@ atrium_display_attach(device_t dev)
 		return (ENXIO);
 	}
 	sc->display_cdev->si_drv1 = sc;
+
+	/* Who may open it (display_lease_check); jaild sets it for frescod. */
+	SYSCTL_ADD_PROC(device_get_sysctl_ctx(dev),
+	    SYSCTL_CHILDREN(device_get_sysctl_tree(dev)), OID_AUTO, "lease",
+	    CTLTYPE_STRING | CTLFLAG_RW | CTLFLAG_MPSAFE, sc, 0,
+	    display_lease_sysctl, "A",
+	    "jail:uid that may open the display; empty = host only");
 
 	/*
 	 * Register our IH cause handler so the base ISR routes DCN vblank interrupts

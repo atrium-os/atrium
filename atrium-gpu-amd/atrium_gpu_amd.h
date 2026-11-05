@@ -723,6 +723,15 @@ struct atrium_amd_softc {
 	struct file	*display_release[ATRIUM_AMD_DISPLAY_NRELEASE];
 	int		 display_nrelease;
 	int		 display_opened;	/* exclusive open held */
+	/*
+	 * The display lease (ISOLATION.md "Display lease"): who may open
+	 * /dev/atrium-display0. Unset, only host (prison0) processes may; set
+	 * (by jaild, through the root-only sysctl dev.atrium_gpu_amd_display.N.
+	 * lease), only processes in the named jail running as the named uid.
+	 */
+	int		 display_lease_set;
+	uid_t		 display_lease_uid;
+	char		 display_lease_jail[MAXHOSTNAMELEN];
 	int		 display_mode_set;	/* CRTC lit by a MODESET commit */
 	uint32_t	 display_refresh_mhz;	/* refresh of the mode in use */
 	uint32_t	 display_mode_width;	/* the mode in use, for the kernel's */

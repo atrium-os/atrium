@@ -938,6 +938,53 @@ part_d(void)
 	close(fda);
 }
 
+/*
+ * Display lease (ISOLATION.md "Display lease"): only the jail and uid named in
+ * dev.atrium_gpu_amd_display.0.lease may open the display, root on the host
+ * included; with no lease only host processes may. This runs on the host as
+ * root, so it checks the host half and the sysctl; the jail half (another
+ * jail refused, frescod's admitted) is run by hand in the VM.
+ */
+static void
+part_e(void)
+{
+	const char *oid = "dev.atrium_gpu_amd_display.0.lease";
+	char saved[300] = "", now[300];
+	size_t len = sizeof(saved);
+	int fd;
+
+	printf("Part E: display lease\n");
+	if (sysctlbyname(oid, saved, &len, NULL, 0) != 0) {
+		CHECK(0, "%s readable (%s)", oid, strerror(errno));
+		return;
+	}
+	if (saved[0] != '\0') {
+		printf("  skip leased to %s (frescod running?)\n", saved);
+		return;
+	}
+	CHECK(sysctlbyname(oid, NULL, NULL, "no-such-jail:65010",
+	    sizeof("no-such-jail:65010")) == 0, "root can set a lease");
+	fd = open(DISPLAY, O_RDWR);
+	CHECK(fd < 0 && errno == EPERM,
+	    "leased elsewhere: host root's open is refused (EPERM)");
+	if (fd >= 0)
+		close(fd);
+	CHECK(sysctlbyname(oid, NULL, NULL, "nocolon", sizeof("nocolon")) != 0 &&
+	    errno == EINVAL, "a malformed lease is refused (EINVAL)");
+	CHECK(sysctlbyname(oid, NULL, NULL, "x:notanumber",
+	    sizeof("x:notanumber")) != 0 && errno == EINVAL,
+	    "a lease with a bad uid is refused (EINVAL)");
+	len = sizeof(now);
+	CHECK(sysctlbyname(oid, now, &len, NULL, 0) == 0 &&
+	    strcmp(now, "no-such-jail:65010") == 0,
+	    "a refused write leaves the lease as it was");
+	CHECK(sysctlbyname(oid, NULL, NULL, "", 1) == 0, "root can clear it");
+	fd = open(DISPLAY, O_RDWR);
+	CHECK(fd >= 0, "no lease: host root opens the display again");
+	if (fd >= 0)
+		close(fd);
+}
+
 static void
 attest(void)
 {
@@ -975,6 +1022,7 @@ main(int argc, char **argv)
 	break4();
 	part_c();
 	part_d();
+	part_e();
 	if (argc > 1 && strcmp(argv[1], "--attest") == 0)
 		attest();
 	printf(failures == 0 ? "ALL OK\n" : "%d FAILURES\n", failures);
