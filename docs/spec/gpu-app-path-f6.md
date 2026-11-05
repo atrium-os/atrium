@@ -1,6 +1,6 @@
 # F6: the app GPU path
 
-*Status 2026-11-05: proposed. Threat model §2.5.3 and §2.5.4 row F6. Owner: the GPU driver
+*Status 2026-11-05: option A chosen (Shankar). G3's library is built (`atrium-gpu-app`) and runs an app's own kernel end to end on gpusim (`app-path-e2e`). Threat model §2.5.3 and §2.5.4 row F6. Owner: the GPU driver
 thread, with Fresco for the broker wiring.*
 
 ## What F6 must end with
@@ -26,7 +26,7 @@ with:
   own `bin`/`raster` ISA, builds PM4 with `atrium-rdna4-cmd`, and submits it. The app path
   reuses that machinery, with the app's ISA in the app's VM.
 
-## The trust question (decision needed)
+## The trust question (decided: A)
 
 §2.5.3 puts the shader compiler in the app's jail and has the broker receive "machine code plus
 the aqueduct-gpu §11 validation record". But anything the app's jail produces, the app controls.
@@ -79,7 +79,13 @@ Fixed-size records over the existing `fresco_split` channel, fuzzed with F3's ha
   app's own table, and dims and counts are bounded.
 - `GPU_DONE(fence)` / `GPU_LOST(fence, EIO)` back to the app.
 
-### G3. Broker PM4 builder
+### G3. Broker PM4 builder (library done)
+- `atrium-gpu-app` (6dcd221f): code header checks, the closed record set (bind code, user
+  SGPRs, dispatch, barrier), and a builder that writes every packet with `atrium-rdna4-cmd`. A
+  mutation fuzzer is built in, and it found an overflow on its first run. `app-path-e2e` (feature
+  `e2e`) stands in for the broker on the device: an app's own kernel runs in its own VM, the
+  same kernel aimed at that VA from a second app's VM writes only that app's page, and bad
+  headers and oversized dispatches are refused before anything is submitted.
 - A library crate turns a validated frame into PM4 with `atrium-rdna4-cmd`, using the app's VAs
   and the broker's own syncobj.
 - On EIO the app's GPU context is lost: the broker reports it, drops the app's VM, and the app

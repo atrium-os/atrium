@@ -11,3 +11,14 @@ path = "src/lib.rs"
 
 [dependencies]
 atrium-rdna4-cmd = { path = "../atrium-rdna4-cmd" }
+atrium-gpu-rs    = { path = "../atrium-gpu-rs", optional = true }
+atrium-rdna4-isa = { path = "../atrium-rdna4-isa", optional = true }
+
+[features]
+# The on-device end-to-end check (FreeBSD guest with the driver loaded).
+e2e = ["dep:atrium-gpu-rs", "dep:atrium-rdna4-isa"]
+
+[[bin]]
+name = "app-path-e2e"
+path = "src/bin/app_path_e2e.rs"
+required-features = ["e2e"]

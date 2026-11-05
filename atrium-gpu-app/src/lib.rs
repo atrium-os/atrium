@@ -63,6 +63,7 @@ pub mod limits {
 /// Why the broker refused something an app sent. The index, where present, is
 /// the record number in the submission.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[allow(missing_docs)] // fields: `index` is the record number, the rest as named
 pub enum Refusal {
     /// The slot is shorter than what it claims to hold.
     Truncated,

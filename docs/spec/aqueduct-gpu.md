@@ -1554,6 +1554,17 @@ static validation + descriptor-bounded isolation + GPU timeout
 enforcement, regardless of API surface (Vulkan or direct) or
 composition strategy (semantic or surface).
 
+**What is a boundary and what is advisory (decided 2026-11-05, Shankar,
+option A of `gpu-app-path-f6.md`).** Code an app compiled in its own jail
+is untrusted, and so is any validation record it sends with it: the app
+controls both. For that code the security boundary is the GPU MMU (the
+app's own VMID and the page tables the kernel built, `gpu-isolation.md`),
+the broker writing every command packet itself (`atrium-gpu-app`), and the
+driver's hang watchdog. The validation below still runs, and catches
+buggy shaders early, but against a hostile app it is advisory. It remains a
+gate where something other than the app produces or checks the code: the
+install-time pass (§4.2) and Atrium-shipped bundles (§11.5).
+
 **Two pre-execution gates, one set of primitives.** Validation runs at
 two well-defined points, never at runtime on the hot path:
 

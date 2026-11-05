@@ -505,6 +505,9 @@ the residual risk to three places, each with an owner:
    - The broker receives machine code plus the aqueduct-gpu §11 validation record:
      bounded loops, descriptor coverage, interface checks.
    - The broker never compiles.
+   - *Decided 2026-11-05 (option A, `gpu-app-path-f6.md`):* the app controls the record as
+     much as the code, so the broker treats both as untrusted. It checks only the code header
+     against hardware limits and writes every packet itself. The record is advisory.
 2. **Arbitrary machine code on the GPU is confined by the GPU MMU, not by inspection.**
    An app's dispatches run under its own VMID with page tables the kernel built. That is
    `gpu-isolation.md`'s invariant, and the app GPU path stays gated on its attestation.
