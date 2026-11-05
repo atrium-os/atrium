@@ -292,18 +292,33 @@ pub struct Compute {
     last: Vec<(u32, Arc<fresco_compute::Frame>)>,
 }
 
-/// Where frescod keeps its compiled Tier-2 kernels: `FRESCO_COMPUTE_CACHE`,
-/// else the system shader cache if frescod may write it, else (frescod runs
-/// as `_frescod`, which may not) a directory of its own in the temp dir,
-/// created 0700 and refused if someone else made it first.
+/// Where the installer puts frescod's precompiled Tier-2 kernels
+/// (`fresco-renderer --seed-kernels`, run by `scripts/fresco-renderer-bundle.sh`).
+/// The jailed service mounts it read-only and writes nothing.
+#[cfg(feature = "cranelift")]
+const INSTALLED_KERNELS: &str = "/usr/local/share/atrium/fresco-kernels";
+
+/// Where frescod finds (or compiles) its Tier-2 kernels, seeded: the first
+/// of `FRESCO_COMPUTE_CACHE`; the installed kernels if they are complete
+/// (seeding them then writes nothing); the system shader cache if frescod
+/// may write it; else (frescod runs as `_frescod`, which may not) a
+/// directory of its own in the temp dir, created 0700 and refused if
+/// someone else made it first.
 #[cfg(feature = "cranelift")]
 fn kernel_dir() -> Result<std::path::PathBuf> {
+    use fresco_compute::tier2::Tier2;
     use std::os::unix::fs::{DirBuilderExt, MetadataExt};
     if let Some(d) = std::env::var_os("FRESCO_COMPUTE_CACHE") {
-        return Ok(d.into());
+        let d = std::path::PathBuf::from(d);
+        Tier2::seed_cache(&d)?;
+        return Ok(d);
+    }
+    let installed = std::path::PathBuf::from(INSTALLED_KERNELS);
+    if installed.is_dir() && Tier2::seed_cache(&installed).is_ok() {
+        return Ok(installed);
     }
     let sys = atrium_spv_loader::LoaderConfig::production().cache_root;
-    if std::fs::create_dir_all(&sys).is_ok() && tempfile_ok(&sys) {
+    if std::fs::create_dir_all(&sys).is_ok() && tempfile_ok(&sys) && Tier2::seed_cache(&sys).is_ok() {
         return Ok(sys);
     }
     // SAFETY: getuid cannot fail.
@@ -312,12 +327,13 @@ fn kernel_dir() -> Result<std::path::PathBuf> {
     match std::fs::DirBuilder::new().mode(0o700).create(&d) {
         Ok(()) => {}
         Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
-        Err(e) => return Err(e.into()),
+        Err(e) => return Err(format!("{}: {e}", d.display()).into()),
     }
     let m = std::fs::symlink_metadata(&d)?;
     if !m.is_dir() || m.uid() != uid || m.mode() & 0o077 != 0 {
         return Err(format!("{} is not frescod's own private directory", d.display()).into());
     }
+    Tier2::seed_cache(&d)?;
     Ok(d)
 }
 
@@ -335,7 +351,6 @@ impl Compute {
         #[cfg(feature = "cranelift")]
         let t2 = {
             let dir = kernel_dir()?;
-            fresco_compute::tier2::Tier2::seed_cache(&dir)?;
             let compiler = std::env::var_os("ATRIUM_SPV_COMPILE")
                 .map(std::path::PathBuf::from)
                 .unwrap_or_else(|| atrium_spv_loader::LoaderConfig::production().compile_binary);

@@ -13,10 +13,19 @@
 # gates only on device-node perms (no priv_check). Isolated: own rootfs (sees no
 # host fs), per-jail devfs (only basics + gpu0/display0/hidraw*).
 #
+# This is the compute (default) and gpu renderers' jail: frescod reads no
+# fonts, shader bundles or Vulkan ICDs, because each client's text and scene
+# are handled in that client's renderer jail (F4b, F4g). FRESCOD_RENDERER=vulkan
+# (opt-in, unsplit) would need /usr/local/share/{fonts,vulkan} and
+# /usr/local/llvm19/lib mounted read-only and LD_LIBRARY_PATH set for the
+# loader's dlopen; it is not offered here.
+#
 # REQUIRES (commission once per host):
 #   1. The _frescod (65010) and _fresco-render (65011) system users, the signed
 #      renderer bundle and the system policy's worker rule for it:
-#      scripts/fresco-renderer-bundle.sh does all three. 65010/65011 are in
+#      scripts/fresco-renderer-bundle.sh does all three, and installs frescod's
+#      precompiled kernels in /usr/local/share/atrium/fresco-kernels (frescod
+#      writes nothing: it has no writable mount but its sockets). 65010/65011 are in
 #      jaild.policy's allowed_system_uids. frescod starts one renderer jail per
 #      client through portcullisd (its socket is under the /atrium/sockets
 #      mount below) and refuses clients if portcullisd is not running.
@@ -57,39 +66,21 @@ source = "/usr/local/bin"
 dest   = "usr/local/bin"
 kind   = "ro_nullfs"
 [[mounts]]
-source = "/usr/local/share/atrium"               # the atrium-core bundle lives here
+source = "/usr/local/share/atrium"               # fresco-kernels/: Tier-2 code, precompiled
 dest   = "usr/local/share/atrium"
-kind   = "ro_nullfs"
-[[mounts]]
-source = "/usr/local/share/fonts"                # system-sans etc. (text.rs font search path)
-dest   = "usr/local/share/fonts"
-kind   = "ro_nullfs"
-[[mounts]]
-source = "/usr/local/share/vulkan"               # vulkan ICD manifests (icd.d/*.json)
-dest   = "usr/local/share/vulkan"
-kind   = "ro_nullfs"
-[[mounts]]
-source = "/usr/local/llvm19/lib"                  # libLLVM.so.19.1 — the lvp/radeon ICDs need it
-dest   = "usr/local/llvm19/lib"
 kind   = "ro_nullfs"
 [[mounts]]
 source = "/atrium/sockets"                        # rw: frescod BINDS its sockets here
 dest   = "atrium/sockets"
 kind   = "rw_nullfs"
 
+
 [exec]
 # Installed as atrium-frescod (the atrium- prefix the exec_paths allow-list
-# permits, consistent with atrium-memoryd/atrium-memfed). sockets + bundle
-# resolve to defaults (/atrium/sockets/fresco*, /usr/local/share/atrium/bundles).
+# permits, consistent with atrium-memoryd/atrium-memfed). Its sockets take
+# their defaults under /atrium/sockets (fresco/, fresco-wm/); the chrome and
+# app-GPU sockets are opt-in (FRESCOD_CHROME_SOCK, FRESCOD_GPU_SOCK).
 path = "/usr/local/bin/atrium-frescod"
 argv = ["atrium-frescod"]
 uid  = 65010   # _frescod
 gid  = 65010
-# The vulkan loader is dlopen'd at runtime (ash::Entry::load); the jail's
-# linker resolves LINKED libs from the mounted /usr/local/lib, but runtime
-# dlopen needs it on the search path (the host finds it via ld-hints we don't
-# carry into the jail). Points only at the ro-mounted, operator-trusted lib
-# dir, so no injection surface. ICDs self-discover from the vulkan mount above.
-[[exec.env]]
-key   = "LD_LIBRARY_PATH"
-value = "/usr/local/lib:/usr/local/llvm19/lib"

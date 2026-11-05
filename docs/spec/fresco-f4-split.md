@@ -64,7 +64,7 @@ Known gaps:
 - Fonts: the bundle carries them (`scripts/fresco-renderer-bundle.sh`), at the path the renderer's text looks in.
 - A client drawing on window 0 draws only in its renderer's own window 0, which the broker does not show. Clients that want a desktop draw in a window of role Background, as forum-dock does.
 - The Vulkan backend does not take renderer frames, so with it (no longer the default) split mode is off.
-- frescod's services.d manifest (`frescod/etc/services.d/40-atrium-frescod.toml`) now runs it as `_frescod` (65010); its `/atrium/sockets` mount carries the portcullisd socket. Not yet run end to end through atrium-portcullisd-bootstrap.
+- frescod's services.d manifest (`frescod/etc/services.d/40-atrium-frescod.toml`) runs it as `_frescod` (65010) in its own jail. Run end to end through atrium-portcullisd-bootstrap in the amd64 VM (2026-11-05): frescod drove the gpusim display from jail `atrium-frescod`, a client's renderer started in its own jail as `_fresco-render`, and `atrium-surfaces-demo` showed on screen (`frescod-service-jail.png`). Its jail has no writable mount but `/atrium/sockets`: the Tier-2 kernels come precompiled in `/usr/local/share/atrium/fresco-kernels` (read-only; `scripts/fresco-renderer-bundle.sh` installs them), and the Vulkan-only mounts (fonts, ICDs, LLVM) are gone, since the compute and gpu renderers read none of them. Found on the way: jaild mounts a manifest's tmpfs volume as root 0755, ignoring its `mode` and `owner_uid`, so a non-root service cannot write one.
 
 Plan as written:
 

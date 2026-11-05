@@ -21,6 +21,9 @@ rm -rf $B && mkdir -p $B/bin $B/usr/local/share/fonts
 cp "$BIN" $B/bin/fresco-renderer
 cp -R "$FONTS"/* $B/usr/local/share/fonts/
 "$BIN" --seed-kernels $B/usr/local/share/fresco-kernels
+# frescod's own copy (compose; and raster when it takes frames), which its
+# jail mounts read-only (40-atrium-frescod.toml): nothing in it is writable.
+"$BIN" --seed-kernels /usr/local/share/atrium/fresco-kernels
 cat > $B/atrium.toml <<'T'
 [app]
 id = "org.atrium.fresco.renderer"
