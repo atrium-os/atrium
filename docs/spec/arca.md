@@ -87,6 +87,10 @@ A changed recipient is a new item. A server can't move its cookie to another hos
 update keeps its items only if the publisher key is unchanged. Moving an item to a new
 recipient is a user action in the trusted UI, never an API call.
 
+**Sharing between apps** works the same way. App B can use App A's item only after a
+trusted prompt ("App B wants to use your X credential"). The user's yes grants one item, to
+one app, and can be revoked. It is logged and shown in the trusted UI.
+
 ## 4. Who talks to Arca, and how Arca knows who they are
 
 ### 4.1 Identity is the channel, not the message
@@ -297,7 +301,9 @@ page.** For each credentialed request, the broker gives Arca a ticket naming:
 - the SameSite context: the initiator site and the target;
 - whether a user gesture started it.
 
-The courier redeems the ticket with the origin it actually reached over verified TLS. Arca
+Tickets are single-use, expire within seconds, and are bound to one origin and one
+request, so a ticket can't be replayed or reused for another request. The courier redeems
+the ticket with the origin it actually reached over verified TLS. Arca
 releases the `Cookie` value and any slot values only when the ticket, the courier's label
 and the item's recipient all agree, over `https`. A compromised converter can't claim a
 same-site context or a gesture, because it never holds a ticket.
