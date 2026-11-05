@@ -182,34 +182,42 @@ Screenshots: `/mnt/project-files/graphics/frescod-*.png`.
 
 ## 1. Summary
 
-*(2026-11-03 snapshot; the frescod and display bullets are superseded by §0.)*
+*(Rewritten 2026-11-05. Sections 2–11 below are still the 2026-11-03 snapshot, so where they describe frescod's Vulkan renderer, lavapipe or the interim display ABI, §0 is current.)*
 
 - **Apps never touch the GPU.** A 2D app sends a retained, content-addressed
   scenegraph (`fresco-protocol`, the `CLASS_DISPLAY` vocabulary on the
   Aqueduct envelope) to **frescod** over a Unix socket. frescod owns all GPU
-  and display resources.
-- **frescod renders with Vulkan** (`fresco-vulkan::HeadlessRenderer`, which
-  runs SPIR-V "bundles" for rect/path/texture/glyph ops), reads the frame back
-  to CPU memory, then hands it to the **native kernel driver** for scanout.
+  and display resources. An app with its own GPU code sends checked code and
+  closed-set records over frescod's GPU channel (F6); it still holds no GPU fd.
+- **frescod renders with its own compute kernels, not Vulkan.** `fresco-compute`'s
+  bin, raster and compose kernels run on the **CPU through Tier-2** (the
+  default, `FRESCOD_RENDERER=compute`) or on the **GPU through our RDNA4
+  compiler** (`FRESCOD_RENDERER=gpu`). Each client's scene is packed by its
+  own jailed renderer process. The old Vulkan renderer
+  (`fresco-vulkan::HeadlessRenderer`) is **deprecated**: opt-in only with
+  `FRESCOD_RENDERER=vulkan`, and split mode is off with it.
 - **The kernel side is Atrium's own** (no DRM, no linuxkpi, no drm-kmod).
   The canonical driver is **`atrium-gpu-amd`**, a from-scratch RDNA4 driver
   that today runs against **gpusim**, a functional RDNA model in a separate
   repo, wired into QEMU as a PCI device. It exposes the v2 GPU ABI (`'A'`,
-  `/dev/atrium-gpu0`) and the display ABI (`'D'`, `/dev/atrium-display0`).
-- **No Vulkan driver for that kernel driver exists yet.** So inside the VM,
-  frescod's Vulkan is the **CPU**: Mesa's **lavapipe**, from the FreeBSD
-  package. The "GPU" in the native path does only the CP DMA copy of the
-  finished frame into the VRAM scanout buffer.
+  `/dev/atrium-gpu0`) and display ABI v2 (`'D'`, `/dev/atrium-display0`:
+  commit a BO fd with in/out fences, paced by flip-done).
+- **Mesa is not used at runtime on the default path.** lavapipe runs only if
+  someone opts into `FRESCOD_RENDERER=vulkan`, and as the golden-test oracle
+  for `fresco-compute`. RADV is used only on the R9700 box as the speed
+  yardstick for our compiler.
 - **3D and third-party Vulkan go through a separate GPU-dispatch protocol,
   `aqueduct-gpu`.** `atrium-vk-icd` turns Vulkan calls into `FrameOp`s and
   sends them to an `aqueduct-gpu-host` endpoint. That endpoint runs Tier-1
   (tiny-skia), Tier-2 (Atrium's own AOT SPIR-V→native CPU compiler,
   `atrium-spv-*`) or Tier-3 (MoltenVK→Metal on the Mac host, reached from the
   VM through the **Carillon** doorbell transport). The finished frames come
-  back into frescod as textures.
-- **Mesa: yes at runtime today, though not by design.** See §7.
+  back into frescod as textures. A native Vulkan driver on our RDNA4
+  backend is the next step for this path.
 
 ## 2. Diagram
+
+*(2026-11-03: shows frescod on Vulkan/lavapipe, now deprecated. Current diagrams: §0.)*
 
 ```mermaid
 flowchart TB
@@ -411,6 +419,8 @@ is installed (§7).
 | `--gpu` | fresco.ko | out-of-repo `~/src/fresco` server | Metal on host | **Phase-0 relic** |
 
 ## 7. Is Mesa used?
+
+*(2026-11-03 answer. Since 2026-11-05 the default frescod path uses no Mesa; see §1.)*
 
 The design says only at build time. At runtime it is used anyway:
 
