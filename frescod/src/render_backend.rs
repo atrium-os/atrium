@@ -243,6 +243,10 @@ impl<'a> Backend<'a> {
     /// counterpart of the gpu renderer's VM per window). The gpu renderer
     /// takes frames and rasters each in its window's VM.
     /// `FRESCOD_SPLIT_PIXELS=0` sends frames to the compute renderer too.
+    /// Whether frames pass through the CPU on their way to scanout, so the
+    /// HDR encode (hdr.rs) can run on them: not for the gpu renderer.
+    pub fn can_hdr(&self) -> bool { !matches!(self, Backend::Gpu(_)) }
+
     pub fn wants_pixels(&self) -> bool {
         matches!(self, Backend::Compute(_)) && std::env::var("FRESCOD_SPLIT_PIXELS").as_deref() != Ok("0")
     }
@@ -281,11 +285,15 @@ impl<'a> Backend<'a> {
         staging: &mut [u8],
         deadline_ns: u32,
         signal: (&Syncobj<'_>, u64),
+        hdr: Option<&crate::hdr::Encoder>,
     ) -> Result<()> {
         match self {
             Backend::Gpu(g) => g.submit(scan.buffer(i), deadline_ns, signal),
             _ => {
                 self.read_pixels(staging)?;
+                if let Some(e) = hdr {
+                    e.encode(staging);
+                }
                 scan.upload(i, staging, deadline_ns, Some(signal))?;
                 Ok(())
             }

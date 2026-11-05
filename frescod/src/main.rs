@@ -42,6 +42,7 @@ mod split;
 mod gpu_app;
 mod chrome;
 mod screen;
+mod hdr;
 
 use atrium_gpu::amd::{Display, EventWatch, Gpu, ModeV2, Scanout, MODE_PREFERRED, NOTE_HOTPLUG, NOTE_RESET};
 
@@ -254,7 +255,10 @@ fn main() -> std::io::Result<()> {
     let mut on_screen: usize = 0;
     render_one_frame(&mut renderer, &frontend, &comp, split.as_deref(), mode.width, mode.height)
         .map_err(io_other)?;
-    renderer.present(&scan, on_screen, &mut framebuffer, frame_deadline_ns, (&copy_done, frame))
+    let hdr_enc = hdr::Encoder::new();
+    let mut hdr_on = apply_hdr(&dpy, &conn, renderer.can_hdr(), None);
+    renderer.present(&scan, on_screen, &mut framebuffer, frame_deadline_ns, (&copy_done, frame),
+        hdr_on.then_some(&hdr_enc))
         .map_err(io_other)?;
     let vrr = use_vrr(&conn, &mode);
     check_fault("modeset", dpy.modeset_vrr(
@@ -340,6 +344,16 @@ fn main() -> std::io::Result<()> {
                 let cur = (mode.width, mode.height, mode.refresh_mhz);
                 let same_monitor = conn.edid == monitor_edid;
                 monitor_edid = conn.edid.clone();
+                /* HDR follows the monitor, whether or not the mode changes:
+                 * it goes out with the next commit, so repaint in the new
+                 * format at once. */
+                if !same_monitor {
+                    let was_hdr = hdr_on;
+                    hdr_on = apply_hdr(&dpy, &conn, renderer.can_hdr(), Some(was_hdr));
+                    if hdr_on != was_hdr {
+                        last_gen = 0;
+                    }
+                }
                 let pick = match request {
                     Some(r) => find_mode(&conn.modes, Some(r)),
                     /* The same monitor back: keep its mode. A new one gets
@@ -461,7 +475,8 @@ fn main() -> std::io::Result<()> {
             .map_err(io_other)?;
         frame += 1;
         let back = (on_screen + 1) % scan.len();
-        renderer.present(&scan, back, &mut framebuffer, frame_deadline_ns, (&copy_done, frame))
+        renderer.present(&scan, back, &mut framebuffer, frame_deadline_ns, (&copy_done, frame),
+            hdr_on.then_some(&hdr_enc))
             .map_err(io_other)?;
         check_fault("flip", dpy.commit(
             scan.buffer(back), 0, 0,
@@ -727,6 +742,39 @@ fn parse_mode(v: &str) -> Option<(u32, u32, u32)> {
         None => 0,
     };
     Some((w.trim().parse().ok()?, h.trim().parse().ok()?, mhz))
+}
+
+/// Signal HDR10 and send frames as 10-bit PQ (hdr.rs) when FRESCOD_HDR=1,
+/// the renderer's frames pass through the CPU, and the monitor takes PQ in
+/// BT.2020; otherwise SDR in XRGB8888. Takes effect with the next commit.
+/// Returns whether HDR is on; logs when that differs from `was`.
+fn apply_hdr(dpy: &Display, conn: &atrium_gpu::amd::ConnectorV2, can: bool, was: Option<bool>) -> bool {
+    use atrium_gpu::amd::{Hdr, COLORIMETRY_BT2020, EOTF_PQ, FORMAT_XRGB2101010, FORMAT_XRGB8888};
+    let want = std::env::var("FRESCOD_HDR").is_ok_and(|v| v == "1");
+    if want && conn.hdr && can {
+        if let Ok((_, caps)) = dpy.hdr() {
+            if caps.eotfs & (1 << EOTF_PQ) != 0 && caps.colorimetry & (1 << COLORIMETRY_BT2020) != 0 {
+                /* SDR content: nothing brighter than reference white. */
+                let white = hdr::SDR_WHITE_NITS as u16;
+                let peak = if caps.max_nits == 0 { 1000 } else { caps.max_nits.min(10000) as u16 };
+                if dpy.set_hdr(&Hdr::hdr10(peak, white, white)).is_ok() {
+                    dpy.set_format(FORMAT_XRGB2101010);
+                    if was != Some(true) {
+                        eprintln!("frescod: HDR10 on (monitor peak {} cd/m2): the desktop at {white} cd/m2 white, 10-bit PQ",
+                            caps.max_nits);
+                    }
+                    return true;
+                }
+            }
+        }
+    }
+    if want && was != Some(false) {
+        eprintln!("frescod: HDR asked for but {}; SDR",
+            if !can { "the gpu renderer draws straight to scanout" } else { "the monitor doesn't take HDR10" });
+    }
+    let _ = dpy.set_hdr(&Hdr::default());
+    dpy.set_format(FORMAT_XRGB8888);
+    false
 }
 
 /// The listed mode matching (width, height, refresh mHz): refresh 0 takes
