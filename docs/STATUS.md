@@ -50,7 +50,7 @@ Command streams in `atrium-rdna4-cmd`, ISA tables in `atrium-rdna4-isa`
 - Docs: [spec/atrium-rdna4-vulkan-backend.md](spec/atrium-rdna4-vulkan-backend.md),
   [spec/atrium-gpu-ir.md](spec/atrium-gpu-ir.md),
   [spec/rdna4-vulkan-subset.md](spec/rdna4-vulkan-subset.md),
-  [GRAPHICS-STACK.md](GRAPHICS-STACK.md) (map as of 2026-11-03).
+  [GRAPHICS-STACK.md](GRAPHICS-STACK.md) (current map).
 - Roadmap after this: graphics pipeline → ray queries → full RT, with Orbis as
   the driving workload.
 
@@ -105,7 +105,7 @@ compute route chosen; security conditions F1–F6 in
 | F5 | deferred (Shankar) | — |
 | D4 gpusim toward real DCN4 regs, D5 silicon display | not started (R9700 has no monitor) | — |
 
-Slice detail: [spec/fresco-f4-split.md](spec/fresco-f4-split.md). The whole display stack as it stands: [GRAPHICS-STACK.md §0](GRAPHICS-STACK.md#0-the-display-stack-now-updated-2026-11-05). Screenshots
+Slice detail: [spec/fresco-f4-split.md](spec/fresco-f4-split.md). The whole display stack as it stands: [GRAPHICS-STACK.md](GRAPHICS-STACK.md). Screenshots
 in `/mnt/project-files/graphics/frescod-*.png`.
 
 ## 4. Compressed memory
