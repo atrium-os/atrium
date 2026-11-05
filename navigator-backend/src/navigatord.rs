@@ -27,6 +27,7 @@
 //! broker logic, and that the test suite below is already written against the
 //! boundary rather than against the internals.
 
+use crate::links::{decide, LinkAction, SchemeAllowlist};
 use crate::reverse::{Back, Forward};
 use crate::session::{Expiry, Millis, SessionId, SessionLimits, Sessions, Status};
 
@@ -60,6 +61,12 @@ pub trait DocumentHost {
     /// The triggers a reader could act on. The broker passes these to the UI
     /// without understanding them.
     fn triggers(&self, id: SessionId) -> Vec<String>;
+    /// The URL of the session's document, which a relative link resolves
+    /// against. It is the recording's own claim, and that is enough: it only
+    /// chooses a base, and the broker decides on the URL the link RESOLVES
+    /// to — a host lying about it can do no more than a page writing absolute
+    /// links already could.
+    fn document_url(&mut self, id: SessionId, now: Millis) -> Result<String, String>;
     /// Every open session and what it costs — what §4.4a's caller-chosen
     /// eviction decides from.
     fn report(&self) -> Vec<(SessionId, usize)>;
@@ -85,6 +92,9 @@ pub enum Request {
     /// What is open and what it costs — a UI showing a session list, or a
     /// caller deciding what to evict under §4.4a.
     Report,
+    /// The reader activated a link in the session's scene. `href` is the
+    /// link's target as the scene carries it; the broker decides what it does.
+    Activate { session: SessionId, href: String },
 }
 
 /// What the UI hears back.
@@ -114,6 +124,10 @@ pub enum Event {
     /// The session named does not exist — and whether it once did.
     NoSuchSession { session: SessionId, status: Status },
     Report { sessions: Vec<(SessionId, usize)>, total_bytes: usize },
+    /// What an activated link does: scroll within the document, open a page
+    /// (marked when it is `http`), or hand an allowlisted scheme to its
+    /// handler. A refused link is `Blocked`, like any other refusal.
+    Link { session: SessionId, action: LinkAction },
 }
 
 /// The broker.
@@ -123,9 +137,18 @@ pub struct Navigatord<H: DocumentHost> {
     /// component that owns the lifecycle owns the clock, and a test drives it
     /// rather than waiting for it.
     now: Millis,
+    /// Schemes beyond `https` and `http` a link may hand off. Empty unless
+    /// the user names one (threat model §2.10).
+    schemes: SchemeAllowlist,
 }
 
 impl<H: DocumentHost> Navigatord<H> {
+    /// Let links of `scheme` be handed to its handler. ★ The user's choice,
+    /// so a page cannot make it; `javascript` is refused (see `links`).
+    pub fn allow_scheme(&mut self, scheme: &str) -> Result<(), String> {
+        self.schemes.allow(scheme)
+    }
+
     /// ★★ THE PRODUCTION CONSTRUCTOR, and it refuses an unconfined host
     /// (threat model §2.3). `require_confinement()` existed, but nothing on
     /// the production path called it, so the shipped default was a worker
@@ -136,7 +159,7 @@ impl<H: DocumentHost> Navigatord<H> {
             return Err("navigatord refuses to start: the document host is not confined \
                         (configure a launcher, e.g. `portcullis exec --daemon --instance {instance}`)".into());
         }
-        Ok(Navigatord { host, now: 0 })
+        Ok(Navigatord { host, now: 0, schemes: SchemeAllowlist::default() })
     }
 
     /// An unconfined broker, for tests: in-process hosts, bare worker
@@ -144,7 +167,9 @@ impl<H: DocumentHost> Navigatord<H> {
     /// or a dependent that enables the `unconfined-for-testing` feature —
     /// so a shipped binary that calls it does not link.
     #[cfg(any(test, feature = "unconfined-for-testing"))]
-    pub fn unconfined_for_testing(host: H) -> Self { Navigatord { host, now: 0 } }
+    pub fn unconfined_for_testing(host: H) -> Self {
+        Navigatord { host, now: 0, schemes: SchemeAllowlist::default() }
+    }
 
     /// The host, for an operator (or a test) inspecting it.
     pub fn host(&self) -> &H { &self.host }
@@ -253,6 +278,21 @@ impl<H: DocumentHost> Navigatord<H> {
                 sessions: self.host.report(),
                 total_bytes: self.host.bytes(),
             }),
+            // ★★ The link decision is the broker's, made here on every
+            // activation: the href came from a scene a worker rendered from
+            // hostile bytes, so nothing upstream of this line is in a
+            // position to have made it (threat model §2.10).
+            Request::Activate { session, href } => {
+                if let Some(e) = self.absent(session) { out.push(e); return out }
+                let base = match self.host.document_url(session, self.now) {
+                    Ok(u) => u,
+                    Err(why) => { out.push(Event::Blocked { session: Some(session), why }); return out }
+                };
+                match decide(&base, &href, &self.schemes) {
+                    Ok(action) => out.push(Event::Link { session, action }),
+                    Err(why) => out.push(Event::Blocked { session: Some(session), why: why.to_string() }),
+                }
+            }
         }
         out
     }
@@ -366,6 +406,10 @@ impl DocumentHost for InProcessHost {
 
     fn report(&self) -> Vec<(SessionId, usize)> {
         self.sessions.report().into_iter().map(|(id, _url, bytes)| (id, bytes)).collect()
+    }
+
+    fn document_url(&mut self, id: SessionId, _now: Millis) -> Result<String, String> {
+        self.sessions.get(id).map(|s| s.url.clone()).ok_or_else(|| "no such session".into())
     }
 
     fn triggers(&self, id: SessionId) -> Vec<String> {

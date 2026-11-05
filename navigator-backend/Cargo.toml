@@ -21,6 +21,10 @@ navigator-dom = { path = "../navigator-dom" }
 # hash, and the same pure-Rust build, as navigator-prerender's subresources
 # (spec §5: the store is Tessera, and Tessera is content-addressed).
 blake3 = { version = "1", features = ["pure"] }
+# The WHATWG URL parser, for the one decision the broker makes on a URL: where
+# an activated link may go (src/links.rs). The converter resolves every URL it
+# meets with the same crate.
+url = "2"
 
 [features]
 # ★ Unconfined brokers (`Navigatord::unconfined_for_testing`) exist only in

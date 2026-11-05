@@ -641,6 +641,31 @@ pipe, and the typed island channel.
   user allowlists them. There is no `javascript:` vehicle in the document lane, but the
   scheme still has to be refused at the link-activation layer, not left to happen not to
   work.
+  - *Built 2026-11-05* (`navigator-backend/src/links.rs`). Link activation is a broker
+    request: `Request::Activate { session, href }`. `navigatord` answers it with
+    `Event::Link` or `Blocked`, and no other layer is consulted: the href reaches the UI
+    from a scene that a worker rendered from hostile bytes.
+  - The decision is made on the URL the href *resolves* to, against the document's URL,
+    through the WHATWG parser (the `url` crate, the converter's own). So the spellings a
+    browser normalises still count as the scheme they become: `java\tscript:`,
+    `JavaScript:`, a leading space or control character. A relative href takes the
+    document's scheme.
+  - `https` navigates. `http` navigates with `insecure: true`, which the UI must show. The
+    same document plus a fragment is `InDocument`.
+  - Every other scheme is refused unless the user allowlisted it, in which case it is
+    handed to its handler (`Handoff`). This covers `file:`, `data:`, `blob:`, `about:`,
+    `mailto:`, `tel:` and OS handlers such as `ms-settings:` and `zoommtg:`.
+  - `javascript:` and `vbscript:` cannot be allowlisted: there is no script to run them
+    in, so an entry would only hand page-authored code to whatever claims the scheme.
+  - An href over 8 KiB is refused before it is parsed.
+  - A document whose own URL has a refused scheme cannot launder its relative links or
+    its anchors into an allowed one.
+  - Tests: `navigator-backend/tests/links.rs`, the decision, plus the same decisions
+    through both hosts, the in-process one and the worker (where the base URL crosses
+    the pipe as `URL`).
+  - *Not yet:* the broker does not check that an href is one the current document
+    carries, so a compromised worker can offer any `https` or `http` URL, as a hostile
+    page already can by writing it. Downloads are untouched.
 - **Downloads.** Saved with the source origin recorded, never executable by default, and
   opened only by a jailed viewer.
 
@@ -693,7 +718,7 @@ These belong in the model because they are *wins*, not because they need work:
 | P2 | Fuzz Fresco scene ingest and the GPU ioctl surface; Fresco takes outlines, not fonts | A1 against the shared compositor | medium | §2.5 |
 | P2 | Broker rules for replayed request templates | A3, CSRF | design-time, with §5.4.5 | §2.7 |
 | P2 | Unobscured-input rule for islands; bhyve for the CDM | A2 clickjacking, kernel surface | medium, with §8.1 | §2.9 |
-| P2 | Scheme allowlist on link activation; download marking | A1/A2 | small | §2.10 |
+| P2 ✔ scheme allowlist built, in the broker (2026-11-05); download marking open | Scheme allowlist on link activation; download marking | A1/A2 | small | §2.10 |
 | P3 | Origin chrome, punycode for confusables, form warnings | A2 | product work | §2.11 |
 | gate | No login support before §6's vault and per-origin fetcher (C0) | account takeover | — | §6 |
 

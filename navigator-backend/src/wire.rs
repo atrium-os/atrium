@@ -104,6 +104,8 @@ pub const REQ_BACK: &str = "BACK";
 pub const REQ_FORWARD: &str = "FWD";
 pub const REQ_TRIGGERS: &str = "TRIG";
 pub const REQ_BYTES: &str = "SIZE";
+/// The document's URL, which the broker resolves a link against.
+pub const REQ_URL: &str = "URL";
 /// The worker's half of a saved session: answers a `session::Trail` as JSON.
 pub const REQ_SAVE: &str = "SAVE";
 /// Replay a `session::Trail` onto the document this worker just opened.

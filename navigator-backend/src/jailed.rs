@@ -440,6 +440,10 @@ impl DocumentHost for JailedHost {
         self.workers.get(&id).map(|w| w.triggers.clone()).unwrap_or_default()
     }
 
+    fn document_url(&mut self, id: SessionId, now: Millis) -> Result<String, String> {
+        self.ask(id, Frame::new(REQ_URL, &b""[..]), now)
+    }
+
     fn report(&self) -> Vec<(SessionId, usize)> {
         let mut v: Vec<_> = self.workers.iter().map(|(&id, w)| (id, w.charged)).collect();
         v.sort_by_key(|(id, _)| *id);

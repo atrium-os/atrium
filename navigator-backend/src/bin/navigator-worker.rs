@@ -53,6 +53,10 @@ impl Worker {
             .map(|t| t.trigger.as_str()).collect::<Vec<_>>().join("\n")
     }
 
+    fn url(&mut self) -> Result<String, String> {
+        Ok(self.session()?.url.clone())
+    }
+
     fn navigate(&mut self, trigger: &str) -> Result<String, String> {
         self.session()?.navigate(trigger).map_err(|e| e.to_string())?;
         Ok(String::new())
@@ -120,6 +124,7 @@ fn main() {
             REQ_FORWARD => w.forward(),
             REQ_TRIGGERS => Ok(w.triggers()),
             REQ_BYTES => Ok(w.size()),
+            REQ_URL => w.url(),
             other => Err(format!("unknown request {other:?}")),
         };
         let reply = match answer {

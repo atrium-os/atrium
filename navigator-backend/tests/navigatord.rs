@@ -308,6 +308,9 @@ impl DocumentHost for NullHost {
     fn bytes(&self) -> usize { 0 }
     fn open_count(&self) -> usize { self.open.len() }
     fn triggers(&self, _id: SessionId) -> Vec<String> { vec![] }
+    fn document_url(&mut self, _id: SessionId, _now: u64) -> Result<String, String> {
+        Ok("https://null.test/".into())
+    }
     fn report(&self) -> Vec<(SessionId, usize)> { self.open.iter().map(|&i| (i, 0)).collect() }
 }
 

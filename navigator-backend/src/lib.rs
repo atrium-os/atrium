@@ -17,6 +17,7 @@ pub mod document;
 pub mod ingest;
 pub mod jailed;
 pub mod limits;
+pub mod links;
 pub mod navigatord;
 pub mod reverse;
 pub mod session;
