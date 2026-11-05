@@ -62,35 +62,88 @@ fn usable_trigger(trigger: &str, anchored: bool, tier: Tier) -> bool {
 }
 
 pub fn emit(url: Option<&str>, c: &Conversion, policy: &TierPolicy) -> String {
-    let (document, decision) = policy.artifact(c);
+    emit_part(url, c, policy, true)
+}
+
+/// ★ THE READABLE ARTIFACT (legacy-web §5.4.5.7, step 3): the recording
+/// with no transition table — the document, its stylesheets and image sizes,
+/// and the measurements a control (non-exploring) conversion would report.
+/// It is what a reader needs to READ, and it exists before exploration runs;
+/// `emit_transitions` carries the rest. For an exploring conversion it is
+/// byte-identical to the recording a control conversion of the same page
+/// writes (exploration is reverted, so the document is the same), and
+/// `merge` of the two parts is byte-identical to `emit`.
+pub fn emit_readable(url: Option<&str>, c: &Conversion, policy: &TierPolicy) -> String {
+    emit_part(url, c, policy, false)
+}
+
+/// The transitions artifact's format.
+pub const TRANSITIONS_FORMAT: &str = "atrium-navigator-transitions/1";
+
+/// ★ THE TRANSITIONS ARTIFACT: exploration's output, delivered after the
+/// readable artifact and bound to it by `readable`, the BLAKE3 of the
+/// readable recording's bytes — a table recorded against one document must
+/// not be attached to another. The `transitions` (and `templates`) blocks
+/// are written exactly as `emit` writes them, which is what lets `merge`
+/// splice them back verbatim.
+pub fn emit_transitions(url: Option<&str>, c: &Conversion, policy: &TierPolicy, readable: &str) -> String {
+    let (_, decision) = policy.artifact(c);
+    let (block, _, dropped) = transitions_block(c, decision.tier);
+    let mut s = String::new();
+    s.push_str("{\n");
+    field(&mut s, "format", TRANSITIONS_FORMAT, false);
+    field(&mut s, "url", url.unwrap_or(""), false);
+    field(&mut s, "readable", &format!("blake3:{}", blake3::hash(readable.as_bytes()).to_hex()), false);
+    s.push_str(&format!("  \"interactive_found\": {},\n", c.interactive_found));
+    s.push_str(&format!("  \"transitions_dropped\": {dropped},\n"));
+    s.push_str(&block);
+    s.push_str("  \"end\": true\n}\n");
+    s
+}
+
+/// The whole recording from its two parts, byte for byte what `emit` writes
+/// for the same conversion. Refuses a transitions artifact recorded against
+/// a different readable recording, and either part not in the shape this
+/// module writes.
+pub fn merge(readable: &str, transitions: &str) -> Result<String, String> {
+    let want = format!("\"readable\": \"blake3:{}\",", blake3::hash(readable.as_bytes()).to_hex());
+    if !transitions.contains(&want) { return Err("the transitions were recorded against another document".into()) }
+    let line = |k: &str| -> Result<u64, String> {
+        let at = transitions.find(&format!("\n  \"{k}\": ")).ok_or(format!("no {k}"))? + k.len() + 6;
+        transitions[at..].split(',').next().and_then(|v| v.trim().parse().ok()).ok_or(format!("bad {k}"))
+    };
+    let (found, dropped) = (line("interactive_found")?, line("transitions_dropped")?);
+    let start = transitions.find("\n  \"transitions\": [").ok_or("no transitions block")? + 1;
+    let end = transitions.rfind("  \"end\": true\n}").ok_or("no end")?;
+    let block = &transitions[start..end];
+    let mut out = readable.to_string();
+    let swap = |out: &mut String, a: &str, b: &str| -> Result<(), String> {
+        let at = out.find(a).ok_or(format!("readable recording without {a:?}"))?;
+        out.replace_range(at..at + a.len(), b);
+        Ok(())
+    };
+    swap(&mut out, "\n  \"transitions\": [],\n", &format!("\n{block}"))?;
+    swap(&mut out, "\n    \"interactive_found\": 0,\n", &format!("\n    \"interactive_found\": {found},\n"))?;
+    swap(&mut out, "\n    \"transitions_dropped\": 0\n", &format!("\n    \"transitions_dropped\": {dropped}\n"))?;
+    if block.contains("\n  \"templates\": [") {
+        swap(&mut out, &format!("\"format\": \"{FORMAT}\""), &format!("\"format\": \"{FORMAT_V4}\""))?;
+    }
+    Ok(out)
+}
+
+/// The `transitions` (and `templates`) blocks of a recording, as `emit`
+/// writes them, with whether there were templates and how many were dropped.
+fn transitions_block(c: &Conversion, tier: Tier) -> (String, bool, usize) {
     let kept: Vec<&crate::Transition> =
-        c.transitions.iter().filter(|t| usable(t, decision.tier)).collect();
+        c.transitions.iter().filter(|t| usable(t, tier)).collect();
     let mut dropped = c.transitions.len() - kept.len();
     let templates: Vec<(&crate::Template, Vec<&crate::Instance>)> = c.templates.iter().filter_map(|t| {
         let inst: Vec<&crate::Instance> = t.instances.iter()
-            .filter(|i| usable_trigger(&i.trigger, i.anchored, decision.tier)).collect();
+            .filter(|i| usable_trigger(&i.trigger, i.anchored, tier)).collect();
         dropped += t.instances.len() - inst.len();
         (!inst.is_empty()).then_some((t, inst))
     }).collect();
-
     let mut s = String::new();
-    s.push_str("{\n");
-    field(&mut s, "format", if templates.is_empty() { FORMAT } else { FORMAT_V4 }, false);
-    field(&mut s, "url", url.unwrap_or(""), false);
-    s.push_str(&format!("  \"tier\": {},\n",
-        match decision.tier { Tier::One => 1, Tier::Two => 2 }));
-    field(&mut s, "tier_reason", decision.reason, false);
-
-    s.push_str("  \"measurements\": {\n");
-    s.push_str(&format!("    \"elements\": {},\n", c.elements_after));
-    s.push_str(&format!("    \"text_before\": {},\n", c.text_before));
-    s.push_str(&format!("    \"text_after\": {},\n", c.text_after));
-    s.push_str(&format!("    \"scripts_total\": {},\n", c.scripts_total));
-    s.push_str(&format!("    \"scripts_failed\": {},\n", c.scripts_failed));
-    s.push_str(&format!("    \"interactive_found\": {},\n", c.interactive_found));
-    s.push_str(&format!("    \"transitions_dropped\": {dropped}\n"));
-    s.push_str("  },\n");
-
     s.push_str("  \"transitions\": [");
     for (i, t) in kept.iter().enumerate() {
         s.push_str(if i == 0 { "\n" } else { ",\n" });
@@ -138,6 +191,34 @@ pub fn emit(url: Option<&str>, c: &Conversion, policy: &TierPolicy) -> String {
         s.push_str("\n  ],\n");
     }
 
+    (s, !templates.is_empty(), dropped)
+}
+
+fn emit_part(url: Option<&str>, c: &Conversion, policy: &TierPolicy, whole: bool) -> String {
+    let (document, decision) = policy.artifact(c);
+    let (block, has_templates, dropped) = transitions_block(c, decision.tier);
+    // The readable part reports what a control conversion would: no table.
+    let (has_templates, dropped, found) = if whole { (has_templates, dropped, c.interactive_found) } else { (false, 0, 0) };
+
+    let mut s = String::new();
+    s.push_str("{\n");
+    field(&mut s, "format", if has_templates { FORMAT_V4 } else { FORMAT }, false);
+    field(&mut s, "url", url.unwrap_or(""), false);
+    s.push_str(&format!("  \"tier\": {},\n",
+        match decision.tier { Tier::One => 1, Tier::Two => 2 }));
+    field(&mut s, "tier_reason", decision.reason, false);
+
+    s.push_str("  \"measurements\": {\n");
+    s.push_str(&format!("    \"elements\": {},\n", c.elements_after));
+    s.push_str(&format!("    \"text_before\": {},\n", c.text_before));
+    s.push_str(&format!("    \"text_after\": {},\n", c.text_after));
+    s.push_str(&format!("    \"scripts_total\": {},\n", c.scripts_total));
+    s.push_str(&format!("    \"scripts_failed\": {},\n", c.scripts_failed));
+    s.push_str(&format!("    \"interactive_found\": {found},\n"));
+    s.push_str(&format!("    \"transitions_dropped\": {dropped}\n"));
+    s.push_str("  },\n");
+
+    if whole { s.push_str(&block) } else { s.push_str("  \"transitions\": [],\n") }
     // The subresources, in the order they were found.
     s.push_str("  \"stylesheets\": [");
     for (i, sh) in c.subresources.sheets.iter().enumerate() {

@@ -136,7 +136,137 @@ pub fn convert_with_opts(
     fetcher: &mut dyn Fetcher,
     protect_parser_nodes: bool,
 ) -> Conversion {
-    convert_impl(html, base, Some(engine), fetcher, protect_parser_nodes)
+    convert_impl(html, base, Some(engine), fetcher, protect_parser_nodes, Flow::ALONE, None)
+}
+
+/// Which artifact a progressive conversion has reached (§5.4.5.7).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Stage {
+    /// The tier-1 conversion: parsed, no script run. First display.
+    First,
+    /// The scripts have settled (load, events, timers, the reader's sweep)
+    /// and exploration has not started: the readable artifact
+    /// (`artifact::emit_readable`). Its `transitions` are empty and
+    /// `interactive_found` is 0, as a control conversion's are.
+    Settled,
+    /// Exploration is done: the transitions artifact
+    /// (`artifact::emit_transitions`) is this conversion's.
+    Done,
+}
+
+/// ★★ A CONVERSION THAT NEVER MAKES A READER WAIT FOR THE WHOLE PIPELINE
+/// (legacy-web §5.4.5.7). `on` is called three times, in order, as each
+/// artifact comes to exist: the tier-1 conversion (no script fetched or
+/// run), the scripted conversion once its scripts settle, before
+/// exploration; and the finished conversion. The tier-1 conversion's
+/// fetches are remembered, so the scripted one does not pull a stylesheet
+/// or an image twice. The returned conversion is the one
+/// `convert_with_opts` would return, byte for byte in what it emits.
+pub fn convert_progressive(
+    html: &str,
+    base: Option<&str>,
+    engine: &mut dyn ScriptEngine,
+    fetcher: &mut dyn Fetcher,
+    protect_parser_nodes: bool,
+    on: &mut dyn FnMut(Stage, &Conversion),
+) -> Conversion {
+    let first = {
+        let _s = timing::span("first");
+        convert_impl(html, base, None, fetcher, false, Flow { fresh: true, keep_after: true }, None)
+    };
+    timing::mark("first");
+    on(Stage::First, &first);
+    drop(first);
+    let full = {
+        let mut settled = |c: &Conversion| { timing::mark("settled"); on(Stage::Settled, c) };
+        convert_impl(html, base, Some(engine), fetcher, protect_parser_nodes,
+                     Flow { fresh: false, keep_after: false }, Some(&mut settled))
+    };
+    timing::mark("done");
+    on(Stage::Done, &full);
+    full
+}
+
+/// Whether a conversion starts the stopwatch and the fetch memo afresh, and
+/// whether it leaves the memo for a conversion that follows it.
+#[derive(Clone, Copy)]
+struct Flow { fresh: bool, keep_after: bool }
+impl Flow { const ALONE: Flow = Flow { fresh: true, keep_after: false }; }
+
+/// What a conversion knows before any script runs, and every assembly of
+/// its result needs.
+#[derive(Clone)]
+struct Pre {
+    html_tier1: String,
+    scripts_held: bool,
+    engine: &'static str,
+    before: usize,
+    text_before: usize,
+    origin_refusal: Option<&'static str>,
+    profile_violations: Vec<profile::Violation>,
+    scripts_total: usize,
+    ext: (usize, usize, usize),
+}
+
+/// The run's outcome as a `Conversion`.
+fn assemble(dom: &dom::Dom, rep: engine::RunReport, subresources: subresource::Subresources, pre: Pre) -> Conversion {
+    let verdict = classify(rep.first_error.as_deref(), rep.cause.as_ref());
+    Conversion {
+        subresources,
+        html: dom.serialize(),
+        html_tier1: pre.html_tier1,
+        scripts_held: pre.scripts_held,
+        engine: pre.engine,
+        elements_before: pre.before,
+        text_before: pre.text_before,
+        origin_refusal: pre.origin_refusal,
+        profile_violations: pre.profile_violations,
+        text_after: dom.visible_text(dom.root()).split_whitespace()
+            .map(str::len).sum::<usize>(),
+        removals_refused: dom.removals_refused,
+        transitions: rep.transitions,
+        templates: rep.templates,
+        interactive_found: rep.interactive_found,
+        coverage: rep.coverage,
+        explore_stats: rep.explore_stats,
+        elements_after: dom.element_count(),
+        depth_after: dom.max_depth(),
+        scripts_total: pre.scripts_total,
+        external_total: pre.ext.0,
+        external_fetched: pre.ext.1,
+        external_failed: pre.ext.2,
+        scripts_run: rep.scripts_run,
+        scripts_failed: rep.scripts_failed,
+        script_mutations: dom.script_mutations,
+        listeners_fired: rep.listeners_fired,
+        module_retries: rep.module_retries,
+        observers_registered: rep.observers_registered,
+        mutation_records: rep.mutation_records,
+        ce_upgrades: rep.ce_upgrades,
+        history_writes: rep.history_writes,
+        history_refused: rep.history_refused,
+        events_dispatched: rep.events_dispatched,
+        event_listeners_run: rep.event_listeners_run,
+        doc_writes: rep.doc_writes,
+        doc_writes_refused: rep.doc_writes_refused,
+        injected_scripts_run: rep.injected_scripts_run,
+        injected_scripts_refused: rep.injected_scripts_refused,
+        layout_reads: rep.layout_reads,
+        geo: rep.geo,
+        timers_fired: rep.timers_fired,
+        timers_dropped: rep.timers_dropped,
+        page_fetches: rep.page_fetches,
+        page_fetch_failures: rep.page_fetch_failures,
+        page_blocked: rep.page_blocked,
+        blocked_hosts: rep.blocked_hosts,
+        beacons_suppressed: rep.beacons_suppressed,
+        verdict,
+        missing: rep.missing,
+        first_error: rep.first_error,
+        cause: rep.cause,
+        nulls: rep.nulls,
+        errors: rep.errors,
+    }
 }
 
 /// ★ TIER 1, FOR FIRST DISPLAY (legacy-web §5.4.5.7): parse, collect the
@@ -144,7 +274,7 @@ pub fn convert_with_opts(
 /// script is fetched or run, so nothing here waits for the page's code;
 /// the scripted conversion follows and replaces it.
 pub fn convert_tier1(html: &str, base: Option<&str>, fetcher: &mut dyn Fetcher) -> Conversion {
-    convert_impl(html, base, None, fetcher, false)
+    convert_impl(html, base, None, fetcher, false, Flow::ALONE, None)
 }
 
 fn convert_impl(
@@ -153,11 +283,15 @@ fn convert_impl(
     mut engine: Option<&mut dyn ScriptEngine>,
     fetcher: &mut dyn Fetcher,
     protect_parser_nodes: bool,
+    flow: Flow,
+    mut settled: Option<&mut dyn FnMut(&Conversion)>,
 ) -> Conversion {
     let scripts_held = engine.is_none();
     // A conversion's fetches are its own (see `subresource::forget_fetched`).
-    subresource::forget_fetched();
-    timing::reset();
+    if flow.fresh {
+        subresource::forget_fetched();
+        timing::reset();
+    }
     let parse_span = timing::span("html.parse");
     let mut dom = parse::parse(html);
     let before = dom.element_count();
@@ -270,12 +404,35 @@ fn convert_impl(
         }
     }
 
+    let pre = Pre {
+        html_tier1, scripts_held,
+        engine: engine.as_deref().map(|e| e.name()).unwrap_or("none"),
+        before, text_before, origin_refusal, profile_violations,
+        scripts_total: scripts.len() + held,
+        ext: (ext_total, ext_ok, ext_fail),
+    };
     let mut rep = match engine.as_deref_mut() {
         Some(engine) => {
             engine.set_module_root(&mirror_root);
             engine.set_base_url(base);
             let _s = timing::span("js");
-            engine.run(&mut dom, &scripts)
+            match settled.as_deref_mut() {
+                None => engine.run(&mut dom, &scripts),
+                // ★ The readable artifact is assembled from the SETTLED
+                // document, the way the final one is from the final
+                // document: its subresources collected (through the same
+                // memo, so nothing is fetched twice) and its measurements
+                // those a control conversion reports.
+                Some(cb) => engine.run_settled(&mut dom, &scripts, &mut |d, r| {
+                    let subs = { let _s = timing::span("subresource"); subresource::collect(d, base, &mut *fetcher) };
+                    let partial = engine::RunReport {
+                        scripts_run: r.scripts_run, scripts_failed: r.scripts_failed,
+                        ..engine::RunReport::default()
+                    };
+                    let c = { let _s = timing::span("serialize"); assemble(d, partial, subs, pre.clone()) };
+                    cb(&c);
+                }),
+            }
         }
         None => engine::RunReport::default(),
     };
@@ -289,68 +446,9 @@ fn convert_impl(
         let _s = timing::span("subresource");
         subresource::collect(&dom, base, fetcher)
     };
-    subresource::forget_fetched();
-    let serialize_span = timing::span("serialize");
-    // Computed before the struct consumes the fields it reads.
-    let verdict = classify(rep.first_error.as_deref(), rep.cause.as_ref());
-    let c = Conversion {
-        subresources,
-        html: dom.serialize(),
-        html_tier1,
-        scripts_held,
-        engine: engine.map(|e| e.name()).unwrap_or("none"),
-        elements_before: before,
-        text_before,
-        origin_refusal,
-        profile_violations,
-        text_after: dom.visible_text(dom.root()).split_whitespace()
-            .map(str::len).sum::<usize>(),
-        removals_refused: dom.removals_refused,
-        transitions: rep.transitions,
-        templates: rep.templates,
-        interactive_found: rep.interactive_found,
-        coverage: rep.coverage,
-        explore_stats: rep.explore_stats,
-        elements_after: dom.element_count(),
-        depth_after: dom.max_depth(),
-        scripts_total: scripts.len() + held,
-        external_total: ext_total,
-        external_fetched: ext_ok,
-        external_failed: ext_fail,
-        scripts_run: rep.scripts_run,
-        scripts_failed: rep.scripts_failed,
-        script_mutations: dom.script_mutations,
-        listeners_fired: rep.listeners_fired,
-        module_retries: rep.module_retries,
-        observers_registered: rep.observers_registered,
-        mutation_records: rep.mutation_records,
-        ce_upgrades: rep.ce_upgrades,
-        history_writes: rep.history_writes,
-        history_refused: rep.history_refused,
-        events_dispatched: rep.events_dispatched,
-        event_listeners_run: rep.event_listeners_run,
-        doc_writes: rep.doc_writes,
-        doc_writes_refused: rep.doc_writes_refused,
-        injected_scripts_run: rep.injected_scripts_run,
-        injected_scripts_refused: rep.injected_scripts_refused,
-        layout_reads: rep.layout_reads,
-        geo: rep.geo,
-        timers_fired: rep.timers_fired,
-        timers_dropped: rep.timers_dropped,
-        page_fetches: rep.page_fetches,
-        page_fetch_failures: rep.page_fetch_failures,
-        page_blocked: rep.page_blocked,
-        blocked_hosts: rep.blocked_hosts,
-        beacons_suppressed: rep.beacons_suppressed,
-        verdict,
-        missing: rep.missing,
-        first_error: rep.first_error,
-        cause: rep.cause,
-        nulls: rep.nulls,
-        errors: rep.errors,
-    };
-    drop(serialize_span);
-    c
+    if !flow.keep_after { subresource::forget_fetched() }
+    let _s = timing::span("serialize");
+    assemble(&dom, rep, subresources, pre)
 }
 
 /// Resolve a `src` against the document base. Absolute URLs pass through;

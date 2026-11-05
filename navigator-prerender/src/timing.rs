@@ -46,6 +46,7 @@ struct State {
     stack: Vec<(String, Instant, Instant)>,
     totals: BTreeMap<String, Totals>,
     fetches: Vec<FetchRec>,
+    marks: Vec<(String, Duration)>,
 }
 
 thread_local! {
@@ -87,6 +88,16 @@ impl Drop for Span {
             if let Some(top) = t.stack.last_mut() { top.2 = now }
         });
     }
+}
+
+/// Note the moment `name` happened (since `reset`): `at.<name>` in the
+/// report, e.g. when the first-display artifact existed.
+pub fn mark(name: &str) {
+    T.with(|t| {
+        let mut t = t.borrow_mut();
+        let at = t.origin.map(|o| o.elapsed()).unwrap_or_default();
+        t.marks.push((name.to_string(), at));
+    });
 }
 
 /// The innermost open span's name, or "".
@@ -150,6 +161,7 @@ pub fn report_line() -> String {
     let (wall, totals, fetches) = snapshot();
     let ms = |d: Duration| format!("{:.1}", d.as_secs_f64() * 1000.0);
     let mut o = format!("TM\twall={}", ms(wall));
+    for (k, at) in T.with(|t| t.borrow().marks.clone()) { o.push_str(&format!("\tat.{k}={}", ms(at))) }
     let mut covered = Duration::ZERO;
     for (k, v) in &totals {
         covered += v.exclusive;

@@ -747,6 +747,12 @@ struct Driver {
     /// `PRERENDER_TIER1=1`: convert without running scripts (the tier-1,
     /// first-display conversion; legacy-web §5.4.5.7).
     tier1: bool,
+    /// `PRERENDER_PROGRESSIVE=1`: the child delivers the tier-1 recording,
+    /// then the readable one, then the transitions (§5.4.5.7). The emitted
+    /// `<stem>.json` is still the whole recording (`artifact::merge`);
+    /// `PRERENDER_PARTS_DIR` also keeps the three parts.
+    progressive: bool,
+    parts_dir: Option<PathBuf>,
     emit_dir: Option<PathBuf>,
     blob_dir: Option<PathBuf>,
     mem_mb: u64,
@@ -771,6 +777,8 @@ impl Driver {
             protect: on("PRERENDER_PROTECT"),
             dump: on("PRERENDER_DUMP"),
             tier1: on("PRERENDER_TIER1"),
+            progressive: on("PRERENDER_PROGRESSIVE"),
+            parts_dir: std::env::var_os("PRERENDER_PARTS_DIR").map(PathBuf::from),
             emit_dir: std::env::var_os("PRERENDER_EMIT_DIR").map(PathBuf::from),
             blob_dir: std::env::var_os("PRERENDER_BLOB_DIR").map(PathBuf::from),
             mem_mb: std::env::var("PRERENDER_MEM_MB").ok().and_then(|v| v.parse().ok()).unwrap_or(4096),
@@ -838,7 +846,7 @@ fn convert_in_child(
         base: (!base.is_empty()).then(|| base.to_string()),
         net, explore: d.explore, same_site: d.same_site, protect: d.protect,
         emit: d.emit_dir.is_some(), blobs: d.blob_dir.is_some(), require_confined: d.require,
-        deadline_s: deadline.as_secs().max(1), mem_mb: d.mem_mb, scripts: !d.tier1, len: doc.len(),
+        deadline_s: deadline.as_secs().max(1), mem_mb: d.mem_mb, progressive: d.progressive, scripts: !d.tier1, len: doc.len(),
     };
     let header = job.header()?;
     let instance = format!("{}{:05}", std::process::id(), INSTANCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed));
@@ -928,8 +936,21 @@ fn convert_in_child(
     if o.timed_out { return Err(format!("timed out at {}s", deadline.as_secs())) }
     if !o.ended { return Err(crash_reason(start.elapsed().as_secs_f64(), &status.to_string(), &stderr)) }
     if d.dump { eprint!("{stderr}") }
-    if let (Some(dir), Some(rec)) = (&d.emit_dir, &o.recording) {
-        let stem = file.file_stem().map(|s| s.to_string_lossy().to_string()).unwrap_or_else(|| "doc".into());
+    let stem = file.file_stem().map(|s| s.to_string_lossy().to_string()).unwrap_or_else(|| "doc".into());
+    if let Some(dir) = &d.parts_dir {
+        let _ = fs::create_dir_all(dir);
+        for (ext, part) in [("first", &o.first), ("readable", &o.recording), ("transitions", &o.transitions)] {
+            if let Some(b) = part { let _ = fs::write(dir.join(format!("{stem}.{ext}.json")), b); }
+        }
+    }
+    // A progressive conversion's whole recording is its two parts merged;
+    // a merge that fails is a converter bug, and fails the document.
+    let whole = match (&o.recording, &o.transitions) {
+        (Some(r), Some(t)) => Some(navigator_prerender::artifact::merge(&String::from_utf8_lossy(r), &String::from_utf8_lossy(t))
+            .map_err(|e| format!("converter protocol: the parts do not merge: {e}"))?.into_bytes()),
+        _ => o.recording.clone(),
+    };
+    if let (Some(dir), Some(rec)) = (&d.emit_dir, &whole) {
         let path = dir.join(format!("{stem}.json"));
         if let Err(e) = fs::create_dir_all(dir).and_then(|_| fs::write(&path, rec)) {
             eprintln!("emit: cannot write {}: {e}", path.display());
@@ -963,6 +984,10 @@ fn convert_in_child(
         let mut line = format!("{name}\tchild_wall={:.1}", child_wall.as_secs_f64() * 1e3);
         if let Some(tm) = o.report.lines().find(|l| l.starts_with("TM\t")) { line.push('\t'); line.push_str(&tm[3..]) }
         line.push_str(&relay_summary(&curl_log));
+        let ms = |d: Option<std::time::Duration>| d.map(|d| format!("{:.1}", d.as_secs_f64() * 1e3)).unwrap_or_else(|| "-".into());
+        line.push_str(&format!("\tarrive_first={}\tarrive_recording={}\tarrive_transitions={}",
+            ms(o.first_at), ms(o.recording_at), ms(o.transitions_at)));
+        if let Some(rec) = &o.first { line.push_str(&display_cost(rec).replace("\tdisplay_", "\tfirst_display_")) }
         if let Some(rec) = &o.recording { line.push_str(&display_cost(rec)) }
         line.push('\n');
         use std::io::Write;
@@ -1081,7 +1106,39 @@ fn serve() -> ! {
         no_scroll_sweep: std::env::var("PRERENDER_SCROLL").ok().as_deref() == Some("0"),
         ..Default::default()
     };
-    let c = if job.scripts {
+    let c = if job.scripts && job.progressive {
+        // ★ Each artifact leaves the moment it exists (§5.4.5.7): the blobs
+        // it names first, then the frame. Nothing waits for exploration.
+        use navigator_prerender::{artifact, Stage, TierPolicy};
+        let policy = TierPolicy::default();
+        let base = job.base.clone();
+        let mut sent: std::collections::HashSet<String> = Default::default();
+        let mut readable = String::new();
+        let mut frame = |tag: &str, body: &str, sent: &mut std::collections::HashSet<String>| {
+            let mut out = std::io::stdout().lock();
+            for (a, b) in navigator_prerender::subresource::take_blobs() {
+                if job.blobs && sent.insert(a.clone()) {
+                    let _ = write!(out, "BLOB {a} {}\n", b.len());
+                    let _ = out.write_all(&b);
+                }
+            }
+            let _ = write!(out, "{tag} {}\n", body.len());
+            let _ = out.write_all(body.as_bytes());
+            let _ = out.flush();
+        };
+        navigator_prerender::convert_progressive(&src, base.as_deref(), &mut eng, fetcher, job.protect, &mut |stage, c| {
+            if !job.emit || c.origin_refusal.is_some() { return }
+            let _s = navigator_prerender::timing::span("emit");
+            match stage {
+                Stage::First => frame("FIRST", &artifact::emit(base.as_deref(), c, &policy), &mut sent),
+                Stage::Settled => {
+                    readable = artifact::emit_readable(base.as_deref(), c, &policy);
+                    frame("RECORDING", &readable, &mut sent);
+                }
+                Stage::Done => frame("TRANSITIONS", &artifact::emit_transitions(base.as_deref(), c, &policy, &readable), &mut sent),
+            }
+        })
+    } else if job.scripts {
         navigator_prerender::convert_with_opts(&src, job.base.as_deref(), &mut eng, fetcher, job.protect)
     } else {
         navigator_prerender::convert_tier1(&src, job.base.as_deref(), fetcher)
@@ -1096,7 +1153,9 @@ fn serve() -> ! {
             let _ = out.write_all(b);
         }
     }
-    if job.emit {
+    if job.emit && job.progressive && job.scripts {
+        if let Some(why) = c.origin_refusal { eprintln!("emit: refused by origin ({why}); no recording written") }
+    } else if job.emit {
         if let Some(why) = c.origin_refusal {
             eprintln!("emit: refused by origin ({why}); no recording written");
         } else {

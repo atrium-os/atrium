@@ -25,7 +25,8 @@ fn driver(dir: &std::path::Path, env: &[(&str, &str)]) -> (i32, String, String) 
     c.arg(dir);
     for k in ["PRERENDER_LAUNCHER", "PRERENDER_FETCHD", "PRERENDER_REQUIRE_CONFINEMENT", "PRERENDER_NET",
               "PRERENDER_EMIT_DIR", "PRERENDER_BLOB_DIR", "PRERENDER_DEADLINE", "PRERENDER_FETCH_BUDGET",
-              "PRERENDER_EXPLORE", "PRERENDER_COVERAGE"] { c.env_remove(k); }
+              "PRERENDER_EXPLORE", "PRERENDER_COVERAGE", "PRERENDER_PROGRESSIVE", "PRERENDER_PARTS_DIR",
+              "PRERENDER_TIMING", "PRERENDER_TIER1"] { c.env_remove(k); }
     for (k, v) in env { c.env(k, v); }
     let o = c.output().unwrap();
     (o.status.code().unwrap_or(-1), String::from_utf8_lossy(&o.stdout).into(), String::from_utf8_lossy(&o.stderr).into())
@@ -175,4 +176,37 @@ fn the_relay_enforces_a_per_conversion_byte_budget() {
     let (_, out, _) = driver(&docs, &[("PRERENDER_NET", "1"), ("PRERENDER_FETCHD", &fetchd)]);
     assert!(!out.contains("FETCH BUDGET"), "{out}");
     assert_eq!(std::fs::read_to_string(&log).unwrap().lines().count(), 5);
+}
+
+/// ★ Progressive delivery through the real driver and child (§5.4.5.7): the
+/// three parts are written, the whole recording the driver emits is their
+/// merge, and it is byte-identical to a non-progressive run's. The timing
+/// line says each artifact arrived, the first one before the readable one.
+#[test]
+fn a_progressive_run_writes_its_parts_and_the_same_whole_recording() {
+    let page = "<!doctype html><title>t</title><p id=a>one</p><div id=p class=c>x</div>\
+                <script>document.getElementById('a').textContent='two';\
+                document.getElementById('a').addEventListener('click',function(){\
+                document.getElementById('p').setAttribute('class','o')})</script>";
+    let d = corpus_of_one("progressive", page);
+    let (plain, prog, parts) = (d.join("plain"), d.join("prog"), d.join("parts"));
+    let timing = d.join("t.tsv");
+    let (code, out, err) = driver(&d, &[("PRERENDER_EXPLORE", "1"), ("PRERENDER_EMIT_DIR", plain.to_str().unwrap())]);
+    assert_eq!(code, 0, "{out}{err}");
+    let (code, out, err) = driver(&d, &[("PRERENDER_EXPLORE", "1"), ("PRERENDER_PROGRESSIVE", "1"),
+        ("PRERENDER_EMIT_DIR", prog.to_str().unwrap()), ("PRERENDER_PARTS_DIR", parts.to_str().unwrap()),
+        ("PRERENDER_TIMING", timing.to_str().unwrap())]);
+    assert_eq!(code, 0, "{out}{err}");
+    let a = std::fs::read(plain.join("doc.json")).unwrap();
+    let b = std::fs::read(prog.join("doc.json")).unwrap();
+    assert_eq!(String::from_utf8_lossy(&a), String::from_utf8_lossy(&b));
+    let first = std::fs::read_to_string(parts.join("doc.first.json")).unwrap();
+    assert!(first.contains("first display: scripts not run yet") && first.contains(">one</p>"), "{first}");
+    assert!(std::fs::read_to_string(parts.join("doc.readable.json")).unwrap().contains(">two</p>"));
+    assert!(std::fs::read_to_string(parts.join("doc.transitions.json")).unwrap().contains("atrium-navigator-transitions/1"));
+    let t = std::fs::read_to_string(&timing).unwrap();
+    let field = |k: &str| t.split('\t').find_map(|f| f.strip_prefix(&format!("{k}="))).and_then(|v| v.trim().parse::<f64>().ok());
+    let (f, r, x) = (field("arrive_first").unwrap(), field("arrive_recording").unwrap(), field("arrive_transitions").unwrap());
+    assert!(f <= r && r <= x, "{t}");
+    assert!(t.contains("first_display_normalize=") && t.contains("\tdisplay_normalize="), "{t}");
 }

@@ -238,6 +238,16 @@ pub trait ScriptEngine {
     /// The document's own URL, for `location` and relative `URL` resolution.
     fn set_base_url(&mut self, _url: Option<&str>) {}
     fn run(&mut self, dom: &mut Dom, scripts: &[ScriptSource]) -> RunReport;
+    /// `run`, calling `settled` once the page's scripts have settled (load,
+    /// lifecycle events, timers, the reader's sweep) and before exploration
+    /// starts, with the document as it then is (§5.4.5.7). An engine that
+    /// does not explore calls it at the end, which is the same moment.
+    fn run_settled(&mut self, dom: &mut Dom, scripts: &[ScriptSource],
+                   settled: &mut dyn FnMut(&Dom, &RunReport)) -> RunReport {
+        let r = self.run(dom, scripts);
+        settled(dom, &r);
+        r
+    }
 }
 
 /// One observable state transition: a trigger, and what it did.

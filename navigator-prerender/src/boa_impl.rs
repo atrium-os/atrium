@@ -5876,6 +5876,17 @@ impl ScriptEngine for BoaEngine {
     }
 
     fn run(&mut self, dom: &mut Dom, scripts: &[ScriptSource]) -> RunReport {
+        self.run_hooked(dom, scripts, None)
+    }
+    fn run_settled(&mut self, dom: &mut Dom, scripts: &[ScriptSource],
+                   settled: &mut dyn FnMut(&Dom, &RunReport)) -> RunReport {
+        self.run_hooked(dom, scripts, Some(settled))
+    }
+}
+
+impl BoaEngine {
+    fn run_hooked(&mut self, dom: &mut Dom, scripts: &[ScriptSource],
+                  settled: Option<&mut dyn FnMut(&Dom, &RunReport)>) -> RunReport {
         // ★ BEFORE any wrapper is built. Clearing it later threw away the
         // `document.body` wrapper that had just been cached, so the next
         // lookup minted a second object and `x.parentNode === document.body`
@@ -6217,6 +6228,13 @@ impl ScriptEngine for BoaEngine {
         // maps to know which elements the page wired — clearing them first
         // left it with nothing to probe and reporting zero interactive
         // elements on pages full of them.
+        // ★ THE PAGE HAS SETTLED: what a reader reads exists now, and
+        // exploration (which is reverted, probe by probe) only adds a table
+        // of what its elements do. The readable artifact is taken here
+        // (§5.4.5.7), so exploration is off the reader's critical path.
+        if let Some(cb) = settled {
+            DOM.with(|d| cb(&d.borrow(), &rep));
+        }
         if self.explore {
             let parser_nodes = DOM.with(|d| d.borrow().parser_nodes);
             let bounds = self.probe_bounds.unwrap_or((PROBES_PER_HANDLER, MAX_PROBES));

@@ -66,6 +66,10 @@ pub struct Job {
     pub deadline_s: u64,
     /// The child's address-space ceiling, in MiB (FreeBSD; RLIMIT_AS).
     pub mem_mb: u64,
+    /// ★ Deliver as each artifact exists (§5.4.5.7): `FIRST` (tier 1, no
+    /// script run), then `RECORDING` as the READABLE artifact once the
+    /// scripts settle, then `TRANSITIONS` once exploration is done.
+    pub progressive: bool,
     /// Run the page's scripts. Off: the tier-1 conversion alone (parse,
     /// subresources, serialize), the first-display artifact (§5.4.5.7).
     pub scripts: bool,
@@ -75,7 +79,7 @@ pub struct Job {
 impl Default for Job {
     fn default() -> Self {
         Job { base: None, net: false, explore: false, same_site: false, protect: false, emit: false,
-              blobs: false, require_confined: false, deadline_s: 30, mem_mb: 4096, scripts: true, len: 0 }
+              blobs: false, require_confined: false, deadline_s: 30, mem_mb: 4096, progressive: false, scripts: true, len: 0 }
     }
 }
 
@@ -86,9 +90,9 @@ impl Job {
         let base = self.base.as_deref().unwrap_or("");
         if base.contains(['\t', '\n', '\r']) { return Err(format!("base URL with a control character: {base:?}")) }
         Ok(format!("{MAGIC}\tbase={base}\tnet={}\texplore={}\tsame_site={}\tprotect={}\temit={}\tblobs={}\
-                    \trequire_confined={}\tdeadline={}\tmem_mb={}\tscripts={}\tlen={}\n",
+                    \trequire_confined={}\tdeadline={}\tmem_mb={}\tprogressive={}\tscripts={}\tlen={}\n",
             b(self.net), b(self.explore), b(self.same_site), b(self.protect), b(self.emit), b(self.blobs),
-            b(self.require_confined), self.deadline_s, self.mem_mb, b(self.scripts), self.len))
+            b(self.require_confined), self.deadline_s, self.mem_mb, b(self.progressive), b(self.scripts), self.len))
     }
 
     /// ★ Strict: an unknown key, a missing `len`, or a value that does not
@@ -113,6 +117,7 @@ impl Job {
                 "require_confined" => j.require_confined = flag(v)?,
                 "deadline" => j.deadline_s = v.parse().map_err(|_| format!("bad deadline {v:?}"))?,
                 "scripts" => j.scripts = flag(v)?,
+                "progressive" => j.progressive = flag(v)?,
                 "mem_mb" => j.mem_mb = v.parse().map_err(|_| format!("bad mem_mb {v:?}"))?,
                 "len" => { j.len = v.parse().map_err(|_| format!("bad len {v:?}"))?; have_len = true }
                 _ => return Err(format!("unknown field {k:?}")),
@@ -138,7 +143,17 @@ pub fn read_job(r: &mut impl BufRead) -> Result<(Job, Vec<u8>), String> {
 pub struct Outcome {
     /// The report lines, as `--one` prints them; `parse_child` reads these.
     pub report: String,
+    /// The recording: whole, or (a progressive conversion) the readable
+    /// artifact, delivered before exploration ran.
     pub recording: Option<Vec<u8>>,
+    /// A progressive conversion's tier-1 recording (`FIRST`), and its
+    /// transitions artifact (`TRANSITIONS`).
+    pub first: Option<Vec<u8>>,
+    pub transitions: Option<Vec<u8>>,
+    /// When each artifact arrived, from the start of `drive`.
+    pub first_at: Option<std::time::Duration>,
+    pub recording_at: Option<std::time::Duration>,
+    pub transitions_at: Option<std::time::Duration>,
     pub blobs: usize,
     pub fetches: usize,
     pub timed_out: bool,
@@ -178,7 +193,25 @@ pub fn drive(
     fetch: &mut dyn FnMut(&str) -> Vec<u8>,
     blob: &mut dyn FnMut(&str, &[u8]),
 ) -> Result<Outcome, String> {
+    drive_streaming(out, stdin, fetch, blob, &mut |_, _| {})
+}
+
+/// An artifact the child delivered, as it arrived.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Artifact { First, Recording, Transitions }
+
+/// `drive`, handing each artifact to `artifact` THE MOMENT IT ARRIVES, so a
+/// caller can show a reader the tier-1 conversion while the scripted one is
+/// still running (§5.4.5.7). Blobs a recording names arrive before it.
+pub fn drive_streaming(
+    out: &mut impl BufRead,
+    stdin: &Mutex<Option<Box<dyn Write + Send>>>,
+    fetch: &mut dyn FnMut(&str) -> Vec<u8>,
+    blob: &mut dyn FnMut(&str, &[u8]),
+    artifact: &mut dyn FnMut(Artifact, &[u8]),
+) -> Result<Outcome, String> {
     let mut o = Outcome::default();
+    let t0 = std::time::Instant::now();
     // Set once the child stops reading: it has exited (its own watchdog, a
     // crash) or closed its input. Not a protocol error — what it says next on
     // stdout (TIMEOUT, or nothing) decides how the conversion is reported.
@@ -214,7 +247,26 @@ pub fn drive(
         } else if let Some(n) = line.strip_prefix("RECORDING ") {
             if o.recording.is_some() { return Err("a second RECORDING".into()) }
             let n = len_of(n, MAX_RECORDING, "recording")?;
-            o.recording = Some(read_n(out, n, "recording")?);
+            let r = read_n(out, n, "recording")?;
+            o.recording_at = Some(t0.elapsed());
+            artifact(Artifact::Recording, &r);
+            o.recording = Some(r);
+        } else if let Some(n) = line.strip_prefix("FIRST ") {
+            // ★ In order, once each: a FIRST after the recording, or a
+            // second one, is a child out of step, not a newer draft.
+            if o.first.is_some() || o.recording.is_some() { return Err("FIRST out of order".into()) }
+            let n = len_of(n, MAX_RECORDING, "first recording")?;
+            let r = read_n(out, n, "first recording")?;
+            o.first_at = Some(t0.elapsed());
+            artifact(Artifact::First, &r);
+            o.first = Some(r);
+        } else if let Some(n) = line.strip_prefix("TRANSITIONS ") {
+            if o.transitions.is_some() || o.recording.is_none() { return Err("TRANSITIONS out of order".into()) }
+            let n = len_of(n, MAX_RECORDING, "transitions")?;
+            let r = read_n(out, n, "transitions")?;
+            o.transitions_at = Some(t0.elapsed());
+            artifact(Artifact::Transitions, &r);
+            o.transitions = Some(r);
         } else if line == "TIMEOUT" {
             o.timed_out = true;
         } else if line == "END" {
@@ -320,6 +372,26 @@ mod tests {
             &mut |a, _| blobs.push(a.to_string()));
         let sent = buf.lock().unwrap().clone();
         (r, sent, urls, blobs)
+    }
+
+    #[test]
+    fn progressive_artifacts_arrive_in_order_and_are_handed_over_as_they_come() {
+        let (_, stdin) = stdin_sink();
+        let mut seen = vec![];
+        let o = drive_streaming(&mut &b"FIRST 2\nt1F https://a.example/s.css\nRECORDING 2\nt2TRANSITIONS 2\ntxR\t1\nEND\n"[..], &stdin,
+            &mut |_| b"ok 200 0 2 https://a.example/\nhi".to_vec(), &mut |_, _| {},
+            &mut |a, b| seen.push((a, b.to_vec()))).unwrap();
+        assert_eq!(seen, vec![(Artifact::First, b"t1".to_vec()), (Artifact::Recording, b"t2".to_vec()),
+                              (Artifact::Transitions, b"tx".to_vec())]);
+        assert!(o.ended && o.first_at.unwrap() <= o.recording_at.unwrap() && o.recording_at.unwrap() <= o.transitions_at.unwrap());
+    }
+
+    #[test]
+    fn progressive_artifacts_out_of_order_are_refused() {
+        for bad in [&b"RECORDING 1\naFIRST 1\nb"[..], b"TRANSITIONS 1\na", b"FIRST 1\naFIRST 1\nb",
+                    b"RECORDING 1\naTRANSITIONS 1\nbTRANSITIONS 1\nc"] {
+            assert!(run(bad).0.unwrap_err().contains("out of order"), "{:?}", String::from_utf8_lossy(bad));
+        }
     }
 
     #[test]
