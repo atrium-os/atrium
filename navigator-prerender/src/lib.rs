@@ -152,12 +152,28 @@ pub enum Stage {
     /// Exploration is done: the transitions artifact
     /// (`artifact::emit_transitions`) is this conversion's.
     Done,
+    /// ★ The first display's images (§5.4.5.7, the image-free first
+    /// display): the `First` conversion again, its images now as `collect`
+    /// writes them — those fetched so far, and (unless `complete`) the rest
+    /// still pending. `artifact::emit_images` writes it; merged into the
+    /// first artifact (`artifact::merge_images`), the complete one is the
+    /// recording a tier-1 conversion that waited for its images writes.
+    /// Comes between `First` and `Settled`, and only when the first
+    /// artifact has an image pending.
+    Images { complete: bool },
 }
 
+/// A partial `Stage::Images` is offered at most this often…
+pub const IMAGES_EVERY: std::time::Duration = std::time::Duration::from_millis(250);
+/// …and at most this many times: each one carries the whole list so far.
+pub const MAX_PARTIAL_IMAGES: usize = 32;
+
 /// ★★ A CONVERSION THAT NEVER MAKES A READER WAIT FOR THE WHOLE PIPELINE
-/// (legacy-web §5.4.5.7). `on` is called three times, in order, as each
-/// artifact comes to exist: the tier-1 conversion (no script fetched or
-/// run), the scripted conversion once its scripts settle, before
+/// (legacy-web §5.4.5.7). `on` is called in order as each artifact comes
+/// to exist: the tier-1 conversion (no script fetched or run, and no image
+/// fetched: each is `Pending`, `subresource::collect_first`); its images as
+/// they arrive (`Stage::Images`, partial at most every `IMAGES_EVERY`, then
+/// complete); the scripted conversion once its scripts settle, before
 /// exploration; and the finished conversion. The tier-1 conversion's
 /// fetches are remembered, so the scripted one does not pull a stylesheet
 /// or an image twice. The returned conversion is the one
@@ -170,17 +186,35 @@ pub fn convert_progressive(
     protect_parser_nodes: bool,
     on: &mut dyn FnMut(Stage, &Conversion),
 ) -> Conversion {
-    let first = {
+    let mut first = {
         let _s = timing::span("first");
-        convert_impl(html, base, None, fetcher, false, Flow { fresh: true, keep_after: true }, None)
+        convert_impl(html, base, None, fetcher, false, Flow { fresh: true, keep_after: true, defer_images: true }, None)
     };
     timing::mark("first");
     on(Stage::First, &first);
+    // ★ Then its images, as they arrive — before any script is fetched, so
+    // the scripted conversion that follows finds every one in the memo and
+    // is no later than it was when the first artifact waited for them.
+    let pending = std::mem::take(&mut first.subresources.images);
+    if pending.iter().any(|i| i.pending.is_some()) {
+        let _s = timing::span("images");
+        let dom = parse::parse(html);
+        let (mut last, mut offered) = (std::time::Instant::now(), 0usize);
+        let subs = subresource::collect_streaming(&dom, base, fetcher, &pending, &mut |now| {
+            if offered >= MAX_PARTIAL_IMAGES || last.elapsed() < IMAGES_EVERY { return }
+            first.subresources.images = now();
+            on(Stage::Images { complete: false }, &first);
+            (last, offered) = (std::time::Instant::now(), offered + 1);
+        });
+        first.subresources = subs;
+        timing::mark("images");
+        on(Stage::Images { complete: true }, &first);
+    }
     drop(first);
     let full = {
         let mut settled = |c: &Conversion| { timing::mark("settled"); on(Stage::Settled, c) };
         convert_impl(html, base, Some(engine), fetcher, protect_parser_nodes,
-                     Flow { fresh: false, keep_after: false }, Some(&mut settled))
+                     Flow { fresh: false, keep_after: false, defer_images: false }, Some(&mut settled))
     };
     timing::mark("done");
     on(Stage::Done, &full);
@@ -190,8 +224,8 @@ pub fn convert_progressive(
 /// Whether a conversion starts the stopwatch and the fetch memo afresh, and
 /// whether it leaves the memo for a conversion that follows it.
 #[derive(Clone, Copy)]
-struct Flow { fresh: bool, keep_after: bool }
-impl Flow { const ALONE: Flow = Flow { fresh: true, keep_after: false }; }
+struct Flow { fresh: bool, keep_after: bool, defer_images: bool }
+impl Flow { const ALONE: Flow = Flow { fresh: true, keep_after: false, defer_images: false }; }
 
 /// What a conversion knows before any script runs, and every assembly of
 /// its result needs.
@@ -452,7 +486,7 @@ fn convert_impl(
     // a script may well have added the stylesheet or the image.
     let subresources = {
         let _s = timing::span("subresource");
-        subresource::collect(&dom, base, fetcher)
+        if flow.defer_images { subresource::collect_first(&dom, base, fetcher) } else { subresource::collect(&dom, base, fetcher) }
     };
     if !flow.keep_after { subresource::forget_fetched() }
     let _s = timing::span("serialize");

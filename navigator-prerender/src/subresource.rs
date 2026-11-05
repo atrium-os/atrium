@@ -20,7 +20,38 @@ use navigator_dom::Dom;
 pub struct Sheet { pub href: String, pub media: String, pub text: String }
 
 #[derive(Debug, Clone, PartialEq)]
-pub struct Image { pub src: String, pub natural: Natural, pub address: String }
+pub struct Image {
+    pub src: String,
+    pub natural: Natural,
+    pub address: String,
+    /// ★ Set only in a first-display recording whose images have not been
+    /// fetched yet (legacy-web §5.4.5.7, the image-free first display):
+    /// what its box is sized from until the image arrives. `None` is an
+    /// image that HAS arrived (or failed), and is how every other recording
+    /// is written — the field is not emitted for it, so those recordings
+    /// are byte for byte what they were.
+    pub pending: Option<Pending>,
+}
+
+/// How a not-yet-fetched image's box is sized at first display.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Pending {
+    /// The document declares both `width` and `height`: the box is that
+    /// size, as it will be once the image arrives (unless the page's CSS
+    /// takes its height from the image's own ratio, and that ratio differs).
+    Declared,
+    /// It does not: no natural size is claimed (`null`, ratio `none`), so
+    /// the box is whatever the page's CSS makes it, else the default object
+    /// size (300 × 150, CSS Images 3 §5.3). Its arrival may move the layout,
+    /// and that is measured, not assumed away.
+    Placeholder,
+}
+
+impl Pending {
+    pub fn as_str(self) -> &'static str {
+        match self { Pending::Declared => "declared", Pending::Placeholder => "placeholder" }
+    }
+}
 
 /// An image's natural sizing; the reader lives in `navigator_dom::natural`
 /// so the WPT oracle can use it without depending on the converter.
@@ -75,7 +106,50 @@ pub struct Subresources {
 const MAX_IMPORT_DEPTH: usize = 2;
 
 pub fn collect(dom: &Dom, base: Option<&str>, fetcher: &mut dyn Fetcher) -> Subresources {
-    collect_inner(dom, base, fetcher, false)
+    collect_inner(dom, base, fetcher, Mode::Final, None)
+}
+
+/// ★ THE IMAGE-FREE FIRST DISPLAY (legacy-web §5.4.5.7): the stylesheets,
+/// fetched as `collect` fetches them, and the images NOT fetched — each
+/// entered as `Pending`, sized from the document's own `width`/`height`
+/// where it declares both, otherwise claiming no natural size at all. A
+/// first display then waits for the page's design and not for its
+/// pictures, and every image keeps a box (the normalizer drops an `<img>`
+/// it has no entry for, which would move the layout when it arrived).
+pub fn collect_first(dom: &Dom, base: Option<&str>, fetcher: &mut dyn Fetcher) -> Subresources {
+    collect_inner(dom, base, fetcher, Mode::First, None)
+}
+
+/// `collect`, offering `progress` after each image what the recording's
+/// images would be if the collection stopped there: every image handled so
+/// far as `collect` writes it, and every one not yet handled as `first`
+/// has it (`collect_first`). The list is built only if `progress` asks for
+/// it (calls the function it is handed), since most offers are declined.
+/// The returned value, not the last offer, is the final list: an image that
+/// failed once and was found again later in the document lands in its
+/// final place only there.
+pub fn collect_streaming(dom: &Dom, base: Option<&str>, fetcher: &mut dyn Fetcher, first: &[Image],
+                         progress: &mut dyn FnMut(&dyn Fn() -> Vec<Image>)) -> Subresources {
+    let mut p = |done: &Subresources, handled: &std::collections::HashSet<String>| {
+        let now = || -> Vec<Image> {
+            first.iter().filter_map(|f| {
+                if !handled.contains(&f.src) { return Some(f.clone()) }
+                done.images.iter().find(|i| i.src == f.src).cloned()
+            }).collect()
+        };
+        progress(&now);
+    };
+    collect_inner(dom, base, fetcher, Mode::Final, Some(&mut p))
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Mode {
+    /// The images a recording names: fetched, measured, hashed and stored.
+    Final,
+    /// A layout's: measured only (`collect_for_layout`).
+    Layout,
+    /// First display's: not fetched (`collect_first`).
+    First,
 }
 
 /// ★ Every subresource fetched during ONE conversion, by absolute URL —
@@ -100,7 +174,7 @@ pub fn forget_fetched() { FETCHED.with(|f| *f.borrow_mut() = Default::default())
 /// blob is stored and nothing is hashed, so laying a page out mid-script
 /// cannot add a blob the final document does not name.
 pub fn collect_for_layout(dom: &Dom, base: Option<&str>, fetcher: &mut dyn Fetcher) -> Subresources {
-    collect_inner(dom, base, fetcher, true)
+    collect_inner(dom, base, fetcher, Mode::Layout, None)
 }
 
 /// A fetcher that answers from `FETCHED` first.
@@ -120,7 +194,11 @@ impl Fetcher for Remembering<'_> {
     }
 }
 
-fn collect_inner(dom: &Dom, base: Option<&str>, fetcher: &mut dyn Fetcher, layout: bool) -> Subresources {
+type Progress<'a> = &'a mut dyn FnMut(&Subresources, &std::collections::HashSet<String>);
+
+fn collect_inner(dom: &Dom, base: Option<&str>, fetcher: &mut dyn Fetcher, mode: Mode,
+                 mut progress: Option<Progress<'_>>) -> Subresources {
+    let layout = mode == Mode::Layout;
     let mut remembering = Remembering { inner: fetcher };
     let fetcher: &mut dyn Fetcher = &mut remembering;
     let mut out = Subresources::default();
@@ -150,19 +228,35 @@ fn collect_inner(dom: &Dom, base: Option<&str>, fetcher: &mut dyn Fetcher, layou
         }
     }
 
+    // Every `src` met, whatever became of it: what `collect_streaming`
+    // reports progress against. (`out.images` alone cannot say, because an
+    // image that failed is not in it.)
+    let mut handled: std::collections::HashSet<String> = Default::default();
     for h in dom.by_tag_anywhere("img") {
         let Some(src) = dom.attr(h, "src").map(str::to_string) else { continue };
+        // ★ Deduplicated by what is IN the list, as it always was: a later
+        // `<img>` with the same `src` is tried again when the first one
+        // failed (it may declare a size the first did not).
         if out.images.iter().any(|i| i.src == src) { continue }
+        handled.insert(src.clone());
         // An image whose size the DOCUMENT already declares needs no fetch:
         // it has already arrived measured.
         let declared = |n: &str| dom.attr(h, n).and_then(|v| v.trim().parse::<u32>().ok());
         let Some(abs) = resolve(&src) else { out.failed.push((src, "cannot resolve".into())); continue };
+        if mode == Mode::First {
+            let (natural, pending) = match declared("width").zip(declared("height")) {
+                Some((w, ht)) => (Natural::sized(w, ht), Pending::Declared),
+                None => (Natural { width: None, height: None, ratio: None }, Pending::Placeholder),
+            };
+            out.images.push(Image { src, natural, address: String::new(), pending: Some(pending) });
+            continue;
+        }
         // ★ For a layout, the SIZE is all that is needed: never hashed,
         // never stored.
         if layout {
             let n = fetcher.get_bytes(&abs).ok().and_then(|b| natural_size(&b));
             match n.or_else(|| declared("width").zip(declared("height")).map(|(w, h)| Natural::sized(w, h))) {
-                Some(natural) => out.images.push(Image { src, natural, address: String::new() }),
+                Some(natural) => out.images.push(Image { src, natural, address: String::new(), pending: None }),
                 None => out.failed.push((src, "no intrinsic size".into())),
             }
             continue;
@@ -172,17 +266,18 @@ fn collect_inner(dom: &Dom, base: Option<&str>, fetcher: &mut dyn Fetcher, layou
                 Some(natural) => {
                     let address = format!("blake3:{}", blake3::hash(&bytes).to_hex());
                     store(&address, &bytes);
-                    out.images.push(Image { src, natural, address });
+                    out.images.push(Image { src, natural, address, pending: None });
                 }
                 None => out.failed.push((src, "no intrinsic size in the header".into())),
             },
             Err(e) => match declared("width").zip(declared("height")) {
                 // The document declared it, so layout is safe even though the
                 // bytes are not in hand: the renderer reserves the space.
-                Some((w, ht)) => out.images.push(Image { src, natural: Natural::sized(w, ht), address: String::new() }),
+                Some((w, ht)) => out.images.push(Image { src, natural: Natural::sized(w, ht), address: String::new(), pending: None }),
                 None => out.failed.push((src, e)),
             },
         }
+        if let Some(p) = progress.as_mut() { p(&out, &handled) }
     }
     out
 }

@@ -26,6 +26,22 @@
 //!    a table recorded against one document must not be replayed on another.
 //!    That swap shows no change, by the definition of "not meaningful".
 //!
+//! 0. (Between 1 and 2.) `Images`, as the first document's images arrive.
+//!    The first document waited for its stylesheets and not its images:
+//!    each `<img>` stood as a box sized from the page's own `width` and
+//!    `height` (`pending: declared`), or with no natural size at all
+//!    (`pending: placeholder`). Each images artifact is bound to the first
+//!    document by digest and carries its whole images list so far
+//!    (`FirstImages`). The document does not change; the session's recording
+//!    does — it names the images that arrived, so the UI may ask for their
+//!    pixels — and the UI is told which ones arrived and which ones changed
+//!    size. None changed size: their pixels are painted into the boxes that
+//!    were already there, and nothing moves. Some did: the UI lays the
+//!    document out again at an idle moment, at the reader's `Anchor` (the
+//!    same element, the same offset into it: on an unchanged document
+//!    `map_anchor` is the identity), and presents it in one frame, as it
+//!    presents a swap.
+//!
 //! Refused: a swap while the reader has changed the published document
 //! (taken a step), whose state the swap would throw away; an upgrade for a
 //! different URL; a second upgrade; a table for a document the session has
@@ -257,6 +273,8 @@ pub struct Swapped {
 pub struct Progress {
     /// `blake3:<hex>` of the shown recording's bytes.
     pub shown: String,
+    /// The first document's images, as they arrive.
+    pub images: FirstImages,
     pub held: Option<Staged>,
     /// A scripted document judged not meaningfully different, kept in case
     /// its transitions arrive.
@@ -267,7 +285,9 @@ pub struct Progress {
 pub fn address(bytes: &[u8]) -> String { format!("blake3:{}", digest(bytes)) }
 
 impl Progress {
-    pub fn opened(recording: &[u8]) -> Self { Progress { shown: address(recording), ..Default::default() } }
+    pub fn opened(recording: &[u8]) -> Self {
+        Progress { shown: address(recording), images: FirstImages::opened(recording), ..Default::default() }
+    }
 
     pub fn upgrade(&mut self, sessions: &mut Sessions, id: SessionId, bytes: &[u8], limits: &Limits, now: Millis)
         -> Result<Upgrade, String>
@@ -307,6 +327,9 @@ impl Progress {
             return Err(e.to_string());
         }
         self.shown = held.digest;
+        // The first document is gone, and its images with it: the scripted
+        // one names its own.
+        self.images.retire();
         Ok(Swapped { mapped, recording: held.bytes, transitions: held.transitions })
     }
 
@@ -355,4 +378,159 @@ pub fn compose(readable: &[u8], transitions: &[u8]) -> Result<Vec<u8>, String> {
         }
     }
     serde_json::to_vec(&r).map_err(|e| e.to_string())
+}
+
+/// The most entries an images artifact may carry: a recording names each
+/// `src` once, and the corpus's largest page names 452.
+pub const MAX_IMAGES: usize = 4096;
+
+/// One entry of a recording's `images` block, as far as the broker reads it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ImageEntry {
+    pub src: String,
+    pub width: Option<u64>,
+    pub height: Option<u64>,
+    pub ratio: String,
+    /// `blake3:<hex>`, or empty: the bytes are not in hand.
+    pub address: String,
+    /// `declared` or `placeholder`: not fetched yet.
+    pub pending: Option<String>,
+}
+
+impl ImageEntry {
+    /// What the image's box is sized from: two entries that agree on this
+    /// lay out the same.
+    fn sizing(&self) -> (Option<u64>, Option<u64>, &str) { (self.width, self.height, &self.ratio) }
+}
+
+fn bad(field: &'static str, why: &'static str) -> crate::Reject { crate::Reject::BadField { field, why } }
+
+/// Read an `images` array, bounded and checked: every `src` a bounded
+/// string and each once, every dimension `null` or a `u32`, every address
+/// empty or `blake3:<64 hex>`, `pending` absent or one of its two words.
+pub fn image_entries(v: Option<&serde_json::Value>, limits: &Limits) -> Result<Vec<ImageEntry>, crate::Reject> {
+    use serde_json::Value;
+    let Some(v) = v else { return Ok(vec![]) };
+    let arr = v.as_array().ok_or(bad("images", "not an array"))?;
+    if arr.len() > MAX_IMAGES { return Err(crate::Reject::TooLarge { what: "images", measured: arr.len(), allowed: MAX_IMAGES }) }
+    let mut seen = std::collections::HashSet::new();
+    let mut out = Vec::with_capacity(arr.len());
+    for e in arr {
+        let o = e.as_object().ok_or(bad("images", "an entry is not an object"))?;
+        let s = |k: &'static str| -> Result<Option<String>, crate::Reject> {
+            match o.get(k) {
+                None | Some(Value::Null) => Ok(None),
+                Some(Value::String(v)) if v.len() <= limits.max_string_bytes => Ok(Some(v.clone())),
+                Some(Value::String(_)) => Err(crate::Reject::TooLarge { what: "image field", measured: 0, allowed: limits.max_string_bytes }),
+                Some(_) => Err(bad("images", "a field is not a string")),
+            }
+        };
+        let dim = |k: &'static str| -> Result<Option<u64>, crate::Reject> {
+            match o.get(k) {
+                None | Some(Value::Null) => Ok(None),
+                Some(v) => v.as_u64().filter(|n| *n <= u32::MAX as u64).map(Some).ok_or(bad("images", "a dimension is not null or a u32")),
+            }
+        };
+        let src = s("src")?.ok_or(bad("images", "an entry has no src"))?;
+        if !seen.insert(src.clone()) { return Err(bad("images", "a src appears twice")) }
+        let address = s("address")?.unwrap_or_default();
+        if !address.is_empty() && crate::image::address_hex(&address).is_none() {
+            return Err(bad("images", "an address is not blake3:<64 hex>"));
+        }
+        let pending = s("pending")?;
+        if pending.as_deref().is_some_and(|p| p != "declared" && p != "placeholder") {
+            return Err(bad("images", "pending is neither declared nor placeholder"));
+        }
+        if pending.is_some() && !address.is_empty() { return Err(bad("images", "a pending image names bytes")) }
+        out.push(ImageEntry { src, width: dim("width")?, height: dim("height")?, ratio: s("ratio")?.unwrap_or_default(), address, pending });
+    }
+    Ok(out)
+}
+
+/// What one images artifact changed, for the UI.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ImagesAttached {
+    /// The recording the session now shows: the first document with these
+    /// images in. What it carries, and what a store keeps.
+    pub merged: Vec<u8>,
+    /// Every image has been handled; no more images artifacts are taken.
+    pub complete: bool,
+    /// Image addresses the session's recording names now and did not
+    /// before: the UI may ask for their pixels (`Request::Image`).
+    pub arrived: Vec<String>,
+    /// `src`s whose box may change: their natural size differs from the one
+    /// the shown layout used, or the image is gone (it failed). Empty: no
+    /// layout changes, and the arrived pixels fill boxes already there.
+    pub resized: Vec<String>,
+}
+
+/// ★★ THE FIRST DOCUMENT'S IMAGES, AS THEY ARRIVE (legacy-web §5.4.5.7).
+///
+/// The first document names each image it has not fetched as `pending`.
+/// An images artifact (`atrium-navigator-images/1`) is bound to that
+/// document by `first`, the BLAKE3 of its bytes, and carries the WHOLE
+/// images block so far, so each one is applied to the first document as it
+/// was opened — never to the previous merge — and a lost one costs nothing.
+/// The merged recording is ingested again, as any recording is.
+///
+/// Refused: an artifact for another document; one after the complete one;
+/// one after the first document was swapped out; a complete one with an
+/// image still pending; and an entry that is malformed (`image_entries`).
+#[derive(Debug, Clone, Default)]
+pub struct FirstImages {
+    /// `blake3:<hex>` of the first document's bytes.
+    first: String,
+    /// Its bytes, kept only while an image is pending.
+    bytes: Option<Vec<u8>>,
+    /// The images as the session shows them now.
+    shown: Vec<ImageEntry>,
+    retired: bool,
+}
+
+impl FirstImages {
+    pub fn opened(recording: &[u8]) -> Self {
+        let shown = serde_json::from_slice::<serde_json::Value>(recording).ok()
+            .and_then(|v| image_entries(v.get("images"), &Limits::default()).ok()).unwrap_or_default();
+        let pending = shown.iter().any(|e| e.pending.is_some());
+        FirstImages { first: address(recording), bytes: pending.then(|| recording.to_vec()), shown, retired: false }
+    }
+
+    /// The first document is no longer shown.
+    pub fn retire(&mut self) { self.retired = true; self.bytes = None }
+
+    /// Whether an image of the shown document is still pending.
+    pub fn pending(&self) -> bool { self.bytes.is_some() }
+
+    pub fn attach(&mut self, bytes: &[u8], limits: &Limits) -> Result<ImagesAttached, String> {
+        use serde_json::Value;
+        if bytes.len() > limits.max_total_bytes { return Err(format!("an images artifact of {} bytes is over the limit", bytes.len())) }
+        let v: Value = serde_json::from_slice(bytes).map_err(|e| format!("not JSON: {e}"))?;
+        let o = v.as_object().ok_or("an images artifact is not an object")?;
+        if o.get("format").and_then(Value::as_str) != Some(crate::IMAGES_FORMAT) { return Err("not an images artifact".into()) }
+        let first = o.get("first").and_then(Value::as_str).ok_or("an images artifact without its first document")?;
+        let complete = o.get("complete").and_then(Value::as_bool).ok_or("an images artifact without `complete`")?;
+        let entries = image_entries(o.get("images"), limits).map_err(|e| e.to_string())?;
+        if self.retired { return Err("the first document has been replaced; its images are not this document's".into()) }
+        if first != self.first { return Err("these images were recorded against a document this session does not show".into()) }
+        let Some(original) = &self.bytes else { return Err("this document has all its images already".into()) };
+        if complete && entries.iter().any(|e| e.pending.is_some()) { return Err("a complete images artifact with an image still pending".into()) }
+        // The first document, with this block for its own.
+        let mut r: Value = serde_json::from_slice(original).map_err(|e| e.to_string())?;
+        r.as_object_mut().ok_or("the first document is not an object")?.insert("images".into(), o["images"].clone());
+        let merged = serde_json::to_vec(&r).map_err(|e| e.to_string())?;
+        crate::ingest(&merged, limits).map_err(|e| format!("the first document with its images: {e}"))?;
+        let before: HashMap<&str, &ImageEntry> = self.shown.iter().map(|e| (e.src.as_str(), e)).collect();
+        let after: HashMap<&str, &ImageEntry> = entries.iter().map(|e| (e.src.as_str(), e)).collect();
+        let mut resized: Vec<String> = self.shown.iter()
+            .filter(|e| after.get(e.src.as_str()).is_none_or(|n| n.sizing() != e.sizing()))
+            .map(|e| e.src.clone()).collect();
+        resized.extend(entries.iter().filter(|e| !before.contains_key(e.src.as_str())).map(|e| e.src.clone()));
+        let had: std::collections::HashSet<&str> = self.shown.iter().map(|e| e.address.as_str()).collect();
+        let mut once = std::collections::HashSet::new();
+        let arrived: Vec<String> = entries.iter().filter(|e| !e.address.is_empty() && !had.contains(e.address.as_str()))
+            .filter(|e| once.insert(e.address.as_str())).map(|e| e.address.clone()).collect();
+        self.shown = entries;
+        if complete { self.bytes = None }
+        Ok(ImagesAttached { merged, complete, arrived, resized })
+    }
 }

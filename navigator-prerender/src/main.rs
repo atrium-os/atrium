@@ -956,9 +956,25 @@ fn convert_in_child(
     if !o.ended && !o.timed_out { return Err(crash_reason(start.elapsed().as_secs_f64(), &status.to_string(), &stderr)) }
     if d.dump { eprint!("{stderr}") }
     let stem = file.file_stem().map(|s| s.to_string_lossy().to_string()).unwrap_or_else(|| "doc".into());
+    // ★ The first display with its images in (§5.4.5.7): the first artifact
+    // merged with the latest images artifact. A merge that fails is a
+    // converter bug, and fails the document; so is a conversion that ended
+    // with an image of its first artifact still pending and no complete
+    // images artifact to say what became of it.
+    let first_images = match (&o.first, &o.images) {
+        (Some(f), Some(i)) => Some(navigator_prerender::artifact::merge_images(&String::from_utf8_lossy(f), &String::from_utf8_lossy(i))
+            .map_err(|e| format!("converter protocol: the images do not merge: {e}"))?.into_bytes()),
+        _ => None,
+    };
+    let images_complete = o.images.as_deref().is_some_and(|i| navigator_prerender::artifact::images_complete(&String::from_utf8_lossy(i)));
+    let pending_in_first = o.first.as_deref().is_some_and(|f| memchr_str(f, b"\", \"pending\": \""));
+    if o.ended && pending_in_first && !images_complete {
+        return Err("converter protocol: the first artifact has images pending and no complete images artifact followed".into());
+    }
     if let Some(dir) = &d.parts_dir {
         let _ = fs::create_dir_all(dir);
-        for (ext, part) in [("first", &o.first), ("readable", &o.recording), ("transitions", &o.transitions)] {
+        for (ext, part) in [("first", &o.first), ("images", &o.images), ("first-images", &first_images),
+                            ("readable", &o.recording), ("transitions", &o.transitions)] {
             if let Some(b) = part { let _ = fs::write(dir.join(format!("{stem}.{ext}.json")), b); }
         }
     }
@@ -971,7 +987,8 @@ fn convert_in_child(
         (Some(r), Some(t)) => Some(navigator_prerender::artifact::merge(&String::from_utf8_lossy(r), &String::from_utf8_lossy(t))
             .map_err(|e| format!("converter protocol: the parts do not merge: {e}"))?.into_bytes()),
         // …and one that timed out after only its tier-1 artifact, that one.
-        _ => o.recording.clone().or_else(|| o.first.clone().filter(|_| o.timed_out)),
+        // (With whatever of its images had arrived.)
+        _ => o.recording.clone().or_else(|| first_images.clone().or_else(|| o.first.clone()).filter(|_| o.timed_out)),
     };
     if let (Some(dir), Some(rec)) = (&d.emit_dir, &whole) {
         let path = dir.join(format!("{stem}.json"));
@@ -1011,6 +1028,8 @@ fn convert_in_child(
         let ms = |d: Option<std::time::Duration>| d.map(|d| format!("{:.1}", d.as_secs_f64() * 1e3)).unwrap_or_else(|| "-".into());
         line.push_str(&format!("\tarrive_first={}\tarrive_recording={}\tarrive_transitions={}",
             ms(o.first_at), ms(o.recording_at), ms(o.transitions_at)));
+        line.push_str(&format!("\tarrive_images_first={}\tarrive_images={}\timages_frames={}\timages_complete={}",
+            ms(o.images_first_at), ms(o.images_at), o.images_frames, u8::from(images_complete)));
         if let Some(rec) = &o.first { line.push_str(&display_cost(rec).replace("\tdisplay_", "\tfirst_display_")) }
         if let Some(rec) = &o.recording { line.push_str(&display_cost(rec)) }
         line.push('\n');
@@ -1035,6 +1054,8 @@ fn convert_in_child(
     }
     Ok(c)
 }
+
+fn memchr_str(hay: &[u8], needle: &[u8]) -> bool { hay.windows(needle.len()).any(|w| w == needle) }
 
 /// The relay's view of one conversion's fetches (curl's own timings): how
 /// many went to the network, how many hosts they named, and what connection
@@ -1147,6 +1168,7 @@ fn serve() -> ! {
         let base = job.base.clone();
         let mut sent: std::collections::HashSet<String> = Default::default();
         let mut readable = String::new();
+        let mut first = String::new();
         let mut frame = |tag: &str, body: &str, sent: &mut std::collections::HashSet<String>| {
             let mut out = std::io::stdout().lock();
             for (a, b) in navigator_prerender::subresource::take_blobs() {
@@ -1163,7 +1185,12 @@ fn serve() -> ! {
             if !job.emit || c.origin_refusal.is_some() { return }
             let _s = navigator_prerender::timing::span("emit");
             match stage {
-                Stage::First => frame("FIRST", &artifact::emit(base.as_deref(), c, &policy), &mut sent),
+                Stage::First => {
+                    first = artifact::emit(base.as_deref(), c, &policy);
+                    frame("FIRST", &first, &mut sent);
+                }
+                // The blobs the images name go first, as for any frame.
+                Stage::Images { complete } => frame("IMAGES", &artifact::emit_images(base.as_deref(), c, &first, complete), &mut sent),
                 Stage::Settled => {
                     readable = artifact::emit_readable(base.as_deref(), c, &policy);
                     frame("RECORDING", &readable, &mut sent);

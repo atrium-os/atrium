@@ -184,3 +184,6 @@ pub const FORMAT_V4: &str = "atrium-navigator-recording/4";
 /// has the readable recording. Bound to that recording by `readable`, the
 /// BLAKE3 of its bytes; `ingest_transitions` reads it.
 pub const TRANSITIONS_FORMAT: &str = "atrium-navigator-transitions/1";
+/// ★ The first display's images, delivered after it (legacy-web §5.4.5.7,
+/// the image-free first display); see `progressive::FirstImages`.
+pub const IMAGES_FORMAT: &str = "atrium-navigator-images/1";

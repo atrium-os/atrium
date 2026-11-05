@@ -165,6 +165,10 @@ struct Worker {
     staged: Option<Vec<u8>>,
     staged_table: Option<Vec<u8>>,
     kept_out: Option<Vec<u8>>,
+    /// The first document's images, as they arrive. Broker-side only: the
+    /// worker's document does not change, and the worker is never asked
+    /// what its recording names.
+    first_images: crate::progressive::FirstImages,
 }
 
 impl Worker {
@@ -353,6 +357,7 @@ impl DocumentHost for JailedHost {
             child, stdin: Some(stdin), frames, charged, opened_at: now, last_seen: now,
             triggers: vec![], reply_limit, carried: Carried::new(recording),
             staged: None, staged_table: None, kept_out: None,
+            first_images: crate::progressive::FirstImages::opened(recording),
         });
 
         match self.ask(id, Frame::new(REQ_OPEN, recording), now) {
@@ -569,6 +574,7 @@ impl DocumentHost for JailedHost {
         w.carried = c;
         w.charged = rec.len() * 2;
         w.triggers = triggers;
+        w.first_images.retire();
         if let Some(store) = &mut self.store {
             let whole = match &table { Some(t) => crate::progressive::compose(&rec, t)?, None => rec };
             let a = store.put(&whole).map_err(|e| format!("could not store the recording: {e}"))?;
@@ -618,6 +624,29 @@ impl DocumentHost for JailedHost {
                 Err(why)
             }
         }
+    }
+
+    fn images(&mut self, id: SessionId, images: &[u8], now: Millis) -> Result<crate::progressive::ImagesAttached, String> {
+        let used: usize = self.workers.values().map(|w| w.charged).sum();
+        let w = self.workers.get_mut(&id).ok_or("no such session")?;
+        // ★ JSON only, the converter's envelope and the images block, and
+        // the merged recording's bounds: the broker parses no HTML here, as
+        // nowhere (the document is unchanged, and stays the worker's).
+        let a = w.first_images.attach(images, &crate::Limits::default())?;
+        // ★ Charged as `open` charges, with this session's own charge given
+        // back: the merged recording replaces the first one.
+        let need = a.merged.len() * 2;
+        if need > self.limits.max_total_bytes.saturating_sub(used - w.charged) {
+            return Err(format!("the document with its images needs {need} bytes, over the budget"));
+        }
+        w.charged = need;
+        w.carried = Carried::new(&a.merged);
+        w.last_seen = now;
+        if let Some(store) = &mut self.store {
+            let addr = store.put(&a.merged).map_err(|e| format!("could not store the recording: {e}"))?;
+            self.recordings.insert(id, addr);
+        }
+        Ok(a)
     }
 
     fn document_url(&mut self, id: SessionId, now: Millis) -> Result<String, String> {

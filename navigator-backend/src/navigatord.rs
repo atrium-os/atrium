@@ -109,6 +109,12 @@ pub trait DocumentHost {
     fn attach(&mut self, _id: SessionId, _transitions: &[u8], _now: Millis) -> Result<crate::progressive::Attached, String> {
         Err("this host does not take a transition table apart from its recording".into())
     }
+    /// An images artifact for the first document (`progressive::FirstImages`).
+    /// What the session carries afterwards is the merged recording's, from
+    /// bytes the broker holds.
+    fn images(&mut self, _id: SessionId, _images: &[u8], _now: Millis) -> Result<crate::progressive::ImagesAttached, String> {
+        Err("this host does not take images apart from its recording".into())
+    }
     /// ★ Whether each document runs CONFINED, as the host itself states it.
     /// Defaults to false: a host has to claim confinement to get it, so a new
     /// host that forgets is refused by `Navigatord::start`, not trusted.
@@ -155,6 +161,10 @@ pub enum Request {
     Swap { session: SessionId, anchor: crate::progressive::Anchor },
     /// The transitions artifact, whenever exploration finished.
     Attach { session: SessionId, transitions: Vec<u8> },
+    /// ★ An images artifact for the first document, as its images arrive
+    /// (§5.4.5.7, the image-free first display). From the converter, like
+    /// `Upgrade`; never from a page.
+    Images { session: SessionId, images: Vec<u8> },
 }
 
 /// What the UI hears back.
@@ -206,6 +216,13 @@ pub enum Event {
     TransitionsAttached { session: SessionId, triggers: Vec<String> },
     /// The table belongs to the held document and goes in with the swap.
     TransitionsHeld { session: SessionId },
+    /// Images of the shown document arrived. `arrived` are addresses the
+    /// UI may now ask pixels for (`Request::Image`). `resized` empty: they
+    /// fill boxes already laid out, and nothing moves. Otherwise the layout
+    /// changes for those `src`s: the UI lays out again at an idle moment, at
+    /// the reader's anchor, and presents it in one frame, as for a swap.
+    /// `complete`: no image of this document is pending any more.
+    ImagesAttached { session: SessionId, arrived: Vec<String>, resized: Vec<String>, complete: bool },
 }
 
 /// The broker.
@@ -455,6 +472,13 @@ impl<H: DocumentHost> Navigatord<H> {
                     Err(why) => out.push(Event::Blocked { session: Some(session), why }),
                 }
             }
+            Request::Images { session, images } => {
+                if let Some(e) = self.absent(session) { out.push(e); return out }
+                match self.host.images(session, &images, self.now) {
+                    Ok(a) => out.push(Event::ImagesAttached { session, arrived: a.arrived, resized: a.resized, complete: a.complete }),
+                    Err(why) => out.push(Event::Blocked { session: Some(session), why }),
+                }
+            }
             Request::Image { session, address, painted } => {
                 if let Some(e) = self.absent(session) { out.push(e); return out }
                 match self.image(session, address, painted) {
@@ -646,6 +670,18 @@ impl DocumentHost for InProcessHost {
                 self.store_parts(id, &readable, Some(transitions))?;
             }
         }
+        Ok(a)
+    }
+
+    fn images(&mut self, id: SessionId, images: &[u8], _now: Millis) -> Result<crate::progressive::ImagesAttached, String> {
+        let p = self.progress.get_mut(&id).ok_or("no such session")?;
+        let a = p.images.attach(images, &self.limits)?;
+        // ★ What the session CARRIES is the merged recording's: the image
+        // bound now names the addresses that arrived, from bytes the broker
+        // was handed (an inserted effect's, from a table attached later,
+        // are added to it then, as before).
+        self.carried.insert(id, Carried::new(&a.merged));
+        self.store_parts(id, &a.merged, None)?;
         Ok(a)
     }
 

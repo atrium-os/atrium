@@ -12,6 +12,8 @@
 //! child → parent   F <url> \n                      a fetch, relayed by the parent
 //!                  <TAG> \t …  \n                  the report (R, L, O, … as `--one` prints)
 //!                  BLOB <blake3:hex> <n> \n <n>    an image, by content address
+//!                  FIRST <n> \n <n>                progressive: the first display
+//!                  IMAGES <n> \n <n>               progressive: its images, as they arrive
 //!                  RECORDING <n> \n <n>            the publishable recording
 //!                  TIMEOUT \n                      the child's own deadline fired
 //!                  END \n
@@ -47,6 +49,9 @@ pub const MAX_URL: usize = 16 * 1024;
 /// (tripadvisor, walgreens, old.reddit in the corpus), and bounding every line
 /// at the URL limit failed those conversions as protocol errors.
 pub const MAX_LINE: usize = 1024 * 1024;
+/// `IMAGES` frames one conversion may send: the converter's partial ones
+/// (`MAX_PARTIAL_IMAGES`) and the complete one.
+pub const MAX_IMAGE_FRAMES: usize = crate::MAX_PARTIAL_IMAGES + 1;
 
 /// One conversion, as the parent describes it to the child.
 #[derive(Debug, Clone, PartialEq)]
@@ -67,8 +72,9 @@ pub struct Job {
     /// The child's address-space ceiling, in MiB (FreeBSD; RLIMIT_AS).
     pub mem_mb: u64,
     /// ★ Deliver as each artifact exists (§5.4.5.7): `FIRST` (tier 1, no
-    /// script run), then `RECORDING` as the READABLE artifact once the
-    /// scripts settle, then `TRANSITIONS` once exploration is done.
+    /// script run, no image fetched), `IMAGES` as its images arrive, then
+    /// `RECORDING` as the READABLE artifact once the scripts settle, then
+    /// `TRANSITIONS` once exploration is done.
     pub progressive: bool,
     /// Run the page's scripts. Off: the tier-1 conversion alone (parse,
     /// subresources, serialize), the first-display artifact (§5.4.5.7).
@@ -150,8 +156,16 @@ pub struct Outcome {
     /// transitions artifact (`TRANSITIONS`).
     pub first: Option<Vec<u8>>,
     pub transitions: Option<Vec<u8>>,
-    /// When each artifact arrived, from the start of `drive`.
+    /// The latest images artifact for the first display (`IMAGES`; each
+    /// carries the whole list so far, so the latest is all of it), and how
+    /// many arrived.
+    pub images: Option<Vec<u8>>,
+    pub images_frames: usize,
+    /// When each artifact arrived, from the start of `drive`. `images_at`
+    /// is the latest images artifact; `images_first_at` the earliest.
     pub first_at: Option<std::time::Duration>,
+    pub images_at: Option<std::time::Duration>,
+    pub images_first_at: Option<std::time::Duration>,
     pub recording_at: Option<std::time::Duration>,
     pub transitions_at: Option<std::time::Duration>,
     pub blobs: usize,
@@ -199,7 +213,7 @@ pub fn drive(
 
 /// An artifact the child delivered, as it arrived.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Artifact { First, Recording, Transitions }
+pub enum Artifact { First, Images, Recording, Transitions }
 
 /// `drive`, handing each artifact to `artifact` THE MOMENT IT ARRIVES, so a
 /// caller can show a reader the tier-1 conversion while the scripted one is
@@ -267,6 +281,22 @@ pub fn drive_streaming(
             o.first_at = Some(t0.elapsed());
             artifact(Artifact::First, &r);
             o.first = Some(r);
+        } else if let Some(n) = line.strip_prefix("IMAGES ") {
+            // ★ Between the first artifact and the readable one, and not
+            // past `MAX_IMAGE_FRAMES`, and nothing after a complete one: the
+            // relay does not parse them, so it bounds them by count.
+            if o.first.is_none() || o.recording.is_some() || o.images_frames >= MAX_IMAGE_FRAMES
+                || o.images.as_deref().is_some_and(|i| crate::artifact::images_complete(&String::from_utf8_lossy(i))) {
+                return Err("IMAGES out of order".into())
+            }
+            let n = len_of(n, MAX_RECORDING, "images")?;
+            let r = read_n(out, n, "images")?;
+            let at = t0.elapsed();
+            o.images_first_at.get_or_insert(at);
+            o.images_at = Some(at);
+            o.images_frames += 1;
+            artifact(Artifact::Images, &r);
+            o.images = Some(r);
         } else if let Some(n) = line.strip_prefix("TRANSITIONS ") {
             if o.transitions.is_some() || o.recording.is_none() { return Err("TRANSITIONS out of order".into()) }
             let n = len_of(n, MAX_RECORDING, "transitions")?;
@@ -391,6 +421,27 @@ mod tests {
         assert_eq!(seen, vec![(Artifact::First, b"t1".to_vec()), (Artifact::Recording, b"t2".to_vec()),
                               (Artifact::Transitions, b"tx".to_vec())]);
         assert!(o.ended && o.first_at.unwrap() <= o.recording_at.unwrap() && o.recording_at.unwrap() <= o.transitions_at.unwrap());
+    }
+
+    #[test]
+    fn images_arrive_between_the_first_and_readable_artifacts() {
+        let (_, stdin) = stdin_sink();
+        let mut seen = vec![];
+        let done = "{\n  \"complete\": true,\n}";
+        let child = format!("FIRST 2\nt1IMAGES 2\ni1IMAGES {}\n{done}RECORDING 2\nt2END\n", done.len());
+        let o = drive_streaming(&mut child.as_bytes(), &stdin, &mut |_| vec![], &mut |_| {}, &mut |_, _| {},
+            &mut |a, b| seen.push((a, b.to_vec()))).unwrap();
+        assert_eq!(seen.iter().map(|x| x.0).collect::<Vec<_>>(),
+                   vec![Artifact::First, Artifact::Images, Artifact::Images, Artifact::Recording]);
+        assert_eq!((o.images_frames, o.images.as_deref()), (2, Some(done.as_bytes())));
+        assert!(o.images_first_at.unwrap() <= o.images_at.unwrap() && o.images_at.unwrap() <= o.recording_at.unwrap());
+        // Before the first artifact, after the readable one, after a
+        // complete one, or past the count: out of order.
+        let too_many = format!("FIRST 1\na{}", "IMAGES 1\nb".repeat(MAX_IMAGE_FRAMES + 1));
+        for bad in [String::from("IMAGES 1\na"), "FIRST 1\naRECORDING 1\nbIMAGES 1\nc".into(),
+                    format!("FIRST 1\naIMAGES {}\n{done}IMAGES 1\nc", done.len()), too_many] {
+            assert!(run(bad.as_bytes()).0.unwrap_err().contains("out of order"), "{bad:?}");
+        }
     }
 
     #[test]

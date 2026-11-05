@@ -227,21 +227,83 @@ fn emit_part(url: Option<&str>, c: &Conversion, policy: &TierPolicy, whole: bool
             json_str(&sh.href), json_str(&sh.media), json_str(&sh.text)));
     }
     s.push_str(if c.subresources.sheets.is_empty() { "],\n" } else { "\n  ],\n" });
-    s.push_str("  \"images\": [");
-    for (i, im) in c.subresources.images.iter().enumerate() {
-        s.push_str(if i == 0 { "\n" } else { ",\n" });
-        // A missing natural dimension is `null`, and the ratio is explicit:
-        // `W/H`, or `none` when the image has no ratio.
-        let num = |v: Option<u32>| v.map(|n| n.to_string()).unwrap_or_else(|| "null".into());
-        let ratio = im.natural.ratio.map(|(a, b)| format!("{a}/{b}")).unwrap_or_else(|| "none".into());
-        s.push_str(&format!("    {{ \"src\": {}, \"width\": {}, \"height\": {}, \"ratio\": {}, \"address\": {} }}",
-            json_str(&im.src), num(im.natural.width), num(im.natural.height), json_str(&ratio), json_str(&im.address)));
-    }
-    s.push_str(if c.subresources.images.is_empty() { "],\n" } else { "\n  ],\n" });
+    s.push_str(&images_block(c));
     s.push_str(&format!("  \"document\": {}\n", json_str(document)));
     s.push_str("}\n");
     s
 }
+
+/// The `images` block of a recording, as `emit` writes it: one object per
+/// line, in the order found. A missing natural dimension is `null`, and the
+/// ratio is explicit: `W/H`, or `none` when the image has no ratio. An image
+/// still `pending` (the image-free first display) says so, and how its box
+/// is sized; no other recording has the field.
+fn images_block(c: &Conversion) -> String {
+    let mut s = String::new();
+    s.push_str("  \"images\": [");
+    for (i, im) in c.subresources.images.iter().enumerate() {
+        s.push_str(if i == 0 { "\n" } else { ",\n" });
+        let num = |v: Option<u32>| v.map(|n| n.to_string()).unwrap_or_else(|| "null".into());
+        let ratio = im.natural.ratio.map(|(a, b)| format!("{a}/{b}")).unwrap_or_else(|| "none".into());
+        let pending = im.pending.map(|p| format!(", \"pending\": {}", json_str(p.as_str()))).unwrap_or_default();
+        s.push_str(&format!("    {{ \"src\": {}, \"width\": {}, \"height\": {}, \"ratio\": {}, \"address\": {}{pending} }}",
+            json_str(&im.src), num(im.natural.width), num(im.natural.height), json_str(&ratio), json_str(&im.address)));
+    }
+    s.push_str(if c.subresources.images.is_empty() { "],\n" } else { "\n  ],\n" });
+    s
+}
+
+/// The images artifact's format.
+pub const IMAGES_FORMAT: &str = "atrium-navigator-images/1";
+
+/// ★ THE IMAGES ARTIFACT (legacy-web §5.4.5.7, the image-free first
+/// display): the first artifact's `images` block once (some of) its images
+/// have arrived, bound to the first artifact by `first`, the BLAKE3 of its
+/// bytes. `complete` says every image has been handled; until then the ones
+/// not yet fetched are still written `pending`, exactly as the first
+/// artifact wrote them. Each artifact carries the WHOLE block, so a reader
+/// that missed one loses nothing by taking the next.
+pub fn emit_images(url: Option<&str>, c: &Conversion, first: &str, complete: bool) -> String {
+    let mut s = String::new();
+    s.push_str("{\n");
+    field(&mut s, "format", IMAGES_FORMAT, false);
+    field(&mut s, "url", url.unwrap_or(""), false);
+    field(&mut s, "first", &format!("blake3:{}", blake3::hash(first.as_bytes()).to_hex()), false);
+    s.push_str(&format!("  \"complete\": {complete},\n"));
+    s.push_str(&images_block(c));
+    s.push_str("  \"end\": true\n}\n");
+    s
+}
+
+/// The first artifact with an images artifact's block in place of its own:
+/// for a complete one, byte for byte the recording a tier-1 conversion that
+/// waited for its images writes. Refuses an images artifact recorded
+/// against another first artifact, and either part not in the shape this
+/// module writes.
+///
+/// ★ The blocks are found by their line starts. A JSON string cannot hold a
+/// raw newline, so `\n  "images": [` cannot occur inside one — not in a
+/// stylesheet's text, not in the document.
+pub fn merge_images(first: &str, images: &str) -> Result<String, String> {
+    let want = format!("\n  \"first\": \"blake3:{}\",\n", blake3::hash(first.as_bytes()).to_hex());
+    if !images.contains(&want) { return Err("the images were recorded against another document".into()) }
+    if !images.starts_with(&format!("{{\n  \"format\": \"{IMAGES_FORMAT}\",\n")) { return Err("not an images artifact".into()) }
+    let (open, close) = ("\n  \"images\": [", "\n  \"end\": true\n}");
+    let start = images.find(open).ok_or("no images block")? + 1;
+    let end = images.rfind(close).ok_or("no end")? + 1;
+    let block = &images[start..end];
+    let at = first.find(open).ok_or("first artifact without an images block")? + 1;
+    let to = first.find("\n  \"document\": ").ok_or("first artifact without a document")? + 1;
+    if to < at { return Err("first artifact out of shape".into()) }
+    let mut out = String::with_capacity(first.len() + block.len());
+    out.push_str(&first[..at]);
+    out.push_str(block);
+    out.push_str(&first[to..]);
+    Ok(out)
+}
+
+/// Whether an images artifact says every image has been handled.
+pub fn images_complete(images: &str) -> bool { images.contains("\n  \"complete\": true,\n") }
 
 fn effect_json(e: &Effect) -> String {
     match e {

@@ -39,6 +39,7 @@ fn parts() -> (Vec<Stage>, String, String, String, Conversion) {
             Stage::First => first = artifact::emit(Some(URL), c, &p),
             Stage::Settled => readable = artifact::emit_readable(Some(URL), c, &p),
             Stage::Done => trans = artifact::emit_transitions(Some(URL), c, &p, &readable),
+            Stage::Images { .. } => unreachable!("the page has no image"),
         }
     });
     (stages, first, readable, trans, c)
