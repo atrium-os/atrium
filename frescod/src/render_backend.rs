@@ -247,6 +247,9 @@ impl<'a> Backend<'a> {
     /// HDR encode (hdr.rs) can run on them: not for the gpu renderer.
     pub fn can_hdr(&self) -> bool { !matches!(self, Backend::Gpu(_)) }
 
+    /// The gpu renderer: it draws one screen straight into scanout.
+    pub fn is_gpu(&self) -> bool { matches!(self, Backend::Gpu(_)) }
+
     pub fn wants_pixels(&self) -> bool {
         matches!(self, Backend::Compute(_)) && std::env::var("FRESCOD_SPLIT_PIXELS").as_deref() != Ok("0")
     }
