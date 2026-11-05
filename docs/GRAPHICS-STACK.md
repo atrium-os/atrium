@@ -164,6 +164,7 @@ flowchart TB
 | One GPU VM per window (F4e) | with `FRESCOD_RENDERER=gpu`, each window's bin and raster run in their own VM (code and staging read-only, its own inputs, ring and surface); compose runs in frescod's VM, which maps every surface read-only plus the scanout. `FRESCOD_GPU_ISOLATION_PROBE=1` makes later windows write the first window's surface: both writes fault (EIO) | `frescod`, `atrium-gpu-rs` (`Vm::share`) | `e7c3187` |
 | Pixels from the renderer jail (F4g) | with the compute renderer, each client's jailed renderer rasters its own windows and sends finished pixels (FRP1 slot); frescod copies once and composes, so a hostile scene never reaches frescod's CPU kernels. `FRESCOD_SPLIT_PIXELS=0` turns it off. Also fixed: the precompiled-kernel folder path (`Tier2::seed_cache` writes the loader's per-arch dir) and frescod's private kernel-cache fallback when the system cache isn't writable | `frescod`, `fresco-renderer` | `9a01b97` |
 | Driver isolation (F1, F6 G1) | the five §A3 breaks closed; per-queue completions; hang watchdog (`hang_ms`, default 5000); VM fault fails that queue's work at once; read-only binds (ABI rev 3); `CAP_ISA` (ABI rev 4); Bus Master cleared on shutdown | `atrium-gpu-amd/` | `73a94ec`, `2dac848`, `622693d`, `bb3f7ba`, `8023c92` |
+| Incremental drawing | renderer rasters only changed tiles (`Tier2::render_tiles`), FRP1 header words 4..7 = damage vs the previous frame; broker patches in place (`Pixels::since`); compute composes only changed screen rects (`Tier2::compose_rects`); heads upload only stale rows (`Scanout::upload_range`). Partial-stress in the VM: frescod −35 %, renderer −42 % CPU | `fresco-compute`, `fresco-split`, `frescod` | `95c083a`, `93a3fa9` |
 | VRAM allocator | device-wide `vmem` arena sized from `CONFIG_MEMSIZE` (small BAR: placed above the CPU window); freed VRAM stays dirty until a kernel-owned GPU fill (CP `DMA_DATA`, HQD 2, VMID 0) scrubs it, so no client ever sees another's pixels; replaces the bump allocator and the per-client reuse of `b51c6ca`. Clear engine per architecture (`clear.c` is amd's) | `atrium-gpu-amd/vram.c`, `clear.c`; gpusim `DMA_DATA` fill | `89a0237`, gpusim `8c6f712` |
 
 What is still missing: §11.
@@ -296,7 +297,10 @@ offers that mode, else scaled to fit).
 3. With the compute renderer (default), the jailed renderer runs bin and
    raster itself (Tier-2 kernels bundled precompiled) and sends finished
    pixels in a window-sized FRP1 slot; frescod checks the header, copies the
-   pixels once and only composes (F4g; `FRESCOD_SPLIT_PIXELS=0` sends frames
+   pixels once and only composes. Drawing is incremental end to end: the
+   renderer rasters only tiles whose signatures changed and puts a damage
+   rect in the slot header, frescod copies and composes only that, and each
+   monitor gets only the rows its scanout buffer lacks (F4g; `FRESCOD_SPLIT_PIXELS=0` sends frames
    instead). With the gpu renderer, the renderer sends a packed frame and
    frescod rasters it in that window's own GPU VM (F4e). Either way frescod
    validates a header only; the kernels
