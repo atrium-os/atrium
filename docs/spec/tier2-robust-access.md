@@ -121,7 +121,11 @@ jail per app (2026-11-05).
   VM run (amd64, racct on): four probes as an ordinary user, each in its own
   `app-org-atrium-aqueduct-gpu--gpuN` jail as `_aqueduct-gpu-app`, all `PROBE OK`.
 
-Not done yet: no app jail mounts the broker's socket dir (third-party Vulkan apps need a
-graphics capability that grants it), the old shared listener (`--transport socket`) still
+App access: a manifest with `graphics = "vulkan"` gets the broker's socket dir mounted
+(`portcullis-jail` `apply_graphics`), and atrium-vk-icd uses
+`/atrium/sockets/aqueduct-gpu/aqueduct-gpu.sock` when it exists (`ATRIUM_VK_ICD_SOCKET`
+still overrides).
+
+Not done yet: the old shared listener (`--transport socket`) still
 exists for development and the Mac host, and the arm64 bespoke backend still declines
 SSBO shaders (they use Cranelift).

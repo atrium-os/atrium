@@ -138,6 +138,10 @@ type VkPhysicalDevice = *mut c_void;
 /// frescod-aqueduct's FRESCOD_AQUEDUCT_SOCK to keep the same default.
 const ATRIUM_VK_ICD_SOCKET_ENV: &str = "ATRIUM_VK_ICD_SOCKET";
 const ATRIUM_VK_ICD_SOCKET_DEFAULT: &str = "/tmp/frescod-aqueduct.sock";
+/// The aqueduct-gpu broker's socket as an app jail with
+/// `graphics = "vulkan"` sees it (one executor jail per app,
+/// docs/spec/tier2-robust-access.md §4). Preferred when present.
+const ATRIUM_VK_ICD_SOCKET_JAILED: &str = "/atrium/sockets/aqueduct-gpu/aqueduct-gpu.sock";
 
 /// ICD-side state behind a `VkInstance`. The first field MUST be
 /// the loader magic — the loader overwrites it on first use with a
@@ -1166,8 +1170,13 @@ fn try_connect_aqueduct() -> Option<(
     aqueduct_gpu_client::GpuClient,
     aqueduct_gpu::backends::BackendId,
 )> {
-    let sock = std::env::var(ATRIUM_VK_ICD_SOCKET_ENV)
-        .unwrap_or_else(|_| ATRIUM_VK_ICD_SOCKET_DEFAULT.to_string());
+    let sock = std::env::var(ATRIUM_VK_ICD_SOCKET_ENV).unwrap_or_else(|_| {
+        if std::path::Path::new(ATRIUM_VK_ICD_SOCKET_JAILED).exists() {
+            ATRIUM_VK_ICD_SOCKET_JAILED
+        } else {
+            ATRIUM_VK_ICD_SOCKET_DEFAULT
+        }.to_string()
+    });
     let conn = aqueduct::Connection::connect(&sock).ok()?;
     let mut client = aqueduct_gpu_client::GpuClient::new(conn);
     let resp = client.handshake(

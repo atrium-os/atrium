@@ -75,13 +75,22 @@ pub fn apply_all(
 
 // ── individual translators ────────────────────────────────────
 
+/// `graphics = "fresco"`: Fresco's client socket (windows, scenes).
+/// `graphics = "vulkan"`: that, plus the aqueduct-gpu broker's socket dir, so
+/// third-party Vulkan (atrium-vk-icd) can reach it. The broker hands each
+/// connection to an executor jail of its own, so the grant is reachability
+/// only: the app's draw records and shaders run in that jail, never here or
+/// alongside another app's (docs/spec/tier2-robust-access.md §4).
 pub fn apply_graphics(value: &str, jc: &mut JailConfig, opts: &BuildOpts) -> Result<(), BuildError> {
-    if value != "fresco" {
+    if value != "fresco" && value != "vulkan" {
         return Err(BuildError::UnsupportedGraphics(value.to_string()));
     }
     apply_socket("fresco.sock", jc, opts);
     /* Fresco needs the GPU cdev too. */
     jc.add_devfs_action("path 'fresco0' unhide");
+    if value == "vulkan" {
+        apply_socket("aqueduct-gpu.sock", jc, opts);
+    }
     Ok(())
 }
 
@@ -271,9 +280,20 @@ mod tests {
     }
 
     #[test]
+    fn graphics_vulkan_adds_the_gpu_broker_socket() {
+        let mut j = jc();
+        apply_graphics("vulkan", &mut j, &opts()).unwrap();
+        let srcs: Vec<_> = j.mounts.iter().map(|m| m.src.clone()).collect();
+        assert_eq!(srcs, [PathBuf::from("/atrium/sockets/fresco"),
+                          PathBuf::from("/atrium/sockets/aqueduct-gpu")]);
+        assert_eq!(j.mounts[1].dst,
+            PathBuf::from("/var/lib/atrium/jails/test/atrium/sockets/aqueduct-gpu"));
+    }
+
+    #[test]
     fn graphics_bad_value_rejected() {
         let mut j = jc();
-        let err = apply_graphics("vulkan", &mut j, &opts()).unwrap_err();
+        let err = apply_graphics("metal", &mut j, &opts()).unwrap_err();
         assert!(matches!(err, BuildError::UnsupportedGraphics(_)));
     }
 

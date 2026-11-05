@@ -250,6 +250,7 @@ keep-alive  = false               # if true, restart immediately on exit
 | Capability | Grants | Mechanism |
 |---|---|---|
 | `graphics = "fresco"` | Talk to compositor | nullfs `/atrium/sockets/fresco.sock` + devfs `/dev/fresco0` |
+| `graphics = "vulkan"` | `fresco`, plus third-party Vulkan (atrium-vk-icd) on the CPU executor | also nullfs `/atrium/sockets/aqueduct-gpu/`: the aqueduct-gpu broker, which hands each connection to an executor jail of its own ([tier2-robust-access.md](tier2-robust-access.md) §4). Reachability only: the app's shaders never run in its own jail or beside another app's. |
 | `gpu.access = true` | Open `/dev/atrium-gpu0`, allocate ordinary BOs, submit GPU work (aqueduct-gpu). Required by Vulkan games via atrium-vk-icd, by any app that drives the GPU directly. Does **not** grant scanout. | devfs `/dev/atrium-gpu0` + portcullisd cap-mediator check at aqueduct-gpu handshake. Kmod enforces fd-scoped resource isolation. See `aqueduct-gpu.md` §12.3. |
 | `gpu.scanout = true` | Additionally allocate scanout BOs (`ATRIUM_GPU_BO_SCANOUT`) and call `page_flip`. Granted only to display-server processes (`frescod` today). **Restricted capability**: not user-grantable without explicit policy approval. | Kmod cross-checks the calling fd's cap token (set via `IOC_SET_CAPS` at portcullisd-mediated open time) against the `ATRIUM_GPU_BO_SCANOUT` flag at `IOC_ALLOC`; rejects with `EPERM` if not granted. See `aqueduct-gpu.md` §12.4. |
 | `clipboard = true` | Talk to clipboard daemon | nullfs `/atrium/sockets/clipboard.sock` |

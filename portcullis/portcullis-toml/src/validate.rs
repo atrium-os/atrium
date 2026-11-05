@@ -102,11 +102,12 @@ pub fn validate(m: &Manifest) -> Report {
 }
 
 fn validate_capabilities(c: &Capabilities, ctx: &str, r: &mut Report) {
-    /* graphics: today only "fresco" is recognised; warn on others. */
+    /* graphics: "fresco" (windows) or "vulkan" (windows + the per-app GPU
+     * executor broker); warn on others. */
     if let Some(g) = &c.graphics {
-        if g != "fresco" {
+        if g != "fresco" && g != "vulkan" {
             r.warnings.push(format!(
-                "{ctx}.graphics = {g:?}: only \"fresco\" is recognised today"));
+                "{ctx}.graphics = {g:?}: only \"fresco\" and \"vulkan\" are recognised"));
         }
     }
 
