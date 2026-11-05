@@ -34,5 +34,8 @@ atrium_display_probe_sink(const struct atrium_display_hw_ops *ops, void *hw,
 	}
 	s->ntimings = atrium_edid_parse(s->edid, s->edid_len, s->timings,
 	    ATRIUM_DISPLAY_SINK_MODES);
+	if (!atrium_edid_vrr_range(s->edid, s->edid_len, &s->vrr_min_hz,
+	    &s->vrr_max_hz))
+		s->vrr_min_hz = s->vrr_max_hz = 0;
 	return (0);
 }

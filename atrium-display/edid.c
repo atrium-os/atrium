@@ -211,3 +211,43 @@ atrium_edid_parse(const uint8_t *e, uint32_t len,
 	}
 	return (n);
 }
+
+int
+atrium_edid_vrr_range(const uint8_t *e, uint32_t len, uint32_t *min_hz,
+    uint32_t *max_hz)
+{
+	static const uint32_t slots[] = { 54, 72, 90, 108 };
+	const uint8_t *d;
+	uint32_t i, lo, hi;
+
+	if (!atrium_edid_base_ok(e, len) || (e[24] & 0x01) == 0)
+		return (0);
+	for (i = 0; i < sizeof(slots) / sizeof(slots[0]); i++) {
+		d = e + slots[i];
+		if (d[0] != 0 || d[1] != 0 || d[3] != 0xfd)
+			continue;
+		/* Byte 4 bits 1:0 add 255 to the max (bit 1) and min (bit 0)
+		 * vertical rates, for monitors past 255 Hz. */
+		lo = d[5] + ((d[4] & 0x01) ? 255 : 0);
+		hi = d[6] + ((d[4] & 0x02) ? 255 : 0);
+		if (lo == 0 || hi < lo + 10)
+			return (0);
+		*min_hz = lo;
+		*max_hz = hi;
+		return (1);
+	}
+	return (0);
+}
+
+uint32_t
+atrium_timing_vtotal_at(const struct atrium_display_timing *t, uint32_t hz)
+{
+	uint64_t htotal = t->hactive + t->hfront + t->hsync + t->hback;
+	uint32_t vtotal = t->vactive + t->vfront + t->vsync + t->vback;
+	uint64_t lines;
+
+	if (hz == 0 || htotal == 0 || t->pixel_clock_khz == 0)
+		return (0);
+	lines = (uint64_t)t->pixel_clock_khz * 1000 / (htotal * hz);
+	return (lines < vtotal ? vtotal : (uint32_t)lines);
+}

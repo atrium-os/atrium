@@ -73,6 +73,15 @@
 					       * already be signalled (EAGAIN if not) */
 #define ATRIUM_DISPLAY_COMMIT_ASYNC	0x2u  /* flip now, not at vblank (may tear) */
 #define ATRIUM_DISPLAY_COMMIT_TEST_ONLY	0x4u  /* validate the fds and the buffer, change nothing */
+#define ATRIUM_DISPLAY_COMMIT_VRR	0x8u  /* (2.2) with MODESET: variable refresh. A frame
+					       * lasts from the mode's own period up to the
+					       * monitor's lowest refresh (CONNECTOR's
+					       * out_vrr_min_hz), and a flip ends the frame
+					       * it waits on as soon as the shortest frame
+					       * allows. EINVAL without MODESET, for a
+					       * monitor without VRR, or a mode whose
+					       * refresh is outside the monitor's range.
+					       * A MODESET without it turns VRR off */
 
 /*
  * COMMIT: put a buffer on the primary plane.
@@ -182,6 +191,8 @@ struct atrium_display_status_v2 {
 
 /* (2.1) CONNECTOR flags and per-mode flags. */
 #define ATRIUM_DISPLAY_CONNECTOR_CONNECTED	0x1u
+#define ATRIUM_DISPLAY_CONNECTOR_VRR		0x2u  /* (2.2) the monitor offers variable refresh */
+#define ATRIUM_DISPLAY_CONNECTOR_VRR_ACTIVE	0x4u  /* (2.2) the lit mode runs with it */
 #define ATRIUM_DISPLAY_MODE_PREFERRED		0x1u  /* the monitor's native mode */
 
 #define ATRIUM_DISPLAY_EDID_MAX		512	/* base block + 3 extensions */
@@ -212,7 +223,8 @@ struct atrium_display_connector_v2 {
 	uint32_t out_mode_count;
 	uint32_t out_current_mode;	/* index of the lit mode, 0xffffffff = none
 					 * or not in this list */
-	uint32_t _pad;
+	uint16_t out_vrr_min_hz;	/* (2.2) variable refresh range the monitor */
+	uint16_t out_vrr_max_hz;	/* takes any rate in; 0 = fixed refresh */
 	uint8_t  out_edid[ATRIUM_DISPLAY_EDID_MAX];
 	struct atrium_display_mode_v2 out_modes[ATRIUM_DISPLAY_CONNECTOR_MODES];
 };

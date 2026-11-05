@@ -77,4 +77,23 @@ int atrium_cta_vic_timing(uint8_t vic, struct atrium_display_timing *t);
 uint32_t atrium_edid_parse(const uint8_t *e, uint32_t len,
     struct atrium_display_timing *out, uint32_t max);
 
+/*
+ * The vertical total (lines) that runs `t`'s raster at `hz`: the same
+ * pixel clock and line length, a longer vertical blank. At least t's own
+ * total; 0 for hz 0 or a timing without a clock.
+ */
+uint32_t atrium_timing_vtotal_at(const struct atrium_display_timing *t,
+    uint32_t hz);
+
+/*
+ * The refresh range, in Hz, a monitor takes any rate within (variable
+ * refresh): a valid base block with the E-EDID 1.4 continuous-frequency bit
+ * (byte 24 bit 0) and a display range limits descriptor (0xFD) whose max
+ * vertical rate exceeds its min by at least 10 Hz. Returns 0 (and leaves
+ * the outputs alone) for a fixed-refresh monitor. HDMI's VRR data block and
+ * DisplayID's adaptive-sync block are not read yet.
+ */
+int atrium_edid_vrr_range(const uint8_t *e, uint32_t len, uint32_t *min_hz,
+    uint32_t *max_hz);
+
 #endif /* _ATRIUM_DISPLAY_EDID_H_ */

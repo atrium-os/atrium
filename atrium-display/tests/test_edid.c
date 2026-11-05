@@ -108,6 +108,29 @@ main(void)
 	assert(atrium_display_probe_sink(&fake_ops, &f, &s) == 0);
 	assert(s.connected && s.ntimings == 0 && s.edid_len == 128);
 
+	/* Variable refresh: the desktop monitor takes 48..120 Hz. */
+	{
+		uint32_t lo = 0, hi = 0;
+		uint8_t fixed[256];
+
+		assert(atrium_edid_vrr_range(desktop_monitor_edid, 256, &lo, &hi));
+		assert(lo == 48 && hi == 120);
+		/* Without continuous frequency the range is only limits. */
+		memcpy(fixed, desktop_monitor_edid, 256);
+		fixed[24] &= ~0x01;
+		fixed[127] += 0x01;	/* keep the checksum */
+		assert(atrium_edid_block_ok(fixed));
+		assert(!atrium_edid_vrr_range(fixed, 256, &lo, &hi));
+		f.present = 1;
+		f.len = 256;
+		assert(atrium_display_probe_sink(&fake_ops, &f, &s) == 0);
+		assert(s.vrr_min_hz == 48 && s.vrr_max_hz == 120);
+		/* 1080p120 stretched to 48 Hz: 297 MHz / (2200 * 48). */
+		assert(atrium_timing_vtotal_at(&s.timings[1], 48) == 2812);
+		assert(atrium_timing_vtotal_at(&s.timings[1], 240) == 1125);
+		assert(atrium_timing_vtotal_at(&s.timings[1], 0) == 0);
+	}
+
 	/* Known VICs decode; unknown ones don't. */
 	assert(atrium_cta_vic_timing(97, &t[0]));
 	expect(&t[0], 3840, 2160, 60000);

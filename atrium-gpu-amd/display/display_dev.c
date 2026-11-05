@@ -42,12 +42,14 @@
  *   sink         the monitor as last probed (raw EDID and its modes)
  *   sink_gen     sc->display_conn_gen when it was probed (0 = never)
  *   timing       the timing of the lit mode, re-applied after a device reset
+ *   vrr_min_hz   its variable refresh floor (0 = fixed refresh), ditto
  */
 struct atrium_amd_display_state {
 	struct atrium_display_sink	sink;
 	uint32_t			sink_gen;
 	struct atrium_display_timing	timing;
 	int				timing_valid;
+	uint32_t			vrr_min_hz;
 };
 
 static MALLOC_DEFINE(M_ATRIUM_DISPLAY, "atrium_display", "Atrium display state");
@@ -127,6 +129,31 @@ amd_disp_program_timing(void *hw, const struct atrium_display_timing *t)
 }
 
 /*
+ * Variable refresh on OTG0 (DRR): V_TOTAL_MIN is the mode's own total,
+ * V_TOTAL_MAX the total that stretches it to `min_hz`, and selecting both in
+ * V_TOTAL_CONTROL lets each frame end anywhere between, at the flip that
+ * waits on it. Field use as the Linux display code (gpl_fact, medium
+ * confidence). min_hz 0: both at the mode's total, selects off.
+ */
+static void
+amd_disp_set_vrr(void *hw, const struct atrium_display_timing *t,
+    uint32_t min_hz)
+{
+	struct atrium_amd_softc *sc = hw;
+	uint32_t vt = t->vactive + t->vfront + t->vsync + t->vback;
+	uint32_t vmax = min_hz != 0 ? atrium_timing_vtotal_at(t, min_hz) : vt;
+
+	if (vmax == 0 || vmax > DCN_OTG_TOTAL_MASK + 1)
+		vmax = DCN_OTG_TOTAL_MASK + 1;
+	amd_mmio_write32(sc, regOTG0_OTG_V_TOTAL_CONTROL, 0);
+	amd_mmio_write32(sc, regOTG0_OTG_V_TOTAL_MIN, vt - 1);
+	amd_mmio_write32(sc, regOTG0_OTG_V_TOTAL_MAX, vmax - 1);
+	if (min_hz != 0)
+		amd_mmio_write32(sc, regOTG0_OTG_V_TOTAL_CONTROL,
+		    DCN_V_TOTAL_MIN_SEL | DCN_V_TOTAL_MAX_SEL);
+}
+
+/*
  * HPD0 is a level interrupt that fires while SENSE equals POLARITY: wait for
  * the opposite of what is there now (a disconnect while a monitor is
  * present, a connect while none is), then acknowledge.
@@ -148,6 +175,7 @@ static const struct atrium_display_hw_ops amd_display_hw_ops = {
 	.read_edid_block =	amd_disp_read_edid_block,
 	.program_timing =	amd_disp_program_timing,
 	.hpd_rearm =		amd_disp_hpd_rearm,
+	.set_vrr =		amd_disp_set_vrr,
 };
 
 /*
@@ -258,7 +286,12 @@ display_connector(struct atrium_amd_softc *sc,
 	c->out_edid_len = n;
 	c->out_mode_count = 0;
 	c->out_current_mode = 0xffffffffu;
-	c->_pad = 0;
+	c->out_vrr_min_hz = (uint16_t)sink->vrr_min_hz;
+	c->out_vrr_max_hz = (uint16_t)sink->vrr_max_hz;
+	if (sink->vrr_min_hz != 0 && amd_display_hw_ops.set_vrr != NULL)
+		c->out_flags |= ATRIUM_DISPLAY_CONNECTOR_VRR;
+	else
+		c->out_vrr_min_hz = c->out_vrr_max_hz = 0;
 	memset(c->out_modes, 0, sizeof(c->out_modes));
 	mtx_lock(&sc->lock);
 	for (i = 0; i < sink->ntimings && i < ATRIUM_DISPLAY_CONNECTOR_MODES;
@@ -269,6 +302,8 @@ display_connector(struct atrium_amd_softc *sc,
 			c->out_current_mode = i;
 		c->out_mode_count++;
 	}
+	if (c->out_current_mode != 0xffffffffu && ds->vrr_min_hz != 0)
+		c->out_flags |= ATRIUM_DISPLAY_CONNECTOR_VRR_ACTIVE;
 	mtx_unlock(&sc->lock);
 	free(sink, M_ATRIUM_DISPLAY);
 	return (0);
@@ -599,13 +634,16 @@ display_commit(struct atrium_amd_softc *sc, struct atrium_display_commit *c,
 	struct atrium_display_sink *sink = NULL;
 	struct atrium_display_timing tm = { 0 };
 	uint64_t off, size;
-	uint32_t fault, gen;
+	uint32_t fault, gen, vrr_min_hz = 0;
 	int err, have_tm = 0;
 
 	c->out_fault = 0;
 	if (c->struct_size < sizeof(*c) ||
 	    (c->flags & ~(ATRIUM_DISPLAY_COMMIT_MODESET |
-	    ATRIUM_DISPLAY_COMMIT_ASYNC | ATRIUM_DISPLAY_COMMIT_TEST_ONLY)) != 0 ||
+	    ATRIUM_DISPLAY_COMMIT_ASYNC | ATRIUM_DISPLAY_COMMIT_TEST_ONLY |
+	    ATRIUM_DISPLAY_COMMIT_VRR)) != 0 ||
+	    ((c->flags & ATRIUM_DISPLAY_COMMIT_VRR) != 0 &&
+	    (c->flags & ATRIUM_DISPLAY_COMMIT_MODESET) == 0) ||
 	    c->format != ATRIUM_DISPLAY_FORMAT_XRGB8888 ||
 	    c->modifier != ATRIUM_DISPLAY_MODIFIER_LINEAR || c->bo_offset != 0 ||
 	    (c->pitch % 256) != 0)
@@ -656,6 +694,21 @@ display_commit(struct atrium_amd_softc *sc, struct atrium_display_commit *c,
 			}
 			tm = sink->timings[c->mode_index];
 			have_tm = 1;
+			if (c->flags & ATRIUM_DISPLAY_COMMIT_VRR) {
+				/* The mode's refresh must sit in the
+				 * monitor's range, rounded to whole Hz. */
+				uint32_t hz = (atrium_timing_refresh_mhz(&tm) +
+				    500) / 1000;
+
+				if (amd_display_hw_ops.set_vrr == NULL ||
+				    sink->vrr_min_hz == 0 ||
+				    hz < sink->vrr_min_hz ||
+				    hz > sink->vrr_max_hz) {
+					err = EINVAL;
+					goto out;
+				}
+				vrr_min_hz = sink->vrr_min_hz;
+			}
 			/* The kernel checks the buffer covers the mode it will
 			 * scan out; gpusim's referee is the second line, not
 			 * the first (review §A2.5, isolation break 4). */
@@ -663,7 +716,8 @@ display_commit(struct atrium_amd_softc *sc, struct atrium_display_commit *c,
 				err = EINVAL;
 				goto out;
 			}
-		} else if (c->mode_index != 0) {
+		} else if (c->mode_index != 0 ||
+		    (c->flags & ATRIUM_DISPLAY_COMMIT_VRR) != 0) {
 			err = EINVAL;	/* no monitor: nothing to index */
 			goto out;
 		}
@@ -689,6 +743,8 @@ display_commit(struct atrium_amd_softc *sc, struct atrium_display_commit *c,
 		if (have_tm) {
 			sc->display_width = tm.hactive;
 			amd_display_hw_ops.program_timing(sc, &tm);
+			if (amd_display_hw_ops.set_vrr != NULL)
+				amd_display_hw_ops.set_vrr(sc, &tm, vrr_min_hz);
 		}
 		/* The surface goes up with the mode (the SIM mode set takes the
 		 * held surface); the unlock after it then has nothing to flip. */
@@ -713,6 +769,7 @@ display_commit(struct atrium_amd_softc *sc, struct atrium_display_commit *c,
 		ds->timing_valid = have_tm;
 		if (have_tm)
 			ds->timing = tm;
+		ds->vrr_min_hz = have_tm ? vrr_min_hz : 0;
 		sc->display_refresh_mhz = have_tm ?
 		    atrium_timing_refresh_mhz(&tm) : 0;
 		sc->display_mode_width = have_tm ? tm.hactive : 0;
@@ -1069,9 +1126,14 @@ amd_display_reset_restore(struct atrium_amd_softc *sc)
 	KNOTE_LOCKED(&sc->display_sel.si_note, DISPLAY_HINT_RESET);
 	amd_display_hw_ops.hpd_rearm(sc);
 	if (sc->display_mode_set && sc->display_on_screen.bo_fp != NULL) {
-		if (sc->display_state->timing_valid)
+		if (sc->display_state->timing_valid) {
 			amd_display_hw_ops.program_timing(sc,
 			    &sc->display_state->timing);
+			if (amd_display_hw_ops.set_vrr != NULL)
+				amd_display_hw_ops.set_vrr(sc,
+				    &sc->display_state->timing,
+				    sc->display_state->vrr_min_hz);
+		}
 		display_program_surface(sc, &sc->display_on_screen, 1);
 		display_set_mode(sc);
 		display_unlock(sc, 1);

@@ -201,6 +201,9 @@
 #define regOTG0_OTG_H_BLANK_START_END		regDCN2(0x1b2b)
 #define regOTG0_OTG_H_SYNC_A			regDCN2(0x1b2c)
 #define regOTG0_OTG_V_TOTAL			regDCN2(0x1b2f)
+#define regOTG0_OTG_V_TOTAL_MIN			regDCN2(0x1b30)
+#define regOTG0_OTG_V_TOTAL_MAX			regDCN2(0x1b31)
+#define regOTG0_OTG_V_TOTAL_CONTROL		regDCN2(0x1b33)
 #define regOTG0_OTG_V_BLANK_START_END		regDCN2(0x1b38)
 #define regOTG0_OTG_V_SYNC_A			regDCN2(0x1b39)
 #define regOTG0_OTG_STATUS_FRAME_COUNT		regDCN2(0x1b4d)
@@ -223,6 +226,9 @@
 #define DCN_VINT0_INT_ENABLE		(1u << 8)	/* VERTICAL_INTERRUPT0_CONTROL */
 #define DCN_VINT0_CLEAR			(1u << 20)
 #define DCN_OTG_END_SHIFT		16	/* *_START_END / *_SYNC_A: end in 30:16 */
+#define DCN_OTG_TOTAL_MASK		0x7fffu	/* *_TOTAL, *_TOTAL_MIN/MAX: lines - 1 */
+#define DCN_V_TOTAL_MIN_SEL		(1u << 0)	/* OTG_V_TOTAL_CONTROL */
+#define DCN_V_TOTAL_MAX_SEL		(1u << 1)
 #define DCN_HPD_SENSE			(1u << 1)	/* DC_HPD_INT_STATUS */
 #define DCN_HPD_INT_ACK			(1u << 0)	/* DC_HPD_INT_CONTROL */
 #define DCN_HPD_INT_POLARITY		(1u << 8)

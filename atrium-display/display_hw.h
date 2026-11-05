@@ -33,6 +33,12 @@ struct atrium_display_hw_ops {
 	/* Re-arm hot plug detection for the next change (after one fired, and
 	 * at attach). May run from the interrupt handler. */
 	void	(*hpd_rearm)(void *hw);
+	/* Variable refresh for the timing `t` just programmed: frames from
+	 * t's own period up to `min_hz`'s (see atrium_timing_vtotal_at), a
+	 * pending flip ending a stretched one. min_hz 0 = fixed refresh.
+	 * Optional: NULL means the CRTC can't. */
+	void	(*set_vrr)(void *hw, const struct atrium_display_timing *t,
+		    uint32_t min_hz);
 };
 
 /* What a connector's monitor offers, as last probed. */
@@ -42,6 +48,8 @@ struct atrium_display_sink {
 	uint8_t  edid[ATRIUM_EDID_MAX_LEN];
 	uint32_t ntimings;
 	struct atrium_display_timing timings[ATRIUM_DISPLAY_SINK_MODES];
+	uint32_t vrr_min_hz;			/* variable refresh range; 0 = none */
+	uint32_t vrr_max_hz;
 };
 
 /*
