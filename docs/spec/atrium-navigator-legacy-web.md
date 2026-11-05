@@ -513,6 +513,61 @@ in §5.4.1c. Arca's cookie slice is built either way, because logins need it.
 6. `document.cookie`;
 7. the reader-facing UI.
 
+**Measured (2026-11-06): step 1.**
+
+*Method.* Every candidate URL of both corpora was used: 146, not just the 122 kept. The
+23 that failed at selection (403s, 000s, a 400, a 202) are exactly where a cookie check
+would hide. Each URL got three live fetches of its main document, back to back, with the
+corpus UA and flags:
+- **A**, with no jar, as today;
+- **B**, with a throwaway in-memory jar for that one redirect chain (curl's cookie
+  engine, an experiment harness, never shipped);
+- **A2**, with no jar again, as the control.
+
+A difference counts only where B differs from A and A2 agrees with A. Query strings are
+not compared, because sign-in redirects carry per-request parameters. Nothing ran a
+script, so no challenge cookie could be computed, and nothing was replayed that the server
+did not itself send. Fetched from India, 2026-11-06, 01:12–01:35 IST.
+
+| question | result |
+|---|---|
+| servers that set any cookie in the main document's chain | 57 of 146 |
+| **a redirect sets a cookie and returns to the same origin** | **7**: weather.com, mail.google.com, calendar.google.com, web.whatsapp.com, nature.com, sciencedirect.com, old.reddit.com |
+| …and the outcome changes with a jar | **2**: nature.com, sciencedirect.com |
+| **content gained with a jar** | **1**: sciencedirect.com, 400 → 200, visible text 532 → 5,347 characters, the homepage instead of an error page. It was one of the 23 dropped at selection. |
+| "enable cookies" walls (a short page asking for cookies, not a §5.4.1b challenge) | **0**. One long page mentions enabling cookies in its content. |
+| consent walls (content hidden until consent) | **0**. 43 pages run a consent manager (OneTrust, Didomi, Sourcepoint and others), all as banners over content that is already there. |
+| challenges and refusals | 6, all unchanged with a jar (none became readable, none changed outcome) |
+| no cookie check, jar on | 139 URLs: B equals A byte for byte on 91. Where the page is stable (A2 = A, 88), B = A on 86. The other 2 (spiegel.de, doc02) differ in bytes with identical text and element counts: page churn. With no redirect, a fresh jar sends no cookie on the first request at all, so a document without a cookie check is unchanged by construction. |
+
+*What it says.*
+- **The jar rescues one page in 146.** The other real cookie check is nature.com's
+  (`?error=cookies_not_supported` without a jar). It covers that publisher's articles,
+  but the test article is a 404 either way. Both are academic publishers.
+- The remaining five cookie-setting redirects change nothing. Two are Google sign-ins,
+  which are logins and wait for Arca.
+- By this section's own rule, **the Navigator side waits**, as same-site did in §5.4.1c.
+  Arca's cookie slice is still built, because logins need it.
+- *Geography is a stated limit.* These are a reader's results from India. An EU reader
+  is shown consent walls where this run saw banners (lemonde, spiegel, elpais and
+  corriere are in the corpus). The measurement should be repeated from an EU vantage
+  before the decision is final.
+
+*Two design refinements the data asks for.*
+1. **The "site needs it" trigger should be narrower.** Turning a view cookied whenever a
+   redirect sets a cookie and returns to the same origin would make 7 of 146 views (4.8%)
+   private, and only 2 of them need it. A narrower trigger turns a view cookied only when
+   the no-jar chain **ends in an error status, a loop, or a URL naming a cookie error**.
+   On this data it catches exactly sciencedirect and nature.
+2. **A banner is not a reason to go private.** Dismissing a consent banner whose content
+   is already shown should be a local transition: the banner hides and no jar is made.
+   Otherwise the 43 pages with banners (29% of views) would turn private the moment a
+   reader clicked "accept". Only a wall, which is content withheld, should turn a view
+   cookied.
+
+Data: `~/src/navigator-corpus/cookies-2026-11-06/`. `fetch.py` fetches and `analyze.py`
+reproduces the table; `cookies.tsv` has one row per URL.
+
 ### 5.4.2 Never emit an artifact worse than the input
 
 Because tier 2 is tier 1's DOM plus whatever the scripts changed, both artifacts are in
