@@ -1136,17 +1136,26 @@ impl<'f> Lower<'f> {
         use MInst as M;
         match &inst.op {
             // ── constants ─────────────────────────────────────────────
+            // A scalar constant, even when the frontend types it as a
+            // vector: like Cranelift, it is one value that lane-wise ops
+            // broadcast.
             Op::ConstFloat { value, kind: FloatKind::F32 } => {
-                let d = self.define(Self::result(inst)?)?;
-                self.code.push(M::XConst { d: d[0], bits: (*value as f32).to_bits() });
+                let res = Self::result(inst)?;
+                if lane_classes(&res.ty)?.iter().any(|&c| c != Class::X) {
+                    return unsupported(format!("ConstFloat of type {:?}", res.ty));
+                }
+                let d = self.vreg(Class::X);
+                self.code.push(M::XConst { d, bits: (*value as f32).to_bits() });
+                self.lanes.insert(res.id, vec![d]);
             }
             Op::ConstInt { value, kind: IntKind::I32 | IntKind::U32 } => {
                 let res = Self::result(inst)?;
-                let d = self.define(res)?;
-                if self.class_of(d[0]) != Class::G {
+                if lane_classes(&res.ty)?.iter().any(|&c| c != Class::G) {
                     return unsupported(format!("ConstInt of type {:?}", res.ty));
                 }
-                self.code.push(M::GConst { d: d[0], imm: *value as i32 });
+                let d = self.vreg(Class::G);
+                self.code.push(M::GConst { d, imm: *value as i32 });
+                self.lanes.insert(res.id, vec![d]);
             }
             Op::ConstNull => {
                 let res = Self::result(inst)?;

@@ -3915,8 +3915,11 @@ fn translate_inst(
                 // vector operands expand per lane: extract each
                 // lane, run the scalar synthesis, recombine with
                 // ConstVec.
-                13..=30 => {
-                    let two_arg = matches!(inst_enum, 25 | 26);
+                // Round, RoundEven, FSign and Step take the same
+                // per-lane route: their scalar synthesis needs scalar
+                // compares.
+                1 | 2 | 6 | 48 | 13..=30 => {
+                    let two_arg = matches!(inst_enum, 25 | 26 | 48);
                     let a_id = expect_id(&spv_inst.operands, 2)?;
                     let a = resolve_value(a_id, types, constants, id_map,
                         next_value_id, insts, source_spirv_offset)?;
@@ -3938,6 +3941,9 @@ fn translate_inst(
                                            insts: &mut Vec<Inst>,
                                            next_value_id: &mut u32|
                                            -> Value {
+                            if !matches!(v.ty, Type::Vec2(_) | Type::Vec3(_) | Type::Vec4(_)) {
+                                return v.clone();
+                            }
                             let id = ValueId(*next_value_id);
                             *next_value_id += 1;
                             let lane = Value { id, ty: Type::F32 };
@@ -3977,71 +3983,6 @@ fn translate_inst(
                     let x = resolve_value(x_id, types, constants, id_map,
                         next_value_id, insts, source_spirv_offset)?;
                     Op::FSqrt(x)
-                }
-                2 => {
-                    // RoundEven(x): round-half-to-even (banker's
-                    // rounding).  ARM has FRINTN for this in one
-                    // instruction but it's not in the IR; we
-                    // synthesise the algorithm.
-                    //
-                    //   a       = x + 0.5
-                    //   r       = floor(a)            // round-half-up
-                    //   floor_x = floor(x)
-                    //   frac    = x - floor_x          // in [0, 1)
-                    //   is_tie  = (frac == 0.5)
-                    //   r_i     = (i32) r
-                    //   adj     = (is_tie ? (r_i & 1) : 0)
-                    //   result  = (f32) (r_i - adj)
-                    //
-                    // The trick: only adjust on exact tie, and
-                    // only when r_i is odd -- subtract 1 to
-                    // round down to the even neighbour.  Works
-                    // symmetrically for negatives (verified by
-                    // hand: -2.5 -> -2, -1.5 -> -2, -0.5 -> 0).
-                    let x_id = expect_id(&spv_inst.operands, 2)?;
-                    let x = resolve_value(x_id, types, constants, id_map,
-                        next_value_id, insts, source_spirv_offset)?;
-                    let push = |op: Op, ty: Type,
-                                insts: &mut Vec<Inst>,
-                                next_value_id: &mut u32| -> Value {
-                        let id = ValueId(*next_value_id);
-                        *next_value_id += 1;
-                        let val = Value { id, ty };
-                        insts.push(Inst {
-                            op, result: Some(val.clone()),
-                            source_spirv_offset,
-                        });
-                        val
-                    };
-                    let c_half = push_cf(0.5,
-                        source_spirv_offset, insts, next_value_id);
-                    let a = push(Op::FAdd(x.clone(), c_half.clone()),
-                        Type::F32, insts, next_value_id);
-                    let r = push(Op::FFloor(a),
-                        Type::F32, insts, next_value_id);
-                    let floor_x = push(Op::FFloor(x.clone()),
-                        Type::F32, insts, next_value_id);
-                    let frac = push(Op::FSub(x, floor_x),
-                        Type::F32, insts, next_value_id);
-                    let is_tie = push(Op::FOrdEq(frac, c_half),
-                        Type::Bool, insts, next_value_id);
-                    let r_i = push(Op::ConvertFToS(r),
-                        Type::I32, insts, next_value_id);
-                    let c_one_i = push_ci(1, atrium_spv_ir::IntKind::I32,
-                        source_spirv_offset, insts, next_value_id);
-                    let c_zero_i = push_ci(0, atrium_spv_ir::IntKind::I32,
-                        source_spirv_offset, insts, next_value_id);
-                    let r_low_bit = push(Op::BitAnd(r_i.clone(), c_one_i),
-                        Type::I32, insts, next_value_id);
-                    let adj = push(Op::Select {
-                            cond: is_tie,
-                            t_val: r_low_bit,
-                            f_val: c_zero_i,
-                        },
-                        Type::I32, insts, next_value_id);
-                    let r_adjusted_i = push(Op::ISub(r_i, adj),
-                        Type::I32, insts, next_value_id);
-                    Op::ConvertSToF(r_adjusted_i)
                 }
                 55 => {
                     // PackUnorm4x8(v):  vec4 in [0, 1] -> u32.
@@ -4881,52 +4822,6 @@ fn translate_inst(
                         f_val: refr,
                     }
                 }
-                1 => {
-                    // Round(x): round-half-away-from-zero.
-                    //   absx       = FAbs(x)
-                    //   sum        = absx + 0.5
-                    //   floored    = Floor(sum)
-                    //   is_neg     = x < 0.0
-                    //   neg_floor  = -floored
-                    //   result     = is_neg ? neg_floor : floored
-                    // Matches glslang's GL_OES_standard_derivatives
-                    // round-half-away-from-zero semantics (Round(0.5)
-                    // = 1, Round(-0.5) = -1).
-                    let x_id = expect_id(&spv_inst.operands, 2)?;
-                    let x = resolve_value(x_id, types, constants, id_map,
-                        next_value_id, insts, source_spirv_offset)?;
-                    let absx = push_f32(Op::FAbs(x.clone()),
-                        source_spirv_offset, insts, next_value_id);
-                    let half = push_cf(0.5,
-                        source_spirv_offset, insts, next_value_id);
-                    let sum = push_f32(Op::FAdd(absx, half),
-                        source_spirv_offset, insts, next_value_id);
-                    let floored = push_f32(Op::FFloor(sum),
-                        source_spirv_offset, insts, next_value_id);
-                    let zero = push_cf(0.0,
-                        source_spirv_offset, insts, next_value_id);
-                    // FSub(0, floored) -- avoids FNeg (which
-                    // the bespoke backend doesn't lower today).
-                    let neg_floor = push_f32(
-                        Op::FSub(zero.clone(), floored.clone()),
-                        source_spirv_offset, insts, next_value_id);
-                    let is_neg = {
-                        let id = ValueId(*next_value_id);
-                        *next_value_id += 1;
-                        let v = Value { id, ty: Type::Bool };
-                        insts.push(Inst {
-                            op: Op::FOrdLt(x, zero),
-                            result: Some(v.clone()),
-                            source_spirv_offset,
-                        });
-                        v
-                    };
-                    Op::Select {
-                        cond: is_neg,
-                        t_val: neg_floor,
-                        f_val: floored,
-                    }
-                }
                 7 => {
                     // SSign(x): -1 for x<0, 0 for x==0, +1 for x>0.
                     // Branchless bit-twiddle (no Select / no
@@ -4995,7 +4890,9 @@ fn translate_inst(
                         next_value_id, insts, source_spirv_offset)?;
                     let c = resolve_value(c_id, types, constants, id_map,
                         next_value_id, insts, source_spirv_offset)?;
-                    let prod = push_f32(Op::FMul(a, b),
+                    // The product has the result's type (vector Fma is
+                    // component-wise).
+                    let prod = push_typed(Op::FMul(a, b), result_ty.clone(),
                         source_spirv_offset, insts, next_value_id);
                     Op::FAdd(prod, c)
                 }
@@ -5271,45 +5168,6 @@ fn translate_inst(
                         v
                     };
                     Op::FMin(mid, hi)
-                }
-                6 => {
-                    // FSign(x) ≡ (x > 0) - (x < 0).  Cleanly
-                    // handles +/-0 (both yield 0) and normal
-                    // signed values.  Synthesised as:
-                    //   gt    = FOrdGt(x, 0.0)       // i32 0/1
-                    //   lt    = FOrdLt(x, 0.0)       // i32 0/1
-                    //   gt_f  = ConvertUToF(gt)      // 0.0 or 1.0
-                    //   lt_f  = ConvertUToF(lt)      // 0.0 or 1.0
-                    //   sign  = FSub(gt_f, lt_f)     // -1.0, 0.0, +1.0
-                    let x_id = expect_id(&spv_inst.operands, 2)?;
-                    let x = resolve_value(x_id, types, constants, id_map,
-                        next_value_id, insts, source_spirv_offset)?;
-                    let push_inst = |op: Op, ty: Type,
-                                     insts: &mut Vec<Inst>,
-                                     next_value_id: &mut u32| -> Value {
-                        let id = ValueId(*next_value_id);
-                        *next_value_id += 1;
-                        let val = Value { id, ty };
-                        insts.push(Inst {
-                            op, result: Some(val.clone()),
-                            source_spirv_offset,
-                        });
-                        val
-                    };
-                    let zero = push_inst(
-                        Op::ConstFloat { value: 0.0, kind: atrium_spv_ir::FloatKind::F32 },
-                        Type::F32, insts, next_value_id);
-                    let gt = push_inst(
-                        Op::FOrdGt(x.clone(), zero.clone()),
-                        Type::U32, insts, next_value_id);
-                    let lt = push_inst(
-                        Op::FOrdLt(x, zero),
-                        Type::U32, insts, next_value_id);
-                    let gt_f = push_inst(
-                        Op::ConvertUToF(gt), Type::F32, insts, next_value_id);
-                    let lt_f = push_inst(
-                        Op::ConvertUToF(lt), Type::F32, insts, next_value_id);
-                    Op::FSub(gt_f, lt_f)
                 }
                 71 => {
                     // Reflect(I, N) ≡ I - 2 * dot(N, I) * N
@@ -5665,28 +5523,6 @@ fn translate_inst(
                     let _ = one;
                     Op::FMul(t_squared, three_minus_2t)
                 }
-                48 => {
-                    // Step(edge, x) ≡ x < edge ? 0.0 : 1.0
-                    //              ≡ float(x >= edge).
-                    let edge_id = expect_id(&spv_inst.operands, 2)?;
-                    let x_id    = expect_id(&spv_inst.operands, 3)?;
-                    let edge = resolve_value(edge_id, types, constants, id_map,
-                        next_value_id, insts, source_spirv_offset)?;
-                    let x = resolve_value(x_id, types, constants, id_map,
-                        next_value_id, insts, source_spirv_offset)?;
-                    let ge = {
-                        let id = ValueId(*next_value_id);
-                        *next_value_id += 1;
-                        let val = Value { id, ty: Type::U32 };
-                        insts.push(Inst {
-                            op: Op::FOrdGe(x, edge),
-                            result: Some(val.clone()),
-                            source_spirv_offset,
-                        });
-                        val
-                    };
-                    Op::ConvertUToF(ge)
-                }
                 46 => {
                     // FMix(x, y, a) ≡ x + a*(y - x).
                     let x_id = expect_id(&spv_inst.operands, 2)?;
@@ -6030,9 +5866,20 @@ fn push_f32(
     insts: &mut Vec<Inst>,
     next_value_id: &mut u32,
 ) -> Value {
+    push_typed(op, Type::F32, source_spirv_offset, insts, next_value_id)
+}
+
+/// Emit `op` with a result of type `ty`.
+fn push_typed(
+    op: Op,
+    ty: Type,
+    source_spirv_offset: u32,
+    insts: &mut Vec<Inst>,
+    next_value_id: &mut u32,
+) -> Value {
     let id = ValueId(*next_value_id);
     *next_value_id += 1;
-    let v = Value { id, ty: Type::F32 };
+    let v = Value { id, ty };
     insts.push(Inst { op, result: Some(v.clone()), source_spirv_offset });
     v
 }
@@ -6855,7 +6702,59 @@ fn synth_transcendental(
     insts: &mut Vec<Inst>,
     next_value_id: &mut u32,
 ) -> Result<Op, FrontendError> {
+    // Values with an explicit type (compare results, ints).
+    let push = |op: Op, ty: Type, insts: &mut Vec<Inst>, next_value_id: &mut u32| -> Value {
+        push_typed(op, ty, source_spirv_offset, insts, next_value_id)
+    };
     Ok(match inst_enum {
+        1 => {
+        // Round(x): round half away from zero (Round(0.5) = 1,
+        // Round(-0.5) = -1):
+        //   floored = floor(|x| + 0.5); x < 0 ? 0 - floored : floored
+        // (FSub from 0 rather than FNeg.)
+        let absx = push_f32(Op::FAbs(a.clone()), source_spirv_offset, insts, next_value_id);
+        let half = push_cf(0.5, source_spirv_offset, insts, next_value_id);
+        let sum = push_f32(Op::FAdd(absx, half), source_spirv_offset, insts, next_value_id);
+        let floored = push_f32(Op::FFloor(sum), source_spirv_offset, insts, next_value_id);
+        let zero = push_cf(0.0, source_spirv_offset, insts, next_value_id);
+        let neg_floor = push_f32(Op::FSub(zero.clone(), floored.clone()),
+            source_spirv_offset, insts, next_value_id);
+        let is_neg = push(Op::FOrdLt(a, zero), Type::Bool, insts, next_value_id);
+        Op::Select { cond: is_neg, t_val: neg_floor, f_val: floored }
+        }
+        2 => {
+        // RoundEven(x): round half to even.
+        //   r = floor(x + 0.5); on an exact tie (x - floor(x) == 0.5)
+        //   subtract r's low bit, i.e. step down to the even neighbour.
+        let c_half = push_cf(0.5, source_spirv_offset, insts, next_value_id);
+        let ah = push(Op::FAdd(a.clone(), c_half.clone()), Type::F32, insts, next_value_id);
+        let r = push(Op::FFloor(ah), Type::F32, insts, next_value_id);
+        let floor_x = push(Op::FFloor(a.clone()), Type::F32, insts, next_value_id);
+        let frac = push(Op::FSub(a, floor_x), Type::F32, insts, next_value_id);
+        let is_tie = push(Op::FOrdEq(frac, c_half), Type::Bool, insts, next_value_id);
+        let r_i = push(Op::ConvertFToS(r), Type::I32, insts, next_value_id);
+        let c_one_i = push_ci(1, atrium_spv_ir::IntKind::I32, source_spirv_offset, insts, next_value_id);
+        let c_zero_i = push_ci(0, atrium_spv_ir::IntKind::I32, source_spirv_offset, insts, next_value_id);
+        let low = push(Op::BitAnd(r_i.clone(), c_one_i), Type::I32, insts, next_value_id);
+        let adj = push(Op::Select { cond: is_tie, t_val: low, f_val: c_zero_i }, Type::I32, insts, next_value_id);
+        let r_adj = push(Op::ISub(r_i, adj), Type::I32, insts, next_value_id);
+        Op::ConvertSToF(r_adj)
+        }
+        6 => {
+        // FSign(x) = float(x > 0) - float(x < 0); both zeros give 0.
+        let zero = push_cf(0.0, source_spirv_offset, insts, next_value_id);
+        let gt = push(Op::FOrdGt(a.clone(), zero.clone()), Type::U32, insts, next_value_id);
+        let lt = push(Op::FOrdLt(a, zero), Type::U32, insts, next_value_id);
+        let gt_f = push(Op::ConvertUToF(gt), Type::F32, insts, next_value_id);
+        let lt_f = push(Op::ConvertUToF(lt), Type::F32, insts, next_value_id);
+        Op::FSub(gt_f, lt_f)
+        }
+        48 => {
+        // Step(edge, x) = float(x >= edge).
+        let x = b.clone().ok_or_else(|| FrontendError::Malformed("Step without x".into()))?;
+        let ge = push(Op::FOrdGe(x, a), Type::U32, insts, next_value_id);
+        Op::ConvertUToF(ge)
+        }
         13 => {
         // Sin(a): range-reduce to [-π/2, π/2] then
         // evaluate 4-term Horner Taylor polynomial

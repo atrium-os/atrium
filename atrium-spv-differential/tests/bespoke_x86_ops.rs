@@ -664,7 +664,7 @@ fn derivative_helper_call() {
             &module, atrium_spv_backend_bespoke_x86::Target::host()).expect("bespoke-x86").object),
     ];
     let mut table = [0usize; 10];
-    table[72 / 8] = deriv as usize;
+    table[72 / 8] = deriv as *const () as usize;
     let mut results = Vec::new();
     for (name, obj) in &objs {
         let dir = tempfile::tempdir().unwrap();
@@ -982,4 +982,117 @@ fn packed_vector_ops() {
         }).collect();
         assert_eq!(res[1], res[0], "inputs {vary:?}");
     }
+}
+
+/// Every component-wise GLSL.std.450 op that the frontend expands into
+/// several IR ops, on vec4 operands (Slang emits these for its built-ins):
+/// bespoke-x86 must compile each one and agree with Cranelift bit for bit.
+#[test]
+fn glsl_ext_ops_on_vectors() {
+    use rspirv::dr::Operand::{self, LiteralBit32};
+    use rspirv::spirv::{
+        AddressingModel, Capability, Decoration, ExecutionMode, ExecutionModel, FunctionControl,
+        MemoryModel, StorageClass as SC,
+    };
+    if !cfg!(target_arch = "x86_64") {
+        return;
+    }
+    // (enum, operand count, scalar result, name)
+    let ops: &[(u32, usize, bool, &str)] = &[
+        (1, 1, false, "Round"),
+        (2, 1, false, "RoundEven"),
+        (6, 1, false, "FSign"),
+        (10, 1, false, "Fract"),
+        (37, 2, false, "FMin"),
+        (40, 2, false, "FMax"),
+        (43, 3, false, "FClamp"),
+        (46, 3, false, "FMix"),
+        (48, 2, false, "Step"),
+        (49, 3, false, "SmoothStep"),
+        (50, 3, false, "Fma"),
+        (66, 1, true, "Length"),
+        (67, 2, true, "Distance"),
+        (69, 1, false, "Normalize"),
+        (70, 3, false, "FaceForward"),
+        (71, 2, false, "Reflect"),
+    ];
+    type FsMain = unsafe extern "C" fn(
+        *const u8, *const u8, *const u8, f32, f32, f32, f32, u32, *mut f32, *mut f32, u32, u32,
+    );
+    let vals = [1.5f32, -2.25, 0.0, -0.0, 0.5, -0.5, 2.5, 7.0, -1e3, 0.333, 0.75, 1.0];
+    let mut failures = Vec::new();
+    for &(e, nargs, scalar, name) in ops {
+        let mut b = Builder::new();
+        b.set_version(1, 0);
+        b.capability(Capability::Shader);
+        let glsl = b.ext_inst_import("GLSL.std.450");
+        b.memory_model(AddressingModel::Logical, MemoryModel::GLSL450);
+        let void = b.type_void();
+        let f = b.type_float(32, None);
+        let v4 = b.type_vector(f, 4);
+        let void_fn = b.type_function(void, vec![]);
+        let pin4 = b.type_pointer(None, SC::Input, v4);
+        let pout4 = b.type_pointer(None, SC::Output, v4);
+        let ins: Vec<_> = (0..3).map(|k| {
+            let v = b.variable(pin4, None, SC::Input, None);
+            b.decorate(v, Decoration::Location, vec![LiteralBit32(k)]);
+            v
+        }).collect();
+        let out = b.variable(pout4, None, SC::Output, None);
+        b.decorate(out, Decoration::Location, vec![LiteralBit32(0)]);
+        let main = b.begin_function(void, None, FunctionControl::NONE, void_fn).unwrap();
+        b.begin_block(None).unwrap();
+        let args: Vec<Operand> = ins[..nargs].iter()
+            .map(|&v| Operand::IdRef(b.load(v4, None, v, None, vec![]).unwrap())).collect();
+        let r = b.ext_inst(if scalar { f } else { v4 }, None, glsl, e, args).unwrap();
+        let r4 = if scalar { b.composite_construct(v4, None, vec![r, r, r, r]).unwrap() } else { r };
+        b.store(out, r4, None, vec![]).unwrap();
+        b.ret().unwrap();
+        b.end_function().unwrap();
+        let mut iface = ins.clone();
+        iface.push(out);
+        b.entry_point(ExecutionModel::Fragment, main, "main", iface);
+        b.execution_mode(main, ExecutionMode::OriginUpperLeft, vec![]);
+        let spirv = assemble(b);
+        let module = match atrium_spv_frontend::translate(&spirv) {
+            Ok(m) => m,
+            Err(err) => { failures.push(format!("{name}: frontend {err}")); continue; }
+        };
+        let cl = atrium_spv_backend_cranelift::compile(&module, atrium_spv_backend_cranelift::Target::host());
+        let x86 = atrium_spv_backend_bespoke_x86::compile(&module, atrium_spv_backend_bespoke_x86::Target::host());
+        let (cl, x86) = match (cl, x86) {
+            (Ok(c), Ok(x)) => (c.object, x.object),
+            (c, x) => {
+                failures.push(format!("{name}: cranelift {:?} bespoke {:?}", c.err(), x.err()));
+                continue;
+            }
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let libs: Vec<libloading::Library> = [cl, x86].iter().enumerate().map(|(k, obj)| {
+            let o = dir.path().join(format!("s{k}.o"));
+            let so = dir.path().join(format!("s{k}.so"));
+            std::fs::write(&o, obj).unwrap();
+            assert!(std::process::Command::new("cc").arg("-shared").arg("-o").arg(&so).arg(&o)
+                .status().unwrap().success());
+            unsafe { libloading::Library::new(&so) }.unwrap()
+        }).collect();
+        let fs: Vec<FsMain> = libs.iter().map(|l| unsafe { *l.get::<FsMain>(b"atrium_fs_main").unwrap() }).collect();
+        for k in 0..24 {
+            let vary: Vec<f32> = (0..12).map(|i| vals[(k * 5 + i * 7 + i / 4) % vals.len()]).collect();
+            let res: Vec<[u32; 4]> = fs.iter().map(|&f| {
+                let mut c = [0f32; 4];
+                let mut d = 0f32;
+                unsafe {
+                    f(vary.as_ptr() as *const u8, std::ptr::null(), std::ptr::null(), 0.0, 0.0, 0.0, 1.0, 1,
+                      c.as_mut_ptr(), &mut d, 1, 0);
+                }
+                c.map(f32::to_bits)
+            }).collect();
+            if res[0] != res[1] {
+                failures.push(format!("{name}: inputs {vary:?}: cranelift {:?} bespoke {:?}", res[0], res[1]));
+                break;
+            }
+        }
+    }
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
 }
