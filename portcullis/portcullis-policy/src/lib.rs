@@ -39,6 +39,39 @@ use portcullis_toml::{Capabilities, NetworkCap};
 pub struct Policy {
     #[serde(default)]
     pub grants: BTreeMap<String, Grant>,
+    /// Worker delegations, honoured only in the SYSTEM policy (root-owned):
+    /// who may start a one-shot worker of an app, and the uid it runs as.
+    /// Indexed by the worker's app id. A user's own policy file may not
+    /// delegate a uid, so portcullisd reads this table from the system
+    /// policy alone.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub workers: BTreeMap<String, WorkerRule>,
+}
+
+/// One delegation: `callers` (user names, e.g. `_frescod`) may run the app
+/// as a one-shot worker, and it runs as `run_as` instead of as the caller.
+///
+/// ★ Why a worker needs a uid of its own: `ExecInstance` otherwise runs the
+/// worker as its caller, so a compromised worker would hold its caller's
+/// identity, and with it whatever the caller owns on shared mounts. frescod's
+/// window renderers parse hostile scene graphs; they must not be frescod.
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+pub struct WorkerRule {
+    pub callers: Vec<String>,
+    pub run_as: String,
+    /// How many of these workers may run at once. They are counted on their
+    /// own, not against the per-user and host one-shot limits: frescod runs
+    /// one per connection, and the Navigator's workers must not compete
+    /// with the desktop for the same 64 slots.
+    #[serde(default)]
+    pub concurrent: Option<usize>,
+}
+
+impl Policy {
+    /// The delegation for `app_id` if `caller` is one of its callers.
+    pub fn worker_rule(&self, app_id: &str, caller: &str) -> Option<&WorkerRule> {
+        self.workers.get(app_id).filter(|r| r.callers.iter().any(|c| c == caller))
+    }
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]

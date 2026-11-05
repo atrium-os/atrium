@@ -148,6 +148,35 @@ impl Limiter {
         Ok(())
     }
 
+    /// Take a slot from a delegated worker budget (`portcullis_policy::WorkerRule`):
+    /// keyed on its own, capped at `cap` instead of the per-user limit, and
+    /// not counted against the host ceiling, which the rule's own cap stands
+    /// in for. The rate limit still applies.
+    pub fn acquire_reserved(&mut self, key: &str, cap: usize, now: Millis) -> Result<(), Refusal> {
+        let limits = self.limits;
+        let b = self.users.entry(key.to_string()).or_insert(Bucket {
+            held: 0, tokens: limits.burst as f64, last: now,
+        });
+        if b.held >= cap {
+            return Err(Refusal::TooManyForUser { held: b.held, allowed: cap });
+        }
+        let elapsed = now.saturating_sub(b.last) as f64 / 1000.0;
+        b.tokens = (b.tokens + elapsed * limits.refill_per_sec as f64).min(limits.burst as f64);
+        b.last = b.last.max(now);
+        if b.tokens < 1.0 {
+            return Err(Refusal::TooFast { allowed_per_sec: limits.refill_per_sec });
+        }
+        b.tokens -= 1.0;
+        b.held += 1;
+        Ok(())
+    }
+
+    fn release_reserved(&mut self, key: &str) {
+        if let Some(b) = self.users.get_mut(key) {
+            b.held = b.held.saturating_sub(1);
+        }
+    }
+
     /// Give a slot back.
     ///
     /// ★ MUST RUN ON EVERY PATH. A leaked count is permanent: it lowers the
@@ -167,6 +196,7 @@ impl Limiter {
 pub struct Slot {
     limiter: std::sync::Arc<std::sync::Mutex<Limiter>>,
     user: String,
+    reserved: bool,
 }
 
 impl Slot {
@@ -181,14 +211,31 @@ impl Slot {
         let mut l = limiter.lock().unwrap_or_else(|e| e.into_inner());
         l.acquire(user, now)?;
         drop(l);
-        Ok(Slot { limiter: limiter.clone(), user: user.to_string() })
+        Ok(Slot { limiter: limiter.clone(), user: user.to_string(), reserved: false })
+    }
+
+    /// A slot from a delegated worker budget ([`Limiter::acquire_reserved`]).
+    pub fn acquire_reserved(
+        limiter: &std::sync::Arc<std::sync::Mutex<Limiter>>,
+        key: &str,
+        cap: usize,
+        now: Millis,
+    ) -> Result<Slot, Refusal> {
+        let mut l = limiter.lock().unwrap_or_else(|e| e.into_inner());
+        l.acquire_reserved(key, cap, now)?;
+        drop(l);
+        Ok(Slot { limiter: limiter.clone(), user: key.to_string(), reserved: true })
     }
 }
 
 impl Drop for Slot {
     fn drop(&mut self) {
         let mut l = self.limiter.lock().unwrap_or_else(|e| e.into_inner());
-        l.release(&self.user);
+        if self.reserved {
+            l.release_reserved(&self.user);
+        } else {
+            l.release(&self.user);
+        }
     }
 }
 
@@ -224,6 +271,20 @@ mod tests {
         let mut l = Limiter::default();
         for i in 0..16 { l.acquire("reader", 0).unwrap_or_else(|e| panic!("session {i}: {e}")); }
         assert_eq!(l.held(), 16);
+    }
+
+    /// A delegated worker budget has its own cap and leaves the host's
+    /// one-shot slots alone.
+    #[test]
+    fn a_reserved_budget_is_capped_on_its_own_and_spares_the_host_ceiling() {
+        let mut l = limiter(2, 2, 100, 100);
+        for i in 0..5 { l.acquire_reserved("worker:r", 5, 0).unwrap_or_else(|e| panic!("{i}: {e}")); }
+        assert!(matches!(l.acquire_reserved("worker:r", 5, 0), Err(Refusal::TooManyForUser { allowed: 5, .. })));
+        assert_eq!(l.held(), 0, "reserved slots do not count against the host");
+        l.acquire("reader", 0).unwrap();
+        l.acquire("reader", 0).unwrap();
+        l.release_reserved("worker:r");
+        l.acquire_reserved("worker:r", 5, 0).unwrap();
     }
 
     #[test]

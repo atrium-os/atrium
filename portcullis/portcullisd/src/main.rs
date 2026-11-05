@@ -466,7 +466,21 @@ fn handle_exec_instance(
      * first would have the client send three descriptors the daemon is about
      * to refuse, and a refusal that still costs the caller work is a refusal
      * a loop can use as a service. */
-    let slot = match portcullisd::ratelimit::Slot::acquire(limiter, user, now_millis()) {
+    /* A delegation in the SYSTEM policy (root-owned; a user's own file may
+     * not delegate a uid): `user` may start this app as a worker that runs
+     * as the rule's `run_as`, on the rule's own budget. Without one, the
+     * worker runs as the caller, as it always has. */
+    let rule = Policy::load_system(std::path::Path::new(SYSTEM_PATH)).ok()
+        .and_then(|p| p.worker_rule(&app_id, user).cloned());
+    if let Some(r) = &rule {
+        eprintln!("portcullisd: {user} starts {app_id} as {} (system worker rule)", r.run_as);
+    }
+    let acquired = match &rule {
+        Some(r) => portcullisd::ratelimit::Slot::acquire_reserved(
+            limiter, &format!("worker:{app_id}"), r.concurrent.unwrap_or(32), now_millis()),
+        None => portcullisd::ratelimit::Slot::acquire(limiter, user, now_millis()),
+    };
+    let slot = match acquired {
         Ok(s) => s,
         Err(why) => {
             eprintln!("portcullisd: rate-limited {user}: {why}");
@@ -563,7 +577,7 @@ fn handle_exec_instance(
         require_memory_limit: limits.2,
         // The home jail(8) chdirs into is resolved from this user's passwd
         // inside portcullis_oneshot — see Spec::user_name.
-        user_name: user.to_string(),
+        user_name: rule.as_ref().map(|r| r.run_as.clone()).unwrap_or_else(|| user.to_string()),
     };
     let resp = match portcullis_oneshot::run_with_stdio(&spec, Some(stdio)) {
         // The worker's own status (jaild reaps it); None = killed by a signal.

@@ -39,7 +39,7 @@ Before this change, frescod's event fan-out sent every event to every connection
 
 ### F4b. The process split
 
-Done, renderer jailed (atrium a46ec90 and the commit after it). `FRESCOD_SPLIT=1` hands every connection on `fresco.sock` to its own `fresco-renderer`; the WM socket stays in the broker. The renderer's stdin is the record channel, and the client's socket arrives over it in the first record (`CLIENT`), because a jail from `portcullis exec` gets only its three stdio fds. `FRESCOD_RENDERER_LAUNCHER` runs it confined, e.g. `portcullis exec --require-memory-limit --user <unprivileged> --instance fresco{client} org.atrium.fresco.renderer` (a signed bundle with no capabilities).
+Done, renderer jailed (atrium a46ec90 and the commit after it). frescod runs as `_frescod` and has portcullisd start each renderer, which runs as `_fresco-render` under the system policy's worker rule (portcullis.md §6.5.2g): launcher `portcullis exec --daemon --require-memory-limit --instance fresco{client} org.atrium.fresco.renderer`, set up by `scripts/fresco-renderer-bundle.sh`. `FRESCOD_SPLIT=1` hands every connection on `fresco.sock` to its own `fresco-renderer`; the WM socket stays in the broker. The renderer's stdin is the record channel, and the client's socket arrives over it in the first record (`CLIENT`), because a jail from `portcullis exec` gets only its three stdio fds. `FRESCOD_RENDERER_LAUNCHER` runs it confined, e.g. `portcullis exec --require-memory-limit --user <unprivileged> --instance fresco{client} org.atrium.fresco.renderer` (a signed bundle with no capabilities).
 
 Verified in the amd64 VM with `atrium-surfaces-demo`:
 - Unconfined: headless on Tier-2, and on gpusim with the GPU renderer (screenshot `frescod-f4b-split-gpu.png`).

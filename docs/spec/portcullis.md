@@ -1496,6 +1496,35 @@ step". Dir-or-file is decided by stat'ing the source, as the application path do
 | after `policy revoke` | refused again |
 | the 98-document corpus | unaffected — 98/259/259 |
 
+### 6.5.2g Worker rules — a worker that is not its caller (2026-11-05)
+
+`ExecInstance` runs the worker as its caller. That is right for the Navigator's broker,
+whose workers are its own documents, and wrong for frescod: its window renderers parse
+hostile scene graphs, so a renderer running as frescod would hold frescod's identity.
+The **system** policy (`/etc/atrium/policy.toml`, root-owned) can delegate:
+
+```toml
+[workers."org.atrium.fresco.renderer"]
+callers    = ["_frescod"]
+run_as     = "_fresco-render"
+concurrent = 255
+```
+
+- Only a caller named in `callers` gets the rule; anyone else's worker runs as itself.
+  A user's own policy file cannot delegate a uid: portcullisd reads `workers` from the
+  system policy alone.
+- The rule's workers have their own budget (`concurrent`, rate as usual). They do not
+  count against the per-user and host one-shot limits (§6.5.2b), so the desktop's
+  renderers and the Navigator's workers never compete for the same 64 slots.
+- `run_as` must be a uid jaild allows. Atrium's system uids sit above the user range and
+  below `nobody`: 65010 `_frescod`, 65011 `_fresco-render`. The 65–67 first reserved in
+  the jaild policy are FreeBSD's `_dhcp` and `uucp`.
+
+Verified in the amd64 VM: frescod, running as `_frescod`, has every connection's renderer
+started through portcullisd (`portcullis exec --daemon`). Each runs as `_fresco-render`
+in its own jail with the bundle's 512 MiB cap. The same request from `navtest` runs as
+`navtest`.
+
 ### 6.5.2d One copy of the mount mechanics
 
 Three lanes had three copies of "unmount everything under this root", at **three different

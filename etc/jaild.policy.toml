@@ -191,14 +191,21 @@ allowed_prefixes = [
 min_user_uid        = 1000
 max_user_uid        = 65000
 allowed_system_uids = [
-    # 65 = _frescod        (reserved; not yet allocated in v1)
-    # 66 = _atrium-devevents
-    # 67 = _atrium-portcullisd
+    # Atrium's system uids sit above the user range and below nobody
+    # (65534), clear of base and ports: 65 and 66, reserved here at first,
+    # are FreeBSD's _dhcp and uucp.
+    65010,   # _frescod: the compositor (fresco-renderer-bundle.sh creates it)
+    65011,   # _fresco-render: frescod's window renderers, started for it by
+             # portcullisd under the system policy's worker rule
+    # 65012 = _atrium-devevents   (reserved)
+    # 65013 = _atrium-portcullisd (reserved)
 ]
 
 [gid]
 allowed_system_gids = [
     # mirrors uid table
+    65010,   # _frescod
+    65011,   # _fresco-render
 ]
 
 
@@ -279,7 +286,7 @@ required_mounts_rw    = [
     "/var/log/atrium",
 ]
 network      = "disable"
-uid          = "root"          # owns /dev/atrium-gpu0
+uid          = "_frescod"      # the atrium_gpu ruleset opens its nodes to it
 children_max = 0
 
 [services.atrium-devevents]

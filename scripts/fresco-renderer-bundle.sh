@@ -35,4 +35,22 @@ floor = "64M"
 T
 openssl dgst -sha256 -sign "$KEY" -out $B/atrium.toml.sig $B/atrium.toml
 "$OPIFEX" install $B
+
+# The renderer runs as a uid of its own, never as frescod: frescod (as
+# _frescod) asks portcullisd to start it, and the system policy's worker
+# rule says it runs as _fresco-render. Both uids sit above the jaild policy's
+# user range (65000) and below nobody, clear of base and ports.
+id _frescod >/dev/null 2>&1 || pw useradd _frescod -u 65010 -d /nonexistent -s /usr/sbin/nologin -c "Fresco compositor"
+id _fresco-render >/dev/null 2>&1 || pw useradd _fresco-render -u 65011 -d /nonexistent -s /usr/sbin/nologin -c "Fresco window renderer"
+P=/etc/atrium/policy.toml
+if ! grep -q 'workers."org.atrium.fresco.renderer"' $P 2>/dev/null; then
+    cat >> $P <<'T'
+
+[workers."org.atrium.fresco.renderer"]
+callers    = ["_frescod"]
+run_as     = "_fresco-render"
+concurrent = 255
+T
+    chown root:wheel $P && chmod 644 $P
+fi
 echo "fresco-renderer-bundle: installed $(du -sh $B | cut -f1)"
