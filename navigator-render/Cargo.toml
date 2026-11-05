@@ -54,3 +54,12 @@ path = "src/bin/nsg-flag.rs"
 name = "nsg-raster"
 path = "src/bin/nsg-raster.rs"
 required-features = ["raster"]
+
+[dev-dependencies]
+# The frescod integration test (tests/fresco_integration.rs): Navigator's fills
+# through frescod's packing and its real kernels — Tier-2 (Cranelift) and the
+# GIR interpreter — against fresco-compute's reference.
+fresco-compute = { path = "../fresco-compute", features = ["cranelift"] }
+atrium-gir = { path = "../atrium-gir" }
+atrium-spv-frontend = { path = "../atrium-spv-frontend" }
+tempfile = "3"

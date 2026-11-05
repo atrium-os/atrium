@@ -294,7 +294,24 @@ coverage functions, with gradients evaluated as Fresco does (`path::paint_at`).
 
 - *Pages without inline SVG:* their NSG is byte-identical to 0beab757's. All 57 scenes
   that changed are pages with inline SVG.
-- *Not yet run:* the integration test against frescod itself.
+- *Through frescod's own pipeline* (`navigator-render/tests/fresco_integration.rs`).
+  - *The steps.* A page of inline SVGs (strokes, a dash, both gradients, a rectangle
+    clip, opacity) is rendered into path nodes. Each becomes the `FillParams` the broker
+    would send and passes `validate`. It is translated as frescod does
+    (`translate_fill`), packed by `Frame::pack_report` as frescod packs a window, and
+    rastered by frescod's real kernels.
+  - *Tier-2* (the SPIR-V compiled by Cranelift, frescod's CPU renderer) is **identical
+    to fresco-compute's reference, 0 pixels differing**, and the GIR interpreter agrees.
+  - *A path too dense for one tile* is dropped by `pack_report` with reason 2 (tile too
+    dense), and only it; the scene's bitmap fallback for its SVG is what the UI draws
+    instead.
+- *The worker's tile pre-check is best-effort.* Tile density depends on where a path
+  falls on the 16 px grid, and scrolling moves that. The worker packs each path at the
+  origin of the grid; frescod's drop report and the fallback are what make a dense path
+  safe wherever it lands.
+- *Not covered yet:* the socket, the scene server's envelope, the compositor and the
+  `EV_WINDOW_FILLS_DROPPED` delivery, which need frescod running in the VM. frescod has
+  no pixel readback, so that run would compare a QEMU screendump.
 
 **The M0 gate:** the repo's own Markdown (the corpus) produces **byte-identical NSG over
 3 runs on 2 machines**: macOS (host) and FreeBSD (the VM, Laminar, cross-built).
