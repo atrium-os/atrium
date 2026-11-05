@@ -32,6 +32,16 @@ use crate::split::Bucket;
 pub const MAX_PER_UID: usize = 4;
 /// Contexts frescod serves at once.
 pub const MAX_CONTEXTS: usize = 32;
+/// When this few contexts are left, a uid may hold only one, so a handful
+/// of colluding apps cannot take every context (as socket_server does for
+/// client ids).
+const TAIL: usize = 8;
+/// Staging memory frescod holds for all contexts together. Each buffer's
+/// staging slot is frescod's own shared memory, so this bounds what apps
+/// can make frescod commit.
+const MAX_STAGING: u64 = 1 << 30;
+/// Bytes copied between staging and a buffer at a time.
+const CHUNK: usize = 1 << 20;
 /// Records per second one context may send (it waits past that).
 const RECORDS_PER_S: f64 = 2000.0;
 const RECORD_BURST: f64 = 256.0;
@@ -62,6 +72,34 @@ fn device() -> Option<&'static Gpu> {
     .as_ref()
 }
 
+static STAGING: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// A buffer's staging slot, counted against [`MAX_STAGING`] while it lives.
+/// `Shm::create` seals it against shrinking and growing (and further
+/// seals), so the app holding the fd cannot truncate it under frescod.
+struct Staging(Shm);
+
+impl Staging {
+    fn create(bytes: usize) -> Result<Staging, Error> {
+        use std::sync::atomic::Ordering::SeqCst;
+        let b = bytes as u64;
+        if STAGING.fetch_add(b, SeqCst) + b > MAX_STAGING {
+            STAGING.fetch_sub(b, SeqCst);
+            return Err(Error::Limit("frescod staging memory"));
+        }
+        Shm::create(bytes).map(Staging).map_err(|e| {
+            STAGING.fetch_sub(b, SeqCst);
+            Error::Device(e)
+        })
+    }
+}
+
+impl Drop for Staging {
+    fn drop(&mut self) {
+        STAGING.fetch_sub(self.0.len() as u64, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
 /// A context slot for `uid`, released on drop.
 struct Slot(u32);
 
@@ -70,8 +108,9 @@ impl Slot {
         let mut g = CONTEXTS.lock().unwrap();
         let m = g.get_or_insert_with(HashMap::new);
         let total: usize = m.values().sum();
+        let limit = if MAX_CONTEXTS - total.min(MAX_CONTEXTS) <= TAIL { 1 } else { MAX_PER_UID };
         let mine = m.entry(uid).or_insert(0);
-        if *mine >= MAX_PER_UID || total >= MAX_CONTEXTS {
+        if *mine >= limit || total >= MAX_CONTEXTS {
             return None;
         }
         *mine += 1;
@@ -107,14 +146,16 @@ pub fn serve(path: &std::path::Path) -> io::Result<()> {
                 Ok((c, uid)) => {
                     next += 1;
                     let conn = next;
+                    // Admit before spawning: a connect flood costs a
+                    // refusal each, not a thread each.
+                    let Some(slot) = Slot::take(uid) else {
+                        refuse(&c, reason::LIMIT, 0);
+                        log::info!("frescod: GPU context {conn} (uid {uid}): at the context cap");
+                        continue;
+                    };
                     let _ = std::thread::Builder::new().name(format!("frescod-gpu-{conn}")).spawn(move || {
-                        let why = match Slot::take(uid) {
-                            Some(_slot) => context(&c),
-                            None => {
-                                refuse(&c, reason::LIMIT, 0);
-                                format!("uid {uid} at its context cap")
-                            }
-                        };
+                        let _slot = slot;
+                        let why = context(&c);
                         log::info!("frescod: GPU context {conn} (uid {uid}): {why}");
                     });
                 }
@@ -193,7 +234,7 @@ fn context(c: &Chan) -> String {
     if let Err(e) = c.send_now_raw(&hello.encode(), &[upload.fd(), work.fd()]) {
         return e.to_string();
     }
-    let mut staging: HashMap<u32, Shm> = HashMap::new();
+    let mut staging: HashMap<u32, Staging> = HashMap::new();
     let mut rate = Bucket::new(RECORDS_PER_S, RECORD_BURST);
     loop {
         let m = match c.recv_raw() {
@@ -259,7 +300,7 @@ fn serve_one(
     s: &mut Ctx,
     upload: &Shm,
     work: &Shm,
-    staging: &mut HashMap<u32, Shm>,
+    staging: &mut HashMap<u32, Staging>,
     m: GpuMsg,
 ) -> Result<(Option<GpuMsg>, Option<std::os::fd::RawFd>), Error> {
     Ok(match m {
@@ -271,15 +312,15 @@ fn serve_one(
         }
         GpuMsg::Buffer { id, bytes } => {
             let va = s.create_buffer(id, bytes as u64)?;
-            match Shm::create(bytes as usize) {
-                Ok(shm) => {
-                    let fd = shm.fd();
-                    staging.insert(id, shm);
+            match Staging::create(bytes as usize) {
+                Ok(st) => {
+                    let fd = st.0.fd();
+                    staging.insert(id, st);
                     (Some(GpuMsg::BufferOk { id, va, bytes }), Some(fd))
                 }
                 Err(e) => {
                     let _ = s.free_buffer(id);
-                    return Err(Error::Device(e));
+                    return Err(e);
                 }
             }
         }
@@ -289,17 +330,27 @@ fn serve_one(
             (None, None)
         }
         GpuMsg::Write { id, offset, bytes } => {
-            let st = staging.get(&id).ok_or(Error::Id(id))?;
-            let data = st.as_slice()[span(st.len(), offset, bytes)?].to_vec();
-            s.write_buffer(id, offset as u64, &data)?;
+            // In chunks, through one CHUNK of frescod memory: copied out of
+            // the slot first (the app may be rewriting it), then to the BO.
+            let st = &staging.get(&id).ok_or(Error::Id(id))?.0;
+            let r = span(st.len(), offset, bytes)?;
+            let mut buf = vec![0u8; CHUNK.min(r.len())];
+            for at in r.clone().step_by(CHUNK) {
+                let n = CHUNK.min(r.end - at);
+                buf[..n].copy_from_slice(&st.as_slice()[at..at + n]);
+                s.write_buffer(id, at as u64, &buf[..n])?;
+            }
             (None, None)
         }
         GpuMsg::Read { id, offset, bytes } => {
-            let st = staging.get_mut(&id).ok_or(Error::Id(id))?;
+            let st = &mut staging.get_mut(&id).ok_or(Error::Id(id))?.0;
             let r = span(st.len(), offset, bytes)?;
-            let mut data = vec![0u8; bytes as usize];
-            s.read_buffer(id, offset as u64, &mut data)?;
-            st.as_mut_slice()[r].copy_from_slice(&data);
+            let mut buf = vec![0u8; CHUNK.min(r.len())];
+            for at in r.clone().step_by(CHUNK) {
+                let n = CHUNK.min(r.end - at);
+                s.read_buffer(id, at as u64, &mut buf[..n])?;
+                st.as_mut_slice()[at..at + n].copy_from_slice(&buf[..n]);
+            }
             (Some(GpuMsg::ReadDone { id }), None)
         }
         GpuMsg::Submit { fence, bytes } => {
