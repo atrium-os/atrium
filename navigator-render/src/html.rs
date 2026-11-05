@@ -187,6 +187,12 @@ struct Cx<'a> {
     /// What is left of this document's share of vector lines
     /// (`path::DOCUMENT_SEGMENT_SHARE`); past it, SVGs keep the bitmap path.
     vector_budget: usize,
+    /// Inside a scroll region: a table in it does not open another (the
+    /// outer one already scrolls it, and the compositor's model is flat).
+    in_scroll: bool,
+    /// The region a box has opened and `block` will close: the attributes
+    /// to restore, its clip, its transform, and the content's x, y, width.
+    scroll_open: Option<(crate::Attrs, u32, u32, (U, U, U))>,
     /// ★ Absolutely positioned boxes whose placement needs the HEIGHT of a
     /// containing block that is still being laid out (`bottom` without
     /// `top`, a percentage `top` or `height`, both offsets with an auto
@@ -362,7 +368,7 @@ fn render_inner(html: &str, fonts: &FontSet, env: &Env, subs: &Subresources, geo
     let mut cx = Cx { dom: &dom, styles: &styled.styles, sh: Shaper::new(fonts), scene: Scene { width: u(env.width_px), ..Default::default() },
                       report: Report::default(), links: vec![], unimplemented: BTreeMap::new(), marker: None, baseline_probe: None, indent: None, iso_paths: vec![vec![]], iso_cur: 0, content_dy: 0, table_part: false, promoted: vec![], boxes: std::env::var_os("NSG_DUMP_BOXES").map(|_| vec![]), geo: None, inl_cur: 0,
                       viewport: (u(env.width_px), Some(u(env.height_px))), pos_cb: (0, 0, u(env.width_px), Some(u(env.height_px))),
-                      subs, placing_abs: false, pending_abs: vec![], deferred_abs: vec![], cb_open: false, canvas_src: None, abs_origin: None, flex_static: None, measured: HashMap::new(), contexts: vec![], hoists: vec![], diagnostics: vec![], vector_budget: crate::path::DOCUMENT_SEGMENT_SHARE };
+                      subs, placing_abs: false, pending_abs: vec![], deferred_abs: vec![], cb_open: false, canvas_src: None, abs_origin: None, flex_static: None, measured: HashMap::new(), contexts: vec![], hoists: vec![], diagnostics: vec![], vector_budget: crate::path::DOCUMENT_SEGMENT_SHARE, in_scroll: false, scroll_open: None };
     if geo { cx.geo = Some(GeoLog { inl_paths: vec![vec![]], ..Default::default() }) }
     cx.promoted = promote_block_in_inline(&dom, &styled.styles);
     cx.count_unread_rows();
@@ -438,7 +444,7 @@ pub fn premeasure_tables_at(html: &str, fonts: &FontSet, env: &Env) -> (String, 
                       report: Report::default(), links: vec![], unimplemented: BTreeMap::new(), marker: None, baseline_probe: None,
                       indent: None, iso_paths: vec![vec![]], iso_cur: 0, content_dy: 0, table_part: false, promoted: vec![], boxes: std::env::var_os("NSG_DUMP_BOXES").map(|_| vec![]), geo: None, inl_cur: 0, viewport: (u(env.width_px), Some(u(env.height_px))),
                       pos_cb: (0, 0, u(env.width_px), Some(u(env.height_px))), subs: &Subresources::new(),
-                      placing_abs: false, pending_abs: vec![], deferred_abs: vec![], cb_open: false, canvas_src: None, abs_origin: None, flex_static: None, measured: HashMap::new(), contexts: vec![], hoists: vec![], diagnostics: vec![], vector_budget: crate::path::DOCUMENT_SEGMENT_SHARE };
+                      placing_abs: false, pending_abs: vec![], deferred_abs: vec![], cb_open: false, canvas_src: None, abs_origin: None, flex_static: None, measured: HashMap::new(), contexts: vec![], hoists: vec![], diagnostics: vec![], vector_budget: crate::path::DOCUMENT_SEGMENT_SHARE, in_scroll: false, scroll_open: None };
     // (table, per-column (min, max), its first row's cells) for every table.
     let mut tables: Vec<(Handle, Vec<(U, U)>, Vec<Handle>)> = vec![];
     for t in 0..dom.nodes.len() as Handle {
@@ -709,9 +715,21 @@ impl<'a> Cx<'a> {
         // origin: WPT's align-content references put "one" on the line of
         // "three", 16 px right of its own `left`.
         let outer = std::mem::take(&mut self.pending_abs);
+        let opened_here = self.scroll_open.is_none();
         let r = self.block_box(h, x, y, cb_w, cb_h, force);
         debug_assert!(self.pending_abs.is_empty(), "a block places its own out-of-flow boxes");
         self.pending_abs = outer;
+        // ★ This box opened a scroll region (`block_box`, a wide table):
+        // close it, now that its height is known.
+        if opened_here {
+            if let Some((saved, clip, xf, (cx, cy, cw))) = self.scroll_open.take() {
+                let c = &mut self.scene.clips[clip as usize];
+                c.3 = (cy + r).min(c.1.saturating_add(c.3)).saturating_sub(c.1).max(0);
+                self.scene.scrolls.push(crate::scroll::Scroll { clip, xform: xf, content: (cx, cy, cw, r) });
+                self.scene.cur = saved;
+                self.in_scroll = false;
+            }
+        }
         r
     }
 
@@ -838,6 +856,31 @@ impl<'a> Cx<'a> {
         let (bx, by) = (bx + rel_dx, by + rel_dy);
         // `abs_box` has already decided where this box goes.
         let (bx, by) = self.abs_origin.take().unwrap_or((bx, by));
+        // ★ A TABLE WIDER THAN ITS CONTAINING BLOCK SCROLLS ON ITS OWN
+        // (backend §4.9 item 4). Its layout does not change: the box, its
+        // border and background and every cell are painted under a clip of
+        // the containing block, moved by a translation the UI owns
+        // (`scroll`), so the rest of the page still fits the window. Not when
+        // something inside makes a clip of its own — clips are page-space and
+        // flat, so an inner one could not move with the content (counted;
+        // the table overflows as before) — and not inside another region,
+        // which already moves it. `block` closes the region.
+        if kw(s, "display") == "table" && !self.in_scroll && force.0.is_none() && !positioned
+            // (an RTL containing block gives way with a NEGATIVE margin-left,
+            // so the box is held against what its non-negative margins leave)
+            && w > cb_w - ml.unwrap_or(0).max(0) - mr.unwrap_or(0).max(0) && !self.table_rows(h).0.is_empty() {
+            if self.subtree_clips(h) {
+                self.count("wide table not scrollable: a clip inside it");
+            } else {
+                let saved = self.scene.cur;
+                let clip = self.scene.clip(x, by, cb_w, U::MAX / 4);
+                let xf = self.scene.xform([XF_ONE, 0, 0, XF_ONE, 0, 0]);
+                self.scene.cur.0 = Some(clip);
+                self.scene.cur.2 = Some(xf);
+                self.in_scroll = true;
+                self.scroll_open = Some((saved, clip, xf, (bx, by, w)));
+            }
+        }
         // A definite height is known BEFORE the children, so they can resolve
         // their own percentages against it.
         let clamp = |v: U| {
@@ -1713,7 +1756,7 @@ impl<'a> Cx<'a> {
         self.scene.paths.truncate(pa); self.scene.path_attrs.truncate(pa); self.vector_budget = vb;
         self.scene.path_fallbacks.retain(|(first, _, _)| *first < pa);
         self.scene.clips.truncate(cl); self.scene.groups.truncate(gr); self.scene.cur = cur;
-        self.scene.xforms.truncate(xf); self.scene.xform_parents.truncate(xf);
+        self.scene.xforms.truncate(xf); self.scene.xform_parents.truncate(xf); self.scene.scrolls.retain(|sc| (sc.xform as usize) < xf);
         // A trial layout must leave no diagnostics behind: the real one
         // re-emits whatever it finds.
         self.diagnostics.truncate(diags);
@@ -2685,6 +2728,22 @@ impl<'a> Cx<'a> {
             }
         }
         cy - y
+    }
+
+    /// Whether `h` or anything in its subtree would make a clip of its own.
+    /// (★ `h` too: a table with `overflow: hidden` clips its own cells, and
+    /// that clip, inside the region, is not the region's viewport — the
+    /// broker refused hi and ru Wikipedia's wide tables for it.)
+    fn subtree_clips(&self, h: Handle) -> bool {
+        let mut stack = vec![h];
+        while let Some(c) = stack.pop() {
+            if let Some(cs) = self.st(c) {
+                if kw(cs, "display") == "none" { continue }
+                if kw(cs, "overflow-x") != "visible" || kw(cs, "overflow-y") != "visible" { return true }
+            }
+            stack.extend(self.dom.element_children(c));
+        }
+        false
     }
 
     /// An item's content size along the main axis (its max-content width in
@@ -5053,7 +5112,7 @@ mod tests {
                           report: Report::default(), links: vec![], unimplemented: BTreeMap::new(), marker: None,
                           baseline_probe: None, indent: None, iso_paths: vec![vec![]], iso_cur: 0, content_dy: 0, table_part: false, promoted: vec![], boxes: std::env::var_os("NSG_DUMP_BOXES").map(|_| vec![]), geo: None, inl_cur: 0,
                           viewport: (0, None), pos_cb: (0, 0, 0, None), subs: &Subresources::new(),
-                          placing_abs: false, pending_abs: vec![], deferred_abs: vec![], cb_open: false, canvas_src: None, abs_origin: None, flex_static: None, measured: HashMap::new(), contexts: vec![], hoists: vec![], diagnostics: vec![], vector_budget: crate::path::DOCUMENT_SEGMENT_SHARE };
+                          placing_abs: false, pending_abs: vec![], deferred_abs: vec![], cb_open: false, canvas_src: None, abs_origin: None, flex_static: None, measured: HashMap::new(), contexts: vec![], hoists: vec![], diagnostics: vec![], vector_budget: crate::path::DOCUMENT_SEGMENT_SHARE, in_scroll: false, scroll_open: None };
         cx.count_rows_outside(&held_out);
         // The non-initial value is counted once; the initial one is not.
         assert_eq!(cx.unimplemented.get("row text-align… (not implemented)"), Some(&1), "{:?}", cx.unimplemented);

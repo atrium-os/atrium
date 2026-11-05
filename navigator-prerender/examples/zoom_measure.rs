@@ -4,7 +4,7 @@
 //! out at each page zoom and each text size, and print one TSV line per
 //! (document, mode, level):
 //!
-//! `stem  mode  level  ms  repro  same100  doc_w_px  doc_h_px  tables  over_min  anchors  kept  clamped  hidden`
+//! `stem  mode  level  ms  repro  same100  doc_w_px  doc_h_px  tables  over_min  anchors  kept  clamped  hidden  regions  refused  valid`
 //!
 //! - `mode`: `page` (layout at 800/zoom x 600/zoom, `Env::zoomed`) or `text`
 //!   (`text_scale_64`);
@@ -23,7 +23,10 @@
 //!   100% layout carried through `navigator_render::anchor`; kept = the
 //!   anchor's element contains the new scroll position at the same fraction;
 //!   clamped = the position was pinned to the document's end; hidden = the
-//!   element is not laid out at the new size (a media query hid it).
+//!   element is not laid out at the new size (a media query hid it);
+//! - `regions`, `refused`, `valid`: wide tables made scroll regions, wide
+//!   tables left overflowing because of a clip inside them, and whether the
+//!   broker's check (`scroll::validate`) passed (1/0).
 //!
 //! With `--tables`, instead one line per document and text level:
 //! `stem  TABLES  level  cols  diff_p50_px  diff_p90_px  diff_max_px  under  over`
@@ -148,9 +151,13 @@ fn main() {
                         let want = g.y + (g.h as i128 * an.frac as i128 / 65536) as i64;
                         if sy != want { clamped += 1 } else if sy >= g.y && sy < g.y + g.h.max(1) { kept += 1 }
                     }
+                    // Scroll regions (item 4), and the broker's check of them.
+                    let regions = o.scene.scrolls.len();
+                    let refused = o.unimplemented.get("wide table not scrollable: a clip inside it").copied().unwrap_or(0);
+                    let valid = navigator_render::scroll::validate(&o.scene).is_ok() as u8;
                     // The horizontal extent: the furthest right edge laid out.
                     let right = geo.elements.values().map(|g| g.x + g.w).max().unwrap_or(0);
-                    println!("{stem}\t{mode}\t{z}\t{ms:.1}\t{}\t{same100}\t{:.0}\t{:.0}\t{}\t{over_min}\t{n}\t{kept}\t{clamped}\t{hidden}",
+                    println!("{stem}\t{mode}\t{z}\t{ms:.1}\t{}\t{same100}\t{:.0}\t{:.0}\t{}\t{over_min}\t{n}\t{kept}\t{clamped}\t{hidden}\t{regions}\t{refused}\t{valid}",
                              (a == b) as u8, right as f64 / 64.0, geo.height as f64 / 64.0, tables.len());
                 }
             }

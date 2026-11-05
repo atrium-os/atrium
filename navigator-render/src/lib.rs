@@ -18,6 +18,7 @@ pub mod fontset;
 pub mod html;
 pub mod nsg;
 pub mod path;
+pub mod scroll;
 #[cfg(feature = "raster")]
 pub mod raster;
 
@@ -168,6 +169,9 @@ pub struct Scene {
     /// (`EV_WINDOW_FILLS_DROPPED`), the UI swaps that SVG's paths for this
     /// image, and swaps back when the report is empty (`path::fallback_for`).
     pub path_fallbacks: Vec<(usize, usize, Image)>,
+    /// ★ Scroll regions (backend §4.9 item 4, `scroll`): a table wider than
+    /// its box scrolls on its own instead of widening the page.
+    pub scrolls: Vec<scroll::Scroll>,
     /// The clip and group a node created now belongs to.
     /// Public only so review tooling can build a scene of one node.
     pub cur: Attrs,

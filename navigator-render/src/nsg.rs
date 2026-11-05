@@ -10,6 +10,9 @@
 //! font f<i> <address> "<name>" <weight>
 //! clip c<i> <x> <y> <w> <h>
 //! group g<i> <alpha> [p<parent>]
+//! scroll c<viewport> x<i>[,<j>…] <content x> <y> <w> <h>
+//!      (a region the UI scrolls: the transforms it moves, its content box at
+//!       offset 0; see `scroll`)
 //! xform x<i> <a> <b> <c> <d> <e> <f>   (a-d in 1/65536, e f in 1/64 px)
 //! rect <x> <y> <w> <h> <rrggbbaa> [r<tl>,<tr>,<br>,<bl>] [b<ring>] [c<i>] [g<i>] [x<i>]
 //! run f<i> <size> <rrggbbaa> <x> <y> <em 0|1> <gid>:<dx>,<dy> … "<text>" [c<i>] [g<i>] [x<i>]
@@ -67,6 +70,13 @@ pub fn write(scene: &Scene, fonts: &FontSet) -> String {
         let _ = write!(o, "group g{i} {}", g.0);
         if let Some(p) = g.1 { let _ = write!(o, " p{p}"); }
         o.push('\n');
+    }
+    // Scroll regions (crate::scroll): written only when there are any, so a
+    // page whose tables fit is byte-identical to NSG without them.
+    for s in &scene.scrolls {
+        let xs: Vec<String> = crate::scroll::moved_xforms(scene, s).iter().map(|x| x.to_string()).collect();
+        let (cx, cy, cw, ch) = s.content;
+        let _ = writeln!(o, "scroll c{} x{} {cx} {cy} {cw} {ch}", s.clip, xs.join(","));
     }
     debug_assert_eq!(scene.rect_attrs.len(), scene.rects.len());
     debug_assert_eq!(scene.run_attrs.len(), scene.runs.len());

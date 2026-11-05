@@ -1393,6 +1393,71 @@ size: 1,952 layouts.
   800/zoom px), before item 4: 9 tables on 6 pages at 100%, 72 on 17 at 200%, and
   220 on 24 at 300%.
 
+*Built (M2: item 4, wide tables).*
+- A table box wider than its containing block becomes a scroll region
+  (`navigator_render::scroll`). Its layout does not change: the box, its border and
+  background, and every cell keep their positions.
+- They are painted under a clip of the containing block (the region's viewport) and
+  under a translation transform that the UI owns. NSG declares it as:
+
+  ```text
+  scroll c<viewport> x<i>[,<j>…] <content x> <y> <w> <h>
+  ```
+
+  The `x` list holds the region's own translation and every transform nested in it.
+  The content box bounds the offset. A right-to-left table, which overflows on the
+  left, scrolls the other way.
+- The worker lays the table out once and never learns the offset. The compositor
+  moves every node under those transforms, along with the own clip of any vector
+  path among them. `scroll::offset_scene` is the model of that, and it clamps the
+  offset to the content box.
+- *The broker's check* (`scroll::validate`, the first scene-graph rule of §4.2 in
+  code) refuses, never clamps:
+  - too many regions;
+  - an index that names nothing;
+  - a region transform that is not a pure translation of its parent;
+  - a transform claimed by two regions;
+  - a negative content size;
+  - ★ any node a region moves that is not clipped to that region's viewport. Moved,
+    it would paint over the rest of the page.
+- *Not scrollable, left overflowing as before, and counted:*
+  - A table that is itself a clip (`overflow` other than `visible`), or that holds
+    one. NSG clips are page-space and flat, so an inner clip could not move with the
+    content.
+  - The first corpus run found this the hard way. hi and ru Wikipedia's tables
+    clip themselves, and the broker refused those regions; the check is what caught
+    it.
+  - A region does not nest: a table inside one is moved by it.
+- *Not built:*
+  - Keeping the first column in view (optional in the request).
+  - Pinch (item 3), whose settle is a page-zoom layout.
+
+*Measured (2026-11-06, the same 1,952 corpus layouts and 56 big-document ones).*
+- Before this change, every table here overflowed its containing block. After it,
+  only the tables refused for a clip still do; the rest scroll on their own:
+
+  | | overflowed before | still overflowing after | scroll on their own |
+  |---|---|---|---|
+  | page zoom 100% | 55 tables, 12 pages | 4 tables, 3 pages | 51 |
+  | page zoom 200% | 64 tables, 11 pages | 9 tables, 5 pages | 55 |
+  | page zoom 300% | 169 tables, 21 pages | 18 tables, 8 pages | 151 |
+  | text size 200% | 133 tables, 24 pages | 9 tables, 7 pages | 124 |
+  | text size 300% | 286 tables, 30 pages | 15 tables, 9 pages | 271 |
+
+- The broker's check passes on every layout: 0 refusals in 2,008.
+- Every layout is still reproducible, 100% is still identical to the plain render,
+  and no anchor is lost.
+- *Pages whose tables fit are byte-identical.* On the 421-document identity set
+  against the build before item 4 (8760ab3d), 373 NSG outputs are identical. All 37
+  that changed gained regions (195 in all).
+  - Stripped of `clip`, `xform` and `scroll` lines and of `c`/`x` attributes, every
+    node in those 37 is identical, so no layout moved.
+  - Two full runs gave identical digests.
+- Conformance row 64 (vertical-align) is five 150 px cells, 2 px wider than their
+  784 px body. Its golden gained a region and the cells' `c0 x0`, and no position
+  changed. 64/64 still match.
+- The zoom step is unchanged: corpus p50 21.6–23.3 ms, p90 140–154 ms.
+
 ## 5. The store is Tessera
 
 `atrium-doc://<hash>` *is* a content address in the root filesystem's CAS. This is what
