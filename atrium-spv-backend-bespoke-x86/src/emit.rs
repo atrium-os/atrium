@@ -132,10 +132,58 @@ pub(crate) fn emit(vc: &VCode, alloc: &Allocation) -> Result<(Vec<u8>, Vec<(u32,
 
     let mut marks: Vec<(usize, u32)> = Vec::new();
     let insts = &vc.insts;
+    let mut use_count = vec![0u32; vc.classes.len()];
+    let mut tmp = Vec::new();
+    for inst in insts {
+        tmp.clear();
+        inst.uses(&mut tmp);
+        for v in &tmp {
+            use_count[v.0 as usize] += 1;
+        }
+    }
+    let mut fused: Vec<usize> = Vec::new();
+    let mut skip_to = 0usize;
     for (i, inst) in insts.iter().enumerate() {
+        if skip_to > i {
+            continue;
+        }
         if let MInst::Mark(s) = inst {
             marks.push((e.a.instructions().len(), *s));
             continue;
+        }
+        if fused.contains(&i) {
+            continue;
+        }
+        // A compare whose only use is the branch or select right after it
+        // sets the flags for that consumer directly (no setcc + test).
+        if let Some(cc) = fused_cc(inst) {
+            let mut j = i + 1;
+            while matches!(insts.get(j), Some(MInst::Mark(_))) {
+                j += 1;
+            }
+            let d = match inst {
+                MInst::GCmp { d, .. } | MInst::FCmp { d, .. } => *d,
+                _ => unreachable!(),
+            };
+            let consumer = match insts.get(j) {
+                Some(MInst::Br { c, .. }) | Some(MInst::GSelect { c, .. }) if *c == d && use_count[d.0 as usize] == 1 => {
+                    Some(&insts[j])
+                }
+                _ => None,
+            };
+            if let Some(cons) = consumer {
+                e.cmp_flags(inst)?;
+                // Marks between the two keep their place.
+                for m in &insts[i + 1..j] {
+                    if let MInst::Mark(s) = m {
+                        marks.push((e.a.instructions().len(), *s));
+                    }
+                }
+                e.fused(cc, cons, next_label(insts, j + 1))?;
+                fused.push(j);
+                skip_to = j + 1;
+                continue;
+            }
         }
         let next = next_label(insts, i + 1);
         e.inst(inst, next)?;
@@ -155,6 +203,70 @@ pub(crate) fn emit(vc: &VCode, alloc: &Allocation) -> Result<(Vec<u8>, Vec<(u32,
 }
 
 /// The label placed right after position `i`, if only markers come first.
+/// A single x86 condition code.
+#[derive(Clone, Copy)]
+enum Cc {
+    E,
+    Ne,
+    B,
+    Be,
+    A,
+    Ae,
+    L,
+    Le,
+    G,
+    Ge,
+}
+
+impl Cc {
+    fn inv(self) -> Cc {
+        use Cc::*;
+        match self {
+            E => Ne,
+            Ne => E,
+            B => Ae,
+            Ae => B,
+            Be => A,
+            A => Be,
+            L => Ge,
+            Ge => L,
+            Le => G,
+            G => Le,
+        }
+    }
+}
+
+/// The condition a compare's result equals after [`Emit::cmp_flags`], if
+/// one x86 condition code expresses it (ordered == and unordered != need
+/// the parity flag as well, so they don't fuse).
+fn fused_cc(inst: &MInst) -> Option<Cc> {
+    use FCond::*;
+    Some(match inst {
+        MInst::GCmp { cc, .. } => match cc {
+            ICond::Eq => Cc::E,
+            ICond::Ne => Cc::Ne,
+            ICond::Ult => Cc::B,
+            ICond::Ule => Cc::Be,
+            ICond::Ugt => Cc::A,
+            ICond::Uge => Cc::Ae,
+            ICond::Slt => Cc::L,
+            ICond::Sle => Cc::Le,
+            ICond::Sgt => Cc::G,
+            ICond::Sge => Cc::Ge,
+        },
+        MInst::FCmp { cc, .. } => match cc {
+            OrdEq | UnordNe => return None,
+            OrdNe => Cc::Ne,
+            OrdLt | OrdGt => Cc::A,
+            OrdLe | OrdGe => Cc::Ae,
+            UnordEq => Cc::E,
+            UnordLt | UnordGt => Cc::B,
+            UnordLe | UnordGe => Cc::Be,
+        },
+        _ => return None,
+    })
+}
+
 fn next_label(insts: &[MInst], mut i: usize) -> Option<Label> {
     while i < insts.len() {
         match &insts[i] {
@@ -730,6 +842,101 @@ impl<'a> Emit<'a> {
                 }
                 self.a.je(self.label(*t)).map_err(enc)?;
             }
+        }
+        Ok(())
+    }
+
+    /// The flag-setting half of a GCmp/FCmp (see [`fused_cc`]).
+    fn cmp_flags(&mut self, inst: &MInst) -> Result<(), BackendError> {
+        use FCond::*;
+        match inst {
+            MInst::GCmp { a, b, .. } => {
+                let ra = self.g_reg(*a, eax)?;
+                g2!(self.a, cmp, ra, self.g(*b))
+            }
+            MInst::FCmp { cc, a, b, .. } => {
+                let (x, y) = match cc {
+                    OrdLt | OrdLe | UnordGt | UnordGe => (*b, *a),
+                    _ => (*a, *b),
+                };
+                let rx = self.x_reg(x, XS0)?;
+                match self.x_ss(y) {
+                    X::R(r) => self.a.vucomiss(rx, r).map_err(enc),
+                    X::M(m) => self.a.vucomiss(rx, m).map_err(enc),
+                }
+            }
+            _ => unreachable!(),
+        }
+    }
+
+    fn jcc(&mut self, cc: Cc, l: Label) -> Result<(), BackendError> {
+        let t = self.label(l);
+        let a = &mut self.a;
+        match cc {
+            Cc::E => a.je(t),
+            Cc::Ne => a.jne(t),
+            Cc::B => a.jb(t),
+            Cc::Be => a.jbe(t),
+            Cc::A => a.ja(t),
+            Cc::Ae => a.jae(t),
+            Cc::L => a.jl(t),
+            Cc::Le => a.jle(t),
+            Cc::G => a.jg(t),
+            Cc::Ge => a.jge(t),
+        }
+        .map_err(enc)
+    }
+
+    fn cmovcc(&mut self, cc: Cc, d: AsmRegister32, s: G) -> Result<(), BackendError> {
+        macro_rules! go {
+            ($m:ident) => {
+                g2!(self.a, $m, d, s)
+            };
+        }
+        match cc {
+            Cc::E => go!(cmove),
+            Cc::Ne => go!(cmovne),
+            Cc::B => go!(cmovb),
+            Cc::Be => go!(cmovbe),
+            Cc::A => go!(cmova),
+            Cc::Ae => go!(cmovae),
+            Cc::L => go!(cmovl),
+            Cc::Le => go!(cmovle),
+            Cc::G => go!(cmovg),
+            Cc::Ge => go!(cmovge),
+        }
+    }
+
+    /// A Br or GSelect consuming flags that hold `cc`.
+    fn fused(&mut self, cc: Cc, cons: &MInst, next: Option<Label>) -> Result<(), BackendError> {
+        match cons {
+            MInst::Br { t, f, .. } => {
+                if t == f {
+                    if next != Some(*t) {
+                        self.a.jmp(self.label(*t)).map_err(enc)?;
+                    }
+                } else if next == Some(*f) {
+                    self.jcc(cc, *t)?;
+                } else if next == Some(*t) {
+                    self.jcc(cc.inv(), *f)?;
+                } else {
+                    self.jcc(cc, *t)?;
+                    self.a.jmp(self.label(*f)).map_err(enc)?;
+                }
+            }
+            MInst::GSelect { d, t, f, .. } => {
+                let rd = self.g_dst(*d);
+                if self.g(*t).reg() == Some(rd) {
+                    self.cmovcc(cc.inv(), rd, self.g(*f))?;
+                } else {
+                    if self.g(*f).reg() != Some(rd) {
+                        g2!(self.a, mov, rd, self.g(*f))?; // mov keeps the flags
+                    }
+                    self.cmovcc(cc, rd, self.g(*t))?;
+                }
+                self.g_fin(*d, rd)?;
+            }
+            _ => unreachable!(),
         }
         Ok(())
     }

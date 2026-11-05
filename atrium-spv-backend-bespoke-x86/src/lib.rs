@@ -217,6 +217,7 @@ fn emit_function(func: &Function) -> Result<(Vec<u8>, Vec<(u32, u32)>), BackendE
     let mut vc = vcode::lower(func)?;
     vcode::thread_jumps(&mut vc);
     vcode::dce(&mut vc);
+    vcode::sink_compares(&mut vc);
     let al = regalloc::allocate(&vc);
     let (code, pcs) = emit::emit(&vc, &al)?;
     if cfg!(debug_assertions) {

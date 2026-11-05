@@ -985,33 +985,37 @@ impl<'f> Lower<'f> {
             }
             moves.extend(dst.into_iter().zip(src));
         }
-        let dsts: HashSet<VReg> = moves.iter().map(|m| m.0).collect();
-        let overlap = moves.iter().any(|(d, s)| d != s && dsts.contains(s));
         let mv = |d: VReg, s: VReg, c: Class| match c {
             Class::X => MInst::XMov { d, s },
             Class::G => MInst::GMov { d, s },
             Class::P => MInst::PMov { d, s },
         };
-        if overlap {
-            let mut temps = Vec::new();
-            for &(_, s) in &moves {
-                let c = self.class_of(s);
-                let t = self.vreg(c);
-                self.hints.insert(t, s);
-                self.code.push(mv(t, s, c));
-                temps.push(t);
-            }
-            for (k, &(d, _)) in moves.iter().enumerate() {
-                let c = self.class_of(d);
-                self.hints.entry(d).or_insert(temps[k]);
-                self.code.push(mv(d, temps[k], c));
-            }
-        } else {
-            for &(d, s) in &moves {
-                if d != s {
+        // Sequentialise the parallel copy: emit a move once nothing still
+        // pending reads its destination; break a cycle by saving one
+        // destination's old value in a temporary.
+        let mut pending: Vec<(VReg, VReg)> = moves.into_iter().filter(|(d, s)| d != s).collect();
+        while !pending.is_empty() {
+            let ready = pending
+                .iter()
+                .position(|&(d, _)| !pending.iter().any(|&(_, s)| s == d));
+            match ready {
+                Some(k) => {
+                    let (d, s) = pending.remove(k);
                     let c = self.class_of(d);
                     self.hints.entry(d).or_insert(s);
                     self.code.push(mv(d, s, c));
+                }
+                None => {
+                    let d = pending[0].0;
+                    let c = self.class_of(d);
+                    let t = self.vreg(c);
+                    self.hints.insert(t, d);
+                    self.code.push(mv(t, d, c));
+                    for m in pending.iter_mut() {
+                        if m.1 == d {
+                            m.1 = t;
+                        }
+                    }
                 }
             }
         }
@@ -2071,5 +2075,51 @@ pub(crate) fn dce(vc: &mut VCode) {
         if vc.insts.len() == before {
             break;
         }
+    }
+}
+
+/// Move each compare whose only use is a later Br or GSelect in the same
+/// block to just before that use, so the emitter can fuse the two (flags
+/// straight into jcc/cmovcc). Safe because a block body never redefines a
+/// vreg: phi copies sit at the very end of a block, after its last use.
+pub(crate) fn sink_compares(vc: &mut VCode) {
+    let mut use_count = vec![0u32; vc.classes.len()];
+    let mut tmp = Vec::new();
+    for inst in &vc.insts {
+        tmp.clear();
+        inst.uses(&mut tmp);
+        for v in &tmp {
+            use_count[v.0 as usize] += 1;
+        }
+    }
+    let mut i = 0;
+    while i < vc.insts.len() {
+        let d = match &vc.insts[i] {
+            MInst::GCmp { d, .. } | MInst::FCmp { d, .. } if use_count[d.0 as usize] == 1 => *d,
+            _ => {
+                i += 1;
+                continue;
+            }
+        };
+        let mut j = i + 1;
+        let mut target = None;
+        while j < vc.insts.len() {
+            match &vc.insts[j] {
+                MInst::Br { c, .. } | MInst::GSelect { c, .. } if *c == d => {
+                    target = Some(j);
+                    break;
+                }
+                MInst::Label(_) | MInst::Jmp(_) | MInst::Br { .. } | MInst::CaseEq { .. } | MInst::Ret => break,
+                _ => j += 1,
+            }
+        }
+        if let Some(j) = target {
+            if j > i + 1 {
+                let c = vc.insts.remove(i);
+                vc.insts.insert(j - 1, c);
+                continue; // re-examine the instruction now at i
+            }
+        }
+        i += 1;
     }
 }
