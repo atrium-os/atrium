@@ -201,6 +201,35 @@ bandwidth limits — §8).
   fds, no implicit padding). Until it lands, `atrium-gpu-amd/atrium_display_abi.h`
   is the intermediate surface.
 
+### 7.2 v2.1 modes, EDID and hotplug (implemented 2026-11-05)
+
+- **Generic above, physical below.** EDID and CTA-861 parsing
+  (`atrium-display/edid.c`) and the sink probe (`sink.c`) are shared by
+  every display driver. A driver supplies four hooks in
+  `struct atrium_display_hw_ops` (`display_hw.h`): `sense` (is a monitor
+  there), `read_edid_block` (DDC/I2C, or DP AUX on DisplayPort),
+  `program_timing` (its CRTC/OTG registers) and `hpd_rearm` (its
+  hotplug interrupt). The AMD module implements them for DCN; another
+  vendor's module implements the same four.
+- **Mode list.** `ATRIUM_DISPLAY_IOC_CONNECTOR` returns the raw EDID (up to
+  512 bytes: base + one extension), every mode it describes (detailed
+  timings, then CTA Video Data Block VICs, preferred first, duplicates and
+  interlaced dropped; at most 16) and a connector generation.
+- **Any mode.** A commit's `mode_index` may name any listed mode; the module
+  programs that mode's timing. An index past the list is `EINVAL`. A nonzero
+  `mode_generation` that is not the current one is `ESTALE`, so a commit
+  built for a monitor that has since been swapped is refused instead of
+  lighting the wrong timing on the new one.
+- **Hotplug.** The HPD interrupt bumps the generation, drops the cached sink
+  and posts `ATRIUM_DISPLAY_NOTE_HOTPLUG` through kqueue (`data` = new
+  generation). A registration that names notes in `fflags` hears only those.
+- **Policy above the kernel.** frescod lists the modes to the WM
+  (`OP_WM_DISPLAY_MODES`), switches on `OP_WM_SET_DISPLAY_MODE` or a
+  hotplug (same monitor back: keep its mode; a different monitor: its
+  preferred mode or `FRESCOD_MODE`), and broadcasts `EV_DISPLAY_CHANGED`,
+  on which forum-wm re-lays out. `forum-ctl modes` / `forum-ctl mode WxH[@Hz]`
+  drive it by hand.
+
 ## 8. The output topology — connectors, encoders, PHYs (HDMI / DP / USB-C)
 
 "How does the driver detect and redirect output to HDMI vs DisplayPort vs

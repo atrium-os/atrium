@@ -215,6 +215,15 @@ out-syncobj when the buffer is on screen and the previous one is free; the
 node is exclusive; the last frame holds across close; a second outstanding
 commit is EBUSY. Pacing is by flip-done.
 
+Display 2.1 adds modes and hotplug: `CONNECTOR` returns the EDID and every
+mode it lists (CTA-861 extensions included), a commit may light any of them
+(`mode_index`, guarded by `mode_generation`), and `NOTE_HOTPLUG` reports a
+monitor change. The EDID parser is generic (`atrium-display/`); each driver
+supplies only the physical hooks (EDID read over DDC or DP AUX, timing
+registers, HPD). frescod switches mode when the WM asks or a monitor
+changes and tells clients with `EV_DISPLAY_CHANGED`; forum-wm re-lays out.
+Spec: [atrium-display-architecture.md §7.2](spec/atrium-display-architecture.md).
+
 ## 6. Userspace bindings and protocols
 
 - **`atrium-gpu-rs`**: Rust binding. `atrium_gpu::amd::{Gpu, Vm, Bo, Syncobj,
@@ -320,8 +329,10 @@ Tier-2 or our RDNA4 compiler. Mesa appears in three places only:
   step; the driver stays experimental until `test_gpu_isolation` passes there.
 - **Modeset is gpusim-shaped.** Since D4 the display module scans out and
   flips through the real DCN 4.0.1 HUBP/OTG registers and takes its
-  interrupts by real IH source ids, but modeset, connector detection and EDID
-  are still gpusim's `regDISP_*`. Nothing has driven a real monitor yet (D5;
+  interrupts by real IH source ids, and since 2.1 programs mode timing on the
+  OTG and takes hotplug from the DCN HPD block, but EDID is still read
+  through gpusim's `regDISP_*` DDC window (silicon needs the DCN DDC/AUX
+  engine). Nothing has driven a real monitor yet (D5;
   the R9700 has none attached; D5 step 1 inherits the GOP mode instead).
 - **gpusim has no graphics pipeline.** Its RDNA4 core is compute-only, so a
   graphics-pipeline (NGG/raster/blend) backend has nothing to run on yet.

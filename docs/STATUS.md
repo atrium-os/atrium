@@ -107,6 +107,7 @@ compute route chosen; security conditions F1–F6 in
 | Flip on the in-fence signal (the display watches its in-fence syncobj; a failed render drops the commit and fails its out-fence) | done; fenced async flips land 8–11 ms after the signal in the VM, before they waited for vblank (18 ms) | `c613251` |
 | Recovery from a device reset: `NOTE_RESET` kqueue event + `STATUS_CONTENT_LOST` (GPU ABI v2.1 §10.3); frescod re-presents at once, gpu renderer falls back to Tier-2 for 5 s | done; screen back within 2 s on both renderers in the VM (black without frescod) | `7cc2939`, `6e2b92d` |
 | D4 real DCN 4.0.1 scanout/flip/vblank registers in gpusim + display kmod (modeset still `regDISP_*`) | done; display tests, `atrium_gpu_test`, `test_gpu_isolation`, jailed frescod pass on gpusim | gpusim `3f37036`, `e3b0658` |
+| Modes, EDID and hotplug (display 2.1): shared EDID/CTA-861 parser + per-driver hooks (`atrium-display/`), any listed mode via OTG timing, `NOTE_HOTPLUG`; frescod switches mode on a WM request or hotplug, forum-wm re-lays out, `forum-ctl mode WxH[@Hz]` | done on gpusim; `display_modes` 7/7 in the VM | gpusim `a140c6a`, `192a47a`; atrium `aeca87e` and after |
 | D5 silicon display (inherit GOP mode first) | not started (needs native boot on the R9700; it has no monitor) | — |
 
 Slice detail: [spec/fresco-f4-split.md](spec/fresco-f4-split.md). The whole display stack as it stands: [GRAPHICS-STACK.md](GRAPHICS-STACK.md). Screenshots
