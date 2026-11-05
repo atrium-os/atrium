@@ -205,8 +205,11 @@ user credential (passcode, biometric, recovery key)        — Vestibulum
     root key is sealed to it, and keys of class *device-bound* (DBSC, optionally passkeys)
     are generated in it and never leave it. The TPM's dictionary-attack lockout limits
     passcode guessing on a stolen disk.
-  - *No TPM:* the root key comes from the passcode through Argon2id alone. That's weaker
-    against a stolen disk, and the UI says so.
+  - *No TPM* (the dev VM, some laptops): allowed. The root key comes from the passcode
+    through Argon2id alone, at a high cost setting. That's weaker against a stolen disk,
+    and setup says so.
+  - *Optional FIDO2 key:* a user can mix an `hmac-secret` answer from a hardware key into
+    the root key, so unlocking needs the key as well as the passcode.
   - *macOS host adapter:* the Secure Enclave and the Keychain, through vestibulum-macos.
     Its keystore today keeps `master.key` in clear at mode 0600 (`keystore.rs` header). That
     is a known gap, and Arca's Phase A closes it.
@@ -220,7 +223,7 @@ user credential (passcode, biometric, recovery key)        — Vestibulum
 
 | class | usable | default for |
 |---|---|---|
-| after-first-unlock | from the first unlock after boot until shutdown, including while the screen is locked | cookies, tokens, push keys: so background refresh and push work while locked |
+| after-first-unlock | from the first unlock after boot until shutdown, including while the screen is locked | cookies, tokens, push keys: so push and the refresh of **pages already open** work while locked. A navigation that starts while locked gets no cookies |
 | while-unlocked | only while the session is unlocked; the key is evicted at lock | passwords, refresh tokens, API keys |
 | verify-each-use | each use passes a Vestibulum check (biometric or passcode) | revealing a password, exporting, passkey assertions with user verification, high-value items the user marks |
 
@@ -283,13 +286,21 @@ This is threat model §6 restated on Arca. Nothing in it is a Navigator-only mec
   design. `HttpOnly` cookies never leave Arca and its couriers. Writes go to Arca through
   the same validation.
 
-### 8.2 Partitioning and SameSite
+### 8.2 Partitioning, SameSite and tickets
 
 These are as in threat model §6.3: no third-party cookies, `SameSite=Lax` by default, and
-first-party IdP cookies at the IdP. Arca needs to know a navigation's initiator site and
-whether a user gesture started it. **The broker supplies that context, not the page.** Arca
-attaches it to the courier's channel for that navigation, so a compromised converter can't
-claim a same-site context.
+first-party IdP cookies at the IdP.
+
+**Tickets.** Arca needs to know why a request is made. **The broker says so, not the
+page.** For each credentialed request, the broker gives Arca a ticket naming:
+- the reason: a navigation, a subresource or a form submission;
+- the SameSite context: the initiator site and the target;
+- whether a user gesture started it.
+
+The courier redeems the ticket with the origin it actually reached over verified TLS. Arca
+releases the `Cookie` value and any slot values only when the ticket, the courier's label
+and the item's recipient all agree, over `https`. A compromised converter can't claim a
+same-site context or a gesture, because it never holds a ticket.
 
 ### 8.3 Passwords
 
@@ -301,8 +312,11 @@ claim a same-site context.
   - the origin is exactly the item's recipient;
   - the action is same-origin and `https`;
   - the broker has stamped a user gesture.
+- **Echoes.** If the site echoes the submitted password back in its response, the courier
+  replaces it with bullets before the body goes on to the converter.
 - **Saving.** After a login succeeds, Arca's trusted UI offers to save. Generated passwords
-  are created inside Arca.
+  are created inside Arca and are never shown or copied unless the user reveals them with
+  verification.
 - **Filling** happens only on a user gesture, on the trusted fill chip. It is refused on
   `http:`, on a confusable host, and in a tier-4 island unless the user confirms.
 
@@ -391,11 +405,13 @@ each step.
    daemon, makes both smaller.
 2. **Bearer secrets default to courier-attached; app-held only by user grant.** *Recommend
    yes.* It's the only way "only the intended recipient" survives an app compromise.
-3. **Cookies are after-first-unlock, so background refresh and push work while locked;
-   passwords are while-unlocked.** *Recommend yes,* as iOS does.
+3. **Cookies stay usable while the screen is locked, but only for pages already open;
+   passwords are while-unlocked.** *Recommend yes,* close to what iOS does.
 4. **`document.cookie` exposes non-`HttpOnly` cookies to the origin's own script** (§8.1).
    *Recommend yes;* refusing it breaks many sites for no gain, since those cookies are
    script-readable by design.
-5. **TPM sealing where present, with a visible "weaker without TPM" notice.** *Recommend
-   yes.*
-6. **The name Arca.**
+5. **TPM sealing where present. Devices without one, such as the dev VM, are allowed, with
+   a warning at setup and a high Argon2id cost.** *Recommend yes.*
+6. **Passwords ship together with passkeys (phase A3 and A4 together), with passkeys
+   offered first in the UI.** *Recommend yes;* most sites still need passwords.
+7. **The name Arca.** If agreed, it goes into `docs/NAMING.md`.

@@ -34,6 +34,7 @@ Canonical vocabulary for the Atrium platform. Every component in this table has 
 | **Embed broker** | **Limen** | threshold, doorway | mediates cross-jail Fresco surface composition (Insula's iframe replacement); typed embed roles, capability-gated launch |
 | **Push broker** | **Tabellarius** | Roman courier / letter-carrier | device-wide push relay; decrypts remote pushes, delivers via Aqueduct to target Insula app |
 | **Wallet** | **Loculus** | small carried purse / box for valuables | user-curated data items (addresses, payment methods, profiles); powerbox autofill — apps see only items the user picked |
+| **Secret store** *(proposed 2026-11-05)* | **Arca** | strongbox | the one system store for every secret: keys (used, never released), passwords, cookies, tokens; bearer secrets reach only their bound server through a courier. See `docs/spec/arca.md` |
 | **Peer broker** | **Concursus** | a coming-together | symmetric device-to-device channel broker; STUN/TURN-equivalent + signaling + typed role messages |
 | **Name resolver** | **Nomenclator** | the Roman servant who whispered names to his master | resolves `atrium-doc://` / `atrium-app://` names through publisher manifests to content hashes |
 | **IDE (reference dev environment)** | **Artifex** | skilled artisan / maker — "one who makes," paired with Opifex (the maker of packages) | reference Insula IDE — native Pergola app, Limen-extension model, LSP/DAP host, Stoa-embedded terminal; flagship demonstrator of the no-Electron pitch (§10.9 of insula spec) |
