@@ -172,6 +172,44 @@
 #define regDISP_FLIP_DONE_COUNT	0x30090	/* r: flips that reached the screen */
 #define regDISP_SCANOUT_BASE_LO	0x30094	/* r: VRAM base of the FB on screen now (lo/hi) */
 #define regDISP_SCANOUT_BASE_HI	0x30098
+
+/*
+ * The real DCN 4 (DCN 4.0.1, RDNA4) display registers the scanout path uses,
+ * pipe 0 (Fresco D4). Offsets are hardware dword offsets in DCN segment 2 and
+ * fields are from AMD's MIT-licensed dcn_4_1_0_offset.h / _sh_mask.h. A
+ * register's MMIO byte address is (segment base + offset) * 4. gpusim places
+ * segment 2 at byte 0x60000 of its register BAR, as it places GC and OSS; on
+ * the R9700 IP discovery gives DMU 4.0.1 segment bases 0x12, 0xc0, 0x34c0,
+ * 0x9000, 0x2403c00 (dwords), so on silicon (D5) DCN_SEG2_BYTES comes from IP
+ * discovery: 0x34c0 * 4. What is left on the SIM registers above: the mode
+ * set (OTG timing, OPP, DIG and PHY are not modelled), EDID/DDC, link
+ * training, MST and power, the referee's fault code, and the test hooks.
+ */
+#define DCN_SEG2_BYTES		0x60000u	/* gpusim; silicon: IP discovery */
+#define regDCN2(d)		(DCN_SEG2_BYTES + (d) * 4u)
+#define regHUBP0_DCSURF_SURFACE_CONFIG		regDCN2(0x05e5)
+#define regHUBP0_DCSURF_TILING_CONFIG		regDCN2(0x05e7)
+#define regHUBPREQ0_DCSURF_SURFACE_PITCH	regDCN2(0x0607)
+#define regHUBPREQ0_DCSURF_PRIMARY_SURFACE_ADDRESS	regDCN2(0x060a)
+#define regHUBPREQ0_DCSURF_PRIMARY_SURFACE_ADDRESS_HIGH	regDCN2(0x060b)
+#define regHUBPREQ0_DCSURF_FLIP_CONTROL		regDCN2(0x0613)
+#define regHUBPREQ0_DCSURF_SURFACE_FLIP_INTERRUPT	regDCN2(0x0617)
+#define regOTG0_OTG_STATUS_FRAME_COUNT		regDCN2(0x1b4d)
+#define regOTG0_OTG_VERTICAL_INTERRUPT0_POSITION	regDCN2(0x1b5f)
+#define regOTG0_OTG_VERTICAL_INTERRUPT0_CONTROL	regDCN2(0x1b60)
+
+#define DCN_PIXEL_FORMAT_ARGB8888	8u	/* SURFACE_CONFIG.SURFACE_PIXEL_FORMAT */
+#define DCN_SW_MODE_LINEAR		0u	/* TILING_CONFIG.SW_MODE */
+#define DCN_PITCH_MASK			0xffffu	/* SURFACE_PITCH.PITCH: pixels - 1 */
+#define DCN_ADDRESS_HIGH_MASK		0xffffu
+#define DCN_SURFACE_UPDATE_LOCK		(1u << 0)	/* FLIP_CONTROL */
+#define DCN_SURFACE_FLIP_TYPE		(1u << 1)	/* 0 vsync, 1 immediate */
+#define DCN_SURFACE_FLIP_PENDING	(1u << 8)
+#define DCN_SURFACE_FLIP_INT_MASK	(1u << 0)	/* SURFACE_FLIP_INTERRUPT: enable */
+#define DCN_SURFACE_FLIP_CLEAR		(1u << 8)
+#define DCN_OTG_FRAME_COUNT_MASK	0x00ffffffu
+#define DCN_VINT0_INT_ENABLE		(1u << 8)	/* VERTICAL_INTERRUPT0_CONTROL */
+#define DCN_VINT0_CLEAR			(1u << 20)
 #define ATRIUM_AMD_EDID_LEN	128
 
 /*
@@ -671,7 +709,10 @@ struct atrium_amd_softc {
 	} display_on_screen, display_next;
 	int		 display_next_state;	/* 0 none, 1 waiting on in-fence, 2 flipped */
 	int		 display_next_vsync;
-	uint64_t	 display_next_flips;	/* FLIP_DONE_COUNT that means "landed" */
+	uint64_t	 display_flips_landed;	/* commits that reached the screen */
+	uint32_t	 display_width;		/* the mode's width, for a packed pitch */
+	uint32_t	 display_frame_raw;	/* last OTG_STATUS_FRAME_COUNT read */
+	uint64_t	 display_frames;	/* frames, widened past the 24-bit counter */
 	struct file	*display_in_fp;		/* in-fence syncobj (held ref) */
 	struct atrium_amd_syncobj *display_in_so;
 	uint64_t	 display_in_value;

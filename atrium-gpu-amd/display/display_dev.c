@@ -134,20 +134,6 @@ display_modes(struct atrium_amd_softc *sc, struct atrium_display_modes *out)
 	}
 }
 
-/*
- * Program FB_BASE/FB_SIZE from an exported scanout {vram_offset, size}. The
- * display reads VRAM by offset, so the base IS the offset — no BO lookup. The
- * referee enforces residency (FbNotResident if no VRAM BO covers it) and bounds
- * (FbTooSmall), surfaced through regDISP_FAULT.
- */
-static void
-display_program_fb(struct atrium_amd_softc *sc, uint64_t base, uint64_t size)
-{
-	amd_mmio_write32(sc, regDISP_FB_BASE_LO, (uint32_t)base);
-	amd_mmio_write32(sc, regDISP_FB_BASE_HI, (uint32_t)(base >> 32));
-	amd_mmio_write32(sc, regDISP_FB_SIZE, (uint32_t)size);
-}
-
 /* --- cdev ioctl dispatch -------------------------------------------------- */
 
 /* --- commit state machine (display ABI v2) ------------------------------- */
@@ -189,13 +175,85 @@ display_drain(struct atrium_amd_softc *sc, struct thread *td)
 		fdrop(fps[i], td);
 }
 
+/*
+ * Program HUBP0 to scan out `fb`, under SURFACE_UPDATE_LOCK: the address write
+ * that would otherwise request a flip is held until display_unlock(). The
+ * surface address is the BO's VRAM offset (the display reads VRAM by offset;
+ * the referee checks residency and bounds and reports through regDISP_FAULT).
+ * XRGB8888 linear is DCN's 32 bpp ARGB8888, linear swizzle, alpha plane off.
+ */
 static void
 display_program_surface(struct atrium_amd_softc *sc,
-    const struct atrium_amd_display_fb *fb)
+    const struct atrium_amd_display_fb *fb, int vsync)
 {
-	display_program_fb(sc, fb->vram_offset, fb->size);
-	amd_mmio_write32(sc, regDISP_FB_PITCH, fb->pitch);
-	amd_mmio_write32(sc, regDISP_FB_FORMAT, fb->format);
+	uint32_t pitch = fb->pitch != 0 ? fb->pitch : sc->display_width * 4;
+	uint32_t type = vsync ? 0 : DCN_SURFACE_FLIP_TYPE;
+
+	amd_mmio_write32(sc, regHUBPREQ0_DCSURF_FLIP_CONTROL,
+	    DCN_SURFACE_UPDATE_LOCK | type);
+	amd_mmio_write32(sc, regHUBP0_DCSURF_SURFACE_CONFIG,
+	    DCN_PIXEL_FORMAT_ARGB8888);
+	amd_mmio_write32(sc, regHUBP0_DCSURF_TILING_CONFIG, DCN_SW_MODE_LINEAR);
+	amd_mmio_write32(sc, regHUBPREQ0_DCSURF_SURFACE_PITCH,
+	    pitch >= 4 ? (pitch / 4 - 1) & DCN_PITCH_MASK : 0);
+	amd_mmio_write32(sc, regHUBPREQ0_DCSURF_PRIMARY_SURFACE_ADDRESS_HIGH,
+	    (uint32_t)(fb->vram_offset >> 32) & DCN_ADDRESS_HIGH_MASK);
+	amd_mmio_write32(sc, regHUBPREQ0_DCSURF_PRIMARY_SURFACE_ADDRESS,
+	    (uint32_t)fb->vram_offset);
+}
+
+/* Release SURFACE_UPDATE_LOCK: a held surface update becomes a flip, at
+ * vsync or at once as display_program_surface chose. */
+static void
+display_unlock(struct atrium_amd_softc *sc, int vsync)
+{
+	amd_mmio_write32(sc, regHUBPREQ0_DCSURF_FLIP_CONTROL,
+	    vsync ? 0 : DCN_SURFACE_FLIP_TYPE);
+}
+
+/* Arm (or disarm) OTG0's vertical interrupt 0, our per-frame interrupt, and
+ * HUBP0's flip interrupt; both acknowledge anything latched. */
+static void
+display_irqs(struct atrium_amd_softc *sc, int vblank, int flip)
+{
+	amd_mmio_write32(sc, regOTG0_OTG_VERTICAL_INTERRUPT0_CONTROL,
+	    DCN_VINT0_CLEAR | (vblank ? DCN_VINT0_INT_ENABLE : 0));
+	amd_mmio_write32(sc, regHUBPREQ0_DCSURF_SURFACE_FLIP_INTERRUPT,
+	    DCN_SURFACE_FLIP_CLEAR | (flip ? DCN_SURFACE_FLIP_INT_MASK : 0));
+}
+
+/* Frames since attach: OTG_STATUS_FRAME_COUNT is 24 bits, widened here. */
+static uint64_t
+display_frames(struct atrium_amd_softc *sc)
+{
+	uint32_t raw = amd_mmio_read32(sc, regOTG0_OTG_STATUS_FRAME_COUNT) &
+	    DCN_OTG_FRAME_COUNT_MASK;
+
+	sc->display_frames += (raw - sc->display_frame_raw) &
+	    DCN_OTG_FRAME_COUNT_MASK;
+	sc->display_frame_raw = raw;
+	return (sc->display_frames);
+}
+
+/*
+ * The OTG frame counter restarts when the timing generator is (re)enabled: on
+ * a mode set and across an FLR. Bank the frames counted so far, then take the
+ * restarted value as the new base, so the counter userland sees stays
+ * monotonic and does not jump by 2^24 at each restart.
+ */
+static void
+display_frames_rebase(struct atrium_amd_softc *sc)
+{
+	sc->display_frame_raw = amd_mmio_read32(sc,
+	    regOTG0_OTG_STATUS_FRAME_COUNT) & DCN_OTG_FRAME_COUNT_MASK;
+}
+
+static void
+display_set_mode(struct atrium_amd_softc *sc)
+{
+	(void)display_frames(sc);
+	amd_mmio_write32(sc, regDISP_SET_MODE, 1);
+	display_frames_rebase(sc);
 }
 
 /* Signal (and let go of) the outstanding commit's out-fence. */
@@ -227,6 +285,7 @@ display_landed(struct atrium_amd_softc *sc)
 	mtx_assert(&sc->lock, MA_OWNED);
 	display_park(sc, sc->display_on_screen.bo_fp);
 	sc->display_on_screen = sc->display_next;
+	sc->display_flips_landed++;
 	memset(&sc->display_next, 0, sizeof(sc->display_next));
 	sc->display_next_state = 0;
 	display_drop_in(sc);
@@ -247,18 +306,16 @@ display_abandon(struct atrium_amd_softc *sc)
 	display_signal_out(sc);
 }
 
-/* Has the flip we programmed landed? The model counts flips that reach the
- * screen; ours is the one that takes the count to display_next_flips. */
+/* Has the flip we programmed landed? HUBP0 holds SURFACE_FLIP_PENDING until
+ * the requested surface is the one being scanned out. */
 static void
 display_reap(struct atrium_amd_softc *sc)
 {
-	uint32_t done;
-
 	mtx_assert(&sc->lock, MA_OWNED);
 	if (sc->display_next_state != 2)
 		return;
-	done = amd_mmio_read32(sc, regDISP_FLIP_DONE_COUNT);
-	if ((int32_t)(done - (uint32_t)sc->display_next_flips) >= 0)
+	if ((amd_mmio_read32(sc, regHUBPREQ0_DCSURF_FLIP_CONTROL) &
+	    DCN_SURFACE_FLIP_PENDING) == 0)
 		display_landed(sc);
 }
 
@@ -267,16 +324,15 @@ display_reap(struct atrium_amd_softc *sc)
 static uint32_t
 display_flip_next(struct atrium_amd_softc *sc)
 {
-	uint32_t done, fault;
+	uint32_t fault;
 
 	mtx_assert(&sc->lock, MA_OWNED);
-	done = amd_mmio_read32(sc, regDISP_FLIP_DONE_COUNT);
-	display_program_surface(sc, &sc->display_next);
-	amd_mmio_write32(sc, regDISP_FLIP, sc->display_next_vsync ? 1u : 0u);
+	/* Lock, program, unlock: the unlock is the flip. */
+	display_program_surface(sc, &sc->display_next, sc->display_next_vsync);
+	display_unlock(sc, sc->display_next_vsync);
 	fault = amd_mmio_read32(sc, regDISP_FAULT);
 	if (fault != 0)
 		return (fault);
-	sc->display_next_flips = (uint64_t)done + 1;
 	sc->display_next_state = 2;
 	display_drop_in(sc);	/* the fence has done its job */
 	display_reap(sc);	/* an immediate flip has already landed */
@@ -323,6 +379,9 @@ display_try_fence(struct atrium_amd_softc *sc)
 static void
 amd_display_flip_handler(struct atrium_amd_softc *sc, int count __unused)
 {
+	/* Acknowledge (FLIP_CLEAR), keeping the interrupt enabled. */
+	amd_mmio_write32(sc, regHUBPREQ0_DCSURF_SURFACE_FLIP_INTERRUPT,
+	    DCN_SURFACE_FLIP_CLEAR | DCN_SURFACE_FLIP_INT_MASK);
 	display_reap(sc);
 }
 
@@ -423,8 +482,13 @@ display_commit(struct atrium_amd_softc *sc, struct atrium_display_commit *c,
 			goto out;
 		}
 		sc->display_in_so = NULL;
-		display_program_surface(sc, &fb);
-		amd_mmio_write32(sc, regDISP_SET_MODE, 1);
+		if (modes.count > 0)
+			sc->display_width = modes.modes[0].width;
+		/* The surface goes up with the mode (the SIM mode set takes the
+		 * held surface); the unlock after it then has nothing to flip. */
+		display_program_surface(sc, &fb, 1);
+		display_set_mode(sc);
+		display_unlock(sc, 1);
 		fault = amd_mmio_read32(sc, regDISP_FAULT);
 		if (fault != 0) {
 			mtx_unlock(&sc->lock);
@@ -437,8 +501,7 @@ display_commit(struct atrium_amd_softc *sc, struct atrium_display_commit *c,
 		 * device raises them through the IH ring and the base ISR routes
 		 * them here (interrupt-driven like real silicon).
 		 */
-		amd_mmio_write32(sc, regDISP_VBLANK_IRQ_EN, 1);
-		amd_mmio_write32(sc, regDISP_FLIP_IRQ_EN, 1);
+		display_irqs(sc, 1, 1);
 		sc->display_vblank_armed = 1;	/* remembered across a device reset */
 		sc->display_mode_set = 1;
 		sc->display_refresh_mhz = modes.count > 0 ?
@@ -588,6 +651,9 @@ display_filt_vblank(struct knote *kn, long hint)
 static void
 amd_display_vblank_handler(struct atrium_amd_softc *sc, int count)
 {
+	/* Acknowledge (VERTICAL_INTERRUPT0_CLEAR), keeping it enabled. */
+	amd_mmio_write32(sc, regOTG0_OTG_VERTICAL_INTERRUPT0_CONTROL,
+	    DCN_VINT0_CLEAR | DCN_VINT0_INT_ENABLE);
 	KNOTE_LOCKED(&sc->display_sel.si_note, count);
 	display_try_fence(sc);	/* a commit waiting on its render */
 	display_reap(sc);
@@ -603,8 +669,10 @@ amd_display_vblank_handler(struct atrium_amd_softc *sc, int count)
 static void
 amd_display_reset_prepare(struct atrium_amd_softc *sc)
 {
-	amd_mmio_write32(sc, regDISP_VBLANK_IRQ_EN, 0);
-	amd_mmio_write32(sc, regDISP_FLIP_IRQ_EN, 0);
+	mtx_lock(&sc->lock);
+	(void)display_frames(sc);	/* bank them: the FLR restarts the OTG */
+	mtx_unlock(&sc->lock);
+	display_irqs(sc, 0, 0);
 }
 
 /*
@@ -621,13 +689,14 @@ amd_display_reset_restore(struct atrium_amd_softc *sc)
 	mtx_lock(&sc->lock);
 	if (sc->display_next_state == 2)
 		display_landed(sc);
+	display_frames_rebase(sc);
 	if (sc->display_mode_set && sc->display_on_screen.bo_fp != NULL) {
-		display_program_surface(sc, &sc->display_on_screen);
-		amd_mmio_write32(sc, regDISP_SET_MODE, 1);
-		amd_mmio_write32(sc, regDISP_FLIP_IRQ_EN, 1);
+		display_program_surface(sc, &sc->display_on_screen, 1);
+		display_set_mode(sc);
+		display_unlock(sc, 1);
 	}
-	if (sc->display_vblank_armed)
-		amd_mmio_write32(sc, regDISP_VBLANK_IRQ_EN, 1);
+	display_irqs(sc, sc->display_vblank_armed,
+	    sc->display_mode_set && sc->display_on_screen.bo_fp != NULL);
 	mtx_unlock(&sc->lock);
 }
 
@@ -724,8 +793,8 @@ display_ioctl(struct cdev *cdev, u_long cmd, caddr_t data, int fflag,
 		st->out_flags = (sc->display_next_state != 0 ?
 		    ATRIUM_DISPLAY_STATUS_COMMIT_PENDING : 0) |
 		    (sc->display_mode_set ? ATRIUM_DISPLAY_STATUS_MODE_SET : 0);
-		st->out_vblank_count = amd_mmio_read32(sc, regDISP_VBLANK_COUNT);
-		st->out_flips_done = amd_mmio_read32(sc, regDISP_FLIP_DONE_COUNT);
+		st->out_vblank_count = display_frames(sc);
+		st->out_flips_done = sc->display_flips_landed;
 		st->out_dropped_flips = amd_mmio_read32(sc, regDISP_DROPPED_FLIPS);
 		st->out_tear_line = amd_mmio_read32(sc, regDISP_TEAR_LINE);
 		st->out_refresh_mhz = sc->display_refresh_mhz;
@@ -739,7 +808,9 @@ display_ioctl(struct cdev *cdev, u_long cmd, caddr_t data, int fflag,
 		struct atrium_display_status *st =
 		    (struct atrium_display_status *)data;
 
-		st->vblank_count = amd_mmio_read32(sc, regDISP_VBLANK_COUNT);
+		mtx_lock(&sc->lock);
+		st->vblank_count = display_frames(sc);
+		mtx_unlock(&sc->lock);
 		st->dropped_flips = amd_mmio_read32(sc, regDISP_DROPPED_FLIPS);
 		st->tear_line = amd_mmio_read32(sc, regDISP_TEAR_LINE);
 		return (0);
@@ -888,8 +959,7 @@ atrium_display_detach(device_t dev)
 		energy_member_unregister(sc->display_energy_member);
 		sc->display_energy_member = -1;
 	}
-	amd_mmio_write32(sc, regDISP_VBLANK_IRQ_EN, 0);
-	amd_mmio_write32(sc, regDISP_FLIP_IRQ_EN, 0);
+	display_irqs(sc, 0, 0);
 	sc->display_vblank_armed = 0;
 	amd_ih_set_handler(sc, ATRIUM_AMD_IH_CAUSE_VBLANK, NULL);
 	amd_ih_set_handler(sc, ATRIUM_AMD_IH_CAUSE_FLIP, NULL);

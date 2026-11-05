@@ -22,7 +22,7 @@ use std::io;
 use std::time::{Duration, Instant};
 
 use atrium_gpu::amd::{
-    Display, Gpu, Scanout, Syncobj, COMMIT_ASYNC, COMMIT_TEST_ONLY, FAULT_BAD_PITCH,
+    Display, Gpu, Scanout, Syncobj, COMMIT_ASYNC, COMMIT_TEST_ONLY,
     STATUS_COMMIT_PENDING, STATUS_MODE_SET,
 };
 
@@ -173,9 +173,11 @@ fn run() -> io::Result<()> {
         Err(e) if e.raw_os_error() == Some(libc::EINVAL) => {} // not 256-aligned: rejected up front
         other => return Err(fail(format!("unaligned pitch: {other:?}, want EINVAL"))),
     }
-    let f = dpy.commit(b, 0, 256, None, None)?; // aligned but shorter than a line
-    if f != FAULT_BAD_PITCH {
-        return Err(fail(format!("short pitch fault={f}, want {FAULT_BAD_PITCH}")));
+    // Aligned but shorter than a line: since the isolation fix (73a94ec) the
+    // kmod refuses it up front, because pitch x height must fit in the BO.
+    match dpy.commit(b, 0, 256, None, None) {
+        Err(e) if e.raw_os_error() == Some(libc::EINVAL) => {}
+        other => return Err(fail(format!("short pitch: {other:?}, want EINVAL"))),
     }
     let sys = vm.alloc(bytes, 0)?; // System BO: not scannable
     match dpy.commit(&sys, 0, 0, None, None) {
@@ -188,7 +190,7 @@ fn run() -> io::Result<()> {
     if f != 0 || st.flips_done != flips || st.flags & STATUS_COMMIT_PENDING != 0 {
         return Err(fail("TEST_ONLY changed something".into()));
     }
-    eprintln!("8 pitch faults, System BO refused, TEST_ONLY inert");
+    eprintln!("8 bad pitches refused, System BO refused, TEST_ONLY inert");
 
     // 9. Hold-last-frame across close/reopen.
     drop(dpy);
