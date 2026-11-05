@@ -16,7 +16,7 @@ branch `atrium-os`, `gpusim:` = atrium-os/gpusim.
 |---|---|---|---|
 | [Native RDNA4 backend + gpusim](#1-native-rdna4-gpu-stack) | R9700 oracle v19: **54/54 jobs, 82 MATCH, 0 MISMATCH**; bench v5 ours ≤ RADV | spilling stage 3 `4bf3191`; VA reuse `2dac848` | bench v7 staged on the box (atrium16), waiting for an idle GPU |
 | [GPU driver isolation (F1/F6)](#2-gpu-driver-isolation) | F1 done; F6 G1–G4 done (watchdog, VM-fault → EIO, read-only binds, app GPU channel, hostile-ISA fuzz); `CAP_ISA` (ABI rev 4) | `622693d`, `bb3f7ba`, `8023c92`, `a8a595d` | G5; silicon run of `test_gpu_isolation` before a production grant |
-| [Fresco display pipeline](#3-fresco-display-pipeline) | compute is the default renderer; split mode on by default, renderers jailed as `_fresco-render`; F2, F3, F4a–F4e done; F5 deferred | `3ccac5d`, `1455488`, `e7c3187` | F4f (secure password input); check gpusim async doorbell (gpusim `3d31e61`) in the VM |
+| [Fresco display pipeline](#3-fresco-display-pipeline) | compute is the default renderer; split mode on by default, renderers jailed as `_fresco-render`; F2, F3, F4a–F4e done; F5 deferred | `3ccac5d`, `1455488`, `e7c3187` | F4f (secure password input) |
 | [Compressed memory](#4-compressed-memory) | zram v2 increments 0–6 done; design A (swap fast path) **kept**, B shelved | spec `3da0acb` | — (closed 2026-11-04) |
 | [Navigator security](#5-navigator-threat-model-fixes) | P0/P1 rows verified on FreeBSD; jail limits verified; P2 byte budget, link activation, image decoding in the worker done | `b0927c0`, `4995101`, `7b74432`, `ceead6a` | credentials C0 (vault + per-origin fetcher) |
 | [Navigator exploration coverage](#6-navigator-exploration-coverage) | covered handler elements 298 → 324 → **754 (45.2 %)** with sibling templates (recording format /4) | `78c50e9`, `3e98a25`, `493f5d6` | `el.id` at load; 6 pre-existing replay failures |
@@ -73,7 +73,7 @@ header `include/atrium/gpu_abi_v2.h` is normative).
   - G1: a VM fault fails that queue's work at once; read-only binds, ABI rev 3 (`bb3f7ba`, isolation Part D `e48e89b`).
   - G2: frescod's GPU channel (`FRESCOD_GPU_SOCK`), one context and VM per connection, arch-neutral (`4cf6395`, review fixes `5f6bd11`).
   - G3: `atrium-gpu-app` checks every field and writes every PM4 packet itself (`6dcd221`).
-  - G4: hostile machine code (infinite loop, wild stores) is lost with EIO while other apps' work completes (`a8a595d`).
+  - G4: hostile machine code (infinite loop, wild stores) is lost with EIO while other apps' work completes (`a8a595d`). With gpusim's async doorbell (gpusim `3d31e61`) the watchdog fails a spinning kernel after ~5.2 s instead of ~20 s (`7686038`).
   - `CAP_ISA` (ABI rev 4): the ISA family comes from the driver, not the vendor string (`8023c92`).
   - jaild stanza re-attested at each driver change (latest `e572532`), still experimental.
 

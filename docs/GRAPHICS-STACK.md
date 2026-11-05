@@ -286,7 +286,7 @@ commit is EBUSY. Pacing is by flip-done.
 | Configuration | Renderer | Where verified |
 |---|---|---|
 | amd64 VM + gpusim, default frescod | compute (Tier-2), split on, renderers jailed | cloud VM (`1455488`, `3ccac5d`) |
-| amd64 VM + gpusim, `FRESCOD_RENDERER=gpu` | RDNA4 kernels on gpusim, one GPU VM per window; the guest freezes per GPU frame until gpusim's async doorbell (gpusim `3d31e61`) is checked in the VM | cloud VM (`7c1ec1b`); kernels pixel-exact on the R9700 (oracle v14+, v19 incl. `fresco_compose`) |
+| amd64 VM + gpusim, `FRESCOD_RENDERER=gpu` | RDNA4 kernels on gpusim, one GPU VM per window; needs gpusim `3d31e61`+ (async doorbell, verified in the VM) | cloud VM (`7c1ec1b`); kernels pixel-exact on the R9700 (oracle v14+, v19 incl. `fresco_compose`) |
 | `FRESCOD_HEADLESS_PNG` | compute, no display | quickest check |
 | `FRESCOD_RENDERER=vulkan` | lavapipe | legacy; no split |
 

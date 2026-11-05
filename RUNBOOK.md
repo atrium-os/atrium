@@ -5218,11 +5218,12 @@ In the guest:
   suite 28/28, isolation 50/50.
 - After changing gpusim: rebuild `gpusim-server`, then `cloud-vm.sh down`/`up`
   (and the nextboot/kldload/devctl steps again).
-- gpusim has run dispatches synchronously inside the doorbell MMIO, so the
-  **whole guest freezes for each GPU frame** (ssh times out). If a demo is
-  hogging it, restart the VM rather than trying to ssh in. gpusim `3d31e61`
-  makes the doorbell asynchronous; it is **not yet verified in the VM**, so
-  until it is, assume the freeze.
+- Use gpusim `3d31e61` or later: its doorbell is asynchronous, so the guest
+  keeps running while a dispatch executes (verified in the VM, atrium
+  `7686038`; a never-ending kernel is failed by the watchdog after ~5.2 s
+  while another app's work completes). Older gpusim ran dispatches inside the
+  doorbell MMIO and froze the whole guest for each GPU frame; if you see ssh
+  time out during a GPU demo, check the gpusim version first.
 - `GPUSIM_RDNA4_BUDGET` (default 2^30 wave instructions) bounds a dispatch;
   `GPUSIM_RDNA4_STATS=1` logs each dispatch's time to `gpusim-server.log`.
   Screenshot the scanout: `screendump f.ppm gpusim0` on the QEMU monitor socket.
