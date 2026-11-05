@@ -51,7 +51,8 @@ done
 # stops being built.
 SRCS="error.c hash.c crc.c codec.c cdc.c btree.c manifest.c pack.c journal.c
       extent.c gc.c volume.c quota.c quota_store.c
-      b3_blake3.c b3_blake3_portable.c b3_shim.c tessera_reader.c"
+      b3_blake3.c b3_blake3_portable.c b3_shim.c b3_blake3_sse41.c b3_blake3_avx2.c
+      tessera_reader.c"
 
 # ★ Keep this list derived from the Makefile, not copied by hand. A test added
 # there and missed here is a test that silently never runs — the same class of

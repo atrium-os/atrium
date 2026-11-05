@@ -38,12 +38,20 @@ void tessera_sha256_final(tessera_sha256_ctx_t *, tessera_hash_t out);
 void tessera_sha256_free(tessera_sha256_ctx_t *);
 
 /*
- * One-shot 256-bit BLAKE3 (portable compression only — plain integer
- * registers, no FPU/SIMD state on any architecture). Backend for
- * TESSERA_HASH_ALG_BLAKE3_256; implementation is the vendored
- * b3_blake3*.c.
+ * One-shot 256-bit BLAKE3. Backend for TESSERA_HASH_ALG_BLAKE3_256;
+ * implementation is the vendored b3_blake3*.c. SIMD where compiled in:
+ * NEON on arm64, SSE4.1/AVX2 picked at runtime on amd64 (kernel callers get
+ * sliced fpu_kern regions, see b3_shim.c). Digests never depend on which.
  */
 void tessera_blake3_256(const uint8_t *data, size_t len, tessera_hash_t out);
+/*
+ * BLAKE3 SIMD backend control (amd64 picks SSE4.1/AVX2 at runtime). limit
+ * caps the backend (0 portable, 1 SSE4.1, 2 AVX2; -1 leaves it) and the
+ * return is the level now in use. Digests are identical at every level;
+ * this exists so tests can prove that. On other arches it returns 1 when a
+ * compiled-in SIMD backend (NEON) is used, else 0.
+ */
+int tessera_b3_simd_limit(int limit);
 
 /*
  * Content-hash dispatch keyed on the volume's sb.hash_alg

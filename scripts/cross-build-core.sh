@@ -31,14 +31,23 @@ OUT="${OUT:-$CORE/libtessera_core.a}"
 
 SRCS="error.c hash.c crc.c codec.c cdc.c btree.c manifest.c pack.c journal.c \
       extent.c gc.c volume.c quota.c quota_store.c \
-      b3_blake3.c b3_blake3_portable.c b3_shim.c tessera_reader.c"
+      b3_blake3.c b3_blake3_portable.c b3_shim.c b3_blake3_sse41.c \
+      b3_blake3_avx2.c tessera_reader.c"
 
 TMP="$(mktemp -d)"
 trap 'rm -rf "$TMP"' EXIT
 echo "cross-building libtessera_core.a ($TRIPLE)"
+# amd64: BLAKE3 SSE4.1/AVX2 backends (runtime CPUID dispatch in b3_shim.c).
+# Only the backend files get the ISA flags; on aarch64 they compile empty.
+case "$TRIPLE" in x86_64-*) X86="-DBLAKE3_USE_X86=1" ;; *) X86="" ;; esac
 for f in $SRCS; do
+    ISA=""
+    if [ -n "$X86" ]; then
+        case "$f" in b3_blake3_sse41.c) ISA=-msse4.1 ;; b3_blake3_avx2.c) ISA=-mavx2 ;; esac
+    fi
+    # shellcheck disable=SC2086
     "$CC_BIN" -target "$TRIPLE" --sysroot="$SYSROOT" \
-        -O2 -fno-strict-aliasing -fPIC \
+        -O2 -fno-strict-aliasing -fPIC $X86 $ISA \
         -I"$CORE/include" -I"$CORE/src" \
         -c "$CORE/src/$f" -o "$TMP/${f%.c}.o"
 done

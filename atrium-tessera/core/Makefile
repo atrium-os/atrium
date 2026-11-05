@@ -17,6 +17,7 @@ SHLIB_MAJOR= 1
 SRCS=       error.c hash.c crc.c codec.c cdc.c btree.c \
             manifest.c pack.c journal.c extent.c gc.c volume.c quota.c quota_store.c \
             b3_blake3.c b3_blake3_portable.c b3_shim.c \
+            b3_blake3_sse41.c b3_blake3_avx2.c \
             tessera_reader.c
 INCS=       include/tessera/tessera.h \
             include/tessera/error.h \
@@ -39,6 +40,19 @@ WARNS?=     6
 CFLAGS+=    -O2 -fno-strict-aliasing
 CFLAGS+=    -I${.CURDIR}/include
 CFLAGS+=    -I${.CURDIR}/src
+
+# BLAKE3 x86 SIMD (amd64): SSE4.1 + AVX2 backends, picked at runtime from
+# CPUID by b3_shim.c. Only these two files get the ISA flags, so nothing else
+# in the library can emit AVX2 on a CPU without it. Elsewhere the two files
+# compile to nothing (guarded by BLAKE3_USE_X86).
+.if ${MACHINE_ARCH} == "amd64"
+CFLAGS+=    -DBLAKE3_USE_X86=1
+# Upstream's intrinsics code (and the compiler's own intrinsics headers) trip
+# WARNS=6's -Wcast-align/-Wcast-qual; the files are vendored verbatim, so
+# relax just those two warnings for just these two files.
+CFLAGS.b3_blake3_sse41.c+= -msse4.1 -Wno-cast-align -Wno-cast-qual -Wno-system-headers
+CFLAGS.b3_blake3_avx2.c+=  -mavx2 -Wno-cast-align -Wno-cast-qual -Wno-system-headers
+.endif
 
 # libmd provides SHA-256 in userspace (auto-dispatches HW SHA-2 / SHA-NI).
 LIBADD=     md
@@ -64,7 +78,8 @@ TEST_NAMES= \
     test_journal \
     test_volume \
     test_quota \
-    test_quota_store
+    test_quota_store \
+    test_b3_simd
 
 TEST_BINS= ${TEST_NAMES:S,^,${.OBJDIR}/,}
 

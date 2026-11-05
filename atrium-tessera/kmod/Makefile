@@ -100,4 +100,34 @@ b3_blake3_neon.o: b3_blake3_neon.c
 	${CTFCONVERT_CMD}
 .endif
 
+# BLAKE3 SSE4.1 + AVX2 in the kernel, amd64.
+#
+# Not architecturally guaranteed (unlike NEON on ARMv8), so b3_shim.c picks
+# the backend at RUNTIME: SSE4.1 from cpu_feature2, AVX2 only when the CPU has
+# it AND the kernel enabled YMM state in XSAVE (fpu_kern can only preserve
+# what XSAVE covers). Same sliced fpu_kern regions as NEON (#94). Measured on
+# a Xeon host in userspace: portable 605, SSE4.1 1251, AVX2 1979 MiB/s on
+# 64 KiB blobs. Digests byte-identical at every level (core test_b3_simd).
+#
+# The two backend files are the only translation units built with SSE/AVX
+# allowed, so nothing else in the module can touch vector state outside an
+# fpu_kern region. The kernel's -mno-sse/-mno-avx*/-msoft-float/-mno-mmx come
+# off just for them; immintrin.h comes from the compiler's resource dir via
+# -idirafter (same reason as the NEON rule above), and neon-compat/ supplies
+# its <stdint.h>.
+.if ${MACHINE_ARCH} == "amd64"
+CFLAGS+=    -DBLAKE3_USE_X86=1
+OBJS+=      b3_blake3_sse41.o b3_blake3_avx2.o
+X86_RESOURCE_DIR!=	${CC} -print-resource-dir 2>/dev/null || echo /nonexistent
+X86_SIMD_CFLAGS=	${CFLAGS:N-mno-sse*:N-mno-avx*:N-mno-mmx:N-msoft-float:N-mno-aes} \
+		-I${.CURDIR}/neon-compat -idirafter ${X86_RESOURCE_DIR}/include \
+		-Wno-cast-qual -Wno-cast-align	# vendored verbatim (upstream casts)
+b3_blake3_sse41.o: b3_blake3_sse41.c
+	${CC} -c ${X86_SIMD_CFLAGS} -msse4.1 ${WERROR} ${PROF} ${.IMPSRC}
+	${CTFCONVERT_CMD}
+b3_blake3_avx2.o: b3_blake3_avx2.c
+	${CC} -c ${X86_SIMD_CFLAGS} -mavx2 ${WERROR} ${PROF} ${.IMPSRC}
+	${CTFCONVERT_CMD}
+.endif
+
 .include <bsd.kmod.mk>

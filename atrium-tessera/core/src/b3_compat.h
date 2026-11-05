@@ -16,9 +16,11 @@
  * slices the hash, one region per 64 KiB (~32 us), and NEON is enabled for
  * the aarch64 kernel build (see kmod/Makefile).
  *
- * x86 SIMD stays off: those backends are not vendored, and unlike NEON on
- * ARMv8 they are not architecturally guaranteed, so they would need runtime
- * feature detection.
+ * x86 SIMD (amd64): the SSE4.1 and AVX2 backends are vendored too
+ * (b3_blake3_sse41.c, b3_blake3_avx2.c). Unlike NEON on ARMv8 they are not
+ * architecturally guaranteed, so b3_shim.c picks one at runtime from CPUID
+ * (and, for AVX2, from the XSAVE state the OS enabled). Same sliced fpu_kern
+ * regions in the kernel; same byte-identical-digest requirement.
  */
 
 #ifndef B3_COMPAT_H_
@@ -31,9 +33,14 @@
 #ifndef BLAKE3_USE_NEON
 #define BLAKE3_USE_NEON 0
 #endif
+#ifndef BLAKE3_USE_X86
+#define BLAKE3_USE_X86 0
+#endif
 #define BLAKE3_NO_SSE2 1
+#if !BLAKE3_USE_X86
 #define BLAKE3_NO_SSE41 1
 #define BLAKE3_NO_AVX2 1
+#endif
 #define BLAKE3_NO_AVX512 1
 
 #ifdef TESSERA_KERNEL

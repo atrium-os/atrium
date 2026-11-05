@@ -14437,8 +14437,9 @@ tessera_blake3_selftest(void *arg __unused)
 	free(buf, M_TESSERA);
 	tessera_blake3_ok = ok;
 	if (ok)
-		printf("tessera: BLAKE3 self-test passed (%zu vectors)\n",
-		    nitems(tessera_blake3_kat));
+		printf("tessera: BLAKE3 self-test passed (%zu vectors, "
+		    "simd level %d)\n", nitems(tessera_blake3_kat),
+		    tessera_b3_simd_limit(-1));
 }
 SYSINIT(tessera_blake3_kat, SI_SUB_VFS, SI_ORDER_ANY,
     tessera_blake3_selftest, NULL);

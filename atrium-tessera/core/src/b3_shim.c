@@ -13,19 +13,96 @@
  */
 
 #include "b3_compat.h"
-#if defined(TESSERA_KERNEL) && defined(BLAKE3_USE_NEON) && BLAKE3_USE_NEON
+/* Any SIMD backend compiled in? In the kernel it needs fpu_kern regions. */
+#if (defined(BLAKE3_USE_NEON) && BLAKE3_USE_NEON) || BLAKE3_USE_X86
+#define TESSERA_B3_SIMD 1
+#else
+#define TESSERA_B3_SIMD 0
+#endif
+#if defined(TESSERA_KERNEL) && TESSERA_B3_SIMD
 #include <sys/proc.h>		/* curthread */
+#if BLAKE3_USE_X86
+#include <machine/fpu.h>	/* fpu_kern_enter/leave */
+#include <machine/md_var.h>	/* cpu_feature2, cpu_stdext_feature, xsave */
+#include <machine/specialreg.h>
+#else
 #include <machine/vfp.h>	/* fpu_kern_enter/leave (#94) */
+#endif
 #endif
 #include "b3_blake3.h"
 #include "b3_blake3_impl.h"
 
 #include "tessera/hash.h"
 
+#if BLAKE3_USE_X86
+/*
+ * amd64 runtime dispatch: 0 = portable, 1 = SSE4.1, 2 = AVX2. Detected once
+ * (racing first callers compute the same value, so the lazy init is benign).
+ * tessera_b3_simd_limit caps it, which is how the digest-equality test runs
+ * every backend on the same machine.
+ */
+static int b3_x86_level = -1;
+static int b3_x86_limit = 2;
+
+static int
+b3_x86_detect(void)
+{
+	int l = 0;
+#ifdef TESSERA_KERNEL
+	if (cpu_feature2 & CPUID2_SSE41)
+		l = 1;
+	/* AVX2 needs the CPU bit AND the OS saving YMM state: fpu_kern only
+	 * preserves what XSAVE is enabled for. */
+	if (l == 1 && (cpu_stdext_feature & CPUID_STDEXT_AVX2) &&
+	    use_xsave && (xsave_mask & XFEATURE_AVX) == XFEATURE_AVX)
+		l = 2;
+#else
+	__builtin_cpu_init();
+	if (__builtin_cpu_supports("sse4.1"))
+		l = 1;
+	if (l == 1 && __builtin_cpu_supports("avx2"))
+		l = 2;
+#endif
+	return (l);
+}
+
+static int
+b3_level(void)
+{
+	int l = b3_x86_level;
+
+	if (l < 0)
+		b3_x86_level = l = b3_x86_detect();
+	return (l < b3_x86_limit ? l : b3_x86_limit);
+}
+
+int
+tessera_b3_simd_limit(int limit)
+{
+	if (limit >= 0)
+		b3_x86_limit = limit;
+	return (b3_level());
+}
+#else
+int
+tessera_b3_simd_limit(int limit)
+{
+	(void)limit;
+	return (TESSERA_B3_SIMD);
+}
+#endif
+
 void
 blake3_compress_in_place(uint32_t cv[8], const uint8_t block[BLAKE3_BLOCK_LEN],
     uint8_t block_len, uint64_t counter, uint8_t flags)
 {
+#if BLAKE3_USE_X86
+	if (b3_level() >= 1) {
+		blake3_compress_in_place_sse41(cv, block, block_len, counter,
+		    flags);
+		return;
+	}
+#endif
 	blake3_compress_in_place_portable(cv, block, block_len, counter,
 	    flags);
 }
@@ -34,6 +111,13 @@ void
 blake3_compress_xof(const uint32_t cv[8], const uint8_t block[BLAKE3_BLOCK_LEN],
     uint8_t block_len, uint64_t counter, uint8_t flags, uint8_t out[64])
 {
+#if BLAKE3_USE_X86
+	if (b3_level() >= 1) {
+		blake3_compress_xof_sse41(cv, block, block_len, counter, flags,
+		    out);
+		return;
+	}
+#endif
 	blake3_compress_xof_portable(cv, block, block_len, counter, flags,
 	    out);
 }
@@ -44,7 +128,7 @@ blake3_xof_many(const uint32_t cv[8], const uint8_t block[BLAKE3_BLOCK_LEN],
     size_t outblocks)
 {
 	for (size_t i = 0; i < outblocks; i++) {
-		blake3_compress_xof_portable(cv, block, block_len, counter + i,
+		blake3_compress_xof(cv, block, block_len, counter + i,
 		    flags, out + 64 * i);
 	}
 }
@@ -61,6 +145,21 @@ blake3_hash_many(const uint8_t *const *inputs, size_t num_inputs,
 	 * only hash_many). */
 	blake3_hash_many_neon(inputs, num_inputs, blocks, key, counter,
 	    increment_counter, flags, flags_start, flags_end, out);
+#elif BLAKE3_USE_X86
+	switch (b3_level()) {
+	case 2:
+		blake3_hash_many_avx2(inputs, num_inputs, blocks, key, counter,
+		    increment_counter, flags, flags_start, flags_end, out);
+		break;
+	case 1:
+		blake3_hash_many_sse41(inputs, num_inputs, blocks, key, counter,
+		    increment_counter, flags, flags_start, flags_end, out);
+		break;
+	default:
+		blake3_hash_many_portable(inputs, num_inputs, blocks, key,
+		    counter, increment_counter, flags, flags_start, flags_end,
+		    out);
+	}
 #else
 	blake3_hash_many_portable(inputs, num_inputs, blocks, key, counter,
 	    increment_counter, flags, flags_start, flags_end, out);
@@ -104,7 +203,7 @@ blake3_simd_degree(void)
  * refuted the original "NEON would need fpu_kern_enter around every hash"
  * objection: the cost was never the problem, the region length was.
  */
-#if defined(TESSERA_KERNEL) && defined(BLAKE3_USE_NEON) && BLAKE3_USE_NEON
+#if defined(TESSERA_KERNEL) && TESSERA_B3_SIMD
 #define TESSERA_B3_FPU_SLICE	(64u * 1024u)
 
 void
