@@ -272,7 +272,7 @@ M4 Max. See docs/spec/gpu-isolation.md.
 status                  = "experimental"
 isolation_test_passed   = true
 isolation_test_date     = "2026-11-05"
-isolation_test_commit   = "36767d2b693b"
+isolation_test_commit   = "7cc2939d61c2"
 abi_rev                 = 4
 notes = """
 RDNA4 driver against gpusim 3f37036 (display on DCN 4.0.1 registers, D4; display lease; NOTE_RESET). The five 2026-11-03 isolation breaks
