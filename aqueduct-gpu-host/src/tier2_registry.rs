@@ -466,9 +466,9 @@ impl Tier2Registry {
         // VS StorageBuffer descriptor-table base (null when the
         // VS declares no SSBO).  The backing buffers are owned by
         // the caller and outlive this call.
-        let ssbo_table_ptr: *const u8 = if draw.vs_storage_table.is_empty() {
+        let ssbo_table_ptr: *const u8 = if draw.vs_storage_table == 0 {
             std::ptr::null()
-        } else { draw.vs_storage_table.as_ptr() };
+        } else { draw.vs_storage_table as *const u8 };
 
         // ── Step 1: vertex shading.  3 invocations.
         //
@@ -3430,15 +3430,16 @@ pub struct DrawTriangle<'a> {
     pub swap_rb: bool,
 
     /// StorageBuffer descriptor table handed to the vertex
-    /// shader as its trailing `storage_table` parameter: a
-    /// packed array of `u64` buffer base pointers, one per
-    /// binding slot (`slot[binding] = buffer base`).  Empty ⇒
-    /// null (VS declares no StorageBuffer).  Lets an instanced
+    /// shader as its trailing `storage_table` parameter: an
+    /// ABI v5 [`atrium_spv_runtime::SsboTable`] pointer
+    /// (`{ base, size }` per binding, sink before entry 0), or
+    /// 0 (VS declares no StorageBuffer).  Lets an instanced
     /// VS read `instances[gl_InstanceIndex]` from the SSBO the
     /// compute stage populated.  The pointed-at buffers must
     /// outlive the `build_triangle_setups` call (the VS runs
     /// serially there, before tile rasterization).
-    pub vs_storage_table: &'a [u8],
+    /// (An address, not a pointer, so the draw stays `Sync`.)
+    pub vs_storage_table: usize,
 
     /// Const-fill fast path: when `Some`, the FS is pixel-invariant (output
     /// identical for every pixel of the draw — no varyings / FragCoord /
@@ -3557,7 +3558,7 @@ impl Default for DrawTriangle<'_> {
             primitive_id: 0,
             fs_writes_depth: false,
             swap_rb: false,
-            vs_storage_table: &[],
+            vs_storage_table: 0,
             fs_const_color: None,
             fs_blend_lut: None,
             fs_texblit: None,

@@ -284,6 +284,37 @@ pub fn compile_blob(module: &Module, target: Target)
 fn emit_function_auto(
     func: &Function,
 ) -> Result<(Vec<u8>, Vec<(u32, u32)>), BackendError> {
+    // Robust access (docs/spec/tier2-robust-access.md, ABI v5): this
+    // backend doesn't bounds-check StorageBuffer accesses or image
+    // texel pointers yet, so such shaders go to Cranelift, which does.
+    let unchecked_memory = !func.ssbo_bindings.is_empty()
+        || func.blocks.values().flat_map(|b| &b.insts).any(|i| match &i.op {
+            Op::ImageTexelPointer { .. } => true,
+            Op::Load(p)
+            | Op::Store { ptr: p, .. }
+            | Op::AccessChain { base: p, .. }
+            | Op::PtrOffsetDynamic { base: p, .. }
+            | Op::AtomicLoad(p)
+            | Op::AtomicStore { ptr: p, .. }
+            | Op::AtomicIAdd { ptr: p, .. }
+            | Op::AtomicAnd { ptr: p, .. }
+            | Op::AtomicOr { ptr: p, .. }
+            | Op::AtomicXor { ptr: p, .. }
+            | Op::AtomicSMin { ptr: p, .. }
+            | Op::AtomicSMax { ptr: p, .. }
+            | Op::AtomicUMin { ptr: p, .. }
+            | Op::AtomicUMax { ptr: p, .. }
+            | Op::AtomicExchange { ptr: p, .. }
+            | Op::AtomicCompareExchange { ptr: p, .. } => {
+                matches!(p.ty, Type::Pointer(StorageClass::StorageBuffer, _))
+            }
+            _ => false,
+        });
+    if unchecked_memory {
+        return Err(BackendError::Unsupported(
+            "StorageBuffer or image texel pointer: no bounds checks in the arm64 backend yet".into(),
+        ));
+    }
     // Testing lever: force spill mode so SMALL kernels (the
     // whole differential suite) exercise the spill machinery.
     if std::env::var("ATRIUM_SPV_FORCE_SPILL").is_ok() {

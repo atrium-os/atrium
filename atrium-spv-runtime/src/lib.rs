@@ -309,6 +309,71 @@ pub struct SamplerDesc {
 // dedicated descriptor-table register (X6) land later when
 // a real shader needs both.
 
+/// One StorageBuffer binding in the shader ABI v5 descriptor table
+/// (compute `out_buffer`, vertex `storage_table`): the buffer's base and
+/// its size in bytes. Generated code checks every SSBO access against
+/// `size` and sends an out-of-bounds one to the table's sink instead
+/// (docs/spec/tier2-robust-access.md), so `size` must never exceed the
+/// buffer. A zero-size binding may have a null base.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct SsboDesc {
+    /// Buffer base address.
+    pub base: u64,
+    /// Bytes the shader may touch from `base`.
+    pub size: u64,
+}
+
+impl SsboDesc {
+    /// Describe `buf`.
+    pub fn of(buf: &[u8]) -> Self {
+        SsboDesc { base: buf.as_ptr() as u64, size: buf.len() as u64 }
+    }
+}
+
+/// Bytes per [`SsboDesc`] table entry.
+pub const SSBO_DESC_BYTES: usize = 16;
+
+/// Size of the sink an out-of-bounds SSBO access goes to: the largest
+/// single access (a mat4).
+pub const SSBO_SINK_BYTES: usize = 64;
+
+/// Byte offset, relative to the table pointer the shader gets, of the
+/// sink's address: the 16 bytes before entry 0 hold `{ u64 sink, 0 }`.
+pub const SSBO_SINK_OFFSET: i32 = -16;
+
+/// An ABI v5 StorageBuffer descriptor table with its sink. Pass
+/// [`SsboTable::as_ptr`] as the shader's table argument; keep the table
+/// (and the buffers it describes) alive while the shader runs. Out-of-
+/// bounds writes from any invocation land in the sink and are lost;
+/// out-of-bounds reads return whatever is there (Vulkan's
+/// robustBufferAccess allows both).
+pub struct SsboTable {
+    words: Vec<u64>,
+    _sink: Box<[u64; SSBO_SINK_BYTES / 8]>,
+}
+
+impl SsboTable {
+    /// A table over `descs`, entry i for binding i.
+    pub fn new(descs: &[SsboDesc]) -> Self {
+        let mut sink = Box::new([0u64; SSBO_SINK_BYTES / 8]);
+        let mut words = Vec::with_capacity(2 + 2 * descs.len());
+        words.push(sink.as_mut_ptr() as u64);
+        words.push(0);
+        for d in descs {
+            words.push(d.base);
+            words.push(d.size);
+        }
+        SsboTable { words, _sink: sink }
+    }
+
+    /// The table pointer for the shader: entry 0.
+    pub fn as_ptr(&self) -> *mut u8 {
+        // SAFETY: `words` always holds the two header words.
+        unsafe { self.words.as_ptr().add(2) as *mut u8 }
+    }
+}
+
 /// Offset of the runtime-helper pointer block at the start
 /// of the uniforms buffer. `uniforms + 0` is
 /// `atrium_tex_sample_2d`; `uniforms + 8` is

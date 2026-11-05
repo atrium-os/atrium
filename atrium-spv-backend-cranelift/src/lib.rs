@@ -487,6 +487,8 @@ fn emit_function(
             stage: func.stage,
             local_size: func.local_size,
             ssbo_var_ptr: HashMap::new(),
+            ssbo_var_size: HashMap::new(),
+            guards: HashMap::new(),
             entry_block: entry,
             // Cache the param-index → Cranelift value
             // mapping once; ip-walk reads it for ptr-arg
@@ -516,8 +518,10 @@ fn emit_function(
         // a table (params[9] = table base), since the vertex ABI
         // has no single-binding direct slot — the rect VS reads
         // the instance SSBO this way.
+        // ABI v5: every StorageBuffer goes through the table, whose
+        // entries are `{ u64 base, u64 size }` (16 bytes).
         let ssbo_table_base = match func.stage {
-            ShaderStage::Compute if func.ssbo_bindings.len() >= 2 =>
+            ShaderStage::Compute if !func.ssbo_bindings.is_empty() =>
                 Some(translator.params[2]),
             ShaderStage::Vertex if !func.ssbo_bindings.is_empty() =>
                 Some(translator.params[9]),
@@ -525,14 +529,29 @@ fn emit_function(
         };
         if let Some(table_base) = ssbo_table_base {
             builder.switch_to_block(entry);
+            let sink = builder.ins().load(
+                pointer_type,
+                cranelift_codegen::ir::MemFlags::new(),
+                table_base,
+                atrium_spv_runtime::SSBO_SINK_OFFSET,
+            );
             for (&vid, &(_set, binding)) in &func.ssbo_bindings {
+                let off = i32::try_from(binding as u64 * SSBO_DESC_BYTES as u64)
+                    .map_err(|_| BackendError::Unsupported("SSBO binding".into()))?;
                 let p = builder.ins().load(
                     pointer_type,
                     cranelift_codegen::ir::MemFlags::new(),
                     table_base,
-                    (binding as i32) * 8,
+                    off,
+                );
+                let size = builder.ins().load(
+                    clif_types::I64,
+                    cranelift_codegen::ir::MemFlags::new(),
+                    table_base,
+                    off + 8,
                 );
                 translator.ssbo_var_ptr.insert(vid, p);
+                translator.ssbo_var_size.insert(vid, (size, sink));
             }
         }
 
@@ -1023,6 +1042,8 @@ fn emit_fragment_span(
             stage: func.stage,
             local_size: func.local_size,
             ssbo_var_ptr: HashMap::new(),
+            ssbo_var_size: HashMap::new(),
+            guards: HashMap::new(),
             entry_block: body_entry,
             params: sp.clone(),
             scalars: HashMap::new(),
@@ -1188,6 +1209,15 @@ struct FnTranslator {
     /// path).  Populated by the entry-block prologue when
     /// `func.ssbo_bindings.len() >= 2`.
     ssbo_var_ptr: HashMap<u32, ClifValue>,
+    /// StorageBuffer variable ValueId -> the binding's byte size,
+    /// loaded with its base by the entry prologue (ABI v5 table).
+    /// (and the table's out-of-bounds sink address).
+    ssbo_var_size: HashMap<u32, (ClifValue, ClifValue)>,
+    /// SSBO-derived pointers: their bounds. For these, `pointers`
+    /// holds (buffer base, constant offset) and the dynamic offset
+    /// lives here; every access is checked against the size
+    /// (docs/spec/tier2-robust-access.md).
+    guards: HashMap<ValueId, SsboGuard>,
     #[allow(dead_code)]
     entry_block: cranelift_codegen::ir::Block,
     params: Vec<ClifValue>,
@@ -1359,7 +1389,11 @@ impl FnTranslator {
                 // chain's offset rather than always writing at
                 // the base.  Bare-Variable pointers (no chain)
                 // fall through to offset 0.
-                let (ptr_param, base_off) = self.resolve_or_make_pointer(ptr)?;
+                let bytes = match self.vectors.get(&value.id) {
+                    Some(l) => 4 * l.len() as u32,
+                    None => 4,
+                };
+                let (ptr_param, base_off) = self.checked_pointer(builder, ptr, bytes)?;
                 // Vector value: emit one store per lane at
                 // consecutive 4-byte offsets.
                 if let Some(lanes) = self.vectors.get(&value.id).cloned() {
@@ -1395,15 +1429,20 @@ impl FnTranslator {
                     BackendError::Internal(
                         "AccessChain without result Value".to_string()))?;
                 let (param, base_off) = self.resolve_or_make_pointer(base)?;
-                let new_off = base_off.saturating_add(*byte_offset as i32);
+                let new_off = i32::try_from(*byte_offset).ok()
+                    .and_then(|o| base_off.checked_add(o))
+                    .ok_or_else(|| BackendError::Unsupported("AccessChain offset overflow".into()))?;
                 self.pointers.insert(result.id, (param, new_off));
+                if let Some(g) = self.guards.get(&base.id).copied() {
+                    self.guards.insert(result.id, g);
+                }
                 Ok(())
             }
             Op::AtomicLoad(ptr) => {
                 let result = inst.result.as_ref().ok_or_else(||
                     BackendError::Internal(
                         "AtomicLoad without result".to_string()))?;
-                let (ptr_v, ptr_off) = self.resolve_or_make_pointer(ptr)?;
+                let (ptr_v, ptr_off) = self.checked_pointer(builder, ptr, 4)?;
                 let mflags = cranelift_codegen::ir::MemFlags::new();
                 let v = builder.ins().load(
                     clif_types::I32, mflags, ptr_v, ptr_off);
@@ -1411,7 +1450,7 @@ impl FnTranslator {
                 Ok(())
             }
             Op::AtomicStore { ptr, value } => {
-                let (ptr_v, ptr_off) = self.resolve_or_make_pointer(ptr)?;
+                let (ptr_v, ptr_off) = self.checked_pointer(builder, ptr, 4)?;
                 let val = *self.scalars.get(&value.id).ok_or_else(||
                     BackendError::Internal(format!(
                         "AtomicStore value {:?} not in scalars", value.id)))?;
@@ -1423,7 +1462,7 @@ impl FnTranslator {
                 let result = inst.result.as_ref().ok_or_else(||
                     BackendError::Internal(
                         "AtomicCompareExchange without result".to_string()))?;
-                let (ptr_v, ptr_off) = self.resolve_or_make_pointer(ptr)?;
+                let (ptr_v, ptr_off) = self.checked_pointer(builder, ptr, 4)?;
                 let exp = *self.scalars.get(&expected.id).ok_or_else(||
                     BackendError::Internal(format!(
                         "AtomicCompareExchange expected {:?} not in scalars",
@@ -1455,7 +1494,7 @@ impl FnTranslator {
                 let result = inst.result.as_ref().ok_or_else(||
                     BackendError::Internal(
                         "Atomic op without result".to_string()))?;
-                let (ptr_v, ptr_off) = self.resolve_or_make_pointer(ptr)?;
+                let (ptr_v, ptr_off) = self.checked_pointer(builder, ptr, 4)?;
                 let val = *self.scalars.get(&value.id).ok_or_else(||
                     BackendError::Internal(format!(
                         "Atomic value {:?} not in scalars",
@@ -1525,6 +1564,17 @@ impl FnTranslator {
                         clif_types::I64, *stride as i64);
                     builder.ins().imul(idx_ext, s)
                 };
+                if let Some(g) = self.guards.get(&base.id).copied() {
+                    // SSBO: accumulate the dynamic offset; the base
+                    // stays the buffer's for the bounds check.
+                    let doff = match g.doff {
+                        Some(d) => builder.ins().iadd(d, scaled),
+                        None => scaled,
+                    };
+                    self.pointers.insert(result.id, (base_ptr, base_off));
+                    self.guards.insert(result.id, SsboGuard { doff: Some(doff), ..g });
+                    return Ok(());
+                }
                 let addr = builder.ins().iadd(base_ptr, scaled);
                 // Stash as a pointer with the residual
                 // constant offset; downstream Load/Store
@@ -1704,13 +1754,24 @@ impl FnTranslator {
                 let result = inst.result.as_ref().ok_or_else(||
                     BackendError::Internal(
                         "Load without result Value".to_string()))?;
-                let (param, off) = self.resolve_or_make_pointer(ptr)?;
                 let pointee = match &ptr.ty {
                     Type::Pointer(_, inner) => (**inner).clone(),
                     other => return Err(BackendError::Unsupported(format!(
                         "Op::Load pointer Value is not Pointer-typed: {other:?}",
                     ))),
                 };
+                let bytes = match &pointee {
+                    Type::F32 | Type::I32 | Type::U32 | Type::Bool => 4,
+                    Type::Vec2(_) => 8,
+                    Type::Vec3(_) => 12,
+                    Type::Vec4(_) => 16,
+                    Type::Mat4(_) => 64,
+                    other if self.guards.contains_key(&ptr.id) =>
+                        return Err(BackendError::Unsupported(format!(
+                            "StorageBuffer load of {other:?}"))),
+                    _ => 0,
+                };
+                let (param, off) = self.checked_pointer(builder, ptr, bytes)?;
                 match &pointee {
                     Type::F32 => {
                         let v = builder.ins().load(
@@ -2861,6 +2922,20 @@ impl FnTranslator {
                 let desc_off: i32 = IMG_TABLE_DESC_BASE_I32 + (binding as i32) * 8;
                 let desc_ptr = builder.ins().load(
                     pointer_type, MemFlags::new(), img_table, desc_off);
+                // Bounds: a coordinate outside the image (width @8,
+                // height @12, depth @24) addresses texel 0 on that
+                // axis (docs/spec/tier2-robust-access.md).
+                let mut clamp = |c: ClifValue, field: i32| {
+                    let dim = builder.ins().load(
+                        clif_types::I32, MemFlags::new(), desc_ptr, field);
+                    let lt = builder.ins().icmp(
+                        cranelift_codegen::ir::condcodes::IntCC::UnsignedLessThan, c, dim);
+                    let zero = builder.ins().iconst(clif_types::I32, 0);
+                    builder.ins().select(lt, c, zero)
+                };
+                let x = clamp(x, 8);
+                let y = clamp(y, 12);
+                let z = z.map(|z| clamp(z, 24));
                 // data ptr @ #0
                 let mut addr = builder.ins().load(
                     pointer_type, MemFlags::new(), desc_ptr, 0);
@@ -3236,7 +3311,36 @@ impl FnTranslator {
         if let Some(p) = self.pointers.get(&v.id) { return Ok(*p); }
         let param = self.resolve_pointer_param(&v.ty, v.id.0)?;
         self.pointers.insert(v.id, (param, 0));
+        if let Some(&(size, sink)) = self.ssbo_var_size.get(&v.id.0) {
+            self.guards.insert(v.id, SsboGuard { size, sink, doff: None });
+        }
         Ok((param, 0))
+    }
+
+    /// The (address, offset) for a `bytes`-wide access through `ptr`.
+    /// SSBO pointers get the bounds check: an access that would end
+    /// past the binding's size goes to the table's sink instead
+    /// (docs/spec/tier2-robust-access.md).
+    fn checked_pointer(
+        &mut self,
+        builder: &mut FunctionBuilder,
+        ptr: &atrium_spv_ir::Value,
+        bytes: u32,
+    ) -> Result<(ClifValue, i32), BackendError> {
+        let (base, off) = self.resolve_or_make_pointer(ptr)?;
+        let Some(g) = self.guards.get(&ptr.id).copied() else {
+            return Ok((base, off));
+        };
+        let doff = match g.doff {
+            Some(d) => d,
+            None => builder.ins().iconst(clif_types::I64, 0),
+        };
+        let end = builder.ins().iadd_imm(doff, off as i64 + bytes as i64);
+        let inb = builder.ins().icmp(
+            cranelift_codegen::ir::condcodes::IntCC::UnsignedLessThanOrEqual, end, g.size);
+        let start = builder.ins().iadd_imm(doff, off as i64);
+        let addr = builder.ins().iadd(base, start);
+        Ok((builder.ins().select(inb, addr, g.sink), 0))
     }
 
     /// Map a storage-class pointer type to its Cranelift
@@ -3314,13 +3418,31 @@ impl FnTranslator {
             //          workgroup_id*3, local_id*3)
             (ShaderStage::Compute, StorageClass::Uniform) => Ok(self.params[0]),
             (ShaderStage::Compute, StorageClass::PushConstant) => Ok(self.params[1]),
-            (ShaderStage::Compute, StorageClass::StorageBuffer) => Ok(self.params[2]),
+            (ShaderStage::Compute, StorageClass::StorageBuffer) =>
+                Err(BackendError::Unsupported(format!(
+                    "compute StorageBuffer var {var_id} not resolved by the \
+                     SSBO prologue (missing ssbo_bindings entry)",
+                ))),
             (stage, sc) => Err(BackendError::Unsupported(format!(
                 "no param mapping for stage={stage:?}, storage={sc:?}",
             ))),
         }
     }
 }
+
+/// Bounds of an SSBO-derived pointer (see `FnTranslator::guards`).
+#[derive(Clone, Copy)]
+struct SsboGuard {
+    /// The binding's byte size (i64).
+    size: ClifValue,
+    /// Out-of-bounds accesses go here (the table's sink).
+    sink: ClifValue,
+    /// Dynamic byte offset from the buffer base (i64), if any.
+    doff: Option<ClifValue>,
+}
+
+/// Bytes per StorageBuffer descriptor-table entry (ABI v5).
+const SSBO_DESC_BYTES: usize = atrium_spv_runtime::SSBO_DESC_BYTES;
 
 // Silence the unused-import warning until we use clif_types
 // in a future phase.

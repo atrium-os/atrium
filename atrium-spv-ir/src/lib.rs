@@ -1574,7 +1574,13 @@ pub struct Varying {
 /// `storage_table` parameter (StorageBuffer descriptor-table
 /// base), so an instanced VS can read the instance SSBO.  Stale
 /// v3 vertex blobs have the old 9-param ABI — rotate the cache.
-pub const TIER2_SHADER_ABI_VERSION: u32 = 4;
+///
+/// v5: robust access (docs/spec/tier2-robust-access.md).  Every
+/// StorageBuffer goes through a descriptor table of `{ u64 base,
+/// u64 size }` entries (compute `out_buffer` loses its single-binding
+/// direct-pointer mode), and generated code checks each SSBO access
+/// against `size`.
+pub const TIER2_SHADER_ABI_VERSION: u32 = 5;
 //
 // History:
 //   v1 -- original tier-2 ABI (Arc 1-149).

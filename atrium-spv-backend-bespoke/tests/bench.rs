@@ -140,7 +140,9 @@ struct BackendStats {
     blob_bytes: usize,
 }
 
-fn compile_both(spv: &[u8]) -> (BackendStats, BackendStats) {
+/// `None` when the arm64 backend declines the shader (SSBO access has
+/// no bounds checks there yet, so it falls back to Cranelift).
+fn compile_both(spv: &[u8]) -> Option<(BackendStats, BackendStats)> {
     let module = translate(spv).expect("frontend translate");
 
     let bespoke_target = if cfg!(target_os = "macos") {
@@ -160,7 +162,11 @@ fn compile_both(spv: &[u8]) -> (BackendStats, BackendStats) {
     let mut bespoke_size = 0;
     for _ in 0..3 {
         let t0 = Instant::now();
-        let out = bespoke_compile(&module, bespoke_target).expect("bespoke");
+        let out = match bespoke_compile(&module, bespoke_target) {
+            Ok(o) => o,
+            Err(atrium_spv_backend_bespoke::BackendError::Unsupported(_)) => return None,
+            Err(e) => panic!("bespoke: {e}"),
+        };
         bespoke_times.push(t0.elapsed().as_micros());
         bespoke_size = out.blob.len();
     }
@@ -184,7 +190,7 @@ fn compile_both(spv: &[u8]) -> (BackendStats, BackendStats) {
         blob_bytes: cranelift_size,
     };
 
-    (bespoke_stats, cranelift_stats)
+    Some((bespoke_stats, cranelift_stats))
 }
 
 #[test]
@@ -201,7 +207,10 @@ fn compare_bespoke_vs_cranelift_compile() {
     println!("\n  shader            | bespoke compile | bespoke size | cranelift compile | cranelift size | bespoke speedup");
     println!(  "  ------------------|-----------------|--------------|-------------------|----------------|----------------");
     for (name, spv) in &shaders {
-        let (b, c) = compile_both(spv);
+        let Some((b, c)) = compile_both(spv) else {
+            println!("  {name:18}| declined by bespoke (no SSBO bounds checks yet)");
+            continue;
+        };
         let speedup = c.compile_us as f64 / b.compile_us.max(1) as f64;
         println!("  {:18}| {:11} us | {:8} bytes | {:13} us | {:10} bytes | {:.2}x",
                  name, b.compile_us, b.blob_bytes,

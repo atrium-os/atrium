@@ -27,6 +27,11 @@ pub(crate) const IMG_TABLE_BARRIER_OFFSET: i32 = 64;
 /// `atrium_spv_runtime::IMG_TABLE_DESC_BASE`: the compute image table's
 /// first storage-image descriptor pointer. Pinned by a unit test.
 pub(crate) const IMG_TABLE_DESC_BASE: i32 = 72;
+/// Bytes per StorageBuffer descriptor-table entry (ABI v5:
+/// `{ u64 base, u64 size }`); pinned to the runtime's by a unit test.
+pub(crate) const SSBO_DESC_BYTES: u32 = 16;
+/// Offset of the sink address from the SSBO table pointer; pinned too.
+pub(crate) const SSBO_SINK_OFFSET: i32 = -16;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub(crate) struct VReg(pub u32);
@@ -237,6 +242,11 @@ pub(crate) enum MInst {
     StackArg { d: VReg, off: i32, wide: bool },
     /// d = base + zext(idx) * stride (64-bit pointer arithmetic).
     PtrAdd { d: VReg, base: Base, idx: VReg, stride: u32 },
+    /// d = zext(idx) * stride (64-bit).
+    PScale { d: VReg, idx: VReg, stride: u32 },
+    /// Bounds-checked SSBO address:
+    /// d = doff + off + bytes <= size ? buf + doff + off : sink.
+    Guard { d: VReg, buf: VReg, size: VReg, sink: VReg, doff: Option<VReg>, off: i32, bytes: u32 },
     /// Load a 64-bit pointer.
     PLoad { d: VReg, addr: Addr },
     /// 64-bit register move.
@@ -368,6 +378,15 @@ impl MInst {
                 }
                 out.push(*idx);
             }
+            PScale { idx, .. } => out.push(*idx),
+            Guard { buf, size, sink, doff, .. } => {
+                out.push(*buf);
+                out.push(*size);
+                out.push(*sink);
+                if let Some(o) = doff {
+                    out.push(*o);
+                }
+            }
             XMov { s, .. } | GMov { s, .. } | MovXToG { s, .. } | MovGToX { s, .. } => out.push(*s),
             XBin { a, b, .. }
             | GBin { a, b, .. }
@@ -425,6 +444,8 @@ impl MInst {
             CallHelper { ret, .. } => out.extend(ret.iter().copied()),
             StackArg { d, .. }
             | PtrAdd { d, .. }
+            | PScale { d, .. }
+            | Guard { d, .. }
             | PLoad { d, .. }
             | PMov { d, .. }
             | AtomicRmw { d, .. }
@@ -494,11 +515,25 @@ impl MInst {
     }
 }
 
-/// A pointer value: base plus constant byte offset.
+/// A pointer value: base plus constant byte offset. A pointer into a
+/// StorageBuffer also carries its bounds: every access through it is
+/// checked against the binding's size (docs/spec/tier2-robust-access.md).
 #[derive(Clone, Copy, Debug)]
 struct Ptr {
     base: Base,
     off: i32,
+    guard: Option<Guard>,
+}
+
+/// Bounds of an SSBO-derived pointer: `base` is the buffer base, the
+/// address is `base + doff + off`, and `size` the binding's byte size.
+#[derive(Clone, Copy, Debug)]
+struct Guard {
+    size: VReg,
+    /// Where an out-of-bounds access goes instead (the table's sink).
+    sink: VReg,
+    /// Dynamic byte offset (sum of `zext(index) * stride`), if any.
+    doff: Option<VReg>,
 }
 
 /// An ABI argument of the entry point (SysV, the loader's signatures).
@@ -839,7 +874,7 @@ impl<'f> Lower<'f> {
         };
         let at = |l: &mut Self, a: Arg, off: u32| -> Result<Ptr, BackendError> {
             let off = i32::try_from(off).map_err(|_| BackendError::Unsupported("offset".into()))?;
-            Ok(Ptr { base: Base::V(l.arg(a)), off })
+            Ok(Ptr { base: Base::V(l.arg(a)), off, guard: None })
         };
         match func.stage {
             ShaderStage::Fragment => {
@@ -875,32 +910,21 @@ impl<'f> Lower<'f> {
                     let Some(&(_set, binding)) = func.ssbo_bindings.get(&v.id.0) else {
                         return unsupported("vertex StorageBuffer without a binding");
                     };
-                    // slot[binding] of the descriptor table holds the base.
                     let table = self.arg(Arg::VsSsboTable);
-                    let d = self.vreg(Class::P);
-                    let off = i32::try_from(binding * 8)
-                        .map_err(|_| BackendError::Unsupported("binding".into()))?;
-                    // Loaded once at entry, so every use is dominated.
-                    self.stack_args.push(MInst::PLoad { d, addr: Addr { base: Base::V(table), off } });
-                    Ok(Ptr { base: Base::V(d), off: 0 })
+                    self.ssbo_ptr(table, binding)
                 }
                 other => unsupported(format!("vertex storage class {other:?}")),
             },
             ShaderStage::Compute => match sc {
                 StorageClass::Uniform => at(self, Arg::CsUniforms, 0),
                 StorageClass::PushConstant => at(self, Arg::CsPush, 0),
-                StorageClass::StorageBuffer if func.ssbo_bindings.len() >= 2 => {
+                StorageClass::StorageBuffer => {
                     let Some(&(_set, binding)) = func.ssbo_bindings.get(&v.id.0) else {
                         return unsupported("StorageBuffer without a binding");
                     };
                     let table = self.arg(Arg::CsOut);
-                    let d = self.vreg(Class::P);
-                    let off = i32::try_from(binding * 8)
-                        .map_err(|_| BackendError::Unsupported("binding".into()))?;
-                    self.stack_args.push(MInst::PLoad { d, addr: Addr { base: Base::V(table), off } });
-                    Ok(Ptr { base: Base::V(d), off: 0 })
+                    self.ssbo_ptr(table, binding)
                 }
-                StorageClass::StorageBuffer => at(self, Arg::CsOut, 0),
                 StorageClass::Workgroup => match func.workgroup_var_offset.get(&v.id) {
                     Some(&off) => at(self, Arg::CsWgBuf, off),
                     None => unsupported("Workgroup variable without an offset"),
@@ -908,6 +932,31 @@ impl<'f> Lower<'f> {
                 other => unsupported(format!("compute storage class {other:?}")),
             },
         }
+    }
+
+    /// A StorageBuffer binding's pointer: entry `binding` of the ABI v5
+    /// descriptor table (`{ u64 base, u64 size }`), loaded once at entry
+    /// so every use is dominated.
+    fn ssbo_ptr(&mut self, table: VReg, binding: u32) -> Result<Ptr, BackendError> {
+        let off = binding
+            .checked_mul(SSBO_DESC_BYTES)
+            .and_then(|o| i32::try_from(o).ok())
+            .ok_or_else(|| BackendError::Unsupported("SSBO binding".into()))?;
+        let (buf, size, sink) = (self.vreg(Class::P), self.vreg(Class::P), self.vreg(Class::P));
+        self.stack_args.push(MInst::PLoad { d: buf, addr: Addr { base: Base::V(table), off } });
+        self.stack_args.push(MInst::PLoad { d: size, addr: Addr { base: Base::V(table), off: off + 8 } });
+        self.stack_args.push(MInst::PLoad { d: sink, addr: Addr { base: Base::V(table), off: SSBO_SINK_OFFSET } });
+        Ok(Ptr { base: Base::V(buf), off: 0, guard: Some(Guard { size, sink, doff: None }) })
+    }
+
+    /// The checked address for a `bytes`-wide access through `p`; `p`
+    /// itself when it isn't an SSBO pointer.
+    fn checked(&mut self, p: Ptr, bytes: usize) -> Result<Ptr, BackendError> {
+        let Some(g) = p.guard else { return Ok(p) };
+        let Base::V(buf) = p.base else { return Err(BackendError::Internal("SSBO pointer base".into())) };
+        let d = self.vreg(Class::P);
+        self.code.push(MInst::Guard { d, buf, size: g.size, sink: g.sink, doff: g.doff, off: p.off, bytes: bytes as u32 });
+        Ok(Ptr { base: Base::V(d), off: 0, guard: None })
     }
 
     fn load_lanes(&mut self, p: Ptr, d: &[VReg]) {
@@ -1503,7 +1552,7 @@ impl<'f> Lower<'f> {
                     .ok()
                     .and_then(|o| p.off.checked_add(o))
                     .ok_or_else(|| BackendError::Unsupported("AccessChain offset overflow".into()))?;
-                self.ptrs.insert(res.id, Ptr { base: p.base, off });
+                self.ptrs.insert(res.id, Ptr { base: p.base, off, guard: p.guard });
             }
             Op::PtrOffsetDynamic { base, index, stride } => {
                 let res = Self::result(inst)?;
@@ -1513,19 +1562,30 @@ impl<'f> Lower<'f> {
                     return unsupported("PtrOffsetDynamic index type");
                 }
                 let d = self.vreg(Class::P);
-                self.code.push(M::PtrAdd { d, base: p.base, idx: idx[0], stride: *stride });
-                self.ptrs.insert(res.id, Ptr { base: Base::V(d), off: p.off });
+                if let Some(g) = p.guard {
+                    // SSBO: accumulate the dynamic offset; the base stays
+                    // the buffer's, for the bounds check at the access.
+                    self.code.push(match g.doff {
+                        Some(o) => M::PtrAdd { d, base: Base::V(o), idx: idx[0], stride: *stride },
+                        None => M::PScale { d, idx: idx[0], stride: *stride },
+                    });
+                    self.ptrs.insert(res.id, Ptr { guard: Some(Guard { doff: Some(d), ..g }), ..p });
+                } else {
+                    self.code.push(M::PtrAdd { d, base: p.base, idx: idx[0], stride: *stride });
+                    self.ptrs.insert(res.id, Ptr { base: Base::V(d), off: p.off, guard: None });
+                }
             }
             Op::LocalAlloc { offset, bytes } => {
                 let res = Self::result(inst)?;
                 let off = i32::try_from(*offset).map_err(|_| BackendError::Unsupported("LocalAlloc".into()))?;
                 self.local_bytes = self.local_bytes.max(offset.saturating_add(*bytes));
-                self.ptrs.insert(res.id, Ptr { base: Base::Locals, off });
+                self.ptrs.insert(res.id, Ptr { base: Base::Locals, off, guard: None });
             }
             Op::Load(ptr) => {
                 let res = Self::result(inst)?;
                 let p = self.ptr_of(ptr)?;
                 let d = self.define(res)?;
+                let p = self.checked(p, 4 * d.len())?;
                 self.load_lanes(p, &d);
                 // Also the packed load; DCE keeps whichever form is used.
                 if matches!(res.ty, Type::Mat4(VecElement::F32)) {
@@ -1546,6 +1606,8 @@ impl<'f> Lower<'f> {
             }
             Op::Store { ptr, value } => {
                 let p = self.ptr_of(ptr)?;
+                let n = self.lanes_of(value)?.len();
+                let p = self.checked(p, 4 * n)?;
                 if let (Some(n), Some(&v)) = (packable(&value.ty), self.packed.get(&value.id)) {
                     self.code.push(M::VStore { addr: Addr { base: p.base, off: p.off }, s: v, n: n as u8 });
                     return Ok(());
@@ -1565,6 +1627,7 @@ impl<'f> Lower<'f> {
                 let cols: Vec<VReg> = match &matrix.ty {
                     Type::Pointer(..) => {
                         let p = self.ptr_of(matrix)?;
+                        let p = self.checked(p, 64)?;
                         let d: Vec<VReg> = (0..16).map(|_| self.vreg(Class::X)).collect();
                         self.load_lanes(p, &d);
                         d
@@ -1581,6 +1644,7 @@ impl<'f> Lower<'f> {
                     let pcols: Vec<VReg> = match &matrix.ty {
                         Type::Pointer(..) => {
                             let p = self.ptr_of(matrix)?;
+                            let p = self.checked(p, 64)?;
                             (0..4)
                                 .map(|j| {
                                     let d = self.vreg(Class::V);
@@ -1644,6 +1708,7 @@ impl<'f> Lower<'f> {
             Op::AtomicLoad(ptr) => {
                 let res = Self::result(inst)?;
                 let p = self.ptr_of(ptr)?;
+                let p = self.checked(p, 4)?;
                 let d = self.define(res)?;
                 if d.len() != 1 || self.class_of(d[0]) != Class::G {
                     return unsupported("AtomicLoad type");
@@ -1652,6 +1717,7 @@ impl<'f> Lower<'f> {
             }
             Op::AtomicStore { ptr, value } => {
                 let p = self.ptr_of(ptr)?;
+                let p = self.checked(p, 4)?;
                 let s = self.lanes_of(value)?;
                 if s.len() != 1 || self.class_of(s[0]) != Class::G {
                     return unsupported("AtomicStore type");
@@ -1670,6 +1736,7 @@ impl<'f> Lower<'f> {
             Op::AtomicCompareExchange { ptr, expected, desired } => {
                 let res = Self::result(inst)?;
                 let p = self.ptr_of(ptr)?;
+                let p = self.checked(p, 4)?;
                 let (e, w) = (self.lanes_of(expected)?, self.lanes_of(desired)?);
                 let d = self.define(res)?;
                 if [&e, &w, &d].iter().any(|l| l.len() != 1 || self.class_of(l[0]) != Class::G) {
@@ -1924,7 +1991,7 @@ impl<'f> Lower<'f> {
         if d.len() != n {
             return unsupported(format!("{} result shape", op_name(&inst.op)));
         }
-        self.load_lanes(Ptr { base: Base::Helper, off: 0 }, &d);
+        self.load_lanes(Ptr { base: Base::Helper, off: 0, guard: None }, &d);
         Ok(())
     }
 
@@ -2089,6 +2156,19 @@ impl<'f> Lower<'f> {
                 self.code.push(M::PLoad { d: desc, addr: Addr { base: Base::V(table), off: comp_desc(b) } });
                 let mut addr = self.vreg(Class::P);
                 self.code.push(M::PLoad { d: addr, addr: Addr { base: Base::V(desc), off: 0 } });
+                // Bounds: a coordinate outside the image (width @8, height
+                // @12, depth @24) addresses texel 0 on that axis instead
+                // (docs/spec/tier2-robust-access.md).
+                let c: Vec<VReg> = c
+                    .iter()
+                    .zip([8, 12, 24])
+                    .map(|(&ci, off)| {
+                        let dim = self.g2(|d| M::GLoad { d, addr: Addr { base: Base::V(desc), off } });
+                        let lt = self.g2(|d| M::GCmp { cc: ICond::Ult, d, a: ci, b: dim });
+                        let zero = self.gconst(0);
+                        self.gsel(lt, ci, zero)
+                    })
+                    .collect();
                 // data + z * slice_bytes (@28) + y * stride_bytes (@16) + 4x,
                 // the products in 32 bits as Cranelift does.
                 let mut add = |l: &mut Self, idx: VReg, field: Option<i32>| {
@@ -2111,7 +2191,7 @@ impl<'f> Lower<'f> {
                 }
                 add(self, c[1], Some(16));
                 add(self, c[0], None);
-                self.ptrs.insert(res.id, Ptr { base: Base::V(addr), off: 0 });
+                self.ptrs.insert(res.id, Ptr { base: Base::V(addr), off: 0, guard: None });
             }
             Op::ImageRead { image, coord }
             | Op::ImageWrite { image, coord, .. }
@@ -2175,6 +2255,7 @@ impl<'f> Lower<'f> {
     fn atomic(&mut self, inst: &Inst, ptr: &Value, value: &Value, op: AtomicOp) -> Result<(), BackendError> {
         let res = Self::result(inst)?;
         let p = self.ptr_of(ptr)?;
+        let p = self.checked(p, 4)?;
         let v = self.lanes_of(value)?;
         let d = self.define(res)?;
         if v.len() != 1 || d.len() != 1 || self.class_of(v[0]) != Class::G || self.class_of(d[0]) != Class::G {

@@ -2204,6 +2204,23 @@ fn translate_inst(
                                      non-leaf element type {elem_type_id}",
                                 )));
                             }
+                            // A constant index past a sized array's end
+                            // would address outside the variable.
+                            if raw.class.opcode == rspirv::spirv::Op::TypeArray {
+                                let len = raw.operands.get(1).and_then(|op| match op {
+                                    Operand::IdRef(id) => constants.get(*id).and_then(|c| match &c.kind {
+                                        ConstantKind::Scalar(Op::ConstInt { value, .. }) => Some(*value as u32),
+                                        _ => None,
+                                    }),
+                                    _ => None,
+                                });
+                                if len.is_some_and(|n| idx_val >= n) {
+                                    return Err(FrontendError::Unsupported(format!(
+                                        "AccessChain constant index {idx_val} past the end of \
+                                         an array of {} elements", len.unwrap_or(0),
+                                    )));
+                                }
+                            }
                             byte_offset = byte_offset
                                 .saturating_add(idx_val.saturating_mul(stride));
                             current_pointee_id = elem_type_id;
@@ -2261,18 +2278,14 @@ fn translate_inst(
                     dyn_idx_id, types, constants, id_map,
                     next_value_id, insts, source_spirv_offset,
                 )?;
-                // Function-scratch bounds safety: a dynamic index
-                // into a stack-local array is CLAMPED to the array
-                // (GLSL robustness semantics) — no shader can
-                // address outside its own scratch. SSBO indices
-                // stay as-is: the descriptor range is the sandbox
-                // there.
-                let is_function = matches!(
-                    &prefix_value.ty, Type::Pointer(
-                        atrium_spv_ir::StorageClass::Function, _));
-                let dyn_idx_val = if let (true, Some(len)) =
-                    (is_function, arr_len)
-                {
+                // Bounds safety: a dynamic index into an array of
+                // known length (Function, Workgroup, Uniform,
+                // PushConstant, or a sized SSBO array) is CLAMPED to
+                // the array (GLSL robustness semantics). Runtime-
+                // sized SSBO arrays have no length here; the backends
+                // check every SSBO access against the binding's size
+                // instead (docs/spec/tier2-robust-access.md).
+                let dyn_idx_val = if let Some(len) = arr_len {
                     let push_v = |op: Op, ty: Type,
                                   insts: &mut Vec<Inst>,
                                   next_value_id: &mut u32| -> Value {

@@ -96,7 +96,9 @@ impl Drop for Guarded {
 /// buffer faults and kills the test (the failure message is the crash).
 fn run_tier2(t2: &tier2::Tier2, f: &Frame, at_end: bool) -> Vec<u32> {
     let bufs: Vec<Guarded> = f.buffers().iter().map(|b| Guarded::new(b, at_end)).collect();
-    let table: [u64; binding::COUNT] = std::array::from_fn(|i| bufs[i].data as u64);
+    let table: [atrium_spv_runtime::SsboDesc; binding::COUNT] = std::array::from_fn(|i| {
+        atrium_spv_runtime::SsboDesc { base: bufs[i].data as u64, size: bufs[i].n as u64 }
+    });
     // SAFETY: each pointer addresses a live buffer of the size `buffers()`
     // gives for this header, which `validate` accepted; mask and target are
     // zeroed and writable; the header binding is `f.header`'s bytes.

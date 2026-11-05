@@ -49,7 +49,14 @@ fn bespoke_or_cranelift(module: &atrium_spv_ir::Module, use_bespoke: bool) -> Ve
         let t = if cfg!(target_os = "macos") {
             BespokeTarget::Aarch64Darwin
         } else { BespokeTarget::Aarch64FreeBSD };
-        return bespoke_compile(module, t).expect("bespoke compile").object;
+        // Shaders the arm64 backend declines (SSBO and texel-pointer
+        // access, until it has bounds checks) fall back to Cranelift,
+        // as atrium-spv-compile does.
+        match bespoke_compile(module, t) {
+            Ok(o) => return o.object,
+            Err(atrium_spv_backend_bespoke::BackendError::Unsupported(_)) => {}
+            Err(e) => panic!("bespoke compile: {e}"),
+        }
     }
     if use_bespoke && cfg!(target_arch = "x86_64") {
         use atrium_spv_backend_bespoke_x86 as x86;
@@ -76,8 +83,28 @@ type CsMain = unsafe extern "C" fn(
 /// `out_ptr` (which can be either a direct SSBO pointer or
 /// a descriptor-table base, depending on the shader).
 fn invoke(spv: &[u8], use_bespoke: bool, dir: &Path, name: &str,
-          out_ptr: *mut u8) {
-    invoke_with_gids(spv, use_bespoke, dir, name, out_ptr, &[(0, 0, 0)]);
+          bufs: &mut [&mut [u8]]) {
+    invoke_with_gids(spv, use_bespoke, dir, name, bufs, &[(0, 0, 0)]);
+}
+
+/// Each buffer as a mutable slice, for `invoke`.
+fn slices(v: &mut [Vec<u8>]) -> Vec<&mut [u8]> {
+    v.iter_mut().map(|b| &mut b[..]).collect()
+}
+
+/// The ABI v5 SSBO table for `module` over `bufs`: binding i is
+/// `bufs[i]`, or `bufs[0]` for every binding when only one buffer is
+/// given (the old single-buffer calling convention).
+fn ssbo_table(module: &atrium_spv_ir::Module, bufs: &mut [&mut [u8]]) -> atrium_spv_runtime::SsboTable {
+    let max_b = module.functions.iter()
+        .flat_map(|f| f.ssbo_bindings.values().map(|&(_, b)| b as usize))
+        .max().unwrap_or(0).max(bufs.len().saturating_sub(1));
+    let descs: Vec<atrium_spv_runtime::SsboDesc> = (0..=max_b).map(|b| {
+        let buf: &[u8] = if bufs.len() == 1 { &bufs[0][..] }
+            else { bufs.get(b).map(|x| &x[..]).unwrap_or(&[]) };
+        atrium_spv_runtime::SsboDesc::of(buf)
+    }).collect();
+    atrium_spv_runtime::SsboTable::new(&descs)
 }
 
 /// Same as `invoke`, but calls `cs_main` once per entry in
@@ -86,8 +113,10 @@ fn invoke(spv: &[u8], use_bespoke: bool, dir: &Path, name: &str,
 /// `(gid_x, gid_y, gid_z)`; local-invocation lanes are kept
 /// at 0 since these tests don't exercise lid math.
 fn invoke_with_gids(spv: &[u8], use_bespoke: bool, dir: &Path, name: &str,
-                    out_ptr: *mut u8, gids: &[(u32, u32, u32)]) {
+                    bufs: &mut [&mut [u8]], gids: &[(u32, u32, u32)]) {
     let module = translate(spv).expect("frontend");
+    let table = ssbo_table(&module, bufs);
+    let out_ptr = table.as_ptr();
     // Per-workgroup shared-memory scratch size (0 for shaders
     // that declare no Workgroup-storage variables).
     let wg_bytes = module.functions.first()
@@ -128,22 +157,10 @@ fn diff(spv: &[u8], n_bindings: usize) -> (Vec<Vec<u8>>, Vec<Vec<u8>>) {
     let dir = TempDir::new().unwrap();
     // Bespoke run.
     let mut b_bufs: Vec<Vec<u8>> = (0..n_bindings).map(|_| vec![0u8; 16]).collect();
-    if n_bindings >= 2 {
-        let table: Vec<u64> = b_bufs.iter_mut().map(|b| b.as_mut_ptr() as u64).collect();
-        invoke(spv, true, dir.path(), "b", table.as_ptr() as *mut u8);
-    } else {
-        let p = b_bufs[0].as_mut_ptr();
-        invoke(spv, true, dir.path(), "b", p);
-    }
+    invoke(spv, true, dir.path(), "b", &mut slices(&mut b_bufs));
     // Cranelift run.
     let mut c_bufs: Vec<Vec<u8>> = (0..n_bindings).map(|_| vec![0u8; 16]).collect();
-    if n_bindings >= 2 {
-        let table: Vec<u64> = c_bufs.iter_mut().map(|b| b.as_mut_ptr() as u64).collect();
-        invoke(spv, false, dir.path(), "c", table.as_ptr() as *mut u8);
-    } else {
-        let p = c_bufs[0].as_mut_ptr();
-        invoke(spv, false, dir.path(), "c", p);
-    }
+    invoke(spv, false, dir.path(), "c", &mut slices(&mut c_bufs));
     (b_bufs, c_bufs)
 }
 
@@ -304,8 +321,8 @@ fn differential_dynamic_ssbo_index_writes_per_lane() {
     let mut b_buf = vec![0u8; 64];
     let mut c_buf = vec![0u8; 64];
     let gids: Vec<(u32, u32, u32)> = (0..8).map(|i| (i, 0, 0)).collect();
-    invoke_with_gids(&spv, true,  dir.path(), "b", b_buf.as_mut_ptr(), &gids);
-    invoke_with_gids(&spv, false, dir.path(), "c", c_buf.as_mut_ptr(), &gids);
+    invoke_with_gids(&spv, true,  dir.path(), "b", &mut [&mut b_buf[..]], &gids);
+    invoke_with_gids(&spv, false, dir.path(), "c", &mut [&mut c_buf[..]], &gids);
     assert_eq!(b_buf, c_buf,
         "bespoke and cranelift diverge on dynamic SSBO index:\n  \
          bespoke   = {b_buf:?}\n  \
@@ -390,8 +407,8 @@ fn differential_dynamic_rmw_with_prefill() {
     b_buf[..16].copy_from_slice(&prefill);
     c_buf[..16].copy_from_slice(&prefill);
     let gids: Vec<(u32, u32, u32)> = (0..4).map(|i| (i, 0, 0)).collect();
-    invoke_with_gids(&spv, true,  dir.path(), "b", b_buf.as_mut_ptr(), &gids);
-    invoke_with_gids(&spv, false, dir.path(), "c", c_buf.as_mut_ptr(), &gids);
+    invoke_with_gids(&spv, true,  dir.path(), "b", &mut [&mut b_buf[..]], &gids);
+    invoke_with_gids(&spv, false, dir.path(), "c", &mut [&mut c_buf[..]], &gids);
     assert_eq!(b_buf, c_buf,
         "bespoke vs cranelift diverge on dynamic RMW:\n  \
          bespoke   = {b_buf:?}\n  \
@@ -491,13 +508,11 @@ fn differential_multi_binding_plus_dynamic_index() {
     };
     let mut b_bufs = make_bufs();
     let mut c_bufs = make_bufs();
-    let b_table: Vec<u64> = b_bufs.iter_mut().map(|b| b.as_mut_ptr() as u64).collect();
-    let c_table: Vec<u64> = c_bufs.iter_mut().map(|b| b.as_mut_ptr() as u64).collect();
     let gids: Vec<(u32, u32, u32)> = (0..4).map(|i| (i, 0, 0)).collect();
     invoke_with_gids(&spv, true,  dir.path(), "b",
-        b_table.as_ptr() as *mut u8, &gids);
+        &mut slices(&mut b_bufs), &gids);
     invoke_with_gids(&spv, false, dir.path(), "c",
-        c_table.as_ptr() as *mut u8, &gids);
+        &mut slices(&mut c_bufs), &gids);
     assert_eq!(b_bufs, c_bufs,
         "bespoke vs cranelift diverge on multi-binding + dynamic:\n  \
          bespoke   in={:?} out={:?}\n  \
@@ -578,8 +593,8 @@ fn differential_atomic_iadd_accumulator() {
     let mut b_buf = vec![0u8; 16];
     let mut c_buf = vec![0u8; 16];
     let gids: Vec<(u32, u32, u32)> = (0..8).map(|i| (i, 0, 0)).collect();
-    invoke_with_gids(&spv, true,  dir.path(), "b", b_buf.as_mut_ptr(), &gids);
-    invoke_with_gids(&spv, false, dir.path(), "c", c_buf.as_mut_ptr(), &gids);
+    invoke_with_gids(&spv, true,  dir.path(), "b", &mut [&mut b_buf[..]], &gids);
+    invoke_with_gids(&spv, false, dir.path(), "c", &mut [&mut c_buf[..]], &gids);
     assert_eq!(b_buf, c_buf,
         "bespoke vs cranelift diverge on atomicAdd:\n  \
          bespoke   = {b_buf:?}\n  \
@@ -662,8 +677,8 @@ fn run_atomic_diff(op: rspirv::spirv::Op, prefill: u32, gids_range: u32) -> u32 
     b_buf[..4].copy_from_slice(&prefill.to_le_bytes());
     c_buf[..4].copy_from_slice(&prefill.to_le_bytes());
     let gids: Vec<(u32, u32, u32)> = (0..gids_range).map(|i| (i, 0, 0)).collect();
-    invoke_with_gids(&spv, true,  dir.path(), "b", b_buf.as_mut_ptr(), &gids);
-    invoke_with_gids(&spv, false, dir.path(), "c", c_buf.as_mut_ptr(), &gids);
+    invoke_with_gids(&spv, true,  dir.path(), "b", &mut [&mut b_buf[..]], &gids);
+    invoke_with_gids(&spv, false, dir.path(), "c", &mut [&mut c_buf[..]], &gids);
     assert_eq!(b_buf, c_buf,
         "bespoke vs cranelift diverge on {op:?}:\n  \
          bespoke   = {b_buf:?}\n  cranelift = {c_buf:?}");
@@ -698,8 +713,8 @@ fn differential_atomic_xor_toggles() {
     let mut b_buf = vec![0u8; 16];
     let mut c_buf = vec![0u8; 16];
     let gids: Vec<(u32, u32, u32)> = (1..5).map(|i| (i, 0, 0)).collect();
-    invoke_with_gids(&spv, true,  dir.path(), "b", b_buf.as_mut_ptr(), &gids);
-    invoke_with_gids(&spv, false, dir.path(), "c", c_buf.as_mut_ptr(), &gids);
+    invoke_with_gids(&spv, true,  dir.path(), "b", &mut [&mut b_buf[..]], &gids);
+    invoke_with_gids(&spv, false, dir.path(), "c", &mut [&mut c_buf[..]], &gids);
     assert_eq!(b_buf, c_buf);
     let got = u32::from_le_bytes(b_buf[0..4].try_into().unwrap());
     assert_eq!(got, 1u32 ^ 2 ^ 3 ^ 4, "got {got:#x}");
@@ -774,8 +789,8 @@ fn differential_atomic_load_then_store() {
     // Pre-fill a = 0x12345678; b stays 0.
     b_buf[0..4].copy_from_slice(&0x1234_5678u32.to_le_bytes());
     c_buf[0..4].copy_from_slice(&0x1234_5678u32.to_le_bytes());
-    invoke_with_gids(&spv, true,  dir.path(), "b", b_buf.as_mut_ptr(), &[(0, 0, 0)]);
-    invoke_with_gids(&spv, false, dir.path(), "c", c_buf.as_mut_ptr(), &[(0, 0, 0)]);
+    invoke_with_gids(&spv, true,  dir.path(), "b", &mut [&mut b_buf[..]], &[(0, 0, 0)]);
+    invoke_with_gids(&spv, false, dir.path(), "c", &mut [&mut c_buf[..]], &[(0, 0, 0)]);
     assert_eq!(b_buf, c_buf, "diverge on atomicLoad/Store");
     let a = u32::from_le_bytes(b_buf[0..4].try_into().unwrap());
     let b = u32::from_le_bytes(b_buf[4..8].try_into().unwrap());
@@ -1172,8 +1187,8 @@ fn differential_op_is_helper_invocation() {
     let dir = TempDir::new().unwrap();
     let mut b_buf = vec![0u8; 4];
     let mut c_buf = vec![0u8; 4];
-    invoke(&spv, true,  dir.path(), "b", b_buf.as_mut_ptr());
-    invoke(&spv, false, dir.path(), "c", c_buf.as_mut_ptr());
+    invoke(&spv, true,  dir.path(), "b", &mut [&mut b_buf[..]]);
+    invoke(&spv, false, dir.path(), "c", &mut [&mut c_buf[..]]);
     assert_eq!(b_buf, c_buf,
         "OpIsHelperInvocationEXT diverges between backends");
     let got = u32::from_le_bytes(b_buf[0..4].try_into().unwrap());
@@ -1193,8 +1208,8 @@ fn differential_atomic_cas_weak_success_path() {
     let mut c_buf = vec![0u8; 16];
     b_buf[0..4].copy_from_slice(&42u32.to_le_bytes());
     c_buf[0..4].copy_from_slice(&42u32.to_le_bytes());
-    invoke_with_gids(&spv, true,  dir.path(), "b", b_buf.as_mut_ptr(), &[(0, 0, 0)]);
-    invoke_with_gids(&spv, false, dir.path(), "c", c_buf.as_mut_ptr(), &[(0, 0, 0)]);
+    invoke_with_gids(&spv, true,  dir.path(), "b", &mut [&mut b_buf[..]], &[(0, 0, 0)]);
+    invoke_with_gids(&spv, false, dir.path(), "c", &mut [&mut c_buf[..]], &[(0, 0, 0)]);
     assert_eq!(b_buf, c_buf, "diverge on CAS-weak success");
     assert_eq!(u32::from_le_bytes(b_buf[0..4].try_into().unwrap()), 99,
         "CAS-weak success should write desired (99)");
@@ -1212,8 +1227,8 @@ fn differential_atomic_cas_success_path() {
     let mut c_buf = vec![0u8; 16];
     b_buf[0..4].copy_from_slice(&42u32.to_le_bytes());
     c_buf[0..4].copy_from_slice(&42u32.to_le_bytes());
-    invoke_with_gids(&spv, true,  dir.path(), "b", b_buf.as_mut_ptr(), &[(0, 0, 0)]);
-    invoke_with_gids(&spv, false, dir.path(), "c", c_buf.as_mut_ptr(), &[(0, 0, 0)]);
+    invoke_with_gids(&spv, true,  dir.path(), "b", &mut [&mut b_buf[..]], &[(0, 0, 0)]);
+    invoke_with_gids(&spv, false, dir.path(), "c", &mut [&mut c_buf[..]], &[(0, 0, 0)]);
     assert_eq!(b_buf, c_buf, "diverge on CAS success");
     assert_eq!(u32::from_le_bytes(b_buf[0..4].try_into().unwrap()), 99,
         "CAS success should write desired (99)");
@@ -1231,8 +1246,8 @@ fn differential_atomic_cas_failure_path() {
     let mut c_buf = vec![0u8; 16];
     b_buf[0..4].copy_from_slice(&7u32.to_le_bytes());
     c_buf[0..4].copy_from_slice(&7u32.to_le_bytes());
-    invoke_with_gids(&spv, true,  dir.path(), "b", b_buf.as_mut_ptr(), &[(0, 0, 0)]);
-    invoke_with_gids(&spv, false, dir.path(), "c", c_buf.as_mut_ptr(), &[(0, 0, 0)]);
+    invoke_with_gids(&spv, true,  dir.path(), "b", &mut [&mut b_buf[..]], &[(0, 0, 0)]);
+    invoke_with_gids(&spv, false, dir.path(), "c", &mut [&mut c_buf[..]], &[(0, 0, 0)]);
     assert_eq!(b_buf, c_buf, "diverge on CAS failure");
     assert_eq!(u32::from_le_bytes(b_buf[0..4].try_into().unwrap()), 7,
         "CAS failure should leave value unchanged");
@@ -1298,8 +1313,8 @@ fn differential_atomic_iincrement_counts_invocations() {
     let mut b_buf = vec![0u8; 16];
     let mut c_buf = vec![0u8; 16];
     let gids: Vec<(u32, u32, u32)> = (0..5).map(|i| (i, 0, 0)).collect();
-    invoke_with_gids(&spv, true,  dir.path(), "b", b_buf.as_mut_ptr(), &gids);
-    invoke_with_gids(&spv, false, dir.path(), "c", c_buf.as_mut_ptr(), &gids);
+    invoke_with_gids(&spv, true,  dir.path(), "b", &mut [&mut b_buf[..]], &gids);
+    invoke_with_gids(&spv, false, dir.path(), "c", &mut [&mut c_buf[..]], &gids);
     assert_eq!(b_buf, c_buf);
     let v = u32::from_le_bytes(b_buf[0..4].try_into().unwrap());
     assert_eq!(v, 5, "5 increments should leave counter at 5; got {v}");
@@ -1315,8 +1330,8 @@ fn differential_atomic_idecrement_counts_down() {
     b_buf[0..4].copy_from_slice(&10u32.to_le_bytes());
     c_buf[0..4].copy_from_slice(&10u32.to_le_bytes());
     let gids: Vec<(u32, u32, u32)> = (0..4).map(|i| (i, 0, 0)).collect();
-    invoke_with_gids(&spv, true,  dir.path(), "b", b_buf.as_mut_ptr(), &gids);
-    invoke_with_gids(&spv, false, dir.path(), "c", c_buf.as_mut_ptr(), &gids);
+    invoke_with_gids(&spv, true,  dir.path(), "b", &mut [&mut b_buf[..]], &gids);
+    invoke_with_gids(&spv, false, dir.path(), "c", &mut [&mut c_buf[..]], &gids);
     assert_eq!(b_buf, c_buf);
     let v = u32::from_le_bytes(b_buf[0..4].try_into().unwrap());
     assert_eq!(v, 6, "10 - 4 decrements should leave 6; got {v}");
@@ -1379,8 +1394,8 @@ fn differential_atomic_isub_subtracts() {
     b_buf[0..4].copy_from_slice(&100u32.to_le_bytes());
     c_buf[0..4].copy_from_slice(&100u32.to_le_bytes());
     let gids: Vec<(u32, u32, u32)> = (1..5).map(|i| (i, 0, 0)).collect();
-    invoke_with_gids(&spv, true,  dir.path(), "b", b_buf.as_mut_ptr(), &gids);
-    invoke_with_gids(&spv, false, dir.path(), "c", c_buf.as_mut_ptr(), &gids);
+    invoke_with_gids(&spv, true,  dir.path(), "b", &mut [&mut b_buf[..]], &gids);
+    invoke_with_gids(&spv, false, dir.path(), "c", &mut [&mut c_buf[..]], &gids);
     assert_eq!(b_buf, c_buf, "diverge on isub");
     let v = u32::from_le_bytes(b_buf[0..4].try_into().unwrap());
     assert_eq!(v, 100 - (1 + 2 + 3 + 4),
@@ -1429,8 +1444,8 @@ fn differential_atomic_smax_keeps_positive_over_negative() {
     b_buf[0..4].copy_from_slice(&0xFFFF_FFFFu32.to_le_bytes());
     c_buf[0..4].copy_from_slice(&0xFFFF_FFFFu32.to_le_bytes());
     let gids: Vec<(u32, u32, u32)> = (1..5).map(|i| (i, 0, 0)).collect();
-    invoke_with_gids(&spv, true,  dir.path(), "b", b_buf.as_mut_ptr(), &gids);
-    invoke_with_gids(&spv, false, dir.path(), "c", c_buf.as_mut_ptr(), &gids);
+    invoke_with_gids(&spv, true,  dir.path(), "b", &mut [&mut b_buf[..]], &gids);
+    invoke_with_gids(&spv, false, dir.path(), "c", &mut [&mut c_buf[..]], &gids);
     assert_eq!(b_buf, c_buf, "diverge on smax");
     let got = u32::from_le_bytes(b_buf[0..4].try_into().unwrap());
     assert_eq!(got, 4, "smax should leave 4; got {got}");
@@ -1703,8 +1718,8 @@ fn differential_workgroup_size_materialises_localsize() {
     let dir = TempDir::new().unwrap();
     let mut b_buf = vec![0u8; 16];
     let mut c_buf = vec![0u8; 16];
-    invoke_with_gids(&spv, true,  dir.path(), "b", b_buf.as_mut_ptr(), &[(0, 0, 0)]);
-    invoke_with_gids(&spv, false, dir.path(), "c", c_buf.as_mut_ptr(), &[(0, 0, 0)]);
+    invoke_with_gids(&spv, true,  dir.path(), "b", &mut [&mut b_buf[..]], &[(0, 0, 0)]);
+    invoke_with_gids(&spv, false, dir.path(), "c", &mut [&mut c_buf[..]], &[(0, 0, 0)]);
     assert_eq!(b_buf, c_buf,
         "bespoke vs cranelift diverge on gl_WorkGroupSize");
     // LocalSize=(7,5,3) -> slots 0,1,2 should hold 7,5,3.
@@ -1780,8 +1795,8 @@ fn differential_glsl_std_450_scalar_math() {
     let dir = TempDir::new().unwrap();
     let mut b_buf = vec![0u8; 16];
     let mut c_buf = vec![0u8; 16];
-    invoke_with_gids(&spv, true,  dir.path(), "b", b_buf.as_mut_ptr(), &[(0, 0, 0)]);
-    invoke_with_gids(&spv, false, dir.path(), "c", c_buf.as_mut_ptr(), &[(0, 0, 0)]);
+    invoke_with_gids(&spv, true,  dir.path(), "b", &mut [&mut b_buf[..]], &[(0, 0, 0)]);
+    invoke_with_gids(&spv, false, dir.path(), "c", &mut [&mut c_buf[..]], &[(0, 0, 0)]);
     assert_eq!(b_buf, c_buf,
         "bespoke vs cranelift diverge on GLSL.std.450 scalar math");
     let read = |i: usize| -> f32 {
@@ -1925,8 +1940,8 @@ fn differential_glsl_vec4_math() {
     let dir = TempDir::new().unwrap();
     let mut b_buf = vec![0u8; 64];
     let mut c_buf = vec![0u8; 64];
-    invoke_with_gids(&spv, true,  dir.path(), "b", b_buf.as_mut_ptr(), &[(0, 0, 0)]);
-    invoke_with_gids(&spv, false, dir.path(), "c", c_buf.as_mut_ptr(), &[(0, 0, 0)]);
+    invoke_with_gids(&spv, true,  dir.path(), "b", &mut [&mut b_buf[..]], &[(0, 0, 0)]);
+    invoke_with_gids(&spv, false, dir.path(), "c", &mut [&mut c_buf[..]], &[(0, 0, 0)]);
     assert_eq!(b_buf, c_buf, "diverge on vec4 GLSL math");
     let read = |off: usize| -> f32 {
         f32::from_le_bytes(b_buf[off..off+4].try_into().unwrap())
@@ -2048,8 +2063,8 @@ fn differential_glsl_smoothstep() {
     let dir = TempDir::new().unwrap();
     let mut b_buf = vec![0u8; 16];
     let mut c_buf = vec![0u8; 16];
-    invoke_with_gids(&spv, true,  dir.path(), "b", b_buf.as_mut_ptr(), &[(0, 0, 0)]);
-    invoke_with_gids(&spv, false, dir.path(), "c", c_buf.as_mut_ptr(), &[(0, 0, 0)]);
+    invoke_with_gids(&spv, true,  dir.path(), "b", &mut [&mut b_buf[..]], &[(0, 0, 0)]);
+    invoke_with_gids(&spv, false, dir.path(), "c", &mut [&mut c_buf[..]], &[(0, 0, 0)]);
     assert_eq!(b_buf, c_buf, "diverge on smoothstep");
     let v = f32::from_le_bytes(b_buf[0..4].try_into().unwrap());
     assert_eq!(v, 0.5, "smoothstep(0,1,0.5) = 0.5; got {v}");
@@ -2124,8 +2139,8 @@ fn differential_glsl_sign_and_step() {
     let dir = TempDir::new().unwrap();
     let mut b_buf = vec![0u8; 32];
     let mut c_buf = vec![0u8; 32];
-    invoke_with_gids(&spv, true,  dir.path(), "b", b_buf.as_mut_ptr(), &[(0, 0, 0)]);
-    invoke_with_gids(&spv, false, dir.path(), "c", c_buf.as_mut_ptr(), &[(0, 0, 0)]);
+    invoke_with_gids(&spv, true,  dir.path(), "b", &mut [&mut b_buf[..]], &[(0, 0, 0)]);
+    invoke_with_gids(&spv, false, dir.path(), "c", &mut [&mut c_buf[..]], &[(0, 0, 0)]);
     assert_eq!(b_buf, c_buf, "diverge on sign/step");
     let read = |i: usize| -> f32 {
         f32::from_le_bytes(b_buf[i*4..i*4+4].try_into().unwrap())
@@ -2189,8 +2204,8 @@ fn differential_glsl_reflect() {
     let dir = TempDir::new().unwrap();
     let mut b_buf = vec![0u8; 16];
     let mut c_buf = vec![0u8; 16];
-    invoke_with_gids(&spv, true,  dir.path(), "b", b_buf.as_mut_ptr(), &[(0, 0, 0)]);
-    invoke_with_gids(&spv, false, dir.path(), "c", c_buf.as_mut_ptr(), &[(0, 0, 0)]);
+    invoke_with_gids(&spv, true,  dir.path(), "b", &mut [&mut b_buf[..]], &[(0, 0, 0)]);
+    invoke_with_gids(&spv, false, dir.path(), "c", &mut [&mut c_buf[..]], &[(0, 0, 0)]);
     assert_eq!(b_buf, c_buf, "diverge on reflect");
     let read = |i: usize| -> f32 {
         f32::from_le_bytes(b_buf[i*4..i*4+4].try_into().unwrap())
@@ -2248,8 +2263,8 @@ fn differential_glsl_normalize() {
     let dir = TempDir::new().unwrap();
     let mut b_buf = vec![0u8; 16];
     let mut c_buf = vec![0u8; 16];
-    invoke_with_gids(&spv, true,  dir.path(), "b", b_buf.as_mut_ptr(), &[(0, 0, 0)]);
-    invoke_with_gids(&spv, false, dir.path(), "c", c_buf.as_mut_ptr(), &[(0, 0, 0)]);
+    invoke_with_gids(&spv, true,  dir.path(), "b", &mut [&mut b_buf[..]], &[(0, 0, 0)]);
+    invoke_with_gids(&spv, false, dir.path(), "c", &mut [&mut c_buf[..]], &[(0, 0, 0)]);
     assert_eq!(b_buf, c_buf, "diverge on normalize");
     let read = |i: usize| -> f32 {
         f32::from_le_bytes(b_buf[i*4..i*4+4].try_into().unwrap())
@@ -2318,8 +2333,8 @@ fn differential_glsl_cross() {
     let dir = TempDir::new().unwrap();
     let mut b_buf = vec![0u8; 16];
     let mut c_buf = vec![0u8; 16];
-    invoke_with_gids(&spv, true,  dir.path(), "b", b_buf.as_mut_ptr(), &[(0, 0, 0)]);
-    invoke_with_gids(&spv, false, dir.path(), "c", c_buf.as_mut_ptr(), &[(0, 0, 0)]);
+    invoke_with_gids(&spv, true,  dir.path(), "b", &mut [&mut b_buf[..]], &[(0, 0, 0)]);
+    invoke_with_gids(&spv, false, dir.path(), "c", &mut [&mut c_buf[..]], &[(0, 0, 0)]);
     assert_eq!(b_buf, c_buf, "diverge on cross");
     let read = |i: usize| -> f32 {
         f32::from_le_bytes(b_buf[i*4..i*4+4].try_into().unwrap())
@@ -2390,8 +2405,8 @@ fn differential_glsl_length_and_distance() {
     let dir = TempDir::new().unwrap();
     let mut b_buf = vec![0u8; 16];
     let mut c_buf = vec![0u8; 16];
-    invoke_with_gids(&spv, true,  dir.path(), "b", b_buf.as_mut_ptr(), &[(0, 0, 0)]);
-    invoke_with_gids(&spv, false, dir.path(), "c", c_buf.as_mut_ptr(), &[(0, 0, 0)]);
+    invoke_with_gids(&spv, true,  dir.path(), "b", &mut [&mut b_buf[..]], &[(0, 0, 0)]);
+    invoke_with_gids(&spv, false, dir.path(), "c", &mut [&mut c_buf[..]], &[(0, 0, 0)]);
     assert_eq!(b_buf, c_buf, "diverge on length/distance");
     let len = f32::from_le_bytes(b_buf[0..4].try_into().unwrap());
     let dst = f32::from_le_bytes(b_buf[4..8].try_into().unwrap());
@@ -2451,8 +2466,8 @@ fn differential_glsl_sabs() {
     let dir = TempDir::new().unwrap();
     let mut b_buf = vec![0u8; 16];
     let mut c_buf = vec![0u8; 16];
-    invoke_with_gids(&spv, true,  dir.path(), "b", b_buf.as_mut_ptr(), &[(0, 0, 0)]);
-    invoke_with_gids(&spv, false, dir.path(), "c", c_buf.as_mut_ptr(), &[(0, 0, 0)]);
+    invoke_with_gids(&spv, true,  dir.path(), "b", &mut [&mut b_buf[..]], &[(0, 0, 0)]);
+    invoke_with_gids(&spv, false, dir.path(), "c", &mut [&mut c_buf[..]], &[(0, 0, 0)]);
     assert_eq!(b_buf, c_buf, "diverge on sabs");
     let v0 = u32::from_le_bytes(b_buf[0..4].try_into().unwrap());
     let v1 = u32::from_le_bytes(b_buf[4..8].try_into().unwrap());
@@ -2511,8 +2526,8 @@ fn differential_glsl_tan() {
     let dir = TempDir::new().unwrap();
     let mut b_buf = vec![0u8; 16];
     let mut c_buf = vec![0u8; 16];
-    invoke_with_gids(&spv, true,  dir.path(), "b", b_buf.as_mut_ptr(), &[(0, 0, 0)]);
-    invoke_with_gids(&spv, false, dir.path(), "c", c_buf.as_mut_ptr(), &[(0, 0, 0)]);
+    invoke_with_gids(&spv, true,  dir.path(), "b", &mut [&mut b_buf[..]], &[(0, 0, 0)]);
+    invoke_with_gids(&spv, false, dir.path(), "c", &mut [&mut c_buf[..]], &[(0, 0, 0)]);
     assert_eq!(b_buf, c_buf, "diverge on tan");
     let read = |i: usize| -> f32 {
         f32::from_le_bytes(b_buf[i*4..i*4+4].try_into().unwrap())
@@ -2580,8 +2595,8 @@ fn differential_glsl_sin_cos() {
     let dir = TempDir::new().unwrap();
     let mut b_buf = vec![0u8; 16];
     let mut c_buf = vec![0u8; 16];
-    invoke_with_gids(&spv, true,  dir.path(), "b", b_buf.as_mut_ptr(), &[(0, 0, 0)]);
-    invoke_with_gids(&spv, false, dir.path(), "c", c_buf.as_mut_ptr(), &[(0, 0, 0)]);
+    invoke_with_gids(&spv, true,  dir.path(), "b", &mut [&mut b_buf[..]], &[(0, 0, 0)]);
+    invoke_with_gids(&spv, false, dir.path(), "c", &mut [&mut c_buf[..]], &[(0, 0, 0)]);
     assert_eq!(b_buf, c_buf, "diverge on sin/cos");
     let read = |i: usize| -> f32 {
         f32::from_le_bytes(b_buf[i*4..i*4+4].try_into().unwrap())
@@ -2709,8 +2724,8 @@ fn differential_glsl_nan_min_max_clamp() {
         let dir = TempDir::new().unwrap();
         let mut b_buf = vec![0u8; 4];
         let mut c_buf = vec![0u8; 4];
-        invoke(&spv, true,  dir.path(), "b", b_buf.as_mut_ptr());
-        invoke(&spv, false, dir.path(), "c", c_buf.as_mut_ptr());
+        invoke(&spv, true,  dir.path(), "b", &mut [&mut b_buf[..]]);
+        invoke(&spv, false, dir.path(), "c", &mut [&mut c_buf[..]]);
         assert_eq!(b_buf, c_buf, "{label}: bespoke vs cranelift diverge");
         let got = f32::from_le_bytes(b_buf[0..4].try_into().unwrap());
         assert!((got - expected).abs() < 1e-6,
@@ -2785,7 +2800,8 @@ fn lse_atomics_are_race_safe_under_concurrent_threads() {
     const N_THREADS: usize = 32;
     const N_ITERS_PER_THREAD: usize = 100;
     let mut buf = vec![0u8; 4];
-    let addr = buf.as_mut_ptr() as usize;
+    let table = ssbo_table(&module, &mut [&mut buf[..]]);
+    let addr = table.as_ptr() as usize;
     std::thread::scope(|scope| {
         for _ in 0..N_THREADS {
             scope.spawn(move || {
@@ -2866,8 +2882,8 @@ fn differential_op_bit_count_and_reverse() {
         let dir = TempDir::new().unwrap();
         let mut b_buf = vec![0u8; 4];
         let mut c_buf = vec![0u8; 4];
-        invoke(&spv, true,  dir.path(), "b", b_buf.as_mut_ptr());
-        invoke(&spv, false, dir.path(), "c", c_buf.as_mut_ptr());
+        invoke(&spv, true,  dir.path(), "b", &mut [&mut b_buf[..]]);
+        invoke(&spv, false, dir.path(), "c", &mut [&mut c_buf[..]]);
         assert_eq!(b_buf, c_buf, "{label}: bespoke vs cranelift diverge");
         let got = u32::from_le_bytes(b_buf[0..4].try_into().unwrap());
         assert_eq!(got, expected,
@@ -2899,8 +2915,8 @@ fn differential_glsl_int_bit_scan() {
         let dir = TempDir::new().unwrap();
         let mut b_buf = vec![0u8; 4];
         let mut c_buf = vec![0u8; 4];
-        invoke(&spv, true,  dir.path(), "b", b_buf.as_mut_ptr());
-        invoke(&spv, false, dir.path(), "c", c_buf.as_mut_ptr());
+        invoke(&spv, true,  dir.path(), "b", &mut [&mut b_buf[..]]);
+        invoke(&spv, false, dir.path(), "c", &mut [&mut c_buf[..]]);
         assert_eq!(b_buf, c_buf, "{label}: bespoke vs cranelift diverge");
         let got = i32::from_le_bytes(b_buf[0..4].try_into().unwrap());
         assert_eq!(got, expected,
@@ -2970,8 +2986,8 @@ fn differential_op_unreachable_branch() {
     let dir = TempDir::new().unwrap();
     let mut b_buf = vec![0u8; 4];
     let mut c_buf = vec![0u8; 4];
-    invoke(&spv, true,  dir.path(), "b", b_buf.as_mut_ptr());
-    invoke(&spv, false, dir.path(), "c", c_buf.as_mut_ptr());
+    invoke(&spv, true,  dir.path(), "b", &mut [&mut b_buf[..]]);
+    invoke(&spv, false, dir.path(), "c", &mut [&mut c_buf[..]]);
     assert_eq!(b_buf, c_buf,
         "OpUnreachable branch diverges between backends");
     let got = u32::from_le_bytes(b_buf[0..4].try_into().unwrap());
@@ -3041,8 +3057,8 @@ fn differential_op_quantize_to_f16() {
         let dir = TempDir::new().unwrap();
         let mut b_buf = vec![0u8; 4];
         let mut c_buf = vec![0u8; 4];
-        invoke(&spv, true,  dir.path(), "b", b_buf.as_mut_ptr());
-        invoke(&spv, false, dir.path(), "c", c_buf.as_mut_ptr());
+        invoke(&spv, true,  dir.path(), "b", &mut [&mut b_buf[..]]);
+        invoke(&spv, false, dir.path(), "c", &mut [&mut c_buf[..]]);
         assert_eq!(b_buf, c_buf, "{label}: bespoke vs cranelift diverge");
         let got = f32::from_le_bytes(b_buf[0..4].try_into().unwrap());
         assert_eq!(got, expected,
@@ -3122,8 +3138,8 @@ fn differential_op_composite_insert_copy_undef() {
     let dir = TempDir::new().unwrap();
     let mut b_buf = vec![0u8; 16];
     let mut c_buf = vec![0u8; 16];
-    invoke(&spv, true,  dir.path(), "b", b_buf.as_mut_ptr());
-    invoke(&spv, false, dir.path(), "c", c_buf.as_mut_ptr());
+    invoke(&spv, true,  dir.path(), "b", &mut [&mut b_buf[..]]);
+    invoke(&spv, false, dir.path(), "c", &mut [&mut c_buf[..]]);
     assert_eq!(b_buf, c_buf,
         "CompositeInsert/CopyObject/Undef divergence");
     let read = |buf: &[u8], i: usize| -> f32 {
@@ -3215,8 +3231,8 @@ fn differential_vector_dynamic_index() {
         let dir = TempDir::new().unwrap();
         let mut b_buf = vec![0u8; 16];
         let mut c_buf = vec![0u8; 16];
-        invoke(&spv, true,  dir.path(), "b", b_buf.as_mut_ptr());
-        invoke(&spv, false, dir.path(), "c", c_buf.as_mut_ptr());
+        invoke(&spv, true,  dir.path(), "b", &mut [&mut b_buf[..]]);
+        invoke(&spv, false, dir.path(), "c", &mut [&mut c_buf[..]]);
         assert_eq!(b_buf, c_buf, "{label}: bespoke vs cranelift diverge");
         let read = |buf: &[u8], i: usize| -> f32 {
             f32::from_le_bytes(buf[i*4..i*4+4].try_into().unwrap())
@@ -3296,8 +3312,8 @@ fn differential_op_srem_smod() {
         let dir = TempDir::new().unwrap();
         let mut b_buf = vec![0u8; 4];
         let mut c_buf = vec![0u8; 4];
-        invoke(&spv, true,  dir.path(), "b", b_buf.as_mut_ptr());
-        invoke(&spv, false, dir.path(), "c", c_buf.as_mut_ptr());
+        invoke(&spv, true,  dir.path(), "b", &mut [&mut b_buf[..]]);
+        invoke(&spv, false, dir.path(), "c", &mut [&mut c_buf[..]]);
         assert_eq!(b_buf, c_buf, "{label}: bespoke vs cranelift diverge");
         let got = i32::from_le_bytes(b_buf[0..4].try_into().unwrap());
         assert_eq!(got, expected, "{label}: got {got}, want {expected}");
@@ -3366,8 +3382,8 @@ fn differential_op_frem_fmod() {
         let dir = TempDir::new().unwrap();
         let mut b_buf = vec![0u8; 4];
         let mut c_buf = vec![0u8; 4];
-        invoke(&spv, true,  dir.path(), "b", b_buf.as_mut_ptr());
-        invoke(&spv, false, dir.path(), "c", c_buf.as_mut_ptr());
+        invoke(&spv, true,  dir.path(), "b", &mut [&mut b_buf[..]]);
+        invoke(&spv, false, dir.path(), "c", &mut [&mut c_buf[..]]);
         assert_eq!(b_buf, c_buf, "{label}: bespoke vs cranelift diverge");
         let got = f32::from_le_bytes(b_buf[0..4].try_into().unwrap());
         assert!((got - expected).abs() < 1e-5,
@@ -3442,8 +3458,8 @@ fn differential_bit_field_ops() {
         let dir = TempDir::new().unwrap();
         let mut b_buf = vec![0u8; 4];
         let mut c_buf = vec![0u8; 4];
-        invoke(&spv, true,  dir.path(), "b", b_buf.as_mut_ptr());
-        invoke(&spv, false, dir.path(), "c", c_buf.as_mut_ptr());
+        invoke(&spv, true,  dir.path(), "b", &mut [&mut b_buf[..]]);
+        invoke(&spv, false, dir.path(), "c", &mut [&mut c_buf[..]]);
         assert_eq!(b_buf, c_buf, "{label}: bespoke vs cranelift diverge");
         let got = u32::from_le_bytes(b_buf[0..4].try_into().unwrap());
         assert_eq!(got, expected,
@@ -3528,8 +3544,8 @@ fn differential_any_all_logical() {
         let dir = TempDir::new().unwrap();
         let mut b_buf = vec![0u8; 4];
         let mut c_buf = vec![0u8; 4];
-        invoke(&spv, true,  dir.path(), "b", b_buf.as_mut_ptr());
-        invoke(&spv, false, dir.path(), "c", c_buf.as_mut_ptr());
+        invoke(&spv, true,  dir.path(), "b", &mut [&mut b_buf[..]]);
+        invoke(&spv, false, dir.path(), "c", &mut [&mut c_buf[..]]);
         assert_eq!(b_buf, c_buf, "{label}: bespoke vs cranelift diverge");
         let got = u32::from_le_bytes(b_buf[0..4].try_into().unwrap());
         assert_eq!(got, expected, "{label}: got {got}, want {expected}");
@@ -3562,8 +3578,8 @@ fn differential_glsl_int_min_max_clamp() {
         let dir = TempDir::new().unwrap();
         let mut b_buf = vec![0u8; 4];
         let mut c_buf = vec![0u8; 4];
-        invoke(&spv, true,  dir.path(), "b", b_buf.as_mut_ptr());
-        invoke(&spv, false, dir.path(), "c", c_buf.as_mut_ptr());
+        invoke(&spv, true,  dir.path(), "b", &mut [&mut b_buf[..]]);
+        invoke(&spv, false, dir.path(), "c", &mut [&mut c_buf[..]]);
         assert_eq!(b_buf, c_buf, "{label}: bespoke vs cranelift diverge");
         let got = u32::from_le_bytes(b_buf[0..4].try_into().unwrap());
         assert_eq!(got, expected,
@@ -3640,8 +3656,8 @@ fn differential_glsl_hyperbolic() {
     let n = results.len();
     let mut b_buf = vec![0u8; n * 4];
     let mut c_buf = vec![0u8; n * 4];
-    invoke_with_gids(&spv, true,  dir.path(), "b", b_buf.as_mut_ptr(), &[(0, 0, 0)]);
-    invoke_with_gids(&spv, false, dir.path(), "c", c_buf.as_mut_ptr(), &[(0, 0, 0)]);
+    invoke_with_gids(&spv, true,  dir.path(), "b", &mut [&mut b_buf[..]], &[(0, 0, 0)]);
+    invoke_with_gids(&spv, false, dir.path(), "c", &mut [&mut c_buf[..]], &[(0, 0, 0)]);
     assert_eq!(b_buf, c_buf, "diverge on hyperbolic");
     let read = |i: usize| -> f32 {
         f32::from_le_bytes(b_buf[i*4..i*4+4].try_into().unwrap())
@@ -3733,8 +3749,8 @@ fn differential_glsl_atan2() {
     let n = results.len();
     let mut b_buf = vec![0u8; n * 4];
     let mut c_buf = vec![0u8; n * 4];
-    invoke_with_gids(&spv, true,  dir.path(), "b", b_buf.as_mut_ptr(), &[(0, 0, 0)]);
-    invoke_with_gids(&spv, false, dir.path(), "c", c_buf.as_mut_ptr(), &[(0, 0, 0)]);
+    invoke_with_gids(&spv, true,  dir.path(), "b", &mut [&mut b_buf[..]], &[(0, 0, 0)]);
+    invoke_with_gids(&spv, false, dir.path(), "c", &mut [&mut c_buf[..]], &[(0, 0, 0)]);
     assert_eq!(b_buf, c_buf, "diverge on atan2");
     let read = |i: usize| -> f32 {
         f32::from_le_bytes(b_buf[i*4..i*4+4].try_into().unwrap())
@@ -3822,8 +3838,8 @@ fn differential_glsl_atan_asin_acos() {
     let n = results.len();
     let mut b_buf = vec![0u8; n * 4];
     let mut c_buf = vec![0u8; n * 4];
-    invoke_with_gids(&spv, true,  dir.path(), "b", b_buf.as_mut_ptr(), &[(0, 0, 0)]);
-    invoke_with_gids(&spv, false, dir.path(), "c", c_buf.as_mut_ptr(), &[(0, 0, 0)]);
+    invoke_with_gids(&spv, true,  dir.path(), "b", &mut [&mut b_buf[..]], &[(0, 0, 0)]);
+    invoke_with_gids(&spv, false, dir.path(), "c", &mut [&mut c_buf[..]], &[(0, 0, 0)]);
     assert_eq!(b_buf, c_buf, "diverge on atan/asin/acos");
     let read = |i: usize| -> f32 {
         f32::from_le_bytes(b_buf[i*4..i*4+4].try_into().unwrap())
@@ -3915,8 +3931,8 @@ fn differential_glsl_exp_exp2() {
     let n = results.len();
     let mut b_buf = vec![0u8; n * 4];
     let mut c_buf = vec![0u8; n * 4];
-    invoke_with_gids(&spv, true,  dir.path(), "b", b_buf.as_mut_ptr(), &[(0, 0, 0)]);
-    invoke_with_gids(&spv, false, dir.path(), "c", c_buf.as_mut_ptr(), &[(0, 0, 0)]);
+    invoke_with_gids(&spv, true,  dir.path(), "b", &mut [&mut b_buf[..]], &[(0, 0, 0)]);
+    invoke_with_gids(&spv, false, dir.path(), "c", &mut [&mut c_buf[..]], &[(0, 0, 0)]);
     assert_eq!(b_buf, c_buf, "diverge on exp/exp2");
     let read = |i: usize| -> f32 {
         f32::from_le_bytes(b_buf[i*4..i*4+4].try_into().unwrap())
@@ -4012,8 +4028,8 @@ fn differential_glsl_log_log2_pow() {
     let n = results.len();
     let mut b_buf = vec![0u8; n * 4];
     let mut c_buf = vec![0u8; n * 4];
-    invoke_with_gids(&spv, true,  dir.path(), "b", b_buf.as_mut_ptr(), &[(0, 0, 0)]);
-    invoke_with_gids(&spv, false, dir.path(), "c", c_buf.as_mut_ptr(), &[(0, 0, 0)]);
+    invoke_with_gids(&spv, true,  dir.path(), "b", &mut [&mut b_buf[..]], &[(0, 0, 0)]);
+    invoke_with_gids(&spv, false, dir.path(), "c", &mut [&mut c_buf[..]], &[(0, 0, 0)]);
     assert_eq!(b_buf, c_buf, "diverge on log/log2/pow");
     let read = |i: usize| -> f32 {
         f32::from_le_bytes(b_buf[i*4..i*4+4].try_into().unwrap())
@@ -4115,8 +4131,8 @@ fn differential_glsl_sin_cos_extended_range() {
     let n = inputs.len() * 2;
     let mut b_buf = vec![0u8; n * 4];
     let mut c_buf = vec![0u8; n * 4];
-    invoke_with_gids(&spv, true,  dir.path(), "b", b_buf.as_mut_ptr(), &[(0, 0, 0)]);
-    invoke_with_gids(&spv, false, dir.path(), "c", c_buf.as_mut_ptr(), &[(0, 0, 0)]);
+    invoke_with_gids(&spv, true,  dir.path(), "b", &mut [&mut b_buf[..]], &[(0, 0, 0)]);
+    invoke_with_gids(&spv, false, dir.path(), "c", &mut [&mut c_buf[..]], &[(0, 0, 0)]);
     assert_eq!(b_buf, c_buf, "diverge on sin/cos extended range");
     let read = |i: usize| -> f32 {
         f32::from_le_bytes(b_buf[i*4..i*4+4].try_into().unwrap())
@@ -4185,8 +4201,8 @@ fn differential_glsl_inversesqrt() {
     let dir = TempDir::new().unwrap();
     let mut b_buf = vec![0u8; 16];
     let mut c_buf = vec![0u8; 16];
-    invoke_with_gids(&spv, true,  dir.path(), "b", b_buf.as_mut_ptr(), &[(0, 0, 0)]);
-    invoke_with_gids(&spv, false, dir.path(), "c", c_buf.as_mut_ptr(), &[(0, 0, 0)]);
+    invoke_with_gids(&spv, true,  dir.path(), "b", &mut [&mut b_buf[..]], &[(0, 0, 0)]);
+    invoke_with_gids(&spv, false, dir.path(), "c", &mut [&mut c_buf[..]], &[(0, 0, 0)]);
     assert_eq!(b_buf, c_buf, "diverge on inversesqrt");
     let v = f32::from_le_bytes(b_buf[0..4].try_into().unwrap());
     assert_eq!(v, 0.5, "1/sqrt(4) = 0.5; got {v}");
@@ -4240,8 +4256,8 @@ fn differential_glsl_fmod() {
     let dir = TempDir::new().unwrap();
     let mut b_buf = vec![0u8; 16];
     let mut c_buf = vec![0u8; 16];
-    invoke_with_gids(&spv, true,  dir.path(), "b", b_buf.as_mut_ptr(), &[(0, 0, 0)]);
-    invoke_with_gids(&spv, false, dir.path(), "c", c_buf.as_mut_ptr(), &[(0, 0, 0)]);
+    invoke_with_gids(&spv, true,  dir.path(), "b", &mut [&mut b_buf[..]], &[(0, 0, 0)]);
+    invoke_with_gids(&spv, false, dir.path(), "c", &mut [&mut c_buf[..]], &[(0, 0, 0)]);
     assert_eq!(b_buf, c_buf, "diverge on fmod");
     let v = f32::from_le_bytes(b_buf[0..4].try_into().unwrap());
     assert!((v - 1.7).abs() < 1e-5, "fmod(5.7, 2.0) ≈ 1.7; got {v}");
@@ -4293,8 +4309,8 @@ fn differential_glsl_fract() {
     let dir = TempDir::new().unwrap();
     let mut b_buf = vec![0u8; 16];
     let mut c_buf = vec![0u8; 16];
-    invoke_with_gids(&spv, true,  dir.path(), "b", b_buf.as_mut_ptr(), &[(0, 0, 0)]);
-    invoke_with_gids(&spv, false, dir.path(), "c", c_buf.as_mut_ptr(), &[(0, 0, 0)]);
+    invoke_with_gids(&spv, true,  dir.path(), "b", &mut [&mut b_buf[..]], &[(0, 0, 0)]);
+    invoke_with_gids(&spv, false, dir.path(), "c", &mut [&mut c_buf[..]], &[(0, 0, 0)]);
     assert_eq!(b_buf, c_buf);
     let v = f32::from_le_bytes(b_buf[0..4].try_into().unwrap());
     assert_eq!(v, 0.75, "fract(3.75) = 0.75; got {v}");
@@ -4366,8 +4382,8 @@ fn differential_glsl_vec4_floor_ceil_trunc() {
     let dir = TempDir::new().unwrap();
     let mut b_buf = vec![0u8; 64];
     let mut c_buf = vec![0u8; 64];
-    invoke_with_gids(&spv, true,  dir.path(), "b", b_buf.as_mut_ptr(), &[(0, 0, 0)]);
-    invoke_with_gids(&spv, false, dir.path(), "c", c_buf.as_mut_ptr(), &[(0, 0, 0)]);
+    invoke_with_gids(&spv, true,  dir.path(), "b", &mut [&mut b_buf[..]], &[(0, 0, 0)]);
+    invoke_with_gids(&spv, false, dir.path(), "c", &mut [&mut c_buf[..]], &[(0, 0, 0)]);
     assert_eq!(b_buf, c_buf, "diverge on vec4 floor/ceil/trunc");
     let read = |off: usize| -> f32 {
         f32::from_le_bytes(b_buf[off..off+4].try_into().unwrap())
@@ -4386,8 +4402,8 @@ fn differential_glsl_floor_ceil_trunc() {
     let dir = TempDir::new().unwrap();
     let mut b_buf = vec![0u8; 16];
     let mut c_buf = vec![0u8; 16];
-    invoke_with_gids(&spv, true,  dir.path(), "b", b_buf.as_mut_ptr(), &[(0, 0, 0)]);
-    invoke_with_gids(&spv, false, dir.path(), "c", c_buf.as_mut_ptr(), &[(0, 0, 0)]);
+    invoke_with_gids(&spv, true,  dir.path(), "b", &mut [&mut b_buf[..]], &[(0, 0, 0)]);
+    invoke_with_gids(&spv, false, dir.path(), "c", &mut [&mut c_buf[..]], &[(0, 0, 0)]);
     assert_eq!(b_buf, c_buf, "diverge on floor/ceil/trunc");
     let read = |i: usize| -> f32 {
         f32::from_le_bytes(b_buf[i*4..i*4+4].try_into().unwrap())
@@ -4449,8 +4465,8 @@ fn differential_glsl_vec4_mix() {
     let dir = TempDir::new().unwrap();
     let mut b_buf = vec![0u8; 16];
     let mut c_buf = vec![0u8; 16];
-    invoke_with_gids(&spv, true,  dir.path(), "b", b_buf.as_mut_ptr(), &[(0, 0, 0)]);
-    invoke_with_gids(&spv, false, dir.path(), "c", c_buf.as_mut_ptr(), &[(0, 0, 0)]);
+    invoke_with_gids(&spv, true,  dir.path(), "b", &mut [&mut b_buf[..]], &[(0, 0, 0)]);
+    invoke_with_gids(&spv, false, dir.path(), "c", &mut [&mut c_buf[..]], &[(0, 0, 0)]);
     assert_eq!(b_buf, c_buf, "diverge on vec4 mix");
     let read = |off: usize| -> f32 {
         f32::from_le_bytes(b_buf[off..off+4].try_into().unwrap())
@@ -4470,8 +4486,8 @@ fn differential_glsl_clamp_and_mix() {
     let dir = TempDir::new().unwrap();
     let mut b_buf = vec![0u8; 16];
     let mut c_buf = vec![0u8; 16];
-    invoke_with_gids(&spv, true,  dir.path(), "b", b_buf.as_mut_ptr(), &[(0, 0, 0)]);
-    invoke_with_gids(&spv, false, dir.path(), "c", c_buf.as_mut_ptr(), &[(0, 0, 0)]);
+    invoke_with_gids(&spv, true,  dir.path(), "b", &mut [&mut b_buf[..]], &[(0, 0, 0)]);
+    invoke_with_gids(&spv, false, dir.path(), "c", &mut [&mut c_buf[..]], &[(0, 0, 0)]);
     assert_eq!(b_buf, c_buf, "diverge on clamp/mix");
     let read = |i: usize| -> f32 {
         f32::from_le_bytes(b_buf[i*4..i*4+4].try_into().unwrap())
@@ -4639,8 +4655,8 @@ fn differential_load_sqrt_store_vec4() {
         b_buf[j*4..j*4+4].copy_from_slice(&x.to_le_bytes());
         c_buf[j*4..j*4+4].copy_from_slice(&x.to_le_bytes());
     }
-    invoke_with_gids(&spv, true,  dir.path(), "b", b_buf.as_mut_ptr(), &[(0, 0, 0)]);
-    invoke_with_gids(&spv, false, dir.path(), "c", c_buf.as_mut_ptr(), &[(0, 0, 0)]);
+    invoke_with_gids(&spv, true,  dir.path(), "b", &mut [&mut b_buf[..]], &[(0, 0, 0)]);
+    invoke_with_gids(&spv, false, dir.path(), "c", &mut [&mut c_buf[..]], &[(0, 0, 0)]);
     assert_eq!(b_buf, c_buf, "diverge on load+sqrt+store vec4");
     let read = |buf: &[u8], i: usize| -> f32 {
         f32::from_le_bytes(buf[i*4..i*4+4].try_into().unwrap())
@@ -4719,8 +4735,8 @@ fn differential_load_fmax_loaded_store_vec4() {
         b_buf[16+j*4..16+j*4+4].copy_from_slice(&x.to_le_bytes());
         c_buf[16+j*4..16+j*4+4].copy_from_slice(&x.to_le_bytes());
     }
-    invoke_with_gids(&spv, true,  dir.path(), "b", b_buf.as_mut_ptr(), &[(0, 0, 0)]);
-    invoke_with_gids(&spv, false, dir.path(), "c", c_buf.as_mut_ptr(), &[(0, 0, 0)]);
+    invoke_with_gids(&spv, true,  dir.path(), "b", &mut [&mut b_buf[..]], &[(0, 0, 0)]);
+    invoke_with_gids(&spv, false, dir.path(), "c", &mut [&mut c_buf[..]], &[(0, 0, 0)]);
     assert_eq!(b_buf, c_buf, "diverge on fmax(loaded, loaded)");
 }
 
@@ -4787,8 +4803,8 @@ fn differential_load_fadd_const_store_vec4() {
         b_buf[j*4..j*4+4].copy_from_slice(&x.to_le_bytes());
         c_buf[j*4..j*4+4].copy_from_slice(&x.to_le_bytes());
     }
-    invoke_with_gids(&spv, true,  dir.path(), "b", b_buf.as_mut_ptr(), &[(0, 0, 0)]);
-    invoke_with_gids(&spv, false, dir.path(), "c", c_buf.as_mut_ptr(), &[(0, 0, 0)]);
+    invoke_with_gids(&spv, true,  dir.path(), "b", &mut [&mut b_buf[..]], &[(0, 0, 0)]);
+    invoke_with_gids(&spv, false, dir.path(), "c", &mut [&mut c_buf[..]], &[(0, 0, 0)]);
     assert_eq!(b_buf, c_buf, "diverge on load + fadd(loaded, const_vec) + store");
 }
 
@@ -4866,8 +4882,8 @@ fn differential_tonemap_with_direct_fmax() {
         b_buf[j*4..j*4+4].copy_from_slice(&x.to_le_bytes());
         c_buf[j*4..j*4+4].copy_from_slice(&x.to_le_bytes());
     }
-    invoke_with_gids(&spv, true,  dir.path(), "b", b_buf.as_mut_ptr(), &[(0, 0, 0)]);
-    invoke_with_gids(&spv, false, dir.path(), "c", c_buf.as_mut_ptr(), &[(0, 0, 0)]);
+    invoke_with_gids(&spv, true,  dir.path(), "b", &mut [&mut b_buf[..]], &[(0, 0, 0)]);
+    invoke_with_gids(&spv, false, dir.path(), "c", &mut [&mut c_buf[..]], &[(0, 0, 0)]);
     assert_eq!(b_buf, c_buf, "diverge on direct fmax(loaded vec, zero vec)");
 }
 
@@ -4941,8 +4957,8 @@ fn differential_tonemap_without_clamp() {
         b_buf[j*4..j*4+4].copy_from_slice(&x.to_le_bytes());
         c_buf[j*4..j*4+4].copy_from_slice(&x.to_le_bytes());
     }
-    invoke_with_gids(&spv, true,  dir.path(), "b", b_buf.as_mut_ptr(), &[(0, 0, 0)]);
-    invoke_with_gids(&spv, false, dir.path(), "c", c_buf.as_mut_ptr(), &[(0, 0, 0)]);
+    invoke_with_gids(&spv, true,  dir.path(), "b", &mut [&mut b_buf[..]], &[(0, 0, 0)]);
+    invoke_with_gids(&spv, false, dir.path(), "c", &mut [&mut c_buf[..]], &[(0, 0, 0)]);
     assert_eq!(b_buf, c_buf, "diverge on tonemap-no-clamp");
 }
 
@@ -4970,14 +4986,12 @@ fn differential_tonemap_per_pixel_vec4() {
     };
     let mut b_bufs = make_bufs();
     let mut c_bufs = make_bufs();
-    let b_table: Vec<u64> = b_bufs.iter_mut().map(|b| b.as_mut_ptr() as u64).collect();
-    let c_table: Vec<u64> = c_bufs.iter_mut().map(|b| b.as_mut_ptr() as u64).collect();
     let gids: Vec<(u32, u32, u32)> = (0..pixels.len() as u32)
         .map(|i| (i, 0, 0)).collect();
     invoke_with_gids(&spv, true,  dir.path(), "b",
-        b_table.as_ptr() as *mut u8, &gids);
+        &mut slices(&mut b_bufs), &gids);
     invoke_with_gids(&spv, false, dir.path(), "c",
-        c_table.as_ptr() as *mut u8, &gids);
+        &mut slices(&mut c_bufs), &gids);
     assert_eq!(b_bufs, c_bufs, "tonemap diverges between backends");
     // Spot-check: pixel 2 (saturated white in) should land
     // at ~sqrt(0.5) ≈ 0.7071 in all RGB channels.
@@ -5062,8 +5076,8 @@ fn differential_workgroup_shared_memory_accumulator() {
     // Four local invocations of a single workgroup.
     let lids: Vec<(u32, u32, u32)> =
         (0..4u32).map(|i| (i, 0, 0)).collect();
-    invoke_cs_main_with_lids(&spv, true,  dir.path(), "b", b_buf.as_mut_ptr(), &lids);
-    invoke_cs_main_with_lids(&spv, false, dir.path(), "c", c_buf.as_mut_ptr(), &lids);
+    invoke_cs_main_with_lids(&spv, true,  dir.path(), "b", &mut [&mut b_buf[..]], &lids);
+    invoke_cs_main_with_lids(&spv, false, dir.path(), "c", &mut [&mut c_buf[..]], &lids);
     assert_eq!(b_buf, c_buf,
         "bespoke vs cranelift diverge on workgroup shared memory");
     for i in 0..4u32 {
@@ -5963,15 +5977,9 @@ fn differential_storage_image_3d_write() {
     }}}
 }
 
-#[test]
-fn differential_storage_image_atomic_add() {
-    // imageAtomicAdd: each invocation forms a texel pointer
-    // via OpImageTexelPointer into an R32 storage image and
-    // atomicAdd's 1 into it.  Every texel of a 2×2 image is
-    // visited 3 times, so each ends at (initial + 3).  The
-    // OpImageTexelPointer path is bespoke-only (Cranelift's
-    // aarch64 backend can't form the Image-class pointer), so
-    // the oracle is the hand-computed final buffer.
+/// CS: `imageAtomicAdd(img, ivec2(gid.xy), 1)` on an R32ui 2D storage
+/// image at binding 0 (OpImageTexelPointer + AtomicIAdd).
+fn build_image_atomic_add_cs() -> Vec<u8> {
     use rspirv::binary::Assemble;
     use rspirv::spirv::{
         AddressingModel, BuiltIn, Capability, Decoration, Dim,
@@ -6028,6 +6036,19 @@ fn differential_storage_image_atomic_add() {
     let words: Vec<u32> = b.module().assemble();
     let mut spv = Vec::with_capacity(words.len() * 4);
     for w in words { spv.extend_from_slice(&w.to_le_bytes()); }
+    spv
+}
+
+#[test]
+fn differential_storage_image_atomic_add() {
+    // imageAtomicAdd: each invocation forms a texel pointer
+    // via OpImageTexelPointer into an R32 storage image and
+    // atomicAdd's 1 into it.  Every texel of a 2×2 image is
+    // visited 3 times, so each ends at (initial + 3).  The
+    // OpImageTexelPointer path is bespoke-only (Cranelift's
+    // aarch64 backend can't form the Image-class pointer), so
+    // the oracle is the hand-computed final buffer.
+    let spv = build_image_atomic_add_cs();
 
     let (w, h) = (2u32, 2u32);
     // Each texel visited 3 times.
@@ -6557,8 +6578,8 @@ fn differential_subgroup_ops_size1_degenerate() {
     let dir = TempDir::new().unwrap();
     let mut b_buf = vec![0u8; 32];
     let mut c_buf = vec![0u8; 32];
-    invoke(&spv, true,  dir.path(), "b", b_buf.as_mut_ptr());
-    invoke(&spv, false, dir.path(), "c", c_buf.as_mut_ptr());
+    invoke(&spv, true,  dir.path(), "b", &mut [&mut b_buf[..]]);
+    invoke(&spv, false, dir.path(), "c", &mut [&mut c_buf[..]]);
     assert_eq!(b_buf, c_buf,
         "subgroup-op lowering diverges between backends");
     let at = |i: usize| u32::from_le_bytes(
@@ -6678,8 +6699,8 @@ fn differential_spec_constant_op() {
     let dir = TempDir::new().unwrap();
     let mut b_buf = vec![0u8; 16];
     let mut c_buf = vec![0u8; 16];
-    invoke(&spv, true,  dir.path(), "b", b_buf.as_mut_ptr());
-    invoke(&spv, false, dir.path(), "c", c_buf.as_mut_ptr());
+    invoke(&spv, true,  dir.path(), "b", &mut [&mut b_buf[..]]);
+    invoke(&spv, false, dir.path(), "c", &mut [&mut c_buf[..]]);
     assert_eq!(b_buf, c_buf,
         "SpecConstantOp folding diverges between backends");
     let at = |i: usize| u32::from_le_bytes(
@@ -6695,10 +6716,12 @@ fn differential_spec_constant_op() {
     let mut overrides = SpecOverrides::new();
     overrides.insert(0, 1);
     let run_one = |use_bespoke: bool, name: &str,
-                   out_ptr: *mut u8| {
+                   bufs: &mut [&mut [u8]]| {
         let dir = TempDir::new().unwrap();
         let module = atrium_spv_frontend::translate_with_spec_overrides(
             &spv, &overrides).expect("frontend");
+        let table = ssbo_table(&module, bufs);
+        let out_ptr = table.as_ptr();
         let obj = bespoke_or_cranelift(&module, use_bespoke);
         let obj_path = dir.path().join(format!("{name}.o"));
         std::fs::write(&obj_path, &obj).unwrap();
@@ -6719,8 +6742,8 @@ fn differential_spec_constant_op() {
     };
     let mut b2 = vec![0u8; 16];
     let mut c2 = vec![0u8; 16];
-    run_one(true,  "b_ov", b2.as_mut_ptr());
-    run_one(false, "c_ov", c2.as_mut_ptr());
+    run_one(true, "b_ov", &mut [&mut b2[..]]);
+    run_one(false, "c_ov", &mut [&mut c2[..]]);
     assert_eq!(b2, c2,
         "SpecConstantOp under override diverges between backends");
     let at2 = |i: usize| u32::from_le_bytes(
@@ -6807,10 +6830,12 @@ fn differential_spec_constants_host_overrides() {
     // Compile through both backends using the overrides path,
     // then dlopen + run inline.  Mirrors invoke()'s shape.
     let run_one = |use_bespoke: bool, name: &str,
-                   out_ptr: *mut u8| {
+                   bufs: &mut [&mut [u8]]| {
         let dir = TempDir::new().unwrap();
         let module = atrium_spv_frontend::translate_with_spec_overrides(
             &spv, &overrides).expect("frontend");
+        let table = ssbo_table(&module, bufs);
+        let out_ptr = table.as_ptr();
         let obj = bespoke_or_cranelift(&module, use_bespoke);
         let obj_path = dir.path().join(format!("{name}.o"));
         std::fs::write(&obj_path, &obj).unwrap();
@@ -6832,8 +6857,8 @@ fn differential_spec_constants_host_overrides() {
     };
     let mut b_buf = vec![0u8; 12];
     let mut c_buf = vec![0u8; 12];
-    run_one(true,  "b_ov", b_buf.as_mut_ptr());
-    run_one(false, "c_ov", c_buf.as_mut_ptr());
+    run_one(true, "b_ov", &mut [&mut b_buf[..]]);
+    run_one(false, "c_ov", &mut [&mut c_buf[..]]);
     assert_eq!(b_buf, c_buf,
         "spec-constant overrides diverge between backends");
     let at = |i: usize| u32::from_le_bytes(
@@ -6920,8 +6945,8 @@ fn differential_spec_constants_default_values() {
     let dir = TempDir::new().unwrap();
     let mut b_buf = vec![0u8; 12];
     let mut c_buf = vec![0u8; 12];
-    invoke(&spv, true,  dir.path(), "b", b_buf.as_mut_ptr());
-    invoke(&spv, false, dir.path(), "c", c_buf.as_mut_ptr());
+    invoke(&spv, true,  dir.path(), "b", &mut [&mut b_buf[..]]);
+    invoke(&spv, false, dir.path(), "c", &mut [&mut c_buf[..]]);
     assert_eq!(b_buf, c_buf,
         "spec-constant default-values diverge between backends");
     let at = |i: usize| u32::from_le_bytes(
@@ -6999,8 +7024,8 @@ fn differential_glsl_pack_unpack_unorm4x8() {
     let dir = TempDir::new().unwrap();
     let mut b_buf = vec![0u8; 12];
     let mut c_buf = vec![0u8; 12];
-    invoke(&spv, true,  dir.path(), "b", b_buf.as_mut_ptr());
-    invoke(&spv, false, dir.path(), "c", c_buf.as_mut_ptr());
+    invoke(&spv, true,  dir.path(), "b", &mut [&mut b_buf[..]]);
+    invoke(&spv, false, dir.path(), "c", &mut [&mut c_buf[..]]);
     assert_eq!(b_buf, c_buf,
         "Pack/UnpackUnorm4x8 diverges between backends");
     let u_at = |i: usize| u32::from_le_bytes(
@@ -7090,8 +7115,8 @@ fn differential_glsl_pack_unpack_snorm4x8() {
     let dir = TempDir::new().unwrap();
     let mut b_buf = vec![0u8; 16];
     let mut c_buf = vec![0u8; 16];
-    invoke(&spv, true,  dir.path(), "b", b_buf.as_mut_ptr());
-    invoke(&spv, false, dir.path(), "c", c_buf.as_mut_ptr());
+    invoke(&spv, true,  dir.path(), "b", &mut [&mut b_buf[..]]);
+    invoke(&spv, false, dir.path(), "c", &mut [&mut c_buf[..]]);
     assert_eq!(b_buf, c_buf,
         "Pack/UnpackSnorm4x8 diverges between backends");
     let u_at = |i: usize| u32::from_le_bytes(
@@ -7187,8 +7212,8 @@ fn differential_glsl_pack_unpack_snorm2x16() {
     let dir = TempDir::new().unwrap();
     let mut b_buf = vec![0u8; 20];
     let mut c_buf = vec![0u8; 20];
-    invoke(&spv, true,  dir.path(), "b", b_buf.as_mut_ptr());
-    invoke(&spv, false, dir.path(), "c", c_buf.as_mut_ptr());
+    invoke(&spv, true,  dir.path(), "b", &mut [&mut b_buf[..]]);
+    invoke(&spv, false, dir.path(), "c", &mut [&mut c_buf[..]]);
     assert_eq!(b_buf, c_buf,
         "Pack/UnpackSnorm2x16 diverges between backends");
     let u_at = |i: usize| u32::from_le_bytes(
@@ -7293,8 +7318,8 @@ fn differential_glsl_pack_unpack_unorm2x16() {
     let dir = TempDir::new().unwrap();
     let mut b_buf = vec![0u8; 20];
     let mut c_buf = vec![0u8; 20];
-    invoke(&spv, true,  dir.path(), "b", b_buf.as_mut_ptr());
-    invoke(&spv, false, dir.path(), "c", c_buf.as_mut_ptr());
+    invoke(&spv, true,  dir.path(), "b", &mut [&mut b_buf[..]]);
+    invoke(&spv, false, dir.path(), "c", &mut [&mut c_buf[..]]);
     assert_eq!(b_buf, c_buf,
         "Pack/UnpackUnorm2x16 diverges between backends");
     let u_at = |i: usize| u32::from_le_bytes(
@@ -7399,8 +7424,8 @@ fn differential_glsl_round_even() {
         let dir = TempDir::new().unwrap();
         let mut b_buf = vec![0u8; 4];
         let mut c_buf = vec![0u8; 4];
-        invoke(&spv, true,  dir.path(), "b", b_buf.as_mut_ptr());
-        invoke(&spv, false, dir.path(), "c", c_buf.as_mut_ptr());
+        invoke(&spv, true,  dir.path(), "b", &mut [&mut b_buf[..]]);
+        invoke(&spv, false, dir.path(), "c", &mut [&mut c_buf[..]]);
         assert_eq!(b_buf, c_buf,
             "RoundEven({x}) diverges between backends");
         let got = f32::from_bits(u32::from_le_bytes(
@@ -7478,8 +7503,8 @@ fn differential_glsl_ldexp() {
         let dir = TempDir::new().unwrap();
         let mut b_buf = vec![0u8; 4];
         let mut c_buf = vec![0u8; 4];
-        invoke(&spv, true,  dir.path(), "b", b_buf.as_mut_ptr());
-        invoke(&spv, false, dir.path(), "c", c_buf.as_mut_ptr());
+        invoke(&spv, true,  dir.path(), "b", &mut [&mut b_buf[..]]);
+        invoke(&spv, false, dir.path(), "c", &mut [&mut c_buf[..]]);
         assert_eq!(b_buf, c_buf,
             "Ldexp({x}, {n}) diverges between backends");
         let got = f32::from_bits(u32::from_le_bytes(
@@ -7582,8 +7607,8 @@ fn differential_glsl_face_forward() {
         let dir = TempDir::new().unwrap();
         let mut b_buf = vec![0u8; 12];
         let mut c_buf = vec![0u8; 12];
-        invoke(&spv, true,  dir.path(), "b", b_buf.as_mut_ptr());
-        invoke(&spv, false, dir.path(), "c", c_buf.as_mut_ptr());
+        invoke(&spv, true,  dir.path(), "b", &mut [&mut b_buf[..]]);
+        invoke(&spv, false, dir.path(), "c", &mut [&mut c_buf[..]]);
         assert_eq!(b_buf, c_buf, "{label}: FaceForward diverges");
         let f32_at = |i: usize| f32::from_le_bytes(
             b_buf[i*4..i*4+4].try_into().unwrap());
@@ -7684,8 +7709,8 @@ fn differential_glsl_refract() {
         let dir = TempDir::new().unwrap();
         let mut b_buf = vec![0u8; 8];
         let mut c_buf = vec![0u8; 8];
-        invoke(&spv, true,  dir.path(), "b", b_buf.as_mut_ptr());
-        invoke(&spv, false, dir.path(), "c", c_buf.as_mut_ptr());
+        invoke(&spv, true,  dir.path(), "b", &mut [&mut b_buf[..]]);
+        invoke(&spv, false, dir.path(), "c", &mut [&mut c_buf[..]]);
         assert_eq!(b_buf, c_buf, "{label}: Refract diverges");
         let f32_at = |i: usize| f32::from_le_bytes(
             b_buf[i*4..i*4+4].try_into().unwrap());
@@ -7783,8 +7808,8 @@ fn differential_glsl_round_ssign_fma() {
         let dir = TempDir::new().unwrap();
         let mut b_buf = vec![0u8; 12];
         let mut c_buf = vec![0u8; 12];
-        invoke(&spv, true,  dir.path(), "b", b_buf.as_mut_ptr());
-        invoke(&spv, false, dir.path(), "c", c_buf.as_mut_ptr());
+        invoke(&spv, true,  dir.path(), "b", &mut [&mut b_buf[..]]);
+        invoke(&spv, false, dir.path(), "c", &mut [&mut c_buf[..]]);
         assert_eq!(b_buf, c_buf, "{label}: Round/SSign/Fma diverges");
         let f32_at = |i: usize| f32::from_le_bytes(
             b_buf[i*4..i*4+4].try_into().unwrap());
@@ -7865,8 +7890,8 @@ fn differential_glsl_radians_degrees() {
         let dir = TempDir::new().unwrap();
         let mut b_buf = vec![0u8; 12];
         let mut c_buf = vec![0u8; 12];
-        invoke(&spv, true,  dir.path(), "b", b_buf.as_mut_ptr());
-        invoke(&spv, false, dir.path(), "c", c_buf.as_mut_ptr());
+        invoke(&spv, true,  dir.path(), "b", &mut [&mut b_buf[..]]);
+        invoke(&spv, false, dir.path(), "c", &mut [&mut c_buf[..]]);
         assert_eq!(b_buf, c_buf,
             "Radians/Degrees diverges for deg={deg}");
         let f32_at = |buf: &[u8], i: usize| -> f32 {
@@ -7963,7 +7988,7 @@ fn differential_glsl_pack_unpack_half2x16() {
     // bespoke-path-only.  The hand-computed f16 bit patterns
     // below are the correctness oracle.
     let mut b_buf = vec![0u8; 16];
-    invoke_with_gids(&spv, true,  dir.path(), "b", b_buf.as_mut_ptr(), &[(0, 0, 0)]);
+    invoke_with_gids(&spv, true,  dir.path(), "b", &mut [&mut b_buf[..]], &[(0, 0, 0)]);
     let u32_at = |i: usize| -> u32 {
         u32::from_le_bytes(b_buf[i*4..i*4+4].try_into().unwrap())
     };
@@ -8039,8 +8064,8 @@ fn differential_op_isnan_isinf() {
         let dir = TempDir::new().unwrap();
         let mut b_buf = vec![0u8; 4];
         let mut c_buf = vec![0u8; 4];
-        invoke(&spv, true,  dir.path(), "b", b_buf.as_mut_ptr());
-        invoke(&spv, false, dir.path(), "c", c_buf.as_mut_ptr());
+        invoke(&spv, true,  dir.path(), "b", &mut [&mut b_buf[..]]);
+        invoke(&spv, false, dir.path(), "c", &mut [&mut c_buf[..]]);
         assert_eq!(b_buf, c_buf, "{label}: bespoke vs cranelift diverge");
         let got = u32::from_le_bytes(b_buf[0..4].try_into().unwrap());
         assert_eq!(got, expected, "{label}: got {got}, want {expected}");
@@ -8126,8 +8151,8 @@ fn differential_workgroup_shared_array() {
     let mut c_buf = vec![0u8; 16];
     let lids: Vec<(u32, u32, u32)> =
         (0..4u32).map(|i| (i, 0, 0)).collect();
-    invoke_cs_main_with_lids(&spv, true,  dir.path(), "b", b_buf.as_mut_ptr(), &lids);
-    invoke_cs_main_with_lids(&spv, false, dir.path(), "c", c_buf.as_mut_ptr(), &lids);
+    invoke_cs_main_with_lids(&spv, true,  dir.path(), "b", &mut [&mut b_buf[..]], &lids);
+    invoke_cs_main_with_lids(&spv, false, dir.path(), "c", &mut [&mut c_buf[..]], &lids);
     assert_eq!(b_buf, c_buf,
         "bespoke vs cranelift diverge on workgroup shared array");
     for i in 0..4u32 {
@@ -8162,8 +8187,8 @@ fn differential_local_invocation_index_linearises() {
     // the right slots.  Use the existing helper -- its 4th-6th
     // args ARE lid (per the cs_main signature).
     let lid_tuples: Vec<(u32, u32, u32)> = gids;
-    invoke_cs_main_with_lids(&spv, true,  dir.path(), "b", b_buf.as_mut_ptr(), &lid_tuples);
-    invoke_cs_main_with_lids(&spv, false, dir.path(), "c", c_buf.as_mut_ptr(), &lid_tuples);
+    invoke_cs_main_with_lids(&spv, true,  dir.path(), "b", &mut [&mut b_buf[..]], &lid_tuples);
+    invoke_cs_main_with_lids(&spv, false, dir.path(), "c", &mut [&mut c_buf[..]], &lid_tuples);
     assert_eq!(b_buf, c_buf,
         "bespoke vs cranelift diverge on LocalInvocationIndex");
     for i in 0..8u32 {
@@ -8178,8 +8203,10 @@ fn differential_local_invocation_index_linearises() {
 /// always (0,0,0) here.  Used by tests that need to drive
 /// the lid lanes directly.
 fn invoke_cs_main_with_lids(spv: &[u8], use_bespoke: bool, dir: &Path, name: &str,
-                            out_ptr: *mut u8, lids: &[(u32, u32, u32)]) {
+                            bufs: &mut [&mut [u8]], lids: &[(u32, u32, u32)]) {
     let module = translate(spv).expect("frontend");
+    let table = ssbo_table(&module, bufs);
+    let out_ptr = table.as_ptr();
     let obj = bespoke_or_cranelift(&module, use_bespoke);
     let obj_path = dir.join(format!("{name}.o"));
     std::fs::write(&obj_path, &obj).unwrap();
@@ -8232,8 +8259,8 @@ fn differential_histogram_one_binding() {
     let mut c_buf = make_buf();
     let gids: Vec<(u32, u32, u32)> = (0..samples.len() as u32)
         .map(|i| (i, 0, 0)).collect();
-    invoke_with_gids(&spv, true,  dir.path(), "b", b_buf.as_mut_ptr(), &gids);
-    invoke_with_gids(&spv, false, dir.path(), "c", c_buf.as_mut_ptr(), &gids);
+    invoke_with_gids(&spv, true,  dir.path(), "b", &mut [&mut b_buf[..]], &gids);
+    invoke_with_gids(&spv, false, dir.path(), "c", &mut [&mut c_buf[..]], &gids);
     assert_eq!(b_buf, c_buf,
         "bespoke vs cranelift diverge on one-ssbo histogram");
     let bins: Vec<u32> = (0..4)
@@ -8257,14 +8284,12 @@ fn differential_histogram_integration() {
     };
     let mut b_bufs = make_bufs();
     let mut c_bufs = make_bufs();
-    let b_table: Vec<u64> = b_bufs.iter_mut().map(|b| b.as_mut_ptr() as u64).collect();
-    let c_table: Vec<u64> = c_bufs.iter_mut().map(|b| b.as_mut_ptr() as u64).collect();
     let gids: Vec<(u32, u32, u32)> = (0..samples.len() as u32)
         .map(|i| (i, 0, 0)).collect();
     invoke_with_gids(&spv, true,  dir.path(), "b",
-        b_table.as_ptr() as *mut u8, &gids);
+        &mut slices(&mut b_bufs), &gids);
     invoke_with_gids(&spv, false, dir.path(), "c",
-        c_table.as_ptr() as *mut u8, &gids);
+        &mut slices(&mut c_bufs), &gids);
     assert_eq!(b_bufs, c_bufs,
         "bespoke vs cranelift diverge on histogram integration");
     // Sanity-check the actual histogram.
@@ -8359,8 +8384,8 @@ fn differential_glsl_vec_transcendentals() {
     let dir = TempDir::new().unwrap();
     let mut b_buf = vec![0u8; 48];
     let mut c_buf = vec![0u8; 48];
-    invoke_with_gids(&spv, true,  dir.path(), "b", b_buf.as_mut_ptr(), &[(0, 0, 0)]);
-    invoke_with_gids(&spv, false, dir.path(), "c", c_buf.as_mut_ptr(), &[(0, 0, 0)]);
+    invoke_with_gids(&spv, true,  dir.path(), "b", &mut [&mut b_buf[..]], &[(0, 0, 0)]);
+    invoke_with_gids(&spv, false, dir.path(), "c", &mut [&mut c_buf[..]], &[(0, 0, 0)]);
     // exp(0.5, -1.25, 2.0); log2(0.75, 2.5, 8.0); sin(x); pow(y, x).
     let expect: [f32; 12] = [
         1.6487213, 0.2865048, 7.3890561,
@@ -8492,8 +8517,8 @@ fn differential_local_scratch_array() {
         (0..4).map(|i| (i, 0, 0)).collect();
     let mut b_buf = vec![0u8; 32];
     let mut c_buf = vec![0u8; 32];
-    invoke_with_gids(&spv, true, dir.path(), "b", b_buf.as_mut_ptr(), &gids);
-    invoke_with_gids(&spv, false, dir.path(), "c", c_buf.as_mut_ptr(), &gids);
+    invoke_with_gids(&spv, true, dir.path(), "b", &mut [&mut b_buf[..]], &gids);
+    invoke_with_gids(&spv, false, dir.path(), "c", &mut [&mut c_buf[..]], &gids);
     assert_eq!(b_buf, c_buf, "bespoke vs cranelift diverge on local arrays");
     let read = |i: usize| -> f32 {
         f32::from_le_bytes(b_buf[i * 4..i * 4 + 4].try_into().unwrap())
@@ -8576,8 +8601,8 @@ fn differential_op_umod() {
     let gids: Vec<(u32, u32, u32)> = (0..6).map(|i| (i, 0, 0)).collect();
     let mut b_buf = vec![0u8; 24];
     let mut c_buf = vec![0u8; 24];
-    invoke_with_gids(&spv, true, dir.path(), "b", b_buf.as_mut_ptr(), &gids);
-    invoke_with_gids(&spv, false, dir.path(), "c", c_buf.as_mut_ptr(), &gids);
+    invoke_with_gids(&spv, true, dir.path(), "b", &mut [&mut b_buf[..]], &gids);
+    invoke_with_gids(&spv, false, dir.path(), "c", &mut [&mut c_buf[..]], &gids);
     assert_eq!(b_buf, c_buf, "bespoke vs cranelift diverge on UMod");
     let read = |i: usize| -> u32 {
         u32::from_le_bytes(b_buf[i * 4..i * 4 + 4].try_into().unwrap())
@@ -8664,9 +8689,9 @@ fn differential_op_smod_floored() {
     let dir = TempDir::new().unwrap();
     let mut b_buf = vec![0u8; 24];
     let mut c_buf = vec![0u8; 24];
-    invoke_with_gids(&spv, true, dir.path(), "b", b_buf.as_mut_ptr(),
+    invoke_with_gids(&spv, true, dir.path(), "b", &mut [&mut b_buf[..]],
         &[(0, 0, 0)]);
-    invoke_with_gids(&spv, false, dir.path(), "c", c_buf.as_mut_ptr(),
+    invoke_with_gids(&spv, false, dir.path(), "c", &mut [&mut c_buf[..]],
         &[(0, 0, 0)]);
     assert_eq!(b_buf, c_buf, "bespoke vs cranelift diverge on SMod");
     let read = |i: usize| -> i32 {
@@ -8679,5 +8704,222 @@ fn differential_op_smod_floored() {
     let expect = [1, 2, -2, -1, 0, 0];
     for (i, e) in expect.iter().enumerate() {
         assert_eq!(read(i), *e, "case {i}");
+    }
+}
+
+// ── Robust access (ABI v5): out-of-bounds SSBO accesses ────
+//
+// docs/spec/tier2-robust-access.md: an access past the end of a binding
+// goes to a per-table sink instead, so a shader can neither crash the
+// host nor touch memory outside its buffers. Each test runs both
+// backends over a buffer that sits inside a canary-filled allocation and
+// checks that nothing outside the buffer changed.
+
+/// Index into `data` for `build_oob_cs`.
+#[derive(Clone, Copy)]
+enum OobIdx {
+    /// `gid_x + k` (dynamic; the test picks gid_x).
+    Dyn(u32),
+    /// The literal `k` (constant-only access chain).
+    Const(u32),
+}
+
+/// CS over binding 0 `{ uint data[]; }` and binding 1 `{ uint out[]; }`:
+///   v = data[i]; data[i] = v + 1; atomicAdd(data[i], 2); out[0] = v;
+/// `out` is in bounds; `data[i]` is the access under test.
+fn build_oob_cs(idx: OobIdx) -> Vec<u8> {
+    use rspirv::binary::Assemble;
+    use rspirv::spirv::{
+        AddressingModel, BuiltIn, Capability, Decoration, ExecutionMode,
+        ExecutionModel, FunctionControl, MemoryModel, MemorySemantics, Scope,
+        StorageClass,
+    };
+    use rspirv::dr::Operand::LiteralBit32 as L;
+    let mut b = rspirv::dr::Builder::new();
+    b.set_version(1, 3);
+    b.capability(Capability::Shader);
+    b.memory_model(AddressingModel::Logical, MemoryModel::GLSL450);
+    let void   = b.type_void();
+    let u32_ty = b.type_int(32, 0);
+    let uvec3  = b.type_vector(u32_ty, 3);
+    let void_fn = b.type_function(void, vec![]);
+    let rt_arr = b.type_runtime_array(u32_ty);
+    b.decorate(rt_arr, Decoration::ArrayStride, vec![L(4)]);
+    let s = b.type_struct(vec![rt_arr]);
+    b.decorate(s, Decoration::Block, vec![]);
+    b.member_decorate(s, 0, Decoration::Offset, vec![L(0)]);
+    let ptr_s = b.type_pointer(None, StorageClass::StorageBuffer, s);
+    let ptr_u = b.type_pointer(None, StorageClass::StorageBuffer, u32_ty);
+    let data = b.variable(ptr_s, None, StorageClass::StorageBuffer, None);
+    b.decorate(data, Decoration::DescriptorSet, vec![L(0)]);
+    b.decorate(data, Decoration::Binding, vec![L(0)]);
+    let out = b.variable(ptr_s, None, StorageClass::StorageBuffer, None);
+    b.decorate(out, Decoration::DescriptorSet, vec![L(0)]);
+    b.decorate(out, Decoration::Binding, vec![L(1)]);
+    let ptr_in_uvec3 = b.type_pointer(None, StorageClass::Input, uvec3);
+    let gid_var = b.variable(ptr_in_uvec3, None, StorageClass::Input, None);
+    b.decorate(gid_var, Decoration::BuiltIn,
+        vec![rspirv::dr::Operand::BuiltIn(BuiltIn::GlobalInvocationId)]);
+    let c_zero = b.constant_bit32(u32_ty, 0);
+    let c_one  = b.constant_bit32(u32_ty, 1);
+    let c_two  = b.constant_bit32(u32_ty, 2);
+    let c_scope = b.constant_bit32(u32_ty, Scope::Device as u32);
+    let c_sem   = b.constant_bit32(u32_ty, MemorySemantics::empty().bits());
+    let k = match idx { OobIdx::Dyn(k) | OobIdx::Const(k) => k };
+    let c_k = b.constant_bit32(u32_ty, k);
+    let main = b.begin_function(void, None, FunctionControl::NONE, void_fn).unwrap();
+    b.begin_block(None).unwrap();
+    let i = match idx {
+        OobIdx::Dyn(_) => {
+            let gid = b.load(uvec3, None, gid_var, None, vec![]).unwrap();
+            let gid_x = b.composite_extract(u32_ty, None, gid, vec![0]).unwrap();
+            b.i_add(u32_ty, None, gid_x, c_k).unwrap()
+        }
+        OobIdx::Const(_) => c_k,
+    };
+    let p = b.access_chain(ptr_u, None, data, vec![c_zero, i]).unwrap();
+    let v = b.load(u32_ty, None, p, None, vec![]).unwrap();
+    let v1 = b.i_add(u32_ty, None, v, c_one).unwrap();
+    b.store(p, v1, None, vec![]).unwrap();
+    b.atomic_i_add(u32_ty, None, p, c_scope, c_sem, c_two).unwrap();
+    let o = b.access_chain(ptr_u, None, out, vec![c_zero, c_zero]).unwrap();
+    b.store(o, v, None, vec![]).unwrap();
+    b.ret().unwrap();
+    b.end_function().unwrap();
+    b.entry_point(ExecutionModel::GLCompute, main, "main",
+        vec![gid_var, data, out]);
+    b.execution_mode(main, ExecutionMode::LocalSize, [1u32, 1, 1]);
+    let words: Vec<u32> = b.module().assemble();
+    let mut bytes = Vec::with_capacity(words.len() * 4);
+    for w in words { bytes.extend_from_slice(&w.to_le_bytes()); }
+    bytes
+}
+
+const CANARY: u8 = 0xA5;
+const PAD: usize = 4096;
+
+/// Run `build_oob_cs(idx)` on one backend with a `data` buffer of
+/// `n_bytes` (prefilled with words 10, 20, 30, ...) between two canary
+/// pads, over `gids`. Returns `(data, out)` after checking the pads.
+fn run_oob(idx: OobIdx, use_bespoke: bool, n_bytes: usize,
+           gids: &[(u32, u32, u32)]) -> (Vec<u8>, u32) {
+    let spv = build_oob_cs(idx);
+    if use_bespoke && cfg!(target_arch = "x86_64") {
+        // The bespoke side must really be the x86 backend's own code,
+        // not the Cranelift fallback.
+        use atrium_spv_backend_bespoke_x86 as x86;
+        let module = translate(&spv).expect("frontend");
+        x86::compile(&module, x86::Target::host())
+            .expect("bespoke-x86 compiles the bounds-checked shader");
+    }
+    let dir = TempDir::new().unwrap();
+    let mut arena = vec![CANARY; PAD + n_bytes + PAD];
+    for (w, chunk) in arena[PAD..PAD + n_bytes].chunks_exact_mut(4).enumerate() {
+        chunk.copy_from_slice(&(10 * (w as u32 + 1)).to_le_bytes());
+    }
+    let mut out = vec![CANARY; PAD + 16 + PAD];
+    {
+        let (_, rest) = arena.split_at_mut(PAD);
+        let (data, _) = rest.split_at_mut(n_bytes);
+        let (_, orest) = out.split_at_mut(PAD);
+        let (o, _) = orest.split_at_mut(16);
+        invoke_with_gids(&spv, use_bespoke, dir.path(),
+            if use_bespoke { "b" } else { "c" }, &mut [data, o], gids);
+    }
+    let who = if use_bespoke { "bespoke" } else { "cranelift" };
+    for (name, buf, n) in [("data", &arena, n_bytes), ("out", &out, 16)] {
+        assert!(buf[..PAD].iter().all(|&x| x == CANARY),
+            "{who}: write below the {name} buffer");
+        assert!(buf[PAD + n..].iter().all(|&x| x == CANARY),
+            "{who}: write past the end of the {name} buffer");
+    }
+    let o = u32::from_le_bytes(out[PAD..PAD + 4].try_into().unwrap());
+    (arena[PAD..PAD + n_bytes].to_vec(), o)
+}
+
+fn prefilled(n_bytes: usize) -> Vec<u8> {
+    (0..n_bytes / 4).flat_map(|w| (10 * (w as u32 + 1)).to_le_bytes()).collect()
+}
+
+#[test]
+fn robust_in_bounds_access_still_works() {
+    // Sanity: the shader really reads, writes and adds when in bounds.
+    for be in [true, false] {
+        let (data, o) = run_oob(OobIdx::Dyn(1), be, 16, &[(0, 0, 0)]);
+        assert_eq!(o, 20);
+        assert_eq!(u32::from_le_bytes(data[4..8].try_into().unwrap()), 23);
+        let (data, o) = run_oob(OobIdx::Const(3), be, 16, &[(0, 0, 0)]);
+        assert_eq!(o, 40);
+        assert_eq!(u32::from_le_bytes(data[12..16].try_into().unwrap()), 43);
+    }
+}
+
+#[test]
+fn robust_dynamic_index_past_end_is_contained() {
+    // Just past the end, far past it, and at the top of the u32 range
+    // (unchecked, 4 * 0xFFFF_FFFF lands ~16 GiB away and faults).
+    let gids = [(4, 0, 0), (5, 0, 0), (1 << 20, 0, 0), (0x7FFF_FFFF, 0, 0),
+                (0xFFFF_FFFE, 0, 0), (0xFFFF_FFFF, 0, 0)];
+    for be in [true, false] {
+        let (data, _) = run_oob(OobIdx::Dyn(0), be, 16, &gids);
+        assert_eq!(data, prefilled(16), "OOB writes must not land in the buffer");
+    }
+}
+
+#[test]
+fn robust_index_wraps_in_u32_and_stays_contained() {
+    // gid_x + k overflows u32 to a small index: that is in bounds by
+    // SPIR-V's own arithmetic and must hit the right word.
+    for be in [true, false] {
+        let (data, o) = run_oob(OobIdx::Dyn(0xFFFF_FFFF), be, 16, &[(2, 0, 0)]);
+        assert_eq!(o, 20);
+        assert_eq!(u32::from_le_bytes(data[4..8].try_into().unwrap()), 23);
+    }
+}
+
+#[test]
+fn robust_constant_index_past_end_is_contained() {
+    for k in [4u32, 100, 1 << 28] {
+        for be in [true, false] {
+            let (data, _) = run_oob(OobIdx::Const(k), be, 16, &[(0, 0, 0)]);
+            assert_eq!(data, prefilled(16), "k={k}");
+        }
+    }
+}
+
+#[test]
+fn robust_empty_and_unaligned_buffers_are_contained() {
+    // A zero-length binding: every access is out of bounds. A 6-byte
+    // binding: word 1 straddles the end, so it must not be accessed.
+    for be in [true, false] {
+        let (data, _) = run_oob(OobIdx::Const(0), be, 0, &[(0, 0, 0)]);
+        assert!(data.is_empty());
+        let (data, _) = run_oob(OobIdx::Dyn(0), be, 6, &[(1, 0, 0), (2, 0, 0)]);
+        assert_eq!(&data[..4], &10u32.to_le_bytes());
+        assert_eq!(&data[4..], &[CANARY, CANARY], "word 1 straddles the end");
+    }
+}
+
+#[test]
+fn robust_image_texel_pointer_out_of_range_is_contained() {
+    // Coordinates outside the image clamp to 0 on that axis (spec §2),
+    // so the atomic lands inside the image, never past it.
+    let spv = build_image_atomic_add_cs();
+    let (w, h) = (2u32, 2u32);
+    let n = (w * h * 4) as usize;
+    let gids = [(2, 0, 0), (0, 2, 0), (0xFFFF_FFFF, 1, 0), (1, 0x8000_0000, 0),
+                (1 << 30, 1 << 30, 0)];
+    for be in [true, false] {
+        let dir = TempDir::new().unwrap();
+        let mut arena = vec![CANARY; PAD + n + PAD];
+        arena[PAD..PAD + n].fill(0);
+        invoke_compute_image(&spv, be, dir.path(), if be { "b" } else { "c" },
+            &mut arena[PAD..PAD + n], w, h, 1, 1, &gids);
+        assert!(arena[..PAD].iter().all(|&x| x == CANARY), "write below image");
+        assert!(arena[PAD + n..].iter().all(|&x| x == CANARY), "write past image");
+        let t: Vec<u32> = arena[PAD..PAD + n].chunks_exact(4)
+            .map(|c| u32::from_le_bytes(c.try_into().unwrap())).collect();
+        // (2,0)->(0,0); (0,2)->(0,0); (big,1)->(0,1); (1,big)->(1,0); both->(0,0).
+        assert_eq!(t, vec![3, 1, 1, 0], "backend bespoke={be}");
     }
 }

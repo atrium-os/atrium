@@ -87,8 +87,11 @@ fn tierb_case(path: &std::path::Path, dir: &Path) -> Option<String> {
     unsafe {
         let lib = libloading::Library::new(&so).unwrap();
         let cs: libloading::Symbol<CsMain2> = lib.get(b"atrium_cs_main").unwrap();
-        let table: Vec<u64> = t.iter_mut().map(|b| b.as_mut_ptr() as u64).collect();
-        let out = if nb >= 2 { table.as_ptr() as *mut u8 } else { table[0] as *mut u8 };
+        // ABI v5 SSBO table: `{ base, size }` per binding.
+        let descs: Vec<_> = t.iter().map(|b| atrium_spv_runtime::SsboDesc::of(b)).collect();
+        let table = atrium_spv_runtime::SsboTable::new(&descs);
+        let out = table.as_ptr();
+        let _ = nb;
         for z in 0..lz { for y in 0..ly { for x in 0..lx {
             cs(std::ptr::null(), push.as_ptr(), out, 0, 0, 0, x, y, z, std::ptr::null_mut());
         }}}
@@ -144,10 +147,11 @@ fn run_tier2(bytes: &[u8], bufs: &[Vec<u8>], groups: u32, dir: &Path) -> Vec<Vec
     unsafe {
         let lib = libloading::Library::new(&so).unwrap();
         let cs: libloading::Symbol<CsMain> = lib.get(b"atrium_cs_main").unwrap();
-        let table: Vec<u64> = out.iter_mut().map(|b| b.as_mut_ptr() as u64).collect();
+        let descs: Vec<_> = out.iter().map(|b| atrium_spv_runtime::SsboDesc::of(b)).collect();
+        let table = atrium_spv_runtime::SsboTable::new(&descs);
         for g in 0..groups {
             for l in 0..64 {
-                cs(std::ptr::null(), std::ptr::null(), table.as_ptr() as *mut u8, g, 0, 0, l, 0, 0, std::ptr::null_mut());
+                cs(std::ptr::null(), std::ptr::null(), table.as_ptr(), g, 0, 0, l, 0, 0, std::ptr::null_mut());
             }
         }
     }

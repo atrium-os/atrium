@@ -33,6 +33,7 @@ dependencies = [
  "atrium-spv-backend-cranelift",
  "atrium-spv-frontend",
  "atrium-spv-ir",
+ "atrium-spv-runtime",
  "libloading",
  "tempfile",
 ]

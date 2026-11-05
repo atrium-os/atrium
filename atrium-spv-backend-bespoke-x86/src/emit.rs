@@ -496,7 +496,11 @@ impl<'a> Emit<'a> {
                 self.a.mov(r, qword_ptr(b + (disp + addr.off))).map_err(enc)?;
                 self.p_fin(*d, r)?;
             }
-            M::PtrAdd { d, base, idx, stride } => self.ptr_add(*d, *base, *idx, *stride)?,
+            M::PtrAdd { d, base, idx, stride } => self.ptr_add(*d, Some(*base), *idx, *stride)?,
+            M::PScale { d, idx, stride } => self.ptr_add(*d, None, *idx, *stride)?,
+            M::Guard { d, buf, size, sink, doff, off, bytes } => {
+                self.guard(*d, *buf, *size, *sink, *doff, *off, *bytes)?
+            }
             M::PMov { d, s } => match (self.loc(*d), self.loc(*s)) {
                 (a, b) if a == b => {}
                 (Loc::Reg(PReg::G(rd)), Loc::Reg(PReg::G(rs))) => {
@@ -1200,29 +1204,77 @@ impl<'a> Emit<'a> {
 
     /// d = base + zext(idx) * stride. A 32-bit GPR value is already
     /// zero-extended in its 64-bit register.
-    fn ptr_add(&mut self, d: VReg, base: Base, idx: VReg, stride: u32) -> Result<(), BackendError> {
-        let (b, disp) = self.base(base)?;
+    /// d = base + zext(idx) * stride, or just zext(idx) * stride.
+    fn ptr_add(&mut self, d: VReg, base: Option<Base>, idx: VReg, stride: u32) -> Result<(), BackendError> {
+        let bd = match base {
+            Some(b) => Some(self.base(b)?),
+            None => None,
+        };
         let i32r = self.g_reg(idx, eax)?;
-        let i = to64(i32r);
+        // A 32-bit register is zero-extended only by a 32-bit write; the
+        // index's register may hold garbage above bit 31, so copy it.
+        self.a.mov(eax, i32r).map_err(enc)?;
         let rd = self.p_dst(d);
-        match stride {
-            1 => self.a.lea(rd, ptr(b + i + disp)).map_err(enc)?,
-            2 => self.a.lea(rd, ptr(b + i * 2 + disp)).map_err(enc)?,
-            4 => self.a.lea(rd, ptr(b + i * 4 + disp)).map_err(enc)?,
-            8 => self.a.lea(rd, ptr(b + i * 8 + disp)).map_err(enc)?,
+        let scaled = match stride {
+            1 | 2 | 4 | 8 => None,
             s if s.is_power_of_two() => {
-                if i != rax {
-                    self.a.mov(eax, i32r).map_err(enc)?; // zero-extends
-                }
                 self.a.shl(rax, s.trailing_zeros() as i32).map_err(enc)?;
-                self.a.lea(rd, ptr(b + rax + disp)).map_err(enc)?;
+                Some(())
             }
             _ => {
                 let s = i32::try_from(stride)
                     .map_err(|_| BackendError::Unsupported("PtrOffsetDynamic stride".into()))?;
-                self.a.imul_3(rax, i, s).map_err(enc)?;
-                self.a.lea(rd, ptr(b + rax + disp)).map_err(enc)?;
+                self.a.imul_3(rax, rax, s).map_err(enc)?;
+                Some(())
             }
+        };
+        let k = if scaled.is_some() { 1 } else { stride };
+        let m = match (bd, k) {
+            (Some((b, disp)), 1) => ptr(b + rax + disp),
+            (Some((b, disp)), 2) => ptr(b + rax * 2 + disp),
+            (Some((b, disp)), 4) => ptr(b + rax * 4 + disp),
+            (Some((b, disp)), _) => ptr(b + rax * 8 + disp),
+            (None, 1) => ptr(rax + 0),
+            (None, 2) => ptr(rax * 2),
+            (None, 4) => ptr(rax * 4),
+            (None, _) => ptr(rax * 8),
+        };
+        self.a.lea(rd, m).map_err(enc)?;
+        self.p_fin(d, rd)
+    }
+
+    /// Bounds-checked SSBO address (docs/spec/tier2-robust-access.md):
+    ///   rax = doff + off + bytes; cmp rax, size
+    ///   d = buf + rax - bytes (lea, flags kept); cmova d, sink
+    #[allow(clippy::too_many_arguments)]
+    fn guard(
+        &mut self,
+        d: VReg,
+        buf: VReg,
+        size: VReg,
+        sink: VReg,
+        doff: Option<VReg>,
+        off: i32,
+        bytes: u32,
+    ) -> Result<(), BackendError> {
+        let n = bytes as i32;
+        match doff {
+            Some(o) => {
+                let r = self.g64(o)?;
+                self.a.lea(rax, ptr(r + (off + n))).map_err(enc)?;
+            }
+            None => self.a.mov(rax, (off as i64) + n as i64).map_err(enc)?,
+        }
+        let rs = self.g64(size)?;
+        self.a.cmp(rax, rs).map_err(enc)?;
+        // From here on only lea, mov and cmov: the flags must survive.
+        let rb = self.g64(buf)?;
+        let rd = self.p_dst(d);
+        self.a.lea(rd, ptr(rb + rax - n)).map_err(enc)?;
+        match self.loc(sink) {
+            Loc::Reg(PReg::G(r)) => self.a.cmova(rd, G64[r as usize]).map_err(enc)?,
+            Loc::Slot(k) => self.a.cmova(rd, qword_ptr(rsp + 16 * k as i32)).map_err(enc)?,
+            Loc::Reg(PReg::X(_)) => unreachable!(),
         }
         self.p_fin(d, rd)
     }

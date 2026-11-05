@@ -2380,31 +2380,25 @@ impl Tier2Backend {
         // tuple, so the raw pointers in `vs_ssbo_table` remain
         // valid for every `build_triangle_setups` call below (the
         // VS runs serially there, before tile rasterization).
-        let (vs_ssbo_store, vs_ssbo_table): (Vec<Vec<u8>>, Vec<u8>) = {
+        let (vs_ssbo_store, vs_ssbo_table): (Vec<Vec<u8>>, Option<atrium_spv_runtime::SsboTable>) = {
             let bindings = &state.bound_storage_buffers;
             if bindings.is_empty() {
-                (Vec::new(), Vec::new())
+                (Vec::new(), None)
             } else {
                 let max_binding = *bindings.keys().max().unwrap() as usize;
                 let bufs = self.buffers.lock().unwrap();
-                let mut store: Vec<Vec<u8>> = Vec::new();
-                let mut slot_idx: Vec<Option<usize>> = vec![None; max_binding + 1];
+                // ABI v5 table: `{ base, size }` per binding (an
+                // unbound binding is empty, size 0); the shader sends
+                // out-of-bounds accesses to the table's sink.
+                let mut store: Vec<Vec<u8>> = vec![Vec::new(); max_binding + 1];
                 for (&binding, &buffer_raw) in bindings.iter() {
-                    let bytes = bufs.get(&buffer_raw)
+                    store[binding as usize] = bufs.get(&buffer_raw)
                         .map(|b| b.bytes.clone())
                         .unwrap_or_default();
-                    slot_idx[binding as usize] = Some(store.len());
-                    store.push(bytes);
                 }
-                let mut table = vec![0u8; (max_binding + 1) * 8];
-                for (binding, idx) in slot_idx.iter().enumerate() {
-                    if let Some(i) = idx {
-                        let ptr = store[*i].as_ptr() as u64;
-                        table[binding * 8 .. binding * 8 + 8]
-                            .copy_from_slice(&ptr.to_le_bytes());
-                    }
-                }
-                (store, table)
+                let descs: Vec<atrium_spv_runtime::SsboDesc> =
+                    store.iter().map(|b| atrium_spv_runtime::SsboDesc::of(b)).collect();
+                (store, Some(atrium_spv_runtime::SsboTable::new(&descs)))
             }
         };
         let _ = &vs_ssbo_store; // keep-alive: backs vs_ssbo_table's pointers
@@ -2567,7 +2561,8 @@ impl Tier2Backend {
                 instance_index,
                 primitive_id: t as u32,
                 fs_writes_depth,
-                vs_storage_table: &vs_ssbo_table,
+                vs_storage_table: vs_ssbo_table.as_ref()
+                    .map_or(0, |t| t.as_ptr() as usize),
                 ..Default::default()
             };
             match self.registry.build_triangle_setups(
@@ -3044,7 +3039,6 @@ impl Tier2Backend {
         let mut per_binding: Vec<Vec<u8>>;
         // descriptor_table must outlive the dispatch loop --
         // out_ptr borrows from it for the multi-binding case.
-        let mut descriptor_table: Vec<u64> = Vec::new();
         let n_buffers_to_alloc = n_bindings.max(1) as usize;
         per_binding = (0..n_buffers_to_alloc).map(|_| vec![0u8; cap]).collect();
         // Apply pre-fill stash: copy bytes for each binding
@@ -3060,14 +3054,13 @@ impl Tier2Backend {
                 }
             }
         }
-        let out_ptr: *mut u8 = if n_bindings >= 2 {
-            descriptor_table = per_binding.iter_mut()
-                .map(|buf| buf.as_mut_ptr() as u64).collect();
-            descriptor_table.as_mut_ptr() as *mut u8
-        } else {
-            per_binding[0].as_mut_ptr()
-        };
-        let _ = descriptor_table;
+        // ABI v5: always a table of `{ base, size }` per binding;
+        // the shader bounds-checks every access against `size`.
+        let descs: Vec<atrium_spv_runtime::SsboDesc> = per_binding.iter_mut()
+            .map(|buf| atrium_spv_runtime::SsboDesc::of(buf))
+            .collect();
+        let ssbo_table = atrium_spv_runtime::SsboTable::new(&descs);
+        let out_ptr: *mut u8 = ssbo_table.as_ptr();
 
         // Workgroup-parallel dispatch.  Workgroups are
         // independent by Vulkan semantics (no cross-workgroup

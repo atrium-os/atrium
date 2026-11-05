@@ -280,5 +280,7 @@ mod tests {
             atrium_spv_runtime::IMG_TABLE_BARRIER_OFFSET
         );
         assert_eq!(crate::vcode::IMG_TABLE_DESC_BASE as usize, atrium_spv_runtime::IMG_TABLE_DESC_BASE);
+        assert_eq!(crate::vcode::SSBO_DESC_BYTES as usize, atrium_spv_runtime::SSBO_DESC_BYTES);
+        assert_eq!(crate::vcode::SSBO_SINK_OFFSET, atrium_spv_runtime::SSBO_SINK_OFFSET);
     }
 }

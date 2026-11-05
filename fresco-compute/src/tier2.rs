@@ -4,8 +4,9 @@
 //! `atrium-spv-compile` on a cache miss and maps the result), then
 //! dispatched here with the compute calling convention
 //! `aqueduct-gpu-host::Tier2Backend::dispatch_compute` uses: X0 the
-//! storage-image table (its barrier slot filled), X2 a table of one pointer
-//! per binding, one call per invocation. Workgroups are spread over threads;
+//! storage-image table (its barrier slot filled), X2 the ABI v5 SSBO table
+//! (`{ base, size }` per binding; the kernels bounds-check every access
+//! against it), one call per invocation. Workgroups are spread over threads;
 //! the kernels use no shared memory or barriers, so lanes run serially.
 
 use std::io;
@@ -13,6 +14,12 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use atrium_spv_loader::{CsMain, LoadedShader, LoaderConfig, ShaderCache};
+use atrium_spv_runtime::{SsboDesc, SsboTable};
+
+/// The SSBO descriptor for any slice: its bytes.
+fn desc<T>(s: &[T]) -> SsboDesc {
+    SsboDesc { base: s.as_ptr() as u64, size: std::mem::size_of_val(s) as u64 }
+}
 
 use crate::{binding, Frame, BIN_LOCAL, BIN_SPV, RASTER_LOCAL, RASTER_SPV};
 
@@ -102,14 +109,14 @@ impl Tier2 {
         frame.validate(target.len()).map_err(err)?;
         let mut mask = vec![0u32; frame.mask_words()];
         let header = [frame.header];
-        let mut table = [0u64; binding::COUNT];
-        table[binding::FRAME as usize] = header.as_ptr() as u64;
-        table[binding::OPS as usize] = frame.ops.as_ptr() as u64;
-        table[binding::TEX as usize] = frame.tex.as_ptr() as u64;
-        table[binding::TEXELS as usize] = frame.texels.as_ptr() as u64;
-        table[binding::MASK as usize] = mask.as_mut_ptr() as u64;
-        table[binding::TARGET as usize] = target.as_mut_ptr() as u64;
-        table[binding::LUT as usize] = frame.lut.as_ptr() as u64;
+        let mut table = [SsboDesc::default(); binding::COUNT];
+        table[binding::FRAME as usize] = desc(&header);
+        table[binding::OPS as usize] = desc(&frame.ops);
+        table[binding::TEX as usize] = desc(&frame.tex);
+        table[binding::TEXELS as usize] = desc(&frame.texels);
+        table[binding::MASK as usize] = desc(&mask);
+        table[binding::TARGET as usize] = desc(target);
+        table[binding::LUT as usize] = desc(&frame.lut);
         // SAFETY: every pointer in `table` stays valid until both dispatches
         // return, and `validate` checked the header against the buffers, so
         // the kernels stay within them.
@@ -117,16 +124,18 @@ impl Tier2 {
         Ok(())
     }
 
-    /// Both dispatches over a caller-built binding table (one pointer per
-    /// binding), e.g. buffers placed against guard pages by the fuzzer.
+    /// Both dispatches over a caller-built binding table (one `{ base,
+    /// size }` per binding), e.g. buffers placed against guard pages by the
+    /// fuzzer.
     ///
     /// # Safety
     /// Each pointer must address a live buffer the size [`Frame::validate`]
     /// accepted for `header`, which must be the header `table` points to;
     /// the mask (zeroed, [`Frame::mask_words`] words) and target writable.
-    pub unsafe fn render_table(&self, table: &[u64; binding::COUNT], header: &crate::Header) {
-        self.dispatch(self.bin.1, table, header.bin_groups(), [BIN_LOCAL, 1, 1]);
-        self.dispatch(self.raster.1, table, header.raster_groups(), [RASTER_LOCAL, RASTER_LOCAL, 1]);
+    pub unsafe fn render_table(&self, table: &[SsboDesc; binding::COUNT], header: &crate::Header) {
+        let t = SsboTable::new(table);
+        self.dispatch(self.bin.1, &t, header.bin_groups(), [BIN_LOCAL, 1, 1]);
+        self.dispatch(self.raster.1, &t, header.raster_groups(), [RASTER_LOCAL, RASTER_LOCAL, 1]);
     }
 
     /// Stack the surfaces in `heap` into `target` by `c`'s layer list.
@@ -134,23 +143,25 @@ impl Tier2 {
         use crate::compose::{binding as cb, COMPOSE_LOCAL};
         c.validate(target.len(), heap.len()).map_err(err)?;
         let header = [c.header];
-        let mut table = [0u64; cb::COUNT];
-        table[cb::HEADER as usize] = header.as_ptr() as u64;
-        table[cb::LAYERS as usize] = c.layers.as_ptr() as u64;
-        table[cb::HEAP as usize] = heap.as_ptr() as u64;
-        table[cb::TARGET as usize] = target.as_mut_ptr() as u64;
-        table[cb::LUT as usize] = c.lut.as_ptr() as u64;
+        let mut table = [SsboDesc::default(); cb::COUNT];
+        table[cb::HEADER as usize] = desc(&header);
+        table[cb::LAYERS as usize] = desc(&c.layers);
+        table[cb::HEAP as usize] = desc(heap);
+        table[cb::TARGET as usize] = desc(target);
+        table[cb::LUT as usize] = desc(&c.lut);
+        let table = SsboTable::new(&table);
         // SAFETY: the pointers outlive the dispatch, and `validate` checked
         // the header and every layer's surface against these buffers.
         unsafe { self.dispatch(self.compose.1, &table, c.groups(), [COMPOSE_LOCAL, COMPOSE_LOCAL, 1]) };
         Ok(())
     }
 
-    unsafe fn dispatch(&self, cs: CsMain, table: &[u64], groups: [u32; 3], local: [u32; 3]) {
+    unsafe fn dispatch(&self, cs: CsMain, table: &SsboTable, groups: [u32; 3], local: [u32; 3]) {
         let total = groups[0] as u64 * groups[1] as u64 * groups[2] as u64;
         let n = (self.threads as u64).min(total).max(1);
         let chunk = total.div_ceil(n);
         let table_addr = table.as_ptr() as usize;
+        let _ = table; // borrowed for the whole scope below
         std::thread::scope(|s| {
             for t in 0..n {
                 let (lo, hi) = (t * chunk, ((t + 1) * chunk).min(total));
