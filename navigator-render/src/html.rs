@@ -1300,8 +1300,19 @@ impl<'a> Cx<'a> {
     /// `natural-ratio` means the ratio is theirs; one dimension alone means
     /// none. An SVG that states only `width="100"` has no ratio, and giving
     /// it one shrank its width under `max-height` where a browser keeps it.
+    /// A replaced element: an `<img>`, or an inline `<svg>` the normalizer
+    /// made a standalone blob of (`navigator_normalize::svg_inline`): it
+    /// carries `src="blake3:…"` and no children, and paints that blob.
+    fn is_replaced(&self, h: Handle) -> bool {
+        match self.dom.tag(h) {
+            Some("img") => true,
+            Some("svg") => self.dom.attr(h, "src").is_some_and(|v| v.starts_with("blake3:")),
+            _ => false,
+        }
+    }
+
     fn natural(&self, h: Handle) -> Option<(String, Natural)> {
-        if self.dom.tag(h) != Some("img") { return None }
+        if !self.is_replaced(h) { return None }
         let src = self.dom.attr(h, "src").unwrap_or("");
         // ★ ZERO IS A DIMENSION (CSS Images 3 §5.1): an image declared 0 wide
         // is 0 wide, not "no width", which would fall to the 300 × 150 default
@@ -1331,7 +1342,7 @@ impl<'a> Cx<'a> {
     }
 
     fn replaced(&mut self, h: Handle) -> Option<(String, Natural)> {
-        if self.dom.tag(h) != Some("img") { return None }
+        if !self.is_replaced(h) { return None }
         let src = self.dom.attr(h, "src").unwrap_or("").to_string();
         // ★ §1.2 says replaced content CARRIES its natural sizing, on the
         // element. The subresource map is a separate thing: it names the
@@ -2975,7 +2986,7 @@ impl<'a> Cx<'a> {
                 // ★ A replaced element is an atomic inline whatever its
                 // `display` says (short of `none`): it has no inline content
                 // to flow, only a box of its own declared size.
-                if tag == "img" { let (st, l) = self.font_style(s); out.push(Item::Atomic(h, st, l)); return }
+                if tag == "img" || self.is_replaced(h) { let (st, l) = self.font_style(s); out.push(Item::Atomic(h, st, l)); return }
                 if tag == "br" { out.push(Item::Break); return }
                 let link = (tag == "a").then(|| self.dom.attr(h, "href")).flatten().map(|href| { self.links.push(href.to_string()); self.links.len() - 1 });
                 let before = out.len();

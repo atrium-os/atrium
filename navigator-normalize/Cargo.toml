@@ -9,14 +9,16 @@ navigator-dom = { path = "../navigator-dom" }
 navigator-style = { path = "../navigator-style" }
 navigator-render = { path = "../navigator-render" }
 unicode-bidi = "0.3.18"
-# Review tooling only (wpt-reftest): content addresses for test images.
-blake3 = { version = "1", features = ["pure"], optional = true }
+# Content addresses: inline SVGs made standalone (src/svg_inline.rs) are
+# named by the BLAKE3 of their bytes, as the converter stores them; also the
+# WPT tooling's test images.
+blake3 = { version = "1", features = ["pure"] }
 png = { version = "0.17", optional = true }
 
 [features]
 # The WPT reftest oracle: renders test and reference to PIXELS, which needs
 # the review-only rasterizer. Never in the worker's build.
-wpt = ["navigator-render/raster", "dep:blake3", "dep:png"]
+wpt = ["navigator-render/raster", "dep:png"]
 
 # navigator-fonts vendors a one-line fix to pathfinder_simd; a dependent
 # crate must repeat the patch, because [patch] only applies at the build root.

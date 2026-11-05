@@ -406,7 +406,34 @@ fn collect_inner(dom: &Dom, base: Option<&str>, fetcher: &mut dyn Fetcher, mode:
         }
         if let Some(p) = progress.as_mut() { p(&out, &handled) }
     }
+    if !layout { inline_svgs(dom, &mut out) }
     out
+}
+
+/// ★ Inline `<svg>`s, made standalone (threat model §2.4; the function is
+/// `navigator_normalize::svg_inline::standalone`, which the normalizer runs
+/// again on the recording and must agree with byte for byte). Each becomes a
+/// blob named by its content address and an image entry under that address,
+/// sized from its own header; the normalizer then turns the `<svg>` box into
+/// a replaced element painting it. Nothing is fetched, so nothing is
+/// pending. The inputs are built exactly as `recording::parse` builds them
+/// from the sheets this recording carries, and the document is the
+/// serialization the recording carries.
+fn inline_svgs(dom: &Dom, out: &mut Subresources) {
+    if dom.by_tag_anywhere("svg").is_empty() { return }
+    let mut inputs = navigator_normalize::Inputs::default();
+    for sh in &out.sheets {
+        inputs.stylesheets.insert(sh.href.clone(), sh.text.clone());
+        if !sh.media.is_empty() { inputs.stylesheet_media.insert(sh.href.clone(), sh.media.clone()); }
+    }
+    for text in navigator_normalize::svg_inline::standalone(&dom.serialize(), &inputs) {
+        let bytes = text.into_bytes();
+        let address = format!("blake3:{}", blake3::hash(&bytes).to_hex());
+        if out.images.iter().any(|i| i.src == address) { continue }
+        let Some(natural) = natural_size(&bytes) else { continue };
+        store(&address, &bytes);
+        out.images.push(Image { src: address.clone(), natural, address, pending: None });
+    }
 }
 
 /// `abs` is where the sheet was fetched from; `key` is how the DOCUMENT

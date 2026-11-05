@@ -1415,6 +1415,7 @@ dependencies = [
 name = "navigator-normalize"
 version = "0.1.0"
 dependencies = [
+ "blake3",
  "navigator-dom",
  "navigator-render",
  "navigator-style",

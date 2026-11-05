@@ -23,6 +23,7 @@ mod collapse;
 pub mod expand;
 pub mod recording;
 pub mod sel;
+pub mod svg_inline;
 pub mod value;
 
 use navigator_dom::{Dom, Handle, Kind};
@@ -168,6 +169,17 @@ pub fn normalize_and_measure(html: &str, inputs: &Inputs, fonts: &navigator_rend
 pub fn normalize(html: &str, inputs: &Inputs) -> (String, Report) {
     phases::lap("before");
     let mut dom = navigator_dom::parse(html);
+    // ★ Inline SVGs the converter made standalone (src/svg_inline.rs): the
+    // same function, on the same untouched document and stylesheets, so the
+    // bytes — and their address — are the converter's. Only a recording that
+    // names a `blake3:` image can have any, so every other document skips it.
+    let inline_svgs: Vec<(Handle, String)> = if inputs.images.keys().any(|k| k.starts_with("blake3:")) {
+        let outers = svg_inline::outer_svgs(&dom);
+        let texts = svg_inline::standalone_in(&dom, &outers, inputs);
+        outers.into_iter().zip(texts)
+            .map(|(h, t)| (h, format!("blake3:{}", blake3::hash(t.as_bytes()).to_hex())))
+            .filter(|(_, a)| inputs.images.contains_key(a)).collect()
+    } else { vec![] };
     phases::lap("parse");
     let mut report = Report::default();
     let budget = inputs.budget;
@@ -916,7 +928,14 @@ pub fn normalize(html: &str, inputs: &Inputs) -> (String, Report) {
     // 7. Declared intrinsic sizes (§3.13): an image the input measured gets
     //    `width`/`height` attributes; one it did not is DROPPED, because the
     //    profile admits no measurement path and a guess is worse than a gap.
-    let imgs: Vec<Handle> = dom.by_tag_anywhere("img");
+    // An inline SVG made standalone: its box (styled above like any
+    // element) becomes a replaced element painting that blob, and its
+    // children go — they are in the blob.
+    for (h, address) in &inline_svgs {
+        for c in dom.children_of(*h) { detach(&mut dom, c) }
+        dom.set_attr(*h, "src", address);
+    }
+    let imgs: Vec<Handle> = dom.by_tag_anywhere("img").into_iter().chain(inline_svgs.iter().map(|(h, _)| *h)).collect();
     for h in imgs {
         let src = dom.attr(h, "src").unwrap_or("").to_string();
         match inputs.images.get(&src) {

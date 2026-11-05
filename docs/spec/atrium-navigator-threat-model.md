@@ -642,22 +642,63 @@ no text.
 Pages without SVG are untouched: the change is in the worker's decode of SVG bytes, and
 recordings and scenes are unchanged.
 
-**Inline `<svg>`, not yet drawn.** There are 4,462 inline SVGs on 67 of the 122 pages,
-mostly icons. 1,101 use `currentColor`, and 3,169 are styled by the page's CSS through
-classes. So an inline SVG cannot be drawn on its own: its paint comes from the page's
-cascade.
+**Inline `<svg>`, built (2026-11-06; `navigator_normalize::svg_inline`).** There are
+4,462 inline SVGs on 67 of the 122 pages, mostly icons. 1,101 use `currentColor` and 3,169
+are styled by the page's CSS through classes, so an inline SVG cannot be drawn on its own:
+its paint comes from the page.
 
-The design is producer-side. The converter, which already runs the normalizer's cascade
-for layout geometry, resolves each inline SVG's paint properties (`fill`, `stroke`, their
-opacities and widths, `display`, `visibility`, and `currentColor` from the element's
-`color`) into presentation attributes. It then stores the subtree as a standalone,
-content-addressed SVG blob, and the document names it as an image. Inline SVG then takes
-exactly this profile, budget and zoom path. A vector path node in NSG would also keep it
-sharp, but it needs Fresco and broker support that does not exist. Inline SVG is the next
-step of this work.
+*How.* One function, called in two places that must agree byte for byte.
+- For each outer `<svg>` it resolves the SVG paint properties the page's cascade gives
+  each element: `fill`, `stroke` and their opacities, widths, caps, joins and dashes,
+  `opacity`, `display`, `visibility`, `stop-color` and `color`. It uses rules with no
+  `@media` condition and no dynamic state, plus `style=`, at the normalizer's own
+  priority order, with custom properties resolved through the normalizer's cascade.
+- It writes them onto the elements as presentation attributes, which is the value the
+  page meant, since CSS beats a presentation attribute. What inherits in from the HTML
+  around the SVG is set on its root.
+- It replaces `currentColor` with each element's resolved `color`.
+- It copies in any symbol a `<use href="#id">` names from elsewhere in the document,
+  such as an inline sprite sheet.
+- It serializes one standalone SVG.
+
+*The two callers.*
+- *The converter* stores each result as a content-addressed blob and names it as an
+  image of the recording, sized from its own header and never pending.
+- *The normalizer* resolves the `<svg>` box's own CSS like any element's (so
+  `svg { width: 1em }` still matches), then makes it a replaced element painting that
+  blob, and drops its children, which are in the blob.
+
+Both run on the same recording, so the addresses agree. Drawing is the SVG-as-image path
+above, with its profile, budget and zoom behaviour. A recording that names no inline-SVG
+blob is normalized exactly as before.
+
+*Measured* (warm, all 122 pages):
+- *Pages without inline SVG are unchanged:* 57 of 57 recordings are byte-identical to the
+  previous binary's. All 65 recordings that changed are pages with inline SVG.
+- *Reproducible:* two runs are identical in every recording and part (664 of 664), and
+  the blob sets are equal.
+- *Drawn:* 966 of 1,056 distinct inline-SVG blobs (91.5%). The rest:
+
+  | why not drawn | blobs |
+  |---|---|
+  | an external sprite file (`<use href="/sprite.svg#id">`): 847 `use`s on 6 pages, which needs the converter to fetch the sprite; the next step | 70 |
+  | an embedded image | 8 |
+  | animation | 5 |
+  | filter | 3 |
+  | text | 2 |
+  | invalid size | 2 |
+
+- *Painted:* scene image nodes grow where icon boxes were empty. lemonde goes 27 → 76,
+  aljazeera 102 → 173, thomann 117 → 461.
+- *The cost:* normalize on those pages is 14–57% slower (thomann 960 → 1,504 ms). The
+  standalone pass builds its own rule index and custom properties. Sharing the
+  normalizer's would need the converter to take the same path, so it waits; speed work is
+  parked.
+- *Next* (approved): true vector shapes, an NSG path node mapping one to one to Fresco's
+  fill op. The bitmap path stays for clip paths, masks, filters and SVG text.
 
 **Rating now: low.** What stays open:
-- inline SVG and SVG text;
+- external SVG sprites, SVG text, and vector (not bitmap) inline SVG;
 - the transient natural frame (DCT scaling or row streaming);
 - callers that ask for re-decode on zoom (the zoom work);
 - the third-party image residual above.
