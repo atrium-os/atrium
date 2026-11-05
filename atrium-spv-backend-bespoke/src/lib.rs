@@ -392,6 +392,9 @@ fn emit_function(
     // expiration on last_use < i; alloc pops from
     // bool_free, expire pushes back.
     let mut bools: HashMap<ValueId, asm::Wreg> = HashMap::new();
+    // Bool operands aliased into `ints` for the current op only
+    // (see the Bool-as-int step before the op dispatch).
+    let mut bool_alias: Vec<ValueId> = Vec::new();
     // Bool Phi dests that overflowed the W pool into S-regs
     // (V-class). Bools are written at phi-move edges
     // (`fmov s, w` / `fmov s, s`) and read at only a handful
@@ -2023,6 +2026,47 @@ fn emit_function(
                     &phi_pinned, &loop_spans, &value_def_flat_idx, &read_pos, i,
                     spill_mode, &inst.op, id)?;
                 reload_cached_v.push(id);
+            }
+        }
+
+        // Bools are 0/1 W values, and the frontend feeds them to
+        // integer ops (LogicalOr → BitOr, LogicalNot → IEq b, 0).
+        // Alias each Bool operand into `ints` for this op only.
+        for id in bool_alias.drain(..) {
+            ints.remove(&id);
+        }
+        if let Op::BitAnd(l, r) | Op::BitOr(l, r) | Op::BitXor(l, r)
+            | Op::IEq(l, r) | Op::INe(l, r) = &inst.op
+        {
+            let mut w9_used = false;
+            for v in [l, r] {
+                if ints.contains_key(&v.id) || bool_alias.contains(&v.id) {
+                    continue;
+                }
+                let w = if let Some(&w) = bools.get(&v.id) {
+                    w
+                } else if let Some(&bv) = bool_in_v.get(&v.id) {
+                    if w9_used {
+                        return Err(BackendError::Unsupported(
+                            "two V-resident Bool operands".into()));
+                    }
+                    w9_used = true;
+                    a.emit(asm::fmov_w_from_s(asm::Wreg(9), bv));
+                    asm::Wreg(9)
+                } else if let Some(&slot) = bool_in_slot.get(&v.id) {
+                    if w9_used {
+                        return Err(BackendError::Unsupported(
+                            "two slot-resident Bool operands".into()));
+                    }
+                    w9_used = true;
+                    a.emit(asm::ldr_w_offset(
+                        asm::Wreg(9), asm::Xreg(31), (slot as u16) * 8));
+                    asm::Wreg(9)
+                } else {
+                    continue;
+                };
+                ints.insert(v.id, w);
+                bool_alias.push(v.id);
             }
         }
 
@@ -5340,6 +5384,9 @@ fn emit_function(
                 return Err(BackendError::Unsupported(format!(
                     "op {other:?} not supported")));
             }
+        }
+        for id in bool_alias.drain(..) {
+            ints.remove(&id);
         }
     }
     } // end of per-block loop
