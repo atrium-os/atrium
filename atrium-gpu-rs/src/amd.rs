@@ -1151,7 +1151,12 @@ impl Display {
 
     /// (2.3) What is signalled now, and what the monitor offers.
     pub fn hdr(&self) -> io::Result<(Hdr, HdrCaps)> {
-        let mut d = DHdr::default();
+        self.hdr_at(0)
+    }
+
+    /// (3.0) [`Self::hdr`] for any output.
+    pub fn hdr_at(&self, output: u32) -> io::Result<(Hdr, HdrCaps)> {
+        let mut d = DHdr { output, ..Default::default() };
         let caps = self.hdr_call(&mut d)?;
         Ok((
             Hdr {

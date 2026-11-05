@@ -196,31 +196,33 @@ fn run() -> io::Result<()> {
     flip_wait(&dpy, 1, s1.buffer(1))?;
     eprintln!("4 a commit refused part way (fault {}) is rolled back; output 1 still flips OK", r.reason);
 
-    // 5. Own rates.
-    let watch = VblankWatch::new(&dpy, note_output(0) | note_output(1))?;
+    // 5. Own rates: counted while idle (flipping both from one thread in a
+    // TCG guest slows the faster pipe's count), then one kqueue sees both.
     let v0 = dpy.status_at(0)?.vblank_count;
     let v1 = dpy.status_at(1)?.vblank_count;
-    let mut seen = 0u32;
-    let t0 = Instant::now();
-    let mut k = 0;
-    while t0.elapsed() < Duration::from_secs(4) {
-        k += 1;
-        flip_wait(&dpy, 0, s0.buffer(k % 2))?;
-        flip_wait(&dpy, 1, s1.buffer(k % 2))?;
-        if let Some((_, f)) = watch.wait(Some(Duration::from_millis(0)))? {
-            seen |= f;
-        }
-    }
+    std::thread::sleep(Duration::from_secs(3));
     let d0 = dpy.status_at(0)?.vblank_count - v0;
     let d1 = dpy.status_at(1)?.vblank_count - v1;
     let ratio = d0 as f64 / d1.max(1) as f64;
     if !(1.5..2.6).contains(&ratio) {
         return Err(fail(format!("vblanks: output 0 {d0}, output 1 {d1}: ratio {ratio:.2}, want ~2")));
     }
+    let watch = VblankWatch::new(&dpy, note_output(0) | note_output(1))?;
+    let mut seen = 0u32;
+    let t0 = Instant::now();
+    let mut k = 0;
+    while t0.elapsed() < Duration::from_secs(3) && seen != note_output(0) | note_output(1) {
+        k += 1;
+        flip_wait(&dpy, 0, s0.buffer(k % 2))?;
+        flip_wait(&dpy, 1, s1.buffer(k % 2))?;
+        while let Some((_, f)) = watch.wait(Some(Duration::from_millis(0)))? {
+            seen |= f;
+        }
+    }
     if seen & (note_output(0) | note_output(1)) != note_output(0) | note_output(1) {
         return Err(fail(format!("one registration for two outputs saw fflags {seen:#x}")));
     }
-    eprintln!("5 own rates: {d0} vs {d1} vblanks ({ratio:.2}x), {k} flips each; one kqueue sees both OK");
+    eprintln!("5 own rates: {d0} vs {d1} vblanks ({ratio:.2}x); both flip, one kqueue sees both OK");
 
     // 6. Unplug output 1 while the others keep flipping.
     let gen0 = dpy.outputs()?.topology_generation;
