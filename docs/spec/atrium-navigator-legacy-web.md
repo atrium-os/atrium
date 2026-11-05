@@ -1238,6 +1238,109 @@ Raw data, outside the repo, at `~/src/navigator-corpus/eid-2026-11-05/`: `bin/` 
 binaries), `before-{1,2}/` and `after-{1,2}/` (recordings, blobs, reports, coverage,
 normalize and flag outputs), and `run.sh`, `pipeline.sh` and `compare.py`.
 
+#### 5.4.5.6e Proposed: layout geometry for the state recorder (2026-11-05, investigation only)
+
+**What the converter answers today.** These are fixed answers, not zeros:
+- `getBoundingClientRect()` gives x = y = top = left = 0, width = right = 1280 and
+  height = bottom = 600, for every element.
+- `offsetWidth`, `clientWidth` and `scrollWidth` are 1280; the three `*Height` metrics
+  are 600.
+- `offsetTop`, `offsetLeft`, `scrollTop` and `scrollLeft` are 0.
+- `IntersectionObserver` and `ResizeObserver` accept `observe()` and never deliver.
+- `innerWidth` × `innerHeight` is 1280 × 600.
+
+Every element therefore claims to be 1280 × 600 and at the origin: visible, in the
+viewport, never scrolled, and all the same size.
+
+**Measured.**
+- *Static:* 92 of 124 corpus pages ship a script that mentions one of these APIs
+  (inline scripts plus 1,094 external scripts from the fetch caches). This is a
+  mention, not a call.
+- *Dynamic:* both corpora were converted offline with a per-read log, a temporary
+  patch that is not committed. Exploration was on and the deadline 180 s. Of 126
+  documents, **37 read geometry during conversion**: 7,621 reads, p50 5 per reading
+  document, p90 478, max 3,971. **15 register a geometry observer** (73 `observe()`
+  calls), and those observers never fire.
+
+| API | reads | documents |
+|---|---|---|
+| `getBoundingClientRect` | 4,274 | 9 |
+| `offsetWidth` | 2,414 | 13 |
+| `offsetHeight` | 568 | 14 |
+| `clientHeight` | 106 | 18 |
+| `scrollHeight` | 82 | 12 |
+| `scrollTop` | 54 | 10 |
+| `clientWidth` | 52 | 14 |
+| `scrollLeft` / `scrollWidth` / `offsetTop` / `offsetLeft` | 43 / 21 / 6 / 1 | 5 / 4 / 6 / 1 |
+
+**What it is used for, and what goes wrong.** Six patterns cover the volume.
+
+- **Lazy loading by visibility** (The Hindu: 1,800 `offsetWidth` reads on
+  `img.lazy`). The fiction *helps* here. Every image looks visible, so the loader swaps
+  in real sources: 86 of 118 placeholders became real images in the recording. Loaders
+  built on `IntersectionObserver` get no callback, so their images stay placeholders.
+  Those 15 documents are where that happens.
+- **Equal-height cards** (Samsung). The script reads each card as 600 px tall and
+  writes `min-height: 600px` onto card contents **and their headlines**: 9 of the 11
+  nominal values the corpora's recordings gained in `style` attributes. These are tall
+  blank gaps. nsg-flag cannot see them, because nothing overlaps.
+- **Scroll-spy** (doc13, mdbook). The script marks the last header whose top is at or
+  above a line, and every top is 0, so it picks the last header ("Return Values and
+  Scope"). A browser at scroll 0 marks the first (§5.4.5.6d).
+- **Carousels and scrollers** (Yahoo JP: `scrollLeft`/`scrollTop`/`clientWidth` on
+  carousel tracks). Arrow states and offsets are computed from 0 and 1280. No damage
+  was found in the recordings.
+- **Page-shape probes** (Python docs: `scrollHeight` vs `clientHeight` on `html` and
+  `body`; Trello: 474 `offsetWidth`/`offsetHeight` reads on spans, a font-load probe).
+  The script decides something, the document is unchanged.
+- **Per-icon polling** (Walgreens: 3,956 `getBoundingClientRect` on SVG `<use>`). Pure
+  cost, no effect found.
+
+Writes of measured values back into the document are rare: +11 `600px` values in 3
+documents and no `1280px`. The harm is mostly in *decisions* (which header, which
+image, whether to equalise), not in copied numbers.
+
+**Options.**
+
+1. **Keep the nominal answers** (today). Deterministic and free. It helps visibility
+   loaders and harms equalisers and scroll-spies. Its cost is invisible to the flagger.
+2. **Zeros, a "no layout" answer.** Deterministic and free, but worse. Scripts read
+   0 × 0 as hidden, and collapse or skip the element; the converter's comments already
+   record this. It would also undo The Hindu's 86 images. Not recommended.
+3. **Answer from our own layout, once.** At the first geometry read (or at load end),
+   normalize the *current* DOM and lay it out with navigator-render at the conversion
+   viewport. Answer every read from that snapshot until exploration starts, and deliver
+   one initial `IntersectionObserver`/`ResizeObserver` record from it, as a browser does.
+   - Cost: one normalize plus render. Measured 0.2–3.4 s per document (Samsung 1.9 s,
+     edX 3.4 s, The Hindu 1.2 s, doc13 0.2 s), against the 180 s deadline.
+   - Determinism is kept: the normalizer and renderer are pure functions of the
+     document, the pinned fonts and the viewport, as recordings already must be (threat
+     model §2.6). The snapshot's digest goes in the recording, so a re-run can check it.
+   - Fixes: scroll-spy (real tops), IO-based lazy loading (real intersections) and
+     equalisers (real heights, at the *conversion* viewport).
+   - Limits:
+     - A stale snapshot: a script that writes then reads gets pre-write geometry. Per
+       read relayout is unaffordable, since Walgreens alone reads 3,956 times.
+     - A renderer gap returns a wrong number instead of an obviously fictional one.
+     - The conversion viewport is not the reader's. An equaliser bakes heights for
+       one width, so heights written into `style` should still be refused (option 4).
+4. **Refuse geometry-derived writes.** Taint the values the geometry getters return,
+   and drop a script's write of `style.width`/`height`/`min-*`/`max-*`/`top`/`left`/
+   `transform` whose value came from one. Cheap and deterministic, and it removes the
+   Samsung class at any viewport. It does nothing for decisions (scroll-spy, observers).
+   Taint through string concatenation needs a wrapper number type or a sentinel value,
+   so this is the fiddliest to make exact.
+
+**Recommendation:** 3 and 4 together. One snapshot answers reads and observers; tainted
+writes are refused, because whatever the snapshot says is still the wrong viewport for
+the reader. Measure before building, as §5.4.5.6a did:
+- the 37 + 15 documents' recordings, normalized output and flag rows, before and after;
+- the Chrome oracle on every document whose layout moves;
+- reproduction (123/123) re-checked with the snapshot on.
+
+Not built. The per-read log patch, both logs and the scan scripts are outside the repo, in
+`~/src/navigator-corpus/geo-2026-11-05/`.
+
 ### 5.5 WebAssembly is a better cage, not a translation
 
 A recurring hope is that WASM offers a way out. It does not, for a simple factual reason:
