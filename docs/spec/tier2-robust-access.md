@@ -1,6 +1,6 @@
 # Tier-2: robust memory access for untrusted shaders
 
-Status: step 1 done 2026-11-05 (bounds checks, ABI v5); steps 2 and 3 next. Owner: the Tier-2 thread. Asked for by Shankar: Tier-2 runs
+Status: steps 1 (bounds checks, ABI v5) and 2 (compiler sandbox) done 2026-11-05; step 3 next. Owner: the Tier-2 thread. Asked for by Shankar: Tier-2 runs
 app-supplied SPIR-V as native code, which is arbitrary code execution, so it has to be
 bounded in the code and jailed around it.
 
@@ -63,11 +63,29 @@ constant, u32-wrapping; empty and unaligned buffers; texel pointers) on both bac
 the buffer inside a canary-filled allocation, and require no crash and no write outside
 it. Disabling the Cranelift guard makes all of them fail.
 
-## 3. Jail the compiler (step 2)
+## 3. Jail the compiler (step 2): done
 
-`atrium-spv-compile` runs with read access to its input file and write access to the cache
-directory only: Capsicum (`cap_enter` after opening both) on FreeBSD, plus the Portcullis
-spawn the spec already calls for.
+The loader spawns `atrium-spv-compile --stdio`. The compiler sandboxes itself before it reads
+a byte of SPIR-V, reads the module from stdin (at most 16 MiB) and writes `ASPVOUT1`, then
+the blob and the pcmap (each a u64 length plus bytes), to stdout. It never touches the
+filesystem; the loader writes the cache files itself (temp file + rename), so a compromised
+compiler can't read files or poison other cache entries.
+
+- FreeBSD: Capsicum `cap_enter` (fatal if it fails).
+- Linux (development): `PR_SET_NO_NEW_PRIVS` plus a deny-all Landlock ruleset
+  (filesystem, and TCP on Landlock ABI ≥ 4); rlimits only on kernels without Landlock.
+- Everywhere: RLIMIT_CPU 30 s, RLIMIT_AS 4 GiB (not on macOS).
+
+This replaces D3's Portcullis spawn: with no filesystem or network the compiler needs no
+mounts, and it inherits the executor's jail from step 3. `--sandbox-check PATH` lets tests
+confirm the sandbox refuses to open a file (`binary_sandbox_refuses_file_access`). The
+`--input/--output-dir` mode stays as an unsandboxed developer tool; `--hash` must be hex.
+
+Limits: the executor still maps whatever the compiler returns, so a compromised compiler can
+hand back unchecked code; the executor jail (step 3) is the backstop for that. The optional
+`spirv-opt` pre-pass in `aqueduct-gpu-host` (`--spirv-opt-binary`, off by default) parses
+app SPIR-V unsandboxed and should stay a development option. Not yet run on FreeBSD
+(cross-checked only); the first run is part of step 3's VM test.
 
 ## 4. Jail the executor (step 3)
 

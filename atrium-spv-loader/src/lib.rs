@@ -7,12 +7,13 @@
 //!    cache key.
 //! 2. **Look up `<cache_dir>/v{N}/<hash>.{so,dylib}`** and
 //!    its `.pcmap` sidecar.
-//! 3. **On miss**, spawn `atrium-spv-compile` with the
-//!    SPIR-V as input and wait for it to write the cache
-//!    files. In production the spawn runs through
-//!    Portcullis with FS caps for input + cache dirs
-//!    only; this crate doesn't enforce that — the caller
-//!    sets the jail up.
+//! 3. **On miss**, spawn `atrium-spv-compile --stdio`, pipe
+//!    the SPIR-V to it and read the blob + pcmap back. The
+//!    compiler sandboxes itself before reading the SPIR-V
+//!    (Capsicum on FreeBSD) and has no filesystem access;
+//!    this crate writes the cache files (temp file + rename),
+//!    so a compromised compiler can't touch other entries.
+//!    See docs/spec/tier2-robust-access.md §3.
 //! 4. **Dlopen the resulting shared library** and grab
 //!    the entry-point function pointers
 //!    (`atrium_fs_main` / `atrium_vs_main` /
@@ -261,65 +262,113 @@ impl ShaderCache {
         }
     }
 
-    /// Run the compile binary as a subprocess.  When
+    /// Run the compile binary as a sandboxed subprocess
+    /// (`--stdio`) and write its output into the cache. When
     /// `overrides` is non-empty, each entry is forwarded as a
-    /// `--spec-const SPECID=VALUE` arg (hex-encoded so the
-    /// shell quoting stays trivial).
+    /// `--spec-const SPECID=VALUE` arg (hex-encoded).
     fn compile(
         &self,
         spirv: &[u8],
         hash: &str,
         overrides: &[(u32, u32)],
     ) -> Result<(), LoadError> {
+        use std::io::{Read as _, Write as _};
+        use std::process::Stdio;
+
         let version_dir = self.version_dir();
         std::fs::create_dir_all(&version_dir).map_err(|e|
             LoadError::Internal(format!(
                 "creating cache dir {}: {e}", version_dir.display(),
             )))?;
 
-        // Write SPIR-V to a tempfile in the version dir.
-        // We write into the version dir rather than the
-        // system tempdir so a Portcullis-jailed binary
-        // doesn't need an extra FS cap.
-        let in_path = version_dir.join(format!("{hash}.spv.tmp"));
-        std::fs::write(&in_path, spirv).map_err(|e|
-            LoadError::Internal(format!(
-                "writing {}: {e}", in_path.display(),
-            )))?;
-
         let mut cmd = Command::new(&self.config.compile_binary);
-        cmd.arg("--input").arg(&in_path)
-            .arg("--output-dir").arg(&version_dir)
-            .arg("--hash").arg(hash);
+        cmd.arg("--stdio")
+            .stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped());
         for (spec_id, value) in overrides {
             cmd.arg("--spec-const")
                 .arg(format!("{spec_id}=0x{value:08x}"));
         }
-        let result = cmd.output();
-
-        // Clean up the input tempfile regardless of compile
-        // outcome.
-        let _ = std::fs::remove_file(&in_path);
-
-        let output = result.map_err(|e| LoadError::Internal(
+        let mut child = cmd.spawn().map_err(|e| LoadError::Internal(
             format!("spawning {}: {e}", self.config.compile_binary.display()),
         ))?;
-
-        match output.status.code() {
-            Some(0) => Ok(()),
-            Some(1) => Err(LoadError::Unsupported(
-                String::from_utf8_lossy(&output.stderr).into_owned(),
-            )),
-            Some(code) => Err(LoadError::Internal(format!(
-                "atrium-spv-compile exited {code}: {}",
-                String::from_utf8_lossy(&output.stderr),
-            ))),
-            None => Err(LoadError::Internal(format!(
-                "atrium-spv-compile killed by signal: {}",
-                String::from_utf8_lossy(&output.stderr),
-            ))),
+        // Feed stdin from a thread so a compiler that writes before it
+        // has read everything can't deadlock us.
+        let mut stdin = child.stdin.take().expect("piped stdin");
+        let input = spirv.to_vec();
+        let feeder = std::thread::spawn(move || {
+            let _ = stdin.write_all(&input);
+        });
+        let mut stderr = child.stderr.take().expect("piped stderr");
+        let err_reader = std::thread::spawn(move || {
+            let mut e = Vec::new();
+            let _ = (&mut stderr).take(MAX_COMPILER_STDERR).read_to_end(&mut e);
+            e
+        });
+        let mut stdout = Vec::new();
+        let read = child.stdout.take().expect("piped stdout")
+            .take(MAX_COMPILER_OUTPUT + 1).read_to_end(&mut stdout);
+        if read.is_err() || stdout.len() as u64 > MAX_COMPILER_OUTPUT {
+            let _ = child.kill();
         }
+        let status = child.wait().map_err(|e| LoadError::Internal(
+            format!("waiting for atrium-spv-compile: {e}")))?;
+        let _ = feeder.join();
+        let stderr = String::from_utf8_lossy(&err_reader.join().unwrap_or_default())
+            .into_owned();
+
+        match status.code() {
+            Some(0) => {}
+            Some(1) => return Err(LoadError::Unsupported(stderr)),
+            Some(code) => return Err(LoadError::Internal(format!(
+                "atrium-spv-compile exited {code}: {stderr}"))),
+            None => return Err(LoadError::Internal(format!(
+                "atrium-spv-compile killed by signal: {stderr}"))),
+        }
+        if stdout.len() as u64 > MAX_COMPILER_OUTPUT {
+            return Err(LoadError::Internal(format!(
+                "atrium-spv-compile output exceeds {MAX_COMPILER_OUTPUT} bytes")));
+        }
+        let (blob, pcmap) = parse_stdio_reply(&stdout)?;
+        write_atomically(&self.blob_path(hash), blob)?;
+        write_atomically(&self.pcmap_path(hash), pcmap)?;
+        Ok(())
     }
+}
+
+/// First 8 bytes of an `atrium-spv-compile --stdio` reply.
+const STDIO_MAGIC: &[u8; 8] = b"ASPVOUT1";
+/// Largest compiler reply the loader reads.
+const MAX_COMPILER_OUTPUT: u64 = 64 << 20;
+/// Largest compiler diagnostic the loader keeps.
+const MAX_COMPILER_STDERR: u64 = 64 << 10;
+
+/// Split a `--stdio` reply into `(blob, pcmap)`.
+fn parse_stdio_reply(o: &[u8]) -> Result<(&[u8], &[u8]), LoadError> {
+    let bad = |m: &str| LoadError::Internal(format!("atrium-spv-compile reply: {m}"));
+    let rest = o.strip_prefix(&STDIO_MAGIC[..]).ok_or_else(|| bad("bad magic"))?;
+    fn take(r: &[u8]) -> Option<(&[u8], &[u8])> {
+        let n = usize::try_from(u64::from_le_bytes(r.get(..8)?.try_into().ok()?)).ok()?;
+        let body = r.get(8..)?.get(..n)?;
+        Some((body, &r[8 + n..]))
+    }
+    let (blob, rest) = take(rest).ok_or_else(|| bad("truncated blob"))?;
+    let (pcmap, rest) = take(rest).ok_or_else(|| bad("truncated pcmap"))?;
+    if !rest.is_empty() {
+        return Err(bad("trailing bytes"));
+    }
+    Ok((blob, pcmap))
+}
+
+/// Write `bytes` to `path` via a temp file in the same directory and a
+/// rename, so readers never see a partial file.
+fn write_atomically(path: &Path, bytes: &[u8]) -> Result<(), LoadError> {
+    let tmp = path.with_extension(format!("tmp{}", std::process::id()));
+    std::fs::write(&tmp, bytes)
+        .and_then(|_| std::fs::rename(&tmp, path))
+        .map_err(|e| {
+            let _ = std::fs::remove_file(&tmp);
+            LoadError::Internal(format!("writing {}: {e}", path.display()))
+        })
 }
 
 /// Loader-side errors.

@@ -17,6 +17,7 @@ atrium-spv-backend-cranelift = { path = "../atrium-spv-backend-cranelift" }
 atrium-spv-backend-bespoke   = { path = "../atrium-spv-backend-bespoke" }
 atrium-spv-backend-bespoke-x86 = { path = "../atrium-spv-backend-bespoke-x86" }
 sha2 = "0.10"
+libc = "0.2"
 
 [dev-dependencies]
 rspirv     = "0.13"

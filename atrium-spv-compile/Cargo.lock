@@ -80,6 +80,7 @@ dependencies = [
  "atrium-spv-backend-cranelift",
  "atrium-spv-frontend",
  "atrium-spv-ir",
+ "libc",
  "libloading",
  "rspirv",
  "sha2",

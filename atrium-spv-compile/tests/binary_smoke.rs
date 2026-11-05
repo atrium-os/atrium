@@ -290,3 +290,69 @@ fn binary_emits_metrics_json_on_stderr() {
     assert!(stderr.contains("\"compile_us\":"));
     assert!(stderr.contains("\"size_bytes\":"));
 }
+
+/// `--stdio`: the production mode. SPIR-V in on stdin, framed blob and
+/// pcmap out on stdout, identical to what the file mode writes.
+#[test]
+fn binary_stdio_mode_matches_file_mode() {
+    use std::io::Write as _;
+    use std::process::Stdio;
+    let spv = build_constant_color_spirv([0.25, 0.5, 0.75, 1.0]);
+    let mut child = Command::new(binary_path())
+        .arg("--stdio")
+        .stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped())
+        .spawn().expect("spawn");
+    child.stdin.take().unwrap().write_all(&spv).unwrap();
+    let out = child.wait_with_output().unwrap();
+    assert!(out.status.success(), "stderr: {}", String::from_utf8_lossy(&out.stderr));
+    let o = &out.stdout;
+    assert_eq!(&o[..8], b"ASPVOUT1");
+    let bl = u64::from_le_bytes(o[8..16].try_into().unwrap()) as usize;
+    let blob = &o[16..16 + bl];
+    let pl = u64::from_le_bytes(o[16 + bl..24 + bl].try_into().unwrap()) as usize;
+    let pcmap = &o[24 + bl..24 + bl + pl];
+    assert_eq!(o.len(), 24 + bl + pl);
+
+    let dir = TempDir::new().unwrap();
+    let input = dir.path().join("s.spv");
+    std::fs::write(&input, &spv).unwrap();
+    let st = Command::new(binary_path())
+        .arg("--input").arg(&input).arg("--output-dir").arg(dir.path())
+        .arg("--hash").arg("ab")
+        .status().unwrap();
+    assert!(st.success());
+    assert_eq!(std::fs::read(dir.path().join("ab.afblob")).unwrap(), blob);
+    assert_eq!(std::fs::read(dir.path().join("ab.pcmap")).unwrap(), pcmap);
+}
+
+/// The sandbox the `--stdio` mode runs in refuses to open files
+/// (Capsicum on FreeBSD, Landlock on Linux).
+#[test]
+fn binary_sandbox_refuses_file_access() {
+    let dir = TempDir::new().unwrap();
+    let f = dir.path().join("secret");
+    std::fs::write(&f, b"x").unwrap();
+    let st = Command::new(binary_path()).arg("--sandbox-check").arg(&f)
+        .output().unwrap();
+    match st.status.code() {
+        Some(0) => {}
+        Some(4) if !cfg!(target_os = "freebsd") => {
+            eprintln!("skipping: no sandbox here ({})",
+                String::from_utf8_lossy(&st.stderr).trim());
+        }
+        c => panic!("sandbox check exit {c:?}: {}", String::from_utf8_lossy(&st.stderr)),
+    }
+}
+
+/// `--hash` names files in the output dir, so it must be hex.
+#[test]
+fn binary_rejects_path_like_hash() {
+    let dir = TempDir::new().unwrap();
+    let input = dir.path().join("s.spv");
+    std::fs::write(&input, build_constant_color_spirv([0.0; 4])).unwrap();
+    let st = Command::new(binary_path())
+        .arg("--input").arg(&input).arg("--output-dir").arg(dir.path())
+        .arg("--hash").arg("../escape")
+        .status().unwrap();
+    assert_eq!(st.code(), Some(2));
+}

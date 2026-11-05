@@ -22,6 +22,18 @@
 //!   `<output-dir>/<sha256>.afblob`
 //!   `<output-dir>/<sha256>.pcmap`
 //!
+//! ```text
+//! atrium-spv-compile --stdio [--target ...] [--spec-const ...]
+//! ```
+//!
+//! The production mode (the loader spawns this). The compiler enters
+//! its sandbox ([`sandbox`]: Capsicum on FreeBSD) before reading the
+//! SPIR-V from stdin, and writes [`STDIO_MAGIC`], then the blob and the
+//! pcmap, each as a little-endian u64 length plus bytes, to stdout. It
+//! never touches the filesystem, so a compromised compiler can't
+//! read files or poison other entries of the shader cache; the loader
+//! writes the cache.
+//!
 //! On stderr the binary prints one structured JSON line
 //! per compile (constraint G7) describing the result —
 //! `link_us` is always 0 now that `cc` is gone, kept in
@@ -73,9 +85,16 @@ use atrium_spv_frontend::{
 };
 use sha2::{Digest, Sha256};
 
+mod sandbox;
+
 const EXIT_OK: u8 = 0;
 const EXIT_UNSUPPORTED: u8 = 1;
 const EXIT_INTERNAL: u8 = 2;
+
+/// First 8 bytes of a `--stdio` reply.
+const STDIO_MAGIC: &[u8; 8] = b"ASPVOUT1";
+/// Largest SPIR-V module `--stdio` accepts.
+const MAX_SPIRV_BYTES: u64 = 16 << 20;
 
 fn main() -> ExitCode {
     let args = match parse_args() {
@@ -85,7 +104,15 @@ fn main() -> ExitCode {
             return ExitCode::from(EXIT_INTERNAL);
         }
     };
-    match run(&args) {
+    if let Some(path) = &args.sandbox_check {
+        return sandbox_check(path);
+    }
+    let result = if args.stdio {
+        run_stdio(&args)
+    } else {
+        run_files(&args)
+    };
+    match result {
         Ok(report) => {
             // G7: structured metrics line on stderr. The
             // `*_us` fields break the wall-clock down into
@@ -121,6 +148,13 @@ fn main() -> ExitCode {
 
 #[derive(Debug)]
 struct Args {
+    /// `--stdio`: SPIR-V on stdin, framed blob + pcmap on stdout,
+    /// inside the sandbox. `input` and `output_dir` are unused.
+    stdio: bool,
+    /// `--sandbox-check PATH`: enter the sandbox, then try to open
+    /// PATH. Exit 0 if that is refused, 3 if it succeeds, 4 if the
+    /// platform has no sandbox. For tests.
+    sandbox_check: Option<PathBuf>,
     input: PathBuf,
     output_dir: PathBuf,
     target: Target,
@@ -157,6 +191,8 @@ fn parse_args() -> Result<Args, String> {
     let mut hash_override: Option<String> = None;
     let mut force_backend: Option<ForceBackend> = None;
     let mut spec_overrides: SpecOverrides = SpecOverrides::new();
+    let mut stdio = false;
+    let mut sandbox_check: Option<PathBuf> = None;
 
     let parse_spec_const = |raw: &str,
                              out: &mut SpecOverrides| -> Result<(), String> {
@@ -189,6 +225,10 @@ fn parse_args() -> Result<Args, String> {
     let mut it = std::env::args().skip(1);
     while let Some(arg) = it.next() {
         match arg.as_str() {
+            "--stdio" => stdio = true,
+            "--sandbox-check" => sandbox_check = Some(PathBuf::from(
+                it.next().ok_or("--sandbox-check needs a path")?,
+            )),
             "--input" => input = Some(PathBuf::from(
                 it.next().ok_or("--input needs a path")?,
             )),
@@ -237,9 +277,27 @@ fn parse_args() -> Result<Args, String> {
             });
         }
     }
+    if let Some(h) = &hash_override {
+        // The hash names files in the output directory: hex only, so
+        // it can't climb out of it.
+        if h.is_empty() || h.len() > 128 || !h.bytes().all(|b| b.is_ascii_hexdigit()) {
+            return Err(format!("--hash must be 1-128 hex digits, got `{h}`"));
+        }
+    }
+    let files_needed = !stdio && sandbox_check.is_none();
     Ok(Args {
-        input: input.ok_or("--input is required")?,
-        output_dir: output_dir.ok_or("--output-dir is required")?,
+        stdio,
+        sandbox_check,
+        input: match input {
+            Some(p) => p,
+            None if files_needed => return Err("--input is required".into()),
+            None => PathBuf::new(),
+        },
+        output_dir: match output_dir {
+            Some(p) => p,
+            None if files_needed => return Err("--output-dir is required".into()),
+            None => PathBuf::new(),
+        },
         target: target.unwrap_or_else(Target::host),
         hash_override,
         force_backend,
@@ -260,8 +318,7 @@ fn parse_target(s: &str) -> Result<Target, String> {
 fn print_usage() {
     eprintln!(
         "Usage: atrium-spv-compile \\\n  \
-           --input <SPIR-V file> \\\n  \
-           --output-dir <cache dir> \\\n  \
+           (--input <SPIR-V file> --output-dir <cache dir> | --stdio) \\\n  \
            [--target <aarch64-unknown-freebsd|aarch64-apple-darwin|x86_64-unknown-freebsd|x86_64-unknown-linux-gnu>] \\\n  \
            [--hash <override sha256 hex>] \\\n  \
            [--spec-const SPECID=VALUE]... \\\n  \
@@ -304,14 +361,88 @@ enum CompileError {
     Internal(String),
 }
 
-fn run(args: &Args) -> Result<CompileReport, CompileError> {
+/// `--input`/`--output-dir` mode: developer tool and tests. Not
+/// sandboxed (it needs the filesystem).
+fn run_files(args: &Args) -> Result<CompileReport, CompileError> {
     let t0 = Instant::now();
-
-    // 1. Read SPIR-V.
     let spirv = std::fs::read(&args.input)
         .map_err(|e| CompileError::Internal(format!(
             "reading {}: {e}", args.input.display(),
         )))?;
+    let (blob, pcmap, mut report) = compile(args, &spirv)?;
+    let hash = &report.shader_hash;
+
+    // Write the flat blob into the cache directory. The
+    // loader `mmap`s it `PROT_EXEC` directly.
+    std::fs::create_dir_all(&args.output_dir).map_err(|e|
+        CompileError::Internal(format!(
+            "creating output dir {}: {e}", args.output_dir.display(),
+        )))?;
+    let blob_path = args.output_dir.join(format!("{hash}.afblob"));
+    std::fs::write(&blob_path, &blob).map_err(|e|
+        CompileError::Internal(format!(
+            "writing {}: {e}", blob_path.display())))?;
+    let pcmap_path = args.output_dir.join(format!("{hash}.pcmap"));
+    std::fs::write(&pcmap_path, &pcmap).map_err(|e|
+        CompileError::Internal(format!(
+            "writing {}: {e}", pcmap_path.display(),
+        )))?;
+    report.compile_us = t0.elapsed().as_micros();
+    Ok(report)
+}
+
+/// `--stdio` mode: sandbox first, then SPIR-V from stdin, framed
+/// output to stdout.
+fn run_stdio(args: &Args) -> Result<CompileReport, CompileError> {
+    use std::io::Read as _;
+    sandbox::enter().map_err(|e| CompileError::Internal(format!("sandbox: {e}")))?;
+    let t0 = Instant::now();
+    let mut spirv = Vec::new();
+    std::io::stdin().lock().take(MAX_SPIRV_BYTES + 1).read_to_end(&mut spirv)
+        .map_err(|e| CompileError::Internal(format!("reading stdin: {e}")))?;
+    if spirv.len() as u64 > MAX_SPIRV_BYTES {
+        return Err(CompileError::Unsupported(format!(
+            "SPIR-V module larger than {MAX_SPIRV_BYTES} bytes")));
+    }
+    let (blob, pcmap, mut report) = compile(args, &spirv)?;
+    let mut out = std::io::stdout().lock();
+    let w = |out: &mut std::io::StdoutLock, b: &[u8]| out.write_all(b);
+    (|| -> std::io::Result<()> {
+        w(&mut out, STDIO_MAGIC)?;
+        w(&mut out, &(blob.len() as u64).to_le_bytes())?;
+        w(&mut out, &blob)?;
+        w(&mut out, &(pcmap.len() as u64).to_le_bytes())?;
+        w(&mut out, &pcmap)?;
+        out.flush()
+    })().map_err(|e| CompileError::Internal(format!("writing stdout: {e}")))?;
+    report.compile_us = t0.elapsed().as_micros();
+    Ok(report)
+}
+
+fn sandbox_check(path: &std::path::Path) -> ExitCode {
+    match sandbox::enter() {
+        Err(e) => {
+            eprintln!("atrium-spv-compile: sandbox: {e}");
+            ExitCode::from(EXIT_INTERNAL)
+        }
+        Ok(sandbox::Level::LimitsOnly) => {
+            eprintln!("atrium-spv-compile: no sandbox on this platform/kernel");
+            ExitCode::from(4)
+        }
+        Ok(sandbox::Level::Full) => match std::fs::File::open(path) {
+            Ok(_) => {
+                eprintln!("atrium-spv-compile: opened {} inside the sandbox", path.display());
+                ExitCode::from(3)
+            }
+            Err(_) => ExitCode::from(EXIT_OK),
+        },
+    }
+}
+
+/// Frontend + backend, no I/O. Returns `(blob, pcmap, report)`.
+fn compile(args: &Args, spirv: &[u8])
+    -> Result<(Vec<u8>, Vec<u8>, CompileReport), CompileError>
+{
 
     // 2. Hash for cache key.  When no host-supplied hash is
     // given, hash the SPIR-V bytes.  If spec-constant
@@ -323,7 +454,7 @@ fn run(args: &Args) -> Result<CompileReport, CompileError> {
     // (preserves existing callers' cache keys).
     let hash = args.hash_override.clone().unwrap_or_else(|| {
         let mut hasher = Sha256::new();
-        hasher.update(&spirv);
+        hasher.update(spirv);
         if !args.spec_overrides.is_empty() {
             // Sort by SpecId for stability across HashMap
             // iteration order.
@@ -343,7 +474,7 @@ fn run(args: &Args) -> Result<CompileReport, CompileError> {
     // overrides (no-op when --spec-const wasn't passed).
     let t_frontend = Instant::now();
     let mut module = frontend_translate_with_overrides(
-        &spirv, &args.spec_overrides,
+        spirv, &args.spec_overrides,
     ).map_err(|e| match e {
         atrium_spv_frontend::FrontendError::Unsupported(m) =>
             CompileError::Unsupported(m),
@@ -436,41 +567,17 @@ fn run(args: &Args) -> Result<CompileReport, CompileError> {
     // the whole selection, not just the winning backend.
     let backend_us = t_backend.elapsed().as_micros();
 
-    // 5. Write the flat blob into the cache directory. The
-    // loader `mmap`s it `PROT_EXEC` directly — no linker,
-    // so the ~99.5%-of-compile `cc` step is simply gone.
-    std::fs::create_dir_all(&args.output_dir).map_err(|e|
-        CompileError::Internal(format!(
-            "creating output dir {}: {e}", args.output_dir.display(),
-        )))?;
-
-    let blob_path = args.output_dir.join(format!("{hash}.afblob"));
-    std::fs::write(&blob_path, &blob).map_err(|e|
-        CompileError::Internal(format!(
-            "writing {}: {e}", blob_path.display())))?;
     let size_bytes = blob.len();
-    // No link step on any path now.
-    let link_us: u128 = 0;
-
-    // 6. Write pcmap sidecar.
-    let pcmap_path = args.output_dir.join(format!("{hash}.pcmap"));
-    std::fs::write(&pcmap_path, &pcmap).map_err(|e|
-        CompileError::Internal(format!(
-            "writing {}: {e}", pcmap_path.display(),
-        )))?;
-
-    let so_size = size_bytes;
-    let elapsed_us = t0.elapsed().as_micros();
-
-    Ok(CompileReport {
+    let report = CompileReport {
         shader_hash: hash,
         backend: backend_name,
-        compile_us: elapsed_us,
+        compile_us: 0, // filled in by the caller
         frontend_us,
         backend_us,
-        link_us,
-        size_bytes: so_size,
-    })
+        link_us: 0, // no link step on any path now
+        size_bytes,
+    };
+    Ok((blob, pcmap, report))
 }
 
 /// Compute the standard cache filename for a SPIR-V blob.
