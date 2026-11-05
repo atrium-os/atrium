@@ -166,7 +166,8 @@ Measurement in legacy-web §5.4.5.6a (`3dd3fb7`); raw tables in
 
 [spec/x86_64-port.md](spec/x86_64-port.md) (status §3.5).
 
-- **A done** (`2280670`): Tier-2 on x86_64 via Cranelift (bespoke stays AArch64).
+- **A done** (`2280670`): Tier-2 on x86_64 via Cranelift.
+- **Bespoke x86_64 Tier-2 backend** ([spec/tier2-bespoke-x86.md](spec/tier2-bespoke-x86.md)): phase 1 skeleton (`4b0675c`, iced-x86, x86-64-v3) and phases 2–3, VCode + linear-scan regalloc, integer ops, any control flow (`dbd2d34`). `atrium-spv-compile` tries it before Cranelift on x86_64; Cranelift takes whatever it returns Unsupported. Debug knobs `ATRIUM_SPV_X86_DUMP=1`, `ATRIUM_SPV_FORCE_SPILL=1`.
 - **C done**: amd64 FreeBSD VM boots the fork kernel (`801a762`) and a Tessera
   root; fork userland cross-built and installed (`108098c`); Navigator jail e2e
   passes on amd64 (`6273d0d`); gpusim on amd64 (`991db65`, `atrium_gpu_test` 27/27).

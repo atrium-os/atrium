@@ -79,7 +79,7 @@ flowchart LR
   subgraph ATR["Atrium"]
     direction TB
     AA["App jail<br/>holds NO GPU fd"]
-    AR["Renderer jail, one per client<br/>(_fresco-render): scene → packed frame"]
+    AR["Renderer jail, one per client<br/>(_fresco-render): compute: rasters its own pixels<br/>gpu: scene → packed frame"]
     AF["frescod broker (_frescod)<br/>validates header, compose + chrome,<br/>input routing, writes every PM4 packet"]
     AC["Our compiler: frontend IR → GIR → RDNA4<br/>(atrium-spv-* / atrium-gir / atrium-rdna4-*)<br/>only signed kernels or checked app code"]
     AT["Tier-2: same kernels on the CPU<br/>(default renderer, no Mesa)"]
@@ -102,7 +102,7 @@ flowchart LR
 | Who renders an app's window | the app, with its own Vulkan/GL driver | a per-client jailed renderer packs the scene; frescod's own kernels draw it | the renderer is sacrificial; frescod trusts only a 64 B header |
 | Userspace driver | Mesa RADV (Vulkan), radeonsi (GL), inside every app | none in apps. frescod runs our compiler's output; third-party Vulkan goes through `atrium-vk-icd` → aqueduct-gpu → Tier-2/Tier-3 | no driver code in untrusted processes; one compiler we control |
 | Shader compiler | NIR → ACO (or LLVM), in the app process | frontend IR → GIR → RDNA4 machine layer, built from AMD's public ISA docs only | public-sources rule; layered for more GPU families; RADV kept only as the speed yardstick on the R9700 |
-| CPU fallback | lavapipe/llvmpipe (Mesa) | Tier-2: AOT SPIR-V → native code (bespoke ARM64, Cranelift x86_64); it is frescod's default renderer | no Mesa at runtime; lavapipe survives only as a golden-test oracle and `FRESCOD_RENDERER=vulkan` |
+| CPU fallback | lavapipe/llvmpipe (Mesa) | Tier-2: AOT SPIR-V → native code (bespoke ARM64 and x86_64, Cranelift fallback); it is frescod's default renderer | no Mesa at runtime; lavapipe survives only as a golden-test oracle and `FRESCOD_RENDERER=vulkan` |
 | Command submission | userspace builds IBs; kernel `amdgpu_cs` checks BOs, not packets | the broker (`atrium-gpu-app`, frescod) writes every packet; the ring is read-only to the GPU; app code is mapped read-only and confined by its VMID | packets come from one trusted writer |
 | Buffers | GEM handles, TTM placement, dmabuf export | BOs named by fd; sealed buffers for content-addressed sharing (GPU ABI v2.1 §5.13) | fds pass like any capability; no global GEM names |
 | Kernel driver | DRM `amdgpu.ko` (Linux), or drm-kmod via linuxkpi on FreeBSD | `atrium-gpu-amd`, written for FreeBSD from scratch (newbus, bus_dma, kqueue) | no DRM, no linuxkpi; per-VM isolation, watchdog and fault handling designed in |
@@ -124,11 +124,11 @@ flowchart TB
     G["own GPU code (optional)"]
   end
   subgraph REND["Renderer jail (_fresco-render, one per client connection)"]
-    R["fresco-renderer: scene → packed frame<br/>in a sealed memfd slot"]
+    R["fresco-renderer: compute → finished pixels (FRP1 slot)<br/>gpu → packed frame; sealed memfd slot"]
   end
   subgraph BROKER["frescod (_frescod)"]
     S["socket_server: ids, caps per uid"]
-    V["Frame::validate (64 B header only)"]
+    V["header check only<br/>(Frame::validate / FRP1)"]
     K["compose + chrome + input routing"]
     GA["gpu_app: one VM per GPU context<br/>atrium-gpu-app checks + PM4 builder"]
   end
@@ -161,7 +161,8 @@ flowchart TB
 | Broker fuzzing (F3) | `atrium-split-fuzz` plays hostile renderers and a hostile Navigator; broker sends non-blocking and retires a renderer whose channel is full; per-renderer rate budgets | `atrium-split-fuzz`, `scripts/fresco-split-fuzz.sh` | `9d8429a` |
 | Connection limits | 32 connections per uid; last 64 client ids at most 2 per uid | `fresco-scene-server` | `a43f23f`, `da65060` |
 | App GPU channel (F6) | `FRESCOD_GPU_SOCK`, one GPU context (thread + VM) per connection, ≤ 4 per uid, last 8 of 32 one per uid. Apps send a code header + machine code + closed-set records (bind code, user SGPRs, dispatch, barrier); `atrium-gpu-app` checks every field and writes every PM4 packet; the ring is read-only to the GPU; code mapped read-only. **Option A:** app code is untrusted, the VMID confines it. Hostile ISA (infinite loop, wild stores) is lost with EIO while other apps' work completes | `atrium-gpu-app/`, `frescod/src/gpu_app.rs`, `atrium-gpu-fuzz` | `6dcd221`, `4cf6395`, `a8a595d`, `5f6bd11`, `a8587af`; spec [spec/gpu-app-path-f6.md](spec/gpu-app-path-f6.md) |
-| One GPU VM per window (F4e) | with `FRESCOD_RENDERER=gpu`, each window's bin and raster run in their own VM (code and staging read-only, its own inputs, ring and surface); compose runs in frescod's VM, which maps every surface read-only plus the scanout. `FRESCOD_GPU_ISOLATION_PROBE=1` makes later windows write the first window's surface: both writes fault (EIO). Not applied to the compute renderer | `frescod`, `atrium-gpu-rs` (`Vm::share`) | `e7c3187` |
+| One GPU VM per window (F4e) | with `FRESCOD_RENDERER=gpu`, each window's bin and raster run in their own VM (code and staging read-only, its own inputs, ring and surface); compose runs in frescod's VM, which maps every surface read-only plus the scanout. `FRESCOD_GPU_ISOLATION_PROBE=1` makes later windows write the first window's surface: both writes fault (EIO) | `frescod`, `atrium-gpu-rs` (`Vm::share`) | `e7c3187` |
+| Pixels from the renderer jail (F4g) | with the compute renderer, each client's jailed renderer rasters its own windows and sends finished pixels (FRP1 slot); frescod copies once and composes, so a hostile scene never reaches frescod's CPU kernels. `FRESCOD_SPLIT_PIXELS=0` turns it off. Also fixed: the precompiled-kernel folder path (`Tier2::seed_cache` writes the loader's per-arch dir) and frescod's private kernel-cache fallback when the system cache isn't writable | `frescod`, `fresco-renderer` | `9a01b97` |
 | Driver isolation (F1, F6 G1) | the five §A3 breaks closed; per-queue completions; hang watchdog (`hang_ms`, default 5000); VM fault fails that queue's work at once; read-only binds (ABI rev 3); `CAP_ISA` (ABI rev 4); Bus Master cleared on shutdown | `atrium-gpu-amd/` | `73a94ec`, `2dac848`, `622693d`, `bb3f7ba`, `8023c92` |
 
 What is still missing: §11.
@@ -172,12 +173,15 @@ What is still missing: §11.
 app ──fresco-protocol──▶ frescod socket_server (per-uid caps)
                               │ ExecInstance → portcullisd → renderer jail (_fresco-render)
                               ▼
-          renderer: scene → packed frame in its memfd slot ──96 B record──▶ frescod
-                              │ Frame::validate (header only)
+          renderer, in its jail:
+            compute (default): bin + raster on Tier-2 → finished pixels (FRP1 slot, window-sized)
+            gpu:               scene → packed frame (frescod rasters it in that window's own GPU VM:
+                               bin → CS_PARTIAL_FLUSH → raster; damage: only changed tiles)
+                              │ 96 B record; frescod checks the header only
                               ▼
           compose kernel over frescod's layer list + chrome strip
-                              │ compute: Tier-2 on the CPU   gpu: RDNA4 dispatches
-                              │ (damage: only changed tiles)  (bin → CS_PARTIAL_FLUSH → raster)
+                              │ (compute: copy the pixels once, compose on the CPU;
+                              │  gpu: compose in frescod's VM, surfaces mapped read-only)
                               ▼
           scanout BO ──COMMIT(bo_fd, in-fence, out-fence)──▶ display v2 ──▶ gpusim scanout
                               pacing: flip-done (out-fence), double-buffered
@@ -235,7 +239,7 @@ commit is EBUSY. Pacing is by flip-done.
 | What | Code | Used for |
 |---|---|---|
 | **`fresco-compute`**: bin, raster and compose kernels + a Rust reference that matches them statement for statement | `fresco-compute/` | everything frescod draws |
-| **Tier-2**: AOT SPIR-V → `atrium-spv-ir` → bespoke ARM64 or Cranelift (x86_64) → native code | `atrium-spv-*` | `FRESCOD_RENDERER=compute` (default); third-party Vulkan on the CPU via aqueduct-gpu-host |
+| **Tier-2**: AOT SPIR-V → `atrium-spv-ir` → bespoke ARM64 or bespoke x86_64 (`atrium-spv-backend-bespoke-x86`, phases 1–3: regalloc, ints, control flow), Cranelift for anything they return Unsupported → native code | `atrium-spv-*` | `FRESCOD_RENDERER=compute` (default); third-party Vulkan on the CPU via aqueduct-gpu-host |
 | **Our GPU compiler**: frontend IR → GIR (`atrium-gir`) → RDNA4 machine layer; spilling stages 1–3 | `atrium-gir`, `atrium-rdna4-compiler`, `atrium-rdna4-cmd`, `atrium-rdna4-isa`, `atrium-rdna4` | `FRESCOD_RENDERER=gpu`; the oracle corpus (R9700 v19: 54/54 jobs); bench vs RADV (ours ≤ RADV) |
 | **`fresco_compute::gpu::{Arch, Stream}`** | `fresco-compute/src/gpu` | keeps frescod GPU-neutral; RDNA4 is one `Arch`, chosen from `CAP_ISA` or `FRESCOD_GPU_ARCH` |
 | Tier-1 tiny-skia | `aqueduct-gpu-host/src/software/` | Atrium bundle ops on the aqueduct-gpu path only |
@@ -251,8 +255,13 @@ commit is EBUSY. Pacing is by flip-done.
 2. frescod admits the connection (32 per uid; the last 64 client ids at most
    2 per uid) and asks portcullisd for a renderer jail (`ExecInstance`,
    `_fresco-render`, 512 MiB / 100 % CPU). No portcullisd → the client is refused.
-3. The renderer turns the scene into a packed frame in its sealed memfd slot
-   and sends a record. frescod validates the 64 B header only; the kernels
+3. With the compute renderer (default), the jailed renderer runs bin and
+   raster itself (Tier-2 kernels bundled precompiled) and sends finished
+   pixels in a window-sized FRP1 slot; frescod checks the header, copies the
+   pixels once and only composes (F4g; `FRESCOD_SPLIT_PIXELS=0` sends frames
+   instead). With the gpu renderer, the renderer sends a packed frame and
+   frescod rasters it in that window's own GPU VM (F4e). Either way frescod
+   validates a header only; the kernels
    bound every index they read.
 4. frescod composes the windows from its own layer list, draws the chrome
    strip (origin set by the Navigator over `FRESCOD_CHROME_SOCK`, never by a
@@ -317,8 +326,7 @@ Tier-2 or our RDNA4 compiler. Mesa appears in three places only:
 - **No native Vulkan driver** for third-party apps on `'A'`; they run on
   Tier-2 or the Mac host.
 - **Fresco security items left:** F4f (secure password input to frescod),
-  F5 (deferred). F4e's per-window GPU VMs protect only the gpu renderer: the
-  default compute renderer composes all windows in one CPU address space.
+  F5 (deferred).
 - **`'A'` is not all of v2.1:** no `QUEUE_CREATE`/queue fds, cross-device
   `share_fd` or `QUERY_TELEMETRY` yet (see the ABI spec's §18 list).
 - **Legacy paths remain:** `frescod-aqueduct` on `'G'`, Carillon has no
