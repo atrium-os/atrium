@@ -236,9 +236,11 @@ fn attribution_uses_the_proximate_cause_not_a_tally() {
     assert_eq!(c.cause.as_ref().map(|(k, _)| k.as_str()), Some("no-match"));
 }
 
-/// Layout metrics are fiction; the test pins WHICH fiction — a generous,
+/// With geometry OFF (`nominal_geometry`, `PRERENDER_GEOMETRY=0`) layout
+/// metrics are the old fiction; the test pins WHICH fiction — a generous,
 /// self-consistent box that errs toward content being visible, with scroll*
-/// equal to client* so nothing concludes it must truncate.
+/// equal to client* so nothing concludes it must truncate. With geometry on
+/// they come from a layout (tests/geometry.rs).
 #[test]
 fn layout_metrics_are_nominal_consistent_and_counted() {
     let html = "<html><body><div id=r>x</div><script>\
@@ -250,7 +252,7 @@ fn layout_metrics_are_nominal_consistent_and_counted() {
         e.setAttribute('rw', String(rect.width));\
         e.setAttribute('overflows', String(e.scrollHeight > e.clientHeight));\
         </script></body></html>";
-    let c = convert(html, &mut BoaEngine::default());
+    let c = convert(html, &mut BoaEngine { nominal_geometry: true, ..Default::default() });
     assert_eq!(c.scripts_failed, 0, "{:?}", c.errors);
     assert!(c.html.contains(r#"overflows="false""#),
         "scroll must equal client so nothing truncates: {}", c.html);

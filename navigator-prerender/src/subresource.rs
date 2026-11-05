@@ -22,18 +22,9 @@ pub struct Sheet { pub href: String, pub media: String, pub text: String }
 #[derive(Debug, Clone, PartialEq)]
 pub struct Image { pub src: String, pub natural: Natural, pub address: String }
 
-/// ★ An image's NATURAL sizing (CSS Images 3 §5.1): a width, a height and
-/// a ratio, EACH optional. A raster image has all three. An SVG may state a
-/// width alone (no ratio: its height defaults at layout), or only a
-/// viewBox (a ratio and no size), or nothing (measured — and natural size
-/// none). Collapsing that to a (width, height) pair invented ratios CSS
-/// says are not there.
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub struct Natural { pub width: Option<u32>, pub height: Option<u32>, pub ratio: Option<(u32, u32)> }
-
-impl Natural {
-    pub fn sized(w: u32, h: u32) -> Self { Natural { width: Some(w), height: Some(h), ratio: Some((w, h)) } }
-}
+/// An image's natural sizing; the reader lives in `navigator_dom::natural`
+/// so the WPT oracle can use it without depending on the converter.
+pub use navigator_dom::natural::{natural_size, Natural};
 
 /// Where fetched bytes are kept, named by their content address. A
 /// stand-in for Tessera's CAS with the same two properties that matter: the
@@ -84,6 +75,54 @@ pub struct Subresources {
 const MAX_IMPORT_DEPTH: usize = 2;
 
 pub fn collect(dom: &Dom, base: Option<&str>, fetcher: &mut dyn Fetcher) -> Subresources {
+    collect_inner(dom, base, fetcher, false)
+}
+
+/// ★ Every subresource fetched during ONE conversion, by absolute URL —
+/// layouts (legacy-web §5.4.5.6e) and the final collection share it, so a
+/// sheet or an image crosses the fetcher (in a jail: the relay, whose bytes
+/// are budgeted per conversion) once. Fetching each again for the final
+/// collection pushed The Verge's and The Hindu's images past the relay's
+/// budget, and the recording lost them. Cleared at the start and end of a
+/// conversion (`forget_fetched`). It holds no more than the blob sink
+/// already does: every image a recording names.
+type Fetched = (std::collections::HashMap<String, Result<String, String>>,
+                std::collections::HashMap<String, Result<std::rc::Rc<Vec<u8>>, String>>);
+thread_local! {
+    static FETCHED: std::cell::RefCell<Fetched> = std::cell::RefCell::new(Default::default());
+}
+
+pub fn forget_fetched() { FETCHED.with(|f| *f.borrow_mut() = Default::default()) }
+
+/// ★ The inputs a layout of the CURRENT document needs, by the same walk as
+/// `collect` — the sheets and image sizes the recording would carry if the
+/// document stopped here — but with no side effects on the artifact: no
+/// blob is stored and nothing is hashed, so laying a page out mid-script
+/// cannot add a blob the final document does not name.
+pub fn collect_for_layout(dom: &Dom, base: Option<&str>, fetcher: &mut dyn Fetcher) -> Subresources {
+    collect_inner(dom, base, fetcher, true)
+}
+
+/// A fetcher that answers from `FETCHED` first.
+struct Remembering<'a> { inner: &'a mut dyn Fetcher }
+impl Fetcher for Remembering<'_> {
+    fn get(&mut self, url: &str) -> Result<String, String> {
+        if let Some(r) = FETCHED.with(|f| f.borrow().0.get(url).cloned()) { return r }
+        let r = self.inner.get(url);
+        FETCHED.with(|f| f.borrow_mut().0.insert(url.to_string(), r.clone()));
+        r
+    }
+    fn get_bytes(&mut self, url: &str) -> Result<Vec<u8>, String> {
+        if let Some(r) = FETCHED.with(|f| f.borrow().1.get(url).cloned()) { return r.map(|b| (*b).clone()) }
+        let r = self.inner.get_bytes(url).map(std::rc::Rc::new);
+        FETCHED.with(|f| f.borrow_mut().1.insert(url.to_string(), r.clone()));
+        r.map(|b| (*b).clone())
+    }
+}
+
+fn collect_inner(dom: &Dom, base: Option<&str>, fetcher: &mut dyn Fetcher, layout: bool) -> Subresources {
+    let mut remembering = Remembering { inner: fetcher };
+    let fetcher: &mut dyn Fetcher = &mut remembering;
     let mut out = Subresources::default();
     let resolve = |href: &str| -> Option<String> {
         match base.and_then(|b| url::Url::parse(b).ok()) {
@@ -118,6 +157,16 @@ pub fn collect(dom: &Dom, base: Option<&str>, fetcher: &mut dyn Fetcher) -> Subr
         // it has already arrived measured.
         let declared = |n: &str| dom.attr(h, n).and_then(|v| v.trim().parse::<u32>().ok());
         let Some(abs) = resolve(&src) else { out.failed.push((src, "cannot resolve".into())); continue };
+        // ★ For a layout, the SIZE is all that is needed: never hashed,
+        // never stored.
+        if layout {
+            let n = fetcher.get_bytes(&abs).ok().and_then(|b| natural_size(&b));
+            match n.or_else(|| declared("width").zip(declared("height")).map(|(w, h)| Natural::sized(w, h))) {
+                Some(natural) => out.images.push(Image { src, natural, address: String::new() }),
+                None => out.failed.push((src, "no intrinsic size".into())),
+            }
+            continue;
+        }
         match fetcher.get_bytes(&abs) {
             Ok(bytes) => match natural_size(&bytes).or_else(|| declared("width").zip(declared("height")).map(|(w, h)| Natural::sized(w, h))) {
                 Some(natural) => {
@@ -176,89 +225,3 @@ pub fn intrinsic_size(b: &[u8]) -> Option<(u32, u32)> {
     n.width.zip(n.height)
 }
 
-/// ★ The image's natural sizing, each part optional (see [`Natural`]).
-/// `None` only when the bytes are not an image this can read.
-pub fn natural_size(b: &[u8]) -> Option<Natural> {
-    if let Some((w, h)) = raster_size(b) { return Some(Natural::sized(w, h)) }
-    let head = &b[..b.len().min(4096)];
-    let text = String::from_utf8_lossy(head);
-    let start = text.find("<svg")?;
-    // ★ Only the ROOT element's attributes. Searching the whole file took
-    // the first `width="` anywhere — a nested rect's, as often as not.
-    let tag = &text[start..start + text[start..].find('>').unwrap_or(text.len() - start)];
-    let raw = |name: &str| -> Option<String> {
-        let at = [format!(" {name}=\""), format!(" {name}='")].iter().find_map(|k| tag.find(k.as_str()).map(|i| i + k.len()))?;
-        let rest = &tag[at..];
-        Some(rest[..rest.find(['"', '\''])?].trim().to_string())
-    };
-    // Only absolute px lengths are natural dimensions; `100%` or `2em`
-    // depend on where the image is used, so they are no natural size.
-    let px = |name: &str| -> Option<f64> {
-        let v = raw(name)?;
-        let v = v.strip_suffix("px").unwrap_or(&v);
-        v.parse::<f64>().ok().filter(|n| *n > 0.0)
-    };
-    let (w, h) = (px("width"), px("height"));
-    let vb: Option<(f64, f64)> = raw("viewBox").and_then(|v| {
-        let n: Vec<f64> = v.split([' ', ',']).filter(|x| !x.is_empty()).filter_map(|x| x.parse().ok()).collect();
-        (n.len() == 4 && n[2] > 0.0 && n[3] > 0.0).then(|| (n[2], n[3]))
-    });
-    // ★ A ratio is EXACT: the numbers themselves (to three decimals),
-    // reduced by their gcd — 1000×1300 is 10/13. Scaling the larger side
-    // to 1000 and rounding made it 769/1000, and the Rust book's diagrams
-    // came out a fraction of a pixel short, shifting every line below.
-    let ratio_of = |a: f64, b: f64| -> (u32, u32) {
-        let (mut x, mut y) = (((a * 1000.0).round() as u64).max(1), ((b * 1000.0).round() as u64).max(1));
-        let (mut p, mut q) = (x, y);
-        while q != 0 { let r = p % q; p = q; q = r }
-        x /= p; y /= p;
-        // Keep it in u32 without losing the proportion.
-        while x > u32::MAX as u64 || y > u32::MAX as u64 { x = (x + 1) / 2; y = (y + 1) / 2 }
-        (x as u32, y as u32)
-    };
-    let ratio = match (w, h) { (Some(a), Some(b)) => Some(ratio_of(a, b)), _ => vb.map(|(a, b)| ratio_of(a, b)) };
-    Some(Natural { width: w.map(|v| v.round() as u32), height: h.map(|v| v.round() as u32), ratio })
-}
-
-fn raster_size(b: &[u8]) -> Option<(u32, u32)> {
-    let be32 = |i: usize| -> Option<u32> { Some(u32::from_be_bytes([*b.get(i)?, *b.get(i + 1)?, *b.get(i + 2)?, *b.get(i + 3)?])) };
-    let be16 = |i: usize| -> Option<u32> { Some(u16::from_be_bytes([*b.get(i)?, *b.get(i + 1)?]) as u32) };
-    let le16 = |i: usize| -> Option<u32> { Some(u16::from_le_bytes([*b.get(i)?, *b.get(i + 1)?]) as u32) };
-    if b.starts_with(b"\x89PNG\r\n\x1a\n") && b.get(12..16) == Some(b"IHDR") {
-        return Some((be32(16)?, be32(20)?));
-    }
-    if b.starts_with(&[0xFF, 0xD8]) {
-        // JPEG: walk the segments to the frame header.
-        let mut i = 2usize;
-        // ★ `i + 9 <= len`: the frame header's last byte read is `i + 8`,
-        // and a `<` here made a JPEG whose frame is the LAST segment report
-        // no size at all.
-        while i + 9 <= b.len() {
-            if b[i] != 0xFF { i += 1; continue }
-            let marker = b[i + 1];
-            if (0xC0..=0xCF).contains(&marker) && ![0xC4, 0xC8, 0xCC].contains(&marker) {
-                return Some((be16(i + 7)?, be16(i + 5)?));
-            }
-            let seg = be16(i + 2)? as usize;
-            if seg < 2 { return None }
-            i += 2 + seg;
-        }
-        return None;
-    }
-    if b.starts_with(b"GIF87a") || b.starts_with(b"GIF89a") { return Some((le16(6)?, le16(8)?)) }
-    if b.starts_with(b"RIFF") && b.get(8..12) == Some(b"WEBP") {
-        return match b.get(12..16) {
-            Some(b"VP8X") => {
-                let d = |i: usize| -> Option<u32> { Some(u32::from_le_bytes([*b.get(i)?, *b.get(i + 1)?, *b.get(i + 2)?, 0]) + 1) };
-                Some((d(24)?, d(27)?))
-            }
-            Some(b"VP8 ") => Some(((le16(26)? & 0x3FFF), (le16(28)? & 0x3FFF))),
-            Some(b"VP8L") => {
-                let bits = u32::from_le_bytes([*b.get(21)?, *b.get(22)?, *b.get(23)?, *b.get(24)?]);
-                Some(((bits & 0x3FFF) + 1, ((bits >> 14) & 0x3FFF) + 1))
-            }
-            _ => None,
-        };
-    }
-    None
-}

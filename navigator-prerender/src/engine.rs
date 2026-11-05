@@ -127,7 +127,35 @@ pub struct ExploreStats {
     pub inert: u32,
 }
 
+/// ★ Layout geometry (legacy-web §5.4.5.6e): what the converter's layouts
+/// did. Observation only, never in an artifact (`ms` is wall time).
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct GeoStats {
+    /// Layouts performed, and layouts that failed (both count toward
+    /// `geometry::MAX_LAYOUTS`).
+    pub layouts: u32,
+    pub failures: u32,
+    pub first_failure: String,
+    /// Geometry reads answered from a layout of the DOM as it was, and from
+    /// an older one because the budget was spent.
+    pub reads: u32,
+    pub stale: u32,
+    /// Style writes refused for copying a measured size back.
+    pub writes_refused: u32,
+    pub first_refused: String,
+    /// Observer records delivered (the one initial record each).
+    pub io_records: u32,
+    pub ro_records: u32,
+    /// Viewports the reader's sweep scrolled through.
+    pub scroll_steps: u32,
+    /// Wall time in layouts, total and the longest one.
+    pub ms: f64,
+    pub max_ms: f64,
+}
+
 pub struct RunReport {
+    /// Layout geometry: see `GeoStats`.
+    pub geo: GeoStats,
     /// Exploration's budget accounting (only when exploring).
     pub explore_stats: ExploreStats,
     /// Per-element exploration coverage (only when exploring).
@@ -185,7 +213,8 @@ pub struct RunReport {
     /// anything: the denominator for the transitions above.
     pub interactive_found: u32,
     pub injected_scripts_refused: u32,
-    /// Reads of a layout metric this converter cannot truthfully answer.
+    /// Reads of a layout metric (answered from a layout since §5.4.5.6e;
+    /// see `geo`).
     pub layout_reads: u32,
     /// Timer callbacks dispatched, and those still pending at the horizon.
     pub timers_fired: u32,

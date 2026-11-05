@@ -842,9 +842,11 @@ the half one machine can run.
   - **Thread scheduling.** A conversion is one thread, and the relay answers fetches
     synchronously. The contention run was identical.
   - **ICU data.** Compiled into the binary, at the versions `Cargo.lock` pins.
-  - **Fonts.** The converter reads none: layout queries get fixed answers. The fonts the
-    normalizer and renderer use are the repo's own set, which is an input of theirs, not
-    of the artifact.
+  - **Fonts.** The converter reads none from the host. Since legacy-web §5.4.5.6e its
+    layout queries are answered from a layout by the normalizer and renderer, with the
+    repo's pinned font set compiled into the binary (canonicalized and checked against
+    its pinned addresses at load), so the set is part of the build, not of the machine.
+    Re-checked after that change: 123/123 identical across two runs.
   - **Build.** The converter's hash is an input like the rest, and a clean build
     reproduced it here.
   - *Open:*

@@ -210,7 +210,7 @@ fn load(root: &Path, file: &Path) -> Option<Loaded> {
     let mut assets = BTreeMap::new();
     for (raw, path) in urls {
         let Ok(bytes) = std::fs::read(&path) else { missing.push(raw); continue };
-        let Some(n) = navigator_prerender::subresource::natural_size(&bytes) else { continue };
+        let Some(n) = navigator_dom::natural::natural_size(&bytes) else { continue };
         let address = format!("blake3:{}", blake3::hash(&bytes).to_hex());
         inputs.images.insert(raw.clone(), navigator_normalize::ImageSize { width: n.width, height: n.height, ratio: n.ratio });
         subs.insert(raw, (address.clone(), n.width.unwrap_or(0) as i64 * 64, n.height.unwrap_or(0) as i64 * 64));

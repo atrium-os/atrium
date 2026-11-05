@@ -1,4 +1,5 @@
 pub mod subresource;
+pub mod geometry;
 pub mod artifact;
 // ★ Re-exported rather than re-implemented: `crate::dom::…` and
 // `crate::parse::…` resolve exactly as before, so extracting these cost no
@@ -88,6 +89,8 @@ pub struct Conversion {
     pub injected_scripts_run: u32,
     pub injected_scripts_refused: u32,
     pub layout_reads: u32,
+    /// Layout geometry (legacy-web §5.4.5.6e): observation only.
+    pub geo: engine::GeoStats,
     pub timers_fired: u32,
     pub timers_dropped: u32,
     pub page_fetches: u32,
@@ -127,6 +130,8 @@ pub fn convert_with_opts(
     fetcher: &mut dyn Fetcher,
     protect_parser_nodes: bool,
 ) -> Conversion {
+    // A conversion's fetches are its own (see `subresource::forget_fetched`).
+    subresource::forget_fetched();
     let mut dom = parse::parse(html);
     let before = dom.element_count();
     // ★ THE QUESTION TIER 2 ACTUALLY HAS TO ANSWER is not "did the scripts
@@ -243,6 +248,7 @@ pub fn convert_with_opts(
     // ran — because that is the document the normalizer will be handed, and
     // a script may well have added the stylesheet or the image.
     let subresources = subresource::collect(&dom, base, fetcher);
+    subresource::forget_fetched();
     // Computed before the struct consumes the fields it reads.
     let verdict = classify(rep.first_error.as_deref(), rep.cause.as_ref());
     Conversion {
@@ -285,6 +291,7 @@ pub fn convert_with_opts(
         injected_scripts_run: rep.injected_scripts_run,
         injected_scripts_refused: rep.injected_scripts_refused,
         layout_reads: rep.layout_reads,
+        geo: rep.geo,
         timers_fired: rep.timers_fired,
         timers_dropped: rep.timers_dropped,
         page_fetches: rep.page_fetches,

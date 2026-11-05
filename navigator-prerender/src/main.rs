@@ -39,6 +39,10 @@ fn name_of(p: &Path) -> String {
     p.file_name().map(|s| s.to_string_lossy().to_string()).unwrap_or_default()
 }
 
+/// `PRERENDER_GEOMETRY=0`: answer layout reads with the old nominal box
+/// (legacy-web §5.4.5.6e), to measure what the layout changes.
+fn nominal_geometry() -> bool { std::env::var("PRERENDER_GEOMETRY").ok().as_deref() == Some("0") }
+
 fn collect(p: &Path, out: &mut Vec<PathBuf>) {
     if p.is_dir() {
         if let Ok(rd) = fs::read_dir(p) {
@@ -61,6 +65,10 @@ fn report(c: &navigator_prerender::Conversion, fetchd: Option<(u64, u64)>) -> St
         c.external_total, c.external_fetched, c.module_retries,
         c.observers_registered);
     let _ = writeln!(o, "L\t{}", c.layout_reads);
+    let g = &c.geo;
+    let _ = writeln!(o, "G\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{:.1}\t{:.1}\t{}\t{}\t{}", g.layouts, g.failures, g.reads, g.stale,
+        g.writes_refused, g.io_records, g.ro_records, g.ms, g.max_ms, g.scroll_steps,
+        g.first_refused.replace(['\t', '\n'], " "), g.first_failure.replace(['\t', '\n'], " "));
     let _ = writeln!(o, "O\t{}\t{}\t{}", c.observers_registered, c.mutation_records, c.ce_upgrades);
     let _ = writeln!(o, "H\t{}\t{}", c.history_writes, c.history_refused);
     let _ = writeln!(o, "D\t{}\t{}", c.events_dispatched, c.event_listeners_run);
@@ -198,6 +206,15 @@ fn run_one(file: &str, base: Option<&str>, net: bool) -> ! {
             (None, true) => Some(Box::new(HttpFetcher::new(std::env::temp_dir().join("prerender-pagecache")))),
             (None, false) => None,
         },
+        // ★ A layout's inputs come from where the recording's do: the same
+        // fetchd, or the same cache as `fetcher` above.
+        layout_fetcher: match (&fetchd, net) {
+            (Some(f), _) => Some(Box::new(f.clone()) as Box<dyn Fetcher>),
+            (None, true) => Some(Box::new(HttpFetcher::new(std::env::temp_dir().join("prerender-jscache")))),
+            (None, false) => None,
+        },
+        nominal_geometry: nominal_geometry(),
+        no_scroll_sweep: std::env::var("PRERENDER_SCROLL").ok().as_deref() == Some("0"),
         ..Default::default()
     };
     let c = convert_with(&src, base, &mut eng, fetcher);
@@ -291,6 +308,7 @@ fn main() {
     let mut mod_retries = 0u32;
     let mut observers = 0u32;
     let mut layout_reads = 0u32;
+    let mut geo_rows: Vec<(String, navigator_prerender::engine::GeoStats)> = vec![];
     let mut mo_records = 0u32;
     let mut ce_up = 0u32;
     let mut hist_w = 0u32; let mut hist_r = 0u32; let mut hist_docs = 0usize;
@@ -405,6 +423,7 @@ fn main() {
         mod_retries += c.module_retries;
         observers += c.observers;
         layout_reads += c.layout_reads;
+        if c.geo.layouts + c.geo.failures + c.geo.io_records + c.geo.ro_records > 0 { geo_rows.push((name.clone(), c.geo.clone())); }
         mo_records += c.mutation_records;
         ce_up += c.ce_upgrades;
         inj += c.injected_scripts_run; injr += c.injected_scripts_refused;
@@ -544,10 +563,23 @@ fn main() {
         println!("  mutation records DELIVERED (real, not invented): {mo_records} in {mo_docs} docs");
     }
     if layout_reads > 0 {
-        println!("  layout metrics read (no layout exists — nominal values): {layout_reads} in {layout_docs} docs");
+        println!("  layout metrics read: {layout_reads} in {layout_docs} docs");
     }
     if observers > 0 {
-        println!("  geometry observations registered, never delivered: {observers}  (no layout — see GLOBALS)");
+        println!("  geometry observations registered: {observers}");
+    }
+    // ★ Layout geometry (legacy-web §5.4.5.6e), per document that laid out.
+    if !geo_rows.is_empty() {
+        let (l, f, r, st, w, io, ro, ms): (u32, u32, u32, u32, u32, u32, u32, f64) = geo_rows.iter().fold((0, 0, 0, 0, 0, 0, 0, 0.0),
+            |a, (_, g)| (a.0 + g.layouts, a.1 + g.failures, a.2 + g.reads, a.3 + g.stale, a.4 + g.writes_refused, a.5 + g.io_records, a.6 + g.ro_records, a.7 + g.ms));
+        println!("  layouts for geometry: {l} in {} docs ({f} failed), {:.0} ms in all; reads {r} from a current layout, {st} stale; \
+                  {w} measured-size writes refused; observer records IO {io} RO {ro}", geo_rows.len(), ms);
+        for (name, g) in &geo_rows {
+            println!("    geo {name}: layouts {} ({:.0} ms, max {:.0}) failed {} reads {} stale {} refused {} io {} ro {} sweep {}{}{}",
+                g.layouts, g.ms, g.max_ms, g.failures, g.reads, g.stale, g.writes_refused, g.io_records, g.ro_records, g.scroll_steps,
+                if g.first_refused.is_empty() { String::new() } else { format!(" e.g. {}", g.first_refused) },
+                if g.first_failure.is_empty() { String::new() } else { format!(" FAILURE {}", g.first_failure) });
+        }
     }
     if !causes.is_empty() {
         println!("FIRST FAILURES BY PROXIMATE CAUSE (what to build, ranked by documents)");
@@ -970,6 +1002,9 @@ fn serve() -> ! {
         probe_bounds: probe_bounds_env(),
         same_site_network: job.same_site,
         page_fetcher: relay.clone().map(|f| Box::new(f) as Box<dyn Fetcher>),
+        layout_fetcher: relay.clone().map(|f| Box::new(f) as Box<dyn Fetcher>),
+        nominal_geometry: nominal_geometry(),
+        no_scroll_sweep: std::env::var("PRERENDER_SCROLL").ok().as_deref() == Some("0"),
         ..Default::default()
     };
     let c = navigator_prerender::convert_with_opts(&src, job.base.as_deref(), &mut eng, fetcher, job.protect);
@@ -1048,6 +1083,7 @@ pub struct Child {
     pub module_retries: u32,
     pub observers: u32,
     pub layout_reads: u32,
+    pub geo: navigator_prerender::engine::GeoStats,
     pub mutation_records: u32,
     pub ce_upgrades: u32,
     pub history_writes: u32,
@@ -1085,7 +1121,7 @@ fn parse_child(s: &str) -> Option<Child> {
         scripts_failed: 0, script_mutations: 0, external_total: 0, external_fetched: 0,
         errors: vec![], missing: vec![], nulls: vec![], verdict: String::new(),
         first_error: None,
-        module_retries: 0, observers: 0, layout_reads: 0, mutation_records: 0, ce_upgrades: 0, history_writes: 0, history_refused: 0,
+        module_retries: 0, observers: 0, layout_reads: 0, geo: Default::default(), mutation_records: 0, ce_upgrades: 0, history_writes: 0, history_refused: 0,
         events_dispatched: 0, event_listeners_run: 0,
         doc_writes: 0, doc_writes_refused: 0,
         injected_scripts_run: 0, injected_scripts_refused: 0,
@@ -1155,6 +1191,14 @@ fn parse_child(s: &str) -> Option<Child> {
             }
             Some(&"C") if f.len() >= 3 => c.cause = Some((f[1].to_string(), f[2].to_string())),
             Some(&"L") if f.len() >= 2 => c.layout_reads = f[1].parse().unwrap_or(0),
+            Some(&"G") if f.len() >= 10 => {
+                let n = |i: usize| f[i].parse::<u32>().unwrap_or(0);
+                c.geo = navigator_prerender::engine::GeoStats { layouts: n(1), failures: n(2), reads: n(3), stale: n(4),
+                    writes_refused: n(5), io_records: n(6), ro_records: n(7),
+                    ms: f[8].parse().unwrap_or(0.0), max_ms: f[9].parse().unwrap_or(0.0),
+                    scroll_steps: f.get(10).and_then(|v| v.parse().ok()).unwrap_or(0),
+                    first_refused: f.get(11).unwrap_or(&"").to_string(), first_failure: f.get(12).unwrap_or(&"").to_string() };
+            }
             Some(&"O") if f.len() >= 3 => {
                 c.observers = f[1].parse().unwrap_or(0);
                 c.mutation_records = f[2].parse().unwrap_or(0);

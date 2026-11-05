@@ -1322,9 +1322,16 @@ fn node_obj(h: Handle, ctx: &mut Context) -> JsValue {
     // empty one. Reading still reports the ABSOLUTE url, as a browser does.
     live_get_set(&o, "src", src_get, src_set, ctx);
     install_text_accessor(&o, ctx);
-    for n in ["clientWidth", "offsetWidth", "scrollWidth"] { layout_prop(&o, n, layout_w, ctx); }
-    for n in ["clientHeight", "offsetHeight", "scrollHeight"] { layout_prop(&o, n, layout_h, ctx); }
-    for n in ["offsetTop", "offsetLeft", "scrollTop", "scrollLeft"] { layout_prop(&o, n, layout_zero, ctx); }
+    for (n, f) in [("offsetWidth", g_offset_w as fn(&JsValue, &[JsValue], &mut Context) -> JsResult<JsValue>),
+                   ("offsetHeight", g_offset_h), ("clientWidth", g_client_w), ("clientHeight", g_client_h),
+                   ("scrollWidth", g_scroll_w), ("scrollHeight", g_scroll_h),
+                   ("offsetTop", g_offset_top), ("offsetLeft", g_offset_left),
+                   ("clientTop", g_client_top), ("clientLeft", g_client_left),
+                   ("offsetParent", g_offset_parent)] { layout_prop(&o, n, f, ctx); }
+    // ★ Elements are never scrolled; the document is, only during the
+    // reader's sweep, and is back at the top when the recording is taken.
+    layout_prop(&o, "scrollTop", g_scroll_top, ctx);
+    layout_prop(&o, "scrollLeft", layout_zero, ctx);
     {
         let cl = class_list_obj(h, ctx);
         let _ = o.set(js_string!("classList"), cl, false, ctx);
@@ -1344,6 +1351,8 @@ fn node_obj(h: Handle, ctx: &mut Context) -> JsValue {
         let f = NativeFunction::from_fn_ptr(bounding_rect);
         let _ = o.set(js_string!("getBoundingClientRect"),
                       f.to_js_function(ctx.realm()), false, ctx);
+        let f = NativeFunction::from_fn_ptr(client_rects);
+        let _ = o.set(js_string!("getClientRects"), f.to_js_function(ctx.realm()), false, ctx);
     }
     install_tree(&o, ctx);
     install_handlers(&o, ctx);
@@ -1455,31 +1464,343 @@ fn parse_url(_t: &JsValue, args: &[JsValue], ctx: &mut Context) -> JsResult<JsVa
 const NOMINAL_W: f64 = 1280.0;
 const NOMINAL_H: f64 = 600.0;
 
-fn layout_w(_t: &JsValue, _a: &[JsValue], _c: &mut Context) -> JsResult<JsValue> {
-    LAYOUT_READS.with(|n| *n.borrow_mut() += 1);
-    Ok(JsValue::from(NOMINAL_W))
-}
-fn layout_h(_t: &JsValue, _a: &[JsValue], _c: &mut Context) -> JsResult<JsValue> {
-    LAYOUT_READS.with(|n| *n.borrow_mut() += 1);
-    Ok(JsValue::from(NOMINAL_H))
-}
 fn layout_zero(_t: &JsValue, _a: &[JsValue], _c: &mut Context) -> JsResult<JsValue> {
     LAYOUT_READS.with(|n| *n.borrow_mut() += 1);
     Ok(JsValue::from(0.0))
 }
-fn bounding_rect(_t: &JsValue, _a: &[JsValue], ctx: &mut Context) -> JsResult<JsValue> {
+
+// --- layout geometry (legacy-web §5.4.5.6e) --------------------------------
+//
+// ★★ ANSWERED FROM A LAYOUT, not from the fiction above. The live DOM is
+// laid out by the lane's own normalizer and renderer (src/geometry.rs) the
+// first time a script asks, and again after a mutation when another read
+// follows it, at most `MAX_LAYOUTS` times; the nominal box survives only as
+// the answer when no layout is possible (the engine has geometry off, or no
+// layout succeeded), and that is counted.
+
+#[derive(Default)]
+struct GeoState {
+    on: bool,
+    /// The converter's fetcher for layout inputs (sheets, image sizes):
+    /// the same caches the recording's own collection reads.
+    fetcher: Option<Box<dyn crate::fetch::Fetcher>>,
+    base: Option<String>,
+    /// The last layout and the DOM's mutation count when it was taken.
+    /// ★ The count travels WITH the DOM, so a probe's restore brings back an
+    /// old count over the old tree; the snapshot is restored with it (see
+    /// `probe`), or a layout taken during the probe would match by count
+    /// over a different tree.
+    snap: Option<(u64, std::rc::Rc<navigator_render::html::Geometry>)>,
+    stats: crate::engine::GeoStats,
+    /// The document's scroll position during the reader's sweep (`sweep`),
+    /// in px; 0 otherwise. Rects are viewport-relative, so they move by it.
+    scroll_y: f64,
+    /// ★ Every size a geometry getter has returned, in 1/64 px (exact and
+    /// rounded each way to whole px), so a
+    /// style write that copies one back can be recognised and refused.
+    measured: std::collections::BTreeSet<i64>,
+}
+
+thread_local! {
+    static GEO: RefCell<GeoState> = RefCell::new(GeoState::default());
+}
+
+/// The current layout, laying out again if the DOM changed since the last
+/// one and the budget allows. `None`: no layout is possible (nominal
+/// answers apply).
+fn geometry() -> Option<std::rc::Rc<navigator_render::html::Geometry>> {
+    let key = with(|d| d.script_mutations);
+    let (on, cached, spent) = GEO.with(|g| {
+        let g = g.borrow();
+        (g.on, g.snap.clone(), g.stats.layouts + g.stats.failures >= crate::geometry::MAX_LAYOUTS)
+    });
+    if !on { return None }
+    match cached {
+        Some((k, geo)) if k == key => { GEO.with(|g| g.borrow_mut().stats.reads += 1); return Some(geo) }
+        Some((_, geo)) if spent => { GEO.with(|g| g.borrow_mut().stats.stale += 1); return Some(geo) }
+        None if spent => return None,
+        _ => {}
+    }
+    let t = std::time::Instant::now();
+    let r = GEO.with(|g| {
+        let mut g = g.borrow_mut();
+        let g = &mut *g;
+        let mut nonet = crate::fetch::NoNetwork;
+        let f: &mut dyn crate::fetch::Fetcher = match g.fetcher.as_mut() { Some(b) => b.as_mut(), None => &mut nonet };
+        let base = g.base.clone();
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            with(|d| crate::geometry::layout(d, base.as_deref(), f))
+        })).unwrap_or_else(|_| Err("layout panicked".into()))
+    });
+    let ms = t.elapsed().as_secs_f64() * 1e3;
+    GEO.with(|g| {
+        let mut g = g.borrow_mut();
+        g.stats.ms += ms;
+        g.stats.max_ms = g.stats.max_ms.max(ms);
+        match r {
+            Ok(geo) => {
+                g.stats.layouts += 1;
+                g.stats.reads += 1;
+                let geo = std::rc::Rc::new(geo);
+                g.snap = Some((key, geo.clone()));
+                Some(geo)
+            }
+            Err(e) => {
+                g.stats.failures += 1;
+                if g.stats.first_failure.is_empty() { g.stats.first_failure = e }
+                g.snap.as_ref().map(|(_, geo)| geo.clone())
+            }
+        }
+    })
+}
+
+/// px from layout units.
+fn px(v: i64) -> f64 { v as f64 / 64.0 }
+
+/// The element's geometry: `Err(())` when there is no layout at all (the
+/// caller answers nominally), `Ok(None)` when it was not laid out (a
+/// browser's zeros: `display: none`, detached, in `<head>`).
+fn geom_of(h: Handle) -> Result<Option<navigator_render::html::Geom>, ()> {
+    let geo = geometry().ok_or(())?;
+    Ok(geo.elements.get(&(h as u64)).cloned())
+}
+
+fn note_size(v: f64) {
+    if v == 0.0 || !v.is_finite() { return }
+    // In 1/64 px, the layout's own unit: the exact value and its whole-px
+    // roundings (a script may `Math.ceil` a rect before writing it).
+    GEO.with(|g| { let mut g = g.borrow_mut(); for r in [v, v.floor(), v.ceil(), v.round()] { g.measured.insert((r * 64.0).round() as i64); } });
+}
+
+fn size_answer(v: f64) -> JsResult<JsValue> { note_size(v); Ok(JsValue::from(v)) }
+
+fn root_element() -> Option<Handle> { with(|d| d.element_children(d.root()).into_iter().next()) }
+fn body_element() -> Option<Handle> { with(|d| d.by_tag("body").first().copied()) }
+
+/// ★ offsetWidth and friends are INTEGERS in a browser (rounded); the rect
+/// methods are not.
+fn g_offset_w(t: &JsValue, _a: &[JsValue], ctx: &mut Context) -> JsResult<JsValue> {
     LAYOUT_READS.with(|n| *n.borrow_mut() += 1);
-    let o = ObjectInitializer::new(ctx)
-        .property(js_string!("x"), 0.0, Attribute::all())
-        .property(js_string!("y"), 0.0, Attribute::all())
-        .property(js_string!("top"), 0.0, Attribute::all())
-        .property(js_string!("left"), 0.0, Attribute::all())
-        .property(js_string!("width"), NOMINAL_W, Attribute::all())
-        .property(js_string!("height"), NOMINAL_H, Attribute::all())
-        .property(js_string!("right"), NOMINAL_W, Attribute::all())
-        .property(js_string!("bottom"), NOMINAL_H, Attribute::all())
-        .build();
-    Ok(JsValue::from(o))
+    let Some(h) = handle_of(t, ctx) else { return Ok(JsValue::from(0.0)) };
+    match geom_of(h) { Err(()) => Ok(JsValue::from(NOMINAL_W)), Ok(None) => Ok(JsValue::from(0.0)), Ok(Some(e)) => size_answer(px(e.w).round()) }
+}
+fn g_offset_h(t: &JsValue, _a: &[JsValue], ctx: &mut Context) -> JsResult<JsValue> {
+    LAYOUT_READS.with(|n| *n.borrow_mut() += 1);
+    let Some(h) = handle_of(t, ctx) else { return Ok(JsValue::from(0.0)) };
+    match geom_of(h) { Err(()) => Ok(JsValue::from(NOMINAL_H)), Ok(None) => Ok(JsValue::from(0.0)), Ok(Some(e)) => size_answer(px(e.h).round()) }
+}
+/// The padding box; the viewport for the root element (CSSOM View §6);
+/// zero for an inline box.
+fn client_size(t: &JsValue, ctx: &mut Context, height: bool) -> JsResult<JsValue> {
+    LAYOUT_READS.with(|n| *n.borrow_mut() += 1);
+    let nominal = if height { NOMINAL_H } else { NOMINAL_W };
+    let Some(h) = handle_of(t, ctx) else { return Ok(JsValue::from(0.0)) };
+    let g = match geom_of(h) { Err(()) => return Ok(JsValue::from(nominal)), Ok(g) => g };
+    if Some(h) == root_element() {
+        let (w, ht) = crate::geometry::VIEWPORT;
+        return size_answer(if height { ht } else { w });
+    }
+    match g {
+        None => Ok(JsValue::from(0.0)),
+        Some(e) if e.inline => Ok(JsValue::from(0.0)),
+        Some(e) => size_answer(if height { px(e.h - e.border[0] - e.border[2]) } else { px(e.w - e.border[1] - e.border[3]) }.round()),
+    }
+}
+fn g_client_w(t: &JsValue, _a: &[JsValue], ctx: &mut Context) -> JsResult<JsValue> { client_size(t, ctx, false) }
+fn g_client_h(t: &JsValue, _a: &[JsValue], ctx: &mut Context) -> JsResult<JsValue> { client_size(t, ctx, true) }
+fn g_client_top(t: &JsValue, _a: &[JsValue], ctx: &mut Context) -> JsResult<JsValue> {
+    let Some(h) = handle_of(t, ctx) else { return Ok(JsValue::from(0.0)) };
+    Ok(JsValue::from(match geom_of(h) { Ok(Some(e)) if !e.inline => px(e.border[0]).round(), _ => 0.0 }))
+}
+fn g_client_left(t: &JsValue, _a: &[JsValue], ctx: &mut Context) -> JsResult<JsValue> {
+    let Some(h) = handle_of(t, ctx) else { return Ok(JsValue::from(0.0)) };
+    Ok(JsValue::from(match geom_of(h) { Ok(Some(e)) if !e.inline => px(e.border[3]).round(), _ => 0.0 }))
+}
+/// ★ The scroll size: the padding box, or further where descendants'
+/// boxes reach past it; the document's extent for the root.
+fn scroll_size(t: &JsValue, ctx: &mut Context, height: bool) -> JsResult<JsValue> {
+    LAYOUT_READS.with(|n| *n.borrow_mut() += 1);
+    let nominal = if height { NOMINAL_H } else { NOMINAL_W };
+    let Some(h) = handle_of(t, ctx) else { return Ok(JsValue::from(0.0)) };
+    let Some(geo) = geometry() else { return Ok(JsValue::from(nominal)) };
+    if Some(h) == root_element() {
+        let (w, ht) = crate::geometry::VIEWPORT;
+        return size_answer(if height { px(geo.height).max(ht) } else { px(geo.width).max(w) }.round());
+    }
+    let Some(e) = geo.elements.get(&(h as u64)) else { return Ok(JsValue::from(0.0)) };
+    if e.inline { return Ok(JsValue::from(0.0)) }
+    let (ox, oy) = (e.x + e.border[3], e.y + e.border[0]);
+    let mut reach = if height { e.h - e.border[0] - e.border[2] } else { e.w - e.border[1] - e.border[3] };
+    let mut stack: Vec<Handle> = with(|d| d.children_of(h));
+    while let Some(c) = stack.pop() {
+        if let Some(g) = geo.elements.get(&(c as u64)) {
+            reach = reach.max(if height { g.y + g.h - oy } else { g.x + g.w - ox });
+        }
+        stack.extend(with(|d| d.children_of(c)));
+    }
+    size_answer(px(reach).round())
+}
+fn g_scroll_w(t: &JsValue, _a: &[JsValue], ctx: &mut Context) -> JsResult<JsValue> { scroll_size(t, ctx, false) }
+/// The scrolling element's (`<html>`, and `<body>` as browsers also
+/// answer for it) is the document's scroll position; every other is 0.
+fn g_scroll_top(t: &JsValue, _a: &[JsValue], ctx: &mut Context) -> JsResult<JsValue> {
+    LAYOUT_READS.with(|n| *n.borrow_mut() += 1);
+    let h = handle_of(t, ctx);
+    let doc = h.is_some() && (h == root_element() || h == body_element());
+    Ok(JsValue::from(if doc { GEO.with(|g| g.borrow().scroll_y) } else { 0.0 }))
+}
+fn g_scroll_h(t: &JsValue, _a: &[JsValue], ctx: &mut Context) -> JsResult<JsValue> { scroll_size(t, ctx, true) }
+
+/// ★ `offsetParent` (CSSOM View §7): the nearest positioned ancestor — or,
+/// for a static element, the nearest `td`/`th`/`table` — else `body`; null
+/// for the root, `body`, a fixed box and an element with no box.
+fn offset_parent(h: Handle, geo: &navigator_render::html::Geometry) -> Option<Handle> {
+    let e = geo.elements.get(&(h as u64))?;
+    if Some(h) == root_element() || Some(h) == body_element() { return None }
+    if with(|d| d.style_get(h, "position")) == "fixed" { return None }
+    let mut p = with(|d| d.get(h).and_then(|n| n.parent));
+    while let Some(a) = p {
+        if Some(a) == body_element() { return Some(a) }
+        if let Some(ag) = geo.elements.get(&(a as u64)) {
+            if ag.positioned { return Some(a) }
+            let tag = with(|d| d.tag(a).map(|t| t.to_ascii_lowercase())).unwrap_or_default();
+            if !e.positioned && matches!(tag.as_str(), "td" | "th" | "table") { return Some(a) }
+        }
+        p = with(|d| d.get(a).and_then(|n| n.parent));
+    }
+    body_element()
+}
+fn offset_pos(t: &JsValue, ctx: &mut Context, top: bool) -> JsResult<JsValue> {
+    LAYOUT_READS.with(|n| *n.borrow_mut() += 1);
+    let Some(h) = handle_of(t, ctx) else { return Ok(JsValue::from(0.0)) };
+    let Some(geo) = geometry() else { return Ok(JsValue::from(0.0)) };
+    let Some(e) = geo.elements.get(&(h as u64)) else { return Ok(JsValue::from(0.0)) };
+    let own = if top { e.y } else { e.x };
+    // Relative to the parent's PADDING edge, except where the parent is the
+    // body (or there is none): then to the document's origin.
+    let rel = match offset_parent(h, &geo) {
+        Some(p) if Some(p) != body_element() => geo.elements.get(&(p as u64))
+            .map(|pg| own - if top { pg.y + pg.border[0] } else { pg.x + pg.border[3] }).unwrap_or(own),
+        _ => own,
+    };
+    Ok(JsValue::from(px(rel).round()))
+}
+fn g_offset_top(t: &JsValue, _a: &[JsValue], ctx: &mut Context) -> JsResult<JsValue> { offset_pos(t, ctx, true) }
+fn g_offset_left(t: &JsValue, _a: &[JsValue], ctx: &mut Context) -> JsResult<JsValue> { offset_pos(t, ctx, false) }
+fn g_offset_parent(t: &JsValue, _a: &[JsValue], ctx: &mut Context) -> JsResult<JsValue> {
+    let Some(h) = handle_of(t, ctx) else { return Ok(JsValue::null()) };
+    let Some(geo) = geometry() else { return Ok(body_element().map(|b| node_obj(b, ctx)).unwrap_or(JsValue::null())) };
+    Ok(offset_parent(h, &geo).map(|p| node_obj(p, ctx)).unwrap_or(JsValue::null()))
+}
+
+fn dom_rect(x: f64, y: f64, w: f64, h: f64, ctx: &mut Context) -> JsValue {
+    JsValue::from(ObjectInitializer::new(ctx)
+        .property(js_string!("x"), x, Attribute::all())
+        .property(js_string!("y"), y, Attribute::all())
+        .property(js_string!("top"), y, Attribute::all())
+        .property(js_string!("left"), x, Attribute::all())
+        .property(js_string!("width"), w, Attribute::all())
+        .property(js_string!("height"), h, Attribute::all())
+        .property(js_string!("right"), x + w, Attribute::all())
+        .property(js_string!("bottom"), y + h, Attribute::all())
+        .build())
+}
+
+/// ★ Page coordinates ARE viewport coordinates here: the document is at
+/// scroll 0 (its recorded, initial state).
+fn bounding_rect(t: &JsValue, _a: &[JsValue], ctx: &mut Context) -> JsResult<JsValue> {
+    LAYOUT_READS.with(|n| *n.borrow_mut() += 1);
+    let (x, y, w, h) = match handle_of(t, ctx).map(geom_of) {
+        Some(Ok(Some(e))) => (px(e.x), px(e.y) - GEO.with(|g| g.borrow().scroll_y), px(e.w), px(e.h)),
+        Some(Err(())) => (0.0, 0.0, NOMINAL_W, NOMINAL_H),
+        _ => (0.0, 0.0, 0.0, 0.0),
+    };
+    note_size(w); note_size(h);
+    Ok(dom_rect(x, y, w, h, ctx))
+}
+
+fn client_rects(t: &JsValue, _a: &[JsValue], ctx: &mut Context) -> JsResult<JsValue> {
+    LAYOUT_READS.with(|n| *n.borrow_mut() += 1);
+    let frags: Vec<(i64, i64, i64, i64)> = match handle_of(t, ctx).map(geom_of) {
+        Some(Ok(Some(e))) => e.fragments.clone(),
+        Some(Err(())) => vec![(0, 0, NOMINAL_W as i64 * 64, NOMINAL_H as i64 * 64)],
+        _ => vec![],
+    };
+    let sy = GEO.with(|g| g.borrow().scroll_y);
+    let rects: Vec<JsValue> = frags.iter().map(|&(x, y, w, h)| {
+        note_size(px(w)); note_size(px(h));
+        dom_rect(px(x), px(y) - sy, px(w), px(h), ctx)
+    }).collect();
+    Ok(JsValue::from(boa_engine::object::builtins::JsArray::from_iter(rects, ctx)))
+}
+
+/// `__geoBox(el)` -> [x, y, w, h, bt, br, bb, bl, pt, pr, pb, pl] in px, or
+/// null when it has no box; `undefined` when there is no layout at all. For
+/// the observers, which compute their records in script.
+fn geo_box(_t: &JsValue, args: &[JsValue], ctx: &mut Context) -> JsResult<JsValue> {
+    let Some(h) = handle_of(args.get_or_undefined(0), ctx) else { return Ok(JsValue::null()) };
+    match geom_of(h) {
+        Err(()) => Ok(JsValue::undefined()),
+        Ok(None) => Ok(JsValue::null()),
+        Ok(Some(e)) => {
+            let v: Vec<JsValue> = [e.x, e.y, e.w, e.h].into_iter().chain(e.border).chain(e.padding)
+                .map(|u| JsValue::from(px(u))).collect();
+            Ok(JsValue::from(boa_engine::object::builtins::JsArray::from_iter(v, ctx)))
+        }
+    }
+}
+
+/// `__geoNote(kind, n)`: count observer records delivered.
+fn geo_note(_t: &JsValue, args: &[JsValue], ctx: &mut Context) -> JsResult<JsValue> {
+    let kind = args.get_or_undefined(0).to_string(ctx)?.to_std_string_escaped();
+    let n = args.get_or_undefined(1).to_number(ctx).unwrap_or(0.0) as u32;
+    GEO.with(|g| { let mut g = g.borrow_mut(); if kind == "io" { g.stats.io_records += n } else { g.stats.ro_records += n } });
+    Ok(JsValue::undefined())
+}
+
+/// `__geoScroll(y)`: set the document's scroll position (the sweep).
+fn geo_scroll(_t: &JsValue, args: &[JsValue], ctx: &mut Context) -> JsResult<JsValue> {
+    let y = args.get_or_undefined(0).to_number(ctx).unwrap_or(0.0);
+    GEO.with(|g| g.borrow_mut().scroll_y = if y.is_finite() { y.max(0.0) } else { 0.0 });
+    Ok(JsValue::undefined())
+}
+
+/// `__geoOn()`: whether geometry answers come from a layout. With it off,
+/// the observers keep their old behaviour (accept, never deliver).
+fn geo_on(_t: &JsValue, _a: &[JsValue], _ctx: &mut Context) -> JsResult<JsValue> {
+    Ok(JsValue::from(GEO.with(|g| g.borrow().on)))
+}
+
+/// ★★ A STYLE WRITE THAT COPIES A MEASURED SIZE BACK IS REFUSED.
+///
+/// An equaliser reads every card's height and writes the tallest onto all
+/// of them as `min-height`. With real geometry those are real heights — at
+/// the CONVERSION viewport, 1280 px. The document is read at other widths
+/// (the lane renders at 800), where the same text wraps differently, so a
+/// height baked at 1280 is a blank gap or a clipped card (Samsung: 9 of the
+/// corpora's 11 nominal values were `min-height: 600px` on headlines). So a
+/// write of a SIZE property (`width`, `height`, their `min-`/`max-`) whose
+/// value is a nonzero px length equal to a size a geometry getter returned
+/// (exactly, or rounded to whole px) is not applied, and is counted. Positions are not refused;
+/// zero is not (collapsing is not baking); a derived value (a sum, a margin
+/// added) is not caught: the rule is exact matching, stated as such, not
+/// taint tracking.
+fn refuse_measured_write(prop: &str, value: &str) -> bool {
+    let p: String = prop.chars().filter(|c| *c != '-').collect::<String>().to_ascii_lowercase();
+    if !matches!(p.as_str(), "width" | "height" | "minwidth" | "minheight" | "maxwidth" | "maxheight") { return false }
+    let v = value.trim();
+    let Some(n) = v.strip_suffix("px").unwrap_or(v).trim().parse::<f64>().ok() else { return false };
+    let units = n * 64.0;
+    if n == 0.0 || !n.is_finite() || units.fract() != 0.0 { return false }
+    let hit = GEO.with(|g| { let g = g.borrow(); g.snap.is_some() && g.measured.contains(&(units as i64)) });
+    if hit {
+        GEO.with(|g| {
+            let mut g = g.borrow_mut();
+            g.stats.writes_refused += 1;
+            if g.stats.first_refused.is_empty() { g.stats.first_refused = format!("{prop}: {v}") }
+        });
+    }
+    hit
 }
 
 /// Install a read-only accessor backed by one of the layout getters.
@@ -1660,6 +1981,10 @@ fn style_set_trap(_t: &JsValue, args: &[JsValue], ctx: &mut Context) -> JsResult
     let name = args.get_or_undefined(1).clone().to_property_key(ctx)?.to_string();
     let val = args.get_or_undefined(2).to_string(ctx)?.to_std_string_escaped();
     let h = target.get(js_string!("__h"), ctx)?.as_number().unwrap_or(0.0) as Handle;
+    // ★ Refused, not applied: a measured size copied back (see
+    // `refuse_measured_write`). The assignment still "succeeds", as a
+    // browser's would; the document just does not take it.
+    if name != "cssText" && refuse_measured_write(&name, &val) { return Ok(JsValue::from(true)) }
     with(|d| {
         if name == "cssText" { d.set_attr(h, "style", &val) } else { d.style_set(h, &name, &val) }
         d.script_mutations += 1;
@@ -1671,6 +1996,7 @@ fn style_set_property(this: &JsValue, args: &[JsValue], ctx: &mut Context) -> Js
     let p = args.get_or_undefined(0).to_string(ctx)?.to_std_string_escaped();
     let v = args.get_or_undefined(1).to_string(ctx)?.to_std_string_escaped();
     if let Some(h) = handle_of(this, ctx) {
+        if refuse_measured_write(&p, &v) { return Ok(JsValue::undefined()) }
         with(|d| { d.style_set(h, &p, &v); d.script_mutations += 1 });
         record_mutation("attributes", h, "style");
     }
@@ -2752,6 +3078,10 @@ fn run_probe(ctx: &mut Context, p: &Probe, parser_nodes: Handle) -> ProbeResult 
     use crate::engine::Transition;
     let h = p.target;
     let before = DOM.with(|d| d.borrow().clone());
+    // ★ The layout goes back with the DOM: the restored tree carries its old
+    // mutation count, so a snapshot taken DURING the probe would otherwise
+    // match it by key over a different tree.
+    let geo_before = GEO.with(|g| g.borrow().snap.clone());
     let path = before.node_path(h);
     // PRERENDER_TRACE_PROBES=<file>: append each probe before it runs, so
     // the one that never returns is the last line (a timed-out child's
@@ -2808,6 +3138,7 @@ fn run_probe(ctx: &mut Context, p: &Probe, parser_nodes: Handle) -> ProbeResult 
     let selectors = PROBE_SELECTORS.with(|s| s.borrow_mut().take()).unwrap_or_default();
     // Restore. The probe is an observation, not an edit.
     DOM.with(|d| *d.borrow_mut() = before);
+    GEO.with(|g| g.borrow_mut().snap = geo_before.clone());
     let probe1 = probe_counters(ctx);
     let counters = (probe1.0.saturating_sub(probe0.0), probe1.1.saturating_sub(probe0.1),
         probe1.2.saturating_sub(probe0.2), probe1.3.saturating_sub(probe0.3),
@@ -3512,6 +3843,55 @@ fn describe(h: Handle, e: &mut crate::engine::Interactive) {
 }
 
 /// (callbacks fired, virtual now, last timer id) — the virtual timer clock.
+/// Viewports the reader's sweep covers at most: 40 × 600 px = 24,000 px of
+/// document. Bounded by count, as everything in a conversion is.
+pub const MAX_SCROLL_STEPS: u32 = 40;
+
+/// ★★ THE READER'S SWEEP (legacy-web §5.4.5.6e, as built).
+///
+/// With real geometry a lazy loader is honest: at scroll 0 only the first
+/// screen is "in view", so Samsung's rect-on-scroll loader filled 9 of 63
+/// images and an IntersectionObserver loader would fill the first screen
+/// only. The old nominal box loaded everything by accident — every element
+/// claimed to be on screen. But a recording is READ, and a reader scrolls:
+/// every image a browser would load for them on the way down is content of
+/// the page. So after load the converter scrolls the document as a reader
+/// does — one viewport at a time to the end, each step a `scroll` event,
+/// an IntersectionObserver update, delivered mutations and a bounded timer
+/// drain (relative, like a probe's) — and then back to the top, where the
+/// recording is taken. What a page does on the way (loads images, reveals
+/// sections) stays; what depends on the position (a sticky header's class,
+/// a scroll-spy's mark) is recomputed by the page at scroll 0 on the way
+/// back. Deterministic: positions come from the layout, steps are counted.
+fn sweep(ctx: &mut Context) {
+    if !GEO.with(|g| g.borrow().on) { return }
+    // ★ Only a page that can NOTICE a scroll is scrolled: one listening for
+    // it, or with an IntersectionObserver still observing something. Any
+    // other would be laid out for nothing.
+    let reacts = ctx.eval(Source::from_bytes(
+        b"__listens('scroll') || __ioAll.some(function (io) { return io._seen.length > 0; })"))
+        .ok().map(|v| v.to_boolean()).unwrap_or(false);
+    if !reacts { return }
+    let height = ctx.eval(Source::from_bytes(b"document.documentElement.scrollHeight")).ok()
+        .and_then(|v| v.as_number()).unwrap_or(0.0);
+    let step = crate::geometry::VIEWPORT.1;
+    let mut y = step;
+    let mut steps = 0u32;
+    let go = |ctx: &mut Context, y: f64| {
+        let (fired, now, seq) = timer_clock(ctx);
+        let js = format!("__scrollTo({y}); __deliverMutations(4); __drainTimers({}, {}, {})", fired + 50, now + 500, seq);
+        let _ = ctx.eval(Source::from_bytes(js.as_bytes()));
+        let _ = ctx.run_jobs();
+    };
+    while y < height && steps < MAX_SCROLL_STEPS {
+        go(ctx, y);
+        y += step;
+        steps += 1;
+    }
+    if steps > 0 { go(ctx, 0.0) }
+    GEO.with(|g| g.borrow_mut().stats.scroll_steps = steps);
+}
+
 fn timer_clock(ctx: &mut Context) -> (i64, i64, i64) {
     let mut t = [0i64; 5];
     if let Ok(v) = ctx.eval(Source::from_bytes(b"__timerStats()")) {
@@ -3874,6 +4254,17 @@ pub struct BoaEngine {
     pub module_root: Option<std::path::PathBuf>,
     /// The document's own URL.
     pub base_url: Option<String>,
+    /// ★ Where a LAYOUT reads the document's stylesheets and image sizes
+    /// (legacy-web §5.4.5.6e): the converter's own fetcher, never the
+    /// page's — wired to the same caches (or fetchd) the recording's
+    /// subresource collection uses, so a layout sees the inputs the lane
+    /// will. `None`: layouts see only what the document itself carries.
+    pub layout_fetcher: Option<Box<dyn crate::fetch::Fetcher>>,
+    /// Answer geometry with the old nominal box instead of a layout
+    /// (`PRERENDER_GEOMETRY=0`), for measuring the difference.
+    pub nominal_geometry: bool,
+    /// Skip the reader's sweep (`PRERENDER_SCROLL=0`; see `sweep`).
+    pub no_scroll_sweep: bool,
 }
 
 /// Parse, link and evaluate a module, then settle its promise.
@@ -4334,17 +4725,23 @@ const GLOBALS: &str = r#"
     };
   })();
 
-  // ★ GEOMETRY OBSERVERS ACCEPT AND NEVER DELIVER.
+  // ★★ GEOMETRY OBSERVERS DELIVER ONE INITIAL RECORD, FROM THE LAYOUT.
   //
-  // ResizeObserver and IntersectionObserver report layout, and this converter
-  // performs no layout — so any box it handed a callback would be fiction.
-  // That is not a harmless fiction either: a script told an element is 0x0
-  // routinely collapses or hides it, which would make the conversion WORSE
-  // than not firing at all. Real implementations deliver one initial
-  // observation on observe(); we deliberately do not.
+  // They used to accept and never deliver, because there was no layout to
+  // report and an invented box (0x0) makes scripts collapse what they see.
+  // Now there is a layout (legacy-web §5.4.5.6e), so each (observer, target)
+  // gets exactly the record a browser delivers first: in a task after
+  // observe(), computed from the layout of the document as it is then. It
+  // is the ONLY record: the document is never scrolled or resized, so a
+  // browser would send nothing more either, and a later mutation is not
+  // reported. The IntersectionObserver root is the viewport at scroll 0
+  // (or the `root` element's border box), grown by `rootMargin`; clipping
+  // by overflow ancestors is not modelled. A ResizeObserver target whose
+  // content box is 0x0 gets none, as in a browser (its last reported size
+  // starts at 0x0). With geometry off (`__geoOn()` false) both behave as
+  // they did: accept, never deliver. PerformanceObserver never delivers.
   //
-  // Registrations are counted so the cost of that choice is visible rather
-  // than assumed — see `observers_registered` in the report.
+  // Registrations are still counted (`observers_registered`).
   globalThis.__observed = 0;
   function GeometryObserver(cb) {
     this._cb = cb;
@@ -4353,8 +4750,118 @@ const GLOBALS: &str = r#"
     this.disconnect = function () {};
     this.takeRecords = function () { return []; };
   }
-  globalThis.ResizeObserver = GeometryObserver;
-  globalThis.IntersectionObserver = GeometryObserver;
+  function __rect(x, y, w, h) {
+    return { x: x, y: y, width: w, height: h, top: y, left: x, right: x + w, bottom: y + h,
+             toJSON: function () { return { x: x, y: y, width: w, height: h, top: y, left: x, right: x + w, bottom: y + h }; } };
+  }
+  // `rootMargin`: one to four px or % lengths, as CSS margins expand.
+  function __margins(m, rw, rh) {
+    var p = String(m === undefined ? '0px' : m).trim().split(/\s+/);
+    var v = p.map(function (t, i) {
+      var n = parseFloat(t); if (!isFinite(n)) n = 0;
+      return /%$/.test(t) ? n / 100 * ((i % 2 === 0) ? rh : rw) : n;
+    });
+    if (v.length === 1) v = [v[0], v[0], v[0], v[0]];
+    else if (v.length === 2) v = [v[0], v[1], v[0], v[1]];
+    else if (v.length === 3) v = [v[0], v[1], v[2], v[1]];
+    return v; // top right bottom left
+  }
+  function __observerQueue(self, deliver) {
+    // `_seen`: observed and not unobserved; `_last`: the isIntersecting
+    // last delivered for each (IntersectionObserver), parallel to `_seen`.
+    self._seen = []; self._last = []; self._pending = [];
+    self._deliver = function (e) { if (e.length) { __geoNote(deliver, e.length); self._cb.call(self, e, self); } };
+    self.observe = function (t) {
+      globalThis.__observed++;
+      if (!t || self._seen.indexOf(t) >= 0 || !__geoOn()) return;
+      self._seen.push(t); self._last.push(null); self._pending.push(t);
+      if (self._pending.length === 1) setTimeout(function () { self._deliver(self.takeRecords()); }, 0);
+    };
+    self.unobserve = function (t) {
+      var i = self._pending.indexOf(t); if (i >= 0) self._pending.splice(i, 1);
+      i = self._seen.indexOf(t); if (i >= 0) { self._seen.splice(i, 1); self._last.splice(i, 1); }
+    };
+    self.disconnect = function () { self._pending = []; self._seen = []; self._last = []; };
+  }
+  // ★ During the reader's sweep the viewport moves, and an
+  // IntersectionObserver reports each target whose intersection CHANGED,
+  // as a browser does on scroll. ResizeObservers have nothing to report.
+  globalThis.__ioAll = [];
+  globalThis.__ioScrolled = function () {
+    __ioAll.forEach(function (io) { io._deliver(io._entries(io._seen, true)); });
+  };
+  function IntersectionObserver(cb, opts) {
+    var self = this; opts = opts || {};
+    self._cb = cb; self.root = opts.root || null;
+    self.rootMargin = opts.rootMargin === undefined ? '0px 0px 0px 0px' : String(opts.rootMargin);
+    self.thresholds = [].concat(opts.threshold === undefined ? 0 : opts.threshold);
+    __observerQueue(self, 'io');
+    __ioAll.push(self);
+    self.takeRecords = function () { var e = self._entries(self._pending, false); self._pending = []; return e; };
+    // Entries for `targets`, in viewport coordinates; with `changed`, only
+    // those whose isIntersecting differs from the last one delivered.
+    self._entries = function (targets, changed) {
+      var out = [], sy = scrollY;
+      var rb = self.root ? __geoBox(self.root) : null;
+      var root = rb ? [rb[0], rb[1], rb[2], rb[3]] : [0, sy, innerWidth, innerHeight];
+      var m = __margins(self.rootMargin, root[2], root[3]);
+      root = [root[0] - m[3], root[1] - m[0], root[2] + m[1] + m[3], root[3] + m[0] + m[2]];
+      targets.forEach(function (t) {
+        var b = __geoBox(t);
+        if (b === undefined) return;
+        var hit = false, ir = __rect(0, 0, 0, 0), br = __rect(0, 0, 0, 0), ratio = 0;
+        if (b) {
+          br = __rect(b[0], b[1] - sy, b[2], b[3]);
+          var x0 = Math.max(b[0], root[0]), y0 = Math.max(b[1], root[1]);
+          var x1 = Math.min(b[0] + b[2], root[0] + root[2]), y1 = Math.min(b[1] + b[3], root[1] + root[3]);
+          // Edge-adjacent counts (IntersectionObserver §3.2.8), so a 0x0
+          // placeholder inside the root still intersects.
+          hit = x1 >= x0 && y1 >= y0;
+          if (hit) ir = __rect(x0, y0 - sy, x1 - x0, y1 - y0);
+          var area = b[2] * b[3];
+          ratio = hit ? (area > 0 ? (ir.width * ir.height) / area : 1) : 0;
+        }
+        var i = self._seen.indexOf(t);
+        if (changed && i >= 0 && self._last[i] === hit) return;
+        if (i >= 0) self._last[i] = hit;
+        out.push({ target: t, isIntersecting: hit, intersectionRatio: ratio, boundingClientRect: br,
+                   intersectionRect: ir, rootBounds: self.root ? null : __rect(root[0], root[1] - sy, root[2], root[3]),
+                   time: performance.now() });
+      });
+      return out;
+    };
+  }
+  function ResizeObserver(cb) {
+    var self = this;
+    self._cb = cb;
+    __observerQueue(self, 'ro');
+    self.takeRecords = function () {
+      var out = [];
+      self._pending.forEach(function (t) {
+        var b = __geoBox(t);
+        if (!b) return;
+        var cw = Math.max(0, b[2] - b[5] - b[7] - b[9] - b[11]), ch = Math.max(0, b[3] - b[4] - b[6] - b[8] - b[10]);
+        if (cw === 0 && ch === 0) return;
+        var content = [{ inlineSize: cw, blockSize: ch }];
+        out.push({ target: t, contentRect: __rect(b[11], b[8], cw, ch),
+                   borderBoxSize: [{ inlineSize: b[2], blockSize: b[3] }],
+                   contentBoxSize: content, devicePixelContentBoxSize: content });
+      });
+      self._pending = [];
+      return out;
+    };
+  }
+  // One step of the reader's sweep: scroll the document to `y`, tell the
+  // page (a `scroll` event), and move the IntersectionObservers' viewport.
+  globalThis.__scrollTo = function (y) {
+    globalThis.scrollY = globalThis.pageYOffset = y;
+    if (typeof window !== 'undefined') { window.scrollY = window.pageYOffset = y; }
+    __geoScroll(y);
+    __fire('scroll');
+    __ioScrolled();
+  };
+  globalThis.ResizeObserver = ResizeObserver;
+  globalThis.IntersectionObserver = IntersectionObserver;
   globalThis.PerformanceObserver = GeometryObserver;
 
   // Fixed identity: the converter's, not the reader's. A real user agent
@@ -5261,6 +5768,11 @@ const BOOTSTRAP: &str = r#"
     for (var i = L.length - 1; i >= 0; i--) if (L[i][0] === String(t) && L[i][1] === f) L.splice(i, 1);
   }
   globalThis.__dispatchRan = 0;
+  // Whether anything listens for `type` on the document or window.
+  globalThis.__listens = function (type) {
+    for (var i = 0; i < L.length; i++) if (L[i][0] === type) return true;
+    return typeof globalThis['on' + type] === 'function';
+  };
   globalThis.__fire = function (type, extra) {
     var ev = { type: type, target: document, currentTarget: document,
                preventDefault: function () {}, stopPropagation: function () {} };
@@ -5375,6 +5887,12 @@ impl ScriptEngine for BoaEngine {
         EXECUTED.with(|e| e.borrow_mut().clear());
         WRITE_POS.with(|m| m.borrow_mut().clear());
         DOM.with(|d| *d.borrow_mut() = std::mem::take(dom));
+        GEO.with(|g| *g.borrow_mut() = GeoState {
+            on: !self.nominal_geometry,
+            fetcher: self.layout_fetcher.take(),
+            base: self.base_url.clone(),
+            ..GeoState::default()
+        });
         let hooks = std::rc::Rc::new(FixedHooks);
         let clock = std::rc::Rc::new(FixedClock(
             if self.clock_millis == 0 { CONVERSION_EPOCH_MS } else { self.clock_millis }));
@@ -5521,10 +6039,14 @@ impl ScriptEngine for BoaEngine {
             doc_writes: 0, doc_writes_refused: 0,
             injected_scripts_run: 0, injected_scripts_refused: 0, layout_reads: 0,
             timers_fired: 0, timers_dropped: 0, page_fetches: 0, page_fetch_failures: 0,
-            page_blocked: 0, blocked_hosts: vec![], beacons_suppressed: 0 };
+            page_blocked: 0, blocked_hosts: vec![], beacons_suppressed: 0, geo: Default::default() };
         RECORDING.with(|r| *r.borrow_mut() = false);
         let _ = ctx.register_global_callable(js_string!("__parse_url"), 2,
             NativeFunction::from_fn_ptr(parse_url));
+        let _ = ctx.register_global_callable(js_string!("__geoBox"), 1, NativeFunction::from_fn_ptr(geo_box));
+        let _ = ctx.register_global_callable(js_string!("__geoNote"), 2, NativeFunction::from_fn_ptr(geo_note));
+        let _ = ctx.register_global_callable(js_string!("__geoOn"), 0, NativeFunction::from_fn_ptr(geo_on));
+        let _ = ctx.register_global_callable(js_string!("__geoScroll"), 1, NativeFunction::from_fn_ptr(geo_scroll));
         let _ = ctx.register_global_callable(js_string!("__fetch_sync"), 2,
             NativeFunction::from_fn_ptr(fetch_sync));
         let _ = ctx.register_global_callable(js_string!("__take_mutations"), 0,
@@ -5651,6 +6173,7 @@ impl ScriptEngine for BoaEngine {
             // Settled once a full round adds nothing new.
             if ran == 0 && refused == 0 && round > 0 { break }
         }
+        if !self.nominal_geometry && !self.no_scroll_sweep { sweep(&mut ctx) }
         if let Ok(v) = ctx.eval(Source::from_bytes(b"__timerStats()")) {
             if let Some(o) = v.as_object() {
                 rep.timers_fired = o.get(0, &mut ctx).ok()
@@ -5688,6 +6211,9 @@ impl ScriptEngine for BoaEngine {
         SHEET_CACHE.with(|c| c.borrow_mut().clear());
         DOM.with(|d| *dom = std::mem::take(&mut d.borrow_mut()));
         rep.layout_reads = LAYOUT_READS.with(|n| *n.borrow());
+        let geo = GEO.with(|g| std::mem::take(&mut *g.borrow_mut()));
+        rep.geo = geo.stats;
+        self.layout_fetcher = geo.fetcher;
         let (pf, pfail) = PAGE_FETCHES.with(|c| *c.borrow());
         rep.page_fetches = pf;
         rep.page_fetch_failures = pfail;

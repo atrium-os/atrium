@@ -1238,7 +1238,7 @@ Raw data, outside the repo, at `~/src/navigator-corpus/eid-2026-11-05/`: `bin/` 
 binaries), `before-{1,2}/` and `after-{1,2}/` (recordings, blobs, reports, coverage,
 normalize and flag outputs), and `run.sh`, `pipeline.sh` and `compare.py`.
 
-#### 5.4.5.6e Proposed: layout geometry for the state recorder (2026-11-05, investigation only)
+#### 5.4.5.6e Layout geometry for the state recorder (2026-11-05: investigated, then built)
 
 **What the converter answers today.** These are fixed answers, not zeros:
 - `getBoundingClientRect()` gives x = y = top = left = 0, width = right = 1280 and
@@ -1338,8 +1338,166 @@ the reader. Measure before building, as §5.4.5.6a did:
 - the Chrome oracle on every document whose layout moves;
 - reproduction (123/123) re-checked with the snapshot on.
 
-Not built. The per-read log patch, both logs and the scan scripts are outside the repo, in
+The per-read log patch, both logs and the scan scripts are outside the repo, in
 `~/src/navigator-corpus/geo-2026-11-05/`.
+
+**Built (2026-11-05): options 3 and 4, and a reader's sweep the measurement showed was
+needed.** `navigator-prerender/src/geometry.rs`, the geometry natives in `boa_impl.rs`, and
+`navigator-render`'s `layout_geometry`.
+
+- *The layout.* The first geometry read serializes the live DOM with
+  `data-atrium-geo="<handle>"` on every element (`Dom::serialize_marked`, the one
+  serializer with a marker threaded through). It collects the sheets and image sizes the
+  recording would carry, normalizes with `navigator-normalize`, and lays out with
+  `navigator-render`, which records every box and keys it by the marker. These are the
+  lane's own stages, not a second layout engine. Node positions do not survive
+  normalization (row-reverse reorders, whitespace is stripped), but a marker attribute
+  does.
+  - *Viewport:* 1280 × 600, which is what the converter already tells scripts
+    (`innerWidth`, `innerHeight`). The lane renders at 800 px; see the refusal below.
+  - *What the renderer records:* each block-level and atomic box's border box, borders
+    and padding, and whether it is positioned. Inline boxes get one fragment per line,
+    carried on the item the way link spans already were. A trial layout (`measure`, as
+    a flex item gets) rolls its boxes back, so only real placements survive (a test
+    checks a flex item's x).
+  - *Geometry is opt-in:* a render without it records nothing. All 133 corpus scenes
+    and normalized documents are byte-identical with this renderer, and WPT is 2,083
+    passes before and after, with no test changing result.
+- *Answered from it:*
+  - `getBoundingClientRect`, `getClientRects` (new), `offsetWidth/Height`,
+    `clientWidth/Height` (the padding box; 0 for an inline box), and
+    `clientTop/Left` (new).
+  - `scrollWidth/Height`: the padding box, or further where descendants reach.
+  - `offsetTop/Left` and `offsetParent` (new): the CSSOM View rules. The parent is the
+    nearest positioned ancestor, or `td`/`th`/`table` for a static element, else
+    `body`; positions are relative to its padding edge, or to the page when it is
+    `body`.
+  - For the root, `documentElement.clientWidth/Height` is the viewport and its scroll
+    size is the document's.
+  - An element with no box (`display: none`, detached, in `<head>`) answers zeros, as a
+    browser does.
+  - The old nominal box survives only when no layout is possible: the engine has
+    geometry off (`PRERENDER_GEOMETRY=0`, kept for A/B), or no layout succeeded.
+    Corpus failures: 0.
+- *When it lays out again.* A read lays out again only after a mutation; the cache key
+  is the DOM's mutation count. A probe's restore swaps the old DOM, with its old count,
+  back in, so the snapshot is restored with it (a test pins this). There are at most
+  `MAX_LAYOUTS` = 8 layouts per conversion, by count. After that the last layout
+  answers, and the read is counted `stale`.
+- *Observers.* Each (IntersectionObserver or ResizeObserver, target) pair gets the
+  record a browser delivers first, in a task after `observe()`:
+  - IntersectionObserver: the viewport at the scroll position (or the `root`
+    element's box), grown by `rootMargin`. Edge-adjacent counts. Clipping by
+    overflow ancestors is not modelled.
+  - ResizeObserver: the content box. A 0 × 0 box gets no record.
+  - PerformanceObserver still never delivers.
+- *Option 4, the refusal.* A style write of `width`, `height` or their `min-`/`max-`
+  forms (property assignment or `setProperty`) is refused and counted when its value
+  is a nonzero px length equal to a size a getter returned (exactly, or rounded to
+  whole px). Such a height was baked at 1280 px, and the document is read at other
+  widths.
+  - Rather than taint tracking, the rule is exact matching. It does not catch derived
+    values (a sum, an added margin), positions, `cssText` or zero (collapsing is not
+    baking).
+  - Refused on the corpora: 18 writes in 3 documents. Samsung's 9 (`min-height:
+    85px`, the equaliser on headlines), ynet's 7 (`width: 687px`), Walgreens' 2.
+- *Found while measuring, and built (★ the reader's sweep).* Honest geometry makes lazy
+  loaders honest. At scroll 0 only the first screen is in view: Samsung's
+  rect-on-scroll loader filled 9 of 63 images, and an IntersectionObserver loader
+  fills one screen.
+  - The nominal box had loaded everything by accident, because every element claimed
+    to be on screen. A recording is read, and its reader scrolls.
+  - So after load, a page that can notice a scroll (a `scroll` listener, or an
+    IntersectionObserver with targets) is scrolled as a reader would scroll it. It
+    goes down one viewport at a time, at most 40 steps. Each step dispatches `scroll`,
+    re-evaluates the IntersectionObservers (delivering only changes), delivers
+    mutations and drains timers with a probe's relative bounds. Then it returns to the
+    top, where the recording is taken.
+  - What the page did on the way stays (loaded images, revealed sections). What
+    depends on the position (a scroll-spy mark, a sticky header's class) is recomputed
+    by the page at scroll 0. `PRERENDER_SCROLL=0` turns it off. 23 documents were
+    swept, 501 steps in all.
+- *Also found and fixed while measuring:*
+  - (a) An image with no `src` (a lazy placeholder) had no box. The normalizer drops
+    an unsized image from the document, which is right for the artifact, so
+    Samsung's `offsetWidth || getClientRects().length` check never passed. For the
+    layout only, unsized images are now declared 0 × 0 with no ratio. That is what
+    Chrome lays them out as (measured: 300 × 0 under `width: 100%`, 0 × 0 bare, one
+    client rect each).
+  - (a, continued) The renderer had treated a natural dimension of 0 as absent, which
+    fell back to the 300 × 150 default object size. A 0 is now a dimension (CSS Images
+    3 §5.1). Corpus scenes are unchanged, since no recording declares 0.
+  - (b) Layout-time image fetches went through the relay a second time and pushed The
+    Verge past the 128 MiB per-conversion fetch budget (37 images refused). One memo
+    per conversion now serves layouts and the final collection, so each URL crosses
+    the fetcher once. Relay bytes per conversion are back to the before figures (max
+    28.0 and 79.3 MB).
+- *Tests.* Converter `tests/geometry.rs` (13): scroll-spy, real rects and zeros, inline
+  rects per line, offsetParent, the equaliser refused (and a non-measured write and
+  zero applied), IntersectionObserver initial records with `rootMargin` and
+  `display: none`, ResizeObserver content box, relayout budget and staleness,
+  determinism, the A/B switch, the sweep (rect and IntersectionObserver loaders, ending
+  at the top), no sweep without listeners, and a source-less image's box. The old
+  nominal test now pins `nominal_geometry`. Renderer `tests/geometry.rs` (7). The
+  converter suite is 386/0 and the renderer suite 154/0.
+
+**Measured (2026-11-05, one machine, both corpora offline, 123 pages, exploring).**
+- *Method.* Main's converter (built in a scratch worktree) against this one. The fetch
+  cache was first warmed by one online run of the new converter, which fetched only
+  URLs the old one never asked for (The Hindu's right-sized image variants, images
+  loaded on the way down), as `record.sh` would. Then both arms ran offline, with
+  `navigator-normalize` and `nsg-flag` over each.
+- *Reproducibility (the c92d16ea check):* two offline runs of the new converter are
+  **123/123 identical** in recording, normalized document and flag row.
+- *Who reads:* 38 documents laid out (0 failed), 138 layouts. Reads: 2,360 from a
+  current layout, 7,796 stale (Walgreens' icon polling and Samsung after their 8
+  layouts). Observer records: 94 IntersectionObserver, 17 ResizeObserver.
+- *What changed:* 13 of 123 recordings. Flag totals are unchanged in both batches
+  (batch 1: OVERLAP 4, SLICED 8, TEXTLOSS 4, OFFCANVAS 5; batch 2: 12, 8, 3, 13). Only
+  Samsung's, Walgreens' and ynet's rows move, and only in coverage.
+
+  | document | before | after |
+  |---|---|---|
+  | **doc13** (mdbook) | current header "Return Values and Scope" (the last) | "What Is Ownership?" (the first, as a browser at scroll 0); transitions 40 → 51 |
+  | **Samsung** | 9 × `min-height: 600px` on headlines; 63 images | 0 (9 measured writes refused); 38 images; page 8,576 → 7,014 px here, and in Chrome on the normalized document 6,648 → 4,940 px |
+  | **The Hindu** | 96 images (the 1200-px variant of each) | 101 (the variant for each image's real width: 230–660 px), all its lazy images still loaded |
+  | Walgreens | one `600px` height | none (2 writes refused) |
+  | IKEA | 1 transition | 2 |
+  | ynet | | 44 more words; 7 writes refused |
+  | LinkedIn | 7 images | 5 (two in a 564 px modal header) |
+
+  Samsung's other 25 images are ones a browser at 1280 px does not load at rest
+  either: carousel slides outside the visible area (14), inactive tab panes (5), and
+  mobile and video variants. The carousel arrows and tabs are transitions; their
+  images are not fetched until a reader takes one. That is a cost the old fiction
+  hid, written down rather than faked back.
+- *Chrome.* Chrome was run on the normalized document (images mapped to blobs,
+  standards mode, border-box, Plex). Iframes were stripped, because their YouTube and
+  `javascript:` sources kept `load` from firing. It confirms Samsung's gap removal
+  (6,648 → 4,940 px). The Hindu still never fires `load` in this harness, so its gain
+  is checked by images, not pixels. doc13's change is a class, and its page height is
+  14,558 px in both arms.
+- *Cost.* Layouts take 0.05–9.4 s each (node_fs 9.4 s for one layout, of
+  `MAX_LAYOUTS` per document). In total: 70.8 s over batch 1 and 68.1 s over batch 2.
+  Conversion wall per page:
+
+  | | before p50 / p90 / max | after p50 / p90 / max | total |
+  |---|---|---|---|
+  | batch 1 (73) | 0.30 / 2.2 / 10.2 s | 0.40 / 4.9 / 20.1 s | 63 → 135 s |
+  | batch 2 (50) | 0.21 / 1.5 / 4.7 s | 0.55 / 4.6 / 26.7 s | 30 → 98 s |
+
+  The slowest page (ynet, 22 s of layouts) is 15% of the 180 s deadline. The deadline
+  is wall-clock, which the threat model already lists as open (§2.6), and layout makes
+  it matter more on a slow machine.
+- *Open:*
+  - Re-decoding or re-laying out for the reader's own viewport. Geometry is answered
+    at 1280 × 600, and that is why size writes are refused.
+  - Transforms in rects.
+  - IntersectionObserver clipping by overflow ancestors.
+  - The snapshot digest in the recording (proposed above; not added, to keep the
+    format).
+  - A faster layout for repeat reads: the 8-layout budget is what bounds Walgreens'
+    3,956 reads.
 
 ### 5.5 WebAssembly is a better cage, not a translation
 

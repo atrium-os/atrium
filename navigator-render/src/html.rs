@@ -158,6 +158,14 @@ struct Cx<'a> {
     /// cannot say which element painted it, and that is the question every
     /// layout investigation starts from.
     pub boxes: Option<Vec<(Handle, U, U, U, U)>>,
+    /// ★ ELEMENT GEOMETRY for the converter's layout reads (legacy-web
+    /// §5.4.5.6e), off unless `layout_geometry` asks for it, so the scene
+    /// path is untouched. A LOG, so a trial layout (`measure`) can roll back
+    /// what it recorded: only the real placement of each box survives.
+    geo: Option<GeoLog>,
+    /// The chain of inline elements the item being collected sits in, as an
+    /// index into `GeoLog::inl_paths` (0: none). Like `iso_cur`.
+    inl_cur: u32,
     subs: &'a Subresources,
     /// The initial containing block: the viewport, which is also the
     /// containing block of every `position: fixed` box (NSG has no scroll
@@ -225,6 +233,94 @@ pub fn render_html(html: &str, fonts: &FontSet, env: &Env) -> HtmlOut {
 /// With the subresources the input supplies (profile §3.13): a document that
 /// references one it does not declare gets a diagnostic, never a guess.
 pub fn render_html_with(html: &str, fonts: &FontSet, env: &Env, subs: &Subresources) -> HtmlOut {
+    render_inner(html, fonts, env, subs, false).0
+}
+
+/// One element's geometry from a layout (legacy-web §5.4.5.6e). Page
+/// coordinates at scroll 0, in 1/64 px, as the scene's.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct Geom {
+    /// The border box: a block-level or atomic box's own, or the union of an
+    /// inline box's line fragments.
+    pub x: U, pub y: U, pub w: U, pub h: U,
+    /// Border widths and padding, top, right, bottom, left (zero for an
+    /// inline box: its fragments already carry what is painted).
+    pub border: [U; 4],
+    pub padding: [U; 4],
+    /// `position` is not `static` (an `offsetParent` candidate).
+    pub positioned: bool,
+    /// An inline box (its `clientWidth` and `clientHeight` are 0).
+    pub inline: bool,
+    /// What `getClientRects()` returns: one rect per line an inline box is
+    /// on, or the border box of any other.
+    pub fragments: Vec<(U, U, U, U)>,
+}
+
+/// A document's geometry, keyed by the value of a marker attribute the
+/// caller put on its elements before handing the document over (the
+/// normalizer keeps attributes, and the caller's own node ids survive
+/// normalization that way where node positions do not).
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct Geometry {
+    /// The scene's extent: the document's scroll size.
+    pub width: U,
+    pub height: U,
+    pub elements: BTreeMap<u64, Geom>,
+}
+
+#[derive(Default)]
+struct GeoLog {
+    /// (element, border box, border, padding, positioned) per block-level
+    /// or atomic box, in the order laid out: the LAST entry for an element
+    /// is its real placement.
+    blocks: Vec<(Handle, [U; 4], [U; 4], [U; 4], bool)>,
+    /// (inline element, x, y, w, h) per placed item it contains.
+    frags: Vec<(Handle, U, U, U, U)>,
+    /// Inline element chains, outermost first; index 0 is the empty chain.
+    inl_paths: Vec<Vec<Handle>>,
+    /// Inline elements that are positioned (`position: relative` on a span).
+    inl_positioned: std::collections::BTreeSet<Handle>,
+}
+
+/// ★ LAYOUT GEOMETRY for the converter (legacy-web §5.4.5.6e): the same
+/// layout `render_html_with` paints, with every element's box recorded and
+/// keyed by its `marker` attribute. Elements that were not laid out
+/// (`display: none`, or inside one) are absent — the caller answers them as
+/// a browser does, with zeros. The scene path does not change: a render
+/// with geometry off records nothing and paints the same bytes.
+pub fn layout_geometry(html: &str, fonts: &FontSet, env: &Env, subs: &Subresources, marker: &str) -> Geometry {
+    let (out, log, dom) = render_inner(html, fonts, env, subs, true);
+    let log = log.expect("geometry was asked for");
+    let key = |h: Handle| dom.attr(h, marker).and_then(|v| v.parse::<u64>().ok());
+    let mut elements: BTreeMap<u64, Geom> = BTreeMap::new();
+    for (h, b, border, padding, positioned) in &log.blocks {
+        let Some(k) = key(*h) else { continue };
+        elements.insert(k, Geom { x: b[0], y: b[1], w: b[2], h: b[3], border: *border, padding: *padding,
+                                  positioned: *positioned, inline: false, fragments: vec![(b[0], b[1], b[2], b[3])] });
+    }
+    // Inline boxes: one fragment per line (items on one line share its y),
+    // the bounding box their union. An element with a box of its own (an
+    // inline-block) keeps that box.
+    let mut lines: BTreeMap<u64, (Handle, BTreeMap<(U, U), (U, U)>)> = BTreeMap::new();
+    for &(h, x, y, w, ht) in &log.frags {
+        let Some(k) = key(h) else { continue };
+        if elements.contains_key(&k) { continue }
+        let e = lines.entry(k).or_insert((h, BTreeMap::new())).1.entry((y, ht)).or_insert((x, x + w));
+        *e = (e.0.min(x), e.1.max(x + w));
+    }
+    for (k, (h, ls)) in lines {
+        let fragments: Vec<(U, U, U, U)> = ls.iter().map(|(&(y, ht), &(x0, x1))| (x0, y, x1 - x0, ht)).collect();
+        let x0 = fragments.iter().map(|f| f.0).min().unwrap_or(0);
+        let y0 = fragments.iter().map(|f| f.1).min().unwrap_or(0);
+        let x1 = fragments.iter().map(|f| f.0 + f.2).max().unwrap_or(0);
+        let y1 = fragments.iter().map(|f| f.1 + f.3).max().unwrap_or(0);
+        elements.insert(k, Geom { x: x0, y: y0, w: x1 - x0, h: y1 - y0, border: [0; 4], padding: [0; 4],
+                                  positioned: log.inl_positioned.contains(&h), inline: true, fragments });
+    }
+    Geometry { width: out.scene.width, height: out.scene.height, elements }
+}
+
+fn render_inner(html: &str, fonts: &FontSet, env: &Env, subs: &Subresources, geo: bool) -> (HtmlOut, Option<GeoLog>, Dom) {
     let dom = navigator_dom::parse(html);
     let mut diagnostics = vec![];
     // Stylesheets: every <style>, in document order, one author layer each
@@ -254,9 +350,10 @@ pub fn render_html_with(html: &str, fonts: &FontSet, env: &Env, subs: &Subresour
     let styled = cascade(&dom, &sheets, env);
     diagnostics.extend(styled.diagnostics);
     let mut cx = Cx { dom: &dom, styles: &styled.styles, sh: Shaper::new(fonts), scene: Scene { width: u(env.width_px), ..Default::default() },
-                      report: Report::default(), links: vec![], unimplemented: BTreeMap::new(), marker: None, baseline_probe: None, indent: None, iso_paths: vec![vec![]], iso_cur: 0, content_dy: 0, table_part: false, promoted: vec![], boxes: std::env::var_os("NSG_DUMP_BOXES").map(|_| vec![]),
+                      report: Report::default(), links: vec![], unimplemented: BTreeMap::new(), marker: None, baseline_probe: None, indent: None, iso_paths: vec![vec![]], iso_cur: 0, content_dy: 0, table_part: false, promoted: vec![], boxes: std::env::var_os("NSG_DUMP_BOXES").map(|_| vec![]), geo: None, inl_cur: 0,
                       viewport: (u(env.width_px), Some(u(env.height_px))), pos_cb: (0, 0, u(env.width_px), Some(u(env.height_px))),
                       subs, placing_abs: false, pending_abs: vec![], deferred_abs: vec![], cb_open: false, canvas_src: None, abs_origin: None, flex_static: None, measured: HashMap::new(), contexts: vec![], hoists: vec![], diagnostics: vec![] };
+    if geo { cx.geo = Some(GeoLog { inl_paths: vec![vec![]], ..Default::default() }) }
     cx.promoted = promote_block_in_inline(&dom, &styled.styles);
     cx.count_unread_rows();
     // The root element is the initial containing block's only child.
@@ -299,7 +396,9 @@ pub fn render_html_with(html: &str, fonts: &FontSet, env: &Env, subs: &Subresour
             eprintln!("BOX {tag}{id} [{class}] x={} y={} w={} h={}", x / 64, y / 64, w / 64, ht / 64);
         }
     }
-    HtmlOut { scene: cx.scene, report: cx.report, diagnostics, unimplemented: cx.unimplemented }
+    let log = cx.geo.take();
+    let out = HtmlOut { scene: cx.scene, report: cx.report, diagnostics, unimplemented: cx.unimplemented };
+    (out, log, dom)
 }
 
 /// ★ §3.13's offline half: measure every table column's min-content and
@@ -319,7 +418,7 @@ pub fn premeasure_tables(html: &str, fonts: &FontSet, env: &Env) -> (String, usi
     let styled = cascade(&dom, &sheets, env);
     let mut cx = Cx { dom: &dom, styles: &styled.styles, sh: Shaper::new(fonts), scene: Scene { width: u(env.width_px), ..Default::default() },
                       report: Report::default(), links: vec![], unimplemented: BTreeMap::new(), marker: None, baseline_probe: None,
-                      indent: None, iso_paths: vec![vec![]], iso_cur: 0, content_dy: 0, table_part: false, promoted: vec![], boxes: std::env::var_os("NSG_DUMP_BOXES").map(|_| vec![]), viewport: (u(env.width_px), Some(u(env.height_px))),
+                      indent: None, iso_paths: vec![vec![]], iso_cur: 0, content_dy: 0, table_part: false, promoted: vec![], boxes: std::env::var_os("NSG_DUMP_BOXES").map(|_| vec![]), geo: None, inl_cur: 0, viewport: (u(env.width_px), Some(u(env.height_px))),
                       pos_cb: (0, 0, u(env.width_px), Some(u(env.height_px))), subs: &Subresources::new(),
                       placing_abs: false, pending_abs: vec![], deferred_abs: vec![], cb_open: false, canvas_src: None, abs_origin: None, flex_static: None, measured: HashMap::new(), contexts: vec![], hoists: vec![], diagnostics: vec![] };
     // (table, per-column (min, max), its first row's cells) for every table.
@@ -1022,6 +1121,7 @@ impl<'a> Cx<'a> {
         }
         self.scene.cur = saved_attrs;
         if let Some(v) = self.boxes.as_mut() { v.push((h, bx, by, w, hgt)) }
+        if let Some(g) = self.geo.as_mut() { g.blocks.push((h, [bx, by, w, hgt], [bt, br, bb, bl], [pt, pr, pb, pl], positioned)) }
         if positioned { self.pos_cb = saved_cb }
         if opens_context { self.contexts.push((z.unwrap_or(0), ctx_start, self.scene.order.len(), painted)) }
         else if positioned { self.hoists.push((ctx_start, self.scene.order.len())) }
@@ -1203,7 +1303,10 @@ impl<'a> Cx<'a> {
     fn natural(&self, h: Handle) -> Option<(String, Natural)> {
         if self.dom.tag(h) != Some("img") { return None }
         let src = self.dom.attr(h, "src").unwrap_or("");
-        let dim = |n: &str| self.dom.attr(h, n).and_then(|v| v.trim().parse::<f64>().ok()).filter(|v| *v > 0.0).map(u);
+        // ★ ZERO IS A DIMENSION (CSS Images 3 §5.1): an image declared 0 wide
+        // is 0 wide, not "no width", which would fall to the 300 × 150 default
+        // object size. Negative or unparsable is no dimension.
+        let dim = |n: &str| self.dom.attr(h, n).and_then(|v| v.trim().parse::<f64>().ok()).filter(|v| *v >= 0.0).map(u);
         let (w, hh) = (dim("width"), dim("height"));
         let ratio_attr = self.dom.attr(h, "natural-ratio").map(str::trim);
         let sub = self.subs.get(src);
@@ -1520,7 +1623,10 @@ impl<'a> Cx<'a> {
         // consume the ones the real pass is still holding.
         let pend = std::mem::take(&mut self.pending_abs);
         let dfr = self.deferred_abs.len();
+        let geo_len = self.geo.as_ref().map(|g| (g.blocks.len(), g.frags.len()));
         let hgt = self.block(h, 0, 0, cb_w, cb_h, force);
+        // ★ A trial's boxes are not where anything is: only the real pass's.
+        if let (Some(g), Some((b, f))) = (self.geo.as_mut(), geo_len) { g.blocks.truncate(b); g.frags.truncate(f) }
         self.pending_abs = pend;
         self.deferred_abs.truncate(dfr);
         self.scene.order.truncate(o); self.scene.rects.truncate(r); self.scene.runs.truncate(n); self.scene.links.truncate(l);
@@ -2836,7 +2942,7 @@ impl<'a> Cx<'a> {
                           tab: match s.get("tab-size") { V::Int(n) => (*n).clamp(0, 64), _ => 8 },
                           nowrap: matches!(kw(s, "white-space"), "pre" | "nowrap"), iso: self.iso_cur };
         let sp = |p: &str| match s.get(p) { V::Len(l) => u(l.v), V::Calc(c) => calc_eval(c, 0).map(u).unwrap_or(0), _ => 0 };
-        (FontStyle { family, bold: weight >= 600, em, size, rgba: color, link: None,
+        (FontStyle { family, bold: weight >= 600, em, size, rgba: color, link: None, inl: self.inl_cur,
                      ls: sp("letter-spacing"), ws: sp("word-spacing"), tnum: kw(s, "font-variant-numeric") == "tabular-nums" }, line)
     }
 
@@ -2887,7 +2993,16 @@ impl<'a> Cx<'a> {
                     self.iso_cur = self.iso_paths.len() as u32;
                     self.iso_paths.push(path);
                 }
+                let saved_inl = self.inl_cur;
+                if let Some(g) = self.geo.as_mut() {
+                    let mut path = g.inl_paths[self.inl_cur as usize].clone();
+                    path.push(h);
+                    if kw(s, "position") != "static" { g.inl_positioned.insert(h); }
+                    self.inl_cur = g.inl_paths.len() as u32;
+                    g.inl_paths.push(path);
+                }
                 for c in self.dom.children_of(h) { self.collect_inline(c, out, s) }
+                self.inl_cur = saved_inl;
                 self.iso_cur = saved_iso;
                 if let Some(li) = link {
                     for it in &mut out[before..] {
@@ -3292,6 +3407,11 @@ impl<'a> Cx<'a> {
             for (pi, p) in line.iter().enumerate() {
                 let mut px = x + shift + p.x;
                 let start = px;
+                // Every inline element this item sits in covers it, hidden
+                // or not (visibility: hidden still has geometry).
+                if let Some(g) = self.geo.as_mut() {
+                    for &e in &g.inl_paths[p.st.inl as usize] { g.frags.push((e, start, yy, p.adv, lh)) }
+                }
                 // visibility: hidden — the space is taken (positions are
                 // already fixed), nothing is painted, and hidden text is not
                 // hit-testable, so it contributes no link region either.
@@ -4831,7 +4951,7 @@ mod tests {
         let held_out: Vec<u8> = READ_ROWS.iter().copied().filter(|r| *r != 39).collect();
         let mut cx = Cx { dom: &dom, styles: &styled.styles, sh: Shaper::new(&fonts), scene: Scene::default(),
                           report: Report::default(), links: vec![], unimplemented: BTreeMap::new(), marker: None,
-                          baseline_probe: None, indent: None, iso_paths: vec![vec![]], iso_cur: 0, content_dy: 0, table_part: false, promoted: vec![], boxes: std::env::var_os("NSG_DUMP_BOXES").map(|_| vec![]),
+                          baseline_probe: None, indent: None, iso_paths: vec![vec![]], iso_cur: 0, content_dy: 0, table_part: false, promoted: vec![], boxes: std::env::var_os("NSG_DUMP_BOXES").map(|_| vec![]), geo: None, inl_cur: 0,
                           viewport: (0, None), pos_cb: (0, 0, 0, None), subs: &Subresources::new(),
                           placing_abs: false, pending_abs: vec![], deferred_abs: vec![], cb_open: false, canvas_src: None, abs_origin: None, flex_static: None, measured: HashMap::new(), contexts: vec![], hoists: vec![], diagnostics: vec![] };
         cx.count_rows_outside(&held_out);

@@ -282,6 +282,9 @@ const QUOTE_BAR: u32 = 0xd0d7deff;
 
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) struct Style { pub(crate) family: Family, pub(crate) bold: bool, pub(crate) em: bool, pub(crate) size: U, pub(crate) rgba: u32, pub(crate) link: Option<usize>,
+    /// The inline elements an item sits in, for layout geometry (index
+    /// into html.rs's `GeoLog::inl_paths`; 0 outside any).
+    pub(crate) inl: u32,
     /// letter-spacing / word-spacing, added after each glyph / each space.
     pub(crate) ls: U, pub(crate) ws: U,
     /// font-variant-numeric: tabular-nums (the OpenType `tnum` feature).
@@ -417,7 +420,7 @@ struct Table { rows: Vec<Vec<Vec<Atom>>>, head_rows: usize, in_head: bool }
 
 pub fn render(md: &str, fonts: &FontSet, opts: &Options) -> (Scene, Report) {
     let margin = 32 * PX;
-    let base = Style { family: Family::Sans, bold: false, em: false, size: 16 * PX, rgba: TEXT, link: None, ls: 0, ws: 0, tnum: false };
+    let base = Style { family: Family::Sans, bold: false, em: false, size: 16 * PX, rgba: TEXT, link: None, inl: 0, ls: 0, ws: 0, tnum: false };
     let mut l = Layout {
         sh: Shaper::new(fonts), scene: Scene { width: opts.width_px * PX, ..Default::default() },
         report: Report::default(), links: vec![], width: opts.width_px * PX, margin, y: margin,
@@ -553,7 +556,7 @@ impl<'a> Layout<'a> {
 
     fn code_block(&mut self) {
         let Some(src) = self.code.take() else { return };
-        let st = Style { family: Family::Mono, bold: false, em: false, size: 14 * PX, rgba: TEXT, link: None, ls: 0, ws: 0, tnum: false };
+        let st = Style { family: Family::Mono, bold: false, em: false, size: 14 * PX, rgba: TEXT, link: None, inl: 0, ls: 0, ws: 0, tnum: false };
         let (asc, lh) = self.sh.metrics(&st);
         let lines: Vec<&str> = src.strip_suffix('\n').unwrap_or(&src).split('\n').collect();
         let pad = 8 * PX;

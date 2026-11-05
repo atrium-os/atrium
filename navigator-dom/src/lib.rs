@@ -33,6 +33,7 @@
 //! live with it.
 
 pub mod dom;
+pub mod natural;
 pub mod parse;
 pub mod profile;
 

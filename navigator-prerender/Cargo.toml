@@ -27,6 +27,18 @@ url = "2"
 blake3 = { version = "1", features = ["pure"] }
 # setrlimit + sysctlbyname for the jailed converter's self-checks (src/serve.rs).
 libc = "0.2"
+# ★ Layout geometry (legacy-web §5.4.5.6e): a script's getBoundingClientRect
+# and offsetWidth are answered from the SAME normalizer and renderer the lane
+# uses, run over the converter's live DOM — not from a second layout engine
+# that would disagree with what the document is later drawn as.
+navigator-normalize = { path = "../navigator-normalize" }
+navigator-render = { path = "../navigator-render" }
+navigator-style = { path = "../navigator-style" }
+
+# navigator-fonts vendors a one-line fix to pathfinder_simd; a dependent
+# crate must repeat the patch, because [patch] only applies at the build root.
+[patch.crates-io]
+pathfinder_simd = { path = "../navigator-fonts/vendor/pathfinder_simd" }
 
 [[bin]]
 name = "prerender"

@@ -610,12 +610,23 @@ impl Dom {
         n.0
     }
 
+    /// ★ `serialize`, with every element also carrying `attr="<its handle>"`
+    /// — how the converter finds its own nodes again in a layout of the
+    /// NORMALIZED document (legacy-web §5.4.5.6e), whose node positions are
+    /// not this DOM's. The same walk as `serialize`, so the document laid out
+    /// is the document that will be recorded, plus one attribute.
+    pub fn serialize_marked(&self, attr: &str) -> String {
+        let mut s = String::new();
+        for &c in &self.nodes[self.root() as usize].children { self.ser_in(c, &mut s, false, Some(attr)); }
+        s
+    }
+
     fn ser(&self, h: Handle, s: &mut String) {
-        self.ser_in(h, s, false)
+        self.ser_in(h, s, false, None)
     }
 
     fn ser_root(&self, s: &mut impl Sink) {
-        for &c in &self.nodes[self.root() as usize].children { self.ser_in(c, s, false); }
+        for &c in &self.nodes[self.root() as usize].children { self.ser_in(c, s, false, None); }
     }
 
     /// ★★ RAW-TEXT ELEMENTS MUST NOT BE ESCAPED, and getting this wrong is
@@ -629,7 +640,7 @@ impl Dom {
     ///
     /// Found by building the consumer: the converter alone never re-read its
     /// own output, so nothing could notice.
-    fn ser_in(&self, h: Handle, s: &mut impl Sink, raw: bool) {
+    fn ser_in(&self, h: Handle, s: &mut impl Sink, raw: bool, mark: Option<&str>) {
         const VOID: &[&str] = &["area","base","br","col","embed","hr","img","input","link","meta","source","track","wbr"];
         // `noscript` belongs here because we parse — and the converter runs —
         // with scripting ENABLED, and the spec makes noscript raw text in that
@@ -645,17 +656,18 @@ impl Dom {
             Kind::Text(t) => escape_into(t, s),
             Kind::Comment(_) => {}
             Kind::Document | Kind::Fragment => {
-                for &c in &self.nodes[h as usize].children { self.ser_in(c, s, false); }
+                for &c in &self.nodes[h as usize].children { self.ser_in(c, s, false, mark); }
             }
             Kind::Element(tag) => {
                 s.put("<"); s.put(tag);
                 for (k, v) in &self.nodes[h as usize].attrs {
                     s.put(" "); s.put(k); s.put("=\""); escape_into(v, s); s.put("\"");
                 }
+                if let Some(m) = mark { s.put(" "); s.put(m); s.put("=\""); s.put(&h.to_string()); s.put("\"") }
                 s.put(">");
                 if VOID.contains(&tag.as_str()) { return; }
                 let child_raw = RAW_TEXT.iter().any(|r| r.eq_ignore_ascii_case(tag));
-                for &c in &self.nodes[h as usize].children { self.ser_in(c, s, child_raw); }
+                for &c in &self.nodes[h as usize].children { self.ser_in(c, s, child_raw, mark); }
                 s.put("</"); s.put(tag); s.put(">");
             }
         }
