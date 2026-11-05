@@ -7,7 +7,9 @@
  * shared softc and the carve happens here, in the device owner — an IP module
  * just calls amd_vram_alloc rather than reaching into sc->vram_next itself.
  *
- * It is a bump allocator (no per-BO reclaim): VRAM offsets are handed out
+ * Freed VRAM goes back to the client that had it (struct amd_vram_pool,
+ * bo.c), never to another client, since it is not scrubbed. Here it is a bump
+ * allocator (no per-BO reclaim): VRAM offsets are handed out
  * monotonically and reset wholesale by a device FLR (which wipes VRAM). That
  * matches the model and is enough for the current workloads; a real free-list is
  * a later refinement that, being here, only this file would change.

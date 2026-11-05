@@ -38,6 +38,7 @@
 #include <machine/resource.h>
 
 #include <sys/sx.h>
+#include <sys/refcount.h>
 #include <sys/vmem.h>
 #include <sys/sysctl.h>
 #include <sys/taskqueue.h>
@@ -558,8 +559,35 @@ struct atrium_amd_bo_binding {
 	uint64_t	 gpu_va;	/* base GPU-VA of the BO in that vm */
 };
 
+/*
+ * VRAM a client gave back (bo.c). The device allocator (vram.c) never takes
+ * VRAM back, since freed VRAM would have to be scrubbed before another client
+ * may see it. A client's own freed VRAM holds nothing it couldn't already
+ * read, so its later VRAM allocations reuse it first: a compositor that
+ * reallocates scanout buffers on every hotplug or mode change stays within
+ * what it already had. Each VRAM BO holds a reference on its creator's pool,
+ * so the pool outlives the client while its BOs do; what it holds when the
+ * last reference goes is lost, as all freed VRAM was before.
+ */
+#define AMD_VRAM_POOL_SLOTS	32
+struct amd_vram_pool {
+	volatile u_int	 refs;
+	struct mtx	 lock;
+	int		 n;
+	struct {
+		uint64_t off, size;
+	}		 free[AMD_VRAM_POOL_SLOTS];
+	uint64_t	 reused;	/* bytes handed out again (stats) */
+};
+
+struct amd_vram_pool *amd_vram_pool_new(void);
+void	 amd_vram_pool_rele(struct amd_vram_pool *p);
+
 struct atrium_amd_bo {
 	struct atrium_amd_softc *sc;
+	/* The creating client's pool (VRAM BOs: referenced; set before
+	 * bo_alloc, which may take VRAM from it). */
+	struct amd_vram_pool *vram_pool;
 	struct atrium_amd_bo_binding bindings[ATRIUM_AMD_BO_MAX_BIND];
 	int		 n_bindings;	/* VMs this BO is currently bound into */
 	void		*kva;		/* CPU mapping (bus_dmamem, page-contiguous) */
@@ -690,6 +718,7 @@ struct atrium_amd_reset_hooks {
 
 struct atrium_amd_client {
 	struct atrium_amd_softc *sc;
+	struct amd_vram_pool *vram_pool;	/* its freed VRAM (bo.c) */
 };
 
 /* One doorbell mapping grant: the pager handle of one owner's mapping. */
@@ -895,7 +924,8 @@ amd_ih_set_handler(struct atrium_amd_softc *sc, int cause,
 	mtx_unlock(&sc->lock);
 }
 int	 amd_bo_create_fd(struct atrium_amd_softc *sc, struct thread *td,
-	    uint64_t size, uint32_t flags, int *out_fd);
+	    uint64_t size, uint32_t flags, struct amd_vram_pool *pool,
+	    int *out_fd);
 int	 amd_bo_fget(struct thread *td, int fd, struct file **out_fp,
 	    struct atrium_amd_bo **out_bo);
 /* Bind a BO into `vm` at *va (0 = auto), adding a binding (a BO may be bound

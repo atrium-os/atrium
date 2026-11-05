@@ -19,6 +19,7 @@ atrium_amd_client_dtor(void *arg)
 	struct atrium_amd_client *c = arg;
 
 	amd_hwq_client_close(c->sc, c);
+	amd_vram_pool_rele(c->vram_pool);
 	free(c, M_DEVBUF);
 }
 
@@ -31,9 +32,12 @@ atrium_amd_open(struct cdev *cdev, int oflags, int devtype, struct thread *td)
 
 	c = malloc(sizeof(*c), M_DEVBUF, M_WAITOK | M_ZERO);
 	c->sc = sc;
+	c->vram_pool = amd_vram_pool_new();
 	err = devfs_set_cdevpriv(c, atrium_amd_client_dtor);
-	if (err != 0)
+	if (err != 0) {
+		amd_vram_pool_rele(c->vram_pool);
 		free(c, M_DEVBUF);
+	}
 	return (err);
 }
 
@@ -131,7 +135,8 @@ atrium_amd_ioctl(struct cdev *cdev, u_long cmd, caddr_t data, int fflag,
 		struct atrium_gpu_bo_alloc *a = (struct atrium_gpu_bo_alloc *)data;
 		int fd;
 
-		err = amd_bo_create_fd(sc, td, a->size, a->flags, &fd);
+		err = amd_bo_create_fd(sc, td, a->size, a->flags,
+		    client->vram_pool, &fd);
 		if (err != 0)
 			return (err);
 		a->bo_fd = fd;
