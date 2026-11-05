@@ -80,8 +80,7 @@ fn compile_to_object(spirv: &[u8], backend: &str) -> Vec<u8> {
     match backend {
         "cranelift" => atrium_spv_backend_cranelift::compile(
             &module, atrium_spv_backend_cranelift::Target::host()).unwrap().object,
-        "bespoke" => atrium_spv_backend_bespoke::compile(
-            &module, atrium_spv_backend_bespoke::Target::host()).unwrap().object,
+        "bespoke" => atrium_spv_differential::bespoke_object(spirv),
         _ => panic!("unknown backend"),
     }
 }
@@ -135,7 +134,7 @@ fn three_way_vertex_uniform_position() {
     let interp_pos = interp.run_vertex(&inputs).unwrap().positions[0];
 
     // Both backends agree (bespoke only where it can run: aarch64).
-    let backends: &[&str] = if cfg!(target_arch = "aarch64") {
+    let backends: &[&str] = if atrium_spv_differential::HOST_HAS_ANY_BESPOKE {
         &["cranelift", "bespoke"]
     } else {
         &["cranelift"]

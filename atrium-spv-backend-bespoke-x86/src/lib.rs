@@ -170,8 +170,8 @@ fn exported_symbol_name(func: &Function) -> String {
 /// Lower one function. Returns its machine code and the PC-map entries
 /// `(body offset, SPIR-V offset)`.
 fn emit_function(func: &Function) -> Result<(Vec<u8>, Vec<(u32, u32)>), BackendError> {
-    if func.stage != ShaderStage::Fragment {
-        return unsupported(format!("{:?} stage (fragment only so far)", func.stage));
+    if func.stage == ShaderStage::Compute {
+        return unsupported("compute stage (phase 6)");
     }
     let mut vc = vcode::lower(func)?;
     vcode::thread_jumps(&mut vc);

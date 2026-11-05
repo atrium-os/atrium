@@ -15,7 +15,7 @@ use iced_x86::BlockEncoderOptions;
 
 use crate::regalloc::{Allocation, Loc};
 use crate::vcode::{
-    gpr, Addr, DivKind, FCond, GOp, GUnOp, ICond, Label, MInst, PReg, ShiftOp, VCode, VReg, XOp,
+    gpr, Addr, Base, DivKind, FCond, GOp, GUnOp, ICond, Label, MInst, PReg, ShiftOp, VCode, VReg, XOp,
     XUnOp,
 };
 use crate::BackendError;
@@ -78,6 +78,8 @@ struct Emit<'a> {
     a: CodeAssembler,
     al: &'a Allocation,
     frame: i32,
+    /// rsp offset of the LocalAlloc area.
+    locals: i32,
     saved: Vec<u8>,
     labels: HashMap<Label, CodeLabel>,
 }
@@ -91,11 +93,15 @@ pub(crate) fn emit(vc: &VCode, alloc: &Allocation) -> Result<(Vec<u8>, Vec<(u32,
         }
     }
     let saved: Vec<u8> = CALLEE_SAVED.iter().copied().filter(|&r| used[r as usize]).collect();
-    // On entry rsp ≡ 8 (mod 16). Keep it 16-aligned after the frame.
-    let frame = if alloc.num_slots == 0 {
+    // Frame, from rsp up: spill slots, LocalAlloc area, padding, saved
+    // registers, return address. On entry rsp ≡ 8 (mod 16); keep it
+    // 16-aligned after the frame.
+    let locals = 16 * alloc.num_slots as i32;
+    let local_bytes = vc.local_bytes.div_ceil(16) as i32 * 16;
+    let frame = if locals + local_bytes == 0 {
         0
     } else {
-        let mut f = 16 * alloc.num_slots as i32;
+        let mut f = locals + local_bytes;
         if (8 + 8 * saved.len() as i32 + f) % 16 != 0 {
             f += 8;
         }
@@ -105,6 +111,7 @@ pub(crate) fn emit(vc: &VCode, alloc: &Allocation) -> Result<(Vec<u8>, Vec<(u32,
         a: CodeAssembler::new(64).map_err(enc)?,
         al: alloc,
         frame,
+        locals,
         saved,
         labels: HashMap::new(),
     };
@@ -203,7 +210,33 @@ impl<'a> Emit<'a> {
         }
     }
 
-    /// Pointer base (always an ABI argument register in practice).
+    /// Address operand base register: a pointer vreg (loaded into r11 if
+    /// spilled) or rsp for the locals area, plus the extra displacement.
+    fn base(&mut self, b: Base) -> Result<(AsmRegister64, i32), BackendError> {
+        match b {
+            Base::V(v) => Ok((self.g64(v)?, 0)),
+            Base::Locals => Ok((rsp, self.locals)),
+        }
+    }
+
+    /// Store a 64-bit result computed in `r` (r11 for spilled dests).
+    fn p_fin(&mut self, v: VReg, r: AsmRegister64) -> Result<(), BackendError> {
+        match self.loc(v) {
+            Loc::Reg(PReg::G(d)) if G64[d as usize] == r => Ok(()),
+            Loc::Reg(PReg::G(d)) => self.a.mov(G64[d as usize], r).map_err(enc),
+            Loc::Slot(s) => self.a.mov(qword_ptr(rsp + 16 * s as i32), r).map_err(enc),
+            Loc::Reg(PReg::X(_)) => unreachable!(),
+        }
+    }
+
+    fn p_dst(&self, v: VReg) -> AsmRegister64 {
+        match self.loc(v) {
+            Loc::Reg(PReg::G(d)) => G64[d as usize],
+            _ => r11,
+        }
+    }
+
+    /// A pointer vreg in a register (r11 if spilled).
     fn g64(&mut self, v: VReg) -> Result<AsmRegister64, BackendError> {
         match self.loc(v) {
             Loc::Reg(PReg::G(r)) => Ok(G64[r as usize]),
@@ -216,8 +249,8 @@ impl<'a> Emit<'a> {
     }
 
     fn mem(&mut self, addr: Addr) -> Result<AsmMemoryOperand, BackendError> {
-        let b = self.g64(addr.base)?;
-        Ok(dword_ptr(b + addr.off))
+        let (b, disp) = self.base(addr.base)?;
+        Ok(dword_ptr(b + (disp + addr.off)))
     }
 
     fn x_preg(&self, v: VReg) -> Option<AsmRegisterXmm> {
@@ -294,6 +327,25 @@ impl<'a> Emit<'a> {
                     self.a.sub(rsp, self.frame).map_err(enc)?;
                 }
             }
+            M::StackArg { d, off, wide } => {
+                let at = rsp + (self.frame + 8 * self.saved.len() as i32 + *off);
+                if *wide {
+                    let r = self.p_dst(*d);
+                    self.a.mov(r, qword_ptr(at)).map_err(enc)?;
+                    self.p_fin(*d, r)?;
+                } else {
+                    let r = self.g_dst(*d);
+                    self.a.mov(r, dword_ptr(at)).map_err(enc)?;
+                    self.g_fin(*d, r)?;
+                }
+            }
+            M::PLoad { d, addr } => {
+                let (b, disp) = self.base(addr.base)?;
+                let r = self.p_dst(*d);
+                self.a.mov(r, qword_ptr(b + (disp + addr.off))).map_err(enc)?;
+                self.p_fin(*d, r)?;
+            }
+            M::PtrAdd { d, base, idx, stride } => self.ptr_add(*d, *base, *idx, *stride)?,
             M::Ret => {
                 if self.frame > 0 {
                     self.a.add(rsp, self.frame).map_err(enc)?;
@@ -613,6 +665,35 @@ impl<'a> Emit<'a> {
             }
         }
         Ok(())
+    }
+
+    /// d = base + zext(idx) * stride. A 32-bit GPR value is already
+    /// zero-extended in its 64-bit register.
+    fn ptr_add(&mut self, d: VReg, base: Base, idx: VReg, stride: u32) -> Result<(), BackendError> {
+        let (b, disp) = self.base(base)?;
+        let i32r = self.g_reg(idx, eax)?;
+        let i = to64(i32r);
+        let rd = self.p_dst(d);
+        match stride {
+            1 => self.a.lea(rd, ptr(b + i + disp)).map_err(enc)?,
+            2 => self.a.lea(rd, ptr(b + i * 2 + disp)).map_err(enc)?,
+            4 => self.a.lea(rd, ptr(b + i * 4 + disp)).map_err(enc)?,
+            8 => self.a.lea(rd, ptr(b + i * 8 + disp)).map_err(enc)?,
+            s if s.is_power_of_two() => {
+                if i != rax {
+                    self.a.mov(eax, i32r).map_err(enc)?; // zero-extends
+                }
+                self.a.shl(rax, s.trailing_zeros() as i32).map_err(enc)?;
+                self.a.lea(rd, ptr(b + rax + disp)).map_err(enc)?;
+            }
+            _ => {
+                let s = i32::try_from(stride)
+                    .map_err(|_| BackendError::Unsupported("PtrOffsetDynamic stride".into()))?;
+                self.a.imul_3(rax, i, s).map_err(enc)?;
+                self.a.lea(rd, ptr(b + rax + disp)).map_err(enc)?;
+            }
+        }
+        self.p_fin(d, rd)
     }
 
     fn bool_from_al(&mut self, d: VReg) -> Result<(), BackendError> {

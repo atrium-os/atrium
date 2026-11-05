@@ -114,6 +114,26 @@ impl ShaderRunner for BespokeX86Runner {
     }
 }
 
+/// Compile SPIR-V with this host's bespoke backend (arm64 or x86_64) to
+/// an object file. Panics on failure; for the vertex tests, which call
+/// `atrium_vs_main` themselves.
+pub fn bespoke_object(spirv: &[u8]) -> Vec<u8> {
+    let module = atrium_spv_frontend::translate(spirv).expect("frontend");
+    if cfg!(target_arch = "x86_64") {
+        atrium_spv_backend_bespoke_x86::compile(
+            &module, atrium_spv_backend_bespoke_x86::Target::host())
+            .expect("bespoke-x86").object
+    } else {
+        atrium_spv_backend_bespoke::compile(
+            &module, atrium_spv_backend_bespoke::Target::host())
+            .expect("bespoke").object
+    }
+}
+
+/// True when this host has a bespoke backend that can run here.
+pub const HOST_HAS_ANY_BESPOKE: bool =
+    cfg!(any(target_arch = "aarch64", target_arch = "x86_64"));
+
 /// The host's production Tier-2 backend: bespoke on
 /// aarch64, Cranelift elsewhere (bespoke is aarch64-only).
 /// Tests use it to pin absolute values on any host.

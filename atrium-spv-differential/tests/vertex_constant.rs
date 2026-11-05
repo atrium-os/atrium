@@ -65,8 +65,7 @@ fn compile_to_object(spirv: &[u8], backend: Backend) -> Vec<u8> {
     match backend {
         Backend::Cranelift => atrium_spv_backend_cranelift::compile(
             &module, atrium_spv_backend_cranelift::Target::host()).unwrap().object,
-        Backend::Bespoke => atrium_spv_backend_bespoke::compile(
-            &module, atrium_spv_backend_bespoke::Target::host()).unwrap().object,
+        Backend::Bespoke => atrium_spv_differential::bespoke_object(spirv),
     }
 }
 
@@ -246,7 +245,7 @@ fn assert_passthrough(backend: Backend) {
 #[test] fn cranelift_constant_position_vertex() { assert_constant_position(Backend::Cranelift); }
 #[test] fn cranelift_passthrough_vertex()       { assert_passthrough(Backend::Cranelift); }
 // Bespoke emits AArch64 only.
-#[cfg(target_arch = "aarch64")]
+#[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
 #[test] fn bespoke_constant_position_vertex()   { assert_constant_position(Backend::Bespoke); }
-#[cfg(target_arch = "aarch64")]
+#[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
 #[test] fn bespoke_passthrough_vertex()         { assert_passthrough(Backend::Bespoke); }

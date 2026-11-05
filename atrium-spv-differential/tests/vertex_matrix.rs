@@ -130,9 +130,7 @@ fn compile_to_object(spirv: &[u8], backend: Backend) -> Vec<u8> {
         Backend::Cranelift => atrium_spv_backend_cranelift::compile(
             &module, atrium_spv_backend_cranelift::Target::host())
             .unwrap().object,
-        Backend::Bespoke => atrium_spv_backend_bespoke::compile(
-            &module, atrium_spv_backend_bespoke::Target::host())
-            .unwrap().object,
+        Backend::Bespoke => atrium_spv_differential::bespoke_object(spirv),
     }
 }
 
@@ -212,7 +210,7 @@ fn assert_three_way_mvp(mvp: [[f32; 4]; 4], pos: [f32; 3], expected: [f32; 4]) {
 
     // Bespoke -- aarch64 only.  Skip silently elsewhere; the
     // interpreter/cranelift pair still validates the shader.
-    if cfg!(target_arch = "aarch64") {
+    if atrium_spv_differential::HOST_HAS_ANY_BESPOKE {
         let bs_pos = run_mvp(&spirv, &attr, &ubo, Backend::Bespoke);
         for k in 0..4 {
             assert!((bs_pos[k] - interp_pos[k]).abs() < 1e-6,

@@ -15,8 +15,8 @@
 use std::collections::{HashMap, HashSet};
 
 use atrium_spv_ir::{
-    BlockId, BuiltinKind, FloatKind, Function, Inst, IntKind, Op, StorageClass, Type, Value,
-    ValueId, VecElement,
+    BlockId, BuiltinKind, FloatKind, Function, Inst, IntKind, Op, ShaderStage, StorageClass, Type,
+    Value, ValueId, VecElement,
 };
 
 use crate::{unsupported, BackendError};
@@ -28,8 +28,18 @@ pub(crate) struct VReg(pub u32);
 pub(crate) enum Class {
     /// XMM register, f32 in lane 0.
     X,
-    /// General-purpose register: 32-bit ints and bools, or a 64-bit pointer.
+    /// General-purpose register holding a 32-bit int or bool (upper half
+    /// always zero, as every 32-bit write leaves it).
     G,
+    /// General-purpose register holding a 64-bit pointer.
+    P,
+}
+
+impl Class {
+    /// Register file: XMM or GPR.
+    pub fn is_xmm(self) -> bool {
+        matches!(self, Class::X)
+    }
 }
 
 /// Physical register: hardware encoding number within its class.
@@ -40,19 +50,29 @@ pub(crate) enum PReg {
 }
 
 pub(crate) mod gpr {
+    pub const RCX: u8 = 1;
     pub const RDX: u8 = 2;
     pub const RSI: u8 = 6;
     pub const RDI: u8 = 7;
     pub const R8: u8 = 8;
+    pub const R9: u8 = 9;
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub(crate) struct Label(pub u32);
 
-/// `[base + off]`, base a pointer-holding GPR vreg.
+/// Base of an address: a pointer vreg, or this function's local area
+/// (LocalAlloc) on the stack.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Base {
+    V(VReg),
+    Locals,
+}
+
+/// `[base + off]`.
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct Addr {
-    pub base: VReg,
+    pub base: Base,
     pub off: i32,
 }
 
@@ -153,6 +173,13 @@ pub(crate) enum MInst {
     Label(Label),
     /// Function entry: defines the ABI argument vregs (precoloured).
     Entry { defs: Vec<VReg> },
+    /// Load a stack-passed argument; `off` is from the entry rsp (8 = the
+    /// first stack argument). `wide` loads 64 bits.
+    StackArg { d: VReg, off: i32, wide: bool },
+    /// d = base + zext(idx) * stride (64-bit pointer arithmetic).
+    PtrAdd { d: VReg, base: Base, idx: VReg, stride: u32 },
+    /// Load a 64-bit pointer.
+    PLoad { d: VReg, addr: Addr },
 
     XConst { d: VReg, bits: u32 },
     XMov { d: VReg, s: VReg },
@@ -201,7 +228,14 @@ impl MInst {
     pub fn uses(&self, out: &mut Vec<VReg>) {
         use MInst::*;
         match self {
-            Mark(_) | Label(_) | Entry { .. } | XConst { .. } | GConst { .. } | Jmp(_) | Ret => {}
+            Mark(_) | Label(_) | Entry { .. } | StackArg { .. } | XConst { .. } | GConst { .. }
+            | Jmp(_) | Ret => {}
+            PtrAdd { base, idx, .. } => {
+                if let Base::V(b) = base {
+                    out.push(*b);
+                }
+                out.push(*idx);
+            }
             XMov { s, .. } | GMov { s, .. } | MovXToG { s, .. } | MovGToX { s, .. } => out.push(*s),
             XBin { a, b, .. }
             | GBin { a, b, .. }
@@ -217,9 +251,15 @@ impl MInst {
             CvtSToF { a, .. } | CvtUToF { a, .. } | CvtFToS { a, .. } | CvtFToU { a, .. } => {
                 out.push(*a)
             }
-            XLoad { addr, .. } | GLoad { addr, .. } => out.push(addr.base),
+            XLoad { addr, .. } | GLoad { addr, .. } | PLoad { addr, .. } => {
+                if let Base::V(b) = addr.base {
+                    out.push(b);
+                }
+            }
             XStore { addr, s } | GStore { addr, s } => {
-                out.push(addr.base);
+                if let Base::V(b) = addr.base {
+                    out.push(b);
+                }
                 out.push(*s);
             }
             XSelect { c, t, f, .. } | GSelect { c, t, f, .. } => out.extend([*c, *t, *f]),
@@ -232,6 +272,7 @@ impl MInst {
         use MInst::*;
         match self {
             Entry { defs } => out.extend(defs.iter().copied()),
+            StackArg { d, .. } | PtrAdd { d, .. } | PLoad { d, .. } => out.push(*d),
             XConst { d, .. }
             | XMov { d, .. }
             | XBin { d, .. }
@@ -272,31 +313,77 @@ impl MInst {
     }
 }
 
-/// A pointer value: ABI argument vreg plus constant byte offset.
+/// A pointer value: base plus constant byte offset.
 #[derive(Clone, Copy, Debug)]
 struct Ptr {
-    base: VReg,
+    base: Base,
     off: i32,
 }
 
-/// Fragment ABI argument (SysV FsMain).
+/// An ABI argument of the entry point (SysV, the loader's signatures).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 enum Arg {
-    InVaryings,
-    Uniforms,
-    PushConstants,
-    OutColor,
-    FragCoord(u8),
+    // FsMain(in_varyings rdi, uniforms rsi, push_constants rdx,
+    //        frag_coord xmm0-3, samples_mask ecx, out_color r8,
+    //        out_depth r9, front_facing [8], primitive_id [16])
+    FsInVaryings,
+    FsUniforms,
+    FsPush,
+    FsFragCoord(u8),
+    FsOutColor,
+    FsOutDepth,
+    FsFrontFacing,
+    FsPrimitiveId,
+    // VsMain(in_attributes rdi, in_attr_strides rsi, uniforms rdx,
+    //        push_constants rcx, vertex_index r8d, instance_index r9d,
+    //        out_position [8], out_varyings [16], out_clip_distance [24],
+    //        ssbo_table [32])
+    VsIn,
+    VsUniforms,
+    VsPush,
+    VsVertexIndex,
+    VsInstanceIndex,
+    VsOutPosition,
+    VsOutVaryings,
+    VsSsboTable,
+}
+
+enum ArgSrc {
+    Reg(PReg),
+    /// Offset from the entry rsp.
+    Stack(i32),
 }
 
 impl Arg {
-    fn preg(self) -> PReg {
+    fn class(self) -> Class {
         match self {
-            Arg::InVaryings => PReg::G(gpr::RDI),
-            Arg::Uniforms => PReg::G(gpr::RSI),
-            Arg::PushConstants => PReg::G(gpr::RDX),
-            Arg::OutColor => PReg::G(gpr::R8),
-            Arg::FragCoord(i) => PReg::X(i),
+            Arg::FsFragCoord(_) => Class::X,
+            Arg::FsFrontFacing | Arg::FsPrimitiveId | Arg::VsVertexIndex | Arg::VsInstanceIndex => {
+                Class::G
+            }
+            _ => Class::P,
+        }
+    }
+
+    fn src(self) -> ArgSrc {
+        use ArgSrc::*;
+        match self {
+            Arg::FsInVaryings => Reg(PReg::G(gpr::RDI)),
+            Arg::FsUniforms => Reg(PReg::G(gpr::RSI)),
+            Arg::FsPush => Reg(PReg::G(gpr::RDX)),
+            Arg::FsFragCoord(i) => Reg(PReg::X(i)),
+            Arg::FsOutColor => Reg(PReg::G(gpr::R8)),
+            Arg::FsOutDepth => Reg(PReg::G(gpr::R9)),
+            Arg::FsFrontFacing => Stack(8),
+            Arg::FsPrimitiveId => Stack(16),
+            Arg::VsIn => Reg(PReg::G(gpr::RDI)),
+            Arg::VsUniforms => Reg(PReg::G(gpr::RDX)),
+            Arg::VsPush => Reg(PReg::G(gpr::RCX)),
+            Arg::VsVertexIndex => Reg(PReg::G(gpr::R8)),
+            Arg::VsInstanceIndex => Reg(PReg::G(gpr::R9)),
+            Arg::VsOutPosition => Stack(8),
+            Arg::VsOutVaryings => Stack(16),
+            Arg::VsSsboTable => Stack(32),
         }
     }
 }
@@ -309,6 +396,8 @@ pub(crate) struct VCode {
     /// Allocation hints: prefer the register of the given vreg.
     pub hints: HashMap<VReg, VReg>,
     pub num_labels: u32,
+    /// Bytes of LocalAlloc storage the frame must provide.
+    pub local_bytes: u32,
 }
 
 struct Lower<'f> {
@@ -322,6 +411,9 @@ struct Lower<'f> {
     args: HashMap<Arg, VReg>,
     block_labels: HashMap<BlockId, Label>,
     num_labels: u32,
+    /// Stack-passed arguments, loaded right after the prologue.
+    stack_args: Vec<MInst>,
+    local_bytes: u32,
 }
 
 fn elem_class(e: &VecElement) -> Result<Class, BackendError> {
@@ -340,6 +432,8 @@ pub(crate) fn lane_classes(ty: &Type) -> Result<Vec<Class>, BackendError> {
         Type::Vec2(e) => vec![elem_class(e)?; 2],
         Type::Vec3(e) => vec![elem_class(e)?; 3],
         Type::Vec4(e) => vec![elem_class(e)?; 4],
+        // Column-major: lane 4*col + row.
+        Type::Mat4(VecElement::F32) => vec![Class::X; 16],
         other => return unsupported(format!("values of type {other:?}")),
     })
 }
@@ -394,6 +488,8 @@ pub(crate) fn lower(func: &Function) -> Result<VCode, BackendError> {
         args: HashMap::new(),
         block_labels: HashMap::new(),
         num_labels: 0,
+        stack_args: Vec::new(),
+        local_bytes: func.scratch_bytes,
     };
     let order = rpo(func)?;
     for &b in &order {
@@ -411,12 +507,15 @@ pub(crate) fn lower(func: &Function) -> Result<VCode, BackendError> {
     let mut defs: Vec<(Arg, VReg)> = l.args.iter().map(|(a, v)| (*a, *v)).collect();
     defs.sort_by_key(|(_, v)| *v);
     l.code[0] = MInst::Entry { defs: defs.iter().map(|(_, v)| *v).collect() };
+    let stack_args = std::mem::take(&mut l.stack_args);
+    l.code.splice(1..1, stack_args);
     Ok(VCode {
         insts: l.code,
         classes: l.classes,
         fixed: l.fixed,
         hints: l.hints,
         num_labels: l.num_labels,
+        local_bytes: l.local_bytes,
     })
 }
 
@@ -437,12 +536,15 @@ impl<'f> Lower<'f> {
         if let Some(v) = self.args.get(&a) {
             return *v;
         }
-        let c = match a.preg() {
-            PReg::X(_) => Class::X,
-            PReg::G(_) => Class::G,
-        };
-        let v = self.vreg(c);
-        self.fixed.insert(v, a.preg());
+        let v = self.vreg(a.class());
+        match a.src() {
+            ArgSrc::Reg(r) => {
+                self.fixed.insert(v, r);
+            }
+            ArgSrc::Stack(off) => {
+                self.stack_args.push(MInst::StackArg { d: v, off, wide: a.class() == Class::P });
+            }
+        }
         self.args.insert(a, v);
         v
     }
@@ -485,21 +587,81 @@ impl<'f> Lower<'f> {
         if let Some(p) = self.ptrs.get(&v.id) {
             return Ok(*p);
         }
-        // A bare variable: its storage class picks the ABI argument.
+        let p = self.var_ptr(v)?;
+        self.ptrs.insert(v.id, p);
+        Ok(p)
+    }
+
+    /// A bare variable: storage class and the frontend's per-variable
+    /// routing pick the ABI argument and offset, as in Cranelift's
+    /// `resolve_pointer_param`.
+    fn var_ptr(&mut self, v: &Value) -> Result<Ptr, BackendError> {
+        let func = self.func;
         let sc = match &v.ty {
             Type::Pointer(sc, _) => *sc,
             other => return unsupported(format!("pointer of type {other:?}")),
         };
-        let arg = match sc {
-            StorageClass::Input => Arg::InVaryings,
-            StorageClass::Uniform => Arg::Uniforms,
-            StorageClass::PushConstant => Arg::PushConstants,
-            StorageClass::Output => Arg::OutColor,
-            other => return unsupported(format!("fragment storage class {other:?}")),
+        let at = |l: &mut Self, a: Arg, off: u32| -> Result<Ptr, BackendError> {
+            let off = i32::try_from(off).map_err(|_| BackendError::Unsupported("offset".into()))?;
+            Ok(Ptr { base: Base::V(l.arg(a)), off })
         };
-        let p = Ptr { base: self.arg(arg), off: 0 };
-        self.ptrs.insert(v.id, p);
-        Ok(p)
+        match func.stage {
+            ShaderStage::Fragment => {
+                if func.frag_depth_output == Some(v.id) {
+                    return at(self, Arg::FsOutDepth, 0);
+                }
+                match sc {
+                    StorageClass::Input => {
+                        let off = func.input_varying_byte_offset.get(&v.id).copied().unwrap_or(0);
+                        at(self, Arg::FsInVaryings, off)
+                    }
+                    StorageClass::Output => {
+                        let off = func.output_varying_byte_offset.get(&v.id).copied().unwrap_or(0);
+                        at(self, Arg::FsOutColor, off)
+                    }
+                    StorageClass::Uniform => at(self, Arg::FsUniforms, 0),
+                    StorageClass::PushConstant => at(self, Arg::FsPush, 0),
+                    other => unsupported(format!("fragment storage class {other:?}")),
+                }
+            }
+            ShaderStage::Vertex => match sc {
+                StorageClass::Input => {
+                    let off = func.input_varying_byte_offset.get(&v.id).copied().unwrap_or(0);
+                    at(self, Arg::VsIn, off)
+                }
+                StorageClass::Output => match func.output_varying_byte_offset.get(&v.id) {
+                    Some(&off) => at(self, Arg::VsOutVaryings, off),
+                    None => at(self, Arg::VsOutPosition, 0),
+                },
+                StorageClass::Uniform => at(self, Arg::VsUniforms, 0),
+                StorageClass::PushConstant => at(self, Arg::VsPush, 0),
+                StorageClass::StorageBuffer => {
+                    let Some(&(_set, binding)) = func.ssbo_bindings.get(&v.id.0) else {
+                        return unsupported("vertex StorageBuffer without a binding");
+                    };
+                    // slot[binding] of the descriptor table holds the base.
+                    let table = self.arg(Arg::VsSsboTable);
+                    let d = self.vreg(Class::P);
+                    let off = i32::try_from(binding * 8)
+                        .map_err(|_| BackendError::Unsupported("binding".into()))?;
+                    // Loaded once at entry, so every use is dominated.
+                    self.stack_args.push(MInst::PLoad { d, addr: Addr { base: Base::V(table), off } });
+                    Ok(Ptr { base: Base::V(d), off: 0 })
+                }
+                other => unsupported(format!("vertex storage class {other:?}")),
+            },
+            ShaderStage::Compute => unsupported("compute stage"),
+        }
+    }
+
+    fn load_lanes(&mut self, p: Ptr, d: &[VReg]) {
+        for (i, &v) in d.iter().enumerate() {
+            let addr = Addr { base: p.base, off: p.off + 4 * i as i32 };
+            self.code.push(match self.class_of(v) {
+                Class::X => MInst::XLoad { d: v, addr },
+                _ => MInst::GLoad { d: v, addr },
+            });
+        }
     }
 
     /// Lane-wise binary op; a scalar operand is broadcast to the vector.
@@ -638,7 +800,7 @@ impl<'f> Lower<'f> {
         let overlap = moves.iter().any(|(d, s)| d != s && dsts.contains(s));
         let mv = |d: VReg, s: VReg, c: Class| match c {
             Class::X => MInst::XMov { d, s },
-            Class::G => MInst::GMov { d, s },
+            Class::G | Class::P => MInst::GMov { d, s },
         };
         if overlap {
             let mut temps = Vec::new();
@@ -692,7 +854,7 @@ impl<'f> Lower<'f> {
                 for v in d {
                     match self.class_of(v) {
                         Class::X => self.code.push(M::XConst { d: v, bits: 0 }),
-                        Class::G => self.code.push(M::GConst { d: v, imm: 0 }),
+                        _ => self.code.push(M::GConst { d: v, imm: 0 }),
                     }
                 }
             }
@@ -824,7 +986,7 @@ impl<'f> Lower<'f> {
                     let c = if lc.len() == 1 { lc[0] } else { lc[i] };
                     self.code.push(match self.class_of(d[i]) {
                         Class::X => M::XSelect { d: d[i], c, t: lt[i], f: lf[i] },
-                        Class::G => M::GSelect { d: d[i], c, t: lt[i], f: lf[i] },
+                        _ => M::GSelect { d: d[i], c, t: lt[i], f: lf[i] },
                     });
                 }
             }
@@ -860,8 +1022,8 @@ impl<'f> Lower<'f> {
                     }
                     let d = self.vreg(want[i]);
                     self.code.push(match want[i] {
-                        Class::G => M::MovXToG { d, s },
                         Class::X => M::MovGToX { d, s },
+                        _ => M::MovXToG { d, s },
                     });
                     out.push(d);
                 }
@@ -903,11 +1065,27 @@ impl<'f> Lower<'f> {
             }
 
             // ── memory ────────────────────────────────────────────────
-            Op::LoadBuiltin(BuiltinKind::FragCoord) => {
+            Op::LoadBuiltin(kind) => {
                 let res = Self::result(inst)?;
-                let regs: Vec<VReg> = (0..4).map(|i| self.arg(Arg::FragCoord(i))).collect();
-                let n = lane_classes(&res.ty)?.len();
-                self.lanes.insert(res.id, regs[..n.min(4)].to_vec());
+                let stage = self.func.stage;
+                let regs: Vec<VReg> = match (stage, kind) {
+                    (ShaderStage::Fragment, BuiltinKind::FragCoord) => {
+                        let n = lane_classes(&res.ty)?.len().min(4);
+                        (0..n as u8).map(|i| self.arg(Arg::FsFragCoord(i))).collect()
+                    }
+                    (ShaderStage::Fragment, BuiltinKind::FrontFacing) => vec![self.arg(Arg::FsFrontFacing)],
+                    (ShaderStage::Fragment, BuiltinKind::PrimitiveId) => vec![self.arg(Arg::FsPrimitiveId)],
+                    (ShaderStage::Vertex, BuiltinKind::VertexIndex) => vec![self.arg(Arg::VsVertexIndex)],
+                    (ShaderStage::Vertex, BuiltinKind::InstanceIndex) => vec![self.arg(Arg::VsInstanceIndex)],
+                    (ShaderStage::Vertex, BuiltinKind::BaseVertex | BuiltinKind::BaseInstance) => {
+                        // 0 for direct draws; the index args are absolute.
+                        let d = self.vreg(Class::G);
+                        self.code.push(M::GConst { d, imm: 0 });
+                        vec![d]
+                    }
+                    (s, k) => return unsupported(format!("LoadBuiltin({k:?}) in {s:?}")),
+                };
+                self.lanes.insert(res.id, regs);
             }
             Op::AccessChain { base, byte_offset } => {
                 let res = Self::result(inst)?;
@@ -918,32 +1096,70 @@ impl<'f> Lower<'f> {
                     .ok_or_else(|| BackendError::Unsupported("AccessChain offset overflow".into()))?;
                 self.ptrs.insert(res.id, Ptr { base: p.base, off });
             }
+            Op::PtrOffsetDynamic { base, index, stride } => {
+                let res = Self::result(inst)?;
+                let p = self.ptr_of(base)?;
+                let idx = self.lanes_of(index)?;
+                if idx.len() != 1 || self.class_of(idx[0]) != Class::G {
+                    return unsupported("PtrOffsetDynamic index type");
+                }
+                let d = self.vreg(Class::P);
+                self.code.push(M::PtrAdd { d, base: p.base, idx: idx[0], stride: *stride });
+                self.ptrs.insert(res.id, Ptr { base: Base::V(d), off: p.off });
+            }
+            Op::LocalAlloc { offset, bytes } => {
+                let res = Self::result(inst)?;
+                let off = i32::try_from(*offset).map_err(|_| BackendError::Unsupported("LocalAlloc".into()))?;
+                self.local_bytes = self.local_bytes.max(offset.saturating_add(*bytes));
+                self.ptrs.insert(res.id, Ptr { base: Base::Locals, off });
+            }
             Op::Load(ptr) => {
                 let res = Self::result(inst)?;
                 let p = self.ptr_of(ptr)?;
                 let d = self.define(res)?;
-                for (i, &v) in d.iter().enumerate() {
-                    let addr = Addr { base: p.base, off: p.off + 4 * i as i32 };
-                    self.code.push(match self.class_of(v) {
-                        Class::X => M::XLoad { d: v, addr },
-                        Class::G => M::GLoad { d: v, addr },
-                    });
-                }
+                self.load_lanes(p, &d);
             }
             Op::Store { ptr, value } => {
                 let p = self.ptr_of(ptr)?;
-                if !matches!(&ptr.ty, Type::Pointer(StorageClass::Output, _))
-                    && self.args.get(&Arg::OutColor) != Some(&p.base)
-                {
-                    return unsupported("fragment store to a non-output pointer");
-                }
                 for (i, v) in self.lanes_of(value)?.into_iter().enumerate() {
                     let addr = Addr { base: p.base, off: p.off + 4 * i as i32 };
                     self.code.push(match self.class_of(v) {
                         Class::X => M::XStore { addr, s: v },
-                        Class::G => M::GStore { addr, s: v },
+                        _ => M::GStore { addr, s: v },
                     });
                 }
+            }
+            Op::MatrixTimesVector { matrix, vector } => {
+                // out[i] = sum_j m[j][i] * v[j], multiply then add (no FMA),
+                // in Cranelift's order, so results match bit for bit.
+                let res = Self::result(inst)?;
+                let cols: Vec<VReg> = match &matrix.ty {
+                    Type::Pointer(..) => {
+                        let p = self.ptr_of(matrix)?;
+                        let d: Vec<VReg> = (0..16).map(|_| self.vreg(Class::X)).collect();
+                        self.load_lanes(p, &d);
+                        d
+                    }
+                    _ => self.lanes_of(matrix)?,
+                };
+                let v = self.lanes_of(vector)?;
+                if cols.len() != 16 || v.len() != 4 || lane_classes(&res.ty)?.len() != 4 {
+                    return unsupported("MatrixTimesVector shape");
+                }
+                let mut out = Vec::new();
+                for i in 0..4 {
+                    let mut acc = self.vreg(Class::X);
+                    self.code.push(M::XBin { op: XOp::Mul, d: acc, a: cols[i], b: v[0] });
+                    for j in 1..4 {
+                        let p = self.vreg(Class::X);
+                        self.code.push(M::XBin { op: XOp::Mul, d: p, a: cols[4 * j + i], b: v[j] });
+                        let s = self.vreg(Class::X);
+                        self.code.push(M::XBin { op: XOp::Add, d: s, a: acc, b: p });
+                        acc = s;
+                    }
+                    out.push(acc);
+                }
+                self.lanes.insert(res.id, out);
             }
 
             // ── control flow ──────────────────────────────────────────

@@ -18,7 +18,7 @@
 
 use std::collections::HashMap;
 
-use crate::vcode::{Class, Label, MInst, PReg, VCode, VReg};
+use crate::vcode::{Label, MInst, PReg, VCode, VReg};
 
 /// Where a vreg lives.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -236,14 +236,8 @@ pub(crate) fn allocate(vc: &VCode) -> Allocation {
         }
 
         let class = vc.classes[v];
-        let mk = |i: u8| match class {
-            Class::X => PReg::X(i),
-            Class::G => PReg::G(i),
-        };
-        let candidates: &[u8] = match class {
-            Class::X => &XMM_ORDER,
-            Class::G => &GPR_ORDER,
-        };
+        let mk = |i: u8| if class.is_xmm() { PReg::X(i) } else { PReg::G(i) };
+        let candidates: &[u8] = if class.is_xmm() { &XMM_ORDER } else { &GPR_ORDER };
         // Hint first: the register of the hinted vreg, if free now.
         let hinted = vc.hints.get(&VReg(v as u32)).and_then(|h| match locs[h.0 as usize] {
             Loc::Reg(r) if !held.contains_key(&r) && candidates.iter().any(|&c| mk(c) == r) => Some(r),
@@ -260,7 +254,9 @@ pub(crate) fn allocate(vc: &VCode) -> Allocation {
         // non-precoloured intervals ends last.
         let victim = active
             .iter()
-            .filter(|&&(_, u)| vc.classes[u] == class && !vc.fixed.contains_key(&VReg(u as u32)))
+            .filter(|&&(_, u)| {
+                vc.classes[u].is_xmm() == class.is_xmm() && !vc.fixed.contains_key(&VReg(u as u32))
+            })
             .max_by_key(|&&(e, _)| e)
             .copied();
         match victim {

@@ -1,6 +1,6 @@
 # Tier-2 bespoke backend for x86_64
 
-Status: plan, 2026-11-05. Owner: the x86_64 port thread. Companion to
+Status: phases 1-4 landed 2026-11-05 (4b0675c, dbd2d34, phase 4 below). Owner: the x86_64 port thread. Companion to
 [x86_64-port.md](x86_64-port.md) §1 and the arm64 backend in
 `atrium-spv-backend-bespoke/`.
 
@@ -61,7 +61,7 @@ phase returns `Unsupported`, so x86 output is never silently wrong.
 3. **Integer, bool and control flow.** Int ops, compares, `Select`, `Branch`/`BranchCond`/
    `Switch`, `Phi` with critical-edge splitting (reuse the arm64 pass), conversions,
    `Bitcast`.
-4. **Memory.** `Load`/`Store`/`AccessChain`/`PtrOffsetDynamic`/`LocalAlloc`, uniforms, push
+4. **Memory.** (Also brought the vertex stage forward: its ABI is mostly memory.) `Load`/`Store`/`AccessChain`/`PtrOffsetDynamic`/`LocalAlloc`, uniforms, push
    constants, varyings, storage buffers.
 5. **Vectors.** Shuffle/extract/insert/dot/`MatrixTimesVector`, scalarized first, then
    packed XMM where it pays.
