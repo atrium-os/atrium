@@ -215,6 +215,91 @@ pub const CONNECTOR_VRR: u32 = 0x2;
 pub const CONNECTOR_VRR_ACTIVE: u32 = 0x4;
 /// `ATRIUM_DISPLAY_FORMAT_XRGB8888`: B,G,R,X in memory.
 pub const FORMAT_XRGB8888: u32 = 0;
+/// (2.3) `ATRIUM_DISPLAY_FORMAT_XRGB2101010`: LE words, B 9:0, G 19:10, R 29:20.
+pub const FORMAT_XRGB2101010: u32 = 1;
+/// (2.3) CONNECTOR: the monitor declares HDR / an HDR EOTF is signalled.
+pub const CONNECTOR_HDR: u32 = 0x8;
+pub const CONNECTOR_HDR_ACTIVE: u32 = 0x10;
+/// (2.3) HDR EOTFs (`ATRIUM_DISPLAY_EOTF_*`) and colorimetries.
+pub const EOTF_SDR: u32 = 0;
+pub const EOTF_TRAD_HDR: u32 = 1;
+pub const EOTF_PQ: u32 = 2;
+pub const EOTF_HLG: u32 = 3;
+pub const COLORIMETRY_DEFAULT: u32 = 0;
+pub const COLORIMETRY_BT2020: u32 = 1;
+const HDR_SET: u32 = 0x1;
+
+#[repr(C)]
+#[derive(Default)]
+struct DHdr {
+    struct_size: u32,
+    flags: u32,
+    eotf: u32,
+    colorimetry: u32,
+    primaries_x: [u16; 3],
+    primaries_y: [u16; 3],
+    white_x: u16,
+    white_y: u16,
+    max_mastering_nits: u16,
+    min_mastering: u16,
+    max_cll: u16,
+    max_fall: u16,
+    out_eotfs: u32,
+    out_colorimetry: u32,
+    out_max_nits: u32,
+    out_max_fall_nits: u32,
+    out_min_nits_x10000: u32,
+    _pad: u32,
+}
+
+/// What the stream is signalled with (display ABI 2.3 HDR): EOTF,
+/// colorimetry and CTA-861.3 static metadata type 1.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Hdr {
+    pub eotf: u32,
+    pub colorimetry: u32,
+    /// R, G, B chromaticity, units of 0.00002.
+    pub primaries_x: [u16; 3],
+    pub primaries_y: [u16; 3],
+    pub white_x: u16,
+    pub white_y: u16,
+    pub max_mastering_nits: u16,
+    /// Units of 0.0001 cd/m².
+    pub min_mastering: u16,
+    pub max_cll: u16,
+    pub max_fall: u16,
+}
+
+impl Hdr {
+    /// HDR10: PQ in BT.2020 with a D65 white point, mastered on a display of
+    /// `max_mastering_nits` (0.005 cd/m² black), content light as given.
+    pub fn hdr10(max_mastering_nits: u16, max_cll: u16, max_fall: u16) -> Self {
+        Hdr {
+            eotf: EOTF_PQ,
+            colorimetry: COLORIMETRY_BT2020,
+            primaries_x: [35400, 8500, 6550],
+            primaries_y: [14600, 39850, 2300],
+            white_x: 15635,
+            white_y: 16450,
+            max_mastering_nits,
+            min_mastering: 50,
+            max_cll,
+            max_fall,
+        }
+    }
+}
+
+/// The monitor's HDR side, from its EDID.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct HdrCaps {
+    /// Bit n = EOTF n offered (SDR always).
+    pub eotfs: u32,
+    /// Bit n = colorimetry n offered (default always).
+    pub colorimetry: u32,
+    pub max_nits: u32,
+    pub max_fall_nits: u32,
+    pub min_nits_x10000: u32,
+}
 /// Display referee faults (`ATRIUM_DISPLAY_FAULT_*`).
 pub const FAULT_NO_MODE: u32 = 1;
 pub const FAULT_NOT_RESIDENT: u32 = 3;
@@ -713,7 +798,11 @@ impl Drop for Syncobj<'_> { fn drop(&mut self) { unsafe { libc::close(self.fd) }
 // Display — /dev/atrium-display0 (decoupled, dma-buf-style scanout)
 // ---------------------------------------------------------------------------
 
-pub struct Display { fd: RawFd }
+pub struct Display {
+    fd: RawFd,
+    /// Pixel format of the buffers committed (`FORMAT_*`), see [`Display::set_format`].
+    format: std::cell::Cell<u32>,
+}
 
 /// [`Display::status_v2`] result.
 #[derive(Debug, Clone, Copy)]
@@ -742,6 +831,9 @@ pub struct ConnectorV2 {
     pub vrr: Option<(u32, u32)>,
     /// The lit mode runs with variable refresh.
     pub vrr_active: bool,
+    /// (2.3) The monitor declares HDR; an HDR EOTF is being signalled.
+    pub hdr: bool,
+    pub hdr_active: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -754,7 +846,7 @@ pub struct Connector {
 
 impl Display {
     pub fn open() -> io::Result<Self> {
-        Ok(Self { fd: open_rdwr("/dev/atrium-display0")? })
+        Ok(Self { fd: open_rdwr("/dev/atrium-display0")?, format: std::cell::Cell::new(FORMAT_XRGB8888) })
     }
 
     pub fn connector(&self) -> io::Result<Connector> {
@@ -790,7 +882,66 @@ impl Display {
             vrr: (c.out_flags & CONNECTOR_VRR != 0)
                 .then_some((u32::from(c.out_vrr_min_hz), u32::from(c.out_vrr_max_hz))),
             vrr_active: c.out_flags & CONNECTOR_VRR_ACTIVE != 0,
+            hdr: c.out_flags & CONNECTOR_HDR != 0,
+            hdr_active: c.out_flags & CONNECTOR_HDR_ACTIVE != 0,
         })
+    }
+
+    /// The pixel format of the buffers this display commits from now on
+    /// (`FORMAT_XRGB8888` until set).
+    pub fn set_format(&self, format: u32) { self.format.set(format); }
+
+    fn hdr_call(&self, d: &mut DHdr) -> io::Result<HdrCaps> {
+        d.struct_size = std::mem::size_of::<DHdr>() as u32;
+        unsafe { call(self.fd, iowr(D, 67, std::mem::size_of::<DHdr>()), d)? };
+        Ok(HdrCaps {
+            eotfs: d.out_eotfs,
+            colorimetry: d.out_colorimetry,
+            max_nits: d.out_max_nits,
+            max_fall_nits: d.out_max_fall_nits,
+            min_nits_x10000: d.out_min_nits_x10000,
+        })
+    }
+
+    /// (2.3) What is signalled now, and what the monitor offers.
+    pub fn hdr(&self) -> io::Result<(Hdr, HdrCaps)> {
+        let mut d = DHdr::default();
+        let caps = self.hdr_call(&mut d)?;
+        Ok((
+            Hdr {
+                eotf: d.eotf,
+                colorimetry: d.colorimetry,
+                primaries_x: d.primaries_x,
+                primaries_y: d.primaries_y,
+                white_x: d.white_x,
+                white_y: d.white_y,
+                max_mastering_nits: d.max_mastering_nits,
+                min_mastering: d.min_mastering,
+                max_cll: d.max_cll,
+                max_fall: d.max_fall,
+            },
+            caps,
+        ))
+    }
+
+    /// (2.3) Signal `h` from the next commit on (`EINVAL` if the monitor
+    /// doesn't offer its EOTF or colorimetry). [`Hdr::default`] is SDR.
+    pub fn set_hdr(&self, h: &Hdr) -> io::Result<HdrCaps> {
+        let mut d = DHdr {
+            flags: HDR_SET,
+            eotf: h.eotf,
+            colorimetry: h.colorimetry,
+            primaries_x: h.primaries_x,
+            primaries_y: h.primaries_y,
+            white_x: h.white_x,
+            white_y: h.white_y,
+            max_mastering_nits: h.max_mastering_nits,
+            min_mastering: h.min_mastering,
+            max_cll: h.max_cll,
+            max_fall: h.max_fall,
+            ..Default::default()
+        };
+        self.hdr_call(&mut d)
     }
 
     /// Test knob (interim CONFIG): re-plug the simulated monitor (`PLUG_*`)
@@ -841,7 +992,7 @@ impl Display {
             struct_size: std::mem::size_of::<DCommit>() as u32,
             flags: COMMIT_MODESET | if vrr { COMMIT_VRR } else { 0 },
             mode_index: index,
-            format: FORMAT_XRGB8888,
+            format: self.format.get(),
             bo_fd: bo.fd,
             pitch,
             in_fence_fd: in_fd,
@@ -875,7 +1026,7 @@ impl Display {
         let mut c = DCommit {
             struct_size: std::mem::size_of::<DCommit>() as u32,
             flags,
-            format: FORMAT_XRGB8888,
+            format: self.format.get(),
             bo_fd: bo.fd,
             pitch,
             in_fence_fd: in_fd,
