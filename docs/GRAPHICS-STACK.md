@@ -238,6 +238,16 @@ in `atrium-display/`; the driver only sends them (AMD: VPG generic packets).
 frescod stays SDR unless `FRESCOD_HDR=1`, which runs the desktop as HDR10
 with SDR white at 203 cd/m² ([§7.4](spec/atrium-display-architecture.md)).
 
+Display 3.0 drives several monitors from the one node: OUTPUTS lists them
+with a stable monitor identity, and COMMIT_MULTI changes any set of them
+atomically, checked first against the display's bandwidth (a refused part
+is named with its reason, a half-applied change is rolled back). frescod
+runs one desktop across them, remembers arrangements per set of monitors,
+and rides out hotplug bursts and short dropouts
+([§7.5](spec/atrium-display-architecture.md)). The GPU driver gives a
+client's freed VRAM back to that client (the device allocator doesn't take
+VRAM back yet; a scrubbing allocator is in progress).
+
 ## 6. Userspace bindings and protocols
 
 - **`atrium-gpu-rs`**: Rust binding. `atrium_gpu::amd::{Gpu, Vm, Bo, Syncobj,

@@ -5269,8 +5269,14 @@ five-mode desktop monitor, -1 unplug; host root only); the desktop
 monitor declares HDR, the others don't. `sysctl -n
 dev.atrium_gpu_amd_display.0.sim_sink` shows what the simulated monitor
 decodes (EOTF, BT.2020, MaxCLL/MaxFALL, bits per colour). Kernel checks:
-`display_modes`, `display_vrr` and `display_hdr` (need the display free, so
-stop frescod first). After changing gpusim's QEMU device, copy `qemu-device/gpusim.c`
+`display_modes`, `display_vrr`, `display_hdr` and `display_multi` (need the
+display free, so stop frescod first: `pkill -x atrium-frescod`, then
+`sysctl dev.atrium_gpu_amd_display.0.lease=""`). Several monitors: `sysctl
+dev.atrium_gpu_amd_display.0.sim_plug_at=N:MODE` plugs output N (0–3; MODE
+as above plus 4 a 1440p office monitor, 5 a twin of the desktop monitor; -1
+unplugs), and `sim_bw_budget_khz` sets the display's pixel-rate budget
+(default 2400000). `display_multi` holds ~110 MB of VRAM until it exits and
+the device doesn't reuse VRAM across clients yet, so give it its own boot. After changing gpusim's QEMU device, copy `qemu-device/gpusim.c`
 into the QEMU fork and rebuild it, then restart the VM and gpusim-server. Don't
 `kldunload` the GPU modules while frescod or a renderer runs; reboot.
 

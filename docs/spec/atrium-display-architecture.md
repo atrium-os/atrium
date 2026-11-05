@@ -283,6 +283,48 @@ bandwidth limits — §8).
   later go above white. The gpu renderer draws straight into scanout, so it
   stays SDR. A hotplug re-decides.
 
+### 7.5 v3.0 several monitors (implemented 2026-11-05)
+
+Design: `docs/reviews/2026-11-05-multi-monitor.md`. One display node drives
+every output (`ATRIUM_DISPLAY_MAX_OUTPUTS` 8; the AMD driver has 4 DCN pipes);
+the 2.x ioctls act on output 0.
+
+- **Seeing them.** OUTPUTS (`'D', 68`) gives every output at a glance: its
+  monitor's identity, connector, lit mode and pixel clock, plus the topology
+  generation and the display's bandwidth budget and use. CONNECTOR_AT /
+  STATUS_AT (69, 70) are CONNECTOR / STATUS for any output; HDR takes an
+  `output` (the old `_pad`).
+- **Identity.** `atrium_edid_identity`: FNV-1a over the EDID's maker,
+  product and serial bytes and its serial-number descriptor; never 0 for a
+  valid EDID. The same monitor reads the same on any output and any boot;
+  the output's path is mixed in only for monitors with no serial, so two
+  identical serial-less monitors are told apart.
+- **Atomic commit across outputs.** COMMIT_MULTI (71) takes one commit per
+  output. All MODESET / `COMMIT_OFF` (a topology change) or all flips, never
+  mixed (`EINVAL`); an output named twice or out of range is refused with
+  `FAULT_NO_OUTPUT`. A topology change checks everything before touching a
+  register: fences, modes and the bandwidth budget, which it charges for the
+  outputs it leaves alone and then each lit output it asks for in order; the
+  first past the budget fails with `FAULT_BANDWIDTH`. `out_failed` names
+  that part and `out_reason` says why. `TEST_ONLY` stops there. Applying it,
+  every named output goes dark, then each is lit; if the hardware still
+  refuses one, every output is put back from a snapshot. Flips are per
+  output; `EBUSY` if any named output still has one pending.
+- **Events.** NOTE_HOTPLUG fires for any output; its data is the topology
+  generation, and an output's generation is the topology generation of its
+  last hotplug (with one monitor the data equals CONNECTOR's
+  `out_generation`, as in 2.x). Vblank notes take output bits
+  (`NOTE_OUTPUT(n)`); none means output 0.
+- **Policy: frescod.** One desktop, the bounding box of the outputs'
+  viewports: left to right by default, remembered per set of monitors by
+  identity. Each output shows its part, paced on its own (a slower monitor
+  catches up with the newest frame). Hotplugs settle for 500 ms first, and
+  a monitor gone for less than 5 s keeps its place and its lit output. When
+  the bandwidth runs short the refused output steps down to its next mode,
+  the same choice every time, and stays dark only if none fits, with the
+  reason logged. With several monitors the gpu renderer gives way to
+  Tier-2. Forum's display sets, window rescue and per-monitor scale are next.
+
 ## 8. The output topology — connectors, encoders, PHYs (HDMI / DP / USB-C)
 
 "How does the driver detect and redirect output to HDMI vs DisplayPort vs
