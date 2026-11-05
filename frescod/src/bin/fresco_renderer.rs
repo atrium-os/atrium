@@ -72,6 +72,78 @@ struct Win {
     sig: Option<u64>,
     seq: u32,
     title: String,
+    /// Pixel mode: the window as last drawn, its tiles' signatures, the
+    /// drawing each slot holds (seq, 0 none), and recent frames' damage.
+    px: Vec<u32>,
+    tiles: Option<Vec<u64>>,
+    slot_seq: [u32; 2],
+    history: std::collections::VecDeque<(u32, Option<slot::Rect>)>,
+}
+
+impl Win {
+    /// Forget what was drawn: the next frame is drawn and sent whole.
+    fn forget(&mut self) {
+        self.sig = None;
+        self.tiles = None;
+        self.slot_seq = [0; 2];
+        self.history.clear();
+    }
+
+    /// What slot `i` lacks of drawing `seq` (the newest in `history`):
+    /// the damage since the drawing it holds; `None` for all of it.
+    fn stale(&self, i: usize) -> Option<slot::Rect> {
+        let had = self.slot_seq[i];
+        if had == 0 {
+            return None;
+        }
+        let mut r: Option<slot::Rect> = None;
+        let mut reached = false;
+        for &(seq, d) in self.history.iter().rev() {
+            if seq == had {
+                reached = true;
+                break;
+            }
+            let d = d?;
+            r = Some(r.map_or(d, |r| union(r, d)));
+        }
+        if !reached {
+            return None;
+        }
+        Some(r.unwrap_or([0, 0, 1, 1]))
+    }
+}
+
+fn union(a: slot::Rect, b: slot::Rect) -> slot::Rect {
+    [a[0].min(b[0]), a[1].min(b[1]), a[2].max(b[2]), a[3].max(b[3])]
+}
+
+/// Raster `frame` into `w.px`: only the tiles whose signatures changed.
+/// `Ok(Some(damage))`: the drawing changed, inside `damage` against the
+/// previous one (`None`: anywhere); `Ok(None)`: not a pixel changed.
+fn raster(t2: &fresco_compute::tier2::Tier2, w: &mut Win, frame: &fresco_compute::Frame, width: u32, height: u32) -> Result<Option<Option<slot::Rect>>, String> {
+    use fresco_compute::damage;
+    let n = width as usize * height as usize;
+    if w.px.len() != n {
+        w.px = vec![0; n];
+        w.tiles = None;
+    }
+    let sig = damage::tile_signatures(frame);
+    let h = &frame.header;
+    let Some(held) = w.tiles.as_deref() else {
+        t2.render(frame, &mut w.px).map_err(|e| e.to_string())?;
+        w.tiles = Some(sig);
+        return Ok(Some(None));
+    };
+    let dirty = damage::dirty(&sig, Some(held));
+    let tiles = damage::rects(&dirty, h.tiles_x, h.tiles_y, 32);
+    if tiles.is_empty() {
+        return Ok(None);
+    }
+    t2.render_tiles(frame, &mut w.px, &tiles).map_err(|e| e.to_string())?;
+    w.tiles = Some(sig);
+    let t = fresco_compute::TILE;
+    let r = tiles.iter().map(|r| [r[0] * t, r[1] * t, (r[2] * t).min(width), (r[3] * t).min(height)]).reduce(union);
+    Ok(Some(r.filter(|r| r[0] < r[2] && r[1] < r[3])))
 }
 
 #[derive(Default)]
@@ -261,7 +333,7 @@ fn declare(broker: &Chan, state: &Mutex<State>, comp: &Mutex<Compositor>, screen
 fn draw(broker: &Chan, state: &Mutex<State>, fe: &Mutex<EnvelopeFrontend>, scene: &pack::SceneState, tex_gen: u64, t2: Option<&fresco_compute::tier2::Tier2>) {
     let mut s = state.lock().unwrap();
     for (&id, w) in s.wins.iter_mut() {
-        let (Some(slots), Some((width, height))) = (&mut w.slots, w.size) else { continue };
+        let (true, Some((width, height))) = (w.slots.is_some(), w.size) else { continue };
         let Some(wf) = pack::window_frame(&fe.lock().unwrap(), id, (0.0, 0.0), (width as f32, height as f32)) else {
             continue;
         };
@@ -278,20 +350,46 @@ fn draw(broker: &Chan, state: &Mutex<State>, fe: &Mutex<EnvelopeFrontend>, scene
             continue;
         }
         let Some(i) = (0..2).find(|&i| !w.busy[i]) else { continue }; // FRAME_DONE wakes us
-        log::debug!("fresco-renderer: window {id}: drawing {width}x{height} into slot {i}");
-        w.seq = w.seq.wrapping_add(1);
         let written = match t2 {
-            // Pixel mode: raster here, send the pixels.
+            // Pixel mode: raster here (only what changed), send the pixels.
             Some(t2) => {
-                let mut px = vec![0u32; width as usize * height as usize];
-                t2.render(&frame, &mut px)
-                    .map_err(|e| e.to_string())
-                    .and_then(|_| slot::write_pixels(slots[i].as_mut_slice(), width, height, &px, w.seq).map_err(str::to_string))
+                let damage = match raster(t2, w, &frame, width, height) {
+                    Ok(Some(d)) => d,
+                    Ok(None) => {
+                        // Not a pixel changed.
+                        w.sig = Some(sig);
+                        continue;
+                    }
+                    Err(e) => {
+                        log::warn!("fresco-renderer: window {id}: {e}; not drawn");
+                        w.forget();
+                        w.sig = Some(sig);
+                        continue;
+                    }
+                };
+                w.seq = w.seq.wrapping_add(1).max(1);
+                w.history.push_back((w.seq, damage));
+                while w.history.len() > 4 {
+                    w.history.pop_front();
+                }
+                let copy = w.stale(i);
+                log::debug!("fresco-renderer: window {id}: drawing {width}x{height} into slot {i}, damage {damage:?}, copy {copy:?}");
+                let r = slot::write_pixels_damage(w.slots.as_mut().unwrap()[i].as_mut_slice(), width, height, &w.px, w.seq, copy, damage)
+                    .map_err(str::to_string);
+                if r.is_ok() {
+                    w.slot_seq[i] = w.seq;
+                }
+                r
             }
-            None => slot::write(slots[i].as_mut_slice(), &frame, w.seq).map_err(str::to_string),
+            None => {
+                w.seq = w.seq.wrapping_add(1);
+                log::debug!("fresco-renderer: window {id}: drawing {width}x{height} into slot {i}");
+                slot::write(w.slots.as_mut().unwrap()[i].as_mut_slice(), &frame, w.seq).map_err(str::to_string)
+            }
         };
         if let Err(e) = written {
             log::warn!("fresco-renderer: window {id}: {e}; not drawn");
+            w.forget();
             w.sig = Some(sig);
             continue;
         }
@@ -337,6 +435,7 @@ fn from_broker(
                         if let Some(w) = state.lock().unwrap().wins.get_mut(&local) {
                             w.slots = Some(p);
                             w.busy = [false; 2];
+                            w.forget();
                         }
                     }
                     Err(e) => return log::warn!("fresco-renderer: slots: {e}"),
@@ -350,7 +449,7 @@ fn from_broker(
             Msg::Geometry { width, height, .. } => {
                 if let Some(w) = state.lock().unwrap().wins.get_mut(&local) {
                     w.size = Some((width, height));
-                    w.sig = None;
+                    w.forget();
                 }
                 // Tells the client, which lays out again.
                 comp.lock().unwrap().resize_window(local as u16, width, height);

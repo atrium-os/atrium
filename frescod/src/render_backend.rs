@@ -277,21 +277,50 @@ impl<'a> Backend<'a> {
         }
     }
 
+    /// Where the last render changed the screen: `Some([x0, y0, x1, y1))`
+    /// (empty when nothing did), `None` when it may have changed anywhere.
+    pub fn damage(&self) -> Option<[u32; 4]> {
+        match self {
+            Backend::Compute(c) => c.damage,
+            _ => None,
+        }
+    }
+
     /// Put the last rendered frame into scanout buffer `i`, signalling
     /// `signal` when it is there. CPU renderers read their pixels into
-    /// `staging` and copy them up; the GPU renderer runs the frame's
-    /// kernels with buffer `i` as the target.
+    /// `staging` and copy them up (only screen rows `rows`, `[y0, y1)`,
+    /// when given: the buffer holds the rest already); the GPU renderer runs
+    /// the frame's kernels with buffer `i` as the target.
+    #[allow(clippy::too_many_arguments)]
     pub fn present(
         &mut self,
         scan: &Scanout<'_>,
         i: usize,
         staging: &mut [u8],
+        rows: Option<(u32, u32)>,
         deadline_ns: u32,
         signal: (&Syncobj<'_>, u64),
         hdr: Option<&crate::hdr::Encoder>,
     ) -> Result<()> {
         match self {
             Backend::Gpu(g) => g.submit(scan.buffer(i), deadline_ns, signal),
+            Backend::Compute(c) => {
+                let pitch = c.width as usize * 4;
+                let (y0, y1) = rows.map_or((0, c.height), |(a, b)| (a.min(c.height), b.min(c.height)));
+                // The flip still needs its copy: one row at least.
+                let (y0, y1) = if y1 > y0 { (y0, y1) } else { (0, 1) };
+                let range = y0 as usize * pitch..y1 as usize * pitch;
+                let n = staging.len().min(c.target.len() * 4);
+                let range = range.start.min(n)..range.end.min(n);
+                for (d, w) in staging[range.clone()].chunks_exact_mut(4).zip(&c.target[range.start / 4..]) {
+                    d.copy_from_slice(&w.to_le_bytes());
+                }
+                if let Some(e) = hdr {
+                    e.encode(&mut staging[range.clone()]);
+                }
+                scan.upload_range(i, staging, range, deadline_ns, Some(signal))?;
+                Ok(())
+            }
             _ => {
                 self.read_pixels(staging)?;
                 if let Some(e) = hdr {
@@ -344,6 +373,11 @@ pub struct Compute {
     target: Vec<u32>,
     /// The frames last rendered, for hit-testing.
     last: Vec<(u32, Arc<fresco_compute::Frame>)>,
+    /// The layers `target` was last composed from: while they stay the
+    /// same, only where a surface changed is composed again.
+    composed: Option<Vec<Layer>>,
+    /// Where the last render changed `target` (see [`Backend::damage`]).
+    damage: Option<[u32; 4]>,
 }
 
 /// Where the installer puts frescod's precompiled Tier-2 kernels
@@ -422,6 +456,8 @@ impl Compute {
             held: HashMap::new(),
             target: vec![0; (width * height) as usize],
             last: Vec::new(),
+            composed: None,
+            damage: None,
         })
     }
 
@@ -434,35 +470,89 @@ impl Compute {
         if self.surfaces.layout(&sizes) {
             self.heap = vec![0; self.surfaces.words as usize];
             self.held.clear();
+            self.composed = None;
         }
         self.last.clear();
+        // Each surface's change this frame, in its own pixels.
+        let mut changed: HashMap<u32, [u32; 4]> = HashMap::new();
         for w in &f.windows {
             let s = self.surfaces.map[&w.id];
+            let whole = [0, 0, s[2], s[3]];
             if let Some(p) = &w.pixels {
-                // Drawn by the window's renderer, in its jail: copied in as is
-                // (the same drawing as last time means nothing changed).
-                let key = p.gen;
-                if self.held.get(&w.id).is_some_and(|h| h.as_slice() == [key]) {
-                    continue;
-                }
+                // Drawn by the window's renderer, in its jail: copied in as is,
+                // only where it differs from the drawing held.
+                let since = self.held.get(&w.id).and_then(|h| h.first()).and_then(|&g| p.changed_since(g));
                 let off = s[0] as usize;
-                self.heap[off..off + p.px.len()].copy_from_slice(&p.px);
-                self.held.insert(w.id, vec![key]);
+                match since {
+                    Some(None) => continue,
+                    Some(Some(r)) if p.px.len() == (s[2] * s[3]) as usize => {
+                        for y in r[1]..r[3].min(s[3]) {
+                            let (a, b) = ((y * s[2] + r[0]) as usize, (y * s[2] + r[2].min(s[2])) as usize);
+                            self.heap[off + a..off + b].copy_from_slice(&p.px[a..b]);
+                        }
+                        changed.insert(w.id, r);
+                    }
+                    _ => {
+                        self.heap[off..off + p.px.len()].copy_from_slice(&p.px);
+                        changed.insert(w.id, whole);
+                    }
+                }
+                self.held.insert(w.id, vec![p.gen]);
                 continue;
             }
             let frame = frame_of(&self.scene, w, s);
             self.last.push((w.id, frame.clone()));
             let sig = fresco_compute::damage::tile_signatures(&frame);
-            if self.held.get(&w.id) == Some(&sig) {
-                continue;
-            }
             let (off, len) = (s[0] as usize, (s[1] * s[3]) as usize);
-            self.t2.render(&frame, &mut self.heap[off..off + len])?;
+            let surface = &mut self.heap[off..off + len];
+            match self.held.get(&w.id) {
+                Some(h) if *h == sig => continue,
+                Some(h) if h.len() == sig.len() => {
+                    use fresco_compute::{damage, TILE};
+                    let h = &frame.header;
+                    let dirty = damage::dirty(&sig, self.held.get(&w.id).map(Vec::as_slice));
+                    let tiles = damage::rects(&dirty, h.tiles_x, h.tiles_y, 32);
+                    self.t2.render_tiles(&frame, surface, &tiles)?;
+                    let r = tiles.iter().map(|t| [t[0] * TILE, t[1] * TILE, (t[2] * TILE).min(s[2]), (t[3] * TILE).min(s[3])])
+                        .reduce(|a, b| [a[0].min(b[0]), a[1].min(b[1]), a[2].max(b[2]), a[3].max(b[3])]);
+                    if let Some(r) = r {
+                        changed.insert(w.id, r);
+                    }
+                }
+                _ => {
+                    self.t2.render(&frame, surface)?;
+                    changed.insert(w.id, whole);
+                }
+            }
             self.held.insert(w.id, sig);
         }
         let layers = self.surfaces.layers(&f.windows);
         let c = Compose::new(&layers, self.width, self.height, self.width, self.heap.len() as u32);
-        self.t2.compose(&c, &self.heap, &mut self.target)?;
+        if self.composed.as_ref() == Some(&layers) {
+            // The same stack: compose again only where a surface changed.
+            let rects: Vec<[u32; 4]> = f.windows.iter().zip(&layers)
+                .filter_map(|(w, l)| {
+                    let r = changed.get(&w.id)?;
+                    // The surface rect on screen, within the layer's rect.
+                    let (ox, oy) = (l.origin[0], l.origin[1]);
+                    let mut m = *l;
+                    m.rect = [
+                        (ox + r[0] as i32).max(l.rect[0]),
+                        (oy + r[1] as i32).max(l.rect[1]),
+                        (ox + r[2] as i32).min(l.rect[2]),
+                        (oy + r[3] as i32).min(l.rect[3]),
+                    ];
+                    on_screen(&m, self.width, self.height)
+                })
+                .collect();
+            log::trace!("compute: compose {} rects", rects.len());
+            self.t2.compose_rects(&c, &self.heap, &mut self.target, &rects)?;
+            self.damage = Some(rects.into_iter().reduce(union).unwrap_or([0; 4]));
+        } else {
+            self.t2.compose(&c, &self.heap, &mut self.target)?;
+            self.composed = Some(layers);
+            self.damage = None;
+        }
         Ok(())
     }
 }
@@ -579,6 +669,17 @@ fn on_screen(l: &Layer, w: u32, h: u32) -> Option<[u32; 4]> {
     let c = |v: i32, hi: u32| v.clamp(0, hi as i32) as u32;
     let r = [c(l.rect[0], w), c(l.rect[1], h), c(l.rect[2], w), c(l.rect[3], h)];
     (r[2] > r[0] && r[3] > r[1]).then_some(r)
+}
+
+/// The smallest rect holding `a` and `b`; an empty rect (`x0 >= x1` or
+/// `y0 >= y1`) holds nothing.
+pub fn union(a: [u32; 4], b: [u32; 4]) -> [u32; 4] {
+    let empty = |r: &[u32; 4]| r[0] >= r[2] || r[1] >= r[3];
+    match (empty(&a), empty(&b)) {
+        (true, _) => b,
+        (_, true) => a,
+        _ => [a[0].min(b[0]), a[1].min(b[1]), a[2].max(b[2]), a[3].max(b[3])],
+    }
 }
 
 /// Place `bytes` in `stage` at a 256-byte boundary; its offset.
@@ -807,4 +908,57 @@ impl<'a> GpuCompute<'a> {
 /// seconds).
 fn flip_wait_ms() -> u32 {
     std::env::var("FRESCOD_FLIP_TIMEOUT_MS").ok().and_then(|v| v.parse().ok()).unwrap_or(2000)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::pack::Pixels;
+
+    fn node(x: f32, y: f32, w: f32, h: f32, color: [f32; 4]) -> fresco_vulkan::SceneNode {
+        fresco_vulkan::SceneNode { position: [x, y], size: [w, h], color, radius: 0.0, _pad: [0.0; 3] }
+    }
+
+    fn input(px: &Arc<Pixels>, color: [f32; 4], bpos: (f32, f32)) -> ScreenInput {
+        let a = WindowFrame { id: 1, pos: (10.0, 10.0), size: (px.width, px.height), pixels: Some(px.clone()), ..Default::default() };
+        let b = WindowFrame {
+            id: 2,
+            pos: bpos,
+            size: (50, 40),
+            rects: vec![node(0.0, 0.0, 50.0, 40.0, [0.1, 0.2, 0.3, 1.0]), node(20.0, 5.0, 6.0, 12.0, color)],
+            ..Default::default()
+        };
+        ScreenInput { windows: vec![a, b], uploads: Vec::new(), clears: Vec::new() }
+    }
+
+    /// Drawing only what changed gives the same screen as drawing it all.
+    #[test]
+    fn incremental_frames_match_full_ones() {
+        let (w, h) = (128, 96);
+        let mut inc = Compute::new(w, h).expect("kernels");
+        let px1: Vec<u32> = (0..40 * 30).map(|i| 0xff00_0000 | i * 997).collect();
+        let p1 = Arc::new(Pixels { gen: 1, width: 40, height: 30, px: px1.clone(), seq: 1, since: Vec::new() });
+        inc.render(input(&p1, [1.0, 0.0, 0.0, 1.0], (60.0, 20.0))).unwrap();
+
+        // A: a 5x4 patch changes; B: its small rect turns green.
+        let mut px2 = px1.clone();
+        for y in 7..11 {
+            for x in 3..8 {
+                px2[y * 40 + x] = 0xff12_3456;
+            }
+        }
+        let p2 = Arc::new(Pixels { gen: 2, width: 40, height: 30, px: px2, seq: 2, since: vec![(1, [3, 7, 8, 11])] });
+        let check = |inc: &mut Compute, f: &dyn Fn() -> ScreenInput| {
+            inc.render(f()).unwrap();
+            let mut full = Compute::new(w, h).unwrap();
+            full.render(f()).unwrap();
+            assert!(inc.target == full.target, "incremental frame differs from a full one");
+        };
+        check(&mut inc, &|| input(&p2, [0.0, 1.0, 0.0, 1.0], (60.0, 20.0)));
+        // B moves: the stack changed, composed whole.
+        check(&mut inc, &|| input(&p2, [0.0, 1.0, 0.0, 1.0], (50.0, 30.0)));
+        // A drawing the consumer never held: copied whole.
+        let p3 = Arc::new(Pixels { gen: 9, width: 40, height: 30, px: vec![0xff77_7777; 1200], seq: 7, since: vec![(8, [0, 0, 1, 1])] });
+        check(&mut inc, &|| input(&p3, [0.0, 1.0, 0.0, 1.0], (50.0, 30.0)));
+    }
 }

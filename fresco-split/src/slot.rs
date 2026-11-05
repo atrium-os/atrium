@@ -14,7 +14,7 @@
 //!
 //! In pixel mode (`CLIENT.pixels`, the compute renderer) a slot holds the
 //! window's finished pixels instead: a 32-byte [`SlotHeader`]-sized header
-//! (magic `FRP1`, seq, width, height, zeros), then `width * height` BGRA8
+//! (magic `FRP1`, seq, width, height, damage rect or zeros), then `width * height` BGRA8
 //! words ([`write_pixels`], [`read_pixels`]). Any bytes are valid pixels, so
 //! the broker checks only the header against the size it decided.
 
@@ -144,41 +144,103 @@ pub fn pixel_slot_bytes(width: u32, height: u32) -> usize {
     SLOT_HDR + width as usize * height as usize * 4
 }
 
+/// A rect of window pixels, `[x0, y0, x1, y1)`.
+pub type Rect = [u32; 4];
+
 /// Write a window's pixels (`width * height` words) into `slot`. Renderer side.
 pub fn write_pixels(slot: &mut [u8], width: u32, height: u32, px: &[u32], seq: u32) -> Result<(), &'static str> {
+    write_pixels_damage(slot, width, height, px, seq, None, None)
+}
+
+/// [`write_pixels`], copying only `copy` of `px` (the slot already holds
+/// the rest of this drawing; `None` copies all) and telling the broker that
+/// the drawing differs from the one sent before it (`seq - 1`) only inside
+/// `damage` (`None`: anywhere). The slot always ends up holding the whole
+/// drawing, so a broker that does not have `seq - 1` reads it all.
+pub fn write_pixels_damage(
+    slot: &mut [u8],
+    width: u32,
+    height: u32,
+    px: &[u32],
+    seq: u32,
+    copy: Option<Rect>,
+    damage: Option<Rect>,
+) -> Result<(), &'static str> {
     let n = width as usize * height as usize;
     if px.len() != n || pixel_slot_bytes(width, height) > slot.len() {
         return Err("pixels larger than the slot");
     }
-    let hdr = [PIXELS_MAGIC, seq, width, height, 0, 0, 0, 0];
+    let fits = |r: &Rect| r[0] < r[2] && r[1] < r[3] && r[2] <= width && r[3] <= height;
+    if copy.is_some_and(|r| !fits(&r)) || damage.is_some_and(|r| !fits(&r)) {
+        return Err("rect outside the window");
+    }
+    let d = damage.unwrap_or([0; 4]);
+    let hdr = [PIXELS_MAGIC, seq, width, height, d[0], d[1], d[2], d[3]];
     slot[..SLOT_HDR].copy_from_slice(&bytes_of(&hdr));
-    slot[SLOT_HDR..SLOT_HDR + n * 4].copy_from_slice(&bytes_of(px));
+    let body = &mut slot[SLOT_HDR..SLOT_HDR + n * 4];
+    match copy {
+        None => body.copy_from_slice(&bytes_of(px)),
+        Some(r) => {
+            for y in r[1]..r[3] {
+                let (a, b) = ((y * width + r[0]) as usize, (y * width + r[2]) as usize);
+                body[a * 4..b * 4].copy_from_slice(&bytes_of(&px[a..b]));
+            }
+        }
+    }
     Ok(())
 }
 
-/// Copy a window's pixels out of `slot`. Broker side: read once, into broker
-/// memory; the header must name the size the broker decided.
-pub fn read_pixels(slot: &[u8], width: u32, height: u32) -> Result<(u32, Vec<u32>), String> {
+/// A pixel slot's header, checked against the size the broker decided:
+/// the sequence and the damage against `seq - 1` (`None`: the whole window).
+pub fn pixel_header(slot: &[u8], width: u32, height: u32) -> Result<(u32, Option<Rect>), String> {
     let bad = |m: &str| Err(format!("pixel slot: {m}"));
-    let n = width as usize * height as usize;
     if slot.len() < pixel_slot_bytes(width, height) {
         return bad("slot smaller than the window");
     }
-    let mut hdr = [0u8; SLOT_HDR];
-    hdr.copy_from_slice(&slot[..SLOT_HDR]);
-    let w: Vec<u32> = words(&hdr).collect();
+    let w: Vec<u32> = words(&slot[..SLOT_HDR]).collect();
     if w[0] != PIXELS_MAGIC {
         return bad("magic");
     }
     if w[2] != width || w[3] != height {
         return bad("not the size the broker gave the window");
     }
-    if w[4..].iter().any(|&x| x != 0) {
-        return bad("reserved words");
+    let d = [w[4], w[5], w[6], w[7]];
+    if d == [0; 4] {
+        return Ok((w[1], None));
     }
-    let mut px = vec![0u32; n];
-    for (d, c) in px.iter_mut().zip(slot[SLOT_HDR..SLOT_HDR + n * 4].chunks_exact(4)) {
-        *d = u32::from_le_bytes(c.try_into().unwrap());
+    if !(d[0] < d[2] && d[1] < d[3] && d[2] <= width && d[3] <= height) {
+        return bad("damage rect");
     }
-    Ok((w[1], px))
+    Ok((w[1], Some(d)))
+}
+
+/// Copy `only` (`None`: all) of the window's pixels out of `slot` into
+/// `dst` (`width * height` words). Broker side; check the header first
+/// ([`pixel_header`]).
+pub fn copy_pixels(slot: &[u8], width: u32, height: u32, dst: &mut [u32], only: Option<Rect>) -> Result<(), String> {
+    let n = width as usize * height as usize;
+    if dst.len() != n || slot.len() < pixel_slot_bytes(width, height) {
+        return Err("pixel slot: wrong size".into());
+    }
+    let r = only.unwrap_or([0, 0, width, height]);
+    if !(r[0] <= r[2] && r[1] <= r[3] && r[2] <= width && r[3] <= height) {
+        return Err("pixel slot: rect outside the window".into());
+    }
+    let body = &slot[SLOT_HDR..SLOT_HDR + n * 4];
+    for y in r[1]..r[3] {
+        let (a, b) = ((y * width + r[0]) as usize, (y * width + r[2]) as usize);
+        for (d, c) in dst[a..b].iter_mut().zip(body[a * 4..b * 4].chunks_exact(4)) {
+            *d = u32::from_le_bytes(c.try_into().unwrap());
+        }
+    }
+    Ok(())
+}
+
+/// Copy a window's pixels out of `slot`. Broker side: read once, into broker
+/// memory; the header must name the size the broker decided.
+pub fn read_pixels(slot: &[u8], width: u32, height: u32) -> Result<(u32, Vec<u32>), String> {
+    let (seq, _) = pixel_header(slot, width, height)?;
+    let mut px = vec![0u32; width as usize * height as usize];
+    copy_pixels(slot, width, height, &mut px, None)?;
+    Ok((seq, px))
 }

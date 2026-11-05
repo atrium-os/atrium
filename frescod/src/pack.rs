@@ -38,9 +38,28 @@ pub struct Pixels {
     pub width: u32,
     pub height: u32,
     pub px: Vec<u32>,
+    /// The renderer's sequence number for this drawing.
+    pub seq: u32,
+    /// What changed since earlier drawings: `(gen, rect)` says this one
+    /// differs from drawing `gen` only inside `rect` (window pixels,
+    /// `[x0, y0, x1, y1)`). Newest first, a few deep; a consumer holding
+    /// a drawing not listed takes the whole window.
+    pub since: Vec<(u64, [u32; 4])>,
 }
 
+/// How many earlier drawings [`Pixels::since`] reaches back.
+pub const SINCE_DEPTH: usize = 6;
+
 impl Pixels {
+    /// Where this drawing differs from drawing `gen`: `Some(None)` nowhere
+    /// (it is that drawing), `Some(Some(rect))` inside `rect`, `None`
+    /// unknown (anywhere).
+    pub fn changed_since(&self, gen: u64) -> Option<Option<[u32; 4]>> {
+        if gen == self.gen {
+            return Some(None);
+        }
+        self.since.iter().find(|(g, _)| *g == gen).map(|&(_, r)| Some(r))
+    }
     /// The alpha of pixel (x, y), 0 outside.
     pub fn alpha_at(&self, x: u32, y: u32) -> u8 {
         if x >= self.width || y >= self.height {

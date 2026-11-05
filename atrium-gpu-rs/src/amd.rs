@@ -791,9 +791,28 @@ impl<'a> Scanout<'a> {
         deadline_ns: u32,
         signal: Option<(&Syncobj<'_>, u64)>,
     ) -> io::Result<()> {
-        self.staging.write(0, pixels)?;
-        let src = self.staging.gpu_va();
-        let dst = self.buffers[i].gpu_va();
+        self.upload_range(i, pixels, 0..pixels.len(), deadline_ns, signal)
+    }
+
+    /// Like [`Scanout::upload`], but only bytes `range` of `pixels` (the
+    /// whole frame) go up, to the same offsets in buffer `i`; the rest of
+    /// it keeps what it holds.
+    pub fn upload_range(
+        &self,
+        i: usize,
+        pixels: &[u8],
+        range: std::ops::Range<usize>,
+        deadline_ns: u32,
+        signal: Option<(&Syncobj<'_>, u64)>,
+    ) -> io::Result<()> {
+        if range.start >= range.end || range.end > pixels.len() || range.end as u64 > self.size {
+            return Err(io::Error::new(io::ErrorKind::InvalidInput, "upload range outside the frame"));
+        }
+        let off = range.start as u64;
+        let pixels = &pixels[range];
+        self.staging.write(off, pixels)?;
+        let src = self.staging.gpu_va() + off;
+        let dst = self.buffers[i].gpu_va() + off;
         // The EOP fence lands in the ring BO's second half (never executed).
         let fence = self.ring.gpu_va() + 2048;
         let words: [u32; 14] = [

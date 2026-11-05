@@ -530,18 +530,14 @@ impl Broker {
             }
             Msg::FrameReady { slot: s, .. } => {
                 if self.pixels {
-                    let got = {
+                    let (global, (width, height)) = {
                         let wins = r.wins.lock().unwrap();
                         let w = wins.get(&local).ok_or_else(|| format!("frame for unknown window {local}"))?;
-                        (w.global, w.told, slot::read_pixels(w.slots[s as usize].as_slice(), w.told.0, w.told.1))
+                        (w.global, w.told)
                     };
-                    match got {
-                        (global, (width, height), Ok((_, px))) => {
-                            log::debug!("frescod: client {} window {local}: {width}x{height} pixels, {} opaque", r.client_id, px.iter().filter(|&&p| p >> 24 != 0).count());
-                            self.drawn.lock().unwrap().insert(global as u32, Arc::new(crate::pack::Pixels { gen: self.drawings.fetch_add(1, std::sync::atomic::Ordering::Relaxed), width, height, px }));
-                            self.redraw.wake();
-                        }
-                        (_, _, Err(e)) => log::debug!("frescod: client {} window {local}: {e}", r.client_id),
+                    match self.take_pixels(r, local, global, width, height, s as usize) {
+                        Ok(()) => self.redraw.wake(),
+                        Err(e) => log::debug!("frescod: client {} window {local}: {e}", r.client_id),
                     }
                     r.tell(&Msg::FrameDone { window: local, slot: s }, &[])?;
                     return Ok(());
@@ -564,6 +560,51 @@ impl Broker {
             }
             _ => unreachable!("serve() admits only a renderer's records"),
         }
+        Ok(())
+    }
+
+    /// Take a window's drawing from slot `s`: only its damage when the
+    /// drawing it follows is the one held (patched in place when nothing
+    /// else holds that one), else all of it.
+    fn take_pixels(&self, r: &Renderer, local: u32, global: u16, width: u32, height: u32, s: usize) -> std::result::Result<(), String> {
+        use crate::pack::{Pixels, SINCE_DEPTH};
+        use std::sync::atomic::Ordering::Relaxed;
+        let wins = r.wins.lock().unwrap();
+        let w = wins.get(&local).ok_or_else(|| format!("frame for unknown window {local}"))?;
+        let slot = w.slots[s].as_slice();
+        let (seq, damage) = slot::pixel_header(slot, width, height)?;
+        let gen = self.drawings.fetch_add(1, Relaxed);
+        let mut drawn = self.drawn.lock().unwrap();
+        let follows = |p: &Pixels| p.width == width && p.height == height && p.seq == seq.wrapping_sub(1);
+        if let (Some(d), Some(prev)) = (damage, drawn.get_mut(&(global as u32))) {
+            if follows(prev) {
+                let since = |p: &Pixels| {
+                    let mut v = vec![(p.gen, d)];
+                    let u = |r: [u32; 4]| [r[0].min(d[0]), r[1].min(d[1]), r[2].max(d[2]), r[3].max(d[3])];
+                    v.extend(p.since.iter().map(|&(g, r)| (g, u(r))));
+                    v.truncate(SINCE_DEPTH);
+                    v
+                };
+                if let Some(p) = Arc::get_mut(prev) {
+                    // Nothing else holds it: patch it in place.
+                    slot::copy_pixels(slot, width, height, &mut p.px, Some(d))?;
+                    p.since = since(p);
+                    p.gen = gen;
+                    p.seq = seq;
+                } else {
+                    let mut px = prev.px.clone();
+                    slot::copy_pixels(slot, width, height, &mut px, Some(d))?;
+                    let since = since(prev);
+                    *prev = Arc::new(Pixels { gen, width, height, px, seq, since });
+                }
+                return Ok(());
+            }
+        }
+        drop(drawn);
+        let mut px = vec![0u32; width as usize * height as usize];
+        slot::copy_pixels(slot, width, height, &mut px, None)?;
+        log::debug!("frescod: client {} window {local}: {width}x{height} pixels, whole", r.client_id);
+        self.drawn.lock().unwrap().insert(global as u32, Arc::new(Pixels { gen, width, height, px, seq, since: Vec::new() }));
         Ok(())
     }
 

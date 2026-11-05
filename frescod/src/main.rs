@@ -523,6 +523,13 @@ fn main() -> std::io::Result<()> {
         let t_render = Instant::now();
         render_one_frame(&mut renderer, &frontend, &comp, split.as_deref(), dw, dh)
             .map_err(io_other)?;
+        let damage = renderer.damage();
+        for h in heads.iter_mut() {
+            h.dirty.add(damage);
+            if reset_due {
+                h.dirty.forget();
+            }
+        }
         if multi {
             renderer.read_pixels(&mut framebuffer).map_err(io_other)?;
         }
@@ -686,16 +693,31 @@ fn present_head(
 ) -> std::io::Result<()> {
     let back = (h.on_screen + 1) % h.scan.len();
     let next = h.frame + 1;
+    /* Only the rows this buffer lacks go up. */
+    let lacks = heads::Dirty::take(h, back);
     match renderer {
-        Some(r) => r
-            .present(&h.scan, back, desktop, deadline_ns, (&h.copy_done, next), h.hdr_on.then_some(enc))
-            .map_err(io_other)?,
+        Some(r) => {
+            let rows = lacks.map(|d| (d[1], d[3]));
+            r.present(&h.scan, back, desktop, rows, deadline_ns, (&h.copy_done, next), h.hdr_on.then_some(enc))
+                .map_err(io_other)?
+        }
         None => {
             outputs::crop_fit(desktop, desktop_w, &h.vp, &mut h.staging, h.mode.width, h.mode.height);
             if h.hdr_on {
                 enc.encode(&mut h.staging);
             }
-            h.scan.upload(back, &h.staging, deadline_ns, Some((&h.copy_done, next)))?;
+            /* Rows map one to one unless the head scales (a mirror). */
+            let pitch = h.mode.width as usize * 4;
+            let same = h.vp.width == h.mode.width && h.vp.height == h.mode.height;
+            let range = match lacks.filter(|_| same) {
+                Some(d) => {
+                    let y0 = d[1].max(h.vp.y).saturating_sub(h.vp.y).min(h.mode.height);
+                    let y1 = d[3].min(h.vp.y + h.vp.height).saturating_sub(h.vp.y).min(h.mode.height);
+                    if y1 > y0 { y0 as usize * pitch..y1 as usize * pitch } else { 0..pitch }
+                }
+                None => 0..h.staging.len(),
+            };
+            h.scan.upload_range(back, &h.staging, range, deadline_ns, Some((&h.copy_done, next)))?;
         }
     }
     let mut c = OutputCommit::flip(h.output, Some(h.scan.buffer(back)), true);

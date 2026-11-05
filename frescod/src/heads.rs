@@ -47,6 +47,48 @@ pub struct Head<'a> {
     /// The monitor (identity) this head mirrors: it shows that head's part
     /// of the desktop (its `vp` is the source's) instead of a part of its own.
     pub mirror_of: Option<u64>,
+    /// Where each scanout buffer differs from the newest desktop frame.
+    pub dirty: Dirty,
+}
+
+/// Per scanout buffer, the desktop rect where it differs from the newest
+/// desktop frame (`None`: anywhere), so a present copies up only that.
+#[derive(Default)]
+pub struct Dirty {
+    /// What the buffers were filled for (buffer, HDR, place, mode): when
+    /// it changes, every buffer is stale.
+    key: Option<(u64, bool, Viewport, u32, u32)>,
+    bufs: Vec<Option<[u32; 4]>>,
+}
+
+impl Dirty {
+    /// A new desktop frame changed `d` (`None`: anywhere).
+    pub fn add(&mut self, d: Option<[u32; 4]>) {
+        for b in &mut self.bufs {
+            *b = match (*b, d) {
+                (Some(a), Some(d)) => Some(crate::render_backend::union(a, d)),
+                _ => None,
+            };
+        }
+    }
+
+    /// Every buffer stale.
+    pub fn forget(&mut self) {
+        self.bufs.iter_mut().for_each(|b| *b = None);
+    }
+
+    /// What buffer `i` of `h` lacks (`None`: all of it); from now on it
+    /// holds the newest frame.
+    pub fn take(h: &mut Head<'_>, i: usize) -> Option<[u32; 4]> {
+        let key = (h.scan.buffer(0).gpu_va(), h.hdr_on, h.vp, h.mode.width, h.mode.height);
+        let n = h.scan.len();
+        let d = &mut h.dirty;
+        if d.key != Some(key) || d.bufs.len() != n {
+            d.key = Some(key);
+            d.bufs = vec![None; n];
+        }
+        std::mem::replace(&mut d.bufs[i], Some([0; 4]))
+    }
 }
 
 impl Head<'_> {
@@ -306,6 +348,7 @@ pub fn reconfigure<'a>(
                     stale: true,
                     present: true,
                     mirror_of: None,
+                    dirty: Dirty::default(),
                     conn: p.conn,
                 });
             }
