@@ -73,7 +73,6 @@
 static void
 amd_get_caps(struct atrium_amd_softc *sc, struct atrium_gpu_backend_caps *c)
 {
-	(void)sc;
 	c->vendor = "Atrium AMD RDNA4 (gpusim)";
 	c->features = ATRIUM_GPU_FEAT_GRAPHICS | ATRIUM_GPU_FEAT_COMPUTE |
 	    ATRIUM_GPU_FEAT_USER_QUEUES | ATRIUM_GPU_FEAT_SYNCOBJ |
@@ -81,7 +80,7 @@ amd_get_caps(struct atrium_amd_softc *sc, struct atrium_gpu_backend_caps *c)
 	c->va_base = ATRIUM_AMD_BO_VA_BASE;
 	c->va_size = (uint64_t)ATRIUM_AMD_VM_MAX_BO * PAGE_SIZE;
 	c->va_align = PAGE_SIZE;
-	c->vram_bytes = ATRIUM_AMD_VRAM_BYTES;
+	c->vram_bytes = sc->vram.total;
 	c->bind_features = ATRIUM_GPU_BIND_FEAT_READ_ONLY;
 	/* gpusim models the R9700 (Navi 48, gfx1201). */
 	c->isa_family = ATRIUM_GPU_ISA_AMD_RDNA4;
@@ -102,6 +101,7 @@ amd_gpu_reset_restore(struct atrium_amd_softc *sc)
 	amd_firmware_load(sc);
 	amd_mes_init(sc);
 	amd_hwq_reset_restore(sc);	/* lets submits through again */
+	amd_clear_reset_restore(sc);	/* and VRAM scrubs */
 }
 
 /*
@@ -112,6 +112,8 @@ amd_gpu_reset_restore(struct atrium_amd_softc *sc)
 static void
 amd_gpu_reset_prepare(struct atrium_amd_softc *sc)
 {
+	/* Clear lock first, released last (restore reaps under hwq locks). */
+	amd_clear_reset_prepare(sc);	/* no VRAM scrub across the FLR */
 	amd_hwq_reset_prepare(sc);
 }
 
@@ -185,7 +187,9 @@ amd_teardown(struct atrium_amd_softc *sc)
 		destroy_dev(sc->cdev);
 		sc->cdev = NULL;
 	}
-	/* After destroy_dev: no ioctl, mmap or cdevpriv dtor is still running. */
+	/* After destroy_dev: no ioctl, mmap or cdevpriv dtor is still running.
+	 * The clear engine goes first: it uses the null page directory. */
+	amd_clear_fini(sc);
 	amd_hwq_fini(sc);
 	/*
 	 * Reset this module's footprint in the SHARED softc back to the pristine
@@ -305,6 +309,15 @@ atrium_amd_attach(device_t dev)
 		amd_teardown(sc);
 		return (err);
 	}
+
+	/*
+	 * The VRAM clear engine (clear.c): from here freed VRAM is scrubbed by
+	 * the GPU and goes back into circulation. Without it, freed VRAM is
+	 * only held back, never reused unscrubbed, so this is not fatal.
+	 */
+	if ((err = amd_clear_init(sc)) != 0)
+		device_printf(dev, "VRAM clear engine init failed (%d): freed "
+		    "VRAM will not be reused\n", err);
 
 	/*
 	 * Register this module's IH cause handler: the base ISR routes every

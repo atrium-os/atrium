@@ -93,6 +93,36 @@ list. So in the rare case of a lap completing while old work is in flight,
 the reused VA can only receive writes from that same VM's own earlier work.
 It can never receive another VM's writes.
 
+## Device memory (VRAM)
+
+Freed VRAM can hold the last owner's pixels, so it never goes to anyone
+unscrubbed. `vram.c` (base module) is the device allocator: a `vmem(9)` arena
+of clean VRAM. Freeing a VRAM BO, which bo.c does only after every queue that
+could reach it has drained (break 2), puts the range on a dirty list. The
+allocator's own thread hands each dirty range to the clear engine and only
+then returns it to the arena. An allocation that finds too little clean VRAM
+while a scrub is pending waits up to 5 s for it before `ENOMEM`.
+
+The clear engine is the per-architecture part. `clear.c` (gpu module) is the
+amd one: a CP `DMA_DATA` fill (`SRC_SEL = DATA`, value 0) on compute HQD 2
+under VMID 0. Both belong to the kernel alone: HQD 2 is not in `sc->hwq[]`, so
+no client can submit to, map or mmap it, and `vm.c` hands out VMIDs 1..15. Its
+page directory maps one System page (ring and fence) and a 64 MiB window that
+is re-pointed at each range. The CPU never writes VRAM. If a clear fails or
+times out (2 s per window), the range stays dirty and is retried every second.
+It is never handed out unscrubbed. With no clear engine loaded, freed VRAM is
+held back, not reused.
+
+Sizes come from the device: `CONFIG_MEMSIZE` for VRAM, BAR0 for the CPU
+window. They differ on a small-BAR card (gpusim: 8 GiB behind 256 MiB).
+Allocations go above the window first, keeping it for what must be
+CPU-visible (`AMD_VRAM_CPU_VISIBLE`; nothing needs it yet). Counters are under
+`sysctl dev.atrium_gpu_amd_pci.0.vram`. Test: `test_gpu_isolation` part F
+(a VRAM BO filled with a sentinel, freed, then reallocated by another client,
+must read zero; then 1.1x the device's VRAM is churned in 64 MiB BOs with no
+`ENOMEM` and no failed scrub). Lock order: the clear lock comes before the
+hwq locks (a device reset takes it first and drops it last).
+
 ## Known limits (not isolation breaks, but worth knowing)
 
 - The device still has only two shared queues (gfx and compute). A client

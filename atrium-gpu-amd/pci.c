@@ -34,6 +34,7 @@ atrium_amd_pci_probe(device_t dev)
 static void
 atrium_amd_pci_teardown(struct atrium_amd_softc *sc)
 {
+	amd_vram_fini(sc);
 	/* Unhook the ISR + free the IH ring before the MSI-X vectors it used. */
 	amd_irq_teardown(sc);
 	amd_ih_fini(sc);
@@ -136,6 +137,17 @@ atrium_amd_pci_attach(device_t dev)
 	 */
 	if (amd_flr(sc) != 0)
 		device_printf(dev, "cold FLR failed — continuing\n");
+
+	/*
+	 * The device VRAM allocator: sized from the device (CONFIG_MEMSIZE) and
+	 * BAR0, before any child can allocate. The gpu child registers the
+	 * clear engine that scrubs freed VRAM (vram.c).
+	 */
+	if (amd_vram_init(sc) != 0) {
+		device_printf(dev, "VRAM allocator init failed\n");
+		atrium_amd_pci_teardown(sc);
+		return (ENXIO);
+	}
 
 	/*
 	 * Stand up the device-global IH ring + hook the single ISR HERE, in the

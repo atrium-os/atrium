@@ -11,86 +11,6 @@
 #include "atrium_gpu_amd.h"
 #include "atrium_gpu_amd_abi.h"	/* ATRIUM_GPU_BO_VRAM placement flag */
 
-/* --- per-client VRAM reuse (see struct amd_vram_pool) -------------------- */
-
-static MALLOC_DEFINE(M_AMD_VRAM_POOL, "atrium_vram_pool", "freed VRAM per client");
-
-struct amd_vram_pool *
-amd_vram_pool_new(void)
-{
-	struct amd_vram_pool *p;
-
-	p = malloc(sizeof(*p), M_AMD_VRAM_POOL, M_WAITOK | M_ZERO);
-	refcount_init(&p->refs, 1);
-	mtx_init(&p->lock, "atrium_vram_pool", NULL, MTX_DEF);
-	return (p);
-}
-
-void
-amd_vram_pool_rele(struct amd_vram_pool *p)
-{
-	if (p == NULL || !refcount_release(&p->refs))
-		return;
-	mtx_destroy(&p->lock);
-	free(p, M_AMD_VRAM_POOL);
-}
-
-/* Give [off, off+size) back to the pool, merged with its neighbours. A pool
- * with no free slot drops the range (lost, as freed VRAM always was). */
-static void
-amd_vram_pool_put(struct amd_vram_pool *p, uint64_t off, uint64_t size)
-{
-	int i, merged;
-
-	mtx_lock(&p->lock);
-	do {
-		merged = 0;
-		for (i = 0; i < p->n; i++) {
-			if (p->free[i].off + p->free[i].size == off) {
-				off = p->free[i].off;
-				size += p->free[i].size;
-			} else if (off + size == p->free[i].off) {
-				size += p->free[i].size;
-			} else
-				continue;
-			p->free[i] = p->free[--p->n];
-			merged = 1;
-			break;
-		}
-	} while (merged);
-	if (p->n < AMD_VRAM_POOL_SLOTS) {
-		p->free[p->n].off = off;
-		p->free[p->n].size = size;
-		p->n++;
-	}
-	mtx_unlock(&p->lock);
-}
-
-/* Take `size` bytes from the pool (best fit). Returns whether it did. */
-static int
-amd_vram_pool_take(struct amd_vram_pool *p, uint64_t size, uint64_t *off)
-{
-	int i, best = -1;
-
-	if (p == NULL)
-		return (0);
-	mtx_lock(&p->lock);
-	for (i = 0; i < p->n; i++)
-		if (p->free[i].size >= size &&
-		    (best < 0 || p->free[i].size < p->free[best].size))
-			best = i;
-	if (best >= 0) {
-		*off = p->free[best].off;
-		p->free[best].off += size;
-		p->free[best].size -= size;
-		if (p->free[best].size == 0)
-			p->free[best] = p->free[--p->n];
-		p->reused += size;
-	}
-	mtx_unlock(&p->lock);
-	return (best >= 0);
-}
-
 /*
  * bus_dmamap_load callback: record each page's bus address. With a tag whose
  * maxsegsz == PAGE_SIZE the loader hands us one segment per page, so the GPUVM
@@ -267,7 +187,7 @@ const struct fileops atrium_amd_bo_fileops = {
 
 /*
  * amd backend: allocate a BO's backing store into a (front-end-owned) bo.
- * VRAM-resident BOs bump-allocate device-local pages (no bus_dma / no CPU map —
+ * VRAM-resident BOs carve device-local pages from vram.c (no bus_dma / no CPU map —
  * VRAM is GPU-only; userspace populates it with a GPU copy from a System staging
  * BO; pages[] hold VRAM offsets). System BOs go through bus_dma(9) — the real-
  * silicon path (proper bus addresses, IOMMU-ready), one page-granular segment
@@ -300,16 +220,13 @@ amd_bo_backing_alloc(struct atrium_amd_softc *sc, struct atrium_amd_bo *bo,
 		uint64_t vram_off;
 		int i;
 
-		/* The client's own freed VRAM first, then a fresh carve from
-		 * the device VRAM pool (base-owned — see vram.c). */
-		if (!amd_vram_pool_take(bo->vram_pool, rounded, &vram_off) &&
-		    amd_vram_alloc(sc, rounded, &vram_off) != 0) {
+		/* Carve from the device VRAM allocator (base-owned, vram.c):
+		 * clean VRAM only, never what another client left behind. */
+		if (amd_vram_alloc(sc, rounded, 0, &vram_off) != 0) {
 			free(bo->pages, M_DEVBUF);
 			bo->pages = NULL;
 			return (ENOMEM);
 		}
-		if (bo->vram_pool != NULL)
-			refcount_acquire(&bo->vram_pool->refs);
 		mtx_lock(&sc->lock);
 		sc->bo_count++;
 		mtx_unlock(&sc->lock);
@@ -383,9 +300,9 @@ amd_export_scanout(struct atrium_amd_bo *bo, uint64_t *vram_offset,
 	return (0);
 }
 
-/* amd backend: release a BO's backing store (the bus_dma System path; VRAM
- * goes back to its creator's pool, see amd_vram_pool) and drop the device's
- * BO count. */
+/* amd backend: release a BO's backing store and drop the device's BO count.
+ * VRAM goes back to the device allocator, which scrubs it before anyone can
+ * have it again; we only get here once no queue can still reach it. */
 void
 amd_bo_backing_free(struct atrium_amd_bo *bo)
 {
@@ -394,12 +311,8 @@ amd_bo_backing_free(struct atrium_amd_bo *bo)
 	mtx_lock(&sc->lock);
 	sc->bo_count--;
 	mtx_unlock(&sc->lock);
-	if (bo->vram && bo->pages != NULL && bo->vram_pool != NULL) {
-		amd_vram_pool_put(bo->vram_pool, bo->pages[0],
-		    (uint64_t)bo->npages * PAGE_SIZE);
-		amd_vram_pool_rele(bo->vram_pool);
-		bo->vram_pool = NULL;
-	}
+	if (bo->vram && bo->pages != NULL)
+		amd_vram_free(sc, bo->pages[0], (uint64_t)bo->npages * PAGE_SIZE);
 	if (bo->kva != NULL) {
 		bus_dmamap_unload(bo->dmat, bo->dmamap);
 		bus_dmamem_free(bo->dmat, bo->kva, bo->dmamap);
@@ -420,7 +333,7 @@ amd_bo_backing_free(struct atrium_amd_bo *bo)
  */
 int
 amd_bo_create_fd(struct atrium_amd_softc *sc, struct thread *td, uint64_t size,
-    uint32_t flags, struct amd_vram_pool *pool, int *out_fd)
+    uint32_t flags, int *out_fd)
 {
 	struct atrium_amd_bo *bo;
 	struct file *fp;
@@ -428,14 +341,11 @@ amd_bo_create_fd(struct atrium_amd_softc *sc, struct thread *td, uint64_t size,
 
 	bo = malloc(sizeof(*bo), M_DEVBUF, M_WAITOK | M_ZERO);
 	bo->sc = sc;
-	bo->vram_pool = pool;	/* referenced by bo_alloc if it takes VRAM */
 	err = sc->backend->bo_alloc(sc, bo, size, flags);
 	if (err != 0) {
 		free(bo, M_DEVBUF);	/* bo_alloc unwound its own backing */
 		return (err);
 	}
-	if (!bo->vram)
-		bo->vram_pool = NULL;
 
 	err = falloc_noinstall(td, &fp);
 	if (err != 0) {

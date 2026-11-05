@@ -13,6 +13,7 @@
  *   cc -Wall -o /tmp/test_gpu_isolation tests/test_gpu_isolation.c
  *   /tmp/test_gpu_isolation [--attest]
  * --attest prints the jaild.policy.toml stanza for this build on success.
+ * Part F (VRAM scrubbing) needs gpusim with DMA_DATA fill (see gpusim pm4.rs).
  */
 #include "atrium_gpu_amd_abi.h"
 #include "atrium_display_abi.h"
@@ -987,6 +988,168 @@ part_e(void)
 		close(fd);
 }
 
+/* ---------------------------------------------------------------------------
+ * Part F: freed VRAM is scrubbed before anyone else gets it (vram.c, clear.c).
+ */
+#define VRAM	"dev.atrium_gpu_amd_pci.0.vram."
+
+static uint64_t
+vram(const char *name)
+{
+	char oid[128];
+	uint64_t v = 0;
+	size_t len = sizeof(v);
+
+	snprintf(oid, sizeof(oid), VRAM "%s", name);
+	if (sysctlbyname(oid, &v, &len, NULL, 0) != 0) {
+		fprintf(stderr, "sysctl %s: %s\n", oid, strerror(errno));
+		exit(2);
+	}
+	return (v);
+}
+
+static int
+bo_read(int fd, int bo, void *dst, uint64_t len)
+{
+	struct atrium_gpu_bo_xfer x;
+
+	memset(&x, 0, sizeof(x));
+	x.bo_fd = bo;
+	x.len = len;
+	x.user_ptr = (uint64_t)(uintptr_t)dst;
+	return (ioctl(fd, ATRIUM_GPU_IOC_BO_READ, &x) == 0 ? 0 : errno);
+}
+
+/* DMA_DATA copy src_va -> dst_va (bytes) on gfx; returns the submit errno. */
+static int
+gpu_copy(int fd, int vm, uint64_t src_va, uint64_t dst_va, uint32_t bytes)
+{
+	uint32_t r[7];
+	uint64_t ring_va;
+	int ring = bo_new(fd, vm, 4096, 0, &ring_va), err;
+
+	r[0] = type3(IT_DMA_DATA, 6);
+	r[1] = 0;
+	r[2] = (uint32_t)(src_va & 0xffffffff);
+	r[3] = (uint32_t)(src_va >> 32);
+	r[4] = (uint32_t)(dst_va & 0xffffffff);
+	r[5] = (uint32_t)(dst_va >> 32);
+	r[6] = bytes;
+	bo_write(fd, ring, r, sizeof(r));
+	err = submit(fd, vm, ring, 7, ATRIUM_GPU_ENGINE_GFX);
+	close(ring);
+	return (err);
+}
+
+/* Wait (up to `ms`) for every freed VRAM range to be scrubbed. */
+static int
+vram_settle(int ms)
+{
+	double end = now_s() + ms / 1000.0;
+
+	while (vram("dirty") != 0) {
+		if (now_s() > end)
+			return (0);
+		usleep(10 * 1000);
+	}
+	return (1);
+}
+
+#define F_BYTES	(64 * 1024)
+
+static void
+part_f(void)
+{
+	static uint32_t buf[F_BYTES / 4];
+	uint64_t used0, scrubbed0, enomem0, total, sva, vva, i, cycles;
+	int fda, fdb, vma, vmb, stage, v, w, ok, n, err;
+	double t0;
+
+	printf("Part F: freed VRAM is scrubbed before reuse\n");
+	CHECK(vram("clear_engine") == 1, "a VRAM clear engine is registered");
+	total = vram("total");
+	printf("       (VRAM %llu MiB, %llu MiB CPU-visible)\n",
+	    (unsigned long long)(total >> 20),
+	    (unsigned long long)(vram("visible") >> 20));
+	vram_settle(5000);
+	used0 = vram("used");
+	scrubbed0 = vram("scrubbed");
+	enomem0 = vram("enomem");
+
+	/* A fills a VRAM BO with the sentinel (GPU copy from System). */
+	fda = xopen(GPU);
+	vma = vm_create(fda);
+	stage = bo_new(fda, vma, F_BYTES, 0, &sva);
+	v = bo_new(fda, vma, F_BYTES, ATRIUM_GPU_BO_VRAM, &vva);
+	for (i = 0; i < F_BYTES / 4; i++)
+		buf[i] = SENTINEL;
+	bo_write(fda, stage, buf, F_BYTES);
+	err = gpu_copy(fda, vma, sva, vva, F_BYTES);
+	memset(buf, 0, sizeof(buf));
+	bo_write(fda, stage, buf, F_BYTES);
+	err = err != 0 ? err : gpu_copy(fda, vma, vva, sva, F_BYTES);
+	bo_read(fda, stage, buf, F_BYTES);
+	CHECK(err == 0 && buf[0] == SENTINEL && buf[F_BYTES / 4 - 1] == SENTINEL,
+	    "A's VRAM BO holds the sentinel (round trip through the GPU)");
+	CHECK(vram("used") == used0 + F_BYTES, "VRAM in use grew by A's BO");
+
+	/* A frees it: it is dirty, then scrubbed by the GPU. */
+	close(v);
+	close(stage);
+	close(vma);
+	close(fda);
+	ok = vram_settle(5000);
+	CHECK(ok && vram("used") == used0 &&
+	    vram("scrubbed") >= scrubbed0 + F_BYTES,
+	    "A's freed VRAM was scrubbed (%llu KiB) and is free again",
+	    (unsigned long long)((vram("scrubbed") - scrubbed0) >> 10));
+
+	/* B takes VRAM of the same size: it must read all zero. */
+	fdb = xopen(GPU);
+	vmb = vm_create(fdb);
+	stage = bo_new(fdb, vmb, F_BYTES, 0, &sva);
+	w = bo_new(fdb, vmb, F_BYTES, ATRIUM_GPU_BO_VRAM, &vva);
+	for (i = 0; i < F_BYTES / 4; i++)
+		buf[i] = 0xffffffffu;
+	bo_write(fdb, stage, buf, F_BYTES);
+	err = gpu_copy(fdb, vmb, vva, sva, F_BYTES);
+	bo_read(fdb, stage, buf, F_BYTES);
+	for (i = 0, n = 0; i < F_BYTES / 4; i++)
+		if (buf[i] != 0)
+			n++;
+	CHECK(err == 0 && n == 0, "B's new VRAM BO reads zero (%d non-zero "
+	    "dwords, none may be A's sentinel)", n);
+	close(w);
+	close(stage);
+
+	/* Churn: allocate and free more VRAM than the device has, 64 MiB at a
+	 * time. A bump allocator runs dry; a reusing one never does. */
+	t0 = now_s();
+	cycles = total / (64ULL << 20) + 16;
+	for (i = 0, n = 0; i < cycles; i++) {
+		struct atrium_gpu_bo_alloc a;
+
+		memset(&a, 0, sizeof(a));
+		a.size = 64ULL << 20;
+		a.flags = ATRIUM_GPU_BO_VRAM;
+		if (ioctl(fdb, ATRIUM_GPU_IOC_BO_ALLOC, &a) != 0) {
+			n++;
+			break;
+		}
+		close((int)a.bo_fd);
+	}
+	ok = vram_settle(10000);
+	CHECK(n == 0 && ok, "allocated and freed %llu MiB of VRAM (%.1fx the "
+	    "device) in %.1f s with no ENOMEM",
+	    (unsigned long long)(i * 64), (double)(i * (64ULL << 20)) / total,
+	    now_s() - t0);
+	CHECK(vram("used") == used0 && vram("enomem") == enomem0 &&
+	    vram("scrub_failed") == 0,
+	    "VRAM in use is back where it started; no scrub failed");
+	close(vmb);
+	close(fdb);
+}
+
 static void
 attest(void)
 {
@@ -1025,6 +1188,7 @@ main(int argc, char **argv)
 	part_c();
 	part_d();
 	part_e();
+	part_f();
 	if (argc > 1 && strcmp(argv[1], "--attest") == 0)
 		attest();
 	printf(failures == 0 ? "ALL OK\n" : "%d FAILURES\n", failures);

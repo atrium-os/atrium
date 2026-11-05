@@ -38,7 +38,6 @@
 #include <machine/resource.h>
 
 #include <sys/sx.h>
-#include <sys/refcount.h>
 #include <sys/vmem.h>
 #include <sys/sysctl.h>
 #include <sys/taskqueue.h>
@@ -56,6 +55,7 @@
 /* BAR5 = 256 KiB MMIO register file; BAR2 = the doorbell page (dev-ref §2,§5). */
 #define ATRIUM_AMD_REGS_BAR	PCIR_BAR(5)
 #define ATRIUM_AMD_DOORBELL_BAR	PCIR_BAR(2)
+#define ATRIUM_AMD_VRAM_BAR	PCIR_BAR(0)	/* CPU window onto VRAM (sized, not mapped) */
 
 /*
  * Register offsets within BAR5. A real GFX12 register's absolute BAR5 offset
@@ -85,6 +85,8 @@
 #define regPT_BASE_HI		0x5a40	/* GC: ..._HI32 */
 #define regTLB_INVALIDATE	0x591c	/* GC: GCVM_INVALIDATE_ENG0_REQ */
 #define regVM_CNTL		0x20088	/* SIM: bit 0 = enforce PTE_WRITE */
+#define regCONFIG_MEMSIZE	0x2008c	/* SIM: r = device VRAM in MiB (the NBIO
+					 * RCC_CONFIG_MEMSIZE role); 0 on older gpusim */
 #define VM_CNTL_WRITE_PROTECT	0x1
 #define regIH_SIZE		0x10200	/* OSS: IH_RB_CNTL (ring size in entries) */
 #define regIH_WPTR		0x10208	/* OSS: IH_RB_WPTR (device's write pointer) */
@@ -338,7 +340,7 @@
 #define ATRIUM_AMD_PTE_VALID	0x1ULL
 #define ATRIUM_AMD_PTE_VRAM	0x2ULL	/* page is device VRAM (else System/GTT) */
 #define ATRIUM_AMD_PTE_WRITE	0x4ULL	/* GPU may write (enforced once VM_CNTL.WP) */
-#define ATRIUM_AMD_VRAM_BYTES	(256ULL << 20)	/* BAR0 VRAM capacity */
+#define ATRIUM_AMD_VRAM_BYTES	(256ULL << 20)	/* VRAM size if CONFIG_MEMSIZE reads 0 */
 #define ATRIUM_AMD_PD_SHIFT	21
 #define ATRIUM_AMD_PT_SHIFT	12
 #define ATRIUM_AMD_PT_MASK	0x1ff
@@ -347,6 +349,11 @@
 #define PM4_TYPE3		3u
 #define IT_NOP			0x10u
 #define IT_RELEASE_MEM		0x49u
+#define IT_DMA_DATA		0x50u	/* CP DMA: copy, or fill with SRC_SEL = DATA */
+/* DMA_DATA fields (public layout, Mesa sid.h R_411/R_415; GFX9+). */
+#define DMA_DATA_SRC_SEL_DATA	(2u << 29)	/* DW1: source is the DW2 value */
+#define DMA_DATA_CP_SYNC	(1u << 31)	/* DW1: finish before the next packet */
+#define DMA_DATA_MAX_BYTES	((1u << 26) - 1)	/* DW6 BYTE_COUNT width */
 #define IT_DISPATCH_DIRECT	0x15u
 #define IT_DRAW_INDEX_AUTO	0x2du
 
@@ -559,35 +566,8 @@ struct atrium_amd_bo_binding {
 	uint64_t	 gpu_va;	/* base GPU-VA of the BO in that vm */
 };
 
-/*
- * VRAM a client gave back (bo.c). The device allocator (vram.c) never takes
- * VRAM back, since freed VRAM would have to be scrubbed before another client
- * may see it. A client's own freed VRAM holds nothing it couldn't already
- * read, so its later VRAM allocations reuse it first: a compositor that
- * reallocates scanout buffers on every hotplug or mode change stays within
- * what it already had. Each VRAM BO holds a reference on its creator's pool,
- * so the pool outlives the client while its BOs do; what it holds when the
- * last reference goes is lost, as all freed VRAM was before.
- */
-#define AMD_VRAM_POOL_SLOTS	32
-struct amd_vram_pool {
-	volatile u_int	 refs;
-	struct mtx	 lock;
-	int		 n;
-	struct {
-		uint64_t off, size;
-	}		 free[AMD_VRAM_POOL_SLOTS];
-	uint64_t	 reused;	/* bytes handed out again (stats) */
-};
-
-struct amd_vram_pool *amd_vram_pool_new(void);
-void	 amd_vram_pool_rele(struct amd_vram_pool *p);
-
 struct atrium_amd_bo {
 	struct atrium_amd_softc *sc;
-	/* The creating client's pool (VRAM BOs: referenced; set before
-	 * bo_alloc, which may take VRAM from it). */
-	struct amd_vram_pool *vram_pool;
 	struct atrium_amd_bo_binding bindings[ATRIUM_AMD_BO_MAX_BIND];
 	int		 n_bindings;	/* VMs this BO is currently bound into */
 	void		*kva;		/* CPU mapping (bus_dmamem, page-contiguous) */
@@ -718,7 +698,6 @@ struct atrium_amd_reset_hooks {
 
 struct atrium_amd_client {
 	struct atrium_amd_softc *sc;
-	struct amd_vram_pool *vram_pool;	/* its freed VRAM (bo.c) */
 };
 
 /* One doorbell mapping grant: the pager handle of one owner's mapping. */
@@ -767,6 +746,83 @@ struct atrium_amd_isolation_stats {
 	uint64_t	 vm_faults;	/* VM fault interrupts */
 	int		 deferred_now;	/* deferred BO frees outstanding */
 	int		 grants_live;	/* grant pager objects alive */
+};
+
+/*
+ * The device VRAM allocator (vram.c, base module). Arch-neutral: it knows
+ * offsets and sizes, and nothing of how a GPU clears memory. Freed VRAM is
+ * DIRTY (it may hold another client's pixels) until the registered clear
+ * engine has scrubbed it; only then does it go back to the free arena. The
+ * clear engine is the per-architecture part (amd: clear.c, a CP DMA fill on a
+ * kernel-owned queue), registered by the gpu module with amd_vram_set_clear.
+ *
+ * Small BAR: VRAM can be far bigger than the CPU's BAR0 window (8 GiB behind
+ * 256 MiB on gpusim, like a non-ReBAR discrete card). `total` comes from the
+ * device (CONFIG_MEMSIZE), `visible` from BAR0. Nothing the kernel does with
+ * VRAM needs the CPU (the scrub is a GPU fill), so ordinary allocations go
+ * above the window and keep it free for what must be CPU-visible
+ * (AMD_VRAM_CPU_VISIBLE).
+ */
+struct amd_vram_dirty {
+	TAILQ_ENTRY(amd_vram_dirty) link;
+	uint64_t	 off;		/* one whole freed allocation */
+	uint64_t	 size;
+};
+
+/* Clear [off, off+len) of VRAM to zero and wait for it. Sleeps; never called
+ * with a lock held. 0, or an errno (the range then stays dirty). */
+typedef int amd_vram_clear_fn(struct atrium_amd_softc *sc, uint64_t off,
+    uint64_t len);
+
+struct amd_vram_stats {
+	uint64_t	 allocs;
+	uint64_t	 frees;
+	uint64_t	 scrubbed;	/* bytes cleared by the clear engine */
+	uint64_t	 scrub_jobs;	/* clear-engine calls */
+	uint64_t	 scrub_failed;	/* clear-engine calls that failed */
+	uint64_t	 alloc_waits;	/* allocations that waited for a scrub */
+	uint64_t	 enomem;	/* allocations refused */
+	uint64_t	 peak_used;
+};
+
+struct atrium_amd_vram {
+	struct mtx	 lock;		/* everything below */
+	int		 inited;
+	vmem_t		*arena;		/* clean free VRAM (offsets + ARENA_BASE) */
+	uint64_t	 total;		/* device VRAM bytes */
+	uint64_t	 visible;	/* of which the CPU can reach via BAR0 */
+	uint64_t	 used;		/* allocated now */
+	uint64_t	 dirty_bytes;	/* freed, not yet scrubbed (incl. in flight) */
+	TAILQ_HEAD(, amd_vram_dirty) dirty;
+	amd_vram_clear_fn *clear;	/* the clear engine; NULL = none loaded */
+	int		 scrubbing;	/* a scrub pass is running */
+	uint64_t	 passes;	/* scrub passes finished (waiters sleep on it) */
+	struct taskqueue *tq;		/* our own thread: a scrub sleeps */
+	struct timeout_task scrub_task;
+	struct amd_vram_stats st;
+};
+#define AMD_VRAM_ARENA_BASE	(1ULL << 40)	/* vmem never hands out 0 */
+#define AMD_VRAM_CPU_VISIBLE	0x1	/* amd_vram_alloc: inside the BAR0 window */
+
+/*
+ * The amd clear engine (clear.c, gpu module): a compute HQD and a GPUVM
+ * context that belong to the kernel alone. VMID 0 is the kernel context on
+ * AMD (user VMs get 1..15) and the queue is never handed to a client. Its page
+ * directory maps one System page (ring + fence) and a window of VRAM that is
+ * re-pointed at each range before the fill. No CPU access to VRAM at all.
+ */
+#define AMD_CLEAR_QID		2	/* kernel-only compute HQD */
+#define AMD_CLEAR_DOORBELL	0x2000	/* its own doorbell page */
+#define AMD_CLEAR_VMID		0	/* the kernel GPUVM context */
+#define AMD_CLEAR_WIN_PT	32	/* PT pages in the window: 64 MiB */
+struct amd_clear_engine {
+	struct sx	 lock;		/* one clear at a time; held across reset */
+	int		 ready;
+	struct atrium_amd_dma_page pdb;
+	struct atrium_amd_dma_page pt_misc;	/* maps the ring page */
+	struct atrium_amd_dma_page ring;	/* PM4 ring + fence word */
+	struct atrium_amd_dma_page pt_win[AMD_CLEAR_WIN_PT];
+	uint64_t	 seq;		/* last fence value */
 };
 
 struct atrium_amd_softc {
@@ -864,7 +920,8 @@ struct atrium_amd_softc {
 	struct timeout_task watchdog_task;
 	int		 hang_ms;	/* no progress this long = hung */
 	int		 watchdog_armed; /* watchdog_task scheduled (sc->lock) */
-	uint64_t	 vram_next;	/* VRAM bump allocator cursor (base-managed) */
+	struct atrium_amd_vram vram;	/* device VRAM allocator (base, vram.c) */
+	struct amd_clear_engine clear;	/* VRAM clear engine (gpu, clear.c) */
 };
 
 /*
@@ -924,8 +981,7 @@ amd_ih_set_handler(struct atrium_amd_softc *sc, int cause,
 	mtx_unlock(&sc->lock);
 }
 int	 amd_bo_create_fd(struct atrium_amd_softc *sc, struct thread *td,
-	    uint64_t size, uint32_t flags, struct amd_vram_pool *pool,
-	    int *out_fd);
+	    uint64_t size, uint32_t flags, int *out_fd);
 int	 amd_bo_fget(struct thread *td, int fd, struct file **out_fp,
 	    struct atrium_amd_bo **out_bo);
 /* Bind a BO into `vm` at *va (0 = auto), adding a binding (a BO may be bound
@@ -979,12 +1035,26 @@ int	 amd_flr(struct atrium_amd_softc *sc);
 int	 amd_device_reset(struct atrium_amd_softc *sc);
 
 /*
- * vram.c (BASE module) — the device VRAM bump allocator. VRAM is a *device*
- * resource (any IP block may carve from it — the gpu's BOs today, a display
- * cursor/overlay plane tomorrow), so the base owns the cursor. Bumps under
- * sc->lock; *out_off is a byte offset into the VRAM aperture. ENOMEM when full.
+ * vram.c (BASE module) — the device VRAM allocator (struct atrium_amd_vram).
+ * VRAM is a *device* resource (the gpu's BOs today, a display cursor/overlay
+ * plane tomorrow), so the base owns it. Offsets are bytes into device VRAM.
+ *   alloc: clean VRAM only; waits (bounded) for a scrub in progress; ENOMEM.
+ *   free:  the range becomes dirty and is scrubbed before anyone gets it again.
+ *   set_clear: the gpu module registers its clear engine (NULL on detach,
+ *          which waits out a running scrub).
  */
-int	 amd_vram_alloc(struct atrium_amd_softc *sc, uint64_t size, uint64_t *out_off);
+int	 amd_vram_init(struct atrium_amd_softc *sc);
+void	 amd_vram_fini(struct atrium_amd_softc *sc);
+int	 amd_vram_alloc(struct atrium_amd_softc *sc, uint64_t size, int flags,
+	    uint64_t *out_off);
+void	 amd_vram_free(struct atrium_amd_softc *sc, uint64_t off, uint64_t size);
+void	 amd_vram_set_clear(struct atrium_amd_softc *sc, amd_vram_clear_fn *fn);
+
+/* clear.c (gpu module) — the amd VRAM clear engine (struct amd_clear_engine) */
+int	 amd_clear_init(struct atrium_amd_softc *sc);
+void	 amd_clear_fini(struct atrium_amd_softc *sc);
+void	 amd_clear_reset_prepare(struct atrium_amd_softc *sc);
+void	 amd_clear_reset_restore(struct atrium_amd_softc *sc);
 
 /*
  * Register an IP module's reset prepare/restore hooks (NULL to clear on detach).
