@@ -216,18 +216,20 @@ fn paint_one(cv: &mut Canvas, scene: &Scene, fonts: &FontSet, ctx: &mut swash::s
             let p = &scene.paths[i];
             let fp = crate::path::fill_params(p, None);
             let f = fresco_compute::fill::Fill { verbs: fp.verbs.clone(), points: fp.points.clone(), transform: fp.transform,
-                rule: fresco_compute::fill::FillRule::NonZero, color: [0.0; 4], clip: None };
+                rule: fresco_compute::fill::FillRule::NonZero, color: [0.0; 4], clip: None, gradient: Default::default() };
             let Some(lines) = fresco_compute::fill::flatten(&f) else { return };
             if lines.is_empty() { return }
             let (mut x0, mut y0, mut x1, mut y1) = (f32::MAX, f32::MAX, f32::MIN, f32::MIN);
             for s in &lines { x0 = x0.min(s[0]).min(s[2]); y0 = y0.min(s[1]).min(s[3]); x1 = x1.max(s[0]).max(s[2]); y1 = y1.max(s[1]).max(s[3]) }
-            let a = ((p.rgba & 0xff) * p.opacity / 255).min(255);
-            let rgba = (p.rgba & 0xffff_ff00) | a;
             for py in (y0.floor() as i64).max(0)..(y1.ceil() as i64).min(cv.h as i64) {
                 for px in (x0.floor() as i64).max(0)..(x1.ceil() as i64 + 1).min(cv.w as i64) {
                     let acc: f32 = lines.iter().map(|s| fresco_compute::fill::fill_line(*s, px as f32, py as f32)).sum();
                     let cover = fresco_compute::fill::coverage(acc, p.even_odd);
-                    if cover > 0.0 { cv.blend(px, py, rgba, cover) }
+                    if cover <= 0.0 { continue }
+                    let Some(c) = crate::path::paint_at(p, px as f32, py as f32) else { continue };
+                    let q = |v: f32| (v.clamp(0.0, 1.0) * 255.0).round() as u32;
+                    let rgba = (q(c[0]) << 24) | (q(c[1]) << 16) | (q(c[2]) << 8) | q(c[3] * p.opacity as f32 / 255.0);
+                    cv.blend(px, py, rgba, cover)
                 }
             }
         }

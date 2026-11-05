@@ -233,9 +233,34 @@ replaced element (`atrium-svg`). The renderer turns it into paths (navigator-svg
 - a transform becomes the fill's own affine;
 - group opacity over one shape folds into its paint.
 
-*What keeps the bitmap path* (the image node of SVG as an image), with the reason
-counted: a clip path, a mask, a filter, group opacity over several shapes, a pattern,
-an embedded image, text, and a gradient (until Fresco's gradient paints are wired here).
+*Paint, clips, and drops (2026-11-06, after Fresco's gradients landed, 3892556).*
+- *Gradients.* A paint is solid, or linear or radial: Fresco's `FillPaint`, at most 16
+  stops, pad spread. In NSG it is `L<x0>,<y0>,<x1>,<y1>` or `R<cx>,<cy>,<r>`, in 1/64
+  path unit, then `;<rrggbbaa>@<offset/1024>` per stop.
+- *Colour spaces differ by paint.* A solid colour goes to Fresco in linear RGB. Gradient
+  stops stay sRGB, because Fresco interpolates them premultiplied in sRGB. Both are
+  tested.
+- *A linear gradient is exact under any invertible gradient transform.* Its parameter
+  is still an affine function of position, so its end points are solved for
+  (p₀ = T q₀, direction L⁻ᵀd/|d|²); they are not merely mapped. A non-uniform
+  `objectBoundingBox` and a skew are tested against the SVG's own parameter.
+- *A radial gradient goes vector only under a similarity*, with its focus at its centre.
+- *Rectangle clips.* A clip path that is one axis-aligned rectangle, under axis-aligned
+  transforms, becomes the fill's own clip rectangle (`k<x0>,<y0>,<x1>,<y1>` in 1/64 px).
+  Nested clips intersect, and the scene's clip is intersected too. Fresco tests the
+  pixel centre against it, with no antialiasing on the clip edge.
+- *Drops.* Every vector SVG keeps its bitmap fallback in the scene (`path_fallbacks`;
+  NSG `fallback p<first>+<count> <image>`). When Fresco reports fills dropped
+  (`EV_WINDOW_FILLS_DROPPED`), the UI swaps that SVG's paths for the image, and swaps
+  back on an empty report (`path::fallback_for`).
+
+*What keeps the bitmap path*, with the reason counted:
+- any other clip path, a mask, a filter;
+- group opacity over several shapes;
+- a pattern;
+- a gradient with reflect or repeat spread, more than 16 stops, or (radial) a
+  non-similar transform or a focus;
+- an embedded image, or text.
 
 *The checks.*
 - The worker checks each path against Fresco's own limits at the painted scale
@@ -243,35 +268,32 @@ an embedded image, text, and a gradient (until Fresco's gradient paints are wire
   16 px tile).
 - A document's SVGs may use at most half of a frame's 512K lines.
 - A path that would pass any of these sends the whole SVG back to the bitmap path.
-- `fill_params` makes a node what frescod takes (colour to linear RGB).
+- `fill_params` makes a node what frescod takes.
 - `validate` runs fresco-protocol's `FillParams::validate`, the same function frescod
-  runs: bounds, finite values, verbs. The broker calls it before handing a node on.
+  runs. The broker calls it before handing a node on.
 - Scroll and zoom move a fill with `ATRIUM_CORE_FILL_TRANSFORM` (0x1005), without
   re-sending its geometry.
 
 *In the review rasterizer* (`raster`), paths are painted by fresco-compute's own
-coverage functions, so a review shows what frescod would draw.
+coverage functions, with gradients evaluated as Fresco does (`path::paint_at`).
 
 *Measured* (warm, all 122 pages):
 
 | | inline SVGs drawn |
 |---|---|
-| **as vector shapes** (1,855 path nodes) | **1,502 (70.4%)** |
-| kept as a bitmap: clip path | 525 |
+| **as vector shapes** (2,651 path nodes) | **1,962 (92.0%)**; with solid paint only it was 1,502 (70.4%) |
 | kept as a bitmap: external sprite | 67 |
+| kept as a bitmap: clip path (not a rectangle); 525 before rectangle clips | 66 |
 | kept as a bitmap: filter | 12 |
 | kept as a bitmap: embedded image | 8 |
-| kept as a bitmap: mask | 6 |
+| kept as a bitmap: mask | 7 |
 | kept as a bitmap: group opacity over several shapes | 5 |
-| kept as a bitmap: gradient | 4 |
 | kept as a bitmap: animation | 2 |
+| kept as a bitmap: radial gradient under a non-uniform transform | 2 |
 | kept as a bitmap: text | 2 |
 
 - *Pages without inline SVG:* their NSG is byte-identical to 0beab757's. All 57 scenes
   that changed are pages with inline SVG.
-- *The clip paths* are mostly a whole-viewport rectangle (the Figma export pattern). A
-  rectangle clip under an axis-aligned transform could be sent as the fill's own clip
-  rectangle; it stays on the bitmap path for now, as agreed.
 - *Not yet run:* the integration test against frescod itself.
 
 **The M0 gate:** the repo's own Markdown (the corpus) produces **byte-identical NSG over

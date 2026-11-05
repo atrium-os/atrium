@@ -1113,7 +1113,12 @@ impl<'a> Cx<'a> {
                 match vector {
                     Some(Ok(paths)) => {
                         self.count("inline svg drawn as vector shapes");
+                        let first = self.scene.paths.len();
+                        let n = paths.len();
                         for p in paths { self.scene.insert_path(slot, p); slot += 1 }
+                        self.scene.path_fallbacks.push((first, n, crate::Image {
+                            area: crate::Tiling { x: content.0, y: content.1, w: content.2, h: content.3, tx, ty, tw: tw.max(1), th: th.max(1), repeat: 0 },
+                            address: addr.clone(), fit }));
                     }
                     other => {
                         if let Some(Err(why)) = other { self.count(kept_as_bitmap(why)) }
@@ -1668,6 +1673,7 @@ impl<'a> Cx<'a> {
         self.scene.grads.truncate(gr_n); self.scene.grad_attrs.truncate(gr_n);
         self.scene.images.truncate(im); self.scene.image_attrs.truncate(im);
         self.scene.paths.truncate(pa); self.scene.path_attrs.truncate(pa); self.vector_budget = vb;
+        self.scene.path_fallbacks.retain(|(first, _, _)| *first < pa);
         self.scene.clips.truncate(cl); self.scene.groups.truncate(gr); self.scene.cur = cur;
         self.scene.xforms.truncate(xf); self.scene.xform_parents.truncate(xf);
         // A trial layout must leave no diagnostics behind: the real one

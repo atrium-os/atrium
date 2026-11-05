@@ -17,9 +17,14 @@
 //! shadow <x> <y> <w> <h> <rrggbbaa> <blur> [r<tl>,<tr>,<br>,<bl>] [c<i>] [g<i>] [x<i>]
 //! grad <x> <y> <w> <h> t<tx>,<ty>,<tw>,<th> <repeat> <angle 1/64 deg> <rrggbbaa>@<pos 1/1024> …
 //! image <address> <x> <y> <w> <h> t<tx>,<ty>,<tw>,<th> <repeat> <fit>
-//! path <evenodd 0|1> <a> <b> <c> <d> <e> <f> <rrggbbaa> <opacity 0-255> v<verbs> p<x>,<y> … [c<i>] [g<i>] [x<i>]
+//! path <evenodd 0|1> <a> <b> <c> <d> <e> <f> <paint> <opacity 0-255> v<verbs> p<x>,<y> … [k<x0>,<y0>,<x1>,<y1>] [c<i>] [g<i>] [x<i>]
 //!      (Fresco's ATRIUM_CORE_FILL one to one: a-d in 1/65536, e f in 1/64 px,
-//!       verbs 0 move 1 line 2 quad 3 cubic 4 close, points in 1/64 path unit)
+//!       verbs 0 move 1 line 2 quad 3 cubic 4 close, points in 1/64 path unit;
+//!       paint `rrggbbaa`, or `L<x0>,<y0>,<x1>,<y1>` / `R<cx>,<cy>,<r>` (1/64
+//!       path unit) then `;<rrggbbaa>@<offset 1/1024>` per stop; k: the
+//!       path's own clip, 1/64 px)
+//! fallback p<first>+<count> <address> <x> <y> <w> <h> t<tx>,<ty>,<tw>,<th> <fit>
+//!      (the bitmap a vector SVG's paths fall back to when Fresco drops one)
 //! ```
 
 use crate::fontset::FontSet;
@@ -118,10 +123,23 @@ pub fn write(scene: &Scene, fonts: &FontSet) -> String {
             6 => {
                 let p = &scene.paths[i];
                 let t = &p.transform;
-                let _ = write!(o, "path {} {} {} {} {} {} {} {:08x} {} v", u8::from(p.even_odd), t[0], t[1], t[2], t[3], t[4], t[5], p.rgba, p.opacity);
+                let _ = write!(o, "path {} {} {} {} {} {} {} ", u8::from(p.even_odd), t[0], t[1], t[2], t[3], t[4], t[5]);
+                match &p.paint {
+                    crate::path::Paint::Solid(c) => { let _ = write!(o, "{c:08x}"); }
+                    crate::path::Paint::Linear { p: q, stops } => {
+                        let _ = write!(o, "L{},{},{},{}", q[0], q[1], q[2], q[3]);
+                        for (off, c) in stops { let _ = write!(o, ";{c:08x}@{off}"); }
+                    }
+                    crate::path::Paint::Radial { c, stops } => {
+                        let _ = write!(o, "R{},{},{}", c[0], c[1], c[2]);
+                        for (off, col) in stops { let _ = write!(o, ";{col:08x}@{off}"); }
+                    }
+                }
+                let _ = write!(o, " {} v", p.opacity);
                 for v in &p.verbs { let _ = write!(o, "{v}"); }
                 o.push_str(" p");
                 for (k, (x, y)) in p.points.iter().enumerate() { let _ = write!(o, "{}{x},{y}", if k == 0 { "" } else { " " }); }
+                if let Some(k) = p.clip { let _ = write!(o, " k{},{},{},{}", k[0], k[1], k[2], k[3]); }
                 attrs(&mut o, scene.path_attrs.get(i));
                 o.push('\n');
             }
@@ -134,6 +152,12 @@ pub fn write(scene: &Scene, fonts: &FontSet) -> String {
                 o.push('\n');
             }
         }
+    }
+    // Each vector SVG's bitmap fallback, after the nodes (it draws nothing
+    // unless Fresco drops one of that SVG's paths).
+    for (first, n, im) in &scene.path_fallbacks {
+        let a = &im.area;
+        let _ = writeln!(o, "fallback p{first}+{n} {} {} {} {} {} t{},{},{},{} {}", im.address, a.x, a.y, a.w, a.h, a.tx, a.ty, a.tw, a.th, im.fit);
     }
     o
 }

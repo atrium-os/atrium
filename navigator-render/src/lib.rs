@@ -162,6 +162,11 @@ pub struct Scene {
     /// Filled paths (kind 6): an inline SVG as vector shapes (`path`).
     pub paths: Vec<path::Path>,
     pub path_attrs: Vec<Attrs>,
+    /// ★ Each vector SVG's bitmap fallback: (first path, path count, the
+    /// image node it would otherwise be). When Fresco reports a fill dropped
+    /// (`EV_WINDOW_FILLS_DROPPED`), the UI swaps that SVG's paths for this
+    /// image, and swaps back when the report is empty (`path::fallback_for`).
+    pub path_fallbacks: Vec<(usize, usize, Image)>,
     /// The clip and group a node created now belongs to.
     /// Public only so review tooling can build a scene of one node.
     pub cur: Attrs,
