@@ -38,7 +38,7 @@ impl Carried {
 
     /// The recording contains these bytes, anywhere.
     pub fn contains(&self, needle: &[u8]) -> bool {
-        !needle.is_empty() && self.bytes.windows(needle.len()).any(|w| w == needle)
+        !needle.is_empty() && memchr::memmem::find(&self.bytes, needle).is_some()
     }
 
     pub fn len(&self) -> usize { self.bytes.len() }

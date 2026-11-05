@@ -483,6 +483,21 @@ impl DocumentHost for JailedHost {
         }
     }
 
+    /// ★ Asked of the worker, whose answer is believed only as far as the
+    /// broker's own bound allows (`Navigatord::carries_link` checks the
+    /// recording first). An answer other than yes or no is a lie.
+    fn links_to(&mut self, id: SessionId, href: &str, now: Millis) -> Result<bool, String> {
+        match self.ask(id, Frame::new(REQ_HREF, href.as_bytes()), now)?.as_str() {
+            "yes" => Ok(true),
+            "no" => Ok(false),
+            other => {
+                let why = format!("worker sent an unknown link answer {other:?}");
+                self.retire(id, Status::Failed);
+                Err(why)
+            }
+        }
+    }
+
     fn triggers(&self, id: SessionId) -> Vec<String> {
         self.workers.get(&id).map(|w| w.triggers.clone()).unwrap_or_default()
     }

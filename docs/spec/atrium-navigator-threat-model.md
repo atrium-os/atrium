@@ -833,9 +833,38 @@ pipe, and the typed island channel.
   - Tests: `navigator-backend/tests/links.rs`, the decision, plus the same decisions
     through both hosts, the in-process one and the worker (where the base URL crosses
     the pipe as `URL`).
-  - *Not yet:* the broker does not check that an href is one the current document
-    carries, so a compromised worker can offer any `https` or `http` URL, as a hostile
-    page already can by writing it. Downloads are untouched.
+  - *Built 2026-11-05: only links the document carries.* Before deciding anything, the
+    broker runs two checks (`Navigatord::carries_link`), both through both hosts. A
+    failure of either is `Blocked`.
+    1. **The bound, the broker's own.** The href must be spelled, the way the
+       converter's emitter writes a link, somewhere in the recording bytes the broker
+       holds (`links::recording_spellings` + `src/carried.rs`). The search is
+       memmem, not a parse. It recognises two spellings: `href=\"…\"`, HTML-escaped by
+       navigator-dom's own serializer (`dom::escape`, now public) and then JSON-escaped;
+       or a JSON string token, an `attribute` effect's value. A worker answering "yes" to
+       everything therefore still cannot send the reader to a URL the recording does not
+       already contain. ★ That is the property that matters: a compromised worker cannot
+       encode what it read into a destination (`https://evil.test/?leak=…`). A recording
+       spelled any other way fails the bound, so it fails closed.
+    2. **The precise check, the host's.** An `<a>` or `<area>` in the *current* document
+       (after the reader's transitions) carries exactly that href: `HREF` across the
+       pipe, answered `yes` or `no`. Any other answer retires the worker. This refuses a
+       link a transition has not yet added, one that Back took away, and one that appears
+       only as markup inside a script's text. The in-process host asks its own session.
+  - The bound is positive-controlled on the corpora, so it does not refuse real links.
+    Every one of the 93,326 `<a>`/`<area>` hrefs in 133 documents is found by both
+    checks (49,326 + 44,000), as are the 2 transition-inserted hrefs in the exploration
+    recordings (`examples/link_bound_corpus.rs`). A miss costs at most 1.2 ms on the
+    largest recording (10 MB), and was 25.6 ms before memmem.
+  - Tests (`tests/links.rs`, both hosts) cover:
+    - an uncarried https URL, and near misses (`/her`, a trailing `/`);
+    - transition results before and after the transition, and after Back;
+    - a script-text mention;
+    - a lying "yes" worker, which still cannot invent a destination;
+    - a "maybe" worker, which is retired;
+    - the bound finding every character the two escapings touch.
+  - Still open: SVG `<a xlink:href>` is not a link (refused, closed); downloads are
+    untouched.
 - **Downloads.** Saved with the source origin recorded, never executable by default, and
   opened only by a jailed viewer.
 
@@ -888,7 +917,7 @@ These belong in the model because they are *wins*, not because they need work:
 | P2 | Fuzz Fresco scene ingest and the GPU ioctl surface; Fresco takes outlines, not fonts | A1 against the shared compositor | medium | §2.5 |
 | P2 | Broker rules for replayed request templates | A3, CSRF | design-time, with §5.4.5 | §2.7 |
 | P2 | Unobscured-input rule for islands; bhyve for the CDM | A2 clickjacking, kernel surface | medium, with §8.1 | §2.9 |
-| P2 ✔ scheme allowlist built, in the broker (2026-11-05); download marking open | Scheme allowlist on link activation; download marking | A1/A2 | small | §2.10 |
+| P2 ✔ scheme allowlist built, in the broker (2026-11-05); ✔ only carried hrefs activate (2026-11-05); download marking open | Scheme allowlist on link activation; download marking | A1/A2 | small | §2.10 |
 | P3 | Origin chrome, punycode for confusables, form warnings | A2 | product work | §2.11 |
 | gate | No login support before §6's vault and per-origin fetcher (C0) | account takeover | — | §6 |
 

@@ -35,6 +35,9 @@ zune-jpeg = { version = "0.5", default-features = false, features = ["std"] }
 zune-core = { version = "0.5", default-features = false, features = ["std"] }
 image-webp = "0.2.4"
 gif = { version = "0.14.2", default-features = false, features = ["std"] }
+# The broker's byte search of a recording (src/carried.rs): a 10 MB miss
+# took 25.6 ms with `windows().any()`, and the broker is single-threaded.
+memchr = "2"
 
 [features]
 # ★ Unconfined brokers (`Navigatord::unconfined_for_testing`) exist only in

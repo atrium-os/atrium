@@ -451,8 +451,9 @@ the leak it was added to explain; past that boundary the answer honestly becomes
 ### 4.6 The broker, and the seam that makes §1 testable
 
 `navigatord` drives sessions through the control-plane vocabulary of §3: `OpenSession`,
-`Navigate`, `Back`, `Close`, `Report`, `Activate` in; `SessionOpened`, `SceneReady`,
-`Rewound`, `Closed`, `Expired`, `Blocked`, `NoSuchSession`, `Report`, `Link` out.
+`Navigate`, `Back`, `Close`, `Report`, `Activate`, `Image` in; `SessionOpened`,
+`SceneReady`, `Rewound`, `Closed`, `Expired`, `Blocked`, `NoSuchSession`, `Report`,
+`Link`, `Image` out.
 
 `Activate { session, href }` is a reader following a link in the scene. The broker
 decides where it goes (`links.rs`, threat model §2.10): it resolves the href against the
@@ -461,7 +462,14 @@ document. Then it answers with one of three `LinkAction`s: `InDocument`, `Naviga
 (with `insecure` set for `http`), or `Handoff`, which is only for a scheme the user
 allowlisted. Anything else is `Blocked`. A jailed host supplies the base URL over the
 worker pipe (`URL`). A worker that lies about it can do no more than a page writing
-absolute links already could.
+absolute links already could. And the href must be one the document carries: spelled in
+the recording the broker holds, and on an `<a>`/`<area>` of the current document
+(threat model §2.10).
+
+`Image { session, address }` asks for one image's pixels. The broker checks that the
+recording names the address and reads the blob from its store. The document's worker
+decodes it, and the broker validates the RGBA8 buffer before it becomes
+`Event::Image` (threat model §2.4).
 
 **The broker names no document type.** It cannot call the parser, hold a DOM, or read a
 recording's bytes, because it never sees any of those types — everything that does lives

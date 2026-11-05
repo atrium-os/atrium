@@ -366,6 +366,7 @@ dependencies = [
  "gif",
  "image-webp",
  "jpeg-encoder",
+ "memchr",
  "navigator-backend",
  "navigator-dom",
  "png",

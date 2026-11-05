@@ -132,3 +132,47 @@ pub fn decide(document_url: &str, href: &str, allow: &SchemeAllowlist)
         s => Err(LinkRefusal::Scheme(s.to_string())),
     }
 }
+
+/// ★★ HOW AN HREF CAN BE SPELLED IN A RECORDING, for the broker's bound
+/// (threat model §2.10): a byte search in the recording it holds, which it
+/// does not parse.
+///
+/// A link reaches a recording in two forms, both written by the converter's
+/// emitter: as an attribute of serialized HTML inside a JSON string (the
+/// document, or an `insert` effect's markup) — `href=\"…\"`, HTML-escaped
+/// by the serializer and then JSON-escaped; and as an `attribute` effect's
+/// value — a JSON string token on its own. A recording spelled any other
+/// way (another emitter's escaping) fails this check and its links are
+/// refused: the bound fails CLOSED.
+pub fn recording_spellings(href: &str) -> [Vec<u8>; 2] {
+    let attr = format!("href=\\\"{}\\\"", json_body(&navigator_dom::dom::escape(href)));
+    let token = format!("\"{}\"", json_body(href));
+    [attr.into_bytes(), token.into_bytes()]
+}
+
+/// A JSON string's body as the converter's emitter writes it
+/// (navigator-prerender `artifact::json_str`, without the quotes).
+fn json_body(v: &str) -> String {
+    let mut out = String::with_capacity(v.len());
+    for c in v.chars() {
+        match c {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            '\u{08}' => out.push_str("\\b"),
+            '\u{0c}' => out.push_str("\\f"),
+            c if (c as u32) < 0x20 => out.push_str(&format!("\\u{:04x}", c as u32)),
+            c => out.push(c),
+        }
+    }
+    out
+}
+
+/// ★ The PRECISE question, for whoever holds the current document: does an
+/// `<a>` or `<area>` in it carry exactly this href? Connected elements only —
+/// a link a transition removed is no longer on the page.
+pub fn document_carries(dom: &navigator_dom::Dom, href: &str) -> bool {
+    ["a", "area"].iter().any(|t| dom.by_tag(t).into_iter().any(|h| dom.attr(h, "href") == Some(href)))
+}

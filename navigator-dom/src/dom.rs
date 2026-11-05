@@ -668,6 +668,16 @@ impl Sink for String { fn put(&mut self, s: &str) { self.push_str(s) } }
 struct Count(usize);
 impl Sink for Count { fn put(&mut self, s: &str) { self.0 += s.len() } }
 
+/// A text or attribute value exactly as the serializer writes it. ★ Public
+/// so a consumer that must recognise serialized bytes (the broker looking
+/// for a link in a recording it does not parse) uses the serializer's own
+/// escaping rather than a copy that could drift from it.
+pub fn escape(t: &str) -> String {
+    let mut s = String::with_capacity(t.len());
+    escape_into(t, &mut s);
+    s
+}
+
 /// `&`, `<`, `>` and `"` as entities, in one pass and without allocating —
 /// the four chained `replace` calls this replaces built four strings per text
 /// node and attribute value. Unescaped runs are written whole.

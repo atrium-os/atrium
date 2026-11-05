@@ -132,5 +132,8 @@ pub const REQ_RESTORE: &str = "RSTR";
 /// Decode one image (src/image.rs). Payload: `<address> <budget>\n` and the
 /// encoded bytes; the answer is `<width> <height>\n` and RGBA8 pixels.
 pub const REQ_IMAGE: &str = "IMG";
+/// Whether the current document has an `<a>`/`<area>` with this href:
+/// answers `yes` or `no`.
+pub const REQ_HREF: &str = "HREF";
 pub const RSP_OK: &str = "OK";
 pub const RSP_ERR: &str = "ERR";

@@ -88,6 +88,13 @@ pub trait DocumentHost {
     {
         Err("this host does not decode images".into())
     }
+    /// Whether an `<a>` or `<area>` in the session's CURRENT document — after
+    /// whatever transitions the reader took — carries exactly `href`. The
+    /// precise half of the link check; the broker's own bound (`carried`)
+    /// does not depend on this answer. Refuses by default.
+    fn links_to(&mut self, _id: SessionId, _href: &str, _now: Millis) -> Result<bool, String> {
+        Err("this host cannot say what its document links to".into())
+    }
     /// ★ Whether each document runs CONFINED, as the host itself states it.
     /// Defaults to false: a host has to claim confinement to get it, so a new
     /// host that forgets is refused by `Navigatord::start`, not trusted.
@@ -334,6 +341,10 @@ impl<H: DocumentHost> Navigatord<H> {
             // position to have made it (threat model §2.10).
             Request::Activate { session, href } => {
                 if let Some(e) = self.absent(session) { out.push(e); return out }
+                if let Err(why) = self.carries_link(session, &href) {
+                    out.push(Event::Blocked { session: Some(session), why });
+                    return out;
+                }
                 let base = match self.host.document_url(session, self.now) {
                     Ok(u) => u,
                     Err(why) => { out.push(Event::Blocked { session: Some(session), why }); return out }
@@ -352,6 +363,34 @@ impl<H: DocumentHost> Navigatord<H> {
             }
         }
         out
+    }
+
+    /// ★★ A LINK IS ACTIVATED ONLY IF THE DOCUMENT CARRIES IT (threat model
+    /// §2.10). Two checks, in this order:
+    ///
+    /// 1. the BOUND, the broker's own: the href is spelled, as the converter
+    ///    writes a link, somewhere in the recording the broker holds
+    ///    (`links::recording_spellings`, a byte search). A compromised worker
+    ///    cannot pass it with a URL the recording does not already contain,
+    ///    so it cannot invent a destination — `https://evil.test/?<what it
+    ///    read>` — however it answers below;
+    /// 2. the PRECISE check, the host's: an `<a>`/`<area>` in the CURRENT
+    ///    document carries it, so a link a transition removed, or one that
+    ///    appears only in a script's text, is refused by an honest worker.
+    ///
+    /// Bounded before either: an over-long href is refused unscanned.
+    fn carries_link(&mut self, session: SessionId, href: &str) -> Result<(), String> {
+        if href.len() > crate::links::MAX_HREF {
+            return Err(crate::links::LinkRefusal::TooLong(href.len()).to_string());
+        }
+        let carried = self.host.carried(session).ok_or("no such session")?;
+        if !crate::links::recording_spellings(href).iter().any(|n| carried.contains(n)) {
+            return Err("the document does not carry this link".into());
+        }
+        match self.host.links_to(session, href, self.now)? {
+            true => Ok(()),
+            false => Err("the current document does not carry this link".into()),
+        }
     }
 
     /// ★★ AN IMAGE, IN THE ORDER THAT MAKES A HOSTILE ONE CHEAP TO REFUSE.
@@ -499,6 +538,10 @@ impl DocumentHost for InProcessHost {
         gone
     }
     fn carried(&self, id: SessionId) -> Option<&Carried> { self.carried.get(&id) }
+    fn links_to(&mut self, id: SessionId, href: &str, _now: Millis) -> Result<bool, String> {
+        let s = self.sessions.get(id).ok_or("no such session")?;
+        Ok(crate::links::document_carries(&s.document().dom, href))
+    }
     /// ★ In this process, because this host IS this process: it exists for
     /// tests, and decodes with the same function the worker runs.
     fn decode_image(&mut self, id: SessionId, address: &str, bytes: &[u8], c: Ceilings, _now: Millis)

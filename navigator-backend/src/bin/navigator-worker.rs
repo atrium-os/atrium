@@ -106,6 +106,10 @@ impl Worker {
         Ok(out)
     }
 
+    fn links_to(&mut self, href: &str) -> Result<bool, String> {
+        Ok(navigator_backend::links::document_carries(&self.session()?.document().dom, href))
+    }
+
     /// What this worker holds. ★ The host does NOT trust this for its budget
     /// — a compromised worker would simply report zero — it charges what it
     /// measured locally before sending. This is for reporting to a person.
@@ -144,6 +148,7 @@ fn main() {
             REQ_BYTES => Ok(w.size().into_bytes()),
             REQ_URL => w.url().map(String::into_bytes),
             REQ_IMAGE => w.image(&f.payload),
+            REQ_HREF => w.links_to(&f.text()).map(|y| if y { "yes" } else { "no" }.into()),
             other => Err(format!("unknown request {other:?}")),
         };
         let reply = match answer {
