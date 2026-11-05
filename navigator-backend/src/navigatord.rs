@@ -246,7 +246,16 @@ pub struct Navigatord<H: DocumentHost> {
     /// Device pixels per CSS px, in 1/64 (64 = 1x, 128 = 2x). The display's
     /// property, so the broker's, not a page's.
     device_scale: u32,
+    /// ★ Each session's page zoom, in 1/64 (backend §4.9); absent is 100%.
+    /// The reader's choice, set by the UI. It multiplies the device scale
+    /// for that session's images, so an image is decoded again at its new
+    /// painted size after a zoom — within the same decode budget.
+    zoom: std::collections::BTreeMap<SessionId, u32>,
 }
+
+/// Page zoom bounds, in 1/64: 25% to 500%.
+pub const MIN_ZOOM_64: u32 = 16;
+pub const MAX_ZOOM_64: u32 = 320;
 
 /// NSG's unit: 1/64 CSS px.
 const NSG_UNIT: u64 = 64;
@@ -268,9 +277,28 @@ impl<H: DocumentHost> Navigatord<H> {
     /// Device pixels for a painted size in NSG units, rounded up so the box
     /// is covered, at least 1 per axis.
     pub fn device_size(&self, painted: (u32, u32)) -> (u32, u32) {
-        let d = |v: u32| (v as u64 * self.device_scale as u64).div_ceil(NSG_UNIT * NSG_UNIT).clamp(1, u32::MAX as u64) as u32;
+        self.device_size_at(painted, NSG_UNIT as u32)
+    }
+
+    /// The same at a page zoom (1/64): device scale x zoom.
+    pub fn device_size_at(&self, painted: (u32, u32), zoom_64: u32) -> (u32, u32) {
+        let s = self.device_scale as u64 * zoom_64 as u64;
+        let d = |v: u32| (v as u64 * s).div_ceil(NSG_UNIT * NSG_UNIT * NSG_UNIT).clamp(1, u32::MAX as u64) as u32;
         (d(painted.0), d(painted.1))
     }
+
+    /// Set a session's page zoom (1/64), within `MIN_ZOOM_64..=MAX_ZOOM_64`.
+    pub fn set_zoom(&mut self, session: SessionId, zoom_64: u32) -> Result<(), String> {
+        if !(MIN_ZOOM_64..=MAX_ZOOM_64).contains(&zoom_64) {
+            return Err(format!("zoom {zoom_64}/64 is outside {MIN_ZOOM_64}..={MAX_ZOOM_64}"));
+        }
+        if self.host.carried(session).is_none() { return Err("no such session".into()) }
+        if zoom_64 == NSG_UNIT as u32 { self.zoom.remove(&session); } else { self.zoom.insert(session, zoom_64); }
+        Ok(())
+    }
+
+    /// A session's page zoom (1/64).
+    pub fn zoom(&self, session: SessionId) -> u32 { self.zoom.get(&session).copied().unwrap_or(NSG_UNIT as u32) }
 
     /// Decoded image bytes charged to a session so far.
     pub fn decoded_bytes(&self, session: SessionId) -> usize {
@@ -293,7 +321,7 @@ impl<H: DocumentHost> Navigatord<H> {
             return Err("navigatord refuses to start: the document host is not confined \
                         (configure a launcher, e.g. `portcullis exec --daemon --instance {instance}`)".into());
         }
-        Ok(Navigatord { host, now: 0, schemes: SchemeAllowlist::default(), blobs: None, decoded: Default::default(), device_scale: NSG_UNIT as u32 })
+        Ok(Navigatord { host, now: 0, schemes: SchemeAllowlist::default(), blobs: None, decoded: Default::default(), device_scale: NSG_UNIT as u32, zoom: Default::default() })
     }
 
     /// An unconfined broker, for tests: in-process hosts, bare worker
@@ -302,7 +330,7 @@ impl<H: DocumentHost> Navigatord<H> {
     /// so a shipped binary that calls it does not link.
     #[cfg(any(test, feature = "unconfined-for-testing"))]
     pub fn unconfined_for_testing(host: H) -> Self {
-        Navigatord { host, now: 0, schemes: SchemeAllowlist::default(), blobs: None, decoded: Default::default(), device_scale: NSG_UNIT as u32 }
+        Navigatord { host, now: 0, schemes: SchemeAllowlist::default(), blobs: None, decoded: Default::default(), device_scale: NSG_UNIT as u32, zoom: Default::default() }
     }
 
     /// The host, for an operator (or a test) inspecting it.
@@ -547,7 +575,7 @@ impl<H: DocumentHost> Navigatord<H> {
         let c = Ceilings {
             budget: navigator_dom::profile::MAX_DECODED_IMAGE_BYTES.saturating_sub(used - mine),
             // ★ Charged at what is kept: the painted size, not the source's.
-            target: painted.map(|p| self.device_size(p)),
+            target: painted.map(|p| self.device_size_at(p, self.zoom(session))),
             ..Ceilings::default()
         };
         let pixels = self.host.decode_image(session, &address, &bytes, c, self.now)?;

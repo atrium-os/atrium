@@ -418,6 +418,21 @@ fn the_broker_decodes_to_the_painted_size<H: DocumentHost>(n: Navigatord<H>) {
     assert_eq!(n.decoded_bytes(s), 4 * 512 * 512 * 4 + 256 * 256 * 4);
     // Not painted means not painted.
     blocked(n.handle(Request::Image { session: s, address: addrs[1].clone(), painted: Some((0, 64)) }).pop().unwrap(), "zero dimension");
+    // ★ PAGE ZOOM (backend §4.9): after a zoom settles, every image is asked
+    // for again and comes back at painted x device scale x zoom — never
+    // below its painted resolution — and the charge is replaced, not added.
+    for (zoom, want) in [(32u32, 256u32), (96, 768), (128, 1024), (192, 1536), (64, 512)] {
+        n.set_zoom(s, zoom).unwrap();
+        for a in &addrs {
+            match image_at(&mut n, s, a, (256, 256)) {
+                Event::Image { pixels, .. } => assert_eq!((pixels.width, pixels.height), (want, want), "zoom {zoom}/64"),
+                other => panic!("zoom {zoom}/64: {other:?}"),
+            }
+        }
+        assert_eq!(n.decoded_bytes(s), 5 * want as usize * want as usize * 4, "zoom {zoom}/64 charged once per image");
+    }
+    assert!(n.set_zoom(s, 400).unwrap_err().contains("outside"));
+    assert!(n.set_zoom(s, 8).unwrap_err().contains("outside"));
 }
 
 #[test]

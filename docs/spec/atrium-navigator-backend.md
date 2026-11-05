@@ -1288,6 +1288,111 @@ and `timing.tsv`; `worker.sh` produces `worker.tsv`; both tool builds are kept b
    image working set, and two screens of prefetch either side, then tuning by the frame-time
    measurements.
 
+### 4.9 Zoom and text size (approved by the user, 2026-11-06)
+
+*Asked by the user, 2026-11-05: zoom and bigger fonts.* Four ways a reader changes size.
+None of them re-converts or re-normalizes: a normalized document carries every media
+context, so each is a fresh LAYOUT of the same document.
+
+1. **Page zoom.**
+   - The document is laid out at the window's width divided by the zoom (CSS px), so
+     media queries are evaluated at that width, as a browser does.
+   - It is painted at device scale × zoom. The broker's `device_scale` already scales
+     every image request, so an image is re-decoded at its new painted size within the
+     decode budget, and an SVG image is drawn again at it. Vector paths move by
+     `ATRIUM_CORE_FILL_TRANSFORM`, with no new geometry.
+   - The reader stays on the same element: the anchor of §4.8 and progressive
+     display, an element and an offset into it, is mapped through the new layout's
+     geometry.
+2. **Text size only.**
+   - A user text scale multiplies font sizes. The profile's fixed 16 px root becomes
+     16 px × scale, and `px` font sizes scale too. `em`, `rem` and `%` follow from them,
+     and the page reflows.
+   - An inherited font size is the parent's computed size, already scaled, and is
+     not scaled again. A root sized relatively (`html { font-size: 100% }`) resolves
+     against the reader's initial 16 px × scale. Margins, padding, borders, viewport
+     units and media queries do not scale.
+   - *Tables.* Each column's min-content and max-content widths (profile §3.13) are
+     measured again, exactly, in the worker, at the reader's text size. The
+     normalizer's pre-measure sheet is marked `atrium-premeasured`; at 100% it is used
+     as is, and at any other size it is dropped and the columns are measured at that
+     size. The normalized document, and its cache entry, do not depend on text size.
+   - ★★ *Not scaled.* The first design scaled the 100% widths by the text scale
+     (rounded to the nearest 1/64 px, halves away from zero). The corpus refuted it
+     (2026-11-06; 1,705 columns on 36 of the 122 pages):
+
+     | text size | within 1 px of exact | more than 1 px too narrow |
+     |---|---|---|
+     | 125% | 79% | 0.4% |
+     | 200% | 31% | 3.5% |
+     | 300% | 29% | 4.8% |
+
+     A column holds parts that do not scale: padding, borders, images and an
+     author's px floor. Most scaled columns came out too wide, and a too-narrow one
+     clips its text.
+3. **Pinch zoom.**
+   - The compositor magnifies the scene it already has, immediately: fills by
+     transform, the rest as composed.
+   - When the gesture settles, the page is laid out and drawn again at the new zoom,
+     sharp.
+4. **Wide tables.** A table whose min-content width exceeds the available width becomes
+   its own horizontally scrolling region, so the rest of the page still fits the window.
+   - NSG had no scroll offset (`auto` and `scroll` clip like `hidden`), so this needs a
+     `scroll` node. It is validated by the broker like every other node, and scrolled
+     by the UI and compositor, never the worker.
+   - Optionally, the table's first column stays in view.
+
+*Tests.* Every zoom level from 50% to 300% is byte-reproducible; the anchor is kept; no
+image is drawn below its painted resolution after a zoom settles; a zoom step is timed
+on the corpus and on the §4.8 big documents; tables that overflow are counted at 100%,
+200% and 300% before and after; and pages whose tables fit are byte-identical.
+
+*Built (M1: items 1 and 2, and item 1's re-decode).*
+- `Env::zoomed` lays a page out for zoom. `Env.text_scale_64` scales text in the
+  cascade.
+- `remeasure_tables` re-measures table columns at a text size other than 100%.
+- The broker's `set_zoom` is per session, from 25% to 500%. Image requests are
+  decoded at painted size × device scale × zoom, and each re-decode replaces that
+  image's charge rather than adding to it.
+- `navigator_render::anchor` finds an anchor in the geometry and maps it through the
+  new layout.
+
+*Measured (2026-11-06, `navigator-prerender/examples/zoom_measure`).* The corpus is the
+122 readable documents, each at 8 levels from 50% to 300%, by page zoom and by text
+size: 1,952 layouts.
+- **Reproducible.** Two renders at every level gave identical NSG; 0 of 1,952
+  differed. All 56 big-document layouts also reproduced.
+- **Byte-identical at 100%.** Every layout at 100% equals the plain render. On the
+  421-document identity set, the scenes are identical to the build before zoom. The
+  normalized documents that have tables (115) gain the `atrium-premeasured`
+  attribute and nothing else.
+- **Anchor.** There are 1,098 reading positions, 9 per page at 10% to 90% of its
+  scroll range. None was lost at any level. Two cases leave a position elsewhere,
+  and both have a defined answer:
+  - *Pinned to the end.* When the page got shorter than the position (zoom out,
+    and smaller text), it was pinned to the end: page zoom 166 at 50%, text size 7
+    at 300%.
+  - *Element hidden.* A media query at the new width hid the element: page zoom
+    16 to 36. The caller keeps the same fraction of the document.
+- **Image resolution.** After a zoom, every image comes back at painted size ×
+  device scale × zoom, from 50% to 300% (`navigator-backend/tests/image.rs`).
+- **The zoom step is one full layout and scene** of the cached normalized document.
+  Text size adds the column re-measure.
+
+  | | p50 | p90 | max |
+  |---|---|---|---|
+  | page zoom, corpus | 21–23 ms | 139–183 ms | 492 ms |
+  | text size, corpus | 22–23 ms | 163–193 ms | 744 ms |
+  | page zoom, big documents | | | whatwg 2.5 s, 100k-row table 4.7 s |
+  | text size, big documents | | | whatwg 4.3 s, 100k-row table 8.1 s |
+
+  On a big document a zoom costs what its first layout cost. That is the case for
+  §4.8's bands and checkpoints. Until then, pinch (item 3) is what keeps the zoom
+  immediate.
+- **Tables needing more than the available width** (page zoom, min-content against
+  800/zoom px), before item 4: 9 tables on 6 pages at 100%, 72 on 17 at 200%, and
+  220 on 24 at 300%.
+
 ## 5. The store is Tessera
 
 `atrium-doc://<hash>` *is* a content address in the root filesystem's CAS. This is what

@@ -324,6 +324,13 @@ pub fn layout_geometry(html: &str, fonts: &FontSet, env: &Env, subs: &Subresourc
 }
 
 fn render_inner(html: &str, fonts: &FontSet, env: &Env, subs: &Subresources, geo: bool) -> (HtmlOut, Option<GeoLog>, Dom) {
+    // ★ At another text size the pre-measured columns are measured AGAIN,
+    // exactly (backend §4.9, `remeasure_tables`).
+    let remeasured;
+    let html = if env.text_scale_64 != 64 && html.contains("atrium-premeasured") {
+        remeasured = remeasure_tables(html, fonts, env);
+        remeasured.as_str()
+    } else { html };
     let dom = navigator_dom::parse(html);
     let mut diagnostics = vec![];
     // Stylesheets: every <style>, in document order, one author layer each
@@ -412,6 +419,14 @@ fn render_inner(html: &str, fonts: &FontSet, env: &Env, subs: &Subresources, geo
 ///
 /// Returns the rewritten HTML and how many columns were measured.
 pub fn premeasure_tables(html: &str, fonts: &FontSet, env: &Env) -> (String, usize) {
+    // Always at text size 100%: the renderer scales the result (§4.9), so
+    // the normalizer's output does not depend on the reader's text size.
+    premeasure_tables_at(html, fonts, &Env { text_scale_64: 64, ..env.clone() })
+}
+
+/// The same measurement at `env`'s own text scale: what an exact re-measure
+/// at another text size gives (`remeasure_tables`).
+pub fn premeasure_tables_at(html: &str, fonts: &FontSet, env: &Env) -> (String, usize) {
     let dom = navigator_dom::parse(html);
     let mut sheets: Vec<Stylesheet> = vec![];
     for h in dom.by_tag_anywhere("style") {
@@ -543,6 +558,8 @@ pub fn premeasure_tables(html: &str, fonts: &FontSet, env: &Env) -> (String, usi
         if let Some(p) = dom2.get_mut(t) { let g = p.children.pop().unwrap(); p.children.insert(0, g) }
     }
     let style = dom2.create(Kind::Element("style".into()));
+    // Marked, so the renderer can scale it at another text size (§4.9).
+    dom2.set_attr(style, "atrium-premeasured", "");
     let text = dom2.create(Kind::Text(css));
     dom2.append(style, text);
     let head = dom2.by_tag_anywhere("head").into_iter().next()
@@ -550,6 +567,27 @@ pub fn premeasure_tables(html: &str, fonts: &FontSet, env: &Env) -> (String, usi
         .unwrap_or(dom2.root());
     dom2.append(head, style);
     (dom2.serialize(), n)
+}
+
+/// ★ TEXT SIZE ON PRE-MEASURED TABLES (backend §4.9): the normalizer's
+/// column widths are measured at text size 100%, and at any other size they
+/// are measured again, exactly, at that size — the pre-measure sheet is
+/// dropped and `premeasure_tables_at` runs on what is left.
+///
+/// ★★ NOT SCALED. Scaling the 100% widths by the text scale was the first
+/// design, and the corpus refuted it (2026-11-06, 1,705 columns on 36 of the
+/// 122 pages): at 200% only 31% of columns came within 1 px of an exact
+/// re-measure. A column holds parts that do not scale — padding, borders,
+/// images, an author's px floor — so most came out too WIDE, and 3.5% (4.8%
+/// at 300%) came out more than 1 px too NARROW, which clips their text.
+pub fn remeasure_tables(html: &str, fonts: &FontSet, env: &Env) -> String {
+    let mut dom = navigator_dom::parse(html);
+    for h in dom.by_tag_anywhere("style") {
+        if dom.attr(h, "atrium-premeasured").is_some() {
+            if let Some(p) = dom.nodes[h as usize].parent { dom.remove_child(p, h); }
+        }
+    }
+    premeasure_tables_at(&dom.serialize(), fonts, env).0
 }
 
 /// ★ The static position of an absolutely positioned child of a flex
@@ -4960,6 +4998,28 @@ mod tests {
         let (sp, l) = (boxes(&o, 0xff0000ff)[0], boxes(&o, 0x0000ffff)[0]);
         assert!(l.0 >= sp.0 + sp.2, "the long cell is in column 2: {sp:?} {l:?}");
         assert!(l.2 > 4 * sp.2, "and column 2 is the wide one: {sp:?} {l:?}");
+    }
+
+    #[test]
+    fn text_size_remeasures_columns_exactly_not_by_scaling() {
+        // A column with a fixed part (an image's 120 px) and text beside it:
+        // scaling the 100% widths would double the image's share too.
+        let src = r#"<style>td { padding-left: 6px; padding-right: 6px } .p { width: 120px; height: 10px; background-color: #ff0000 }
+            .t { background-color: #0000ff }</style>
+            <table><tr><td><div class="p"></div></td><td class="t">Supercalifragilistic expialidocious words</td></tr></table>"#;
+        let fonts = FontSet::load().unwrap();
+        let big = Env { text_scale_64: 128, ..Env::default() };
+        let (at100, _) = premeasure_tables(src, &fonts, &big);
+        assert!(at100.contains("atrium-premeasured"), "the normalizer's sheet is marked");
+        let (exact, _) = premeasure_tables_at(src, &fonts, &big);
+        let a = render_html(&at100, &fonts, &big);
+        let b = render_html(&exact, &fonts, &big);
+        assert!(a.diagnostics.is_empty(), "{:?}", a.diagnostics);
+        assert_eq!(crate::nsg::write(&a.scene, &fonts), crate::nsg::write(&b.scene, &fonts),
+                   "the 100%-measured document at 200% lays out as one measured at 200%");
+        assert_eq!(crate::nsg::write(&render_html(&at100, &fonts, &Env::default()).scene, &fonts),
+                   crate::nsg::write(&render_html(&premeasure_tables(src, &fonts, &Env::default()).0, &fonts, &Env::default()).scene, &fonts),
+                   "and at 100% nothing is measured again");
     }
 
     #[test]

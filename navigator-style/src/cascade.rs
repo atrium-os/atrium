@@ -29,9 +29,28 @@ pub struct Env {
     pub reduced_motion: bool,
     pub contrast: &'static str,
     pub dppx: u8,
+    /// ★ The reader's TEXT size (backend §4.9), in 1/64: 64 is the profile's
+    /// own. The root's 16 px becomes 16 px × this, and every `px` font size
+    /// is multiplied by it; `em`, `rem` and `%` follow. Nothing else scales.
+    pub text_scale_64: u32,
 }
 impl Default for Env {
-    fn default() -> Self { Env { width_px: 800.0, height_px: 600.0, dark: false, reduced_motion: false, contrast: "no-preference", dppx: 1 } }
+    fn default() -> Self { Env { width_px: 800.0, height_px: 600.0, dark: false, reduced_motion: false, contrast: "no-preference", dppx: 1, text_scale_64: 64 } }
+}
+
+impl Env {
+    /// The text scale as a factor.
+    pub fn text_scale(&self) -> f64 { self.text_scale_64.max(1) as f64 / 64.0 }
+
+    /// ★ PAGE ZOOM (backend §4.9): a `window_w` x `window_h` CSS-px window
+    /// at `zoom_64` (64 = 100%) is laid out at the window's size divided by
+    /// the zoom — media queries evaluated there — and painted at the
+    /// device scale times the zoom (the broker's). Exactly `Env::default()`'s
+    /// geometry at 800 x 600 and 100%.
+    pub fn zoomed(window_w: f64, window_h: f64, zoom_64: u32) -> Env {
+        let z = zoom_64.max(1) as f64 / 64.0;
+        Env { width_px: window_w / z, height_px: window_h / z, ..Env::default() }
+    }
 }
 
 /// Computed style of one element: every longhand, resolved (no inherit,
@@ -228,10 +247,12 @@ fn substitute(toks: &[Token], customs: &BTreeMap<String, Vec<Token>>, depth: usi
     Ok(out)
 }
 
-struct Base { font_px: f64, root_px: f64, vw: f64, vh: f64 }
+/// `px_scale` multiplies absolute (`px`) lengths: the text scale while a
+/// font size is resolved, 1 for everything else.
+struct Base { font_px: f64, root_px: f64, vw: f64, vh: f64, px_scale: f64 }
 
 fn len_px(l: &Length, b: &Base) -> f64 {
-    match l.unit { Unit::Px => l.v, Unit::Em => l.v * b.font_px, Unit::Rem => l.v * b.root_px,
+    match l.unit { Unit::Px => l.v * b.px_scale, Unit::Em => l.v * b.font_px, Unit::Rem => l.v * b.root_px,
                    // `ch` without the font's measured "0" advance: CSS's 0.5em fallback.
                    Unit::Ch => l.v * b.font_px * 0.5, Unit::Vw => l.v * b.vw / 100.0, Unit::Vh => l.v * b.vh / 100.0 }
 }
@@ -371,7 +392,10 @@ pub fn cascade(dom: &Dom, authors: &[Stylesheet], env: &Env) -> Styled {
         order.push(h);
         if let Some(n) = dom.get(h) { for &c in n.children.iter().rev() { stack.push(c) } }
     }
-    let mut root_px = 16.0;
+    // ★ The initial font size is the reader's: 16 px x the text scale. A
+    // root's `100%`, `1em` or `1rem` resolves against it (usa.gov's root
+    // `font-size: 100%` held its whole page at 16 px whatever the scale).
+    let mut root_px = 16.0 * env.text_scale();
     for h in order {
         if dom.tag(h).is_none() || !matches!(dom.get(h).map(|n| &n.kind), Some(Kind::Element(_))) { continue }
         let parent = dom.get(h).and_then(|n| n.parent).and_then(|p| styles.get(p as usize).cloned().flatten());
@@ -398,7 +422,7 @@ pub fn cascade(dom: &Dom, authors: &[Stylesheet], env: &Env) -> Styled {
             }
         }
         // font-size first: every other em resolves against it.
-        let parent_font = parent.as_ref().map(|p| p.font_size_px).unwrap_or(16.0);
+        let parent_font = parent.as_ref().map(|p| p.font_size_px).unwrap_or(16.0 * env.text_scale());
         let is_root = parent.is_none();
         let fs_i = props.iter().position(|p| *p == "font-size").expect("row 34");
         let mut values = vec![V::Kw("unset"); props.len()];
@@ -426,18 +450,32 @@ pub fn cascade(dom: &Dom, authors: &[Stylesheet], env: &Env) -> Styled {
             }
         };
         let fs_v = resolve(fs_i, specified[fs_i].as_ref(), &mut diagnostics);
+        // ★ The text scale applies here, and only here: to the root's own
+        // size and to absolute font sizes an AUTHOR wrote; relative ones
+        // follow from those. ★★ An inherited font size is the parent's
+        // COMPUTED px, already scaled: scaling it again compounded the scale
+        // once per nesting level (a 3,258 px page was 101 million px tall
+        // at 300%).
+        let ts = env.text_scale();
+        let fs_inherited = match &specified[fs_i] {
+            None | Some((Specified::Inherit, _)) => true,
+            Some((Specified::Unresolved(toks), _)) => !matches!(substitute(toks, &customs, 0, &mut vec![])
+                .and_then(|t| values::parse_value(props[fs_i], &t, &web)), Ok(Specified::Value(_))),
+            _ => false,
+        };
         let font_px = match &fs_v {
-            None => if is_root { 16.0 } else { parent_font },
-            Some(V::Len(l)) => len_px(l, &Base { font_px: parent_font, root_px, vw: env.width_px, vh: env.height_px }),
+            _ if fs_inherited && !is_root => parent_font,
+            None => if is_root { 16.0 * ts } else { parent_font },
+            Some(V::Len(l)) => len_px(l, &Base { font_px: parent_font, root_px, vw: env.width_px, vh: env.height_px, px_scale: ts }),
             Some(V::Pct(p)) => parent_font * p / 100.0,
             Some(V::Calc(c)) => {
-                let c = calc_px(c, &Base { font_px: parent_font, root_px, vw: env.width_px, vh: env.height_px });
+                let c = calc_px(c, &Base { font_px: parent_font, root_px, vw: env.width_px, vh: env.height_px, px_scale: ts });
                 calc_eval_px(&c).unwrap_or(parent_font)
             }
             Some(_) => parent_font,
         };
         if is_root { root_px = font_px }
-        let base = Base { font_px, root_px, vw: env.width_px, vh: env.height_px };
+        let base = Base { font_px, root_px, vw: env.width_px, vh: env.height_px, px_scale: 1.0 };
         for i in 0..props.len() {
             values[i] = if i == fs_i { V::Len(Length { v: font_px, unit: Unit::Px }) } else {
                 let inherited_already = specified[i].is_none() && gram[i].2;
@@ -501,6 +539,32 @@ mod tests {
         assert_eq!(i.get("color"), &V::Color(Color::Rgba(Rgba { r: 0, g: 0, b: 255, a: 255 })), "color inherits");
         let o = s.styles[el(&d, "o") as usize].as_ref().unwrap();
         assert_eq!(px(o.get("margin-top")), 0.0, "margin does not inherit");
+    }
+
+    #[test]
+    fn text_scale_scales_authored_px_and_the_root_once_and_nothing_else() {
+        let html = "<div id=a><div id=b><div id=c><p id=d>x</p></div></div></div><section id=e><p id=f>y</p></section><div id=v>z</div>";
+        let css = "#a { font-size: 20px; margin-top: 10px } #c { font-size: 1.5em } #d { font-size: 50% } #e { font-size: 1rem } #f { font-size: inherit } #v { font-size: 5vw }";
+        let dom = navigator_dom::parse(html);
+        let sheet = parse_sheet(css).sheet;
+        let at = |t: u32| cascade(&dom, std::slice::from_ref(&sheet), &Env { text_scale_64: t, ..Env::default() });
+        let (one, two) = (at(64), at(128));
+        let fs = |s: &Styled, id: &str| s.styles[el(&dom, id) as usize].as_ref().unwrap().font_size_px;
+        for (id, want) in [("a", 20.0), ("b", 20.0), ("c", 30.0), ("d", 15.0), ("e", 16.0), ("f", 16.0)] {
+            assert_eq!(fs(&one, id), want, "{id} at 100%");
+            // ★ Inherited and relative sizes scale ONCE: an inherited px is
+            // already the parent's scaled size.
+            assert_eq!(fs(&two, id), want * 2.0, "{id} at 200%");
+        }
+        assert_eq!(fs(&one, "v"), fs(&two, "v"), "a viewport unit is the window's, not the text's");
+        assert_eq!(px(two.styles[el(&dom, "a") as usize].as_ref().unwrap().get("margin-top")), 10.0, "a px margin is not text");
+        // ★ A root sized RELATIVELY resolves against the reader's initial
+        // size (usa.gov: `html { font-size: 100% }`, then rem everywhere).
+        let dom = navigator_dom::parse("<html id=r><body><p id=p>x</p></body></html>");
+        let sheet = parse_sheet("#r { font-size: 62.5% } #p { font-size: 1.6rem }").sheet;
+        let s = cascade(&dom, std::slice::from_ref(&sheet), &Env { text_scale_64: 128, ..Env::default() });
+        assert_eq!(s.styles[el(&dom, "r") as usize].as_ref().unwrap().font_size_px, 20.0);
+        assert_eq!(s.styles[el(&dom, "p") as usize].as_ref().unwrap().font_size_px, 32.0);
     }
 
     #[test]
