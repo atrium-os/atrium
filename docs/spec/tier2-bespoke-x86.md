@@ -1,6 +1,6 @@
 # Tier-2 bespoke backend for x86_64
 
-Status: phases 1-7 landed 2026-11-05 (phase 5 scalarised only; packed forms move to phase 9). Owner: the x86_64 port thread. Companion to
+Status: phases 1-8 landed 2026-11-05 (phase 5 scalarised only; packed forms move to phase 9). Owner: the x86_64 port thread. Companion to
 [x86_64-port.md](x86_64-port.md) §1 and the arm64 backend in
 `atrium-spv-backend-bespoke/`.
 

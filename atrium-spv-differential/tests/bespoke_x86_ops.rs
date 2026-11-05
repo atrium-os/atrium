@@ -694,3 +694,100 @@ fn derivative_helper_call() {
     assert_eq!(results[1].1.map(f32::from_bits), [e * 10.0, e * 10.0 + 1000.0, 3.5, 4.25]);
     assert_eq!(results[1].2.iter().map(|s| s.1).collect::<Vec<_>>(), vec![0, 1]);
 }
+
+/// The span entry (`atrium_fs_main_span`) against per-lane calls of
+/// `atrium_fs_main`: a varying- and FragCoord-dependent shader, a mask
+/// with holes, masked-off lanes left untouched.
+#[test]
+fn span_thunk_matches_per_lane_fs_main() {
+    use rspirv::dr::Operand::LiteralBit32;
+    use rspirv::spirv::{
+        AddressingModel, BuiltIn, Capability, Decoration, ExecutionMode, ExecutionModel,
+        FunctionControl, MemoryModel, StorageClass as SC,
+    };
+    if !cfg!(target_arch = "x86_64") {
+        return;
+    }
+    let mut b = Builder::new();
+    b.set_version(1, 0);
+    b.capability(Capability::Shader);
+    b.memory_model(AddressingModel::Logical, MemoryModel::GLSL450);
+    let void = b.type_void();
+    let f32_ty = b.type_float(32, None);
+    let vec4 = b.type_vector(f32_ty, 4);
+    let void_fn = b.type_function(void, vec![]);
+    let p_out4 = b.type_pointer(None, SC::Output, vec4);
+    let p_in4 = b.type_pointer(None, SC::Input, vec4);
+    let p_inf = b.type_pointer(None, SC::Input, f32_ty);
+    let o0 = b.variable(p_out4, None, SC::Output, None);
+    b.decorate(o0, Decoration::Location, vec![LiteralBit32(0)]);
+    let fc = b.variable(p_in4, None, SC::Input, None);
+    b.decorate(fc, Decoration::BuiltIn, vec![rspirv::dr::Operand::BuiltIn(BuiltIn::FragCoord)]);
+    let u = b.variable(p_inf, None, SC::Input, None);
+    b.decorate(u, Decoration::Location, vec![LiteralBit32(0)]);
+    let main = b.begin_function(void, None, FunctionControl::NONE, void_fn).unwrap();
+    b.begin_block(None).unwrap();
+    let fcv = b.load(vec4, None, fc, None, vec![]).unwrap();
+    let x = b.composite_extract(f32_ty, None, fcv, vec![0]).unwrap();
+    let y = b.composite_extract(f32_ty, None, fcv, vec![1]).unwrap();
+    let z = b.composite_extract(f32_ty, None, fcv, vec![2]).unwrap();
+    let w = b.composite_extract(f32_ty, None, fcv, vec![3]).unwrap();
+    let uv = b.load(f32_ty, None, u, None, vec![]).unwrap();
+    let xu = b.f_mul(f32_ty, None, x, uv).unwrap();
+    let c = b.composite_construct(vec4, None, vec![xu, y, z, w]).unwrap();
+    b.store(o0, c, None, vec![]).unwrap();
+    b.ret().unwrap();
+    b.end_function().unwrap();
+    b.entry_point(ExecutionModel::Fragment, main, "main", vec![o0, fc, u]);
+    b.execution_mode(main, ExecutionMode::OriginUpperLeft, vec![]);
+    let spirv = assemble(b);
+    let module = atrium_spv_frontend::translate(&spirv).expect("frontend");
+    let obj = atrium_spv_backend_bespoke_x86::compile(
+        &module, atrium_spv_backend_bespoke_x86::Target::host()).expect("bespoke-x86").object;
+    let dir = tempfile::tempdir().unwrap();
+    let o = dir.path().join("s.o");
+    let so = dir.path().join("s.so");
+    std::fs::write(&o, obj).unwrap();
+    assert!(std::process::Command::new("cc").arg("-shared").arg("-o").arg(&so).arg(&o)
+        .status().unwrap().success());
+    let lib = unsafe { libloading::Library::new(&so) }.unwrap();
+    type FsMain = unsafe extern "C" fn(
+        *const u8, *const u8, *const u8, f32, f32, f32, f32, u32, *mut f32, *mut f32, u32, u32,
+    );
+    type FsSpanMain = unsafe extern "C" fn(
+        *const u8, u32, *const u8, *const u8, *const f32, *const f32, *const f32, *const f32,
+        u64, u32, *mut f32, *mut f32, u32, u32, u32,
+    );
+    let f: libloading::Symbol<FsMain> = unsafe { lib.get(b"atrium_fs_main").unwrap() };
+    let fs: libloading::Symbol<FsSpanMain> = unsafe { lib.get(b"atrium_fs_main_span").unwrap() };
+    const N: usize = 7;
+    let stride = 16u32;
+    let mut vary = vec![0u8; N * stride as usize];
+    for l in 0..N {
+        vary[l * 16..l * 16 + 4].copy_from_slice(&(1.5f32 + l as f32).to_le_bytes());
+    }
+    let fx: Vec<f32> = (0..N).map(|l| 10.0 + l as f32).collect();
+    let fy: Vec<f32> = (0..N).map(|l| 20.0 + l as f32).collect();
+    let fz: Vec<f32> = (0..N).map(|l| 0.25 * l as f32).collect();
+    let fw: Vec<f32> = (0..N).map(|l| 1.0 / (1.0 + l as f32)).collect();
+    let mask: u64 = 0b1011101 | (1 << 40); // bit 40 is past lane_count
+    let mut span_c = [-1.0f32; N * 4];
+    let mut span_d = [-1.0f32; N];
+    unsafe {
+        fs(vary.as_ptr(), stride, std::ptr::null(), std::ptr::null(), fx.as_ptr(), fy.as_ptr(),
+           fz.as_ptr(), fw.as_ptr(), mask, 1, span_c.as_mut_ptr(), span_d.as_mut_ptr(), 1, 3, N as u32);
+    }
+    for l in 0..N {
+        let mut c = [-1.0f32; 4];
+        let mut d = -1.0f32;
+        if mask >> l & 1 != 0 {
+            unsafe {
+                f(vary.as_ptr().add(l * 16), std::ptr::null(), std::ptr::null(), fx[l], fy[l], fz[l], fw[l],
+                  1, c.as_mut_ptr(), &mut d, 1, 3);
+            }
+            assert_eq!(c[0], fx[l] * (1.5 + l as f32));
+        }
+        assert_eq!(&span_c[l * 4..l * 4 + 4], &c, "lane {l}");
+        assert_eq!(span_d[l].to_bits(), d.to_bits(), "lane {l} depth");
+    }
+}

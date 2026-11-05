@@ -44,11 +44,13 @@
 //! and derivatives are calls to the runtime's helpers through the
 //! uniforms table, staged so arguments never clobber each other.
 //!
-//! Not yet: PackHalf2x16 (Cranelift's NaN behaviour), f64, and the
-//! fragment span entry (phase 8).
+//! Fragment shaders in the span subset also get `atrium_fs_main_span`
+//! ([`span`]). Not yet: PackHalf2x16 (Cranelift's NaN behaviour), f64, and
+//! packed vector forms (phase 9).
 
 mod emit;
 mod regalloc;
+mod span;
 mod vcode;
 
 use atrium_spv_ir::{Function, Module, ShaderStage};
@@ -118,11 +120,13 @@ pub fn compile(module: &Module, _target: Target) -> Result<CompileOutput, Backen
     obj.add_section(Vec::new(), b".note.GNU-stack".to_vec(), object::SectionKind::Elf(object::elf::SHT_PROGBITS));
     let mut pcmap = atrium_spv_pcmap::Builder::new();
     for func in &module.functions {
-        let (body, pcs) = emit_function(func)?;
+        let (mut body, pcs) = emit_function(func)?;
+        let main_len = body.len();
+        let span_at = with_span_thunk(func, &mut body)?;
         let sym = obj.add_symbol(object::write::Symbol {
             name: exported_symbol_name(func).into_bytes(),
             value: 0,
-            size: body.len() as u64,
+            size: main_len as u64,
             kind: object::SymbolKind::Text,
             scope: object::SymbolScope::Dynamic,
             weak: false,
@@ -130,6 +134,18 @@ pub fn compile(module: &Module, _target: Target) -> Result<CompileOutput, Backen
             flags: object::SymbolFlags::None,
         });
         let off = obj.add_symbol_data(sym, text, &body, 16);
+        if let Some(at) = span_at {
+            obj.add_symbol(object::write::Symbol {
+                name: format!("{}_span", exported_symbol_name(func)).into_bytes(),
+                value: off + at as u64,
+                size: (body.len() - at) as u64,
+                kind: object::SymbolKind::Text,
+                scope: object::SymbolScope::Dynamic,
+                weak: false,
+                section: object::write::SymbolSection::Section(text),
+                flags: object::SymbolFlags::None,
+            });
+        }
         for (rel, spirv) in pcs {
             pcmap.push(off as u32 + rel, spirv);
         }
@@ -150,8 +166,12 @@ pub fn compile_blob(module: &Module, _target: Target) -> Result<BlobOutput, Back
         while code.len() % 16 != 0 {
             code.push(0xCC);
         }
-        let (body, pcs) = emit_function(func)?;
+        let (mut body, pcs) = emit_function(func)?;
+        let span_at = with_span_thunk(func, &mut body)?;
         let off = code.len() as u32;
+        if let Some(at) = span_at {
+            entries.fs_span = Some(off + at as u32);
+        }
         for (rel, spirv) in pcs {
             pcmap.push(off + rel, spirv);
         }
@@ -164,6 +184,20 @@ pub fn compile_blob(module: &Module, _target: Target) -> Result<BlobOutput, Back
     }
     let blob = atrium_spv_blob::ShaderBlob { arch: atrium_spv_blob::ARCH_X86_64, code, entries };
     Ok(BlobOutput { blob: blob.to_bytes(), pcmap: pcmap.finish_to_bytes() })
+}
+
+/// Append the fragment span thunk (16-byte aligned, int3 padding) to a
+/// function body when the shader is in the span subset. Returns its
+/// offset in the body.
+fn with_span_thunk(func: &Function, body: &mut Vec<u8>) -> Result<Option<usize>, BackendError> {
+    let at = body.len().next_multiple_of(16);
+    let Some(thunk) = span::thunk(func, at as u64)? else { return Ok(None) };
+    body.resize(at, 0xCC);
+    if cfg!(debug_assertions) {
+        roundtrip_check(&thunk)?;
+    }
+    body.extend_from_slice(&thunk);
+    Ok(Some(at))
 }
 
 fn exported_symbol_name(func: &Function) -> String {
