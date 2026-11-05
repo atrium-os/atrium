@@ -17,7 +17,7 @@
 use navigator_backend::reverse::{Back, Forward};
 use navigator_backend::session::{SessionId, SessionLimits, Sessions, Trail};
 use navigator_backend::wire::*;
-use navigator_backend::{ingest, Limits};
+use navigator_backend::{image, ingest, Limits};
 use std::io::{BufReader, Write};
 
 /// ★ A `Sessions` holding at most ONE session: the same code the in-process
@@ -88,6 +88,24 @@ impl Worker {
         Ok(String::new())
     }
 
+    /// ★ Decode one image of THIS document (threat model §2.4). The broker
+    /// sends the bytes it read from the store and the document's remaining
+    /// decoded-bytes budget; the worker checks the bytes against their
+    /// address itself, and refuses on the header before allocating a frame.
+    /// The answer is `<width> <height>\n` and the RGBA8 pixels, which the
+    /// broker validates again before anything else sees them.
+    fn image(&mut self, payload: &[u8]) -> Result<Vec<u8>, String> {
+        let nl = payload.iter().position(|&b| b == b'\n').ok_or("image request has no header")?;
+        let head = std::str::from_utf8(&payload[..nl]).map_err(|_| "image request header is not text")?;
+        let (address, budget) = head.split_once(' ').ok_or("image request header has no budget")?;
+        let budget: usize = budget.parse().map_err(|_| "image request budget is not a number")?;
+        let c = image::Ceilings { budget: budget.min(navigator_dom::profile::MAX_DECODED_IMAGE_BYTES), ..Default::default() };
+        let px = image::decode(address, &payload[nl + 1..], c).map_err(|e| e.to_string())?;
+        let mut out = format!("{} {}\n", px.width, px.height).into_bytes();
+        out.extend_from_slice(&px.rgba);
+        Ok(out)
+    }
+
     /// What this worker holds. ★ The host does NOT trust this for its budget
     /// — a compromised worker would simply report zero — it charges what it
     /// measured locally before sending. This is for reporting to a person.
@@ -115,23 +133,27 @@ fn main() {
                 std::process::exit(2);
             }
         };
-        let answer = match f.tag.as_str() {
-            REQ_OPEN => w.open(&f.payload),
-            REQ_SAVE => w.save().map(|b| String::from_utf8_lossy(&b).into_owned()),
-            REQ_RESTORE => w.restore(&f.payload),
-            REQ_NAVIGATE => w.navigate(&f.text()),
-            REQ_BACK => w.back(),
-            REQ_FORWARD => w.forward(),
-            REQ_TRIGGERS => Ok(w.triggers()),
-            REQ_BYTES => Ok(w.size()),
-            REQ_URL => w.url(),
+        let answer: Result<Vec<u8>, String> = match f.tag.as_str() {
+            REQ_OPEN => w.open(&f.payload).map(String::into_bytes),
+            REQ_SAVE => w.save(),
+            REQ_RESTORE => w.restore(&f.payload).map(String::into_bytes),
+            REQ_NAVIGATE => w.navigate(&f.text()).map(String::into_bytes),
+            REQ_BACK => w.back().map(String::into_bytes),
+            REQ_FORWARD => w.forward().map(String::into_bytes),
+            REQ_TRIGGERS => Ok(w.triggers().into_bytes()),
+            REQ_BYTES => Ok(w.size().into_bytes()),
+            REQ_URL => w.url().map(String::into_bytes),
+            REQ_IMAGE => w.image(&f.payload),
             other => Err(format!("unknown request {other:?}")),
         };
         let reply = match answer {
             Ok(payload) => Frame::new(RSP_OK, payload),
             Err(why) => Frame::new(RSP_ERR, why),
         };
-        if write_frame(&mut output, &reply).is_err() { return }
+        // ★ The one frame allowed past MAX_FRAME is a pixel reply, and
+        // only up to the budget the broker sent with the request.
+        let max = if f.tag == REQ_IMAGE { MAX_PIXEL_FRAME } else { MAX_FRAME };
+        if write_frame_limited(&mut output, &reply, max).is_err() { return }
         let _ = output.flush();
     }
 }

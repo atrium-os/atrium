@@ -22,6 +22,13 @@ pub const MAX_DOCUMENT_BYTES: usize = 8 * 1024 * 1024;
 pub const MAX_ELEMENTS: usize = 131_072;
 pub const MAX_DEPTH: usize = 256;
 pub const MAX_STYLESHEETS: usize = 256;
+/// An image's width or height, in pixels. A cheap early reject, checked on
+/// the header before a frame is allocated (profile §5: "the dimension cap is
+/// a cheap early reject on a header").
+pub const MAX_IMAGE_DIMENSION: u32 = 16_384;
+/// ★ The image ceiling that BINDS: decoded bytes across one document. A
+/// single 16,384² image is about 1 GiB, which this forbids.
+pub const MAX_DECODED_IMAGE_BYTES: usize = 256 * 1024 * 1024;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Violation {

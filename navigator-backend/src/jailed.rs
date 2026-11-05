@@ -42,7 +42,11 @@ use std::collections::HashMap;
 use std::io::BufReader;
 use std::process::{Child, ChildStdin, Command, Stdio};
 use std::sync::mpsc::{channel, Receiver, RecvTimeoutError};
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Arc;
 use std::time::Duration;
+use crate::carried::Carried;
+use crate::image::{Ceilings, Pixels};
 
 /// How a worker process is launched.
 #[derive(Debug, Clone)]
@@ -145,10 +149,23 @@ struct Worker {
     /// with nothing to click and reported no error at all. The cache is the
     /// fix; the empty vec was the bug.
     triggers: Vec<String>,
+    /// ★ The largest reply the reader thread will accept, set before each
+    /// request. `MAX_FRAME` for everything except an image, whose reply may
+    /// be as large as the budget the broker sent with it and no larger: a
+    /// worker announcing a 256 MiB frame unasked is refused before the
+    /// allocation, as any oversized frame is.
+    reply_limit: Arc<AtomicUsize>,
+    /// What the recording carries, from the bytes the broker was handed.
+    carried: Carried,
 }
 
 impl Worker {
     fn request(&mut self, f: &Frame, deadline: Duration) -> Result<Frame, String> {
+        self.request_limited(f, deadline, MAX_FRAME)
+    }
+
+    fn request_limited(&mut self, f: &Frame, deadline: Duration, reply: usize) -> Result<Frame, String> {
+        self.reply_limit.store(reply, Ordering::SeqCst);
         let stdin = self.stdin.as_mut().ok_or("worker input is closed")?;
         write_frame(stdin, f).map_err(|e| e.to_string())?;
         match self.frames.recv_timeout(deadline) {
@@ -310,10 +327,12 @@ impl DocumentHost for JailedHost {
         // "bound every request" would be a comment rather than a mechanism:
         // the broker would block in `read` with no way back out.
         let (tx, frames) = channel();
+        let reply_limit = Arc::new(AtomicUsize::new(MAX_FRAME));
+        let limit = reply_limit.clone();
         std::thread::spawn(move || {
             let mut r = BufReader::new(stdout);
             loop {
-                match read_frame(&mut r) {
+                match read_frame_limited(&mut r, limit.load(Ordering::SeqCst)) {
                     Ok(f) => if tx.send(Ok(f)).is_err() { return },
                     Err(WireError::Closed) => return,
                     Err(e) => { let _ = tx.send(Err(e.to_string())); return }
@@ -324,7 +343,7 @@ impl DocumentHost for JailedHost {
         self.next = id;
         self.workers.insert(id, Worker {
             child, stdin: Some(stdin), frames, charged, opened_at: now, last_seen: now,
-            triggers: vec![],
+            triggers: vec![], reply_limit, carried: Carried::new(recording),
         });
 
         match self.ask(id, Frame::new(REQ_OPEN, recording), now) {
@@ -436,6 +455,34 @@ impl DocumentHost for JailedHost {
     fn bytes(&self) -> usize { self.workers.values().map(|w| w.charged).sum() }
     fn open_count(&self) -> usize { self.workers.len() }
 
+    fn carried(&self, id: SessionId) -> Option<&Carried> { self.workers.get(&id).map(|w| &w.carried) }
+
+    /// ★ Decoded IN THE WORKER, the process that already holds this
+    /// document's hostile bytes, and validated here on the way back. A reply
+    /// of the wrong shape is a lie, and a worker that lies is retired — the
+    /// same rule as every other answer it gives.
+    fn decode_image(&mut self, id: SessionId, address: &str, bytes: &[u8], c: Ceilings, now: Millis)
+        -> Result<Pixels, String>
+    {
+        let deadline = self.config.deadline;
+        let w = self.workers.get_mut(&id).ok_or("no such session")?;
+        w.last_seen = w.last_seen.max(now);
+        let mut payload = format!("{address} {}\n", c.budget).into_bytes();
+        payload.extend_from_slice(bytes);
+        let header = 64;
+        let reply = match w.request_limited(&Frame::new(REQ_IMAGE, payload), deadline, c.budget + header) {
+            Ok(r) => r,
+            Err(why) => { self.retire(id, Status::Failed); return Err(why) }
+        };
+        if reply.tag == RSP_ERR { return Err(reply.text()) }
+        let parsed = if reply.tag == RSP_OK { parse_pixels(reply.payload, c) }
+                     else { Err(format!("worker sent an unknown reply {:?}", reply.tag)) };
+        match parsed {
+            Ok(p) => Ok(p),
+            Err(why) => { self.retire(id, Status::Failed); Err(format!("worker sent a bad image: {why}")) }
+        }
+    }
+
     fn triggers(&self, id: SessionId) -> Vec<String> {
         self.workers.get(&id).map(|w| w.triggers.clone()).unwrap_or_default()
     }
@@ -449,4 +496,23 @@ impl DocumentHost for JailedHost {
         v.sort_by_key(|(id, _)| *id);
         v
     }
+}
+
+/// A worker's pixel reply: `<width> <height>\n` and exactly the RGBA8 bytes
+/// those imply, within the ceilings the request carried.
+pub fn parse_pixels(mut payload: Vec<u8>, c: Ceilings) -> Result<Pixels, String> {
+    let nl = payload.iter().take(32).position(|&b| b == b'\n').ok_or("no header")?;
+    let head = std::str::from_utf8(&payload[..nl]).map_err(|_| "header is not text")?;
+    let (w, h) = head.split_once(' ').ok_or("header has no height")?;
+    let parse = |v: &str| -> Result<u32, String> {
+        // Digits only: `u32::from_str` takes a leading `+`, and a header
+        // has one spelling.
+        if v.is_empty() || !v.bytes().all(|b| b.is_ascii_digit()) { return Err(format!("{v:?} is not a dimension")) }
+        v.parse().map_err(|_| format!("{v:?} is not a dimension"))
+    };
+    let (width, height) = (parse(w)?, parse(h)?);
+    crate::image::validate(width, height, payload.len() - nl - 1, c)?;
+    // In place: a copy would hold the frame twice.
+    payload.drain(..=nl);
+    Ok(Pixels { width, height, rgba: payload })
 }

@@ -25,6 +25,16 @@ blake3 = { version = "1", features = ["pure"] }
 # an activated link may go (src/links.rs). The converter resolves every URL it
 # meets with the same crate.
 url = "2"
+# ★ Image decoders for the worker, which is where images decode (src/image.rs,
+# threat model §2.4). Pure-Rust, permissively licensed, and chosen for being
+# memory-safe: zune-jpeg is built WITHOUT its x86/neon features, which are
+# the crate's SIMD intrinsics (its `unsafe`); the scalar path decodes the
+# same images. gif without `color_quant` (an encoder concern).
+png = "0.17"
+zune-jpeg = { version = "0.5", default-features = false, features = ["std"] }
+zune-core = { version = "0.5", default-features = false, features = ["std"] }
+image-webp = "0.2.4"
+gif = { version = "0.14.2", default-features = false, features = ["std"] }
 
 [features]
 # ★ Unconfined brokers (`Navigatord::unconfined_for_testing`) exist only in
@@ -34,5 +44,7 @@ url = "2"
 unconfined-for-testing = []
 
 [dev-dependencies]
+jpeg-encoder = "0.7.1"
 # Tests and examples get the unconfined constructor; the library does not.
 navigator-backend = { path = ".", features = ["unconfined-for-testing"] }
+png = "0.17"

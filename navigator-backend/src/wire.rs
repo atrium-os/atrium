@@ -58,7 +58,7 @@ impl std::fmt::Display for WireError {
             WireError::Io(e) => write!(f, "io: {e}"),
             WireError::Malformed(w) => write!(f, "malformed frame: {w}"),
             WireError::TooLarge { announced } =>
-                write!(f, "frame of {announced} bytes exceeds the {MAX_FRAME} limit"),
+                write!(f, "frame of {announced} bytes exceeds the limit"),
         }
     }
 }
@@ -68,7 +68,12 @@ impl From<std::io::Error> for WireError {
 }
 
 pub fn write_frame(w: &mut impl Write, f: &Frame) -> Result<(), WireError> {
-    if f.payload.len() > MAX_FRAME {
+    write_frame_limited(w, f, MAX_FRAME)
+}
+
+/// `write_frame` for the one frame that may be larger: a worker's pixel reply.
+pub fn write_frame_limited(w: &mut impl Write, f: &Frame, max: usize) -> Result<(), WireError> {
+    if f.payload.len() > max.min(MAX_PIXEL_FRAME) {
         return Err(WireError::TooLarge { announced: f.payload.len() });
     }
     write!(w, "{} {}\n", f.tag, f.payload.len())?;
@@ -78,6 +83,20 @@ pub fn write_frame(w: &mut impl Write, f: &Frame) -> Result<(), WireError> {
 }
 
 pub fn read_frame(r: &mut BufReader<impl Read>) -> Result<Frame, WireError> {
+    read_frame_limited(r, MAX_FRAME)
+}
+
+/// The largest reply to an image request: the document's whole decoded-image
+/// budget plus a header. ★ Not the default for every frame: a pixel reply
+/// is the one frame allowed to be this large, and only while the broker is
+/// waiting for one (`read_frame_limited`, with the bound the broker set for
+/// that request).
+pub const MAX_PIXEL_FRAME: usize = navigator_dom::profile::MAX_DECODED_IMAGE_BYTES + 64;
+
+/// `read_frame` with a caller-chosen ceiling, which may not exceed
+/// `MAX_PIXEL_FRAME`.
+pub fn read_frame_limited(r: &mut BufReader<impl Read>, max: usize) -> Result<Frame, WireError> {
+    let max = max.min(MAX_PIXEL_FRAME);
     let mut header = String::new();
     // ★ Bounded even here. `read_line` on a hostile peer that never sends a
     // newline grows this String until the broker dies, which is a denial of
@@ -90,7 +109,7 @@ pub fn read_frame(r: &mut BufReader<impl Read>) -> Result<Frame, WireError> {
     let len: usize = len.parse()
         .map_err(|_| WireError::Malformed(format!("bad length in {header:?}")))?;
     // ★ CHECKED BEFORE THE ALLOCATION, not after the read.
-    if len > MAX_FRAME { return Err(WireError::TooLarge { announced: len }) }
+    if len > max { return Err(WireError::TooLarge { announced: len }) }
     let mut payload = vec![0u8; len];
     r.read_exact(&mut payload)?;
     Ok(Frame { tag: tag.to_string(), payload })
@@ -110,5 +129,8 @@ pub const REQ_URL: &str = "URL";
 pub const REQ_SAVE: &str = "SAVE";
 /// Replay a `session::Trail` onto the document this worker just opened.
 pub const REQ_RESTORE: &str = "RSTR";
+/// Decode one image (src/image.rs). Payload: `<address> <budget>\n` and the
+/// encoded bytes; the answer is `<width> <height>\n` and RGBA8 pixels.
+pub const REQ_IMAGE: &str = "IMG";
 pub const RSP_OK: &str = "OK";
 pub const RSP_ERR: &str = "ERR";

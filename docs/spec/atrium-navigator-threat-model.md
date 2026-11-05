@@ -309,6 +309,103 @@ source of browser RCE.
 
 **Rating:** undefined today, low once fixed.
 
+**Built (2026-11-05): images decode in the document's worker.** `navigator-backend/src/image.rs`.
+
+- *Where, and why not a jail per image.* The worker that already parses the document
+  decodes its images. A decoder compromise there gains nothing the document's own bytes
+  did not already give it: the jail holds one document, has no capabilities, and the
+  broker hands it only blobs that document's recording names (below). An ephemeral jail
+  per image would cost about 50 ms (≈25 ms to open, 26 to close, §4.7a) per image, and
+  the corpora name a median of 2 and 17 images per document, a maximum of 183. That is
+  seconds per page for one property: a hostile *third-party* image cannot alter the
+  first-party page's scene. That residual is written down here rather than solved. The
+  host seam (`DocumentHost::decode_image`) is where a separate per-document decoder jail
+  would go, without broker changes.
+- *The request.* `Request::Image { session, address }` → `Event::Image { pixels }` or
+  `Blocked`. The broker does these steps in order:
+  1. It checks the address shape (`blake3:` + 64 lowercase hex).
+  2. It checks that **the recording names the address**. This is answered from the
+     recording bytes the broker was handed (`src/carried.rs`, a byte scan, not a parse),
+     never by asking the worker. So a compromised worker cannot pull another document's
+     blob out of a shared store.
+  3. It reads the bytes from the blob store, the broker's capability, which re-hashes
+     them.
+  4. It sends the worker the bytes and the document's remaining decoded-bytes budget.
+- *In the worker,* in this order:
+  1. The encoded size is capped at 16 MiB (3× the corpora's 5.0 MiB maximum).
+  2. **The bytes must hash to the address.** The worker does not take the broker's word;
+     a test swaps the bytes under a store that does not check, and the worker refuses.
+  3. The format is sniffed from magic bytes only.
+  4. **The header's dimensions are admitted before any frame is allocated**: at most
+     16,384 px per axis, and the frame must fit the remaining budget (profile:
+     256 MiB per document). PNG's IHDR, GIF's logical screen and WebP's
+     VP8X/VP8/VP8L fields are read from the bytes before the decoder is built. A
+     progressive JPEG is also charged zune's coefficient planes.
+  5. Each decoder gets the budget as its own memory limit.
+  6. The output's shape is re-checked.
+- *Decoders.* Memory-safe and permissive: `png`, `zune-jpeg` built without its
+  `x86`/`neon` features (the crate is then `forbid(unsafe_code)`), `image-webp` and
+  `gif`. SVG is **not** a raster this decodes and is refused by name. Rendering it needs
+  a vector renderer, which is not chosen.
+- *The output, stated once.* RGBA8, **straight (not premultiplied) alpha**, rows top
+  down, stride = 4 × width, values as encoded (sRGB by convention; ICC and gAMA are
+  ignored), first frame of an animation. Premultiplying is the compositor's job, on a
+  buffer whose shape is already checked.
+- *The broker's check.* `image::validate`: non-zero, ≤ 16,384 per axis,
+  `len == w × h × 4`, and within the budget. The jailed host parses the worker's reply
+  with one spelling (digits only), validates it, and **retires a worker that lies**.
+  The broker validates again whatever the host is. The reader thread accepts a reply
+  larger than `MAX_FRAME` only while an image request is outstanding, and only up to
+  the budget it sent. Tests cover a short buffer, an axis over the ceiling, a zero
+  dimension, `+1`, no header, an oversized announcement and the wrong tag: each is
+  refused and the worker retired.
+- *Fresco never decodes.* `fresco-scene-server` carried a `load_texture_from_path` that
+  decoded JPEG/PNG with the `image` crate, with no caller. It was removed, along with the
+  dependency. frescod's `image` dependency encodes its own screenshots and decodes
+  nothing from a page.
+- *Tests.* `tests/image.rs` (17): each format against pixels it was encoded from
+  (lossless PNG/WebP/GIF exact; JPEG within tolerance with the orientation checked);
+  every PNG colour type; GIF frame offset and clipping; the address check; header lies;
+  the budget binding across images and not charging a re-decode; both hosts; the lying
+  worker. `tests/image_fuzz.rs` uses `fuzz.rs`'s discipline: 20,000 seeded mutations
+  (truncation, flips, lying lengths, lying dimensions per format, spliced and duplicated
+  chunks). It **fails unless** every format reached ok, corrupt, header, over-budget,
+  and, where the field can express it, too-large and empty. A per-thread counting
+  allocator asserts that no header refusal allocated more than 1 MiB first (measured
+  maximum: 1,488 B), and that no decode held more than its budget plus 4 MiB (8 MiB
+  budget; measured peak 8.26 MiB). It is positive-controlled: every successful decode
+  must show at least its frame in the counter.
+
+**Measured (2026-11-05, one machine, release build).**
+
+| | corpus 1 (85 docs) | batch 2 (48 docs) |
+|---|---|---|
+| blobs | 1,398 | 2,269 |
+| raster blobs decoded | 1,198 / 1,198 (PNG 288, JPEG 877, GIF 4, WebP 29) | 2,173 / 2,173 (PNG 538, JPEG 1,440, GIF 10, WebP 185) |
+| refused: SVG / HTML error pages | 194 / 6 | 96 / 0 |
+| time per decode, p50 / p95 / max | 0.47 / 4.3 / 71 ms | 0.31 / 5.0 / 67 ms |
+| peak heap per decode, p50 / p95 / max | 0.7 / 7.7 / 125.8 MiB | 0.3 / 6.3 / 110.8 MiB |
+| through broker + worker pipe, per image p50 / p95 | 0.56 / 6.6 ms | 0.36 / 4.6 ms |
+| all images of a document, p50 / p95 / max | 0 / 67 / 299 ms | 7 / 300 / 489 ms |
+
+- *Correctness against an independent decoder* (macOS `sips` → PNG, every 4th and 6th
+  blob). PNG 149/149, GIF 5/5 and WebP 38/38 are identical. JPEG 465/465 agree to a
+  mean of at most 2.2 levels, with a worst single channel of 121. These are IDCT and
+  chroma-upsampling differences at edges; a flipped or swapped decode would show far
+  larger means.
+- ★ **The 256 MiB per-document budget binds on real pages.** Decoding every image a
+  recording names at natural size, 4 of 133 documents exceed it: ocw.mit.edu (3 of 79
+  images refused), which.co.uk (16 of 53), thehindu (24 of 96) and nasa (24 of 58).
+  Batch 2's p95 is 177 MiB. This is an upper bound, because a renderer decodes only what
+  it paints. But the ceiling was reasoned, not measured, and real pages reach it.
+  *Recommended:* decode to the painted size (most of these are thumbnails of large
+  sources) and charge that, rather than raising the ceiling. Not built.
+- Run: `cargo run --release --example image_corpus -- [--reference REF] BLOBS...` and
+  `examples/image_documents WORKER BLOBS RECORDINGS`.
+
+**Rating now: low.** What stays open: SVG; decode-to-painted-size; and the third-party
+image residual above.
+
 ### 2.5 Composition and GPU — Fresco, Limen, the RDNA4 driver
 
 Every site's output converges here, so this is the **shared, privileged choke point**.
@@ -782,7 +879,7 @@ These belong in the model because they are *wins*, not because they need work:
 | **P0** ✔ built, verified on FreeBSD | Jail the converter process (Boa) with zero capabilities via `portcullis exec` | A1 → code execution as the user | small: the launcher exists and was measured (§4.7a) | §2.2 |
 | P1 ✔ built, verified on FreeBSD | Refuse non-global addresses after resolution; pin the address per conversion; intranet as an explicit grant | A4: LAN and localhost, DNS rebinding | small | §2.1 |
 | P1 ✔ built | `navigatord` refuses to start unconfined outside test builds | A1 against the worker | trivial | §2.3 |
-| P1 | Decide where images decode: per-document jail, memory-safe decoders, never in Fresco | A1 via decoders | design and medium code | §2.4 |
+| P1 ✔ built (2026-11-05): worker decodes, broker validates, fuzzed, measured on both corpora; Fresco's dead decoder removed | Decide where images decode: per-document jail, memory-safe decoders, never in Fresco | A1 via decoders | design and medium code | §2.4 |
 | P1 | Per-user dedup domain by default; reproduce-to-share | A5 poisoning | design now, code with sharing | §2.6 |
 | P2 ✔ rctl built and verified on FreeBSD; ✔ byte budget built (128 MiB per conversion, in the relay) | `rctl` memory/CPU limits on converter and worker jails; per-conversion byte budget | A6 | small | §2.2 |
 | **P0 (graphics)** | Fix the five GPU driver isolation breaks and pass the attestation gate (F1) | everything in §2.5 rests on it | medium–large | §2.5.4 |

@@ -27,6 +27,8 @@
 //! broker logic, and that the test suite below is already written against the
 //! boundary rather than against the internals.
 
+use crate::carried::Carried;
+use crate::image::{Ceilings, Pixels};
 use crate::links::{decide, LinkAction, SchemeAllowlist};
 use crate::reverse::{Back, Forward};
 use crate::session::{Expiry, Millis, SessionId, SessionLimits, Sessions, Status};
@@ -70,6 +72,22 @@ pub trait DocumentHost {
     /// Every open session and what it costs — what §4.4a's caller-chosen
     /// eviction decides from.
     fn report(&self) -> Vec<(SessionId, usize)>;
+    /// ★ What the session's recording carries, from the bytes the BROKER
+    /// was handed at open (or read from its store at restore) — never from a
+    /// worker's answer (`carried`). `None` for a session that is not open —
+    /// and by default, so a host that keeps nothing is refused every image
+    /// and every link rather than trusted.
+    fn carried(&self, _id: SessionId) -> Option<&Carried> { None }
+    /// Decode one image of the session's document where the document's
+    /// hostile bytes are already parsed — the worker, for a jailed host —
+    /// and NEVER in the broker (threat model §2.4). `bytes` were read from
+    /// the blob store by the broker and checked against `address` there; the
+    /// decoder checks them again. The broker validates what comes back.
+    fn decode_image(&mut self, _id: SessionId, _address: &str, _bytes: &[u8], _c: Ceilings, _now: Millis)
+        -> Result<Pixels, String>
+    {
+        Err("this host does not decode images".into())
+    }
     /// ★ Whether each document runs CONFINED, as the host itself states it.
     /// Defaults to false: a host has to claim confinement to get it, so a new
     /// host that forgets is refused by `Navigatord::start`, not trusted.
@@ -95,6 +113,9 @@ pub enum Request {
     /// The reader activated a link in the session's scene. `href` is the
     /// link's target as the scene carries it; the broker decides what it does.
     Activate { session: SessionId, href: String },
+    /// Pixels for one image the session's scene names, by content address
+    /// (`blake3:<hex>`). Decoded by the host, validated here (§2.4).
+    Image { session: SessionId, address: String },
 }
 
 /// What the UI hears back.
@@ -128,6 +149,11 @@ pub enum Event {
     /// (marked when it is `http`), or hand an allowlisted scheme to its
     /// handler. A refused link is `Blocked`, like any other refusal.
     Link { session: SessionId, action: LinkAction },
+    /// An image's pixels, decoded in the document's own worker and checked
+    /// here: RGBA8, straight alpha, `width × height × 4` bytes, within the
+    /// profile's ceilings. This is the only form in which an image reaches
+    /// the compositor — Fresco never sees encoded bytes.
+    Image { session: SessionId, address: String, pixels: Pixels },
 }
 
 /// The broker.
@@ -140,9 +166,28 @@ pub struct Navigatord<H: DocumentHost> {
     /// Schemes beyond `https` and `http` a link may hand off. Empty unless
     /// the user names one (threat model §2.10).
     schemes: SchemeAllowlist,
+    /// Where image bytes are read from: the converter's blob store, named by
+    /// the hex of each blob's BLAKE3 address. ★ The broker's capability,
+    /// never a worker's: the worker is handed only blobs its recording names.
+    blobs: Option<Box<dyn crate::store::Store>>,
+    /// Decoded bytes charged to each open session, per image address, so the
+    /// profile's per-document total binds across requests. An address decoded
+    /// again is not charged twice.
+    decoded: std::collections::BTreeMap<SessionId, std::collections::BTreeMap<String, usize>>,
 }
 
 impl<H: DocumentHost> Navigatord<H> {
+    /// Read image bytes from `blobs` (see the field).
+    pub fn with_blobs(mut self, blobs: Box<dyn crate::store::Store>) -> Self {
+        self.blobs = Some(blobs);
+        self
+    }
+
+    /// Decoded image bytes charged to a session so far.
+    pub fn decoded_bytes(&self, session: SessionId) -> usize {
+        self.decoded.get(&session).map(|m| m.values().sum()).unwrap_or(0)
+    }
+
     /// Let links of `scheme` be handed to its handler. ★ The user's choice,
     /// so a page cannot make it; `javascript` is refused (see `links`).
     pub fn allow_scheme(&mut self, scheme: &str) -> Result<(), String> {
@@ -159,7 +204,7 @@ impl<H: DocumentHost> Navigatord<H> {
             return Err("navigatord refuses to start: the document host is not confined \
                         (configure a launcher, e.g. `portcullis exec --daemon --instance {instance}`)".into());
         }
-        Ok(Navigatord { host, now: 0, schemes: SchemeAllowlist::default() })
+        Ok(Navigatord { host, now: 0, schemes: SchemeAllowlist::default(), blobs: None, decoded: Default::default() })
     }
 
     /// An unconfined broker, for tests: in-process hosts, bare worker
@@ -168,7 +213,7 @@ impl<H: DocumentHost> Navigatord<H> {
     /// so a shipped binary that calls it does not link.
     #[cfg(any(test, feature = "unconfined-for-testing"))]
     pub fn unconfined_for_testing(host: H) -> Self {
-        Navigatord { host, now: 0, schemes: SchemeAllowlist::default() }
+        Navigatord { host, now: 0, schemes: SchemeAllowlist::default(), blobs: None, decoded: Default::default() }
     }
 
     /// The host, for an operator (or a test) inspecting it.
@@ -182,9 +227,14 @@ impl<H: DocumentHost> Navigatord<H> {
     /// there and then take it away under them.
     pub fn tick(&mut self, now: Millis) -> Vec<Event> {
         self.now = self.now.max(now);
-        self.host.expire(self.now).into_iter()
+        let out: Vec<Event> = self.host.expire(self.now).into_iter()
             .map(|(session, why)| Event::Expired { session, why })
-            .collect()
+            .collect();
+        // A session that ended for any reason — expired, closed, or a worker
+        // retired on a lie — gives its image budget back.
+        let host = &self.host;
+        self.decoded.retain(|&id, _| host.status(id) == Status::Open);
+        out
     }
 
     pub fn now(&self) -> Millis { self.now }
@@ -293,8 +343,52 @@ impl<H: DocumentHost> Navigatord<H> {
                     Err(why) => out.push(Event::Blocked { session: Some(session), why: why.to_string() }),
                 }
             }
+            Request::Image { session, address } => {
+                if let Some(e) = self.absent(session) { out.push(e); return out }
+                match self.image(session, address) {
+                    Ok(e) => out.push(e),
+                    Err(why) => out.push(Event::Blocked { session: Some(session), why }),
+                }
+            }
         }
         out
+    }
+
+    /// ★★ AN IMAGE, IN THE ORDER THAT MAKES A HOSTILE ONE CHEAP TO REFUSE.
+    /// The address is checked for shape and against the recording the broker
+    /// holds (so a worker cannot pull another document's blob out of a
+    /// shared store), the bytes are read and hash-checked by the store, the
+    /// remaining budget is sent with them, and the host's answer is validated
+    /// for shape before it becomes an event.
+    fn image(&mut self, session: SessionId, address: String) -> Result<Event, String> {
+        if crate::image::address_hex(&address).is_none() {
+            return Err(format!("{address:?} is not an image address (blake3:<64 hex>)"));
+        }
+        let carried = self.host.carried(session).ok_or("no such session")?;
+        if !carried.image(&address) {
+            return Err(format!("the document does not name the image {address}"));
+        }
+        let blobs = self.blobs.as_ref().ok_or("this broker has no blob store to read images from")?;
+        let hex = crate::image::address_hex(&address).expect("checked");
+        let bytes = blobs.get(hex)?;
+        if bytes.len() > crate::image::MAX_ENCODED_IMAGE_BYTES {
+            return Err(format!("image is {} bytes encoded, over {}", bytes.len(), crate::image::MAX_ENCODED_IMAGE_BYTES));
+        }
+        let charged = self.decoded.get(&session);
+        let used: usize = charged.map(|m| m.values().sum()).unwrap_or(0);
+        let mine = charged.and_then(|m| m.get(&address)).copied().unwrap_or(0);
+        let c = Ceilings {
+            budget: navigator_dom::profile::MAX_DECODED_IMAGE_BYTES.saturating_sub(used - mine),
+            ..Ceilings::default()
+        };
+        let pixels = self.host.decode_image(session, &address, &bytes, c, self.now)?;
+        // ★ Re-checked whatever the host is. A jailed host has already
+        // checked (and retired a worker that lied); this is the broker's own
+        // check, so a new host cannot forget it.
+        crate::image::validate(pixels.width, pixels.height, pixels.rgba.len(), c)
+            .map_err(|why| format!("the host returned a bad image: {why}"))?;
+        self.decoded.entry(session).or_default().insert(address.clone(), pixels.rgba.len());
+        Ok(Event::Image { session, address, pixels })
     }
 
     /// ★ A request naming a session that is gone answers with WHY it is gone.
@@ -323,6 +417,7 @@ pub struct InProcessHost {
     store: Option<Box<dyn crate::store::Store>>,
     /// Each open session's recording address, in `store`.
     recordings: std::collections::HashMap<SessionId, String>,
+    carried: std::collections::HashMap<SessionId, Carried>,
 }
 
 impl Default for InProcessHost {
@@ -331,7 +426,7 @@ impl Default for InProcessHost {
 
 impl InProcessHost {
     pub fn new(sessions: SessionLimits, limits: crate::Limits) -> Self {
-        InProcessHost { sessions: Sessions::new(sessions), limits, store: None, recordings: Default::default() }
+        InProcessHost { sessions: Sessions::new(sessions), limits, store: None, recordings: Default::default(), carried: Default::default() }
     }
 
     /// With a store, so sessions can be saved and restored.
@@ -355,6 +450,7 @@ impl DocumentHost for InProcessHost {
                 Err(why) => { self.sessions.close(id); return Err(format!("could not store the recording: {why}")) }
             }
         }
+        self.carried.insert(id, Carried::new(recording));
         Ok(id)
     }
 
@@ -373,6 +469,7 @@ impl DocumentHost for InProcessHost {
         let r = crate::ingest(&bytes, &self.limits).map_err(|e| e.to_string())?;
         let id = self.sessions.restore(&r, &record, now).map_err(|e| e.to_string())?;
         self.recordings.insert(id, record.recording);
+        self.carried.insert(id, Carried::new(&bytes));
         Ok(id)
     }
 
@@ -393,12 +490,22 @@ impl DocumentHost for InProcessHost {
 
     fn close(&mut self, id: SessionId) -> bool {
         self.recordings.remove(&id);
+        self.carried.remove(&id);
         self.sessions.close(id)
     }
     fn expire(&mut self, now: Millis) -> Vec<(SessionId, Expiry)> {
         let gone = self.sessions.expire(now);
-        for (id, _) in &gone { self.recordings.remove(id); }
+        for (id, _) in &gone { self.recordings.remove(id); self.carried.remove(id); }
         gone
+    }
+    fn carried(&self, id: SessionId) -> Option<&Carried> { self.carried.get(&id) }
+    /// ★ In this process, because this host IS this process: it exists for
+    /// tests, and decodes with the same function the worker runs.
+    fn decode_image(&mut self, id: SessionId, address: &str, bytes: &[u8], c: Ceilings, _now: Millis)
+        -> Result<Pixels, String>
+    {
+        if self.sessions.get(id).is_none() { return Err("no such session".into()) }
+        crate::image::decode(address, bytes, c).map_err(|e| e.to_string())
     }
     fn status(&self, id: SessionId) -> Status { self.sessions.status(id) }
     fn bytes(&self) -> usize { self.sessions.bytes() }

@@ -1058,28 +1058,11 @@ pub fn hit_close_button(comp: &Compositor, x: f32, y: f32) -> Option<WindowId> {
     None
 }
 
-/// Decode a JPG/PNG from disk and upload it as a NODE_TEXTURE +
-/// NODE_PIXEL_DATA blob pair. Returns the texture hash on success.
-pub fn load_texture_from_path(cas: &mut CasStore, path: &std::path::Path) -> Option<Hash256> {
-    let img = image::open(path).ok()?.to_rgba8();
-    let (w, h) = (img.width(), img.height());
-    let pixels = img.into_raw();
-    let mut pix_blob = Vec::with_capacity(8 + pixels.len());
-    pix_blob.extend_from_slice(&0x0401u16.to_le_bytes());
-    pix_blob.extend_from_slice(&1u16.to_le_bytes());
-    pix_blob.extend_from_slice(&0u32.to_le_bytes());
-    pix_blob.extend_from_slice(&pixels);
-    let pix_hash = cas.store_pinned(&pix_blob);
-    let mut tex = vec![0u8; 56];
-    tex[0..2].copy_from_slice(&0x0400u16.to_le_bytes());
-    tex[2..4].copy_from_slice(&1u16.to_le_bytes());
-    tex[8..12].copy_from_slice(&0u32.to_le_bytes());
-    tex[12..16].copy_from_slice(&w.to_le_bytes());
-    tex[16..20].copy_from_slice(&h.to_le_bytes());
-    tex[20..24].copy_from_slice(&0u32.to_le_bytes());
-    tex[24..56].copy_from_slice(&pix_hash);
-    Some(cas.store_pinned(&tex))
-}
+// ★ No image decoder lives in Fresco (navigator threat model §2.4). A
+// `load_texture_from_path` that decoded JPEG/PNG with the `image` crate sat
+// here with no caller; it was removed with the dependency, so a decoder
+// cannot drift back onto the display path by being already linked. Pixels
+// reach Fresco decoded and shape-checked, never as encoded bytes.
 
 /// POSITION+UV unit quad (stride 20 = f32x5). Replaces the
 /// position-only titlebar mesh when the theme uses a textured fill.

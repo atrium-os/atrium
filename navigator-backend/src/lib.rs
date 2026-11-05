@@ -13,7 +13,9 @@
 //! different reasons and a caller needs to tell them apart.
 
 pub mod apply;
+pub mod carried;
 pub mod document;
+pub mod image;
 pub mod ingest;
 pub mod jailed;
 pub mod limits;
