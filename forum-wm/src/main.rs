@@ -83,6 +83,12 @@ impl FrescoConn for ClientConn {
     fn set_display_mode(&mut self, width: u32, height: u32, refresh_mhz: u32) -> io::Result<()> {
         self.conn.wm_set_display_mode(width, height, refresh_mhz)
     }
+    fn outputs(&mut self) -> io::Result<Vec<fresco_protocol::WmOutput>> {
+        self.conn.wm_outputs().map(|r| r.outputs)
+    }
+    fn arrange_outputs(&mut self, placements: Vec<fresco_protocol::WmOutputPlacement>) -> io::Result<()> {
+        self.conn.wm_arrange_outputs(placements)
+    }
 }
 
 
@@ -146,6 +152,11 @@ fn main() -> io::Result<()> {
     let cfg = config::ForumConfig::load();
     let mut wm = Wm::new(screen(&mut io_conn.conn));
     wm.workspaces = cfg.workspaces;
+    // The monitors (display 3.0); the first reconcile lays out on them.
+    match io_conn.conn.wm_outputs() {
+        Ok(r) => wm.outputs = r.outputs,
+        Err(e) => eprintln!("forum-wm: outputs: {e} (one screen)"),
+    }
     wm.names = cfg.names;
     wm.assign_rules = cfg.assign;
     // Overlay the learned placements (persisted manual moves) — they win over the
@@ -241,6 +252,7 @@ fn spawn_input_poller(core: Core) {
             let mut zoom = false;
             let mut snap_dir: Option<Snap> = None;
             let mut unsnap = false;
+            let mut next_monitor = false;
             let mut display: Option<fresco_protocol::DisplayInfoResponse> = None;
             {
                 let mut g = core.lock().unwrap();
@@ -269,6 +281,10 @@ fn spawn_input_poller(core: Core) {
                         Ok(Some(Event::Key { hid_usage: KEY_F, pressed: true, modifiers, .. }))
                             if modifiers & MOD_GUI != 0 => zoom = true,
                         // Super+Left / Right: snap the focused document to a half.
+                        // Super+Shift+Right: send the focused window to the next monitor
+                        // (must precede the plain Super+Right snap arm).
+                        Ok(Some(Event::Key { hid_usage: KEY_RIGHT, pressed: true, modifiers, .. }))
+                            if modifiers & MOD_GUI != 0 && modifiers & MOD_SHIFT != 0 => next_monitor = true,
                         Ok(Some(Event::Key { hid_usage: KEY_LEFT, pressed: true, modifiers, .. }))
                             if modifiers & MOD_GUI != 0 => snap_dir = Some(Snap::Left),
                         Ok(Some(Event::Key { hid_usage: KEY_RIGHT, pressed: true, modifiers, .. }))
@@ -323,6 +339,20 @@ fn spawn_input_poller(core: Core) {
                                 "forum-wm: display now {w}x{h} — re-laid out {} surface(s)", l.slots.len()),
                             Ok(None) => {}       // same geometry (a refresh-only switch)
                             Err(e) => eprintln!("forum-wm: relayout on display change: {e}"),
+                        }
+                        // The monitors on it: windows follow their monitor,
+                        // or are rescued to the primary while it is away.
+                        match conn.outputs() {
+                            Ok(outs) => {
+                                let n = outs.iter().filter(|o| o.present).count();
+                                match wm.set_outputs(conn, outs) {
+                                    Ok(Some(l)) => eprintln!(
+                                        "forum-wm: {n} monitor(s) — re-laid out {} surface(s)", l.slots.len()),
+                                    Ok(None) => {}
+                                    Err(e) => eprintln!("forum-wm: relayout on monitor change: {e}"),
+                                }
+                            }
+                            Err(e) => eprintln!("forum-wm: outputs: {e}"),
                         }
                     }
                 }
@@ -406,6 +436,16 @@ fn spawn_input_poller(core: Core) {
                     Ok(Some(s)) => eprintln!("forum-wm: snapped surface {s} {d:?}"),
                     Ok(None) => {}               // nothing focusable to snap
                     Err(e) => eprintln!("forum-wm: snap_focused error: {e}"),
+                }
+            }
+
+            if next_monitor {
+                let mut g = core.lock().unwrap();
+                let (wm, conn) = { let c = &mut *g; (&mut c.0, &mut c.1) };
+                match wm.move_focused_to_next_monitor(conn) {
+                    Ok(Some(m)) => eprintln!("forum-wm: window sent to monitor {m:016x}"),
+                    Ok(None) => {}
+                    Err(e) => eprintln!("forum-wm: move to monitor: {e}"),
                 }
             }
 

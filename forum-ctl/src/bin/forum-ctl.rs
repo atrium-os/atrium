@@ -5,11 +5,15 @@
 //!   forum-ctl focus ID            focus a surface
 //!   forum-ctl modes               list the monitor's modes (`*` = lit)
 //!   forum-ctl mode WxH[@Hz]       switch the display mode (Hz may be 59.94)
+//!   forum-ctl outputs             list the monitors and where they sit
+//!   forum-ctl arrange A SIDE B    put output A right-of / left-of / above / below output B
+//!   forum-ctl move-monitor        send the focused window to the next monitor
 
 use forum_ctl::{default_socket_path, request, Intent, Reply};
 
 fn usage() -> ! {
-    eprintln!("usage: forum-ctl surfaces | focus ID | modes | mode WxH[@Hz]");
+    eprintln!("usage: forum-ctl surfaces | focus ID | modes | mode WxH[@Hz] | outputs \
+               | arrange A right-of|left-of|above|below B | move-monitor");
     std::process::exit(2)
 }
 
@@ -36,6 +40,13 @@ fn main() {
             let (width, height, refresh_mhz) = parse_mode(m).unwrap_or_else(|| usage());
             Intent::SetDisplayMode { width, height, refresh_mhz }
         }
+        ["outputs"] => Intent::ListOutputs,
+        ["arrange", a, side, b] => Intent::PlaceOutput {
+            output: a.parse().unwrap_or_else(|_| usage()),
+            side: side.parse().unwrap_or_else(|e| { eprintln!("forum-ctl: {e}"); usage() }),
+            of: b.parse().unwrap_or_else(|_| usage()),
+        },
+        ["move-monitor"] => Intent::MoveToNextMonitor,
         _ => usage(),
     };
     let sock = default_socket_path();
@@ -54,6 +65,14 @@ fn main() {
                 let mark = if i as u32 == current { '*' } else { ' ' };
                 let pref = if m.preferred { " (preferred)" } else { "" };
                 println!("{mark} {}x{}@{:.2}{pref}", m.width, m.height, m.refresh_mhz as f64 / 1000.0);
+            }
+        }
+        Ok(Reply::Outputs { outputs }) => {
+            if outputs.is_empty() { println!("no monitor"); }
+            for o in outputs {
+                println!("output {} {}x{}@{:.2} at {},{} monitor {:016x}{}", o.output, o.rect.w, o.rect.h,
+                         o.refresh_mhz as f64 / 1000.0, o.rect.x, o.rect.y, o.identity,
+                         if o.present { "" } else { " (gone, place kept)" });
             }
         }
         Ok(Reply::Err { message }) => { eprintln!("forum-ctl: {message}"); std::process::exit(1) }

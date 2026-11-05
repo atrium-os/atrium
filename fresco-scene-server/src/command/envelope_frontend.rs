@@ -301,6 +301,11 @@ pub struct EnvelopeFrontend {
     /// frescod's frame loop takes and carries out.
     display_modes: fresco_protocol::WmDisplayModesReply,
     mode_request: Option<(u32, u32, u32)>,
+    /// What `OP_WM_OUTPUTS` reports (frescod sets it whenever the monitors
+    /// change), and an arrangement `OP_WM_ARRANGE_OUTPUTS` asked for, which
+    /// frescod's frame loop takes and applies.
+    outputs: fresco_protocol::WmOutputsReply,
+    arrange_request: Option<Vec<fresco_protocol::WmOutputPlacement>>,
 }
 
 impl EnvelopeFrontend {
@@ -329,6 +334,8 @@ impl EnvelopeFrontend {
             reserved_top: 0,
             display_modes: fresco_protocol::WmDisplayModesReply { modes: Vec::new(), current: u32::MAX },
             mode_request: None,
+            outputs: fresco_protocol::WmOutputsReply { outputs: Vec::new() },
+            arrange_request: None,
         }
     }
 
@@ -357,6 +364,16 @@ impl EnvelopeFrontend {
     }
 
     /// A mode switch the WM asked for and nobody has carried out yet.
+    /// The monitors of the desktop, for `OP_WM_OUTPUTS`.
+    pub fn set_outputs(&mut self, outputs: Vec<fresco_protocol::WmOutput>) {
+        self.outputs = fresco_protocol::WmOutputsReply { outputs };
+    }
+
+    /// An arrangement a WM asked for, if any (taken once).
+    pub fn take_arrange_request(&mut self) -> Option<Vec<fresco_protocol::WmOutputPlacement>> {
+        self.arrange_request.take()
+    }
+
     pub fn take_mode_request(&mut self) -> Option<(u32, u32, u32)> {
         self.mode_request.take()
     }
@@ -510,6 +527,8 @@ impl EnvelopeFrontend {
             control::OP_WM_SET_RENDERING     => self.handle_wm_set_rendering(msg),
             control::OP_WM_DISPLAY_MODES     => self.handle_wm_display_modes(),
             control::OP_WM_SET_DISPLAY_MODE  => self.handle_wm_set_display_mode(msg),
+            control::OP_WM_OUTPUTS           => self.handle_wm_outputs(),
+            control::OP_WM_ARRANGE_OUTPUTS   => self.handle_wm_arrange_outputs(msg),
 
             op => Err(DispatchError::UnknownOp(op)),
         }
@@ -818,6 +837,36 @@ impl EnvelopeFrontend {
         }
         let payload = encode(&self.display_modes).map_err(|_| DispatchError::BadPayload)?;
         Ok(vec![Outbound { op: control::OP_WM_DISPLAY_MODES, flags: flag::IS_RESPONSE, payload }])
+    }
+
+    /// `OP_WM_OUTPUTS` — where each monitor sits on the desktop (WM only).
+    fn handle_wm_outputs(&mut self) -> Result<Vec<Outbound>, DispatchError> {
+        if !self.wm_capable.contains(&self.current_client) {
+            return Err(DispatchError::Forbidden);
+        }
+        let payload = encode(&self.outputs).map_err(|_| DispatchError::BadPayload)?;
+        Ok(vec![Outbound { op: control::OP_WM_OUTPUTS, flags: flag::IS_RESPONSE, payload }])
+    }
+
+    /// `OP_WM_ARRANGE_OUTPUTS` — queue an arrangement of the monitors (WM
+    /// only). Only monitors on the desktop may be named, each once; frescod
+    /// checks the geometry when it applies it (a refused one leaves the
+    /// desktop as it was, and no EV_DISPLAY_CHANGED follows).
+    fn handle_wm_arrange_outputs(&mut self, msg: &Message) -> Result<Vec<Outbound>, DispatchError> {
+        if !self.wm_capable.contains(&self.current_client) {
+            return Err(DispatchError::Forbidden);
+        }
+        let p: fresco_protocol::WmArrangeOutputsPayload =
+            decode(&msg.payload).map_err(|_| DispatchError::BadPayload)?;
+        let mut seen = std::collections::HashSet::new();
+        let known = p.placements.iter().all(|pl| {
+            seen.insert(pl.identity) && self.outputs.outputs.iter().any(|o| o.identity == pl.identity)
+        });
+        if p.placements.is_empty() || !known {
+            return Err(DispatchError::BadPayload);
+        }
+        self.arrange_request = Some(p.placements);
+        Ok(vec![Outbound { op: control::OP_WM_ARRANGE_OUTPUTS, flags: flag::IS_RESPONSE, payload: Vec::new() }])
     }
 
     /// `OP_WM_SET_DISPLAY_MODE` — queue a switch to a listed mode (WM only).

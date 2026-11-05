@@ -141,6 +141,10 @@ pub mod control {
     // forum-ctl through it) asks, frescod programs the display.
     pub const OP_WM_DISPLAY_MODES:      u16 = 0x0523; // → WmDisplayModesReply
     pub const OP_WM_SET_DISPLAY_MODE:   u16 = 0x0524; // WmSetDisplayModePayload
+    // Several monitors (display ABI 3.0): where each one sits on the desktop,
+    // and moving them. The desktop (DisplayInfoResponse) is their bounding box.
+    pub const OP_WM_OUTPUTS:            u16 = 0x0525; // → WmOutputsReply
+    pub const OP_WM_ARRANGE_OUTPUTS:    u16 = 0x0526; // WmArrangeOutputsPayload
 
     // Async events (server → client). Sent with envelope flag
     // ASYNC_EVENT (aqueduct::envelope::flags::ASYNC_EVENT).
@@ -287,6 +291,45 @@ pub struct WmSetDisplayModePayload {
     pub width: u32,
     pub height: u32,
     pub refresh_mhz: u32,
+}
+
+/// One monitor on the desktop, as `OP_WM_OUTPUTS` lists it.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub struct WmOutput {
+    /// The display output (connector) it is on.
+    pub output: u32,
+    /// The monitor's identity: the same monitor reads the same on any
+    /// output and any boot (display ABI 3.0, from its EDID).
+    pub identity: u64,
+    /// Its part of the desktop, in desktop pixels.
+    pub rect: WmRect,
+    pub refresh_mhz: u32,
+    /// false while the monitor is gone but keeps its place (a dropout of a
+    /// few seconds); nothing shows there meanwhile.
+    pub present: bool,
+}
+
+/// Reply to `OP_WM_OUTPUTS`: every monitor of the desktop, by output.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct WmOutputsReply {
+    pub outputs: Vec<WmOutput>,
+}
+
+/// `OP_WM_ARRANGE_OUTPUTS` — put monitors at these desktop positions (top-left
+/// corners), by identity; monitors not listed stay. The arrangement must leave
+/// every monitor touching another, with no overlap, or it is refused with
+/// `BAD_PAYLOAD`; positions are shifted so the desktop starts at (0, 0). It is
+/// remembered for this set of monitors. `EV_DISPLAY_CHANGED` follows.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct WmArrangeOutputsPayload {
+    pub placements: Vec<WmOutputPlacement>,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub struct WmOutputPlacement {
+    pub identity: u64,
+    pub x: i32,
+    pub y: i32,
 }
 
 /// `OP_WM_SET_RENDERING` — mark a fully-occluded surface non-rendering so its GPU

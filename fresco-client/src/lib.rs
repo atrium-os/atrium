@@ -496,6 +496,23 @@ impl Connection {
         self.wm_response(control::OP_WM_SET_DISPLAY_MODE).map(|_| ())
     }
 
+    /// Where each monitor sits on the desktop (window-management cap).
+    pub fn wm_outputs(&mut self) -> io::Result<fresco_protocol::WmOutputsReply> {
+        self.send_window_managed(control::OP_WM_OUTPUTS, &())?;
+        let m = self.wm_response(control::OP_WM_OUTPUTS)?;
+        decode(&m.payload).map_err(|e| io::Error::new(io::ErrorKind::InvalidData,
+            format!("decode WM_OUTPUTS reply: {e}")))
+    }
+
+    /// Move monitors on the desktop (by identity). Returns once frescod
+    /// accepted the request; it applies it at its next frame and announces it
+    /// with [`Event::DisplayChanged`] (none if the geometry is refused).
+    pub fn wm_arrange_outputs(&mut self, placements: Vec<fresco_protocol::WmOutputPlacement>) -> io::Result<()> {
+        let p = fresco_protocol::WmArrangeOutputsPayload { placements };
+        self.send_window_managed(control::OP_WM_ARRANGE_OUTPUTS, &p)?;
+        self.wm_response(control::OP_WM_ARRANGE_OUTPUTS).map(|_| ())
+    }
+
     /// Wait for the IS_RESPONSE to WM op `op`, turning an IS_ERROR into an
     /// error. Other messages in between are skipped, as `wm_enumerate` does.
     fn wm_response(&mut self, op: u16) -> io::Result<Message> {

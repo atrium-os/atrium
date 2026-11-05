@@ -172,6 +172,7 @@ fn main() -> std::io::Result<()> {
      * rather than each assuming a screen size, and output 0's modes. */
     frontend.lock().unwrap().set_display_mode(dw, dh, refresh);
     publish_output0(&frontend, &dpy, &heads);
+    publish_outputs(&frontend, &heads);
 
     /* ── Socket server ───────────────────────────────────────────── */
     let sock_path = std::env::var("FRESCOD_SOCK")
@@ -336,9 +337,11 @@ fn main() -> std::io::Result<()> {
             hotplug_pending = true;
             if let Ok(seen) = seen_outputs(&dpy) {
                 mark_present(&mut heads, &seen);
+                publish_outputs(&frontend, &heads);
             }
         }
         let request = frontend.lock().unwrap().take_mode_request();
+        let mut changed = false;
         let settled = hotplug_pending && tracker.settled(now);
         let regrace = recheck_at.is_some_and(|t| now >= t);
         if settled || regrace || request.is_some() {
@@ -349,40 +352,56 @@ fn main() -> std::io::Result<()> {
             match reconfigure_heads(&cx, &mut heads, &mut tracker, &remembered, request, renderer.can_hdr()) {
                 Ok((true, again)) => {
                     recheck_at = again;
-                    let (nw, nh) = desktop_of(&heads);
-                    refresh = fastest(&heads);
-                    frame_deadline_ns = frame_deadline(refresh);
-                    if (nw, nh) != (dw, dh) {
-                        renderer.resize(&vm, nw, nh, load_bundles).map_err(io_other)?;
-                        framebuffer = vec![0u8; nw as usize * nh as usize * 4];
-                        (dw, dh) = (nw, nh);
-                    }
-                    if heads.len() > 1 && renderer.fall_back_to_cpu(dw, dh).map_err(io_other)? {
-                        eprintln!("frescod: {} monitors: renderer -> {} (the gpu renderer drives one)",
-                            heads.len(), renderer.name());
-                    } else if heads.len() == 1 && gpu_wanted && !renderer.is_gpu() && gpu_back_at.is_none() {
-                        match renderer.back_to_gpu(&vm, dw, dh) {
-                            Ok(()) => eprintln!("frescod: one monitor again; renderer -> {}", renderer.name()),
-                            Err(e) => eprintln!("frescod: GPU renderer not back ({e}); staying on Tier-2"),
-                        }
-                    }
-                    remember(&heads, &mut remembered);
-                    screen::set(dw, dh, refresh);
-                    let info = {
-                        let mut f = frontend.lock().unwrap();
-                        f.set_display_mode(dw, dh, refresh);
-                        f.display_info()
-                    };
-                    let _ = ev_main.send(fresco_scene_server::window::DisplayEvent::DisplayChanged {
-                        width: info.width, height: info.height,
-                        refresh_mhz: info.refresh_mhz, reserved_top: info.reserved_top,
-                    });
-                    last_gen = 0; /* repaint at once */
+                    changed = true;
                 }
                 Ok((false, again)) => recheck_at = again,
                 Err(e) => eprintln!("frescod: display reconfiguration failed ({e}); staying"),
             }
             publish_output0(&frontend, &dpy, &heads);
+        }
+        /* A WM moving monitors on the desktop (OP_WM_ARRANGE_OUTPUTS). */
+        let placements = frontend.lock().unwrap().take_arrange_request();
+        if let Some(pl) = placements {
+            match place_outputs(&mut heads, &pl) {
+                Ok(()) => {
+                    let at: Vec<String> = heads.iter().map(|h| format!("output {} at {},{}", h.output, h.vp.x, h.vp.y)).collect();
+                    eprintln!("frescod: monitors arranged: {}", at.join(", "));
+                    changed = true;
+                }
+                Err(e) => eprintln!("frescod: monitor arrangement refused: {e}"),
+            }
+        }
+        if changed {
+            let (nw, nh) = desktop_of(&heads);
+            refresh = fastest(&heads);
+            frame_deadline_ns = frame_deadline(refresh);
+            if (nw, nh) != (dw, dh) {
+                renderer.resize(&vm, nw, nh, load_bundles).map_err(io_other)?;
+                framebuffer = vec![0u8; nw as usize * nh as usize * 4];
+                (dw, dh) = (nw, nh);
+            }
+            if heads.len() > 1 && renderer.fall_back_to_cpu(dw, dh).map_err(io_other)? {
+                eprintln!("frescod: {} monitors: renderer -> {} (the gpu renderer drives one)",
+                    heads.len(), renderer.name());
+            } else if heads.len() == 1 && gpu_wanted && !renderer.is_gpu() && gpu_back_at.is_none() {
+                match renderer.back_to_gpu(&vm, dw, dh) {
+                    Ok(()) => eprintln!("frescod: one monitor again; renderer -> {}", renderer.name()),
+                    Err(e) => eprintln!("frescod: GPU renderer not back ({e}); staying on Tier-2"),
+                }
+            }
+            remember(&heads, &mut remembered);
+            screen::set(dw, dh, refresh);
+            publish_outputs(&frontend, &heads);
+            let info = {
+                let mut f = frontend.lock().unwrap();
+                f.set_display_mode(dw, dh, refresh);
+                f.display_info()
+            };
+            let _ = ev_main.send(fresco_scene_server::window::DisplayEvent::DisplayChanged {
+                width: info.width, height: info.height,
+                refresh_mhz: info.refresh_mhz, reserved_top: info.reserved_top,
+            });
+            last_gen = 0; /* repaint at once */
         }
 
         let multi = heads.len() > 1;
@@ -584,6 +603,54 @@ fn present_head(
     h.frame = next;
     h.on_screen = back;
     h.stale = false;
+    Ok(())
+}
+
+/// Tell the WM side where each monitor sits (`OP_WM_OUTPUTS`).
+fn publish_outputs(frontend: &Arc<Mutex<EnvelopeFrontend>>, heads: &[heads::Head<'_>]) {
+    let list = heads
+        .iter()
+        .map(|h| fresco_protocol::WmOutput {
+            output: h.output,
+            identity: h.identity,
+            rect: fresco_protocol::WmRect { x: h.vp.x as i32, y: h.vp.y as i32, w: h.vp.width as i32, h: h.vp.height as i32 },
+            refresh_mhz: h.mode.refresh_mhz,
+            present: h.present,
+        })
+        .collect();
+    frontend.lock().unwrap().set_outputs(list);
+}
+
+/// Move monitors on the desktop (a WM's OP_WM_ARRANGE_OUTPUTS): the named
+/// ones to their new corners, shifted so the desktop starts at (0, 0). The
+/// result must keep every monitor touching another with no overlap
+/// (outputs::validate), else nothing changes.
+fn place_outputs(heads: &mut [heads::Head<'_>], placements: &[fresco_protocol::WmOutputPlacement]) -> Result<(), String> {
+    let mut at: Vec<(i64, i64)> = heads
+        .iter()
+        .map(|h| {
+            placements
+                .iter()
+                .find(|p| p.identity == h.identity)
+                .map_or((i64::from(h.vp.x), i64::from(h.vp.y)), |p| (i64::from(p.x), i64::from(p.y)))
+        })
+        .collect();
+    let (mx, my) = (at.iter().map(|a| a.0).min().unwrap_or(0), at.iter().map(|a| a.1).min().unwrap_or(0));
+    for a in at.iter_mut() {
+        *a = (a.0 - mx, a.1 - my);
+    }
+    if at.iter().any(|a| a.0 > i64::from(u16::MAX) || a.1 > i64::from(u16::MAX)) {
+        return Err("too far apart".into());
+    }
+    let vps: Vec<outputs::Viewport> = heads
+        .iter()
+        .zip(&at)
+        .map(|(h, a)| outputs::Viewport { x: a.0 as u32, y: a.1 as u32, ..h.vp })
+        .collect();
+    outputs::validate(&vps)?;
+    for (h, v) in heads.iter_mut().zip(vps) {
+        h.vp = v;
+    }
     Ok(())
 }
 

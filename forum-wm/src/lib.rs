@@ -96,6 +96,11 @@ fn resolve_focus(surfaces: &[WmSurfaceInfo], focus_intent: Option<u32>) -> u32 {
         .unwrap_or(0)
 }
 
+/// App surfaces a person works in (what can be focused and moved).
+fn click_focusable_role(role: WmRole) -> bool {
+    matches!(role, WmRole::Document | WmRole::Dialog | WmRole::Panel)
+}
+
 fn rect_for(screen: &Screen, role: WmRole) -> WmRect {
     let wa = screen.work_area();
     match role {
@@ -285,8 +290,9 @@ fn subtract(r: &WmRect, cut: &WmRect) -> Vec<WmRect> {
 /// The daemon reconcile loop. The WM core's job each time the surface set or focus
 /// changes: enumerate → arrange → declare the layout + the rendering decisions.
 pub mod daemon {
-    use super::{arrange, arrange_for, arrange_snapped, rendering_decisions, Screen, Snap};
-    use fresco_protocol::{WmDeclareLayoutPayload, WmRole, WmSetRenderingPayload, WmSlot, WmSurfaceInfo};
+    use super::{arrange, arrange_for, arrange_snapped, rendering_decisions, resolve_focus, Screen, Snap};
+    use fresco_protocol::{WmDeclareLayoutPayload, WmOutput, WmOutputPlacement, WmRect, WmRole, WmSetRenderingPayload, WmSlot, WmSurfaceInfo};
+    use std::cell::RefCell;
     use portcullis_peer::AppRegistry;
     use std::collections::{HashMap, HashSet};
     use std::io;
@@ -347,6 +353,11 @@ pub mod daemon {
         /// at its next frame and broadcasts EV_DISPLAY_CHANGED, on which the
         /// WM adopts the new screen ([`Wm::set_screen`]).
         fn set_display_mode(&mut self, width: u32, height: u32, refresh_mhz: u32) -> io::Result<()>;
+        /// Where each monitor sits on the desktop (OP_WM_OUTPUTS).
+        fn outputs(&mut self) -> io::Result<Vec<WmOutput>>;
+        /// Move monitors on the desktop (OP_WM_ARRANGE_OUTPUTS); frescod
+        /// applies it at its next frame and broadcasts EV_DISPLAY_CHANGED.
+        fn arrange_outputs(&mut self, placements: Vec<WmOutputPlacement>) -> io::Result<()>;
     }
 
     /// The WM core state: output geometry, the human's focus intent, and the
@@ -385,7 +396,20 @@ pub mod daemon {
         /// any document on the active workspace is snapped, it enters snap mode
         /// (manual tile: snapped docs show in their halves, the rest gate).
         pub snapped: HashMap<u32, Snap>,
+        /// The monitors (display 3.0), as frescod places them on the desktop.
+        /// With fewer than two present the WM lays out on `screen` alone.
+        pub outputs: Vec<WmOutput>,
+        /// surface_id → the monitor (identity) it lives on. A window whose
+        /// monitor is gone shows on the primary one meanwhile (rescued) and
+        /// goes back when that monitor returns, on whatever output it is
+        /// plugged into (restored): the home is kept, not rewritten.
+        pub home: HashMap<u32, u64>,
+        /// The document last on top of each monitor, so focusing a window on
+        /// one monitor doesn't change what another one shows.
+        pub top: RefCell<HashMap<u64, u32>>,
     }
+
+    pub use forum_ctl::Side;
 
     impl Wm {
         pub fn new(screen: Screen) -> Self {
@@ -401,7 +425,126 @@ pub mod daemon {
                 tiled_workspaces: HashSet::new(),
                 zoomed: None,
                 snapped: HashMap::new(),
+                outputs: Vec::new(),
+                home: HashMap::new(),
+                top: RefCell::new(HashMap::new()),
             }
+        }
+
+        /// The monitors to lay out on: the present ones, primary first. The
+        /// primary is the top-left one (top row, then leftmost); it holds the
+        /// bar and the dock, and takes the windows whose monitor is gone.
+        pub fn monitors(&self) -> Vec<WmOutput> {
+            let mut v: Vec<WmOutput> = self.outputs.iter().filter(|o| o.present).copied().collect();
+            v.sort_by_key(|o| (o.rect.y, o.rect.x, o.output));
+            v
+        }
+
+        /// The monitor surface `s` shows on: chrome, hud and the wallpaper on
+        /// the primary; an app surface on its home if that monitor is here,
+        /// else on the primary.
+        pub fn monitor_of(&self, s: &WmSurfaceInfo, mons: &[WmOutput]) -> u64 {
+            let primary = mons.first().map_or(0, |m| m.identity);
+            if matches!(s.role, WmRole::Chrome | WmRole::Hud | WmRole::Background) {
+                return primary;
+            }
+            self.home
+                .get(&s.surface_id)
+                .copied()
+                .filter(|h| mons.iter().any(|m| m.identity == *h))
+                .unwrap_or(primary)
+        }
+
+        /// Monitor `m`'s screen: its part of the desktop below frescod's
+        /// trusted strip (the strip runs along the desktop's top), with the
+        /// bar and dock reserved on the primary only.
+        fn screen_of(&self, m: &WmOutput, primary: bool) -> Screen {
+            let top = self.screen.rect.y;
+            let y = m.rect.y.max(top);
+            let h = m.rect.h - (y - m.rect.y);
+            Screen {
+                rect: WmRect { x: m.rect.x, y, w: m.rect.w, h },
+                bar_h: if primary { self.screen.bar_h } else { 0 },
+                dock_h: if primary { self.screen.dock_h } else { 0 },
+            }
+        }
+
+        /// Adopt frescod's monitors (after EV_DISPLAY_CHANGED) and re-lay out
+        /// if they moved, came or went. Returns the new layout if it changed.
+        pub fn set_outputs(&mut self, conn: &mut impl FrescoConn, outputs: Vec<WmOutput>)
+            -> io::Result<Option<WmDeclareLayoutPayload>>
+        {
+            if outputs == self.outputs {
+                return Ok(None);
+            }
+            // Windows with no home yet (opened while there was one monitor)
+            // belong to the monitor they are on now, so a new monitor
+            // becoming the primary doesn't pull them over to it.
+            let mons = self.monitors();
+            if !mons.is_empty() {
+                for s in conn.enumerate()? {
+                    if super::click_focusable_role(s.role) && !self.home.contains_key(&s.surface_id) {
+                        let at = self.monitor_of(&s, &mons);
+                        self.home.insert(s.surface_id, at);
+                    }
+                }
+            }
+            self.outputs = outputs;
+            self.reconcile(conn).map(Some)
+        }
+
+        /// Send the focused window to the next monitor (in the primary-first
+        /// order, wrapping) and re-declare; it becomes that window's home.
+        /// Returns the monitor it went to, `None` with one monitor or nothing
+        /// focusable.
+        pub fn move_focused_to_next_monitor(&mut self, conn: &mut impl FrescoConn)
+            -> io::Result<Option<u64>>
+        {
+            let mons = self.monitors();
+            if mons.len() < 2 {
+                return Ok(None);
+            }
+            let surfaces = conn.enumerate()?;
+            let active: Vec<WmSurfaceInfo> = surfaces
+                .iter()
+                .filter(|s| shown_in_workspace(s, &self.assignment, self.active))
+                .cloned()
+                .collect();
+            let focus = resolve_focus(&active, self.focus_intent);
+            let Some(s) = active.iter().find(|s| s.surface_id == focus && super::click_focusable_role(s.role)) else {
+                return Ok(None);
+            };
+            let here = self.monitor_of(s, &mons);
+            let i = mons.iter().position(|m| m.identity == here).unwrap_or(0);
+            let to = mons[(i + 1) % mons.len()].identity;
+            self.home.insert(focus, to);
+            self.snapped.remove(&focus); // a half of the old monitor means nothing on the new one
+            self.focus_intent = Some(focus);
+            self.declare(conn, &surfaces)?;
+            Ok(Some(to))
+        }
+
+        /// Put output `which` beside output `of` (by output number), keeping
+        /// the top (or left) edges aligned, and ask frescod to move it. The
+        /// other monitors stay where they are; frescod refuses an arrangement
+        /// that leaves a monitor detached or overlapping.
+        pub fn place_output(&mut self, conn: &mut impl FrescoConn, which: u32, side: Side, of: u32)
+            -> io::Result<()>
+        {
+            let find = |n: u32| self.outputs.iter().find(|o| o.output == n).copied();
+            let (Some(a), Some(b)) = (find(which), find(of)) else {
+                return Err(io::Error::new(io::ErrorKind::NotFound, "no such output"));
+            };
+            if which == of {
+                return Err(io::Error::new(io::ErrorKind::InvalidInput, "an output can't sit beside itself"));
+            }
+            let (x, y) = match side {
+                Side::RightOf => (b.rect.x + b.rect.w, b.rect.y),
+                Side::LeftOf => (b.rect.x - a.rect.w, b.rect.y),
+                Side::Above => (b.rect.x, b.rect.y - a.rect.h),
+                Side::Below => (b.rect.x, b.rect.y + b.rect.h),
+            };
+            conn.arrange_outputs(vec![WmOutputPlacement { identity: a.identity, x, y }])
         }
 
         /// A human-facing label for workspace `i`: its configured name, else
@@ -563,21 +706,62 @@ pub mod daemon {
         /// Pick the layout for the active workspace's visible surfaces, applying
         /// the active intent: zoom (one surface fills the screen) > snap (manual
         /// tile of the snapped docs) > the workspace's split/stacked arrangement.
+        ///
+        /// With several monitors each one is laid out on its own, for the
+        /// surfaces that show on it ([`Self::monitor_of`]): the intents apply
+        /// per monitor (zoom fills the zoomed window's monitor, split tiles
+        /// each monitor's documents), and a monitor without the focused window
+        /// keeps showing the document last on top of it.
         fn layout_active(&self, active: &[WmSurfaceInfo]) -> WmDeclareLayoutPayload {
+            let mons = self.monitors();
+            match mons.as_slice() {
+                [] => return self.layout_on(&self.screen, active, self.focus_intent),
+                // One monitor left (the others gone, or within their grace):
+                // everything on it, sized to it rather than to the desktop.
+                [m] => return self.layout_on(&self.screen_of(m, true), active, self.focus_intent),
+                _ => {}
+            }
+            let focus = resolve_focus(active, self.focus_intent);
+            let mut slots = Vec::new();
+            for (i, m) in mons.iter().enumerate() {
+                let sub: Vec<WmSurfaceInfo> =
+                    active.iter().filter(|s| self.monitor_of(s, &mons) == m.identity).cloned().collect();
+                if sub.is_empty() {
+                    continue;
+                }
+                let has = |id: u32| sub.iter().any(|s| s.surface_id == id);
+                let f = if has(focus) {
+                    Some(focus)
+                } else {
+                    self.top.borrow().get(&m.identity).copied().filter(|t| has(*t))
+                };
+                let l = self.layout_on(&self.screen_of(m, i == 0), &sub, f);
+                if l.focus != 0 && sub.iter().any(|s| s.surface_id == l.focus && s.role == WmRole::Document) {
+                    self.top.borrow_mut().insert(m.identity, l.focus);
+                }
+                slots.extend(l.slots);
+            }
+            WmDeclareLayoutPayload { slots, focus }
+        }
+
+        /// [`Self::layout_active`] on one screen.
+        fn layout_on(&self, screen: &Screen, active: &[WmSurfaceInfo], focus_intent: Option<u32>)
+            -> WmDeclareLayoutPayload
+        {
             // Zoom wins: the zoomed surface alone fills the whole screen.
             if let Some(zid) = self.zoomed.filter(|z| active.iter().any(|s| s.surface_id == *z)) {
                 return WmDeclareLayoutPayload {
-                    slots: vec![WmSlot { surface_id: zid, rect: self.screen.rect, layer: 0 }],
+                    slots: vec![WmSlot { surface_id: zid, rect: screen.rect, layer: 0 }],
                     focus: zid,
                 };
             }
             // Snap: if any visible document is snapped, enter snap mode.
             if active.iter().any(|s| s.role == WmRole::Document && self.snapped.contains_key(&s.surface_id)) {
-                return arrange_snapped(&self.screen, active, self.focus_intent, &self.snapped);
+                return arrange_snapped(screen, active, focus_intent, &self.snapped);
             }
             // Otherwise the workspace's split (tiled) or stacked arrangement.
             let tiled = self.tiled_workspaces.contains(&self.active);
-            arrange_for(&self.screen, active, self.focus_intent, tiled)
+            arrange_for(screen, active, focus_intent, tiled)
         }
 
         /// The workspace-aware placement step shared by every reconcile path:
@@ -677,6 +861,22 @@ pub mod daemon {
                     .filter(|w| *w < self.workspaces)
                     .unwrap_or(self.active);
                 self.assignment.insert(new_id, ws);
+                // With several monitors a new window opens on the monitor of
+                // the window you're working in (the primary if none).
+                let mons = self.monitors();
+                if mons.len() > 1 && !self.home.contains_key(&new_id) {
+                    let shown: Vec<WmSurfaceInfo> = surfaces
+                        .iter()
+                        .filter(|t| t.surface_id != new_id && shown_in_workspace(t, &self.assignment, self.active))
+                        .cloned()
+                        .collect();
+                    let cur = resolve_focus(&shown, self.focus_intent);
+                    let at = shown
+                        .iter()
+                        .find(|t| t.surface_id == cur)
+                        .map_or(mons[0].identity, |t| self.monitor_of(t, &mons));
+                    self.home.insert(new_id, at);
+                }
                 // A new document opens focused — but only if it landed on the
                 // workspace you're looking at (a rule may send it elsewhere).
                 if s.role == WmRole::Document && ws == self.active {
@@ -768,6 +968,21 @@ pub mod control {
             }
             Intent::ListDisplayModes => match conn.display_modes() {
                 Ok(r) => Reply::DisplayModes { modes: r.modes, current: r.current },
+                Err(e) => Reply::Err { message: e.to_string() },
+            },
+            Intent::ListOutputs => match conn.outputs() {
+                Ok(outputs) => Reply::Outputs { outputs },
+                Err(e) => Reply::Err { message: e.to_string() },
+            },
+            // frescod checks the geometry and moves the monitor at its next
+            // frame; the WM re-lays out on the EV_DISPLAY_CHANGED that follows.
+            Intent::PlaceOutput { output, side, of } => match wm.place_output(conn, output, side, of) {
+                Ok(()) => Reply::Ack,
+                Err(e) => Reply::Err { message: e.to_string() },
+            },
+            Intent::MoveToNextMonitor => match wm.move_focused_to_next_monitor(conn) {
+                Ok(Some(_)) => Reply::Ack,
+                Ok(None) => Reply::Err { message: "nothing to move, or only one monitor".into() },
                 Err(e) => Reply::Err { message: e.to_string() },
             },
             // frescod validates the mode against the monitor's list; the WM
@@ -961,7 +1176,7 @@ mod tests {
 
     // ── the daemon reconcile loop ────────────────────────────────────────────
 
-    use crate::daemon::{FrescoConn, Wm};
+    use crate::daemon::{FrescoConn, Side, Wm};
     use std::io;
 
     /// A recorder standing in for the live frescod connection.
@@ -972,6 +1187,8 @@ mod tests {
         rendering: Vec<WmSetRenderingPayload>,
         modes: Vec<fresco_protocol::WmDisplayMode>,
         mode_set: Option<(u32, u32, u32)>,
+        outputs: Vec<fresco_protocol::WmOutput>,
+        arranged: Option<Vec<fresco_protocol::WmOutputPlacement>>,
     }
     impl FrescoConn for MockConn {
         fn enumerate(&mut self) -> io::Result<Vec<WmSurfaceInfo>> {
@@ -993,6 +1210,13 @@ mod tests {
                 return Err(io::Error::new(io::ErrorKind::InvalidInput, "no such mode"));
             }
             self.mode_set = Some((w, h, r));
+            Ok(())
+        }
+        fn outputs(&mut self) -> io::Result<Vec<fresco_protocol::WmOutput>> {
+            Ok(self.outputs.clone())
+        }
+        fn arrange_outputs(&mut self, p: Vec<fresco_protocol::WmOutputPlacement>) -> io::Result<()> {
+            self.arranged = Some(p);
             Ok(())
         }
     }
@@ -1287,5 +1511,112 @@ mod tests {
             Some(&2),
             "moving a known app records its placement for future launches + persistence",
         );
+    }
+
+    // ── several monitors ────────────────────────────────────────────────
+
+    fn mon(output: u32, identity: u64, x: i32, w: i32, h: i32) -> fresco_protocol::WmOutput {
+        fresco_protocol::WmOutput {
+            output, identity, rect: WmRect { x, y: 0, w, h }, refresh_mhz: 60000, present: true,
+        }
+    }
+
+    fn slot(l: &WmDeclareLayoutPayload, id: u32) -> Option<WmRect> {
+        l.slots.iter().find(|s| s.surface_id == id).map(|s| s.rect)
+    }
+
+    fn two_monitors() -> (Wm, MockConn) {
+        let mut conn = MockConn { surfaces: vec![surf(1, WmRole::Document)], ..Default::default() };
+        let mut wm = Wm::new(Screen { rect: WmRect { x: 0, y: 0, w: 4480, h: 1440 }, bar_h: 24, dock_h: 48 });
+        wm.set_outputs(&mut conn, vec![mon(0, 10, 0, 1920, 1080), mon(1, 20, 1920, 2560, 1440)]).unwrap();
+        (wm, conn)
+    }
+
+    #[test]
+    fn each_monitor_shows_its_own_windows_and_chrome_stays_on_the_primary() {
+        let (mut wm, mut conn) = two_monitors();
+        conn.surfaces.push(surf(9, WmRole::Chrome));
+        wm.focus_new(&mut conn, 1).unwrap();
+        // Window 1 opened on the primary; send it to the other monitor.
+        assert_eq!(wm.move_focused_to_next_monitor(&mut conn).unwrap(), Some(20));
+        // A second window opens where you're working: monitor 20.
+        conn.surfaces.push(surf(2, WmRole::Document));
+        let l = wm.focus_new(&mut conn, 2).unwrap();
+        let r2 = slot(&l, 2).unwrap();
+        assert!(r2.x >= 1920 && r2.y == 0 && r2.h == 1440, "{r2:?}: no bar or dock off the primary");
+        let r9 = slot(&l, 9).unwrap();
+        assert!(r9.x == 0 && r9.w == 1920, "{r9:?}: the bar sits on the primary");
+        // Focus moves to a window on the primary: monitor 20 keeps showing 2.
+        conn.surfaces.push(surf(3, WmRole::Document));
+        wm.home.insert(3, 10);
+        wm.focus(3);
+        let l = wm.reconcile(&mut conn).unwrap();
+        assert_eq!(l.focus, 3);
+        let on20 = l.slots.iter().filter(|s| s.rect.x >= 1920 && s.layer == DOC_FOCUSED).count();
+        assert_eq!(on20, 1, "monitor 20 still has a document on top: {l:?}");
+    }
+
+    #[test]
+    fn a_window_on_a_monitor_that_left_is_rescued_and_goes_back_when_it_returns() {
+        let (mut wm, mut conn) = two_monitors();
+        wm.focus_new(&mut conn, 1).unwrap();
+        wm.move_focused_to_next_monitor(&mut conn).unwrap();
+        let on = |wm: &mut Wm, conn: &mut MockConn| slot(&wm.reconcile(conn).unwrap(), 1).unwrap();
+        assert!(on(&mut wm, &mut conn).x >= 1920);
+        // Monitor 20 unplugged (frescod drops it after its grace).
+        wm.set_outputs(&mut conn, vec![mon(0, 10, 0, 1920, 1080)]).unwrap();
+        let r = on(&mut wm, &mut conn);
+        assert!(r.x < 1920 && r.x + r.w <= 1920, "rescued onto the primary: {r:?}");
+        // It comes back, on another output and to the left this time.
+        wm.set_outputs(&mut conn, vec![mon(2, 20, 0, 2560, 1440), mon(0, 10, 2560, 1920, 1080)]).unwrap();
+        let r = on(&mut wm, &mut conn);
+        assert!(r.x < 2560 && r.w <= 2560, "back on its monitor: {r:?}");
+        assert_eq!(wm.home.get(&1), Some(&20));
+    }
+
+    #[test]
+    fn a_monitor_in_its_grace_shows_nothing_and_keeps_its_windows() {
+        let (mut wm, mut conn) = two_monitors();
+        wm.focus_new(&mut conn, 1).unwrap();
+        wm.move_focused_to_next_monitor(&mut conn).unwrap();
+        let mut gone = mon(1, 20, 1920, 2560, 1440);
+        gone.present = false;
+        wm.set_outputs(&mut conn, vec![mon(0, 10, 0, 1920, 1080), gone]).unwrap();
+        let r = slot(&wm.reconcile(&mut conn).unwrap(), 1).unwrap();
+        assert!(r.x + r.w <= 1920, "shown on the primary meanwhile: {r:?}");
+        assert_eq!(wm.home.get(&1), Some(&20), "and still at home on 20");
+    }
+
+    #[test]
+    fn zoom_fills_only_its_own_monitor() {
+        let (mut wm, mut conn) = two_monitors();
+        wm.focus_new(&mut conn, 1).unwrap();
+        wm.move_focused_to_next_monitor(&mut conn).unwrap();
+        wm.toggle_zoom(&mut conn).unwrap();
+        let l = conn.declared.clone().unwrap();
+        assert_eq!(slot(&l, 1), Some(WmRect { x: 1920, y: 0, w: 2560, h: 1440 }));
+    }
+
+    #[test]
+    fn placing_an_output_asks_frescod_for_its_new_corner() {
+        let (mut wm, mut conn) = two_monitors();
+        wm.place_output(&mut conn, 1, Side::LeftOf, 0).unwrap();
+        assert_eq!(conn.arranged, Some(vec![fresco_protocol::WmOutputPlacement { identity: 20, x: -2560, y: 0 }]));
+        wm.place_output(&mut conn, 1, Side::Below, 0).unwrap();
+        assert_eq!(conn.arranged, Some(vec![fresco_protocol::WmOutputPlacement { identity: 20, x: 0, y: 1080 }]));
+        assert!(wm.place_output(&mut conn, 1, Side::Below, 1).is_err());
+        assert!(wm.place_output(&mut conn, 5, Side::Below, 0).is_err());
+    }
+
+    #[test]
+    fn windows_stay_on_their_monitor_when_a_new_one_becomes_the_primary() {
+        let mut conn = MockConn { surfaces: vec![surf(1, WmRole::Document)], ..Default::default() };
+        let mut wm = Wm::new(Screen { rect: WmRect { x: 0, y: 0, w: 1920, h: 1080 }, bar_h: 24, dock_h: 48 });
+        wm.set_outputs(&mut conn, vec![mon(0, 10, 0, 1920, 1080)]).unwrap();
+        wm.focus_new(&mut conn, 1).unwrap();
+        // A second monitor arrives to the left: it is now the top-left one.
+        wm.set_outputs(&mut conn, vec![mon(1, 20, 0, 2560, 1440), mon(0, 10, 2560, 1920, 1080)]).unwrap();
+        let r = slot(&wm.reconcile(&mut conn).unwrap(), 1).unwrap();
+        assert!(r.x >= 2560, "window 1 stayed on monitor 10: {r:?}");
     }
 }

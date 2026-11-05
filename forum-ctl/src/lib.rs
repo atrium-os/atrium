@@ -12,7 +12,24 @@
 
 use serde::{Deserialize, Serialize};
 
-pub use fresco_protocol::{WmDisplayMode, WmSurfaceInfo};
+pub use fresco_protocol::{WmDisplayMode, WmOutput, WmSurfaceInfo};
+
+/// Where one monitor goes relative to another ([`Intent::PlaceOutput`]).
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub enum Side { RightOf, LeftOf, Above, Below }
+
+impl std::str::FromStr for Side {
+    type Err = String;
+    fn from_str(s: &str) -> Result<Self, String> {
+        match s {
+            "right-of" => Ok(Side::RightOf),
+            "left-of" => Ok(Side::LeftOf),
+            "above" => Ok(Side::Above),
+            "below" => Ok(Side::Below),
+            _ => Err(format!("{s}: want right-of, left-of, above or below")),
+        }
+    }
+}
 
 /// The canonical forum-ctl socket inside a Portcullis jail. Portcullis nullfs-mounts
 /// the per-service directory `/atrium/sockets/forum-ctl/` (for both `window-management`,
@@ -55,6 +72,14 @@ pub enum Intent {
     /// listed refresh at that size. The core asks frescod, which switches at
     /// its next frame and broadcasts the new geometry; the WM then re-lays out.
     SetDisplayMode { width: u32, height: u32, refresh_mhz: u32 },
+    /// "Which monitors are there, and where on the desktop?" Read-only.
+    ListOutputs,
+    /// "Put output `output` on this side of output `of`." frescod checks the
+    /// arrangement (every monitor touching another, no overlap), applies and
+    /// remembers it for this set of monitors.
+    PlaceOutput { output: u32, side: Side, of: u32 },
+    /// "Send the focused window to the next monitor."
+    MoveToNextMonitor,
 }
 
 /// The core's answer to an `Intent`.
@@ -69,6 +94,8 @@ pub enum Reply {
     /// The monitor's modes and the lit one's index (`u32::MAX` if none or no
     /// monitor) — answer to `ListDisplayModes`.
     DisplayModes { modes: Vec<WmDisplayMode>, current: u32 },
+    /// The monitors and where they sit — answer to `ListOutputs`.
+    Outputs { outputs: Vec<WmOutput> },
 }
 
 /// Encode a message for the wire.
@@ -120,7 +147,9 @@ mod tests {
     #[test]
     fn intents_round_trip() {
         for i in [Intent::ListSurfaces, Intent::Focus { surface_id: 7 }, Intent::ListDisplayModes,
-                  Intent::SetDisplayMode { width: 2560, height: 1440, refresh_mhz: 59951 }] {
+                  Intent::SetDisplayMode { width: 2560, height: 1440, refresh_mhz: 59951 },
+                  Intent::ListOutputs, Intent::MoveToNextMonitor,
+                  Intent::PlaceOutput { output: 1, side: "left-of".parse().unwrap(), of: 0 }] {
             let b = encode(&i).unwrap();
             assert_eq!(decode::<Intent>(&b).unwrap(), i);
         }
