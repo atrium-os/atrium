@@ -382,8 +382,7 @@ source of browser RCE.
   6. The output's shape is re-checked.
 - *Decoders.* Memory-safe and permissive: `png`, `zune-jpeg` built without its
   `x86`/`neon` features (the crate is then `forbid(unsafe_code)`), `image-webp` and
-  `gif`. SVG is **not** a raster this decodes and is refused by name. Rendering it needs
-  a vector renderer, which is not chosen.
+  `gif`. SVG is drawn by its own path under a strict profile (*SVG as an image*, below).
 - *The output, stated once.* RGBA8, **straight (not premultiplied) alpha**, rows top
   down, stride = 4 × width, values as encoded (sRGB by convention; ICC and gAMA are
   ignored), first frame of an animation. Premultiplying is the compositor's job, on a
@@ -548,7 +547,8 @@ source of browser RCE.
   API supports it: a request at a new size decodes again and replaces the charge. But
   nothing asks for it yet, and zooming in past the decoded size will be blurry until
   something does. Transforms are not in the painted size: a `scale(2)` ancestor
-  under-samples by 2. SVG is still not decoded.
+  under-samples by 2. An SVG is drawn at whatever size it is asked for, so a request at a
+  new size draws it again sharp, never a scaled bitmap.
 
 **Images after the first display (2026-11-05, legacy-web §5.4.5.7).** The first
 artifact no longer waits for its images: it names each one `pending`, with no address,
@@ -569,8 +569,98 @@ changes because of that:
   `compose` already did for tables. Never HTML: the document does not change, and the
   worker is not told.
 
-**Rating now: low.** What stays open: SVG; the transient natural frame (DCT scaling or
-row streaming); re-decode on zoom; and the third-party image residual above.
+**SVG as an image (2026-11-06, `src/svg.rs`).** Until now SVG was refused by name.
+
+*Why it needs its own rules.* SVG is a document format, not a picture format. A browser's
+SVG can run script, load other files, embed HTML (`foreignObject`) and animate, and
+`<use>` can expand a few hundred bytes into billions of nodes.
+
+*Where it runs.* In the document worker, never in the broker or Fresco, like every
+decoder.
+
+*How a file is checked.*
+1. The bytes are parsed once, by roxmltree, with DTDs off. A bare DOCTYPE is dropped; an
+   internal subset or any `<!ENTITY>` is refused, so entity expansion cannot happen.
+2. That tree is checked against a strict profile.
+3. Only a tree that passes is handed to usvg (the same tree, not the bytes again) and
+   drawn by resvg/tiny-skia at exactly the painted size.
+
+*The profile.* Each limit is set from the corpora's 279 distinct SVGs (bytes p50 2.4 kB,
+max 438 kB; elements max 288; depth max 9; path segments max 15,000; none with script,
+foreignObject, filter or an external reference):
+- at most 1 MiB, UTF-8, root `svg`; no svgz;
+- SVG elements from an allowlist only;
+- refused **by name**: script, `foreignObject`, `<image>`, text (v1), filters,
+  animation, `marker`, embedded content, and any unlisted SVG element. A picture drawn
+  with a part silently missing is worse than one not drawn: an SVG with text is refused,
+  not drawn without its words;
+- every reference local: an `href` must be `#id`, every `url(…)` must be `url(#id)`, a
+  `<style>` may not `@import` or `@font-face`, and no attribute may be an event handler;
+- bounded: 10,000 elements, depth 64, 200,000 path segments, 1,024 gradient stops;
+- at most 20,000 nodes after `<use>` expansion. The count is memoised, so the check is
+  linear however large the expansion would be, and a reference cycle is refused;
+- layers that allocate (opacity, mask, clip, pattern) nested at most 8 deep;
+- work, meaning expanded nodes × output pixels, at most 2³¹;
+- pixels charged before allocation: the axis cap, the document's decode budget, and a
+  transient frame of output × (1 + layer depth), since resvg allocates a pixmap per
+  group layer.
+
+usvg is given resolvers that resolve nothing (no files, no data URLs) and no fonts.
+
+*Zoom and device scale.* A vector is drawn at the painted size in device pixels, so a
+zoom or device-scale change asks again at the new size and is drawn again sharp, through
+the same request path as a raster's re-decode. It is never a scaled bitmap.
+
+*Licence decision.* resvg and usvg are Apache-2.0 OR MIT since 0.36; they were MPL-2.0
+before, which this project avoids, as it avoided `cssparser`. roxmltree is MIT OR
+Apache-2.0, and tiny-skia BSD-3. Every crate in their tree is permissive. Default
+features are off: no system fonts, no svgz decompressor, no embedded raster decoders,
+no text.
+
+*Tested.*
+- Each attack is a positive control that must be refused by name, quickly (`tests/svg.rs`):
+  - a `<use>` bomb of 10¹⁰ nodes in a few hundred bytes;
+  - a `use` cycle;
+  - a billion-laughs DTD;
+  - script, `foreignObject` and an external `<image>`, `use`, `url()` or `@import`;
+  - an event handler, a filter, animation, deep nesting, and too many elements or
+    segments;
+  - each over-limit pixel case.
+- A mutation fuzzer ran 100,000 mutants plus all 457 corpus SVG blobs. It reached every
+  outcome class, with no panic, no case over 5 s, and every drawn output exactly the
+  painted size.
+
+*Measured.*
+
+| | before | after |
+|---|---|---|
+| distinct SVG blobs drawn, both corpora and the 85-recording corpus | 0 of 279 | **252 (90.3%)** |
+| refused: text (v1) | — | 25 |
+| refused: an embedded `<image>` (a data URL) | — | 2 |
+| raster outputs changed, all 3,429 blobs (pixels by digest, `examples/decode_digest`) | — | **0** |
+
+Pages without SVG are untouched: the change is in the worker's decode of SVG bytes, and
+recordings and scenes are unchanged.
+
+**Inline `<svg>`, not yet drawn.** There are 4,462 inline SVGs on 67 of the 122 pages,
+mostly icons. 1,101 use `currentColor`, and 3,169 are styled by the page's CSS through
+classes. So an inline SVG cannot be drawn on its own: its paint comes from the page's
+cascade.
+
+The design is producer-side. The converter, which already runs the normalizer's cascade
+for layout geometry, resolves each inline SVG's paint properties (`fill`, `stroke`, their
+opacities and widths, `display`, `visibility`, and `currentColor` from the element's
+`color`) into presentation attributes. It then stores the subtree as a standalone,
+content-addressed SVG blob, and the document names it as an image. Inline SVG then takes
+exactly this profile, budget and zoom path. A vector path node in NSG would also keep it
+sharp, but it needs Fresco and broker support that does not exist. Inline SVG is the next
+step of this work.
+
+**Rating now: low.** What stays open:
+- inline SVG and SVG text;
+- the transient natural frame (DCT scaling or row streaming);
+- callers that ask for re-decode on zoom (the zoom work);
+- the third-party image residual above.
 
 ### 2.5 Composition and GPU — Fresco, Limen, the RDNA4 driver
 

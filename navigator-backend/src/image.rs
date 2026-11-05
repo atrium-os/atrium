@@ -89,11 +89,11 @@ impl Default for Ceilings {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Format { Png, Jpeg, Gif, Webp }
+pub enum Format { Png, Jpeg, Gif, Webp, Svg }
 
 impl Format {
     pub fn name(self) -> &'static str {
-        match self { Format::Png => "png", Format::Jpeg => "jpeg", Format::Gif => "gif", Format::Webp => "webp" }
+        match self { Format::Png => "png", Format::Jpeg => "jpeg", Format::Gif => "gif", Format::Webp => "webp", Format::Svg => "svg" }
     }
 }
 
@@ -138,6 +138,10 @@ pub enum DecodeError {
     /// The decoder refused the data after the header: truncated, corrupt, a
     /// feature it does not support, or its own memory limit.
     Corrupt { format: Format, why: String },
+    /// Outside the format's profile (the SVG profile, src/svg.rs), refused
+    /// by name before anything is rendered: `why` is what the measurement
+    /// counts.
+    Refused { format: Format, why: &'static str },
 }
 
 impl DecodeError {
@@ -153,6 +157,7 @@ impl DecodeError {
             DecodeError::OverBudget { .. } => "over-budget",
             DecodeError::FrameTooLarge { .. } => "frame-too-large",
             DecodeError::Corrupt { .. } => "corrupt",
+            DecodeError::Refused { .. } => "refused-by-profile",
         }
     }
 }
@@ -173,6 +178,7 @@ impl std::fmt::Display for DecodeError {
             DecodeError::FrameTooLarge { format, needed, limit } =>
                 write!(f, "{} image needs a {needed}-byte frame to decode, over {limit}", format.name()),
             DecodeError::Corrupt { format, why } => write!(f, "{} image did not decode: {why}", format.name()),
+            DecodeError::Refused { format, why } => write!(f, "{} image refused by its profile: {why}", format.name()),
         }
     }
 }
@@ -190,8 +196,10 @@ pub fn sniff(b: &[u8]) -> Result<Format, &'static str> {
     if b.starts_with(b"BM") { return Err("bmp") }
     if b.starts_with(&[0, 0, 1, 0]) { return Err("ico") }
     let head = String::from_utf8_lossy(&b[..b.len().min(1024)]).to_ascii_lowercase();
-    if head.contains("<svg") { return Err("svg") }
-    if head.contains("<html") || head.contains("<!doctype") { return Err("html") }
+    // An HTML page that happens to hold an inline <svg> is still HTML.
+    if head.contains("<html") || head.contains("<!doctype html") { return Err("html") }
+    if head.contains("<svg") { return Ok(Format::Svg) }
+    if head.contains("<!doctype") { return Err("html") }
     if b.is_empty() { return Err("empty") }
     Err("unknown")
 }
@@ -220,11 +228,21 @@ pub fn decode(address: &str, bytes: &[u8], c: Ceilings) -> Result<Pixels, Decode
 pub fn decode_unaddressed(bytes: &[u8], c: Ceilings) -> Result<Pixels, DecodeError> {
     if bytes.len() > MAX_ENCODED_IMAGE_BYTES { return Err(DecodeError::EncodedTooLarge { len: bytes.len() }) }
     let format = sniff(bytes).map_err(|kind| DecodeError::NotARaster { kind })?;
+    // ★ SVG is drawn AT the painted size (src/svg.rs), not decoded at a
+    // natural size and reduced: a vector stays sharp at any size, so a zoom
+    // or device-scale change asks again at the new size and is drawn again,
+    // never a scaled bitmap.
+    if format == Format::Svg {
+        let px = crate::svg::rasterize(bytes, c)?;
+        validate(px.width, px.height, px.rgba.len(), c).map_err(|why| DecodeError::Corrupt { format, why })?;
+        return Ok(px);
+    }
     let px = match format {
         Format::Png => png_decode(bytes, c),
         Format::Jpeg => jpeg_decode(bytes, c),
         Format::Gif => gif_decode(bytes, c),
         Format::Webp => webp_decode(bytes, c),
+        Format::Svg => unreachable!("drawn above"),
     }?;
     // ★ To the painted size, the natural frame dropped as soon as the
     // reduction exists. `admit` already checked the output's size.

@@ -35,6 +35,18 @@ zune-jpeg = { version = "0.5", default-features = false, features = ["std"] }
 zune-core = { version = "0.5", default-features = false, features = ["std"] }
 image-webp = "0.2.4"
 gif = { version = "0.14.2", default-features = false, features = ["std"] }
+# ★ SVG, rasterised in the worker like any image (src/svg.rs, threat model
+# §2.4). LICENCE DECISION (2026-11-06): resvg/usvg are Apache-2.0 OR MIT
+# since 0.36 (they were MPL-2.0 before, which this project avoided, as it
+# avoided cssparser); roxmltree is MIT OR Apache-2.0; tiny-skia BSD-3. All
+# default features OFF: no system fonts (a render must not depend on the
+# host), no svgz (no decompressor of hostile input), no embedded raster
+# decoders (an <image> is refused by the profile before usvg sees it), no
+# text (v1; see svg.rs). The strict profile is checked on roxmltree's tree
+# BEFORE usvg parses anything.
+resvg = { version = "0.49", default-features = false }
+usvg = { version = "0.49", default-features = false }
+roxmltree = { version = "0.21", default-features = false, features = ["std"] }
 # The broker's byte search of a recording (src/carried.rs): a 10 MB miss
 # took 25.6 ms with `windows().any()`, and the broker is single-threaded.
 memchr = "2"

@@ -1098,6 +1098,15 @@ the repo; two of them are synthetic, generated there.
   normalize peaks within 1% (coreutils 690 vs 697 MiB, HN 1,159 vs 1,166 MiB), with
   normalize 2.1–2.4× slower.
 
+**Order of work, approved by the user on 2026-11-06.** It follows SVG, page zoom (with the
+two table items) and the float and border-collapse layout items:
+1. computed-style sharing in the renderer and normalizer: output byte-identical, with
+   worker peak memory and time measured on this set before and after;
+2. a scroll harness that drives Fresco scrolling and reports frame time p50 and p99 at
+   60 and 120 Hz;
+3. bands and checkpoints, as above;
+4. only then, raise the profile ceilings, by measurement.
+
 Data: `~/src/navigator-corpus/bigdocs-2026-11-06/`. `convert.sh` produces `convert.txt`
 and `timing.tsv`; `worker.sh` produces `worker.tsv`; both tool builds are kept beside them.
 

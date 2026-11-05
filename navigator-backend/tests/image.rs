@@ -115,8 +115,8 @@ fn the_address_is_checked_by_the_decoder_itself() {
 #[test]
 fn what_is_not_a_raster_is_named_and_refused() {
     for (bytes, kind) in [
-        (&b"<svg xmlns='http://www.w3.org/2000/svg'/>"[..], "svg"),
-        (b"<!DOCTYPE html><html>", "html"),
+        // (SVG is a format now: tests/svg.rs.)
+        (&b"<!DOCTYPE html><html>"[..], "html"),
         (b"\0\0\0\x1cftypavif\0\0\0\0", "avif"),
         (b"BM\0\0", "bmp"),
         (b"", "empty"),

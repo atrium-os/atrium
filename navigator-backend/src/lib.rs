@@ -26,6 +26,7 @@ pub mod resample;
 pub mod reverse;
 pub mod session;
 pub mod store;
+pub mod svg;
 pub mod wire;
 pub use ingest::ingest;
 pub use limits::Limits;

@@ -158,6 +158,8 @@ fn lie_about_size(rng: &mut Rng, f: Format, b: &mut [u8]) {
                 b[21..25].copy_from_slice(&bits.to_le_bytes());
             }
         },
+        // SVG has its own fuzzer (tests/svg.rs); this one mutates rasters.
+        Format::Svg => {}
     }
 }
 
