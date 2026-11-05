@@ -365,6 +365,9 @@ impl Drop for GpuCtl { fn drop(&mut self) { unsafe { libc::close(self.fd) }; } }
 pub struct Vm<'a> { gpu: &'a Gpu, fd: RawFd }
 
 impl<'a> Vm<'a> {
+    /// The device this address space belongs to.
+    pub fn gpu(&self) -> &'a Gpu { self.gpu }
+
     /// Allocate a BO and bind it into this VM at an auto-assigned GPU-VA.
     /// Allocate a BO mapped read-only for the GPU in this VM (`VM_BIND2`,
     /// `BIND_READONLY`): a GPU store to it is a VM fault. The CPU still fills

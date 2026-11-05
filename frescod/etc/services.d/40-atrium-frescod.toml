@@ -14,8 +14,12 @@
 # host fs), per-jail devfs (only basics + gpu0/display0/hidraw*).
 #
 # REQUIRES (commission once per host):
-#   1. _frescod system uid (e.g. `pw useradd _frescod -u 50092 -d /nonexistent
-#      -s /usr/sbin/nologin`); 50092 is in jaild.policy's user-uid range.
+#   1. The _frescod (65010) and _fresco-render (65011) system users, the signed
+#      renderer bundle and the system policy's worker rule for it:
+#      scripts/fresco-renderer-bundle.sh does all three. 65010/65011 are in
+#      jaild.policy's allowed_system_uids. frescod starts one renderer jail per
+#      client through portcullisd (its socket is under the /atrium/sockets
+#      mount below) and refuses clients if portcullisd is not running.
 #   2. The atrium_gpu devfs ruleset (etc/atrium.devfs.rules, installed and
 #      loaded at boot by scripts/bootstrap-atrium.sh); id 21 in jaild.policy
 #      [devfs_rulesets].allowed_ids.
@@ -79,8 +83,8 @@ kind   = "rw_nullfs"
 # resolve to defaults (/atrium/sockets/fresco*, /usr/local/share/atrium/bundles).
 path = "/usr/local/bin/atrium-frescod"
 argv = ["atrium-frescod"]
-uid  = 50092   # _frescod
-gid  = 50092
+uid  = 65010   # _frescod
+gid  = 65010
 # The vulkan loader is dlopen'd at runtime (ash::Entry::load); the jail's
 # linker resolves LINKED libs from the mounted /usr/local/lib, but runtime
 # dlopen needs it on the search path (the host finds it via ld-hints we don't

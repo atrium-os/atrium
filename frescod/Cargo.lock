@@ -899,7 +899,6 @@ dependencies = [
  "aqueduct-gpu-host",
  "atrium-devevents",
  "atrium-gpu-rs",
- "atrium-rdna4",
  "atrium-spv-loader",
  "atrium-trace",
  "env_logger",

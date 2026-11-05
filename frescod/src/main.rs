@@ -9,8 +9,9 @@
 //!   fresco_vulkan::HeadlessRenderer (compute + indirect draw)
 //!   ↓ (read_pixels, BGRA8)
 //!   atrium_gpu::amd::Scanout (CPU staging BO -> CP DMA -> one of two VRAM BOs;
-//!   with FRESCOD_RENDERER=gpu the RDNA4 compute kernels write the VRAM BO
-//!   directly, see render_backend.rs)
+//!   the default compute renderer and FRESCOD_RENDERER=gpu replace the Vulkan
+//!   stage; gpu's kernels, compiled for the device's architecture, write the
+//!   VRAM BO directly, see render_backend.rs)
 //!   ↓ (the copy signals a syncobj)
 //!   atrium_gpu::amd::Display::commit (BO fd, in-fence = the copy, out-fence = flip done)
 //!
@@ -113,7 +114,7 @@ fn main() -> std::io::Result<()> {
      * uploaded into the VRAM scanout via scan.update (DMA copy). */
     let mut framebuffer = vec![0u8; bytes as usize];
 
-    /* ── Renderer (FRESCOD_RENDERER: vulkan | compute) ───────────── */
+    /* ── Renderer (FRESCOD_RENDERER: compute (default) | gpu | vulkan) ── */
     let mut renderer = Backend::from_env(mode.width, mode.height, Some(&vm), load_bundles)
         .map_err(io_other)?;
     eprintln!("frescod: renderer {}", renderer.name());

@@ -1,17 +1,19 @@
-//! The two renderers frescod can draw a frame with.
+//! The three renderers frescod can draw a frame with.
 //!
-//! - `vulkan` (default): `fresco_vulkan::HeadlessRenderer` through whatever
-//!   Vulkan ICD the loader finds (lavapipe in the VM today), with the op
-//!   bundles.
-//! - `compute` (`FRESCOD_RENDERER=compute`): `fresco_compute`'s two compute
+//! - `compute` (the default, `FRESCOD_RENDERER=compute`): `fresco_compute`'s compute
 //!   kernels run on Tier-2, Atrium's own SPIR-V-to-CPU compiler. No Vulkan,
 //!   no Mesa, no bundles. Kernels are compiled through `atrium-spv-compile`
 //!   (`ATRIUM_SPV_COMPILE`) into `FRESCO_COMPUTE_CACHE`; built with the
 //!   `cranelift` feature, frescod compiles them itself when the compiler
 //!   binary isn't there.
-//! - `gpu` (`FRESCOD_RENDERER=gpu`): the same two kernels compiled for RDNA4
-//!   by `atrium-rdna4` and submitted on `'A'`. The raster kernel writes the
-//!   VRAM scanout buffer directly: no read-back, no copy.
+//! - `gpu` (`FRESCOD_RENDERER=gpu`): the same kernels compiled for the GPU's
+//!   architecture (`fresco_compute::gpu`: RDNA4 today, picked from the
+//!   device or `FRESCOD_GPU_ARCH`) and submitted on `'A'`. The compose pass
+//!   writes the VRAM scanout buffer directly: no read-back, no copy.
+//! - `vulkan` (`FRESCOD_RENDERER=vulkan`): the old path,
+//!   `fresco_vulkan::HeadlessRenderer` through whatever Vulkan ICD the loader
+//!   finds (lavapipe in the VM), with the op bundles. It cannot show split
+//!   mode's renderer frames, so with it split mode is off.
 //!
 //! All take the same per-frame input (the node types and texture uploads
 //! frescod already assembles) and produce BGRA8 sRGB pixels; [`Backend::present`]
@@ -131,6 +133,22 @@ fn frame_of(scene: &SceneState, w: &WindowFrame, s: Surface) -> Arc<fresco_compu
     }
 }
 
+/// The GPU's architecture: `FRESCOD_GPU_ARCH` if set, else what the device
+/// reports about itself.
+fn gpu_arch(vm: &Vm<'_>) -> Result<Box<dyn fresco_compute::gpu::Arch>> {
+    use fresco_compute::gpu;
+    let name = match std::env::var("FRESCOD_GPU_ARCH") {
+        Ok(n) if !n.is_empty() => n,
+        _ => {
+            let vendor = vm.gpu().caps()?.vendor;
+            gpu::for_device(&vendor).ok_or_else(|| format!(
+                "no built-in GPU architecture matches device {vendor:?} (have: {}); set FRESCOD_GPU_ARCH",
+                gpu::names().join(", ")))?.to_string()
+        }
+    };
+    gpu::by_name(&name).map_err(|e| format!("{name}: {e}").into())
+}
+
 pub enum Backend<'a> {
     Vulkan(Box<HeadlessRenderer>),
     Compute(Box<Compute>),
@@ -138,8 +156,8 @@ pub enum Backend<'a> {
 }
 
 impl<'a> Backend<'a> {
-    /// Pick the renderer from `FRESCOD_RENDERER` (`vulkan`, `compute` or
-    /// `gpu`). `load_bundles` is called only for Vulkan; `gpu` needs `vm`.
+    /// Pick the renderer from `FRESCOD_RENDERER` (`compute`, the default,
+    /// `gpu` or `vulkan`). `load_bundles` is called only for Vulkan; `gpu` needs `vm`.
     pub fn from_env(
         width: u32,
         height: u32,
@@ -147,12 +165,15 @@ impl<'a> Backend<'a> {
         load_bundles: impl FnOnce(&mut HeadlessRenderer) -> Result<()>,
     ) -> Result<Self> {
         match std::env::var("FRESCOD_RENDERER").as_deref() {
-            Ok("compute") => Ok(Backend::Compute(Box::new(Compute::new(width, height)?))),
+            Ok("compute") | Err(_) => Ok(Backend::Compute(Box::new(Compute::new(width, height)
+                .map_err(|e| format!("compute renderer: {e} (FRESCOD_RENDERER=vulkan selects the old renderer)"))?))),
             Ok("gpu") => {
                 let vm = vm.ok_or("FRESCOD_RENDERER=gpu needs the GPU (not headless)")?;
-                Ok(Backend::Gpu(Box::new(GpuCompute::new(vm, width, height)?)))
+                let arch = gpu_arch(vm)?;
+                eprintln!("frescod: gpu renderer, architecture {}", arch.name());
+                Ok(Backend::Gpu(Box::new(GpuCompute::new(vm, arch, width, height)?)))
             }
-            Ok("vulkan") | Err(_) => {
+            Ok("vulkan") => {
                 let mut r = HeadlessRenderer::new(width, height)
                     .map_err(|e| format!("HeadlessRenderer::new: {e}"))?;
                 load_bundles(&mut r)?;
@@ -317,17 +338,14 @@ impl Compute {
     }
 }
 
-/// Bytes per CP DMA copy: well under GFX12 DMA_DATA's 26-bit byte count.
-const DMA_CHUNK: u64 = 1 << 20;
-/// PM4 DMA_DATA (CP copy, memory to memory) and RELEASE_MEM.
-const IT_DMA_DATA: u32 = 0x50;
-const IT_RELEASE_MEM: u32 = 0x49;
 /// The ring BO: the frame's packets, then the end-of-pipe fence word.
 const RING_BYTES: u64 = 64 * 1024;
 const FENCE_OFFSET: u64 = RING_BYTES - 256;
 
-/// The compute renderer on the GPU: the kernels compiled for RDNA4, every
-/// buffer in VRAM.
+/// The compute renderer on the GPU: the kernels compiled for the device's
+/// architecture ([`fresco_compute::gpu::Arch`]; RDNA4 is the one built
+/// today), every buffer in VRAM. Nothing here is specific to one GPU: the
+/// architecture supplies the code and encodes the command stream.
 ///
 /// Per frame, each window whose tiles changed is rastered into its own
 /// surface in one VRAM surface heap (only its dirty tiles), then
@@ -341,10 +359,7 @@ pub struct GpuCompute<'a> {
     width: u32,
     height: u32,
     vm: &'a Vm<'a>,
-    k: fresco_compute::rdna4::Rdna4,
-    kc: fresco_compute::rdna4::Compose,
-    /// Offset of compose's code in `code`.
-    compose_off: u64,
+    arch: Box<dyn fresco_compute::gpu::Arch>,
     scene: SceneState,
     /// The frame `prepare` packed, for `submit`.
     pending: Option<Pending>,
@@ -392,12 +407,8 @@ fn on_screen(l: &Layer, w: u32, h: u32) -> Option<[u32; 4]> {
 }
 
 impl<'a> GpuCompute<'a> {
-    pub fn new(vm: &'a Vm<'a>, width: u32, height: u32) -> Result<Self> {
-        let k = fresco_compute::rdna4::Rdna4::new().map_err(|e| format!("rdna4 compile: {e}"))?;
-        let kc = fresco_compute::rdna4::Compose::new().map_err(|e| format!("rdna4 compose compile: {e}"))?;
-        let (_, code_end) = k.code_layout();
-        let compose_off = code_end.next_multiple_of(atrium_rdna4::CODE_ALIGN);
-        let code_bytes = compose_off + kc.code().len() as u64;
+    pub fn new(vm: &'a Vm<'a>, arch: Box<dyn fresco_compute::gpu::Arch>, width: u32, height: u32) -> Result<Self> {
+        let code_bytes = arch.code().len() as u64;
         Ok(Self {
             width,
             height,
@@ -408,9 +419,7 @@ impl<'a> GpuCompute<'a> {
             data: None,
             heap: None,
             ring: vm.alloc(RING_BYTES, 0)?,
-            k,
-            kc,
-            compose_off,
+            arch,
             scene: SceneState::default(),
             pending: None,
             surfaces: Surfaces::default(),
@@ -504,13 +513,7 @@ impl<'a> GpuCompute<'a> {
         let mut stage: Vec<u8> = Vec::new();
         let mut code_copy = None;
         if !self.code_loaded {
-            let (raster_off, _) = self.k.code_layout();
-            let [bin, raster] = self.k.code();
-            let mut code = bin;
-            code.resize(raster_off as usize, 0);
-            code.extend(raster);
-            code.resize(self.compose_off as usize, 0);
-            code.extend(self.kc.code());
+            let code = self.arch.code();
             code_copy = Some(code.len() as u64);
             stage.extend(code);
         }
@@ -546,32 +549,20 @@ impl<'a> GpuCompute<'a> {
         }
         self.staging.write(0, &stage)?;
 
-        let mut ib = atrium_rdna4::Blob::compute();
+        let mut ib = self.arch.stream();
         let src0 = self.staging.gpu_va();
-        let copy = |ib: &mut atrium_rdna4::Blob, off: u64, dst: u64, len: u64| {
-            let mut done = 0;
-            while done < len {
-                let n = (len - done).min(DMA_CHUNK);
-                let (s, d) = (src0 + off + done, dst + done);
-                // CP_SYNC (bit 31): later packets wait for the copy.
-                ib.packet(IT_DMA_DATA, &[1 << 31, s as u32, (s >> 32) as u32, d as u32, (d >> 32) as u32, n as u32]);
-                done += n;
-            }
-        };
         if let Some(len) = code_copy {
-            copy(&mut ib, 0, self.code.gpu_va(), len);
+            ib.copy(src0, self.code.gpu_va(), len);
         }
-        copy(&mut ib, data_start as u64, data_va, data_bytes);
+        ib.copy(src0 + data_start as u64, data_va, data_bytes);
 
-        let (raster_off, _) = self.k.code_layout();
         let code_va = self.code.gpu_va();
         for ((i, rects), offs) in draws.iter().zip(&window_offs) {
             let (id, f) = &p.frames[*i];
             let s = self.surfaces.map[id];
             let mut va: [u64; binding::COUNT] = std::array::from_fn(|b| data_va + offs[b]);
             va[binding::TARGET as usize] = heap_va + s[0] as u64 * 4;
-            let addrs = fresco_compute::rdna4::Addrs { code: [code_va, code_va + raster_off], buffers: va };
-            self.k.record_tiles(&mut ib, &addrs, f, rects).map_err(|e| format!("rdna4 record: {e}"))?;
+            ib.frame(code_va, &va, f, rects).map_err(|e| format!("{} record: {e}", self.arch.name()))?;
         }
         if compose_compose {
             let mut cva = [0u64; cb::COUNT];
@@ -581,22 +572,21 @@ impl<'a> GpuCompute<'a> {
             cva[cb::HEAP as usize] = heap_va;
             cva[cb::TARGET as usize] = target.gpu_va();
             let rects = screen_rects.as_deref().unwrap_or(&[]);
-            self.kc.record(&mut ib, code_va + self.compose_off, &cva, &compose, rects)
-                .map_err(|e| format!("rdna4 compose record: {e}"))?;
+            ib.compose(code_va, &cva, &compose, rects)
+                .map_err(|e| format!("{} compose record: {e}", self.arch.name()))?;
         }
         log::debug!("gpu: {} of {} windows redrawn, compose {:?}", draws.len(), p.frames.len(),
             screen_rects.as_ref().map(|r| r.len()));
         self.composed.insert(target.gpu_va(), (ids, p.layers, versions));
-        // End of pipe: write the fence, then interrupt (signals `signal`).
-        let fence = self.ring.gpu_va() + FENCE_OFFSET;
-        ib.packet(IT_RELEASE_MEM, &[5 << 8, (2 << 29) | (2 << 24), fence as u32, (fence >> 32) as u32, 1, 0]);
+        // End of pipe: the fence, then the interrupt that signals `signal`.
+        ib.end(self.ring.gpu_va() + FENCE_OFFSET);
         let bytes = ib.bytes();
         if bytes.len() as u64 > FENCE_OFFSET {
             return Err(format!("frame IB of {} bytes does not fit the ring", bytes.len()).into());
         }
         self.ring.write(0, &bytes)?;
         self.code_loaded = true;
-        self.vm.submit_deadline(&self.ring, ib.dw.len() as u32, ENGINE_GFX, Some(signal), deadline_ns)?;
+        self.vm.submit_deadline(&self.ring, ib.len_units(), ENGINE_GFX, Some(signal), deadline_ns)?;
         Ok(())
     }
 }

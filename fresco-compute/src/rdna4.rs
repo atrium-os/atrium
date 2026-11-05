@@ -142,3 +142,95 @@ impl Compose {
         Ok(())
     }
 }
+
+/// RDNA4 as a [`crate::gpu::Arch`]: the three kernels, and PM4 for the
+/// copies and the end-of-frame fence.
+pub struct Rdna4Arch {
+    k: Rdna4,
+    c: Compose,
+    offsets: [u64; 3],
+}
+
+impl Rdna4Arch {
+    pub fn new() -> Result<Self, Error> {
+        let (k, c) = (Rdna4::new()?, Compose::new()?);
+        let (raster_off, end) = k.code_layout();
+        let offsets = [0, raster_off, end.next_multiple_of(CODE_ALIGN)];
+        Ok(Rdna4Arch { k, c, offsets })
+    }
+}
+
+/// Bytes per CP DMA copy: well under GFX12 DMA_DATA's 26-bit byte count.
+const DMA_CHUNK: u64 = 1 << 20;
+/// PM4 DMA_DATA (CP copy, memory to memory) and RELEASE_MEM.
+const IT_DMA_DATA: u32 = 0x50;
+const IT_RELEASE_MEM: u32 = 0x49;
+
+impl crate::gpu::Arch for Rdna4Arch {
+    fn name(&self) -> &'static str {
+        "rdna4"
+    }
+
+    fn code(&self) -> Vec<u8> {
+        let [bin, raster] = self.k.code();
+        let mut code = bin;
+        code.resize(self.offsets[1] as usize, 0);
+        code.extend(raster);
+        code.resize(self.offsets[2] as usize, 0);
+        code.extend(self.c.code());
+        code
+    }
+
+    fn code_offsets(&self) -> [u64; 3] {
+        self.offsets
+    }
+
+    fn code_align(&self) -> u64 {
+        CODE_ALIGN
+    }
+
+    fn stream(&self) -> Box<dyn crate::gpu::Stream + '_> {
+        Box::new(Rdna4Stream { arch: self, ib: Blob::compute() })
+    }
+}
+
+struct Rdna4Stream<'a> {
+    arch: &'a Rdna4Arch,
+    ib: Blob,
+}
+
+impl crate::gpu::Stream for Rdna4Stream<'_> {
+    fn copy(&mut self, src: u64, dst: u64, len: u64) {
+        let mut done = 0;
+        while done < len {
+            let n = (len - done).min(DMA_CHUNK);
+            let (s, d) = (src + done, dst + done);
+            // CP_SYNC (bit 31): later packets wait for the copy.
+            self.ib.packet(IT_DMA_DATA, &[1 << 31, s as u32, (s >> 32) as u32, d as u32, (d >> 32) as u32, n as u32]);
+            done += n;
+        }
+    }
+
+    fn frame(&mut self, code: u64, buffers: &[u64; binding::COUNT], f: &Frame, rects: &[[u32; 4]]) -> Result<(), crate::gpu::Error> {
+        let o = self.arch.offsets;
+        let a = Addrs { code: [code + o[0], code + o[1]], buffers: *buffers };
+        Ok(self.arch.k.record_tiles(&mut self.ib, &a, f, rects)?)
+    }
+
+    fn compose(&mut self, code: u64, buffers: &[u64; crate::compose::binding::COUNT], c: &crate::compose::Compose, rects: &[[u32; 4]]) -> Result<(), crate::gpu::Error> {
+        Ok(self.arch.c.record(&mut self.ib, code + self.arch.offsets[2], buffers, c, rects)?)
+    }
+
+    fn end(&mut self, fence: u64) {
+        // End of pipe: write the fence, then interrupt.
+        self.ib.packet(IT_RELEASE_MEM, &[5 << 8, (2 << 29) | (2 << 24), fence as u32, (fence >> 32) as u32, 1, 0]);
+    }
+
+    fn bytes(&self) -> Vec<u8> {
+        self.ib.bytes()
+    }
+
+    fn len_units(&self) -> u32 {
+        self.ib.dw.len() as u32
+    }
+}

@@ -50,14 +50,17 @@ path = "src/bin/fresco_renderer.rs"
 # Compile the compute renderer's kernels in-process (Cranelift) when
 # atrium-spv-compile is not installed.
 cranelift = ["fresco-compute/cranelift"]
+# GPU architectures the `gpu` renderer is built for (fresco_compute::gpu).
+# Another one (rdna3, xe2, ...) is another feature here.
+default = ["cranelift", "rdna4"]
+rdna4 = ["fresco-compute/rdna4"]
 
 [dependencies]
 atrium-gpu-rs       = { path = "../atrium-gpu-rs" }
 atrium-devevents    = { path = "../atrium-devevents" }
 fresco-scene-server = { path = "../fresco-scene-server" }
 fresco-vulkan       = { path = "../fresco-vulkan" }
-fresco-compute      = { path = "../fresco-compute", features = ["rdna4"] }
-atrium-rdna4        = { path = "../atrium-rdna4" }
+fresco-compute      = { path = "../fresco-compute" }
 atrium-spv-loader   = { path = "../atrium-spv-loader" }
 fresco-protocol     = { path = "../fresco-protocol" }
 aqueduct            = { path = "../aqueduct" }

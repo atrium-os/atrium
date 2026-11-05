@@ -45,7 +45,7 @@ Starting renderers (2026-11-05):
 - frescod runs as `_frescod`, not root. For each connection it asks portcullisd itself (`ExecInstance` over the portcullisd socket, as `portcullis exec --daemon` does, so frescod's jail needs no CLI) for a one-shot jail of `org.atrium.fresco.renderer` (`FRESCOD_RENDERER_APP`), instance `fresco<handle>`, with `require_memory_limit`.
 - The system policy's worker rule (portcullis.md §6.5.2g) runs it as `_fresco-render` with the bundle's 512 MiB / 100 % CPU caps. `scripts/fresco-renderer-bundle.sh` builds the signed bundle and sets up the users and the rule.
 - It fails closed: if portcullisd is not there or refuses, the client is refused and logged; frescod never falls back to an unconfined renderer.
-- Split mode is on unless `FRESCOD_SPLIT=0`, when the renderer can show renderer frames (`compute`, `gpu`). With Vulkan, still the default renderer, it stays off and frescod warns; making `compute` the default renderer is a follow-up.
+- Split mode is on unless `FRESCOD_SPLIT=0`, when the renderer can show renderer frames (`compute`, `gpu`). `compute` is the default renderer (2026-11-05); with `FRESCOD_RENDERER=vulkan` split mode stays off and frescod warns.
 - `FRESCOD_RENDERER_LAUNCHER=<command>` replaces portcullisd with a command (`{client}` is the client id; the fuzz harness uses it), and `FRESCOD_RENDERER_LAUNCHER=unconfined` runs `FRESCOD_RENDERER_BIN` directly, for development.
 
 Verified in the amd64 VM with `atrium-surfaces-demo`:
@@ -63,8 +63,8 @@ How it works:
 Known gaps:
 - Fonts: the bundle carries them (`scripts/fresco-renderer-bundle.sh`), at the path the renderer's text looks in.
 - A client drawing on window 0 draws only in its renderer's own window 0, which the broker does not show. Clients that want a desktop draw in a window of role Background, as forum-dock does.
-- The Vulkan backend does not take renderer frames, so with it (still the default renderer) split mode is off.
-- frescod has no services.d manifest yet: it should run jailed as `_frescod` with the portcullisd socket mounted (the `[services.frescod]` jaild stanza already names `_frescod`).
+- The Vulkan backend does not take renderer frames, so with it (no longer the default) split mode is off.
+- frescod's services.d manifest (`frescod/etc/services.d/40-atrium-frescod.toml`) now runs it as `_frescod` (65010); its `/atrium/sockets` mount carries the portcullisd socket. Not yet run end to end through atrium-portcullisd-bootstrap.
 
 Plan as written:
 

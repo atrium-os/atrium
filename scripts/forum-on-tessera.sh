@@ -97,7 +97,16 @@ else
 fi
 
 echo "=== frescod ==="
-daemon -f -o /tmp/fresco.log /usr/local/bin/frescod
+# Split mode (one jailed renderer per client) is frescod's default and needs
+# the renderer bundle and worker rule (scripts/fresco-renderer-bundle.sh).
+# This test is about Tessera, not the renderer: without the bundle it runs
+# frescod in the old single-process mode, and says so.
+if [ -d /var/lib/atrium/apps/org.atrium.fresco.renderer ]; then
+    daemon -f -o /tmp/fresco.log /usr/local/bin/frescod
+else
+    echo "  (no fresco renderer bundle: frescod with FRESCOD_SPLIT=0)"
+    daemon -f -o /tmp/fresco.log env FRESCOD_SPLIT=0 /usr/local/bin/frescod
+fi
 sleep 4
 if pgrep -q frescod; then ok "frescod running"; else
     bad "frescod did not start:"; tail -4 /tmp/fresco.log | sed 's/^/       /'

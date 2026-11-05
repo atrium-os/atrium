@@ -83,7 +83,8 @@ compute route chosen; security conditions F1–F6 in
 |---|---|---|
 | D1 display ABI v2 on gpusim (`include/atrium/display_abi_v2.h`, fenced commits, vblank pacing) | done | `4205742` |
 | D2/D3 `fresco-compute` bin + raster kernels, Tier-2 matches reference; `FRESCOD_RENDERER=compute` | done | `ce1d804`, golden `6ca05f0` |
-| GPU renderer: `FRESCOD_RENDERER=gpu` draws via RDNA4 kernels on gpusim | done | `7c1ec1b` |
+| GPU renderer: `FRESCOD_RENDERER=gpu` draws via RDNA4 kernels on gpusim; architecture behind `fresco_compute::gpu::Arch` (RDNA4 the one built in) | done | `7c1ec1b` |
+| `compute` is frescod's default renderer (Vulkan opt-in) | done | |
 | Damage tracking (only dirty tiles re-rastered; 15 s → 0.4 s/frame on gpusim) | done | `57035bc` |
 | F2 bounds hardening + differential fuzzer | done | `9323062` |
 | F4a per-window surfaces + compose kernel | done | `a20492f`, `797a3e5` |

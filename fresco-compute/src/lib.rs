@@ -27,6 +27,7 @@
 pub mod compose;
 pub mod damage;
 pub mod fuzz;
+pub mod gpu;
 #[cfg(feature = "rdna4")]
 pub mod rdna4;
 pub mod reference;

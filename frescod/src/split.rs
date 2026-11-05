@@ -100,9 +100,9 @@ const MAX_OPENED: usize = 64;
 
 impl Broker {
     /// Split mode is ON unless `FRESCOD_SPLIT=0`, when the renderer can
-    /// take renderer-drawn frames (`takes_frames`: compute and gpu; Vulkan
-    /// cannot, so with it split mode stays off unless `FRESCOD_SPLIT=1`
-    /// forces it, and frescod says so).
+    /// take renderer-drawn frames (`takes_frames`: compute, the default,
+    /// and gpu; Vulkan cannot, so with it split mode stays off unless
+    /// `FRESCOD_SPLIT=1` forces it, and frescod says so).
     ///
     /// How a renderer is started:
     /// - by default frescod asks portcullisd for a one-shot jail of

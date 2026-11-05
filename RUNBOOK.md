@@ -5229,8 +5229,10 @@ In the guest:
 
 | env | effect |
 |---|---|
-| `FRESCOD_RENDERER=compute` | CPU (Tier-2) compute renderer (`fresco-compute` bin + raster kernels) |
-| `FRESCOD_RENDERER=gpu` | same kernels compiled by atrium-rdna4, run on the GPU (gpusim or silicon); set `FRESCOD_FLIP_TIMEOUT_MS=900000` on gpusim |
+| `FRESCOD_RENDERER=compute` (default) | CPU (Tier-2) compute renderer (`fresco-compute` bin + raster + compose kernels; built with Cranelift by default) |
+| `FRESCOD_RENDERER=gpu` | same kernels compiled for the GPU's architecture (`fresco_compute::gpu::Arch`; `rdna4` built in, picked from the device's vendor string), run on gpusim or silicon; set `FRESCOD_FLIP_TIMEOUT_MS=900000` on gpusim |
+| `FRESCOD_GPU_ARCH=rdna4` | override the gpu renderer's architecture |
+| `FRESCOD_RENDERER=vulkan` | the old Vulkan/lavapipe renderer; split mode stays off with it |
 | `FRESCOD_HEADLESS_PNG=/tmp/x` | headless, writes PNGs; test here first |
 | (default) | F4b split mode with `compute`/`gpu`: one jailed renderer per client, started by portcullisd (needs the bundle and worker rule from `scripts/fresco-renderer-bundle.sh`; refuses clients if portcullisd is down) |
 | `FRESCOD_SPLIT=0` / `=1` | force split mode off / on (on is the default unless the renderer is Vulkan) |
