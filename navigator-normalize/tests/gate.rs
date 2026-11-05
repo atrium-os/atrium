@@ -1353,8 +1353,9 @@ fn self_alignment_keywords_map_to_the_ones_they_name() {
 
 /// ★ An image's `normal` self-alignment is `start` in a grid (Grid §6.2: a
 /// replaced box with a ratio or a natural size is not stretched) — and so is
-/// a non-replaced `aspect-ratio` box's in the block axis once its width is
-/// settled (Sizing 4: the block axis is the ratio-dependent one) — and that is
+/// a non-replaced `aspect-ratio` box's in whichever axis the ratio derives:
+/// the block axis unless its height is settled, the inline axis when it is
+/// (Sizing 4; every case below measured in headless Chrome) — and that is
 /// also what a page that says NOTHING gets — `auto` takes the container's
 /// `normal`. The profile's initial is `stretch`, so it is written out, in
 /// every media context where the container is a grid, and taken back
@@ -1368,7 +1369,10 @@ fn an_image_in_a_grid_keeps_its_size_as_in_css() {
       #c { align-items: center } #n { justify-self: normal; align-self: normal }
     </style></head><body>
       <div class="g"><img id="a" src="cat.png"><p id="p">text</p><img id="n" src="cat.png"><p id="r" style="aspect-ratio: 2">r</p>
-        <p id="w" style="aspect-ratio: 2; width: 100px">w</p><p id="j" style="aspect-ratio: 2; justify-self: stretch">j</p></div>
+        <p id="w" style="aspect-ratio: 2; width: 100px">w</p><p id="j" style="aspect-ratio: 2; justify-self: stretch">j</p>
+        <p id="h" style="aspect-ratio: 2; height: 50px">h</p><p id="s" style="aspect-ratio: 2; align-self: stretch">s</p>
+        <p id="k" style="aspect-ratio: 2; justify-self: center">k</p><p id="q" style="aspect-ratio: 2; height: 50%">q</p></div>
+      <div style="display: grid; grid-template: 100px / 200px"><p id="t" style="aspect-ratio: 2; height: 50%">t</p></div>
       <div class="f"><img id="b" src="cat.png"></div>
       <div id="m"><img id="d" src="cat.png"></div>
       <div class="g" id="c"><img id="e" src="cat.png"></div>
@@ -1380,9 +1384,17 @@ fn an_image_in_a_grid_keeps_its_size_as_in_css() {
     assert_eq!([p("a", "justify-self"), p("a", "align-self")], ["start", "start"], "{out}");
     assert_eq!([p("n", "justify-self"), p("n", "align-self")], ["start", "start"], "explicit normal, same answer");
     assert_eq!([p("p", "justify-self"), p("p", "align-self")], ["", ""], "a box with no ratio stretches already");
-    assert_eq!([p("r", "justify-self"), p("r", "align-self")], ["", ""], "a NON-replaced aspect-ratio box with an auto width stretches");
-    assert_eq!(p("w", "align-self"), "start", "…but with its width settled, its height comes from the ratio");
-    assert_eq!([p("j", "justify-self"), p("j", "align-self")], ["stretch", "start"], "an explicit stretch settles it too");
+    // A 1/1 box in a 200px column and a 100px row is 200×200 in Chrome,
+    // overflowing the row: the WIDTH stretches and the ratio gives the
+    // height. (Round 17 left this `stretch`: 200×100.)
+    assert_eq!([p("r", "justify-self"), p("r", "align-self")], ["", "start"], "a NON-replaced aspect-ratio box stretches its width, its height from the ratio");
+    assert_eq!(p("w", "align-self"), "start", "…as it does with its width specified");
+    assert_eq!([p("j", "justify-self"), p("j", "align-self")], ["stretch", "start"], "…or explicitly stretched");
+    assert_eq!([p("h", "justify-self"), p("h", "align-self")], ["start", ""], "a SETTLED height makes the width the ratio's (Chrome 100×50, not 200×50)");
+    assert_eq!([p("s", "justify-self"), p("s", "align-self")], ["start", "stretch"], "an explicit block stretch settles the height");
+    assert_eq!([p("k", "justify-self"), p("k", "align-self")], ["center", ""], "a non-stretch justify leaves the width unsettled: the block axis stretches");
+    assert_eq!([p("q", "justify-self"), p("q", "align-self")], ["", "start"], "a % height in an AUTO row is `auto`: nothing settled");
+    assert_eq!(p("t", "justify-self"), "start", "…but in a 100px row it resolves, and settles the height");
     assert_eq!([p("b", "justify-self"), p("b", "align-self")], ["", ""], "a flex item's normal is stretch");
     assert_eq!([p("e", "justify-self"), p("e", "align-self")], ["start".to_string(), String::new()], "the container's center stands");
     assert_eq!(p("d", "align-self"), "start", "grid in the base context");

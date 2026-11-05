@@ -2233,8 +2233,8 @@ type Slots = BTreeMap<(Handle, String, String), BTreeMap<String, (Priority, Stri
 ///   natural size in the axis, and otherwise as `start` (Grid §6.2), or
 ///   `stretch` for any flex item (Flexbox §8.3). An `<img>` takes the
 ///   `start` reading; a NON-replaced box with an `aspect-ratio` takes it in
-///   the block axis only, and only once its width is settled (see
-///   `decide`).
+///   whichever axis the ratio derives — the inline axis when its height is
+///   settled, the block axis when its width is (see `decide`).
 ///
 /// That last rule is also CSS's INITIAL behaviour — `auto` takes the
 /// container's `normal` — while the profile's initial is `stretch`. So an
@@ -2339,22 +2339,65 @@ fn alignment_pass(resolved: &mut Slots, dom: &Dom, els: &[Handle], rtl: &BTreeMa
                 if !eff_normal { return None }
                 let is_normal = own.as_deref() == Some("normal");
                 let display = parent.and_then(|p| get(r, p, ctx, "display"));
-                // ★ A NON-replaced box with an `aspect-ratio` whose WIDTH is
-                // settled — specified, or stretched by an explicit `stretch`
-                // — takes its height from the ratio: its block axis is the
-                // ratio-dependent one, and `normal` does not stretch it
-                // (Sizing 4 §5.1; WPT grid-aspect-ratio-007, -030; Chrome
-                // agrees). With an auto, unstretched width Chrome stretches
-                // the block axis instead, so it stays `stretch`.
-                if !inline && display.as_deref() == Some("grid") && dom.tag(h) != Some("img")
+                // ★★ A NON-replaced box with an `aspect-ratio` in a grid:
+                // `normal` stretches ONE axis and the ratio gives the other
+                // (Sizing 4 §5.1, Grid §6.2). Which one, measured in Chrome
+                // (2026-11-05; WPT grid-aspect-ratio-007, -010, -028, -030,
+                // -038):
+                // - the HEIGHT is settled — specified, or an explicit
+                //   `stretch` — so the width is the ratio-dependent axis and
+                //   `justify-self: normal` is `start` (height 100px in a
+                //   200px column: 100×100, not 200×100);
+                // - otherwise the WIDTH is: specified, explicitly stretched,
+                //   or stretched by its own `normal` — so `align-self:
+                //   normal` is `start` (a 1/1 box in a 200px column and a
+                //   100px row: 200×200, overflowing the row — round 17 left
+                //   this one `stretch`, 200×100);
+                // - an explicit non-stretch `justify-self` (center, start…)
+                //   leaves the width unsettled, and then Chrome stretches the
+                //   block axis instead (100px row: 100×100, centred), which
+                //   is the profile's `stretch` — nothing to write.
+                if display.as_deref() == Some("grid") && dom.tag(h) != Some("img")
                     && get(r, h, ctx, "aspect-ratio").is_some_and(|v| !matches!(v.as_str(), "auto" | "initial")) {
-                    let w_settled = get(r, h, ctx, "width").is_some_and(|v| !matches!(v.as_str(), "auto" | "initial" | "min-content" | "max-content" | "fit-content"));
-                    let j_stretch = match get(r, h, ctx, "justify-self").as_deref() {
-                        Some("stretch") => true,
-                        None | Some("auto" | "initial") => parent.and_then(|p| get(r, p, ctx, "justify-items")).as_deref() == Some("stretch"),
-                        _ => false,
+                    let sized = |p: &str| get(r, h, ctx, p).is_some_and(|v| !matches!(v.as_str(), "auto" | "initial" | "min-content" | "max-content" | "fit-content"));
+                    // What an axis's own alignment says once `auto` takes
+                    // the container's `-items` (None: nothing said, so
+                    // `normal`).
+                    let says = |own: &str, items: &str| -> Option<String> {
+                        match get(r, h, ctx, own) {
+                            Some(v) if !matches!(v.as_str(), "auto" | "initial") => Some(v),
+                            _ => parent.and_then(|p| get(r, p, ctx, items)).filter(|v| !matches!(v.as_str(), "initial")),
+                        }
                     };
-                    if w_settled || j_stretch { return Some("start") }
+                    let a_says = says("align-self", "align-items");
+                    let j_says = says("justify-self", "justify-items");
+                    // ★ A PERCENTAGE height settles nothing unless the row it
+                    // resolves against is definite: in an auto row Chrome
+                    // treats it as `auto` and stretches the width instead
+                    // (`height: 100%` in a 100px column: 100×100, not 0×0;
+                    // in a 100px row, `height: 50%` gives 50×50). Definite
+                    // here means every row the item can land in is a fixed
+                    // length — explicit px rows, with px implicit rows or no
+                    // more children than explicit cells.
+                    let rows_definite = || -> bool {
+                        let Some(p) = parent else { return false };
+                        let px_tracks = |v: &str| -> Option<usize> {
+                            let t: Vec<&str> = v.split_whitespace().collect();
+                            (!t.is_empty() && t.iter().all(|x| x.strip_suffix("px").is_some_and(|n| n.parse::<f64>().is_ok()))).then_some(t.len())
+                        };
+                        let Some(rows) = get(r, p, ctx, "grid-template-rows").as_deref().and_then(px_tracks) else { return false };
+                        if get(r, p, ctx, "grid-auto-rows").as_deref().and_then(px_tracks).is_some() { return true }
+                        let cols = get(r, p, ctx, "grid-template-columns").map(|v| v.split_whitespace().count().max(1)).unwrap_or(1);
+                        dom.element_children(p).len() <= rows * cols
+                    };
+                    let h_set = sized("height") && (!get(r, h, ctx, "height").is_some_and(|v| v.contains('%')) || rows_definite());
+                    let h_settled = h_set || a_says.as_deref() == Some("stretch");
+                    if inline {
+                        if !sized("width") && h_settled { return Some("start") }
+                    } else {
+                        let j_stretches = match j_says.as_deref() { None | Some("normal" | "stretch") => true, _ => false };
+                        if !h_set && (sized("width") || j_stretches) { return Some("start") }
+                    }
                 }
                 if !ratio_box(r, h, ctx, inline) { return is_normal.then_some("stretch") }
                 // Only a grid's items need it written: a flex item's
