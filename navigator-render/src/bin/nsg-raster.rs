@@ -1,5 +1,5 @@
 //! nsg-raster <file.html|file.md> <out.png> [width_px]
-//!            [--recording <file.json>] [--blobs <dir>]
+//!            [--recording <file.json>] [--blobs <dir>] [--max-height <px>]
 //!
 //! With a recording and a blob directory, an image PAINTS: the recording
 //! says which address a `src` has, and the directory holds the bytes under
@@ -44,6 +44,11 @@ fn main() {
         for (k, n) in &o.unimplemented { eprintln!("unimplemented ×{n}: {k}") }
         o.scene
     };
+    // `--max-height`: paint only the top of a long page (a review crop).
+    let mut scene = scene;
+    if let Some(mh) = a.iter().position(|x| x == "--max-height").and_then(|i| a.get(i + 1)).and_then(|v| v.parse::<i64>().ok()) {
+        scene.height = scene.height.min(mh * 64);
+    }
     let cv = paint(&scene, &fonts, &assets);
     let file = std::fs::File::create(&a[2]).expect("writable output");
     let mut enc = png::Encoder::new(std::io::BufWriter::new(file), cv.w as u32, cv.h as u32);

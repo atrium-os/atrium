@@ -305,8 +305,9 @@ fn a_masked_box_paints_neither_fill_nor_image() {
 }
 
 /// ★ A ROW of same-direction floats is a horizontal strip and becomes one;
-/// a float with unfloated company is not, and keeps being dropped. Without
-/// the first half GitHub's Watch/Fork/Star buttons stacked one per line.
+/// a float with unfloated company is not — it is compiled to a flex row with
+/// the content beside it (tests/floats.rs). Without the first half GitHub's
+/// Watch/Fork/Star buttons stacked one per line.
 #[test]
 fn a_float_row_becomes_a_strip_but_a_lone_float_does_not() {
     let row = r#"<html><head><style>
@@ -323,7 +324,7 @@ fn a_float_row_becomes_a_strip_but_a_lone_float_does_not() {
     </style></head><body><div><span class="fig">img</span><p>text</p></div></body></html>"#;
     let (out, report) = normalize(lone, &Inputs::default());
     assert!(!out.contains("display: inline-block"), "a lone float is not promoted: {out}");
-    assert!(report.dropped.keys().any(|k| k.contains("not a row")), "{:?}", report.dropped);
+    assert!(report.dropped.keys().any(|k| k.contains("float beside content compiled")), "{:?}", report.dropped);
     assert!(refusals(&out).is_empty());
 }
 

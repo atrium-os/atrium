@@ -1147,10 +1147,56 @@ indents), the `dir` attribute, named grid lines/areas, media-query range syntax,
 container contexts compiled in the two corpora; 38 + 47 that reverse only in some media or
 state and 6 + 6 that wrap are laid out on the same axis unreversed, and counted),
 float ROWS (as inline-block, with the white space between the floats — which renders
-nothing — removed), Box Alignment's self-alignment keywords (§3.5, from 2026-11-04: `flex-*`,
+nothing — removed), floats BESIDE CONTENT (from 2026-11-06, below), Box Alignment's self-alignment keywords (§3.5, from 2026-11-04: `flex-*`,
 `self-*`, `left` / `right`, `normal`, and an image's initial `normal` in a grid), and — from 2026-09-24 — `box-sizing` (§3.3; 1,725 sizes in
 28 documents). The renderer stays small; the normalizer carries the cascade.
 `unset` (646 drops) and font-size keywords belong here and are **not yet compiled**.
+
+**Floats beside content, compiled (2026-11-06).** A float with content after it, up to
+the next float or the next element that clears, becomes a flex row: the float, plus a flow
+column (`flex: 1 1 0; min-width: 0`) holding that content.
+- *Visual order is reading order.* The row's children are in the order they are seen,
+  start side first. So a right float in a left-to-right parent comes after the text beside
+  it in the document, as a reversed row is reversed in the document (§3.4).
+- *What goes beside is decided by layout, at the reference width.*
+  - After the tables are measured (§3.13), `fit_floats` lays the document out. A block
+    in the column that starts at or below the float's bottom goes back out, after the
+    row, at the full width.
+  - A block that starts beside the float stays whole, so a column can run a little past
+    the float.
+  - Outermost rows are cut first, then the rows nested inside them are measured again,
+    with at most four layouts.
+  - A float that leaves the column under a quarter of the row has nothing beside it, and
+    its content goes below.
+- *The renderer stays float-free (G4).* What it lays out is a flex row and blocks.
+- *The cost of the reference width.* At another width (zoom, a narrow window) the text
+  beside a float may end a little above or below the float's bottom. The row is not
+  re-cut per width.
+
+Measured on both corpora (normalizer at 6a0a26b7 + this change):
+
+| | recordings (85) | readable (122) |
+|---|---|---|
+| documents with a compiled float | 18 | 40 |
+| floats compiled | 1,328 of 1,824 (73%) | 1,618 of 2,170 (75%) |
+| dropped as before: nothing before the next float or `clear` | 496 | 552 |
+| rows cut by layout / nodes moved below | 593 / 1,280 | 782 / 2,942 |
+| floats too wide for anything beside them | n/a | 40 |
+| layouts per document (p50 / max) | 1 / 2 | 1 / 3 |
+| added time (p50 / p90 / max) | 32 / 233 / 543 ms | 52 / 465 / 594 ms |
+
+The added time compares with normalize plus table pre-measure at p50 171 ms and 206 ms.
+- *Identity.* On the 421-document identity set, the 286 documents without a compiled
+  float are byte-identical, both their normalized documents and their NSG. Two full runs
+  gave identical digests.
+- *Wikipedia.* ru's article text now runs beside its infobox. ar, right to left, has its
+  infobox on the left with the text beside it.
+  - The ar render exposed a renderer bug, now fixed. A table that is a flex item was
+    given its `width` rather than its min-content (CSS 2.1 §17.5.2), and it covered 30 px
+    of the article.
+  - Not yet: a thumbnail whose width should come from its image, because its caption is
+    a `table-caption`, takes its caption's one-line width instead. It is then too wide
+    to have text beside it (part of the 40).
 
 ### C. None: cost — the backlog, by evidence
 
@@ -1158,7 +1204,7 @@ nothing — removed), Box Alignment's self-alignment keywords (§3.5, from 2026-
 |---|---|---|
 | generated content, `::before`/`::after` | 95,698 | separators (Wikipedia's "·"), breadcrumb arrows, quotes, icon glyphs; many are empty clearfixes — the subset with text or counters is what matters |
 | ~~margin collapsing~~ | **compiled** (2026-09-25): 140,430 margins rewritten over 85 documents | was: gaps up to twice the author's. Now the producer collapses each chain of adjoining margins into literal ones (below); the renderer still never collapses |
-| floats beside text (not rows) | 1,400 + 818 `clear` | Wikipedia's infobox and thumbnails come out full-width, the text below instead of beside |
+| ~~floats beside text (not rows)~~ | **compiled** (2026-11-06, §7a B): 1,328 + 1,618 floats in the two corpora | was: Wikipedia's infobox and thumbnails full-width, the text below. Left: floats followed directly by another float or a `clear` (496 + 552, dropped), and thumbnails sized by a `table-caption` |
 | masks | 2,577 | icons painted through a mask; today the box paints nothing |
 | `box-shadow` lists, spread, inset | 1,665 | shadows missing |
 | `overflow-wrap: anywhere` | 1,667 | long URLs overflow instead of breaking; near-free to admit |
@@ -1235,8 +1281,9 @@ specified width was not shared by empty columns) and a double-counted border in 
 intrinsic width of a definite-width block.
 
 **Order of work:** section E, then margin collapsing and floats (compiled by the producer
-where they can be, like box-sizing), then generated content with text and counters, then
-the cheap rows of C by count. Each admission is checked against the guarantees before it
+where they can be, like box-sizing; margin collapsing done 2026-09-25, floats beside
+content 2026-11-06), then `border-collapse` (next, approved by the user 2026-11-05), then
+generated content with text and counters, then the cheap rows of C by count. Each admission is checked against the guarantees before it
 lands.
 
 ## 8. Open questions

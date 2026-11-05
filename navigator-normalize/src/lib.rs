@@ -160,8 +160,17 @@ fn layer_rank(layer: Option<usize>, layers: usize, important: bool) -> usize {
 pub fn normalize_and_measure(html: &str, inputs: &Inputs, fonts: &navigator_render::fontset::FontSet,
                              env: &navigator_style::cascade::Env) -> (String, Report) {
     let (doc, mut report) = normalize(html, inputs);
+    // ★ Tables first: a float that is a table (an infobox) has no height
+    // until its columns are measured — fitted before them, ru Wikipedia's
+    // infobox was 2 px tall and every paragraph went below it. Column
+    // measures do not depend on the width a table is given, so moving
+    // content afterwards leaves them true.
     let (measured, n) = navigator_render::html::premeasure_tables(&doc, fonts, env);
     phases::lap("tables");
+    let (measured, fit) = fit_floats(&measured, fonts, env);
+    phases::lap("floats");
+    if fit.cut > fit.narrow { report.drop_n("content below a float moved out of its row (by layout)", fit.cut - fit.narrow) }
+    if fit.narrow > 0 { report.drop_n("float too wide for content beside it (content moved below)", fit.narrow) }
     if n > 0 { report.columns_measured = n }
     (measured, report)
 }
@@ -602,11 +611,12 @@ pub fn normalize(html: &str, inputs: &Inputs) -> (String, Report) {
         }
     }
     let mut rows = 0usize;
-    let mut lone = 0usize;
+
     let parents: Vec<Handle> = float_of.keys()
         .filter_map(|h| dom.get(*h).and_then(|n| n.parent))
         .collect::<std::collections::BTreeSet<_>>().into_iter().collect();
     let mut strip: Vec<Handle> = vec![];
+    let mut lone_floats: Vec<(Handle, String)> = vec![];
     let mut strip_parents: Vec<(Handle, Vec<Handle>)> = vec![];
     for p in parents {
         let kids = dom.element_children(p);
@@ -627,7 +637,9 @@ pub fn normalize(html: &str, inputs: &Inputs) -> (String, Report) {
         let all_left = dirs.len() >= 2 && dirs.iter().all(|d| *d == start);
         let has_text = dom.children_of(p).iter().any(|c|
             dom.get(*c).is_some_and(|n| matches!(n.kind, Kind::Text(ref t) if !t.trim().is_empty())));
-        if all_left && !has_text { rows += 1; strip_parents.push((p, inflow.clone())); strip.extend(inflow) } else { lone += dirs.iter().filter(|d| **d != "none").count() }
+        if all_left && !has_text { rows += 1; strip_parents.push((p, inflow.clone())); strip.extend(inflow) } else {
+            for (k, d) in inflow.iter().zip(&dirs) { if *d != "none" { lone_floats.push((*k, d.to_string())) } }
+        }
     }
     // ★ The WHITE SPACE between floats generates nothing (CSS 2.1 §9.5.1:
     // it collapses, and a line holding only collapsible space is not
@@ -666,8 +678,26 @@ pub fn normalize(html: &str, inputs: &Inputs) -> (String, Report) {
         }
     }
     if rows > 0 { report.drop_n("float row laid out as inline-block", rows) }
-    if lone > 0 { report.drop_n("property `float` (not a row; dropped)", lone) }
-    for (_, props) in resolved.iter_mut() { props.remove("float-marker"); }
+    // ★ FLOATS BESIDE CONTENT (profile §7a C, 2026-11-06). A float with
+    // content after it is compiled into what the profile admits — a flex
+    // ROW holding the float and a FLOW column with the content after it —
+    // so the renderer stays float-free (G4). Which content goes beside is
+    // decided twice: here, everything up to the next float or `clear`; then,
+    // once the layout is known, only what starts above the float's bottom
+    // (`normalize_and_measure`, `fit_floats`), the rest moved back below.
+    // ★ VISUAL ORDER IS READING ORDER: the row's children are in the order
+    // they are seen, start side first — a right float in a left-to-right
+    // parent comes AFTER the content beside it, as a reversed row is
+    // reversed in the document (§3.4).
+    let clear_of: BTreeMap<Handle, String> = resolved.iter()
+        .filter(|((_, st, me), _)| st.is_empty() && me.is_empty())
+        .filter_map(|((h, _, _), pr)| pr.get("clear-marker").map(|(_, v)| (*h, v.clone())))
+        .filter(|(_, v)| v != "none").collect();
+    let (beside, alone) = compile_floats(&mut dom, &mut resolved, &lone_floats, &float_of, &clear_of, &rtl);
+    let lone = alone;
+    if beside > 0 { report.drop_n("float beside content compiled to a flex row", beside) }
+    if lone > 0 { report.drop_n("property `float` (no content before the next float or clear; dropped)", lone) }
+    for (_, props) in resolved.iter_mut() { props.remove("float-marker"); props.remove("clear-marker"); }
 
     // ★ BOX-SIZING, compiled away. The profile's boxes are all border-box;
     // CSS's default is content-box, where `width` excludes padding and
@@ -1058,6 +1088,145 @@ fn uses_var(v: &[Token]) -> bool {
     v.iter().any(|t| matches!(&t.tok, Tok::Function(f) if f.eq_ignore_ascii_case("var")))
 }
 
+/// The attributes marking a compiled float's row and its flow column, for
+/// `fit_floats` (which removes them).
+pub const FLOAT_ROW: &str = "atrium-float";
+pub const FLOAT_FLOW: &str = "atrium-float-flow";
+
+/// ★ WHAT GOES BESIDE A FLOAT, decided by layout (see the float pass). A row
+/// first holds everything up to the next float or `clear`; laid out, the
+/// content that starts at or below the float's bottom is moved back out,
+/// after the row, where it takes the full width — as it would in a browser,
+/// where text below a float is no longer beside it. A block that STARTS
+/// beside the float stays beside it whole (a paragraph is not split), so the
+/// column may run a little past the float's bottom.
+///
+/// Outermost rows first: a row nested in another's column was measured at
+/// the column's width, and is measured again once it has its own place.
+/// At most `FIT_PASSES` layouts; the reference width is `env`'s.
+pub fn fit_floats(doc: &str, fonts: &navigator_render::fontset::FontSet, env: &navigator_style::cascade::Env) -> (String, FloatFit) {
+    let mut fit = FloatFit::default();
+    if !doc.contains(FLOAT_ROW) { return (doc.to_string(), fit) }
+    let mut dom = navigator_dom::parse(doc);
+    const MARK: &str = "atrium-fk";
+    for pass in 0..FIT_PASSES {
+        let rows: Vec<Handle> = (0..dom.nodes.len() as Handle).filter(|h| dom.connected(*h) && dom.attr(*h, FLOAT_ROW).is_some_and(|v| v != "done")).collect();
+        if rows.is_empty() { break }
+        let in_flow = |dom: &Dom, h: Handle| {
+            let mut cur = dom.get(h).and_then(|n| n.parent);
+            while let Some(c) = cur {
+                if dom.attr(c, FLOAT_FLOW).is_some() && dom.get(c).and_then(|n| n.parent).is_some_and(|r| dom.attr(r, FLOAT_ROW).is_some_and(|v| v != "done")) { return true }
+                cur = dom.get(c).and_then(|n| n.parent);
+            }
+            false
+        };
+        // The outermost undecided rows (all of them on the last pass).
+        let last = pass + 1 == FIT_PASSES;
+        let now: Vec<Handle> = rows.iter().copied().filter(|r| last || !in_flow(&dom, *r)).collect();
+        let geo = navigator_render::html::layout_geometry(&dom.serialize_marked(MARK), fonts, env, &navigator_render::Subresources::new(), MARK);
+        fit.layouts += 1;
+        for row in now {
+            dom.set_attr(row, FLOAT_ROW, "done");
+            let kids = dom.element_children(row);
+            let (Some(&flow), Some(&float)) = (kids.iter().find(|k| dom.attr(**k, FLOAT_FLOW).is_some()), kids.iter().find(|k| dom.attr(**k, FLOAT_FLOW).is_none())) else { continue };
+            let Some(fg) = geo.elements.get(&(float as u64)) else { continue };
+            let bottom = fg.y + fg.h;
+            let items = dom.children_of(flow);
+            // ★ A float that leaves the column too narrow has nothing beside
+            // it: in CSS, content that does not fit beside a float goes below
+            // it. Without this a 684 px figure left ru Wikipedia a 44 px
+            // column, one word per line.
+            let w = |h: Handle| geo.elements.get(&(h as u64)).map(|g| g.w).unwrap_or(0);
+            let narrow = w(flow) * MIN_BESIDE_DIV < w(row);
+            if narrow { fit.narrow += 1 }
+            let cut = if narrow { Some(0) } else {
+                items.iter().position(|c| geo.elements.get(&(*c as u64)).is_some_and(|g| !g.inline && g.y >= bottom))
+            };
+            fit.rows += 1;
+            let Some(cut) = cut else { continue };
+            let Some(parent) = dom.get(row).and_then(|n| n.parent) else { continue };
+            let next = dom.children_of(parent).into_iter().skip_while(|c| *c != row).nth(1);
+            for &c in &items[cut..] {
+                detach(&mut dom, c);
+                dom.insert_before(parent, c, next);
+            }
+            fit.moved += items[cut..].len();
+            fit.cut += 1;
+        }
+    }
+    for h in 0..dom.nodes.len() as Handle {
+        if dom.attr(h, FLOAT_ROW).is_some() { dom.remove_attr(h, FLOAT_ROW) }
+        if dom.attr(h, FLOAT_FLOW).is_some() { dom.remove_attr(h, FLOAT_FLOW) }
+    }
+    (dom.serialize(), fit)
+}
+
+/// At most this many layouts to fit a document's floats.
+pub const FIT_PASSES: usize = 4;
+
+/// A flow column narrower than 1/this of its row has nothing beside the float.
+pub const MIN_BESIDE_DIV: i64 = 4;
+
+/// What `fit_floats` did.
+#[derive(Debug, Default, Clone, PartialEq)]
+pub struct FloatFit {
+    /// Rows measured; rows cut (content moved back below the float); nodes moved.
+    pub rows: usize,
+    /// Rows whose float left too narrow a column (all their content moved below).
+    pub narrow: usize,
+    pub cut: usize,
+    pub moved: usize,
+    /// Layouts it took.
+    pub layouts: usize,
+}
+
+/// Compile each lone float with content after it into a flex row (see the
+/// float pass). Returns (compiled, left alone: nothing beside them).
+fn compile_floats(dom: &mut Dom, resolved: &mut collapse::Resolved, floats: &[(Handle, String)],
+                  float_of: &BTreeMap<Handle, String>, clear_of: &BTreeMap<Handle, String>,
+                  rtl: &BTreeMap<Handle, bool>) -> (usize, usize) {
+    let (mut beside, mut alone) = (0, 0);
+    let pri: Priority = (false, usize::MAX, (0, 1, 0), usize::MAX - 1);
+    let set = |resolved: &mut collapse::Resolved, h: Handle, props: &[(&str, &str)]| {
+        let slot = resolved.entry((h, String::new(), String::new())).or_default();
+        for (k, v) in props { slot.insert(k.to_string(), (pri, v.to_string())); }
+    };
+    for (f, dir) in floats {
+        let Some(p) = dom.get(*f).and_then(|n| n.parent) else { continue };
+        let kids = dom.children_of(p);
+        let Some(pos) = kids.iter().position(|c| c == f) else { continue };
+        // What follows, up to the next float or anything that clears.
+        let mut after: Vec<Handle> = vec![];
+        for &c in &kids[pos + 1..] {
+            if float_of.contains_key(&c) || clear_of.contains_key(&c) { break }
+            after.push(c);
+        }
+        let content = after.iter().any(|c| match dom.get(*c).map(|n| &n.kind) {
+            Some(Kind::Element(_)) => resolved.get(&(*c, String::new(), String::new()))
+                .and_then(|pr| pr.get("display")).map(|(_, v)| v != "none").unwrap_or(true),
+            Some(Kind::Text(t)) => !t.trim().is_empty(),
+            _ => false,
+        });
+        if !content { alone += 1; continue }
+        let row = dom.create(Kind::Element("div".into()));
+        let flow = dom.create(Kind::Element("div".into()));
+        dom.set_attr(row, FLOAT_ROW, &beside.to_string());
+        dom.set_attr(flow, FLOAT_FLOW, "");
+        dom.insert_before(p, row, Some(*f));
+        detach(dom, *f);
+        for &c in &after { detach(dom, c); dom.append(flow, c); }
+        let start = if rtl.get(&p).copied().unwrap_or(false) { "right" } else { "left" };
+        if dir == start { dom.append(row, *f); dom.append(row, flow); } else { dom.append(row, flow); dom.append(row, *f); }
+        set(resolved, row, &[("display", "flex"), ("flex-direction", "row"), ("align-items", "flex-start")]);
+        set(resolved, flow, &[("display", "block"), ("flex-grow", "1"), ("flex-shrink", "1"), ("flex-basis", "0px"), ("min-width", "0px")]);
+        // A float is as wide as its content up to the space there is (CSS
+        // 2.1 §10.3.5, shrink-to-fit): a flex item that does not grow.
+        set(resolved, *f, &[("flex-grow", "0"), ("flex-shrink", "1")]);
+        beside += 1;
+    }
+    (beside, alone)
+}
+
 fn detach_all(dom: &mut Dom, tag: &str) {
     for h in dom.by_tag_anywhere(tag) { detach(dom, h) }
 }
@@ -1368,6 +1537,10 @@ fn to_longhands_inner(name: &str, value: &[Token], inputs: &Inputs, report: &mut
     if name == "float" && matches!(text.as_str(), "left" | "right" | "none" | "inline-start" | "inline-end") {
         return vec![("float-marker".to_string(), text)];
     }
+    // `clear` ends what goes beside a float (see the float pass).
+    if name == "clear" && matches!(text.as_str(), "left" | "right" | "both" | "none" | "inline-start" | "inline-end") {
+        return vec![("clear-marker".to_string(), text)];
+    }
     // ★ The VISUALLY-HIDDEN idiom: a 1px box, `clip: rect(0 0 0 0)` and
     // `clip-path: inset(50%)`. The profile has no clipping, so both used to
     // be dropped and the 1px box drew its text anyway: Folha's "Salvar
@@ -1440,7 +1613,7 @@ fn to_longhands_inner(name: &str, value: &[Token], inputs: &Inputs, report: &mut
         // once the whole cascade is known. Without it every child lands in
         // the same cell: rustdoc's breadcrumb rendered on top of its search
         // box.
-        if p == "grid-template-areas" || p == "grid-area-name" || p == "float-marker" || p == "box-sizing-marker"
+        if p == "grid-template-areas" || p == "grid-area-name" || p == "float-marker" || p == "clear-marker" || p == "box-sizing-marker"
             || p == "clip-marker" || p == "clip-path-marker" || p.ends_with("-lines-marker") || p == "icon-font-marker" { return Some((p, v)) }
         // ★ An image the input has not measured cannot be painted (§3.13),
         // and the renderer says so. The normalizer must decide it HERE, the

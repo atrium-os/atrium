@@ -1871,6 +1871,16 @@ impl<'a> Cx<'a> {
                 }
                 _ => px(minp, main_avail.unwrap_or(0)).unwrap_or(0),
             };
+            // ★ A TABLE is never narrower than its min-content (CSS 2.1
+            // §17.5.2): `block` widens it to that whatever it is given, so a
+            // row that shared out less put it OVER its neighbour — ar
+            // Wikipedia's 327 px infobox was given 297 and covered the first
+            // 30 px of the article beside it.
+            let min = if row && kw(cs, "display") == "table" {
+                let b = |side: &str| if kw(cs, &format!("border-{side}-style")) == "none" { 0 } else { len(cs.get(&format!("border-{side}-width")), 0).unwrap_or(0) };
+                let frame = len(cs.get("padding-left"), w).unwrap_or(0) + len(cs.get("padding-right"), w).unwrap_or(0) + b("left") + b("right");
+                match self.table_content(c, cs, w, false) { Some(tm) => min.max(tm + frame), None => min }
+            } else { min };
             let max = px(maxp, main_avail.unwrap_or(0)).unwrap_or(U::MAX);
             let hypo = base.clamp(min, max.max(min));
             let num = |p: &str| match cs.get(p) { V::Num(n) => *n, _ => 0.0 };
@@ -5079,6 +5089,24 @@ mod tests {
         assert_eq!(crate::nsg::write(&render_html(&at100, &fonts, &Env::default()).scene, &fonts),
                    crate::nsg::write(&render_html(&premeasure_tables(src, &fonts, &Env::default()).0, &fonts, &Env::default()).scene, &fonts),
                    "and at 100% nothing is measured again");
+    }
+
+    #[test]
+    fn a_table_flex_item_is_never_narrower_than_its_min_content() {
+        // ★ ar Wikipedia's infobox: `width` below the table's min-content,
+        // beside a growing column. The row must give the table its
+        // min-content, not its `width`, or the table covers the column.
+        let src = r#"<style>body { margin-left: 0px; margin-top: 0px } .row { display: flex; width: 400px }
+            .t { width: 50px; border-spacing: 0px 0px } td { padding-left: 0px; padding-right: 0px; background-color: #ff0000 }
+            .c { flex-grow: 1; flex-shrink: 1; flex-basis: 0px; min-width: 0px; height: 10px; background-color: #0000ff }</style>
+            <div class="row"><table class="t"><tr><td>Supercalifragilistic</td></tr></table><div class="c"></div></div>"#;
+        let fonts = FontSet::load().unwrap();
+        let (fixed, _) = premeasure_tables(src, &fonts, &Env::default());
+        let o = render_html(&fixed, &fonts, &Env::default());
+        assert!(o.diagnostics.is_empty(), "{:?}", o.diagnostics);
+        let (t, c) = (boxes(&o, 0xff0000ff)[0], boxes(&o, 0x0000ffff)[0]);
+        assert!(t.2 > 50, "the table (its cell) is wider than its width (px): {t:?}");
+        assert!(c.0 >= t.0 + t.2, "the column starts where the table ends: table {t:?} column {c:?}");
     }
 
     #[test]
