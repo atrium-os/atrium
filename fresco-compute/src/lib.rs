@@ -265,7 +265,14 @@ impl Frame {
     /// Pack `scene` for a `width` x `height` target with `pitch` pixels per
     /// line.
     pub fn pack(scene: &Scene, width: u32, height: u32, pitch: u32) -> Frame {
+        Self::pack_report(scene, width, height, pitch).0
+    }
+
+    /// [`Frame::pack`], and the fills it did not draw: `(index into
+    /// scene.fills, fill::drop reason)`. A culled fill is not listed.
+    pub fn pack_report(scene: &Scene, width: u32, height: u32, pitch: u32) -> (Frame, Vec<(usize, u8)>) {
         assert!(pitch >= width);
+        let mut dropped = Vec::new();
         let mut ops = Vec::new();
         for r in &scene.rects {
             let [x, y] = r.position;
@@ -311,13 +318,34 @@ impl Frame {
         // Filled paths: each one's tiled block in `texels` (see `fill`).
         let mut fill_ops = Vec::new();
         let (mut lines_total, mut indices_total) = (0usize, 0usize);
-        for fl in &scene.fills {
-            let Some(lines) = fill::flatten(fl) else { continue };
-            if lines_total + lines.len() > fill::MAX_FRAME_SEGMENTS {
+        for (k, fl) in scene.fills.iter().enumerate() {
+            if fill::check(&fl.verbs, &fl.points, &fl.transform).is_err() {
+                dropped.push((k, fill::drop::MALFORMED));
                 continue;
             }
-            let Some(p) = fill::pack(&lines, fl.rule, fl.clip, width, height, texels.len() as u32) else { continue };
+            if fl.gradient.as_ref().is_some_and(|g| fill::check_gradient(g).is_err()) {
+                dropped.push((k, fill::drop::BAD_PAINT));
+                continue;
+            }
+            let Some(lines) = fill::flatten(fl) else {
+                dropped.push((k, fill::drop::TOO_MANY_LINES));
+                continue;
+            };
+            if lines_total + lines.len() > fill::MAX_FRAME_SEGMENTS {
+                dropped.push((k, fill::drop::FRAME_BUDGET));
+                continue;
+            }
+            let paint = fl.gradient.as_ref().map(|g| (g, &fl.transform));
+            let p = match fill::pack_paint(&lines, fl.rule, fl.clip, paint, width, height, texels.len() as u32) {
+                Ok(p) => p,
+                Err(fill::CULLED) => continue,
+                Err(why) => {
+                    dropped.push((k, why));
+                    continue;
+                }
+            };
             if indices_total + p.indices > fill::MAX_FRAME_INDICES {
+                dropped.push((k, fill::drop::FRAME_BUDGET));
                 continue;
             }
             lines_total += p.lines;
@@ -387,7 +415,7 @@ impl Frame {
         if ops.is_empty() {
             ops.push(Op::default()); // a binding may not be empty
         }
-        Frame { header, ops, tex, texels, lut: lut() }
+        (Frame { header, ops, tex, texels, lut: lut() }, dropped)
     }
 
     /// Check the header against the buffers, as the broker must before it

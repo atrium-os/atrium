@@ -65,7 +65,9 @@ bool inside(vec4 r, vec2 pc) {
 }
 
 // Filled paths (src/fill.rs has the normative rule and block layout).
-#define FILL_HEADER 8u
+#define FILL_HEADER 18u
+#define FILL_MAX_STOPS 16u
+#define FILL_STOP 5u
 #define FILL_ENTRY 18u
 #define FILL_MAX_GRID 1024u
 #define FILL_MAX_TILE_SEGS 4096u
@@ -164,7 +166,47 @@ vec4 fill_shade(vec4 c, vec4 color, uint b, vec2 pc) {
         }
     }
     float cov = clamp_(a, 0.0, 1.0);
-    return vec4(color.rgb, color.a * cov);
+    uint paint = texels[b + 8u];
+    if (paint == 0u) {
+        return vec4(color.rgb, color.a * cov);
+    }
+    uint sat = texels[b + 9u];
+    uint n = texels[b + 10u];
+    if (n == 0u || n > FILL_MAX_STOPS || sat > tw_ || n * FILL_STOP > tw_ - sat) {
+        return vec4(0.0);
+    }
+    float u = uintBitsToFloat(texels[b + 11u]) * pc.x + uintBitsToFloat(texels[b + 12u]) * pc.y + uintBitsToFloat(texels[b + 13u]);
+    float gt = u;
+    if (paint != 1u) {
+        float v = uintBitsToFloat(texels[b + 14u]) * pc.x + uintBitsToFloat(texels[b + 15u]) * pc.y + uintBitsToFloat(texels[b + 16u]);
+        gt = sqrt(u * u + v * v);
+    }
+    // gradient_at: pad, find the span, interpolate premultiplied sRGB.
+    float first = uintBitsToFloat(texels[sat]);
+    float last = uintBitsToFloat(texels[sat + (n - 1u) * FILL_STOP]);
+    gt = gt >= first ? (gt <= last ? gt : last) : first;
+    uint i = 0u;
+    while (i + 1u < n && uintBitsToFloat(texels[sat + (i + 1u) * FILL_STOP]) < gt) {
+        i = i + 1u;
+    }
+    uint j = i + 1u < n ? i + 1u : i;
+    uint w0 = sat + i * FILL_STOP;
+    uint w1 = sat + j * FILL_STOP;
+    float o0 = uintBitsToFloat(texels[w0]);
+    float o1 = uintBitsToFloat(texels[w1]);
+    vec4 c0 = vec4(uintBitsToFloat(texels[w0 + 1u]), uintBitsToFloat(texels[w0 + 2u]), uintBitsToFloat(texels[w0 + 3u]), uintBitsToFloat(texels[w0 + 4u]));
+    vec4 c1 = vec4(uintBitsToFloat(texels[w1 + 1u]), uintBitsToFloat(texels[w1 + 2u]), uintBitsToFloat(texels[w1 + 3u]), uintBitsToFloat(texels[w1 + 4u]));
+    float span = o1 - o0;
+    float f = span > 0.0 ? (gt - o0) / span : 1.0;
+    vec3 pa = vec3(c0.x * c0.w, c0.y * c0.w, c0.z * c0.w);
+    vec3 pb = vec3(c1.x * c1.w, c1.y * c1.w, c1.z * c1.w);
+    float ga = c0.w + f * (c1.w - c0.w);
+    vec3 p = vec3(pa.x + f * (pb.x - pa.x), pa.y + f * (pb.y - pa.y), pa.z + f * (pb.z - pa.z));
+    vec3 sc = ga > 0.0 ? vec3(p.x / ga, p.y / ga, p.z / ga) : vec3(0.0);
+    vec3 lin = vec3(lut[uint(clamp_(sc.x, 0.0, 1.0) * 255.0 + 0.5)],
+                    lut[uint(clamp_(sc.y, 0.0, 1.0) * 255.0 + 0.5)],
+                    lut[uint(clamp_(sc.z, 0.0, 1.0) * 255.0 + 0.5)]);
+    return vec4(lin, ga * color.a * cov);
 }
 
 vec4 shade(uint oi, vec2 pc) {

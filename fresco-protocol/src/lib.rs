@@ -163,6 +163,9 @@ pub mod control {
     /// every event; the WM is the consumer that cares.
     pub const EV_WINDOW_CREATED:         u16 = 0x0584;
     pub const EV_WINDOW_DESTROYED:       u16 = 0x0585;
+    /// Fills of the window frescod is not drawing because of a limit
+    /// (`WindowFillsDroppedEvent`), sent whenever that set changes.
+    pub const EV_WINDOW_FILLS_DROPPED:   u16 = 0x0587;
     /// The display's mode changed (a mode switch, or a monitor plugged in
     /// or swapped): payload `DisplayInfoResponse`. Every client gets it;
     /// anything laid out for the screen lays itself out again.
@@ -817,6 +820,37 @@ pub struct WindowDestroyedEvent {
     pub window_id: u32,
 }
 
+/// Why a fill is not drawn ([`FillDrop::reason`]).
+pub mod fill_drop {
+    /// It flattens to more than 65,536 lines.
+    pub const TOO_MANY_LINES: u8 = 1;
+    /// More than 4,096 of its lines fall in one 16x16 tile at the current
+    /// transform (a zoom can cause this).
+    pub const TILE_TOO_DENSE: u8 = 2;
+    /// The window's fills together pass 512K lines or 4M tile entries.
+    pub const FRAME_BUDGET: u8 = 3;
+    /// Its gradient is malformed.
+    pub const BAD_PAINT: u8 = 4;
+    /// Malformed geometry (a broker in front of frescod refuses these
+    /// before they arrive).
+    pub const MALFORMED: u8 = 5;
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FillDrop {
+    pub node_id: u32,
+    pub reason: u8,
+}
+
+/// `EV_WINDOW_FILLS_DROPPED` — every fill of the window that is not being
+/// drawn, and why. Sent when the set changes; an empty list means all are
+/// drawn again. A client can draw a dropped one another way (a bitmap).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct WindowFillsDroppedEvent {
+    pub window_id: u32,
+    pub dropped: Vec<FillDrop>,
+}
+
 /// `EV_WINDOW_DPI_CHANGED` — output DPI changed (window moved to a
 /// different display, monitor reconfiguration, etc.). `scale_factor`
 /// is multiplicative: 1.0 = standard 96 DPI, 2.0 = HiDPI, 1.5 =
@@ -1004,11 +1038,63 @@ pub const FILL_MAX_COORD: f32 = 32768.0;
 /// Most verbs, and most points, one FILL node may carry.
 pub const FILL_MAX_VERBS: usize = 1 << 18;
 
-/// How a FILL is painted. Colours are linear RGB, straight alpha, like
-/// every other node's. Gradients come as further variants.
+/// One gradient stop: `offset` in [0, 1] (non-decreasing along the
+/// list), colour sRGB-encoded with straight alpha, as CSS gives it.
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct GradientStop {
+    pub offset: f32,
+    pub r: f32,
+    pub g: f32,
+    pub b: f32,
+    pub a: f32,
+}
+
+/// Most stops a gradient may have.
+pub const FILL_MAX_STOPS: usize = 16;
+
+/// How a FILL is painted. The solid colour is linear RGB, straight alpha,
+/// like every other node's. Gradients are CSS's default: geometry in path
+/// space (the fill's transform applies), stops interpolated premultiplied
+/// in sRGB, pad outside the first and last stop. A zero-length or
+/// zero-radius gradient paints its last stop.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum FillPaint {
     Solid { r: f32, g: f32, b: f32, a: f32 },
+    Linear { x0: f32, y0: f32, x1: f32, y1: f32, stops: Vec<GradientStop> },
+    Radial { cx: f32, cy: f32, radius: f32, stops: Vec<GradientStop> },
+}
+
+impl FillPaint {
+    pub fn validate(&self) -> Result<(), &'static str> {
+        let stops = match self {
+            FillPaint::Solid { r, g, b, a } => {
+                return if finite(&[*r, *g, *b, *a]) { Ok(()) } else { Err("paint not finite") };
+            }
+            FillPaint::Linear { x0, y0, x1, y1, stops } => {
+                if !finite(&[*x0, *y0, *x1, *y1]) {
+                    return Err("gradient geometry not finite");
+                }
+                stops
+            }
+            FillPaint::Radial { cx, cy, radius, stops } => {
+                if !finite(&[*cx, *cy, *radius]) {
+                    return Err("gradient geometry not finite");
+                }
+                stops
+            }
+        };
+        if stops.is_empty() || stops.len() > FILL_MAX_STOPS {
+            return Err("gradient stop count");
+        }
+        let mut last = 0.0f32;
+        for s in stops {
+            if !(s.offset.is_finite() && s.offset >= last && s.offset <= 1.0) || !finite(&[s.r, s.g, s.b, s.a]) {
+                return Err("gradient stops must be finite, in [0, 1] and non-decreasing");
+            }
+            last = s.offset;
+        }
+        Ok(())
+    }
 }
 
 /// Params for `scene_ops::ATRIUM_CORE_FILL`: one filled path. Fresco
@@ -1066,10 +1152,7 @@ impl FillParams {
         if self.verbs.len() > FILL_MAX_VERBS || self.points.len() > FILL_MAX_VERBS {
             return Err("too many verbs or points");
         }
-        let FillPaint::Solid { r, g, b, a } = self.paint;
-        if !finite(&[r, g, b, a]) {
-            return Err("paint not finite");
-        }
+        self.paint.validate()?;
         FillTransformParams { transform: self.transform, opacity: self.opacity, clip: self.clip }.validate()?;
         let mut need = 0usize;
         for (i, &v) in self.verbs.iter().enumerate() {
@@ -1404,6 +1487,7 @@ mod tests {
             control::EV_WINDOW_DPI_CHANGED,
             control::EV_WINDOW_CREATED,
             control::EV_WINDOW_DESTROYED,
+            control::EV_WINDOW_FILLS_DROPPED,
             control::OP_LANE_REQUEST,
             control::OP_WM_ENUMERATE,
             control::OP_WM_DECLARE_LAYOUT,

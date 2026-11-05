@@ -1004,6 +1004,16 @@ fn render_one_frame(
     let drawn: std::collections::HashMap<u32, Arc<pack::Pixels>> =
         windows.iter().filter_map(|w| w.pixels.clone().map(|p| (w.id, p))).collect();
     renderer.render(ScreenInput { windows, uploads, clears })?;
+    /* Fills packed here that did not draw: their owners hear which. */
+    let drops = renderer.take_fill_drops();
+    if !drops.is_empty() {
+        let mut c = comp.lock().unwrap();
+        for (id, d) in drops {
+            if let Ok(id) = u16::try_from(id) {
+                c.set_fill_drops(id, d);
+            }
+        }
+    }
     /* Each layer's alpha comes from the frame it was drawn from, so a
      * pixel a window left transparent passes the click on (F4c′). */
     let frames: std::collections::HashMap<u32, Arc<fresco_compute::Frame>> =

@@ -140,3 +140,102 @@ fn off_target_paths_are_culled() {
     clipped.clip = Some([30.0, 0.0, 32.0, 2.0]);
     assert_eq!(n(clipped), 0, "outside its clip: culled");
 }
+
+#[test]
+fn gradients_interpolate_in_srgb_and_pad() {
+    // Black to white across 0..256 px, linear: byte x at pixel x (t at the
+    // pixel centre, quantized), padded outside 64..192 by stops at 0.25/0.75.
+    let rect = Fill {
+        verbs: vec![VERB_MOVE, VERB_LINE, VERB_LINE, VERB_LINE],
+        points: vec![[0.0, 0.0], [256.0, 0.0], [256.0, 4.0], [0.0, 4.0]],
+        transform: IDENTITY,
+        color: [0.0, 0.0, 0.0, 1.0],
+        gradient: Some(Gradient {
+            shape: GradientShape::Linear { p0: [0.0, 0.0], p1: [256.0, 0.0] },
+            stops: vec![(0.25, [0.0, 0.0, 0.0, 1.0]), (0.75, [1.0, 1.0, 1.0, 1.0])],
+        }),
+        ..Default::default()
+    };
+    let f = Frame::pack(&Scene { fills: vec![rect], ..Default::default() }, 256, 4, 256);
+    let out = reference::render(&f);
+    for x in [0u32, 40, 64, 100, 128, 150, 191, 192, 250] {
+        let t = ((x as f32 + 0.5) / 256.0).clamp(0.25, 0.75);
+        let want = (((t - 0.25) / 0.5) * 255.0 + 0.5) as u32;
+        let got = out[(2 * 256 + x) as usize] & 255;
+        assert!(got.abs_diff(want) <= 1, "x {x}: byte {got}, want {want}");
+    }
+    // Radial with a scaled transform: concentric; the centre is the first stop.
+    let disk = Fill {
+        verbs: vec![VERB_MOVE, VERB_LINE, VERB_LINE, VERB_LINE],
+        points: vec![[-10.0, -10.0], [10.0, -10.0], [10.0, 10.0], [-10.0, 10.0]],
+        transform: [2.0, 0.0, 0.0, 2.0, 20.0, 20.0],
+        color: [0.0, 0.0, 0.0, 1.0],
+        gradient: Some(Gradient {
+            shape: GradientShape::Radial { center: [0.0, 0.0], radius: 10.0 },
+            stops: vec![(0.0, [1.0, 0.0, 0.0, 1.0]), (1.0, [0.0, 0.0, 1.0, 1.0])],
+        }),
+        ..Default::default()
+    };
+    let f = Frame::pack(&Scene { fills: vec![disk], ..Default::default() }, 40, 40, 40);
+    let out = reference::render(&f);
+    let px = |x: u32, y: u32| out[(y * 40 + x) as usize];
+    assert!((px(20, 20) >> 16) & 255 > 240 && px(20, 20) & 255 < 15, "centre is red");
+    // Pixel centres at (±9.5, 0.5) and (0.5, 9.5) from the centre.
+    assert_eq!(px(29, 20), px(20, 29), "concentric");
+    assert_eq!(px(29, 20), px(10, 20), "concentric");
+    assert_ne!(px(29, 20), px(20, 20), "it varies");
+    // A bad gradient drops the fill.
+    let mut bad = Fill { ..f_with_stops(vec![(0.5, [1.0; 4]), (0.2, [0.0; 4])]) };
+    assert!(check_gradient(bad.gradient.as_ref().unwrap()).is_err());
+    bad.gradient.as_mut().unwrap().stops.clear();
+    assert_eq!(Frame::pack(&Scene { fills: vec![bad], ..Default::default() }, 8, 8, 8).header.op_count, 0);
+}
+
+fn f_with_stops(stops: Vec<(f32, [f32; 4])>) -> Fill {
+    Fill {
+        verbs: vec![VERB_MOVE, VERB_LINE, VERB_LINE],
+        points: vec![[0.0, 0.0], [8.0, 0.0], [0.0, 8.0]],
+        transform: IDENTITY,
+        color: [1.0; 4],
+        gradient: Some(Gradient { shape: GradientShape::Linear { p0: [0.0, 0.0], p1: [8.0, 0.0] }, stops }),
+        ..Default::default()
+    }
+}
+
+#[test]
+fn dropped_fills_are_reported_with_why() {
+    let tri = || Fill {
+        verbs: vec![VERB_MOVE, VERB_LINE, VERB_LINE],
+        points: vec![[0.0, 0.0], [20.0, 0.0], [0.0, 20.0]],
+        transform: IDENTITY,
+        color: [1.0; 4],
+        ..Default::default()
+    };
+    let malformed = Fill { verbs: vec![VERB_LINE], points: vec![[0.0, 0.0]], ..tri() };
+    let bad_paint = f_with_stops(vec![(2.0, [1.0; 4])]);
+    let long = {
+        let n = MAX_PATH_SEGMENTS + 10;
+        let mut verbs = vec![VERB_MOVE];
+        verbs.extend(std::iter::repeat_n(VERB_LINE, n));
+        let points = (0..=n).map(|i| [(i % 100) as f32, (i % 7) as f32]).collect();
+        Fill { verbs, points, ..tri() }
+    };
+    // 5000 lines inside one 16x16 tile.
+    let dense = {
+        let n = 5000;
+        let mut verbs = vec![VERB_MOVE];
+        verbs.extend(std::iter::repeat_n(VERB_LINE, n));
+        let points = (0..=n).map(|i| [1.0 + (i % 13) as f32, if i % 2 == 0 { 1.0 } else { 14.0 }]).collect();
+        Fill { verbs, points, ..tri() }
+    };
+    let culled = Fill { transform: [1.0, 0.0, 0.0, 1.0, 0.0, -1.0e5], ..tri() };
+    let scene = Scene { fills: vec![tri(), malformed, bad_paint, long, dense, culled], ..Default::default() };
+    let (frame, dropped) = Frame::pack_report(&scene, 64, 64, 64);
+    assert_eq!(dropped, vec![
+        (1, drop::MALFORMED),
+        (2, drop::BAD_PAINT),
+        (3, drop::TOO_MANY_LINES),
+        (4, drop::TILE_TOO_DENSE),
+    ]);
+    assert_eq!(frame.header.op_count, 1, "only the good one draws; the culled one is not a drop");
+}

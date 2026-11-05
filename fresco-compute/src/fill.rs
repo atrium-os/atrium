@@ -46,9 +46,11 @@
 //! | words | what |
 //! |---|---|
 //! | 0..8 | tile x0, tile y0, tiles wide, tiles high, first line word, lines, rule (0 nonzero, 1 even-odd), block words |
+//! | 8..18 | paint (0 solid, 1 linear, 2 radial), first stop word, stops, six gradient coefficients ([`gradient_coefficients`]), 0 |
 //! | 8.. | per tile, row major: first list word, list length, 16 backdrop floats (one per pixel row) |
 //! | then | the lists: line indices |
 //! | then | the lines: x0, y0, x1, y1 as f32 bits |
+//! | then | the gradient stops: offset, r, g, b, a ([`Gradient`]) |
 
 use crate::TILE;
 
@@ -85,7 +87,11 @@ pub const TOLERANCE: f32 = 0.25;
 pub const MAX_CURVE_PIECES: u32 = 1024;
 /// Words per tile entry and in the block header.
 pub const ENTRY_WORDS: u32 = 18;
-pub const HEADER_WORDS: u32 = 8;
+pub const HEADER_WORDS: u32 = 18;
+/// Most gradient stops.
+pub const MAX_STOPS: u32 = 16;
+/// Words per gradient stop: offset, then r, g, b, a (sRGB, straight).
+pub const STOP_WORDS: u32 = 5;
 /// Largest block grid edge in tiles (`MAX_DIM / TILE`); the kernel refuses
 /// bigger ones.
 pub const MAX_GRID: u32 = crate::MAX_DIM / TILE;
@@ -105,10 +111,98 @@ pub struct Fill {
     /// `[a, b, c, d, e, f]`: x' = a x + c y + e, y' = b x + d y + f.
     pub transform: [f32; 6],
     pub rule: FillRule,
-    /// Linear RGB, straight alpha (opacity folded in).
+    /// Linear RGB, straight alpha (opacity folded in). With a gradient,
+    /// only the alpha is used: the opacity.
     pub color: [f32; 4],
     /// Target pixels `[x0, y0, x1, y1)`; `None`: the whole target.
     pub clip: Option<[f32; 4]>,
+    pub gradient: Option<Gradient>,
+}
+
+/// A gradient's geometry, in path space (the fill's transform applies).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum GradientShape {
+    /// From `p0` (t = 0) to `p1` (t = 1).
+    Linear { p0: [f32; 2], p1: [f32; 2] },
+    /// t = distance from `center` / `radius`.
+    Radial { center: [f32; 2], radius: f32 },
+}
+
+/// A gradient paint: CSS's default. Stops are `(offset, [r, g, b, a])`,
+/// sRGB-encoded with straight alpha, offsets non-decreasing in [0, 1];
+/// colours interpolate premultiplied in sRGB, `t` is clamped to the first
+/// and last offsets (pad), and the result is quantized to 8-bit sRGB and
+/// decoded through the LUT, so every executor gets the same linear value.
+/// A zero-length or zero-radius gradient (or a singular transform) paints
+/// the last stop.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Gradient {
+    pub shape: GradientShape,
+    pub stops: Vec<(f32, [f32; 4])>,
+}
+
+/// Check a gradient: 1 to [`MAX_STOPS`] stops, finite, offsets
+/// non-decreasing within [0, 1], a finite shape.
+pub fn check_gradient(g: &Gradient) -> Result<(), &'static str> {
+    if g.stops.is_empty() || g.stops.len() > MAX_STOPS as usize {
+        return Err("gradient stop count");
+    }
+    let mut last = 0.0f32;
+    for (o, c) in &g.stops {
+        if !(o.is_finite() && *o >= last && *o <= 1.0) || !c.iter().all(|v| v.is_finite()) {
+            return Err("gradient stops must be finite, in [0, 1] and non-decreasing");
+        }
+        last = *o;
+    }
+    let ok = match g.shape {
+        GradientShape::Linear { p0, p1 } => p0.iter().chain(&p1).all(|v| v.is_finite()),
+        GradientShape::Radial { center, radius } => center.iter().all(|v| v.is_finite()) && radius.is_finite(),
+    };
+    ok.then_some(()).ok_or("gradient shape not finite")
+}
+
+/// The gradient's per-pixel coefficients in target space: `t` (linear) or
+/// `(u, v)` (radial, `t = |(u, v)|`) as affine functions of the pixel
+/// centre: `u = m0 x + m1 y + m2`, `v = m3 x + m4 y + m5`.
+pub fn gradient_coefficients(g: &Gradient, t: &[f32; 6]) -> [f32; 6] {
+    let last = [0.0, 0.0, 1.0, 0.0, 0.0, 0.0];
+    let [a, b, c, d, e, f] = t.map(f64::from);
+    let det = a * d - b * c;
+    if !(det.abs() > 1e-12) {
+        return last;
+    }
+    // Path-space point as affine functions of target (X, Y):
+    // px = pxx X + pxy Y + px0, py = pyx X + pyy Y + py0.
+    let (pxx, pxy, px0) = (d / det, -c / det, (c * f - d * e) / det);
+    let (pyx, pyy, py0) = (-b / det, a / det, (b * e - a * f) / det);
+    let out = match g.shape {
+        GradientShape::Linear { p0, p1 } => {
+            let (x0, y0) = (p0[0] as f64, p0[1] as f64);
+            let (dx, dy) = (p1[0] as f64 - x0, p1[1] as f64 - y0);
+            let l2 = dx * dx + dy * dy;
+            if !(l2 > 1e-12) {
+                return last;
+            }
+            [
+                (pxx * dx + pyx * dy) / l2,
+                (pxy * dx + pyy * dy) / l2,
+                ((px0 - x0) * dx + (py0 - y0) * dy) / l2,
+                0.0,
+                0.0,
+                0.0,
+            ]
+        }
+        GradientShape::Radial { center, radius } => {
+            let r = radius as f64;
+            if !(r > 1e-12) {
+                return last;
+            }
+            let (cx, cy) = (center[0] as f64, center[1] as f64);
+            [pxx / r, pxy / r, (px0 - cx) / r, pyx / r, pyy / r, (py0 - cy) / r]
+        }
+    };
+    let out = out.map(|v| v as f32);
+    if out.iter().all(|v| v.is_finite()) { out } else { last }
 }
 
 pub const IDENTITY: [f32; 6] = [1.0, 0.0, 0.0, 1.0, 0.0, 0.0];
@@ -230,6 +324,21 @@ pub fn flatten(f: &Fill) -> Option<Vec<[f32; 4]>> {
     (out.len() <= MAX_PATH_SEGMENTS && out.iter().flatten().all(|c| c.is_finite())).then_some(out)
 }
 
+/// Why [`crate::Frame::pack_report`] did not draw a fill (the values of
+/// `fresco_protocol::fill_drop`).
+pub mod drop {
+    pub const TOO_MANY_LINES: u8 = 1;
+    pub const TILE_TOO_DENSE: u8 = 2;
+    pub const FRAME_BUDGET: u8 = 3;
+    pub const BAD_PAINT: u8 = 4;
+    pub const MALFORMED: u8 = 5;
+}
+
+/// Paint kinds in a block's header word 8.
+pub const PAINT_SOLID: u32 = 0;
+pub const PAINT_LINEAR: u32 = 1;
+pub const PAINT_RADIAL: u32 = 2;
+
 /// What a fill packs to: its block (to append to `texels` at word `base`)
 /// and its op's box and clip.
 pub struct Packed {
@@ -258,8 +367,24 @@ fn clip_y(s: [f32; 4], lo: f32, hi: f32) -> Option<[f32; 4]> {
 /// Tile `lines` for a `width` x `height` target: the block with its words
 /// relative to `base` made absolute. `None` when culled or past a limit.
 pub fn pack(lines: &[[f32; 4]], rule: FillRule, clip: Option<[f32; 4]>, width: u32, height: u32, base: u32) -> Option<Packed> {
+    pack_paint(lines, rule, clip, None, width, height, base).ok()
+}
+
+/// Culled: nothing of it is on the target or in its clip (not a drop).
+pub const CULLED: u8 = 0;
+
+/// [`pack`] with a gradient (`(gradient, fill transform)`).
+pub fn pack_paint(
+    lines: &[[f32; 4]],
+    rule: FillRule,
+    clip: Option<[f32; 4]>,
+    paint: Option<(&Gradient, &[f32; 6])>,
+    width: u32,
+    height: u32,
+    base: u32,
+) -> Result<Packed, u8> {
     if lines.is_empty() {
-        return None;
+        return Err(CULLED);
     }
     let (mut x0, mut y0, mut x1, mut y1) = (f32::MAX, f32::MAX, f32::MIN, f32::MIN);
     for s in lines {
@@ -270,14 +395,14 @@ pub fn pack(lines: &[[f32; 4]], rule: FillRule, clip: Option<[f32; 4]>, width: u
     }
     let clip = clip.unwrap_or([0.0, 0.0, width as f32, height as f32]);
     if !clip.iter().all(|c| c.is_finite()) {
-        return None;
+        return Err(CULLED);
     }
     let bx0 = x0.max(clip[0]).max(0.0).floor();
     let by0 = y0.max(clip[1]).max(0.0).floor();
     let bx1 = x1.min(clip[2]).min(width as f32).ceil();
     let by1 = y1.min(clip[3]).min(height as f32).ceil();
     if bx1 <= bx0 || by1 <= by0 {
-        return None; // culled
+        return Err(CULLED);
     }
     let t = TILE as f32;
     let (tx0, ty0) = ((bx0 / t) as u32, (by0 / t) as u32);
@@ -322,12 +447,24 @@ pub fn pack(lines: &[[f32; 4]], rule: FillRule, clip: Option<[f32; 4]>, width: u
     }
     let indices: usize = lists.iter().map(Vec::len).sum();
     if lists.iter().any(|l| l.len() > MAX_TILE_SEGMENTS as usize) {
-        return None;
+        return Err(drop::TILE_TOO_DENSE);
     }
     let entries = HEADER_WORDS as usize + n * ENTRY_WORDS as usize;
     let lines_at = entries + indices;
-    let words = lines_at + lines.len() * 4;
+    let stops_at = lines_at + lines.len() * 4;
+    let n_stops = paint.map_or(0, |(g, _)| g.stops.len());
+    let words = stops_at + n_stops * STOP_WORDS as usize;
     let mut block = vec![0u32; words];
+    let (kind, m) = match paint {
+        None => (PAINT_SOLID, [0.0; 6]),
+        Some((g, t)) => {
+            let k = match g.shape {
+                GradientShape::Linear { .. } => PAINT_LINEAR,
+                GradientShape::Radial { .. } => PAINT_RADIAL,
+            };
+            (k, gradient_coefficients(g, t))
+        }
+    };
     block[..HEADER_WORDS as usize].copy_from_slice(&[
         tx0,
         ty0,
@@ -337,7 +474,26 @@ pub fn pack(lines: &[[f32; 4]], rule: FillRule, clip: Option<[f32; 4]>, width: u
         lines.len() as u32,
         (rule == FillRule::EvenOdd) as u32,
         words as u32,
+        kind,
+        base + stops_at as u32,
+        n_stops as u32,
+        m[0].to_bits(),
+        m[1].to_bits(),
+        m[2].to_bits(),
+        m[3].to_bits(),
+        m[4].to_bits(),
+        m[5].to_bits(),
+        0,
     ]);
+    if let Some((g, _)) = paint {
+        for (i, (o, c)) in g.stops.iter().enumerate() {
+            let at = stops_at + i * STOP_WORDS as usize;
+            block[at] = o.to_bits();
+            for k in 0..4 {
+                block[at + 1 + k] = c[k].to_bits();
+            }
+        }
+    }
     let mut at = entries;
     for ty in 0..th {
         let mut acc = [0.0f32; 16];
@@ -361,7 +517,40 @@ pub fn pack(lines: &[[f32; 4]], rule: FillRule, clip: Option<[f32; 4]>, width: u
             block[lines_at + i * 4 + j] = c.to_bits();
         }
     }
-    Some(Packed { block, bbox: [bx0, by0, bx1, by1], clip, lines: lines.len(), indices })
+    Ok(Packed { block, bbox: [bx0, by0, bx1, by1], clip, lines: lines.len(), indices })
+}
+
+/// The gradient's straight-alpha sRGB colour at `t`: `raster.comp`'s
+/// `stop_color`, operation for operation. `stops` as packed.
+pub fn gradient_at(stops: &[(f32, [f32; 4])], t: f32) -> [f32; 4] {
+    let n = stops.len();
+    let first = stops[0].0;
+    let last = stops[n - 1].0;
+    let t = if t >= first { if t <= last { t } else { last } } else { first };
+    let mut i = 0;
+    while i + 1 < n && stops[i + 1].0 < t {
+        i += 1;
+    }
+    let (o0, c0) = stops[i];
+    let (o1, c1) = if i + 1 < n { stops[i + 1] } else { stops[i] };
+    let span = o1 - o0;
+    let f = if span > 0.0 { (t - o0) / span } else { 1.0 };
+    let pa = [c0[0] * c0[3], c0[1] * c0[3], c0[2] * c0[3]];
+    let pb = [c1[0] * c1[3], c1[1] * c1[3], c1[2] * c1[3]];
+    let a = c0[3] + f * (c1[3] - c0[3]);
+    let mut out = [0.0f32; 4];
+    for k in 0..3 {
+        let p = pa[k] + f * (pb[k] - pa[k]);
+        out[k] = if a > 0.0 { p / a } else { 0.0 };
+    }
+    out[3] = a;
+    out
+}
+
+/// An sRGB channel in [0, 1] to linear through the LUT's 256 entries.
+pub fn srgb_channel(lut: &[f32], c: f32) -> f32 {
+    let v = if c >= 0.0 { if c <= 1.0 { c } else { 1.0 } } else { 0.0 };
+    lut[(v * 255.0 + 0.5) as u32 as usize]
 }
 
 /// G(t), the integral of clamp(1 - t, 0, 1) (see the coverage rule).

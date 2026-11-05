@@ -185,6 +185,8 @@ pub fn spawn_event_fanout(
 /// its own, role Background).
 enum Route {
     OwnerAndWm(Option<u8>),
+    /// Only the window's owner: what happened to its own drawing.
+    Owner(Option<u8>),
     WmOnly,
     /// Everyone: a change to the screen itself (EV_DISPLAY_CHANGED).
     All,
@@ -196,12 +198,16 @@ impl Route {
             Route::WmOnly => sub.wm,
             Route::All => true,
             Route::OwnerAndWm(owner) => sub.wm || *owner == Some(sub.client_id),
+            Route::Owner(owner) => *owner == Some(sub.client_id),
         }
     }
 }
 
 fn route(ev: &DisplayEvent, comp: &Arc<Mutex<Compositor>>) -> Route {
     use DisplayEvent as E;
+    let owner_of = |window_id: u32| u16::try_from(window_id).ok()
+        .and_then(|id| comp.lock().unwrap().windows.get(&id).map(|w| w.owner))
+        .and_then(|o| u8::try_from(o).ok());
     let window_id = match *ev {
         E::WindowResized { window_id, .. }
         | E::WindowFocusChanged { window_id, .. }
@@ -214,14 +220,12 @@ fn route(ev: &DisplayEvent, comp: &Arc<Mutex<Compositor>>) -> Route {
         | E::InputPointerButton { window_id, .. }
         | E::InputPointerScroll { window_id, .. } => window_id,
         E::DisplayChanged { .. } => return Route::All,
+        E::WindowFillsDropped { window_id, .. } => return Route::Owner(owner_of(window_id)),
     };
     if window_id == 0 {
         return Route::WmOnly;
     }
-    let owner = u16::try_from(window_id).ok()
-        .and_then(|id| comp.lock().unwrap().windows.get(&id).map(|w| w.owner))
-        .and_then(|o| u8::try_from(o).ok());
-    Route::OwnerAndWm(owner)
+    Route::OwnerAndWm(owner_of(window_id))
 }
 
 fn out_clone(o: &Outbound) -> Outbound {

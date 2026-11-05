@@ -1,12 +1,13 @@
 //! atrium-vector-demo — filled paths (ATRIUM_CORE_FILL) in one window:
-//! a ring (cubics, nonzero with a hole), an even-odd star, a quadratic
-//! blob, a clipped wedge and a 4,000-segment chart line turned into a
-//! fill, then a slow zoom of the star sent as FILL_TRANSFORM only.
+//! a ring (cubics, nonzero with a hole, radial gradient), an even-odd
+//! star, a quadratic blob (linear gradient), a clipped wedge and a 4,000-segment chart line turned into a
+//! fill, a scribble too dense to draw (reported back as dropped), then a
+//! slow zoom of the star sent as FILL_TRANSFORM only.
 //!
 //! Usage: atrium-vector-demo [SOCK] [SECONDS]
 
-use fresco_client::Connection;
-use fresco_protocol::{fill_verb as v, FillParams, FillPaint, FillTransformParams, RectParams, WindowHints};
+use fresco_client::{Connection, Event};
+use fresco_protocol::{fill_verb as v, FillParams, FillPaint, FillTransformParams, GradientStop, RectParams, WindowHints};
 use std::time::{Duration, Instant};
 
 fn solid(r: f32, g: f32, b: f32, a: f32) -> FillPaint {
@@ -49,7 +50,9 @@ fn main() -> std::io::Result<()> {
     let (v2, p2) = circle(0.0, 0.0, 55.0, true);
     rv.extend(v2);
     rp.extend(p2);
-    conn.scene_node_fill(10, &fill(rv, rp, [1.0, 0.0, 0.0, 1.0, 160.0, 170.0], 0, solid(0.05, 0.35, 0.6, 1.0)))?;
+    let stop = |offset: f32, r: f32, g: f32, b: f32, a: f32| GradientStop { offset, r, g, b, a };
+    let radial = FillPaint::Radial { cx: 0.0, cy: 0.0, radius: 110.0, stops: vec![stop(0.5, 1.0, 0.85, 0.2, 1.0), stop(1.0, 0.1, 0.3, 0.8, 1.0)] };
+    conn.scene_node_fill(10, &fill(rv, rp, [1.0, 0.0, 0.0, 1.0, 160.0, 170.0], 0, radial))?;
     // Even-odd star (its centre stays empty).
     let star: Vec<[f32; 2]> = (0..5)
         .map(|i| {
@@ -63,7 +66,8 @@ fn main() -> std::io::Result<()> {
     conn.scene_node_fill(12, &fill(
         vec![v::MOVE, v::QUAD, v::QUAD, v::QUAD, v::CLOSE],
         vec![[0.0, 0.0], [120.0, -60.0], [160.0, 40.0], [120.0, 140.0], [20.0, 120.0], [-60.0, 60.0], [0.0, 0.0]],
-        [1.0, 0.0, 0.0, 1.0, 200.0, 220.0], 0, solid(0.9, 0.75, 0.1, 0.6)))?;
+        [1.0, 0.0, 0.0, 1.0, 200.0, 220.0], 0,
+        FillPaint::Linear { x0: -60.0, y0: 0.0, x1: 160.0, y1: 0.0, stops: vec![stop(0.0, 0.9, 0.1, 0.5, 0.9), stop(1.0, 0.1, 0.8, 0.9, 0.5)] }))?;
     // A wedge clipped to a box.
     let mut wedge = fill(vec![v::MOVE, v::LINE, v::LINE, v::CLOSE], vec![[0.0, 0.0], [200.0, 40.0], [60.0, 200.0]], [1.0, 0.0, 0.0, 1.0, 620.0, 60.0], 0, solid(0.2, 0.6, 0.2, 1.0));
     wedge.clip = Some([650.0, 80.0, 780.0, 220.0]);
@@ -81,6 +85,13 @@ fn main() -> std::io::Result<()> {
     verbs.extend(std::iter::repeat_n(v::LINE, pts.len() - 1));
     verbs.push(v::CLOSE);
     conn.scene_node_fill(14, &fill(verbs, pts, [1.0, 0.0, 0.0, 1.0, 50.0, 430.0], 0, solid(0.4, 0.1, 0.6, 0.85)))?;
+    // A scribble too dense to draw: 5,000 lines in one 16x16 tile. frescod
+    // drops it and says so (EV_WINDOW_FILLS_DROPPED).
+    let k = 5000;
+    let mut verbs = vec![v::MOVE];
+    verbs.extend(std::iter::repeat_n(v::LINE, k));
+    let pts = (0..=k).map(|i| [1.0 + (i % 13) as f32, if i % 2 == 0 { 1.0 } else { 14.0 }]).collect();
+    conn.scene_node_fill(15, &fill(verbs, pts, [1.0, 0.0, 0.0, 1.0, 864.0, 560.0], 0, solid(0.0, 0.0, 0.0, 1.0)))?;
     conn.scene_frame_end()?;
 
     // Zoom the star by transform only.
@@ -93,6 +104,12 @@ fn main() -> std::io::Result<()> {
         conn.scene_frame_begin()?;
         conn.scene_node_fill_transform(11, FillTransformParams { transform: star_xf(s), opacity: 1.0, clip: None })?;
         conn.scene_frame_end()?;
+        while let Some(ev) = conn.poll_event()? {
+            if let Event::FillsDropped { window_id, dropped } = ev {
+                let d: Vec<String> = dropped.iter().map(|d| format!("node {} reason {}", d.node_id, d.reason)).collect();
+                eprintln!("window {window_id}: fills dropped: [{}]", d.join(", "));
+            }
+        }
         frame += 1;
         if frame % 50 == 0 {
             eprintln!("frame {frame}: star at scale {s:.2}");

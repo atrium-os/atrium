@@ -73,6 +73,10 @@ pub enum DisplayEvent {
     /// Pointer scroll (wheel / two-finger). `dy > 0` = content scrolls
     /// down (matches macOS/Wayland convention).
     InputPointerScroll { window_id: u32, dx: f32, dy: f32 },
+    /// The fills of this window that are not drawn, by node id with a
+    /// `fresco_protocol::fill_drop` reason. Sent whenever the set
+    /// changes, so an empty list says every fill draws again.
+    WindowFillsDropped { window_id: u32, dropped: Vec<(u32, u8)> },
 }
 
 /// Encode a `DisplayEvent` as a fresco-protocol payload. Returns
@@ -146,6 +150,13 @@ pub fn encode_event(ev: &DisplayEvent)
                 window_id: *window_id, dx: *dx, dy: *dy,
             };
             Ok((control::EV_INPUT_POINTER_SCROLL, encode(&p)?))
+        }
+        DisplayEvent::WindowFillsDropped { window_id, dropped } => {
+            let p = WindowFillsDroppedEvent {
+                window_id: *window_id,
+                dropped: dropped.iter().map(|&(node_id, reason)| FillDrop { node_id, reason }).collect(),
+            };
+            Ok((control::EV_WINDOW_FILLS_DROPPED, encode(&p)?))
         }
     }
 }
@@ -320,6 +331,8 @@ pub struct Compositor {
     /// wires this to a fan-out bus that broadcasts to per-connection
     /// writer threads (see M2.7 cutover).
     event_sink: Option<mpsc::Sender<DisplayEvent>>,
+    /// The fills last reported dropped, per window (see `set_fill_drops`).
+    fill_drops: std::collections::HashMap<WindowId, Vec<(u32, u8)>>,
 }
 
 /// Server-side WM theme — controls how the compositor draws window
@@ -446,6 +459,23 @@ impl Compositor {
             close_button_material: NULL_HASH,
             font: None,
             event_sink: None,
+            fill_drops: std::collections::HashMap::new(),
+        }
+    }
+
+    /// Record which of window `id`'s fills the last drawing dropped
+    /// (node id, `fresco_protocol::fill_drop` reason), telling its owner
+    /// with `WindowFillsDropped` only when that set changes.
+    pub fn set_fill_drops(&mut self, id: WindowId, dropped: Vec<(u32, u8)>) {
+        let old = self.fill_drops.get(&id).map(Vec::as_slice).unwrap_or(&[]);
+        if old == dropped.as_slice() {
+            return;
+        }
+        self.emit(DisplayEvent::WindowFillsDropped { window_id: id as u32, dropped: dropped.clone() });
+        if dropped.is_empty() {
+            self.fill_drops.remove(&id);
+        } else {
+            self.fill_drops.insert(id, dropped);
         }
     }
 
@@ -722,6 +752,7 @@ impl Compositor {
         let allowed = self.windows.get(&id).map(|w| w.owner == by).unwrap_or(false);
         if !allowed { return (false, None); }
         self.windows.remove(&id);
+        self.fill_drops.remove(&id);
         self.z_order.retain(|&w| w != id);
         let shift = if self.focus == Some(id) {
             let new_focus = self.z_order.last().copied();
@@ -1274,6 +1305,33 @@ mod event_tests {
             DisplayEvent::WindowDestroyed { window_id } => assert_eq!(window_id, id as u32),
             other => panic!("expected WindowDestroyed, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn fill_drops_are_told_only_when_they_change() {
+        let (mut c, rx) = comp_with_sink();
+        let id = c.create(7, (100, 100));
+        drain(&rx);
+        c.set_fill_drops(id, vec![]);
+        assert!(rx.try_recv().is_err(), "nothing dropped, nothing to say");
+        c.set_fill_drops(id, vec![(4, 2)]);
+        match expect_event(&rx) {
+            DisplayEvent::WindowFillsDropped { window_id, dropped } => {
+                assert_eq!((window_id, dropped), (id as u32, vec![(4, 2)]));
+            }
+            other => panic!("expected WindowFillsDropped, got {other:?}"),
+        }
+        c.set_fill_drops(id, vec![(4, 2)]);
+        assert!(rx.try_recv().is_err(), "same set: no event");
+        c.set_fill_drops(id, vec![]);
+        match expect_event(&rx) {
+            DisplayEvent::WindowFillsDropped { dropped, .. } => assert!(dropped.is_empty()),
+            other => panic!("expected WindowFillsDropped, got {other:?}"),
+        }
+        let (op, payload) = encode_event(&DisplayEvent::WindowFillsDropped { window_id: 3, dropped: vec![(9, 1)] }).unwrap();
+        assert_eq!(op, fresco_protocol::control::EV_WINDOW_FILLS_DROPPED);
+        let e: fresco_protocol::WindowFillsDroppedEvent = fresco_protocol::decode(&payload).unwrap();
+        assert_eq!((e.window_id, e.dropped[0].node_id, e.dropped[0].reason), (3, 9, 1));
     }
 
     #[test]

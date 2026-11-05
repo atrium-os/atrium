@@ -42,7 +42,7 @@ use fresco_protocol::{
     WindowSetHintsPayload, WindowRequestClosePayload, WindowPresentPayload,
     WindowPresentDamagePayload, WindowHints,
     WindowResizedEvent, WindowFocusChangedEvent,
-    WindowCloseRequestedEvent, WindowDpiChangedEvent,
+    WindowCloseRequestedEvent, WindowDpiChangedEvent, WindowFillsDroppedEvent,
     WindowCreatedEvent, WindowDestroyedEvent,
     InputKeyEvent, InputPointerMotionEvent,
     InputPointerButtonEvent, InputPointerScrollEvent,
@@ -71,6 +71,11 @@ pub enum Event {
     FocusChanged   { window_id: u32, gained: bool },
     CloseRequested { window_id: u32 },
     DpiChanged     { window_id: u32, scale_factor: f32 },
+    /// The fills of this window that are not drawn (each with a
+    /// `fresco_protocol::fill_drop` reason): sent when that set changes,
+    /// so an empty list means all of them draw again. Draw a dropped
+    /// one some other way, as a bitmap say.
+    FillsDropped   { window_id: u32, dropped: Vec<fresco_protocol::FillDrop> },
     /// A surface was created in this session. Window managers reconcile on
     /// this; ordinary clients ignore it (it's about other surfaces).
     WindowCreated  { window_id: u32 },
@@ -895,6 +900,10 @@ fn decode_event(op: u16, payload: &[u8]) -> Event {
             },
             Err(_) => Event::Unknown { op, payload: payload.to_vec() },
         },
+        EV_WINDOW_FILLS_DROPPED => match decode::<WindowFillsDroppedEvent>(payload) {
+            Ok(p) => Event::FillsDropped { window_id: p.window_id, dropped: p.dropped },
+            Err(_) => Event::Unknown { op, payload: payload.to_vec() },
+        },
         EV_WINDOW_CREATED => match decode::<WindowCreatedEvent>(payload) {
             Ok(p) => Event::WindowCreated { window_id: p.window_id },
             Err(_) => Event::Unknown { op, payload: payload.to_vec() },
@@ -969,6 +978,18 @@ mod tests {
                 assert_eq!(scale_factor, 2.0);
             }
             other => panic!("expected DpiChanged, got {other:?}"),
+        }
+
+        let p = WindowFillsDroppedEvent {
+            window_id: 7,
+            dropped: vec![fresco_protocol::FillDrop { node_id: 12, reason: fresco_protocol::fill_drop::TILE_TOO_DENSE }],
+        };
+        let bytes = encode(&p).unwrap();
+        match decode_event(EV_WINDOW_FILLS_DROPPED, &bytes) {
+            Event::FillsDropped { window_id: 7, dropped } => {
+                assert_eq!((dropped[0].node_id, dropped[0].reason), (12, fresco_protocol::fill_drop::TILE_TOO_DENSE));
+            }
+            other => panic!("expected FillsDropped, got {other:?}"),
         }
     }
 

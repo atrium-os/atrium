@@ -337,7 +337,9 @@ fn draw(broker: &Chan, state: &Mutex<State>, fe: &Mutex<EnvelopeFrontend>, scene
         let Some(wf) = pack::window_frame(&fe.lock().unwrap(), id, (0.0, 0.0), (width as f32, height as f32)) else {
             continue;
         };
-        let frame = scene.pack(&wf, width, height);
+        let (frame, drops) = scene.pack_report(&wf, width, height);
+        let comp = fe.lock().unwrap().compositor_arc().clone();
+        comp.lock().unwrap().set_fill_drops(id as u16, drops);
         let sig = {
             let mut h = std::collections::hash_map::DefaultHasher::new();
             fresco_compute::bytes_of(&[frame.header]).hash(&mut h);

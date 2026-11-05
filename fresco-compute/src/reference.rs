@@ -6,7 +6,7 @@ use crate::{Frame, Op, KIND_PATH, KIND_RECT, KIND_TEXTURE, TILE};
 /// Branch counters (feature `coverage`): what a corpus actually exercised.
 pub mod coverage {
     /// The branches counted, by index.
-    pub const NAMES: [&str; 22] = [
+    pub const NAMES: [&str; 25] = [
         "bin: empty bbox",
         "bin: bbox clipped to the target",
         "bin: bbox inside the target",
@@ -29,6 +29,9 @@ pub mod coverage {
         "fill: list word past texel_words",
         "fill: line index past its lines",
         "fill: drawn",
+        "fill: gradient stops out of range",
+        "fill: linear gradient",
+        "fill: radial gradient",
     ];
     #[cfg(feature = "coverage")]
     static HITS: [std::sync::atomic::AtomicU64; NAMES.len()] =
@@ -204,7 +207,34 @@ fn fill_shade(f: &Frame, o: &Op, pc: [f32; 2]) -> [f32; 4] {
     }
     hit(21);
     let cov = coverage(acc, rule == 1);
-    [o.p1[0], o.p1[1], o.p1[2], o.p1[3] * cov]
+    let paint = t(b + 8);
+    if paint == crate::fill::PAINT_SOLID {
+        return [o.p1[0], o.p1[1], o.p1[2], o.p1[3] * cov];
+    }
+    let (sat, n) = (t(b + 9), t(b + 10));
+    if n == 0 || n > crate::fill::MAX_STOPS || sat > tw_ || n * crate::fill::STOP_WORDS > tw_ - sat {
+        hit(22);
+        return [0.0; 4];
+    }
+    let m: Vec<f32> = (11..17).map(|k| f32::from_bits(t(b + k))).collect();
+    let u = m[0] * pc[0] + m[1] * pc[1] + m[2];
+    let gt = if paint == crate::fill::PAINT_LINEAR {
+        hit(23);
+        u
+    } else {
+        hit(24);
+        let v = m[3] * pc[0] + m[4] * pc[1] + m[5];
+        (u * u + v * v).sqrt()
+    };
+    let stops: Vec<(f32, [f32; 4])> = (0..n)
+        .map(|i| {
+            let w = sat + i * crate::fill::STOP_WORDS;
+            (f32::from_bits(t(w)), [1, 2, 3, 4].map(|k| f32::from_bits(t(w + k))))
+        })
+        .collect();
+    let c = crate::fill::gradient_at(&stops, gt);
+    let lin = |v: f32| crate::fill::srgb_channel(&f.lut, v);
+    [lin(c[0]), lin(c[1]), lin(c[2]), c[3] * o.p1[3] * cov]
 }
 
 /// One op's straight-alpha colour at pixel centre `pc`.

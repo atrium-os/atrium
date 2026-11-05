@@ -82,18 +82,22 @@ pub fn fills() -> Vec<fill::Fill> {
     v.extend(v2);
     p.extend(p2);
     vec![
-        Fill { verbs: star_verbs.clone(), points: star.clone(), transform: [1.0, 0.0, 0.0, 1.0, 14.0, 14.0], rule: FillRule::EvenOdd, color: [0.9, 0.9, 0.1, 0.9], clip: None },
-        Fill { verbs: star_verbs, points: star, transform: [1.5, 0.3, -0.3, 1.5, 58.0, 26.0], rule: FillRule::NonZero, color: [0.2, 0.1, 0.8, 0.8], clip: None },
-        Fill { verbs: v, points: p, transform: [1.0, 0.0, 0.0, 1.0, 40.3, 22.7], rule: FillRule::NonZero, color: [0.1, 0.7, 0.6, 0.7], clip: None },
+        Fill { verbs: star_verbs.clone(), points: star.clone(), transform: [1.0, 0.0, 0.0, 1.0, 14.0, 14.0], rule: FillRule::EvenOdd, color: [0.9, 0.9, 0.1, 0.9], clip: None, gradient: None },
+        Fill { verbs: star_verbs, points: star, transform: [1.5, 0.3, -0.3, 1.5, 58.0, 26.0], rule: FillRule::NonZero, color: [0.2, 0.1, 0.8, 0.8], clip: None, gradient: None },
+        Fill {
+            verbs: v, points: p, transform: [1.0, 0.0, 0.0, 1.0, 40.3, 22.7], rule: FillRule::NonZero, color: [0.1, 0.7, 0.6, 0.7], clip: None,
+            gradient: Some(Gradient { shape: GradientShape::Radial { center: [3.0, -2.0], radius: 12.0 }, stops: vec![(0.0, [1.0, 1.0, 0.2, 1.0]), (0.6, [0.9, 0.1, 0.4, 0.8]), (1.0, [0.1, 0.1, 0.9, 1.0])] }),
+        },
         Fill {
             verbs: vec![VERB_MOVE, VERB_QUAD, VERB_QUAD, VERB_QUAD],
             points: vec![[60.0, -6.0], [90.0, 5.0], [70.0, 20.0], [50.0, 30.0], [55.0, 10.0], [40.0, 0.0], [60.0, -6.0]],
             transform: IDENTITY, rule: FillRule::NonZero, color: [1.0, 0.4, 0.4, 0.6], clip: None,
+            gradient: Some(Gradient { shape: GradientShape::Linear { p0: [45.0, 0.0], p1: [75.0, 25.0] }, stops: vec![(0.2, [0.0, 0.5, 1.0, 1.0]), (0.8, [1.0, 0.5, 0.0, 0.3])] }),
         },
         Fill {
             verbs: vec![VERB_MOVE, VERB_LINE, VERB_LINE],
             points: vec![[0.0, 39.0], [30.0, 20.0], [33.0, 40.0]],
-            transform: IDENTITY, rule: FillRule::NonZero, color: [0.3, 1.0, 0.3, 1.0], clip: Some([5.0, 25.5, 28.0, 38.0]),
+            transform: IDENTITY, rule: FillRule::NonZero, color: [0.3, 1.0, 0.3, 1.0], clip: Some([5.0, 25.5, 28.0, 38.0]), gradient: None,
         },
     ]
 }
@@ -137,7 +141,25 @@ pub fn scene(r: &mut Rng, w: u32, h: u32) -> Scene {
         let transform = if r.chance(50) { IDENTITY } else { [r.f(0.5, 1.5), r.f(-0.5, 0.5), r.f(-0.5, 0.5), r.f(0.5, 1.5), r.f(-5.0, 5.0), r.f(-5.0, 5.0)] };
         let clip = r.chance(30).then(|| [r.f(-2.0, fw), r.f(-2.0, fh), r.f(0.0, fw + 2.0), r.f(0.0, fh + 2.0)]);
         let rule = if r.chance(50) { FillRule::NonZero } else { FillRule::EvenOdd };
-        s.fills.push(Fill { verbs, points, transform, rule, color: r.color(), clip });
+        let gradient = match r.below(3) {
+            0 => None,
+            k => {
+                let mut o = 0.0f32;
+                let stops = (0..1 + r.below(5))
+                    .map(|_| {
+                        o = (o + r.f(0.0, 0.5)).min(1.0);
+                        (o, r.color())
+                    })
+                    .collect();
+                let shape = if k == 1 {
+                    GradientShape::Linear { p0: [r.f(-5.0, fw), r.f(-5.0, fh)], p1: [r.f(-5.0, fw), r.f(-5.0, fh)] }
+                } else {
+                    GradientShape::Radial { center: [r.f(0.0, fw), r.f(0.0, fh)], radius: r.f(0.0, fw) }
+                };
+                Some(Gradient { shape, stops })
+            }
+        };
+        s.fills.push(Fill { verbs, points, transform, rule, color: r.color(), clip, gradient });
     }
     let nt = s.textures.len() as u32;
     if nt > 0 {

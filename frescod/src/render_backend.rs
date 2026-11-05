@@ -128,13 +128,22 @@ pub fn surface_size(w: &WindowFrame) -> (u32, u32) {
     (c(w.size.0), c(w.size.1))
 }
 
-/// A window's frame: the renderer's, or packed here from its nodes.
-fn frame_of(scene: &SceneState, w: &WindowFrame, s: Surface) -> Arc<fresco_compute::Frame> {
+/// A window's frame: the renderer's, or packed here from its nodes (then
+/// the fills it dropped go on `drops`, by window).
+fn frame_of(scene: &SceneState, w: &WindowFrame, s: Surface, drops: &mut FillDrops) -> Arc<fresco_compute::Frame> {
     match &w.frame {
         Some(f) => f.clone(),
-        None => Arc::new(scene.pack(w, s[2], s[3])),
+        None => {
+            let (frame, d) = scene.pack_report(w, s[2], s[3]);
+            drops.push((w.id, d));
+            Arc::new(frame)
+        }
     }
 }
+
+/// Per window packed here: the fills its last frame dropped (node id,
+/// `fresco_protocol::fill_drop` reason).
+pub type FillDrops = Vec<(u32, Vec<(u32, u8)>)>;
 
 /// The GPU's architecture: `FRESCOD_GPU_ARCH` if set, else the device's
 /// `CAP_ISA` family.
@@ -277,6 +286,15 @@ impl<'a> Backend<'a> {
         }
     }
 
+    /// The fills the last render dropped, for each window it packed.
+    pub fn take_fill_drops(&mut self) -> FillDrops {
+        match self {
+            Backend::Compute(c) => std::mem::take(&mut c.fill_drops),
+            Backend::Gpu(g) => std::mem::take(&mut g.fill_drops),
+            Backend::Vulkan(_) => Vec::new(),
+        }
+    }
+
     /// Where the last render changed the screen: `Some([x0, y0, x1, y1))`
     /// (empty when nothing did), `None` when it may have changed anywhere.
     pub fn damage(&self) -> Option<[u32; 4]> {
@@ -378,6 +396,7 @@ pub struct Compute {
     composed: Option<Vec<Layer>>,
     /// Where the last render changed `target` (see [`Backend::damage`]).
     damage: Option<[u32; 4]>,
+    fill_drops: FillDrops,
 }
 
 /// Where the installer puts frescod's precompiled Tier-2 kernels
@@ -458,11 +477,13 @@ impl Compute {
             last: Vec::new(),
             composed: None,
             damage: None,
+            fill_drops: Vec::new(),
         })
     }
 
     fn render(&mut self, f: ScreenInput) -> Result<()> {
         self.scene.apply(f.uploads, f.clears);
+        self.fill_drops.clear();
         let sizes: Vec<(u32, u32, u32)> = f.windows.iter().map(|w| {
             let (sw, sh) = surface_size(w);
             (w.id, sw, sh)
@@ -500,7 +521,7 @@ impl Compute {
                 self.held.insert(w.id, vec![p.gen]);
                 continue;
             }
-            let frame = frame_of(&self.scene, w, s);
+            let frame = frame_of(&self.scene, w, s, &mut self.fill_drops);
             self.last.push((w.id, frame.clone()));
             let sig = fresco_compute::damage::tile_signatures(&frame);
             let (off, len) = (s[0] as usize, (s[1] * s[3]) as usize);
@@ -591,6 +612,7 @@ pub struct GpuCompute<'a> {
     pending: Option<Pending>,
     /// The frames last rendered, for hit-testing.
     last: Vec<(u32, Arc<fresco_compute::Frame>)>,
+    fill_drops: FillDrops,
     code: Bo<'a>,
     /// Compose's inputs, its staging, its ring (frescod's VM).
     data: Option<Bo<'a>>,
@@ -725,6 +747,7 @@ impl<'a> GpuCompute<'a> {
             scene: SceneState::default(),
             pending: None,
             last: Vec::new(),
+            fill_drops: Vec::new(),
             code,
             data: None,
             staging,
@@ -739,6 +762,7 @@ impl<'a> GpuCompute<'a> {
     /// size, and pack each window's scene; `submit` records and runs it.
     fn prepare(&mut self, f: ScreenInput) -> Result<()> {
         self.scene.apply(f.uploads, f.clears);
+        self.fill_drops.clear();
         // Windows that are gone take their VMs with them.
         self.wins.retain(|id, _| f.windows.iter().any(|w| w.id == *id));
         self.version.retain(|id, _| f.windows.iter().any(|w| w.id == *id));
@@ -753,7 +777,7 @@ impl<'a> GpuCompute<'a> {
                 *self.version.entry(w.id).or_insert(0) += 1;
                 self.composed.clear();
             }
-            frames.push((w.id, frame_of(&self.scene, w, [0, sw, sw, sh])));
+            frames.push((w.id, frame_of(&self.scene, w, [0, sw, sw, sh], &mut self.fill_drops)));
         }
         self.last = frames.clone();
         let pos = f.windows.iter().map(|w| (w.id, (w.pos.0.round() as i32, w.pos.1.round() as i32))).collect();

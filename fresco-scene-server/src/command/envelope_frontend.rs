@@ -1574,10 +1574,17 @@ mod tests {
         bad.transform[0] = f32::NAN;
         assert!(set(&mut f, 4, scene_ops::ATRIUM_CORE_FILL, encode(&bad).unwrap()).is_err());
         assert!(!f.window_state(0).unwrap().fill_nodes.contains_key(&4));
+        // Gradients: valid stops pass; decreasing offsets do not.
+        let st = |offset: f32| fresco_protocol::GradientStop { offset, r: 1.0, g: 0.0, b: 0.0, a: 1.0 };
+        let mut g = tri.clone();
+        g.paint = FillPaint::Radial { cx: 0.0, cy: 0.0, radius: 5.0, stops: vec![st(0.0), st(1.0)] };
+        set(&mut f, 5, scene_ops::ATRIUM_CORE_FILL, encode(&g).unwrap()).expect("radial");
+        g.paint = FillPaint::Linear { x0: 0.0, y0: 0.0, x1: 1.0, y1: 0.0, stops: vec![st(0.7), st(0.2)] };
+        assert!(set(&mut f, 6, scene_ops::ATRIUM_CORE_FILL, encode(&g).unwrap()).is_err());
         // A rect on the same id replaces the fill.
         let r = RectParams { x: 0.0, y: 0.0, w: 1.0, h: 1.0, r: 1.0, g: 1.0, b: 1.0, a: 1.0, radius: 0.0 };
         set(&mut f, 3, scene_ops::ATRIUM_CORE_RECT, encode(&r).unwrap()).expect("rect");
-        assert!(f.window_state(0).unwrap().fill_nodes.is_empty());
+        assert!(!f.window_state(0).unwrap().fill_nodes.contains_key(&3));
     }
 
     #[test]

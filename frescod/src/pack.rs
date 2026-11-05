@@ -31,6 +31,8 @@ pub struct WindowFrame {
     pub glyph_batches: Vec<GlyphRunBatch>,
     /// Filled paths, in node id order (drawn after `paths`).
     pub fills: Vec<fresco_compute::fill::Fill>,
+    /// The node id of each of `fills`, for reporting drops.
+    pub fill_ids: Vec<u32>,
 }
 
 /// A window's finished pixels, BGRA8, `width * height` words.
@@ -141,6 +143,12 @@ impl SceneState {
     /// Pack one window's scene for the kernels, for a `width` x `height`
     /// surface.
     pub fn pack(&self, f: &WindowFrame, width: u32, height: u32) -> fresco_compute::Frame {
+        self.pack_report(f, width, height).0
+    }
+
+    /// `pack`, also naming the fills that were dropped (by node id, with
+    /// a `fresco_protocol::fill_drop` reason), in node id order.
+    pub fn pack_report(&self, f: &WindowFrame, width: u32, height: u32) -> (fresco_compute::Frame, Vec<(u32, u8)>) {
         use fresco_compute as fc;
         let mut scene = fc::Scene {
             rects: f.rects.iter().map(|n| fc::Rect {
@@ -184,13 +192,16 @@ impl SceneState {
             }).collect();
             scene.glyph_batches.push(fc::GlyphBatch { atlas, runs });
         }
-        let mut frame = fc::Frame::pack(&scene, width, height, width);
+        let (mut frame, drops) = fc::Frame::pack_report(&scene, width, height, width);
         // Window 0 is the screen's background; every other window's
         // surface is transparent where the window draws nothing.
         if f.id != 0 {
             frame.header.clear = fc::TRANSPARENT;
         }
-        frame
+        let drops = drops.into_iter()
+            .filter_map(|(i, why)| Some((*f.fill_ids.get(i)?, why)))
+            .collect();
+        (frame, drops)
     }
 }
 
@@ -225,6 +236,7 @@ pub fn window_frame(fe: &EnvelopeFrontend, id: u32, pos: (f32, f32), size: (f32,
     let mut fill_ids: Vec<&u32> = state.fill_nodes.keys().collect();
     fill_ids.sort_unstable();
     for id in fill_ids {
+        w.fill_ids.push(*id);
         w.fills.push(translate_fill(&state.fill_nodes[id]));
     }
     let mut tex_by_slot: std::collections::BTreeMap<u32, Vec<TextureNode>> =
@@ -288,15 +300,28 @@ fn translate_rect(p: &RectParams, ox: f32, oy: f32) -> SceneNode {
 }
 
 fn translate_fill(p: &fresco_protocol::FillParams) -> fresco_compute::fill::Fill {
-    use fresco_compute::fill::{Fill, FillRule};
-    let fresco_protocol::FillPaint::Solid { r, g, b, a } = p.paint;
+    use fresco_compute::fill::{Fill, FillRule, Gradient, GradientShape};
+    use fresco_protocol::FillPaint;
+    let stops = |s: &[fresco_protocol::GradientStop]| s.iter().map(|s| (s.offset, [s.r, s.g, s.b, s.a])).collect();
+    let (color, gradient) = match &p.paint {
+        FillPaint::Solid { r, g, b, a } => ([*r, *g, *b, *a * p.opacity], None),
+        FillPaint::Linear { x0, y0, x1, y1, stops: s } => (
+            [0.0, 0.0, 0.0, p.opacity],
+            Some(Gradient { shape: GradientShape::Linear { p0: [*x0, *y0], p1: [*x1, *y1] }, stops: stops(s) }),
+        ),
+        FillPaint::Radial { cx, cy, radius, stops: s } => (
+            [0.0, 0.0, 0.0, p.opacity],
+            Some(Gradient { shape: GradientShape::Radial { center: [*cx, *cy], radius: *radius }, stops: stops(s) }),
+        ),
+    };
     Fill {
         verbs: p.verbs.clone(),
         points: p.points.clone(),
         transform: p.transform,
         rule: if p.rule == 1 { FillRule::EvenOdd } else { FillRule::NonZero },
-        color: [r, g, b, a * p.opacity],
+        color,
         clip: p.clip,
+        gradient,
     }
 }
 
