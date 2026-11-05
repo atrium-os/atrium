@@ -607,3 +607,90 @@ fn mrt_depth_and_stack_builtins() {
     assert_eq!(f32::from_bits(depth), 1.75);
     assert_eq!(f32::from_bits(results[1].1[1].0[4]), 0.0);
 }
+
+/// dFdx/dFdy through the derivative helper (uniforms table slot 72), with
+/// a stub helper: checks the float and immediate arguments, the xmm0
+/// return, and that values live across the call survive it.
+#[test]
+fn derivative_helper_call() {
+    use rspirv::spirv::{
+        AddressingModel, BuiltIn, Capability, Decoration, ExecutionMode, ExecutionModel,
+        FunctionControl, MemoryModel, StorageClass as SC,
+    };
+    use std::sync::Mutex;
+    if !cfg!(target_arch = "x86_64") {
+        return;
+    }
+    static SITES: Mutex<Vec<(i32, i32)>> = Mutex::new(Vec::new());
+    extern "C" fn deriv(v: f32, site: i32, axis: i32) -> f32 {
+        SITES.lock().unwrap().push((site, axis));
+        v * 10.0 + axis as f32 * 1000.0
+    }
+    let mut b = Builder::new();
+    b.set_version(1, 0);
+    b.capability(Capability::Shader);
+    b.memory_model(AddressingModel::Logical, MemoryModel::GLSL450);
+    let void = b.type_void();
+    let f32_ty = b.type_float(32, None);
+    let vec4 = b.type_vector(f32_ty, 4);
+    let void_fn = b.type_function(void, vec![]);
+    let p_out4 = b.type_pointer(None, SC::Output, vec4);
+    let p_in4 = b.type_pointer(None, SC::Input, vec4);
+    let o0 = b.variable(p_out4, None, SC::Output, None);
+    b.decorate(o0, Decoration::Location, vec![rspirv::dr::Operand::LiteralBit32(0)]);
+    let fc = b.variable(p_in4, None, SC::Input, None);
+    b.decorate(fc, Decoration::BuiltIn, vec![rspirv::dr::Operand::BuiltIn(BuiltIn::FragCoord)]);
+    let main = b.begin_function(void, None, FunctionControl::NONE, void_fn).unwrap();
+    b.begin_block(None).unwrap();
+    let fcv = b.load(vec4, None, fc, None, vec![]).unwrap();
+    let x = b.composite_extract(f32_ty, None, fcv, vec![0]).unwrap();
+    let y = b.composite_extract(f32_ty, None, fcv, vec![1]).unwrap();
+    let e = b.f_mul(f32_ty, None, x, y).unwrap();
+    let dx = b.d_pdx(f32_ty, None, e).unwrap();
+    let dy = b.d_pdy(f32_ty, None, e).unwrap();
+    let c0 = b.composite_construct(vec4, None, vec![dx, dy, x, y]).unwrap();
+    b.store(o0, c0, None, vec![]).unwrap();
+    b.ret().unwrap();
+    b.end_function().unwrap();
+    b.entry_point(ExecutionModel::Fragment, main, "main", vec![o0, fc]);
+    b.execution_mode(main, ExecutionMode::OriginUpperLeft, vec![]);
+    let spirv = assemble(b);
+
+    let module = atrium_spv_frontend::translate(&spirv).expect("frontend");
+    let objs = [
+        ("cranelift", atrium_spv_backend_cranelift::compile(
+            &module, atrium_spv_backend_cranelift::Target::host()).expect("cranelift").object),
+        ("bespoke-x86", atrium_spv_backend_bespoke_x86::compile(
+            &module, atrium_spv_backend_bespoke_x86::Target::host()).expect("bespoke-x86").object),
+    ];
+    let mut table = [0usize; 10];
+    table[72 / 8] = deriv as usize;
+    let mut results = Vec::new();
+    for (name, obj) in &objs {
+        let dir = tempfile::tempdir().unwrap();
+        let o = dir.path().join("s.o");
+        let so = dir.path().join("s.so");
+        std::fs::write(&o, obj).unwrap();
+        assert!(std::process::Command::new("cc").arg("-shared").arg("-o").arg(&so).arg(&o)
+            .status().unwrap().success());
+        let lib = unsafe { libloading::Library::new(&so) }.unwrap();
+        type FsMain = unsafe extern "C" fn(
+            *const u8, *const u8, *const u8, f32, f32, f32, f32, u32, *mut f32, *mut f32, u32, u32,
+        );
+        let f: libloading::Symbol<FsMain> = unsafe { lib.get(b"atrium_fs_main").unwrap() };
+        let mut color = [-1.0f32; 4];
+        let mut depth = 0.0f32;
+        SITES.lock().unwrap().clear();
+        unsafe {
+            f(std::ptr::null(), table.as_ptr() as *const u8, std::ptr::null(), 3.5, 4.25, 0.5, 1.0, 1,
+              color.as_mut_ptr(), &mut depth, 1, 0);
+        }
+        let sites = SITES.lock().unwrap().clone();
+        results.push((name, color.map(f32::to_bits), sites));
+    }
+    assert_eq!(results[0].1, results[1].1, "cranelift vs bespoke-x86");
+    assert_eq!(results[0].2, results[1].2, "helper arguments");
+    let e = 3.5f32 * 4.25;
+    assert_eq!(results[1].1.map(f32::from_bits), [e * 10.0, e * 10.0 + 1000.0, 3.5, 4.25]);
+    assert_eq!(results[1].2.iter().map(|s| s.1).collect::<Vec<_>>(), vec![0, 1]);
+}

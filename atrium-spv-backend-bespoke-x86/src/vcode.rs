@@ -15,7 +15,7 @@
 use std::collections::{HashMap, HashSet};
 
 use atrium_spv_ir::{
-    BlockId, BuiltinKind, FloatKind, Function, Inst, IntKind, Op, ShaderStage, StorageClass, Type,
+    BlockId, BuiltinKind, FloatKind, Function, ImageDimensionality, Inst, IntKind, Op, ShaderStage, StorageClass, Type,
     Value, ValueId, VecElement,
 };
 
@@ -24,6 +24,9 @@ use crate::{unsupported, BackendError};
 /// `atrium_spv_runtime::IMG_TABLE_BARRIER_OFFSET`: the image table's slot
 /// for the workgroup barrier function. Pinned by a unit test.
 pub(crate) const IMG_TABLE_BARRIER_OFFSET: i32 = 64;
+/// `atrium_spv_runtime::IMG_TABLE_DESC_BASE`: the compute image table's
+/// first storage-image descriptor pointer. Pinned by a unit test.
+pub(crate) const IMG_TABLE_DESC_BASE: i32 = 72;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub(crate) struct VReg(pub u32);
@@ -71,6 +74,9 @@ pub(crate) struct Label(pub u32);
 pub(crate) enum Base {
     V(VReg),
     Locals,
+    /// The helper-call area: a 16-byte out buffer at offset 0 that
+    /// runtime helpers read or write, then the argument staging.
+    Helper,
 }
 
 /// `[base + off]`.
@@ -89,7 +95,7 @@ impl Addr {
                 crate::regalloc::Loc::Reg(PReg::G(r)) => Some(r),
                 _ => None,
             },
-            Base::Locals => None,
+            Base::Locals | Base::Helper => None,
         }
     }
 }
@@ -199,6 +205,25 @@ pub(crate) enum FCond {
     UnordGe,
 }
 
+/// One argument of a [`MInst::CallHelper`].
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum CArg {
+    /// A vreg; its class picks the register file.
+    V(VReg),
+    /// A 32-bit immediate (integer register).
+    Imm(i32),
+    /// The 64-bit pointer at `[table + off]` (a descriptor).
+    TableLoad(i32),
+    /// The address of the helper area's out buffer.
+    OutBuf,
+}
+
+/// Bytes of helper area a call with `n` arguments needs: the out buffer,
+/// one staging qword per argument, and one for the function pointer.
+pub(crate) fn helper_area_bytes(n: usize) -> u32 {
+    16 + 8 * (n as u32 + 1)
+}
+
 #[derive(Clone, Debug)]
 pub(crate) enum MInst {
     /// PC-map marker: the next instruction comes from this SPIR-V offset.
@@ -218,6 +243,12 @@ pub(crate) enum MInst {
     /// `call [table + off]`, a runtime helper taking no arguments.
     /// Clobbers every caller-saved register.
     Call { table: VReg, off: i32 },
+    /// `call [table + fn_off]` with SysV arguments, a runtime helper
+    /// (texture sampling, storage images, derivatives). Integer-class
+    /// arguments go to rdi, rsi, rdx, rcx, r8, r9 in order, X arguments to
+    /// xmm0-7. `ret` takes eax or xmm0 by its class. Clobbers every
+    /// caller-saved register.
+    CallHelper { table: VReg, fn_off: i32, args: Vec<CArg>, ret: Option<VReg> },
     /// d = old *addr; *addr = op(old, v), atomically.
     AtomicRmw { op: AtomicOp, d: VReg, addr: Addr, v: VReg },
     /// d = old *addr; if old == expected { *addr = desired }, atomically.
@@ -276,6 +307,14 @@ impl MInst {
             | Jmp(_) | Ret => {}
             PMov { s, .. } => out.push(*s),
             Call { table, .. } => out.push(*table),
+            CallHelper { table, args, .. } => {
+                out.push(*table);
+                for a in args {
+                    if let CArg::V(v) = a {
+                        out.push(*v);
+                    }
+                }
+            }
             AtomicRmw { addr, v, .. } => {
                 if let Base::V(b) = addr.base {
                     out.push(b);
@@ -337,6 +376,7 @@ impl MInst {
         use MInst::*;
         match self {
             Entry { defs } => out.extend(defs.iter().copied()),
+            CallHelper { ret, .. } => out.extend(ret.iter().copied()),
             StackArg { d, .. }
             | PtrAdd { d, .. }
             | PLoad { d, .. }
@@ -371,12 +411,15 @@ impl MInst {
     }
 
     pub fn is_call(&self) -> bool {
-        matches!(self, MInst::Call { .. })
+        matches!(self, MInst::Call { .. } | MInst::CallHelper { .. })
     }
 
     /// Has side effects beyond its result (kept by DCE).
     pub fn has_effects(&self) -> bool {
-        matches!(self, MInst::Call { .. } | MInst::AtomicRmw { .. } | MInst::AtomicCas { .. })
+        matches!(
+            self,
+            MInst::Call { .. } | MInst::CallHelper { .. } | MInst::AtomicRmw { .. } | MInst::AtomicCas { .. }
+        )
     }
 
     pub fn targets(&self, out: &mut Vec<Label>) {
@@ -498,6 +541,8 @@ pub(crate) struct VCode {
     pub num_labels: u32,
     /// Bytes of LocalAlloc storage the frame must provide.
     pub local_bytes: u32,
+    /// Bytes of helper-call area (above the locals), 0 without helpers.
+    pub helper_bytes: u32,
 }
 
 struct Lower<'f> {
@@ -519,6 +564,9 @@ struct Lower<'f> {
     /// Stack-passed arguments and other entry loads, after the copies.
     stack_args: Vec<MInst>,
     local_bytes: u32,
+    helper_bytes: u32,
+    /// Image and sampled-image values: their descriptor (set, binding).
+    images: HashMap<ValueId, (u32, u32)>,
 }
 
 fn elem_class(e: &VecElement) -> Result<Class, BackendError> {
@@ -597,6 +645,8 @@ pub(crate) fn lower(func: &Function) -> Result<VCode, BackendError> {
         arg_copies: Vec::new(),
         stack_args: Vec::new(),
         local_bytes: func.scratch_bytes,
+        helper_bytes: 0,
+        images: HashMap::new(),
     };
     let order = rpo(func)?;
     for &b in &order {
@@ -622,6 +672,7 @@ pub(crate) fn lower(func: &Function) -> Result<VCode, BackendError> {
         hints: l.hints,
         num_labels: l.num_labels,
         local_bytes: l.local_bytes,
+        helper_bytes: l.helper_bytes,
     })
 }
 
@@ -1464,7 +1515,309 @@ impl<'f> Lower<'f> {
             }
             Op::Return => self.code.push(M::Ret),
 
+            Op::ImageHandle { .. }
+            | Op::CombineSampledImage { .. }
+            | Op::Derivative { .. }
+            | Op::ImageSampleImplicitLod { .. }
+            | Op::ImageSampleExplicitLod { .. }
+            | Op::ImageSampleDref { .. }
+            | Op::ImageGather { .. }
+            | Op::ImageFetch { .. }
+            | Op::SampledImageQuerySizeLod { .. }
+            | Op::ImageQuerySize(_)
+            | Op::ImageTexelPointer { .. }
+            | Op::ImageRead { .. }
+            | Op::ImageWrite { .. }
+            | Op::ImageReadLod { .. }
+            | Op::ImageWriteLod { .. } => self.image_op(inst)?,
+
             other => return unsupported(op_name(other)),
+        }
+        Ok(())
+    }
+
+    // ── images and derivatives (phase 7) ──────────────────────────────
+    //
+    // Everything here mirrors Cranelift's lowering: the
+    // same table slots, argument orders and out-buffer layout, so both
+    // backends call the runtime identically.
+
+    fn require_stage(&self, s: ShaderStage, what: &str) -> Result<(), BackendError> {
+        if self.func.stage != s {
+            return unsupported(format!("{what} in {:?}", self.func.stage));
+        }
+        Ok(())
+    }
+
+    /// Descriptor binding of an image or sampled-image value.
+    fn binding_of(&self, v: &Value) -> Result<i32, BackendError> {
+        let (_, b) = self
+            .images
+            .get(&v.id)
+            .copied()
+            .ok_or_else(|| BackendError::Unsupported(format!("image value {:?} is not a descriptor", v.id)))?;
+        i32::try_from(b).ok().filter(|&b| b < 1 << 20).ok_or_else(|| BackendError::Unsupported("binding".into()))
+    }
+
+    /// At least `n` lanes of `v`, all of class `c`.
+    fn lanes_class(&self, v: &Value, c: Class, n: usize, what: &str) -> Result<Vec<VReg>, BackendError> {
+        let l = self.lanes_of(v)?;
+        if l.len() < n || l.iter().any(|&r| self.class_of(r) != c) {
+            return unsupported(format!("{what}: operand shape"));
+        }
+        Ok(l)
+    }
+
+    fn call_helper(&mut self, table: VReg, fn_off: i32, args: Vec<CArg>, ret: Option<VReg>) {
+        self.helper_bytes = self.helper_bytes.max(helper_area_bytes(args.len()));
+        self.code.push(MInst::CallHelper { table, fn_off, args, ret });
+    }
+
+    /// Result lanes read back from the helper out buffer.
+    fn out_buf_result(&mut self, inst: &Inst, n: usize) -> Result<(), BackendError> {
+        let res = Self::result(inst)?;
+        let d = self.define(res)?;
+        if d.len() != n {
+            return unsupported(format!("{} result shape", op_name(&inst.op)));
+        }
+        self.load_lanes(Ptr { base: Base::Helper, off: 0 }, &d);
+        Ok(())
+    }
+
+    fn image_op(&mut self, inst: &Inst) -> Result<(), BackendError> {
+        use MInst as M;
+        let name = op_name(&inst.op);
+        // Fragment descriptors: the uniforms argument, helpers at fixed
+        // slots, binding b's (tex, samp) pointers at 80 + 16b.
+        let frag_desc = |b: i32| 80 + 16 * b;
+        // Compute storage images: ImageDesc* at IMG_TABLE_DESC_BASE + 8b.
+        let comp_desc = |b: i32| IMG_TABLE_DESC_BASE + 8 * b;
+        match &inst.op {
+            Op::ImageHandle { set, binding } => {
+                let res = Self::result(inst)?;
+                self.images.insert(res.id, (*set, *binding));
+            }
+            Op::CombineSampledImage { image, .. } => {
+                let res = Self::result(inst)?;
+                let h = self
+                    .images
+                    .get(&image.id)
+                    .copied()
+                    .ok_or_else(|| BackendError::Unsupported("CombineSampledImage image operand".into()))?;
+                self.images.insert(res.id, h);
+            }
+            Op::Derivative { value, site, axis } => {
+                self.require_stage(ShaderStage::Fragment, &name)?;
+                let v = self.lanes_class(value, Class::X, 1, &name)?;
+                if v.len() != 1 {
+                    return unsupported("Derivative of a vector");
+                }
+                let site = i32::try_from(*site).map_err(|_| BackendError::Unsupported("Derivative site".into()))?;
+                let res = Self::result(inst)?;
+                let d = self.define(res)?;
+                if d.len() != 1 || self.class_of(d[0]) != Class::X {
+                    return unsupported("Derivative result");
+                }
+                let table = self.arg(Arg::FsUniforms);
+                self.call_helper(table, 72, vec![CArg::V(v[0]), CArg::Imm(site), CArg::Imm(*axis as i32)], Some(d[0]));
+            }
+            Op::ImageSampleImplicitLod { sampled_image, coord }
+            | Op::ImageSampleExplicitLod { sampled_image, coord, .. } => {
+                self.require_stage(ShaderStage::Fragment, &name)?;
+                let b = self.binding_of(sampled_image)?;
+                let c = self.lanes_class(coord, Class::X, 2, &name)?;
+                let is_cube = matches!(sampled_image.ty, Type::SampledImage(ImageDimensionality::Cube));
+                let is_array = !is_cube && c.len() >= 3;
+                let lod = match &inst.op {
+                    Op::ImageSampleExplicitLod { lod, .. } => Some(self.lanes_class(lod, Class::X, 1, &name)?[0]),
+                    _ => None,
+                };
+                let fn_off = match (is_cube, is_array, lod.is_some()) {
+                    (true, _, true) => 56,
+                    (_, true, true) => 48,
+                    (true, _, false) => 32,
+                    (_, true, false) => 24,
+                    (_, _, true) => 16,
+                    _ => 0,
+                };
+                let mut args = vec![
+                    CArg::TableLoad(frag_desc(b)),
+                    CArg::TableLoad(frag_desc(b) + 8),
+                    CArg::V(c[0]),
+                    CArg::V(c[1]),
+                ];
+                if is_cube || is_array {
+                    args.push(CArg::V(c[2]));
+                }
+                // 2D + lod: the lod takes the third slot.
+                args.extend(lod.map(CArg::V));
+                args.push(CArg::OutBuf);
+                let table = self.arg(Arg::FsUniforms);
+                self.call_helper(table, fn_off, args, None);
+                self.out_buf_result(inst, 4)?;
+            }
+            Op::ImageSampleDref { sampled_image, coord, dref } => {
+                self.require_stage(ShaderStage::Fragment, &name)?;
+                let b = self.binding_of(sampled_image)?;
+                let c = self.lanes_class(coord, Class::X, 2, &name)?;
+                let r = self.lanes_class(dref, Class::X, 1, &name)?;
+                let args = vec![
+                    CArg::TableLoad(frag_desc(b)),
+                    CArg::TableLoad(frag_desc(b) + 8),
+                    CArg::V(c[0]),
+                    CArg::V(c[1]),
+                    CArg::V(r[0]),
+                    CArg::OutBuf,
+                ];
+                let table = self.arg(Arg::FsUniforms);
+                self.call_helper(table, 64, args, None);
+                self.out_buf_result(inst, 1)?;
+            }
+            Op::ImageGather { sampled_image, coord, component } => {
+                self.require_stage(ShaderStage::Fragment, &name)?;
+                let b = self.binding_of(sampled_image)?;
+                let c = self.lanes_class(coord, Class::X, 2, &name)?;
+                let k = self.lanes_class(component, Class::G, 1, &name)?;
+                let args = vec![
+                    CArg::TableLoad(frag_desc(b)),
+                    CArg::TableLoad(frag_desc(b) + 8),
+                    CArg::V(c[0]),
+                    CArg::V(c[1]),
+                    CArg::V(k[0]),
+                    CArg::OutBuf,
+                ];
+                let table = self.arg(Arg::FsUniforms);
+                self.call_helper(table, 40, args, None);
+                self.out_buf_result(inst, 4)?;
+            }
+            Op::ImageFetch { image, coord, lod } => {
+                self.require_stage(ShaderStage::Fragment, &name)?;
+                let b = self.binding_of(image)?;
+                let c = self.lanes_class(coord, Class::G, 2, &name)?;
+                let lod = match lod {
+                    Some(l) => CArg::V(self.lanes_class(l, Class::G, 1, &name)?[0]),
+                    None => CArg::Imm(0),
+                };
+                let args = vec![CArg::TableLoad(frag_desc(b)), CArg::V(c[0]), CArg::V(c[1]), lod, CArg::OutBuf];
+                let table = self.arg(Arg::FsUniforms);
+                self.call_helper(table, 8, args, None);
+                self.out_buf_result(inst, 4)?;
+            }
+            Op::SampledImageQuerySizeLod { image, .. } => {
+                self.require_stage(ShaderStage::Fragment, &name)?;
+                let b = self.binding_of(image)?;
+                let res = Self::result(inst)?;
+                // Cranelift fills only width and height; a vec3 result
+                // would leave a lane undefined there.
+                if !matches!(res.ty, Type::Vec2(_)) {
+                    return unsupported("SampledImageQuerySizeLod result type");
+                }
+                let d = self.define(res)?;
+                let table = self.arg(Arg::FsUniforms);
+                let desc = self.vreg(Class::P);
+                self.code.push(M::PLoad { d: desc, addr: Addr { base: Base::V(table), off: frag_desc(b) } });
+                for (i, &v) in d.iter().enumerate() {
+                    self.code.push(M::GLoad { d: v, addr: Addr { base: Base::V(desc), off: 8 + 4 * i as i32 } });
+                }
+            }
+            Op::ImageQuerySize(image) => {
+                self.require_stage(ShaderStage::Compute, &name)?;
+                let b = self.binding_of(image)?;
+                let res = Self::result(inst)?;
+                if !matches!(res.ty, Type::Vec2(_) | Type::Vec3(_)) {
+                    return unsupported("ImageQuerySize result type");
+                }
+                let d = self.define(res)?;
+                let table = self.arg(Arg::CsUniforms);
+                let desc = self.vreg(Class::P);
+                self.code.push(M::PLoad { d: desc, addr: Addr { base: Base::V(table), off: comp_desc(b) } });
+                for (&v, off) in d.iter().zip([8, 12, 24]) {
+                    self.code.push(M::GLoad { d: v, addr: Addr { base: Base::V(desc), off } });
+                }
+            }
+            Op::ImageTexelPointer { image, coord } => {
+                self.require_stage(ShaderStage::Compute, &name)?;
+                let b = self.binding_of(image)?;
+                let c = self.lanes_class(coord, Class::G, 2, &name)?;
+                let res = Self::result(inst)?;
+                let table = self.arg(Arg::CsUniforms);
+                let desc = self.vreg(Class::P);
+                self.code.push(M::PLoad { d: desc, addr: Addr { base: Base::V(table), off: comp_desc(b) } });
+                let mut addr = self.vreg(Class::P);
+                self.code.push(M::PLoad { d: addr, addr: Addr { base: Base::V(desc), off: 0 } });
+                // data + z * slice_bytes (@28) + y * stride_bytes (@16) + 4x,
+                // the products in 32 bits as Cranelift does.
+                let mut add = |l: &mut Self, idx: VReg, field: Option<i32>| {
+                    let idx = match field {
+                        Some(off) => {
+                            let f = l.vreg(Class::G);
+                            l.code.push(M::GLoad { d: f, addr: Addr { base: Base::V(desc), off } });
+                            let p = l.vreg(Class::G);
+                            l.code.push(M::GBin { op: GOp::Mul, d: p, a: idx, b: f });
+                            p
+                        }
+                        None => idx,
+                    };
+                    let d = l.vreg(Class::P);
+                    l.code.push(M::PtrAdd { d, base: Base::V(addr), idx, stride: if field.is_some() { 1 } else { 4 } });
+                    addr = d;
+                };
+                if c.len() >= 3 {
+                    add(self, c[2], Some(28));
+                }
+                add(self, c[1], Some(16));
+                add(self, c[0], None);
+                self.ptrs.insert(res.id, Ptr { base: Base::V(addr), off: 0 });
+            }
+            Op::ImageRead { image, coord }
+            | Op::ImageWrite { image, coord, .. }
+            | Op::ImageReadLod { image, coord, .. }
+            | Op::ImageWriteLod { image, coord, .. } => {
+                self.require_stage(ShaderStage::Compute, &name)?;
+                let b = self.binding_of(image)?;
+                let c = self.lanes_class(coord, Class::G, 2, &name)?;
+                let is_3d = c.len() >= 3;
+                let (texel, lod) = match &inst.op {
+                    Op::ImageWrite { texel, .. } => (Some(texel), None),
+                    Op::ImageWriteLod { texel, lod, .. } => (Some(texel), Some(lod)),
+                    Op::ImageReadLod { lod, .. } => (None, Some(lod)),
+                    _ => (None, None),
+                };
+                let fn_off = if lod.is_some() { 32 } else { 0 }
+                    + match (is_3d, texel.is_some()) {
+                        (false, false) => 0,
+                        (false, true) => 8,
+                        (true, false) => 16,
+                        (true, true) => 24,
+                    };
+                let mut args = vec![CArg::TableLoad(comp_desc(b)), CArg::V(c[0]), CArg::V(c[1])];
+                if is_3d {
+                    args.push(CArg::V(c[2]));
+                }
+                if let Some(l) = lod {
+                    args.push(CArg::V(self.lanes_class(l, Class::G, 1, &name)?[0]));
+                }
+                args.push(CArg::OutBuf);
+                if let Some(t) = texel {
+                    let t = self.lanes_of(t)?;
+                    if t.len() < 4 {
+                        return unsupported("ImageWrite texel must be a vec4");
+                    }
+                    for (i, &s) in t.iter().take(4).enumerate() {
+                        let addr = Addr { base: Base::Helper, off: 4 * i as i32 };
+                        self.code.push(match self.class_of(s) {
+                            Class::X => M::XStore { addr, s },
+                            _ => M::GStore { addr, s },
+                        });
+                    }
+                }
+                let table = self.arg(Arg::CsUniforms);
+                self.call_helper(table, fn_off, args, None);
+                if texel.is_none() {
+                    self.out_buf_result(inst, 4)?;
+                }
+            }
+            _ => unreachable!(),
         }
         Ok(())
     }

@@ -28,15 +28,24 @@
 //!    slots over the XMM and GPR files.
 //! 3. [`emit`]: VCode + allocation → machine code via iced-x86.
 //!
-//! # Supported so far (phases 1-3)
+//! # Supported so far (phases 1-7)
 //!
-//! Fragment shaders with any control flow (branches, switch, loops, phis):
+//! Fragment, vertex and compute shaders with any control flow (branches,
+//! switch, loops, phis):
 //! f32 math (+ - * /, fma, neg, abs, min, max, sqrt, floor/ceil/trunc, dot),
 //! i32/u32 math (+ - *, div/mod with safe zero and overflow cases, bitwise,
 //! shifts, neg, not, clz), integer and float compares, select, int↔float
 //! conversions (saturating), bitcasts, vector construct/extract/insert/
-//! shuffle, loads from varyings, uniforms and push constants, `gl_FragCoord`,
-//! and stores to the colour output.
+//! shuffle, matrix × vector, every builtin and variable routing the
+//! Cranelift backend has, local arrays and dynamic indexing, SSBOs,
+//! workgroup memory, atomics and barriers, and the image ops: sampling
+//! (implicit/explicit lod, array, cube, dref), gather, fetch, size queries,
+//! storage-image read/write and texel pointers, and derivatives. Image ops
+//! and derivatives are calls to the runtime's helpers through the
+//! uniforms table, staged so arguments never clobber each other.
+//!
+//! Not yet: PackHalf2x16 (Cranelift's NaN behaviour), f64, and the
+//! fragment span entry (phase 8).
 
 mod emit;
 mod regalloc;
@@ -225,5 +234,6 @@ mod tests {
             crate::vcode::IMG_TABLE_BARRIER_OFFSET as usize,
             atrium_spv_runtime::IMG_TABLE_BARRIER_OFFSET
         );
+        assert_eq!(crate::vcode::IMG_TABLE_DESC_BASE as usize, atrium_spv_runtime::IMG_TABLE_DESC_BASE);
     }
 }

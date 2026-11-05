@@ -15,7 +15,7 @@ use iced_x86::BlockEncoderOptions;
 
 use crate::regalloc::{Allocation, Loc};
 use crate::vcode::{
-    gpr, Addr, AtomicOp, Base, DivKind, FCond, GOp, GUnOp, ICond, Label, MInst, PReg, ShiftOp, VCode, VReg, XOp,
+    gpr, Addr, AtomicOp, Base, CArg, Class, DivKind, FCond, GOp, GUnOp, ICond, Label, MInst, PReg, ShiftOp, VCode, VReg, XOp,
     XUnOp,
 };
 use crate::BackendError;
@@ -77,9 +77,12 @@ macro_rules! x3 {
 struct Emit<'a> {
     a: CodeAssembler,
     al: &'a Allocation,
+    classes: &'a [Class],
     frame: i32,
     /// rsp offset of the LocalAlloc area.
     locals: i32,
+    /// rsp offset of the helper-call area.
+    helper: i32,
     saved: Vec<u8>,
     labels: HashMap<Label, CodeLabel>,
 }
@@ -98,6 +101,8 @@ pub(crate) fn emit(vc: &VCode, alloc: &Allocation) -> Result<(Vec<u8>, Vec<(u32,
     // 16-aligned after the frame.
     let locals = 16 * alloc.num_slots as i32;
     let local_bytes = vc.local_bytes.div_ceil(16) as i32 * 16;
+    let helper = locals + local_bytes;
+    let local_bytes = local_bytes + vc.helper_bytes.div_ceil(16) as i32 * 16;
     let has_calls = vc.insts.iter().any(|i| i.is_call());
     // A call needs rsp 16-aligned, so a function with calls always
     // aligns; a leaf with no frame skips it.
@@ -113,8 +118,10 @@ pub(crate) fn emit(vc: &VCode, alloc: &Allocation) -> Result<(Vec<u8>, Vec<(u32,
     let mut e = Emit {
         a: CodeAssembler::new(64).map_err(enc)?,
         al: alloc,
+        classes: &vc.classes,
         frame,
         locals,
+        helper,
         saved,
         labels: HashMap::new(),
     };
@@ -160,6 +167,10 @@ fn next_label(insts: &[MInst], mut i: usize) -> Option<Label> {
 }
 
 impl<'a> Emit<'a> {
+    fn is_x_vreg(&self, v: VReg) -> bool {
+        self.classes[v.0 as usize] == Class::X
+    }
+
     fn loc(&self, v: VReg) -> Loc {
         self.al.locs[v.0 as usize]
     }
@@ -219,6 +230,7 @@ impl<'a> Emit<'a> {
         match b {
             Base::V(v) => Ok((self.g64(v)?, 0)),
             Base::Locals => Ok((rsp, self.locals)),
+            Base::Helper => Ok((rsp, self.helper)),
         }
     }
 
@@ -364,6 +376,7 @@ impl<'a> Emit<'a> {
                 self.a.mov(rax, qword_ptr(t + *off)).map_err(enc)?;
                 self.a.call(rax).map_err(enc)?;
             }
+            M::CallHelper { table, fn_off, args, ret } => self.call_helper(*table, *fn_off, args, *ret)?,
             M::AtomicStore { addr, s } => {
                 let m = self.mem(*addr)?;
                 g2!(self.a, mov, eax, self.g(*s))?;
@@ -736,6 +749,71 @@ impl<'a> Emit<'a> {
 
     /// d = old *addr; *addr = op(old, v). Add and exchange have single
     /// instructions; the rest are a `lock cmpxchg` loop.
+    /// A helper call. Every argument is first staged in the helper area,
+    /// using only scratch registers, and then loaded into its ABI
+    /// register, so no argument register is overwritten while another
+    /// argument still needs it. The function pointer goes last, in rax.
+    fn call_helper(&mut self, table: VReg, fn_off: i32, args: &[CArg], ret: Option<VReg>) -> Result<(), BackendError> {
+        const INT_ARGS: [u8; 6] = [gpr::RDI, gpr::RSI, gpr::RDX, gpr::RCX, gpr::R8, gpr::R9];
+        let helper = self.helper;
+        let stage = move |k: usize| qword_ptr(rsp + (helper + 16 + 8 * k as i32));
+        let fn_slot = stage(args.len());
+        for (k, a) in args.iter().enumerate() {
+            match *a {
+                CArg::V(v) => match self.loc(v) {
+                    Loc::Reg(PReg::G(r)) => self.a.mov(stage(k), G64[r as usize]).map_err(enc)?,
+                    Loc::Reg(PReg::X(r)) => self.a.vmovss(dword_ptr(rsp + (helper + 16 + 8 * k as i32)), XMM[r as usize]).map_err(enc)?,
+                    Loc::Slot(sl) => {
+                        // G values keep their upper half zero in the slot
+                        // too, so a 64-bit copy is right for every class.
+                        self.a.mov(rax, qword_ptr(rsp + 16 * sl as i32)).map_err(enc)?;
+                        self.a.mov(stage(k), rax).map_err(enc)?;
+                    }
+                },
+                CArg::TableLoad(off) => {
+                    let t = self.g64(table)?;
+                    self.a.mov(rax, qword_ptr(t + off)).map_err(enc)?;
+                    self.a.mov(stage(k), rax).map_err(enc)?;
+                }
+                CArg::Imm(_) | CArg::OutBuf => {}
+            }
+        }
+        let t = self.g64(table)?;
+        self.a.mov(rax, qword_ptr(t + fn_off)).map_err(enc)?;
+        self.a.mov(fn_slot, rax).map_err(enc)?;
+        let (mut ni, mut nx) = (0usize, 0usize);
+        for (k, a) in args.iter().enumerate() {
+            if matches!(*a, CArg::V(v) if self.is_x_vreg(v)) {
+                if nx == 8 {
+                    return Err(BackendError::Unsupported("helper call with more than 8 float arguments".into()));
+                }
+                self.a.vmovss(XMM[nx], dword_ptr(rsp + (helper + 16 + 8 * k as i32))).map_err(enc)?;
+                nx += 1;
+                continue;
+            }
+            let Some(&n) = INT_ARGS.get(ni) else {
+                return Err(BackendError::Unsupported("helper call with more than 6 integer arguments".into()));
+            };
+            ni += 1;
+            let r = G64[n as usize];
+            match *a {
+                CArg::Imm(imm) => self.a.mov(G32[n as usize], imm).map_err(enc)?,
+                CArg::OutBuf => self.a.lea(r, qword_ptr(rsp + self.helper)).map_err(enc)?,
+                _ => self.a.mov(r, stage(k)).map_err(enc)?,
+            }
+        }
+        self.a.mov(rax, fn_slot).map_err(enc)?;
+        self.a.call(rax).map_err(enc)?;
+        if let Some(d) = ret {
+            if self.is_x_vreg(d) {
+                self.x_fin(d, xmm0)?;
+            } else {
+                self.g_fin(d, eax)?;
+            }
+        }
+        Ok(())
+    }
+
     fn atomic_rmw(&mut self, op: AtomicOp, d: VReg, addr: Addr, v: VReg) -> Result<(), BackendError> {
         let m = self.mem(addr)?;
         let gv = self.g(v);
