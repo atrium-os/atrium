@@ -584,6 +584,79 @@ produce. That artifact then reaches everyone who shares the store.
 **Rating:** low on a single-user machine, **high** the day stores are shared. So this
 must be decided before sharing ships, not after.
 
+**Measured: reproducibility on one machine (2026-11-05).** This is §5 q3's experiment,
+the half one machine can run.
+- *Setup.* Every page of both corpora (123: batch 1's 73 served pages and batch 2's 50),
+  exploring, offline: `PRERENDER_OFFLINE=1` answers every fetch from the fetch caches
+  and fails a miss. Each run is a separate driver process, with one process per page.
+  The "artifact" compared is the recording (the published JSON: document, transitions,
+  stylesheets, image sizes) and its blobs. navigator-normalize and nsg-flag ran over
+  each run as well.
+- *Before pinning,* main at 493f5d68. Two runs: 123/123 recordings, blobs, normalized
+  documents and flag rows identical. The same holds for the binary before §5.4.5.6d.
+  A third run perturbed what a second machine would vary:
+  `TZ=Pacific/Chatham LANG=tr_TR.UTF-8 LC_ALL=tr_TR.UTF-8`, another working directory,
+  both corpora converting at once, and six busy loops plus a clean cargo build competing
+  for the CPU. It was identical on all 123 too.
+- *After pinning:* the same three runs, 123/123 each. Pinned against unpinned:
+  123/123 identical. The corpus never reached the paths pinned below on this machine.
+- *The binary.* A clean build into an empty target directory reproduced the binary's
+  hash (`e31a5b17…`). That is the same machine and toolchain, so it says nothing yet
+  about another.
+- *Not a source here:*
+  - The coverage table's per-document exploration time (`micros`). It is observation
+    only, never in an artifact, and the only field that differed between runs.
+  - The report's wall times.
+- *Sources, and their state:*
+  - **Clock.** Pinned before: `Date` is `CONVERSION_EPOCH_MS`; `performance.now` is
+    virtual time.
+  - **`Math.random`, `crypto`.** Pinned before: one stream, seeded from the document URL.
+  - **Timer order.** Pinned before: virtual time, ties broken by scheduling sequence.
+  - **Timezone.** Pinned before (UTC host hook). The `TZ` run confirms it.
+  - **Locale.** Pinned before, for the Intl constructors and the `toLocale*` methods (the
+    document's `lang`, else en-US). *Three leaks pinned now*, each reaching Boa's
+    `DefaultLocale()`, which is the host's (`sys_locale`; on macOS the system setting,
+    so `LANG` cannot show it):
+    - an unsupported locale fell back to the host's. On this en_IN Mac,
+      `<html lang="ach">` formatted 1234567.5 as `12,34,567.5`. It now falls back to
+      en-US.
+    - `toLocaleUpperCase()` and `toLocaleLowerCase()` with no argument used the host's
+      case rules (`i` → `İ` on a Turkish machine). They now use the document's.
+    - `Array` and `TypedArray` `toLocaleString` took the host's list separator. They now
+      join with `,`, as Chrome does.
+
+    Tests in `navigator-prerender/tests/platform.rs`; all three fail on this machine
+    without the pins.
+  - **Hash-map iteration.** Rust's `HashMap` is seeded per process. One map was
+    iterated where order could matter: native listeners numbered `o1`, `o2`, … in
+    iteration order. The numbering reaches no output (keys only group), and seven
+    separately seeded runs were identical. The listener maps are now `BTreeMap`, so it
+    stays that way by construction.
+  - **Thread scheduling.** A conversion is one thread, and the relay answers fetches
+    synchronously. The contention run was identical.
+  - **ICU data.** Compiled into the binary, at the versions `Cargo.lock` pins.
+  - **Fonts.** The converter reads none: layout queries get fixed answers. The fonts the
+    normalizer and renderer use are the repo's own set, which is an input of theirs, not
+    of the artifact.
+  - **Build.** The converter's hash is an input like the rest, and a clean build
+    reproduced it here.
+  - *Open:*
+    - The 180 s wall-clock deadline. A page near it would convert differently under
+      load; the slowest page took about 24 s.
+    - Transcendental `Math` functions (`sin`, `exp`, `pow`), which go to the platform
+      libm and can differ in the last bit across OS or CPU. Pinning them means a portable
+      libm. Not cheap; not seen in an artifact.
+    - The fetched inputs themselves. Offline they are fixed; online, the live site is the
+      dominant source, and reproduce-to-share has to compare conversions of the *same
+      recorded source bytes*, as above.
+- *Match rate:* 123/123 (100%) before pinning and after, same machine, including the
+  perturbed run. The second-machine half of q3 is not yet run. It needs another host
+  (another OS or CPU, another system locale), and the pins above are what made its
+  expected answer 100% rather than "whatever that host's locale is".
+- Raw data, outside the repo, at `~/src/navigator-corpus/eid-2026-11-05/`: the
+  `before-*`, `after-*`, `stress-1`, `pinned-*` and `pinned-stress` runs, `bin/`, and
+  the scripts.
+
 ### 2.7 Data bindings and request templates (§5.4.5, proposed)
 
 Once §5.4.5 lands, a document carries *declared* requests that the backend replays at view
@@ -760,6 +833,14 @@ one element that needs it.
    - Reproduce-to-share admits only what matches. A page that doesn't reproduce stays in
      the user's own domain, which is the safe failure.
    - The match rate is the number that says whether sharing is worth building at all.
+   - *Measured 2026-11-05 (§2.6), one machine:* 123/123 pages of both corpora reproduce
+     byte for byte (recording, blobs, normalized output, flag rows). That holds across
+     runs, under CPU contention, and with timezone, locale environment and working
+     directory changed. It held before pinning and after. Three host-locale leaks were
+     found by reading where the engine consults the host; one machine cannot show them.
+     All three are now pinned to the document's locale or en-US, with tests. Also pinned:
+     listener-map iteration order. Open: the deadline under load, platform libm, and the
+     second machine itself.
 4. **Should Fresco ever parse a font?** *Recommend: only the shipped, signed font set,
    never a web font.* Fresco needs fonts for its own UI, and those are trusted data (§7.2).
    Web fonts reach it as glyph outlines, produced in the jail from the sanitised sfnt. The

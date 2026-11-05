@@ -73,8 +73,13 @@ thread_local! {
     ///
     /// Holds JsValues, so like NODE_CACHE it must be cleared on the way in
     /// AND on the way out: engine objects must not outlive the engine.
-    static ELISTENERS: RefCell<HashMap<Handle, Vec<(String, JsValue)>>> =
-        RefCell::new(HashMap::new());
+    // ★ BTreeMap, not HashMap: `element_listeners` iterates it and numbers
+    // native handlers ("o1", "o2", …) in that order. A HashMap's order is
+    // seeded per process; the numbering reaches no output today (keys only
+    // group), and ordering it by handle keeps that true by construction
+    // rather than by audit (threat model §2.6).
+    static ELISTENERS: RefCell<BTreeMap<Handle, Vec<(String, JsValue)>>> =
+        RefCell::new(BTreeMap::new());
     /// ★ One CSSStyleSheet object per owner element, for the life of a run.
     ///
     /// `document.styleSheets` is a live getter, so it rebuilds the list on
@@ -88,8 +93,8 @@ thread_local! {
     /// `el.onclick = fn` — the handler SLOT, separate from addEventListener
     /// because assigning replaces where adding appends, and reading back an
     /// unset one must give null rather than undefined.
-    static ONHANDLERS: RefCell<HashMap<(Handle, String), JsValue>> =
-        RefCell::new(HashMap::new());
+    static ONHANDLERS: RefCell<BTreeMap<(Handle, String), JsValue>> =
+        RefCell::new(BTreeMap::new());
     /// ★ RANDOMNESS IS SEEDED FROM THE DOCUMENT, NOT THE MACHINE.
     ///
     /// A converter whose output feeds a content-addressed store must produce
@@ -4527,12 +4532,26 @@ const GLOBALS: &str = r#"
     } catch (e) {}
     globalThis.__docLocale = __docLocale;
 
+    // ★★ AND A LOCALE THE ENGINE HAS NO DATA FOR FALLS BACK TO en-US, NOT TO
+    // THE HOST. ECMA-402 resolves an unsupported request to DefaultLocale(),
+    // and boa's is the machine's (sys_locale): on the converter's own Mac,
+    // `<html lang="ach">` formatted 1234567.5 as "12,34,567.5" — en-IN lakh
+    // grouping, the converting machine's locale written into the artifact
+    // (threat model §2.6: a second machine would convert it differently).
+    // Checked against the service's own supportedLocalesOf; a malformed tag
+    // is passed through, so the constructor still throws as the spec says.
+    function __pinLocales(svc, locales) {
+      var l = locales === undefined ? __docLocale : locales;
+      try { if (svc && svc.supportedLocalesOf(l).length === 0) return 'en-US'; } catch (e) {}
+      return l;
+    }
+
     ['NumberFormat', 'DateTimeFormat', 'Collator', 'PluralRules',
      'ListFormat', 'Segmenter', 'DisplayNames'].forEach(function (n) {
       var Orig = Intl[n];
       if (typeof Orig !== 'function') return;
       function Wrapped(locales, options) {
-        return new Orig(locales === undefined ? __docLocale : locales, options);
+        return new Orig(__pinLocales(Orig, locales), options);
       }
       Wrapped.prototype = Orig.prototype;
       if (typeof Orig.supportedLocalesOf === 'function') {
@@ -4592,20 +4611,44 @@ const GLOBALS: &str = r#"
       Intl.RelativeTimeFormat = RelativeTimeFormat;
     }
 
-    // The prototype methods take their locale the same way.
-    function defaulted(proto, name) {
+    // The prototype methods take their locale the same way, pinned against
+    // the service that backs them (captured before the wrapping above, so
+    // its supportedLocalesOf is the engine's own).
+    var __svc = { nf: Intl.NumberFormat, dtf: Intl.DateTimeFormat, col: Intl.Collator };
+    function defaulted(proto, name, svc) {
       var orig = proto && proto[name];
       if (typeof orig !== 'function') return;
       proto[name] = function (locales, options) {
-        return orig.call(this, locales === undefined ? __docLocale : locales, options);
+        return orig.call(this, __pinLocales(svc, locales), options);
       };
     }
-    defaulted(Number.prototype, 'toLocaleString');
-    defaulted(Date.prototype, 'toLocaleString');
-    defaulted(Date.prototype, 'toLocaleDateString');
-    defaulted(Date.prototype, 'toLocaleTimeString');
-    defaulted(String.prototype, 'localeCompare');
-    defaulted(Array.prototype, 'toLocaleString');
+    defaulted(Number.prototype, 'toLocaleString', __svc.nf);
+    defaulted(Date.prototype, 'toLocaleString', __svc.dtf);
+    defaulted(Date.prototype, 'toLocaleDateString', __svc.dtf);
+    defaulted(Date.prototype, 'toLocaleTimeString', __svc.dtf);
+    defaulted(String.prototype, 'localeCompare', __svc.col);
+    // ★ Case mapping with no locale used the HOST's (DefaultLocale again): a
+    // Turkish machine upper-cases "i" to "İ". No service to check against: a
+    // locale without special case rules maps as the root does, never as the host.
+    defaulted(String.prototype, 'toLocaleUpperCase', null);
+    defaulted(String.prototype, 'toLocaleLowerCase', null);
+    // ★ Array and TypedArray toLocaleString took their SEPARATOR from the
+    // host locale whatever was passed ("1,234.5, 2" here, with the space of
+    // this machine's list pattern). Chrome joins with ",", and so does this;
+    // each element still formats with the caller's (or the document's) locale.
+    function __listToLocale(locales, options) {
+      var o = Object(this), n = o.length >>> 0, parts = [];
+      for (var i = 0; i < n; i++) {
+        var e = o[i];
+        parts.push(e === undefined || e === null ? '' : String(Object(e).toLocaleString(locales, options)));
+      }
+      return parts.join(',');
+    }
+    Array.prototype.toLocaleString = __listToLocale;
+    try {
+      var __ta = Object.getPrototypeOf(Int8Array.prototype);
+      if (__ta && __ta.toLocaleString) __ta.toLocaleString = __listToLocale;
+    } catch (e) {}
   }
 
   // ── Event ───────────────────────────────────────────────────────────

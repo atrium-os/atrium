@@ -222,3 +222,50 @@ fn counters_stay_writable_while_functions_are_sealed() {
     </script></body></html>"#);
     assert_eq!(r(&c), "function|function|999");
 }
+
+/// ★★ THE CONVERTING MACHINE'S LOCALE MUST NOT REACH THE ARTIFACT (threat
+/// model §2.6, 5 q3). Three ECMA-402 paths fell back to boa's DefaultLocale(),
+/// which is the host's (sys_locale). On the en_IN Mac these were found on,
+/// an unsupported `lang` formatted with lakh grouping ("12,34,567.5"), so the
+/// assertions below FAIL there without the pins; on an en-US host the first
+/// one would pass by luck, which is exactly why it is pinned rather than left.
+#[test]
+fn an_unsupported_locale_falls_back_to_en_us_not_to_the_host() {
+    let c = run(r#"<html lang="ach"><body><script>
+      document.body.setAttribute('data-r', [
+        new Intl.NumberFormat().format(1234567.5),
+        new Intl.NumberFormat('ach').resolvedOptions().locale,
+        (1234567.5).toLocaleString(),
+        new Intl.DateTimeFormat('ach', { timeZone: 'UTC' }).resolvedOptions().locale,
+      ].join('|'));
+    </script></body></html>"#);
+    assert_eq!(r(&c), "1,234,567.5|en-US|1,234,567.5|en-US");
+}
+
+/// Case mapping without a locale used the host's: a Turkish machine would
+/// upper-case "i" to "İ" on every page. It now uses the document's.
+#[test]
+fn locale_case_mapping_uses_the_document_locale() {
+    let tr = run(r#"<html lang="tr"><body><script>
+      document.body.setAttribute('data-r', 'i'.toLocaleUpperCase() + 'I'.toLocaleLowerCase());
+    </script></body></html>"#);
+    assert_eq!(r(&tr), "İı");
+    let en = run(r#"<html lang="en"><body><script>
+      document.body.setAttribute('data-r', 'i'.toLocaleUpperCase() + 'I'.toLocaleLowerCase() + 'i'.toLocaleUpperCase('tr'));
+    </script></body></html>"#);
+    assert_eq!(r(&en), "Iiİ");
+}
+
+/// Array/TypedArray toLocaleString took the host's list separator whatever
+/// locale was passed. Chrome joins with ","; elements format with the locale.
+#[test]
+fn array_to_locale_string_joins_like_chrome() {
+    let c = run(r#"<html lang="de"><body><script>
+      document.body.setAttribute('data-r', [
+        [1234.5, 2, null].toLocaleString(),
+        [1234.5, 2].toLocaleString('en-US'),
+        new Float64Array([1.5, 2]).toLocaleString('en-US'),
+      ].join('|'));
+    </script></body></html>"#);
+    assert_eq!(r(&c), "1.234,5,2,|1,234.5,2|1.5,2");
+}
