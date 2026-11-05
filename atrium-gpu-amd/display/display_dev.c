@@ -823,6 +823,32 @@ display_lease_check(struct atrium_amd_softc *sc, struct ucred *cr)
 }
 
 /*
+ * dev.atrium_gpu_amd_display.N.sim_plug: plug a simulated monitor (the
+ * CONFIG plug_mode codes; -1 unplugs) from outside the lease. A real cable
+ * is plugged by someone other than the display's holder, so the hotplug
+ * path is tested the same way: frescod keeps the display open while the
+ * host swaps the monitor under it. Host root only (no CTLFLAG_PRISON), and
+ * it drives the simulator's SIM registers, which silicon does not have.
+ */
+static int
+display_sim_plug_sysctl(SYSCTL_HANDLER_ARGS)
+{
+	struct atrium_amd_softc *sc = arg1;
+	int mode = 0, error;
+
+	error = sysctl_handle_int(oidp, &mode, 0, req);
+	if (error != 0 || req->newptr == NULL)
+		return (error);
+	if (mode == -1)
+		amd_mmio_write32(sc, regDISP_CFG_UNPLUG, 1);
+	else if (mode >= 0 && mode <= 3)
+		amd_mmio_write32(sc, regDISP_CFG_PLUG_MODE, mode);
+	else
+		return (EINVAL);
+	return (0);
+}
+
+/*
  * dev.atrium_gpu_amd_display.N.lease: "<jail name>:<uid>", or "" for none.
  * Root on the host only: the sysctl is not CTLFLAG_PRISON, so a jailed
  * process cannot write it whatever its uid. Changing the lease does not evict
@@ -1289,6 +1315,11 @@ atrium_display_attach(device_t dev)
 	    CTLTYPE_STRING | CTLFLAG_RW | CTLFLAG_MPSAFE, sc, 0,
 	    display_lease_sysctl, "A",
 	    "jail:uid that may open the display; empty = host only");
+	SYSCTL_ADD_PROC(device_get_sysctl_ctx(dev),
+	    SYSCTL_CHILDREN(device_get_sysctl_tree(dev)), OID_AUTO, "sim_plug",
+	    CTLTYPE_INT | CTLFLAG_WR | CTLFLAG_MPSAFE, sc, 0,
+	    display_sim_plug_sysctl, "I",
+	    "simulator: plug monitor 0 VGA, 1 1080p, 2 4K, 3 desktop; -1 unplug");
 
 	/*
 	 * Register our IH cause handler so the base ISR routes DCN vblank interrupts
