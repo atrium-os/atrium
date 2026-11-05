@@ -175,6 +175,10 @@
 #define regDISP_CFG_UNPLUG	0x3009c	/* w1: unplug the simulated monitor (test) */
 #define regDISP_PIXEL_CLOCK_KHZ	0x300a0	/* w/r: pixel clock for the next mode set (DCCG not modelled) */
 #define regDISP_FRAME_PERIOD_NS	0x300a4	/* r: the lit mode's frame period, ns */
+#define regDISP_SINK_EOTF	0x300ac	/* r: test: the monitor's EOTF from the infoframes it gets */
+#define regDISP_SINK_COLORIMETRY 0x300b0 /* r: test: 1 = BT.2020 */
+#define regDISP_SINK_CONTENT_LIGHT 0x300b4 /* r: test: MaxCLL 15:0, MaxFALL 31:16 */
+#define regDISP_SINK_BPC	0x300b8	/* r: test: bits per colour of the surface on screen */
 
 /*
  * The real DCN 4 (DCN 4.0.1, RDNA4) display registers the scanout path uses,
@@ -212,8 +216,20 @@
 #define regHPD0_DC_HPD_CONTROL			regDCN2(0x175c)
 #define regOTG0_OTG_VERTICAL_INTERRUPT0_POSITION	regDCN2(0x1b5f)
 #define regOTG0_OTG_VERTICAL_INTERRUPT0_CONTROL	regDCN2(0x1b60)
+#define regVPG0_VPG_GENERIC_PACKET_ACCESS_CTRL	regDCN2(0x2068)
+#define regVPG0_VPG_GENERIC_PACKET_DATA		regDCN2(0x2069)
+#define regVPG0_VPG_GSP_FRAME_UPDATE_CTRL	regDCN2(0x206a)
+#define regDIG0_HDMI_GENERIC_PACKET_CONTROL0	regDCN2(0x20a5)
 
 #define DCN_PIXEL_FORMAT_ARGB8888	8u	/* SURFACE_CONFIG.SURFACE_PIXEL_FORMAT */
+#define DCN_PIXEL_FORMAT_ARGB2101010	10u
+/* VPG generic packets (infoframes): GENERIC_DATA_INDEX = 9 x n, then 9
+ * dwords to GENERIC_PACKET_DATA (header, PB0..PB31), then FRAME_UPDATE bit
+ * n; DIG0 HDMI_GENERICn_SEND (bit 4n) + _CONT (4n+1) send it every frame.
+ * Packet layout as the Linux display code writes it (gpl_fact, medium). */
+#define DCN_VPG_PACKET_DWORDS		9u
+#define DCN_VPG_GENERICS		8u
+#define DCN_HDMI_GENERIC_SEND_CONT(n)	(3u << (4 * (n)))
 #define DCN_SW_MODE_LINEAR		0u	/* TILING_CONFIG.SW_MODE */
 #define DCN_PITCH_MASK			0xffffu	/* SURFACE_PITCH.PITCH: pixels - 1 */
 #define DCN_ADDRESS_HIGH_MASK		0xffffu

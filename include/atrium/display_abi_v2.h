@@ -1,5 +1,5 @@
 /*
- * Atrium display ABI v2.1 — /dev/atrium-display<N>. Normative header.
+ * Atrium display ABI v2.3 — /dev/atrium-display<N>. Normative header.
  *
  * Spec: docs/spec/atrium-display-architecture.md §7 and §7.1, and
  * docs/spec/atrium-gpu-abi-v2.md §7. This header follows the GPU header's
@@ -46,10 +46,15 @@
 #endif
 
 #define ATRIUM_DISPLAY_ABI_MAJOR	2
-#define ATRIUM_DISPLAY_ABI_MINOR	1
+#define ATRIUM_DISPLAY_ABI_MINOR	3
 
 /* Pixel formats a plane can scan out. */
 #define ATRIUM_DISPLAY_FORMAT_XRGB8888	0  /* 32 bpp, B,G,R,X in memory (Vulkan B8G8R8A8) */
+#define ATRIUM_DISPLAY_FORMAT_XRGB2101010 1 /* (2.3) 32 bpp little-endian words: B 9:0,
+					     * G 19:10, R 29:20, X 31:30 (Vulkan
+					     * A2R10G10B10_UNORM_PACK32). For HDR the
+					     * values are the EOTF's code values (PQ or
+					     * HLG), as HDR sets out */
 
 /* Layout modifiers (GPU ABI §5.12). Only linear in 2.0. */
 #define ATRIUM_DISPLAY_MODIFIER_LINEAR	0ull
@@ -175,6 +180,63 @@ struct atrium_display_commit {
  */
 #define ATRIUM_DISPLAY_NOTE_HOTPLUG		0x2u
 
+/*
+ * (2.3) HDR: what the monitor can show, and which EOTF and colorimetry the
+ * stream is signalled with (CTA-861.3 / CTA-861-G infoframes).
+ *
+ * The out_* fields always describe the monitor, from its EDID: out_eotfs has
+ * bit n set for EOTF n (SDR is always there), out_colorimetry bit n for
+ * colorimetry n (DEFAULT always), and the luminances are the ones it would
+ * like content mastered for (0 = not given).
+ *
+ * Without SET, eotf .. max_fall return what is signalled now. With SET they
+ * are what to signal, and take effect with the next COMMIT that succeeds
+ * (MODESET or flip), so the switch reaches the monitor with the first frame
+ * rendered for it; a SET that no commit follows changes nothing on screen,
+ * and a later SET replaces it. EOTF_SDR with COLORIMETRY_DEFAULT stops the
+ * infoframes: the monitor's defaults. The surface format is the commit's
+ * business: HDR works in XRGB8888 too, with more banding.
+ *
+ * A MODESET re-checks against the monitor then attached: if it no longer
+ * offers the signalled EOTF or colorimetry (a hotplug swapped it), the
+ * stream falls back to SDR / default and a read says so.
+ *
+ * Errors: EINVAL for a bad struct, flag, eotf or colorimetry, or one the
+ * monitor does not offer; ENODEV with SET while no monitor is attached.
+ */
+#define ATRIUM_DISPLAY_HDR_SET			0x1u
+
+#define ATRIUM_DISPLAY_EOTF_SDR			0  /* traditional gamma, SDR range */
+#define ATRIUM_DISPLAY_EOTF_TRAD_HDR		1  /* traditional gamma, HDR range */
+#define ATRIUM_DISPLAY_EOTF_PQ			2  /* SMPTE ST 2084 (HDR10) */
+#define ATRIUM_DISPLAY_EOTF_HLG			3  /* ARIB STD-B67 hybrid log-gamma */
+
+#define ATRIUM_DISPLAY_COLORIMETRY_DEFAULT	0  /* the format's default (sRGB / BT.709) */
+#define ATRIUM_DISPLAY_COLORIMETRY_BT2020	1  /* BT.2020 RGB */
+
+struct atrium_display_hdr {
+	uint32_t struct_size;
+	uint32_t flags;			/* ATRIUM_DISPLAY_HDR_* */
+	uint32_t eotf;			/* ATRIUM_DISPLAY_EOTF_* */
+	uint32_t colorimetry;		/* ATRIUM_DISPLAY_COLORIMETRY_* */
+	/* Static metadata type 1: the mastering display and the content. */
+	uint16_t primaries_x[3];	/* R, G, B chromaticity, units of 0.00002 */
+	uint16_t primaries_y[3];
+	uint16_t white_x;
+	uint16_t white_y;
+	uint16_t max_mastering_nits;	/* cd/m^2 */
+	uint16_t min_mastering;		/* units of 0.0001 cd/m^2 */
+	uint16_t max_cll;		/* brightest pixel, cd/m^2; 0 = unknown */
+	uint16_t max_fall;		/* brightest frame average, cd/m^2; 0 = unknown */
+	/* The monitor. */
+	uint32_t out_eotfs;		/* bit n = ATRIUM_DISPLAY_EOTF n offered */
+	uint32_t out_colorimetry;	/* bit n = ATRIUM_DISPLAY_COLORIMETRY n offered */
+	uint32_t out_max_nits;		/* desired content max luminance, cd/m^2 */
+	uint32_t out_max_fall_nits;	/* desired content max frame average */
+	uint32_t out_min_nits_x10000;	/* desired content min, 0.0001 cd/m^2 */
+	uint32_t _pad;
+};
+
 /* STATUS: refresh and flip telemetry for frame pacing and tests. */
 struct atrium_display_status_v2 {
 	uint32_t struct_size;
@@ -193,6 +255,8 @@ struct atrium_display_status_v2 {
 #define ATRIUM_DISPLAY_CONNECTOR_CONNECTED	0x1u
 #define ATRIUM_DISPLAY_CONNECTOR_VRR		0x2u  /* (2.2) the monitor offers variable refresh */
 #define ATRIUM_DISPLAY_CONNECTOR_VRR_ACTIVE	0x4u  /* (2.2) the lit mode runs with it */
+#define ATRIUM_DISPLAY_CONNECTOR_HDR		0x8u  /* (2.3) the monitor declares HDR (see HDR) */
+#define ATRIUM_DISPLAY_CONNECTOR_HDR_ACTIVE	0x10u /* (2.3) an HDR EOTF is being signalled */
 #define ATRIUM_DISPLAY_MODE_PREFERRED		0x1u  /* the monitor's native mode */
 
 #define ATRIUM_DISPLAY_EDID_MAX		512	/* base block + 3 extensions */
@@ -232,5 +296,6 @@ struct atrium_display_connector_v2 {
 #define ATRIUM_DISPLAY_IOC_COMMIT	_IOWR('D', 64, struct atrium_display_commit)
 #define ATRIUM_DISPLAY_IOC_STATUS_V2	_IOWR('D', 65, struct atrium_display_status_v2)
 #define ATRIUM_DISPLAY_IOC_CONNECTOR	_IOWR('D', 66, struct atrium_display_connector_v2)
+#define ATRIUM_DISPLAY_IOC_HDR		_IOWR('D', 67, struct atrium_display_hdr)
 
 #endif /* _ATRIUM_DISPLAY_ABI_V2_H_ */

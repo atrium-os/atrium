@@ -45,6 +45,9 @@
  *                before it is not cached
  *   timing       the timing of the lit mode, re-applied after a device reset
  *   vrr_min_hz   its variable refresh floor (0 = fixed refresh), ditto
+ *   hdr          (2.3) the EOTF, colorimetry and metadata being signalled
+ *                (eotf .. max_fall used), re-sent after a device reset
+ *   hdr_pending  what HDR SET asked for, applied by the next commit
  */
 struct atrium_amd_display_state {
 	struct atrium_display_sink	sink;
@@ -53,6 +56,9 @@ struct atrium_amd_display_state {
 	struct atrium_display_timing	timing;
 	int				timing_valid;
 	uint32_t			vrr_min_hz;
+	struct atrium_display_hdr	hdr;
+	struct atrium_display_hdr	hdr_pending;
+	int				hdr_pending_valid;
 };
 
 static MALLOC_DEFINE(M_ATRIUM_DISPLAY, "atrium_display", "Atrium display state");
@@ -173,13 +179,47 @@ amd_disp_hpd_rearm(void *hw)
 	    (present ? 0 : DCN_HPD_INT_POLARITY) | DCN_HPD_INT_ACK);
 }
 
+/*
+ * Infoframes through VPG0's generic packets, sent every frame by DIG0:
+ * generic n holds frames[n]. Packets past `n` stop being sent. Packet RAM
+ * layout and the FRAME_UPDATE hand-over as the Linux display code
+ * (gpl_fact, medium confidence).
+ */
+static void
+amd_disp_send_infoframes(void *hw, const uint8_t *frames, uint32_t n)
+{
+	struct atrium_amd_softc *sc = hw;
+	uint32_t ctl = 0, k, d;
+	const uint8_t *f;
+
+	if (n > DCN_VPG_GENERICS)
+		n = DCN_VPG_GENERICS;
+	for (k = 0; k < n; k++) {
+		f = frames + k * ATRIUM_INFOFRAME_LEN;
+		amd_mmio_write32(sc, regVPG0_VPG_GENERIC_PACKET_ACCESS_CTRL,
+		    k * DCN_VPG_PACKET_DWORDS);
+		for (d = 0; d < DCN_VPG_PACKET_DWORDS; d++)
+			amd_mmio_write32(sc, regVPG0_VPG_GENERIC_PACKET_DATA,
+			    (uint32_t)f[4 * d] | (uint32_t)f[4 * d + 1] << 8 |
+			    (uint32_t)f[4 * d + 2] << 16 |
+			    (uint32_t)f[4 * d + 3] << 24);
+		ctl |= DCN_HDMI_GENERIC_SEND_CONT(k);
+	}
+	if (n != 0)
+		amd_mmio_write32(sc, regVPG0_VPG_GSP_FRAME_UPDATE_CTRL,
+		    (1u << n) - 1);
+	amd_mmio_write32(sc, regDIG0_HDMI_GENERIC_PACKET_CONTROL0, ctl);
+}
+
 static const struct atrium_display_hw_ops amd_display_hw_ops = {
 	.sense =		amd_disp_sense,
 	.read_edid_block =	amd_disp_read_edid_block,
 	.program_timing =	amd_disp_program_timing,
 	.hpd_rearm =		amd_disp_hpd_rearm,
 	.set_vrr =		amd_disp_set_vrr,
+	.send_infoframes =	amd_disp_send_infoframes,
 };
+
 
 /*
  * The monitor as of the current hotplug generation, into `out`; returns that
@@ -323,9 +363,167 @@ display_connector(struct atrium_amd_softc *sc,
 	}
 	if (c->out_current_mode != 0xffffffffu && ds->vrr_min_hz != 0)
 		c->out_flags |= ATRIUM_DISPLAY_CONNECTOR_VRR_ACTIVE;
+	if (sink->connected && sink->hdr &&
+	    amd_display_hw_ops.send_infoframes != NULL)
+		c->out_flags |= ATRIUM_DISPLAY_CONNECTOR_HDR;
+	if (sc->display_mode_set && ds->hdr.eotf != ATRIUM_DISPLAY_EOTF_SDR)
+		c->out_flags |= ATRIUM_DISPLAY_CONNECTOR_HDR_ACTIVE;
 	mtx_unlock(&sc->lock);
 	free(sink, M_ATRIUM_DISPLAY);
 	return (0);
+}
+
+/* --- HDR (display ABI 2.3) ------------------------------------------------- */
+
+/* The EOTFs and colorimetries this monitor can be sent, as HDR's out_*
+ * bit masks: SDR and the default always; the rest from its EDID, and only
+ * if the encoder can send infoframes. */
+static void
+display_hdr_offers(const struct atrium_display_sink *sink, uint32_t *eotfs,
+    uint32_t *colorimetry)
+{
+	*eotfs = 1u << ATRIUM_DISPLAY_EOTF_SDR;
+	*colorimetry = 1u << ATRIUM_DISPLAY_COLORIMETRY_DEFAULT;
+	if (!sink->connected || !sink->hdr ||
+	    amd_display_hw_ops.send_infoframes == NULL)
+		return;
+	*eotfs |= sink->hdr_caps.eotfs & 0xfu;
+	if (sink->hdr_caps.bt2020_rgb)
+		*colorimetry |= 1u << ATRIUM_DISPLAY_COLORIMETRY_BT2020;
+}
+
+/* Does the monitor take `h`'s EOTF and colorimetry? */
+static int
+display_hdr_fits(const struct atrium_display_sink *sink,
+    const struct atrium_display_hdr *h)
+{
+	uint32_t eotfs, colorimetry;
+
+	display_hdr_offers(sink, &eotfs, &colorimetry);
+	return (h->eotf < 32 && (eotfs & (1u << h->eotf)) != 0 &&
+	    h->colorimetry < 32 && (colorimetry & (1u << h->colorimetry)) != 0);
+}
+
+/* Signal `h`: a DRM infoframe for a non-SDR EOTF, an AVI infoframe for any
+ * HDR or BT.2020 stream, nothing at all for plain SDR. Lock held. */
+static void
+display_hdr_send(struct atrium_amd_softc *sc, const struct atrium_display_hdr *h)
+{
+	struct atrium_hdr_metadata m;
+	uint8_t frames[2 * ATRIUM_INFOFRAME_LEN];
+	uint32_t n = 0, i;
+
+	mtx_assert(&sc->lock, MA_OWNED);
+	if (amd_display_hw_ops.send_infoframes == NULL)
+		return;
+	if (h->eotf != ATRIUM_DISPLAY_EOTF_SDR) {
+		memset(&m, 0, sizeof(m));
+		m.eotf = (uint8_t)h->eotf;
+		for (i = 0; i < 3; i++) {
+			m.primaries_x[i] = h->primaries_x[i];
+			m.primaries_y[i] = h->primaries_y[i];
+		}
+		m.white_x = h->white_x;
+		m.white_y = h->white_y;
+		m.max_mastering_nits = h->max_mastering_nits;
+		m.min_mastering = h->min_mastering;
+		m.max_cll = h->max_cll;
+		m.max_fall = h->max_fall;
+		atrium_infoframe_drm(&m, &frames[n++ * ATRIUM_INFOFRAME_LEN]);
+	}
+	if (h->eotf != ATRIUM_DISPLAY_EOTF_SDR ||
+	    h->colorimetry != ATRIUM_DISPLAY_COLORIMETRY_DEFAULT)
+		atrium_infoframe_avi(
+		    h->colorimetry == ATRIUM_DISPLAY_COLORIMETRY_BT2020, 0,
+		    &frames[n++ * ATRIUM_INFOFRAME_LEN]);
+	amd_display_hw_ops.send_infoframes(sc, frames, n);
+}
+
+/*
+ * A commit succeeded: what HDR SET asked for goes out with it. A MODESET
+ * also re-checks the signalled state against `sink` (the monitor it lit):
+ * one that no longer takes it gets SDR. Lock held.
+ */
+static void
+display_hdr_commit(struct atrium_amd_softc *sc,
+    const struct atrium_display_sink *sink)
+{
+	struct atrium_amd_display_state *ds = sc->display_state;
+	int changed = 0;
+
+	mtx_assert(&sc->lock, MA_OWNED);
+	if (ds->hdr_pending_valid) {
+		ds->hdr = ds->hdr_pending;
+		ds->hdr_pending_valid = 0;
+		changed = 1;
+	}
+	if (sink != NULL && !display_hdr_fits(sink, &ds->hdr)) {
+		memset(&ds->hdr, 0, sizeof(ds->hdr));
+		changed = 1;
+	}
+	if (changed || sink != NULL)
+		display_hdr_send(sc, &ds->hdr);
+}
+
+/* HDR (2.3): report the monitor and the signalled state, or SET the next. */
+static int
+display_hdr(struct atrium_amd_softc *sc, struct atrium_display_hdr *h)
+{
+	struct atrium_amd_display_state *ds = sc->display_state;
+	struct atrium_display_sink *sink;
+	struct atrium_display_hdr want;
+	int err = 0;
+
+	if (h->struct_size < sizeof(*h) ||
+	    (h->flags & ~ATRIUM_DISPLAY_HDR_SET) != 0 || h->_pad != 0)
+		return (EINVAL);
+	sink = malloc(sizeof(*sink), M_ATRIUM_DISPLAY, M_WAITOK);
+	(void)display_sink_get(sc, sink);
+	if (h->flags & ATRIUM_DISPLAY_HDR_SET) {
+		if (!sink->connected)
+			err = ENODEV;
+		else if (h->eotf > ATRIUM_DISPLAY_EOTF_HLG ||
+		    h->colorimetry > ATRIUM_DISPLAY_COLORIMETRY_BT2020 ||
+		    !display_hdr_fits(sink, h))
+			err = EINVAL;
+		if (err == 0) {
+			want = *h;
+			want.flags = 0;
+			want.out_eotfs = want.out_colorimetry = 0;
+			want.out_max_nits = want.out_max_fall_nits = 0;
+			want.out_min_nits_x10000 = 0;
+			mtx_lock(&sc->lock);
+			ds->hdr_pending = want;
+			ds->hdr_pending_valid = 1;
+			mtx_unlock(&sc->lock);
+		}
+	} else {
+		mtx_lock(&sc->lock);
+		want = ds->hdr;
+		mtx_unlock(&sc->lock);
+		h->eotf = want.eotf;
+		h->colorimetry = want.colorimetry;
+		memcpy(h->primaries_x, want.primaries_x, sizeof(h->primaries_x));
+		memcpy(h->primaries_y, want.primaries_y, sizeof(h->primaries_y));
+		h->white_x = want.white_x;
+		h->white_y = want.white_y;
+		h->max_mastering_nits = want.max_mastering_nits;
+		h->min_mastering = want.min_mastering;
+		h->max_cll = want.max_cll;
+		h->max_fall = want.max_fall;
+	}
+	display_hdr_offers(sink, &h->out_eotfs, &h->out_colorimetry);
+	if ((h->out_eotfs & ~1u) != 0) {
+		h->out_max_nits = atrium_hdr_cv_nits(sink->hdr_caps.max_cv);
+		h->out_max_fall_nits =
+		    atrium_hdr_cv_nits(sink->hdr_caps.max_fall_cv);
+		h->out_min_nits_x10000 = atrium_hdr_min_cv_ten_thousandths(
+		    sink->hdr_caps.max_cv, sink->hdr_caps.min_cv);
+	} else
+		h->out_max_nits = h->out_max_fall_nits =
+		    h->out_min_nits_x10000 = 0;
+	free(sink, M_ATRIUM_DISPLAY);
+	return (err);
 }
 
 /* --- cdev ioctl dispatch -------------------------------------------------- */
@@ -374,7 +572,8 @@ display_drain(struct atrium_amd_softc *sc, struct thread *td)
  * that would otherwise request a flip is held until display_unlock(). The
  * surface address is the BO's VRAM offset (the display reads VRAM by offset;
  * the referee checks residency and bounds and reports through regDISP_FAULT).
- * XRGB8888 linear is DCN's 32 bpp ARGB8888, linear swizzle, alpha plane off.
+ * XRGB8888 linear is DCN's 32 bpp ARGB8888, linear swizzle, alpha plane off;
+ * XRGB2101010 is its ARGB2101010.
  */
 static void
 display_program_surface(struct atrium_amd_softc *sc,
@@ -386,7 +585,8 @@ display_program_surface(struct atrium_amd_softc *sc,
 	amd_mmio_write32(sc, regHUBPREQ0_DCSURF_FLIP_CONTROL,
 	    DCN_SURFACE_UPDATE_LOCK | type);
 	amd_mmio_write32(sc, regHUBP0_DCSURF_SURFACE_CONFIG,
-	    DCN_PIXEL_FORMAT_ARGB8888);
+	    fb->format == ATRIUM_DISPLAY_FORMAT_XRGB2101010 ?
+	    DCN_PIXEL_FORMAT_ARGB2101010 : DCN_PIXEL_FORMAT_ARGB8888);
 	amd_mmio_write32(sc, regHUBP0_DCSURF_TILING_CONFIG, DCN_SW_MODE_LINEAR);
 	amd_mmio_write32(sc, regHUBPREQ0_DCSURF_SURFACE_PITCH,
 	    pitch >= 4 ? (pitch / 4 - 1) & DCN_PITCH_MASK : 0);
@@ -663,7 +863,8 @@ display_commit(struct atrium_amd_softc *sc, struct atrium_display_commit *c,
 	    ATRIUM_DISPLAY_COMMIT_VRR)) != 0 ||
 	    ((c->flags & ATRIUM_DISPLAY_COMMIT_VRR) != 0 &&
 	    (c->flags & ATRIUM_DISPLAY_COMMIT_MODESET) == 0) ||
-	    c->format != ATRIUM_DISPLAY_FORMAT_XRGB8888 ||
+	    (c->format != ATRIUM_DISPLAY_FORMAT_XRGB8888 &&
+	    c->format != ATRIUM_DISPLAY_FORMAT_XRGB2101010) ||
 	    c->modifier != ATRIUM_DISPLAY_MODIFIER_LINEAR || c->bo_offset != 0 ||
 	    (c->pitch % 256) != 0)
 		return (EINVAL);
@@ -789,6 +990,7 @@ display_commit(struct atrium_amd_softc *sc, struct atrium_display_commit *c,
 		if (have_tm)
 			ds->timing = tm;
 		ds->vrr_min_hz = have_tm ? vrr_min_hz : 0;
+		display_hdr_commit(sc, sink);
 		sc->display_refresh_mhz = have_tm ?
 		    atrium_timing_refresh_mhz(&tm) : 0;
 		sc->display_mode_width = have_tm ? tm.hactive : 0;
@@ -852,6 +1054,8 @@ display_commit(struct atrium_amd_softc *sc, struct atrium_display_commit *c,
 		}
 	} else
 		display_try_fence(sc);	/* a failed in-fence drops it now */
+	if (ds->hdr_pending_valid)
+		display_hdr_commit(sc, NULL);
 	mtx_unlock(&sc->lock);
 	display_drain(sc, td);
 	return (0);	/* the display owns the references now */
@@ -923,6 +1127,27 @@ display_sim_plug_sysctl(SYSCTL_HANDLER_ARGS)
 		return (EINVAL);
 	display_sink_invalidate(sc);
 	return (0);
+}
+
+/*
+ * dev.atrium_gpu_amd_display.N.sim_sink: what the simulated monitor makes of
+ * the stream, "eotf=E bt2020=B cll=C fall=F bpc=D" (test readback of the
+ * infoframes it decoded; silicon has no such register: a real monitor shows
+ * it in its menu).
+ */
+static int
+display_sim_sink_sysctl(SYSCTL_HANDLER_ARGS)
+{
+	struct atrium_amd_softc *sc = arg1;
+	char buf[80];
+	uint32_t light;
+
+	light = amd_mmio_read32(sc, regDISP_SINK_CONTENT_LIGHT);
+	snprintf(buf, sizeof(buf), "eotf=%u bt2020=%u cll=%u fall=%u bpc=%u",
+	    amd_mmio_read32(sc, regDISP_SINK_EOTF),
+	    amd_mmio_read32(sc, regDISP_SINK_COLORIMETRY), light & 0xffff,
+	    light >> 16, amd_mmio_read32(sc, regDISP_SINK_BPC));
+	return (sysctl_handle_string(oidp, buf, sizeof(buf), req));
 }
 
 /*
@@ -1154,6 +1379,7 @@ amd_display_reset_restore(struct atrium_amd_softc *sc)
 				    &sc->display_state->timing,
 				    sc->display_state->vrr_min_hz);
 		}
+		display_hdr_send(sc, &sc->display_state->hdr);
 		display_program_surface(sc, &sc->display_on_screen, 1);
 		display_set_mode(sc);
 		display_unlock(sc, 1);
@@ -1250,6 +1476,9 @@ display_ioctl(struct cdev *cdev, u_long cmd, caddr_t data, int fflag,
 	case ATRIUM_DISPLAY_IOC_COMMIT:
 		return (display_commit(sc, (struct atrium_display_commit *)data,
 		    td));
+
+	case ATRIUM_DISPLAY_IOC_HDR:
+		return (display_hdr(sc, (struct atrium_display_hdr *)data));
 
 	case ATRIUM_DISPLAY_IOC_STATUS_V2: {
 		struct atrium_display_status_v2 *st =
@@ -1404,6 +1633,11 @@ atrium_display_attach(device_t dev)
 	    CTLTYPE_INT | CTLFLAG_WR | CTLFLAG_MPSAFE, sc, 0,
 	    display_sim_plug_sysctl, "I",
 	    "simulator: plug monitor 0 VGA, 1 1080p, 2 4K, 3 desktop; -1 unplug");
+	SYSCTL_ADD_PROC(device_get_sysctl_ctx(dev),
+	    SYSCTL_CHILDREN(device_get_sysctl_tree(dev)), OID_AUTO, "sim_sink",
+	    CTLTYPE_STRING | CTLFLAG_RD | CTLFLAG_MPSAFE, sc, 0,
+	    display_sim_sink_sysctl, "A",
+	    "simulator: the monitor's view of the stream (HDR test readback)");
 
 	/*
 	 * Register our IH cause handler so the base ISR routes DCN vblank interrupts

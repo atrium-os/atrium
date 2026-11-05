@@ -96,4 +96,67 @@ uint32_t atrium_timing_vtotal_at(const struct atrium_display_timing *t,
 int atrium_edid_vrr_range(const uint8_t *e, uint32_t len, uint32_t *min_hz,
     uint32_t *max_hz);
 
+/*
+ * HDR (CTA-861.3): what a monitor's HDR Static Metadata Data Block (CTA
+ * extended tag 6) and Colorimetry Data Block (extended tag 5) declare.
+ * eotfs has bit n set for EOTF code n (ATRIUM_EOTF_*). The luminances are
+ * the block's coded values, 0 when not given; atrium_hdr_cv_* decode them.
+ */
+#define ATRIUM_EOTF_SDR		0	/* traditional gamma, SDR range */
+#define ATRIUM_EOTF_TRAD_HDR	1	/* traditional gamma, HDR range */
+#define ATRIUM_EOTF_PQ		2	/* SMPTE ST 2084 */
+#define ATRIUM_EOTF_HLG		3	/* ARIB STD-B67 hybrid log-gamma */
+
+struct atrium_hdr_caps {
+	uint8_t eotfs;
+	uint8_t max_cv;		/* desired content max luminance */
+	uint8_t max_fall_cv;	/* desired content max frame-average */
+	uint8_t min_cv;		/* desired content min luminance */
+	uint8_t bt2020_rgb;	/* Colorimetry Data Block offers BT.2020 RGB */
+	uint8_t _pad[3];
+};
+
+/*
+ * The HDR capabilities of the first CTA-861 extension with an HDR Static
+ * Metadata Data Block that offers static metadata type 1. Returns 0 (and
+ * zeroes *out) when there is none: the monitor is SDR only.
+ */
+int atrium_edid_hdr_caps(const uint8_t *e, uint32_t len,
+    struct atrium_hdr_caps *out);
+
+/* CTA-861.3 luminance coding: max and max frame-average are 50 x 2^(cv/32)
+ * cd/m^2 (0 for cv 0, "not given"); min is max x (cv/255)^2 / 100, here in
+ * units of 0.0001 cd/m^2. Integer arithmetic, within 0.1%. */
+uint32_t atrium_hdr_cv_nits(uint8_t cv);
+uint32_t atrium_hdr_min_cv_ten_thousandths(uint8_t max_cv, uint8_t min_cv);
+
+/*
+ * Infoframes (CTA-861-G) a driver sends to put the monitor in an HDR mode,
+ * built here so every driver sends the same bytes. Each fills 36 bytes in
+ * the generic-packet layout DCN and most encoders take: HB0..HB2, a zero
+ * byte, then PB0 (the checksum) .. PB31.
+ */
+#define ATRIUM_INFOFRAME_LEN	36
+
+struct atrium_hdr_metadata {
+	uint8_t  eotf;			/* ATRIUM_EOTF_* */
+	uint8_t  _pad;
+	uint16_t primaries_x[3];	/* R, G, B; units of 0.00002 */
+	uint16_t primaries_y[3];
+	uint16_t white_x, white_y;
+	uint16_t max_mastering_nits;	/* cd/m^2 */
+	uint16_t min_mastering;		/* 0.0001 cd/m^2 */
+	uint16_t max_cll;		/* cd/m^2, 0 = unknown */
+	uint16_t max_fall;
+};
+
+/* Dynamic Range and Mastering infoframe (type 0x87, version 1, length 26)
+ * with static metadata type 1. */
+void atrium_infoframe_drm(const struct atrium_hdr_metadata *m, uint8_t *out);
+
+/* AVI infoframe (type 0x82, version 2, length 13): RGB, full range, the
+ * picture's aspect, the timing's VIC (0 when it has none), and BT.2020
+ * colorimetry (C = 3, EC = 6) when bt2020, else the default. */
+void atrium_infoframe_avi(int bt2020, uint8_t vic, uint8_t *out);
+
 #endif /* _ATRIUM_DISPLAY_EDID_H_ */

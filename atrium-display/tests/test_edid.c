@@ -131,6 +131,57 @@ main(void)
 		assert(atrium_timing_vtotal_at(&s.timings[1], 0) == 0);
 	}
 
+	/* HDR: the desktop monitor offers SDR, PQ and HLG in BT.2020. */
+	{
+		struct atrium_hdr_caps h;
+		struct atrium_hdr_metadata m = {
+			.eotf = ATRIUM_EOTF_PQ,
+			.primaries_x = { 35400, 8500, 6550 },
+			.primaries_y = { 14600, 39850, 2300 },
+			.white_x = 15635, .white_y = 16450,
+			.max_mastering_nits = 1000, .min_mastering = 50,
+			.max_cll = 800, .max_fall = 300,
+		};
+		uint8_t fr[ATRIUM_INFOFRAME_LEN], sum;
+		uint32_t i;
+
+		assert(atrium_edid_hdr_caps(desktop_monitor_edid, 256, &h));
+		assert(h.eotfs == ((1 << ATRIUM_EOTF_SDR) | (1 << ATRIUM_EOTF_PQ) |
+		    (1 << ATRIUM_EOTF_HLG)));
+		assert(h.max_cv == 115 && h.max_fall_cv == 96 && h.min_cv == 23);
+		assert(h.bt2020_rgb);
+		assert(atrium_hdr_cv_nits(115) == 604);
+		assert(atrium_hdr_cv_nits(96) == 400);
+		assert(atrium_hdr_cv_nits(0) == 0);
+		assert(atrium_hdr_cv_nits(255) == 12526);	/* 50 x 2^(255/32) */
+		i = atrium_hdr_min_cv_ten_thousandths(115, 23);
+		assert(i >= 489 && i <= 493);			/* ~0.049 cd/m^2 */
+		assert(s.hdr && s.hdr_caps.max_cv == 115);
+		/* An EDID without the block: SDR only. */
+		assert(!atrium_edid_hdr_caps(desktop_monitor_edid, 128, &h));
+		assert(h.eotfs == 0);
+
+		atrium_infoframe_drm(&m, fr);
+		assert(fr[0] == 0x87 && fr[1] == 1 && fr[2] == 26 && fr[3] == 0);
+		for (sum = 0, i = 0; i < 3; i++)
+			sum += fr[i];
+		for (i = 0; i <= 26; i++)
+			sum += fr[4 + i];
+		assert(sum == 0);
+		assert(fr[5] == ATRIUM_EOTF_PQ && fr[6] == 0);
+		assert(fr[7] == (35400 & 0xff) && fr[8] == (35400 >> 8));
+		assert(fr[4 + 23] == (800 & 0xff) && fr[4 + 24] == (800 >> 8));
+		assert(fr[4 + 25] == (300 & 0xff) && fr[4 + 26] == (300 >> 8));
+		atrium_infoframe_avi(1, 16, fr);
+		assert(fr[0] == 0x82 && fr[1] == 2 && fr[2] == 13);
+		assert(fr[6] >> 6 == 3 && ((fr[7] >> 4) & 7) == 6 && fr[8] == 16);
+		for (sum = 0, i = 0; i < 3; i++)
+			sum += fr[i];
+		for (i = 0; i <= 13; i++)
+			sum += fr[4 + i];
+		assert(sum == 0);
+	}
+
 	/* Known VICs decode; unknown ones don't. */
 	assert(atrium_cta_vic_timing(97, &t[0]));
 	expect(&t[0], 3840, 2160, 60000);

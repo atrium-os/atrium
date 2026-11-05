@@ -39,6 +39,11 @@ struct atrium_display_hw_ops {
 	 * Optional: NULL means the CRTC can't. */
 	void	(*set_vrr)(void *hw, const struct atrium_display_timing *t,
 		    uint32_t min_hz);
+	/* Send these `n` infoframes (ATRIUM_INFOFRAME_LEN bytes each, built by
+	 * atrium_infoframe_*) to the monitor every frame from the next one,
+	 * replacing what was sent before; n 0 stops sending them. Optional:
+	 * NULL means the encoder can't (no HDR). */
+	void	(*send_infoframes)(void *hw, const uint8_t *frames, uint32_t n);
 };
 
 /* What a connector's monitor offers, as last probed. */
@@ -50,6 +55,8 @@ struct atrium_display_sink {
 	struct atrium_display_timing timings[ATRIUM_DISPLAY_SINK_MODES];
 	uint32_t vrr_min_hz;			/* variable refresh range; 0 = none */
 	uint32_t vrr_max_hz;
+	uint32_t hdr;				/* has an HDR static metadata block */
+	struct atrium_hdr_caps hdr_caps;	/* its contents (zero without) */
 };
 
 /*
