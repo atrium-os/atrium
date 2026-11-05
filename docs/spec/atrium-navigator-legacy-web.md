@@ -1604,8 +1604,16 @@ needed.** `navigator-prerender/src/geometry.rs`, the geometry natives in `boa_im
 
 #### 5.4.5.7 Time to first display (2026-11-05: measured, then built)
 
-**The goal**, as agreed: first display in under 1 s for 90% of pages, and no conversion
-makes a reader wait for the whole pipeline. "First display" is the moment a reader can
+**The goal, revised by the user on 2026-11-05:** *"let's abandon the 1s goal..its too
+tight..we can live with a few seconds..the added bonus is the security".* The goal is now
+**a first display within a few seconds**, which the cold p90 already meets (3.2–3.8 s from
+the main document's arrival, cuts A and B below), and no conversion makes a reader wait
+for the whole pipeline. The further speed cuts are **parked, not scheduled**: cold image
+headers, HTTP/2 or a stylesheet cache, normalize's remainder, and converting ahead. They
+are taken up only if a page is unusably slow. The measurements below stay as the record
+of where the time goes.
+
+*The original goal* was a first display in under 1 s for 90% of pages. "First display" is the moment a reader can
 see the document: the main document fetched, a recording converted, then normalized and
 rendered. Before this section, the only recording was the whole one: scripts, layouts and
 exploration all ran before anything could be shown.
@@ -1940,7 +1948,140 @@ None timed out, and fetch failures were in the usual range (54–415 per arm).
   exited. Its unfinished batch 2 of pair 2 was re-run into fresh directories (`*-2r`),
   and the partial one is not read.
 
-**Open, and the next cuts, in order of what they would move.**
+**Then built, cut A: pending images sized from their headers** (2026-11-06, 1e73ca28).
+Cut 1's first display gave an `<img>` the page leaves unsized a placeholder box, and the
+layout moved when the image arrived: 51 pages, 18 of them in the first screen. Its box is
+now sized from the image's own first bytes, fetched while the stylesheets load.
+- *The parser* (`navigator_dom::natural::header_size`). It is a strict prefix reader:
+  - it answers `Sized` only when `natural_size` of ANY image that starts with those bytes
+    gives that size, so the box is the one the whole image gets; otherwise `More(n)` or
+    `Unreadable`;
+  - it reads at most 64 KiB, in at most four reads (16, 32, 64 KiB);
+  - it refuses zero sizes, a side over 16,384 and a frame over the 256 MiB decode budget;
+  - it never stores, hashes or keeps the bytes.
+
+  16 KiB answers 2,720 of the corpora's 2,737 images, and 64 KiB all but one (a JPEG
+  with 84 KiB of EXIF before its frame header).
+- *Fuzzed differentially* (`navigator-dom` `tests/header.rs`). On every prefix of
+  mutated seeds of every format, the verdict is checked against `natural_size` of the
+  whole image. The test fails unless every outcome class is reached for every format: a
+  fuzzer that never reaches `Sized` for a JPEG is not testing JPEG. The 2,739 corpus
+  images and 300,000 mutants agree.
+- *Fetching* (`navigator-fetch`).
+  - The converter hints each unsized image's header (`HH <url>`) after the stylesheets
+    and before every image body.
+  - fetchd fetches its first 16 KiB with `Range`, reading no more even from a server that
+    ignores it, and checks a 206 against `Content-Range`.
+  - Jobs run in hint order (sheets, headers, bodies), with two more workers that take
+    headers only.
+  - The converter peeks (`P <start> <len> <url>`). The relay bounds each peek and charges
+    it to the per-conversion budget.
+  - *The header window* (250 ms from the first peek) is fetchd's, beside the network's
+    other timeouts, so no converter decision reads a clock (threat model §2.6). To the
+    converter a late header is a fetch that failed.
+- *Pending says how the box is sized.* `header` is the new word. An image whose header
+  **proves** it will fail is left out, as the final recording leaves it: not an image at
+  all (a `src=""` that returns HTML), an HTTP error, a refusal, or offline. A late header
+  stays a `placeholder`. The broker accepts `header`; such an image arrives with
+  `resized` empty.
+
+**Then built, cut B: what the first display waits for, profiled and cut** (2026-11-06,
+e23e712d). Time from the main document's arrival to the first display was split per page
+(timing checkpoint at the first artifact; normalize by phase, `navigator_normalize::
+phases`; `examples/display_profile`). On cut 1, summed over 122 pages:
+- cold: the stylesheet wait is 66%, normalize 27%, render 6%, and parse 0.3%;
+- warm: normalize is 80% and render 18%.
+
+A preload scan before the full parse could save at most the parse (p50 3 ms), so it was
+not built. Fixed, with every output byte-identical:
+- *Imports early.* Every top-level sheet is taken as it arrives and its `@import`s are
+  hinted at once (13 of 122 pages import), then theirs. The unchanged walk then finds them
+  fetched or in flight. Also fixed: an `@import` with no `;` was cut at byte 256 even
+  inside a multi-byte character, which panicked the converter.
+- *Margin collapsing.* Everything a chain walk asks of an element is remembered per media
+  context. `empty(h)` walked h's whole subtree and was asked again at every level above
+  it. It was 31% of normalize on first displays, quadratic on deep pages, and is now 4.2×
+  faster on the five slowest.
+- *The renderer's cascade* (navigator-style). It matched every rule against every
+  element. A normalized document has one class per distinct block, so that was rules ×
+  elements. Rules are now indexed by their subject compound's id, class or tag and tried
+  in their own order. Each longhand's grammar row is looked up once, not per element per
+  property.
+- *The normalizer's cascade.* A declaration with no `var()` is expanded once per rule,
+  and its report entries are replayed on each use.
+- *Kept.* The normalized document, the report and the rendered scene are identical on
+  **421 documents**: the first, first-with-images and readable artifacts of all 122 pages,
+  and the 85-recording corpus, against 0beab757 (`examples/display_digest`).
+
+**Re-measured, cuts A + B** (ms; the same 122 pages, method and machine; base = 0beab757,
+cut 1; new = e23e712d; ABBA per batch: base, new, new, base, cold then warm; none timed
+out).
+
+| arm | p50 | p90 | p99 | from main-document arrival p50 / p90 / p99 | under 1 s from arrival |
+|---|---|---|---|---|---|
+| cold, base, pair 1 | 2,373 | 6,508 | 13,793 | 1,395 / 3,901 / 6,806 | 30% |
+| **cold, new, pair 1** | **2,236** | **5,704** | 20,257 | **1,353 / 3,241** / 16,395 | 33% |
+| **cold, new, pair 2** | **2,459** | **5,996** | 13,949 | **1,603 / 3,759** / 7,248 | 27% |
+| cold, base, pair 2 | 2,492 | 5,776 | 13,164 | 1,392 / 3,687 / 7,843 | 31% |
+| warm, base (×2) | 1,292 / 1,291 | 3,808 / 3,790 | 10,614 / 10,595 | 253 / 2,081 / 4,013 | 80% |
+| **warm, new (×2)** | **1,208 / 1,202** | **3,176 / 3,162** | **10,324 / 10,327** | **126 / 1,099 / 2,081** | **88%** |
+
+- *Warm* is the display path. From arrival, p90 is 2.08 → 1.10 s and p99 4.0 → 2.1 s.
+  Under 1 s rises from 80% to 88%; both pairs agree within 10 ms. Summed over the 122
+  first displays, normalize is 63.0 → 34.7 s and render 14.4 → 5.8 s. What remains of
+  normalize: cascade matching 34% of it, collapse 14%, table pre-measure 10%, custom
+  properties 8%.
+- *Cold* is the network.
+  - The stylesheet wait is now 79% of the time from arrival, normalize 14% and render 2.5%.
+  - Header peeks add at most the 250 ms window (p90 255 ms), on the pages that have late
+    headers.
+  - Pair 1's p90 improved (3.90 → 3.24 s); pair 2's did not (3.69 → 3.76 s).
+- *One page regressed in both new arms*: postgres (`335_postgres_select`).
+  - Two of its stylesheet fetches failed after about 34 s each, and its first display came
+    at 65–68 s, against 13 s on base. That is the new arms' p99 and maximum.
+  - Run alone afterwards with the same binaries, it was clean three times out of three:
+    all five sheets, first display at 2.1–8.0 s.
+  - **Cause not established.** The likeliest is that header jobs add connections to one
+    origin, tripping a server-side limit during that window. Open.
+- *Header sizing, cold* (`c.header.*`). Of 1,426 unsized images:
+  - 41% were sized from their header and 57% were late (the window closed first);
+  - 2% were left out as proven failures.
+
+  Late headers are concentrated on image-heavy pages (ikea ~70 unsized images,
+  ocw.mit.edu ~80, spotify ~83). Those pages' lower images still move when they arrive.
+- *Layout shift* (`examples/layout_shift.rs`, first artifact vs first + images, 800 × 600):
+
+  | arm | pages with any text moved | pages with first-screen text moved | placeholders |
+  |---|---|---|---|
+  | warm, cut 1 | 51 | 18 | 1,413 |
+  | **warm, cut A** | **13** | **0** | 3 |
+  | cold, cut 1 | 51 | 18 | 1,413 |
+  | **cold, cut A** | **31** | **1** (thomann, 34 late headers) | 812 |
+
+  Warm, every first-screen shift is gone. Before cut A's last change, the two warm
+  survivors were an `<img src="">` (samsung) and an SVG whose fetch fails (vanguard); both
+  are now left out, as the final recording leaves them. Cold, the late headers fall mostly
+  below the first screen, because headers are asked for in document order.
+- *Kept* (warm, all 122, against 0beab757):
+  - first display with its images, base == new: **122/122**;
+  - each first artifact differs from base's only in its images block: 122/122;
+  - whole recordings, readable and transitions parts identical: 122/122;
+  - two new runs identical in every part: 122/122 (images artifacts 88/88);
+  - the same blob sets.
+
+  Suites: converter 419, backend 228, renderer 152, normalizer 72, fetch 40, dom 17 and
+  style 35 tests, all passing.
+- Data: `~/src/navigator-corpus/ttfd-headers-2026-11-05/`:
+  - `ttfd.py` reproduces the table, `breakdown.py` the split by phase and `headers.py` the
+    header outcomes;
+  - `check.py` and `check2.py` the identities, `shift-*.tsv` the layout shift;
+  - `bin.sha256` the binaries.
+
+  Three isolated postgres reruns overlapped the first warm new arm of batch 1 (01:13–01:15
+  IST). They are network-bound and small, and both warm new runs agree within 10 ms.
+
+**Open, and the next cuts, in order of what they would move** (*superseded 2026-11-05:
+the 1 s goal is dropped and these are parked; see the goal above*).
 1. **Stylesheets.** Cold, they are now what a first display waits for. Next: fetch a
    page's sheets ahead of its body's other subresources (they already lead the hints),
    HTTP/2 to their origins, and a stylesheet cache across conversions. The

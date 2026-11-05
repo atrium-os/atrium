@@ -246,6 +246,25 @@ details and the numbers.
     most twice the budget. Tests: `navigator-fetch` `tests/pool.rs`
     (`hints_stop_at_the_byte_budget`), and the relay's fake fetchd sees `B 250000`
     before its five hints (`tests/confine.rs`).
+  - *Header peeks (2026-11-06, legacy-web §5.4.5.7 cut A).* The first display sizes
+    an image the page leaves unsized from the image's own first bytes. The converter
+    hints each such image's header (`HH <url>`): fetchd fetches its first 16 KiB with a
+    `Range` request, reads at most that whatever the server sends (a server that
+    ignores `Range` is cut off, and its connection is not reused), and counts those
+    bytes against the hint budget like any prefetch. The converter then asks
+    `P <start> <len> <url>`; the relay refuses a peek past 64 KiB from the body's start
+    before anything goes upstream, and charges what it delivers against the
+    per-conversion budget as it charges a fetch. A 206 that does not say it starts
+    where it was asked to is refused. The bytes are parsed in the jailed converter by
+    a strict prefix parser (`navigator_dom::natural::header_size`), never stored,
+    hashed or kept, and it refuses zero sizes, a side over 16,384 px and a frame over
+    the 256 MiB decode budget; it is fuzzed differentially against the whole-image
+    reader on every prefix (`navigator-dom` `tests/header.rs`). The wait for headers
+    is fetchd's (a 250 ms window from the first peek), not the converter's, so no
+    converter decision reads a clock (§2.6); to the converter a late header is a
+    failed fetch. The bound on what upstream is asked for grows by the header bytes:
+    at most 16 KiB per hinted image within the hint budget, and at most 64 KiB per
+    image asked for by peeks, within the request budget.
   - *Concurrency and the address rule.* The parallel fetches are `sibling`s of one
     `Conversation`: one pin table, locked across resolve-and-pin, so concurrent first
     lookups of a name get one answer, and a rebinding answer is refused exactly as

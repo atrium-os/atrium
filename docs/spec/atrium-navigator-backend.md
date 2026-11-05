@@ -480,8 +480,12 @@ keeping its own copy of what it staged so what a session carries follows what it
 
 **Images after the first display (2026-11-05).** The first document is shown before its
 images are fetched: each `<img>` is `pending` in its recording, sized from the page's
-own `width` and `height` (`declared`), or claiming no natural size (`placeholder`: the
-box is what the page's CSS makes it, else 300 × 150). `Images { session, images }`
+own `width` and `height` (`declared`), from the image's own first bytes when the page
+does not size it (`header`, 2026-11-06, legacy-web §5.4.5.7 cut A: exactly the size the
+whole image will have, so it arrives with `resized` empty), or claiming no natural size
+(`placeholder`: its header was not in hand in time; the box is what the page's CSS makes
+it, else 300 × 150). An image whose header proves it will fail is left out, as the final
+recording leaves it. `Images { session, images }`
 hands the broker an images artifact as they arrive: bound to the first document by
 digest, carrying the whole images list so far, partial at most every 250 ms, then
 complete. The answer is `ImagesAttached { arrived, resized, complete }`. `arrived` are
