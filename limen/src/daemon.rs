@@ -289,7 +289,7 @@ fn request(shared: &Arc<Shared>, conn: ConnId, uid: u32, req: proto::Request) ->
         child_window: None, rect: None, visible: true, bound: false, attached: false,
         to_child: Rate::default(), to_parent: Rate::default(),
     };
-    st.to_child(&e, ChildEvent::Attach { embed, role: role.name.into(), parent_app: app });
+    st.to_child(&e, ChildEvent::Attach { embed, role: role.name.into(), parent_app: app, parent_uid: uid });
     st.embeds.insert(embed, e);
     Ok(Reply::Embed { embed })
 }

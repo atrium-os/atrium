@@ -106,9 +106,12 @@ pub enum ParentEvent {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ChildEvent {
-    /// A new instance. `parent_app` is the parent's registry app id, as
-    /// data: never authority.
-    Attach { embed: EmbedId, role: String, parent_app: String },
+    /// A new instance. `parent_app` is the parent's registry app id and
+    /// `parent_uid` the uid limend read off the parent's connection
+    /// (getpeereid; frescod's bind confirms it owns the slot's window), so
+    /// a provider such as Arca can look the publisher up in the launch
+    /// registry itself. Data, never authority.
+    Attach { embed: EmbedId, role: String, parent_app: String, parent_uid: u32 },
     Message { embed: EmbedId, bytes: Vec<u8> },
     Suspended { embed: EmbedId },
     Resumed { embed: EmbedId },

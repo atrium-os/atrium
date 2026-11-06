@@ -121,7 +121,7 @@ fn credential_embed_attaches_relays_and_detaches() {
     let mut arca = w.arca();
     let mut app = w.parent(APP);
     let e = app.request("credential", W_APP).unwrap();
-    assert_eq!(next_c(&mut arca), ChildEvent::Attach { embed: e, role: "credential".into(), parent_app: "org.example.mail".into() });
+    assert_eq!(next_c(&mut arca), ChildEvent::Attach { embed: e, role: "credential".into(), parent_app: "org.example.mail".into(), parent_uid: APP });
     app.place(e, RECT).unwrap();
     // Not attached until the child's window is bound.
     assert!(app.poll(Duration::from_millis(50)).unwrap().is_none());
@@ -234,7 +234,7 @@ fn a_spawned_child_crash_is_child_lost_and_a_parent_exit_ends_its_children() {
     let mut app = w.parent(APP);
     let e = app.request("doc-viewer", W_APP).unwrap();
     let (_, mut viewer) = w.spawned();
-    assert_eq!(next_c(&mut viewer), ChildEvent::Attach { embed: e, role: "doc-viewer".into(), parent_app: "org.example.mail".into() });
+    assert_eq!(next_c(&mut viewer), ChildEvent::Attach { embed: e, role: "doc-viewer".into(), parent_app: "org.example.mail".into(), parent_uid: APP });
     app.place(e, RECT).unwrap();
     viewer.ready(e, W_VIEWER).unwrap();
     assert_eq!(next_p(&mut app), ParentEvent::Attached { embed: e });

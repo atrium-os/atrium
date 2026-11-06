@@ -324,7 +324,8 @@ parent                    limend                 portcullisd       frescod      
   frescod does for its renderers. That's one jail per embed, discarded at exit, with the
   provider's own manifest capabilities. The child's stdin is its limend channel, its stdout
   goes nowhere, and its stderr is limend's. Hanging up the request connection ends the jail.
-  The parent's identity goes to the child as data (`Attach { parent_app }`), never as
+  The parent's identity goes to the child as data (`Attach { parent_app, parent_uid }`: the uid limend read off the
+  parent's connection, which frescod's bind confirmed owns the slot's window), never as
   authority.
 - **The child runs as its own user, never as `_limen`.** `ExecInstance` runs a worker as its
   caller unless the system policy has a worker rule for it, so every provider needs one:
