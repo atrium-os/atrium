@@ -1072,6 +1072,7 @@ impl EnvelopeFrontend {
         }
         let writer = self.current_client;
         let s = self.ensure_window_state(win_id);
+        s.leaf_replaces(p.node_id);
         s.glyph_run_nodes.insert(p.node_id, run);
         s.rect_nodes.remove(&p.node_id);
         s.texture_nodes.remove(&p.node_id);

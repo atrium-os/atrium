@@ -9,6 +9,8 @@
 //! the commit cycle. Layout primitives (`Stack`), `Text`, `Image`,
 //! `Path` arrive in subsequent phases.
 
+use std::collections::HashMap;
+
 use crate::color::Color;
 use crate::geom::{Axis, Rect, Size};
 use crate::theme::tokens::Weight;
@@ -124,6 +126,23 @@ impl Node {
         }
     }
 
+    /// The same node moved by `(dx, dy)` (to its group's coordinates).
+    pub fn offset(mut self, dx: f32, dy: f32) -> Self {
+        match &mut self {
+            Node::Rect { rect, .. } | Node::Text { rect, .. } | Node::Stack { rect, .. } => {
+                rect.origin.x += dx;
+                rect.origin.y += dy;
+            }
+            Node::Path { p0, p1, .. } => {
+                p0.0 += dx;
+                p0.1 += dy;
+                p1.0 += dx;
+                p1.1 += dy;
+            }
+        }
+        self
+    }
+
     /// Intrinsic size — what this node "wants" to be when given no
     /// outside constraint. Used by `layout::layout_stack` to
     /// distribute children along the axis. Stack containers report
@@ -143,32 +162,122 @@ impl Node {
     }
 }
 
-/// A flat arena of nodes. Tree structure lives in the
-/// `parent`/`children` Vecs, not in pointers — this lets us diff old
-/// vs new trees by iterating numeric ids.
+/// What makes a node "the same node" from one render to the next: its
+/// parent's id plus either an explicit key (`Ctx::key`) or its position
+/// among its parent's children.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+enum Key {
+    Ordinal(u32),
+    Explicit(u64),
+}
+
+/// Hands out stable node ids. Persists across renders (the `App` moves it
+/// from one tree to the next), so a node keeps its id while its key path
+/// stays the same, however the nodes around it change. Ids are below
+/// 2^31: the top bit names a node's background rect on the wire.
+#[derive(Debug, Default)]
+pub struct KeyAlloc {
+    ids: HashMap<(u32, Key), u32>,
+    seen: std::collections::HashSet<(u32, Key)>,
+    next: u32,
+}
+
+/// Parent id of the top-level nodes in the key map.
+const NO_PARENT: u32 = u32::MAX;
+/// Wire ids at or above this are derived (a filled Stack's background).
+pub const DERIVED_BIT: u32 = 1 << 31;
+
+impl KeyAlloc {
+    fn id(&mut self, parent: Option<NodeId>, key: Key) -> NodeId {
+        let k = (parent.map(|p| p.0).unwrap_or(NO_PARENT), key);
+        self.seen.insert(k);
+        if let Some(&id) = self.ids.get(&k) {
+            return NodeId(id);
+        }
+        let id = self.next;
+        self.next = (self.next + 1) % DERIVED_BIT;
+        self.ids.insert(k, id);
+        NodeId(id)
+    }
+
+    /// Forget keys not used since the last sweep (after each render).
+    pub fn sweep(&mut self) {
+        let seen = std::mem::take(&mut self.seen);
+        self.ids.retain(|k, _| seen.contains(k));
+    }
+}
+
+/// The node tree of one render. Ids are stable across renders
+/// ([`KeyAlloc`]); structure lives in `parent`/`children`, not pointers.
 #[derive(Debug, Default)]
 pub struct NodeTree {
-    nodes: Vec<Option<Node>>,
+    nodes: Vec<Node>,
+    ids: Vec<NodeId>,
+    index: HashMap<NodeId, usize>,
     parent: Vec<Option<NodeId>>,
     children: Vec<Vec<NodeId>>,
     /// Flex parameters per node (side-table — layout concerns stay
     /// out of the wire-facing `Node` payloads). Sparse: most nodes
     /// use defaults.
     styles: Vec<Option<crate::layout::FlexStyle>>,
+    keys: KeyAlloc,
+    /// Set by `Ctx::key`: the key of the next node inserted.
+    next_key: Option<u64>,
+    /// Top-level nodes so far (their position key).
+    root_count: u32,
 }
 
 impl NodeTree {
     pub fn new() -> Self { Self::default() }
 
-    /// Allocate a new node in the tree under `parent`. Returns its id.
+    /// A tree that continues `prev`'s ids: same key path, same id.
+    pub fn continuing(prev: &mut NodeTree) -> Self {
+        Self { keys: std::mem::take(&mut prev.keys), ..Self::default() }
+    }
+
+    /// Forget the keys this render did not use.
+    pub fn sweep_keys(&mut self) {
+        self.keys.sweep();
+    }
+
+    /// The next `insert` uses `key` instead of its position among its
+    /// siblings, so it keeps its id when siblings come and go.
+    pub fn key_next(&mut self, key: u64) {
+        self.next_key = Some(key);
+    }
+
+    /// Insert a node under `parent`. Returns its (stable) id.
     pub fn insert(&mut self, parent: Option<NodeId>, node: Node) -> NodeId {
-        let id = NodeId(self.nodes.len() as u32);
-        self.nodes.push(Some(node));
+        let key = match self.next_key.take() {
+            Some(k) => Key::Explicit(k),
+            None => {
+                let n = match parent {
+                    Some(p) => self.index.get(&p).map(|&i| self.children[i].len()).unwrap_or(0),
+                    None => self.root_count as usize,
+                };
+                Key::Ordinal(n as u32)
+            }
+        };
+        let mut id = self.keys.id(parent, key);
+        // Two explicit keys alike under one parent: keep the tree sound
+        // with a fresh id (the second node just does not diff stably).
+        while self.index.contains_key(&id) {
+            id = self.keys.id(parent, Key::Ordinal(u32::MAX - self.nodes.len() as u32));
+        }
+        let i = self.nodes.len();
+        self.nodes.push(node);
+        self.ids.push(id);
+        self.index.insert(id, i);
         self.parent.push(parent);
         self.children.push(Vec::new());
         self.styles.push(None);
-        if let Some(p) = parent {
-            self.children[p.0 as usize].push(id);
+        match parent {
+            Some(p) => {
+                if let Some(&pi) = self.index.get(&p) {
+                    self.children[pi].push(id);
+                }
+            }
+            None => self.root_count += 1,
         }
         id
     }
@@ -176,98 +285,144 @@ impl NodeTree {
     /// Attach flex parameters to a node (grow, alignment, container
     /// padding/justify for Stacks). See `layout::FlexStyle`.
     pub fn set_style(&mut self, id: NodeId, style: crate::layout::FlexStyle) {
-        if let Some(slot) = self.styles.get_mut(id.0 as usize) {
-            *slot = Some(style);
+        if let Some(&i) = self.index.get(&id) {
+            self.styles[i] = Some(style);
         }
     }
 
     pub fn style(&self, id: NodeId) -> Option<&crate::layout::FlexStyle> {
-        self.styles.get(id.0 as usize).and_then(|s| s.as_ref())
+        self.index.get(&id).and_then(|&i| self.styles[i].as_ref())
     }
 
     pub fn get(&self, id: NodeId) -> Option<&Node> {
-        self.nodes.get(id.0 as usize).and_then(|n| n.as_ref())
+        self.index.get(&id).map(|&i| &self.nodes[i])
     }
 
     pub fn get_mut(&mut self, id: NodeId) -> Option<&mut Node> {
-        self.nodes.get_mut(id.0 as usize).and_then(|n| n.as_mut())
+        let i = *self.index.get(&id)?;
+        Some(&mut self.nodes[i])
     }
 
     pub fn parent_of(&self, id: NodeId) -> Option<NodeId> {
-        self.parent.get(id.0 as usize).copied().flatten()
+        self.index.get(&id).and_then(|&i| self.parent[i])
     }
 
     pub fn children_of(&self, id: NodeId) -> &[NodeId] {
-        self.children.get(id.0 as usize).map(|v| v.as_slice()).unwrap_or(&[])
+        self.index.get(&id).map(|&i| self.children[i].as_slice()).unwrap_or(&[])
     }
 
+    /// Every node, in insertion order (parents before children).
     pub fn iter(&self) -> impl Iterator<Item = (NodeId, &Node)> {
-        self.nodes.iter().enumerate().filter_map(|(i, n)| {
-            n.as_ref().map(|node| (NodeId(i as u32), node))
-        })
+        self.ids.iter().copied().zip(self.nodes.iter())
     }
 
-    /// Iterate the node ids that have no parent (top-level nodes).
-    /// Layout is run once per root.
+    /// The top-level nodes. Layout is run once per root.
     pub fn roots(&self) -> impl Iterator<Item = NodeId> + '_ {
-        self.parent.iter().enumerate().filter_map(|(i, p)| {
-            if p.is_none() && self.nodes.get(i).and_then(|n| n.as_ref()).is_some() {
-                Some(NodeId(i as u32))
-            } else {
-                None
-            }
-        })
+        self.ids.iter().zip(&self.parent).filter(|(_, p)| p.is_none()).map(|(id, _)| *id)
     }
 
-    pub fn len(&self) -> usize { self.nodes.iter().filter(|n| n.is_some()).count() }
-    pub fn is_empty(&self) -> bool { self.len() == 0 }
+    pub fn len(&self) -> usize { self.nodes.len() }
+    pub fn is_empty(&self) -> bool { self.nodes.is_empty() }
+
+    /// The nearest Stack strictly above `id`: the group it is drawn in.
+    pub fn group_of(&self, id: NodeId) -> Option<NodeId> {
+        let mut p = self.parent_of(id);
+        while let Some(x) = p {
+            if matches!(self.get(x), Some(Node::Stack { .. })) {
+                return Some(x);
+            }
+            p = self.parent_of(x);
+        }
+        None
+    }
+
+    /// Where each node sits on the wire: its group, its paint order
+    /// within that group (preorder among the group's members), and its
+    /// payload in the group's coordinates.
+    fn placements(&self) -> HashMap<NodeId, Placement> {
+        let mut out = HashMap::with_capacity(self.nodes.len());
+        let mut next_order: HashMap<Option<NodeId>, u32> = HashMap::new();
+        // Preorder: roots in order, then children depth first.
+        let mut stack: Vec<NodeId> = self.roots().collect::<Vec<_>>().into_iter().rev().collect();
+        while let Some(id) = stack.pop() {
+            let group = self.group_of(id);
+            let origin = group.and_then(|g| self.get(g)).map(|g| g.rect().origin).unwrap_or(crate::geom::Point::new(0.0, 0.0));
+            // Order 0 is a filled Stack's own background, drawn first.
+            let o = next_order.entry(group).or_insert(1);
+            let order = *o;
+            *o += 1;
+            let node = self.get(id).cloned().map(|n| n.offset(-origin.x, -origin.y));
+            if let Some(node) = node {
+                out.insert(id, Placement { group, order, node });
+            }
+            for &c in self.children_of(id).iter().rev() {
+                stack.push(c);
+            }
+        }
+        out
+    }
+
+    /// Ids in preorder (parents before children, siblings in order).
+    fn preorder(&self) -> Vec<NodeId> {
+        let mut out = Vec::with_capacity(self.nodes.len());
+        let mut stack: Vec<NodeId> = self.roots().collect::<Vec<_>>().into_iter().rev().collect();
+        while let Some(id) = stack.pop() {
+            out.push(id);
+            for &c in self.children_of(id).iter().rev() {
+                stack.push(c);
+            }
+        }
+        out
+    }
 }
 
-/// A single change between two `NodeTree`s. The diff pass produces a
-/// stream of these; on phase-4 wire integration these will translate
-/// into `SCENE_NODE_SET` / `SCENE_NODE_CLEAR` envelopes via fresco-client.
+#[derive(Debug, Clone, PartialEq)]
+struct Placement {
+    group: Option<NodeId>,
+    order: u32,
+    node: Node,
+}
+
+/// A single change between two `NodeTree`s, as it goes on the wire: the
+/// node's payload is in its group's coordinates (`group` = the nearest
+/// Stack above it, `None` = the window), so moving a Stack changes only
+/// the Stack. A Stack is itself a group on the wire.
 #[derive(Debug, Clone, PartialEq)]
 pub enum NodeDelta {
     /// Node id was not present in the previous tree.
-    Added { id: NodeId, node: Node, parent: Option<NodeId> },
-    /// Node id existed but its payload changed.
-    Changed { id: NodeId, node: Node },
+    Added { id: NodeId, node: Node, group: Option<NodeId>, order: u32 },
+    /// Its payload, group or order changed.
+    Changed { id: NodeId, node: Node, group: Option<NodeId>, order: u32 },
     /// Node id was present in the previous tree but not in the new one.
     Removed { id: NodeId },
 }
 
-/// Compute the minimal delta list between `prev` and `next`. The
-/// algorithm is positional: a NodeId in the new tree is "the same"
-/// node as that NodeId in the previous tree. View code that allocates
-/// stable ids therefore gets stable diffs.
-///
-/// This is the simple textbook diff — O(n) — appropriate while node
-/// counts are in the thousands. Keyed reconciliation (React-style) can
-/// layer on top later if collection-of-children patterns demand it.
+/// The deltas from `prev` to `next`, matched by id (ids are stable across
+/// renders, [`KeyAlloc`]). Removals first, then additions and changes in
+/// preorder, so a group always exists before anything is placed in it.
 pub fn diff(prev: &NodeTree, next: &NodeTree) -> Vec<NodeDelta> {
+    let before = prev.placements();
+    let after = next.placements();
     let mut deltas = Vec::new();
-    let max = prev.nodes.len().max(next.nodes.len());
-
-    for i in 0..max {
-        let p = prev.nodes.get(i).and_then(|n| n.as_ref());
-        let n = next.nodes.get(i).and_then(|n| n.as_ref());
-        let id = NodeId(i as u32);
-
-        match (p, n) {
-            (None, Some(node)) => {
-                let parent = next.parent.get(i).copied().flatten();
-                deltas.push(NodeDelta::Added { id, node: node.clone(), parent });
-            }
-            (Some(_), None) => {
-                deltas.push(NodeDelta::Removed { id });
-            }
-            (Some(a), Some(b)) if a != b => {
-                deltas.push(NodeDelta::Changed { id, node: b.clone() });
-            }
-            _ => {} // unchanged or both empty
+    for id in prev.preorder() {
+        if after.contains_key(&id) {
+            continue;
+        }
+        // Removing a group removes everything in it, so a node whose
+        // group also goes needs no message of its own.
+        if prev.group_of(id).is_some_and(|g| !after.contains_key(&g)) {
+            continue;
+        }
+        deltas.push(NodeDelta::Removed { id });
+    }
+    for id in next.preorder() {
+        let Some(a) = after.get(&id) else { continue };
+        match before.get(&id) {
+            None => deltas.push(NodeDelta::Added { id, node: a.node.clone(), group: a.group, order: a.order }),
+            Some(b) if b != a => deltas.push(NodeDelta::Changed { id, node: a.node.clone(), group: a.group, order: a.order }),
+            _ => {}
         }
     }
-
     deltas
 }
 
@@ -338,5 +493,115 @@ mod diff_tests {
             radius: 0.0,
         });
         assert!(diff(&a, &b).is_empty());
+    }
+
+    fn rect(x: f32, y: f32) -> Node {
+        Node::Rect { rect: Rect::new(x, y, 4.0, 4.0), fill: Color::rgba(1.0, 0.0, 0.0, 1.0), radius: 0.0 }
+    }
+
+    fn stack(x: f32, y: f32) -> Node {
+        Node::Stack {
+            rect: Rect::new(x, y, 40.0, 40.0),
+            axis: crate::geom::Axis::Vertical,
+            spacing: 0.0,
+            fill: None,
+            radius: 0.0,
+        }
+    }
+
+    /// A root Stack holding a keyed child per entry of `keys`.
+    fn keyed(prev: &mut NodeTree, keys: &[u64]) -> (NodeTree, Vec<NodeId>) {
+        let mut t = NodeTree::continuing(prev);
+        let root = t.insert(None, stack(0.0, 0.0));
+        let ids = keys.iter().map(|&k| {
+            t.key_next(k);
+            t.insert(Some(root), rect(k as f32, 0.0))
+        }).collect();
+        t.sweep_keys();
+        (t, ids)
+    }
+
+    #[test]
+    fn the_first_render_numbers_nodes_in_order() {
+        let mut t = NodeTree::new();
+        let a = t.insert(None, stack(0.0, 0.0));
+        let b = t.insert(Some(a), rect(0.0, 0.0));
+        let c = t.insert(Some(a), rect(0.0, 0.0));
+        assert_eq!((a.0, b.0, c.0), (0, 1, 2));
+    }
+
+    #[test]
+    fn a_keyed_node_keeps_its_id_when_a_sibling_is_inserted_before_it() {
+        let mut empty = NodeTree::new();
+        let (mut first, ids1) = keyed(&mut empty, &[10, 20]);
+        let (second, ids2) = keyed(&mut first, &[5, 10, 20]);
+        assert_eq!(&ids2[1..], &ids1[..]);
+        assert!(!ids1.contains(&ids2[0]));
+        // The new node is added; the others only move down one place.
+        let d = diff(&first, &second);
+        assert!(d.iter().any(|d| matches!(d, NodeDelta::Added { id, .. } if *id == ids2[0])));
+        assert!(!d.iter().any(|d| matches!(d, NodeDelta::Removed { .. })));
+    }
+
+    #[test]
+    fn a_node_not_rendered_loses_its_key() {
+        let mut empty = NodeTree::new();
+        let (mut first, ids1) = keyed(&mut empty, &[1, 2]);
+        let (mut second, _) = keyed(&mut first, &[2]);
+        let (_, ids3) = keyed(&mut second, &[1, 2]);
+        assert_ne!(ids3[0], ids1[0], "key 1 was swept, so it gets a new id");
+        assert_eq!(ids3[1], ids1[1]);
+    }
+
+    #[test]
+    fn moving_a_stack_changes_only_the_stack() {
+        let build = |prev: &mut NodeTree, x: f32| {
+            let mut t = NodeTree::continuing(prev);
+            let root = t.insert(None, stack(0.0, 0.0));
+            let inner = t.insert(Some(root), stack(x, 10.0));
+            t.insert(Some(inner), rect(x + 2.0, 12.0));
+            t.sweep_keys();
+            (t, inner)
+        };
+        let (mut a, inner) = build(&mut NodeTree::new(), 10.0);
+        let (b, _) = build(&mut a, 50.0);
+        let d = diff(&a, &b);
+        assert_eq!(d.len(), 1, "{d:?}");
+        match &d[0] {
+            NodeDelta::Changed { id, group, .. } => {
+                assert_eq!(*id, inner);
+                assert!(group.is_some());
+            }
+            other => panic!("expected the Stack to change, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_leaf_is_placed_in_its_stack_coordinates() {
+        let mut t = NodeTree::new();
+        let root = t.insert(None, stack(0.0, 0.0));
+        let inner = t.insert(Some(root), stack(10.0, 20.0));
+        let leaf = t.insert(Some(inner), rect(13.0, 25.0));
+        let d = diff(&NodeTree::new(), &t);
+        let placed = d.iter().find_map(|d| match d {
+            NodeDelta::Added { id, node, group, order } if *id == leaf => Some((node.clone(), *group, *order)),
+            _ => None,
+        }).unwrap();
+        assert_eq!(placed.1, Some(inner));
+        assert_eq!(placed.2, 1, "order 0 is the Stack's background");
+        assert_eq!(placed.0.rect().origin, crate::geom::Point::new(3.0, 5.0));
+    }
+
+    #[test]
+    fn removing_a_stack_sends_one_removal() {
+        let mut a = NodeTree::new();
+        let root = a.insert(None, stack(0.0, 0.0));
+        let inner = a.insert(Some(root), stack(0.0, 0.0));
+        a.insert(Some(inner), rect(0.0, 0.0));
+        a.insert(Some(inner), rect(0.0, 0.0));
+        let mut b = NodeTree::continuing(&mut a);
+        b.insert(None, stack(0.0, 0.0));
+        b.sweep_keys();
+        assert_eq!(diff(&a, &b), vec![NodeDelta::Removed { id: inner }]);
     }
 }

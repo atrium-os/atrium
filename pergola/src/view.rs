@@ -108,6 +108,13 @@ impl<'a> Ctx<'a> {
         self.interactions.entry(id).focusable = true;
     }
 
+    /// Give the next node emitted a stable key among its siblings, so
+    /// it keeps its id (and its state on the screen) when siblings
+    /// before it are inserted or removed. Keys are per parent.
+    pub fn key(&mut self, key: u64) {
+        self.tree.key_next(key);
+    }
+
     /// Attach flex parameters (grow, alignment, container padding /
     /// justify) to a node emitted in this render pass.
     pub fn set_flex(&mut self, id: NodeId, style: crate::layout::FlexStyle) {
@@ -160,11 +167,24 @@ pub fn render_with_state<V: View>(
     theme: Semantic,
     state: InteractionState,
 ) -> (NodeTree, Interactions) {
-    let mut tree = NodeTree::new();
+    render_continuing(view, theme, state, &mut NodeTree::new())
+}
+
+/// `render_with_state` keeping `prev`'s node ids: a node at the same
+/// key path gets the same id, so the diff sees a change, not a
+/// remove and an add. `App::tick` uses this.
+pub fn render_continuing<V: View>(
+    view: &V,
+    theme: Semantic,
+    state: InteractionState,
+    prev: &mut NodeTree,
+) -> (NodeTree, Interactions) {
+    let mut tree = NodeTree::continuing(prev);
     let mut interactions = Interactions::new();
     {
         let mut ctx = Ctx::with_state(&mut tree, &mut interactions, theme, state);
         view.render(&mut ctx);
     }
+    tree.sweep_keys();
     (tree, interactions)
 }

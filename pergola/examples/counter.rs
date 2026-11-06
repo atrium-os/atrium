@@ -91,7 +91,7 @@ fn main() {
 
 fn print_delta(d: &NodeDelta) {
     match d {
-        NodeDelta::Added { id, parent, .. } => println!("  + Added id={} parent={:?}", id.0, parent.map(|p| p.0)),
+        NodeDelta::Added { id, group, order, .. } => println!("  + Added id={} group={:?} order={}", id.0, group.map(|g| g.0), order),
         NodeDelta::Changed { id, .. } => println!("  ~ Changed id={}", id.0),
         NodeDelta::Removed { id } => println!("  - Removed id={}", id.0),
     }

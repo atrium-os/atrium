@@ -188,8 +188,10 @@ Pergola sends one transform change per frame, which is a few dozen bytes.
   to it. A filled stack is a group with a rect as its first child.
 - `ScrollView` is a `SCROLL` group with a clip and an opaque background, holding one content group.
   A scroll is one `GROUP` update on the content group.
-- The window scale (`EV_WINDOW_DPI_CHANGED`) is the root group's uniform scale; app code stays in
-  logical pixels.
+- The window scale (`EV_WINDOW_DPI_CHANGED`) is applied by the surface as it emits each node
+  (positions, sizes and text size times the scale), not as a group scale, because glyph runs do
+  not scale with their group (§2.3). App code and layout stay in logical pixels; a scale change
+  re-sends every node.
 - Pergola's own hit testing walks the same transforms and clips, so a click lands where the pixel
   was drawn.
 - Node ids become keyed (stable across renders) in the same change, so a scroll or an inserted row
@@ -233,6 +235,10 @@ Pergola thread's, except 5 and 6.
 2. Kernel clip test (§3 step 4), through the oracle checks. Until it lands, clips apply to fills
    only and other ops are culled by their whole box.
 3. `fresco-client`: `scene_group`, `scene_place`. Pergola moves Stack and the root onto groups.
+   **Done 2026-11-06**: every `Stack` is a group (translate = its layout origin; a filled Stack's
+   background is a rect at order 0 under a derived id with bit 31 set), leaves are placed in
+   their Stack's coordinates, node ids are keyed (`Ctx::key`, `NodeTree::continuing`) so an
+   inserted row or a moved Stack re-sends only what changed, and removing a Stack is one clear.
 4. `SCROLL` shift in the pixel-mode renderer; Pergola `ScrollView`; judged with the scroll harness
    against the §10.1 gates.
 5. `ISOLATE` (exact group opacity: draw the group to its own buffer, then blend), moved up at the

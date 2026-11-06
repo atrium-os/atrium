@@ -26,7 +26,7 @@ use crate::layout;
 use crate::node::{diff, NodeDelta, NodeId, NodeTree};
 use crate::reactive::Mutable;
 use crate::theme::Semantic;
-use crate::view::{render_with_state, InteractionState, View};
+use crate::view::{render_continuing, InteractionState, View};
 
 pub struct App<V: View> {
     view: V,
@@ -49,6 +49,9 @@ pub struct App<V: View> {
     /// distinct from `pending_press`, which is click bookkeeping).
     pressed_vis: Option<NodeId>,
     dirty: Arc<AtomicBool>,
+    /// The next tick sends every node, not just the changed ones (the
+    /// surface's scale changed, so every node's wire form did).
+    resend: bool,
     pub theme: Semantic,
 }
 
@@ -79,6 +82,7 @@ impl<V: View> App<V> {
             hovered: None,
             pressed_vis: None,
             dirty,
+            resend: false,
             theme: Semantic::LIGHT,
         }
     }
@@ -95,6 +99,18 @@ impl<V: View> App<V> {
             self.theme = theme;
             self.dirty.store(true, Ordering::Release);
         }
+    }
+
+    /// Re-render and send every node on the next tick, as if it were
+    /// the first (`Window` calls this when the DPI scale changes).
+    pub fn resend_all(&mut self) {
+        self.resend = true;
+        self.dirty.store(true, Ordering::Release);
+    }
+
+    /// Mark the UI for a re-render (the window was resized).
+    pub fn invalidate(&self) {
+        self.dirty.store(true, Ordering::Release);
     }
 
     /// A handle to the dirty flag. Pass to `Mutable::with_dirty` if
@@ -128,7 +144,7 @@ impl<V: View> App<V> {
             pressed: self.pressed_vis,
             focused: self.focused,
         };
-        let (mut next, interactions) = render_with_state(&self.view, self.theme, state);
+        let (mut next, interactions) = render_continuing(&self.view, self.theme, state, &mut self.prev_tree);
         // Run layout from each root in the tree (a render pass may
         // produce multiple top-level nodes; in practice it's one per
         // window).
@@ -136,7 +152,11 @@ impl<V: View> App<V> {
         for root in roots {
             layout::layout(&mut next, root);
         }
-        let deltas = diff(&self.prev_tree, &next);
+        let deltas = if std::mem::take(&mut self.resend) {
+            diff(&NodeTree::new(), &next)
+        } else {
+            diff(&self.prev_tree, &next)
+        };
         self.prev_tree = next;
         self.interactions = interactions;
         deltas

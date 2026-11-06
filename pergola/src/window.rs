@@ -121,6 +121,27 @@ impl Window {
         Ok(())
     }
 
+    /// Window lifecycle the toolkit handles itself: a resize re-lays
+    /// out; a DPI change rescales every node on the wire (layout stays
+    /// in logical pixels, the surface multiplies at emission).
+    fn window_event<V: View>(&mut self, ev: &fresco_client::Event, app: &mut App<V>) {
+        match *ev {
+            fresco_client::Event::Resized { width, height, .. } => {
+                self.width = width as f32;
+                self.height = height as f32;
+                app.invalidate();
+            }
+            fresco_client::Event::DpiChanged { scale_factor, .. }
+                if scale_factor.is_finite() && scale_factor > 0.0
+                    && scale_factor != self.surface.scale =>
+            {
+                self.surface.scale = scale_factor;
+                app.resend_all();
+            }
+            _ => {}
+        }
+    }
+
     /// One loop iteration: wait up to `timeout` for an event, default-
     /// dispatch it into the app, repaint if dirty. Returns the raw
     /// event (`None` on timeout) so callers with periodic work — a
@@ -138,6 +159,7 @@ impl Window {
                 if matches!(ev, fresco_client::Event::CloseRequested { .. }) {
                     return Ok(StepResult::Closed);
                 }
+                self.window_event(&ev, app);
                 if let Some(pev) = translate(&ev) {
                     app.handle_event(pev);
                 }
@@ -177,6 +199,7 @@ impl Window {
                 if matches!(ev, fresco_client::Event::CloseRequested { .. }) {
                     return Ok(());
                 }
+                self.window_event(&ev, app);
                 if let Some(pev) = translate(&ev) {
                     app.handle_event(pev);
                 }
