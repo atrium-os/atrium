@@ -36,6 +36,7 @@ fn samples() -> Vec<Msg> {
         Msg::VideoPlace { window: 3, layer: 2, rect: Some([-10, 20, 640, 360]) },
         Msg::VideoPlace { window: 3, layer: 2, rect: None },
         Msg::VideoDestroy { window: 3, layer: 2 },
+        Msg::VideoRate { window: 3, layer: 2, hz_milli: 23_976 },
         Msg::VideoSlots { window: 3, layer: 2, bytes: 8294400 },
         Msg::VideoDone { window: 3, layer: 2, slot: 0 },
         Msg::VideoPresented { window: 3, layer: 2, seq: 99, vblank_ns: u64::MAX - 5, dropped: 2 },

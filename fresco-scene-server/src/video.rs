@@ -21,6 +21,8 @@ pub trait VideoSink: Send + Sync {
     /// A frame for the layer, `w` x `h` (its rect's size): `fill` writes
     /// it, BGRA words, into the slice it is given (`w * h` long).
     fn frame(&self, window: u32, layer: u32, w: u32, h: u32, seq: u32, present_ns: u64, fill: &mut dyn FnMut(&mut [u32]));
+    /// The layer's content runs at `hz_milli` (0: not said).
+    fn rate(&self, window: u32, layer: u32, hz_milli: u32);
     /// The layer is gone.
     fn destroy(&self, window: u32, layer: u32);
 }

@@ -214,6 +214,8 @@ pub mod control {
     pub const OP_VIDEO_FRAME:           u16 = 0x0722;
     /// `VideoLayerDestroy`, no reply.
     pub const OP_VIDEO_LAYER_DESTROY:   u16 = 0x0723;
+    /// The layer's content frame rate, for VRR pacing (fresco-video.md §4).
+    pub const OP_VIDEO_LAYER_RATE:      u16 = 0x0724;
     /// `VideoPresentedEvent`.
     pub const EV_VIDEO_PRESENTED:       u16 = 0x0728;
     /// `VideoReleasedEvent`.
@@ -1157,6 +1159,18 @@ pub mod video {
         pub layer: u32,
     }
 
+    /// Content rates a layer may give, in milli-Hz (0 clears it).
+    pub const RATE_RANGE: core::ops::RangeInclusive<u32> = 1_000..=480_000;
+
+    /// `OP_VIDEO_LAYER_RATE`: the content runs at `content_hz_milli` (24p
+    /// is 24_000, 23.976 is 23_976; 0: not said). With variable refresh
+    /// frescod then shows each frame for a whole number of refreshes.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+    pub struct VideoLayerRate {
+        pub layer: u32,
+        pub content_hz_milli: u32,
+    }
+
     #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
     pub struct VideoPresentedEvent {
         pub window_id: u32,
@@ -1998,6 +2012,7 @@ mod tests {
             control::OP_VIDEO_LAYER_PLACE,
             control::OP_VIDEO_FRAME,
             control::OP_VIDEO_LAYER_DESTROY,
+            control::OP_VIDEO_LAYER_RATE,
             control::EV_VIDEO_PRESENTED,
             control::EV_VIDEO_RELEASED,
         ];

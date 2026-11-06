@@ -670,6 +670,13 @@ impl Broker {
                 crate::video::VIDEOS.place(global as u32, layer, rect);
                 self.redraw.wake();
             }
+            Msg::VideoRate { layer, hz_milli, .. } => {
+                let global = r.wins.lock().unwrap().get(&local).map(|w| w.global).ok_or("video rate for unknown window")?;
+                let hz = if fresco_protocol::video::RATE_RANGE.contains(&hz_milli) { hz_milli } else { 0 };
+                if r.videos.lock().unwrap().contains_key(&(local, layer)) {
+                    crate::video::VIDEOS.rate(global as u32, layer, hz);
+                }
+            }
             Msg::VideoDestroy { layer, .. } => {
                 let global = r.wins.lock().unwrap().get(&local).map(|w| w.global).ok_or("video destroy for unknown window")?;
                 r.videos.lock().unwrap().remove(&(local, layer));
@@ -937,6 +944,9 @@ fn event_record(r: &Renderer, ev: &DisplayEvent) -> Option<Msg> {
     let (global, input) = match *ev {
         E::WindowFocusChanged { window_id, gained } => return Some(Msg::Focus { window: r.local_of(window_id)?, gained }),
         E::WindowCloseRequested { window_id } => return Some(Msg::CloseRequested { window: r.local_of(window_id)? }),
+        E::VideoPresented { window_id, layer, seq, vblank_ns, dropped } => {
+            return Some(Msg::VideoPresented { window: r.local_of(window_id)?, layer, seq, vblank_ns, dropped });
+        }
         E::WindowDpiChanged { window_id, scale_factor } => {
             let scale_milli = (scale_factor * 1000.0).round() as u32; /* NaN -> 0 */
             if !(fresco_split::SCALE_MIN..=fresco_split::SCALE_MAX).contains(&scale_milli) {

@@ -175,6 +175,58 @@ fn main() {
         p.check(!blue(c), &format!("right of the window: not drawn ({c:?})"));
     }
 
+    // V2: present times. Back to the whole hole, then three frames queued
+    // ahead, each to show at its time, in order, announced once shown.
+    app.video_layer_place(layer, Some(video)).unwrap();
+    app.video_layer_rate(layer, 24_000).unwrap();
+    while let Ok(Some(_)) = app.wait_event(Some(Duration::from_millis(50))) {}
+    let t0 = now_ns() + 400_000_000;
+    let times = [t0, t0 + 400_000_000, t0 + 800_000_000];
+    for (i, &t) in times.iter().enumerate() {
+        bufs[i].nv12(63 + i as u8 * 20, 128, 128);
+        app.video_frame(layer, i as u32, 10 + i as u32, t).unwrap();
+    }
+    let got = events_for(&mut app, Duration::from_secs(6));
+    let shown: Vec<(u32, u64, u32)> = got.iter().filter_map(|e| match e {
+        Event::VideoPresented { layer: l, seq, vblank_ns, dropped, .. } if *l == layer => Some((*seq, *vblank_ns, *dropped)),
+        _ => None,
+    }).collect();
+    let released = got.iter().filter(|e| matches!(e, Event::VideoReleased { .. })).count();
+    p.check(released == 3, &format!("all three buffers released ({released})"));
+    p.check(shown.iter().map(|s| s.0).collect::<Vec<_>>() == [10, 11, 12], &format!("each frame presented once, in order ({shown:?})"));
+    let late: Vec<i64> = shown.iter().zip(times).map(|(s, t)| (s.1 as i64 - t as i64) / 1_000_000).collect();
+    // Never early; late by at most a capture interval or two under TCG.
+    p.check(late.iter().all(|&ms| (0..=600).contains(&ms)), &format!("none early, none far late (ms after its time: {late:?})"));
+    p.check(shown.iter().all(|s| s.2 == 0), "none dropped");
+
+    // Two frames for the same time: the later one shows, one dropped.
+    let t = now_ns() + 400_000_000;
+    bufs[0].nv12(63, 102, 240);
+    app.video_frame(layer, 0, 20, t).unwrap();
+    bufs[1].nv12(63, 102, 240);
+    app.video_frame(layer, 1, 21, t).unwrap();
+    let got = events_for(&mut app, Duration::from_secs(3));
+    let shown: Vec<(u32, u32)> = got.iter().filter_map(|e| match e {
+        Event::VideoPresented { seq, dropped, .. } => Some((*seq, *dropped)),
+        _ => None,
+    }).collect();
+    p.check(shown == [(21, 1)], &format!("two due at once: the later shows, one dropped ({shown:?})"));
+
+    // Hidden: a frame comes back but is never presented.
+    app.video_layer_place(layer, None).unwrap();
+    bufs[2].nv12(63, 102, 240);
+    app.video_frame(layer, 2, 30, 0).unwrap();
+    let got = events_for(&mut app, Duration::from_secs(2));
+    let rel = got.iter().any(|e| matches!(e, Event::VideoReleased { buffer: 2, .. }));
+    let pres = got.iter().any(|e| matches!(e, Event::VideoPresented { .. }));
+    p.check(rel && !pres, &format!("hidden: released, not presented ({got:?})"));
+    let _ = app.video_layer_rate(layer, 5); // out of range: an error, nothing else
+    app.video_layer_place(layer, Some([0.0, BAR_H, 200.0, 100.0])).unwrap();
+    bufs[0].nv12(32, 240, 118);
+    app.video_frame(layer, 0, 31, 0).unwrap();
+    let got = events_for(&mut app, Duration::from_secs(2));
+    p.check(got.iter().any(|e| matches!(e, Event::VideoPresented { seq: 31, .. })), "shown again: presented");
+
     // A click on the video goes to its window, not through it.
     while let Ok(Some(_)) = app.wait_event(Some(Duration::from_millis(50))) {}
     let inj = |line: &str| {
@@ -210,6 +262,26 @@ fn main() {
     drop(bufs);
     println!("{}", if p.failed == 0 { "PASS" } else { "FAILED" });
     std::process::exit(if p.failed == 0 { 0 } else { 1 });
+}
+
+/// CLOCK_MONOTONIC, the clock present times are on.
+fn now_ns() -> u64 {
+    let mut t = libc::timespec { tv_sec: 0, tv_nsec: 0 };
+    // SAFETY: one timespec of ours for the call.
+    unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut t) };
+    t.tv_sec as u64 * 1_000_000_000 + t.tv_nsec as u64
+}
+
+/// Every event in the next `d`.
+fn events_for(c: &mut Connection, d: Duration) -> Vec<Event> {
+    let end = Instant::now() + d;
+    let mut v = Vec::new();
+    while Instant::now() < end {
+        if let Ok(Some(e)) = c.wait_event(Some(Duration::from_millis(50))) {
+            v.push(e);
+        }
+    }
+    v
 }
 
 fn wait_short(c: &mut Connection) -> bool {

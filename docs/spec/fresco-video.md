@@ -204,6 +204,23 @@ create is refused. `atrium-video-probe` checks it in the VM in both modes: refus
 under the window's hole with the window drawn over it, clipping, release, hit-testing and
 destroy (16/16 direct, 15/15 split).
 
+**V2 as built (2026-11-06).** frescod's frame loop wakes at the next queued frame's
+`present_ns` rather than every refresh, and takes the latest frame due at that moment; the
+ones passed over are counted. A frame newly on screen is announced with `EV_VIDEO_PRESENTED`
+once the flip carrying it has landed (the lead monitor's flip fence; headless, once
+captured). `vblank_ns` is when frescod saw it land, on `CLOCK_MONOTONIC`: the display ABI has
+no vblank timestamp yet, so it can trail the real vblank by up to a poll interval (2 ms). A
+layer whose window isn't composed skips its frames and gets no `PRESENTED`; its buffers come
+back as `RELEASED` regardless, since V1 releases each as soon as it is converted.
+`OP_VIDEO_LAYER_RATE` (0x0724, 1–480 Hz in milli-Hz, 0 clears) sets the content rate. With
+variable refresh, when the panel's floor is above it, frescod presents the frame again at
+the smallest multiple of the content rate inside the range, so 24p on a 48–144 Hz panel
+goes up every 1/48 s and each frame lasts exactly two refreshes. The probe checks it
+headless in both modes: three frames queued ahead show in order, never early (late by up
+to one 200 ms capture interval headless), two due at once give one `PRESENTED` with
+`dropped: 1`, and a hidden layer releases without presenting. Timing on a real flip path
+(gpusim display, and VRR repeats) is part of V4.
+
 ## 9. Who does what
 
 | # | work | owner |

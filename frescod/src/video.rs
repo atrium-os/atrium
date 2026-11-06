@@ -30,6 +30,17 @@ struct Layer {
     current: Option<Arc<Pixels>>,
     /// Frames passed over since the last one shown.
     dropped: u32,
+    /// The content's rate in milli-Hz (0: not said), for VRR pacing.
+    hz_milli: u32,
+}
+
+/// A frame newly on screen, to announce once its flip has landed.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Presented {
+    pub window: u32,
+    pub layer: u32,
+    pub seq: u32,
+    pub dropped: u32,
 }
 
 /// One video surface to compose this refresh.
@@ -44,6 +55,8 @@ pub struct Shown {
 pub struct Videos {
     /// By (global window id, layer id).
     layers: Mutex<HashMap<(u32, u32), Layer>>,
+    /// Frames composed into a frame whose flip has not landed yet.
+    awaiting: Mutex<Vec<Presented>>,
 }
 
 /// Every layer frescod composes.
@@ -71,7 +84,7 @@ impl Videos {
             // Wraps after 2^32 layers; ids stay above window ids.
             let n = NEXT_ID.fetch_add(1, Ordering::Relaxed);
             let id = FIRST_ID | (n as u32 & 0x7fff_ffff);
-            Layer { id, rect: None, queue: VecDeque::new(), current: None, dropped: 0 }
+            Layer { id, rect: None, queue: VecDeque::new(), current: None, dropped: 0, hz_milli: 0 }
         })
     }
 
@@ -109,21 +122,57 @@ impl Videos {
         self.layers.lock().unwrap().retain(|&(w, _), _| w != window);
     }
 
-    /// Whether any layer has a frame waiting, so the frame loop knows to
-    /// come back.
-    pub fn pending(&self) -> bool {
-        self.layers.lock().unwrap().values().any(|l| !l.queue.is_empty())
+    pub fn rate(&self, window: u32, layer: u32, hz_milli: u32) {
+        let mut m = self.layers.lock().unwrap();
+        if let Some(l) = m.get_mut(&(window, layer)) {
+            l.hz_milli = hz_milli;
+        }
     }
 
-    /// Advance every layer to the latest frame due at `now_ns`, and return
-    /// what to compose, by window.
-    pub fn take(&self, now_ns: u64) -> HashMap<u32, Vec<Shown>> {
+    /// When the next queued frame is due (CLOCK_MONOTONIC ns), if any
+    /// layer that shows has one waiting.
+    pub fn next_due(&self) -> Option<u64> {
+        self.layers.lock().unwrap().values()
+            .filter(|l| l.rect.is_some())
+            .filter_map(|l| l.queue.front().map(|f| f.2))
+            .min()
+    }
+
+    /// With variable refresh down to `lo_mhz`: how often to present again
+    /// so the shown layer with the slowest content keeps each frame up for
+    /// a whole number of refreshes (24p on a 48–144 Hz panel: every
+    /// 1/48 s). `None` when no shown layer said its rate, or none needs it.
+    pub fn repeat_ns(&self, lo_mhz: u32) -> Option<u64> {
+        if lo_mhz == 0 {
+            return None;
+        }
+        self.layers.lock().unwrap().values()
+            .filter(|l| l.rect.is_some() && l.current.is_some() && l.hz_milli > 0)
+            .filter_map(|l| {
+                let k = lo_mhz.div_ceil(l.hz_milli).max(1);
+                (k > 1).then(|| 1_000_000_000_000u64 / (u64::from(l.hz_milli) * u64::from(k)))
+            })
+            .min()
+    }
+
+    /// Advance every layer of a window in `composed` to the latest frame
+    /// due at `now_ns`, and return what to compose, by window. A layer
+    /// whose window is not composed (off screen, or hidden in its slot)
+    /// skips its frames and gets no `PRESENTED` (fresco-video.md §4).
+    /// Frames newly shown wait in `awaiting` for [`Videos::landed`].
+    pub fn take(&self, now_ns: u64, composed: &std::collections::HashSet<u32>) -> HashMap<u32, Vec<Shown>> {
         let mut out: HashMap<u32, Vec<Shown>> = HashMap::new();
+        let mut newly = Vec::new();
         let mut m = self.layers.lock().unwrap();
         let mut keys: Vec<(u32, u32)> = m.keys().copied().collect();
         keys.sort_unstable();
         for key in keys {
             let l = m.get_mut(&key).unwrap();
+            if !composed.contains(&key.0) {
+                l.dropped += l.queue.len() as u32;
+                l.queue.clear();
+                continue;
+            }
             let mut next = None;
             while l.queue.front().is_some_and(|f| f.2 <= now_ns) {
                 if next.is_some() {
@@ -131,14 +180,39 @@ impl Videos {
                 }
                 next = l.queue.pop_front();
             }
-            if let Some((px, _seq, _)) = next {
+            if let Some((px, seq, _)) = next {
                 l.current = Some(px);
+                if l.rect.is_some() {
+                    newly.push(Presented { window: key.0, layer: key.1, seq, dropped: std::mem::take(&mut l.dropped) });
+                }
             }
             if let (Some(r), Some(px)) = (l.rect, &l.current) {
                 out.entry(key.0).or_default().push(Shown { id: l.id, at: (r[0], r[1]), pixels: px.clone() });
             }
         }
+        drop(m);
+        self.awaiting.lock().unwrap().extend(newly);
         out
+    }
+
+    /// Whether frames wait for their flip to land.
+    pub fn awaiting(&self) -> bool {
+        !self.awaiting.lock().unwrap().is_empty()
+    }
+
+    /// The flip carrying the frames composed so far is on screen, from
+    /// `vblank_ns`: tell their owners (`EV_VIDEO_PRESENTED`).
+    pub fn landed(&self, vblank_ns: u64, comp: &std::sync::Mutex<fresco_scene_server::window::Compositor>) {
+        let done = std::mem::take(&mut *self.awaiting.lock().unwrap());
+        if done.is_empty() {
+            return;
+        }
+        let c = comp.lock().unwrap();
+        for p in done {
+            c.emit(fresco_scene_server::window::DisplayEvent::VideoPresented {
+                window_id: p.window, layer: p.layer, seq: p.seq, vblank_ns, dropped: p.dropped,
+            });
+        }
     }
 }
 
@@ -180,6 +254,10 @@ impl fresco_scene_server::video::VideoSink for Direct {
         self.redraw.wake();
     }
 
+    fn rate(&self, window: u32, layer: u32, hz_milli: u32) {
+        VIDEOS.rate(window, layer, hz_milli);
+    }
+
     fn destroy(&self, window: u32, layer: u32) {
         VIDEOS.destroy(window, layer);
         self.redraw.wake();
@@ -197,15 +275,37 @@ mod tests {
         for (seq, t) in [(1, 100), (2, 200), (3, 300)] {
             v.queue(3, 1, pixels(2, 2, vec![seq; 4], seq), seq, t);
         }
-        assert!(v.take(50).is_empty());
-        let s = v.take(250);
+        let on: std::collections::HashSet<u32> = [3].into();
+        assert_eq!(v.next_due(), Some(100));
+        assert!(v.take(50, &on).is_empty());
+        let s = v.take(250, &on);
         assert_eq!(s[&3][0].pixels.px[0], 2);
         assert_eq!(s[&3][0].at, (10, 20));
-        assert_eq!(v.layers.lock().unwrap()[&(3, 1)].dropped, 1);
-        // Still shown with nothing new due.
-        assert_eq!(v.take(260)[&3][0].pixels.px[0], 2);
+        assert_eq!(*v.awaiting.lock().unwrap(), vec![Presented { window: 3, layer: 1, seq: 2, dropped: 1 }]);
+        // Still shown with nothing new due, and nothing new to announce.
+        v.awaiting.lock().unwrap().clear();
+        assert_eq!(v.take(260, &on)[&3][0].pixels.px[0], 2);
+        assert!(!v.awaiting());
+        // Off screen: frames are skipped, not announced.
+        v.queue(3, 1, pixels(2, 2, vec![9; 4], 9), 9, 270);
+        assert!(v.take(280, &Default::default()).is_empty());
+        assert!(!v.awaiting() && v.next_due().is_none());
         v.forget_window(3);
-        assert!(v.take(1000).is_empty());
+        assert!(v.take(1000, &on).is_empty());
+    }
+
+    #[test]
+    fn repeats_slow_content_on_variable_refresh() {
+        let v = Videos::default();
+        v.place(1, 1, Some([0, 0, 2, 2]));
+        v.queue(1, 1, pixels(2, 2, vec![0; 4], 1), 1, 0);
+        v.take(1, &[1].into());
+        assert_eq!(v.repeat_ns(48_000), None); // rate not said
+        v.rate(1, 1, 24_000);
+        assert_eq!(v.repeat_ns(48_000), Some(20_833_333)); // twice per frame
+        assert_eq!(v.repeat_ns(20_000), None); // the panel holds 24 Hz itself
+        v.rate(1, 1, 23_976);
+        assert_eq!(v.repeat_ns(40_000), Some(20_854_187));
     }
 
     #[test]

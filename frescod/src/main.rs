@@ -325,6 +325,7 @@ fn main() -> std::io::Result<()> {
     let mut last_render = Instant::now()
         .checked_sub(IDLE_HEARTBEAT)
         .unwrap_or_else(Instant::now);
+    let mut last_present_ns = 0u64;
     loop {
         let gen = reset_gen.load(std::sync::atomic::Ordering::SeqCst);
         let reset_due = gen != handled_gen;
@@ -489,7 +490,17 @@ fn main() -> std::io::Result<()> {
         let multi = heads.len() > 1;
         let cur = redraw.current();
         let heartbeat_due = last_render.elapsed() >= heartbeat;
-        if cur == last_gen && !heartbeat_due && !reset_due {
+        /* Video (fresco-video.md §4): the next queued frame's time, and with
+         * variable refresh, when slow content must go up again so each
+         * frame lasts a whole number of refreshes. */
+        let now_ns = video::monotonic_ns();
+        let vrr_floor = heads.iter().filter(|h| h.present && h.vrr).filter_map(|h| h.conn.vrr.map(|(lo, _)| lo * 1000)).max();
+        let video_at = [
+            video::VIDEOS.next_due(),
+            vrr_floor.and_then(|lo| video::VIDEOS.repeat_ns(lo)).map(|r| last_present_ns + r),
+        ].into_iter().flatten().min();
+        let video_due = video_at.is_some_and(|t| t <= now_ns);
+        if cur == last_gen && !heartbeat_due && !reset_due && !video_due {
             /* Heads that missed the newest frame get it once they land. */
             let mut stale = false;
             if multi {
@@ -518,6 +529,16 @@ fn main() -> std::io::Result<()> {
             if stale {
                 until_beat = until_beat.min(STALE_POLL);
             }
+            if let Some(t) = video_at {
+                until_beat = until_beat.min(Duration::from_nanos(t.saturating_sub(now_ns)));
+            }
+            /* Video frames on screen once the flip carrying them lands. */
+            if video::VIDEOS.awaiting() {
+                match heads.iter().filter(|h| h.present).max_by_key(|h| h.mode.refresh_mhz) {
+                    Some(lead) if !lead.landed() => until_beat = until_beat.min(STALE_POLL),
+                    _ => video::VIDEOS.landed(video::monotonic_ns(), &comp),
+                }
+            }
             redraw.wait_past(last_gen, until_beat);
             continue;
         }
@@ -536,6 +557,7 @@ fn main() -> std::io::Result<()> {
                 eprintln!("frescod: frame {} did not land across the reset ({e}); presenting anew", lead.frame);
             }
         }
+        video::VIDEOS.landed(video::monotonic_ns(), &comp);
 
         /* Snapshot the generation AFTER the wait so damage during it is
          * folded into this present rather than triggering an extra one. */
@@ -543,10 +565,7 @@ fn main() -> std::io::Result<()> {
         let t_render = Instant::now();
         render_one_frame(&mut renderer, &frontend, &comp, split.as_deref(), dw, dh)
             .map_err(io_other)?;
-        /* A video frame due later: come back next refresh. */
-        if video::VIDEOS.pending() {
-            redraw.wake();
-        }
+        last_present_ns = video::monotonic_ns();
         let damage = renderer.damage();
         for h in heads.iter_mut() {
             h.dirty.add(damage);
@@ -923,8 +942,12 @@ fn run_headless(png: &str) -> std::io::Result<()> {
     loop {
         let cur = redraw2.current();
         let heartbeat_due = last_render.elapsed() >= heartbeat;
-        if cur == last_gen && !heartbeat_due {
-            let until_beat = heartbeat.saturating_sub(last_render.elapsed());
+        let (now_ns, video_at) = (video::monotonic_ns(), video::VIDEOS.next_due());
+        if cur == last_gen && !heartbeat_due && !video_at.is_some_and(|t| t <= now_ns) {
+            let mut until_beat = heartbeat.saturating_sub(last_render.elapsed());
+            if let Some(t) = video_at {
+                until_beat = until_beat.min(Duration::from_nanos(t.saturating_sub(now_ns)));
+            }
             redraw2.wait_past(last_gen, until_beat);
             continue;
         }
@@ -937,9 +960,8 @@ fn run_headless(png: &str) -> std::io::Result<()> {
         last_gen = redraw2.current();
         let t_render = Instant::now();
         render_one_frame(&mut renderer, &frontend, &comp, split.as_deref(), W, H).map_err(io_other)?;
-        if video::VIDEOS.pending() {
-            redraw2.wake();
-        }
+        /* No flip here: on screen once captured. */
+        video::VIDEOS.landed(video::monotonic_ns(), &comp);
         let mut rgba = vec![0u8; (W * H * 4) as usize];
         renderer.read_pixels(&mut rgba).map_err(io_other)?;
         for px in rgba.chunks_exact_mut(4) { px.swap(0, 2); } // BGRA → RGBA
@@ -1062,7 +1084,8 @@ fn render_one_frame(
      * layers itself (they are part of it, §10). */
     let mut video_rects: std::collections::HashMap<u32, Vec<[i32; 4]>> = std::collections::HashMap::new();
     if renderer.takes_pixels() {
-        let mut due = video::VIDEOS.take(video::monotonic_ns());
+        let composed: std::collections::HashSet<u32> = windows.iter().map(|w| w.id).collect();
+        let mut due = video::VIDEOS.take(video::monotonic_ns(), &composed);
         if !due.is_empty() {
             let mut out = Vec::with_capacity(windows.len() + due.len());
             for w in windows.drain(..) {

@@ -106,6 +106,9 @@ pub enum Msg {
     VideoPlace { window: u32, layer: u32, rect: Option<[i32; 4]> },
     /// The layer is gone.
     VideoDestroy { window: u32, layer: u32 },
+    /// The layer's content runs at `hz_milli` (0: not said), for VRR
+    /// pacing (fresco-video.md §4).
+    VideoRate { window: u32, layer: u32, hz_milli: u32 },
 
     // ── broker → renderer ─────────────────────────────────────────
     /// The first record a renderer gets, with the client's socket as its
@@ -195,6 +198,7 @@ mod kind {
     pub const VIDEO_FRAME: u32 = 8;
     pub const VIDEO_PLACE: u32 = 9;
     pub const VIDEO_DESTROY: u32 = 10;
+    pub const VIDEO_RATE: u32 = 11;
     pub const VIDEO_SLOTS: u32 = 0x130;
     pub const VIDEO_DONE: u32 = 0x131;
     pub const VIDEO_PRESENTED: u32 = 0x132;
@@ -264,6 +268,7 @@ impl Msg {
             | Msg::VideoFrame { window, .. }
             | Msg::VideoPlace { window, .. }
             | Msg::VideoDestroy { window, .. }
+            | Msg::VideoRate { window, .. }
             | Msg::VideoSlots { window, .. }
             | Msg::VideoDone { window, .. }
             | Msg::VideoPresented { window, .. } => window,
@@ -440,6 +445,12 @@ impl Msg {
                 r.put(2, *layer);
                 r
             }
+            Msg::VideoRate { window, layer, hz_milli } => {
+                let mut r = Rec::new(VIDEO_RATE, *window);
+                r.put(2, *layer);
+                r.put(3, *hz_milli);
+                r
+            }
             Msg::VideoSlots { window, layer, bytes } => {
                 let mut r = Rec::new(VIDEO_SLOTS, *window);
                 r.put(2, *layer);
@@ -495,6 +506,7 @@ impl Msg {
             VIDEO_FRAME | VIDEO_PRESENTED => (5, false),
             VIDEO_PLACE => (6, false),
             VIDEO_DESTROY => (1, false),
+            VIDEO_RATE => (2, false),
             VIDEO_SLOTS | VIDEO_DONE => (2, false),
             _ => return Err(Refused("unknown kind")),
         };
@@ -616,6 +628,7 @@ impl Msg {
                 },
             },
             VIDEO_DESTROY => Msg::VideoDestroy { window, layer: r.get(2) },
+            VIDEO_RATE => Msg::VideoRate { window, layer: r.get(2), hz_milli: r.get(3) },
             VIDEO_SLOTS => Msg::VideoSlots { window, layer: r.get(2), bytes: r.get(3) },
             VIDEO_DONE => Msg::VideoDone { window, layer: r.get(2), slot: slot(r.get(3))? },
             VIDEO_PRESENTED => Msg::VideoPresented {
@@ -644,6 +657,7 @@ impl Msg {
                 | Msg::VideoFrame { .. }
                 | Msg::VideoPlace { .. }
                 | Msg::VideoDestroy { .. }
+                | Msg::VideoRate { .. }
         )
     }
 }

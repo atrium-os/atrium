@@ -524,6 +524,14 @@ impl Connection {
             &fresco_protocol::video::VideoFrame { layer, buffer, seq, present_ns })
     }
 
+    /// The content's frame rate in milli-Hz (24p: 24_000; 0: not said).
+    /// With variable refresh, frescod then keeps each frame up for a whole
+    /// number of refreshes.
+    pub fn video_layer_rate(&mut self, layer: u32, content_hz_milli: u32) -> io::Result<()> {
+        self.send_window_managed(control::OP_VIDEO_LAYER_RATE,
+            &fresco_protocol::video::VideoLayerRate { layer, content_hz_milli })
+    }
+
     pub fn video_layer_destroy(&mut self, layer: u32) -> io::Result<()> {
         self.send_window_managed(control::OP_VIDEO_LAYER_DESTROY,
             &fresco_protocol::video::VideoLayerDestroy { layer })

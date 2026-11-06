@@ -280,6 +280,10 @@ impl fresco_scene_server::video::VideoSink for VideoToBroker {
         }
     }
 
+    fn rate(&self, window: u32, layer: u32, hz_milli: u32) {
+        send(&self.broker, &Msg::VideoRate { window, layer, hz_milli });
+    }
+
     fn destroy(&self, window: u32, layer: u32) {
         self.rings.lock().unwrap().remove(&(window, layer));
         send(&self.broker, &Msg::VideoDestroy { window, layer });

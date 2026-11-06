@@ -622,6 +622,7 @@ impl EnvelopeFrontend {
             control::OP_VIDEO_LAYER_PLACE    => self.handle_video_layer_place(msg),
             control::OP_VIDEO_FRAME          => self.handle_video_frame(msg),
             control::OP_VIDEO_LAYER_DESTROY  => self.handle_video_layer_destroy(msg),
+            control::OP_VIDEO_LAYER_RATE     => self.handle_video_layer_rate(msg),
 
             // ── Cross-app window management (gated by window-management) ──
             control::OP_WM_ENUMERATE         => self.handle_wm_enumerate(msg),
@@ -766,6 +767,19 @@ impl EnvelopeFrontend {
             });
         }
         self.compositor.lock().unwrap().emit(crate::window::DisplayEvent::VideoReleased { window_id: window, layer: p.layer, buffer: p.buffer });
+        Ok(Vec::new())
+    }
+
+    fn handle_video_layer_rate(&mut self, msg: &Message) -> Result<Vec<Outbound>, DispatchError> {
+        let p: fresco_protocol::video::VideoLayerRate = decode(&msg.payload).map_err(|_| DispatchError::BadPayload)?;
+        let hz = p.content_hz_milli;
+        if hz != 0 && !fresco_protocol::video::RATE_RANGE.contains(&hz) {
+            return Err(DispatchError::BadPayload);
+        }
+        let window = self.my_layer(p.layer)?.window;
+        if let Some(s) = crate::video::SINK.get() {
+            s.rate(window, p.layer, hz);
+        }
         Ok(Vec::new())
     }
 
