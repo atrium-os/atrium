@@ -47,7 +47,54 @@ pub struct Document {
     /// document; serializing the whole page per click to learn it was 99%
     /// of a click's cost.
     pub(crate) bytes: std::cell::Cell<Option<usize>>,
+    /// ★ WHAT CHANGED, AND SINCE WHEN (replay part 2): every step this
+    /// document took in place, as the attributes it wrote and whether it
+    /// changed the tree's shape, under a version that counts them. The
+    /// display path reads it to tell a step nothing it draws depends on
+    /// from one it must lay out again (`display::Bands::update`).
+    pub(crate) journal: Journal,
+    /// Which document this is: a document that took steps keeps it; one
+    /// made anew (a swap, a restore) has its own, so the display path never
+    /// mistakes it for a later state of another.
+    pub(crate) lineage: u64,
 }
+
+/// See `Document::journal`.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct Journal { version: u64, log: std::collections::VecDeque<(u64, Touched)> }
+
+/// What steps wrote: attribute names, lowercased, and whether any step
+/// inserted or removed nodes.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Touched {
+    pub structure: bool,
+    pub attrs: std::collections::BTreeSet<String>,
+    /// An attribute was written inside an `<svg>` (the normalizer
+    /// serializes an inline SVG whole and addresses it by hash, so no
+    /// attribute there is unread).
+    pub in_svg: bool,
+}
+
+/// Steps remembered (a reader further behind than this is shown the
+/// document afresh).
+const JOURNAL_STEPS: usize = 256;
+
+impl Journal {
+    pub(crate) fn record(&mut self, effects: &[crate::Effect], in_svg: bool) {
+        let mut t = Touched { in_svg, ..Default::default() };
+        for e in effects {
+            match e {
+                crate::Effect::Attribute { name, .. } => { t.attrs.insert(name.to_ascii_lowercase()); }
+                _ => t.structure = true,
+            }
+        }
+        self.version += 1;
+        self.log.push_back((self.version, t));
+        while self.log.len() > JOURNAL_STEPS { self.log.pop_front(); }
+    }
+}
+
+static LINEAGE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
 
 /// See `Document::stats`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -69,7 +116,32 @@ impl Document {
     /// store want `accept`; this stays for tests and for tools that need to
     /// look at a document precisely because it is out of bounds.
     pub(crate) fn from_dom(dom: Dom) -> Self {
-        Document { dom, stats: None, ids: Default::default(), paths: Default::default(), frags: Default::default(), bytes: Default::default() }
+        Document { dom, stats: None, ids: Default::default(), paths: Default::default(), frags: Default::default(), bytes: Default::default(),
+                   journal: Journal::default(), lineage: LINEAGE.fetch_add(1, std::sync::atomic::Ordering::Relaxed) }
+    }
+
+    /// How many steps this document has taken in place.
+    pub fn version(&self) -> u64 { self.journal.version }
+
+    /// Which document this is (see `lineage`).
+    pub fn lineage(&self) -> u64 { self.lineage }
+
+    /// What the steps after `version` wrote, together; `None` when they are
+    /// no longer remembered (or `version` is not one of this document's).
+    pub fn touched_since(&self, version: u64) -> Option<Touched> {
+        let j = &self.journal;
+        if version > j.version { return None }
+        if version == j.version { return Some(Touched::default()) }
+        let first = j.log.front().map(|e| e.0)?;
+        if version + 1 < first { return None }
+        let mut t = Touched::default();
+        for (v, x) in &j.log {
+            if *v <= version { continue }
+            t.structure |= x.structure;
+            t.in_svg |= x.in_svg;
+            t.attrs.extend(x.attrs.iter().cloned());
+        }
+        Some(t)
     }
 
     /// `dom.serialized_len()`, measured once and then kept (see `bytes`).

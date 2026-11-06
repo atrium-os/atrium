@@ -473,6 +473,17 @@ impl Session {
         self.by_trigger.get(trigger).map(|&i| &self.transitions[i])
     }
 
+    /// The state key of the current document (`History::key`).
+    pub fn state_key(&self) -> u64 { self.history.key() }
+
+    /// The transitions a click can take from here: each offerable trigger's,
+    /// in the table's order, with the state key it leads to.
+    pub fn next_states(&self) -> Vec<(&Transition, u64)> {
+        let mut ix: Vec<usize> = self.by_trigger.values().copied().collect();
+        ix.sort_unstable();
+        ix.into_iter().map(|i| (&self.transitions[i], crate::reverse::step_key(self.history.key(), &self.transitions[i]))).collect()
+    }
+
     /// Take the transition a trigger names.
     pub fn navigate(&mut self, trigger: &str) -> Result<(), NavigateError> {
         let i = *self.by_trigger.get(trigger)

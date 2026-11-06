@@ -970,15 +970,27 @@ impl DocumentHost for InProcessHost {
         let mut produced = None;
         if self.bands.get(&id).is_none_or(|b| b.generation != generation) {
             let s = self.sessions.get(id).ok_or("no such session")?;
-            let current = (!initial).then(|| s.document().dom.serialize());
             let rec = self.carried.get(&id).ok_or("no recording for this session")?;
-            let c = if initial { cached() } else { None };
-            let (b, n) = crate::display::Bands::open(rec.bytes(), current.as_deref(), c.as_deref(), generation)?;
-            produced = n;
-            self.bands.insert(id, b);
+            match self.bands.get_mut(&id) {
+                // ★ Only what changed is done again (replay part 2).
+                Some(b) if b.shown().is_some_and(|x| x.0 == s.document().lineage()) => { b.update(rec.bytes(), s.document(), s.state_key(), generation)?; }
+                _ => {
+                    let current = (!initial).then(|| s.document().dom.serialize());
+                    let c = if initial { cached() } else { None };
+                    let (mut b, n) = crate::display::Bands::open(rec.bytes(), current.as_deref(), c.as_deref(), generation)?;
+                    b.showing(s.document(), s.state_key());
+                    produced = n;
+                    self.bands.insert(id, b);
+                }
+            }
         }
         let mut a = self.bands.get_mut(&id).expect("built").ask(ask)?;
         a.normalized = produced;
+        if matches!(ask, crate::display::BandsAsk::Idle { .. }) {
+            if let (Some(b), Some(s), Some(rec)) = (self.bands.get_mut(&id), self.sessions.get(id), self.carried.get(&id)) {
+                if !b.prepare_back() { b.precompute(rec.bytes(), s.document(), &s.next_states(), 1)?; }
+            }
+        }
         Ok(a)
     }
     fn scene(&mut self, id: SessionId, cached: Option<&[u8]>, initial: bool, limit_px: u32, _now: Millis)

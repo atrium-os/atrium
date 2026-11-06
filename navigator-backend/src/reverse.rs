@@ -93,7 +93,8 @@ pub enum Forward {
 pub struct History {
     current: Document,
     /// Each step as (the transition taken, the undo derived when it was taken).
-    past: std::collections::VecDeque<(Transition, Transition)>,
+    /// (…, and the state key before it was taken.)
+    past: std::collections::VecDeque<(Transition, Transition, u64)>,
     /// ★ FORWARD RE-TAKES THE STEP THE READER BACKED OUT OF, through the
     /// ordinary path. It stores the transition, not the document it led to:
     /// after a back the document is byte-identical to the one the step was
@@ -104,6 +105,8 @@ pub struct History {
     ///
     /// Bounded by `past`: an entry arrives here only by leaving it.
     future: Vec<Transition>,
+    /// See `key`.
+    key: u64,
     limits: HistoryLimits,
     /// Steps dropped to stay inside the bound. Never reset: it is the reason
     /// `back` answers `Forgotten` rather than `AtStart`.
@@ -138,12 +141,20 @@ impl History {
 
     pub fn with_limits(document: Document, limits: HistoryLimits) -> Self {
         History {
-            current: document, past: Default::default(), future: vec![],
+            current: document, past: Default::default(), future: vec![], key: 0,
             limits, forgotten: 0, undo_bytes: 0,
         }
     }
 
     pub fn document(&self) -> &Document { &self.current }
+
+    /// ★ WHICH STATE THIS IS (replay part 2): the steps taken from the
+    /// document as opened, chained (`step_key`); going back restores the
+    /// key it had. Two keys equal means the same steps from the same start,
+    /// so the same document — what the display path's cache of laid-out
+    /// states is keyed by. (The same document reached by different steps
+    /// has different keys: a miss, never a wrong answer.)
+    pub fn key(&self) -> u64 { self.key }
     pub fn depth(&self) -> usize { self.past.len() }
     /// How many states the reader can go forward to.
     pub fn ahead(&self) -> usize { self.future.len() }
@@ -164,7 +175,7 @@ impl History {
         while self.past.len() > self.limits.max_steps
             || self.undo_bytes > self.limits.max_undo_bytes
         {
-            let Some((_, dropped)) = self.past.pop_front() else { break };
+            let Some((_, dropped, _)) = self.past.pop_front() else { break };
             self.undo_bytes -= weight(&dropped).min(self.undo_bytes);
             self.forgotten += 1;
         }
@@ -191,7 +202,8 @@ impl History {
         // before, the same document and undo byte for byte.
         let undo = self.current.apply_in_place_with_undo(t)?;
         self.undo_bytes += weight(&undo);
-        self.past.push_back((t.clone(), undo));
+        self.past.push_back((t.clone(), undo, self.key));
+        self.key = step_key(self.key, t);
         self.trim();
         Ok(())
     }
@@ -211,20 +223,29 @@ impl History {
 
     /// Go back one step, saying which of the three things happened.
     pub fn back(&mut self) -> Result<Back, ApplyError> {
-        let Some((taken, undo)) = self.past.pop_back() else {
+        let Some((taken, undo, key)) = self.past.pop_back() else {
             return Ok(if self.forgotten > 0 { Back::Forgotten } else { Back::AtStart });
         };
         match self.current.undo_in_place(&undo) {
             Ok(()) => {
+                self.key = key;
                 self.undo_bytes -= weight(&undo).min(self.undo_bytes);
                 self.future.push(taken);
                 Ok(Back::Stepped)
             }
             Err(e) => {
                 // A failed undo must not consume the step.
-                self.past.push_back((taken, undo));
+                self.past.push_back((taken, undo, key));
                 Err(e)
             }
         }
     }
+}
+
+/// The state key after taking `t` from the state keyed `key` (`History::key`).
+pub fn step_key(key: u64, t: &Transition) -> u64 {
+    let mut h = blake3::Hasher::new();
+    h.update(&key.to_le_bytes());
+    h.update(format!("{t:?}").as_bytes());
+    u64::from_le_bytes(h.finalize().as_bytes()[..8].try_into().expect("8 bytes")) | 1
 }

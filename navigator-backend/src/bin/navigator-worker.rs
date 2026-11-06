@@ -93,14 +93,30 @@ impl Worker {
         ask.check()?;
         let mut produced = None;
         if self.bands.as_ref().is_none_or(|x| x.generation != generation) {
-            let cached = (n > 0).then(|| &payload[nl + 1..]);
-            let current = if initial { None } else { Some(self.session()?.document().dom.serialize()) };
-            let (src, norm) = Bands::open(&self.recording, current.as_deref(), cached, generation)?;
-            produced = norm;
-            self.bands = Some(src);
+            let id = self.id.ok_or("no document")?;
+            let s = self.sessions.get(id).ok_or("no document")?;
+            match self.bands.as_mut() {
+                // ★ The document changed: only what changed is done again
+                // (replay part 2, `Bands::update`).
+                Some(b) if b.shown().is_some_and(|x| x.0 == s.document().lineage()) => { b.update(&self.recording, s.document(), s.state_key(), generation)?; }
+                _ => {
+                    let cached = (n > 0).then(|| &payload[nl + 1..]);
+                    let current = if initial { None } else { Some(s.document().dom.serialize()) };
+                    let (mut src, norm) = Bands::open(&self.recording, current.as_deref(), cached, generation)?;
+                    src.showing(s.document(), s.state_key());
+                    produced = norm;
+                    self.bands = Some(src);
+                }
+            }
         }
         let mut ans = self.bands.as_mut().expect("built").ask(ask)?;
         ans.normalized = produced;
+        // In idle time, the next click's state, laid out ahead.
+        if matches!(ask, BandsAsk::Idle { .. }) {
+            if let (Some(b), Some(s)) = (self.bands.as_mut(), self.id.and_then(|id| self.sessions.get(id))) {
+                if !b.prepare_back() { b.precompute(&self.recording, s.document(), &s.next_states(), 1)?; }
+            }
+        }
         Ok(navigator_backend::display::encode_answer(&ans))
     }
 

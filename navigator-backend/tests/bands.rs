@@ -81,11 +81,13 @@ fn wanted_through_the_broker<H: DocumentHost>(n: Navigatord<H>) {
     let (_, puts_b, _, cached) = want(&mut n, b, 0);
     assert!(cached, "built from the stored normalized document");
     assert_eq!(puts_b.iter().find(|p| p.group == GroupId::Band(0)).unwrap().nsg, b0.nsg, "the same band either way");
-    // A navigated document gets a new source: the revealed note is drawn.
+    // A navigated document is brought up to date in place (replay part 2):
+    // the band the click changed is sent again as UPDATED, with the
+    // revealed note drawn.
     assert!(matches!(n.handle(Request::Navigate { session: b, trigger: "#b".into() }).pop(), Some(Event::SceneReady { .. })));
     let (ev, puts, _, cached) = want(&mut n, b, 0);
-    assert!(!cached && ev.iter().any(|e| matches!(e, SE::BandReady { band: 0, .. })));
-    assert!(puts.iter().any(|p| p.nsg.contains("\"hidden\"")), "the source was built again for the new document");
+    assert!(!cached && ev.iter().any(|e| matches!(e, SE::BandUpdated { band: 0, .. })), "{ev:?}");
+    assert!(puts.iter().any(|p| p.nsg.contains("\"hidden\"")), "the band the click changed is drawn again");
     // An ask out of bounds is refused, and the session survives.
     assert!(matches!(n.handle(Request::Want { session: a, range: (10, 0), zoom_64: 64, prefetch: 0 }).pop(), Some(Event::Blocked { .. })));
     assert!(matches!(n.handle(Request::BandsIdle { session: a, bands: 0 }).pop(), Some(Event::Blocked { .. })));
