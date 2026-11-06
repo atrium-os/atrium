@@ -28,6 +28,7 @@ pub struct State {
     pub kdf_default: KdfParams,
     stores: HashMap<String, Store>,
     audit: Option<File>,
+    handles: crate::handles::Handles,
 }
 
 /// A reply body. Secret bodies stay in locked memory up to the socket.
@@ -98,7 +99,7 @@ impl State {
     pub fn new(dir: PathBuf) -> std::io::Result<State> {
         std::fs::DirBuilder::new().recursive(true).create(&dir)?;
         let audit = OpenOptions::new().create(true).append(true).mode(0o600).open(dir.join("audit.log")).ok();
-        Ok(State { dir, kdf_default: KdfParams::NO_TPM, stores: HashMap::new(), audit })
+        Ok(State { dir, kdf_default: KdfParams::NO_TPM, stores: HashMap::new(), audit, handles: Default::default() })
     }
 
     pub fn handle(&mut self, who: &Label, op: u16, body: &[u8]) -> Reply {
@@ -329,6 +330,7 @@ impl State {
                 if let Some(s) = self.stores.get_mut(&user) {
                     s.lock();
                 }
+                self.handles.lock_user(&user);
                 ok(Vec::new())
             }
             op::V_REWRAP => {
@@ -441,9 +443,144 @@ impl State {
                 tri!(s.set_flags(&id, &who, set, clear));
                 ok(Vec::new())
             }
+            op::U_ACCOUNTS | op::U_HOLD | op::U_HANDLE | op::U_GENERATE => self.field_op(op, body, item),
+            op::U_DROP => {
+                let Ok(h) = <[u8; 16]>::try_from(body) else { return malformed() };
+                self.handles.drop_handle(&h);
+                ok(Vec::new())
+            }
             _ => reply(status::DENIED),
         }
     }
+
+    /// The credential field's ops. The recipient is the field's parent app,
+    /// which arca-ui resolved from the launch registry by the parent's uid.
+    fn field_op(&mut self, op: u16, body: &[u8], item: &mut Option<ItemId>) -> Reply {
+        use crate::handles::{Entry, Source};
+        let mut r = Reader::new(body);
+        let parsed = (|| {
+            let user = r.str(caps::USER)?.to_string();
+            let publisher = r.array::<32>()?;
+            let app_id = r.str(caps::APP_ID)?.to_string();
+            Ok::<_, Error>((user, publisher, app_id))
+        })();
+        let Ok((user, publisher, app_id)) = parsed else { return malformed() };
+        let Ok(app) = Recipient::app(publisher, &app_id) else { return malformed() };
+        let Some(store) = self.stores.get(&user) else { return reply(status::LOCKED) };
+        let who = Access { persona: PERSONA, recipient: &app };
+        let entry = |source, generated| Entry {
+            user: user.clone(),
+            recipient: app.clone(),
+            source,
+            expires: std::time::Instant::now() + crate::handles::TTL,
+            generated,
+        };
+        let issued = |h: Option<[u8; 16]>| match h {
+            Some(h) => ok(h.to_vec()),
+            None => reply(status::FULL),
+        };
+        match op {
+            op::U_ACCOUNTS => {
+                if r.end().is_err() {
+                    return malformed();
+                }
+                let items = tri!(store.list(&who));
+                let mut w = Writer::new();
+                let pw: Vec<_> = items.into_iter().filter(|m| m.kind == Kind::Password).collect();
+                w.u32(pw.len() as u32);
+                for m in pw {
+                    w.raw(&m.id.0);
+                    w.str(&m.account);
+                }
+                ok(w.buf)
+            }
+            op::U_HOLD => {
+                let Ok(v) = r.bytes(caps::VALUE) else { return malformed() };
+                if r.end().is_err() || v.is_empty() {
+                    return malformed();
+                }
+                if store.state() != LockState::Unlocked {
+                    return reply(status::LOCKED); // passwords are while-unlocked
+                }
+                let v = tri!(LockedBuf::from_slice(v).map_err(Error::Io));
+                issued(self.handles.issue(entry(Source::Pending(v), false)))
+            }
+            op::U_HANDLE => {
+                let Ok(id) = r.array::<16>() else { return malformed() };
+                if r.end().is_err() {
+                    return malformed();
+                }
+                let id = ItemId(id);
+                *item = Some(id);
+                let m = tri!(store.meta(&id, &who));
+                if m.kind != Kind::Password {
+                    return reply(status::DENIED);
+                }
+                if m.class != Class::AfterFirstUnlock && store.state() != LockState::Unlocked {
+                    return reply(status::LOCKED);
+                }
+                issued(self.handles.issue(entry(Source::Item(id), false)))
+            }
+            op::U_GENERATE => {
+                if r.end().is_err() {
+                    return malformed();
+                }
+                if store.state() != LockState::Unlocked {
+                    return reply(status::LOCKED);
+                }
+                let v = tri!(generate_password());
+                issued(self.handles.issue(entry(Source::Pending(v), true)))
+            }
+            _ => reply(status::DENIED),
+        }
+    }
+
+    /// For the courier (A1) and tests: redeem a handle for the verified
+    /// recipient, once. The value is in locked memory.
+    pub fn redeem(&mut self, handle: &[u8; 16], user: &str, recipient: &Recipient) -> Option<LockedBuf> {
+        use crate::handles::Source;
+        let e = self.handles.take(handle, user, recipient)?;
+        match e.source {
+            Source::Pending(v) => Some(v),
+            Source::Item(id) => {
+                let store = self.stores.get(user)?;
+                let who = Access { persona: PERSONA, recipient };
+                store.release(&id, &who, None).ok().map(|(_, v)| v)
+            }
+        }
+    }
+}
+
+/// A strong password: four groups of five from [a-zA-Z0-9] joined by '-'
+/// (about 119 bits), typeable on any keyboard and accepted by nearly every
+/// site's rules. Made in locked memory; never logged or shown.
+fn generate_password() -> Result<LockedBuf, Error> {
+    const ALPHA: &[u8] = b"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
+    let mut out = LockedBuf::zeroed(23)?;
+    let mut rnd = LockedBuf::zeroed(64)?;
+    let mut i = 0;
+    let mut pos = 0;
+    while pos < 23 {
+        if pos == 5 || pos == 11 || pos == 17 {
+            out.as_mut()[pos] = b'-';
+            pos += 1;
+            continue;
+        }
+        if i == rnd.len() {
+            i = 0;
+        }
+        if i == 0 {
+            getrandom::getrandom(rnd.as_mut()).map_err(std::io::Error::other)?;
+        }
+        let b = rnd.as_ref()[i];
+        i += 1;
+        // Rejection sampling: 248 = 4 × 62, so no bias.
+        if b < 248 {
+            out.as_mut()[pos] = ALPHA[(b % 62) as usize];
+            pos += 1;
+        }
+    }
+    Ok(out)
 }
 
 fn signing_key(seed: &LockedBuf) -> SigningKey {

@@ -59,6 +59,22 @@ pub mod op {
     pub const U_GRANT: u16 = 0x60;
     /// Revoke that grant, same body.
     pub const U_REVOKE: u16 = 0x61;
+
+    // The credential field (arca-autofill.md). Every body starts with the
+    // field's parent as arca-ui resolved it from the launch registry:
+    // `str user | publisher[32] | str app_id`, the item recipient.
+
+    /// → `u32 n | n × (id[16] | str account)`: the passwords the chip offers.
+    pub const U_ACCOUNTS: u16 = 0x62;
+    /// `parent | bytes value` → `handle[16]`: hold what the user typed.
+    pub const U_HOLD: u16 = 0x63;
+    /// `parent | id[16]` → `handle[16]`: the item the user picked on the chip.
+    pub const U_HANDLE: u16 = 0x64;
+    /// `parent` → `handle[16]`: a strong password made inside Arca, held
+    /// pending; nobody sees it unless the user reveals it.
+    pub const U_GENERATE: u16 = 0x65;
+    /// `handle[16]` → nothing: the field was cleared or detached.
+    pub const U_DROP: u16 = 0x66;
 }
 
 /// Reply status. Every refusal about an item that isn't the caller's own

@@ -29,6 +29,7 @@ version = "0.1.0"
 dependencies = [
  "arca-store",
  "ed25519-dalek",
+ "getrandom 0.2.17",
  "libc",
  "portcullis-peer",
  "tempfile",
