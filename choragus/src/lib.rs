@@ -13,7 +13,7 @@
 
 pub mod app;
 pub mod capability;
-pub mod control;
+pub mod daemon;
 pub mod grant;
 pub mod identity;
 pub mod policy;

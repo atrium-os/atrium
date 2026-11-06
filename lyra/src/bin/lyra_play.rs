@@ -1,71 +1,94 @@
-//! lyra-play — the reference audio app, using ONE front door.
+//! lyra-play — the reference audio app (lyra-v1.md §5).
 //!
-//! It calls `lyra_protocol::client::play`: connect to **choragusd**, register
-//! under a role (declaring requested capabilities), and receive the data-plane
-//! ring — which choragusd brokered from lyrad after applying policy (routing,
-//! ducking of others, the §9 capability check). The app never touches the RT
-//! engine directly. It then writes a tone into the ring; lyrad mixes it.
+//! Connects to choragusd with `lyra_protocol::client`, opens one stream,
+//! primes its ring, starts it, plays a tone, drains and exits. Its identity is
+//! its uid (choragusd resolves it through the launch registry); it sends no
+//! name of its own.
 //!
-//! This is the payoff of the client-library refactor: an app depends only on
-//! `lyra-protocol` (wire + ring + client), not on the engine or the policy crate.
-//!
-//! usage: lyra-play <choragus_sock> <role> <secs> [app_id] [monitor|mic]
+//! usage: lyra-play <choragus_sock> <role> <secs> [ignored...]
+//!   LYRA_PLAY_FREQ (Hz, default by role), LYRA_PLAY_RATE (default 48000),
+//!   LYRA_PLAY_CHANNELS (1, 2, 6 or 8; default 2), LYRA_PLAY_VOLUME (0..1).
 
-use lyra_protocol::app::{role_byte, CAP_AUDIO, CAP_MICROPHONE, CAP_MONITOR};
-use lyra_protocol::client;
+use lyra_protocol::client::Client;
+use lyra_protocol::wire::{Role, StreamParams, ToApp};
 
-const RATE: f32 = 48_000.0;
 const CHUNK: usize = 256;
+
+fn env<T: std::str::FromStr>(k: &str) -> Option<T> {
+    std::env::var(k).ok().and_then(|v| v.parse().ok())
+}
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
-    let sock = args.get(1).map(String::as_str).unwrap_or("/tmp/choragus.sock");
-    let role = args.get(2).and_then(|s| role_byte(s)).unwrap_or(0);
-    let secs: f32 = args.get(3).and_then(|s| s.parse().ok()).unwrap_or(4.0);
-    let app_id = args.get(4).map(String::as_str).unwrap_or("org.atrium.player");
-    let mut caps = CAP_AUDIO;
-    if args.iter().any(|a| a == "monitor") { caps |= CAP_MONITOR; }
-    if args.iter().any(|a| a == "mic") { caps |= CAP_MICROPHONE; }
-    // distinct tone per role, and distinct from lyrad's synth fallback (440/660)
-    // so the spectral proof shows the REAL fed audio. LYRA_PLAY_FREQ overrides it
-    // (the multi-session demo gives two same-role streams distinct tones).
-    let freq = std::env::var("LYRA_PLAY_FREQ")
-        .ok()
-        .and_then(|v| v.parse::<f32>().ok())
-        .unwrap_or(500.0 + 90.0 * role as f32);
-
-    let stream = match client::play(sock, app_id, role, caps) {
-        Ok(s) => s,
-        Err(e) => {
-            eprintln!("lyra-play: play denied/failed: {e} (granted? choragusd up?)");
-            std::process::exit(1);
-        }
+    let sock = args.get(1).map(String::as_str).unwrap_or("/atrium/sockets/audio/audio.sock");
+    let (role, base) = match args.get(2).map(|s| s.to_ascii_lowercase()).as_deref() {
+        Some("comms") | Some("communication") => (Role::Communication, 590.0),
+        Some("notification") | Some("notify") => (Role::Notification, 680.0),
+        Some("game") => (Role::Game, 770.0),
+        Some("pro") => (Role::Pro, 860.0),
+        _ => (Role::Media, 500.0),
     };
-    eprintln!("lyra-play: '{app_id}' registered as role {role} -> stream {} ({freq:.0} Hz), playing {secs}s",
-        stream.stream_id);
+    let secs: f32 = args.get(3).and_then(|s| s.parse().ok()).unwrap_or(4.0);
+    let freq: f32 = env("LYRA_PLAY_FREQ").unwrap_or(base);
+    let rate: u32 = env("LYRA_PLAY_RATE").unwrap_or(48_000);
+    let channels: u8 = env("LYRA_PLAY_CHANNELS").unwrap_or(2);
 
-    let step = 2.0 * std::f32::consts::PI * freq / RATE;
+    let mut c = match Client::connect(sock, None) {
+        Ok(c) => c,
+        Err(e) => { eprintln!("lyra-play: connect {sock}: {e}"); std::process::exit(1); }
+    };
+    let params = StreamParams { role, rate, channels, buffer_ms: 100, label: "Tone".into() };
+    let s = match c.open(params) {
+        Ok(s) => s,
+        Err(e) => { eprintln!("lyra-play: open refused: {e}"); std::process::exit(1); }
+    };
+    if let Some(v) = env::<f32>("LYRA_PLAY_VOLUME") {
+        let _ = c.set_volume(&s, v);
+    }
+    eprintln!("lyra-play: stream {} ({role:?}, {rate} Hz, {channels} ch, {freq:.0} Hz tone) for {secs}s", s.id);
+
+    let ch = channels as usize;
+    let step = 2.0 * std::f32::consts::PI * freq / rate as f32;
     let mut phase = 0.0f32;
-    let mut buf = vec![0.0f32; CHUNK * 2];
-    let chunks = (secs * RATE / CHUNK as f32) as u64;
-    for _ in 0..chunks {
+    let mut buf = vec![0.0f32; CHUNK * ch];
+    let total = (secs * rate as f32) as u64;
+    let mut written = 0u64;
+    let mut started = false;
+    while written < total {
         for f in 0..CHUNK {
-            let s = phase.sin() * 0.25;
-            buf[f * 2] = s;
-            buf[f * 2 + 1] = s;
+            let v = phase.sin() * 0.25;
+            for k in 0..ch {
+                buf[f * ch + k] = v;
+            }
             phase += step;
             if phase > 2.0 * std::f32::consts::PI { phase -= 2.0 * std::f32::consts::PI; }
         }
         let mut off = 0usize;
         while off < CHUNK {
-            let w = stream.write(&buf[off * 2..]) as usize;
+            let w = s.write(&buf[off * ch..]) as usize;
             off += w;
             if w == 0 {
-                unsafe { libc::usleep(500) };
+                if !started {
+                    // ring primed: start playing.
+                    let _ = c.start(&s);
+                    started = true;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(2));
             }
         }
+        written += CHUNK as u64;
     }
-    eprintln!("lyra-play: done (dropping the session closes the stream)");
-    // dropping `stream` closes the choragusd session -> choragusd closes the
-    // stream and un-ducks anything that was ducked for it.
+    if !started {
+        let _ = c.start(&s);
+    }
+    let _ = c.drain(&s);
+    loop {
+        match c.next_event() {
+            Ok(ToApp::Drained { .. }) => break,
+            Ok(ToApp::Underrun { frames, .. }) => eprintln!("lyra-play: underrun, {frames} frames"),
+            Ok(ToApp::StreamLost { .. }) | Err(_) => { eprintln!("lyra-play: stream lost"); break; }
+            Ok(_) => {}
+        }
+    }
+    eprintln!("lyra-play: done");
 }

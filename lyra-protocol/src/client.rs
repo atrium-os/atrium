@@ -1,57 +1,143 @@
-//! The high-level audio-app API — one front door.
+//! The app API (lyra-v1.md §5). An app connects to choragusd, opens streams,
+//! writes interleaved `f32` (or `i16`) samples into each stream's ring, and
+//! reads events. It never talks to lyrad.
 //!
-//! An app calls [`play`]: it connects to **choragusd** (the session layer),
-//! registers under a role, and receives the producer end of its data-plane ring
-//! — which choragusd brokered from lyrad. The app never touches the RT engine
-//! directly; policy (routing, ducking, the §9 capability check) is applied on the
-//! way. The returned [`PlayStream`] owns the session connection: dropping it
-//! closes the stream.
+//! ```no_run
+//! use lyra_protocol::client::Client;
+//! use lyra_protocol::wire::{Role, StreamParams};
+//! let mut c = Client::connect("/atrium/sockets/audio/audio.sock", None)?;
+//! let s = c.open(StreamParams { role: Role::Media, rate: 48_000, channels: 2, buffer_ms: 100, label: "Video".into() })?;
+//! s.write(&[0.0; 960]);   // prime the ring
+//! c.start(&s)?;
+//! # Ok::<(), std::io::Error>(())
+//! ```
 
-use crate::app::{write_hello, AppMsg, DENIED};
 use crate::fdpass::recv_fd;
 use crate::ring::Ring;
-use std::io::{self, Read, Write};
+use crate::wire::{self, DenyCode, StreamParams, ToApp, ToChoragus};
+use std::collections::VecDeque;
+use std::io;
 use std::os::fd::AsRawFd;
 use std::os::unix::net::UnixStream;
 
-/// A registered, playing audio stream: the producer end of its ring plus the
-/// live session connection to choragusd.
-pub struct PlayStream {
-    pub stream_id: u32,
+/// An open stream: the producer end of its ring.
+pub struct Stream {
+    pub id: u32,
+    pub channels: u8,
+    pub rate: u32,
     pub ring: Ring,
-    conn: UnixStream, // hold the session open; dropping it closes the stream
+    /// lyrad's output latency when the stream opened (device queue + delays).
+    pub latency_ns: u64,
 }
 
-impl PlayStream {
-    /// Write interleaved frames into the ring; returns frames accepted (bounded
-    /// by free space — the consumer's drain paces a well-behaved source).
+impl Stream {
+    /// Write interleaved frames; returns frames accepted (bounded by free space).
     pub fn write(&self, frames: &[f32]) -> u64 {
         self.ring.write(frames)
     }
 
-    /// The session fd (for poll/close); the stream lives as long as it is open.
-    pub fn session(&self) -> &UnixStream {
-        &self.conn
+    /// Write interleaved `i16` frames, converted to `f32`.
+    pub fn write_i16(&self, frames: &[i16]) -> u64 {
+        let f: Vec<f32> = frames.iter().map(|&s| s as f32 / 32768.0).collect();
+        self.ring.write(&f)
+    }
+
+    /// Frames of free space in the ring.
+    pub fn writable(&self) -> u64 {
+        self.ring.writable()
     }
 }
 
-/// Connect to choragusd, register `app_id` as `role`/`caps`, and receive the
-/// data-plane ring (brokered from lyrad). The single front door: control + data
-/// set up over one connection, policy applied between.
-pub fn play(choragus_sock: &str, app_id: &str, role: u8, caps: u8) -> io::Result<PlayStream> {
-    let mut conn = UnixStream::connect(choragus_sock)?;
-    write_hello(&mut conn, app_id)?;
-    conn.write_all(&AppMsg::Register { role, caps }.encode())?;
+/// A connection to choragusd.
+pub struct Client {
+    sock: UnixStream,
+    pub device_rate: u32,
+    pub device_channels: u8,
+    pub period_frames: u32,
+    next_tag: u32,
+    pending: VecDeque<ToApp>,
+}
 
-    let mut idb = [0u8; 4];
-    conn.read_exact(&mut idb)?;
-    let id = u32::from_le_bytes(idb);
-    if id == DENIED {
-        return Err(io::Error::new(io::ErrorKind::PermissionDenied, "registration denied"));
+fn denied(code: DenyCode) -> io::Error {
+    let kind = match code {
+        DenyCode::NotGranted => io::ErrorKind::PermissionDenied,
+        DenyCode::EngineUnavailable => io::ErrorKind::NotConnected,
+        _ => io::ErrorKind::InvalidInput,
+    };
+    io::Error::new(kind, format!("denied: {code:?}"))
+}
+
+impl Client {
+    /// Connect and say hello. `ticket`: a Limen attribution ticket, if this
+    /// process is an embedded player.
+    pub fn connect(path: &str, ticket: Option<[u8; 16]>) -> io::Result<Client> {
+        let mut sock = UnixStream::connect(path)?;
+        wire::send(&mut sock, &ToChoragus::Hello { version: wire::VERSION, ticket })?;
+        match wire::recv::<_, ToApp>(&mut sock)? {
+            ToApp::Welcome { device_rate, device_channels, period_frames } => Ok(Client {
+                sock,
+                device_rate,
+                device_channels,
+                period_frames,
+                next_tag: 1,
+                pending: VecDeque::new(),
+            }),
+            ToApp::Denied { code, .. } => Err(denied(code)),
+            other => Err(io::Error::new(io::ErrorKind::InvalidData, format!("expected Welcome, got {other:?}"))),
+        }
     }
 
-    // choragusd follows the id with the ring's fd (it brokered it from lyrad).
-    let fd = recv_fd(conn.as_raw_fd())?;
-    let ring = Ring::from_fd(fd, true)?; // this end is the producer
-    Ok(PlayStream { stream_id: id, ring, conn })
+    /// Open a stream (paused). Events that arrive meanwhile are kept for
+    /// [`Client::next_event`].
+    pub fn open(&mut self, params: StreamParams) -> io::Result<Stream> {
+        let tag = self.next_tag;
+        self.next_tag = self.next_tag.wrapping_add(1).max(1);
+        let (rate, channels) = (params.rate, params.channels);
+        wire::send(&mut self.sock, &ToChoragus::Open { tag, params })?;
+        loop {
+            match wire::recv::<_, ToApp>(&mut self.sock)? {
+                ToApp::Opened { tag: t, stream, latency_ns, .. } if t == tag => {
+                    let fd = recv_fd(self.sock.as_raw_fd())?;
+                    let ring = Ring::from_fd(fd, true)?;
+                    return Ok(Stream { id: stream, channels, rate, ring, latency_ns });
+                }
+                ToApp::Denied { tag: t, code } if t == tag => return Err(denied(code)),
+                other => self.pending.push_back(other),
+            }
+        }
+    }
+
+    pub fn start(&mut self, s: &Stream) -> io::Result<()> {
+        wire::send(&mut self.sock, &ToChoragus::Start { stream: s.id })
+    }
+    pub fn pause(&mut self, s: &Stream) -> io::Result<()> {
+        wire::send(&mut self.sock, &ToChoragus::Pause { stream: s.id })
+    }
+    /// Drop what is queued; a `Flushed` event says where the next frame starts.
+    pub fn flush(&mut self, s: &Stream) -> io::Result<()> {
+        wire::send(&mut self.sock, &ToChoragus::Flush { stream: s.id })
+    }
+    /// A `Drained` event follows when the last written frame has been heard.
+    pub fn drain(&mut self, s: &Stream) -> io::Result<()> {
+        wire::send(&mut self.sock, &ToChoragus::Drain { stream: s.id })
+    }
+    pub fn set_volume(&mut self, s: &Stream, gain: f32) -> io::Result<()> {
+        wire::send(&mut self.sock, &ToChoragus::SetVolume { stream: s.id, gain })
+    }
+    pub fn close(&mut self, s: Stream) -> io::Result<()> {
+        wire::send(&mut self.sock, &ToChoragus::Close { stream: s.id })
+    }
+
+    /// The next event (blocking).
+    pub fn next_event(&mut self) -> io::Result<ToApp> {
+        if let Some(e) = self.pending.pop_front() {
+            return Ok(e);
+        }
+        wire::recv(&mut self.sock)
+    }
+
+    /// The socket, to poll for events.
+    pub fn socket(&self) -> &UnixStream {
+        &self.sock
+    }
 }

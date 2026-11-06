@@ -3010,27 +3010,26 @@ volume/privacy and drives lyrad over `lyra-protocol` (Aqueduct class 5). Cross-
 compile all three crates (`lyra`, `choragus`, `lyra-protocol`) from the host.
 
 ```sh
-# lyrad as the service (lyra-v1.md §3): one socket carrying control frames and
-# ring requests (Ctl::RingFor). `--control <sock>` is the dev form: it trusts
+# lyrad as the service (lyra-v1.md §3): one socket speaking lyra_protocol::wire
+# (choragusd's Open gets the ring fd back on the same connection). `--control <sock>` is the dev form: it trusts
 # only lyrad's own uid unless ATRIUM_LYRAD_PEERS names others. There is no data
 # socket any more; apps get their ring from choragusd. Runs until killed.
 vssh "cp /mnt/host/lyra/target/aarch64-unknown-freebsd/release/{lyrad,lyra-play} \
          /mnt/host/choragus/target/aarch64-unknown-freebsd/release/choragusd /root/"
 vssh "LYRA_DUMP=/root/mix.raw /root/lyrad --control /tmp/lyrad.ctl &"
 
-# choragusd as the SESSION DAEMON: apps register, policy drives lyrad. --grants
-# points at the capability store (etc/choragus.grants.example is the format).
+# choragusd in development mode: one socket allowing every capability. With no
+# --app-registry an app is named by its uid's user name, so the grants file is
+# keyed by user here (the service names apps through the launch registry).
+vssh "echo 'root audio' > /root/choragus.grants"
 vssh "/root/choragusd --daemon /tmp/choragus.sock /tmp/lyrad.ctl --grants /root/choragus.grants &"
 
-# an app: register under a role -> choragusd opens the slot, applies policy and
-# brokers the ring fd from lyrad. lyra-play writes a real tone into it. A second
-# app registering as 'comms' ducks the media app automatically.
-vssh "/root/lyra-play /tmp/choragus.sock media 6 org.atrium.player &"
-vssh "/root/lyra-play /tmp/choragus.sock comms 2 org.atrium.meet"
+# an app (lyra_protocol::client): open a stream, prime the ring, start, drain.
+# A second app opening as 'comms' ducks the media app by -18 dB.
+vssh "/root/lyra-play /tmp/choragus.sock media 6 &"
+vssh "LYRA_PLAY_RATE=44100 LYRA_PLAY_CHANNELS=1 /root/lyra-play /tmp/choragus.sock comms 2"
 
-# privacy: a recorder requesting the system monitor is DENIED unless its app-id is
-# granted audio_monitor in the store (default-deny).
-vssh "/root/lyra-play /tmp/choragus.sock media 1 org.evil.spyware monitor"  # DENIED
+# no grant, no sound: an empty grants file refuses every app at Hello.
 ```
 
 **As jailed services** (lyra-v1.md §3): lyrad as `_lyra` with the atrium_audio

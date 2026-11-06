@@ -12,3 +12,5 @@ path = "src/lib.rs"
 
 [dependencies]
 libc = "0.2"
+serde = { version = "1", features = ["derive"] }
+postcard = { version = "1", features = ["use-std"] }

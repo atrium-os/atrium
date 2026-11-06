@@ -123,8 +123,8 @@ Limen uses. Samples never cross the socket; they go through the ring.
 |---|---|---|
 | app → | `Hello` | `version: u16`, `ticket: Option<[u8; 16]>` |
 | → app | `Welcome` | `device_rate`, `device_channels`, `period_frames` |
-| app → | `Open` | `role` (media, communication, notification, game, pro), `rate` (8000 to 192000), `channels` (1 to 8), `format` (F32, S16), `buffer_ms` (10 to 2000), `label: String` (at most 64 bytes, shown in the volume UI, e.g. "Video") |
-| → app | `Opened` | `stream`, `ring_frames`, `latency_ns` (fd passed: the ring), (fd passed: the clock page) |
+| app → | `Open` | `tag` (the app's number, echoed back), `role` (media, communication, notification, game, pro), `rate` (8000 to 192000), `channels` (1, 2, 6 or 8), `buffer_ms` (10 to 2000), `label: String` (at most 64 bytes, shown in the volume UI, e.g. "Video"). Samples in the ring are always interleaved f32; the client library converts i16 |
+| → app | `Opened` | `tag`, `stream`, `ring_frames`, `latency_ns` (fd passed: the ring), (fd passed: the clock page, from A5) |
 | app → | `Start`, `Pause` | `stream`. A new stream is paused until `Start`, so the app can fill the ring first |
 | app → | `Flush` | `stream`: drop everything queued (a seek) |
 | → app | `Flushed` | `stream`, `frame`: the stream position the next written frame will have |
@@ -136,11 +136,15 @@ Limen uses. Samples never cross the socket; they go through the ring.
 | → app | `Changed` | `stream`, `latency_ns`: the route or device changed (a headset was plugged in) |
 | → app | `Held` | `stream`, `held: bool`: policy is holding it silent (seat switch, exclusive claim) |
 | → app | `StreamLost` | `stream`: lyrad went away |
-| → app | `Denied` | `code`: not granted, too many streams, bad format |
+| → app | `Denied` | `tag` (the `Open` it answers, else 0), `code`: not granted, too many streams, too much memory, bad format, engine unavailable, no such stream |
 
 **Limits per app connection:** 8 streams, 4 MiB of rings in total, 64 messages queued. Over
 the stream or memory limit `Open` gets `Denied`; a connection that overflows its queue is
 closed. lyrad holds at most 64 streams in all.
+
+Built (A4): `lyra_protocol::wire` holds these messages and the choragusd ⟷ lyrad ones
+(`ToEngine`, `FromEngine`), and `lyra_protocol::client` is the app API. `lyra-play` is
+the reference app.
 
 **The ring.** lyrad creates it with `SHM_ANON` and passes the fd, as now, sized from
 `buffer_ms` in the stream's own rate and format. lyrad keeps its read position in its own

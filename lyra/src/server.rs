@@ -1,36 +1,37 @@
-//! lyrad as a service (lyra-v1.md §3, work item A2).
+//! lyrad as a service (lyra-v1.md §3 and §5, work items A2 and A4).
 //!
-//! The mixer `lyrad --control` proved, run the way a system service must run:
-//!
-//! - **One socket, one peer.** `lyrad.sock` carries the control frames *and*
-//!   ring requests (`Ctl::RingFor`), and lyrad accepts a connection only from
-//!   the uids it was told to trust (choragusd's). The old separate data socket
-//!   handed a fresh ring for any stream id to anyone who could connect, which
-//!   let a caller take over another app's stream; it is gone.
+//! - **One socket, one peer.** `lyrad.sock` speaks [`wire::ToEngine`] /
+//!   [`wire::FromEngine`], and lyrad accepts a connection only from the uids it
+//!   was told to trust (choragusd's). A stream's ring is made only by the
+//!   `Open` that creates the stream, on that connection.
 //! - **Sessions.** The trusted peer's connection is a session. Every stream
 //!   belongs to it: when it ends (choragusd exits or restarts) every stream is
-//!   closed, and a new connection starts with none.
-//! - **Runs until stopped**, reopening the device if it goes away, and plays
-//!   silence for a stream with no ring (no demo tones).
-//! - **A bad stream is only noise in its own slot.** Samples are checked before
-//!   they are summed ([`sanitize`]): one NaN no longer silences every app.
+//!   closed, and commands from a stale session are ignored.
+//! - **Streams** have their own rate (8 to 192 kHz) and channel count (1, 2,
+//!   6, 8). lyrad converts each once, to the device's rate and layout
+//!   ([`Adapter`]), checks its samples ([`sanitize`]), applies its gain and sums.
+//!   A stream starts paused; `Flush` drops what is queued; `Drain` reports when
+//!   the last frame has been played; empty rings are reported as underruns, at
+//!   most once a second.
+//! - **Runs until stopped**, reopening the device if it goes away.
 //!
-//! The engine state ([`Engine`]) is host-testable; [`run`] is the FreeBSD loop.
+//! The engine ([`Engine`]) is host-testable; [`run`] is the FreeBSD loop.
 
+use crate::channels::{matrix, ChannelMap};
 use crate::gain::Gain;
 use crate::oss::OssSink;
 use crate::ring::Ring;
-use lyra_protocol::{Ctl, FRAME_LEN};
-use std::io::{self, Read};
+use lyra_protocol::wire::{self, FromEngine, ToEngine};
+use std::io;
 use std::os::fd::AsRawFd;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::PathBuf;
-use std::sync::mpsc;
+use std::sync::{mpsc, Arc, Mutex};
 
 /// The most streams lyrad mixes at once (lyra-v1.md §5).
 pub const MAX_STREAMS: usize = 64;
-/// Ring depth per stream, in frames (A4 sizes it from the stream's `buffer_ms`).
-pub const RING_FRAMES: u64 = 4096;
+/// Largest ring lyrad will make, in frames (2 s at 192 kHz, rounded up).
+pub const MAX_RING_FRAMES: u64 = 1 << 19;
 /// Largest magnitude a sample may have after [`sanitize`].
 pub const SAMPLE_LIMIT: f32 = 4.0;
 
@@ -43,35 +44,151 @@ pub fn sanitize(buf: &mut [f32]) {
     }
 }
 
+fn layout(channels: u8) -> Option<ChannelMap> {
+    Some(match channels {
+        1 => ChannelMap::mono(),
+        2 => ChannelMap::stereo(),
+        6 => ChannelMap::surround_5_1(),
+        8 => ChannelMap::surround_7_1(),
+        _ => return None,
+    })
+}
+
+/// Converts one stream to the device: pulls frames from its ring at the
+/// stream's rate, resamples (linear; resample once, architecture §4) and maps
+/// channels, producing exactly the frames the period needs.
+pub struct Adapter {
+    ch: usize,
+    dev_ch: usize,
+    /// Stream frames per device frame.
+    ratio: f64,
+    frac: f64,
+    /// Stream frames read but not yet used; always starts with the left
+    /// interpolation point.
+    carry: Vec<f32>,
+    m: Vec<Vec<f32>>,
+    scratch: Vec<f32>,
+}
+
+impl Adapter {
+    pub fn new(rate: u32, channels: u8, dev_rate: u32, dev_channels: u8) -> Option<Adapter> {
+        let m = matrix(&layout(channels)?, &layout(dev_channels)?);
+        let ch = channels as usize;
+        Some(Adapter {
+            ch,
+            dev_ch: dev_channels as usize,
+            ratio: rate as f64 / dev_rate as f64,
+            frac: 0.0,
+            carry: vec![0.0; ch],
+            m,
+            scratch: Vec::new(),
+        })
+    }
+
+    /// Forget carried frames (a flush).
+    pub fn reset(&mut self) {
+        self.frac = 0.0;
+        self.carry.clear();
+        self.carry.resize(self.ch, 0.0);
+    }
+
+    /// Fill `out` (`n × dev_ch` interleaved) from `ring`. Returns the device
+    /// frames that had real input; the rest are zero (an underrun).
+    pub fn pull(&mut self, ring: &Ring, out: &mut [f32]) -> usize {
+        let n = out.len() / self.dev_ch;
+        let ch = self.ch;
+        let have = self.carry.len() / ch;
+        // Highest stream index the n outputs touch, plus its right neighbour.
+        let need = (self.frac + (n.saturating_sub(1)) as f64 * self.ratio).floor() as usize + 2;
+        if need > have {
+            let start = self.carry.len();
+            self.carry.resize(need * ch, 0.0);
+            let got = ring.read(&mut self.carry[start..]) as usize;
+            self.carry.truncate(start + got * ch);
+        }
+        let have = self.carry.len() / ch;
+        self.scratch.resize(ch, 0.0);
+        let mut produced = 0;
+        for k in 0..n {
+            let x = self.frac + k as f64 * self.ratio;
+            let i = x.floor() as usize;
+            if i + 1 >= have {
+                break;
+            }
+            let t = (x - i as f64) as f32;
+            for c in 0..ch {
+                self.scratch[c] = self.carry[i * ch + c] * (1.0 - t) + self.carry[(i + 1) * ch + c] * t;
+            }
+            for o in 0..self.dev_ch {
+                let mut acc = 0.0;
+                for c in 0..ch {
+                    acc += self.m[o][c] * self.scratch[c];
+                }
+                out[k * self.dev_ch + o] = acc;
+            }
+            produced += 1;
+        }
+        out[produced * self.dev_ch..].iter_mut().for_each(|v| *v = 0.0);
+        // Drop the stream frames fully behind the next output's left point.
+        let next = self.frac + produced as f64 * self.ratio;
+        let drop = (next.floor() as usize).min(have.saturating_sub(1));
+        self.frac = next - drop as f64;
+        self.carry.drain(..drop * ch);
+        if produced < n {
+            // Underrun: keep only the last frame as the left point, and restart
+            // the phase there so the next frames line up.
+            let keep = self.carry.len().saturating_sub(ch);
+            self.carry.drain(..keep);
+            self.frac = 0.0;
+        }
+        produced
+    }
+}
+
 /// A command for the engine, applied at a period boundary.
 pub enum Cmd {
     /// A trusted peer connected: session `gen` begins with no streams.
     Begin(u64),
     /// Session `gen`'s connection ended: close its streams.
     End(u64),
-    Ctl(u64, Ctl),
-    /// The consumer end of the ring made for `stream` by session `gen`.
-    Attach(u64, u32, Ring),
+    Msg(u64, ToEngine),
+    /// A stream made by session `gen`'s `Open`, with the consumer end of its ring.
+    Open(u64, u32, Box<Adapter>, Ring),
 }
 
 struct Slot {
     id: u32,
     gain: Gain,
-    ring: Option<Ring>,
+    ring: Ring,
+    adapter: Box<Adapter>,
+    playing: bool,
+    /// Periods left before `Drained`, once the ring has run dry.
+    drain: Option<Option<u32>>,
+    underrun_frames: u64,
+    periods_since_report: u32,
 }
 
 /// The mix state: the current session and its streams.
 pub struct Engine {
     gen: u64,
     slots: Vec<Slot>,
-    rate: f32,
-    channels: usize,
+    rate: u32,
+    period_frames: usize,
     tmp: Vec<f32>,
+    /// Events for the current session, taken by [`Engine::take_events`].
+    events: Vec<FromEngine>,
 }
 
 impl Engine {
     pub fn new(rate: u32, channels: usize, period_frames: usize) -> Self {
-        Engine { gen: 0, slots: Vec::new(), rate: rate as f32, channels, tmp: vec![0.0; period_frames * channels] }
+        Engine {
+            gen: 0,
+            slots: Vec::new(),
+            rate,
+            period_frames,
+            tmp: vec![0.0; period_frames * channels],
+            events: Vec::new(),
+        }
     }
 
     pub fn streams(&self) -> usize {
@@ -80,6 +197,18 @@ impl Engine {
 
     pub fn is_open(&self, stream: u32) -> bool {
         self.slots.iter().any(|s| s.id == stream)
+    }
+
+    pub fn session(&self) -> u64 {
+        self.gen
+    }
+
+    pub fn take_events(&mut self) -> Vec<FromEngine> {
+        std::mem::take(&mut self.events)
+    }
+
+    fn slot(&mut self, stream: u32) -> Option<&mut Slot> {
+        self.slots.iter_mut().find(|s| s.id == stream)
     }
 
     /// Apply one command. Commands from a session that is not the current one
@@ -91,6 +220,7 @@ impl Engine {
                     eprintln!("lyrad: new session {g}; closing {} stream(s) of session {}", self.slots.len(), self.gen);
                 }
                 self.slots.clear();
+                self.events.clear();
                 self.gen = g;
             }
             Cmd::End(g) if g == self.gen => {
@@ -98,54 +228,97 @@ impl Engine {
                     eprintln!("lyrad: session {g} ended; closing {} stream(s)", self.slots.len());
                 }
                 self.slots.clear();
+                self.events.clear();
             }
             Cmd::End(_) => {}
-            Cmd::Ctl(g, _) | Cmd::Attach(g, _, _) if g != self.gen => {}
-            Cmd::Ctl(_, c) => self.apply_ctl(c),
-            Cmd::Attach(_, stream, ring) => {
-                // Only an open stream takes a ring; a ring never creates a slot.
-                if let Some(s) = self.slots.iter_mut().find(|s| s.id == stream) {
-                    s.ring = Some(ring);
+            Cmd::Msg(g, _) | Cmd::Open(g, ..) if g != self.gen => {}
+            Cmd::Open(_, id, adapter, ring) => {
+                if self.is_open(id) || self.slots.len() >= MAX_STREAMS {
+                    return;
                 }
+                self.slots.push(Slot {
+                    id,
+                    gain: Gain::new(1.0, self.rate as f32, 20.0),
+                    ring,
+                    adapter,
+                    playing: false,
+                    drain: None,
+                    underrun_frames: 0,
+                    periods_since_report: 0,
+                });
             }
+            Cmd::Msg(_, m) => self.apply_msg(m),
         }
     }
 
-    fn apply_ctl(&mut self, c: Ctl) {
-        match c {
-            Ctl::OpenStream { stream } => {
-                if self.is_open(stream) {
-                    return;
+    fn apply_msg(&mut self, m: ToEngine) {
+        match m {
+            ToEngine::Open { .. } => {} // made by the connection thread
+            ToEngine::Close { stream } => self.slots.retain(|s| s.id != stream),
+            ToEngine::Start { stream } => {
+                if let Some(s) = self.slot(stream) {
+                    s.playing = true;
                 }
-                if self.slots.len() >= MAX_STREAMS {
-                    eprintln!("lyrad: OpenStream {stream} refused: {MAX_STREAMS} streams open");
-                    return;
-                }
-                self.slots.push(Slot { id: stream, gain: Gain::new(1.0, self.rate, 20.0), ring: None });
             }
-            Ctl::CloseStream { stream } => self.slots.retain(|s| s.id != stream),
-            Ctl::SetGainDb { stream, db } => {
-                if let Some(s) = self.slots.iter_mut().find(|s| s.id == stream) {
+            ToEngine::Pause { stream } => {
+                if let Some(s) = self.slot(stream) {
+                    s.playing = false;
+                }
+            }
+            ToEngine::Flush { stream } => {
+                if let Some(s) = self.slot(stream) {
+                    let frame = s.ring.discard();
+                    s.adapter.reset();
+                    s.drain = None;
+                    self.events.push(FromEngine::Flushed { stream, frame });
+                }
+            }
+            ToEngine::Drain { stream } => {
+                if let Some(s) = self.slot(stream) {
+                    s.drain = Some(None);
+                }
+            }
+            ToEngine::SetGain { stream, db } => {
+                if let Some(s) = self.slot(stream) {
                     // A non-finite or absurd level from the wire is clamped too.
                     let db = if db.is_finite() { db.clamp(-120.0, 12.0) } else { -120.0 };
                     s.gain.set_target(if db <= -120.0 { 0.0 } else { 10f32.powf(db / 20.0) });
                 }
             }
-            Ctl::Reroute { .. } => {} // single sink in v1
-            Ctl::RingFor { .. } => {}  // answered by the connection thread
+            ToEngine::Reroute { .. } => {} // single sink in v1
         }
     }
 
     /// Mix one period into `mix` (interleaved, `period_frames × channels`).
-    pub fn mix(&mut self, mix: &mut [f32]) {
+    /// `device_delay_frames` is what the device still has queued, for `Drain`.
+    pub fn mix(&mut self, mix: &mut [f32], device_delay_frames: u64) {
         mix.iter_mut().for_each(|v| *v = 0.0);
-        let ch = self.channels;
+        let drain_periods = (device_delay_frames as usize).div_ceil(self.period_frames) as u32 + 1;
+        let report_every = (self.rate as usize / self.period_frames).max(1) as u32;
         for s in self.slots.iter_mut() {
-            let got = match s.ring.as_ref() {
-                Some(r) => r.read(&mut self.tmp) as usize,
-                None => 0,
-            };
-            self.tmp[got * ch..].iter_mut().for_each(|v| *v = 0.0);
+            if !s.playing {
+                continue;
+            }
+            let got = s.adapter.pull(&s.ring, &mut self.tmp);
+            let short = (self.period_frames - got) as u64;
+            match s.drain {
+                Some(None) if short > 0 || s.ring.readable() == 0 => s.drain = Some(Some(drain_periods)),
+                Some(Some(0)) => {
+                    self.events.push(FromEngine::Drained { stream: s.id });
+                    s.drain = None;
+                    s.playing = false;
+                }
+                Some(Some(ref mut left)) => *left -= 1,
+                _ => s.underrun_frames += short,
+            }
+            s.periods_since_report += 1;
+            if s.periods_since_report >= report_every {
+                if s.underrun_frames > 0 {
+                    self.events.push(FromEngine::Underrun { stream: s.id, frames: s.underrun_frames });
+                    s.underrun_frames = 0;
+                }
+                s.periods_since_report = 0;
+            }
             sanitize(&mut self.tmp);
             s.gain.process(&mut self.tmp);
             for (m, t) in mix.iter_mut().zip(&self.tmp) {
@@ -155,7 +328,8 @@ impl Engine {
     }
 }
 
-/// Where lyrad listens and whom it trusts.
+/// Where lyrad listens, whom it trusts, and the device format.
+#[derive(Clone)]
 pub struct Config {
     pub socket: PathBuf,
     /// Peer uids allowed to connect. Empty = only lyrad's own uid (development).
@@ -176,6 +350,11 @@ impl Config {
         let socket = std::env::var("ATRIUM_LYRAD_SOCK").unwrap_or_else(|_| "/atrium/sockets/lyrad/lyrad.sock".into());
         let peers_s = std::env::var("ATRIUM_LYRAD_PEERS").unwrap_or_else(|_| "_choragus".into());
         Ok(Config { socket: socket.into(), peers: parse_peers(&peers_s)?, rate: 48_000, channels: 2, period_frames: 128, nfrags: 8 })
+    }
+
+    /// The output latency a new stream sees: the device queue plus one period.
+    pub fn latency_ns(&self) -> u64 {
+        (self.nfrags as u64 + 1) * self.period_frames as u64 * 1_000_000_000 / self.rate as u64
     }
 }
 
@@ -202,48 +381,71 @@ pub fn peer_allowed(uid: u32, peers: &[u32]) -> bool {
     }
 }
 
-/// Serve one trusted connection as session `gen`: forward control frames to the
-/// engine and answer `RingFor` with a ring fd on the same connection.
-fn serve_session(mut conn: UnixStream, gen: u64, tx: mpsc::Sender<Cmd>) {
+/// The current session's write side, shared by its connection thread (which
+/// answers `Open` with a ring fd) and the event writer (engine events).
+type Writer = Arc<Mutex<Option<(u64, UnixStream)>>>;
+
+/// Make a ring for an `Open`, or `None` if its parameters are out of range.
+fn make_stream(cfg: &Config, rate: u32, channels: u8, ring_frames: u64) -> Option<(Box<Adapter>, Ring, std::os::fd::OwnedFd)> {
+    if !(wire::MIN_RATE..=wire::MAX_RATE).contains(&rate)
+        || !ring_frames.is_power_of_two()
+        || ring_frames > MAX_RING_FRAMES
+    {
+        return None;
+    }
+    let adapter = Adapter::new(rate, channels, cfg.rate, cfg.channels as u8)?;
+    let (ring, fd) = Ring::create_anon(ring_frames, channels as u64, false).ok()?;
+    Some((Box::new(adapter), ring, fd))
+}
+
+/// Serve one trusted connection as session `gen`.
+fn serve_session(mut conn: UnixStream, gen: u64, cfg: Config, tx: mpsc::Sender<Cmd>, writer: Writer) {
     let _ = tx.send(Cmd::Begin(gen));
-    // This session's open streams, so RingFor answers only for those.
-    let mut open = std::collections::HashSet::new();
-    let mut frame = [0u8; FRAME_LEN];
-    while conn.read_exact(&mut frame).is_ok() {
-        let Some(c) = Ctl::decode(&frame) else { continue };
-        match c {
-            Ctl::RingFor { stream } => {
-                let is_open = open.contains(&stream);
-                let made = if is_open { Ring::create_anon(RING_FRAMES, 2, false).ok() } else { None };
-                match made {
-                    Some((ring, fd)) => {
-                        if crate::fdpass::send_fd(conn.as_raw_fd(), fd.as_raw_fd()).is_ok() {
-                            let _ = tx.send(Cmd::Attach(gen, stream, ring));
-                        }
+    if let Ok(w) = conn.try_clone() {
+        *writer.lock().unwrap() = Some((gen, w));
+    }
+    loop {
+        let msg: ToEngine = match wire::recv(&mut conn) {
+            Ok(m) => m,
+            Err(_) => break,
+        };
+        match msg {
+            ToEngine::Open { stream, rate, channels, ring_frames } => {
+                let reply = match make_stream(&cfg, rate, channels, ring_frames) {
+                    Some((adapter, ring, fd)) => {
+                        let _ = tx.send(Cmd::Open(gen, stream, adapter, ring));
+                        Some(fd)
                     }
-                    None => {
-                        // No ring: answer with the filler byte alone, so the
-                        // peer's recv_fd fails instead of waiting forever.
-                        use std::io::Write;
-                        let _ = conn.write_all(&[0u8]);
-                    }
+                    None => None,
+                };
+                let mut w = writer.lock().unwrap();
+                let Some((g, w)) = w.as_mut() else { break };
+                if *g != gen {
+                    break; // a newer session took over
+                }
+                let ok = match reply {
+                    Some(fd) => wire::send(w, &FromEngine::Opened { stream, ring_frames, latency_ns: cfg.latency_ns() }).is_ok()
+                        && crate::fdpass::send_fd(w.as_raw_fd(), fd.as_raw_fd()).is_ok(),
+                    None => wire::send(w, &FromEngine::OpenFailed { stream }).is_ok(),
+                };
+                if !ok {
+                    break;
                 }
             }
             other => {
-                match other {
-                    Ctl::OpenStream { stream } => { open.insert(stream); }
-                    Ctl::CloseStream { stream } => { open.remove(&stream); }
-                    _ => {}
-                }
-                let _ = tx.send(Cmd::Ctl(gen, other));
+                let _ = tx.send(Cmd::Msg(gen, other));
             }
         }
     }
     let _ = tx.send(Cmd::End(gen));
+    let mut w = writer.lock().unwrap();
+    if matches!(w.as_ref(), Some((g, _)) if *g == gen) {
+        *w = None;
+    }
 }
 
 /// Bind the socket and accept trusted peers forever (on its own thread).
-pub fn listen(cfg: &Config, tx: mpsc::Sender<Cmd>) -> io::Result<()> {
+pub fn listen(cfg: &Config, tx: mpsc::Sender<Cmd>, writer: Writer) -> io::Result<()> {
     let _ = std::fs::remove_file(&cfg.socket);
     let listener = UnixListener::bind(&cfg.socket)?;
     {
@@ -252,7 +454,7 @@ pub fn listen(cfg: &Config, tx: mpsc::Sender<Cmd>) -> io::Result<()> {
         use std::os::unix::fs::PermissionsExt;
         std::fs::set_permissions(&cfg.socket, std::fs::Permissions::from_mode(0o660))?;
     }
-    let peers = cfg.peers.clone();
+    let cfg = cfg.clone();
     std::thread::spawn(move || {
         let mut gen = 0u64;
         for conn in listener.incoming() {
@@ -261,25 +463,43 @@ pub fn listen(cfg: &Config, tx: mpsc::Sender<Cmd>) -> io::Result<()> {
                 Ok(u) => u,
                 Err(_) => continue,
             };
-            if !peer_allowed(uid, &peers) {
+            if !peer_allowed(uid, &cfg.peers) {
                 eprintln!("lyrad: refused a connection from uid {uid} (not a trusted peer)");
                 continue; // dropping `conn` hangs up
             }
             gen += 1;
             eprintln!("lyrad: session {gen} from uid {uid}");
-            let tx = tx.clone();
-            std::thread::spawn(move || serve_session(conn, gen, tx));
+            let (tx, writer, cfg) = (tx.clone(), writer.clone(), cfg.clone());
+            std::thread::spawn(move || serve_session(conn, gen, cfg, tx, writer));
         }
     });
     Ok(())
 }
 
+/// Send engine events to the current session, off the mix thread.
+fn event_writer(rx: mpsc::Receiver<(u64, FromEngine)>, writer: Writer) {
+    for (gen, ev) in rx {
+        let mut w = writer.lock().unwrap();
+        if let Some((g, s)) = w.as_mut() {
+            if *g == gen {
+                let _ = wire::send(s, &ev);
+            }
+        }
+    }
+}
+
 /// The service: listen, then mix to the device forever, reopening it if it goes.
 pub fn run(cfg: Config) -> ! {
     let (tx, rx) = mpsc::channel::<Cmd>();
-    if let Err(e) = listen(&cfg, tx) {
+    let writer: Writer = Arc::new(Mutex::new(None));
+    if let Err(e) = listen(&cfg, tx, writer.clone()) {
         eprintln!("lyrad: bind {}: {e}", cfg.socket.display());
         std::process::exit(1);
+    }
+    let (ev_tx, ev_rx) = mpsc::channel::<(u64, FromEngine)>();
+    {
+        let writer = writer.clone();
+        std::thread::spawn(move || event_writer(ev_rx, writer));
     }
     eprintln!("lyrad: serving on {} (trusted peers: {:?})", cfg.socket.display(), cfg.peers);
     let period_us = cfg.period_frames as u64 * 1_000_000 / cfg.rate as u64;
@@ -312,7 +532,12 @@ pub fn run(cfg: Config) -> ! {
             while let Ok(c) = rx.try_recv() {
                 engine.apply(c);
             }
-            engine.mix(&mut mix);
+            let delay = sink.delay_frames().unwrap_or(0);
+            engine.mix(&mut mix, delay);
+            let gen = engine.session();
+            for ev in engine.take_events() {
+                let _ = ev_tx.send((gen, ev));
+            }
             for (o, m) in out.iter_mut().zip(&mix) {
                 *o = (m.clamp(-1.0, 1.0) * 32767.0) as i16;
             }
@@ -333,6 +558,20 @@ pub fn run(cfg: Config) -> ! {
 mod tests {
     use super::*;
 
+    /// A named ring pair (named shm works on the Linux host; anonymous is
+    /// FreeBSD-only).
+    fn ring_pair(tag: &str, frames: u64, ch: u64) -> (Ring, Ring) {
+        let name = format!("/lyra-test-{tag}-{}", std::process::id());
+        let p = Ring::create(&name, frames, ch).unwrap();
+        let c = Ring::open(&name, false).unwrap();
+        (p, c)
+    }
+
+    fn open(e: &mut Engine, gen: u64, id: u32, rate: u32, ch: u8, ring: Ring) {
+        e.apply(Cmd::Open(gen, id, Box::new(Adapter::new(rate, ch, 48_000, 2).unwrap()), ring));
+        e.apply(Cmd::Msg(gen, ToEngine::Start { stream: id }));
+    }
+
     #[test]
     fn sanitize_zeroes_non_finite_and_clamps() {
         let mut b = [f32::NAN, f32::INFINITY, f32::NEG_INFINITY, 1e9, -1e9, 0.5];
@@ -340,79 +579,157 @@ mod tests {
         assert_eq!(b, [0.0, 0.0, 0.0, SAMPLE_LIMIT, -SAMPLE_LIMIT, 0.5]);
     }
 
-    /// ★ One stream writes NaN, infinity and huge values; the other's tone comes
-    /// through exactly. Before, one NaN made the whole sum NaN: silence for all.
+    /// ★ One stream writes NaN, infinity and huge values; the other's level
+    /// comes through exactly. Before, one NaN made the whole sum NaN: silence
+    /// for every app.
     #[test]
     fn a_poisoned_stream_does_not_touch_the_others() {
-        let name_a = format!("/lyra-test-a-{}", std::process::id());
-        let name_b = format!("/lyra-test-b-{}", std::process::id());
-        let pa = Ring::create(&name_a, 8, 2).unwrap();
-        let pb = Ring::create(&name_b, 8, 2).unwrap();
-        let ca = Ring::open(&name_a, false).unwrap();
-        let cb = Ring::open(&name_b, false).unwrap();
-        let mut e = Engine::new(48_000, 2, 4);
+        let (pa, ca) = ring_pair("poison-a", 64, 2);
+        let (pb, cb) = ring_pair("poison-b", 64, 2);
+        let mut e = Engine::new(48_000, 2, 8);
         e.apply(Cmd::Begin(1));
-        for (id, r) in [(1, ca), (2, cb)] {
-            e.apply(Cmd::Ctl(1, Ctl::OpenStream { stream: id }));
-            e.apply(Cmd::Attach(1, id, r));
-        }
-        pa.write(&[f32::NAN, f32::INFINITY, 1e30, f32::NEG_INFINITY, f32::NAN, f32::NAN, f32::NAN, f32::NAN]);
-        pb.write(&[0.25; 8]);
-        let mut mix = [0.0f32; 8];
-        e.mix(&mut mix);
-        // stream 1 contributes 0 for the non-finite samples and ±4.0 at most for 1e30.
-        assert_eq!(mix[0], 0.25);
-        assert_eq!(mix[1], 0.25);
-        assert_eq!(mix[2], 0.25 + SAMPLE_LIMIT);
+        open(&mut e, 1, 1, 48_000, 2, ca);
+        open(&mut e, 1, 2, 48_000, 2, cb);
+        let mut bad = vec![f32::NAN; 32];
+        bad[3] = f32::INFINITY;
+        bad[5] = 1e30;
+        pa.write(&bad);
+        pb.write(&[0.25; 32]);
+        let mut mix = [0.0f32; 16];
+        e.mix(&mut mix, 0);
         assert!(mix.iter().all(|v| v.is_finite()), "{mix:?}");
-        assert_eq!(&mix[3..], &[0.25; 5]);
+        // The adapter starts with one zero frame as its left point, so output
+        // frame k is stream frame k-1; frame 0 is that silent start.
+        assert_eq!(&mix[..2], &[0.0, 0.0]);
+        assert!(mix[2..].iter().all(|&v| v == 0.25 || v == 0.25 + SAMPLE_LIMIT), "{mix:?}");
     }
 
     #[test]
-    fn a_ring_never_creates_a_stream() {
-        let name = format!("/lyra-test-c-{}", std::process::id());
-        let _p = Ring::create(&name, 8, 2).unwrap();
-        let mut e = Engine::new(48_000, 2, 4);
+    fn a_new_stream_is_paused_until_start() {
+        let (p, c) = ring_pair("paused", 64, 2);
+        let mut e = Engine::new(48_000, 2, 8);
         e.apply(Cmd::Begin(1));
-        e.apply(Cmd::Attach(1, 5, Ring::open(&name, false).unwrap()));
-        assert_eq!(e.streams(), 0);
+        e.apply(Cmd::Open(1, 1, Box::new(Adapter::new(48_000, 2, 48_000, 2).unwrap()), c));
+        p.write(&[0.5; 32]);
+        let mut mix = [0.0f32; 16];
+        e.mix(&mut mix, 0);
+        assert!(mix.iter().all(|&v| v == 0.0), "paused: nothing read");
+        assert_eq!(p.writable(), 64 - 16, "the ring was not touched");
+        e.apply(Cmd::Msg(1, ToEngine::Start { stream: 1 }));
+        e.mix(&mut mix, 0);
+        assert_eq!(mix[15], 0.5);
+    }
+
+    #[test]
+    fn flush_drops_the_queue_and_reports_the_position() {
+        let (p, c) = ring_pair("flush", 64, 2);
+        let mut e = Engine::new(48_000, 2, 8);
+        e.apply(Cmd::Begin(1));
+        open(&mut e, 1, 1, 48_000, 2, c);
+        p.write(&[0.5; 40]); // 20 frames
+        e.apply(Cmd::Msg(1, ToEngine::Flush { stream: 1 }));
+        assert_eq!(e.take_events(), vec![FromEngine::Flushed { stream: 1, frame: 20 }]);
+        let mut mix = [0.0f32; 16];
+        e.mix(&mut mix, 0);
+        assert!(mix.iter().all(|&v| v == 0.0), "nothing left to play");
+    }
+
+    #[test]
+    fn drain_reports_after_the_device_queue_plays_out() {
+        let (p, c) = ring_pair("drain", 64, 2);
+        let mut e = Engine::new(48_000, 2, 8);
+        e.apply(Cmd::Begin(1));
+        open(&mut e, 1, 1, 48_000, 2, c);
+        p.write(&[0.5; 8]); // 4 frames, less than one period
+        e.apply(Cmd::Msg(1, ToEngine::Drain { stream: 1 }));
+        let mut mix = [0.0f32; 16];
+        // device has 16 frames queued = 2 periods; Drained after those + 1.
+        let mut periods = 0;
+        loop {
+            e.mix(&mut mix, 16);
+            periods += 1;
+            if e.take_events().contains(&FromEngine::Drained { stream: 1 }) {
+                break;
+            }
+            assert!(periods < 10, "never drained");
+        }
+        assert_eq!(periods, 5, "dry period, then 3 periods of device queue + margin, then report");
+    }
+
+    #[test]
+    fn underruns_are_reported_at_most_once_a_second() {
+        let (_p, c) = ring_pair("underrun", 64, 2);
+        let mut e = Engine::new(800, 2, 8); // 100 periods a second
+        e.apply(Cmd::Begin(1));
+        e.apply(Cmd::Open(1, 1, Box::new(Adapter::new(800, 2, 800, 2).unwrap()), c));
+        e.apply(Cmd::Msg(1, ToEngine::Start { stream: 1 }));
+        let mut mix = [0.0f32; 16];
+        let mut reports = Vec::new();
+        for _ in 0..250 {
+            e.mix(&mut mix, 0);
+            reports.extend(e.take_events());
+        }
+        assert_eq!(reports.len(), 2, "{reports:?}");
+        assert_eq!(reports[0], FromEngine::Underrun { stream: 1, frames: 800 });
+    }
+
+    #[test]
+    fn the_adapter_resamples_and_maps_channels() {
+        // 24 kHz mono ramp into 48 kHz stereo: each stream frame becomes two
+        // device frames, interpolated, on both channels at -3 dB (mono folds
+        // to L and R as the centre does).
+        let (p, c) = ring_pair("adapt", 64, 1);
+        let mut a = Adapter::new(24_000, 1, 48_000, 2).unwrap();
+        p.write(&[1.0, 2.0, 3.0, 4.0, 5.0]);
+        let mut out = [0.0f32; 8 * 2];
+        let got = a.pull(&c, &mut out);
+        assert_eq!(got, 8);
+        let k = std::f32::consts::FRAC_1_SQRT_2;
+        let left: Vec<f32> = out.chunks(2).map(|f| (f[0] / k * 10.0).round() / 10.0).collect();
+        assert_eq!(left, vec![0.0, 0.5, 1.0, 1.5, 2.0, 2.5, 3.0, 3.5]);
+        assert!(out.chunks(2).all(|f| f[0] == f[1]));
+        // 44.1 kHz into 48 kHz consumes 44.1/48 stream frames per device frame.
+        let (p, c) = ring_pair("adapt2", 4096, 2);
+        let mut a = Adapter::new(44_100, 2, 48_000, 2).unwrap();
+        p.write(&vec![0.1; 4000 * 2]);
+        let mut out = vec![0.0f32; 480 * 2];
+        for _ in 0..8 {
+            assert_eq!(a.pull(&c, &mut out), 480);
+        }
+        let used = c.consumed() as f64;
+        assert!((used - 3840.0 * 44_100.0 / 48_000.0).abs() < 3.0, "{used}");
+    }
+
+    #[test]
+    fn unsupported_layouts_are_refused() {
+        for ch in [0u8, 3, 4, 5, 7, 9] {
+            assert!(Adapter::new(48_000, ch, 48_000, 2).is_none(), "{ch}");
+        }
     }
 
     #[test]
     fn commands_from_a_stale_session_are_ignored() {
+        let (_p, c1) = ring_pair("stale1", 8, 2);
+        let (_q, c2) = ring_pair("stale2", 8, 2);
         let mut e = Engine::new(48_000, 2, 4);
         e.apply(Cmd::Begin(1));
-        e.apply(Cmd::Ctl(1, Ctl::OpenStream { stream: 7 }));
+        open(&mut e, 1, 7, 48_000, 2, c1);
         e.apply(Cmd::Begin(2)); // choragusd restarted
         assert_eq!(e.streams(), 0, "a new session starts empty");
-        e.apply(Cmd::Ctl(1, Ctl::OpenStream { stream: 8 }));
+        open(&mut e, 1, 8, 48_000, 2, c2);
         e.apply(Cmd::End(1));
         assert_eq!(e.streams(), 0, "the old session can't open or close anything");
-        e.apply(Cmd::Ctl(2, Ctl::OpenStream { stream: 9 }));
-        assert!(e.is_open(9));
-        e.apply(Cmd::End(2));
-        assert_eq!(e.streams(), 0, "the session's end closes its streams");
-    }
-
-    #[test]
-    fn stream_count_is_capped() {
-        let mut e = Engine::new(48_000, 2, 4);
-        e.apply(Cmd::Begin(1));
-        for id in 0..(MAX_STREAMS as u32 + 10) {
-            e.apply(Cmd::Ctl(1, Ctl::OpenStream { stream: id }));
-        }
-        assert_eq!(e.streams(), MAX_STREAMS);
     }
 
     #[test]
     fn wild_gains_are_clamped() {
+        let (_p, c) = ring_pair("gain", 8, 2);
         let mut e = Engine::new(48_000, 2, 4);
         e.apply(Cmd::Begin(1));
-        e.apply(Cmd::Ctl(1, Ctl::OpenStream { stream: 1 }));
+        open(&mut e, 1, 1, 48_000, 2, c);
         for db in [f32::NAN, f32::INFINITY, 1e9] {
-            e.apply(Cmd::Ctl(1, Ctl::SetGainDb { stream: 1, db }));
-            let s = &e.slots[0];
-            assert!(s.gain.current().is_finite());
+            e.apply(Cmd::Msg(1, ToEngine::SetGain { stream: 1, db }));
+            assert!(e.slots[0].gain.current().is_finite());
         }
     }
 
@@ -427,40 +744,36 @@ mod tests {
         assert!(!peer_allowed(me.wrapping_add(1), &[]));
     }
 
-    /// The socket refuses an untrusted uid and serves a trusted one: a session
-    /// opens a stream and `RingFor` on an unopened stream returns no fd.
+    /// The socket refuses an untrusted uid and serves a trusted one.
     #[test]
-    fn socket_serves_trusted_peer_and_ring_for_needs_an_open_stream() {
-        use std::io::Write;
+    fn socket_refuses_untrusted_and_serves_trusted() {
         let dir = std::env::temp_dir().join(format!("lyrad-test-{}", std::process::id()));
         let _ = std::fs::create_dir_all(&dir);
         let me = unsafe { libc::getuid() };
-        // Untrusted: trust only some other uid.
-        let cfg = Config { socket: dir.join("a.sock"), peers: vec![me.wrapping_add(1)], rate: 48_000, channels: 2, period_frames: 4, nfrags: 2 };
+        let base = Config { socket: dir.join("a.sock"), peers: vec![me.wrapping_add(1)], rate: 48_000, channels: 2, period_frames: 4, nfrags: 2 };
         let (tx, rx) = mpsc::channel();
-        listen(&cfg, tx).unwrap();
-        let mut c = UnixStream::connect(&cfg.socket).unwrap();
+        listen(&base, tx, Arc::new(Mutex::new(None))).unwrap();
+        let mut c = UnixStream::connect(&base.socket).unwrap();
         c.set_read_timeout(Some(std::time::Duration::from_secs(2))).unwrap();
         let mut b = [0u8; 1];
+        use std::io::Read;
         assert_eq!(c.read(&mut b).unwrap_or(0), 0, "hung up on the untrusted peer");
         assert!(rx.recv_timeout(std::time::Duration::from_millis(200)).is_err(), "no session began");
 
-        // Trusted: ourselves.
-        let cfg = Config { socket: dir.join("b.sock"), peers: vec![me], ..cfg };
+        let cfg = Config { socket: dir.join("b.sock"), peers: vec![me], ..base };
         let (tx, rx) = mpsc::channel();
-        listen(&cfg, tx).unwrap();
+        listen(&cfg, tx, Arc::new(Mutex::new(None))).unwrap();
         let mut c = UnixStream::connect(&cfg.socket).unwrap();
-        c.write_all(&Ctl::RingFor { stream: 3 }.encode()).unwrap();
-        assert!(crate::fdpass::recv_fd(c.as_raw_fd()).is_err(), "no ring for a stream that isn't open");
-        c.write_all(&Ctl::OpenStream { stream: 3 }.encode()).unwrap();
-        let mut e = Engine::new(48_000, 2, 4);
+        c.set_read_timeout(Some(std::time::Duration::from_secs(2))).unwrap();
+        // Out-of-range Open: refused with OpenFailed, no stream.
+        wire::send(&mut c, &ToEngine::Open { stream: 3, rate: 1, channels: 2, ring_frames: 64 }).unwrap();
+        assert_eq!(wire::recv::<_, FromEngine>(&mut c).unwrap(), FromEngine::OpenFailed { stream: 3 });
+        wire::send(&mut c, &ToEngine::Start { stream: 3 }).unwrap();
         let t = std::time::Duration::from_secs(2);
-        e.apply(rx.recv_timeout(t).unwrap()); // Begin
-        e.apply(rx.recv_timeout(t).unwrap()); // Open
-        assert!(e.is_open(3));
+        assert!(matches!(rx.recv_timeout(t).unwrap(), Cmd::Begin(1)));
+        assert!(matches!(rx.recv_timeout(t).unwrap(), Cmd::Msg(1, ToEngine::Start { stream: 3 })));
         drop(c);
-        e.apply(rx.recv_timeout(t).unwrap()); // End
-        assert_eq!(e.streams(), 0);
+        assert!(matches!(rx.recv_timeout(t).unwrap(), Cmd::End(1)));
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

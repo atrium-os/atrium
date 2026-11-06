@@ -251,6 +251,16 @@ impl Ring {
         }
     }
 
+    /// Consumer: drop everything queued (a flush). Returns the new position,
+    /// which the next frame the producer writes will have.
+    pub fn discard(&self) -> u64 {
+        debug_assert!(!self.producer);
+        let pos = self.cursor.load(Ordering::Relaxed) + self.readable();
+        self.cursor.store(pos, Ordering::Relaxed);
+        unsafe { (*self.hdr).tail.store(pos, Ordering::Release) };
+        pos
+    }
+
     /// Consumer: frames read since the ring was mapped, from its own cursor (the
     /// stream position lyrad's clock counts; never anything the producer wrote).
     pub fn consumed(&self) -> u64 {
@@ -369,6 +379,18 @@ mod tests {
             unsafe { (*hdr).capacity_frames = cap; (*hdr).frame_floats = ff; }
             assert!(Ring::header_fits(map, len).is_err(), "cap {cap} ff {ff}");
         }
+    }
+
+    #[test]
+    fn discard_drops_what_is_queued() {
+        let (p, c, _m) = pair(8, 1);
+        p.write(&[1.0, 2.0, 3.0]);
+        assert_eq!(c.discard(), 3);
+        assert_eq!(c.readable(), 0);
+        p.write(&[4.0]);
+        let mut o = [0.0f32; 2];
+        assert_eq!(c.read(&mut o), 1);
+        assert_eq!(o[0], 4.0);
     }
 
     #[test]
