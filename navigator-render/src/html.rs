@@ -1353,6 +1353,12 @@ impl<'a> Cx<'a> {
                         }
                         if inline.is_empty() && (b.cut_at == Some(c) || (b.cut_at.is_none() && b.limit.is_some_and(|l| cy > l))) {
                             b.fired = Some((c, cy));
+                            // Where the next band starts this box's children
+                            // (without it, a band whose checkpoint is a child
+                            // of a box it continues walked every sibling
+                            // before it: the HTML standard's first pass did
+                            // 6.6x the whole layout's text work).
+                            b.at.entry(c).or_insert(cy);
                             continue;
                         }
                     }

@@ -223,6 +223,8 @@ pub struct Banded<'f> {
     shapes: crate::ShapeCache,
     finals: HashMap<Handle, U>,
     span_starts: SpanStarts,
+    /// `reach_index`, built when first needed after a run.
+    reach: std::cell::RefCell<Option<(HashMap<i64, Vec<(usize, usize)>>, Vec<(usize, usize)>)>>,
     /// The first pass reached the end of the document.
     pub complete: bool,
     /// The lowest painted bottom and the root's height so far.
@@ -261,7 +263,7 @@ impl<'f> Banded<'f> {
         let prep = html::prepare(html, fonts, env);
         Banded { prep, fonts, env: env.clone(), subs: subs.clone(), band_h: band_h.max(PX_MIN),
                  checkpoints: vec![Checkpoint { at: None, y: 0, vector_budget: crate::path::DOCUMENT_SEGMENT_SHARE }],
-                 bands: vec![], done: HashMap::new(), lines_before: HashMap::new(), at: HashMap::new(), firsts: Default::default(), shapes: Default::default(), finals: HashMap::new(), span_starts: HashMap::new(), complete: false, bottom: 0, root_h: 0,
+                 bands: vec![], done: HashMap::new(), lines_before: HashMap::new(), at: HashMap::new(), firsts: Default::default(), shapes: Default::default(), finals: HashMap::new(), span_starts: HashMap::new(), reach: Default::default(), complete: false, bottom: 0, root_h: 0,
                  progress: 0.0, stats: BandStats::default(), whole: None }
     }
 
@@ -333,6 +335,7 @@ impl<'f> Banded<'f> {
     /// Lay band `k` out: the next one of the first pass (`k == bands.len()`)
     /// or again from its checkpoint.
     fn run(&mut self, k: usize, keep: bool) {
+        *self.reach.borrow_mut() = None;
         if let Some(w) = &self.whole {
             if keep { if let Some(b) = self.bands.get_mut(k) { b.scene = Some(scene_of(w, &(0..w.order.len() as u32).collect::<Vec<_>>())) } }
             return;
@@ -462,9 +465,19 @@ impl<'f> Banded<'f> {
     fn foreign(&self, b: usize) -> Vec<(usize, usize, usize)> {
         let Some(band) = self.bands.get(b) else { return vec![] };
         let mut out = vec![];
-        for (j, src) in self.bands.iter().enumerate() {
+        let mut reach = self.reach.borrow_mut();
+        let reach = reach.get_or_insert_with(|| self.reach_index());
+        let bh = self.band_h;
+        let (b0, b1) = (band.range.0.max(-(1 << 40)).div_euclid(bh), band.range.1.min(1 << 40).saturating_sub(1).div_euclid(bh));
+        let mut cand: Vec<(usize, usize)> = reach.1.clone();
+        if b1 - b0 < 1 << 16 { for k in b0..=b1 { if let Some(v) = reach.0.get(&k) { cand.extend_from_slice(v) } } }
+        else { cand.extend(reach.0.values().flatten().copied()) }
+        cand.sort_unstable();
+        cand.dedup();
+        for (j, n) in cand {
             if j == b { continue }
-            for n in 0..src.cross.order.len() {
+            let src = &self.bands[j];
+            {
                 let (a, e) = src.cross_ext[n];
                 if band.range.1 <= a || band.range.0 >= e { continue }
                 let key = &src.cross_keys[n];
@@ -474,6 +487,22 @@ impl<'f> Banded<'f> {
         }
         out.sort_by(|x, y| x.0.cmp(&y.0).then_with(|| gcmp(&self.bands[x.1].cross_keys[x.2], &self.bands[y.1].cross_keys[y.2])));
         out
+    }
+
+    /// Every band's overlay sources by the band-high buckets their extents
+    /// touch (a leaf reaching more than 256 buckets is in the second list),
+    /// so finding what reaches a band does not walk the document.
+    fn reach_index(&self) -> (HashMap<i64, Vec<(usize, usize)>>, Vec<(usize, usize)>) {
+        let (mut m, mut wide) = (HashMap::<i64, Vec<(usize, usize)>>::new(), vec![]);
+        let bh = self.band_h;
+        for (j, src) in self.bands.iter().enumerate() {
+            for (n, &(a, e)) in src.cross_ext.iter().enumerate() {
+                let (k0, k1) = (a.max(-(1 << 40)).div_euclid(bh), e.min(1 << 40).saturating_sub(1).div_euclid(bh));
+                if k1 - k0 > 256 { wide.push((j, n)); continue }
+                for k in k0..=k1 { m.entry(k).or_default().push((j, n)) }
+            }
+        }
+        (m, wide)
     }
 
     /// ★ BAND `b`'S GROUP, as it is sent: every leaf its run painted there,
@@ -504,13 +533,14 @@ impl<'f> Banded<'f> {
     /// ★ THE OVERLAY GROUP: the leaves bands painted outside themselves that
     /// the whole layout paints over everything of each other band they
     /// reach (positioned and transformed content, a fixed header written
-    /// last), once per such band, clipped to it. Sent after the bands.
+    /// last), once per RESIDENT band they reach, clipped to it — so it is
+    /// bounded by the window, not the document. Sent after the bands.
     pub fn overlay(&self) -> Scene {
         let mut out = Scene { width: (self.env.width_px * crate::PX as f64) as U, ..Default::default() };
         let mut memos = HashMap::<usize, Memo>::new();
         for b in 0..self.bands.len() {
+            if self.bands[b].scene.is_none() { continue }
             let len = self.bands[b].keys.len();
-            // (A band not resident has no keys: everything goes over it.)
             for (pos, j, n) in self.foreign(b) {
                 if pos < len { continue }
                 let src = &self.bands[j].cross;

@@ -154,7 +154,10 @@ fn the_overlay_holds_what_paints_outside_its_band() {
     let mut b = Banded::new(&doc, &fonts, &env, &Default::default(), 300 * PX);
     b.settle();
     // The fixed header is written last and paints at the top: the overlay
-    // draws it over band 0.
+    // draws it over band 0 — once band 0 is resident (the overlay holds
+    // leaves for resident bands only).
+    assert!(b.overlay().order.is_empty(), "nothing resident, no overlay");
+    b.ensure(0);
     let ov = b.overlay();
     assert!(ov.runs.iter().any(|r| r.text.contains("fixed") || r.text == "A"), "the fixed header is in the overlay");
     assert!(b.stats.cross_leaves > 0);
