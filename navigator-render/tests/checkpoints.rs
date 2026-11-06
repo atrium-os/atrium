@@ -193,3 +193,73 @@ fn list_markers_survive_a_cut_before_the_first_line() {
         assert!(n > 12, "{n} bands at {band} px");
     }
 }
+
+/// A long table: striped rows, some cells spanning two rows, a header row,
+/// with paragraphs before and after it.
+fn table_page(rows: usize) -> String {
+    let mut d = String::from(r#"<html><head><style>body { margin: 8px; background-color: #fbfbfb } p { margin: 0px 0px 8px }
+        table { border-spacing: 2px 3px; background-color: #e8eef8; border-top: 2px solid #335577 }
+        td { padding-left: 4px; background-color: #ffffff } .odd td { background-color: #f4f4ff } th { background-color: #ccddee }
+        </style></head><body><p>Before the table, a paragraph that wraps across the width of the page at least once here.</p><table><tr><th>Row</th><th>Value</th><th>Note</th></tr>"#);
+    for i in 0..rows {
+        let cls = if i % 2 == 1 { r#" class="odd""# } else { "" };
+        if i % 11 == 5 { d.push_str(&format!(r#"<tr{cls}><td rowspan="2">Row {i} and {}</td><td>value {}</td><td>a note long enough to wrap in its column, maybe twice over</td></tr>"#, i + 1, i * 7)) }
+        else if i % 11 == 6 { d.push_str(&format!(r#"<tr{cls}><td>value {}</td><td>short</td></tr>"#, i * 7)) }
+        else { d.push_str(&format!(r#"<tr{cls}><td>Row {i}</td><td>value {}</td><td>note {i}</td></tr>"#, i * 7)) }
+    }
+    d.push_str("</table><p>After the table.</p></body></html>");
+    let fonts = FontSet::load().unwrap();
+    navigator_render::html::premeasure_tables(&d, &fonts, &Env::default()).0
+}
+
+#[test]
+fn a_long_table_is_cut_between_its_rows() {
+    let doc = table_page(400);
+    for band in [150, 333, 600] {
+        let (n, st) = check_every_band(&doc, band);
+        assert!(n >= 8, "a 400-row table is cut into bands: {n} at {band} px");
+        assert!(!st.whole);
+    }
+}
+
+#[test]
+fn a_band_never_stops_inside_a_row_span() {
+    // Rows 5k+5 and 5k+6 share a cell: no band starts at the second.
+    let fonts = FontSet::load().unwrap();
+    let doc = table_page(200);
+    let mut b = Banded::new(&doc, &fonts, &Env::default(), &Default::default(), 60 * PX);
+    b.settle();
+    assert!(b.laid_out() > 20);
+    for cp in &b.checkpoints[1..] {
+        let d = b.describe(cp.at.unwrap());
+        assert!(!d.starts_with("tr") || !doc_row_follows_span(&doc, &d), "{d}");
+    }
+}
+
+/// Whether the row a checkpoint names is the second of a spanned pair
+/// (index within its row group: 5 mod 11 + 1, after the header row).
+fn doc_row_follows_span(_doc: &str, desc: &str) -> bool {
+    // "tr[N children, index I] < tbody…": I counts the header row first.
+    let i: usize = desc.split("index ").nth(1).and_then(|r| r.split(']').next()).and_then(|v| v.parse().ok()).unwrap_or(0);
+    i >= 1 && (i - 1) % 11 == 6
+}
+
+#[test]
+fn a_page_in_one_table_cell_is_cut_inside_it() {
+    // HN's shape: the page is a table; its third row is one cell holding the
+    // story, a <br>, and a table of comments, each a row of one cell.
+    let mut d = String::from(r#"<html><head><style>body { margin: 8px } table { border-spacing: 0px 0px } .top td { background-color: #ff6600 }
+        .c td { padding-left: 4px } .default { background-color: #f6f6ef } p { margin: 0px 0px 6px }</style></head><body><center><table id="main">
+        <tr class="top"><td><b>Header</b> news | past | comments</td></tr><tr id="big"><td><table><tr><td>Story title, a long one that wraps around the width.</td></tr></table><br><table class="tree">"#);
+    for i in 0..300 {
+        d.push_str(&format!(r#"<tr class="c"><td><table><tr><td class="default"><p>user{i} 3 hours ago</p><p>Comment {i}: something worth saying, at a length that wraps onto a second line at least.</p></td></tr></table></td></tr>"#));
+    }
+    d.push_str("</table></td></tr><tr><td>Footer</td></tr></table></center></body></html>");
+    let fonts = FontSet::load().unwrap();
+    let doc = navigator_render::html::premeasure_tables(&d, &fonts, &Env::default()).0;
+    for band in [200, 600] {
+        let (n, st) = check_every_band(&doc, band);
+        assert!(n >= 10, "the one cell is cut into bands: {n} at {band} px");
+        assert!(!st.whole);
+    }
+}

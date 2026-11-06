@@ -1151,8 +1151,8 @@ fuzzer, which has a `/4` seed and must reach `TemplateInstancesTruncated`.
 
 *Asked by the user, 2026-11-05: "memory management for pages with or without js or other
 scripting that are super big — we don't want an OOM. Scrolling a 1000 page document
-shouldn't choke the navigator too or feel laggy." Steps 1–2 and step 3 phases 1–2 built
-(below); the image working set and table-row checkpoints not yet.*
+shouldn't choke the navigator too or feel laggy." Steps 1–2 and step 3 phases 1–3 built
+(below; phase 3 is table rows); the image working set not yet.*
 
 **Today, a big page is safe, but by refusal.** Checked against the tree on 2026-11-05:
 
@@ -1684,8 +1684,8 @@ normalized document, so parsing and styling are in both arms; the source with ba
 - **A document that is one table is one band** (the table; HN, whose comments are one
   table cell): checkpoints are between blocks in plain flow, and a table is laid out
   whole. It costs what the whole layout costs (after a fix, 8bb1f10b: it first cost twice,
-  laid out once to find its range and again to keep it). Checkpoints between table rows
-  are the next step for these.
+  laid out once to find its range and again to keep it). *Since fixed: checkpoints between
+  table rows, phase 3 below.*
 - *Time to reach a jump target.* Once the first pass has passed it, a jump is one band
   laid out from its checkpoint: 0–6 ms. Before that, the jump waits for the first pass to
   get there; to the end that is the whole layout's time again (the pass costs what the
@@ -1732,9 +1732,55 @@ both arms: `source` and the whole scene `scene`):
 
 *Not yet:* the worker's wire protocol for `want` and its events (out of process, pergola
 §10.4: the same messages over the doc-viewer role's channel), so the broker's worker still
-answers only `Scene` with the first screen; table-row checkpoints; the image working set
-(part 3); checkpoints that survive a restyle (a navigated document is laid out again from
-the start).
+answers only `Scene` with the first screen; ~~table-row checkpoints~~ (built, below); the
+image working set (part 3); checkpoints that survive a restyle (a navigated document is laid
+out again from the start).
+
+**Step 3, phase 3 built: checkpoints between table rows (2026-11-06).** A document that is
+one big table was one band (above). Now:
+- *A band may stop before a row of a table in plain flow* when no cell above spans past that
+  row. The next band starts the table at that row, at the y recorded for it, and measures and
+  lays out only its own rows, group by group (the rows between two such boundaries, whose
+  column slots need nothing from above). The columns are declared (§3.13), so a row's height
+  is its own cells'. A table's rows and its boundaries are computed once and kept with the
+  band state; a band never walks the 100,000 rows.
+- *A row that is one cell holding a long flow* (HN: the page is a table, and its third row is
+  one cell holding the story and the table of comments) is laid out as plain flow at its own
+  height, so a band may stop inside it, and inside the tables it holds. Only where that is
+  exactly what the whole layout does (which gives the cell its row's height as a definite
+  height): the row has one cell and no span crosses it; the cell neither clips nor positions;
+  nothing in it has a percentage height, offset or `min`/`max-height`; and the first column
+  is not pinned (a wide table that scrolls on its own and has two or more columns).
+- *Checked.* `tests/checkpoints.rs`: a 400-row table with row spans, paragraphs before and
+  after, at bands of 150, 333 and 600 px; no band starts inside a row span; HN's shape (a
+  page in one cell of a table, 300 comments as rows of one cell) at 200 and 600 px. The
+  oracle, re-run: 129 corpus documents, 3,448 bands (3,234 before: their tables are cut
+  now), 1,427 checked, **0 differ**; the 7 big documents, 0 differ — the table 40 of 4,546
+  bands checked, HN 40 of 468. Whole-layout NSG byte-identical on all 136.
+- *Measured* (`band_peak`, 3 runs per arm, as above; this build, so every row is new):
+
+  | document | bands | whole layout: ms, peak | first screen: ms, peak | first pass to the end: ms | scrolled end to end: peak | a jump from a checkpoint |
+  |---|---|---|---|---|---|---|
+  | 100,000-row table | 1 → **4,546** | 3,370–4,190 ms, 669–672 MiB | **331–350 ms, 335 MiB** | 4,677–4,747 ms | **414–415 MiB** | 1–4 ms |
+  | HN thread | 1 → **468** | 926–952 ms, 211–213 MiB | **182–189 ms, 170–174 MiB** | 595–650 ms | **178–182 MiB** | 3–5 ms |
+  | HTML Living Standard | 3,999 | 1,713–1,869 ms, 626–638 MiB | 444–464 ms, 409 MiB | 1,645–1,820 ms | 466–468 MiB | 0–2 ms |
+  | coreutils manual | 839 | 328–346 ms, 117–119 MiB | 81–84 ms, 78 MiB | 294–307 ms | 87 MiB | 0–1 ms |
+  | War and Peace | 1,998 | 732–769 ms, 202–204 MiB | 24–26 ms, 51 MiB | 815–823 ms | 85–86 MiB | 0–1 ms |
+
+  - The table's first screen falls from the whole layout's 3.4–4.2 s to a third of a second,
+    and its worker peak by 38%; what remains is the DOM and cascade of 500,000 elements. Its first pass to the end
+    costs about 20% more than the whole layout (each band re-enters the table and sizes its
+    columns again). HN's first screen is 5× faster.
+  - The HTML standard and coreutils gain bands too (their tables are cut): 3,723 → 3,999 and
+    694 → 839, and the most leaves resident fall 7,772 → 3,663 and 28,854 → 1,353.
+- *The scroll harness* (both arms, 8 s, this time alone on the machine): **every frame gate
+  passes** on the five big documents at 60 and 120 Hz, in both arms, and the arms match:
+  p99.9 at most 12.8 ms at 60 Hz (one cell 24.9 ms, coreutils page-down with the source;
+  still under 2 periods) and at most 9.4 ms at 120 Hz; missed vsyncs at most 1.5%; 0 stalls.
+  No placeholders in flings, page-down or Pergola's physics. **The content gate still fails
+  only for a jump to the end in the first seconds:** the table waits 3.7–4.1 s, the standard
+  1.2 s, War and Peace 0.27 s; HN 33–50 ms and coreutils none pass it. Laying out from the
+  end first, or a first pass that sizes rows without painting them, is what would meet it.
 
 *Gates for bands (proposed):* at 60 Hz, 0 stalls over 100 ms after first display in every
 pattern, p99.9 frame time ≤ 2 periods, and missed vsyncs ≤ 1%. At 120 Hz, the same once

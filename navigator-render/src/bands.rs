@@ -220,6 +220,8 @@ pub struct Banded<'f> {
     lines_before: HashMap<Handle, (U, u32)>,
     at: HashMap<Handle, U>,
     firsts: HashMap<Handle, u32>,
+    row_cuts: HashMap<Handle, std::rc::Rc<html::TableCuts>>,
+    rows_cache: HashMap<Handle, std::rc::Rc<(Vec<Handle>, Vec<Handle>)>>,
     shapes: crate::ShapeCache,
     finals: HashMap<Handle, U>,
     span_starts: SpanStarts,
@@ -263,7 +265,7 @@ impl<'f> Banded<'f> {
         let prep = html::prepare(html, fonts, env);
         Banded { prep, fonts, env: env.clone(), subs: subs.clone(), band_h: band_h.max(PX_MIN),
                  checkpoints: vec![Checkpoint { at: None, y: 0, vector_budget: crate::path::DOCUMENT_SEGMENT_SHARE }],
-                 bands: vec![], done: HashMap::new(), lines_before: HashMap::new(), at: HashMap::new(), firsts: Default::default(), shapes: Default::default(), finals: HashMap::new(), span_starts: HashMap::new(), reach: Default::default(), complete: false, bottom: 0, root_h: 0,
+                 bands: vec![], done: HashMap::new(), lines_before: HashMap::new(), at: HashMap::new(), firsts: Default::default(), row_cuts: HashMap::new(), rows_cache: HashMap::new(), shapes: Default::default(), finals: HashMap::new(), span_starts: HashMap::new(), reach: Default::default(), complete: false, bottom: 0, root_h: 0,
                  progress: 0.0, stats: BandStats::default(), whole: None }
     }
 
@@ -349,6 +351,8 @@ impl<'f> Banded<'f> {
         if let Some(at) = cp.at { r.resume_path = self.prep.ancestors(at); r.resume_at = Some(at) }
         r.at = std::mem::take(&mut self.at);
         r.firsts = std::mem::take(&mut self.firsts);
+        r.row_cuts = std::mem::take(&mut self.row_cuts);
+        r.rows_cache = std::mem::take(&mut self.rows_cache);
         // Words already shaped stay shaped; the cache is bounded (it is
         // per word, so a document's vocabulary, not its length).
         if self.shapes.borrow().len() > 200_000 { self.shapes.borrow_mut().clear() }
@@ -362,6 +366,8 @@ impl<'f> Banded<'f> {
         self.lines_before = std::mem::take(&mut r.lines_before);
         self.at = std::mem::take(&mut r.at);
         self.firsts = std::mem::take(&mut r.firsts);
+        self.row_cuts = std::mem::take(&mut r.row_cuts);
+        self.rows_cache = std::mem::take(&mut r.rows_cache);
         self.finals = std::mem::take(&mut r.finals);
         if first { self.stats.first_runs += 1 } else { self.stats.reruns += 1 }
         self.stats.suppressed += r.suppressed as u64;

@@ -224,6 +224,12 @@ struct Cx<'a> {
     marker_owner: Handle,
     indent_owner: Handle,
     trials: u32,
+    /// Set by `block_box` for the one `table` call it makes: the table is in
+    /// plain flow of a band run, so the band may stop between its rows.
+    table_band: bool,
+    /// A table's rows (`table_rows`), cached: a 100,000-row table's rows
+    /// were walked several times per layout, and per band run.
+    rows_cache: std::cell::RefCell<HashMap<Handle, std::rc::Rc<(Vec<Handle>, Vec<Handle>)>>>,
     /// The region a box has opened and `block` will close: the attributes
     /// to restore, its clip, its transform, and the content's x, y, width.
     scroll_open: Option<(crate::Attrs, u32, u32, (U, U, U))>,
@@ -442,6 +448,10 @@ pub(crate) struct BandRun {
     /// Where each block in plain flow began, with the line boxes before it
     /// (so a band continuing its container starts there directly).
     pub at: HashMap<Handle, U>,
+    /// Each table's cuttable row boundaries and flow rows (`row_cuts`).
+    pub row_cuts: HashMap<Handle, std::rc::Rc<TableCuts>>,
+    /// Each table's rows (`table_rows`), kept across band runs.
+    pub rows_cache: HashMap<Handle, std::rc::Rc<(Vec<Handle>, Vec<Handle>)>>,
     /// The boxes whose first line some band placed (it took their list
     /// marker and text-indent).
     pub firsts: HashMap<Handle, u32>,
@@ -476,9 +486,14 @@ pub(crate) struct BandRun {
 impl BandRun {
     pub(crate) fn new(k: u32) -> Self {
         BandRun { k, limit: None, cut_at: None, vector_budget: crate::path::DOCUMENT_SEGMENT_SHARE, canvas_h: 0,
-                  done: HashMap::new(), lines_before: HashMap::new(), finals: HashMap::new(), fired: None, skips: 0, resume_path: Default::default(), at: HashMap::new(), resume_at: None, shape_cache: None, firsts: Default::default(), spanning: vec![], completed_spans: vec![], suppressed: 0, root_h: 0, keys: vec![] }
+                  done: HashMap::new(), lines_before: HashMap::new(), finals: HashMap::new(), fired: None, skips: 0, resume_path: Default::default(), at: HashMap::new(), resume_at: None, shape_cache: None, firsts: Default::default(), row_cuts: HashMap::new(), rows_cache: HashMap::new(), spanning: vec![], completed_spans: vec![], suppressed: 0, root_h: 0, keys: vec![] }
     }
 }
+
+/// A table's row boundaries a band may stop at, and its rows of one cell
+/// laid out as plain flow (`Cx::row_cuts`).
+#[derive(Debug)]
+pub(crate) struct TableCuts { pub cuts: Vec<bool>, pub flow: Vec<bool> }
 
 /// Lay a prepared document out whole.
 pub(crate) fn lay_out_whole(p: &Prepared, fonts: &FontSet, env: &Env, subs: &Subresources) -> HtmlOut {
@@ -580,11 +595,13 @@ fn lay_out(p: &Prepared, fonts: &FontSet, env: &Env, subs: &Subresources, geo: b
     let mut cx = Cx { dom, styles, sh, scene: Scene { width: u(env.width_px), ..Default::default() },
                       report: Report::default(), links: vec![], unimplemented: BTreeMap::new(), marker: None, baseline_probe: None, indent: None, iso_paths: vec![vec![]], iso_cur: 0, content_dy: 0, table_part: false, promoted: Default::default(), boxes: std::env::var_os("NSG_DUMP_BOXES").map(|_| vec![]), geo: None, inl_cur: 0,
                       viewport: (u(env.width_px), Some(u(env.height_px))), pos_cb: (0, 0, u(env.width_px), Some(u(env.height_px))),
-                      subs, placing_abs: false, pending_abs: vec![], deferred_abs: vec![], cb_open: false, canvas_src: None, abs_origin: None, flex_static: None, measured: HashMap::new(), contexts: vec![], hoists: vec![], diagnostics: vec![], vector_budget: crate::path::DOCUMENT_SEGMENT_SHARE, in_scroll: false, scroll_open: None, measured_tables: HashMap::new(), scroll_table: None, stop_after: None, stop_ok: true, table_stop: None, truncated: false, stop_unsafe: false, band: None, marker_owner: Handle::MAX, indent_owner: Handle::MAX, trials: 0 };
+                      subs, placing_abs: false, pending_abs: vec![], deferred_abs: vec![], cb_open: false, canvas_src: None, abs_origin: None, flex_static: None, measured: HashMap::new(), contexts: vec![], hoists: vec![], diagnostics: vec![], vector_budget: crate::path::DOCUMENT_SEGMENT_SHARE, in_scroll: false, scroll_open: None, measured_tables: HashMap::new(), scroll_table: None, stop_after: None, stop_ok: true, table_stop: None, truncated: false, stop_unsafe: false, band: None, marker_owner: Handle::MAX, indent_owner: Handle::MAX, trials: 0, table_band: false, rows_cache: Default::default() };
     if geo { cx.geo = Some(GeoLog { inl_paths: vec![vec![]], ..Default::default() }) }
     cx.stop_after = STOP_AFTER.with(|c| c.get());
     if let Some(b) = band {
         cx.vector_budget = b.vector_budget;
+        let mut b = b;
+        *cx.rows_cache.borrow_mut() = std::mem::take(&mut b.rows_cache);
         cx.band = Some(b);
     }
     cx.promoted = p.promoted.clone();
@@ -642,7 +659,7 @@ fn lay_out(p: &Prepared, fonts: &FontSet, env: &Env, subs: &Subresources, geo: b
     let truncated = cx.truncated;
     STOP_UNSAFE.with(|c| c.set(cx.stop_unsafe));
     let mut band = cx.band.take();
-    if let Some(b) = band.as_mut() { b.vector_budget = cx.vector_budget }
+    if let Some(b) = band.as_mut() { b.vector_budget = cx.vector_budget; b.rows_cache = std::mem::take(&mut *cx.rows_cache.borrow_mut()) }
     let out = HtmlOut { scene: cx.scene, report: cx.report, diagnostics, unimplemented: cx.unimplemented };
     (out, log, truncated, band)
 }
@@ -674,7 +691,7 @@ pub fn premeasure_tables_at(html: &str, fonts: &FontSet, env: &Env) -> (String, 
                       report: Report::default(), links: vec![], unimplemented: BTreeMap::new(), marker: None, baseline_probe: None,
                       indent: None, iso_paths: vec![vec![]], iso_cur: 0, content_dy: 0, table_part: false, promoted: Default::default(), boxes: std::env::var_os("NSG_DUMP_BOXES").map(|_| vec![]), geo: None, inl_cur: 0, viewport: (u(env.width_px), Some(u(env.height_px))),
                       pos_cb: (0, 0, u(env.width_px), Some(u(env.height_px))), subs: &Subresources::new(),
-                      placing_abs: false, pending_abs: vec![], deferred_abs: vec![], cb_open: false, canvas_src: None, abs_origin: None, flex_static: None, measured: HashMap::new(), contexts: vec![], hoists: vec![], diagnostics: vec![], vector_budget: crate::path::DOCUMENT_SEGMENT_SHARE, in_scroll: false, scroll_open: None, measured_tables: HashMap::new(), scroll_table: None, stop_after: None, stop_ok: true, table_stop: None, truncated: false, stop_unsafe: false, band: None, marker_owner: Handle::MAX, indent_owner: Handle::MAX, trials: 0 };
+                      placing_abs: false, pending_abs: vec![], deferred_abs: vec![], cb_open: false, canvas_src: None, abs_origin: None, flex_static: None, measured: HashMap::new(), contexts: vec![], hoists: vec![], diagnostics: vec![], vector_budget: crate::path::DOCUMENT_SEGMENT_SHARE, in_scroll: false, scroll_open: None, measured_tables: HashMap::new(), scroll_table: None, stop_after: None, stop_ok: true, table_stop: None, truncated: false, stop_unsafe: false, band: None, marker_owner: Handle::MAX, indent_owner: Handle::MAX, trials: 0, table_band: false, rows_cache: Default::default() };
     // (table, per-column (min, max), its first row's cells) for every table.
     let mut tables: Vec<(Handle, Vec<(U, U)>, Vec<Handle>)> = vec![];
     // ★ INNER TABLES FIRST: a cell holding a table is as wide as that
@@ -1281,7 +1298,9 @@ impl<'a> Cx<'a> {
         } else if kw(s, "display") == "table" && !self.table_rows(h).0.is_empty() {
             let so = std::mem::replace(&mut self.stop_ok, false);
             self.table_stop = if so { self.stop_after } else { None };
+            self.table_band = so && self.band.is_some();
             cy += self.table(h, s, content_x, cy, content_w);
+            self.table_band = false;
             self.table_stop = None;
             self.stop_ok = so;
         } else if kw(s, "display") == "flex" {
@@ -2027,6 +2046,13 @@ impl<'a> Cx<'a> {
     /// around a real navbox `<table>` adopted that table's spanning title
     /// row, could not declare its columns, and was refused.
     fn table_rows(&self, h: Handle) -> (Vec<Handle>, Vec<Handle>) {
+        if let Some(r) = self.rows_cache.borrow().get(&h) { return (r.0.clone(), r.1.clone()) }
+        let r = self.table_rows_walk(h);
+        self.rows_cache.borrow_mut().insert(h, std::rc::Rc::new(r.clone()));
+        r
+    }
+
+    fn table_rows_walk(&self, h: Handle) -> (Vec<Handle>, Vec<Handle>) {
         let (mut rows, mut nested) = (vec![], vec![]);
         let mut stack: Vec<Handle> = self.dom.element_children(h).into_iter().rev().collect();
         while let Some(c) = stack.pop() {
@@ -2991,6 +3017,63 @@ impl<'a> Cx<'a> {
     /// The parser inserts `<tbody>`, and the profile's `display` has no
     /// `table-row-group`, so elements between the table and its rows are
     /// flattened (decision).
+    /// Where a band run starts in table `h`: (the first row's index, its y,
+    /// the row the band stops before when laid out again).
+    fn band_rows_start(&self, h: Handle, rows: &[Handle], top: U) -> (usize, U, Option<Handle>) {
+        let Some(b) = self.band.as_ref() else { return (0, top, None) };
+        let cut_at = b.cut_at.filter(|c| rows.contains(c));
+        if b.resume_path.contains(&h) {
+            // The checkpoint row, or the flow row the checkpoint is inside.
+            if let Some(i) = rows.iter().position(|r| b.resume_at == Some(*r) || b.resume_path.contains(r)) {
+                if let Some(&y) = b.at.get(&rows[i]) { return (i, y, cut_at) }
+            }
+        }
+        (0, top, cut_at)
+    }
+
+    /// Which row boundaries of table `h` a band may stop at (`cuts[r]`:
+    /// no cell above row `r` spans down past it), and which rows are one
+    /// cell to be laid out as plain flow (`flow[r]`). Computed once per
+    /// table and kept with the band state.
+    fn row_cuts(&mut self, h: Handle, rows: &[Handle]) -> std::rc::Rc<TableCuts> {
+        if let Some(c) = self.band.as_ref().and_then(|b| b.row_cuts.get(&h)) { return c.clone() }
+        let mut cuts = vec![true; rows.len() + 1];
+        let mut cells: Vec<Vec<Handle>> = vec![];
+        let mut reach = 0usize; // the first row not covered by a span from above
+        for (r, row) in rows.iter().enumerate() {
+            cuts[r] = r >= reach;
+            let cs: Vec<Handle> = self.dom.element_children(*row).into_iter()
+                .filter(|c| self.st(*c).map(|cs| kw(cs, "display")) == Some("table-cell")).collect();
+            for c in &cs { reach = reach.max(r + self.rowspan(*c).max(1)) }
+            cells.push(cs);
+        }
+        let flow = (0..rows.len()).map(|r| cuts[r] && cuts[r + 1] && cells[r].len() == 1 && self.rowspan(cells[r][0]) == 1 && self.flow_cell(cells[r][0])).collect();
+        let t = std::rc::Rc::new(TableCuts { cuts, flow });
+        if let Some(b) = self.band.as_mut() { b.row_cuts.insert(h, t.clone()); }
+        t
+    }
+
+    /// ★ A cell that may be laid out as plain flow at its own height (a row
+    /// of that cell alone): worth it (a long subtree), and laid out exactly
+    /// as the whole layout lays it out — which gives it its row's height as
+    /// a DEFINITE height — only when nothing inside reads that height: no
+    /// percentage height, offset or clip on the cell or below, and the cell
+    /// neither clips nor positions.
+    fn flow_cell(&self, c: Handle) -> bool {
+        let Some(cs) = self.st(c) else { return false };
+        if kw(cs, "position") != "static" || kw(cs, "overflow-x") != "visible" || kw(cs, "overflow-y") != "visible" { return false }
+        let mut n = 0usize;
+        let mut st = vec![c];
+        while let Some(x) = st.pop() {
+            n += 1;
+            if let Some(es) = self.st(x) {
+                if ["height", "min-height", "max-height", "top", "bottom"].iter().any(|p| pct_size(es, p)) { return false }
+            }
+            st.extend(self.dom.element_children(x));
+        }
+        n >= 64
+    }
+
     fn table(&mut self, h: Handle, s: &Style, x: U, y: U, w: U) -> U {
         let (sx, sy) = match s.get("border-spacing") {
             V::Pair(a, b) => (len(a, w).unwrap_or(0), len(b, 0).unwrap_or(0)),
@@ -3075,10 +3158,81 @@ impl<'a> Cx<'a> {
         // spacing between them. A cell past the declared columns keeps the
         // old fallback (the last column's width) and is counted, not
         // silently squeezed.
-        let mut rows_cells: Vec<Vec<Handle>> = rows.iter().map(|r| cells_of(self, *r)).collect();
-        let mut slots = self.slots(&rows_cells);
-        // First screen only: rows are measured until they pass the limit.
-        let row_limit = self.table_stop.take();
+        // ★ A BAND RUN (backend §4.8, table-row checkpoints): the band may
+        // stop before a row no row span crosses, and a later band starts at
+        // that row, at the y it was laid out at, measuring and laying out
+        // only its own rows. Rows are independent there: the columns are
+        // declared (§3.13), and a row's height is its own cells'. A row that
+        // is ONE cell holding a long flow (HN's comments) is laid out as
+        // that flow, so the band may stop inside it too (`TableCuts::flow`).
+        let band_rows = std::mem::take(&mut self.table_band);
+        if !band_rows {
+            let row_limit = self.table_stop.take();
+            let (cy, _) = self.table_seg(h, s, x, w, sx, sy, &cols, &rows, y + sy, None, row_limit);
+            return cy - y;
+        }
+        let (r0, y_start, cut_at) = self.band_rows_start(h, &rows, y + sy);
+        let cuts = self.row_cuts(h, &rows);
+        let limit = self.band.as_ref().and_then(|b| if b.cut_at.is_none() { b.limit } else { None });
+        let mut r1 = rows.len();
+        if let Some(c) = cut_at { if let Some(i) = rows.iter().position(|r| *r == c) { r1 = i } }
+        // (Not where the first column is pinned: those cells are reordered.)
+        let flow_ok = !(self.scroll_table == Some(h) && cols.len() >= 2);
+        let mut cy = y_start;
+        let mut r = r0;
+        while r < r1 {
+            if self.band.as_ref().is_some_and(|b| b.fired.is_some()) { break }
+            // First pass: stop before the first cuttable row that starts
+            // below the limit (never before the band's own first row).
+            if limit.is_some_and(|l| r > r0 && cy > l) { r1 = r; break }
+            if flow_ok && cuts.flow[r] {
+                // One cell, laid out as plain flow at its own height.
+                let c = cells_of(self, rows[r])[0];
+                let cw = { let k = self.slots(&[vec![c]])[0][0]; let end = (k.0 + k.1).min(cols.len()); cols[k.0..end].iter().sum::<U>() + sx * (end - k.0 - 1) as U };
+                let cx = x + sx;
+                let cx = if kw(s, "direction") == "rtl" { x + w - (cx - x) - cw } else { cx };
+                if let Some(b) = self.band.as_mut() { b.at.entry(rows[r]).or_insert(cy); }
+                self.table_part = true;
+                let so = std::mem::replace(&mut self.stop_ok, true);
+                let ch = self.block(c, cx, cy, cw, None, (Some(cw), None));
+                self.stop_ok = so;
+                cy += ch + sy;
+                r += 1;
+                continue;
+            }
+            // A run of ordinary rows, up to the next flow row.
+            let mut e = r + 1;
+            while e < r1 && !(flow_ok && cuts.flow[e]) { e += 1 }
+            let (ncy, laid) = self.table_seg(h, s, x, w, sx, sy, &cols, &rows[r..e], cy, Some((&cuts.cuts[r..=e], limit, r > r0)), None);
+            cy = ncy;
+            if laid < e - r { r1 = r + laid; break }
+            r = e;
+        }
+        // The band stops before this row — the next band's checkpoint — once
+        // its own rows' cells are laid out (a stop set earlier would end
+        // every cell's content before it began).
+        if r1 < rows.len() {
+            let b = self.band.as_mut().expect("band run");
+            if b.fired.is_none() {
+                b.fired = Some((rows[r1], cy));
+                b.at.entry(rows[r1]).or_insert(cy);
+            }
+        }
+        cy - y
+    }
+
+    /// Rows `rows` of table `h`, from `y0`: measured, aligned, sized and laid
+    /// out. Returns the y after them and how many were laid out. `band`, in
+    /// a band run's first pass: the cuttable boundaries (`cuts[i]` before
+    /// `rows[i]`), the limit, and whether the band's first row is behind us
+    /// (so it may stop before `rows[0]`... it never does: the caller checks).
+    #[allow(clippy::too_many_arguments)]
+    fn table_seg(&mut self, h: Handle, s: &Style, x: U, w: U, sx: U, sy: U, cols: &[U], rows: &[Handle], y0: U,
+                 band: Option<(&[bool], Option<U>, bool)>, row_limit: Option<U>) -> (U, usize) {
+        let cells_of = |this: &Self, r: Handle| -> Vec<Handle> {
+            this.dom.element_children(r).into_iter()
+                .filter(|c| this.st(*c).map(|cs| kw(cs, "display")) == Some("table-cell")).collect()
+        };
         let width_of = |this: &mut Self, (k, n, _): (usize, usize, usize)| -> U {
             if k >= cols.len() {
                 this.count("table cell past the declared columns");
@@ -3091,15 +3245,46 @@ impl<'a> Cx<'a> {
         // Natural heights first, every cell at its width.
         let mut nat: Vec<Vec<U>> = vec![];
         let mut widths: Vec<Vec<U>> = vec![];
-        let mut acc = y + sy;
-        for (cells, row_slots) in rows_cells.iter().zip(&slots) {
-            let ws: Vec<U> = row_slots.iter().map(|sl| width_of(self, *sl)).collect();
-            nat.push(cells.iter().zip(&ws).map(|(c, cw)| { self.table_part = true; self.measure(*c, *cw, None, (Some(*cw), None)) }).collect());
-            widths.push(ws);
-            if let Some(l) = row_limit {
-                let r = nat.len() - 1;
-                acc += row_slots.iter().zip(&nat[r]).filter(|((_, _, rs), _)| *rs == 1).map(|(_, h)| *h).max().unwrap_or(0) + sy;
-                if acc > l { break }
+        let mut acc = y0;
+        let (mut rows_cells, mut slots): (Vec<Vec<Handle>>, Vec<Vec<(usize, usize, usize)>>);
+        match band {
+            None => {
+                rows_cells = rows.iter().map(|r| cells_of(self, *r)).collect();
+                slots = self.slots(&rows_cells);
+                for (cells, row_slots) in rows_cells.iter().zip(&slots) {
+                    let ws: Vec<U> = row_slots.iter().map(|sl| width_of(self, *sl)).collect();
+                    nat.push(cells.iter().zip(&ws).map(|(c, cw)| { self.table_part = true; self.measure(*c, *cw, None, (Some(*cw), None)) }).collect());
+                    widths.push(ws);
+                    if let Some(l) = row_limit {
+                        let r = nat.len() - 1;
+                        acc += row_slots.iter().zip(&nat[r]).filter(|((_, _, rs), _)| *rs == 1).map(|(_, h)| *h).max().unwrap_or(0) + sy;
+                        if acc > l { break }
+                    }
+                }
+            }
+            Some((cuts, limit, _)) => {
+                // Group by group — the rows between two boundaries a band
+                // may stop at, whose slots need nothing from above — so a
+                // band touches only its own rows, never the table's.
+                (rows_cells, slots) = (vec![], vec![]);
+                let mut r = 0;
+                while r < rows.len() {
+                    if limit.is_some_and(|l| r > 0 && acc > l) { break }
+                    let mut e = r + 1;
+                    while e < rows.len() && !cuts[e] { e += 1 }
+                    let g: Vec<Vec<Handle>> = rows[r..e].iter().map(|x| cells_of(self, *x)).collect();
+                    let gs = self.slots(&g);
+                    for (cells, row_slots) in g.iter().zip(&gs) {
+                        let ws: Vec<U> = row_slots.iter().map(|sl| width_of(self, *sl)).collect();
+                        let hs: Vec<U> = cells.iter().zip(&ws).map(|(c, cw)| { self.table_part = true; self.measure(*c, *cw, None, (Some(*cw), None)) }).collect();
+                        acc += row_slots.iter().zip(&hs).filter(|((_, _, rs), _)| *rs == 1).map(|(_, h)| *h).max().unwrap_or(0) + sy;
+                        nat.push(hs);
+                        widths.push(ws);
+                    }
+                    rows_cells.extend(g);
+                    slots.extend(gs);
+                    r = e;
+                }
             }
         }
         if nat.len() < rows_cells.len() {
@@ -3108,7 +3293,7 @@ impl<'a> Cx<'a> {
             rows_cells.truncate(n);
             slots.truncate(n);
             for (r, row) in slots.iter_mut().enumerate() { for sl in row.iter_mut() { sl.2 = sl.2.min(n - r) } }
-            self.truncated = true;
+            if band.is_none() { self.truncated = true }
         }
         // Baselines, for cells aligned on one: the row's shared baseline is
         // the lowest of them (a cell spanning rows shares its FIRST row's),
@@ -3149,8 +3334,12 @@ impl<'a> Cx<'a> {
             }
         }
         let mut row_y: Vec<U> = vec![];
-        let mut cy = y + sy;
+        let mut cy = y0;
         for h in &row_h { row_y.push(cy); cy += h + sy }
+        if band.is_some() {
+            let b = self.band.as_mut().expect("band run");
+            for (r, ry) in row_y.iter().enumerate() { b.at.entry(rows[r]).or_insert(*ry); }
+        }
         // Column i's left edge, so a cell starts where its first column does.
         let col_x = |i: usize| -> U { x + sx + cols[..i.min(cols.len())].iter().sum::<U>() + sx * i.min(cols.len()) as U };
         // ★ A right-to-left table's columns run from its RIGHT edge (CSS 2.1
@@ -3220,7 +3409,7 @@ impl<'a> Cx<'a> {
             self.scene.order.extend(front);
             self.scene.order.extend(back);
         }
-        cy - y
+        (cy, rows_cells.len())
     }
 
     /// Whether `h` or anything inside it has a transform or is absolutely
@@ -5697,7 +5886,7 @@ mod tests {
                           report: Report::default(), links: vec![], unimplemented: BTreeMap::new(), marker: None,
                           baseline_probe: None, indent: None, iso_paths: vec![vec![]], iso_cur: 0, content_dy: 0, table_part: false, promoted: Default::default(), boxes: std::env::var_os("NSG_DUMP_BOXES").map(|_| vec![]), geo: None, inl_cur: 0,
                           viewport: (0, None), pos_cb: (0, 0, 0, None), subs: &Subresources::new(),
-                          placing_abs: false, pending_abs: vec![], deferred_abs: vec![], cb_open: false, canvas_src: None, abs_origin: None, flex_static: None, measured: HashMap::new(), contexts: vec![], hoists: vec![], diagnostics: vec![], vector_budget: crate::path::DOCUMENT_SEGMENT_SHARE, in_scroll: false, scroll_open: None, measured_tables: HashMap::new(), scroll_table: None, stop_after: None, stop_ok: true, table_stop: None, truncated: false, stop_unsafe: false, band: None, marker_owner: Handle::MAX, indent_owner: Handle::MAX, trials: 0 };
+                          placing_abs: false, pending_abs: vec![], deferred_abs: vec![], cb_open: false, canvas_src: None, abs_origin: None, flex_static: None, measured: HashMap::new(), contexts: vec![], hoists: vec![], diagnostics: vec![], vector_budget: crate::path::DOCUMENT_SEGMENT_SHARE, in_scroll: false, scroll_open: None, measured_tables: HashMap::new(), scroll_table: None, stop_after: None, stop_ok: true, table_stop: None, truncated: false, stop_unsafe: false, band: None, marker_owner: Handle::MAX, indent_owner: Handle::MAX, trials: 0, table_band: false, rows_cache: Default::default() };
         cx.count_rows_outside(&held_out);
         // The non-initial value is counted once; the initial one is not.
         assert_eq!(cx.unimplemented.get("row text-align… (not implemented)"), Some(&1), "{:?}", cx.unimplemented);
