@@ -23,3 +23,7 @@ libc            = "0.2"
 [dev-dependencies]
 tempfile = "3"
 libc = "0.2"
+
+[[bin]]
+name = "arca-probe"
+path = "src/bin/arca-probe.rs"

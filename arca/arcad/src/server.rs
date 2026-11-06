@@ -137,6 +137,9 @@ impl State {
     // ── apps ─────────────────────────────────────────────────────────────
 
     fn app_op(&mut self, user: &str, me: &Recipient, op: u16, body: &[u8], item: &mut Option<ItemId>) -> Reply {
+        if !matches!(op, op::MINT | op::PUBKEY | op::SIGN | op::STORE | op::RELEASE | op::LIST | op::DELETE) {
+            return reply(status::DENIED);
+        }
         let Some(store) = self.stores.get_mut(user) else { return reply(status::LOCKED) };
         let who = Access { persona: PERSONA, recipient: me };
         let mut r = Reader::new(body);
