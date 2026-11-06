@@ -748,6 +748,13 @@ pub fn run(cfg: Config) -> ! {
     // Appended, so a restarted lyrad keeps what the last one wrote.
     let mut dump = std::env::var("LYRA_DUMP").ok()
         .and_then(|p| std::fs::OpenOptions::new().create(true).append(true).open(p).ok());
+    // Development: LYRA_POSLOG=<file> logs, each period, CLOCK_MONOTONIC, the
+    // device's consumed frames (GETOPTR), the frames written so far (the
+    // dump's frame index) and GETODELAY: the clock test's truth (§8 check 6).
+    let mut poslog = std::env::var("LYRA_POSLOG").ok()
+        .and_then(|p| std::fs::OpenOptions::new().create(true).append(true).open(p).ok())
+        .map(std::io::BufWriter::new);
+    let mut written: u64 = 0;
     loop {
         let sink = match OssSink::open(cfg.rate, channels, cfg.period_frames, cfg.nfrags) {
             Ok(s) => s,
@@ -793,6 +800,13 @@ pub fn run(cfg: Config) -> ! {
                 if let Some(ppm) = speed.sample(played, now) {
                     engine.rate_ppm = ppm;
                 }
+                if let Some(w) = poslog.as_mut() {
+                    use std::io::Write;
+                    let _ = writeln!(w, "{now} {played} {written} {delay}");
+                    if written % (cfg.rate as u64) < cfg.period_frames as u64 {
+                        let _ = w.flush();
+                    }
+                }
             }
             engine.mix(&mut mix, delay, now);
             let gen = engine.session();
@@ -807,6 +821,7 @@ pub fn run(cfg: Config) -> ! {
                 let bytes = unsafe { std::slice::from_raw_parts(out.as_ptr() as *const u8, out.len() * 2) };
                 let _ = f.write_all(bytes);
             }
+            written += cfg.period_frames as u64;
             if let Err(e) = sink.write_i16(&out) {
                 eprintln!("lyrad: device write failed ({e}); reopening");
                 break;

@@ -267,7 +267,7 @@ case "${1:-}" in
                sleep 3
            done; echo "  down" ;;
     e2e)   e2e ;;
-    lyra)  cross_env; sh "$ROOT/scripts/lyra-vm-check.sh" ;;
+    lyra)  cross_env; shift; sh "$ROOT/scripts/lyra-vm-check.sh" "$@" ;;
     env)   cross_env ;;
     *)     sed -n '2,20p' "$0"; exit 2 ;;
 esac

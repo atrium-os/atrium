@@ -21,8 +21,15 @@
 #   7  kill lyrad while an app plays: the app is told, the supervisor restarts
 #      lyrad and choragusd, and a new stream plays.
 # Not here: 3 (no device in app jails) is portcullis-jail's devfs test plus
-# the shipped manifests; 6 (clock accuracy, ±2 ms over 10 min) needs real
-# timing, which QEMU's emulated CPU doesn't give: run it on the Mac's VM.
+# the shipped manifests.
+#
+#   sh scripts/lyra-vm-check.sh clock     # only check 6, CLOCK_SECS (600) long
+#   6  clock accuracy: two apps (48 and 44.1 kHz) play clicks at known frames;
+#      each click's heard time, predicted by the clock page 30-300 ms ahead,
+#      is compared with when the device consumed that frame (the dump gives
+#      the frame, LYRA_POSLOG the device position over CLOCK_MONOTONIC).
+#      Pass: every click within ±2 ms, rate_ppm stable. Needs real timing:
+#      run it on the Mac's VM (HVF), not under TCG.
 #
 # Needs CROSS_RUSTFLAGS and TARGET (cloud-vm.sh's cross_env sets them).
 set -u
@@ -33,6 +40,9 @@ OUT="${LYRA_VM_OUT:-$HOME/atrium-vm/lyra}"
 BIN=/usr/local/bin
 T=/var/run/lyra-test
 DUMP=/var/tmp/lyra-mix.raw
+POSLOG=/var/tmp/lyra-pos.log
+MODE="${1:-all}"
+CLOCK_SECS="${CLOCK_SECS:-600}"
 FAILS=0
 
 if [ "${1:-}" = qemu-args ]; then
@@ -91,12 +101,12 @@ v "set -e
     printf '50001 alice org.test.a\n50002 alice org.test.b\n50003 alice org.test.c\n50004 alice org.test.ui\n' > $T/registry
     printf 'org.test.a audio\norg.test.b audio\norg.test.ui audio-control\n' > $T/grants
     chmod 644 $T/registry $T/grants
-    rm -f $DUMP; install -o _lyra -m 0644 /dev/null $DUMP
+    rm -f $DUMP $POSLOG; install -o _lyra -m 0644 /dev/null $DUMP; install -o _lyra -m 0644 /dev/null $POSLOG
     chmod 666 /dev/dsp0" || die "commission"
 echo "  snd_hda, users, registry, grants"
 
 say "start lyrad (_lyra) and choragusd (_choragus) under daemon(8) -r"
-v "daemon -r -R 1 -u _lyra -o $T/lyrad.log -t lyra-test-lyrad env LYRA_DUMP=$DUMP $BIN/lyrad --serve </dev/null >/dev/null 2>&1
+v "daemon -r -R 1 -u _lyra -o $T/lyrad.log -t lyra-test-lyrad env LYRA_DUMP=$DUMP LYRA_POSLOG=$POSLOG $BIN/lyrad --serve </dev/null >/dev/null 2>&1
    daemon -r -R 1 -u _choragus -o $T/choragusd.log -t lyra-test-choragusd \
        $BIN/choragusd --daemon $T/audio.sock /atrium/sockets/lyrad/lyrad.sock \
        --grants $T/grants --app-registry $T/registry --control $T/control.sock --state /var/db/choragus </dev/null >/dev/null 2>&1
@@ -105,6 +115,103 @@ v "daemon -r -R 1 -u _lyra -o $T/lyrad.log -t lyra-test-lyrad env LYRA_DUMP=$DUM
 # Let the device open and the dump start.
 sleep 3
 echo "  up"
+
+if [ "$MODE" = clock ]; then
+    say "6: clock accuracy ($CLOCK_SECS s; two apps, 48 and 44.1 kHz)"
+    v "su -m appa -c '$BIN/lyra-vmtest clock $T/audio.sock 48000 $CLOCK_SECS 0.25' >$T/c48.txt 2>$T/c48.err </dev/null &
+       su -m appb -c '$BIN/lyra-vmtest clock $T/audio.sock 44100 $CLOCK_SECS 0.75' >$T/c44.txt 2>$T/c44.err </dev/null &
+       sleep 2; while pgrep -q lyra-vmtest; do sleep 5; done"
+    v "pkill -f 'daemon.*lyra-test'; pkill -u _lyra lyrad; pkill -u _choragus choragusd; true" >/dev/null 2>&1
+    mkdir -p "$OUT"
+    for f in "$DUMP:mix.raw" "$POSLOG:pos.log" "$T/c48.txt:c48.txt" "$T/c44.txt:c44.txt" "$T/lyrad.log:lyrad.log"; do
+        # shellcheck disable=SC2086
+        scp $SCP_OPTS "root@localhost:${f%%:*}" "$OUT/${f#*:}" >/dev/null 2>&1 || die "pull ${f%%:*}"
+    done
+    v "cat $T/c48.err $T/c44.err" | sed 's/^/  app: /'
+    python3 -I - "$OUT" <<'PY' || FAILS=$((FAILS + 1))
+import struct, sys
+out = sys.argv[1]
+RATE = 48000
+raw = open(out + '/mix.raw', 'rb').read()
+n = len(raw) // 4
+left = struct.unpack('<%dh' % (n * 2), raw[:n * 4])[0::2]
+pos = [tuple(int(x) for x in l.split()) for l in open(out + '/pos.log') if len(l.split()) == 4]
+now = [p[0] for p in pos]
+played = [p[1] for p in pos]
+queued = [p[2] - p[3] for p in pos]   # written - GETODELAY
+preds = []
+for name in ('c48.txt', 'c44.txt'):
+    for l in open(out + '/' + name):
+        w = l.split()
+        if w and w[0] == 'click':
+            preds.append((int(w[1]), int(w[2]), int(w[4]), int(w[5])))
+# Clicks in the dump: runs above a third of full scale, placed at their
+# amplitude-weighted centroid (a resampled click spreads over two frames).
+clicks, i = [], 0
+while i < n:
+    if abs(left[i]) > 10000:
+        j = i
+        while j < n and j - i < 8 and abs(left[j]) > 300:
+            j += 1
+        w = [abs(left[k]) for k in range(i, j)]
+        clicks.append(sum(k * a for k, a in zip(range(i, j), w)) / sum(w))
+        i = j + 8
+    else:
+        i += 1
+import bisect
+def when(series, d):
+    # The time the device position passed frame d: a least-squares line
+    # through the position samples within half a second of it.
+    k = bisect.bisect_left(series, d)
+    lo, hi = max(0, k - RATE // 256), min(len(series), k + RATE // 256)
+    xs, ys = series[lo:hi], now[lo:hi]
+    if len(xs) < 10:
+        return None
+    mx, my = sum(xs) / len(xs), sum(ys) / len(ys)
+    sxx = sum((x - mx) ** 2 for x in xs)
+    if sxx == 0:
+        return None
+    b = sum((x - mx) * (y - my) for x, y in zip(xs, ys)) / sxx
+    return my + b * (d - mx)
+# The truth is when the device's queue (frames written minus GETODELAY)
+# passed the click's frame: sound(4)'s own position on OSS path A. (GETOPTR
+# counts frames taken into the device's buffer, not played: shown for
+# reference only.)
+truth = [(d, when(queued, d), when(played, d)) for d in clicks]
+truth = [t for t in truth if t[1] is not None]
+errs, alt, ppms, unmatched = [], [], [], 0
+for rate, k, pred, ppm in preds:
+    best = min(truth, key=lambda t: abs(t[1] - pred), default=None)
+    if best is None or abs(best[1] - pred) > 200e6:
+        unmatched += 1
+        continue
+    errs.append((pred - best[1]) / 1e6)
+    if best[2] is not None:
+        alt.append((pred - best[2]) / 1e6)
+    if k >= 30:
+        ppms.append(ppm)
+fails = 0
+def line(good, text):
+    global fails
+    print('  %s %s' % ('ok  ' if good else 'FAIL', text))
+    fails += not good
+print('  dump: %d frames (%.0f s); %d clicks found, %d predictions, %d unmatched' % (n, n / RATE, len(clicks), len(preds), unmatched))
+line(len(errs) >= 0.95 * len(preds) and len(preds) > 0, '6: clicks matched to predictions: %d of %d' % (len(errs), len(preds)))
+if errs:
+    e = sorted(errs)
+    line(max(abs(x) for x in errs) <= 2.0, '6: predicted minus heard (device queue): median %+.3f ms, min %+.3f, max %+.3f (want within ±2)' % (e[len(e) // 2], e[0], e[-1]))
+if alt:
+    a = sorted(alt)
+    print('       (against GETOPTR instead: median %+.3f ms, min %+.3f, max %+.3f)' % (a[len(a) // 2], a[0], a[-1]))
+if ppms:
+    line(max(ppms) - min(ppms) <= 20, '6: rate_ppm after 30 s: %d to %d (want a spread of 20 or less)' % (min(ppms), max(ppms)))
+sys.exit(1 if fails else 0)
+PY
+    echo "  data in $OUT"
+    [ "$FAILS" = 0 ] && { say "lyra clock check PASSED"; exit 0; }
+    say "lyra clock check: $FAILS FAILED"
+    exit 1
+fi
 
 mark() { v "stat -f %z $DUMP"; }
 
