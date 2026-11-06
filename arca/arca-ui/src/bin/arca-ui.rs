@@ -213,8 +213,6 @@ fn main() -> ExitCode {
                         cx.run(embed, e, dos);
                     }
                 }
-                // Resumed, and events for other roles (AudioTicket).
-                _ => {}
                 ChildEvent::Detaching { embed } => {
                     if let Some(mut e) = embeds.remove(&embed) {
                         let dos = e.field.detach();
@@ -222,6 +220,8 @@ fn main() -> ExitCode {
                         let _ = e.win.window_destroy(e.window_id);
                     }
                 }
+                // Resumed, and events for other roles (AudioTicket).
+                _ => {}
             },
             Ok(None) => {}
             Err(e) => {
