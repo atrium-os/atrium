@@ -199,6 +199,62 @@ that endpoint has an open view, then recycled after a bounded number of requests
 Reuse doesn't widen what a courier holds, because each request still fetches its items fresh
 and wipes them afterwards.
 
+### 5.3 As built: A1 (2026-11-06)
+
+`arca/arca-courier` is the courier and `arcad` its counterpart.
+
+- **Identity.** Couriers run as uids 64000–64999. The launcher writes each uid's label to
+  the courier registry (`/var/run/atrium/courier-registry`, one line
+  `uid user persona https host port [partition]`). Both arcad and the courier read the
+  label from there by uid. A courier uid never resolves as an app, and a duplicate line
+  voids the uid.
+- **Whose items.** An app stores a token for an endpoint with `STORE_FOR`. The item's
+  recipient is the endpoint, and its persona is the app's own
+  (`app-` + 16 bytes of SHA-256 over publisher and app id). So only couriers whose label
+  names that persona and that endpoint can fill it. The app itself can't read it back,
+  and another app's courier to the same server gets nothing. The launcher sets a
+  courier's persona from the app that asked for it. The Navigator's web personas come
+  with A2.
+- **The request** (`schema.rs`) is a fixed binary frame. It has a method, a path and a
+  query (visible ASCII, no `#`, no `?` in the path), up to 16 headers from a seven-name
+  allowlist, up to 8 slots and up to 256 body segments (1 MiB). A slot is an item id or a
+  credential handle. It goes either into `Authorization: Bearer`, or into the body as raw,
+  form or JSON-string text. Every body slot must be used, and anything accepted has
+  exactly one encoding. The courier writes Host, Content-Length, Connection and
+  Accept-Encoding itself. A Bearer value with any byte outside visible ASCII is refused
+  `Unsendable`.
+- **Order.** The courier resolves through navigator-fetch's address policy (private
+  ranges refused unless granted) and connects. It finishes the rustls handshake to the
+  label's host. Only then does it send arcad `FILL`, which is all or nothing. It builds the
+  request in locked memory, sends it, and reads the response with navigator-fetch's
+  bounded reader. A kept-alive connection is reused for the next request to the same
+  endpoint.
+- **The response.** Every `Set-Cookie` goes to arcad as a `SET_COOKIE` record and is
+  removed. Arca keeps one record per (endpoint, name) and never fills one by id; cookie
+  matching is A2. Any echo of a sent value in headers or body, raw or encoded, is masked
+  with `*`. Redirects come back to the client as they are: the courier follows none.
+- **Gates.**
+  - `arca-courier/tests/courier.rs` runs against loopback TLS servers. It checks that the
+    token reaches only the bound host and that the cookie goes to Arca and the echo is
+    masked. A 302 to evil.example is returned and not even looked up. A wrong-name cert,
+    an untrusted CA or a refused address asks Arca nothing. Form and JSON encoding are
+    checked. A hostile-client run of 20,000 mutated frames checks that every malformed
+    frame is refused before Arca or the network and that valid frames ask for exactly
+    their own refs.
+  - `fuzz/` is a libFuzzer target for the schema.
+  - `arcad/tests/courier.rs` checks the rules: another endpoint, another app or publisher,
+    the app itself, all-or-nothing fills, cookies never by id, and couriers getting no
+    other ops.
+  - `scripts/arca-vm-test.sh` §4 runs the courier in the VM under its own uid against
+    the jailed arcad.
+- **Not yet.**
+  - The launcher (a jail per courier with its own vnet, §5.2): the VM gate runs the
+    courier with `su`.
+  - Capsicum for the courier after connect.
+  - Handles from arca-ui are bound to the app, so they can't be redeemed by a courier
+    yet. They need the field's endpoint (A3).
+  - Pinned keys and revocation ([../TLS.md](../TLS.md)).
+
 ## 6. At rest and in memory
 
 ### 6.1 The key hierarchy

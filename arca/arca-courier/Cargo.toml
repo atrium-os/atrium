@@ -10,6 +10,10 @@ description = "Arca's courier (docs/spec/arca.md §5): one endpoint's HTTPS requ
 name = "arca_courier"
 path = "src/lib.rs"
 
+[[bin]]
+name = "arca-courier"
+path = "src/bin/arca-courier.rs"
+
 [dependencies]
 arca-store      = { path = "../arca-store" }
 arcad           = { path = "../arcad" }
@@ -21,3 +25,7 @@ libc            = "0.2"
 [dev-dependencies]
 rcgen    = { version = "0.13", default-features = false, features = ["ring", "pem"] }
 tempfile = "3"
+
+[[example]]
+name = "courier-vm-probe"
+path = "examples/vm_probe.rs"

@@ -56,6 +56,7 @@ dependencies = [
  "getrandom 0.2.17",
  "libc",
  "portcullis-peer",
+ "sha2",
 ]
 
 [[package]]

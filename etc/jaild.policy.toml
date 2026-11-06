@@ -66,6 +66,9 @@ ro_paths = [
     # The Portcullis launch registry (uid -> user, app id), one file, for
     # services that name their peers by uid: choragusd, arcad.
     "/var/run/atrium/app-registry",
+    # Arca's courier registry (courier uid -> user, persona, endpoint), one
+    # file, written by the courier launcher; read by arcad (arca.md §4.1).
+    "/var/run/atrium/courier-registry",
     # Users' approved grants (<user>/policy.toml, 0644), read by choragusd to
     # check audio capabilities. The host identity key here is root 0600.
     "/var/db/atrium",

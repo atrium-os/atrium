@@ -19,10 +19,10 @@
 #   2. `mkdir -p /var/db/arca && chown _arca:_arca /var/db/arca && chmod 700 /var/db/arca`
 #   3. `mkdir -p /atrium/sockets/arca && chown _arca:_arca /atrium/sockets/arca`
 #   4. /var/db/arca in jaild.policy mount_sources.rw_paths and
-#      /var/run/atrium/app-registry in ro_paths.
+#      /var/run/atrium/app-registry and courier-registry in ro_paths.
 #   5. The rootfs mountpoints: <path>/{dev,libexec,lib,usr/lib,usr/local/lib,
 #      usr/local/bin,atrium/sockets/arca,var/db/arca,var/run/atrium} and an
-#      empty file <path>/var/run/atrium/app-registry (the nullfs file mount point).
+#      empty files <path>/var/run/atrium/{app,courier}-registry (nullfs file mount points).
 #   6. ostiarius's uid in ARCA_VESTIBULUM_UID and arca-ui's (_arca-ui) in ARCA_UI_UID below.
 
 enabled       = true
@@ -64,6 +64,10 @@ kind   = "rw_nullfs"
 [[mounts]]
 source = "/var/run/atrium/app-registry"           # ro: who each app uid is (one file)
 dest   = "var/run/atrium/app-registry"
+kind   = "ro_nullfs"
+[[mounts]]
+source = "/var/run/atrium/courier-registry"       # ro: each courier uid's (user, persona, endpoint)
+dest   = "var/run/atrium/courier-registry"
 kind   = "ro_nullfs"
 
 [exec]

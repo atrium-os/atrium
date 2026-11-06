@@ -29,7 +29,7 @@ check() { # name expected actual
 
 echo "=== cross-build"
 BINS=""
-for c in arca/arca-store arca/arcad arca/arca-ui; do
+for c in arca/arca-store arca/arcad arca/arca-ui arca/arca-courier; do
     out=$(cd "$ROOT/$c" && RUSTFLAGS="$CROSS_RUSTFLAGS" cargo test --release --target "$TARGET" --no-run --message-format=json 2>/dev/null \
         | python3 -c 'import sys,json
 for l in sys.stdin:
@@ -39,10 +39,12 @@ for l in sys.stdin:
 done
 (cd "$ROOT/arca/arcad" && RUSTFLAGS="$CROSS_RUSTFLAGS" cargo build -q --release --target "$TARGET" --bins)
 REL="$ROOT/arca/arcad/target/$TARGET/release"
+(cd "$ROOT/arca/arca-courier" && RUSTFLAGS="$CROSS_RUSTFLAGS" cargo build -q --release --target "$TARGET" --bins --examples)
+CREL="$ROOT/arca/arca-courier/target/$TARGET/release"
 
 echo "=== deploy"
 g "mkdir -p /root/arca-test && rm -f /root/arca-test/*"
-for b in $BINS "$REL/arcad" "$REL/arca-probe"; do
+for b in $BINS "$REL/arcad" "$REL/arca-probe" "$CREL/arca-courier" "$CREL/examples/courier-vm-probe"; do
     put "$b" /root/arca-test/
     h=$(sha256sum "$b" | cut -d' ' -f1)
     gh=$(g "sha256 -q /root/arca-test/$(basename "$b")")
@@ -79,10 +81,10 @@ fi
 g "pw usershow _arca >/dev/null 2>&1 || pw useradd _arca -u 65020 -d /nonexistent -s /usr/sbin/nologin"
 g "pw usershow _ostiarius >/dev/null 2>&1 || pw useradd _ostiarius -u 50093 -d /nonexistent -s /usr/sbin/nologin"
 g "pw usershow _arca-ui >/dev/null 2>&1 || pw useradd _arca-ui -u 65021 -d /nonexistent -s /usr/sbin/nologin"
-g "install -m 755 /root/arca-test/arcad /usr/local/bin/atrium-arcad && install -m 755 /root/arca-test/arca-probe /usr/local/bin/arca-probe"
+g "install -m 755 /root/arca-test/arcad /usr/local/bin/atrium-arcad && install -m 755 /root/arca-test/arca-probe /usr/local/bin/arca-probe && install -m 755 /root/arca-test/arca-courier /usr/local/bin/arca-courier"
 g "mkdir -p /var/db/arca /atrium/sockets/arca /var/run/atrium && chown _arca:_arca /var/db/arca /atrium/sockets/arca && chmod 700 /var/db/arca"
-g "touch /var/run/atrium/app-registry"
-g "mkdir -p $J/dev $J/libexec $J/lib $J/usr/lib $J/usr/local/lib $J/usr/local/bin $J/atrium/sockets/arca $J/var/db/arca $J/var/run/atrium && { test -e $J/var/run/atrium/app-registry || touch $J/var/run/atrium/app-registry; }"
+g "touch /var/run/atrium/app-registry /var/run/atrium/courier-registry"
+g "mkdir -p $J/dev $J/libexec $J/lib $J/usr/lib $J/usr/local/lib $J/usr/local/bin $J/atrium/sockets/arca $J/var/db/arca $J/var/run/atrium && for f in app-registry courier-registry; do test -e $J/var/run/atrium/\$f || touch $J/var/run/atrium/\$f; done"
 # jaild policy: the repo's (which carries _arca and Arca's mount sources),
 # merged with the live one exactly as deploy-portcullis.sh does.
 tmpd=$(mktemp -d)
@@ -144,6 +146,33 @@ case "$r" in *Existing*) check "right passcode unlocks again" ok ok ;; *) check 
 check "and the key works again" 0 "$(as arcaapp1 "sign $KID hello" | sed -n 's/^status=\([0-9]*\).*/\1/p')"
 check "audit log has no value" 0 "$(g 'grep -c hunter2 /var/db/arca/audit.log' || true)"
 check "nothing in clear on disk" 0 "$(g 'grep -rl hunter2 /var/db/arca | wc -l' | tr -d ' ')"
+
+echo "=== 4. the courier (A1)"
+# Two couriers for mail's persona: one bound to api.example, one to
+# evil.example. Their labels come from the courier registry by uid.
+MP=$(g "arca-probe - persona $PUB org.example.mail")
+g "pw usershow arcacourier1 >/dev/null 2>&1 || pw useradd arcacourier1 -u 64001 -d /nonexistent -s /usr/sbin/nologin"
+g "pw usershow arcacourier2 >/dev/null 2>&1 || pw useradd arcacourier2 -u 64002 -d /nonexistent -s /usr/sbin/nologin"
+g "printf '64001 alice $MP https api.example 443\n64002 alice $MP https evil.example 443\n' > /var/run/atrium/courier-registry"
+as _ostiarius 'unlock alice correct-horse' >/dev/null
+TID=$(as arcaapp1 'store-for api.example hunter2-token' | sed -n 's/^status=0 body=//p')
+check "app stores a token for api.example" 32 "${#TID}"
+check "the app can't read it back" "status=1 body=" "$(as arcaapp1 "release $TID")"
+CENV="env ARCA_COURIER_CA=/tmp/courier-ca.pem ARCA_COURIER_GRANT_PRIVATE_NETWORK=1 ARCA_SOCKET=$S su -m"
+r=$(g "/root/arca-test/courier-vm-probe api.example /tmp/courier-ca.pem $TID \"$CENV arcacourier1 -c\"")
+echo "$r" | sed 's/^/    /'
+check "courier: the server got the token over TLS" true "$(echo "$r" | sed -n 's/^server_got_token=//p')"
+check "courier: 200 to the client" 200 "$(echo "$r" | sed -n 's/^status=//p')"
+check "courier: the echoed token is masked" "echo *************" "$(echo "$r" | sed -n 's/^body=//p')"
+check "courier: Set-Cookie kept from the client" true "$(echo "$r" | sed -n 's/^cookie_hidden=//p')"
+check "courier: a redirect comes back, not followed" "302 https://evil.example/" "$(echo "$r" | sed -n 's/^redirect=//p')"
+check "courier: two requests at the server, no more" 2 "$(echo "$r" | sed -n 's/^requests_at_server=//p')"
+r=$(as arcaapp1 'list-for api.example')
+case "$r" in *"$(printf 'sid' | od -An -tx1 | tr -d ' \n')"*) check "the cookie is a record in Arca" ok ok ;; *) check "the cookie is a record in Arca" ok "$r" ;; esac
+r=$(g "/root/arca-test/courier-vm-probe evil.example /tmp/courier-ca.pem $TID \"$CENV arcacourier2 -c\"")
+check "courier for evil.example: Arca denies the token" "refused=Denied" "$(echo "$r" | head -1)"
+check "and evil.example's server got no token" false "$(echo "$r" | sed -n 's/^server_got_token=//p')"
+check "a courier uid is no app" "status=1 body=" "$(as arcacourier1 'store hunter3')"
 
 echo "=== $pass passed, $fail failed"
 [ "$fail" = 0 ]

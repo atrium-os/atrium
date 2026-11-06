@@ -10,6 +10,9 @@
 //! arca-probe SOCK list
 //! arca-probe SOCK mint ACCOUNT              # ed25519; prints id and pubkey
 //! arca-probe SOCK sign ID MESSAGE
+//! arca-probe SOCK store-for HOST VALUE      # an API token for https://HOST
+//! arca-probe SOCK list-for HOST
+//! arca-probe - persona PUBHEX APP            # the app's courier persona
 //! arca-probe SOCK accounts USER PUBHEX APP # as arca-ui's uid: the chip's list
 //! arca-probe SOCK generate USER PUBHEX APP # as arca-ui's uid: a handle
 //! ```
@@ -49,7 +52,24 @@ fn main() -> ExitCode {
     let sock = &a[1];
     let arg = |i: usize| a.get(i).map(String::as_str).unwrap_or("");
     let mut w = Writer::new();
+    if arg(2) == "persona" {
+        let p: [u8; 32] = unhex(arg(3)).try_into().unwrap_or([0; 32]);
+        println!("{}", arcad::courier::app_persona(&p, arg(4)));
+        return ExitCode::SUCCESS;
+    }
     let (st, body) = match arg(2) {
+        "store-for" => {
+            w.u16(4);
+            w.u8(2);
+            w.str("probe-token");
+            arcad::proto::write_endpoint(&mut w, arg(3), 443);
+            w.bytes(arg(4).as_bytes());
+            call(sock, op::STORE_FOR, &w.buf)
+        }
+        "list-for" => {
+            arcad::proto::write_endpoint(&mut w, arg(3), 443);
+            call(sock, op::LIST_FOR, &w.buf)
+        }
         "unlock" => {
             match VestibulumLink::new(sock).unlock(arg(3), arg(4).as_bytes()) {
                 Ok(u) => println!("unlocked {u:?}"),
