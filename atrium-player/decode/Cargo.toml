@@ -1,0 +1,19 @@
+[package]
+name        = "atrium-media-decode"
+version     = "0.1.0"
+edition.workspace = true
+license.workspace = true
+description = "atrium-player's decoders: dav1d, libvpx, libopus, libvorbis behind small C shims (docs/spec/atrium-player.md §4). Links into the decode worker only."
+publish     = false
+links       = "atrium_media_shim"
+build       = "build.rs"
+
+[dependencies]
+atrium-media-demux = { path = "../demux" }
+
+[build-dependencies]
+cc         = "1"
+pkg-config = "0.3"
+
+[dev-dependencies]
+md-5 = "0.10"
