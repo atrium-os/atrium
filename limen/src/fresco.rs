@@ -66,17 +66,6 @@ impl Compositor for Frescod {
     }
 }
 
-/// fresco-video.md §8 S1, as agreed with the Fresco thread (2026-11-06).
-/// Local until fresco_protocol carries it; same encoding.
-pub mod embed_connect {
-    use serde::{Deserialize, Serialize};
-    pub const OP: u16 = 0x0911;
-    #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
-    pub struct EmbedConnect { pub owner_uid: u32 }
-    #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-    pub enum EmbedConnectResult { Ok, Refused { reason: u8 } }
-}
-
 impl Frescod {
     /// Open a new activation-socket connection, ask for EMBED_CONNECT, and
     /// hand back the raw stream, which frescod then treats as the child's
@@ -84,7 +73,7 @@ impl Frescod {
     /// nothing after it.
     pub fn open_embed(&self, owner_uid: u32) -> std::io::Result<std::os::unix::net::UnixStream> {
         use aqueduct::envelope::{read_message_alloc, write_message};
-        use embed_connect::*;
+        use slot::{EmbedConnect, EmbedConnectResult, op::EMBED_CONNECT as OP};
         let mut s = std::os::unix::net::UnixStream::connect(&self.path)?;
         s.set_read_timeout(Some(Duration::from_secs(2)))?;
         let payload = postcard::to_stdvec(&EmbedConnect { owner_uid }).unwrap();
