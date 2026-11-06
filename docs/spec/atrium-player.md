@@ -254,6 +254,17 @@ Fresco's layers land.
   have no time text, because text waits for Pergola's in-app shaping. They are drawn
   directly, not with Pergola widgets, because a Pergola window can't hold a video layer
   yet. There is one source per embed; a new `src` is a new embed.
+- M6 (on Linux, against a stand-in choragusd in `worker/tests/audio.rs`): one Lyra stream as
+  role `Media` per player, and the audio clock as the master the video follows
+  (`audio_out.rs`). Every decoded sample reaches the stream in order; pause stops it; a seek
+  flushes and the next run starts at the target, with the pre-roll trimmed; the media clock
+  runs at real time to within 30 ms over 500 ms. Opus start delay is now taken from the
+  container (WebM `CodecDelay`, MP4 `elst`) and the decoder's pre-skip, so the timestamps
+  line up. `SetRate` plays at 0.25 to 4 times with the pitch kept: a streaming WSOLA
+  (`wsola.rs`, 20 ms Hann segments, ±8 ms search). The new rate takes effect from a seek to
+  where playback is. At 1.5 times, the clock runs 1.5 times as fast and the clip plays a third
+  shorter. WSOLA keeps its last segment (about 30 ms) at the end of a clip. The run on real
+  lyrad in the VM is still to do.
 - Known gaps: a WebM with its Cues at the end can only seek within what is read ahead,
   otherwise it reads again from the start and drops frames up to the target (reading Cues
   through the SeekHead is an M7 item). The stream's colour info isn't read yet, so the layer
