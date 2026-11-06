@@ -14,13 +14,15 @@
 //!    handoff.
 //!  * `set_cache_cap` — cap RAM used by the per-connection blob
 //!    cache.
+//!  * `send_message_with_fds` / `take_fds` — pass file descriptors
+//!    (shared memory, spec §4.2) along with a message.
 //!
 //! Verify-on-use is unconditional: every cache read re-hashes the
 //! bytes and rejects on mismatch.
 
-use std::collections::HashMap;
-use std::io::{self, BufWriter, Read, Write};
-use std::os::fd::{AsRawFd, RawFd};
+use std::collections::{HashMap, VecDeque};
+use std::io::{self, BufWriter, Write};
+use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::os::unix::net::UnixStream;
 use std::path::Path;
 use std::time::{Duration, Instant};
@@ -33,6 +35,12 @@ use crate::envelope::{self, flag, Header, MAX_PAYLOAD};
 /// `set_cache_cap`. 8 MiB is plenty for icons, manifests, and
 /// config-shaped blobs; bulk content should ride shm/fd-pass.
 pub const DEFAULT_CACHE_BYTES: usize = 8 * 1024 * 1024;
+
+/// Most fds one message may carry.
+pub const MAX_FDS_PER_MESSAGE: usize = 16;
+/// Most received fds a connection holds before the caller takes them;
+/// past this, more are closed on arrival (a peer can't exhaust our fds).
+pub const MAX_QUEUED_FDS: usize = 64;
 
 /// What the caller asked recv_message for. Matches the envelope's
 /// flag bits.
@@ -86,6 +94,8 @@ pub struct Connection {
     _outbound_uploads: HashMap<Hash, ()>,
     /// In-progress incoming uploads — receiver state. Keyed by hash.
     incoming_uploads:  HashMap<Hash, IncomingUpload>,
+    /// Fds received with messages, in arrival order, until `take_fds`.
+    infds: VecDeque<OwnedFd>,
 }
 
 #[derive(Debug)]
@@ -118,6 +128,7 @@ impl Connection {
             cache_cap:   DEFAULT_CACHE_BYTES,
             _outbound_uploads: HashMap::new(),
             incoming_uploads:  HashMap::new(),
+            infds: VecDeque::new(),
         })
     }
 
@@ -148,6 +159,50 @@ impl Connection {
         self.wr.flush()
     }
 
+    /// Send a message with `fds` attached (at most
+    /// [`MAX_FDS_PER_MESSAGE`]). They arrive with the message's first
+    /// byte, so by the time the receiver has the whole message they are
+    /// in its queue for [`Connection::take_fds`]. The payload should say
+    /// how many there are.
+    pub fn send_message_with_fds(
+        &mut self,
+        opcode_class: u8,
+        op: u16,
+        flags: u16,
+        payload: &[u8],
+        fds: &[RawFd],
+    ) -> io::Result<()> {
+        if fds.is_empty() {
+            return self.send_message(opcode_class, op, flags, payload);
+        }
+        if fds.len() > MAX_FDS_PER_MESSAGE || payload.len() as u64 > MAX_PAYLOAD as u64 {
+            return Err(io::Error::new(io::ErrorKind::InvalidInput, "too many fds or payload too big"));
+        }
+        self.wr.flush()?;
+        let h = Header::new(opcode_class, op, flags, payload.len() as u32);
+        let mut bytes = h.encode().to_vec();
+        bytes.extend_from_slice(payload);
+        let sent = send_with_fds(self.wr.get_ref(), &bytes, fds)?;
+        self.wr.get_mut().write_all(&bytes[sent..])
+    }
+
+    /// Take `n` received fds, oldest first; `None` (and none taken) if
+    /// fewer than `n` have arrived.
+    pub fn take_fds(&mut self, n: usize) -> Option<Vec<OwnedFd>> {
+        (self.infds.len() >= n).then(|| self.infds.drain(..n).collect())
+    }
+
+    /// Read from the socket into `chunk`, queueing any fds that came along.
+    fn read_chunk(&mut self, chunk: &mut [u8]) -> io::Result<usize> {
+        let (n, fds) = recv_with_fds(&self.rd, chunk)?;
+        for fd in fds {
+            if self.infds.len() < MAX_QUEUED_FDS {
+                self.infds.push_back(fd);
+            }
+        }
+        Ok(n)
+    }
+
     /// Pull the next service-level message. Auto-handles
     /// CLASS_CORE traffic in the background (cache loading, ACKs).
     /// Caller-visible messages are everything in their own service
@@ -174,7 +229,7 @@ impl Connection {
             if self.has_buffered_message() {
                 return Ok(true);
             }
-            match self.rd.read(&mut chunk) {
+            match self.read_chunk(&mut chunk) {
                 Ok(0) => return Ok(false),
                 Ok(n) => self.inbuf.extend_from_slice(&chunk[..n]),
                 Err(e) if e.kind() == io::ErrorKind::WouldBlock => return Ok(true),
@@ -232,7 +287,7 @@ impl Connection {
             if let Some(env) = self.pop_envelope()? {
                 return Ok(env);
             }
-            match self.rd.read(&mut chunk) {
+            match self.read_chunk(&mut chunk) {
                 Ok(0) => return Err(io::Error::new(
                     io::ErrorKind::UnexpectedEof, "connection closed")),
                 Ok(n) => self.inbuf.extend_from_slice(&chunk[..n]),
@@ -628,5 +683,113 @@ impl Connection {
                   || e.kind() == io::ErrorKind::TimedOut => Ok(None),
             Err(e) => Err(e),
         }
+    }
+}
+
+/// `sendmsg` the start of `bytes` with `fds` attached; returns how many
+/// bytes went (at least one, or an error).
+fn send_with_fds(s: &UnixStream, bytes: &[u8], fds: &[RawFd]) -> io::Result<usize> {
+    let space = unsafe { libc::CMSG_SPACE((fds.len() * std::mem::size_of::<RawFd>()) as u32) } as usize;
+    let mut cbuf = vec![0u8; space];
+    let mut iov = libc::iovec { iov_base: bytes.as_ptr() as *mut _, iov_len: bytes.len() };
+    // SAFETY: msghdr is plain data; every pointer in it points into
+    // `iov`, `bytes` and `cbuf`, which outlive the sendmsg call, and the
+    // control message is written inside `cbuf`'s CMSG_SPACE.
+    unsafe {
+        let mut m: libc::msghdr = std::mem::zeroed();
+        m.msg_iov = &mut iov;
+        m.msg_iovlen = 1;
+        m.msg_control = cbuf.as_mut_ptr().cast();
+        m.msg_controllen = space as _;
+        let c = libc::CMSG_FIRSTHDR(&m);
+        (*c).cmsg_level = libc::SOL_SOCKET;
+        (*c).cmsg_type = libc::SCM_RIGHTS;
+        (*c).cmsg_len = libc::CMSG_LEN((fds.len() * std::mem::size_of::<RawFd>()) as u32) as _;
+        std::ptr::copy_nonoverlapping(fds.as_ptr(), libc::CMSG_DATA(c).cast::<RawFd>(), fds.len());
+        loop {
+            let n = libc::sendmsg(s.as_raw_fd(), &m, 0);
+            if n >= 0 {
+                return Ok(n as usize);
+            }
+            let e = io::Error::last_os_error();
+            if e.kind() != io::ErrorKind::Interrupted {
+                return Err(e);
+            }
+        }
+    }
+}
+
+/// `recvmsg` into `buf`, returning the bytes read and any fds that came
+/// with them (close-on-exec). Fds past [`MAX_FDS_PER_MESSAGE`] in one
+/// control message are closed.
+fn recv_with_fds(s: &UnixStream, buf: &mut [u8]) -> io::Result<(usize, Vec<OwnedFd>)> {
+    let space = unsafe { libc::CMSG_SPACE((MAX_FDS_PER_MESSAGE * std::mem::size_of::<RawFd>()) as u32) } as usize;
+    let mut cbuf = vec![0u8; space];
+    let mut iov = libc::iovec { iov_base: buf.as_mut_ptr().cast(), iov_len: buf.len() };
+    // SAFETY: as in send_with_fds; the kernel writes at most `space`
+    // control bytes and `buf.len()` data bytes, and every fd we read out
+    // of a SCM_RIGHTS message is a fresh descriptor we now own.
+    unsafe {
+        let mut m: libc::msghdr = std::mem::zeroed();
+        m.msg_iov = &mut iov;
+        m.msg_iovlen = 1;
+        m.msg_control = cbuf.as_mut_ptr().cast();
+        m.msg_controllen = space as _;
+        let n = libc::recvmsg(s.as_raw_fd(), &mut m, libc::MSG_CMSG_CLOEXEC);
+        if n < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        let mut fds = Vec::new();
+        let mut c = libc::CMSG_FIRSTHDR(&m);
+        while !c.is_null() {
+            if (*c).cmsg_level == libc::SOL_SOCKET && (*c).cmsg_type == libc::SCM_RIGHTS {
+                let data = libc::CMSG_DATA(c).cast::<RawFd>();
+                let len = (*c).cmsg_len as usize - (data as usize - c as usize);
+                for i in 0..len / std::mem::size_of::<RawFd>() {
+                    let fd = OwnedFd::from_raw_fd(std::ptr::read_unaligned(data.add(i)));
+                    if fds.len() < MAX_FDS_PER_MESSAGE {
+                        fds.push(fd);
+                    }
+                }
+            }
+            c = libc::CMSG_NXTHDR(&m, c);
+        }
+        Ok((n as usize, fds))
+    }
+}
+
+#[cfg(test)]
+mod fd_tests {
+    use super::*;
+    use std::io::{Read, Seek, SeekFrom, Write};
+
+    #[test]
+    fn fds_ride_along_with_their_message() {
+        let (a, b) = UnixStream::pair().unwrap();
+        let mut tx = Connection::wrap(a).unwrap();
+        let mut rx = Connection::wrap(b).unwrap();
+        let mut f = std::fs::File::from(tempfile_fd());
+        f.write_all(b"frame").unwrap();
+        tx.send_message(9, 1, 0, b"before").unwrap();
+        tx.send_message_with_fds(9, 2, 0, &[1], &[f.as_raw_fd(), f.as_raw_fd()]).unwrap();
+        tx.send_message(9, 3, 0, b"after").unwrap();
+        assert_eq!(rx.recv_message().unwrap().op, 1);
+        let m = rx.recv_message().unwrap();
+        assert_eq!((m.op, m.payload.as_slice()), (2, &[1u8][..]));
+        let got = rx.take_fds(2).expect("two fds");
+        assert!(rx.take_fds(1).is_none());
+        let mut g = std::fs::File::from(got.into_iter().next().unwrap());
+        g.seek(SeekFrom::Start(0)).unwrap();
+        let mut s = String::new();
+        g.read_to_string(&mut s).unwrap();
+        assert_eq!(s, "frame");
+        assert_eq!(rx.recv_message().unwrap().op, 3);
+    }
+
+    fn tempfile_fd() -> OwnedFd {
+        let p = std::env::temp_dir().join(format!("aqueduct-fd-{}", std::process::id()));
+        let f = std::fs::OpenOptions::new().read(true).write(true).create(true).truncate(true).open(&p).unwrap();
+        let _ = std::fs::remove_file(&p);
+        f.into()
     }
 }
