@@ -42,7 +42,7 @@ app. Apps can't pick monitors or ask for a span by geometry (forum.md §0: no am
 authority); a game that wants per-monitor windows still opens several windows.
 
 **The game is told the layout.** When a window is zoomed over a group, frescod sends
-`EV_WINDOW_SPAN { window_id, tiles: Vec<[x, y, w, h]>, hidden: Vec<[x, y, w, h]> }` along with
+`EV_WINDOW_SPAN { window_id, tiles: Vec<Tile { rect: [x, y, w, h], present: bool }>, hidden: Vec<[x, y, w, h]> }` along with
 the resize: `tiles` is each monitor's part of the surface and `hidden` the bezel strips. A game
 that knows nothing about it renders one wide frame (Eyefinity behaviour). A game that cares
 renders one view per tile, with that monitor's angle, into the same surface: correct
@@ -91,13 +91,27 @@ work is.
 
 ## 6. Monitors coming and going
 
-- A dropout of under 5 s keeps the member's place (the display 3.0 rule); its tile shows
-  nothing meanwhile.
-- A member gone for longer: the span shrinks to the members left (`EV_WINDOW_SPAN` with fewer
-  tiles, and a resize). If one monitor is left it is an ordinary zoom.
-- The member comes back: the span grows again, if the window is still zoomed.
-- A game that doesn't handle resize keeps its old size: frescod centres it, letterboxed, the
-  same as any window that ignores a resize.
+A span is more fragile than a desktop: a resize in the middle of a race is worse than a
+window moving, and every member shares one timing lock and one flip. So a span holds its
+shape through anything short, and changes shape only for a monitor that is really gone.
+The desktop rules (display 3.0) stay underneath: hotplug signals settle for 500 ms
+(`outputs::SETTLE`) before anything is reconfigured, and a monitor missing for under 5 s
+(`GRACE`) keeps its place.
+
+| Case | What the game sees | What frescod does |
+|---|---|---|
+| **HPD glitch** (a pulse, a link retrain, a burst of hotplug interrupts that settles within 500 ms) | Nothing. | Nothing: the debounce absorbs it. If the link dropped, the member's link is retrained in place; its pipe never stopped. |
+| **Short dropout** (monitor power-cycles, input switch, cable wiggle, under 30 s) | No resize. `EV_WINDOW_SPAN` marks that tile `present: false` and then `true` again, so a game may pause drawing it; one that ignores this loses nothing. | The member's tile isn't scanned out. Its **pipe keeps running** (OTG timing on, stream off at the link), so the timing lock and the other members' flips are untouched, and the member's VRR and HDR capabilities still count for the group. Group flips leave it out of the commit while it is gone. On return: same monitor identity, so the link is trained and the group mode set on that member alone; the others don't blank. |
+| **Accidental disconnect** (a cable pulled and pushed back) | Same as a short dropout, if it is back within 30 s. | Same. A *different* monitor plugged into that connector is not a return (identity differs): it gets the desktop rules, not the span. |
+| **Gone** (more than 30 s, longer than the desktop's 5 s because a mid-game resize costs more than a moved window) | One resize to the members left, with `EV_WINDOW_SPAN`. One monitor left: an ordinary zoom. | Pipe released, timing group shrunk, group VRR/HDR recomputed. Coming back later grows the span again, also as one resize. |
+| **Flapping** (a member drops 3 times within 60 s: a failing cable, a monitor with a bad power-save, a dying link) | The tile stays `present: false` at the same size: no resizes, however often it flaps. A notification names the monitor. | The member is held out: its returns are ignored until it has stayed up for 10 s, then it rejoins once. Each flap costs nothing but that tile. |
+| **Returns in another mode** (some monitors forget their mode on power-up) | Nothing more than for a short dropout. | frescod sets the group's mode again; if the monitor no longer offers it, the member stays out and the user is told. |
+| **The timing master goes** | Nothing. | The lock's master is a pipe, not a monitor, and pipes keep running through dropouts. If a member is released for good, a remaining pipe takes over as master at the next vblank (gpusim models the hand-over; silicon check with D5). |
+
+Throughout, a gone member never holds up a flip: group flips commit only the present members,
+and a member's flip-done fence is not waited on while it is out. The S4/S5 tests cover each row
+(sim_plug unplug/replug inside and past 30 s, a burst of HPD pulses, a flapping script, and a
+swapped monitor).
 
 ## 7. Security and control
 
@@ -137,5 +151,7 @@ S1 and S2 are the hard parts; S3 to S5 follow the patterns multi-monitor already
    *Recommend yes.* Without it a flip can land a refresh apart across monitors, which shows as
    a tear between screens in fast motion. It is gpusim-modelled now and silicon-verified with
    D5.
-5. **Bezel compensation off by default**, with widths set once per monitor. *Recommend yes*:
+5. **A span holds its shape through dropouts up to 30 s and through flapping**, with the
+   tile marked not present; it resizes only for a monitor gone longer (§6). *Recommend yes.*
+6. **Bezel compensation off by default**, with widths set once per monitor. *Recommend yes*:
    most people find hidden pixels surprising until they try it.
