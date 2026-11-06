@@ -49,7 +49,7 @@ fn a_long_document_scrolls_with_a_few_screens_resident() {
     let dirty = Arc::new(AtomicBool::new(true));
     let state = Mutable::with_dirty(ScrollState::default(), dirty.clone());
     let more = Mutable::with_dirty(0u64, dirty.clone());
-    let doc = Rc::new(RefCell::new(Doc::html(html(200), Default::default(), 800.0, 600.0, |_| None).unwrap()));
+    let doc = Rc::new(RefCell::new(Doc::html(html(200), Default::default(), 800.0, 600.0, false, |_| None).unwrap()));
     let view = DocumentView::new(state.clone(), Rect::new(0.0, 0.0, 800.0, 600.0), doc.clone(), more);
     let mut app = App::new_with_flag(Page { view }, dirty);
 

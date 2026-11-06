@@ -40,6 +40,23 @@ pub fn clear_measurer() {
 /// Measure `content` in `style`. Shaped width when a measurer is
 /// installed; the 0.55·size estimate otherwise. Single-line height by
 /// the toolkit convention either way.
+/// Where frescod's text run goes (`y` on the wire is the top of the
+/// font's ascender box) so the text sits optically centred in `rect`:
+/// the band from baseline to cap height centred on the rect's middle, as
+/// UI labels are aligned (visual language §3). Centring the em box
+/// instead leaves IBM Plex about 0.18 em low, since its ascender (1.025
+/// em) is far taller than its descender (0.275 em). Icon fonts are drawn
+/// in a centred em square already and keep the plain top.
+pub fn wire_top(rect: crate::geom::Rect, style: &TextStyle) -> f32 {
+    // (ascender, cap height) in em, read from the shipped faces.
+    let (asc, cap) = match style.family.as_str() {
+        crate::theme::font::SANS | crate::theme::font::MONO | "IBMPlexSans" | "IBMPlexMono" => (1.025, 0.698),
+        _ => return rect.y(),
+    };
+    let baseline = rect.y() + rect.h() / 2.0 + cap * style.size / 2.0;
+    baseline - asc * style.size
+}
+
 pub fn measure(content: &str, style: &TextStyle) -> Size {
     let h = style.size * line_height::UI_SINGLE_LINE;
     if let Some(m) = MEASURER.lock().unwrap().as_mut() {

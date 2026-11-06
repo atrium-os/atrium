@@ -89,7 +89,8 @@ fn page() -> String {
     let mut b = String::from(r#"<html><head><style>body { margin: 16px; font-size: 15px }
         h1 { font-size: 26px; margin: 0px 0px 12px } h2 { font-size: 19px; margin: 18px 0px 8px }
         p { margin: 0px 0px 10px } .note { background-color: #eef4ff; padding: 8px 12px; border-radius: 6px }
-        code { background-color: #f1efe9 }</style></head><body><h1>Atrium document view</h1>
+        code { background-color: #f1efe9 }
+        @media (prefers-color-scheme: dark) { body { background-color: #16181d; color: #e6e8ec } .note { background-color: #1f2b3d } code { background-color: #2a2d33 } }</style></head><body><h1>Atrium document view</h1>
         <p class="note">This page is laid out by the document engine and drawn by Pergola: bands of the page become glyph runs, rects and fills.</p>"#);
     for s in 1..=40 {
         b.push_str(&format!("<h2>Section {s}</h2>"));
@@ -107,7 +108,7 @@ fn main() -> std::io::Result<()> {
     let mut window = Window::open(&WindowDesc::new("Pergola showcase", SizeSpec::Fixed(1280, 800)))?;
     window.follow_appearance(false);
     let dirty = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
-    let doc = Rc::new(RefCell::new(Doc::html(page(), Default::default(), 800.0, 740.0, |_| None).map_err(std::io::Error::other)?));
+    let doc = Rc::new(RefCell::new(Doc::html(page(), Default::default(), 808.0, 740.0, dark, |_| None).map_err(std::io::Error::other)?));
     let view = Show {
         name: Mutable::with_dirty(TextEdit::new("Shankar"), dirty.clone()),
         check: Mutable::with_dirty(Check::On, dirty.clone()),

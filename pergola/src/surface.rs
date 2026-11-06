@@ -337,7 +337,7 @@ impl Surface for FrescoSurface {
                 let color = [style.color.r, style.color.g, style.color.b, style.color.a];
                 self.conn.text_run_install(
                     id.0, font_id, style.size * k,
-                    rect.x() * k, rect.y() * k,
+                    rect.x() * k, crate::text::wire_top(*rect, style) * k,
                     color,
                     content.clone(),
                     style.weight as u16,
