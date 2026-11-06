@@ -86,6 +86,11 @@ pub struct ServiceManifest {
     /// network). See `docs/spec/network.md`.
     #[serde(default)]
     pub network: ManifestNetwork,
+    /// `allow.mlock` for the jail (jaild allowlists it per jail name in
+    /// `policy.mlock.allow_jails`). Arca sets it: its secrets live in locked
+    /// memory and it refuses to serve without it.
+    #[serde(default)]
+    pub allow_mlock: bool,
 
     pub exec: Option<ManifestExec>,
 
@@ -466,6 +471,7 @@ impl ServiceManifest {
             hostname: None,
             hostid: None,
             hostuuid: None,
+            allow_mlock: self.allow_mlock,
         }
     }
 }
@@ -636,6 +642,7 @@ mod tests {
             }],
             volumes: vec![],
             network: ManifestNetwork::Disable,
+            allow_mlock: false,
             exec: None,
             supervision: Supervision::default(),
             capabilities: Capabilities::default(),

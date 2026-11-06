@@ -30,6 +30,7 @@ name          = "atrium-arcad"
 path          = "/var/lib/atrium/jails/arcad"
 children_max  = 0
 devfs_ruleset = 4
+allow_mlock   = true                              # secrets in locked memory (jaild policy [mlock])
 # network: none (the manifest default, `disable`). Arca has no network, ever.
 
 [[mounts]]

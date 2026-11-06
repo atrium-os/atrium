@@ -999,6 +999,7 @@ fn handle_create(
         hostname:       req.hostname.as_deref().unwrap_or(&req.name),
         hostid:         req.hostid,
         hostuuid:       req.hostuuid.as_deref(),
+        allow_mlock:    req.allow_mlock,
     };
     let created = ffi::create_persistent_jail(&spec).map_err(|e| {
         /* Roll back the lo0 alias if jail_set failed. */
@@ -1153,6 +1154,7 @@ fn isolated_spec(req: &CreateJailRequest) -> JailCreateSpec<'_> {
         hostname:      req.hostname.as_deref().unwrap_or(&req.name),
         hostid:        req.hostid,
         hostuuid:      req.hostuuid.as_deref(),
+        allow_mlock:   req.allow_mlock,
     }
 }
 
@@ -1298,6 +1300,7 @@ fn handle_create_with_exec(
             hostname:       req.hostname.as_deref().unwrap_or(&req.name),
             hostid:         req.hostid,
             hostuuid:       req.hostuuid.as_deref(),
+            allow_mlock:    req.allow_mlock,
         };
         let attached = match pre_created {
             // A Routed jail already exists, network and all: just join it.

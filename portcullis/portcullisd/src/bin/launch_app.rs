@@ -89,6 +89,7 @@ fn main() {
         hostname: None,
         hostid: None,
         hostuuid: None,
+        allow_mlock: false,
     });
     let mut c = match Client::connect(JAILD_SOCK) {
         Ok(c) => c,

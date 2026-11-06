@@ -52,6 +52,18 @@ pub struct Policy {
     /// both must allow. See `atrium-memory-pressure.md` §9.5.
     #[serde(default)]
     pub resource_control: ResourceControl,
+    /// Which jails may lock memory (`allow.mlock`). Absent = none.
+    #[serde(default)]
+    pub mlock: MlockPolicy,
+}
+
+/// `[mlock]`: jails whose processes may `mlock(2)`. A jail that holds secrets
+/// in memory (Arca) needs it so they never reach swap or the zram
+/// compressor; nothing else should have it.
+#[derive(Debug, Default, Deserialize, Serialize)]
+pub struct MlockPolicy {
+    #[serde(default)]
+    pub allow_jails: Vec<String>,
 }
 
 /// What the memory-governor broker may do. jaild only ever acts on jails it itself

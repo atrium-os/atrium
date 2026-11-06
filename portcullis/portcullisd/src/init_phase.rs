@@ -104,6 +104,7 @@ pub fn run_init(
         hostname: None,
         hostid: None,
         hostuuid: None,
+        allow_mlock: false,
     });
 
     info!("{}: running init for volume {} (jail={})",

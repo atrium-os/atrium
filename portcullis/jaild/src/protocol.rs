@@ -303,6 +303,11 @@ pub struct CreateJailRequest {
     pub hostid:   Option<u32>,
     #[serde(default)]
     pub hostuuid: Option<String>,
+
+    /// `allow.mlock` for the jail: its processes may lock memory. Only for
+    /// jails named in `policy.mlock.allow_jails` (Arca, arca.md §6.3).
+    #[serde(default)]
+    pub allow_mlock: bool,
 }
 
 /// One mount applied inside a jail. `source` is a path on the host
@@ -637,6 +642,7 @@ mod tests {
             hostname: None,
             hostid: None,
             hostuuid: None,
+            allow_mlock: false,
         });
         let bytes = serde_json::to_vec(&req).unwrap();
         let back: Request = serde_json::from_slice(&bytes).unwrap();

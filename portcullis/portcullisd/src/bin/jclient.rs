@@ -67,6 +67,7 @@ fn main() -> ExitCode {
                 hostname: None,
                 hostid: None,
                 hostuuid: None,
+                allow_mlock: false,
             })
         }
         "remove" => {
@@ -106,6 +107,7 @@ fn main() -> ExitCode {
                 hostname: None,
                 hostid: None,
                 hostuuid: None,
+                allow_mlock: false,
             })
         }
         "attach" => {

@@ -87,6 +87,12 @@ rw_paths = [
     # Atrium logs.
     "/var/log/atrium",
 
+    # Arca's per-user secret stores (0700 _arca), mounted only into arcad,
+    # and its own socket dir: arcad gets that one dir rw, not the whole
+    # socket tree.
+    "/var/db/arca",
+    "/atrium/sockets/arca",
+
     # Atrium shared state — session records, jaild persistent
     # state, etc.
     "/var/run/atrium",
@@ -207,6 +213,11 @@ allowed_keys = [
     # stoad's persistent session-state dir (points into its own /atrium-data
     # data volume). Where session metadata + scrollback are persisted (S3a).
     "STOA_STATE",
+    # arcad: the system uids allowed to unlock stores (ostiarius) and to
+    # grant (Arca's trusted UI). ARCA_ALLOW_UNSIGNED is deliberately NOT
+    # here: a jailed arcad can never be told to serve unsigned apps.
+    "ARCA_VESTIBULUM_UID",
+    "ARCA_UI_UID",
 ]
 allowed_prefixes = [
     "ATRIUM_",        # all Atrium-namespaced vars
@@ -233,6 +244,7 @@ allowed_system_uids = [
              # portcullisd under the system policy's worker rule
     65016,   # _lyra: the audio engine, lyrad (lyra-service.sh creates it)
     65017,   # _choragus: the audio policy daemon, choragusd
+    65020,   # _arca: the secret store (docs/spec/arca.md)
 ]
 
 [gid]
@@ -244,7 +256,17 @@ allowed_system_gids = [
     65015,   # _aqueduct-gpu-app
     65016,   # _lyra
     65017,   # _choragus
+    65020,   # _arca
 ]
+
+
+# ---------------------------------------------------------------
+# Memory locking (allow.mlock), allowlisted per jail. Arca keeps every
+# clear secret in mlocked memory so none reaches swap or the zram
+# compressor (docs/spec/arca.md §6.3), and refuses to serve without it.
+# ---------------------------------------------------------------
+[mlock]
+allow_jails = ["atrium-arcad"]
 
 
 # ---------------------------------------------------------------

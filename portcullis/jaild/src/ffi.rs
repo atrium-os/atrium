@@ -125,6 +125,10 @@ pub struct JailCreateSpec<'a> {
     /// `host.hostid` / `host.hostuuid` — the synthetic identity (§9.1c).
     pub hostid:         Option<u32>,
     pub hostuuid:       Option<&'a str>,
+    /// `allow.mlock`: processes in the jail may lock memory (mlock(2)).
+    /// Validator-gated to `policy.mlock.allow_jails`; Arca needs it so no
+    /// secret reaches swap or the zram compressor (arca.md §6.3).
+    pub allow_mlock:    bool,
 }
 
 impl IovBuilder {
@@ -162,6 +166,10 @@ pub fn create_persistent_jail(spec: &JailCreateSpec) -> io::Result<CreatedJail> 
     }
     iob.add_network(spec.ip4_addr, spec.ip4_inherit, spec.isolated)?;
     iob.add_host_identity(spec)?;
+    if spec.allow_mlock {
+        // A jail boolean takes an int value (kern_jail.c copies sizeof(int)).
+        iob.add_i32("allow.mlock", 1);
+    }
     let mut errmsg = vec![0u8; 256];
     iob.add_buf("errmsg", &mut errmsg);
     let jid = iob.run(JAIL_CREATE, &errmsg)?;
@@ -287,6 +295,10 @@ pub fn jail_create_and_attach(spec: &JailCreateSpec) -> io::Result<i32> {
     }
     iob.add_network(spec.ip4_addr, spec.ip4_inherit, spec.isolated)?;
     iob.add_host_identity(spec)?;
+    if spec.allow_mlock {
+        // A jail boolean takes an int value (kern_jail.c copies sizeof(int)).
+        iob.add_i32("allow.mlock", 1);
+    }
     let mut errmsg = vec![0u8; 256];
     iob.add_buf("errmsg", &mut errmsg);
     iob.run(JAIL_CREATE | JAIL_ATTACH, &errmsg)

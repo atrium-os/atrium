@@ -69,15 +69,18 @@ fn main() -> ExitCode {
         if live.load(Ordering::SeqCst) >= MAX_CONNS {
             continue; // dropped: the client sees the connection close
         }
-        let label = match portcullis_peer::uid_gid(stream.as_raw_fd()) {
-            Ok((uid, _)) => resolver.resolve(uid),
-            Err(_) => Label::Unknown,
+        let (uid, label) = match portcullis_peer::uid_gid(stream.as_raw_fd()) {
+            Ok((uid, _)) => (uid, resolver.resolve(uid)),
+            Err(_) => (u32::MAX, Label::Unknown),
         };
         let state = state.clone();
         let live = live.clone();
         live.fetch_add(1, Ordering::SeqCst);
         std::thread::spawn(move || {
-            let _ = arcad::serve_conn(stream, &label, &state);
+            if let Err(e) = arcad::serve_conn(stream, &label, &state) {
+                // No content, only the kind of failure and the peer uid.
+                eprintln!("arcad: connection from uid {uid} ended: {:?}", e.kind());
+            }
             live.fetch_sub(1, Ordering::SeqCst);
         });
     }

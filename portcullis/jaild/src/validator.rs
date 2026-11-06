@@ -30,6 +30,7 @@ pub fn validate_create(
     validate_devfs_ruleset(req.devfs_ruleset, policy)?;
     validate_devfs_pin(req, policy)?;
     validate_network(&req.network, &req.name, policy)?;
+    validate_mlock(req, policy)?;
     for m in &req.mounts {
         validate_mount(m, policy)?;
         validate_tmpfs_owner(m, req.exec.as_ref())?;
@@ -79,6 +80,17 @@ pub fn is_instance_root(req: &CreateJailRequest, policy: &Policy) -> bool {
     let Some(dir) = policy.exec_paths.instance_root_dir.as_deref() else { return false };
     req.name.starts_with("app-")
         && std::path::Path::new(&req.path) == std::path::Path::new(dir).join(&req.name)
+}
+
+/// `allow.mlock` lets a jail wire memory, so it is allowlisted per jail.
+fn validate_mlock(req: &CreateJailRequest, policy: &Policy) -> Result<(), JaildError> {
+    if !req.allow_mlock || policy.mlock.allow_jails.iter().any(|n| n == &req.name) {
+        return Ok(());
+    }
+    Err(JaildError::PolicyViolation {
+        rule:   "mlock.not_allowed",
+        detail: format!("jail {:?} not in policy.mlock.allow_jails", req.name),
+    })
 }
 
 fn validate_network(net: &NetworkConfig, name: &str, policy: &Policy) -> Result<(), JaildError> {
@@ -662,6 +674,7 @@ mod tests {
             hostname: None,
             hostid: None,
             hostuuid: None,
+            allow_mlock: false,
         };
         validate_create(&req, &p).unwrap();
     }
@@ -686,6 +699,7 @@ mod tests {
             hostname: None,
             hostid: None,
             hostuuid: None,
+            allow_mlock: false,
         }
     }
 
@@ -800,6 +814,7 @@ mod tests {
             hostname: None,
             hostid: None,
             hostuuid: None,
+            allow_mlock: false,
         };
         let err = validate_create(&req, &p).unwrap_err();
         match err {
@@ -821,6 +836,7 @@ mod tests {
             hostname: None,
             hostid: None,
             hostuuid: None,
+            allow_mlock: false,
         }
     }
 
@@ -1072,6 +1088,21 @@ mod tests {
         ).unwrap_err();
         assert!(matches!(err,
             JaildError::PolicyViolation { rule: "network.vnet.unimplemented_v0", .. }));
+    }
+
+    #[test]
+    fn mlock_requires_allowlist() {
+        let mut p = load_sample_policy();
+        let mut req = req_default();
+        req.allow_mlock = true;
+        p.mlock.allow_jails.retain(|n| n != &req.name);
+        assert!(matches!(validate_mlock(&req, &p),
+            Err(JaildError::PolicyViolation { rule: "mlock.not_allowed", .. })));
+        p.mlock.allow_jails.push(req.name.clone());
+        assert!(validate_mlock(&req, &p).is_ok());
+        req.allow_mlock = false;
+        p.mlock.allow_jails.clear();
+        assert!(validate_mlock(&req, &p).is_ok());
     }
 
     #[test]

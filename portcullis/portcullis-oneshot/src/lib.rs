@@ -406,6 +406,7 @@ pub fn run_with_stdio(spec: &Spec, stdio: Option<[std::os::fd::OwnedFd; 3]>) -> 
         hostname: Some(manifest.app.id.clone()),
         hostid:   Some(host_identity.hostid),
         hostuuid: Some(host_identity.hostuuid.clone()),
+        allow_mlock: false,
     });
     let outcome = run_via_jaild(&req, stdio);
 
