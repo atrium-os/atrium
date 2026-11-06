@@ -4,6 +4,9 @@
 #   sh scripts/cloud-vm.sh up        # VM running, Portcullis stack deployed
 #   sh scripts/arca-vm-test.sh       # cross-build, deploy, run the gates
 #
+# The VM's jaild must be current (allow.mlock): on a fresh VM, cross-build
+# portcullis and run scripts/deploy-portcullis.sh first.
+#
 # 1. The arca-store and arcad test suites, as root and as an unprivileged
 #    user (mlock limits differ).
 # 2. arcad as a jailed system service: uid _arca, no network, untraceable.
@@ -97,6 +100,7 @@ check "runs as _arca" _arca "$(g "ps -o user= -p $PID" | tr -d ' ')"
 JID=$(g "ps -o jid= -p $PID" | tr -d ' ')
 check "in a jail" yes "$( [ "${JID:-0}" != 0 ] && echo yes || echo no)"
 check "jail may lock memory (allow.mlock)" true "$(g "jls -j $JID allow.mlock" | tr -d ' ')"
+[ "$(g "jls -j $JID allow.mlock" | tr -d ' ')" = true ] || echo "  hint: the deployed jaild predates allow.mlock; cross-build portcullis and run scripts/deploy-portcullis.sh"
 check "no network in the jail" "" "$(g "jls -j $JID ip4.addr ip6.addr 2>/dev/null | tr -d ' -'" || true)"
 check "untraceable, even by root (procctl)" refused "$(g "timeout 5 truss -p $PID >/dev/null 2>&1 && echo allowed || echo refused")"
 
