@@ -1448,6 +1448,74 @@ paths.
 - *Page-down* still misses 3%. A 600 px jump exposes the whole window, so a page-down
   should be animated over a few frames, as browsers do, which makes it strips too.
 
+**Step 3, phase 1 built: the first screen, and a banded scene (2026-11-06).** It is
+placed in the layout crate (`navigator-render`) to serve the contract of pergola.md §10.3.
+A `DocumentView`, the Navigator worker and any long list use it alike.
+- *`render_html_first(…, y_limit)`.* The layout of the document down to the limit. It
+  stops at the first block in normal flow whose top is below the limit, and a table in
+  normal flow stops measuring rows once they pass it.
+  - The stop is off inside flex and grid containers, table cells and trial measurements,
+    whose sizes must stay exact. It fires only before a block with no inline content
+    pending: the profile's total-fit line breaking makes a line depend on the words
+    after it.
+  - After the stop, a `position: fixed` child is still laid out (doc28's header is
+    written at the end of its document).
+  - If anything skipped has a transform or is absolutely positioned, the first screen is
+    unsafe, and the page is laid out whole. ynet's carousel cards are translated up from
+    below the cut. `first_screens_laid_out_whole()` counts these.
+- *`bands::index(scene, band_h)`.* Each draw-order entry goes into every band its painted
+  extent touches (through its transform). `nodes_in(y0, y1)` returns a viewport's nodes;
+  `band_scene(b)` returns a self-contained scene with the scene's tables. Bands do not yet
+  carry vector-SVG bitmap fallbacks, whose path indices change.
+
+*Checked.* `tests/bands.rs`, compared by pixels:
+- the first screen draws what the full layout draws there, and a planted recoloured box
+  is caught;
+- a 1,000-row table stops at about 40 rows;
+- a page that fits is byte-identical;
+- every band of a page draws its rows as the full scene does.
+
+On the corpus (`examples/first_screen_check`: first screen 600 px, laid out to 1,200 px,
+8-bit pixels):
+- *Result.* All 122 readable documents and the 7 big ones draw their first screen
+  identically to the full layout.
+- *The search that got there:*
+  - The first version differed on 7 pages: a fixed header at the end of a document, a
+    paragraph split mid-content, and transformed content from below.
+  - The remaining two were real and are fixed: wikihow's opacity groups composite
+    differently once more content is in the draw order (now laid out whole), and ynet's
+    carousel.
+  - ynet differed by up to 227 levels before the transform rule.
+- *Coverage.* 36 of the 122 readable pages take the fast path; the rest have a
+  transformed or absolutely positioned element below the fold and are laid out whole, as
+  before.
+- *The identity set* is byte-identical with the limit unset.
+
+*Measured* (layout and scene, single runs):
+
+| document | whole layout | first screen | nodes |
+|---|---|---|---|
+| War and Peace | 693 ms | **25 ms** | 573,326 → 157 |
+| 100,000-row table | 3,286 ms | **394 ms** (parse and cascade of the whole document remain) | 400,005 → 161 |
+| HTML Living Standard | 1,599 ms | **480 ms** | 934,835 → 262 |
+| coreutils manual | 312 ms | 84 ms | 154,620 → 217 |
+| HN thread | 871 ms | 883 ms: no gain (its comments are one table cell, where the stop is off) | — |
+| readable corpus, the 36 cut | p50 18 / p90 147 ms | p50 10 / p90 54 ms | — |
+
+- *Not yet faster:* normalize still processes the whole document (3.7 s for the table,
+  2.7 s for the standard), before any layout. It is cached by the recording's address,
+  so a second visit skips it. A first visit to a big document is now normalize-bound.
+- *Band culling in the compositor* (`scroll_bench --bands`): the index takes 7–14 ms to
+  build. On the HTML standard at 120 Hz with strips, frame p50 goes 4.0 → 2.3 ms and p99
+  8.9 → 5.2 ms. `--verify`, against a reference that walks the whole scene, finds 0
+  differing frames over flings, page-down and jump on four documents. It caught a
+  harness bug on the way: a full redraw at a fractional scroll position, drawn half a
+  pixel off.
+
+*Phase 2* (next): checkpoints at top-level block boundaries, so the worker can lay a band
+out again from its checkpoint, drop far regions, and lay out a far jump without the
+layout above it.
+
 *Gates for bands (proposed):* at 60 Hz, 0 stalls over 100 ms after first display in every
 pattern, p99.9 frame time ≤ 2 periods, and missed vsyncs ≤ 1%. At 120 Hz, the same once
 the compositor redraws by damage.

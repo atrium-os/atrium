@@ -55,6 +55,15 @@ name = "nsg-raster"
 path = "src/bin/nsg-raster.rs"
 required-features = ["raster"]
 
+# Examples that paint (swash glyphs, the review raster): `--features raster`.
+[[example]]
+name = "scroll_bench"
+required-features = ["raster"]
+
+[[example]]
+name = "first_screen_check"
+required-features = ["raster"]
+
 [dev-dependencies]
 # The frescod integration test (tests/fresco_integration.rs): Navigator's fills
 # through frescod's packing and its real kernels — Tier-2 (Cranelift) and the

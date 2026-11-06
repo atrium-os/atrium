@@ -1,6 +1,6 @@
 //! scroll_bench <normalized.html> [--hz 60|120] [--pattern fling|flings|page|jump] [--secs N]
 //!              [--scale 1|2] [--csv out.csv] [--inject-stall MS@T]
-//!              [--compose full|strip] [--fast PX_PER_S] [--blur]
+//!              [--compose full|strip] [--fast PX_PER_S] [--blur] [--bands]
 //!
 //! ★ THE SCROLL HARNESS (backend §4.8, step 2): what scrolling a document
 //! costs, frame by frame, with the TAIL and the TIMELINE reported — not just
@@ -102,6 +102,9 @@ impl Compositor<'_> {
     fn strip_frame(&mut self, y: i64, greek: bool, blur_px: u32, force_full: bool) -> u32 {
         let (w, h) = (self.w as usize, self.h as usize);
         let y_dev = (y as f64 * self.scale as f64 / PX as f64).round() as i64;
+        // Every branch rasters at the whole-pixel position the window is
+        // shifted by (a fractional one drew the jump's frames half a pixel off).
+        let y = (y_dev as f64 * PX as f64 / self.scale as f64) as i64;
         if self.buf.len() != w * h { self.buf = vec![0; w * h]; self.buf_y = None }
         let dy = self.buf_y.map(|b| y_dev - b);
         let rows = match dy {
@@ -213,6 +216,9 @@ struct Compositor<'a> {
     nsg: &'a Nsg, fonts: &'a FontSet, ctx: swash::scale::ScaleContext, atlas: Atlas,
     textures: HashMap<String, usize>, tex_store: Vec<Texture>, t2: tier2::Tier2, w: u32, h: u32, scale: f32,
     target: Vec<u32>, glyphs_skipped: u64,
+    /// `--bands`: the scene's band index (`navigator_render::bands`), so a
+    /// frame finds its nodes without walking the whole page.
+    index: Option<navigator_render::bands::BandIndex>,
     /// `--compose strip`: the window as last composed, and where it was (device px).
     buf: Vec<u32>, buf_y: Option<i64>, blurred: bool,
     /// Rows still drawn greeked or blurred, as page rows (device px), to
@@ -235,7 +241,12 @@ impl Compositor<'_> {
         let mut scene = Scene::default();
         let mut runs: Vec<GlyphRun> = vec![];
         let mut quads: HashMap<usize, Vec<[f32; 4]>> = HashMap::new();
-        for &(kind, i) in &self.nsg.order {
+        let which: Vec<usize> = match &self.index {
+            Some(ix) => ix.nodes_in(y0, y1 + 1).into_iter().map(|o| o as usize).collect(),
+            None => (0..self.nsg.order.len()).collect(),
+        };
+        for o in which {
+            let (kind, i) = self.nsg.order[o];
             let Some((a, b)) = extent(self.nsg, kind, i) else { continue };
             if b < y0 || a > y1 { continue }
             match kind {
@@ -356,7 +367,12 @@ fn main() {
     let t2 = tier2::Tier2::new(dir.path().to_path_buf(), "/nonexistent/atrium-spv-compile".into()).expect("tier2");
     let mut c = Compositor { nsg: &nsg, fonts: &fonts, ctx: swash::scale::ScaleContext::new(), atlas: Atlas::new(), textures: HashMap::new(),
                              tex_store: vec![], t2, w: (vw as f32 * scale) as u32, h: (vh as f32 * scale) as u32, scale, target: vec![], glyphs_skipped: 0,
-                             buf: vec![], buf_y: None, blurred: false, sharpen: vec![] };
+                             buf: vec![], buf_y: None, blurred: false, sharpen: vec![], index: None };
+    if args.iter().any(|a| a == "--bands") {
+        let t = Instant::now();
+        c.index = Some(navigator_render::bands::index(&nsg, (vh as i64) * PX));
+        println!("bands\tindex_ms {:.0}\tbands {}", t.elapsed().as_secs_f64() * 1e3, c.index.as_ref().unwrap().bands.len());
+    }
     // ---- The replay. ----
     let period = 1000.0 / hz;
     let frames = (secs * hz) as usize;
@@ -400,7 +416,10 @@ fn main() {
                 if verify && !fast_now && !c.blurred && c.sharpen.is_empty() && !greek_frames_pending(&c) {
                     let elapsed = s.elapsed();
                     let y_dev = c.buf_y.expect("composed");
+                    // The reference walks the whole scene: no band index.
+                    let ix = c.index.take();
                     c.region(y_dev * PX / c.scale as i64, c.h, false);
+                    c.index = ix;
                     let n = (c.w * c.h) as usize;
                     let bad = c.buf.iter().zip(&c.target[..n]).filter(|(a, b)| a != b).count();
                     verified += 1;

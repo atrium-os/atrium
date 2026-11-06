@@ -203,6 +203,20 @@ struct Cx<'a> {
     measured_tables: HashMap<Handle, (U, U)>,
     /// The table whose box opened the scroll region now open, if any.
     scroll_table: Option<Handle>,
+    /// ★ FIRST SCREEN ONLY (backend §4.8, bands phase 1): stop laying out
+    /// at the first block in normal flow whose top is below this (1/64 px).
+    stop_after: Option<U>,
+    /// The stop applies here: plain block flow, not inside a flex or grid
+    /// container, a table cell, or a trial measurement — whose sizes must
+    /// stay exact for the layout above the limit to be the full layout's.
+    stop_ok: bool,
+    /// The limit handed to a table in normal flow, which stops measuring
+    /// rows once they pass it.
+    table_stop: Option<U>,
+    /// Whether the stop cut anything.
+    truncated: bool,
+    /// Something skipped could paint above the cut (see the stop).
+    stop_unsafe: bool,
     /// The region a box has opened and `block` will close: the attributes
     /// to restore, its clip, its transform, and the content's x, y, width.
     scroll_open: Option<(crate::Attrs, u32, u32, (U, U, U))>,
@@ -256,6 +270,37 @@ pub fn render_html(html: &str, fonts: &FontSet, env: &Env) -> HtmlOut {
 /// references one it does not declare gets a diagnostic, never a guess.
 pub fn render_html_with(html: &str, fonts: &FontSet, env: &Env, subs: &Subresources) -> HtmlOut {
     render_inner(html, fonts, env, subs, false).0
+}
+
+/// ★ THE FIRST SCREEN (backend §4.8, bands phase 1): the layout of the
+/// document down to `y_limit` (1/64 px), stopping at the first block in
+/// normal flow whose top is below it, and a table's rows once they pass it.
+/// Everything that is laid out is laid out as the full layout lays it out —
+/// the stop is off inside flex and grid containers, table cells and trial
+/// measurements — so the scene above the limit is the full scene's (checked
+/// by `tests/bands.rs` and on the corpus). The second value says whether
+/// anything was cut (when not, this IS the full layout).
+pub fn render_html_first(html: &str, fonts: &FontSet, env: &Env, subs: &Subresources, y_limit: U) -> (HtmlOut, bool) {
+    STOP_AFTER.with(|c| c.set(Some(y_limit)));
+    let (o, _, _, truncated) = render_inner_t(html, fonts, env, subs, false);
+    STOP_AFTER.with(|c| c.set(None));
+    // Something skipped could paint above the cut: the page, whole.
+    if STOP_UNSAFE.with(|c| c.replace(false)) {
+        UNSAFE_FIRST.with(|c| c.set(c.get() + 1));
+        return (render_inner_t(html, fonts, env, subs, false).0, false);
+    }
+    (o, truncated)
+}
+
+/// How many first screens on this thread were laid out whole because
+/// something skipped could have painted above the cut (for measurement).
+pub fn first_screens_laid_out_whole() -> u64 { UNSAFE_FIRST.with(|c| c.get()) }
+
+thread_local! {
+    /// The first-screen limit for the next `render_inner` (see `render_html_first`).
+    static STOP_AFTER: std::cell::Cell<Option<U>> = const { std::cell::Cell::new(None) };
+    static STOP_UNSAFE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    static UNSAFE_FIRST: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
 }
 
 /// One element's geometry from a layout (legacy-web §5.4.5.6e). Page
@@ -343,6 +388,11 @@ pub fn layout_geometry(html: &str, fonts: &FontSet, env: &Env, subs: &Subresourc
 }
 
 fn render_inner(html: &str, fonts: &FontSet, env: &Env, subs: &Subresources, geo: bool) -> (HtmlOut, Option<GeoLog>, Dom) {
+    let (o, g, d, _) = render_inner_t(html, fonts, env, subs, geo);
+    (o, g, d)
+}
+
+fn render_inner_t(html: &str, fonts: &FontSet, env: &Env, subs: &Subresources, geo: bool) -> (HtmlOut, Option<GeoLog>, Dom, bool) {
     // ★ At another text size the pre-measured columns are measured AGAIN,
     // exactly (backend §4.9, `remeasure_tables`).
     let remeasured;
@@ -381,8 +431,9 @@ fn render_inner(html: &str, fonts: &FontSet, env: &Env, subs: &Subresources, geo
     let mut cx = Cx { dom: &dom, styles: &styled.styles, sh: Shaper::new(fonts), scene: Scene { width: u(env.width_px), ..Default::default() },
                       report: Report::default(), links: vec![], unimplemented: BTreeMap::new(), marker: None, baseline_probe: None, indent: None, iso_paths: vec![vec![]], iso_cur: 0, content_dy: 0, table_part: false, promoted: vec![], boxes: std::env::var_os("NSG_DUMP_BOXES").map(|_| vec![]), geo: None, inl_cur: 0,
                       viewport: (u(env.width_px), Some(u(env.height_px))), pos_cb: (0, 0, u(env.width_px), Some(u(env.height_px))),
-                      subs, placing_abs: false, pending_abs: vec![], deferred_abs: vec![], cb_open: false, canvas_src: None, abs_origin: None, flex_static: None, measured: HashMap::new(), contexts: vec![], hoists: vec![], diagnostics: vec![], vector_budget: crate::path::DOCUMENT_SEGMENT_SHARE, in_scroll: false, scroll_open: None, measured_tables: HashMap::new(), scroll_table: None };
+                      subs, placing_abs: false, pending_abs: vec![], deferred_abs: vec![], cb_open: false, canvas_src: None, abs_origin: None, flex_static: None, measured: HashMap::new(), contexts: vec![], hoists: vec![], diagnostics: vec![], vector_budget: crate::path::DOCUMENT_SEGMENT_SHARE, in_scroll: false, scroll_open: None, measured_tables: HashMap::new(), scroll_table: None, stop_after: None, stop_ok: true, table_stop: None, truncated: false, stop_unsafe: false };
     if geo { cx.geo = Some(GeoLog { inl_paths: vec![vec![]], ..Default::default() }) }
+    cx.stop_after = STOP_AFTER.with(|c| c.get());
     cx.promoted = promote_block_in_inline(&dom, &styled.styles);
     cx.count_unread_rows();
     // The root element is the initial containing block's only child.
@@ -426,8 +477,10 @@ fn render_inner(html: &str, fonts: &FontSet, env: &Env, subs: &Subresources, geo
         }
     }
     let log = cx.geo.take();
+    let truncated = cx.truncated;
+    STOP_UNSAFE.with(|c| c.set(cx.stop_unsafe));
     let out = HtmlOut { scene: cx.scene, report: cx.report, diagnostics, unimplemented: cx.unimplemented };
-    (out, log, dom)
+    (out, log, dom, truncated)
 }
 
 /// ★ §3.13's offline half: measure every table column's min-content and
@@ -457,7 +510,7 @@ pub fn premeasure_tables_at(html: &str, fonts: &FontSet, env: &Env) -> (String, 
                       report: Report::default(), links: vec![], unimplemented: BTreeMap::new(), marker: None, baseline_probe: None,
                       indent: None, iso_paths: vec![vec![]], iso_cur: 0, content_dy: 0, table_part: false, promoted: vec![], boxes: std::env::var_os("NSG_DUMP_BOXES").map(|_| vec![]), geo: None, inl_cur: 0, viewport: (u(env.width_px), Some(u(env.height_px))),
                       pos_cb: (0, 0, u(env.width_px), Some(u(env.height_px))), subs: &Subresources::new(),
-                      placing_abs: false, pending_abs: vec![], deferred_abs: vec![], cb_open: false, canvas_src: None, abs_origin: None, flex_static: None, measured: HashMap::new(), contexts: vec![], hoists: vec![], diagnostics: vec![], vector_budget: crate::path::DOCUMENT_SEGMENT_SHARE, in_scroll: false, scroll_open: None, measured_tables: HashMap::new(), scroll_table: None };
+                      placing_abs: false, pending_abs: vec![], deferred_abs: vec![], cb_open: false, canvas_src: None, abs_origin: None, flex_static: None, measured: HashMap::new(), contexts: vec![], hoists: vec![], diagnostics: vec![], vector_budget: crate::path::DOCUMENT_SEGMENT_SHARE, in_scroll: false, scroll_open: None, measured_tables: HashMap::new(), scroll_table: None, stop_after: None, stop_ok: true, table_stop: None, truncated: false, stop_unsafe: false };
     // (table, per-column (min, max), its first row's cells) for every table.
     let mut tables: Vec<(Handle, Vec<(U, U)>, Vec<Handle>)> = vec![];
     // ★ INNER TABLES FIRST: a cell holding a table is as wide as that
@@ -1052,15 +1105,50 @@ impl<'a> Cx<'a> {
         // Children: block-level children stack; runs of inline content
         // between them form anonymous block boxes of line boxes.
         if kw(s, "display") == "grid" {
+            let so = std::mem::replace(&mut self.stop_ok, false);
             cy += self.grid(h, s, content_x, cy, content_w, child_cb_h);
+            self.stop_ok = so;
         } else if kw(s, "display") == "table" && !self.table_rows(h).0.is_empty() {
+            let so = std::mem::replace(&mut self.stop_ok, false);
+            self.table_stop = if so { self.stop_after } else { None };
             cy += self.table(h, s, content_x, cy, content_w);
+            self.table_stop = None;
+            self.stop_ok = so;
         } else if kw(s, "display") == "flex" {
             let auto_h = (clamp(0).max(vframe) - vframe, clamp(U::MAX / 4).max(vframe) - vframe);
+            let so = std::mem::replace(&mut self.stop_ok, false);
             cy += self.flex(h, s, content_x, cy, content_w, child_cb_h, auto_h);
+            self.stop_ok = so;
         } else {
             let mut inline: Vec<Item> = vec![];
+            let mut stopped = false;
             for c in self.dom.children_of(h) {
+                // ★ First screen only: nothing below the limit is laid out —
+                // stopping only BEFORE a block, never inside a paragraph
+                // (total-fit line breaking makes a line depend on the words
+                // after it), and still laying out what is OUT OF FLOW after
+                // the stop: a fixed header written at the end of the
+                // document paints at its top (doc28).
+                if !stopped && self.stop_ok && inline.is_empty() && self.is_block_level(c) && self.stop_after.is_some_and(|l| cy > l) {
+                    stopped = true;
+                    self.truncated = true;
+                }
+                if stopped {
+                    // A FIXED box is placed against the viewport, not the
+                    // flow above it: laid out. Anything else skipped that
+                    // could paint ABOVE the cut — a transform (ynet's
+                    // carousel cards are translated up from below it), or
+                    // an absolutely positioned box, whose containing block's
+                    // height may come from what was skipped — makes this
+                    // first screen unsafe, and the caller lays the page out
+                    // whole instead.
+                    if self.st(c).is_some_and(|cs| kw(cs, "position") == "fixed") {
+                        cy += self.block(c, content_x, cy, content_w, child_cb_h, (None, None));
+                    } else if self.subtree_moves(c) {
+                        self.stop_unsafe = true;
+                    }
+                    continue;
+                }
                 if self.is_block_level(c) {
                     let ly = cy;
                     cy += self.lines(std::mem::take(&mut inline), content_x, cy, content_w, s);
@@ -1747,7 +1835,16 @@ impl<'a> Cx<'a> {
         })
     }
 
+    /// A trial layout. The first-screen stop never applies inside one: its
+    /// size must be the full layout's.
     fn measure(&mut self, h: Handle, cb_w: U, cb_h: Option<U>, force: (Option<U>, Option<U>)) -> U {
+        let so = std::mem::replace(&mut self.stop_ok, false);
+        let r = self.measure_inner(h, cb_w, cb_h, force);
+        self.stop_ok = so;
+        r
+    }
+
+    fn measure_inner(&mut self, h: Handle, cb_w: U, cb_h: Option<U>, force: (Option<U>, Option<U>)) -> U {
         // A trial with a side channel open — a list marker waiting for its
         // line, an out-of-flow box being placed, a content offset, a static
         // position — is not memoized; nor read from it.
@@ -2686,8 +2783,10 @@ impl<'a> Cx<'a> {
         // spacing between them. A cell past the declared columns keeps the
         // old fallback (the last column's width) and is counted, not
         // silently squeezed.
-        let rows_cells: Vec<Vec<Handle>> = rows.iter().map(|r| cells_of(self, *r)).collect();
-        let slots = self.slots(&rows_cells);
+        let mut rows_cells: Vec<Vec<Handle>> = rows.iter().map(|r| cells_of(self, *r)).collect();
+        let mut slots = self.slots(&rows_cells);
+        // First screen only: rows are measured until they pass the limit.
+        let row_limit = self.table_stop.take();
         let width_of = |this: &mut Self, (k, n, _): (usize, usize, usize)| -> U {
             if k >= cols.len() {
                 this.count("table cell past the declared columns");
@@ -2700,10 +2799,24 @@ impl<'a> Cx<'a> {
         // Natural heights first, every cell at its width.
         let mut nat: Vec<Vec<U>> = vec![];
         let mut widths: Vec<Vec<U>> = vec![];
+        let mut acc = y + sy;
         for (cells, row_slots) in rows_cells.iter().zip(&slots) {
             let ws: Vec<U> = row_slots.iter().map(|sl| width_of(self, *sl)).collect();
             nat.push(cells.iter().zip(&ws).map(|(c, cw)| { self.table_part = true; self.measure(*c, *cw, None, (Some(*cw), None)) }).collect());
             widths.push(ws);
+            if let Some(l) = row_limit {
+                let r = nat.len() - 1;
+                acc += row_slots.iter().zip(&nat[r]).filter(|((_, _, rs), _)| *rs == 1).map(|(_, h)| *h).max().unwrap_or(0) + sy;
+                if acc > l { break }
+            }
+        }
+        if nat.len() < rows_cells.len() {
+            // The rows kept, and spans clamped to them.
+            let n = nat.len();
+            rows_cells.truncate(n);
+            slots.truncate(n);
+            for (r, row) in slots.iter_mut().enumerate() { for sl in row.iter_mut() { sl.2 = sl.2.min(n - r) } }
+            self.truncated = true;
         }
         // Baselines, for cells aligned on one: the row's shared baseline is
         // the lowest of them (a cell spanning rows shares its FIRST row's),
@@ -2816,6 +2929,22 @@ impl<'a> Cx<'a> {
             self.scene.order.extend(back);
         }
         cy - y
+    }
+
+    /// Whether `h` or anything inside it has a transform or is absolutely
+    /// or fixed positioned: something that may paint away from where the
+    /// flow would put it.
+    fn subtree_moves(&self, h: Handle) -> bool {
+        let mut st = vec![h];
+        while let Some(x) = st.pop() {
+            if let Some(cs) = self.st(x) {
+                if kw(cs, "display") == "none" { continue }
+                if matches!(kw(cs, "position"), "absolute" | "fixed") { return true }
+                if matches!(cs.get("transform"), V::Transform(l) if !l.is_empty()) { return true }
+            }
+            st.extend(self.dom.element_children(x));
+        }
+        false
     }
 
     /// The nearest opaque background behind `h`: an ancestor's, else the
@@ -5261,7 +5390,7 @@ mod tests {
                           report: Report::default(), links: vec![], unimplemented: BTreeMap::new(), marker: None,
                           baseline_probe: None, indent: None, iso_paths: vec![vec![]], iso_cur: 0, content_dy: 0, table_part: false, promoted: vec![], boxes: std::env::var_os("NSG_DUMP_BOXES").map(|_| vec![]), geo: None, inl_cur: 0,
                           viewport: (0, None), pos_cb: (0, 0, 0, None), subs: &Subresources::new(),
-                          placing_abs: false, pending_abs: vec![], deferred_abs: vec![], cb_open: false, canvas_src: None, abs_origin: None, flex_static: None, measured: HashMap::new(), contexts: vec![], hoists: vec![], diagnostics: vec![], vector_budget: crate::path::DOCUMENT_SEGMENT_SHARE, in_scroll: false, scroll_open: None, measured_tables: HashMap::new(), scroll_table: None };
+                          placing_abs: false, pending_abs: vec![], deferred_abs: vec![], cb_open: false, canvas_src: None, abs_origin: None, flex_static: None, measured: HashMap::new(), contexts: vec![], hoists: vec![], diagnostics: vec![], vector_budget: crate::path::DOCUMENT_SEGMENT_SHARE, in_scroll: false, scroll_open: None, measured_tables: HashMap::new(), scroll_table: None, stop_after: None, stop_ok: true, table_stop: None, truncated: false, stop_unsafe: false };
         cx.count_rows_outside(&held_out);
         // The non-initial value is counted once; the initial one is not.
         assert_eq!(cx.unimplemented.get("row text-align… (not implemented)"), Some(&1), "{:?}", cx.unimplemented);

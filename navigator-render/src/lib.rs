@@ -12,6 +12,7 @@
 //! counted; code blocks do not wrap (overflow is counted).
 
 pub mod anchor;
+pub mod bands;
 pub mod conformance;
 pub mod flag;
 pub mod fontset;
