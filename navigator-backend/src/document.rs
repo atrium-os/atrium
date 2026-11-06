@@ -12,6 +12,9 @@ pub use navigator_dom::profile::Violation;
 /// The document, parsed, plus what the transitions can actually address.
 #[derive(Debug)]
 pub struct Document {
+    /// ★ Changed only through `apply` (in place or by copy): the kept
+    /// measures below (`stats`, `bytes`) and the compiled addresses follow
+    /// those writes, not edits made to the tree from outside.
     pub dom: Dom,
     /// ★ What the profile ceilings measure, kept across in-place steps
     /// (`apply::apply_in_place_with_undo`): the element count exactly, and
@@ -27,6 +30,23 @@ pub struct Document {
     /// can change what a path means (a structural change, or an `id`
     /// written), and rebuilt on next use; only the apply paths write.
     pub(crate) ids: std::cell::RefCell<Option<std::collections::HashMap<String, Vec<navigator_dom::Handle>>>>,
+    /// ★ POSITIONAL ADDRESSES, compiled the same way (replay part 1b): each
+    /// `html:0>body:0>…` path a step has resolved, with its answer (also
+    /// "none"). A walk of the tree once per document state and path instead
+    /// of once per click. Dropped with `ids`, by the same writes.
+    pub(crate) paths: std::cell::RefCell<std::collections::HashMap<String, Option<navigator_dom::Handle>>>,
+    /// ★ INSERTED MARKUP, parsed once: each `insert` effect's HTML, by its
+    /// text, as the shared parser makes it. Parsing is a pure function of
+    /// the text, so nothing ever invalidates it; the step grafts from the
+    /// parsed tree instead of parsing at every click.
+    pub(crate) frags: std::cell::RefCell<std::collections::HashMap<String, std::rc::Rc<Dom>>>,
+    /// ★ The document's EXACT serialized length, once measured, kept by
+    /// every in-place step from what it changed (`apply`): the attributes it
+    /// wrote, the subtrees it removed and inserted, each measured by the
+    /// serializer's own code. What a session is charged for its current
+    /// document; serializing the whole page per click to learn it was 99%
+    /// of a click's cost.
+    pub(crate) bytes: std::cell::Cell<Option<usize>>,
 }
 
 /// See `Document::stats`.
@@ -48,8 +68,33 @@ impl Document {
     /// This does NOT check the profile. Callers handling a recording from the
     /// store want `accept`; this stays for tests and for tools that need to
     /// look at a document precisely because it is out of bounds.
+    pub(crate) fn from_dom(dom: Dom) -> Self {
+        Document { dom, stats: None, ids: Default::default(), paths: Default::default(), frags: Default::default(), bytes: Default::default() }
+    }
+
+    /// `dom.serialized_len()`, measured once and then kept (see `bytes`).
+    pub fn serialized_bytes(&self) -> usize {
+        if let Some(b) = self.bytes.get() { return b }
+        let b = self.dom.serialized_len();
+        self.bytes.set(Some(b));
+        b
+    }
+
+    /// An element's attributes as serialized: Σ ` name="value"`.
+    pub(crate) fn attrs_len(&self, h: navigator_dom::Handle) -> usize {
+        self.dom.get(h).map(|n| n.attrs.iter().map(|(k, v)| Dom::attr_serialized_len(k, v)).sum()).unwrap_or(0)
+    }
+
+    /// An insert's markup, parsed once (see `frags`).
+    pub(crate) fn fragment(&self, html: &str) -> std::rc::Rc<Dom> {
+        if let Some(f) = self.frags.borrow().get(html) { return f.clone() }
+        let f = std::rc::Rc::new(navigator_dom::parse_fragment(html));
+        self.frags.borrow_mut().insert(html.to_string(), f.clone());
+        f
+    }
+
     pub fn parse(html: &str) -> Self {
-        Document { dom: parse(html), stats: None, ids: Default::default() }
+        Document::from_dom(parse(html))
     }
 
     /// ★★ THE PROFILE IS A RENDERER'S REFUSAL, NOT A CONVERTER'S WARNING.
@@ -74,7 +119,7 @@ impl Document {
     pub fn accept(html: &str) -> Result<Self, Vec<Violation>> {
         let dom = parse(html);
         let v = profile::check(&dom, html.len());
-        if v.is_empty() { Ok(Document { dom, stats: None, ids: Default::default() }) } else { Err(v) }
+        if v.is_empty() { Ok(Document::from_dom(dom)) } else { Err(v) }
     }
 
     /// Resolve a transition's trigger against this document.
@@ -97,7 +142,12 @@ impl Document {
             // Exactly `resolve_path`'s answer: the one connected node holding
             // that id, or nothing if none or several do.
             Some(id) => match self.ids_index().get(id) { Some(v) if v.len() == 1 => Some(v[0]), _ => None },
-            None => self.dom.resolve_path(trigger),
+            None => {
+                if let Some(h) = self.paths.borrow().get(trigger) { return *h }
+                let h = self.dom.resolve_path(trigger);
+                self.paths.borrow_mut().insert(trigger.to_string(), h);
+                h
+            }
         }
     }
 
@@ -122,5 +172,5 @@ impl Document {
 
     /// Forget the compiled addresses: the tree changed in a way that can
     /// change what a path names.
-    pub(crate) fn invalidate_addresses(&self) { *self.ids.borrow_mut() = None }
+    pub(crate) fn invalidate_addresses(&self) { *self.ids.borrow_mut() = None; self.paths.borrow_mut().clear() }
 }

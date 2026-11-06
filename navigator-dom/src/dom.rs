@@ -619,6 +619,25 @@ impl Dom {
         n.0
     }
 
+    /// What one attribute adds to its element's serialized start tag:
+    /// ` name="value"`, the value escaped as `ser_in` escapes it.
+    pub fn attr_serialized_len(name: &str, value: &str) -> usize {
+        let mut n = Count(0);
+        n.put(" "); n.put(name); n.put("=\""); escape_into(value, &mut n); n.put("\"");
+        n.0
+    }
+
+    /// What the subtree at `h` contributes to `serialized_len`: the same
+    /// `ser_in` walk over that subtree alone, raw text decided by its parent
+    /// as the whole-document walk decides it. ★ So a change to the document
+    /// can be measured by what it changed — exactly, by the same code.
+    pub fn subtree_serialized_len(&self, h: Handle) -> usize {
+        let raw = self.nodes[h as usize].parent.and_then(|p| self.tag(p)).is_some_and(|t| RAW_TEXT.iter().any(|r| r.eq_ignore_ascii_case(t)));
+        let mut n = Count(0);
+        self.ser_in(h, &mut n, raw, None);
+        n.0
+    }
+
     /// ★ `serialize`, with every element also carrying `attr="<its handle>"`
     /// — how the converter finds its own nodes again in a layout of the
     /// NORMALIZED document (legacy-web §5.4.5.6e), whose node positions are
@@ -651,15 +670,6 @@ impl Dom {
     /// own output, so nothing could notice.
     fn ser_in(&self, h: Handle, s: &mut impl Sink, raw: bool, mark: Option<&str>) {
         const VOID: &[&str] = &["area","base","br","col","embed","hr","img","input","link","meta","source","track","wbr"];
-        // `noscript` belongs here because we parse — and the converter runs —
-        // with scripting ENABLED, and the spec makes noscript raw text in that
-        // mode. Escaping it grew the document every round: a recorded
-        // `&lt;iframe` came back as `&amp;lt;iframe`, then `&amp;amp;lt;`.
-        // `textarea` and `title` are deliberately absent: they are ESCAPABLE
-        // raw text, where entities are decoded on parse and so must be
-        // re-escaped on the way out.
-        const RAW_TEXT: &[&str] =
-            &["script", "style", "xmp", "iframe", "noembed", "noframes", "noscript"];
         match &self.nodes[h as usize].kind {
             Kind::Text(t) if raw => s.put(t),
             Kind::Text(t) => escape_into(t, s),
@@ -682,6 +692,16 @@ impl Dom {
         }
     }
 }
+
+// `noscript` belongs here because we parse — and the converter runs —
+// with scripting ENABLED, and the spec makes noscript raw text in that
+// mode. Escaping it grew the document every round: a recorded
+// `&lt;iframe` came back as `&amp;lt;iframe`, then `&amp;amp;lt;`.
+// `textarea` and `title` are deliberately absent: they are ESCAPABLE
+// raw text, where entities are decoded on parse and so must be
+// re-escaped on the way out.
+const RAW_TEXT: &[&str] =
+    &["script", "style", "xmp", "iframe", "noembed", "noframes", "noscript"];
 
 /// Where serialized bytes go: a `String` to keep them, a `Count` to measure.
 trait Sink { fn put(&mut self, s: &str); }

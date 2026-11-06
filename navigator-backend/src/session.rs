@@ -208,6 +208,15 @@ fn effect_bytes(e: &crate::Effect) -> usize {
     }
 }
 
+/// Each offerable trigger's first transition (see `Session::by_trigger`).
+fn index_triggers(ts: &[Transition]) -> std::collections::HashMap<String, usize> {
+    let mut m = std::collections::HashMap::new();
+    for (i, t) in ts.iter().enumerate() {
+        if t.is_offerable() { m.entry(t.trigger.clone()).or_insert(i); }
+    }
+    m
+}
+
 fn transitions_bytes(ts: &[Transition]) -> usize {
     ts.iter().map(|t| t.trigger.len() + t.event.len() + t.effects.iter().map(effect_bytes).sum::<usize>()).sum()
 }
@@ -235,6 +244,10 @@ pub struct Session {
     /// recorded for it. Dropping the table at open time made a session able
     /// to hold a document and unable to do anything with it.
     transitions: Vec<Transition>,
+    /// ★ Each offerable trigger's FIRST transition, by trigger (replay part
+    /// 1b): a click is a hash lookup, not a scan of the table with a string
+    /// compare per entry. Built whenever `transitions` is set.
+    by_trigger: std::collections::HashMap<String, usize>,
     /// ★ HOW TO GET BACK HERE: the steps taken from the published document,
     /// as indexes into `transitions`. A session's restorable state is this
     /// and the recording; the document is derived by replaying it, and
@@ -313,7 +326,10 @@ impl Session {
     pub fn document(&self) -> &Document { self.history.document() }
 
     pub fn go(&mut self, t: &Transition) -> Result<(), ApplyError> {
-        let index = self.transitions.iter().position(|x| x == t);
+        // The recorded transition this is, if any: by its trigger first, the
+        // scan only when that is not it (a trigger with several entries).
+        let index = self.by_trigger.get(&t.trigger).copied().filter(|&i| &self.transitions[i] == t)
+            .or_else(|| self.transitions.iter().position(|x| x == t));
         self.history.go(t)?;
         self.ahead.clear();
         match index { Some(i) => self.push_trail(i), None => self.trail = Err(NotRestorable::UnrecordedStep) }
@@ -322,8 +338,8 @@ impl Session {
     }
 
     fn go_index(&mut self, i: usize) -> Result<(), ApplyError> {
-        let t = self.transitions[i].clone();
-        self.history.go(&t)?;
+        // Borrowed, not cloned: a click copied every string of its transition.
+        self.history.go(&self.transitions[i])?;
         self.ahead.clear();
         self.push_trail(i);
         self.remeasure();
@@ -401,7 +417,12 @@ impl Session {
     pub fn ahead(&self) -> usize { self.history.ahead() }
 
     fn remeasure(&mut self) {
-        self.current_bytes = self.history.document().dom.serialize().len();
+        // ★ KEPT, not re-measured: serializing the whole document to take
+        // its length was ~99% of a click (830 µs of an 830 µs step; the
+        // transition itself is under a microsecond), and even counting
+        // without building the string was 565 µs. The document keeps its
+        // exact length by what each step changes (`Document::bytes`).
+        self.current_bytes = self.history.document().serialized_bytes();
     }
     pub fn depth(&self) -> usize { self.history.depth() }
     pub fn forgotten(&self) -> usize { self.history.forgotten() }
@@ -430,6 +451,7 @@ impl Session {
             return Err("this session has already taken a step".into());
         }
         self.transitions_bytes = transitions_bytes(&transitions);
+        self.by_trigger = index_triggers(&transitions);
         self.transitions = transitions;
         Ok(())
     }
@@ -448,12 +470,12 @@ impl Session {
     /// reader would produce a refusal at apply time for a reason the reader
     /// could do nothing about.
     pub fn transition_for(&self, trigger: &str) -> Option<&Transition> {
-        self.transitions.iter().find(|t| t.is_offerable() && t.trigger == trigger)
+        self.by_trigger.get(trigger).map(|&i| &self.transitions[i])
     }
 
     /// Take the transition a trigger names.
     pub fn navigate(&mut self, trigger: &str) -> Result<(), NavigateError> {
-        let i = self.transitions.iter().position(|t| t.is_offerable() && t.trigger == trigger)
+        let i = *self.by_trigger.get(trigger)
             .ok_or_else(|| NavigateError::NoSuchTrigger { trigger: trigger.to_string() })?;
         self.go_index(i).map_err(NavigateError::Refused)
     }
@@ -608,6 +630,7 @@ impl Sessions {
             // serialization can differ in length from the recorded bytes —
             // the parser normalizes — so it is measured, not assumed.
             current_bytes: doc.dom.serialize().len(),
+            by_trigger: index_triggers(&r.transitions),
             transitions: r.transitions.clone(),
             transitions_bytes,
             history: History::with_limits(doc, self.limits.history),

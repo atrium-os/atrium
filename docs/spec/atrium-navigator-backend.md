@@ -479,8 +479,48 @@ one.
 | **+ compiled addresses** | **0.6 / 22 µs** | **0.5 / 22 µs** |
 
 A document's first step also compiles its state (the stats and the id index), once: p50
-0.2 ms, p99 2 ms. Part 2 (incremental restyle and relayout, repainting affected bands,
-the 16 ms click) follows bands and checkpoints (§4.8).
+0.2 ms, p99 2 ms.
+
+**Part 1b: the whole click (2026-11-06; asked by the user).** `nav_cost` timed the
+transition alone, so the table above did not show what a reader's click cost. A new
+example, `examples/click_cost`, times all of `Session::navigate` and `back` over the same
+steps: 830 µs at p50. 99% of it was outside the transition.
+- *The session's memory charge* (`remeasure`).
+  - It serialized the whole document after every step, to learn its length. Even
+    counting without building the string (`serialized_len`) was 565 µs.
+  - The document now KEEPS its exact serialized length (`Document::bytes`). It is
+    measured once, then changed by each in-place step by what that step wrote: the
+    element's attribute list before and after, each removed subtree before it goes,
+    each inserted subtree after it lands.
+  - Each of those is measured by the serializer's own code
+    (`Dom::attr_serialized_len`, `Dom::subtree_serialized_len`, one `RAW_TEXT` list),
+    not a second implementation.
+- *Finding the transition.* A scan of the table with a string compare per entry is now a
+  hash map of offerable triggers (`Session::by_trigger`), first entry first as before.
+  The click no longer clones the transition it applies.
+- *Positional addresses* (`html:0>body:0>…`) are compiled per document state like `#id`
+  ones (`Document::paths`). They are dropped by the same writes.
+- *Inserted markup* is parsed once per distinct fragment (`Document::frags`), not at
+  every click. Parsing is pure, so nothing invalidates it.
+
+*Kept, byte for byte:*
+- `tests/apply_in_place.rs` over the recordings (`NAVIGATOR_RECORDINGS`): every step and
+  rewind is still the clone path's. The kept length now equals the real serialized
+  length after each of them.
+- A control that drops the insert accounting fails it.
+- The 421-document identity set's normalized documents and NSG are unchanged.
+
+*Measured* (3 interleaved runs per arm, the same 2,211 clicks and 2,242 backs; M4 Max):
+
+| | click p50 / p90 / p99 | back p50 / p99 |
+|---|---|---|
+| before (f23419dd) | 829–832 / 1,464–1,469 / 1,485–1,496 µs | 823–829 / 1,483–1,500 µs |
+| **after** | **0.79 / 1.54–1.58 / 20.8–21.0 µs** | **0.58 / 19.8–20.1 µs** |
+
+A click is now what its transition costs. `History::go` alone is p50 0.6–0.7 µs, and its
+p99 moved from 23 µs to 18 µs with the address and fragment caches. Part 2 (incremental
+restyle and relayout, repainting affected bands, the 16 ms click) follows bands and
+checkpoints (§4.8). After a DOM step it is the whole remaining cost.
 
 ### 4.4 Going back
 

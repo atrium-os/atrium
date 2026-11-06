@@ -25,7 +25,7 @@
 
 use crate::document::Document;
 use crate::{Effect, Transition};
-use navigator_dom::{parse_fragment, profile, Handle};
+use navigator_dom::{profile, Handle};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ApplyError {
@@ -183,7 +183,8 @@ impl Document {
             });
         }
 
-        let mut next = Document { dom: self.dom.clone(), stats: None, ids: Default::default() };
+        let mut next = Document::from_dom(self.dom.clone());
+        *next.frags.borrow_mut() = self.frags.borrow().clone();
         let mut removed: Vec<Handle> = vec![];
         let mut inserted: Vec<Handle> = vec![];
 
@@ -242,7 +243,7 @@ impl Document {
             // markup in this system. Inserted HTML is the most hostile
             // input the backend handles and is exactly where a second,
             // more forgiving parser would get written.
-            let frag = parse_fragment(html);
+            let frag = self.fragment(html);
             let roots = frag.children_of(frag.root());
             // ★ An out-of-range index is CLAMPED, not refused. The index
             // is a position in a tree the recording describes and this
@@ -251,7 +252,7 @@ impl Document {
             // degrades to the older behaviour rather than losing content.
             let at = index.unwrap_or(usize::MAX).min(next.dom.children_of(p).len());
             for (i, c) in roots.into_iter().enumerate() {
-                let g = next.dom.graft(&frag, c);
+                let g = next.dom.graft(&*frag, c);
                 let before = next.dom.children_of(p).get(at + i).copied();
                 next.dom.insert_before(p, g, before);
                 inserted.push(g);
@@ -408,7 +409,7 @@ impl Document {
         for &(p, parent, _, _) in &ins {
             if gone(&self.dom, &removed_order, p) { return Err(ApplyError::TargetUnresolved { path: parent.clone() }) }
         }
-        let frags: Vec<navigator_dom::Dom> = ins.iter().map(|&(_, _, _, html)| parse_fragment(html)).collect();
+        let frags: Vec<std::rc::Rc<navigator_dom::Dom>> = ins.iter().map(|&(_, _, _, html)| self.fragment(html)).collect();
         // ★ The profile, incrementally: exact elements, bounded the rest.
         let stats = match self.stats { Some(s) => s, None => Stats::exact(&self.dom) };
         let count_elements = |dom: &navigator_dom::Dom, h: Handle| -> usize {
@@ -446,29 +447,39 @@ impl Document {
             let index = self.dom.children_of(p).iter().position(|&c| c == h).unwrap_or(0);
             (h, p, index, self.dom.outer_html(h))
         }).collect();
+        // The exact length, kept by what changes (see `Document::bytes`):
+        // only when it is already known, so a step never pays the walk.
+        let mut bytes = self.bytes.get().map(|b| b as i64);
         let mut touched: Vec<(Handle, &str, &Option<String>, Option<usize>)> = vec![];
         for op in &ops {
             let Op::Attr { h, name, from, to, at, .. } = op else { continue };
             touched.push((*h, name.as_str(), *from, self.dom.attr_index(*h, name)));
+            let before = bytes.map(|_| self.attrs_len(*h));
             match (to, at) {
                 (Some(v), Some(i)) => self.dom.set_attr_at(*h, name, v, *i),
                 (Some(v), None) => self.dom.set_attr(*h, name, v),
                 (None, _) => self.dom.remove_attr(*h, name),
             }
+            if let (Some(b), Some(a)) = (bytes.as_mut(), before) { *b += self.attrs_len(*h) as i64 - a as i64 }
         }
-        for &h in &removed_order { self.dom.detach(h); }
+        for &h in &removed_order {
+            if let Some(b) = bytes.as_mut() { *b -= self.dom.subtree_serialized_len(h) as i64 }
+            self.dom.detach(h);
+        }
         let mut inserted: Vec<Handle> = vec![];
         for (k, &(p, _, index, _)) in ins.iter().enumerate() {
             let frag = &frags[k];
             let roots = frag.children_of(frag.root());
             let at = index.unwrap_or(usize::MAX).min(self.dom.children_of(p).len());
             for (i, c) in roots.into_iter().enumerate() {
-                let g = self.dom.graft(frag, c);
+                let g = self.dom.graft(&**frag, c);
                 let before = self.dom.children_of(p).get(at + i).copied();
                 self.dom.insert_before(p, g, before);
+                if let Some(b) = bytes.as_mut() { *b += self.dom.subtree_serialized_len(g) as i64 }
                 inserted.push(g);
             }
         }
+        self.bytes.set(bytes.map(|b| b as usize));
         self.stats = Some(Stats { elements, bytes_ub, depth_ub, sheets_ub });
         if !removed_order.is_empty() || !inserted.is_empty() || touched.iter().any(|(_, name, _, _)| *name == "id") {
             self.invalidate_addresses();

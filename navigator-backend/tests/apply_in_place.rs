@@ -9,7 +9,18 @@
 use navigator_backend::document::Document;
 use navigator_backend::{ingest, Effect, Limits, Transition};
 
-fn same(a: &Document, b: &Document) -> bool { a.dom.serialize() == b.dom.serialize() }
+/// The two documents serialize identically — and the in-place one's KEPT
+/// length (`Document::serialized_bytes`, maintained by each step from what
+/// it changed) is its real one. The first call measures; every later call
+/// checks what the steps since then kept.
+fn same(a: &Document, b: &Document) -> bool {
+    let sb = b.dom.serialize();
+    let eq = a.dom.serialize() == sb;
+    // (A planted difference edits the tree directly, outside any step, so
+    // its count is not kept by design; it is checked where the trees agree.)
+    if eq { assert_eq!(b.serialized_bytes(), sb.len(), "the kept byte count drifted from the document") }
+    eq
+}
 
 /// One step on both paths; panics on any difference. Returns the undo if it applied.
 fn step(clone: &mut Document, inplace: &mut Document, t: &Transition, what: &str) -> Option<Transition> {
