@@ -303,6 +303,15 @@ impl<'a> Ctx<'a> {
         id
     }
 
+    /// [`Ctx::paragraph`] with hyphenation and a line limit ("…" past it;
+    /// `max_lines: 1` is a truncated label).
+    pub fn paragraph_with(&mut self, content: impl Into<String>, style: crate::node::TextStyle, wrap: crate::wrap::Wrap) -> NodeId {
+        let id = self.paragraph(content, style);
+        let fs = self.tree.style(id).copied().unwrap_or_default();
+        self.set_flex(id, crate::layout::FlexStyle { hyphens: wrap.hyphens, max_lines: wrap.max_lines, ..fs });
+        id
+    }
+
     /// Lay the stack `id` out as a grid ([`crate::layout::Grid`]).
     pub fn grid(&mut self, id: NodeId, grid: crate::layout::Grid) {
         self.tree.set_grid(id, grid);

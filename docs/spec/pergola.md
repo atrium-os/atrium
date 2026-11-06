@@ -558,12 +558,25 @@ sit in a stack and nothing lined their labels up. As built:
   column, a padded body, a right-justified button row of placed buttons).
 
 - Text wraps: `Ctx::paragraph(text, style)` adds text that breaks into
-  lines at the width layout gives it (greedy, at spaces and `\n`, a too
-  long word on its own line), with body leading (`line-height.body`); it
-  is as tall as its lines and pushes what follows down. After layout it
-  becomes a free column of one-line runs, which is what the wire draws
-  (frescod still shapes each run). Dialog bodies and Section
-  descriptions use it.
+  lines at the width layout gives it, with body leading
+  (`line-height.body`); it is as tall as its lines and pushes what
+  follows down. After layout it becomes a free column of one-line runs,
+  which is what the wire draws (frescod still shapes each run). Dialog
+  bodies and Section descriptions use it. The breaker (`pergola::wrap`):
+  - breaks where UAX #14 allows (spaces, after hyphens and dashes, around
+    slashes, ideographs; never at a no-break space), greedily, and at `\n`;
+  - a soft hyphen (U+00AD) is a break that shows a hyphen, invisible
+    otherwise;
+  - `Wrap { hyphens: true }` (`Ctx::paragraph_with`) hyphenates a word
+    that doesn't fit the room left, by Knuth–Liang with the TeX en-US
+    patterns (built in, crate `hyphenation`); off by default, as UI text
+    usually is;
+  - a word wider than a whole line breaks by grapheme;
+  - `Wrap { max_lines: n }` ends the last line in "…" when the text goes
+    on (`max_lines: 1` is a truncated label).
 
-Not yet: a grid's explicit row/column placement, RTL, hyphenation and
-breaking inside long words, ellipsis truncation.
+Not yet: hyphenation for other languages (needs a `lang` on the text and
+their patterns), justification, a text-wide line-fitting (Knuth–Plass)
+pass, RTL.
+
+Also not yet: a grid's explicit row/column placement.
