@@ -146,7 +146,7 @@ impl View for Button {
             }
         };
 
-        if focused {
+        if ctx.is_focus_visible(bg_id) {
             if let Some(Node::Rect { fill, .. }) = ctx.tree.get_mut(halo_id) {
                 *fill = theme.accent_bg();
             }

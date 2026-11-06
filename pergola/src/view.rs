@@ -29,6 +29,8 @@ pub struct InteractionState {
     pub hovered: Option<NodeId>,
     pub pressed: Option<NodeId>,
     pub focused: Option<NodeId>,
+    /// Focus came from the keyboard: draw the focus ring.
+    pub focus_visible: bool,
 }
 
 /// Per-render context handed to `View::render`. Owns the in-construction
@@ -70,6 +72,8 @@ impl<'a> Ctx<'a> {
     pub fn is_hovered(&self, id: NodeId) -> bool { self.state.hovered == Some(id) }
     pub fn is_pressed(&self, id: NodeId) -> bool { self.state.pressed == Some(id) }
     pub fn is_focused(&self, id: NodeId) -> bool { self.state.focused == Some(id) }
+    /// Focused from the keyboard: the one case the focus ring shows.
+    pub fn is_focus_visible(&self, id: NodeId) -> bool { self.state.focus_visible && self.is_focused(id) }
 
     /// Add a leaf node under the current parent.
     pub fn add(&mut self, node: Node) -> NodeId {

@@ -42,6 +42,9 @@ pub struct App<V: View> {
     /// down on a focusable node sets this; Tab / Shift-Tab cycle it
     /// through focusables in id order.
     focused: Option<NodeId>,
+    /// Whether focus came from the keyboard, so its ring shows (visual
+    /// language rev. 2 §14.1: pointer focus shows no ring).
+    focus_visible: bool,
     /// Current hover target — nearest interactive ancestor under the
     /// pointer. Drives widgets' hover looks via `InteractionState`.
     hovered: Option<NodeId>,
@@ -91,6 +94,7 @@ impl<V: View> App<V> {
             interactions: Interactions::new(),
             pending_press: None,
             focused: None,
+            focus_visible: false,
             hovered: None,
             pressed_vis: None,
             dirty,
@@ -203,6 +207,7 @@ impl<V: View> App<V> {
             hovered: self.hovered,
             pressed: self.pressed_vis,
             focused: self.focused,
+            focus_visible: self.focus_visible,
         };
         let (mut next, interactions) = render_continuing(&self.view, self.theme, state, &mut self.prev_tree);
         // Run layout from each root in the tree (a render pass may
@@ -313,8 +318,9 @@ impl<V: View> App<V> {
                 if backwards { *ids.last().unwrap() } else { ids[0] }
             }
         };
-        if self.focused != Some(next) {
+        if self.focused != Some(next) || !self.focus_visible {
             self.focused = Some(next);
+            self.focus_visible = true;
             self.touch();
         }
     }
@@ -340,8 +346,9 @@ impl<V: View> App<V> {
                 // focus uses the nearest focusable ancestor.
                 self.pending_press = hit.and_then(|id| self.bubble_to(id, |h| h.on_click.is_some()));
                 let new_focus = hit.and_then(|id| self.bubble_to(id, |h| h.focusable));
-                if self.focused != new_focus {
+                if self.focused != new_focus || self.focus_visible {
                     self.focused = new_focus;
+                    self.focus_visible = false;
                     self.touch();
                 }
                 if self.pressed_vis != self.pending_press {
@@ -544,6 +551,24 @@ mod tests {
         assert_eq!(app.focused(), Some(first), "wraps around");
         app.handle_event(tab(true));
         assert_eq!(app.focused(), Some(second), "shift-tab reverses");
+    }
+
+    #[test]
+    fn only_keyboard_focus_shows_the_ring() {
+        let mut app = App::new(TwoFields);
+        app.tick();
+        app.handle_event(Event::PointerDown { at: crate::geom::Point::new(10.0, 10.0) });
+        assert!(app.focused().is_some());
+        assert!(!app.focus_visible, "a click focuses without a ring");
+        app.handle_event(Event::Key {
+            kind: crate::event::KeyEventKind::Down,
+            key: crate::event::Key::Tab,
+            modifiers: Default::default(),
+            chars: String::new(),
+        });
+        assert!(app.focus_visible, "Tab shows it");
+        app.handle_event(Event::PointerDown { at: crate::geom::Point::new(10.0, 10.0) });
+        assert!(!app.focus_visible, "and the pointer hides it again");
     }
 
     #[test]
