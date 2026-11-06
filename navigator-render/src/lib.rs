@@ -172,6 +172,13 @@ pub struct Scene {
     /// ★ Scroll regions (backend §4.9 item 4, `scroll`): a table wider than
     /// its box scrolls on its own instead of widening the page.
     pub scrolls: Vec<scroll::Scroll>,
+    /// While a scroll region is being laid out: its viewport clip and the
+    /// clip outside it. A clip made inside the region is intersected with
+    /// the OUTSIDE one, not the viewport — it moves with the content, and is
+    /// intersected with the viewport when painted (`scroll::Scroll::inner`).
+    #[doc(hidden)] pub scroll_clip: Option<(u32, Option<u32>)>,
+    /// The clips made inside the open region.
+    #[doc(hidden)] pub inner_clips: Vec<u32>,
     /// The clip and group a node created now belongs to.
     /// Public only so review tooling can build a scene of one node.
     pub cur: Attrs,
@@ -214,7 +221,8 @@ impl Scene {
     }
     /// A clip rectangle, intersected with whatever is already in force.
     pub(crate) fn clip(&mut self, x: U, y: U, w: U, h: U) -> u32 {
-        let (x, y, w, h) = match self.cur.0.and_then(|i| self.clips.get(i as usize).copied()) {
+        let parent = match (self.cur.0, self.scroll_clip) { (Some(c), Some((vp, outer))) if c == vp => outer, (c, _) => c };
+        let (x, y, w, h) = match parent.and_then(|i| self.clips.get(i as usize).copied()) {
             Some((px, py, pw, ph)) => {
                 let (x0, y0) = (x.max(px), y.max(py));
                 (x0, y0, (x + w).min(px + pw) - x0, (y + h).min(py + ph) - y0)
@@ -222,7 +230,9 @@ impl Scene {
             None => (x, y, w, h),
         };
         self.clips.push((x, y, w.max(0), h.max(0)));
-        self.clips.len() as u32 - 1
+        let id = self.clips.len() as u32 - 1;
+        if self.scroll_clip.is_some() { self.inner_clips.push(id) }
+        id
     }
     pub(crate) fn group(&mut self, alpha: u32) -> u32 {
         self.groups.push((alpha, self.cur.1));

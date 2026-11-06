@@ -1195,9 +1195,23 @@ The added time compares with normalize plus table pre-measure at p50 171 ms and 
   - The ar render exposed a renderer bug, now fixed. A table that is a flex item was
     given its `width` rather than its min-content (CSS 2.1 §17.5.2), and it covered 30 px
     of the article.
-  - Not yet: a thumbnail whose width should come from its image, because its caption is
-    a `table-caption`, takes its caption's one-line width instead. It is then too wide
-    to have text beside it (part of the 40).
+  - *Thumbnails, fixed later the same day.* A thumbnail whose width comes from its
+    image (its caption is a `table-caption`) used to take its caption's one-line
+    width, which left it too wide for anything beside it (part of the 40). Two fixes:
+    - *Captions compiled.* A `display: table` with a caption and no rows, such as
+      Wikipedia's thumbnail `figure`, gets its other content in one explicit row and
+      cell, and each caption becomes a cell in a row of its own. The cell is marked
+      `atrium-caption`, and the table pre-measure counts only its min-content (CSS
+      2.1 §17.4). A table with rows keeps its caption as a block, as before.
+    - *A percentage limit is no limit in an intrinsic measure.* A `max-width` (or
+      `width`) given as a percentage, or as a `calc()` holding one, is skipped when
+      there is no width to resolve it against. A replaced box with such a limit
+      contributes nothing to min-content and its size to max-content (CSS Sizing 3
+      §5.2.2). Wikipedia's thumbnail image, `max-width: calc(100% - 8px + 2px)`, had
+      measured 0 wide.
+    - The same fix corrected inline images with percentage limits elsewhere. For
+      example, usa.gov's 1rem banner flag had been squeezed to 11 px by the clamp.
+    - Floats too wide for anything beside them: 40 → 7 (readable), 3 (recordings).
 
 **Collapsed table borders, compiled (2026-11-06).** `border-collapse: collapse` becomes
 separated borders that draw the same lines (`navigator-normalize/src/borders.rs`):

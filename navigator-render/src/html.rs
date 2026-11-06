@@ -77,18 +77,9 @@ fn len(v: &V, basis: U) -> Option<U> {
 /// box, `width: calc(8rem * 2 + 0.125rem)`, by its placeholder text, and
 /// the Menu button beside it was pushed 22 px off the page.
 fn abs_len(v: &V) -> Option<U> {
-    fn pct(c: &Calc) -> bool {
-        match c {
-            Calc::Pct(_) => true,
-            Calc::Num(_) | Calc::Len(_) => false,
-            Calc::Add(a, b) | Calc::Sub(a, b) | Calc::Mul(a, b) | Calc::Div(a, b) => pct(a) || pct(b),
-            Calc::Min(v) | Calc::Max(v) => v.iter().any(pct),
-            Calc::Clamp(a, b, c) => pct(a) || pct(b) || pct(c),
-        }
-    }
     match v {
         V::Len(l) => Some(u(l.v)),
-        V::Calc(c) if !pct(c) => calc_eval(c, 0).map(u),
+        V::Calc(c) if !calc_has_pct(c) => calc_eval(c, 0).map(u),
         _ => None,
     }
 }
@@ -105,6 +96,23 @@ fn contribution(cs: &Style, size: U) -> U {
     let table = matches!(cs.get("display"), V::Kw("table"));
     let size = if table { size } else { lim("max-width").map_or(size, |mx| size.min(mx)) };
     lim("min-width").map_or(size, |mn| size.max(mn))
+}
+
+/// Whether a size property is a percentage, or a calc() that holds one.
+fn pct_size(cs: &Style, p: &str) -> bool {
+    match cs.get(p) { V::Pct(_) => true, V::Calc(c) => calc_has_pct(c), _ => false }
+}
+
+/// Whether a calc() depends on a percentage.
+fn calc_has_pct(c: &navigator_style::values::Calc) -> bool {
+    use navigator_style::values::Calc as C;
+    match c {
+        C::Pct(_) => true,
+        C::Num(_) | C::Len(_) => false,
+        C::Add(a, b) | C::Sub(a, b) | C::Mul(a, b) | C::Div(a, b) => calc_has_pct(a) || calc_has_pct(b),
+        C::Min(v) | C::Max(v) => v.iter().any(calc_has_pct),
+        C::Clamp(a, b, d) => calc_has_pct(a) || calc_has_pct(b) || calc_has_pct(d),
+    }
 }
 
 fn rgba(c: &Color, current: u32) -> u32 {
@@ -193,6 +201,8 @@ struct Cx<'a> {
     /// Tables already measured by `premeasure_tables`: their (min, max)
     /// content widths, spacing included, for the cells that contain them.
     measured_tables: HashMap<Handle, (U, U)>,
+    /// The table whose box opened the scroll region now open, if any.
+    scroll_table: Option<Handle>,
     /// The region a box has opened and `block` will close: the attributes
     /// to restore, its clip, its transform, and the content's x, y, width.
     scroll_open: Option<(crate::Attrs, u32, u32, (U, U, U))>,
@@ -371,7 +381,7 @@ fn render_inner(html: &str, fonts: &FontSet, env: &Env, subs: &Subresources, geo
     let mut cx = Cx { dom: &dom, styles: &styled.styles, sh: Shaper::new(fonts), scene: Scene { width: u(env.width_px), ..Default::default() },
                       report: Report::default(), links: vec![], unimplemented: BTreeMap::new(), marker: None, baseline_probe: None, indent: None, iso_paths: vec![vec![]], iso_cur: 0, content_dy: 0, table_part: false, promoted: vec![], boxes: std::env::var_os("NSG_DUMP_BOXES").map(|_| vec![]), geo: None, inl_cur: 0,
                       viewport: (u(env.width_px), Some(u(env.height_px))), pos_cb: (0, 0, u(env.width_px), Some(u(env.height_px))),
-                      subs, placing_abs: false, pending_abs: vec![], deferred_abs: vec![], cb_open: false, canvas_src: None, abs_origin: None, flex_static: None, measured: HashMap::new(), contexts: vec![], hoists: vec![], diagnostics: vec![], vector_budget: crate::path::DOCUMENT_SEGMENT_SHARE, in_scroll: false, scroll_open: None, measured_tables: HashMap::new() };
+                      subs, placing_abs: false, pending_abs: vec![], deferred_abs: vec![], cb_open: false, canvas_src: None, abs_origin: None, flex_static: None, measured: HashMap::new(), contexts: vec![], hoists: vec![], diagnostics: vec![], vector_budget: crate::path::DOCUMENT_SEGMENT_SHARE, in_scroll: false, scroll_open: None, measured_tables: HashMap::new(), scroll_table: None };
     if geo { cx.geo = Some(GeoLog { inl_paths: vec![vec![]], ..Default::default() }) }
     cx.promoted = promote_block_in_inline(&dom, &styled.styles);
     cx.count_unread_rows();
@@ -447,7 +457,7 @@ pub fn premeasure_tables_at(html: &str, fonts: &FontSet, env: &Env) -> (String, 
                       report: Report::default(), links: vec![], unimplemented: BTreeMap::new(), marker: None, baseline_probe: None,
                       indent: None, iso_paths: vec![vec![]], iso_cur: 0, content_dy: 0, table_part: false, promoted: vec![], boxes: std::env::var_os("NSG_DUMP_BOXES").map(|_| vec![]), geo: None, inl_cur: 0, viewport: (u(env.width_px), Some(u(env.height_px))),
                       pos_cb: (0, 0, u(env.width_px), Some(u(env.height_px))), subs: &Subresources::new(),
-                      placing_abs: false, pending_abs: vec![], deferred_abs: vec![], cb_open: false, canvas_src: None, abs_origin: None, flex_static: None, measured: HashMap::new(), contexts: vec![], hoists: vec![], diagnostics: vec![], vector_budget: crate::path::DOCUMENT_SEGMENT_SHARE, in_scroll: false, scroll_open: None, measured_tables: HashMap::new() };
+                      placing_abs: false, pending_abs: vec![], deferred_abs: vec![], cb_open: false, canvas_src: None, abs_origin: None, flex_static: None, measured: HashMap::new(), contexts: vec![], hoists: vec![], diagnostics: vec![], vector_budget: crate::path::DOCUMENT_SEGMENT_SHARE, in_scroll: false, scroll_open: None, measured_tables: HashMap::new(), scroll_table: None };
     // (table, per-column (min, max), its first row's cells) for every table.
     let mut tables: Vec<(Handle, Vec<(U, U)>, Vec<Handle>)> = vec![];
     // ★ INNER TABLES FIRST: a cell holding a table is as wide as that
@@ -498,6 +508,10 @@ pub fn premeasure_tables_at(html: &str, fonts: &FontSet, env: &Env) -> (String, 
                 // column to 48 px and "Initial:" painted over its value.
                 let floor = cx.st(c).and_then(|cs| abs_len(cs.get("width"))).unwrap_or(0);
                 let (mn, mx) = ((mn + pad).max(floor), (mx + pad).max(floor));
+                // ★ A CAPTION (compiled to a cell by the normalizer) does not
+                // widen its table past its own longest word: only its
+                // min-content counts (CSS 2.1 §17.4).
+                let mx = if dom.attr(c, "atrium-caption").is_some() { mn } else { mx };
                 if n == 1 {
                     mins[k] = mins[k].max(mn);
                     maxs[k] = maxs[k].max(mx);
@@ -736,9 +750,14 @@ impl<'a> Cx<'a> {
             if let Some((saved, clip, xf, (cx, cy, cw))) = self.scroll_open.take() {
                 let c = &mut self.scene.clips[clip as usize];
                 c.3 = (cy + r).min(c.1.saturating_add(c.3)).saturating_sub(c.1).max(0);
-                self.scene.scrolls.push(crate::scroll::Scroll { clip, xform: xf, content: (cx, cy, cw, r) });
+                let mut inner = std::mem::take(&mut self.scene.inner_clips);
+                inner.retain(|c| (*c as usize) < self.scene.clips.len());
+                inner.sort_unstable(); inner.dedup();
+                self.scene.scroll_clip = None;
+                self.scene.scrolls.push(crate::scroll::Scroll { clip, xform: xf, content: (cx, cy, cw, r), inner });
                 self.scene.cur = saved;
                 self.in_scroll = false;
+                self.scroll_table = None;
             }
         }
         r
@@ -871,25 +890,26 @@ impl<'a> Cx<'a> {
         // (backend §4.9 item 4). Its layout does not change: the box, its
         // border and background and every cell are painted under a clip of
         // the containing block, moved by a translation the UI owns
-        // (`scroll`), so the rest of the page still fits the window. Not when
-        // something inside makes a clip of its own — clips are page-space and
-        // flat, so an inner one could not move with the content (counted;
-        // the table overflows as before) — and not inside another region,
-        // which already moves it. `block` closes the region.
+        // (`scroll`), so the rest of the page still fits the window. A clip
+        // made inside (the table's own `overflow`, a cell's) moves with the
+        // content (`Scroll::inner`). Not inside another region, which
+        // already moves it. `block` closes the region.
         if kw(s, "display") == "table" && !self.in_scroll && force.0.is_none() && !positioned
             // (an RTL containing block gives way with a NEGATIVE margin-left,
             // so the box is held against what its non-negative margins leave)
             && w > cb_w - ml.unwrap_or(0).max(0) - mr.unwrap_or(0).max(0) && !self.table_rows(h).0.is_empty() {
-            if self.subtree_clips(h) {
-                self.count("wide table not scrollable: a clip inside it");
-            } else {
+            {
                 let saved = self.scene.cur;
                 let clip = self.scene.clip(x, by, cb_w, U::MAX / 4);
                 let xf = self.scene.xform([XF_ONE, 0, 0, XF_ONE, 0, 0]);
                 self.scene.cur.0 = Some(clip);
                 self.scene.cur.2 = Some(xf);
+                // ★ Clips made inside move with the content (`Scroll::inner`).
+                self.scene.scroll_clip = Some((clip, saved.0));
+                self.scene.inner_clips.clear();
                 self.in_scroll = true;
                 self.scroll_open = Some((saved, clip, xf, (bx, by, w)));
+                self.scroll_table = Some(h);
             }
         }
         // A definite height is known BEFORE the children, so they can resolve
@@ -1489,7 +1509,12 @@ impl<'a> Cx<'a> {
     /// border-box, so the frame comes off first and goes back on last.
     fn replaced_used(s: &Style, nat: &Natural, cb_w: U, cb_h: Option<U>, fh: U, fv: U, imposed_w: Option<U>) -> (U, U) {
         let hv = |p: &str| -> Option<U> { match s.get(p) { V::Kw(_) => None, V::Pct(_) => cb_h.and_then(|b| len(s.get(p), b)), v => len(v, 0) } };
-        let wv = |p: &str| -> Option<U> { match s.get(p) { V::Kw(_) => None, V::Pct(_) if cb_w <= 0 => None, v => len(v, cb_w) } };
+        // ★ With no containing block width (an intrinsic measure), a
+        // percentage is not a size — nor is a calc() holding one: Wikipedia's
+        // thumbnail image, `max-width: calc(100% - 8px + 2px)`, measured 0
+        // wide and its 282 px picture shrank to fit the caption's longest word.
+        let wv = |p: &str| -> Option<U> { match s.get(p) { V::Kw(_) => None, V::Pct(_) if cb_w <= 0 => None,
+                                                            V::Calc(c) if cb_w <= 0 && calc_has_pct(c) => None, v => len(v, cb_w) } };
         let (sw, sh) = (imposed_w.or_else(|| wv("width").map(|v| (v - fh).max(0))), hv("height").map(|v| (v - fv).max(0)));
         let mnw = wv("min-width").map(|v| (v - fh).max(0)).unwrap_or(0);
         let mxw = wv("max-width").map(|v| (v - fh).max(0)).unwrap_or(U::MAX / 4).max(mnw);
@@ -1767,7 +1792,7 @@ impl<'a> Cx<'a> {
         self.scene.paths.truncate(pa); self.scene.path_attrs.truncate(pa); self.vector_budget = vb;
         self.scene.path_fallbacks.retain(|(first, _, _)| *first < pa);
         self.scene.clips.truncate(cl); self.scene.groups.truncate(gr); self.scene.cur = cur;
-        self.scene.xforms.truncate(xf); self.scene.xform_parents.truncate(xf); self.scene.scrolls.retain(|sc| (sc.xform as usize) < xf);
+        self.scene.xforms.truncate(xf); self.scene.xform_parents.truncate(xf); self.scene.scrolls.retain(|sc| (sc.xform as usize) < xf); self.scene.inner_clips.retain(|c| (*c as usize) < cl);
         // A trial layout must leave no diagnostics behind: the real one
         // re-emits whatever it finds.
         self.diagnostics.truncate(diags);
@@ -2727,9 +2752,32 @@ impl<'a> Cx<'a> {
         // §17.2: column 1 is on the right): each cell is mirrored in the
         // table's box.
         let rtl = kw(s, "direction") == "rtl";
+        // ★ THE FIRST COLUMN STAYS IN VIEW (backend §4.9 item 4): in a table
+        // that scrolls on its own, the first column's cells keep the
+        // transform OUTSIDE the region — the compositor does not move them —
+        // and are painted after the rest, over the background behind them,
+        // so the other columns slide under. Not when the first column would
+        // take more than 40% of the region: pinned, it would leave too
+        // little to scroll through.
+        let pin = self.scroll_table == Some(h) && cols.len() >= 2 && self.scroll_open.as_ref().is_some_and(|(_, clip, ..)| {
+            let vw = self.scene.clips[*clip as usize].2;
+            (cols[0] + 2 * sx) * 5 <= vw * 2
+        });
+        let outer_xf = self.scroll_open.as_ref().map(|(saved, ..)| saved.2);
+        let order_from = self.scene.order.len();
+        let mut pinned: Vec<std::ops::Range<usize>> = vec![];
         for (r, (cells, row_slots)) in rows_cells.iter().zip(&slots).enumerate() {
             for (i, c) in cells.iter().enumerate() {
                 let (k, _, rs) = row_slots[i];
+                let pin_this = pin && k == 0;
+                let (start, cur_xf) = (self.scene.order.len(), self.scene.cur.2);
+                let (saved_scroll_clip, cur_clip) = (self.scene.scroll_clip, self.scene.cur.0);
+                // A pinned cell is clipped to the region's VIEWPORT, which
+                // does not move — not to a clip made inside the region (the
+                // table's own `overflow`), which does: ru Wikipedia's
+                // self-clipping tables were refused by the broker for it.
+                let viewport = self.scroll_open.as_ref().map(|(_, clip, ..)| *clip);
+                if pin_this { self.scene.cur.2 = outer_xf.flatten(); self.scene.scroll_clip = None; self.scene.cur.0 = viewport }
                 let cw = widths[r][i];
                 // The cell box fills every row it spans (separate-borders model).
                 let ch: U = row_h[r..r + rs].iter().sum::<U>() + sy * (rs as U - 1);
@@ -2746,25 +2794,44 @@ impl<'a> Cx<'a> {
                 self.table_part = true;
                 self.block(*c, cx, row_y[r], cw, Some(ch), (Some(cw), Some(ch)));
                 self.content_dy = 0;
+                if pin_this {
+                    // What scrolls under it must not show through: the
+                    // background behind the cell, under the cell and over
+                    // the spacing around it (which the cell does not paint).
+                    let bg = self.background_behind(*c);
+                    self.scene.insert_rect(start, Rect { x: cx - sx, y: row_y[r] - sy, w: cw + 2 * sx, h: ch + 2 * sy, rgba: bg, radii: [0; 4], ring: 0 });
+                    pinned.push(start..self.scene.order.len());
+                    self.scene.cur.2 = cur_xf;
+                    self.scene.cur.0 = cur_clip;
+                    self.scene.scroll_clip = saved_scroll_clip;
+                }
             }
+        }
+        if !pinned.is_empty() {
+            let tail = self.scene.order.split_off(order_from);
+            let is_pinned = |j: usize| pinned.iter().any(|rg| rg.contains(&(order_from + j)));
+            let (mut front, mut back) = (vec![], vec![]);
+            for (j, e) in tail.into_iter().enumerate() { if is_pinned(j) { back.push(e) } else { front.push(e) } }
+            self.scene.order.extend(front);
+            self.scene.order.extend(back);
         }
         cy - y
     }
 
-    /// Whether `h` or anything in its subtree would make a clip of its own.
-    /// (★ `h` too: a table with `overflow: hidden` clips its own cells, and
-    /// that clip, inside the region, is not the region's viewport — the
-    /// broker refused hi and ru Wikipedia's wide tables for it.)
-    fn subtree_clips(&self, h: Handle) -> bool {
-        let mut stack = vec![h];
-        while let Some(c) = stack.pop() {
-            if let Some(cs) = self.st(c) {
-                if kw(cs, "display") == "none" { continue }
-                if kw(cs, "overflow-x") != "visible" || kw(cs, "overflow-y") != "visible" { return true }
+    /// The nearest opaque background behind `h`: an ancestor's, else the
+    /// page's white.
+    fn background_behind(&self, h: Handle) -> u32 {
+        let mut cur = self.dom.get(h).and_then(|n| n.parent);
+        while let Some(p) = cur {
+            if let Some(cs) = self.st(p) {
+                if let V::Color(c) = cs.get("background-color") {
+                    let v = rgba(c, 0x000000ff);
+                    if v & 0xff == 0xff { return v }
+                }
             }
-            stack.extend(self.dom.element_children(c));
+            cur = self.dom.get(p).and_then(|n| n.parent);
         }
-        false
+        0xffffffff
     }
 
     /// An item's content size along the main axis (its max-content width in
@@ -2794,12 +2861,18 @@ impl<'a> Cx<'a> {
     /// `max-content`, or a replaced element's own size).
     fn atomic_min_outer_w(&mut self, h: Handle) -> Option<U> {
         let cs = self.st(h)?;
-        if !matches!(cs.get("width"), V::Kw(k) if *k != "max-content") { return None }
-        if self.replaced_size(h).is_some() { return None }
         let px = |p: &str| len(cs.get(p), 0).unwrap_or(0);
         let (ml, mr) = (px("margin-left"), px("margin-right"));
         let border = |side: &str| if kw(cs, &format!("border-{side}-style")) == "none" { 0 } else { px(&format!("border-{side}-width")) };
         let frame = px("padding-left") + px("padding-right") + border("left") + border("right");
+        // ★ A COMPRESSIBLE replaced box (CSS Sizing 3 §5.2.2: a percentage
+        // `width` or `max-width`, also inside calc()) contributes nothing to
+        // min-content — the same rule `intrinsic` applies to a block-level
+        // one. Its max-content is still its size (`atomic_outer_w`).
+        if self.replaced_size(h).is_some() {
+            return (pct_size(cs, "width") || pct_size(cs, "max-width")).then_some(frame + ml + mr);
+        }
+        if !matches!(cs.get("width"), V::Kw(k) if *k != "max-content") { return None }
         let mut bw = frame + self.intrinsic(h).0;
         if let Some(m) = len(cs.get("max-width"), 0) { bw = bw.min(m) }
         if let Some(m) = len(cs.get("min-width"), 0) { bw = bw.max(m) }
@@ -2827,8 +2900,17 @@ impl<'a> Cx<'a> {
             },
             v => len(v, cb_w).unwrap_or(0),
         };
-        if let Some(m) = len(cs.get("max-width"), cb_w) { bw = bw.min(m) }
-        if let Some(m) = len(cs.get("min-width"), cb_w) { bw = bw.max(m) }
+        // ★ With no width to resolve against (an intrinsic measure), a
+        // percentage limit is no limit — nor a calc() holding one. Wikipedia's
+        // thumbnail image, `max-width: calc(100% - 8px + 2px)`, was clamped
+        // against 0 and its column measured as the caption's longest word.
+        let limit = |p: &str| match cs.get(p) {
+            V::Pct(_) if cb_w <= 0 => None,
+            V::Calc(c) if cb_w <= 0 && calc_has_pct(c) => None,
+            v => len(v, cb_w),
+        };
+        if let Some(m) = limit("max-width") { bw = bw.min(m) }
+        if let Some(m) = limit("min-width") { bw = bw.max(m) }
         bw.max(frame) + ml + mr
     }
 
@@ -2911,8 +2993,7 @@ impl<'a> Cx<'a> {
         // El País ran 81 words off the page.
         if !anon {
             if let Some((w, _)) = self.replaced_size(h) {
-                let pct = |p: &str| matches!(s.get(p), V::Pct(_));
-                return (if pct("width") || pct("max-width") { 0 } else { w }, w);
+                return (if pct_size(s, "width") || pct_size(s, "max-width") { 0 } else { w }, w);
             }
         }
         // ★ A TABLE's intrinsic widths are its declared columns' (§3.13),
@@ -5132,6 +5213,24 @@ mod tests {
     }
 
     #[test]
+    fn an_inline_image_with_a_percentage_limit_is_compressible_but_keeps_its_max_content() {
+        // ★ CSS Sizing 3 §5.2.2: min-content 0 (El País), max-content its
+        // size — also when the limit is a calc() holding a percentage
+        // (Wikipedia's thumbnails). Clamped against "no width", both came
+        // out 0, or both its full width.
+        for limit in ["max-width: 100%", "max-width: calc((100% - 8px) + 2px)"] {
+            let src = format!(r#"<style>td {{ padding-left: 0px; padding-right: 0px }} img {{ width: 400px; {limit} }}</style>
+                <table><tr><td><a href="x"><img src="i.png" width="400" height="100"></a></td></tr></table>"#);
+            let fonts = FontSet::load().unwrap();
+            let (out, _) = premeasure_tables(&src, &fonts, &Env::default());
+            let decl = out.lines().find(|l| l.contains(".tc0")).expect("declared").to_string();
+            let px = |name: &str| decl.split(name).nth(1).and_then(|r| r.split("px").next()).and_then(|v| v.trim().parse::<f64>().ok()).unwrap();
+            assert!(px("min-width:") < 50.0, "{limit}: compressible, min {decl}");
+            assert!(px("max-width:") >= 400.0, "{limit}: but its max-content is its width: {decl}");
+        }
+    }
+
+    #[test]
     fn z_index_orders_painting() {
         // Tree order would paint red last; z-index puts it under both, and
         // the negative one under the in-flow content of the context.
@@ -5162,7 +5261,7 @@ mod tests {
                           report: Report::default(), links: vec![], unimplemented: BTreeMap::new(), marker: None,
                           baseline_probe: None, indent: None, iso_paths: vec![vec![]], iso_cur: 0, content_dy: 0, table_part: false, promoted: vec![], boxes: std::env::var_os("NSG_DUMP_BOXES").map(|_| vec![]), geo: None, inl_cur: 0,
                           viewport: (0, None), pos_cb: (0, 0, 0, None), subs: &Subresources::new(),
-                          placing_abs: false, pending_abs: vec![], deferred_abs: vec![], cb_open: false, canvas_src: None, abs_origin: None, flex_static: None, measured: HashMap::new(), contexts: vec![], hoists: vec![], diagnostics: vec![], vector_budget: crate::path::DOCUMENT_SEGMENT_SHARE, in_scroll: false, scroll_open: None, measured_tables: HashMap::new() };
+                          placing_abs: false, pending_abs: vec![], deferred_abs: vec![], cb_open: false, canvas_src: None, abs_origin: None, flex_static: None, measured: HashMap::new(), contexts: vec![], hoists: vec![], diagnostics: vec![], vector_budget: crate::path::DOCUMENT_SEGMENT_SHARE, in_scroll: false, scroll_open: None, measured_tables: HashMap::new(), scroll_table: None };
         cx.count_rows_outside(&held_out);
         // The non-initial value is counted once; the initial one is not.
         assert_eq!(cx.unimplemented.get("row text-align… (not implemented)"), Some(&1), "{:?}", cx.unimplemented);

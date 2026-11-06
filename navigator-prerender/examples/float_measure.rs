@@ -1,6 +1,6 @@
 //! float_measure <dir>… [--ext readable|any]: floats beside content on real
 //! documents (profile §7a C). One TSV line per document:
-//! `stem  compiled  alone  rows_cut  nodes_moved  fit_layouts  fit_ms  normalize_and_tables_ms`
+//! `stem  compiled  alone  rows_cut  nodes_moved  fit_layouts  fit_ms  normalize_and_tables_ms  too_wide`
 //! - `compiled`: floats with content after them, compiled to a flex row;
 //! - `alone`: floats with nothing after them (dropped, as before);
 //! - `rows_cut`, `nodes_moved`, `fit_layouts`, `fit_ms`: `fit_floats`, which
@@ -27,8 +27,8 @@ fn main() {
             let (_, fit) = navigator_normalize::fit_floats(&doc, &fonts, &env);
             let fit_ms = t1.elapsed().as_secs_f64() * 1e3;
             let n = |k: &str| report.dropped.get(k).copied().unwrap_or(0);
-            println!("{stem}\t{}\t{}\t{}\t{}\t{}\t{fit_ms:.1}\t{:.1}", n("float beside content compiled to a flex row"),
-                     n("property `float` (no content before the next float or clear; dropped)"), fit.cut, fit.moved, fit.layouts, (t1 - t0).as_secs_f64() * 1e3); // normalize + table pre-measure
+            println!("{stem}\t{}\t{}\t{}\t{}\t{}\t{fit_ms:.1}\t{:.1}\t{}", n("float beside content compiled to a flex row"),
+                     n("property `float` (no content before the next float or clear; dropped)"), fit.cut, fit.moved, fit.layouts, (t1 - t0).as_secs_f64() * 1e3, fit.narrow); // normalize + table pre-measure
         }
     }
 }

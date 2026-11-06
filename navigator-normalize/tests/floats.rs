@@ -133,3 +133,34 @@ fn in_a_right_to_left_page_text_beside_a_left_float_stays_in_its_column() {
         assert!(r.x >= bx + bw, "a word beside the box is in the column: {:?} at x {} (box ends {})", r.text, r.x / 64, (bx + bw) / 64);
     }
 }
+
+#[test]
+fn a_thumbnail_is_as_wide_as_its_image_and_its_caption_wraps() {
+    // ★ Wikipedia's thumbnail: `figure { display: table; float: right }`
+    // around an image and a `figcaption { display: table-caption }`. CSS
+    // makes it as wide as the image, the caption wrapped to that; as a
+    // block it took the caption's one-line width and had nothing beside it.
+    let mut body = String::from(r#"<figure class="th"><a href="x"><img src="t.png" width="220" height="150"></a>
+        <figcaption class="cap">A long caption describing the picture in many words, longer than the image is wide</figcaption></figure>"#);
+    for i in 0..8 { body.push_str(&format!("<p>Para{i} {WORDS}</p>")) }
+    let html = format!(r#"<html><head><style>body {{ margin: 0px }} p {{ margin: 0px 0px 8px }}
+        .th {{ display: table; float: right; margin: 0px; background-color: #00ff00 }} .cap {{ display: table-caption; caption-side: bottom }}
+        img {{ display: block; max-width: calc((100% - 8px) + 2px) }}</style></head><body>{body}</body></html>"#);
+    let fonts = FontSet::load().unwrap();
+    let mut inputs = Inputs::default();
+    inputs.images.insert("t.png".into(), (220, 150).into());
+    let (doc, report) = normalize_and_measure(&html, &inputs, &fonts, &Env::default());
+    assert!(report.dropped.keys().any(|k| k.starts_with("table with a caption and no rows")), "{:?}", report.dropped);
+    let o = render_html(&doc, &fonts, &Env::default());
+    assert!(o.diagnostics.is_empty(), "{:?}", o.diagnostics);
+    let s = o.scene;
+    let (fx, fy, fw, fh) = rect(&s, 0x00ff00ff);
+    // ★ …with Wikipedia's `max-width: calc(100% - …)` on the image, which
+    // measured against no width once made the figure its caption's longest word.
+    assert!(fw <= 230 * 64 && fw >= 220 * 64, "the figure is as wide as its image: {} px", fw / 64);
+    let cap: Vec<_> = s.runs.iter().filter(|r| r.text == "caption" || r.text == "picture" || r.text == "wide").collect();
+    assert!(cap.iter().map(|r| r.y).collect::<std::collections::BTreeSet<_>>().len() >= 2, "the caption wraps");
+    assert!(cap.iter().all(|r| r.x >= fx && r.x < fx + fw), "inside the figure");
+    let (x0, y0) = line_of(&s, "Para0");
+    assert!(y0 < fy + fh && x0 < fx, "Para0 is beside the thumbnail");
+}

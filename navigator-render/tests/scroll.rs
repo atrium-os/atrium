@@ -93,14 +93,29 @@ fn a_table_that_fits_writes_no_scroll_and_is_unchanged() {
 }
 
 #[test]
-fn a_clip_inside_keeps_the_table_overflowing_as_before() {
-    let (scene, _) = render(&page("ltr", ".g { overflow-x: hidden }"));
-    assert!(scene.scrolls.is_empty(), "an inner clip could not move with the content");
-    // ★ The table's OWN clip counts too (hi and ru Wikipedia: the broker
-    // refused the region, because the cells carried the table's clip).
-    let (scene, _) = render(&page("ltr", "table { overflow-x: hidden }"));
-    assert!(scene.scrolls.is_empty());
-    scroll::validate(&scene).unwrap();
+fn a_clip_inside_scrolls_with_the_content_and_stays_inside_the_viewport() {
+    // ★ A cell that clips (`overflow: hidden`) and a table that clips
+    // itself: their clips are INNER clips of the region, moved with it and
+    // intersected with the viewport when painted. (They used to keep the
+    // table overflowing: 18 of 169 wide tables at 300%.)
+    for extra in [".g { overflow-x: hidden }", "table { overflow-x: hidden }"] {
+        let (mut scene, fonts) = render(&page("ltr", extra));
+        assert_eq!(scene.scrolls.len(), 1, "{extra}: a region");
+        assert!(!scene.scrolls[0].inner.is_empty(), "{extra}: with an inner clip");
+        scroll::validate(&scene).unwrap_or_else(|e| panic!("{extra}: {e}"));
+        scene.width = 1200 * 64;
+        let none = std::collections::BTreeMap::new();
+        let inside = |xs: &[usize]| xs.iter().all(|&x| (50..350).contains(&x));
+        // Green (the clipping cell) scrolls into view, whole, and stays inside.
+        let mut seen_green = false;
+        for step in 0..12 {
+            let cv = raster::paint(&scene, &fonts, &none);
+            for c in [RED, GREEN, BLUE] { assert!(inside(&columns(&cv, c)), "{extra}, step {step}: {c:08x} outside the box") }
+            seen_green |= !columns(&cv, GREEN).is_empty();
+            scroll::offset_scene(&mut scene, 0, -64 * 64, 0);
+        }
+        assert!(seen_green, "{extra}: the clipped cell scrolled into view");
+    }
 }
 
 #[test]
@@ -124,6 +139,10 @@ fn the_broker_refuses_a_forged_region() {
     let mut bad = clone(&scene);
     bad.scrolls[0].clip = 9999;
     assert!(scroll::validate(&bad).unwrap_err().contains("no clip"));
+    // An inner clip that is the viewport itself.
+    let mut bad = clone(&scene);
+    bad.scrolls[0].inner = vec![s.clip];
+    assert!(scroll::validate(&bad).unwrap_err().contains("not a clip of its own"));
     let mut bad = clone(&scene);
     bad.scrolls[0].content.2 = -1;
     assert!(scroll::validate(&bad).unwrap_err().contains("negative"));
@@ -135,4 +154,35 @@ fn clone(s: &Scene) -> Scene {
     Scene { width: s.width, height: s.height, rects: s.rects.clone(), runs: s.runs.clone(), clips: s.clips.clone(), xforms: s.xforms.clone(),
             xform_parents: s.xform_parents.clone(), rect_attrs: s.rect_attrs.clone(), run_attrs: s.run_attrs.clone(), scrolls: s.scrolls.clone(),
             order: s.order.clone(), ..Default::default() }
+}
+
+#[test]
+fn a_narrow_first_column_stays_in_view_while_the_rest_scrolls() {
+    let word = |c: char| std::iter::repeat_n(c, 40).collect::<String>();
+    let doc = format!(r#"<html><head><style>body {{ margin-left: 0px; margin-top: 0px }} .box {{ width: 300px; margin-left: 50px }}
+        td {{ padding-left: 0px; padding-right: 0px }} .k {{ background-color: #00ff00 }}
+        .r {{ background-color: #ff0000 }} .b {{ background-color: #0000ff }}</style></head>
+        <body><div class="box"><table><tr><td class="k">Key</td><td class="r">{}</td><td class="b">{}</td></tr></table></div></body></html>"#, word('a'), word('c'));
+    let (mut scene, fonts) = render(&doc);
+    assert_eq!(scene.scrolls.len(), 1);
+    scroll::validate(&scene).expect("pinned cells keep the viewport clip");
+    scene.width = 1200 * 64;
+    let none = std::collections::BTreeMap::new();
+    let cv = raster::paint(&scene, &fonts, &none);
+    let k0 = columns(&cv, GREEN);
+    assert!(!k0.is_empty() && *k0.first().unwrap() >= 50, "the key column, at the box's start: {k0:?}");
+    assert!(columns(&cv, BLUE).is_empty(), "blue is past the box at offset 0");
+    scroll::offset_scene(&mut scene, 0, -1 << 40, 0);
+    let cv = raster::paint(&scene, &fonts, &none);
+    assert_eq!(columns(&cv, GREEN), k0, "the key column has not moved");
+    let b = columns(&cv, BLUE);
+    assert!(!b.is_empty(), "blue scrolled in");
+    assert!(b.iter().all(|x| *x > *k0.last().unwrap()), "and slides UNDER the key column, never over it: key {k0:?} blue {b:?}");
+    // ★ A table that clips itself AND pins its first column (ru Wikipedia):
+    // the pinned cells are clipped to the viewport, not to the table's own
+    // clip, which moves — or the broker refuses the region.
+    let (scene, _) = render(&doc.replace(".k {{", "table { overflow-x: hidden } .k {{").replace("</style>", " table { overflow-x: hidden }</style>"));
+    assert_eq!(scene.scrolls.len(), 1);
+    assert!(!scene.scrolls[0].inner.is_empty(), "the table's own clip is an inner clip");
+    scroll::validate(&scene).expect("pinned cells of a self-clipping table");
 }

@@ -5,13 +5,15 @@
 //! `hidden`. A scroll region is declared, not drawn:
 //!
 //! ```text
-//! scroll c<viewport> x<i>[,<j>…] <content x> <content y> <content w> <content h>
+//! scroll c<viewport> x<i>[,<j>…] [k<i>,…] <content x> <content y> <content w> <content h>
 //! ```
 //!
 //! - `c<viewport>` is the region's clip: what the reader sees of it.
 //! - `x<i>,…` are the transforms the region MOVES: its own translation (the
 //!   first, identity at offset 0) and every transform nested in it (they are
 //!   written composed, so each must be moved too).
+//! - `k<i>,…` (only when there are any) are the clips made INSIDE the region:
+//!   they move with it, and are intersected with the viewport when painted.
 //! - the content box, in page units at offset 0: how far the region may move.
 //!
 //! The worker lays the content out once, at offset 0, and never learns where
@@ -32,6 +34,12 @@ pub struct Scroll {
     pub xform: u32,
     /// The content box at offset 0: x, y, w, h in 1/64 px.
     pub content: (U, U, U, U),
+    /// ★ Clips made inside the region (the table's own `overflow`, a
+    /// cell's): they move WITH the content, and a node clipped by one is
+    /// painted inside it AND the viewport — the compositor intersects them.
+    /// Stored at offset 0, NOT already intersected with the viewport, or a
+    /// part scrolled into view would stay cut away.
+    pub inner: Vec<u32>,
 }
 
 /// At most this many scroll regions in one scene.
@@ -59,6 +67,17 @@ pub fn range(scene: &Scene, s: &Scroll) -> (U, U, U, U) {
     (lo(vx, vw, cx, cw), hi(vx, cx), lo(vy, vh, cy, ch), hi(vy, cy))
 }
 
+/// The clip a node is painted with: its own, intersected with the viewport
+/// of the region whose inner clip it is (see `Scroll::inner`).
+pub fn effective_clip(scene: &Scene, clip: u32) -> Option<(U, U, U, U)> {
+    let c = *scene.clips.get(clip as usize)?;
+    let Some(s) = scene.scrolls.iter().find(|s| s.inner.contains(&clip)) else { return Some(c) };
+    let v = scene.clips[s.clip as usize];
+    let (x0, y0) = (c.0.max(v.0), c.1.max(v.1));
+    let (x1, y1) = ((c.0 + c.2).min(v.0 + v.2), (c.1 + c.3).min(v.1 + v.3));
+    Some((x0, y0, (x1 - x0).max(0), (y1 - y0).max(0)))
+}
+
 /// ★ The compositor's half, as a model: move region `i` by `(dx, dy)`,
 /// clamped to its range — every transform it moves, and the own clip of
 /// every path under those transforms. Returns the offset applied.
@@ -71,6 +90,9 @@ pub fn offset_scene(scene: &mut Scene, i: usize, dx: U, dy: U) -> (U, U) {
         let m = &mut scene.xforms[x as usize];
         m[4] += dx;
         m[5] += dy;
+    }
+    for &c in &s.inner {
+        if let Some(k) = scene.clips.get_mut(c as usize) { k.0 += dx; k.1 += dy }
     }
     for (p, a) in scene.paths.iter_mut().zip(&scene.path_attrs) {
         if a.2.is_some_and(|x| moved.contains(&x)) {
@@ -89,7 +111,11 @@ pub fn offset_scene(scene: &mut Scene, i: usize, dx: U, dy: U) -> (U, U) {
 /// - a content box with a negative size (a small one is fine: it bounds the
 ///   offset, and a region whose content fits just cannot move);
 /// - ★ a node moved by a region that is NOT clipped to that region's
-///   viewport: moving it would paint it over the rest of the page.
+///   viewport or one of its inner clips: moving it would paint it over the
+///   rest of the page; and a node clipped by an inner clip that the region
+///   does not move;
+/// - an inner clip that is the viewport, names nothing, or is another
+///   region's.
 pub fn validate(scene: &Scene) -> Result<(), String> {
     if scene.scrolls.len() > MAX_SCROLLS { return Err(format!("{} scroll regions, over {MAX_SCROLLS}", scene.scrolls.len())) }
     let mut owner: Vec<Option<usize>> = vec![None; scene.xforms.len()];
@@ -107,15 +133,25 @@ pub fn validate(scene: &Scene) -> Result<(), String> {
             if let Some(o) = owner[x as usize] { return Err(format!("scroll {i}: x{x} is already moved by scroll {o}")) }
             owner[x as usize] = Some(i);
         }
+        for &k in &s.inner {
+            if k as usize >= scene.clips.len() || k == s.clip { return Err(format!("scroll {i}: inner clip c{k} is not a clip of its own")) }
+            if scene.scrolls.iter().enumerate().any(|(j, o)| j != i && (o.inner.contains(&k) || o.clip == k)) { return Err(format!("scroll {i}: inner clip c{k} belongs to another region")) }
+        }
     }
-    // Every node under a moved transform is clipped to that region's viewport.
-    let regions: Vec<(Vec<u32>, u32)> = scene.scrolls.iter().map(|s| (moved_xforms(scene, s), s.clip)).collect();
+    // Every node under a moved transform is clipped to that region's
+    // viewport, or to one of its inner clips (which the viewport bounds);
+    // and a node clipped by an inner clip is one the region moves.
+    let regions: Vec<(Vec<u32>, u32, &Vec<u32>)> = scene.scrolls.iter().map(|s| (moved_xforms(scene, s), s.clip, &s.inner)).collect();
     let check = |kind: &str, attrs: &[crate::Attrs]| -> Result<(), String> {
         for (n, a) in attrs.iter().enumerate() {
-            let Some(x) = a.2 else { continue };
-            for (moved, clip) in &regions {
-                if moved.contains(&x) && a.0 != Some(*clip) {
+            for (moved, clip, inner) in &regions {
+                let is_moved = a.2.is_some_and(|x| moved.contains(&x));
+                let in_inner = a.0.is_some_and(|c| inner.contains(&c));
+                if is_moved && a.0 != Some(*clip) && !in_inner {
                     return Err(format!("{kind} {n} is moved by a scroll region but not clipped to its viewport c{clip}"));
+                }
+                if in_inner && !is_moved {
+                    return Err(format!("{kind} {n} is clipped by an inner clip of a region that does not move it"));
                 }
             }
         }

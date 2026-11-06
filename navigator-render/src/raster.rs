@@ -315,8 +315,8 @@ pub fn paint(scene: &Scene, fonts: &FontSet, assets: &std::collections::BTreeMap
                 layer.clip = None;
                 paint_one(&mut layer, scene, fonts, &mut ctx, kind, i, assets);
                 let dst: &mut Canvas = match stack.last_mut() { Some((_, c)) => c, None => &mut cv };
-                let clip = clip_of(kind, i).and_then(|c| scene.clips.get(c as usize))
-                    .map(|&(x, y, w, h)| (x / PX, y / PX, (x + w) / PX, (y + h) / PX));
+                let clip = clip_of(kind, i).and_then(|c| crate::scroll::effective_clip(scene, c))
+                    .map(|(x, y, w, h)| (x / PX, y / PX, (x + w) / PX, (y + h) / PX));
                 for py in 0..dst.h as i64 {
                     for px in 0..dst.w as i64 {
                         if let Some((x0, y0, x1, y1)) = clip { if px < x0 || py < y0 || px >= x1 || py >= y1 { continue } }
@@ -335,7 +335,7 @@ pub fn paint(scene: &Scene, fonts: &FontSet, assets: &std::collections::BTreeMap
             }
         }
         let cvr: &mut Canvas = match stack.last_mut() { Some((_, c)) => c, None => &mut cv };
-        cvr.clip = clip_of(kind, i).and_then(|c| scene.clips.get(c as usize)).map(|&(x, y, w, h)| (x / PX, y / PX, (x + w) / PX, (y + h) / PX));
+        cvr.clip = clip_of(kind, i).and_then(|c| crate::scroll::effective_clip(scene, c)).map(|(x, y, w, h)| (x / PX, y / PX, (x + w) / PX, (y + h) / PX));
         paint_one(cvr, scene, fonts, &mut ctx, kind, i, assets);
     }
     // Any group still open at the end composites now.

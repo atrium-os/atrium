@@ -26,6 +26,7 @@ fn main() {
             let h = |s: &str| blake3::hash(s.as_bytes()).to_hex().to_string();
             if let Some(d) = std::env::var_os("NSG_OUT") {
                 let _ = std::fs::write(std::path::Path::new(&d).join(format!("{stem}.nsg")), navigator_render::nsg::write(&o.scene, &fonts));
+                let _ = std::fs::write(std::path::Path::new(&d).join(format!("{stem}.html")), &normalized);
             }
             println!("{stem}\t{}\t{}\t{}", h(&normalized), h(&format!("{report:?}")), h(&navigator_render::nsg::write(&o.scene, &fonts)));
         }

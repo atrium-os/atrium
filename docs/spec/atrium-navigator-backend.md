@@ -1420,17 +1420,34 @@ size: 1,952 layouts.
   - a negative content size;
   - ★ any node a region moves that is not clipped to that region's viewport. Moved,
     it would paint over the rest of the page.
-- *Not scrollable, left overflowing as before, and counted:*
-  - A table that is itself a clip (`overflow` other than `visible`), or that holds
-    one. NSG clips are page-space and flat, so an inner clip could not move with the
-    content.
-  - The first corpus run found this the hard way. hi and ru Wikipedia's tables
-    clip themselves, and the broker refused those regions; the check is what caught
-    it.
-  - A region does not nest: a table inside one is moved by it.
-- *Not built:*
-  - Keeping the first column in view (optional in the request).
-  - Pinch (item 3), whose settle is a page-zoom layout.
+- *Clips inside a region (2026-11-06).* A table that clips itself, or holds a clip,
+  scrolls too.
+  - A clip made inside a region is intersected with the clip outside the region, not
+    with its viewport. It is listed in the `scroll` line as `k<i>,…`, moves with the
+    content, and is intersected with the viewport when painted
+    (`scroll::effective_clip`).
+  - Before this, such tables stayed overflowing: 18 of 169 at 300%. The broker
+    refuses an inner clip that is the viewport or another region's, and any node
+    clipped by an inner clip that the region does not move.
+  - The first corpus run with plain regions found the case the hard way: hi and ru
+    Wikipedia's tables clip themselves, and the broker refused those regions.
+- *The first column stays in view (2026-11-06).*
+  - In a region, the first column's cells keep the transform outside the region, so
+    the compositor does not move them. They are clipped to the viewport and painted
+    after the other columns, over the background behind them, so the rest slides
+    under them.
+  - A first column wider than 40% of the region is not pinned.
+  - A pinned cell inside a self-clipping table is clipped to the viewport, not to the
+    table's own clip, which moves. ru Wikipedia showed this; the broker refused it
+    otherwise.
+- A region does not nest: a table inside one is moved by it.
+- *Not built:* pinch (item 3), whose settle is a page-zoom layout.
+- *Measured with both (2026-11-06, the same 1,952 corpus layouts).* No wide table
+  is left overflowing at any level: 47 regions at 100%, 157 at 300% page zoom and 269
+  at 300% text size. The broker's check passes on every layout.
+  - On the identity set, the documents that changed are those with regions, compiled
+    captions, or images with percentage limits. The rest are byte-identical, and two
+    runs gave identical output.
 
 *Measured (2026-11-06, the same 1,952 corpus layouts and 56 big-document ones).*
 - Before this change, every table here overflowed its containing block. After it,

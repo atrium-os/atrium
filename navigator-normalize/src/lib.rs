@@ -594,6 +594,9 @@ pub fn normalize(html: &str, inputs: &Inputs) -> (String, Report) {
     // compiled to the keywords the grammar admits (needs the directions).
     alignment_pass(&mut resolved, &dom, &els, &rtl, inputs, &mut report);
 
+    // ★ TABLE CAPTIONS (see `caption_pass`).
+    caption_pass(&mut dom, &mut resolved, &mut report);
+
     // ★ FLOAT ROWS. The profile has no floats, and dropping `float` left
     // GitHub's three repository-action buttons stacked one per line: they are
     // `<li float:left>` inside a `<ul>`. When EVERY in-flow element child of a
@@ -1091,6 +1094,90 @@ fn area_rect(rows: &[Vec<String>], name: &str) -> Option<(usize, usize, usize, u
 
 fn uses_var(v: &[Token]) -> bool {
     v.iter().any(|t| matches!(&t.tok, Tok::Function(f) if f.eq_ignore_ascii_case("var")))
+}
+
+/// The attribute marking a table caption compiled to a cell: the table
+/// pre-measure counts only its min-content (CSS 2.1 §17.4: a caption does
+/// not make its table wider than the caption's longest word needs).
+pub const CAPTION_CELL: &str = "atrium-caption";
+
+/// ★ TABLE CAPTIONS. The profile has no `table-caption`; it used to become a
+/// plain block. In a table that HAS rows that is close enough (the caption
+/// sits above or below it, as wide as the container). But a `display:
+/// table` with NO rows — Wikipedia's thumbnail `figure`: an image and a
+/// `figcaption` — is a one-cell table around the image, which CSS makes as
+/// wide as the image, with the caption wrapped to that width. As a block,
+/// the figure took the caption's one-line width: a 684 px thumbnail.
+///
+/// Compiled: the table's other content goes into one explicit row and cell,
+/// and each caption becomes a cell in a row of its own, in document order
+/// (Wikipedia's `caption-side: bottom` captions come last), marked
+/// `CAPTION_CELL` so the table pre-measure counts only its min-content.
+fn caption_pass(dom: &mut Dom, resolved: &mut collapse::Resolved, report: &mut Report) {
+    let pri: Priority = (false, usize::MAX, (0, 1, 0), usize::MAX - 1);
+    let base = |resolved: &collapse::Resolved, h: Handle, p: &str| resolved.get(&(h, String::new(), String::new())).and_then(|pr| pr.get(p)).map(|(_, v)| v.clone());
+    let captions: Vec<Handle> = resolved.iter()
+        .filter(|((_, st, me), pr)| st.is_empty() && me.is_empty() && pr.get("display").is_some_and(|(_, v)| v == "table-caption"))
+        .map(|((h, _, _), _)| *h).collect();
+    let mut tables: Vec<Handle> = captions.iter().filter_map(|c| dom.get(*c).and_then(|n| n.parent)).collect();
+    tables.sort_unstable(); tables.dedup();
+    let mut compiled = 0usize;
+    for t in tables {
+        let disp = base(resolved, t, "display").or_else(|| (dom.tag(t) == Some("table")).then(|| "table".to_string()));
+        if disp.as_deref() != Some("table") { continue }
+        let kids = dom.children_of(t);
+        let has_rows = kids.iter().any(|k| {
+            let d = base(resolved, *k, "display").or_else(|| dom.tag(*k).map(|tg| match tg { "tr" => "table-row", "td" | "th" => "table-cell", "thead" | "tbody" | "tfoot" => "table-row-group", _ => "" }.to_string()));
+            matches!(d.as_deref(), Some("table-row" | "table-cell" | "table-row-group"))
+        });
+        if has_rows { continue }
+        let is_caption = |h: Handle| captions.contains(&h);
+        let set = |resolved: &mut collapse::Resolved, h: Handle, props: &[(&str, &str)]| {
+            let slot = resolved.entry((h, String::new(), String::new())).or_default();
+            for (k, v) in props { slot.insert(k.to_string(), (pri, v.to_string())); }
+        };
+        let (mut content_row, mut content_cell): (Option<Handle>, Option<Handle>) = (None, None);
+        for k in kids {
+            detach(dom, k);
+            if is_caption(k) {
+                let row = dom.create(Kind::Element("div".into()));
+                set(resolved, row, &[("display", "table-row")]);
+                dom.append(t, row);
+                dom.append(row, k);
+                set(resolved, k, &[("display", "table-cell")]);
+                dom.set_attr(k, CAPTION_CELL, "");
+            } else {
+                let cell = match content_cell {
+                    Some(c) => c,
+                    None => {
+                        let row = dom.create(Kind::Element("div".into()));
+                        let cell = dom.create(Kind::Element("div".into()));
+                        set(resolved, row, &[("display", "table-row")]);
+                        set(resolved, cell, &[("display", "table-cell"), ("padding-top", "0px"), ("padding-right", "0px"), ("padding-bottom", "0px"), ("padding-left", "0px")]);
+                        dom.append(t, row);
+                        dom.append(row, cell);
+                        content_row = Some(row);
+                        content_cell = Some(cell);
+                        cell
+                    }
+                };
+                dom.append(cell, k);
+            }
+        }
+        let _ = content_row;
+        compiled += 1;
+    }
+    // Every other caption is a block, as before.
+    for ((_, st, _), pr) in resolved.iter_mut() {
+        if !st.is_empty() { continue }
+        if let Some((_, v)) = pr.get_mut("display") { if v == "table-caption" { *v = "block".into() } }
+    }
+    for c in &captions {
+        if dom.attr(*c, CAPTION_CELL).is_some() {
+            resolved.entry((*c, String::new(), String::new())).or_default().insert("display".into(), (pri, "table-cell".into()));
+        }
+    }
+    if compiled > 0 { report.drop_n("table with a caption and no rows: content and caption compiled to cells", compiled) }
 }
 
 /// The attributes marking a compiled float's row and its flow column, for
@@ -1614,6 +1701,8 @@ fn to_longhands_inner(name: &str, value: &[Token], inputs: &Inputs, report: &mut
         // out literally (see `splice_contents`), so it is kept here as a
         // marker rather than dropped. 1510 elements in a 29-document corpus.
         if p == "display" && v == "contents" { return Some((p, v)) }
+        // A table CAPTION is decided on the DOM (see the caption pass).
+        if p == "display" && v.eq_ignore_ascii_case("table-caption") { return Some((p, "table-caption".to_string())) }
         // ★ NAMED GRID AREAS. The profile places items by NUMBER, and modern
         // layouts name them: `grid-template-areas` on the container plus
         // `grid-area: toolbar` on each child. The mapping from a name to a
