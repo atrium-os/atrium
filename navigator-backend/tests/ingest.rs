@@ -168,3 +168,23 @@ fn a_v3_recording_is_read_as_v2() {
     let tight = Limits { max_total_bytes: json.len() - 1, ..Limits::default() };
     assert!(matches!(ingest(json.as_bytes(), &tight), Err(Reject::TooLarge { .. })));
 }
+
+/// ★ External SVG sprite files travel in the recording for the NORMALIZER
+/// (`sprites`, 2026-11-06). The backend replays transitions and needs none
+/// of them: a recording carrying them is read as before, and the field
+/// counts toward the size limit like the other normalizer inputs.
+#[test]
+fn a_recording_with_sprites_is_read_and_the_sprites_are_charged() {
+    let json = r##"{"format":"atrium-navigator-recording/3","url":"https://a.test/","tier":2,
+      "tier_reason":"","measurements":{},
+      "stylesheets":[],
+      "sprites":[{"href":"/img/sprite.svg","text":"<svg xmlns=\"http://www.w3.org/2000/svg\"><symbol id=\"i\"><rect width=\"8\" height=\"8\"/></symbol></svg>"}],
+      "images":[],
+      "transitions":[{"trigger":"#t","event":"click","anchored":true,
+        "effects":[{"kind":"attribute","target":"#m","name":"class","from":"a","to":"b"}]}],
+      "document":"<html><body><button id=\"t\">t</button><nav id=\"m\" class=\"a\"></nav></body></html>"}"##;
+    let r = ingest(json.as_bytes(), &Limits::default()).expect("a recording with sprites is accepted");
+    assert_eq!(r.transitions.len(), 1);
+    let tight = Limits { max_total_bytes: json.len() - 1, ..Limits::default() };
+    assert!(matches!(ingest(json.as_bytes(), &tight), Err(Reject::TooLarge { .. })));
+}

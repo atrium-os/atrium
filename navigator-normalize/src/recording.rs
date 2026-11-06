@@ -38,6 +38,13 @@ pub fn parse(json: &str) -> Result<Recording, String> {
         r.inputs.stylesheets.insert(href.clone(), text);
         if !media.is_empty() { r.inputs.stylesheet_media.insert(href, media); }
     }
+    // External SVG sprite files (`Inputs::sprites`), bounded as the
+    // converter bounds them; absent in a recording that needs none.
+    for obj in objects_in_array(json, "\"sprites\"") {
+        let (Some(href), Some(text)) = (string_field(&obj, "\"href\""), string_field(&obj, "\"text\"")) else { continue };
+        if r.inputs.sprites.len() >= crate::MAX_SPRITE_FILES || text.len() > crate::MAX_SPRITE_BYTES { continue }
+        r.inputs.sprites.insert(href, text);
+    }
     for obj in objects_in_array(json, "\"images\"") {
         let Some(src) = string_field(&obj, "\"src\"") else { continue };
         // Either dimension may be `null`; the ratio is `W/H` or `none`, and

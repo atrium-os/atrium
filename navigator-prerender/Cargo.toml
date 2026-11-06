@@ -35,6 +35,11 @@ navigator-normalize = { path = "../navigator-normalize" }
 navigator-render = { path = "../navigator-render" }
 navigator-style = { path = "../navigator-style" }
 
+[dev-dependencies]
+# The worker's SVG profile, for `examples/sprite_measure`: whether an icon
+# is one the worker draws.
+navigator-svg = { path = "../navigator-svg" }
+
 # navigator-fonts vendors a one-line fix to pathfinder_simd; a dependent
 # crate must repeat the patch, because [patch] only applies at the build root.
 [patch.crates-io]

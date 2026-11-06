@@ -20,6 +20,11 @@ png = { version = "0.17", optional = true }
 # the review-only rasterizer. Never in the worker's build.
 wpt = ["navigator-render/raster", "dep:png"]
 
+[dev-dependencies]
+# The worker's SVG profile and vector conversion, to check that a sprite
+# compiled in by `svg_inline` is one the worker draws.
+navigator-svg = { path = "../navigator-svg" }
+
 # navigator-fonts vendors a one-line fix to pathfinder_simd; a dependent
 # crate must repeat the patch, because [patch] only applies at the build root.
 [patch.crates-io]

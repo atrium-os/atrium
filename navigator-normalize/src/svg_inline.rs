@@ -19,8 +19,9 @@
 //!
 //! Both call it on the same recording (its document and its stylesheets),
 //! so the addresses agree. Drawing is the worker's SVG path and its strict
-//! profile; an icon the profile refuses (an external sprite file, text, a
-//! filter) keeps its box and draws nothing, and is counted.
+//! profile; an icon the profile refuses (an external sprite file the
+//! recording does not carry, text, a filter) keeps its box and draws
+//! nothing, and is counted.
 //!
 //! What is resolved, deliberately narrow: rules with no `@media` condition
 //! and no dynamic state, and the `style=` attribute, at the normalizer's
@@ -138,12 +139,94 @@ pub(crate) fn standalone_in(dom: &Dom, outers: &[Handle], inputs: &Inputs) -> Ve
         won.get(&(h, *p)).map(|(_, v)| v.clone()).filter(|v| !v.eq_ignore_ascii_case("inherit") && !v.is_empty())
             .or_else(|| (dom.is_foreign(h)).then(|| dom.attr(h, p).map(str::to_string)).flatten())
     };
-    outers.iter().map(|&o| serialize(dom, o, &own)).collect()
+    outers.iter().map(|&o| serialize(dom, o, &own, &inputs.sprites)).collect()
 }
 
 fn esc(s: &str) -> String { s.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;").replace('"', "&quot;") }
 
-fn serialize(dom: &Dom, outer: Handle, own: &dyn Fn(Handle, &str) -> Option<String>) -> String {
+/// The local id an external `file#id` reference is written to: a pure
+/// function of both, so the converter and the normalizer write the same
+/// bytes, and two files' `#icon` never collide.
+fn sprite_id(file: &str, id: &str) -> String {
+    let h = blake3::hash(file.as_bytes()).to_hex();
+    format!("atrium-sprite-{}-{id}", &h[..8])
+}
+
+/// `file#id` when `v` names a symbol in another file: `(file, id)`.
+fn external_ref(v: &str) -> Option<(&str, &str)> {
+    let (file, id) = v.split_once('#')?;
+    (!file.is_empty() && !id.is_empty()).then_some((file, id))
+}
+
+/// Every `#id` an element's attributes reference: `href`, `xlink:href`, and
+/// `url(#id)` in any value.
+fn local_refs(dom: &Dom, h: Handle) -> Vec<String> {
+    let mut out = vec![];
+    let Some(n) = dom.get(h) else { return out };
+    for (k, v) in &n.attrs {
+        if (k == "href" || k == "xlink:href") && v.starts_with('#') { out.push(v[1..].to_string()) }
+        let mut rest = v.as_str();
+        while let Some(i) = rest.find("url(#") {
+            let tail = &rest[i + 5..];
+            let end = tail.find(')').unwrap_or(tail.len());
+            out.push(tail[..end].trim_matches(['"', '\'', ' ']).to_string());
+            rest = &tail[end..];
+        }
+    }
+    out
+}
+
+/// The `<defs>` content an external `(file, id)` needs, copied from the
+/// sprite file: the element and what it references inside the file,
+/// transitively, ids renamed by `sprite_id` and their references with them.
+/// `None` when the file is not carried or has no such element.
+fn sprite_defs(sprites: &BTreeMap<String, String>, parsed: &mut HashMap<String, Option<Dom>>, file: &str, id: &str,
+               done: &mut HashSet<String>, color: &str, out: &mut String) -> bool {
+    let entry = parsed.entry(file.to_string()).or_insert_with(|| sprites.get(file).map(|t| navigator_dom::parse(t)));
+    let Some(sdom) = entry.as_mut() else { return false };
+    if sdom.by_id(id).is_none() { return false }
+    let mut want = vec![id.to_string()];
+    while let Some(i) = want.pop() {
+        let key = sprite_id(file, &i);
+        if done.contains(&key) || done.len() >= MAX_COPIED { continue }
+        let Some(h) = sdom.by_id(&i) else { continue };
+        done.insert(key);
+        // Rename the copied subtree's ids and references, in the parsed
+        // file (each file's copy is private to this document's walk).
+        let mut st = vec![h];
+        let mut nodes = vec![];
+        while let Some(x) = st.pop() { nodes.push(x); st.extend(sdom.children_of(x)); }
+        for &x in &nodes {
+            for r in local_refs(sdom, x) { want.push(r) }
+            let attrs: Vec<(String, String)> = sdom.get(x).map(|n| n.attrs.clone()).unwrap_or_default();
+            for (k, v) in attrs {
+                let nv = if k == "id" { if v.starts_with("atrium-sprite-") { v.clone() } else { sprite_id(file, &v) } }
+                    else if (k == "href" || k == "xlink:href") && v.starts_with('#') && !v.starts_with("#atrium-sprite-") { format!("#{}", sprite_id(file, &v[1..])) }
+                    else if v.contains("url(#") && !v.contains("url(#atrium-sprite-") { rename_urls(&v, file) }
+                    else { continue };
+                sdom.set_attr(x, &k, &nv);
+            }
+        }
+        node(sdom, h, &|_, _| None, color, out);
+    }
+    true
+}
+
+fn rename_urls(v: &str, file: &str) -> String {
+    let mut out = String::new();
+    let mut rest = v;
+    while let Some(i) = rest.find("url(#") {
+        out.push_str(&rest[..i + 5]);
+        let tail = &rest[i + 5..];
+        let end = tail.find(')').unwrap_or(tail.len());
+        out.push_str(&sprite_id(file, tail[..end].trim_matches(['"', '\'', ' '])));
+        rest = &tail[end..];
+    }
+    out.push_str(rest);
+    out
+}
+
+fn serialize(dom: &Dom, outer: Handle, own: &dyn Fn(Handle, &str) -> Option<String>, sprites: &BTreeMap<String, String>) -> String {
     // What inherits in from the HTML around the svg.
     let mut inherited: BTreeMap<&str, String> = BTreeMap::new();
     let mut p = dom.get(outer).and_then(|n| n.parent);
@@ -172,17 +255,44 @@ fn serialize(dom: &Dom, outer: Handle, own: &dyn Fn(Handle, &str) -> Option<Stri
             st.extend(dom.children_of(x));
         }
     }
+    // External sprites: the symbols `<use href="file#id">` names, from the
+    // carried files. A reference whose file is not carried is left as
+    // written (the profile refuses it, and it is counted, as before).
+    let mut sprite_out = String::new();
+    let mut parsed: HashMap<String, Option<Dom>> = HashMap::new();
+    let mut done: HashSet<String> = HashSet::new();
+    // The svg and the document symbols copied into it, in that order.
+    let mut st: Vec<Handle> = copies.iter().rev().copied().chain(std::iter::once(outer)).collect();
+    while let Some(x) = st.pop() {
+        if dom.tag(x) == Some("use") {
+            if let Some((file, id)) = dom.attr(x, "href").or_else(|| dom.attr(x, "xlink:href")).and_then(external_ref) {
+                sprite_defs(sprites, &mut parsed, file, id, &mut done, &root_color, &mut sprite_out);
+            }
+        }
+        // In document order: children pushed last-first.
+        let kids = dom.children_of(x);
+        st.extend(kids.into_iter().rev());
+    }
+    SPRITE_IDS.with(|c| *c.borrow_mut() = done);
     let mut out = String::from("<svg xmlns=\"http://www.w3.org/2000/svg\"");
     write_attrs(dom, outer, own, &root_color, Some(&inherited), &mut out);
     out.push('>');
-    if !copies.is_empty() {
+    if !copies.is_empty() || !sprite_out.is_empty() {
         out.push_str("<defs>");
         for &c in &copies { node(dom, c, own, &root_color, &mut out) }
+        out.push_str(&sprite_out);
         out.push_str("</defs>");
     }
     for c in dom.children_of(outer) { node(dom, c, own, &root_color, &mut out) }
+    SPRITE_IDS.with(|c| c.borrow_mut().clear());
     out.push_str("</svg>");
     out
+}
+
+thread_local! {
+    /// The sprite ids copied into the svg being written: a `<use>` naming
+    /// one of them is written pointing at the copy (`write_attrs`).
+    static SPRITE_IDS: std::cell::RefCell<HashSet<String>> = Default::default();
 }
 
 /// One element's attributes: its own, less `class`, `style` and the paint
@@ -212,6 +322,14 @@ fn write_attrs(dom: &Dom, h: Handle, own: &dyn Fn(Handle, &str) -> Option<String
     }
     for (k, v) in &n.attrs {
         if k == "class" || k == "style" || k == "xmlns" || k.starts_with("xmlns:") || written.contains(k.as_str()) || k == "color" { continue }
+        // An external sprite reference whose symbol was copied in points at
+        // the copy.
+        if k == "href" || k == "xlink:href" {
+            if let Some((file, id)) = external_ref(v) {
+                let local = sprite_id(file, id);
+                if SPRITE_IDS.with(|c| c.borrow().contains(&local)) { out.push_str(&format!(" {k}=\"#{}\"", esc(&local))); continue }
+            }
+        }
         out.push_str(&format!(" {}=\"{}\"", k, esc(&cur(v))));
     }
     for (k, v) in paint { out.push_str(&format!(" {k}=\"{}\"", esc(&v))) }

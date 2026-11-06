@@ -164,6 +164,11 @@ fn store(address: &str, bytes: &[u8]) {
 pub struct Subresources {
     pub sheets: Vec<Sheet>,
     pub images: Vec<Image>,
+    /// ★ External SVG sprite files: the file part of an inline
+    /// `<use href="file.svg#icon">` as the document writes it, and the file's
+    /// text (`navigator_normalize::Inputs::sprites`). Carried so the
+    /// normalizer can copy the symbol in and the icon stays self-contained.
+    pub sprites: Vec<(String, String)>,
     /// What could not be fetched or measured, with the reason.
     pub failed: Vec<(String, String)>,
 }
@@ -406,8 +411,44 @@ fn collect_inner(dom: &Dom, base: Option<&str>, fetcher: &mut dyn Fetcher, mode:
         }
         if let Some(p) = progress.as_mut() { p(&out, &handled) }
     }
-    if !layout { inline_svgs(dom, &mut out) }
+    if !layout {
+        // ★ Not for the FIRST display (legacy-web §5.4.5.7): a sprite file
+        // is a whole round trip that only draws icons, and the first display
+        // does not wait for its images either. Its icons fill in with the
+        // readable recording.
+        if mode != Mode::First { sprites(dom, &resolve, fetcher, &mut out) }
+        inline_svgs(dom, &mut out);
+    }
     out
+}
+
+/// ★ EXTERNAL SVG SPRITE FILES (2026-11-06; approved by the user). Every
+/// file an inline `<use href="file.svg#id">` names, fetched once — through
+/// the same fetcher as the stylesheets, so in the jailed lane through fetchd
+/// with its origin and size rules — at most `MAX_SPRITE_FILES` of them and
+/// `MAX_SPRITE_BYTES` each. Hinted together first, so they arrive in
+/// parallel. Keyed by the href as the document writes it, as stylesheets are.
+fn sprites(dom: &Dom, resolve: &dyn Fn(&str) -> Option<String>, fetcher: &mut dyn Fetcher, out: &mut Subresources) {
+    use navigator_normalize::{MAX_SPRITE_BYTES, MAX_SPRITE_FILES};
+    let mut files: Vec<(String, String)> = vec![];
+    for h in dom.by_tag_anywhere("use") {
+        let Some(v) = dom.attr(h, "href").or_else(|| dom.attr(h, "xlink:href")) else { continue };
+        let Some((file, id)) = v.split_once('#') else { continue };
+        if file.is_empty() || id.is_empty() || files.iter().any(|(f, _)| f == file) { continue }
+        if files.len() >= MAX_SPRITE_FILES { out.failed.push((file.to_string(), "sprite: over the per-document file count".into())); continue }
+        match resolve(file) {
+            Some(abs) => files.push((file.to_string(), abs)),
+            None => out.failed.push((file.to_string(), "sprite: cannot resolve".into())),
+        }
+    }
+    for (_, abs) in &files { fetcher.hint(abs) }
+    for (file, abs) in files {
+        match fetcher.get(&abs) {
+            Ok(text) if text.len() > MAX_SPRITE_BYTES => out.failed.push((file, format!("sprite: {} bytes, over {MAX_SPRITE_BYTES}", text.len()))),
+            Ok(text) => out.sprites.push((file, text)),
+            Err(e) => out.failed.push((file, format!("sprite: {e}"))),
+        }
+    }
 }
 
 /// ★ Inline `<svg>`s, made standalone (threat model §2.4; the function is
@@ -426,6 +467,7 @@ fn inline_svgs(dom: &Dom, out: &mut Subresources) {
         inputs.stylesheets.insert(sh.href.clone(), sh.text.clone());
         if !sh.media.is_empty() { inputs.stylesheet_media.insert(sh.href.clone(), sh.media.clone()); }
     }
+    for (file, text) in &out.sprites { inputs.sprites.insert(file.clone(), text.clone()); }
     for text in navigator_normalize::svg_inline::standalone(&dom.serialize(), &inputs) {
         let bytes = text.into_bytes();
         let address = format!("blake3:{}", blake3::hash(&bytes).to_hex());

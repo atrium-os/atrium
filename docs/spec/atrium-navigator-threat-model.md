@@ -697,8 +697,46 @@ blob is normalized exactly as before.
 - *Next* (approved): true vector shapes, an NSG path node mapping one to one to Fresco's
   fill op. The bitmap path stays for clip paths, masks, filters and SVG text.
 
+*External SVG sprites (2026-11-06; approved by the user).* `<use href="/sprite.svg#id">`
+names a symbol in another file. The converter fetches that file, and the icon is made
+self-contained, so the worker's profile still sees local references only.
+- *Fetched by the converter, and only there.* Each distinct file an inline `<use>` names
+  is fetched once, through the same fetcher as the stylesheets. In the jailed lane that
+  is fetchd, with its origin and size rules.
+  - At most `MAX_SPRITE_FILES` (32) files per document, and `MAX_SPRITE_BYTES` (1 MiB,
+    the profile's own ceiling for one SVG) each. A file over either bound is not
+    carried, and the reason is reported.
+  - Not for the first display, which waits for no images either.
+- *Carried in the recording* (`sprites`, keyed by the href as the document writes it,
+  like stylesheets). Written only when there are any, so other recordings are unchanged.
+  The normalizer reads them with the same bounds. The backend replays transitions without
+  them and charges them against `max_total_bytes`.
+- *Copied in by `svg_inline`, both sides alike.* The named symbol, and what it references
+  inside the same file (gradients, other symbols, transitively, at most `MAX_COPIED`), go
+  into the icon's `<defs>`. Their ids are renamed by a pure function of file and id, so
+  two files' `#icon` never collide and converter and normalizer write the same bytes.
+  The `<use>` is written pointing at the copy.
+  - As in a browser, the page's stylesheets do not reach into the sprite. Inherited
+    paint and `currentColor` come from the `<use>`.
+  - A file not carried leaves the reference as written, and the profile refuses it as
+    before.
+- *What the worker sees is unchanged.* An ordinary standalone SVG goes through the
+  strict profile and then the vector path or the bitmap fallback. Nothing in the worker
+  fetches.
+
+*Measured* (the 9 corpus recordings whose inline icons name another file, the files
+fetched live, `examples/sprite_measure`):
+- Before, 0 of their icons were drawn. Now every visible one is: 165 of 165 in the
+  122-page set, all as vector shapes.
+- The other 682 are icons the page itself hides (`display: none`, `visibility: hidden`),
+  which draw nothing, as in a browser. Thomann alone has 645.
+- 12 files, 0 failed; 8–210 KB per page. A cold fetch takes 1.0–10.3 s per page when fetched
+  one after another. The converter hints them together.
+- Two runs gave identical counts. The 421-document identity set, whose recordings carry
+  no sprites, is byte-identical.
+
 **Rating now: low.** What stays open:
-- external SVG sprites, SVG text, and vector (not bitmap) inline SVG;
+- SVG text;
 - the transient natural frame (DCT scaling or row streaming);
 - callers that ask for re-decode on zoom (the zoom work);
 - the third-party image residual above.

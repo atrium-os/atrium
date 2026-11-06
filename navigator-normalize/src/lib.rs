@@ -46,7 +46,18 @@ pub struct Inputs {
     pub stylesheet_media: BTreeMap<String, String>,
     /// What one document may cost. See `Budget`.
     pub budget: Budget,
+    /// ★ EXTERNAL SVG SPRITE FILES (2026-11-06): the file part of an inline
+    /// `<use href="file.svg#icon">`, as the document writes it → the file's
+    /// text, fetched by the converter. `svg_inline` copies the named symbol
+    /// in, so the icon is a self-contained SVG and the strict profile still
+    /// sees only local references.
+    pub sprites: BTreeMap<String, String>,
 }
+
+/// At most this many sprite files per document, and this many bytes each
+/// (the SVG profile's own ceiling on one SVG).
+pub const MAX_SPRITE_FILES: usize = 32;
+pub const MAX_SPRITE_BYTES: usize = 1 << 20;
 
 /// ★ WORK BUDGETS. The normalizer reads hostile input, and its worst cases
 /// are not exotic: GitHub's custom-property cascade once took more than

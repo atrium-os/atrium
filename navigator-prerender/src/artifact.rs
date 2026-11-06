@@ -227,6 +227,17 @@ fn emit_part(url: Option<&str>, c: &Conversion, policy: &TierPolicy, whole: bool
             json_str(&sh.href), json_str(&sh.media), json_str(&sh.text)));
     }
     s.push_str(if c.subresources.sheets.is_empty() { "],\n" } else { "\n  ],\n" });
+    // External SVG sprite files, written only when there are any, so a
+    // recording without them is byte for byte what it was (and a reader
+    // that does not know the field draws those icons blank, as before).
+    if !c.subresources.sprites.is_empty() {
+        s.push_str("  \"sprites\": [");
+        for (i, (href, text)) in c.subresources.sprites.iter().enumerate() {
+            s.push_str(if i == 0 { "\n" } else { ",\n" });
+            s.push_str(&format!("    {{ \"href\": {}, \"text\": {} }}", json_str(href), json_str(text)));
+        }
+        s.push_str("\n  ],\n");
+    }
     s.push_str(&images_block(c));
     s.push_str(&format!("  \"document\": {}\n", json_str(document)));
     s.push_str("}\n");

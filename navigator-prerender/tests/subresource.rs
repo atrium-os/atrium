@@ -122,3 +122,45 @@ fn svg_natural_sizing_reads_the_root_and_keeps_absent_parts_absent() {
     assert_eq!(intrinsic_size(br#"<svg xmlns="http://www.w3.org/2000/svg" width="100"></svg>"#), None);
     assert_eq!(intrinsic_size(br#"<svg xmlns="http://www.w3.org/2000/svg" width="20" height="10"></svg>"#), Some((20, 10)));
 }
+
+/// ★ EXTERNAL SVG SPRITES (2026-11-06): the file an inline
+/// `<use href="file.svg#id">` names is fetched once, carried keyed as the
+/// document writes it, and the icon's standalone SVG — the blob the
+/// recording names — has the symbol copied in.
+#[test]
+fn an_external_sprite_file_is_fetched_once_and_the_icon_carries_its_symbol() {
+    let dom = navigator_dom::parse(r##"<html><body>
+        <svg width="16" height="16"><use href="/img/s.svg#a"></use></svg>
+        <svg width="16" height="16"><use xlink:href="/img/s.svg#b"></use></svg>
+        <svg width="16" height="16"><use href="/img/gone.svg#c"></use></svg></body></html>"##);
+    let mut f = MapFetcher::default();
+    f.0.insert("https://example.com/img/s.svg".into(),
+        r##"<svg xmlns="http://www.w3.org/2000/svg"><symbol id="a" viewBox="0 0 16 16"><rect width="16" height="16" fill="#ff0000"/></symbol><symbol id="b" viewBox="0 0 16 16"><circle cx="8" cy="8" r="8" fill="#0000ff"/></symbol></svg>"##.into());
+    navigator_prerender::subresource::install_blob_sink();
+    let out = collect(&dom, Some("https://example.com/page"), &mut f);
+    let blobs = navigator_prerender::subresource::take_blobs();
+    assert_eq!(out.sprites.iter().map(|(h, _)| h.as_str()).collect::<Vec<_>>(), vec!["/img/s.svg"], "one file, fetched once");
+    assert!(out.failed.iter().any(|(h, why)| h == "/img/gone.svg" && why.starts_with("sprite:")), "{:?}", out.failed);
+    // The inline icons' blobs (images named blake3:…): the two with a
+    // carried file have their symbols.
+    let svgs: Vec<&str> = out.images.iter().filter(|i| i.src.starts_with("blake3:")).map(|i| i.src.as_str()).collect();
+    assert_eq!(svgs.len(), 3, "{:?}", out.images);
+    let text = |a: &str| String::from_utf8(blobs.iter().find(|(x, _)| x == a).expect("stored").1.clone()).unwrap();
+    let all: Vec<String> = svgs.iter().map(|a| text(a)).collect();
+    assert!(all.iter().any(|t| t.contains("<symbol id=\"atrium-sprite-") && t.contains("#ff0000")), "icon a has its symbol: {all:#?}");
+    assert!(all.iter().any(|t| t.contains("<symbol id=\"atrium-sprite-") && t.contains("#0000ff")), "icon b has its symbol");
+    assert!(all.iter().any(|t| t.contains("/img/gone.svg#c")), "the missing file's icon is left as written");
+}
+
+/// The FIRST display does not wait for sprite files (it does not wait for
+/// images either): its icons fill in with the readable recording.
+#[test]
+fn the_first_display_fetches_no_sprite_file() {
+    let dom = navigator_dom::parse(r##"<html><body><svg width="16" height="16"><use href="/img/s.svg#a"></use></svg></body></html>"##);
+    let mut f = MapFetcher::default();
+    f.0.insert("https://example.com/img/s.svg".into(), r##"<svg xmlns="http://www.w3.org/2000/svg"><symbol id="a"><rect width="16" height="16"/></symbol></svg>"##.into());
+    let out = navigator_prerender::subresource::collect_first(&dom, Some("https://example.com/page"), &mut f);
+    assert!(out.sprites.is_empty());
+    let full = collect(&dom, Some("https://example.com/page"), &mut f);
+    assert_eq!(full.sprites.len(), 1);
+}
