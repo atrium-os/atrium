@@ -179,6 +179,8 @@ fn run(
                         button:    (bit + 1) as u8,
                         pressed,
                         modifiers: 0,
+                        // A real device: frescod mints the press's token.
+                        activation: if pressed { fresco_scene_server::window::MINT_HERE } else { [0; 16] },
                     });
                 }
             }

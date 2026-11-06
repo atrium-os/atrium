@@ -77,12 +77,18 @@
 
 #[path = "../input_reader.rs"]
 mod input_reader;
+#[path = "../screen.rs"]
+#[allow(dead_code)]
+mod screen;
 #[path = "../pointer_reader.rs"]
 mod pointer_reader;
 #[path = "../laminar.rs"]
 mod laminar;
 #[path = "../redraw.rs"]
 mod redraw;
+#[path = "../activation.rs"]
+#[allow(dead_code)]
+mod activation;
 #[path = "../socket_server.rs"]
 mod socket_server;
 

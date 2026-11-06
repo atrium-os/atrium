@@ -893,6 +893,10 @@ pub struct InputKeyEvent {
     pub hid_usage: u16,
     pub pressed:   bool,
     pub modifiers: u8,
+    /// The press's activation token (docs/spec/tabula.md §2): random,
+    /// one use, for this window's app; all zero on releases and on input
+    /// that did not come from a real device.
+    pub activation: [u8; 16],
 }
 
 /// `EV_INPUT_POINTER_MOTION` — cursor moved. Coordinates are in
@@ -918,6 +922,8 @@ pub struct InputPointerButtonEvent {
     pub button:    u8,
     pub pressed:   bool,
     pub modifiers: u8,
+    /// As [`InputKeyEvent::activation`].
+    pub activation: [u8; 16],
 }
 
 /// `EV_INPUT_POINTER_SCROLL` — scroll wheel / two-finger scroll.

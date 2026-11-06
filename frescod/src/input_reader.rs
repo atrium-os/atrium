@@ -263,5 +263,7 @@ fn send(
      * here. */
     let _ = sink.send(DisplayEvent::InputKey {
         window_id, hid_usage, pressed, modifiers,
+        // A real device: frescod mints the press's token.
+        activation: if pressed { fresco_scene_server::window::MINT_HERE } else { [0; 16] },
     });
 }

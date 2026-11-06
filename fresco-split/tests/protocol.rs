@@ -19,9 +19,9 @@ fn samples() -> Vec<Msg> {
         Msg::Focus { window: 2, gained: true },
         Msg::CloseRequested { window: 2 },
         Msg::Scale { window: 2, scale_milli: 1500 },
-        Msg::Input { window: 4, input: Input::Key { usage: 0x04, pressed: true, modifiers: 2 } },
+        Msg::Input { window: 4, input: Input::Key { usage: 0x04, pressed: true, modifiers: 2, activation: [9; 16] } },
         Msg::Input { window: 4, input: Input::Motion { x: 1.5, y: -2.0 } },
-        Msg::Input { window: 4, input: Input::Button { x: 3.0, y: 4.0, button: 1, pressed: false, modifiers: 0 } },
+        Msg::Input { window: 4, input: Input::Button { x: 3.0, y: 4.0, button: 1, pressed: false, modifiers: 0, activation: [0; 16] } },
         Msg::Input { window: 4, input: Input::Scroll { dx: 0.0, dy: 3.0 } },
     ]
 }

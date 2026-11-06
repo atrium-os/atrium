@@ -92,6 +92,9 @@ pub enum Event {
         hid_usage: u16,
         pressed:   bool,
         modifiers: u8,
+        /// The press's activation token, for Tabula (docs/spec/tabula.md
+        /// §2): zero on releases.
+        activation: [u8; 16],
     },
     /// Pointer motion in window-local logical pixels.
     PointerMotion { window_id: u32, x: f32, y: f32 },
@@ -102,6 +105,8 @@ pub enum Event {
         button: u8,
         pressed: bool,
         modifiers: u8,
+        /// As for `Key`.
+        activation: [u8; 16],
     },
     /// Pointer scroll delta in logical pixels.
     PointerScroll { window_id: u32, dx: f32, dy: f32 },
@@ -938,7 +943,7 @@ fn decode_event(op: u16, payload: &[u8]) -> Event {
         EV_INPUT_KEY => match decode::<InputKeyEvent>(payload) {
             Ok(p) => Event::Key {
                 window_id: p.window_id, hid_usage: p.hid_usage,
-                pressed: p.pressed, modifiers: p.modifiers,
+                pressed: p.pressed, modifiers: p.modifiers, activation: p.activation,
             },
             Err(_) => Event::Unknown { op, payload: payload.to_vec() },
         },
@@ -951,7 +956,7 @@ fn decode_event(op: u16, payload: &[u8]) -> Event {
         EV_INPUT_POINTER_BUTTON => match decode::<InputPointerButtonEvent>(payload) {
             Ok(p) => Event::PointerButton {
                 window_id: p.window_id, x: p.x, y: p.y,
-                button: p.button, pressed: p.pressed, modifiers: p.modifiers,
+                button: p.button, pressed: p.pressed, modifiers: p.modifiers, activation: p.activation,
             },
             Err(_) => Event::Unknown { op, payload: payload.to_vec() },
         },
@@ -1019,10 +1024,11 @@ mod tests {
         let p = InputKeyEvent {
             window_id: 4, hid_usage: 0x04, /* 'a' */
             pressed: true, modifiers: 0x01, /* shift */
+            activation: [7; 16],
         };
         let bytes = encode(&p).unwrap();
         match decode_event(EV_INPUT_KEY, &bytes) {
-            Event::Key { window_id: 4, hid_usage: 0x04, pressed: true, modifiers: 0x01 } => {}
+            Event::Key { window_id: 4, hid_usage: 0x04, pressed: true, modifiers: 0x01, activation: [7, ..] } => {}
             other => panic!("expected Key, got {other:?}"),
         }
 
@@ -1037,7 +1043,7 @@ mod tests {
 
         let p = InputPointerButtonEvent {
             window_id: 1, x: 10.0, y: 20.0,
-            button: 1, pressed: true, modifiers: 0,
+            button: 1, pressed: true, modifiers: 0, activation: [0; 16],
         };
         let bytes = encode(&p).unwrap();
         match decode_event(EV_INPUT_POINTER_BUTTON, &bytes) {

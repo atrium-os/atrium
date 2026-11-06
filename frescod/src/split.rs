@@ -816,10 +816,12 @@ fn event_record(r: &Renderer, ev: &DisplayEvent) -> Option<Msg> {
             }
             return Some(Msg::Scale { window: r.local_of(window_id)?, scale_milli });
         }
-        E::InputKey { window_id, hid_usage, pressed, modifiers } => (window_id, Input::Key { usage: hid_usage, pressed, modifiers }),
+        E::InputKey { window_id, hid_usage, pressed, modifiers, activation } => {
+            (window_id, Input::Key { usage: hid_usage, pressed, modifiers, activation })
+        }
         E::InputPointerMotion { window_id, x, y } => (window_id, Input::Motion { x, y }),
-        E::InputPointerButton { window_id, x, y, button, pressed, modifiers } => {
-            (window_id, Input::Button { x, y, button, pressed, modifiers })
+        E::InputPointerButton { window_id, x, y, button, pressed, modifiers, activation } => {
+            (window_id, Input::Button { x, y, button, pressed, modifiers, activation })
         }
         E::InputPointerScroll { window_id, dx, dy } => (window_id, Input::Scroll { dx, dy }),
         _ => return None,

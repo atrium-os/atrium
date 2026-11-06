@@ -80,7 +80,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 Some(Event::CloseRequested { window_id }) if window_id == win => {
                     alive = false;
                 }
-                Some(Event::Key { hid_usage, pressed, modifiers, window_id })
+                Some(Event::Key { hid_usage, pressed, modifiers, window_id, .. })
                     if window_id == win =>
                 {
                     keymap.shift = modifiers & 0x01 != 0;

@@ -66,6 +66,7 @@ version = "0.1.0"
 name = "atrium-test-client"
 version = "0.1.0"
 dependencies = [
+ "aqueduct",
  "atrium-gpu-app",
  "atrium-rdna4-isa",
  "fresco-client",
@@ -73,6 +74,7 @@ dependencies = [
  "fresco-protocol",
  "fresco-split",
  "fresco-text",
+ "libc",
 ]
 
 [[package]]

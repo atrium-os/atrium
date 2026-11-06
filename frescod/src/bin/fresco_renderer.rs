@@ -52,6 +52,9 @@ mod laminar;
 mod pack;
 #[path = "../redraw.rs"]
 mod redraw;
+#[path = "../activation.rs"]
+#[allow(dead_code)]
+mod activation;
 #[path = "../socket_server.rs"]
 mod socket_server;
 
@@ -523,10 +526,12 @@ fn from_broker(
             Msg::Input { input, .. } => {
                 let window_id = local;
                 let _ = events.send(match input {
-                    Input::Key { usage, pressed, modifiers } => DisplayEvent::InputKey { window_id, hid_usage: usage, pressed, modifiers },
+                    Input::Key { usage, pressed, modifiers, activation } => {
+                        DisplayEvent::InputKey { window_id, hid_usage: usage, pressed, modifiers, activation }
+                    }
                     Input::Motion { x, y } => DisplayEvent::InputPointerMotion { window_id, x, y },
-                    Input::Button { x, y, button, pressed, modifiers } => {
-                        DisplayEvent::InputPointerButton { window_id, x, y, button, pressed, modifiers }
+                    Input::Button { x, y, button, pressed, modifiers, activation } => {
+                        DisplayEvent::InputPointerButton { window_id, x, y, button, pressed, modifiers, activation }
                     }
                     Input::Scroll { dx, dy } => DisplayEvent::InputPointerScroll { window_id, dx, dy },
                 });

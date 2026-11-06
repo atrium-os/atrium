@@ -31,6 +31,7 @@
 //! collisions across windows are not yet handled (M3+); typical
 //! single-window apps render correctly.
 
+mod activation;
 mod injector_reader;
 mod input_reader;
 mod laminar;
@@ -215,6 +216,7 @@ fn main() -> std::io::Result<()> {
         gpu_app::serve(Path::new(&p))?;
     }
     socket_server::spawn_event_fanout(ev_rx, event_subs, redraw.clone(), comp.clone());
+    activation::start(comp.clone());
 
     /* Native FreeBSD keyboard + pointer input. Both read /dev/hidraw*
      * directly (boot-protocol HID), update server cursor / focus state,
@@ -861,6 +863,7 @@ fn run_headless(png: &str) -> std::io::Result<()> {
         gpu_app::serve(Path::new(&p))?;
     }
     socket_server::spawn_event_fanout(ev_rx, subs, redraw2.clone(), comp.clone());
+    activation::start(comp.clone());
     eprintln!("frescod-headless: {W}x{H} on {} → {png}.png", sock.display());
 
     /* Damage-driven, like the display path — this loop used to render

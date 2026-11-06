@@ -28,6 +28,11 @@ use std::sync::{Arc, Mutex, mpsc};
 /// `mpsc::Sender`); the consumer (frescod's per-connection writer
 /// thread) drains, filters by ownership, encodes via `encode_event`,
 /// and sends as aqueduct envelopes with the `ASYNC_EVENT` flag.
+/// Set by a real input device's reader on a press: frescod's event
+/// fan-out replaces it with a fresh activation token (or zero). Never
+/// sent to a client as is: encoding turns a leftover one into zero.
+pub const MINT_HERE: [u8; 16] = [0xff; 16];
+
 #[derive(Clone, Debug)]
 pub enum DisplayEvent {
     /// Window dimensions changed (compositor / WM resized; user
@@ -58,6 +63,8 @@ pub enum DisplayEvent {
         hid_usage: u16,
         pressed:   bool,
         modifiers: u8,
+        /// See [`MINT_HERE`] and `fresco_protocol::InputKeyEvent::activation`.
+        activation: [u8; 16],
     },
     /// Pointer cursor moved over a window's content region.
     InputPointerMotion { window_id: u32, x: f32, y: f32 },
@@ -69,6 +76,7 @@ pub enum DisplayEvent {
         button: u8,
         pressed: bool,
         modifiers: u8,
+        activation: [u8; 16],
     },
     /// Pointer scroll (wheel / two-finger). `dy > 0` = content scrolls
     /// down (matches macOS/Wayland convention).
@@ -124,12 +132,13 @@ pub fn encode_event(ev: &DisplayEvent)
             };
             Ok((control::EV_DISPLAY_CHANGED, encode(&p)?))
         }
-        DisplayEvent::InputKey { window_id, hid_usage, pressed, modifiers } => {
+        DisplayEvent::InputKey { window_id, hid_usage, pressed, modifiers, activation } => {
             let p = InputKeyEvent {
                 window_id: *window_id,
                 hid_usage: *hid_usage,
                 pressed:   *pressed,
                 modifiers: *modifiers,
+                activation: if *activation == MINT_HERE { [0; 16] } else { *activation },
             };
             Ok((control::EV_INPUT_KEY, encode(&p)?))
         }
@@ -139,10 +148,11 @@ pub fn encode_event(ev: &DisplayEvent)
             };
             Ok((control::EV_INPUT_POINTER_MOTION, encode(&p)?))
         }
-        DisplayEvent::InputPointerButton { window_id, x, y, button, pressed, modifiers } => {
+        DisplayEvent::InputPointerButton { window_id, x, y, button, pressed, modifiers, activation } => {
             let p = InputPointerButtonEvent {
                 window_id: *window_id, x: *x, y: *y,
                 button: *button, pressed: *pressed, modifiers: *modifiers,
+                activation: if *activation == MINT_HERE { [0; 16] } else { *activation },
             };
             Ok((control::EV_INPUT_POINTER_BUTTON, encode(&p)?))
         }

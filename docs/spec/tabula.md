@@ -1,7 +1,7 @@
 # Tabula — clipboard and drag-and-drop, and the gesture interface with frescod
 
 Status: interface draft, 2026-11-06. `tabulad` built (crate `tabula/`, §3) and tested against a
-stand-in frescod; frescod's side (activation tokens) not yet. The token and consume types are
+stand-in frescod; frescod's side of the activation tokens built (§2.5). The token and consume types are
 `fresco_protocol::activation` (ops 0x0900 `CONSUME`, 0x0901 `GRANT`), on frescod's socket
 `/var/run/atrium/fresco-activation.sock`.
 
@@ -112,6 +112,44 @@ checks that the press it is spending was in a Forum window and mints a `GRANTED`
   The click was real, in its focused window, within a second, so this is the web's activation
   model, not a per-command proof. Narrowing it needs frescod to know command semantics (a
   system Edit menu); deferred.
+
+### 2.5 As built in frescod (2026-11-06)
+
+`frescod/src/activation.rs`. The HID readers mark each press; the event fan-out mints its token
+with the uid of the window's app (the connection's peer uid, or, for a window a renderer opened
+in split mode, the uid of the app behind it). Only the window's owner gets the token: the WM sees
+the same press with an all-zero `activation`. The injector (`FRESCOD_INPUT_SOCK`) mints nothing,
+unless `FRESCOD_INJECT_ACTIVATION=1`, which is for tests and logs a warning. The table holds at
+most 4096 live tokens (the oldest goes first) and drops expired ones on each mint.
+
+The socket is `FRESCOD_ACTIVATION_SOCK` (default `/var/run/atrium/fresco-activation.sock`).
+frescod checks each connection's peer uid. Consumers are `FRESCOD_ACTIVATION_UIDS`, or else the
+uids of `_tabula`, `_share` and `_praeco`; Forum is `FRESCOD_FORUM_UID`, or else `_forum`'s uid.
+Other uids are not served. A consumer may only `CONSUME` and Forum may only `GRANT`; anything
+else gets `Refused { NOT_ALLOWED }`. Replies carry `IS_RESPONSE` and the request's op.
+
+- "Focused" means the window keys go to: the focused one, else the topmost. `GRANTED` tokens
+  skip the focus check.
+- A refused consume does not spend the token, so a wrong presenter cannot burn the real app's
+  token. tabula's stand-in `Fake` spends it on any attempt; tests that rely on that differ here.
+- An expired token answers `EXPIRED`, then `UNKNOWN` once it has been dropped.
+- `GRANT` spends a `BUTTON` press in one of Forum's own windows. It mints a `GRANTED` token for
+  `for_uid` that can be spent on that one purpose (`PASTE`, `SHARE` or `ACTION`) within 1 s.
+
+Tests are the table's unit tests in frescod and `atrium-activation-probe` (atrium-test-client).
+The probe runs end to end over the real sockets, in direct and split mode, and checks:
+
+- the app's press carries a token, and the WM's copy carries none;
+- a token is refused for another uid, spent once, and unknown after;
+- typing 'a' does not paste; Ctrl-C copies;
+- a click expires after 1 s;
+- Forum grants, and the granted token works only for its purpose.
+
+Not yet built:
+
+- `DROP` tokens (§4);
+- the system users `_tabula`, `_share`, `_praeco` and `_forum`;
+- Portcullis mounting the socket's directory into those jails.
 
 ## 3. Tabula's wire (`CLASS_CLIPBOARD` = 2, `/var/run/atrium/tabulad.sock`)
 

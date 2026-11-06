@@ -25,6 +25,7 @@
 //! the write side), so splitting on `UnixStream::try_clone()` keeps
 //! each direction's state coherent.
 
+use crate::activation;
 use aqueduct::{Connection as AqConn, CLASS_DISPLAY};
 use aqueduct::envelope::flag;
 use fresco_scene_server::command::envelope_frontend::{
@@ -148,28 +149,49 @@ pub fn spawn_event_fanout(
     std::thread::Builder::new()
         .name("frescod-event-fanout".into())
         .spawn(move || {
-            for ev in rx.iter() {
+            for mut ev in rx.iter() {
                 /* Task #25: input + compositor events all funnel through
                  * here — wake the display loop so cursor/focus/window
                  * changes recompose. */
                 redraw.wake();
-                let (op, payload) = match encode_event(&ev) {
-                    Ok(p) => p,
+                let to = route(&ev, &comp);
+                /* A real press gets its activation token (tabula.md §2),
+                 * bound to the window's app; only that app sees it, the
+                 * WM gets the event without it. */
+                let bare = activation::has_token(&ev).then(|| {
+                    let uid = window_uid(&ev, &comp);
+                    activation::mint_for(&mut ev, uid);
+                    activation::without_token(&ev)
+                });
+                let wire = |ev: &DisplayEvent| match encode_event(ev) {
+                    Ok((op, payload)) => Some(Outbound { op, flags: flag::ASYNC_EVENT, payload }),
                     Err(e) => {
                         log::debug!("encode_event failed: {e}");
-                        continue;
+                        None
                     }
                 };
-                let out = Outbound {
-                    op,
-                    flags:   flag::ASYNC_EVENT,
-                    payload,
+                let Some(out) = wire(&ev) else { continue };
+                let out_bare = match &bare {
+                    Some(b) => match wire(b) {
+                        Some(o) => o,
+                        None => continue,
+                    },
+                    None => out_clone(&out),
                 };
-                let to = route(&ev, &comp);
+                let owner = to.owner();
                 let mut s = subs.lock().unwrap();
-                s.retain(|sub| !to.reaches(sub) || match &sub.tx {
-                    SubTx::Wire(tx) => tx.send(out_clone(&out)).is_ok(),
-                    SubTx::Split(tx) => tx.send(ev.clone()).is_ok(),
+                s.retain(|sub| {
+                    if !to.reaches(sub) {
+                        return true;
+                    }
+                    let mine = owner == Some(sub.client_id);
+                    match &sub.tx {
+                        SubTx::Wire(tx) => tx.send(out_clone(if mine { &out } else { &out_bare })).is_ok(),
+                        SubTx::Split(tx) => tx.send(match (&bare, mine) {
+                            (Some(b), false) => b.clone(),
+                            _ => ev.clone(),
+                        }).is_ok(),
+                    }
                 });
             }
         })
@@ -193,6 +215,13 @@ enum Route {
 }
 
 impl Route {
+    fn owner(&self) -> Option<u8> {
+        match self {
+            Route::OwnerAndWm(o) | Route::Owner(o) => *o,
+            _ => None,
+        }
+    }
+
     fn reaches(&self, sub: &Sub) -> bool {
         match self {
             Route::WmOnly => sub.wm,
@@ -226,6 +255,19 @@ fn route(ev: &DisplayEvent, comp: &Arc<Mutex<Compositor>>) -> Route {
         return Route::WmOnly;
     }
     Route::OwnerAndWm(owner_of(window_id))
+}
+
+/// The uid of the app whose window a press went to: the window's owner
+/// uid, as the frontend or the split broker recorded it.
+fn window_uid(ev: &DisplayEvent, comp: &Arc<Mutex<Compositor>>) -> Option<u32> {
+    use DisplayEvent as E;
+    let (E::InputKey { window_id, .. } | E::InputPointerButton { window_id, .. }) = *ev else { return None };
+    let id = u16::try_from(window_id).ok()?;
+    let c = comp.lock().unwrap();
+    let w = c.windows.get(&id)?;
+    let known = u8::try_from(w.owner).ok()
+        .and_then(|o| CLIENT_UID.lock().unwrap()[o as usize]);
+    Some(known.unwrap_or(w.owner_uid))
 }
 
 fn out_clone(o: &Outbound) -> Outbound {

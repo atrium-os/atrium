@@ -62,9 +62,11 @@ impl Role {
 /// A pointer or key event, in the receiving window's coordinates.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum Input {
-    Key { usage: u16, pressed: bool, modifiers: u8 },
+    /// `activation`: the press's token (docs/spec/tabula.md §2), passed on
+    /// to the client as is; zero on releases.
+    Key { usage: u16, pressed: bool, modifiers: u8, activation: [u8; 16] },
     Motion { x: f32, y: f32 },
-    Button { x: f32, y: f32, button: u8, pressed: bool, modifiers: u8 },
+    Button { x: f32, y: f32, button: u8, pressed: bool, modifiers: u8, activation: [u8; 16] },
     Scroll { dx: f32, dy: f32 },
 }
 
@@ -256,11 +258,12 @@ impl Msg {
                 r
             }
             Msg::Input { window, input } => match *input {
-                Input::Key { usage, pressed, modifiers } => {
+                Input::Key { usage, pressed, modifiers, activation } => {
                     let mut r = Rec::new(KEY, *window);
                     r.put(2, usage as u32);
                     r.put(3, pressed as u32);
                     r.put(4, modifiers as u32);
+                    r.0[32..48].copy_from_slice(&activation);
                     r
                 }
                 Input::Motion { x, y } => {
@@ -269,13 +272,14 @@ impl Msg {
                     r.put(3, y.to_bits());
                     r
                 }
-                Input::Button { x, y, button, pressed, modifiers } => {
+                Input::Button { x, y, button, pressed, modifiers, activation } => {
                     let mut r = Rec::new(BUTTON, *window);
                     r.put(2, x.to_bits());
                     r.put(3, y.to_bits());
                     r.put(4, button as u32);
                     r.put(5, pressed as u32);
                     r.put(6, modifiers as u32);
+                    r.0[32..48].copy_from_slice(&activation);
                     r
                 }
                 Input::Scroll { dx, dy } => {
@@ -327,7 +331,9 @@ impl Msg {
             }
             s.to_string()
         } else {
-            if r.0[32..].iter().any(|&c| c != 0) {
+            // Key and button records carry the activation token in 32..48.
+            let tail = if matches!(k, KEY | BUTTON) { 48 } else { 32 };
+            if r.0[tail..].iter().any(|&c| c != 0) {
                 return Err(Refused("unused field not zero"));
             }
             String::new()
@@ -366,15 +372,17 @@ impl Msg {
             KEY => {
                 let usage = u16::try_from(r.get(2)).map_err(|_| Refused("key usage"))?;
                 let modifiers = u8::try_from(r.get(4)).map_err(|_| Refused("modifiers"))?;
-                Msg::Input { window, input: Input::Key { usage, pressed: flag(r.get(3))?, modifiers } }
+                let activation = r.0[32..48].try_into().unwrap();
+                Msg::Input { window, input: Input::Key { usage, pressed: flag(r.get(3))?, modifiers, activation } }
             }
             MOTION => Msg::Input { window, input: Input::Motion { x: finite(r.get(2))?, y: finite(r.get(3))? } },
             BUTTON => {
                 let button = u8::try_from(r.get(4)).map_err(|_| Refused("button"))?;
                 let modifiers = u8::try_from(r.get(6)).map_err(|_| Refused("modifiers"))?;
+                let activation = r.0[32..48].try_into().unwrap();
                 Msg::Input {
                     window,
-                    input: Input::Button { x: finite(r.get(2))?, y: finite(r.get(3))?, button, pressed: flag(r.get(5))?, modifiers },
+                    input: Input::Button { x: finite(r.get(2))?, y: finite(r.get(3))?, button, pressed: flag(r.get(5))?, modifiers, activation },
                 }
             }
             SCROLL => Msg::Input { window, input: Input::Scroll { dx: finite(r.get(2))?, dy: finite(r.get(3))? } },

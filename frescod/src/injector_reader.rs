@@ -22,6 +22,22 @@ use std::os::unix::net::UnixListener;
 use std::sync::mpsc::Sender;
 use std::sync::{Arc, Mutex};
 
+/// Injected input is synthetic: it mints no activation token
+/// (docs/spec/tabula.md §2.1), unless the dev harness asks with
+/// `FRESCOD_INJECT_ACTIVATION=1` to test the token path in a VM with no
+/// input device.
+fn injected(pressed: bool) -> [u8; 16] {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    let on = *ON.get_or_init(|| {
+        let on = std::env::var("FRESCOD_INJECT_ACTIVATION").as_deref() == Ok("1");
+        if on {
+            eprintln!("frescod: WARNING: injected input mints activation tokens (FRESCOD_INJECT_ACTIVATION=1, testing only)");
+        }
+        on
+    });
+    if on && pressed { fresco_scene_server::window::MINT_HERE } else { [0; 16] }
+}
+
 pub fn spawn(
     sink: Sender<DisplayEvent>,
     comp: Arc<Mutex<Compositor>>,
@@ -75,7 +91,7 @@ fn handle(sink: &Sender<DisplayEvent>, comp: &Arc<Mutex<Compositor>>, sw: f32, s
                 let (lx, ly, target) = cursor_here(comp);
                 eprintln!("frescod: inject BTN {button} {} -> window {target}", pressed as u8);
                 let _ = sink.send(DisplayEvent::InputPointerButton {
-                    window_id: target, x: lx, y: ly, button, pressed, modifiers: 0,
+                    window_id: target, x: lx, y: ly, button, pressed, modifiers: 0, activation: injected(pressed),
                 });
             }
         }
@@ -86,7 +102,7 @@ fn handle(sink: &Sender<DisplayEvent>, comp: &Arc<Mutex<Compositor>>, sw: f32, s
             if let (Some(hid_usage), Some(pressed)) = (usage, pressed) {
                 let target = focused_window(comp);
                 eprintln!("frescod: inject KEY {hid_usage} {} -> window {target}", pressed as u8);
-                let _ = sink.send(DisplayEvent::InputKey { window_id: target, hid_usage, pressed, modifiers: mods });
+                let _ = sink.send(DisplayEvent::InputKey { window_id: target, hid_usage, pressed, modifiers: mods, activation: injected(pressed) });
             }
         }
         "SCROLL" => {
