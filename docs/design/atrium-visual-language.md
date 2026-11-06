@@ -577,7 +577,7 @@ screen has it.
 | **Toggle** | 32×18 pill track, 1px `border-control`, 14 thumb `border-control` | track `accent-fill`, thumb `text-on-accent`, slides with `spring-snappy` |
 | **Slider** | 4 high pill track `border-strong`, filled part `accent-mark`, 16 thumb `bg-elevated` with 1px `border-control` | — |
 | **Dropdown** (select) | the secondary button's body, label left, `caret-down` glyph right; opens a menu aligned to its left edge, the current item under the pointer | — |
-| **Segmented control** | `bg-surface` track radius-sm, 2px inset; segments equal width | the selected segment is a `bg-elevated` pill with `border-default` |
+| **Segmented control** | `bg-surface` track with a 1px `border-default` edge (so it shows on `bg-surface` too), radius-sm, 2px inset; segments equal width | the selected segment is a `bg-elevated` pill with `border-default` |
 | **Tabs** (in a panel) | labels `text-secondary` 16 apart, a 2px `accent-mark` bar under the selected one, a 1px `border-default` line under the row | label `text-primary` |
 | **List row** | 32 (dense 24), padding 12, glyph `icon-md` | `selection-bg` when the list has focus, `selection-idle` when not |
 | **Menu** | floating surface, 4px inset; items 28 high, padding 12, shortcut right in `text-tertiary`; separator a `Divider` with 4px above and below; submenu `caret-right` | the hovered or arrowed item takes `selection-bg` |

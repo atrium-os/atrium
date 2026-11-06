@@ -419,7 +419,10 @@ impl View for Segmented {
         let mut r = self.rect;
         r.size.w = self.natural_width();
         let ring = focus_ring(ctx, r, radius::SM);
-        let track = ctx.add(Node::Rect { rect: r, fill: t.bg_surface(), radius: radius::SM });
+        // The track: a `border-default` edge round a `bg-surface` fill, so
+        // it shows on a `bg-surface` page too.
+        let track = ctx.add(Node::Rect { rect: r, fill: t.border_default(), radius: radius::SM });
+        ctx.tree.insert(Some(track), Node::Rect { rect: inflate(r, -stroke::DEFAULT), fill: t.bg_surface(), radius: radius::SM - stroke::DEFAULT });
         let seg_w = (r.w() - inset * 2.0 - inset * (n as f32 - 1.0)) / n as f32;
         for (i, label) in self.labels.iter().enumerate() {
             let s = Rect::new(r.x() + inset + i as f32 * (seg_w + inset), r.y() + inset, seg_w, r.h() - inset * 2.0);

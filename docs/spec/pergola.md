@@ -553,4 +553,8 @@ sit in a stack and nothing lined their labels up. As built:
   clips and fades as one); RadioGroup, Segmented and Tabs are one Tab stop.
 - Tab order is now tree order (reading order), not node id order.
 
-Not yet: wrapping rows, a grid's explicit row/column placement, RTL.
+- Rows wrap (`FlexStyle::wrap`): what does not fit carries on on the
+  next line, `spacing` apart. Dialog is laid out this way (a centring
+  column, a padded body, a right-justified button row of placed buttons).
+
+Not yet: a grid's explicit row/column placement, RTL, wrapped text.

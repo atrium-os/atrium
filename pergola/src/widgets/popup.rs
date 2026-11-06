@@ -15,7 +15,8 @@ use std::rc::Rc;
 use std::sync::Arc;
 
 use crate::event::{Event, Key, KeyEventKind};
-use crate::geom::Rect;
+use crate::geom::{Axis, Rect};
+use crate::layout::{Align, FlexStyle, Justify};
 use crate::node::{Node, NodeId, TextStyle};
 use crate::reactive::Mutable;
 use crate::theme::{font, radius, size, space, stroke, type_size, Weight};
@@ -370,16 +371,20 @@ impl View for Dialog {
         let o = self.open.clone();
         ctx.on_click(scrim, move || o.set(false));
 
-        let pad = space::LG;
+        // Laid out: a column the size of `within` centres the body; the
+        // body is a padded column (title, text, then the buttons' row).
         let w = self.width.min(self.within.w() - 2.0 * space::LG);
-        let title_s = text(t.text_primary(), type_size::LG, font::SANS, Weight::Semibold);
-        let body_s = text(t.text_secondary(), type_size::SM, font::SANS, Weight::Regular);
-        let th = Node::measure_text(&self.title, &title_s).h;
-        let bh = Node::measure_text(&self.body, &body_s).h;
-        let btn_h = size::BUTTON_HEIGHT_DEFAULT;
-        let h = pad + th + space::SM + bh + space::LG + btn_h + pad;
-        let r = Rect::new(self.within.x() + (self.within.w() - w) / 2.0, self.within.y() + (self.within.h() - h) / 2.0, w, h);
-        let body = surface(ctx, r, radius::LG);
+        let o = self.open.clone();
+        let centre = ctx.push(Node::stack(Axis::Vertical, self.within, 0.0));
+        ctx.set_flex(centre, FlexStyle { justify: Justify::Center, align: Align::Center, ..FlexStyle::default() });
+        ctx.on_click(centre, move || o.set(false));
+        let body = ctx.push(Node::stack(Axis::Vertical, Rect::new(0.0, 0.0, w, 0.0), space::LG));
+        ctx.set_flex(body, FlexStyle { padding: space::LG, ..FlexStyle::default() });
+        let inset = |d: f32| FlexStyle { absolute_inset: Some([Some(d), Some(d), Some(d), Some(d)]), ..FlexStyle::default() };
+        let edge = ctx.add(Node::Rect { rect: Rect::ZERO_SIZED, fill: t.border_default(), radius: radius::LG });
+        ctx.set_flex(edge, inset(0.0));
+        let fill = ctx.add(Node::Rect { rect: Rect::ZERO_SIZED, fill: t.bg_elevated(), radius: radius::LG - stroke::DEFAULT });
+        ctx.set_flex(fill, inset(stroke::DEFAULT));
         ctx.autofocus(body);
         ctx.on_click(body, || {});
         let o = self.open.clone();
@@ -388,23 +393,16 @@ impl View for Dialog {
                 o.set(false);
             }
         });
-        ctx.tree.insert(Some(body), Node::Text { rect: Rect::new(r.x() + pad, r.y() + pad, w - 2.0 * pad, th), content: self.title.clone(), style: title_s });
-        ctx.tree.insert(Some(body), Node::Text { rect: Rect::new(r.x() + pad, r.y() + pad + th + space::SM, w - 2.0 * pad, bh), content: self.body.clone(), style: body_s });
+        ctx.push(Node::stack(Axis::Vertical, Rect::ZERO_SIZED, space::SM));
+        ctx.add(Node::Text { rect: Rect::ZERO_SIZED, content: self.title.clone(), style: text(t.text_primary(), type_size::LG, font::SANS, Weight::Semibold) });
+        ctx.add(Node::Text { rect: Rect::ZERO_SIZED, content: self.body.clone(), style: text(t.text_secondary(), type_size::SM, font::SANS, Weight::Regular) });
+        ctx.pop();
 
         // Buttons bottom right, primary last.
-        let by = r.y() + h - pad - btn_h;
-        let mut x = r.x() + w - pad;
+        let row = ctx.push(Node::stack(Axis::Horizontal, Rect::ZERO_SIZED, space::XS));
+        ctx.set_flex(row, FlexStyle { justify: Justify::End, align: Align::Baseline, ..FlexStyle::default() });
         let last = self.buttons.len().saturating_sub(1);
-        let mut placed = Vec::new();
-        for (i, b) in self.buttons.iter().enumerate().rev() {
-            let bw = Node::measure_text(&b.label, &text(t.text_primary(), type_size::MD, font::SANS, Weight::Medium)).w + 2.0 * space::SM;
-            x -= bw;
-            placed.push((i, x, bw));
-            x -= space::XS;
-        }
-        placed.reverse();
-        for (i, bx, bw) in placed {
-            let b = &self.buttons[i];
+        for (i, b) in self.buttons.iter().enumerate() {
             let (o, act) = (self.open.clone(), b.action.clone());
             let btn = if i == last && b.destructive {
                 Button::destructive(b.label.clone())
@@ -413,12 +411,14 @@ impl View for Dialog {
             } else {
                 Button::secondary(b.label.clone())
             };
-            btn.at(bx, by).width(bw).on_click(move || {
+            ctx.place(btn.on_click(move || {
                 o.set(false);
                 act();
-            })
-            .render(ctx);
+            }));
         }
+        ctx.pop();
+        ctx.pop();
+        ctx.pop();
     }
 }
 

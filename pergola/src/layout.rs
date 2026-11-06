@@ -132,6 +132,9 @@ pub struct FlexStyle {
     pub padding_y: Option<f32>,
     pub justify: Justify,
     pub align: Align,
+    /// A row that runs out of width carries on on the next line (`spacing`
+    /// apart, as between children).
+    pub wrap: bool,
 }
 
 impl Default for FlexStyle {
@@ -155,6 +158,7 @@ impl Default for FlexStyle {
             padding_y: None,
             justify: Justify::Start,
             align: Align::Stretch,
+            wrap: false,
         }
     }
 }
@@ -378,6 +382,10 @@ fn build(
                 Axis::Vertical => FlexDirection::Column,
             };
             style.gap = Size { width: length(*spacing), height: length(*spacing) };
+            if fs.wrap {
+                style.flex_wrap = FlexWrap::Wrap;
+                style.align_content = Some(AlignContent::FLEX_START);
+            }
             let px = fs.padding_x.unwrap_or(fs.padding);
             let py = fs.padding_y.unwrap_or(fs.padding);
             style.padding = taffy::Rect {
@@ -515,6 +523,18 @@ mod tests {
         assert_eq!(tree.get(doc).unwrap().rect(), Rect::new(0.0, 50.0, 300.0, 400.0));
         assert_eq!(tree.get(a).unwrap().rect(), Rect::new(10.0, 60.0, 20.0, 5.0), "not laid out, only moved");
         assert_eq!(tree.get(b).unwrap().rect(), Rect::new(40.0, 350.0, 20.0, 5.0));
+    }
+
+    #[test]
+    fn a_wrapping_row_carries_on_on_the_next_line() {
+        let mut tree = NodeTree::new();
+        let row = tree.insert(None, Node::hstack(Rect::new(0.0, 0.0, 100.0, 0.0), 10.0));
+        tree.set_style(row, FlexStyle { wrap: true, align: Align::Start, ..FlexStyle::default() });
+        let ids: Vec<_> = (0..3).map(|_| tree.insert(Some(row), Node::Rect { rect: Rect::new(0.0, 0.0, 40.0, 20.0), fill: palette::neutral_300(), radius: 0.0 })).collect();
+        layout(&mut tree, row);
+        assert_eq!(tree.get(ids[1]).unwrap().rect(), Rect::new(50.0, 0.0, 40.0, 20.0));
+        assert_eq!(tree.get(ids[2]).unwrap().rect(), Rect::new(0.0, 30.0, 40.0, 20.0), "no room: next line");
+        assert_eq!(tree.get(row).unwrap().rect().h(), 50.0);
     }
 
     #[test]

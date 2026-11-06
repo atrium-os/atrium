@@ -2,7 +2,7 @@
 //! window, for checking them on a live frescod (headless: its PNG is the
 //! screenshot). Runs `SHOWCASE_SECS` (default 40) then exits.
 //!
-//!   FRESCO_SOCKET=… showcase [dark]
+//!   FRESCO_SOCKET=… showcase [dark] [dialog]
 
 use std::cell::RefCell;
 use std::rc::Rc;
@@ -16,13 +16,14 @@ use pergola::text_edit::TextEdit;
 use pergola::theme::{font, space, type_size, Semantic, Weight};
 use pergola::view::{Ctx, View};
 use pergola::widgets::canvas::{Canvas, Item};
-use pergola::widgets::{Check, Checkbox, Dropdown, GroupBox, MenuState, ScrollState, Section, Segmented, Slider, Tabs, Toggle};
+use pergola::widgets::{Check, Checkbox, Dialog, DialogButton, Dropdown, GroupBox, MenuState, ScrollState, Section, Segmented, Slider, Tabs, Toggle};
 use pergola::{App, Button, Color, Mutable, SizeSpec, TextField, TextStyle, Window, WindowDesc};
 use pergola_document::{Doc, DocumentView};
 
 struct Show {
     name: Mutable<TextEdit>,
     check: Mutable<Check>,
+    dialog: Mutable<bool>,
     plan: Mutable<usize>,
     plan_menu: Mutable<MenuState>,
     toggle: Mutable<bool>,
@@ -68,12 +69,17 @@ impl View for Show {
         // below this line but the column's).
         let col = ctx.push(Node::stack(Axis::Vertical, Rect::new(24.0, 20.0, 392.0, 0.0), space::LG));
         Section::new("Buttons").show(ctx, |ctx| {
-            row(ctx, space::XS, |ctx| {
-                ctx.place(Button::primary("Save").on_click(|| {}));
-                ctx.place(Button::secondary("Cancel").on_click(|| {}));
-                ctx.place(Button::ghost("More").on_click(|| {}).tooltip("More actions"));
-                ctx.place(Button::destructive("Delete").on_click(|| {}));
-            });
+            // A wrapping row: what does not fit goes on the next line.
+            let r = ctx.push(Node::stack(Axis::Horizontal, Rect::ZERO_SIZED, space::XS));
+            ctx.set_flex(r, FlexStyle { align: Align::Baseline, wrap: true, ..FlexStyle::default() });
+            ctx.place(Button::primary("Save").on_click(|| {}));
+            ctx.place(Button::secondary("Cancel").on_click(|| {}));
+            ctx.place(Button::ghost("More").on_click(|| {}).tooltip("More actions"));
+            ctx.place(Button::destructive("Delete").on_click(|| {}));
+            for l in ["Archive", "Share", "Export"] {
+                ctx.place(Button::secondary(l).on_click(|| {}));
+            }
+            ctx.pop();
         });
         GroupBox::new("Account").show(ctx, |ctx| {
             let g = ctx.push(Node::stack(Axis::Vertical, Rect::ZERO_SIZED, 0.0));
@@ -106,6 +112,11 @@ impl View for Show {
 
         heading(ctx, 448.0, 20.0, "DocumentView");
         self.doc.render(ctx);
+        Dialog::new(self.dialog.clone(), Rect::new(0.0, 0.0, 1280.0, 720.0), "Discard changes?", "Your edits to this page have not been saved.", vec![
+            DialogButton::new("Keep editing", || {}),
+            DialogButton::new("Discard", || {}).destructive(),
+        ])
+        .render(ctx);
     }
 }
 
@@ -146,7 +157,7 @@ fn page() -> String {
 }
 
 fn main() -> std::io::Result<()> {
-    let dark = std::env::args().nth(1).as_deref() == Some("dark");
+    let dark = std::env::args().any(|a| a == "dark");
     let secs: u64 = std::env::var("SHOWCASE_SECS").ok().and_then(|s| s.parse().ok()).unwrap_or(40);
     let mut window = Window::open(&WindowDesc::new("Pergola showcase", SizeSpec::Fixed(1280, 800)))?;
     window.follow_appearance(false);
@@ -155,6 +166,7 @@ fn main() -> std::io::Result<()> {
     let view = Show {
         name: Mutable::with_dirty(TextEdit::new("Shankar"), dirty.clone()),
         check: Mutable::with_dirty(Check::On, dirty.clone()),
+        dialog: Mutable::with_dirty(std::env::args().any(|a| a == "dialog"), dirty.clone()),
         plan: Mutable::with_dirty(1usize, dirty.clone()),
         plan_menu: Mutable::with_dirty(MenuState::default(), dirty.clone()),
         toggle: Mutable::with_dirty(true, dirty.clone()),

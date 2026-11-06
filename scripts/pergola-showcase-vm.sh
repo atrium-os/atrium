@@ -3,7 +3,7 @@
 # the FreeBSD dev VM; the composited frame comes back as a PNG.
 #
 #   sh scripts/cloud-vm.sh up
-#   sh scripts/pergola-showcase-vm.sh [dark] [out.png]
+#   sh scripts/pergola-showcase-vm.sh [light|dark|dark-dialog|light-dialog] [out.png]
 set -eu
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 MODE="${1:-light}"
@@ -39,7 +39,7 @@ echo "=== run"
 g "cd /tmp/ps && env FRESCOD_SPLIT=0 FRESCOD_HEADLESS_PNG=/tmp/ps/screen FRESCOD_SOCK=/tmp/ps/fresco.sock \
     FRESCOD_WM_SOCK=/tmp/ps/wm.sock daemon -f -o /tmp/ps/frescod.log $D/frescod </dev/null"
 i=0; while [ $i -lt 60 ] && ! g "test -S /tmp/ps/fresco.sock"; do sleep 2; i=$((i+1)); done
-arg=""; [ "$MODE" = dark ] && arg=dark
+arg="$(echo "$MODE" | tr - " ")"
 S=${SECS:-90}
 g "cd /tmp/ps && env FRESCO_SOCKET=/tmp/ps/fresco.sock SHOWCASE_SECS=$S daemon -f -o /tmp/ps/showcase.log $D/showcase $arg </dev/null"
 # The frame while the window is still up (frescod rewrites the PNG on damage).
