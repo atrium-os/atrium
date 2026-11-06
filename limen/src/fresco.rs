@@ -6,7 +6,7 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use aqueduct::{flag, Connection};
-use fresco_protocol::slot::{self, SlotBind, SlotBindResult};
+use fresco_protocol::slot::{self, PressedQuery, PressedResult, SlotBind, SlotBindResult};
 
 use crate::catalogue::SlotKind;
 use crate::daemon::Compositor;
@@ -24,17 +24,21 @@ impl Frescod {
     pub fn new(path: impl Into<PathBuf>) -> Self { Self { path: path.into(), conn: None } }
 
     fn ask(&mut self, b: &SlotBind) -> std::io::Result<SlotBindResult> {
+        self.call(slot::op::BIND, b)
+    }
+
+    fn call<Q: serde::Serialize, R: serde::de::DeserializeOwned>(&mut self, opc: u16, q: &Q) -> std::io::Result<R> {
         if self.conn.is_none() {
             self.conn = Some(Connection::connect(&self.path)?);
         }
         let c = self.conn.as_mut().unwrap();
         let bad = |e: String| std::io::Error::new(std::io::ErrorKind::InvalidData, e);
-        let payload = postcard::to_stdvec(b).map_err(|e| bad(e.to_string()))?;
-        c.send_message(aqueduct::classes::CLASS_DISPLAY, slot::op::BIND, flag::RESPONSE_EXPECTED, &payload)?;
+        let payload = postcard::to_stdvec(q).map_err(|e| bad(e.to_string()))?;
+        c.send_message(aqueduct::classes::CLASS_DISPLAY, opc, flag::RESPONSE_EXPECTED, &payload)?;
         loop {
             let m = c.recv_message_or_timeout(Duration::from_secs(1))?
                 .ok_or_else(|| bad("frescod did not answer".into()))?;
-            if m.op == slot::op::BIND && m.flags & flag::IS_RESPONSE != 0 {
+            if m.op == opc && m.flags & flag::IS_RESPONSE != 0 {
                 return postcard::from_bytes(&m.payload).map_err(|e| bad(e.to_string()));
             }
         }
@@ -52,6 +56,36 @@ impl Compositor for Frescod {
             Ok(SlotBindResult::Refused { reason }) => Err(reason),
             Err(e) => {
                 eprintln!("limend: frescod slot op: {e}");
+                self.conn = None;
+                Err(u8::MAX)
+            }
+        }
+    }
+
+    fn pressed_within(&mut self, window: WindowToken, ms: u32) -> bool {
+        let q = PressedQuery { window, within_ms: ms.min(slot::PRESSED_MAX_MS) };
+        match self.call::<_, PressedResult>(slot::op::PRESSED, &q) {
+            Ok(PressedResult::Ok { pressed }) => pressed,
+            Ok(PressedResult::Refused { reason }) => {
+                eprintln!("limend: frescod refused the press query ({reason})");
+                false
+            }
+            Err(e) => {
+                eprintln!("limend: frescod press query: {e}");
+                self.conn = None;
+                false
+            }
+        }
+    }
+
+    /// Unbind but keep shown (`keep_shown`), for Forum's `pip` layer.
+    fn release(&mut self, parent: WindowToken, child: WindowToken) -> Result<(), u8> {
+        // The kind and z don't matter for an unbind.
+        match self.ask(&SlotBind { parent, child, kind: slot::kind::PLAIN, rect: None, z: 0, keep_shown: true }) {
+            Ok(SlotBindResult::Ok { .. }) => Ok(()),
+            Ok(SlotBindResult::Refused { reason }) => Err(reason),
+            Err(e) => {
+                eprintln!("limend: frescod slot release: {e}");
                 self.conn = None;
                 Err(u8::MAX)
             }
