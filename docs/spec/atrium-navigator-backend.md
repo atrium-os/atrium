@@ -1503,8 +1503,26 @@ On the corpus (`examples/first_screen_check`: first screen 600 px, laid out to 1
 | readable corpus, the 36 cut | p50 18 / p90 147 ms | p50 10 / p90 54 ms | — |
 
 - *Not yet faster:* normalize still processes the whole document (3.7 s for the table,
-  2.7 s for the standard), before any layout. It is cached by the recording's address,
-  so a second visit skips it. A first visit to a big document is now normalize-bound.
+  2.7 s for the standard), before any layout. **Correction (same day):** this section
+  first said the normalized document is cached by the recording's address, so a second
+  visit skips it. It is not. No such cache exists. The display path (normalize, layout,
+  scene) is not wired into the broker's worker yet; `bigdoc_measure` and these examples
+  model it. The cache keyed by recording and font-set version (§8.5) is a design.
+- *Where a big document's worker memory is now* (after style sharing; peak resident set,
+  `examples/bigdoc_measure` and `examples/layout_peak`):
+
+  | document | normalize + layout + scene (today's path) | from an already-normalized document | …first screen only |
+  |---|---|---|---|
+  | HTML Living Standard | 1,251 MiB | 646 MiB | 409 MiB |
+  | 100,000-row table | 1,320 MiB | 669 MiB | 344 MiB |
+  | HN thread | 613 MiB | 215 MiB | 218 MiB |
+  | coreutils manual | 361 MiB | 120 MiB | 79 MiB |
+  | War and Peace | 290 MiB | 200 MiB | 51 MiB |
+
+  Normalizing is about half the peak of the big documents. A worker that receives the
+  normalized document (normalized once, stored by content address) halves its peak and
+  skips 2.7–3.7 s. Bands with checkpoints then remove most of the layout's share. What
+  remains is parsing and styling the whole document.
 - *Band culling in the compositor* (`scroll_bench --bands`): the index takes 7–14 ms to
   build. On the HTML standard at 120 Hz with strips, frame p50 goes 4.0 → 2.3 ms and p99
   8.9 → 5.2 ms. `--verify`, against a reference that walks the whole scene, finds 0
