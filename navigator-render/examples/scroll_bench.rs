@@ -1,5 +1,6 @@
 //! scroll_bench <normalized.html> [--hz 60|120] [--pattern fling|flings|page|jump] [--secs N]
 //!              [--scale 1|2] [--csv out.csv] [--inject-stall MS@T]
+//!              [--compose full|strip] [--fast PX_PER_S] [--blur]
 //!
 //! ★ THE SCROLL HARNESS (backend §4.8, step 2): what scrolling a document
 //! costs, frame by frame, with the TAIL and the TIMELINE reported — not just
@@ -20,6 +21,12 @@
 //! server's envelope; clips, groups and transforms are not applied (their
 //! nodes are drawn as if unclipped). It measures the structure of the work:
 //! today, one whole-page scene the compositor walks every frame.
+//!
+//! `--compose strip`: the window keeps its last frame, a scroll shifts it and
+//! only the exposed rows are rastered (`strip_frame`); above `--fast` px/s
+//! (2,500) new strips draw text as bars (greeked) and, with `--blur`, the
+//! window gets a velocity-scaled vertical motion blur; when the fling slows,
+//! the window is redrawn sharp once (`sharp_after_slowdown_ms`).
 //!
 //! `--inject-stall MS@T`: the frame starting at or after T ms takes MS ms
 //! longer — the POSITIVE CONTROL: a harness that reports no stalls must be
@@ -84,6 +91,105 @@ impl Atlas {
     }
 }
 
+impl Compositor<'_> {
+    /// ★ SHIFT, THEN DRAW ONLY THE STRIP (asked by the user, 2026-11-06):
+    /// the window keeps its last frame; a scroll moves those pixels by the
+    /// whole-pixel delta and rasters only the rows it exposed. A delta as big
+    /// as the window, or the first frame, redraws it all. `greek`: the new
+    /// strip's text drawn as bars; `blur`: a vertical motion blur scaled to
+    /// the velocity over the composed window (the CPU stands in for what is
+    /// one GPU pass). Returns the rows rastered.
+    fn strip_frame(&mut self, y: i64, greek: bool, blur_px: u32, force_full: bool) -> u32 {
+        let (w, h) = (self.w as usize, self.h as usize);
+        let y_dev = (y as f64 * self.scale as f64 / PX as f64).round() as i64;
+        if self.buf.len() != w * h { self.buf = vec![0; w * h]; self.buf_y = None }
+        let dy = self.buf_y.map(|b| y_dev - b);
+        let rows = match dy {
+            Some(d) if !force_full && d.unsigned_abs() < h as u64 => {
+                let d = d as isize;
+                if d > 0 {
+                    self.buf.copy_within(d as usize * w.., 0);
+                    let start = (h - d as usize) as i64;
+                    self.region(((y_dev + start) as f64 * PX as f64 / self.scale as f64) as i64, d as u32, greek);
+                    let n = d as usize * w;
+                    self.buf[(h - d as usize) * w..].copy_from_slice(&self.target[..n]);
+                    d as u32
+                } else if d < 0 {
+                    let d = (-d) as usize;
+                    self.buf.copy_within(..(h - d) * w, d * w);
+                    self.region(y, d as u32, greek);
+                    self.buf[..d * w].copy_from_slice(&self.target[..d * w]);
+                    d as u32
+                } else { 0 }
+            }
+            _ => {
+                self.region(y, h as u32, greek);
+                self.buf.copy_from_slice(&self.target[..w * h]);
+                h as u32
+            }
+        };
+        self.buf_y = Some(y_dev);
+        if greek && rows > 0 { self.blurred = true }
+        if blur_px > 0 { vertical_blur(&mut self.buf, w, h, blur_px as usize); self.blurred = true }
+        rows
+    }
+}
+
+impl Compositor<'_> {
+    /// ★ SHARPEN PROGRESSIVELY: once a fling slows, the window it drew
+    /// greeked or blurred is queued in `SHARPEN_SLICES` slices (page rows),
+    /// and one is re-rastered sharp per frame — twelve cheap frames (100 ms
+    /// at 120 Hz) instead of one full redraw that misses a vsync. Thirds
+    /// missed 2% and sixths 3% on the HTML standard at 120 Hz: every frame
+    /// also pays ~3 ms to walk its 935,000-node scene, so a 100-row slice
+    /// cost ~9 ms. Rows that scrolled out are dropped.
+    fn queue_sharpen(&mut self) {
+        let (h, y) = (self.h as i64, self.buf_y.unwrap_or(0));
+        let slice = (h + SHARPEN_SLICES - 1) / SHARPEN_SLICES;
+        self.sharpen = (0..SHARPEN_SLICES).map(|k| (y + k * slice, slice.min(h - k * slice).max(0) as u32)).filter(|r| r.1 > 0).collect();
+    }
+
+    /// One queued slice, re-rastered sharp where it is in the window now.
+    /// Returns the rows drawn.
+    fn sharpen_step(&mut self) -> u32 {
+        let Some((py, rows)) = (!self.sharpen.is_empty()).then(|| self.sharpen.remove(0)) else { return 0 };
+        let (w, h) = (self.w as usize, self.h as i64);
+        let top = (py - self.buf_y.unwrap_or(0)).max(0);
+        let bot = (py + rows as i64 - self.buf_y.unwrap_or(0)).min(h);
+        if bot <= top { return 0 }
+        let n = (bot - top) as u32;
+        let page = self.buf_y.unwrap_or(0) + top;
+        self.region((page as f64 * PX as f64 / self.scale as f64) as i64, n, false);
+        self.buf[top as usize * w..bot as usize * w].copy_from_slice(&self.target[..n as usize * w]);
+        if self.sharpen.is_empty() { self.blurred = false }
+        n
+    }
+}
+
+/// How many slices a settled window is sharpened in, one per frame.
+const SHARPEN_SLICES: i64 = 12;
+
+/// A vertical box blur of radius `r` over a packed RGBA8 window: the
+/// motion blur a fast fling is drawn with.
+fn vertical_blur(buf: &mut [u32], w: usize, h: usize, r: usize) {
+    let src = buf.to_vec();
+    let n = (2 * r + 1) as u32;
+    for x in 0..w {
+        let mut acc = [0u32; 4];
+        let px = |y: isize| src[(y.clamp(0, h as isize - 1) as usize) * w + x];
+        for y in -(r as isize)..=(r as isize) { let p = px(y); for c in 0..4 { acc[c] += (p >> (8 * c)) & 255 } }
+        for y in 0..h as isize {
+            buf[y as usize * w + x] = (0..4).fold(0, |o, c| o | ((acc[c] / n) << (8 * c)));
+            let (a, b) = (px(y + r as isize + 1), px(y - r as isize));
+            for c in 0..4 { acc[c] = acc[c] + ((a >> (8 * c)) & 255) - ((b >> (8 * c)) & 255) }
+        }
+    }
+}
+
+/// Whether greeked rows may still be on screen (none queued, but greek
+/// strips drawn since the last full sharpen): verification waits for sharp.
+fn greek_frames_pending(c: &Compositor) -> bool { c.blurred }
+
 /// The node's vertical extent in the scene, for culling.
 fn extent(s: &Nsg, kind: u8, i: usize) -> Option<(i64, i64)> {
     match kind {
@@ -107,12 +213,22 @@ struct Compositor<'a> {
     nsg: &'a Nsg, fonts: &'a FontSet, ctx: swash::scale::ScaleContext, atlas: Atlas,
     textures: HashMap<String, usize>, tex_store: Vec<Texture>, t2: tier2::Tier2, w: u32, h: u32, scale: f32,
     target: Vec<u32>, glyphs_skipped: u64,
+    /// `--compose strip`: the window as last composed, and where it was (device px).
+    buf: Vec<u32>, buf_y: Option<i64>, blurred: bool,
+    /// Rows still drawn greeked or blurred, as page rows (device px), to
+    /// re-raster sharp a slice per frame once a fling slows.
+    sharpen: Vec<(i64, u32)>,
 }
 
 impl Compositor<'_> {
     /// One frame at scroll `y` (1/64 px): cull, translate, pack, raster.
-    fn frame(&mut self, y: i64) {
-        let (vw, vh) = (self.w as f32 / self.scale, self.h as f32 / self.scale);
+    fn frame(&mut self, y: i64) { self.region(y, self.h, false) }
+
+    /// `rows` device rows of the page starting at `y` (1/64 CSS px) into
+    /// `self.target` (`self.w` × `rows`). With `greek`, text is drawn as a
+    /// bar per run, the cheap stand-in for text a fling moves too fast to read.
+    fn region(&mut self, y: i64, rows: u32, greek: bool) {
+        let (vw, vh) = (self.w as f32 / self.scale, rows as f32 / self.scale);
         let (y0, y1) = (y, y + (vh * PX as f32) as i64);
         let dy = y as f32 / PX as f32;
         let s = self.scale;
@@ -128,6 +244,14 @@ impl Compositor<'_> {
                     if r.ring > 0 { continue } // rings (borders) approximated away
                     scene.rects.push(Rect { position: [r.x as f32 / PX as f32 * s, (r.y as f32 / PX as f32 - dy) * s],
                         size: [r.w as f32 / PX as f32 * s, r.h as f32 / PX as f32 * s], color: rgba(r.rgba), radius: r.radii[0] as f32 / PX as f32 * s });
+                }
+                1 if greek => {
+                    let r = &self.nsg.runs[i];
+                    let w = r.glyphs.last().map(|g| g.1).unwrap_or(0) + r.size / 2;
+                    let mut col = rgba(r.rgba);
+                    col[3] *= 0.5;
+                    scene.rects.push(Rect { position: [r.x as f32 / PX as f32 * s, ((r.y - r.size * 45 / 100) as f32 / PX as f32 - dy) * s],
+                        size: [w as f32 / PX as f32 * s, (r.size * 40 / 100) as f32 / PX as f32 * s], color: col, radius: 0.0 });
                 }
                 1 => {
                     let r = &self.nsg.runs[i];
@@ -169,7 +293,7 @@ impl Compositor<'_> {
         let atlas_i = scene.textures.len();
         scene.textures.push(Texture { width: self.atlas.w, height: self.atlas.h, format: TexFormat::R8, data: std::mem::take(&mut self.atlas.data) });
         scene.glyph_batches.push(GlyphBatch { atlas: atlas_i, runs });
-        let (frame, _) = Frame::pack_report(&scene, self.w, self.h, self.w);
+        let (frame, _) = Frame::pack_report(&scene, self.w, rows.max(1), self.w);
         self.target.resize(frame.target_words(), 0);
         let _ = self.t2.render(&frame, &mut self.target);
         // Give the textures back.
@@ -209,6 +333,11 @@ fn main() {
     let pattern = opt("--pattern").unwrap_or_else(|| "flings".into());
     let secs: f64 = opt("--secs").map(|v| v.parse().unwrap()).unwrap_or(8.0);
     let scale: f32 = opt("--scale").map(|v| v.parse().unwrap()).unwrap_or(1.0);
+    let strip = opt("--compose").as_deref() == Some("strip");
+    let fast: f64 = opt("--fast").map(|v| v.parse().unwrap()).unwrap_or(2500.0);
+    let blur = args.iter().any(|a| a == "--blur");
+    let verify = args.iter().any(|a| a == "--verify");
+    let (mut verified, mut verify_bad) = (0usize, 0usize);
     let mut inject: Option<(f64, f64)> = opt("--inject-stall").map(|v| {
         let (ms, at) = v.split_once('@').expect("MS@T");
         (ms.parse().unwrap(), at.parse().unwrap())
@@ -226,7 +355,8 @@ fn main() {
     tier2::Tier2::seed_cache(dir.path()).expect("cranelift");
     let t2 = tier2::Tier2::new(dir.path().to_path_buf(), "/nonexistent/atrium-spv-compile".into()).expect("tier2");
     let mut c = Compositor { nsg: &nsg, fonts: &fonts, ctx: swash::scale::ScaleContext::new(), atlas: Atlas::new(), textures: HashMap::new(),
-                             tex_store: vec![], t2, w: (vw as f32 * scale) as u32, h: (vh as f32 * scale) as u32, scale, target: vec![], glyphs_skipped: 0 };
+                             tex_store: vec![], t2, w: (vw as f32 * scale) as u32, h: (vh as f32 * scale) as u32, scale, target: vec![], glyphs_skipped: 0,
+                             buf: vec![], buf_y: None, blurred: false, sharpen: vec![] };
     // ---- The replay. ----
     let period = 1000.0 / hz;
     let frames = (secs * hz) as usize;
@@ -234,6 +364,8 @@ fn main() {
     let mut pending: Option<(f64, f64, f64)> = None; // (present at, y, sampled at)
     let (mut shown_y, mut shown_sampled) = (0.0f64, 0.0f64);
     let mut costs: Vec<f64> = vec![];
+    let (mut prev_goal, mut greek_on, mut greek_frames, mut rows_total, mut sharp_waits) = (0.0f64, false, 0usize, 0u64, Vec::<f64>::new());
+    let mut slow_since: Option<f64> = None;
     let mut rows: Vec<(f64, f64, f64, f64, f64, bool)> = vec![];
     let (mut missed, mut run, mut longest_run) = (0usize, 0usize, 0usize);
     for k in 0..frames {
@@ -245,8 +377,41 @@ fn main() {
         if !busy {
             // A new frame starts at this vsync, for the target as it is now.
             let s = Instant::now();
-            c.frame(goal as i64);
+            if strip {
+                // Velocity, px/s, from the targets of consecutive vsyncs.
+                let v = (goal - prev_goal).abs() / PX as f64 * hz;
+                let fast_now = v > fast;
+                if !fast_now && slow_since.is_none() && greek_on { slow_since = Some(t) }
+                // Settled: the window drawn greeked or blurred is queued, and
+                // sharpened a third per frame (`queue_sharpen`).
+                let settle = greek_on && !fast_now;
+                let blur_px = if blur && fast_now { ((v / 1000.0) * 2.0).min(12.0) as u32 } else { 0 };
+                rows_total += c.strip_frame(goal as i64, fast_now, blur_px, false) as u64;
+                if fast_now { greek_frames += 1; c.sharpen.clear() }
+                if settle { c.queue_sharpen() }
+                if !fast_now && !c.sharpen.is_empty() {
+                    rows_total += c.sharpen_step() as u64;
+                    if c.sharpen.is_empty() { if let Some(s0) = slow_since.take() { sharp_waits.push(t + period - s0) } }
+                }
+                greek_on = fast_now;
+                // ★ The composed window must be what a full redraw would draw
+                // (outside a fling, where it is drawn sharp): checked, not
+                // assumed, off the clock.
+                if verify && !fast_now && !c.blurred && c.sharpen.is_empty() && !greek_frames_pending(&c) {
+                    let elapsed = s.elapsed();
+                    let y_dev = c.buf_y.expect("composed");
+                    c.region(y_dev * PX / c.scale as i64, c.h, false);
+                    let n = (c.w * c.h) as usize;
+                    let bad = c.buf.iter().zip(&c.target[..n]).filter(|(a, b)| a != b).count();
+                    verified += 1;
+                    if bad > 0 { verify_bad += 1 }
+                    let _ = elapsed;
+                }
+            } else {
+                c.frame(goal as i64);
+            }
             cost = s.elapsed().as_secs_f64() * 1e3;
+            if verify { cost = 0.0 } // timings are not measured in a verify run
             if let Some((ms, at)) = inject { if t >= at { cost += ms; inject = None } }
             costs.push(cost);
             free_at = t + cost;
@@ -257,6 +422,7 @@ fn main() {
         let moved = (goal - shown_y).abs() > 0.5;
         let miss = moved && pending.is_some_and(|(at, ..)| at > t + 1e-9) && busy;
         if miss { missed += 1; run += 1; longest_run = longest_run.max(run) } else if !busy { run = 0 }
+        prev_goal = goal;
         let age = if (goal - shown_y).abs() <= 0.5 { 0.0 } else { t - shown_sampled };
         rows.push((t, goal / PX as f64, shown_y / PX as f64, age, cost, miss));
     }
@@ -296,6 +462,11 @@ fn main() {
     let over = |l: f64| stalls.iter().filter(|s| s.2 > l).count();
     println!("stalls\tover_100ms {}\tover_500ms {}\tover_1s {}", over(100.0), over(500.0), over(1000.0));
     for s in &stalls { println!("stall\tstart_ms {:.0}\tlength_ms {:.0}\tworst_age_ms {:.0}\tcatch_up_ms {:.0}", s.0, s.1, s.2, s.3) }
+    if verify { println!("verify\tframes_checked {verified}\tframes_differing {verify_bad}") }
+    if strip {
+        println!("compose\tstrip\trows_rastered_per_frame {:.1} (window {})\tgreeked_frames {greek_frames}\tsharp_after_slowdown_ms {}", rows_total as f64 / costs.len().max(1) as f64, c.h,
+                 if sharp_waits.is_empty() { "-".into() } else { format!("max {:.0}", sharp_waits.iter().cloned().fold(0.0, f64::max)) });
+    }
     if c.glyphs_skipped > 0 { println!("note\tatlas full: {} glyph draws skipped", c.glyphs_skipped) }
     if let Some(p) = opt("--csv") {
         let mut out = String::from("t_ms,target_y,shown_y,age_ms,cost_ms,missed\n");

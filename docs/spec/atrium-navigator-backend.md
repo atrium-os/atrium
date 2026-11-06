@@ -1406,6 +1406,48 @@ runs, 8 s each, 800 × 600 at 1×; M4 Max):
   Bands remove that cost. They introduce worker latency while scrolling, and that is what
   this harness's stall detector is for.
 
+**The compositor for scrolling: shift, draw the strip, greek a fling (proposed
+2026-11-06).** *Asked by the user:* for flings, redraw only the newly exposed strips, but
+still give the impression of scrolling, perhaps with blurred text. Measured in the harness
+(`--compose strip`, `--blur`), and proposed to whoever owns frescod's damage and upload
+paths.
+1. *Shift, then draw only the strip.*
+   - The window keeps its last frame. A scroll moves those pixels by the whole-pixel delta
+     (a GPU blit or texture offset) and rasters only the rows it exposed.
+   - A delta as large as the window, or the first frame, redraws everything.
+   - `--verify` checks that the composed window equals a full redraw at the same position:
+     **0 differing frames** in every run checked. A control that skips writing the strip
+     differs in 239 of 240.
+2. *A fast fling is drawn as motion.*
+   - Above 2,500 px/s, new strips draw text as one bar per run (greeked), at half the text
+     colour's alpha.
+   - With blur on, the window gets a vertical motion blur scaled to the velocity: 2 px per
+     1,000 px/s, at most 12. That is one GPU pass; the CPU here only stands in for it.
+3. *Sharpened progressively when it slows.*
+   - The window drawn greeked is queued in 12 slices of page rows, and one is re-rastered
+     sharp per frame. That is sharp within 100 ms at 120 Hz.
+   - One full redraw at that moment missed a vsync. Thirds missed 2% and sixths 3% on the
+     HTML standard: every frame also pays about 3 ms to walk its 935,000-node scene, so a
+     100-row slice cost 9 ms. Bands, with a spatial index, remove that walk.
+4. *The same trick hides band latency* (with bands): a band not yet laid out when a fling
+   reaches it is drawn as greeked lines in the page's text colour, not blank and not
+   frozen. The stall detector holds real content to 100 ms after the fling stops.
+
+*Measured at 120 Hz, `flings`, 8 s, 2 runs each* (frame p50 / p99 ms; missed vsyncs):
+
+| document | full redraw (today) | strip | strip + greek + blur, sharpened in 12 slices |
+|---|---|---|---|
+| HTML Living Standard | 9.9–10.4 / 12.4–12.5; **50%** | 3.6–3.8 / 4.0–4.1; 0.1% | 3.7 / 8.0; 0.1% |
+| 100,000-row table | 8.6–8.7 / 9.9–10.1; **50%** | 2.8–2.9 / 3.1–3.2; 0.1% | 2.8–2.9 / 6.2; 0.1% |
+| HN thread | 10.4–11.2 / 13.1–15.4; **50%** | 2.6 / 2.9–3.0; 0.1% | 2.6 / 5.8; 0.1% |
+| War and Peace | 7.7–7.8 / 8.7; 5–9% | 3.0–3.1 / 3.4–3.5; 0.1% | 3.0 / 6.6; 0.1% |
+
+- The one missed vsync is the first frame, which draws the whole window.
+- Every run: shown age at most 17 ms (two frames), 0 stalls.
+- About 14–18 rows are rastered per frame, of a 600-row window.
+- *Page-down* still misses 3%. A 600 px jump exposes the whole window, so a page-down
+  should be animated over a few frames, as browsers do, which makes it strips too.
+
 *Gates for bands (proposed):* at 60 Hz, 0 stalls over 100 ms after first display in every
 pattern, p99.9 frame time ≤ 2 periods, and missed vsyncs ≤ 1%. At 120 Hz, the same once
 the compositor redraws by damage.
