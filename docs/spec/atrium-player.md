@@ -1,6 +1,6 @@
 # atrium-player: the native media player
 
-**Status:** plan for review, 2026-11-06. **Owner:** the "Build the native media player"
+**Status:** accepted, 2026-11-06 (Shankar agreed with all six §9 recommendations); M0–M3 in progress. **Owner:** the "Build the native media player"
 thread. This is item P1 of [fresco-video.md](fresco-video.md) §8.
 
 `atrium-player` is the app behind Limen's `media-player` role ([limen.md](limen.md) §2.2,
@@ -208,6 +208,8 @@ Fresco's layers land.
 - A/V sync: measured skew from `PRESENTED` and Lyra's clock stays within half a refresh.
 
 ## 9. Decisions, with recommendations
+
+**Accepted by Shankar, 2026-11-06: all six recommendations below.**
 
 1. **Two processes in the jail, with demux and decode only in a Capsicum'd worker.**
    *Recommend yes.* The jail alone would leave a decoder exploit holding the Limen channel,

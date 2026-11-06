@@ -163,19 +163,23 @@ There are two ways to feed it.
 | parent → child | `Abort` | `track`: drop a half-parsed segment |
 | parent → child | `EndOfStream` | `error: Option<u8>` |
 | parent → child | `SetDuration` | `secs: f64` |
+| parent → child | `CanPlay` | `mime`: asks whether the player decodes this type |
 | parent → child | `Play`, `Pause`, `Stop` | none |
 | parent → child | `Seek` | `secs: f64` |
 | parent → child | `SetVolume` | `volume: f32` (0 to 1) |
 | parent → child | `SetRate` | `rate: f32` (0.25 to 4) |
 | child → parent | `Ready` | `duration_secs: f64`, `width`, `height` |
-| child → parent | `CanPlay` | `type: String` reply to `CanPlay` asks, for `MediaSource.isTypeSupported` |
+| child → parent | `CanPlay` | `mime`, `supported: bool`: the reply, for `MediaSource.isTypeSupported` |
+| child → parent | `Playing`, `Paused` | none: the play state changed, from the parent's message or the native controls |
 | child → parent | `Buffered` | `track`, `ranges: Vec<(f64, f64)>` (at most 64), after each append or remove |
 | child → parent | `Appended` | `track`: the append is parsed, so the next may go (`updateend`) |
 | child → parent | `Time` | `secs: f64`, at most 4 a second |
 | child → parent | `Waiting` | `secs: f64`: playback reached the end of what is buffered |
 | child → parent | `Seeking` | `secs: f64`: the user seeked in the native controls; the parent fetches from there |
 | child → parent | `Ended` | none |
-| child → parent | `Error` | `code: u16` (`DECODE`, `UNSUPPORTED`, `TOO_BIG`) |
+| child → parent | `Error` | `code: u16` (`DECODE`, `UNSUPPORTED`, `TOO_BIG`, `STATE`, `NETWORK`) |
+
+The types are `limen::media_player` (atrium-player.md M0).
 
 **Limits and back-pressure.** One `Append` is in flight per track: the next waits for
 `Appended`. The player keeps at most 150 MB buffered per feed, or its jail's memory limit if

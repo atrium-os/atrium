@@ -5,7 +5,7 @@
 //! - [`daemon`]: limend itself, over traits for frescod and the launcher so
 //!   it can be tested without either.
 //! - [`client`]: the parent's and the child's ends.
-//! - one module per role's messages: [`credential`].
+//! - one module per role's messages: [`credential`], [`media_player`].
 
 pub mod catalogue;
 pub mod client;
@@ -13,4 +13,5 @@ pub mod credential;
 pub mod daemon;
 pub mod fresco;
 pub mod launch;
+pub mod media_player;
 pub mod proto;
