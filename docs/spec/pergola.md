@@ -282,10 +282,11 @@ supplies content (bands, §10.3), never scroll behaviour.
   by the scroll delta (a blit or texture offset) and draws only the newly exposed strip.
   At 4,000 px/s and 120 Hz that is about 33 px of an 800 × 600 window, roughly 6% of a
   full frame.
-- **Never worse than a full draw.** When the exposed strip is more than about half the
-  viewport, or on a jump, the frame is drawn in full and the shift is skipped. The
-  threshold is set by measurement (the Navigator scroll harness,
-  atrium-navigator-backend.md §4.8, reports both paths).
+- **Never worse than a full draw.** Measured (atrium-navigator-backend.md §4.8, harness
+  8e79bd46; Fresco damage test a5bff603): shift-plus-strip costs the full path's fixed
+  per-frame work plus the exposed rows in proportion, plus a sub-millisecond pixel move,
+  so it is no worse than a full draw at any strip height. The only switch is: a scroll of
+  the whole viewport or more, a jump, or the first frame is drawn in full directly.
 - **Motion during fast flings.** Above a speed threshold (start at about 2,500 px/s, tuned
   by eye), a vertical motion blur scaled to velocity. Strips drawn while blurred may be
   cheaper (reduced resolution, or text as greeked lines). As the fling slows below the
