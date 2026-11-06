@@ -123,6 +123,9 @@ impl Feed {
         }
     }
 
+    /// Whether segment `i` is appended and not since removed.
+    pub fn holds(&self, i: usize) -> bool { self.appended.contains(&i) }
+
     /// Start (or restart after an error): fetch from the playhead.
     pub fn start(&mut self, net: &dyn Fetch) {
         self.failed.clear();
@@ -179,7 +182,14 @@ impl Feed {
             return;
         }
         let first = self.covering(self.playhead);
-        let next = self.ready.keys().copied().filter(|&i| i >= first).min().or_else(|| self.ready.keys().copied().next());
+        // ★ Until the playhead's own segment is in, append nothing else:
+        // fetches finish in any order, and a later segment taking the one
+        // Append slot first delays the one playback is waiting for.
+        let next = if !self.appended.contains(&first) && !self.failed.contains(&first) {
+            self.ready.contains_key(&first).then_some(first)
+        } else {
+            self.ready.keys().copied().filter(|&i| i >= first).min().or_else(|| self.ready.keys().copied().next())
+        };
         let Some(i) = next else { return };
         let b = self.ready.remove(&i).unwrap();
         match media.append_buffer(self.track, &b) {

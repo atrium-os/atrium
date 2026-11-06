@@ -306,6 +306,14 @@ fn run(mut conv: Conversation<'static>, o: Open, ctl: &Ctl, inner: &Inner, ev: &
             loop {
                 if cancelled() { return Event::Error { id, code: ErrorCode::Cancelled } }
                 if Instant::now() >= deadline { return Event::Error { id, code: ErrorCode::Timeout } }
+                // ★ A ranged request is complete when its length is in hand:
+                // never wait for credit (or the server's close) it will not
+                // use — with the budget spent exactly, that wait was until
+                // the deadline.
+                if want_len.is_some_and(|l| got >= l) {
+                    send(Event::Progress { id, received: got });
+                    return Event::Done { id, bytes: got };
+                }
                 // Flow control: a Stream request reads only with credit.
                 let mut max = DATA_MAX;
                 if deliver == Deliver::Stream {

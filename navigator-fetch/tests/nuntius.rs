@@ -381,3 +381,24 @@ fn concurrent_requests_are_bounded() {
     assert_eq!(refused.len(), 3, "past 64 in flight, refused");
     for id in 0..MAX_REQUESTS as u32 { n.request(Request::Cancel { id }) }
 }
+
+#[test]
+fn a_ranged_resume_with_exactly_its_credit_completes_without_waiting() {
+    // Regression (fresco-video P3 feed stall test): a ranged request whose
+    // budget was granted exactly — the Navigator's feed grants each segment
+    // its length — spent its last credit on its last byte and then waited
+    // for more credit until the total deadline instead of finishing.
+    let s = server(|n| Plan { etag: "\"v1\"", stall_after: (n == 0).then_some((40_000, 5_000)), ..Default::default() });
+    let (n, rx) = instance(&s, 100_000, GRANT);
+    let mut o = open(1);
+    o.range = Some((0, Some(100_000)));
+    let t = Instant::now();
+    n.request(Request::Open(o));
+    let (k, b, err) = collect(&rx, 1);
+    assert_eq!(err, None);
+    assert_eq!(k.last().map(String::as_str), Some("done"), "{k:?}");
+    assert_eq!(b, (0..100_000).map(byte).collect::<Vec<_>>());
+    assert_eq!(s.seen.lock().unwrap()[1].range.as_deref(), Some("bytes=40000-99999"));
+    assert!(t.elapsed() < Duration::from_secs(3), "done when the length is in hand: {:?}", t.elapsed());
+    assert_eq!(n.budget(), 0, "the credit was spent exactly");
+}
