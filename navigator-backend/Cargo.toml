@@ -26,6 +26,8 @@ blake3 = { version = "1", features = ["pure"] }
 # converter's tools measure. The layout crates do not depend back on this one
 # (pergola.md §10.3).
 navigator-normalize = { path = "../navigator-normalize" }
+# Which views are cookied, and their partition (legacy-web §5.4.1e).
+navigator-cookies = { path = "../navigator-cookies" }
 navigator-render = { path = "../navigator-render" }
 navigator-style = { path = "../navigator-style" }
 # The WHATWG URL parser, for the one decision the broker makes on a URL: where

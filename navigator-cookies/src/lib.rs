@@ -280,6 +280,35 @@ impl<A: Arca, C: Couriers> Broker<A, C> {
     }
 }
 
+/// One hop of a document's redirect chain fetched WITHOUT cookies.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Hop { pub url: String, pub status: u16, pub set_cookie: bool }
+
+/// ★ DOES THE SITE NEED COOKIES? (legacy-web §5.4.1e, the narrower
+/// trigger the measurement asked for.) A cookie check is a chain that sets
+/// a cookie and comes back to its own origin, expecting it; but only a
+/// check that FAILED without one is a reason to make the view private:
+/// the chain ends in an error status, goes round in a loop, or lands on a
+/// URL that names a cookie error. On the 146-URL measurement this catches
+/// exactly the two that needed it (sciencedirect, nature) and none of the
+/// five whose cookie-setting redirects changed nothing.
+pub fn site_needs_cookies(chain: &[Hop]) -> bool {
+    let origin = |u: &str| url::Url::parse(u).ok().map(|u| u.origin().ascii_serialization());
+    let Some(first) = chain.first().and_then(|h| origin(&h.url)) else { return false };
+    // A cookie set, then the same origin again after it.
+    let set_at = chain.iter().position(|h| h.set_cookie);
+    let returns = set_at.is_some_and(|i| chain[i + 1..].iter().any(|h| origin(&h.url).as_deref() == Some(first.as_str())));
+    if !returns { return false }
+    let last = chain.last().expect("non-empty");
+    let failed = last.status >= 400;
+    let looped = chain.iter().enumerate().any(|(i, h)| chain[..i].iter().any(|g| g.url == h.url));
+    let names_error = url::Url::parse(&last.url).is_ok_and(|u| {
+        let s = format!("{}?{}", u.path(), u.query().unwrap_or("")).to_ascii_lowercase();
+        s.contains("cookie") && ["error", "not_supported", "notsupported", "disabled", "required", "enable"].iter().any(|w| s.contains(w))
+    });
+    failed || looped || names_error
+}
+
 // ---------------------------------------------------------------------------
 // The real Arca and launcher, over their sockets.
 // ---------------------------------------------------------------------------
@@ -331,5 +360,30 @@ impl Couriers for Launcher {
         let r = Self::exchange(&mut s, req).map_err(|e| format!("courier {host}: {e}"))?;
         self.open.insert(key, s);
         Ok(r)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    fn hop(url: &str, status: u16, set_cookie: bool) -> Hop { Hop { url: url.into(), status, set_cookie } }
+
+    #[test]
+    fn a_failed_cookie_check_needs_cookies_and_a_passing_one_does_not() {
+        // sciencedirect's shape: a cookie, back to itself, 400 without it.
+        assert!(site_needs_cookies(&[hop("https://www.sd.example/", 302, true), hop("https://auth.sd.example/check", 302, false), hop("https://www.sd.example/", 400, false)]));
+        // nature's: back to itself naming the error.
+        assert!(site_needs_cookies(&[hop("https://www.nature.example/a", 303, true), hop("https://www.nature.example/a?error=cookies_not_supported", 200, false)]));
+        // A loop.
+        assert!(site_needs_cookies(&[hop("https://x.example/", 302, true), hop("https://x.example/go", 302, false), hop("https://x.example/", 302, false)]));
+        // A cookie-setting redirect that works anyway: not a reason.
+        assert!(!site_needs_cookies(&[hop("https://weather.example/", 302, true), hop("https://weather.example/today", 200, false)]));
+        // An error with no cookie in the chain: not a cookie check.
+        assert!(!site_needs_cookies(&[hop("https://x.example/", 404, false)]));
+        // A cookie set, the error elsewhere (another origin): not this site's check.
+        assert!(!site_needs_cookies(&[hop("https://x.example/", 302, true), hop("https://login.other.example/", 400, false)]));
+        // A page about cookies that loads fine.
+        assert!(!site_needs_cookies(&[hop("https://x.example/", 302, true), hop("https://x.example/cookie-policy", 200, false)]));
+        assert!(!site_needs_cookies(&[]));
     }
 }
