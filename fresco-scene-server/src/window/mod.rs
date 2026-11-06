@@ -1044,12 +1044,62 @@ impl Compositor {
         }
     }
 
+    fn is_notification(&self, id: WindowId) -> bool {
+        self.windows.get(&id).is_some_and(|w| w.role == WmRole::Notification)
+    }
+
+    /// Put notification windows above every other window, keeping each
+    /// group's order (docs/spec/tabula.md §5).
+    pub fn layer_notifications(&mut self) {
+        let (mut z, notes): (Vec<WindowId>, Vec<WindowId>) =
+            self.z_order.iter().partition(|&&id| !self.is_notification(id));
+        z.extend(notes);
+        if z != self.z_order {
+            for (i, &id) in z.iter().enumerate() {
+                if let Some(w) = self.windows.get_mut(&id) {
+                    w.z = i as u32;
+                }
+            }
+            self.z_order = z;
+        }
+    }
+
+    /// Keep notification windows inside `band` (`[x, y, w, h]`): shrink
+    /// one that is larger (its client hears the new size) and move it in.
+    pub fn clamp_notifications(&mut self, band: [i32; 4]) {
+        let (bx, by, bw, bh) = (band[0] as f32, band[1] as f32, band[2].max(1) as f32, band[3].max(1) as f32);
+        let ids: Vec<WindowId> = self.windows.keys().copied().filter(|&id| self.is_notification(id)).collect();
+        for id in ids {
+            let size = self.windows[&id].size;
+            // No size yet means "the screen's": the band's, here.
+            let fit = |v: f32, max: f32| if v >= 1.0 { v.min(max).floor() } else { max };
+            let (w, h) = (fit(size.0, bw), fit(size.1, bh));
+            if (w, h) != size {
+                self.resize_window(id, w as u32, h as u32);
+            }
+            if let Some(win) = self.windows.get_mut(&id) {
+                win.pos = (win.pos.0.clamp(bx, bx + bw - w), win.pos.1.clamp(by, by + bh - h));
+            }
+        }
+        self.layer_notifications();
+    }
+
+    /// The window keys go to: the focused one, else the topmost that is
+    /// not a notification (0: none).
+    pub fn keyboard_window(&self) -> u32 {
+        match self.focus.unwrap_or(0) {
+            0 => self.z_order.iter().rev().find(|&&id| id != 0 && !self.is_notification(id)).copied().unwrap_or(0) as u32,
+            f => f as u32,
+        }
+    }
+
     pub fn raise(&mut self, id: WindowId) -> Option<FocusChange> {
         if !self.z_order.iter().any(|&w| w == id) {
             return None;
         }
         self.z_order.retain(|&w| w != id);
         self.z_order.push(id);
+        self.layer_notifications();
         let prev = self.focus;
         self.focus = Some(id);
         if prev == Some(id) {
@@ -1388,5 +1438,29 @@ mod event_tests {
         assert_eq!(decoded.window_id, 7);
         assert_eq!(decoded.width, 1280);
         assert_eq!(decoded.height, 720);
+    }
+}
+
+#[cfg(test)]
+mod notification_tests {
+    use super::*;
+
+    #[test]
+    fn notifications_stay_on_top_inside_their_band() {
+        let mut c = Compositor::new();
+        let a = c.create(1, (300, 200));
+        let n = c.create(2, (2000, 50));
+        c.windows.get_mut(&n).unwrap().role = WmRole::Notification;
+        c.windows.get_mut(&n).unwrap().pos = (-40.0, 900.0);
+        let b = c.create(1, (300, 200));
+        c.clamp_notifications([1500, 24, 420, 500]);
+        assert_eq!(c.z_order.last(), Some(&n), "above a window opened after it");
+        let w = &c.windows[&n];
+        assert_eq!(w.size, (420.0, 50.0));
+        assert_eq!(w.pos, (1500.0, 474.0));
+        c.raise(a);
+        assert_eq!(c.z_order, vec![0, b, a, n], "a raise does not cover it");
+        c.focus = None;
+        assert_eq!(c.keyboard_window(), a as u32, "keys never fall to a toast");
     }
 }

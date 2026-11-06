@@ -275,6 +275,8 @@ fn main() {
     comp.lock().unwrap().set_event_sink(ev_tx.clone());
     let frontend = Arc::new(Mutex::new(EnvelopeFrontend::new(cas, comp.clone())));
     frontend.lock().unwrap().set_display_mode(sw, sh, refresh);
+    // Roles are frescod's to grant: pass a notification ask on.
+    frontend.lock().unwrap().set_notification_uids(None);
     let redraw = redraw::RedrawSignal::new();
     let state = Arc::new(Mutex::new(State::default()));
 
@@ -344,6 +346,7 @@ fn role(r: WmRole) -> Role {
         WmRole::Panel => Role::Panel,
         WmRole::Dialog => Role::Dialog,
         WmRole::Chrome => Role::Chrome,
+        WmRole::Notification => Role::Notification,
         WmRole::Document | WmRole::Hud => Role::Document,
     }
 }

@@ -51,6 +51,8 @@ const DOC_UNFOCUSED: i32 = 5;
 
 fn layer(role: WmRole) -> i32 {
     match role {
+        // frescod keeps toasts on top whatever the layout says.
+        WmRole::Notification => -1,
         WmRole::Dialog => 0,
         WmRole::Hud => 1,
         WmRole::Chrome => 2,
@@ -116,6 +118,12 @@ fn rect_for(screen: &Screen, role: WmRole) -> WmRect {
         }
         WmRole::Hud | WmRole::Chrome => {
             WmRect { x: screen.rect.x, y: screen.rect.y, w: screen.rect.w, h: screen.bar_h }
+        }
+        // frescod's band for toasts (it clamps them there anyway).
+        WmRole::Notification => {
+            let top = (wa.y - screen.rect.y).max(0) as u32;
+            let [x, y, w, h] = fresco_protocol::notification_band(screen.rect.w.max(0) as u32, screen.rect.h.max(0) as u32, top);
+            WmRect { x: screen.rect.x + x, y: screen.rect.y + y, w, h }
         }
     }
 }
@@ -531,7 +539,7 @@ pub mod daemon {
     pub fn shown_in_workspace(
         s: &WmSurfaceInfo, assignment: &HashMap<u32, usize>, active: usize,
     ) -> bool {
-        matches!(s.role, WmRole::Chrome | WmRole::Background | WmRole::Hud)
+        matches!(s.role, WmRole::Chrome | WmRole::Background | WmRole::Hud | WmRole::Notification)
             || assignment.get(&s.surface_id).copied().unwrap_or(active) == active
     }
 
@@ -682,7 +690,7 @@ pub mod daemon {
         /// else on the primary.
         pub fn monitor_of(&self, s: &WmSurfaceInfo, mons: &[WmOutput]) -> u64 {
             let primary = mons.first().map_or(0, |m| m.identity);
-            if matches!(s.role, WmRole::Chrome | WmRole::Hud | WmRole::Background) {
+            if matches!(s.role, WmRole::Chrome | WmRole::Hud | WmRole::Background | WmRole::Notification) {
                 return primary;
             }
             self.home

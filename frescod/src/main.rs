@@ -33,6 +33,7 @@
 
 mod activation;
 mod drag;
+mod notify;
 mod injector_reader;
 mod input_reader;
 mod laminar;
@@ -178,6 +179,7 @@ fn main() -> std::io::Result<()> {
     comp.lock().unwrap().set_event_sink(ev_tx.clone());
 
     let frontend = Arc::new(Mutex::new(EnvelopeFrontend::new(cas, comp.clone())));
+    frontend.lock().unwrap().set_notification_uids(Some(notify::uids().to_vec()));
     /* Publish the desktop's size, so clients can ASK (OP_DISPLAY_INFO)
      * rather than each assuming a screen size, and output 0's modes. */
     frontend.lock().unwrap().set_display_mode(dw, dh, refresh);
@@ -835,6 +837,7 @@ fn run_headless(png: &str) -> std::io::Result<()> {
         injector_reader::spawn(ev_tx.clone(), comp.clone(), W, H, isock);
     }
     let frontend = Arc::new(Mutex::new(EnvelopeFrontend::new(cas, comp.clone())));
+    frontend.lock().unwrap().set_notification_uids(Some(notify::uids().to_vec()));
     /* Headless has no connector, but clients still need an answer — the surface
      * it renders into IS the screen here. Refresh 0 says "no real mode". */
     frontend.lock().unwrap().set_display_mode(W, H, 0);
@@ -930,6 +933,14 @@ fn render_one_frame(
     split:    Option<&split::Broker>,
     screen_w: u32, screen_h: u32,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    /* Toasts above every window, inside their band (tabula.md §5),
+     * whatever the WM or the client asked; before sync, which passes
+     * the sizes on to renderers. */
+    {
+        let top = frontend.lock().unwrap().reserved_top();
+        let band = fresco_protocol::notification_band(screen_w, screen_h, top);
+        comp.lock().unwrap().clamp_notifications(band);
+    }
     if let Some(b) = split {
         b.sync();
     }

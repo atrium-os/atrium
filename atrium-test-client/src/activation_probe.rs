@@ -11,7 +11,7 @@
 
 use fresco_client::{Connection, Event};
 use fresco_protocol::activation::{kind, op, purpose, refusal, Consume, ConsumeResult, Grant, GrantResult, Token};
-use fresco_protocol::{RectParams, WindowHints};
+use fresco_protocol::{RectParams, WindowHints, WmRole};
 use std::io::Write;
 use std::os::unix::net::UnixStream;
 use std::time::{Duration, Instant};
@@ -207,6 +207,33 @@ fn main() {
         }
         other => p.check(false, &format!("the target gets the drop ({other:?})")),
     }
+
+    // The notification layer (tabula.md §5): a toast asking for the whole
+    // screen gets the band, and keys still go to the app.
+    let mut shelf = Connection::connect(sock).expect("app socket");
+    let hints = WindowHints { role: Some(WmRole::Notification), initial_position: Some((0, 0)), ..WindowHints::default() };
+    let toast = shelf.window_create(2000, 2000, "toast", hints).expect("window");
+    shelf.set_default_window(toast as u16);
+    shelf.scene_frame_begin().unwrap();
+    shelf.scene_node_rect(1, RectParams { x: 0.0, y: 0.0, w: 400.0, h: 300.0, r: 0.1, g: 0.1, b: 0.1, a: 1.0, radius: 0.0 }).unwrap();
+    shelf.scene_frame_end().unwrap();
+    std::thread::sleep(Duration::from_secs(2));
+    let rects = p.wm.wm_enumerate().expect("enumerate");
+    let band = rects.iter().find(|s| s.role == WmRole::Notification).map(|s| s.rect);
+    println!("toast at {band:?}");
+    let d = p.app.display_info().expect("display info");
+    println!("display {}x{}, reserved top {}", d.width, d.height, d.reserved_top);
+    // The band: the top right, NOTIFICATION_BAND_W wide, below the strip,
+    // at most half the screen high.
+    let (w, h) = (d.width as i32, d.height as i32);
+    let bw = fresco_protocol::NOTIFICATION_BAND_W as i32;
+    p.check(
+        band.is_some_and(|r| r.x >= w - bw && r.x + r.w <= w && r.y >= d.reserved_top as i32 && r.h <= h / 2),
+        "a toast is kept inside its band",
+    );
+    let (t, _) = p.press(&format!("KEY {HID_A} 1 0"));
+    p.inject(&format!("KEY {HID_A} 0 0"));
+    p.check(t != [0; 16], "keys still go to the app under it");
 
     if p.failed > 0 {
         println!("{} FAILED", p.failed);

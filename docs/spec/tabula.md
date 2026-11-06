@@ -306,6 +306,35 @@ be the system reads as a title under the app's real name. A click dismisses. It 
 ordinary chrome surface until frescod's notification layer exists, and must be listed in
 `PRAECO_SUBSCRIBERS`. Not run on frescod yet.
 
+### 5.2 The notification layer, as built in frescod (2026-11-06)
+
+`WmRole::Notification` is appended to fresco-protocol's roles. In split mode it is `Role::Notification`
+(5). frescod grants it only to the uids in `FRESCOD_NOTIFY_UIDS`, and the default is none.
+Forum's shelf runs under its app's own uid, so the session lists that uid there, as it does for
+`PRAECO_SUBSCRIBERS`. Any other client asking for the role gets `Document`. Every frame, before
+anything is drawn or sent to renderers, frescod applies two rules:
+
+- **Order:** notification windows sit above every other window, but stay below frescod's own
+  strip. The same holds after a WM layout, a raise or a new window. Hit testing follows the same
+  order.
+- **Placement:** each one stays inside `fresco_protocol::notification_band(width, height,
+  reserved_top)`. That is the top right of the screen, 420 px wide, below the strip, and half of
+  the rest of the screen high. A larger window is shrunk, and its client hears the new size. A
+  window placed outside is moved in.
+
+Keys never fall through to a notification. With nothing focused, they go to the topmost other
+window (`Compositor::keyboard_window`). forum-wm places the role in the band, shows it on every
+workspace and never gives it focus.
+
+Tests:
+
+- a compositor unit test covers order, clamping and the keyboard rule;
+- `atrium-activation-probe`, run in the VM in both modes, opens a 2000x2000 toast at (0, 0). It
+  lands at the band, (860, 24, 420, 348) on 1280x720 in split mode, and keys still reach the app.
+
+Still to do: forum-shelf should ask for `Notification` and a band-sized window instead of a
+full-screen chrome surface (Pergola thread).
+
 ## 6. Pergola's part
 
 - `TextField` and `DocumentView`: Ctrl-C/X/V and their menu items spend the activation token of

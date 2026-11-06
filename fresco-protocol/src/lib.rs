@@ -246,7 +246,26 @@ pub enum WmRole {
     Dialog,
     Hud,
     Chrome,
+    /// Toasts (docs/spec/tabula.md §5): frescod keeps these above every
+    /// other window and inside the [`notification_band`], and grants the
+    /// role only to the uids it is configured with (Forum's shelf). Any
+    /// other client asking for it gets `Document`.
+    Notification,
 }
+
+/// Where notification surfaces may be, for a screen `width` x `height`
+/// whose top `reserved_top` rows are frescod's strip: the top right,
+/// [`NOTIFICATION_BAND_W`] wide and half the rest of the screen high.
+/// `[x, y, w, h]`.
+pub fn notification_band(width: u32, height: u32, reserved_top: u32) -> [i32; 4] {
+    let w = NOTIFICATION_BAND_W.min(width) as i32;
+    let top = reserved_top.min(height) as i32;
+    let h = (height as i32 - top) / 2;
+    [width as i32 - w, top, w, h.max(0)]
+}
+
+/// The notification band's width, pixels.
+pub const NOTIFICATION_BAND_W: u32 = 420;
 
 /// One surface, as reported by `OP_WM_ENUMERATE`. `owner_app` is the verified
 /// launch-registry app-id (getpeereid → registry), never the app's self-claim.

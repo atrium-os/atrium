@@ -136,14 +136,7 @@ fn hit(g: &Compositor, x: f32, y: f32) -> (f32, f32, u32) {
 
 /// The focused window (or the topmost non-screen window), mirroring `input_reader`.
 fn focused_window(comp: &Arc<Mutex<Compositor>>) -> u32 {
-    let g = comp.lock().unwrap();
-    let focus_id = g.focus.unwrap_or(0);
-    let effective = if focus_id == 0 {
-        g.z_order.iter().rev().find(|&&id| id != 0).copied().unwrap_or(0)
-    } else {
-        focus_id
-    };
-    effective as u32
+    comp.lock().unwrap().keyboard_window()
 }
 
 fn next_f32<'a>(it: &mut impl Iterator<Item = &'a str>) -> Option<f32> {

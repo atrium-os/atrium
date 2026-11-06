@@ -526,7 +526,10 @@ impl Broker {
                     let g = c.create(r.client_id as u32, (width, height));
                     if let Some(w) = c.windows.get_mut(&g) {
                         w.title = title;
-                        w.role = wm_role(role);
+                        w.role = match wm_role(role) {
+                            WmRole::Notification if !crate::notify::may(uid) => WmRole::Document,
+                            r => r,
+                        };
                         w.owner_uid = uid;
                         if let Some((x, y)) = pos {
                             w.pos = (x as f32, y as f32);
@@ -887,6 +890,7 @@ fn wm_role(r: Role) -> WmRole {
         Role::Panel => WmRole::Panel,
         Role::Background => WmRole::Background,
         Role::Chrome => WmRole::Chrome,
+        Role::Notification => WmRole::Notification,
     }
 }
 

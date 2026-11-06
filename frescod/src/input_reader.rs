@@ -223,16 +223,8 @@ fn run_one(path: String,
          * on WINDOW_CREATE, so initial state would otherwise broadcast
          * every keystroke to every client (bypassing per-window
          * routing). */
-        let target_window = {
-            let g = wm.lock().unwrap();
-            let focus_id = g.focus.unwrap_or(0);
-            let effective = if focus_id == 0 {
-                g.z_order.iter().rev().find(|&&id| id != 0).copied().unwrap_or(0)
-            } else {
-                focus_id
-            };
-            effective as u32
-        };
+        // (Never a notification window: tabula.md §5.)
+        let target_window = wm.lock().unwrap().keyboard_window();
 
         for &k in cur_keys {
             if k == 0 { continue; }

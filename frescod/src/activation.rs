@@ -248,13 +248,9 @@ fn uid_of(name: &str) -> Option<u32> {
 }
 
 /// The window that has the keyboard: the focused one, else the topmost
-/// (what the input readers deliver keys to).
+/// that is not a notification (what the input readers deliver keys to).
 pub fn focused_window(comp: &Mutex<fresco_scene_server::window::Compositor>) -> u32 {
-    let g = comp.lock().unwrap();
-    match g.focus.unwrap_or(0) {
-        0 => g.z_order.iter().rev().find(|&&id| id != 0).copied().unwrap_or(0) as u32,
-        f => f as u32,
-    }
+    comp.lock().unwrap().keyboard_window()
 }
 
 /// Serve the activation socket on FRESCOD_ACTIVATION_SOCK (default

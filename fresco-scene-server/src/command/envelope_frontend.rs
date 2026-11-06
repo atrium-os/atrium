@@ -300,6 +300,9 @@ pub struct EnvelopeFrontend {
     /// what a headless/test frontend reports.
     display_mode: (u32, u32, u32),
     reserved_top: u32,
+    /// Who may open notification surfaces; `None`: anyone (a renderer's
+    /// frontend, which only forwards). Default: no one.
+    notification_uids: Option<Vec<u32>>,
 
     /// What `OP_WM_DISPLAY_MODES` reports (frescod sets it from the
     /// connector), and a switch `OP_WM_SET_DISPLAY_MODE` asked for, which
@@ -342,6 +345,7 @@ impl EnvelopeFrontend {
             client_uids: HashMap::new(),
             display_mode: (0, 0, 0),
             reserved_top: 0,
+            notification_uids: Some(Vec::new()),
             display_modes: fresco_protocol::WmDisplayModesReply { modes: Vec::new(), current: u32::MAX },
             mode_request: None,
             outputs: fresco_protocol::WmOutputsReply { outputs: Vec::new() },
@@ -356,6 +360,14 @@ impl EnvelopeFrontend {
     /// read the connector; call it again on a mode change.
     /// Rows at the top of the screen frescod's own chrome holds (F4d),
     /// reported over OP_DISPLAY_INFO so the WM lays out below them.
+    pub fn set_notification_uids(&mut self, uids: Option<Vec<u32>>) {
+        self.notification_uids = uids;
+    }
+
+    pub fn reserved_top(&self) -> u32 {
+        self.reserved_top
+    }
+
     pub fn set_reserved_top(&mut self, rows: u32) {
         self.reserved_top = rows;
     }
@@ -1110,15 +1122,25 @@ impl EnvelopeFrontend {
              * it to Document. Capability-gating the other privileged roles
              * (e.g. chrome only for shell apps) is future work — today the
              * hint is trusted for everything except hud. */
+            let uid = self.client_uids.get(&self.current_client).copied();
+            /* The notification layer (tabula.md §5) only for the uids
+             * frescod grants it (None: a renderer, which passes the ask
+             * on and frescod decides). */
+            let may_notify = match &self.notification_uids {
+                None => true,
+                Some(u) => uid.is_some_and(|uid| u.contains(&uid)),
+            };
             win.role = match p.hints.role {
                 Some(fresco_protocol::WmRole::Hud) | None => fresco_protocol::WmRole::Document,
+                Some(fresco_protocol::WmRole::Notification) if !may_notify => fresco_protocol::WmRole::Document,
                 Some(r) => r,
             };
             // Stamp the owning uid (resolved at connect) so WM_ENUMERATE carries
             // the surface's stable app identity for workspace assignment.
-            win.owner_uid = self.client_uids.get(&self.current_client).copied().unwrap_or(0);
+            win.owner_uid = uid.unwrap_or(0);
             let _ = p.parent_window_id;
         }
+        comp.layer_notifications();
 
         /* Reply with the assigned window_id. Wire encoding mirrors the
          * payload format (postcard). For a server-assigned u32 the
@@ -1235,6 +1257,7 @@ impl EnvelopeFrontend {
             if let Some(w) = comp.windows.get_mut(&id) { w.z = i as u32; }
         }
         comp.z_order = new_z;
+        comp.layer_notifications();
 
         // 3. focus — set the declared focus (0 = leave unfocused). z is set
         //    above from roles, so focus here must not raise.

@@ -44,6 +44,8 @@ pub enum Role {
     Panel = 2,
     Background = 3,
     Chrome = 4,
+    /// Toasts: frescod grants it only to the uids it is configured with.
+    Notification = 5,
 }
 
 impl Role {
@@ -54,6 +56,7 @@ impl Role {
             2 => Role::Panel,
             3 => Role::Background,
             4 => Role::Chrome,
+            5 => Role::Notification,
             _ => return None,
         })
     }
