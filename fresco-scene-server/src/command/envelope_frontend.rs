@@ -2052,7 +2052,7 @@ mod tests {
         let a = make_window(&mut f, 1, 100, 100);
         let out = |output, identity, x, scale_milli| WmOutput {
             output, identity, rect: WmRect { x, y: 0, w: 1920, h: 1080 },
-            refresh_mhz: 60000, present: true, scale_milli, scale_auto: true, mirror_of: 0,
+            refresh_mhz: 60000, present: true, scale_milli, scale_auto: true, mirror_of: 0, width_mm: 0, height_mm: 0, flapping: false,
         };
         f.set_outputs(vec![out(0, 10, 0, 1000), out(1, 20, 1920, 1500)]);
         let dpi = |rx: &std::sync::mpsc::Receiver<crate::window::DisplayEvent>| -> Vec<(u32, f32)> {
@@ -2094,7 +2094,7 @@ mod tests {
         f.grant_window_management(9);
         let out = |output, identity, mirror_of| WmOutput {
             output, identity, rect: WmRect { x: 0, y: 0, w: 1920, h: 1080 },
-            refresh_mhz: 60000, present: true, scale_milli: 1000, scale_auto: true, mirror_of,
+            refresh_mhz: 60000, present: true, scale_milli: 1000, scale_auto: true, mirror_of, width_mm: 0, height_mm: 0, flapping: false,
         };
         f.set_outputs(vec![out(0, 10, 0), out(1, 20, 10), out(2, 30, 0)]);
         let ask = |f: &mut EnvelopeFrontend, identity, of| {

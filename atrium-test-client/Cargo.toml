@@ -35,6 +35,10 @@ name = "atrium-window-demo"
 path = "src/window_demo.rs"
 
 [[bin]]
+name = "atrium-span-probe"
+path = "src/span_probe.rs"
+
+[[bin]]
 name = "atrium-server-text-demo"
 path = "src/server_text_demo.rs"
 

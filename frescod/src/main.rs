@@ -132,6 +132,14 @@ fn main() -> std::io::Result<()> {
      * held-out member may rejoin. */
     let mut span: Option<span::Span> = None;
     let mut span_recheck: Option<Instant> = None;
+    /* Direct scanout of a span (fresco-span.md §5): the strip shows for a
+     * while after the span starts or the focus moves (`strip_until`, from
+     * the focus last seen); the source of the members' last frame; and
+     * what was last logged about it. */
+    let mut strip_until: Option<Instant> = None;
+    let mut span_focus: Option<Option<u16>> = None;
+    let mut last_direct: Option<span::Direct> = None;
+    let mut direct_said: Option<&'static str> = None;
     /* The gpu renderer can't encode HDR; corrected below once it exists. */
     let guess_hdr = std::env::var("FRESCOD_RENDERER").map_or(true, |v| v != "gpu");
     let seen = seen_outputs(&dpy)?;
@@ -192,7 +200,7 @@ fn main() -> std::io::Result<()> {
      * rather than each assuming a screen size, and output 0's modes. */
     frontend.lock().unwrap().set_display_mode(dw, dh, refresh);
     publish_output0(&frontend, &dpy, &heads);
-    publish_outputs(&frontend, &heads, &scales);
+    publish_outputs(&frontend, &heads, &scales, span.as_ref());
 
     /* ── Socket server ───────────────────────────────────────────── */
     let sock_path = std::env::var("FRESCOD_SOCK")
@@ -371,10 +379,10 @@ fn main() -> std::io::Result<()> {
             hotplug_pending = true;
             if let Ok(seen) = seen_outputs(&dpy) {
                 mark_present(&mut heads, &seen);
-                publish_outputs(&frontend, &heads, &scales);
                 if let Some(s) = span.as_mut() {
                     span_recheck = span_attach(s, &dpy, &heads, &seen, &ev_main, now);
                 }
+                publish_outputs(&frontend, &heads, &scales, span.as_ref());
             }
         }
         /* A held-out span member that has stayed up rejoins. */
@@ -383,6 +391,7 @@ fn main() -> std::io::Result<()> {
             if let (Some(s), Ok(seen)) = (span.as_mut(), seen_outputs(&dpy)) {
                 span_recheck = span_attach(s, &dpy, &heads, &seen, &ev_main, now);
             }
+            publish_outputs(&frontend, &heads, &scales, span.as_ref());
         }
         let mut changed = false;
         /* A WM mirroring a monitor (OP_WM_MIRROR_OUTPUT), or stopping. */
@@ -546,7 +555,7 @@ fn main() -> std::io::Result<()> {
                 remember(&heads, &mut remembered, &mut mirrors_memo);
             }
             screen::set(dw, dh, refresh);
-            publish_outputs(&frontend, &heads, &scales);
+            publish_outputs(&frontend, &heads, &scales, span.as_ref());
             let info = {
                 let mut f = frontend.lock().unwrap();
                 f.set_display_mode(dw, dh, refresh);
@@ -560,6 +569,16 @@ fn main() -> std::io::Result<()> {
         }
 
         let multi = heads.len() > 1;
+        if span.is_some() {
+            let f = comp.lock().unwrap().focus;
+            if span_focus != Some(f) {
+                span_focus = Some(f);
+                strip_until = Some(Instant::now() + span::STRIP_SHOWN);
+            }
+        } else {
+            (span_focus, strip_until, last_direct, direct_said) = (None, None, None, None);
+        }
+        let strip_end_due = strip_until.is_some_and(|t| t <= Instant::now());
         let cur = redraw.current();
         let heartbeat_due = last_render.elapsed() >= heartbeat;
         /* Video (fresco-video.md §4): the next queued frame's time, and with
@@ -572,7 +591,7 @@ fn main() -> std::io::Result<()> {
             vrr_floor.and_then(|lo| video::VIDEOS.repeat_ns(lo)).map(|r| last_present_ns + r),
         ].into_iter().flatten().min();
         let video_due = video_at.is_some_and(|t| t <= now_ns);
-        if cur == last_gen && !heartbeat_due && !reset_due && !video_due {
+        if cur == last_gen && !heartbeat_due && !reset_due && !video_due && !strip_end_due {
             /* Heads that missed the newest frame get it once they land. */
             let mut stale = false;
             if multi {
@@ -588,7 +607,7 @@ fn main() -> std::io::Result<()> {
                 let group = span.as_ref().map(|s| s.active_heads(&heads)).unwrap_or_default();
                 if group.iter().any(|&k| heads[k].stale) {
                     if group.iter().all(|&k| heads[k].landed()) {
-                        present_span(&dpy, &mut heads, &group, &mut framebuffer, dw, frame_deadline_ns, &hdr_enc)?;
+                        present_span(&dpy, &mut heads, &group, last_direct.as_ref(), &mut framebuffer, dw, frame_deadline_ns, &hdr_enc)?;
                     } else {
                         stale = true;
                     }
@@ -602,7 +621,7 @@ fn main() -> std::io::Result<()> {
             let mut until_beat =
                 heartbeat.saturating_sub(last_render.elapsed());
             let now = Instant::now();
-            for t in [gpu_back_at, recheck_at, span_recheck, hotplug_pending.then(|| tracker.settles_at()).flatten()]
+            for t in [gpu_back_at, recheck_at, span_recheck, strip_until, hotplug_pending.then(|| tracker.settles_at()).flatten()]
                 .into_iter()
                 .flatten()
             {
@@ -646,20 +665,58 @@ fn main() -> std::io::Result<()> {
          * folded into this present rather than triggering an extra one. */
         last_gen = redraw.current();
         let t_render = Instant::now();
-        render_one_frame(&mut renderer, &frontend, &comp, split.as_deref(), dw, dh)
-            .map_err(io_other)?;
-        last_present_ns = video::monotonic_ns();
-        let damage = renderer.damage();
-        for h in heads.iter_mut() {
-            h.dirty.add(damage);
-            if reset_due {
-                h.dirty.forget();
-            }
-        }
-        if multi {
-            renderer.read_pixels(&mut framebuffer).map_err(io_other)?;
+        if strip_end_due {
+            strip_until = None;
         }
         let spanned = |h: &heads::Head<'_>| span.as_ref().is_some_and(|s| s.is_member(h.identity));
+        /* A span's members take the window straight when nothing covers
+         * it; the desktop is composed only if some head still shows it. */
+        last_direct = match span.as_ref().map(|s| span::direct(s, &comp, split.as_deref(), &heads, strip_until.is_some())) {
+            Some(Ok(d)) => {
+                if direct_said != Some("") {
+                    eprintln!("frescod: span: direct scanout");
+                    direct_said = Some("");
+                }
+                Some(d)
+            }
+            Some(Err(why)) => {
+                if direct_said != Some(why) {
+                    eprintln!("frescod: span: composed ({why})");
+                    direct_said = Some(why);
+                }
+                None
+            }
+            None => None,
+        };
+        if reset_due {
+            heads.iter_mut().for_each(|h| h.direct.clear());
+        }
+        let compose = last_direct.is_none() || heads.iter().any(|h| h.present && !spanned(h));
+        if compose {
+            render_one_frame(&mut renderer, &frontend, &comp, split.as_deref(), dw, dh)
+                .map_err(io_other)?;
+            let damage = renderer.damage();
+            for h in heads.iter_mut() {
+                h.dirty.add(damage);
+                if reset_due {
+                    h.dirty.forget();
+                }
+            }
+            if multi {
+                renderer.read_pixels(&mut framebuffer).map_err(io_other)?;
+            }
+        } else if let (Some(d), Some(s), Some(b)) = (&last_direct, &span, split.as_deref()) {
+            /* Renderers still hear their sizes; pointer hits go to the
+             * window, as compose would have shown it. */
+            b.sync();
+            let id = s.window_id as u16;
+            let rect = [d.at.0, d.at.1, d.at.0 + d.px.width as i32, d.at.1 + d.px.height as i32];
+            comp.lock().unwrap().shown = Some(vec![
+                fresco_scene_server::window::ShownLayer { id: 0, rect: [0, 0, dw as i32, dh as i32], alpha: None },
+                fresco_scene_server::window::ShownLayer { id, rect, alpha: Some(b.alpha_probe(s.window_id)) },
+            ]);
+        }
+        last_present_ns = video::monotonic_ns();
         for h in heads.iter_mut().filter(|h| h.present && !spanned(h)) {
             if !h.landed() {
                 if !reset_due {
@@ -680,7 +737,7 @@ fn main() -> std::io::Result<()> {
                 for &k in &group {
                     let _ = heads[k].flip_done.wait(heads[k].frame, flip_timeout_ms());
                 }
-                present_span(&dpy, &mut heads, &group, &mut framebuffer, dw, frame_deadline_ns, &hdr_enc)?;
+                present_span(&dpy, &mut heads, &group, last_direct.as_ref(), &mut framebuffer, dw, frame_deadline_ns, &hdr_enc)?;
             } else {
                 group.iter().for_each(|&k| heads[k].stale = true);
             }
@@ -862,6 +919,9 @@ fn upload_head(
 ) -> std::io::Result<(usize, u64)> {
     let back = (h.on_screen + 1) % h.scan.len();
     let next = h.frame + 1;
+    if let Some(x) = h.direct.get_mut(back) {
+        *x = None;
+    }
     /* Only the rows this buffer lacks go up. */
     let lacks = heads::Dirty::take(h, back);
     match renderer {
@@ -891,14 +951,48 @@ fn upload_head(
     Ok((back, next))
 }
 
-/// Put the newest desktop frame on a span's members (`group`: the heads
-/// in its flips) and flip them in one commit, so every monitor shows the
+/// Cut `h`'s tile out of a spanning window's drawing into its next
+/// scanout buffer (direct scanout, fresco-span.md §5): only the rows that
+/// changed since the drawing the buffer holds. Returns (buffer, frame).
+fn upload_direct(
+    h: &mut heads::Head<'_>,
+    d: &span::Direct,
+    deadline_ns: u32,
+    enc: &hdr::Encoder,
+) -> std::io::Result<(usize, u64)> {
+    let back = (h.on_screen + 1) % h.scan.len();
+    let next = h.frame + 1;
+    if h.direct.len() != h.scan.len() {
+        h.direct = vec![None; h.scan.len()];
+    }
+    let held = h.direct[back].filter(|&(_, hdr, vp)| hdr == h.hdr_on && vp == h.vp).map(|(g, ..)| g);
+    let (mut y0, mut y1) = span::tile_rows(d, &h.vp, held).unwrap_or((0, h.mode.height));
+    if y1 <= y0 {
+        /* Nothing changed; one row still goes up, for the fence. */
+        (y0, y1) = (0, 1.min(h.mode.height));
+    }
+    span::tile(d, &h.vp, &mut h.staging, (y0, y1));
+    let pitch = h.mode.width as usize * 4;
+    let range = y0 as usize * pitch..y1 as usize * pitch;
+    if h.hdr_on {
+        enc.encode(&mut h.staging[range.clone()]);
+    }
+    h.scan.upload_range(back, &h.staging, range, deadline_ns, Some((&h.copy_done, next)))?;
+    h.direct[back] = Some((d.px.gen, h.hdr_on, h.vp));
+    /* The buffer no longer holds a desktop frame. */
+    h.dirty.forget();
+    Ok((back, next))
+}
+
+/// Put the newest frame on a span's members (`group`: the heads in its
+/// flips; the window straight with `direct`, else the desktop) and flip them in one commit, so every monitor shows the
 /// same frame from the same vblank (fresco-span.md §5). A refused commit
 /// is logged and tried again next frame: the members stay in the span.
 fn present_span(
     dpy: &Display,
     heads: &mut [heads::Head<'_>],
     group: &[usize],
+    direct: Option<&span::Direct>,
     desktop: &mut [u8],
     desktop_w: u32,
     deadline_ns: u32,
@@ -906,7 +1000,10 @@ fn present_span(
 ) -> std::io::Result<()> {
     let mut up = Vec::with_capacity(group.len());
     for &k in group {
-        up.push(upload_head(&mut heads[k], None, desktop, desktop_w, deadline_ns, enc)?);
+        up.push(match direct {
+            Some(d) => upload_direct(&mut heads[k], d, deadline_ns, enc)?,
+            None => upload_head(&mut heads[k], None, desktop, desktop_w, deadline_ns, enc)?,
+        });
     }
     let parts: Vec<OutputCommit<'_, '_>> = group
         .iter()
@@ -1030,7 +1127,7 @@ fn end_span<'a>(
 /// Tell the WM side where each monitor sits (`OP_WM_OUTPUTS`).
 /// Each monitor's scale is the one the session set for it, else the
 /// automatic one from its pixel density.
-fn publish_outputs(frontend: &Arc<Mutex<EnvelopeFrontend>>, heads: &[heads::Head<'_>], scales: &HashMap<u64, u32>) {
+fn publish_outputs(frontend: &Arc<Mutex<EnvelopeFrontend>>, heads: &[heads::Head<'_>], scales: &HashMap<u64, u32>, span: Option<&span::Span>) {
     let list = heads
         .iter()
         .map(|h| {
@@ -1044,6 +1141,9 @@ fn publish_outputs(frontend: &Arc<Mutex<EnvelopeFrontend>>, heads: &[heads::Head
                 scale_milli: set.unwrap_or_else(|| outputs::auto_scale(&h.conn.edid, h.mode.width, h.mode.height)),
                 scale_auto: set.is_none(),
                 mirror_of: h.mirror_of.unwrap_or(0),
+                width_mm: outputs::size_mm(&h.conn.edid).map_or(0, |s| s.0),
+                height_mm: outputs::size_mm(&h.conn.edid).map_or(0, |s| s.1),
+                flapping: span.is_some_and(|s| s.flapping(h.identity)),
             }
         })
         .collect();

@@ -146,6 +146,23 @@ fn screen_from(w: i32, h: i32, top: i32) -> Screen {
     Screen { rect: WmRect { x: 0, y: top, w, h: h - top }, bar_h: 24, dock_h: 48 }
 }
 
+/// Tell the user (Praeco, as a system poster: praecod's
+/// `PRAECO_SYSTEM_POSTERS` lists Forum's uid), off the event loop.
+fn post_notices(notices: Vec<(String, String)>) {
+    if notices.is_empty() {
+        return;
+    }
+    let sock = std::env::var_os("PRAECO_SOCKET").map_or_else(|| "/var/run/atrium/praecod.sock".into(), std::path::PathBuf::from);
+    std::thread::spawn(move || {
+        for (title, body) in notices {
+            match praeco::client::post(&sock, praeco::proto::urgency::NORMAL, &title, &body) {
+                Ok(id) => eprintln!("forum-wm: told the user: {title} (notification {id})"),
+                Err(e) => eprintln!("forum-wm: could not tell the user \"{title}: {body}\" ({}: {e})", sock.display()),
+            }
+        }
+    });
+}
+
 fn main() -> io::Result<()> {
     // The WM drives its cross-app ops over the DEDICATED window-management socket
     // (reachability = the window-management grant; frescod reads no policy), not
@@ -372,6 +389,7 @@ fn spawn_input_poller(core: Core) {
                                     Ok(None) => {}
                                     Err(e) => eprintln!("forum-wm: relayout on monitor change: {e}"),
                                 }
+                                post_notices(std::mem::take(&mut wm.notices));
                             }
                             Err(e) => eprintln!("forum-wm: outputs: {e}"),
                         }

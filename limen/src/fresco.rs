@@ -47,7 +47,7 @@ impl Compositor for Frescod {
             SlotKind::Plain => slot::kind::PLAIN,
             SlotKind::Credential => slot::kind::CREDENTIAL,
         };
-        match self.ask(&SlotBind { parent, child, kind, rect, z }) {
+        match self.ask(&SlotBind { parent, child, kind, rect, z, keep_shown: false }) {
             Ok(SlotBindResult::Ok { parent_uid, child_uid }) => Ok((parent_uid, child_uid)),
             Ok(SlotBindResult::Refused { reason }) => Err(reason),
             Err(e) => {

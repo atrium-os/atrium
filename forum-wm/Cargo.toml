@@ -29,6 +29,8 @@ toml = "0.8"
 fresco-protocol = { path = "../fresco-protocol" }
 fresco-client = { path = "../fresco-client" }
 forum-ctl = { path = "../forum-ctl" }
+# Notices for the user (a span monitor flapping), posted as a system service.
+praeco = { path = "../praeco" }
 libc = "0.2"
 # forum-ctl admission: resolve a chrome peer's app id (getpeereid → app-registry)
 # and check the owning user's `forum-control` grant.

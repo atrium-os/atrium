@@ -307,6 +307,10 @@ pub struct Window {
     pub hidden: bool,
     /// Created with the `embed_pending` hint (a renderer passes it on).
     pub embed_pending: bool,
+    /// Released from its slot in this window but kept on screen
+    /// (`SlotBind::keep_shown`, picture-in-picture): it goes when that
+    /// window does.
+    pub kept_by: Option<WindowId>,
     /// Names the window to limend (limen.md §5); zero where none is minted.
     pub embed_token: [u8; 16],
     /// Cached title-text glyphs: PathHeader hash + (x, y) baseline
@@ -344,6 +348,7 @@ impl Window {
             slot: None,
             hidden: false,
             embed_pending: false,
+            kept_by: None,
             embed_token: [0; 16],
             title_glyphs: Vec::new(),
             role:  WmRole::Document,
@@ -364,6 +369,7 @@ impl Window {
             slot: None,
             hidden: false,
             embed_pending: false,
+            kept_by: None,
             embed_token: [0; 16],
             title_glyphs: Vec::new(),
             role:  WmRole::Document,
@@ -1205,6 +1211,13 @@ impl Compositor {
     /// hosts slots, is a notification or sits in another parent, or a
     /// bad kind or rect.
     pub fn bind_slot(&mut self, child: WindowId, parent: WindowId, kind: u8, rect: Option<[f32; 4]>, z: u8) -> Result<(), u8> {
+        self.bind_slot_keep(child, parent, kind, rect, z, false)
+    }
+
+    /// [`Self::bind_slot`]; with `keep_shown` a release (`rect: None`)
+    /// leaves the child on screen as a window of its own, tied to `parent`
+    /// (picture-in-picture), instead of hiding it.
+    pub fn bind_slot_keep(&mut self, child: WindowId, parent: WindowId, kind: u8, rect: Option<[f32; 4]>, z: u8, keep_shown: bool) -> Result<(), u8> {
         use fresco_protocol::slot::{kind as k, refusal};
         if child == 0 || parent == 0 || !self.windows.contains_key(&child) || !self.windows.contains_key(&parent) {
             return Err(refusal::UNKNOWN_WINDOW);
@@ -1214,6 +1227,7 @@ impl Compositor {
             && self.windows[&parent].slot.is_none()
             && c.role != WmRole::Notification
             && c.slot.is_none_or(|s| s.parent == parent)
+            && c.kept_by.is_none_or(|p| p == parent)
             && !self.windows.values().any(|w| w.slot.is_some_and(|s| s.parent == child))
             && matches!(kind, k::PLAIN | k::CREDENTIAL)
             && rect.is_none_or(|r| r.iter().all(|v| v.is_finite()) && r[2] >= 1.0 && r[3] >= 1.0);
@@ -1224,11 +1238,27 @@ impl Compositor {
             Some(rect) => {
                 let w = self.windows.get_mut(&child).unwrap();
                 w.slot = Some(Slot { parent, rect, kind, z });
+                w.kept_by = None;
                 w.hidden = false;
                 self.place_slots();
             }
+            None if keep_shown => {
+                // Only a child shown in its slot now: keep_shown never
+                // brings a hidden window up.
+                let w = self.windows.get_mut(&child).unwrap();
+                if w.slot.is_none() || w.hidden {
+                    return Err(refusal::INVALID);
+                }
+                w.slot = None;
+                w.kept_by = Some(parent);
+                if !self.z_order.contains(&child) {
+                    self.z_order.push(child);
+                }
+            }
             None => {
-                self.windows.get_mut(&child).unwrap().slot = None;
+                let w = self.windows.get_mut(&child).unwrap();
+                w.slot = None;
+                w.kept_by = None;
                 self.hide(child);
             }
         }
@@ -1238,10 +1268,12 @@ impl Compositor {
     /// Release every slot in `parent` (it went): their windows hide.
     fn release_slots_in(&mut self, parent: WindowId) {
         let kids: Vec<WindowId> = self.windows.iter()
-            .filter(|(_, w)| w.slot.is_some_and(|s| s.parent == parent))
+            .filter(|(_, w)| w.slot.is_some_and(|s| s.parent == parent) || w.kept_by == Some(parent))
             .map(|(&id, _)| id).collect();
         for id in kids {
-            self.windows.get_mut(&id).unwrap().slot = None;
+            let w = self.windows.get_mut(&id).unwrap();
+            w.slot = None;
+            w.kept_by = None;
             self.hide(id);
         }
     }
@@ -1736,5 +1768,29 @@ mod notification_tests {
         c.raise(p);
         assert_eq!(above(&c), vec![doc, video, over, cred]);
         assert!(c.z_order.iter().position(|&w| w == other).unwrap() < c.z_order.iter().position(|&w| w == p).unwrap());
+    }
+
+    #[test]
+    fn a_child_released_for_picture_in_picture_stays_shown_until_its_parent_goes() {
+        use fresco_protocol::slot::kind;
+        let mut c = Compositor::new();
+        let p = c.create(1, (800, 600));
+        let e = c.create(2, (10, 10));
+        c.hide(e);
+        let r = Some([0.0, 0.0, 400.0, 300.0]);
+        assert_eq!(c.bind_slot_keep(e, p, kind::PLAIN, None, 0, true), Err(fresco_protocol::slot::refusal::INVALID), "never brings a hidden child up");
+        assert_eq!(c.bind_slot(e, p, kind::PLAIN, r, 0), Ok(()));
+        assert_eq!(c.bind_slot_keep(e, p, kind::PLAIN, None, 0, true), Ok(()));
+        let w = &c.windows[&e];
+        assert!(w.slot.is_none() && !w.hidden && c.z_order.contains(&e) && w.kept_by == Some(p), "out of the slot, still shown");
+        // Another parent can't take it while it is kept.
+        let q = c.create(3, (800, 600));
+        assert_eq!(c.bind_slot(e, q, kind::PLAIN, r, 0), Err(fresco_protocol::slot::refusal::INVALID));
+        // Back into its slot, out again, then the parent goes: it goes too.
+        assert_eq!(c.bind_slot(e, p, kind::PLAIN, r, 0), Ok(()));
+        assert!(c.windows[&e].kept_by.is_none());
+        assert_eq!(c.bind_slot_keep(e, p, kind::PLAIN, None, 0, true), Ok(()));
+        assert!(c.destroy(p, 1));
+        assert!(c.windows[&e].hidden && !c.z_order.contains(&e) && c.windows[&e].kept_by.is_none());
     }
 }

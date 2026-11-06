@@ -5306,6 +5306,18 @@ on a window on one of them covers the group. gpusim plug code 6 is the
 desktop monitor with VRR from 60 Hz. `scripts/vm-span-e2e.sh` (copy to
 /root/s) runs it end to end with dropouts, flapping and a member gone, and
 ends with `span: N failed`; `atrium-gpu-rs` `display_span` tests the kernel side.
+Its window is `atrium-span-probe` (atrium-test-client), a test game whose 8 px
+columns encode their x across the window; copy it, `praecod` (for the flapping
+notice) and `forum-ctl` to /root/s too. At `SPAN-DIRECT-MARK` screendump every
+gpusim pipe from the host (`screendump FILE gpusim0 N` on the QEMU monitor,
+N = 0..3; a pipe's number is not its output's) and run
+`scripts/span-probe-check.py 0,1960,3920 pipe-*.ppm`: each member must show its
+tile of the window, continuous across the bezel gaps, with nothing over it.
+`scripts/vm-span-chaos.sh` (STEPS, SEED) puts the span through zoom toggles,
+dropouts, HPD glitches, flapping, a member gone past the grace and bezel
+changes, checks frescod/Forum and the window's width against its tiles after
+each step, and ends zoomed at `CHAOS-END-MARK` for the same pipe check; it ends
+with `span chaos: N steps, M failed` (~25 min for 60 steps).
 `scripts/vm-multimonitor-chaos.sh` (copy to /root/s in the guest) runs a
 seeded storm of plugs, unplugs, dropouts, bursts, arrangements and mirroring and checks
 after each step that frescod and forum-wm live, every plugged monitor is

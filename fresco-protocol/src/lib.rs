@@ -417,6 +417,14 @@ pub struct WmOutput {
     /// fit its own mode when the sizes differ; it is not a place of its own
     /// to lay windows out on.
     pub mirror_of: u64,
+    /// The picture's physical size in millimetres, from the monitor's
+    /// EDID; 0 when it doesn't say (a projector, a TV that hides it).
+    pub width_mm: u32,
+    pub height_mm: u32,
+    /// A span member held out for flapping (fresco-span.md §6: it dropped
+    /// out 3 times within a minute); it rejoins once it stays up 10 s.
+    /// Forum tells the user, naming the monitor.
+    pub flapping: bool,
 }
 
 /// `OP_WM_MIRROR_OUTPUT` — make monitor `identity` mirror monitor `of`, or
@@ -1769,7 +1777,15 @@ pub mod slot {
         /// §8): every window it opens is `embed_pending`, shown only by
         /// `BIND`. The caller sends nothing more on it and passes it on.
         pub const EMBED_CONNECT: u16 = 0x0911;
+        /// `PressedQuery` → `PressedResult`; slot allowlist only: did a
+        /// real key or button press reach this window lately? limend's
+        /// gesture check for picture-in-picture (atrium-player-pip-keys.md
+        /// §3.1): frescod routed the press, so the app can't fake one.
+        pub const PRESSED: u16 = 0x0912;
     }
+
+    /// The longest look back `PressedQuery` takes.
+    pub const PRESSED_MAX_MS: u32 = 5_000;
 
     pub mod kind {
         /// Pinned and clipped to the parent, nothing else.
@@ -1802,6 +1818,26 @@ pub mod slot {
         /// lower one where they overlap, ties go by window (stable), and a
         /// credential slot sits above every plain one whatever its `z`.
         pub z: u8,
+        /// With `rect: None`: the child stays on screen, a window of its
+        /// own the WM places (picture-in-picture, atrium-player-pip-keys.md
+        /// §3.1), instead of hiding. It still goes when its parent does,
+        /// and a later `BIND` with a rect puts it back in the slot.
+        pub keep_shown: bool,
+    }
+
+    /// `PRESSED`: the window (by its embed token) and how far back to look.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+    pub struct PressedQuery {
+        pub window: [u8; 16],
+        /// At most `PRESSED_MAX_MS`.
+        pub within_ms: u32,
+    }
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+    pub enum PressedResult {
+        /// Whether a press reached it within that time.
+        Ok { pressed: bool },
+        Refused { reason: u8 },
     }
 
     #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

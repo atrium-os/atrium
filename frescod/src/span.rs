@@ -16,9 +16,10 @@
 //!   and one that drops [`FLAP_DROPS`] times within [`FLAP_WINDOW`] is held
 //!   out until it has stayed up for [`FLAP_REJOIN`].
 //!
-//! Direct scanout of the game's surface (§5) is not done yet: the members
-//! show the composed desktop, cropped per monitor, as every multi-monitor
-//! desktop does today.
+//! Direct scanout (§5): while nothing frescod must draw covers the members
+//! (the strip, a notification, a credential slot, another window, a video
+//! layer), each member's tile is cut straight from the window's pixels
+//! ([`direct`], [`tile`]) and the desktop is not composed for them.
 
 use std::collections::{HashMap, VecDeque};
 use std::sync::mpsc;
@@ -30,6 +31,8 @@ use fresco_scene_server::span::{self, Place, SpanLayout};
 use fresco_scene_server::window::DisplayEvent;
 
 use crate::heads::Head;
+use crate::outputs::Viewport;
+use crate::pack::Pixels;
 
 /// Drops within [`FLAP_WINDOW`] that make a member flapping.
 pub const FLAP_DROPS: usize = 3;
@@ -170,6 +173,11 @@ impl Span {
     /// Where the moved monitors were (identity, x, y), for the frontend.
     pub fn moved(&self) -> Vec<(u64, i32, i32)> {
         self.orig.iter().map(|&(id, x, y)| (id, x as i32, y as i32)).collect()
+    }
+
+    /// A member held out for flapping.
+    pub fn flapping(&self, id: u64) -> bool {
+        self.held.contains_key(&id)
     }
 
     /// A member is in this frame's flips: attached and not held out.
@@ -338,6 +346,27 @@ mod tests {
     }
 
     #[test]
+    fn a_tile_is_cut_from_the_window_and_only_changed_rows_go_again() {
+        /* A 6x2 window at (-1, 0) over a 4x2 tile at (2, 0): window
+         * columns 3..6 fill tile columns 0..3, column 3 is past it. */
+        let px: Vec<u32> = (0..12).collect();
+        let d = Direct {
+            px: std::sync::Arc::new(Pixels { gen: 7, width: 6, height: 2, px, seq: 0, since: vec![(6, [0, 1, 6, 2])] }),
+            at: (-1, 0),
+        };
+        let vp = Viewport { output: 0, identity: 1, x: 2, y: 0, width: 4, height: 2, refresh_mhz: 60_000 };
+        let mut out = vec![0xaau8; 4 * 2 * 4];
+        tile(&d, &vp, &mut out, (0, 2));
+        let at = |x: usize, y: usize| u32::from_le_bytes(out[(y * 4 + x) * 4..][..4].try_into().unwrap());
+        assert_eq!([at(0, 0), at(1, 0), at(2, 0), at(3, 0)], [3, 4, 5, 0]);
+        assert_eq!([at(0, 1), at(2, 1)], [9, 11]);
+        assert_eq!(tile_rows(&d, &vp, None), None);
+        assert_eq!(tile_rows(&d, &vp, Some(7)), Some((0, 0)));
+        assert_eq!(tile_rows(&d, &vp, Some(6)), Some((1, 2)));
+        assert_eq!(tile_rows(&d, &vp, Some(3)), None);
+    }
+
+    #[test]
     fn drops_far_apart_are_not_flapping() {
         let mut s = bare(&[1, 2]);
         let t0 = Instant::now();
@@ -345,6 +374,110 @@ mod tests {
             s.attach(t0 + Duration::from_secs(k * 40), &[1]);
             s.attach(t0 + Duration::from_secs(k * 40 + 1), &[1, 2]);
             assert!(s.active(2));
+        }
+    }
+}
+
+/// How long frescod's strip shows over a span after it starts or the
+/// focus changes (§7); the members are composed meanwhile.
+pub const STRIP_SHOWN: Duration = Duration::from_secs(3);
+
+/// The window's latest drawing and where it sits on the desktop, for the
+/// members to scan out directly.
+pub struct Direct {
+    pub px: std::sync::Arc<Pixels>,
+    pub at: (i32, i32),
+}
+
+/// What the members show this frame: the window straight, or (`Err`, why)
+/// the composed desktop, because something must be drawn over the window
+/// on a member or there is nothing to take the window from.
+pub fn direct(
+    s: &Span,
+    comp: &std::sync::Mutex<fresco_scene_server::window::Compositor>,
+    split: Option<&crate::split::Broker>,
+    heads: &[Head<'_>],
+    strip: bool,
+) -> Result<Direct, &'static str> {
+    if strip {
+        return Err("the strip is shown");
+    }
+    let b = split.ok_or("the window is drawn by frescod (direct mode)")?;
+    let id = u16::try_from(s.window_id).map_err(|_| "no such window")?;
+    let members: Vec<&Head<'_>> = heads.iter().filter(|h| s.is_member(h.identity)).collect();
+    if members.iter().any(|h| h.vp.width != h.mode.width || h.vp.height != h.mode.height) {
+        return Err("a member scales its picture");
+    }
+    let at = {
+        let g = comp.lock().unwrap();
+        let w = g.windows.get(&id).ok_or("no such window")?;
+        if !w.rendering {
+            return Err("the window is not drawing");
+        }
+        let at = (w.pos.0.round() as i32, w.pos.1.round() as i32);
+        /* Anything above the window on a member: a window, a toast, a
+         * credential slot (each its own window). */
+        let above = g.z_order.iter().skip_while(|&&w| w != id).skip(1);
+        for o in above {
+            let Some(w) = g.windows.get(o).filter(|w| w.rendering) else { continue };
+            let r = [w.pos.0 as i32, w.pos.1 as i32, (w.pos.0 + w.size.0.max(1.0)) as i32, (w.pos.1 + w.size.1.max(1.0)) as i32];
+            if members.iter().any(|h| overlaps(r, &h.vp)) {
+                return Err("another window is above it");
+            }
+        }
+        if !g.z_order.contains(&id) {
+            return Err("the window is not shown");
+        }
+        at
+    };
+    if crate::video::VIDEOS.has_window(s.window_id) {
+        return Err("it shows a video layer");
+    }
+    let px = b.pixels(s.window_id).ok_or("no drawing from the window yet")?;
+    Ok(Direct { px, at })
+}
+
+fn overlaps(r: [i32; 4], vp: &Viewport) -> bool {
+    let v = [vp.x as i32, vp.y as i32, (vp.x + vp.width) as i32, (vp.y + vp.height) as i32];
+    r[0] < v[2] && v[0] < r[2] && r[1] < v[3] && v[1] < r[3]
+}
+
+/// The rows of a member's tile (at `vp`) that changed between drawing
+/// `held` and `d` (`None`: all of them).
+pub fn tile_rows(d: &Direct, vp: &Viewport, held: Option<u64>) -> Option<(u32, u32)> {
+    let held = held?;
+    if held == d.px.gen {
+        return Some((0, 0));
+    }
+    let &(_, r) = d.px.since.iter().find(|(g, _)| *g == held)?;
+    let h = vp.height as i64;
+    let y0 = (i64::from(r[1]) + i64::from(d.at.1) - i64::from(vp.y)).clamp(0, h);
+    let y1 = (i64::from(r[3]) + i64::from(d.at.1) - i64::from(vp.y)).clamp(0, h);
+    Some((y0 as u32, y1.max(y0) as u32))
+}
+
+/// Cut rows `y0..y1` of a member's tile (`vp`, its mode as large) out of
+/// the window's pixels into `out` (BGRA8, `vp.width` wide); what the
+/// window doesn't cover is black.
+pub fn tile(d: &Direct, vp: &Viewport, out: &mut [u8], (y0, y1): (u32, u32)) {
+    let (pw, ph) = (i64::from(d.px.width), i64::from(d.px.height));
+    let w = vp.width as usize;
+    /* The tile's columns inside the window: x0..x1, from window column sx. */
+    let sx = i64::from(vp.x) - i64::from(d.at.0);
+    let x0 = (-sx).clamp(0, w as i64) as usize;
+    let x1 = (pw - sx).clamp(0, w as i64) as usize;
+    for y in y0..y1 {
+        let row = &mut out[y as usize * w * 4..(y as usize + 1) * w * 4];
+        let sy = i64::from(vp.y) + i64::from(y) - i64::from(d.at.1);
+        if sy < 0 || sy >= ph || x1 <= x0 {
+            row.fill(0);
+            continue;
+        }
+        row[..x0 * 4].fill(0);
+        row[x1 * 4..].fill(0);
+        let src = &d.px.px[(sy * pw + sx + x0 as i64) as usize..][..x1 - x0];
+        for (o, p) in row[x0 * 4..x1 * 4].chunks_exact_mut(4).zip(src) {
+            o.copy_from_slice(&p.to_le_bytes());
         }
     }
 }
