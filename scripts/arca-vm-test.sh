@@ -18,6 +18,9 @@ ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 set -- env
 . "$ROOT/scripts/cloud-vm.sh" >/dev/null
 set --
+# ring (rustls's crypto, in the courier) has C and assembly: build it for the guest.
+export CC_aarch64_unknown_freebsd=clang AR_aarch64_unknown_freebsd=llvm-ar
+export CFLAGS_aarch64_unknown_freebsd="--target=aarch64-unknown-freebsd --sysroot=$VMDIR/sysroot"
 KEY="$HOME/.ssh/fresco_bsd_ed25519"
 SSHOPT="-i $KEY -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR"
 g() { ssh $SSHOPT -o ConnectTimeout=30 -p 2222 root@localhost "$@"; }
