@@ -123,6 +123,13 @@ pub struct Capabilities {
     /// nothing else about the filesystem.
     #[serde(rename = "app-launch")]
     pub app_launch: Option<bool>,
+    /// The volume UI's grant (Forum, Curia): list the session user's apps that
+    /// are playing and set their volume, mute, the master level and the output,
+    /// over choragusd's `audio-control/` socket. It hears nothing and reads no
+    /// samples (that is `audio-monitor`). Restricted so an app can't silence or
+    /// blast another (lyra-v1.md §7).
+    #[serde(rename = "audio-control")]
+    pub audio_control: Option<bool>,
     /// Unknown / future keys. Validator warns; doesn't reject.
     #[serde(flatten)]
     pub extra:      BTreeMap<String, toml::Value>,
@@ -250,6 +257,7 @@ pub fn merge_capabilities(base: &Capabilities, ovr: &Capabilities) -> Capabiliti
         window_management: ovr.window_management.or(base.window_management),
         forum_control:    ovr.forum_control.or(base.forum_control),
         app_launch:       ovr.app_launch.or(base.app_launch),
+        audio_control:    ovr.audio_control.or(base.audio_control),
         extra:            {
             let mut e = base.extra.clone();
             for (k, v) in &ovr.extra { e.insert(k.clone(), v.clone()); }

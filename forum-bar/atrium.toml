@@ -12,6 +12,7 @@ icon        = "settings"
 [capabilities]
 graphics      = "fresco"
 forum-control = true
+audio-control = true   # the volume control: levels and mutes, never samples
 network       = "none"
 
 [supervision]

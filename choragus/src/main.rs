@@ -9,10 +9,12 @@
 //!         ATRIUM_LYRAD_SOCK        lyrad         (default /atrium/sockets/lyrad/lyrad.sock)
 //!         ATRIUM_APP_REGISTRY      registry      (default /var/run/atrium/app-registry)
 //!         ATRIUM_POLICY_BASE       user policies (default /var/db/atrium)
+//!         ATRIUM_CHORAGUS_STATE    users' volumes (default /var/db/choragus)
 //!
 //!   choragusd --daemon <app_sock> <lyrad_sock> [--grants F] [--portcullis-grants BASE]
-//!                      [--app-registry F] [--seat]
-//!       Development: one socket allowing every capability. Without a registry
+//!                      [--app-registry F] [--seat] [--control SOCK] [--state DIR]
+//!       Development: one socket allowing every capability (and, with
+//!       --control, a volume-UI socket; --state keeps volumes in DIR). Without a registry
 //!       the app is named by its uid's user name (and --grants is keyed by it).
 //!
 //!   choragusd --demo
@@ -41,6 +43,7 @@ fn main() {
         device_rate: 48_000,
         device_channels: 2,
         period_frames: 128,
+        state_dir: None,
     };
 
     if args.iter().any(|a| a == "--serve") {
@@ -54,6 +57,7 @@ fn main() {
             lyrad: env("ATRIUM_LYRAD_SOCK", "/atrium/sockets/lyrad/lyrad.sock"),
             registry: Some(env("ATRIUM_APP_REGISTRY", portcullis_peer::DEFAULT_REGISTRY)),
             policy_base: Some(env("ATRIUM_POLICY_BASE", "/var/db/atrium")),
+            state_dir: Some(env("ATRIUM_CHORAGUS_STATE", "/var/db/choragus")),
             seat: true,
             strict: true,
             ..base
@@ -74,8 +78,13 @@ fn main() {
             }),
             None => GrantStore::default(),
         };
+        let mut listeners = vec![(app_sock, CAP_AUDIO | CAP_MICROPHONE | CAP_MONITOR)];
+        if let Some(p) = arg(&args, "--control") {
+            listeners.push((p.to_string(), choragus::app::CAP_CONTROL));
+        }
         let cfg = Config {
-            listeners: vec![(app_sock, CAP_AUDIO | CAP_MICROPHONE | CAP_MONITOR)],
+            listeners,
+            state_dir: arg(&args, "--state").map(String::from),
             lyrad,
             registry: arg(&args, "--app-registry").map(String::from),
             policy_base: arg(&args, "--portcullis-grants").map(String::from),

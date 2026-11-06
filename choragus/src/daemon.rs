@@ -6,12 +6,18 @@
 //! into one `SetGain` for lyrad. It brokers each stream's ring fd from lyrad
 //! to the app, and forwards lyrad's events (flushed, drained, underrun) to the
 //! app that owns the stream. An app can name only its own streams.
+//!
+//! The volume UI connects to `audio-control/` ([`serve_control`]): it lists its
+//! user's apps that are playing and sets the user's level per app, the master
+//! and the output (lyra-v1.md §7). Those levels persist ([`crate::volumes`]).
+//! A stream plays at `policy × app's own volume × user's app level × master`.
 
-use crate::app::{role_from_wire, CAP_AUDIO};
+use crate::app::{role_from_wire, CAP_AUDIO, CAP_CONTROL};
 use crate::grant::GrantStore;
 use crate::policy::{Device, DeviceKind, Session, Stream};
+use crate::volumes::{clamp, Level, VolumeStore};
 use lyra_protocol::fdpass::{recv_fd, send_fd};
-use lyra_protocol::wire::{self, DenyCode, FromEngine, ToApp, ToChoragus, ToEngine};
+use lyra_protocol::wire::{self, AppEntry, DenyCode, FromControl, FromEngine, Output, Role as WireRole, ToApp, ToChoragus, ToControl, ToEngine};
 use portcullis_peer::AppRegistry;
 use std::collections::HashMap;
 use std::io;
@@ -40,15 +46,22 @@ pub struct Config {
     pub device_rate: u32,
     pub device_channels: u8,
     pub period_frames: u32,
+    /// Where users' volumes persist (`<dir>/<user>.toml`); `None`: memory only.
+    pub state_dir: Option<String>,
 }
 
 struct StreamRec {
     conn: u64,
     user: String,
+    app_id: String,
+    label: String,
+    role: WireRole,
     tag: u32,
     ring_bytes: usize,
     policy_db: f32,
     app_gain: f32,
+    /// The user's level × master for this app, linear (from [`VolumeStore`]).
+    user_gain: f32,
     held: bool,
     sent_db: Option<f32>,
     open: bool,
@@ -59,8 +72,18 @@ struct AppConn {
     streams: Vec<u32>,
 }
 
+/// A volume UI connection.
+struct ControlConn {
+    writer: UnixStream,
+    user: String,
+}
+
 struct State {
     sess: Session,
+    volumes: VolumeStore,
+    /// The seat file, when streams are gated on the active session.
+    seat: Option<String>,
+    controls: HashMap<u64, ControlConn>,
     lyrad: UnixStream,
     next_stream: u32,
     next_conn: u64,
@@ -70,14 +93,22 @@ struct State {
 
 impl State {
     fn total_db(r: &StreamRec) -> f32 {
-        if r.held || r.app_gain <= 0.0 {
+        let g = r.app_gain * r.user_gain;
+        if r.held || g <= 0.0 {
             return HELD_DB;
         }
-        (r.policy_db + 20.0 * r.app_gain.log10()).max(HELD_DB)
+        (r.policy_db + 20.0 * g.log10()).max(HELD_DB)
     }
 
     /// Re-run policy and send lyrad the level of every stream whose level changed.
     fn recompute(&mut self) {
+        let keys: Vec<(u32, String, String)> =
+            self.streams.iter().map(|(id, r)| (*id, r.user.clone(), r.app_id.clone())).collect();
+        for (id, user, app) in keys {
+            let v = self.volumes.user(&user);
+            let g = v.app(&app).gain() * v.master_gain();
+            self.streams.get_mut(&id).unwrap().user_gain = g;
+        }
         for d in self.sess.resolve() {
             if let Some(r) = self.streams.get_mut(&d.stream) {
                 r.policy_db = d.gain_db;
@@ -113,11 +144,67 @@ impl State {
             self.sess.close(id);
             let _ = wire::send(&mut self.lyrad, &ToEngine::Close { stream: id });
             self.recompute();
+            if r.open {
+                self.notify_controls(Some(&r.user));
+            }
         }
     }
 
     fn owns(&self, conn: u64, stream: u32) -> bool {
         self.streams.get(&stream).is_some_and(|r| r.conn == conn && r.open)
+    }
+
+    /// Whether `user`'s session is the active one (always, without a seat).
+    fn active(&self, user: &str) -> bool {
+        match &self.seat {
+            Some(p) => portcullis_peer::seat::active_at(p).as_deref() == Some(user),
+            None => true,
+        }
+    }
+
+    /// `user`'s apps with a stream open, for the volume UI.
+    fn apps_for(&mut self, user: &str) -> FromControl {
+        let mut apps: Vec<AppEntry> = Vec::new();
+        if self.active(user) {
+            let mut ids: Vec<&u32> = self.streams.iter().filter(|(_, r)| r.user == user && r.open).map(|(id, _)| id).collect();
+            ids.sort();
+            let recs: Vec<(String, String, WireRole)> = ids.iter()
+                .map(|id| { let r = &self.streams[id]; (r.app_id.clone(), r.label.clone(), r.role) }).collect();
+            for (app_id, label, role) in recs {
+                if let Some(e) = apps.iter_mut().find(|e| e.app_id == app_id) {
+                    e.streams = e.streams.saturating_add(1);
+                    continue;
+                }
+                if apps.len() >= wire::MAX_CONTROL_APPS {
+                    continue;
+                }
+                let l = self.volumes.user(user).app(&app_id);
+                let mut shown = app_id.clone();
+                shown.truncate(wire::MAX_APP_ID);
+                apps.push(AppEntry { app_id: shown, label, role, volume: l.volume, muted: l.muted, streams: 1 });
+            }
+        }
+        let v = self.volumes.user(user);
+        FromControl::Apps { master: v.master, master_muted: v.master_muted, apps }
+    }
+
+    fn to_control(&mut self, conn: u64, msg: &FromControl) {
+        if let Some(c) = self.controls.get_mut(&conn) {
+            if wire::send(&mut c.writer, msg).is_err() {
+                let _ = c.writer.shutdown(std::net::Shutdown::Both);
+            }
+        }
+    }
+
+    /// Tell `user`'s volume UIs (or everyone's, for `None`) the list changed.
+    fn notify_controls(&mut self, user: Option<&str>) {
+        let conns: Vec<(u64, String)> = self.controls.iter()
+            .filter(|(_, c)| user.map_or(true, |u| c.user == u))
+            .map(|(id, c)| (*id, c.user.clone())).collect();
+        for (conn, u) in conns {
+            let m = self.apps_for(&u);
+            self.to_control(conn, &m);
+        }
     }
 }
 
@@ -194,8 +281,9 @@ fn serve_app(mut app: UnixStream, state: Shared, cfg: Arc<Config>, socket_caps: 
                 }
                 let held = cfg.seat && portcullis_peer::seat::active_at(&cfg.seat_path).as_deref() != Some(v.user.as_str());
                 st.streams.insert(id, StreamRec {
-                    conn, user: v.user.clone(), tag, ring_bytes: params.ring_bytes(),
-                    policy_db: 0.0, app_gain: 1.0, held, sent_db: None, open: false,
+                    conn, user: v.user.clone(), app_id: v.app_id.clone(), label: params.label.clone(),
+                    role: params.role, tag, ring_bytes: params.ring_bytes(),
+                    policy_db: 0.0, app_gain: 1.0, user_gain: 1.0, held, sent_db: None, open: false,
                 });
                 st.apps.get_mut(&conn).unwrap().streams.push(id);
                 let open = ToEngine::Open { stream: id, rate: params.rate, channels: params.channels, ring_frames: params.ring_frames() };
@@ -243,6 +331,113 @@ fn serve_app(mut app: UnixStream, state: Shared, cfg: Arc<Config>, socket_caps: 
     eprintln!("choragusd: '{}' (uid {uid}) disconnected", v.app_id);
 }
 
+fn output_name(d: &Device) -> String {
+    match d.kind {
+        DeviceKind::Speakers => "Speakers",
+        DeviceKind::Headset => "Headset",
+        DeviceKind::Hdmi => "HDMI",
+    }
+    .to_string()
+}
+
+/// Handle one volume UI connection (`audio-control/`, lyra-v1.md §7). It may
+/// change only its own user's levels, and sees only that user's apps, and
+/// only while that user's session is the active one.
+fn serve_control(mut c: UnixStream, state: Shared, cfg: Arc<Config>, socket_caps: u8) {
+    let uid = match lyra_protocol::peer::peer_uid(c.as_raw_fd()) {
+        Ok(u) => u,
+        Err(_) => return,
+    };
+    let _ = c.set_read_timeout(Some(Duration::from_secs(5)));
+    if !matches!(wire::recv::<_, ToControl>(&mut c), Ok(ToControl::Hello { .. })) {
+        return;
+    }
+    let _ = c.set_read_timeout(None);
+    let registry = cfg.registry.as_deref().map(|p| AppRegistry::load(p).unwrap_or_default());
+    let grant = |user: &str, app_id: &str| match &cfg.policy_base {
+        Some(base) => GrantStore::load_portcullis(base, user).granted(app_id),
+        None => cfg.grants.granted(app_id),
+    };
+    let claimed = portcullis_peer::username(uid).unwrap_or_default();
+    let verified = crate::identity::resolve(uid, &claimed, registry.as_ref(), cfg.strict, socket_caps, grant);
+    let Some(v) = verified.filter(|v| v.caps & CAP_CONTROL != 0) else {
+        eprintln!("choragusd: uid {uid} refused on audio-control (no audio-control grant)");
+        let _ = wire::send(&mut c, &FromControl::Denied { code: DenyCode::NotGranted });
+        return;
+    };
+    if wire::send(&mut c, &FromControl::Welcome).is_err() {
+        return;
+    }
+    let Ok(writer) = c.try_clone() else { return };
+    let _ = writer.set_write_timeout(Some(Duration::from_secs(1)));
+    let conn = {
+        let mut st = state.lock().unwrap();
+        st.next_conn += 1;
+        let id = st.next_conn;
+        st.controls.insert(id, ControlConn { writer, user: v.user.clone() });
+        id
+    };
+    eprintln!("choragusd: volume UI '{}' (user {}, uid {uid}) connected", v.app_id, v.user);
+    let user = v.user.as_str();
+    while let Ok(msg) = wire::recv::<_, ToControl>(&mut c) {
+        let mut st = state.lock().unwrap();
+        let set_app = |st: &mut State, app_id: &str, f: &dyn Fn(&mut Level)| {
+            if app_id.is_empty() || app_id.len() > wire::MAX_APP_ID {
+                st.to_control(conn, &FromControl::Denied { code: DenyCode::BadFormat });
+                return;
+            }
+            if let Err(e) = st.volumes.update(user, |u| f(u.apps.entry(app_id.to_string()).or_default())) {
+                eprintln!("choragusd: saving {user}'s volumes: {e}");
+            }
+            st.recompute();
+            st.notify_controls(Some(user));
+        };
+        match msg {
+            ToControl::Hello { .. } => {}
+            ToControl::List => {
+                let m = st.apps_for(user);
+                st.to_control(conn, &m);
+            }
+            ToControl::SetAppVolume { app_id, volume } => set_app(&mut st, &app_id, &|l| l.volume = clamp(volume)),
+            ToControl::SetAppMute { app_id, muted } => set_app(&mut st, &app_id, &|l| l.muted = muted),
+            ToControl::SetMaster { .. } | ToControl::SetMasterMute { .. } => {
+                let r = st.volumes.update(user, |u| match msg {
+                    ToControl::SetMaster { volume } => u.master = clamp(volume),
+                    ToControl::SetMasterMute { muted } => u.master_muted = muted,
+                    _ => {}
+                });
+                if let Err(e) = r {
+                    eprintln!("choragusd: saving {user}'s volumes: {e}");
+                }
+                st.recompute();
+                st.notify_controls(Some(user));
+            }
+            ToControl::ListOutputs => {
+                let outputs = st.sess.devices.iter().map(|d| Output { id: d.id, name: output_name(d) }).collect();
+                let current = st.sess.default_device;
+                st.to_control(conn, &FromControl::Outputs { current, outputs });
+            }
+            ToControl::SetOutput { output } => {
+                // The output is the seat's, so only the active session moves it.
+                if !st.active(user) || !st.sess.devices.iter().any(|d| d.id == output) {
+                    st.to_control(conn, &FromControl::Denied { code: DenyCode::NotGranted });
+                    continue;
+                }
+                let before = st.sess.resolve();
+                st.sess.default_device = output;
+                for ch in crate::policy::diff(&before, &st.sess.resolve()) {
+                    if let crate::policy::Change::Reroute { stream, to_sink } = ch {
+                        let _ = wire::send(&mut st.lyrad, &ToEngine::Reroute { stream, sink: to_sink });
+                    }
+                }
+                st.recompute();
+            }
+        }
+    }
+    state.lock().unwrap().controls.remove(&conn);
+    eprintln!("choragusd: volume UI '{}' (uid {uid}) disconnected", v.app_id);
+}
+
 /// Read lyrad's messages: hand ring fds to apps, forward events. Returns when
 /// lyrad hangs up.
 fn serve_lyrad(mut rd: UnixStream, state: Shared) -> io::Error {
@@ -270,6 +465,8 @@ fn serve_lyrad(mut rd: UnixStream, state: Shared) -> io::Error {
                 if st.streams.get(&stream).is_some_and(|r| r.held) {
                     st.to_app(conn, &ToApp::Held { stream, held: true });
                 }
+                let user = st.streams[&stream].user.clone();
+                st.notify_controls(Some(&user));
             }
             FromEngine::OpenFailed { stream } => {
                 let mut st = state.lock().unwrap();
@@ -317,6 +514,7 @@ fn apply_seat(state: &Shared, seat_path: &str) {
     for (conn, stream, held) in changed {
         st.to_app(conn, &ToApp::Held { stream, held });
     }
+    st.notify_controls(None);
 }
 
 /// Run the daemon. Returns only on an error: binding a socket, reaching lyrad,
@@ -333,6 +531,9 @@ pub fn run(cfg: Config) -> io::Error {
     let spk = Device { id: 0, kind: DeviceKind::Speakers };
     let state: Shared = Arc::new(Mutex::new(State {
         sess: Session::new(vec![spk], spk.id),
+        volumes: VolumeStore::new(cfg.state_dir.clone()),
+        seat: cfg.seat.then(|| cfg.seat_path.clone()),
+        controls: HashMap::new(),
         lyrad,
         next_stream: 1,
         next_conn: 0,
@@ -366,7 +567,11 @@ pub fn run(cfg: Config) -> io::Error {
             for app in listener.incoming() {
                 let Ok(app) = app else { continue };
                 let (state, cfg) = (state.clone(), cfg.clone());
-                std::thread::spawn(move || serve_app(app, state, cfg, caps));
+                if caps == CAP_CONTROL {
+                    std::thread::spawn(move || serve_control(app, state, cfg, caps));
+                } else {
+                    std::thread::spawn(move || serve_app(app, state, cfg, caps));
+                }
             }
         });
     }

@@ -4,7 +4,7 @@
 //!
 //! - **The socket it reached.** choragusd listens on one socket per audio
 //!   capability (`audio/`, `audio-capture/`, `audio-monitor/` under
-//!   `/atrium/sockets`), and Portcullis mounts each directory only into jails
+//!   `/atrium/sockets`, and `audio-control/` for the volume UI), and Portcullis mounts each directory only into jails
 //!   that hold that capability. So the socket caps what a connection may ask for.
 //! - **The user's grant.** The peer uid resolves through the Portcullis launch
 //!   registry to `(user, app id)`, and that user's approved policy must grant the
@@ -13,16 +13,19 @@
 //! The app's own hello is never identity in strict mode (the service): an uid
 //! not in the registry gets nothing.
 
-use crate::app::{CAP_AUDIO, CAP_MICROPHONE, CAP_MONITOR};
+use crate::app::{CAP_AUDIO, CAP_CONTROL, CAP_MICROPHONE, CAP_MONITOR};
 use portcullis_peer::AppRegistry;
 
 /// choragusd's sockets: `<root>/<name>/<name>.sock`, and what each allows. The
 /// names match the directories Portcullis mounts for each capability
 /// (portcullis-jail `apply_audio`, `apply_microphone`, `apply_audio_monitor`).
-pub const SOCKETS: [(&str, u8); 3] = [
+/// `audio-control/` is the volume UI's (lyra-v1.md §7): it speaks the control
+/// dictionary, not the app one, and allows no streams.
+pub const SOCKETS: [(&str, u8); 4] = [
     ("audio", CAP_AUDIO),
     ("audio-capture", CAP_AUDIO | CAP_MICROPHONE),
     ("audio-monitor", CAP_AUDIO | CAP_MONITOR),
+    ("audio-control", CAP_CONTROL),
 ];
 
 /// A connection's verified identity and the capability bits it holds.

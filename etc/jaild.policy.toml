@@ -93,6 +93,9 @@ rw_paths = [
     "/var/db/arca",
     "/atrium/sockets/arca",
 
+    # choragusd's users' volumes (<user>.toml; _choragus 0700).
+    "/var/db/choragus",
+
     # Atrium shared state — session records, jaild persistent
     # state, etc.
     "/var/run/atrium",

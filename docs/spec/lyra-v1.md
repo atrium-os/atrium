@@ -203,14 +203,23 @@ A stream's clock says nothing about other apps or what they play.
 
 - The level a stream plays at is `user volume for (user, app) × app's SetVolume × policy
   (ducking) × seat × master`. An app can lower itself but never raise itself past the user's
-  setting.
-- User volumes persist per `(user, app id)` in choragusd's state. An embedded player's
-  streams use the parent's entry.
-- `audio-control.sock` is for the volume UI only: a restricted capability `audio-control`
-  (like `window-management`), granted to Forum and Curia. Messages: `List` (the active
-  user's apps with a stream open: app id, label, role, level, muted), `SetAppVolume`,
-  `SetAppMute`, `SetMaster`, `SetMasterMute`, `ListOutputs`, `SetOutput`, and an event when
-  the list changes. It shows only the active session's apps.
+  setting. All levels are linear 0 to 1; anything out of range is clamped, and not a number
+  counts as 0, so nothing on the wire or on disk can amplify.
+- User volumes persist per `(user, app id)`, with the user's master level and mute, in
+  `/var/db/choragus/<user>.toml` (choragusd's own directory, `_choragus` 0700, mounted rw
+  into its jail only), written through a temporary file and a rename. An embedded player's
+  streams use the parent's entry (A7).
+- `audio-control.sock` (`/atrium/sockets/audio-control/`) is for the volume UI only: a
+  restricted capability `audio-control` (like `window-management`), held by the Forum bar
+  today and by Curia when it exists. It speaks its own dictionary (`ToControl`,
+  `FromControl` in `lyra_protocol::wire`; `lyra_protocol::client::Control`), names apps,
+  never streams, and carries no samples. Messages: `List` (the user's apps with a stream
+  open: app id, label, role, level, muted, stream count; at most 16), `SetAppVolume`,
+  `SetAppMute`, `SetMaster`, `SetMasterMute`, `ListOutputs`, `SetOutput`. choragusd sends
+  `Apps` unasked whenever the list or a level changes.
+- A control connection changes only its own user's levels and sees only that user's apps,
+  and the list is empty while that user's session is not the active one. `SetOutput`
+  moves the seat's output, so only the active session may send it.
 
 ## 8. Tests
 

@@ -7,22 +7,26 @@
 # choragusd runs NON-ROOT (_choragus), one for the seat (decision 3): it gates
 # each stream on the active session itself. It sees no device. It:
 #   - binds one socket per audio capability under /atrium/sockets: audio/,
-#     audio-capture/, audio-monitor/. Portcullis mounts each directory only
+#     audio-capture/, audio-monitor/, and audio-control/ for the volume UI.
+#     Portcullis mounts each directory only
 #     into jails holding that capability, so the socket caps what an app may
 #     ask for;
 #   - names each app by its peer uid through the launch registry (ro, one file)
 #     and refuses any uid the registry can't name;
 #   - reads each user's approved grants from /var/db/atrium/<user>/policy.toml
 #     (ro; the host identity key there is root 0600 and stays unreadable);
+#   - keeps each user's volumes in /var/db/choragus/<user>.toml (rw, _choragus 0700);
 #   - reads the seat's active session from /atrium/sockets/ostiarius/;
 #   - connects to lyrad at /atrium/sockets/lyrad/lyrad.sock (group _choragus).
 #
 # REQUIRES (commission once per host; scripts/lyra-service.sh does all of it):
 #   1. The _choragus (65017) system user; 65017 in jaild.policy allowed_system_uids.
-#   2. `install -d -o _choragus -g _choragus -m 0755 /atrium/sockets/{audio,audio-capture,audio-monitor}`.
-#   3. /var/db/atrium and /var/run/atrium/app-registry in jaild.policy ro_paths.
+#   2. `install -d -o _choragus -g _choragus -m 0755 /atrium/sockets/{audio,audio-capture,audio-monitor,audio-control}`,
+#      and `install -d -o _choragus -g _choragus -m 0700 /var/db/choragus`.
+#   3. /var/db/atrium and /var/run/atrium/app-registry in jaild.policy ro_paths;
+#      /var/db/choragus in rw_paths.
 #   4. The rootfs mountpoints: <path>/{dev,libexec,lib,usr/lib,usr/local/bin,
-#      atrium/sockets,var/db/atrium,var/run/atrium} and an empty file
+#      atrium/sockets,var/db/atrium,var/db/choragus,var/run/atrium} and an empty file
 #      <path>/var/run/atrium/app-registry (the nullfs file mount point).
 
 enabled       = true
@@ -55,6 +59,10 @@ kind   = "rw_nullfs"
 source = "/var/db/atrium"                         # ro: users' approved grants
 dest   = "var/db/atrium"
 kind   = "ro_nullfs"
+[[mounts]]
+source = "/var/db/choragus"                       # rw: users' volumes (owned _choragus, 0700)
+dest   = "var/db/choragus"
+kind   = "rw_nullfs"
 [[mounts]]
 source = "/var/run/atrium/app-registry"           # ro: who each app uid is (one file)
 dest   = "var/run/atrium/app-registry"

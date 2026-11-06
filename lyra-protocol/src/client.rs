@@ -15,7 +15,7 @@
 use crate::clock::{Clock, ClockReader};
 use crate::fdpass::recv_fd;
 use crate::ring::Ring;
-use crate::wire::{self, DenyCode, StreamParams, ToApp, ToChoragus};
+use crate::wire::{self, DenyCode, FromControl, StreamParams, ToApp, ToChoragus, ToControl};
 use std::collections::VecDeque;
 use std::io;
 use std::os::fd::AsRawFd;
@@ -149,5 +149,33 @@ impl Client {
     /// The socket, to poll for events.
     pub fn socket(&self) -> &UnixStream {
         &self.sock
+    }
+}
+
+/// The volume UI's connection to choragusd (`audio-control/`, lyra-v1.md §7).
+/// Requests are fire-and-forget; answers and change events arrive through
+/// [`Control::recv`].
+pub struct Control {
+    sock: UnixStream,
+}
+
+impl Control {
+    pub fn connect(path: &str) -> io::Result<Control> {
+        let mut sock = UnixStream::connect(path)?;
+        wire::send(&mut sock, &ToControl::Hello { version: wire::VERSION })?;
+        match wire::recv(&mut sock)? {
+            FromControl::Welcome => Ok(Control { sock }),
+            FromControl::Denied { code } => Err(denied(code)),
+            m => Err(io::Error::new(io::ErrorKind::InvalidData, format!("unexpected {m:?}"))),
+        }
+    }
+
+    pub fn send(&mut self, m: &ToControl) -> io::Result<()> {
+        wire::send(&mut self.sock, m)
+    }
+
+    /// The next answer or change event (blocks).
+    pub fn recv(&mut self) -> io::Result<FromControl> {
+        wire::recv(&mut self.sock)
     }
 }

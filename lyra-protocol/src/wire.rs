@@ -2,8 +2,9 @@
 //! framing Limen uses. Samples never cross these sockets; they go through the
 //! shared-memory ring, whose fd follows the message that announces it.
 //!
-//! Two dictionaries:
+//! Three dictionaries:
 //! - **app ⟷ choragusd** ([`ToChoragus`], [`ToApp`]): what an app may say.
+//! - **volume UI ⟷ choragusd** ([`ToControl`], [`FromControl`]): levels only.
 //! - **choragusd ⟷ lyrad** ([`ToEngine`], [`FromEngine`]): mechanism only.
 //!
 //! A frame is a `u32` little-endian length followed by that many bytes of
@@ -128,6 +129,60 @@ pub enum ToApp {
     Held { stream: u32, held: bool },
     /// lyrad went away; open a new stream when the service is back.
     StreamLost { stream: u32 },
+}
+
+// ── volume UI ⟷ choragusd (audio-control/, lyra-v1.md §7) ──────────────────
+
+/// Apps an `Apps` message lists (so it fits one frame).
+pub const MAX_CONTROL_APPS: usize = 16;
+/// Longest app id the control wire carries (longer ones are cut).
+pub const MAX_APP_ID: usize = 128;
+
+/// What the volume UI (Forum, Curia: the `audio-control` capability) may say.
+/// It names apps, never streams, and only its own user's.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+pub enum ToControl {
+    Hello { version: u16 },
+    /// Answered by `Apps`.
+    List,
+    /// The user's level for an app, 0 to 1. Kept across restarts.
+    SetAppVolume { app_id: String, volume: f32 },
+    SetAppMute { app_id: String, muted: bool },
+    SetMaster { volume: f32 },
+    SetMasterMute { muted: bool },
+    /// Answered by `Outputs`.
+    ListOutputs,
+    SetOutput { output: u32 },
+}
+
+/// One app with a stream open, as the volume UI shows it.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+pub struct AppEntry {
+    pub app_id: String,
+    /// The label of its first stream (e.g. "Video").
+    pub label: String,
+    pub role: Role,
+    /// The user's level for the app.
+    pub volume: f32,
+    pub muted: bool,
+    pub streams: u8,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+pub struct Output {
+    pub id: u32,
+    pub name: String,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+pub enum FromControl {
+    Welcome,
+    /// The user's apps with a stream open. The answer to `List`, and sent
+    /// unasked whenever it changes (an app opens or closes a stream, a level
+    /// changes). Empty while the user's session is not the active one.
+    Apps { master: f32, master_muted: bool, apps: Vec<AppEntry> },
+    Outputs { current: u32, outputs: Vec<Output> },
+    Denied { code: DenyCode },
 }
 
 // ── choragusd ⟷ lyrad ───────────────────────────────────────────────────────
@@ -273,5 +328,12 @@ mod tests {
         // 48 kHz × 100 ms = 4800 frames -> 8192.
         assert_eq!(params().ring_frames(), 8192);
         assert_eq!(params().ring_bytes(), 8192 * 2 * 4);
+    }
+
+    #[test]
+    fn a_full_apps_list_fits_one_frame() {
+        let e = AppEntry { app_id: "a".repeat(MAX_APP_ID), label: "l".repeat(MAX_LABEL), role: Role::Media, volume: 1.0, muted: false, streams: 8 };
+        let m = FromControl::Apps { master: 1.0, master_muted: false, apps: vec![e; MAX_CONTROL_APPS] };
+        assert!(encode(&m).is_ok());
     }
 }

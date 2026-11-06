@@ -3,12 +3,12 @@
 //! to the app, volumes composed into lyrad's gain, events forwarded, and that
 //! an app can only name its own streams.
 
-use choragus::app::{CAP_AUDIO, CAP_MICROPHONE, CAP_MONITOR};
+use choragus::app::{CAP_AUDIO, CAP_CONTROL, CAP_MICROPHONE, CAP_MONITOR};
 use choragus::daemon::{self, Config};
 use choragus::grant::GrantStore;
-use lyra_protocol::client::Client;
+use lyra_protocol::client::{Client, Control};
 use lyra_protocol::ring::Ring;
-use lyra_protocol::wire::{self, DenyCode, FromEngine, Role, StreamParams, ToApp, ToChoragus, ToEngine};
+use lyra_protocol::wire::{self, AppEntry, DenyCode, FromControl, FromEngine, Output, Role, StreamParams, ToApp, ToChoragus, ToControl, ToEngine};
 use std::os::fd::AsRawFd;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::PathBuf;
@@ -66,13 +66,20 @@ fn me() -> u32 {
 }
 
 fn start(tag: &'static str, registry: &str, grants: &str, socket_caps: u8) -> (PathBuf, mpsc::Receiver<ToEngine>, mpsc::Receiver<Ring>) {
+    let (mut socks, eng, rings) = start_with(tag, registry, grants, &[("audio.sock", socket_caps)], None);
+    (socks.remove(0), eng, rings)
+}
+
+/// The daemon with these sockets (`(file name, caps)`) and volume state dir.
+fn start_with(tag: &'static str, registry: &str, grants: &str, listeners: &[(&str, u8)], state_dir: Option<PathBuf>)
+    -> (Vec<PathBuf>, mpsc::Receiver<ToEngine>, mpsc::Receiver<Ring>) {
     let d = dir(tag);
     let lyrad = d.join("lyrad.sock");
     let (eng, rings) = fake_lyrad(lyrad.clone(), tag);
     std::fs::write(d.join("registry"), registry).unwrap();
-    let app = d.join("audio.sock");
+    let socks: Vec<PathBuf> = listeners.iter().map(|(n, _)| d.join(n)).collect();
     let cfg = Config {
-        listeners: vec![(app.to_string_lossy().into(), socket_caps)],
+        listeners: socks.iter().zip(listeners).map(|(p, (_, c))| (p.to_string_lossy().into(), *c)).collect(),
         lyrad: lyrad.to_string_lossy().into(),
         registry: Some(d.join("registry").to_string_lossy().into()),
         policy_base: None,
@@ -83,13 +90,14 @@ fn start(tag: &'static str, registry: &str, grants: &str, socket_caps: u8) -> (P
         device_rate: 48_000,
         device_channels: 2,
         period_frames: 128,
+        state_dir: state_dir.map(|p| p.to_string_lossy().into()),
     };
     std::thread::spawn(move || daemon::run(cfg));
     for _ in 0..200 {
-        if app.exists() { break; }
+        if socks.iter().all(|s| s.exists()) { break; }
         std::thread::sleep(Duration::from_millis(10));
     }
-    (app, eng, rings)
+    (socks, eng, rings)
 }
 
 fn params() -> StreamParams {
@@ -176,4 +184,104 @@ fn limits_and_other_apps_streams() {
     assert!(matches!(wire::recv::<_, ToApp>(&mut b).unwrap(), ToApp::Welcome { .. }));
     wire::send(&mut b, &ToChoragus::Start { stream: held[0].id }).unwrap();
     assert_eq!(wire::recv::<_, ToApp>(&mut b).unwrap(), ToApp::Denied { tag: 0, code: DenyCode::NoSuchStream });
+}
+
+fn gain(eng: &mpsc::Receiver<ToEngine>, want: f32) {
+    let ToEngine::SetGain { db, .. } = next_engine(eng, |m| matches!(m, ToEngine::SetGain { db, .. } if (db - want).abs() < 0.05))
+        else { unreachable!() };
+    assert!((db - want).abs() < 0.05, "{db}");
+}
+
+/// The next `Apps` the volume UI gets with `n` apps in it.
+fn apps(ui: &mut Control, n: usize) -> (f32, bool, Vec<AppEntry>) {
+    loop {
+        if let FromControl::Apps { master, master_muted, apps } = ui.recv().unwrap() {
+            if apps.len() == n {
+                return (master, master_muted, apps);
+            }
+        }
+    }
+}
+
+#[test]
+fn the_volume_ui_sets_the_users_levels_and_they_persist() {
+    let reg = format!("{} alice org.atrium.player\n", me());
+    let grants = "org.atrium.player audio,audio-control\n";
+    let state = dir("ctl-state");
+    let socks = [("audio.sock", CAP_AUDIO), ("audio-control.sock", CAP_CONTROL)];
+    let (s1, eng, _rings) = start_with("ctl", &reg, grants, &socks, Some(state.clone()));
+    let mut ui = Control::connect(s1[1].to_str().unwrap()).expect("welcome");
+    ui.send(&ToControl::List).unwrap();
+    assert_eq!(apps(&mut ui, 0), (1.0, false, vec![]));
+    // An app starts playing; the volume UI is told unasked.
+    let mut c = Client::connect(s1[0].to_str().unwrap(), None).unwrap();
+    let s = c.open(params()).unwrap();
+    let (_, _, a) = apps(&mut ui, 1);
+    assert_eq!(a[0], AppEntry { app_id: "org.atrium.player".into(), label: "Video".into(), role: Role::Media, volume: 1.0, muted: false, streams: 1 });
+    // The user's level for the app becomes lyrad's gain: 0.5 -> about -6 dB.
+    ui.send(&ToControl::SetAppVolume { app_id: "org.atrium.player".into(), volume: 0.5 }).unwrap();
+    gain(&eng, -6.02);
+    assert_eq!(apps(&mut ui, 1).2[0].volume, 0.5);
+    // The app's own volume multiplies under the user's: it can only go lower.
+    c.set_volume(&s, 0.5).unwrap();
+    gain(&eng, -12.04);
+    // Out-of-range or not-a-number levels never amplify.
+    ui.send(&ToControl::SetMaster { volume: f32::NAN }).unwrap();
+    gain(&eng, choragus::daemon::HELD_DB);
+    ui.send(&ToControl::SetMaster { volume: 7.0 }).unwrap();
+    gain(&eng, -12.04);
+    // Mutes.
+    ui.send(&ToControl::SetMasterMute { muted: true }).unwrap();
+    gain(&eng, choragus::daemon::HELD_DB);
+    ui.send(&ToControl::SetMasterMute { muted: false }).unwrap();
+    gain(&eng, -12.04);
+    ui.send(&ToControl::SetAppMute { app_id: "org.atrium.player".into(), muted: true }).unwrap();
+    gain(&eng, choragus::daemon::HELD_DB);
+    ui.send(&ToControl::SetAppMute { app_id: "org.atrium.player".into(), muted: false }).unwrap();
+    gain(&eng, -12.04);
+    // Outputs: one sink in v1; an unknown one is refused.
+    ui.send(&ToControl::ListOutputs).unwrap();
+    loop {
+        match ui.recv().unwrap() {
+            FromControl::Outputs { current, outputs } => {
+                assert_eq!((current, outputs), (0, vec![Output { id: 0, name: "Speakers".into() }]));
+                break;
+            }
+            _ => continue,
+        }
+    }
+    ui.send(&ToControl::SetOutput { output: 9 }).unwrap();
+    loop {
+        if let FromControl::Denied { code } = ui.recv().unwrap() {
+            assert_eq!(code, DenyCode::NotGranted);
+            break;
+        }
+    }
+    // The app hangs up; the volume UI's list empties.
+    drop(s);
+    drop(c);
+    apps(&mut ui, 0);
+    // The user's level was saved, and a restarted choragusd plays at it.
+    let saved = std::fs::read_to_string(state.join("alice.toml")).unwrap();
+    assert!(saved.contains("volume = 0.5"), "{saved}");
+    let (s2, eng2, _r2) = start_with("ctl2", &reg, grants, &socks, Some(state));
+    let mut c = Client::connect(s2[0].to_str().unwrap(), None).unwrap();
+    let _s = c.open(params()).unwrap();
+    gain(&eng2, -6.02);
+}
+
+#[test]
+fn only_the_audio_control_grant_reaches_the_volume_ui() {
+    let reg = format!("{} alice org.atrium.player\n", me());
+    // An app with audio only can't use the control socket.
+    let (s, _e, _r) = start_with("ctl-nogrant", &reg, "org.atrium.player audio\n", &[("audio-control.sock", CAP_CONTROL)], None);
+    let err = Control::connect(s[0].to_str().unwrap()).err().expect("refused");
+    assert_eq!(err.kind(), std::io::ErrorKind::PermissionDenied);
+    // Holding audio-control, but reaching only the playback socket, gives no control:
+    // that socket speaks the app dictionary and the hello doesn't parse.
+    let (s, _e, _r) = start_with("ctl-wrongsock", &reg, "org.atrium.player audio,audio-control\n", &[("audio.sock", CAP_AUDIO)], None);
+    assert!(Control::connect(s[0].to_str().unwrap()).is_err());
+    // And the control grant alone opens no streams.
+    let (s, _e, _r) = start_with("ctl-nostream", &reg, "org.atrium.player audio-control\n", &[("audio.sock", CAP_AUDIO | CAP_CONTROL)], None);
+    assert!(Client::connect(s[0].to_str().unwrap(), None).is_err());
 }

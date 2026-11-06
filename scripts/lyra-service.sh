@@ -30,7 +30,7 @@ install -d -m 0755 /atrium/sockets
 install -d -o _lyra -g _choragus -m 0750 /atrium/sockets/lyrad
 # choragusd's front doors, one per audio capability (Portcullis mounts each
 # only into jails that hold it).
-for d in audio audio-capture audio-monitor; do
+for d in audio audio-capture audio-monitor audio-control; do
     install -d -o _choragus -g _choragus -m 0755 /atrium/sockets/$d
 done
 
@@ -44,7 +44,9 @@ install -m 0644 "$HERE/choragus/etc/services.d/36-atrium-choragusd.toml" /etc/at
 R=/var/lib/atrium/jails/lyrad
 for d in dev libexec lib usr/lib usr/local/bin atrium/sockets; do install -d "$R/$d"; done
 R=/var/lib/atrium/jails/choragusd
-for d in dev libexec lib usr/lib usr/local/bin atrium/sockets var/db/atrium var/run/atrium; do install -d "$R/$d"; done
+for d in dev libexec lib usr/lib usr/local/bin atrium/sockets var/db/atrium var/db/choragus var/run/atrium; do install -d "$R/$d"; done
+# Users' volumes (lyra-v1.md §7): only choragusd reads or writes them.
+install -d -o _choragus -g _choragus -m 0700 /var/db/choragus
 [ -e "$R/var/run/atrium/app-registry" ] || : > "$R/var/run/atrium/app-registry"
 # The registry itself must exist for the file mount; portcullisd fills it.
 install -d /var/run/atrium /var/db/atrium
