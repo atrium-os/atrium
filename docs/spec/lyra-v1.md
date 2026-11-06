@@ -271,7 +271,12 @@ Host tests run on Linux in the cloud; the rest run in the arm64 or amd64 VM with
    at all, median −0.001 ms, but one 10 s window where QEMU's HDA device (paced by a host
    timer with `-audiodev none`) consumed 8.6% slow, giving −122 ms and `rate_ppm` −1000. A
    real device's crystal doesn't do that, so this setup can't judge ±2 ms; check 6 needs a
-   device with a real clock (a host audio backend, or hardware).
+   device with a real clock (a host audio backend, or hardware). Run 4 (4033f13, QEMU
+   paced by the Mac's CoreAudio output, muted): the same, one window −48420 ppm, worst
+   −194 ms, median −0.005 ms; between excursions the device holds about +6 ppm in all four
+   runs. The check now also prints, for diagnosis only, the error on clicks outside 10 s
+   windows where the device ran more than 1000 ppm off its median. **Verdict pending real
+   hardware.**
 7. **Restart** (VM): kill lyrad while two apps play; both get `StreamLost`, reopen, and play
    again when the supervisor restarts it.
 

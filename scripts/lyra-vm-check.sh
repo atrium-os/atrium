@@ -223,6 +223,35 @@ line(len(clean) >= 0.8 * max(len(errs), 1), '6: clicks with no dry spell in the 
 if clean:
     e = sorted(clean)
     line(max(abs(x) for x in clean) <= 2.0, '6: predicted minus heard (device queue), those clicks: median %+.3f ms, min %+.3f, max %+.3f (want within ±2)' % (e[len(e) // 2], e[0], e[-1]))
+# For diagnosis, not judged: a virtual sound card can change speed by
+# percents for seconds (QEMU's HDA under host load; no crystal does). Clicks
+# in 10 s windows where the device ran more than 1000 ppm off its run's
+# median rate, shown apart.
+win = {}
+for t, q in zip(now, queued):
+    win.setdefault(int((t - now[0]) // 10e9), []).append((t, q))
+rates = {}
+for k, pts in win.items():
+    if len(pts) > 100:
+        mt = sum(p[0] for p in pts) / len(pts); mq = sum(p[1] for p in pts) / len(pts)
+        sxx = sum((p[0] - mt) ** 2 for p in pts)
+        if sxx > 0:
+            rates[k] = sum((p[0] - mt) * (p[1] - mq) for p in pts) / sxx * 1e9 / RATE * 1e6 - 1e6
+if rates:
+    med = sorted(rates.values())[len(rates) // 2]
+    odd = {k for k, r in rates.items() if abs(r - med) > 1000}
+    steady = []
+    for rate, k, pred, ppm in preds:
+        best = min(truth, key=lambda t: abs(t[1] - pred), default=None)
+        if best is None or abs(best[1] - pred) > 200e6:
+            continue
+        w = int((best[1] - now[0]) // 10e9)
+        if not ({w - 1, w} & odd) and not after_dry(best[1]):
+            steady.append((pred - best[1]) / 1e6)
+    print('       device rate: median %+.0f ppm; %d of %d 10 s windows off by more than 1000 ppm %s' % (med, len(odd), len(rates), sorted('%d s: %+.0f' % (k * 10, rates[k]) for k in odd)))
+    if steady:
+        e = sorted(steady)
+        print('       clicks outside those windows (and the one before each): %d, median %+.3f ms, min %+.3f, max %+.3f' % (len(e), e[len(e) // 2], e[0], e[-1]))
 if alt:
     a = sorted(alt)
     print('       (against GETOPTR instead: median %+.3f ms, min %+.3f, max %+.3f)' % (a[len(a) // 2], a[0], a[-1]))
