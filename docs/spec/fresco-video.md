@@ -137,7 +137,9 @@ the parent's process, cookies or other windows.
   `owner_uid` (never a slot-allowlist uid) and marked embed-only, which in split mode the
   broker enforces on the renderer's window records. limend passes the connected fd to the
   child. User-role children only: system providers (Arca, Vestibulum) keep ordinary
-  connections, and a provider's embed instance doesn't get the app socket mounted. Owners: Fresco and
+  connections, and a provider's embed instance doesn't get the app socket mounted.
+  **Built** 2026-11-06 (`slot::op::EMBED_CONNECT`, `EmbedConnect`/`EmbedConnectResult` in
+  fresco-protocol); the activation probe checks it in the VM in direct and split mode. Owners: Fresco and
   Pergola threads; it applies to every Limen role, not only video.
 - *Its layers stay inside its window.* frescod clips every layer to its window's rect, and a
   layer takes its window's place in z-order, so it can never sit over another window or over

@@ -245,6 +245,31 @@ pub fn binders() -> Vec<u32> {
     uid_of("_limen").into_iter().collect()
 }
 
+/// Answer `EMBED_CONNECT` on `conn` and, on `Ok`, hand `raw` (the same
+/// stream) over as an embed-only client owned by the named uid
+/// (fresco-video.md §8, S1). The caller sends nothing after it, so
+/// nothing is left buffered in `conn`.
+fn embed_connect(mut conn: aqueduct::Connection, raw: std::os::unix::net::UnixStream, payload: &[u8], binders: &[u32]) -> std::io::Result<()> {
+    use fresco_protocol::slot::{op, refusal, EmbedConnect, EmbedConnectResult};
+    let owner = match fresco_protocol::decode::<EmbedConnect>(payload) {
+        Ok(e) if !binders.contains(&e.owner_uid) => Ok(e.owner_uid),
+        _ => Err(refusal::INVALID),
+    };
+    let reply = match owner {
+        Ok(_) => EmbedConnectResult::Ok,
+        Err(reason) => EmbedConnectResult::Refused { reason },
+    };
+    let bytes = fresco_protocol::encode(&reply).unwrap_or_default();
+    conn.send_message(aqueduct::CLASS_DISPLAY, op::EMBED_CONNECT, aqueduct::envelope::flag::IS_RESPONSE, &bytes)?;
+    let Ok(owner) = owner else { return Ok(()) };
+    drop(conn);
+    match crate::socket_server::EMBED_CLIENT.get() {
+        Some(serve) => serve(raw, owner),
+        None => eprintln!("frescod: embed connection for uid {owner}: no client server"),
+    }
+    Ok(())
+}
+
 /// `slot::op::BIND`: find both windows by token, bind, and name their
 /// owners so limend can check them against its own records.
 pub fn bind_slot(comp: &Mutex<fresco_scene_server::window::Compositor>, b: &fresco_protocol::slot::SlotBind) -> fresco_protocol::slot::SlotBindResult {
@@ -337,8 +362,9 @@ pub fn serve(path: &std::path::Path, allowed: Callers, focused: Arc<dyn Fn(u32) 
             };
             let (focused, may_consume, may_grant) = (focused.clone(), allowed.consumers.contains(&uid), allowed.forum == Some(uid));
             let binder = allowed.binders.contains(&uid).then(|| comp.clone());
+            let binders = allowed.binders.clone();
             let _ = std::thread::Builder::new().name("frescod-activation-conn".into()).spawn(move || {
-                if let Err(e) = conn_loop(s, uid, may_consume, may_grant, &*focused, binder.as_deref()) {
+                if let Err(e) = conn_loop(s, uid, may_consume, may_grant, &*focused, binder.as_deref(), &binders) {
                     log::debug!("activation connection: {e}");
                 }
             });
@@ -349,14 +375,21 @@ pub fn serve(path: &std::path::Path, allowed: Callers, focused: Arc<dyn Fn(u32) 
 
 /// One caller's requests: `CONSUME` if it is a consumer, `GRANT` (with
 /// its own uid as the granter) if it is Forum; anything else is refused.
-fn conn_loop(s: std::os::unix::net::UnixStream, uid: u32, may_consume: bool, may_grant: bool, focused: &(dyn Fn(u32) -> bool + Send + Sync), binder: Option<&Mutex<fresco_scene_server::window::Compositor>>) -> std::io::Result<()> {
+fn conn_loop(s: std::os::unix::net::UnixStream, uid: u32, may_consume: bool, may_grant: bool, focused: &(dyn Fn(u32) -> bool + Send + Sync), binder: Option<&Mutex<fresco_scene_server::window::Compositor>>, binders: &[u32]) -> std::io::Result<()> {
     use aqueduct::envelope::flag;
     use fresco_protocol::activation::{op, Consume, Grant};
+    let raw = s.try_clone()?;
     let mut conn = aqueduct::Connection::wrap(s)?;
+    let mut first = true;
     loop {
         let msg = conn.recv_message()?;
         if msg.opcode_class != aqueduct::CLASS_DISPLAY {
             continue;
+        }
+        // A binder's new stream may become an embed-only client with its
+        // first message (S1); later in a stream it is refused by silence.
+        if std::mem::take(&mut first) && msg.op == fresco_protocol::slot::op::EMBED_CONNECT && binder.is_some() {
+            return embed_connect(conn, raw, &msg.payload, binders);
         }
         let payload = match msg.op {
             op::CONSUME => fresco_protocol::encode(&match fresco_protocol::decode::<Consume>(&msg.payload) {

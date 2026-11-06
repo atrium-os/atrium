@@ -514,6 +514,9 @@ impl Broker {
         let local = m.window();
         match m {
             Msg::WindowCreate { width, height, role, pos, title, embed_pending, .. } => {
+                // An embed-only client's windows stay embeds (S1).
+                let only = socket_server::is_embed_only(r.client_id);
+                let (embed_pending, role) = if only { (true, Role::Document) } else { (embed_pending, role) };
                 let mut wins = r.wins.lock().unwrap();
                 if wins.contains_key(&local) || wins.len() >= MAX_WINDOWS as usize {
                     return Err(format!("window {local}: already open, or too many windows"));

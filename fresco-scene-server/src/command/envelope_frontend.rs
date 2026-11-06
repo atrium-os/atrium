@@ -293,6 +293,8 @@ pub struct EnvelopeFrontend {
     /// report the stable kernel identity (the WM resolves it to an app-id for
     /// workspace assignment). Absent → 0 (unresolved, e.g. a test harness).
     client_uids: HashMap<u8, u32>,
+    /// Clients whose windows stay embeds (S1).
+    embed_only: std::collections::HashSet<u8>,
 
     /// The mode the display is actually scanning out, answered to
     /// `OP_DISPLAY_INFO`. frescod sets it from the connector at startup — the
@@ -343,6 +345,7 @@ impl EnvelopeFrontend {
             pending_region_uploads: Vec::new(),
             wm_capable: std::collections::HashSet::new(),
             client_uids: HashMap::new(),
+            embed_only: std::collections::HashSet::new(),
             display_mode: (0, 0, 0),
             reserved_top: 0,
             notification_uids: Some(Vec::new()),
@@ -465,6 +468,7 @@ impl EnvelopeFrontend {
     pub fn revoke_client_caps(&mut self, client_id: u8) {
         self.wm_capable.remove(&client_id);
         self.client_uids.remove(&client_id);
+        self.embed_only.remove(&client_id);
     }
 
     /// Record the connecting client's uid (`getpeereid`), called by the accept
@@ -472,6 +476,17 @@ impl EnvelopeFrontend {
     /// the app's stable identity over `WM_ENUMERATE`.
     pub fn register_client_uid(&mut self, client_id: u8, uid: u32) {
         self.client_uids.insert(client_id, uid);
+    }
+
+    /// Mark a client embed-only (fresco-video.md §8, S1): every window it
+    /// opens is `embed_pending`, an ordinary document, and only a slot
+    /// bind shows it.
+    pub fn mark_embed_only(&mut self, client_id: u8) {
+        self.embed_only.insert(client_id);
+    }
+
+    pub fn is_embed_only(&self, client_id: u8) -> bool {
+        self.embed_only.contains(&client_id)
     }
 
     /// Stash a blob into the scene-server CasStore. The aqueduct
@@ -1099,8 +1114,12 @@ impl EnvelopeFrontend {
     fn handle_window_create(&mut self, msg: &Message)
         -> Result<Vec<Outbound>, DispatchError>
     {
-        let p: WindowCreatePayload = decode(&msg.payload)
+        let mut p: WindowCreatePayload = decode(&msg.payload)
             .map_err(|_| DispatchError::BadPayload)?;
+        if self.embed_only.contains(&self.current_client) {
+            p.hints.embed_pending = true;
+            p.hints.role = None;
+        }
         let mut comp = self.compositor.lock().unwrap();
         let new_id = comp.create(self.current_client as u32, (p.width, p.height));
         /* Apply title + hints. Compositor's title is set via

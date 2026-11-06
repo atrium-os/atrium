@@ -427,6 +427,7 @@ fn alloc(uid: Option<u32>) -> Option<u8> {
 }
 
 pub fn free_client_id(id: u8) {
+    EMBED_ONLY.lock().unwrap()[id as usize] = false;
     let mut live = LIVE_CLIENTS.lock().unwrap();
     live[id as usize] = false;
     CLIENT_UID.lock().unwrap()[id as usize] = None;
@@ -437,60 +438,7 @@ fn accept_loop(listener: UnixListener, shared: Shared, event_subs: EventSubs, wm
         match conn {
             Ok(stream) => {
                 let uid = peer_xucred(&stream).map(|(_, uid)| uid);
-                let client_id = match alloc_client_id_for(uid) {
-                    Ok(id) => id,
-                    Err(why) => {
-                        eprintln!("frescod: refusing a connection from uid {uid:?}: {why}");
-                        continue;
-                    }
-                };
-                if let (false, Some(h)) = (wm_grant, &shared.hand_off) {
-                    h(stream, client_id, uid, event_subs.clone());
-                    continue;
-                }
-                let (tx, rx) = mpsc::channel::<Outbound>();
-
-                /* Register writer's tx for async-event broadcast. */
-                event_subs.lock().unwrap().push(Sub { client_id, wm: wm_grant, tx: SubTx::Wire(tx.clone()) });
-
-                let writer_stream = match stream.try_clone() {
-                    Ok(s) => s,
-                    Err(e) => {
-                        eprintln!("frescod: try_clone for client {client_id}: {e}");
-                        continue;
-                    }
-                };
-
-                /* Writer thread. */
-                let wlane = shared.lane.clone();
-                std::thread::Builder::new()
-                    .name(format!("frescod-writer-{client_id}"))
-                    .spawn(move || {
-                        writer_loop(writer_stream, rx, client_id, wlane);
-                    })
-                    .ok();
-
-                /* Reader thread. */
-                let frontend = shared.frontend.clone();
-                let lane = shared.lane.clone();
-                let redraw = shared.redraw.clone();
-                std::thread::Builder::new()
-                    .name(format!("frescod-reader-{client_id}"))
-                    .spawn(move || {
-                        if let Err(e) = reader_loop(
-                            stream, frontend.clone(), client_id, tx,
-                            lane.clone(), wm_grant, redraw,
-                        ) {
-                            eprintln!("frescod: reader {client_id}: {e}");
-                        }
-                        if let Some(l) = &lane {
-                            l.drop_self();
-                            l.client_gone(client_id);
-                        }
-                        cleanup_client(&frontend, client_id);
-                        free_client_id(client_id);
-                    })
-                    .ok();
+                serve_client(stream, uid, wm_grant, false, &shared, &event_subs);
             }
             Err(e) => {
                 eprintln!("frescod: accept: {e}");
@@ -498,6 +446,91 @@ fn accept_loop(listener: UnixListener, shared: Shared, event_subs: EventSubs, wm
             }
         }
     }
+}
+
+/// Serves a connection that arrived some other way: an embed-only one
+/// (fresco-video.md §8, S1), handed over by the activation socket.
+pub type EmbedClientFn = Box<dyn Fn(UnixStream, u32) + Send + Sync>;
+pub static EMBED_CLIENT: std::sync::OnceLock<EmbedClientFn> = std::sync::OnceLock::new();
+
+static EMBED_ONLY: Mutex<[bool; 256]> = Mutex::new([false; 256]);
+
+/// Whether client `id`'s windows must stay embeds (S1).
+pub fn is_embed_only(id: u8) -> bool {
+    EMBED_ONLY.lock().unwrap()[id as usize]
+}
+
+/// Serve the client socket's connections and embed-only ones alike.
+pub fn install_embed_client(shared: Shared, event_subs: EventSubs) {
+    let _ = EMBED_CLIENT.set(Box::new(move |stream, uid| {
+        serve_client(stream, Some(uid), false, true, &shared, &event_subs);
+    }));
+}
+
+/// Serve one client connection, owned by `uid`: in process, or handed to
+/// a renderer (split mode). `embed_only`: see [`is_embed_only`].
+fn serve_client(stream: UnixStream, uid: Option<u32>, wm_grant: bool, embed_only: bool, shared: &Shared, event_subs: &EventSubs) {
+    let client_id = match alloc_client_id_for(uid) {
+        Ok(id) => id,
+        Err(why) => {
+            eprintln!("frescod: refusing a connection from uid {uid:?}: {why}");
+            return;
+        }
+    };
+    EMBED_ONLY.lock().unwrap()[client_id as usize] = embed_only;
+    if embed_only {
+        shared.frontend.lock().unwrap().mark_embed_only(client_id);
+    }
+    if let (false, Some(h)) = (wm_grant, &shared.hand_off) {
+        h(stream, client_id, uid, event_subs.clone());
+        return;
+    }
+    let (tx, rx) = mpsc::channel::<Outbound>();
+
+    /* Register writer's tx for async-event broadcast. */
+    event_subs.lock().unwrap().push(Sub { client_id, wm: wm_grant, tx: SubTx::Wire(tx.clone()) });
+
+    let writer_stream = match stream.try_clone() {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("frescod: try_clone for client {client_id}: {e}");
+            return;
+        }
+    };
+
+    /* Writer thread. */
+    let wlane = shared.lane.clone();
+    std::thread::Builder::new()
+        .name(format!("frescod-writer-{client_id}"))
+        .spawn(move || {
+            writer_loop(writer_stream, rx, client_id, wlane);
+        })
+        .ok();
+
+    /* Reader thread. */
+    let frontend = shared.frontend.clone();
+    let lane = shared.lane.clone();
+    let redraw = shared.redraw.clone();
+    std::thread::Builder::new()
+        .name(format!("frescod-reader-{client_id}"))
+        .spawn(move || {
+            if let Some(uid) = uid {
+                frontend.lock().unwrap().register_client_uid(client_id, uid);
+            }
+            if let Err(e) = reader_loop(
+                stream, frontend.clone(), client_id, tx,
+                lane.clone(), wm_grant, redraw,
+            ) {
+                eprintln!("frescod: reader {client_id}: {e}");
+            }
+            if let Some(l) = &lane {
+                l.drop_self();
+                l.client_gone(client_id);
+            }
+            cleanup_client(&frontend, client_id);
+            free_client_id(client_id);
+        })
+        .ok();
 }
 
 pub fn reader_loop(
@@ -517,7 +550,12 @@ pub fn reader_loop(
      * not a capability decision (window-management stays reachability-gated), so
      * frescod needs no registry/portcullis-peer dependency here. */
     if let Some((_, uid)) = peer_xucred(&stream) {
-        frontend.lock().unwrap().register_client_uid(client_id, uid);
+        // An embed-only connection's peer is limend; its owner was named
+        // when it was handed over (S1) and is already registered.
+        let mut fe = frontend.lock().unwrap();
+        if !fe.is_embed_only(client_id) {
+            fe.register_client_uid(client_id, uid);
+        }
     }
 
     /* Capability admission for the cross-app window-management ops = REACHABILITY.

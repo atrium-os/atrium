@@ -220,6 +220,12 @@ fn main() -> std::io::Result<()> {
     if let Ok(p) = std::env::var("FRESCOD_GPU_SOCK") {
         gpu_app::serve(Path::new(&p))?;
     }
+    socket_server::install_embed_client(socket_server::Shared {
+        frontend: frontend.clone(),
+        lane: None,
+        redraw: redraw.clone(),
+        hand_off: split.as_ref().map(|b| b.hand_off()),
+    }, event_subs.clone());
     socket_server::spawn_event_fanout(ev_rx, event_subs, redraw.clone(), comp.clone());
     activation::start(comp.clone());
     drag::install(comp.clone());
@@ -870,6 +876,12 @@ fn run_headless(png: &str) -> std::io::Result<()> {
     if let Ok(p) = std::env::var("FRESCOD_GPU_SOCK") {
         gpu_app::serve(Path::new(&p))?;
     }
+    socket_server::install_embed_client(socket_server::Shared {
+        frontend: frontend.clone(),
+        lane: None,
+        redraw: redraw2.clone(),
+        hand_off: split.as_ref().map(|b| b.hand_off()),
+    }, subs.clone());
     socket_server::spawn_event_fanout(ev_rx, subs, redraw2.clone(), comp.clone());
     activation::start(comp.clone());
     drag::install(comp.clone());

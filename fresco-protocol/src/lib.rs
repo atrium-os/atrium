@@ -1465,6 +1465,12 @@ pub mod slot {
         /// `SlotBind` → `SlotBindResult`; uids on frescod's slot
         /// allowlist only (`_limen`).
         pub const BIND: u16 = 0x0910;
+        /// `EmbedConnect` → `EmbedConnectResult`, as the first message on a
+        /// new activation-socket stream; slot allowlist only. On `Ok` that
+        /// stream becomes an embed-only client connection (fresco-video.md
+        /// §8): every window it opens is `embed_pending`, shown only by
+        /// `BIND`. The caller sends nothing more on it and passes it on.
+        pub const EMBED_CONNECT: u16 = 0x0911;
     }
 
     pub mod kind {
@@ -1494,6 +1500,19 @@ pub mod slot {
         /// `[x, y, w, h]` in the parent's surface pixels; `None` releases
         /// the slot and hides the child again.
         pub rect: Option<[f32; 4]>,
+    }
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+    pub struct EmbedConnect {
+        /// Who the connection's windows belong to (the child's uid); never
+        /// a uid on the slot allowlist.
+        pub owner_uid: u32,
+    }
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+    pub enum EmbedConnectResult {
+        Ok,
+        Refused { reason: u8 },
     }
 
     #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

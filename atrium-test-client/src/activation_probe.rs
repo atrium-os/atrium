@@ -410,6 +410,41 @@ fn main() {
     let r = slot_bind(&mut p, ht, et, sk::PLAIN, Some([0.0, 0.0, 50.0, 50.0]));
     p.check(r == SlotBindResult::Refused { reason: sno::UNKNOWN_WINDOW }, "a gone window's token is dead");
 
+    // Embed-only connections (fresco-video.md §8, S1): limend turns a new
+    // activation-socket stream into the child's frescod connection; every
+    // window on it stays an embed, whatever its hints say.
+    use fresco_protocol::slot::{EmbedConnect, EmbedConnectResult};
+    let embed_connect = |owner_uid: u32| -> (EmbedConnectResult, UnixStream) {
+        let s = UnixStream::connect(act_sock).expect("activation socket");
+        let mut c = aqueduct::Connection::wrap(s.try_clone().unwrap()).unwrap();
+        let b = fresco_protocol::encode(&EmbedConnect { owner_uid }).unwrap();
+        c.send_message(aqueduct::classes::CLASS_DISPLAY, sop::EMBED_CONNECT, aqueduct::flag::RESPONSE_EXPECTED, &b).unwrap();
+        let m = c.recv_message().unwrap();
+        (fresco_protocol::decode(&m.payload).unwrap(), s)
+    };
+    let (r, _) = embed_connect(p.uid);
+    p.check(r == EmbedConnectResult::Refused { reason: sno::INVALID }, &format!("limend can't name its own uid ({r:?})"));
+    let (r, s) = embed_connect(4242);
+    p.check(r == EmbedConnectResult::Ok, &format!("an embed connection for uid 4242 ({r:?})"));
+    let mut child = Connection::wrap(s).expect("embed connection");
+    let hints = WindowHints { initial_position: Some((900, 500)), role: Some(fresco_protocol::WmRole::Notification), ..WindowHints::default() };
+    let cid = child.window_create(120, 60, "sneaky", hints).expect("window");
+    child.set_default_window(cid as u16);
+    child.scene_frame_begin().unwrap();
+    child.scene_node_rect(1, RectParams { x: 0.0, y: 0.0, w: 2000.0, h: 2000.0, r: 0.9, g: 0.1, b: 0.1, a: 1.0, radius: 0.0 }).unwrap();
+    child.scene_frame_end().unwrap();
+    let ct = token_of(&mut child);
+    still();
+    let h = hits(&mut p, &mut child, 950, 530);
+    p.check(!h && ct != [0; 16], "its window asked for no embed and still isn't on screen");
+    let (mut host2, _) = window(sock, (100, 80), (300, 150), [0.5, 0.5, 0.5, 1.0]);
+    let h2 = token_of(&mut host2);
+    let r = slot_bind(&mut p, h2, ct, sk::PLAIN, Some([10.0, 10.0, 200.0, 50.0])); // screen (110, 90) to (310, 140)
+    p.check(r == SlotBindResult::Ok { parent_uid: me, child_uid: 4242 }, &format!("bound, owned by the uid limend named ({r:?})"));
+    still();
+    let h = hits(&mut p, &mut child, 200, 115);
+    p.check(h, "bound: it shows in its slot");
+
     if p.failed > 0 {
         println!("{} FAILED", p.failed);
         std::process::exit(1);
