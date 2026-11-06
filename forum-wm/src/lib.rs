@@ -331,6 +331,10 @@ pub mod displays {
         pub mirrors: HashMap<Vec<u64>, Vec<(u64, u64)>>,
         /// Scales the session set, by monitor (thousandths).
         pub scales: HashMap<u64, u32>,
+        /// By set of monitors: its span groups (fresco-span.md §3).
+        pub spans: HashMap<Vec<u64>, Vec<forum_ctl::SpanGroupInfo>>,
+        /// Apps whose zoom stays on one monitor.
+        pub no_span: std::collections::BTreeSet<String>,
     }
 
     /// The set a list of monitors makes, as `sets` keys it: every monitor
@@ -430,7 +434,18 @@ pub mod displays {
                 }
                 lines.push(format!("set {}", ps.join(" ")));
             }
-            let mut t = String::from("# forum-wm: where each set of monitors sat, and monitor scales\n");
+            let hex = |v: &[u64]| v.iter().map(|i| format!("{i:016x}")).collect::<Vec<_>>().join(",");
+            let mut spans: Vec<(&Vec<u64>, &Vec<forum_ctl::SpanGroupInfo>)> = self.spans.iter().collect();
+            spans.sort_by(|a, b| a.0.cmp(b.0));
+            for (key, groups) in spans {
+                for g in groups {
+                    lines.push(format!("span {} {} {}", hex(key), hex(&g.members), g.gap));
+                }
+            }
+            for a in &self.no_span {
+                lines.push(format!("nospan {a}"));
+            }
+            let mut t = String::from("# forum-wm: where each set of monitors sat, monitor scales, span groups\n");
             for l in lines {
                 t.push_str(&l);
                 t.push('\n');
@@ -449,6 +464,17 @@ pub mod displays {
                         if let (Ok(id), Ok(s)) = (u64::from_str_radix(w[1], 16), w[2].parse::<u32>()) {
                             m.scales.insert(id, s);
                         }
+                    }
+                    Some(&"span") if w.len() == 4 => {
+                        let ids = |s: &str| -> Option<Vec<u64>> { s.split(',').map(|x| u64::from_str_radix(x, 16).ok()).collect() };
+                        if let (Some(key), Some(members), Ok(gap)) = (ids(w[1]), ids(w[2]), w[3].parse::<u32>()) {
+                            if members.len() >= 2 {
+                                m.spans.entry(key).or_default().push(forum_ctl::SpanGroupInfo { members, gap });
+                            }
+                        }
+                    }
+                    Some(&"nospan") if w.len() == 2 => {
+                        m.no_span.insert(w[1].to_string());
                     }
                     Some(&"set") if w.len() > 1 => {
                         let cut = w.iter().position(|&x| x == "mirror").unwrap_or(w.len());
@@ -596,6 +622,20 @@ pub mod daemon {
         /// Set the system appearance (OP_WM_SET_APPEARANCE); every client
         /// hears EV_APPEARANCE_CHANGED.
         fn set_appearance(&mut self, a: fresco_protocol::AppearancePayload) -> io::Result<()>;
+        /// Span window `p.window_id` over monitors `p.members`
+        /// (OP_WM_SPAN_GROUP), or end the span (no members); the reply is
+        /// the rect the window must cover. EV_DISPLAY_CHANGED follows.
+        fn span_group(&mut self, p: fresco_protocol::WmSpanGroupPayload) -> io::Result<WmRect>;
+    }
+
+    /// A window spanning a group of monitors, as frescod granted it.
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub struct SpanUp {
+        pub window: u32,
+        pub members: Vec<u64>,
+        pub gap: u32,
+        /// The desktop rect the window covers.
+        pub rect: WmRect,
     }
 
     /// The WM core state: output geometry, the human's focus intent, and the
@@ -655,6 +695,11 @@ pub mod daemon {
         /// Mirrorings were asked for to put a set back: when they land
         /// (same set), its arrangement is put back too, not overwritten.
         pub restoring: bool,
+        /// The window spanning a group of monitors now (fresco-span.md).
+        pub span_up: RefCell<Option<SpanUp>>,
+        /// The last span frescod refused (window, members): not asked
+        /// again until something changes, so a refusal doesn't loop.
+        span_refused: RefCell<Option<(u32, Vec<u64>)>>,
     }
 
     pub use forum_ctl::Side;
@@ -680,6 +725,8 @@ pub mod daemon {
                 displays: Default::default(),
                 display_store: None,
                 restoring: false,
+                span_up: RefCell::new(None),
+                span_refused: RefCell::new(None),
             }
         }
 
@@ -764,6 +811,11 @@ pub mod daemon {
                     Some(&s) if o.scale_auto || o.scale_milli != s => conn.set_output_scale(o.identity, s)?,
                     _ => {}
                 }
+            }
+            /* A span moves its monitors apart for the bezels: that is not
+             * an arrangement to keep, nor one to put back. */
+            if self.span_up.borrow().is_some() {
+                return Ok(());
             }
             if restore {
                 let mirrors = self.displays.restore_mirrors(outputs);
@@ -995,6 +1047,158 @@ pub mod daemon {
             Ok(now_zoomed)
         }
 
+        /// The span the zoom wants now: the zoomed window, if its monitor is
+        /// in a span group of this set and the app may span, over the
+        /// group's monitors still on the desktop (present, or within their
+        /// grace: frescod keeps a member's place while it is briefly gone).
+        fn wanted_span(&self, active: &[WmSurfaceInfo]) -> Option<(u32, Vec<u64>, u32)> {
+            let z = self.zoomed?;
+            let s = active.iter().find(|s| s.surface_id == z)?;
+            if self.displays.no_span.contains(&s.owner_app) {
+                return None;
+            }
+            let mons = self.monitors();
+            let home = self.monitor_of(s, &mons);
+            // This set's group; else (a member gone for good makes another
+            // set) the remembered group with the most monitors still here.
+            let here = |g: &&forum_ctl::SpanGroupInfo| g.members.iter().filter(|id| self.outputs.iter().any(|o| o.identity == **id)).count();
+            let g = match self.displays.spans.get(&super::displays::set_of(&self.outputs)) {
+                Some(groups) => groups.iter().find(|g| g.members.contains(&home))?,
+                None => self.displays.spans.values().flatten().filter(|g| g.members.contains(&home)).max_by_key(here)?,
+            };
+            let members: Vec<u64> = g
+                .members
+                .iter()
+                .copied()
+                .filter(|id| self.outputs.iter().any(|o| o.identity == *id && o.mirror_of == 0))
+                .collect();
+            (members.len() >= 2).then_some((z, members, g.gap))
+        }
+
+        /// Ask frescod for the span the zoom wants, or end the one up.
+        fn sync_span(&self, conn: &mut impl FrescoConn, active: &[WmSurfaceInfo]) -> io::Result<()> {
+            let want = self.wanted_span(active);
+            let now = self.span_up.borrow().as_ref().map(|s| (s.window, s.members.clone(), s.gap));
+            if want == now {
+                return Ok(());
+            }
+            if let Some((w, m, _)) = &want {
+                if self.span_refused.borrow().as_ref() == Some(&(*w, m.clone())) {
+                    // Refused before: zoom stays on one monitor.
+                    if now.is_none() {
+                        return Ok(());
+                    }
+                }
+            }
+            if now.is_some() && want.is_none() {
+                let ended = conn.span_group(fresco_protocol::WmSpanGroupPayload {
+                    window_id: 0, members: Vec::new(), gaps_x: Vec::new(), gaps_y: Vec::new(),
+                });
+                *self.span_up.borrow_mut() = None;
+                eprintln!("forum-wm: span ended");
+                return ended.map(|_| ());
+            }
+            let Some((window, members, gap)) = want else { return Ok(()) };
+            let rects: Vec<WmRect> = members.iter().filter_map(|id| self.outputs.iter().find(|o| o.identity == *id)).map(|o| o.rect).collect();
+            let distinct = |f: fn(&WmRect) -> i32| {
+                let mut v: Vec<i32> = rects.iter().map(f).collect();
+                v.sort_unstable();
+                v.dedup();
+                v.len()
+            };
+            let (cols, rows) = (distinct(|r| r.x), distinct(|r| r.y));
+            let gaps = |n: usize| if gap == 0 { Vec::new() } else { vec![gap; n.saturating_sub(1)] };
+            let p = fresco_protocol::WmSpanGroupPayload { window_id: window, members: members.clone(), gaps_x: gaps(cols), gaps_y: gaps(rows) };
+            match conn.span_group(p) {
+                Ok(rect) => {
+                    eprintln!("forum-wm: window {window} spans {} monitors ({}x{})", members.len(), rect.w, rect.h);
+                    *self.span_up.borrow_mut() = Some(SpanUp { window, members, gap, rect });
+                    *self.span_refused.borrow_mut() = None;
+                }
+                Err(e) => {
+                    eprintln!("forum-wm: span refused ({e}); the zoom stays on one monitor");
+                    *self.span_refused.borrow_mut() = Some((window, members));
+                    if now.is_some() {
+                        *self.span_up.borrow_mut() = None;
+                        let _ = conn.span_group(fresco_protocol::WmSpanGroupPayload {
+                            window_id: 0, members: Vec::new(), gaps_x: Vec::new(), gaps_y: Vec::new(),
+                        });
+                    }
+                }
+            }
+            Ok(())
+        }
+
+        /// Make outputs `outs` a span group of this set of monitors, with
+        /// `gap` hidden pixels between neighbours (fresco-span.md §3, §4):
+        /// two or more monitors, all at one mode, none a mirror. They
+        /// leave any group they were in; one output alone just leaves.
+        /// Remembered; a zoom on one of them now covers them all.
+        pub fn set_span_group(&mut self, conn: &mut impl FrescoConn, outs: &[u32], gap: u32) -> io::Result<()> {
+            let bad = |m: &str| io::Error::new(io::ErrorKind::InvalidInput, m.to_string());
+            let mut members = Vec::new();
+            for &n in outs {
+                let o = self.outputs.iter().find(|o| o.output == n).ok_or_else(|| bad("no such output"))?;
+                if o.mirror_of != 0 {
+                    return Err(bad("a mirror can't be in a span group"));
+                }
+                if members.contains(&o.identity) {
+                    return Err(bad("an output named twice"));
+                }
+                members.push(o.identity);
+            }
+            if members.len() >= 2 {
+                let first = self.outputs.iter().find(|o| o.identity == members[0]).unwrap();
+                let one_mode = members.iter().all(|id| {
+                    self.outputs.iter().any(|o| o.identity == *id && (o.rect.w, o.rect.h, o.refresh_mhz) == (first.rect.w, first.rect.h, first.refresh_mhz))
+                });
+                if !one_mode {
+                    return Err(bad("the monitors of a span group must run one mode"));
+                }
+                if first.rect.w < first.rect.h {
+                    return Err(bad("a span is landscape only"));
+                }
+                if gap > 1000 {
+                    return Err(bad("a bezel gap of more than 1000 pixels"));
+                }
+            }
+            let key = super::displays::set_of(&self.outputs);
+            let groups = self.displays.spans.entry(key.clone()).or_default();
+            for g in groups.iter_mut() {
+                g.members.retain(|id| !members.contains(id));
+            }
+            groups.retain(|g| g.members.len() >= 2);
+            if members.len() >= 2 {
+                groups.push(forum_ctl::SpanGroupInfo { members, gap });
+            }
+            if groups.is_empty() {
+                self.displays.spans.remove(&key);
+            }
+            self.save_displays();
+            *self.span_refused.borrow_mut() = None;
+            self.reconcile(conn).map(|_| ())
+        }
+
+        /// This set's span groups, and the window spanning now (0: none).
+        pub fn span_groups(&self) -> (Vec<forum_ctl::SpanGroupInfo>, u32) {
+            let g = self.displays.spans.get(&super::displays::set_of(&self.outputs)).cloned().unwrap_or_default();
+            (g, self.span_up.borrow().as_ref().map_or(0, |s| s.window))
+        }
+
+        /// Let app `app` span (or keep its zoom on one monitor); remembered.
+        pub fn set_app_spans(&mut self, conn: &mut impl FrescoConn, app: &str, spans: bool) -> io::Result<()> {
+            if app.is_empty() || app.len() > 255 || app.chars().any(char::is_whitespace) {
+                return Err(io::Error::new(io::ErrorKind::InvalidInput, "an app id, without spaces"));
+            }
+            if spans {
+                self.displays.no_span.remove(app);
+            } else {
+                self.displays.no_span.insert(app.to_string());
+            }
+            self.save_displays();
+            self.reconcile(conn).map(|_| ())
+        }
+
         /// Snap the focused document to a half of the work area (the snap intent,
         /// forum.md §2.3) and re-declare. Entering snap mode manually tiles the
         /// snapped docs; unsnapped docs render-gate. Only documents snap (chrome /
@@ -1046,6 +1250,24 @@ pub mod daemon {
         /// keeps showing the document last on top of it.
         fn layout_active(&self, active: &[WmSurfaceInfo]) -> WmDeclareLayoutPayload {
             let mons = self.monitors();
+            // A span: its window covers the group's monitors; the others
+            // are laid out as usual.
+            if let Some(su) = self.span_up.borrow().clone().filter(|su| active.iter().any(|s| s.surface_id == su.window)) {
+                let mut slots = vec![WmSlot { surface_id: su.window, rect: su.rect, layer: 0 }];
+                for (i, m) in mons.iter().enumerate().filter(|(_, m)| !su.members.contains(&m.identity)) {
+                    let sub: Vec<WmSurfaceInfo> = active
+                        .iter()
+                        .filter(|s| s.surface_id != su.window && self.monitor_of(s, &mons) == m.identity)
+                        .cloned()
+                        .collect();
+                    if sub.is_empty() {
+                        continue;
+                    }
+                    let f = self.top.borrow().get(&m.identity).copied().filter(|t| sub.iter().any(|s| s.surface_id == *t));
+                    slots.extend(self.layout_on(&self.screen_of(m, i == 0), &sub, f).slots);
+                }
+                return WmDeclareLayoutPayload { slots, focus: su.window, focus_cause: 0 };
+            }
             match mons.as_slice() {
                 [] => return self.layout_on(&self.screen, active, self.focus_intent),
                 // One monitor left (the others gone, or within their grace):
@@ -1110,6 +1332,7 @@ pub mod daemon {
                 .filter(|s| shown_in_workspace(s, &self.assignment, self.active))
                 .cloned()
                 .collect();
+            self.sync_span(conn, &active)?;
             let mut layout = self.layout_active(&active);
             layout.focus_cause = self.focus_cause.take();
             conn.declare_layout(&layout)?;
@@ -1332,6 +1555,22 @@ pub mod control {
                     Err(e) => Reply::Err { message: e.to_string() },
                 }
             }
+            Intent::ToggleZoom => match wm.toggle_zoom(conn) {
+                Ok(_) => Reply::Ack,
+                Err(e) => Reply::Err { message: e.to_string() },
+            },
+            Intent::SetSpanGroup { outputs, gap } => match wm.set_span_group(conn, &outputs, gap) {
+                Ok(()) => Reply::Ack,
+                Err(e) => Reply::Err { message: e.to_string() },
+            },
+            Intent::ListSpanGroups => {
+                let (groups, spanning) = wm.span_groups();
+                Reply::SpanGroups { groups, spanning, no_span: wm.displays.no_span.iter().cloned().collect() }
+            }
+            Intent::SetAppSpans { app, spans } => match wm.set_app_spans(conn, &app, spans) {
+                Ok(()) => Reply::Ack,
+                Err(e) => Reply::Err { message: e.to_string() },
+            },
             Intent::MoveToNextMonitor => match wm.move_focused_to_next_monitor(conn) {
                 Ok(Some(_)) => Reply::Ack,
                 Ok(None) => Reply::Err { message: "nothing to move, or only one monitor".into() },
@@ -1545,8 +1784,24 @@ mod tests {
         scaled: Vec<(u64, u32)>,
         mirrored: Vec<(u64, u64)>,
         appearance: Option<fresco_protocol::AppearancePayload>,
+        spans: Vec<fresco_protocol::WmSpanGroupPayload>,
     }
     impl FrescoConn for MockConn {
+        fn span_group(&mut self, p: fresco_protocol::WmSpanGroupPayload) -> io::Result<fresco_protocol::WmRect> {
+            let rects: Vec<fresco_protocol::WmRect> =
+                p.members.iter().filter_map(|id| self.outputs.iter().find(|o| o.identity == *id)).map(|o| o.rect).collect();
+            let r = if rects.is_empty() {
+                fresco_protocol::WmRect { x: 0, y: 0, w: 0, h: 0 }
+            } else {
+                let x0 = rects.iter().map(|r| r.x).min().unwrap();
+                let y0 = rects.iter().map(|r| r.y).min().unwrap();
+                let x1 = rects.iter().map(|r| r.x + r.w).max().unwrap() + p.gaps_x.iter().sum::<u32>() as i32;
+                let y1 = rects.iter().map(|r| r.y + r.h).max().unwrap() + p.gaps_y.iter().sum::<u32>() as i32;
+                fresco_protocol::WmRect { x: x0, y: y0, w: x1 - x0, h: y1 - y0 }
+            };
+            self.spans.push(p);
+            Ok(r)
+        }
         fn set_appearance(&mut self, a: fresco_protocol::AppearancePayload) -> io::Result<()> {
             self.appearance = Some(a);
             Ok(())
@@ -2054,6 +2309,61 @@ mod tests {
         wm.toggle_zoom(&mut conn).unwrap();
         let l = conn.declared.clone().unwrap();
         assert_eq!(slot(&l, 1), Some(WmRect { x: 1920, y: 0, w: 2560, h: 1440 }));
+    }
+
+    #[test]
+    fn zoom_on_a_span_group_covers_the_group_and_ends_with_the_zoom() {
+        let mut conn = MockConn { surfaces: vec![surf(1, WmRole::Document), surf(2, WmRole::Document)], ..Default::default() };
+        let mut wm = Wm::new(Screen { rect: WmRect { x: 0, y: 0, w: 5760, h: 1080 }, bar_h: 24, dock_h: 48 });
+        let mons = vec![mon(0, 10, 0, 1920, 1080), mon(1, 11, 1920, 1920, 1080), mon(2, 12, 3840, 1920, 1080), mon(3, 13, 5760, 2560, 1440)];
+        conn.outputs = mons.clone();
+        wm.set_outputs(&mut conn, mons).unwrap();
+        // Refused: mixed modes, a mirror-less unknown output.
+        assert!(wm.set_span_group(&mut conn, &[2, 3], 0).is_err(), "1080p and 1440p");
+        assert!(wm.set_span_group(&mut conn, &[0, 9], 0).is_err(), "no output 9");
+        wm.set_span_group(&mut conn, &[0, 1, 2], 40).unwrap();
+        assert!(conn.spans.is_empty(), "a group alone spans nothing");
+        assert_eq!(wm.span_groups().0, vec![forum_ctl::SpanGroupInfo { members: vec![10, 11, 12], gap: 40 }]);
+
+        wm.focus_new(&mut conn, 1).unwrap();
+        wm.toggle_zoom(&mut conn).unwrap();
+        let p = conn.spans.last().unwrap().clone();
+        assert_eq!((p.window_id, p.members.clone(), p.gaps_x.clone(), p.gaps_y.clone()), (1, vec![10, 11, 12], vec![40, 40], vec![]));
+        let l = conn.declared.clone().unwrap();
+        assert_eq!(slot(&l, 1), Some(WmRect { x: 0, y: 0, w: 5840, h: 1080 }), "the window covers the group and its bezels");
+        assert_eq!(slot(&l, 2), None, "nothing else on the group");
+        assert_eq!(wm.span_groups().1, 1);
+        // A re-declare asks nothing more.
+        let n = conn.spans.len();
+        wm.reconcile(&mut conn).unwrap();
+        assert_eq!(conn.spans.len(), n);
+
+        // Un-zoom ends it.
+        wm.toggle_zoom(&mut conn).unwrap();
+        assert_eq!(conn.spans.last().unwrap().members, Vec::<u64>::new());
+        assert_eq!(wm.span_groups().1, 0);
+
+        // An app that doesn't span zooms on its monitor alone.
+        wm.set_app_spans(&mut conn, "org.atrium.app1", false).unwrap();
+        let n = conn.spans.len();
+        wm.toggle_zoom(&mut conn).unwrap();
+        assert_eq!(conn.spans.len(), n);
+        assert_eq!(slot(&conn.declared.clone().unwrap(), 1).map(|r| r.w), Some(1920));
+        wm.toggle_zoom(&mut conn).unwrap();
+        wm.set_app_spans(&mut conn, "org.atrium.app1", true).unwrap();
+
+        // A member gone for good (no longer on the desktop): the span goes
+        // on over the rest, as one new request.
+        wm.toggle_zoom(&mut conn).unwrap();
+        let fewer = vec![mon(0, 10, 0, 1920, 1080), mon(1, 11, 1920, 1920, 1080), mon(3, 13, 3840, 2560, 1440)];
+        conn.outputs = fewer.clone();
+        wm.set_outputs(&mut conn, fewer).unwrap();
+        assert_eq!(conn.spans.last().unwrap().members, vec![10, 11]);
+        // The group is per set of monitors: the memory round-trips it.
+        let m = crate::displays::DisplayMemory::from_text(&wm.displays.to_text());
+        assert_eq!(m, wm.displays);
+        // One output alone takes it out of the group.
+        wm.set_span_group(&mut conn, &[0, 1, 2], 0).ok();
     }
 
     #[test]

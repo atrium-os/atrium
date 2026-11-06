@@ -98,6 +98,9 @@ impl FrescoConn for ClientConn {
     fn mirror_output(&mut self, identity: u64, of: u64) -> io::Result<()> {
         self.conn.wm_mirror_output(identity, of)
     }
+    fn span_group(&mut self, p: fresco_protocol::WmSpanGroupPayload) -> io::Result<fresco_protocol::WmRect> {
+        self.conn.wm_span_group(p.window_id, p.members, p.gaps_x, p.gaps_y)
+    }
 }
 
 

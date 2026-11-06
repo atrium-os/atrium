@@ -147,6 +147,29 @@ snapshots of the three pipes (5361 of them while one member's in-fence was
 held back); with a member's lock off the others flip without it, and the
 test's detector sees the split.
 
+**S2–S4 as built (2026-11-06).** Forum keeps span groups per set of
+monitors (`forum-ctl span A B C [gap PX]`, `spans`, `span-app APP on|off`)
+and, when the zoomed window's monitor is in a group, asks frescod for the
+span (`OP_WM_SPAN_GROUP`); the reply is the rect the window covers. Bezel
+compensation is done by frescod moving the members (and any monitor past
+them) apart by the gaps while the span is up, so the window covers the
+hidden strips and no head scans them out; they go back when it ends. The
+gap is in pixels for now; millimetres from the EDID size come later. frescod
+(`frescod/src/span.rs`) locks the members' timing, presents them with one
+`COMMIT_MULTI` per frame, runs VRR and HDR on all members or none (VRR off on
+all if one lacks it; the kernel runs the highest floor), gives members a
+30 s grace, darkens a dropped member's tile with its flip lock off, and holds
+out a member that drops 3 times in 60 s until it has stayed up 10 s (logged;
+a notification naming it is not posted yet). A member gone past the grace
+ends the span and Forum asks again over the members left: one resize.
+**Not yet:** direct scanout of the game's surface (members show the composed
+desktop, cropped per head, as multi-monitor does), the per-tile probe game
+and the span chaos run. `scripts/vm-span-e2e.sh` passes in the amd64 VM with
+0 failures, split mode on: three 1080p monitors (one with a 60 Hz VRR floor),
+a window covering 5840x1080 with two 40 px strips, a 10 s dropout, flapping
+held out and rejoining, a member gone 45 s (one resize to 3880x1080 and back),
+and the un-zoom putting the monitors back.
+
 ## 9. Decisions for Shankar
 
 1. **Spanning only through zoom over a user-made span group, never a whole-desktop mode.**

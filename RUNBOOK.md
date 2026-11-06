@@ -5299,6 +5299,13 @@ monitor` line), `forum-ctl move-monitor` sends the focused window to the next mo
 `/var/db/atrium/<user>/forum-displays.state` (`$FORUM_DISPLAYS`); delete it
 to forget them. gpusim's monitors carry physical sizes: code 1 a 24"
 1080p, 2 a 27" 4K (scale 1.5), 3 and 5 a 24" desktop, 4 a 27" 1440p.
+Game spanning (fresco-span.md): `forum-ctl span 0 1 2 gap 40` makes outputs
+0-2 a span group with 40 px bezels (`span 1` takes one out, `spans` lists,
+`span-app APP off` keeps an app's zoom on one monitor), and `forum-ctl zoom`
+on a window on one of them covers the group. gpusim plug code 6 is the
+desktop monitor with VRR from 60 Hz. `scripts/vm-span-e2e.sh` (copy to
+/root/s) runs it end to end with dropouts, flapping and a member gone, and
+ends with `span: N failed`; `atrium-gpu-rs` `display_span` tests the kernel side.
 `scripts/vm-multimonitor-chaos.sh` (copy to /root/s in the guest) runs a
 seeded storm of plugs, unplugs, dropouts, bursts, arrangements and mirroring and checks
 after each step that frescod and forum-wm live, every plugged monitor is

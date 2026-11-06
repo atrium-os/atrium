@@ -51,6 +51,7 @@ mod hdr;
 mod heads;
 mod outputs;
 mod video;
+mod span;
 
 use atrium_gpu::amd::{Display, EventWatch, Gpu, ModeV2, OutputCommit, MODE_PREFERRED, NOTE_HOTPLUG, NOTE_RESET};
 
@@ -127,6 +128,10 @@ fn main() -> std::io::Result<()> {
      * to its own preferred mode. */
     let mut remodes: Vec<(u32, (u32, u32, u32))> = Vec::new();
     let mut tracker = outputs::Tracker::default();
+    /* A fullscreen window spanning monitors (fresco-span.md), and when a
+     * held-out member may rejoin. */
+    let mut span: Option<span::Span> = None;
+    let mut span_recheck: Option<Instant> = None;
     /* The gpu renderer can't encode HDR; corrected below once it exists. */
     let guess_hdr = std::env::var("FRESCOD_RENDERER").map_or(true, |v| v != "gpu");
     let seen = seen_outputs(&dpy)?;
@@ -367,11 +372,25 @@ fn main() -> std::io::Result<()> {
             if let Ok(seen) = seen_outputs(&dpy) {
                 mark_present(&mut heads, &seen);
                 publish_outputs(&frontend, &heads, &scales);
+                if let Some(s) = span.as_mut() {
+                    span_recheck = span_attach(s, &dpy, &heads, &seen, &ev_main, now);
+                }
+            }
+        }
+        /* A held-out span member that has stayed up rejoins. */
+        if span_recheck.is_some_and(|t| now >= t) {
+            span_recheck = None;
+            if let (Some(s), Ok(seen)) = (span.as_mut(), seen_outputs(&dpy)) {
+                span_recheck = span_attach(s, &dpy, &heads, &seen, &ev_main, now);
             }
         }
         let mut changed = false;
         /* A WM mirroring a monitor (OP_WM_MIRROR_OUTPUT), or stopping. */
         for r in frontend.lock().unwrap().take_mirror_requests() {
+            if span.is_some() {
+                eprintln!("frescod: mirroring refused: a window spans monitors");
+                continue;
+            }
             match set_mirror(&mut heads, r.identity, r.of) {
                 Ok(remode) => {
                     remodes.extend(remode);
@@ -394,6 +413,11 @@ fn main() -> std::io::Result<()> {
             }
             recheck_at = None;
             let before = outputs::display_set(heads.iter().map(|h| h.identity));
+            /* Under a span the monitors go back to their places first; the
+             * span is laid out again over whatever is left. */
+            if let Some(s) = &span {
+                s.unplace(&mut heads);
+            }
             match reconfigure_heads(&cx, &mut heads, &mut tracker, &remembered, &requests, renderer.can_hdr()) {
                 Ok((true, again)) => {
                     recheck_at = again;
@@ -428,7 +452,47 @@ fn main() -> std::io::Result<()> {
                 Ok((false, again)) => recheck_at = again,
                 Err(e) => eprintln!("frescod: display reconfiguration failed ({e}); staying"),
             }
+            if let Some(mut s) = span.take() {
+                match s.relayout(&mut heads).and_then(|()| {
+                    s.unify_hdr(&dpy, &mut heads);
+                    s.lock(&dpy, &heads)
+                }) {
+                    Ok(()) => {
+                        frontend.lock().unwrap().set_span_moved(s.moved());
+                        span = Some(s);
+                    }
+                    Err(e) => {
+                        eprintln!("frescod: span over: {e}");
+                        end_span(s, &cx, &mut heads, &mut tracker, &remembered, &frontend, &ev_main, renderer.can_hdr());
+                    }
+                }
+                changed = true;
+            }
             publish_output0(&frontend, &dpy, &heads);
+        }
+        /* A window spanning monitors (OP_WM_SPAN_GROUP), or a span ending:
+         * Forum un-zoomed it, or the window is gone. */
+        let gone = span.as_ref().is_some_and(|s| {
+            u16::try_from(s.window_id).map_or(true, |id| !comp.lock().unwrap().windows.contains_key(&id))
+        });
+        let span_reqs = frontend.lock().unwrap().take_span_requests();
+        if gone || !span_reqs.is_empty() {
+            if let Some(s) = span.take() {
+                end_span(s, &cx, &mut heads, &mut tracker, &remembered, &frontend, &ev_main, renderer.can_hdr());
+                changed = true;
+            }
+            if let Some(r) = span_reqs.last().filter(|r| r.window_id != 0 && !r.members.is_empty()) {
+                match start_span(r, &cx, &mut heads, &mut tracker, &remembered, &frontend, &ev_main, renderer.can_hdr()) {
+                    Ok(s) => {
+                        let at: Vec<String> = heads.iter().filter(|h| s.is_member(h.identity))
+                            .map(|h| format!("output {} at {},{}", h.output, h.vp.x, h.vp.y)).collect();
+                        eprintln!("frescod: window {} spans {}", s.window_id, at.join(", "));
+                        span = Some(s);
+                    }
+                    Err(e) => eprintln!("frescod: span refused: {e}"),
+                }
+                changed = true;
+            }
         }
         /* A WM setting a monitor's scale (OP_WM_SET_OUTPUT_SCALE): kept
          * by monitor, wherever it is plugged; 0 goes back to automatic. */
@@ -444,7 +508,12 @@ fn main() -> std::io::Result<()> {
         }
         /* A WM moving monitors on the desktop (OP_WM_ARRANGE_OUTPUTS). */
         let placements = frontend.lock().unwrap().take_arrange_request();
-        if let Some(pl) = placements {
+        if let Some(pl) = placements.filter(|_| {
+            if span.is_some() {
+                eprintln!("frescod: monitor arrangement refused: a window spans monitors");
+            }
+            span.is_none()
+        }) {
             match place_outputs(&mut heads, &pl) {
                 Ok(()) => {
                     let at: Vec<String> = heads.iter().map(|h| format!("output {} at {},{}", h.output, h.vp.x, h.vp.y)).collect();
@@ -472,7 +541,10 @@ fn main() -> std::io::Result<()> {
                     Err(e) => eprintln!("frescod: GPU renderer not back ({e}); staying on Tier-2"),
                 }
             }
-            remember(&heads, &mut remembered, &mut mirrors_memo);
+            /* A span's moved monitors are not an arrangement to keep. */
+            if span.is_none() {
+                remember(&heads, &mut remembered, &mut mirrors_memo);
+            }
             screen::set(dw, dh, refresh);
             publish_outputs(&frontend, &heads, &scales);
             let info = {
@@ -504,9 +576,19 @@ fn main() -> std::io::Result<()> {
             /* Heads that missed the newest frame get it once they land. */
             let mut stale = false;
             if multi {
-                for h in heads.iter_mut().filter(|h| h.present && h.stale) {
+                let spanned = |h: &heads::Head<'_>| span.as_ref().is_some_and(|s| s.is_member(h.identity));
+                for h in heads.iter_mut().filter(|h| h.present && h.stale && !spanned(h)) {
                     if h.landed() {
                         present_head(&dpy, h, None, &mut framebuffer, dw, frame_deadline_ns, &hdr_enc)?;
+                    } else {
+                        stale = true;
+                    }
+                }
+                /* The span's members catch up together, once all landed. */
+                let group = span.as_ref().map(|s| s.active_heads(&heads)).unwrap_or_default();
+                if group.iter().any(|&k| heads[k].stale) {
+                    if group.iter().all(|&k| heads[k].landed()) {
+                        present_span(&dpy, &mut heads, &group, &mut framebuffer, dw, frame_deadline_ns, &hdr_enc)?;
                     } else {
                         stale = true;
                     }
@@ -520,7 +602,7 @@ fn main() -> std::io::Result<()> {
             let mut until_beat =
                 heartbeat.saturating_sub(last_render.elapsed());
             let now = Instant::now();
-            for t in [gpu_back_at, recheck_at, hotplug_pending.then(|| tracker.settles_at()).flatten()]
+            for t in [gpu_back_at, recheck_at, span_recheck, hotplug_pending.then(|| tracker.settles_at()).flatten()]
                 .into_iter()
                 .flatten()
             {
@@ -547,7 +629,8 @@ fn main() -> std::io::Result<()> {
          * before this one starts, both because its flip released the buffer
          * we are about to fill and because nothing presents faster than its
          * refresh. Damage that lands meanwhile coalesces into this frame. */
-        if let Some(lead) = heads.iter().filter(|h| h.present).max_by_key(|h| h.mode.refresh_mhz) {
+        let flips = |h: &heads::Head<'_>| h.present && span.as_ref().is_none_or(|s| !s.is_member(h.identity) || s.active(h.identity));
+        if let Some(lead) = heads.iter().filter(|h| flips(h)).max_by_key(|h| h.mode.refresh_mhz) {
             if let Err(e) = lead.flip_done.wait(lead.frame, flip_timeout_ms()) {
                 /* The reset may have taken the last flip's copy with it; the
                  * display kept its buffer, so go on and commit a fresh frame. */
@@ -576,7 +659,8 @@ fn main() -> std::io::Result<()> {
         if multi {
             renderer.read_pixels(&mut framebuffer).map_err(io_other)?;
         }
-        for h in heads.iter_mut().filter(|h| h.present) {
+        let spanned = |h: &heads::Head<'_>| span.as_ref().is_some_and(|s| s.is_member(h.identity));
+        for h in heads.iter_mut().filter(|h| h.present && !spanned(h)) {
             if !h.landed() {
                 if !reset_due {
                     h.stale = true;
@@ -586,6 +670,20 @@ fn main() -> std::io::Result<()> {
             }
             let r = if multi { None } else { Some(&mut renderer) };
             present_head(&dpy, h, r, &mut framebuffer, dw, frame_deadline_ns, &hdr_enc)?;
+        }
+        /* A span's members flip together: one commit, once every one of
+         * them has landed its last frame (they share one clock, so they
+         * land together). Members out of the span's flips are left be. */
+        let group = span.as_ref().map(|s| s.active_heads(&heads)).unwrap_or_default();
+        if !group.is_empty() {
+            if group.iter().all(|&k| heads[k].landed()) || reset_due {
+                for &k in &group {
+                    let _ = heads[k].flip_done.wait(heads[k].frame, flip_timeout_ms());
+                }
+                present_span(&dpy, &mut heads, &group, &mut framebuffer, dw, frame_deadline_ns, &hdr_enc)?;
+            } else {
+                group.iter().for_each(|&k| heads[k].stale = true);
+            }
         }
 
         let cost = t_render.elapsed();
@@ -734,6 +832,34 @@ fn present_head(
     deadline_ns: u32,
     enc: &hdr::Encoder,
 ) -> std::io::Result<()> {
+    let (back, next) = upload_head(h, renderer, desktop, desktop_w, deadline_ns, enc)?;
+    let mut c = OutputCommit::flip(h.output, Some(h.scan.buffer(back)), true);
+    c.format = h.format();
+    c.in_fence = Some((&h.copy_done, next));
+    c.out_fence = Some((&h.flip_done, next));
+    let r = dpy.commit_multi(&[c], false)?;
+    if r.failed.is_some() {
+        eprintln!("frescod: flip on output {} refused (fault {}); it waits for the next hotplug", h.output, r.reason);
+        h.present = false;
+        return Ok(());
+    }
+    h.frame = next;
+    h.on_screen = back;
+    h.stale = false;
+    Ok(())
+}
+
+/// Put the newest desktop frame into `h`'s next scanout buffer (see
+/// [`present_head`]); copy_done reaches the returned frame number once it
+/// is there. Returns (buffer, frame).
+fn upload_head(
+    h: &mut heads::Head<'_>,
+    renderer: Option<&mut Backend<'_>>,
+    desktop: &mut [u8],
+    desktop_w: u32,
+    deadline_ns: u32,
+    enc: &hdr::Encoder,
+) -> std::io::Result<(usize, u64)> {
     let back = (h.on_screen + 1) % h.scan.len();
     let next = h.frame + 1;
     /* Only the rows this buffer lacks go up. */
@@ -762,20 +888,143 @@ fn present_head(
             h.scan.upload_range(back, &h.staging, range, deadline_ns, Some((&h.copy_done, next)))?;
         }
     }
-    let mut c = OutputCommit::flip(h.output, Some(h.scan.buffer(back)), true);
-    c.format = h.format();
-    c.in_fence = Some((&h.copy_done, next));
-    c.out_fence = Some((&h.flip_done, next));
-    let r = dpy.commit_multi(&[c], false)?;
-    if r.failed.is_some() {
-        eprintln!("frescod: flip on output {} refused (fault {}); it waits for the next hotplug", h.output, r.reason);
-        h.present = false;
+    Ok((back, next))
+}
+
+/// Put the newest desktop frame on a span's members (`group`: the heads
+/// in its flips) and flip them in one commit, so every monitor shows the
+/// same frame from the same vblank (fresco-span.md §5). A refused commit
+/// is logged and tried again next frame: the members stay in the span.
+fn present_span(
+    dpy: &Display,
+    heads: &mut [heads::Head<'_>],
+    group: &[usize],
+    desktop: &mut [u8],
+    desktop_w: u32,
+    deadline_ns: u32,
+    enc: &hdr::Encoder,
+) -> std::io::Result<()> {
+    let mut up = Vec::with_capacity(group.len());
+    for &k in group {
+        up.push(upload_head(&mut heads[k], None, desktop, desktop_w, deadline_ns, enc)?);
+    }
+    let parts: Vec<OutputCommit<'_, '_>> = group
+        .iter()
+        .zip(&up)
+        .map(|(&k, &(back, next))| {
+            let h = &heads[k];
+            let mut c = OutputCommit::flip(h.output, Some(h.scan.buffer(back)), true);
+            c.format = h.format();
+            c.in_fence = Some((&h.copy_done, next));
+            c.out_fence = Some((&h.flip_done, next));
+            c
+        })
+        .collect();
+    let refused = match dpy.commit_multi(&parts, false) {
+        Ok(r) => r.failed.map(|i| format!("at output {} (fault {})", heads[group[i]].output, r.reason)),
+        Err(e) => Some(e.to_string()),
+    };
+    drop(parts);
+    if let Some(why) = refused {
+        static SAID: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+        if !SAID.swap(true, std::sync::atomic::Ordering::Relaxed) {
+            eprintln!("frescod: span flip refused {why}; trying again next frame");
+        }
         return Ok(());
     }
-    h.frame = next;
-    h.on_screen = back;
-    h.stale = false;
+    for (&k, &(back, next)) in group.iter().zip(&up) {
+        let h = &mut heads[k];
+        h.frame = next;
+        h.on_screen = back;
+        h.stale = false;
+    }
     Ok(())
+}
+
+/// What OUTPUTS shows to the span (§6): a member that dropped out leaves
+/// the flips and its tile goes dark; one back (and not held out for
+/// flapping) rejoins. Returns when to look again.
+fn span_attach(
+    s: &mut span::Span,
+    dpy: &Display,
+    heads: &[heads::Head<'_>],
+    seen: &[outputs::Seen],
+    ev: &mpsc::Sender<fresco_scene_server::window::DisplayEvent>,
+    now: Instant,
+) -> Option<Instant> {
+    let ids: Vec<u64> = seen.iter().map(|x| x.identity).collect();
+    let (changed, again) = s.attach(now, &ids);
+    if changed {
+        if let Err(e) = s.lock(dpy, heads) {
+            eprintln!("frescod: span: flip lock after a dropout: {e}");
+        }
+        s.tell(ev);
+    }
+    again
+}
+
+/// Start a span: lay it out and move the monitors for the bezels, VRR and
+/// HDR on all members or none, lock their timing, and tell the window.
+#[allow(clippy::too_many_arguments)]
+fn start_span<'a>(
+    r: &fresco_protocol::WmSpanGroupPayload,
+    cx: &heads::Ctx<'a>,
+    heads: &mut Vec<heads::Head<'a>>,
+    tracker: &mut outputs::Tracker,
+    remembered: &HashMap<outputs::DisplaySet, outputs::Arrangement>,
+    frontend: &Arc<Mutex<EnvelopeFrontend>>,
+    ev: &mpsc::Sender<fresco_scene_server::window::DisplayEvent>,
+    can_hdr: bool,
+) -> Result<span::Span, String> {
+    let mut s = span::Span::new(r, heads)?;
+    tracker.spanned = s.members.clone();
+    if s.vrr_mixed(heads) {
+        /* One frame period for the group: fixed refresh on every member. */
+        eprintln!("frescod: span: not every member has variable refresh; fixed refresh while it is up");
+        s.unplace(heads);
+        *span::NO_VRR.lock().unwrap() = s.members.clone();
+        s.vrr_off = true;
+        reconfigure_heads(cx, heads, tracker, remembered, &[], can_hdr).map_err(|e| e.to_string())?;
+        s.relayout(heads)?;
+    }
+    s.unify_hdr(cx.dpy, heads);
+    if let Err(e) = s.lock(cx.dpy, heads) {
+        end_span(s, cx, heads, tracker, remembered, frontend, ev, can_hdr);
+        return Err(e);
+    }
+    frontend.lock().unwrap().set_span_moved(s.moved());
+    s.tell(ev);
+    Ok(s)
+}
+
+/// End a span: the monitors back in their places, the sync group gone,
+/// the members' own VRR and HDR back, and the window told.
+#[allow(clippy::too_many_arguments)]
+fn end_span<'a>(
+    s: span::Span,
+    cx: &heads::Ctx<'a>,
+    heads: &mut Vec<heads::Head<'a>>,
+    tracker: &mut outputs::Tracker,
+    remembered: &HashMap<outputs::DisplaySet, outputs::Arrangement>,
+    frontend: &Arc<Mutex<EnvelopeFrontend>>,
+    ev: &mpsc::Sender<fresco_scene_server::window::DisplayEvent>,
+    can_hdr: bool,
+) {
+    s.unplace(heads);
+    span::Span::unlock(cx.dpy);
+    frontend.lock().unwrap().set_span_moved(Vec::new());
+    tracker.spanned.clear();
+    for h in heads.iter_mut().filter(|h| s.hdr_off.contains(&h.identity)) {
+        h.hdr_on = apply_hdr(cx.dpy, h.output, &h.conn, can_hdr, Some(false));
+    }
+    if s.vrr_off {
+        span::NO_VRR.lock().unwrap().clear();
+        if let Err(e) = reconfigure_heads(cx, heads, tracker, remembered, &[], can_hdr) {
+            eprintln!("frescod: span: variable refresh back: {e}");
+        }
+    }
+    s.tell_ended(ev);
+    eprintln!("frescod: window {} no longer spans", s.window_id);
 }
 
 /// Tell the WM side where each monitor sits (`OP_WM_OUTPUTS`).
@@ -1217,8 +1466,8 @@ pub(crate) fn apply_hdr(dpy: &Display, output: u32, conn: &atrium_gpu::amd::Conn
 /// mode's refresh, and FRESCOD_VRR isn't 0. Frames then go up as soon as they
 /// are rendered (no waiting for the next fixed refresh slot), and an idle
 /// screen refreshes at the monitor's floor.
-pub(crate) fn use_vrr(conn: &atrium_gpu::amd::ConnectorV2, mode: &ModeV2) -> bool {
-    if std::env::var("FRESCOD_VRR").is_ok_and(|v| v == "0") {
+pub(crate) fn use_vrr(conn: &atrium_gpu::amd::ConnectorV2, mode: &ModeV2, identity: u64) -> bool {
+    if std::env::var("FRESCOD_VRR").is_ok_and(|v| v == "0") || span::NO_VRR.lock().unwrap().contains(&identity) {
         return false;
     }
     let hz = (mode.refresh_mhz + 500) / 1000;

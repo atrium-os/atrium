@@ -10,12 +10,18 @@
 //!   forum-ctl move-monitor        send the focused window to the next monitor
 //!   forum-ctl scale N F|auto      show output N at scale F (e.g. 1.5), or the automatic one
 //!   forum-ctl mirror A B|off      show output B's picture on output A too, or stop
+//!   forum-ctl zoom                zoom the focused window, or un-zoom it
+//!   forum-ctl span A B.. [gap PX] make outputs A B.. a span group (a zoom covers them all)
+//!   forum-ctl span A              take output A out of its span group
+//!   forum-ctl spans               list the span groups and what spans
+//!   forum-ctl span-app APP on|off let an app's zoom span a group, or not
 
 use forum_ctl::{default_socket_path, request, Intent, Reply};
 
 fn usage() -> ! {
     eprintln!("usage: forum-ctl surfaces | focus ID | modes | mode WxH[@Hz] | outputs \
-               | arrange A right-of|left-of|above|below B | move-monitor | scale N F|auto | mirror A B|off");
+               | arrange A right-of|left-of|above|below B | move-monitor | scale N F|auto | mirror A B|off \
+               | zoom | span A [B..] [gap PX] | spans | span-app APP on|off");
     std::process::exit(2)
 }
 
@@ -59,6 +65,19 @@ fn main() {
                 (f.parse::<f64>().unwrap_or_else(|_| usage()) * 1000.0).round() as u32
             },
         },
+        ["zoom"] => Intent::ToggleZoom,
+        ["spans"] => Intent::ListSpanGroups,
+        ["span-app", app, on] => Intent::SetAppSpans {
+            app: app.to_string(),
+            spans: match *on { "on" => true, "off" => false, _ => usage() },
+        },
+        ["span", rest @ ..] if !rest.is_empty() => {
+            let (outs, gap) = match rest {
+                [o @ .., "gap", g] => (o, g.parse().unwrap_or_else(|_| usage())),
+                o => (o, 0),
+            };
+            Intent::SetSpanGroup { outputs: outs.iter().map(|n| n.parse().unwrap_or_else(|_| usage())).collect(), gap }
+        }
         _ => usage(),
     };
     let sock = default_socket_path();
@@ -90,6 +109,15 @@ fn main() {
                     println!("  mirrors monitor {:016x}", o.mirror_of);
                 }
             }
+        }
+        Ok(Reply::SpanGroups { groups, spanning, no_span }) => {
+            if groups.is_empty() { println!("no span groups"); }
+            for g in groups {
+                let ids: Vec<String> = g.members.iter().map(|m| format!("{m:016x}")).collect();
+                println!("span {} gap {}", ids.join(" "), g.gap);
+            }
+            if spanning != 0 { println!("window {spanning} spans"); }
+            for a in no_span { println!("app {a} does not span"); }
         }
         Ok(Reply::Err { message }) => { eprintln!("forum-ctl: {message}"); std::process::exit(1) }
         Err(e) => { eprintln!("forum-ctl: {}: {e}", sock.display()); std::process::exit(1) }

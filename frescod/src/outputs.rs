@@ -23,6 +23,9 @@ use std::time::{Duration, Instant};
 pub const SETTLE: Duration = Duration::from_millis(500);
 /// A monitor gone for less than this keeps its place.
 pub const GRACE: Duration = Duration::from_secs(5);
+/// The grace for a monitor a fullscreen window spans (fresco-span.md §6):
+/// a resize mid-game costs more than a moved window.
+pub const SPAN_GRACE: Duration = Duration::from_secs(30);
 
 /// One output as OUTPUTS reports it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -192,6 +195,8 @@ pub struct Tracker {
     last_hotplug: Option<Instant>,
     /// Monitors in the layout whose output lost them: when, and where.
     gone: HashMap<u64, (u32, Instant)>,
+    /// Monitors a span covers: they get [`SPAN_GRACE`].
+    pub spanned: Vec<u64>,
 }
 
 /// What [`Tracker::target`] decided.
@@ -239,7 +244,7 @@ impl Tracker {
                 continue;
             }
             let since = self.gone.entry(l.identity).or_insert((l.output, now)).1;
-            let until = since + GRACE;
+            let until = since + if self.spanned.contains(&l.identity) { SPAN_GRACE } else { GRACE };
             if now < until {
                 keep.push(*l);
                 recheck = Some(recheck.map_or(until, |r: Instant| r.min(until)));

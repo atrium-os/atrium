@@ -90,6 +90,28 @@ pub enum Intent {
     /// "Make the system light or dark" (visual language §15): the bar's
     /// switch. The core asks frescod, which tells every client.
     SetAppearance { dark: bool },
+    /// "Zoom the focused window (fullscreen), or un-zoom it." On a monitor
+    /// of a span group, zoom covers the whole group (fresco-span.md §3).
+    ToggleZoom,
+    /// "Make outputs `outputs` a span group" (two or more, one mode,
+    /// touching in a row or a grid), with `gap` hidden pixels between
+    /// neighbours for the bezels (0: none). Remembered for this set of
+    /// monitors; a monitor leaves any group it was in. One output alone
+    /// takes it out of its group.
+    SetSpanGroup { outputs: Vec<u32>, gap: u32 },
+    /// "Which span groups does this set of monitors have, and what spans?"
+    ListSpanGroups,
+    /// "Let app `app` span (true), or keep its zoom on one monitor."
+    SetAppSpans { app: String, spans: bool },
+}
+
+/// A span group as the core reports it.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SpanGroupInfo {
+    /// Monitors (identities), in order.
+    pub members: Vec<u64>,
+    /// Hidden pixels between neighbours.
+    pub gap: u32,
 }
 
 /// The core's answer to an `Intent`.
@@ -106,6 +128,9 @@ pub enum Reply {
     DisplayModes { modes: Vec<WmDisplayMode>, current: u32 },
     /// The monitors and where they sit — answer to `ListOutputs`.
     Outputs { outputs: Vec<WmOutput> },
+    /// This set's span groups, the window spanning one now (0: none), and
+    /// the apps that don't span — answer to `ListSpanGroups`.
+    SpanGroups { groups: Vec<SpanGroupInfo>, spanning: u32, no_span: Vec<String> },
 }
 
 /// Encode a message for the wire.

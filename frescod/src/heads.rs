@@ -203,7 +203,7 @@ pub fn reconfigure<'a>(
         .or_else(|| preferred_mode(&conn.modes));
         let Some(i) = pick else { continue };
         if let Some(h) = held {
-            if conn.current == Some(i) {
+            if conn.current == Some(i) && conn.vrr_active == crate::use_vrr(&conn, &conn.modes[i], s.identity) {
                 continue; // lit at that mode already
             }
             let _ = h;
@@ -294,7 +294,7 @@ pub fn reconfigure<'a>(
     }
     for (p, buf) in plans.into_iter().zip(fresh) {
         let m = p.conn.modes[p.mode_index];
-        let vrr = crate::use_vrr(&p.conn, &m);
+        let vrr = crate::use_vrr(&p.conn, &m, p.identity);
         let pos = heads.iter().position(|h| h.output == p.output);
         let was_hdr = pos.map(|k| heads[k].hdr_on);
         let hdr_on = crate::apply_hdr(cx.dpy, p.output, &p.conn, can_hdr, was_hdr);
@@ -435,7 +435,7 @@ fn parts<'b, 'a>(heads: &'b [Head<'a>], plans: &[Plan], fresh: &'b [Buf<'a>], of
             }
         };
         let mut c = OutputCommit::modeset(p.output, bo, p.mode_index as u32, p.conn.generation);
-        if crate::use_vrr(&p.conn, &p.conn.modes[p.mode_index]) {
+        if crate::use_vrr(&p.conn, &p.conn.modes[p.mode_index], p.identity) {
             c.flags |= COMMIT_VRR;
         }
         v.push(c);

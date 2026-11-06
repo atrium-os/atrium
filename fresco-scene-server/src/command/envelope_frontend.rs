@@ -2241,6 +2241,10 @@ mod tests {
         fn set_appearance(&mut self, a: fresco_protocol::AppearancePayload) -> std::io::Result<()> {
             self.dispatch(control::OP_WM_SET_APPEARANCE, encode(&a).unwrap()).map(|_| ())
         }
+        fn span_group(&mut self, p: fresco_protocol::WmSpanGroupPayload) -> std::io::Result<WmRect> {
+            let out = self.dispatch(control::OP_WM_SPAN_GROUP, encode(&p).unwrap())?;
+            Ok(decode::<fresco_protocol::WmSpanGroupReply>(&out[0].payload).unwrap().rect)
+        }
     }
 
     #[test]
