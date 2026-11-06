@@ -119,7 +119,7 @@ mod tests {
     #[derive(Clone, Default)]
     struct Fresco(Arc<Mutex<Vec<Option<[f32; 4]>>>>);
     impl limen::daemon::Compositor for Fresco {
-        fn bind(&mut self, p: WindowToken, c: WindowToken, k: SlotKind, r: Option<[f32; 4]>) -> Result<(u32, u32), u8> {
+        fn bind(&mut self, p: WindowToken, c: WindowToken, k: SlotKind, r: Option<[f32; 4]>, _z: u8) -> Result<(u32, u32), u8> {
             assert_eq!((p, c, k), (W, W_ARCA, SlotKind::Credential));
             self.0.lock().unwrap().push(r);
             Ok((APP, ARCA))
