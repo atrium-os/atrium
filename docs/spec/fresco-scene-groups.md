@@ -89,8 +89,12 @@ the same frame; frescod applies a frame atomically, so nothing is drawn half pla
 - **Parent checks.** The parent must be a group in the same window, written by the same client
   (the existing `node_writers` check). A node cannot be placed under itself or a descendant.
   A leaf whose parent is cleared goes with it; no node is ever left dangling.
-- **Limits** (per window, refused past them): depth ≤ 32, groups ≤ 4,096. Numbers to settle with
-  the Fresco owners; the point is a stated bound per window, like the fill budget.
+- **Limits** (per window, refused past them): depth ≤ 32, groups ≤ 4,096 (agreed with the Fresco
+  owners 2026-11-06). Transforms are composed in f64 and the tree is walked iteratively.
+- **Op budget.** A window frame holds at most `MAX_OPS` = 65,536 kernel ops after culling, and every
+  glyph is an op. Today pack does not cap, so a frame past it fails validation and the window does
+  not draw at all (a bug now). Pack culls by clip first, then drops ops past the cap and reports
+  them, through the dropped-fill event generalised to any node (Fresco owners).
 - **Validation** as for fills: finite values, coordinates within ±`FILL_MAX_COORD`, `0 ≤ opacity ≤ 1`,
   a v1 transform that is not translate + positive uniform scale is refused.
 
@@ -118,12 +122,17 @@ once per frame:
 2. Intersect clips down the tree. A group whose clip misses the window is skipped whole, with all
    its descendants: off-screen bands cost nothing.
 3. Emit kernel ops in paint order. The kernels already draw ops in list order (bin sets bit = op
-   index, raster walks bits in order), so interleaving kinds needs no kernel change.
+   index, raster walks bits in order, branching on kind per op), so interleaving kinds needs no
+   kernel change and costs Tier-2 nothing. `fresco_compute::Frame::pack(&Scene)` takes per-kind
+   vectors; an ordered entry point is added beside it, and `Frame::pack` keeps producing identical
+   bytes. The fill-index-to-node-id mapping of `pack_report` and the `FillCache` path keep working,
+   since dropped-fill reports depend on them.
 4. Clip every op to its clip rect, rounded out to whole device pixels. **One kernel change**: the
-   raster kernel tests the pixel against the op's whole-pixel box (`p3`, today read only by the bin
-   kernel) before shading. Fills keep their own clip, intersected with the group's. This changes
-   `raster.comp`, so it goes through the Tier-2, GIR and RDNA4 oracle checks like any kernel change;
-   that is the Fresco owners' call.
+   raster kernel tests the pixel against the op's whole-pixel box (`p3`) before shading. Pack sets
+   `p3` = the op's box ∩ its clip rounded out; fills keep their own clip in `p0` as today. Confirmed
+   by the Fresco owners 2026-11-06: bin already culls by `p3`, damage signatures hash it, and
+   `reference::alpha_at` tests it; over 300 fuzz scenes no op paints outside its own `p3`, so the
+   test changes no legacy pixel. It goes through the Tier-2, GIR and RDNA4 oracle checks.
 
 Damage needs nothing new: tile signatures already make unchanged tiles free, and a changed group
 transform changes the signatures of exactly the tiles its content covers.
@@ -181,6 +190,9 @@ So DocumentView in a Pergola window and the Navigator's own surface send the sam
 native control inside a document is a Pergola widget subtree under the document's group.
 
 ## 7. Work, in order
+
+Steps 2 and the renderer half of 4 are the Fresco owners' (kernels, Tier-2); the rest is the
+Pergola thread's, except 5.
 
 1. `fresco-protocol` + `fresco-scene-server`: the two ops, the rules in §2.3, the tests below.
    frescod packs the tree (§3 steps 1–3). Interleaved order already fixes the popover bug.
