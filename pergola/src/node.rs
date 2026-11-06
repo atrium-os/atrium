@@ -117,6 +117,73 @@ pub enum Node {
         color: Color,
         glyphs: std::sync::Arc<[crate::glyphs::Glyph]>,
     },
+    /// A filled path (Fresco's FILL: curves, even-odd or non-zero, solid
+    /// or gradient paint, its own affine and clip), in the node's group's
+    /// logical px. Strokes are turned into fills by the caller. Absolutely
+    /// positioned.
+    Fill(std::sync::Arc<fresco_protocol::FillParams>),
+    /// A bitmap drawn into `rect` ([`Image`]); uploaded once per window.
+    Image { rect: Rect, image: Image },
+}
+
+/// RGBA8 (sRGB, straight alpha) pixels, named by a process-wide id so a
+/// window uploads each image once.
+#[derive(Clone)]
+pub struct Image(std::sync::Arc<ImageData>);
+
+pub struct ImageData {
+    pub id: u32,
+    pub width: u32,
+    pub height: u32,
+    pub rgba: Vec<u8>,
+}
+
+static NEXT_IMAGE: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(1);
+
+impl Image {
+    pub fn new(width: u32, height: u32, rgba: Vec<u8>) -> Self {
+        assert_eq!(rgba.len(), (width * height * 4) as usize, "RGBA8 pixels");
+        Image(std::sync::Arc::new(ImageData { id: NEXT_IMAGE.fetch_add(1, std::sync::atomic::Ordering::Relaxed), width, height, rgba }))
+    }
+    pub fn data(&self) -> &ImageData { &self.0 }
+}
+
+impl PartialEq for Image {
+    fn eq(&self, o: &Self) -> bool { self.0.id == o.0.id }
+}
+
+impl std::fmt::Debug for Image {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result { write!(f, "Image#{} {}×{}", self.0.id, self.0.width, self.0.height) }
+}
+
+/// The bounds of `points` under `t` (`[a, b, c, d, e, f]`).
+fn fill_bounds(p: &fresco_protocol::FillParams) -> Rect {
+    let t = p.transform;
+    let (mut x0, mut y0, mut x1, mut y1) = (f32::MAX, f32::MAX, f32::MIN, f32::MIN);
+    for &[x, y] in &p.points {
+        let (u, v) = (t[0] * x + t[2] * y + t[4], t[1] * x + t[3] * y + t[5]);
+        x0 = x0.min(u); y0 = y0.min(v); x1 = x1.max(u); y1 = y1.max(v);
+    }
+    if x0 > x1 {
+        return Rect::new(0.0, 0.0, 0.0, 0.0);
+    }
+    let r = Rect::new(x0, y0, x1 - x0, y1 - y0);
+    match p.clip {
+        Some([a, b, c, d]) => {
+            let (l, t, rr, bb) = (r.x().max(a), r.y().max(b), (r.x() + r.w()).min(c), (r.y() + r.h()).min(d));
+            Rect::new(l, t, (rr - l).max(0.0), (bb - t).max(0.0))
+        }
+        None => r,
+    }
+}
+
+/// `p` with `x' = (x - origin) * scale` composed after its affine.
+pub fn fill_to(p: &fresco_protocol::FillParams, origin: crate::geom::Point, scale: f32) -> fresco_protocol::FillParams {
+    let t = p.transform;
+    let mut q = p.clone();
+    q.transform = [t[0] * scale, t[1] * scale, t[2] * scale, t[3] * scale, (t[4] - origin.x) * scale, (t[5] - origin.y) * scale];
+    q.clip = p.clip.map(|[a, b, c, d]| [(a - origin.x) * scale, (b - origin.y) * scale, (c - origin.x) * scale, (d - origin.y) * scale]);
+    q
 }
 
 impl Node {
@@ -150,6 +217,8 @@ impl Node {
             }
             // An estimate (ascent 0.8 em, descent 0.25): the pen's travel
             // plus one em for the last glyph.
+            Node::Fill(p) => fill_bounds(p),
+            Node::Image { rect, .. } => *rect,
             Node::Glyphs { origin, size, glyphs, .. } => {
                 let end = glyphs.iter().map(|g| g.dx).fold(0.0f32, f32::max) + size;
                 Rect::new(origin.x, origin.y - 0.8 * size, end, 1.05 * size)
@@ -160,7 +229,8 @@ impl Node {
     pub fn set_rect(&mut self, r: Rect) {
         match self {
             Node::Rect { rect, .. } | Node::Text { rect, .. } | Node::Stack { rect, .. } | Node::Scroll { rect, .. } => *rect = r,
-            Node::Path { .. } | Node::Glyphs { .. } => {} // absolutely positioned — layout doesn't move it
+            Node::Image { rect, .. } => *rect = r,
+            Node::Path { .. } | Node::Glyphs { .. } | Node::Fill(_) => {} // absolutely positioned — layout doesn't move it
         }
     }
 
@@ -188,6 +258,8 @@ impl Node {
                 *p1 = map(p1.0, p1.1);
                 *width *= scale;
             }
+            Node::Fill(p) => *p = std::sync::Arc::new(fill_to(p, origin, scale)),
+            Node::Image { rect, .. } => *rect = scale_rect(*rect, origin, scale),
             Node::Glyphs { origin: o, size, glyphs, .. } => {
                 let (x, y) = map(o.x, o.y);
                 *o = crate::geom::Point::new(x, y);
@@ -208,7 +280,7 @@ impl Node {
         match self {
             Node::Rect { rect, .. } | Node::Stack { rect, .. } | Node::Scroll { rect, .. } => rect.size,
             Node::Text { content, style, .. } => Self::measure_text(content, style),
-            Node::Path { .. } | Node::Glyphs { .. } => self.rect().size,
+            Node::Path { .. } | Node::Glyphs { .. } | Node::Fill(_) | Node::Image { .. } => self.rect().size,
         }
     }
 
@@ -695,5 +767,20 @@ mod diff_tests {
         b.insert(None, stack(0.0, 0.0));
         b.sweep_keys();
         assert_eq!(diff(&a, &b), vec![NodeDelta::Removed { id: inner }]);
+    }
+
+    #[test]
+    fn a_fill_moves_into_its_group_with_its_clip() {
+        let p = fresco_protocol::FillParams {
+            rule: 0, transform: [2.0, 0.0, 0.0, 2.0, 10.0, 20.0],
+            paint: fresco_protocol::FillPaint::Solid { r: 1.0, g: 0.0, b: 0.0, a: 1.0 }, opacity: 1.0,
+            clip: Some([0.0, 0.0, 100.0, 25.0]),
+            verbs: vec![0, 1, 1, 4], points: vec![[0.0, 0.0], [10.0, 0.0], [10.0, 10.0]],
+        };
+        let n = Node::Fill(std::sync::Arc::new(p.clone()));
+        assert_eq!(n.rect(), Rect::new(10.0, 20.0, 20.0, 5.0), "bounds under the affine, clipped");
+        let Node::Fill(q) = n.to_group(crate::geom::Point::new(10.0, 20.0), 2.0) else { unreachable!() };
+        assert_eq!(q.transform, [4.0, 0.0, 0.0, 4.0, 0.0, 0.0]);
+        assert_eq!(q.clip, Some([-20.0, -40.0, 180.0, 10.0]));
     }
 }

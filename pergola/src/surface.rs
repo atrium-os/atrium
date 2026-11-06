@@ -105,6 +105,12 @@ impl Surface for LogSurface {
                 "  set  id={:>3}  {at:<8} Path ({:>4.1},{:>4.1})→({:>4.1},{:>4.1}) w={:.1}",
                 id.0, p0.0, p0.1, p1.0, p1.1, width,
             ),
+            Node::Fill(p) => println!(
+                "  set  id={:>3}  {at:<8} Fill {} verbs, {} points", id.0, p.verbs.len(), p.points.len(),
+            ),
+            Node::Image { rect, image } => println!(
+                "  set  id={:>3}  {at:<8} Image ({:>4.0},{:>4.0} {:>4.0}×{:>4.0}) {image:?}", id.0, rect.x(), rect.y(), rect.w(), rect.h(),
+            ),
             Node::Glyphs { origin, face, size, glyphs, .. } => println!(
                 "  set  id={:>3}  {at:<8} Glyphs ({:>4.0},{:>4.0}) {face:?} {size:.1}px ×{}",
                 id.0, origin.x, origin.y, glyphs.len(),
@@ -163,7 +169,12 @@ pub struct FrescoSurface {
     /// App-shaped text's glyphs; uploaded on first use.
     atlas: crate::glyphs::Atlas,
     atlas_bound: bool,
+    /// Images bound to texture slots, by image id.
+    images: std::collections::HashSet<u32>,
 }
+
+/// Image texture slots: this bit plus the image's id.
+pub const IMAGE_SLOT_BIT: u32 = 0x4000_0000;
 
 /// The window's glyph atlas texture slot.
 pub const ATLAS_SLOT: u32 = 0x00A7_1A50;
@@ -175,7 +186,7 @@ fn background_id(id: NodeId) -> u32 {
 
 impl FrescoSurface {
     pub fn new(conn: fresco_client::Connection, window_id: u32) -> Self {
-        Self { conn, window_id, fonts: std::collections::HashMap::new(), scale: 1.0, scrolls: Default::default(), atlas: crate::glyphs::Atlas::new(), atlas_bound: false }
+        Self { conn, window_id, fonts: std::collections::HashMap::new(), scale: 1.0, scrolls: Default::default(), atlas: crate::glyphs::Atlas::new(), atlas_bound: false, images: Default::default() }
     }
 
     pub fn window_id(&self) -> u32 { self.window_id }
@@ -345,6 +356,20 @@ impl Surface for FrescoSurface {
                     r: color.r, g: color.g, b: color.b, a: color.a,
                 };
                 self.conn.scene_node_path(id.0, params)?;
+            }
+            Node::Fill(p) => {
+                let q = crate::node::fill_to(p, crate::geom::Point::new(0.0, 0.0), k);
+                self.conn.scene_node_fill(id.0, &q)?;
+            }
+            Node::Image { rect, image } => {
+                let d = image.data();
+                let slot = IMAGE_SLOT_BIT | d.id;
+                if self.images.insert(d.id) {
+                    let hash = self.conn.upload_blob(&d.rgba)?;
+                    self.conn.slot_set_texture(slot, hash, d.width, d.height, fresco_protocol::TextureFormat::Rgba8UnormSrgb)?;
+                }
+                let r = *rect;
+                self.conn.scene_node_texture(id.0, fresco_protocol::TextureParams { x: r.x() * k, y: r.y() * k, w: r.w() * k, h: r.h() * k, slot_id: slot })?;
             }
             Node::Glyphs { origin, face, size, color, glyphs } => {
                 let params = self.glyph_run(*origin, face, *size, *color, glyphs)?;
