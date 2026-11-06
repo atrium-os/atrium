@@ -31,6 +31,14 @@ fn samples() -> Vec<Msg> {
         Msg::Drop { window: 2, x: 4.0, y: 5.0, activation: [6; 16] },
         Msg::DragEnd { window: 3, drag_id: 7, dropped: true },
         Msg::EmbedToken { window: 3, token: [7; 16] },
+        Msg::VideoRing { window: 3, layer: 2, width: 1920, height: 1080 },
+        Msg::VideoFrame { window: 3, layer: 2, slot: 1, seq: 99, present_ns: 0x1234_5678_9abc },
+        Msg::VideoPlace { window: 3, layer: 2, rect: Some([-10, 20, 640, 360]) },
+        Msg::VideoPlace { window: 3, layer: 2, rect: None },
+        Msg::VideoDestroy { window: 3, layer: 2 },
+        Msg::VideoSlots { window: 3, layer: 2, bytes: 8294400 },
+        Msg::VideoDone { window: 3, layer: 2, slot: 0 },
+        Msg::VideoPresented { window: 3, layer: 2, seq: 99, vblank_ns: u64::MAX - 5, dropped: 2 },
     ]
 }
 

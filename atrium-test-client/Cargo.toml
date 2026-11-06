@@ -92,6 +92,10 @@ path = "src/scroll_demo.rs"
 name = "atrium-activation-probe"
 path = "src/activation_probe.rs"
 
+[[bin]]
+name = "atrium-video-probe"
+path = "src/video_probe.rs"
+
 [dependencies]
 aqueduct        = { path = "../aqueduct" }
 fresco-client   = { path = "../fresco-client" }
@@ -102,3 +106,4 @@ atrium-rdna4-isa = { path = "../atrium-rdna4-isa" }
 fresco-compute  = { path = "../fresco-compute" }
 fresco-text     = { path = "../fresco-text" }
 libc            = "0.2"
+png             = "0.17"

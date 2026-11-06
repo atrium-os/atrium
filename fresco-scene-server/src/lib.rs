@@ -19,3 +19,4 @@ pub mod command;
 pub mod render;
 pub mod window;
 pub mod text;
+pub mod video;

@@ -236,6 +236,8 @@ pub struct Outbound {
     pub op:      u16,
     pub flags:   u16,
     pub payload: Vec<u8>,
+    /// Fds to pass with it (a video layer's buffers).
+    pub fds:     Vec<std::sync::Arc<std::os::fd::OwnedFd>>,
 }
 
 pub struct EnvelopeFrontend {
@@ -295,6 +297,9 @@ pub struct EnvelopeFrontend {
     client_uids: HashMap<u8, u32>,
     /// Clients whose windows stay embeds (S1).
     embed_only: std::collections::HashSet<u8>,
+    /// Video layers, by id (fresco-video.md).
+    video: HashMap<u32, crate::video::Layer>,
+    next_video_layer: u32,
 
     /// The mode the display is actually scanning out, answered to
     /// `OP_DISPLAY_INFO`. frescod sets it from the connector at startup — the
@@ -346,6 +351,8 @@ impl EnvelopeFrontend {
             wm_capable: std::collections::HashSet::new(),
             client_uids: HashMap::new(),
             embed_only: std::collections::HashSet::new(),
+            video: HashMap::new(),
+            next_video_layer: 1,
             display_mode: (0, 0, 0),
             reserved_top: 0,
             notification_uids: Some(Vec::new()),
@@ -610,6 +617,12 @@ impl EnvelopeFrontend {
             control::OP_WINDOW_PRESENT       => self.handle_window_present(msg),
             control::OP_WINDOW_PRESENT_DAMAGE => self.handle_window_present_damage(msg),
 
+            // ── Video layers (fresco-video.md) ──
+            control::OP_VIDEO_LAYER_CREATE   => self.handle_video_layer_create(msg),
+            control::OP_VIDEO_LAYER_PLACE    => self.handle_video_layer_place(msg),
+            control::OP_VIDEO_FRAME          => self.handle_video_frame(msg),
+            control::OP_VIDEO_LAYER_DESTROY  => self.handle_video_layer_destroy(msg),
+
             // ── Cross-app window management (gated by window-management) ──
             control::OP_WM_ENUMERATE         => self.handle_wm_enumerate(msg),
             control::OP_WM_DECLARE_LAYOUT    => self.handle_wm_declare_layout(msg),
@@ -643,6 +656,127 @@ impl EnvelopeFrontend {
     /// client disconnect).
     pub fn forget_window(&mut self, window_id: u32) {
         self.per_window.remove(&window_id);
+        let gone: Vec<u32> = self.video.iter().filter(|(_, l)| l.window == window_id).map(|(&id, _)| id).collect();
+        for id in gone {
+            self.video.remove(&id);
+            if let Some(s) = crate::video::SINK.get() {
+                s.destroy(window_id, id);
+            }
+        }
+    }
+
+    // ── Video layers (docs/spec/fresco-video.md) ─────────────────────
+
+    /// `OP_VIDEO_LAYER_CREATE`: a ring of buffers for one of the client's
+    /// own windows, within the per-window and per-client limits.
+    fn handle_video_layer_create(&mut self, msg: &Message) -> Result<Vec<Outbound>, DispatchError> {
+        use fresco_protocol::video::{self as v, VideoLayerCreate, VideoLayerCreated};
+        let p: VideoLayerCreate = decode(&msg.payload).map_err(|_| DispatchError::BadPayload)?;
+        let me = self.current_client;
+        let owns = u16::try_from(p.window_id).ok()
+            .and_then(|w| self.compositor.lock().unwrap().windows.get(&w).map(|w| w.owner == me as u32))
+            .unwrap_or(false);
+        let bytes = v::buffer_bytes(p.format, p.width, p.height);
+        let mine = || self.video.values().filter(|l| l.client == me);
+        let ok = owns
+            && crate::video::SINK.get().is_some()
+            && (v::MIN_BUFFERS..=v::MAX_BUFFERS).contains(&p.buffers)
+            && mine().filter(|l| l.window == p.window_id).count() < v::MAX_LAYERS_PER_WINDOW
+            && mine().count() < v::MAX_LAYERS_PER_CLIENT
+            && bytes.is_some_and(|b| mine().map(|l| l.bytes * l.maps.len() as u64).sum::<u64>() + b * p.buffers as u64 <= v::MAX_BYTES_PER_CLIENT);
+        let refused = || Ok(vec![Outbound {
+            op: control::OP_VIDEO_LAYER_CREATE, flags: aqueduct::envelope::flag::IS_RESPONSE,
+            payload: encode(&VideoLayerCreated::Refused).unwrap_or_default(), fds: Vec::new(),
+        }]);
+        let (true, Some(bytes)) = (ok, bytes) else { return refused() };
+        let Ok((fds, maps)) = crate::video::buffers(p.buffers, bytes) else { return refused() };
+        let layer = self.next_video_layer;
+        self.next_video_layer = self.next_video_layer.wrapping_add(1).max(1);
+        self.video.insert(layer, crate::video::Layer {
+            client: me, window: p.window_id, format: p.format, width: p.width, height: p.height,
+            bytes, maps, rect: None, shown: None,
+        });
+        Ok(vec![Outbound {
+            op: control::OP_VIDEO_LAYER_CREATE, flags: aqueduct::envelope::flag::IS_RESPONSE,
+            payload: encode(&VideoLayerCreated::Ok { layer, buffers: p.buffers }).map_err(|_| DispatchError::BadPayload)?,
+            fds: fds.into_iter().map(std::sync::Arc::new).collect(),
+        }])
+    }
+
+    /// The client's own layer `id`.
+    fn my_layer(&mut self, id: u32) -> Result<&mut crate::video::Layer, DispatchError> {
+        let me = self.current_client;
+        self.video.get_mut(&id).filter(|l| l.client == me).ok_or(DispatchError::UnknownWindow)
+    }
+
+    /// The part of layer `id`'s rect inside its window now, and tell the
+    /// sink when that changed.
+    fn video_show(&mut self, id: u32) -> Option<[i32; 4]> {
+        let l = self.video.get(&id)?;
+        let size = self.compositor.lock().unwrap().windows.get(&(l.window as u16)).map(|w| w.size);
+        // A window with no size yet is the screen's (as frescod draws it).
+        let (ww, wh) = match size {
+            Some((w, h)) if w >= 1.0 && h >= 1.0 => (w as u32, h as u32),
+            _ => (self.display_mode.0, self.display_mode.1),
+        };
+        let vis = l.rect.and_then(|r| crate::video::visible(r, ww, wh));
+        let l = self.video.get_mut(&id)?;
+        if vis != l.shown {
+            l.shown = vis;
+            if let Some(s) = crate::video::SINK.get() {
+                s.place(l.window, id, vis);
+            }
+        }
+        vis
+    }
+
+    fn handle_video_layer_place(&mut self, msg: &Message) -> Result<Vec<Outbound>, DispatchError> {
+        let p: fresco_protocol::video::VideoLayerPlace = decode(&msg.payload).map_err(|_| DispatchError::BadPayload)?;
+        let rect = match p.rect {
+            None => None,
+            Some(r) if r.iter().all(|v| v.is_finite() && v.abs() <= 1.0e6) && r[2] >= 1.0 && r[3] >= 1.0
+                && r[2] <= fresco_protocol::video::MAX_W as f32 && r[3] <= fresco_protocol::video::MAX_H as f32 =>
+                Some([r[0].round() as i32, r[1].round() as i32, r[2].round() as i32, r[3].round() as i32]),
+            Some(_) => return Err(DispatchError::BadPayload),
+        };
+        self.my_layer(p.layer)?.rect = rect;
+        self.video_show(p.layer);
+        Ok(Vec::new())
+    }
+
+    /// `OP_VIDEO_FRAME`: convert the buffer now (here, in whatever process
+    /// serves this client), scaled to the layer's rect and cut to the part
+    /// inside its window, and hand the pixels on; the buffer goes back at
+    /// once. A hidden layer converts nothing.
+    fn handle_video_frame(&mut self, msg: &Message) -> Result<Vec<Outbound>, DispatchError> {
+        let p: fresco_protocol::video::VideoFrame = decode(&msg.payload).map_err(|_| DispatchError::BadPayload)?;
+        let l = self.my_layer(p.layer)?;
+        if p.buffer as usize >= l.maps.len() {
+            return Err(DispatchError::BadPayload);
+        }
+        let window = l.window;
+        let vis = self.video_show(p.layer);
+        let l = &self.video[&p.layer];
+        if let (Some(r), Some(v), Some(s)) = (l.rect, vis, crate::video::SINK.get()) {
+            let src = crate::video::Shared::of(&l.maps[p.buffer as usize]);
+            let (fmt, sw, sh) = (l.format, l.width, l.height);
+            let crop = [(v[0] - r[0]) as u32, (v[1] - r[1]) as u32, v[2] as u32, v[3] as u32];
+            s.frame(window, p.layer, crop[2], crop[3], p.seq, p.present_ns, &mut |out| {
+                crate::video::convert(fmt, src, sw, sh, r[2] as u32, r[3] as u32, crop, out)
+            });
+        }
+        self.compositor.lock().unwrap().emit(crate::window::DisplayEvent::VideoReleased { window_id: window, layer: p.layer, buffer: p.buffer });
+        Ok(Vec::new())
+    }
+
+    fn handle_video_layer_destroy(&mut self, msg: &Message) -> Result<Vec<Outbound>, DispatchError> {
+        let p: fresco_protocol::video::VideoLayerDestroy = decode(&msg.payload).map_err(|_| DispatchError::BadPayload)?;
+        let window = self.my_layer(p.layer)?.window;
+        self.video.remove(&p.layer);
+        if let Some(s) = crate::video::SINK.get() {
+            s.destroy(window, p.layer);
+        }
+        Ok(Vec::new())
     }
 
     /// Walk every per-window scene state and purge nodes + slot
@@ -933,7 +1067,7 @@ impl EnvelopeFrontend {
         Ok(vec![Outbound {
             op:      control::OP_FONT_OPEN,
             flags:   flag::IS_RESPONSE,
-            payload,
+            payload, fds: Vec::new(),
         }])
     }
 
@@ -963,7 +1097,7 @@ impl EnvelopeFrontend {
         Ok(vec![Outbound {
             op:      control::OP_TEXT_MEASURE,
             flags:   flag::IS_RESPONSE,
-            payload,
+            payload, fds: Vec::new(),
         }])
     }
 
@@ -973,7 +1107,7 @@ impl EnvelopeFrontend {
             return Err(DispatchError::Forbidden);
         }
         let payload = encode(&self.display_modes).map_err(|_| DispatchError::BadPayload)?;
-        Ok(vec![Outbound { op: control::OP_WM_DISPLAY_MODES, flags: flag::IS_RESPONSE, payload }])
+        Ok(vec![Outbound { op: control::OP_WM_DISPLAY_MODES, flags: flag::IS_RESPONSE, payload, fds: Vec::new() }])
     }
 
     /// `OP_WM_OUTPUTS` — where each monitor sits on the desktop (WM only).
@@ -982,7 +1116,7 @@ impl EnvelopeFrontend {
             return Err(DispatchError::Forbidden);
         }
         let payload = encode(&self.outputs).map_err(|_| DispatchError::BadPayload)?;
-        Ok(vec![Outbound { op: control::OP_WM_OUTPUTS, flags: flag::IS_RESPONSE, payload }])
+        Ok(vec![Outbound { op: control::OP_WM_OUTPUTS, flags: flag::IS_RESPONSE, payload, fds: Vec::new() }])
     }
 
     /// `OP_WM_ARRANGE_OUTPUTS` — queue an arrangement of the monitors (WM
@@ -1003,7 +1137,7 @@ impl EnvelopeFrontend {
             return Err(DispatchError::BadPayload);
         }
         self.arrange_request = Some(p.placements);
-        Ok(vec![Outbound { op: control::OP_WM_ARRANGE_OUTPUTS, flags: flag::IS_RESPONSE, payload: Vec::new() }])
+        Ok(vec![Outbound { op: control::OP_WM_ARRANGE_OUTPUTS, flags: flag::IS_RESPONSE, payload: Vec::new(), fds: Vec::new() }])
     }
 
     /// `OP_WM_MIRROR_OUTPUT` — queue a mirroring (WM only): both monitors on
@@ -1026,7 +1160,7 @@ impl EnvelopeFrontend {
             }
         }
         self.mirror_requests.push(p);
-        Ok(vec![Outbound { op: control::OP_WM_MIRROR_OUTPUT, flags: flag::IS_RESPONSE, payload: Vec::new() }])
+        Ok(vec![Outbound { op: control::OP_WM_MIRROR_OUTPUT, flags: flag::IS_RESPONSE, payload: Vec::new(), fds: Vec::new() }])
     }
 
     /// `OP_WM_SET_OUTPUT_SCALE` — queue a monitor's scale (WM only): a
@@ -1043,7 +1177,7 @@ impl EnvelopeFrontend {
             return Err(DispatchError::BadPayload);
         }
         self.scale_requests.push(p);
-        Ok(vec![Outbound { op: control::OP_WM_SET_OUTPUT_SCALE, flags: flag::IS_RESPONSE, payload: Vec::new() }])
+        Ok(vec![Outbound { op: control::OP_WM_SET_OUTPUT_SCALE, flags: flag::IS_RESPONSE, payload: Vec::new(), fds: Vec::new() }])
     }
 
     /// `OP_WM_SET_DISPLAY_MODE` — queue a switch to a listed mode (WM only).
@@ -1063,7 +1197,7 @@ impl EnvelopeFrontend {
             return Err(DispatchError::BadPayload);
         }
         self.mode_request = Some((p.width, p.height, p.refresh_mhz));
-        Ok(vec![Outbound { op: control::OP_WM_SET_DISPLAY_MODE, flags: flag::IS_RESPONSE, payload: Vec::new() }])
+        Ok(vec![Outbound { op: control::OP_WM_SET_DISPLAY_MODE, flags: flag::IS_RESPONSE, payload: Vec::new(), fds: Vec::new() }])
     }
 
     /// `OP_DISPLAY_INFO` — hand back the scanout mode. No payload in, no state
@@ -1077,7 +1211,7 @@ impl EnvelopeFrontend {
         Ok(vec![Outbound {
             op:      control::OP_DISPLAY_INFO,
             flags:   flag::IS_RESPONSE,
-            payload,
+            payload, fds: Vec::new(),
         }])
     }
 
@@ -1181,7 +1315,7 @@ impl EnvelopeFrontend {
         Ok(vec![Outbound {
             op:      control::OP_WINDOW_CREATE,
             flags:   aqueduct::envelope::flag::IS_RESPONSE,
-            payload: reply_payload,
+            payload: reply_payload, fds: Vec::new(),
         }])
     }
 
@@ -1232,7 +1366,7 @@ impl EnvelopeFrontend {
         Ok(vec![Outbound {
             op:      control::OP_WM_ENUMERATE,
             flags:   aqueduct::envelope::flag::IS_RESPONSE,
-            payload: reply_payload,
+            payload: reply_payload, fds: Vec::new(),
         }])
     }
 
@@ -1263,7 +1397,7 @@ impl EnvelopeFrontend {
         if !self.compositor.lock().unwrap().bind_credential(child, parent, p.rect) {
             return Err(DispatchError::UnknownWindow);
         }
-        Ok(vec![Outbound { op: control::OP_WM_CREDENTIAL_SLOT, flags: aqueduct::envelope::flag::IS_RESPONSE, payload: Vec::new() }])
+        Ok(vec![Outbound { op: control::OP_WM_CREDENTIAL_SLOT, flags: aqueduct::envelope::flag::IS_RESPONSE, payload: Vec::new(), fds: Vec::new() }])
     }
 
     fn handle_wm_declare_layout(&mut self, msg: &Message)

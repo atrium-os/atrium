@@ -199,6 +199,93 @@ fn raster(
     Ok(Some(r.filter(|r| r[0] < r[2] && r[1] < r[3])))
 }
 
+/// A video layer's slots from the broker (fresco-video.md §10, decision
+/// 6): frames are converted here, in this jail, into a free one.
+struct VRing {
+    size: (u32, u32),
+    slots: Option<[Shm; 2]>,
+    busy: [bool; 2],
+    /// The newest frame converted while no slot was free (or before the
+    /// slots came): sent when one is, so a single frame (a paused player
+    /// after a move) is not lost.
+    pending: Option<(Vec<u32>, u32, u64)>,
+}
+
+impl VRing {
+    fn new(size: (u32, u32)) -> VRing {
+        VRing { size, slots: None, busy: [false; 2], pending: None }
+    }
+
+    /// A free slot as words, with its index.
+    fn free(&mut self) -> Option<(usize, &mut [u32])> {
+        let n = self.size.0 as usize * self.size.1 as usize;
+        let i = (0..2).find(|&i| !self.busy[i])?;
+        let bytes = self.slots.as_mut()?[i].as_mut_slice();
+        if bytes.len() < n * 4 || bytes.as_ptr() as usize % 4 != 0 {
+            return None;
+        }
+        // SAFETY: the slot is our own mapping, page aligned, at least n
+        // words long, and nothing else here touches it until VIDEO_DONE.
+        Some((i, unsafe { std::slice::from_raw_parts_mut(bytes.as_mut_ptr() as *mut u32, n) }))
+    }
+
+    /// Send the pending frame if a slot is free.
+    fn flush(&mut self, broker: &Chan, window: u32, layer: u32) {
+        let Some((px, seq, present_ns)) = self.pending.take() else { return };
+        let Some((i, words)) = self.free() else {
+            self.pending = Some((px, seq, present_ns));
+            return;
+        };
+        words.copy_from_slice(&px);
+        self.busy[i] = true;
+        send(broker, &Msg::VideoFrame { window, layer, slot: i as u32, seq, present_ns });
+    }
+}
+
+type VRings = Arc<Mutex<HashMap<(u32, u32), VRing>>>;
+
+/// Where the frontend's video frames go: into the broker's slots.
+struct VideoToBroker {
+    broker: Arc<Chan>,
+    rings: VRings,
+}
+
+impl fresco_scene_server::video::VideoSink for VideoToBroker {
+    fn place(&self, window: u32, layer: u32, rect: Option<[i32; 4]>) {
+        if let Some(r) = rect {
+            let size = (r[2] as u32, r[3] as u32);
+            let mut rings = self.rings.lock().unwrap();
+            let ring = rings.entry((window, layer)).or_insert_with(|| VRing::new((0, 0)));
+            if ring.size != size {
+                *ring = VRing::new(size);
+                send(&self.broker, &Msg::VideoRing { window, layer, width: size.0, height: size.1 });
+            }
+        }
+        send(&self.broker, &Msg::VideoPlace { window, layer, rect });
+    }
+
+    fn frame(&self, window: u32, layer: u32, w: u32, h: u32, seq: u32, present_ns: u64, fill: &mut dyn FnMut(&mut [u32])) {
+        let mut rings = self.rings.lock().unwrap();
+        let Some(ring) = rings.get_mut(&(window, layer)).filter(|r| r.size == (w, h)) else { return };
+        if let Some((i, words)) = ring.free() {
+            fill(words);
+            ring.busy[i] = true;
+            ring.pending = None;
+            send(&self.broker, &Msg::VideoFrame { window, layer, slot: i as u32, seq, present_ns });
+        } else {
+            // Kept until a slot is free; an older pending one is dropped.
+            let mut px = vec![0u32; w as usize * h as usize];
+            fill(&mut px);
+            ring.pending = Some((px, seq, present_ns));
+        }
+    }
+
+    fn destroy(&self, window: u32, layer: u32) {
+        self.rings.lock().unwrap().remove(&(window, layer));
+        send(&self.broker, &Msg::VideoDestroy { window, layer });
+    }
+}
+
 #[derive(Default)]
 struct State {
     wins: HashMap<u32, Win>,
@@ -282,6 +369,11 @@ fn main() {
     frontend.lock().unwrap().set_notification_uids(None);
     let redraw = redraw::RedrawSignal::new();
     let state = Arc::new(Mutex::new(State::default()));
+    // Video layers: only in pixel mode, where frescod composes pixels.
+    let rings: VRings = Arc::default();
+    if pixels {
+        let _ = fresco_scene_server::video::SINK.set(Box::new(VideoToBroker { broker: broker.clone(), rings: rings.clone() }));
+    }
 
     // The client: its reader, its writer, and its events.
     let (tx, rx) = mpsc::channel::<Outbound>();
@@ -322,7 +414,7 @@ fn main() {
     {
         let (state, comp, redraw, broker) = (state.clone(), comp.clone(), redraw.clone(), broker.clone());
         std::thread::spawn(move || {
-            from_broker(&broker, &state, &comp, ev_tx, &redraw);
+            from_broker(&broker, &state, &rings, &comp, ev_tx, &redraw);
             std::process::exit(0);
         });
     }
@@ -494,6 +586,7 @@ fn send(broker: &Chan, m: &Msg) {
 fn from_broker(
     broker: &Chan,
     state: &Mutex<State>,
+    rings: &VRings,
     comp: &Mutex<Compositor>,
     events: mpsc::Sender<DisplayEvent>,
     redraw: &redraw::Redraw,
@@ -585,6 +678,33 @@ fn from_broker(
             }
             Msg::EmbedToken { token, .. } => {
                 let _ = events.send(DisplayEvent::EmbedToken { window_id: local, token });
+            }
+            Msg::VideoSlots { layer, bytes, .. } => {
+                let mut it = fds.into_iter();
+                let (Some(a), Some(b), None) = (it.next(), it.next(), it.next()) else {
+                    return log::warn!("fresco-renderer: VIDEO_SLOTS without two fds");
+                };
+                let mut r = rings.lock().unwrap();
+                // Slots for a size since replaced are dropped.
+                if let Some(ring) = r.get_mut(&(local, layer)).filter(|g| g.size.0 as usize * g.size.1 as usize * 4 == bytes as usize) {
+                    match Shm::open(a, bytes as usize).and_then(|a| Ok([a, Shm::open(b, bytes as usize)?])) {
+                        Ok(p) => {
+                            ring.slots = Some(p);
+                            ring.busy = [false; 2];
+                            ring.flush(broker, local, layer);
+                        }
+                        Err(e) => return log::warn!("fresco-renderer: video slots: {e}"),
+                    }
+                }
+            }
+            Msg::VideoDone { layer, slot, .. } => {
+                if let Some(ring) = rings.lock().unwrap().get_mut(&(local, layer)) {
+                    ring.busy[slot as usize] = false;
+                    ring.flush(broker, local, layer);
+                }
+            }
+            Msg::VideoPresented { layer, seq, vblank_ns, dropped, .. } => {
+                let _ = events.send(DisplayEvent::VideoPresented { window_id: local, layer, seq, vblank_ns, dropped });
             }
             _ => unreachable!("from_renderer() covers the rest"),
         }

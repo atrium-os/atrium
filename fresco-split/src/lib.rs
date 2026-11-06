@@ -96,6 +96,16 @@ pub enum Msg {
     /// The client started dragging `drag_id` out of `window` with the
     /// press `activation` came with (docs/spec/tabula.md §4).
     DragBegin { window: u32, drag_id: u64, activation: [u8; 16] },
+    /// `window`'s video layer `layer` (fresco-video.md) will send frames of
+    /// `width` x `height`: the broker answers [`Msg::VideoSlots`].
+    VideoRing { window: u32, layer: u32, width: u32, height: u32 },
+    /// Video slot `slot` of the layer holds frame `seq` (BGRA, the ring's
+    /// size), to show at `present_ns` (0: at once).
+    VideoFrame { window: u32, layer: u32, slot: u32, seq: u32, present_ns: u64 },
+    /// The layer sits at `rect` (`[x, y, w, h]`, window pixels) or is hidden.
+    VideoPlace { window: u32, layer: u32, rect: Option<[i32; 4]> },
+    /// The layer is gone.
+    VideoDestroy { window: u32, layer: u32 },
 
     // ── broker → renderer ─────────────────────────────────────────
     /// The first record a renderer gets, with the client's socket as its
@@ -134,6 +144,13 @@ pub enum Msg {
     DragEnd { window: u32, drag_id: u64, dropped: bool },
     /// `window`'s embed token (limen.md §5), for its client alone.
     EmbedToken { window: u32, token: [u8; 16] },
+    /// Two video slots of `bytes` each for the layer follow as fds.
+    VideoSlots { window: u32, layer: u32, bytes: u32 },
+    /// The broker has copied video slot `slot` out; it may be filled again.
+    VideoDone { window: u32, layer: u32, slot: u32 },
+    /// Frame `seq` of the layer first showed at `vblank_ns`, `dropped`
+    /// frames skipped since the last one.
+    VideoPresented { window: u32, layer: u32, seq: u32, vblank_ns: u64, dropped: u32 },
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -174,6 +191,13 @@ mod kind {
     pub const DROP: u32 = 0x122;
     pub const DRAG_END: u32 = 0x123;
     pub const EMBED_TOKEN: u32 = 0x124;
+    pub const VIDEO_RING: u32 = 7;
+    pub const VIDEO_FRAME: u32 = 8;
+    pub const VIDEO_PLACE: u32 = 9;
+    pub const VIDEO_DESTROY: u32 = 10;
+    pub const VIDEO_SLOTS: u32 = 0x130;
+    pub const VIDEO_DONE: u32 = 0x131;
+    pub const VIDEO_PRESENTED: u32 = 0x132;
 }
 
 /// Layout: word 0 kind, word 1 window, words 2..8 arguments, bytes 32..96
@@ -235,7 +259,14 @@ impl Msg {
             | Msg::Drag { window, .. }
             | Msg::Drop { window, .. }
             | Msg::DragEnd { window, .. }
-            | Msg::EmbedToken { window, .. } => window,
+            | Msg::EmbedToken { window, .. }
+            | Msg::VideoRing { window, .. }
+            | Msg::VideoFrame { window, .. }
+            | Msg::VideoPlace { window, .. }
+            | Msg::VideoDestroy { window, .. }
+            | Msg::VideoSlots { window, .. }
+            | Msg::VideoDone { window, .. }
+            | Msg::VideoPresented { window, .. } => window,
             Msg::Client { .. } => 0,
         }
     }
@@ -376,6 +407,60 @@ impl Msg {
                 r.0[32..48].copy_from_slice(token);
                 r
             }
+            Msg::VideoRing { window, layer, width, height } => {
+                let mut r = Rec::new(VIDEO_RING, *window);
+                r.put(2, *layer);
+                r.put(3, *width);
+                r.put(4, *height);
+                r
+            }
+            Msg::VideoFrame { window, layer, slot, seq, present_ns } => {
+                let mut r = Rec::new(VIDEO_FRAME, *window);
+                r.put(2, *layer);
+                r.put(3, *slot);
+                r.put(4, *seq);
+                r.put(5, *present_ns as u32);
+                r.put(6, (*present_ns >> 32) as u32);
+                r
+            }
+            Msg::VideoPlace { window, layer, rect } => {
+                let mut r = Rec::new(VIDEO_PLACE, *window);
+                r.put(2, *layer);
+                if let Some([x, y, w, h]) = *rect {
+                    r.put(3, x as u32);
+                    r.put(4, y as u32);
+                    r.put(5, w as u32);
+                    r.put(6, h as u32);
+                    r.put(7, 1);
+                }
+                r
+            }
+            Msg::VideoDestroy { window, layer } => {
+                let mut r = Rec::new(VIDEO_DESTROY, *window);
+                r.put(2, *layer);
+                r
+            }
+            Msg::VideoSlots { window, layer, bytes } => {
+                let mut r = Rec::new(VIDEO_SLOTS, *window);
+                r.put(2, *layer);
+                r.put(3, *bytes);
+                r
+            }
+            Msg::VideoDone { window, layer, slot } => {
+                let mut r = Rec::new(VIDEO_DONE, *window);
+                r.put(2, *layer);
+                r.put(3, *slot);
+                r
+            }
+            Msg::VideoPresented { window, layer, seq, vblank_ns, dropped } => {
+                let mut r = Rec::new(VIDEO_PRESENTED, *window);
+                r.put(2, *layer);
+                r.put(3, *seq);
+                r.put(4, *vblank_ns as u32);
+                r.put(5, (*vblank_ns >> 32) as u32);
+                r.put(6, *dropped);
+                r
+            }
         };
         r.0
     }
@@ -406,6 +491,11 @@ impl Msg {
             DRAG_END => (3, false),
             DRAG => (5, false),
             EMBED_TOKEN => (0, false),
+            VIDEO_RING => (3, false),
+            VIDEO_FRAME | VIDEO_PRESENTED => (5, false),
+            VIDEO_PLACE => (6, false),
+            VIDEO_DESTROY => (1, false),
+            VIDEO_SLOTS | VIDEO_DONE => (2, false),
             _ => return Err(Refused("unknown kind")),
         };
         if (2 + args..8).any(|i| r.get(i) != 0) {
@@ -508,6 +598,33 @@ impl Msg {
             DROP => Msg::Drop { window, x: finite(r.get(2))?, y: finite(r.get(3))?, activation: r.0[32..48].try_into().unwrap() },
             DRAG_END => Msg::DragEnd { window, drag_id: r.get(2) as u64 | (r.get(3) as u64) << 32, dropped: flag(r.get(4))? },
             EMBED_TOKEN => Msg::EmbedToken { window, token: r.0[32..48].try_into().unwrap() },
+            VIDEO_RING => Msg::VideoRing { window, layer: r.get(2), width: dim(r.get(3))?, height: dim(r.get(4))? },
+            VIDEO_FRAME => Msg::VideoFrame {
+                window,
+                layer: r.get(2),
+                slot: slot(r.get(3))?,
+                seq: r.get(4),
+                present_ns: r.get(5) as u64 | (r.get(6) as u64) << 32,
+            },
+            VIDEO_PLACE => Msg::VideoPlace {
+                window,
+                layer: r.get(2),
+                rect: match flag(r.get(7))? {
+                    true => Some([r.get(3) as i32, r.get(4) as i32, dim(r.get(5))? as i32, dim(r.get(6))? as i32]),
+                    false if (3..7).all(|i| r.get(i) == 0) => None,
+                    false => return Err(Refused("video rect without its flag")),
+                },
+            },
+            VIDEO_DESTROY => Msg::VideoDestroy { window, layer: r.get(2) },
+            VIDEO_SLOTS => Msg::VideoSlots { window, layer: r.get(2), bytes: r.get(3) },
+            VIDEO_DONE => Msg::VideoDone { window, layer: r.get(2), slot: slot(r.get(3))? },
+            VIDEO_PRESENTED => Msg::VideoPresented {
+                window,
+                layer: r.get(2),
+                seq: r.get(3),
+                vblank_ns: r.get(4) as u64 | (r.get(5) as u64) << 32,
+                dropped: r.get(6),
+            },
             _ => unreachable!(),
         })
     }
@@ -523,6 +640,10 @@ impl Msg {
                 | Msg::FrameReady { .. }
                 | Msg::DragFormat { .. }
                 | Msg::DragBegin { .. }
+                | Msg::VideoRing { .. }
+                | Msg::VideoFrame { .. }
+                | Msg::VideoPlace { .. }
+                | Msg::VideoDestroy { .. }
         )
     }
 }

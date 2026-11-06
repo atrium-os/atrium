@@ -50,6 +50,7 @@ mod screen;
 mod hdr;
 mod heads;
 mod outputs;
+mod video;
 
 use atrium_gpu::amd::{Display, EventWatch, Gpu, ModeV2, OutputCommit, MODE_PREFERRED, NOTE_HOTPLUG, NOTE_RESET};
 
@@ -198,6 +199,11 @@ fn main() -> std::io::Result<()> {
      * input, compositor events) and consumed by the display loop so it
      * recomposes on change instead of spinning at TARGET_FPS. */
     let redraw = redraw::RedrawSignal::new();
+    /* Video layers (fresco-video.md): composed as pixels, so only by
+     * the compute renderer; with another, creating one is refused. */
+    if renderer.takes_pixels() {
+        let _ = fresco_scene_server::video::SINK.set(Box::new(video::Direct { redraw: redraw.clone() }));
+    }
     let split = split::Broker::from_env(comp.clone(), redraw.clone(), (dw, dh, refresh), renderer.takes_frames(), renderer.wants_pixels());
 
     let event_subs = socket_server::spawn(
@@ -537,6 +543,10 @@ fn main() -> std::io::Result<()> {
         let t_render = Instant::now();
         render_one_frame(&mut renderer, &frontend, &comp, split.as_deref(), dw, dh)
             .map_err(io_other)?;
+        /* A video frame due later: come back next refresh. */
+        if video::VIDEOS.pending() {
+            redraw.wake();
+        }
         let damage = renderer.damage();
         for h in heads.iter_mut() {
             h.dirty.add(damage);
@@ -857,6 +867,11 @@ fn run_headless(png: &str) -> std::io::Result<()> {
     let wm_sock = Some(std::env::var("FRESCOD_WM_SOCK").map(PathBuf::from)
         .unwrap_or_else(|_| PathBuf::from("/atrium/sockets/fresco-wm/fresco-wm.sock")));
     let redraw2 = redraw::RedrawSignal::new();
+    /* Video layers (fresco-video.md): composed as pixels, so only by
+     * the compute renderer; with another, creating one is refused. */
+    if renderer.takes_pixels() {
+        let _ = fresco_scene_server::video::SINK.set(Box::new(video::Direct { redraw: redraw2.clone() }));
+    }
     let split = split::Broker::from_env(comp.clone(), redraw2.clone(), (W, H, 0), renderer.takes_frames(), renderer.wants_pixels());
     let subs = socket_server::spawn(
         socket_server::Shared {
@@ -922,6 +937,9 @@ fn run_headless(png: &str) -> std::io::Result<()> {
         last_gen = redraw2.current();
         let t_render = Instant::now();
         render_one_frame(&mut renderer, &frontend, &comp, split.as_deref(), W, H).map_err(io_other)?;
+        if video::VIDEOS.pending() {
+            redraw2.wake();
+        }
         let mut rgba = vec![0u8; (W * H * 4) as usize];
         renderer.read_pixels(&mut rgba).map_err(io_other)?;
         for px in rgba.chunks_exact_mut(4) { px.swap(0, 2); } // BGRA → RGBA
@@ -1039,6 +1057,32 @@ fn render_one_frame(
         rects.push((c.id, [0, 0, c.size.0 as i32, c.size.1 as i32]));
         windows.push(c);
     }
+    /* Video layers (fresco-video.md §3): each the latest frame due, just
+     * under its window, clipped to it; a window answers clicks inside its
+     * layers itself (they are part of it, §10). */
+    let mut video_rects: std::collections::HashMap<u32, Vec<[i32; 4]>> = std::collections::HashMap::new();
+    if renderer.takes_pixels() {
+        let mut due = video::VIDEOS.take(video::monotonic_ns());
+        if !due.is_empty() {
+            let mut out = Vec::with_capacity(windows.len() + due.len());
+            for w in windows.drain(..) {
+                let (ww, wh) = render_backend::surface_size(&w);
+                for v in due.remove(&w.id).unwrap_or_default() {
+                    let Some((px, at)) = video::clip(&v.pixels, v.at, ww, wh) else { continue };
+                    video_rects.entry(w.id).or_default().push([at.0, at.1, at.0 + px.width as i32, at.1 + px.height as i32]);
+                    out.push(WindowFrame {
+                        id: v.id,
+                        pos: (w.pos.0.round() + at.0 as f32, w.pos.1.round() + at.1 as f32),
+                        size: (px.width, px.height),
+                        pixels: Some(px),
+                        ..Default::default()
+                    });
+                }
+                out.push(w);
+            }
+            windows = out;
+        }
+    }
     /* A window drawn as pixels (split pixel mode) answers from them. */
     let drawn: std::collections::HashSet<u32> =
         windows.iter().filter(|w| w.pixels.is_some()).map(|w| w.id).collect();
@@ -1064,6 +1108,13 @@ fn render_one_frame(
             frames.get(&id).cloned().map(|f| -> fresco_scene_server::window::AlphaProbe {
                 Arc::new(move |x, y| fresco_compute::reference::alpha_at(&f, x, y))
             })
+        };
+        let alpha = match (alpha, video_rects.remove(&id)) {
+            (Some(a), Some(vr)) => Some(Arc::new(move |x: u32, y: u32| {
+                let (x, y) = (x as i32, y as i32);
+                if vr.iter().any(|r| x >= r[0] && y >= r[1] && x < r[2] && y < r[3]) { 255 } else { a(x as u32, y as u32) }
+            }) as fresco_scene_server::window::AlphaProbe),
+            (a, _) => a,
         };
         fresco_scene_server::window::ShownLayer { id: id as u16, rect, alpha }
     }).collect();

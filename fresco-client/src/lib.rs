@@ -123,6 +123,13 @@ pub enum Event {
     /// The drag started from this window ended (`dropped` = over a window;
     /// false too when frescod refused the begin).
     DragEnd { window_id: u32, drag_id: u64, dropped: bool },
+    /// Video layer `layer`'s frame `seq` first showed at `vblank_ns`
+    /// (CLOCK_MONOTONIC); `dropped` frames were passed over since the last
+    /// one (fresco-video.md §4).
+    VideoPresented { window_id: u32, layer: u32, seq: u32, vblank_ns: u64, dropped: u32 },
+    /// Frescod is done with buffer `buffer` of video layer `layer`: fill
+    /// it again.
+    VideoReleased { window_id: u32, layer: u32, buffer: u32 },
     /// Op-id outside the events fresco-client knows about. App can
     /// either decode it itself or ignore.
     Unknown        { op: u16, payload: Vec<u8> },
@@ -146,6 +153,9 @@ pub struct Connection {
     /// only by `FrameBuilder::finish`. Apps that hand-allocate
     /// node_ids (calling `scene_node_*` directly) don't touch it.
     seq_max_id:     u32,
+    /// Events that arrived while a request waited for its reply, for the
+    /// next `poll_event` / `wait_event`.
+    pending:        std::collections::VecDeque<Event>,
 }
 
 /// The canonical Fresco socket location inside a Portcullis jail. Portcullis
@@ -199,6 +209,7 @@ impl Connection {
             inner: AqConn::connect(path)?,
             default_window: 0,
             seq_max_id:     0,
+            pending:        std::collections::VecDeque::new(),
         })
     }
 
@@ -220,6 +231,7 @@ impl Connection {
             inner: AqConn::wrap(s)?,
             default_window: 0,
             seq_max_id:     0,
+            pending:        std::collections::VecDeque::new(),
         })
     }
 
@@ -446,7 +458,7 @@ impl Connection {
          * aqueduct's connection internals (server-pushed messages
          * unrelated to this request). */
         loop {
-            let m = self.inner.recv_message()?;
+            let m = self.recv_reply()?;
             if m.opcode_class == CLASS_DISPLAY
                && m.op == control::OP_WINDOW_CREATE
                && m.flags & flag::IS_RESPONSE != 0
@@ -459,6 +471,62 @@ impl Connection {
             }
             log::debug!("window_create: skipping unrelated message op={:#x}", m.op);
         }
+    }
+
+    // ── Video layers (docs/spec/fresco-video.md) ───────────────────
+
+    /// A video layer under `window_id` with `buffers` buffers of `width`
+    /// x `height` in `format` (`fresco_protocol::video::format`). Returns
+    /// the layer and its buffers, shared memory to map read-write, each
+    /// `fresco_protocol::video::buffer_bytes` long; `None` when refused
+    /// (limits, or a renderer that composes no video).
+    pub fn video_layer_create(
+        &mut self, window_id: u32, format: u8, width: u32, height: u32, buffers: u32,
+    ) -> io::Result<Option<(u32, Vec<std::os::fd::OwnedFd>)>> {
+        use fresco_protocol::video::{VideoLayerCreate, VideoLayerCreated};
+        self.send_window_managed(control::OP_VIDEO_LAYER_CREATE,
+            &VideoLayerCreate { window_id, format, width, height, buffers })?;
+        loop {
+            let m = self.recv_reply()?;
+            if m.opcode_class == CLASS_DISPLAY
+               && m.op == control::OP_VIDEO_LAYER_CREATE
+               && m.flags & flag::IS_RESPONSE != 0
+            {
+                let r: VideoLayerCreated = decode(&m.payload)
+                    .map_err(|e| io::Error::new(io::ErrorKind::InvalidData,
+                        format!("decode VIDEO_LAYER_CREATE reply: {e}")))?;
+                return match r {
+                    VideoLayerCreated::Refused => Ok(None),
+                    VideoLayerCreated::Ok { layer, buffers } => {
+                        let fds = self.inner.take_fds(buffers as usize).ok_or_else(|| io::Error::new(
+                            io::ErrorKind::InvalidData, "VIDEO_LAYER_CREATE reply without its buffers"))?;
+                        Ok(Some((layer, fds)))
+                    }
+                };
+            }
+            log::debug!("video_layer_create: skipping unrelated message op={:#x}", m.op);
+        }
+    }
+
+    /// Show the layer at `rect` (`[x, y, w, h]` in its window's pixels,
+    /// the frame scaled to it), or hide it (`None`). It sits under the
+    /// window's drawing: leave those pixels transparent.
+    pub fn video_layer_place(&mut self, layer: u32, rect: Option<[f32; 4]>) -> io::Result<()> {
+        self.send_window_managed(control::OP_VIDEO_LAYER_PLACE,
+            &fresco_protocol::video::VideoLayerPlace { layer, rect })
+    }
+
+    /// Buffer `buffer` holds frame `seq`, to show at `present_ns` on
+    /// CLOCK_MONOTONIC (0: at once). Don't touch it again until
+    /// `Event::VideoReleased` gives it back.
+    pub fn video_frame(&mut self, layer: u32, buffer: u32, seq: u32, present_ns: u64) -> io::Result<()> {
+        self.send_window_managed(control::OP_VIDEO_FRAME,
+            &fresco_protocol::video::VideoFrame { layer, buffer, seq, present_ns })
+    }
+
+    pub fn video_layer_destroy(&mut self, layer: u32) -> io::Result<()> {
+        self.send_window_managed(control::OP_VIDEO_LAYER_DESTROY,
+            &fresco_protocol::video::VideoLayerDestroy { layer })
     }
 
     /// Start dragging `drag_id` (Tabula's `DRAG_BEGIN` answer) out of
@@ -511,7 +579,7 @@ impl Connection {
     pub fn wm_enumerate(&mut self) -> io::Result<Vec<WmSurfaceInfo>> {
         self.send_window_managed(control::OP_WM_ENUMERATE, &())?;
         loop {
-            let m = self.inner.recv_message()?;
+            let m = self.recv_reply()?;
             if m.opcode_class == CLASS_DISPLAY
                && m.op == control::OP_WM_ENUMERATE
                && m.flags & flag::IS_RESPONSE != 0
@@ -606,7 +674,7 @@ impl Connection {
     /// error. Other messages in between are skipped, as `wm_enumerate` does.
     fn wm_response(&mut self, op: u16) -> io::Result<Message> {
         loop {
-            let m = self.inner.recv_message()?;
+            let m = self.recv_reply()?;
             if m.opcode_class == CLASS_DISPLAY && m.op == op && m.flags & flag::IS_RESPONSE != 0 {
                 if m.flags & flag::IS_ERROR != 0 {
                     let err: ErrorReply = decode(&m.payload).unwrap_or(ErrorReply {
@@ -652,7 +720,7 @@ impl Connection {
         self.send_payload(control::OP_FONT_OPEN, 0,
             &FontOpenPayload { name: name.into() })?;
         loop {
-            let m = self.inner.recv_message()?;
+            let m = self.recv_reply()?;
             if m.opcode_class == CLASS_DISPLAY
                && m.op == control::OP_FONT_OPEN
                && m.flags & flag::IS_RESPONSE != 0
@@ -688,7 +756,7 @@ impl Connection {
         self.send_payload(control::OP_TEXT_MEASURE, 0,
             &TextMeasurePayload { font_id, size_px, weight, text: text.into() })?;
         loop {
-            let m = self.inner.recv_message()?;
+            let m = self.recv_reply()?;
             if m.opcode_class == CLASS_DISPLAY
                && m.op == control::OP_TEXT_MEASURE
                && m.flags & flag::IS_RESPONSE != 0
@@ -712,7 +780,7 @@ impl Connection {
     pub fn display_info(&mut self) -> io::Result<DisplayInfoResponse> {
         self.send_payload(control::OP_DISPLAY_INFO, 0, &())?;
         loop {
-            let m = self.inner.recv_message()?;
+            let m = self.recv_reply()?;
             if m.opcode_class == CLASS_DISPLAY
                && m.op == control::OP_DISPLAY_INFO
                && m.flags & flag::IS_RESPONSE != 0
@@ -779,7 +847,26 @@ impl Connection {
         }
     }
 
+    /// The next message that is not an event, keeping events that come
+    /// first for `poll_event` / `wait_event` (an event can overtake the
+    /// reply it follows from, as a window's embed token can its create).
+    fn recv_reply(&mut self) -> io::Result<Message> {
+        loop {
+            let m: Message = self.inner.recv_message()?;
+            if m.opcode_class == CLASS_DISPLAY && is_event(&m) {
+                if self.pending.len() < 4096 {
+                    self.pending.push_back(decode_event(m.op, &m.payload));
+                }
+                continue;
+            }
+            return Ok(m);
+        }
+    }
+
     fn recv_event_inner(&mut self) -> io::Result<Event> {
+        if let Some(e) = self.pending.pop_front() {
+            return Ok(e);
+        }
         loop {
             let m: Message = self.inner.recv_message()?;
             if m.opcode_class != CLASS_DISPLAY {
@@ -790,8 +877,7 @@ impl Connection {
              * necessarily carry the ASYNC_EVENT flag in our scheme,
              * but the op-id range (0x0580-0x05FF for window events)
              * is unambiguous. */
-            if !matches!(m.kind, MessageKind::Event)
-               && (m.flags & flag::ASYNC_EVENT == 0) {
+            if !is_event(&m) {
                 /* Probably a stray response; skip. */
                 log::debug!("recv_event: skipping non-event op={:#x}", m.op);
                 continue;
@@ -928,6 +1014,10 @@ impl<'a> Drop for FrameBuilder<'a> {
 
 // ── event decoding ───────────────────────────────────────────────────
 
+fn is_event(m: &Message) -> bool {
+    matches!(m.kind, MessageKind::Event) || m.flags & flag::ASYNC_EVENT != 0
+}
+
 fn decode_event(op: u16, payload: &[u8]) -> Event {
     use control::*;
     match op {
@@ -959,6 +1049,16 @@ fn decode_event(op: u16, payload: &[u8]) -> Event {
         },
         EV_WINDOW_EMBED_TOKEN => match decode::<fresco_protocol::EmbedTokenEvent>(payload) {
             Ok(p) => Event::EmbedToken { window_id: p.window_id, token: p.token },
+            Err(_) => Event::Unknown { op, payload: payload.to_vec() },
+        },
+        EV_VIDEO_PRESENTED => match decode::<fresco_protocol::video::VideoPresentedEvent>(payload) {
+            Ok(p) => Event::VideoPresented {
+                window_id: p.window_id, layer: p.layer, seq: p.seq, vblank_ns: p.vblank_ns, dropped: p.dropped,
+            },
+            Err(_) => Event::Unknown { op, payload: payload.to_vec() },
+        },
+        EV_VIDEO_RELEASED => match decode::<fresco_protocol::video::VideoReleasedEvent>(payload) {
+            Ok(p) => Event::VideoReleased { window_id: p.window_id, layer: p.layer, buffer: p.buffer },
             Err(_) => Event::Unknown { op, payload: payload.to_vec() },
         },
         EV_WINDOW_CREATED => match decode::<WindowCreatedEvent>(payload) {

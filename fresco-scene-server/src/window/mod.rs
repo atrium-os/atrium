@@ -95,6 +95,10 @@ pub enum DisplayEvent {
     DragEnd { window_id: u32, drag_id: u64, dropped: bool },
     /// To the window's owner alone: its embed token (limen.md §5).
     EmbedToken { window_id: u32, token: [u8; 16] },
+    /// To the owner: a video layer's buffer may be filled again.
+    VideoReleased { window_id: u32, layer: u32, buffer: u32 },
+    /// To the owner: a video frame first showed at `vblank_ns`.
+    VideoPresented { window_id: u32, layer: u32, seq: u32, vblank_ns: u64, dropped: u32 },
 }
 
 /// Where a slot sits (limen.md §5): `rect` (`[x, y, w, h]`) in `parent`;
@@ -226,6 +230,14 @@ pub fn encode_event(ev: &DisplayEvent)
         DisplayEvent::DragEnd { window_id, drag_id, dropped } => {
             let p = DragEndEvent { window_id: *window_id, drag_id: *drag_id, dropped: *dropped };
             Ok((control::EV_DRAG_END, encode(&p)?))
+        }
+        DisplayEvent::VideoReleased { window_id, layer, buffer } => {
+            let p = fresco_protocol::video::VideoReleasedEvent { window_id: *window_id, layer: *layer, buffer: *buffer };
+            Ok((control::EV_VIDEO_RELEASED, encode(&p)?))
+        }
+        DisplayEvent::VideoPresented { window_id, layer, seq, vblank_ns, dropped } => {
+            let p = fresco_protocol::video::VideoPresentedEvent { window_id: *window_id, layer: *layer, seq: *seq, vblank_ns: *vblank_ns, dropped: *dropped };
+            Ok((control::EV_VIDEO_PRESENTED, encode(&p)?))
         }
         DisplayEvent::EmbedToken { window_id, token } => {
             let p = fresco_protocol::EmbedTokenEvent { window_id: *window_id, token: *token };

@@ -178,7 +178,7 @@ pub fn spawn_event_fanout(
 fn fan_out(subs: &EventSubs, comp: &Arc<Mutex<Compositor>>, ev: DisplayEvent, bare: Option<DisplayEvent>) {
     let to = route(&ev, comp);
     let wire = |ev: &DisplayEvent| match encode_event(ev) {
-        Ok((op, payload)) => Some(Outbound { op, flags: flag::ASYNC_EVENT, payload }),
+        Ok((op, payload)) => Some(Outbound { op, flags: flag::ASYNC_EVENT, payload, fds: Vec::new() }),
         Err(e) => {
             log::debug!("encode_event failed: {e}");
             None
@@ -273,7 +273,9 @@ fn route(ev: &DisplayEvent, comp: &Arc<Mutex<Compositor>>) -> Route {
         | E::Drag { window_id, .. }
         | E::Drop { window_id, .. }
         | E::DragEnd { window_id, .. }
-        | E::EmbedToken { window_id, .. } => return Route::Owner(owner_of(window_id)),
+        | E::EmbedToken { window_id, .. }
+        | E::VideoReleased { window_id, .. }
+        | E::VideoPresented { window_id, .. } => return Route::Owner(owner_of(window_id)),
     };
     if window_id == 0 {
         return Route::WmOnly;
@@ -300,7 +302,7 @@ pub fn window_owner_uid(window_id: u32, comp: &Mutex<Compositor>) -> Option<u32>
 }
 
 fn out_clone(o: &Outbound) -> Outbound {
-    Outbound { op: o.op, flags: o.flags, payload: o.payload.clone() }
+    Outbound { op: o.op, flags: o.flags, payload: o.payload.clone(), fds: o.fds.clone() }
 }
 
 /// Build the `IS_ERROR` response for a dispatch failure on op `op`.
@@ -316,7 +318,7 @@ fn error_reply(op: u16, e: &DispatchError) -> Outbound {
         code,
         message: format!("{e:?}"),
     }).unwrap_or_default();
-    Outbound { op, flags: flag::IS_RESPONSE | flag::IS_ERROR, payload }
+    Outbound { op, flags: flag::IS_RESPONSE | flag::IS_ERROR, payload, fds: Vec::new() }
 }
 
 /// Client ids in use. Ids are a `u8` on the wire and in the window table,
@@ -613,7 +615,7 @@ pub fn reader_loop(
                 let _ = out.send(Outbound {
                     op: fresco_protocol::control::EV_DRAG_END,
                     flags: flag::ASYNC_EVENT,
-                    payload: fresco_protocol::encode(&end).unwrap_or_default(),
+                    payload: fresco_protocol::encode(&end).unwrap_or_default(), fds: Vec::new(),
                 });
             }
             continue;
@@ -652,7 +654,7 @@ pub fn reader_loop(
             let _ = out.send(Outbound {
                 op: fresco_protocol::control::OP_LANE_REQUEST,
                 flags: flag::IS_RESPONSE,
-                payload,
+                payload, fds: Vec::new(),
             });
             continue;
         }
@@ -711,7 +713,9 @@ pub fn writer_loop(
                 }
             }
         }
-        if let Err(e) = conn.send_message(CLASS_DISPLAY, o.op, o.flags, &o.payload) {
+        use std::os::fd::AsRawFd;
+        let fds: Vec<i32> = o.fds.iter().map(|f| f.as_raw_fd()).collect();
+        if let Err(e) = conn.send_message_with_fds(CLASS_DISPLAY, o.op, o.flags, &o.payload, &fds) {
             log::debug!("frescod: writer {client_id} send: {e}");
             break;
         }

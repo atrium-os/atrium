@@ -39,6 +39,13 @@ struct Win {
     told: (u32, u32),
 }
 
+/// A video layer's slots (fresco-video.md §10, decision 6): the renderer
+/// converts each frame in its jail into one, BGRA at `size`.
+struct VRing {
+    slots: [Shm; 2],
+    size: (u32, u32),
+}
+
 /// One renderer process.
 struct Renderer {
     client_id: u8,
@@ -58,6 +65,8 @@ struct Renderer {
     gone: std::sync::atomic::AtomicBool,
     /// Its windows, by its own (local) ids.
     wins: Mutex<HashMap<u32, Win>>,
+    /// Its video layers' slots, by (local window, layer).
+    videos: Mutex<HashMap<(u32, u32), VRing>>,
     proc_: Mutex<Proc>,
 }
 
@@ -435,6 +444,7 @@ impl Broker {
             drag_formats: Mutex::new(Vec::new()),
             gone: std::sync::atomic::AtomicBool::new(false),
             wins: Mutex::new(HashMap::new()),
+            videos: Mutex::new(HashMap::new()),
             proc_: Mutex::new(proc_),
         });
         self.renderers.lock().unwrap().insert(client_id, r.clone());
@@ -556,6 +566,7 @@ impl Broker {
             }
             Msg::WindowDestroy { .. } => {
                 let w = r.wins.lock().unwrap().remove(&local).ok_or_else(|| format!("destroy of unknown window {local}"))?;
+                r.videos.lock().unwrap().retain(|&(win, _), _| win != local);
                 self.drop_window(r, w.global);
             }
             Msg::WindowTitle { title, .. } => {
@@ -610,6 +621,61 @@ impl Broker {
                     r.tell(&Msg::DragEnd { window: local, drag_id, dropped: false }, &[])?;
                 }
             }
+            Msg::VideoRing { layer, width, height, .. } => {
+                // Slots no larger than the window (a layer shows only
+                // inside it), for at most a client's layers.
+                let (global, told) = r.wins.lock().unwrap().get(&local).map(|w| (w.global, w.told)).ok_or("video ring for unknown window")?;
+                let mut v = r.videos.lock().unwrap();
+                v.remove(&(local, layer));
+                if v.len() >= fresco_protocol::video::MAX_LAYERS_PER_CLIENT {
+                    return Err("too many video layers".into());
+                }
+                if u64::from(width) * u64::from(height) > u64::from(told.0) * u64::from(told.1) {
+                    // A window resized under it: the next frame asks again.
+                    log::debug!("frescod: client {} window {local}: video ring {width}x{height} past the window", r.client_id);
+                    crate::video::VIDEOS.destroy(global as u32, layer);
+                    self.redraw.wake();
+                    return Ok(());
+                }
+                let bytes = width as usize * height as usize * 4;
+                let [Ok(a), Ok(b)] = [Shm::create(bytes), Shm::create(bytes)] else { return Err("cannot create video slots".into()) };
+                r.tell(&Msg::VideoSlots { window: local, layer, bytes: bytes as u32 }, &[a.fd(), b.fd()])?;
+                v.insert((local, layer), VRing { slots: [a, b], size: (width, height) });
+            }
+            Msg::VideoFrame { layer, slot: s, seq, present_ns, .. } => {
+                let global = r.wins.lock().unwrap().get(&local).map(|w| w.global).ok_or("video frame for unknown window")?;
+                let px = {
+                    let v = r.videos.lock().unwrap();
+                    v.get(&(local, layer)).map(|ring| {
+                        // Any bytes are pixels; shown opaque.
+                        let src = ring.slots[s as usize].as_slice();
+                        let px: Vec<u32> = src.chunks_exact(4)
+                            .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]) | 0xff00_0000)
+                            .collect();
+                        (ring.size, px)
+                    })
+                };
+                if let Some(((w, h), px)) = px {
+                    crate::video::VIDEOS.queue(global as u32, layer, crate::video::pixels(w, h, px, seq), seq, present_ns);
+                    self.redraw.wake();
+                }
+                r.tell(&Msg::VideoDone { window: local, layer, slot: s }, &[])?;
+            }
+            Msg::VideoPlace { layer, rect, .. } => {
+                let global = r.wins.lock().unwrap().get(&local).map(|w| w.global).ok_or("video place for unknown window")?;
+                // Only a layer with slots (so at most a client's layers).
+                if !r.videos.lock().unwrap().contains_key(&(local, layer)) {
+                    return Ok(());
+                }
+                crate::video::VIDEOS.place(global as u32, layer, rect);
+                self.redraw.wake();
+            }
+            Msg::VideoDestroy { layer, .. } => {
+                let global = r.wins.lock().unwrap().get(&local).map(|w| w.global).ok_or("video destroy for unknown window")?;
+                r.videos.lock().unwrap().remove(&(local, layer));
+                crate::video::VIDEOS.destroy(global as u32, layer);
+                self.redraw.wake();
+            }
             _ => unreachable!("serve() admits only a renderer's records"),
         }
         Ok(())
@@ -651,6 +717,7 @@ impl Broker {
         self.comp.lock().unwrap().destroy_with_focus_shift(global, r.client_id as u32);
         self.frames.lock().unwrap().remove(&(global as u32));
         self.drawn.lock().unwrap().remove(&(global as u32));
+        crate::video::VIDEOS.forget_window(global as u32);
         self.redraw.wake();
     }
 

@@ -185,6 +185,25 @@ fetcher with the Navigator's address filter (no LAN, loopback or rebinding), and
 unless Arca attaches them for that origin. Segment feeds are fetched by the engine, so they
 are covered by the engine's own rules.
 
+**V1 as built (2026-11-06).** `OP_VIDEO_LAYER_CREATE` (0x0720), `_PLACE` (0x0721), `_FRAME`
+(0x0722), `_DESTROY` (0x0723), `EV_VIDEO_PRESENTED` (0x0728) and `EV_VIDEO_RELEASED` (0x0729)
+in `fresco_protocol::{control, video}`, with the limits of §3 (4 layers and 64 MiB a client, 2
+a window, 3 to 8 buffers). The buffers are sealed memfds (no shrink or grow), passed with the
+create reply (`aqueduct` now carries fds); frescod reads them only with volatile loads. The
+frontend serving the client converts each frame, scaled to the layer's rect and cut to the
+part inside its window (`fresco_scene_server::video`): in split mode that is the window's
+renderer, in its jail (decision 6), which writes BGRA into two broker-made slots per layer
+(`fresco_split` records `VIDEO_RING`/`VIDEO_SLOTS`/`VIDEO_FRAME`/`VIDEO_DONE`); the broker
+copies a slot out, opaque, and checks its size against the window. frescod (`frescod/src/
+video.rs`) queues frames per layer, takes the latest due on `CLOCK_MONOTONIC` each refresh,
+composes it as its own surface just under its window, clipped to it again, and a click on it
+goes to the window. Buffers are released as soon as they are converted; `PRESENTED`, the
+off-screen release and content rate are V2, `OP_VIDEO_LAYER_COLOR` (BT.709 limited is the
+fixed default now) is V3. Only the compute renderer composes video; with gpu or Vulkan the
+create is refused. `atrium-video-probe` checks it in the VM in both modes: refusals, a frame
+under the window's hole with the window drawn over it, clipping, release, hit-testing and
+destroy (16/16 direct, 15/15 split).
+
 ## 9. Who does what
 
 | # | work | owner |

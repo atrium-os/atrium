@@ -204,6 +204,20 @@ pub mod control {
     pub const EV_DROP:                  u16 = 0x0714;
     /// To the source: the drag ended (`DragEndEvent`).
     pub const EV_DRAG_END:              u16 = 0x0715;
+
+    // Video layers (docs/spec/fresco-video.md).
+    /// `VideoLayerCreate` → `VideoLayerCreated`, with `buffers` fds.
+    pub const OP_VIDEO_LAYER_CREATE:    u16 = 0x0720;
+    /// `VideoLayerPlace`, no reply.
+    pub const OP_VIDEO_LAYER_PLACE:     u16 = 0x0721;
+    /// `VideoFrame`, no reply: the buffer comes back as `EV_VIDEO_RELEASED`.
+    pub const OP_VIDEO_FRAME:           u16 = 0x0722;
+    /// `VideoLayerDestroy`, no reply.
+    pub const OP_VIDEO_LAYER_DESTROY:   u16 = 0x0723;
+    /// `VideoPresentedEvent`.
+    pub const EV_VIDEO_PRESENTED:       u16 = 0x0728;
+    /// `VideoReleasedEvent`.
+    pub const EV_VIDEO_RELEASED:        u16 = 0x0729;
 }
 
 // ── Deadline-lane payloads ───────────────────────────────────────────
@@ -1064,6 +1078,103 @@ pub struct DragEndEvent {
     pub dropped: bool,
 }
 
+/// Video layers (docs/spec/fresco-video.md): a ring of frame buffers a
+/// window's client fills, shown under the window's own drawing.
+pub mod video {
+    use serde::{Deserialize, Serialize};
+
+    /// Buffer formats. NV12 and P010 need an even width and height.
+    pub mod format {
+        /// 8-bit Y plane, then interleaved 8-bit Cb Cr at half size.
+        pub const NV12: u8 = 1;
+        /// As NV12 with 16-bit little-endian samples, value in the top
+        /// 10 bits.
+        pub const P010: u8 = 2;
+        /// 8-bit R, G, B, A (alpha ignored: video is opaque).
+        pub const RGBA8: u8 = 3;
+    }
+
+    pub const MAX_W: u32 = 7680;
+    pub const MAX_H: u32 = 4320;
+    pub const MIN_BUFFERS: u32 = 3;
+    pub const MAX_BUFFERS: u32 = 8;
+    /// Layers per window, and per client.
+    pub const MAX_LAYERS_PER_WINDOW: usize = 2;
+    pub const MAX_LAYERS_PER_CLIENT: usize = 4;
+    /// Video buffer bytes per client.
+    pub const MAX_BYTES_PER_CLIENT: u64 = 64 << 20;
+
+    /// Bytes one buffer of `format` at `w` x `h` takes; None if the
+    /// format is unknown or the size is out of range.
+    pub fn buffer_bytes(format: u8, w: u32, h: u32) -> Option<u64> {
+        if w == 0 || h == 0 || w > MAX_W || h > MAX_H {
+            return None;
+        }
+        let px = w as u64 * h as u64;
+        match format {
+            format::NV12 if w % 2 == 0 && h % 2 == 0 => Some(px * 3 / 2),
+            format::P010 if w % 2 == 0 && h % 2 == 0 => Some(px * 3),
+            format::RGBA8 => Some(px * 4),
+            _ => None,
+        }
+    }
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+    pub struct VideoLayerCreate {
+        pub window_id: u32,
+        pub format: u8,
+        pub width: u32,
+        pub height: u32,
+        pub buffers: u32,
+    }
+
+    /// The reply: `layer` names it from now on, and `buffers` fds (each
+    /// `buffer_bytes` long, shared memory) came with it, in order.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+    pub enum VideoLayerCreated {
+        Ok { layer: u32, buffers: u32 },
+        Refused,
+    }
+
+    #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+    pub struct VideoLayerPlace {
+        pub layer: u32,
+        /// `[x, y, w, h]` in the window's surface pixels; None hides it.
+        pub rect: Option<[f32; 4]>,
+    }
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+    pub struct VideoFrame {
+        pub layer: u32,
+        pub buffer: u32,
+        pub seq: u32,
+        /// When to show it, `CLOCK_MONOTONIC` ns; 0 = as soon as possible.
+        pub present_ns: u64,
+    }
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+    pub struct VideoLayerDestroy {
+        pub layer: u32,
+    }
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+    pub struct VideoPresentedEvent {
+        pub window_id: u32,
+        pub layer: u32,
+        pub seq: u32,
+        pub vblank_ns: u64,
+        /// Frames skipped since the last event.
+        pub dropped: u32,
+    }
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+    pub struct VideoReleasedEvent {
+        pub window_id: u32,
+        pub layer: u32,
+        pub buffer: u32,
+    }
+}
+
 // ── Scene op IDs (closed registry per §3.4) ──────────────────────────
 
 /// Scene op IDs from the §3.4 closed registry. NOT envelope opcodes —
@@ -1883,6 +1994,12 @@ mod tests {
             control::EV_DRAG_LEAVE,
             control::EV_DROP,
             control::EV_DRAG_END,
+            control::OP_VIDEO_LAYER_CREATE,
+            control::OP_VIDEO_LAYER_PLACE,
+            control::OP_VIDEO_FRAME,
+            control::OP_VIDEO_LAYER_DESTROY,
+            control::EV_VIDEO_PRESENTED,
+            control::EV_VIDEO_RELEASED,
         ];
         let mut sorted = ops.to_vec();
         sorted.sort();

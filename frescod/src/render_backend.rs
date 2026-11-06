@@ -259,6 +259,10 @@ impl<'a> Backend<'a> {
     /// The gpu renderer: it draws one screen straight into scanout.
     pub fn is_gpu(&self) -> bool { matches!(self, Backend::Gpu(_)) }
 
+    /// Whether it composes surfaces given as pixels (video layers, split
+    /// pixel mode): the compute renderer on the CPU.
+    pub fn takes_pixels(&self) -> bool { matches!(self, Backend::Compute(_)) }
+
     pub fn wants_pixels(&self) -> bool {
         matches!(self, Backend::Compute(_)) && std::env::var("FRESCOD_SPLIT_PIXELS").as_deref() != Ok("0")
     }

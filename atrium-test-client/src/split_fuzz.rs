@@ -158,7 +158,7 @@ fn renderer(seed: u64) {
                 let role = [Role::Document, Role::Dialog, Role::Panel, Role::Background, Role::Chrome][r.below(5) as usize];
                 let pos = if r.chance(30) { Some((r.next() as i32, r.next() as i32)) } else { None };
                 let title: String = (0..r.below(70)).map(|_| char::from_u32(0x20 + r.below(0x2000)).unwrap_or('?')).collect();
-                Msg::WindowCreate { window, width: dim(&mut r), height: dim(&mut r), role, pos, title }.encode()
+                Msg::WindowCreate { window, width: dim(&mut r), height: dim(&mut r), role, pos, title, embed_pending: false }.encode()
             }
             25..=54 => {
                 let window = some_window(&mut r);
@@ -193,7 +193,7 @@ fn renderer(seed: u64) {
                 // A valid record, mutated.
                 let mut b = Msg::FrameReady { window: some_window(&mut r), slot: 0, seq: 1 }.encode();
                 if r.chance(50) {
-                    b = Msg::WindowCreate { window: 3, width: 100, height: 100, role: Role::Document, pos: None, title: "t".into() }.encode();
+                    b = Msg::WindowCreate { window: 3, width: 100, height: 100, role: Role::Document, pos: None, title: "t".into(), embed_pending: false }.encode();
                 }
                 for _ in 0..1 + r.below(3) {
                     b[r.below(MSG_BYTES as u32) as usize] = r.next() as u8;
@@ -228,7 +228,7 @@ fn renderer(seed: u64) {
 /// broker that sends blocking would wait on it forever.
 fn staller(broker: &Chan, stalled: &std::sync::atomic::AtomicBool) -> ! {
     stalled.store(true, std::sync::atomic::Ordering::Relaxed);
-    let create = Msg::WindowCreate { window: 1, width: 64, height: 64, role: Role::Document, pos: None, title: "stall".into() };
+    let create = Msg::WindowCreate { window: 1, width: 64, height: 64, role: Role::Document, pos: None, title: "stall".into(), embed_pending: false };
     let mut n = 0u64;
     loop {
         if broker.send(&create, &[]).is_err() || broker.send(&Msg::WindowDestroy { window: 1 }, &[]).is_err() {
@@ -243,7 +243,7 @@ fn staller(broker: &Chan, stalled: &std::sync::atomic::AtomicBool) -> ! {
 /// broker answers, for a few seconds: the broker's cost per frame is the
 /// copy and the check, and it must stay bounded.
 fn flooder(r: &mut Rng, broker: &Chan, rx: &mpsc::Receiver<(Msg, Vec<OwnedFd>)>) -> ! {
-    let _ = broker.send(&Msg::WindowCreate { window: 1, width: 900, height: 700, role: Role::Document, pos: None, title: "flood".into() }, &[]);
+    let _ = broker.send(&Msg::WindowCreate { window: 1, width: 900, height: 700, role: Role::Document, pos: None, title: "flood".into(), embed_pending: false }, &[]);
     let (mut slots, mut size) = (None, (900, 700));
     let end = Instant::now() + Duration::from_secs(3 + r.below(5) as u64);
     let mut sent = 0u32;
@@ -482,7 +482,7 @@ fn hog() -> ! {
     };
     let mut slots = Vec::new();
     for w in 1..=40u32 {
-        let create = Msg::WindowCreate { window: w, width: 64, height: 64, role: Role::Document, pos: None, title: "hog".into() };
+        let create = Msg::WindowCreate { window: w, width: 64, height: 64, role: Role::Document, pos: None, title: "hog".into(), embed_pending: false };
         if broker.send(&create, &[]).is_err() {
             std::process::exit(0);
         }

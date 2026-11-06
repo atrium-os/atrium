@@ -59,6 +59,9 @@ pub fn translate(ev: &fresco_client::Event) -> Option<Event> {
         | fresco_client::Event::DragOver { .. }
         | fresco_client::Event::DragLeave { .. }
         | fresco_client::Event::DragEnd { .. }
+        // Video layers: Pergola makes none yet.
+        | fresco_client::Event::VideoPresented { .. }
+        | fresco_client::Event::VideoReleased { .. }
         | fresco_client::Event::Unknown { .. } => None,
     }
 }
