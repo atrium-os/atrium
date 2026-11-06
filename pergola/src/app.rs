@@ -169,6 +169,16 @@ impl<V: View> App<V> {
     /// When the loop should wake with no input (ms on the app clock): a
     /// tooltip waiting out its delay.
     pub fn wake_at(&self) -> Option<f64> {
+        // State changed outside any event (a render asked for another, a
+        // background result): paint now.
+        if self.is_dirty() {
+            return Some(self.now_ms);
+        }
+        self.tip_due()
+    }
+
+    /// When the hovered node's tooltip opens, if it is waiting to.
+    fn tip_due(&self) -> Option<f64> {
         let h = self.hovered?;
         if self.tip == Some(h) || !self.interactions.get(h).is_some_and(|h| h.tooltip) {
             return None;
@@ -179,7 +189,7 @@ impl<V: View> App<V> {
 
     /// Open the tooltip whose delay has run out.
     fn run_timers(&mut self) {
-        if self.wake_at().is_some_and(|at| at <= self.now_ms) {
+        if self.tip_due().is_some_and(|at| at <= self.now_ms) {
             self.tip = self.hovered;
             self.touch();
         }

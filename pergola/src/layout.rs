@@ -65,6 +65,11 @@ pub struct FlexStyle {
     /// relative to the container. Used for overlays like the bell's
     /// badge dot.
     pub absolute_inset: Option<[Option<f32>; 4]>,
+    /// A `Stack` whose children keep the rects they were declared with
+    /// (a document, a canvas): layout sizes and places the stack from its
+    /// own declared rect, never looks inside, and moves the whole subtree
+    /// by however far the stack moved.
+    pub free: bool,
     // — as a container (Stack nodes) —
     pub padding: f32,
     /// Per-axis padding overrides; fall back to `padding`.
@@ -86,6 +91,7 @@ impl Default for FlexStyle {
             max_width: None,
             max_height: None,
             absolute_inset: None,
+            free: false,
             padding: 0.0,
             padding_x: None,
             padding_y: None,
@@ -187,6 +193,14 @@ fn flex_subtree(tree: &mut NodeTree, root: PNodeId) {
         } else {
             (origin_x + l.location.x, origin_y + l.location.y)
         };
+        if tree.style(p_id).is_some_and(|s| s.free) {
+            let was = tree.get(p_id).map(|n| n.rect().origin).unwrap_or(crate::geom::Point::new(x, y));
+            if let Some(node) = tree.get_mut(p_id) {
+                node.set_rect(PRect::new(x, y, l.size.width, l.size.height));
+            }
+            shift(tree, p_id, x - was.x, y - was.y);
+            return;
+        }
         if let Some(node) = tree.get_mut(p_id) {
             node.set_rect(PRect::new(x, y, l.size.width, l.size.height));
             if let Node::Scroll { content_h, .. } = node {
@@ -198,6 +212,20 @@ fn flex_subtree(tree: &mut NodeTree, root: PNodeId) {
         for (tc, pc) in t_children.into_iter().zip(p_children) {
             write_back(tree, taffy, tc, pc, x, y, false);
         }
+    }
+}
+
+/// Move everything under `id` by `(dx, dy)`.
+fn shift(tree: &mut NodeTree, id: PNodeId, dx: f32, dy: f32) {
+    if dx == 0.0 && dy == 0.0 {
+        return;
+    }
+    for c in tree.children_of(id).to_vec() {
+        if let Some(n) = tree.get_mut(c) {
+            let moved = n.clone().to_group(crate::geom::Point::new(-dx, -dy), 1.0);
+            *n = moved;
+        }
+        shift(tree, c, dx, dy);
     }
 }
 
@@ -246,6 +274,10 @@ fn build(
     }
 
     match node {
+        Node::Stack { rect, .. } if fs.free => {
+            style.size = Size { width: dim(rect.size.w), height: dim(rect.size.h) };
+            taffy.new_leaf(style).ok()
+        }
         Node::Stack { rect, axis, spacing, .. } => {
             style.display = Display::Flex;
             style.flex_direction = match axis {
@@ -334,6 +366,21 @@ mod tests {
             fill: Color::rgba(1.0, 0.0, 0.0, 1.0),
             radius: radius::SM,
         }
+    }
+
+    #[test]
+    fn a_free_stack_keeps_its_childrens_rects_and_moves_them_with_it() {
+        let mut tree = NodeTree::new();
+        let col = tree.insert(None, Node::vstack(Rect::new(0.0, 0.0, 300.0, 0.0), 0.0));
+        tree.insert(Some(col), red_rect(50.0));
+        let doc = tree.insert(Some(col), Node::vstack(Rect::new(0.0, 0.0, 300.0, 400.0), 0.0));
+        tree.set_style(doc, FlexStyle { free: true, ..FlexStyle::default() });
+        let a = tree.insert(Some(doc), Node::Rect { rect: Rect::new(10.0, 10.0, 20.0, 5.0), fill: palette::neutral_300(), radius: 0.0 });
+        let b = tree.insert(Some(doc), Node::Rect { rect: Rect::new(40.0, 300.0, 20.0, 5.0), fill: palette::neutral_300(), radius: 0.0 });
+        layout(&mut tree, col);
+        assert_eq!(tree.get(doc).unwrap().rect(), Rect::new(0.0, 50.0, 300.0, 400.0));
+        assert_eq!(tree.get(a).unwrap().rect(), Rect::new(10.0, 60.0, 20.0, 5.0), "not laid out, only moved");
+        assert_eq!(tree.get(b).unwrap().rect(), Rect::new(40.0, 350.0, 20.0, 5.0));
     }
 
     #[test]
