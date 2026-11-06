@@ -165,8 +165,13 @@ with one. Fails closed: if frescod's activation socket does not answer within 50
 request is refused. Tests (`tabula/tests/wire.rs`, over real sockets, two apps by uid): copy in
 one app and paste in another; a made-up, stolen (other uid), reused, expired or wrong-kind token
 is refused; no background overwrite or clear; naming a hash that wasn't uploaded is refused; a
-secret must be text; change events; the audit log holds uids and outcomes only. Not yet: drag
-(`DRAG_BEGIN`, `DROP_GET`), privacy mode, persistence across restarts (none planned for v1).
+secret must be text; change events; the audit log holds uids and outcomes only. Drag (§4) is
+built on Tabula's side: `DRAG_BEGIN` (a `BUTTON` press, purpose `DRAG`) holds the payload and
+returns `Reply::Dragging { drag_id }`; `DROP_GET` spends the `DROP` token and takes the payload
+of the drag frescod bound it to, once; `DRAG_CANCEL { drag_id }` (op `0x12`, source only) frees
+it; one pending drag per source, 60 s at most. Tested: a drop releases once; a plain press or a
+drop token minted for another app takes nothing; only the source cancels; a drag needs a button
+press. Not yet: privacy mode, persistence across restarts (none planned for v1).
 
 ## 4. Drag and drop
 

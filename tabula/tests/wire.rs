@@ -161,3 +161,67 @@ fn the_audit_log_has_uids_not_contents() {
     let log: Vec<_> = s.store.lock().unwrap().audit().map(|a| (a.uid, a.op, a.outcome)).collect();
     assert_eq!(log, vec![(EDITOR, op::SET, 0), (VIEWER, op::GET, refusal::NO_GESTURE)]);
 }
+
+fn drag(c: &mut Connection, token: Token, items: &[(&str, &[u8])]) -> Reply {
+    let formats = items.iter().map(|(m, b)| Format { mime: m.to_string(), hash: c.upload_blob(b).unwrap() }).collect();
+    call(c, op::DRAG_BEGIN, &proto::DragBegin { token, formats })
+}
+
+fn drop_get(c: &mut Connection, token: Token, accept: &[&str]) -> (Reply, Option<Vec<u8>>) {
+    let r = call(c, op::DROP_GET, &proto::DropGet { token, accept: accept.iter().map(|s| s.to_string()).collect() });
+    let bytes = match &r {
+        Reply::Got { format } => c.cache_get(&format.hash),
+        _ => None,
+    };
+    (r, bytes)
+}
+
+#[test]
+fn a_drop_releases_the_drag_once() {
+    let (f, s) = setup();
+    let mut src = app(&s, EDITOR);
+    let mut dst = app(&s, VIEWER);
+    let Reply::Dragging { drag_id } = drag(&mut src, f.mint(EDITOR, kind::BUTTON), &[("image/png", b"\x89PNG..")]) else { panic!() };
+    // frescod saw the release over the viewer's window.
+    let (r, b) = drop_get(&mut dst, f.mint_drop(VIEWER, drag_id), &["image/png"]);
+    assert!(matches!(r, Reply::Got { .. }));
+    assert_eq!(b.as_deref(), Some(&b"\x89PNG.."[..]));
+    // A second drop of the same drag gets nothing.
+    assert_eq!(drop_get(&mut dst, f.mint_drop(VIEWER, drag_id), &["image/png"]).0,
+        Reply::Refused { reason: refusal::NO_DRAG, detail: 0 });
+    // A drag is not the clipboard.
+    match call(&mut dst, op::OFFERS, &()) {
+        Reply::Offers { formats, .. } => assert!(formats.is_empty()),
+        other => panic!("{other:?}"),
+    }
+}
+
+#[test]
+fn a_drag_cannot_be_taken_without_a_drop_on_you() {
+    let (f, s) = setup();
+    let mut src = app(&s, EDITOR);
+    let mut other = app(&s, VIEWER);
+    let Reply::Dragging { drag_id } = drag(&mut src, f.mint(EDITOR, kind::BUTTON), &[("text/plain", b"dragged")]) else { panic!() };
+    // An ordinary press is not a drop.
+    assert!(matches!(drop_get(&mut other, f.mint(VIEWER, kind::BUTTON), &["text/plain"]).0,
+        Reply::Refused { reason: refusal::NO_GESTURE, .. }));
+    // A drop token frescod minted for another window's app.
+    assert!(matches!(drop_get(&mut other, f.mint_drop(EDITOR, drag_id), &["text/plain"]).0,
+        Reply::Refused { reason: refusal::NO_GESTURE, .. }));
+    // Only the source can cancel it.
+    assert_eq!(call(&mut other, op::DRAG_CANCEL, &proto::DragCancel { drag_id }), Reply::Refused { reason: refusal::NO_DRAG, detail: 0 });
+    assert_eq!(call(&mut src, op::DRAG_CANCEL, &proto::DragCancel { drag_id }), Reply::Ok);
+    assert_eq!(s.store.lock().unwrap().pending_drags(), 0);
+}
+
+#[test]
+fn a_drag_needs_a_press_and_one_at_a_time() {
+    let (f, s) = setup();
+    let mut src = app(&s, EDITOR);
+    assert!(matches!(drag(&mut src, [4; 16], &[("text/plain", b"x")]), Reply::Refused { reason: refusal::NO_GESTURE, .. }));
+    assert!(matches!(drag(&mut src, f.mint(EDITOR, kind::KEY), &[("text/plain", b"x")]),
+        Reply::Refused { reason: refusal::NO_GESTURE, detail: fr::WRONG_KIND }), "a drag starts with a button");
+    drag(&mut src, f.mint(EDITOR, kind::BUTTON), &[("text/plain", b"1")]);
+    drag(&mut src, f.mint(EDITOR, kind::BUTTON), &[("text/plain", b"2")]);
+    assert_eq!(s.store.lock().unwrap().pending_drags(), 1);
+}

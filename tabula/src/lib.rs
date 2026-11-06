@@ -21,6 +21,12 @@ pub mod proto {
         pub const OFFERS: u16 = 0x02;
         pub const GET: u16 = 0x03;
         pub const CLEAR: u16 = 0x04;
+        /// Hold a drag's payload until a drop (§4).
+        pub const DRAG_BEGIN: u16 = 0x10;
+        /// Take a drop's payload, once.
+        pub const DROP_GET: u16 = 0x11;
+        /// The source gives up its drag.
+        pub const DRAG_CANCEL: u16 = 0x12;
         /// Pushed to every client when the entry changes.
         pub const EV_CHANGED: u16 = 0x80;
     }
@@ -52,6 +58,25 @@ pub mod proto {
     }
 
     #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+    pub struct DragBegin {
+        /// The press that started the drag (purpose `DRAG`).
+        pub token: Token,
+        pub formats: Vec<Format>,
+    }
+
+    /// `token` is the `DROP` token frescod sent the target with `EV_DROP`.
+    #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+    pub struct DropGet {
+        pub token: Token,
+        pub accept: Vec<String>,
+    }
+
+    #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+    pub struct DragCancel {
+        pub drag_id: u64,
+    }
+
+    #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
     pub struct Clear {
         pub token: Token,
     }
@@ -69,11 +94,15 @@ pub mod proto {
         pub const MALFORMED: u8 = 6;
         pub const NO_FORMATS: u8 = 7;
         pub const DUPLICATE_MIME: u8 = 8;
+        /// No such drag, or it was dropped, cancelled or timed out.
+        pub const NO_DRAG: u8 = 9;
     }
 
     #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
     pub enum Reply {
         Ok,
+        /// The drag's id, to hand to frescod's drag begin.
+        Dragging { drag_id: u64 },
         Offers { formats: Vec<String>, generation: u64 },
         /// The format chosen from `accept`; its bytes were uploaded to the
         /// client just before this reply.
@@ -165,7 +194,7 @@ pub mod gate {
 
     #[derive(Default)]
     pub struct FakeTable {
-        live: std::collections::HashMap<Token, (u32, u8, std::time::Instant)>,
+        live: std::collections::HashMap<Token, (u32, u8, std::time::Instant, u64)>,
         next: u64,
     }
 
@@ -176,7 +205,15 @@ pub mod gate {
             let mut tok = [0u8; 16];
             tok[..8].copy_from_slice(&t.next.to_le_bytes());
             tok[8] = 0xa5;
-            t.live.insert(tok, (uid, kind, std::time::Instant::now()));
+            t.live.insert(tok, (uid, kind, std::time::Instant::now(), 0));
+            tok
+        }
+
+        /// What frescod does on a drop: a `DROP` token for the window's
+        /// uid, bound to the drag.
+        pub fn mint_drop(&self, uid: u32, drag_id: u64) -> Token {
+            let tok = self.mint(uid, fresco_protocol::activation::kind::DROP);
+            self.0.lock().unwrap().live.get_mut(&tok).unwrap().3 = drag_id;
             tok
         }
 
@@ -191,7 +228,7 @@ pub mod gate {
     impl Gate for Fake {
         fn consume(&mut self, c: Consume) -> ConsumeResult {
             use fresco_protocol::activation::{kind, purpose, refusal};
-            let Some((uid, k, at)) = self.0.lock().unwrap().live.remove(&c.token) else {
+            let Some((uid, k, at, drag_id)) = self.0.lock().unwrap().live.remove(&c.token) else {
                 return ConsumeResult::Refused { reason: refusal::UNKNOWN };
             };
             if at.elapsed() > std::time::Duration::from_secs(1) {
@@ -208,7 +245,7 @@ pub mod gate {
             if !fits {
                 return ConsumeResult::Refused { reason: refusal::WRONG_KIND };
             }
-            ConsumeResult::Ok { window_id: 1, kind: k, minted_ns: 0, drag_id: 0 }
+            ConsumeResult::Ok { window_id: 1, kind: k, minted_ns: 0, drag_id }
         }
     }
 }
@@ -253,9 +290,22 @@ pub mod store {
         pub at: Instant,
     }
 
+    /// A drag not yet dropped lives this long.
+    pub const DRAG_SECS: u64 = 60;
+
+    #[derive(Debug, Clone)]
+    struct Drag {
+        owner: u32,
+        formats: Vec<(String, Vec<u8>)>,
+        at: Instant,
+    }
+
     #[derive(Debug, Default)]
     pub struct Store {
         entry: Option<Entry>,
+        /// Pending drags by id; one per source uid.
+        drags: std::collections::HashMap<u64, Drag>,
+        next_drag: u64,
         pub generation: u64,
         audit: std::collections::VecDeque<Audit>,
     }
@@ -341,6 +391,35 @@ pub mod store {
         }
 
         pub fn owner(&self) -> Option<u32> { self.entry.as_ref().map(|e| e.owner) }
+
+        /// Hold a drag's payload. A source has one drag at a time: a new
+        /// one replaces its old one.
+        pub fn drag_begin(&mut self, owner: u32, formats: Vec<(String, Vec<u8>)>, now: Instant) -> u64 {
+            self.drags.retain(|_, d| d.owner != owner && now.duration_since(d.at) < Duration::from_secs(DRAG_SECS));
+            self.next_drag += 1;
+            self.drags.insert(self.next_drag, Drag { owner, formats, at: now });
+            self.next_drag
+        }
+
+        /// Release a dropped drag's payload in the first accepted format;
+        /// the drag is gone either way.
+        pub fn drop_take(&mut self, drag_id: u64, accept: &[String], now: Instant) -> Result<Option<(String, Vec<u8>)>, u8> {
+            let d = self.drags.remove(&drag_id).ok_or(refusal::NO_DRAG)?;
+            if now.duration_since(d.at) >= Duration::from_secs(DRAG_SECS) {
+                return Err(refusal::NO_DRAG);
+            }
+            Ok(accept.iter().find_map(|a| d.formats.iter().find(|(m, _)| m == a).cloned()))
+        }
+
+        /// Only its source can cancel a drag.
+        pub fn drag_cancel(&mut self, owner: u32, drag_id: u64) -> bool {
+            match self.drags.get(&drag_id) {
+                Some(d) if d.owner == owner => self.drags.remove(&drag_id).is_some(),
+                _ => false,
+            }
+        }
+
+        pub fn pending_drags(&self) -> usize { self.drags.len() }
     }
 }
 
@@ -423,28 +502,35 @@ pub mod server {
         reply
     }
 
+    /// The bytes of `formats`, all of which must have been uploaded on
+    /// this connection (no naming content by hash, aqueduct.md §6.6),
+    /// checked against the limits.
+    fn uploaded(conn: &mut Connection, formats: &[Format]) -> Result<Vec<(String, Vec<u8>)>, Reply> {
+        let mut out = Vec::with_capacity(formats.len());
+        for f in formats {
+            match conn.cache_get(&f.hash) {
+                Some(b) => out.push((f.mime.clone(), b)),
+                None => return Err(Reply::Refused { reason: refusal::NOT_UPLOADED, detail: 0 }),
+            }
+        }
+        let sizes: Vec<(String, usize)> = out.iter().map(|(m, b)| (m.clone(), b.len())).collect();
+        Store::validate(&sizes).map_err(|r| Reply::Refused { reason: r, detail: 0 })?;
+        Ok(out)
+    }
+
     fn malformed() -> Reply { Reply::Refused { reason: refusal::MALFORMED, detail: 0 } }
 
     fn handle_inner(conn: &mut Connection, uid: u32, shared: &Shared, m: &Message, now: Instant) -> Reply {
         match m.op {
             op::SET => {
                 let Ok(req) = postcard::from_bytes::<proto::Set>(&m.payload) else { return malformed() };
-                // Every byte must have come from this connection: no
-                // naming content by hash (aqueduct.md §6.6).
-                let mut formats = Vec::with_capacity(req.formats.len());
-                for f in &req.formats {
-                    match conn.cache_get(&f.hash) {
-                        Some(b) => formats.push((f.mime.clone(), b)),
-                        None => return Reply::Refused { reason: refusal::NOT_UPLOADED, detail: 0 },
-                    }
-                }
+                let formats = match uploaded(conn, &req.formats) {
+                    Ok(f) => f,
+                    Err(r) => return r,
+                };
                 if req.sensitive && !formats.iter().any(|(m, _)| m == "text/plain") {
                     // A secret is kept as text only; nothing would be left.
                     return Reply::Refused { reason: refusal::NO_FORMATS, detail: 0 };
-                }
-                let sizes: Vec<(String, usize)> = formats.iter().map(|(m, b)| (m.clone(), b.len())).collect();
-                if let Err(r) = Store::validate(&sizes) {
-                    return Reply::Refused { reason: r, detail: 0 };
                 }
                 if let Err(r) = gesture(shared, uid, req.token, purpose::COPY) {
                     return r;
@@ -472,6 +558,49 @@ pub mod server {
                         Ok(hash) => Reply::Got { format: Format { mime, hash } },
                         Err(_) => malformed(),
                     },
+                }
+            }
+            op::DRAG_BEGIN => {
+                let Ok(req) = postcard::from_bytes::<proto::DragBegin>(&m.payload) else { return malformed() };
+                let formats = match uploaded(conn, &req.formats) {
+                    Ok(f) => f,
+                    Err(r) => return r,
+                };
+                if let Err(r) = gesture(shared, uid, req.token, purpose::DRAG) {
+                    return r;
+                }
+                let drag_id = shared.store.lock().unwrap().drag_begin(uid, formats, now);
+                Reply::Dragging { drag_id }
+            }
+            op::DROP_GET => {
+                let Ok(req) = postcard::from_bytes::<proto::DropGet>(&m.payload) else { return malformed() };
+                if req.accept.len() > store::MAX_FORMATS || req.accept.iter().any(|a| !store::valid_mime(a)) {
+                    return malformed();
+                }
+                // frescod bound the token to this window's uid and to the
+                // drag that was dropped there: the target cannot name
+                // another drag.
+                let r = shared.gate.lock().unwrap().consume(Consume { token: req.token, presenter_uid: uid, purpose: purpose::DROP });
+                let drag_id = match r {
+                    ConsumeResult::Ok { drag_id, .. } => drag_id,
+                    ConsumeResult::Refused { reason } => return Reply::Refused { reason: refusal::NO_GESTURE, detail: reason },
+                };
+                let got = shared.store.lock().unwrap().drop_take(drag_id, &req.accept, now);
+                match got {
+                    Err(r) => Reply::Refused { reason: r, detail: 0 },
+                    Ok(None) => Reply::Empty,
+                    Ok(Some((mime, bytes))) => match conn.upload_blob(&bytes) {
+                        Ok(hash) => Reply::Got { format: Format { mime, hash } },
+                        Err(_) => malformed(),
+                    },
+                }
+            }
+            op::DRAG_CANCEL => {
+                let Ok(req) = postcard::from_bytes::<proto::DragCancel>(&m.payload) else { return malformed() };
+                if shared.store.lock().unwrap().drag_cancel(uid, req.drag_id) {
+                    Reply::Ok
+                } else {
+                    Reply::Refused { reason: refusal::NO_DRAG, detail: 0 }
                 }
             }
             op::CLEAR => {
