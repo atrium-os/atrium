@@ -3,7 +3,7 @@
 > *Nuntius* (Latin: messenger). The Navigator's jailed fetcher (`navigator-fetch`,
 > `navigator-fetchd`), made into a system component any app can use to fetch a URL.
 
-**Status:** interface proposed, 2026-11-06. Not built. Owner: the Navigator thread.
+**Status:** accepted by the user, 2026-11-06 (name and interface, all recommendations). Not built yet. Owner: the Navigator thread.
 
 **Asked by the user, 2026-11-06:** "the navigator's sandboxed fetcher is the right one... used
 as a widget, third party apps can use it too." The same day, the user chose that the media
@@ -171,7 +171,7 @@ The jailed-gate tests (backend §8 M1 gate) run on every step, unchanged.
 
 ## 7. Open questions
 
-- The name: Nuntius is proposed; NAMING.md gets a row once it is accepted.
+- The name: Nuntius, accepted 2026-11-06.
 - A shared HTTP cache across a client's own instances? Not in v1, which keeps one instance per
   client and no cache beyond connection reuse.
 - HTTP/2 and HTTP/3. The fetcher is HTTP/1.1 today. Multiplexing would help media and pages,
