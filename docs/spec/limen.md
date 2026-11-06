@@ -576,6 +576,15 @@ the VM in both direct and split mode:
 The Pergola parent side (`Embeds`, `CredentialField`) is tested on Linux against limend, but
 not yet in the VM.
 
+**With the real Arca, 2026-11-06.** `scripts/limen-arca-vm-test.sh` runs a credential field end
+to end in the VM, every part a separate process as its own user: headless frescod (direct),
+limend as `_limen` (65022), arca-ui as `_arca-ui`, jailed arcad, and `limen-arca-probe` as the
+app. As `org.example.mail` (an account saved), all 6 checks pass: the field attaches, nothing
+fills on load, an injected click on the chip fills (the username, then a handle), typing clears
+it, and Tab hands over a handle for what was typed. As `org.example.evil` (same publisher,
+nothing saved), no click fills. Needs the current Portcullis stack (an older jaild drops
+`allow.mlock` and arcad serves nothing).
+
 **Tests for L1:**
 - a parent can't embed into a window it doesn't own;
 - an unknown role and a system role's impostor are refused;

@@ -33,3 +33,7 @@ fresco-client = { path = "../fresco-client" }
 [[example]]
 name = "limen-embed-probe"
 path = "examples/embed_probe.rs"
+
+[[example]]
+name = "limen-arca-probe"
+path = "examples/arca_fill_probe.rs"
