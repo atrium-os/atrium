@@ -264,6 +264,20 @@ R9700 with a monitor (D5).
 | G2 | GPU frames into layers (§7): sealed buffers from the player's context | GPU thread with Fresco thread, after F6 |
 | D1 | overlay planes for video on silicon | Fresco thread, after D5 |
 
+**P3 status (2026-11-06): built against a fake player.**
+
+- NSG `embed` leaves for `<video>`, with the source classified as a URL, `script` or
+  `unplayable`.
+- The converter records each document's videos (`media` in the artifact).
+- `navigator-media` holds the slot and session layer (at most 8 live, started on a press or
+  under the autoplay policy, plain files via Nuntius `Fd`), the MSE front end (mapping in
+  legacy-web §8.1.1), and the seek-driven segment feed over Nuntius `Stream`.
+- The feed is tested against a server that is slow, stalls, drops connections, answers 5xx,
+  has a dead primary, or never answers.
+- Waiting on P1: answer order, `Buffered` before `Appended`, a track on `Error`, and a
+  "more is coming" signal for progressive `Load { Fd }`.
+- Waiting on the Pergola UI: the real `Embeds` wiring (before L6).
+
 V1 to V4 are ready to build once this is reviewed. P1 can start at once against V1's
 `RGBA8` format and a CPU decoder. Nothing in it waits on G1.
 

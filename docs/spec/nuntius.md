@@ -3,7 +3,9 @@
 > *Nuntius* (Latin: messenger). The Navigator's jailed fetcher (`navigator-fetch`,
 > `navigator-fetchd`), made into a system component any app can use to fetch a URL.
 
-**Status:** accepted by the user, 2026-11-06 (name and interface, all recommendations). Not built yet. Owner: the Navigator thread.
+**Status:** accepted by the user, 2026-11-06 (name and interface, all recommendations).
+Build step 1 and the fetcher side of step 3 are **built inside `navigator-fetch`** (§6.1);
+steps 2, 4 and 5 are not. Owner: the Navigator thread.
 
 **Asked by the user, 2026-11-06:** "the navigator's sandboxed fetcher is the right one... used
 as a widget, third party apps can use it too." The same day, the user chose that the media
@@ -168,6 +170,53 @@ for `Stream` media and 60 s otherwise. Numbers to tune by measurement.
 5. The C ABI.
 
 The jailed-gate tests (backend §8 M1 gate) run on every step, unchanged.
+
+### 6.1 What is built (2026-11-06)
+
+`navigator_fetch::nuntius` (in-process; no channel yet):
+
+- `Nuntius::new(conversation, Sender<Event>, budget)`, then `request(Request)`, `live()` and
+  `budget()`.
+- The `Open`, `Cancel` and `Budget` requests, and every event in §3.2, with the field names
+  above.
+- **Stream** delivery is flow-controlled: reading stops when the budget is spent, and a
+  ranged request finishes as soon as its length is in hand. `Data` events are at most 60 KiB
+  and their offsets are absolute.
+- **Fd** delivery (step 3, fetcher side): a read-only descriptor is sent with `Fd` as soon as
+  `Head` is known, then filled front to back.
+  - FreeBSD: `SHM_ANON`, with a `cap_rights_limit` read-only dup.
+  - Linux: `memfd`, reopened read-only through `/proc`.
+  - macOS (development only): an unlinked temp file.
+  - With no length, the request falls back to Stream.
+  - `navigator_fetch::nuntius::anon_file()` is public.
+- Timeouts: `connect_ms`, `idle_ms` and `total_ms`.
+- Retry: on a timeout, reset, short body, 5xx, 408 or 429, with doubling backoff and jitter.
+  Policy, DNS, TLS and other 4xx errors are final.
+- Resume: `Range` from the last byte, with `If-Range`. A 200 or a changed validator fails
+  `Malformed`, never a splice.
+- `Cancel` shuts the socket at once.
+- Caps: 64 live requests, at most 1 GiB for `Fd`, `total_ms` at most 10 min. The connect,
+  idle, attempt and backoff values are clamped.
+- Every fetchd guarantee holds, because a request goes through the same `Conversation`: the
+  address policy is checked between resolve and connect, addresses are pinned against
+  rebinding, redirects are capped at 5 and refused on a downgrade, and 206 responses are
+  checked. The converter's line protocol (`serve_with`) is unchanged.
+
+**Not built:**
+
+- 6 connections per origin, 256 MiB in flight, and the 60 s total for non-media requests.
+- The `nuntius` crate, the Aqueduct channel, `nuntiusd`, the portcullisd launch, `net.fetch`
+  and the C ABI.
+
+The standalone player can wire to the in-process API today (`navigator-fetch` as a
+dependency). The types are the ones §3 names, so moving to the channel is a transport change,
+not an interface change.
+
+**Tests.** `navigator-fetch/tests/nuntius.rs` has 15 tests against a scriptable loopback
+server: slow, stalled mid-body, dropped, 5xx and 4xx, a changed resource, flow control, an
+exact-credit resume, cancel, connect timeout, range checks, Fd read-only, the address and
+redirect rules, and the concurrency cap. `navigator-media/tests/feed.rs` runs P3's segment
+feed through it (fresco-video P3).
 
 ## 7. Open questions
 

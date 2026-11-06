@@ -2399,8 +2399,68 @@ own jail and window. This has three effects:
 - The engine never holds a decoded frame, and the CDM sits below the player, not the engine.
 - Picture-in-picture, background audio, media keys and hardware decode are built once.
 
-A page whose video is a plain file needs no engine: the document lane embeds the player with
-`Load` and the URL, and no script runs.
+A page whose video is a plain file needs no engine. The document lane fetches the file
+through its fetcher (Nuntius, `Fd` delivery) and loads the player with `Load` and the
+descriptor; no script runs. The player has no network ([nuntius.md](nuntius.md); `Source::Url`
+was removed).
+
+### 8.1.1 The `<video>` and `MediaSource` mapping (built, fresco-video P3, 2026-11-06)
+
+*Built in `navigator-media`, against a fake player. No engine runs at view time yet, so no
+page calls it yet.*
+
+**Where the embed comes from.** The renderer treats `<video>` as a replaced element (poster,
+or 300×150) and writes an NSG `embed` leaf: role `media-player`, a key, the box, flags
+(autoplay, loop, muted, controls), and the source class. The class is one of: a URL and
+type (the first `src` or `<source>` the player can play: WebM or MP4 with AV1, VP8, VP9,
+H.264, Opus, Vorbis or AAC); `script` (an empty or `blob:` src, which only an engine can
+feed); or `unplayable`. The UI places the slot (`Ctx::slot`, keys with the top bit set) as
+a sibling of the document, never nested. At most 8 media embeds are live per page, and each
+starts only on a press or under the autoplay policy.
+
+**The mapping.** An engine binds its JS objects to `navigator_media::mse::Media`. It sends
+what `take_out` returns to the embed, feeds the embed's messages to `from_player`, and
+dispatches `take_events` in order.
+
+| page | message to the player | answered by → what the page sees |
+|---|---|---|
+| `video.src = url` (a file) | the Navigator fetches it (Nuntius `Fd`), then `Load { Fd }` | `Ready` → `loadedmetadata`, `loadeddata`, `canplay`, `canplaythrough` |
+| `video.src = URL.createObjectURL(ms)` | `OpenSource` | `sourceopen` at once |
+| `MediaSource.isTypeSupported(t)` | synchronous, from a cache of `CanPlay` answers; an unknown type answers `false` and is asked | `CanPlay` fills the cache |
+| `ms.addSourceBuffer(t)` | `AddTrack` (the track is its index, at most 8) | |
+| `sb.appendBuffer(b)` | `Append`s of at most 60 KiB, one in flight per track; `timestampOffset` goes on the first | each `Appended` releases the next; the last → `update`, `updateend` |
+| `sb.remove(a, b)` | `Remove` | the track's next `Buffered` → `update`, `updateend` |
+| `sb.abort()` | `Abort` | `abort`, `updateend` at once; an `Append` still in flight holds back the next |
+| `ms.endOfStream(e)` | `EndOfStream` | `sourceended` |
+| `ms.duration = d` | `SetDuration` | `durationchange` |
+| `sb.buffered`, `video.buffered` | | `Buffered` (the element's is every track's, intersected) |
+| `play()`, `pause()` | `Play`, `Pause` | `Playing` → `playing`; `Paused` → `pause` |
+| `currentTime = t` | `Seek` | `seeking` at once; the next `Time` → `seeked`, `timeupdate` |
+| `volume`, `muted` | `SetVolume` (0 while muted) | `volumechange` at once |
+| `playbackRate` | `SetRate` (0.25 to 4; anything else is `NotSupportedError`) | `ratechange` at once |
+| | | `Time` → `timeupdate`; `Waiting` → `waiting`; `Seeking` from the native controls → `seeking`; `Ended` → `pause`, `ended` |
+| | `Error { TOO_BIG }` | the append in flight → `error`, `updateend`; the next `appendBuffer` throws `QuotaExceededError` until a `remove` completes |
+| | `Error { DECODE, UNSUPPORTED, NETWORK }` | `video.error` (`MEDIA_ERR_DECODE` 3, `SRC_NOT_SUPPORTED` 4, `NETWORK` 2), then `error`; a later `play()` or seek clears it |
+
+**What the Navigator fetches itself** (`navigator_media::feed`, for a segment index it
+knows, not a page's own MSE script):
+
+- A seek cancels every fetch the new time doesn't need.
+- The covering segment is fetched first, and nothing else is appended until it is in.
+- The feed refills up to 20 s ahead, and removes what is more than 30 s behind so the
+  player's 150 MB budget holds the playhead's neighbourhood. `TOO_BIG` halves the
+  look-behind and evicts.
+- Retries, ranged resume and timeouts are Nuntius's.
+- A segment that still fails moves to its next alternate URL. With none left, the feed
+  reports `NETWORK`, and a later play or seek starts afresh, so no refresh is ever needed.
+
+**Assumptions for P1 to confirm, and gaps:**
+
+- The player answers in the order it is sent.
+- An `Append`'s `Buffered` comes before its `Appended`.
+- `Error` names no track, so a `TOO_BIG` ends every append in flight.
+- A plain file is loaded only once it is whole. Progressive `Load { Fd }` needs a
+  "more is coming" signal on the role.
 
 ## 9. Honest costs
 
