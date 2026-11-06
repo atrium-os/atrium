@@ -256,7 +256,7 @@ keep-alive  = false               # if true, restart immediately on exit
 | `clipboard = true` | Talk to clipboard daemon | nullfs `/atrium/sockets/clipboard.sock` |
 | `notify = true` | Send notifications | nullfs `/atrium/sockets/notify.sock` |
 | `open-uri = true` | Ask broker to open URLs | nullfs `/atrium/sockets/broker.sock` |
-| `audio = true` | Capture/play audio | nullfs audio.sock + devfs `/dev/dsp*` |
+| `audio = true` | Play audio through Lyra | nullfs `/atrium/sockets/audio/` (choragusd) only. No `/dev/dsp*`: only lyrad holds the device ([lyra-v1.md](lyra-v1.md) §3) |
 | `filesystem = [...]` | Read/write listed paths | nullfs each path |
 | `fonts.mode = "read-only", paths = [...]` | Read fonts | nullfs read-only |
 | `network = "none"` | (default) | jail flag `allow.raw_sockets=0`, no interface |
@@ -265,7 +265,7 @@ keep-alive  = false               # if true, restart immediately on exit
 | `tessera-cas-read = true` | Read global CAS | nullfs read-only of `/var/lib/tessera/cas` |
 | `usb-hid = true` | Read input devices | devfs `/dev/input/eventN` |
 | `camera = true` | Read camera device | devfs `/dev/video0` |
-| `microphone = true` | Read mic input | devfs audio capture |
+| `microphone = true` | Record through Lyra | the same audio socket; choragusd checks the grant. No device node |
 
 Special / restricted (`tessera-cas-read`, `usb-hid` for non-input
 apps, `gpu.scanout`) require explicit policy approval beyond user

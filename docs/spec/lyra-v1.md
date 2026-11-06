@@ -1,6 +1,6 @@
 # Lyra v1: the audio service apps use
 
-**Status:** proposal for review, 2026-11-06. **Owner:** the audio thread (item P2 of
+**Status:** accepted 2026-11-06 (Shankar agreed with all six §10 recommendations); being built. **Owner:** the audio thread (item P2 of
 [fresco-video.md](fresco-video.md) §8).
 
 Atrium already has an audio design and working prototypes of it. The architecture is in

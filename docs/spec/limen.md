@@ -493,7 +493,7 @@ focused.
 | drawing over the slot to mislead | the parent is below the child in z-order; for `credential` slots, frescod's visibility record and frame |
 | frame timing | limend relays role messages only, with no frame events. Role events such as `Time` are rate-limited |
 | GPU caches | per-window renderers in split mode (fresco-f4-split.md) |
-| audio | needs the child's own `media-output` capability |
+| audio | the child and its parent must both hold `audio`; the sound counts as the parent's ([lyra-v1.md](lyra-v1.md) §4) |
 | storage and network | none shared: each jail has its own |
 
 Timing and hardware side channels (Spectre-class) are the kernel's and GPU driver's to

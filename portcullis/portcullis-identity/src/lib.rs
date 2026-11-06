@@ -133,9 +133,26 @@ pub fn for_app(app_id: &str) -> io::Result<HostIdentity> {
     Ok(derive(&load_or_create_secret(Path::new(SECRET_PATH))?, app_id))
 }
 
+#[cfg(not(target_os = "linux"))]
 fn fill_random(buf: &mut [u8]) {
     // SAFETY: arc4random_buf fills exactly `len` bytes and cannot fail.
     unsafe { libc::arc4random_buf(buf.as_mut_ptr().cast(), buf.len()) }
+}
+
+/// Linux (host tests only): the libc crate has no arc4random_buf for glibc, so
+/// use getrandom(2), which blocks only until the pool is seeded.
+#[cfg(target_os = "linux")]
+fn fill_random(buf: &mut [u8]) {
+    let mut off = 0;
+    while off < buf.len() {
+        // SAFETY: writes at most `len - off` bytes into the slice's tail.
+        let n = unsafe { libc::getrandom(buf[off..].as_mut_ptr().cast(), buf.len() - off, 0) };
+        if n > 0 {
+            off += n as usize;
+        } else if std::io::Error::last_os_error().kind() != std::io::ErrorKind::Interrupted {
+            panic!("getrandom failed: {}", std::io::Error::last_os_error());
+        }
+    }
 }
 
 #[cfg(test)]

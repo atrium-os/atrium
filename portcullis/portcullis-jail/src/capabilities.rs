@@ -33,7 +33,7 @@ pub fn apply_all(
     if caps.open_uri == Some(true) {
         apply_socket("broker.sock", jc, opts);
     }
-    if caps.audio == Some(true) {
+    if caps.audio == Some(true) || caps.microphone == Some(true) {
         apply_audio(jc, opts);
     }
     if let Some(paths) = &caps.filesystem {
@@ -57,9 +57,6 @@ pub fn apply_all(
     }
     if caps.camera == Some(true) {
         apply_camera(jc);
-    }
-    if caps.microphone == Some(true) {
-        apply_microphone(jc);
     }
     if caps.window_management == Some(true) {
         apply_window_management(jc, opts);
@@ -153,11 +150,18 @@ pub fn apply_socket(name: &str, jc: &mut JailConfig, opts: &BuildOpts) {
     jc.add_mount(&src, &dst_in_jail, "nullfs", &["rw"]);
 }
 
+/// `audio` (and `microphone`): Choragus's socket directory, and nothing else.
+///
+/// ★★ No `/dev/dsp*` or `/dev/mixer*` in any app jail (lyra-v1.md §3,
+/// decision 2). Only lyrad holds the device. An app that could open the codec
+/// itself would bypass Choragus — its identity check, the
+/// `microphone`/`audio-monitor` split, ducking, per-app volume and the seat —
+/// and with `microphone` it could record with no one in between. Samples
+/// reach lyrad through the shared-memory ring Choragus brokers over this
+/// socket. Recording is a grant bit Choragus checks at the door, so
+/// `microphone` mounts the same socket.
 pub fn apply_audio(jc: &mut JailConfig, opts: &BuildOpts) {
     apply_socket("audio.sock", jc, opts);
-    /* Audio data plane needs OSS device nodes. */
-    jc.add_devfs_action("path 'dsp*' unhide");
-    jc.add_devfs_action("path 'mixer*' unhide");
 }
 
 pub fn apply_filesystem(spec: &str, jc: &mut JailConfig, opts: &BuildOpts) -> Result<(), BuildError> {
@@ -236,11 +240,6 @@ pub fn apply_camera(jc: &mut JailConfig) {
     jc.add_devfs_action("path 'video*' unhide");
 }
 
-pub fn apply_microphone(jc: &mut JailConfig) {
-    /* Mic capture device — same OSS surface as audio output. */
-    jc.add_devfs_action("path 'dsp*' unhide");
-    jc.add_devfs_action("path 'mixer*' unhide");
-}
 
 // ── tests ─────────────────────────────────────────────────────
 

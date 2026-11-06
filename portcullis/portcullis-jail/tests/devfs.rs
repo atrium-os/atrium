@@ -51,12 +51,12 @@ fn apps_mount_devfs_with_the_defined_app_ruleset() {
 /// before it creates the jail).
 #[test]
 fn a_capability_grant_is_applied_to_this_jails_devfs_before_it_starts() {
-    let jc = build(&manifest("[capabilities]\naudio = true\n"), &opts()).expect("builds");
+    let jc = build(&manifest("[capabilities]\ncamera = true\nusb-hid = true\n"), &opts()).expect("builds");
     let Some(Value::String(pre)) = param(&jc, "exec.prestart") else {
-        panic!("audio grants nothing: no exec.prestart in {:?}", jc.params);
+        panic!("camera grants nothing: no exec.prestart in {:?}", jc.params);
     };
-    assert!(pre.contains("devfs -m /var/lib/atrium/jails/test/dev rule apply path 'dsp*' unhide"), "{pre}");
-    assert!(pre.contains("rule apply path 'mixer*' unhide"), "{pre}");
+    assert!(pre.contains("devfs -m /var/lib/atrium/jails/test/dev rule apply path 'video*' unhide"), "{pre}");
+    assert!(pre.contains("rule apply path 'input/event*' unhide"), "{pre}");
     // ★ `&&`, so a grant that fails to apply fails the launch instead of
     // starting an app without the device it asked for.
     assert!(pre.contains(" && "), "{pre}");
@@ -70,4 +70,26 @@ fn a_capability_grant_is_applied_to_this_jails_devfs_before_it_starts() {
 fn no_device_capability_means_no_grants() {
     let jc = build(&manifest(""), &opts()).expect("builds");
     assert!(param(&jc, "exec.prestart").is_none(), "{:?}", jc.params);
+}
+
+/// ★★ `audio` and `microphone` grant Choragus's socket, never the codec
+/// (lyra-v1.md §3, decision 2). An app that could open /dev/dsp would bypass
+/// every audio check, and with `microphone` record with no one in between.
+#[test]
+fn audio_and_microphone_get_the_socket_and_no_sound_device() {
+    for caps in ["audio = true\n", "microphone = true\n", "audio = true\nmicrophone = true\n"] {
+        let jc = build(&manifest(&format!("[capabilities]\n{caps}")), &opts()).expect("builds");
+        if let Some(Value::String(pre)) = param(&jc, "exec.prestart") {
+            assert!(!pre.contains("dsp") && !pre.contains("mixer"), "{caps}: {pre}");
+        }
+        let conf = jc.render_jail_conf();
+        assert!(!conf.contains("dsp") && !conf.contains("mixer"), "{caps}: {conf}");
+        let audio_mounts: Vec<_> = jc.mounts.iter()
+            .filter(|m| m.dst.ends_with("atrium/sockets/audio"))
+            .collect();
+        assert_eq!(audio_mounts.len(), 1, "{caps}: exactly one audio socket dir mount, got {:?}", jc.mounts);
+    }
+    // No audio capability: no audio socket.
+    let jc = build(&manifest(""), &opts()).expect("builds");
+    assert!(!jc.mounts.iter().any(|m| m.dst.ends_with("atrium/sockets/audio")), "{:?}", jc.mounts);
 }
