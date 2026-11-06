@@ -275,8 +275,10 @@ Host tests run on Linux in the cloud; the rest run in the arm64 or amd64 VM with
    paced by the Mac's CoreAudio output, muted): the same, one window −48420 ppm, worst
    −194 ms, median −0.005 ms; between excursions the device holds about +6 ppm in all four
    runs. The check now also prints, for diagnosis only, the error on clicks outside 10 s
-   windows where the device ran more than 1000 ppm off its median. **Verdict pending real
-   hardware.**
+   windows where the device ran more than 1000 ppm off its median: run 4, 1141 clicks
+   within −2.097 to +0.695 ms; run 3, 1122 clicks within −4.816 to +2.121 ms (the 20 s fit
+   still carries an excursion for a while after it). **Verdict pending real hardware**:
+   the clock arithmetic is right to about ±2 ms whenever the device keeps time.
 7. **Restart** (VM): kill lyrad while two apps play; both get `StreamLost`, reopen, and play
    again when the supervisor restarts it.
 
