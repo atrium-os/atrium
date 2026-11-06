@@ -50,6 +50,12 @@ pub fn translate(ev: &fresco_client::Event) -> Option<Event> {
         | fresco_client::Event::DisplayChanged(_)
         // Pergola draws no filled paths yet, so it has none to fall back for.
         | fresco_client::Event::FillsDropped { .. }
+        // Drag and drop (tabula.md §4): not routed to widgets yet.
+        | fresco_client::Event::DragEnter { .. }
+        | fresco_client::Event::DragOver { .. }
+        | fresco_client::Event::DragLeave { .. }
+        | fresco_client::Event::Drop { .. }
+        | fresco_client::Event::DragEnd { .. }
         | fresco_client::Event::Unknown { .. } => None,
     }
 }
