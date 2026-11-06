@@ -3,9 +3,22 @@ name        = "limen"
 version     = "0.1.0"
 edition     = "2021"
 license     = "MIT OR Apache-2.0"
-description = "Limen, the cross-jail embed broker (docs/spec/limen.md): role message types. The broker itself is not built yet."
+description = "Limen, the cross-jail embed broker (docs/spec/limen.md): role catalogue and messages, the limend daemon, and the parent and child clients."
 publish     = false
 
+[lib]
+name = "limen"
+path = "src/lib.rs"
+
+[[bin]]
+name = "limend"
+path = "src/bin/limend.rs"
+
 [dependencies]
+aqueduct        = { path = "../aqueduct" }
+portcullis-peer = { path = "../portcullis/portcullis-peer" }
 serde    = { version = "1", features = ["derive"] }
 postcard = { version = "1", features = ["use-std"] }
+
+[dev-dependencies]
+libc = "0.2"

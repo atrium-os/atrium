@@ -131,6 +131,10 @@ pub const CLASS_NET:       u8 = 12;
 ///         1 = the device's received-push queue is empty
 pub const CLASS_TABELLARIUS: u8 = 13;
 
+/// Limen, the embed broker (docs/spec/limen.md): embed requests, slot
+/// placement, role messages relayed between a parent and its child.
+pub const CLASS_LIMEN:     u8 = 14;
+
 /// Smoke-test / fuzzing service. Not part of the production
 /// surface; used by aqueduct-echo and unit tests.
 pub const CLASS_ECHO:      u8 = 63;
@@ -156,6 +160,7 @@ pub fn class_name(c: u8) -> &'static str {
         CLASS_VESTIBULUM => "vestibulum",
         CLASS_NET        => "net",
         CLASS_TABELLARIUS => "tabellarius",
+        CLASS_LIMEN      => "limen",
         CLASS_ECHO       => "echo",
         c if c >= CLASS_VENDOR_BASE => "vendor",
         _ => "reserved",

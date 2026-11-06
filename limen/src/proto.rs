@@ -1,0 +1,117 @@
+//! limend's wire: CLASS_LIMEN, postcard payloads (limen.md §11).
+//!
+//! A parent's requests get a [`Reply`] (IS_RESPONSE, same op). Events go
+//! out as ASYNC_EVENT: [`ParentEvent`] to a parent, [`ChildEvent`] to a
+//! child or a system provider. A provider serves many instances on one
+//! connection, so every child op names its embed.
+
+use serde::{Deserialize, Serialize};
+
+pub use crate::catalogue::SlotKind;
+
+pub const CLASS: u8 = aqueduct::classes::CLASS_LIMEN;
+
+pub mod op {
+    // parent
+    pub const REQUEST: u16 = 0x01;
+    pub const PLACE: u16 = 0x02;
+    pub const SEND: u16 = 0x03;
+    pub const DETACH: u16 = 0x04;
+    pub const SET_VISIBLE: u16 = 0x05;
+    // child or system provider
+    pub const PROVIDE: u16 = 0x10;
+    pub const READY: u16 = 0x11;
+    pub const EMIT: u16 = 0x12;
+    pub const FOCUS_OUT: u16 = 0x13;
+    // events
+    pub const EV_PARENT: u16 = 0x80;
+    pub const EV_CHILD: u16 = 0x81;
+}
+
+pub mod refusal {
+    pub const UNKNOWN_ROLE: u8 = 1;
+    pub const NO_PROVIDER: u8 = 2;
+    pub const NOT_YOUR_WINDOW: u8 = 3;
+    pub const TOO_MANY: u8 = 4;
+    pub const NOT_YOURS: u8 = 5;
+    pub const TOO_BIG: u8 = 6;
+    pub const MALFORMED: u8 = 7;
+    pub const NOT_PROVIDER: u8 = 8;
+    pub const LAUNCH_FAILED: u8 = 9;
+    pub const NOT_ATTACHED: u8 = 10;
+    pub const NOT_AN_APP: u8 = 11;
+    pub const RATE: u8 = 12;
+}
+
+pub type EmbedId = u64;
+
+/// frescod's embed token for a window (EV_WINDOW_EMBED_TOKEN): 16 random
+/// bytes pushed only to the window's owner, so holding one proves the
+/// window. App window ids are not global in split mode; tokens are.
+pub type WindowToken = [u8; 16];
+
+/// Embed a `role` child into the caller's window named by `window`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Request { pub role: String, pub window: WindowToken }
+
+/// The slot's rect in the parent window's surface pixels; `None` hides it.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Place { pub embed: EmbedId, pub rect: Option<[f32; 4]> }
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Send { pub embed: EmbedId, pub bytes: Vec<u8> }
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Detach { pub embed: EmbedId }
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SetVisible { pub embed: EmbedId, pub visible: bool }
+
+/// A system service offers `role` (it must be the catalogue's provider).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Provide { pub role: String }
+
+/// The child's window for `embed` is open; `window` is its embed token.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Ready { pub embed: EmbedId, pub window: WindowToken }
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Emit { pub embed: EmbedId, pub bytes: Vec<u8> }
+
+/// Tab left the child's focus order: the parent focuses its next widget.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FocusOut { pub embed: EmbedId, pub forward: bool }
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Reply {
+    Ok,
+    Embed { embed: EmbedId },
+    Refused { reason: u8 },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ParentEvent {
+    /// The child's window is bound into the slot.
+    Attached { embed: EmbedId },
+    Message { embed: EmbedId, bytes: Vec<u8> },
+    Suspended { embed: EmbedId },
+    Resumed { embed: EmbedId },
+    /// The child crashed or exited; the slot is gone.
+    ChildLost { embed: EmbedId },
+    Detached { embed: EmbedId },
+    FocusOut { embed: EmbedId, forward: bool },
+    /// The child went over the message rate; told once.
+    Dropped { embed: EmbedId },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ChildEvent {
+    /// A new instance. `parent_app` is the parent's registry app id, as
+    /// data: never authority.
+    Attach { embed: EmbedId, role: String, parent_app: String },
+    Message { embed: EmbedId, bytes: Vec<u8> },
+    Suspended { embed: EmbedId },
+    Resumed { embed: EmbedId },
+    /// The parent is gone or detached it: stop, the jail ends shortly.
+    Detaching { embed: EmbedId },
+}
