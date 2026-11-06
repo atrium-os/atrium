@@ -114,6 +114,11 @@ fn main() {
     #[allow(unsafe_code)]
     // SAFETY: the supervisor gave us this descriptor for exactly this.
     let sock = UnixStream::from(unsafe { sys::adopt(fd) });
+    // The socket can only carry messages: no ioctl, fcntl or shutdown games.
+    if let Err(e) = sys::limit(&std::os::fd::OwnedFd::from(sock.try_clone().unwrap()), sys::Rights::Socket) {
+        eprintln!("atrium-player-decode: cap_rights_limit: {e}");
+        std::process::exit(1);
+    }
     if let Err(e) = sys::limit_memory(mem) {
         eprintln!("atrium-player-decode: rlimit: {e}");
         std::process::exit(1);
@@ -162,10 +167,11 @@ impl Worker {
         loop {
             let busy = !self.failed && self.work();
             // Block for the next message only when there's nothing to do.
-            self.sock.set_nonblocking(busy).ok();
+            if busy && !sys::readable(&self.sock, 0) {
+                continue;
+            }
             match sys::recv_frame(&self.sock) {
                 Ok(Some((payload, fds))) => {
-                    self.sock.set_nonblocking(false).ok();
                     let Some(msg) = decode_frame(&payload) else { return };
                     if !self.handle(msg, fds) {
                         return;

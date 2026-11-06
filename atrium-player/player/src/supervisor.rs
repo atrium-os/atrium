@@ -82,7 +82,18 @@ impl Proc {
         let mut cmd = Command::new(&o.worker);
         cmd.arg("--fd").arg(theirs.as_raw_fd().to_string()).arg("--mem-mib").arg(o.worker_mem_mib.to_string()).stdin(std::process::Stdio::null());
         sys::pass_fd(&mut cmd, theirs.as_raw_fd());
-        let child = cmd.spawn()?;
+        // ETXTBSY: a worker binary just written can be briefly busy while
+        // another thread's fork still holds it open for writing.
+        let mut tries = 0;
+        let child = loop {
+            match cmd.spawn() {
+                Err(e) if e.raw_os_error() == Some(libc::ETXTBSY) && tries < 50 => {
+                    tries += 1;
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                r => break r?,
+            }
+        };
         drop(theirs);
         Ok(Proc { child, sock: mine, partial: Vec::new() })
     }
@@ -206,6 +217,7 @@ impl<S: Sink> Player<S> {
         match &self.source {
             Source::File(f) => {
                 let fd: OwnedFd = f.try_clone()?.into();
+                let fd = sys::restricted(&fd, sys::Rights::Input)?;
                 w.send(&ToWorker::Init { mode: Mode::Load, limits: self.opts.limits.clone() }, &[&fd])?;
             }
             Source::Feed(tracks) => {
@@ -420,6 +432,9 @@ impl<S: Sink> Player<S> {
                 let count = self.opts.buffers.clamp(3, BUFFERS_MAX);
                 match self.sink.layer(format, lw, lh, count) {
                     Ok(fds) if fds.len() == count as usize => {
+                        let Ok(fds) = fds.iter().map(|f| sys::restricted(f, sys::Rights::Shm)).collect::<io::Result<Vec<_>>>() else {
+                            return self.worker_lost();
+                        };
                         let refs: Vec<&OwnedFd> = fds.iter().collect();
                         let ok = self.w.as_ref().map(|w| w.send(&ToWorker::Buffers { format, width: lw, height: lh, count }, &refs).is_ok()).unwrap_or(false);
                         if !ok {
@@ -443,6 +458,7 @@ impl<S: Sink> Player<S> {
                 // One second of PCM between the worker and us.
                 match PcmRing::create(rate, channels) {
                     Ok((ring, fd)) => {
+                        let Ok(fd) = sys::restricted(&fd, sys::Rights::Shm) else { return self.worker_lost() };
                         let ok = self.w.as_ref().map(|w| w.send(&ToWorker::PcmRing, &[&fd]).is_ok()).unwrap_or(false);
                         if !ok {
                             return self.worker_lost();

@@ -278,3 +278,54 @@ pub fn kill(pid: u32) {
         libc::kill(pid as libc::pid_t, libc::SIGKILL);
     }
 }
+
+/// What a descriptor handed to the worker may be used for.
+#[derive(Clone, Copy, Debug)]
+pub enum Rights {
+    /// The `Load` input: read, seek, fstat.
+    Input,
+    /// Shared memory: map read-write, fstat.
+    Shm,
+    /// The worker's socket: read, write, poll.
+    Socket,
+}
+
+/// A duplicate of `fd` that can do only `rights` (FreeBSD Capsicum
+/// `cap_rights_limit`), for passing to the worker: rights travel with a
+/// descriptor, so the worker can't widen them. Elsewhere a plain duplicate.
+pub fn restricted(fd: &OwnedFd, rights: Rights) -> io::Result<OwnedFd> {
+    let dup = fd.try_clone()?;
+    limit(&dup, rights)?;
+    Ok(dup)
+}
+
+/// Narrow `fd` itself to `rights`.
+pub fn limit(fd: &OwnedFd, rights: Rights) -> io::Result<()> {
+    #[cfg(target_os = "freebsd")]
+    {
+        let bits = match rights {
+            Rights::Input => [libc::CAP_READ, libc::CAP_SEEK, libc::CAP_FSTAT],
+            Rights::Shm => [libc::CAP_MMAP_RW, libc::CAP_FSTAT, libc::CAP_FSTAT],
+            Rights::Socket => [libc::CAP_READ, libc::CAP_WRITE, libc::CAP_EVENT],
+        };
+        // SAFETY: __cap_rights_init takes a zero-terminated list of rights
+        // into a cap_rights_t we own; cap_rights_limit only reads it.
+        unsafe {
+            let mut r: libc::cap_rights_t = std::mem::zeroed();
+            libc::__cap_rights_init(libc::CAP_RIGHTS_VERSION, &mut r, bits[0], bits[1], bits[2], 0u64);
+            if libc::cap_rights_limit(fd.as_raw_fd(), &r) != 0 {
+                return Err(io::Error::last_os_error());
+            }
+        }
+    }
+    #[cfg(not(target_os = "freebsd"))]
+    let _ = (fd, rights);
+    Ok(())
+}
+
+/// Whether `sock` has something to read within `ms` milliseconds.
+pub fn readable(sock: &UnixStream, ms: i32) -> bool {
+    let mut p = libc::pollfd { fd: sock.as_raw_fd(), events: libc::POLLIN, revents: 0 };
+    // SAFETY: one pollfd we own.
+    unsafe { libc::poll(&mut p, 1, ms) > 0 }
+}
