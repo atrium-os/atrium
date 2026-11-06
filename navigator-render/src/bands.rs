@@ -219,6 +219,7 @@ pub struct Banded<'f> {
     done: HashMap<Handle, (U, u32)>,
     lines_before: HashMap<Handle, (U, u32)>,
     at: HashMap<Handle, U>,
+    firsts: HashMap<Handle, u32>,
     shapes: crate::ShapeCache,
     finals: HashMap<Handle, U>,
     span_starts: SpanStarts,
@@ -260,9 +261,12 @@ impl<'f> Banded<'f> {
         let prep = html::prepare(html, fonts, env);
         Banded { prep, fonts, env: env.clone(), subs: subs.clone(), band_h: band_h.max(PX_MIN),
                  checkpoints: vec![Checkpoint { at: None, y: 0, vector_budget: crate::path::DOCUMENT_SEGMENT_SHARE }],
-                 bands: vec![], done: HashMap::new(), lines_before: HashMap::new(), at: HashMap::new(), shapes: Default::default(), finals: HashMap::new(), span_starts: HashMap::new(), complete: false, bottom: 0, root_h: 0,
+                 bands: vec![], done: HashMap::new(), lines_before: HashMap::new(), at: HashMap::new(), firsts: Default::default(), shapes: Default::default(), finals: HashMap::new(), span_starts: HashMap::new(), complete: false, bottom: 0, root_h: 0,
                  progress: 0.0, stats: BandStats::default(), whole: None }
     }
+
+    /// A block, as its tag path (review tooling).
+    pub fn describe(&self, h: Handle) -> String { self.prep.describe(h) }
 
     /// The bands laid out so far (the first pass's frontier).
     pub fn laid_out(&self) -> usize { self.bands.len() }
@@ -341,6 +345,7 @@ impl<'f> Banded<'f> {
         r.vector_budget = cp.vector_budget;
         if let Some(at) = cp.at { r.resume_path = self.prep.ancestors(at); r.resume_at = Some(at) }
         r.at = std::mem::take(&mut self.at);
+        r.firsts = std::mem::take(&mut self.firsts);
         // Words already shaped stay shaped; the cache is bounded (it is
         // per word, so a document's vocabulary, not its length).
         if self.shapes.borrow().len() > 200_000 { self.shapes.borrow_mut().clear() }
@@ -353,6 +358,7 @@ impl<'f> Banded<'f> {
         self.done = std::mem::take(&mut r.done);
         self.lines_before = std::mem::take(&mut r.lines_before);
         self.at = std::mem::take(&mut r.at);
+        self.firsts = std::mem::take(&mut r.firsts);
         self.finals = std::mem::take(&mut r.finals);
         if first { self.stats.first_runs += 1 } else { self.stats.reruns += 1 }
         self.stats.suppressed += r.suppressed as u64;

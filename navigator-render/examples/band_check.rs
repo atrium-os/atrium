@@ -114,6 +114,19 @@ fn main() {
         b.settle();
         let banded_ms = t.elapsed().as_secs_f64() * 1e3;
         let n = b.laid_out();
+        if let Ok(y) = std::env::var("BAND_PROBE") {
+            let y: i64 = y.parse::<i64>().unwrap() * PX;
+            let k = b.band_at(y).unwrap();
+            for kk in k.saturating_sub(1)..=k + 1 {
+                let r = b.bands[kk].range;
+                eprintln!("band {kk}: {}..{} checkpoint {:?} {}", r.0 / PX, r.1 / PX, b.checkpoints.get(kk).map(|c| (c.at, c.y / PX)),
+                          b.checkpoints.get(kk).and_then(|c| c.at).map(|h| b.describe(h)).unwrap_or_default());
+            }
+            b.ensure(k);
+            let c = b.composite(k).unwrap();
+            for run in &c.runs { if (run.y - y).abs() < 40 * PX { eprintln!("  run {:?} at {} {}", run.text, run.x / PX, run.y / PX) } }
+            for run in &full.runs { if (run.y - y).abs() < 40 * PX { eprintln!("  whole run {:?} at {} {}", run.text, run.x / PX, run.y / PX) } }
+        }
         let (ogroups, overlap) = overlapping_groups(&full);
         let (rtext, rimg) = rotated(&full);
         let idx = bands::index(&full, 64 * PX);
@@ -134,10 +147,13 @@ fn main() {
             maxg = maxg.max(groups_in(&b.group(k).unwrap()));
             if pixels {
                 let (y0, y1) = b.bands[k].range;
+                // (At most 2,400 rows of a band: a one-band document is the whole page.)
                 let (y0, y1) = ((y0.max(0) + PX - 1) / PX, y1.min(full.height) / PX);
+                let y1 = y1.min(y0 + 2400);
                 if y0 < y1 {
                     checked += 1;
-                    let mine = rows(&c, &fonts, y0, y1);
+                    let ci = bands::index(&c, 64 * PX);
+                    let mine = rows(&bands::scene_of(&c, &ci.nodes_in(y0 * PX, y1 * PX)), &fonts, y0, y1);
                     let theirs = rows(&bands::scene_of(&full, &idx.nodes_in(y0 * PX, y1 * PX)), &fonts, y0, y1);
                     if mine != theirs {
                         differing += 1;
