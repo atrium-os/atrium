@@ -1,0 +1,22 @@
+[package]
+name        = "atrium-player"
+version     = "0.1.0"
+edition.workspace = true
+license.workspace = true
+description = "atrium-player's supervisor: the media-player role's process that never parses media (docs/spec/atrium-player.md §2), and the worker wire."
+publish     = false
+
+[lib]
+name = "atrium_player"
+path = "src/lib.rs"
+
+[[bin]]
+name = "atrium-player"
+path = "src/bin/atrium-player.rs"
+
+[dependencies]
+libc     = "0.2"
+serde    = { version = "1", features = ["derive"] }
+postcard = { version = "1", features = ["use-std"] }
+# --headless prints frame hashes comparable with ffmpeg's framemd5.
+md-5     = "0.10"

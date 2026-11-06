@@ -21,6 +21,9 @@ $ff $src -c:v libvpx-vp9 -b:v 200k -g 24 -c:a libopus -b:a 48k -strict -2 \
 # Reference hashes of every decoded frame (planar, as the decoder outputs).
 for f in *.webm *.mp4; do
     $ff -i "$f" -map 0:v -f framemd5 "$f.video.framemd5"
+    # What atrium-player puts in a video layer: NV12, or P010 for 10-bit.
+    case $f in *10bit*) pf=p010le ;; *) pf=nv12 ;; esac
+    $ff -i "$f" -map 0:v -pix_fmt $pf -f framemd5 "$f.layer.framemd5"
     # The video packets as the container states them: pts (s), key flag.
     ffprobe -v error -select_streams v -show_entries packet=pts_time,flags -of csv=p=0 "$f" \
         > "$f.video.packets"
