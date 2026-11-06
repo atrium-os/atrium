@@ -65,6 +65,8 @@ pub struct Window {
     pub height: f32,
     /// Where slot placements go (Limen, or a test's stand-in).
     binder: Option<Box<dyn crate::slot::SlotBinder>>,
+    /// frescod's embed token for this window (limen.md §1), once it came.
+    embed_token: Option<[u8; 16]>,
 }
 
 /// Default socket path, overridable with `FRESCO_SOCKET`.
@@ -107,6 +109,7 @@ impl Window {
             width: w as f32,
             height: h as f32,
             binder: None,
+            embed_token: None,
         })
     }
 
@@ -139,6 +142,12 @@ impl Window {
         Ok(())
     }
 
+    /// frescod's embed token for this window: what limend names it by,
+    /// for [`crate::embed::Embeds::request`] (as a parent) or
+    /// `limen::client::Child::ready` (as a child). `None` until frescod
+    /// has sent it, shortly after the window opens.
+    pub fn embed_token(&self) -> Option<[u8; 16]> { self.embed_token }
+
     /// Install the binder that embeds other processes' surfaces in this
     /// window's slots ([`crate::slot`]).
     pub fn set_slot_binder(&mut self, b: Box<dyn crate::slot::SlotBinder>) {
@@ -150,6 +159,9 @@ impl Window {
     /// in logical pixels, the surface multiplies at emission).
     fn window_event<V: View>(&mut self, ev: &fresco_client::Event, app: &mut App<V>) {
         match *ev {
+            fresco_client::Event::EmbedToken { window_id, token } if window_id == self.surface.window_id() => {
+                self.embed_token = Some(token);
+            }
             fresco_client::Event::Resized { width, height, .. } => {
                 self.width = width as f32;
                 self.height = height as f32;

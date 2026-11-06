@@ -9,27 +9,14 @@
 //! - `LIMEN_USER`: limend's user name as worker rules name it (default `_limen`).
 //!
 //! User-role children start through portcullisd's `ExecInstance`
-//! ([`limen::launch`]). frescod's slot op (limen.md §12 L2) is not wired yet:
-//! binds are refused and logged, so an embed stays unattached instead of
-//! half-working.
+//! ([`limen::launch`]). Slots are bound with frescod's slot op on its
+//! activation socket (`LIMEN_FRESCOD_ACTIVATION`, default
+//! /var/run/atrium/fresco-activation.sock; [`limen::fresco`]).
 
 use std::os::fd::AsRawFd;
 use std::os::unix::net::UnixListener;
 
-use limen::catalogue::SlotKind;
-use limen::daemon::{Compositor, Shared};
-use limen::proto::WindowToken;
-
-struct NoSlotsYet;
-impl Compositor for NoSlotsYet {
-    fn bind(&mut self, _: WindowToken, _: WindowToken, _: SlotKind, rect: Option<[f32; 4]>) -> Result<(u32, u32), u8> {
-        if rect.is_some() {
-            eprintln!("limend: frescod's slot op is not built yet (limen.md §12 L2)");
-        }
-        Err(u8::MAX)
-    }
-}
-
+use limen::daemon::Shared;
 
 fn main() -> std::io::Result<()> {
     let path = std::env::var("LIMEN_SOCKET").unwrap_or_else(|_| limen::client::DEFAULT_SOCKET.into());
@@ -45,7 +32,7 @@ fn main() -> std::io::Result<()> {
     let defaults = Box::new(move |_user: &str, role: &str| {
         defaults.iter().find(|(r, _)| r == role).map(|(_, a)| a.clone())
     });
-    let shared = Shared::new(Box::new(NoSlotsYet), Box::new(limen::launch::Portcullis::new(std::env::var("LIMEN_USER").unwrap_or_else(|_| "_limen".into()))), resolve, defaults);
+    let shared = Shared::new(Box::new(limen::fresco::Frescod::new(std::env::var("LIMEN_FRESCOD_ACTIVATION").unwrap_or_else(|_| limen::fresco::DEFAULT_SOCKET.into()))), Box::new(limen::launch::Portcullis::new(std::env::var("LIMEN_USER").unwrap_or_else(|_| "_limen".into()))), resolve, defaults);
     let _ = std::fs::remove_file(&path);
     let listener = UnixListener::bind(&path)?;
     eprintln!("limend: listening on {path}");
