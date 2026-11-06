@@ -313,6 +313,17 @@ pub struct ItemMeta {
     /// Unix seconds.
     pub created: u64,
     pub updated: u64,
+    /// [`flags`] bits.
+    pub flags: u32,
+}
+
+/// Item flags, kept in the sealed metadata.
+pub mod flags {
+    /// The user granted this app-held item's value to its app (arca.md §4.3).
+    /// Set only from Arca's trusted UI, never by the app.
+    pub const APP_HELD_GRANTED: u32 = 1 << 0;
+    /// All defined bits; anything else in a record is corruption.
+    pub const ALL: u32 = APP_HELD_GRANTED;
 }
 
 /// A new item as a client hands it in. The value is copied into locked

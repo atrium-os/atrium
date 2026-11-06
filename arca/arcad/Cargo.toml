@@ -1,0 +1,25 @@
+[package]
+name        = "arcad"
+version     = "0.1.0"
+edition     = "2021"
+license     = "MIT OR Apache-2.0"
+publish     = false
+description = "Arca, the system secret store (docs/spec/arca.md): the daemon. Identity from the kernel peer uid and the launch registry; keys used, never read; app-held values only with a user grant. No network."
+
+[lib]
+name = "arcad"
+path = "src/lib.rs"
+
+[[bin]]
+name = "arcad"
+path = "src/bin/arcad.rs"
+
+[dependencies]
+arca-store      = { path = "../arca-store" }
+portcullis-peer = { path = "../../portcullis/portcullis-peer" }
+ed25519-dalek   = { version = "2", default-features = false, features = ["zeroize"] }
+libc            = "0.2"
+
+[dev-dependencies]
+tempfile = "3"
+libc = "0.2"

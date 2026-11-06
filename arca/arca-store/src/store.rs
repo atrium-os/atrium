@@ -525,6 +525,7 @@ impl Store {
         w.u64(m.updated);
         w.str(&m.account);
         w.bytes(&m.scope);
+        w.u32(m.flags);
         w.buf
     }
 
@@ -536,6 +537,10 @@ impl Store {
         let updated = r.u64()?;
         let account = r.str(caps::ACCOUNT)?.to_string();
         let scope = r.bytes(caps::SCOPE)?.to_vec();
+        let item_flags = r.u32()?;
+        if item_flags & !flags::ALL != 0 {
+            return Err(Error::Corrupt("unknown flags"));
+        }
         r.end()?;
         Ok(ItemMeta {
             id,
@@ -549,6 +554,7 @@ impl Store {
             scope,
             created,
             updated,
+            flags: item_flags,
         })
     }
 
@@ -588,6 +594,7 @@ impl Store {
             scope: n.scope.to_vec(),
             created: t,
             updated: t,
+            flags: 0,
         };
         let rec = self.seal_item(&gid, &meta, n.value)?;
         self.groups.get_mut(&gid).unwrap().items.push(rec);
@@ -697,6 +704,32 @@ impl Store {
             meta.account = a.into();
         }
         let rec = self.seal_item(&gid, &meta, value)?;
+        let old = std::mem::replace(&mut self.groups.get_mut(&gid).unwrap().items[idx], rec);
+        if let Err(e) = self.write_group(&gid) {
+            self.groups.get_mut(&gid).unwrap().items[idx] = old;
+            return Err(e);
+        }
+        Ok(meta)
+    }
+
+    /// Set or clear flag bits. Same version rule as [`Store::update`]: the
+    /// value is re-sealed under the new version.
+    pub fn set_flags(&mut self, id: &ItemId, who: &Access<'_>, set: u32, clear: u32) -> Result<ItemMeta, Error> {
+        if (set | clear) & !flags::ALL != 0 {
+            return Err(Error::BadInput("flags"));
+        }
+        let (gid, idx) = self.locate(id, who)?;
+        let class = self.groups[&gid].class;
+        if class != Class::AfterFirstUnlock && self.master.is_none() {
+            return Err(Error::Locked);
+        }
+        let verified = (class == Class::VerifyEachUse).then(UserVerified::vouched_by_vestibulum);
+        let (mut meta, value) = self.release(id, who, verified)?;
+        meta.version += 1;
+        meta.updated = now();
+        meta.flags = (meta.flags | set) & !clear;
+        let rec = self.seal_item(&gid, &meta, value.as_ref())?;
+        drop(value);
         let old = std::mem::replace(&mut self.groups.get_mut(&gid).unwrap().items[idx], rec);
         if let Err(e) = self.write_group(&gid) {
             self.groups.get_mut(&gid).unwrap().items[idx] = old;
