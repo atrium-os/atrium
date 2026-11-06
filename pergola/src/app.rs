@@ -52,6 +52,12 @@ pub struct App<V: View> {
     /// The autofocus layer that is up (a dialog, an open menu): Tab stays
     /// inside it, and keys no one in it took go to it.
     modal: Option<NodeId>,
+    /// When the pointer came onto `hovered`.
+    hover_since: f64,
+    /// The node whose tooltip is up.
+    tip: Option<NodeId>,
+    /// Until when a tooltip that just closed lets the next open at once.
+    tip_warm_until: f64,
     /// Current hover target — nearest interactive ancestor under the
     /// pointer. Drives widgets' hover looks via `InteractionState`.
     hovered: Option<NodeId>,
@@ -105,6 +111,9 @@ impl<V: View> App<V> {
             dragging: None,
             focus_return: None,
             modal: None,
+            hover_since: 0.0,
+            tip: None,
+            tip_warm_until: f64::NEG_INFINITY,
             hovered: None,
             pressed_vis: None,
             dirty,
@@ -147,6 +156,37 @@ impl<V: View> App<V> {
     /// Whether something is moving (a fling, an eased jump, a zoom
     /// settling): the loop should call [`App::frame`] every vsync.
     pub fn wants_frame(&self) -> bool { self.animating }
+
+    /// When the loop should wake with no input (ms on the app clock): a
+    /// tooltip waiting out its delay.
+    pub fn wake_at(&self) -> Option<f64> {
+        let h = self.hovered?;
+        if self.tip == Some(h) || !self.interactions.get(h).is_some_and(|h| h.tooltip) {
+            return None;
+        }
+        let at = if self.now_ms <= self.tip_warm_until { self.now_ms } else { self.hover_since + TOOLTIP_DELAY_MS };
+        at.is_finite().then_some(at)
+    }
+
+    /// Open the tooltip whose delay has run out.
+    fn run_timers(&mut self) {
+        if self.wake_at().is_some_and(|at| at <= self.now_ms) {
+            self.tip = self.hovered;
+            self.touch();
+        }
+    }
+
+    /// Close the tooltip (the pointer left, a press, a key). After a press
+    /// or a key it stays shut until the pointer moves to another node.
+    fn close_tip(&mut self, warm: bool) {
+        if !warm {
+            self.hover_since = f64::INFINITY;
+        }
+        if self.tip.take().is_some() {
+            self.tip_warm_until = if warm { self.now_ms + TOOLTIP_WARM_MS } else { f64::NEG_INFINITY };
+            self.touch();
+        }
+    }
 
     /// Step every `on_frame` handler at the current time. Their state
     /// changes mark the app dirty; the next tick renders them.
@@ -210,6 +250,7 @@ impl<V: View> App<V> {
     /// list and skips the render pass entirely. If dirty, renders,
     /// diffs, swaps trees, clears the flag, and returns the deltas.
     pub fn tick(&mut self) -> Vec<NodeDelta> {
+        self.run_timers();
         if !self.dirty.swap(false, Ordering::AcqRel) {
             return Vec::new();
         }
@@ -218,6 +259,7 @@ impl<V: View> App<V> {
             pressed: self.pressed_vis,
             focused: self.focused,
             focus_visible: self.focus_visible,
+            tip: self.tip,
         };
         let (mut next, interactions) = render_continuing(&self.view, self.theme, state, &mut self.prev_tree);
         // Run layout from each root in the tree (a render pass may
@@ -394,6 +436,7 @@ impl<V: View> App<V> {
         match &event {
             Event::PointerDown { at } => {
                 self.pointer = Some(*at);
+                self.close_tip(false);
                 let hit = hit_test(&self.prev_tree, *at);
                 // A press inside a scroll view catches its fling.
                 self.scroll_to(hit, crate::interaction::ScrollKind::Press);
@@ -449,9 +492,11 @@ impl<V: View> App<V> {
                 // Hover target = nearest interactive ancestor (clickable
                 // or focusable) under the pointer.
                 let hover = hit_test(&self.prev_tree, *at)
-                    .and_then(|id| self.bubble_to(id, |h| h.on_click.is_some() || h.focusable));
+                    .and_then(|id| self.bubble_to(id, |h| h.on_click.is_some() || h.focusable || h.tooltip));
                 if self.hovered != hover {
                     self.hovered = hover;
+                    self.hover_since = self.now_ms;
+                    self.close_tip(true);
                     self.touch();
                 }
             }
@@ -473,6 +518,9 @@ impl<V: View> App<V> {
             }
             Event::Key { kind, key, modifiers, chars } => {
                 self.modifiers = *modifiers;
+                if *kind == KeyEventKind::Down {
+                    self.close_tip(false);
+                }
                 // Tab is focus traversal, owned by the App; focused
                 // widgets never see it.
                 if *kind == KeyEventKind::Down && *key == Key::Tab {
@@ -527,6 +575,11 @@ impl<V: View> App<V> {
 
 /// Keys a scroll view acts on: arrows, Page Up/Down, Home/End, Space,
 /// and Ctrl with `+`, `=`, `-`, `0`.
+/// Hover this long before a tooltip opens (visual language §14.2).
+pub const TOOLTIP_DELAY_MS: f64 = 500.0;
+/// After one closes, the next opens at once for this long.
+pub const TOOLTIP_WARM_MS: f64 = 300.0;
+
 fn is_scroll_key(key: Key, chars: &str, m: &crate::event::Modifiers) -> bool {
     match key {
         Key::Up | Key::Down | Key::PageUp | Key::PageDown | Key::Home | Key::End => true,
@@ -707,5 +760,49 @@ mod tests {
 
         // Now clean again.
         assert!(!app.is_dirty());
+    }
+
+    struct Tipped;
+    impl View for Tipped {
+        fn render(&self, ctx: &mut Ctx) {
+            crate::widgets::Button::ghost("A").at(0.0, 0.0).width(40.0).tooltip("First").on_click(|| {}).render(ctx);
+            crate::widgets::Button::ghost("B").at(100.0, 0.0).width(40.0).tooltip("Second").on_click(|| {}).render(ctx);
+        }
+    }
+
+    fn tip_text(app: &App<Tipped>) -> Option<String> {
+        app.tree().iter().find_map(|(_, n)| match n {
+            Node::Text { content, .. } if content == "First" || content == "Second" => Some(content.clone()),
+            _ => None,
+        })
+    }
+
+    #[test]
+    fn a_tooltip_waits_for_the_hover_delay_and_moves_on_at_once() {
+        let mut app = App::new(Tipped);
+        app.tick();
+        app.set_time(1000.0);
+        app.handle_event(Event::PointerMove { at: crate::geom::Point::new(20.0, 10.0) });
+        app.tick();
+        assert_eq!(tip_text(&app), None, "not yet");
+        assert_eq!(app.wake_at(), Some(1500.0), "the loop wakes for it");
+        app.set_time(1499.0);
+        app.tick();
+        assert_eq!(tip_text(&app), None);
+        app.set_time(1500.0);
+        app.tick();
+        assert_eq!(tip_text(&app).as_deref(), Some("First"));
+        // Straight to the next one: no second wait.
+        app.set_time(1600.0);
+        app.handle_event(Event::PointerMove { at: crate::geom::Point::new(120.0, 10.0) });
+        app.tick();
+        assert_eq!(tip_text(&app).as_deref(), Some("Second"));
+        // A press closes it, and it stays shut while the pointer stays.
+        app.handle_event(Event::PointerDown { at: crate::geom::Point::new(120.0, 10.0) });
+        app.handle_event(Event::PointerUp { at: crate::geom::Point::new(120.0, 10.0) });
+        app.set_time(5000.0);
+        app.tick();
+        assert_eq!(tip_text(&app), None);
+        assert_eq!(app.wake_at(), None);
     }
 }

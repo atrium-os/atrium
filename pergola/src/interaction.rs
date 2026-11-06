@@ -60,6 +60,8 @@ pub struct Handlers {
     pub focusable: bool,
     /// Take focus when this node first appears ([`crate::view::Ctx::autofocus`]).
     pub autofocus: bool,
+    /// Shows a tooltip on hover ([`crate::view::Ctx::tooltip`]).
+    pub tooltip: bool,
     /// Wheel, navigation keys and presses for a scroll view.
     pub on_scroll: Option<ScrollHandler>,
     /// A per-frame step (a fling, an eased jump, a zoom settling).

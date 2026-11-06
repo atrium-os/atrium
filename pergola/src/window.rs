@@ -186,7 +186,10 @@ impl Window {
     /// Frames are paced at 120 Hz; the server presents at its own vsync.
     fn wait_for<V: View>(&self, app: &App<V>, cap: Option<Duration>) -> Option<Duration> {
         if !app.wants_frame() {
-            return cap;
+            // A timer (a tooltip's delay) bounds the wait.
+            let Some(at) = app.wake_at() else { return cap };
+            let d = Duration::from_secs_f64((at - self.now_ms()).max(0.0) / 1e3);
+            return Some(cap.map_or(d, |c| c.min(d)));
         }
         const FRAME: Duration = Duration::from_micros(8_333);
         let since = Duration::from_secs_f64((self.now_ms() - app.time()).max(0.0) / 1e3);

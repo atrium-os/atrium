@@ -40,6 +40,8 @@ pub struct Button {
     /// Outer rect — width is fixed (caller chooses); height defaults
     /// to `size::BUTTON_HEIGHT_DEFAULT` if `rect.size.h == 0.0`.
     pub rect: Rect,
+    /// Shown after a hover (an icon-only button names itself here).
+    pub tooltip: Option<String>,
 }
 
 impl Button {
@@ -49,6 +51,7 @@ impl Button {
             variant: Variant::Primary,
             on_click: None,
             rect: Rect::new(0.0, 0.0, 0.0, size::BUTTON_HEIGHT_DEFAULT),
+            tooltip: None,
         }
     }
 
@@ -62,6 +65,11 @@ impl Button {
 
     pub fn ghost(label: impl Into<String>) -> Self {
         Self { variant: Variant::Ghost, ..Self::primary(label) }
+    }
+
+    pub fn tooltip(mut self, t: impl Into<String>) -> Self {
+        self.tooltip = Some(t.into());
+        self
     }
 
     pub fn on_click<F: Fn() + Send + Sync + 'static>(mut self, f: F) -> Self {
@@ -201,6 +209,9 @@ impl View for Button {
             let cb = Arc::clone(cb);
             ctx.on_click(bg_id, move || cb());
             ctx.focusable(bg_id);
+        }
+        if let Some(tip) = &self.tooltip {
+            ctx.tooltip(bg_id, tip.clone());
         }
     }
 }

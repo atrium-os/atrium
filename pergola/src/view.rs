@@ -31,6 +31,8 @@ pub struct InteractionState {
     pub focused: Option<NodeId>,
     /// Focus came from the keyboard: draw the focus ring.
     pub focus_visible: bool,
+    /// The node whose tooltip is showing.
+    pub tip: Option<NodeId>,
 }
 
 /// Per-render context handed to `View::render`. Owns the in-construction
@@ -159,6 +161,29 @@ impl<'a> Ctx<'a> {
             }
             self.parent_stack = saved;
         }
+    }
+
+    /// Give `id` a tooltip (visual language §14.2): `bg-inverse`, `sm`
+    /// `text-inverse`, 8px under the node, after 500 ms of hover, at once
+    /// when moving from one tooltip to the next. Drawn as an overlay.
+    pub fn tooltip(&mut self, id: NodeId, text: impl Into<String>) {
+        self.interactions.entry(id).tooltip = true;
+        if self.state.tip != Some(id) {
+            return;
+        }
+        let Some(anchor) = self.tree.get(id).map(|n| n.rect()) else { return };
+        let text = text.into();
+        self.overlay(move |ctx| {
+            use crate::theme::{font, radius, space, type_size, Weight};
+            let t = ctx.theme;
+            let style = crate::node::TextStyle { family: font::SANS.into(), size: type_size::SM, weight: Weight::Regular, color: t.text_inverse() };
+            let m = Node::measure_text(&text, &style);
+            let (px, py) = (space::XS, space::XXS);
+            let (w, h) = (m.w + 2.0 * px, m.h + 2.0 * py);
+            let r = crate::geom::Rect::new(anchor.x() + (anchor.w() - w) / 2.0, anchor.y() + anchor.h() + space::XS, w, h);
+            let bg = ctx.tree.insert(None, Node::Rect { rect: r, fill: t.bg_inverse(), radius: radius::XS });
+            ctx.tree.insert(Some(bg), Node::Text { rect: crate::geom::Rect::new(r.x() + px, r.y() + py, m.w, m.h), content: text, style });
+        });
     }
 
     /// Give `id` keyboard focus when it first appears (an opened menu or
