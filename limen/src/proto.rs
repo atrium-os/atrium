@@ -18,6 +18,9 @@ pub mod op {
     pub const SEND: u16 = 0x03;
     pub const DETACH: u16 = 0x04;
     pub const SET_VISIBLE: u16 = 0x05;
+    /// [`Send`](super::Send) with one descriptor in the same frame, for a
+    /// role that takes one (catalogue `takes_fd`).
+    pub const SEND_FD: u16 = 0x06;
     // child or system provider
     pub const PROVIDE: u16 = 0x10;
     pub const READY: u16 = 0x11;
@@ -41,6 +44,8 @@ pub mod refusal {
     pub const NOT_ATTACHED: u8 = 10;
     pub const NOT_AN_APP: u8 = 11;
     pub const RATE: u8 = 12;
+    /// The descriptor isn't a read-only regular file or pipe.
+    pub const BAD_FD: u8 = 13;
 }
 
 pub type EmbedId = u64;
@@ -113,6 +118,9 @@ pub enum ChildEvent {
     /// registry itself. Data, never authority.
     Attach { embed: EmbedId, role: String, parent_app: String, parent_uid: u32 },
     Message { embed: EmbedId, bytes: Vec<u8> },
+    /// A message with one descriptor, read-only and narrowed by limend:
+    /// take it with [`Child::take_fd`](crate::client::Child::take_fd).
+    MessageFd { embed: EmbedId, bytes: Vec<u8> },
     Suspended { embed: EmbedId },
     Resumed { embed: EmbedId },
     /// The parent is gone or detached it: stop, the jail ends shortly.

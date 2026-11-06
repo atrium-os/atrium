@@ -245,8 +245,12 @@ Fresco's layers land.
   CanPlay, appends acknowledged one at a time, buffered ranges, Ready, the poster, red then
   blue in the slot, Time, Ended, a seek while paused, suspend and resume, a malformed
   message dropped, and detach ending the player.
-- Not in M5: `Load` gives `UNSUPPORTED` (for a descriptor, limend doesn't carry descriptors
-  with messages yet) or `NETWORK` (for a URL, there is no jailed fetcher yet). The controls
+- `Load` by descriptor: limend carries one read-only file or pipe with a message for roles
+  that take one (limen.md §2.2, `SEND_FD`), checks it and narrows it with `cap_rights_limit`.
+  The player plays it like a local file. The probe's second embed loads `red-blue.webm`
+  this way, after limend refuses a socket in its place: 24/24 checks pass in the VM. limen's
+  daemon tests (11) pass on Linux and FreeBSD.
+- Not in M5: `Load` of a URL gives `NETWORK`, because there is no jailed fetcher yet. The controls
   have no time text, because text waits for Pergola's in-app shaping. They are drawn
   directly, not with Pergola widgets, because a Pergola window can't hold a video layer
   yet. There is one source per embed; a new `src` is a new embed.

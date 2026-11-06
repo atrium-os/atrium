@@ -14,7 +14,8 @@
 //! pieces and buffered, a poster frame shows before Play, the video plays
 //! red then blue in the slot, Time advances, Ended arrives, a seek while
 //! paused shows its frame, a malformed message is dropped, a hidden slot
-//! pauses, and detach ends the player.
+//! pauses, and detach ends the player. Then a second embed is given the file
+//! by descriptor (`Load`), after limend refuses a socket in its place.
 use std::os::fd::OwnedFd;
 use std::os::unix::net::UnixStream;
 use std::path::PathBuf;
@@ -268,6 +269,38 @@ fn main() {
         std::thread::sleep(Duration::from_millis(100));
     }
     p.check(exited, "detach ends the player");
+
+    // A second embed, given the whole file by descriptor (Load).
+    let e2 = p.app.request("media-player", token).expect("request");
+    p.app.place(e2, Some(SLOT)).unwrap();
+    p.e = e2;
+    p.pending.clear();
+    let until = Instant::now() + Duration::from_secs(20);
+    let mut attached = false;
+    while Instant::now() < until && !attached {
+        attached = matches!(p.app.poll(Duration::from_millis(100)), Ok(Some(ParentEvent::Attached { embed })) if embed == e2);
+    }
+    p.check(attached, "a second player is bound into the slot");
+    {
+        use std::os::fd::AsFd;
+        let (sock, _peer) = UnixStream::pair().unwrap();
+        let r = p.app.send_fd(e2, ToChild::Load { source: limen::media_player::Source::Fd, mime: "video/webm".into() }.encode(), sock.as_fd());
+        p.check(matches!(r, Err(limen::client::Error::Refused(limen::proto::refusal::BAD_FD))), &format!("limend refuses a socket as the Load descriptor ({r:?})"));
+        let f = std::fs::File::open(&clip).unwrap();
+        let r = p.app.send_fd(e2, ToChild::Load { source: limen::media_player::Source::Fd, mime: "video/webm".into() }.encode(), f.as_fd());
+        p.check(r.is_ok(), &format!("Load with the clip's descriptor ({r:?})"));
+    }
+    let r = p.wait(Duration::from_secs(10), |m| matches!(m, ToParent::Ready { .. }));
+    p.check(matches!(r, Some(ToParent::Ready { width: 160, height: 96, .. })), &format!("Ready from the loaded file ({r:?})"));
+    let c = slot_colour(Duration::from_secs(5), red);
+    p.check(c.is_some_and(red), &format!("its red poster frame ({c:?})"));
+    p.send(ToChild::Play);
+    let c = slot_colour(Duration::from_secs(10), blue);
+    p.check(c.is_some_and(blue), &format!("then blue ({c:?})"));
+    let r = p.wait(Duration::from_secs(15), |m| matches!(m, ToParent::Ended));
+    p.check(r.is_some(), "and Ended");
+    p.app.detach(e2).unwrap();
+    std::thread::sleep(Duration::from_millis(500));
     for c in procs.lock().unwrap().iter_mut() {
         let _ = c.kill();
     }

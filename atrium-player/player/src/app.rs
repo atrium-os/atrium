@@ -18,6 +18,9 @@ use crate::wire::err;
 #[derive(Debug)]
 pub enum HostEvent {
     Msg(ToChild),
+    /// `Load` with its descriptor: a read-only file or pipe, checked and
+    /// narrowed by limend.
+    Load(std::os::fd::OwnedFd),
     /// The slot is hidden: pause, and keep the position.
     Suspend,
     Resume,
@@ -70,6 +73,14 @@ impl Host for LimenHost {
                     Some(m) => out.push(HostEvent::Msg(m)),
                     None => self.dropped += 1,
                 },
+                ChildEvent::MessageFd { embed, bytes } => {
+                    // Taken whatever it is, so none is left for a later message.
+                    let fd = self.child.take_fd();
+                    match (embed == self.embed, ToChild::decode(&bytes), fd) {
+                        (true, Some(ToChild::Load { source: LoadSource::Fd, .. }), Some(fd)) => out.push(HostEvent::Load(fd)),
+                        _ => self.dropped += 1,
+                    }
+                }
                 ChildEvent::Suspended { embed } if embed == self.embed => out.push(HostEvent::Suspend),
                 ChildEvent::Resumed { embed } if embed == self.embed => out.push(HostEvent::Resume),
                 ChildEvent::Detaching { embed } if embed == self.embed => out.push(HostEvent::Gone),
@@ -228,6 +239,7 @@ impl<H: Host> App<H> {
                 }
                 return Ok(());
             }
+            HostEvent::Load(fd) => return self.start(Source::File(File::from(fd))),
             HostEvent::Msg(m) => m,
         };
         fn feed<H: Host>(app: &mut App<H>) -> Option<&mut Player<FrescoSink>> {
@@ -237,10 +249,9 @@ impl<H: Host> App<H> {
             app.player.as_mut()
         }
         match m {
-            ToChild::Load { source: LoadSource::Fd, .. } => {
-                // limend doesn't carry descriptors with messages yet.
-                self.host.emit(ToParent::Error { code: code::UNSUPPORTED })
-            }
+            // A `Load` of a descriptor comes as HostEvent::Load; without one
+            // it is out of place.
+            ToChild::Load { source: LoadSource::Fd, .. } => self.host.emit(ToParent::Error { code: code::STATE }),
             // No jailed fetcher in the player yet.
             ToChild::Load { source: LoadSource::Url(_), .. } => self.host.emit(ToParent::Error { code: code::NETWORK }),
             ToChild::OpenSource => self.start(Source::Feed(Vec::new()))?,

@@ -435,7 +435,8 @@ impl<S: Sink> Player<S> {
         self.sink.discontinuity();
         // A whole resource can start over where it was; a feed's bytes are
         // gone with the worker.
-        let restartable = matches!(self.source, Source::File(_)) && self.restarts == 0;
+        // (A pipe can't: what the last worker read is gone.)
+        let restartable = matches!(&self.source, Source::File(f) if f.metadata().is_ok_and(|m| m.is_file())) && self.restarts == 0;
         if restartable && self.start_worker().is_ok() {
             self.restarts += 1;
             self.audio_skip_until = self.audio_read_until;

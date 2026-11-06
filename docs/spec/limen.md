@@ -158,7 +158,7 @@ There are two ways to feed it.
 
 | direction | message | payload |
 |---|---|---|
-| parent → child | `Load` | `media: DocRef`, `mime` |
+| parent → child | `Load` | `source` (`Fd`: a descriptor passed with the message, see below; or `Url`, which the player fetches through its own jailed fetcher), `mime` |
 | parent → child | `OpenSource` | none: begins a segment feed |
 | parent → child | `AddTrack` | `track: u8` (at most 8), `mime` (an MSE type such as `video/webm; codecs="av01.0.08M.08"`) |
 | parent → child | `Append` | `track`, `bytes` (at most 60 KiB a message, inside limend's 64 KiB message cap; a parent splits a segment into several appends), `timestamp_offset: Option<f64>` |
@@ -183,6 +183,22 @@ There are two ways to feed it.
 | child → parent | `Error` | `code: u16` (`DECODE`, `UNSUPPORTED`, `TOO_BIG`, `STATE`, `NETWORK`) |
 
 The types are `limen::media_player` (atrium-player.md M0).
+
+**A file by descriptor.** `Load { source: Fd }` goes with `Parent::send_fd`, limend's
+`SEND_FD` op. The descriptor travels in the same frame as the message (`SCM_RIGHTS`), so the
+two can't be separated. Only a role whose catalogue entry says `takes_fd` may receive one,
+and today that is `media-player` alone. For any other role limend refuses `MALFORMED` and
+closes the descriptor. A message carries at most one descriptor. limend `fstat`s it and
+refuses anything but a regular file or a pipe opened read-only with `BAD_FD`. That rules out
+sockets, directories, devices and anything writable. FreeBSD's pipes are bidirectional, so a
+pipe end is accepted there either way and made read-only by narrowing. On FreeBSD limend
+narrows every passed descriptor with `cap_rights_limit` to read, seek and fstat before
+forwarding it. The rights travel with the descriptor, so the child can't widen them. limend
+never reads it. A descriptor counts against the message rate like any message, and is
+closed with the event if the child is gone. Descriptors sent with any other op are closed.
+The child receives `ChildEvent::MessageFd` and takes the descriptor with
+`Child::take_fd()`. A pipe plays once, front to back. The player can't seek in a pipe or
+restart a crashed decoder on one.
 
 **Limits and back-pressure.** One `Append` is in flight per track: the next waits for
 `Appended`. The player keeps at most 150 MB buffered per feed, or its jail's memory limit if
@@ -348,6 +364,9 @@ parent                    limend                 portcullisd       frescod      
   hidden while it is waiting to be bound (the `embed_pending` window hint), so a child can't
   flash up as a top-level window.
 - `Attached` reaches the parent only after frescod has bound the slot.
+- **Descriptors after attach.** Besides the frescod connection at launch, limend forwards a
+  descriptor to a child only with a `SEND_FD` message for a role that takes one (§2.2): it
+  is checked, narrowed and never read.
 
 ## 5. Slots
 

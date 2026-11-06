@@ -33,8 +33,13 @@ struct Wire<E> {
 
 impl<E: for<'a> serde::Deserialize<'a>> Wire<E> {
     fn call<T: Serialize>(&mut self, opc: u16, req: &T) -> Result<Reply, Error> {
+        self.call_fds(opc, req, &[])
+    }
+
+    /// With `fds` in the same frame as the request.
+    fn call_fds<T: Serialize>(&mut self, opc: u16, req: &T, fds: &[std::os::fd::RawFd]) -> Result<Reply, Error> {
         let payload = postcard::to_stdvec(req).expect("encodes");
-        self.conn.send_message(proto::CLASS, opc, flag::RESPONSE_EXPECTED, &payload)?;
+        self.conn.send_message_with_fds(proto::CLASS, opc, flag::RESPONSE_EXPECTED, &payload, fds)?;
         loop {
             let m = self.conn.recv_message_or_timeout(Duration::from_secs(5))?
                 .ok_or_else(|| io::Error::new(io::ErrorKind::TimedOut, "limend did not answer"))?;
@@ -117,6 +122,18 @@ impl Parent {
         self.0.ok(op::SEND, &proto::Send { embed, bytes })
     }
 
+    /// A role message with one descriptor, for a role that takes one
+    /// (`media-player`'s `Load`): a regular file or a pipe, open read-only.
+    /// limend checks it, narrows it to read, seek and fstat, and refuses
+    /// anything else with `BAD_FD`. The caller keeps its own descriptor.
+    pub fn send_fd(&mut self, embed: EmbedId, bytes: Vec<u8>, fd: std::os::fd::BorrowedFd<'_>) -> Result<(), Error> {
+        use std::os::fd::AsRawFd;
+        match self.0.call_fds(op::SEND_FD, &proto::Send { embed, bytes }, &[fd.as_raw_fd()])? {
+            Reply::Refused { reason } => Err(Error::Refused(reason)),
+            _ => Ok(()),
+        }
+    }
+
     pub fn detach(&mut self, embed: EmbedId) -> Result<(), Error> {
         self.0.ok(op::DETACH, &proto::Detach { embed })
     }
@@ -128,7 +145,7 @@ impl Parent {
 
 /// The child's end, or a system provider's (which serves many embeds on
 /// one connection; every call names its embed).
-pub struct Child(Wire<ChildEvent>);
+pub struct Child(Wire<ChildEvent>, VecDeque<std::os::fd::OwnedFd>);
 
 impl Child {
     /// A child limend started through portcullisd: its channel is its stdin
@@ -168,7 +185,7 @@ impl Child {
     }
 
     pub fn wrap(conn: Connection) -> Self {
-        Child(Wire { conn, queued: VecDeque::new(), ev_op: op::EV_CHILD })
+        Child(Wire { conn, queued: VecDeque::new(), ev_op: op::EV_CHILD }, VecDeque::new())
     }
 
     /// The child's window for `embed` is open; `window` is its embed token.
@@ -185,6 +202,19 @@ impl Child {
     }
 
     pub fn poll(&mut self, wait: Duration) -> Result<Option<ChildEvent>, Error> {
-        self.0.poll(wait)
+        let ev = self.0.poll(wait)?;
+        // Its descriptor came with it (and, for an event queued during a
+        // call, is in the queue in the same order).
+        if matches!(ev, Some(ChildEvent::MessageFd { .. })) {
+            if let Some(fd) = self.0.conn.take_fds(1).and_then(|mut v| v.pop()) {
+                self.1.push_back(fd);
+            }
+        }
+        Ok(ev)
+    }
+
+    /// The descriptor of the last [`ChildEvent::MessageFd`] polled.
+    pub fn take_fd(&mut self) -> Option<std::os::fd::OwnedFd> {
+        self.1.pop_front()
     }
 }

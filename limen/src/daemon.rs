@@ -12,6 +12,7 @@
 
 use std::collections::HashMap;
 use std::io;
+use std::os::fd::{AsRawFd, OwnedFd};
 use std::os::unix::net::UnixStream;
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::{Arc, Mutex};
@@ -102,11 +103,14 @@ impl Rate {
     }
 }
 
+/// An event for a connection, with the descriptor that goes with it.
+type Out = (u16, Vec<u8>, Option<OwnedFd>);
+
 #[derive(Default)]
 struct State {
     next_conn: ConnId,
     next_embed: EmbedId,
-    conns: HashMap<ConnId, Sender<(u16, Vec<u8>)>>,
+    conns: HashMap<ConnId, Sender<Out>>,
     embeds: HashMap<EmbedId, Embed>,
     /// role → the system provider's connection.
     providers: HashMap<&'static str, (ConnId, u32)>,
@@ -115,7 +119,14 @@ struct State {
 impl State {
     fn push<T: Serialize>(&self, conn: ConnId, op: u16, ev: &T) {
         if let Some(tx) = self.conns.get(&conn) {
-            let _ = tx.send((op, postcard::to_stdvec(ev).expect("encodes")));
+            let _ = tx.send((op, postcard::to_stdvec(ev).expect("encodes"), None));
+        }
+    }
+    /// A message with a descriptor; if the child is gone, the descriptor
+    /// is closed with the event.
+    fn to_child_fd(&self, e: &Embed, ev: ChildEvent, fd: OwnedFd) {
+        if let Some(tx) = self.conns.get(&e.child) {
+            let _ = tx.send((op::EV_CHILD, postcard::to_stdvec(&ev).expect("encodes"), Some(fd)));
         }
     }
     fn to_parent(&self, e: &Embed, ev: ParentEvent) { self.push(e.parent, op::EV_PARENT, &ev) }
@@ -180,17 +191,29 @@ pub fn serve(conn: Connection, uid: u32, shared: Arc<Shared>) -> io::Result<()> 
     run(conn, uid, id, rx, shared)
 }
 
-fn run(mut conn: Connection, uid: u32, id: ConnId, rx: Receiver<(u16, Vec<u8>)>, shared: Arc<Shared>) -> io::Result<()> {
+fn run(mut conn: Connection, uid: u32, id: ConnId, rx: Receiver<Out>, shared: Arc<Shared>) -> io::Result<()> {
     let r = (|| -> io::Result<()> {
         loop {
-            while let Ok((op, payload)) = rx.try_recv() {
-                conn.send_message(proto::CLASS, op, flag::ASYNC_EVENT, &payload)?;
+            while let Ok((op, payload, fd)) = rx.try_recv() {
+                match fd {
+                    Some(fd) => conn.send_message_with_fds(proto::CLASS, op, flag::ASYNC_EVENT, &payload, &[fd.as_raw_fd()])?,
+                    None => conn.send_message(proto::CLASS, op, flag::ASYNC_EVENT, &payload)?,
+                }
             }
             let Some(m) = conn.recv_message_or_timeout(Duration::from_millis(20))? else { continue };
             if m.opcode_class != proto::CLASS {
                 continue;
             }
-            let reply = handle(&shared, id, uid, m.op, &m.payload);
+            // A SEND_FD's descriptor came with the message's first byte, so
+            // it is queued by now; only that op takes one.
+            let fd = if m.op == op::SEND_FD { conn.take_fds(1).and_then(|mut v| v.pop()) } else { None };
+            // Descriptors sent with anything else are closed, so none waits
+            // to be taken for a later message. (Clients wait for each reply,
+            // so a later message's descriptor can't be queued yet.)
+            if m.op != op::SEND_FD {
+                while conn.take_fds(1).is_some() {}
+            }
+            let reply = handle(&shared, id, uid, m.op, &m.payload, fd);
             // Events this request caused go after its reply.
             conn.send_message(proto::CLASS, m.op, flag::IS_RESPONSE, &postcard::to_stdvec(&reply).unwrap())?;
         }
@@ -199,7 +222,7 @@ fn run(mut conn: Connection, uid: u32, id: ConnId, rx: Receiver<(u16, Vec<u8>)>,
     r
 }
 
-fn handle(shared: &Arc<Shared>, conn: ConnId, uid: u32, opc: u16, payload: &[u8]) -> Reply {
+fn handle(shared: &Arc<Shared>, conn: ConnId, uid: u32, opc: u16, payload: &[u8], fd: Option<OwnedFd>) -> Reply {
     fn de<'a, T: serde::Deserialize<'a>>(b: &'a [u8]) -> Result<T, Reply> {
         postcard::from_bytes(b).map_err(|_| Reply::Refused { reason: refusal::MALFORMED })
     }
@@ -219,7 +242,13 @@ fn handle(shared: &Arc<Shared>, conn: ConnId, uid: u32, opc: u16, payload: &[u8]
             }
             op::SEND => {
                 let s: proto::Send = de(payload)?;
-                send(shared, conn, s)
+                send(shared, conn, s, None)
+            }
+            op::SEND_FD => {
+                let s: proto::Send = de(payload)?;
+                // A SEND_FD without its descriptor is malformed.
+                let fd = fd.ok_or(Reply::Refused { reason: refusal::MALFORMED })?;
+                send(shared, conn, s, Some(fd))
             }
             op::DETACH => {
                 let d: proto::Detach = de(payload)?;
@@ -389,7 +418,9 @@ fn rebind(shared: &Arc<Shared>, st: &mut State, embed: EmbedId) {
     }
 }
 
-fn send(shared: &Arc<Shared>, conn: ConnId, s: proto::Send) -> Result<Reply, Reply> {
+/// A parent's message for its child, and on a role that takes one, a
+/// descriptor. Every refusal closes the descriptor (it is dropped here).
+fn send(shared: &Arc<Shared>, conn: ConnId, s: proto::Send, fd: Option<OwnedFd>) -> Result<Reply, Reply> {
     let mut st = shared.state.lock().unwrap();
     let Some(e) = st.embeds.get_mut(&s.embed).filter(|e| e.parent == conn) else {
         return Err(Reply::Refused { reason: refusal::NOT_YOURS });
@@ -397,11 +428,23 @@ fn send(shared: &Arc<Shared>, conn: ConnId, s: proto::Send) -> Result<Reply, Rep
     if s.bytes.len() > catalogue::MAX_MESSAGE {
         return Err(Reply::Refused { reason: refusal::TOO_BIG });
     }
+    if fd.is_some() && !e.role.takes_fd {
+        return Err(Reply::Refused { reason: refusal::MALFORMED });
+    }
+    if let Some(f) = fd.as_ref() {
+        if crate::fdpass::check(f).is_err() || crate::fdpass::narrow(f).is_err() {
+            return Err(Reply::Refused { reason: refusal::BAD_FD });
+        }
+    }
+    // A descriptor counts like any message.
     if !e.to_child.take(Instant::now()).0 {
         return Err(Reply::Refused { reason: refusal::RATE });
     }
     let e = &st.embeds[&s.embed];
-    st.to_child(e, ChildEvent::Message { embed: s.embed, bytes: s.bytes });
+    match fd {
+        Some(fd) => st.to_child_fd(e, ChildEvent::MessageFd { embed: s.embed, bytes: s.bytes }, fd),
+        None => st.to_child(e, ChildEvent::Message { embed: s.embed, bytes: s.bytes }),
+    }
     Ok(Reply::Ok)
 }
 

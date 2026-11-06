@@ -23,21 +23,24 @@ pub struct Role {
     pub name: &'static str,
     pub provider: Provider,
     pub slot: SlotKind,
+    /// The parent may pass one descriptor with a message (limen.md §2.2):
+    /// a read-only file or pipe, checked and narrowed by limend.
+    pub takes_fd: bool,
 }
 
 pub const ARCA: &str = "org.atrium.arca";
 pub const VESTIBULUM: &str = "org.atrium.vestibulum";
 
 pub const ROLES: &[Role] = &[
-    Role { name: "credential", provider: Provider::System(ARCA), slot: SlotKind::Credential },
-    Role { name: "sign-in", provider: Provider::System(VESTIBULUM), slot: SlotKind::Credential },
-    Role { name: "doc-viewer", provider: Provider::User, slot: SlotKind::Plain },
-    Role { name: "picker", provider: Provider::User, slot: SlotKind::Plain },
-    Role { name: "share-target", provider: Provider::User, slot: SlotKind::Plain },
-    Role { name: "media-player", provider: Provider::User, slot: SlotKind::Plain },
-    Role { name: "payment", provider: Provider::User, slot: SlotKind::Credential },
-    Role { name: "map", provider: Provider::User, slot: SlotKind::Plain },
-    Role { name: "editor-extension", provider: Provider::User, slot: SlotKind::Plain },
+    Role { name: "credential", provider: Provider::System(ARCA), slot: SlotKind::Credential, takes_fd: false },
+    Role { name: "sign-in", provider: Provider::System(VESTIBULUM), slot: SlotKind::Credential, takes_fd: false },
+    Role { name: "doc-viewer", provider: Provider::User, slot: SlotKind::Plain, takes_fd: false },
+    Role { name: "picker", provider: Provider::User, slot: SlotKind::Plain, takes_fd: false },
+    Role { name: "share-target", provider: Provider::User, slot: SlotKind::Plain, takes_fd: false },
+    Role { name: "media-player", provider: Provider::User, slot: SlotKind::Plain, takes_fd: true },
+    Role { name: "payment", provider: Provider::User, slot: SlotKind::Credential, takes_fd: false },
+    Role { name: "map", provider: Provider::User, slot: SlotKind::Plain, takes_fd: false },
+    Role { name: "editor-extension", provider: Provider::User, slot: SlotKind::Plain, takes_fd: false },
 ];
 
 /// Roles whose children may play sound as their parent (lyra-v1.md §4):

@@ -192,10 +192,13 @@ impl Worker {
                 if mode == Mode::Load {
                     let Some(fd) = fds.pop() else { self.fail(err::STATE); return true };
                     let mut f = File::from(fd);
-                    // A restarted worker shares the file offset with the last one.
-                    if f.seek(SeekFrom::Start(0)).is_err() {
-                        self.fail(err::STATE);
-                        return true;
+                    // A restarted worker shares the file offset with the last
+                    // one. A pipe has none: it plays once, front to back.
+                    if let Err(e) = f.seek(SeekFrom::Start(0)) {
+                        if e.raw_os_error() != Some(libc::ESPIPE) {
+                            self.fail(err::STATE);
+                            return true;
+                        }
                     }
                     self.input = Some(f);
                     self.feeds.push((0, Feed { parser: None, mime: String::new(), tracks: Vec::new(), offset_ns: 0, video: None, audio: None }));

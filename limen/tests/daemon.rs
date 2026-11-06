@@ -329,3 +329,67 @@ fn an_embedded_player_gets_an_audio_ticket_that_dies_with_the_embed() {
     let _ = w.spawned();
     assert_eq!(tickets.0.lock().unwrap().0.len(), 2);
 }
+
+#[test]
+fn a_player_gets_a_read_only_file_or_pipe_with_a_message_and_nothing_else() {
+    use std::io::{Read, Seek, Write};
+    use std::os::fd::AsFd;
+    let w = World::new();
+    let mut app = w.parent(APP);
+    let e = app.request("media-player", W_APP).unwrap();
+    let (_, mut player) = w.spawned();
+    assert!(matches!(next_c(&mut player), ChildEvent::Attach { .. }));
+
+    // A regular file, read-only: delivered with the message.
+    let path = std::env::temp_dir().join(format!("limen-fd-{}", std::process::id()));
+    std::fs::write(&path, b"media bytes").unwrap();
+    let ro = std::fs::File::open(&path).unwrap();
+    app.send_fd(e, b"load".to_vec(), ro.as_fd()).unwrap();
+    assert_eq!(next_c(&mut player), ChildEvent::MessageFd { embed: e, bytes: b"load".to_vec() });
+    let mut got = std::fs::File::from(player.take_fd().expect("the descriptor"));
+    let mut s = String::new();
+    got.read_to_string(&mut s).unwrap();
+    assert_eq!(s, "media bytes");
+    got.rewind().unwrap();
+    assert!(got.write_all(b"x").is_err(), "it stays read-only");
+
+    // A pipe's read end.
+    let (r, mut wr) = std::io::pipe().unwrap();
+    wr.write_all(b"piped").unwrap();
+    drop(wr);
+    app.send_fd(e, b"load".to_vec(), r.as_fd()).unwrap();
+    assert!(matches!(next_c(&mut player), ChildEvent::MessageFd { .. }));
+    let mut s = String::new();
+    std::fs::File::from(player.take_fd().unwrap()).read_to_string(&mut s).unwrap();
+    assert_eq!(s, "piped");
+
+    // A socket, a writable file, a pipe's write end: refused, nothing sent.
+    let (sock, _peer) = UnixStream::pair().unwrap();
+    assert_eq!(refused(app.send_fd(e, b"load".to_vec(), sock.as_fd())), refusal::BAD_FD);
+    let rw = std::fs::OpenOptions::new().read(true).write(true).open(&path).unwrap();
+    assert_eq!(refused(app.send_fd(e, b"load".to_vec(), rw.as_fd())), refusal::BAD_FD);
+    let (_r2, w2) = std::io::pipe().unwrap();
+    if cfg!(target_os = "freebsd") {
+        // Pipes are bidirectional there: either end goes, narrowed to read.
+        app.send_fd(e, b"load".to_vec(), w2.as_fd()).unwrap();
+        assert!(matches!(next_c(&mut player), ChildEvent::MessageFd { .. }));
+        let mut end = std::fs::File::from(player.take_fd().unwrap());
+        assert!(end.write_all(b"x").is_err(), "narrowed: it can't write");
+    } else {
+        assert_eq!(refused(app.send_fd(e, b"load".to_vec(), w2.as_fd())), refusal::BAD_FD);
+    }
+    let dir = std::fs::File::open(std::env::temp_dir()).unwrap();
+    assert_eq!(refused(app.send_fd(e, b"load".to_vec(), dir.as_fd())), refusal::BAD_FD);
+    // Plain messages still go through, and no descriptor came with them.
+    app.send(e, b"play".to_vec()).unwrap();
+    assert_eq!(next_c(&mut player), ChildEvent::Message { embed: e, bytes: b"play".to_vec() });
+    assert!(player.take_fd().is_none());
+
+    // A role that takes no descriptor, and someone else's embed.
+    let v = app.request("doc-viewer", W_APP).unwrap();
+    let _viewer = w.spawned();
+    assert_eq!(refused(app.send_fd(v, b"x".to_vec(), ro.as_fd())), refusal::MALFORMED);
+    let mut other = w.parent(OTHER);
+    assert_eq!(refused(other.send_fd(e, b"x".to_vec(), ro.as_fd())), refusal::NOT_YOURS);
+    let _ = std::fs::remove_file(&path);
+}
