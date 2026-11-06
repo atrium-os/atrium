@@ -40,6 +40,23 @@ Pergola does NOT own:
 - Multi-app composition (that's the scene server)
 - Window placement / z-order policy (that's the scene server's WM role)
 - Storage, network, audio (separate Atrium services)
+- Clipboard, app-to-app messaging and notifications (decided 2026-11-06, asked by the user).
+  Each is a system service outside any app jail, on the Aqueduct envelope; Pergola carries only
+  a thin client and the widgets that use it:
+
+  | concern | where it runs | wire | Pergola's part |
+  |---|---|---|---|
+  | Clipboard and drag-and-drop | **Tabula** (`tabulad`), user-scoped service | `CLASS_CLIPBOARD` (2); entries are CAS blobs with format lists (aqueduct.md §6.4) | Ctrl-C/X/V in `TextField` and `DocumentView`, a drag source/target API |
+  | App-to-app messaging | no general app bus: typed, brokered roles. **Limen** for embedding, the **share sheet** (a powerbox, insula.md §5.2) for handing one item over, both on `CLASS_BROKER` (4) | broker-minted fds, one operation each | the share button, receiving a share |
+  | Notifications | **Praeco** (`praecod`); remote pushes arrive through **Tabellarius** into Praeco | `CLASS_NOTIFY` (3); `praeco-macos` v0 is the wire reference | none in the app: toasts and history are drawn by **Forum** (a Pergola app in the trusted shell), never by the posting app |
+
+  Why outside Pergola: each crosses jails, so each needs a trusted party that applies policy
+  (per-jail clipboard scoping, aqueduct.md §6.5; Portcullis manifest `clipboard = true` /
+  `notify = true`), and none can be in the app's process. **A paste is a user gesture**
+  (insula.md §5.3: "clipboard read: one paste"): frescod owns input and focus, so it vouches for
+  the paste keystroke or menu click, and Tabula hands the focused app that one entry. An app
+  cannot read the clipboard at will. Likewise a notification's look and placement are the
+  shell's, so an app cannot draw a fake system prompt.
 
 ---
 
