@@ -194,6 +194,29 @@ fn transitions_block(c: &Conversion, tier: Tier) -> (String, bool, usize) {
     (s, !templates.is_empty(), dropped)
 }
 
+/// `"media": { "mse_scripts": n, "videos": [...] },` or nothing.
+pub fn media_block(document: &str, mse_scripts: usize) -> String {
+    use navigator_dom::media::{video_source, VideoSource};
+    let dom = navigator_dom::parse(document);
+    let videos = dom.by_tag_anywhere("video");
+    if videos.is_empty() { return String::new() }
+    let mut s = format!("  \"media\": {{ \"mse_scripts\": {mse_scripts}, \"videos\": [");
+    for (i, v) in videos.iter().enumerate() {
+        s.push_str(if i == 0 { "\n" } else { ",\n" });
+        let sources = dom.element_children(*v).into_iter().filter(|c| dom.tag(*c) == Some("source")).count();
+        let (class, src, mime) = match video_source(&dom, *v) {
+            VideoSource::Url { src, mime } => ("plain", src, mime),
+            VideoSource::Script => (if mse_scripts > 0 { "mse" } else { "script" }, String::new(), String::new()),
+            VideoSource::Unplayable => ("unplayable", String::new(), String::new()),
+        };
+        let flag = |a: &str| dom.attr(*v, a).is_some();
+        s.push_str(&format!("    {{ \"class\": {}, \"src\": {}, \"type\": {}, \"sources\": {sources}, \"poster\": {}, \"autoplay\": {}, \"muted\": {} }}",
+            json_str(class), json_str(&src), json_str(&mime), flag("poster"), flag("autoplay"), flag("muted")));
+    }
+    s.push_str("\n  ] },\n");
+    s
+}
+
 fn emit_part(url: Option<&str>, c: &Conversion, policy: &TierPolicy, whole: bool) -> String {
     let (document, decision) = policy.artifact(c);
     let (block, has_templates, dropped) = transitions_block(c, decision.tier);
@@ -219,6 +242,11 @@ fn emit_part(url: Option<&str>, c: &Conversion, policy: &TierPolicy, whole: bool
     s.push_str("  },\n");
 
     if whole { s.push_str(&block) } else { s.push_str("  \"transitions\": [],\n") }
+    // ★ The document's video elements (fresco-video P3), written only when
+    // it has any, so a recording without them is byte for byte what it was:
+    // each one's source as the document lane would play it, and whether the
+    // page's scripts use MSE (then its script-fed videos need an engine).
+    s.push_str(&media_block(&document, c.mse_scripts));
     // The subresources, in the order they were found.
     s.push_str("  \"stylesheets\": [");
     for (i, sh) in c.subresources.sheets.iter().enumerate() {

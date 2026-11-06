@@ -42,6 +42,7 @@ pub fn extent(s: &Scene, kind: u8, i: usize) -> Option<(U, U)> {
                (sh.y - b, sh.y + sh.h + b, sh.x - b, sh.x + sh.w + b, s.shadow_attrs.get(i).and_then(|a| a.2)) }
         4 => { let a = &s.grads[i].area; (a.y, a.y + a.h, a.x, a.x + a.w, s.grad_attrs.get(i).and_then(|a| a.2)) }
         5 => { let a = &s.images[i].area; (a.y, a.y + a.h, a.x, a.x + a.w, s.image_attrs.get(i).and_then(|a| a.2)) }
+        7 => { let e = &s.embeds[i]; (e.y, e.y + e.h, e.x, e.x + e.w, s.embed_attrs.get(i).and_then(|a| a.2)) }
         6 => {
             // A path's points through its own transform (already page units).
             let p = &s.paths[i];
@@ -127,6 +128,7 @@ pub fn scene_of(scene: &Scene, which: &[u32]) -> Scene {
             4 => { out.grads.push(scene.grads[i].clone()); out.grad_attrs.push(scene.grad_attrs[i]); out.grads.len() - 1 }
             5 => { out.images.push(scene.images[i].clone()); out.image_attrs.push(scene.image_attrs[i]); out.images.len() - 1 }
             6 => { out.paths.push(scene.paths[i].clone()); out.path_attrs.push(scene.path_attrs[i]); out.paths.len() - 1 }
+            7 => { out.embeds.push(scene.embeds[i].clone()); out.embed_attrs.push(scene.embed_attrs[i]); out.embeds.len() - 1 }
             _ => continue,
         };
         out.order.push((k, at));
@@ -670,7 +672,7 @@ struct Memo { groups: HashMap<u32, u32>, xforms: HashMap<u32, u32>, clips: HashM
 fn append(dst: &mut Scene, src: &Scene, kind: u8, i: usize, clip_y: Option<(U, U)>, memo: &mut Memo) {
     let attrs = match kind {
         0 => src.rect_attrs[i], 1 => src.run_attrs[i], 2 => src.link_attrs[i], 3 => src.shadow_attrs[i],
-        4 => src.grad_attrs[i], 5 => src.image_attrs[i], 6 => src.path_attrs[i], _ => return,
+        4 => src.grad_attrs[i], 5 => src.image_attrs[i], 6 => src.path_attrs[i], 7 => src.embed_attrs[i], _ => return,
     };
     let clip = match (attrs.0, clip_y) {
         (None, None) => None,
@@ -702,7 +704,8 @@ fn append(dst: &mut Scene, src: &Scene, kind: u8, i: usize, clip_y: Option<(U, U
         3 => { dst.order.push((3, dst.shadows.len())); dst.shadows.push(src.shadows[i].clone()); dst.shadow_attrs.push(a) }
         4 => { dst.order.push((4, dst.grads.len())); dst.grads.push(src.grads[i].clone()); dst.grad_attrs.push(a) }
         5 => { dst.order.push((5, dst.images.len())); dst.images.push(src.images[i].clone()); dst.image_attrs.push(a) }
-        _ => { dst.order.push((6, dst.paths.len())); dst.paths.push(src.paths[i].clone()); dst.path_attrs.push(a) }
+        6 => { dst.order.push((6, dst.paths.len())); dst.paths.push(src.paths[i].clone()); dst.path_attrs.push(a) }
+        _ => { dst.order.push((7, dst.embeds.len())); dst.embeds.push(src.embeds[i].clone()); dst.embed_attrs.push(a) }
     }
 }
 
@@ -728,6 +731,7 @@ pub fn translated(scene: &Scene, dy: U) -> Scene {
     for (l, a) in s.shadows.iter_mut().zip(&s.shadow_attrs) { if !moved(a) { l.y -= dy } }
     for (g, a) in s.grads.iter_mut().zip(&s.grad_attrs) { if !moved(a) { g.area.y -= dy; g.area.ty -= dy } }
     for (g, a) in s.images.iter_mut().zip(&s.image_attrs) { if !moved(a) { g.area.y -= dy; g.area.ty -= dy } }
+    for (e, a) in s.embeds.iter_mut().zip(&s.embed_attrs) { if !moved(a) { e.y -= dy } }
     for p in s.paths.iter_mut() {
         p.transform[5] -= dy;
         if let Some(c) = p.clip.as_mut() { c[1] -= dy; c[3] -= dy }

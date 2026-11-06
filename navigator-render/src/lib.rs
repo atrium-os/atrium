@@ -99,6 +99,29 @@ pub struct Image { pub area: Tiling, pub address: String,
                    /// How the source fills its tile: `object-fit` (row 58).
                    pub fit: &'static str }
 
+/// What an embed slot plays (`navigator_dom::media`).
+pub use navigator_dom::media::VideoSource as EmbedSource;
+
+/// ★ AN EMBED SLOT: one scene node, sized and clipped like any leaf, that
+/// the UI binds to a Limen embed (here a `media-player`). The nodes painted
+/// under it (a placeholder, the poster) show until the slot binds. It
+/// belongs to the band it is laid out in, and is released when that band
+/// is evicted.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Embed {
+    pub x: U, pub y: U, pub w: U, pub h: U,
+    /// The Limen role: `media-player`.
+    pub role: &'static str,
+    /// Stable across layouts and bands: the element's node in the
+    /// normalized document.
+    pub key: u32,
+    pub source: EmbedSource,
+    /// `autoplay`, `loop`, `muted`, `controls` (bits 0-3), as written.
+    pub flags: u8,
+}
+
+pub mod embed_flags { pub const AUTOPLAY: u8 = 1; pub const LOOP: u8 = 2; pub const MUTED: u8 = 4; pub const CONTROLS: u8 = 8; }
+
 /// The subresources a document's input supplies, by URL: content address and
 /// intrinsic size in 1/64 px. ★ There is NO fallback measurement path
 /// (profile §3.13) — an image the input does not declare is a diagnostic,
@@ -165,6 +188,10 @@ pub struct Scene {
     pub image_attrs: Vec<Attrs>,
     /// Filled paths (kind 6): an inline SVG as vector shapes (`path`).
     pub paths: Vec<path::Path>,
+    /// ★ Embed slots (kind 7; fresco-video.md P3): a box another process
+    /// fills — today a video element's media player (limen.md §2.2).
+    pub embeds: Vec<Embed>,
+    pub embed_attrs: Vec<Attrs>,
     pub path_attrs: Vec<Attrs>,
     /// ★ Each vector SVG's bitmap fallback: (first path, path count, the
     /// image node it would otherwise be). When Fresco reports a fill dropped
@@ -194,6 +221,11 @@ impl Scene {
         self.order.insert(slot, (5, self.images.len()));
         self.images.push(im);
         self.image_attrs.push(self.cur);
+    }
+    pub(crate) fn insert_embed(&mut self, slot: usize, e: Embed) {
+        self.order.insert(slot, (7, self.embeds.len()));
+        self.embeds.push(e);
+        self.embed_attrs.push(self.cur);
     }
     pub(crate) fn insert_path(&mut self, slot: usize, p: path::Path) {
         self.order.insert(slot, (6, self.paths.len()));

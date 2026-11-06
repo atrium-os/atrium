@@ -26,6 +26,8 @@
 //!       paint `rrggbbaa`, or `L<x0>,<y0>,<x1>,<y1>` / `R<cx>,<cy>,<r>` (1/64
 //!       path unit) then `;<rrggbbaa>@<offset 1/1024>` per stop; k: the
 //!       path's own clip, 1/64 px)
+//! embed <role> k<key> <x> <y> <w> <h> a<flags> url "<src>" "<mime>" | script | unplayable [c<i>] [g<i>] [x<i>]
+//!      (a slot another process fills: a video element's media player)
 //! fallback p<first>+<count> <address> <x> <y> <w> <h> t<tx>,<ty>,<tw>,<th> <fit>
 //!      (the bitmap a vector SVG's paths fall back to when Fresco drops one)
 //! ```
@@ -156,6 +158,17 @@ pub fn write(scene: &Scene, fonts: &FontSet) -> String {
                 attrs(&mut o, scene.path_attrs.get(i));
                 o.push('\n');
             }
+            7 => {
+                let e = &scene.embeds[i];
+                let _ = write!(o, "embed {} k{} {} {} {} {} a{}", e.role, e.key, e.x, e.y, e.w, e.h, e.flags);
+                match &e.source {
+                    crate::EmbedSource::Url { src, mime } => { let _ = write!(o, " url {} {}", quote(src), quote(mime)); }
+                    crate::EmbedSource::Script => o.push_str(" script"),
+                    crate::EmbedSource::Unplayable => o.push_str(" unplayable"),
+                }
+                attrs(&mut o, scene.embed_attrs.get(i));
+                o.push('\n');
+            }
             _ => {
                 let l = &scene.links[i];
                 let _ = write!(o, "link {} {} {} {} {}", l.x, l.y, l.w, l.h, quote(&l.href));
@@ -173,4 +186,42 @@ pub fn write(scene: &Scene, fonts: &FontSet) -> String {
         let _ = writeln!(o, "fallback p{first}+{n} {} {} {} {} {} t{},{},{},{} {}", im.address, a.x, a.y, a.w, a.h, a.tx, a.ty, a.tw, a.th, im.fit);
     }
     o
+}
+
+/// ★ The embed slots an NSG text holds (a band's group, the overlay), as
+/// the UI reads them to bind Limen embeds: (key, role, box, flags, source).
+/// Lines that are not `embed` are skipped; an `embed` line out of shape is
+/// skipped too, never half read.
+pub fn embeds(nsg: &str) -> Vec<(u32, String, (i64, i64, i64, i64), u8, crate::EmbedSource)> {
+    let unquote = |s: &str| -> Option<(String, usize)> {
+        if !s.starts_with('"') { return None }
+        let mut out = String::new();
+        let mut it = s[1..].char_indices();
+        while let Some((i, c)) = it.next() {
+            match c {
+                '"' => return Some((out, i + 2)),
+                '\\' => match it.next()?.1 { 'n' => out.push('\n'), '"' => out.push('"'), '\\' => out.push('\\'), _ => return None },
+                c => out.push(c),
+            }
+        }
+        None
+    };
+    let mut out = vec![];
+    for line in nsg.lines() {
+        let Some(rest) = line.strip_prefix("embed ") else { continue };
+        let f: Vec<&str> = rest.splitn(8, ' ').collect();
+        if f.len() < 8 { continue }
+        let (Some(key), Ok(x), Ok(y), Ok(w), Ok(h), Some(fl)) = (f[1].strip_prefix('k').and_then(|v| v.parse().ok()), f[2].parse(), f[3].parse(), f[4].parse(), f[5].parse(),
+            f[6].strip_prefix('a').and_then(|v| v.parse().ok())) else { continue };
+        let tail = f[7];
+        let source = if let Some(t) = tail.strip_prefix("url ") {
+            let Some((src, n)) = unquote(t) else { continue };
+            let Some((mime, _)) = unquote(t[n..].trim_start()) else { continue };
+            crate::EmbedSource::Url { src, mime }
+        } else if tail == "script" || tail.starts_with("script ") { crate::EmbedSource::Script }
+        else if tail == "unplayable" || tail.starts_with("unplayable ") { crate::EmbedSource::Unplayable }
+        else { continue };
+        out.push((key, f[0].to_string(), (x, y, w, h), fl, source));
+    }
+    out
 }

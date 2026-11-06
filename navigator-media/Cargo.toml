@@ -1,0 +1,16 @@
+[package]
+name = "navigator-media"
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+description = "The Navigator's media front end (fresco-video.md P3): a document's video embed slots as Limen media-player embeds, and HTMLMediaElement / MediaSource mapped onto the media-player role's messages (limen.md §2.2)."
+publish = false
+
+[dependencies]
+limen = { path = "../limen" }
+navigator-render = { path = "../navigator-render" }
+
+# navigator-fonts vendors a one-line fix to pathfinder_simd (see its
+# vendor/README.md); a dependent crate must repeat the patch.
+[patch.crates-io]
+pathfinder_simd = { path = "../navigator-fonts/vendor/pathfinder_simd" }

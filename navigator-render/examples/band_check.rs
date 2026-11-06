@@ -50,7 +50,7 @@ fn leaf_box(s: &Scene, kind: u8, i: usize) -> Option<(U, U, U, U)> {
 
 fn attrs(s: &Scene, kind: u8, i: usize) -> navigator_render::Attrs {
     match kind { 0 => s.rect_attrs[i], 1 => s.run_attrs[i], 2 => s.link_attrs[i], 3 => s.shadow_attrs[i],
-                 4 => s.grad_attrs[i], 5 => s.image_attrs[i], _ => s.path_attrs[i] }
+                 4 => s.grad_attrs[i], 5 => s.image_attrs[i], 7 => s.embed_attrs[i], _ => s.path_attrs[i] }
 }
 
 /// (opacity groups, groups whose leaves overlap one another).

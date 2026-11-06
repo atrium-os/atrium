@@ -1319,7 +1319,10 @@ impl<'a> Cx<'a> {
         let flow_ok = self.stop_ok;
         // Children: block-level children stack; runs of inline content
         // between them form anonymous block boxes of line boxes.
-        if kw(s, "display") == "grid" {
+        // A replaced box's children are not its content (a video's
+        // `<source>`s and fallback text).
+        if self.dom.tag(h) == Some("video") {
+        } else if kw(s, "display") == "grid" {
             let so = std::mem::replace(&mut self.stop_ok, false);
             cy += self.grid(h, s, content_x, cy, content_w, child_cb_h);
             self.stop_ok = so;
@@ -1648,6 +1651,25 @@ impl<'a> Cx<'a> {
                 }
             }
         }
+        // ★ A VIDEO'S EMBED SLOT (fresco-video P3), over its content box: a
+        // dark placeholder when there is no poster, then the slot itself,
+        // which the UI binds to a Limen media player.
+        if self.dom.tag(h) == Some("video") && !hidden {
+            let content = (bx + bl + pl, by + bt + pt, (w - frame).max(0), (hgt - pt - pb - bt - bb).max(0));
+            if content.2 > 0 && content.3 > 0 {
+                let has_poster = self.dom.attr(h, "poster").is_some_and(|p| self.subs.get(p).is_some());
+                if !has_poster {
+                    self.scene.insert_rect(slot, Rect { x: content.0, y: content.1, w: content.2, h: content.3, rgba: 0x000000ff, radii: [0; 4], ring: 0 });
+                    slot += 1;
+                }
+                let flag = |a: &str| self.dom.attr(h, a).is_some();
+                let flags = (flag("autoplay") as u8) * crate::embed_flags::AUTOPLAY | (flag("loop") as u8) * crate::embed_flags::LOOP
+                    | (flag("muted") as u8) * crate::embed_flags::MUTED | (flag("controls") as u8) * crate::embed_flags::CONTROLS;
+                let source = video_source(self.dom, h);
+                self.scene.insert_embed(slot, crate::Embed { x: content.0, y: content.1, w: content.2, h: content.3, role: "media-player", key: h, source, flags });
+                slot += 1;
+            }
+        }
         let painted = slot - bg_slot;
         if self.band.is_some() && (skipped_any || fired_inside) {
             let lens1 = (self.scene.rects.len(), self.scene.shadows.len(), self.scene.grads.len(), self.scene.images.len(), self.scene.paths.len());
@@ -1869,6 +1891,9 @@ impl<'a> Cx<'a> {
     fn is_replaced(&self, h: Handle) -> bool {
         match self.dom.tag(h) {
             Some("img") => true,
+            // ★ A video is replaced content (fresco-video P3): its box is an
+            // embed slot the media player fills.
+            Some("video") => true,
             Some("svg") => self.dom.attr(h, "src").is_some_and(|v| v.starts_with("blake3:")),
             _ => false,
         }
@@ -1883,7 +1908,15 @@ impl<'a> Cx<'a> {
         let dim = |n: &str| self.dom.attr(h, n).and_then(|v| v.trim().parse::<f64>().ok()).filter(|v| *v >= 0.0).map(u);
         let (w, hh) = (dim("width"), dim("height"));
         let ratio_attr = self.dom.attr(h, "natural-ratio").map(str::trim);
+        // A video paints its POSTER (when its bytes are supplied) until the
+        // player's slot binds; its own `src` is the player's, never fetched
+        // here, and its size is declared or CSS's default object size.
+        let is_video = self.dom.tag(h) == Some("video");
+        let src = if is_video { self.dom.attr(h, "poster").unwrap_or("") } else { src };
         let sub = self.subs.get(src);
+        if is_video && w.is_none() && hh.is_none() && ratio_attr.is_none() {
+            return Some((sub.map(|(a, ..)| a.clone()).unwrap_or_default(), Natural { w: None, h: None, ratio: None }));
+        }
         let addr = sub.map(|(a, ..)| a.clone()).unwrap_or_default();
         let declared = w.is_some() || hh.is_some() || ratio_attr.is_some();
         let nat = if declared {
@@ -2211,7 +2244,7 @@ impl<'a> Cx<'a> {
         // still renders correctly, and quietly carries orphan nodes that
         // nothing points at.
         let (sh, gr_n, im) = (self.scene.shadows.len(), self.scene.grads.len(), self.scene.images.len());
-        let (pa, vb) = (self.scene.paths.len(), self.vector_budget);
+        let (pa, vb, em) = (self.scene.paths.len(), self.vector_budget, self.scene.embeds.len());
         let (cl, gr, cur, xf) = (self.scene.clips.len(), self.scene.groups.len(), self.scene.cur, self.scene.xforms.len());
         let diags = self.diagnostics.len();
         let (links, counts, marker, report) = (self.links.len(), self.unimplemented.clone(), self.marker.clone(), self.report.clone());
@@ -2233,6 +2266,7 @@ impl<'a> Cx<'a> {
         self.scene.grads.truncate(gr_n); self.scene.grad_attrs.truncate(gr_n);
         self.scene.images.truncate(im); self.scene.image_attrs.truncate(im);
         self.scene.paths.truncate(pa); self.scene.path_attrs.truncate(pa); self.vector_budget = vb;
+        self.scene.embeds.truncate(em); self.scene.embed_attrs.truncate(em);
         self.scene.path_fallbacks.retain(|(first, _, _)| *first < pa);
         self.scene.clips.truncate(cl); self.scene.groups.truncate(gr); self.scene.cur = cur;
         self.scene.xforms.truncate(xf); self.scene.xform_parents.truncate(xf); self.scene.scrolls.retain(|sc| (sc.xform as usize) < xf); self.scene.inner_clips.retain(|c| (*c as usize) < cl);
@@ -6606,10 +6640,6 @@ fn promote_block_in_inline(dom: &Dom, styles: &[Option<std::rc::Rc<Style>>]) -> 
     promoted
 }
 
-fn restack(order: &[(u8, usize)], real: &[(i64, usize, usize, usize)], hoist: &[(usize, usize)]) -> Vec<(u8, usize)> {
-    restack_keyed(order, real, hoist, false).0
-}
-
 /// A leaf's place in painting order apart from where it was emitted: the
 /// z-index chain of the stacking contexts it is in, and whether it is
 /// hoisted (layer 6). Two leaves compare by this, then by emission order.
@@ -6674,6 +6704,8 @@ fn restack_keyed(order: &[(u8, usize)], real: &[(i64, usize, usize, usize)], hoi
     }
     (idx.into_iter().map(|i| order[i]).collect(), out_keys)
 }
+
+pub use navigator_dom::media::{playable, video_source};
 
 /// The matrix for a `transform` list, about `origin` (absolute, 1/64 px).
 ///

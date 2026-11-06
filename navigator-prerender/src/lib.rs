@@ -69,6 +69,9 @@ pub struct Conversion {
     pub elements_after: usize,
     pub depth_after: usize,
     pub scripts_total: usize,
+    /// ★ Scripts that use Media Source Extensions (fresco-video P3): a page
+    /// whose videos a script feeds plays only in an engine island.
+    pub mse_scripts: usize,
     pub external_total: usize,
     pub external_fetched: usize,
     pub external_failed: usize,
@@ -239,7 +242,15 @@ struct Pre {
     origin_refusal: Option<&'static str>,
     profile_violations: Vec<profile::Violation>,
     scripts_total: usize,
+    mse_scripts: usize,
     ext: (usize, usize, usize),
+}
+
+/// Whether a script uses Media Source Extensions: it constructs or tests a
+/// `MediaSource` (or Safari's `ManagedMediaSource`) or adds a source buffer.
+pub fn uses_mse(text: &str) -> bool {
+    text.contains("addSourceBuffer") || text.contains("MediaSource.isTypeSupported") || text.contains("new MediaSource")
+        || text.contains("ManagedMediaSource") || text.contains("window.MediaSource")
 }
 
 /// The run's outcome as a `Conversion`.
@@ -266,6 +277,7 @@ fn assemble(dom: &dom::Dom, rep: engine::RunReport, subresources: subresource::S
         elements_after: dom.element_count(),
         depth_after: dom.max_depth(),
         scripts_total: pre.scripts_total,
+        mse_scripts: pre.mse_scripts,
         external_total: pre.ext.0,
         external_fetched: pre.ext.1,
         external_failed: pre.ext.2,
@@ -458,6 +470,7 @@ fn convert_impl(
         engine: engine.as_deref().map(|e| e.name()).unwrap_or("none"),
         before, text_before, origin_refusal, profile_violations,
         scripts_total: scripts.len() + held,
+        mse_scripts: scripts.iter().filter(|s| uses_mse(&s.text)).count(),
         ext: (ext_total, ext_ok, ext_fail),
     };
     let mut rep = match engine.as_deref_mut() {
