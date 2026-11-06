@@ -118,7 +118,7 @@ smoothing position changes so a jump doesn't click.
 | M2 | VM check (QEMU's HDA codec is stereo only: today's check proves the fallback, sound(4) refusing 6 channels bit-perfect and lyrad staying at 2; the 5.1 path needs real hardware or a multichannel codec): 5.1 stream on a 5.1 output reaches all six channels untouched; on stereo, the downmix levels | M1 |
 | S1 ✓ | Headphone virtual surround: virtual 7.1 bed + 8 binaural renderers, spatial switch per output, Pro/user bypass | M1 |
 | S2 | Object streams: `Open` with objects, object page (app writes, lyrad reads, sanitised), per-period rendering to speakers or headphones, caps | M1 |
-| S3 | HRTF upgrade for S1/S2 once a licence-clean HRTF set is chosen | S1 |
+| S3 | HRTF upgrade for S1/S2 once a licence-clean HRTF set is chosen (candidates: [lyra-hrtf-survey.md](lyra-hrtf-survey.md)) | S1 |
 
 ## 5. Decisions, with recommendations
 
