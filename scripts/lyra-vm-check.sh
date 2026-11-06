@@ -13,6 +13,7 @@
 #      only its tone drops 12 dB. A communication stream ducks media 18 dB.
 #   2  a hostile stream (NaN, infinity, wild ring header) beside a 1 kHz tone:
 #      lyrad lives and the tone is untouched.
+#   balance: the output's balance 0.5 takes the left 6 dB down, the right not.
 #   7  kill lyrad while an app plays: the app is told, the supervisor restarts
 #      lyrad and choragusd, and a new stream plays.
 # Not here: 3 (no device in app jails) is portcullis-jail's devfs test plus
@@ -152,6 +153,30 @@ r=$(v "pgrep -u _lyra lyrad >/dev/null && echo alive")
 [ "$r" = alive ] && ok "lyrad lives through the hostile stream" || bad "lyrad died: $(v "tail -5 $T/lyrad.log")"
 v "su -m appui -c '$BIN/lyra-vmtest ctl $T/control.sock mute org.test.b 0'" >/dev/null
 
+say "balance: the output's left/right"
+M10=$(mark)
+v "su -m appa -c 'env LYRA_PLAY_FREQ=500 $BIN/lyra-play $T/audio.sock media 12' >$T/a.log 2>&1 </dev/null &
+   sleep 4"
+M11=$(mark)
+r=$(v "su -m appui -c '$BIN/lyra-vmtest ctl $T/control.sock balance 0.5'")
+echo "$r" | sed 's/^/  ui: /'
+v "sleep 4"
+M12=$(mark)
+v "while pgrep -q lyra-play; do sleep 1; done"
+v "su -m appui -c '$BIN/lyra-vmtest ctl $T/control.sock balance 0'" >/dev/null
+
+say "layout: the output set to 5.1"
+# QEMU's codec is stereo: sound(4) either converts 6 channels for it or
+# refuses them; either way the service must keep playing.
+v "su -m appui -c '$BIN/lyra-vmtest ctl $T/control.sock layout 6'" | sed 's/^/  ui: /'
+v "sleep 3"
+r=$(v "grep -E 'layout|refused|OSS device open' $T/lyrad.log | tail -3")
+echo "$r" | sed 's/^/  lyrad: /'
+r=$(v "su -m appa -c '$BIN/lyra-play $T/audio.sock media 1' 2>&1; echo rc=\$?")
+case "$r" in *rc=0*) ok "a stream plays after the layout change" ;; *) bad "after layout 6: $r" ;; esac
+v "su -m appui -c '$BIN/lyra-vmtest ctl $T/control.sock layout 2'" >/dev/null
+v "sleep 2"
+
 say "7: restart"
 v "su -m appa -c '$BIN/lyra-play $T/audio.sock media 30' >$T/r.log 2>&1 </dev/null &
    sleep 4; pkill -u _lyra lyrad; sleep 3"
@@ -161,26 +186,30 @@ r=$(v "for i in \$(seq 1 30); do su -m appa -c '$BIN/lyra-play $T/audio.sock med
 case "$r" in back*) ok "lyrad and choragusd restarted; a new stream plays ($r tries)" ;; *) bad "no restart: $(v "tail -5 $T/choragusd.log")" ;; esac
 
 say "analyse the dump (host)"
+# Stop first: lyrad writes the dump for as long as it runs.
+v "pkill -f 'daemon.*lyra-test'; pkill -u _lyra lyrad; pkill -u _choragus choragusd; true" >/dev/null 2>&1
 mkdir -p "$OUT"
 # shellcheck disable=SC2086
 scp $SCP_OPTS "root@localhost:$DUMP" "$OUT/mix.raw" >/dev/null 2>&1 || die "pull the dump"
 v "cat $T/lyrad.log" > "$OUT/lyrad.log" 2>&1
 v "cat $T/choragusd.log" > "$OUT/choragusd.log" 2>&1
-python3 -I - "$OUT/mix.raw" "$M0" "$M1" "$M2" "$M3" "$M4" "$M5" "$M6" "$M7" "$M8" "$M9" <<'PY' || FAILS=$((FAILS + 1))
+python3 -I - "$OUT/mix.raw" "$M0" "$M1" "$M2" "$M3" "$M4" "$M5" "$M6" "$M7" "$M8" "$M9" "$M10" "$M11" "$M12" <<'PY' || FAILS=$((FAILS + 1))
 import math, struct, sys
 path = sys.argv[1]
 m = [int(x) // 4 for x in sys.argv[2:]]   # byte offsets -> stereo frames
 raw = open(path, 'rb').read()
 n = len(raw) // 4
-left = struct.unpack('<%dh' % (n * 2), raw[:n * 4])[0::2]
+both = struct.unpack('<%dh' % (n * 2), raw[:n * 4])
+left, right = both[0::2], both[1::2]
 RATE, WIN = 48000, 4800
-def amp(a, b, f):
+def amp(a, b, f, ch=None):
     """Median Goertzel amplitude (dBFS) of f over 100 ms windows in frames [a, b)."""
+    ch = left if ch is None else ch
     vals = []
     k = 2 * math.cos(2 * math.pi * f / RATE)
     for s in range(a, b - WIN, WIN):
         s1 = s2 = 0.0
-        for x in left[s:s + WIN]:
+        for x in ch[s:s + WIN]:
             s0 = x / 32768.0 + k * s1 - s2
             s2, s1 = s1, s0
         p = s1 * s1 + s2 * s2 - k * s1 * s2
@@ -213,6 +242,10 @@ for f in (3000, 6857, 9000):
 clipped = sum(1 for x in left[m[8]:m[9]] if x in (32767, -32768))
 print('  %s 2: no clipped samples during the hostile stream (%d)' % ('ok  ' if clipped == 0 else 'FAIL', clipped))
 fails += clipped != 0
+l0, r0 = amp(m[10] + S, m[11], 500, left), amp(m[10] + S, m[11], 500, right)
+l1, r1 = amp(m[11] + S, m[12], 500, left), amp(m[11] + S, m[12], 500, right)
+check('balance 0.5: left fades', l1 - l0, -6.02, 1.0)
+check('balance 0.5: right stays', r1 - r0, 0.0, 1.0)
 sys.exit(1 if fails else 0)
 PY
 

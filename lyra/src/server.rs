@@ -76,6 +76,18 @@ pub struct Adapter {
 }
 
 impl Adapter {
+    /// Convert to another device layout from the next period on.
+    pub fn set_device_channels(&mut self, dev: u8) -> bool {
+        let Some(m) = layout(self.ch as u8).zip(layout(dev)).map(|(a, b)| matrix(&a, &b)) else { return false };
+        self.m = m;
+        self.dev_ch = dev as usize;
+        true
+    }
+
+    pub fn device_channels(&self) -> usize {
+        self.dev_ch
+    }
+
     pub fn new(rate: u32, channels: u8, dev_rate: u32, dev_channels: u8) -> Option<Adapter> {
         let m = matrix(&layout(channels)?, &layout(dev_channels)?);
         let ch = channels as usize;
@@ -202,6 +214,18 @@ pub struct Engine {
     events: Vec<FromEngine>,
     /// Measured device speed against nominal (ppm), for the clock pages.
     pub rate_ppm: i32,
+    channels: usize,
+    /// The output's left and right gains, from its balance.
+    balance: [Gain; 2],
+    /// A layout choragusd asked for, until the run loop reopens the device.
+    pub want_channels: Option<u8>,
+}
+
+/// Left and right gains for a balance in −1..1: the far side fades, the near
+/// side stays at full level. Not a number counts as centred.
+pub fn balance_gains(b: f32) -> [f32; 2] {
+    let b = if b.is_finite() { b.clamp(-1.0, 1.0) } else { 0.0 };
+    [(1.0 - b).min(1.0), (1.0 + b).min(1.0)]
 }
 
 impl Engine {
@@ -214,7 +238,24 @@ impl Engine {
             tmp: vec![0.0; period_frames * channels],
             events: Vec::new(),
             rate_ppm: 0,
+            channels,
+            balance: [Gain::new(1.0, rate as f32, 20.0), Gain::new(1.0, rate as f32, 20.0)],
+            want_channels: None,
         }
+    }
+
+    /// Mix for a device with `ch` channels from the next period on (the
+    /// device was reopened with them). Every stream keeps its ring and clock.
+    pub fn set_channels(&mut self, ch: usize) {
+        self.channels = ch;
+        self.tmp.resize(self.period_frames * ch, 0.0);
+        for s in &mut self.slots {
+            s.adapter.set_device_channels(ch as u8);
+        }
+    }
+
+    pub fn channels(&self) -> usize {
+        self.channels
     }
 
     pub fn streams(&self) -> usize {
@@ -258,7 +299,11 @@ impl Engine {
             }
             Cmd::End(_) => {}
             Cmd::Msg(g, _) | Cmd::Open(g, ..) if g != self.gen => {}
-            Cmd::Open(_, id, adapter, ring, clock) => {
+            Cmd::Open(_, id, mut adapter, ring, clock) => {
+                // Made for the layout the connection thread knew of.
+                if adapter.device_channels() != self.channels && !adapter.set_device_channels(self.channels as u8) {
+                    return;
+                }
                 if self.is_open(id) || self.slots.len() >= MAX_STREAMS {
                     return;
                 }
@@ -327,6 +372,16 @@ impl Engine {
                 }
             }
             ToEngine::Reroute { .. } => {} // single sink in v1
+            ToEngine::SetLayout { channels, .. } => {
+                if layout(channels).is_some() && channels >= 2 {
+                    self.want_channels = Some(channels);
+                }
+            }
+            ToEngine::SetBalance { balance, .. } => {
+                let [l, r] = balance_gains(balance);
+                self.balance[0].set_target(l);
+                self.balance[1].set_target(r);
+            }
         }
     }
 
@@ -379,6 +434,20 @@ impl Engine {
             s.gain.process(&mut self.tmp);
             for (m, t) in mix.iter_mut().zip(&self.tmp) {
                 *m += *t;
+            }
+        }
+        // The output's balance: left-side speakers (FL, SL, RL) take the
+        // left gain, right-side ones (FR, SR, RR) the right; FC and LFE none.
+        if self.channels >= 2 {
+            let (lefts, rights): (&[usize], &[usize]) = match self.channels {
+                6 => (&[0, 4], &[1, 5]),
+                8 => (&[0, 4, 6], &[1, 5, 7]),
+                _ => (&[0], &[1]),
+            };
+            for f in mix.chunks_exact_mut(self.channels) {
+                let (l, r) = (self.balance[0].next(), self.balance[1].next());
+                lefts.iter().for_each(|&i| f[i] *= l);
+                rights.iter().for_each(|&i| f[i] *= r);
             }
         }
     }
@@ -604,18 +673,26 @@ pub fn run(cfg: Config) -> ! {
         Ok(fd) => { eprintln!("lyrad: mix thread on the deadline lane"); Some(fd) }
         Err(e) => { eprintln!("lyrad: no deadline lane ({e}); mixing on timeshare"); None }
     };
-    let n = (cfg.period_frames * cfg.channels) as usize;
     let mut engine = Engine::new(cfg.rate, cfg.channels as usize, cfg.period_frames as usize);
-    let mut mix = vec![0.0f32; n];
-    let mut out = vec![0i16; n];
+    let mut mix = Vec::new();
+    let mut out = Vec::new();
+    // The device's channel count: 2 until choragusd sets the output's layout.
+    let mut channels = cfg.channels;
     // Development: LYRA_DUMP=<file> writes the exact i16 stereo sent to the
     // device, for offline spectral checks (jaild passes no such variable).
     // Appended, so a restarted lyrad keeps what the last one wrote.
     let mut dump = std::env::var("LYRA_DUMP").ok()
         .and_then(|p| std::fs::OpenOptions::new().create(true).append(true).open(p).ok());
     loop {
-        let sink = match OssSink::open(cfg.rate, cfg.channels, cfg.period_frames, cfg.nfrags) {
+        let sink = match OssSink::open(cfg.rate, channels, cfg.period_frames, cfg.nfrags) {
             Ok(s) => s,
+            Err(e) if channels != engine.channels() as u32 => {
+                // The device refused the new layout: back to the one it had.
+                eprintln!("lyrad: the device refused {channels} channels ({e}); staying at {}", engine.channels());
+                channels = engine.channels() as u32;
+                let _ = ev_tx.send((engine.session(), FromEngine::Layout { channels: channels as u8 }));
+                continue;
+            }
             Err(e) => {
                 eprintln!("lyrad: no OSS device ({e}); retrying in 2 s");
                 // Keep the session state current while there is no device.
@@ -627,10 +704,23 @@ pub fn run(cfg: Config) -> ! {
             }
         };
         eprintln!("lyrad: OSS device open ({} Hz, {} ch)", sink.rate_hz(), sink.channels());
+        engine.set_channels(channels as usize);
+        mix.resize(cfg.period_frames as usize * channels as usize, 0.0);
+        out.resize(mix.len(), 0);
+        let _ = ev_tx.send((engine.session(), FromEngine::Layout { channels: channels as u8 }));
         let mut speed = DeviceSpeed::new(cfg.rate);
         loop {
             while let Ok(c) = rx.try_recv() {
                 engine.apply(c);
+            }
+            if let Some(w) = engine.want_channels.take() {
+                if w as u32 != channels {
+                    eprintln!("lyrad: output layout {channels} -> {w} channels; reopening the device");
+                    channels = w as u32;
+                    break;
+                }
+                // Already so: still answer, so choragusd knows.
+                let _ = ev_tx.send((engine.session(), FromEngine::Layout { channels: w }));
             }
             let delay = sink.delay_frames().unwrap_or(0);
             let now = monotonic_ns();
@@ -848,6 +938,58 @@ mod tests {
         e.apply(Cmd::Msg(1, ToEngine::Start { stream: 1 }));
         e.apply(Cmd::Msg(1, ToEngine::SetGain { stream: 1, db: 0.0 }));
         assert!(e.slots[0].gain.current() < 0.6, "ramps once it plays");
+    }
+
+    #[test]
+    fn balance_fades_the_far_side_only() {
+        assert_eq!(balance_gains(0.0), [1.0, 1.0]);
+        assert_eq!(balance_gains(-0.5), [1.0, 0.5]);
+        assert_eq!(balance_gains(1.0), [0.0, 1.0]);
+        assert_eq!(balance_gains(f32::NAN), [1.0, 1.0]);
+        assert_eq!(balance_gains(-7.0), [1.0, 0.0]);
+        let (p, c) = ring_pair("balance", 4096, 2);
+        let mut e = Engine::new(48_000, 2, 64);
+        e.apply(Cmd::Begin(1));
+        open(&mut e, 1, 1, 48_000, 2, c);
+        e.apply(Cmd::Msg(1, ToEngine::SetBalance { sink: 0, balance: 0.5 }));
+        let mut mix = vec![0.0f32; 128];
+        for _ in 0..200 {
+            p.write(&[0.5; 128]);
+            e.mix(&mut mix, 0, 0);
+        }
+        assert!((mix[126] - 0.25).abs() < 0.01 && (mix[127] - 0.5).abs() < 0.01, "{:?}", &mix[126..]);
+    }
+
+    #[test]
+    fn a_layout_change_keeps_streams_playing_in_the_new_layout() {
+        let (p, c) = ring_pair("layout", 4096, 2);
+        let mut e = Engine::new(48_000, 2, 64);
+        e.apply(Cmd::Begin(1));
+        open(&mut e, 1, 1, 48_000, 2, c);
+        e.apply(Cmd::Msg(1, ToEngine::SetLayout { sink: 0, channels: 6 }));
+        assert_eq!(e.want_channels.take(), Some(6));
+        e.set_channels(6);
+        // A stream opened for the old layout is converted to the new one.
+        let (p2, c2) = ring_pair("layout2", 4096, 1);
+        e.apply(Cmd::Open(1, 2, Box::new(Adapter::new(48_000, 1, 48_000, 2).unwrap()), c2, writer()));
+        e.apply(Cmd::Msg(1, ToEngine::SetGain { stream: 2, db: 0.0 }));
+        e.apply(Cmd::Msg(1, ToEngine::Start { stream: 2 }));
+        e.apply(Cmd::Msg(1, ToEngine::SetBalance { sink: 0, balance: 1.0 }));
+        let mut mix = vec![0.0f32; 64 * 6];
+        for _ in 0..200 {
+            p.write(&[0.5; 128]);
+            p2.write(&[0.25; 64]);
+            e.mix(&mut mix, 0, 0);
+        }
+        let f = &mix[mix.len() - 6..];
+        // FL faded out by the balance, FR full; mono lands in the centre;
+        // nothing in LFE or the surrounds.
+        assert!(f[0].abs() < 0.01 && (f[1] - 0.5).abs() < 0.01, "{f:?}");
+        assert!((f[2] - 0.25).abs() < 0.01, "{f:?}");
+        assert_eq!((f[3], f[4], f[5]), (0.0, 0.0, 0.0), "{f:?}");
+        // Unknown layouts are ignored.
+        e.apply(Cmd::Msg(1, ToEngine::SetLayout { sink: 0, channels: 5 }));
+        assert_eq!(e.want_channels, None);
     }
 
     #[test]

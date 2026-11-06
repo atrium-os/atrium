@@ -19,7 +19,7 @@
 use crate::app::{role_from_wire, CAP_ATTRIBUTION, CAP_AUDIO, CAP_CONTROL};
 use crate::grant::GrantStore;
 use crate::policy::{Device, DeviceKind, Session, Stream};
-use crate::volumes::{clamp, Level, VolumeStore};
+use crate::volumes::{clamp, Level, OutputSettings, VolumeStore};
 use lyra_protocol::fdpass::{recv_fd, send_fd};
 use lyra_protocol::wire::{
     self, AppEntry, DenyCode, FromAttribution, FromControl, FromEngine, Output, Role as WireRole, Ticket, ToApp,
@@ -105,6 +105,11 @@ struct ControlConn {
 struct State {
     sess: Session,
     volumes: VolumeStore,
+    /// The outputs' balance (system-wide), and where it is kept.
+    outputs: OutputSettings,
+    state_dir: Option<String>,
+    /// The device's channel count, as lyrad last reported it.
+    device_channels: u8,
     /// The seat file, when streams are gated on the active session.
     seat: Option<String>,
     controls: HashMap<u64, ControlConn>,
@@ -177,6 +182,25 @@ impl State {
 
     fn owns(&self, conn: u64, stream: u32) -> bool {
         self.streams.get(&stream).is_some_and(|r| r.conn == conn && r.open)
+    }
+
+    fn outputs_msg(&self) -> FromControl {
+        let outputs = self.sess.devices.iter()
+            .map(|d| {
+                let name = output_name(d);
+                Output { id: d.id, balance: self.outputs.balance(&name), channels: self.outputs.layout(&name), name }
+            })
+            .collect();
+        FromControl::Outputs { current: self.sess.default_device, outputs }
+    }
+
+    /// Tell lyrad the current output's balance and speaker layout.
+    fn send_balance(&mut self) {
+        let sink = self.sess.default_device;
+        let name = self.sess.devices.iter().find(|d| d.id == sink).map(output_name).unwrap_or_default();
+        let (balance, channels) = (self.outputs.balance(&name), self.outputs.layout(&name));
+        let _ = wire::send(&mut self.lyrad, &ToEngine::SetBalance { sink, balance });
+        let _ = wire::send(&mut self.lyrad, &ToEngine::SetLayout { sink, channels });
     }
 
     /// Whether `user`'s session is the active one (always, without a seat).
@@ -281,7 +305,8 @@ fn serve_app(mut app: UnixStream, state: Shared, cfg: Arc<Config>, socket_caps: 
         let _ = wire::send(&mut app, &ToApp::Denied { tag: 0, code: DenyCode::NotGranted });
         return;
     };
-    let welcome = ToApp::Welcome { device_rate: cfg.device_rate, device_channels: cfg.device_channels, period_frames: cfg.period_frames };
+    let device_channels = state.lock().unwrap().device_channels;
+    let welcome = ToApp::Welcome { device_rate: cfg.device_rate, device_channels, period_frames: cfg.period_frames };
     if wire::send(&mut app, &welcome).is_err() {
         return;
     }
@@ -463,9 +488,48 @@ fn serve_control(mut c: UnixStream, state: Shared, cfg: Arc<Config>, socket_caps
                 st.notify_controls(Some(user));
             }
             ToControl::ListOutputs => {
-                let outputs = st.sess.devices.iter().map(|d| Output { id: d.id, name: output_name(d) }).collect();
-                let current = st.sess.default_device;
-                st.to_control(conn, &FromControl::Outputs { current, outputs });
+                let m = st.outputs_msg();
+                st.to_control(conn, &m);
+            }
+            ToControl::SetLayout { output, channels } => {
+                let Some(d) = st.sess.devices.iter().find(|d| d.id == output).copied() else {
+                    st.to_control(conn, &FromControl::Denied { code: DenyCode::NotGranted });
+                    continue;
+                };
+                if !st.active(user) || !crate::volumes::LAYOUTS.contains(&channels) {
+                    let code = if st.active(user) { DenyCode::BadFormat } else { DenyCode::NotGranted };
+                    st.to_control(conn, &FromControl::Denied { code });
+                    continue;
+                }
+                let dir = st.state_dir.clone();
+                if let Err(e) = st.outputs.set_layout(&dir, &output_name(&d), channels) {
+                    eprintln!("choragusd: saving output settings: {e}");
+                }
+                st.send_balance();
+                let m = st.outputs_msg();
+                for c in st.controls.keys().copied().collect::<Vec<_>>() {
+                    st.to_control(c, &m);
+                }
+            }
+            ToControl::SetBalance { output, balance } => {
+                // A system setting of the output: only the active session.
+                let Some(d) = st.sess.devices.iter().find(|d| d.id == output).copied() else {
+                    st.to_control(conn, &FromControl::Denied { code: DenyCode::NotGranted });
+                    continue;
+                };
+                if !st.active(user) {
+                    st.to_control(conn, &FromControl::Denied { code: DenyCode::NotGranted });
+                    continue;
+                }
+                let dir = st.state_dir.clone();
+                if let Err(e) = st.outputs.set_balance(&dir, &output_name(&d), balance) {
+                    eprintln!("choragusd: saving output settings: {e}");
+                }
+                st.send_balance();
+                let m = st.outputs_msg();
+                for c in st.controls.keys().copied().collect::<Vec<_>>() {
+                    st.to_control(c, &m);
+                }
             }
             ToControl::SetOutput { output } => {
                 // The output is the seat's, so only the active session moves it.
@@ -475,6 +539,7 @@ fn serve_control(mut c: UnixStream, state: Shared, cfg: Arc<Config>, socket_caps
                 }
                 let before = st.sess.resolve();
                 st.sess.default_device = output;
+                st.send_balance();
                 for ch in crate::policy::diff(&before, &st.sess.resolve()) {
                     if let crate::policy::Change::Reroute { stream, to_sink } = ch {
                         let _ = wire::send(&mut st.lyrad, &ToEngine::Reroute { stream, sink: to_sink });
@@ -614,6 +679,29 @@ fn serve_lyrad(mut rd: UnixStream, state: Shared) -> io::Error {
             FromEngine::Flushed { stream, frame } => forward(&state, stream, ToApp::Flushed { stream, frame }),
             FromEngine::Drained { stream } => forward(&state, stream, ToApp::Drained { stream }),
             FromEngine::Underrun { stream, frames } => forward(&state, stream, ToApp::Underrun { stream, frames }),
+            FromEngine::Layout { channels } => {
+                let mut st = state.lock().unwrap();
+                // The device refused a layout: keep what it has, and show it.
+                let sink = st.sess.default_device;
+                if let Some(name) = st.sess.devices.iter().find(|d| d.id == sink).map(output_name) {
+                    if st.outputs.layout(&name) != channels {
+                        eprintln!("choragusd: {name} can't take {} channels; kept at {channels}", st.outputs.layout(&name));
+                        let dir = st.state_dir.clone();
+                        let _ = st.outputs.set_layout(&dir, &name, channels);
+                        let m = st.outputs_msg();
+                        for c in st.controls.keys().copied().collect::<Vec<_>>() {
+                            st.to_control(c, &m);
+                        }
+                    }
+                }
+                if channels != st.device_channels {
+                    eprintln!("choragusd: output now {channels} channels");
+                    st.device_channels = channels;
+                    for conn in st.apps.keys().copied().collect::<Vec<_>>() {
+                        st.to_app(conn, &ToApp::OutputChanged { device_channels: channels });
+                    }
+                }
+            }
         }
     }
 }
@@ -664,6 +752,9 @@ pub fn run(cfg: Config) -> io::Error {
     let state: Shared = Arc::new(Mutex::new(State {
         sess: Session::new(vec![spk], spk.id),
         volumes: VolumeStore::new(cfg.state_dir.clone()),
+        outputs: OutputSettings::load(&cfg.state_dir),
+        state_dir: cfg.state_dir.clone(),
+        device_channels: cfg.device_channels,
         seat: cfg.seat.then(|| cfg.seat_path.clone()),
         controls: HashMap::new(),
         tickets: HashMap::new(),
@@ -710,6 +801,8 @@ pub fn run(cfg: Config) -> io::Error {
             }
         });
     }
+    // lyrad starts centred; give it the kept balance.
+    state.lock().unwrap().send_balance();
     let e = serve_lyrad(rd, state.clone());
     // Tell every app its streams are gone before we go.
     let mut st = state.lock().unwrap();

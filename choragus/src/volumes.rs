@@ -146,6 +146,71 @@ impl VolumeStore {
     }
 }
 
+/// The outputs' own settings, system-wide (not any user's): each output's
+/// left/right balance, by output name, in `<dir>/.outputs.toml` (a name no
+/// user file can have: user names never start with a dot).
+#[derive(Serialize, Deserialize, Clone, Debug, Default, PartialEq)]
+pub struct OutputSettings {
+    #[serde(default)]
+    pub balance: BTreeMap<String, f32>,
+    /// Speaker layout by output name: 2, 6 or 8 channels (default 2).
+    #[serde(default)]
+    pub layout: BTreeMap<String, u8>,
+}
+
+/// Speaker layouts an output may have: stereo, 5.1, 7.1.
+pub const LAYOUTS: [u8; 3] = [2, 6, 8];
+
+/// A balance from the wire or a file: −1 to 1, not a number is centred.
+pub fn clamp_balance(b: f32) -> f32 {
+    if b.is_finite() { b.clamp(-1.0, 1.0) } else { 0.0 }
+}
+
+impl OutputSettings {
+    fn path(dir: &Option<String>) -> Option<String> {
+        dir.as_ref().map(|d| format!("{d}/.outputs.toml"))
+    }
+
+    pub fn load(dir: &Option<String>) -> OutputSettings {
+        let mut o: OutputSettings = Self::path(dir)
+            .and_then(|p| std::fs::read_to_string(p).ok())
+            .and_then(|t| toml::from_str(&t).ok())
+            .unwrap_or_default();
+        o.balance.retain(|_, b| b.is_finite());
+        o.balance.values_mut().for_each(|b| *b = clamp_balance(*b));
+        o.layout.retain(|_, c| LAYOUTS.contains(c));
+        o
+    }
+
+    pub fn layout(&self, output: &str) -> u8 {
+        self.layout.get(output).copied().unwrap_or(2)
+    }
+
+    pub fn set_layout(&mut self, dir: &Option<String>, output: &str, channels: u8) -> io::Result<()> {
+        if LAYOUTS.contains(&channels) {
+            self.layout.insert(output.to_string(), channels);
+        }
+        self.save(dir)
+    }
+
+    pub fn balance(&self, output: &str) -> f32 {
+        self.balance.get(output).copied().unwrap_or(0.0)
+    }
+
+    pub fn set_balance(&mut self, dir: &Option<String>, output: &str, b: f32) -> io::Result<()> {
+        self.balance.insert(output.to_string(), clamp_balance(b));
+        self.save(dir)
+    }
+
+    fn save(&self, dir: &Option<String>) -> io::Result<()> {
+        let Some(path) = Self::path(dir) else { return Ok(()) };
+        let text = toml::to_string(self).map_err(io::Error::other)?;
+        let tmp = format!("{path}.tmp");
+        std::fs::write(&tmp, text)?;
+        std::fs::rename(&tmp, &path)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -192,6 +257,17 @@ mod tests {
         assert_eq!(std::fs::read_dir(&d).unwrap().count(), 0);
         // In memory it still applies for this run.
         assert_eq!(s.user("../etc").master, 0.1);
+    }
+
+    #[test]
+    fn balance_is_kept_and_clamped() {
+        let d = Some(dir("balance"));
+        let mut o = OutputSettings::load(&d);
+        assert_eq!(o.balance("Speakers"), 0.0);
+        o.set_balance(&d, "Speakers", 5.0).unwrap();
+        assert_eq!(OutputSettings::load(&d).balance("Speakers"), 1.0);
+        o.set_balance(&d, "Speakers", f32::NAN).unwrap();
+        assert_eq!(OutputSettings::load(&d).balance("Speakers"), 0.0);
     }
 
     #[test]

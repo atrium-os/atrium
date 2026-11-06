@@ -208,6 +208,10 @@ A stream's clock says nothing about other apps or what they play.
 
 ## 7. Volume and the control socket
 
+- **Balance and speaker layout** (added 2026-11-06, [lyra-spatial.md](lyra-spatial.md)): each
+  output has a left/right balance (−1 to 1; only attenuates the far side) and a speaker layout
+  (2, 6 or 8 channels), system settings of the output kept in `/var/db/choragus/.outputs.toml`
+  and set by the active session (`SetBalance`, `SetLayout`; `Output` carries both).
 - The level a stream plays at is `user volume for (user, app) × app's SetVolume × policy
   (ducking) × seat × master`. An app can lower itself but never raise itself past the user's
   setting. All levels are linear 0 to 1; anything out of range is clamped, and not a number

@@ -24,6 +24,12 @@ impl Gain {
         self.target = g;
     }
 
+    /// One sample's gain, advancing the ramp (for per-channel use).
+    pub fn next(&mut self) -> f32 {
+        self.current += (self.target - self.current) * self.coeff;
+        self.current
+    }
+
     /// Go to `g` at once, with no ramp (for a stream nothing has heard yet).
     pub fn jump(&mut self, g: f32) {
         self.target = g;

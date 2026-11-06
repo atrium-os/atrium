@@ -10,6 +10,8 @@
 //!   lyra-vmtest ctl <control_sock> app <app_id> <volume 0..1>
 //!   lyra-vmtest ctl <control_sock> mute <app_id> <0|1>
 //!   lyra-vmtest ctl <control_sock> master <volume 0..1>
+//!   lyra-vmtest ctl <control_sock> balance <-1..1>
+//!   lyra-vmtest ctl <control_sock> layout <2|6|8>
 //!       The volume UI's requests (needs the `audio-control` grant).
 //!   lyra-vmtest lyrad-raw <lyrad_sock>
 //!       Connect to lyrad directly and ask for a stream. Prints `refused` if
@@ -59,6 +61,8 @@ fn ctl(sock: &str, args: &[String]) {
         "app" => ToControl::SetAppVolume { app_id: a(1), volume: a(2).parse().unwrap_or(1.0) },
         "mute" => ToControl::SetAppMute { app_id: a(1), muted: a(2) == "1" },
         "master" => ToControl::SetMaster { volume: a(1).parse().unwrap_or(1.0) },
+        "balance" => ToControl::SetBalance { output: 0, balance: a(1).parse().unwrap_or(0.0) },
+        "layout" => ToControl::SetLayout { output: 0, channels: a(1).parse().unwrap_or(2) },
         other => die(format!("unknown ctl command {other}")),
     };
     u.send(&req).unwrap_or_else(|e| die(format!("send: {e}")));
@@ -68,6 +72,11 @@ fn ctl(sock: &str, args: &[String]) {
             println!("master {master:.3}{}", if master_muted { " muted" } else { "" });
             for e in apps {
                 println!("{} \"{}\" {:?} volume {:.3}{} streams {}", e.app_id, e.label, e.role, e.volume, if e.muted { " muted" } else { "" }, e.streams);
+            }
+        }
+        Ok(FromControl::Outputs { current, outputs }) => {
+            for o in outputs {
+                println!("output {} \"{}\" balance {:+.2} {} ch{}", o.id, o.name, o.balance, o.channels, if o.id == current { " (current)" } else { "" });
             }
         }
         Ok(m) => die(format!("unexpected {m:?}")),

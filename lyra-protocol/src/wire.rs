@@ -133,6 +133,9 @@ pub enum ToApp {
     Held { stream: u32, held: bool },
     /// lyrad went away; open a new stream when the service is back.
     StreamLost { stream: u32 },
+    /// The output's layout changed (the user set 5.1, say): streams keep
+    /// playing, converted to it; a player may switch to a matching track.
+    OutputChanged { device_channels: u8 },
 }
 
 // ── volume UI ⟷ choragusd (audio-control/, lyra-v1.md §7) ──────────────────
@@ -157,6 +160,15 @@ pub enum ToControl {
     /// Answered by `Outputs`.
     ListOutputs,
     SetOutput { output: u32 },
+    /// The output's left/right balance, −1 (left only) to 1 (right only), 0
+    /// centred. A system setting of the output (it corrects speakers or ears,
+    /// not apps), kept across restarts; only the active session sets it.
+    /// Answered by `Outputs`.
+    SetBalance { output: u32, balance: f32 },
+    /// The output's speaker layout: 2, 6 (5.1) or 8 (7.1) channels. The
+    /// codec can't see what is plugged in, so the user says. Kept across
+    /// restarts; only the active session sets it. Answered by `Outputs`.
+    SetLayout { output: u32, channels: u8 },
 }
 
 /// One app with a stream open, as the volume UI shows it.
@@ -176,6 +188,9 @@ pub struct AppEntry {
 pub struct Output {
     pub id: u32,
     pub name: String,
+    pub balance: f32,
+    /// Its speaker layout (2, 6 or 8).
+    pub channels: u8,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
@@ -231,6 +246,12 @@ pub enum ToEngine {
     SetGain { stream: u32, db: f32 },
     /// Move to another sink (one sink in v1).
     Reroute { stream: u32, sink: u32 },
+    /// The sink's left/right balance, −1 to 1 (choragusd clamps it). Only
+    /// attenuates: the louder side stays at full level. lyrad ramps to it.
+    SetBalance { sink: u32, balance: f32 },
+    /// The sink's speaker layout: 2, 6 (5.1) or 8 (7.1) channels. lyrad
+    /// reopens the device with it between periods and answers `Layout`.
+    SetLayout { sink: u32, channels: u8 },
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
@@ -242,6 +263,9 @@ pub enum FromEngine {
     Flushed { stream: u32, frame: u64 },
     Drained { stream: u32 },
     Underrun { stream: u32, frames: u64 },
+    /// The device is open with this many channels (each time lyrad opens it;
+    /// after a `SetLayout` the device refused, the old count again).
+    Layout { channels: u8 },
 }
 
 // ── framing ─────────────────────────────────────────────────────────────────

@@ -53,6 +53,11 @@ fn fake_lyrad(sock: PathBuf, tag: &'static str) -> (mpsc::Receiver<ToEngine>, mp
                     drop(p);
                     rtx.send(cons).unwrap();
                 }
+                ToEngine::SetLayout { channels, .. } => {
+                    // A stand-in device that takes stereo and 5.1, not 7.1.
+                    let got = if *channels == 8 { 2 } else { *channels };
+                    wire::send(&mut c, &FromEngine::Layout { channels: got }).unwrap();
+                }
                 ToEngine::Flush { stream } => {
                     wire::send(&mut c, &FromEngine::Flushed { stream: *stream, frame: 42 }).unwrap();
                 }
@@ -248,10 +253,58 @@ fn the_volume_ui_sets_the_users_levels_and_they_persist() {
     loop {
         match ui.recv().unwrap() {
             FromControl::Outputs { current, outputs } => {
-                assert_eq!((current, outputs), (0, vec![Output { id: 0, name: "Speakers".into() }]));
+                assert_eq!((current, outputs), (0, vec![Output { id: 0, name: "Speakers".into(), balance: 0.0, channels: 2 }]));
                 break;
             }
             _ => continue,
+        }
+    }
+    // Balance is the output's: lyrad gets it, the UI sees it, and it's kept.
+    ui.send(&ToControl::SetBalance { output: 0, balance: -0.5 }).unwrap();
+    assert_eq!(next_engine(&eng, |m| matches!(m, ToEngine::SetBalance { balance, .. } if *balance < 0.0)),
+        ToEngine::SetBalance { sink: 0, balance: -0.5 });
+    loop {
+        if let FromControl::Outputs { outputs, .. } = ui.recv().unwrap() {
+            assert_eq!(outputs[0].balance, -0.5);
+            break;
+        }
+    }
+    ui.send(&ToControl::SetBalance { output: 0, balance: f32::NAN }).unwrap();
+    assert_eq!(next_engine(&eng, |m| matches!(m, ToEngine::SetBalance { .. })), ToEngine::SetBalance { sink: 0, balance: 0.0 });
+    ui.send(&ToControl::SetBalance { output: 0, balance: 0.25 }).unwrap();
+    next_engine(&eng, |m| matches!(m, ToEngine::SetBalance { balance, .. } if *balance == 0.25));
+    // The speaker layout: lyrad is told, and apps learn the new channel count.
+    ui.send(&ToControl::SetLayout { output: 0, channels: 6 }).unwrap();
+    assert_eq!(next_engine(&eng, |m| matches!(m, ToEngine::SetLayout { channels: 6, .. })), ToEngine::SetLayout { sink: 0, channels: 6 });
+    loop {
+        match c.next_event().unwrap() {
+            ToApp::OutputChanged { device_channels } => { assert_eq!(device_channels, 6); break; }
+            _ => continue,
+        }
+    }
+    let c6 = Client::connect(s1[0].to_str().unwrap(), None).unwrap();
+    assert_eq!(c6.device_channels, 6, "a new app is welcomed with the layout");
+    drop(c6);
+    // A layout the device refuses is not kept: the UI sees what it has.
+    ui.send(&ToControl::SetLayout { output: 0, channels: 8 }).unwrap();
+    let mut seen = Vec::new();
+    loop {
+        // Earlier requests' Outputs may still be queued: start at the 8.
+        if let FromControl::Outputs { outputs, .. } = ui.recv().unwrap() {
+            if outputs[0].channels == 8 || !seen.is_empty() {
+                seen.push(outputs[0].channels);
+            }
+            if seen.len() == 2 { break; }
+        }
+    }
+    assert_eq!(seen, vec![8, 2], "asked for, then what the device took");
+    ui.send(&ToControl::SetLayout { output: 0, channels: 6 }).unwrap();
+    next_engine(&eng, |m| matches!(m, ToEngine::SetLayout { channels: 6, .. }));
+    ui.send(&ToControl::SetLayout { output: 0, channels: 5 }).unwrap();
+    loop {
+        if let FromControl::Denied { code } = ui.recv().unwrap() {
+            assert_eq!(code, DenyCode::BadFormat);
+            break;
         }
     }
     ui.send(&ToControl::SetOutput { output: 9 }).unwrap();
@@ -269,6 +322,10 @@ fn the_volume_ui_sets_the_users_levels_and_they_persist() {
     let saved = std::fs::read_to_string(state.join("alice.toml")).unwrap();
     assert!(saved.contains("volume = 0.5"), "{saved}");
     let (s2, eng2, _r2) = start_with("ctl2", &reg, grants, &socks, Some(state));
+    assert_eq!(next_engine(&eng2, |m| matches!(m, ToEngine::SetBalance { .. })), ToEngine::SetBalance { sink: 0, balance: 0.25 },
+        "a restarted choragusd gives lyrad the kept balance");
+    assert_eq!(next_engine(&eng2, |m| matches!(m, ToEngine::SetLayout { .. })), ToEngine::SetLayout { sink: 0, channels: 6 },
+        "and the kept layout");
     let mut c = Client::connect(s2[0].to_str().unwrap(), None).unwrap();
     let _s = c.open(params()).unwrap();
     gain(&eng2, -6.02);
