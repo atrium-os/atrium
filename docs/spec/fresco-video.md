@@ -186,7 +186,7 @@ are covered by the engine's own rules.
 | V3 | frescod: colour (matrix, range, BT.2390 tone map, HDR passthrough); the protected flag | Fresco thread |
 | V4 | a probe player: plays a test clip through a layer in the VM, checks timing and colour against reference frames | Fresco thread |
 | P1 | the native player behind `media-player` ([atrium-player.md](atrium-player.md)): demux (WebM, MP4), dav1d, libvpx, OpenH264, A/V sync from `PRESENTED`, native controls, PiP and media keys | a new thread (Shankar to allocate) |
-| P2 | audio: Lyra and Choragus exist (atrium-lyra-architecture.md §5.4); the player needs Lyra's audio presentation clock on the wire (§12.1), choragusd brokering the ring fd, and jail-verified identity (atrium-player.md §9.6) | a new thread (Shankar to allocate) |
+| P2 | audio: finish Lyra and Choragus for apps ([lyra-v1.md](lyra-v1.md)): the audio presentation clock on the wire (Lyra §12.1), the app wire (formats, pause, flush), registry-only identity, no `/dev/dsp` in app jails, lyrad and choragusd as non-root jailed services. choragusd already brokers the ring fd | audio thread |
 | P3 | the Navigator's `<video>` and `MediaSource` as a front end to the role | Navigator thread, with the Pergola thread |
 | G1 | hardware decode: the VCN block in atrium-gpu-amd, and a gpusim model of it | GPU thread; feasibility first (§10.4) |
 | G2 | GPU frames into layers (§7): sealed buffers from the player's context | GPU thread with Fresco thread, after F6 |
