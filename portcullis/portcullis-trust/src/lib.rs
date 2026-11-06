@@ -108,6 +108,17 @@ impl Trust {
     pub fn verify(&self, tree: &Path, manifest_text: &str, demand: Demand)
         -> Result<(), String>
     {
+        self.verify_publisher(tree, manifest_text, demand).map(|_| ())
+    }
+
+    /// As [`Trust::verify`], and name the publisher: `Some(id)` (SHA-256 of
+    /// the signing key's SPKI DER) when a trusted publisher signed it, `None`
+    /// when trust is unconfigured and an unsigned manifest was allowed. The
+    /// launcher records the id in the launch registry; services that bind
+    /// data to an app (Arca) treat `None` as "no publisher identity".
+    pub fn verify_publisher(&self, tree: &Path, manifest_text: &str, demand: Demand)
+        -> Result<Option<[u8; 32]>, String>
+    {
         let publishers = load_trusted_publishers(
             self.publishers_dir.to_str().unwrap_or(PUBLISHERS_DIR));
         if publishers.is_empty() {
@@ -120,12 +131,15 @@ impl Trust {
             eprintln!(
                 "portcullisd: WARNING manifest trust not configured ({} empty); allowing UNSIGNED {}",
                 self.publishers_dir.display(), tree.display());
-            return Ok(());
+            return Ok(None);
         }
         let sig = manifest_signature(&tree.join("atrium.toml.sig"));
-        portcullis_sig::verify_trusted(manifest_text.as_bytes(), &sig, &publishers)
-            .map(|()| eprintln!("portcullis: {} manifest signature verified (trusted publisher)",
-                                tree.display()))
+        portcullis_sig::verify_trusted_publisher(manifest_text.as_bytes(), &sig, &publishers)
+            .map(|id| {
+                eprintln!("portcullis: {} manifest signature verified (trusted publisher)",
+                          tree.display());
+                Some(id)
+            })
             .map_err(|e| format!("manifest not signed by a trusted publisher ({e:?})"))
     }
 }
@@ -162,6 +176,11 @@ pub fn manifest_signature(sig_path: &Path) -> Vec<u8> {
 /// The machine's configured gate, at the operator's policy level.
 pub fn verify(tree: &Path, manifest_text: &str) -> Result<(), String> {
     Trust::load().verify(tree, manifest_text, Demand::PolicyDefault)
+}
+
+/// As [`verify`], naming the publisher (see [`Trust::verify_publisher`]).
+pub fn verify_publisher(tree: &Path, manifest_text: &str) -> Result<Option<[u8; 32]>, String> {
+    Trust::load().verify_publisher(tree, manifest_text, Demand::PolicyDefault)
 }
 
 #[cfg(test)]

@@ -58,6 +58,35 @@ pub fn verify_trusted(
     Err(if trusted_keys_pem.is_empty() { SigError::Untrusted } else { last })
 }
 
+/// As [`verify_trusted`], and say WHICH publisher signed: the SHA-256 of the
+/// matching key's SPKI DER. That 32-byte publisher id is half of an app's
+/// identity (with its app id): services such as Arca bind secrets to it, so
+/// an app id re-installed under another publisher's key is another app.
+pub fn verify_trusted_publisher(
+    manifest: &[u8],
+    sig_der: &[u8],
+    trusted_keys_pem: &[String],
+) -> Result<[u8; 32], SigError> {
+    let mut last = SigError::Untrusted;
+    for pem in trusted_keys_pem {
+        match verify_one(manifest, sig_der, pem) {
+            Ok(()) => return publisher_id(pem),
+            Err(e) => last = e,
+        }
+    }
+    Err(if trusted_keys_pem.is_empty() { SigError::Untrusted } else { last })
+}
+
+/// The publisher id of a PEM public key: SHA-256 over its SPKI DER, so the
+/// same key always has the same id however its PEM is wrapped.
+pub fn publisher_id(pubkey_pem: &str) -> Result<[u8; 32], SigError> {
+    use p256::pkcs8::EncodePublicKey;
+    use sha2::Digest;
+    let vk = VerifyingKey::from_public_key_pem(pubkey_pem).map_err(|_| SigError::BadKey)?;
+    let der = vk.to_public_key_der().map_err(|_| SigError::BadKey)?;
+    Ok(sha2::Sha256::digest(der.as_bytes()).into())
+}
+
 /// Decode a base64 signature (cosign's on-disk form) to DER bytes.
 pub fn sig_from_base64(s: &str) -> Result<Vec<u8>, SigError> {
     base64::engine::general_purpose::STANDARD
@@ -87,6 +116,20 @@ mod tests {
         let manifest = b"[app]\nid = \"org.atrium.recorder\"\n";
         let sig: Signature = sk.sign(manifest);
         assert_eq!(verify_trusted(manifest, sig.to_der().as_bytes(), &[pem]), Ok(()));
+    }
+
+    #[test]
+    fn the_signing_publisher_is_named() {
+        let (sk, pem) = keypair();
+        let other = SigningKey::from_bytes(&[9u8; 32].into()).unwrap();
+        let other_pem = other.verifying_key().to_public_key_pem(Default::default()).unwrap();
+        let manifest = b"[app]\nid = \"org.atrium.mail\"\n";
+        let sig: Signature = sk.sign(manifest);
+        let id = verify_trusted_publisher(manifest, sig.to_der().as_bytes(), &[other_pem.clone(), pem.clone()]).unwrap();
+        assert_eq!(id, publisher_id(&pem).unwrap());
+        assert_ne!(id, publisher_id(&other_pem).unwrap());
+        // The same signature under only the other key: untrusted, no id.
+        assert!(verify_trusted_publisher(manifest, sig.to_der().as_bytes(), &[other_pem]).is_err());
     }
 
     #[test]

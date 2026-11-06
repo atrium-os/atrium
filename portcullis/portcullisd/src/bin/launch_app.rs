@@ -50,17 +50,20 @@ fn main() {
     let text = String::from_utf8_lossy(&manifest).into_owned();
     // The gate reads the signature from <tree>/atrium.toml.sig itself.
     let _ = sig_p;
-    if let Err(e) = manifest_trust::Trust::load()
-        .verify(tree, &text, manifest_trust::Demand::Required)
+    let publisher = match manifest_trust::Trust::load()
+        .verify_publisher(tree, &text, manifest_trust::Demand::Required)
     {
-        eprintln!("launch: REFUSED — {e}");
-        exit(1);
-    }
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("launch: REFUSED — {e}");
+            exit(1);
+        }
+    };
     eprintln!("launch: manifest verified (trusted publisher) for {app_id}");
 
     // 2. ALLOCATE a dedicated uid; 3. REGISTER the binding.
     let uid = portcullis_peer::allocate(portcullis_peer::DEFAULT_REGISTRY);
-    if let Err(e) = portcullis_peer::register(portcullis_peer::DEFAULT_REGISTRY, uid, owner, app_id) {
+    if let Err(e) = portcullis_peer::register_with_publisher(portcullis_peer::DEFAULT_REGISTRY, uid, owner, app_id, publisher.as_ref()) {
         eprintln!("launch: register uid {uid}: {e}"); exit(1);
     }
     eprintln!("launch: allocated uid {uid} for {app_id} (owner {owner}); registered");

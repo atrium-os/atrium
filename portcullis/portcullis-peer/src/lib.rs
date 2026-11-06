@@ -87,16 +87,45 @@ pub fn username(uid: u32) -> Option<String> {
     Some(name.to_string_lossy().into_owned())
 }
 
-// ── the launch registry: uid → (owning user, app-id) ──────────────────────────
+// ── the launch registry: uid → (owning user, app-id, publisher) ───────────────
+
+/// One registry binding.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Entry {
+    user: String,
+    app_id: String,
+    /// The manifest's verified publisher id (SHA-256 of the signing key's SPKI
+    /// DER, `portcullis_sig::publisher_id`), or `None` for an app launched
+    /// unsigned (trust unconfigured) or a system session component.
+    publisher: Option<[u8; 32]>,
+}
 
 #[derive(Default)]
 pub struct AppRegistry {
-    map: HashMap<u32, (String, String)>,
+    map: HashMap<u32, Entry>,
+}
+
+fn parse_publisher(hex: &str) -> Option<[u8; 32]> {
+    if hex.len() != 64 || !hex.bytes().all(|c| c.is_ascii_hexdigit()) {
+        return None;
+    }
+    let mut out = [0u8; 32];
+    for (i, b) in out.iter_mut().enumerate() {
+        *b = u8::from_str_radix(&hex[2 * i..2 * i + 2], 16).ok()?;
+    }
+    Some(out)
+}
+
+fn publisher_hex(p: &[u8; 32]) -> String {
+    p.iter().map(|b| format!("{b:02x}")).collect()
 }
 
 impl AppRegistry {
-    /// Parse the registry text. One app per line: `<uid> <user> <app-id>`;
-    /// `#` comments and blanks ignored.
+    /// Parse the registry text. One app per line:
+    /// `<uid> <user> <app-id> [publisher-id hex]`; `#` comments and blanks
+    /// ignored; a later line for the same uid replaces an earlier one. A
+    /// fourth field that isn't 64 hex digits makes the line void: a binding
+    /// with a garbled publisher must not read as "unsigned".
     pub fn parse(text: &str) -> AppRegistry {
         let mut map = HashMap::new();
         for line in text.lines() {
@@ -106,8 +135,18 @@ impl AppRegistry {
             }
             let mut it = line.split_whitespace();
             if let (Some(uid), Some(user), Some(app)) = (it.next(), it.next(), it.next()) {
+                let publisher = match it.next() {
+                    None => None,
+                    Some(h) => match parse_publisher(h) {
+                        Some(p) => Some(p),
+                        None => continue,
+                    },
+                };
+                if it.next().is_some() {
+                    continue;
+                }
                 if let Ok(uid) = uid.parse::<u32>() {
-                    map.insert(uid, (user.to_string(), app.to_string()));
+                    map.insert(uid, Entry { user: user.to_string(), app_id: app.to_string(), publisher });
                 }
             }
         }
@@ -121,7 +160,14 @@ impl AppRegistry {
     /// The verified `(owning user, app-id)` for a uid, if Portcullis launched an
     /// app there. `None` = not a Portcullis-launched app (→ default-deny).
     pub fn resolve(&self, uid: u32) -> Option<(&str, &str)> {
-        self.map.get(&uid).map(|(u, a)| (u.as_str(), a.as_str()))
+        self.map.get(&uid).map(|e| (e.user.as_str(), e.app_id.as_str()))
+    }
+
+    /// The verified publisher id for a uid: `Some(Some(id))` for a signed app,
+    /// `Some(None)` for one launched without a publisher, `None` if the uid
+    /// isn't in the registry.
+    pub fn publisher(&self, uid: u32) -> Option<Option<[u8; 32]>> {
+        self.map.get(&uid).map(|e| e.publisher)
     }
 
     /// The uid already bound to `(user, app_id)`, if any. Lets a re-launch REUSE
@@ -129,7 +175,16 @@ impl AppRegistry {
     /// peer-cred it) instead of leaking a fresh uid + passwd entry every time.
     pub fn uid_for(&self, user: &str, app_id: &str) -> Option<u32> {
         self.map.iter()
-            .find(|(_, (u, a))| u == user && a == app_id)
+            .find(|(_, e)| e.user == user && e.app_id == app_id)
+            .map(|(uid, _)| *uid)
+    }
+
+    /// As [`AppRegistry::uid_for`], but only a binding with the same publisher.
+    /// The launcher uses this: an app id re-installed under another publisher's
+    /// key gets a NEW uid, so it inherits nothing keyed by the old one.
+    pub fn uid_for_publisher(&self, user: &str, app_id: &str, publisher: Option<&[u8; 32]>) -> Option<u32> {
+        self.map.iter()
+            .find(|(_, e)| e.user == user && e.app_id == app_id && e.publisher.as_ref() == publisher)
             .map(|(uid, _)| *uid)
     }
 }
@@ -150,9 +205,28 @@ pub fn app_username(uid: u32) -> String {
 /// Append a binding to the registry file (the **write** side — Portcullis calls
 /// this when it launches an app at `uid`). Append-only; one line per launch.
 pub fn register(path: &str, uid: u32, user: &str, app_id: &str) -> io::Result<()> {
+    register_with_publisher(path, uid, user, app_id, None)
+}
+
+/// As [`register`], recording the manifest's verified publisher id.
+pub fn register_with_publisher(
+    path: &str,
+    uid: u32,
+    user: &str,
+    app_id: &str,
+    publisher: Option<&[u8; 32]>,
+) -> io::Result<()> {
     use std::io::Write;
     let mut f = std::fs::OpenOptions::new().create(true).append(true).open(path)?;
-    writeln!(f, "{uid} {user} {app_id}")
+    match publisher {
+        None => writeln!(f, "{uid} {user} {app_id}"),
+        Some(p) => writeln!(f, "{uid} {user} {app_id} {}", publisher_hex(p)),
+    }
+}
+
+/// As [`AppRegistry::uid_for_publisher`], reading the registry file.
+pub fn uid_for_app_publisher(path: &str, user: &str, app_id: &str, publisher: Option<&[u8; 32]>) -> Option<u32> {
+    AppRegistry::load(path).ok().and_then(|r| r.uid_for_publisher(user, app_id, publisher))
 }
 
 // ── the one call a service makes ──────────────────────────────────────────────
@@ -237,6 +311,31 @@ pub mod seat {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn registry_records_the_publisher() {
+        let d = std::env::temp_dir().join(format!("peer-pub-{}", std::process::id()));
+        let path = d.to_str().unwrap();
+        let _ = std::fs::remove_file(path);
+        register(path, 50000, "alice", "org.x.sys").unwrap();
+        register_with_publisher(path, 50001, "alice", "org.x.mail", Some(&[0xab; 32])).unwrap();
+        let r = AppRegistry::load(path).unwrap();
+        assert_eq!(r.publisher(50000), Some(None));
+        assert_eq!(r.publisher(50001), Some(Some([0xab; 32])));
+        assert_eq!(r.publisher(1), None);
+        assert_eq!(r.uid_for_publisher("alice", "org.x.mail", Some(&[0xab; 32])), Some(50001));
+        // Same app id, another publisher: no reuse.
+        assert_eq!(r.uid_for_publisher("alice", "org.x.mail", Some(&[0xcd; 32])), None);
+        assert_eq!(r.uid_for_publisher("alice", "org.x.mail", None), None);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn a_garbled_publisher_voids_the_line() {
+        let r = AppRegistry::parse("50001 alice org.x.mail nothex\n50002 alice org.x.b 00 extra\n");
+        assert_eq!(r.resolve(50001), None);
+        assert_eq!(r.resolve(50002), None);
+    }
 
     const REG: &str = "
         # uid  user  app-id  (Portcullis writes this at launch)

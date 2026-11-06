@@ -675,6 +675,7 @@ version = "0.1.0"
 dependencies = [
  "base64",
  "p256",
+ "sha2",
 ]
 
 [[package]]

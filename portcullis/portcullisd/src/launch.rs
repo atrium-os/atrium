@@ -72,7 +72,7 @@ pub fn launch_with_stdio(
     /* manifest TRUST gate — the SAME shared check as the Launch path, so a
      * session/stdio-launched app is signature-verified identically (any
      * user-app launch vector goes through one gate, not a per-path copy). */
-    crate::manifest_trust::verify(&tree, &text)
+    let publisher = crate::manifest_trust::verify_publisher(&tree, &text)
         .map_err(|m| LaunchError::Failed("signature", m))?;
     let manifest = Manifest::from_str(&text)
         .map_err(|e| LaunchError::Failed("manifest",
@@ -92,7 +92,7 @@ pub fn launch_with_stdio(
      * launch registry; the process executes as the per-app uid that services
      * peer-cred back to (owner, app_id). $HOME is the app uid's own (nologin)
      * home, not the human's. */
-    let (app_uid, run_as_user) = resolve_app_uid(user, app_id)?;
+    let (app_uid, run_as_user) = resolve_app_uid(user, app_id, publisher.as_ref())?;
     eprintln!("portcullisd: launching {app_id} as uid {app_uid} ({run_as_user}); owner={user}");
     let user_home = match std::ffi::CString::new(run_as_user.as_str()).ok().and_then(|cuser| {
         let mut pwd: libc::passwd = unsafe { std::mem::zeroed() };
@@ -457,17 +457,19 @@ fn full_teardown(jail_path: &Path, jail_name: Option<&str>) {
 /// NOTE: creating the passwd entry here mirrors the launch path already shelling
 /// out (mount/jail/umount). Longer-term this privileged mutation belongs in jaild
 /// (the audited broker) or at app-install time, not in portcullisd per-launch.
-fn resolve_app_uid(owner: &str, app_id: &str) -> Result<(u32, String), LaunchError> {
+fn resolve_app_uid(owner: &str, app_id: &str, publisher: Option<&[u8; 32]>) -> Result<(u32, String), LaunchError> {
     let reg = portcullis_peer::DEFAULT_REGISTRY;
     let fail = |s: String| LaunchError::Failed("uid", s);
     if let Some(dir) = Path::new(reg).parent() {
         let _ = fs::create_dir_all(dir);
     }
-    let uid = match portcullis_peer::uid_for_app(reg, owner, app_id) {
+    /* Reuse only a binding with the SAME publisher: an app id re-installed under
+     * another publisher's key is another app (arca.md §4.1) and gets a new uid. */
+    let uid = match portcullis_peer::uid_for_app_publisher(reg, owner, app_id, publisher) {
         Some(uid) => uid,
         None => {
             let uid = portcullis_peer::allocate(reg);
-            portcullis_peer::register(reg, uid, owner, app_id)
+            portcullis_peer::register_with_publisher(reg, uid, owner, app_id, publisher)
                 .map_err(|e| fail(format!("register uid {uid}: {e}")))?;
             uid
         }
