@@ -22,20 +22,25 @@ pub fn monotonic_ns() -> i64 {
     ts.tv_sec as i64 * 1_000_000_000 + ts.tv_nsec as i64
 }
 
-/// Media time to wall time. Until Lyra's clock drives it (M6), the master
-/// is `CLOCK_MONOTONIC`, started at the first frame after play or a seek.
+/// Media time to wall time. With sound, the audio clock is the master
+/// (`av`, from [`crate::audio_out`]); without, `CLOCK_MONOTONIC`, started at
+/// the first frame after play or a seek.
 #[derive(Debug, Default)]
 pub struct Clock {
     base: Option<(i64, i64)>,
     /// How far ahead of now the first frame is scheduled.
     pub lead_ns: i64,
+    pub av: Option<crate::audio_out::AvMap>,
 }
 
 impl Clock {
     pub fn new(lead_ns: i64) -> Self {
-        Clock { base: None, lead_ns }
+        Clock { base: None, lead_ns, av: None }
     }
     pub fn present_at(&mut self, pts_ns: i64) -> i64 {
+        if let Some(m) = self.av {
+            return m.at(pts_ns);
+        }
         let lead = self.lead_ns;
         let (m, p) = *self.base.get_or_insert_with(|| (monotonic_ns() + lead, pts_ns));
         m + (pts_ns - p)

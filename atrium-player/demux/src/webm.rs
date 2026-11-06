@@ -51,6 +51,9 @@ pub struct Parser {
     timescale: u64,
     tracks: Vec<TrackInfo>,
     by_number: HashMap<u64, u8>,
+    /// Each track's CodecDelay (ns): block times include it, media time
+    /// doesn't (Opus pre-skip).
+    delay: Vec<i64>,
     cluster_tc: Option<u64>,
     /// (time ns, absolute cluster offset), sorted by time.
     cues: Vec<(i64, u64)>,
@@ -73,6 +76,7 @@ impl Parser {
             timescale: 1_000_000,
             tracks: Vec::new(),
             by_number: HashMap::new(),
+            delay: Vec::new(),
             cluster_tc: None,
             cues: Vec::new(),
             want: None,
@@ -230,6 +234,7 @@ impl Parser {
     fn parse_tracks(&mut self, b: &[u8]) -> Result<()> {
         let mut tracks = Vec::new();
         let mut by_number = HashMap::new();
+        let mut delay = Vec::new();
         for el in children(b) {
             let (id, v) = el?;
             if id != 0xAE {
@@ -238,7 +243,8 @@ impl Parser {
             if tracks.len() >= self.lim.max_tracks {
                 return Err(Error::TooBig("tracks"));
             }
-            let t = self.track_entry(v, tracks.len() as u8)?;
+            let (t, d) = self.track_entry(v, tracks.len() as u8)?;
+            delay.push(d);
             if by_number.insert(t.id, t.index).is_some() {
                 return Err(Error::Malformed("duplicate track number"));
             }
@@ -246,14 +252,16 @@ impl Parser {
         }
         self.tracks = tracks.clone();
         self.by_number = by_number;
+        self.delay = delay;
         self.out.push_back(Event::Tracks(tracks));
         Ok(())
     }
 
-    fn track_entry(&self, b: &[u8], index: u8) -> Result<TrackInfo> {
+    /// The track, and its CodecDelay in ns.
+    fn track_entry(&self, b: &[u8], index: u8) -> Result<(TrackInfo, i64)> {
         let (mut number, mut ttype, mut codec_id, mut private) = (0u64, 0u64, String::new(), Vec::new());
         let (mut w, mut h, mut rate, mut channels) = (0u64, 0u64, 0f64, 1u64);
-        let (mut default_duration, mut encrypted) = (None, false);
+        let (mut default_duration, mut encrypted, mut codec_delay) = (None, false, 0u64);
         for el in children(b) {
             let (id, v) = el?;
             match id {
@@ -271,6 +279,8 @@ impl Parser {
                     }
                     private = v.to_vec();
                 }
+                // CodecDelay; anything over a second is nonsense.
+                0x56AA => codec_delay = be_uint(v)?.min(1_000_000_000),
                 0x23_E383 => {
                     let d = be_uint(v)?;
                     default_duration = (d > 0).then_some(d);
@@ -344,7 +354,7 @@ impl Parser {
             Codec::Vorbis => vorbis_headers(&private)?,
             _ => private,
         };
-        Ok(TrackInfo { index, id: number, codec, kind, config, default_duration_ns: default_duration, encrypted })
+        Ok((TrackInfo { index, id: number, codec, kind, config, default_duration_ns: default_duration, encrypted }, codec_delay as i64))
     }
 
     fn parse_cues(&mut self, b: &[u8]) -> Result<()> {
@@ -413,7 +423,7 @@ impl Parser {
         let key = key.unwrap_or(flags & 0x80 != 0);
         let frames = lace(r.rest(), flags, self.lim.max_frame)?;
         let ts = self.timescale as i128;
-        let t0 = to_ns((cluster_tc as i128 + rel as i128) * ts, 1_000_000_000);
+        let t0 = to_ns((cluster_tc as i128 + rel as i128) * ts, 1_000_000_000) - self.delay.get(track as usize).copied().unwrap_or(0);
         let info = &self.tracks[track as usize];
         let per = info.default_duration_ns.or_else(|| {
             dur.map(|d| to_ns(d as i128 * ts, 1_000_000_000).max(0) as u64 / frames.len().max(1) as u64)

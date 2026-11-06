@@ -354,6 +354,14 @@ impl<S: Sink> Player<S> {
 
     pub fn seek(&mut self, t_ns: i64) {
         self.drop_queued();
+        // PCM still in the ring is from before the seek: none of it is
+        // readable until the worker's new PCM records say what is.
+        if let Some(a) = self.audio.as_mut() {
+            if let Some(r) = a.ring.as_ref() {
+                a.known_until = r.read_pos();
+            }
+            a.runs.clear();
+        }
         self.sink.discontinuity();
         self.show_one = self.paused;
         self.epoch += 1;

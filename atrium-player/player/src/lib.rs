@@ -11,6 +11,7 @@
 #![deny(unsafe_code)]
 
 pub mod app;
+pub mod audio_out;
 pub mod controls;
 pub mod fresco_sink;
 pub mod ring;

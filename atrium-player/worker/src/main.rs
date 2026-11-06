@@ -170,6 +170,11 @@ impl Worker {
             if busy && !sys::readable(&self.sock, 0) {
                 continue;
             }
+            // Audio waiting for room in the PCM ring: the supervisor frees
+            // it by reading, which sends no message, so look again soon.
+            if !busy && !self.failed && self.audio_waiting() && !sys::readable(&self.sock, 10) {
+                continue;
+            }
             match sys::recv_frame(&self.sock) {
                 Ok(Some((payload, fds))) => {
                     let Some(msg) = decode_frame(&payload) else { return };
@@ -654,6 +659,10 @@ impl Worker {
         true
     }
 
+    fn audio_waiting(&self) -> bool {
+        self.audio.as_ref().is_some_and(|a| a.ring.is_some() && (!a.pcm.is_empty() || a.store.ahead() > 0))
+    }
+
     fn work_audio(&mut self) -> bool {
         let epoch = self.epoch;
         let Some(a) = self.audio.as_mut() else { return false };
@@ -685,7 +694,10 @@ impl Worker {
                 a.pcm.clear();
                 continue;
             }
-            a.pcm_pts = pts;
+            // The decoder may have dropped the packet's first frames (Opus
+            // pre-skip): what is left starts that much later.
+            a.pcm_pts = pts + a.dec.skipped() as i64 * 1_000_000_000 / a.dec.rate() as i64;
+            let pts = a.pcm_pts;
             if let Some(t) = a.drop_before {
                 let rate = a.dec.rate() as i64;
                 let ch = a.dec.channels() as usize;

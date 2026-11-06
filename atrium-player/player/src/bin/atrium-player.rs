@@ -236,7 +236,7 @@ fn embedded() {
     if child.ready(embed, token).is_err() {
         std::process::exit(1);
     }
-    let mut app = App::new(LimenHost { child, embed, dropped: 0 }, conn, win, size, Options::default());
+    let mut app = App::new(LimenHost { child, embed, dropped: 0, ticket: None }, conn, win, size, Options::default());
     run(&mut app);
     if app.host.dropped > 0 {
         eprintln!("atrium-player: dropped {} malformed messages", app.host.dropped);

@@ -88,6 +88,12 @@ pub trait AudioDecoder: Send {
     /// Decode one packet, appending interleaved f32 frames to `out`.
     /// Returns the frames appended.
     fn decode(&mut self, packet: &[u8], out: &mut Vec<f32>) -> Result<usize>;
+    /// Frames the last `decode` dropped from the front of its packet (Opus
+    /// pre-skip), so the first frame kept is that much after the packet's
+    /// timestamp.
+    fn skipped(&self) -> usize {
+        0
+    }
     /// Drop decoder state (a seek).
     fn reset(&mut self);
 }
@@ -147,13 +153,14 @@ pub fn audio(track: &TrackInfo) -> Result<Box<dyn AudioDecoder>> {
 struct OpusDecoder {
     d: ffi::Opus,
     to_skip: usize,
+    skipped: usize,
 }
 
 impl OpusDecoder {
     fn new(head: &[u8]) -> Result<Self> {
         let d = ffi::Opus::new(head)?;
         let pre_skip = u16::from_le_bytes([head[10], head[11]]) as usize;
-        Ok(OpusDecoder { d, to_skip: pre_skip })
+        Ok(OpusDecoder { d, to_skip: pre_skip, skipped: 0 })
     }
 }
 
@@ -168,12 +175,16 @@ impl AudioDecoder for OpusDecoder {
         let start = out.len();
         let n = self.d.decode(packet, out)?;
         let skip = self.to_skip.min(n);
+        self.skipped = skip;
         if skip > 0 {
             let ch = self.channels() as usize;
             out.drain(start..start + skip * ch);
             self.to_skip -= skip;
         }
         Ok(n - skip)
+    }
+    fn skipped(&self) -> usize {
+        self.skipped
     }
     fn reset(&mut self) {
         self.d.reset();

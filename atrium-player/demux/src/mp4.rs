@@ -29,6 +29,9 @@ struct Trex {
 #[derive(Debug, Clone)]
 struct Trk {
     timescale: u64,
+    /// The edit list's start (media timescale): presentation times begin
+    /// there (Opus pre-skip, B-frame delay).
+    shift: i64,
     trex: Trex,
     /// Next decode time for fragments without `tfdt`, in timescale units.
     next_dts: u64,
@@ -220,12 +223,12 @@ impl Parser {
                         return Err(Error::TooBig("tracks"));
                     }
                     let idx = tracks.len() as u8;
-                    let (info, ts, samples) = self.trak(v, idx, self.lim.max_index.saturating_sub(index.len()))?;
+                    let (info, ts, shift, samples) = self.trak(v, idx, self.lim.max_index.saturating_sub(index.len()))?;
                     if by_id.insert(info.id as u32, idx).is_some() {
                         return Err(Error::Malformed("duplicate track id"));
                     }
                     tracks.push(info);
-                    trks.push(Trk { timescale: ts, trex: Trex::default(), next_dts: 0 });
+                    trks.push(Trk { timescale: ts, shift, trex: Trex::default(), next_dts: 0 });
                     index.extend(samples);
                 }
                 _ => {}
@@ -257,9 +260,10 @@ impl Parser {
         Ok(())
     }
 
-    /// (track, timescale, plain sample table).
-    fn trak(&self, b: &[u8], idx: u8, room: usize) -> Result<(TrackInfo, u64, Vec<Pending>)> {
+    /// (track, timescale, edit shift, plain sample table).
+    fn trak(&self, b: &[u8], idx: u8, room: usize) -> Result<(TrackInfo, u64, i64, Vec<Pending>)> {
         let mut id = 0u32;
+        let mut shift = 0i64;
         let mut ts = 0u64;
         let mut handler = [0u8; 4];
         let mut stbl: Option<&[u8]> = None;
@@ -272,6 +276,33 @@ impl Parser {
                     r.skip(3)?;
                     r.skip(if ver == 1 { 16 } else { 8 })?;
                     id = r.u32()?;
+                }
+                // The first edit that shows media says where it starts.
+                b"edts" => {
+                    for bx in boxes(v) {
+                        let (ty, v) = bx?;
+                        if &ty != b"elst" {
+                            continue;
+                        }
+                        let mut r = Rd::new(v);
+                        let ver = r.u8()?;
+                        r.skip(3)?;
+                        let n = r.u32()?.min(64);
+                        for _ in 0..n {
+                            let t = if ver == 1 {
+                                r.skip(8)?;
+                                r.u64()? as i64
+                            } else {
+                                r.skip(4)?;
+                                r.u32()? as i32 as i64
+                            };
+                            r.skip(4)?;
+                            if t >= 0 {
+                                shift = t;
+                                break;
+                            }
+                        }
+                    }
                 }
                 b"mdia" => {
                     for bx in boxes(v) {
@@ -309,11 +340,11 @@ impl Parser {
         }
         let stbl = stbl.ok_or(Error::Malformed("trak without stbl"))?;
         let mut info = TrackInfo { index: idx, id: id as u64, codec: Codec::Unknown, kind: Kind::Other, config: Vec::new(), default_duration_ns: None, encrypted: false };
-        let samples = self.stbl(stbl, &mut info, &handler, ts, room)?;
-        Ok((info, ts, samples))
+        let samples = self.stbl(stbl, &mut info, &handler, ts, shift, room)?;
+        Ok((info, ts, shift, samples))
     }
 
-    fn stbl(&self, b: &[u8], info: &mut TrackInfo, handler: &FourCc, ts: u64, room: usize) -> Result<Vec<Pending>> {
+    fn stbl(&self, b: &[u8], info: &mut TrackInfo, handler: &FourCc, ts: u64, shift: i64, room: usize) -> Result<Vec<Pending>> {
         let (mut stts, mut ctts, mut stss, mut stsz, mut stsc, mut stco) = (None, None, None, None, None, None);
         let mut co64 = false;
         for bx in boxes(b) {
@@ -432,7 +463,7 @@ impl Parser {
                         offset: off,
                         size: sizes[s],
                         dts: to_ns(d, ts),
-                        pts: to_ns(d + cto[s] as i128, ts),
+                        pts: to_ns(d + cto[s] as i128 - shift as i128, ts),
                         dur: Some(to_ns(durs[s] as i128, ts).max(0) as u64),
                         key: key[s],
                     });
@@ -622,7 +653,7 @@ impl Parser {
                                 offset: ptr,
                                 size,
                                 dts: to_ns(dt, trk.timescale),
-                                pts: to_ns(dt + cto as i128, trk.timescale),
+                                pts: to_ns(dt + cto as i128 - trk.shift as i128, trk.timescale),
                                 dur: Some(to_ns(dur as i128, trk.timescale).max(0) as u64),
                                 key: sf & 0x0001_0000 == 0,
                             });

@@ -18,3 +18,5 @@ libc = "0.2"
 
 [dev-dependencies]
 md-5 = "0.10"
+# tests/audio.rs: a stand-in choragusd.
+lyra-protocol = { path = "../../lyra-protocol" }

@@ -9,6 +9,7 @@ use std::time::{Duration, Instant};
 use fresco_client::{Connection, Event};
 use limen::media_player::{code, Source as LoadSource, ToChild, ToParent, RANGES_MAX, TIME_HZ_MAX};
 
+use crate::audio_out::AudioOut;
 use crate::controls::{Action, Controls};
 use crate::fresco_sink::FrescoSink;
 use crate::supervisor::{Options, Player, PlayerEvent, Source};
@@ -32,6 +33,10 @@ pub trait Host {
     /// Waiting at most `wait`.
     fn poll(&mut self, wait: Duration) -> Vec<HostEvent>;
     fn emit(&mut self, m: ToParent);
+    /// Limen's attribution ticket for Lyra, for an embedded player.
+    fn audio_ticket(&self) -> Option<[u8; 16]> {
+        None
+    }
 }
 
 /// A window of its own: nobody to tell.
@@ -49,6 +54,7 @@ pub struct LimenHost {
     pub child: limen::client::Child,
     pub embed: limen::proto::EmbedId,
     pub dropped: u32,
+    pub ticket: Option<[u8; 16]>,
 }
 
 impl Host for LimenHost {
@@ -84,7 +90,7 @@ impl Host for LimenHost {
                 ChildEvent::Suspended { embed } if embed == self.embed => out.push(HostEvent::Suspend),
                 ChildEvent::Resumed { embed } if embed == self.embed => out.push(HostEvent::Resume),
                 ChildEvent::Detaching { embed } if embed == self.embed => out.push(HostEvent::Gone),
-                // The ticket is for Lyra (M6); other embeds aren't ours.
+                ChildEvent::AudioTicket { embed, ticket } if embed == self.embed => self.ticket = Some(ticket),
                 _ => {}
             }
         }
@@ -93,6 +99,10 @@ impl Host for LimenHost {
 
     fn emit(&mut self, m: ToParent) {
         let _ = self.child.emit(self.embed, m.encode());
+    }
+
+    fn audio_ticket(&self) -> Option<[u8; 16]> {
+        self.ticket
     }
 }
 
@@ -117,6 +127,12 @@ pub struct App<H: Host> {
     pub done: bool,
     /// Buffered ranges of the first track the feed reported, in seconds.
     shown_track: Option<u8>,
+    pub audio: Option<AudioOut>,
+    /// choragusd's socket.
+    pub audio_socket: String,
+    volume: f32,
+    /// Since when play is waiting for the audio to start.
+    audio_wait: Option<Instant>,
 }
 
 fn secs(ns: i64) -> f64 {
@@ -163,6 +179,10 @@ impl<H: Host> App<H> {
             frames: 0,
             done: false,
             shown_track: None,
+            audio: None,
+            audio_socket: std::env::var("ATRIUM_AUDIO_SOCKET").unwrap_or_else(|_| crate::audio_out::DEFAULT_SOCKET.into()),
+            volume: 1.0,
+            audio_wait: None,
         }
     }
 
@@ -203,10 +223,29 @@ impl<H: Host> App<H> {
             // Play after the end starts again.
             self.seek(0.0, false);
         }
-        if let Some(p) = self.player.as_mut() {
-            p.set_paused(!play || self.suspended);
-        }
+        self.audio_wait = None;
+        self.sync_paused();
         self.host.emit(if play { ToParent::Playing } else { ToParent::Paused });
+    }
+
+    /// Video runs when playing, shown and, with sound, once the audio clock
+    /// runs (or has failed to start within a second).
+    fn sync_paused(&mut self) {
+        let run = self.want_play && !self.suspended;
+        if let Some(a) = self.audio.as_mut() {
+            a.set_playing(run);
+        }
+        let audio_ready = match self.audio.as_ref() {
+            None => true,
+            Some(a) => a.map().is_some() || self.audio_wait.get_or_insert_with(Instant::now).elapsed() > Duration::from_secs(1),
+        };
+        if !run {
+            self.audio_wait = None;
+        }
+        let ended = self.player.as_ref().is_some_and(|p| p.ended());
+        if let Some(p) = self.player.as_mut() {
+            p.set_paused(!(run && (audio_ready || ended)));
+        }
     }
 
     fn seek(&mut self, to: f64, from_controls: bool) {
@@ -217,6 +256,11 @@ impl<H: Host> App<H> {
         if let Some(p) = self.player.as_mut() {
             p.seek(ns(to));
         }
+        if let Some(a) = self.audio.as_mut() {
+            a.seek(ns(to));
+        }
+        self.audio_wait = None;
+        self.sink().clock.av = None;
         self.ended_sent = false;
         self.ended_at = None;
         self.controls.position_s = to;
@@ -233,10 +277,8 @@ impl<H: Host> App<H> {
             }
             HostEvent::Suspend | HostEvent::Resume => {
                 self.suspended = matches!(ev, HostEvent::Suspend);
-                let paused = !self.want_play || self.suspended;
-                if let Some(p) = self.player.as_mut() {
-                    p.set_paused(paused);
-                }
+                self.audio_wait = None;
+                self.sync_paused();
                 return Ok(());
             }
             HostEvent::Load(fd) => return self.start(Source::File(File::from(fd))),
@@ -295,8 +337,14 @@ impl<H: Host> App<H> {
             ToChild::Play => self.set_playing(true),
             ToChild::Pause | ToChild::Stop => self.set_playing(false),
             ToChild::Seek { secs } => self.seek(secs, false),
-            // Audio is M6 (Lyra); the values are checked by decode already.
-            ToChild::SetVolume { .. } | ToChild::SetRate { .. } => {}
+            ToChild::SetVolume { volume } => {
+                self.volume = volume;
+                if let Some(a) = self.audio.as_mut() {
+                    a.set_volume(volume);
+                }
+            }
+            // Rate (WSOLA) is still to come; the value is checked by decode.
+            ToChild::SetRate { .. } => {}
         }
         Ok(())
     }
@@ -315,7 +363,22 @@ impl<H: Host> App<H> {
                 self.video = Some((width, height));
                 println!("video-track {width}x{height} {bit_depth}-bit");
             }
-            PlayerEvent::AudioTrack { .. } | PlayerEvent::Sandboxed(_) | PlayerEvent::Probe { .. } | PlayerEvent::Restarted => {}
+            PlayerEvent::AudioTrack { rate, channels } => {
+                if self.audio.is_none() {
+                    match AudioOut::open(&self.audio_socket, self.host.audio_ticket(), rate, channels) {
+                        Ok(mut a) => {
+                            if self.volume < 1.0 {
+                                a.set_volume(self.volume);
+                            }
+                            self.audio = Some(a);
+                            self.sync_paused();
+                        }
+                        // No sound for us (no grant, or no Lyra): play silent.
+                        Err(e) => eprintln!("atrium-player: no audio: {e}"),
+                    }
+                }
+            }
+            PlayerEvent::Sandboxed(_) | PlayerEvent::Probe { .. } | PlayerEvent::Restarted => {}
             PlayerEvent::Duration(d) => {
                 if self.duration.is_none() {
                     self.duration = Some(d);
@@ -358,15 +421,28 @@ impl<H: Host> App<H> {
             while let Some(ev) = p.poll(Duration::from_millis(1)) {
                 evs.push(ev);
             }
-            // Audio waits for Lyra (M6): drop it while playing so the worker
-            // keeps going; paused, the ring fills and the worker waits.
-            if !p.paused() {
-                while p.read_pcm(&mut self.pcm).0 > 0 {}
-            }
         }
         for ev in evs {
             self.on_player(ev);
         }
+        if let Some(p) = self.player.as_mut() {
+            let ended = p.ended();
+            match self.audio.as_mut() {
+                Some(a) => {
+                    if !a.pump(p, ended) {
+                        eprintln!("atrium-player: Lyra went away; playing on silent");
+                        self.audio = None;
+                    }
+                }
+                // No sound: drop it while playing so the worker keeps
+                // going; paused, the ring fills and the worker waits.
+                None if self.want_play && !self.suspended => while p.read_pcm(&mut self.pcm).0 > 0 {},
+                None => {}
+            }
+        }
+        let map = self.audio.as_ref().and_then(|a| a.map());
+        self.sink().clock.av = map;
+        self.sync_paused();
         let (released, other) = self.sink().pump(Duration::from_millis(4))?;
         if let Some(p) = self.player.as_mut() {
             for i in released {

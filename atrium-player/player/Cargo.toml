@@ -20,6 +20,8 @@ fresco-client   = { path = "../../fresco-client" }
 fresco-protocol = { path = "../../fresco-protocol" }
 # The media-player role's messages and the child's end of limend.
 limen           = { path = "../../limen" }
+# Sound: choragusd's client and the clock page (lyra-v1.md §5, §6).
+lyra-protocol   = { path = "../../lyra-protocol" }
 # Only `mime_supported`, a string check: the supervisor parses no media.
 atrium-media-demux = { path = "../demux" }
 serde    = { version = "1", features = ["derive"] }
