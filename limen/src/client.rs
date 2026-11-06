@@ -101,7 +101,12 @@ impl Parent {
     /// Ask for a `role` embed in the window `window` names (its frescod
     /// embed token).
     pub fn request(&mut self, role: &str, window: WindowToken) -> Result<EmbedId, Error> {
-        match self.0.call(op::REQUEST, &proto::Request { role: role.into(), window })? {
+        self.request_at(role, window, 0)
+    }
+
+    /// [`Self::request`] at stacking `z` among the window's slots.
+    pub fn request_at(&mut self, role: &str, window: WindowToken, z: u8) -> Result<EmbedId, Error> {
+        match self.0.call(op::REQUEST, &proto::Request { role: role.into(), window, z })? {
             Reply::Embed { embed } => Ok(embed),
             Reply::Refused { reason } => Err(Error::Refused(reason)),
             Reply::Ok => Err(Error::Refused(proto::refusal::MALFORMED)),

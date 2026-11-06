@@ -42,13 +42,12 @@ impl Frescod {
 }
 
 impl Compositor for Frescod {
-    fn bind(&mut self, parent: WindowToken, child: WindowToken, kind: SlotKind, rect: Option<[f32; 4]>) -> Result<(u32, u32), u8> {
+    fn bind(&mut self, parent: WindowToken, child: WindowToken, kind: SlotKind, rect: Option<[f32; 4]>, z: u8) -> Result<(u32, u32), u8> {
         let kind = match kind {
             SlotKind::Plain => slot::kind::PLAIN,
             SlotKind::Credential => slot::kind::CREDENTIAL,
         };
-        /* Stacking among siblings (z) is not plumbed through limen yet. */
-        match self.ask(&SlotBind { parent, child, kind, rect, z: 0 }) {
+        match self.ask(&SlotBind { parent, child, kind, rect, z }) {
             Ok(SlotBindResult::Ok { parent_uid, child_uid }) => Ok((parent_uid, child_uid)),
             Ok(SlotBindResult::Refused { reason }) => Err(reason),
             Err(e) => {

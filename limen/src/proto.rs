@@ -57,7 +57,14 @@ pub type WindowToken = [u8; 16];
 
 /// Embed a `role` child into the caller's window named by `window`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct Request { pub role: String, pub window: WindowToken }
+pub struct Request {
+    pub role: String,
+    pub window: WindowToken,
+    /// Stacking among the parent window's slots: higher above lower (a
+    /// document's video above the doc-viewer). Credential slots are above
+    /// every plain one whatever this says.
+    pub z: u8,
+}
 
 /// The slot's rect in the parent window's surface pixels; `None` hides it.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

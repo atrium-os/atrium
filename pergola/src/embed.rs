@@ -36,7 +36,13 @@ impl Embeds {
     /// Ask for a `role` child in the slot `slot` of the window named by
     /// `window` (frescod's embed token for it).
     pub fn request(&mut self, role: &str, window: WindowToken, slot: SlotKey) -> Result<EmbedId, Error> {
-        let e = self.parent.request(role, window)?;
+        self.request_at(role, window, slot, 0)
+    }
+
+    /// [`Self::request`] at stacking `z` among the window's slots: a
+    /// document's video (z 1) above the doc-viewer (z 0).
+    pub fn request_at(&mut self, role: &str, window: WindowToken, slot: SlotKey, z: u8) -> Result<EmbedId, Error> {
+        let e = self.parent.request_at(role, window, z)?;
         self.by_slot.insert(slot, e);
         if let Some(r) = self.rects.get(&slot).copied() {
             self.parent.place(e, Some(r))?;

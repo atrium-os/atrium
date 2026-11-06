@@ -142,7 +142,8 @@ The child never sends the parent document text.
 **Embeds in a document** (fresco-video P3, 2026-11-06). frescod refuses a slot whose child
 hosts slots (§5.1), so a video in a doc-viewer page is not the doc-viewer's own slot. It is a
 **sibling**: the parent requests the `media-player` embed for its own window and binds it
-above the doc-viewer slot. The child, which owns the scroll position, reports each embed's
+above the doc-viewer slot: `Request.z` (limen `Parent::request_at`, Pergola `Embeds::request_at`)
+is carried to frescod's `SlotBind.z` (ecc6d38), the doc-viewer at 0 and its videos at 1. The child, which owns the scroll position, reports each embed's
 rect in its window; the parent adds the doc-viewer slot's origin, releases any rect that isn't
 wholly inside the doc-viewer slot (§5.2's whole-or-hidden rule, and a lying child can place a
 video nowhere it couldn't already draw), and places the rest. Keys are the document worker's

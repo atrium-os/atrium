@@ -28,7 +28,7 @@ use crate::proto::{self, op, refusal, ChildEvent, EmbedId, ParentEvent, Reply, W
 pub trait Compositor: Send {
     /// Bind `child` into `parent` at `rect` (parent surface px), or release
     /// it with `None`. A bind answers the two windows' owner uids.
-    fn bind(&mut self, parent: WindowToken, child: WindowToken, kind: SlotKind, rect: Option<[f32; 4]>)
+    fn bind(&mut self, parent: WindowToken, child: WindowToken, kind: SlotKind, rect: Option<[f32; 4]>, z: u8)
         -> Result<(u32, u32), u8>;
 
     /// A new embed-only frescod connection whose windows belong to
@@ -68,6 +68,8 @@ struct Embed {
     parent: ConnId,
     parent_uid: u32,
     parent_window: WindowToken,
+    /// Stacking among the parent's slots (`Request::z`).
+    z: u8,
     child: ConnId,
     /// Known once the child connects (spawned: at launch; system: the provider).
     child_uid: u32,
@@ -339,7 +341,7 @@ fn request(shared: &Arc<Shared>, conn: ConnId, uid: u32, req: proto::Request) ->
         .then(|| shared.attribution.lock().unwrap().as_mut().and_then(|a| a.issue(child_uid, uid)))
         .flatten();
     let e = Embed {
-        role, parent: conn, parent_uid: uid, parent_window: req.window, child, child_uid, spawned, audio_ticket,
+        role, parent: conn, parent_uid: uid, parent_window: req.window, z: req.z, child, child_uid, spawned, audio_ticket,
         child_window: None, rect: None, visible: true, bound: false, attached: false,
         to_child: Rate::default(), to_parent: Rate::default(),
     };
@@ -380,7 +382,7 @@ fn rebind(shared: &Arc<Shared>, st: &mut State, embed: EmbedId) {
     };
     let mut comp = shared.compositor.lock().unwrap();
     match want {
-        Some((rect, child)) => match comp.bind(e.parent_window, child, e.role.slot, Some(rect)) {
+        Some((rect, child)) => match comp.bind(e.parent_window, child, e.role.slot, Some(rect), e.z) {
             // frescod names the owners: each window must be its side's.
             Ok((pu, cu)) if pu == e.parent_uid && cu == e.child_uid => {
                 let e = st.embeds.get_mut(&embed).unwrap();
@@ -397,7 +399,7 @@ fn rebind(shared: &Arc<Shared>, st: &mut State, embed: EmbedId) {
             }
             Ok((pu, cu)) => {
                 eprintln!("limend: embed {embed}: windows owned by {pu}/{cu}, not {}/{}", e.parent_uid, e.child_uid);
-                let _ = comp.bind(e.parent_window, child, e.role.slot, None);
+                let _ = comp.bind(e.parent_window, child, e.role.slot, None, e.z);
                 drop(comp);
                 let e = st.embeds.remove(&embed).unwrap();
                 st.to_parent(&e, ParentEvent::ChildLost { embed });
@@ -407,7 +409,7 @@ fn rebind(shared: &Arc<Shared>, st: &mut State, embed: EmbedId) {
         },
         None if e.bound => {
             let child = e.child_window.unwrap();
-            let _ = comp.bind(e.parent_window, child, e.role.slot, None);
+            let _ = comp.bind(e.parent_window, child, e.role.slot, None, e.z);
             let e = st.embeds.get_mut(&embed).unwrap();
             e.bound = false;
             let e = &st.embeds[&embed];
@@ -490,7 +492,7 @@ fn provide(shared: &Arc<Shared>, conn: ConnId, uid: u32, p: proto::Provide) -> R
 fn end(shared: &Arc<Shared>, st: &State, embed: EmbedId, e: Embed, tell_parent: bool) {
     if e.bound {
         if let Some(c) = e.child_window {
-            let _ = shared.compositor.lock().unwrap().bind(e.parent_window, c, e.role.slot, None);
+            let _ = shared.compositor.lock().unwrap().bind(e.parent_window, c, e.role.slot, None, e.z);
         }
     }
     st.to_child(&e, ChildEvent::Detaching { embed });

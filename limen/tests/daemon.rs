@@ -24,7 +24,7 @@ const W_VIEWER: WindowToken = [4; 16];
 #[derive(Clone, Default)]
 struct Fresco(Arc<Mutex<(HashMap<WindowToken, u32>, Vec<(WindowToken, WindowToken, SlotKind, Option<[f32; 4]>)>, Vec<(u32, UnixStream)>)>>);
 impl Compositor for Fresco {
-    fn bind(&mut self, p: WindowToken, c: WindowToken, k: SlotKind, r: Option<[f32; 4]>) -> Result<(u32, u32), u8> {
+    fn bind(&mut self, p: WindowToken, c: WindowToken, k: SlotKind, r: Option<[f32; 4]>, _z: u8) -> Result<(u32, u32), u8> {
         let mut g = self.0.lock().unwrap();
         g.1.push((p, c, k, r));
         match (g.0.get(&p), g.0.get(&c)) {
