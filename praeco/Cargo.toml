@@ -1,0 +1,21 @@
+[package]
+name        = "praeco"
+version     = "0.1.0"
+edition     = "2021"
+license     = "MIT OR Apache-2.0"
+description = "Praeco, the Atrium notifications service (docs/spec/tabula.md §5): apps post on CLASS_NOTIFY (praeco-macos's v0 wire), Praeco names the app from the Portcullis launch registry, keeps the text plain and rate-limits, and streams notifications to Forum, which draws them. Apps never draw their own."
+publish     = false
+
+[lib]
+name = "praeco"
+path = "src/lib.rs"
+
+[[bin]]
+name = "praecod"
+path = "src/bin/praecod.rs"
+
+[dependencies]
+aqueduct        = { path = "../aqueduct" }
+portcullis-peer = { path = "../portcullis/portcullis-peer" }
+serde           = { version = "1", features = ["derive"] }
+postcard        = { version = "1", features = ["use-std"] }

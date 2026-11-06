@@ -208,6 +208,19 @@ A drop nobody consumes within 1 s, or a cancelled drag, frees the payload.
 - frescod keeps a **notification layer** above every app window, drawable only by the
   Forum/Praeco role and clamped to a screen band, as for the origin strip (Fresco thread).
 
+### 5.1 As built (2026-11-06)
+
+Crate `praeco/` (lib + `praecod`), the production service beside the `praeco-macos` adapter, same
+v0 `POST` wire (libatrium's `atrium_notify` unchanged; tested byte for byte). The app is named by
+the Portcullis launch registry from the peer uid (an unlaunched process gets `NOT_AN_APP`);
+title ≤ 64 and body ≤ 512 bytes, cut on a character boundary; control, bidi-override and
+zero-width characters dropped (so "invoice‮txt.exe" cannot read as a different name); markup is
+kept as literal text; 3 a burst, 5 a minute per app; `WITHDRAW` only one's own; `SUBSCRIBE` only
+for the uids in `PRAECO_SUBSCRIBERS` (Forum's), which get the history (500) then a stream.
+Each notification carries the registry's user, and Forum shows only its own user's. Not yet:
+actions (need `CLASS_BROKER` delivery and `ACTIVATION_GRANT`), images, per-app mute, the Forum
+toast UI.
+
 ## 6. Pergola's part
 
 - `TextField` and `DocumentView`: Ctrl-C/X/V and their menu items spend the activation token of
