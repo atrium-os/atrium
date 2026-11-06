@@ -26,7 +26,7 @@ check() { # name expected actual
 
 echo "=== cross-build"
 BINS=""
-for c in arca/arca-store arca/arcad; do
+for c in arca/arca-store arca/arcad arca/arca-ui; do
     out=$(cd "$ROOT/$c" && RUSTFLAGS="$CROSS_RUSTFLAGS" cargo test --release --target "$TARGET" --no-run --message-format=json 2>/dev/null \
         | python3 -c 'import sys,json
 for l in sys.stdin:
@@ -75,6 +75,7 @@ if [ -x "$BOOT" ]; then
 fi
 g "pw usershow _arca >/dev/null 2>&1 || pw useradd _arca -u 65020 -d /nonexistent -s /usr/sbin/nologin"
 g "pw usershow _ostiarius >/dev/null 2>&1 || pw useradd _ostiarius -u 50093 -d /nonexistent -s /usr/sbin/nologin"
+g "pw usershow _arca-ui >/dev/null 2>&1 || pw useradd _arca-ui -u 65021 -d /nonexistent -s /usr/sbin/nologin"
 g "install -m 755 /root/arca-test/arcad /usr/local/bin/atrium-arcad && install -m 755 /root/arca-test/arca-probe /usr/local/bin/arca-probe"
 g "mkdir -p /var/db/arca /atrium/sockets/arca /var/run/atrium && chown _arca:_arca /var/db/arca /atrium/sockets/arca && chmod 700 /var/db/arca"
 g "touch /var/run/atrium/app-registry"
@@ -121,6 +122,14 @@ KID=$(echo "$M" | cut -c1-32)
 check "key minted (id + public key)" 96 "${#M}"
 check "the app signs" 0 "$(as arcaapp1 "sign $KID hello" | sed -n 's/^status=\([0-9]*\).*/\1/p')"
 check "another app can't sign" "status=1 body=" "$(as arcaapp2 "sign $KID hello")"
+# Arca's own UI (arca-ui, uid 65021): the chip's list and a generated
+# password, for the parent it names; no app may ask.
+r=$(as _arca-ui "accounts alice $PUB org.example.mail")
+# At least one (earlier runs' items stay in /var/db/arca).
+case "$r" in "status=0 body=00000000"*) check "arca-ui lists the app's accounts" ok "$r" ;; "status=0 body="?*) check "arca-ui lists the app's accounts" ok ok ;; *) check "arca-ui lists the app's accounts" ok "$r" ;; esac
+check "another publisher's app: nothing" "status=0 body=00000000" "$(as _arca-ui "accounts alice $(printf 'b%.0s' $(seq 64)) org.example.mail")"
+check "arca-ui generates (a handle)" 32 "$(as _arca-ui "generate alice $PUB org.example.mail" | sed -n 's/^status=0 body=//p' | tr -d '\n' | wc -c | tr -d ' ')"
+check "an app can't ask for the chip" "status=1 body=" "$(as arcaapp1 "accounts alice $PUB org.example.mail")"
 check "app can't lock" "status=1 body=" "$(as arcaapp1 'lock alice')"
 check "ostiarius locks" "status=0 body=" "$(as _ostiarius 'lock alice')"
 check "while-unlocked gone after lock" "status=1 body=" "$(as arcaapp1 "sign $KID hello")"

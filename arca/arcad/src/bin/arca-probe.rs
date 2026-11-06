@@ -10,6 +10,8 @@
 //! arca-probe SOCK list
 //! arca-probe SOCK mint ACCOUNT              # ed25519; prints id and pubkey
 //! arca-probe SOCK sign ID MESSAGE
+//! arca-probe SOCK accounts USER PUBHEX APP # as arca-ui's uid: the chip's list
+//! arca-probe SOCK generate USER PUBHEX APP # as arca-ui's uid: a handle
 //! ```
 //!
 //! Prints `status=N` and any body; exits 0 whatever the status, so a
@@ -82,6 +84,12 @@ fn main() -> ExitCode {
             w.raw(&unhex(arg(3)));
             w.bytes(arg(4).as_bytes());
             call(sock, op::SIGN, &w.buf)
+        }
+        "accounts" | "generate" => {
+            w.str(arg(3));
+            w.raw(&unhex(arg(4)));
+            w.str(arg(5));
+            call(sock, if arg(2) == "accounts" { op::U_ACCOUNTS } else { op::U_GENERATE }, &w.buf)
         }
         c => {
             eprintln!("unknown command {c}");

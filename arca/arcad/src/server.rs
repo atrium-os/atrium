@@ -512,7 +512,14 @@ impl State {
                 }
                 let id = ItemId(id);
                 *item = Some(id);
-                let m = tri!(store.meta(&id, &who));
+                let m = match store.meta(&id, &who) {
+                    Ok(m) => m,
+                    // While locked, a while-unlocked item's group isn't in
+                    // memory, so it looks absent: tell Arca's own UI the
+                    // real reason, so the chip says "locked", not "no".
+                    Err(_) if store.state() != LockState::Unlocked => return reply(status::LOCKED),
+                    Err(e) => return map_err(e),
+                };
                 if m.kind != Kind::Password {
                     return reply(status::DENIED);
                 }

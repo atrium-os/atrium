@@ -1,0 +1,29 @@
+[package]
+name        = "arca-ui"
+version     = "0.1.0"
+edition     = "2021"
+license     = "MIT OR Apache-2.0"
+publish     = false
+description = "Arca's credential field (docs/spec/arca-autofill.md): the Limen `credential` provider. Draws the field and the fill chip in a slot pinned into the app's window, takes the keys typed into it, spends the user's press with frescod, and hands the app only a handle."
+
+[lib]
+name = "arca_ui"
+path = "src/lib.rs"
+
+[[bin]]
+name = "arca-ui"
+path = "src/bin/arca-ui.rs"
+
+[dependencies]
+arca-store      = { path = "../arca-store" }
+arcad           = { path = "../arcad" }
+limen           = { path = "../../limen" }
+fresco-client   = { path = "../../fresco-client" }
+fresco-protocol = { path = "../../fresco-protocol" }
+aqueduct        = { path = "../../aqueduct" }
+portcullis-peer = { path = "../../portcullis/portcullis-peer" }
+postcard        = { version = "1", features = ["use-std"] }
+libc            = "0.2"
+
+[dev-dependencies]
+tempfile = "3"

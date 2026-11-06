@@ -235,7 +235,8 @@ modes. Limen's role and Pergola's side are in §8.1.
 
 ## 9. Order of work
 
-Arca is a spec today; nothing of A0 is built. Autofill is arca.md phase **A3**, and it
+Steps 1 to 3 are built, and A0 (arca-store, arcad) passes its gates in the FreeBSD VM.
+The real child is built too (§9.1). Autofill is arca.md phase **A3**, and it
 needs A0 (the store and channels) and A1 (the courier) first. The pieces outside Arca can
 go first, because they are useful on their own:
 
@@ -245,6 +246,43 @@ go first, because they are useful on their own:
 3. Pergola: `CredentialField` against the stand-in.
 4. Arca A0 and A1, then A3: the real child, fill, generate, save, and the Navigator's
    broker placing slots over marked web fields.
+
+### 9.1 As built: arca-ui, the real child (2026-11-06)
+
+`arca/arca-ui` is the `credential` provider. It runs as `_arca-ui` (65021), which limend
+recognises by uid, arcad knows as its trusted UI (`ARCA_UI_UID`) and frescod lists as the
+`FILL` consumer. One process serves every field: for each `Attach` it opens an
+`embed_pending` window, hands limend its token with `ready`, and runs one `Field`.
+
+- **The parent** is resolved by arca-ui itself: the `parent_uid` limend read off the
+  parent's connection, looked up in the launch registry, gives (user, publisher, app id).
+  An unregistered or unsigned app gets no chip and the field says "Arca can't tell which
+  app this is". `parent_app` from limend must match, as a check.
+- **The chip**: a sign-in field lists the parent's saved passwords (`U_ACCOUNTS`: ids and
+  account names, never values) with the app it fills for; Up/Down picks one. A
+  new-password field offers "Use a strong password". A one-time-code field offers nothing
+  yet.
+- **A fill** is a click on the chip, or Enter while it shows. arca-ui spends that press's
+  token with frescod (`FILL`, presenter its own uid) and checks the press was in this
+  field's window; only then does it ask arcad for a handle (`U_HANDLE` or `U_GENERATE`).
+  It sends the parent `Filled { username }` (the account name, if the parent has a
+  username field) and `Handle`. A refusal shows on the chip ("Not filled: the field was
+  covered or had just moved", "Arca is locked") and fills nothing.
+- **Typing** goes byte by byte into an mlocked buffer, from a US keymap that never builds a
+  `String`; bullets are drawn as rects, so frescod never receives the text. On Tab, focus
+  loss or suspend, the value goes to arcad (`U_HOLD`, framed in locked memory) and the
+  parent gets the handle. Any edit afterwards drops that handle (`U_DROP`) and sends
+  `Cleared`. Backspace on a filled field empties it whole. Detach drops the handle and
+  zeroes the buffer.
+- **Tests**: `arca/arca-ui/tests/field.rs` drives the state machine (press-only fill,
+  refusals, typing and voiding, generate, layout hit test) and the arcad client against a
+  real arcad on a socket (another publisher sees nothing, a dropped handle can't be
+  redeemed, locked says locked). `scripts/arca-vm-test.sh` runs them in the VM and checks
+  over the real socket that `_arca-ui` gets the chip's list and a generated handle and an
+  app gets `DENIED`.
+- **Not yet**: arca-ui runs unjailed (its manifest needs the fresco, activation, limend and
+  arca sockets); web recipients (the Navigator's broker tells Arca the frame's origin, A3);
+  saving after the courier's outcome; reveal for generated passwords; TOTP.
 
 ## 10. Decisions, with recommendations
 

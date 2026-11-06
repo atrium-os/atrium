@@ -23,7 +23,7 @@
 #   5. The rootfs mountpoints: <path>/{dev,libexec,lib,usr/lib,usr/local/lib,
 #      usr/local/bin,atrium/sockets/arca,var/db/arca,var/run/atrium} and an
 #      empty file <path>/var/run/atrium/app-registry (the nullfs file mount point).
-#   6. ostiarius's uid in ARCA_VESTIBULUM_UID below.
+#   6. ostiarius's uid in ARCA_VESTIBULUM_UID and arca-ui's (_arca-ui) in ARCA_UI_UID below.
 
 enabled       = true
 name          = "atrium-arcad"
@@ -72,4 +72,4 @@ argv = ["atrium-arcad"]
 uid  = 65020   # _arca
 gid  = 65020
 # _ostiarius: the only uid that may unlock and lock stores.
-env  = [{ key = "ARCA_VESTIBULUM_UID", value = "50093" }]
+env  = [{ key = "ARCA_VESTIBULUM_UID", value = "50093" }, { key = "ARCA_UI_UID", value = "65021" }]
