@@ -1,6 +1,6 @@
 # Fresco: spanning a fullscreen window across monitors
 
-Status: **draft for Shankar's review** (2026-11-06). Owner: Fresco thread (frescod, display
+Status: **accepted** (Shankar, 2026-11-06: all six §9 recommendations). Owner: Fresco thread (frescod, display
 kmod, gpusim), with Forum for the policy and the user-facing controls.
 
 Builds on display 3.0 (several monitors, atomic `COMMIT_MULTI`, monitor identity), Forum's
