@@ -110,7 +110,6 @@ impl View for Button {
 
         let hovered = ctx.is_hovered(bg_id);
         let pressed = ctx.is_pressed(bg_id);
-        let focused = ctx.is_focused(bg_id);
 
         // Resolve per variant and state. Pressed beats hover. `body`
         // is the outer rect; `inner` is the 1px-inset fill Secondary
