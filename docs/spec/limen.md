@@ -135,8 +135,21 @@ window (pergola.md §10).
 | child → parent | `Loaded` | `title: String` (at most 256 bytes), `anchors: Vec<String>` (at most 256 of them) |
 | child → parent | `LinkActivated` | `url: String`. Only after a press in the child; the parent decides whether to open it |
 | child → parent | `Error` | `code: u16` |
+| child → parent | `Embeds` | `list: Vec<{ key: u64, rect: Option<[x, y, w, h]>, role: String, src: EmbedSrc }>`, every embed the child has in view, `rect` in the child's window px (`None`: scrolled partly or wholly out). At most 64. Sent when the list or a rect changes, after the frame that shows it |
 
-The child never sends the parent document text. A selection leaves only through the
+The child never sends the parent document text.
+
+**Embeds in a document** (fresco-video P3, 2026-11-06). frescod refuses a slot whose child
+hosts slots (§5.1), so a video in a doc-viewer page is not the doc-viewer's own slot. It is a
+**sibling**: the parent requests the `media-player` embed for its own window and binds it
+above the doc-viewer slot. The child, which owns the scroll position, reports each embed's
+rect in its window; the parent adds the doc-viewer slot's origin, releases any rect that isn't
+wholly inside the doc-viewer slot (§5.2's whole-or-hidden rule, and a lying child can place a
+video nowhere it couldn't already draw), and places the rest. Keys are the document worker's
+embed keys. The parent caps live media embeds per page (8) and starts one only on the user's
+press or the page's autoplay policy. Until L6 the Navigator UI owns the `ScrollView` and needs
+none of this: it emits a slot node at the embed's document box inside the scroll content
+(`Ctx::slot`), and `pergola::slot::window_rect` does the mapping and the clipping. A selection leaves only through the
 clipboard, on the user's Ctrl-C in the child (tabula.md).
 
 ### 2.2 `media-player`
