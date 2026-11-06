@@ -248,6 +248,8 @@ allowed_system_uids = [
     65016,   # _lyra: the audio engine, lyrad (lyra-service.sh creates it)
     65017,   # _choragus: the audio policy daemon, choragusd
     65020,   # _arca: the secret store (docs/spec/arca.md)
+    65022,   # _limen: the embed broker, limend (docs/spec/limen.md); choragusd
+             # knows it by this uid (--limen-uid) for embedded players' audio tickets
 ]
 
 [gid]
@@ -260,6 +262,7 @@ allowed_system_gids = [
     65016,   # _lyra
     65017,   # _choragus
     65020,   # _arca
+    65022,   # _limen
 ]
 
 

@@ -63,7 +63,7 @@ parent app (jail A)                         child app (jail B)
      └── relay role messages A ⇄ B, lifecycle events to A
 ```
 
-`limend` is a small trusted daemon, running as its own user `_limen`. It holds no secrets and
+`limend` is a small trusted daemon, running as its own user `_limen` (fixed uid 65022, so frescod and choragusd can name it). It holds no secrets and
 draws nothing. It knows four things: the role catalogue, who each connection is, which embeds
 exist, and which slot each one is in.
 

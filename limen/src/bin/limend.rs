@@ -45,6 +45,12 @@ fn main() -> std::io::Result<()> {
         std::env::var("LIMEN_CHORAGUS").unwrap_or_else(|_| limen::audio::DEFAULT_SOCKET.into()))));
     let _ = std::fs::remove_file(&path);
     let listener = UnixListener::bind(&path)?;
+    // Every app may connect: who it is comes from the connection
+    // (getpeereid), never from the socket's mode.
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o666))?;
+    }
     eprintln!("limend: listening on {path}");
     for s in listener.incoming() {
         let Ok(s) = s else { continue };
