@@ -9,7 +9,7 @@
 #   - binds one socket per audio capability under /atrium/sockets: audio/,
 #     audio-capture/, audio-monitor/, audio-control/ for the volume UI, and
 #     audio-attribution/ where limend gets tickets for embedded players (only
-#     the uid given by --limen-uid; add it to argv once _limen exists).
+#     the uid given by --limen-uid: _limen, 65022).
 #     Portcullis mounts each directory only
 #     into jails holding that capability, so the socket caps what an app may
 #     ask for;
@@ -72,6 +72,6 @@ kind   = "ro_nullfs"
 
 [exec]
 path = "/usr/local/bin/atrium-choragusd"
-argv = ["atrium-choragusd", "--serve"]
+argv = ["atrium-choragusd", "--serve", "--limen-uid", "65022"]   # _limen (limen.md §2)
 uid  = 65017   # _choragus
 gid  = 65017
