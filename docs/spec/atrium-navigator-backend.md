@@ -1410,6 +1410,16 @@ runs, 8 s each, 800 × 600 at 1×; M4 Max):
 pattern, p99.9 frame time ≤ 2 periods, and missed vsyncs ≤ 1%. At 120 Hz, the same once
 the compositor redraws by damage.
 
+**Scrolling belongs to Pergola (agreed with the user, 2026-11-06).** Flings, momentum, the
+shift-then-draw-the-strip compositor, fast-fling motion blur, placeholders for regions not
+yet laid out, and reduce motion are specified in pergola.md §10.1 as `ScrollView`
+behaviour, so every app scrolls the same way. This section owns the content side only:
+bands, checkpoints and the resident window, which feed `ScrollView` through the band
+interface (pergola.md §10.3). The harness above stays the judge of both; it measures
+strip redraw and placeholders, but they are built in Pergola and frescod, not here. The
+same layout is offered to other apps as Limen's `doc-viewer` (untrusted content) and a
+Pergola `DocumentView` (trusted content), pergola.md §10.2.
+
 **Decisions to settle:**
 1. Raise the profile ceilings once bands and the image working set are in, or split very
    large documents into chapters at conversion? *Recommend raising them,* to levels

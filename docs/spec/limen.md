@@ -121,6 +121,10 @@ default.
 Used by: Artifex (Markdown preview), email clients
 (rendering HTML mail bodies), help systems, RSS readers.
 
+Implemented by the Navigator's jailed document worker (layout,
+zoom, big-document bands, replay); scrolling inside the slot is
+Pergola's `ScrollView` (pergola.md §10, 2026-11-06).
+
 ### 2.2 `media-player`
 
 Plays an audio/video stream.

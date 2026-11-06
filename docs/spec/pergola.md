@@ -260,3 +260,76 @@ Color management has three layers, addressed in order:
   rewritten on Pergola as canary apps.
 - **D6+** (Pergola maturation, additional widgets, theming, third-party
   app uptake).
+
+---
+
+## §10. Scrolling and rich documents (agreed with the user, 2026-11-06)
+
+*Asked by the user, 2026-11-06, while the Navigator's big-document work was under way:
+scrolling and flings "belong ideally to the UI", and "I'm wondering if this becomes some
+kind of a rich text/layout widget for the UI so other apps can get the same features".
+Agreed: yes. Status: specified, not built. Pergola has no `ScrollView` yet.*
+
+### §10.1 Scrolling is Pergola's, not the Navigator's
+
+`ScrollView` owns everything a reader feels while scrolling, so that every app scrolls
+the same way. The Navigator's document surface is one user of it. The Navigator backend
+supplies content (bands, §10.3), never scroll behaviour.
+
+- **Input to motion.** Wheel, trackpad, keyboard (page/arrow/home/end) and touch flings,
+  with momentum and the system's scroll settings. One physics model, shared by all apps.
+- **Shift, then draw the strip.** On a scroll the compositor moves what is already drawn
+  by the scroll delta (a blit or texture offset) and draws only the newly exposed strip.
+  At 4,000 px/s and 120 Hz that is about 33 px of an 800 × 600 window, roughly 6% of a
+  full frame.
+- **Never worse than a full draw.** When the exposed strip is more than about half the
+  viewport, or on a jump, the frame is drawn in full and the shift is skipped. The
+  threshold is set by measurement (the Navigator scroll harness,
+  atrium-navigator-backend.md §4.8, reports both paths).
+- **Motion during fast flings.** Above a speed threshold (start at about 2,500 px/s, tuned
+  by eye), a vertical motion blur scaled to velocity. Strips drawn while blurred may be
+  cheaper (reduced resolution, or text as greeked lines). As the fling slows below the
+  threshold the blur fades out over 2–3 frames and the visible area is redrawn sharp: the
+  same "approximate now, sharpen on settle" mechanism as pinch zoom.
+- **Placeholders, not stalls.** If content for a region is not ready when the scroll
+  reaches it, show greeked placeholder lines in the content's text colour (or a blurred
+  low-detail preview), never a blank area or a frozen frame. They resolve to real content
+  when it arrives.
+- **Reduce motion.** The system's reduce-motion setting turns the blur off; placeholders
+  stay (they are not motion).
+- **Gates** (the same as the Navigator's, so one harness judges both): at 60 Hz, no stall
+  over 100 ms after first display, p99.9 frame time ≤ 2 periods, missed vsyncs ≤ 1%; the
+  same at 120 Hz. A placeholder counts as shown content for frame rate but not for lag:
+  real content must replace it within 100 ms of the scroll settling.
+
+Where it runs: client-driven first (§4.1), then the shift and blur move server-side with
+declarative animation (§4.2), so a busy app still scrolls smoothly. The strip redraw rides
+frescod's damage path (incremental drawing redraws only changed tiles), which the Fresco owners decide.
+
+### §10.2 A document view any app can use
+
+The Navigator's document layout (profile normalize, style, layout, SVG, zoom and text
+size, tables, big-document bands, replay of recorded interactions) already outputs the
+Fresco scene graph that Pergola widgets are made of (atrium-document-profile-v1.md §3.14).
+So it is offered to other apps in two forms, chosen by **whose content it is**:
+
+| content | form | why |
+|---|---|---|
+| untrusted (an HTML mail body, a downloaded help page, a file preview, a feed item) | **Limen `doc-viewer` role** (limen.md §2.1): the app embeds a jailed document surface | the content never runs in the app's process; the app gets layout, zoom, bands and replay without their attack surface |
+| the app's own trusted text (help, release notes, a chat log, rich text it generates) | **`DocumentView` widget**, linking the same layout crates in-process | no jail hop, and the text can use the app's theme and widgets directly |
+
+Both draw through `ScrollView` (§10.1), so scrolling feels the same everywhere.
+`DocumentView` is not an editor; rich-text editing is a separate widget that may later
+share the layout code.
+
+### §10.3 What this requires of the layout code now
+
+- The layout crates stay free of Navigator-only dependencies. Checked 2026-11-06:
+  `navigator-dom`, `-style`, `-render`, `-svg`, `-normalize` and `-fonts` depend on
+  each other, on Fresco's protocol and compute crates, and on third-party crates only; not
+  on `navigator-backend`, `-fetch` or `-prerender`. Keep it that way. (The `navigator-`
+  prefix can be renamed when `DocumentView` is built.)
+- The band interface (atrium-navigator-backend.md §4.8 step 3) is the contract between a
+  content source and `ScrollView`: "give me the scene for this range of the document, at
+  this zoom", with an estimated total extent that may settle later. A `DocumentView`, the
+  Navigator worker and any long list (a mail index, a log) implement it alike.
