@@ -1019,6 +1019,11 @@ fn render_one_frame(
         c.size.1 = c.size.1.min(screen_h);
         rects.push((c.id, [0, 0, c.size.0 as i32, c.size.1 as i32]));
         windows.push(c);
+    } else if let Some(mut c) = chrome::slot_frames(&slots) {
+        /* Direct mode: no strip, but slots still get their frame. */
+        c.size = (c.size.0.min(screen_w), c.size.1.min(screen_h));
+        rects.push((c.id, [0, 0, c.size.0 as i32, c.size.1 as i32]));
+        windows.push(c);
     }
     /* A window drawn as pixels (split pixel mode) answers from them. */
     let drawn: std::collections::HashSet<u32> =

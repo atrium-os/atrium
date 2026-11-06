@@ -137,8 +137,9 @@ not spent. Visibility is checked before focus, so a click that lands while a cov
 `OBSCURED` even if the cover took focus. A `FILL` accepts a click, or Enter (or keypad Enter) in the slot; ordinary typing is
 refused `WRONG_KIND`. The default consumers gain `_arca`.
 
-**The frame.** In split mode, frescod's chrome draws a gold ring and a key tab around each slot
-that is fit to fill on this frame. No app, and not Arca either, can draw that frame.
+**The frame.** frescod draws a gold ring and a key tab around each slot that is fit to fill on
+this frame: in split mode as part of its chrome, in direct mode (no strip) as a layer of its own
+on top. No app, and not Arca either, can draw that frame.
 
 **Tests:**
 
@@ -150,7 +151,8 @@ that is fit to fill on this frame. No app, and not Arca either, can draw that fr
   out of its window. It also checks that a slot that is still and clear fills, both before and
   after the covers go.
 
-Not yet built: frames in direct mode, where there is no chrome.
+The probe also saves the last capture with a slot fit to fill; the ring and tab show in both
+modes. Limen's role and Pergola's side are in §8.1.
 
 ### 8.1 As built: the role messages and Pergola (2026-11-06, §9 steps 2 and 3)
 

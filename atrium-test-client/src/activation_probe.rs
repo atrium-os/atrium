@@ -18,6 +18,7 @@ use std::time::{Duration, Instant};
 
 const HID_A: u16 = 0x04;
 const HID_C: u16 = 0x06;
+const HID_LSHIFT: u16 = 0xE1;
 const HID_V: u16 = 0x19;
 const CTRL: u8 = 1 << 1;
 
@@ -126,6 +127,21 @@ fn main() {
     let uid = unsafe { libc::getuid() };
     let mut p = Probe { app, wm, inject: inject.clone(), act, uid, failed: 0 };
     println!("window {win}, uid {uid}");
+    // Under TCG the first input after boot can arrive before the window
+    // has focus. Tap Shift until the app hears it, then drop what came.
+    let mut ready = false;
+    for _ in 0..100 {
+        p.inject(&format!("KEY {HID_LSHIFT} 1 0"));
+        p.inject(&format!("KEY {HID_LSHIFT} 0 0"));
+        if let Ok(Some(Event::Key { .. })) = p.app.wait_event(Some(Duration::from_millis(200))) {
+            ready = true;
+            break;
+        }
+    }
+    p.check(ready, "the app hears input");
+    for c in [&mut p.app, &mut p.wm] {
+        while let Ok(Some(_)) = c.wait_event(Some(Duration::from_millis(100))) {}
+    }
 
     let (t, w) = p.press(&format!("KEY {HID_V} 1 {CTRL}"));
     p.inject(&format!("KEY {HID_V} 0 {CTRL}"));
@@ -315,6 +331,14 @@ fn main() {
     still();
     let r = fill(&mut p, &mut arca, 450, 330);
     p.check(r == refusal::OBSCURED, &format!("sticking out of its window: refused ({r})"));
+    // Leave it fit to fill, so the last capture shows frescod's frame.
+    bind(&mut p, [20.0, 20.0, 200.0, 40.0]);
+    still();
+    if let Ok(png) = std::env::var("PROBE_CAPTURE") {
+        // frescod captures at most every 200 ms; take it while we're up.
+        std::thread::sleep(Duration::from_millis(1500));
+        let _ = std::fs::copy(&png, format!("{png}.slot.png"));
+    }
 
     if p.failed > 0 {
         println!("{} FAILED", p.failed);

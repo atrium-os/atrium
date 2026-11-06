@@ -193,8 +193,37 @@ pub fn build(screen_w: u32, focus: Option<u16>, origin: impl Fn(u16) -> Option<S
     }
 }
 
+/// Direct mode has no strip, so only the slots' frames go on top: a layer
+/// at (0, 0) as wide and tall as the lowest, rightmost frame needs.
+pub fn slot_frames(slots: &[[i32; 4]]) -> Option<WindowFrame> {
+    if slots.is_empty() {
+        return None;
+    }
+    let mut rects = Vec::new();
+    let (mut right, mut bottom) = (0, 0);
+    for &s in slots {
+        bottom = bottom.max(slot_frame(&mut rects, s));
+        right = right.max(s[2] + RING);
+    }
+    Some(WindowFrame {
+        id: CHROME_ID,
+        pos: (0.0, 0.0),
+        size: (right.max(1) as u32, bottom.max(1) as u32),
+        rects,
+        ..Default::default()
+    })
+}
+
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn slot_frames_cover_each_slot_and_its_tab() {
+        assert!(super::slot_frames(&[]).is_none());
+        let f = super::slot_frames(&[[120, 320, 320, 360]]).unwrap();
+        assert!(f.size.0 >= 320 && f.size.1 >= 360);
+        assert!(f.rects.iter().any(|r| r.position[0] < 120.0 - super::TAB as f32 + 1.0));
+    }
+
     #[test]
     fn every_origin_character_has_a_glyph() {
         for c in 0u8..=127 {
