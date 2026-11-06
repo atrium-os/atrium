@@ -28,6 +28,10 @@ $ff $c -pix_fmt yuv420p10le -c:v libvpx-vp9 -profile:v 2 -b:v 50k -color_primari
     -color_trc smpte2084 -colorspace bt2020nc -color_range tv -an color-hdr10.webm
 $ff $c -c:v libaom-av1 -cpu-used 8 -b:v 50k -color_primaries bt709 -color_trc bt709 \
     -colorspace bt709 -color_range pc -an color-full.mp4
+# Subtitles (atrium-player M7): subs.vtt (checked in) as WebVTT in WebM, as tx3g in MP4.
+c2="-f lavfi -i testsrc2=size=64x36:rate=24:duration=2"
+$ff $c2 -i subs.vtt -map 0 -map 1 -c:v libvpx-vp9 -b:v 50k -c:s webvtt subs-vtt.webm
+$ff $c2 -i subs.vtt -map 0 -map 1 -c:v libaom-av1 -cpu-used 8 -b:v 50k -c:s mov_text subs-tx3g.mp4
 # Reference hashes of every decoded frame (planar, as the decoder outputs).
 for f in *.webm *.mp4; do
     $ff -i "$f" -map 0:v -f framemd5 "$f.video.framemd5"

@@ -377,6 +377,7 @@ impl Parser {
             "A_OPUS" => Codec::Opus,
             "A_VORBIS" => Codec::Vorbis,
             c if c.starts_with("A_AAC") => Codec::Aac,
+            "D_WEBVTT/SUBTITLES" | "D_WEBVTT/CAPTIONS" | "S_TEXT/WEBVTT" => Codec::WebVtt,
             _ => Codec::Unknown,
         };
         let kind = match ttype {
@@ -392,6 +393,7 @@ impl Parser {
                 }
                 Kind::Audio { rate: rate as u32, channels: channels as u16 }
             }
+            0x11 if codec == Codec::WebVtt => Kind::Text,
             _ => Kind::Other,
         };
         let config = match codec {

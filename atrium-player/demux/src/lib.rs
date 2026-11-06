@@ -93,6 +93,11 @@ pub enum Codec {
     Opus,
     Vorbis,
     Aac,
+    /// WebVTT cues: WebM's `D_WEBVTT/*` (a block is a cue's text), or MP4's
+    /// `wvtt` (a sample is `vttc`/`vtte` boxes).
+    WebVtt,
+    /// MP4 timed text (`tx3g`, 3GPP TS 26.245): a u16 length, then UTF-8.
+    Tx3g,
     Unknown,
 }
 
@@ -106,6 +111,8 @@ impl Codec {
 pub enum Kind {
     Video { width: u32, height: u32 },
     Audio { rate: u32, channels: u16 },
+    /// Subtitles or captions.
+    Text,
     Other,
 }
 

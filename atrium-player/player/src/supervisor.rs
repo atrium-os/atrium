@@ -18,6 +18,17 @@ use crate::wire::{encode_frame, err, Format, Limits, Mode, Record, ToWorker, BUF
 pub const WATCHDOG: Duration = Duration::from_secs(5);
 
 /// Where decoded frames go.
+/// Most subtitle cues a player keeps (a feature film has 1,000 to 2,000).
+const CUES_MAX: usize = 8192;
+
+/// A subtitle cue, as the worker sent it: plain text, lines split by `\n`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Cue {
+    pub start_ns: i64,
+    pub end_ns: i64,
+    pub text: String,
+}
+
 pub trait Sink {
     /// Buffers for a video layer of this format and (even) size.
     fn layer(&mut self, format: Format, width: u32, height: u32, count: u32) -> io::Result<Vec<OwnedFd>>;
@@ -177,6 +188,9 @@ pub struct Player<S: Sink> {
     epoch: u32,
     /// The video's colour, from the worker.
     color: atrium_media_demux::Color,
+    /// Subtitle cues so far, by start time, and one still arriving.
+    cues: Vec<Cue>,
+    cue_partial: Option<(i64, i64, usize, Vec<u8>)>,
     /// Media time of the last frame handed to the sink.
     last_pts: Option<i64>,
     /// Frames before this media time are dropped (after a seek).
@@ -212,6 +226,8 @@ impl<S: Sink> Player<S> {
             audio: None,
             epoch: 0,
             color: atrium_media_demux::Color::default(),
+            cues: Vec::new(),
+            cue_partial: None,
             last_pts: None,
             show_from: None,
             events: VecDeque::new(),
@@ -312,6 +328,27 @@ impl<S: Sink> Player<S> {
     /// Show the next frame even if paused (a poster, or a seek's target).
     pub fn show_next(&mut self) {
         self.show_one = true;
+    }
+
+    /// Cue texts to show at media time `t_ns`, earliest first.
+    pub fn cues_at(&self, t_ns: i64) -> Vec<&str> {
+        let end = self.cues.partition_point(|c| c.start_ns <= t_ns);
+        // Cues last at most a minute (the worker caps them).
+        let from = self.cues[..end].partition_point(|c| c.start_ns < t_ns - 60_000_000_000);
+        self.cues[from..end].iter().filter(|c| t_ns < c.end_ns).map(|c| c.text.as_str()).collect()
+    }
+
+    fn add_cue(&mut self, c: Cue) {
+        let i = self.cues.partition_point(|x| x.start_ns <= c.start_ns);
+        // Read again (a restarted worker, a re-read after a seek): once.
+        if self.cues[..i].iter().rev().take_while(|x| x.start_ns == c.start_ns).any(|x| x.text == c.text) {
+            return;
+        }
+        if self.cues.len() >= CUES_MAX {
+            self.cues.remove(0);
+        }
+        let i = self.cues.partition_point(|x| x.start_ns <= c.start_ns);
+        self.cues.insert(i, c);
     }
 
     pub fn sink(&self) -> &S {
@@ -653,6 +690,31 @@ impl<S: Sink> Player<S> {
             Record::Error { code } => {
                 self.waiting = false;
                 self.events.push_back(PlayerEvent::Error(code));
+            }
+            Record::Cue { start_ns, end_ns, len } => {
+                if self.cue_partial.is_some() {
+                    return self.worker_lost();
+                }
+                self.cue_partial = Some((start_ns, end_ns, len as usize, Vec::with_capacity(len as usize)));
+                if len == 0 {
+                    self.cue_partial = None;
+                }
+            }
+            Record::CueText { i, bytes } => {
+                let Some((start, end, len, mut text)) = self.cue_partial.take() else { return self.worker_lost() };
+                if i as usize != text.len() / 24 {
+                    return self.worker_lost();
+                }
+                text.extend_from_slice(&bytes[..(len - text.len()).min(24)]);
+                if text.len() < len {
+                    self.cue_partial = Some((start, end, len, text));
+                    return;
+                }
+                let Ok(text) = String::from_utf8(text) else { return self.worker_lost() };
+                if text.chars().any(|c| c.is_control() && c != '\n') {
+                    return self.worker_lost();
+                }
+                self.add_cue(Cue { start_ns: start, end_ns: end, text });
             }
             Record::Color { primaries, transfer, matrix, range } => {
                 if self.video.is_none() {

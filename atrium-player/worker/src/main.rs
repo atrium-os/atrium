@@ -8,6 +8,7 @@
 //! parses or decodes is hostile.
 #![deny(unsafe_code)]
 
+mod cue;
 mod store;
 
 use std::collections::VecDeque;
@@ -28,6 +29,9 @@ const AHEAD_NS: i64 = 3_000_000_000;
 const READ_CHUNK: usize = 256 << 10;
 /// Decode audio only while the ring has room for a whole packet.
 const PCM_PACKET_MAX: u64 = 8192;
+/// A cue's time on screen when the container doesn't say, and at most.
+const CUE_DEFAULT_NS: i64 = 4_000_000_000;
+const CUE_MAX_NS: i64 = 60_000_000_000;
 
 fn codec_id(c: Codec) -> u32 {
     match c {
@@ -39,6 +43,8 @@ fn codec_id(c: Codec) -> u32 {
         Codec::Opus => 5,
         Codec::Vorbis => 6,
         Codec::Aac => 7,
+        Codec::WebVtt => 8,
+        Codec::Tx3g => 9,
     }
 }
 
@@ -51,6 +57,8 @@ struct Feed {
     /// Which of this feed's demuxed tracks are the chosen video / audio.
     video: Option<u8>,
     audio: Option<u8>,
+    /// The subtitle track whose cues go to the supervisor (the first).
+    text: Option<(u8, Codec)>,
 }
 
 struct Video {
@@ -159,6 +167,18 @@ impl Worker {
         self.sock.write_all(&r.encode())
     }
 
+    /// A cue: its times, then its text in 24-byte pieces.
+    fn send_cue(&mut self, start_ns: i64, end_ns: i64, text: &str) -> std::io::Result<()> {
+        let b = text.as_bytes();
+        self.send(Record::Cue { start_ns, end_ns, len: b.len() as u32 })?;
+        for (i, c) in b.chunks(24).enumerate() {
+            let mut piece = [0u8; 24];
+            piece[..c.len()].copy_from_slice(c);
+            self.send(Record::CueText { i: i as u32, bytes: piece })?;
+        }
+        Ok(())
+    }
+
     fn fail(&mut self, code: u32) {
         if !self.failed {
             self.failed = true;
@@ -211,7 +231,7 @@ impl Worker {
                         }
                     }
                     self.input = Some(f);
-                    self.feeds.push((0, Feed { parser: None, mime: String::new(), tracks: Vec::new(), offset_ns: 0, video: None, audio: None }));
+                    self.feeds.push((0, Feed { parser: None, mime: String::new(), tracks: Vec::new(), offset_ns: 0, video: None, audio: None, text: None }));
                 }
                 self.mode = Some(mode);
             }
@@ -219,7 +239,7 @@ impl Worker {
                 if self.mode != Some(Mode::Feed) || self.feeds.iter().any(|(t, _)| *t == track) {
                     self.fail(err::STATE);
                 } else {
-                    self.feeds.push((track, Feed { parser: None, mime, tracks: Vec::new(), offset_ns: 0, video: None, audio: None }));
+                    self.feeds.push((track, Feed { parser: None, mime, tracks: Vec::new(), offset_ns: 0, video: None, audio: None, text: None }));
                 }
             }
             ToWorker::Append { track, bytes, timestamp_offset_ns } => {
@@ -330,6 +350,13 @@ impl Worker {
                         if let Some(a) = self.audio.as_mut() {
                             a.store.push(s);
                         }
+                    } else if let Some((_, codec)) = feed.text.filter(|t| t.0 == s.track) {
+                        // Cues go up as they are read: they are few, and the
+                        // supervisor shows each over its own time.
+                        if let Some(t) = cue::text(codec, &s.data) {
+                            let end = s.pts_ns.saturating_add(s.duration_ns.map_or(CUE_DEFAULT_NS, |d| d.min(CUE_MAX_NS as u64) as i64));
+                            let _ = self.send_cue(s.pts_ns, end, &t);
+                        }
                     }
                 }
             }
@@ -366,6 +393,11 @@ impl Worker {
                     Err(_) => return self.fail(err::UNSUPPORTED),
                 }
             }
+        }
+        let feed = &mut self.feeds[fi].1;
+        if feed.text.is_none() && !self.feeds.iter().any(|(_, f)| f.text.is_some()) {
+            let feed = &mut self.feeds[fi].1;
+            feed.text = tracks.iter().find(|t| t.kind == Kind::Text).map(|t| (t.index, t.codec));
         }
         let feed = &mut self.feeds[fi].1;
         if self.audio.is_none() {

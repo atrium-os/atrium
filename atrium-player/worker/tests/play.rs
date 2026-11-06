@@ -318,3 +318,22 @@ fn the_worker_reports_colour() {
 fn p_sink_color(p: &Player<LocalSink>) -> Option<atrium_media_demux::Color> {
     p.sink().color
 }
+
+/// Subtitles in the file reach the supervisor as plain cues over their times.
+#[test]
+fn subtitle_cues_show_over_their_times() {
+    for name in ["subs-vtt.webm", "subs-tx3g.mp4"] {
+        let mut p = Player::new(opts(), LocalSink::new(Box::new(|_, _| {})), load(name)).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let mut pcm = vec![0f32; 1 << 16];
+        while p.cues_at(1_200_000_000).is_empty() && Instant::now() < deadline {
+            p.poll(Duration::from_millis(10));
+            p.read_pcm(&mut pcm);
+        }
+        assert_eq!(p.cues_at(100_000_000), Vec::<&str>::new(), "{name}: before the first");
+        assert_eq!(p.cues_at(500_000_000), vec!["Hello, world"], "{name}: markup stripped");
+        assert_eq!(p.cues_at(950_000_000), Vec::<&str>::new(), "{name}: between");
+        assert_eq!(p.cues_at(1_200_000_000), vec!["Second line\ntwo rows"], "{name}: two lines");
+        assert_eq!(p.cues_at(1_900_000_000), Vec::<&str>::new(), "{name}: after the last");
+    }
+}

@@ -518,6 +518,13 @@ impl<H: Host> App<H> {
                 self.host.emit(ToParent::Time { secs: secs(t).max(0.0) });
             }
         }
+        if let Some(p) = self.player.as_ref() {
+            let t = p.position_ns().unwrap_or(ns(self.controls.position_s));
+            let now: Vec<String> = p.cues_at(t).into_iter().map(str::to_string).collect();
+            if now != self.controls.subtitles {
+                self.controls.subtitles = now;
+            }
+        }
         let mut c = std::mem::replace(&mut self.controls, Controls::new((0, 0)));
         let r = c.draw(&mut self.sink().conn);
         self.controls = c;

@@ -488,6 +488,15 @@ impl Parser {
         let (mut ty, v) = entry?;
         let video = handler == b"vide";
         let audio = handler == b"soun";
+        if matches!(handler, b"text" | b"sbtl" | b"subt") {
+            info.codec = match &ty {
+                b"tx3g" => Codec::Tx3g,
+                b"wvtt" => Codec::WebVtt,
+                _ => Codec::Unknown,
+            };
+            info.kind = if info.codec == Codec::Unknown { Kind::Other } else { Kind::Text };
+            return Ok(());
+        }
         let mut r = Rd::new(v);
         r.skip(8)?; // reserved, data_reference_index
         let kind;

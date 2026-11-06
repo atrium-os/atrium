@@ -15,6 +15,8 @@ pub const FRAME_MAX: usize = (1 << 20) + 4096;
 pub const FDS_MAX: usize = 16;
 /// Most layer buffers (fresco-video §3: 3 to 8).
 pub const BUFFERS_MAX: u32 = 8;
+/// Longest cue text the worker may send (bytes).
+pub const CUE_TEXT_MAX: u32 = 512;
 
 /// The pixel format of the layer buffers (fresco-video §3).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -103,6 +105,8 @@ pub mod tag {
     pub const PROBE: u32 = 12;
     pub const COLOR: u32 = 13;
     pub const HDR: u32 = 14;
+    pub const CUE: u32 = 15;
+    pub const CUE_TEXT: u32 = 16;
 }
 
 /// Error codes (map to limen `media_player::code`).
@@ -142,6 +146,11 @@ pub enum Record {
     /// The video's colour, in H.273 code points (2: unspecified); range 0
     /// unspecified, 1 limited, 2 full. Follows `VideoTrack`.
     Color { primaries: u8, transfer: u8, matrix: u8, range: u8 },
+    /// A subtitle cue shown over `[start_ns, end_ns)`; its `len` bytes of
+    /// UTF-8 follow in `CueText` records.
+    Cue { start_ns: i64, end_ns: i64, len: u32 },
+    /// Piece `i` of a cue's text, 24 bytes (the last one zero-padded).
+    CueText { i: u32, bytes: [u8; 24] },
     /// Static HDR metadata (CTA-861.3 units), after `Color`.
     Hdr { primaries_x: [u16; 3], primaries_y: [u16; 3], white: [u16; 2], luminance: [u16; 2], light: [u16; 2] },
 }
@@ -178,6 +187,11 @@ impl Record {
             Record::Probe { refused } => put(&mut b, tag::PROBE, refused, 0, 0, 0),
             Record::Color { primaries, transfer, matrix, range } => {
                 put(&mut b, tag::COLOR, u32::from_le_bytes([primaries, transfer, matrix, range]), 0, 0, 0)
+            }
+            Record::Cue { start_ns, end_ns, len } => put(&mut b, tag::CUE, len, start_ns as u64, end_ns as u64, 0),
+            Record::CueText { i, bytes } => {
+                let w = |k: usize| u64::from_le_bytes(bytes[k * 8..k * 8 + 8].try_into().unwrap());
+                put(&mut b, tag::CUE_TEXT, i, w(0), w(1), w(2))
             }
             Record::Hdr { primaries_x: px, primaries_y: py, white, luminance, light } => {
                 let w = |a: [u16; 4]| a.iter().enumerate().fold(0u64, |acc, (i, &v)| acc | (v as u64) << (16 * i));
@@ -239,6 +253,14 @@ impl Record {
                 }
                 Record::Color { primaries, transfer, matrix, range }
             }
+            tag::CUE if a <= CUE_TEXT_MAX && (x as i64) <= (y as i64) => Record::Cue { start_ns: x as i64, end_ns: y as i64, len: a },
+            tag::CUE_TEXT if a < CUE_TEXT_MAX.div_ceil(24) => {
+                let mut bytes = [0u8; 24];
+                bytes[..8].copy_from_slice(&x.to_le_bytes());
+                bytes[8..16].copy_from_slice(&y.to_le_bytes());
+                bytes[16..].copy_from_slice(&z.to_le_bytes());
+                Record::CueText { i: a, bytes }
+            }
             tag::HDR => {
                 let h = |v: u64, i: usize| (v >> (16 * i)) as u16;
                 Record::Hdr {
@@ -273,6 +295,8 @@ mod tests {
             Record::Ready { sandboxed: true },
             Record::VideoTrack { track: 0, codec: 2, width: 1920, height: 1080, bit_depth: 10 },
             Record::Color { primaries: 9, transfer: 16, matrix: 9, range: 1 },
+            Record::Cue { start_ns: 200_000_000, end_ns: 900_000_000, len: 30 },
+            Record::CueText { i: 1, bytes: *b"abcdefghijklmnopqrstuvwx" },
             Record::Hdr { primaries_x: [34000, 13250, 7500], primaries_y: [16000, 34500, 3000], white: [15635, 16450], luminance: [1000, 50], light: [1000, 400] },
             Record::AudioTrack { track: 1, codec: 5, rate: 48_000, channels: 2 },
             Record::Duration { secs: 12.5 },
