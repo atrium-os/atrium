@@ -400,7 +400,7 @@ messages over the doc-viewer role's channel, limen.md §2.1):
 | view → source | `want { range, zoom, prefetch }` | keep `range` (document space) ready at `zoom`; `prefetch` is a hint, about one viewport above and below |
 | source → view | `extent { height, settled }` | estimated total height; `settled` once it is exact. Sent whenever it changes |
 | source → view | `band_ready { band, range }` | band `band` covers `range` and its scene is in the window, as one group the source wrote |
-| source → view | `band_updated { band, range }` | its content or extent changed (images arriving, a restyle) |
+| source → view | `band_updated { band, range }` | its content or extent changed (images arriving, a restyle). After a reader's step, exactly the bands whose bytes changed (backend §4.3, part 2) |
 | source → view | `band_evicted { band }` | gone; anything of it still visible shows placeholders (§10.1) |
 
 - **Scenes go straight to Fresco, not through `ScrollView`.** Each band is one scene group
