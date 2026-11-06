@@ -140,7 +140,9 @@ fn main() {
         let mut launcher = JaildLauncher::default();
         // De-rooted: ostiarius launches via the portcullisd broker, not jaild.
         if let Ok(b) = std::env::var("BROKER_SOCK") { launcher.broker_sock = b; }
-        let mut o = Ostiarius::new(launcher).with_seat_path(seat); // stub auth (no with_pam)
+        let arca = std::env::var("ARCA_SOCKET")
+            .unwrap_or_else(|_| "/atrium/sockets/arca/arcad.sock".into());
+        let mut o = Ostiarius::new(launcher).with_seat_path(seat).with_arca(arca); // stub auth (no with_pam)
         // Gate on the display server being READY before booting the login UI: as
         // the supervisor, ostiarius sequences startup rather than launching a
         // doomed vestibulum into a not-yet-up frescod. If frescod never comes up

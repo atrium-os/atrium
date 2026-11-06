@@ -1,0 +1,74 @@
+# /etc/atrium/services.d/42-atrium-arcad.toml
+#
+# Arca, the system secret store (docs/spec/arca.md), as a jailed system
+# service. atrium-portcullisd-bootstrap reads this, asks jaild to create the
+# jail, and supervises arcad inside it. Numbered 42: after frescod (40),
+# before ostiarius (45), which unlocks users' stores at login.
+#
+# arcad is the smallest jail on the system on purpose (arca.md §6.3):
+#   - NO network: network is disabled for the jail, and arcad never opens a
+#     socket other than its own unix listener.
+#   - runs as _arca (65020), non-root; refuses to start if it can't disable
+#     core dumps and tracing for itself.
+#   - sees: libs, its binary, its own socket dir (rw), its store dir (rw),
+#     and the launch registry (ro, one file). Nothing else of the host.
+#
+# REQUIRES (commission once per host; scripts/arca-commission.sh does all):
+#   1. The _arca system user: `pw useradd _arca -u 65020 -d /nonexistent
+#      -s /usr/sbin/nologin`, and 65020 in jaild.policy [uid].allowed_system_uids.
+#   2. `mkdir -p /var/db/arca && chown _arca:_arca /var/db/arca && chmod 700 /var/db/arca`
+#   3. `mkdir -p /atrium/sockets/arca && chown _arca:_arca /atrium/sockets/arca`
+#   4. /var/db/arca in jaild.policy mount_sources.rw_paths and
+#      /var/run/atrium/app-registry in ro_paths.
+#   5. The rootfs mountpoints: <path>/{dev,libexec,lib,usr/lib,usr/local/lib,
+#      usr/local/bin,atrium/sockets/arca,var/db/arca,var/run/atrium} and an
+#      empty file <path>/var/run/atrium/app-registry (the nullfs file mount point).
+#   6. ostiarius's uid in ARCA_VESTIBULUM_UID below.
+
+enabled       = true
+name          = "atrium-arcad"
+path          = "/var/lib/atrium/jails/arcad"
+children_max  = 0
+devfs_ruleset = 4
+# network: none (the manifest default, `disable`). Arca has no network, ever.
+
+[[mounts]]
+source = "/libexec"
+dest   = "libexec"
+kind   = "ro_nullfs"
+[[mounts]]
+source = "/lib"
+dest   = "lib"
+kind   = "ro_nullfs"
+[[mounts]]
+source = "/usr/lib"
+dest   = "usr/lib"
+kind   = "ro_nullfs"
+[[mounts]]
+source = "/usr/local/lib"
+dest   = "usr/local/lib"
+kind   = "ro_nullfs"
+[[mounts]]
+source = "/usr/local/bin"
+dest   = "usr/local/bin"
+kind   = "ro_nullfs"
+[[mounts]]
+source = "/atrium/sockets/arca"                   # rw: bind arcad.sock (dir owned by _arca)
+dest   = "atrium/sockets/arca"
+kind   = "rw_nullfs"
+[[mounts]]
+source = "/var/db/arca"                           # rw: the per-user stores (0700 _arca)
+dest   = "var/db/arca"
+kind   = "rw_nullfs"
+[[mounts]]
+source = "/var/run/atrium/app-registry"           # ro: who each app uid is (one file)
+dest   = "var/run/atrium/app-registry"
+kind   = "ro_nullfs"
+
+[exec]
+path = "/usr/local/bin/atrium-arcad"
+argv = ["atrium-arcad"]
+uid  = 65020   # _arca
+gid  = 65020
+# _ostiarius: the only uid that may unlock and lock stores.
+env  = [{ key = "ARCA_VESTIBULUM_UID", value = "50093" }]

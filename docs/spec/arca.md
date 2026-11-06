@@ -225,9 +225,9 @@ user credential (passcode, biometric, recovery key)        — Vestibulum
     and setup says so.
   - *Optional FIDO2 key:* a user can mix an `hmac-secret` answer from a hardware key into
     the root key, so unlocking needs the key as well as the passcode.
-  - *macOS host adapter:* the Secure Enclave and the Keychain, through vestibulum-macos.
-    Its keystore today keeps `master.key` in clear at mode 0600 (`keystore.rs` header). That
-    is a known gap, and Arca's Phase A closes it.
+  - *Not in scope: the Insula host on macOS.* `vestibulum-macos` keeps its own keystore
+    (with `master.key` in clear at mode 0600) for Atrium apps running on a Mac. That is an
+    Insula-host question, not Arca's, and is out of this plan (user, 2026-11-06).
 - **Rollback.** A store restored from an old copy would bring back sessions the user logged
   out of. With a TPM, a monotonic NV counter is stored in the header and checked at unlock.
   Without one, a rollback is detected only across devices that sync.
@@ -409,7 +409,7 @@ each step.
 
 | phase | work | gate |
 |---|---|---|
-| **A0** | Arca daemon, store format, key hierarchy, classes, peer identity from the launch registry (§4.1); Vestibulum unlock and lock; move the keychain items out of `vestibulumd` | a test app gets EACCES on another app's item; the store fails to decrypt a record moved between recipients; the item is unreadable after lock (while-unlocked) |
+| **A0** | Arca daemon, store format, key hierarchy, classes, peer identity from the launch registry (§4.1); Vestibulum unlock and lock (ostiarius, which verifies the passcode, derives the root key at login and locks at sign-out). Atrium has no `vestibulumd` keychain to migrate: Arca is the keychain | a test app gets EACCES on another app's item; the store fails to decrypt a record moved between recipients; the item is unreadable after lock (while-unlocked) |
 | **A1** | the courier for HTTP(S): fixed request schema, TLS-then-attach, no cross-endpoint redirects, Set-Cookie records; fuzz targets | a hostile-client fuzz run finds no read of an item; a redirect test proves no attach crosses endpoints |
 | **A2** | the web profile: cookies, partitioning, SameSite with broker context, private credentialed conversions | **this is the gate for any login in the Navigator** (replaces C0) |
 | **A3** | password secure input, slot-filled form POST, trusted save and fill UI | password login |

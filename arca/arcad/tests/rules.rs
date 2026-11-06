@@ -140,7 +140,7 @@ fn lock_and_unlock_through_vestibulum_only() {
     assert_eq!(s.handle(&mail, op::RELEASE, &id).status, status::OK);
     // No store for a user who never logged in.
     let bob = body(|w| { w.str("bob"); w.raw(&root(1)); });
-    assert_eq!(s.handle(&Label::Vestibulum, op::V_UNLOCK, &bob).status, status::DENIED);
+    assert_eq!(s.handle(&Label::Vestibulum, op::V_UNLOCK, &bob).status, status::NO_STORE);
 }
 
 #[test]

@@ -55,9 +55,13 @@ pub struct KdfParams {
 }
 
 impl KdfParams {
-    /// 1 GiB, 4 passes: about a second on the dev VM's class of CPU, and
-    /// expensive to parallelise on GPUs. Raised, never lowered, over time.
-    pub const NO_TPM: KdfParams = KdfParams { m_kib: 1024 * 1024, t_cost: 4, p_cost: 1 };
+    /// 256 MiB, 3 passes: well above OWASP's Argon2id floor (19 MiB, 2
+    /// passes), around a second per login on the dev VM, and memory-hard
+    /// enough that GPU guessing is expensive. It is computed by the login
+    /// process (ostiarius) at every unlock, so it must fit that jail's
+    /// memory. Raised, never lowered, over time: the parameters are stored
+    /// per user, so a raise applies at the next passcode change.
+    pub const NO_TPM: KdfParams = KdfParams { m_kib: 256 * 1024, t_cost: 3, p_cost: 1 };
     /// Only for tests: cheap, never written by a shipped build.
     pub const TEST: KdfParams = KdfParams { m_kib: 64, t_cost: 1, p_cost: 1 };
 }

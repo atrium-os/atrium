@@ -12,6 +12,7 @@
 //! granted it (app-held, §4.3). Couriers (A1) and the web profile (A2) come
 //! next.
 
+pub mod client;
 pub mod label;
 pub mod proto;
 pub mod server;

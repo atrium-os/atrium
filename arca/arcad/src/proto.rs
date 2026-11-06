@@ -49,6 +49,10 @@ pub mod op {
     pub const V_REWRAP: u16 = 0x43;
     /// `str user` → `u8 state` (0 none, 1 sealed, 2 locked, 3 unlocked).
     pub const V_STATE: u16 = 0x44;
+    /// `str user` → `salt[16] | u32 m_kib | u32 t_cost | u32 p_cost`: how
+    /// Vestibulum derives this user's root key without a TPM. Made on first
+    /// ask. Not secret, but only Vestibulum may ask (it tells who has a store).
+    pub const V_KDF: u16 = 0x45;
 
     /// The user, in Arca's trusted UI, grants an app-held item to its app:
     /// `str user | publisher[32] | str app_id | id[16]` → nothing.
@@ -78,6 +82,8 @@ pub mod status {
     pub const NOT_RELEASABLE: u8 = 11;
     /// The op isn't supported for this kind or class (yet).
     pub const UNSUPPORTED: u8 = 12;
+    /// Vestibulum only: this user has no store yet (V_CREATE it).
+    pub const NO_STORE: u8 = 13;
 }
 
 /// Read one frame into locked memory. `Ok(None)` at a clean end of stream.

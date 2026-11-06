@@ -129,6 +129,10 @@ pub struct Ostiarius<L: Launcher> {
     /// active (only the active session's audio/windows are live — the seat-aware
     /// Choragus/Forum gate on it).
     sessions: HashMap<String, Vec<String>>,
+    /// Arca, the secret store (docs/spec/arca.md): unlocked with the root key
+    /// derived from the passcode at login, locked at sign-out. `None` = not
+    /// configured (tests, CLI fallback).
+    arca: Option<arcad::client::VestibulumLink>,
 }
 
 impl<L: Launcher> Ostiarius<L> {
@@ -137,6 +141,33 @@ impl<L: Launcher> Ostiarius<L> {
             launcher,
             seat_path: seat::ACTIVE_SESSION.to_string(),
             sessions: HashMap::new(),
+            arca: None,
+        }
+    }
+
+    /// Unlock and lock the user's Arca store at login and sign-out.
+    pub fn with_arca(mut self, socket: impl Into<std::path::PathBuf>) -> Self {
+        self.arca = Some(arcad::client::VestibulumLink::new(socket));
+        self
+    }
+
+    /// After a successful authentication: derive the user's root key from
+    /// the passcode just verified and unlock their secrets. A failure here
+    /// is logged and does not stop the login: without Arca the session
+    /// simply has no secrets (Arca fails closed, the login does not).
+    pub fn unlock_secrets(&self, human: &str, passcode: &str) {
+        let Some(arca) = &self.arca else { return };
+        match arca.unlock(human, passcode.as_bytes()) {
+            Ok(arcad::client::Unlocked::Created) => eprintln!("ostiarius: arca store created for {human}"),
+            Ok(arcad::client::Unlocked::Existing) => eprintln!("ostiarius: arca unlocked for {human}"),
+            Err(e) => eprintln!("ostiarius: arca unlock for {human} failed: {e:?}"),
+        }
+    }
+
+    fn lock_secrets(&self, human: &str) {
+        let Some(arca) = &self.arca else { return };
+        if let Err(e) = arca.lock(human) {
+            eprintln!("ostiarius: arca lock for {human} failed: {e:?}");
         }
     }
 
@@ -206,6 +237,7 @@ impl<L: Launcher> Ostiarius<L> {
     /// (back to the login screen). Other humans' sessions stay alive (detached).
     pub fn logout(&mut self) -> Result<(), String> {
         if let Some(active) = self.active_human() {
+            self.lock_secrets(&active);
             if let Some(ids) = self.sessions.remove(&active) {
                 for id in ids {
                     let _ = self.launcher.teardown(&id);
@@ -259,7 +291,10 @@ pub mod control {
         let r = match req {
             Request::Login { user, password, frontend } => ost
                 .authenticate(&user, &password)
-                .and_then(|human| ost.login(&human, frontend)),
+                .and_then(|human| {
+                    ost.unlock_secrets(&human, &password);
+                    ost.login(&human, frontend)
+                }),
             Request::Logout => ost.logout(),
         };
         match r {

@@ -4,14 +4,14 @@
 use std::collections::HashMap;
 use std::fs::{File, OpenOptions};
 use std::io::Write;
-use std::os::unix::fs::OpenOptionsExt;
+use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
 use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use arca_store::codec::{Reader, Writer};
 use arca_store::model::{caps, valid_user};
 use arca_store::secret::LockedBuf;
-use arca_store::{flags, Access, Class, Error, ItemId, Kind, LockState, NewItem, Provenance, Recipient, RootKey, Shape, Store};
+use arca_store::{flags, Access, KdfParams, Class, Error, ItemId, Kind, LockState, NewItem, Provenance, Recipient, RootKey, Shape, Store};
 use ed25519_dalek::{Signer, SigningKey};
 
 use crate::label::Label;
@@ -23,6 +23,9 @@ pub const PERSONA: &str = "main";
 
 pub struct State {
     dir: PathBuf,
+    /// The parameters new users get. Tests lower it; shipped builds use
+    /// [`KdfParams::NO_TPM`] until TPM sealing lands (A4).
+    pub kdf_default: KdfParams,
     stores: HashMap<String, Store>,
     audit: Option<File>,
 }
@@ -95,7 +98,7 @@ impl State {
     pub fn new(dir: PathBuf) -> std::io::Result<State> {
         std::fs::DirBuilder::new().recursive(true).create(&dir)?;
         let audit = OpenOptions::new().create(true).append(true).mode(0o600).open(dir.join("audit.log")).ok();
-        Ok(State { dir, stores: HashMap::new(), audit })
+        Ok(State { dir, kdf_default: KdfParams::NO_TPM, stores: HashMap::new(), audit })
     }
 
     pub fn handle(&mut self, who: &Label, op: u16, body: &[u8]) -> Reply {
@@ -291,7 +294,7 @@ impl State {
                 if r.end().is_err() {
                     return malformed();
                 }
-                if self.stores.contains_key(&user) {
+                if self.stores.contains_key(&user) || self.user_dir(&user).join("header").exists() {
                     return reply(status::EXISTS);
                 }
                 let s = tri!(Store::create(&self.user_dir(&user), &user, &k));
@@ -307,10 +310,10 @@ impl State {
                     return malformed();
                 }
                 if !self.stores.contains_key(&user) {
-                    let s = tri!(Store::open(&self.user_dir(&user), &user).map_err(|e| match e {
-                        Error::Io(_) => Error::Denied, // no store for this user yet
-                        e => e,
-                    }));
+                    if !self.user_dir(&user).join("header").exists() {
+                        return reply(status::NO_STORE);
+                    }
+                    let s = tri!(Store::open(&self.user_dir(&user), &user));
                     self.stores.insert(user.clone(), s);
                 }
                 tri!(self.stores.get_mut(&user).unwrap().unlock(&k));
@@ -349,8 +352,59 @@ impl State {
                 };
                 ok(vec![st])
             }
+            op::V_KDF => {
+                if r.end().is_err() {
+                    return malformed();
+                }
+                match self.kdf(&user) {
+                    Ok((salt, k)) => {
+                        let mut w = Writer::new();
+                        w.raw(&salt);
+                        w.u32(k.m_kib);
+                        w.u32(k.t_cost);
+                        w.u32(k.p_cost);
+                        ok(w.buf)
+                    }
+                    Err(e) => map_err(e),
+                }
+            }
             _ => reply(status::DENIED),
         }
+    }
+
+    /// The user's root-key derivation parameters, made on first ask.
+    fn kdf(&self, user: &str) -> Result<([u8; arca_store::root::SALT_LEN], KdfParams), Error> {
+        let dir = self.user_dir(user);
+        let path = dir.join("kdf");
+        if let Ok(b) = std::fs::read(&path) {
+            let mut r = Reader::new(&b);
+            let salt = r.array::<{ arca_store::root::SALT_LEN }>()?;
+            let k = KdfParams { m_kib: r.u32()?, t_cost: r.u32()?, p_cost: r.u32()? };
+            r.end()?;
+            // Editing this record gains an attacker nothing: other parameters
+            // or another salt give another root key, which fails to unwrap
+            // the master. Only sanity is checked.
+            if k.t_cost == 0 || k.p_cost == 0 || k.m_kib < 8 * k.p_cost {
+                return Err(Error::Corrupt("kdf parameters"));
+            }
+            return Ok((salt, k));
+        }
+        std::fs::DirBuilder::new().recursive(true).mode(0o700).create(&dir)?;
+        let salt = arca_store::root::new_salt()?;
+        let k = self.kdf_default;
+        let mut w = Writer::new();
+        w.raw(&salt);
+        w.u32(k.m_kib);
+        w.u32(k.t_cost);
+        w.u32(k.p_cost);
+        let tmp = dir.join("kdf.tmp");
+        {
+            let mut f = OpenOptions::new().write(true).create(true).truncate(true).mode(0o600).open(&tmp)?;
+            f.write_all(&w.buf)?;
+            f.sync_all()?;
+        }
+        std::fs::rename(&tmp, &path)?;
+        Ok((salt, k))
     }
 
     // ── trusted UI ───────────────────────────────────────────────────────
