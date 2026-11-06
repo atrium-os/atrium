@@ -623,6 +623,7 @@ impl EnvelopeFrontend {
             control::OP_VIDEO_FRAME          => self.handle_video_frame(msg),
             control::OP_VIDEO_LAYER_DESTROY  => self.handle_video_layer_destroy(msg),
             control::OP_VIDEO_LAYER_RATE     => self.handle_video_layer_rate(msg),
+            control::OP_VIDEO_LAYER_COLOR    => self.handle_video_layer_color(msg),
 
             // ── Cross-app window management (gated by window-management) ──
             control::OP_WM_ENUMERATE         => self.handle_wm_enumerate(msg),
@@ -696,6 +697,7 @@ impl EnvelopeFrontend {
         self.video.insert(layer, crate::video::Layer {
             client: me, window: p.window_id, format: p.format, width: p.width, height: p.height,
             bytes, maps, rect: None, shown: None,
+            colour: crate::video::Colour::default(), protected: p.protected,
         });
         Ok(vec![Outbound {
             op: control::OP_VIDEO_LAYER_CREATE, flags: aqueduct::envelope::flag::IS_RESPONSE,
@@ -725,7 +727,7 @@ impl EnvelopeFrontend {
         if vis != l.shown {
             l.shown = vis;
             if let Some(s) = crate::video::SINK.get() {
-                s.place(l.window, id, vis);
+                s.place(l.window, id, vis, l.protected);
             }
         }
         vis
@@ -762,11 +764,28 @@ impl EnvelopeFrontend {
             let src = crate::video::Shared::of(&l.maps[p.buffer as usize]);
             let (fmt, sw, sh) = (l.format, l.width, l.height);
             let crop = [(v[0] - r[0]) as u32, (v[1] - r[1]) as u32, v[2] as u32, v[3] as u32];
+            let colour = &l.colour;
             s.frame(window, p.layer, crop[2], crop[3], p.seq, p.present_ns, &mut |out| {
-                crate::video::convert(fmt, src, sw, sh, r[2] as u32, r[3] as u32, crop, out)
+                crate::video::convert(fmt, colour, src, sw, sh, r[2] as u32, r[3] as u32, crop, out)
             });
         }
         self.compositor.lock().unwrap().emit(crate::window::DisplayEvent::VideoReleased { window_id: window, layer: p.layer, buffer: p.buffer });
+        Ok(Vec::new())
+    }
+
+    /// `OP_VIDEO_LAYER_COLOR`: the colour its next frames convert with
+    /// (here, where they are converted). Unknown values are refused.
+    fn handle_video_layer_color(&mut self, msg: &Message) -> Result<Vec<Outbound>, DispatchError> {
+        use fresco_protocol::video::{matrix, primaries, range, transfer, VideoLayerColor};
+        let p: VideoLayerColor = decode(&msg.payload).map_err(|_| DispatchError::BadPayload)?;
+        let known = (matrix::BT601..=matrix::BT2020).contains(&p.matrix)
+            && (range::LIMITED..=range::FULL).contains(&p.range)
+            && (primaries::BT709..=primaries::BT2020).contains(&p.primaries)
+            && (transfer::SRGB..=transfer::HLG).contains(&p.transfer);
+        if !known {
+            return Err(DispatchError::BadPayload);
+        }
+        self.my_layer(p.layer)?.colour = crate::video::Colour::new(p.matrix, p.range, p.primaries, p.transfer, p.hdr);
         Ok(Vec::new())
     }
 

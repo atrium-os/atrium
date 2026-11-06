@@ -103,7 +103,8 @@ pub enum Msg {
     /// size), to show at `present_ns` (0: at once).
     VideoFrame { window: u32, layer: u32, slot: u32, seq: u32, present_ns: u64 },
     /// The layer sits at `rect` (`[x, y, w, h]`, window pixels) or is hidden.
-    VideoPlace { window: u32, layer: u32, rect: Option<[i32; 4]> },
+    /// `protected`: kept out of screen capture (fresco-video.md §6).
+    VideoPlace { window: u32, layer: u32, rect: Option<[i32; 4]>, protected: bool },
     /// The layer is gone.
     VideoDestroy { window: u32, layer: u32 },
     /// The layer's content runs at `hz_milli` (0: not said), for VRR
@@ -428,15 +429,17 @@ impl Msg {
                 r.put(6, (*present_ns >> 32) as u32);
                 r
             }
-            Msg::VideoPlace { window, layer, rect } => {
+            Msg::VideoPlace { window, layer, rect, protected } => {
                 let mut r = Rec::new(VIDEO_PLACE, *window);
                 r.put(2, *layer);
+                // Word 7: bit 0 a rect follows, bit 1 protected.
+                r.put(7, u32::from(*protected) << 1);
                 if let Some([x, y, w, h]) = *rect {
                     r.put(3, x as u32);
                     r.put(4, y as u32);
                     r.put(5, w as u32);
                     r.put(6, h as u32);
-                    r.put(7, 1);
+                    r.put(7, 1 | u32::from(*protected) << 1);
                 }
                 r
             }
@@ -621,11 +624,13 @@ impl Msg {
             VIDEO_PLACE => Msg::VideoPlace {
                 window,
                 layer: r.get(2),
-                rect: match flag(r.get(7))? {
+                rect: match r.get(7) & 1 == 1 {
+                    _ if r.get(7) > 3 => return Err(Refused("video place flags")),
                     true => Some([r.get(3) as i32, r.get(4) as i32, dim(r.get(5))? as i32, dim(r.get(6))? as i32]),
                     false if (3..7).all(|i| r.get(i) == 0) => None,
                     false => return Err(Refused("video rect without its flag")),
                 },
+                protected: r.get(7) & 2 != 0,
             },
             VIDEO_DESTROY => Msg::VideoDestroy { window, layer: r.get(2) },
             VIDEO_RATE => Msg::VideoRate { window, layer: r.get(2), hz_milli: r.get(3) },

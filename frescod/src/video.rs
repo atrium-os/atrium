@@ -32,6 +32,8 @@ struct Layer {
     dropped: u32,
     /// The content's rate in milli-Hz (0: not said), for VRR pacing.
     hz_milli: u32,
+    /// Kept out of screen capture (fresco-video.md §6).
+    protected: bool,
 }
 
 /// A frame newly on screen, to announce once its flip has landed.
@@ -46,6 +48,8 @@ pub struct Presented {
 /// One video surface to compose this refresh.
 pub struct Shown {
     pub id: u32,
+    /// Shown black where the screen is captured.
+    pub protected: bool,
     /// Its pixels' position in the window.
     pub at: (i32, i32),
     pub pixels: Arc<Pixels>,
@@ -61,6 +65,10 @@ pub struct Videos {
 
 /// Every layer frescod composes.
 pub static VIDEOS: LazyLock<Videos> = LazyLock::new(Videos::default);
+
+/// Set when frescod's output is a capture (headless: the PNG), so
+/// protected layers show black in it.
+pub static CAPTURED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 static GEN: AtomicU64 = AtomicU64::new(1);
 static NEXT_ID: AtomicU64 = AtomicU64::new(FIRST_ID as u64);
@@ -84,14 +92,15 @@ impl Videos {
             // Wraps after 2^32 layers; ids stay above window ids.
             let n = NEXT_ID.fetch_add(1, Ordering::Relaxed);
             let id = FIRST_ID | (n as u32 & 0x7fff_ffff);
-            Layer { id, rect: None, queue: VecDeque::new(), current: None, dropped: 0, hz_milli: 0 }
+            Layer { id, rect: None, queue: VecDeque::new(), current: None, dropped: 0, hz_milli: 0, protected: false }
         })
     }
 
-    pub fn place(&self, window: u32, layer: u32, rect: Option<[i32; 4]>) {
+    pub fn place(&self, window: u32, layer: u32, rect: Option<[i32; 4]>, protected: bool) {
         let mut m = self.layers.lock().unwrap();
         let l = Self::layer(&mut m, (window, layer));
         l.rect = rect;
+        l.protected |= protected; // once protected, always
         if rect.is_none() {
             l.dropped += l.queue.len() as u32;
             l.queue.clear();
@@ -187,7 +196,7 @@ impl Videos {
                 }
             }
             if let (Some(r), Some(px)) = (l.rect, &l.current) {
-                out.entry(key.0).or_default().push(Shown { id: l.id, at: (r[0], r[1]), pixels: px.clone() });
+                out.entry(key.0).or_default().push(Shown { id: l.id, protected: l.protected, at: (r[0], r[1]), pixels: px.clone() });
             }
         }
         drop(m);
@@ -242,8 +251,8 @@ pub struct Direct {
 }
 
 impl fresco_scene_server::video::VideoSink for Direct {
-    fn place(&self, window: u32, layer: u32, rect: Option<[i32; 4]>) {
-        VIDEOS.place(window, layer, rect);
+    fn place(&self, window: u32, layer: u32, rect: Option<[i32; 4]>, protected: bool) {
+        VIDEOS.place(window, layer, rect, protected);
         self.redraw.wake();
     }
 
@@ -271,7 +280,7 @@ mod tests {
     #[test]
     fn takes_the_latest_due_frame_and_counts_the_rest() {
         let v = Videos::default();
-        v.place(3, 1, Some([10, 20, 2, 2]));
+        v.place(3, 1, Some([10, 20, 2, 2]), false);
         for (seq, t) in [(1, 100), (2, 200), (3, 300)] {
             v.queue(3, 1, pixels(2, 2, vec![seq; 4], seq), seq, t);
         }
@@ -297,7 +306,7 @@ mod tests {
     #[test]
     fn repeats_slow_content_on_variable_refresh() {
         let v = Videos::default();
-        v.place(1, 1, Some([0, 0, 2, 2]));
+        v.place(1, 1, Some([0, 0, 2, 2]), false);
         v.queue(1, 1, pixels(2, 2, vec![0; 4], 1), 1, 0);
         v.take(1, &[1].into());
         assert_eq!(v.repeat_ns(48_000), None); // rate not said

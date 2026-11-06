@@ -891,6 +891,7 @@ fn run_headless(png: &str) -> std::io::Result<()> {
     if renderer.takes_pixels() {
         let _ = fresco_scene_server::video::SINK.set(Box::new(video::Direct { redraw: redraw2.clone() }));
     }
+    video::CAPTURED.store(true, std::sync::atomic::Ordering::Relaxed);
     let split = split::Broker::from_env(comp.clone(), redraw2.clone(), (W, H, 0), renderer.takes_frames(), renderer.wants_pixels());
     let subs = socket_server::spawn(
         socket_server::Shared {
@@ -1091,7 +1092,11 @@ fn render_one_frame(
             for w in windows.drain(..) {
                 let (ww, wh) = render_backend::surface_size(&w);
                 for v in due.remove(&w.id).unwrap_or_default() {
-                    let Some((px, at)) = video::clip(&v.pixels, v.at, ww, wh) else { continue };
+                    let Some((mut px, at)) = video::clip(&v.pixels, v.at, ww, wh) else { continue };
+                    /* Protected (fresco-video.md §6): black in a capture. */
+                    if v.protected && video::CAPTURED.load(std::sync::atomic::Ordering::Relaxed) {
+                        px = video::pixels(px.width, px.height, vec![0xff00_0000; px.px.len()], px.seq);
+                    }
                     video_rects.entry(w.id).or_default().push([at.0, at.1, at.0 + px.width as i32, at.1 + px.height as i32]);
                     out.push(WindowFrame {
                         id: v.id,

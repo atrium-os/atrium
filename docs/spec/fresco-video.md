@@ -221,6 +221,25 @@ to one 200 ms capture interval headless), two due at once give one `PRESENTED` w
 `dropped: 1`, and a hidden layer releases without presenting. Timing on a real flip path
 (gpusim display, and VRR repeats) is part of V4.
 
+**V3 as built (2026-11-06).** `OP_VIDEO_LAYER_COLOR` (0x0725, `VideoLayerColor` with the
+`fresco_protocol::video::{matrix, range, primaries, transfer}` constants and an optional
+`Mastering`) sets how the layer's next frames convert; until it is sent a layer is BT.709,
+limited range, BT.1886. The conversion stays where V1 put it, in the frontend serving the
+client (the renderer jail in split mode), so frescod never sees anything but BGRA. SDR BT.709
+content is shown as it is; anything else goes per channel through a table: its transfer to
+linear light (BT.1886 decodes as sRGB, so a grey stays the same grey), PQ through the BT.2390
+EETF from the content's peak (MaxCLL, else the mastering peak, else 1000 cd/m²) onto SDR
+white at 203 cd/m², HLG through its OOTF for a 1000 cd/m² display and the same EETF, then
+BT.2020 to BT.709 primaries with clipping, and back to sRGB. The HLG OOTF is applied per
+channel, an approximation of BT.2100's luminance-based one. `VideoLayerCreate.protected`
+keeps the layer out of capture: today frescod's only capture is the headless PNG, where a
+protected layer shows black; any capture path added later must ask `video::CAPTURED` the same
+way. **Open (Shankar):** on an HDR monitor, HDR video is tone-mapped to SDR white like
+everything else. True PQ passthrough needs the desktop composed in wider than 8-bit sRGB,
+which is a larger change than V3 (decision card in the Fresco thread). The probe checks
+BT.601 full-range red, PQ peak to SDR white, PQ 100 cd/m² to grey, a refused matrix and
+a protected layer's black in the capture, in both modes.
+
 ## 9. Who does what
 
 | # | work | owner |

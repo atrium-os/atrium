@@ -661,13 +661,13 @@ impl Broker {
                 }
                 r.tell(&Msg::VideoDone { window: local, layer, slot: s }, &[])?;
             }
-            Msg::VideoPlace { layer, rect, .. } => {
+            Msg::VideoPlace { layer, rect, protected, .. } => {
                 let global = r.wins.lock().unwrap().get(&local).map(|w| w.global).ok_or("video place for unknown window")?;
                 // Only a layer with slots (so at most a client's layers).
                 if !r.videos.lock().unwrap().contains_key(&(local, layer)) {
                     return Ok(());
                 }
-                crate::video::VIDEOS.place(global as u32, layer, rect);
+                crate::video::VIDEOS.place(global as u32, layer, rect, protected);
                 self.redraw.wake();
             }
             Msg::VideoRate { layer, hz_milli, .. } => {

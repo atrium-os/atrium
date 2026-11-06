@@ -251,7 +251,7 @@ struct VideoToBroker {
 }
 
 impl fresco_scene_server::video::VideoSink for VideoToBroker {
-    fn place(&self, window: u32, layer: u32, rect: Option<[i32; 4]>) {
+    fn place(&self, window: u32, layer: u32, rect: Option<[i32; 4]>, protected: bool) {
         if let Some(r) = rect {
             let size = (r[2] as u32, r[3] as u32);
             let mut rings = self.rings.lock().unwrap();
@@ -261,7 +261,7 @@ impl fresco_scene_server::video::VideoSink for VideoToBroker {
                 send(&self.broker, &Msg::VideoRing { window, layer, width: size.0, height: size.1 });
             }
         }
-        send(&self.broker, &Msg::VideoPlace { window, layer, rect });
+        send(&self.broker, &Msg::VideoPlace { window, layer, rect, protected });
     }
 
     fn frame(&self, window: u32, layer: u32, w: u32, h: u32, seq: u32, present_ns: u64, fill: &mut dyn FnMut(&mut [u32])) {

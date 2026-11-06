@@ -17,7 +17,8 @@ pub trait VideoSink: Send + Sync {
     /// Layer `layer` of window `window` (the frontend's own window id)
     /// now shows at `rect` (`[x, y, w, h]` in the window's pixels, inside
     /// the window), or is hidden. Its next frame is that size.
-    fn place(&self, window: u32, layer: u32, rect: Option<[i32; 4]>);
+    /// `protected`: kept out of anything that captures the screen.
+    fn place(&self, window: u32, layer: u32, rect: Option<[i32; 4]>, protected: bool);
     /// A frame for the layer, `w` x `h` (its rect's size): `fill` writes
     /// it, BGRA words, into the slice it is given (`w * h` long).
     fn frame(&self, window: u32, layer: u32, w: u32, h: u32, seq: u32, present_ns: u64, fill: &mut dyn FnMut(&mut [u32]));
@@ -45,6 +46,9 @@ pub struct Layer {
     pub rect: Option<[i32; 4]>,
     /// The part of it inside the window, as last told to the sink.
     pub shown: Option<[i32; 4]>,
+    pub colour: Colour,
+    /// Kept out of screen capture (fresco-video.md §6).
+    pub protected: bool,
 }
 
 /// `n` anonymous shared-memory buffers of `len` bytes, sealed against
@@ -82,18 +86,188 @@ pub fn buffers(n: u32, len: u64) -> std::io::Result<(Vec<OwnedFd>, Vec<memmap2::
     Ok((fds, maps))
 }
 
-/// BT.709 limited range, 8-bit Y'CbCr to R'G'B' (the default until
-/// layers carry their colour, V3).
-#[inline]
-fn yuv_to_bgra(y: f32, cb: f32, cr: f32) -> u32 {
-    let y = (y - 16.0) * (255.0 / 219.0);
-    let cb = (cb - 128.0) * (255.0 / 224.0);
-    let cr = (cr - 128.0) * (255.0 / 224.0);
-    let r = y + 1.5748 * cr;
-    let g = y - 0.1873 * cb - 0.4681 * cr;
-    let b = y + 1.8556 * cb;
-    let c = |v: f32| v.round().clamp(0.0, 255.0) as u32;
-    0xff00_0000 | c(r) << 16 | c(g) << 8 | c(b)
+/// SDR reference white, cd/m² (BT.2408): HDR is shown with this as the
+/// desktop's white.
+pub const SDR_WHITE_NITS: f32 = 203.0;
+
+/// Entries of the transfer table, over a signal of 0..=1.
+const LUT_IN: usize = 1024;
+/// Entries of the sRGB encode table, over linear 0..=1.
+const LUT_OUT: usize = 4096;
+
+/// How a layer's samples become desktop sRGB (fresco-video.md §5): the
+/// matrix and range turn Y'CbCr into R'G'B'; for SDR BT.709 that is the
+/// picture as it is, else each channel goes through its transfer to linear
+/// light (PQ and HLG tone-mapped to SDR white with the BT.2390 EETF), from
+/// BT.2020 to BT.709 primaries, and back to sRGB.
+#[derive(Clone)]
+pub struct Colour {
+    kr: f32,
+    kb: f32,
+    full: bool,
+    /// R'G'B' is shown as it is (SDR, BT.709).
+    direct: bool,
+    /// Signal (0..=1) to linear light, 1.0 = SDR white.
+    lin: Vec<f32>,
+    /// BT.2020 to BT.709, in linear light.
+    gamut: Option<[[f32; 3]; 3]>,
+    /// Linear light (0..=1) to an sRGB code value.
+    srgb: Vec<u8>,
+}
+
+impl Default for Colour {
+    fn default() -> Self {
+        use fresco_protocol::video::{matrix, primaries, range, transfer};
+        Colour::new(matrix::BT709, range::LIMITED, primaries::BT709, transfer::BT1886, None)
+    }
+}
+
+/// SMPTE ST 2084: signal to cd/m², and back.
+pub fn pq_eotf(e: f32) -> f32 {
+    let (m1, m2, c1, c2, c3) = (0.159_301_76_f32, 78.84375_f32, 0.8359375_f32, 18.851_562_f32, 18.6875_f32);
+    let p = e.clamp(0.0, 1.0).powf(1.0 / m2);
+    10000.0 * ((p - c1).max(0.0) / (c2 - c3 * p)).powf(1.0 / m1)
+}
+
+pub fn pq_oetf(nits: f32) -> f32 {
+    let (m1, m2, c1, c2, c3) = (0.159_301_76_f32, 78.84375_f32, 0.8359375_f32, 18.851_562_f32, 18.6875_f32);
+    let y = (nits / 10000.0).clamp(0.0, 1.0).powf(m1);
+    ((c1 + c2 * y) / (1.0 + c3 * y)).powf(m2)
+}
+
+/// HLG (BT.2100) signal to scene light, 0..=1.
+fn hlg_inverse_oetf(e: f32) -> f32 {
+    let (a, b, c) = (0.178_832_77_f32, 0.284_668_92_f32, 0.559_910_7_f32);
+    let e = e.clamp(0.0, 1.0);
+    if e <= 0.5 { e * e / 3.0 } else { (((e - c) / a).exp() + b) / 12.0 }
+}
+
+/// The BT.2390 EETF: a PQ signal from content peaking at `src_peak`
+/// cd/m² onto a display peaking at `dst_peak` (black at 0), as a PQ
+/// signal.
+pub fn eetf(e: f32, src_peak: f32, dst_peak: f32) -> f32 {
+    let lw = pq_oetf(src_peak);
+    if src_peak <= dst_peak || lw <= 0.0 {
+        return e;
+    }
+    let e1 = (e / lw).clamp(0.0, 1.0);
+    let max_lum = pq_oetf(dst_peak) / lw;
+    let ks = 1.5 * max_lum - 0.5;
+    let e2 = if e1 < ks {
+        e1
+    } else {
+        let t = (e1 - ks) / (1.0 - ks);
+        let (t2, t3) = (t * t, t * t * t);
+        (2.0 * t3 - 3.0 * t2 + 1.0) * ks + (t3 - 2.0 * t2 + t) * (1.0 - ks) + (-2.0 * t3 + 3.0 * t2) * max_lum
+    };
+    e2 * lw
+}
+
+fn srgb_encode(l: f32) -> f32 {
+    if l <= 0.003_130_8 { 12.92 * l } else { 1.055 * l.powf(1.0 / 2.4) - 0.055 }
+}
+
+impl Colour {
+    /// The colour a layer gives (`fresco_protocol::video` constants);
+    /// values it doesn't know read as the default.
+    pub fn new(matrix_: u8, range_: u8, primaries_: u8, transfer_: u8, hdr: Option<fresco_protocol::video::Mastering>) -> Colour {
+        use fresco_protocol::video::{matrix, primaries, range, transfer};
+        let (kr, kb) = match matrix_ {
+            matrix::BT601 => (0.299, 0.114),
+            matrix::BT2020 => (0.2627, 0.0593),
+            _ => (0.2126, 0.0722),
+        };
+        let wide = primaries_ == primaries::BT2020;
+        let transfer_ = match transfer_ {
+            transfer::SRGB | transfer::PQ | transfer::HLG => transfer_,
+            _ => transfer::BT1886,
+        };
+        let sdr = matches!(transfer_, transfer::SRGB | transfer::BT1886);
+        // The content's peak: what its metadata says, else 1000 cd/m².
+        let peak = hdr
+            .map(|m| match (m.max_cll, m.max_luminance) {
+                (c, l) if c > 0 && (l == 0 || c < l) => f32::from(c),
+                (_, l) if l > 0 => f32::from(l),
+                _ => 1000.0,
+            })
+            .unwrap_or(1000.0)
+            .clamp(SDR_WHITE_NITS, 10000.0);
+        let lin = (0..=LUT_IN)
+            .map(|i| {
+                let e = i as f32 / LUT_IN as f32;
+                match transfer_ {
+                    // SDR video is shown on the sRGB desktop as it is
+                    // (the `direct` path), so BT.1886 decodes as sRGB too:
+                    // a grey stays the same grey whatever the primaries.
+                    transfer::SRGB | transfer::BT1886 => if e <= 0.04045 { e / 12.92 } else { ((e + 0.055) / 1.055).powf(2.4) },
+                    transfer::PQ => pq_eotf(eetf(e, peak, SDR_WHITE_NITS)) / SDR_WHITE_NITS,
+                    transfer::HLG => {
+                        // The OOTF for a 1000 cd/m² display (system gamma
+                        // 1.2), per channel, then onto SDR white.
+                        let nits = 1000.0 * hlg_inverse_oetf(e).powf(1.2);
+                        pq_eotf(eetf(pq_oetf(nits), 1000.0, SDR_WHITE_NITS)) / SDR_WHITE_NITS
+                    }
+                    _ => unreachable!(),
+                }
+            })
+            .collect();
+        // BT.2020 to BT.709 (BT.2087), linear light.
+        let gamut = wide.then_some([
+            [1.6605, -0.5876, -0.0728],
+            [-0.1246, 1.1329, -0.0083],
+            [-0.0182, -0.1006, 1.1187],
+        ]);
+        let srgb = (0..=LUT_OUT).map(|i| (srgb_encode(i as f32 / LUT_OUT as f32) * 255.0).round() as u8).collect();
+        Colour {
+            kr,
+            kb,
+            full: range_ == range::FULL,
+            direct: sdr && !wide,
+            lin,
+            gamut,
+            srgb,
+        }
+    }
+
+    /// One pixel from Y'CbCr samples in 8-bit code values (P010 scaled to
+    /// them), as a BGRA word.
+    #[inline]
+    fn yuv(&self, y: f32, cb: f32, cr: f32) -> u32 {
+        let (y, cb, cr) = if self.full {
+            (y / 255.0, (cb - 128.0) / 255.0, (cr - 128.0) / 255.0)
+        } else {
+            ((y - 16.0) / 219.0, (cb - 128.0) / 224.0, (cr - 128.0) / 224.0)
+        };
+        let kg = 1.0 - self.kr - self.kb;
+        let r = y + 2.0 * (1.0 - self.kr) * cr;
+        let b = y + 2.0 * (1.0 - self.kb) * cb;
+        let g = (y - self.kr * r - self.kb * b) / kg;
+        self.rgb(r, g, b)
+    }
+
+    /// One pixel from R'G'B' (0..=1), as a BGRA word.
+    #[inline]
+    fn rgb(&self, r: f32, g: f32, b: f32) -> u32 {
+        if self.direct {
+            let c = |v: f32| (v * 255.0).round().clamp(0.0, 255.0) as u32;
+            return 0xff00_0000 | c(r) << 16 | c(g) << 8 | c(b);
+        }
+        let lin = |v: f32| {
+            let x = v.clamp(0.0, 1.0) * LUT_IN as f32;
+            let i = (x as usize).min(LUT_IN - 1);
+            let f = x - i as f32;
+            self.lin[i] * (1.0 - f) + self.lin[i + 1] * f
+        };
+        let mut l = [lin(r), lin(g), lin(b)];
+        if let Some(m) = &self.gamut {
+            let v = l;
+            for (o, row) in l.iter_mut().zip(m) {
+                *o = row[0] * v[0] + row[1] * v[1] + row[2] * v[2];
+            }
+        }
+        let c = |v: f32| u32::from(self.srgb[(v.clamp(0.0, 1.0) * LUT_OUT as f32).round() as usize]);
+        0xff00_0000 | c(l[0]) << 16 | c(l[1]) << 8 | c(l[2])
+    }
 }
 
 /// Sample plane `p` (`pw` x `ph` samples, `stride` samples a row,
@@ -148,7 +322,7 @@ impl Shared {
 /// to `dw` x `dh`, and write the part `crop` (`[x, y, w, h]` within that
 /// scaled picture) as BGRA words to `out` (`w * h` long). Nothing in `src`
 /// is trusted: it is only ever read as samples.
-pub fn convert(format_: u8, src: Shared, sw: u32, sh: u32, dw: u32, dh: u32, crop: [u32; 4], out: &mut [u32]) {
+pub fn convert(format_: u8, colour: &Colour, src: Shared, sw: u32, sh: u32, dw: u32, dh: u32, crop: [u32; 4], out: &mut [u32]) {
     let (sw, sh, dw, dh) = (sw as usize, sh as usize, dw as usize, dh as usize);
     let [cx0, cy0, cw, chh] = crop.map(|v| v as usize);
     if dw == 0 || dh == 0 || sw == 0 || sh == 0 || cw == 0 || chh == 0 || out.len() < cw * chh || cx0 + cw > dw || cy0 + chh > dh {
@@ -181,7 +355,7 @@ pub fn convert(format_: u8, src: Shared, sw: u32, sh: u32, dw: u32, dh: u32, cro
                     let yv = bilinear(read, sw, sh, sw, 1, 0, x, y);
                     let cb = bilinear(read, cw2, ch2, sw, 2, uv, cx, cy);
                     let cr = bilinear(read, cw2, ch2, sw, 2, uv + 1, cx, cy);
-                    out[oy * cw + ox] = yuv_to_bgra(yv, cb, cr);
+                    out[oy * cw + ox] = colour.yuv(yv, cb, cr);
                 }
             }
         }
@@ -191,8 +365,8 @@ pub fn convert(format_: u8, src: Shared, sw: u32, sh: u32, dw: u32, dh: u32, cro
                 let y = ((cy0 + oy) as f32 + 0.5) * sy - 0.5;
                 for ox in 0..cw {
                     let x = ((cx0 + ox) as f32 + 0.5) * sx - 0.5;
-                    let ch = |c: usize| bilinear(&read, sw, sh, sw * 4, 4, c, x, y).round().clamp(0.0, 255.0) as u32;
-                    out[oy * cw + ox] = 0xff00_0000 | ch(0) << 16 | ch(1) << 8 | ch(2);
+                    let ch = |c: usize| bilinear(&read, sw, sh, sw * 4, 4, c, x, y) / 255.0;
+                    out[oy * cw + ox] = colour.rgb(ch(0), ch(1), ch(2));
                 }
             }
         }
@@ -216,10 +390,81 @@ mod tests {
 
     #[test]
     fn limited_range_black_white_and_grey() {
-        assert_eq!(yuv_to_bgra(16.0, 128.0, 128.0), 0xff00_0000);
-        assert_eq!(yuv_to_bgra(235.0, 128.0, 128.0), 0xffff_ffff);
-        let g = yuv_to_bgra(126.0, 128.0, 128.0) & 0xff;
+        let c = Colour::default();
+        assert_eq!(c.yuv(16.0, 128.0, 128.0), 0xff00_0000);
+        assert_eq!(c.yuv(235.0, 128.0, 128.0), 0xffff_ffff);
+        let g = c.yuv(126.0, 128.0, 128.0) & 0xff;
         assert!((127..=129).contains(&g));
+    }
+
+    fn rgb(p: u32) -> (u32, u32, u32) {
+        ((p >> 16) & 0xff, (p >> 8) & 0xff, p & 0xff)
+    }
+
+    #[test]
+    fn full_range_and_bt601() {
+        use fresco_protocol::video::{matrix, primaries, range, transfer};
+        let c = Colour::new(matrix::BT601, range::FULL, primaries::BT709, transfer::BT1886, None);
+        assert_eq!(c.yuv(0.0, 128.0, 128.0), 0xff00_0000);
+        assert_eq!(c.yuv(255.0, 128.0, 128.0), 0xffff_ffff);
+        // BT.601 full-range red: Y 76, Cb 85, Cr 255.
+        let (r, g, b) = rgb(c.yuv(76.0, 85.0, 255.0));
+        assert!(r > 250 && g < 6 && b < 6, "{r} {g} {b}");
+    }
+
+    #[test]
+    fn pq_goes_through_the_eetf() {
+        // The curve and its inverse agree; reference white is ~0.58.
+        for n in [0.1f32, 1.0, 100.0, 203.0, 1000.0, 4000.0] {
+            assert!((pq_eotf(pq_oetf(n)) - n).abs() / n < 1e-3, "{n}");
+        }
+        assert!((pq_oetf(203.0) - 0.5807).abs() < 1e-3);
+        // Below the knee unchanged, the content's peak onto the display's,
+        // and never brighter.
+        let (src, dst) = (1000.0, SDR_WHITE_NITS);
+        assert_eq!(eetf(0.3, src, dst), 0.3);
+        assert!((pq_eotf(eetf(pq_oetf(src), src, dst)) - dst).abs() < 1.0);
+        let mut last = 0.0;
+        for i in 0..=100 {
+            let e = i as f32 / 100.0 * pq_oetf(src);
+            let o = eetf(e, src, dst);
+            assert!(o <= e + 1e-6 && o >= last - 1e-6);
+            last = o;
+        }
+    }
+
+    #[test]
+    fn hdr_white_and_peaks_land_in_sdr() {
+        use fresco_protocol::video::{matrix, primaries, range, transfer, Mastering};
+        let m = Mastering { max_luminance: 1000, max_cll: 1000, ..Default::default() };
+        let c = Colour::new(matrix::BT2020, range::FULL, primaries::BT2020, transfer::PQ, Some(m));
+        // Full-range PQ white at the content's peak: SDR white.
+        let (r, g, b) = rgb(c.yuv(255.0, 128.0, 128.0));
+        assert!(r >= 254 && g >= 254 && b >= 254, "{r} {g} {b}");
+        // Black stays black.
+        assert_eq!(c.yuv(0.0, 128.0, 128.0), 0xff00_0000);
+        // 100 cd/m² grey, just past the knee for a 1000 cd/m² master:
+        // about half of SDR white in linear light, a little less (sRGB 186
+        // uncompressed).
+        let e = pq_oetf(100.0) * 255.0;
+        let (r, _, _) = rgb(c.yuv(e, 128.0, 128.0));
+        assert!((165..=186).contains(&r), "{r}");
+        // HLG peak white also lands on SDR white.
+        let h = Colour::new(matrix::BT2020, range::FULL, primaries::BT2020, transfer::HLG, None);
+        let (r, _, _) = rgb(h.yuv(255.0, 128.0, 128.0));
+        assert!(r >= 254, "{r}");
+    }
+
+    #[test]
+    fn bt2020_green_is_clipped_into_bt709() {
+        use fresco_protocol::video::{matrix, primaries, range, transfer};
+        let c = Colour::new(matrix::BT2020, range::FULL, primaries::BT2020, transfer::BT1886, None);
+        // Pure BT.2020 green: R'G'B' (0, 1, 0).
+        let (r, g, b) = rgb(c.rgb(0.0, 1.0, 0.0));
+        assert!(r == 0 && g == 255 && b == 0, "{r} {g} {b}");
+        // A BT.709 grey is still grey.
+        let (r, g, b) = rgb(c.rgb(0.5, 0.5, 0.5));
+        assert!(r.abs_diff(g) <= 1 && g.abs_diff(b) <= 1 && (127..=129).contains(&r), "{r} {g} {b}");
     }
 
     #[test]
@@ -229,7 +474,7 @@ mod tests {
         let mut src = vec![63u8; (w * h) as usize];
         src.extend([102u8, 240].repeat((w * h / 4) as usize));
         let mut out = vec![0u32; 8 * 4];
-        convert(format::NV12, Shared::bytes(&src), w, h, 8, 4, [0, 0, 8, 4], &mut out);
+        convert(format::NV12, &Colour::default(), Shared::bytes(&src), w, h, 8, 4, [0, 0, 8, 4], &mut out);
         for p in out {
             let (r, g, b) = ((p >> 16) & 0xff, (p >> 8) & 0xff, p & 0xff);
             assert!(r > 245 && g < 10 && b < 10, "{p:#x}");
@@ -239,7 +484,7 @@ mod tests {
     #[test]
     fn a_short_buffer_reads_as_black_not_a_crash() {
         let mut out = vec![1u32; 16];
-        convert(format::P010, Shared::bytes(&[1, 2, 3]), 4, 4, 4, 4, [0, 0, 4, 4], &mut out);
+        convert(format::P010, &Colour::default(), Shared::bytes(&[1, 2, 3]), 4, 4, 4, 4, [0, 0, 4, 4], &mut out);
         assert!(out.iter().all(|&p| p >> 24 == 0xff));
     }
 
@@ -253,9 +498,9 @@ mod tests {
             }
         }
         let mut whole = vec![0u32; 32];
-        convert(format::RGBA8, Shared::bytes(&src), 4, 2, 8, 4, [0, 0, 8, 4], &mut whole);
+        convert(format::RGBA8, &Colour::default(), Shared::bytes(&src), 4, 2, 8, 4, [0, 0, 8, 4], &mut whole);
         let mut part = vec![0u32; 6];
-        convert(format::RGBA8, Shared::bytes(&src), 4, 2, 8, 4, [5, 1, 3, 2], &mut part);
+        convert(format::RGBA8, &Colour::default(), Shared::bytes(&src), 4, 2, 8, 4, [5, 1, 3, 2], &mut part);
         for y in 0..2 {
             for x in 0..3 {
                 assert_eq!(part[y * 3 + x], whole[(y + 1) * 8 + x + 5]);

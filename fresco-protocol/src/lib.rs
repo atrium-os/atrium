@@ -216,6 +216,8 @@ pub mod control {
     pub const OP_VIDEO_LAYER_DESTROY:   u16 = 0x0723;
     /// The layer's content frame rate, for VRR pacing (fresco-video.md §4).
     pub const OP_VIDEO_LAYER_RATE:      u16 = 0x0724;
+    /// The layer's colour: matrix, range, primaries, transfer, HDR metadata.
+    pub const OP_VIDEO_LAYER_COLOR:     u16 = 0x0725;
     /// `VideoPresentedEvent`.
     pub const EV_VIDEO_PRESENTED:       u16 = 0x0728;
     /// `VideoReleasedEvent`.
@@ -1128,6 +1130,9 @@ pub mod video {
         pub width: u32,
         pub height: u32,
         pub buffers: u32,
+        /// DRM'd content (fresco-video.md §6): never handed to anything
+        /// that captures the screen; it shows black there.
+        pub protected: bool,
     }
 
     /// The reply: `layer` names it from now on, and `buffers` fds (each
@@ -1157,6 +1162,66 @@ pub mod video {
     #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
     pub struct VideoLayerDestroy {
         pub layer: u32,
+    }
+
+    /// `VideoLayerColor::matrix`: how Y'CbCr is made from R'G'B'.
+    pub mod matrix {
+        pub const BT601: u8 = 1;
+        pub const BT709: u8 = 2;
+        pub const BT2020: u8 = 3;
+    }
+
+    /// `VideoLayerColor::range`.
+    pub mod range {
+        /// 16–235 luma, 16–240 chroma (8-bit code values).
+        pub const LIMITED: u8 = 1;
+        pub const FULL: u8 = 2;
+    }
+
+    /// `VideoLayerColor::primaries`.
+    pub mod primaries {
+        pub const BT709: u8 = 1;
+        pub const BT2020: u8 = 2;
+    }
+
+    /// `VideoLayerColor::transfer`.
+    pub mod transfer {
+        pub const SRGB: u8 = 1;
+        pub const BT1886: u8 = 2;
+        /// SMPTE ST 2084.
+        pub const PQ: u8 = 3;
+        /// ARIB STD-B67 / BT.2100 HLG.
+        pub const HLG: u8 = 4;
+    }
+
+    /// Static HDR metadata (CTA-861.3 type 1, as display 2.3 sends it).
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+    pub struct Mastering {
+        /// R, G, B chromaticity of the mastering display, units of 0.00002.
+        pub primaries_x: [u16; 3],
+        pub primaries_y: [u16; 3],
+        pub white_x: u16,
+        pub white_y: u16,
+        /// Its peak, cd/m².
+        pub max_luminance: u16,
+        /// Its black, units of 0.0001 cd/m².
+        pub min_luminance: u16,
+        /// Brightest pixel and brightest frame average of the content,
+        /// cd/m² (0: unknown).
+        pub max_cll: u16,
+        pub max_fall: u16,
+    }
+
+    /// `OP_VIDEO_LAYER_COLOR`: the layer's colour (fresco-video.md §5).
+    /// Until it is sent a layer is BT.709, limited range, BT.1886.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+    pub struct VideoLayerColor {
+        pub layer: u32,
+        pub matrix: u8,
+        pub range: u8,
+        pub primaries: u8,
+        pub transfer: u8,
+        pub hdr: Option<Mastering>,
     }
 
     /// Content rates a layer may give, in milli-Hz (0 clears it).
@@ -2013,6 +2078,7 @@ mod tests {
             control::OP_VIDEO_FRAME,
             control::OP_VIDEO_LAYER_DESTROY,
             control::OP_VIDEO_LAYER_RATE,
+            control::OP_VIDEO_LAYER_COLOR,
             control::EV_VIDEO_PRESENTED,
             control::EV_VIDEO_RELEASED,
         ];

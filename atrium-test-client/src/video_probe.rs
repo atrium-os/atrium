@@ -227,6 +227,57 @@ fn main() {
     let got = events_for(&mut app, Duration::from_secs(2));
     p.check(got.iter().any(|e| matches!(e, Event::VideoPresented { seq: 31, .. })), "shown again: presented");
 
+    // V3: colour. BT.601 full-range red.
+    use fresco_protocol::video::{matrix, primaries, range, transfer, Mastering, VideoLayerColor, VideoLayerCreate};
+    let colour = |m, r, p, t, hdr| VideoLayerColor { layer, matrix: m, range: r, primaries: p, transfer: t, hdr };
+    let show = |app: &mut Connection, bufs: &mut Vec<Buf>, i: usize, yuv: (u8, u8, u8), seq: u32| {
+        bufs[i].nv12(yuv.0, yuv.1, yuv.2);
+        app.video_frame(layer, i as u32, seq, 0).unwrap();
+        let _ = wait(app, |e| matches!(e, Event::VideoPresented { seq: s, .. } if *s == seq));
+    };
+    let at = (WIN_POS.0 + 100, WIN_POS.1 + 80);
+    app.video_layer_color(colour(matrix::BT601, range::FULL, primaries::BT709, transfer::BT1886, None)).unwrap();
+    show(&mut app, &mut bufs, 1, (76, 85, 255), 40);
+    if let Some(cap) = capture() {
+        let c = rgb_at(&cap, at.0, at.1);
+        p.check(red(c), &format!("BT.601 full range red ({c:?})"));
+    }
+    // HDR10: PQ white at the content's peak is SDR white; 100 cd/m² a
+    // little under half of it in linear light.
+    let m = Mastering { max_luminance: 1000, max_cll: 1000, ..Default::default() };
+    app.video_layer_color(colour(matrix::BT2020, range::FULL, primaries::BT2020, transfer::PQ, Some(m))).unwrap();
+    show(&mut app, &mut bufs, 2, (255, 128, 128), 41);
+    if let Some(cap) = capture() {
+        let c = rgb_at(&cap, at.0, at.1);
+        p.check(c.0 >= 250 && c.1 >= 250 && c.2 >= 250, &format!("PQ peak is SDR white ({c:?})"));
+    }
+    show(&mut app, &mut bufs, 0, (130, 128, 128), 42);
+    if let Some(cap) = capture() {
+        let c = rgb_at(&cap, at.0, at.1);
+        p.check((160..=190).contains(&c.0) && c.0.abs_diff(c.1) <= 2 && c.1.abs_diff(c.2) <= 2, &format!("PQ 100 cd/m² is a grey under SDR white ({c:?})"));
+    }
+    let _ = app.video_layer_color(colour(9, range::FULL, primaries::BT709, transfer::BT1886, None));
+    p.check(app.display_info().is_ok(), "an unknown matrix is refused, the connection stays up");
+    app.video_layer_color(colour(matrix::BT709, range::LIMITED, primaries::BT709, transfer::BT1886, None)).unwrap();
+
+    // Protected: black in a capture (headless frescod's output is one).
+    let c = VideoLayerCreate { window_id: win, format: format::NV12, width: SRC.0, height: SRC.1, buffers: 3, protected: true };
+    if let Some((pl, pfds)) = app.video_layer_create_with(c).unwrap() {
+        let mut pb: Vec<Buf> = pfds.iter().map(|f| Buf::map(f, len)).collect();
+        app.video_layer_place(pl, Some([220.0, BAR_H, 100.0, 100.0])).unwrap();
+        pb[0].nv12(63, 102, 240);
+        app.video_frame(pl, 0, 1, 0).unwrap();
+        let _ = wait(&mut app, |e| matches!(e, Event::VideoPresented { layer: l, .. } if *l == pl));
+        if let Some(cap) = capture() {
+            let c = rgb_at(&cap, WIN_POS.0 + 270, WIN_POS.1 + 80);
+            p.check(c == (0, 0, 0), &format!("protected: black in the capture ({c:?})"));
+        }
+        app.video_layer_destroy(pl).unwrap();
+        drop(pb);
+    } else {
+        p.check(false, "a protected layer");
+    }
+
     // A click on the video goes to its window, not through it.
     while let Ok(Some(_)) = app.wait_event(Some(Duration::from_millis(50))) {}
     let inj = |line: &str| {

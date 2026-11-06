@@ -483,9 +483,18 @@ impl Connection {
     pub fn video_layer_create(
         &mut self, window_id: u32, format: u8, width: u32, height: u32, buffers: u32,
     ) -> io::Result<Option<(u32, Vec<std::os::fd::OwnedFd>)>> {
-        use fresco_protocol::video::{VideoLayerCreate, VideoLayerCreated};
-        self.send_window_managed(control::OP_VIDEO_LAYER_CREATE,
-            &VideoLayerCreate { window_id, format, width, height, buffers })?;
+        self.video_layer_create_with(fresco_protocol::video::VideoLayerCreate {
+            window_id, format, width, height, buffers, protected: false,
+        })
+    }
+
+    /// As `video_layer_create`, with every field (`protected` for DRM'd
+    /// content: kept out of screen capture).
+    pub fn video_layer_create_with(
+        &mut self, c: fresco_protocol::video::VideoLayerCreate,
+    ) -> io::Result<Option<(u32, Vec<std::os::fd::OwnedFd>)>> {
+        use fresco_protocol::video::VideoLayerCreated;
+        self.send_window_managed(control::OP_VIDEO_LAYER_CREATE, &c)?;
         loop {
             let m = self.recv_reply()?;
             if m.opcode_class == CLASS_DISPLAY
@@ -522,6 +531,13 @@ impl Connection {
     pub fn video_frame(&mut self, layer: u32, buffer: u32, seq: u32, present_ns: u64) -> io::Result<()> {
         self.send_window_managed(control::OP_VIDEO_FRAME,
             &fresco_protocol::video::VideoFrame { layer, buffer, seq, present_ns })
+    }
+
+    /// The layer's colour (fresco-video.md §5): matrix, range, primaries,
+    /// transfer (`fresco_protocol::video::{matrix, range, primaries,
+    /// transfer}`) and HDR metadata.
+    pub fn video_layer_color(&mut self, c: fresco_protocol::video::VideoLayerColor) -> io::Result<()> {
+        self.send_window_managed(control::OP_VIDEO_LAYER_COLOR, &c)
     }
 
     /// The content's frame rate in milli-Hz (24p: 24_000; 0: not said).
