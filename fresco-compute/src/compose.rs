@@ -180,6 +180,28 @@ fn opacity(c: &Compose, l: usize) -> f32 {
     if o >= 0.0 { if o <= 1.0 { o } else { 1.0 } } else { 0.0 }
 }
 
+/// [`pixel`] where the top layer at the pixel that draws anything there
+/// is fully opaque (at opacity 1, a source alpha of 255), every layer
+/// above it holding nothing at the pixel (a zero word: transparent, adds
+/// nothing): then nothing is blended and the pixel is the source's
+/// (decoding and encoding again is exact, see `lut`). `None` where a
+/// blend is needed.
+pub fn opaque_pixel(c: &Compose, heap: &[u32], x: u32, y: u32) -> Option<u32> {
+    let (ix, iy) = (x as i32, y as i32);
+    for top in (0..c.header.layer_count as usize).rev() {
+        let i = sample_at(c, top, ix, iy);
+        if i == NONE {
+            continue;
+        }
+        let w = heap[i as usize];
+        if w == 0 {
+            continue;
+        }
+        return (opacity(c, top) >= 1.0 && w >> 24 == 255).then_some(w | 0xff00_0000);
+    }
+    None
+}
+
 /// `compose.comp` for one pixel.
 pub fn pixel(c: &Compose, heap: &[u32], x: u32, y: u32) -> u32 {
     let (ix, iy) = (x as i32, y as i32);

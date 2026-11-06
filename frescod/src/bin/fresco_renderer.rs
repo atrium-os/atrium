@@ -175,20 +175,14 @@ fn raster(
     let sh = shifts(w, &scrolls);
     w.scrolls = scrolls;
     let held = w.tiles.as_mut().unwrap();
-    let (forced, moved) = if sh.is_empty() {
-        (Vec::new(), None)
-    } else {
-        damage::shift(&mut w.px, width, height, &sig, held, &sh)
-    };
-    let mut dirty = damage::dirty(&sig, Some(held));
-    for (d, f) in dirty.iter_mut().zip(&forced) {
-        *d |= *f;
-    }
+    let out = if sh.is_empty() { damage::Shifted::default() } else { damage::shift(&mut w.px, width, height, &sig, held, &sh) };
+    let dirty = damage::dirty(&sig, Some(held));
     let tiles = damage::rects(&dirty, h.tiles_x, h.tiles_y, fresco_compute::tier2::Tier2::MAX_TILE_RECTS);
+    let moved = out.changed;
     if tiles.is_empty() && moved.is_none() {
         return Ok(None);
     }
-    if let Err(e) = t2.render_tiles(frame, &mut w.px, &tiles) {
+    if let Err(e) = t2.render_rects(frame, &mut w.px, &tiles, &out.pixels) {
         // What `px` holds is now neither frame: draw the next one whole.
         w.tiles = None;
         return Err(e.to_string());

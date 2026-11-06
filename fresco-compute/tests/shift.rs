@@ -74,11 +74,13 @@ fn shifted_frames_equal_full_draws() {
         let f = frame(next, true);
         let sig = damage::tile_signatures(&f);
         let shift = Shift { area: AREA, d, over: vec![OVER], over_before: vec![OVER] };
-        let (forced, moved) = damage::shift(&mut px, W, H, &sig, &mut held, &[shift]);
-        let dirty: Vec<bool> = damage::dirty(&sig, Some(&held)).iter().zip(&forced).map(|(a, b)| *a || *b).collect();
-        let n_dirty = dirty.iter().filter(|&&b| b).count();
+        let out = damage::shift(&mut px, W, H, &sig, &mut held, &[shift]);
+        let dirty = damage::dirty(&sig, Some(&held));
+        let n_dirty = dirty.iter().filter(|&&b| b).count()
+            + out.pixels.iter().map(|r| ((r[2] - r[0]) * (r[3] - r[1])) as usize).sum::<usize>() / (TILE * TILE) as usize;
+        let moved = out.changed;
         let tiles = damage::rects(&dirty, W.div_ceil(TILE), H.div_ceil(TILE), usize::MAX);
-        t2.render_tiles(&f, &mut px, &tiles).unwrap();
+        t2.render_rects(&f, &mut px, &tiles, &out.pixels).unwrap();
         held = sig;
         let mut want = vec![0u32; px.len()];
         t2.render(&f, &mut want).unwrap();
@@ -93,21 +95,96 @@ fn shifted_frames_equal_full_draws() {
 }
 
 #[test]
-fn nothing_moves_outside_the_area_and_over_tiles_are_forced() {
+fn what_is_left_to_draw_is_the_strip_the_over_box_and_the_edges() {
     let (w, h) = (64u32, 64u32);
     let mut px: Vec<u32> = (0..w * h).collect();
     let n = (w.div_ceil(TILE) * h.div_ceil(TILE)) as usize;
     let sig = vec![7u64; n];
     let mut held = vec![1u64; n];
-    let s = Shift { area: [0, 16, 64, 64], d: [0, -16], over: vec![[0, 50, 10, 52]], over_before: vec![] };
-    let (forced, moved) = damage::shift(&mut px, w, h, &sig, &mut held, &[s]);
-    assert_eq!(moved, Some([0, 16, 64, 64]));
-    // Row 0 of tiles (outside) untouched; row 1 and 2 moved up from 2 and 3.
+    let s = Shift { area: [4, 16, 64, 64], d: [0, -16], over: vec![[0, 50, 10, 52]], over_before: vec![] };
+    let out = damage::shift(&mut px, w, h, &sig, &mut held, &[s]);
+    assert_eq!(out.changed, Some([0, 16, 64, 64]));
+    // Rows 16..48 moved up by 16 inside the area; outside it, untouched.
     assert_eq!(px[0], 0);
-    assert_eq!(px[(16 * w) as usize], 32 * w);
-    // Tiles 4..8 (row 1) and 8..12 (row 2) clean, but tile 12 (row 3, col 0)
-    // is under the floating box, and row 3 is the exposed strip anyway.
-    assert!(!forced[4] && held[4] == 7 && !forced[11] && held[11] == 7);
-    assert!(forced[12] && forced[15] && held[12] == 1);
-    assert!(!forced[0] && held[0] == 1, "outside the area: left to signatures");
+    assert_eq!(px[(16 * w + 4) as usize], 32 * w + 4);
+    assert_eq!(px[(16 * w + 3) as usize], 16 * w + 3);
+    let mut want = vec![
+        [4, 48, 64, 64], // the exposed strip
+        [4, 50, 10, 52], // the floating box, inside the area
+        [0, 16, 4, 64],  // the edge tiles' part outside the area
+    ];
+    let mut got = out.pixels.clone();
+    want.sort();
+    got.sort();
+    assert_eq!(got, want);
+    assert!(held[4..].iter().all(|&v| v == 7), "every tile the area touches holds the new frame");
+    assert!(held[..4].iter().all(|&v| v == 1), "outside: left to signatures");
+}
+
+/// `cargo test --release --test shift -- --ignored --nocapture`: the scroll
+/// demo's window (atrium-scroll-demo), 7 px steps: tiles rastered and time,
+/// shifting against drawing the viewport in full.
+#[test]
+#[ignore]
+fn scroll_demo_cost() {
+    use std::time::Instant;
+    let (w, h) = (900u32, 600u32);
+    let view = [40.0f32, 40.0, 860.0, 560.0];
+    let area = [40u32, 40, 860, 560];
+    let build = |off: f32| {
+        let mut s = Scene::default();
+        let mut order = Vec::new();
+        let mut push = |s: &mut Scene, r: Rect, clip: Option<[f32; 4]>| {
+            s.rects.push(r);
+            order.push(Placed { item: Node::Rect(s.rects.len() - 1), clip });
+        };
+        push(&mut s, Rect { position: [0.0, 0.0], size: [900.0, 600.0], color: [0.3, 0.32, 0.36, 1.0], radius: 0.0 }, None);
+        push(&mut s, Rect { position: [40.0, 40.0], size: [820.0, 520.0], color: [0.97, 0.97, 0.95, 1.0], radius: 0.0 }, Some(view));
+        for i in 0..600 {
+            let y = 40.0 + i as f32 * 22.0 + off;
+            for (x, rw) in [(8.0, 120.0), (140.0, 260.0), (420.0, 90.0 + (i % 7) as f32 * 30.0)] {
+                push(&mut s, Rect { position: [40.0 + x, y + 5.0], size: [rw, 12.0], color: [0.4, 0.45, 0.5, 1.0], radius: 3.0 }, Some(view));
+            }
+        }
+        push(&mut s, Rect { position: [760.0, 480.0], size: [80.0, 50.0], color: [0.1, 0.6, 0.3, 0.9], radius: 10.0 }, None);
+        Frame::pack_ordered(&s, &order, w, h, w, None).0
+    };
+    let dir = tempfile::tempdir().unwrap();
+    tier2::Tier2::seed_cache(dir.path()).expect("cranelift");
+    let mut t2 = tier2::Tier2::new(dir.path().to_path_buf(), "/nonexistent/atrium-spv-compile".into()).expect("tier2");
+    t2.set_threads(1);
+    let mut px = vec![0u32; (w * h) as usize];
+    let f0 = build(0.0);
+    t2.render(&f0, &mut px).unwrap();
+    let mut held = damage::tile_signatures(&f0);
+    let over = vec![[760, 480, 840, 530]];
+    let (mut t_shift, mut t_full, mut tiles_n) = (0.0, 0.0, 0);
+    let frames = 30;
+    for k in 1..=frames {
+        let f = build(-7.0 * k as f32);
+        let t = Instant::now();
+        let sig = damage::tile_signatures(&f);
+        let sh = Shift { area, d: [0, -7], over: over.clone(), over_before: over.clone() };
+        let out = damage::shift(&mut px, w, h, &sig, &mut held, &[sh]);
+        let dirty = damage::dirty(&sig, Some(&held));
+        tiles_n += dirty.iter().filter(|&&b| b).count()
+            + out.pixels.iter().map(|r| ((r[2] - r[0]) * (r[3] - r[1])) as usize).sum::<usize>() / (TILE * TILE) as usize;
+        let tiles = damage::rects(&dirty, w.div_ceil(TILE), h.div_ceil(TILE), usize::MAX);
+        t2.render_rects(&f, &mut px, &tiles, &out.pixels).unwrap();
+        t_shift += t.elapsed().as_secs_f64();
+        held = sig;
+        let mut full = px.clone();
+        let t = Instant::now();
+        let all: Vec<bool> = (0..held.len()).map(|i| {
+            let (tx, ty) = (i as u32 % w.div_ceil(TILE), i as u32 / w.div_ceil(TILE));
+            tx * TILE < 860 && tx * TILE + TILE > 40 && ty * TILE < 560 && ty * TILE + TILE > 40
+        }).collect();
+        let tl = damage::rects(&all, w.div_ceil(TILE), h.div_ceil(TILE), usize::MAX);
+        t2.render_tiles(&f, &mut full, &tl).unwrap();
+        t_full += t.elapsed().as_secs_f64();
+        assert!(full == px);
+    }
+    let n = frames as f64;
+    println!("tiles (or their pixels) per frame {} of {}; shift {:.2} ms, viewport in full {:.2} ms",
+        tiles_n / frames, held.len(), t_shift * 1e3 / n, t_full * 1e3 / n);
 }

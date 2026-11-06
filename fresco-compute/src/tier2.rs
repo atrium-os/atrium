@@ -175,6 +175,88 @@ impl Tier2 {
         Ok(())
     }
 
+    /// [`Tier2::render_tiles`], and also the pixels in `pixels` (target
+    /// rectangles `[x0, y0, x1, y1)`), each drawn exactly as a full render
+    /// would draw it: the raster kernel shares nothing between the lanes
+    /// of a workgroup, so lanes outside a rectangle are simply not run.
+    pub fn render_rects(&self, frame: &Frame, target: &mut [u32], tiles: &[[u32; 4]], pixels: &[[u32; 4]]) -> io::Result<()> {
+        if pixels.is_empty() {
+            return self.render_tiles(frame, target, tiles);
+        }
+        frame.validate(target.len()).map_err(err)?;
+        let h = &frame.header;
+        let mut mask = vec![0u32; frame.mask_words()];
+        let header = [frame.header];
+        let mut table = [SsboDesc::default(); binding::COUNT];
+        table[binding::FRAME as usize] = desc(&header);
+        table[binding::OPS as usize] = desc(&frame.ops);
+        table[binding::TEX as usize] = desc(&frame.tex);
+        table[binding::TEXELS as usize] = desc(&frame.texels);
+        table[binding::MASK as usize] = desc(&mask);
+        table[binding::TARGET as usize] = desc(target);
+        table[binding::LUT as usize] = desc(&frame.lut);
+        let per = crate::TILE / RASTER_LOCAL;
+        let l = RASTER_LOCAL;
+        // Workgroup rects of the tiles, then each pixel rectangle as the
+        // workgroups it touches with the lanes inside it.
+        let mut items: Vec<[u32; 6]> = Vec::new();
+        for t in tiles {
+            for gy in t[1] * per..(t[3] * per).min(h.height.div_ceil(l)) {
+                for gx in t[0] * per..(t[2] * per).min(h.width.div_ceil(l)) {
+                    items.push([gx, gy, 0, 0, l, l]);
+                }
+            }
+        }
+        for r in pixels {
+            let r = [r[0], r[1], r[2].min(h.width), r[3].min(h.height)];
+            if r[0] >= r[2] || r[1] >= r[3] {
+                continue;
+            }
+            for gy in r[1] / l..r[3].div_ceil(l) {
+                for gx in r[0] / l..r[2].div_ceil(l) {
+                    let (x0, y0) = (gx * l, gy * l);
+                    items.push([gx, gy, r[0].max(x0) - x0, r[1].max(y0) - y0, r[2].min(x0 + l) - x0, r[3].min(y0 + l) - y0]);
+                }
+            }
+        }
+        let t = SsboTable::new(&table);
+        // SAFETY: as in `render_tiles`; every lane run is inside the
+        // raster grid.
+        unsafe {
+            self.dispatch(self.bin.1, &t, h.bin_groups(), [BIN_LOCAL, 1, 1]);
+            self.dispatch_lanes(self.raster.1, &t, &items);
+        }
+        Ok(())
+    }
+
+    /// Run `cs` for workgroups `[gx, gy]` with only lanes `lx0..lx1`,
+    /// `ly0..ly1` of each (items `[gx, gy, lx0, ly0, lx1, ly1]`).
+    unsafe fn dispatch_lanes(&self, cs: CsMain, table: &SsboTable, items: &[[u32; 6]]) {
+        if items.is_empty() {
+            return;
+        }
+        let n = self.threads.min(items.len()).max(1);
+        let chunk = items.len().div_ceil(n);
+        let table_addr = table.as_ptr() as usize;
+        let _ = table;
+        std::thread::scope(|s| {
+            for part in items.chunks(chunk) {
+                s.spawn(move || {
+                    let mut img = atrium_spv_runtime::image_table_buffer(0);
+                    atrium_spv_runtime::write_barrier_helper_ptr(&mut img, atrium_spv_runtime::atrium_barrier);
+                    let out = table_addr as *mut u8;
+                    for &[gx, gy, x0, y0, x1, y1] in part {
+                        for ly in y0..y1 {
+                            for lx in x0..x1 {
+                                cs(img.as_ptr(), std::ptr::null(), out, gx, gy, 0, lx, ly, 0, std::ptr::null_mut());
+                            }
+                        }
+                    }
+                });
+            }
+        });
+    }
+
     /// Both dispatches over a caller-built binding table (one `{ base,
     /// size }` per binding), e.g. buffers placed against guard pages by the
     /// fuzzer.
@@ -224,6 +306,35 @@ impl Tier2 {
         }
         if groups.iter().any(|r| r[0] == 0 && r[1] == 0 && r[2] >= g[0] && r[3] >= g[1]) {
             return self.compose(c, heap, target); // all of it
+        }
+        // Where the top layer is opaque the pixel is the surface's: copy
+        // it here, and run the kernel only on workgroups with a blend.
+        let (l, pitch) = (COMPOSE_LOCAL, c.header.pitch);
+        let mut blend: Vec<[u32; 4]> = Vec::new();
+        for r in &groups {
+            for gy in r[1]..r[3] {
+                for gx in r[0]..r[2] {
+                    let mut all = true;
+                    'px: for y in gy * l..((gy + 1) * l).min(c.header.height) {
+                        for x in gx * l..((gx + 1) * l).min(c.header.width) {
+                            match crate::compose::opaque_pixel(c, heap, x, y) {
+                                Some(p) => target[(y * pitch + x) as usize] = p,
+                                None => {
+                                    all = false;
+                                    break 'px;
+                                }
+                            }
+                        }
+                    }
+                    if !all {
+                        blend.push([gx, gy, gx + 1, gy + 1]);
+                    }
+                }
+            }
+        }
+        let groups = blend;
+        if groups.is_empty() {
+            return Ok(());
         }
         let header = [c.header];
         let mut table = [SsboDesc::default(); cb::COUNT];

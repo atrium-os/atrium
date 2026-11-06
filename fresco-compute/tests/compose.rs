@@ -102,3 +102,42 @@ fn per_window_surfaces_compose_into_the_screen() {
     assert_eq!(at(14 + 15, 9 + 11), clear, "B's undrawn pixels are transparent");
     assert_eq!(at(14 + 1, 9 + 1), heap[(7 * aw + 11) as usize], "...also over A");
 }
+
+/// compose_rects copies opaque top pixels itself and runs the kernel only
+/// where something blends: the same pixels as the model, everywhere.
+#[test]
+fn opaque_copies_match_the_kernel() {
+    let dir = tempfile::tempdir().unwrap();
+    tier2::Tier2::seed_cache(dir.path()).expect("cranelift");
+    let t2 = tier2::Tier2::new(dir.path().to_path_buf(), "/nonexistent/atrium-spv-compile".into()).expect("tier2");
+    let mut r = Rng(5);
+    for case in 0..20 {
+        let (w, h) = (97u32, 61u32);
+        let (sw, sh) = (60u32, 40u32);
+        // Three surfaces: mostly opaque, some translucent, some empty.
+        let heap: Vec<u32> = (0..3 * sw * sh).map(|_| {
+            let a = match r.below(5) { 0 => 0, 1 => r.below(255) as u32, _ => 255 };
+            let c = if r.below(3) == 0 { 0 } else { r.below(1 << 24) as u32 };
+            // Premultiplied: a colour no brighter than its alpha.
+            let s = |v: u32| v * a / 255;
+            (a << 24) | (s(c >> 16 & 255) << 16) | (s(c >> 8 & 255) << 8) | s(c & 255)
+        }).collect();
+        let layers: Vec<Layer> = (0..3).map(|k| {
+            let op = if r.below(3) == 0 { 0.6 } else { 1.0 };
+            Layer::at([k * sw * sh, sw, sw, sh], r.below(50) as i32 - 5, r.below(30) as i32 - 5, op)
+        }).collect();
+        let c = Compose::new(&layers, w, h, w, heap.len() as u32);
+        let want = compose::render(&c, &heap);
+        let mut got = vec![0u32; c.target_words()];
+        let rects = [[3, 2, 50, 30], [40, 20, 97, 61], [0, 50, 10, 61]];
+        t2.compose_rects(&c, &heap, &mut got, &rects).unwrap();
+        for rc in rects {
+            for y in rc[1]..rc[3] {
+                for x in rc[0]..rc[2] {
+                    let i = (y * w + x) as usize;
+                    assert_eq!(got[i], want[i], "case {case} at ({x}, {y})");
+                }
+            }
+        }
+    }
+}

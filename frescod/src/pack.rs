@@ -1169,11 +1169,18 @@ mod group_tests {
                 })
             }).collect();
             shifted += sh.len();
-            let (forced, _) = damage::shift(&mut px, W, W, &sig, &mut held, &sh);
+            let out = damage::shift(&mut px, W, W, &sig, &mut held, &sh);
             let full = reference::render(&f);
+            for r in &out.pixels {
+                for y in r[1]..r[3] {
+                    for x in r[0]..r[2] {
+                        px[(y * W + x) as usize] = full[(y * W + x) as usize];
+                    }
+                }
+            }
             let tx = W.div_ceil(fresco_compute::TILE);
             for (i, dirty) in damage::dirty(&sig, Some(&held)).into_iter().enumerate() {
-                if dirty || forced.get(i).copied().unwrap_or(false) {
+                if dirty {
                     let (x0, y0) = ((i as u32 % tx) * 16, (i as u32 / tx) * 16);
                     for y in y0..(y0 + 16).min(W) {
                         for x in x0..(x0 + 16).min(W) {
@@ -1187,5 +1194,43 @@ mod group_tests {
             prev = w.scrolls.clone();
         }
         assert_eq!(shifted, 5, "every whole-pixel scroll smaller than the viewport shifted");
+    }
+
+    /// Pergola's ScrollView (c062808): the SCROLL group translated to the
+    /// view's origin, clip in parent space; backdrop `id | 1 << 31` at
+    /// local (0, 0, w, h), order 0; content `id | 1 << 30`, order 1, its
+    /// translation the offset, a uniform scale while a pinch runs.
+    #[test]
+    fn pergolas_scroll_view_is_a_viewport() {
+        let (id, ox, oy, vw, vh) = (7u32, 6.0f32, 10.0f32, 50.0f32, 40.0f32);
+        let (bg, content) = (id | 1 << 31, id | 1 << 30);
+        let build = |s: &mut WindowSceneState, off: f32, scale: f32| {
+            s.set_group(id, GroupParams {
+                parent: None, order: 0, transform: [1.0, 0.0, 0.0, 1.0, ox, oy],
+                clip: Some([ox, oy, ox + vw, oy + vh]), opacity: 1.0, flags: fresco_protocol::group_flags::SCROLL,
+            }, 1).unwrap();
+            rect(s, bg, 0.0, 0.0, vw, vh, [1.0, 1.0, 1.0, 1.0]);
+            place(s, bg, Some(id), 0);
+            group(s, content, Some(id), 1, [scale, 0.0, 0.0, scale, 0.0, off], None);
+            for i in 0..20u32 {
+                rect(s, 100 + i, 2.0, i as f32 * 6.0, 30.0, 4.0, if i % 2 == 0 { RED } else { BLUE });
+                place(s, 100 + i, Some(content), i);
+            }
+        };
+        let mut s = WindowSceneState::new();
+        build(&mut s, -12.0, 1.0);
+        let a = grouped(&s);
+        assert_eq!(a.scrolls.len(), 1, "recognised");
+        assert_eq!((a.scrolls[0].group, a.scrolls[0].area, a.scrolls[0].offset), (id, [6, 10, 56, 50], [6.0, -2.0]));
+        build(&mut s, -19.0, 1.0);
+        let b = grouped(&s);
+        assert_eq!((b.scrolls[0].hash, b.scrolls[0].offset[1] - a.scrolls[0].offset[1]), (a.scrolls[0].hash, -7.0));
+        // Pinched: another hash (draw in full), steady while it scrolls.
+        build(&mut s, -19.0, 1.25);
+        let c = grouped(&s);
+        build(&mut s, -26.0, 1.25);
+        let d = grouped(&s);
+        assert_ne!(c.scrolls[0].hash, a.scrolls[0].hash);
+        assert_eq!(c.scrolls[0].hash, d.scrolls[0].hash);
     }
 }
