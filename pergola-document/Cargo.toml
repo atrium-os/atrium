@@ -1,0 +1,18 @@
+[package]
+name = "pergola-document"
+version = "0.1.0"
+edition = "2021"
+description = "DocumentView (pergola.md §10.2): the document engine's bands drawn as Pergola nodes inside a ScrollView, for an app's own trusted rich text and for the doc-viewer child."
+
+[dependencies]
+pergola = { path = "../pergola" }
+navigator-render = { path = "../navigator-render" }
+fresco-protocol = { path = "../fresco-protocol" }
+
+[dev-dependencies]
+navigator-style = { path = "../navigator-style" }
+
+# navigator-fonts vendors a one-line fix to pathfinder_simd (see its
+# vendor/README.md); a dependent crate must repeat the patch.
+[patch.crates-io]
+pathfinder_simd = { path = "../navigator-fonts/vendor/pathfinder_simd" }

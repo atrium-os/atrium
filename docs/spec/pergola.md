@@ -347,6 +347,23 @@ Both draw through `ScrollView` (§10.1), so scrolling feels the same everywhere.
 `DocumentView` is not an editor; rich-text editing is a separate widget that may later
 share the layout code.
 
+**As built (2026-11-06).** Crate `pergola-document` (Pergola itself stays free of the layout
+crates). `Doc` holds a `navigator_render::source::ContentSource` (`Doc::html` builds the
+`DocumentSource`), Pergola's `scroll::Viewport` and the resident groups; `DocumentView` is a
+`ScrollView` whose content is one free stack as tall as the document (`FlexStyle::free`: layout
+never looks inside), holding a free stack per resident band keyed by band id, then the overlay.
+The source's sink converts each band's scene to Pergola nodes once (`convert`): rects, rounded
+and ringed rects as fills, runs as `Node::Glyphs` (rastered by the app into its atlas, not shaped
+by frescod), SVG paths and linear gradients as `Node::Fill`, images through the app's resolver;
+every band is clipped to its range (a cut box's height can be unknown). Not drawn yet, counted in
+`Doc::skipped`: box shadows (no Fresco op), image tiling and fit, and non-translation transforms
+on anything but a fill; opacity groups multiply into their nodes. While the height is an
+estimate each render lays out two more bands and asks for another. Tested
+(`pergola-document/tests/document.rs`): a 67,000 px document settles in 54 renders, keeps about
+800 nodes resident wherever it is scrolled, a band keeps its node ids while resident, and a
+scroll frame costs 0.5 ms (render plus diff, release build) before frescod. Not run on frescod
+yet.
+
 ### §10.3 What this requires of the layout code now
 
 - The layout crates stay free of Navigator-only dependencies. Checked 2026-11-06:
