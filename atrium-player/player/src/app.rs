@@ -34,6 +34,8 @@ pub enum HostEvent {
     Resume,
     /// The parent detached us, or the channel broke.
     Gone,
+    /// limend put our window into picture-in-picture, or took it back.
+    Pip(bool),
 }
 
 pub trait Host {
@@ -43,6 +45,15 @@ pub trait Host {
     /// Limen's attribution ticket for Lyra, for an embedded player.
     fn audio_ticket(&self) -> Option<[u8; 16]> {
         None
+    }
+    /// Whether this host can do picture-in-picture at all.
+    fn can_pip(&self) -> bool {
+        false
+    }
+    /// Ask for PiP (`on`) or to go back; `aspect` is the video's.
+    /// Answered with `HostEvent::Pip`; false if refused here.
+    fn pip(&mut self, _on: bool, _aspect: [u32; 2]) -> bool {
+        false
     }
 }
 
@@ -99,6 +110,7 @@ impl Host for LimenHost {
                 ChildEvent::Resumed { embed } if embed == self.embed => out.push(HostEvent::Resume),
                 ChildEvent::Detaching { embed } if embed == self.embed => out.push(HostEvent::Gone),
                 ChildEvent::AudioTicket { embed, ticket } if embed == self.embed => self.ticket = Some(ticket),
+                ChildEvent::Pip { embed, on } if embed == self.embed => out.push(HostEvent::Pip(on)),
                 _ => {}
             }
         }
@@ -111,6 +123,14 @@ impl Host for LimenHost {
 
     fn audio_ticket(&self) -> Option<[u8; 16]> {
         self.ticket
+    }
+
+    fn can_pip(&self) -> bool {
+        true
+    }
+
+    fn pip(&mut self, on: bool, aspect: [u32; 2]) -> bool {
+        self.child.pip(self.embed, on, aspect).is_ok()
     }
 }
 
@@ -159,7 +179,18 @@ pub struct App<H: Host> {
     /// actions it handles (atrium-player-pip-keys.md §4.4).
     pub media_metadata: (String, String, String),
     page_actions: u16,
+    /// The session's name without the page's metadata (the standalone
+    /// player's file name).
+    pub session_name: String,
+    /// What was last sent to choragusd, and when.
+    session_sent: Option<(SessionKey, Instant)>,
+    /// In picture-in-picture (limend said so).
+    pip: bool,
 }
+
+/// A media session as last reported: state, title, artist, actions,
+/// duration in ms.
+type SessionKey = (u8, String, String, u16, Option<i64>);
 
 fn secs(ns: i64) -> f64 {
     ns as f64 / 1e9
@@ -218,6 +249,9 @@ impl<H: Host> App<H> {
             muted: false,
             media_metadata: Default::default(),
             page_actions: 0,
+            session_name: String::new(),
+            session_sent: None,
+            pip: false,
         }
     }
 
@@ -344,6 +378,11 @@ impl<H: Host> App<H> {
                 self.done = true;
                 return Ok(());
             }
+            HostEvent::Pip(on) => {
+                self.pip = on;
+                self.controls.poke();
+                return Ok(());
+            }
             HostEvent::Suspend | HostEvent::Resume => {
                 self.suspended = matches!(ev, HostEvent::Suspend);
                 self.audio_wait = None;
@@ -442,9 +481,82 @@ impl<H: Host> App<H> {
             }
             ToChild::MediaMetadata { title, artist, album } => self.media_metadata = (title, artist, album),
             ToChild::MediaActions { actions } => self.page_actions = actions,
+            ToChild::RequestPip => self.request_pip(true),
+            ToChild::ExitPip => self.request_pip(false),
             ToChild::SetRate { rate } => self.set_rate(rate as f64),
         }
         Ok(())
+    }
+
+    /// Tell choragusd how this player's session stands (once a second
+    /// while playing, and at every change), and act on what it asks.
+    fn media_session(&mut self) {
+        use lyra_protocol::wire::{action, MediaAction, SessionState};
+        let Some(a) = self.audio.as_mut() else { return };
+        for (act, offset, time) in std::mem::take(&mut a.session_actions) {
+            let pos = self.controls.position_s;
+            match act {
+                MediaAction::Play => self.set_playing(true),
+                MediaAction::Pause | MediaAction::Stop => self.set_playing(false),
+                // choragusd resolves Play/Pause to one of the two.
+                MediaAction::PlayPause => self.set_playing(!self.want_play),
+                MediaAction::SeekBackward => self.seek(pos - offset.unwrap_or(10.0), true),
+                MediaAction::SeekForward => self.seek(pos + offset.unwrap_or(10.0), true),
+                MediaAction::SeekTo => {
+                    if let Some(t) = time {
+                        self.seek(t, true)
+                    }
+                }
+                MediaAction::Next if self.page_actions & limen::media_player::media_action::NEXT_TRACK != 0 => {
+                    self.host.emit(ToParent::Action { action: limen::media_player::media_action::NEXT_TRACK })
+                }
+                MediaAction::Previous if self.page_actions & limen::media_player::media_action::PREVIOUS_TRACK != 0 => {
+                    self.host.emit(ToParent::Action { action: limen::media_player::media_action::PREVIOUS_TRACK })
+                }
+                MediaAction::Next | MediaAction::Previous => {}
+            }
+        }
+        let state = if self.want_play && !self.ended_sent { SessionState::Playing } else { SessionState::Paused };
+        let (title, artist) = if self.media_metadata.0.is_empty() {
+            (self.session_name.clone(), String::new())
+        } else {
+            (self.media_metadata.0.clone(), self.media_metadata.1.clone())
+        };
+        let mut actions = action::PLAY | action::PAUSE | action::STOP;
+        let duration = self.duration.filter(|d| d.is_finite() && *d > 0.0);
+        if duration.is_some() {
+            actions |= action::SEEK_BACKWARD | action::SEEK_FORWARD | action::SEEK_TO;
+        }
+        if self.page_actions & limen::media_player::media_action::NEXT_TRACK != 0 {
+            actions |= action::NEXT;
+        }
+        if self.page_actions & limen::media_player::media_action::PREVIOUS_TRACK != 0 {
+            actions |= action::PREVIOUS;
+        }
+        let key: SessionKey = (state as u8, title, artist, actions, duration.map(|d| (d * 1000.0) as i64));
+        let due = match &self.session_sent {
+            None => true,
+            Some((k, at)) => *k != key || (state == SessionState::Playing && at.elapsed() >= Duration::from_secs(1)),
+        };
+        if due {
+            let pos = self.player.as_ref().and_then(|p| p.position_ns()).map(|t| secs(t).max(0.0));
+            if let Some(a) = self.audio.as_mut() {
+                a.session(state, &key.1, &key.2, actions, duration, pos);
+            }
+            self.session_sent = Some((key, Instant::now()));
+        }
+    }
+
+    /// Into picture-in-picture or back. limend checks for a real press and
+    /// answers with `HostEvent::Pip`; a refusal leaves things as they are.
+    fn request_pip(&mut self, on: bool) {
+        if on == self.pip {
+            return;
+        }
+        let Some((w, h)) = self.video.filter(|v| v.0 > 0 && v.1 > 0) else { return };
+        if !self.host.pip(on, [w, h]) && on {
+            eprintln!("atrium-player: picture-in-picture refused");
+        }
     }
 
     fn apply_volume(&mut self) {
@@ -466,6 +578,7 @@ impl<H: Host> App<H> {
         match ev {
             PlayerEvent::VideoTrack { width, height, bit_depth } => {
                 self.video = Some((width, height));
+                self.controls.pip_button = self.host.can_pip() && width > 0 && height > 0;
                 println!("video-track {width}x{height} {bit_depth}-bit");
             }
             PlayerEvent::AudioTrack { rate, channels } => {
@@ -548,6 +661,7 @@ impl<H: Host> App<H> {
                 None => {}
             }
         }
+        self.media_session();
         let map = self.audio.as_ref().and_then(|a| a.map());
         self.sink().clock.av = map;
         self.sync_paused();
@@ -656,6 +770,7 @@ impl<H: Host> App<H> {
             }
             // Only what the page said it handles.
             Some(Action::PageAction(a)) if self.page_actions & a != 0 => self.host.emit(ToParent::Action { action: a }),
+            Some(Action::TogglePip) => self.request_pip(!self.pip),
             Some(Action::PageAction(_)) | None => {}
         }
     }

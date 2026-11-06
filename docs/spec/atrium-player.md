@@ -325,6 +325,15 @@ Fresco's layers land.
   A volume change is reported as `ToParent::Volume`. The page's `MediaMetadata` and
   `MediaActions` are kept for now-playing; shift-N and shift-P send `ToParent::Action` when
   the page handles next or previous.
+- M7, now-playing and PiP (atrium-player-pip-keys.md §3, §4): the player reports its
+  session to choragusd on its stream's connection (so it counts for the parent): state,
+  the page's title and artist or the file name, and the actions it takes, at every change
+  and once a second while playing. Actions from media keys, Forum and the lock screen come
+  back as `SessionAction` and act like the player's own controls; next and previous go to
+  the page as `Action` when it handles them. An embedded player with video has a PiP button
+  (and `i`), and the page can send `RequestPip` and `ExitPip`; the player asks limend
+  (`Child::pip`), which checks the press, and follows limend's `Pip` event. With no sound
+  track there is no session yet (the session rides on the stream's connection).
 
 **Tests along the way:**
 - every demuxer limit has a test with a crafted file that exceeds it;

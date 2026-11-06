@@ -190,6 +190,7 @@ There are two ways to feed it.
 | parent → child | `TextTrack` | `id: u8` (at most 16), `lang`, `label` (64 bytes each), with a WebVTT file as a regular-file descriptor: the page's `<track>` |
 | parent → child | `ShowText` | `text`: `None`, `InBand` (the default) or `Page(id)` |
 | parent → child | `MediaMetadata` | `title`, `artist`, `album` (128 bytes each): `navigator.mediaSession.metadata` |
+| parent → child | `RequestPip`, `ExitPip` | none: `requestPictureInPicture()` during a user gesture, and `exitPictureInPicture()`; limend's `Pip` event says it happened |
 | parent → child | `MediaActions` | `actions: u16`: the `media_action` bits the page handles (`NEXT_TRACK`, `PREVIOUS_TRACK`) |
 | child → parent | `Ready` | `duration_secs: f64`, `width`, `height` |
 | child → parent | `CanPlay` | `mime`, `supported: bool`: the reply, for `MediaSource.isTypeSupported` |

@@ -77,6 +77,13 @@ pub enum ToChild {
     /// The actions the page handles itself (`setActionHandler`), as
     /// [`media_action`] bits. Play, pause and seeking the player does.
     MediaActions { actions: u16 },
+    /// `video.requestPictureInPicture()`, sent only during a user gesture:
+    /// limend checks that a press reached the page or the player (limen.md
+    /// §2.2, atrium-player-pip-keys.md §3). limend's `Pip` event, not a
+    /// player message, tells the parent it happened.
+    RequestPip,
+    /// `document.exitPictureInPicture()`.
+    ExitPip,
 }
 
 /// Bits of `MediaActions` and `ToParent::Action`.
@@ -156,7 +163,7 @@ impl ToChild {
             ToChild::Load { source, mime, .. } => {
                 clean_text(mime, MIME_MAX) && matches!(source, Source::Fd)
             }
-            ToChild::OpenSource | ToChild::LoadDone | ToChild::Play | ToChild::Pause | ToChild::Stop => true,
+            ToChild::OpenSource | ToChild::LoadDone | ToChild::RequestPip | ToChild::ExitPip | ToChild::Play | ToChild::Pause | ToChild::Stop => true,
             ToChild::AddTrack { track, mime } => *track < TRACKS_MAX && clean_text(mime, MIME_MAX),
             ToChild::Append { track, bytes, timestamp_offset } => {
                 *track < TRACKS_MAX
@@ -230,6 +237,8 @@ mod tests {
             ToChild::ShowText { text: TextChoice::None },
             ToChild::MediaMetadata { title: "Song".into(), artist: "Band".into(), album: String::new() },
             ToChild::MediaActions { actions: media_action::ALL },
+            ToChild::RequestPip,
+            ToChild::ExitPip,
             ToChild::OpenSource,
             ToChild::AddTrack { track: 0, mime: "video/webm; codecs=\"vp9\"".into() },
             ToChild::Append { track: 0, bytes: vec![1, 2, 3], timestamp_offset: Some(-2.5) },

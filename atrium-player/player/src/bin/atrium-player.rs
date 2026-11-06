@@ -223,7 +223,7 @@ fn windowed(file: &str, exit_at_end: bool, size: (u32, u32)) {
         std::process::exit(1)
     });
     let title = std::path::Path::new(file.split(['?', '#']).next().unwrap_or(file)).file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
-    let win = conn.window_create(size.0, size.1, title, fresco_protocol::WindowHints::default()).unwrap_or_else(|e| {
+    let win = conn.window_create(size.0, size.1, title.clone(), fresco_protocol::WindowHints::default()).unwrap_or_else(|e| {
         eprintln!("atrium-player: window: {e}");
         std::process::exit(1)
     });
@@ -231,6 +231,7 @@ fn windowed(file: &str, exit_at_end: bool, size: (u32, u32)) {
     let Some(f) = f else {
         let mut app = App::new(UrlHost::new(start_fetcher(file)), conn, win, size, Options::default());
         app.set_exit_at_end(exit_at_end);
+        app.session_name = title.clone();
         run(&mut app);
         if let Some(why) = app.host.failed.take() {
             eprintln!("{file}: {why}");
@@ -239,6 +240,7 @@ fn windowed(file: &str, exit_at_end: bool, size: (u32, u32)) {
         return;
     };
     let mut app = App::new(Standalone, conn, win, size, Options::default());
+    app.session_name = title;
     if let Err(e) = app.play_file(f, exit_at_end) {
         eprintln!("atrium-player: starting the decode worker: {e}");
         std::process::exit(1);

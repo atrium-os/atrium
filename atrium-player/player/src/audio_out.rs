@@ -11,7 +11,7 @@ use std::io;
 
 use lyra_protocol::client::{Client, Stream};
 use lyra_protocol::clock::{Clock, STATE_PLAYING};
-use lyra_protocol::wire::{Role, StreamParams, ToApp};
+use lyra_protocol::wire::{MediaAction, Role, SessionState, StreamParams, ToApp};
 
 use crate::supervisor::{Player, Sink};
 use crate::wsola::Wsola;
@@ -72,6 +72,10 @@ pub struct AudioOut {
     /// Rate other than 1: the PCM goes through WSOLA first.
     stretch: Option<Wsola>,
     rate: f64,
+    /// Media keys, Forum and the lock screen asking this player's session
+    /// for something (atrium-player-pip-keys.md §4): action, seek offset,
+    /// seek time.
+    pub session_actions: Vec<(MediaAction, Option<f64>, Option<f64>)>,
 }
 
 impl AudioOut {
@@ -99,7 +103,16 @@ impl AudioOut {
             buf: vec![0f32; 48_000 * 8],
             stretch: None,
             rate: 1.0,
+            session_actions: Vec::new(),
         })
+    }
+
+    /// This player's media session, on the connection its stream counts
+    /// on (so an embedded player's counts for its parent).
+    pub fn session(&mut self, state: SessionState, title: &str, artist: &str, actions: u16, duration: Option<f64>, position: Option<f64>) {
+        if self.client.session(state, title, artist, actions, duration, position).is_err() {
+            self.lost = true;
+        }
     }
 
     pub fn set_playing(&mut self, play: bool) {
@@ -165,6 +178,11 @@ impl AudioOut {
                 }
                 Ok(Some(ToApp::Underrun { frames, .. })) => self.underruns += frames,
                 Ok(Some(ToApp::Drained { .. })) => self.drained = self.drain_sent,
+                Ok(Some(ToApp::SessionAction { action, seek_offset, seek_time })) => {
+                    if self.session_actions.len() < 16 {
+                        self.session_actions.push((action, seek_offset, seek_time));
+                    }
+                }
                 Ok(Some(ToApp::StreamLost { .. })) | Err(_) => {
                     self.lost = true;
                     break;
