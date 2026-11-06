@@ -614,15 +614,44 @@ pub fn coverage(acc: f32, even_odd: bool) -> f32 {
 /// Everything but the frame-wide budgets ([`MAX_FRAME_SEGMENTS`],
 /// [`MAX_FRAME_INDICES`]), which [`crate::Frame::pack`] applies.
 pub fn prepare(f: &Fill, width: u32, height: u32) -> Result<Packed, u8> {
+    prepare_with(f, width, height, |f| flatten_local(f).map(std::sync::Arc::new))
+}
+
+/// [`prepare`], taking the fill's lines in its local space (see
+/// [`flatten_local`]) from `local`.
+fn prepare_with(
+    f: &Fill,
+    width: u32,
+    height: u32,
+    local: impl FnOnce(&Fill) -> Option<std::sync::Arc<Vec<[f32; 4]>>>,
+) -> Result<Packed, u8> {
     if check(&f.verbs, &f.points, &f.transform).is_err() {
         return Err(drop::MALFORMED);
     }
     if f.gradient.as_ref().is_some_and(|g| check_gradient(g).is_err()) {
         return Err(drop::BAD_PAINT);
     }
-    let lines = flatten(f).ok_or(drop::TOO_MANY_LINES)?;
+    let local = local(f).ok_or(drop::TOO_MANY_LINES)?;
+    let (e, g) = (f.transform[4], f.transform[5]);
+    let lines: Vec<[f32; 4]> = local
+        .iter()
+        .map(|l| [l[0] + e, l[1] + g, l[2] + e, l[3] + g])
+        .filter(|l| l[1] != l[3])
+        .collect();
+    if !lines.iter().flatten().all(|c| c.is_finite()) {
+        return Err(drop::TOO_MANY_LINES);
+    }
     let paint = f.gradient.as_ref().map(|g| (g, &f.transform));
     pack_paint(&lines, f.rule, f.clip, paint, width, height, 0)
+}
+
+/// The fill's lines with its transform's translation left out: what
+/// [`prepare`] flattens, then moves by the translation. A fill that only
+/// moves (a scrolled group's, fresco-scene-groups.md §4) keeps these, so
+/// [`FillCache`] re-tiles it without flattening it again.
+pub fn flatten_local(f: &Fill) -> Option<Vec<[f32; 4]>> {
+    let t = f.transform;
+    flatten(&Fill { transform: [t[0], t[1], t[2], t[3], 0.0, 0.0], verbs: f.verbs.clone(), points: f.points.clone(), gradient: None, clip: None, ..*f })
 }
 
 /// Move a block packed at word 0 to word `base`: its absolute words (the
@@ -662,6 +691,9 @@ pub fn unbase(block: &mut [u32], base: u32) {
 #[derive(Default)]
 pub struct FillCache {
     map: std::collections::HashMap<Vec<u32>, (u64, std::sync::Arc<Result<Packed, u8>>)>,
+    /// Lines in local space (see [`flatten_local`]), keyed by the path and
+    /// the transform's linear part: a fill that moved is only re-tiled.
+    lines: std::collections::HashMap<Vec<u32>, (u64, Option<std::sync::Arc<Vec<[f32; 4]>>>)>,
     tick: u64,
     words: usize,
 }
@@ -670,6 +702,15 @@ pub struct FillCache {
 const CACHE_LIFE: u64 = 64;
 /// Most block words a cache holds (64 MiB) before it starts over.
 const CACHE_MAX_WORDS: usize = 16 << 20;
+
+fn lines_key(f: &Fill) -> Vec<u32> {
+    let mut k = Vec::with_capacity(8 + f.verbs.len() + f.points.len() * 2);
+    k.extend([f.verbs.len() as u32, f.points.len() as u32]);
+    k.extend(f.verbs.iter().map(|&v| v as u32));
+    k.extend(f.points.iter().flat_map(|p| [p[0].to_bits(), p[1].to_bits()]));
+    k.extend(f.transform[..4].iter().map(|v| v.to_bits()));
+    k
+}
 
 fn cache_key(f: &Fill, width: u32, height: u32) -> Vec<u32> {
     let mut k = Vec::with_capacity(16 + f.verbs.len() + f.points.len() * 2);
@@ -707,6 +748,7 @@ impl FillCache {
         self.tick += 1;
         if self.words > CACHE_MAX_WORDS {
             self.map.clear();
+            self.lines.clear();
             self.words = 0;
         } else if self.tick % 16 == 0 {
             let tick = self.tick;
@@ -715,6 +757,13 @@ impl FillCache {
                 let keep = *used + CACHE_LIFE >= tick;
                 if !keep {
                     freed += r.as_ref().as_ref().map_or(0, |p| p.block.len());
+                }
+                keep
+            });
+            self.lines.retain(|_, (used, l)| {
+                let keep = *used + CACHE_LIFE >= tick;
+                if !keep {
+                    freed += l.as_ref().map_or(0, |l| l.len() * 4);
                 }
                 keep
             });
@@ -729,10 +778,24 @@ impl FillCache {
             *used = self.tick;
             return r.clone();
         }
-        let r = std::sync::Arc::new(prepare(f, width, height));
+        let (tick, lines, words) = (self.tick, &mut self.lines, &mut self.words);
+        let r = std::sync::Arc::new(prepare_with(f, width, height, |f| {
+            let e = lines.entry(lines_key(f)).or_insert_with(|| {
+                let l = flatten_local(f).map(std::sync::Arc::new);
+                *words += l.as_ref().map_or(0, |l| l.len() * 4);
+                (tick, l)
+            });
+            e.0 = tick;
+            e.1.clone()
+        }));
         self.words += r.as_ref().as_ref().map_or(0, |p| p.block.len());
         self.map.insert(key, (self.tick, r.clone()));
         r
+    }
+
+    /// Paths held flattened (in local space).
+    pub fn flattened(&self) -> usize {
+        self.lines.len()
     }
 
     /// Entries held.

@@ -129,6 +129,109 @@ pub fn rects(dirty: &[bool], tiles_x: u32, tiles_y: u32, max: usize) -> Vec<[u32
     done
 }
 
+/// A scrolled area of a window to move instead of drawing again
+/// (fresco-scene-groups.md §4): between the frame in the buffer and the
+/// next, the pixels in `area` move by `d`, except where something drawn
+/// over the moving content (`over` in the next frame, `over_before` in the
+/// one in the buffer) touches. Whole pixels throughout.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct Shift {
+    /// `[x0, y0, x1, y1)`.
+    pub area: [u32; 4],
+    pub d: [i32; 2],
+    pub over: Vec<[u32; 4]>,
+    pub over_before: Vec<[u32; 4]>,
+}
+
+fn meets(a: [u32; 4], b: [u32; 4]) -> bool {
+    a[0] < b[2] && b[0] < a[2] && a[1] < b[3] && b[1] < a[3]
+}
+
+/// Apply `shifts` to the drawing in `px` (`width` pixels a line) and to
+/// `held`, its tiles' signatures, before a partial raster of the frame
+/// whose signatures are `sig`: move each area's pixels, and give every
+/// tile whose pixels all came from inside the same area, untouched by
+/// anything drawn over, its new signature. Returns the tiles that must be
+/// rastered whatever their signatures say (the rest of each area: the
+/// exposed strip, tiles across its edge, tiles under something drawn
+/// over), and the box of the pixels moved.
+pub fn shift(
+    px: &mut [u32],
+    width: u32,
+    height: u32,
+    sig: &[u64],
+    held: &mut [u64],
+    shifts: &[Shift],
+) -> (Vec<bool>, Option<[u32; 4]>) {
+    let tiles_x = width.div_ceil(TILE);
+    let tiles_y = height.div_ceil(TILE);
+    let n = (tiles_x * tiles_y) as usize;
+    assert!(sig.len() == n && held.len() == n && px.len() >= (width * height) as usize);
+    let mut forced = vec![false; n];
+    let mut clean = vec![false; n];
+    let mut moved: Option<[u32; 4]> = None;
+    // With more than one, every copy reads the drawing as it was.
+    let before = (shifts.len() > 1).then(|| px.to_vec());
+    for s in shifts {
+        let a = [s.area[0].min(width), s.area[1].min(height), s.area[2].min(width), s.area[3].min(height)];
+        let [dx, dy] = s.d;
+        if a[0] >= a[2] || a[1] >= a[3] || (dx == 0 && dy == 0) {
+            continue;
+        }
+        // Destination pixels whose source is inside the area too.
+        let x0 = (a[0] as i64).max(a[0] as i64 + dx as i64);
+        let x1 = (a[2] as i64).min(a[2] as i64 + dx as i64);
+        let y0 = (a[1] as i64).max(a[1] as i64 + dy as i64);
+        let y1 = (a[3] as i64).min(a[3] as i64 + dy as i64);
+        if x0 < x1 && y0 < y1 {
+            let (x0, x1, w) = (x0 as usize, x1 as usize, width as usize);
+            let rows: Box<dyn Iterator<Item = i64>> = if dy > 0 { Box::new((y0..y1).rev()) } else { Box::new(y0..y1) };
+            for y in rows {
+                let sy = (y - dy as i64) as usize;
+                let sx = (x0 as i64 - dx as i64) as usize;
+                let d = y as usize * w + x0;
+                let len = x1 - x0;
+                match &before {
+                    Some(b) => px[d..d + len].copy_from_slice(&b[sy * w + sx..sy * w + sx + len]),
+                    None => px.copy_within(sy * w + sx..sy * w + sx + len, d),
+                }
+            }
+            moved = Some(match moved {
+                Some(m) if m != a => [m[0].min(a[0]), m[1].min(a[1]), m[2].max(a[2]), m[3].max(a[3])],
+                _ => a,
+            });
+        }
+        let inside = |b: [i64; 4]| b[0] >= a[0] as i64 && b[1] >= a[1] as i64 && b[2] <= a[2] as i64 && b[3] <= a[3] as i64;
+        for ty in a[1] / TILE..a[3].div_ceil(TILE) {
+            for tx in a[0] / TILE..a[2].div_ceil(TILE) {
+                let t = [tx * TILE, ty * TILE, ((tx + 1) * TILE).min(width), ((ty + 1) * TILE).min(height)];
+                let ti = t.map(|v| v as i64);
+                let src = [ti[0] - dx as i64, ti[1] - dy as i64, ti[2] - dx as i64, ti[3] - dy as i64];
+                let src_u = src.map(|v| v.max(0) as u32);
+                let ok = inside(ti)
+                    && inside(src)
+                    && !s.over.iter().any(|o| meets(*o, t))
+                    && !s.over_before.iter().any(|o| meets(*o, src_u));
+                let i = (ty * tiles_x + tx) as usize;
+                if ok {
+                    clean[i] = true;
+                } else {
+                    forced[i] = true;
+                }
+            }
+        }
+    }
+    for i in 0..n {
+        if forced[i] {
+            clean[i] = false;
+        }
+        if clean[i] {
+            held[i] = sig[i];
+        }
+    }
+    (forced, moved)
+}
+
 /// The tiles whose signature differs from `prev` (all of them without one).
 pub fn dirty(sig: &[u64], prev: Option<&[u64]>) -> Vec<bool> {
     match prev {

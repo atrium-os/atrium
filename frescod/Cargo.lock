@@ -923,6 +923,7 @@ dependencies = [
  "libc",
  "log",
  "portcullis-ipc",
+ "serde",
 ]
 
 [[package]]

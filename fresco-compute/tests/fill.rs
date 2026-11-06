@@ -320,3 +320,26 @@ fn a_fill_moving_in_texels_redraws_nothing() {
         }
     }
 }
+
+#[test]
+fn a_moved_fill_is_tiled_again_not_flattened_again() {
+    let mut cache = FillCache::default();
+    let fills = fuzz::fills();
+    let n = fills.len();
+    for dy in [0.0f32, -7.0, -19.5, 3.25] {
+        let s = Scene {
+            fills: fills.iter().map(|f| {
+                let mut f = f.clone();
+                f.transform[5] += dy;
+                f
+            }).collect(),
+            ..Default::default()
+        };
+        let (a, da) = Frame::pack_report(&s, 96, 80, 96);
+        let (b, db) = Frame::pack_cached(&s, 96, 80, 96, Some(&mut cache));
+        assert_eq!(da, db);
+        assert!(words(&a) == words(&b), "dy {dy}: cached frame differs");
+    }
+    assert!(cache.flattened() <= n, "{} paths flattened for {n} fills", cache.flattened());
+    assert!(cache.len() > n, "each position tiled");
+}

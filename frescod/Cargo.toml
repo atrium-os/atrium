@@ -63,6 +63,7 @@ fresco-vulkan       = { path = "../fresco-vulkan" }
 fresco-compute      = { path = "../fresco-compute" }
 atrium-spv-loader   = { path = "../atrium-spv-loader" }
 fresco-protocol     = { path = "../fresco-protocol" }
+serde               = "1"
 aqueduct            = { path = "../aqueduct" }
 aqueduct-gpu        = { path = "../aqueduct-gpu" }
 aqueduct-gpu-client = { path = "../aqueduct-gpu-client" }

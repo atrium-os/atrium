@@ -44,6 +44,33 @@ pub struct WindowFrame {
     /// order, instead of by kind. Indices are into the vectors above, and
     /// each texture or glyph node has a batch of its own.
     pub order: Option<Vec<OrderItem>>,
+    /// The window's scroll viewports (`SCROLL` groups in the shape §4
+    /// shifts), in paint order.
+    pub scrolls: Vec<Scroll>,
+}
+
+/// A scroll viewport, for the pixel renderer's shift
+/// (fresco-scene-groups.md §4): a `SCROLL` group with a clip whose first
+/// child is an opaque background rect and whose second is the content
+/// group, the content group's translation being the scroll offset.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Scroll {
+    /// The `SCROLL` group's node id.
+    pub group: u32,
+    /// Window pixels `[x0, y0, x1, y1)` the shift may move: inside the
+    /// clip and the background, whole pixels only.
+    pub area: [u32; 4],
+    /// The content group's translation in window pixels.
+    pub offset: [f64; 2],
+    /// Everything else that decides what the area shows: the group, where
+    /// it sits, its background, the content in its own space.
+    pub hash: u64,
+    /// Texture slots the content samples (an upload changes what it draws;
+    /// see [`SceneState::slot_gens`]).
+    pub slots: Vec<u32>,
+    /// Boxes (window pixels, rounded out, within `area`) of what is drawn
+    /// after the content.
+    pub over: Vec<[u32; 4]>,
 }
 
 /// One element of a grouped window, in paint order.
@@ -166,10 +193,29 @@ const VK_FORMAT_R8G8B8A8_SRGB: i32 = 43;
 pub struct SceneState {
     slots: HashMap<u32, fresco_compute::Texture>,
     fills: std::sync::Mutex<fresco_compute::fill::FillCache>,
+    /// Per slot, a number that changes with every upload to it.
+    gens: HashMap<u32, u64>,
+    next_gen: u64,
 }
 
 impl SceneState {
+    /// A hash of the upload generations of `slots`: equal across two
+    /// frames when none of them was written in between.
+    pub fn slot_gens(&self, slots: &[u32]) -> u64 {
+        use std::hash::{Hash, Hasher};
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        for s in slots {
+            (s, self.gens.get(s)).hash(&mut h);
+        }
+        h.finish()
+    }
+
     pub fn upload(&mut self, req: UploadRequest) {
+        let slot = match &req {
+            UploadRequest::Texture { slot_id, .. } | UploadRequest::TextureRegion { slot_id, .. } => *slot_id,
+        };
+        self.next_gen += 1;
+        self.gens.insert(slot, self.next_gen);
         match req {
             UploadRequest::Texture { slot_id, bytes, width, height, format } => {
                 let format = match format.as_raw() {
@@ -602,6 +648,7 @@ fn grouped_frame(state: &fresco_scene_server::command::envelope_frontend::Window
         }
     };
     push_kids(&mut stack, None, Xf::ID, 1.0, None);
+    let mut viewports = Vec::new();
     while let Some((id, x, op, clip)) = stack.pop() {
         if let Some(g) = state.group_nodes.get(&id) {
             // The group's clip is in its parent's space: map it with `x`.
@@ -609,12 +656,178 @@ fn grouped_frame(state: &fresco_scene_server::command::envelope_frontend::Window
             if empty(c) {
                 continue; // nothing of it can show: skip the subtree
             }
+            if g.flags & fresco_protocol::group_flags::SCROLL != 0 {
+                if let Some(v) = viewport(state, &kids, id, g, x, op, c, w.size) {
+                    viewports.push(v);
+                }
+            }
             push_kids(&mut stack, Some(id), x.then(&g.transform), op * g.opacity, c);
         } else {
             emit(w, &mut order, id, x, op, clip);
         }
     }
+    // What is drawn after each viewport's content, over its area.
+    for (mut s, content) in viewports {
+        let Some(last) = order.iter().rposition(|o| content.contains(&o.node)) else {
+            // No content drawn: nothing to move.
+            continue;
+        };
+        let a = s.area.map(|v| v as f32);
+        for o in &order[last + 1..] {
+            let Some(b) = item_box(w, o.item) else { continue };
+            let b = meet(Some(b), meet(o.clip, Some(a))).unwrap();
+            if b[0] < b[2] && b[1] < b[3] {
+                s.over.push([b[0].floor() as u32, b[1].floor() as u32, b[2].ceil() as u32, b[3].ceil() as u32]);
+            }
+        }
+        if s.over.len() > 64 {
+            let u = s.over.iter().fold([u32::MAX, u32::MAX, 0, 0], |u, b| [u[0].min(b[0]), u[1].min(b[1]), u[2].max(b[2]), u[3].max(b[3])]);
+            s.over = vec![u];
+        }
+        w.scrolls.push(s);
+    }
     w.order = Some(order);
+}
+
+/// A `SCROLL` group `id` (composed transform `x` of its parent, opacity
+/// `op`, clip `c` in window pixels) as a [`Scroll`], with the node ids of
+/// its content's leaves; `None` if it is not in the shape the shift needs
+/// (§4: a clip, an opaque background rect first, the content group second,
+/// fully opaque).
+#[allow(clippy::too_many_arguments)]
+fn viewport(
+    state: &fresco_scene_server::command::envelope_frontend::WindowSceneState,
+    kids: &HashMap<Option<u32>, Vec<(u32, u32)>>,
+    id: u32,
+    g: &fresco_protocol::GroupParams,
+    x: Xf,
+    op: f32,
+    c: Option<[f32; 4]>,
+    size: (u32, u32),
+) -> Option<(Scroll, std::collections::HashSet<u32>)> {
+    use std::hash::{Hash, Hasher};
+    let c = c?;
+    let ch = kids.get(&Some(id))?;
+    let (&(_, bg_id), &(_, content_id)) = (ch.first()?, ch.get(1)?);
+    let bg = state.rect_nodes.get(&bg_id)?;
+    let content = state.group_nodes.get(&content_id)?;
+    if op * g.opacity != 1.0 || bg.a != 1.0 || bg.radius != 0.0 {
+        return None;
+    }
+    let xg = x.then(&g.transform);
+    let b = xg.rect([bg.x, bg.y, bg.x + bg.w, bg.y + bg.h]);
+    // Whole pixels the background covers, inside the clip and the window.
+    let area = [
+        c[0].max(b[0]).max(0.0).ceil(),
+        c[1].max(b[1]).max(0.0).ceil(),
+        c[2].min(b[2]).min(size.0 as f32).floor(),
+        c[3].min(b[3]).min(size.1 as f32).floor(),
+    ];
+    if !(area[0] < area[2] && area[1] < area[3]) {
+        return None;
+    }
+    let xc = xg.then(&content.transform);
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    // Where the viewport sits and what it is.
+    (id, x.s.to_bits(), x.tx.to_bits(), x.ty.to_bits(), op.to_bits()).hash(&mut h);
+    c.map(f32::to_bits).hash(&mut h);
+    hash_ser(&mut h, g);
+    (bg_id, bg.r.to_bits(), bg.g.to_bits(), bg.b.to_bits()).hash(&mut h);
+    // The content in its own space: its translation left out.
+    let mut local = *content;
+    local.transform[4] = 0.0;
+    local.transform[5] = 0.0;
+    content_id.hash(&mut h);
+    hash_ser(&mut h, &local);
+    let mut slots = Vec::new();
+    let mut leaves = std::collections::HashSet::new();
+    let mut walk = vec![content_id];
+    while let Some(n) = walk.pop() {
+        for &(order, k) in kids.get(&Some(n)).map(Vec::as_slice).unwrap_or(&[]) {
+            (order, k).hash(&mut h);
+            if let Some(gp) = state.group_nodes.get(&k) {
+                hash_ser(&mut h, gp);
+                walk.push(k);
+            } else {
+                leaves.insert(k);
+                if let Some(p) = state.rect_nodes.get(&k) {
+                    hash_ser(&mut h, p);
+                } else if let Some(p) = state.path_nodes.get(&k) {
+                    hash_ser(&mut h, p);
+                } else if let Some(p) = state.fill_nodes.get(&k) {
+                    hash_ser(&mut h, p);
+                } else if let Some(p) = state.texture_nodes.get(&k) {
+                    hash_ser(&mut h, p);
+                    slots.push(p.slot_id);
+                } else if let Some(p) = state.glyph_run_nodes.get(&k) {
+                    hash_ser(&mut h, p);
+                    slots.push(p.atlas_slot_id);
+                }
+            }
+        }
+    }
+    slots.sort_unstable();
+    slots.dedup();
+    let scroll = Scroll {
+        group: id,
+        area: area.map(|v| v as u32),
+        offset: [xc.tx, xc.ty],
+        hash: h.finish(),
+        slots,
+        over: Vec::new(),
+    };
+    Some((scroll, leaves))
+}
+
+fn hash_ser<T: serde::Serialize, H: std::hash::Hasher>(h: &mut H, v: &T) {
+    match fresco_protocol::encode(v) {
+        Ok(b) => h.write(&b),
+        Err(_) => h.write_u8(0xff),
+    }
+}
+
+/// A conservative window-pixel box of what `item` of `w` draws (before
+/// its clip); `None` if it draws nothing.
+fn item_box(w: &WindowFrame, item: fresco_compute::Node) -> Option<[f32; 4]> {
+    use fresco_compute::Node;
+    Some(match item {
+        Node::Rect(i) => {
+            let r = w.rects.get(i)?;
+            [r.position[0], r.position[1], r.position[0] + r.size[0], r.position[1] + r.size[1]]
+        }
+        Node::Path(i) => {
+            let [cx, cy, len, wid] = w.paths.get(i)?.model;
+            let e = 0.5 * len.hypot(wid) + 1.0;
+            [cx - e, cy - e, cx + e, cy + e]
+        }
+        Node::Fill(i) => {
+            let f = w.fills.get(i)?;
+            let t = f.transform;
+            let mut b = [f32::MAX, f32::MAX, f32::MIN, f32::MIN];
+            for p in &f.points {
+                let (px, py) = (t[0] * p[0] + t[2] * p[1] + t[4], t[1] * p[0] + t[3] * p[1] + t[5]);
+                b = [b[0].min(px), b[1].min(py), b[2].max(px), b[3].max(py)];
+            }
+            let b = [b[0] - 1.0, b[1] - 1.0, b[2] + 1.0, b[3] + 1.0];
+            meet(Some(b), f.clip).unwrap()
+        }
+        Node::Quad(b, q) => {
+            let [x, y, qw, qh] = w.batches.get(b)?.nodes.get(q)?.model;
+            [x, y, x + qw, y + qh]
+        }
+        Node::Run(b, r) => {
+            let batch = w.glyph_batches.get(b)?;
+            let n = batch.nodes.get(r)?;
+            let (count, off) = (n.meta[0].max(0) as usize, n.meta[1].max(0) as usize);
+            let mut bx = [f32::MAX, f32::MAX, f32::MIN, f32::MIN];
+            for g in batch.glyphs.get(off..off + count)? {
+                let x = n.origin[0] + g.d_offset[0] + g.bearing[0];
+                let y = n.origin[1] + g.d_offset[1] - g.bearing[1];
+                bx = [bx[0].min(x), bx[1].min(y), bx[2].max(x + g.atlas_uv[2]), bx[3].max(y + g.atlas_uv[3])];
+            }
+            bx
+        }
+    })
 }
 
 fn translate_rect(p: &RectParams, ox: f32, oy: f32) -> SceneNode {
@@ -888,5 +1101,91 @@ mod group_tests {
         place(&mut s, 1, Some(101), 0);
         let w = grouped(&s);
         assert_eq!(w.rects[0].color[3], 0.25);
+    }
+
+    /// A ScrollView (§5): viewport group 200 (SCROLL, clip y 8..56) holding
+    /// its background 300 and content group 201 with striped rows, plus a
+    /// floating button 400 drawn after it.
+    fn scroll_view(s: &mut WindowSceneState, offset: f32) {
+        s.set_group(200, GroupParams { parent: None, order: 0, transform: ID, clip: Some([4.0, 8.0, 60.0, 56.0]), opacity: 1.0, flags: fresco_protocol::group_flags::SCROLL }, 1).unwrap();
+        rect(s, 300, 4.0, 8.0, 56.0, 48.0, [0.9, 0.9, 0.9, 1.0]);
+        place(s, 300, Some(200), 0);
+        group(s, 201, Some(200), 1, [1.0, 0.0, 0.0, 1.0, 0.0, offset], None);
+        for i in 0..40u32 {
+            let c = [(i % 5) as f32 / 5.0, 0.3, 1.0 - (i % 3) as f32 / 3.0, 1.0];
+            rect(s, i + 1, 6.0 + (i % 4) as f32 * 3.5, i as f32 * 5.5, 30.0 + (i % 7) as f32, 4.0, c);
+            place(s, i + 1, Some(201), i);
+        }
+        rect(s, 400, 44.0, 40.0, 10.0, 6.0, [0.1, 0.7, 0.2, 0.8]);
+        place(s, 400, None, 1);
+    }
+
+    #[test]
+    fn a_scroll_view_reports_its_viewport() {
+        let mut s = WindowSceneState::new();
+        scroll_view(&mut s, 8.25);
+        let w = grouped(&s);
+        assert_eq!(w.scrolls.len(), 1);
+        let v = &w.scrolls[0];
+        assert_eq!((v.group, v.area, v.offset), (200, [4, 8, 60, 56], [0.0, 8.25]));
+        assert_eq!(v.over, vec![[44, 40, 54, 46]], "the floating button");
+        // Scrolled: same hash, new offset. A row changed: new hash.
+        scroll_view(&mut s, -20.25);
+        let w2 = grouped(&s);
+        assert_eq!((w2.scrolls[0].hash, w2.scrolls[0].offset), (v.hash, [0.0, -20.25]));
+        rect(&mut s, 7, 6.0, 1.0, 9.0, 4.0, RED);
+        assert_ne!(grouped(&s).scrolls[0].hash, v.hash);
+        // Not opaque: no viewport.
+        rect(&mut s, 300, 4.0, 8.0, 56.0, 48.0, [0.9, 0.9, 0.9, 0.5]);
+        assert!(grouped(&s).scrolls.is_empty());
+    }
+
+    /// The renderer's path (fresco_renderer::raster) with the reference
+    /// rasteriser: shift, then draw the dirty tiles. Equal to full draws.
+    #[test]
+    fn scrolling_by_shifting_equals_full_draws() {
+        use fresco_compute::damage;
+        let mut s = WindowSceneState::new();
+        let mut off = 3.5f32;
+        scroll_view(&mut s, off);
+        let w0 = grouped(&s);
+        let st = SceneState::default();
+        let f0 = st.pack(&w0, W, W);
+        let mut px = reference::render(&f0);
+        let mut held = damage::tile_signatures(&f0);
+        let mut prev = w0.scrolls.clone();
+        let mut shifted = 0;
+        for d in [-5.0f32, -11.0, 7.0, -30.0, -0.5, -4.0, 60.0] {
+            off += d;
+            scroll_view(&mut s, off);
+            let w = grouped(&s);
+            let f = st.pack(&w, W, W);
+            let sig = damage::tile_signatures(&f);
+            let sh: Vec<damage::Shift> = w.scrolls.iter().filter_map(|n| {
+                let p = prev.iter().find(|p| p.group == n.group && p.area == n.area && p.hash == n.hash)?;
+                let dy = n.offset[1] - p.offset[1];
+                (dy.fract() == 0.0 && dy != 0.0 && dy.abs() < 48.0).then(|| damage::Shift {
+                    area: n.area, d: [0, dy as i32], over: n.over.clone(), over_before: p.over.clone(),
+                })
+            }).collect();
+            shifted += sh.len();
+            let (forced, _) = damage::shift(&mut px, W, W, &sig, &mut held, &sh);
+            let full = reference::render(&f);
+            let tx = W.div_ceil(fresco_compute::TILE);
+            for (i, dirty) in damage::dirty(&sig, Some(&held)).into_iter().enumerate() {
+                if dirty || forced.get(i).copied().unwrap_or(false) {
+                    let (x0, y0) = ((i as u32 % tx) * 16, (i as u32 / tx) * 16);
+                    for y in y0..(y0 + 16).min(W) {
+                        for x in x0..(x0 + 16).min(W) {
+                            px[(y * W + x) as usize] = full[(y * W + x) as usize];
+                        }
+                    }
+                }
+            }
+            assert!(px == full, "scrolled by {d}: differs from a full draw");
+            held = sig;
+            prev = w.scrolls.clone();
+        }
+        assert_eq!(shifted, 5, "every whole-pixel scroll smaller than the viewport shifted");
     }
 }

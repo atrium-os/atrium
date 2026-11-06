@@ -78,6 +78,9 @@ struct Win {
     tiles: Option<Vec<u64>>,
     slot_seq: [u32; 2],
     history: std::collections::VecDeque<(u32, Option<slot::Rect>)>,
+    /// The scroll viewports of the drawing in `px`, each with its key
+    /// (content hash and the uploads of the slots it samples).
+    scrolls: Vec<(pack::Scroll, u64)>,
 }
 
 impl Win {
@@ -85,6 +88,7 @@ impl Win {
     fn forget(&mut self) {
         self.sig = None;
         self.tiles = None;
+        self.scrolls.clear();
         self.slot_seq = [0; 2];
         self.history.clear();
     }
@@ -120,7 +124,40 @@ fn union(a: slot::Rect, b: slot::Rect) -> slot::Rect {
 /// Raster `frame` into `w.px`: only the tiles whose signatures changed.
 /// `Ok(Some(damage))`: the drawing changed, inside `damage` against the
 /// previous one (`None`: anywhere); `Ok(None)`: not a pixel changed.
-fn raster(t2: &fresco_compute::tier2::Tier2, w: &mut Win, frame: &fresco_compute::Frame, width: u32, height: u32) -> Result<Option<Option<slot::Rect>>, String> {
+/// The shifts that bring the scroll viewports of the drawing in `w.px`
+/// (`w.scrolls`) to those of the next frame (`now`, with their keys):
+/// a viewport in the same place showing the same content moved by whole
+/// pixels, less than its size (fresco-scene-groups.md §4).
+fn shifts(w: &Win, now: &[(pack::Scroll, u64)]) -> Vec<fresco_compute::damage::Shift> {
+    let mut out = Vec::new();
+    for (s, key) in now {
+        let Some((p, _)) = w.scrolls.iter().find(|(p, k)| p.group == s.group && p.area == s.area && k == key) else {
+            continue;
+        };
+        let d = [s.offset[0] - p.offset[0], s.offset[1] - p.offset[1]];
+        let r = d.map(f64::round);
+        let (aw, ah) = ((s.area[2] - s.area[0]) as f64, (s.area[3] - s.area[1]) as f64);
+        if (d[0] - r[0]).abs() > 1e-4 || (d[1] - r[1]).abs() > 1e-4 || r == [0.0, 0.0] || r[0].abs() >= aw || r[1].abs() >= ah {
+            continue;
+        }
+        out.push(fresco_compute::damage::Shift {
+            area: s.area,
+            d: [r[0] as i32, r[1] as i32],
+            over: s.over.clone(),
+            over_before: p.over.clone(),
+        });
+    }
+    out
+}
+
+fn raster(
+    t2: &fresco_compute::tier2::Tier2,
+    w: &mut Win,
+    frame: &fresco_compute::Frame,
+    width: u32,
+    height: u32,
+    scrolls: Vec<(pack::Scroll, u64)>,
+) -> Result<Option<Option<slot::Rect>>, String> {
     use fresco_compute::damage;
     let n = width as usize * height as usize;
     if w.px.len() != n {
@@ -129,20 +166,36 @@ fn raster(t2: &fresco_compute::tier2::Tier2, w: &mut Win, frame: &fresco_compute
     }
     let sig = damage::tile_signatures(frame);
     let h = &frame.header;
-    let Some(held) = w.tiles.as_deref() else {
+    if w.tiles.is_none() {
         t2.render(frame, &mut w.px).map_err(|e| e.to_string())?;
         w.tiles = Some(sig);
+        w.scrolls = scrolls;
         return Ok(Some(None));
+    }
+    let sh = shifts(w, &scrolls);
+    w.scrolls = scrolls;
+    let held = w.tiles.as_mut().unwrap();
+    let (forced, moved) = if sh.is_empty() {
+        (Vec::new(), None)
+    } else {
+        damage::shift(&mut w.px, width, height, &sig, held, &sh)
     };
-    let dirty = damage::dirty(&sig, Some(held));
+    let mut dirty = damage::dirty(&sig, Some(held));
+    for (d, f) in dirty.iter_mut().zip(&forced) {
+        *d |= *f;
+    }
     let tiles = damage::rects(&dirty, h.tiles_x, h.tiles_y, fresco_compute::tier2::Tier2::MAX_TILE_RECTS);
-    if tiles.is_empty() {
+    if tiles.is_empty() && moved.is_none() {
         return Ok(None);
     }
-    t2.render_tiles(frame, &mut w.px, &tiles).map_err(|e| e.to_string())?;
+    if let Err(e) = t2.render_tiles(frame, &mut w.px, &tiles) {
+        // What `px` holds is now neither frame: draw the next one whole.
+        w.tiles = None;
+        return Err(e.to_string());
+    }
     w.tiles = Some(sig);
     let t = fresco_compute::TILE;
-    let r = tiles.iter().map(|r| [r[0] * t, r[1] * t, (r[2] * t).min(width), (r[3] * t).min(height)]).reduce(union);
+    let r = tiles.iter().map(|r| [r[0] * t, r[1] * t, (r[2] * t).min(width), (r[3] * t).min(height)]).chain(moved).reduce(union);
     Ok(Some(r.filter(|r| r[0] < r[2] && r[1] < r[3])))
 }
 
@@ -355,7 +408,15 @@ fn draw(broker: &Chan, state: &Mutex<State>, fe: &Mutex<EnvelopeFrontend>, scene
         let written = match t2 {
             // Pixel mode: raster here (only what changed), send the pixels.
             Some(t2) => {
-                let damage = match raster(t2, w, &frame, width, height) {
+                let scrolls = wf.scrolls.iter().map(|s| {
+                    let key = {
+                        let mut h = std::collections::hash_map::DefaultHasher::new();
+                        (s.hash, scene.slot_gens(&s.slots)).hash(&mut h);
+                        h.finish()
+                    };
+                    (s.clone(), key)
+                }).collect();
+                let damage = match raster(t2, w, &frame, width, height, scrolls) {
                     Ok(Some(d)) => d,
                     Ok(None) => {
                         // Not a pixel changed.

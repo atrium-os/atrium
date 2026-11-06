@@ -143,9 +143,11 @@ transform changes the signatures of exactly the tiles its content covers.
 
 ## 4. Scrolling: the SCROLL flag
 
-A group with `SCROLL` and a clip is a scroll viewport. Its transform's translation is the scroll
-offset. When between two frames the only change inside its clip is that translation, by a whole
-number of device pixels smaller than the clip, the renderer:
+A group with `SCROLL` and a clip is a scroll viewport, in the shape §5's ScrollView builds: its
+first child is an opaque background rect, its second the content group, and the content group's
+translation is the scroll offset (the viewport's own clip and transform stay put). When between two
+frames the only change inside the viewport is that translation, by a whole number of device pixels
+smaller than the viewport, the renderer:
 
 1. copies its previous pixels inside the clip by the delta,
 2. rasters the newly exposed strip,
@@ -165,6 +167,17 @@ valid take the new frame's signatures; tiles straddling the clip edge, the expos
 touched by ops after the group are rastered. To tell "only the translation changed" without
 re-deriving it, **pack's output carries, per `SCROLL` group, a content hash of its subtree in local
 space (its own translation excluded) and the box of everything drawn after it**.
+
+**As built** (Fresco owners, 2026-11-06): pack's `WindowFrame::scrolls` gives per viewport its
+area (whole pixels inside the clip and the background), the content's offset, a hash of the
+viewport's placement, background and content in local space, the texture slots the content samples
+(any upload to one counts as a change, so new glyphs arriving mid-scroll draw that frame in full),
+and the boxes drawn after the content. The pixel renderer (`fresco_renderer::raster`) shifts with
+`fresco_compute::damage::shift`; tests check shifted frames equal full draws pixel for pixel
+(`fresco-compute/tests/shift.rs`, `frescod` pack tests). A viewport not in this shape, translucent,
+or moved by a fraction of a pixel is drawn by ordinary tile damage. Fills are flattened in local
+space (`fill::flatten_local`) and `FillCache` keeps those lines, so a scrolled fill is only tiled
+again.
 
 **GPU renderer** (F4e): each window's VRAM surface persists and only dirty tiles are rastered, but
 there is no in-VRAM copy that handles overlap yet, so v1 draws the clip in full there (damage
