@@ -152,9 +152,10 @@ The policy is the one Lyra's spec settled (§12.1).
 
 ## 6. Feeds: `Load` and the segment feed
 
-- **`Load`** takes a `DocRef` blob or a file descriptor limend passes. URLs need a fetcher in
-  the player's jail. v1 leaves `Load` by URL to a later step, which reuses the Navigator's
-  jailed fetcher rather than a second network stack.
+- **`Load`** takes a file descriptor limend passes. There is no `Load` by URL (decided by
+  Shankar, 2026-11-06): the player's jail has no network, and the Navigator fetches, passing a
+  descriptor or feeding segments. A standalone player that opens a URL would start the
+  Navigator's jailed fetcher as a separate process, never giving the decode jail network.
 - **The segment feed** implements a reduced MSE coded-frame model per track: init segments,
   `timestamp_offset`, buffered ranges (at most 64), `Remove`, `Abort` and `EndOfStream`.
   One `Append` is in flight per track, `Appended` releases the next, and the 150 MB cap
@@ -191,7 +192,7 @@ The policy is the one Lyra's spec settled (§12.1).
 | M4 | presenting: a Fresco video layer, `RGBA8` first, then `NV12`/`P010`; the clock with `CLOCK_MONOTONIC` as master and `PRESENTED` feedback | the VM | Fresco V1, V2 |
 | M5 | the Pergola window and controls; running as a Limen `media-player` child in the VM, fed by a probe parent (`Load` and segment feed) | the VM | M4, Limen L4 |
 | M6 | audio: a Lyra stream through choragusd as role Media, audio-master sync, volume, rate with WSOLA | the VM | Lyra clock and fd brokering (P2) |
-| M7 | later: `Load` by URL, subtitles, PiP, media keys, H.264 and AAC if decided, hardware decode (G1) | | |
+| M7 | later: subtitles, PiP, media keys, H.264 and AAC if decided, hardware decode (G1) | | |
 
 M0 to M3 start now and wait on nothing. A headless `atrium-player --sink=hash` plays a clip
 end to end and prints per-frame hashes and timing, so the whole pipeline is tested before
@@ -250,7 +251,7 @@ Fresco's layers land.
   The player plays it like a local file. The probe's second embed loads `red-blue.webm`
   this way, after limend refuses a socket in its place: 24/24 checks pass in the VM. limen's
   daemon tests (11) pass on Linux and FreeBSD.
-- Not in M5: `Load` of a URL gives `NETWORK`, because there is no jailed fetcher yet. The controls
+- Not in M5: the controls
   have no time text, because text waits for Pergola's in-app shaping. They are drawn
   directly, not with Pergola widgets, because a Pergola window can't hold a video layer
   yet. There is one source per embed; a new `src` is a new embed.
@@ -283,9 +284,10 @@ Fresco's layers land.
   back. A SeekHead that points past the end or at anything but Cues is ignored. Seeks start
   sound 80 ms before the target (MP4 and WebM alike). A pipe, or a file with no Cues, still
   reads again from the start and drops frames up to the target.
-- Known gaps: the stream's colour info isn't read yet, so the layer
-  keeps Fresco's default (BT.709 limited); `video_layer_color` from the decoder's colour
-  info is an M7 item.
+- M7, colour: the bitstream's and the container's colour descriptions go to
+  `video_layer_color` (09a0787); unsaid fields are guessed (BT.601 below 720 lines). M7,
+  streaming seeks (ff5ca7d): a feed seek waits for its segment however long it takes, and
+  the page is told `Waiting`.
 
 **Tests along the way:**
 - every demuxer limit has a test with a crafted file that exceeds it;

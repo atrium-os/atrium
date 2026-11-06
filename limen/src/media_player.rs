@@ -16,9 +16,8 @@ pub const TRACKS_MAX: u8 = 8;
 pub const APPEND_MAX: usize = 60 * 1024;
 /// Most buffered ranges in one `Buffered`.
 pub const RANGES_MAX: usize = 64;
-/// Longest MIME type, URL and `CanPlay` query.
+/// Longest MIME type and `CanPlay` query.
 pub const MIME_MAX: usize = 256;
-pub const URL_MAX: usize = 4096;
 /// The player's buffer cap per feed (bytes), unless its jail allows less.
 pub const FEED_BYTES_MAX: u64 = 150_000_000;
 /// Most `Time` events a second.
@@ -31,10 +30,10 @@ pub const HEIGHT_MAX: u32 = 4320;
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum Source {
     /// A file descriptor that limend passes with this message (a file, or a
-    /// Tabula-style blob the parent uploaded).
+    /// Tabula-style blob the parent uploaded). There is no URL source: the
+    /// player's jail has no network, and the parent fetches (Shankar,
+    /// 2026-11-06), passing a descriptor or feeding segments.
     Fd,
-    /// A URL the player fetches through its own jailed fetcher.
-    Url(String),
 }
 
 /// Parent to child.
@@ -105,11 +104,7 @@ impl ToChild {
         let m: Self = postcard::from_bytes(b).ok()?;
         let ok = match &m {
             ToChild::Load { source, mime } => {
-                clean_text(mime, MIME_MAX)
-                    && match source {
-                        Source::Fd => true,
-                        Source::Url(u) => clean_text(u, URL_MAX),
-                    }
+                clean_text(mime, MIME_MAX) && matches!(source, Source::Fd)
             }
             ToChild::OpenSource | ToChild::Play | ToChild::Pause | ToChild::Stop => true,
             ToChild::AddTrack { track, mime } => *track < TRACKS_MAX && clean_text(mime, MIME_MAX),
@@ -172,7 +167,6 @@ mod tests {
     fn round_trips() {
         let to_child = [
             ToChild::Load { source: Source::Fd, mime: "video/webm".into() },
-            ToChild::Load { source: Source::Url("https://example.org/a.webm".into()), mime: "video/webm".into() },
             ToChild::OpenSource,
             ToChild::AddTrack { track: 0, mime: "video/webm; codecs=\"vp9\"".into() },
             ToChild::Append { track: 0, bytes: vec![1, 2, 3], timestamp_offset: Some(-2.5) },
@@ -213,7 +207,7 @@ mod tests {
             ToChild::SetVolume { volume: 1.5 },
             ToChild::SetRate { rate: 0.1 },
             ToChild::CanPlay { mime: "a".repeat(MIME_MAX + 1) },
-            ToChild::Load { source: Source::Url("a\nb".into()), mime: "video/mp4".into() },
+            ToChild::Load { source: Source::Fd, mime: "video/\nmp4".into() },
         ];
         for m in bad_child {
             assert_eq!(ToChild::decode(&m.encode()), None, "{m:?}");

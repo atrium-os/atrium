@@ -327,8 +327,6 @@ impl<H: Host> App<H> {
             // A `Load` of a descriptor comes as HostEvent::Load; without one
             // it is out of place.
             ToChild::Load { source: LoadSource::Fd, .. } => self.host.emit(ToParent::Error { code: code::STATE }),
-            // No jailed fetcher in the player yet.
-            ToChild::Load { source: LoadSource::Url(_), .. } => self.host.emit(ToParent::Error { code: code::NETWORK }),
             ToChild::OpenSource => self.start(Source::Feed(Vec::new()))?,
             ToChild::AddTrack { track, mime } => {
                 if !atrium_media_demux::mime_supported(&mime) {

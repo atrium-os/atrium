@@ -161,9 +161,10 @@ controls. Because decoders are the riskiest code in media playback, they live on
 
 There are two ways to feed it.
 
-- **A whole resource** (`Load`): a file, or a URL the player fetches through its own jailed
-  fetcher. The Navigator's document lane uses this for a plain video file (one URL), and no
-  engine runs at all.
+- **A whole resource** (`Load`): a file descriptor. The player's jail has no network
+  (Shankar, 2026-11-06): for a plain video file at a URL, the Navigator fetches it and passes a
+  descriptor, or feeds it as segments, so its cookies, CORS and LAN filter apply in one place.
+  No engine runs at all.
 - **A segment feed**, shaped like Media Source Extensions (MSE). The parent fetches the
   segments and the player decodes them. This lets a tier-4 engine run a site's player script,
   which is what YouTube needs to produce its stream URLs and tokens (legacy-web §8.1),
@@ -172,7 +173,7 @@ There are two ways to feed it.
 
 | direction | message | payload |
 |---|---|---|
-| parent → child | `Load` | `source` (`Fd`: a descriptor passed with the message, see below; or `Url`, which the player fetches through its own jailed fetcher), `mime` |
+| parent → child | `Load` | `source` (`Fd`: a descriptor passed with the message, see below; there is no URL source), `mime` |
 | parent → child | `OpenSource` | none: begins a segment feed |
 | parent → child | `AddTrack` | `track: u8` (at most 8), `mime` (an MSE type such as `video/webm; codecs="av01.0.08M.08"`) |
 | parent → child | `Append` | `track`, `bytes` (at most 60 KiB a message, inside limend's 64 KiB message cap; a parent splits a segment into several appends), `timestamp_offset: Option<f64>` |
