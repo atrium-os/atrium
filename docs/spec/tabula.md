@@ -7,6 +7,23 @@ Pergola thread builds `tabulad`, `praecod`, the Pergola clients and widgets, For
 history, and the share sheet; the Fresco thread builds frescod's half: activation tokens (§2),
 cross-window drag routing (§4), and the notification layer (§5).
 
+## 0. One substrate, three services (asked by the user, 2026-11-06)
+
+Clipboard, app-to-app transfer (drag, share) and notifications stay **three services**, because
+their trust differs: Tabula holds content the user copied, the share broker routes it to an app
+the user picked, and Praeco only displays. Merging them would put a display path next to
+clipboard contents. What they share is unified instead, so each piece exists once:
+
+| shared piece | one implementation | used by |
+|---|---|---|
+| Envelope, identity, capability | Aqueduct envelope; caller = socket peer uid (Portcullis's per-app uid); reachability = manifest `clipboard` / `notify` / `share` | all three |
+| **Proof of a user gesture** | frescod's activation tokens (§2), consumable by an allowlist of brokers | Tabula (copy, paste, drop), the share broker (share), Praeco (a click on a notification's action), later Scrinium and Arca |
+| **A typed item** | one `Offer`: up to 16 `(mime, blob)` formats, blobs in the CAS with proven possession (aqueduct.md §6.6) | clipboard entry, drag payload, shared item, notification image |
+| **Delivery to an app**, launching it if needed | `CLASS_BROKER` (4) on the app's broker connection; Portcullis launches a stopped app | a share arriving, a notification action, a Tabellarius push |
+
+So the share broker is Tabula's offer store plus a chooser drawn by Forum (trusted UI): a share
+is a drop whose target the user picked in the chooser, and it spends the same tokens.
+
 ## 1. The rule
 
 An app touches the clipboard only on a real user gesture in one of its own windows. Copy, cut,
@@ -22,10 +39,13 @@ Identity is the client's **uid**: Portcullis runs each app under a dedicated uid
 
 ### 2.1 Minting
 
-frescod mints a token for **every key press and pointer-button press it delivers to a window**,
-not only for Ctrl-V: an app's own Edit menu, a Paste button or a right-click "Paste" are clicks
-frescod cannot interpret, so every press is a possible gesture (like the web's transient user
-activation). The token travels with the event:
+frescod mints a token for **every pointer-button press and every key press it delivers to a
+window**: an app's own Edit menu, a Paste button or a right-click "Paste" are clicks frescod
+cannot interpret, so a press is the gesture (like the web's transient user activation). Each
+token records what the press was, and §2.2 limits what a key press may be spent on, so ordinary
+typing never authorises a paste. Input that did not come from a local or Stoa-remote device (a
+test client, an accessibility tool replaying input) mints no token. The token travels with the
+event:
 
 ```rust
 // fresco-protocol: added to InputKeyEvent (pressed = true) and InputPointerButtonEvent (pressed = true).
@@ -38,7 +58,7 @@ frescod keeps, per live token:
 |---|---|
 | `token` | the 16 random bytes (the table key) |
 | `window_id`, `uid` | the window the event went to and its client's uid |
-| `kind` | `PRESS` (minted on input) or `DROP` (§4) |
+| `kind` | `BUTTON`, `KEY` (with the HID usage and modifiers), `DROP` (§4), or `GRANTED` (minted by trusted UI for an app, §2.4) |
 | `minted` | monotonic ns |
 | `counter` | per-frescod sequence number, for logs |
 
@@ -56,8 +76,27 @@ ActivationConsume { token: [u8; 16], presenter_uid: u32, purpose: u8 /* COPY | P
 ```
 
 It succeeds once. It fails when the token is unknown, already consumed, older than 1 s, minted
-for a different uid than `presenter_uid`, or of the wrong kind for the purpose (`DROP` tokens only
-for `DROP`; `PRESS` tokens for the rest). On success frescod removes it.
+for a different uid than `presenter_uid`, its window is no longer the focused one (a background
+window cannot spend a token), or its kind does not fit the purpose:
+
+| purpose | accepted kinds |
+|---|---|
+| `PASTE` | `BUTTON`; `KEY` only for the paste chords (Ctrl/Cmd-V, Shift-Insert); `GRANTED` for paste |
+| `COPY` | `BUTTON`; `KEY` only with Ctrl/Cmd/Alt or Enter (Ctrl-C/X, menu accelerators) |
+| `DROP` | `DROP` with a matching `drag_id` |
+| `DRAG`, `SHARE`, `ACTION` | `BUTTON` (and `GRANTED` for `ACTION`) |
+
+On success frescod removes it. The allowlist of callers is fixed in frescod's config: `_tabula`,
+the share broker, `_praeco`; nothing else may consume. The channel is a frescod socket only
+those uids can reach (Portcullis mounts it into their jails), checked again by peer uid.
+
+### 2.4 Tokens granted by trusted UI
+
+A click inside trusted UI on behalf of an app is a gesture for that app: the user clicked a
+notification's "Reply", or picked an app in the share chooser. Forum, which drew the button,
+asks frescod `ACTIVATION_GRANT { for_uid, purpose }` for the press it just received; frescod
+checks that the press it is spending was in a Forum window and mints a `GRANTED` token bound to
+`for_uid`. Only Forum's uid may grant.
 
 ### 2.3 What this buys
 
@@ -65,8 +104,9 @@ for `DROP`; `PRESS` tokens for the rest). On success frescod removes it.
 - A token sent to another app fails the uid check.
 - A replayed token fails: one use.
 - An app holding focus but idle cannot read anything: no press, no token.
-- Not covered, stated: an app can spend a token from an unrelated press (a click on its "Next"
-  button) on a paste. The press was real and in its window, so this is the web's activation
+- Typing does not authorise a paste or a copy: only the chords in §2.2 do.
+- Not covered, stated: an app can spend a click on an unrelated button (its "Next") on a paste.
+  The click was real, in its focused window, within a second, so this is the web's activation
   model, not a per-command proof. Narrowing it needs frescod to know command semantics (a
   system Edit menu); deferred.
 
@@ -93,6 +133,25 @@ Reachable by apps whose manifest says `clipboard = true` (portcullis.md). Payloa
   mode") is kept out of other apps' reach until the user pastes it there.
 - Tabula's own policy (per-jail scoping, audit) lives in `tabulad`, not in the wire.
 
+### 3.1 Security of the store
+
+- **Tabula never parses content.** Blobs are stored and handed out as bytes; there is no format
+  conversion in `tabulad` (an HTML-to-text conversion would parse attacker HTML in a trusted
+  service). An app that wants another format asks for it and converts in its own jail; pasted
+  HTML in `DocumentView` goes through the Navigator's normalizer in its jail, as any untrusted
+  document does (pergola.md §10.2). The receiving app treats every paste as hostile input.
+- **Proven possession.** `SET` uploads the bytes; it may not name a CAS hash it has not sent, or
+  an app could probe whether content exists on the machine (aqueduct.md §6.6).
+- **Limits.** Per entry 256 MiB and 16 formats, mime names ≤ 127 bytes of `[a-z0-9.+/-]`; per app
+  one live entry and one pending drag; `tabulad` runs in its own jail as `_tabula` with no
+  network.
+- **Sensitive entries.** `SET` may mark an entry `sensitive` (Arca does, for a copied password):
+  it is cleared after 60 s, never kept in history, and `OFFERS` shows it as `text/plain` only.
+- **Privacy mode.** A jail marked private (aqueduct.md §6.5) gets its own clipboard; its copies
+  reach another app only through a paste the user makes there with that jail's entry offered
+  explicitly. Deferred past v1.
+- **Audit.** `tabulad` logs who copied and who pasted (uids and times, never contents).
+
 ## 4. Drag and drop
 
 1. The source app gets a press, starts a drag and calls Tabula `DRAG_BEGIN(token, formats)`,
@@ -115,6 +174,16 @@ A drop nobody consumes within 1 s, or a cancelled drag, frees the payload.
   Tabellarius delivers remote pushes into it.
 - Forum draws toasts and history as a Pergola app in the trusted shell. The posting app never
   draws its own notification.
+- **Against spoofing**: the app's name and icon come from its signed manifest, not from the
+  post; title and body are plain text (no markup, no links), length-capped (64 / 512 bytes);
+  images go through the Offer path and are drawn as images, never parsed as documents.
+- **Against flooding**: a per-app rate limit (5 a minute, bursts of 3) and a queue cap; the user
+  can mute an app from the toast.
+- **Privacy**: on the lock screen (Vestibulum) only the app name shows, unless the user allows
+  more per app.
+- **Actions**: clicking an action is a `GRANTED` token (§2.4) delivered to the app over
+  `CLASS_BROKER`; Portcullis launches the app if it is not running. A notification cannot run
+  anything by itself.
 - frescod keeps a **notification layer** above every app window, drawable only by the
   Forum/Praeco role and clamped to a screen band, as for the origin strip (Fresco thread).
 
