@@ -138,16 +138,70 @@ clipboard, on the user's Ctrl-C in the child (tabula.md).
 
 ### 2.2 `media-player`
 
+Plays audio and video in a jailed native player. The parent never handles decoded frames:
+the player demuxes, decodes, presents to frescod in its own window, and draws its own
+controls. Because decoders are the riskiest code in media playback, they live only here.
+
+There are two ways to feed it.
+
+- **A whole resource** (`Load`): a file, or a URL the player fetches through its own jailed
+  fetcher. The Navigator's document lane uses this for a plain video file (one URL), and no
+  engine runs at all.
+- **A segment feed**, shaped like Media Source Extensions (MSE). The parent fetches the
+  segments and the player decodes them. This lets a tier-4 engine run a site's player script,
+  which is what YouTube needs to produce its stream URLs and tokens (legacy-web §8.1),
+  while the engine's `<video>` and `MediaSource` are only a front end to this role. The
+  engine appends bytes it fetched and never sees a frame.
+
 | direction | message | payload |
 |---|---|---|
 | parent → child | `Load` | `media: DocRef`, `mime` |
+| parent → child | `OpenSource` | none: begins a segment feed |
+| parent → child | `AddTrack` | `track: u8` (at most 8), `mime` (an MSE type such as `video/webm; codecs="av01.0.08M.08"`) |
+| parent → child | `Append` | `track`, `bytes` (at most 1 MiB a message), `timestamp_offset: Option<f64>` |
+| parent → child | `Remove` | `track`, `start`, `end` (seconds) |
+| parent → child | `Abort` | `track`: drop a half-parsed segment |
+| parent → child | `EndOfStream` | `error: Option<u8>` |
+| parent → child | `SetDuration` | `secs: f64` |
 | parent → child | `Play`, `Pause`, `Stop` | none |
 | parent → child | `Seek` | `secs: f64` |
 | parent → child | `SetVolume` | `volume: f32` (0 to 1) |
-| child → parent | `Ready` | `duration_secs: f64` |
+| parent → child | `SetRate` | `rate: f32` (0.25 to 4) |
+| child → parent | `Ready` | `duration_secs: f64`, `width`, `height` |
+| child → parent | `CanPlay` | `type: String` reply to `CanPlay` asks, for `MediaSource.isTypeSupported` |
+| child → parent | `Buffered` | `track`, `ranges: Vec<(f64, f64)>` (at most 64), after each append or remove |
+| child → parent | `Appended` | `track`: the append is parsed, so the next may go (`updateend`) |
 | child → parent | `Time` | `secs: f64`, at most 4 a second |
+| child → parent | `Waiting` | `secs: f64`: playback reached the end of what is buffered |
+| child → parent | `Seeking` | `secs: f64`: the user seeked in the native controls; the parent fetches from there |
 | child → parent | `Ended` | none |
-| child → parent | `Error` | `code: u16` |
+| child → parent | `Error` | `code: u16` (`DECODE`, `UNSUPPORTED`, `TOO_BIG`) |
+
+**Limits and back-pressure.** One `Append` is in flight per track: the next waits for
+`Appended`. The player keeps at most 150 MB buffered per feed, or its jail's memory limit if
+that is lower. Over that it answers `Error { TOO_BIG }`, which the engine reports to the
+page as MSE's `QuotaExceededError`. The page then removes what it has played, as it does in
+any browser.
+
+**What the parent learns.** Only `Buffered`, `Time` and the state events, which are what MSE
+and the video element already expose to the page. It gets no frames, no frame timing beyond
+`Time`, and no decoded audio. Those are the same facts a page can read in any browser, so
+running the player out of process adds no new channel.
+
+**Codecs** are royalty-free: dav1d for AV1, libvpx for VP9, and Opus and Vorbis for audio.
+OpenH264 is used for H.264 (as Firefox does), and AAC is decoded with a free decoder where
+it is legally available. Hardware decode, when the GPU stack has it, goes here and nowhere
+else.
+
+**DRM.** A content decryption module (CDM) runs below the player, in its own jail under
+Linux ABI emulation with no network (legacy-web §8.1). The player passes it encrypted
+samples and gets frames back. The engine relays licence messages without seeing a key.
+Messages for this (`LicenceRequest`, `LicenceResponse`) are added when a CDM is.
+
+**One player, many hosts.** The Navigator, a mail app showing an attached video, and a
+podcast app all embed the same role. So picture-in-picture, background audio, the
+media keys and the lock-screen controls are built once, in the player, and work the same for
+all of them.
 
 ### 2.3 `picker`
 

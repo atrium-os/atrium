@@ -2385,6 +2385,23 @@ MSE in the engine and royalty-free decoders (dav1d for AV1, libvpx for VP9; Open
 H.264, as Firefox does). Chapter links seek through the typed channel. No CDM is involved:
 ordinary YouTube videos are not DRM-encrypted.
 
+**Playback is native: the engine is the front end, the player is Limen's (2026-11-06).**
+YouTube's player script still has to run, because it produces the stream URLs, deciphers
+their signatures, and computes the throttling parameter and anti-bot tokens. It changes
+often, and reimplementing it would break YouTube's terms. But the island's engine does not
+decode. Its `<video>` and `MediaSource` are backed by a Limen `media-player` embed
+([limen.md](limen.md) §2.2). The engine fetches segments under §5.4.1c's rules and appends
+their bytes, and the native player demuxes, decodes, presents and draws the controls in its
+own jail and window. This has three effects:
+
+- The decoders (dav1d, libvpx, OpenH264, the audio decoders), the riskiest code in media,
+  run outside the engine's jail, so a decoder exploit doesn't reach the page's session.
+- The engine never holds a decoded frame, and the CDM sits below the player, not the engine.
+- Picture-in-picture, background audio, media keys and hardware decode are built once.
+
+A page whose video is a plain file needs no engine: the document lane embeds the player with
+`Load` and the URL, and no script runs.
+
 ## 9. Honest costs
 
 - A full engine port (Servo → Fresco scene graph, jailed, brokered network) is the largest
