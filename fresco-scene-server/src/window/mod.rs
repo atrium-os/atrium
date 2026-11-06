@@ -113,6 +113,8 @@ pub struct Slot {
     pub parent: WindowId,
     pub rect: [f32; 4],
     pub kind: u8,
+    /// Stacking among the parent's slots (`SlotBind::z`).
+    pub z: u8,
 }
 
 /// A 16-byte token from the kernel's CSPRNG.
@@ -1183,7 +1185,7 @@ impl Compositor {
     /// Make `child` a credential slot at `rect` in `parent` (`None`:
     /// release it): the window-management stand-in for limend.
     pub fn bind_credential(&mut self, child: WindowId, parent: WindowId, rect: Option<[f32; 4]>) -> bool {
-        self.bind_slot(child, parent, fresco_protocol::slot::kind::CREDENTIAL, rect).is_ok()
+        self.bind_slot(child, parent, fresco_protocol::slot::kind::CREDENTIAL, rect, 0).is_ok()
     }
 
     /// The window `token` names, if any lives.
@@ -1195,12 +1197,14 @@ impl Compositor {
     }
 
     /// Make `child` a slot of `kind` at `rect` in `parent`, shown right
-    /// above it; `None` releases it and hides `child` again. Refused
+    /// above it (with the parent's other slots in `z` order, see
+    /// [`Compositor::place_slots`]); `None` releases it and hides `child`
+    /// again. Refused
     /// (a `fresco_protocol::slot::refusal`) for an unknown window, the
     /// same window twice, a parent that is a slot itself, a child that
     /// hosts slots, is a notification or sits in another parent, or a
     /// bad kind or rect.
-    pub fn bind_slot(&mut self, child: WindowId, parent: WindowId, kind: u8, rect: Option<[f32; 4]>) -> Result<(), u8> {
+    pub fn bind_slot(&mut self, child: WindowId, parent: WindowId, kind: u8, rect: Option<[f32; 4]>, z: u8) -> Result<(), u8> {
         use fresco_protocol::slot::{kind as k, refusal};
         if child == 0 || parent == 0 || !self.windows.contains_key(&child) || !self.windows.contains_key(&parent) {
             return Err(refusal::UNKNOWN_WINDOW);
@@ -1219,7 +1223,7 @@ impl Compositor {
         match rect {
             Some(rect) => {
                 let w = self.windows.get_mut(&child).unwrap();
-                w.slot = Some(Slot { parent, rect, kind });
+                w.slot = Some(Slot { parent, rect, kind, z });
                 w.hidden = false;
                 self.place_slots();
             }
@@ -1254,11 +1258,16 @@ impl Compositor {
 
     /// Put each slot where its parent says, at its size clipped to the
     /// parent, right above its parent (so the parent cannot draw over
-    /// it). A slot whose parent is off screen, or that the parent's edge
-    /// clips away entirely, is off screen too.
+    /// it). A parent's slots stack plain below credential, then by `z`,
+    /// then by window id. A slot whose parent is off screen, or that the
+    /// parent's edge clips away entirely, is off screen too.
     pub fn place_slots(&mut self) {
-        let slots: Vec<(WindowId, Slot)> =
+        let mut slots: Vec<(WindowId, Slot)> =
             self.windows.iter().filter_map(|(&id, w)| w.slot.map(|c| (id, c))).collect();
+        /* Each goes in right above its parent, under those placed before
+         * it: the topmost first. */
+        let rank = |id: WindowId, c: &Slot| (c.kind == fresco_protocol::slot::kind::CREDENTIAL, c.z, id);
+        slots.sort_by(|a, b| rank(b.0, &b.1).cmp(&rank(a.0, &a.1)));
         for (id, c) in slots {
             let Some((ppos, psize)) = self.windows.get(&c.parent).map(|p| (p.pos, p.size)) else {
                 self.windows.get_mut(&id).unwrap().slot = None;
@@ -1292,6 +1301,7 @@ impl Compositor {
         self.z_order.retain(|&w| w != id);
         self.z_order.push(id);
         self.layer_notifications();
+        self.place_slots(); // its slots come up with it
         let prev = self.focus;
         self.focus = Some(id);
         if prev == Some(id) {
@@ -1679,20 +1689,52 @@ mod notification_tests {
         assert_eq!(c.window_by_token(&c.windows[&e].embed_token), Some(e));
         assert_eq!(c.window_by_token(&[0; 16]), None);
 
-        assert_eq!(c.bind_slot(e, p, kind::PLAIN, Some([350.0, 10.0, 100.0, 40.0])), Ok(()));
+        assert_eq!(c.bind_slot(e, p, kind::PLAIN, Some([350.0, 10.0, 100.0, 40.0]), 0), Ok(()));
         let at = c.z_order.iter().position(|&w| w == p).unwrap();
         assert_eq!(c.z_order[at + 1], e, "right above its parent");
         assert_eq!(c.windows[&e].size, (50.0, 40.0), "clipped to the parent's edge");
-        assert_eq!(c.bind_slot(e, other, kind::PLAIN, Some([0.0, 0.0, 10.0, 10.0])), Err(refusal::INVALID), "already in another parent");
-        assert_eq!(c.bind_slot(e, p, 9, Some([0.0, 0.0, 10.0, 10.0])), Err(refusal::INVALID));
-        assert_eq!(c.bind_slot(p, e, kind::PLAIN, Some([0.0, 0.0, 10.0, 10.0])), Err(refusal::INVALID), "a host can't be a slot");
-        assert_eq!(c.bind_slot(e, 999, kind::PLAIN, None), Err(refusal::UNKNOWN_WINDOW));
+        assert_eq!(c.bind_slot(e, other, kind::PLAIN, Some([0.0, 0.0, 10.0, 10.0]), 0), Err(refusal::INVALID), "already in another parent");
+        assert_eq!(c.bind_slot(e, p, 9, Some([0.0, 0.0, 10.0, 10.0]), 0), Err(refusal::INVALID));
+        assert_eq!(c.bind_slot(p, e, kind::PLAIN, Some([0.0, 0.0, 10.0, 10.0]), 0), Err(refusal::INVALID), "a host can't be a slot");
+        assert_eq!(c.bind_slot(e, 999, kind::PLAIN, None, 0), Err(refusal::UNKNOWN_WINDOW));
 
-        assert_eq!(c.bind_slot(e, p, kind::PLAIN, None), Ok(()));
+        assert_eq!(c.bind_slot(e, p, kind::PLAIN, None, 0), Ok(()));
         assert!(c.windows[&e].hidden && !c.z_order.contains(&e), "released: hidden again");
-        assert_eq!(c.bind_slot(e, p, kind::CREDENTIAL, Some([10.0, 10.0, 200.0, 40.0])), Ok(()));
+        assert_eq!(c.bind_slot(e, p, kind::CREDENTIAL, Some([10.0, 10.0, 200.0, 40.0]), 0), Ok(()));
         assert!(c.z_order.contains(&e));
         assert!(c.destroy(p, 1));
         assert!(c.windows[&e].slot.is_none() && !c.z_order.contains(&e), "its parent went: released and hidden");
+    }
+
+    #[test]
+    fn overlapping_slots_stack_by_z_with_credentials_on_top() {
+        use fresco_protocol::slot::kind;
+        let mut c = Compositor::new();
+        let p = c.create(1, (800, 600));
+        let [doc, video, cred, over] = [2, 3, 4, 5].map(|o| {
+            let w = c.create(o, (10, 10));
+            c.hide(w);
+            w
+        });
+        let r = Some([0.0, 0.0, 400.0, 300.0]);
+        assert_eq!(c.bind_slot(cred, p, kind::CREDENTIAL, r, 0), Ok(()));
+        assert_eq!(c.bind_slot(video, p, kind::PLAIN, r, 2), Ok(()));
+        assert_eq!(c.bind_slot(doc, p, kind::PLAIN, r, 1), Ok(()));
+        let above = |c: &Compositor| {
+            let at = c.z_order.iter().position(|&w| w == p).unwrap();
+            c.z_order[at + 1..].to_vec()
+        };
+        assert_eq!(above(&c), vec![doc, video, cred], "z 1 under z 2, the credential slot on top");
+        // Moving a slot (a rebind at another rect) keeps the stacking.
+        assert_eq!(c.bind_slot(doc, p, kind::PLAIN, Some([0.0, 50.0, 400.0, 300.0]), 1), Ok(()));
+        assert_eq!(above(&c), vec![doc, video, cred]);
+        // Equal z: by window, whatever the bind order.
+        assert_eq!(c.bind_slot(over, p, kind::PLAIN, r, 2), Ok(()));
+        assert_eq!(above(&c), vec![doc, video, over, cred]);
+        // The parent raised: its slots come with it, in order.
+        let other = c.create(6, (100, 100));
+        c.raise(p);
+        assert_eq!(above(&c), vec![doc, video, over, cred]);
+        assert!(c.z_order.iter().position(|&w| w == other).unwrap() < c.z_order.iter().position(|&w| w == p).unwrap());
     }
 }

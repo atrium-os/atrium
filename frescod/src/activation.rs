@@ -279,7 +279,7 @@ pub fn bind_slot(comp: &Mutex<fresco_scene_server::window::Compositor>, b: &fres
         let (Some(parent), Some(child)) = (c.window_by_token(&b.parent), c.window_by_token(&b.child)) else {
             return SlotBindResult::Refused { reason: refusal::UNKNOWN_WINDOW };
         };
-        c.bind_slot(child, parent, b.kind, b.rect).map(|_| (parent, child))
+        c.bind_slot(child, parent, b.kind, b.rect, b.z).map(|_| (parent, child))
     };
     match r {
         Ok((parent, child)) => SlotBindResult::Ok {

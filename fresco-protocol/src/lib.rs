@@ -1798,6 +1798,10 @@ pub mod slot {
         /// `[x, y, w, h]` in the parent's surface pixels; `None` releases
         /// the slot and hides the child again.
         pub rect: Option<[f32; 4]>,
+        /// Stacking among the parent's slots: a higher `z` sits above a
+        /// lower one where they overlap, ties go by window (stable), and a
+        /// credential slot sits above every plain one whatever its `z`.
+        pub z: u8,
     }
 
     #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

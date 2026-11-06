@@ -47,7 +47,8 @@ impl Compositor for Frescod {
             SlotKind::Plain => slot::kind::PLAIN,
             SlotKind::Credential => slot::kind::CREDENTIAL,
         };
-        match self.ask(&SlotBind { parent, child, kind, rect }) {
+        /* Stacking among siblings (z) is not plumbed through limen yet. */
+        match self.ask(&SlotBind { parent, child, kind, rect, z: 0 }) {
             Ok(SlotBindResult::Ok { parent_uid, child_uid }) => Ok((parent_uid, child_uid)),
             Ok(SlotBindResult::Refused { reason }) => Err(reason),
             Err(e) => {

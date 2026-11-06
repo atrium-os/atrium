@@ -349,7 +349,7 @@ fn main() {
         _ => [0; 16],
     };
     let slot_bind = |p: &mut Probe, parent: [u8; 16], child: [u8; 16], kind: u8, rect: Option<[f32; 4]>| -> SlotBindResult {
-        let b = fresco_protocol::encode(&SlotBind { parent, child, kind, rect }).unwrap();
+        let b = fresco_protocol::encode(&SlotBind { parent, child, kind, rect, z: 0 }).unwrap();
         fresco_protocol::decode(&p.ask(sop::BIND, b)).unwrap()
     };
     // Whether a click at (x, y) reaches `c`'s window (tried for 2 s).
