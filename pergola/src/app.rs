@@ -61,6 +61,10 @@ pub struct App<V: View> {
     /// Some `on_frame` handler still needs frames.
     animating: bool,
     pub theme: Semantic,
+    /// Embed slots as last placed, and what changed since the binder last
+    /// asked ([`crate::slot`]).
+    slots: std::collections::HashMap<crate::slot::SlotKey, crate::geom::Rect>,
+    slot_changes: Vec<(crate::slot::SlotKey, Option<crate::geom::Rect>)>,
 }
 
 impl<V: View> App<V> {
@@ -96,6 +100,8 @@ impl<V: View> App<V> {
             modifiers: Default::default(),
             animating: false,
             theme: Semantic::LIGHT,
+            slots: Default::default(),
+            slot_changes: Vec::new(),
         }
     }
 
@@ -213,7 +219,38 @@ impl<V: View> App<V> {
         };
         self.prev_tree = next;
         self.interactions = interactions;
+        self.place_slots();
         deltas
+    }
+
+    /// Diff the slots' window rects against the last placement.
+    fn place_slots(&mut self) {
+        let mut now = std::collections::HashMap::new();
+        for (id, h) in &self.interactions.by_node {
+            if let Some(key) = h.slot {
+                if let Some(r) = crate::slot::window_rect(&self.prev_tree, *id) {
+                    now.insert(key, r);
+                }
+            }
+        }
+        for (k, r) in &now {
+            if self.slots.get(k) != Some(r) {
+                self.slot_changes.push((*k, Some(*r)));
+            }
+        }
+        for k in self.slots.keys() {
+            if !now.contains_key(k) {
+                self.slot_changes.push((*k, None));
+            }
+        }
+        self.slots = now;
+    }
+
+    /// Slot placements since the last call: `Some(rect)` in window
+    /// coordinates (logical px) to place or move, `None` to release. The
+    /// `Window` hands these to its slot binder.
+    pub fn take_slot_changes(&mut self) -> Vec<(crate::slot::SlotKey, Option<crate::geom::Rect>)> {
+        std::mem::take(&mut self.slot_changes)
     }
 
     /// The node currently receiving keyboard input, if any.

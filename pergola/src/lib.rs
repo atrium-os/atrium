@@ -34,6 +34,7 @@ pub mod layout;
 pub mod node;
 pub mod reactive;
 pub mod scroll;
+pub mod slot;
 pub mod surface;
 pub mod text;
 pub mod theme;

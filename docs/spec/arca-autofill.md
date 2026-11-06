@@ -150,8 +150,25 @@ that is fit to fill on this frame. No app, and not Arca either, can draw that fr
   out of its window. It also checks that a slot that is still and clear fills, both before and
   after the covers go.
 
-Not yet built: frames in direct mode, where there is no chrome, and Limen's own role and
-messages (§9 step 2).
+Not yet built: frames in direct mode, where there is no chrome.
+
+### 8.1 As built: the role messages and Pergola (2026-11-06, §9 steps 2 and 3)
+
+- **`limen/`** (new crate) holds `limen::credential`: `Purpose`, `ToChild::Configure`, and
+  `ToParent::{Filled, Handle, Cleared}`. `ToParent::decode` refuses a username over 256 bytes
+  or one with control characters. The broker itself (launching the child, carrying messages)
+  is not built.
+- **`pergola::slot`**: `Ctx::slot(id, key)` marks a node as an embed slot. After each layout the
+  `App` works out its window rect (through scroll views) and queues a change when it moved;
+  `Window::paint` hands changes to a `SlotBinder` after the present, in surface pixels. A slot
+  that a scroll view clips even partly is released until it is whole again, so a field being
+  scrolled can't be filled (each move restarts frescod's 500 ms anyway).
+- **`CredentialField`** (`password`, `new_password`, `one_time_code`, optional
+  `username_field`) reserves at least 120x24, is not focusable and has no key handler, and keeps
+  only `CredentialState { filled, handle }`. `configure()` gives the binder the `Configure`
+  message; `apply(ToParent)` takes the child's.
+- **Not built**: a binder. The stand-in would send `wm_credential_slot`, which needs the WM
+  socket, so it belongs to Limen's broker, not to the app.
 
 ## 5. What the user sees
 

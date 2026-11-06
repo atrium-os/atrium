@@ -59,6 +59,10 @@ pub struct Handlers {
     pub on_frame: Option<FrameHandler>,
     /// A drop from another window landed on this node (tabula.md §4).
     pub on_drop: Option<ClickHandler>,
+    /// This node is where another process's surface is embedded (a Limen
+    /// slot, e.g. Arca's credential field): the App reports its window
+    /// rect to the binder whenever it changes ([`crate::slot`]).
+    pub slot: Option<crate::slot::SlotKey>,
 }
 
 impl Handlers {

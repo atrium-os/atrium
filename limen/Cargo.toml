@@ -1,0 +1,11 @@
+[package]
+name        = "limen"
+version     = "0.1.0"
+edition     = "2021"
+license     = "MIT OR Apache-2.0"
+description = "Limen, the cross-jail embed broker (docs/spec/limen.md): role message types. The broker itself is not built yet."
+publish     = false
+
+[dependencies]
+serde    = { version = "1", features = ["derive"] }
+postcard = { version = "1", features = ["use-std"] }

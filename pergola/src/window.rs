@@ -63,6 +63,8 @@ pub struct Window {
     epoch: std::time::Instant,
     pub width: f32,
     pub height: f32,
+    /// Where slot placements go (Limen, or a test's stand-in).
+    binder: Option<Box<dyn crate::slot::SlotBinder>>,
 }
 
 /// Default socket path, overridable with `FRESCO_SOCKET`.
@@ -104,6 +106,7 @@ impl Window {
             epoch: std::time::Instant::now(),
             width: w as f32,
             height: h as f32,
+            binder: None,
         })
     }
 
@@ -123,7 +126,23 @@ impl Window {
             commit(&mut self.surface, &deltas)?;
             self.surface.present()?;
         }
+        // After the present, so a slot never sits over a frame that does
+        // not yet show the space for it.
+        let changes = app.take_slot_changes();
+        if let Some(b) = self.binder.as_mut() {
+            let (win, s) = (self.surface.window_id(), self.surface.scale);
+            for (key, rect) in changes {
+                let r = rect.map(|r| [r.x() * s, r.y() * s, r.w() * s, r.h() * s]);
+                b.place(win, key, r);
+            }
+        }
         Ok(())
+    }
+
+    /// Install the binder that embeds other processes' surfaces in this
+    /// window's slots ([`crate::slot`]).
+    pub fn set_slot_binder(&mut self, b: Box<dyn crate::slot::SlotBinder>) {
+        self.binder = Some(b);
     }
 
     /// Window lifecycle the toolkit handles itself: a resize re-lays

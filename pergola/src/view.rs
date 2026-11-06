@@ -103,6 +103,12 @@ impl<'a> Ctx<'a> {
             Some(Box::new(handler) as crate::interaction::KeyHandler);
     }
 
+    /// Mark `id` as an embed slot: its laid-out window rect goes to the
+    /// slot binder whenever it changes (see [`crate::slot`]).
+    pub fn slot(&mut self, id: NodeId, key: crate::slot::SlotKey) {
+        self.interactions.entry(id).slot = Some(key);
+    }
+
     /// Accept drops from other windows. The handler runs with the drop's
     /// token current and takes the content with `clipboard::drop_text`.
     pub fn on_drop<F: Fn() + 'static>(&mut self, id: NodeId, handler: F) {
