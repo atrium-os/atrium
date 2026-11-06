@@ -1,9 +1,16 @@
 //! ★ LIVE MEDIA EMBEDS (limen.md §2.1–2.2; fresco-video P3). A slot shows
 //! its placeholder (or poster) until it is started; a started slot is a
 //! Limen `media-player` embed for the UI's own window, bound above the
-//! doc-viewer, fed `Load` with the video's URL once attached. Native controls
-//! are the player's, so after that the Navigator relays nothing but what
-//! its own UI asks (and, for a script's video, what [`crate::mse`] maps).
+//! doc-viewer. The player's jail has no network (8ba526f): the Navigator
+//! fetches the video's file itself, through its fetcher (Nuntius, `Fd`
+//! delivery), and sends `Load { Fd }` with the read-only descriptor. Native
+//! controls are the player's, so after that the Navigator relays nothing
+//! but what its own UI asks (and, for a script's video, what [`crate::mse`]
+//! maps).
+//!
+//! `Load` goes once the file is whole: a descriptor of a file still being
+//! filled reads as ended at the fill point, and the role has no message to
+//! say "more is coming" (an open question for P1; nuntius.md §3.3).
 //!
 //! The policy (limen.md §2.1): at most [`LIVE_MAX`] live media embeds per
 //! page, and one starts only on the reader's press on its slot, or by the
@@ -18,13 +25,20 @@ use std::collections::BTreeMap;
 /// Most live media embeds per page.
 pub const LIVE_MAX: usize = 8;
 
-/// The UI's side of Limen, as the Navigator uses it: in Pergola,
-/// `pergola::embed::Embeds::request("media-player", window_token, key)`,
-/// `Embeds::send`, and dropping the slot node (or `Embeds::detach`).
+/// The UI's side of Limen and of its fetcher, as the Navigator uses them:
+/// in Pergola, `pergola::embed::Embeds::request("media-player",
+/// window_token, key)`, `Embeds::send` / `send_fd`, and dropping the slot
+/// node (or `Embeds::detach`); and a Nuntius `Open` with `Deliver::Fd`
+/// whose `Fd` and `Done` come back as [`Sessions::fetched`].
 pub trait MediaHost {
     fn request(&mut self, key: u64) -> Result<(), String>;
     fn send(&mut self, key: u64, msg: &ToChild) -> Result<(), String>;
+    /// A message with one descriptor (limend's `SEND_FD`).
+    fn send_fd(&mut self, key: u64, msg: &ToChild, fd: std::os::fd::OwnedFd) -> Result<(), String>;
     fn release(&mut self, key: u64);
+    /// Fetch `url` whole into a descriptor (Nuntius `Fd`), for `key`.
+    fn fetch(&mut self, key: u64, url: &str) -> Result<(), String>;
+    fn cancel_fetch(&mut self, key: u64);
 }
 
 /// Why a slot was not started, for the UI (the lane indicator, a tooltip).
@@ -44,7 +58,8 @@ pub enum NotStarted {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum State { Requested, Loaded, Playing, Paused, Ended, Failed }
 
-struct Live { state: State, want_play: bool, looping: bool, attached: bool, load: ToChild, muted: bool }
+struct Live { state: State, want_play: bool, looping: bool, attached: bool, load: ToChild, muted: bool,
+              file: Option<std::os::fd::OwnedFd>, fetched: bool }
 
 pub struct Sessions {
     base_url: String,
@@ -63,7 +78,7 @@ impl Sessions {
     /// started and why, for those that wanted to.
     pub fn sync(&mut self, slots: &Slots, changes: &Changes, host: &mut dyn MediaHost) -> Vec<(u64, NotStarted)> {
         for k in &changes.removed {
-            if self.live.remove(k).is_some() { host.release(*k) }
+            if self.live.remove(k).is_some() { host.cancel_fetch(*k); host.release(*k) }
         }
         let mut out = vec![];
         for k in &changes.added {
@@ -86,11 +101,11 @@ impl Sessions {
 
     fn start(&mut self, slots: &Slots, key: u64, host: &mut dyn MediaHost) -> Result<(), NotStarted> {
         let e = slots.get(key).ok_or(NotStarted::Unplayable)?;
-        let load = match &e.src {
+        let (load, url) = match &e.src {
             EmbedSource::Url { src, mime } => {
                 let url = crate::url::resolve(&self.base_url, src).ok_or(NotStarted::BadUrl)?;
                 let mime: String = mime.chars().take(limen::media_player::MIME_MAX).collect();
-                ToChild::Load { source: Source::Url(url), mime }
+                (ToChild::Load { source: Source::Fd, mime }, url)
             }
             EmbedSource::Script => return Err(NotStarted::NeedsEngine),
             EmbedSource::Unplayable => return Err(NotStarted::Unplayable),
@@ -99,19 +114,41 @@ impl Sessions {
         // (The message is checked as the player will check it.)
         if ToChild::decode(&load.encode()).is_none() { return Err(NotStarted::BadUrl) }
         if host.request(key).is_err() { return Err(NotStarted::TooMany) }
+        if host.fetch(key, &url).is_err() { host.release(key); return Err(NotStarted::BadUrl) }
         self.live.insert(key, Live { state: State::Requested, want_play: true, looping: e.flags & embed_flags::LOOP != 0,
-                                     attached: false, load, muted: e.flags & embed_flags::MUTED != 0 });
+                                     attached: false, load, muted: e.flags & embed_flags::MUTED != 0, file: None, fetched: false });
         Ok(())
     }
 
-    /// The embed for `key` is attached (Limen `Attached`): send `Load`, and
-    /// silence it first if the element is `muted`.
+    /// The fetcher's answer for `key`: the file's descriptor (Nuntius `Fd`)
+    /// and whether it is whole (`Done`), or `None` when the fetch failed
+    /// (after the fetcher's retries) — the embed is released, and a press
+    /// starts it afresh.
+    pub fn fetched(&mut self, key: u64, fd: Option<std::os::fd::OwnedFd>, done: bool, host: &mut dyn MediaHost) {
+        let Some(l) = self.live.get_mut(&key) else { return };
+        match (fd, done) {
+            (Some(f), _) => { l.file = Some(f); if done { l.fetched = true } }
+            (None, true) if l.file.is_some() => l.fetched = true,
+            _ => { self.live.remove(&key); host.release(key); return }
+        }
+        self.try_load(key, host);
+    }
+
+    fn try_load(&mut self, key: u64, host: &mut dyn MediaHost) {
+        let Some(l) = self.live.get_mut(&key) else { return };
+        if !(l.attached && l.fetched && l.state == State::Requested) { return }
+        let Some(fd) = l.file.take() else { return };
+        if host.send_fd(key, &l.load, fd).is_ok() { l.state = State::Loaded } else { l.state = State::Failed }
+    }
+
+    /// The embed for `key` is attached (Limen `Attached`): silence it first
+    /// if the element is `muted`; `Load` goes once the file is whole.
     pub fn attached(&mut self, key: u64, host: &mut dyn MediaHost) {
         let Some(l) = self.live.get_mut(&key) else { return };
         if l.attached { return }
         l.attached = true;
         if l.muted { let _ = host.send(key, &ToChild::SetVolume { volume: 0.0 }); }
-        if host.send(key, &l.load).is_ok() { l.state = State::Loaded } else { l.state = State::Failed }
+        self.try_load(key, host);
     }
 
     /// A message from the player (already checked with `ToParent::decode`).

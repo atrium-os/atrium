@@ -12,9 +12,12 @@
 //! - [`mse`]: `HTMLMediaElement` and `MediaSource` / `SourceBuffer` mapped
 //!   onto the role's segment feed, for an engine island (legacy-web §8.1),
 //!   engine-independent: an engine binds its JS objects to these.
+//! - [`feed`]: a feed the Navigator drives itself from a segment index:
+//!   what to fetch after a seek, refilling ahead, evicting far behind.
 //! - [`fake`]: a fake `media-player` child that checks the order and limits
 //!   of what it is sent. Real playback is the native player's (P1).
 pub mod fake;
+pub mod feed;
 pub mod mse;
 pub mod session;
 pub mod slots;

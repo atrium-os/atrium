@@ -1,6 +1,9 @@
 //! Resolving a media URL against the document's (RFC 3986 §5.2, the cases a
-//! document writes), for `Load { Url }`. Only `https` and `http` are given to
-//! the player; anything else is refused.
+//! document writes), for the Navigator's fetcher. Only `https` and `http`
+//! are fetched; anything else is refused.
+
+/// Longest URL handed to the fetcher.
+pub const URL_MAX: usize = 4096;
 
 /// `reference` against `base` (an absolute `http(s)` URL), fragment dropped.
 pub fn resolve(base: &str, reference: &str) -> Option<String> {
@@ -29,7 +32,7 @@ pub fn resolve(base: &str, reference: &str) -> Option<String> {
         let dir = if dir.is_empty() { "/" } else { dir };
         format!("{scheme}://{authority}{}", normalize(&format!("{dir}{r}")))
     };
-    (out.len() <= limen::media_player::URL_MAX).then_some(out)
+    (out.len() <= URL_MAX).then_some(out)
 }
 
 /// Remove `.` and `..` segments.

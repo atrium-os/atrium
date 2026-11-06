@@ -143,8 +143,8 @@ fn the_element_maps_onto_the_role() {
     let mut m = Media::new();
     let mut p = FakePlayer::new();
     assert_eq!(m.play(), Err(DomError::NotSupported), "no source yet");
-    m.load_url("https://a.test/v.webm", "video/webm").unwrap();
-    assert_eq!(m.load_url("https://a.test/w.webm", "video/webm"), Err(DomError::InvalidState), "one source per embed");
+    m.load_fd("video/webm").unwrap();
+    assert_eq!(m.load_fd("video/webm"), Err(DomError::InvalidState), "one source per embed");
     settle(&mut m, &mut p);
     assert_eq!(m.duration, 10.0);
     assert_eq!(m.size, (640, 360));
@@ -179,7 +179,7 @@ fn the_element_maps_onto_the_role() {
 #[test]
 fn player_errors_become_media_errors() {
     let mut m = Media::new();
-    m.load_url("https://a.test/v.ogv", "video/ogg").unwrap();
+    m.load_fd("video/ogg").unwrap();
     let mut p = FakePlayer::new();
     settle(&mut m, &mut p);
     assert_eq!(m.error, Some(4), "MEDIA_ERR_SRC_NOT_SUPPORTED");

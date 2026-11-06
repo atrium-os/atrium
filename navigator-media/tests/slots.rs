@@ -23,7 +23,8 @@ impl SceneSink for Ui<'_> {
 
 /// Limen as the UI sees it, with one fake player per embed.
 #[derive(Default)]
-struct Host { players: BTreeMap<u64, FakePlayer>, requested: Vec<u64>, released: Vec<u64>, refuse: bool }
+struct Host { players: BTreeMap<u64, FakePlayer>, requested: Vec<u64>, released: Vec<u64>, refuse: bool,
+              fetches: Vec<(u64, String)>, cancelled: Vec<u64>, fds: usize }
 impl MediaHost for Host {
     fn request(&mut self, key: u64) -> Result<(), String> {
         if self.refuse { return Err("refused".into()) }
@@ -35,8 +36,17 @@ impl MediaHost for Host {
         self.players.get_mut(&key).ok_or("no embed")?.receive(&msg.encode());
         Ok(())
     }
+    fn send_fd(&mut self, key: u64, msg: &ToChild, _fd: std::os::fd::OwnedFd) -> Result<(), String> {
+        self.fds += 1;
+        self.send(key, msg)
+    }
     fn release(&mut self, key: u64) { self.released.push(key); self.players.remove(&key); }
+    fn fetch(&mut self, key: u64, url: &str) -> Result<(), String> { self.fetches.push((key, url.to_string())); Ok(()) }
+    fn cancel_fetch(&mut self, key: u64) { self.cancelled.push(key) }
 }
+
+/// A descriptor as the fetcher hands one over.
+fn fd() -> std::os::fd::OwnedFd { navigator_fetch::nuntius::anon_file().unwrap().1 }
 
 fn page(videos: &[&str]) -> String {
     let mut b = String::from("<html><head><style>body { margin: 8px } p { margin: 0px 0px 8px }</style></head><body>");
@@ -100,9 +110,14 @@ fn a_press_starts_a_player_that_loads_the_resolved_url() {
     assert_eq!(s.press(&ui.slots, by_src(&EmbedSource::Unplayable), &mut host), Err(NotStarted::Unplayable));
     s.press(&ui.slots, file, &mut host).unwrap();
     assert_eq!(host.requested, vec![file]);
+    assert_eq!(host.fetches, vec![(file, "https://site.test/media/a.webm".to_string())], "the Navigator fetches the resolved URL");
     s.attached(file, &mut host);
+    s.fetched(file, Some(fd()), false, &mut host);
+    assert!(host.players[&file].received.is_empty(), "no Load until the file is whole");
+    s.fetched(file, None, true, &mut host);
+    assert_eq!(host.fds, 1);
     let p = host.players.get_mut(&file).unwrap();
-    assert_eq!(p.received, vec![ToChild::Load { source: Source::Url("https://site.test/media/a.webm".into()), mime: "video/webm".into() }]);
+    assert_eq!(p.received, vec![ToChild::Load { source: Source::Fd, mime: "video/webm".into() }], "Load with the descriptor");
     // Ready: the press asked to play.
     for m in p.deliver() { s.from_player(file, &m, &mut host) }
     let p = host.players.get_mut(&file).unwrap();
@@ -129,7 +144,9 @@ fn muted_autoplay_starts_by_itself_at_most_eight_live_and_loops() {
     assert!(!s.is_live(loud), "unmuted autoplay waits for a press");
     let k = host.requested[0];
     s.attached(k, &mut host);
+    s.fetched(k, Some(fd()), true, &mut host);
     assert_eq!(host.players[&k].received[0], ToChild::SetVolume { volume: 0.0 }, "muted before it loads");
+    assert!(matches!(host.players[&k].received[1], ToChild::Load { source: Source::Fd, .. }));
     for m in host.players.get_mut(&k).unwrap().deliver() { s.from_player(k, &m, &mut host) }
     // At the end, `loop` starts it again.
     s.from_player(k, &ToParent::Ended, &mut host);
@@ -159,6 +176,27 @@ fn a_slot_whose_band_is_evicted_releases_its_player() {
     assert!(live_seen, "it played while its band was resident");
     assert_eq!(s.live(), 0, "and was released with it");
     assert_eq!(host.released, host.requested);
+    assert_eq!(host.cancelled, host.requested, "its fetch cancelled with it");
+}
+
+#[test]
+fn a_failed_fetch_releases_the_embed_and_a_press_starts_it_afresh() {
+    let fonts = FontSet::load().unwrap();
+    let html = r#"<html><body><video src="https://cdn.test/a.webm" width="320" height="180"></video></body></html>"#.to_string();
+    let mut src = DocumentSource::new(html, &fonts, Default::default(), (800.0, 600.0), 600 * PX);
+    let mut ui = Ui { fonts: &fonts, slots: Slots::new() };
+    want(&mut src, &mut ui, 0);
+    let mut s = Sessions::new("https://site.test/");
+    let mut host = Host::default();
+    let ch = ui.slots.take_changes();
+    s.sync(&ui.slots, &ch, &mut host);
+    let k = ch.added[0];
+    s.press(&ui.slots, k, &mut host).unwrap();
+    s.fetched(k, None, false, &mut host);
+    assert_eq!(s.live(), 0);
+    assert_eq!(host.released, vec![k]);
+    s.press(&ui.slots, k, &mut host).unwrap();
+    assert_eq!(host.fetches.len(), 2, "a second press fetches again: nothing wedged");
 }
 
 #[test]

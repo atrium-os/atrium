@@ -13,7 +13,7 @@
 //!
 //! | page | message | answered by |
 //! |---|---|---|
-//! | `video.src = url` (a file) | `Load { Url }` | `Ready` → `loadedmetadata`, `loadeddata`, `canplay`, `canplaythrough` |
+//! | `video.src = url` (a file) | the engine fetches it (Nuntius `Fd`) and sends `Load { Fd }` with the descriptor | `Ready` → `loadedmetadata`, `loadeddata`, `canplay`, `canplaythrough` |
 //! | `video.src = URL.createObjectURL(ms)` | `OpenSource` | `sourceopen` at once |
 //! | `MediaSource.isTypeSupported(t)` | (sync) from answers to `CanPlay`; an unknown type answers `false` and is asked | `CanPlay` fills the cache |
 //! | `ms.addSourceBuffer(t)` | `AddTrack` (track = its index, at most 8) | |
@@ -116,11 +116,13 @@ impl Media {
 
     // ---- the element ----
 
-    /// `video.src = url` for a whole resource.
-    pub fn load_url(&mut self, url: &str, mime: &str) -> Result<(), DomError> {
+    /// `video.src = url` for a whole resource, once the engine has fetched
+    /// it into a descriptor (the player has no network): the `Load` this
+    /// queues goes with that descriptor (`Parent::send_fd`).
+    pub fn load_fd(&mut self, mime: &str) -> Result<(), DomError> {
         if self.loaded { return Err(DomError::InvalidState) } // one source per embed (atrium-player M5)
         self.loaded = true;
-        self.out.push(ToChild::Load { source: limen::media_player::Source::Url(url.to_string()), mime: mime.to_string() });
+        self.out.push(ToChild::Load { source: limen::media_player::Source::Fd, mime: mime.to_string() });
         Ok(())
     }
 
@@ -136,6 +138,7 @@ impl Media {
 
     pub fn play(&mut self) -> Result<(), DomError> {
         if !self.loaded { return Err(DomError::NotSupported) }
+        self.error = None;
         if self.ended { self.ended = false; self.out.push(ToChild::Seek { secs: 0.0 }); self.current_time = 0.0 }
         if self.paused { self.paused = false; self.events.push(Fire::Element("play")) }
         self.out.push(ToChild::Play);
@@ -154,6 +157,7 @@ impl Media {
         let t = t.max(0.0);
         let t = if self.duration.is_finite() { t.min(self.duration) } else { t };
         self.current_time = t;
+        self.error = None;
         self.ended = false;
         self.seeking = true;
         self.events.push(Fire::Element("seeking"));
@@ -334,6 +338,11 @@ impl Media {
     /// `sb`'s type, as added.
     pub fn source_type(&self, track: u8) -> Option<&str> { self.ms.as_ref().and_then(|m| m.bufs.get(track as usize)).map(|b| b.mime.as_str()) }
     pub fn source_duration(&self) -> f64 { self.ms.as_ref().map(|m| m.duration).unwrap_or(f64::NAN) }
+
+    /// The Navigator's own fetch for this element failed after its retries
+    /// and alternates (`MEDIA_ERR_NETWORK`). A later play or seek starts
+    /// fresh, so the element is never wedged.
+    pub fn network_error(&mut self) { self.fail(2) }
 
     fn fail(&mut self, media_err: u16) {
         self.error = Some(media_err);

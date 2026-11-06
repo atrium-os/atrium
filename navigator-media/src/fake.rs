@@ -50,7 +50,7 @@ impl FakePlayer {
             ToChild::Load { source, mime } => {
                 if self.loaded { self.violation("a second source for one embed".into()) }
                 self.loaded = true;
-                match source { Source::Url(u) if !(u.starts_with("https://") || u.starts_with("http://")) => self.violation(format!("Load of a URL that is not http(s): {u}")), _ => {} }
+                let Source::Fd = source;
                 let ok = self.supports.iter().any(|s| mime.starts_with(s));
                 self.pending.push_back(if ok { ToParent::Ready { duration_secs: 10.0, width: 640, height: 360 } } else { ToParent::Error { code: code::UNSUPPORTED } });
             }
