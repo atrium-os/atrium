@@ -313,6 +313,11 @@ Fresco's layers land.
   `LoadDone` at `Done`. A download cut off part way plays what arrived. Neither the
   supervisor nor the worker gets network. It stands in for nuntiusd and the `net.fetch`
   launch (nuntius.md §6 steps 2 and 4) and should move to them when they exist.
+  In the FreeBSD VM the fetcher runs in capability mode, and `vp9-opus.webm` served at one
+  16 KiB piece a second plays with every frame matching ffmpeg's hashes. That needed two
+  Nuntius fixes on FreeBSD: the anonymous file is `memfd_create` (a plain `SHM_ANON`
+  object refuses writes past its size), and it is written at explicit offsets (the
+  read-only descriptor is a dup that shares the file offset).
 
 **Tests along the way:**
 - every demuxer limit has a test with a crafted file that exceeds it;

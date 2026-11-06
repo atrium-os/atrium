@@ -347,8 +347,12 @@ fn run(mut conv: Conversation<'static>, o: Open, ctl: &Ctl, inner: &Inner, ev: &
                 if got + p.len() as u64 > o.limits.max_bytes { return Event::Error { id, code: ErrorCode::TooBig } }
                 match (&mut file, deliver) {
                     (Some(f), Deliver::Fd) => {
-                        use std::io::Write;
-                        if f.write_all(p).is_err() { return Event::Error { id, code: ErrorCode::TooBig } }
+                        // ★ At an explicit offset: on FreeBSD the client's
+                        // read-only descriptor is a dup, sharing the file
+                        // offset with this one, so a plain write would land
+                        // wherever the client's last read left it.
+                        use std::os::unix::fs::FileExt;
+                        if f.write_all_at(p, got).is_err() { return Event::Error { id, code: ErrorCode::TooBig } }
                     }
                     _ => {
                         let mut b = inner.budget.lock().unwrap();
@@ -384,7 +388,7 @@ fn run(mut conv: Conversation<'static>, o: Open, ctl: &Ctl, inner: &Inner, ev: &
 }
 
 /// ★ An anonymous file to fill, and a READ-ONLY descriptor of it for the
-/// client (nuntius.md §3.3): `shm_open(SHM_ANON)` with the descriptor
+/// client (nuntius.md §3.3): `memfd_create` (an `SHM_ANON` object that grows on write) with the descriptor
 /// narrowed to read, seek and fstat on FreeBSD (allowed in capability
 /// mode); `memfd_create` and a read-only reopen on Linux; elsewhere (the
 /// macOS dev host) an unlinked temporary file.
@@ -393,7 +397,10 @@ pub fn anon_file() -> std::io::Result<(std::fs::File, std::os::fd::OwnedFd)> {
     use std::os::fd::{FromRawFd, OwnedFd};
     #[cfg(target_os = "freebsd")]
     unsafe {
-        let fd = libc::shm_open(libc::SHM_ANON, libc::O_RDWR, 0o600);
+        // memfd_create is shm_open2(SHM_ANON) with SHM_GROW_ON_WRITE: a
+        // plain SHM_ANON object refuses writes past its size, so filling it
+        // with write(2) failed at the first byte. Allowed in capability mode.
+        let fd = libc::memfd_create(c"nuntius".as_ptr(), libc::MFD_CLOEXEC);
         if fd < 0 { return Err(std::io::Error::last_os_error()) }
         let ro = libc::dup(fd);
         if ro < 0 { libc::close(fd); return Err(std::io::Error::last_os_error()) }
