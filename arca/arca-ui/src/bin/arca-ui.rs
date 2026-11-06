@@ -213,7 +213,8 @@ fn main() -> ExitCode {
                         cx.run(embed, e, dos);
                     }
                 }
-                ChildEvent::Resumed { .. } => {}
+                // Resumed, and events for other roles (AudioTicket).
+                _ => {}
                 ChildEvent::Detaching { embed } => {
                     if let Some(mut e) = embeds.remove(&embed) {
                         let dos = e.field.detach();
