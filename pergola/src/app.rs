@@ -149,6 +149,15 @@ impl<V: View> App<V> {
         self.dirty.store(true, Ordering::Release);
     }
 
+    /// Whether keyboard focus shows its ring: the window arrived by
+    /// keyboard (true) or by a click (false).
+    pub fn set_focus_visible(&mut self, on: bool) {
+        if self.focus_visible != on {
+            self.focus_visible = on;
+            self.touch();
+        }
+    }
+
     /// Set the app clock (ms). Input and frames are stamped with it.
     pub fn set_time(&mut self, ms: f64) { self.now_ms = ms; }
     pub fn time(&self) -> f64 { self.now_ms }

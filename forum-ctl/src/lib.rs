@@ -87,6 +87,9 @@ pub enum Intent {
     /// `None` gives `output` a place of its own again. Remembered for this
     /// set of monitors.
     MirrorOutput { output: u32, of: Option<u32> },
+    /// "Make the system light or dark" (visual language §15): the bar's
+    /// switch. The core asks frescod, which tells every client.
+    SetAppearance { dark: bool },
 }
 
 /// The core's answer to an `Intent`.

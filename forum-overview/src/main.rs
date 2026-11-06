@@ -137,6 +137,7 @@ fn render_overview() -> std::io::Result<()> {
     };
     let mut conn = Connection::connect_default()?;
     let win = conn.window_create(W as u32, H as u32, "forum-overview", WindowHints::default())?;
+    let mode = conn.appearance().map(|a| pergola::window::theme_for(&a)).unwrap_or(mode);
     let mut surface = FrescoSurface::new(conn, win);
 
     let mut app = App::new(OverviewView { windows: windows(), icons: Icons::load() }).with_theme(mode);

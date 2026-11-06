@@ -61,8 +61,9 @@ struct BarView {
     workspace: Mutable<(String, String)>,
     time: Mutable<String>,
     date: Mutable<String>,
-    /// Set by the theme-toggle click; the main loop applies it to the App.
-    want_dark: Mutable<bool>,
+    /// Set by the light/dark switch; the main loop asks the WM to change
+    /// the system appearance, and the bar follows it like every app.
+    want_dark: Mutable<Option<bool>>,
 }
 
 /// A right-row icon: Phosphor glyph, hover → accent. A no-op click
@@ -189,7 +190,7 @@ impl View for BarView {
         let theme_glyph = if t.mode == Mode::Dark { phosphor::SUN } else { phosphor::MOON };
         let dark = self.want_dark.clone();
         let now_dark = t.mode == Mode::Dark;
-        icon_glyph(ctx, theme_glyph, Some(Box::new(move || dark.set(!now_dark))));
+        icon_glyph(ctx, theme_glyph, Some(Box::new(move || dark.set(Some(!now_dark)))));
         // Bell with the amber badge dot pinned to its top-right corner.
         let bell = ctx.push(Node::hstack(Rect::ZERO_SIZED, 0.0));
         ctx.set_flex(bell, FlexStyle { align: pergola::Align::Center, ..FlexStyle::default() });
@@ -299,6 +300,8 @@ fn clock_now() -> (String, String) {
 }
 
 fn main() -> std::io::Result<()> {
+    // The system appearance decides (the Window follows it); `dark` only
+    // seeds the first frame when frescod has none to give.
     let mode = match std::env::args().nth(1).as_deref() {
         Some("dark") => Semantic::DARK,
         _ => Semantic::LIGHT,
@@ -318,7 +321,7 @@ fn main() -> std::io::Result<()> {
     let workspace = Mutable::with_dirty(ws0, dirty.clone());
     let time = Mutable::with_dirty(time0, dirty.clone());
     let date = Mutable::with_dirty(date0, dirty.clone());
-    let want_dark = Mutable::with_dirty(mode == Semantic::DARK, dirty.clone());
+    let want_dark = Mutable::with_dirty(None, dirty.clone());
 
     let view = BarView {
         w,
@@ -353,11 +356,15 @@ fn main() -> std::io::Result<()> {
                 }
             }
         }
-        // Theme toggle requested by the moon/sun click.
-        let want = if want_dark.get() { Semantic::DARK } else { Semantic::LIGHT };
-        if want != app.theme {
-            app.set_theme(want);
-            window.paint(&mut app)?;
+        // The moon/sun click: ask the WM to switch the whole system. The
+        // change comes back as an appearance event, which repaints the bar.
+        if let Some(dark) = want_dark.get() {
+            want_dark.set(None);
+            match forum_ctl::request(forum_ctl::default_socket_path(), &forum_ctl::Intent::SetAppearance { dark }) {
+                Ok(forum_ctl::Reply::Ack) => {}
+                Ok(r) => eprintln!("forum-bar: appearance refused: {r:?}"),
+                Err(e) => eprintln!("forum-bar: appearance: {e}"),
+            }
         }
     }
 }
@@ -376,7 +383,7 @@ mod tests {
             workspace: Mutable::new(ws),
             time: Mutable::new(time),
             date: Mutable::new(date),
-            want_dark: Mutable::new(false),
+            want_dark: Mutable::new(None),
         }
     }
 

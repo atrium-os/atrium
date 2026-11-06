@@ -620,16 +620,16 @@ themes the trusted surfaces of §14.4. High contrast and the accent list follow 
 
 ## §16. Where the code drifts today *(rev. 2, 2026-11-06)*
 
-What a review of Pergola, the Forum shell and arca-ui found against this document:
+What a review of Pergola, the Forum shell and arca-ui found against this document (struck through as fixed):
 
 | where | drift | fix |
 |---|---|---|
-| Pergola `Button` primary | rests on accent-400 (label 3.24:1); hover goes to accent-600, darker than pressed (500) | `accent-fill`, `-hover`, `-pressed` |
-| Pergola `TextField` | no edge at all; no caret or selection | §14.2 text field |
-| Pergola hover and press | each widget picks a neighbouring tone (`bg-surface`) | `state-hover` and `state-pressed` overlays |
-| forum-bar, forum-dock | theme from an environment variable; the bar's toggle changes only the bar | §15 |
-| forum-shelf | always light | §15 |
-| arca-ui | draws raw RGB, with a blue focus edge and caret (the "tech blue" §1 rejects) | Pergola's token table (arca-ui can depend on the theme module alone) |
+| Pergola `Button` primary | rests on accent-400 (label 3.24:1); hover goes to accent-600, darker than pressed (500) | ~~`accent-fill`, `-hover`, `-pressed`~~ fixed |
+| Pergola `TextField` | no edge at all; no caret or selection | ~~§14.2 text field~~ fixed |
+| Pergola hover and press | each widget picks a neighbouring tone (`bg-surface`) | ~~`state-hover` and `state-pressed` overlays~~ fixed |
+| forum-bar, forum-dock | theme from an environment variable; the bar's toggle changes only the bar | ~~§15~~ fixed: every Pergola window, the dock and the overview take frescod's appearance; the bar's switch sets it through forum-wm |
+| forum-shelf | always light | ~~§15~~ fixed (follows through `Window`) |
+| arca-ui | draws raw RGB, with a blue focus edge and caret (the "tech blue" §1 rejects) | ~~Pergola's token table (arca-ui can depend on the theme module alone)~~ fixed by the Arca thread (c7638ea) |
 | floating surfaces | no shadow op in Fresco | edge only until the op exists (§5) |
 | motion | springs are specified but Pergola has no frame clock, so nothing animates | the frame clock in Pergola's order of work |
 | §12 reference render | rev. 1's before/after render was never captured; rev. 1 approval pending | the control sheet below, then a Pergola render of it |

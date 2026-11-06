@@ -67,6 +67,16 @@ pub struct Window {
     binder: Option<Box<dyn crate::slot::SlotBinder>>,
     /// frescod's embed token for this window (limen.md §1), once it came.
     embed_token: Option<[u8; 16]>,
+    /// The system appearance not yet applied to the app (visual language
+    /// §15): set at open and on each change, applied at the next paint.
+    appearance: Option<crate::theme::Semantic>,
+    /// Whether the app takes the system appearance (default on).
+    follow_appearance: bool,
+}
+
+/// The theme for a system appearance.
+pub fn theme_for(a: &fresco_protocol::AppearancePayload) -> crate::theme::Semantic {
+    if a.scheme == fresco_protocol::APPEARANCE_DARK { crate::theme::Semantic::DARK } else { crate::theme::Semantic::LIGHT }
 }
 
 /// Default socket path, overridable with `FRESCO_SOCKET`.
@@ -97,6 +107,13 @@ impl Window {
         };
 
         let win = conn.window_create(w, h, &desc.title, desc.hints.clone())?;
+        let appearance = match conn.appearance() {
+            Ok(a) => Some(theme_for(&a)),
+            Err(e) => {
+                log::warn!("window: no system appearance ({e}); staying light");
+                None
+            }
+        };
 
         match WireMeasurer::connect(&socket) {
             Ok(m) => install_measurer(Box::new(m)),
@@ -110,7 +127,15 @@ impl Window {
             height: h as f32,
             binder: None,
             embed_token: None,
+            appearance,
+            follow_appearance: true,
         })
+    }
+
+    /// Keep the app's own theme instead of the system appearance (a
+    /// preview, a test). On by default.
+    pub fn follow_appearance(&mut self, on: bool) {
+        self.follow_appearance = on;
     }
 
     /// Escape hatch for callers that need connection-level ops the
@@ -123,6 +148,9 @@ impl Window {
     /// changes).
     pub fn paint<V: View>(&mut self, app: &mut App<V>) -> io::Result<()> {
         app.set_time(self.now_ms());
+        if let Some(t) = self.appearance.take().filter(|_| self.follow_appearance) {
+            app.set_theme(t);
+        }
         app.frame();
         let deltas = app.tick();
         if !deltas.is_empty() {
@@ -161,6 +189,18 @@ impl Window {
         match *ev {
             fresco_client::Event::EmbedToken { window_id, token } if window_id == self.surface.window_id() => {
                 self.embed_token = Some(token);
+            }
+            fresco_client::Event::Appearance(ref a) => {
+                self.appearance = Some(theme_for(a));
+            }
+            fresco_client::Event::FocusChanged { window_id, gained: true, cause } if window_id == self.surface.window_id() => {
+                // The focus ring shows only for keyboard focus (§14.1), and
+                // arriving by Alt-Tab is keyboard focus.
+                match cause {
+                    fresco_protocol::focus_cause::KEYBOARD => app.set_focus_visible(true),
+                    fresco_protocol::focus_cause::POINTER => app.set_focus_visible(false),
+                    _ => {}
+                }
             }
             fresco_client::Event::Resized { width, height, .. } => {
                 self.width = width as f32;

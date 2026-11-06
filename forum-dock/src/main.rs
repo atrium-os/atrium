@@ -224,6 +224,9 @@ fn render_dock() -> io::Result<()> {
     let hints = WindowHints { role: Some(WmRole::Background), ..Default::default() };
     let (sw, sh) = screen_wh(&mut conn);
     let win = conn.window_create(sw as u32, sh as u32, "forum-dock", hints)?;
+    // The system appearance (visual language §15); FORUM_THEME only when
+    // frescod has none to give.
+    let mode = conn.appearance().map(|a| pergola::window::theme_for(&a)).unwrap_or(mode);
     let mut surface = FrescoSurface::new(conn, win);
 
     let mut app = App::new(DockView { apps, icons: Icons::load(), w: sw, h: sh }).with_theme(mode);
@@ -238,8 +241,19 @@ fn render_dock() -> io::Result<()> {
     // changes on install/uninstall), so unlike the bar it has nothing to
     // repaint: park instead of polling, and do no compositing at all while
     // idle. A redraw comes from the WM re-declaring the layout, not from here.
+    // The one thing that changes it is the system appearance: redraw then.
     loop {
-        std::thread::sleep(std::time::Duration::from_secs(3600));
+        match surface.connection().wait_event(None)? {
+            Some(fresco_client::Event::Appearance(a)) => {
+                app.set_theme(pergola::window::theme_for(&a));
+                let deltas = app.tick();
+                if !deltas.is_empty() {
+                    commit(&mut surface, &deltas)?;
+                    surface.present()?;
+                }
+            }
+            _ => {}
+        }
     }
 }
 

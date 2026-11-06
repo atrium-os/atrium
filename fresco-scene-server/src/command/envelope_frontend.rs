@@ -2238,6 +2238,9 @@ mod tests {
             let p = WmMirrorOutputPayload { identity, of };
             self.dispatch(control::OP_WM_MIRROR_OUTPUT, encode(&p).unwrap()).map(|_| ())
         }
+        fn set_appearance(&mut self, a: fresco_protocol::AppearancePayload) -> std::io::Result<()> {
+            self.dispatch(control::OP_WM_SET_APPEARANCE, encode(&a).unwrap()).map(|_| ())
+        }
     }
 
     #[test]

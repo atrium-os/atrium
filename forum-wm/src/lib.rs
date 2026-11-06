@@ -593,6 +593,9 @@ pub mod daemon {
         /// Make a monitor mirror another, `of` = 0 stops (OP_WM_MIRROR_OUTPUT);
         /// EV_DISPLAY_CHANGED follows.
         fn mirror_output(&mut self, identity: u64, of: u64) -> io::Result<()>;
+        /// Set the system appearance (OP_WM_SET_APPEARANCE); every client
+        /// hears EV_APPEARANCE_CHANGED.
+        fn set_appearance(&mut self, a: fresco_protocol::AppearancePayload) -> io::Result<()>;
     }
 
     /// The WM core state: output geometry, the human's focus intent, and the
@@ -1322,6 +1325,13 @@ pub mod control {
                 Ok(()) => Reply::Ack,
                 Err(e) => Reply::Err { message: e.to_string() },
             },
+            Intent::SetAppearance { dark } => {
+                let scheme = if dark { fresco_protocol::APPEARANCE_DARK } else { fresco_protocol::APPEARANCE_LIGHT };
+                match conn.set_appearance(fresco_protocol::AppearancePayload { scheme, high_contrast: false, accent: 0 }) {
+                    Ok(()) => Reply::Ack,
+                    Err(e) => Reply::Err { message: e.to_string() },
+                }
+            }
             Intent::MoveToNextMonitor => match wm.move_focused_to_next_monitor(conn) {
                 Ok(Some(_)) => Reply::Ack,
                 Ok(None) => Reply::Err { message: "nothing to move, or only one monitor".into() },
@@ -1534,8 +1544,13 @@ mod tests {
         arranged: Option<Vec<fresco_protocol::WmOutputPlacement>>,
         scaled: Vec<(u64, u32)>,
         mirrored: Vec<(u64, u64)>,
+        appearance: Option<fresco_protocol::AppearancePayload>,
     }
     impl FrescoConn for MockConn {
+        fn set_appearance(&mut self, a: fresco_protocol::AppearancePayload) -> io::Result<()> {
+            self.appearance = Some(a);
+            Ok(())
+        }
         fn enumerate(&mut self) -> io::Result<Vec<WmSurfaceInfo>> {
             Ok(self.surfaces.clone())
         }
@@ -2062,5 +2077,15 @@ mod tests {
         wm.set_outputs(&mut conn, vec![mon(1, 20, 0, 2560, 1440), mon(0, 10, 2560, 1920, 1080)]).unwrap();
         let r = slot(&wm.reconcile(&mut conn).unwrap(), 1).unwrap();
         assert!(r.x >= 2560, "window 1 stayed on monitor 10: {r:?}");
+    }
+
+    #[test]
+    fn the_bar_switch_sets_the_system_appearance() {
+        let mut wm = Wm::new(screen());
+        let mut conn = MockConn::default();
+        assert_eq!(handle_intent(&mut wm, &mut conn, Intent::SetAppearance { dark: true }), Reply::Ack);
+        assert_eq!(conn.appearance.map(|a| a.scheme), Some(fresco_protocol::APPEARANCE_DARK));
+        handle_intent(&mut wm, &mut conn, Intent::SetAppearance { dark: false });
+        assert_eq!(conn.appearance.map(|a| a.scheme), Some(fresco_protocol::APPEARANCE_LIGHT));
     }
 }
