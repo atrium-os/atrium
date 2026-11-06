@@ -105,14 +105,21 @@ Each of these was found by reading the code, not the spec.
   the grant bits are checked at the door as they are now.
 - **Seat:** a stream whose user is not the active session is held at silence, as now.
 - **Embedded players.** limend already has a connection that choragusd can trust (its peer
-  uid is `_limen`). When it starts a `media-player` embed, limend asks choragusd for an
-  **attribution ticket**: "the instance with uid U plays for app P of user X", and gets a
-  random 128-bit ticket back. It passes the ticket to the child with `Attach`. The child
-  puts it in `Hello`. choragusd accepts it only from a peer whose uid is U, only once, and
-  only while limend's embed is alive (limend cancels it when the embed ends). The streams
-  are then listed, volumed and ducked as P's. To play, the parent P must hold `audio` and the
-  player's own manifest must too. A mail app without `audio` cannot get sound by embedding a
-  player. (Decision 4.)
+  uid is `_limen`, the only uid served on `/atrium/sockets/audio-attribution/`; choragusd
+  takes it as `--limen-uid`). When it starts a `media-player` embed, limend asks choragusd
+  for an **attribution ticket** (`ToAttribution::Issue { child_uid, parent_uid }`): "the
+  instance with uid U plays for the app with uid P". choragusd names P through the launch
+  registry, refuses unless P's user granted it `audio`, and answers a random 128-bit
+  ticket. limend passes it to the child as `AudioTicket`, right after `Attach`. The child
+  puts it in `Hello` (`Client::connect(path, Some(ticket))`). choragusd accepts it only
+  from a peer whose uid is U, only once, and only while limend's embed is alive: limend
+  cancels it when the embed ends (`Cancel`, which also hangs up a connection that used
+  it), and every ticket dies if limend's connection does. The streams are then listed,
+  volumed and ducked as P's, under P's grant. The player itself runs as its provider's
+  own user, which is not in the registry, so without a ticket it can't play at all; and
+  its jail reaches `audio/` only if its own manifest holds `audio`. So to play, the parent
+  P must hold `audio` and the player's own manifest must too. A mail app without `audio`
+  cannot get sound by embedding a player. (Decision 4.)
 
 ## 5. The app wire
 

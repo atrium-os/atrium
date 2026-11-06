@@ -11,13 +11,20 @@
 //! user's apps that are playing and sets the user's level per app, the master
 //! and the output (lyra-v1.md §7). Those levels persist ([`crate::volumes`]).
 //! A stream plays at `policy × app's own volume × user's app level × master`.
+//!
+//! limend connects to `audio-attribution/` ([`serve_attribution`]) for
+//! tickets: an embedded player that says one in `Hello` plays as its parent
+//! app, and only if the parent holds `audio` (lyra-v1.md §4, decision 4).
 
-use crate::app::{role_from_wire, CAP_AUDIO, CAP_CONTROL};
+use crate::app::{role_from_wire, CAP_ATTRIBUTION, CAP_AUDIO, CAP_CONTROL};
 use crate::grant::GrantStore;
 use crate::policy::{Device, DeviceKind, Session, Stream};
 use crate::volumes::{clamp, Level, VolumeStore};
 use lyra_protocol::fdpass::{recv_fd, send_fd};
-use lyra_protocol::wire::{self, AppEntry, DenyCode, FromControl, FromEngine, Output, Role as WireRole, ToApp, ToChoragus, ToControl, ToEngine};
+use lyra_protocol::wire::{
+    self, AppEntry, DenyCode, FromAttribution, FromControl, FromEngine, Output, Role as WireRole, Ticket, ToApp,
+    ToAttribution, ToChoragus, ToControl, ToEngine,
+};
 use portcullis_peer::AppRegistry;
 use std::collections::HashMap;
 use std::io;
@@ -48,6 +55,23 @@ pub struct Config {
     pub period_frames: u32,
     /// Where users' volumes persist (`<dir>/<user>.toml`); `None`: memory only.
     pub state_dir: Option<String>,
+    /// limend's uid: the only peer served on the attribution socket.
+    pub limen_uid: Option<u32>,
+}
+
+/// Tickets one limend connection may hold at once.
+pub const MAX_TICKETS: usize = 256;
+
+/// A ticket limend asked for: who may present it, and whom it plays as.
+struct TicketRec {
+    child_uid: u32,
+    user: String,
+    app_id: String,
+    /// The limend connection that holds it.
+    limen: u64,
+    /// Presented already (it works once), and by which app connection.
+    used: bool,
+    conn: Option<u64>,
 }
 
 struct StreamRec {
@@ -84,6 +108,7 @@ struct State {
     /// The seat file, when streams are gated on the active session.
     seat: Option<String>,
     controls: HashMap<u64, ControlConn>,
+    tickets: HashMap<Ticket, TicketRec>,
     lyrad: UnixStream,
     next_stream: u32,
     next_conn: u64,
@@ -217,22 +242,40 @@ fn serve_app(mut app: UnixStream, state: Shared, cfg: Arc<Config>, socket_caps: 
         Err(_) => return,
     };
     let _ = app.set_read_timeout(Some(Duration::from_secs(5)));
-    let hello: ToChoragus = match wire::recv(&mut app) {
-        Ok(m) => m,
-        Err(_) => return,
+    let ticket = match wire::recv(&mut app) {
+        Ok(ToChoragus::Hello { ticket, .. }) => ticket,
+        _ => return,
     };
-    if !matches!(hello, ToChoragus::Hello { .. }) {
-        return;
-    }
     let _ = app.set_read_timeout(None);
     let registry = cfg.registry.as_deref().map(|p| AppRegistry::load(p).unwrap_or_default());
     let grant = |user: &str, app_id: &str| match &cfg.policy_base {
         Some(base) => GrantStore::load_portcullis(base, user).granted(app_id),
         None => cfg.grants.granted(app_id),
     };
-    // In development (no registry, not strict) the "hello" app id is the uid's user.
-    let claimed = portcullis_peer::username(uid).unwrap_or_default();
-    let verified = crate::identity::resolve(uid, &claimed, registry.as_ref(), cfg.strict, socket_caps, grant);
+    let verified = match ticket {
+        // An embedded player: it plays as the parent the ticket names, with
+        // the parent's grant. (Its own jail reached this socket only because
+        // its own manifest holds `audio`.) A ticket works once, only for the
+        // uid limend said, and only while limend's embed lives.
+        Some(t) => {
+            let mut st = state.lock().unwrap();
+            match st.tickets.get_mut(&t) {
+                Some(r) if r.child_uid == uid && !r.used => {
+                    r.used = true;
+                    let (user, app_id) = (r.user.clone(), r.app_id.clone());
+                    let caps = grant(&user, &app_id) & socket_caps;
+                    eprintln!("choragusd: uid {uid} plays as '{app_id}' (user {user}) by attribution ticket");
+                    Some(crate::identity::Verified { app_id, user, caps })
+                }
+                _ => None,
+            }
+        }
+        None => {
+            // In development (no registry, not strict) the "hello" app id is the uid's user.
+            let claimed = portcullis_peer::username(uid).unwrap_or_default();
+            crate::identity::resolve(uid, &claimed, registry.as_ref(), cfg.strict, socket_caps, grant)
+        }
+    };
     let Some(v) = verified.filter(|v| v.caps & CAP_AUDIO != 0) else {
         eprintln!("choragusd: uid {uid} refused (not in the registry, or no audio grant)");
         let _ = wire::send(&mut app, &ToApp::Denied { tag: 0, code: DenyCode::NotGranted });
@@ -249,6 +292,13 @@ fn serve_app(mut app: UnixStream, state: Shared, cfg: Arc<Config>, socket_caps: 
         st.next_conn += 1;
         let c = st.next_conn;
         st.apps.insert(c, AppConn { writer, streams: Vec::new() });
+        if let Some(r) = ticket.and_then(|t| st.tickets.get_mut(&t)) {
+            r.conn = Some(c);
+        } else if ticket.is_some() {
+            // Cancelled between the check and now: the embed is gone.
+            st.apps.remove(&c);
+            return;
+        }
         c
     };
     eprintln!("choragusd: '{}' (user {}, uid {uid}) connected", v.app_id, v.user);
@@ -438,6 +488,88 @@ fn serve_control(mut c: UnixStream, state: Shared, cfg: Arc<Config>, socket_caps
     eprintln!("choragusd: volume UI '{}' (uid {uid}) disconnected", v.app_id);
 }
 
+fn new_ticket() -> io::Result<Ticket> {
+    use std::io::Read;
+    let mut t = [0u8; 16];
+    std::fs::File::open("/dev/urandom")?.read_exact(&mut t)?;
+    Ok(t)
+}
+
+/// Serve limend on `audio-attribution/` (lyra-v1.md §4). Only limend's uid;
+/// its tickets die with its connection.
+fn serve_attribution(mut c: UnixStream, state: Shared, cfg: Arc<Config>) {
+    let uid = match lyra_protocol::peer::peer_uid(c.as_raw_fd()) {
+        Ok(u) => u,
+        Err(_) => return,
+    };
+    if cfg.limen_uid != Some(uid) {
+        eprintln!("choragusd: uid {uid} refused on audio-attribution (not limend)");
+        return;
+    }
+    let conn = {
+        let mut st = state.lock().unwrap();
+        st.next_conn += 1;
+        st.next_conn
+    };
+    let grant = |user: &str, app_id: &str| match &cfg.policy_base {
+        Some(base) => GrantStore::load_portcullis(base, user).granted(app_id),
+        None => cfg.grants.granted(app_id),
+    };
+    while let Ok(msg) = wire::recv::<_, ToAttribution>(&mut c) {
+        let reply = match msg {
+            ToAttribution::Issue { child_uid, parent_uid } => {
+                let registry = cfg.registry.as_deref().map(|p| AppRegistry::load(p).unwrap_or_default());
+                let parent = registry.as_ref()
+                    .and_then(|r| r.resolve(parent_uid))
+                    .map(|(u, a)| (u.to_string(), a.to_string()));
+                let mut st = state.lock().unwrap();
+                let held = st.tickets.values().filter(|r| r.limen == conn).count();
+                match parent {
+                    Some((user, app_id)) if grant(&user, &app_id) & CAP_AUDIO != 0 && held < MAX_TICKETS => {
+                        match new_ticket() {
+                            Ok(t) => {
+                                st.tickets.insert(t, TicketRec { child_uid, user, app_id, limen: conn, used: false, conn: None });
+                                FromAttribution::Issued { ticket: t }
+                            }
+                            Err(_) => FromAttribution::Refused,
+                        }
+                    }
+                    other => {
+                        eprintln!("choragusd: no ticket for uid {child_uid} under uid {parent_uid} ({:?} lacks audio, or limend holds {held})",
+                            other.map(|(_, a)| a));
+                        FromAttribution::Refused
+                    }
+                }
+            }
+            ToAttribution::Cancel { ticket } => {
+                let mut st = state.lock().unwrap();
+                if st.tickets.get(&ticket).is_some_and(|r| r.limen == conn) {
+                    cancel(&mut st, &ticket);
+                }
+                FromAttribution::Cancelled
+            }
+        };
+        if wire::send(&mut c, &reply).is_err() {
+            break;
+        }
+    }
+    let mut st = state.lock().unwrap();
+    let mine: Vec<Ticket> = st.tickets.iter().filter(|(_, r)| r.limen == conn).map(|(t, _)| *t).collect();
+    for t in mine {
+        cancel(&mut st, &t);
+    }
+}
+
+/// End a ticket: an app connection that played with it is hung up (its
+/// reader then closes its streams).
+fn cancel(st: &mut State, t: &Ticket) {
+    if let Some(r) = st.tickets.remove(t) {
+        if let Some(a) = r.conn.and_then(|c| st.apps.get(&c)) {
+            let _ = a.writer.shutdown(std::net::Shutdown::Both);
+        }
+    }
+}
+
 /// Read lyrad's messages: hand ring fds to apps, forward events. Returns when
 /// lyrad hangs up.
 fn serve_lyrad(mut rd: UnixStream, state: Shared) -> io::Error {
@@ -534,6 +666,7 @@ pub fn run(cfg: Config) -> io::Error {
         volumes: VolumeStore::new(cfg.state_dir.clone()),
         seat: cfg.seat.then(|| cfg.seat_path.clone()),
         controls: HashMap::new(),
+        tickets: HashMap::new(),
         lyrad,
         next_stream: 1,
         next_conn: 0,
@@ -567,7 +700,9 @@ pub fn run(cfg: Config) -> io::Error {
             for app in listener.incoming() {
                 let Ok(app) = app else { continue };
                 let (state, cfg) = (state.clone(), cfg.clone());
-                if caps == CAP_CONTROL {
+                if caps == CAP_ATTRIBUTION {
+                    std::thread::spawn(move || serve_attribution(app, state, cfg));
+                } else if caps == CAP_CONTROL {
                     std::thread::spawn(move || serve_control(app, state, cfg, caps));
                 } else {
                     std::thread::spawn(move || serve_app(app, state, cfg, caps));

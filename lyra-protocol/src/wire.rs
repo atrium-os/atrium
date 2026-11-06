@@ -2,9 +2,11 @@
 //! framing Limen uses. Samples never cross these sockets; they go through the
 //! shared-memory ring, whose fd follows the message that announces it.
 //!
-//! Three dictionaries:
+//! The dictionaries:
 //! - **app ⟷ choragusd** ([`ToChoragus`], [`ToApp`]): what an app may say.
 //! - **volume UI ⟷ choragusd** ([`ToControl`], [`FromControl`]): levels only.
+//! - **limend ⟷ choragusd** ([`ToAttribution`], [`FromAttribution`]): tickets
+//!   that let an embedded player play as its parent.
 //! - **choragusd ⟷ lyrad** ([`ToEngine`], [`FromEngine`]): mechanism only.
 //!
 //! A frame is a `u32` little-endian length followed by that many bytes of
@@ -96,7 +98,9 @@ pub enum DenyCode {
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
 pub enum ToChoragus {
-    /// First message. `ticket`: a Limen attribution ticket (A7), or none.
+    /// First message. `ticket`: the attribution ticket limend gave an
+    /// embedded player (Limen `AudioTicket`), so its streams count as the
+    /// parent app's; none for an ordinary app.
     Hello { version: u16, ticket: Option<[u8; 16]> },
     /// `tag` is the app's own number, echoed in `Opened` or `Denied`.
     Open { tag: u32, params: StreamParams },
@@ -183,6 +187,31 @@ pub enum FromControl {
     Apps { master: f32, master_muted: bool, apps: Vec<AppEntry> },
     Outputs { current: u32, outputs: Vec<Output> },
     Denied { code: DenyCode },
+}
+
+// ── limend ⟷ choragusd (audio-attribution/, lyra-v1.md §4) ──────────────────
+
+/// An attribution ticket: 128 random bits.
+pub type Ticket = [u8; 16];
+
+/// limend asks for, and cancels, attribution tickets. Only limend's uid is
+/// served. One reply per request.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+pub enum ToAttribution {
+    /// "The embedded instance running as `child_uid` plays for the app whose
+    /// connection to limend has `parent_uid`." choragusd names the parent
+    /// through the launch registry and refuses unless it holds `audio`.
+    Issue { child_uid: u32, parent_uid: u32 },
+    /// The embed ended: the ticket dies, and a connection that used it is
+    /// hung up.
+    Cancel { ticket: Ticket },
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+pub enum FromAttribution {
+    Issued { ticket: Ticket },
+    Refused,
+    Cancelled,
 }
 
 // ── choragusd ⟷ lyrad ───────────────────────────────────────────────────────

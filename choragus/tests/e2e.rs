@@ -8,7 +8,10 @@ use choragus::daemon::{self, Config};
 use choragus::grant::GrantStore;
 use lyra_protocol::client::{Client, Control};
 use lyra_protocol::ring::Ring;
-use lyra_protocol::wire::{self, AppEntry, DenyCode, FromControl, FromEngine, Output, Role, StreamParams, ToApp, ToChoragus, ToControl, ToEngine};
+use lyra_protocol::wire::{
+    self, AppEntry, DenyCode, FromAttribution, FromControl, FromEngine, Output, Role, StreamParams, ToApp, ToAttribution, ToChoragus,
+    ToControl, ToEngine,
+};
 use std::os::fd::AsRawFd;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::PathBuf;
@@ -91,6 +94,7 @@ fn start_with(tag: &'static str, registry: &str, grants: &str, listeners: &[(&st
         device_channels: 2,
         period_frames: 128,
         state_dir: state_dir.map(|p| p.to_string_lossy().into()),
+        limen_uid: Some(me()),
     };
     std::thread::spawn(move || daemon::run(cfg));
     for _ in 0..200 {
@@ -284,4 +288,56 @@ fn only_the_audio_control_grant_reaches_the_volume_ui() {
     // And the control grant alone opens no streams.
     let (s, _e, _r) = start_with("ctl-nostream", &reg, "org.atrium.player audio-control\n", &[("audio.sock", CAP_AUDIO | CAP_CONTROL)], None);
     assert!(Client::connect(s[0].to_str().unwrap(), None).is_err());
+}
+
+/// limend's side of the attribution socket: one connection, held open (its
+/// tickets die with it).
+struct Limend(UnixStream);
+impl Limend {
+    fn ask(&mut self, m: &ToAttribution) -> FromAttribution {
+        wire::send(&mut self.0, m).unwrap();
+        wire::recv(&mut self.0).unwrap()
+    }
+}
+
+#[test]
+fn an_embedded_player_plays_as_its_parent_only_with_a_ticket() {
+    // Our uid is the embedded player's (and limend's): not in the registry.
+    // 50001 is the parent, a mail app that holds audio; 50002 holds none.
+    let reg = "50001 alice org.example.mail\n50002 alice org.example.notes\n";
+    let grants = "org.example.mail audio\n";
+    let state = dir("tkt-state");
+    // The user turned the mail app down to half: the player's streams follow it.
+    std::fs::write(state.join("alice.toml"), "[apps.\"org.example.mail\"]\nvolume = 0.5\nmuted = false\n").unwrap();
+    let socks = [("audio.sock", CAP_AUDIO), ("audio-attribution.sock", choragus::app::CAP_ATTRIBUTION)];
+    let (s, eng, _rings) = start_with("tkt", reg, grants, &socks, Some(state));
+    let app = s[0].to_str().unwrap();
+    // No ticket: an uid the registry can't name is refused.
+    assert!(Client::connect(app, None).is_err());
+    let mut limend = Limend(UnixStream::connect(&s[1]).unwrap());
+    // A parent without audio gets no ticket for its player.
+    assert_eq!(limend.ask(&ToAttribution::Issue { child_uid: me(), parent_uid: 50002 }), FromAttribution::Refused);
+    // Nor does an uid that isn't an app.
+    assert_eq!(limend.ask(&ToAttribution::Issue { child_uid: me(), parent_uid: 4242 }), FromAttribution::Refused);
+    // A ticket for another uid is no good to us.
+    let FromAttribution::Issued { ticket: other } = limend.ask(&ToAttribution::Issue { child_uid: 4242, parent_uid: 50001 }) else { panic!() };
+    assert!(Client::connect(app, Some(other)).is_err());
+    // Ours: the player plays, counted as the mail app (its user's level for mail).
+    let FromAttribution::Issued { ticket } = limend.ask(&ToAttribution::Issue { child_uid: me(), parent_uid: 50001 }) else { panic!() };
+    let mut c = Client::connect(app, Some(ticket)).expect("welcome by ticket");
+    let st = c.open(params()).unwrap();
+    gain(&eng, -6.02);
+    // Once only.
+    assert!(Client::connect(app, Some(ticket)).is_err(), "a ticket works once");
+    // The embed ends: limend cancels, and the player is hung up.
+    assert_eq!(limend.ask(&ToAttribution::Cancel { ticket }), FromAttribution::Cancelled);
+    assert_eq!(next_engine(&eng, |m| matches!(m, ToEngine::Close { .. })), ToEngine::Close { stream: st.id });
+    assert!(c.next_event().is_err());
+    // limend going away kills its tickets.
+    let FromAttribution::Issued { ticket } = limend.ask(&ToAttribution::Issue { child_uid: me(), parent_uid: 50001 }) else { panic!() };
+    drop(limend);
+    std::thread::sleep(Duration::from_millis(100));
+    assert!(Client::connect(app, Some(ticket)).is_err(), "limend's tickets die with it");
+    // A forged ticket is nothing.
+    assert!(Client::connect(app, Some([9; 16])).is_err());
 }

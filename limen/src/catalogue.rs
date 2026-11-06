@@ -40,6 +40,10 @@ pub const ROLES: &[Role] = &[
     Role { name: "editor-extension", provider: Provider::User, slot: SlotKind::Plain },
 ];
 
+/// Roles whose children may play sound as their parent (lyra-v1.md §4):
+/// limend asks choragusd for an attribution ticket for each embed.
+pub const AUDIO_ROLES: &[&str] = &["media-player"];
+
 pub fn role(name: &str) -> Option<&'static Role> {
     ROLES.iter().find(|r| r.name == name)
 }

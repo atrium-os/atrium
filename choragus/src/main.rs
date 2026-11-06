@@ -1,10 +1,11 @@
 //! choragusd — Choragus, Lyra's audio policy daemon and the front door apps
 //! use for sound (docs/spec/lyra-v1.md §3–5; architecture §7, §9).
 //!
-//!   choragusd --serve
+//!   choragusd --serve [--limen-uid UID]
 //!       The service: one daemon for the seat, identity only from the launch
 //!       registry, grants from each user's Portcullis policy, one socket per
-//!       audio capability. Paths from the environment (jaild passes ATRIUM_*):
+//!       audio capability, and audio-attribution/ for limend (served only to
+//!       --limen-uid; without it, nobody). Paths from the environment (jaild passes ATRIUM_*):
 //!         ATRIUM_CHORAGUS_SOCKETS  socket root   (default /atrium/sockets)
 //!         ATRIUM_LYRAD_SOCK        lyrad         (default /atrium/sockets/lyrad/lyrad.sock)
 //!         ATRIUM_APP_REGISTRY      registry      (default /var/run/atrium/app-registry)
@@ -13,6 +14,7 @@
 //!
 //!   choragusd --daemon <app_sock> <lyrad_sock> [--grants F] [--portcullis-grants BASE]
 //!                      [--app-registry F] [--seat] [--control SOCK] [--state DIR]
+//!                      [--attribution SOCK --limen-uid UID]
 //!       Development: one socket allowing every capability (and, with
 //!       --control, a volume-UI socket; --state keeps volumes in DIR). Without a registry
 //!       the app is named by its uid's user name (and --grants is keyed by it).
@@ -44,16 +46,21 @@ fn main() {
         device_channels: 2,
         period_frames: 128,
         state_dir: None,
+        limen_uid: None,
     };
 
     if args.iter().any(|a| a == "--serve") {
         let env = |k: &str, d: &str| std::env::var(k).unwrap_or_else(|_| d.to_string());
         let root = env("ATRIUM_CHORAGUS_SOCKETS", "/atrium/sockets");
+        let mut listeners: Vec<(String, u8)> = choragus::identity::SOCKETS
+            .iter()
+            .map(|(name, caps)| (format!("{root}/{name}/{name}.sock"), *caps))
+            .collect();
+        // limend's door for attribution tickets; no app jail mounts it.
+        listeners.push((format!("{root}/audio-attribution/audio-attribution.sock"), choragus::app::CAP_ATTRIBUTION));
         let cfg = Config {
-            listeners: choragus::identity::SOCKETS
-                .iter()
-                .map(|(name, caps)| (format!("{root}/{name}/{name}.sock"), *caps))
-                .collect(),
+            listeners,
+            limen_uid: arg(&args, "--limen-uid").and_then(|v| v.parse().ok()),
             lyrad: env("ATRIUM_LYRAD_SOCK", "/atrium/sockets/lyrad/lyrad.sock"),
             registry: Some(env("ATRIUM_APP_REGISTRY", portcullis_peer::DEFAULT_REGISTRY)),
             policy_base: Some(env("ATRIUM_POLICY_BASE", "/var/db/atrium")),
@@ -82,9 +89,13 @@ fn main() {
         if let Some(p) = arg(&args, "--control") {
             listeners.push((p.to_string(), choragus::app::CAP_CONTROL));
         }
+        if let Some(p) = arg(&args, "--attribution") {
+            listeners.push((p.to_string(), choragus::app::CAP_ATTRIBUTION));
+        }
         let cfg = Config {
             listeners,
             state_dir: arg(&args, "--state").map(String::from),
+            limen_uid: arg(&args, "--limen-uid").and_then(|v| v.parse().ok()),
             lyrad,
             registry: arg(&args, "--app-registry").map(String::from),
             policy_base: arg(&args, "--portcullis-grants").map(String::from),
