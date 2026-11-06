@@ -103,6 +103,12 @@ impl<'a> Ctx<'a> {
             Some(Box::new(handler) as crate::interaction::KeyHandler);
     }
 
+    /// Accept drops from other windows. The handler runs with the drop's
+    /// token current and takes the content with `clipboard::drop_text`.
+    pub fn on_drop<F: Fn() + 'static>(&mut self, id: NodeId, handler: F) {
+        self.interactions.entry(id).on_drop = Some(Box::new(handler));
+    }
+
     /// Receive wheel, navigation-key and press input for a scroll view.
     pub fn on_scroll<F: Fn(&crate::interaction::ScrollInput) + 'static>(&mut self, id: NodeId, handler: F) {
         self.interactions.entry(id).on_scroll = Some(Box::new(handler));

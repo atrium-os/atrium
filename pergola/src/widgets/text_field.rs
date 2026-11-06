@@ -159,6 +159,16 @@ impl View for TextField {
                 _ => {}
             }
         });
+        // A drop from another window appends its text, one line, like a paste.
+        let content = self.content.clone();
+        ctx.on_drop(bg_id, move || {
+            if let Ok(Some(t)) = crate::clipboard::drop_text() {
+                let t: String = t.chars().filter(|c| !c.is_control()).collect();
+                let mut s = content.get_cloned();
+                s.push_str(&t);
+                content.set(s);
+            }
+        });
     }
 }
 
@@ -180,7 +190,7 @@ mod tests {
 
     /// What reached the clipboard, and what it holds.
     #[derive(Default)]
-    struct Log { sets: Vec<(Token, String, bool)>, holds: Option<String> }
+    struct Log { sets: Vec<(Token, String, bool)>, holds: Option<String>, dropped: Option<(Token, String)> }
 
     struct Mem(Rc<RefCell<Log>>);
     impl Backend for Mem {
@@ -193,6 +203,13 @@ mod tests {
         }
         fn get(&mut self, _: Token, _: &[&str]) -> Result<Option<(String, Vec<u8>)>, Error> {
             Ok(self.0.borrow().holds.clone().map(|t| ("text/plain".into(), t.into_bytes())))
+        }
+        fn drop_get(&mut self, token: Token, _: &[&str]) -> Result<Option<(String, Vec<u8>)>, Error> {
+            // Only the drop's own token releases it.
+            match self.0.borrow_mut().dropped.take() {
+                Some((t, text)) if t == token => Ok(Some(("text/plain".into(), text.into_bytes()))),
+                _ => Err(Error::Refused { reason: 1, detail: 0 }),
+            }
         }
     }
 
@@ -267,5 +284,20 @@ mod tests {
         app.handle_event_activated(chord("x"), Some(T));
         assert_eq!(content.get_cloned(), "");
         assert_eq!(log.borrow().holds.as_deref(), Some("move me"));
+    }
+
+    #[test]
+    fn a_drop_appends_its_text_with_the_drop_token() {
+        let (mut app, content, log) = setup(false, "a");
+        log.borrow_mut().dropped = Some((T, "b\nc".into()));
+        // No token: nothing is asked for.
+        app.handle_event(Event::Drop { at: Point::new(10.0, 10.0) });
+        assert_eq!(content.get_cloned(), "a");
+        app.handle_event_activated(Event::Drop { at: Point::new(10.0, 10.0) }, Some(T));
+        assert_eq!(content.get_cloned(), "abc");
+        // Off the field nothing takes it.
+        log.borrow_mut().dropped = Some((T, "z".into()));
+        app.handle_event_activated(Event::Drop { at: Point::new(500.0, 500.0) }, Some(T));
+        assert_eq!(content.get_cloned(), "abc");
     }
 }

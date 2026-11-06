@@ -33,6 +33,11 @@ pub enum Event {
         modifiers: Modifiers,
         chars: String,
     },
+    /// Another window's drag was released here (docs/spec/tabula.md §4).
+    /// The drop's token is the current activation while it is handled, so
+    /// the target's handler takes the content with
+    /// [`crate::clipboard::drop_text`].
+    Drop { at: Point },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

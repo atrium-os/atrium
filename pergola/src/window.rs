@@ -251,12 +251,13 @@ pub enum StepResult {
 }
 
 /// The activation token frescod minted for a press (tabula.md §2.1).
-/// Only presses carry one; an all-zero token means none (synthetic input).
+/// Only presses and drops carry one; an all-zero token means none (synthetic input).
 fn activation_of(ev: &fresco_client::Event) -> Option<crate::clipboard::Token> {
     use fresco_client::Event;
     let tok = match ev {
         Event::Key { pressed: true, activation, .. } => *activation,
         Event::PointerButton { pressed: true, activation, .. } => *activation,
+        Event::Drop { activation, .. } => *activation,
         _ => return None,
     };
     (tok != [0u8; 16]).then_some(tok)

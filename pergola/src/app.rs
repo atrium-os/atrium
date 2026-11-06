@@ -348,6 +348,15 @@ impl<V: View> App<V> {
                 let kind = crate::interaction::ScrollKind::Wheel { at, dx: *dx, dy: *dy, modifiers: mods };
                 self.scroll_to(hit, kind);
             }
+            Event::Drop { at } => {
+                self.pointer = Some(*at);
+                let hit = hit_test(&self.prev_tree, *at);
+                if let Some(id) = hit.and_then(|id| self.bubble_to(id, |h| h.on_drop.is_some())) {
+                    if let Some(cb) = self.interactions.get(id).and_then(|h| h.on_drop.as_ref()) {
+                        cb();
+                    }
+                }
+            }
             Event::Key { kind, key, modifiers, chars } => {
                 self.modifiers = *modifiers;
                 // Tab is focus traversal, owned by the App; focused

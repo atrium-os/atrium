@@ -57,6 +57,8 @@ pub struct Handlers {
     pub on_scroll: Option<ScrollHandler>,
     /// A per-frame step (a fling, an eased jump, a zoom settling).
     pub on_frame: Option<FrameHandler>,
+    /// A drop from another window landed on this node (tabula.md §4).
+    pub on_drop: Option<ClickHandler>,
 }
 
 impl Handlers {

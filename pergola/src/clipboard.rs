@@ -46,6 +46,8 @@ pub enum Error {
 pub trait Backend {
     fn set(&mut self, token: Token, formats: &[(&str, &[u8])], sensitive: bool) -> Result<(), Error>;
     fn get(&mut self, token: Token, accept: &[&str]) -> Result<Option<(String, Vec<u8>)>, Error>;
+    /// Take a dropped drag's content with the `DROP` token (`DROP_GET`).
+    fn drop_get(&mut self, token: Token, accept: &[&str]) -> Result<Option<(String, Vec<u8>)>, Error>;
 }
 
 /// Install a backend for this thread (tests, or an app embedding its own).
@@ -72,6 +74,13 @@ pub fn copy_text(text: &str, sensitive: bool) -> Result<(), Error> {
 pub fn paste_text() -> Result<Option<String>, Error> {
     let token = current_activation().ok_or(Error::NoGesture)?;
     Ok(with_backend(|b| b.get(token, &["text/plain"]))?.map(|(_, b)| String::from_utf8_lossy(&b).into_owned()))
+}
+
+/// Inside a drop handler: the dropped content as text, if it offers
+/// `text/plain`. Invalid UTF-8 is replaced.
+pub fn drop_text() -> Result<Option<String>, Error> {
+    let token = current_activation().ok_or(Error::NoGesture)?;
+    Ok(with_backend(|b| b.drop_get(token, &["text/plain"]))?.map(|(_, b)| String::from_utf8_lossy(&b).into_owned()))
 }
 
 /// Tabula over its socket: `TABULA_SOCKET`, else the path Portcullis
@@ -119,6 +128,23 @@ impl Tabula {
     }
 }
 
+impl Tabula {
+    /// A `Got` reply's blob, which Tabula pushed into this connection's cache.
+    fn fetch(&mut self, r: tabula::proto::Reply) -> Result<Option<(String, Vec<u8>)>, Error> {
+        use tabula::proto::Reply;
+        match r {
+            Reply::Got { format } => {
+                let bytes = self.conn()?.cache_get(&format.hash)
+                    .ok_or_else(|| Error::Unavailable("blob missing".into()))?;
+                Ok(Some((format.mime, bytes)))
+            }
+            Reply::Empty => Ok(None),
+            Reply::Refused { reason, detail } => Err(Error::Refused { reason, detail }),
+            other => Err(Error::Unavailable(format!("unexpected reply {other:?}"))),
+        }
+    }
+}
+
 impl Backend for Tabula {
     fn set(&mut self, token: Token, formats: &[(&str, &[u8])], sensitive: bool) -> Result<(), Error> {
         use tabula::proto::{op, Format, Reply, Set};
@@ -135,17 +161,14 @@ impl Backend for Tabula {
     }
 
     fn get(&mut self, token: Token, accept: &[&str]) -> Result<Option<(String, Vec<u8>)>, Error> {
-        use tabula::proto::{op, Get, Reply};
-        let req = Get { token, accept: accept.iter().map(|s| s.to_string()).collect() };
-        match self.call(op::GET, &req)? {
-            Reply::Got { format } => {
-                let bytes = self.conn()?.cache_get(&format.hash)
-                    .ok_or_else(|| Error::Unavailable("blob missing".into()))?;
-                Ok(Some((format.mime, bytes)))
-            }
-            Reply::Empty => Ok(None),
-            Reply::Refused { reason, detail } => Err(Error::Refused { reason, detail }),
-            other => Err(Error::Unavailable(format!("unexpected reply {other:?}"))),
-        }
+        let req = tabula::proto::Get { token, accept: accept.iter().map(|s| s.to_string()).collect() };
+        let r = self.call(tabula::proto::op::GET, &req)?;
+        self.fetch(r)
+    }
+
+    fn drop_get(&mut self, token: Token, accept: &[&str]) -> Result<Option<(String, Vec<u8>)>, Error> {
+        let req = tabula::proto::DropGet { token, accept: accept.iter().map(|s| s.to_string()).collect() };
+        let r = self.call(tabula::proto::op::DROP_GET, &req)?;
+        self.fetch(r)
     }
 }

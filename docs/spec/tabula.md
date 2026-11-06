@@ -351,8 +351,12 @@ is sent), over a `Backend` that is Tabula's socket in production (`TABULA_SOCKET
 (they used to append the letter); Ctrl-C/X copy or cut the whole field (no selection yet); Ctrl-V
 appends `text/plain` with control characters dropped; a `secret` field never copies or cuts.
 Tested in `text_field.rs` and against the real server code in `pergola/tests/clipboard_tabula.rs`.
-Live use waits for frescod's tokens: `Window` passes none until fresco-client's press events
-carry `activation`.
+`Window` passes the `activation` of fresco-client's key and button presses (04c295d) and of
+`Event::Drop`. Drops: fresco-client's `Drop` becomes `pergola::Event::Drop { at }`; the App
+hit-tests it to the nearest `Ctx::on_drop` node, whose handler calls `clipboard::drop_text`
+(`DROP_GET` with the drop token). `TextField` takes drops like pastes. Not built: starting a drag
+from Pergola (`DRAG_BEGIN` + `Connection::drag_begin`), and a drop highlight on
+`DragEnter`/`DragLeave`.
 
 ## 7. Order of work
 

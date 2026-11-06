@@ -37,6 +37,7 @@ pub fn translate(ev: &fresco_client::Event) -> Option<Event> {
         fresco_client::Event::PointerScroll { dx, dy, .. } => {
             Some(Event::Scroll { at: None, dx: *dx, dy: *dy, modifiers: Modifiers::default() })
         }
+        fresco_client::Event::Drop { x, y, .. } => Some(Event::Drop { at: Point::new(*x, *y) }),
         // Window lifecycle events not yet routed through Pergola's
         // input system — the embedder handles them at the loop level.
         fresco_client::Event::Resized { .. }
@@ -50,11 +51,11 @@ pub fn translate(ev: &fresco_client::Event) -> Option<Event> {
         | fresco_client::Event::DisplayChanged(_)
         // Pergola draws no filled paths yet, so it has none to fall back for.
         | fresco_client::Event::FillsDropped { .. }
-        // Drag and drop (tabula.md §4): not routed to widgets yet.
+        // Drag hover (no drop highlight yet) and the end of a drag this
+        // window started (Pergola starts none yet).
         | fresco_client::Event::DragEnter { .. }
         | fresco_client::Event::DragOver { .. }
         | fresco_client::Event::DragLeave { .. }
-        | fresco_client::Event::Drop { .. }
         | fresco_client::Event::DragEnd { .. }
         | fresco_client::Event::Unknown { .. } => None,
     }
