@@ -7,12 +7,12 @@ use std::io;
 use std::time::{Duration, Instant};
 
 use fresco_client::{Connection, Event};
-use limen::media_player::{code, Source as LoadSource, ToChild, ToParent, RANGES_MAX, TIME_HZ_MAX};
+use limen::media_player::{code, Source as LoadSource, TextChoice, ToChild, ToParent, RANGES_MAX, TIME_HZ_MAX};
 
 use crate::audio_out::AudioOut;
 use crate::controls::{Action, Controls};
 use crate::fresco_sink::FrescoSink;
-use crate::supervisor::{Options, Player, PlayerEvent, Source};
+use crate::supervisor::{Options, Player, PlayerEvent, Source, Subtitles};
 use crate::wire::err;
 
 /// Play that has not moved for this long is reported to the parent as
@@ -27,6 +27,8 @@ pub enum HostEvent {
     /// narrowed by limend; `true` if it is still being written (until
     /// `LoadDone`).
     Load(std::os::fd::OwnedFd, bool),
+    /// `TextTrack` with its WebVTT file.
+    TextTrack { id: u8, lang: String, label: String, file: std::os::fd::OwnedFd },
     /// The slot is hidden: pause, and keep the position.
     Suspend,
     Resume,
@@ -89,6 +91,7 @@ impl Host for LimenHost {
                     let fd = self.child.take_fd();
                     match (embed == self.embed, ToChild::decode(&bytes), fd) {
                         (true, Some(ToChild::Load { source: LoadSource::Fd, growing, .. }), Some(fd)) => out.push(HostEvent::Load(fd, growing)),
+                        (true, Some(ToChild::TextTrack { id, lang, label }), Some(fd)) => out.push(HostEvent::TextTrack { id, lang, label, file: fd }),
                         _ => self.dropped += 1,
                     }
                 }
@@ -144,6 +147,10 @@ pub struct App<H: Host> {
     rate: f64,
     /// Since when play is waiting for the audio to start.
     audio_wait: Option<Instant>,
+    /// The page's subtitle files (id, language, label), for the player
+    /// whenever it starts.
+    texts: Vec<(u8, String, String, File)>,
+    subtitles: Subtitles,
 }
 
 fn secs(ns: i64) -> f64 {
@@ -197,6 +204,8 @@ impl<H: Host> App<H> {
             volume: 1.0,
             rate: 1.0,
             audio_wait: None,
+            texts: Vec::new(),
+            subtitles: Subtitles::InBand,
         }
     }
 
@@ -205,6 +214,11 @@ impl<H: Host> App<H> {
             Some(p) => &mut p.sink,
             None => self.sink.as_mut().expect("a sink until the player takes it"),
         }
+    }
+
+    /// Quit when playback ends (the standalone player).
+    pub fn set_exit_at_end(&mut self, yes: bool) {
+        self.exit_at_end = yes;
     }
 
     /// Start playing a whole resource now (the standalone player).
@@ -225,6 +239,12 @@ impl<H: Host> App<H> {
             Source::File(f) if growing => Player::new_growing(self.opts.clone(), sink, f)?,
             source => Player::new(self.opts.clone(), sink, source)?,
         };
+        for (id, _, _, f) in &self.texts {
+            if let Ok(f) = f.try_clone() {
+                let _ = p.add_text_file(*id, f);
+            }
+        }
+        p.set_subtitles(self.subtitles);
         // Paused until Play, with the first frame showing as the poster.
         p.set_paused(true);
         p.show_next();
@@ -319,6 +339,21 @@ impl<H: Host> App<H> {
                 return Ok(());
             }
             HostEvent::Load(fd, growing) => return self.start(Source::File(File::from(fd)), growing),
+            HostEvent::TextTrack { id, lang, label, file } => {
+                let file = File::from(file);
+                if !file.metadata().is_ok_and(|m| m.is_file()) {
+                    self.host.emit(ToParent::Error { code: code::STATE, track: None });
+                    return Ok(());
+                }
+                if let Some(p) = self.player.as_mut() {
+                    if let Ok(f) = file.try_clone() {
+                        let _ = p.add_text_file(id, f);
+                    }
+                }
+                self.texts.retain(|t| t.0 != id);
+                self.texts.push((id, lang, label, file));
+                return Ok(());
+            }
             HostEvent::Msg(m) => m,
         };
         fn feed<H: Host>(app: &mut App<H>) -> Option<&mut Player<FrescoSink>> {
@@ -332,6 +367,18 @@ impl<H: Host> App<H> {
             // it is out of place.
             ToChild::Load { source: LoadSource::Fd, .. } => self.host.emit(ToParent::Error { code: code::STATE, track: None }),
             ToChild::OpenSource => self.start(Source::Feed(Vec::new()), false)?,
+            // Its file comes with it, as HostEvent::TextTrack.
+            ToChild::TextTrack { .. } => self.host.emit(ToParent::Error { code: code::STATE, track: None }),
+            ToChild::ShowText { text } => {
+                self.subtitles = match text {
+                    TextChoice::None => Subtitles::None,
+                    TextChoice::InBand => Subtitles::InBand,
+                    TextChoice::Page(id) => Subtitles::Page(id),
+                };
+                if let Some(p) = self.player.as_mut() {
+                    p.set_subtitles(self.subtitles);
+                }
+            }
             ToChild::LoadDone => match self.player.as_mut() {
                 Some(p) => p.input_done(),
                 None => self.host.emit(ToParent::Error { code: code::STATE, track: None }),

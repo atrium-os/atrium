@@ -109,7 +109,7 @@ impl FakePlayer {
             ToChild::Stop => {}
             ToChild::LoadDone => { if !self.loaded || self.feed { self.violation("LoadDone without a Load".into()) } }
             ToChild::Seek { secs } => { self.time = secs; self.pending.push_back(ToParent::Time { secs }) }
-            ToChild::SetVolume { .. } | ToChild::SetRate { .. } => {}
+            ToChild::SetVolume { .. } | ToChild::SetRate { .. } | ToChild::TextTrack { .. } | ToChild::ShowText { .. } => {}
         }
     }
 

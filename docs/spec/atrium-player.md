@@ -299,6 +299,20 @@ Fresco's layers land.
   ending (a note every second keeps the watchdog quiet), doesn't go looking for Cues that
   aren't written yet, and ends only after `LoadDone`. A seek back into what has arrived
   works meanwhile (`worker/tests/play.rs`).
+- M7, page subtitles: `TextTrack { id, lang, label }` carries a WebVTT file (`<track>`) as a
+  regular-file descriptor, and `ShowText { None | InBand | Page(id) }` picks what shows
+  (in-band by default). The decode worker parses the file (`cue::vtt_file`: signature,
+  timings, NOTE/STYLE/REGION skipped, markup stripped, 4 MiB and 8192 cues at most, a cue at
+  most a minute), so the supervisor still parses nothing. A restarted worker reads the
+  files again; a new file under an id replaces the old one's cues.
+- M7, a URL in the standalone player (`atrium-player URL`, windowed or `--headless`): the
+  player starts `atrium-player-fetch`, a process of its own that reads its trust store,
+  enters Capsicum (network through casper, as navigator-fetchd), and only then reads the
+  URL. It fetches through Nuntius with `Fd` delivery and hands back the read-only
+  descriptor as soon as the head is in; the player plays it as a growing `Load` and gets
+  `LoadDone` at `Done`. A download cut off part way plays what arrived. Neither the
+  supervisor nor the worker gets network. It stands in for nuntiusd and the `net.fetch`
+  launch (nuntius.md §6 steps 2 and 4) and should move to them when they exist.
 
 **Tests along the way:**
 - every demuxer limit has a test with a crafted file that exceeds it;

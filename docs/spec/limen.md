@@ -187,6 +187,8 @@ There are two ways to feed it.
 | parent → child | `Seek` | `secs: f64` |
 | parent → child | `SetVolume` | `volume: f32` (0 to 1) |
 | parent → child | `SetRate` | `rate: f32` (0.25 to 4) |
+| parent → child | `TextTrack` | `id: u8` (at most 16), `lang`, `label` (64 bytes each), with a WebVTT file as a regular-file descriptor: the page's `<track>` |
+| parent → child | `ShowText` | `text`: `None`, `InBand` (the default) or `Page(id)` |
 | child → parent | `Ready` | `duration_secs: f64`, `width`, `height` |
 | child → parent | `CanPlay` | `mime`, `supported: bool`: the reply, for `MediaSource.isTypeSupported` |
 | child → parent | `Playing`, `Paused` | none: the play state changed, from the parent's message or the native controls |

@@ -6,7 +6,7 @@ use std::path::PathBuf;
 use std::rc::Rc;
 use std::time::{Duration, Instant};
 
-use atrium_player::supervisor::{LocalSink, Options, Player, PlayerEvent, Source};
+use atrium_player::supervisor::{LocalSink, Options, Player, PlayerEvent, Source, Subtitles};
 use atrium_player::wire::{err, Limits};
 use md5::{Digest, Md5};
 
@@ -405,4 +405,49 @@ fn a_growing_file_waits_at_its_end_until_load_done() {
     assert_eq!(hashes, layer_refs(name), "every frame, once, in order");
     assert_eq!(p.worker_pid(), pid);
     let _ = std::fs::remove_file(&path);
+}
+
+#[test]
+fn page_subtitles_show_when_chosen() {
+    // The media has its own cues; the page adds a file of its own.
+    let mut p = Player::new(opts(), LocalSink::new(Box::new(|_, _| {})), load("subs-vtt.webm")).unwrap();
+    let pid = p.worker_pid();
+    p.add_text_file(2, File::open(asset("subs.vtt")).unwrap()).unwrap();
+    let fr = std::env::temp_dir().join(format!("atrium-subs-fr-{}.vtt", std::process::id()));
+    std::fs::write(&fr, "WEBVTT\n\nNOTE French\n\n1\n00:00.300 --> 00:00.800\nBonjour &amp; <b>salut</b>\n").unwrap();
+    p.add_text_file(5, File::open(&fr).unwrap()).unwrap();
+    assert!(p.add_text_file(6, File::open("/dev/null").unwrap()).is_err(), "only a regular file");
+    let mut pcm = vec![0f32; 1 << 16];
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let have = |p: &mut Player<LocalSink>, s: Subtitles, t: i64| {
+        p.set_subtitles(s);
+        !p.cues_at(t).is_empty()
+    };
+    while !(have(&mut p, Subtitles::InBand, 1_200_000_000) && have(&mut p, Subtitles::Page(2), 1_200_000_000) && have(&mut p, Subtitles::Page(5), 500_000_000)) {
+        assert!(Instant::now() < deadline, "cues arrive");
+        p.poll(Duration::from_millis(10));
+        p.read_pcm(&mut pcm);
+    }
+    p.set_subtitles(Subtitles::Page(5));
+    assert_eq!(p.cues_at(500_000_000), vec!["Bonjour & salut"]);
+    assert_eq!(p.cues_at(1_200_000_000), Vec::<&str>::new(), "only the chosen file's cues");
+    p.set_subtitles(Subtitles::Page(2));
+    assert_eq!(p.cues_at(500_000_000), vec!["Hello, world"]);
+    assert_eq!(p.cues_at(1_200_000_000), vec!["Second line\ntwo rows"]);
+    p.set_subtitles(Subtitles::None);
+    assert_eq!(p.cues_at(500_000_000), Vec::<&str>::new());
+    // A new file under an id replaces the old one's cues.
+    std::fs::write(&fr, "WEBVTT\n\n00:01.000 --> 00:01.500\nAu revoir\n").unwrap();
+    p.add_text_file(5, File::open(&fr).unwrap()).unwrap();
+    p.set_subtitles(Subtitles::Page(5));
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while p.cues_at(1_200_000_000).is_empty() {
+        assert!(Instant::now() < deadline, "the new file's cues arrive");
+        p.poll(Duration::from_millis(10));
+        p.read_pcm(&mut pcm);
+    }
+    assert_eq!(p.cues_at(500_000_000), Vec::<&str>::new(), "the old file's cue is gone");
+    assert_eq!(p.cues_at(1_200_000_000), vec!["Au revoir"]);
+    assert_eq!(p.worker_pid(), pid);
+    let _ = std::fs::remove_file(&fr);
 }
