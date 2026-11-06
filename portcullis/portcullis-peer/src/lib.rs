@@ -40,6 +40,23 @@ pub fn allocate(registry_path: &str) -> u32 {
 // ── getpeereid: the unforgeable handle ────────────────────────────────────────
 
 /// The connected peer's `(uid, gid)` — the kernel's authenticated answer.
+#[cfg(target_os = "linux")]
+pub fn uid_gid(fd: RawFd) -> io::Result<(u32, u32)> {
+    // Linux has no getpeereid; SO_PEERCRED gives the same kernel answer.
+    // Only for building and testing off-target (the cloud containers).
+    let mut cred = libc::ucred { pid: 0, uid: 0, gid: 0 };
+    let mut len = std::mem::size_of::<libc::ucred>() as libc::socklen_t;
+    let r = unsafe {
+        libc::getsockopt(fd, libc::SOL_SOCKET, libc::SO_PEERCRED, &mut cred as *mut _ as *mut libc::c_void, &mut len)
+    };
+    if r < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok((cred.uid, cred.gid))
+}
+
+/// The connected peer's `(uid, gid)` — the kernel's authenticated answer.
+#[cfg(not(target_os = "linux"))]
 pub fn uid_gid(fd: RawFd) -> io::Result<(u32, u32)> {
     let mut uid: libc::uid_t = 0;
     let mut gid: libc::gid_t = 0;

@@ -40,7 +40,22 @@ pub struct WindowFrame {
     pub path_ids: Vec<u32>,
     pub quad_ids: Vec<Vec<u32>>,
     pub run_ids: Vec<Vec<u32>>,
+    /// The window uses groups (fresco-scene-groups.md): draw these, in this
+    /// order, instead of by kind. Indices are into the vectors above, and
+    /// each texture or glyph node has a batch of its own.
+    pub order: Option<Vec<OrderItem>>,
 }
+
+/// One element of a grouped window, in paint order.
+#[derive(Clone, Copy, Debug)]
+pub struct OrderItem {
+    pub item: fresco_compute::Node,
+    /// Window pixels `[x0, y0, x1, y1)`, all the groups' clips intersected.
+    pub clip: Option<[f32; 4]>,
+    /// The node it came from, for drop reports.
+    pub node: u32,
+}
+
 
 /// A window's finished pixels, BGRA8, `width * height` words.
 pub struct Pixels {
@@ -222,6 +237,9 @@ impl SceneState {
             fills: f.fills.clone(),
             ..Default::default()
         };
+        if let Some(order) = &f.order {
+            return self.pack_grouped(f, order, scene, width, height);
+        }
         let mut index: HashMap<u32, usize> = HashMap::new();
         let mut tex_index = |slot: u32, scene: &mut fc::Scene| -> Option<usize> {
             if let Some(&i) = index.get(&slot) {
@@ -293,6 +311,10 @@ pub fn window_frame(fe: &EnvelopeFrontend, id: u32, pos: (f32, f32), size: (f32,
         size: (size.0.ceil() as u32, size.1.ceil() as u32),
         ..Default::default()
     };
+    if state.has_groups() {
+        grouped_frame(state, &mut w);
+        return Some(w);
+    }
     /* Paint in node_id order (lower id → drawn first → bottom).
      * The per-window node maps are HashMaps, whose iteration
      * order is seeded per-process; iterating `.values()` directly
@@ -372,6 +394,227 @@ pub fn window_frame(fe: &EnvelopeFrontend, id: u32, pos: (f32, f32), size: (f32,
         w.run_ids.push(ids);
     }
     Some(w)
+}
+
+impl SceneState {
+    /// `pack_report` for a window that uses groups: its elements in tree
+    /// order, kinds interleaved, each under its clip.
+    fn pack_grouped(
+        &self,
+        f: &WindowFrame,
+        order: &[OrderItem],
+        mut scene: fresco_compute::Scene,
+        width: u32,
+        height: u32,
+    ) -> (fresco_compute::Frame, Vec<(u32, u8)>) {
+        use fresco_compute as fc;
+        // Batches whose slot is not uploaded are left out, as in the flat
+        // path; `remap` says where each batch landed.
+        let mut index: HashMap<u32, usize> = HashMap::new();
+        let mut tex_index = |slot: u32, scene: &mut fc::Scene| -> Option<usize> {
+            if let Some(&i) = index.get(&slot) {
+                return Some(i);
+            }
+            let t = self.slots.get(&slot)?.clone();
+            scene.textures.push(t);
+            index.insert(slot, scene.textures.len() - 1);
+            Some(scene.textures.len() - 1)
+        };
+        let mut tex_remap = Vec::with_capacity(f.batches.len());
+        for b in &f.batches {
+            tex_remap.push(tex_index(b.slot_id, &mut scene).map(|texture| {
+                scene.texture_batches.push(fc::TextureBatch { texture, quads: b.nodes.iter().map(|n| n.model).collect() });
+                scene.texture_batches.len() - 1
+            }));
+        }
+        let mut glyph_remap = Vec::with_capacity(f.glyph_batches.len());
+        for b in &f.glyph_batches {
+            glyph_remap.push(tex_index(b.atlas_slot_id, &mut scene).map(|atlas| {
+                let runs = b.nodes.iter().map(|n| {
+                    let (count, off) = (n.meta[0].max(0) as usize, n.meta[1].max(0) as usize);
+                    let glyphs = b.glyphs.get(off..off + count).unwrap_or(&[]);
+                    fc::GlyphRun {
+                        origin: [n.origin[0], n.origin[1]],
+                        color: n.color,
+                        glyphs: glyphs.iter().map(|g| fc::Glyph { d_offset: g.d_offset, atlas_uv: g.atlas_uv, bearing: g.bearing }).collect(),
+                    }
+                }).collect();
+                scene.glyph_batches.push(fc::GlyphBatch { atlas, runs });
+                scene.glyph_batches.len() - 1
+            }));
+        }
+        let mut placed = Vec::with_capacity(order.len());
+        let mut node_of: HashMap<fc::Node, u32> = HashMap::with_capacity(order.len());
+        for o in order {
+            let item = match o.item {
+                fc::Node::Quad(b, q) => match tex_remap.get(b).copied().flatten() {
+                    Some(b) => fc::Node::Quad(b, q),
+                    None => continue,
+                },
+                fc::Node::Run(b, r) => match glyph_remap.get(b).copied().flatten() {
+                    Some(b) => fc::Node::Run(b, r),
+                    None => continue,
+                },
+                other => other,
+            };
+            placed.push(fc::Placed { item, clip: o.clip });
+            node_of.insert(item, o.node);
+        }
+        let (mut frame, drops) = {
+            let mut cache = self.fills.lock().unwrap_or_else(|e| e.into_inner());
+            fc::Frame::pack_ordered(&scene, &placed, width, height, width, Some(&mut cache))
+        };
+        if f.id != 0 {
+            frame.header.clear = fc::TRANSPARENT;
+        }
+        let drops = drops.into_iter().filter_map(|(n, why)| Some((*node_of.get(&n)?, why))).collect();
+        (frame, drops)
+    }
+}
+
+/// A group's composed transform: uniform scale, then translation (window
+/// pixels), in f64 (fresco-scene-groups.md §2.3).
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct Xf {
+    s: f64,
+    tx: f64,
+    ty: f64,
+}
+
+impl Xf {
+    const ID: Xf = Xf { s: 1.0, tx: 0.0, ty: 0.0 };
+    fn then(self, t: &[f32; 6]) -> Xf {
+        // self ∘ t, t = [s, 0, 0, s, e, f].
+        Xf { s: self.s * t[0] as f64, tx: self.s * t[4] as f64 + self.tx, ty: self.s * t[5] as f64 + self.ty }
+    }
+    fn x(self, x: f32) -> f32 { (self.s * x as f64 + self.tx) as f32 }
+    fn y(self, y: f32) -> f32 { (self.s * y as f64 + self.ty) as f32 }
+    fn len(self, v: f32) -> f32 { (self.s * v as f64) as f32 }
+    fn rect(self, r: [f32; 4]) -> [f32; 4] { [self.x(r[0]), self.y(r[1]), self.x(r[2]), self.y(r[3])] }
+}
+
+fn meet(a: Option<[f32; 4]>, b: Option<[f32; 4]>) -> Option<[f32; 4]> {
+    match (a, b) {
+        (Some(a), Some(b)) => Some([a[0].max(b[0]), a[1].max(b[1]), a[2].min(b[2]), a[3].min(b[3])]),
+        (a, None) => a,
+        (None, b) => b,
+    }
+}
+
+fn empty(c: Option<[f32; 4]>) -> bool {
+    c.is_some_and(|c| c[0] >= c[2] || c[1] >= c[3])
+}
+
+/// Fill `w` from a window that uses groups: unplaced leaves first, in the
+/// flat path's kind-then-id order (so a client that never places a node
+/// draws as before), then the tree, depth first, siblings by (order, id).
+fn grouped_frame(state: &fresco_scene_server::command::envelope_frontend::WindowSceneState, w: &mut WindowFrame) {
+    use fresco_compute::Node as Item;
+    let mut order: Vec<OrderItem> = Vec::new();
+    let sorted = |keys: Vec<&u32>| { let mut k: Vec<u32> = keys.into_iter().copied().collect(); k.sort_unstable(); k };
+    let unplaced = |id: &u32| !state.placements.contains_key(id);
+
+    // One element, under transform `x`, opacity `op` and clip `clip`.
+    let emit = |w: &mut WindowFrame, order: &mut Vec<OrderItem>, id: u32, x: Xf, op: f32, clip: Option<[f32; 4]>| {
+        let item = if let Some(p) = state.rect_nodes.get(&id) {
+            w.rects.push(SceneNode {
+                position: [x.x(p.x), x.y(p.y)],
+                size: [x.len(p.w), x.len(p.h)],
+                color: [p.r, p.g, p.b, p.a * op],
+                radius: x.len(p.radius),
+                _pad: [0.0; 3],
+            });
+            Item::Rect(w.rects.len() - 1)
+        } else if let Some(p) = state.path_nodes.get(&id) {
+            let mut n = translate_path(p, 0.0, 0.0);
+            n.model = [x.x(p.cx), x.y(p.cy), x.len(p.length), x.len(p.width)];
+            n.color[3] *= op;
+            w.paths.push(n);
+            Item::Path(w.paths.len() - 1)
+        } else if let Some(p) = state.fill_nodes.get(&id) {
+            let mut fl = translate_fill(p);
+            let t = fl.transform;
+            let s = x.s as f32;
+            fl.transform = [s * t[0], s * t[1], s * t[2], s * t[3], x.x(t[4]), x.y(t[5])];
+            fl.clip = meet(fl.clip.map(|c| x.rect(c)), clip);
+            fl.color[3] *= op;
+            w.fills.push(fl);
+            w.fill_ids.push(id);
+            Item::Fill(w.fills.len() - 1)
+        } else if let Some(p) = state.texture_nodes.get(&id) {
+            let mut n = translate_texture(p, 0.0, 0.0);
+            let [qx, qy, qw, qh] = n.model;
+            n.model = [x.x(qx), x.y(qy), x.len(qw), x.len(qh)];
+            w.batches.push(TextureBatch { slot_id: p.slot_id, nodes: vec![n] });
+            Item::Quad(w.batches.len() - 1, 0)
+        } else if let Some(p) = state.glyph_run_nodes.get(&id) {
+            // Glyphs are atlas bitmaps at the size they were shaped: a run
+            // moves with its group but does not scale (§3 step 1).
+            let glyphs = p.glyphs.iter().map(|g| GlyphInstance {
+                d_offset: [g.dx, g.dy],
+                atlas_uv: [g.atlas_u as f32, g.atlas_v as f32, g.atlas_w as f32, g.atlas_h as f32],
+                bearing: [g.bearing_x, g.bearing_y],
+                ..Default::default()
+            }).collect::<Vec<_>>();
+            w.glyph_batches.push(GlyphRunBatch {
+                atlas_slot_id: p.atlas_slot_id,
+                nodes: vec![GlyphRunNode {
+                    origin: [x.x(p.x), x.y(p.y), 0.0, 0.0],
+                    atlas_dim: [p.atlas_width as f32, p.atlas_height as f32, 0.0, 0.0],
+                    color: [p.r, p.g, p.b, p.a * op],
+                    meta: [glyphs.len() as i32, 0, 0, 0],
+                }],
+                glyphs,
+            });
+            Item::Run(w.glyph_batches.len() - 1, 0)
+        } else {
+            return;
+        };
+        order.push(OrderItem { item, clip, node: id });
+    };
+
+    // The flat layer: kind, then id, as `window_frame` draws a flat window.
+    for id in sorted(state.rect_nodes.keys().filter(|i| unplaced(i)).collect()) { emit(w, &mut order, id, Xf::ID, 1.0, None); }
+    for id in sorted(state.path_nodes.keys().filter(|i| unplaced(i)).collect()) { emit(w, &mut order, id, Xf::ID, 1.0, None); }
+    for id in sorted(state.fill_nodes.keys().filter(|i| unplaced(i)).collect()) { emit(w, &mut order, id, Xf::ID, 1.0, None); }
+    for id in sorted(state.texture_nodes.keys().filter(|i| unplaced(i)).collect()) { emit(w, &mut order, id, Xf::ID, 1.0, None); }
+    for id in sorted(state.glyph_run_nodes.keys().filter(|i| unplaced(i)).collect()) { emit(w, &mut order, id, Xf::ID, 1.0, None); }
+
+    // The tree. Children of each parent (None = root), by (order, id).
+    let mut kids: HashMap<Option<u32>, Vec<(u32, u32)>> = HashMap::new();
+    for (&id, g) in &state.group_nodes {
+        kids.entry(g.parent).or_default().push((g.order, id));
+    }
+    for (&id, p) in &state.placements {
+        kids.entry(p.parent).or_default().push((p.order, id));
+    }
+    for v in kids.values_mut() {
+        v.sort_unstable();
+    }
+    // Iterative depth-first walk (§2.3): a stack of (node, transform,
+    // opacity, clip), children pushed in reverse so they pop in order.
+    let mut stack: Vec<(u32, Xf, f32, Option<[f32; 4]>)> = Vec::new();
+    let push_kids = |stack: &mut Vec<_>, of: Option<u32>, x: Xf, op: f32, clip: Option<[f32; 4]>| {
+        if let Some(v) = kids.get(&of) {
+            for &(_, id) in v.iter().rev() {
+                stack.push((id, x, op, clip));
+            }
+        }
+    };
+    push_kids(&mut stack, None, Xf::ID, 1.0, None);
+    while let Some((id, x, op, clip)) = stack.pop() {
+        if let Some(g) = state.group_nodes.get(&id) {
+            // The group's clip is in its parent's space: map it with `x`.
+            let c = meet(clip, g.clip.map(|c| x.rect(c)));
+            if empty(c) {
+                continue; // nothing of it can show: skip the subtree
+            }
+            push_kids(&mut stack, Some(id), x.then(&g.transform), op * g.opacity, c);
+        } else {
+            emit(w, &mut order, id, x, op, clip);
+        }
+    }
+    w.order = Some(order);
 }
 
 fn translate_rect(p: &RectParams, ox: f32, oy: f32) -> SceneNode {
@@ -509,5 +752,141 @@ mod budget_tests {
         assert_eq!(frame.header.op_count as usize, n);
         let why = fresco_protocol::fill_drop::OP_BUDGET;
         assert_eq!(drops, vec![(20, why), (21, why)]);
+    }
+}
+
+#[cfg(test)]
+mod group_tests {
+    //! Windows that use groups (fresco-scene-groups.md §2–3).
+    use super::*;
+    use fresco_compute::reference;
+    use fresco_protocol::{GroupParams, PlaceParams};
+    use fresco_scene_server::command::envelope_frontend::WindowSceneState;
+
+    const W: u32 = 64;
+
+    fn rect(s: &mut WindowSceneState, id: u32, x: f32, y: f32, w: f32, h: f32, c: [f32; 4]) {
+        s.leaf_replaces(id);
+        s.rect_nodes.insert(id, RectParams { x, y, w, h, r: c[0], g: c[1], b: c[2], a: c[3], radius: 0.0 });
+        s.node_writers.insert(id, 1);
+    }
+    fn group(s: &mut WindowSceneState, id: u32, parent: Option<u32>, order: u32, t: [f32; 6], clip: Option<[f32; 4]>) {
+        s.set_group(id, GroupParams { parent, order, transform: t, clip, opacity: 1.0, flags: 0 }, 1).unwrap();
+    }
+    fn place(s: &mut WindowSceneState, id: u32, parent: Option<u32>, order: u32) {
+        s.place(id, PlaceParams { parent, order }, 1).unwrap();
+    }
+    fn flat(s: &WindowSceneState) -> WindowFrame {
+        // What `window_frame` builds for a window without groups.
+        let mut w = WindowFrame { id: 1, size: (W, W), ..Default::default() };
+        let mut ids: Vec<&u32> = s.rect_nodes.keys().collect();
+        ids.sort_unstable();
+        for id in ids {
+            w.rect_ids.push(*id);
+            w.rects.push(translate_rect(&s.rect_nodes[id], 0.0, 0.0));
+        }
+        w
+    }
+    fn grouped(s: &WindowSceneState) -> WindowFrame {
+        let mut w = WindowFrame { id: 1, size: (W, W), ..Default::default() };
+        grouped_frame(s, &mut w);
+        w
+    }
+    fn draw(w: &WindowFrame) -> Vec<u32> {
+        reference::render(&SceneState::default().pack(w, W, W))
+    }
+    const RED: [f32; 4] = [1.0, 0.0, 0.0, 1.0];
+    const BLUE: [f32; 4] = [0.0, 0.0, 1.0, 1.0];
+    const ID: [f32; 6] = GroupParams::IDENTITY;
+
+    #[test]
+    fn unplaced_leaves_draw_as_a_flat_window() {
+        let mut s = WindowSceneState::new();
+        rect(&mut s, 2, 0.0, 0.0, 40.0, 40.0, RED);
+        rect(&mut s, 1, 20.0, 20.0, 40.0, 40.0, BLUE);
+        let want = draw(&flat(&s));
+        group(&mut s, 100, None, 0, ID, None); // an empty group: the window now uses groups
+        assert!(s.has_groups());
+        assert_eq!(draw(&grouped(&s)), want);
+    }
+
+    #[test]
+    fn a_translated_group_equals_the_same_rects_moved_by_hand() {
+        let mut s = WindowSceneState::new();
+        group(&mut s, 100, None, 0, [1.0, 0.0, 0.0, 1.0, 10.0, 5.0], None);
+        rect(&mut s, 1, 0.0, 0.0, 8.0, 8.0, RED);
+        place(&mut s, 1, Some(100), 0);
+        let mut by_hand = WindowSceneState::new();
+        rect(&mut by_hand, 1, 10.0, 5.0, 8.0, 8.0, RED);
+        assert_eq!(draw(&grouped(&s)), draw(&flat(&by_hand)));
+        // Scale 2 about the group's origin, then the translation.
+        group(&mut s, 100, None, 0, [2.0, 0.0, 0.0, 2.0, 10.0, 5.0], None);
+        let mut by_hand = WindowSceneState::new();
+        rect(&mut by_hand, 1, 10.0, 5.0, 16.0, 16.0, RED);
+        assert_eq!(draw(&grouped(&s)), draw(&flat(&by_hand)));
+    }
+
+    #[test]
+    fn siblings_draw_by_order_then_id_not_by_kind_or_id() {
+        let mut s = WindowSceneState::new();
+        group(&mut s, 100, None, 0, ID, None);
+        rect(&mut s, 1, 0.0, 0.0, 64.0, 64.0, RED);
+        rect(&mut s, 2, 0.0, 0.0, 64.0, 64.0, BLUE);
+        // Higher id, lower order: drawn first, so red (id 1) ends on top.
+        place(&mut s, 2, Some(100), 1);
+        place(&mut s, 1, Some(100), 2);
+        let px = draw(&grouped(&s));
+        let mut red = WindowSceneState::new();
+        rect(&mut red, 1, 0.0, 0.0, 64.0, 64.0, RED);
+        assert_eq!(px, draw(&flat(&red)));
+    }
+
+    #[test]
+    fn clips_nest_and_a_hidden_subtree_is_skipped() {
+        let mut s = WindowSceneState::new();
+        // Outer clip [0,0,32,64), inner group translated by 16 with its own
+        // clip [0,0,40,64) in the outer's space: the meet is [0,0,32,64).
+        group(&mut s, 100, None, 0, ID, Some([0.0, 0.0, 32.0, 64.0]));
+        group(&mut s, 101, Some(100), 0, [1.0, 0.0, 0.0, 1.0, 16.0, 0.0], Some([0.0, 0.0, 40.0, 64.0]));
+        rect(&mut s, 1, 0.0, 0.0, 64.0, 64.0, RED);
+        place(&mut s, 1, Some(101), 0);
+        let mut by_hand = WindowSceneState::new();
+        rect(&mut by_hand, 1, 16.0, 0.0, 16.0, 64.0, RED);
+        assert_eq!(draw(&grouped(&s)), draw(&flat(&by_hand)));
+        // A group whose clip misses the window: nothing under it is packed.
+        group(&mut s, 101, Some(100), 0, ID, Some([100.0, 0.0, 120.0, 64.0]));
+        let w = grouped(&s);
+        assert!(w.order.as_ref().unwrap().is_empty() && w.rects.is_empty());
+    }
+
+    #[test]
+    fn a_scrolled_list_is_one_transform_change() {
+        // A viewport at y 16..48 holding a 200 px tall column of 8 px rows.
+        let mut s = WindowSceneState::new();
+        group(&mut s, 100, None, 0, ID, Some([0.0, 16.0, 64.0, 48.0]));
+        group(&mut s, 101, Some(100), 0, [1.0, 0.0, 0.0, 1.0, 0.0, 16.0], None);
+        for i in 0..25u32 {
+            rect(&mut s, i + 1, 0.0, i as f32 * 8.0, 64.0, 8.0, if i % 2 == 0 { RED } else { BLUE });
+            place(&mut s, i + 1, Some(101), i);
+        }
+        let at_0 = draw(&grouped(&s));
+        // Scroll by 8: the content group moves up; the viewport stays.
+        group(&mut s, 101, Some(100), 0, [1.0, 0.0, 0.0, 1.0, 0.0, 8.0], None);
+        let at_8 = draw(&grouped(&s));
+        let row = |px: &[u32], y: usize| px[y * W as usize];
+        assert_eq!(row(&at_0, 20), row(&at_8, 28)); // shifted by 8 inside the viewport
+        assert_eq!(row(&at_0, 8), row(&at_8, 8)); // outside it, unchanged (clear)
+        assert_eq!(row(&at_8, 50), row(&at_0, 50));
+    }
+
+    #[test]
+    fn opacity_multiplies_down_the_tree() {
+        let mut s = WindowSceneState::new();
+        s.set_group(100, GroupParams { parent: None, order: 0, transform: ID, clip: None, opacity: 0.5, flags: 0 }, 1).unwrap();
+        s.set_group(101, GroupParams { parent: Some(100), order: 0, transform: ID, clip: None, opacity: 0.5, flags: 0 }, 1).unwrap();
+        rect(&mut s, 1, 0.0, 0.0, 8.0, 8.0, RED);
+        place(&mut s, 1, Some(101), 0);
+        let w = grouped(&s);
+        assert_eq!(w.rects[0].color[3], 0.25);
     }
 }

@@ -358,6 +358,24 @@ impl Connection {
         self.scene_node_set(node_id, scene_ops::ATRIUM_CORE_FILL_TRANSFORM, &params)
     }
 
+    /// Create or change a group (atrium-core GROUP op,
+    /// docs/spec/fresco-scene-groups.md §2.1). A scroll is one call here
+    /// with the content group's new translation.
+    pub fn scene_group(&mut self, node_id: u32, params: fresco_protocol::GroupParams)
+        -> io::Result<()>
+    {
+        self.scene_node_set(node_id, scene_ops::ATRIUM_CORE_GROUP, &params)
+    }
+
+    /// Move an existing node into a group, or back to the window root
+    /// (atrium-core PLACE op, §2.2). Send it after the node's SET, in
+    /// the same frame.
+    pub fn scene_place(&mut self, node_id: u32, parent: Option<u32>, order: u32)
+        -> io::Result<()>
+    {
+        self.scene_node_set(node_id, scene_ops::ATRIUM_CORE_PLACE, &fresco_protocol::PlaceParams { parent, order })
+    }
+
     /// Convenience: install a texture node (atrium-core TEXTURE op).
     pub fn scene_node_texture(&mut self, node_id: u32, params: TextureParams)
         -> io::Result<()>

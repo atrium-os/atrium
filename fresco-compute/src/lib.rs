@@ -295,6 +295,12 @@ fn budget(scene: &Scene, fill_nodes: &[usize], ops: &mut Vec<Op>, width: u32, he
         }
     }
     debug_assert_eq!(owner.len(), ops.len());
+    let owned: Vec<(Op, Node)> = ops.iter().copied().zip(owner).collect();
+    budget_owned(owned, ops, width, height, dropped);
+}
+
+/// [`budget`] for ops that already know their node, in paint order.
+fn budget_owned(owned: Vec<(Op, Node)>, ops: &mut Vec<Op>, width: u32, height: u32, dropped: &mut Vec<(Node, u8)>) {
     // Culled: no pixel centre of the target inside its box (raster
     // clips every op to p3, so these draw nothing).
     let (w, h) = (width as f32, height as f32);
@@ -302,7 +308,7 @@ fn budget(scene: &Scene, fill_nodes: &[usize], ops: &mut Vec<Op>, width: u32, he
         let [x0, y0, x1, y1] = o.p3;
         x0 < w && y0 < h && x1 > 0.0 && y1 > 0.0 && x1 > x0 && y1 > y0
     };
-    let kept: Vec<(Op, Node)> = ops.iter().zip(owner).filter(|(o, _)| on(o)).map(|(o, n)| (*o, n)).collect();
+    let kept: Vec<(Op, Node)> = owned.into_iter().filter(|(o, _)| on(o)).collect();
     ops.clear();
     let cap = MAX_OPS as usize;
     if kept.len() <= cap {
@@ -320,6 +326,199 @@ fn budget(scene: &Scene, fill_nodes: &[usize], ops: &mut Vec<Op>, width: u32, he
             last = Some(*n);
         }
     }
+}
+/// An element in paint order, with the clip it is drawn under.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Placed {
+    pub item: Node,
+    /// Target pixels `[x0, y0, x1, y1)`; `None`: unclipped.
+    pub clip: Option<[f32; 4]>,
+}
+
+/// The raster kernel tests each pixel against its op's box (`p3`, f1b66f3),
+/// so a clip narrows the box (fresco-scene-groups.md §3 step 4). Were it
+/// false, a clip would only cull ops wholly outside it.
+pub const CLIP_IN_RASTER: bool = true;
+
+/// `op` under `clip`: `None` when wholly outside it.
+fn clip_op(op: &Op, clip: Option<[f32; 4]>) -> Option<Op> {
+    let Some(c) = clip else { return Some(*op) };
+    let c = bbox(c[0], c[1], c[2], c[3]);
+    let b = op.p3;
+    let i = [b[0].max(c[0]), b[1].max(c[1]), b[2].min(c[2]), b[3].min(c[3])];
+    if i[0] >= i[2] || i[1] >= i[3] {
+        return None;
+    }
+    let mut o = *op;
+    if CLIP_IN_RASTER {
+        o.p3 = i;
+    }
+    Some(o)
+}
+
+/// A scene's ops, by kind and by element.
+struct KindOps {
+    rects: Vec<Op>,
+    paths: Vec<Op>,
+    /// `None`: culled or dropped.
+    fills: Vec<Option<Op>>,
+    /// Per texture batch, per quad.
+    quads: Vec<Vec<Op>>,
+    /// Per glyph batch, per run, per glyph.
+    runs: Vec<Vec<Vec<Op>>>,
+}
+
+#[allow(clippy::type_complexity)]
+fn kind_ops(
+    scene: &Scene,
+    width: u32,
+    height: u32,
+    mut cache: Option<&mut fill::FillCache>,
+) -> (KindOps, Vec<[u32; 4]>, Vec<u32>, Vec<(Node, u8)>) {
+    let mut dropped = Vec::new();
+    let mut rects = Vec::with_capacity(scene.rects.len());
+    for r in &scene.rects {
+        let [x, y] = r.position;
+        let [w, h] = r.size;
+        rects.push(Op {
+            p0: [x, y, w, h],
+            p1: r.color,
+            p2: [r.radius, 0.0, 0.0, 0.0],
+            p3: bbox(x, y, x + w, y + h),
+            meta: [KIND_RECT, 0, 0, 0],
+        });
+    }
+    let mut paths = Vec::with_capacity(scene.paths.len());
+    for p in &scene.paths {
+        let [cx, cy, len, wid] = p.model;
+        let (s, c) = p.angle.sin_cos();
+        let ex = (c * len).abs() * 0.5 + (s * wid).abs() * 0.5;
+        let ey = (s * len).abs() * 0.5 + (c * wid).abs() * 0.5;
+        paths.push(Op {
+            p0: p.model,
+            p1: p.color,
+            p2: [c, s, 0.0, 0.0],
+            p3: bbox(cx - ex, cy - ey, cx + ex, cy + ey),
+            meta: [KIND_PATH, 0, 0, 0],
+        });
+    }
+    let mut tex = Vec::with_capacity(scene.textures.len());
+    let mut texels: Vec<u32> = Vec::new();
+    for t in &scene.textures {
+        let n = (t.width * t.height) as usize;
+        assert_eq!(t.data.len(), n * t.format.bytes_per_texel(), "texture size");
+        tex.push([texels.len() as u32, t.width, t.height, (t.format == TexFormat::R8) as u32]);
+        match t.format {
+            TexFormat::Rgba8Srgb => texels.extend(t.data.chunks_exact(4).map(|c| {
+                u32::from_le_bytes([c[0], c[1], c[2], c[3]])
+            })),
+            TexFormat::R8 => texels.extend(t.data.chunks(4).map(|c| {
+                let mut b = [0u8; 4];
+                b[..c.len()].copy_from_slice(c);
+                u32::from_le_bytes(b)
+            })),
+        }
+    }
+    // Filled paths: each one's tiled block in `texels` (see `fill`).
+    let mut fills = Vec::with_capacity(scene.fills.len());
+    let (mut lines_total, mut indices_total) = (0usize, 0usize);
+    if let Some(c) = cache.as_deref_mut() {
+        c.begin();
+    }
+    for (k, fl) in scene.fills.iter().enumerate() {
+        let r = match cache.as_deref_mut() {
+            Some(c) => c.get(fl, width, height),
+            None => std::sync::Arc::new(fill::prepare(fl, width, height)),
+        };
+        let p = match &*r {
+            Ok(p) => p,
+            Err(fill::CULLED) => {
+                fills.push(None);
+                continue;
+            }
+            Err(why) => {
+                dropped.push((Node::Fill(k), *why));
+                fills.push(None);
+                continue;
+            }
+        };
+        if lines_total + p.lines > fill::MAX_FRAME_SEGMENTS || indices_total + p.indices > fill::MAX_FRAME_INDICES {
+            dropped.push((Node::Fill(k), fill::drop::FRAME_BUDGET));
+            fills.push(None);
+            continue;
+        }
+        lines_total += p.lines;
+        indices_total += p.indices;
+        let base = texels.len();
+        fills.push(Some(Op {
+            p0: p.clip,
+            p1: fl.color,
+            p2: [0.0; 4],
+            p3: p.bbox,
+            meta: [KIND_FILL, base as u32, 0, 0],
+        }));
+        texels.extend_from_slice(&p.block);
+        fill::rebase(&mut texels[base..], base as u32);
+    }
+    if texels.is_empty() {
+        texels.push(0); // a binding may not be empty
+    }
+    let quads = scene.texture_batches.iter().map(|b| {
+        b.quads.iter().map(|q| {
+            let [x, y, w, h] = *q;
+            Op {
+                p0: *q,
+                p3: bbox(x, y, x + w, y + h),
+                meta: [KIND_TEXTURE, b.texture as u32, 0, 0],
+                ..Default::default()
+            }
+        }).collect()
+    }).collect();
+    let runs = scene.glyph_batches.iter().map(|b| {
+        let t = &scene.textures[b.atlas];
+        let (aw, ah) = (t.width as f32, t.height as f32);
+        b.runs.iter().map(|run| {
+            run.glyphs.iter().map(|g| {
+                // As op_glyph_run: bearing_y is baseline-to-top.
+                let x = run.origin[0] + g.d_offset[0] + g.bearing[0];
+                let y = run.origin[1] + g.d_offset[1] - g.bearing[1];
+                let [u, v, w, h] = g.atlas_uv;
+                Op {
+                    p0: [x, y, w, h],
+                    p1: run.color,
+                    p2: [u / aw, v / ah, (u + w) / aw, (v + h) / ah],
+                    p3: bbox(x, y, x + w, y + h),
+                    meta: [KIND_GLYPH, b.atlas as u32, 0, 0],
+                }
+            }).collect()
+        }).collect()
+    }).collect();
+    (KindOps { rects, paths, fills, quads, runs }, tex, texels, dropped)
+}
+
+fn finish(mut ops: Vec<Op>, mut tex: Vec<[u32; 4]>, texels: Vec<u32>, tex_count: usize, width: u32, height: u32, pitch: u32) -> Frame {
+    if tex.is_empty() {
+        tex.push([0; 4]);
+    }
+    let tiles_x = width.div_ceil(TILE);
+    let tiles_y = height.div_ceil(TILE);
+    let header = Header {
+        width,
+        height,
+        pitch,
+        tiles_x,
+        tiles_y,
+        op_count: ops.len() as u32,
+        wpt: (ops.len() as u32).div_ceil(32),
+        tex_count: tex_count as u32,
+        texel_words: texels.len() as u32,
+        _pad: [0; 3],
+        clear: CLEAR_COLOR,
+    };
+    if ops.is_empty() {
+        ops.push(Op::default()); // a binding may not be empty
+    }
+    Frame { header, ops, tex, texels, lut: lut() }
 }
 
 impl Frame {
@@ -345,150 +544,72 @@ impl Frame {
         width: u32,
         height: u32,
         pitch: u32,
-        mut cache: Option<&mut fill::FillCache>,
+        cache: Option<&mut fill::FillCache>,
     ) -> (Frame, Vec<(Node, u8)>) {
         assert!(pitch >= width);
-        let mut dropped = Vec::new();
-        let mut ops = Vec::new();
-        for r in &scene.rects {
-            let [x, y] = r.position;
-            let [w, h] = r.size;
-            ops.push(Op {
-                p0: [x, y, w, h],
-                p1: r.color,
-                p2: [r.radius, 0.0, 0.0, 0.0],
-                p3: bbox(x, y, x + w, y + h),
-                meta: [KIND_RECT, 0, 0, 0],
-            });
-        }
-        for p in &scene.paths {
-            let [cx, cy, len, wid] = p.model;
-            let (s, c) = p.angle.sin_cos();
-            let ex = (c * len).abs() * 0.5 + (s * wid).abs() * 0.5;
-            let ey = (s * len).abs() * 0.5 + (c * wid).abs() * 0.5;
-            ops.push(Op {
-                p0: p.model,
-                p1: p.color,
-                p2: [c, s, 0.0, 0.0],
-                p3: bbox(cx - ex, cy - ey, cx + ex, cy + ey),
-                meta: [KIND_PATH, 0, 0, 0],
-            });
-        }
-        let mut tex = Vec::with_capacity(scene.textures.len());
-        let mut texels: Vec<u32> = Vec::new();
-        for t in &scene.textures {
-            let n = (t.width * t.height) as usize;
-            assert_eq!(t.data.len(), n * t.format.bytes_per_texel(), "texture size");
-            tex.push([texels.len() as u32, t.width, t.height, (t.format == TexFormat::R8) as u32]);
-            match t.format {
-                TexFormat::Rgba8Srgb => texels.extend(t.data.chunks_exact(4).map(|c| {
-                    u32::from_le_bytes([c[0], c[1], c[2], c[3]])
-                })),
-                TexFormat::R8 => texels.extend(t.data.chunks(4).map(|c| {
-                    let mut b = [0u8; 4];
-                    b[..c.len()].copy_from_slice(c);
-                    u32::from_le_bytes(b)
-                })),
-            }
-        }
-        // Filled paths: each one's tiled block in `texels` (see `fill`).
-        let mut fill_ops = Vec::new();
-        let mut fill_nodes = Vec::new();
-        let (mut lines_total, mut indices_total) = (0usize, 0usize);
-        if let Some(c) = cache.as_deref_mut() {
-            c.begin();
-        }
-        for (k, fl) in scene.fills.iter().enumerate() {
-            let r = match cache.as_deref_mut() {
-                Some(c) => c.get(fl, width, height),
-                None => std::sync::Arc::new(fill::prepare(fl, width, height)),
-            };
-            let p = match &*r {
-                Ok(p) => p,
-                Err(fill::CULLED) => continue,
-                Err(why) => {
-                    dropped.push((Node::Fill(k), *why));
-                    continue;
-                }
-            };
-            if lines_total + p.lines > fill::MAX_FRAME_SEGMENTS || indices_total + p.indices > fill::MAX_FRAME_INDICES {
-                dropped.push((Node::Fill(k), fill::drop::FRAME_BUDGET));
-                continue;
-            }
-            fill_nodes.push(k);
-            lines_total += p.lines;
-            indices_total += p.indices;
-            let base = texels.len();
-            fill_ops.push(Op {
-                p0: p.clip,
-                p1: fl.color,
-                p2: [0.0; 4],
-                p3: p.bbox,
-                meta: [KIND_FILL, base as u32, 0, 0],
-            });
-            texels.extend_from_slice(&p.block);
-            fill::rebase(&mut texels[base..], base as u32);
-        }
-        // Fills draw after paths, before textures.
-        ops.extend(fill_ops);
-        if texels.is_empty() {
-            texels.push(0); // a binding may not be empty
-        }
-        for b in &scene.texture_batches {
-            for q in &b.quads {
-                let [x, y, w, h] = *q;
-                ops.push(Op {
-                    p0: *q,
-                    p3: bbox(x, y, x + w, y + h),
-                    meta: [KIND_TEXTURE, b.texture as u32, 0, 0],
-                    ..Default::default()
-                });
-            }
-        }
-        for b in &scene.glyph_batches {
-            let t = &scene.textures[b.atlas];
-            let (aw, ah) = (t.width as f32, t.height as f32);
-            for run in &b.runs {
-                for g in &run.glyphs {
-                    // As op_glyph_run: bearing_y is baseline-to-top.
-                    let x = run.origin[0] + g.d_offset[0] + g.bearing[0];
-                    let y = run.origin[1] + g.d_offset[1] - g.bearing[1];
-                    let [u, v, w, h] = g.atlas_uv;
-                    ops.push(Op {
-                        p0: [x, y, w, h],
-                        p1: run.color,
-                        p2: [u / aw, v / ah, (u + w) / aw, (v + h) / ah],
-                        p3: bbox(x, y, x + w, y + h),
-                        meta: [KIND_GLYPH, b.atlas as u32, 0, 0],
-                    });
-                }
-            }
-        }
+        let (k, tex, texels, mut dropped) = kind_ops(scene, width, height, cache);
+        let fill_nodes: Vec<usize> = (0..k.fills.len()).filter(|&i| k.fills[i].is_some()).collect();
+        // Draw order by kind: rects, paths, fills, textures, glyphs.
+        let mut ops = k.rects;
+        ops.extend(k.paths);
+        ops.extend(k.fills.into_iter().flatten());
+        ops.extend(k.quads.into_iter().flatten());
+        ops.extend(k.runs.into_iter().flatten().flatten());
         if ops.len() > MAX_OPS as usize {
             budget(scene, &fill_nodes, &mut ops, width, height, &mut dropped);
         }
-        if tex.is_empty() {
-            tex.push([0; 4]);
+        (finish(ops, tex, texels, scene.textures.len(), width, height, pitch), dropped)
+    }
+
+    /// Pack `scene` drawing its elements in the order `order` names them,
+    /// kinds interleaved (fresco-scene-groups.md §3). An element not named
+    /// is not drawn. Each element may carry a clip (target pixels,
+    /// `[x0, y0, x1, y1)`): its ops' boxes are narrowed to it, and an op
+    /// wholly outside it is culled. A fill's own clip is
+    /// `fill::Fill::clip`; set it there too.
+    ///
+    /// Returns the frame and the nodes not drawn, as [`Frame::pack_report`]
+    /// does: fills that could not be tiled, and past [`MAX_OPS`] ops (after
+    /// culling) every node in paint order from the one that crosses it on.
+    pub fn pack_ordered(
+        scene: &Scene,
+        order: &[Placed],
+        width: u32,
+        height: u32,
+        pitch: u32,
+        cache: Option<&mut fill::FillCache>,
+    ) -> (Frame, Vec<(Node, u8)>) {
+        assert!(pitch >= width);
+        let (k, tex, texels, fill_drops) = kind_ops(scene, width, height, cache);
+        // Fills not drawn are reported in paint order, once each.
+        let mut dropped = Vec::new();
+        let mut owned: Vec<(Op, Node)> = Vec::new();
+        for pl in order {
+            let slice: &[Op] = match pl.item {
+                Node::Rect(i) => k.rects.get(i..=i).unwrap_or(&[]),
+                Node::Path(i) => k.paths.get(i..=i).unwrap_or(&[]),
+                Node::Fill(i) => match k.fills.get(i) {
+                    Some(Some(op)) => std::slice::from_ref(op),
+                    _ => {
+                        if let Some(d) = fill_drops.iter().find(|d| d.0 == Node::Fill(i)) {
+                            dropped.push(*d);
+                        }
+                        &[]
+                    }
+                },
+                Node::Quad(b, q) => k.quads.get(b).and_then(|v| v.get(q..=q)).unwrap_or(&[]),
+                Node::Run(b, r) => k.runs.get(b).and_then(|v| v.get(r)).map(|v| v.as_slice()).unwrap_or(&[]),
+            };
+            owned.extend(slice.iter().filter_map(|op| clip_op(op, pl.clip)).map(|op| (op, pl.item)));
         }
-        let tiles_x = width.div_ceil(TILE);
-        let tiles_y = height.div_ceil(TILE);
-        let header = Header {
-            width,
-            height,
-            pitch,
-            tiles_x,
-            tiles_y,
-            op_count: ops.len() as u32,
-            wpt: (ops.len() as u32).div_ceil(32),
-            tex_count: scene.textures.len() as u32,
-            texel_words: texels.len() as u32,
-            _pad: [0; 3],
-            clear: CLEAR_COLOR,
-        };
-        if ops.is_empty() {
-            ops.push(Op::default()); // a binding may not be empty
+        let mut ops: Vec<Op>;
+        if owned.len() > MAX_OPS as usize {
+            ops = Vec::new();
+            budget_owned(owned, &mut ops, width, height, &mut dropped);
+        } else {
+            ops = owned.into_iter().map(|(o, _)| o).collect();
         }
-        (Frame { header, ops, tex, texels, lut: lut() }, dropped)
+        (finish(ops, tex, texels, scene.textures.len(), width, height, pitch), dropped)
     }
 
     /// Check the header against the buffers, as the broker must before it

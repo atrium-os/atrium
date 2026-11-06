@@ -1,6 +1,6 @@
 # Fresco scene groups: one scene vocabulary for Pergola and the Navigator
 
-**Status:** design, 2026-11-06. Not built.
+**Status:** design, 2026-11-06. Step 1 built (§7); steps 2 and the op budget built by the Fresco owners.
 **Owner:** Pergola thread (UI). Wire, frescod and kernel parts need the Fresco owners' review;
 the Navigator mapping needs the Navigator thread's.
 **Asked by the user, 2026-11-06:** after the Pergola review, the user agreed to "one shared scene
@@ -97,7 +97,8 @@ the same frame; frescod applies a frame atomically, so nothing is drawn half pla
   now names any node kind. Frames within the cap pack unchanged. Done (Fresco owners, 2026-11-06);
   before it, a frame past the cap failed validation and the window did not draw at all.
 - **Validation** as for fills: finite values, coordinates within ±`FILL_MAX_COORD`, `0 ≤ opacity ≤ 1`,
-  a v1 transform that is not translate + positive uniform scale is refused.
+  a v1 transform that is not translate + positive uniform scale is refused, as is a scale outside
+  1/64..64 or a translation past ±`FILL_MAX_COORD`.
 
 ### 2.4 What v1 leaves out, stated
 
@@ -116,10 +117,12 @@ the same frame; frescod applies a frame atomically, so nothing is drawn half pla
 Packing (`frescod/src/pack.rs`, run by the window's jailed renderer in split mode) walks the tree
 once per frame:
 
-1. Compose each node's transform with its ancestors' and apply it to the leaf's geometry. Uniform
-   scale and translation map a rounded rect to a rounded rect, a glyph run to a glyph run (scaled
-   glyphs need the atlas at that size: glyph runs under a scaled group are rasterised at the
-   composed size, not stretched).
+1. Compose each node's transform with its ancestors' (in f64) and apply it to the leaf's geometry.
+   Uniform scale and translation map a rounded rect to a rounded rect, a segment to a segment, a
+   textured quad to a quad, and compose into a fill's own affine. **A glyph run moves with its group
+   but does not scale**: its glyphs are atlas bitmaps at the size they were shaped, and stretching
+   them would blur. A client that scales a window (Pergola at a monitor's scale) shapes text at the
+   device size and keeps text under unit-scale groups. (Built 2026-11-06.)
 2. Intersect clips down the tree. A group whose clip misses the window is skipped whole, with all
    its descendants: off-screen bands cost nothing.
 3. Emit kernel ops in paint order. The kernels already draw ops in list order (bin sets bit = op
@@ -223,6 +226,10 @@ Pergola thread's, except 5 and 6.
 
 1. `fresco-protocol` + `fresco-scene-server`: the two ops, the rules in §2.3, the tests below.
    frescod packs the tree (§3 steps 1–3). Interleaved order already fixes the popover bug.
+   **Done 2026-11-06**: `GroupParams`/`PlaceParams`, `command::groups` (rules + tests),
+   `Frame::pack_ordered` (by-kind packs unchanged: same hash over 500 fuzz scenes), frescod
+   `grouped_frame` (6 pack tests, run in the cloud FreeBSD VM), `fresco-client`
+   `scene_group`/`scene_place`.
 2. Kernel clip test (§3 step 4), through the oracle checks. Until it lands, clips apply to fills
    only and other ops are culled by their whole box.
 3. `fresco-client`: `scene_group`, `scene_place`. Pergola moves Stack and the root onto groups.

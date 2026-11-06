@@ -76,6 +76,10 @@ pub struct WindowSceneState {
     pub path_nodes:      HashMap<u32, PathParams>,
     pub glyph_run_nodes: HashMap<u32, GlyphRunParams>,
     pub fill_nodes:      HashMap<u32, FillParams>,
+    /// Groups (fresco-scene-groups.md); see `command::groups`.
+    pub group_nodes:     HashMap<u32, fresco_protocol::GroupParams>,
+    /// Where placed leaves sit (a group's own place is in its params).
+    pub placements:      HashMap<u32, fresco_protocol::PlaceParams>,
     pub slot_table:      HashMap<u32, [u8; 32]>,
     pub in_frame:        bool,
 
@@ -627,12 +631,7 @@ impl EnvelopeFrontend {
                 if writer == client_id { dead_nodes.push(id); }
             }
             for id in dead_nodes {
-                s.rect_nodes.remove(&id);
-                s.texture_nodes.remove(&id);
-                s.path_nodes.remove(&id);
-                s.glyph_run_nodes.remove(&id);
-                s.fill_nodes.remove(&id);
-                s.node_writers.remove(&id);
+                s.remove_node(id);
             }
 
             let mut dead_slots: Vec<u32> = Vec::new();
@@ -763,11 +762,16 @@ impl EnvelopeFrontend {
             .map_err(|_| DispatchError::BadPayload)?;
         let writer = self.current_client;
         let s = self.ensure_window_state(win_id);
-        s.node_writers.insert(p.node_id, writer);
+        /* GROUP and PLACE check the writer of the nodes they touch
+         * before recording one (command::groups). */
+        if !matches!(p.op_id, scene_ops::ATRIUM_CORE_GROUP | scene_ops::ATRIUM_CORE_PLACE) {
+            s.node_writers.insert(p.node_id, writer);
+        }
         match p.op_id {
             scene_ops::ATRIUM_CORE_RECT => {
                 let inner: RectParams = decode(&p.params)
                     .map_err(|_| DispatchError::BadPayload)?;
+                s.leaf_replaces(p.node_id);
                 s.rect_nodes.insert(p.node_id, inner);
                 /* Repeat-node-id replaces — evict from sibling op-kind
                  * maps to maintain the invariant "node_id appears in
@@ -780,6 +784,7 @@ impl EnvelopeFrontend {
             scene_ops::ATRIUM_CORE_TEXTURE => {
                 let inner: TextureParams = decode(&p.params)
                     .map_err(|_| DispatchError::BadPayload)?;
+                s.leaf_replaces(p.node_id);
                 s.texture_nodes.insert(p.node_id, inner);
                 s.rect_nodes.remove(&p.node_id);
                 s.path_nodes.remove(&p.node_id);
@@ -789,6 +794,7 @@ impl EnvelopeFrontend {
             scene_ops::ATRIUM_CORE_PATH => {
                 let inner: PathParams = decode(&p.params)
                     .map_err(|_| DispatchError::BadPayload)?;
+                s.leaf_replaces(p.node_id);
                 s.path_nodes.insert(p.node_id, inner);
                 s.rect_nodes.remove(&p.node_id);
                 s.texture_nodes.remove(&p.node_id);
@@ -798,6 +804,7 @@ impl EnvelopeFrontend {
             scene_ops::ATRIUM_TEXT_GLYPH_RUN => {
                 let inner: GlyphRunParams = decode(&p.params)
                     .map_err(|_| DispatchError::BadPayload)?;
+                s.leaf_replaces(p.node_id);
                 s.glyph_run_nodes.insert(p.node_id, inner);
                 s.rect_nodes.remove(&p.node_id);
                 s.texture_nodes.remove(&p.node_id);
@@ -811,6 +818,7 @@ impl EnvelopeFrontend {
                     log::debug!("SCENE_NODE_SET fill {}: {e}", p.node_id);
                     DispatchError::BadPayload
                 })?;
+                s.leaf_replaces(p.node_id);
                 s.fill_nodes.insert(p.node_id, inner);
                 s.rect_nodes.remove(&p.node_id);
                 s.texture_nodes.remove(&p.node_id);
@@ -826,6 +834,22 @@ impl EnvelopeFrontend {
                 f.transform = t.transform;
                 f.opacity = t.opacity;
                 f.clip = t.clip;
+            }
+            scene_ops::ATRIUM_CORE_GROUP => {
+                let g: fresco_protocol::GroupParams = decode(&p.params)
+                    .map_err(|_| DispatchError::BadPayload)?;
+                s.set_group(p.node_id, g, writer).map_err(|e| {
+                    log::debug!("SCENE_NODE_SET group {}: {e:?}", p.node_id);
+                    DispatchError::BadPayload
+                })?;
+            }
+            scene_ops::ATRIUM_CORE_PLACE => {
+                let pl: fresco_protocol::PlaceParams = decode(&p.params)
+                    .map_err(|_| DispatchError::BadPayload)?;
+                s.place(p.node_id, pl, writer).map_err(|e| {
+                    log::debug!("SCENE_NODE_SET place {}: {e:?}", p.node_id);
+                    DispatchError::BadPayload
+                })?;
             }
             other => {
                 /* Unknown / unbundled op-id. The closed registry per
@@ -845,12 +869,8 @@ impl EnvelopeFrontend {
         let p: SceneNodeClearPayload = decode(&msg.payload)
             .map_err(|_| DispatchError::BadPayload)?;
         if let Some(s) = self.per_window.get_mut(&win_id) {
-            s.rect_nodes.remove(&p.node_id);
-            s.texture_nodes.remove(&p.node_id);
-            s.path_nodes.remove(&p.node_id);
-            s.glyph_run_nodes.remove(&p.node_id);
-            s.fill_nodes.remove(&p.node_id);
-            s.node_writers.remove(&p.node_id);
+            /* A group goes with its whole subtree. */
+            s.remove_node(p.node_id);
         }
         Ok(Vec::new())
     }

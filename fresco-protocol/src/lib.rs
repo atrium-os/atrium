@@ -964,6 +964,12 @@ pub mod scene_ops {
     /// ([`super::FillTransformParams`]): zoom and scroll without
     /// re-sending the geometry.
     pub const ATRIUM_CORE_FILL_TRANSFORM: u32 = 0x1005;
+    /// A group: parent, paint order, transform, clip, opacity, flags
+    /// ([`super::GroupParams`]). Children are read in its local space.
+    pub const ATRIUM_CORE_GROUP: u32 = 0x1006;
+    /// Moves an existing node (leaf or group) into a group, or back to
+    /// the window root ([`super::PlaceParams`]).
+    pub const ATRIUM_CORE_PLACE: u32 = 0x1007;
 
     // atrium-text (0x2000..=0x2FFF). M6.1 ships atlas-based glyph runs;
     // 0x2001..=0x2FFF reserved for future text ops (color-emoji glyph
@@ -1135,6 +1141,77 @@ pub struct FillTransformParams {
     pub transform: [f32; 6],
     pub opacity: f32,
     pub clip: Option<[f32; 4]>,
+}
+
+/// Per window: at most this many nested groups (fresco-scene-groups.md §2.3).
+pub const GROUP_MAX_DEPTH: usize = 32;
+/// Per window: at most this many groups.
+pub const GROUP_MAX_COUNT: usize = 4096;
+
+/// [`GroupParams::flags`].
+pub mod group_flags {
+    /// A scroll viewport: its translation is the scroll offset, and the
+    /// renderer may shift what is drawn instead of redrawing it (§4).
+    pub const SCROLL: u32 = 1 << 0;
+    /// Reserved: exact group opacity (draw to its own buffer, then blend).
+    pub const ISOLATE: u32 = 1 << 1;
+    pub const KNOWN: u32 = SCROLL | ISOLATE;
+}
+
+/// Params for `scene_ops::ATRIUM_CORE_GROUP` (docs/spec/fresco-scene-groups.md §2.1).
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct GroupParams {
+    /// The group this one sits in; `None` = the window's root.
+    pub parent: Option<u32>,
+    /// Paint order among siblings: lower first; ties by node id.
+    pub order: u32,
+    /// Local space to the parent's: `x' = a x + c y + e`, `y' = b x + d y + f`.
+    /// v1: translate and positive uniform scale only (`b = c = 0`, `a = d > 0`).
+    pub transform: [f32; 6],
+    /// In the PARENT's space (applied after `transform`), `[x0, y0, x1, y1)`.
+    pub clip: Option<[f32; 4]>,
+    /// Multiplies every descendant's alpha.
+    pub opacity: f32,
+    /// [`group_flags`].
+    pub flags: u32,
+}
+
+impl GroupParams {
+    /// No parent, identity, no clip, opaque, no flags.
+    pub const IDENTITY: [f32; 6] = [1.0, 0.0, 0.0, 1.0, 0.0, 0.0];
+
+    pub fn validate(&self) -> Result<(), &'static str> {
+        let t = &self.transform;
+        if !finite(t) || !self.opacity.is_finite() || self.clip.is_some_and(|c| !finite(&c)) {
+            return Err("group transform, opacity or clip not finite");
+        }
+        if t[1] != 0.0 || t[2] != 0.0 || t[0] != t[3] || t[0] <= 0.0 {
+            return Err("group transform must be translate and positive uniform scale (v1)");
+        }
+        if t[4].abs() > FILL_MAX_COORD || t[5].abs() > FILL_MAX_COORD || t[0] > 64.0 || t[0] < 1.0 / 64.0 {
+            return Err("group transform past its bound");
+        }
+        if let Some(c) = self.clip {
+            if c.iter().any(|v| v.abs() > FILL_MAX_COORD) {
+                return Err("group clip past the coordinate bound");
+            }
+        }
+        if !(0.0..=1.0).contains(&self.opacity) {
+            return Err("group opacity outside 0..=1");
+        }
+        if self.flags & !group_flags::KNOWN != 0 {
+            return Err("unknown group flag");
+        }
+        Ok(())
+    }
+}
+
+/// Params for `scene_ops::ATRIUM_CORE_PLACE`, sent with the node id of an
+/// existing node (§2.2).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PlaceParams {
+    pub parent: Option<u32>,
+    pub order: u32,
 }
 
 fn finite(v: &[f32]) -> bool {
