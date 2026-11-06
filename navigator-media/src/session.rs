@@ -105,7 +105,7 @@ impl Sessions {
             EmbedSource::Url { src, mime } => {
                 let url = crate::url::resolve(&self.base_url, src).ok_or(NotStarted::BadUrl)?;
                 let mime: String = mime.chars().take(limen::media_player::MIME_MAX).collect();
-                (ToChild::Load { source: Source::Fd, mime }, url)
+                (ToChild::Load { source: Source::Fd, mime, growing: false }, url)
             }
             EmbedSource::Script => return Err(NotStarted::NeedsEngine),
             EmbedSource::Unplayable => return Err(NotStarted::Unplayable),

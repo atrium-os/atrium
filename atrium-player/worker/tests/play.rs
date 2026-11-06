@@ -342,3 +342,67 @@ fn subtitle_cues_show_over_their_times() {
         assert_eq!(p.cues_at(1_900_000_000), Vec::<&str>::new(), "{name}: after the last");
     }
 }
+
+#[test]
+fn a_growing_file_waits_at_its_end_until_load_done() {
+    use std::io::Write;
+    let name = "vp9-opus.webm";
+    let f = std::fs::read(asset(name)).unwrap();
+    let clusters: Vec<usize> = f.windows(4).enumerate().filter(|(_, w)| *w == [0x1F, 0x43, 0xB6, 0x75]).map(|(i, _)| i).collect();
+    // A download cut mid-cluster, mid-block.
+    let cut = clusters[1] + 777;
+    let path = std::env::temp_dir().join(format!("atrium-growing-{}.webm", std::process::id()));
+    let mut out = File::create(&path).unwrap();
+    out.write_all(&f[..cut]).unwrap();
+    let frames = Rc::new(RefCell::new(Vec::new()));
+    let f2 = frames.clone();
+    let sink = LocalSink::new(Box::new(move |b, pts| f2.borrow_mut().push((pts, format!("{:x}", Md5::digest(b))))));
+    let mut p = Player::new_growing(opts(), sink, File::open(&path).unwrap()).unwrap();
+    let pid = p.worker_pid();
+    let mut pcm = vec![0f32; 1 << 16];
+    let mut events = Vec::new();
+    let mut pump = |p: &mut Player<LocalSink>, d: Duration, events: &mut Vec<PlayerEvent>| {
+        let until = Instant::now() + d;
+        while Instant::now() < until {
+            if let Some(e) = p.poll(Duration::from_millis(10)) {
+                let end = matches!(e, PlayerEvent::Ended);
+                events.push(e);
+                if end {
+                    break;
+                }
+            }
+            p.read_pcm(&mut pcm);
+        }
+    };
+    // Plays what has arrived, then waits past the watchdog for more.
+    pump(&mut p, crate_watchdog() + Duration::from_millis(2000), &mut events);
+    let n0 = frames.borrow().len();
+    assert!(n0 > 0, "plays what it has");
+    assert!(!events.iter().any(|e| matches!(e, PlayerEvent::Ended | PlayerEvent::Error(_))), "{events:?}");
+    assert_eq!(p.worker_pid(), pid, "a worker waiting for bytes is not taken for hung");
+    // A seek back into what has arrived plays from there.
+    p.seek(200_000_000);
+    pump(&mut p, Duration::from_millis(800), &mut events);
+    let back = frames.borrow()[n0..].to_vec();
+    assert!(!back.is_empty(), "plays after seeking back");
+    assert_eq!(back[0].1, layer_refs(name)[5], "from the frame at 0.2 s");
+    // Then to the start, so the whole clip plays once more below.
+    p.seek(0);
+    pump(&mut p, Duration::from_millis(200), &mut events);
+    frames.borrow_mut().clear();
+    p.seek(0);
+    // The rest arrives, in two pieces, and the download finishes.
+    let mid = cut + (f.len() - cut) / 2;
+    out.write_all(&f[cut..mid]).unwrap();
+    pump(&mut p, Duration::from_millis(300), &mut events);
+    out.write_all(&f[mid..]).unwrap();
+    pump(&mut p, Duration::from_millis(300), &mut events);
+    assert!(!events.iter().any(|e| matches!(e, PlayerEvent::Ended)), "no end before LoadDone");
+    p.input_done();
+    pump(&mut p, Duration::from_secs(15), &mut events);
+    assert!(matches!(events.last(), Some(PlayerEvent::Ended)), "ends after LoadDone: {:?}", events.last());
+    let hashes: Vec<_> = frames.borrow().iter().map(|f| f.1.clone()).collect();
+    assert_eq!(hashes, layer_refs(name), "every frame, once, in order");
+    assert_eq!(p.worker_pid(), pid);
+    let _ = std::fs::remove_file(&path);
+}

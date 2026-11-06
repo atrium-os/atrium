@@ -122,7 +122,7 @@ impl Media {
     pub fn load_fd(&mut self, mime: &str) -> Result<(), DomError> {
         if self.loaded { return Err(DomError::InvalidState) } // one source per embed (atrium-player M5)
         self.loaded = true;
-        self.out.push(ToChild::Load { source: limen::media_player::Source::Fd, mime: mime.to_string() });
+        self.out.push(ToChild::Load { source: limen::media_player::Source::Fd, mime: mime.to_string(), growing: false });
         Ok(())
     }
 

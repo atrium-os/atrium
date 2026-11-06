@@ -288,6 +288,17 @@ Fresco's layers land.
   `video_layer_color` (09a0787); unsaid fields are guessed (BT.601 below 720 lines). M7,
   streaming seeks (ff5ca7d): a feed seek waits for its segment however long it takes, and
   the page is told `Waiting`.
+- M7, subtitles: WebVTT text tracks in WebM and tx3g in MP4 become cues the worker sends
+  as records; the supervisor keeps them (bounded) and the window draws the ones at the
+  playback time, shaped in-app with swash and drawn as glyph runs (checked in the VM).
+- M7, for Navigator: the player answers in the order messages come, and each accepted
+  `Append` gets its `Buffered` before its `Appended` (a test checks it). `Error` names a
+  `track`: an append over the cap gets `Error { TOO_BIG, track: Some(t) }` and no
+  `Appended`, and the feed goes on; `track: None` means the player failed. A progressive
+  download is `Load { growing: true }`: the worker waits at the file's end instead of
+  ending (a note every second keeps the watchdog quiet), doesn't go looking for Cues that
+  aren't written yet, and ends only after `LoadDone`. A seek back into what has arrived
+  works meanwhile (`worker/tests/play.rs`).
 
 **Tests along the way:**
 - every demuxer limit has a test with a crafted file that exceeds it;

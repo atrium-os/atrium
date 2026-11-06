@@ -173,7 +173,8 @@ There are two ways to feed it.
 
 | direction | message | payload |
 |---|---|---|
-| parent → child | `Load` | `source` (`Fd`: a descriptor passed with the message, see below; there is no URL source), `mime` |
+| parent → child | `Load` | `source` (`Fd`: a descriptor passed with the message, see below; there is no URL source), `mime`, `growing: bool` (the file is still being written: wait at its end for more) |
+| parent → child | `LoadDone` | none: a growing `Load`'s file is complete |
 | parent → child | `OpenSource` | none: begins a segment feed |
 | parent → child | `AddTrack` | `track: u8` (at most 8), `mime` (an MSE type such as `video/webm; codecs="av01.0.08M.08"`) |
 | parent → child | `Append` | `track`, `bytes` (at most 60 KiB a message, inside limend's 64 KiB message cap; a parent splits a segment into several appends), `timestamp_offset: Option<f64>` |
@@ -195,7 +196,7 @@ There are two ways to feed it.
 | child → parent | `Waiting` | `secs: f64`: playback reached the end of what is buffered |
 | child → parent | `Seeking` | `secs: f64`: the user seeked in the native controls; the parent fetches from there |
 | child → parent | `Ended` | none |
-| child → parent | `Error` | `code: u16` (`DECODE`, `UNSUPPORTED`, `TOO_BIG`, `STATE`, `NETWORK`) |
+| child → parent | `Error` | `code: u16` (`DECODE`, `UNSUPPORTED`, `TOO_BIG`, `STATE`, `NETWORK`), `track: Option<u8>` (an append to this track was refused and the feed goes on; `None`: the player failed) |
 
 The types are `limen::media_player` (atrium-player.md M0).
 

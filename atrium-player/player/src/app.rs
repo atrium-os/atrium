@@ -24,8 +24,9 @@ const WAITING_AFTER: Duration = Duration::from_millis(500);
 pub enum HostEvent {
     Msg(ToChild),
     /// `Load` with its descriptor: a read-only file or pipe, checked and
-    /// narrowed by limend.
-    Load(std::os::fd::OwnedFd),
+    /// narrowed by limend; `true` if it is still being written (until
+    /// `LoadDone`).
+    Load(std::os::fd::OwnedFd, bool),
     /// The slot is hidden: pause, and keep the position.
     Suspend,
     Resume,
@@ -87,7 +88,7 @@ impl Host for LimenHost {
                     // Taken whatever it is, so none is left for a later message.
                     let fd = self.child.take_fd();
                     match (embed == self.embed, ToChild::decode(&bytes), fd) {
-                        (true, Some(ToChild::Load { source: LoadSource::Fd, .. }), Some(fd)) => out.push(HostEvent::Load(fd)),
+                        (true, Some(ToChild::Load { source: LoadSource::Fd, growing, .. }), Some(fd)) => out.push(HostEvent::Load(fd, growing)),
                         _ => self.dropped += 1,
                     }
                 }
@@ -209,18 +210,21 @@ impl<H: Host> App<H> {
     /// Start playing a whole resource now (the standalone player).
     pub fn play_file(&mut self, f: File, exit_at_end: bool) -> io::Result<()> {
         self.exit_at_end = exit_at_end;
-        self.start(Source::File(f))?;
+        self.start(Source::File(f), false)?;
         self.set_playing(true);
         Ok(())
     }
 
-    fn start(&mut self, source: Source) -> io::Result<()> {
+    fn start(&mut self, source: Source, growing: bool) -> io::Result<()> {
         let Some(sink) = self.sink.take() else {
             // One source per embed: a new `src` is a new embed.
             self.host.emit(ToParent::Error { code: code::STATE, track: None });
             return Ok(());
         };
-        let mut p = Player::new(self.opts.clone(), sink, source)?;
+        let mut p = match source {
+            Source::File(f) if growing => Player::new_growing(self.opts.clone(), sink, f)?,
+            source => Player::new(self.opts.clone(), sink, source)?,
+        };
         // Paused until Play, with the first frame showing as the poster.
         p.set_paused(true);
         p.show_next();
@@ -314,7 +318,7 @@ impl<H: Host> App<H> {
                 self.sync_paused();
                 return Ok(());
             }
-            HostEvent::Load(fd) => return self.start(Source::File(File::from(fd))),
+            HostEvent::Load(fd, growing) => return self.start(Source::File(File::from(fd)), growing),
             HostEvent::Msg(m) => m,
         };
         fn feed<H: Host>(app: &mut App<H>) -> Option<&mut Player<FrescoSink>> {
@@ -327,7 +331,11 @@ impl<H: Host> App<H> {
             // A `Load` of a descriptor comes as HostEvent::Load; without one
             // it is out of place.
             ToChild::Load { source: LoadSource::Fd, .. } => self.host.emit(ToParent::Error { code: code::STATE, track: None }),
-            ToChild::OpenSource => self.start(Source::Feed(Vec::new()))?,
+            ToChild::OpenSource => self.start(Source::Feed(Vec::new()), false)?,
+            ToChild::LoadDone => match self.player.as_mut() {
+                Some(p) => p.input_done(),
+                None => self.host.emit(ToParent::Error { code: code::STATE, track: None }),
+            },
             ToChild::AddTrack { track, mime } => {
                 if !atrium_media_demux::mime_supported(&mime) {
                     self.host.emit(ToParent::Error { code: code::UNSUPPORTED, track: None });

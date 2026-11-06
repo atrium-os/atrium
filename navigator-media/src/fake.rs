@@ -47,7 +47,7 @@ impl FakePlayer {
         let Some(m) = ToChild::decode(bytes) else { self.violation("a malformed or out-of-bounds message".into()); return };
         self.received.push(m.clone());
         match m {
-            ToChild::Load { source, mime } => {
+            ToChild::Load { source, mime, .. } => {
                 if self.loaded { self.violation("a second source for one embed".into()) }
                 self.loaded = true;
                 let Source::Fd = source;
@@ -107,6 +107,7 @@ impl FakePlayer {
             ToChild::Play => { if !self.loaded { self.violation("Play before a source".into()) } self.pending.push_back(ToParent::Playing); self.pending.push_back(ToParent::Time { secs: self.time }) }
             ToChild::Pause => self.pending.push_back(ToParent::Paused),
             ToChild::Stop => {}
+            ToChild::LoadDone => { if !self.loaded || self.feed { self.violation("LoadDone without a Load".into()) } }
             ToChild::Seek { secs } => { self.time = secs; self.pending.push_back(ToParent::Time { secs }) }
             ToChild::SetVolume { .. } | ToChild::SetRate { .. } => {}
         }

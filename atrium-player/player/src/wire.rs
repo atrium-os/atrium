@@ -69,7 +69,11 @@ impl Default for Limits {
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum ToWorker {
-    Init { mode: Mode, limits: Limits },
+    /// `growing` (Load only): the file is still being written; wait at
+    /// its end for more until `InputDone`.
+    Init { mode: Mode, limits: Limits, growing: bool },
+    /// A growing Load's file is complete.
+    InputDone,
     AddTrack { track: u8, mime: String },
     Append { track: u8, bytes: Vec<u8>, timestamp_offset_ns: Option<i64> },
     Remove { track: u8, start_ns: i64, end_ns: i64 },
@@ -107,6 +111,7 @@ pub mod tag {
     pub const HDR: u32 = 14;
     pub const CUE: u32 = 15;
     pub const CUE_TEXT: u32 = 16;
+    pub const STARVED: u32 = 17;
 }
 
 /// Error codes (map to limen `media_player::code`).
@@ -155,6 +160,9 @@ pub enum Record {
     CueText { i: u32, bytes: [u8; 24] },
     /// Static HDR metadata (CTA-861.3 units), after `Color`.
     Hdr { primaries_x: [u16; 3], primaries_y: [u16; 3], white: [u16; 2], luminance: [u16; 2], light: [u16; 2] },
+    /// A growing file has no more bytes yet; sent about once a second
+    /// while the worker waits, so the watchdog knows it is alive.
+    Starved,
 }
 
 fn put(b: &mut [u8; RECORD_LEN], tag: u32, a: u32, x: u64, y: u64, z: u64) {
@@ -185,6 +193,7 @@ impl Record {
             }
             Record::Seeked { epoch, pos } => put(&mut b, tag::SEEKED, epoch, pos, 0, 0),
             Record::Ended => put(&mut b, tag::ENDED, 0, 0, 0, 0),
+            Record::Starved => put(&mut b, tag::STARVED, 0, 0, 0, 0),
             Record::Error { code, track } => put(&mut b, tag::ERROR, code, track.map_or(0xFF, |t| t as u64), 0, 0),
             Record::Probe { refused } => put(&mut b, tag::PROBE, refused, 0, 0, 0),
             Record::Color { primaries, transfer, matrix, range } => {
@@ -246,6 +255,7 @@ impl Record {
             }
             tag::SEEKED => Record::Seeked { epoch: a, pos: x },
             tag::ENDED => Record::Ended,
+            tag::STARVED => Record::Starved,
             tag::ERROR if (1..=4).contains(&a) && (x < 8 || x == 0xFF) => Record::Error { code: a, track: (x != 0xFF).then_some(x as u8) },
             tag::PROBE if a < 8 => Record::Probe { refused: a },
             tag::COLOR => {
@@ -309,6 +319,7 @@ mod tests {
             Record::Buffered { track: 0, i: 0, n: 0, start_ns: 0, end_ns: 0 },
             Record::Seeked { epoch: 4, pos: 77 },
             Record::Ended,
+            Record::Starved,
             Record::Error { code: err::DECODE, track: None },
             Record::Error { code: err::TOO_BIG, track: Some(2) },
             Record::Probe { refused: 7 },

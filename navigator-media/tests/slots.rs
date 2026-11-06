@@ -117,7 +117,7 @@ fn a_press_starts_a_player_that_loads_the_resolved_url() {
     s.fetched(file, None, true, &mut host);
     assert_eq!(host.fds, 1);
     let p = host.players.get_mut(&file).unwrap();
-    assert_eq!(p.received, vec![ToChild::Load { source: Source::Fd, mime: "video/webm".into() }], "Load with the descriptor");
+    assert_eq!(p.received, vec![ToChild::Load { source: Source::Fd, mime: "video/webm".into(), growing: false }], "Load with the descriptor");
     // Ready: the press asked to play.
     for m in p.deliver() { s.from_player(file, &m, &mut host) }
     let p = host.players.get_mut(&file).unwrap();

@@ -284,10 +284,10 @@ fn main() {
     {
         use std::os::fd::AsFd;
         let (sock, _peer) = UnixStream::pair().unwrap();
-        let r = p.app.send_fd(e2, ToChild::Load { source: limen::media_player::Source::Fd, mime: "video/webm".into() }.encode(), sock.as_fd());
+        let r = p.app.send_fd(e2, ToChild::Load { source: limen::media_player::Source::Fd, mime: "video/webm".into(), growing: false }.encode(), sock.as_fd());
         p.check(matches!(r, Err(limen::client::Error::Refused(limen::proto::refusal::BAD_FD))), &format!("limend refuses a socket as the Load descriptor ({r:?})"));
         let f = std::fs::File::open(&clip).unwrap();
-        let r = p.app.send_fd(e2, ToChild::Load { source: limen::media_player::Source::Fd, mime: "video/webm".into() }.encode(), f.as_fd());
+        let r = p.app.send_fd(e2, ToChild::Load { source: limen::media_player::Source::Fd, mime: "video/webm".into(), growing: false }.encode(), f.as_fd());
         p.check(r.is_ok(), &format!("Load with the clip's descriptor ({r:?})"));
     }
     let r = p.wait(Duration::from_secs(10), |m| matches!(m, ToParent::Ready { .. }));

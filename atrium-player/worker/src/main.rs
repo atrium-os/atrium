@@ -27,6 +27,9 @@ use store::Store;
 /// Read ahead of the decode cursor in `Load` mode.
 const AHEAD_NS: i64 = 3_000_000_000;
 const READ_CHUNK: usize = 256 << 10;
+/// A growing file: how often to look for more, and to say we're waiting.
+const STARVED_POLL_MS: i32 = 20;
+const STARVED_NOTE: std::time::Duration = std::time::Duration::from_secs(1);
 /// Decode audio only while the ring has room for a whole packet.
 const PCM_PACKET_MAX: u64 = 8192;
 /// A cue's time on screen when the container doesn't say, and at most.
@@ -104,6 +107,10 @@ struct Worker {
     pending_drop: Option<i64>,
     /// The input is a file, not a pipe: it can be read out of order.
     seekable: bool,
+    /// The file is still being written: its end is not the end.
+    growing: bool,
+    /// At a growing file's end, waiting; when we last said so.
+    starved: Option<std::time::Instant>,
 }
 
 fn main() {
@@ -155,6 +162,8 @@ fn main() {
         failed: false,
         pending_drop: None,
         seekable: false,
+        growing: false,
+        starved: None,
     };
     if w.send(Record::Ready { sandboxed }).is_err() {
         return;
@@ -198,6 +207,10 @@ impl Worker {
             if !busy && !self.failed && self.audio_waiting() && !sys::readable(&self.sock, 10) {
                 continue;
             }
+            // At a growing file's end: look for more bytes soon.
+            if !busy && !self.failed && self.starved.is_some() && !self.input_eof && !sys::readable(&self.sock, STARVED_POLL_MS) {
+                continue;
+            }
             match sys::recv_frame(&self.sock) {
                 Ok(Some((payload, fds))) => {
                     let Some(msg) = decode_frame(&payload) else { return };
@@ -215,8 +228,9 @@ impl Worker {
     /// Returns false to exit.
     fn handle(&mut self, msg: ToWorker, mut fds: Vec<OwnedFd>) -> bool {
         match msg {
-            ToWorker::Init { mode, limits } => {
+            ToWorker::Init { mode, limits, growing } => {
                 self.limits = limits;
+                self.growing = growing && mode == Mode::Load;
                 if mode == Mode::Load {
                     let Some(fd) = fds.pop() else { self.fail(err::STATE); return true };
                     let mut f = File::from(fd);
@@ -267,6 +281,17 @@ impl Worker {
                 }
             }
             ToWorker::EndOfStream => self.end_of_stream = true,
+            ToWorker::InputDone => {
+                if self.mode != Some(Mode::Load) {
+                    self.fail(err::STATE);
+                    return true;
+                }
+                self.growing = false;
+                let seekable = self.seekable;
+                if let Some(p) = self.feeds.first_mut().and_then(|f| f.1.parser.as_mut()) {
+                    p.set_seekable(seekable);
+                }
+            }
             ToWorker::Buffers { format, width, height, count } => self.buffers(format, width, height, count, fds),
             ToWorker::PcmRing => {
                 if let (Some(a), Some(fd)) = (self.audio.as_mut(), fds.pop()) {
@@ -324,7 +349,9 @@ impl Worker {
             let Some(fmt) = fmt else { return self.fail(err::UNSUPPORTED) };
             let lim = demux::Limits { max_width: self.limits.max_width, max_height: self.limits.max_height, ..demux::Limits::default() };
             let mut parser = demux::open(fmt, lim);
-            parser.set_seekable(self.seekable);
+            // A growing file's index (WebM Cues after the clusters) isn't
+            // written yet: don't go looking for it until it's complete.
+            parser.set_seekable(self.seekable && !self.growing);
             feed.parser = Some(parser);
         }
         feed.parser.as_mut().unwrap().push(bytes);
@@ -516,6 +543,15 @@ impl Worker {
         if self.mode == Some(Mode::Load) && !self.input_eof && self.needs_input() {
             let mut buf = vec![0u8; READ_CHUNK];
             match self.input.as_mut().map(|f| f.read(&mut buf)) {
+                Some(Ok(0)) if self.growing => {
+                    // More is coming. The run loop waits a little and reads
+                    // again; a note now and then keeps the watchdog quiet.
+                    let now = std::time::Instant::now();
+                    if self.starved.map_or(true, |t| now.duration_since(t) >= STARVED_NOTE) {
+                        self.starved = Some(now);
+                        let _ = self.send(Record::Starved);
+                    }
+                }
                 Some(Ok(0)) => {
                     self.input_eof = true;
                     if let Some(p) = self.feeds[0].1.parser.as_mut() {
@@ -529,6 +565,7 @@ impl Worker {
                     }
                 }
                 Some(Ok(n)) => {
+                    self.starved = None;
                     self.push_bytes(0, &buf[..n]);
                     busy = true;
                 }

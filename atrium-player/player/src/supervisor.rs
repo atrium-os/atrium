@@ -214,10 +214,23 @@ pub struct Player<S: Sink> {
     queued: VecDeque<(u32, i64)>,
     /// Paused and seeked: show the first frame there anyway.
     show_one: bool,
+    /// The file is still being written (until `input_done`).
+    growing: bool,
 }
 
 impl<S: Sink> Player<S> {
     pub fn new(opts: Options, sink: S, source: Source) -> io::Result<Self> {
+        Self::start(opts, sink, source, false)
+    }
+
+    /// A file that is still being written (a progressive download): the
+    /// worker waits at its end for more, and doesn't end, until
+    /// [`Player::input_done`].
+    pub fn new_growing(opts: Options, sink: S, file: File) -> io::Result<Self> {
+        Self::start(opts, sink, Source::File(file), true)
+    }
+
+    fn start(opts: Options, sink: S, source: Source, growing: bool) -> io::Result<Self> {
         let mut p = Player {
             opts,
             sink,
@@ -243,6 +256,7 @@ impl<S: Sink> Player<S> {
             paused: false,
             queued: VecDeque::new(),
             show_one: false,
+            growing,
         };
         p.start_worker()?;
         Ok(p)
@@ -254,10 +268,10 @@ impl<S: Sink> Player<S> {
             Source::File(f) => {
                 let fd: OwnedFd = f.try_clone()?.into();
                 let fd = sys::restricted(&fd, sys::Rights::Input)?;
-                w.send(&ToWorker::Init { mode: Mode::Load, limits: self.opts.limits.clone() }, &[&fd])?;
+                w.send(&ToWorker::Init { mode: Mode::Load, limits: self.opts.limits.clone(), growing: self.growing }, &[&fd])?;
             }
             Source::Feed(tracks) => {
-                w.send(&ToWorker::Init { mode: Mode::Feed, limits: self.opts.limits.clone() }, &[])?;
+                w.send(&ToWorker::Init { mode: Mode::Feed, limits: self.opts.limits.clone(), growing: false }, &[])?;
                 for (t, mime) in tracks {
                     w.send(&ToWorker::AddTrack { track: *t, mime: mime.clone() }, &[])?;
                 }
@@ -293,6 +307,14 @@ impl<S: Sink> Player<S> {
 
     pub fn end_of_stream(&mut self) {
         self.send(ToWorker::EndOfStream);
+    }
+
+    /// A growing file is complete: play to its end and finish.
+    pub fn input_done(&mut self) {
+        if std::mem::take(&mut self.growing) {
+            self.heard = std::time::Instant::now();
+            self.send(ToWorker::InputDone);
+        }
     }
 
     pub fn probe_sandbox(&mut self) {
@@ -684,6 +706,8 @@ impl<S: Sink> Player<S> {
                     }
                 }
             }
+            // (`poll` has noted that the worker is alive.)
+            Record::Starved => {}
             Record::Ended => {
                 self.waiting = false;
                 self.ended = true;

@@ -39,7 +39,12 @@ pub enum Source {
 /// Parent to child.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum ToChild {
-    Load { source: Source, mime: String },
+    /// `growing`: the file is still being written (a progressive
+    /// download). The player waits at its end for more instead of ending,
+    /// until `LoadDone`.
+    Load { source: Source, mime: String, growing: bool },
+    /// A growing `Load`'s file is complete.
+    LoadDone,
     /// Begins a segment feed.
     OpenSource,
     AddTrack { track: u8, mime: String },
@@ -106,10 +111,10 @@ impl ToChild {
     pub fn decode(b: &[u8]) -> Option<Self> {
         let m: Self = postcard::from_bytes(b).ok()?;
         let ok = match &m {
-            ToChild::Load { source, mime } => {
+            ToChild::Load { source, mime, .. } => {
                 clean_text(mime, MIME_MAX) && matches!(source, Source::Fd)
             }
-            ToChild::OpenSource | ToChild::Play | ToChild::Pause | ToChild::Stop => true,
+            ToChild::OpenSource | ToChild::LoadDone | ToChild::Play | ToChild::Pause | ToChild::Stop => true,
             ToChild::AddTrack { track, mime } => *track < TRACKS_MAX && clean_text(mime, MIME_MAX),
             ToChild::Append { track, bytes, timestamp_offset } => {
                 *track < TRACKS_MAX
@@ -170,7 +175,8 @@ mod tests {
     #[test]
     fn round_trips() {
         let to_child = [
-            ToChild::Load { source: Source::Fd, mime: "video/webm".into() },
+            ToChild::Load { source: Source::Fd, mime: "video/webm".into(), growing: true },
+            ToChild::LoadDone,
             ToChild::OpenSource,
             ToChild::AddTrack { track: 0, mime: "video/webm; codecs=\"vp9\"".into() },
             ToChild::Append { track: 0, bytes: vec![1, 2, 3], timestamp_offset: Some(-2.5) },
@@ -211,7 +217,7 @@ mod tests {
             ToChild::SetVolume { volume: 1.5 },
             ToChild::SetRate { rate: 0.1 },
             ToChild::CanPlay { mime: "a".repeat(MIME_MAX + 1) },
-            ToChild::Load { source: Source::Fd, mime: "video/\nmp4".into() },
+            ToChild::Load { source: Source::Fd, mime: "video/\nmp4".into(), growing: false },
         ];
         for m in bad_child {
             assert_eq!(ToChild::decode(&m.encode()), None, "{m:?}");
