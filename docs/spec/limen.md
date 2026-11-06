@@ -324,6 +324,16 @@ parent                    limend                 portcullisd       frescod      
   `[workers."<app>"] callers = ["_limen"], run_as = "<its user>"`. limend refuses a launch
   without one before asking portcullisd, and expects that uid to own the child's window. No
   portcullisd change was needed (`limen::launch`).
+- **The child's only frescod connection is embed-only** (fresco-video.md §8 S1). Before
+  sending anything else on the child's channel, limend opens a new connection to frescod's
+  activation socket and sends `EMBED_CONNECT { owner_uid }` (0x0911), naming the child's
+  uid. frescod refuses a uid that is itself on the slot allowlist. After `Ok`, frescod treats
+  that stream as the child's client connection: every window it opens is forced
+  `embed_pending` and shows only when bound. limend passes the descriptor to the child with
+  `SCM_RIGHTS` as the first thing on the channel, and `limen::Child::embedded()` returns it.
+  limend also refuses to launch a provider whose manifest asks for `graphics`, because
+  `ExecInstance` would then mount the ordinary app socket into its jail. A launch fails
+  closed if frescod can't give the connection.
 - **System roles**: limend asks the provider, which is already running, for a new instance
   over the provider's own connection. The provider opens a new window for it.
 - The child's window is not shown on its own until it is bound. frescod keeps a window

@@ -261,6 +261,7 @@ dependencies = [
  "portcullis-ipc",
  "portcullis-peer",
  "portcullis-policy",
+ "portcullis-toml",
  "postcard",
  "serde",
 ]

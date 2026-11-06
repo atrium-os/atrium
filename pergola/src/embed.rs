@@ -118,6 +118,7 @@ mod tests {
             self.0.lock().unwrap().push(r);
             Ok((APP, ARCA))
         }
+        fn embed_connection(&mut self, _: u32) -> Result<UnixStream, u8> { Err(1) }
     }
     struct NoLaunch;
     impl limen::daemon::Launcher for NoLaunch {

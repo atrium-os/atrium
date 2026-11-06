@@ -21,7 +21,7 @@ const W_VIEWER: WindowToken = [4; 16];
 
 /// frescod: window tokens → owner uids; records binds.
 #[derive(Clone, Default)]
-struct Fresco(Arc<Mutex<(HashMap<WindowToken, u32>, Vec<(WindowToken, WindowToken, SlotKind, Option<[f32; 4]>)>)>>);
+struct Fresco(Arc<Mutex<(HashMap<WindowToken, u32>, Vec<(WindowToken, WindowToken, SlotKind, Option<[f32; 4]>)>, Vec<(u32, UnixStream)>)>>);
 impl Compositor for Fresco {
     fn bind(&mut self, p: WindowToken, c: WindowToken, k: SlotKind, r: Option<[f32; 4]>) -> Result<(u32, u32), u8> {
         let mut g = self.0.lock().unwrap();
@@ -30,6 +30,13 @@ impl Compositor for Fresco {
             (Some(&a), Some(&b)) => Ok((a, b)),
             _ => Err(2),
         }
+    }
+    fn embed_connection(&mut self, owner: u32) -> Result<UnixStream, u8> {
+        // Stands for frescod's embed-only connection; the other end is kept
+        // so the child's end stays open.
+        let (a, b) = UnixStream::pair().unwrap();
+        self.0.lock().unwrap().2.push((owner, b));
+        Ok(a)
     }
 }
 impl Fresco {
@@ -88,7 +95,9 @@ impl World {
     fn arca(&self) -> Child { provider(self.connect(ARCA_UID), "credential").unwrap() }
     fn spawned(&self) -> (EmbedId, Child) {
         let (e, s) = self.launched.recv_timeout(Duration::from_secs(2)).unwrap();
-        (e, Child::wrap(aqueduct::Connection::wrap(s).unwrap()))
+        // The first thing on the channel is its embed-only frescod connection.
+        let (c, _fresco) = Child::embedded_on(s).unwrap();
+        (e, c)
     }
 }
 
@@ -244,6 +253,16 @@ fn a_spawned_child_crash_is_child_lost_and_a_parent_exit_ends_its_children() {
     std::thread::sleep(Duration::from_millis(catalogue::DETACH_GRACE_MS + 200));
     assert!(w.ended.lock().unwrap().contains(&e2));
     assert_eq!(w.shared.embeds(), 0);
+}
+
+#[test]
+fn a_spawned_child_gets_an_embed_only_frescod_connection_for_its_own_uid() {
+    let w = World::new();
+    let mut app = w.parent(APP);
+    let _ = app.request("doc-viewer", W_APP).unwrap();
+    let _ = w.spawned();
+    let owners: Vec<u32> = w.fresco.0.lock().unwrap().2.iter().map(|(u, _)| *u).collect();
+    assert_eq!(owners, vec![VIEWER_UID], "frescod is asked for one, owned by the child, never by limend");
 }
 
 #[test]

@@ -19,6 +19,7 @@ aqueduct        = { path = "../aqueduct" }
 portcullis-peer = { path = "../portcullis/portcullis-peer" }
 fresco-protocol = { path = "../fresco-protocol" }
 portcullis-ipc  = { path = "../portcullis/portcullis-ipc" }
+portcullis-toml  = { path = "../portcullis/portcullis-toml" }
 portcullis-policy = { path = "../portcullis/portcullis-policy" }
 libc            = "0.2"
 serde    = { version = "1", features = ["derive"] }

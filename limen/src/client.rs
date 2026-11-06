@@ -133,15 +133,26 @@ pub struct Child(Wire<ChildEvent>);
 impl Child {
     /// A child limend started through portcullisd: its channel is its stdin
     /// (limen.md §4; `LIMEN_FD` names another descriptor, for development).
-    /// The first event is the `Attach`. Call this only in an app that is
-    /// started as a role provider: it takes stdin over.
-    pub fn embedded() -> Result<Self, Error> {
+    /// Returns the child's end and its frescod connection, which is
+    /// embed-only (fresco-video.md §8 S1): speak the ordinary fresco client
+    /// protocol on it; every window it opens shows only in its slot. Call
+    /// this only in an app started as a role provider: it takes stdin over.
+    pub fn embedded() -> Result<(Self, std::os::unix::net::UnixStream), Error> {
         use std::os::fd::FromRawFd;
         let fd: i32 = std::env::var("LIMEN_FD").ok().and_then(|v| v.parse().ok()).unwrap_or(0);
         // SAFETY: the descriptor is the limend channel portcullisd installed
         // for this child, and nothing else in the process owns it.
         let s = unsafe { std::os::unix::net::UnixStream::from_raw_fd(fd) };
-        Ok(Self::wrap(Connection::wrap(s)?))
+        Self::embedded_on(s)
+    }
+
+    /// [`Child::embedded`] on a given channel.
+    pub fn embedded_on(s: std::os::unix::net::UnixStream) -> Result<(Self, std::os::unix::net::UnixStream), Error> {
+        // The frescod descriptor comes first, before any aqueduct frame,
+        // and is read before the channel is buffered.
+        let mut fds = portcullis_ipc::recv_fds(&s, 1)?;
+        let f = fds.pop().ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "no frescod connection from limend"))?;
+        Ok((Self::wrap(Connection::wrap(s)?), std::os::unix::net::UnixStream::from(f)))
     }
 
     /// A system provider connecting to limend's socket.

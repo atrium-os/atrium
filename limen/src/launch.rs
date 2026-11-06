@@ -44,6 +44,23 @@ impl Portcullis {
     }
 }
 
+/// An embedded child's only way to frescod is the embed-only connection
+/// limend hands it (fresco-video.md §8 S1). `ExecInstance` mounts what the
+/// manifest asks for, so a provider whose manifest asks for `graphics` would
+/// also get the ordinary app socket and could open top-level windows: it is
+/// refused. (An app that is both a provider and a normal app ships its
+/// provider as a separate bundle, until portcullisd can drop the mount for
+/// workers limend starts.)
+fn no_app_socket(app: &str) -> Result<(), String> {
+    let path = std::path::Path::new("/var/lib/atrium/apps").join(app).join("atrium.toml");
+    let text = std::fs::read_to_string(&path).map_err(|e| format!("{}: {e}", path.display()))?;
+    let m = portcullis_toml::Manifest::from_str(&text).map_err(|e| format!("{}: {e:?}", path.display()))?;
+    if m.capabilities.graphics.is_some() {
+        return Err(format!("{app} asks for graphics, so its jail would hold frescod's app socket; an embed provider must not"));
+    }
+    Ok(())
+}
+
 fn uid_of(name: &str) -> Option<u32> {
     let c = std::ffi::CString::new(name).ok()?;
     // SAFETY: getpwnam with a valid C string; the result is read at once.
@@ -55,6 +72,7 @@ impl Launcher for Portcullis {
     fn launch(&mut self, app: &str, embed: EmbedId, channel: UnixStream) -> Result<u32, String> {
         use portcullis_ipc::{read_response, round_trip, send_fds, write_request, Request, Response};
         let uid = self.run_as(app)?;
+        no_app_socket(app)?;
         let go = || -> io::Result<UnixStream> {
             let path = portcullis_ipc::resolve_socket_path()
                 .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "portcullisd's socket is not there"))?;

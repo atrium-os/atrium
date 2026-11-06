@@ -57,4 +57,50 @@ impl Compositor for Frescod {
             }
         }
     }
+
+    fn embed_connection(&mut self, owner_uid: u32) -> Result<std::os::unix::net::UnixStream, u8> {
+        self.open_embed(owner_uid).map_err(|e| {
+            eprintln!("limend: frescod embed connection: {e}");
+            u8::MAX
+        })
+    }
+}
+
+/// fresco-video.md §8 S1, as agreed with the Fresco thread (2026-11-06).
+/// Local until fresco_protocol carries it; same encoding.
+pub mod embed_connect {
+    use serde::{Deserialize, Serialize};
+    pub const OP: u16 = 0x0911;
+    #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+    pub struct EmbedConnect { pub owner_uid: u32 }
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+    pub enum EmbedConnectResult { Ok, Refused { reason: u8 } }
+}
+
+impl Frescod {
+    /// Open a new activation-socket connection, ask for EMBED_CONNECT, and
+    /// hand back the raw stream, which frescod then treats as the child's
+    /// client connection. Read exactly the reply and nothing more, and send
+    /// nothing after it.
+    pub fn open_embed(&self, owner_uid: u32) -> std::io::Result<std::os::unix::net::UnixStream> {
+        use aqueduct::envelope::{read_message_alloc, write_message};
+        use embed_connect::*;
+        let mut s = std::os::unix::net::UnixStream::connect(&self.path)?;
+        s.set_read_timeout(Some(Duration::from_secs(2)))?;
+        let payload = postcard::to_stdvec(&EmbedConnect { owner_uid }).unwrap();
+        let h = aqueduct::Header::new(aqueduct::classes::CLASS_DISPLAY, OP, flag::RESPONSE_EXPECTED, payload.len() as u32);
+        write_message(&mut s, h, &payload)?;
+        let (h, body) = read_message_alloc(&mut s)?;
+        let bad = |m: String| std::io::Error::new(std::io::ErrorKind::InvalidData, m);
+        if h.op != OP || h.flags & flag::IS_RESPONSE == 0 {
+            return Err(bad(format!("unexpected reply op {:#x}", h.op)));
+        }
+        match postcard::from_bytes(&body).map_err(|e| bad(e.to_string()))? {
+            EmbedConnectResult::Ok => {
+                s.set_read_timeout(None)?;
+                Ok(s)
+            }
+            EmbedConnectResult::Refused { reason } => Err(bad(format!("refused ({reason})"))),
+        }
+    }
 }

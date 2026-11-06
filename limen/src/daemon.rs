@@ -29,6 +29,11 @@ pub trait Compositor: Send {
     /// it with `None`. A bind answers the two windows' owner uids.
     fn bind(&mut self, parent: WindowToken, child: WindowToken, kind: SlotKind, rect: Option<[f32; 4]>)
         -> Result<(u32, u32), u8>;
+
+    /// A new embed-only frescod connection whose windows belong to
+    /// `owner_uid` (fresco-video.md §8 S1): every window it opens stays
+    /// hidden until bound, so a child can't put a top-level window on screen.
+    fn embed_connection(&mut self, owner_uid: u32) -> Result<UnixStream, u8>;
 }
 
 /// portcullisd's embed-mode `ExecInstance` (limen.md §4).
@@ -249,6 +254,20 @@ fn request(shared: &Arc<Shared>, conn: ConnId, uid: u32, req: proto::Request) ->
                     return refuse(refusal::LAUNCH_FAILED);
                 }
             };
+            // The child's only way to frescod: an embed-only connection,
+            // handed over on its channel before anything else is sent.
+            let handed = shared.compositor.lock().unwrap().embed_connection(child_uid)
+                .map_err(|r| format!("frescod refused an embed connection ({r})"))
+                .and_then(|f| {
+                    use std::os::fd::AsRawFd;
+                    portcullis_ipc::send_fds(&ours, &[f.as_raw_fd()]).map_err(|e| e.to_string())
+                });
+            if let Err(e) = handed {
+                eprintln!("limend: {provider} for {}: {e}", role.name);
+                shared.launcher.lock().unwrap().end(embed);
+                st.conns.remove(&id);
+                return refuse(refusal::LAUNCH_FAILED);
+            }
             let sh = shared.clone();
             let conn = Connection::wrap(ours).map_err(|_| Reply::Refused { reason: refusal::LAUNCH_FAILED })?;
             std::thread::spawn(move || { let _ = run(conn, child_uid, id, rx, sh); });
