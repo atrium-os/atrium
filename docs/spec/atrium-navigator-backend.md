@@ -1346,6 +1346,70 @@ for 500,000 elements. What remains is mostly the normalizer's own per-element
 declaration maps and the layout itself. Those are the next to share, and bands bound the
 layout.
 
+**Step 2 built: the scroll harness (2026-11-06)** (`navigator-render/examples/scroll_bench`).
+
+*Asked by the user, 2026-11-06:* check short-term jitter and long-term lag too, because
+"sometimes one scroll lags for a few seconds and then catches up. Average won't catch
+this." So the harness reports the tail and the timeline, not only a distribution.
+
+*How it measures.* A replay on a virtual clock with real costs.
+- Each vsync samples a scripted scroll target:
+  - `fling`: 4,000 px/s decaying over 0.6 s;
+  - `flings`: one every 1.5 s;
+  - `page`: page-down every 250 ms;
+  - `jump`: to the end at 1 s and back at 4 s.
+- The compositor's per-frame work is actually run, and its measured time advances the
+  clock:
+  - cull the scene to the viewport;
+  - translate it into a Fresco frame: rects, filled paths, text through an R8 glyph atlas
+    rasterised on first sight, images as textures;
+  - `Frame::pack_report`, as frescod packs a window;
+  - raster on frescod's CPU kernels (Tier-2).
+- A frame presents at the first vsync after its work ends. Until then the previous one
+  stays up.
+- Not modelled: the GPU path, the socket, clips, groups and transforms (drawn unclipped),
+  and image decode arrival.
+
+*What it reports*, per document, rate (60 or 120 Hz) and pattern:
+- *Jitter:* frame time p50, p99, p99.9 and max; the change between consecutive frames
+  (p99); missed vsyncs (a vsync with nothing new while the target moved); the longest run
+  of them.
+- *Lag:* the age of what is shown (how long ago the displayed position was the target),
+  worst and as the worst one-second window; the position error in px.
+- *Stalls:* every stretch where what is shown is more than 100 ms old, with its start,
+  length, worst age and catch-up time; counted over 100 ms, 500 ms and 1 s.
+- `--csv`: one row per vsync (`t_ms target_y shown_y age_ms cost_ms missed`), the
+  timeline.
+
+*Positive control.* `--inject-stall 2500@2000` makes one frame 2.5 s slower. The harness
+reports exactly one stall: start 2,100 ms, length 2,433 ms, worst age 2,517 ms, caught up
+in 17 ms. The frame-time-change p99 stays at 0.99 ms, so a distribution alone would not
+have shown it.
+
+*Baseline* (today's whole-page scene; 7 documents × 2 rates × 4 patterns × 2 runs, 112
+runs, 8 s each, 800 × 600 at 1×; M4 Max):
+- **60 Hz:** every document holds the rate.
+  - Frame p50 7.5–13.6 ms, p99 8.6–16.6 ms.
+  - A rare single spike to 22–32 ms (one missed frame, shown age up to 50 ms) appears in
+    p99.9 and max only.
+  - **0 stalls over 100 ms** in all 56 runs.
+- **120 Hz:** flings miss 35–50% of vsyncs on the documents that scroll far, so they run
+  at about 60 fps.
+  - A frame costs 8–12 ms whatever the document: War and Peace's 573,000 nodes cost
+    7.7 ms, the 663-node feed 12 ms. So the limit is the full-frame CPU raster at
+    800 × 600, not the document or the per-frame walk of the whole scene.
+  - A compositor that redraws only what a scroll exposes (Fresco's damage tracking), or
+    the GPU path, is what 120 Hz needs. The harness redraws every frame in full.
+- **No long lags today, by construction.** The whole scene is resident, so scrolling
+  never waits on the worker. The price is the whole-document layout before anything
+  shows: 0.3–3.3 s here, the 100,000-row table the longest. It is also the memory above.
+  Bands remove that cost. They introduce worker latency while scrolling, and that is what
+  this harness's stall detector is for.
+
+*Gates for bands (proposed):* at 60 Hz, 0 stalls over 100 ms after first display in every
+pattern, p99.9 frame time ≤ 2 periods, and missed vsyncs ≤ 1%. At 120 Hz, the same once
+the compositor redraws by damage.
+
 **Decisions to settle:**
 1. Raise the profile ceilings once bands and the image working set are in, or split very
    large documents into chapters at conversion? *Recommend raising them,* to levels
