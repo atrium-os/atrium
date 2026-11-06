@@ -542,7 +542,7 @@ impl Compute {
                     use fresco_compute::{damage, TILE};
                     let h = &frame.header;
                     let dirty = damage::dirty(&sig, self.held.get(&w.id).map(Vec::as_slice));
-                    let tiles = damage::rects(&dirty, h.tiles_x, h.tiles_y, 32);
+                    let tiles = damage::rects(&dirty, h.tiles_x, h.tiles_y, fresco_compute::tier2::Tier2::MAX_TILE_RECTS);
                     self.t2.render_tiles(&frame, surface, &tiles)?;
                     let r = tiles.iter().map(|t| [t[0] * TILE, t[1] * TILE, (t[2] * TILE).min(s[2]), (t[3] * TILE).min(s[3])])
                         .reduce(|a, b| [a[0].min(b[0]), a[1].min(b[1]), a[2].max(b[2]), a[3].max(b[3])]);

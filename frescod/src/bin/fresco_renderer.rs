@@ -135,7 +135,7 @@ fn raster(t2: &fresco_compute::tier2::Tier2, w: &mut Win, frame: &fresco_compute
         return Ok(Some(None));
     };
     let dirty = damage::dirty(&sig, Some(held));
-    let tiles = damage::rects(&dirty, h.tiles_x, h.tiles_y, 32);
+    let tiles = damage::rects(&dirty, h.tiles_x, h.tiles_y, fresco_compute::tier2::Tier2::MAX_TILE_RECTS);
     if tiles.is_empty() {
         return Ok(None);
     }

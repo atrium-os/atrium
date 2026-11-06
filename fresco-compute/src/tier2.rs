@@ -124,6 +124,13 @@ impl Tier2 {
         Ok(())
     }
 
+    /// Rect cap to pass [`crate::damage::rects`] for [`Tier2::render_tiles`]:
+    /// none. Its cost is per tile rastered, not per rect, so scattered
+    /// changes cost their share of the window; capped (as a GPU backend,
+    /// one dispatch per rect, must be), they fall back to their bounding
+    /// box, which for changes spread over the window is all of it.
+    pub const MAX_TILE_RECTS: usize = usize::MAX;
+
     /// Like [`Tier2::render`], but raster only the tiles in `tiles` (tile
     /// rects `[tx0, ty0, tx1, ty1)`, as [`crate::damage::rects`] gives
     /// them); the rest of `target` keeps what it holds. Binning still
@@ -132,6 +139,13 @@ impl Tier2 {
         frame.validate(target.len()).map_err(err)?;
         if tiles.is_empty() {
             return Ok(());
+        }
+        // Every tile dirty (damage::rects gives disjoint rects): the plain
+        // full dispatch, without listing each workgroup.
+        let h = &frame.header;
+        let area = |t: &[u32; 4]| u64::from(t[2].min(h.tiles_x).saturating_sub(t[0])) * u64::from(t[3].min(h.tiles_y).saturating_sub(t[1]));
+        if tiles.iter().map(area).sum::<u64>() >= u64::from(h.tiles_x) * u64::from(h.tiles_y) {
+            return self.render(frame, target);
         }
         let mut mask = vec![0u32; frame.mask_words()];
         let header = [frame.header];
@@ -143,7 +157,6 @@ impl Tier2 {
         table[binding::MASK as usize] = desc(&mask);
         table[binding::TARGET as usize] = desc(target);
         table[binding::LUT as usize] = desc(&frame.lut);
-        let h = &frame.header;
         let g = h.raster_groups();
         let per = crate::TILE / RASTER_LOCAL;
         let groups: Vec<[u32; 4]> = tiles
@@ -208,6 +221,9 @@ impl Tier2 {
             .collect();
         if groups.is_empty() {
             return Ok(());
+        }
+        if groups.iter().any(|r| r[0] == 0 && r[1] == 0 && r[2] >= g[0] && r[3] >= g[1]) {
+            return self.compose(c, heap, target); // all of it
         }
         let header = [c.header];
         let mut table = [SsboDesc::default(); cb::COUNT];

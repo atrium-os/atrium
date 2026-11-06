@@ -189,3 +189,42 @@ fn damage_redraw_matches_full_render() {
     let same = damage::dirty(&damage::tile_signatures(&fa), Some(&damage::tile_signatures(&fa)));
     assert!(damage::rects(&same, h.tiles_x, h.tiles_y, 16).is_empty());
 }
+
+/// Scattered dirty tiles, listed one rect each (no cap), or all of them:
+/// rastering just those over a stale image gives the full result.
+#[test]
+fn tier2_scattered_and_whole_partial_rasters_match_full() {
+    use fresco_compute::damage;
+    let dir = tempfile::tempdir().unwrap();
+    tier2::Tier2::seed_cache(dir.path()).expect("cranelift");
+    let t2 = tier2::Tier2::new(dir.path().to_path_buf(), "/nonexistent/atrium-spv-compile".into()).expect("tier2 load");
+    let before = scene();
+    let mut after = scene();
+    for r in after.rects.iter_mut() {
+        r.color[0] = 1.0 - r.color[0];
+    }
+    let (fa, fb) = (Frame::pack(&after, W, H, PITCH), Frame::pack(&before, W, H, PITCH));
+    let mut full = vec![0u32; fa.target_words()];
+    t2.render(&fa, &mut full).unwrap();
+    let h = fa.header;
+    let n = (h.tiles_x * h.tiles_y) as usize;
+    let mut rng = fuzz::Rng(11);
+    let scattered: Vec<bool> = (0..n).map(|_| rng.chance(50)).collect();
+    for dirty in [scattered, vec![true; n]] {
+        let mut img = vec![0u32; fb.target_words()];
+        t2.render(&fb, &mut img).unwrap();
+        // Tiles not listed keep the old image; listed ones get the new.
+        let tiles = damage::rects(&dirty, h.tiles_x, h.tiles_y, tier2::Tier2::MAX_TILE_RECTS);
+        t2.render_tiles(&fa, &mut img, &tiles).unwrap();
+        let mut old = vec![0u32; fb.target_words()];
+        t2.render(&fb, &mut old).unwrap();
+        for y in 0..H {
+            for x in 0..W {
+                let i = (y * PITCH + x) as usize;
+                let tile = ((y / TILE) * h.tiles_x + x / TILE) as usize;
+                let want = if dirty[tile] { full[i] } else { old[i] };
+                assert_eq!(img[i], want, "pixel {x},{y}");
+            }
+        }
+    }
+}
