@@ -4,7 +4,7 @@
 > and every system surface inherits.*
 > Locked: 2026-05-09 · Owner: Pergola track · Reviewed before phase 0 of
 > toolkit implementation. · Rev. 2 (controls, contrast, appearance)
-> proposed 2026-11-06, see the revision log.
+> accepted 2026-11-06, see the revision log.
 
 This is a decisive document, not a survey. Each section commits to a
 choice. We can revise; we don't equivocate.
@@ -656,8 +656,8 @@ dock 56/40, chips 24/26) recorded; `radius-tile 10` added; type-scale
 (control-internal metrics are the control designer's); the mockups'
 dock-tile shadow **rejected** (shadow policy unamended). Render:
 `forum-demo` §12 reference screen, light + dark, before/after —
-see `scratch/m1-reference-render/` when captured. Approval: pending
-Pergola track owner.
+see `scratch/m1-reference-render/` when captured. Approval: given with rev. 2
+(2026-11-06).
 
 **Rev. 2 — 2026-11-06 — controls, contrast, appearance.** Trigger: the toolkit needs its
 remaining controls (menus, choice controls, tabs, text editing), and the document said how
@@ -669,5 +669,6 @@ text, `border-control` for control edges); new tokens `accent-mark`, `accent-fil
 (`-hover`, `-pressed`, replacing `accent-pressed`), `state-hover`, `state-pressed`,
 `selection-bg`, `selection-idle`, `border-control`, `bg-inverse`, `text-inverse`, `danger-fg`
 and its siblings; the floating shadow waits for a Fresco op; the token table's real path. Render: the rev. 2 control sheet, light
-and dark. Approval: pending.
+and dark. Approval: Shankar, 2026-11-06, on the control sheet (which also stands as rev. 1's
+render), with the darker `border-control` edges.
 
