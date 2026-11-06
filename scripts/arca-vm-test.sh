@@ -14,13 +14,17 @@
 # 3. Identity over the real socket: app B gets EACCES on app A's item, an
 #    unregistered uid gets nothing, only ostiarius's uid unlocks and locks,
 #    and a while-unlocked item is unreadable after lock.
+# …§4–6 the courier, a jail per courier, web couriers and tickets; §7 the
+# Navigator broker's tickets through navigator-cookies' own clients.
 set -eu
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 set -- env
 . "$ROOT/scripts/cloud-vm.sh" >/dev/null
 set --
 # ring (rustls's crypto, in the courier) has C and assembly: build it for the guest.
-export CC_aarch64_unknown_freebsd=clang AR_aarch64_unknown_freebsd=llvm-ar
+# (A host whose clang can't target FreeBSD — macOS's — sets these to
+# Homebrew's LLVM first; they are kept.)
+export CC_aarch64_unknown_freebsd="${CC_aarch64_unknown_freebsd:-clang}" AR_aarch64_unknown_freebsd="${AR_aarch64_unknown_freebsd:-llvm-ar}"
 export CFLAGS_aarch64_unknown_freebsd="--target=aarch64-unknown-freebsd --sysroot=$VMDIR/sysroot"
 KEY="$HOME/.ssh/fresco_bsd_ed25519"
 SSHOPT="-i $KEY -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR"
@@ -47,12 +51,15 @@ REL="$ROOT/arca/arcad/target/$TARGET/release"
 CREL="$ROOT/arca/arca-courier/target/$TARGET/release"
 (cd "$ROOT/arca/arca-courierd" && RUSTFLAGS="$CROSS_RUSTFLAGS" cargo build -q --release --target "$TARGET" --bins --examples)
 DREL="$ROOT/arca/arca-courierd/target/$TARGET/release"
+# The Navigator broker's side (§7): its real arcad and launcher clients.
+(cd "$ROOT/navigator-cookies" && RUSTFLAGS="$CROSS_RUSTFLAGS" cargo build -q --release --target "$TARGET" --example cookies-vm-probe)
+NREL="$ROOT/navigator-cookies/target/$TARGET/release"
 # The jailed couriers' TLS server runs here, on the machine running the VM.
 (cd "$ROOT/arca/arca-courier" && cargo build -q --example courier-test-server)
 
 echo "=== deploy"
 g "mkdir -p /root/arca-test && rm -f /root/arca-test/*"
-for b in $BINS "$REL/arcad" "$REL/arca-probe" "$CREL/arca-courier" "$CREL/examples/courier-vm-probe" "$DREL/arca-courierd" "$DREL/examples/courierd-vm-probe"; do
+for b in $BINS "$REL/arcad" "$REL/arca-probe" "$CREL/arca-courier" "$CREL/examples/courier-vm-probe" "$DREL/arca-courierd" "$DREL/examples/courierd-vm-probe" "$NREL/examples/cookies-vm-probe"; do
     put "$b" /root/arca-test/
     h=$(sha256sum "$b" | cut -d' ' -f1)
     gh=$(g "sha256 -q /root/arca-test/$(basename "$b")")
@@ -258,6 +265,23 @@ check "a cross-site subresource: the Lax cookie stays home" - "$(L 2)"
 check "a same-site navigation: the cookie goes" sid=vm-cookie "$(L 3)"
 check "no ticket: no cookie" - "$(L 4)"
 check "the launcher logged no failure" 0 "$(g "grep -c ': .*\(refused\|failed\|errno\)' /tmp/courierd.log" || true)"
+
+echo "=== 7. the Navigator broker's tickets (navigator-cookies, legacy-web §5.4.1e)"
+# The broker crate's own clients (ArcadSocket, Launcher) through the real
+# sockets and jailed couriers. What the server got decides each check.
+g "install -m 755 /root/arca-test/cookies-vm-probe /usr/local/bin/cookies-vm-probe"
+N=$(wc -l < "$SRV/log")
+r=$(g "su -m arcabroker -c 'cookies-vm-probe $S $D api.example $PORT'")
+echo "$r" | sed 's/^/    /'
+tail -n +$((N+1)) "$SRV/log" | sed 's/^/    server: /'
+C() { tail -n +$((N+1)) "$SRV/log" | grep -F "GET $1 HTTP" | sed -n "${2:-1}p" | sed 's/.*cookie=//'; }
+check "an uncookied view: the plain way, no ticket asked for" "uncookied=NotCookied tickets=0" "$(echo "$r" | sed -n 1p)"
+check "…and nothing of it reached a courier" "" "$(C /c0)"
+check "cookied: the reader's own navigation carries the cookie" "sid=vm-cookie" "$(C '/c1?q=1')"
+check "a cross-site subresource: the Lax cookie stays home" - "$(C /c2)"
+check "a ticket replayed through its courier: no cookie" - "$(C '/c1?q=1' 2)"
+check "a ticket for /c3?a=1 used for /c3?a=2: no cookie" - "$(C '/c3?a=2')"
+check "…and the same ticket for its own URL: the cookie" "sid=vm-cookie" "$(C '/c3?a=1')"
 g "pkill -x arca-courierd; true"
 
 echo "=== $pass passed, $fail failed"

@@ -497,10 +497,14 @@ same-site context or a gesture, because it never holds a ticket.
   arca-courierd for a courier with a partition. That courier carries the user's `web`
   persona, and each partition is a separate jar.
 - **Tickets** (`W_TICKET`, 0x70). The broker names the endpoint, partition, method, path,
-  reason (navigation, subresource or form), the initiating host ("" for the reader's
-  own navigation) and whether a user gesture started it.
+  query, reason (navigation, subresource or form), the initiating host ("" for the
+  reader's own navigation) and whether a user gesture started it.
   - A ticket lives 10 s and is redeemed once by `COOKIES`, from a courier whose label
-    matches its user, partition, host, port and path.
+    matches its user, partition, host and port, for exactly its method, path and query.
+    A web courier's `COOKIES` carries the request's method and query after the ticket;
+    a mismatch is refused and does not spend it. (Before 0bb0f5c3 a ticket named the
+    path alone, so one for `GET /a?x=1` also opened `/a?x=2` and a `HEAD` or `POST` to
+    `/a`.)
   - After redemption, it admits that response's `Set-Cookie`s for 60 s.
   - A web courier with no ticket, or the wrong one, gets no cookies and can set none.
   - An app's courier can't use a ticket.
@@ -523,8 +527,17 @@ same-site context or a gesture, because it never holds a ticket.
     a view closes.
   - `document.cookie` for the converter.
   - "Forget this site" in the trusted UI.
-  - The Navigator's broker issuing tickets. That is the Navigator thread's work, on
-    this API.
+  - ~~The Navigator's broker issuing tickets.~~ Built 2026-11-06 in `navigator-cookies`:
+    a ticket per request of a cookied view, sent through the courier for its
+    (partition, origin), with redirects followed by the broker (legacy-web §5.4.1e,
+    "Built"). `scripts/arca-vm-test.sh` §7 runs the broker's own clients through jailed
+    couriers: 7/7 in the dev VM, 2026-11-06.
+  - **A teardown leak found by that run** (§5, not a ticket matter). Two checks failed:
+    "its root is removed" and "no mounts left". A courier jail that held TCP
+    connections is still dying after jaild's 10 s wait, because its sockets sit in
+    TIME_WAIT (`net.inet.tcp.msl` 30 s). Nothing unmounts it once it is freed: minutes
+    later no jail was dying, and all six mounts of each of the run's four courier jails
+    were still there. The rest of the gate passed (74/76).
   - Password fill by form ticket and gesture (§8.3) comes with A3.
 
 ## 9. Native apps and other clients
