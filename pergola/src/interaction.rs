@@ -46,6 +46,11 @@ pub type ScrollHandler = Box<dyn Fn(&ScrollInput) + 'static>;
 /// and the node as last laid out. Returns whether it still needs frames.
 pub type FrameHandler = Box<dyn Fn(f64, &Node) -> bool + 'static>;
 
+/// A press held and moved: where it started, moved, and ended (window px).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DragPhase { Start, Move, End }
+pub type DragHandler = Box<dyn Fn(DragPhase, Point) + 'static>;
+
 #[derive(Default)]
 pub struct Handlers {
     pub on_click: Option<ClickHandler>,
@@ -59,6 +64,9 @@ pub struct Handlers {
     pub on_frame: Option<FrameHandler>,
     /// A drop from another window landed on this node (tabula.md §4).
     pub on_drop: Option<ClickHandler>,
+    /// A press on this node, then every move until release, goes here (a
+    /// slider's thumb follows the pointer even off the track).
+    pub on_drag: Option<DragHandler>,
     /// This node is where another process's surface is embedded (a Limen
     /// slot, e.g. Arca's credential field): the App reports its window
     /// rect to the binder whenever it changes ([`crate::slot`]).

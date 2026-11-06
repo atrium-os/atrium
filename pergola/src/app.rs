@@ -45,6 +45,8 @@ pub struct App<V: View> {
     /// Whether focus came from the keyboard, so its ring shows (visual
     /// language rev. 2 §14.1: pointer focus shows no ring).
     focus_visible: bool,
+    /// The node following the held press (`Ctx::on_drag`), if any.
+    dragging: Option<NodeId>,
     /// Current hover target — nearest interactive ancestor under the
     /// pointer. Drives widgets' hover looks via `InteractionState`.
     hovered: Option<NodeId>,
@@ -95,6 +97,7 @@ impl<V: View> App<V> {
             pending_press: None,
             focused: None,
             focus_visible: false,
+            dragging: None,
             hovered: None,
             pressed_vis: None,
             dirty,
@@ -345,6 +348,10 @@ impl<V: View> App<V> {
                 // the handler. Press-tracking uses the nearest on_click ancestor;
                 // focus uses the nearest focusable ancestor.
                 self.pending_press = hit.and_then(|id| self.bubble_to(id, |h| h.on_click.is_some()));
+                self.dragging = hit.and_then(|id| self.bubble_to(id, |h| h.on_drag.is_some()));
+                if let Some(cb) = self.dragging.and_then(|d| self.interactions.get(d)).and_then(|h| h.on_drag.as_ref()) {
+                    cb(crate::interaction::DragPhase::Start, *at);
+                }
                 let new_focus = hit.and_then(|id| self.bubble_to(id, |h| h.focusable));
                 if self.focused != new_focus || self.focus_visible {
                     self.focused = new_focus;
@@ -358,6 +365,11 @@ impl<V: View> App<V> {
             }
             Event::PointerUp { at } => {
                 self.pointer = Some(*at);
+                if let Some(d) = self.dragging.take() {
+                    if let Some(cb) = self.interactions.get(d).and_then(|h| h.on_drag.as_ref()) {
+                        cb(crate::interaction::DragPhase::End, *at);
+                    }
+                }
                 let target = hit_test(&self.prev_tree, *at)
                     .and_then(|id| self.bubble_to(id, |h| h.on_click.is_some()));
                 if let (Some(pressed), Some(up)) = (self.pending_press, target) {
@@ -376,6 +388,9 @@ impl<V: View> App<V> {
             }
             Event::PointerMove { at } => {
                 self.pointer = Some(*at);
+                if let Some(cb) = self.dragging.and_then(|d| self.interactions.get(d)).and_then(|h| h.on_drag.as_ref()) {
+                    cb(crate::interaction::DragPhase::Move, *at);
+                }
                 // Hover target = nearest interactive ancestor (clickable
                 // or focusable) under the pointer.
                 let hover = hit_test(&self.prev_tree, *at)

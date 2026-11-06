@@ -119,6 +119,12 @@ impl<'a> Ctx<'a> {
         self.interactions.entry(id).on_drop = Some(Box::new(handler));
     }
 
+    /// Follow a press from this node until its release: `Start` at the
+    /// press, `Move` for each motion (wherever the pointer is), `End`.
+    pub fn on_drag<F: Fn(crate::interaction::DragPhase, crate::geom::Point) + 'static>(&mut self, id: NodeId, handler: F) {
+        self.interactions.entry(id).on_drag = Some(Box::new(handler));
+    }
+
     /// Receive wheel, navigation-key and press input for a scroll view.
     pub fn on_scroll<F: Fn(&crate::interaction::ScrollInput) + 'static>(&mut self, id: NodeId, handler: F) {
         self.interactions.entry(id).on_scroll = Some(Box::new(handler));

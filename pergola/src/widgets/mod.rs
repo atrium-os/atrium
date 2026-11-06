@@ -20,6 +20,7 @@ pub mod credential_field;
 pub mod label;
 pub mod phosphor;
 pub mod scroll_view;
+pub mod slider;
 pub mod text_field;
 pub mod virtual_list;
 
@@ -30,5 +31,6 @@ pub use choice::{Check, Checkbox, RadioGroup, Segmented, Tabs, Toggle};
 pub use credential_field::{CredentialField, CredentialState};
 pub use label::{Glyph, Label};
 pub use scroll_view::{ScrollState, ScrollView};
+pub use slider::Slider;
 pub use text_field::TextField;
 pub use virtual_list::VirtualList;
