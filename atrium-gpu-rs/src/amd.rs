@@ -386,6 +386,9 @@ pub const UNPLUG: u32 = 0xffff_ffff;
 /// SDR, product 2) and a twin of the desktop monitor (another serial).
 pub const PLUG_OFFICE: u32 = 4;
 pub const PLUG_DESKTOP_TWIN: u32 = 5;
+/// A desktop monitor of another model: as [`PLUG_DESKTOP`], but its variable
+/// refresh runs 60-120 Hz.
+pub const PLUG_DESKTOP_VRR60: u32 = 6;
 /// (3.0) COMMIT_MULTI: turn an output off.
 pub const COMMIT_OFF: u32 = 0x10;
 /// (3.0) OUTPUTS flag: the output scans out a mode.

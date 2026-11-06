@@ -18,6 +18,10 @@
 //!    which shows it can.
 //! 6. The master leaves: the next member drives the group; a mode set takes
 //!    a member out; members = 0 dissolves the group.
+//! 7. Variable refresh: a 48-120 Hz and a 60-120 Hz monitor at 1080p120
+//!    with VRR idle at their own floors apart, and both at 60 Hz (the range
+//!    both take) in a group; the 48 Hz one goes back to 48 when the group
+//!    ends. VRR on one member and not the other is SYNC_MISMATCH.
 //!
 //! Build (host cross): cargo build --target x86_64-unknown-freebsd --bin display_span
 //! Run (guest, as root, frescod stopped and the lease cleared): /root/d4/display_span
@@ -29,7 +33,8 @@ use std::time::{Duration, Instant};
 
 use atrium_gpu::amd::{
     Display, Gpu, OutputCommit, Scanout, FAULT_NO_MODE, FAULT_SYNC_MISMATCH, OUTPUT_FLIP_LOCKED,
-    OUTPUT_SYNC_MASTER, PLUG_DESKTOP_TWIN, PLUG_OFFICE, STATUS_COMMIT_PENDING,
+    OUTPUT_SYNC_MASTER, PLUG_DESKTOP_TWIN, PLUG_DESKTOP_VRR60, PLUG_OFFICE, STATUS_COMMIT_PENDING,
+    COMMIT_VRR,
 };
 
 const FRAMES: usize = 100;
@@ -351,6 +356,60 @@ fn run() -> io::Result<()> {
         return Err(fail(format!("dissolve: {r:?}")));
     }
     eprintln!("6 master hand-over to output 1; a mode set takes a member out; dissolved OK");
+
+    // 7. Variable refresh over the range both monitors take.
+    plug(2, PLUG_DESKTOP_VRR60 as i32)?;
+    let vrr_on = |n: u32, vrr: bool| -> io::Result<OutputCommit<'_, '_>> {
+        let (i, g) = mode(&dpy, n, 1920, 1080, 120000)?;
+        let mut c = OutputCommit::modeset(n, sc[n as usize].buffer(0), i, g);
+        if vrr {
+            c.flags |= COMMIT_VRR;
+        }
+        Ok(c)
+    };
+    let r = dpy.commit_multi(&[vrr_on(1, true)?, vrr_on(2, true)?], false)?;
+    if r.failed.is_some() {
+        return Err(fail(format!("1080p120 VRR on outputs 1 and 2: {r:?}")));
+    }
+    // Idle refresh, Hz, over a second.
+    let rate = || -> io::Result<[f64; 2]> {
+        let a = vblanks(&dpy, &[1, 2])?;
+        let t = Instant::now();
+        std::thread::sleep(Duration::from_millis(1000));
+        let b = vblanks(&dpy, &[1, 2])?;
+        let s = t.elapsed().as_secs_f64();
+        Ok([(b[0] - a[0]) as f64 / s, (b[1] - a[1]) as f64 / s])
+    };
+    let near = |hz: f64, want: f64| (hz - want).abs() < 5.0;
+    let apart = rate()?;
+    if !near(apart[0], 48.0) || !near(apart[1], 60.0) {
+        return Err(fail(format!("idle VRR apart: {apart:?} Hz, want 48 and 60")));
+    }
+    let r = dpy.commit_sync_group(1, 0b0110, 0b0110)?;
+    if r.failed.is_some() {
+        return Err(fail(format!("VRR group: {r:?}")));
+    }
+    let together = rate()?;
+    if !near(together[0], 60.0) || !near(together[1], 60.0) {
+        return Err(fail(format!("idle VRR in a group: {together:?} Hz, want 60 and 60")));
+    }
+    let r = dpy.commit_sync_group(1, 0, 0)?;
+    let after = rate()?;
+    if r.failed.is_some() || !near(after[0], 48.0) {
+        return Err(fail(format!("VRR group dissolved: {r:?}, {after:?} Hz, want output 1 at 48")));
+    }
+    let r = dpy.commit_multi(&[vrr_on(1, false)?], false)?;
+    if r.failed.is_some() {
+        return Err(fail(format!("output 1 fixed 120 Hz: {r:?}")));
+    }
+    let r = dpy.commit_sync_group(1, 0b0110, 0b0110)?;
+    if r.failed != Some(2) || r.reason != FAULT_SYNC_MISMATCH {
+        return Err(fail(format!("fixed and variable refresh joined: {r:?}")));
+    }
+    eprintln!(
+        "7 VRR idle apart {:.0}/{:.0} Hz, in a group {:.0}/{:.0} Hz, after {:.0} Hz; fixed + VRR refused OK",
+        apart[0], apart[1], together[0], together[1], after[0]
+    );
 
     let r = dpy.commit_multi(&[OutputCommit::off(1), OutputCommit::off(2)], false)?;
     if r.failed.is_some() {

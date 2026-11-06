@@ -77,7 +77,8 @@
 #define ATRIUM_DISPLAY_FAULT_NO_OUTPUT		10 /* (3.0) no such output, or named twice
 						    * in one commit */
 #define ATRIUM_DISPLAY_FAULT_SYNC_MISMATCH	11 /* (3.1) a sync group's outputs don't
-						    * all run one timing (and VRR floor) */
+						    * all run one timing, or VRR is on
+						    * for some and off for others */
 
 /* Commit flags. */
 #define ATRIUM_DISPLAY_COMMIT_MODESET	0x1u  /* (re)program the CRTC at mode_index; the
@@ -466,7 +467,10 @@ struct atrium_display_commit_multi {
  * The call sets group `group`'s whole membership: outputs named join (moved
  * out of another group if they were in one), members not named leave, and
  * members = 0 dissolves the group. Every member must be lit
- * (FAULT_NO_MODE), all at one timing and VRR floor (FAULT_SYNC_MISMATCH).
+ * (FAULT_NO_MODE), all at one timing, with variable refresh on all of them
+ * or none (FAULT_SYNC_MISMATCH). With VRR the group has one frame period:
+ * every member runs the range all of them can take (the highest floor),
+ * and goes back to its own when it leaves.
  * A member that is gone for a while (§6: its monitor dropped out) stays a
  * member, keeping the clock, with its flip lock off: the others flip
  * without it. A topology commit (MODESET or OFF) on a member takes it out

@@ -89,6 +89,9 @@ struct display_fb {
  * Span state (3.1, COMMIT_SYNC_GROUP):
  *   sync_group   the timing group it belongs to (0 = none)
  *   flip_lock    its flips land with the group's other locked members
+ *   sync_vrr_hz  the group's variable refresh floor, the highest of its
+ *                members' (their ranges' intersection), which every member
+ *                runs while in the group; 0 = its own
  */
 struct display_output {
 	struct atrium_amd_softc	*sc;
@@ -128,6 +131,7 @@ struct display_output {
 	int			 hdr_pending_valid;
 	uint32_t		 sync_group;
 	int			 flip_lock;
+	uint32_t		 sync_vrr_hz;
 };
 
 /* The display module's state, hung off the shared softc as sc->display_state. */
@@ -1268,6 +1272,14 @@ display_sync_hw(struct display_output *o)
 {
 	uint32_t fault;
 
+	if (o->sync_group == 0)
+		o->sync_vrr_hz = 0;
+	/* One frame period for the group: every VRR member runs the range
+	 * all of them can take. */
+	if (o->vrr_min_hz != 0 && o->timing_valid &&
+	    amd_display_hw_ops.set_vrr != NULL)
+		amd_display_hw_ops.set_vrr(o, &o->timing,
+		    o->sync_vrr_hz != 0 ? o->sync_vrr_hz : o->vrr_min_hz);
 	o_wr(o, SIMR(o, regDISP_SYNC_GROUP), o->sync_group);
 	if (o->sync_group != 0) {
 		fault = o_rd(o, SIMR(o, regDISP_FAULT));
@@ -1318,7 +1330,7 @@ display_commit_sync_group(struct atrium_amd_softc *sc,
     struct atrium_display_sync_group *g)
 {
 	struct display_output *o, *first = NULL;
-	uint32_t n, bit, all = (1u << DISPLAY_NOUT) - 1, fault = 0;
+	uint32_t n, bit, all = (1u << DISPLAY_NOUT) - 1, fault = 0, vrr_hz = 0;
 
 	if (g->struct_size < sizeof(*g) || g->flags != 0 || g->_pad != 0 ||
 	    g->group == 0 || g->group > ATRIUM_DISPLAY_SYNC_GROUPS ||
@@ -1327,7 +1339,8 @@ display_commit_sync_group(struct atrium_amd_softc *sc,
 	g->out_failed = ATRIUM_DISPLAY_MULTI_NONE;
 	g->out_reason = 0;
 	mtx_lock(&sc->lock);
-	/* Check: every member lit, all at one timing and VRR floor. */
+	/* Check: every member lit, all at one timing, and variable refresh on
+	 * all of them or none (the group runs the highest floor). */
 	for (n = 0; n < DISPLAY_NOUT; n++) {
 		if ((g->members & (1u << n)) == 0)
 			continue;
@@ -1336,10 +1349,12 @@ display_commit_sync_group(struct atrium_amd_softc *sc,
 			fault = ATRIUM_DISPLAY_FAULT_NO_MODE;
 		else if (first != NULL &&
 		    (!atrium_timing_equal(&o->timing, &first->timing) ||
-		    o->vrr_min_hz != first->vrr_min_hz))
+		    (o->vrr_min_hz == 0) != (first->vrr_min_hz == 0)))
 			fault = ATRIUM_DISPLAY_FAULT_SYNC_MISMATCH;
 		else if (first == NULL)
 			first = o;
+		if (fault == 0 && o->vrr_min_hz > vrr_hz)
+			vrr_hz = o->vrr_min_hz;
 		if (fault != 0) {
 			g->out_failed = n;
 			g->out_reason = fault;
@@ -1348,14 +1363,17 @@ display_commit_sync_group(struct atrium_amd_softc *sc,
 		}
 	}
 	/* Apply: members leaving first, then the members in pipe order (the
-	 * lowest becomes the master the others lock to). */
+	 * lowest becomes the master the others lock to). A new VRR floor
+	 * takes the whole group out first: the hardware checks a member
+	 * joining against those already in. */
 	for (n = 0; n < DISPLAY_NOUT; n++) {
 		o = display_out(sc, n);
 		if (o->sync_group == g->group && (g->members & (1u << n)) == 0) {
 			o->sync_group = 0;
 			o->flip_lock = 0;
 			(void)display_sync_hw(o);
-		}
+		} else if (o->sync_group == g->group && o->sync_vrr_hz != vrr_hz)
+			o_wr(o, SIMR(o, regDISP_SYNC_GROUP), 0);
 	}
 	for (n = 0; n < DISPLAY_NOUT && fault == 0; n++) {
 		bit = 1u << n;
@@ -1364,6 +1382,7 @@ display_commit_sync_group(struct atrium_amd_softc *sc,
 		o = display_out(sc, n);
 		o->sync_group = g->group;
 		o->flip_lock = (g->flip_lock & bit) != 0;
+		o->sync_vrr_hz = vrr_hz;
 		fault = display_sync_hw(o);
 		if (fault != 0) {
 			g->out_failed = n;
@@ -1801,7 +1820,7 @@ display_sim_plug(struct display_output *o, int mode)
 {
 	if (mode == -1)
 		o_wr(o, SIMR(o, regDISP_CFG_UNPLUG), 1);
-	else if (mode >= 0 && mode <= 5)
+	else if (mode >= 0 && mode <= 6)
 		o_wr(o, SIMR(o, regDISP_CFG_PLUG_MODE), mode);
 	else
 		return (EINVAL);
@@ -2493,7 +2512,8 @@ atrium_display_attach(device_t dev)
 	    CTLTYPE_INT | CTLFLAG_WR | CTLFLAG_MPSAFE, sc, 0,
 	    display_sim_plug_sysctl, "I",
 	    "simulator: plug monitor 0 VGA, 1 1080p, 2 4K, 3 desktop, "
-	    "4 office, 5 desktop twin into output 0; -1 unplug");
+	    "4 office, 5 desktop twin, 6 desktop (VRR from 60 Hz) into "
+	    "output 0; -1 unplug");
 	SYSCTL_ADD_PROC(device_get_sysctl_ctx(dev),
 	    SYSCTL_CHILDREN(device_get_sysctl_tree(dev)), OID_AUTO,
 	    "sim_plug_at", CTLTYPE_STRING | CTLFLAG_RW | CTLFLAG_MPSAFE, sc, 0,
