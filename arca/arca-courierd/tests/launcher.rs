@@ -11,10 +11,14 @@ use navigator_fetch::addr::Policy;
 
 #[test]
 fn a_request_is_an_https_endpoint_and_nothing_more() {
-    let f = encode_request("api.example", 443);
+    let f = encode_request("api.example", 443, None);
     let body = &f[4..];
     assert_eq!(u32::from_le_bytes(f[..4].try_into().unwrap()) as usize, body.len());
-    assert_eq!(decode_request(body), Some(("api.example".into(), 443)));
+    assert_eq!(decode_request(body), Some(("api.example".into(), 443, None)));
+    let w = encode_request("cdn.example", 443, Some("news.example"));
+    assert_eq!(decode_request(&w[4..]), Some(("cdn.example".into(), 443, Some("news.example".into()))));
+    let bad = encode_request("cdn.example", 443, Some("not a host"));
+    assert_eq!(decode_request(&bad[4..]), None, "a partition is a site's host");
     let mut extra = body.to_vec();
     extra.push(0);
     assert_eq!(decode_request(&extra), None, "trailing bytes");
@@ -45,13 +49,13 @@ fn only_public_ipv4_addresses_reach_the_anchor() {
 #[test]
 fn uids_are_capped_per_app_and_reused_only_when_given_back() {
     let mut p = Pool::default();
-    let first: Vec<u32> = (0..PER_APP).map(|_| p.take("a").unwrap()).collect();
+    let first: Vec<u32> = (0..PER_APP).map(|_| p.take("a", PER_APP).unwrap()).collect();
     assert_eq!(first[0], arcad::courier::UID_FIRST);
-    assert_eq!(p.take("a"), Err(reply::TOO_MANY));
-    let b = p.take("b").unwrap();
+    assert_eq!(p.take("a", PER_APP), Err(reply::TOO_MANY));
+    let b = p.take("b", PER_APP).unwrap();
     assert!(!first.contains(&b));
     p.give_back(first[3]);
-    assert_eq!(p.take("a"), Ok(first[3]));
+    assert_eq!(p.take("a", PER_APP), Ok(first[3]));
 }
 
 #[test]

@@ -230,8 +230,7 @@ and wipes them afterwards.
   bounded reader. A kept-alive connection is reused for the next request to the same
   endpoint.
 - **The response.** Every `Set-Cookie` goes to arcad as a `SET_COOKIE` record and is
-  removed. Arca keeps one record per (endpoint, name) and never fills one by id; cookie
-  matching is A2. Any echo of a sent value in headers or body, raw or encoded, is masked
+  removed. Arca never fills a cookie by id; it validates and matches them itself (§8.7). Any echo of a sent value in headers or body, raw or encoded, is masked
   with `*`. Redirects come back to the client as they are: the courier follows none.
 - **Gates.**
   - `arca-courier/tests/courier.rs` runs against loopback TLS servers. It checks that the
@@ -472,6 +471,61 @@ same-site context or a gesture, because it never holds a ticket.
 - "Forget this site" destroys the recipient's data key (§6.1).
 - Credentialed conversions stay private to the user and are deleted with the jar (threat
   model §6.7).
+
+### 8.7 As built: A2 cookies (2026-11-06)
+
+- **The jar is arcad's** (`arcad/src/cookie.rs`). A cookie is an item: recipient
+  = (https, its domain, the courier's port, partition), account = name, scope = its
+  attributes (host-only, Secure, HttpOnly, SameSite, expiry, creation time, path). A
+  `Domain=example.com` cookie lives in example.com's group. Matching walks the request
+  host's parent domains up to the public suffix.
+- **Set-Cookie** (RFC 6265bis) is checked against the courier's label. A `Domain` must
+  domain-match the host and must not be a public suffix (the `psl` crate's built-in list).
+  `__Secure-` and `__Host-` are enforced, and `SameSite=None` needs `Secure`. Lifetimes are
+  capped at 400 days and name plus value at 4 KiB. A group keeps its newest 50. A refused
+  cookie is ignored, as browsers do, and the courier strips the header either way.
+  Expiry is by arcad's clock.
+- **The courier** asks `COOKIES` with the request path after its TLS handshake, as it
+  does `FILL`, and writes the `Cookie` header in locked memory. Each `Set-Cookie` goes
+  to arcad with that path. Cookie values of 16 bytes or more (session ids) are masked
+  in what the client gets back. Shorter ones are left alone, so a `true` in a page
+  survives.
+- **An app's courier** (no partition, the app's endpoint persona) gets every cookie that
+  matches. Its requests are the app's own, so SameSite doesn't apply.
+- **Web couriers** belong to the web broker, which `ARCA_WEB_BROKER` names as
+  `app_id publisher` (arcad and arca-courierd; never unsigned). Only the broker may ask
+  arca-courierd for a courier with a partition. That courier carries the user's `web`
+  persona, and each partition is a separate jar.
+- **Tickets** (`W_TICKET`, 0x70). The broker names the endpoint, partition, method, path,
+  reason (navigation, subresource or form), the initiating host ("" for the reader's
+  own navigation) and whether a user gesture started it.
+  - A ticket lives 10 s and is redeemed once by `COOKIES`, from a courier whose label
+    matches its user, partition, host, port and path.
+  - After redemption, it admits that response's `Set-Cookie`s for 60 s.
+  - A web courier with no ticket, or the wrong one, gets no cookies and can set none.
+  - An app's courier can't use a ticket.
+- **SameSite by the ticket.** Same-site means the initiator's registrable domain is the
+  target's, or the reader started the navigation. Strict cookies go only on same-site
+  requests. Lax, and cookies with no attribute, also go on a cross-site top-level GET or
+  HEAD. None always goes.
+- **Gates.**
+  - `arcad/tests/cookies.rs` has 11 tests: matching, Domain and public-suffix refusals,
+    prefixes, expiry and deletion, the 50 limit, tickets bound to their request, partition
+    isolation, the SameSite table, and broker-only tickets.
+  - `arcad/fuzz` `set_cookie` fuzzes the parser. Its first run found a panic in date
+    parsing on a multi-byte character, which is now fixed; it then ran 2.3M inputs clean.
+  - `scripts/arca-vm-test.sh` §5 checks that a jailed app courier sends back the cookie
+    its first response set. §6 runs a web courier from the broker through four contexts
+    against a real server: the reader's navigation, a cross-site subresource, a same-site
+    navigation, and no ticket. Only the same-site navigation carried the cookie.
+- **Not yet.**
+  - Session cookies dying with the origin's last view (§8.6): the broker has to say when
+    a view closes.
+  - `document.cookie` for the converter.
+  - "Forget this site" in the trusted UI.
+  - The Navigator's broker issuing tickets. That is the Navigator thread's work, on
+    this API.
+  - Password fill by form ticket and gesture (§8.3) comes with A3.
 
 ## 9. Native apps and other clients
 

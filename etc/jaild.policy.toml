@@ -237,6 +237,9 @@ allowed_keys = [
     # here: a jailed arcad can never be told to serve unsigned apps.
     "ARCA_VESTIBULUM_UID",
     "ARCA_UI_UID",
+    # arcad and arca-courierd: the web broker's app id and publisher, the
+    # one app that issues web tickets (arca.md §8.2).
+    "ARCA_WEB_BROKER",
 ]
 allowed_prefixes = [
     "ATRIUM_",        # all Atrium-namespaced vars

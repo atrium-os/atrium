@@ -13,11 +13,13 @@
 //! next.
 
 pub mod client;
+pub mod cookie;
 pub mod courier;
 pub mod handles;
 pub mod label;
 pub mod proto;
 pub mod server;
+pub mod tickets;
 
 use std::io;
 use std::os::unix::net::UnixStream;

@@ -10,6 +10,8 @@
 //!   ARCA_COURIERD_CA         [/etc/ssl/cert.pem] copied into each courier's root
 //!   JAILD_SOCKET             [/var/run/atrium/jaild.sock]
 //!   ARCA_ALLOW_UNSIGNED      [unset; dev only, as for arcad]
+//!   ARCA_WEB_BROKER          [unset] `app_id publisher-hex`, as for arcad:
+//!                            the one app that may ask for web couriers
 //!   ARCA_COURIERD_GRANT_PRIVATE_NETWORK=1   tests only: couriers may reach LAN addresses
 
 #[cfg(not(target_os = "freebsd"))]
@@ -33,7 +35,7 @@ mod freebsd {
     use std::sync::{Arc, Mutex};
 
     use arca_courierd::jail::{self, Config};
-    use arca_courierd::{admit, decode_request, read_request, reply, reset_registry, send_reply, Pool};
+    use arca_courierd::{admit, decode_request, read_request, reply, reset_registry, send_reply, Pool, PER_APP, PER_BROKER, WEB_PERSONA};
     use arca_store::{Recipient, Scheme};
     use arcad::courier::{app_persona, CourierLabel};
     use arcad::label::{Label, Resolver};
@@ -73,6 +75,7 @@ mod freebsd {
                 ui_uid: None,
                 allow_unsigned: std::env::var_os("ARCA_ALLOW_UNSIGNED").is_some(),
                 courier_registry: None,
+                web_broker: std::env::var("ARCA_WEB_BROKER").ok().and_then(|s| arcad::label::parse_web_broker(&s)),
             },
             policy: addr::Policy { grant_private_network: grant },
             pool: Mutex::new(Pool::default()),
@@ -141,21 +144,31 @@ mod freebsd {
 
     fn ask(d: &Daemon, s: &mut UnixStream) -> Result<jail::Courier, u8> {
         let uid = peer_uid(s).ok_or(reply::NOT_AN_APP)?;
-        let Label::App { user, publisher, app_id } = d.resolver.resolve(uid) else { return Err(reply::NOT_AN_APP) };
+        let (user, publisher, app_id, broker) = match d.resolver.resolve(uid) {
+            Label::App { user, publisher, app_id } => (user, publisher, app_id, false),
+            Label::WebBroker { user, publisher, app_id } => (user, publisher, app_id, true),
+            _ => return Err(reply::NOT_AN_APP),
+        };
         let body = read_request(s).map_err(|_| reply::BAD_ENDPOINT)?;
-        let (host, port) = decode_request(&body).ok_or(reply::BAD_ENDPOINT)?;
+        let (host, port, partition) = decode_request(&body).ok_or(reply::BAD_ENDPOINT)?;
+        // A partition is a web courier: the broker's alone.
+        if partition.is_some() && !broker {
+            return Err(reply::NOT_AN_APP);
+        }
         let resolved = (host.as_str(), port).to_socket_addrs().map_err(|_| reply::NO_ADDRESS)?;
         let addrs = admit(resolved, d.policy);
         if addrs.is_empty() {
             return Err(reply::NO_ADDRESS);
         }
+        let persona = if partition.is_some() { WEB_PERSONA.to_string() } else { app_persona(&publisher, &app_id) };
         let label = CourierLabel {
             user: user.clone(),
-            persona: app_persona(&publisher, &app_id),
-            endpoint: Recipient::endpoint(Scheme::Https, &host, port, None).map_err(|_| reply::BAD_ENDPOINT)?,
+            persona,
+            endpoint: Recipient::endpoint(Scheme::Https, &host, port, partition.as_deref()).map_err(|_| reply::BAD_ENDPOINT)?,
         };
         let owner = format!("{user} {} {app_id}", label.persona);
-        let cuid = d.pool.lock().unwrap().take(&owner)?;
+        let cap = if partition.is_some() { PER_BROKER } else { PER_APP };
+        let cuid = d.pool.lock().unwrap().take(&owner, cap)?;
         match jail::launch(&d.cfg, cuid, &label, &addrs) {
             Ok(c) => {
                 eprintln!("arca-courierd: courier {cuid} for {app_id} ({user}) to {host}:{port} via {addrs:?}");

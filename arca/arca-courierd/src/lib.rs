@@ -18,8 +18,11 @@
 //! stdin and stdout. Nothing else of the courier's is the app's to touch.
 //!
 //! Wire: the app sends `u32 LE len | u8 scheme (1 https) | str host | u16
-//! port` (arcad's endpoint encoding) and reads one status byte; on
-//! [`reply::OK`] the courier's socket rides on that byte (SCM_RIGHTS).
+//! port [| str partition]` (arcad's endpoint encoding) and reads one status
+//! byte; on [`reply::OK`] the courier's socket rides on that byte
+//! (SCM_RIGHTS). Only the web broker (arca.md §8.2) may name a partition:
+//! that courier carries the user's `web` persona, and Arca gives it
+//! cookies only against the broker's tickets.
 
 use std::collections::BTreeMap;
 use std::io::{self, Read, Write};
@@ -40,6 +43,12 @@ pub const DEFAULT_SOCKET: &str = "/atrium/sockets/arca-courier/courierd.sock";
 /// Most live couriers one app may hold: a courier is a jail, so an app
 /// that could ask for any number could take the range from every other.
 pub const PER_APP: usize = 16;
+/// The web broker's: one courier per (partition, origin) in use.
+pub const PER_BROKER: usize = 64;
+
+/// The persona of every web courier (the user's web jar; partitions keep
+/// its sites apart).
+pub const WEB_PERSONA: &str = "web";
 
 /// Most addresses one courier's anchor passes.
 pub const MAX_ADDRS: usize = 8;
@@ -50,7 +59,8 @@ const MAX_REQUEST: usize = 512;
 /// The status byte.
 pub mod reply {
     pub const OK: u8 = 0;
-    /// The caller is not a launched app with a verified publisher.
+    /// The caller is not a launched app with a verified publisher, or not
+    /// the web broker and named a partition.
     pub const NOT_AN_APP: u8 = 1;
     /// Not an https endpoint Arca can label.
     pub const BAD_ENDPOINT: u8 = 2;
@@ -62,24 +72,29 @@ pub mod reply {
     pub const FAILED: u8 = 5;
 }
 
-pub fn encode_request(host: &str, port: u16) -> Vec<u8> {
+pub fn encode_request(host: &str, port: u16, partition: Option<&str>) -> Vec<u8> {
     let mut w = Writer::new();
     arcad::proto::write_endpoint(&mut w, host, port);
+    if let Some(p) = partition {
+        w.str(p);
+    }
     let body = w.buf;
     let mut out = (body.len() as u32).to_le_bytes().to_vec();
     out.extend_from_slice(&body);
     out
 }
 
-/// The endpoint an app asked for, or `None` for anything out of shape.
-pub fn decode_request(body: &[u8]) -> Option<(String, u16)> {
+/// The endpoint (and partition) asked for, or `None` for anything out of
+/// shape.
+pub fn decode_request(body: &[u8]) -> Option<(String, u16, Option<String>)> {
     let mut r = Reader::new(body);
     let ep = arcad::proto::read_endpoint(&mut r).ok()?;
+    let partition = if r.remaining() > 0 { Some(r.str(arca_store::model::caps::HOST).ok()?.to_string()) } else { None };
     r.end().ok()?;
-    match ep {
-        Recipient::Endpoint { host, port, partition: None, .. } => Some((host, port)),
-        _ => None,
-    }
+    let Recipient::Endpoint { host, port, .. } = ep else { return None };
+    // The same rules as a label's.
+    Recipient::endpoint(arca_store::Scheme::Https, &host, port, partition.as_deref()).ok()?;
+    Some((host, port, partition))
 }
 
 pub fn read_request(s: &mut impl Read) -> io::Result<Vec<u8>> {
@@ -116,9 +131,10 @@ pub struct Pool {
 }
 
 impl Pool {
-    /// The lowest free uid for `owner` (an app's key), or the refusal.
-    pub fn take(&mut self, owner: &str) -> Result<u32, u8> {
-        if self.live.values().filter(|o| *o == owner).count() >= PER_APP {
+    /// The lowest free uid for `owner` (an app's key), at most `cap` of
+    /// them, or the refusal.
+    pub fn take(&mut self, owner: &str, cap: usize) -> Result<u32, u8> {
+        if self.live.values().filter(|o| *o == owner).count() >= cap {
             return Err(reply::TOO_MANY);
         }
         let uid = (UID_FIRST..=UID_LAST).find(|u| !self.live.contains_key(u)).ok_or(reply::TOO_MANY)?;
@@ -213,9 +229,9 @@ pub fn recv_reply(s: &UnixStream) -> io::Result<(u8, Option<OwnedFd>)> {
 
 /// The app's side: a courier to `host:port`, as a stream of courier frames
 /// (`arca_courier::schema`), or the launcher's status byte.
-pub fn open(socket: &str, host: &str, port: u16) -> Result<UnixStream, u8> {
+pub fn open(socket: &str, host: &str, port: u16, partition: Option<&str>) -> Result<UnixStream, u8> {
     let mut s = UnixStream::connect(socket).map_err(|_| reply::FAILED)?;
-    s.write_all(&encode_request(host, port)).map_err(|_| reply::FAILED)?;
+    s.write_all(&encode_request(host, port, partition)).map_err(|_| reply::FAILED)?;
     match recv_reply(&s) {
         Ok((reply::OK, Some(fd))) => Ok(UnixStream::from(fd)),
         Ok((reply::OK, None)) => Err(reply::FAILED),

@@ -190,7 +190,7 @@ fn resolver_fails_closed() {
     let d = tempfile::tempdir().unwrap();
     let reg = d.path().join("registry");
     std::fs::write(&reg, format!("50001 alice org.example.mail {}\n50002 alice org.example.unsigned\n", "ab".repeat(32))).unwrap();
-    let mut r = Resolver { registry: reg.clone(), vestibulum_uid: Some(65020), ui_uid: None, allow_unsigned: false, courier_registry: None };
+    let mut r = Resolver { registry: reg.clone(), vestibulum_uid: Some(65020), ui_uid: None, allow_unsigned: false, courier_registry: None, web_broker: None };
     assert_eq!(r.resolve(50001), app("org.example.mail", 0xab));
     assert_eq!(r.resolve(50002), Label::Unknown);
     assert_eq!(r.resolve(1001), Label::Unknown);

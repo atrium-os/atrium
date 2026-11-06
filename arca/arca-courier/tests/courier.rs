@@ -124,7 +124,10 @@ impl Connect for Net {
 struct MockVault {
     items: HashMap<[u8; 16], Vec<u8>>,
     fills: Vec<Vec<[u8; 16]>>,
-    cookies: Vec<(String, Vec<u8>, Vec<u8>)>,
+    cookies: Vec<(String, Vec<u8>, Vec<u8>, String)>,
+    /// What Arca's matching answers, and the paths it was asked for.
+    jar: Option<Vec<u8>>,
+    asked: Vec<String>,
 }
 
 impl Vault for MockVault {
@@ -134,8 +137,12 @@ impl Vault for MockVault {
             .map(|(_, r)| self.items.get(r).map(|v| LockedBuf::from_slice(v).unwrap()).ok_or(Refusal::Denied))
             .collect()
     }
-    fn set_cookie(&mut self, name: &str, value: &[u8], attrs: &[u8]) {
-        self.cookies.push((name.into(), value.into(), attrs.into()));
+    fn set_cookie(&mut self, name: &str, value: &[u8], attrs: &[u8], path: &str, _: Option<&[u8; 16]>) {
+        self.cookies.push((name.into(), value.into(), attrs.into(), path.into()));
+    }
+    fn cookies(&mut self, path: &str, ticket: Option<&[u8; 16]>) -> Option<LockedBuf> {
+        self.asked.push(format!("{path}{}", ticket.map_or(String::new(), |t| format!(" ticket {}", t[0]))));
+        self.jar.as_ref().map(|j| LockedBuf::from_slice(j).unwrap())
     }
 }
 
@@ -156,6 +163,7 @@ fn get_with_bearer(path: &str) -> Request {
         headers: vec![(Header::Accept, b"application/json".to_vec())],
         slots: vec![Slot { source: SOURCE_ITEM, reference: TOK, place: Place::Bearer }],
         body: vec![],
+        ticket: None,
     }
 }
 
@@ -193,10 +201,43 @@ fn the_token_goes_only_into_tls_to_the_bound_host_and_cookies_go_to_arca() {
     assert!(headers.iter().all(|(k, _)| k != "set-cookie"));
     assert_eq!(headers.iter().find(|(k, _)| k == "x-echo").unwrap().1, "************");
     assert_eq!(body, b"you sent ************");
-    assert_eq!(v.cookies, vec![("sid".into(), b"abc123".to_vec(), b"Path=/; HttpOnly".to_vec())]);
+    assert_eq!(v.cookies, vec![("sid".into(), b"abc123".to_vec(), b"Path=/; HttpOnly".to_vec(), "/v1/me".into())]);
     // The connection is kept for the next request to the same endpoint.
     let _ = c.handle(&get_with_bearer("/v1/again").encode(), &mut v);
     assert_eq!(c.connects, 1);
+}
+
+#[test]
+fn arcas_cookie_header_goes_after_tls_and_long_values_never_come_back() {
+    let p = pki(&["api.example"]);
+    let h: Handler = Arc::new(|req: &[u8]| {
+        let echoed = String::from_utf8_lossy(req).contains("0123456789abcdef-session");
+        http("200 OK", &[], if echoed { b"sid=0123456789abcdef-session; on=true" } else { b"no cookie" })
+    });
+    let (at, seen) = serve(&p, "api.example", h);
+    let net = Net { map: HashMap::from([("api.example".into(), at)]), lookups: Default::default() };
+    let mut c = Courier::new(ep("api.example"), &net, tls(&p), LOOPBACK);
+    let mut v = vault();
+    v.jar = Some(b"sid=0123456789abcdef-session; on=true".to_vec());
+    let mut req = get_with_bearer("/inbox");
+    req.slots.clear();
+    req.ticket = Some([5; 16]);
+    let r = c.handle(&req.encode(), &mut v);
+    let Response::Http { body, .. } = r else { panic!("{r:?}") };
+    let sent = String::from_utf8(seen.lock().unwrap()[0].clone()).unwrap();
+    assert!(sent.contains("\r\nCookie: sid=0123456789abcdef-session; on=true\r\n"), "{sent}");
+    assert_eq!(v.asked, vec!["/inbox ticket 5".to_string()], "the ticket goes to Arca with the path");
+    // The session id is masked; a short value like `true` is left alone.
+    assert_eq!(String::from_utf8(body).unwrap(), format!("sid={}; on=true", "*".repeat(24)));
+    // A wrong-name certificate: Arca isn't asked for cookies at all.
+    let p2 = pki(&["other.example"]);
+    let (at2, _) = serve(&p2, "other.example", Arc::new(|_: &[u8]| http("200 OK", &[], b"")));
+    let net2 = Net { map: HashMap::from([("api.example".into(), at2)]), lookups: Default::default() };
+    let mut c2 = Courier::new(ep("api.example"), &net2, tls(&p2), LOOPBACK);
+    let mut v2 = vault();
+    v2.jar = Some(b"sid=x".to_vec());
+    assert!(matches!(c2.handle(&req.encode(), &mut v2), Response::Refused(Refusal::Tls)));
+    assert!(v2.asked.is_empty());
 }
 
 #[test]
@@ -258,6 +299,7 @@ fn form_and_json_bodies_and_values_that_cant_go_in_a_header() {
             Segment::Slot { slot: 0, encoding: Encoding::JsonString },
             Segment::Literal(b"\"}".to_vec()),
         ],
+        ticket: None,
     };
     assert!(matches!(c.handle(&form.encode(), &mut v), Response::Http { status: 204, .. }));
     let sent = String::from_utf8(seen.lock().unwrap()[0].clone()).unwrap();
