@@ -115,28 +115,34 @@ impl View for Button {
         // Resolve per variant and state. Pressed beats hover. `body`
         // is the outer rect; `inner` is the 1px-inset fill Secondary
         // uses to fake its border until an outline pass exists.
+        // Visual language rev. 2 §14.1: filled buttons step through
+        // accent-fill, -hover, -pressed; the others take the one hover and
+        // press overlay on their own fill. Pressed beats hover.
+        let overlay = if pressed {
+            Some(theme.state_pressed())
+        } else if hovered {
+            Some(theme.state_hover())
+        } else {
+            None
+        };
         let (body, inner, label_color) = match self.variant {
             Variant::Primary => {
                 let fill = if pressed {
-                    theme.accent_pressed()
+                    theme.accent_fill_pressed()
                 } else if hovered {
-                    theme.accent_strong()
+                    theme.accent_fill_hover()
                 } else {
-                    theme.accent_fg()
+                    theme.accent_fill()
                 };
                 (fill, crate::Color::TRANSPARENT, theme.text_on_accent())
             }
             Variant::Secondary => {
-                let fill = if pressed || hovered { theme.bg_surface() } else { theme.bg_elevated() };
-                (theme.border_strong(), fill, theme.text_primary())
+                let base = theme.bg_elevated();
+                (theme.border_strong(), overlay.map_or(base, |o| o.over(base)), theme.text_primary())
             }
             Variant::Ghost => {
-                let fill = if pressed || hovered {
-                    theme.bg_surface()
-                } else {
-                    crate::Color::TRANSPARENT
-                };
-                (fill, crate::Color::TRANSPARENT, theme.text_secondary())
+                // Over whatever is behind it: the overlay alone.
+                (overlay.unwrap_or(crate::Color::TRANSPARENT), crate::Color::TRANSPARENT, theme.text_secondary())
             }
         };
 

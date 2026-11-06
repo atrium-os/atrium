@@ -125,6 +125,15 @@ pub mod palette {
     pub fn warning_500() -> Color { Color::from_hex("#C99030") }
     pub fn danger_500() -> Color { Color::from_hex("#B23A3A") }
     pub fn info_500() -> Color { Color::from_hex("#4A7BAB") }
+    // Status text steps (visual language rev. 2 §4): 4.5:1 on canvas.
+    pub fn danger_300() -> Color { Color::from_hex("#E58A84") }
+    pub fn danger_600() -> Color { Color::from_hex("#962E2E") }
+    pub fn warning_300() -> Color { Color::from_hex("#E2B45C") }
+    pub fn warning_700() -> Color { Color::from_hex("#8A5E14") }
+    pub fn success_300() -> Color { Color::from_hex("#5DBE88") }
+    pub fn success_700() -> Color { Color::from_hex("#226B43") }
+    pub fn info_300() -> Color { Color::from_hex("#86AEDA") }
+    pub fn info_600() -> Color { Color::from_hex("#3B6690") }
 }
 
 /// Whether the token table resolves against the light or dark palette.
@@ -223,12 +232,28 @@ impl Semantic {
             Mode::Dark => palette::neutral_600(),
         }
     }
+    /// Accent *text and glyphs*: links, accent labels (rev. 2: accent-600
+    /// on light, 6.8:1; accent-400 was 3.2:1).
     pub fn accent_fg(&self) -> Color {
+        match self.mode {
+            Mode::Light => palette::accent_600(),
+            Mode::Dark => palette::accent_300(),
+        }
+    }
+    /// Accent *non-text marks*: dots, bars, indicators, a selected edge
+    /// (3:1 is enough for a mark). (Rev. 2.)
+    pub fn accent_mark(&self) -> Color {
         match self.mode {
             Mode::Light => palette::accent_400(),
             Mode::Dark => palette::accent_300(),
         }
     }
+    /// Filled controls (primary button, checked box, toggle track) at
+    /// rest, hovered and pressed. The same in both themes, with
+    /// `text_on_accent` at 4.6:1 or more. (Rev. 2.)
+    pub fn accent_fill(&self) -> Color { palette::accent_500() }
+    pub fn accent_fill_hover(&self) -> Color { palette::accent_600() }
+    pub fn accent_fill_pressed(&self) -> Color { palette::accent_700() }
     pub fn accent_bg(&self) -> Color {
         match self.mode {
             Mode::Light => palette::accent_100(),
@@ -243,11 +268,6 @@ impl Semantic {
             Mode::Light => palette::accent_600(),
             Mode::Dark => palette::accent_200(),
         }
-    }
-    /// Pressed state of accent-filled controls — one step deeper than
-    /// `accent_fg` in both themes. (Rev. 1.)
-    pub fn accent_pressed(&self) -> Color {
-        palette::accent_500()
     }
     pub fn focus_ring(&self) -> Color {
         match self.mode {
@@ -284,6 +304,64 @@ impl Semantic {
             // even neutral-950 reads slightly warm; this reads neutral.
             Mode::Dark => Color::from_hex("#040608").with_alpha(0.62),
         }
+    }
+
+    /// Hover and press: one overlay for every control, on any surface
+    /// (`Color::over` lands it on the control's fill). (Rev. 2.)
+    pub fn state_hover(&self) -> Color {
+        match self.mode {
+            Mode::Light => palette::neutral_900().with_alpha(0.06),
+            Mode::Dark => palette::neutral_50().with_alpha(0.08),
+        }
+    }
+    pub fn state_pressed(&self) -> Color {
+        match self.mode {
+            Mode::Light => palette::neutral_900().with_alpha(0.10),
+            Mode::Dark => palette::neutral_50().with_alpha(0.12),
+        }
+    }
+    /// Selected text, rows and menu items while their window or list has
+    /// focus; `selection_idle` when it doesn't. (Rev. 2.)
+    pub fn selection_bg(&self) -> Color {
+        match self.mode {
+            Mode::Light => palette::accent_100(),
+            Mode::Dark => palette::accent_700(),
+        }
+    }
+    pub fn selection_idle(&self) -> Color {
+        match self.mode {
+            Mode::Light => palette::neutral_200(),
+            Mode::Dark => palette::neutral_800(),
+        }
+    }
+    /// The edge of a control whose edge is its only affordance (checkbox,
+    /// radio, toggle, a hovered text field): 3:1 or more. (Rev. 2.)
+    pub fn border_control(&self) -> Color { palette::neutral_500() }
+    /// Tooltips and toasts. (Rev. 2.)
+    pub fn bg_inverse(&self) -> Color {
+        match self.mode {
+            Mode::Light => palette::neutral_900(),
+            Mode::Dark => palette::neutral_100(),
+        }
+    }
+    pub fn text_inverse(&self) -> Color {
+        match self.mode {
+            Mode::Light => palette::neutral_50(),
+            Mode::Dark => palette::neutral_900(),
+        }
+    }
+    /// Status *text* (an error under a field, a warning line). (Rev. 2.)
+    pub fn danger_fg(&self) -> Color {
+        match self.mode { Mode::Light => palette::danger_600(), Mode::Dark => palette::danger_300() }
+    }
+    pub fn warning_fg(&self) -> Color {
+        match self.mode { Mode::Light => palette::warning_700(), Mode::Dark => palette::warning_300() }
+    }
+    pub fn success_fg(&self) -> Color {
+        match self.mode { Mode::Light => palette::success_700(), Mode::Dark => palette::success_300() }
+    }
+    pub fn info_fg(&self) -> Color {
+        match self.mode { Mode::Light => palette::info_600(), Mode::Dark => palette::info_300() }
     }
 
     /// Auto-contrast text color: returns whichever of black or white

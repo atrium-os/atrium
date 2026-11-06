@@ -16,6 +16,7 @@ use pergola::event::{Key, KeyEventKind, Modifiers};
 use pergola::geom::{Axis, Point, Rect};
 use pergola::node::Node;
 use pergola::theme::{font, radius, space, type_size, Weight};
+use pergola::text_edit::TextEdit;
 use pergola::view::{Ctx, View};
 use pergola::{
     commit, App, Button, Event, LogSurface, Mutable, Surface, TextField, TextStyle,
@@ -23,8 +24,8 @@ use pergola::{
 
 #[derive(Clone)]
 struct LoginView {
-    username: Mutable<String>,
-    password: Mutable<String>,
+    username: Mutable<TextEdit>,
+    password: Mutable<TextEdit>,
     submitted: Mutable<bool>,
 }
 
@@ -103,8 +104,8 @@ fn main() {
     env_logger::init();
 
     let dirty = Arc::new(AtomicBool::new(true));
-    let username = Mutable::with_dirty(String::new(), Arc::clone(&dirty));
-    let password = Mutable::with_dirty(String::new(), Arc::clone(&dirty));
+    let username = Mutable::with_dirty(TextEdit::default(), Arc::clone(&dirty));
+    let password = Mutable::with_dirty(TextEdit::default().secret(true), Arc::clone(&dirty));
     let submitted = Mutable::with_dirty(false, Arc::clone(&dirty));
 
     let view = LoginView {
@@ -133,7 +134,7 @@ fn main() {
     println!(">>> Type \"alice\" into username");
     type_chars(&mut app, "alice");
     let _ = app.tick();   // re-render after each set is fine; here we batch
-    println!("    username = {:?}", username.get_cloned());
+    println!("    username = {:?}", username.get_cloned().text().to_string());
 
     println!(">>> Click password field");
     app.handle_event(Event::PointerDown { at: Point::new(200.0, 228.0) });
@@ -143,7 +144,7 @@ fn main() {
     println!(">>> Type \"hunter2\" into password");
     type_chars(&mut app, "hunter2");
     let _ = app.tick();
-    println!("    password = {:?}", password.get_cloned());
+    println!("    password = {:?}", password.get_cloned().text().to_string());
 
     println!(">>> Backspace once");
     app.handle_event(Event::Key {
@@ -151,7 +152,7 @@ fn main() {
         modifiers: modifiers(), chars: String::new(),
     });
     let _ = app.tick();
-    println!("    password = {:?}", password.get_cloned());
+    println!("    password = {:?}", password.get_cloned().text().to_string());
 
     println!(">>> Click Sign in (primary button at y≈276)");
     app.handle_event(Event::PointerDown { at: Point::new(200.0, 280.0) });
@@ -159,5 +160,5 @@ fn main() {
     let _ = app.tick();
     println!("    submitted = {}", submitted.get());
     println!("    final state: u={:?} p={:?}",
-             username.get_cloned(), password.get_cloned());
+             username.get_cloned().text().to_string(), password.get_cloned().text().to_string());
 }

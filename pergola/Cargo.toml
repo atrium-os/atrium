@@ -14,6 +14,7 @@ path = "src/lib.rs"
 fresco-client   = { path = "../fresco-client" }
 fresco-protocol = { path = "../fresco-protocol" }
 futures-signals = "0.3"
+unicode-segmentation = "1.12"
 log             = "0.4"
 taffy = "0.12.2"
 # The clipboard service's wire (docs/spec/tabula.md); Pergola is a client.

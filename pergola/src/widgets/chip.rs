@@ -193,7 +193,7 @@ impl<C: View> View for ListRow<C> {
         ctx.pop();
 
         let hovered = ctx.is_hovered(outer);
-        let border = if self.selected { t.accent_fg() } else { Color::TRANSPARENT };
+        let border = if self.selected { t.accent_mark() } else { Color::TRANSPARENT };
         let body = if hovered && self.on_click.is_some() {
             t.bg_surface()
         } else {

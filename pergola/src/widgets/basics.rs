@@ -163,7 +163,7 @@ impl ProgressBar {
         });
         ctx.tree.insert(Some(track), Node::Rect {
             rect: Rect::new(x, y, self.width * self.fraction, H),
-            fill: t.accent_fg(),
+            fill: t.accent_mark(),
             radius: H * 0.5,
         });
         track

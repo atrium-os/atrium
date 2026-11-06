@@ -1,52 +1,61 @@
-//! `TextField` — phase 5 widget for single-line text input.
+//! `TextField`: one line of editable text on the shared editing core
+//! ([`crate::text_edit::TextEdit`]): a caret, a selection, motion by
+//! grapheme and word, undo, copy, cut and paste.
 //!
-//! Holds a `Mutable<String>` for its content. While focused, key
-//! events update the content:
-//!   - `Char` events append `chars`
-//!   - `Backspace` removes the last char
-//!   - other keys are ignored (full caret + selection model is a
-//!     later phase; this is the MVP)
+//! The app owns the state as a `Mutable<TextEdit>` (so the caret and
+//! selection survive re-renders) and reads the value with `text()`.
 //!
-//! Visual language reference: §5 radius (`XS`), §8 density
-//! (`size::INPUT_HEIGHT_DEFAULT`), §4 color (border-default,
-//! border-strong on focus, text-primary, text-tertiary placeholder).
+//! Visual language rev. 2 §14.2: 32 high, `bg-canvas` fill, 1px
+//! `border-strong` edge (`border-control` on hover), radius-xs, text 12
+//! from the edge; a 1.5px `accent-fg` caret; `selection-bg` behind the
+//! selected text; the §14.1 focus ring while it has keyboard focus.
+//!
+//! Not yet: placing the caret by pointer (the field takes the click as
+//! focus and keeps its caret), scrolling text longer than the field, and
+//! an IME (the core models composition; the input method service that
+//! drives it doesn't exist yet).
 
-use std::sync::Arc;
+use std::rc::Rc;
 
-use crate::event::{Event, Key, KeyEventKind};
+use crate::event::{Event, KeyEventKind};
 use crate::geom::Rect;
 use crate::node::{Node, TextStyle};
 use crate::reactive::Mutable;
-use crate::theme::{font, radius, size, space, type_size, Weight};
+use crate::text_edit::{KeyOutcome, TextEdit};
+use crate::theme::{font, radius, size, space, stroke, type_size, Weight};
 use crate::view::{Ctx, View};
+
+/// Enter in the field.
+pub type SubmitCallback = Rc<dyn Fn(&str)>;
+
+/// Caret width, logical px (rev. 2 §14.2).
+const CARET_W: f32 = 1.5;
 
 #[derive(Clone)]
 pub struct TextField {
-    pub content: Mutable<String>,
+    pub state: Mutable<TextEdit>,
     pub placeholder: String,
     pub rect: Rect,
-    /// Password mode: render the content as bullets, never the characters.
-    pub secret: bool,
+    on_submit: Option<SubmitCallback>,
 }
 
 impl TextField {
-    pub fn new(content: Mutable<String>) -> Self {
+    pub fn new(state: Mutable<TextEdit>) -> Self {
         Self {
-            content,
+            state,
             placeholder: String::new(),
             rect: Rect::new(0.0, 0.0, 0.0, size::INPUT_HEIGHT_DEFAULT),
-            secret: false,
+            on_submit: None,
         }
-    }
-
-    /// Mask the content (password field) — the entered text is shown as bullets.
-    pub fn secret(mut self, on: bool) -> Self {
-        self.secret = on;
-        self
     }
 
     pub fn placeholder(mut self, p: impl Into<String>) -> Self {
         self.placeholder = p.into();
+        self
+    }
+
+    pub fn on_submit(mut self, f: impl Fn(&str) + 'static) -> Self {
+        self.on_submit = Some(Rc::new(f));
         self
     }
 
@@ -62,128 +71,166 @@ impl TextField {
     }
 }
 
+fn inflate(r: Rect, by: f32) -> Rect {
+    Rect::new(r.x() - by, r.y() - by, r.w() + 2.0 * by, r.h() + 2.0 * by)
+}
+
+/// What the field shows: the text (bullets for a password, one per
+/// grapheme) with any composition spliced in at the caret, and the map
+/// from text offsets to shown offsets.
+fn shown(e: &TextEdit) -> (String, impl Fn(usize) -> usize + '_) {
+    use unicode_segmentation::UnicodeSegmentation;
+    let pre = e.preedit().map_or("", |p| p.text.as_str());
+    let caret = e.caret();
+    let secret = e.is_secret();
+    let mut out = String::new();
+    let push = |s: &str, out: &mut String| {
+        if secret {
+            for _ in s.graphemes(true) {
+                out.push('\u{2022}');
+            }
+        } else {
+            out.push_str(s);
+        }
+    };
+    push(&e.text()[..caret], &mut out);
+    push(pre, &mut out);
+    push(&e.text()[caret..], &mut out);
+    let map = move |at: usize| -> usize {
+        let conv = |s: &str| if secret { s.graphemes(true).count() * '\u{2022}'.len_utf8() } else { s.len() };
+        if at <= caret { conv(&e.text()[..at]) } else { conv(&e.text()[..caret]) + conv(pre) + conv(&e.text()[caret..at]) }
+    };
+    (out, map)
+}
+
 impl View for TextField {
     fn render(&self, ctx: &mut Ctx) {
         let theme = ctx.theme;
-        let value = self.content.get_cloned();
+        let edit = self.state.get_cloned();
 
         let h = if self.rect.size.h > 0.0 { self.rect.size.h } else { size::INPUT_HEIGHT_DEFAULT };
         let rect = Rect::new(self.rect.x(), self.rect.y(), self.rect.size.w, h);
 
-        // Background + border (currently expressed as a single fill;
-        // an outline pass via scene_node_path lands in 4.5).
-        let bg_id = ctx.tree.insert(None, Node::Rect {
-            rect,
-            fill: theme.bg_canvas(),
-            radius: radius::XS,
-        });
+        // Node structure is the same in every state (ids stay stable):
+        // focus halo, focus ring, edge, fill, selection, text, caret.
+        let halo_id = ctx.tree.insert(None, Node::Rect { rect: inflate(rect, 3.0), fill: crate::Color::TRANSPARENT, radius: radius::XS + 3.0 });
+        let ring_id = ctx.tree.insert(None, Node::Rect { rect: inflate(rect, 1.0), fill: crate::Color::TRANSPARENT, radius: radius::XS + 1.0 });
+        let bg_id = ctx.tree.insert(None, Node::Rect { rect, fill: theme.border_strong(), radius: radius::XS });
+        let hovered = ctx.is_hovered(bg_id);
+        let focused = ctx.is_focused(bg_id);
+        if focused {
+            if let Some(Node::Rect { fill, .. }) = ctx.tree.get_mut(halo_id) {
+                *fill = theme.accent_bg();
+            }
+            if let Some(Node::Rect { fill, .. }) = ctx.tree.get_mut(ring_id) {
+                *fill = theme.focus_ring();
+            }
+        } else if hovered {
+            if let Some(Node::Rect { fill, .. }) = ctx.tree.get_mut(bg_id) {
+                *fill = theme.border_control();
+            }
+        }
+        let inner = inflate(rect, -stroke::DEFAULT);
+        ctx.tree.insert(Some(bg_id), Node::Rect { rect: inner, fill: theme.bg_canvas(), radius: (radius::XS - stroke::DEFAULT).max(0.0) });
 
-        // Text content or placeholder.
-        let (display, color) = if value.is_empty() {
-            (self.placeholder.clone(), theme.text_tertiary())
-        } else if self.secret {
-            // Mask: one bullet per character — never the characters themselves.
-            ("\u{2022}".repeat(value.chars().count()), theme.text_primary())
+        let style = |color| TextStyle { family: font::SANS.into(), size: type_size::MD, weight: Weight::Regular, color };
+        let (display, map) = shown(&edit);
+        let text_x = rect.x() + space::SM;
+        let line_h = Node::measure_text("Mg", &style(theme.text_primary())).h;
+        let text_y = rect.y() + (rect.h() - line_h) / 2.0;
+        let x_at = |byte: usize| text_x + Node::measure_text(&display[..byte], &style(theme.text_primary())).w;
+
+        // Selection, behind the text (shown only while focused).
+        let sel = edit.selection();
+        let sel_rect = if focused && !sel.is_empty() {
+            let (a, b) = (x_at(map(sel.start)), x_at(map(sel.end)));
+            Rect::new(a, text_y, b - a, line_h)
         } else {
-            (value, theme.text_primary())
+            Rect::new(text_x, text_y, 0.0, 0.0)
         };
+        ctx.tree.insert(Some(bg_id), Node::Rect { rect: sel_rect, fill: theme.selection_bg(), radius: 0.0 });
 
-        let style = TextStyle {
-            family: font::SANS.into(),
-            size: type_size::MD,
-            weight: Weight::Regular,
-            color,
+        let (content, color) = if display.is_empty() {
+            (self.placeholder.clone(), theme.text_tertiary())
+        } else {
+            (display.clone(), theme.text_primary())
         };
-        let text_size = Node::measure_text(&display, &style);
-        let text_rect = Rect::new(
-            rect.x() + space::SM,
-            rect.y() + (rect.h() - text_size.h) / 2.0,
-            text_size.w,
-            text_size.h,
-        );
-        ctx.tree.insert(Some(bg_id), Node::Text {
-            rect: text_rect,
-            content: display,
-            style,
-        });
+        let size = Node::measure_text(&content, &style(color));
+        ctx.tree.insert(Some(bg_id), Node::Text { rect: Rect::new(text_x, text_y, size.w, size.h), content, style: style(color) });
 
-        // Make the bg focusable + register key handler.
+        // The caret (and the composition's underline, while composing).
+        let caret_rect = if focused && sel.is_empty() {
+            let at = match edit.preedit() {
+                Some(p) => map(edit.caret()) + if edit.is_secret() { 0 } else { p.cursor },
+                None => map(edit.caret()),
+            };
+            Rect::new(x_at(at), text_y, CARET_W, line_h)
+        } else {
+            Rect::new(text_x, text_y, 0.0, 0.0)
+        };
+        ctx.tree.insert(Some(bg_id), Node::Rect { rect: caret_rect, fill: theme.accent_fg(), radius: 0.0 });
+        let under = match edit.preedit() {
+            Some(p) if focused => {
+                let a = x_at(map(edit.caret()));
+                let b = a + Node::measure_text(&p.text, &style(theme.text_primary())).w;
+                Rect::new(a, text_y + line_h, b - a, stroke::DEFAULT)
+            }
+            _ => Rect::new(text_x, text_y, 0.0, 0.0),
+        };
+        ctx.tree.insert(Some(bg_id), Node::Rect { rect: under, fill: theme.text_primary(), radius: 0.0 });
+
         ctx.focusable(bg_id);
-        let content = self.content.clone();
-        let secret = self.secret;
+        let state = self.state.clone();
+        let submit = self.on_submit.clone();
         ctx.on_key(bg_id, move |ev| {
             let Event::Key { kind, key, chars, modifiers } = ev else { return };
             if *kind != KeyEventKind::Down {
                 return;
             }
-            // Ctrl/Cmd chords are commands, never text.
-            if modifiers.ctrl || modifiers.meta {
-                // The field has no selection yet: copy and cut take it all.
-                // A password field never lets its text out; it takes pastes.
-                match (key, chars.as_str()) {
-                    (Key::Char, "c" | "C") if !secret => {
-                        let _ = crate::clipboard::copy_text(&content.get_cloned(), false);
+            let mut e = state.get_cloned();
+            match e.key(*key, *modifiers, chars) {
+                KeyOutcome::Changed => state.set(e),
+                KeyOutcome::Copy(t) => {
+                    // Copy goes first: a cut that can't reach the clipboard
+                    // keeps its text.
+                    if crate::clipboard::copy_text(&t, false).is_ok() {
+                        state.set(e);
                     }
-                    (Key::Char, "x" | "X") if !secret => {
-                        if crate::clipboard::copy_text(&content.get_cloned(), false).is_ok() {
-                            content.set(String::new());
+                }
+                KeyOutcome::Paste => {
+                    if let Ok(Some(t)) = crate::clipboard::paste_text() {
+                        if e.insert(&t) {
+                            state.set(e);
                         }
                     }
-                    (Key::Char, "v" | "V") => {
-                        if let Ok(Some(t)) = crate::clipboard::paste_text() {
-                            // One line: control characters (a pasted newline,
-                            // an escape sequence) are dropped.
-                            let t: String = t.chars().filter(|c| !c.is_control()).collect();
-                            let mut s = content.get_cloned();
-                            s.push_str(&t);
-                            content.set(s);
-                        }
-                    }
-                    _ => {}
                 }
-                return;
-            }
-            match key {
-                Key::Char => {
-                    if !chars.is_empty() {
-                        let mut s = content.get_cloned();
-                        s.push_str(chars);
-                        content.set(s);
+                KeyOutcome::Submit => {
+                    if let Some(f) = &submit {
+                        f(e.text());
                     }
                 }
-                Key::Backspace => {
-                    let mut s = content.get_cloned();
-                    s.pop();
-                    content.set(s);
-                }
-                _ => {}
+                KeyOutcome::Ignored => {}
             }
         });
-        // A drop from another window appends its text, one line, like a paste.
-        let content = self.content.clone();
+        // A drop from another window goes in at the caret, like a paste.
+        let state = self.state.clone();
         ctx.on_drop(bg_id, move || {
             if let Ok(Some(t)) = crate::clipboard::drop_text() {
-                let t: String = t.chars().filter(|c| !c.is_control()).collect();
-                let mut s = content.get_cloned();
-                s.push_str(&t);
-                content.set(s);
+                let mut e = state.get_cloned();
+                if e.insert(&t) {
+                    state.set(e);
+                }
             }
         });
     }
 }
-
-// Avoid unused-import warning when on_key feature lands; the Arc
-// here is for prospective handler-sharing patterns in higher-level
-// widgets.
-#[allow(dead_code)]
-fn _arc_keepalive() -> Arc<()> { Arc::new(()) }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::app::App;
     use crate::clipboard::{self, Backend, Error, Token};
-    use crate::event::Modifiers;
+    use crate::event::{Key, Modifiers};
     use crate::geom::Point;
     use std::cell::RefCell;
     use std::rc::Rc;
@@ -218,12 +265,12 @@ mod tests {
         fn render(&self, ctx: &mut Ctx) { self.field.render(ctx) }
     }
 
-    fn setup(secret: bool, text: &str) -> (App<Form>, Mutable<String>, Rc<RefCell<Log>>) {
+    fn setup(secret: bool, text: &str) -> (App<Form>, Mutable<TextEdit>, Rc<RefCell<Log>>) {
         let log = Rc::new(RefCell::new(Log::default()));
         clipboard::set_backend(Box::new(Mem(log.clone())));
         let dirty = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
-        let content = Mutable::with_dirty(text.to_string(), dirty.clone());
-        let field = TextField::new(content.clone()).width(200.0).secret(secret);
+        let content = Mutable::with_dirty(TextEdit::new(text).secret(secret), dirty.clone());
+        let field = TextField::new(content.clone()).width(200.0);
         let mut app = App::new_with_flag(Form { field }, dirty);
         app.tick();
         // Focus it.
@@ -232,6 +279,8 @@ mod tests {
         assert!(app.focused().is_some());
         (app, content, log)
     }
+
+    fn text(m: &Mutable<TextEdit>) -> String { m.get_cloned().text().to_string() }
 
     fn chord(c: &str) -> Event {
         Event::Key { kind: KeyEventKind::Down, key: Key::Char, modifiers: Modifiers { ctrl: true, ..Default::default() }, chars: c.into() }
@@ -243,12 +292,13 @@ mod tests {
     fn a_chord_is_never_typed() {
         let (mut app, content, _) = setup(false, "ab");
         app.handle_event(chord("c"));
-        assert_eq!(content.get_cloned(), "ab");
+        assert_eq!(text(&content), "ab");
     }
 
     #[test]
     fn copy_needs_the_press_that_asked_for_it() {
         let (mut app, _, log) = setup(false, "hello");
+        app.handle_event(chord("a"));
         app.handle_event(chord("c"));
         assert!(log.borrow().sets.is_empty(), "no activation, nothing sent");
         app.handle_event_activated(chord("c"), Some(T));
@@ -260,10 +310,11 @@ mod tests {
     #[test]
     fn a_password_never_leaves_its_field() {
         let (mut app, content, log) = setup(true, "hunter2");
+        app.handle_event(chord("a"));
         app.handle_event_activated(chord("c"), Some(T));
         app.handle_event_activated(chord("x"), Some(T));
         assert!(log.borrow().sets.is_empty());
-        assert_eq!(content.get_cloned(), "hunter2");
+        assert_eq!(text(&content), "hunter2");
     }
 
     #[test]
@@ -272,32 +323,67 @@ mod tests {
         log.borrow_mut().holds = Some("b\nc\u{1b}[2Jd".into());
         app.handle_event_activated(chord("v"), Some(T));
         // The newline and the escape are dropped; what is left is inert text.
-        assert_eq!(content.get_cloned(), "abc[2Jd");
+        assert_eq!(text(&content), "abc[2Jd");
         // Without a gesture nothing is asked for.
         app.handle_event(chord("v"));
-        assert_eq!(content.get_cloned(), "abc[2Jd");
+        assert_eq!(text(&content), "abc[2Jd");
     }
 
     #[test]
-    fn cut_empties_the_field() {
+    fn cut_takes_the_selection() {
         let (mut app, content, log) = setup(false, "move me");
+        // Nothing selected: nothing to cut.
         app.handle_event_activated(chord("x"), Some(T));
-        assert_eq!(content.get_cloned(), "");
+        assert_eq!(text(&content), "move me");
+        app.handle_event(chord("a"));
+        app.handle_event_activated(chord("x"), Some(T));
+        assert_eq!(text(&content), "");
         assert_eq!(log.borrow().holds.as_deref(), Some("move me"));
     }
 
+    fn key(k: Key, m: Modifiers) -> Event {
+        Event::Key { kind: KeyEventKind::Down, key: k, modifiers: m, chars: String::new() }
+    }
+
     #[test]
-    fn a_drop_appends_its_text_with_the_drop_token() {
+    fn typing_goes_in_at_the_caret_and_undo_takes_it_back() {
+        let (mut app, content, _) = setup(false, "helo");
+        app.handle_event(key(Key::Left, Modifiers::default()));
+        app.handle_event(Event::Key { kind: KeyEventKind::Down, key: Key::Char, modifiers: Modifiers::default(), chars: "l".into() });
+        assert_eq!(text(&content), "hello");
+        app.handle_event(chord("z"));
+        assert_eq!(text(&content), "helo");
+    }
+
+    #[test]
+    fn enter_submits_the_value() {
+        let log = Rc::new(RefCell::new(Log::default()));
+        clipboard::set_backend(Box::new(Mem(log)));
+        let dirty = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let content = Mutable::with_dirty(TextEdit::new("alice"), dirty.clone());
+        let got = Rc::new(RefCell::new(None));
+        let g = got.clone();
+        let field = TextField::new(content).width(200.0).on_submit(move |t| *g.borrow_mut() = Some(t.to_string()));
+        let mut app = App::new_with_flag(Form { field }, dirty);
+        app.tick();
+        app.handle_event(Event::PointerDown { at: Point::new(10.0, 10.0) });
+        app.handle_event(Event::PointerUp { at: Point::new(10.0, 10.0) });
+        app.handle_event(key(Key::Enter, Modifiers::default()));
+        assert_eq!(got.borrow().as_deref(), Some("alice"));
+    }
+
+    #[test]
+    fn a_drop_goes_in_at_the_caret_with_the_drop_token() {
         let (mut app, content, log) = setup(false, "a");
         log.borrow_mut().dropped = Some((T, "b\nc".into()));
         // No token: nothing is asked for.
         app.handle_event(Event::Drop { at: Point::new(10.0, 10.0) });
-        assert_eq!(content.get_cloned(), "a");
+        assert_eq!(text(&content), "a");
         app.handle_event_activated(Event::Drop { at: Point::new(10.0, 10.0) }, Some(T));
-        assert_eq!(content.get_cloned(), "abc");
+        assert_eq!(text(&content), "abc");
         // Off the field nothing takes it.
         log.borrow_mut().dropped = Some((T, "z".into()));
         app.handle_event_activated(Event::Drop { at: Point::new(500.0, 500.0) }, Some(T));
-        assert_eq!(content.get_cloned(), "abc");
+        assert_eq!(text(&content), "abc");
     }
 }

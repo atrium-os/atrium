@@ -54,6 +54,13 @@ impl Color {
         Self { a: (self.a * factor).clamp(0.0, 1.0), ..self }
     }
 
+    /// `self` (which may be translucent) composited over an opaque `base`:
+    /// how a state overlay (`state_hover`) lands on a control's fill.
+    pub fn over(self, base: Color) -> Color {
+        let a = self.a;
+        Color::rgba(self.r * a + base.r * (1.0 - a), self.g * a + base.g * (1.0 - a), self.b * a + base.b * (1.0 - a), base.a.max(a))
+    }
+
     /// WCAG 2.x relative luminance of this color, range `[0.0, 1.0]`,
     /// alpha ignored. Components are linear-light (per `Color`'s
     /// documented convention); fresco-vulkan applies the linear→sRGB

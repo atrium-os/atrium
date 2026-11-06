@@ -25,6 +25,7 @@ use pergola::geom::Rect;
 use pergola::input::translate;
 use pergola::node::Node;
 use pergola::theme::{font, space, type_size, Weight};
+use pergola::text_edit::TextEdit;
 use pergola::view::{Ctx, View};
 use pergola::{
     commit, App, Button, FrescoSurface, Mutable, Surface, TextField, TextStyle,
@@ -47,8 +48,8 @@ const FORM_Y: f32 = (WIN_H as f32 - FORM_H) / 2.0;
 
 #[derive(Clone)]
 struct LoginView {
-    username: Mutable<String>,
-    password: Mutable<String>,
+    username: Mutable<TextEdit>,
+    password: Mutable<TextEdit>,
     status: Mutable<String>,
     /// Set true to break out of the event loop after a successful submit.
     done: Mutable<bool>,
@@ -109,7 +110,6 @@ impl View for LoginView {
         // Password field — masked.
         TextField::new(self.password.clone())
             .placeholder("password")
-            .secret(true)
             .at(FORM_X, FORM_Y + 60.0 + 48.0)
             .width(FORM_W)
             .render(ctx);
@@ -123,8 +123,8 @@ impl View for LoginView {
             .at(FORM_X, FORM_Y + 60.0 + 48.0 * 2.0 + space::MD)
             .width(FORM_W)
             .on_click(move || {
-                let u = username.get_cloned();
-                let p = password.get_cloned();
+                let u = username.get_cloned().text().to_string();
+                let p = password.get_cloned().text().to_string();
                 if u.is_empty() || p.is_empty() {
                     status.set("enter both fields".into());
                     return;
@@ -231,8 +231,8 @@ fn main() -> std::io::Result<()> {
 
     // Build app + view.
     let dirty = Arc::new(AtomicBool::new(true));
-    let username = Mutable::with_dirty(String::new(), Arc::clone(&dirty));
-    let password = Mutable::with_dirty(String::new(), Arc::clone(&dirty));
+    let username = Mutable::with_dirty(TextEdit::default(), Arc::clone(&dirty));
+    let password = Mutable::with_dirty(TextEdit::default().secret(true), Arc::clone(&dirty));
     let status   = Mutable::with_dirty("Use your local account password.".to_string(), Arc::clone(&dirty));
     let done     = Mutable::with_dirty(false, Arc::clone(&dirty));
 
