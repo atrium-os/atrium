@@ -3,7 +3,7 @@
 //! that `Frame::validate` accepted (F3: the broker's only parsers).
 
 use fresco_compute::fuzz::{frame, Rng};
-use fresco_split::{slot, Input, Msg, Role, MSG_BYTES};
+use fresco_split::{slot, DragPhase, Input, Msg, Role, MSG_BYTES};
 
 fn samples() -> Vec<Msg> {
     vec![
@@ -23,6 +23,12 @@ fn samples() -> Vec<Msg> {
         Msg::Input { window: 4, input: Input::Motion { x: 1.5, y: -2.0 } },
         Msg::Input { window: 4, input: Input::Button { x: 3.0, y: 4.0, button: 1, pressed: false, modifiers: 0, activation: [0; 16] } },
         Msg::Input { window: 4, input: Input::Scroll { dx: 0.0, dy: 3.0 } },
+        Msg::DragFormat { window: 3, format: "text/plain;charset=utf-8".into() },
+        Msg::DragBegin { window: 3, drag_id: 0x1234_5678_9abc_def0, activation: [5; 16] },
+        Msg::DragOffer { window: 2, format: "image/png".into() },
+        Msg::Drag { window: 2, phase: DragPhase::Over, drag_id: u64::MAX, x: 1.0, y: 2.5 },
+        Msg::Drop { window: 2, x: 4.0, y: 5.0, activation: [6; 16] },
+        Msg::DragEnd { window: 3, drag_id: 7, dropped: true },
     ]
 }
 
@@ -137,4 +143,15 @@ fn a_window_of_another_size_is_refused() {
     let g = fresco_compute::Frame::pack(&Default::default(), 20, 10, 24);
     slot::write(&mut buf, &g, 0).unwrap();
     assert!(slot::read(&buf, 20, 10).is_err(), "pitch is the broker's, not the renderer's");
+}
+
+#[test]
+fn a_drag_format_must_be_printable_ascii() {
+    for bad in ["", "text/plain charset", "tëxt/plain"] {
+        let b = Msg::DragFormat { window: 1, format: bad.into() }.encode();
+        assert!(Msg::decode(&b).is_err(), "{bad:?}");
+    }
+    let mut b = Msg::DragBegin { window: 1, drag_id: 1, activation: [1; 16] }.encode();
+    b[60] = 1;
+    assert!(Msg::decode(&b).is_err(), "bytes past the token");
 }

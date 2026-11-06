@@ -85,6 +85,12 @@ pub enum Msg {
     WindowTitle { window: u32, title: String },
     /// `slot` (0 or 1) of `window` holds a new frame, sequence `seq`.
     FrameReady { window: u32, slot: u32, seq: u32 },
+    /// One MIME type of the drag the next [`Msg::DragBegin`] on `window`
+    /// starts (at most `fresco_protocol::drag::MAX_FORMATS`).
+    DragFormat { window: u32, format: String },
+    /// The client started dragging `drag_id` out of `window` with the
+    /// press `activation` came with (docs/spec/tabula.md §4).
+    DragBegin { window: u32, drag_id: u64, activation: [u8; 16] },
 
     // ── broker → renderer ─────────────────────────────────────────
     /// The first record a renderer gets, with the client's socket as its
@@ -112,6 +118,23 @@ pub enum Msg {
     Scale { window: u32, scale_milli: u32 },
     /// Input routed to `window` by the layer list.
     Input { window: u32, input: Input },
+    /// One MIME type the drag entering `window` offers; they precede its
+    /// [`Msg::Drag`] `Enter`.
+    DragOffer { window: u32, format: String },
+    /// A drag came over, moved over, or left `window`.
+    Drag { window: u32, phase: DragPhase, drag_id: u64, x: f32, y: f32 },
+    /// The drag was released over `window`; `activation` is its `DROP` token.
+    Drop { window: u32, x: f32, y: f32, activation: [u8; 16] },
+    /// The drag that started from `window` ended.
+    DragEnd { window: u32, drag_id: u64, dropped: bool },
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(u32)]
+pub enum DragPhase {
+    Enter = 0,
+    Over = 1,
+    Leave = 2,
 }
 
 /// Why a record was refused.
@@ -134,6 +157,12 @@ mod kind {
     pub const MOTION: u32 = 0x111;
     pub const BUTTON: u32 = 0x112;
     pub const SCROLL: u32 = 0x113;
+    pub const DRAG_FORMAT: u32 = 5;
+    pub const DRAG_BEGIN: u32 = 6;
+    pub const DRAG_OFFER: u32 = 0x120;
+    pub const DRAG: u32 = 0x121;
+    pub const DROP: u32 = 0x122;
+    pub const DRAG_END: u32 = 0x123;
 }
 
 /// Layout: word 0 kind, word 1 window, words 2..8 arguments, bytes 32..96
@@ -188,7 +217,13 @@ impl Msg {
             | Msg::Focus { window, .. }
             | Msg::CloseRequested { window }
             | Msg::Scale { window, .. }
-            | Msg::Input { window, .. } => window,
+            | Msg::Input { window, .. }
+            | Msg::DragFormat { window, .. }
+            | Msg::DragBegin { window, .. }
+            | Msg::DragOffer { window, .. }
+            | Msg::Drag { window, .. }
+            | Msg::Drop { window, .. }
+            | Msg::DragEnd { window, .. } => window,
             Msg::Client { .. } => 0,
         }
     }
@@ -289,6 +324,41 @@ impl Msg {
                     r
                 }
             },
+            Msg::DragFormat { window, format } | Msg::DragOffer { window, format } => {
+                let mut r = Rec::new(if matches!(self, Msg::DragFormat { .. }) { DRAG_FORMAT } else { DRAG_OFFER }, *window);
+                r.title(format);
+                r
+            }
+            Msg::DragBegin { window, drag_id, activation } => {
+                let mut r = Rec::new(DRAG_BEGIN, *window);
+                r.put(2, *drag_id as u32);
+                r.put(3, (*drag_id >> 32) as u32);
+                r.0[32..48].copy_from_slice(activation);
+                r
+            }
+            Msg::Drag { window, phase, drag_id, x, y } => {
+                let mut r = Rec::new(DRAG, *window);
+                r.put(2, *phase as u32);
+                r.put(3, *drag_id as u32);
+                r.put(4, (*drag_id >> 32) as u32);
+                r.put(5, x.to_bits());
+                r.put(6, y.to_bits());
+                r
+            }
+            Msg::Drop { window, x, y, activation } => {
+                let mut r = Rec::new(DROP, *window);
+                r.put(2, x.to_bits());
+                r.put(3, y.to_bits());
+                r.0[32..48].copy_from_slice(activation);
+                r
+            }
+            Msg::DragEnd { window, drag_id, dropped } => {
+                let mut r = Rec::new(DRAG_END, *window);
+                r.put(2, *drag_id as u32);
+                r.put(3, (*drag_id >> 32) as u32);
+                r.put(4, *dropped as u32);
+                r
+            }
         };
         r.0
     }
@@ -314,6 +384,10 @@ impl Msg {
             KEY => (3, false),
             CLIENT => (4, false),
             BUTTON => (5, false),
+            DRAG_FORMAT | DRAG_OFFER => (0, true),
+            DRAG_BEGIN | DROP => (2, false),
+            DRAG_END => (3, false),
+            DRAG => (5, false),
             _ => return Err(Refused("unknown kind")),
         };
         if (2 + args..8).any(|i| r.get(i) != 0) {
@@ -332,7 +406,7 @@ impl Msg {
             s.to_string()
         } else {
             // Key and button records carry the activation token in 32..48.
-            let tail = if matches!(k, KEY | BUTTON) { 48 } else { 32 };
+            let tail = if matches!(k, KEY | BUTTON | DRAG_BEGIN | DROP) { 48 } else { 32 };
             if r.0[tail..].iter().any(|&c| c != 0) {
                 return Err(Refused("unused field not zero"));
             }
@@ -386,6 +460,34 @@ impl Msg {
                 }
             }
             SCROLL => Msg::Input { window, input: Input::Scroll { dx: finite(r.get(2))?, dy: finite(r.get(3))? } },
+            DRAG_FORMAT | DRAG_OFFER => {
+                if title.is_empty() || !title.bytes().all(|b| (0x21..0x7f).contains(&b)) {
+                    return Err(Refused("a format must be printable ASCII"));
+                }
+                match k {
+                    DRAG_FORMAT => Msg::DragFormat { window, format: title },
+                    _ => Msg::DragOffer { window, format: title },
+                }
+            }
+            DRAG_BEGIN => Msg::DragBegin {
+                window,
+                drag_id: r.get(2) as u64 | (r.get(3) as u64) << 32,
+                activation: r.0[32..48].try_into().unwrap(),
+            },
+            DRAG => Msg::Drag {
+                window,
+                phase: match r.get(2) {
+                    0 => DragPhase::Enter,
+                    1 => DragPhase::Over,
+                    2 => DragPhase::Leave,
+                    _ => return Err(Refused("drag phase")),
+                },
+                drag_id: r.get(3) as u64 | (r.get(4) as u64) << 32,
+                x: finite(r.get(5))?,
+                y: finite(r.get(6))?,
+            },
+            DROP => Msg::Drop { window, x: finite(r.get(2))?, y: finite(r.get(3))?, activation: r.0[32..48].try_into().unwrap() },
+            DRAG_END => Msg::DragEnd { window, drag_id: r.get(2) as u64 | (r.get(3) as u64) << 32, dropped: flag(r.get(4))? },
             _ => unreachable!(),
         })
     }
@@ -393,6 +495,14 @@ impl Msg {
     /// Records a renderer may send. The broker refuses any other kind from
     /// a renderer (and a renderer any of these from the broker).
     pub fn from_renderer(&self) -> bool {
-        matches!(self, Msg::WindowCreate { .. } | Msg::WindowDestroy { .. } | Msg::WindowTitle { .. } | Msg::FrameReady { .. })
+        matches!(
+            self,
+            Msg::WindowCreate { .. }
+                | Msg::WindowDestroy { .. }
+                | Msg::WindowTitle { .. }
+                | Msg::FrameReady { .. }
+                | Msg::DragFormat { .. }
+                | Msg::DragBegin { .. }
+        )
     }
 }

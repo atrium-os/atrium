@@ -86,6 +86,20 @@ pub enum DisplayEvent {
     /// reason. Sent whenever the set changes, so an empty list says every
     /// node draws again.
     WindowFillsDropped { window_id: u32, dropped: Vec<(u32, u8)> },
+    /// A drag (docs/spec/tabula.md §4) came over, moved over or left the
+    /// window; `formats` on `Enter` only.
+    Drag { phase: DragPhase, window_id: u32, drag_id: u64, x: f32, y: f32, formats: Vec<String> },
+    /// The drag was released over the window; `activation` is its `DROP` token.
+    Drop { window_id: u32, x: f32, y: f32, activation: [u8; 16] },
+    /// To the drag's source window: the drag ended.
+    DragEnd { window_id: u32, drag_id: u64, dropped: bool },
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DragPhase {
+    Enter,
+    Over,
+    Leave,
 }
 
 /// Encode a `DisplayEvent` as a fresco-protocol payload. Returns
@@ -168,6 +182,23 @@ pub fn encode_event(ev: &DisplayEvent)
                 dropped: dropped.iter().map(|&(node_id, reason)| FillDrop { node_id, reason }).collect(),
             };
             Ok((control::EV_WINDOW_FILLS_DROPPED, encode(&p)?))
+        }
+        DisplayEvent::Drag { phase, window_id, drag_id, x, y, formats } => {
+            let op = match phase {
+                DragPhase::Enter => control::EV_DRAG_ENTER,
+                DragPhase::Over => control::EV_DRAG_OVER,
+                DragPhase::Leave => control::EV_DRAG_LEAVE,
+            };
+            let p = DragEvent { window_id: *window_id, drag_id: *drag_id, x: *x, y: *y, formats: formats.clone() };
+            Ok((op, encode(&p)?))
+        }
+        DisplayEvent::Drop { window_id, x, y, activation } => {
+            let p = DropEvent { window_id: *window_id, x: *x, y: *y, activation: *activation };
+            Ok((control::EV_DROP, encode(&p)?))
+        }
+        DisplayEvent::DragEnd { window_id, drag_id, dropped } => {
+            let p = DragEndEvent { window_id: *window_id, drag_id: *drag_id, dropped: *dropped };
+            Ok((control::EV_DRAG_END, encode(&p)?))
         }
     }
 }

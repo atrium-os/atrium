@@ -52,6 +52,8 @@ struct Renderer {
     /// renderer declares the window).
     origins: Mutex<HashMap<u32, String>>,
     chan: Chan,
+    /// Formats of the drag its next DRAG_BEGIN starts.
+    drag_formats: Mutex<Vec<String>>,
     /// Set when the broker has let it go.
     gone: std::sync::atomic::AtomicBool,
     /// Its windows, by its own (local) ids.
@@ -430,6 +432,7 @@ impl Broker {
             opener,
             origins: Mutex::new(HashMap::new()),
             chan: ours,
+            drag_formats: Mutex::new(Vec::new()),
             gone: std::sync::atomic::AtomicBool::new(false),
             wins: Mutex::new(HashMap::new()),
             proc_: Mutex::new(proc_),
@@ -442,10 +445,10 @@ impl Broker {
         {
             let r = r.clone();
             std::thread::Builder::new().name(format!("frescod-split-ev-{client_id}")).spawn(move || {
-                for ev in ev_rx.iter() {
-                    if let Some(m) = event_record(&r, &ev) {
+                'events: for ev in ev_rx.iter() {
+                    for m in event_records(&r, &ev) {
                         if r.tell(&m, &[]).is_err() {
-                            break;
+                            break 'events;
                         }
                     }
                 }
@@ -574,6 +577,22 @@ impl Broker {
                     (_, Err(e)) => log::debug!("frescod: client {} window {local}: {e}", r.client_id),
                 }
                 r.tell(&Msg::FrameDone { window: local, slot: s }, &[])?;
+            }
+            Msg::DragFormat { format, .. } => {
+                let mut f = r.drag_formats.lock().unwrap();
+                if f.len() >= fresco_protocol::drag::MAX_FORMATS {
+                    return Err("too many drag formats".into());
+                }
+                f.push(format);
+            }
+            Msg::DragBegin { drag_id, activation, .. } => {
+                let formats = std::mem::take(&mut *r.drag_formats.lock().unwrap());
+                let global = r.wins.lock().unwrap().get(&local).map(|w| w.global as u32);
+                let b = fresco_protocol::DragBegin { window_id: global.unwrap_or(0), drag_id, activation, formats };
+                if let Err(e) = global.ok_or("unknown window").and_then(|_| crate::drag::begin(&self.comp, r.client_id, &b)) {
+                    log::info!("frescod: client {}: drag {drag_id} refused: {e}", r.client_id);
+                    r.tell(&Msg::DragEnd { window: local, drag_id, dropped: false }, &[])?;
+                }
             }
             _ => unreachable!("serve() admits only a renderer's records"),
         }
@@ -804,6 +823,32 @@ impl Bucket {
 /// Window lifetime events are the renderer's own business, and sizes go
 /// by [`Broker::sync`]; events over window 0 (the shared background) have
 /// no owner yet and do not reach renderers (F4c gives it one).
+fn event_records(r: &Renderer, ev: &DisplayEvent) -> Vec<Msg> {
+    use fresco_scene_server::window::DragPhase as P;
+    use DisplayEvent as E;
+    let finite = |x: f32, y: f32| x.is_finite() && y.is_finite();
+    match ev {
+        E::Drag { phase, window_id, drag_id, x, y, formats } if finite(*x, *y) => {
+            let Some(window) = r.local_of(*window_id) else { return Vec::new() };
+            let phase = match phase {
+                P::Enter => fresco_split::DragPhase::Enter,
+                P::Over => fresco_split::DragPhase::Over,
+                P::Leave => fresco_split::DragPhase::Leave,
+            };
+            let mut v: Vec<Msg> = formats.iter().map(|f| Msg::DragOffer { window, format: f.clone() }).collect();
+            v.push(Msg::Drag { window, phase, drag_id: *drag_id, x: *x, y: *y });
+            v
+        }
+        E::Drop { window_id, x, y, activation } if finite(*x, *y) => {
+            r.local_of(*window_id).map(|window| Msg::Drop { window, x: *x, y: *y, activation: *activation }).into_iter().collect()
+        }
+        E::DragEnd { window_id, drag_id, dropped } => {
+            r.local_of(*window_id).map(|window| Msg::DragEnd { window, drag_id: *drag_id, dropped: *dropped }).into_iter().collect()
+        }
+        _ => event_record(r, ev).into_iter().collect(),
+    }
+}
+
 fn event_record(r: &Renderer, ev: &DisplayEvent) -> Option<Msg> {
     use DisplayEvent as E;
     let (global, input) = match *ev {

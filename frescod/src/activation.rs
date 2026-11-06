@@ -111,7 +111,9 @@ impl Table {
         if !fits(&e, purpose) {
             return refused(refusal::WRONG_KIND);
         }
-        if e.kind != kind::GRANTED && !focused(e.window_id) {
+        // A drop lands on whatever window is under the pointer, focused
+        // or not; a granted token has no window.
+        if !matches!(e.kind, kind::GRANTED | kind::DROP) && !focused(e.window_id) {
             return refused(refusal::NOT_FOCUSED);
         }
         self.live.remove(token);
@@ -193,6 +195,11 @@ pub fn mint_for(ev: &mut fresco_scene_server::window::DisplayEvent, uid: Option<
 
 /// The same event with its token cleared: what the WM sees of a press in
 /// another app's window.
+/// A `DROP` token for `uid`'s window `window_id`, bound to `drag_id`.
+pub fn mint_drop(window_id: u32, uid: u32, drag_id: u64) -> Token {
+    table().lock().unwrap().mint(Entry { window_id, uid, kind: kind::DROP, hid: 0, mods: 0, minted_ns: now_ns(), counter: 0, drag_id, purpose: 0 })
+}
+
 pub fn without_token(ev: &fresco_scene_server::window::DisplayEvent) -> fresco_scene_server::window::DisplayEvent {
     use fresco_scene_server::window::DisplayEvent as E;
     let mut e = ev.clone();

@@ -110,6 +110,16 @@ pub enum Event {
     },
     /// Pointer scroll delta in logical pixels.
     PointerScroll { window_id: u32, dx: f32, dy: f32 },
+    /// A drag (docs/spec/tabula.md §4) came over the window, offering
+    /// these MIME `formats`.
+    DragEnter { window_id: u32, drag_id: u64, x: f32, y: f32, formats: Vec<String> },
+    DragOver { window_id: u32, drag_id: u64, x: f32, y: f32 },
+    DragLeave { window_id: u32, drag_id: u64 },
+    /// Released over the window: hand `activation` to Tabula's `DROP_GET`.
+    Drop { window_id: u32, x: f32, y: f32, activation: [u8; 16] },
+    /// The drag started from this window ended (`dropped` = over a window;
+    /// false too when frescod refused the begin).
+    DragEnd { window_id: u32, drag_id: u64, dropped: bool },
     /// Op-id outside the events fresco-client knows about. App can
     /// either decode it itself or ignore.
     Unknown        { op: u16, payload: Vec<u8> },
@@ -446,6 +456,14 @@ impl Connection {
             }
             log::debug!("window_create: skipping unrelated message op={:#x}", m.op);
         }
+    }
+
+    /// Start dragging `drag_id` (Tabula's `DRAG_BEGIN` answer) out of
+    /// `window_id`, while the press `activation` came with is still held.
+    /// No reply: a refusal comes back as `Event::DragEnd { dropped: false }`.
+    pub fn drag_begin(&mut self, window_id: u32, drag_id: u64, activation: [u8; 16], formats: Vec<String>) -> io::Result<()> {
+        self.send_window_managed(control::OP_DRAG_BEGIN,
+            &fresco_protocol::DragBegin { window_id, drag_id, activation, formats })
     }
 
     pub fn window_destroy(&mut self, window_id: u32) -> io::Result<()> {
@@ -964,6 +982,22 @@ fn decode_event(op: u16, payload: &[u8]) -> Event {
             Ok(p) => Event::PointerScroll {
                 window_id: p.window_id, dx: p.dx, dy: p.dy,
             },
+            Err(_) => Event::Unknown { op, payload: payload.to_vec() },
+        },
+        control::EV_DRAG_ENTER | control::EV_DRAG_OVER | control::EV_DRAG_LEAVE => match decode::<fresco_protocol::DragEvent>(payload) {
+            Ok(p) => match op {
+                control::EV_DRAG_ENTER => Event::DragEnter { window_id: p.window_id, drag_id: p.drag_id, x: p.x, y: p.y, formats: p.formats },
+                control::EV_DRAG_OVER => Event::DragOver { window_id: p.window_id, drag_id: p.drag_id, x: p.x, y: p.y },
+                _ => Event::DragLeave { window_id: p.window_id, drag_id: p.drag_id },
+            },
+            Err(_) => Event::Unknown { op, payload: payload.to_vec() },
+        },
+        control::EV_DROP => match decode::<fresco_protocol::DropEvent>(payload) {
+            Ok(p) => Event::Drop { window_id: p.window_id, x: p.x, y: p.y, activation: p.activation },
+            Err(_) => Event::Unknown { op, payload: payload.to_vec() },
+        },
+        control::EV_DRAG_END => match decode::<fresco_protocol::DragEndEvent>(payload) {
+            Ok(p) => Event::DragEnd { window_id: p.window_id, drag_id: p.drag_id, dropped: p.dropped },
             Err(_) => Event::Unknown { op, payload: payload.to_vec() },
         },
         _ => Event::Unknown { op, payload: payload.to_vec() },

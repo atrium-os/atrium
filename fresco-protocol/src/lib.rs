@@ -182,6 +182,22 @@ pub mod control {
     pub const EV_INPUT_POINTER_MOTION:  u16 = 0x0701;
     pub const EV_INPUT_POINTER_BUTTON:  u16 = 0x0702;
     pub const EV_INPUT_POINTER_SCROLL:  u16 = 0x0703;
+
+    // ── Drag and drop between windows (docs/spec/tabula.md §4) ──
+    /// Client → server, no reply: start dragging from the client's window
+    /// (`DragBegin`). The payload stays with Tabula; frescod carries only
+    /// the drag. A refused begin answers `EV_DRAG_END { dropped: false }`.
+    pub const OP_DRAG_BEGIN:            u16 = 0x0710;
+    /// The drag came over, moved over, or left the receiving window
+    /// (`DragEvent`; `formats` on ENTER only).
+    pub const EV_DRAG_ENTER:            u16 = 0x0711;
+    pub const EV_DRAG_OVER:             u16 = 0x0712;
+    pub const EV_DRAG_LEAVE:            u16 = 0x0713;
+    /// Released over the receiving window (`DropEvent`): its `activation`
+    /// is a `DROP` token Tabula's `DROP_GET` spends for the payload.
+    pub const EV_DROP:                  u16 = 0x0714;
+    /// To the source: the drag ended (`DragEndEvent`).
+    pub const EV_DRAG_END:              u16 = 0x0715;
 }
 
 // ── Deadline-lane payloads ───────────────────────────────────────────
@@ -936,6 +952,63 @@ pub struct InputPointerScrollEvent {
     pub dy:        f32,
 }
 
+/// Limits on a drag's formats.
+pub mod drag {
+    pub const MAX_FORMATS: usize = 8;
+    /// Bytes in one format (a MIME type: printable ASCII).
+    pub const MAX_FORMAT_BYTES: usize = 64;
+
+    /// Whether `formats` are within the limits.
+    pub fn formats_ok(formats: &[String]) -> bool {
+        formats.len() <= MAX_FORMATS
+            && formats.iter().all(|f| !f.is_empty() && f.len() <= MAX_FORMAT_BYTES && f.bytes().all(|b| (0x21..0x7f).contains(&b)))
+    }
+}
+
+/// `OP_DRAG_BEGIN`: drag `drag_id` (from Tabula's `DRAG_BEGIN`) out of
+/// `window_id`. `activation` is the button press that started it, still
+/// held, in that window, which must have focus. frescod does not spend
+/// it (Tabula did).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DragBegin {
+    pub window_id: u32,
+    pub drag_id: u64,
+    pub activation: [u8; 16],
+    /// MIME types the payload offers, for targets to show where they
+    /// accept ([`drag`] limits).
+    pub formats: Vec<String>,
+}
+
+/// `EV_DRAG_ENTER` / `EV_DRAG_OVER` / `EV_DRAG_LEAVE`, in the receiving
+/// window's coordinates.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct DragEvent {
+    pub window_id: u32,
+    pub drag_id: u64,
+    pub x: f32,
+    pub y: f32,
+    /// On `EV_DRAG_ENTER` only; empty otherwise.
+    pub formats: Vec<String>,
+}
+
+/// `EV_DROP`: released over `window_id` at `(x, y)`.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct DropEvent {
+    pub window_id: u32,
+    pub x: f32,
+    pub y: f32,
+    /// A `DROP` token for this window's app, bound to the drag.
+    pub activation: [u8; 16],
+}
+
+/// `EV_DRAG_END`, to the source window: `dropped` = released over a window.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DragEndEvent {
+    pub window_id: u32,
+    pub drag_id: u64,
+    pub dropped: bool,
+}
+
 // ── Scene op IDs (closed registry per §3.4) ──────────────────────────
 
 /// Scene op IDs from the §3.4 closed registry. NOT envelope opcodes —
@@ -1667,6 +1740,16 @@ mod tests {
             control::OP_WM_DISPLAY_MODES,
             control::OP_WM_SET_DISPLAY_MODE,
             control::EV_DISPLAY_CHANGED,
+            control::EV_INPUT_KEY,
+            control::EV_INPUT_POINTER_MOTION,
+            control::EV_INPUT_POINTER_BUTTON,
+            control::EV_INPUT_POINTER_SCROLL,
+            control::OP_DRAG_BEGIN,
+            control::EV_DRAG_ENTER,
+            control::EV_DRAG_OVER,
+            control::EV_DRAG_LEAVE,
+            control::EV_DROP,
+            control::EV_DRAG_END,
         ];
         let mut sorted = ops.to_vec();
         sorted.sort();

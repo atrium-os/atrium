@@ -154,7 +154,6 @@ pub fn spawn_event_fanout(
                  * here — wake the display loop so cursor/focus/window
                  * changes recompose. */
                 redraw.wake();
-                let to = route(&ev, &comp);
                 /* A real press gets its activation token (tabula.md §2),
                  * bound to the window's app; only that app sees it, the
                  * WM gets the event without it. */
@@ -163,40 +162,61 @@ pub fn spawn_event_fanout(
                     activation::mint_for(&mut ev, uid);
                     activation::without_token(&ev)
                 });
-                let wire = |ev: &DisplayEvent| match encode_event(ev) {
-                    Ok((op, payload)) => Some(Outbound { op, flags: flag::ASYNC_EVENT, payload }),
-                    Err(e) => {
-                        log::debug!("encode_event failed: {e}");
-                        None
-                    }
-                };
-                let Some(out) = wire(&ev) else { continue };
-                let out_bare = match &bare {
-                    Some(b) => match wire(b) {
-                        Some(o) => o,
-                        None => continue,
-                    },
-                    None => out_clone(&out),
-                };
-                let owner = to.owner();
-                let mut s = subs.lock().unwrap();
-                s.retain(|sub| {
-                    if !to.reaches(sub) {
-                        return true;
-                    }
-                    let mine = owner == Some(sub.client_id);
-                    match &sub.tx {
-                        SubTx::Wire(tx) => tx.send(out_clone(if mine { &out } else { &out_bare })).is_ok(),
-                        SubTx::Split(tx) => tx.send(match (&bare, mine) {
-                            (Some(b), false) => b.clone(),
-                            _ => ev.clone(),
-                        }).is_ok(),
-                    }
-                });
+                /* Drags follow the input (tabula.md §4; frescod only). */
+                let extra = OBSERVE.get().map(|f| f(&ev, &comp)).unwrap_or_default();
+                fan_out(&subs, &comp, ev, bare);
+                for e in extra {
+                    fan_out(&subs, &comp, e, None);
+                }
             }
         })
         .expect("spawn event fan-out");
 }
+
+/// Send `ev` to every subscriber its route reaches; `bare` (the event
+/// without its token) to those other than the window's owner.
+fn fan_out(subs: &EventSubs, comp: &Arc<Mutex<Compositor>>, ev: DisplayEvent, bare: Option<DisplayEvent>) {
+    let to = route(&ev, comp);
+    let wire = |ev: &DisplayEvent| match encode_event(ev) {
+        Ok((op, payload)) => Some(Outbound { op, flags: flag::ASYNC_EVENT, payload }),
+        Err(e) => {
+            log::debug!("encode_event failed: {e}");
+            None
+        }
+    };
+    let Some(out) = wire(&ev) else { return };
+    let out_bare = match &bare {
+        Some(b) => match wire(b) {
+            Some(o) => o,
+            None => return,
+        },
+        None => out_clone(&out),
+    };
+    let owner = to.owner();
+    let mut s = subs.lock().unwrap();
+    s.retain(|sub| {
+        if !to.reaches(sub) {
+            return true;
+        }
+        let mine = owner == Some(sub.client_id);
+        match &sub.tx {
+            SubTx::Wire(tx) => tx.send(out_clone(if mine { &out } else { &out_bare })).is_ok(),
+            SubTx::Split(tx) => tx.send(match (&bare, mine) {
+                (Some(b), false) => b.clone(),
+                _ => ev.clone(),
+            }).is_ok(),
+        }
+    });
+}
+
+/// Set by frescod (not the renderer, which shares this file): turns each
+/// event into the drag events it causes.
+pub static OBSERVE: std::sync::OnceLock<fn(&DisplayEvent, &Arc<Mutex<Compositor>>) -> Vec<DisplayEvent>> = std::sync::OnceLock::new();
+
+/// What `OP_DRAG_BEGIN` from a client does: frescod checks and starts the
+/// drag, a renderer passes it to frescod. `false`: refused.
+pub type DragBeginFn = Box<dyn Fn(u8, &fresco_protocol::DragBegin) -> bool + Send + Sync>;
+pub static DRAG_BEGIN: std::sync::OnceLock<DragBeginFn> = std::sync::OnceLock::new();
 
 /// Who an event goes to (threat model §2.5.2 "input splits the same way").
 /// Every event names a window. It reaches that window's owner and the WM
@@ -249,7 +269,10 @@ fn route(ev: &DisplayEvent, comp: &Arc<Mutex<Compositor>>) -> Route {
         | E::InputPointerButton { window_id, .. }
         | E::InputPointerScroll { window_id, .. } => window_id,
         E::DisplayChanged { .. } => return Route::All,
-        E::WindowFillsDropped { window_id, .. } => return Route::Owner(owner_of(window_id)),
+        E::WindowFillsDropped { window_id, .. }
+        | E::Drag { window_id, .. }
+        | E::Drop { window_id, .. }
+        | E::DragEnd { window_id, .. } => return Route::Owner(owner_of(window_id)),
     };
     if window_id == 0 {
         return Route::WmOnly;
@@ -262,6 +285,11 @@ fn route(ev: &DisplayEvent, comp: &Arc<Mutex<Compositor>>) -> Route {
 fn window_uid(ev: &DisplayEvent, comp: &Arc<Mutex<Compositor>>) -> Option<u32> {
     use DisplayEvent as E;
     let (E::InputKey { window_id, .. } | E::InputPointerButton { window_id, .. }) = *ev else { return None };
+    window_owner_uid(window_id, comp)
+}
+
+/// The uid of the app that owns `window_id`.
+pub fn window_owner_uid(window_id: u32, comp: &Mutex<Compositor>) -> Option<u32> {
     let id = u16::try_from(window_id).ok()?;
     let c = comp.lock().unwrap();
     let w = c.windows.get(&id)?;
@@ -531,6 +559,25 @@ pub fn reader_loop(
                                 connection cache; upload dropped");
                 }
             }
+        }
+
+        /* A drag out of one of the client's windows (tabula.md §4). No
+         * reply; a refusal ends the drag at once. */
+        if msg.op == fresco_protocol::control::OP_DRAG_BEGIN {
+            let b = fresco_protocol::decode::<fresco_protocol::DragBegin>(&msg.payload);
+            let ok = match &b {
+                Ok(b) => DRAG_BEGIN.get().is_some_and(|f| f(client_id, b)),
+                Err(_) => false,
+            };
+            if let (false, Ok(b)) = (ok, b) {
+                let end = fresco_protocol::DragEndEvent { window_id: b.window_id, drag_id: b.drag_id, dropped: false };
+                let _ = out.send(Outbound {
+                    op: fresco_protocol::control::EV_DRAG_END,
+                    flags: flag::ASYNC_EVENT,
+                    payload: fresco_protocol::encode(&end).unwrap_or_default(),
+                });
+            }
+            continue;
         }
 
         /* Deadline-lane sponsorship (phase J): broker concern, not a

@@ -199,6 +199,8 @@ fn raster(
 #[derive(Default)]
 struct State {
     wins: HashMap<u32, Win>,
+    /// Formats of the drag the next DRAG Enter brings.
+    drag_offers: Vec<String>,
 }
 
 /// Where the bundle carries the precompiled kernels.
@@ -284,6 +286,21 @@ fn main() {
         tx: socket_server::SubTx::Wire(tx.clone()),
     }]));
     socket_server::spawn_event_fanout(ev_rx, subs, redraw.clone(), comp.clone());
+    // A drag out of the client's window goes to frescod, which checks it.
+    {
+        let (broker, comp) = (broker.clone(), comp.clone());
+        let _ = socket_server::DRAG_BEGIN.set(Box::new(move |_, b| {
+            let known = u16::try_from(b.window_id).is_ok_and(|id| id != 0 && comp.lock().unwrap().windows.contains_key(&id));
+            if !known || !fresco_protocol::drag::formats_ok(&b.formats) {
+                return false;
+            }
+            for f in &b.formats {
+                send(&broker, &Msg::DragFormat { window: b.window_id, format: f.clone() });
+            }
+            send(&broker, &Msg::DragBegin { window: b.window_id, drag_id: b.drag_id, activation: b.activation });
+            true
+        }));
+    }
     let wstream = client.try_clone().expect("clone the client socket");
     std::thread::spawn(move || socket_server::writer_loop(wstream, rx, CLIENT, None));
     {
@@ -535,6 +552,29 @@ fn from_broker(
                     }
                     Input::Scroll { dx, dy } => DisplayEvent::InputPointerScroll { window_id, dx, dy },
                 });
+            }
+            Msg::DragOffer { format, .. } => {
+                let mut s = state.lock().unwrap();
+                if s.drag_offers.len() < fresco_protocol::drag::MAX_FORMATS {
+                    s.drag_offers.push(format);
+                }
+            }
+            Msg::Drag { phase, drag_id, x, y, .. } => {
+                use fresco_scene_server::window::DragPhase as P;
+                let formats = std::mem::take(&mut state.lock().unwrap().drag_offers);
+                let phase = match phase {
+                    fresco_split::DragPhase::Enter => P::Enter,
+                    fresco_split::DragPhase::Over => P::Over,
+                    fresco_split::DragPhase::Leave => P::Leave,
+                };
+                let formats = if phase == P::Enter { formats } else { Vec::new() };
+                let _ = events.send(DisplayEvent::Drag { phase, window_id: local, drag_id, x, y, formats });
+            }
+            Msg::Drop { x, y, activation, .. } => {
+                let _ = events.send(DisplayEvent::Drop { window_id: local, x, y, activation });
+            }
+            Msg::DragEnd { drag_id, dropped, .. } => {
+                let _ = events.send(DisplayEvent::DragEnd { window_id: local, drag_id, dropped });
             }
             _ => unreachable!("from_renderer() covers the rest"),
         }

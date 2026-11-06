@@ -1,7 +1,8 @@
 //! atrium-activation-probe — end to end check of frescod's activation
 //! tokens (docs/spec/tabula.md §2) through the real sockets: an app window
 //! gets a token with each injected press, the WM gets the same press with
-//! none, and the activation socket spends tokens by the rules.
+//! none, and the activation socket spends tokens by the rules. Then a
+//! drag from its window to another app's ends in a DROP token for that app.
 //!
 //! Needs frescod with FRESCOD_INJECT_ACTIVATION=1 (injected presses mint),
 //! FRESCOD_ACTIVATION_UIDS and FRESCOD_FORUM_UID set to the probe's uid.
@@ -78,6 +79,19 @@ impl Probe {
     }
 }
 
+/// The next event `want` picks, within 20 s.
+fn wait(c: &mut Connection, want: impl Fn(&Event) -> bool) -> Option<Event> {
+    let end = Instant::now() + Duration::from_secs(20);
+    while Instant::now() < end {
+        if let Ok(Some(e)) = c.wait_event(Some(Duration::from_millis(200))) {
+            if want(&e) {
+                return Some(e);
+            }
+        }
+    }
+    None
+}
+
 fn refused(r: ConsumeResult) -> u8 {
     match r {
         ConsumeResult::Ok { .. } => 0,
@@ -91,6 +105,14 @@ fn main() {
         eprintln!("usage: atrium-activation-probe SOCK WM_SOCK INJECT_SOCK ACTIVATION_SOCK");
         std::process::exit(2);
     };
+    // A second app's window, under the first: the drop target.
+    let mut other = Connection::connect(sock).expect("app socket");
+    let hints = WindowHints { initial_position: Some((400, 100)), ..WindowHints::default() };
+    let target = other.window_create(200, 150, "drop here", hints).expect("window");
+    other.set_default_window(target as u16);
+    other.scene_frame_begin().unwrap();
+    other.scene_node_rect(1, RectParams { x: 0.0, y: 0.0, w: 200.0, h: 150.0, r: 0.8, g: 0.5, b: 0.2, a: 1.0, radius: 0.0 }).unwrap();
+    other.scene_frame_end().unwrap();
     let mut app = Connection::connect(sock).expect("app socket");
     let win = app.window_create(200, 150, "activation", WindowHints::default()).expect("window");
     app.set_default_window(win as u16);
@@ -112,7 +134,8 @@ fn main() {
     let r = p.consume(t, uid + 1, purpose::PASTE);
     p.check(refused(r) == refusal::WRONG_UID, "another app cannot spend it");
     let r = p.consume(t, uid, purpose::PASTE);
-    p.check(matches!(r, ConsumeResult::Ok { kind: kind::KEY, window_id, .. } if window_id == win), "its own app pastes with it");
+    // (window_id is frescod's id for it, which in split mode is not the app's.)
+    p.check(matches!(r, ConsumeResult::Ok { kind: kind::KEY, .. }), "its own app pastes with it");
     let r = p.consume(t, uid, purpose::PASTE);
     p.check(refused(r) == refusal::UNKNOWN, "only once");
 
@@ -126,7 +149,9 @@ fn main() {
     let r = p.consume(t, uid, purpose::COPY);
     p.check(matches!(r, ConsumeResult::Ok { .. }), "Ctrl-C copies");
 
-    let at = p.wm.wm_enumerate().expect("enumerate").into_iter().find(|s| s.surface_id == win).expect("our window").rect;
+    // frescod's window ids differ from the apps' in split mode: the target
+    // is the one placed at (400, 100).
+    let at = p.wm.wm_enumerate().expect("enumerate").into_iter().find(|s| (s.rect.x, s.rect.y) != (400, 100)).expect("our window").rect;
     p.inject(&format!("MOVE {} {}", at.x + at.w / 2, at.y + at.h / 2));
     let (t, _) = p.press("BTN 1 1");
     p.inject("BTN 1 0");
@@ -150,6 +175,38 @@ fn main() {
     p.check(matches!(r, ConsumeResult::Ok { kind: kind::GRANTED, .. }), "and spends on it");
     let r = p.consume([7; 16], uid, purpose::PASTE);
     p.check(refused(r) == refusal::UNKNOWN, "a made-up token is unknown");
+
+    // Drag and drop (tabula.md §4): from the app's window to the other's.
+    let rects = p.wm.wm_enumerate().expect("enumerate");
+    let rect = |is_target: bool| rects.iter().find(|s| ((s.rect.x, s.rect.y) == (400, 100)) == is_target).expect("window").rect;
+    let (a, b) = (rect(false), rect(true));
+    println!("source at {},{} {}x{}; target at {},{} {}x{}", a.x, a.y, a.w, a.h, b.x, b.y, b.w, b.h);
+    p.inject(&format!("MOVE {} {}", a.x + a.w / 2, a.y + a.h / 2));
+    let (t, _) = p.press("BTN 1 1");
+    p.app.drag_begin(win, 42, [9; 16], vec!["text/plain".into()]).unwrap();
+    let end = wait(&mut p.app, |e| matches!(e, Event::DragEnd { .. }));
+    p.check(matches!(end, Some(Event::DragEnd { dropped: false, drag_id: 42, .. })), "a drag needs the press being held");
+    p.app.drag_begin(win, 43, t, vec!["text/plain".into(), "text/html".into()]).unwrap();
+    std::thread::sleep(Duration::from_millis(300));
+    p.inject(&format!("MOVE {} {}", b.x + 20, b.y + 30));
+    let enter = wait(&mut other, |e| matches!(e, Event::DragEnter { .. }));
+    p.check(matches!(&enter, Some(Event::DragEnter { drag_id: 43, formats, .. }) if formats.len() == 2), "the target sees it come in, with its formats");
+    p.inject(&format!("MOVE {} {}", b.x + 25, b.y + 30));
+    let over = wait(&mut other, |e| matches!(e, Event::DragOver { .. }));
+    p.check(matches!(over, Some(Event::DragOver { drag_id: 43, .. })), "and move over it");
+    p.inject("BTN 1 0");
+    let dropped = wait(&mut other, |e| matches!(e, Event::Drop { .. }));
+    let end = wait(&mut p.app, |e| matches!(e, Event::DragEnd { .. }));
+    p.check(matches!(end, Some(Event::DragEnd { dropped: true, drag_id: 43, .. })), "the source hears it was dropped");
+    match dropped {
+        Some(Event::Drop { window_id, activation, .. }) if window_id == target => {
+            let r = p.consume(activation, uid, purpose::PASTE);
+            p.check(refused(r) == refusal::WRONG_KIND, "a drop token is not a paste");
+            let r = p.consume(activation, uid, purpose::DROP);
+            p.check(matches!(r, ConsumeResult::Ok { kind: kind::DROP, drag_id: 43, .. }), "it is the drop of that drag");
+        }
+        other => p.check(false, &format!("the target gets the drop ({other:?})")),
+    }
 
     if p.failed > 0 {
         println!("{} FAILED", p.failed);

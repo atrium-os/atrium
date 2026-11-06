@@ -32,6 +32,7 @@
 //! single-window apps render correctly.
 
 mod activation;
+mod drag;
 mod injector_reader;
 mod input_reader;
 mod laminar;
@@ -217,6 +218,7 @@ fn main() -> std::io::Result<()> {
     }
     socket_server::spawn_event_fanout(ev_rx, event_subs, redraw.clone(), comp.clone());
     activation::start(comp.clone());
+    drag::install(comp.clone());
 
     /* Native FreeBSD keyboard + pointer input. Both read /dev/hidraw*
      * directly (boot-protocol HID), update server cursor / focus state,
@@ -864,6 +866,7 @@ fn run_headless(png: &str) -> std::io::Result<()> {
     }
     socket_server::spawn_event_fanout(ev_rx, subs, redraw2.clone(), comp.clone());
     activation::start(comp.clone());
+    drag::install(comp.clone());
     eprintln!("frescod-headless: {W}x{H} on {} → {png}.png", sock.display());
 
     /* Damage-driven, like the display path — this loop used to render

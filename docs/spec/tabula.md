@@ -226,6 +226,47 @@ press. Not yet: privacy mode, persistence across restarts (none planned for v1).
 
 A drop nobody consumes within 1 s, or a cancelled drag, frees the payload.
 
+### 4.1 As built in frescod (2026-11-06)
+
+The wire is in `fresco_protocol::control`:
+
+- `OP_DRAG_BEGIN` (0x0710, `DragBegin { window_id, drag_id, activation, formats }`) has no
+  reply. A refusal comes back as `EV_DRAG_END { dropped: false }`.
+- `EV_DRAG_ENTER`, `EV_DRAG_OVER` and `EV_DRAG_LEAVE` (0x0711 to 0x0713) carry
+  `DragEvent { window_id, drag_id, x, y, formats }`. `formats` is filled on `ENTER` only.
+- `EV_DROP` (0x0714) carries `DropEvent { window_id, x, y, activation }`.
+- `EV_DRAG_END` (0x0715) goes to the source.
+- fresco-client has `drag_begin` and the matching `Event`s.
+
+A begin is refused unless all of these hold:
+
+- `activation` is the button press still held (frescod remembers the last tokened press until
+  its release, and does not spend it);
+- the press went to `window_id`, a window of the caller's that has focus;
+- no other drag is on;
+- `drag_id` is non-zero;
+- the formats are at most 8 printable-ASCII MIME types of at most 64 bytes.
+
+While the button is held, frescod hit-tests the pointer and sends `ENTER`, `OVER` and `LEAVE`
+to the window under it. Only that window's owner gets these.
+
+On release over a window, frescod mints a `DROP` token for that window's app uid, bound to the
+`drag_id`, and sends `EV_DROP`. The source gets `EV_DRAG_END { dropped }`. Consuming a `DROP`
+token returns its `drag_id` and needs no focus, since the drop target is often a background
+window. A destroyed source window ends the drag.
+
+In split mode the same events travel as fresco-split records:
+
+- renderer to frescod: `DRAG_FORMAT`, then `DRAG_BEGIN`;
+- frescod to renderer: `DRAG_OFFER`, `DRAG`, `DROP` and `DRAG_END`.
+
+Tested by a frescod unit test, and by `atrium-activation-probe` in the VM in both modes. The
+probe drags from one app's window to another's: a begin without the held press is refused, the
+target gets `ENTER` with the formats, then `OVER` and `EV_DROP`, and the source gets
+`dropped: true`. The drop token is refused as a paste and spends as that drag's `DROP`.
+
+Not yet built: a drag image (the cursor only), and Escape to cancel.
+
 ## 5. Notifications (Praeco), for the same split
 
 - `praecod` (`CLASS_NOTIFY` = 3) takes `POST` from apps with `notify = true`; the wire is
