@@ -96,6 +96,9 @@ pub struct Connection {
     incoming_uploads:  HashMap<Hash, IncomingUpload>,
     /// Fds received with messages, in arrival order, until `take_fds`.
     infds: VecDeque<OwnedFd>,
+    /// Service messages that arrived while an upload waited for its ACK
+    /// (events from a busy peer): delivered next, in order.
+    held: VecDeque<(Header, Vec<u8>)>,
 }
 
 #[derive(Debug)]
@@ -129,6 +132,7 @@ impl Connection {
             _outbound_uploads: HashMap::new(),
             incoming_uploads:  HashMap::new(),
             infds: VecDeque::new(),
+            held: VecDeque::new(),
         })
     }
 
@@ -242,7 +246,7 @@ impl Connection {
     /// Whether a complete envelope is buffered — or a malformed header,
     /// which `try_recv_message` will report. Does not read the socket.
     pub fn has_buffered_message(&self) -> bool {
-        !matches!(self.buffered_envelope_len(), Ok(None))
+        !self.held.is_empty() || !matches!(self.buffered_envelope_len(), Ok(None))
     }
 
     /// Serve from the receive buffer only: decode buffered envelopes,
@@ -271,6 +275,9 @@ impl Connection {
     }
 
     fn pop_envelope(&mut self) -> io::Result<Option<(Header, Vec<u8>)>> {
+        if let Some(env) = self.held.pop_front() {
+            return Ok(Some(env));
+        }
         let Some(total) = self.buffered_envelope_len()? else { return Ok(None) };
         let h = Header::decode(&self.inbuf[..envelope::HEADER_LEN])?;
         let payload = self.inbuf[envelope::HEADER_LEN..total].to_vec();
@@ -455,22 +462,29 @@ impl Connection {
     /// Synchronous helper to consume from the wire until a specific
     /// CLASS_CORE op arrives. Used by the upload state machine.
     fn recv_message_until_class(&mut self, class: u8, op: u16) -> io::Result<Hash> {
+        // Messages already held came before this wait: set them aside so
+        // the reads below see only new envelopes, then put them first.
+        let earlier = std::mem::take(&mut self.held);
+        let mut late = VecDeque::new();
+        let r = self.recv_until_class_inner(class, op, &mut late);
+        self.held = earlier;
+        self.held.extend(late);
+        r
+    }
+
+    fn recv_until_class_inner(&mut self, class: u8, op: u16, late: &mut VecDeque<(Header, Vec<u8>)>) -> io::Result<Hash> {
         loop {
             let (h, payload) = self.read_envelope()?;
             if h.opcode_class == class && h.op == op {
                 return cas::decode_hash_msg(&payload).map_err(io_invalid);
             }
-            /* Anything else: process via handle_core or buffer.
-             * For the first pass, only let CORE through; reject
-             * service-class messages that arrive mid-upload. */
+            /* CORE traffic is handled now; service messages (a peer's
+             * events, which don't wait for our upload) are held and
+             * delivered next, in order. */
             if h.opcode_class == CLASS_CORE {
                 let _ = self.handle_core(h.op, &payload)?;
             } else {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    format!("unexpected service message (class {}) mid-upload",
-                        h.opcode_class),
-                ));
+                late.push_back((h, payload));
             }
         }
     }
@@ -572,6 +586,31 @@ mod tests {
         let cb = server.join().unwrap();
         let mut cb = cb;
         assert!(cb.cache_get(&h).is_some());
+    }
+
+    /// Events the peer sends while an upload waits for its ACK are kept,
+    /// in order, and delivered after it.
+    #[test]
+    fn events_during_an_upload_wait_are_kept() {
+        let (a, b) = UnixStream::pair().unwrap();
+        let mut ca = Connection::wrap(a).unwrap();
+        let mut cb = Connection::wrap(b).unwrap();
+        // One event already buffered, one sent while the upload is going.
+        cb.send_message(9, 1, 0, b"first").unwrap();
+        let server = thread::spawn(move || {
+            cb.send_message(9, 2, 0, b"second").unwrap();
+            let _ = cb.recv_message_or_timeout(Duration::from_secs(2));
+            cb
+        });
+        let h = ca.upload_blob(b"the answer is 42").unwrap();
+        assert_eq!(h, cas::hash(b"the answer is 42"));
+        let _cb = server.join().unwrap();
+
+        assert!(ca.has_buffered_message());
+        let m = ca.recv_message().unwrap();
+        assert_eq!((m.op, m.payload.as_slice()), (1, &b"first"[..]));
+        let m = ca.recv_message().unwrap();
+        assert_eq!((m.op, m.payload.as_slice()), (2, &b"second"[..]));
     }
 
     /// Round-trip a blob that requires DATA frames.
