@@ -72,7 +72,8 @@ password, and only with the item the user picked. An item can mark its username 
    token for that press. Because the slot is Arca's surface, the token is bound to Arca's
    uid and window, and the app never sees the event (limen.md §6).
 3. Arca spends the token with frescod, using a new purpose, `FILL`. The consumer allowlist
-   gets `_arca`. On top of the checks in tabula.md §2.2, frescod requires the slot to have
+   gets `_arca-ui`, Arca's jailed credential provider (arcad itself takes no frescod
+   events). On top of the checks in tabula.md §2.2, frescod requires the slot to have
    been **visible** in the sense of §4.
 4. Arca marks its field as filled, showing a fixed number of bullets. It fills the app's
    username field on the same press, through Limen's `filled { username }` message (§8).
@@ -135,7 +136,8 @@ ends the run.
 the press and lasted until the press. A press that doesn't qualify is refused `OBSCURED` and is
 not spent. Visibility is checked before focus, so a click that lands while a cover is up answers
 `OBSCURED` even if the cover took focus. A `FILL` accepts a click, or Enter (or keypad Enter) in the slot; ordinary typing is
-refused `WRONG_KIND`. The default consumers gain `_arca`.
+refused `WRONG_KIND`. The default consumers gain `_arca-ui` (uid 65021), the provider that
+owns the slot; arcad never spends tokens.
 
 **The frame.** frescod draws a gold ring and a key tab around each slot that is fit to fill on
 this frame: in split mode as part of its chrome, in direct mode (no strip) as a layer of its own
@@ -222,7 +224,7 @@ modes. Limen's role and Pergola's side are in §8.1.
   `handle { CredentialHandle }`, `cleared`. There's no message that carries the value.
 - **`CredentialHandle`**: 16 random bytes, meaningful only on this app's Arca channel, for
   one submit. It expires when the slot detaches or after 10 minutes.
-- **frescod**: press purpose `FILL`, consumer `_arca`, refusal `OBSCURED`, the `credential`
+- **frescod**: press purpose `FILL`, consumer `_arca-ui`, refusal `OBSCURED`, the `credential`
   slot's z-policy, and the 500 ms visibility record (Fresco thread).
 - **Pergola**: `CredentialField`, a widget that asks for the slot and lays it out. It
   exposes the handle and `is_filled()`, and nothing else. `TextField::secret` stays for

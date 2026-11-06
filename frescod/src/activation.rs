@@ -302,7 +302,7 @@ pub fn consumers() -> Vec<u32> {
     if let Ok(s) = std::env::var("FRESCOD_ACTIVATION_UIDS") {
         return s.split(',').filter_map(|u| u.trim().parse().ok()).collect();
     }
-    ["_tabula", "_share", "_praeco", "_arca"].iter().filter_map(|n| uid_of(n)).collect()
+    ["_tabula", "_share", "_praeco", "_arca-ui"].iter().filter_map(|n| uid_of(n)).collect()
 }
 
 fn uid_of(name: &str) -> Option<u32> {
