@@ -63,6 +63,9 @@ pub struct AudioOut {
     started: bool,
     pub lost: bool,
     pub underruns: u64,
+    /// At the end: asked Lyra to say when the last frame is heard, and it did.
+    drain_sent: bool,
+    drained: bool,
     buf: Vec<f32>,
     /// Rate other than 1: the PCM goes through WSOLA first.
     stretch: Option<Wsola>,
@@ -89,6 +92,8 @@ impl AudioOut {
             started: false,
             lost: false,
             underruns: 0,
+            drain_sent: false,
+            drained: false,
             buf: vec![0f32; 48_000 * 8],
             stretch: None,
             rate: 1.0,
@@ -119,6 +124,8 @@ impl AudioOut {
         self.written_until = None;
         self.from_ns = Some(to_ns);
         self.stretch = None;
+        self.drain_sent = false;
+        self.drained = false;
     }
 
     /// Play at `rate` (0.25 to 4) with the pitch kept. Takes effect from
@@ -155,6 +162,7 @@ impl AudioOut {
                     self.flushing = false;
                 }
                 Ok(Some(ToApp::Underrun { frames, .. })) => self.underruns += frames,
+                Ok(Some(ToApp::Drained { .. })) => self.drained = self.drain_sent,
                 Ok(Some(ToApp::StreamLost { .. })) | Err(_) => {
                     self.lost = true;
                     break;
@@ -194,6 +202,12 @@ impl AudioOut {
             let (n, pts) = p.read_pcm(&mut buf[..want]);
             if n == 0 {
                 self.buf = buf;
+                if ended && self.started && !self.drain_sent && self.stretch.as_ref().map_or(true, |w| w.ready() == 0) {
+                    // Everything is written: the last partial period plays
+                    // out, and `Drained` says when it has been heard.
+                    self.drain_sent = true;
+                    self.lost |= self.client.drain(&self.stream).is_err();
+                }
                 break;
             }
             let Some(mut pts) = pts else {
@@ -243,6 +257,21 @@ impl AudioOut {
             }
         }
         !self.lost
+    }
+
+    /// The last frame of the clip has been heard.
+    pub fn drained(&self) -> bool {
+        self.drained
+    }
+
+    /// The stream's clock page as it reads now.
+    pub fn stream_clock(&self) -> Clock {
+        self.stream.clock()
+    }
+
+    /// The stream position after the last frame written.
+    pub fn written_frames(&self) -> u64 {
+        self.next_frame
     }
 
     /// The current run's (stream frame, media ns).

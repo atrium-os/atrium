@@ -263,8 +263,21 @@ Fresco's layers land.
   line up. `SetRate` plays at 0.25 to 4 times with the pitch kept: a streaming WSOLA
   (`wsola.rs`, 20 ms Hann segments, ±8 ms search). The new rate takes effect from a seek to
   where playback is. At 1.5 times, the clock runs 1.5 times as fast and the clip plays a third
-  shorter. WSOLA keeps its last segment (about 30 ms) at the end of a clip. The run on real
-  lyrad in the VM is still to do.
+  shorter. WSOLA keeps its last segment (about 30 ms) at the end of a clip. At the end the stream is
+  drained (`Drain`, then `Drained`), so the last partial period is heard.
+- M6 on real lyrad in the VM (lyrad as `_lyra` on QEMU's HDA, choragusd as `_choragus`, the
+  player as registry app `appa`, `examples/audio_play.rs`), with `vp9-opus.webm`'s 440 Hz
+  tone read back from `LYRA_DUMP`:
+
+  | rate | clock (media s per s) | sound heard | expected | pitch | underruns |
+  |------|----------------------|-------------|----------|-------|-----------|
+  | 1    | 0.995 | 2.000 s | 2.014 s | 439.5 Hz | 0 |
+  | 1.5  | 1.500 | 1.327 s | 1.342 s | 440.0 Hz | 0 |
+  | 0.75 | 0.749 | 2.647 s | 2.685 s | 439.7 Hz | 0 |
+
+  The level is the same at every rate. Lyra's own VM check passes on the same boot. A/V skew
+  against vblank isn't measured here, because headless frescod under TCG captures at most
+  every 200 ms; that needs the Mac's VM or hardware.
 - Known gaps: a WebM with its Cues at the end can only seek within what is read ahead,
   otherwise it reads again from the start and drops frames up to the target (reading Cues
   through the SeekHead is an M7 item). The stream's colour info isn't read yet, so the layer

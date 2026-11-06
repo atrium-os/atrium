@@ -35,5 +35,9 @@ aqueduct = { path = "../../aqueduct" }
 png      = "0.17"
 
 [[example]]
+name = "atrium-audio-play"
+path = "examples/audio_play.rs"
+
+[[example]]
 name = "atrium-media-probe"
 path = "examples/media_probe.rs"
