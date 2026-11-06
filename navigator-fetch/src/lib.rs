@@ -8,6 +8,7 @@
 
 pub mod addr;
 pub mod http;
+pub mod nuntius;
 pub mod prefetch;
 #[cfg(target_os = "freebsd")]
 pub mod sandbox;
@@ -153,7 +154,15 @@ enum Conn {
     Tls(Box<rustls::StreamOwned<rustls::ClientConnection, TcpStream>>),
 }
 
+impl std::io::Read for Conn {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        match self { Conn::Plain(s) => s.read(buf), Conn::Tls(s) => s.read(buf) }
+    }
+}
+
 impl Conn {
+    fn tcp(&self) -> &TcpStream { match self { Conn::Plain(s) => s, Conn::Tls(s) => s.get_ref() } }
+
     /// One request and its response; with `range`, the request asks for
     /// `(start, len)` and at most `cap` body bytes are read.
     fn exchange(&mut self, host_header: &str, path: &str, keep: bool, range: Option<(u64, u64)>, cap: Option<usize>) -> Result<(http::Response, bool), FetchError> {
@@ -338,6 +347,81 @@ impl<'a> Conversation<'a> {
             if v.len() < MAX_IDLE_PER_ORIGIN { v.push(c) }
         }
         Ok(resp)
+    }
+}
+
+/// ★ A RESPONSE BEING STREAMED (Nuntius, nuntius.md §3): its head, read;
+/// its body, read in pieces on demand.
+pub struct Stream {
+    /// The URL the response came from, after redirects.
+    pub url: String,
+    pub redirects: usize,
+    pub head: http::Head,
+    body: http::Body,
+    conn: Conn,
+    /// The socket, to shut down from another thread (a cancel is at once).
+    pub sock: TcpStream,
+}
+
+impl Stream {
+    /// Up to `max` more body bytes; `Ok(None)` at its delimited end.
+    pub fn read(&mut self, max: usize) -> Result<Option<Vec<u8>>, FetchError> {
+        self.body.next(&mut self.conn, max).map_err(FetchError::Http)
+    }
+    /// How long a read may wait for a byte (the idle timeout).
+    pub fn set_idle(&self, d: Duration) { self.sock.set_read_timeout(Some(d.max(Duration::from_millis(1)))).ok(); }
+}
+
+impl<'a> Conversation<'a> {
+    /// ★ A request whose body is STREAMED (Nuntius): `head_only` for a
+    /// `HEAD`, `range` `(first byte, length or to the end)`, `If-Range` with
+    /// a validator, an `Accept`. Everything else is `fetch`'s: the URL
+    /// checks, the address rule and the pins, at most `MAX_REDIRECTS`
+    /// redirects and none that downgrade. `head_wait` bounds the wait for
+    /// the response's head (connect, TLS and the server's first answer);
+    /// the connection is never reused.
+    pub fn open_stream(&mut self, url: &str, head_only: bool, range: Option<(u64, Option<u64>)>, if_range: Option<&str>,
+                       accept: Option<&str>, head_wait: Duration) -> Result<Stream, FetchError> {
+        let mut current = url::Url::parse(url).map_err(|e| FetchError::BadUrl(e.to_string()))?;
+        for redirects in 0..=MAX_REDIRECTS {
+            let https = match current.scheme() { "https" => true, "http" => false, s => return Err(FetchError::Refused(format!("scheme {s}"))) };
+            if !current.username().is_empty() || current.password().is_some() { return Err(FetchError::Refused("credentials in URL".into())) }
+            let host = current.host_str().ok_or_else(|| FetchError::BadUrl("no host".into()))?.to_string();
+            let port = current.port_or_known_default().unwrap_or(0);
+            if port != 80 && port != 443 { return Err(FetchError::Refused(format!("port {port}"))) }
+            let literal = match current.host() {
+                Some(url::Host::Ipv4(a)) => Some(IpAddr::V4(a)),
+                Some(url::Host::Ipv6(a)) => Some(IpAddr::V6(a)),
+                _ => None,
+            };
+            if let Some(ip) = literal {
+                self.policy.admit(ip).map_err(|range| FetchError::NonPublicAddress { host: host.clone(), addr: ip, range })?;
+            }
+            let host_header = match current.port() { Some(p) => format!("{host}:{p}"), None => host.clone() };
+            let mut path = current.path().to_string();
+            if let Some(q) = current.query() { path.push('?'); path.push_str(q) }
+            let lookup = host.trim_start_matches('[').trim_end_matches(']').to_string();
+            let mut c = self.connect(&lookup, port, https, &host)?;
+            let sock = c.tcp().try_clone().map_err(|e| FetchError::Connect(e.to_string()))?;
+            sock.set_read_timeout(Some(head_wait.max(Duration::from_millis(1)))).ok();
+            let w = match &mut c {
+                Conn::Plain(s) => http::write_request_full(s, &host_header, &path, head_only, range, if_range, accept).map_err(|e| FetchError::Connect(e.to_string())),
+                Conn::Tls(s) => http::write_request_full(s, &host_header, &path, head_only, range, if_range, accept).map_err(|e| FetchError::Tls(e.to_string())),
+            };
+            w?;
+            let (head, rest) = http::read_head(&mut c, head_only).map_err(FetchError::Http)?;
+            if matches!(head.status, 301 | 302 | 303 | 307 | 308) {
+                let loc = head.header("location").ok_or(FetchError::Http(http::HttpError::Malformed("redirect without Location")))?;
+                let next = current.join(loc).map_err(|e| FetchError::BadUrl(e.to_string()))?;
+                if current.scheme() == "https" && next.scheme() != "https" { return Err(FetchError::Refused(format!("redirect downgrades to {next}"))) }
+                let _ = sock.shutdown(std::net::Shutdown::Both);
+                current = next;
+                continue;
+            }
+            let body = http::Body::new(&head, rest);
+            return Ok(Stream { url: current.to_string(), redirects, head, body, conn: c, sock });
+        }
+        Err(FetchError::TooManyRedirects)
     }
 }
 

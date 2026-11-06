@@ -241,9 +241,191 @@ fn read_chunked(rest: &mut Vec<u8>, r: &mut impl Read, cap: usize) -> Result<(Ve
     }
 }
 
+// ---------------------------------------------------------------------------
+// ★ STREAMING (Nuntius, nuntius.md §3): a response's head, then its body in
+// pieces as it arrives, never more than the caller asks for at a time. The
+// same bounds as above: a head of at most MAX_HEADER_BYTES, chunk-size lines
+// of at most 1 KiB, no compressed body; the body has no total cap here (the
+// caller's `max_bytes` and flow control bound it).
+// ---------------------------------------------------------------------------
+
+/// A request, as Nuntius makes it: `GET` or `HEAD`, a range `(first byte,
+/// length)` or from the first byte to the end, `If-Range` with a validator,
+/// an `Accept`. Still nothing that identifies the reader.
+pub fn write_request_full(w: &mut impl Write, host_header: &str, path_and_query: &str, head_only: bool,
+                          range: Option<(u64, Option<u64>)>, if_range: Option<&str>, accept: Option<&str>) -> io::Result<()> {
+    let method = if head_only { "HEAD" } else { "GET" };
+    let clean = |v: &str| v.chars().filter(|c| !c.is_control()).collect::<String>();
+    let range = match range {
+        Some((s, Some(n))) if n > 0 => format!("Range: bytes={s}-{}\r\n", s + n - 1),
+        Some((s, None)) => format!("Range: bytes={s}-\r\n"),
+        _ => String::new(),
+    };
+    let if_range = match if_range { Some(v) if !range.is_empty() => format!("If-Range: {}\r\n", clean(v)), _ => String::new() };
+    let accept = clean(accept.unwrap_or("*/*"));
+    write!(w, "{method} {path_and_query} HTTP/1.1\r\nHost: {host_header}\r\n\
+               User-Agent: atrium-navigator-fetch/0.1\r\nAccept: {accept}\r\n\
+               Accept-Encoding: identity\r\n{range}{if_range}Connection: close\r\n\r\n")?;
+    w.flush()
+}
+
+/// How a streamed body ends.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Framing { Length(u64), Chunked, Close, Empty }
+
+/// A response's status line and headers.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Head { pub status: u16, pub headers: Vec<(String, String)>, pub framing: Framing }
+
+impl Head {
+    pub fn header(&self, name: &str) -> Option<&str> { self.headers.iter().find(|(k, _)| k == name).map(|(_, v)| v.as_str()) }
+}
+
+/// Read a response's head (`head_only`: a `HEAD`, which has no body).
+/// Returns the head and the body bytes already read past it.
+pub fn read_head(r: &mut impl Read, head_only: bool) -> Result<(Head, Vec<u8>), HttpError> {
+    let (head, rest) = read_until_headers_end(r)?;
+    let head = std::str::from_utf8(&head).map_err(|_| HttpError::Malformed("non-UTF-8 header"))?;
+    let mut lines = head.split("\r\n");
+    let status_line = lines.next().ok_or(HttpError::Malformed("no status line"))?;
+    let mut parts = status_line.splitn(3, ' ');
+    if !parts.next().unwrap_or("").starts_with("HTTP/1.") { return Err(HttpError::Malformed("not HTTP/1.x")) }
+    let status: u16 = parts.next().and_then(|s| s.parse().ok()).ok_or(HttpError::Malformed("bad status"))?;
+    let mut headers = vec![];
+    for l in lines.filter(|l| !l.is_empty()) {
+        let (k, v) = l.split_once(':').ok_or(HttpError::Malformed("header without colon"))?;
+        headers.push((k.trim().to_ascii_lowercase(), v.trim().to_string()));
+    }
+    let h = |n: &str| headers.iter().find(|(k, _)| k == n).map(|(_, v)| v.clone());
+    if let Some(enc) = h("content-encoding") {
+        if !enc.eq_ignore_ascii_case("identity") { return Err(HttpError::Encoded(enc)) }
+    }
+    let framing = if head_only || (100..200).contains(&status) || status == 204 || status == 304 { Framing::Empty }
+        else if h("transfer-encoding").is_some_and(|t| t.to_ascii_lowercase().contains("chunked")) { Framing::Chunked }
+        else if let Some(cl) = h("content-length") { Framing::Length(cl.parse().map_err(|_| HttpError::Malformed("bad content-length"))?) }
+        else { Framing::Close };
+    Ok((Head { status, headers, framing }, rest))
+}
+
+/// A body, read piece by piece.
+pub struct Body { rest: Vec<u8>, framing: Framing, left: u64, chunk_left: u64, done: bool }
+
+impl Body {
+    pub fn new(head: &Head, rest: Vec<u8>) -> Body {
+        let left = match head.framing { Framing::Length(n) => n, _ => 0 };
+        Body { rest, framing: head.framing, left, chunk_left: 0, done: head.framing == Framing::Empty || left == 0 && matches!(head.framing, Framing::Length(_)) }
+    }
+
+    /// Up to `max` more bytes; `Ok(None)` at the body's delimited end. A
+    /// connection that closes before a stated length or the last chunk is
+    /// an error (the caller resumes), never a short body taken as whole.
+    pub fn next(&mut self, r: &mut impl Read, max: usize) -> Result<Option<Vec<u8>>, HttpError> {
+        if self.done || max == 0 { return Ok(if self.done { None } else { Some(vec![]) }) }
+        match self.framing {
+            Framing::Empty => { self.done = true; Ok(None) }
+            Framing::Length(_) => {
+                let want = (self.left as usize).min(max);
+                let got = self.take(r, want, true)?;
+                self.left -= got.len() as u64;
+                if self.left == 0 { self.done = true }
+                Ok(Some(got))
+            }
+            Framing::Close => {
+                let got = self.take(r, max, false)?;
+                if got.is_empty() { self.done = true; return Ok(None) }
+                Ok(Some(got))
+            }
+            Framing::Chunked => {
+                if self.chunk_left == 0 {
+                    // The size line (after the previous chunk's CRLF).
+                    let line = loop {
+                        if let Some(i) = self.rest.windows(2).position(|w| w == b"\r\n") {
+                            let l = String::from_utf8(self.rest[..i].to_vec()).map_err(|_| HttpError::Malformed("chunk size"))?;
+                            self.rest.drain(..i + 2);
+                            if l.is_empty() { continue } // the CRLF after a chunk
+                            break l;
+                        }
+                        if self.rest.len() > 1024 { return Err(HttpError::Malformed("chunk size line too long")) }
+                        self.more(r)?;
+                    };
+                    let size = u64::from_str_radix(line.split(';').next().unwrap_or("").trim(), 16).map_err(|_| HttpError::Malformed("chunk size"))?;
+                    if size == 0 { self.done = true; return Ok(None) }
+                    self.chunk_left = size;
+                }
+                let want = (self.chunk_left as usize).min(max);
+                let got = self.take(r, want, true)?;
+                self.chunk_left -= got.len() as u64;
+                Ok(Some(got))
+            }
+        }
+    }
+
+    fn more(&mut self, r: &mut impl Read) -> Result<usize, HttpError> {
+        let mut chunk = [0u8; 16 * 1024];
+        let n = r.read(&mut chunk)?;
+        if n == 0 { return Err(HttpError::Malformed("connection closed inside body")) }
+        self.rest.extend_from_slice(&chunk[..n]);
+        Ok(n)
+    }
+
+    /// At most `want` bytes: what is buffered, else one read. With
+    /// `delimited`, a close is an error; otherwise it is the end.
+    fn take(&mut self, r: &mut impl Read, want: usize, delimited: bool) -> Result<Vec<u8>, HttpError> {
+        if self.rest.is_empty() {
+            let mut chunk = vec![0u8; want.min(64 * 1024)];
+            let n = r.read(&mut chunk)?;
+            if n == 0 {
+                if delimited { return Err(HttpError::Malformed("connection closed inside body")) }
+                return Ok(vec![]);
+            }
+            chunk.truncate(n);
+            return Ok(chunk);
+        }
+        let n = want.min(self.rest.len());
+        Ok(self.rest.drain(..n).collect())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_streamed_body_comes_in_pieces_and_a_short_one_is_an_error() {
+        let raw = b"HTTP/1.1 206 Partial\r\nContent-Length: 10\r\nContent-Range: bytes 5-14/100\r\n\r\n0123456789";
+        let mut r = &raw[..];
+        let (h, rest) = read_head(&mut r, false).unwrap();
+        assert_eq!((h.status, h.framing), (206, Framing::Length(10)));
+        let mut b = Body::new(&h, rest);
+        assert_eq!(b.next(&mut r, 4).unwrap().unwrap(), b"0123");
+        assert_eq!(b.next(&mut r, 100).unwrap().unwrap(), b"456789");
+        assert_eq!(b.next(&mut r, 100).unwrap(), None);
+        let raw = b"HTTP/1.1 200 OK\r\nContent-Length: 10\r\n\r\n0123";
+        let mut r = &raw[..];
+        let (h, rest) = read_head(&mut r, false).unwrap();
+        let mut b = Body::new(&h, rest);
+        assert_eq!(b.next(&mut r, 100).unwrap().unwrap(), b"0123");
+        assert!(b.next(&mut r, 100).is_err(), "closed before the stated length");
+        let raw = b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n4\r\nWiki\r\n5\r\npedia\r\n0\r\n\r\n";
+        let mut r = &raw[..];
+        let (h, rest) = read_head(&mut r, false).unwrap();
+        let mut b = Body::new(&h, rest);
+        let mut all = vec![];
+        while let Some(p) = b.next(&mut r, 3).unwrap() { all.extend(p) }
+        assert_eq!(all, b"Wikipedia");
+    }
+
+    #[test]
+    fn a_full_request_asks_for_the_range_with_its_validator() {
+        let mut out = vec![];
+        write_request_full(&mut out, "a.test", "/v.webm", false, Some((1000, None)), Some("\"abc\""), Some("video/*")).unwrap();
+        let s = String::from_utf8(out).unwrap();
+        assert!(s.contains("Range: bytes=1000-\r\nIf-Range: \"abc\"\r\n") && s.contains("Accept: video/*"), "{s}");
+        let mut out = vec![];
+        write_request_full(&mut out, "a.test", "/v", true, None, Some("x"), None).unwrap();
+        let s = String::from_utf8(out).unwrap();
+        assert!(s.starts_with("HEAD /v HTTP/1.1") && !s.contains("If-Range"), "no If-Range without a Range");
+    }
 
     fn parse(raw: &[u8]) -> Result<Response, HttpError> { read_response(&mut &raw[..]) }
 
