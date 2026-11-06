@@ -464,10 +464,14 @@ checksum = "9f7c3e4beb33f85d45ae3e3a1792185706c8e16d043238c593331cc7cd313b50"
 name = "pergola"
 version = "0.1.0"
 dependencies = [
+ "aqueduct",
  "fresco-client",
  "fresco-protocol",
  "futures-signals",
  "log",
+ "postcard",
+ "serde",
+ "tabula",
  "taffy",
 ]
 
@@ -506,6 +510,13 @@ dependencies = [
  "portcullis-toml",
  "serde",
  "serde_json",
+]
+
+[[package]]
+name = "portcullis-peer"
+version = "0.1.0"
+dependencies = [
+ "libc",
 ]
 
 [[package]]
@@ -759,6 +770,17 @@ dependencies = [
  "proc-macro2",
  "quote",
  "unicode-ident",
+]
+
+[[package]]
+name = "tabula"
+version = "0.1.0"
+dependencies = [
+ "aqueduct",
+ "fresco-protocol",
+ "portcullis-peer",
+ "postcard",
+ "serde",
 ]
 
 [[package]]

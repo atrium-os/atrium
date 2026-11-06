@@ -562,10 +562,14 @@ checksum = "384b8ab6d37215f3c5301a95a4accb5d64aa607f1fcb26a11b5303878451b4fe"
 name = "pergola"
 version = "0.1.0"
 dependencies = [
+ "aqueduct",
  "fresco-client",
  "fresco-protocol",
  "futures-signals",
  "log",
+ "postcard",
+ "serde",
+ "tabula",
  "taffy",
 ]
 
@@ -608,6 +612,13 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c2a106d1259c23fac8e543272398ae0e3c0b8d33c88ed73d0cc71b0f1d902618"
 dependencies = [
  "portable-atomic",
+]
+
+[[package]]
+name = "portcullis-peer"
+version = "0.1.0"
+dependencies = [
+ "libc",
 ]
 
 [[package]]
@@ -861,6 +872,17 @@ dependencies = [
  "proc-macro2",
  "quote",
  "unicode-ident",
+]
+
+[[package]]
+name = "tabula"
+version = "0.1.0"
+dependencies = [
+ "aqueduct",
+ "fresco-protocol",
+ "portcullis-peer",
+ "postcard",
+ "serde",
 ]
 
 [[package]]
