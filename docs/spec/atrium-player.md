@@ -117,6 +117,14 @@ test clips.
   thread count), and its output is checked against the container's declared size.
 - The FFI is one `unsafe` module per library, reviewed as such, with the rest of the crate
   safe.
+- **Pure-Rust decoders later** (Shankar, 2026-11-06). The C libraries are v1 because they
+  are the mature ones. Each can be swapped behind `Decoder` once a Rust decoder passes the
+  codec's conformance vectors and our fuzzing. Checked 2026-11-06: rav1d (AV1, BSD-2) is a
+  translation of dav1d that still uses dav1d's assembly and 500-odd `unsafe` blocks, and its
+  last release (1.1.0, 2025-05) tracks dav1d 1.5.1. lewton (Vorbis, MIT/Apache) is widely
+  used, but its last release was in 2021. rusty_vp9 (VP9, Apache-2.0, first released
+  2026-07) and opus-rs (BSD-3, 2026-02) or ruopus (MIT, 2026-06) for Opus claim conformance,
+  but they are months old and the claims are their own.
 
 ## 5. Timing and A/V sync
 
