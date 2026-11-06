@@ -23,6 +23,8 @@ fresco-protocol = { path = "../../fresco-protocol" }
 aqueduct        = { path = "../../aqueduct" }
 portcullis-peer = { path = "../../portcullis/portcullis-peer" }
 postcard        = { version = "1", features = ["use-std"] }
+# Only for the visual language's tokens (pergola::theme::Semantic).
+pergola         = { path = "../../pergola" }
 libc            = "0.2"
 
 [dev-dependencies]

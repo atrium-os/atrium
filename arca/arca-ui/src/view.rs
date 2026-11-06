@@ -7,13 +7,16 @@ use std::io;
 
 use fresco_client::Connection;
 use fresco_protocol::RectParams;
+use pergola::theme::Semantic;
 
 use crate::field::{Field, Offer};
 
 pub const FONT_PX: f32 = 13.0;
 /// A rough advance for truncation; frescod shapes the real run.
 const CHAR_PX: f32 = 7.0;
-const PAD: f32 = 4.0;
+/// The field's edge sits inside the slot, leaving room for the focus halo
+/// and ring (visual language rev. 2): halo 2 px, ring 1 px, gap 1 px.
+const PAD: f32 = 6.0;
 const BULLET: f32 = 7.0;
 const BULLET_STEP: f32 = 10.0;
 
@@ -74,33 +77,51 @@ pub fn chip_text(f: &Field, recipient: &str) -> Option<String> {
     })
 }
 
-fn rect(x: f32, y: f32, w: f32, h: f32, c: [f32; 4], radius: f32) -> RectParams {
-    RectParams { x, y, w, h, r: c[0], g: c[1], b: c[2], a: c[3], radius }
+fn rect(x: f32, y: f32, w: f32, h: f32, c: pergola::Color, radius: f32) -> RectParams {
+    RectParams { x, y, w: w.max(0.0), h: h.max(0.0), r: c.r, g: c.g, b: c.b, a: c.a, radius }
 }
 
-pub fn draw(conn: &mut Connection, font: u32, f: &Field, recipient: &str, w: f32, h: f32) -> io::Result<()> {
+fn rgba(c: pergola::Color) -> [f32; 4] {
+    [c.r, c.g, c.b, c.a]
+}
+
+/// Draw with Pergola's semantic tokens (visual language rev. 2). Light
+/// until the system setting for the mode lands.
+pub fn draw(conn: &mut Connection, font: u32, f: &Field, recipient: &str, hover: bool, w: f32, h: f32) -> io::Result<()> {
+    let t = Semantic::LIGHT;
     let l = layout(f, w, h);
-    let border = if f.focused { [0.20, 0.42, 0.85, 1.0] } else { [0.62, 0.64, 0.68, 1.0] };
     let mut fr = conn.frame()?;
-    fr.rect(rect(0.0, 0.0, w, h, border, 5.0))?;
-    fr.rect(rect(1.5, 1.5, w - 3.0, h - 3.0, [1.0, 1.0, 1.0, 1.0], 4.0))?;
+    if f.focused {
+        // A 2 px accent halo, the 1 px focus ring, then the field's fill.
+        fr.rect(rect(0.0, 0.0, w, h, t.accent_bg(), 6.0))?;
+        fr.rect(rect(2.0, 2.0, w - 4.0, h - 4.0, t.focus_ring(), 5.0))?;
+        fr.rect(rect(3.0, 3.0, w - 6.0, h - 6.0, t.bg_canvas(), 4.0))?;
+    } else {
+        let edge = if hover { t.border_control() } else { t.border_strong() };
+        fr.rect(rect(0.0, 0.0, w, h, t.bg_canvas(), 0.0))?;
+        fr.rect(rect(3.0, 3.0, w - 6.0, h - 6.0, edge, 4.0))?;
+        fr.rect(rect(4.0, 4.0, w - 8.0, h - 8.0, t.bg_canvas(), 3.0))?;
+    }
     let shown = f.bullets().min(l.bullets_max);
     let cy = (h - BULLET) / 2.0;
     for i in 0..shown {
-        fr.rect(rect(2.0 * PAD + i as f32 * BULLET_STEP, cy, BULLET, BULLET, [0.12, 0.12, 0.14, 1.0], BULLET / 2.0))?;
+        fr.rect(rect(2.0 * PAD + i as f32 * BULLET_STEP, cy, BULLET, BULLET, t.text_primary(), BULLET / 2.0))?;
     }
     if f.focused && l.chip.is_none() {
         let x = 2.0 * PAD + shown as f32 * BULLET_STEP;
-        fr.rect(rect(x, h * 0.22, 1.5, h * 0.56, [0.20, 0.42, 0.85, 1.0], 0.0))?;
+        fr.rect(rect(x, h * 0.25, 1.5, h * 0.5, t.accent_fg(), 0.0))?;
     }
     if let (Some(c), Some(text)) = (l.chip, chip_text(f, recipient)) {
-        let refusal = f.notice.is_some();
-        let bg = if refusal { [0.99, 0.91, 0.90, 1.0] } else { [0.90, 0.94, 1.0, 1.0] };
-        let fg = if refusal { [0.65, 0.10, 0.08, 1.0] } else { [0.08, 0.20, 0.50, 1.0] };
-        fr.rect(rect(c.x, c.y, c.w, c.h, bg, 4.0))?;
+        let fg = if f.notice.is_some() {
+            t.danger_fg()
+        } else {
+            fr.rect(rect(c.x, c.y, c.w, c.h, t.border_default(), 4.0))?;
+            fr.rect(rect(c.x + 1.0, c.y + 1.0, c.w - 2.0, c.h - 2.0, t.bg_elevated(), 3.0))?;
+            t.text_primary()
+        };
         if font != 0 {
-            let t = truncate(&text, c.w - 2.0 * PAD);
-            fr.text_run(font, FONT_PX, c.x + PAD + 2.0, c.y + c.h / 2.0 + FONT_PX * 0.35, fg, t)?;
+            let s = truncate(&text, c.w - 2.0 * PAD);
+            fr.text_run(font, FONT_PX, c.x + PAD, c.y + c.h / 2.0 + FONT_PX * 0.35, rgba(fg), s)?;
         }
     }
     fr.finish()

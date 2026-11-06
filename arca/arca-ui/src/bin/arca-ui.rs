@@ -38,6 +38,7 @@ struct Embed {
     parent: Option<Parent>,
     field: Field,
     size: (f32, f32),
+    hover: bool,
     dirty: bool,
 }
 
@@ -190,7 +191,7 @@ fn main() -> ExitCode {
                     if parent.is_none() {
                         field.notice = Some(Notice::UnknownApp);
                     }
-                    let mut e = Embed { win, window_id, font, parent, field, size: (240.0, 36.0), dirty: true };
+                    let mut e = Embed { win, window_id, font, parent, field, size: (240.0, 36.0), hover: false, dirty: true };
                     if let Err(err) = cx.child.ready(embed, token) {
                         eprintln!("arca-ui: ready {embed}: {err:?}");
                         let _ = e.win.window_destroy(window_id);
@@ -248,7 +249,12 @@ fn main() -> ExitCode {
                         e.size = (width as f32, height as f32);
                         vec![Do::Redraw]
                     }
+                    Event::PointerMotion { .. } if !e.hover => {
+                        e.hover = true;
+                        vec![Do::Redraw]
+                    }
                     Event::FocusChanged { gained, .. } => {
+                        e.hover = false;
                         if gained {
                             cx.refresh_accounts(e);
                         }
@@ -284,7 +290,7 @@ fn main() -> ExitCode {
             if e.dirty {
                 e.dirty = false;
                 let who = e.parent.as_ref().map_or("unknown app", |p| p.app_id.as_str()).to_string();
-                if let Err(err) = view::draw(&mut e.win, e.font, &e.field, &who, e.size.0, e.size.1) {
+                if let Err(err) = view::draw(&mut e.win, e.font, &e.field, &who, e.hover, e.size.0, e.size.1) {
                     eprintln!("arca-ui: draw {id}: {err}");
                 }
             }
