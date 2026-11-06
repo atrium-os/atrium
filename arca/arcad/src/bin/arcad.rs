@@ -41,6 +41,9 @@ fn main() -> ExitCode {
         vestibulum_uid: env_uid("ARCA_VESTIBULUM_UID"),
         ui_uid: env_uid("ARCA_UI_UID"),
         allow_unsigned: std::env::var("ARCA_ALLOW_UNSIGNED").as_deref() == Ok("1"),
+        courier_registry: Some(
+            std::env::var("ARCA_COURIER_REGISTRY").unwrap_or_else(|_| arcad::courier::DEFAULT_REGISTRY.into()).into(),
+        ),
     };
     if resolver.allow_unsigned {
         eprintln!("arcad: WARNING ARCA_ALLOW_UNSIGNED=1: unsigned apps are served; development only");

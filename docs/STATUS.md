@@ -23,6 +23,7 @@ branch `atrium-os`, `gpusim:` = atrium-os/gpusim.
 | [Navigator document lane](#9-navigator-document-lane-normalizer--renderer) | corpus layout work: grid, flex, tables, RTL, UAX #14 line breaking | grid/box-alignment batch `36a341f`…`d715d05` | keep driving corpus flags down (thread "Fix Navigator corpus render flags") |
 | [Navigator backend](#10-navigator-backend) | M3 forward/back passed; M4 jailed save/restore passes in a real jail | `a168de8`, `0841678`, `b9edfe3` | — |
 | [x86_64 port](#7-x86_64-port) | A done, C done (amd64 VM, Tessera root, gpusim, navigator e2e) | `801a762`, `6273d0d`, `108098c`, `991db65` | B (Ubuntu userspace), D (driver on R9700 via VFIO), E (IPMI boot) |
+| Arca secrets ([arca.md](spec/arca.md), [arca-autofill.md](spec/arca-autofill.md)) | A0 store + jailed arcad pass the VM gates (`scripts/arca-vm-test.sh`); arca-ui credential field built; A1 courier in progress (arcad courier label + ops done) | `3d3c9b2`, `45d773d` | A1 courier binary, fuzz + redirect gates; TLS hardening list in [TLS.md](TLS.md) |
 | [Cloud dev loop](#8-cloud-dev-loop) | arm64 + amd64 FreeBSD VMs under TCG in cloud sessions | `scripts/cloud-vm.sh` | — |
 
 ## 1. Native RDNA4 GPU stack

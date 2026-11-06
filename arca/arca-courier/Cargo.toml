@@ -1,0 +1,23 @@
+[package]
+name        = "arca-courier"
+version     = "0.1.0"
+edition     = "2021"
+license     = "MIT OR Apache-2.0"
+publish     = false
+description = "Arca's courier (docs/spec/arca.md §5): one endpoint's HTTPS requests with secrets attached after TLS, from a fixed binary request schema; never follows a redirect to another endpoint; Set-Cookie goes to Arca as records."
+
+[lib]
+name = "arca_courier"
+path = "src/lib.rs"
+
+[dependencies]
+arca-store      = { path = "../arca-store" }
+arcad           = { path = "../arcad" }
+navigator-fetch = { path = "../../navigator-fetch" }
+rustls          = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+rustls-pki-types = { version = "1", features = ["std"] }
+libc            = "0.2"
+
+[dev-dependencies]
+rcgen    = { version = "0.13", default-features = false, features = ["ring", "pem"] }
+tempfile = "3"

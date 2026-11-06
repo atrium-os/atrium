@@ -14,8 +14,9 @@ use arca_store::secret::LockedBuf;
 use arca_store::{flags, Access, KdfParams, Class, Error, ItemId, Kind, LockState, NewItem, Provenance, Recipient, RootKey, Shape, Store};
 use ed25519_dalek::{Signer, SigningKey};
 
+use crate::courier::{app_persona, CourierLabel};
 use crate::label::Label;
-use crate::proto::{op, status, MAX_SIGN_MSG};
+use crate::proto::{courier_op, op, status, MAX_SIGN_MSG};
 
 /// Personas arrive with the label once insula.md §13.6 lands; until then
 /// every app item is in the user's main persona.
@@ -111,6 +112,7 @@ impl State {
             },
             Label::Vestibulum => self.vestibulum_op(op, body),
             Label::TrustedUi => self.ui_op(op, body, &mut item),
+            Label::Courier(c) => self.courier_op(c, op, body, &mut item),
             Label::Unknown => reply(status::UNKNOWN_PEER),
         };
         self.audit(who, op, item.as_ref(), r.status);
@@ -129,6 +131,10 @@ impl State {
             }
             Label::Vestibulum => "vestibulum".into(),
             Label::TrustedUi => "ui".into(),
+            Label::Courier(c) => match &c.endpoint {
+                Recipient::Endpoint { host, port, .. } => format!("courier:{host}:{port}/{}@{}", c.persona, c.user),
+                _ => "courier:?".into(),
+            },
             Label::Unknown => "unknown".into(),
         };
         let item = item.map(|i| i.hex()).unwrap_or_else(|| "-".into());
@@ -138,7 +144,10 @@ impl State {
     // ── apps ─────────────────────────────────────────────────────────────
 
     fn app_op(&mut self, user: &str, me: &Recipient, op: u16, body: &[u8], item: &mut Option<ItemId>) -> Reply {
-        if !matches!(op, op::MINT | op::PUBKEY | op::SIGN | op::STORE | op::RELEASE | op::LIST | op::DELETE) {
+        if !matches!(
+            op,
+            op::MINT | op::PUBKEY | op::SIGN | op::STORE | op::RELEASE | op::LIST | op::DELETE | op::STORE_FOR | op::LIST_FOR
+        ) {
             return reply(status::DENIED);
         }
         let Some(store) = self.stores.get_mut(user) else { return reply(status::LOCKED) };
@@ -248,9 +257,42 @@ impl State {
                 out.as_mut()[4..].copy_from_slice(v.as_ref());
                 Reply { status: status::OK, body: Body::Secret(out) }
             }
-            op::LIST => {
+            op::STORE_FOR => {
+                let kind = field!(r.u16());
+                let class = rep!(class_for_app(field!(r.u8())));
+                let account = field!(r.str(caps::ACCOUNT));
+                let endpoint = field!(crate::proto::read_endpoint(&mut r));
+                let value = field!(r.bytes(caps::VALUE));
                 field!(r.end());
-                let items = tri!(store.list(&who));
+                let Ok(kind) = Kind::from_u16(kind) else { return malformed() };
+                // Cookies are the server's to set, through its courier.
+                if kind.shape() != Shape::Bearer || kind == Kind::Cookie {
+                    return reply(status::UNSUPPORTED);
+                }
+                let Recipient::App { publisher, app_id } = me else { return reply(status::DENIED) };
+                let m = tri!(store.add(NewItem {
+                    persona: &app_persona(publisher, app_id),
+                    recipient: endpoint,
+                    class,
+                    kind,
+                    provenance: Provenance::AppMinted,
+                    account,
+                    scope: b"",
+                    value,
+                }));
+                *item = Some(m.id);
+                ok(m.id.0.to_vec())
+            }
+            op::LIST | op::LIST_FOR => {
+                let (persona, recipient) = if op == op::LIST_FOR {
+                    let ep = field!(crate::proto::read_endpoint(&mut r));
+                    let Recipient::App { publisher, app_id } = me else { return reply(status::DENIED) };
+                    (app_persona(publisher, app_id), ep)
+                } else {
+                    (PERSONA.to_string(), me.clone())
+                };
+                field!(r.end());
+                let items = tri!(store.list(&Access { persona: &persona, recipient: &recipient }));
                 let mut w = Writer::new();
                 w.u32(items.len() as u32);
                 for m in items {
@@ -470,6 +512,7 @@ impl State {
         let who = Access { persona: PERSONA, recipient: &app };
         let entry = |source, generated| Entry {
             user: user.clone(),
+            persona: PERSONA.into(),
             recipient: app.clone(),
             source,
             expires: std::time::Instant::now() + crate::handles::TTL,
@@ -542,11 +585,115 @@ impl State {
         }
     }
 
+    // ── couriers ─────────────────────────────────────────────────────────
+
+    /// A courier asks only after its TLS handshake with its endpoint, and
+    /// only for its own label's (persona, endpoint): the store's access
+    /// check and the handle's binding both use the registry's label.
+    fn courier_op(&mut self, c: &CourierLabel, op: u16, body: &[u8], item: &mut Option<ItemId>) -> Reply {
+        let mut r = Reader::new(body);
+        let who = Access { persona: &c.persona, recipient: &c.endpoint };
+        match op {
+            courier_op::FILL => {
+                let Ok(n) = r.u8() else { return malformed() };
+                let n = n as usize;
+                if n == 0 || n > courier_op::MAX_SLOTS {
+                    return malformed();
+                }
+                let mut refs = Vec::with_capacity(n);
+                for _ in 0..n {
+                    match (r.u8(), r.array::<16>()) {
+                        (Ok(s), Ok(x)) => refs.push((s, x)),
+                        _ => return malformed(),
+                    }
+                }
+                if r.end().is_err() {
+                    return malformed();
+                }
+                let Some(store) = self.stores.get(&c.user) else { return reply(status::LOCKED) };
+                let mut vals = Vec::with_capacity(n);
+                for (src, x) in refs {
+                    let v = match src {
+                        courier_op::SOURCE_ITEM => {
+                            let id = ItemId(x);
+                            *item = Some(id);
+                            let m = tri!(store.meta(&id, &who));
+                            // Cookies go by Arca's own matching (A2), never by id.
+                            if m.kind.shape() != Shape::Bearer || m.kind == Kind::Cookie {
+                                return reply(status::DENIED);
+                            }
+                            tri!(store.release(&id, &who, None)).1
+                        }
+                        courier_op::SOURCE_HANDLE => {
+                            let Some(e) = self.handles.take(&x, &c.user, &c.persona, &c.endpoint) else {
+                                return reply(status::DENIED);
+                            };
+                            match e.source {
+                                crate::handles::Source::Pending(v) => v,
+                                crate::handles::Source::Item(id) => {
+                                    *item = Some(id);
+                                    tri!(store.release(&id, &who, None)).1
+                                }
+                            }
+                        }
+                        _ => return malformed(),
+                    };
+                    vals.push(v);
+                }
+                let total: usize = vals.iter().map(|v| 4 + v.len()).sum();
+                let mut out = tri!(LockedBuf::zeroed(total).map_err(Error::Io));
+                let mut at = 0;
+                for v in &vals {
+                    out.as_mut()[at..at + 4].copy_from_slice(&(v.len() as u32).to_le_bytes());
+                    out.as_mut()[at + 4..at + 4 + v.len()].copy_from_slice(v.as_ref());
+                    at += 4 + v.len();
+                }
+                Reply { status: status::OK, body: Body::Secret(out) }
+            }
+            courier_op::SET_COOKIE => {
+                let parsed = (|| {
+                    let name = r.str(COOKIE_NAME_MAX)?;
+                    let value = r.bytes(COOKIE_VALUE_MAX)?;
+                    let attrs = r.bytes(COOKIE_ATTRS_MAX)?;
+                    r.end()?;
+                    Ok::<_, Error>((name, value, attrs))
+                })();
+                let Ok((name, value, attrs)) = parsed else { return malformed() };
+                if name.is_empty() || !name.bytes().all(is_token_char) {
+                    return malformed();
+                }
+                let Some(store) = self.stores.get_mut(&c.user) else { return reply(status::LOCKED) };
+                // One record per (endpoint, name): a new Set-Cookie replaces it.
+                let old: Vec<ItemId> = tri!(store.list(&who))
+                    .into_iter()
+                    .filter(|m| m.kind == Kind::Cookie && m.account == name)
+                    .map(|m| m.id)
+                    .collect();
+                for id in old {
+                    tri!(store.delete(&id, &who));
+                }
+                let m = tri!(store.add(NewItem {
+                    persona: &c.persona,
+                    recipient: c.endpoint.clone(),
+                    class: Class::AfterFirstUnlock,
+                    kind: Kind::Cookie,
+                    provenance: Provenance::ServerSet,
+                    account: name,
+                    scope: attrs,
+                    value,
+                }));
+                *item = Some(m.id);
+                ok(Vec::new())
+            }
+            _ => reply(status::DENIED),
+        }
+    }
+
     /// For the courier (A1) and tests: redeem a handle for the verified
     /// recipient, once. The value is in locked memory.
     pub fn redeem(&mut self, handle: &[u8; 16], user: &str, recipient: &Recipient) -> Option<LockedBuf> {
         use crate::handles::Source;
-        let e = self.handles.take(handle, user, recipient)?;
+        let e = self.handles.take(handle, user, PERSONA, recipient)?;
         match e.source {
             Source::Pending(v) => Some(v),
             Source::Item(id) => {
@@ -556,6 +703,15 @@ impl State {
             }
         }
     }
+}
+
+const COOKIE_NAME_MAX: usize = 256;
+const COOKIE_VALUE_MAX: usize = 4096;
+const COOKIE_ATTRS_MAX: usize = 4096;
+
+/// RFC 9110 token characters.
+fn is_token_char(c: u8) -> bool {
+    c.is_ascii_alphanumeric() || b"!#$%&'*+-.^_`|~".contains(&c)
 }
 
 /// A strong password: four groups of five from [a-zA-Z0-9] joined by '-'

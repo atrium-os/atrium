@@ -25,6 +25,7 @@ pub enum Source {
 
 pub struct Entry {
     pub user: String,
+    pub persona: String,
     pub recipient: Recipient,
     pub source: Source,
     pub expires: Instant,
@@ -62,9 +63,9 @@ impl Handles {
     /// else (unknown, expired, another recipient or user) is `None`, and a
     /// mismatch also burns the handle: a handle shown to the wrong party is
     /// treated as leaked.
-    pub fn take(&mut self, h: &Handle, user: &str, recipient: &Recipient) -> Option<Entry> {
+    pub fn take(&mut self, h: &Handle, user: &str, persona: &str, recipient: &Recipient) -> Option<Entry> {
         let e = self.map.remove(h)?;
-        if e.expires <= Instant::now() || e.user != user || &e.recipient != recipient {
+        if e.expires <= Instant::now() || e.user != user || e.persona != persona || &e.recipient != recipient {
             return None;
         }
         Some(e)

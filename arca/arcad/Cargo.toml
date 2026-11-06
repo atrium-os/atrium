@@ -20,6 +20,7 @@ portcullis-peer = { path = "../../portcullis/portcullis-peer" }
 ed25519-dalek   = { version = "2", default-features = false, features = ["zeroize"] }
 libc            = "0.2"
 getrandom       = { version = "0.2", features = ["std"] }
+sha2            = "0.10"
 
 [dev-dependencies]
 tempfile = "3"

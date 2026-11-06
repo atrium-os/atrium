@@ -16,6 +16,8 @@ pub enum Label {
     Vestibulum,
     /// Arca's own trusted UI (grants, reveal); a separate process of Arca's.
     TrustedUi,
+    /// A courier (arca.md §5): carries one persona's items to one endpoint.
+    Courier(crate::courier::CourierLabel),
     /// Anything else: refused every op.
     Unknown,
 }
@@ -31,6 +33,8 @@ pub struct Resolver {
     /// under the all-zero publisher id. Off in every shipped configuration:
     /// with it on, any unsigned app with the same app id is the same app.
     pub allow_unsigned: bool,
+    /// The courier registry; `None` serves no couriers.
+    pub courier_registry: Option<PathBuf>,
 }
 
 /// The all-zero publisher id used for unsigned apps when allowed.
@@ -38,6 +42,14 @@ pub const UNSIGNED_PUBLISHER: [u8; 32] = [0; 32];
 
 impl Resolver {
     pub fn resolve(&self, uid: u32) -> Label {
+        if (crate::courier::UID_FIRST..=crate::courier::UID_LAST).contains(&uid) {
+            // Courier uids are never apps or system services.
+            return self
+                .courier_registry
+                .as_ref()
+                .and_then(|p| crate::courier::lookup(p.to_str()?, uid))
+                .map_or(Label::Unknown, Label::Courier);
+        }
         // Read fresh each time: portcullisd appends at every launch. A read
         // failure is "unknown": fail closed.
         let Ok(reg) = portcullis_peer::AppRegistry::load(self.registry.to_str().unwrap_or("")) else {

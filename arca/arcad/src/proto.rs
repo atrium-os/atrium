@@ -38,6 +38,13 @@ pub mod op {
     pub const LIST: u16 = 0x06;
     /// `id[16]` → nothing.
     pub const DELETE: u16 = 0x07;
+    /// Store a bearer secret for one endpoint, courier-attached (arca.md
+    /// §4.3 class 1): `u16 kind | u8 class | str account | endpoint |
+    /// bytes value` → `id[16]`. Only this app's couriers to that endpoint
+    /// can use it; the app never gets it back.
+    pub const STORE_FOR: u16 = 0x08;
+    /// `endpoint` → as LIST, for this app's items bound to that endpoint.
+    pub const LIST_FOR: u16 = 0x09;
 
     /// `str user | root[32]` → nothing. First login: make the user's store.
     pub const V_CREATE: u16 = 0x40;
@@ -75,6 +82,40 @@ pub mod op {
     pub const U_GENERATE: u16 = 0x65;
     /// `handle[16]` → nothing: the field was cleared or detached.
     pub const U_DROP: u16 = 0x66;
+}
+
+/// Courier ops (0x80..): only a courier's uid, for its own endpoint.
+pub mod courier_op {
+    /// After TLS is up: `u8 n | n × (u8 source | ref[16])` → `n × bytes
+    /// value`, all or nothing. Source 1 = an item id, 2 = a credential
+    /// handle (redeemed once).
+    pub const FILL: u16 = 0x80;
+    /// A `Set-Cookie` from the endpoint, as a record: `str name | bytes
+    /// value | bytes attributes` → nothing. Cookie rules proper are A2.
+    pub const SET_COOKIE: u16 = 0x81;
+
+    pub const SOURCE_ITEM: u8 = 1;
+    pub const SOURCE_HANDLE: u8 = 2;
+    /// Most slots one request fills.
+    pub const MAX_SLOTS: usize = 8;
+}
+
+/// An endpoint on the wire: `u8 scheme (1 https) | str host | u16 port`.
+pub fn read_endpoint(r: &mut arca_store::codec::Reader<'_>) -> Result<arca_store::Recipient, arca_store::Error> {
+    use arca_store::model::caps;
+    let scheme = r.u8()?;
+    let host = r.str(caps::HOST)?;
+    let port = r.u16()?;
+    if scheme != arca_store::Scheme::Https as u8 {
+        return Err(arca_store::Error::BadRecipient);
+    }
+    arca_store::Recipient::endpoint(arca_store::Scheme::Https, host, port, None)
+}
+
+pub fn write_endpoint(w: &mut arca_store::codec::Writer, host: &str, port: u16) {
+    w.u8(arca_store::Scheme::Https as u8);
+    w.str(host);
+    w.u16(port);
 }
 
 /// Reply status. Every refusal about an item that isn't the caller's own

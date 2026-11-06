@@ -169,6 +169,10 @@ redirect to its client, which must start a new courier for the new endpoint. So 
 redirect on `example.com` can't carry `example.com`'s token to `evil.example`. That's a
 common token-leak route on today's web, and here it is closed by construction.
 
+**TLS** is rustls with the `ring` provider, the stack the rest of Atrium uses. The choice,
+and the hardening still to do (revocation, ECH, pinned keys, a system trust store), are in
+[../TLS.md](../TLS.md).
+
 ### 5.1 Why a courier compromise is bounded
 
 The courier parses two hostile inputs, so each one has to be weighed.

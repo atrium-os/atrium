@@ -13,6 +13,7 @@
 //! next.
 
 pub mod client;
+pub mod courier;
 pub mod handles;
 pub mod label;
 pub mod proto;
