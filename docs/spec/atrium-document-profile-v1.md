@@ -1147,7 +1147,8 @@ indents), the `dir` attribute, named grid lines/areas, media-query range syntax,
 container contexts compiled in the two corpora; 38 + 47 that reverse only in some media or
 state and 6 + 6 that wrap are laid out on the same axis unreversed, and counted),
 float ROWS (as inline-block, with the white space between the floats — which renders
-nothing — removed), floats BESIDE CONTENT (from 2026-11-06, below), Box Alignment's self-alignment keywords (§3.5, from 2026-11-04: `flex-*`,
+nothing — removed), floats BESIDE CONTENT (from 2026-11-06, below), COLLAPSED TABLE BORDERS
+(from 2026-11-06, below), Box Alignment's self-alignment keywords (§3.5, from 2026-11-04: `flex-*`,
 `self-*`, `left` / `right`, `normal`, and an image's initial `normal` in a grid), and — from 2026-09-24 — `box-sizing` (§3.3; 1,725 sizes in
 28 documents). The renderer stays small; the normalizer carries the cascade.
 `unset` (646 drops) and font-size keywords belong here and are **not yet compiled**.
@@ -1198,6 +1199,49 @@ The added time compares with normalize plus table pre-measure at p50 171 ms and 
     a `table-caption`, takes its caption's one-line width instead. It is then too wide
     to have text beside it (part of the 40).
 
+**Collapsed table borders, compiled (2026-11-06).** `border-collapse: collapse` becomes
+separated borders that draw the same lines (`navigator-normalize/src/borders.rs`):
+- The table gets `border-spacing: 0` and no padding.
+- The table's and its rows' own borders are removed. They take part in the conflict, and
+  the cells draw the result.
+- Each cell draws the winner of its end and bottom grid lines. It draws its start and
+  top lines only on the table's edge, or where no cell is on the other side. So each
+  line is drawn once.
+
+The conflict is CSS 2.1 §17.6.2.1, per line segment:
+1. `hidden` suppresses the line.
+2. `none` loses, and the wider border wins.
+3. Then the style: solid > dashed > dotted. `double` and the 3-D styles arrive repaired
+   to `solid`.
+4. Then the source: cell > row > table.
+5. Then the border further to the start, and to the top. In a right-to-left table the
+   start is on the right.
+
+Per media context, before box-sizing, which counts the borders.
+
+Not exact, stated:
+- A collapsed border is centred on its line in CSS. Here it sits inside one cell, so
+  content beside a 1 px border moves by half a pixel.
+- A cell spanning rows or columns gets one winner for its whole side.
+- Column and row-group borders are not in the conflict (counted).
+
+Measured:
+
+| | recordings (85) | readable (122) |
+|---|---|---|
+| documents with a collapsed table | 14 | 28 |
+| tables compiled | 125 | 553 |
+| spanning cells (one winner per side) | 98 | 454 |
+| tables with a width read without layout (em/pt) | 0 | 3 |
+| column / row-group borders not in the conflict | 68 (4 documents) | 68 (the same 4) |
+
+- *Identity.* On the 421-document identity set against 7a968558, the 333 documents
+  without a collapsed table are byte-identical, both normalized and NSG. Two runs gave
+  identical digests.
+- *Seen.* Node's `fs` history tables and ru Wikipedia's climate `wikitable` now draw
+  each line once, where they had doubled lines with gaps. The `wikitable` regained the
+  width its spacing had taken.
+
 ### C. None: cost — the backlog, by evidence
 
 | feature | evidence | what it costs a reader today |
@@ -1211,7 +1255,7 @@ The added time compares with normalize plus table pre-measure at p50 171 ms and 
 | `font-variant` | 1,270 | small caps render as regular |
 | counters | 1,013 | ordered lists styled by counters lose their numbers |
 | `text-overflow: ellipsis` | 905 | truncated text is cut, not ellipsised |
-| `border-collapse` | 895 | tables draw doubled borders |
+| ~~`border-collapse`~~ | **compiled** (2026-11-06, §7a B): 125 + 553 tables in the two corpora | was: doubled borders. Left: column and row-group borders (68), and borders centred on their line (half a pixel) |
 | `hyphens` | 791 | deferred on a dependency (dictionaries), §3.7 |
 | `word-break` | 780 | CJK and code break differently |
 | `line-clamp` | 519 | clamped previews show every line instead of the first few |
@@ -1282,8 +1326,8 @@ intrinsic width of a definite-width block.
 
 **Order of work:** section E, then margin collapsing and floats (compiled by the producer
 where they can be, like box-sizing; margin collapsing done 2026-09-25, floats beside
-content 2026-11-06), then `border-collapse` (next, approved by the user 2026-11-05), then
-generated content with text and counters, then the cheap rows of C by count. Each admission is checked against the guarantees before it
+content 2026-11-06), then `border-collapse` (done 2026-11-06), then generated content
+with text and counters, then the cheap rows of C by count. Each admission is checked against the guarantees before it
 lands.
 
 ## 8. Open questions

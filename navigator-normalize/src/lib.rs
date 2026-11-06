@@ -19,6 +19,7 @@
 
 pub mod css;
 pub mod phases;
+mod borders;
 mod collapse;
 pub mod expand;
 pub mod recording;
@@ -698,6 +699,10 @@ pub fn normalize(html: &str, inputs: &Inputs) -> (String, Report) {
     if beside > 0 { report.drop_n("float beside content compiled to a flex row", beside) }
     if lone > 0 { report.drop_n("property `float` (no content before the next float or clear; dropped)", lone) }
     for (_, props) in resolved.iter_mut() { props.remove("float-marker"); props.remove("clear-marker"); }
+
+    // ★ COLLAPSED TABLE BORDERS, compiled into separated ones (`borders`).
+    // Before box-sizing, which counts the borders it decides.
+    borders::compile(&mut resolved, &dom, &rtl, &mut report);
 
     // ★ BOX-SIZING, compiled away. The profile's boxes are all border-box;
     // CSS's default is content-box, where `width` excludes padding and
@@ -1537,6 +1542,10 @@ fn to_longhands_inner(name: &str, value: &[Token], inputs: &Inputs, report: &mut
     if name == "float" && matches!(text.as_str(), "left" | "right" | "none" | "inline-start" | "inline-end") {
         return vec![("float-marker".to_string(), text)];
     }
+    // `border-collapse` is compiled away (see `borders`).
+    if name == "border-collapse" && matches!(text.as_str(), "collapse" | "separate" | "inherit" | "initial" | "unset" | "revert") {
+        return vec![("border-collapse-marker".to_string(), text)];
+    }
     // `clear` ends what goes beside a float (see the float pass).
     if name == "clear" && matches!(text.as_str(), "left" | "right" | "both" | "none" | "inline-start" | "inline-end") {
         return vec![("clear-marker".to_string(), text)];
@@ -1613,7 +1622,7 @@ fn to_longhands_inner(name: &str, value: &[Token], inputs: &Inputs, report: &mut
         // once the whole cascade is known. Without it every child lands in
         // the same cell: rustdoc's breadcrumb rendered on top of its search
         // box.
-        if p == "grid-template-areas" || p == "grid-area-name" || p == "float-marker" || p == "clear-marker" || p == "box-sizing-marker"
+        if p == "grid-template-areas" || p == "grid-area-name" || p == "float-marker" || p == "clear-marker" || p == "border-collapse-marker" || p == "box-sizing-marker"
             || p == "clip-marker" || p == "clip-path-marker" || p.ends_with("-lines-marker") || p == "icon-font-marker" { return Some((p, v)) }
         // ★ An image the input has not measured cannot be painted (§3.13),
         // and the renderer says so. The normalizer must decide it HERE, the
@@ -1652,6 +1661,9 @@ fn to_longhands_inner(name: &str, value: &[Token], inputs: &Inputs, report: &mut
         // An inline-side property (`margin-@start`) is checked as the
         // physical property it will become; both sides take the same values.
         let phys = expand::physical(&p, false);
+        // `hidden` wins a collapsed-border conflict (CSS 2.1 §17.6.2.1), so
+        // it is carried to the borders pass, which then draws it as `none`.
+        if phys.starts_with("border-") && phys.ends_with("-style") && v.trim().eq_ignore_ascii_case("hidden") { return Some((p, "hidden".to_string())) }
         if value::admits(&phys, &v) { return Some((p, v)) }
         match value::repair(&phys, &v) {
             Some(fixed) => Some((p, fixed)),
