@@ -94,7 +94,7 @@ impl View for Show {
                 ctx.place(Toggle::new(self.toggle.clone(), "Wi-Fi"));
             });
         });
-        Section::new("View").description("Range, tab and volume").show(ctx, |ctx| {
+        Section::new("View").description("Pick the range to show, the tab, and how loud alerts are. Changes apply at once and are kept for next time.").show(ctx, |ctx| {
             row(ctx, space::SM, |ctx| {
                 ctx.place(Segmented::new(self.seg.clone(), ["Day", "Week", "Month"]));
                 text(ctx, "Week of 2 Nov");
@@ -112,7 +112,7 @@ impl View for Show {
 
         heading(ctx, 448.0, 20.0, "DocumentView");
         self.doc.render(ctx);
-        Dialog::new(self.dialog.clone(), Rect::new(0.0, 0.0, 1280.0, 720.0), "Discard changes?", "Your edits to this page have not been saved.", vec![
+        Dialog::new(self.dialog.clone(), Rect::new(0.0, 0.0, 1280.0, 720.0), "Discard changes?", "Your edits to this page have not been saved. If you discard them, the page goes back to how it was when you opened it, and this cannot be undone.", vec![
             DialogButton::new("Keep editing", || {}),
             DialogButton::new("Discard", || {}).destructive(),
         ])

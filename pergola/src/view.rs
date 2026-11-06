@@ -294,6 +294,15 @@ impl<'a> Ctx<'a> {
         self.tree.key_next(key);
     }
 
+    /// Add text that breaks into lines at the width layout gives it (a
+    /// stack's stretched child, a grid cell, or `max_width`); it is as tall
+    /// as its lines. Lines break at spaces and at `\n`.
+    pub fn paragraph(&mut self, content: impl Into<String>, style: crate::node::TextStyle) -> NodeId {
+        let id = self.add(Node::Text { rect: crate::geom::Rect::ZERO_SIZED, content: content.into(), style });
+        self.set_flex(id, crate::layout::FlexStyle { wrap: true, shrink: 1.0, ..crate::layout::FlexStyle::default() });
+        id
+    }
+
     /// Lay the stack `id` out as a grid ([`crate::layout::Grid`]).
     pub fn grid(&mut self, id: NodeId, grid: crate::layout::Grid) {
         self.tree.set_grid(id, grid);

@@ -395,7 +395,7 @@ impl View for Dialog {
         });
         ctx.push(Node::stack(Axis::Vertical, Rect::ZERO_SIZED, space::SM));
         ctx.add(Node::Text { rect: Rect::ZERO_SIZED, content: self.title.clone(), style: text(t.text_primary(), type_size::LG, font::SANS, Weight::Semibold) });
-        ctx.add(Node::Text { rect: Rect::ZERO_SIZED, content: self.body.clone(), style: text(t.text_secondary(), type_size::SM, font::SANS, Weight::Regular) });
+        ctx.paragraph(self.body.clone(), text(t.text_secondary(), type_size::SM, font::SANS, Weight::Regular));
         ctx.pop();
 
         // Buttons bottom right, primary last.

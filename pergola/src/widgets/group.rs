@@ -93,11 +93,10 @@ impl Section {
         let t = ctx.theme;
         let id = ctx.push(Node::stack(Axis::Vertical, self.rect, space::SM));
         // Title and description sit together, `xxs` apart.
-        let head = ctx.push(Node::stack(Axis::Vertical, Rect::ZERO_SIZED, space::XXS));
-        ctx.set_flex(head, FlexStyle { align: Align::Start, ..FlexStyle::default() });
+        ctx.push(Node::stack(Axis::Vertical, Rect::ZERO_SIZED, space::XXS));
         ctx.add(text(&self.title, type_size::MD, Weight::Semibold, t.text_primary()));
         if let Some(d) = &self.description {
-            ctx.add(text(d, type_size::SM, Weight::Regular, t.text_secondary()));
+            ctx.paragraph(d.clone(), TextStyle { family: font::SANS.into(), size: type_size::SM, weight: Weight::Regular, color: t.text_secondary() });
         }
         ctx.pop();
         content(ctx);

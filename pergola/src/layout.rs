@@ -133,7 +133,8 @@ pub struct FlexStyle {
     pub justify: Justify,
     pub align: Align,
     /// A row that runs out of width carries on on the next line (`spacing`
-    /// apart, as between children).
+    /// apart, as between children). On a text leaf: the text breaks into
+    /// lines at the width layout gives it (`Ctx::paragraph`).
     pub wrap: bool,
 }
 
@@ -188,6 +189,8 @@ pub fn layout(tree: &mut NodeTree, root: PNodeId) {
 struct MeasureCtx {
     content: String,
     style: TextStyle,
+    /// Breaks into lines at the width it is given.
+    wrap: bool,
 }
 
 fn flex_subtree(tree: &mut NodeTree, root: PNodeId) {
@@ -217,6 +220,14 @@ fn flex_subtree(tree: &mut NodeTree, root: PNodeId) {
         available,
         |known, _avail, _id, ctx: Option<&mut MeasureCtx>, _style| {
             let measured = match ctx {
+                Some(m) if m.wrap => {
+                    let w = known.width.unwrap_or(match _avail.width {
+                        AvailableSpace::Definite(w) => w,
+                        AvailableSpace::MinContent => 0.0,
+                        AvailableSpace::MaxContent => f32::INFINITY,
+                    });
+                    crate::text::measure_wrapped(&m.content, &m.style, w)
+                }
                 Some(m) => crate::text::measure(&m.content, &m.style),
                 None => return Size::ZERO,
             };
@@ -236,6 +247,7 @@ fn flex_subtree(tree: &mut NodeTree, root: PNodeId) {
     // keeps its declared origin (it was positioned by its own parent
     // context or absolutely by the app).
     write_back(tree, &taffy, t_root, root, root_rect.origin.x, root_rect.origin.y, true);
+    break_lines(tree, root);
 
     fn write_back(
         tree: &mut NodeTree,
@@ -277,6 +289,31 @@ fn flex_subtree(tree: &mut NodeTree, root: PNodeId) {
     }
 }
 
+/// Turn each wrapping text leaf under `id` into a column of its lines at
+/// its laid-out width: a free stack (so layout leaves it as it is) of
+/// one-line runs, which is what the wire draws.
+fn break_lines(tree: &mut NodeTree, id: PNodeId) {
+    for c in tree.children_of(id).to_vec() {
+        break_lines(tree, c);
+    }
+    let wraps = tree.style(id).is_some_and(|s| s.wrap);
+    let Some(Node::Text { rect, content, style }) = tree.get(id).cloned() else { return };
+    if !wraps {
+        return;
+    }
+    let lh = crate::text::line_height(&style);
+    let lines = crate::text::lines(&content, &style, rect.w());
+    if let Some(n) = tree.get_mut(id) {
+        *n = Node::stack(Axis::Vertical, rect, 0.0);
+    }
+    let fs = tree.style(id).copied().unwrap_or_default();
+    tree.set_style(id, FlexStyle { wrap: false, free: true, baseline: Some(crate::text::baseline(lh, &style)), ..fs });
+    for (i, l) in lines.into_iter().enumerate() {
+        let w = crate::text::measure(&l, &style).w;
+        tree.insert(Some(id), Node::Text { rect: PRect::new(rect.x(), rect.y() + i as f32 * lh, w, lh), content: l, style: style.clone() });
+    }
+}
+
 /// Move everything under `id` by `(dx, dy)`.
 fn shift(tree: &mut NodeTree, id: PNodeId, dx: f32, dy: f32) {
     if dx == 0.0 && dy == 0.0 {
@@ -312,7 +349,8 @@ fn child_baseline(tree: &NodeTree, id: PNodeId) -> f32 {
     }
     match tree.get(id) {
         Some(Node::Text { content, style, rect }) => {
-            let h = if rect.size.h > 0.0 { rect.size.h } else { crate::text::measure(content, style).h };
+            let wraps = tree.style(id).is_some_and(|s| s.wrap);
+            let h = if wraps { crate::text::line_height(style) } else if rect.size.h > 0.0 { rect.size.h } else { crate::text::measure(content, style).h };
             crate::text::baseline(h, style)
         }
         Some(n) => {
@@ -482,7 +520,7 @@ fn build(
             taffy
                 .new_leaf_with_context(
                     style,
-                    MeasureCtx { content: content.clone(), style: text_style.clone() },
+                    MeasureCtx { content: content.clone(), style: text_style.clone(), wrap: fs.wrap },
                 )
                 .ok()
         }
@@ -535,6 +573,32 @@ mod tests {
         assert_eq!(tree.get(ids[1]).unwrap().rect(), Rect::new(50.0, 0.0, 40.0, 20.0));
         assert_eq!(tree.get(ids[2]).unwrap().rect(), Rect::new(0.0, 30.0, 40.0, 20.0), "no room: next line");
         assert_eq!(tree.get(row).unwrap().rect().h(), 50.0);
+    }
+
+    #[test]
+    fn a_paragraph_breaks_into_lines_at_its_width_and_pushes_what_follows_down() {
+        use crate::node::TextStyle;
+        use crate::theme::tokens::Weight;
+        crate::text::clear_measurer();
+        // Headless: 0.55·size per char, so 10 px text is 5.5 px a char.
+        let style = TextStyle { family: "system-sans".into(), size: 10.0, weight: Weight::Regular, color: Color::TRANSPARENT };
+        let mut tree = NodeTree::new();
+        let col = tree.insert(None, Node::vstack(Rect::new(0.0, 0.0, 100.0, 0.0), 4.0));
+        let p = tree.insert(Some(col), Node::Text { rect: Rect::ZERO_SIZED, content: "aaaa bbbb cccc dddd eeee\nff".into(), style: style.clone() });
+        tree.set_style(p, FlexStyle { wrap: true, shrink: 1.0, ..FlexStyle::default() });
+        let after = tree.insert(Some(col), red_rect(10.0));
+        layout(&mut tree, col);
+        // 100 px holds 18 chars: "aaaa bbbb cccc" (14), then "dddd eeee", then "ff".
+        let lines: Vec<String> = tree.children_of(p).iter().map(|c| match tree.get(*c) {
+            Some(Node::Text { content, .. }) => content.clone(),
+            _ => panic!("a line is a text run"),
+        }).collect();
+        assert_eq!(lines, ["aaaa bbbb cccc", "dddd eeee", "ff"]);
+        let lh = crate::text::line_height(&style);
+        assert_eq!(tree.get(p).unwrap().rect().h(), (3.0 * lh).round());
+        assert_eq!(tree.get(after).unwrap().rect().y(), (3.0 * lh).round() + 4.0);
+        let second = tree.get(tree.children_of(p)[1]).unwrap().rect();
+        assert_eq!(second.y(), lh);
     }
 
     #[test]

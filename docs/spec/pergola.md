@@ -557,4 +557,13 @@ sit in a stack and nothing lined their labels up. As built:
   next line, `spacing` apart. Dialog is laid out this way (a centring
   column, a padded body, a right-justified button row of placed buttons).
 
-Not yet: a grid's explicit row/column placement, RTL, wrapped text.
+- Text wraps: `Ctx::paragraph(text, style)` adds text that breaks into
+  lines at the width layout gives it (greedy, at spaces and `\n`, a too
+  long word on its own line), with body leading (`line-height.body`); it
+  is as tall as its lines and pushes what follows down. After layout it
+  becomes a free column of one-line runs, which is what the wire draws
+  (frescod still shapes each run). Dialog bodies and Section
+  descriptions use it.
+
+Not yet: a grid's explicit row/column placement, RTL, hyphenation and
+breaking inside long words, ellipsis truncation.
