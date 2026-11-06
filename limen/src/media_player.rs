@@ -10,8 +10,10 @@ use serde::{Deserialize, Serialize};
 
 /// Most tracks in one segment feed.
 pub const TRACKS_MAX: u8 = 8;
-/// Most bytes in one `Append`.
-pub const APPEND_MAX: usize = 1 << 20;
+/// Most bytes in one `Append`: limend carries at most
+/// [`crate::catalogue::MAX_MESSAGE`] per message, so a parent splits a
+/// segment into appends of this size.
+pub const APPEND_MAX: usize = 60 * 1024;
 /// Most buffered ranges in one `Buffered`.
 pub const RANGES_MAX: usize = 64;
 /// Longest MIME type, URL and `CanPlay` query.

@@ -10,6 +10,8 @@
 //! - [`supervisor`]: the worker's lifecycle and the player state.
 #![deny(unsafe_code)]
 
+pub mod app;
+pub mod controls;
 pub mod fresco_sink;
 pub mod ring;
 pub mod supervisor;

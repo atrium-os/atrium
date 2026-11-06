@@ -161,7 +161,7 @@ There are two ways to feed it.
 | parent → child | `Load` | `media: DocRef`, `mime` |
 | parent → child | `OpenSource` | none: begins a segment feed |
 | parent → child | `AddTrack` | `track: u8` (at most 8), `mime` (an MSE type such as `video/webm; codecs="av01.0.08M.08"`) |
-| parent → child | `Append` | `track`, `bytes` (at most 1 MiB a message), `timestamp_offset: Option<f64>` |
+| parent → child | `Append` | `track`, `bytes` (at most 60 KiB a message, inside limend's 64 KiB message cap; a parent splits a segment into several appends), `timestamp_offset: Option<f64>` |
 | parent → child | `Remove` | `track`, `start`, `end` (seconds) |
 | parent → child | `Abort` | `track`: drop a half-parsed segment |
 | parent → child | `EndOfStream` | `error: Option<u8>` |

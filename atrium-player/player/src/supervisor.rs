@@ -25,6 +25,9 @@ pub trait Sink {
     /// the sink is done with it at once; otherwise it hands the buffer back
     /// later through [`Player::release`].
     fn frame(&mut self, index: u32, pts_ns: i64) -> bool;
+    /// Media time jumps or stood still (a seek, or play after pause): the
+    /// next frame starts the clock again.
+    fn discontinuity(&mut self) {}
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -44,6 +47,7 @@ pub enum PlayerEvent {
     Sandboxed(bool),
 }
 
+#[derive(Clone)]
 pub struct Options {
     pub worker: PathBuf,
     pub limits: Limits,
@@ -184,6 +188,11 @@ pub struct Player<S: Sink> {
     audio_read_until: Option<i64>,
     /// After a restart: PCM before this media time was already played.
     audio_skip_until: Option<i64>,
+    paused: bool,
+    /// Frames decoded while paused, held until play.
+    queued: VecDeque<(u32, i64)>,
+    /// Paused and seeked: show the first frame there anyway.
+    show_one: bool,
 }
 
 impl<S: Sink> Player<S> {
@@ -207,6 +216,9 @@ impl<S: Sink> Player<S> {
             buffered: Vec::new(),
             audio_read_until: None,
             audio_skip_until: None,
+            paused: false,
+            queued: VecDeque::new(),
+            show_one: false,
         };
         p.start_worker()?;
         Ok(p)
@@ -283,7 +295,67 @@ impl<S: Sink> Player<S> {
         }
     }
 
+    /// A new track in a segment feed (MSE `addSourceBuffer`).
+    pub fn add_track(&mut self, track: u8, mime: String) {
+        if let Source::Feed(tracks) = &mut self.source {
+            tracks.push((track, mime.clone()));
+        }
+        self.send(ToWorker::AddTrack { track, mime });
+    }
+
+    /// Show the next frame even if paused (a poster, or a seek's target).
+    pub fn show_next(&mut self) {
+        self.show_one = true;
+    }
+
+    pub fn paused(&self) -> bool {
+        self.paused
+    }
+
+    /// Pause holds decoded frames back (the worker stops once its buffers
+    /// are all queued here); play hands them on with the clock restarted.
+    pub fn set_paused(&mut self, paused: bool) {
+        if self.paused == paused {
+            return;
+        }
+        self.paused = paused;
+        self.show_one = false;
+        if !paused {
+            self.sink.discontinuity();
+            while let Some((i, pts)) = self.queued.pop_front() {
+                self.present(i, pts);
+            }
+        }
+    }
+
+    /// Media time of the frame last handed to the sink (or of the last PCM
+    /// run, for audio only).
+    pub fn position_ns(&self) -> Option<i64> {
+        self.last_pts
+    }
+
+    pub fn ended(&self) -> bool {
+        self.ended
+    }
+
+    fn present(&mut self, index: u32, pts_ns: i64) {
+        self.last_pts = Some(pts_ns);
+        if self.sink.frame(index, pts_ns) {
+            self.release(index);
+        }
+        self.events.push_back(PlayerEvent::Frame { pts_ns });
+    }
+
+    fn drop_queued(&mut self) {
+        while let Some((i, _)) = self.queued.pop_front() {
+            self.release(i);
+        }
+    }
+
     pub fn seek(&mut self, t_ns: i64) {
+        self.drop_queued();
+        self.sink.discontinuity();
+        self.show_one = self.paused;
         self.epoch += 1;
         self.ended = false;
         self.show_from = Some(t_ns);
@@ -358,6 +430,9 @@ impl<S: Sink> Player<S> {
         if let Some(mut w) = self.w.take() {
             w.kill();
         }
+        // Its buffers die with it.
+        self.queued.clear();
+        self.sink.discontinuity();
         // A whole resource can start over where it was; a feed's bytes are
         // gone with the worker.
         let restartable = matches!(self.source, Source::File(_)) && self.restarts == 0;
@@ -484,12 +559,12 @@ impl<S: Sink> Player<S> {
                     return;
                 }
                 self.show_from = None;
-                self.last_pts = Some(pts_ns);
                 self.waiting = false;
-                if self.sink.frame(index, pts_ns) {
-                    self.release(index);
+                if self.paused && !std::mem::take(&mut self.show_one) {
+                    self.queued.push_back((index, pts_ns));
+                } else {
+                    self.present(index, pts_ns);
                 }
-                self.events.push_back(PlayerEvent::Frame { pts_ns });
             }
             Record::Pcm { epoch, pts_ns, frames, pos } => {
                 let Some(a) = self.audio.as_mut() else { return self.worker_lost() };

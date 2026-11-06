@@ -110,21 +110,9 @@ pub fn supported(codec: Codec) -> bool {
     matches!(codec, Codec::Av1 | Codec::Vp9 | Codec::Vp8 | Codec::Opus | Codec::Vorbis)
 }
 
-/// Answer for `MediaSource.isTypeSupported` from an MSE-style MIME type
-/// such as `video/webm; codecs="vp09.00.10.08, opus"`.
-pub fn mime_supported(mime: &str) -> bool {
-    let mut parts = mime.split(';');
-    let base = parts.next().unwrap_or("").trim().to_ascii_lowercase();
-    if !matches!(base.as_str(), "video/webm" | "audio/webm" | "video/mp4" | "audio/mp4") {
-        return false;
-    }
-    let codecs = parts.find_map(|p| p.trim().strip_prefix("codecs=")).map(|c| c.trim_matches('"'));
-    let Some(codecs) = codecs else { return true };
-    codecs.split(',').map(str::trim).all(|c| {
-        let c = c.to_ascii_lowercase();
-        c == "vp8" || c == "vp9" || c.starts_with("vp09.") || c.starts_with("vp08.") || c.starts_with("av01.") || c == "opus" || c == "vorbis"
-    })
-}
+/// Answer for `MediaSource.isTypeSupported` (lives with the demuxers so the
+/// supervisor can answer without linking a decoder).
+pub use atrium_media_demux::mime_supported;
 
 pub fn video(track: &TrackInfo, cfg: &Config) -> Result<Box<dyn VideoDecoder>> {
     if track.encrypted {

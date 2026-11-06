@@ -229,6 +229,27 @@ Fresco's layers land.
 - Test clips and reference hashes are made by `scripts/media-test-clips.sh` into
   `test-assets/media/` (ffmpeg, a dev tool). Every clip's decoded frames, and what lands in
   the layer buffers, match ffmpeg's `framemd5` exactly.
+- M5: `player/src/app.rs` is one loop for both the standalone window and the Limen child
+  (`atrium-player --limen`: limend's channel on stdin, the embed-only frescod connection on
+  it). The parent's messages are checked with `ToChild::decode` and malformed ones dropped.
+  `player/src/controls.rs` draws the controls with Fresco scene nodes over the video:
+  play/pause, a scrubber showing buffered and played time, hiding after 3 s while playing.
+  A press on the picture or the space key toggles, the arrow keys step 5 s, and the scrubber
+  seeks. Pause holds decoded frames in the supervisor, so the worker stops once its buffers
+  are all held. A child starts paused, showing its first frame as a poster, and a seek
+  while paused shows its target frame. A hidden slot pauses playback, and showing it again
+  resumes. `Append` is capped at 60 KiB, to fit limend's 64 KiB messages.
+  `atrium-media-probe` (`player/examples/`) runs limend's code in process against a live
+  frescod. It starts the player as another uid with its channel on stdin, as portcullisd
+  would, and feeds `red-blue.webm` MSE style. All 16 checks pass in the VM: attach,
+  CanPlay, appends acknowledged one at a time, buffered ranges, Ready, the poster, red then
+  blue in the slot, Time, Ended, a seek while paused, suspend and resume, a malformed
+  message dropped, and detach ending the player.
+- Not in M5: `Load` gives `UNSUPPORTED` (for a descriptor, limend doesn't carry descriptors
+  with messages yet) or `NETWORK` (for a URL, there is no jailed fetcher yet). The controls
+  have no time text, because text waits for Pergola's in-app shaping. They are drawn
+  directly, not with Pergola widgets, because a Pergola window can't hold a video layer
+  yet. There is one source per embed; a new `src` is a new embed.
 - Known gaps: a WebM with its Cues at the end can only seek within what is read ahead,
   otherwise it reads again from the start and drops frames up to the target (reading Cues
   through the SeekHead is an M7 item). The stream's colour info isn't read yet, so the layer

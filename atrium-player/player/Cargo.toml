@@ -18,7 +18,20 @@ path = "src/bin/atrium-player.rs"
 libc     = "0.2"
 fresco-client   = { path = "../../fresco-client" }
 fresco-protocol = { path = "../../fresco-protocol" }
+# The media-player role's messages and the child's end of limend.
+limen           = { path = "../../limen" }
+# Only `mime_supported`, a string check: the supervisor parses no media.
+atrium-media-demux = { path = "../demux" }
 serde    = { version = "1", features = ["derive"] }
 postcard = { version = "1", features = ["use-std"] }
 # --headless prints frame hashes comparable with ffmpeg's framemd5.
 md-5     = "0.10"
+
+[dev-dependencies]
+# examples/media_probe.rs: limend in process, and the capture.
+aqueduct = { path = "../../aqueduct" }
+png      = "0.17"
+
+[[example]]
+name = "atrium-media-probe"
+path = "examples/media_probe.rs"

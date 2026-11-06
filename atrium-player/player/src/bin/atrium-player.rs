@@ -4,17 +4,20 @@
 //!
 //!   atrium-player --headless FILE            # Load: the worker reads FILE
 //!   atrium-player --headless --feed FILE...  # one MSE track per FILE, appended in chunks
+//!   atrium-player [--size WxH] [--exit-at-end] FILE   # in a window, with controls
+//!   atrium-player --limen                    # a Limen media-player child
 //!   options: --seek SECS (after the first frame), --probe-sandbox,
 //!            --kill-worker-after N (frames)
 use std::fs::File;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
-use atrium_player::fresco_sink::FrescoSink;
+use atrium_player::app::{App, LimenHost, Standalone};
 use atrium_player::supervisor::{LocalSink, Options, Player, PlayerEvent, Source};
 use md5::{Digest, Md5};
 
 fn usage() -> ! {
     eprintln!("usage: atrium-player [--size WxH] [--exit-at-end] FILE");
+    eprintln!("       atrium-player --limen   # a Limen media-player child, channel on stdin");
     eprintln!("       atrium-player --headless [--feed] [--seek SECS] [--probe-sandbox] [--kill-worker-after N] FILE...");
     std::process::exit(2);
 }
@@ -32,6 +35,7 @@ fn main() {
             "--probe-sandbox" => probe = true,
             "--kill-worker-after" => kill_after = args.next().and_then(|v| v.parse::<usize>().ok()),
             "--exit-at-end" => exit_at_end = true,
+            "--limen" => return embedded(),
             "--size" => {
                 size = args
                     .next()
@@ -155,8 +159,8 @@ fn main() {
     }
 }
 
-/// Play `file` in a window of its own, the video in a Fresco layer under a
-/// transparent window (M4; the controls and the Limen embedding are M5).
+/// Play `file` in a window of its own: the video in a Fresco layer under a
+/// window that is transparent but for the controls.
 fn windowed(file: &str, exit_at_end: bool, size: (u32, u32)) {
     let f = File::open(file).unwrap_or_else(|e| {
         eprintln!("{file}: {e}");
@@ -172,48 +176,82 @@ fn windowed(file: &str, exit_at_end: bool, size: (u32, u32)) {
         std::process::exit(1)
     });
     conn.set_default_window(win as u16);
-    // An empty scene: every pixel transparent, so the layer under it shows.
-    let _ = conn.scene_frame_begin().and_then(|_| conn.scene_frame_end());
-    let sink = FrescoSink::new(conn, win, size);
-    let mut p = Player::new(Options::default(), sink, Source::File(f)).unwrap_or_else(|e| {
+    let mut app = App::new(Standalone, conn, win, size, Options::default());
+    if let Err(e) = app.play_file(f, exit_at_end) {
         eprintln!("atrium-player: starting the decode worker: {e}");
+        std::process::exit(1);
+    }
+    run(&mut app);
+}
+
+/// A Limen `media-player` child (limen.md §2.2): limend started us with its
+/// channel on stdin and an embed-only frescod connection on it.
+fn embedded() {
+    use limen::proto::ChildEvent;
+    let (mut child, fresco) = limen::client::Child::embedded().unwrap_or_else(|e| {
+        eprintln!("atrium-player: no limend channel: {e:?}");
         std::process::exit(1)
     });
-    let (mut frames, mut ended_at) = (0u32, None);
-    let mut pcm = vec![0f32; 48_000 * 2];
-    loop {
-        while let Some(ev) = p.poll(Duration::from_millis(1)) {
-            match ev {
-                PlayerEvent::VideoTrack { width, height, bit_depth } => println!("video-track {width}x{height} {bit_depth}-bit"),
-                PlayerEvent::Frame { .. } => frames += 1,
-                PlayerEvent::Ended => ended_at = Some(std::time::Instant::now()),
-                PlayerEvent::Error(c) => {
-                    println!("error {c}");
-                    std::process::exit(3);
-                }
-                _ => {}
+    let embed = loop {
+        match child.poll(Duration::from_secs(30)) {
+            Ok(Some(ChildEvent::Attach { embed, role, .. })) if role == "media-player" => break embed,
+            Ok(Some(ChildEvent::Attach { role, .. })) => {
+                eprintln!("atrium-player: asked to be {role}");
+                std::process::exit(1)
+            }
+            Ok(Some(_)) => {}
+            Ok(None) | Err(_) => {
+                eprintln!("atrium-player: limend never attached us");
+                std::process::exit(1)
             }
         }
-        // Audio waits for Lyra (M6): drop it so the worker keeps going.
-        while p.read_pcm(&mut pcm).0 > 0 {}
-        let released = match p.sink.pump(Duration::from_millis(4)) {
-            Ok(r) => r,
+    };
+    let mut conn = fresco_client::Connection::wrap(fresco).unwrap_or_else(|e| {
+        eprintln!("atrium-player: frescod: {e}");
+        std::process::exit(1)
+    });
+    let hints = fresco_protocol::WindowHints { embed_pending: true, server_decorations: Some(false), ..Default::default() };
+    let mut size = (640u32, 360u32);
+    let win = conn.window_create(size.0, size.1, "media", hints).unwrap_or_else(|e| {
+        eprintln!("atrium-player: window: {e}");
+        std::process::exit(1)
+    });
+    conn.set_default_window(win as u16);
+    let until = Instant::now() + Duration::from_secs(10);
+    let token = loop {
+        match conn.wait_event(Some(Duration::from_millis(100))) {
+            Ok(Some(fresco_client::Event::EmbedToken { token, .. })) => break token,
+            Ok(Some(fresco_client::Event::Resized { width, height, .. })) => size = (width, height),
             Err(e) => {
                 eprintln!("atrium-player: frescod: {e}");
-                std::process::exit(1);
+                std::process::exit(1)
             }
-        };
-        for i in released {
-            p.release(i);
+            _ if Instant::now() > until => {
+                eprintln!("atrium-player: no embed token from frescod");
+                std::process::exit(1)
+            }
+            _ => {}
         }
-        if p.sink.closed {
-            break;
-        }
-        if exit_at_end && ended_at.is_some_and(|t| t.elapsed() > Duration::from_millis(500)) {
-            break;
+    };
+    if child.ready(embed, token).is_err() {
+        std::process::exit(1);
+    }
+    let mut app = App::new(LimenHost { child, embed, dropped: 0 }, conn, win, size, Options::default());
+    run(&mut app);
+    if app.host.dropped > 0 {
+        eprintln!("atrium-player: dropped {} malformed messages", app.host.dropped);
+    }
+}
+
+fn run<H: atrium_player::app::Host>(app: &mut App<H>) {
+    while !app.done {
+        if let Err(e) = app.step() {
+            eprintln!("atrium-player: frescod: {e}");
+            std::process::exit(1);
         }
     }
-    let s = p.sink.stats.clone();
+    let frames = app.frames;
+    let s = app.sink().stats.clone();
     let mean = if s.presented > 0 { s.skew_sum / s.presented as i64 } else { 0 };
     println!("frames {frames} presented {} dropped {} skew mean {:.2} ms max {:.2} ms", s.presented, s.dropped, mean as f64 / 1e6, s.skew_max as f64 / 1e6);
 }

@@ -64,17 +64,21 @@ pub struct FrescoSink {
     /// seq → asked present time.
     asked: HashMap<u32, i64>,
     released: Vec<u32>,
+    /// The layer's source size, to place it again on a resize.
+    src: Option<(u32, u32)>,
     pub stats: Stats,
     pub closed: bool,
 }
 
 impl FrescoSink {
     pub fn new(conn: Connection, window: u32, win_size: (u32, u32)) -> Self {
-        FrescoSink { conn, window, win_size, layer: None, clock: Clock::new(60_000_000), seq: 0, asked: HashMap::new(), released: Vec::new(), stats: Stats::default(), closed: false }
+        FrescoSink { conn, window, win_size, layer: None, clock: Clock::new(60_000_000), seq: 0, asked: HashMap::new(), released: Vec::new(), src: None, stats: Stats::default(), closed: false }
     }
 
-    /// Read Fresco's events; returns the buffers given back.
-    pub fn pump(&mut self, timeout: Duration) -> io::Result<Vec<u32>> {
+    /// Read Fresco's events; returns the buffers given back, and the events
+    /// that aren't the layer's (input, resizes) for the app.
+    pub fn pump(&mut self, timeout: Duration) -> io::Result<(Vec<u32>, Vec<Event>)> {
+        let mut other = Vec::new();
         let mut first = true;
         loop {
             let ev = if first { self.conn.wait_event(Some(timeout.max(Duration::from_millis(1))))? } else { self.conn.poll_event()? };
@@ -92,10 +96,19 @@ impl FrescoSink {
                     }
                 }
                 Event::CloseRequested { .. } => self.closed = true,
-                _ => {}
+                Event::Resized { width, height, .. } => {
+                    self.win_size = (width, height);
+                    if let (Some(layer), Some((w, h))) = (self.layer, self.src) {
+                        let rect = self.letterbox(w, h);
+                        self.conn.video_layer_place(layer, Some(rect))?;
+                    }
+                    other.push(ev);
+                }
+                Event::VideoReleased { .. } | Event::VideoPresented { .. } => {}
+                ev => other.push(ev),
             }
         }
-        Ok(std::mem::take(&mut self.released))
+        Ok((std::mem::take(&mut self.released), other))
     }
 
     /// The layer's rect in the window: the video scaled to fit, centred.
@@ -113,12 +126,19 @@ impl Sink for FrescoSink {
             Format::Nv12 => vfmt::NV12,
             Format::P010 => vfmt::P010,
         };
+        // A restarted worker gets a new layer; the old one goes.
+        if let Some(old) = self.layer.take() {
+            let _ = self.conn.video_layer_destroy(old);
+            self.released.clear();
+            self.asked.clear();
+        }
         let Some((layer, fds)) = self.conn.video_layer_create(self.window, f, width, height, count)? else {
             return Err(io::Error::other("frescod refused the video layer"));
         };
         let rect = self.letterbox(width, height);
         self.conn.video_layer_place(layer, Some(rect))?;
         self.layer = Some(layer);
+        self.src = Some((width, height));
         Ok(fds)
     }
 
@@ -133,5 +153,9 @@ impl Sink for FrescoSink {
             self.asked.retain(|&s, _| s.wrapping_sub(oldest) < 64);
         }
         self.conn.video_frame(layer, index, self.seq, at.max(1) as u64).is_err()
+    }
+
+    fn discontinuity(&mut self) {
+        self.clock.reset();
     }
 }

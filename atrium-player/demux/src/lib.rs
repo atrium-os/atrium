@@ -251,3 +251,20 @@ impl Input {
         self.start >= self.buf.len()
     }
 }
+
+/// Answer for `MediaSource.isTypeSupported` from an MSE-style MIME type
+/// such as `video/webm; codecs="vp09.00.10.08, opus"`: the containers we
+/// demux and the codecs the worker decodes.
+pub fn mime_supported(mime: &str) -> bool {
+    let mut parts = mime.split(';');
+    let base = parts.next().unwrap_or("").trim().to_ascii_lowercase();
+    if !matches!(base.as_str(), "video/webm" | "audio/webm" | "video/mp4" | "audio/mp4") {
+        return false;
+    }
+    let codecs = parts.find_map(|p| p.trim().strip_prefix("codecs=")).map(|c| c.trim_matches('"'));
+    let Some(codecs) = codecs else { return true };
+    codecs.split(',').map(str::trim).all(|c| {
+        let c = c.to_ascii_lowercase();
+        c == "vp8" || c == "vp9" || c.starts_with("vp09.") || c.starts_with("vp08.") || c.starts_with("av01.") || c == "opus" || c == "vorbis"
+    })
+}
