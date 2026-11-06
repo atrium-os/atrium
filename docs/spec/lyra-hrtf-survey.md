@@ -38,20 +38,20 @@ repository's record, or Debian's copyright file (which ships samples of several 
 For a generic (not personal) HRTF, every set gives some front/back and elevation
 confusion, because it isn't the listener's ears. What separates good generic sets is
 clean measurement: a dense and even grid, an extended low end, a low noise floor, a
-symmetric head, and true far-field distance. We measured the files we could download
+symmetric head, and true far-field distance. We measured the files
 (scratch script, 2026-11-06; left ear, source in front, levels relative to 1 kHz):
 
-| | SADIE II KU100 (D1) | SADIE II KEMAR (D2) | TH Köln KU100 far field (L2702) |
-|---|---|---|---|
-| Directions | 8802; very dense horizontal ring, worst gap elsewhere 7.5° | same grid | 2702, even Lebedev grid, worst gap 2.6° |
-| Distance | 1.2 m (slightly near field for lateral sources) | 1.2 m | 3.25 m (true far field) |
-| Length at 48 kHz | 256 taps (5.3 ms) | 256 taps | 128 taps (2.7 ms) |
-| Low end (30 / 100 Hz) | +1.0 / +0.7 dB (low-frequency extended) | +1.5 / +1.1 dB | +0.3 / +0.2 dB |
-| Tail relative to peak (noise and windowing) | −45 dB | −43 dB | −48 dB |
-| Left/right mirror difference, 0.2–12 kHz | 3.7 dB rms | 2.1 dB rms | 2.7 dB rms |
-| ITD at 90° (low-passed cross-correlation) | 810 µs left, 789 µs right | 737 / 768 µs | 771 / 766 µs |
-| Front/back spectral difference, 4–12 kHz | 5.8 dB rms | 6.0 dB rms | 6.4 dB rms |
-| Processing | Diffuse-field equalised, low end extended | same | Raw; diffuse-field filter supplied |
+| | SADIE II KU100 (D1) | SADIE II KEMAR (D2) | TH Köln KU100 far field (L2702) | FABIAN (HATO 0) |
+|---|---|---|---|---|
+| Directions | 8802; very dense horizontal ring, worst gap elsewhere 7.5° | same grid | 2702, even Lebedev grid, worst gap 2.6° | 11,950, even grid, worst gap 1.4° |
+| Distance | 1.2 m (slightly near field for lateral sources) | 1.2 m | 3.25 m (true far field) | 1.7 m |
+| Length at 48 kHz | 256 taps (5.3 ms) | 256 taps | 128 taps (2.7 ms) | 256 taps at 44.1 kHz (5.8 ms): resample to 48 kHz |
+| Low end (30 / 100 Hz) | +1.0 / +0.7 dB (low-frequency extended) | +1.5 / +1.1 dB | +0.3 / +0.2 dB | −1.5 / −1.7 dB, flat below 200 Hz (modelled there) |
+| Tail relative to peak (noise and windowing) | −45 dB | −43 dB | −48 dB | −49 dB |
+| Left/right mirror difference, 0.2–12 kHz | 3.7 dB rms | 2.1 dB rms | 2.7 dB rms | 2.8 dB rms |
+| ITD at 90° (low-passed cross-correlation) | 810 µs left, 789 µs right | 737 / 768 µs | 771 / 766 µs | 711 / 723 µs |
+| Front/back spectral difference, 4–12 kHz | 5.8 dB rms | 6.0 dB rms | 6.4 dB rms | **8.2 dB rms** |
+| Processing | Diffuse-field equalised, low end extended | same | Raw; diffuse-field filter supplied | Raw; common-transfer-function (diffuse-field) filters supplied, measured and modelled |
 
 - **TH Köln's KU100 is the cleanest measurement:** an even grid, far field, flat low end,
   lowest tail. But its files say share-alike.
@@ -59,8 +59,11 @@ symmetric head, and true far-field distance. We measured the files we could down
   coarser elsewhere, which interpolation handles. It is 1.2 m away, and its left/right
   mirror error is the largest of the three (a KU100 is built symmetric, so this is
   measurement asymmetry). Interpolation needs either set to be resampled to an even grid.
-- **FABIAN** couldn't be measured here: its downloads come from api-depositonce.tu-berlin.de,
-  which the environment doesn't allow yet. From its paper (Brinkmann et al., JAES 65(10),
+- **FABIAN is the best measurement of the four:** the densest and most even grid, the
+  cleanest tail, the most symmetric ITD, and the strongest front/back difference (the cue
+  generic HRTFs most often lose). Below 200 Hz and below −64° elevation it uses its
+  numerical model, which the file says. Its licence is in the file too: "Creative Commons
+  (CC-BY) … by/4.0". From its paper (Brinkmann et al., JAES 65(10),
   2017): 11,950 directions at about 2°, measured and numerically simulated, the two
   cross-validated with auditory models and found to agree, plus 11 head-above-torso
   orientations (±50°), useful when head tracking comes. On paper it is the best
@@ -75,13 +78,12 @@ symmetric head, and true far-field distance. We measured the files we could down
 
 ## Recommendation
 
-1. **Ship SADIE II's KU100 (D1, Apache 2.0) as the default HRTF.** The licence is confirmed
-   in the file itself, Apache 2.0 needs only the notice in the system's acknowledgements, the
-   KU100 is the usual reference head for binaural rendering, and the 48 kHz, 256-tap,
-   diffuse-field-equalised SOFA file fits the partitioned convolver as it is.
-2. **FABIAN (CC BY 4.0) may be the better measurement** (even 2° grid, cross-validated),
-   so S3 loads any SOFA file and we compare SADIE II KU100 and FABIAN by listening on
-   headphones before choosing which one to ship.
+1. **Ship FABIAN (HATO 0, CC BY 4.0) as the default HRTF.** It measured best (above), and
+   its licence (CC BY 4.0, confirmed in the file) needs only attribution. lyrad gets it
+   resampled to 48 kHz and diffuse-field equalised with its own CTF, done once at build
+   time. The other head orientations stay available for head tracking.
+2. **SADIE II's KU100 (Apache 2.0) is the fallback.** S3's loader takes any SOFA file, so
+   a listening check on headphones can still swap them before shipping.
 3. **Avoid share-alike sets (TH Köln as its files are labelled, ARI)** for anything we ship.
    MIT KEMAR, LISTEN and CIPIC are usable but older and weaker; no reason to prefer them.
 4. **Later, personalisation:** let the user pick a closer match from SONICOM (MIT) or
