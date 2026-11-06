@@ -124,7 +124,7 @@ Limen uses. Samples never cross the socket; they go through the ring.
 | app → | `Hello` | `version: u16`, `ticket: Option<[u8; 16]>` |
 | → app | `Welcome` | `device_rate`, `device_channels`, `period_frames` |
 | app → | `Open` | `tag` (the app's number, echoed back), `role` (media, communication, notification, game, pro), `rate` (8000 to 192000), `channels` (1, 2, 6 or 8), `buffer_ms` (10 to 2000), `label: String` (at most 64 bytes, shown in the volume UI, e.g. "Video"). Samples in the ring are always interleaved f32; the client library converts i16 |
-| → app | `Opened` | `tag`, `stream`, `ring_frames`, `latency_ns` (fd passed: the ring), (fd passed: the clock page, from A5) |
+| → app | `Opened` | `tag`, `stream`, `ring_frames`, `latency_ns` (fd passed: the ring), (fd passed: the clock page) |
 | app → | `Start`, `Pause` | `stream`. A new stream is paused until `Start`, so the app can fill the ring first |
 | app → | `Flush` | `stream`: drop everything queued (a seek) |
 | → app | `Flushed` | `stream`, `frame`: the stream position the next written frame will have |
@@ -164,21 +164,27 @@ A player needs one fact: when will frame *n* of my stream be heard?
   ```c
   struct lyra_clock {            /* little-endian, one per stream */
       uint32_t seq;              /* odd while lyrad writes */
-      uint32_t state;            /* 0 paused, 1 playing, 2 held */
+      uint32_t state;            /* 0 paused, 1 playing (a hold arrives as an event) */
       uint64_t frame;            /* stream position (stream rate) of the anchor */
       int64_t  heard_ns;         /* CLOCK_MONOTONIC when that frame reaches the speaker */
-      uint32_t rate_ppm;         /* measured device speed vs nominal, parts per million offset */
+      int32_t  rate_ppm;         /* measured device speed vs nominal, parts per million */
       uint32_t flush_epoch;      /* bumps on each Flush */
+      uint32_t rate;             /* the stream's nominal rate */
   };
   ```
 
   So frame *n* is heard at `heard_ns + (n - frame) / (rate × (1 + rate_ppm / 10⁶))`. The
-  app reads it whenever it likes, with no message and no wake.
+  app reads it with `Stream::clock().heard_at(n)` (`lyra_protocol::clock`) whenever it
+  likes, with no message and no wake. The page is created under a random name, reopened
+  `O_RDONLY` for the app and unlinked at once, so the app's fd cannot be mapped writable
+  (tested: `mmap(PROT_WRITE)` fails with `EACCES`).
 - **How lyrad computes it.** When lyrad mixes a period it knows which stream frames went
   in. `heard_ns` = the time of that mix + the frames still queued in the device
   (`SNDCTL_DSP_GETODELAY`) at the device rate + the resampler's delay + the codec's fixed
   delay (0 on OSS path A, from the HDA driver on path B). `rate_ppm` comes from the device's
-  consumed-frame count against `CLOCK_MONOTONIC` over a long window (architecture §4).
+  consumed-frame count against `CLOCK_MONOTONIC` over a long window (architecture §4);
+  as built, a window of at least 10 s, a new figure at most once a second, clamped to
+  ±1000 ppm.
 - **The position is lyrad's count**, not anything the app can write. `frame` counts frames
   lyrad has taken from the ring since `Open`. Pausing stops it; `Flush` keeps it counting
   from where the next frame will start (`Flushed { frame }`), so it never runs backwards.

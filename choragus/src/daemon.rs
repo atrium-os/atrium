@@ -253,9 +253,9 @@ fn serve_lyrad(mut rd: UnixStream, state: Shared) -> io::Error {
         };
         match msg {
             FromEngine::Opened { stream, ring_frames, latency_ns } => {
-                let fd = match recv_fd(rd.as_raw_fd()) {
-                    Ok(fd) => fd,
-                    Err(e) => return e,
+                let (ring, clock) = match (recv_fd(rd.as_raw_fd()), recv_fd(rd.as_raw_fd())) {
+                    (Ok(r), Ok(c)) => (r, c),
+                    (Err(e), _) | (_, Err(e)) => return e,
                 };
                 let mut st = state.lock().unwrap();
                 let Some(r) = st.streams.get_mut(&stream) else { continue };
@@ -263,7 +263,8 @@ fn serve_lyrad(mut rd: UnixStream, state: Shared) -> io::Error {
                 let (conn, tag) = (r.conn, r.tag);
                 st.to_app(conn, &ToApp::Opened { tag, stream, ring_frames, latency_ns });
                 if let Some(a) = st.apps.get(&conn) {
-                    let _ = send_fd(a.writer.as_raw_fd(), fd.as_raw_fd());
+                    let _ = send_fd(a.writer.as_raw_fd(), ring.as_raw_fd());
+                    let _ = send_fd(a.writer.as_raw_fd(), clock.as_raw_fd());
                 }
                 // Tell the app at once if its stream starts out held.
                 if st.streams.get(&stream).is_some_and(|r| r.held) {

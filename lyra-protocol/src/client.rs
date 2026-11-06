@@ -12,6 +12,7 @@
 //! # Ok::<(), std::io::Error>(())
 //! ```
 
+use crate::clock::{Clock, ClockReader};
 use crate::fdpass::recv_fd;
 use crate::ring::Ring;
 use crate::wire::{self, DenyCode, StreamParams, ToApp, ToChoragus};
@@ -26,6 +27,8 @@ pub struct Stream {
     pub channels: u8,
     pub rate: u32,
     pub ring: Ring,
+    /// When each frame is heard (lyra-v1.md §6).
+    pub clock: ClockReader,
     /// lyrad's output latency when the stream opened (device queue + delays).
     pub latency_ns: u64,
 }
@@ -40,6 +43,13 @@ impl Stream {
     pub fn write_i16(&self, frames: &[i16]) -> u64 {
         let f: Vec<f32> = frames.iter().map(|&s| s as f32 / 32768.0).collect();
         self.ring.write(&f)
+    }
+
+    /// The clock: `clock().heard_at(n)` is when stream frame `n` is heard, on
+    /// `CLOCK_MONOTONIC`. Frame numbers count every frame written since the
+    /// stream opened (a `Flushed` event says where they continue).
+    pub fn clock(&self) -> Clock {
+        self.clock.read()
     }
 
     /// Frames of free space in the ring.
@@ -97,9 +107,9 @@ impl Client {
         loop {
             match wire::recv::<_, ToApp>(&mut self.sock)? {
                 ToApp::Opened { tag: t, stream, latency_ns, .. } if t == tag => {
-                    let fd = recv_fd(self.sock.as_raw_fd())?;
-                    let ring = Ring::from_fd(fd, true)?;
-                    return Ok(Stream { id: stream, channels, rate, ring, latency_ns });
+                    let ring = Ring::from_fd(recv_fd(self.sock.as_raw_fd())?, true)?;
+                    let clock = ClockReader::from_fd(recv_fd(self.sock.as_raw_fd())?)?;
+                    return Ok(Stream { id: stream, channels, rate, ring, clock, latency_ns });
                 }
                 ToApp::Denied { tag: t, code } if t == tag => return Err(denied(code)),
                 other => self.pending.push_back(other),

@@ -43,6 +43,10 @@ fn fake_lyrad(sock: PathBuf, tag: &'static str) -> (mpsc::Receiver<ToEngine>, mp
                         .open(format!("/dev/shm{name}")).unwrap();
                     wire::send(&mut c, &FromEngine::Opened { stream: *stream, ring_frames: *ring_frames, latency_ns: 7 }).unwrap();
                     lyra_protocol::fdpass::send_fd(c.as_raw_fd(), fd.as_raw_fd()).unwrap();
+                    let (w, cfd) = lyra_protocol::clock::create().unwrap();
+                    w.publish(&lyra_protocol::clock::Clock { state: 1, frame: 100, heard_ns: 5_000, rate_ppm: 0, flush_epoch: 0, rate: 44_100 });
+                    lyra_protocol::fdpass::send_fd(c.as_raw_fd(), cfd.as_raw_fd()).unwrap();
+                    std::mem::forget(w); // keep the page mapped for the test
                     drop(p);
                     rtx.send(cons).unwrap();
                 }
@@ -107,6 +111,8 @@ fn an_app_plays_through_the_front_door() {
     assert_eq!((c.device_rate, c.device_channels), (48_000, 2));
     let s = c.open(params()).expect("opened");
     assert_eq!(s.latency_ns, 7);
+    // The clock page lyrad wrote reaches the app.
+    assert_eq!((s.clock().frame, s.clock().heard_ns), (100, 5_000));
     // lyrad was asked for a 44.1 kHz stereo stream with a power-of-two ring.
     assert!(matches!(next_engine(&eng, |m| matches!(m, ToEngine::Open { .. })),
         ToEngine::Open { rate: 44_100, channels: 2, ring_frames: 4096, .. }));

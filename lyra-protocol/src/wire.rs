@@ -7,9 +7,9 @@
 //! - **choragusd ⟷ lyrad** ([`ToEngine`], [`FromEngine`]): mechanism only.
 //!
 //! A frame is a `u32` little-endian length followed by that many bytes of
-//! postcard, at most [`MAX_FRAME`]. A message that carries fds (the ring, and in
-//! A5 the clock page) is followed on the socket by one `SCM_RIGHTS` message per
-//! fd ([`crate::fdpass`]), in the order the message names them.
+//! postcard, at most [`MAX_FRAME`]. A message that carries fds (`Opened`: the
+//! ring, then the clock page) is followed on the socket by one `SCM_RIGHTS`
+//! message per fd ([`crate::fdpass`]), in that order.
 
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use std::io::{self, Read, Write};
@@ -114,7 +114,8 @@ pub enum ToChoragus {
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
 pub enum ToApp {
     Welcome { device_rate: u32, device_channels: u8, period_frames: u32 },
-    /// Followed by one fd: the ring (producer end).
+    /// Followed by two fds: the ring (producer end), then the clock page
+    /// (read-only, [`crate::clock`]).
     Opened { tag: u32, stream: u32, ring_frames: u64, latency_ns: u64 },
     /// `tag`: the `Open` this answers, or 0 for another message.
     Denied { tag: u32, code: DenyCode },
@@ -150,7 +151,8 @@ pub enum ToEngine {
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
 pub enum FromEngine {
-    /// Followed by one fd: the ring (producer end, for the app).
+    /// Followed by two fds, both for the app: the ring (producer end), then the
+    /// clock page (read-only).
     Opened { stream: u32, ring_frames: u64, latency_ns: u64 },
     OpenFailed { stream: u32 },
     Flushed { stream: u32, frame: u64 },

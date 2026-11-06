@@ -13,6 +13,10 @@
 //!   A stream starts paused; `Flush` drops what is queued; `Drain` reports when
 //!   the last frame has been played; empty rings are reported as underruns, at
 //!   most once a second.
+//! - **The clock** (§6): every period lyrad writes each playing stream's clock
+//!   page: which stream frame is heard at which `CLOCK_MONOTONIC` instant,
+//!   from the adapter's position, the device's queue and the measured device
+//!   speed.
 //! - **Runs until stopped**, reopening the device if it goes away.
 //!
 //! The engine ([`Engine`]) is host-testable; [`run`] is the FreeBSD loop.
@@ -21,6 +25,7 @@ use crate::channels::{matrix, ChannelMap};
 use crate::gain::Gain;
 use crate::oss::OssSink;
 use crate::ring::Ring;
+use lyra_protocol::clock::{self, Clock, ClockWriter, STATE_PAUSED, STATE_PLAYING};
 use lyra_protocol::wire::{self, FromEngine, ToEngine};
 use std::io;
 use std::os::fd::AsRawFd;
@@ -83,6 +88,18 @@ impl Adapter {
             m,
             scratch: Vec::new(),
         })
+    }
+
+    /// The stream position (fractional, stream frames) the next output frame
+    /// will sample, given the ring's consumed count. The first carried frame is
+    /// the one before `consumed - carried + 1`.
+    pub fn position(&self, consumed: u64) -> f64 {
+        consumed as f64 - (self.carry.len() / self.ch) as f64 + self.frac
+    }
+
+    /// Stream frames per device frame.
+    pub fn ratio(&self) -> f64 {
+        self.ratio
     }
 
     /// Forget carried frames (a flush).
@@ -152,8 +169,9 @@ pub enum Cmd {
     /// Session `gen`'s connection ended: close its streams.
     End(u64),
     Msg(u64, ToEngine),
-    /// A stream made by session `gen`'s `Open`, with the consumer end of its ring.
-    Open(u64, u32, Box<Adapter>, Ring),
+    /// A stream made by session `gen`'s `Open`: the consumer end of its ring
+    /// and the writer of its clock page.
+    Open(u64, u32, Box<Adapter>, Ring, ClockWriter),
 }
 
 struct Slot {
@@ -161,6 +179,9 @@ struct Slot {
     gain: Gain,
     ring: Ring,
     adapter: Box<Adapter>,
+    clock: ClockWriter,
+    stream_rate: u32,
+    flush_epoch: u32,
     playing: bool,
     /// Periods left before `Drained`, once the ring has run dry.
     drain: Option<Option<u32>>,
@@ -177,6 +198,8 @@ pub struct Engine {
     tmp: Vec<f32>,
     /// Events for the current session, taken by [`Engine::take_events`].
     events: Vec<FromEngine>,
+    /// Measured device speed against nominal (ppm), for the clock pages.
+    pub rate_ppm: i32,
 }
 
 impl Engine {
@@ -188,6 +211,7 @@ impl Engine {
             period_frames,
             tmp: vec![0.0; period_frames * channels],
             events: Vec::new(),
+            rate_ppm: 0,
         }
     }
 
@@ -232,15 +256,20 @@ impl Engine {
             }
             Cmd::End(_) => {}
             Cmd::Msg(g, _) | Cmd::Open(g, ..) if g != self.gen => {}
-            Cmd::Open(_, id, adapter, ring) => {
+            Cmd::Open(_, id, adapter, ring, clock) => {
                 if self.is_open(id) || self.slots.len() >= MAX_STREAMS {
                     return;
                 }
+                let stream_rate = (adapter.ratio() * self.rate as f64).round() as u32;
+                clock.publish(&Clock { state: STATE_PAUSED, frame: 0, heard_ns: 0, rate_ppm: self.rate_ppm, flush_epoch: 0, rate: stream_rate });
                 self.slots.push(Slot {
                     id,
                     gain: Gain::new(1.0, self.rate as f32, 20.0),
                     ring,
                     adapter,
+                    clock,
+                    stream_rate,
+                    flush_epoch: 0,
                     playing: false,
                     drain: None,
                     underrun_frames: 0,
@@ -261,8 +290,10 @@ impl Engine {
                 }
             }
             ToEngine::Pause { stream } => {
+                let ppm = self.rate_ppm;
                 if let Some(s) = self.slot(stream) {
                     s.playing = false;
+                    s.clock.publish(&Clock { state: STATE_PAUSED, frame: s.ring.consumed(), heard_ns: 0, rate_ppm: ppm, flush_epoch: s.flush_epoch, rate: s.stream_rate });
                 }
             }
             ToEngine::Flush { stream } => {
@@ -270,6 +301,7 @@ impl Engine {
                     let frame = s.ring.discard();
                     s.adapter.reset();
                     s.drain = None;
+                    s.flush_epoch = s.flush_epoch.wrapping_add(1);
                     self.events.push(FromEngine::Flushed { stream, frame });
                 }
             }
@@ -290,16 +322,31 @@ impl Engine {
     }
 
     /// Mix one period into `mix` (interleaved, `period_frames × channels`).
-    /// `device_delay_frames` is what the device still has queued, for `Drain`.
-    pub fn mix(&mut self, mix: &mut [f32], device_delay_frames: u64) {
+    /// `device_delay_frames` is what the device still has queued (for `Drain`
+    /// and the clock), and `now_ns` is `CLOCK_MONOTONIC` now: this period's
+    /// first frame is heard `device_delay_frames` later.
+    pub fn mix(&mut self, mix: &mut [f32], device_delay_frames: u64, now_ns: i64) {
         mix.iter_mut().for_each(|v| *v = 0.0);
+        let start_ns = now_ns + (device_delay_frames as i128 * 1_000_000_000 / self.rate as i128) as i64;
+        let dev_rate = self.rate as f64;
+        let ppm = self.rate_ppm;
         let drain_periods = (device_delay_frames as usize).div_ceil(self.period_frames) as u32 + 1;
         let report_every = (self.rate as usize / self.period_frames).max(1) as u32;
         for s in self.slots.iter_mut() {
             if !s.playing {
                 continue;
             }
+            // The clock: output frame k samples stream position x0 + k·ratio,
+            // and is heard at start + k / device rate. Anchor on the first
+            // whole stream frame at or after x0.
+            let x0 = s.adapter.position(s.ring.consumed());
             let got = s.adapter.pull(&s.ring, &mut self.tmp);
+            if got > 0 {
+                let frame = x0.max(0.0).ceil();
+                let k = (frame - x0) / s.adapter.ratio();
+                let heard_ns = start_ns + (k / dev_rate * 1e9).round() as i64;
+                s.clock.publish(&Clock { state: STATE_PLAYING, frame: frame as u64, heard_ns, rate_ppm: ppm, flush_epoch: s.flush_epoch, rate: s.stream_rate });
+            }
             let short = (self.period_frames - got) as u64;
             match s.drain {
                 Some(None) if short > 0 || s.ring.readable() == 0 => s.drain = Some(Some(drain_periods)),
@@ -386,7 +433,8 @@ pub fn peer_allowed(uid: u32, peers: &[u32]) -> bool {
 type Writer = Arc<Mutex<Option<(u64, UnixStream)>>>;
 
 /// Make a ring for an `Open`, or `None` if its parameters are out of range.
-fn make_stream(cfg: &Config, rate: u32, channels: u8, ring_frames: u64) -> Option<(Box<Adapter>, Ring, std::os::fd::OwnedFd)> {
+#[allow(clippy::type_complexity)]
+fn make_stream(cfg: &Config, rate: u32, channels: u8, ring_frames: u64) -> Option<(Box<Adapter>, Ring, std::os::fd::OwnedFd, ClockWriter, std::os::fd::OwnedFd)> {
     if !(wire::MIN_RATE..=wire::MAX_RATE).contains(&rate)
         || !ring_frames.is_power_of_two()
         || ring_frames > MAX_RING_FRAMES
@@ -395,7 +443,8 @@ fn make_stream(cfg: &Config, rate: u32, channels: u8, ring_frames: u64) -> Optio
     }
     let adapter = Adapter::new(rate, channels, cfg.rate, cfg.channels as u8)?;
     let (ring, fd) = Ring::create_anon(ring_frames, channels as u64, false).ok()?;
-    Some((Box::new(adapter), ring, fd))
+    let (clock, clock_fd) = clock::create().ok()?;
+    Some((Box::new(adapter), ring, fd, clock, clock_fd))
 }
 
 /// Serve one trusted connection as session `gen`.
@@ -412,9 +461,9 @@ fn serve_session(mut conn: UnixStream, gen: u64, cfg: Config, tx: mpsc::Sender<C
         match msg {
             ToEngine::Open { stream, rate, channels, ring_frames } => {
                 let reply = match make_stream(&cfg, rate, channels, ring_frames) {
-                    Some((adapter, ring, fd)) => {
-                        let _ = tx.send(Cmd::Open(gen, stream, adapter, ring));
-                        Some(fd)
+                    Some((adapter, ring, fd, clock, clock_fd)) => {
+                        let _ = tx.send(Cmd::Open(gen, stream, adapter, ring, clock));
+                        Some((fd, clock_fd))
                     }
                     None => None,
                 };
@@ -424,8 +473,9 @@ fn serve_session(mut conn: UnixStream, gen: u64, cfg: Config, tx: mpsc::Sender<C
                     break; // a newer session took over
                 }
                 let ok = match reply {
-                    Some(fd) => wire::send(w, &FromEngine::Opened { stream, ring_frames, latency_ns: cfg.latency_ns() }).is_ok()
-                        && crate::fdpass::send_fd(w.as_raw_fd(), fd.as_raw_fd()).is_ok(),
+                    Some((fd, clock_fd)) => wire::send(w, &FromEngine::Opened { stream, ring_frames, latency_ns: cfg.latency_ns() }).is_ok()
+                        && crate::fdpass::send_fd(w.as_raw_fd(), fd.as_raw_fd()).is_ok()
+                        && crate::fdpass::send_fd(w.as_raw_fd(), clock_fd.as_raw_fd()).is_ok(),
                     None => wire::send(w, &FromEngine::OpenFailed { stream }).is_ok(),
                 };
                 if !ok {
@@ -488,6 +538,44 @@ fn event_writer(rx: mpsc::Receiver<(u64, FromEngine)>, writer: Writer) {
     }
 }
 
+/// `CLOCK_MONOTONIC` in ns.
+pub fn monotonic_ns() -> i64 {
+    let mut ts = libc::timespec { tv_sec: 0, tv_nsec: 0 };
+    unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut ts) };
+    ts.tv_sec as i64 * 1_000_000_000 + ts.tv_nsec as i64
+}
+
+/// Measures the device's real speed from its played-frame count against
+/// `CLOCK_MONOTONIC` (architecture §4: measured, not guessed). Reports parts
+/// per million off nominal once the window is long enough to mean something.
+pub struct DeviceSpeed {
+    nominal: u32,
+    first: Option<(u64, i64)>,
+    last_report: i64,
+}
+
+impl DeviceSpeed {
+    /// Shortest window before a figure is reported.
+    pub const MIN_WINDOW_NS: i64 = 10_000_000_000;
+
+    pub fn new(nominal: u32) -> Self {
+        DeviceSpeed { nominal, first: None, last_report: 0 }
+    }
+
+    /// Feed a (played frames, now) sample; a new figure about once a second.
+    pub fn sample(&mut self, played: u64, now: i64) -> Option<i32> {
+        let (p0, t0) = *self.first.get_or_insert((played, now));
+        let dt = now - t0;
+        if dt < Self::MIN_WINDOW_NS || now - self.last_report < 1_000_000_000 || played < p0 {
+            return None;
+        }
+        self.last_report = now;
+        let rate = (played - p0) as f64 / (dt as f64 / 1e9);
+        let ppm = (rate / self.nominal as f64 - 1.0) * 1e6;
+        Some(ppm.clamp(-1000.0, 1000.0).round() as i32)
+    }
+}
+
 /// The service: listen, then mix to the device forever, reopening it if it goes.
 pub fn run(cfg: Config) -> ! {
     let (tx, rx) = mpsc::channel::<Cmd>();
@@ -528,12 +616,19 @@ pub fn run(cfg: Config) -> ! {
             }
         };
         eprintln!("lyrad: OSS device open ({} Hz, {} ch)", sink.rate_hz(), sink.channels());
+        let mut speed = DeviceSpeed::new(cfg.rate);
         loop {
             while let Ok(c) = rx.try_recv() {
                 engine.apply(c);
             }
             let delay = sink.delay_frames().unwrap_or(0);
-            engine.mix(&mut mix, delay);
+            let now = monotonic_ns();
+            if let Ok(played) = sink.played_frames() {
+                if let Some(ppm) = speed.sample(played, now) {
+                    engine.rate_ppm = ppm;
+                }
+            }
+            engine.mix(&mut mix, delay, now);
             let gen = engine.session();
             for ev in engine.take_events() {
                 let _ = ev_tx.send((gen, ev));
@@ -567,8 +662,12 @@ mod tests {
         (p, c)
     }
 
+    fn writer() -> ClockWriter {
+        clock::create().unwrap().0
+    }
+
     fn open(e: &mut Engine, gen: u64, id: u32, rate: u32, ch: u8, ring: Ring) {
-        e.apply(Cmd::Open(gen, id, Box::new(Adapter::new(rate, ch, 48_000, 2).unwrap()), ring));
+        e.apply(Cmd::Open(gen, id, Box::new(Adapter::new(rate, ch, 48_000, 2).unwrap()), ring, writer()));
         e.apply(Cmd::Msg(gen, ToEngine::Start { stream: id }));
     }
 
@@ -596,7 +695,7 @@ mod tests {
         pa.write(&bad);
         pb.write(&[0.25; 32]);
         let mut mix = [0.0f32; 16];
-        e.mix(&mut mix, 0);
+        e.mix(&mut mix, 0, 0);
         assert!(mix.iter().all(|v| v.is_finite()), "{mix:?}");
         // The adapter starts with one zero frame as its left point, so output
         // frame k is stream frame k-1; frame 0 is that silent start.
@@ -609,14 +708,14 @@ mod tests {
         let (p, c) = ring_pair("paused", 64, 2);
         let mut e = Engine::new(48_000, 2, 8);
         e.apply(Cmd::Begin(1));
-        e.apply(Cmd::Open(1, 1, Box::new(Adapter::new(48_000, 2, 48_000, 2).unwrap()), c));
+        e.apply(Cmd::Open(1, 1, Box::new(Adapter::new(48_000, 2, 48_000, 2).unwrap()), c, writer()));
         p.write(&[0.5; 32]);
         let mut mix = [0.0f32; 16];
-        e.mix(&mut mix, 0);
+        e.mix(&mut mix, 0, 0);
         assert!(mix.iter().all(|&v| v == 0.0), "paused: nothing read");
         assert_eq!(p.writable(), 64 - 16, "the ring was not touched");
         e.apply(Cmd::Msg(1, ToEngine::Start { stream: 1 }));
-        e.mix(&mut mix, 0);
+        e.mix(&mut mix, 0, 0);
         assert_eq!(mix[15], 0.5);
     }
 
@@ -630,7 +729,7 @@ mod tests {
         e.apply(Cmd::Msg(1, ToEngine::Flush { stream: 1 }));
         assert_eq!(e.take_events(), vec![FromEngine::Flushed { stream: 1, frame: 20 }]);
         let mut mix = [0.0f32; 16];
-        e.mix(&mut mix, 0);
+        e.mix(&mut mix, 0, 0);
         assert!(mix.iter().all(|&v| v == 0.0), "nothing left to play");
     }
 
@@ -646,7 +745,7 @@ mod tests {
         // device has 16 frames queued = 2 periods; Drained after those + 1.
         let mut periods = 0;
         loop {
-            e.mix(&mut mix, 16);
+            e.mix(&mut mix, 16, 0);
             periods += 1;
             if e.take_events().contains(&FromEngine::Drained { stream: 1 }) {
                 break;
@@ -661,12 +760,12 @@ mod tests {
         let (_p, c) = ring_pair("underrun", 64, 2);
         let mut e = Engine::new(800, 2, 8); // 100 periods a second
         e.apply(Cmd::Begin(1));
-        e.apply(Cmd::Open(1, 1, Box::new(Adapter::new(800, 2, 800, 2).unwrap()), c));
+        e.apply(Cmd::Open(1, 1, Box::new(Adapter::new(800, 2, 800, 2).unwrap()), c, writer()));
         e.apply(Cmd::Msg(1, ToEngine::Start { stream: 1 }));
         let mut mix = [0.0f32; 16];
         let mut reports = Vec::new();
         for _ in 0..250 {
-            e.mix(&mut mix, 0);
+            e.mix(&mut mix, 0, 0);
             reports.extend(e.take_events());
         }
         assert_eq!(reports.len(), 2, "{reports:?}");
