@@ -134,7 +134,7 @@ if [ "$MODE" = clock ]; then
         scp $SCP_OPTS "root@localhost:${f%%:*}" "$OUT/${f#*:}" >/dev/null 2>&1 || die "pull ${f%%:*}"
     done
     v "cat $T/c48.err $T/c44.err" | sed 's/^/  app: /'
-    python3 -I - "$OUT" <<'PY' || FAILS=$((FAILS + 1))
+    python3 -I - "$OUT" <<'PY' || FAILS=$((FAILS + $?))
 import struct, sys
 out = sys.argv[1]
 RATE = 48000
@@ -211,7 +211,7 @@ if alt:
     print('       (against GETOPTR instead: median %+.3f ms, min %+.3f, max %+.3f)' % (a[len(a) // 2], a[0], a[-1]))
 if ppms:
     line(max(ppms) - min(ppms) <= 20, '6: rate_ppm after 30 s: %d to %d (want a spread of 20 or less)' % (min(ppms), max(ppms)))
-sys.exit(1 if fails else 0)
+sys.exit(min(fails, 100))
 PY
     echo "  data in $OUT"
     [ "$FAILS" = 0 ] && { say "lyra clock check PASSED"; exit 0; }
@@ -320,7 +320,7 @@ mkdir -p "$OUT"
 scp $SCP_OPTS "root@localhost:$DUMP" "$OUT/mix.raw" >/dev/null 2>&1 || die "pull the dump"
 v "cat $T/lyrad.log" > "$OUT/lyrad.log" 2>&1
 v "cat $T/choragusd.log" > "$OUT/choragusd.log" 2>&1
-python3 -I - "$OUT/mix.raw" "$M0" "$M1" "$M2" "$M3" "$M4" "$M5" "$M6" "$M7" "$M8" "$M9" "$M10" "$M11" "$M12" "$M13" "$M14" <<'PY' || FAILS=$((FAILS + 1))
+python3 -I - "$OUT/mix.raw" "$M0" "$M1" "$M2" "$M3" "$M4" "$M5" "$M6" "$M7" "$M8" "$M9" "$M10" "$M11" "$M12" "$M13" "$M14" <<'PY' || FAILS=$((FAILS + $?))
 import math, struct, sys
 path = sys.argv[1]
 m = [int(x) // 4 for x in sys.argv[2:]]   # byte offsets -> stereo frames
@@ -381,7 +381,7 @@ check('surround: left surround, left over right ear', sl - sr, 4.52, 1.0)
 pl, pr = amp(m[13] + S, m[14], 860, left), amp(m[13] + S, m[14], 860, right)
 check('surround: Pro stream untouched (left)', pl, -12.04, 0.5)
 check('surround: Pro stream untouched (right)', pr, -12.04, 0.5)
-sys.exit(1 if fails else 0)
+sys.exit(min(fails, 100))
 PY
 
 say "stop"

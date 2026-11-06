@@ -442,12 +442,18 @@ impl Engine {
     /// and the clock), and `now_ns` is `CLOCK_MONOTONIC` now: this period's
     /// first frame is heard `device_delay_frames` later.
     pub fn mix(&mut self, mix: &mut [f32], device_delay_frames: u64, now_ns: i64) {
+        let start_ns = now_ns + (device_delay_frames as i128 * 1_000_000_000 / self.rate as i128) as i64;
+        self.mix_at(mix, device_delay_frames, start_ns);
+    }
+
+    /// As [`Engine::mix`], with the time this period's first frame is heard
+    /// given (from [`DeviceClock`], smoother than one reading of the delay).
+    pub fn mix_at(&mut self, mix: &mut [f32], device_delay_frames: u64, start_ns: i64) {
         mix.iter_mut().for_each(|v| *v = 0.0);
         let virt = self.virtual_on();
         if virt {
             self.bed.iter_mut().for_each(|v| *v = 0.0);
         }
-        let start_ns = now_ns + (device_delay_frames as i128 * 1_000_000_000 / self.rate as i128) as i64;
         let dev_rate = self.rate as f64;
         let ppm = self.rate_ppm;
         let drain_periods = (device_delay_frames as usize).div_ceil(self.period_frames) as u32 + 1;
@@ -688,33 +694,136 @@ pub fn monotonic_ns() -> i64 {
     ts.tv_sec as i64 * 1_000_000_000 + ts.tv_nsec as i64
 }
 
-/// Measures the device's real speed from its played-frame count against
-/// `CLOCK_MONOTONIC` (architecture §4: measured, not guessed). Reports parts
-/// per million off nominal once the window is long enough to mean something.
-pub struct DeviceSpeed {
-    nominal: u32,
-    first: Option<(u64, i64)>,
+/// The device's clock, measured (architecture §4: measured, not guessed).
+///
+/// Each period lyrad knows how many frames it has written and how many the
+/// device still holds (GETODELAY), so `written − delay` is the frame the
+/// device is sounding now. (GETOPTR is no use: on FreeBSD it counts frames
+/// taken into the device buffer, which runs ahead in bursts.) One reading is
+/// rough: a device (or QEMU's HDA) moves its position in DMA-sized steps, and
+/// a timeshare thread reads it late. So the clock is a least-squares line
+/// through the readings of the last [`DeviceClock::WINDOW_NS`], in 50 ms
+/// buckets: its slope is the device's real rate, and it says when a given
+/// frame will be heard. A reading far off the line (an underrun, a stall)
+/// starts the line again.
+pub struct DeviceClock {
+    nominal: f64,
+    /// Finished buckets: (mean time ns, mean position frames), relative to `base`.
+    buckets: std::collections::VecDeque<(f64, f64)>,
+    /// The bucket being filled: sums and count.
+    cur: (f64, f64, u32),
+    cur_start: i64,
+    base: (i64, i64),
+    /// The fitted line: position = q0 + slope × (t − t0) (relative to `base`).
+    fit: Option<(f64, f64, f64)>,
     last_report: i64,
 }
 
-impl DeviceSpeed {
-    /// Shortest window before a figure is reported.
-    pub const MIN_WINDOW_NS: i64 = 10_000_000_000;
+impl DeviceClock {
+    pub const WINDOW_NS: i64 = 20_000_000_000;
+    const BUCKET_NS: i64 = 50_000_000;
+    /// Fit span before the line is used for the time a frame is heard.
+    const MIN_FIT_NS: f64 = 1e9;
+    /// Fit span before a rate is reported.
+    const MIN_RATE_NS: f64 = 5e9;
+    /// A reading this far off the line (seconds) restarts it.
+    const RESET_S: f64 = 0.030;
 
     pub fn new(nominal: u32) -> Self {
-        DeviceSpeed { nominal, first: None, last_report: 0 }
+        DeviceClock { nominal: nominal as f64, buckets: Default::default(), cur: (0.0, 0.0, 0), cur_start: 0,
+            base: (0, 0), fit: None, last_report: 0 }
     }
 
-    /// Feed a (played frames, now) sample; a new figure about once a second.
-    pub fn sample(&mut self, played: u64, now: i64) -> Option<i32> {
-        let (p0, t0) = *self.first.get_or_insert((played, now));
-        let dt = now - t0;
-        if dt < Self::MIN_WINDOW_NS || now - self.last_report < 1_000_000_000 || played < p0 {
+    fn restart(&mut self, now: i64, pos: i64) {
+        self.buckets.clear();
+        self.cur = (0.0, 0.0, 0);
+        self.cur_start = now;
+        self.base = (now, pos);
+        self.fit = None;
+    }
+
+    fn refit(&mut self) {
+        let n = self.buckets.len();
+        if n < 3 {
+            self.fit = None;
+            return;
+        }
+        let (mt, mq) = self.buckets.iter().fold((0.0, 0.0), |(a, b), (t, q)| (a + t, b + q));
+        let (mt, mq) = (mt / n as f64, mq / n as f64);
+        let (mut sxx, mut sxy) = (0.0, 0.0);
+        for (t, q) in &self.buckets {
+            sxx += (t - mt) * (t - mt);
+            sxy += (t - mt) * (q - mq);
+        }
+        if sxx <= 0.0 {
+            return;
+        }
+        let slope = sxy / sxx;
+        // A slope wildly off nominal is a bad window, not a device.
+        if (slope * 1e9 / self.nominal - 1.0).abs() > 0.05 {
+            self.fit = None;
+            return;
+        }
+        self.fit = Some((mt, mq, slope));
+    }
+
+    fn span_ns(&self) -> f64 {
+        match (self.buckets.front(), self.buckets.back()) {
+            (Some(a), Some(b)) => b.0 - a.0,
+            _ => 0.0,
+        }
+    }
+
+    /// Feed one reading: the device is sounding frame `pos` at `now`.
+    pub fn sample(&mut self, now: i64, pos: u64) {
+        let pos = pos as i64;
+        if self.cur.2 == 0 && self.buckets.is_empty() {
+            self.restart(now, pos);
+        }
+        let (t, q) = ((now - self.base.0) as f64, (pos - self.base.1) as f64);
+        if let Some((t0, q0, slope)) = self.fit {
+            let off = (q - (q0 + slope * (t - t0))) / self.nominal;
+            if off.abs() > Self::RESET_S || q < 0.0 {
+                self.restart(now, pos);
+                return self.sample(now, pos as u64);
+            }
+        }
+        self.cur.0 += t;
+        self.cur.1 += q;
+        self.cur.2 += 1;
+        if now - self.cur_start >= Self::BUCKET_NS {
+            let c = self.cur.2 as f64;
+            self.buckets.push_back((self.cur.0 / c, self.cur.1 / c));
+            self.cur = (0.0, 0.0, 0);
+            self.cur_start = now;
+            let oldest = t - Self::WINDOW_NS as f64;
+            while self.buckets.front().is_some_and(|b| b.0 < oldest) {
+                self.buckets.pop_front();
+            }
+            self.refit();
+        }
+    }
+
+    /// When frame `pos` (counted as in [`DeviceClock::sample`]) is heard, on
+    /// `CLOCK_MONOTONIC`, once the line is long enough to trust.
+    pub fn heard_at(&self, pos: u64) -> Option<i64> {
+        let (t0, q0, slope) = self.fit?;
+        if self.span_ns() < Self::MIN_FIT_NS {
+            return None;
+        }
+        let q = (pos as i64 - self.base.1) as f64;
+        Some(self.base.0 + (t0 + (q - q0) / slope).round() as i64)
+    }
+
+    /// The device's rate off nominal in parts per million (clamped to
+    /// ±1000), about once a second, once the line spans a few seconds.
+    pub fn rate_ppm(&mut self, now: i64) -> Option<i32> {
+        let (_, _, slope) = self.fit?;
+        if self.span_ns() < Self::MIN_RATE_NS || now - self.last_report < 1_000_000_000 {
             return None;
         }
         self.last_report = now;
-        let rate = (played - p0) as f64 / (dt as f64 / 1e9);
-        let ppm = (rate / self.nominal as f64 - 1.0) * 1e6;
+        let ppm = (slope * 1e9 / self.nominal - 1.0) * 1e6;
         Some(ppm.clamp(-1000.0, 1000.0).round() as i32)
     }
 }
@@ -780,7 +889,7 @@ pub fn run(cfg: Config) -> ! {
         mix.resize(cfg.period_frames as usize * channels as usize, 0.0);
         out.resize(mix.len(), 0);
         let _ = ev_tx.send((engine.session(), FromEngine::Layout { channels: channels as u8 }));
-        let mut speed = DeviceSpeed::new(cfg.rate);
+        let mut clock = DeviceClock::new(cfg.rate);
         loop {
             while let Ok(c) = rx.try_recv() {
                 engine.apply(c);
@@ -796,10 +905,12 @@ pub fn run(cfg: Config) -> ! {
             }
             let delay = sink.delay_frames().unwrap_or(0);
             let now = monotonic_ns();
+            // The frame the device is sounding now (see DeviceClock).
+            clock.sample(now, written.saturating_sub(delay));
+            if let Some(ppm) = clock.rate_ppm(now) {
+                engine.rate_ppm = ppm;
+            }
             if let Ok(played) = sink.played_frames() {
-                if let Some(ppm) = speed.sample(played, now) {
-                    engine.rate_ppm = ppm;
-                }
                 if let Some(w) = poslog.as_mut() {
                     use std::io::Write;
                     let _ = writeln!(w, "{now} {played} {written} {delay}");
@@ -808,7 +919,10 @@ pub fn run(cfg: Config) -> ! {
                     }
                 }
             }
-            engine.mix(&mut mix, delay, now);
+            // This period's first frame is frame `written`.
+            let start = clock.heard_at(written)
+                .unwrap_or(now + (delay as i128 * 1_000_000_000 / cfg.rate as i128) as i64);
+            engine.mix_at(&mut mix, delay, start);
             let gen = engine.session();
             for ev in engine.take_events() {
                 let _ = ev_tx.send((gen, ev));
@@ -832,6 +946,74 @@ pub fn run(cfg: Config) -> ! {
 
 #[cfg(test)]
 mod tests {
+
+    /// A device at `ppm` off 48 kHz whose position moves in 10 ms DMA steps,
+    /// read each 128-frame period by a thread up to 2 ms late.
+    fn bursty(ppm: f64, secs: f64, mut each: impl FnMut(i64, u64, u64)) {
+        let rate = 48_000.0 * (1.0 + ppm / 1e6);
+        let mut seed = 12345u64;
+        let mut written = 0u64;
+        let mut t = 1_000_000_000.0f64;
+        while t < 1e9 + secs * 1e9 {
+            seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            let late = (seed >> 40) as f64 / (1u64 << 24) as f64 * 2e6;
+            let now = t + late;
+            let true_pos = (now - 1e9) / 1e9 * rate;
+            let stepped = (true_pos / 480.0).floor() * 480.0;
+            each(now as i64, stepped as u64, written);
+            written += 128;
+            t += 128.0 / rate * 1e9;
+        }
+    }
+
+    #[test]
+    fn the_device_clock_smooths_a_bursty_device_and_finds_its_rate() {
+        for ppm in [-950.0, 0.0, 300.0] {
+            let mut c = DeviceClock::new(48_000);
+            let mut worst = 0.0f64;
+            let mut last_ppm = None;
+            let rate = 48_000.0 * (1.0 + ppm / 1e6);
+            bursty(ppm, 30.0, |now, pos, _| {
+                c.sample(now, pos);
+                if let Some(p) = c.rate_ppm(now) { last_ppm = Some(p); }
+                // After the first seconds: when is the frame 100 ms ahead heard?
+                if now > 4_000_000_000 {
+                    let f = pos + 4800;
+                    // The true time (the position is floored to 480-frame steps,
+                    // so the true line runs half a step above the steps).
+                    let truth = 1e9 + (f as f64 + 240.0) / rate * 1e9;
+                    let got = c.heard_at(f).expect("fitted") as f64;
+                    worst = worst.max((got - truth).abs());
+                }
+            });
+            assert!(worst < 0.5e6, "{ppm} ppm: worst error {:.2} ms", worst / 1e6);
+            let p = last_ppm.expect("a rate") as f64;
+            assert!((p - ppm).abs() <= 20.0, "{ppm} ppm measured as {p}");
+        }
+    }
+
+    #[test]
+    fn the_device_clock_starts_again_after_a_stall() {
+        let mut c = DeviceClock::new(48_000);
+        let mut t = 0i64;
+        let mut pos = 0u64;
+        for _ in 0..2000 {
+            c.sample(t, pos);
+            t += 2_666_667;
+            pos += 128;
+        }
+        let before = c.heard_at(pos).unwrap();
+        assert!((before - t).abs() < 100_000);
+        // The device stalls for 200 ms (an underrun), then plays on.
+        t += 200_000_000;
+        for _ in 0..2000 {
+            c.sample(t, pos);
+            t += 2_666_667;
+            pos += 128;
+        }
+        assert!((c.heard_at(pos).unwrap() - t).abs() < 100_000, "the line follows the stall");
+    }
+
     use super::*;
 
     /// A named ring pair (named shm works on the Linux host; anonymous is
