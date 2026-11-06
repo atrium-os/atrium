@@ -85,6 +85,15 @@ impl FontSet {
         Ok(FontSet { faces })
     }
 
+    /// The pinned set, loaded once per process and shared. The set is
+    /// immutable and fixed at build time, so every worker, DocumentView and
+    /// test in a process can hold the same `&'static` one instead of loading
+    /// (and canonicalizing) their own.
+    pub fn shared() -> Result<&'static FontSet, String> {
+        static SET: std::sync::OnceLock<Result<FontSet, String>> = std::sync::OnceLock::new();
+        SET.get_or_init(FontSet::load).as_ref().map_err(|e| format!("font set: {e}"))
+    }
+
     /// Face indices to try, in order, for a family and weight.
     pub fn stack(&self, family: Family, bold: bool) -> Vec<usize> { self.stack_of(family, bold, false) }
 

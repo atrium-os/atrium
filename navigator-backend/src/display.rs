@@ -148,12 +148,9 @@ pub struct Bands {
     pub generation: u64,
 }
 
-/// ★ The pinned font set for a source that lives as long as its worker: a
-/// worker holds one document, so this is loaded once and kept.
-fn static_fonts() -> Result<&'static FontSet, String> {
-    thread_local! { static F: std::cell::OnceCell<Result<&'static FontSet, String>> = const { std::cell::OnceCell::new() }; }
-    F.with(|c| c.get_or_init(|| FontSet::load().map(|f| &*Box::leak(Box::new(f))).map_err(|e| format!("font set: {e}"))).clone())
-}
+/// The pinned font set for a source that lives as long as its worker:
+/// `FontSet::shared`, loaded once per process.
+fn static_fonts() -> Result<&'static FontSet, String> { FontSet::shared() }
 
 struct NsgSink<'a> { fonts: &'a FontSet, puts: Vec<GroupPut>, clears: Vec<GroupId> }
 
