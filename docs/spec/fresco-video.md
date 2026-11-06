@@ -1,6 +1,6 @@
 # Fresco video layers
 
-**Status:** proposal for review, 2026-11-06. **Owner:** Fresco thread (frescod parts); other
+**Status:** accepted 2026-11-06 (Shankar agreed to all of §10). **Owner:** Fresco thread (frescod parts); other
 owners in §8.
 
 Video playback from local files through to streaming, and what Fresco needs for it. This
@@ -205,6 +205,8 @@ Added for security (§8): S1, embed-only frescod connections for every Limen chi
 thread with the Pergola thread), and the compose limits in V1.
 
 ## 10. Decisions, with recommendations
+
+**Accepted by the user, 2026-11-06: all seven.**
 
 1. **frescod composes video itself, under the window**, rather than the player drawing frames
    into its window. *Recommend yes.* The controls aren't redrawn per frame, frescod owns the
