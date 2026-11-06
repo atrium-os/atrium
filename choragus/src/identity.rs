@@ -13,19 +13,21 @@
 //! The app's own hello is never identity in strict mode (the service): an uid
 //! not in the registry gets nothing.
 
-use crate::app::{CAP_AUDIO, CAP_CONTROL, CAP_MICROPHONE, CAP_MONITOR};
+use crate::app::{CAP_AUDIO, CAP_CONTROL, CAP_MEDIA, CAP_MICROPHONE, CAP_MONITOR};
 use portcullis_peer::AppRegistry;
 
 /// choragusd's sockets: `<root>/<name>/<name>.sock`, and what each allows. The
 /// names match the directories Portcullis mounts for each capability
 /// (portcullis-jail `apply_audio`, `apply_microphone`, `apply_audio_monitor`).
 /// `audio-control/` is the volume UI's (lyra-v1.md §7): it speaks the control
-/// dictionary, not the app one, and allows no streams.
-pub const SOCKETS: [(&str, u8); 4] = [
+/// dictionary, not the app one, and allows no streams. `media-control/` is
+/// now-playing's (Forum, the lock screen; atrium-player-pip-keys.md §4).
+pub const SOCKETS: [(&str, u8); 5] = [
     ("audio", CAP_AUDIO),
     ("audio-capture", CAP_AUDIO | CAP_MICROPHONE),
     ("audio-monitor", CAP_AUDIO | CAP_MONITOR),
     ("audio-control", CAP_CONTROL),
+    ("media-control", CAP_MEDIA),
 ];
 
 /// A connection's verified identity and the capability bits it holds.

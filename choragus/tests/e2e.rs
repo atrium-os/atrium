@@ -3,14 +3,14 @@
 //! to the app, volumes composed into lyrad's gain, events forwarded, and that
 //! an app can only name its own streams.
 
-use choragus::app::{CAP_AUDIO, CAP_CONTROL, CAP_MICROPHONE, CAP_MONITOR};
+use choragus::app::{CAP_AUDIO, CAP_CONTROL, CAP_MEDIA, CAP_MICROPHONE, CAP_MONITOR};
 use choragus::daemon::{self, Config};
 use choragus::grant::GrantStore;
-use lyra_protocol::client::{Client, Control};
+use lyra_protocol::client::{Client, Control, Media};
 use lyra_protocol::ring::Ring;
 use lyra_protocol::wire::{
     self, AppEntry, DenyCode, FromAttribution, FromControl, FromEngine, Output, Role, StreamParams, ToApp, ToAttribution, ToChoragus,
-    ToControl, ToEngine,
+    ToControl, ToEngine, ToMedia, FromMedia, MediaAction, SessionState, action,
 };
 use std::os::fd::AsRawFd;
 use std::os::unix::net::{UnixListener, UnixStream};
@@ -369,6 +369,63 @@ fn only_the_audio_control_grant_reaches_the_volume_ui() {
     // And the control grant alone opens no streams.
     let (s, _e, _r) = start_with("ctl-nostream", &reg, "org.atrium.player audio-control\n", &[("audio.sock", CAP_AUDIO | CAP_CONTROL)], None);
     assert!(Client::connect(s[0].to_str().unwrap(), None).is_err());
+}
+
+fn now_playing(m: &mut Media) -> Option<wire::NowPlaying> {
+    m.socket().set_read_timeout(Some(Duration::from_secs(3))).unwrap();
+    match m.recv().expect("now-playing") {
+        FromMedia::NowPlaying(np) => np,
+        other => panic!("{other:?}"),
+    }
+}
+
+#[test]
+fn now_playing_and_the_media_keys_reach_the_active_session() {
+    let reg = format!("{} alice org.atrium.player\n", me());
+    let (s, _e, _r) = start_with("media", &reg, "org.atrium.player audio,media-control\n",
+        &[("audio.sock", CAP_AUDIO), ("media-control.sock", CAP_MEDIA)], Some(dir("media-state")));
+    let mut bar = Media::connect(s[1].to_str().unwrap(), false).expect("bar welcome");
+    let mut lock = Media::connect(s[1].to_str().unwrap(), true).expect("lock screen welcome");
+    bar.send(&ToMedia::NowPlaying).unwrap();
+    assert_eq!(now_playing(&mut bar), None);
+    // A player starts a session: both controllers hear of it, titles only on the bar.
+    let mut app = Client::connect(s[0].to_str().unwrap(), None).expect("welcome");
+    let acts = action::PLAY | action::PAUSE | action::SEEK_FORWARD;
+    app.session(SessionState::Playing, "Song\u{202e}", "Band", acts, Some(200.0), Some(1.0)).unwrap();
+    let np = now_playing(&mut bar).expect("playing");
+    assert_eq!((np.app_id.as_str(), np.title.as_str(), np.artist.as_str(), np.state), ("org.atrium.player", "Song", "Band", SessionState::Playing));
+    let np = now_playing(&mut lock).expect("playing");
+    assert_eq!((np.title.as_str(), np.artist.as_str(), np.state), ("", "", SessionState::Playing));
+    // Play/Pause on a playing session pauses it; a seek gets the default step.
+    bar.control(MediaAction::PlayPause).unwrap();
+    app.socket().set_read_timeout(Some(Duration::from_secs(3))).unwrap();
+    assert_eq!(app.next_event().unwrap(), ToApp::SessionAction { action: MediaAction::Pause, seek_offset: None, seek_time: None });
+    lock.control(MediaAction::SeekForward).unwrap();
+    assert_eq!(app.next_event().unwrap(), ToApp::SessionAction { action: MediaAction::SeekForward, seek_offset: Some(10.0), seek_time: None });
+    // Not offered: nothing reaches the app (the next thing it hears is the pause below).
+    bar.control(MediaAction::Next).unwrap();
+    // The lock screen can't turn titles on; the user's setting (from the bar) can.
+    lock.send(&ToMedia::SetLockTitles { on: true }).unwrap();
+    assert_eq!(lock.recv().unwrap(), FromMedia::Denied { code: DenyCode::NotGranted });
+    bar.send(&ToMedia::SetLockTitles { on: true }).unwrap();
+    assert_eq!(now_playing(&mut lock).expect("playing").title, "Song");
+    bar.control(MediaAction::PlayPause).unwrap();
+    assert_eq!(app.next_event().unwrap(), ToApp::SessionAction { action: MediaAction::Pause, seek_offset: None, seek_time: None });
+    // The player goes away: nothing is playing.
+    drop(app);
+    assert_eq!(now_playing(&mut bar), None);
+    assert_eq!(now_playing(&mut lock), None);
+}
+
+#[test]
+fn only_the_media_control_grant_reaches_now_playing() {
+    let reg = format!("{} alice org.atrium.player\n", me());
+    let (s, _e, _r) = start_with("media-nogrant", &reg, "org.atrium.player audio,audio-control\n", &[("media-control.sock", CAP_MEDIA)], None);
+    let err = Media::connect(s[0].to_str().unwrap(), false).err().expect("refused");
+    assert_eq!(err.kind(), std::io::ErrorKind::PermissionDenied);
+    // The grant without the socket's cap: a playback socket doesn't speak it.
+    let (s, _e, _r) = start_with("media-wrongsock", &reg, "org.atrium.player audio,media-control\n", &[("audio.sock", CAP_AUDIO)], None);
+    assert!(Media::connect(s[0].to_str().unwrap(), false).is_err());
 }
 
 /// limend's side of the attribution socket: one connection, held open (its

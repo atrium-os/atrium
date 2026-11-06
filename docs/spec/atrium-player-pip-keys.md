@@ -144,6 +144,38 @@ ostiarius or Vestibulum draws the lock screen, and with this it asks choragusd f
 appear only if the user turns that on, because a page's title can be private and the lock
 screen is public. Controls work without unlocking: play, pause, next, previous.
 
+### 4.6 As built in choragusd (2026-11-06)
+
+- **Wire** (`lyra_protocol::wire`): the app sends `ToChoragus::Session { state, title,
+  artist, actions, duration, position }` and gets `ToApp::SessionAction { action,
+  seek_offset, seek_time }`. `SessionState` is `None | Paused | Playing`; `None` ends the
+  session. `actions` is a bit set (`wire::action::PLAY`, `PAUSE`, `STOP`, `NEXT`,
+  `PREVIOUS`, `SEEK_BACKWARD`, `SEEK_FORWARD`, `SEEK_TO`). Client: `Client::session(..)`.
+- **Controllers** connect to `/atrium/sockets/media-control/media-control.sock` (the
+  `media-control` capability; forum-bar and forum-wm hold it) and speak `ToMedia`:
+  `Hello { version, lock_screen }`, `NowPlaying`, `Control { action, seek_offset,
+  seek_time }`, `Focused { app_id }` (forum-wm, on each focus change) and
+  `SetLockTitles { on }` (the user's setting; refused from a lock-screen connection).
+  Replies are `FromMedia::{Welcome, NowPlaying(Option<NowPlaying>), Denied}`;
+  `NowPlaying` is also sent unasked whenever what that connection would see changes.
+  Client: `lyra_protocol::client::Media`.
+- **Actions** are `MediaAction::{Play, Pause, PlayPause, Stop, Next, Previous,
+  SeekBackward, SeekForward, SeekTo}`. The first six map one to one onto the consumer
+  keys. choragusd turns `PlayPause` into `Play` or `Pause` by the session's state, drops
+  actions the session doesn't offer, gives seeks a 10 s default step, and clamps `SeekTo`
+  to the duration.
+- **Active session:** the most recent session to go to playing while eligible. Eligible
+  means its app had the focus when the session began or has gained it since, judged from
+  forum-wm's `Focused`. With no `Focused` reports for that user (development), every
+  session is eligible. A paused session stays active. When the active session ends,
+  the most recent other session that had been active takes over.
+- **Seat:** a controller sees and steers only its own user's sessions, and only while
+  that user's session is the seat's; on a switch it hears `NowPlaying(None)`.
+- **Lock screen:** `lock_screen: true` connections get app and state only, unless the
+  user's `lock_titles` (kept in `/var/db/choragus/<user>.toml`) is on.
+- **Wire hardening:** `wire::recv` now refuses a frame with trailing bytes, so a message
+  of one dictionary can't be half-read as another's on the wrong socket.
+
 ## 5. Security notes
 
 - A session's metadata is untrusted text from a page. It is length-capped, has control
@@ -160,8 +192,9 @@ screen is public. Controls work without unlocking: play, pause, next, previous.
 1. **Player, now** (needs no one; **built**, see atrium-player.md M7): keyboard shortcuts in the focused player (space and k,
    j and l for ±10 s, arrows ±5 s, up and down for volume, m to mute, c for subtitles,
    0 to 9 to jump), the Limen media-session messages (§4.4) and the player keeping them.
-2. **choragusd**: `Session`, `NowPlaying` and `Control`, the active-session rule, and a
-   `media-control` grant. Test with a fake controller.
+2. **choragusd** (**built**, §4.6): `Session`, `NowPlaying` and `Control`, the
+   active-session rule, and a `media-control` grant. Tested with a fake controller
+   (choragus e2e).
 3. **forum-wm**: consumer-page keys to `Control`, and the `input.media_keys` exception.
    forum-bar shows now-playing.
 4. **PiP**: frescod's press record and slot unbind, then forum-wm's `pip` layer and

@@ -30,7 +30,7 @@ install -d -m 0755 /atrium/sockets
 install -d -o _lyra -g _choragus -m 0750 /atrium/sockets/lyrad
 # choragusd's front doors, one per audio capability (Portcullis mounts each
 # only into jails that hold it).
-for d in audio audio-capture audio-monitor audio-control audio-attribution; do
+for d in audio audio-capture audio-monitor audio-control media-control audio-attribution; do
     install -d -o _choragus -g _choragus -m 0755 /atrium/sockets/$d
 done
 

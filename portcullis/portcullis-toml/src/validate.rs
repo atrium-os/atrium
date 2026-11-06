@@ -161,6 +161,11 @@ fn validate_capabilities(c: &Capabilities, ctx: &str, r: &mut Report) {
             "{ctx}.audio-control = true: restricted to the volume UI (Forum, Curia); \
              requires explicit policy approval"));
     }
+    if c.media_control == Some(true) {
+        r.warnings.push(format!(
+            "{ctx}.media-control = true: restricted to now-playing and the media keys \
+             (Forum, the lock screen); requires explicit policy approval"));
+    }
     if c.camera == Some(true) {
         r.warnings.push(format!(
             "{ctx}.camera = true: requires user prompt; document the use case"));

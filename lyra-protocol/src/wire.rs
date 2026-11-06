@@ -114,6 +114,76 @@ pub enum ToChoragus {
     /// The app's own level, 0 to 1, under the user's.
     SetVolume { stream: u32, gain: f32 },
     Close { stream: u32 },
+    /// The connection's media session (atrium-player-pip-keys.md §4.2): what
+    /// it plays, for media keys, Forum's now-playing and the lock screen.
+    /// One per connection; `SessionState::None` ends it. The text is the
+    /// page's: choragusd cuts it to [`MAX_SESSION_TEXT`] bytes and removes
+    /// control and bidi characters. `actions` is a set of `action::*` bits.
+    /// `position` is taken at most once a second (state changes always).
+    Session {
+        state: SessionState,
+        title: String,
+        artist: String,
+        actions: u16,
+        duration: Option<f64>,
+        position: Option<f64>,
+    },
+}
+
+/// Longest session title or artist kept (bytes).
+pub const MAX_SESSION_TEXT: usize = 128;
+
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SessionState {
+    None,
+    Paused,
+    Playing,
+}
+
+/// A media action: what a key, Forum or the lock screen asks of the active
+/// session. `PlayPause` is the controllers' (the Play/Pause key); a session
+/// only ever receives `Play` or `Pause`.
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MediaAction {
+    Play,
+    Pause,
+    PlayPause,
+    Stop,
+    Next,
+    Previous,
+    SeekBackward,
+    SeekForward,
+    SeekTo,
+}
+
+/// The `actions` bits of a [`ToChoragus::Session`].
+pub mod action {
+    pub const PLAY: u16 = 1;
+    pub const PAUSE: u16 = 2;
+    pub const STOP: u16 = 4;
+    pub const NEXT: u16 = 8;
+    pub const PREVIOUS: u16 = 16;
+    pub const SEEK_BACKWARD: u16 = 32;
+    pub const SEEK_FORWARD: u16 = 64;
+    pub const SEEK_TO: u16 = 128;
+    pub const ALL: u16 = 255;
+}
+
+impl MediaAction {
+    /// The `action::*` bit a session must offer to receive it.
+    pub fn bit(self) -> u16 {
+        match self {
+            MediaAction::Play => action::PLAY,
+            MediaAction::Pause => action::PAUSE,
+            MediaAction::PlayPause => action::PLAY | action::PAUSE,
+            MediaAction::Stop => action::STOP,
+            MediaAction::Next => action::NEXT,
+            MediaAction::Previous => action::PREVIOUS,
+            MediaAction::SeekBackward => action::SEEK_BACKWARD,
+            MediaAction::SeekForward => action::SEEK_FORWARD,
+            MediaAction::SeekTo => action::SEEK_TO,
+        }
+    }
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
@@ -136,6 +206,55 @@ pub enum ToApp {
     /// The output's layout changed (the user set 5.1, say): streams keep
     /// playing, converted to it; a player may switch to a matching track.
     OutputChanged { device_channels: u8 },
+    /// A media key, Forum or the lock screen asks this connection's session
+    /// for `action` (never `PlayPause`). `seek_offset` (seconds, for
+    /// `SeekBackward`/`SeekForward`) or `seek_time` (seconds, for `SeekTo`)
+    /// where it applies.
+    SessionAction { action: MediaAction, seek_offset: Option<f64>, seek_time: Option<f64> },
+}
+
+// ── now-playing ⟷ choragusd (media-control/, atrium-player-pip-keys.md §4) ──
+
+/// What a media controller (Forum's bar and key route, the lock screen: the
+/// `media-control` capability) may say. It sees and steers only the active
+/// session of its own user, and only while that user's session is the active
+/// seat's.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+pub enum ToMedia {
+    /// `lock_screen`: the lock screen gets the app and state only, unless the
+    /// user turned titles on (`SetLockTitles`).
+    Hello { version: u16, lock_screen: bool },
+    /// Answered by `NowPlaying`, which is also sent unasked on each change.
+    NowPlaying,
+    /// For the active session. Ignored if it doesn't offer the action.
+    Control { action: MediaAction, seek_offset: Option<f64>, seek_time: Option<f64> },
+    /// forum-wm: this app has the keyboard focus now. Only a session whose
+    /// app had focus since the session began can become active, so a
+    /// background app can't take the media keys by starting to play.
+    Focused { app_id: String },
+    /// The user's choice: titles and artists on the lock screen.
+    SetLockTitles { on: bool },
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+pub struct NowPlaying {
+    /// The app it counts for (an embedded player's parent).
+    pub app_id: String,
+    /// Empty on the lock screen unless the user turned titles on.
+    pub title: String,
+    pub artist: String,
+    pub state: SessionState,
+    pub actions: u16,
+    pub duration: Option<f64>,
+    pub position: Option<f64>,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+pub enum FromMedia {
+    Welcome,
+    /// The active session, or none.
+    NowPlaying(Option<NowPlaying>),
+    Denied { code: DenyCode },
 }
 
 // ── volume UI ⟷ choragusd (audio-control/, lyra-v1.md §7) ──────────────────
@@ -318,7 +437,14 @@ pub fn recv<R: Read, T: DeserializeOwned>(r: &mut R) -> io::Result<T> {
     }
     let mut body = vec![0u8; len];
     r.read_exact(&mut body)?;
-    postcard::from_bytes(&body).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
+    // The whole frame must be the message: a frame of another dictionary that
+    // happens to start like one of ours (a `ToMedia::Hello` sent to the app
+    // socket) is refused, not half-read.
+    let (m, rest) = postcard::take_from_bytes(&body).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+    if !rest.is_empty() {
+        return Err(io::Error::new(io::ErrorKind::InvalidData, "trailing bytes in frame"));
+    }
+    Ok(m)
 }
 
 #[cfg(test)]
@@ -359,6 +485,21 @@ mod tests {
             let mut c = std::io::Cursor::new(encode(&m).unwrap());
             assert_eq!(recv::<_, ToApp>(&mut c).unwrap(), m);
         }
+        let np = NowPlaying {
+            app_id: "a".repeat(MAX_APP_ID),
+            title: "t".repeat(MAX_SESSION_TEXT),
+            artist: "r".repeat(MAX_SESSION_TEXT),
+            state: SessionState::Playing,
+            actions: action::ALL,
+            duration: Some(1.0),
+            position: Some(0.5),
+        };
+        let m = FromMedia::NowPlaying(Some(np));
+        assert_eq!(recv::<_, FromMedia>(&mut std::io::Cursor::new(encode(&m).unwrap())).unwrap(), m);
+        let m = ToChoragus::Session { state: SessionState::Paused, title: "x".into(), artist: String::new(), actions: action::PLAY, duration: None, position: Some(3.0) };
+        assert_eq!(recv::<_, ToChoragus>(&mut std::io::Cursor::new(encode(&m).unwrap())).unwrap(), m);
+        let m = ToApp::SessionAction { action: MediaAction::SeekTo, seek_offset: None, seek_time: Some(12.5) };
+        assert_eq!(recv::<_, ToApp>(&mut std::io::Cursor::new(encode(&m).unwrap())).unwrap(), m);
         for m in [
             ToEngine::Open { stream: 1, rate: 44_100, channels: 6, ring_frames: 4096 },
             ToEngine::SetGain { stream: 1, db: -18.0 },

@@ -13,6 +13,7 @@ icon        = "settings"
 graphics      = "fresco"
 forum-control = true
 audio-control = true   # the volume control: levels and mutes, never samples
+media-control = true   # now-playing: the active player's app, state and controls
 network       = "none"
 
 [supervision]
