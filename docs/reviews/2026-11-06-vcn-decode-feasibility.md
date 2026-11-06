@@ -1,6 +1,6 @@
 # Hardware video decode (VCN) feasibility
 
-**Date:** 2026-11-06. **For:** Shankar's decision. **Covers:** items G1 and G2 in
+**Date:** 2026-11-06. **Decision (Shankar, 2026-11-06): A, park G1 and G2** until atrium-gpu-amd runs on the R9700 with PSP loading; decode stays on the CPU. Revisit the source rule (C suggested) then. **Covers:** items G1 and G2 in
 [fresco-video.md](../spec/fresco-video.md) §8 and decision §9.4.
 
 ## Short answer

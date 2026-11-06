@@ -221,7 +221,8 @@ thread with the Pergola thread), and the compose limits in V1.
    clean-room (MIT and public documents only), and AMD's VCN interface is less publicly
    documented than the rest of the GPU. *Recommend:* the GPU thread first reports what public
    documentation exists, and until then decode stays on the CPU, in the player's jail.
-   Findings: [2026-11-06-vcn-decode-feasibility.md](../reviews/2026-11-06-vcn-decode-feasibility.md).
+   Findings: [2026-11-06-vcn-decode-feasibility.md](../reviews/2026-11-06-vcn-decode-feasibility.md). **Decided 2026-11-06:** G1 and G2 parked until
+   silicon bring-up (PSP on the R9700); CPU decode only.
 5. **v1's `protected` flag only keeps frames out of capture.** *Recommend yes.* It is honest
    about what it guarantees, and real protection waits for the CDM work.
 6. **Where YUV is converted** (§8): in frescod's broker, or in the window's renderer jail with
