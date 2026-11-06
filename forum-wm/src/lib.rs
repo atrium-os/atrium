@@ -46,8 +46,12 @@ impl Screen {
 /// F1 "occluded surface render-gated" tie — the default arrangement is one focused
 /// document filling the work area, the rest stacked + gated (forum.md §2.3), not
 /// tiled (that's an F2 split/group intent).
-const DOC_FOCUSED: i32 = 4;
-const DOC_UNFOCUSED: i32 = 5;
+const DOC_FOCUSED: i32 = 5;
+const DOC_UNFOCUSED: i32 = 6;
+/// Picture-in-picture (atrium-player-pip-keys.md §3): above documents and
+/// panels, below chrome, HUDs and dialogs, so it never covers a prompt or a
+/// credential slot.
+pub const PIP_LAYER: i32 = 3;
 
 fn layer(role: WmRole) -> i32 {
     match role {
@@ -56,9 +60,9 @@ fn layer(role: WmRole) -> i32 {
         WmRole::Dialog => 0,
         WmRole::Hud => 1,
         WmRole::Chrome => 2,
-        WmRole::Panel => 3,
+        WmRole::Panel => 4,
         WmRole::Document => DOC_FOCUSED,
-        WmRole::Background => 6,
+        WmRole::Background => 7,
     }
 }
 
@@ -184,6 +188,54 @@ pub fn arrange_for(
         .collect();
 
     WmDeclareLayoutPayload { slots, focus, focus_cause: 0 }
+}
+
+/// Where the PiP window sits (forum_ctl::Corner), and where it is placed:
+/// `aspect` (width:height, from the player's hints; 0 → 16:9) at a quarter
+/// of the work area's width, no more than a quarter of its height, at least
+/// 160×90, `PIP_MARGIN` from the corner's edges.
+pub const PIP_MARGIN: i32 = 16;
+pub fn pip_rect(wa: WmRect, aspect: (u32, u32), corner: forum_ctl::Corner) -> WmRect {
+    use forum_ctl::Corner;
+    let (aw, ah) = if aspect.0 == 0 || aspect.1 == 0 { (16, 9) } else { aspect };
+    let ratio = ah as f64 / aw as f64;
+    let mut w = wa.w as f64 / 4.0;
+    let mut h = w * ratio;
+    if h > wa.h as f64 / 4.0 {
+        h = wa.h as f64 / 4.0;
+        w = h / ratio;
+    }
+    if w < 160.0 {
+        w = 160.0;
+        h = w * ratio;
+    }
+    if h < 90.0 {
+        h = 90.0;
+        w = h / ratio;
+    }
+    let (w, h) = (w.round() as i32, h.round() as i32);
+    let x = match corner {
+        Corner::TopLeft | Corner::BottomLeft => wa.x + PIP_MARGIN,
+        Corner::TopRight | Corner::BottomRight => wa.x + wa.w - PIP_MARGIN - w,
+    };
+    let y = match corner {
+        Corner::TopLeft | Corner::TopRight => wa.y + PIP_MARGIN,
+        Corner::BottomLeft | Corner::BottomRight => wa.y + wa.h - PIP_MARGIN - h,
+    };
+    WmRect { x, y, w, h }
+}
+
+/// The corner nearest `(x, y)`: where a PiP drag that ends there snaps.
+pub fn nearest_corner(wa: WmRect, x: i32, y: i32) -> forum_ctl::Corner {
+    use forum_ctl::Corner;
+    let right = x >= wa.x + wa.w / 2;
+    let bottom = y >= wa.y + wa.h / 2;
+    match (right, bottom) {
+        (false, false) => Corner::TopLeft,
+        (true, false) => Corner::TopRight,
+        (false, true) => Corner::BottomLeft,
+        (true, true) => Corner::BottomRight,
+    }
 }
 
 /// A snap target — a half of the work area (the snap intent, forum.md §2.3).
@@ -690,6 +742,8 @@ pub mod daemon {
         /// any document on the active workspace is snapped, it enters snap mode
         /// (manual tile: snapped docs show in their halves, the rest gate).
         pub snapped: HashMap<u32, Snap>,
+        /// Where the picture-in-picture window sits (`Intent::PipCorner`).
+        pub pip_corner: forum_ctl::Corner,
         /// The monitors (display 3.0), as frescod places them on the desktop.
         /// With fewer than two present the WM lays out on `screen` alone.
         pub outputs: Vec<WmOutput>,
@@ -735,6 +789,7 @@ pub mod daemon {
                 tiled_workspaces: HashSet::new(),
                 zoomed: None,
                 snapped: HashMap::new(),
+                pip_corner: forum_ctl::Corner::default(),
                 outputs: Vec::new(),
                 home: HashMap::new(),
                 top: RefCell::new(HashMap::new()),
@@ -1056,6 +1111,13 @@ pub mod daemon {
         /// (forum.md §2.3). Zoom on → that surface fills the screen, all else
         /// gates; zoom off → back to the arrangement. Returns the new zoom state.
         /// No-op (returns `false`) when there's no focusable surface.
+        /// Move the PiP window to `corner` and lay out again.
+        pub fn set_pip_corner(&mut self, conn: &mut impl FrescoConn, corner: forum_ctl::Corner) -> io::Result<()> {
+            self.pip_corner = corner;
+            let surfaces = conn.enumerate()?;
+            self.declare(conn, &surfaces).map(|_| ())
+        }
+
         pub fn toggle_zoom(&mut self, conn: &mut impl FrescoConn) -> io::Result<bool> {
             let surfaces = conn.enumerate()?;
             let active: Vec<WmSurfaceInfo> = surfaces
@@ -1612,6 +1674,10 @@ pub mod control {
                 let (groups, spanning) = wm.span_groups();
                 Reply::SpanGroups { groups, spanning, no_span: wm.displays.no_span.iter().cloned().collect() }
             }
+            Intent::PipCorner { corner } => match wm.set_pip_corner(conn, corner) {
+                Ok(()) => Reply::Ack,
+                Err(e) => Reply::Err { message: e.to_string() },
+            },
             Intent::SetAppSpans { app, spans } => match wm.set_app_spans(conn, &app, spans) {
                 Ok(()) => Reply::Ack,
                 Err(e) => Reply::Err { message: e.to_string() },
@@ -2465,4 +2531,29 @@ mod tests {
         handle_intent(&mut wm, &mut conn, Intent::SetAppearance { dark: false });
         assert_eq!(conn.appearance.map(|a| a.scheme), Some(fresco_protocol::APPEARANCE_LIGHT));
     }
+
+#[cfg(test)]
+mod pip_tests {
+    use super::*;
+    use forum_ctl::Corner;
+
+    #[test]
+    fn pip_sits_in_its_corner_at_a_quarter_width_and_snaps_to_the_nearest() {
+        let wa = WmRect { x: 0, y: 48, w: 1920, h: 984 };
+        let r = pip_rect(wa, (16, 9), Corner::BottomRight);
+        assert_eq!((r.w, r.h), (437, 246), "height capped at a quarter of the work area");
+        assert_eq!((r.x + r.w, r.y + r.h), (1920 - PIP_MARGIN, 48 + 984 - PIP_MARGIN));
+        let r = pip_rect(wa, (0, 0), Corner::TopLeft);
+        assert_eq!((r.x, r.y), (PIP_MARGIN, 48 + PIP_MARGIN), "no aspect: 16:9");
+        // A small screen still gets 160×90 at least.
+        let r = pip_rect(WmRect { x: 0, y: 0, w: 400, h: 300 }, (16, 9), Corner::TopLeft);
+        assert!(r.w >= 160 && r.h >= 90);
+        assert_eq!(nearest_corner(wa, 100, 900), Corner::BottomLeft);
+        assert_eq!(nearest_corner(wa, 1800, 100), Corner::TopRight);
+        // Above documents and panels, below chrome, HUDs and dialogs.
+        assert!(PIP_LAYER < layer(WmRole::Panel) && PIP_LAYER < DOC_FOCUSED);
+        assert!(PIP_LAYER > layer(WmRole::Chrome) && PIP_LAYER > layer(WmRole::Dialog) && PIP_LAYER > layer(WmRole::Hud));
+    }
+}
+
 }

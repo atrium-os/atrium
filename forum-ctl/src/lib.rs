@@ -105,6 +105,19 @@ pub enum Intent {
     ListSpanGroups,
     /// "Let app `app` span (true), or keep its zoom on one monitor."
     SetAppSpans { app: String, spans: bool },
+    /// "Move the picture-in-picture window to this corner" (a drag on it
+    /// ends as this; atrium-player-pip-keys.md §3.2). Remembered.
+    PipCorner { corner: Corner },
+}
+
+/// A corner of the work area, for picture-in-picture.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub enum Corner {
+    TopLeft,
+    TopRight,
+    BottomLeft,
+    #[default]
+    BottomRight,
 }
 
 /// A span group as the core reports it.
