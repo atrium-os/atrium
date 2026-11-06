@@ -458,7 +458,9 @@ Apps don't invoke sign-in directly; they request the
 role.
 
 ```c
-/* Initiated via libatrium_limen.h, role="sign-in" */
+/* Initiated via Limen, role="sign-in" (limen.md §2.9; a
+   system role whose provider is always Vestibulum).
+   v1 is Rust (limen::Parent); this C form is illustrative. */
 /* Messages on the role channel:
        parent → child:  { service, hints? }
        child → parent:  { result: { token, expires-at, … } }

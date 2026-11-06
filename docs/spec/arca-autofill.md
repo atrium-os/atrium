@@ -94,9 +94,9 @@ the user saw. For a `credential` slot, it refuses the `FILL` consume (new refusa
 `OBSCURED`) unless all of these held from 500 ms before the press until the press:
 
 - the slot's rect was entirely inside its window and the window inside the screen;
-- nothing was drawn above it: no parent content, no other window, no notification. Limen
-  lets a parent overlay ordinary slots (limen.md §5.1); a `credential` slot is
-  `z_policy: TOPMOST_IN_PARENT`, and frescod clips the parent's content out of its rect;
+- nothing was drawn above it: no parent content, no other window, no notification. Every
+  Limen slot is a child window pinned above its parent (limen.md §5.1), so the parent
+  can't draw over it; for a `credential` slot, frescod also checks other windows;
 - no opacity, blur, scale under 1 or transform applied to it by the parent;
 - it was at least 120 x 24 logical px;
 - it did not move or resize.
@@ -189,7 +189,7 @@ modes. Limen's role and Pergola's side are in §8.1.
 
 ## 6. Typing, generating and saving
 
-- **Typing.** Keys go to the focused surface, which is Arca's (limen.md §6.2). The app and
+- **Typing.** Keys go to the focused surface, which is Arca's (limen.md §6). The app and
   the page never see them. The Navigator's rule in arca.md §8.3 becomes this general one.
 - **Generating.** A `new-password` slot offers "Use a strong password". Arca creates it, and
   holds it as a pending item for the recipient. It's shown only on reveal, with a
@@ -217,7 +217,7 @@ modes. Limen's role and Pergola's side are in §8.1.
 
 ## 8. Interfaces
 
-- **Limen role `credential`** (limen.md §2): parent to child `configure { purpose,
+- **Limen role `credential`** (limen.md §2.8): parent to child `configure { purpose,
   username_field: bool }`; child to parent `filled { username: Option<String> }`,
   `handle { CredentialHandle }`, `cleared`. There's no message that carries the value.
 - **`CredentialHandle`**: 16 random bytes, meaningful only on this app's Arca channel, for

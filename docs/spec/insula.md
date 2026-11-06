@@ -968,6 +968,10 @@ many; users can swap it.
 
 ### 10.3 Cross-app composition
 
+> **2026-11-06:** [limen.md](limen.md) is the v1 design and wins where this section
+> differs. Slots are child windows that frescod pins into the parent, role messages are
+> postcard rather than CBOR, and `credential` and `sign-in` are system roles.
+
 The browser got the *idea* of `<iframe>` right (embed
 renderable content from a different trust domain) and the
 *implementation* wrong (in-process sandbox, SOP-as-trust-

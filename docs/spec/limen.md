@@ -1,796 +1,454 @@
-# Limen — cross-jail embed broker
+# Limen: the cross-jail embed broker
 
-Status: design sketch (pre-implementation). Reviewed and scoped 2026-11-06: see §16, which
-wins where it differs from the sections above.
-Last updated: 2026-11-06.
+Status: v1 design, for review (rewritten 2026-11-06 from the May 2026 sketch). Nothing is
+built except the `credential` role's message types (`limen/`, e710f18) and Pergola's slot
+plumbing (`pergola::slot`, `CredentialField`).
 
-**Limen** (Latin: *threshold, doorway*) is Insula's embed
-broker — the system service that mediates **cross-jail
-Fresco surface composition with typed message channels**.
-It is Insula's answer to `<iframe>` and to platform "intent"
-systems (Android Intents, iOS App Extensions), done as a
-first-class capability of Aqueduct + Fresco rather than as
-a retrofit.
+**Limen** (Latin: *threshold, doorway*) lets one app show part of another app inside its
+window, without either one trusting the other. An email client shows an HTML mail body
+rendered by the jailed document viewer. A sign-in form shows Arca's password field. An editor
+hosts an extension. Each embedded app runs in its own jail, draws in its own window, and talks
+to its host only through a typed **role** contract.
 
-This document expands `insula.md` §10.3 into implementation
-detail. The relationship to other specs:
+It is Atrium's answer to `<iframe>` and to platform intents (Android Intents, iOS App
+Extensions), but built from pieces that already exist: frescod pins windows, portcullisd
+launches jails, and Aqueduct carries the messages. Limen introduces the two sides and enforces
+the contract between them.
 
-- **`insula.md` §10.3** — the design summary, public framing,
-  pixel-readback guarantees, side-channel posture.
-- **`artifex.md` §7** — Artifex's use of Limen for its
-  `editor-extension` role and Stoa terminal embeds.
-- **`fresco-surfaces.md`** — surface-level compositor
-  contract that Limen rides on.
+Related specs:
+
+- [insula.md](insula.md) §10.3: the summary and the side-channel posture.
+- [arca-autofill.md](arca-autofill.md): the `credential` role and frescod's credential slots.
+- [vestibulum.md](vestibulum.md) §4.3, §7: the `sign-in` role.
+- [pergola.md](pergola.md) §10: the `doc-viewer` role's document contract.
+- [artifex.md](artifex.md) §7: the `editor-extension` role.
+- [tabula.md](tabula.md): drag and drop and the clipboard across the boundary.
 
 ## 0. Position
 
 ### 0.1 What Limen is
 
-- The platform service that turns "I want to embed an app
-  of role X" into a running jailed child whose Fresco
-  surface is composed into the parent's window.
-- The wire-format authority for *embed roles* — typed
-  contracts defining what messages a parent and child
-  exchange.
-- The mediator of capability transfer at the embed
-  boundary (no transitive caps; the child's caps come from
-  its own manifest).
-- The router for input events between the compositor and
-  the embedded child.
+- The service that turns "show a role-X embed here" into a running jailed child whose window
+  is pinned into a slot of the parent's window.
+- The authority on roles: which messages a parent and child may exchange, and which apps may
+  provide each role.
+- The relay for those messages, checking size and rate and knowing who is on each end.
+- The owner of an embed's lifecycle: attach, resize, hide, detach, crash.
 
 ### 0.2 What Limen is not
 
-- **Not a window manager.** Forum + Fresco compose surfaces
-  at the top level; Limen only manages the embedded-child
-  case (child surface owned by a different jail, rendered
-  into a slot inside the parent's surface).
-- **Not a UI library.** Limen has no widgets. It allocates
-  slots; what gets rendered in them is the child's affair.
-- **Not a generic IPC.** Aqueduct is the generic IPC.
-  Limen specifically wraps the (slot allocation + role
-  contract + lifecycle + capability boundary) bundle.
+- **Not a window manager.** frescod composes and Forum manages top-level windows. Limen only
+  asks frescod to pin a child window to a rect in its parent.
+- **Not a UI library.** Limen has no widgets. Pergola has the parent's slot widget and the
+  child's window.
+- **Not a general app bus.** Aqueduct is the general IPC, and there is deliberately no
+  app-to-app channel except a role's (pergola.md §1). Limen carries role messages and nothing
+  else.
+- **Not a pixel channel.** The parent never receives the child's pixels, and the child never
+  receives the parent's.
 
 ## 1. Architecture
 
 ```
-Parent app (Insula app in jail A)
-   │
-   │ atrium_limen_request_embed("doc-viewer", rect, options)
-   │
-   ▼
-limend ────────────────► Portcullis ────────► Child app
-   │                       (launch in jail B,    (Insula app
-   │                        embed mode)            in jail B)
-   │                                                 │
-   │ ◄──── slot id + child connection ───────────────┘
-   │
-   ▼
-Compositor (Fresco)
-   │
-   │  knows: parent surface has slot @ (rect)
-   │         slot's content owned by jail B
-   │
-   ▼
-Composed frame to display
-
-         + parallel typed-message channel
-         between parent and child via Aqueduct
+parent app (jail A)                         child app (jail B)
+  Pergola window W                            Pergola window C
+     │ request_embed(role, W, rect)              ▲ attach: role, channel
+     ▼                                           │
+   limend ── launch child (embed mode) ──► portcullisd
+     │       or ask a system provider for a new instance
+     │
+     ├── bind C into W at rect ──────────► frescod (slot op, §5)
+     │
+     └── relay role messages A ⇄ B, lifecycle events to A
 ```
 
-`limend` is the system daemon. It is *trusted* (in the
-TCB per `insula.md` §24.4) and runs as part of the Atrium
-core platform. Its surface is small: launch coordination,
-role lookup, capability checks, lifecycle events.
+`limend` is a small trusted daemon, running as its own user `_limen`. It holds no secrets and
+draws nothing. It knows four things: the role catalogue, who each connection is, which embeds
+exist, and which slot each one is in.
 
-The actual surface composition is the compositor's job;
-the actual message transport is Aqueduct's job. Limen is
-the *broker* — it does the introducing.
+**Identity is the connection, never a message** (as in [arca.md](arca.md) §4.1):
 
-## 2. Role catalogue
+- A **parent** connects to limend's socket. limend reads the peer uid and resolves it to
+  (user, app id) through the launch registry (`portcullis_peer::AppRegistry`). A parent can
+  embed only into a window it owns: limend checks the window's `owner_uid` with frescod.
+- A **child** is started by portcullisd at limend's request and inherits its end of the
+  channel as a descriptor, so limend knows which embed it is without asking. A system
+  provider that is already running (Arca, Vestibulum) instead connects to limend itself. It
+  is recognised by its uid, which the catalogue names (§2.0).
 
-A **role** is a typed contract between parent and child.
-Initial roles, expanded from `insula.md` §10.3.2:
+## 2. Roles
 
-> **A note on layering.** Insula's "typed message
-> channels" are a library-layer convention over
-> Aqueduct's opcode substrate, not an Aqueduct primitive.
-> Each role registers an Aqueduct opcode class; role
-> messages are CBOR payloads validated against the role's
-> CDDL schema. The Aqueduct substrate sees opcodes +
-> opaque bytes; the Limen SDK presents typed message
-> structs to app code. This layering keeps Aqueduct
-> minimal (right for substrate use cases like Fresco's
-> per-frame scene-graph deltas) while giving app
-> developers compile-time-checked messaging (right for
-> app-level protocols).
+A role is:
+
+1. a name (`doc-viewer`, or reverse-DNS for a vendor role);
+2. a Rust module of message types, postcard-encoded, in the `limen` crate (for example
+   `limen::credential`). Each side decodes with the role's types and refuses anything out of
+   shape. limend relays the bytes without decoding them;
+3. a provider rule: a fixed system service, or the user's default among apps whose manifest
+   declares the role;
+4. a slot kind (§5), and limits (message size and rate, lifetime).
+
+Messages are versioned by adding enum variants at the end; a peer that gets a variant it
+doesn't know drops the message. An incompatible change is a new role name (`doc-viewer.2`).
+
+### 2.0 System roles and user roles
+
+- **System roles** have exactly one provider, a system service named in limend's catalogue.
+  The user never picks it, and no app can register for it. `credential` is Arca and
+  `sign-in` is Vestibulum.
+- **User roles** are provided by installed apps that declare them (§3), and the user picks a
+  default.
+
+| role | kind | provider | slot kind | lifetime |
+|---|---|---|---|---|
+| `credential` | system | Arca | `credential` | as long as the form |
+| `sign-in` | system | Vestibulum | `credential` | one sign-in |
+| `doc-viewer` | user | default: the Navigator's document worker | `plain` | as long as the parent wants |
+| `picker` | user | default: Scrinium | `plain` | one pick |
+| `share-target` | user | the app the user chose in the share sheet | `plain` | one share |
+| `media-player` | user | default media app | `plain` | as long as the parent wants |
+| `payment` | user | the user's payment app | `credential` | one payment |
+| `map` | user | default map app | `plain` | as long as the parent wants |
+| `editor-extension` | user | the extension the user installed | `plain` | as long as the parent wants |
 
 ### 2.1 `doc-viewer`
 
-Renders a document URL into the slot. Read-only by
-default.
+Renders a document that the parent doesn't trust (an HTML mail body, a downloaded help page,
+a file preview) in a jailed child. The child runs the Navigator's document worker (layout,
+zoom, big-document bands, replay) and scrolls with Pergola's `ScrollView` inside its own
+window (pergola.md §10).
 
-| Direction | Message | Payload |
+| direction | message | payload |
 |---|---|---|
-| Parent → Child | `load` | `url: string, theme?: string` |
-| Parent → Child | `set_theme` | `theme: string` |
-| Parent → Child | `scroll_to` | `anchor: string` |
-| Child → Parent | `loaded` | `title: string, anchors: [string]` |
-| Child → Parent | `error` | `code: int, message: string` |
-| Child → Parent | `link_clicked` | `url: string, modifiers: ...` |
-| Child → Parent | `selection` | `text: string, range: ...` |
+| parent → child | `Load` | `doc: DocRef` (a Tabula-style blob the parent uploaded, or a URL the child fetches through its own jailed fetcher), `theme` |
+| parent → child | `SetTheme` | `theme` |
+| parent → child | `ScrollTo` | `anchor: String` |
+| child → parent | `Loaded` | `title: String` (at most 256 bytes), `anchors: Vec<String>` (at most 256 of them) |
+| child → parent | `LinkActivated` | `url: String`. Only after a press in the child; the parent decides whether to open it |
+| child → parent | `Error` | `code: u16` |
 
-Used by: Artifex (Markdown preview), email clients
-(rendering HTML mail bodies), help systems, RSS readers.
-
-Implemented by the Navigator's jailed document worker (layout,
-zoom, big-document bands, replay); scrolling inside the slot is
-Pergola's `ScrollView` (pergola.md §10, 2026-11-06).
+The child never sends the parent document text. A selection leaves only through the
+clipboard, on the user's Ctrl-C in the child (tabula.md).
 
 ### 2.2 `media-player`
 
-Plays an audio/video stream.
-
-| Direction | Message | Payload |
+| direction | message | payload |
 |---|---|---|
-| Parent → Child | `load` | `url: string, mime: string` |
-| Parent → Child | `play` / `pause` / `stop` | — |
-| Parent → Child | `seek` | `time: float (seconds)` |
-| Parent → Child | `set_volume` | `volume: float (0-1)` |
-| Child → Parent | `ready` | `duration: float, codecs: [string]` |
-| Child → Parent | `time_update` | `time: float` (rate-limited) |
-| Child → Parent | `ended` | — |
-| Child → Parent | `error` | `code: int, message: string` |
+| parent → child | `Load` | `media: DocRef`, `mime` |
+| parent → child | `Play`, `Pause`, `Stop` | none |
+| parent → child | `Seek` | `secs: f64` |
+| parent → child | `SetVolume` | `volume: f32` (0 to 1) |
+| child → parent | `Ready` | `duration_secs: f64` |
+| child → parent | `Time` | `secs: f64`, at most 4 a second |
+| child → parent | `Ended` | none |
+| child → parent | `Error` | `code: u16` |
 
 ### 2.3 `picker`
 
-One-shot resource picker (file, contact, photo, …).
-Powerbox pattern (`insula.md` §5.2): user picks one item,
-child returns just that item, vanishes.
+One-shot powerbox ([insula.md](insula.md) §5.2): the user picks items in the child's UI, and
+only those items reach the parent.
 
-| Direction | Message | Payload |
+| direction | message | payload |
 |---|---|---|
-| Parent → Child | `open` | `filter: { kind, mime?, multiple? }` |
-| Child → Parent | `picked` | `items: [{ fd?, uri?, metadata }]` |
-| Child → Parent | `cancelled` | — |
+| parent → child | `Open` | `filter: { kind, mime, multiple }` |
+| child → parent | `Picked` | `items: Vec<Item>`; a file comes as a descriptor that limend passes with the message |
+| child → parent | `Cancelled` | none |
 
-Always short-lived. Slot dismisses on `picked` or
-`cancelled`.
+The embed detaches on `Picked` or `Cancelled`.
 
 ### 2.4 `share-target`
 
-Inverse of picker — parent has content to hand off;
-child receives.
+The opposite of `picker`. The parent has content, and the share sheet (pergola.md §1) has the
+user choose a target app, which receives it.
 
-| Direction | Message | Payload |
+| direction | message | payload |
 |---|---|---|
-| Parent → Child | `share` | `items: [{ fd?, text?, uri?, mime }]` |
-| Child → Parent | `accepted` | `summary: string` |
-| Child → Parent | `declined` | `reason?: string` |
+| parent → child | `Share` | `offer: Offer`, the same type as Tabula's clipboard entries (tabula.md §0) |
+| child → parent | `Accepted` | none |
+| child → parent | `Declined` | none |
 
 ### 2.5 `payment`
 
-Handles a payment flow. Specifically:
-
-| Direction | Message | Payload |
+| direction | message | payload |
 |---|---|---|
-| Parent → Child | `start` | `amount, currency, merchant, ref, methods: [string]` |
-| Child → Parent | `completed` | `receipt: { ref, method, ts, signature }` |
-| Child → Parent | `cancelled` | — |
-| Child → Parent | `error` | `code, message` |
+| parent → child | `Start` | `amount, currency, merchant, reference, methods` |
+| child → parent | `Completed` | `receipt: { reference, method, at, signature }` |
+| child → parent | `Cancelled` | none |
+| child → parent | `Error` | `code: u16` |
 
-Payment data flows *only* between user and child (which
-runs the trusted payment app's UI). Parent receives a
-receipt, never card numbers or account details. Strictly
-stronger than `<input type=card>`.
+Card numbers and account details stay between the user and the child. The parent gets a
+receipt. The slot is a `credential` kind, so the press that pays has the same visibility
+check as a password fill.
 
 ### 2.6 `map`
 
-Embedded map widget with markers and navigation.
-
-| Direction | Message | Payload |
+| direction | message | payload |
 |---|---|---|
-| Parent → Child | `set_view` | `lat, lng, zoom` |
-| Parent → Child | `add_marker` | `id, lat, lng, label?` |
-| Parent → Child | `remove_marker` | `id` |
-| Child → Parent | `view_changed` | `lat, lng, zoom, bounds` |
-| Child → Parent | `marker_clicked` | `id` |
-| Child → Parent | `clicked` | `lat, lng` |
+| parent → child | `SetView` | `lat, lng, zoom` |
+| parent → child | `AddMarker` / `RemoveMarker` | `id, lat, lng, label` / `id` |
+| child → parent | `ViewChanged` | `lat, lng, zoom` |
+| child → parent | `MarkerActivated` | `id` |
 
 ### 2.7 `editor-extension`
 
-Detailed in `artifex.md` §7.2. Wire-format ownership:
-`limen.md` defines the *role*; `artifex.md` defines what
-Artifex specifically does with it.
+Defined in [artifex.md](artifex.md) §7.2. This spec owns the role's mechanics; artifex.md owns
+what Artifex does with it.
 
-### 2.8 Adding new roles
+### 2.8 `credential`
 
-A role is defined by:
-1. A registered name (string, `category.kind` form;
-   reverse-DNS allowed for vendor-specific roles).
-2. A typed message schema (CBOR, versioned).
-3. A capability profile — what the child app's manifest
-   may declare to implement the role.
-4. Defaults and lifecycle policy.
+Defined in [arca-autofill.md](arca-autofill.md) §8 and built as `limen::credential`. It has
+`Configure` from parent to child, and `Filled`, `Handle` and `Cleared` from child to parent.
+No message carries the secret.
 
-Platform-blessed roles live in the canonical Limen
-catalogue and ship with the platform. Vendor-specific
-roles can be added under reverse-DNS namespaces with
-their own schemas; the platform does not enforce
-correctness of vendor roles but Limen still mediates
-launch, capability, and slot mechanics.
+### 2.9 `sign-in`
 
-## 3. Role implementation registration
+Defined in [vestibulum.md](vestibulum.md) §7. It has `Begin { service, hints }` from parent
+to child, and `Done { result }`, `Cancelled` or `Error` from child to parent.
+
+## 3. Providers of user roles
 
 ### 3.1 In the app manifest
 
-An app declares which roles it implements:
-
 ```toml
-[role.implements]
-"doc-viewer" = { schema = "1.x" }
-"share-target" = { schema = "1.x", mime = ["text/*", "image/*"] }
+[roles]
+implements = ["doc-viewer", "share-target"]
+
+[roles.share-target]
+mime = ["text/*", "image/*"]
 ```
 
-Limen indexes this at install time; the index lives in
-Curia (system settings) as a (role, schema-version) →
-[apps] map.
+portcullisd checks this at install time, as it does every manifest. limend reads the
+installed apps' declarations from the app tree (`/var/lib/atrium/apps/*/atrium.toml`) at
+start and when an install changes it. A manifest can't declare a system role.
 
-> **Status.** Curia exists in NAMING.md as the
-> system-settings store but does not yet have its own
-> spec. The "Limen indexes role-implementations in
-> Curia" claim assumes Curia's eventual key/value API.
-> Until Curia ships, Limen's index can live in a
-> dedicated `~/Library/Application Support/atrium/limen/
-> roles.db` (macOS) / equivalent local store — semantics
-> unchanged.
+### 3.2 Choosing a default
 
-### 3.2 Default-app selection
+- With one provider, it is used.
+- With more than one, and no choice made yet, limend uses the platform default from its
+  catalogue and remembers that the user hasn't chosen. Asking the user is Curia's job
+  (default-app settings), which doesn't exist yet.
+- The user's choice is stored per user in limend's own store until Curia exists.
 
-When multiple apps implement the same role:
+### 3.3 No provider
 
-1. **First install wins** transiently — until user picks.
-2. **User explicitly picks** in Curia → "Default apps"
-   the first time a role is invoked with no default set.
-3. Subsequent invocations use the user's pick until
-   re-set.
-4. Per-role schema versioning means an app implementing
-   an old schema can coexist with one implementing a new
-   schema; Limen picks the highest schema both endpoints
-   support.
+The parent gets `NoProvider` and shows its own fallback (for a doc-viewer, the document as
+plain text). The install prompt waits for Curia and the package UI.
 
-### 3.3 No implementation installed
-
-If a role is requested and no implementing app exists:
-
-1. Limen prompts the user via a system dialog: "App X
-   wants a `<role>`. Install a `<role>` provider?"
-2. The dialog suggests platform-default candidates from
-   the configured Opifex registry.
-3. If the user declines, the parent gets
-   `EMBED_NO_PROVIDER` and handles gracefully.
-
-## 4. Launch protocol
-
-Concrete sequence for `request_embed("doc-viewer", rect, opts)`:
+## 4. Launch and attach
 
 ```
-Parent                       limend                      Compositor          Child
-  │  request_embed             │                             │                 │
-  ├───────────────────────────►│                             │                 │
-  │                            │ resolve role "doc-viewer"   │                 │
-  │                            │ → user's default = atrium-doc│                │
-  │                            │                             │                 │
-  │                            │ ask Portcullis to launch    │                 │
-  │                            │ atrium-doc in embed mode    │                 │
-  │                            │                             │                 │
-  │                            │                             │     execve      │
-  │                            │ ───────────────────────────►│ ───────────────►│
-  │                            │                             │                 │
-  │                            │ allocate slot in parent's   │                 │
-  │                            │ surface                     │                 │
-  │                            ├────────────────────────────►│                 │
-  │                            │                             │                 │
-  │                            │ wire slot ↔ child surface   │                 │
-  │                            ├────────────────────────────►│                 │
-  │                            │                             │                 │
-  │                            │ open typed Aqueduct channel │                 │
-  │                            │ parent ↔ child for "doc-viewer" role         │
-  │                            ├──────────────────────────────────────────────►│
-  │                            │                             │                 │
-  │  attached(slot_id, channel)│                             │                 │
-  │◄───────────────────────────┤                             │                 │
-  │                                                          │  child renders  │
-  │  load("atrium-doc://...")                                │                 │
-  ├──────────────────────────────────────────────────────────┼────────────────►│
+parent                    limend                 portcullisd       frescod        child
+  │ RequestEmbed{role,      │                        │                │             │
+  │  window, rect, slot}    │                        │                │             │
+  ├────────────────────────►│ is window owned by     │                │             │
+  │                         │ parent's uid? ─────────┼───────────────►│             │
+  │                         │ role → provider        │                │             │
+  │                         │ ExecInstance(embed)───►│ jail, exec ────┼────────────►│
+  │                         │◄── child connects on inherited channel ─┼─────────────┤
+  │                         │                        │                │  child opens │
+  │                         │◄── ChildReady{window} ─┼────────────────┼─────────────┤
+  │                         │ bind slot(child win,   │                │             │
+  │                         │  parent win, rect,kind)┼───────────────►│             │
+  │◄── Attached{embed} ─────┤                        │                │             │
+  │ Send{embed, bytes} ────►│──── relay ─────────────┼────────────────┼────────────►│
 ```
 
-Latency budget for cold launch:
-- Limen role lookup: <1 ms.
-- Portcullis fork+exec+jail-setup: ~500 µs from pool
-  (`insula.md` §8).
-- Slot allocation + wiring: ~100 µs.
-- Channel open: ~100 µs.
-- First message delivery: ~50 µs.
+- **User roles**: limend asks portcullisd for an `ExecInstance` of the provider app in embed
+  mode. That's one jail per embed, discarded at exit, with the provider's own manifest
+  capabilities. The parent's identity goes to the child as data (`Attach { parent_app }`),
+  never as authority.
+- **System roles**: limend asks the provider, which is already running, for a new instance
+  over the provider's own connection. The provider opens a new window for it.
+- The child's window is not shown on its own until it is bound. frescod keeps a window
+  hidden while it is waiting to be bound (the `embed_pending` window hint), so a child can't
+  flash up as a top-level window.
+- `Attached` reaches the parent only after frescod has bound the slot.
 
-**Cold attached event in <1 ms typical.** First user-
-perceivable content depends on the child's startup (file
-load, render, etc.).
+## 5. Slots
 
-## 5. Surface slot mechanics
+### 5.1 A slot is a child window pinned into its parent
 
-### 5.1 Slot allocation
+frescod already does this for credential slots ([arca-autofill.md](arca-autofill.md) §4.1),
+and v1 generalises the same op:
 
-When Limen allocates a slot, it tells the compositor:
+- frescod places the child window at the parent's position plus the slot rect, gives it the
+  rect's size (the child hears the resize), and keeps it directly above its parent in z-order;
+- if either window goes away, frescod releases the slot and destroys nothing else.
 
-```
-slot_id      : opaque handle
-parent_surface : (jail, surface)
-slot_rect    : (x, y, w, h) in parent-surface coords
-child_surface_owner: jail B (just launched)
-input_policy : { keyboard, pointer, scroll, drop }
-audio_policy : NONE | OWN_CONTEXT
-transparency : OPAQUE | ALPHA_BLEND
-z_policy     : ABOVE_PARENT_CONTENT
-```
+This gives the guarantees with no new compositor machinery:
 
-The compositor enforces:
-- The child's surface is composed *into* the parent's
-  surface at `slot_rect`.
-- The parent's process can render *above* the slot
-  (overlays in parent surface) but **cannot read** the
-  child's pixels.
-- The child's process renders *only* into the slot's
-  bounds; clipping enforced by compositor.
+- **No pixel readback.** The child's pixels are another window's, and no client can read
+  another window.
+- **No drawing over the slot.** The parent draws only in its own window, which is below the
+  child. A parent menu or popover over an embed has to be its own window, above both. Pergola's
+  popups are separate windows for this reason.
+- **Input** follows from z-order: the slot is the topmost window under the pointer, so
+  frescod routes there (§6).
 
-### 5.2 Resize
+The slot op takes a **kind**:
 
-Parent can resize the slot:
+- `plain`: pinned, clipped to the parent, and nothing else.
+- `credential`: pinned, plus frescod's visibility record, `FILL` presses, and the frame that
+  frescod draws (arca-autofill.md §4).
 
-```c
-atrium_limen_resize_slot(slot_id, new_rect);
-```
+Only limend may bind slots. The op has its own allowlist (`_limen`) instead of the whole
+window-management socket. `OP_WM_CREDENTIAL_SLOT` stays as the test stand-in until the general
+op lands.
 
-Compositor notifies child of new viewport; child re-lays-
-out. Standard surface-resize semantics.
+### 5.2 Placing, moving, hiding
 
-### 5.3 Visibility
+The parent's Pergola window reports each slot's window rect after layout
+(`pergola::slot::SlotBinder`, e710f18). It sends only changes, after the frame that makes
+room for the slot is presented. limend forwards these to frescod.
 
-Parent can hide/show:
+- **Clipped means hidden.** A slot that a scroll view clips, even partly, is released until
+  it is whole again, because a pinned window can't be partly clipped by its parent's scroll
+  view.
+- **Hidden** (`SetVisible(false)`, or clipped): frescod hides the child window, and the child
+  gets `Suspended` and should stop drawing.
+- **Each move restarts** a `credential` slot's 500 ms visibility run, so a field that is moving
+  can't be filled.
 
-```c
-atrium_limen_set_visibility(slot_id, visible);
-```
+### 5.3 Detach
 
-Hidden slots: child is paused (no input, no frame
-updates). Re-shown: child resumes. This is how panel-
-based UIs in Artifex hide their sidebar extensions
-without tearing them down.
+The parent sends `Detach`, or closes its window, or exits. limend tells the child `Detaching`,
+gives it 500 ms, then asks portcullisd to end the jail (user roles) or tells the provider the
+instance is gone (system roles). The parent gets `Detached`.
 
-### 5.4 Detach
+## 6. Input, focus, clipboard, drag and drop
 
-Parent can detach the slot (terminate the child):
+- **Pointer**: the slot is the topmost window at that point, so frescod sends the event to the
+  child, in the child's coordinates. The parent never sees it.
+- **Keyboard**: focus is per window. A click in the slot focuses the child's window, so keys
+  go to the child. Tab at the end of the child's focus order and Shift-Tab at the start send
+  `FocusOut { forward }` to limend, which tells the parent to focus its next widget. frescod
+  focuses the parent window. System shortcuts go to Forum, as always.
+- **Clipboard and drag and drop** are Tabula's, with the child as one more window: a paste in
+  the child needs a press in the child (tabula.md §2), and a drop onto the slot goes to the
+  child (tabula.md §4).
+- **Scroll**: the child scrolls its own content. Handing a scroll on to the parent at the
+  edge is not in v1.
 
-```c
-atrium_limen_detach(slot_id);
-```
-
-Child gets SIGTERM with grace period; slot is freed;
-parent gets `detached` event.
-
-## 6. Input routing
-
-### 6.1 Pointer events
-
-Compositor hit-tests the cursor:
-- Inside slot rect → routed to child (in child's
-  coordinate space).
-- Outside slot → parent.
-- Multi-touch / gesture events broken across slot
-  boundaries → routed by primary touch point.
-
-The parent never sees pointer events that land inside a
-slot, even for forwarding purposes. (If the parent
-explicitly requests `input_policy.pointer = NONE`, the
-slot is decorative and events pass through to parent.)
-
-### 6.2 Keyboard
-
-Routed based on focus. Pergola's focus model:
-- Each surface has a *focused widget*.
-- When a slot is the focused widget, keyboard events go
-  to the child.
-- When the child's internal focus is on a non-text
-  widget (e.g., a button), keyboard events may bubble
-  back via Limen-mediated focus transfer.
-
-Modifier-only system shortcuts (Cmd-Tab, Cmd-Q, etc.) go
-to the WM, never to the child or parent.
-
-### 6.3 Scroll
-
-Within slot rect → child. Outside → parent. Scroll
-chaining (when child reaches scroll boundary, parent
-scrolls) is opt-in per role; default off.
-
-### 6.4 Drag-and-drop across the boundary
-
-Mediated by the system DnD service:
-- User initiates drag in parent.
-- Cursor crosses into slot rect → system shows drop-
-  zone indicator; child gets drag-enter event.
-- Drop → system mints a one-shot capability for the
-  dropped content (file fd, text, URI list); delivers to
-  child.
-
-Neither side fakes the drag content; the system is the
-trust anchor for DnD across jail boundaries.
-
-## 7. Lifecycle and error handling
-
-### 7.1 States observable from the parent
+## 7. Lifecycle and errors
 
 ```
-                request_embed
-                     │
-                     ▼
-                 LAUNCHING
-                     │
-                     ▼
-                  ATTACHED
-                  /      \
-                 /        \
-                ▼          ▼
-              SUSPENDED   CHILD_LOST
-              (hidden)      │
-                │           ▼
-                ▼        DETACHED
-              ATTACHED
+RequestEmbed ─► LAUNCHING ─► ATTACHED ◄─► SUSPENDED
+                    │            │
+                    ▼            ▼
+                 FAILED      CHILD_LOST ─► DETACHED
 ```
 
-Parent receives messages:
-- `attached(slot_id, channel)` — embed live.
-- `suspended` / `resumed` — visibility changes.
-- `child_lost(reason)` — child crashed, exceeded
-  resource limits, exited unexpectedly.
-- `detached(reason)` — orderly shutdown.
+The parent receives:
 
-### 7.2 Child crash handling
+- `Attached { embed }`;
+- `Suspended` and `Resumed`;
+- `Message { bytes }`;
+- `ChildLost { reason }` (crashed, over its limits, or exited);
+- `Detached`;
+- `Refused { reason }` (`NoProvider`, `NotYourWindow`, `UnknownRole`, `TooMany`).
 
-A crashed child:
-1. Compositor sees disconnect, holds last frame as a
-   placeholder.
-2. limend detects, sends `child_lost(reason)` to parent.
-3. Parent decides: retry (request_embed again), show
-   "extension stopped" UI, or detach permanently.
+On a crash, frescod releases the slot and the parent's own placeholder shows (the
+`CredentialField` well, for example). The parent decides whether to ask again.
 
-The editor in Artifex shows "Extension X stopped
-responding [Restart]" in its place; the user clicks
-Restart, parent re-invokes `request_embed`.
+**Limits** (per parent): at most 16 live embeds, at most 64 KiB per message, and at most 256
+messages a second each way per embed. Over the rate, messages are dropped and the parent is
+told once. Jail limits on the child (memory, CPU) are portcullisd's (`ExecInstance`'s
+`memory_mb`, `cpu_pct`), set per role in the catalogue.
 
-### 7.3 Resource exhaustion
+## 8. Capability and trust
 
-`rctl` limits on the child's jail are enforced by the
-kernel. When exceeded:
-- CPU: child is throttled but stays alive.
-- RSS: child is SIGKILL'd; `child_lost("rss_exceeded")`.
-- Wall time: SIGKILL'd; `child_lost("wall_exceeded")`.
+- **The child's capabilities come from its own manifest**, never the parent's. The parent
+  can't grant the child anything, smuggle capabilities through, or pin an old version. Neither
+  side has authority over the other.
+- **Choosing a default provider is the trust decision**: "I trust this app to show documents
+  when another app asks". It is one decision per role, not one per site.
+- **Messages are data.** limend relays bytes and enforces size and rate. Each side's role
+  types refuse anything out of shape, and a side never acts on a message as if the user had
+  asked. Anything that needs the user's intent (opening a link, paying, filling) needs a press
+  in the child's window, which frescod vouches for.
+- **Per-embed consent** (`payment`) is shown by the provider in its own slot, where the
+  parent can't draw over it.
 
-Defaults are conservative; manifests can request higher
-limits (and the user reviews them at install).
+## 9. Accessibility
 
-## 8. Capability and consent
+The accessibility tree should span the boundary: the slot is an `embedded-content` node in
+the parent's tree, and atrium-ax grafts the child's tree there. That waits for atrium-ax and
+is not in v1. Until then a screen reader reads the child's window on its own when it is
+focused.
 
-### 8.1 Child's capabilities are its own
+## 10. Side channels
 
-This is load-bearing and worth restating: **the child's
-capabilities come from the child's own manifest, not the
-parent's.** The parent cannot grant the child anything.
-The parent cannot smuggle elevated capabilities. The
-parent cannot pin a vulnerable old version.
-
-Trust is symmetric — parent and child each see what they
-see, neither has authority over the other.
-
-### 8.2 The user's choice of default app is the trust act
-
-When the user picks (e.g.) atrium-doc as their default
-`doc-viewer`, they are *trusting that app* for embeds of
-that role across the platform. The trust statement is
-not "I trust app X" but "I trust app Y to render
-document content when app X asks for it."
-
-This is a more honest trust model than the web's same-
-origin policy — the user makes one capability decision
-per role, not zero.
-
-### 8.3 Per-embed consent (rare)
-
-For high-stakes roles (payment, identity-claim), Limen
-may surface a per-invocation consent UI even if the
-default app is set. The role's metadata declares whether
-per-embed consent is required. Default-no; opt-in by
-role.
-
-## 9. Accessibility composition
-
-The AX tree spans the boundary (`insula.md` §10.4
-decision 4). Concretely:
-
-- The compositor's slot has an AX node with
-  `role = embedded-content`.
-- atrium-ax (the AX service) subscribes to the child's
-  AX subtree.
-- The subtree is grafted into the parent's tree at the
-  slot's AX position.
-- Screen readers traversing the parent see one
-  continuous tree.
-
-When the slot is hidden, its AX subtree is hidden too.
-When the child sends an AX-relevant update, Limen
-propagates it to atrium-ax which propagates it to
-subscribers.
-
-## 10. Side channels and mitigations
-
-Restating `insula.md` §10.3.6 in implementation terms:
-
-| Channel | Mitigation |
+| channel | what stops it |
 |---|---|
-| Pixel readback | Compositor architecturally never gives parent the child's pixel buffer. The shared GPU memory the parent has access to does not include the child's allocations. |
-| Render-completion timing | Limen does not surface frame-precise rendering events to the parent. Role-level events (`loaded`, `time_update`) are coalesced. |
-| Shared GPU caches | Per-jail GPU contexts at the driver layer (Atrium GPU ABI requirement). Cross-jail GPU work cannot share cache lines. |
-| Audio capture | Audio output requires the `media-output` capability; embed `audio_policy` controls whether the child can play audio at all. |
-| Storage / network sharing | None — each jail has its own; the embed boundary does not connect them. |
+| pixel readback | each side is a separate window; no client reads another window's pixels |
+| drawing over the slot to mislead | the parent is below the child in z-order; for `credential` slots, frescod's visibility record and frame |
+| frame timing | limend relays role messages only, with no frame events. Role events such as `Time` are rate-limited |
+| GPU caches | per-window renderers in split mode (fresco-f4-split.md) |
+| audio | needs the child's own `media-output` capability |
+| storage and network | none shared: each jail has its own |
 
-The damaging-but-residual concerns (timing attacks,
-hardware side channels, Spectre-class) are addressed at
-the Atrium kernel + GPU driver layer, not at Limen.
-Limen surfaces what is enforceable architecturally and
-relies on the lower layers for the rest.
+Timing and hardware side channels (Spectre-class) are the kernel's and GPU driver's to
+handle, not Limen's.
 
-## 11. API
+## 11. API (Rust)
 
-### 11.1 Parent-side (`libatrium_limen.h`)
+```rust
+// parent side, in pergola (with limen's role types)
+let embed = limen::Parent::connect()?            // LIMEN_SOCKET or /var/run/atrium/limend.sock
+    .request(Role::DocViewer, window_id, slot_key)?;
+embed.send(&doc_viewer::ToChild::Load { .. })?;
+while let Some(ev) = embed.poll()? { /* Attached, Message, ChildLost, ... */ }
 
-```c
-typedef struct atrium_limen_t atrium_limen_t;
+// The Window's SlotBinder is limen::Parent: slot rects go to limend as they change.
 
-typedef struct {
-    enum atrium_limen_input_t input;     // FULL | NONE | DECORATIVE
-    enum atrium_limen_audio_t audio;     // NONE | OWN_CONTEXT
-    enum atrium_limen_alpha_t alpha;     // OPAQUE | ALPHA
-} atrium_limen_options_t;
-
-atrium_limen_t* atrium_limen_request_embed(
-    atrium_window_t* window,
-    atrium_rect_t   rect,
-    const char*     role,
-    const atrium_limen_options_t* opts);
-
-int atrium_limen_send(atrium_limen_t* slot,
-                      const char* msg_name,
-                      const uint8_t* payload, size_t len);
-
-typedef struct {
-    enum {
-        EMBED_EVENT_ATTACHED,
-        EMBED_EVENT_MESSAGE,
-        EMBED_EVENT_SUSPENDED,
-        EMBED_EVENT_RESUMED,
-        EMBED_EVENT_CHILD_LOST,
-        EMBED_EVENT_DETACHED,
-    } kind;
-    /* event-specific payload */
-} atrium_limen_event_t;
-
-int atrium_limen_poll(atrium_limen_t* slot,
-                      atrium_limen_event_t* out);
-
-void atrium_limen_resize(atrium_limen_t* slot,
-                         atrium_rect_t new_rect);
-void atrium_limen_set_visibility(atrium_limen_t* slot,
-                                 bool visible);
-void atrium_limen_detach(atrium_limen_t* slot);
+// child side
+let me = limen::Child::attach()?;                 // None when not started as an embed
+let role = me.role();                             // and the parent's app id, as data
+let window = Window::open(&me.window_desc())?;    // embed_pending until bound
+me.ready(window.id())?;
 ```
 
-### 11.2 Child-side (`libatrium_limen_self.h`)
+The C SDK waits for an Insula app that needs it.
 
-```c
-typedef struct atrium_limen_self_t atrium_limen_self_t;
+## 12. Build plan
 
-/* Called by an Insula app when launched in embed mode.
-   Returns NULL if not in embed mode. */
-atrium_limen_self_t* atrium_limen_self_attach(void);
+| step | work | owner |
+|---|---|---|
+| L0 | `limen` crate: the role catalogue, `Parent` and `Child`, wire types for limend (`RequestEmbed`, `Attached`, `Send`, …) | Pergola thread |
+| L1 | `limend`: identity from the peer uid and the registry, window ownership checked with frescod, embeds, relay, limits, lifecycle. Linux tests with a fake launcher and a fake frescod | Pergola thread |
+| L2 | frescod: the general slot op with a kind, the `_limen` allowlist, and the `embed_pending` hint | Fresco thread |
+| L3 | portcullisd: `ExecInstance` in embed mode, with the channel inherited | Pergola thread, reviewed by portcullisd's owner |
+| L4 | Pergola: `limen::Parent` as the `Window`'s `SlotBinder`, `CredentialField` on it, and the child side for Pergola apps | Pergola thread |
+| L5 | `credential` end to end against a stand-in Arca child, in the VM in split mode. The activation probe's covers are still refused | Pergola thread |
+| L6 | `doc-viewer` with the Navigator's document worker as the child | Pergola thread, with the Navigator thread |
 
-const char* atrium_limen_self_role(atrium_limen_self_t*);
-
-typedef struct {
-    const char* msg_name;
-    const uint8_t* payload;
-    size_t len;
-} atrium_limen_self_msg_t;
-
-int atrium_limen_self_poll(atrium_limen_self_t*,
-                           atrium_limen_self_msg_t* out);
-
-int atrium_limen_self_emit(atrium_limen_self_t*,
-                           const char* msg_name,
-                           const uint8_t* payload, size_t len);
-
-atrium_window_t* atrium_limen_self_window(atrium_limen_self_t*);
-/* The window the embed is rendering into; the child uses
-   this with normal Pergola/Fresco calls. */
-```
-
-### 11.3 Rust SDK
-
-Thin wrapper above the C ABI; idiomatic Rust types
-(`Result<T, EmbedError>`, async `poll_event`, typed
-message structs derived from the role schema).
-
-## 12. Performance targets
-
-| Metric | Target |
-|---|---|
-| Role lookup | <1 ms |
-| Cold launch via Portcullis from jail pool | ~500 µs |
-| Slot allocation + wiring | ~100 µs |
-| Channel open | ~100 µs |
-| **`attached` event (cold)** | **<1 ms** total |
-| Per-message latency on warm channel | ~5–20 µs (Aqueduct local) |
-| Resize / visibility change | <100 µs |
-| Detach (orderly) | ~500 µs grace + cleanup |
-
-## 13. Bring-up phases
-
-### 13.1 Phase A — core mechanism
-
-- `limend` daemon stub: role lookup against an in-memory
-  catalogue; Portcullis launch coordination; slot
-  allocation against Fresco; Aqueduct channel wiring.
-- Two roles implemented end-to-end: `picker` (the simplest
-  short-lived case) and `editor-extension` (Artifex's
-  load-bearing case).
-- Parent-side and child-side C SDKs at the level of §11.
-
-Goal: Artifex can run extensions; Scrinium can be invoked
-as a picker via Limen.
-
-### 13.2 Phase B — full initial role catalogue
-
-- `doc-viewer`, `media-player`, `share-target`, `payment`,
-  `map` schemas + a reference child app for each.
-- Default-app management UI in Curia.
-- Per-embed consent flow for `payment`.
-
-### 13.3 Phase C — A11y bridge
-
-- Composition with atrium-ax (sibling spec, planned).
-- AX subtree subscription, slot AX node propagation.
-- Inspector app integration: an inspector can walk the
-  composed tree across jail boundaries.
-
-### 13.4 Phase D — production hardening
-
-- Resource exhaustion handling with sensible defaults
-  per role.
-- Crash-and-restart polish.
-- Drag-and-drop across boundary, integrated with the
-  system DnD service.
-- Performance optimization to meet §12 targets.
-
-## 14. Open questions
-
-- **CBOR schema language.** Role schemas should be
-  formally specified; CBOR-via-CDDL is the obvious
-  candidate but tooling and Rust ergonomics need
-  evaluation.
-- **Role versioning policy.** Schema bumps within a
-  major version are backward-compatible additions;
-  major bumps are coordinated. Detailed policy TBD.
-- **Vendor role mediation.** Platform mediates launch /
-  capability / slot for vendor roles, but does not
-  enforce wire correctness — is that the right line?
-  An "official" vs. "experimental" tier for roles may
-  be warranted.
-- **Multiple slots from the same child.** Today's model is
-  one slot per embed instance. A child app implementing
-  a role might want to render into multiple slots (e.g.,
-  a sidebar + a status-bar segment). Two-slot extension
-  shape needs design.
-- **Long-running vs. short-lived embeds.** Pickers detach
-  immediately; terminals last for hours; assist
-  extensions may persist across multiple workspaces. The
-  default lifecycle policy per role is part of role
-  metadata; specifics TBD.
-- **Cross-host embedding.** Can a Limen slot's child run
-  on a remote Atrium host (combining `insula.md` §20.2
-  with embed)? Architecturally yes (Aqueduct + Fresco
-  are network-transparent); operationally, latency
-  budgets need tightening. Defer to v2.
-
-## 15. References
-
-- `docs/spec/insula.md` — parent spec; §10.3 is the
-  design summary.
-- `docs/spec/artifex.md` — §7 is the IDE's use of Limen.
-- `docs/spec/fresco-surfaces.md` — surface-level
-  compositor contract.
-- `docs/spec/aqueduct.md` — IPC substrate; the typed
-  message channel.
-- `docs/spec/portcullis.md` — jail launcher; how Limen
-  asks for embedded-mode child launches.
-- `docs/NAMING.md` — naming reference (Limen entry).
-- Future sibling: `docs/spec/atrium-ax.md` — AX tree
-  composition referenced from §9.
-
-## 16. Review and v1 scope (2026-11-06)
-
-This spec was sketched in May, before Fresco's split mode, Tabula, Praeco, Arca and the
-autofill design. Four things in it no longer match the system as built.
-
-### 16.1 What changes
-
-1. **A slot is a child window, not a region of the parent's surface.** frescod already does
-   this for credentials (`OP_WM_CREDENTIAL_SLOT`, arca-autofill.md §4.1). It pins the child
-   window at the parent's position plus the slot rect, sizes it, and keeps it directly above
-   the parent. That gives §5.1's guarantees with nothing new: the parent can't read the child's
-   pixels because they are another window's. Input routing (§6) is frescod's ordinary hit
-   testing and focus, because the child is the topmost window at that point. Drag and drop
-   across the boundary (§6.4) is Tabula's, unchanged.
-   - **Lost:** §5.1's "the parent can draw above the slot". A parent menu or popover over
-     an embed has to be its own window above both, which Pergola's popups will need anyway.
-     For credential slots, not being able to draw over them is the point.
-   - **Needed in frescod:** generalise the credential op to any role. The slot keeps a
-     `kind`, and only the `credential` kind gets the visibility record and the frame. The
-     op needs its own allowlist (`_limen`), not the whole WM socket.
-2. **Messages are postcard plus serde, one Rust module per role**, like `limen::credential`.
-   This replaces CBOR/CDDL (§2, §14) and matches every other Atrium wire format. limend
-   carries role messages as opaque bytes with a size cap. Each side decodes with the role's
-   type and refuses anything out of shape.
-3. **Identity is the channel, as in Arca** (arca.md §4.1). limend learns who the parent is from
-   the peer uid and the launch registry, never from a message. Children are started by
-   portcullisd, so the child is known by construction. A child's capabilities are its own
-   manifest's (§8.1, unchanged).
-4. **Rust first; the C SDK (§11.1, §11.2) waits for an Insula app that needs it.** The latency
-   targets in §12 are aims, not v1 gates.
-
-**System roles** are new. Some roles have exactly one provider, a system service, and the user
-never picks it: `credential` is Arca, `sign-in` is Vestibulum. Their provider is fixed in
-limend's catalogue, and §3's default-app selection doesn't apply.
-
-### 16.2 v1 scope
-
-| piece | what | owner | size |
-|---|---|---|---|
-| **limend** | Aqueduct socket. `request_embed(role, window_id, rect)` from the parent, which must own the window. A static catalogue: system roles, plus a configured default per user role. Start the child, or ask a running system provider for a new instance. Bind its window as the slot. Relay role messages both ways, opaque, at most 64 KiB, rate-limited. Lifecycle: `attached`, `child_lost`, `detached`, plus resize, visibility and detach from the parent. A parent that exits ends its embeds | this thread | about 1.5k lines plus tests, like tabulad and praecod together |
-| **frescod** | a general slot op with a kind and the `_limen` allowlist; release when either window goes | Fresco thread | small; it extends 3088743 |
-| **portcullisd** | an embed-mode launch for user-role children: `ExecInstance` per embed, with the parent's identity passed as data, never as authority | this thread, reviewed by whoever owns portcullisd | small |
-| **Pergola, parent side** | a `SlotBinder` that talks to limend, so `CredentialField` and later a doc-viewer embed widget get real children | this thread | small |
-| **Pergola, child side** | `limen::Child`: an embedded app learns its role and gets its channel at start, and its window is the slot | this thread | small |
-| **first roles** | `credential` against a stand-in Arca child (Arca isn't built), then `doc-viewer` for the Navigator's untrusted-document widget | this thread | the stand-in is small |
-
-**Tests.** The Linux tests run limend with a fake launcher and fake frescod, covering:
+**Tests for L1:**
 - a parent can't embed into a window it doesn't own;
-- an unknown role is refused;
-- oversized or malformed messages are dropped;
-- a child crash reaches the parent as `child_lost`;
-- a parent's exit tears its children down.
+- an unknown role and a system role's impostor are refused;
+- oversized and over-rate messages are dropped;
+- a child crash reaches the parent as `ChildLost`;
+- a parent's exit ends its children.
 
-Then a VM run in split mode: a Pergola window with a `CredentialField` embeds a stand-in
-Arca child, and the activation probe's covers are refused as before.
-
-**Not in v1:**
-- default-app UI in Curia (§3.2), which needs Curia;
-- the install prompt (§3.3);
-- per-embed consent (§8.3), which is only for `payment`;
-- the accessibility bridge (§9, §13.3);
+**Later:**
+- default-app settings and the install prompt, in Curia;
+- the accessibility bridge;
+- scroll chaining;
 - vendor roles;
 - more than one slot per child;
-- cross-host embeds.
+- embeds whose child runs on another host;
+- the C SDK.
 
-### 16.3 Verdict on size
+## 13. Decisions, with recommendations
 
-v1 is about the size of Tabula plus Praeco, which this thread built today, so it can stay
-here. It would be too big if it took in Curia's default-app UI or the accessibility bridge.
-Those are listed as later work, and either could go to another thread when it comes up.
+1. **Slots are child windows pinned by frescod**, not regions of the parent's surface.
+   *Recommend yes.* It reuses what frescod just built for credentials, and it makes "no
+   readback" and "no drawing over" true by construction. The cost is that parent popovers
+   over an embed must be their own windows.
+2. **Role messages are postcard, typed per role in Rust**; CBOR/CDDL is dropped. *Recommend
+   yes*, so every Atrium wire format is the same.
+3. **System roles with fixed providers** (`credential` = Arca, `sign-in` = Vestibulum).
+   *Recommend yes.* No app can register to receive passwords.
+4. **Each user-role embed gets its own throwaway jail** (`ExecInstance`), not a shared instance
+   of the provider. *Recommend yes.* One mail can't affect the next mail's viewer. It costs
+   one jail start per embed, and portcullisd's pool keeps that cheap.
+5. **Rust API first; the C SDK later.** *Recommend yes.*
