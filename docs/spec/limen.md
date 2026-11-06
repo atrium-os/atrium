@@ -518,7 +518,7 @@ The C SDK waits for an Insula app that needs it.
 | L2 | frescod: the general slot op with a kind, the `_limen` allowlist, and the `embed_pending` hint | Fresco thread |
 | L3 ✓ (not run on FreeBSD yet) | portcullisd: `ExecInstance` in embed mode, with the channel inherited | Pergola thread, reviewed by portcullisd's owner |
 | L4 | Pergola: `limen::Parent` as the `Window`'s `SlotBinder`, `CredentialField` on it, and the child side for Pergola apps | Pergola thread |
-| L5 | `credential` end to end against a stand-in Arca child, in the VM in split mode. The activation probe's covers are still refused | Pergola thread |
+| L5 ✓ (with a stand-in Arca) | `credential` end to end against a stand-in Arca child, in the VM in split mode. The activation probe's covers are still refused | Pergola thread |
 | L6 | `doc-viewer` with the Navigator's document worker as the child | Pergola thread, with the Navigator thread |
 
 **As built (2026-11-06, d6f1401).** L0 and L1 are in `limen/`:
@@ -526,6 +526,18 @@ The C SDK waits for an Insula app that needs it.
   `credential`;
 - `limend`, which refuses binds and launches until L2 and L3 land;
 - `tests/daemon.rs`, which covers the list below and the 16-embed cap.
+
+**L5, 2026-11-06.** `limen-embed-probe` (limen/examples) runs limend's code against a live
+frescod at 5062ebd, with a stand-in Arca window opened `embed_pending`. All 8 checks pass in
+the VM in both direct and split mode:
+- the child is attached only once frescod has bound it;
+- frescod sizes it to the slot;
+- hiding and re-placing suspends and resumes it;
+- detach reaches the child;
+- swapped windows are not attached.
+
+The Pergola parent side (`Embeds`, `CredentialField`) is tested on Linux against limend, but
+not yet in the VM.
 
 **Tests for L1:**
 - a parent can't embed into a window it doesn't own;
