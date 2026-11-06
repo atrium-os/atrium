@@ -251,9 +251,14 @@ pub enum StepResult {
 }
 
 /// The activation token frescod minted for a press (tabula.md §2.1).
-/// fresco-client does not carry it yet (the Fresco thread adds the field
-/// to its key and button events); until then no press can copy or paste.
-fn activation_of(_ev: &fresco_client::Event) -> Option<crate::clipboard::Token> {
-    None
+/// Only presses carry one; an all-zero token means none (synthetic input).
+fn activation_of(ev: &fresco_client::Event) -> Option<crate::clipboard::Token> {
+    use fresco_client::Event;
+    let tok = match ev {
+        Event::Key { pressed: true, activation, .. } => *activation,
+        Event::PointerButton { pressed: true, activation, .. } => *activation,
+        _ => return None,
+    };
+    (tok != [0u8; 16]).then_some(tok)
 }
 

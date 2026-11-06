@@ -131,7 +131,7 @@ else gets `Refused { NOT_ALLOWED }`. Replies carry `IS_RESPONSE` and the request
 - "Focused" means the window keys go to: the focused one, else the topmost. `GRANTED` tokens
   skip the focus check.
 - A refused consume does not spend the token, so a wrong presenter cannot burn the real app's
-  token. tabula's stand-in `Fake` spends it on any attempt; tests that rely on that differ here.
+  token. tabula's stand-in `Fake` behaves the same way.
 - An expired token answers `EXPIRED`, then `UNKNOWN` once it has been dropped.
 - `GRANT` spends a `BUTTON` press in one of Forum's own windows. It mints a `GRANTED` token for
   `for_uid` that can be spent on that one purpose (`PASTE`, `SHARE` or `ACTION`) within 1 s.

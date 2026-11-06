@@ -228,7 +228,10 @@ pub mod gate {
     impl Gate for Fake {
         fn consume(&mut self, c: Consume) -> ConsumeResult {
             use fresco_protocol::activation::{kind, purpose, refusal};
-            let Some((uid, k, at, drag_id)) = self.0.lock().unwrap().live.remove(&c.token) else {
+            // Like frescod (tabula.md §2.5): a refused consume does not
+            // spend the token, so a wrong presenter cannot burn it.
+            let mut t = self.0.lock().unwrap();
+            let Some(&(uid, k, at, drag_id)) = t.live.get(&c.token) else {
                 return ConsumeResult::Refused { reason: refusal::UNKNOWN };
             };
             if at.elapsed() > std::time::Duration::from_secs(1) {
@@ -245,6 +248,7 @@ pub mod gate {
             if !fits {
                 return ConsumeResult::Refused { reason: refusal::WRONG_KIND };
             }
+            t.live.remove(&c.token);
             ConsumeResult::Ok { window_id: 1, kind: k, minted_ns: 0, drag_id }
         }
     }
