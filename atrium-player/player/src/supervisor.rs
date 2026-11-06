@@ -28,6 +28,9 @@ pub trait Sink {
     /// Media time jumps or stood still (a seek, or play after pause): the
     /// next frame starts the clock again.
     fn discontinuity(&mut self) {}
+    /// The video's colour, as the worker read it (H.273 code points). It
+    /// comes after the layer, and again if HDR metadata follows.
+    fn color(&mut self, _c: atrium_media_demux::Color) {}
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -172,6 +175,8 @@ pub struct Player<S: Sink> {
     video: Option<VideoState>,
     audio: Option<AudioState>,
     epoch: u32,
+    /// The video's colour, from the worker.
+    color: atrium_media_demux::Color,
     /// Media time of the last frame handed to the sink.
     last_pts: Option<i64>,
     /// Frames before this media time are dropped (after a seek).
@@ -206,6 +211,7 @@ impl<S: Sink> Player<S> {
             video: None,
             audio: None,
             epoch: 0,
+            color: atrium_media_demux::Color::default(),
             last_pts: None,
             show_from: None,
             events: VecDeque::new(),
@@ -306,6 +312,10 @@ impl<S: Sink> Player<S> {
     /// Show the next frame even if paused (a poster, or a seek's target).
     pub fn show_next(&mut self) {
         self.show_one = true;
+    }
+
+    pub fn sink(&self) -> &S {
+        &self.sink
     }
 
     pub fn paused(&self) -> bool {
@@ -644,6 +654,29 @@ impl<S: Sink> Player<S> {
                 self.waiting = false;
                 self.events.push_back(PlayerEvent::Error(code));
             }
+            Record::Color { primaries, transfer, matrix, range } => {
+                if self.video.is_none() {
+                    return self.worker_lost();
+                }
+                self.color = atrium_media_demux::Color { primaries, transfer, matrix, range, hdr: None };
+                self.sink.color(self.color);
+            }
+            Record::Hdr { primaries_x, primaries_y, white, luminance, light } => {
+                if self.video.is_none() {
+                    return self.worker_lost();
+                }
+                self.color.hdr = Some(atrium_media_demux::Hdr {
+                    primaries_x,
+                    primaries_y,
+                    white_x: white[0],
+                    white_y: white[1],
+                    max_luminance: luminance[0],
+                    min_luminance: luminance[1],
+                    max_cll: light[0],
+                    max_fall: light[1],
+                });
+                self.sink.color(self.color);
+            }
             Record::Probe { refused } => {
                 self.waiting = false;
                 self.events.push_back(PlayerEvent::Probe { refused });
@@ -666,11 +699,13 @@ pub struct LocalSink {
     pub maps: Vec<sys::Map>,
     pub format: Option<(Format, u32, u32)>,
     pub on_frame: Box<dyn FnMut(&[u8], i64)>,
+    /// The last colour the worker said.
+    pub color: Option<atrium_media_demux::Color>,
 }
 
 impl LocalSink {
     pub fn new(on_frame: Box<dyn FnMut(&[u8], i64)>) -> Self {
-        LocalSink { maps: Vec::new(), format: None, on_frame }
+        LocalSink { maps: Vec::new(), format: None, on_frame, color: None }
     }
 }
 
@@ -686,6 +721,10 @@ impl Sink for LocalSink {
         }
         self.format = Some((format, width, height));
         Ok(fds)
+    }
+
+    fn color(&mut self, c: atrium_media_demux::Color) {
+        self.color = Some(c);
     }
 
     fn frame(&mut self, index: u32, pts_ns: i64) -> bool {

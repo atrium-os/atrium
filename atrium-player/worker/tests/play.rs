@@ -297,3 +297,24 @@ fn a_feed_seek_waits_for_its_segment() {
 fn crate_watchdog() -> Duration {
     atrium_player::supervisor::WATCHDOG
 }
+
+/// The worker reports the colour the bitstream and the container give, and
+/// leaves unsaid what neither does.
+#[test]
+fn the_worker_reports_colour() {
+    for (name, want) in [("color-hdr10.webm", (9, 16, 9, 1)), ("color-full.mp4", (1, 1, 1, 2)), ("vp8-vorbis.webm", (2, 2, 2, 0))] {
+        let mut p = Player::new(opts(), LocalSink::new(Box::new(|_, _| {})), load(name)).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let mut pcm = vec![0f32; 1 << 16];
+        while p_sink_color(&p).is_none() && Instant::now() < deadline {
+            p.poll(Duration::from_millis(10));
+            p.read_pcm(&mut pcm);
+        }
+        let c = p_sink_color(&p).expect("a colour record");
+        assert_eq!((c.primaries, c.transfer, c.matrix, c.range), want, "{name}");
+    }
+}
+
+fn p_sink_color(p: &Player<LocalSink>) -> Option<atrium_media_demux::Color> {
+    p.sink().color
+}

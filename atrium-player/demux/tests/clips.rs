@@ -319,3 +319,13 @@ fn a_wrong_seekhead_is_ignored() {
         }
     }
 }
+
+#[test]
+fn colour_descriptions_are_read() {
+    let o = play("color-hdr10.webm", 1 << 16);
+    let c = o.tracks[0].color.expect("a Colour element");
+    assert_eq!((c.primaries, c.transfer, c.matrix, c.range), (9, 16, 9, 1), "BT.2020, PQ, BT.2020 NCL, limited");
+    let o = play("color-full.mp4", 1 << 16);
+    let c = o.tracks[0].color.expect("a colr box");
+    assert_eq!((c.primaries, c.transfer, c.matrix, c.range), (1, 1, 1, 2), "BT.709, full range");
+}

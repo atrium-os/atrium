@@ -171,4 +171,69 @@ impl Sink for FrescoSink {
     fn discontinuity(&mut self) {
         self.clock.reset();
     }
+
+    fn color(&mut self, c: atrium_media_demux::Color) {
+        let (Some(layer), Some((_, h))) = (self.layer, self.src) else { return };
+        let lc = layer_color(layer, &c, h);
+        let _ = self.conn.video_layer_color(lc);
+    }
+}
+
+/// H.273 code points to Fresco's, with the usual guesses for what the
+/// stream leaves unsaid: BT.601 matrix below 720 lines, BT.709 above;
+/// limited range; BT.709 primaries; BT.1886. Code points Fresco has no
+/// conversion for (identity/GBR, XYZ, ...) fall back to those guesses too.
+pub fn layer_color(layer: u32, c: &atrium_media_demux::Color, height: u32) -> fresco_protocol::video::VideoLayerColor {
+    use fresco_protocol::video::{matrix, primaries, range, transfer, Mastering};
+    let m = match c.matrix {
+        1 => matrix::BT709,
+        5 | 6 => matrix::BT601,
+        9 | 10 => matrix::BT2020,
+        _ if height >= 720 => matrix::BT709,
+        _ => matrix::BT601,
+    };
+    let r = if c.range == 2 { range::FULL } else { range::LIMITED };
+    let p = match c.primaries {
+        9 => primaries::BT2020,
+        _ => primaries::BT709,
+    };
+    let t = match c.transfer {
+        13 => transfer::SRGB,
+        16 => transfer::PQ,
+        18 => transfer::HLG,
+        _ => transfer::BT1886,
+    };
+    let hdr = c.hdr.filter(|_| matches!(t, transfer::PQ | transfer::HLG)).map(|h| Mastering {
+        primaries_x: h.primaries_x,
+        primaries_y: h.primaries_y,
+        white_x: h.white_x,
+        white_y: h.white_y,
+        max_luminance: h.max_luminance,
+        min_luminance: h.min_luminance,
+        max_cll: h.max_cll,
+        max_fall: h.max_fall,
+    });
+    fresco_protocol::video::VideoLayerColor { layer, matrix: m, range: r, primaries: p, transfer: t, hdr }
+}
+
+#[cfg(test)]
+mod color_tests {
+    use super::*;
+    use atrium_media_demux::Color;
+    use fresco_protocol::video::{matrix, primaries, range, transfer};
+
+    #[test]
+    fn code_points_map_and_gaps_are_guessed() {
+        let unsaid = Color::default();
+        let sd = layer_color(1, &unsaid, 480);
+        assert_eq!((sd.matrix, sd.range, sd.primaries, sd.transfer), (matrix::BT601, range::LIMITED, primaries::BT709, transfer::BT1886));
+        assert_eq!(layer_color(1, &unsaid, 1080).matrix, matrix::BT709);
+        let hdr10 = Color { primaries: 9, transfer: 16, matrix: 9, range: 1, hdr: Some(Default::default()) };
+        let l = layer_color(7, &hdr10, 2160);
+        assert_eq!((l.layer, l.matrix, l.primaries, l.transfer), (7, matrix::BT2020, primaries::BT2020, transfer::PQ));
+        assert!(l.hdr.is_some());
+        // Mastering data on SDR content is dropped; full range is kept.
+        let l = layer_color(1, &Color { range: 2, hdr: Some(Default::default()), ..Color::default() }, 1080);
+        assert_eq!((l.range, l.hdr), (range::FULL, None));
+    }
 }

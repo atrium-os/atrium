@@ -101,6 +101,8 @@ pub mod tag {
     pub const ENDED: u32 = 10;
     pub const ERROR: u32 = 11;
     pub const PROBE: u32 = 12;
+    pub const COLOR: u32 = 13;
+    pub const HDR: u32 = 14;
 }
 
 /// Error codes (map to limen `media_player::code`).
@@ -137,6 +139,11 @@ pub enum Record {
     /// `ProbeSandbox` results: bit 0 open refused, bit 1 connect refused,
     /// bit 2 fork refused.
     Probe { refused: u32 },
+    /// The video's colour, in H.273 code points (2: unspecified); range 0
+    /// unspecified, 1 limited, 2 full. Follows `VideoTrack`.
+    Color { primaries: u8, transfer: u8, matrix: u8, range: u8 },
+    /// Static HDR metadata (CTA-861.3 units), after `Color`.
+    Hdr { primaries_x: [u16; 3], primaries_y: [u16; 3], white: [u16; 2], luminance: [u16; 2], light: [u16; 2] },
 }
 
 fn put(b: &mut [u8; RECORD_LEN], tag: u32, a: u32, x: u64, y: u64, z: u64) {
@@ -169,6 +176,13 @@ impl Record {
             Record::Ended => put(&mut b, tag::ENDED, 0, 0, 0, 0),
             Record::Error { code } => put(&mut b, tag::ERROR, code, 0, 0, 0),
             Record::Probe { refused } => put(&mut b, tag::PROBE, refused, 0, 0, 0),
+            Record::Color { primaries, transfer, matrix, range } => {
+                put(&mut b, tag::COLOR, u32::from_le_bytes([primaries, transfer, matrix, range]), 0, 0, 0)
+            }
+            Record::Hdr { primaries_x: px, primaries_y: py, white, luminance, light } => {
+                let w = |a: [u16; 4]| a.iter().enumerate().fold(0u64, |acc, (i, &v)| acc | (v as u64) << (16 * i));
+                put(&mut b, tag::HDR, 0, w([px[0], px[1], px[2], py[0]]), w([py[1], py[2], white[0], white[1]]), w([luminance[0], luminance[1], light[0], light[1]]))
+            }
         }
         b
     }
@@ -218,6 +232,23 @@ impl Record {
             tag::ENDED => Record::Ended,
             tag::ERROR if (1..=4).contains(&a) => Record::Error { code: a },
             tag::PROBE if a < 8 => Record::Probe { refused: a },
+            tag::COLOR => {
+                let [primaries, transfer, matrix, range] = a.to_le_bytes();
+                if range > 2 {
+                    return None;
+                }
+                Record::Color { primaries, transfer, matrix, range }
+            }
+            tag::HDR => {
+                let h = |v: u64, i: usize| (v >> (16 * i)) as u16;
+                Record::Hdr {
+                    primaries_x: [h(x, 0), h(x, 1), h(x, 2)],
+                    primaries_y: [h(x, 3), h(y, 0), h(y, 1)],
+                    white: [h(y, 2), h(y, 3)],
+                    luminance: [h(z, 0), h(z, 1)],
+                    light: [h(z, 2), h(z, 3)],
+                }
+            }
             _ => return None,
         };
         Some(r)
@@ -241,6 +272,8 @@ mod tests {
         let rs = [
             Record::Ready { sandboxed: true },
             Record::VideoTrack { track: 0, codec: 2, width: 1920, height: 1080, bit_depth: 10 },
+            Record::Color { primaries: 9, transfer: 16, matrix: 9, range: 1 },
+            Record::Hdr { primaries_x: [34000, 13250, 7500], primaries_y: [16000, 34500, 3000], white: [15635, 16450], luminance: [1000, 50], light: [1000, 400] },
             Record::AudioTrack { track: 1, codec: 5, rate: 48_000, channels: 2 },
             Record::Duration { secs: 12.5 },
             Record::Frame { index: 3, epoch: 2, pts_ns: -5 },

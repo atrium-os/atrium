@@ -21,6 +21,13 @@ $ff $src -c:v libvpx-vp9 -b:v 200k -g 24 -c:a libopus -b:a 48k -strict -2 \
 # Colour fields for the on-screen check (atrium-player M4): 1 s red, then 1 s blue.
 $ff -f lavfi -i color=c=red:s=160x96:r=24:d=1 -f lavfi -i color=c=blue:s=160x96:r=24:d=1 \
     -filter_complex '[0][1]concat=n=2:v=1:a=0' -c:v libvpx-vp9 -b:v 100k -g 24 red-blue.webm
+# Colour descriptions (atrium-player M7): HDR10 tags in VP9/WebM, full-range BT.709 in
+# AV1/MP4 (colr box and the sequence header).
+c="-f lavfi -i testsrc2=size=64x36:rate=24:duration=0.5"
+$ff $c -pix_fmt yuv420p10le -c:v libvpx-vp9 -profile:v 2 -b:v 50k -color_primaries bt2020 \
+    -color_trc smpte2084 -colorspace bt2020nc -color_range tv -an color-hdr10.webm
+$ff $c -c:v libaom-av1 -cpu-used 8 -b:v 50k -color_primaries bt709 -color_trc bt709 \
+    -colorspace bt709 -color_range pc -an color-full.mp4
 # Reference hashes of every decoded frame (planar, as the decoder outputs).
 for f in *.webm *.mp4; do
     $ff -i "$f" -map 0:v -f framemd5 "$f.video.framemd5"

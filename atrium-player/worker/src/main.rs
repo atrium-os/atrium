@@ -628,7 +628,7 @@ impl Worker {
         loop {
             match v.dec.receive() {
                 Ok(Some(p)) => {
-                    found = Some((p.width, p.height, p.bit_depth));
+                    found = Some((p.width, p.height, p.bit_depth, p.color));
                     break;
                 }
                 Ok(None) => {}
@@ -655,7 +655,7 @@ impl Worker {
             self.fail(c);
             return false;
         }
-        let Some((w, h, depth)) = found else {
+        let Some((w, h, depth, pic_color)) = found else {
             if input_done && v.store.next().is_none() {
                 self.fail(err::DECODE);
             }
@@ -666,7 +666,28 @@ impl Worker {
         v.probed = true;
         v.dims = (w, h);
         let codec = codec_id(v.track.codec);
+        let c = v.track.color.unwrap_or_default();
         let _ = self.send(Record::VideoTrack { track: fi_track, codec, width: w, height: h, bit_depth: depth });
+        // The bitstream's word on colour, then the container's; what neither
+        // says, the supervisor decides.
+        let pick = |a: u8, b: u8, unset: u8| if a != unset { a } else { b };
+        let color = demux::Color {
+            primaries: pick(pic_color.primaries, c.primaries, 2),
+            transfer: pick(pic_color.transfer, c.transfer, 2),
+            matrix: pick(pic_color.matrix, c.matrix, 2),
+            range: pick(pic_color.range, c.range, 0),
+            hdr: pic_color.hdr.or(c.hdr),
+        };
+        let _ = self.send(Record::Color { primaries: color.primaries, transfer: color.transfer, matrix: color.matrix, range: color.range });
+        if let Some(h) = color.hdr {
+            let _ = self.send(Record::Hdr {
+                primaries_x: h.primaries_x,
+                primaries_y: h.primaries_y,
+                white: [h.white_x, h.white_y],
+                luminance: [h.max_luminance, h.min_luminance],
+                light: [h.max_cll, h.max_fall],
+            });
+        }
         true
     }
 
