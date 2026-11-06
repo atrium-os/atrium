@@ -766,6 +766,7 @@ dependencies = [
  "navigator-dom",
  "navigator-render",
  "navigator-style",
+ "navigator-svg",
  "png",
  "unicode-bidi",
 ]
