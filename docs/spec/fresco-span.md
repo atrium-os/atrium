@@ -154,21 +154,45 @@ span (`OP_WM_SPAN_GROUP`); the reply is the rect the window covers. Bezel
 compensation is done by frescod moving the members (and any monitor past
 them) apart by the gaps while the span is up, so the window covers the
 hidden strips and no head scans them out; they go back when it ends. The
-gap is in pixels for now; millimetres from the EDID size come later. frescod
+gap is in pixels, or in millimetres (below). frescod
 (`frescod/src/span.rs`) locks the members' timing, presents them with one
 `COMMIT_MULTI` per frame, runs VRR and HDR on all members or none (VRR off on
 all if one lacks it; the kernel runs the highest floor), gives members a
 30 s grace, darkens a dropped member's tile with its flip lock off, and holds
-out a member that drops 3 times in 60 s until it has stayed up 10 s (logged;
-a notification naming it is not posted yet). A member gone past the grace
+out a member that drops 3 times in 60 s until it has stayed up 10 s (and
+Forum tells the user, below). A member gone past the grace
 ends the span and Forum asks again over the members left: one resize.
-**Not yet:** direct scanout of the game's surface (members show the composed
-desktop, cropped per head, as multi-monitor does), the per-tile probe game
-and the span chaos run. `scripts/vm-span-e2e.sh` passes in the amd64 VM with
-0 failures, split mode on: three 1080p monitors (one with a 60 Hz VRR floor),
-a window covering 5840x1080 with two 40 px strips, a 10 s dropout, flapping
-held out and rejoining, a member gone 45 s (one resize to 3880x1080 and back),
-and the un-zoom putting the monitors back.
+`scripts/vm-span-e2e.sh` passes in the amd64 VM with 0 failures, split mode
+on: three 1080p monitors (one with a 60 Hz VRR floor), a window covering
+5840x1080 with two 40 px strips, a 10 s dropout, flapping held out and
+rejoining, a member gone 45 s (one resize to 3880x1080 and back), the
+un-zoom putting the monitors back, and an 11 mm bezel giving 40 px.
+
+**S2/S5 follow-ups as built (2026-11-06).** *Direct scanout*: while nothing
+frescod must draw covers a member (its strip, a toast, a credential slot,
+any window above the span window, a video layer of it) and the window comes
+as pixels (split pixel mode), frescod skips the desktop compose for the
+members and cuts each member's tile straight out of the window's latest
+drawing into its scanout buffer, only the rows that changed since the
+drawing that buffer holds (`span::direct`, `span::tile`). The strip shows
+for 3 s after the span starts and after each focus change; those frames, and
+any frame with something over the window, are composed as before. frescod
+logs each switch (`span: direct scanout` / `span: composed (why)`).
+*Bezels in millimetres*: `WmOutput` carries each monitor's EDID size, and
+`forum-ctl span A B C bezel MM` takes the distance between the pictures as a
+ruler measures it; Forum turns it into pixels per axis from the members'
+mean density (refused for a monitor without a size). *Flapping*:
+`WmOutput.flapping` marks a member held out; Forum posts "A monitor keeps
+disconnecting", naming its output, to Praeco as a system poster
+(tabula.md §5.1). *Probe and chaos*: `atrium-span-probe` is a test game
+whose 8 px columns encode their x across the window, with a frame drawn at
+each tile's edge; the e2e screendumps every gpusim pipe while the span scans
+out directly and `scripts/span-probe-check.py` finds each member showing its
+tile continuously, skipping exactly the bezel strips, with nothing over it.
+`scripts/vm-span-chaos.sh` runs 60 seeded steps of zoom toggles, dropouts,
+HPD glitches, flapping, a member gone past the grace and bezel changes. It passes 60 steps with 0 failures (seed 11), ending direct with all three members continuous.
+Not yet: a GPU-rendered game's surface (only pixel-mode windows go direct;
+scene windows frescod rasters are still composed).
 
 ## 9. Decisions for Shankar
 
