@@ -267,7 +267,11 @@ Host tests run on Linux in the cloud; the rest run in the arm64 or amd64 VM with
    +0.001 ms and `rate_ppm` 4–8 between incidents, but the device ran dry in bursts on the
    timeshare thread (`delay` 0, gaps between periods up to 72 ms against a 21 ms buffer),
    giving errors to −196 ms. The clock now moves with a dry spell, keeping its slope, and
-   lyrad logs the device's own underrun count each second.
+   lyrad logs the device's own underrun count each second. Run 3 (f15241e): no dry spells
+   at all, median −0.001 ms, but one 10 s window where QEMU's HDA device (paced by a host
+   timer with `-audiodev none`) consumed 8.6% slow, giving −122 ms and `rate_ppm` −1000. A
+   real device's crystal doesn't do that, so this setup can't judge ±2 ms; check 6 needs a
+   device with a real clock (a host audio backend, or hardware).
 7. **Restart** (VM): kill lyrad while two apps play; both get `StreamLost`, reopen, and play
    again when the supervisor restarts it.
 
