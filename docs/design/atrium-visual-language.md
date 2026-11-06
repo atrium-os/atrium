@@ -612,8 +612,11 @@ Light, dark, or follow the time of day is **one system setting**, not a per-app 
 tells every client when it changes (a display event, the same path as a scale change), Pergola
 swaps `Semantic::LIGHT` and `DARK` and redraws, and every app follows in the same frame. Apps do
 not read an environment variable and do not offer their own switch; the Forum bar's toggle sets
-the system setting. A third table, high contrast (§11), is added the same way later. The accent
-stays Atrium's: no user accent colour in this revision.
+the system setting. **Themes** (decided by Shankar, 2026-11-06): Atrium ships light and dark, a high-contrast
+table for each (§11), and a short curated list of accent colours the user picks from, each
+held to the §4 contrast floor in every table (fill, text-on-fill, accent text, marks and the
+focus ring). Amber-bronze stays the default. There are no installable themes, and nothing
+themes the trusted surfaces of §14.4. High contrast and the accent list follow the controls.
 
 ## §16. Where the code drifts today *(rev. 2, 2026-11-06)*
 
