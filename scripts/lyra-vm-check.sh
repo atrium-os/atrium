@@ -58,6 +58,11 @@ ok() { printf '  ok   %s\n' "$*"; }
 bad() { printf '  FAIL %s\n' "$*"; FAILS=$((FAILS + 1)); }
 v() { "$VSSH" "$@"; }
 
+# LYRA_PREBUILT=<dir>: take lyrad, lyra-play, lyra-vmtest and choragusd from
+# <dir> instead of cross-building (a host with no Rust, e.g. the R9700 box).
+if [ -n "${LYRA_PREBUILT:-}" ]; then
+    say "prebuilt binaries from $LYRA_PREBUILT"
+else
 say "cross-build (host)"
 : "${TARGET:?run through scripts/cloud-vm.sh lyra}"
 for c in lyra choragus; do
@@ -65,13 +70,14 @@ for c in lyra choragus; do
         -Z build-std=std,panic_abort --bins) || die "$c cross-build"
 done
 echo "  built"
+fi
 
 say "stage"
 v true >/dev/null 2>&1 || die "cannot reach the VM (sh scripts/cloud-vm.sh up)"
 v "pkill -f 'daemon.*lyra-test' ; pkill lyrad ; pkill choragusd ; pkill lyra-play ; true" >/dev/null 2>&1
 for b in lyra/lyrad lyra/lyra-play lyra/lyra-vmtest choragus/choragusd; do
-    src="$ROOT/${b%/*}/target/$TARGET/debug/${b#*/}"
     name="${b#*/}"
+    if [ -n "${LYRA_PREBUILT:-}" ]; then src="$LYRA_PREBUILT/$name"; else src="$ROOT/${b%/*}/target/$TARGET/debug/$name"; fi
     h=$(sha256sum "$src" | cut -d' ' -f1)
     for try in 1 2 3; do
         v "rm -f $BIN/$name" >/dev/null 2>&1
