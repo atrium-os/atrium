@@ -85,6 +85,10 @@ struct display_fb {
  *   hdr          (2.3) the EOTF, colorimetry and metadata being signalled,
  *                re-sent after a device reset
  *   hdr_pending  what HDR SET asked for, applied by the next commit
+ *
+ * Span state (3.1, COMMIT_SYNC_GROUP):
+ *   sync_group   the timing group it belongs to (0 = none)
+ *   flip_lock    its flips land with the group's other locked members
  */
 struct display_output {
 	struct atrium_amd_softc	*sc;
@@ -122,6 +126,8 @@ struct display_output {
 	struct atrium_display_hdr hdr;
 	struct atrium_display_hdr hdr_pending;
 	int			 hdr_pending_valid;
+	uint32_t		 sync_group;
+	int			 flip_lock;
 };
 
 /* The display module's state, hung off the shared softc as sc->display_state. */
@@ -1250,6 +1256,135 @@ display_hw_light(struct display_output *o, const struct display_fb *fb,
 	return (fault);
 }
 
+/*
+ * Span groups (3.1). The hardware's half: the pipe joins its timing group
+ * (DCN OTG timing synchronisation; on gpusim the SIM SYNC_GROUP register,
+ * where the group's master clock drives every member) and arms its flip
+ * lock. A mode set or OTG disable takes the pipe out in hardware, so this
+ * is re-run after anything that re-lights a member. A fault, or 0.
+ */
+static uint32_t
+display_sync_hw(struct display_output *o)
+{
+	uint32_t fault;
+
+	o_wr(o, SIMR(o, regDISP_SYNC_GROUP), o->sync_group);
+	if (o->sync_group != 0) {
+		fault = o_rd(o, SIMR(o, regDISP_FAULT));
+		if (fault != 0)
+			return (fault);
+	}
+	o_wr(o, SIMR(o, regDISP_FLIP_LOCK), o->sync_group != 0 && o->flip_lock);
+	return (0);
+}
+
+/* Put every group back in the hardware (after a reset, or a topology
+ * commit that was rolled back). Lock held. */
+static void
+display_sync_reapply(struct atrium_amd_softc *sc)
+{
+	struct display_output *o;
+	uint32_t n;
+
+	mtx_assert(&sc->lock, MA_OWNED);
+	for (n = 0; n < DISPLAY_NOUT; n++) {
+		o = display_out(sc, n);
+		if (o->sync_group != 0 && o->mode_set)
+			(void)display_sync_hw(o);
+	}
+}
+
+/* The outputs whose flips must go up together with `o`'s: its group's
+ * flip-locked members (0 when `o` itself isn't locked). Lock held. */
+static uint32_t
+display_lock_set(struct atrium_amd_softc *sc, struct display_output *o)
+{
+	struct display_output *m;
+	uint32_t n, set = 0;
+
+	if (o->sync_group == 0 || !o->flip_lock)
+		return (0);
+	for (n = 0; n < DISPLAY_NOUT; n++) {
+		m = display_out(sc, n);
+		if (m->sync_group == o->sync_group && m->flip_lock)
+			set |= 1u << n;
+	}
+	return (set);
+}
+
+/* COMMIT_SYNC_GROUP (3.1): set group g->group's members and flip lock. */
+static int
+display_commit_sync_group(struct atrium_amd_softc *sc,
+    struct atrium_display_sync_group *g)
+{
+	struct display_output *o, *first = NULL;
+	uint32_t n, bit, all = (1u << DISPLAY_NOUT) - 1, fault = 0;
+
+	if (g->struct_size < sizeof(*g) || g->flags != 0 || g->_pad != 0 ||
+	    g->group == 0 || g->group > ATRIUM_DISPLAY_SYNC_GROUPS ||
+	    (g->members & ~all) != 0 || (g->flip_lock & ~g->members) != 0)
+		return (EINVAL);
+	g->out_failed = ATRIUM_DISPLAY_MULTI_NONE;
+	g->out_reason = 0;
+	mtx_lock(&sc->lock);
+	/* Check: every member lit, all at one timing and VRR floor. */
+	for (n = 0; n < DISPLAY_NOUT; n++) {
+		if ((g->members & (1u << n)) == 0)
+			continue;
+		o = display_out(sc, n);
+		if (!o->mode_set || !o->timing_valid)
+			fault = ATRIUM_DISPLAY_FAULT_NO_MODE;
+		else if (first != NULL &&
+		    (!atrium_timing_equal(&o->timing, &first->timing) ||
+		    o->vrr_min_hz != first->vrr_min_hz))
+			fault = ATRIUM_DISPLAY_FAULT_SYNC_MISMATCH;
+		else if (first == NULL)
+			first = o;
+		if (fault != 0) {
+			g->out_failed = n;
+			g->out_reason = fault;
+			mtx_unlock(&sc->lock);
+			return (0);
+		}
+	}
+	/* Apply: members leaving first, then the members in pipe order (the
+	 * lowest becomes the master the others lock to). */
+	for (n = 0; n < DISPLAY_NOUT; n++) {
+		o = display_out(sc, n);
+		if (o->sync_group == g->group && (g->members & (1u << n)) == 0) {
+			o->sync_group = 0;
+			o->flip_lock = 0;
+			(void)display_sync_hw(o);
+		}
+	}
+	for (n = 0; n < DISPLAY_NOUT && fault == 0; n++) {
+		bit = 1u << n;
+		if ((g->members & bit) == 0)
+			continue;
+		o = display_out(sc, n);
+		o->sync_group = g->group;
+		o->flip_lock = (g->flip_lock & bit) != 0;
+		fault = display_sync_hw(o);
+		if (fault != 0) {
+			g->out_failed = n;
+			g->out_reason = fault;
+		}
+	}
+	if (fault != 0) {
+		/* The hardware refused what the check passed: dissolve. */
+		for (n = 0; n < DISPLAY_NOUT; n++) {
+			o = display_out(sc, n);
+			if (o->sync_group == g->group) {
+				o->sync_group = 0;
+				o->flip_lock = 0;
+				(void)display_sync_hw(o);
+			}
+		}
+	}
+	mtx_unlock(&sc->lock);
+	return (0);
+}
+
 /* The pixel rate `o` draws while lit, kHz. Lock held. */
 static uint32_t
 display_khz(struct display_output *o)
@@ -1361,6 +1496,7 @@ display_topology(struct atrium_amd_softc *sc, struct display_req *rq,
 			    snap[k].timing_valid ? &snap[k].timing : NULL,
 			    snap[k].vrr_min_hz, &o->hdr);
 		}
+		display_sync_reapply(sc);
 		mtx_unlock(&sc->lock);
 		return (0);
 	}
@@ -1370,6 +1506,10 @@ display_topology(struct atrium_amd_softc *sc, struct display_req *rq,
 		r = &rq[i];
 		o = r->o;
 		display_park(sc, o->on_screen.bo_fp);
+		/* Re-moded or off: its timing generator restarted, so it is
+		 * out of its sync group (COMMIT_SYNC_GROUP puts it back). */
+		o->sync_group = 0;
+		o->flip_lock = 0;
 		if (r->off) {
 			memset(&o->on_screen, 0, sizeof(o->on_screen));
 			o->mode_set = 0;
@@ -1429,7 +1569,9 @@ display_commit(struct atrium_amd_softc *sc, struct atrium_display_commit *c,
 			c->out_fault = reason;	/* a referee fault, not an errno */
 	} else {
 		mtx_lock(&sc->lock);
-		err = display_flip_check(&r, &fault);
+		/* A flip-locked output flips with its group: COMMIT_MULTI. */
+		err = (display_lock_set(sc, o) & ~1u) != 0 ? EINVAL :
+		    display_flip_check(&r, &fault);
 		if (err == 0 && fault == 0)
 			fault = display_queue_flip(&r);
 		mtx_unlock(&sc->lock);
@@ -1507,6 +1649,11 @@ display_commit_multi(struct atrium_amd_softc *sc,
 		/* Flips: every output free and every buffer fitting its mode
 		 * before any is queued. */
 		mtx_lock(&sc->lock);
+		/* A span group flips as one: naming one flip-locked output
+		 * means naming all of its group's. */
+		for (i = 0; i < m->count && err == 0; i++)
+			if ((display_lock_set(sc, rq[i].o) & ~seen) != 0)
+				err = EINVAL;
 		for (i = 0; i < m->count && err == 0; i++) {
 			err = display_flip_check(&rq[i], &fault);
 			if (err == 0 && fault != 0 &&
@@ -1596,6 +1743,12 @@ display_outputs(struct atrium_amd_softc *sc, struct atrium_display_outputs *v)
 			in->pixel_clock_khz = display_khz(o);
 			used += in->pixel_clock_khz;
 		}
+		in->sync_group = o->sync_group;
+		if (o->sync_group != 0 && o->flip_lock)
+			in->flags |= ATRIUM_DISPLAY_OUTPUT_FLIP_LOCKED;
+		if (o->sync_group != 0 &&
+		    o_rd(o, SIMR(o, regDISP_SYNC_MASTER)) != 0)
+			in->flags |= ATRIUM_DISPLAY_OUTPUT_SYNC_MASTER;
 		mtx_unlock(&sc->lock);
 	}
 	free(sink, M_ATRIUM_DISPLAY);
@@ -1703,6 +1856,49 @@ display_sim_plug_at_sysctl(SYSCTL_HANDLER_ARGS)
 	if (end == colon + 1 || *end != '\0')
 		return (EINVAL);
 	return (display_sim_plug(o, (int)mode));
+}
+
+/*
+ * dev.atrium_gpu_amd_display.N.sim_scanout: what every pipe scans out, in one
+ * consistent snapshot: "BASE0 BASE1 BASE2 BASE3" (hex VRAM addresses, 0 =
+ * dark). Read again if a vblank came in between, so a span test can tell
+ * whether a group's members ever show different frames (test readback; the
+ * simulator's SCANOUT_BASE registers).
+ */
+static int
+display_sim_scanout_sysctl(SYSCTL_HANDLER_ARGS)
+{
+	struct atrium_amd_softc *sc = arg1;
+	struct display_output *o;
+	uint32_t before[DISPLAY_NOUT], n, try;
+	uint64_t base[DISPLAY_NOUT];
+	char buf[DISPLAY_NOUT * 20];
+	int len = 0;
+
+	for (try = 0; try < 16; try++) {
+		for (n = 0; n < DISPLAY_NOUT; n++) {
+			o = display_out(sc, n);
+			before[n] = o_rd(o, SIMR(o, regDISP_VBLANK_COUNT));
+		}
+		for (n = 0; n < DISPLAY_NOUT; n++) {
+			o = display_out(sc, n);
+			base[n] = o_rd(o, SIMR(o, regDISP_SCANOUT_BASE_LO)) |
+			    (uint64_t)o_rd(o, SIMR(o, regDISP_SCANOUT_BASE_HI)) << 32;
+		}
+		for (n = 0; n < DISPLAY_NOUT; n++) {
+			o = display_out(sc, n);
+			if (o_rd(o, SIMR(o, regDISP_VBLANK_COUNT)) != before[n])
+				break;
+		}
+		if (n == DISPLAY_NOUT)
+			break;
+	}
+	if (try == 16)
+		return (EAGAIN);
+	for (n = 0; n < DISPLAY_NOUT; n++)
+		len += snprintf(buf + len, sizeof(buf) - len, "%s%jx",
+		    n == 0 ? "" : " ", (uintmax_t)base[n]);
+	return (sysctl_handle_string(oidp, buf, sizeof(buf), req));
 }
 
 /*
@@ -2025,6 +2221,7 @@ amd_display_reset_restore(struct atrium_amd_softc *sc)
 		else
 			display_irqs(o, o->mode_set, 0);
 	}
+	display_sync_reapply(sc);
 	mtx_unlock(&sc->lock);
 }
 
@@ -2136,6 +2333,10 @@ display_ioctl(struct cdev *cdev, u_long cmd, caddr_t data, int fflag,
 
 	case ATRIUM_DISPLAY_IOC_HDR:
 		return (display_hdr(sc, (struct atrium_display_hdr *)data));
+
+	case ATRIUM_DISPLAY_IOC_COMMIT_SYNC_GROUP:
+		return (display_commit_sync_group(sc,
+		    (struct atrium_display_sync_group *)data));
 
 	case ATRIUM_DISPLAY_IOC_STATUS_V2:
 		err = display_status(o0,
@@ -2303,6 +2504,11 @@ atrium_display_attach(device_t dev)
 	    CTLTYPE_STRING | CTLFLAG_RD | CTLFLAG_MPSAFE, sc, 0,
 	    display_sim_sink_sysctl, "A",
 	    "simulator: the monitor's view of the stream (HDR test readback)");
+	SYSCTL_ADD_PROC(device_get_sysctl_ctx(dev),
+	    SYSCTL_CHILDREN(device_get_sysctl_tree(dev)), OID_AUTO,
+	    "sim_scanout", CTLTYPE_STRING | CTLFLAG_RD | CTLFLAG_MPSAFE, sc, 0,
+	    display_sim_scanout_sysctl, "A",
+	    "simulator: every pipe's scanout address, one snapshot (span test)");
 	SYSCTL_ADD_PROC(device_get_sysctl_ctx(dev),
 	    SYSCTL_CHILDREN(device_get_sysctl_tree(dev)), OID_AUTO,
 	    "sim_bw_budget_khz", CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_MPSAFE, sc,

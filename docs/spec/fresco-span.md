@@ -137,6 +137,16 @@ swapped monitor).
 
 S1 and S2 are the hard parts; S3 to S5 follow the patterns multi-monitor already set.
 
+**S1 as built (2026-11-06).** Display ABI 3.1 `COMMIT_SYNC_GROUP`
+(atrium-display-architecture.md §7.6): one call sets a group's members and
+which of them are flip-locked, so the §6 dropout is the same call with that
+member's lock off. gpusim models the timing lock and the flip lock with SIM
+registers; the DCN programming waits for D5. `display_span` passes in the
+amd64 VM: 100 of 100 group flips in one vblank, with no split frame in 7375
+snapshots of the three pipes (5361 of them while one member's in-fence was
+held back); with a member's lock off the others flip without it, and the
+test's detector sees the split.
+
 ## 9. Decisions for Shankar
 
 1. **Spanning only through zoom over a user-made span group, never a whole-desktop mode.**

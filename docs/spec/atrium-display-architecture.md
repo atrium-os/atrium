@@ -355,6 +355,29 @@ the 2.x ioctls act on output 0.
   remembered with the set (frescod while it runs, Forum across restarts);
   a mirror whose source leaves gets a place of its own again.
 
+### 7.6 v3.1 span groups (implemented 2026-11-06)
+
+For a fullscreen window spanning several monitors (`docs/spec/fresco-span.md`
+§5). `COMMIT_SYNC_GROUP` (`'D', 72`) sets one sync group's members (up to
+four groups): every member must be lit, all at one timing and VRR floor
+(`FAULT_NO_MODE`, `FAULT_SYNC_MISMATCH` = 11), and they then run one vblank
+clock (on DCN, OTG timing synchronisation; the lowest member is the master
+and the next takes over if it leaves). Members in `flip_lock` flip together:
+a flip on one is held until every locked member has one queued, then all
+land in the same vblank, and a flip commit naming one locked member must
+name all of them (`EINVAL`). A member whose monitor drops out stays in the
+group, keeping the clock, with its flip lock off (fresco-span §6). A
+topology commit on a member takes it out. OUTPUTS shows each output's
+`sync_group` (the old `_pad`) and `OUTPUT_SYNC_MASTER` / `OUTPUT_FLIP_LOCKED`.
+
+gpusim models it with SIM registers (`SYNC_GROUP`, `FLIP_LOCK`, `SYNC_MASTER`,
+gpusim ad52f38): a member's frames run off the master's timer and held flips
+are released together at the group vblank. The real OTG trigger and flip
+lock programming is for silicon (D5). Test: `display_span` (100 of 100 group
+flips in one vblank, with one member's in-fence late in three of four, by a
+continuous snapshot of every pipe's scanout; dropout, master hand-over,
+refusals) and gpusim `span_group_flips_land_together`.
+
 ## 8. The output topology — connectors, encoders, PHYs (HDMI / DP / USB-C)
 
 "How does the driver detect and redirect output to HDMI vs DisplayPort vs

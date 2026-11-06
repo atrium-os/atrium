@@ -186,6 +186,14 @@
 					 * silicon: the DISPCLK/DCFCLK clock tables) */
 #define regDISP_BW_USED_KHZ	0x300c0	/* r: pixel rate the lit pipes draw now */
 /*
+ * Span groups (display 3.1): SIM registers modelling DCN's OTG timing
+ * synchronisation and flip lock. Per pipe. Silicon: the OTG trigger / GSL
+ * programming, with D5.
+ */
+#define regDISP_SYNC_GROUP	0x300c4	/* w/r: timing group 1..4 this lit pipe joins (0 = none) */
+#define regDISP_FLIP_LOCK	0x300c8	/* w/r: 1 = vsync'd flips held until the group's locked members all have one */
+#define regDISP_SYNC_MASTER	0x300cc	/* r: 1 = this pipe's timing drives its group */
+/*
  * Several pipes (display 3.0): pipe n's SIM registers are its bank at
  * + n x 0x100 (pipe 0 above); BW_* read the same in every bank.
  */

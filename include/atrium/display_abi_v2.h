@@ -1,5 +1,5 @@
 /*
- * Atrium display ABI 3.0 — /dev/atrium-display<N>. Normative header.
+ * Atrium display ABI 3.1 — /dev/atrium-display<N>. Normative header.
  *
  * Spec: docs/spec/atrium-display-architecture.md §7 and §7.1, and
  * docs/spec/atrium-gpu-abi-v2.md §7. This header follows the GPU header's
@@ -46,7 +46,7 @@
 #endif
 
 #define ATRIUM_DISPLAY_ABI_MAJOR	3
-#define ATRIUM_DISPLAY_ABI_MINOR	0
+#define ATRIUM_DISPLAY_ABI_MINOR	1
 
 /* Pixel formats a plane can scan out. */
 #define ATRIUM_DISPLAY_FORMAT_XRGB8888	0  /* 32 bpp, B,G,R,X in memory (Vulkan B8G8R8A8) */
@@ -76,6 +76,8 @@
 						    * out_bandwidth_khz) */
 #define ATRIUM_DISPLAY_FAULT_NO_OUTPUT		10 /* (3.0) no such output, or named twice
 						    * in one commit */
+#define ATRIUM_DISPLAY_FAULT_SYNC_MISMATCH	11 /* (3.1) a sync group's outputs don't
+						    * all run one timing (and VRR floor) */
 
 /* Commit flags. */
 #define ATRIUM_DISPLAY_COMMIT_MODESET	0x1u  /* (re)program the CRTC at mode_index; the
@@ -343,6 +345,8 @@ struct atrium_display_connector_v2 {
 
 /* Per-output flags in OUTPUTS (the CONNECTOR_* flags, plus these). */
 #define ATRIUM_DISPLAY_OUTPUT_LIT		0x100u /* scanning out a mode */
+#define ATRIUM_DISPLAY_OUTPUT_SYNC_MASTER	0x200u /* (3.1) its timing drives its sync group */
+#define ATRIUM_DISPLAY_OUTPUT_FLIP_LOCKED	0x400u /* (3.1) its flips land with its group's */
 
 /*
  * A monitor's identity: a 64-bit hash of its EDID's manufacturer, product
@@ -362,7 +366,7 @@ struct atrium_display_output_info {
 	uint32_t height;
 	uint32_t refresh_mhz;
 	uint32_t pixel_clock_khz;	/* its share of out_bandwidth_khz */
-	uint32_t _pad;
+	uint32_t sync_group;		/* (3.1) its COMMIT_SYNC_GROUP group, 0 = none */
 };
 
 /* OUTPUTS: every output at a glance, one consistent snapshot. */
@@ -447,5 +451,45 @@ struct atrium_display_commit_multi {
 #define ATRIUM_DISPLAY_IOC_CONNECTOR_AT	_IOWR('D', 69, struct atrium_display_connector_at)
 #define ATRIUM_DISPLAY_IOC_STATUS_AT	_IOWR('D', 70, struct atrium_display_status_at)
 #define ATRIUM_DISPLAY_IOC_COMMIT_MULTI	_IOWR('D', 71, struct atrium_display_commit_multi)
+
+/*
+ * COMMIT_SYNC_GROUP (3.1): lock outputs together, for a fullscreen window
+ * spanning several monitors (docs/spec/fresco-span.md §5).
+ *
+ * A sync group's members run one timing generator clock: their vblanks
+ * line up (on DCN, OTG timing synchronisation). The members in flip_lock
+ * also flip together: a flip on one of them is held until every one of
+ * them has a flip queued, and then all land in the same vblank. A flip
+ * commit that names a flip-locked output must name every flip-locked output
+ * of its group (EINVAL otherwise), so a group's flip is one COMMIT_MULTI.
+ *
+ * The call sets group `group`'s whole membership: outputs named join (moved
+ * out of another group if they were in one), members not named leave, and
+ * members = 0 dissolves the group. Every member must be lit
+ * (FAULT_NO_MODE), all at one timing and VRR floor (FAULT_SYNC_MISMATCH).
+ * A member that is gone for a while (§6: its monitor dropped out) stays a
+ * member, keeping the clock, with its flip lock off: the others flip
+ * without it. A topology commit (MODESET or OFF) on a member takes it out
+ * of its group; set the group again after re-moding it.
+ *
+ * Infeasibility is not an errno, as in COMMIT_MULTI: out_failed = the first
+ * output refused and out_reason why, and nothing changes. EINVAL for a bad
+ * struct, group, flag or mask (flip_lock not within members, or naming an
+ * output that doesn't exist).
+ */
+#define ATRIUM_DISPLAY_SYNC_GROUPS		4	/* groups 1..4 */
+
+struct atrium_display_sync_group {
+	uint32_t struct_size;
+	uint32_t flags;			/* none yet: 0 */
+	uint32_t group;			/* 1..ATRIUM_DISPLAY_SYNC_GROUPS */
+	uint32_t members;		/* bit n = output n */
+	uint32_t flip_lock;		/* the members whose flips land together */
+	uint32_t out_failed;		/* output refused, or ATRIUM_DISPLAY_MULTI_NONE */
+	uint32_t out_reason;		/* ATRIUM_DISPLAY_FAULT_* for it */
+	uint32_t _pad;
+};
+
+#define ATRIUM_DISPLAY_IOC_COMMIT_SYNC_GROUP _IOWR('D', 72, struct atrium_display_sync_group)
 
 #endif /* _ATRIUM_DISPLAY_ABI_V2_H_ */

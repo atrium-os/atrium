@@ -203,7 +203,7 @@ struct DOutputInfo {
     height: u32,
     refresh_mhz: u32,
     pixel_clock_khz: u32,
-    _pad: u32,
+    sync_group: u32,
 }
 #[repr(C)]
 #[derive(Default)]
@@ -224,6 +224,18 @@ struct DStatusAt { struct_size: u32, output: u32, status: DStatusV2 }
 #[repr(C)]
 #[derive(Default)]
 struct DOutputCommit { output: u32, _pad: u32, c: DCommit }
+#[repr(C)]
+#[derive(Default)]
+struct DSyncGroup {
+    struct_size: u32,
+    flags: u32,
+    group: u32,
+    members: u32,
+    flip_lock: u32,
+    out_failed: u32,
+    out_reason: u32,
+    _pad: u32,
+}
 #[repr(C)]
 #[derive(Default)]
 struct DCommitMulti {
@@ -382,6 +394,14 @@ pub const OUTPUT_LIT: u32 = 0x100;
 /// has; no such output (or named twice).
 pub const FAULT_BANDWIDTH: u32 = 9;
 pub const FAULT_NO_OUTPUT: u32 = 10;
+/// (3.1) A sync group's outputs don't all run one timing and VRR floor.
+pub const FAULT_SYNC_MISMATCH: u32 = 11;
+/// (3.1) [`OutputInfo::flags`]: its timing drives its sync group.
+pub const OUTPUT_SYNC_MASTER: u32 = 0x200;
+/// (3.1) [`OutputInfo::flags`]: its flips land with its group's.
+pub const OUTPUT_FLIP_LOCKED: u32 = 0x400;
+/// (3.1) Sync groups are numbered 1..=SYNC_GROUPS.
+pub const SYNC_GROUPS: u32 = 4;
 /// (3.0) kqueue fflags: count output `n`'s vblanks.
 pub const fn note_output(n: u32) -> u32 { 0x100 << n }
 /// Interim connector type code for HDMI 2.1 (the power-on cable).
@@ -929,6 +949,8 @@ pub struct OutputInfo {
     pub height: u32,
     pub refresh_mhz: u32,
     pub pixel_clock_khz: u32,
+    /// (3.1) Its [`Display::commit_sync_group`] group, 0 = none.
+    pub sync_group: u32,
 }
 
 impl OutputInfo {
@@ -1071,6 +1093,7 @@ impl Display {
                     height: o.height,
                     refresh_mhz: o.refresh_mhz,
                     pixel_clock_khz: o.pixel_clock_khz,
+                    sync_group: o.sync_group,
                 })
                 .collect(),
         })
@@ -1115,6 +1138,27 @@ impl Display {
         Ok(MultiResult {
             failed: (m.out_failed != u32::MAX).then_some(m.out_failed as usize),
             reason: m.out_reason,
+        })
+    }
+
+    /// (3.1) Lock outputs together for a span (fresco-span.md §5): the
+    /// `members` (bit n = output n) of sync group `group` (1..=4) share
+    /// one vblank clock, and the `flip_lock` ones flip together (a flip
+    /// commit naming one must name all). Sets the group's whole
+    /// membership; `members` 0 dissolves it. A refusal (an output dark,
+    /// or at another timing) comes back as `failed` = the output.
+    pub fn commit_sync_group(&self, group: u32, members: u32, flip_lock: u32) -> io::Result<MultiResult> {
+        let mut g = DSyncGroup {
+            struct_size: std::mem::size_of::<DSyncGroup>() as u32,
+            group,
+            members,
+            flip_lock,
+            ..Default::default()
+        };
+        unsafe { call(self.fd, iowr(D, 72, std::mem::size_of::<DSyncGroup>()), &mut g)? };
+        Ok(MultiResult {
+            failed: (g.out_failed != u32::MAX).then_some(g.out_failed as usize),
+            reason: g.out_reason,
         })
     }
 
