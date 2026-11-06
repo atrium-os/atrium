@@ -48,7 +48,7 @@ pub fn commit(surface: &mut dyn Surface, deltas: &[NodeDelta]) -> io::Result<()>
     for d in deltas {
         match d {
             NodeDelta::Added { id, node, group, order } | NodeDelta::Changed { id, node, group, order } => {
-                if matches!(node, Node::Stack { .. }) {
+                if matches!(node, Node::Stack { .. } | Node::Scroll { .. }) {
                     surface.set_group(*id, node, *group, *order)?;
                 } else {
                     surface.set_node(*id, node, *group, *order)?;
@@ -105,7 +105,7 @@ impl Surface for LogSurface {
                 "  set  id={:>3}  {at:<8} Path ({:>4.1},{:>4.1})→({:>4.1},{:>4.1}) w={:.1}",
                 id.0, p0.0, p0.1, p1.0, p1.1, width,
             ),
-            Node::Stack { .. } => unreachable!("commit() sends Stacks to set_group"),
+            Node::Stack { .. } | Node::Scroll { .. } => unreachable!("commit() sends Stacks and Scrolls to set_group"),
         }
         Ok(())
     }
@@ -114,6 +114,8 @@ impl Surface for LogSurface {
         let r = stack.rect();
         let fill = match stack {
             Node::Stack { fill: Some(f), radius, .. } => format!(" fill=({:.2},{:.2},{:.2},{:.2}) r={radius:.0}", f.r, f.g, f.b, f.a),
+            Node::Scroll { offset, zoom, stretch, content_h, .. } => format!(
+                " SCROLL y={offset:.0} zoom={zoom:.2}×{stretch:.2} content_h={content_h:.0}"),
             _ => String::new(),
         };
         println!(
@@ -151,6 +153,9 @@ pub struct FrescoSurface {
     fonts: std::collections::HashMap<String, u32>,
     /// Device pixels per logical pixel.
     pub scale: f32,
+    /// What each scroll view last sent for its viewport group and
+    /// backdrop, so a scroll frame sends only the content group.
+    scrolls: std::collections::HashMap<u32, (fresco_protocol::GroupParams, Option<[f32; 9]>)>,
 }
 
 /// The wire id of a filled Stack's background rect.
@@ -160,7 +165,7 @@ fn background_id(id: NodeId) -> u32 {
 
 impl FrescoSurface {
     pub fn new(conn: fresco_client::Connection, window_id: u32) -> Self {
-        Self { conn, window_id, fonts: std::collections::HashMap::new(), scale: 1.0 }
+        Self { conn, window_id, fonts: std::collections::HashMap::new(), scale: 1.0, scrolls: Default::default() }
     }
 
     pub fn window_id(&self) -> u32 { self.window_id }
@@ -190,6 +195,67 @@ impl FrescoSurface {
             r: fill.r, g: fill.g, b: fill.b, a: fill.a,
             radius: radius * k,
         }
+    }
+}
+
+impl FrescoSurface {
+    /// A scroll view: a `SCROLL` group at its origin clipped to its box,
+    /// its backdrop at order 0, and the content group (order 1) moved by
+    /// the offset and scaled by the gesture's stretch. Only what changed
+    /// is sent, so a scroll frame is one `GROUP` message.
+    fn set_scroll(&mut self, id: NodeId, node: &Node, group: Option<NodeId>, order: u32) -> io::Result<()> {
+        let Node::Scroll { rect, offset, zoom, stretch, backdrop, .. } = node else { unreachable!() };
+        use fresco_protocol::{group_flags, GroupParams};
+        let k = self.scale;
+        let mut outer = GroupParams {
+            parent: group.map(|g| g.0),
+            order,
+            transform: GroupParams::IDENTITY,
+            clip: Some([rect.x() * k, rect.y() * k, (rect.x() + rect.w()) * k, (rect.y() + rect.h()) * k]),
+            opacity: 1.0,
+            flags: group_flags::SCROLL,
+        };
+        outer.transform[4] = rect.x() * k;
+        outer.transform[5] = rect.y() * k;
+        let back = backdrop.map(|c| [0.0, 0.0, rect.w() * k, rect.h() * k, c.r, c.g, c.b, c.a, 0.0]);
+        let (old_outer, old_back) = match self.scrolls.get(&id.0) {
+            Some(&(o, b)) => (Some(o), Some(b)),
+            None => (None, None),
+        };
+        if old_outer != Some(outer) {
+            self.conn.scene_group(id.0, outer)?;
+        }
+        if old_back != Some(back) {
+            let bg = background_id(id);
+            match back {
+                Some(b) => {
+                    let p = fresco_protocol::RectParams {
+                        x: b[0], y: b[1], w: b[2], h: b[3], r: b[4], g: b[5], b: b[6], a: b[7], radius: 0.0,
+                    };
+                    self.conn.scene_node_rect(bg, p)?;
+                    self.conn.scene_place(bg, Some(id.0), 0)?;
+                }
+                None => self.conn.scene_node_clear(bg)?,
+            }
+        }
+        self.scrolls.insert(id.0, (outer, back));
+        // Content: payloads are already times `zoom` (and `k`); the group
+        // adds the scroll and the live stretch about the viewport's top.
+        let s = stretch.clamp(1.0 / 64.0, 64.0);
+        let mut content = GroupParams {
+            parent: Some(id.0),
+            order: 1,
+            transform: GroupParams::IDENTITY,
+            clip: None,
+            opacity: 1.0,
+            flags: 0,
+        };
+        content.transform[0] = s;
+        content.transform[3] = s;
+        // Whole device pixels: the renderer shifts what is drawn only by a
+        // whole-pixel step (fresco-scene-groups.md §4).
+        content.transform[5] = (-offset * zoom * s * k).round();
+        self.conn.scene_group(id.0 | crate::node::CONTENT_BIT, content)
     }
 }
 
@@ -237,12 +303,15 @@ impl Surface for FrescoSurface {
                 };
                 self.conn.scene_node_path(id.0, params)?;
             }
-            Node::Stack { .. } => return self.set_group(id, node, group, order),
+            Node::Stack { .. } | Node::Scroll { .. } => return self.set_group(id, node, group, order),
         }
         self.conn.scene_place(id.0, group.map(|g| g.0), order)
     }
 
     fn set_group(&mut self, id: NodeId, stack: &Node, group: Option<NodeId>, order: u32) -> io::Result<()> {
+        if let Node::Scroll { .. } = stack {
+            return self.set_scroll(id, stack, group, order);
+        }
         let Node::Stack { rect, fill, radius, .. } = stack else {
             return self.set_node(id, stack, group, order);
         };
@@ -271,6 +340,7 @@ impl Surface for FrescoSurface {
     }
 
     fn clear_node(&mut self, id: NodeId) -> io::Result<()> {
+        self.scrolls.remove(&id.0);
         self.conn.scene_node_clear(id.0)
     }
 

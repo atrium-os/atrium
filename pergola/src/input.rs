@@ -32,13 +32,17 @@ pub fn translate(ev: &fresco_client::Event) -> Option<Event> {
             let (key, chars) = decode_key(*hid_usage, &mods);
             Some(Event::Key { kind, key, modifiers: mods, chars })
         }
+        // A wheel or trackpad delta, at wherever the pointer last was
+        // (the App knows; the event does not say).
+        fresco_client::Event::PointerScroll { dx, dy, .. } => {
+            Some(Event::Scroll { at: None, dx: *dx, dy: *dy, modifiers: Modifiers::default() })
+        }
         // Window lifecycle events not yet routed through Pergola's
         // input system — the embedder handles them at the loop level.
         fresco_client::Event::Resized { .. }
         | fresco_client::Event::FocusChanged { .. }
         | fresco_client::Event::CloseRequested { .. }
         | fresco_client::Event::DpiChanged { .. }
-        | fresco_client::Event::PointerScroll { .. }
         // Window lifecycle (create/destroy) is a WM concern, not app input.
         | fresco_client::Event::WindowCreated { .. }
         | fresco_client::Event::WindowDestroyed { .. }
@@ -105,6 +109,8 @@ fn decode_key(hid: u16, mods: &Modifiers) -> (Key, String) {
         0x52 => (Key::Up,        String::new()),
         0x4A => (Key::Home,      String::new()),
         0x4D => (Key::End,       String::new()),
+        0x4B => (Key::PageUp,    String::new()),
+        0x4E => (Key::PageDown,  String::new()),
         // Anything else: use Char with empty content — the Down event
         // still reaches handlers that want to react to non-printable
         // keys, but TextField won't append anything.

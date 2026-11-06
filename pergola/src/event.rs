@@ -17,6 +17,11 @@ pub enum Event {
     PointerDown { at: Point },
     PointerUp { at: Point },
     PointerMove { at: Point },
+    /// A wheel or trackpad delta in px (positive `dy` scrolls the content
+    /// up, revealing what is below). `at` is the pointer, when known; the
+    /// App fills it from the last pointer position, and `modifiers` from
+    /// the last key event (Ctrl + wheel zooms).
+    Scroll { at: Option<Point>, dx: f32, dy: f32, modifiers: Modifiers },
     /// A keyboard key transition (down or up). `key` is the
     /// USB-HID-usage-code-style identifier from `Key`. `chars` is
     /// any text input the platform decoded for this event (printable
@@ -58,6 +63,8 @@ pub enum Key {
     Down,
     Home,
     End,
+    PageUp,
+    PageDown,
 }
 
 /// Topmost-node hit test. Walks the tree depth-first; returns the
@@ -85,9 +92,21 @@ fn hit_test_subtree(tree: &NodeTree, id: NodeId, point: Point) -> Option<NodeId>
         return None;
     }
 
+    // Children of a scroll view are laid out unscrolled: map the point
+    // into their space (undo the offset and the zoom).
+    let inner = match node {
+        Node::Scroll { rect, offset, zoom, stretch, .. } => {
+            let z = zoom * stretch;
+            Point::new(
+                rect.origin.x + (point.x - rect.origin.x) / z,
+                rect.origin.y + (point.y - rect.origin.y) / z + offset,
+            )
+        }
+        _ => point,
+    };
     // Recurse into children in reverse (later-added = on top).
     for child in tree.children_of(id).iter().rev() {
-        if let Some(hit) = hit_test_subtree(tree, *child, point) {
+        if let Some(hit) = hit_test_subtree(tree, *child, inner) {
             return Some(hit);
         }
     }

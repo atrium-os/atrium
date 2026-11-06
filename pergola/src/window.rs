@@ -59,6 +59,8 @@ impl Flow {
 
 pub struct Window {
     surface: FrescoSurface,
+    /// The app clock's zero.
+    epoch: std::time::Instant,
     pub width: f32,
     pub height: f32,
 }
@@ -99,6 +101,7 @@ impl Window {
 
         Ok(Self {
             surface: FrescoSurface::new(conn, win),
+            epoch: std::time::Instant::now(),
             width: w as f32,
             height: h as f32,
         })
@@ -113,6 +116,8 @@ impl Window {
     /// Paint one frame now (initial paint, or after out-of-loop state
     /// changes).
     pub fn paint<V: View>(&mut self, app: &mut App<V>) -> io::Result<()> {
+        app.set_time(self.now_ms());
+        app.frame();
         let deltas = app.tick();
         if !deltas.is_empty() {
             commit(&mut self.surface, &deltas)?;
@@ -142,6 +147,22 @@ impl Window {
         }
     }
 
+    /// Milliseconds on the app clock.
+    fn now_ms(&self) -> f64 { self.epoch.elapsed().as_secs_f64() * 1e3 }
+
+    /// How long to wait for an event: until the next frame while the app
+    /// animates (client-driven animation, pergola.md §4.1), else `cap`.
+    /// Frames are paced at 120 Hz; the server presents at its own vsync.
+    fn wait_for<V: View>(&self, app: &App<V>, cap: Option<Duration>) -> Option<Duration> {
+        if !app.wants_frame() {
+            return cap;
+        }
+        const FRAME: Duration = Duration::from_micros(8_333);
+        let since = Duration::from_secs_f64((self.now_ms() - app.time()).max(0.0) / 1e3);
+        let next = FRAME.saturating_sub(since);
+        Some(cap.map_or(next, |c| c.min(next)))
+    }
+
     /// One loop iteration: wait up to `timeout` for an event, default-
     /// dispatch it into the app, repaint if dirty. Returns the raw
     /// event (`None` on timeout) so callers with periodic work — a
@@ -153,7 +174,9 @@ impl Window {
         app: &mut App<V>,
         timeout: Option<Duration>,
     ) -> io::Result<StepResult> {
-        let ev = self.surface.connection().wait_event(timeout)?;
+        let wait = self.wait_for(app, timeout);
+        let ev = self.surface.connection().wait_event(wait)?;
+        app.set_time(self.now_ms());
         let result = match ev {
             Some(ev) => {
                 if matches!(ev, fresco_client::Event::CloseRequested { .. }) {
@@ -184,10 +207,16 @@ impl Window {
         self.paint(app)?;
 
         loop {
-            let ev = match self.surface.connection().wait_event(None)? {
+            let wait = self.wait_for(app, None);
+            let ev = match self.surface.connection().wait_event(wait)? {
                 Some(ev) => ev,
-                None => continue,
+                None => {
+                    // A frame tick with no input.
+                    self.paint(app)?;
+                    continue;
+                }
             };
+            app.set_time(self.now_ms());
 
             let mut flow = Flow { exit: false, consumed: false };
             hook(&ev, app, &mut flow);

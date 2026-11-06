@@ -106,7 +106,7 @@ impl FlexStyle {
 /// whole subtree (nested Stacks included); everything else keeps its
 /// declared rect.
 pub fn layout(tree: &mut NodeTree, root: PNodeId) {
-    if matches!(tree.get(root), Some(Node::Stack { .. })) {
+    if matches!(tree.get(root), Some(Node::Stack { .. } | Node::Scroll { .. })) {
         flex_subtree(tree, root);
         return;
     }
@@ -189,6 +189,9 @@ fn flex_subtree(tree: &mut NodeTree, root: PNodeId) {
         };
         if let Some(node) = tree.get_mut(p_id) {
             node.set_rect(PRect::new(x, y, l.size.width, l.size.height));
+            if let Node::Scroll { content_h, .. } = node {
+                *content_h = l.content_size.height;
+            }
         }
         let p_children: Vec<PNodeId> = tree.children_of(p_id).to_vec();
         let t_children = taffy.children(t_id).unwrap_or_default();
@@ -275,6 +278,26 @@ fn build(
             let child_ids: Vec<PNodeId> = tree.children_of(id).to_vec();
             let mut t_children = Vec::with_capacity(child_ids.len());
             for c in child_ids {
+                if let Some(tc) = build(tree, c, taffy) {
+                    t_children.push(tc);
+                }
+            }
+            taffy.new_with_children(style, &t_children).ok()
+        }
+        Node::Scroll { rect, .. } => {
+            // A column the viewport's width, as tall as its content:
+            // scrolling moves it, layout never sees the offset.
+            style.display = Display::Flex;
+            style.flex_direction = FlexDirection::Column;
+            style.align_items = Some(AlignItems::STRETCH);
+            style.overflow = taffy::Point { x: taffy::Overflow::Hidden, y: taffy::Overflow::Scroll };
+            style.scrollbar_width = 0.0;
+            style.size = Size { width: dim(rect.size.w), height: dim(rect.size.h) };
+            let px = fs.padding_x.unwrap_or(fs.padding);
+            let py = fs.padding_y.unwrap_or(fs.padding);
+            style.padding = taffy::Rect { left: length(px), right: length(px), top: length(py), bottom: length(py) };
+            let mut t_children = Vec::new();
+            for &c in tree.children_of(id) {
                 if let Some(tc) = build(tree, c, taffy) {
                     t_children.push(tc);
                 }

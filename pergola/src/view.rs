@@ -103,6 +103,18 @@ impl<'a> Ctx<'a> {
             Some(Box::new(handler) as crate::interaction::KeyHandler);
     }
 
+    /// Receive wheel, navigation-key and press input for a scroll view.
+    pub fn on_scroll<F: Fn(&crate::interaction::ScrollInput) + 'static>(&mut self, id: NodeId, handler: F) {
+        self.interactions.entry(id).on_scroll = Some(Box::new(handler));
+    }
+
+    /// Run `handler` every frame while the app animates (it returns
+    /// whether it still needs frames). Frames start when input reaches an
+    /// `on_scroll` handler.
+    pub fn on_frame<F: Fn(f64, &Node) -> bool + 'static>(&mut self, id: NodeId, handler: F) {
+        self.interactions.entry(id).on_frame = Some(Box::new(handler));
+    }
+
     /// Mark a node as eligible for keyboard focus.
     pub fn focusable(&mut self, id: NodeId) {
         self.interactions.entry(id).focusable = true;

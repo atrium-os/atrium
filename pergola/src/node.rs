@@ -76,6 +76,27 @@ pub enum Node {
         fill: Option<Color>,
         radius: f32,
     },
+    /// A scrolling viewport (`ScrollView`, pergola.md §10): on the wire a
+    /// `SCROLL` group clipped to `rect`, an optional opaque `backdrop`
+    /// under everything, and one content group holding the children. The
+    /// children are laid out once, in a column `rect.w` wide starting at
+    /// `rect.origin`, as if not scrolled; a scroll changes only the
+    /// content group's transform.
+    ///
+    /// - `offset`: scroll position, content px at zoom 1.
+    /// - `zoom`: the settled zoom the children are sent at (their
+    ///   payloads are multiplied by it).
+    /// - `stretch`: the gesture's zoom over `zoom` while a pinch runs (the
+    ///   content group's scale: existing content stretched until it settles).
+    /// - `content_h`: the children's height at zoom 1, written by layout.
+    Scroll {
+        rect: Rect,
+        offset: f32,
+        zoom: f32,
+        stretch: f32,
+        backdrop: Option<Color>,
+        content_h: f32,
+    },
     /// A single stroked line segment (a thick rotated quad at the GPU layer).
     /// Absolutely positioned — layout doesn't touch it. Vector icons are built from
     /// many of these (see `icon::parse_icon`).
@@ -111,7 +132,7 @@ impl Node {
     /// kinds (Text) it is mutated in place by the layout pass.
     pub fn rect(&self) -> Rect {
         match self {
-            Node::Rect { rect, .. } | Node::Text { rect, .. } | Node::Stack { rect, .. } => *rect,
+            Node::Rect { rect, .. } | Node::Text { rect, .. } | Node::Stack { rect, .. } | Node::Scroll { rect, .. } => *rect,
             Node::Path { p0, p1, .. } => {
                 let (x, y) = (p0.0.min(p1.0), p0.1.min(p1.1));
                 Rect::new(x, y, (p0.0 - p1.0).abs(), (p0.1 - p1.1).abs())
@@ -121,23 +142,34 @@ impl Node {
 
     pub fn set_rect(&mut self, r: Rect) {
         match self {
-            Node::Rect { rect, .. } | Node::Text { rect, .. } | Node::Stack { rect, .. } => *rect = r,
+            Node::Rect { rect, .. } | Node::Text { rect, .. } | Node::Stack { rect, .. } | Node::Scroll { rect, .. } => *rect = r,
             Node::Path { .. } => {} // absolutely positioned — layout doesn't move it
         }
     }
 
-    /// The same node moved by `(dx, dy)` (to its group's coordinates).
-    pub fn offset(mut self, dx: f32, dy: f32) -> Self {
+    /// The node in a group's coordinates: moved by `-origin`, then
+    /// multiplied by `scale` (a scroll view's zoom; 1 elsewhere).
+    pub fn to_group(mut self, origin: crate::geom::Point, scale: f32) -> Self {
+        let map = |x: f32, y: f32| ((x - origin.x) * scale, (y - origin.y) * scale);
         match &mut self {
-            Node::Rect { rect, .. } | Node::Text { rect, .. } | Node::Stack { rect, .. } => {
-                rect.origin.x += dx;
-                rect.origin.y += dy;
+            Node::Rect { rect, radius, .. } => {
+                *rect = scale_rect(*rect, origin, scale);
+                *radius *= scale;
             }
-            Node::Path { p0, p1, .. } => {
-                p0.0 += dx;
-                p0.1 += dy;
-                p1.0 += dx;
-                p1.1 += dy;
+            Node::Text { rect, style, .. } => {
+                *rect = scale_rect(*rect, origin, scale);
+                style.size *= scale;
+            }
+            Node::Stack { rect, radius, spacing, .. } => {
+                *rect = scale_rect(*rect, origin, scale);
+                *radius *= scale;
+                *spacing *= scale;
+            }
+            Node::Scroll { rect, .. } => *rect = scale_rect(*rect, origin, scale),
+            Node::Path { p0, p1, width, .. } => {
+                *p0 = map(p0.0, p0.1);
+                *p1 = map(p1.0, p1.1);
+                *width *= scale;
             }
         }
         self
@@ -149,7 +181,7 @@ impl Node {
     /// their declared size; primitives report their `rect.size`.
     pub fn intrinsic_size(&self) -> Size {
         match self {
-            Node::Rect { rect, .. } | Node::Stack { rect, .. } => rect.size,
+            Node::Rect { rect, .. } | Node::Stack { rect, .. } | Node::Scroll { rect, .. } => rect.size,
             Node::Text { content, style, .. } => Self::measure_text(content, style),
             Node::Path { .. } => self.rect().size,
         }
@@ -160,6 +192,10 @@ impl Node {
     pub fn measure_text(content: &str, style: &TextStyle) -> Size {
         crate::text::measure(content, style)
     }
+}
+
+fn scale_rect(r: Rect, origin: crate::geom::Point, scale: f32) -> Rect {
+    Rect::new((r.origin.x - origin.x) * scale, (r.origin.y - origin.y) * scale, r.size.w * scale, r.size.h * scale)
 }
 
 /// What makes a node "the same node" from one render to the next: its
@@ -174,18 +210,26 @@ enum Key {
 /// Hands out stable node ids. Persists across renders (the `App` moves it
 /// from one tree to the next), so a node keeps its id while its key path
 /// stays the same, however the nodes around it change. Ids are below
-/// 2^31: the top bit names a node's background rect on the wire.
+/// 2^30: the top two bits name the wire nodes a node derives
+/// ([`DERIVED_BIT`], [`CONTENT_BIT`]).
 #[derive(Debug, Default)]
 pub struct KeyAlloc {
     ids: HashMap<(u32, Key), u32>,
+    /// The ids in `ids`, so a counter that wraps never reuses a live one.
+    live: std::collections::HashSet<u32>,
     seen: std::collections::HashSet<(u32, Key)>,
     next: u32,
 }
 
 /// Parent id of the top-level nodes in the key map.
 const NO_PARENT: u32 = u32::MAX;
-/// Wire ids at or above this are derived (a filled Stack's background).
+/// A wire id with this bit is a node's background rect (a filled
+/// Stack's fill, a scroll view's backdrop).
 pub const DERIVED_BIT: u32 = 1 << 31;
+/// A wire id with this bit is a scroll view's content group.
+pub const CONTENT_BIT: u32 = 1 << 30;
+/// Node ids are below this.
+pub const ID_LIMIT: u32 = 1 << 30;
 
 impl KeyAlloc {
     fn id(&mut self, parent: Option<NodeId>, key: Key) -> NodeId {
@@ -194,16 +238,25 @@ impl KeyAlloc {
         if let Some(&id) = self.ids.get(&k) {
             return NodeId(id);
         }
-        let id = self.next;
-        self.next = (self.next + 1) % DERIVED_BIT;
+        let mut id = self.next;
+        while self.live.contains(&id) {
+            id = (id + 1) % ID_LIMIT;
+        }
+        self.next = (id + 1) % ID_LIMIT;
         self.ids.insert(k, id);
+        self.live.insert(id);
         NodeId(id)
     }
 
     /// Forget keys not used since the last sweep (after each render).
     pub fn sweep(&mut self) {
         let seen = std::mem::take(&mut self.seen);
-        self.ids.retain(|k, _| seen.contains(k));
+        let live = &mut self.live;
+        self.ids.retain(|k, id| {
+            let keep = seen.contains(k);
+            if !keep { live.remove(id); }
+            keep
+        });
     }
 }
 
@@ -324,11 +377,12 @@ impl NodeTree {
     pub fn len(&self) -> usize { self.nodes.len() }
     pub fn is_empty(&self) -> bool { self.nodes.is_empty() }
 
-    /// The nearest Stack strictly above `id`: the group it is drawn in.
+    /// The nearest Stack or Scroll strictly above `id`: the node whose
+    /// group it is drawn in.
     pub fn group_of(&self, id: NodeId) -> Option<NodeId> {
         let mut p = self.parent_of(id);
         while let Some(x) = p {
-            if matches!(self.get(x), Some(Node::Stack { .. })) {
+            if matches!(self.get(x), Some(Node::Stack { .. } | Node::Scroll { .. })) {
                 return Some(x);
             }
             p = self.parent_of(x);
@@ -336,27 +390,40 @@ impl NodeTree {
         None
     }
 
-    /// Where each node sits on the wire: its group, its paint order
-    /// within that group (preorder among the group's members), and its
-    /// payload in the group's coordinates.
+    /// Where each node sits on the wire: its group (a Stack's own id, a
+    /// Scroll's content group), its paint order within that group
+    /// (preorder among the group's members), and its payload in the
+    /// group's coordinates, times the zoom of the scroll views it is in.
     fn placements(&self) -> HashMap<NodeId, Placement> {
+        #[derive(Clone, Copy)]
+        struct Frame {
+            wire: Option<NodeId>,
+            origin: crate::geom::Point,
+            scale: f32,
+        }
         let mut out = HashMap::with_capacity(self.nodes.len());
         let mut next_order: HashMap<Option<NodeId>, u32> = HashMap::new();
+        let top = Frame { wire: None, origin: crate::geom::Point::new(0.0, 0.0), scale: 1.0 };
         // Preorder: roots in order, then children depth first.
-        let mut stack: Vec<NodeId> = self.roots().collect::<Vec<_>>().into_iter().rev().collect();
-        while let Some(id) = stack.pop() {
-            let group = self.group_of(id);
-            let origin = group.and_then(|g| self.get(g)).map(|g| g.rect().origin).unwrap_or(crate::geom::Point::new(0.0, 0.0));
-            // Order 0 is a filled Stack's own background, drawn first.
-            let o = next_order.entry(group).or_insert(1);
+        let mut stack: Vec<(NodeId, Frame)> = self.roots().collect::<Vec<_>>().into_iter().rev().map(|r| (r, top)).collect();
+        while let Some((id, f)) = stack.pop() {
+            let Some(node) = self.get(id) else { continue };
+            // Order 0 is a group's own background, drawn first.
+            let o = next_order.entry(f.wire).or_insert(1);
             let order = *o;
             *o += 1;
-            let node = self.get(id).cloned().map(|n| n.offset(-origin.x, -origin.y));
-            if let Some(node) = node {
-                out.insert(id, Placement { group, order, node });
-            }
+            out.insert(id, Placement { group: f.wire, order, node: node.clone().to_group(f.origin, f.scale) });
+            let inner = match node {
+                Node::Stack { rect, .. } => Frame { wire: Some(id), origin: rect.origin, scale: f.scale },
+                Node::Scroll { rect, zoom, .. } => Frame {
+                    wire: Some(NodeId(id.0 | CONTENT_BIT)),
+                    origin: rect.origin,
+                    scale: f.scale * zoom,
+                },
+                _ => f,
+            };
             for &c in self.children_of(id).iter().rev() {
-                stack.push(c);
+                stack.push((c, inner));
             }
         }
         out

@@ -268,7 +268,8 @@ Color management has three layers, addressed in order:
 *Asked by the user, 2026-11-06, while the Navigator's big-document work was under way:
 scrolling and flings "belong ideally to the UI", and "I'm wondering if this becomes some
 kind of a rich text/layout widget for the UI so other apps can get the same features".
-Agreed: yes. Status: specified, not built. Pergola has no `ScrollView` yet.*
+Agreed: yes. Status: `ScrollView` prototype built 2026-11-06 (below, §10.5); `DocumentView` and
+band sources not yet.*
 
 ### §10.1 Scrolling is Pergola's, not the Navigator's
 
@@ -408,3 +409,47 @@ the fling blur; it is not blocking ScrollView.
 find bar and zoom controls run on Pergola in the Navigator's trusted UI process, and each
 page is a jailed document surface embedded in it (Limen doc-viewer). frescod's origin strip
 stays frescod's, drawn outside any app.
+
+### §10.5 ScrollView prototype, as built (2026-11-06)
+
+- **Code.** `pergola/src/scroll.rs` holds the pure parts on a caller's clock: `Physics` (drag,
+  fling with 0.998/ms decay, eased jumps for keys and wheel notches, bounds), `Zoom` (pinch,
+  Ctrl-wheel, Ctrl + − 0, settles after 100 ms quiet) and `Viewport` (the band interface's view
+  side: when to send `want`, placeholder ranges, anchoring). `widgets/scroll_view.rs` is the
+  widget; `Node::Scroll` is its node.
+- **Wire shape.** A `SCROLL` group at the view's origin, clipped to its box; an opaque backdrop
+  rect at order 0 (theme window background unless the app picks another); the content group at
+  order 1, whose translation is the offset rounded to whole device pixels. This is exactly the
+  shape frescod shifts (fresco-scene-groups.md §4, 442cd94). A scroll frame sends one `GROUP`
+  message: the surface skips the viewport and backdrop when they are unchanged, and the content's
+  nodes keep their content-group coordinates (tested: each fling frame's delta list is the
+  scroll node alone).
+- **Input.** `Event::Scroll` (from fresco `PointerScroll`, at the last pointer position). Deltas of
+  30 px or more are wheel notches and ease; smaller ones follow the finger and fling on release.
+  The wire has no gesture phases, so release is inferred after 30 ms without a delta; a late
+  delta coasts at the drag's speed and the fling takes over from the coast, so release neither
+  pauses nor jumps (tested at 1 ms steps). Arrows, Page Up/Down, Space, Home/End go to the
+  focused scroll view, else the one under the pointer. A press catches a fling.
+- **Frames.** Client-driven (§4.1): `on_frame` handlers run every frame while something moves;
+  `Window` waits at most one 120 Hz frame while the app animates and blocks otherwise.
+- **Zoom.** Content is laid out at zoom 1 and sent at the settled zoom (payloads and text sizes
+  multiplied); during a gesture the content group stretches it, and text keeps its size until the
+  settle re-sends it. Ctrl-wheel keeps the point under the pointer still.
+- **Measured** with the Navigator scroll harness (`scroll_bench --pattern pergola`, which compiles
+  `pergola/src/scroll.rs` in and drives a 4,000 px/s swipe every 1.5 s through it), strips and
+  bands on, a generated 305,000 px document (2,400 paragraphs), 8 s, after first display:
+
+  | | 60 Hz: p99.9 | missed | stalls > 100 ms | 120 Hz: p99.9 | missed |
+  |---|---|---|---|---|---|
+  | scripted flings | 12.7 ms | 0.2% | 0 | 13.2 ms | 5.3% |
+  | Pergola physics | 11.4 ms | 0.0% | 0 | 11.4 ms | 3.9% |
+
+  The 60 Hz gates pass. At 120 Hz the misses are the harness compositor's frame cost (p99 about
+  10 ms against an 8.3 ms period), the same with either motion; the gate applies once the
+  compositor redraws by damage, which frescod now does (442cd94) but the harness does not model.
+  Runs on a shared 4-core cloud machine vary by a point or two of missed frames.
+- **Not yet.** Horizontal scrolling, a scrollbar, blur on the wire (no renderer op;
+  `Physics::motion_blur_px` gives the amount), placeholders drawn (`Viewport::placeholders` gives
+  the ranges, used once a band source exists), `DocumentView`, gesture phases on the wire (would
+  replace the inferred release), and a run on frescod itself.
+

@@ -253,7 +253,9 @@ Pergola thread's, except 5 and 6.
    their Stack's coordinates, node ids are keyed (`Ctx::key`, `NodeTree::continuing`) so an
    inserted row or a moved Stack re-sends only what changed, and removing a Stack is one clear.
 4. `SCROLL` shift in the pixel-mode renderer; Pergola `ScrollView`; judged with the scroll harness
-   against the §10.1 gates.
+   against the §10.1 gates. Renderer half done (442cd94). **Pergola half done 2026-11-06**: the
+   prototype ScrollView builds the §4 shape and passes the 60 Hz gates in the harness
+   (pergola.md §10.5).
 5. `ISOLATE` (exact group opacity: draw the group to its own buffer, then blend), moved up at the
    Navigator thread's request: a faded card is the commonest case and multiplied alpha gets it
    wrong. Renderer work, Fresco owners; bitmaps stand in until it lands.

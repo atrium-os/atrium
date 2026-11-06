@@ -1,4 +1,4 @@
-//! scroll_bench <normalized.html> [--hz 60|120] [--pattern fling|flings|page|jump] [--secs N]
+//! scroll_bench <normalized.html> [--hz 60|120] [--pattern fling|flings|page|jump|pergola] [--secs N]
 //!              [--scale 1|2] [--csv out.csv] [--inject-stall MS@T]
 //!              [--compose full|strip] [--fast PX_PER_S] [--blur] [--bands]
 //!
@@ -28,6 +28,11 @@
 //! window gets a velocity-scaled vertical motion blur; when the fling slows,
 //! the window is redrawn sharp once (`sharp_after_slowdown_ms`).
 //!
+//! `--pattern pergola`: the motion is Pergola's own `ScrollView` physics
+//! (pergola/src/scroll.rs, compiled in here as is): a 4,000 px/s trackpad
+//! swipe every 1.5 s (eight deltas at 120 Hz input), released and flung
+//! by the same code apps run, so the gates judge the motion users get.
+//!
 //! `--inject-stall MS@T`: the frame starting at or after T ms takes MS ms
 //! longer — the POSITIVE CONTROL: a harness that reports no stalls must be
 //! shown to report one it was given (and its catch-up).
@@ -36,6 +41,34 @@
 //! `--csv` one row per vsync: `t_ms target_y shown_y age_ms cost_ms missed`.
 
 use fresco_compute::*;
+
+// Pergola's scroll physics, the very file `ScrollView` uses (std only).
+#[allow(dead_code)]
+#[path = "../../pergola/src/scroll.rs"]
+mod pergola_scroll;
+
+/// `--pattern pergola`: swipes through Pergola's `Physics`, stepped to
+/// each vsync. Returns 1/64 px like `target`.
+struct PergolaSwipes { p: pergola_scroll::Physics, next_swipe: f64, sent: usize, at: f64 }
+
+impl PergolaSwipes {
+    const EVERY_MS: f64 = 1500.0;
+    const INPUT_MS: f64 = 1000.0 / 120.0;
+    const N: usize = 8;
+    fn new(max_y: f64) -> Self { Self { p: pergola_scroll::Physics::new(max_y), next_swipe: 0.0, sent: 0, at: 0.0 } }
+    fn at(&mut self, t: f64) -> f64 {
+        // Input events due by `t`, then the physics stepped to `t`.
+        loop {
+            let ev = self.next_swipe + self.sent as f64 * Self::INPUT_MS;
+            if ev > t { break; }
+            self.p.drag(4000.0 * Self::INPUT_MS / 1000.0, ev);
+            self.sent += 1;
+            if self.sent == Self::N { self.sent = 0; self.next_swipe += Self::EVERY_MS; }
+        }
+        self.at = t;
+        self.p.step(t) * PX as f64
+    }
+}
 use navigator_render::{fontset::FontSet, html::render_html, Scene as Nsg};
 use navigator_style::cascade::Env;
 use std::collections::HashMap;
@@ -375,6 +408,7 @@ fn main() {
     }
     // ---- The replay. ----
     let period = 1000.0 / hz;
+    let mut swipes = (pattern == "pergola").then(|| PergolaSwipes::new(max_y));
     let frames = (secs * hz) as usize;
     let mut free_at = 0.0f64;                  // when the compositor is idle again
     let mut pending: Option<(f64, f64, f64)> = None; // (present at, y, sampled at)
@@ -387,7 +421,7 @@ fn main() {
     for k in 0..frames {
         let t = k as f64 * period;
         if let Some((at, y, sampled)) = pending { if at <= t + 1e-9 { shown_y = y; shown_sampled = sampled; pending = None } }
-        let goal = target(&pattern, t, max_y, vh);
+        let goal = match swipes.as_mut() { Some(s) => s.at(t), None => target(&pattern, t, max_y, vh) };
         let mut cost = 0.0;
         let busy = free_at > t + 1e-9;
         if !busy {
@@ -398,6 +432,9 @@ fn main() {
                 let v = (goal - prev_goal).abs() / PX as f64 * hz;
                 let fast_now = v > fast;
                 if !fast_now && slow_since.is_none() && greek_on { slow_since = Some(t) }
+                // Fast again before the window was sharp: that slowdown is
+                // moot, the next one is timed.
+                if fast_now { slow_since = None }
                 // Settled: the window drawn greeked or blurred is queued, and
                 // sharpened a third per frame (`queue_sharpen`).
                 let settle = greek_on && !fast_now;

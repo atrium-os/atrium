@@ -115,6 +115,9 @@ fn print_subtree(tree: &pergola::NodeTree, id: NodeId, depth: usize) {
             Node::Path { p0, p1, width, .. } => println!(
                 "{indent}[{:>2}] Path ({:>3.0},{:>3.0})->({:>3.0},{:>3.0}) w={:.0}",
                 id.0, p0.0, p0.1, p1.0, p1.1, width,
+            ),            Node::Scroll { rect, offset, content_h, .. } => println!(
+                "{indent}[{:>2}] Scroll ({:>3.0},{:>3.0} {:>3.0}×{:>3.0}) y={:.0} content_h={:.0}",
+                id.0, rect.x(), rect.y(), rect.w(), rect.h(), offset, content_h,
             ),
         }
     }

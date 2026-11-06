@@ -17,10 +17,12 @@ pub mod button;
 pub mod chip;
 pub mod label;
 pub mod phosphor;
+pub mod scroll_view;
 pub mod text_field;
 
 pub use basics::{Avatar, Divider, Dot, ProgressBar};
 pub use button::Button;
 pub use chip::{Chip, ListRow};
 pub use label::{Glyph, Label};
+pub use scroll_view::{ScrollState, ScrollView};
 pub use text_field::TextField;

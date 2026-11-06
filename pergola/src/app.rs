@@ -52,6 +52,14 @@ pub struct App<V: View> {
     /// The next tick sends every node, not just the changed ones (the
     /// surface's scale changed, so every node's wire form did).
     resend: bool,
+    /// App time, ms (the `Window` sets it from its clock; tests set it).
+    now_ms: f64,
+    /// The pointer's last position, for wheel events (which carry none).
+    pointer: Option<crate::geom::Point>,
+    /// Modifiers of the last key event (Ctrl + wheel zooms).
+    modifiers: crate::event::Modifiers,
+    /// Some `on_frame` handler still needs frames.
+    animating: bool,
     pub theme: Semantic,
 }
 
@@ -83,6 +91,10 @@ impl<V: View> App<V> {
             pressed_vis: None,
             dirty,
             resend: false,
+            now_ms: 0.0,
+            pointer: None,
+            modifiers: Default::default(),
+            animating: false,
             theme: Semantic::LIGHT,
         }
     }
@@ -106,6 +118,48 @@ impl<V: View> App<V> {
     pub fn resend_all(&mut self) {
         self.resend = true;
         self.dirty.store(true, Ordering::Release);
+    }
+
+    /// Set the app clock (ms). Input and frames are stamped with it.
+    pub fn set_time(&mut self, ms: f64) { self.now_ms = ms; }
+    pub fn time(&self) -> f64 { self.now_ms }
+
+    /// Whether something is moving (a fling, an eased jump, a zoom
+    /// settling): the loop should call [`App::frame`] every vsync.
+    pub fn wants_frame(&self) -> bool { self.animating }
+
+    /// Step every `on_frame` handler at the current time. Their state
+    /// changes mark the app dirty; the next tick renders them.
+    pub fn frame(&mut self) {
+        if !self.animating {
+            return;
+        }
+        let t = self.now_ms;
+        let mut still = false;
+        for (id, h) in &self.interactions.by_node {
+            if let (Some(cb), Some(node)) = (&h.on_frame, self.prev_tree.get(*id)) {
+                still |= cb(t, node);
+            }
+        }
+        self.animating = still;
+    }
+
+    /// Deliver `kind` to the scroll view at or above `id`. Returns whether
+    /// one took it.
+    fn scroll_to(&mut self, id: Option<NodeId>, kind: crate::interaction::ScrollKind) -> bool {
+        let Some(target) = id.and_then(|id| self.bubble_to(id, |h| h.on_scroll.is_some())) else {
+            return false;
+        };
+        if let (Some(h), Some(node)) = (self.interactions.get(target), self.prev_tree.get(target)) {
+            if let Some(cb) = &h.on_scroll {
+                cb(&crate::interaction::ScrollInput { kind, t: self.now_ms, node });
+                // Input may have started motion: step frames until the
+                // view says it has stopped.
+                self.animating = true;
+                return true;
+            }
+        }
+        false
     }
 
     /// Mark the UI for a re-render (the window was resized).
@@ -164,6 +218,9 @@ impl<V: View> App<V> {
 
     /// The node currently receiving keyboard input, if any.
     pub fn focused(&self) -> Option<NodeId> { self.focused }
+
+    /// The tree as last rendered and laid out.
+    pub fn tree(&self) -> &NodeTree { &self.prev_tree }
 
     /// Dispatch an input event. Pointer events are hit-tested against
     /// the current tree; matching handlers fire on `PointerUp` when
@@ -228,7 +285,10 @@ impl<V: View> App<V> {
     pub fn handle_event(&mut self, event: Event) {
         match &event {
             Event::PointerDown { at } => {
+                self.pointer = Some(*at);
                 let hit = hit_test(&self.prev_tree, *at);
+                // A press inside a scroll view catches its fling.
+                self.scroll_to(hit, crate::interaction::ScrollKind::Press);
                 // Bubble from the hit node up to the nearest interactive ancestor:
                 // a click landing on a child (e.g. a button's centered label, or a
                 // field's text) must still target the interactive parent that holds
@@ -246,6 +306,7 @@ impl<V: View> App<V> {
                 }
             }
             Event::PointerUp { at } => {
+                self.pointer = Some(*at);
                 let target = hit_test(&self.prev_tree, *at)
                     .and_then(|id| self.bubble_to(id, |h| h.on_click.is_some()));
                 if let (Some(pressed), Some(up)) = (self.pending_press, target) {
@@ -263,6 +324,7 @@ impl<V: View> App<V> {
                 }
             }
             Event::PointerMove { at } => {
+                self.pointer = Some(*at);
                 // Hover target = nearest interactive ancestor (clickable
                 // or focusable) under the pointer.
                 let hover = hit_test(&self.prev_tree, *at)
@@ -272,22 +334,56 @@ impl<V: View> App<V> {
                     self.touch();
                 }
             }
-            Event::Key { kind, key, modifiers, .. } => {
+            Event::Scroll { at, dx, dy, modifiers } => {
+                let at = at.or(self.pointer);
+                let mods = if *modifiers == Default::default() { self.modifiers } else { *modifiers };
+                let hit = at.and_then(|p| hit_test(&self.prev_tree, p));
+                let kind = crate::interaction::ScrollKind::Wheel { at, dx: *dx, dy: *dy, modifiers: mods };
+                self.scroll_to(hit, kind);
+            }
+            Event::Key { kind, key, modifiers, chars } => {
+                self.modifiers = *modifiers;
                 // Tab is focus traversal, owned by the App; focused
                 // widgets never see it.
                 if *kind == KeyEventKind::Down && *key == Key::Tab {
                     self.cycle_focus(modifiers.shift);
                     return;
                 }
+                let mut taken = false;
                 if let Some(id) = self.focused {
                     if let Some(h) = self.interactions.get(id) {
                         if let Some(cb) = &h.on_key {
                             cb(&event);
+                            taken = true;
                         }
+                    }
+                }
+                // Navigation keys no focused widget took scroll the view
+                // that has focus inside it, else the one under the pointer.
+                if !taken && *kind == KeyEventKind::Down && is_scroll_key(*key, chars, modifiers) {
+                    let k = crate::interaction::ScrollKind::Key {
+                        key: *key,
+                        chars: chars.chars().next().unwrap_or('\0'),
+                        modifiers: *modifiers,
+                    };
+                    let under = self.pointer.and_then(|p| hit_test(&self.prev_tree, p));
+                    if !self.scroll_to(self.focused, k) {
+                        self.scroll_to(under, k);
                     }
                 }
             }
         }
+    }
+}
+
+/// Keys a scroll view acts on: arrows, Page Up/Down, Home/End, Space,
+/// and Ctrl with `+`, `=`, `-`, `0`.
+fn is_scroll_key(key: Key, chars: &str, m: &crate::event::Modifiers) -> bool {
+    match key {
+        Key::Up | Key::Down | Key::PageUp | Key::PageDown | Key::Home | Key::End => true,
+        Key::Char if chars == " " => true,
+        Key::Char if m.ctrl => matches!(chars, "+" | "=" | "-" | "0"),
+        _ => false,
     }
 }
 

@@ -10,14 +10,41 @@
 
 use std::collections::HashMap;
 
-use crate::event::Event;
-use crate::node::NodeId;
+use crate::event::{Event, Key, Modifiers};
+use crate::geom::Point;
+use crate::node::{Node, NodeId};
 
 pub type ClickHandler = Box<dyn Fn() + 'static>;
 /// Receives the full key event so handlers can match by kind, key,
 /// modifiers, and consume `chars`. TextField uses this to append
 /// text input.
 pub type KeyHandler = Box<dyn Fn(&Event) + 'static>;
+
+/// What a scroll view is asked to do.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum ScrollKind {
+    /// A wheel or trackpad delta (px) with the pointer at `at`.
+    Wheel { at: Option<Point>, dx: f32, dy: f32, modifiers: Modifiers },
+    /// A navigation key: arrows, Page Up/Down, Home/End, Space, and with
+    /// Ctrl the zoom keys (`+`, `-`, `0` arrive as `Key::Char` + `chars`).
+    Key { key: Key, chars: char, modifiers: Modifiers },
+    /// A press inside the view (catches a fling).
+    Press,
+}
+
+/// A scroll input, with the clock and the view's node as last laid out
+/// (its box and `content_h`).
+pub struct ScrollInput<'a> {
+    pub kind: ScrollKind,
+    /// App time, ms.
+    pub t: f64,
+    pub node: &'a Node,
+}
+
+pub type ScrollHandler = Box<dyn Fn(&ScrollInput) + 'static>;
+/// Called once per frame while the app animates, with the app time (ms)
+/// and the node as last laid out. Returns whether it still needs frames.
+pub type FrameHandler = Box<dyn Fn(f64, &Node) -> bool + 'static>;
 
 #[derive(Default)]
 pub struct Handlers {
@@ -26,6 +53,10 @@ pub struct Handlers {
     /// When `true`, this node can take keyboard focus. Pointer-down
     /// on a focusable node sets focus; Tab navigates among focusables.
     pub focusable: bool,
+    /// Wheel, navigation keys and presses for a scroll view.
+    pub on_scroll: Option<ScrollHandler>,
+    /// A per-frame step (a fling, an eased jump, a zoom settling).
+    pub on_frame: Option<FrameHandler>,
 }
 
 impl Handlers {
