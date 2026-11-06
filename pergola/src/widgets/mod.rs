@@ -14,6 +14,7 @@
 
 pub mod basics;
 pub mod button;
+pub mod canvas;
 pub mod chip;
 pub mod choice;
 pub mod credential_field;
@@ -27,6 +28,7 @@ pub mod virtual_list;
 
 pub use basics::{Avatar, Divider, Dot, ProgressBar};
 pub use button::Button;
+pub use canvas::{Canvas, CanvasEvent, Item as CanvasItem};
 pub use chip::{Chip, ListRow};
 pub use choice::{Check, Checkbox, RadioGroup, Segmented, Tabs, Toggle};
 pub use credential_field::{CredentialField, CredentialState};

@@ -491,3 +491,27 @@ stays frescod's, drawn outside any app.
   the ranges, used once a band source exists), `DocumentView`, gesture phases on the wire (would
   replace the inferred release), and a live run of a Pergola app on frescod.
 
+
+## §11. Vector drawing: `Canvas` (asked by the user, 2026-11-06)
+
+For apps that draw their own 2D content (vector drawing, flowcharts, diagrams). Built
+2026-11-06 in `pergola/src/shape.rs` and `widgets/canvas.rs`.
+
+- **Retained, keyed shapes.** The app holds `Vec<CanvasItem>` (key, `Shape`). A `Shape` is a
+  `PathData` (Fresco's verbs: move, line, quad, cubic, close; builders for rects, rounded rects,
+  ellipses), an optional fill (`Paint`: solid, linear, radial), an optional `Stroke` (width, cap,
+  join, miter limit, dashes), any affine (rotation and skew included) and an opacity. Each draws
+  as one or two `Node::Fill`s; a stroke's outline, dashes applied, is made once by tiny-skia's
+  stroker, the one the Navigator's SVG uses (Fresco never strokes). Nodes are keyed by item, so
+  replacing one item resends that item alone (tested).
+- **Pan and zoom** are `ScrollView`'s: the drawing is a free stack in its content, so scrolling
+  and zoom move one group and resend no shape (tested). Horizontal scroll waits for `Physics`
+  to gain an x axis.
+- **Input.** `on_pointer(CanvasEvent { phase: Start | Move | End, at, hit })`: canvas
+  coordinates with scroll and zoom undone, and the topmost shape whose ink is under the
+  pointer, tested on the fill or the stroke's outline, not on bounds (`Shape::hit`). Selection,
+  handles and tools are the app's.
+- **Not yet:** text on the canvas (use `Node::Glyphs` from a shaper; a shaping helper comes with
+  Pergola's own client-side text), images on the canvas (`Node::Image` exists, `Item` doesn't
+  carry one yet), a pixel buffer for paint programs (a texture slot updated by region; Fresco
+  supports it, no widget until an app needs it), and box-shadow-like effects (no Fresco op).

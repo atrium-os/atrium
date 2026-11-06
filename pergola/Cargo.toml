@@ -17,6 +17,8 @@ futures-signals = "0.3"
 unicode-segmentation = "1.12"
 # Glyph rastering for app-shaped text (src/glyphs.rs); pure Rust.
 swash = "0.1"
+# The stroker (strokes and dashes to fills) the Navigator's SVG uses; BSD-3.
+tiny-skia-path = "0.12"
 log             = "0.4"
 taffy = "0.12.2"
 # The clipboard service's wire (docs/spec/tabula.md); Pergola is a client.
