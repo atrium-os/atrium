@@ -106,6 +106,17 @@ pub enum Node {
         width: f32,
         color: Color,
     },
+    /// A shaped run: glyph ids already positioned (by the document engine,
+    /// or any shaper), rastered by the app into its atlas
+    /// ([`crate::glyphs`]). `origin` is the pen's start on the baseline;
+    /// absolutely positioned, layout doesn't move it.
+    Glyphs {
+        origin: crate::geom::Point,
+        face: crate::glyphs::Face,
+        size: f32,
+        color: Color,
+        glyphs: std::sync::Arc<[crate::glyphs::Glyph]>,
+    },
 }
 
 impl Node {
@@ -137,13 +148,19 @@ impl Node {
                 let (x, y) = (p0.0.min(p1.0), p0.1.min(p1.1));
                 Rect::new(x, y, (p0.0 - p1.0).abs(), (p0.1 - p1.1).abs())
             }
+            // An estimate (ascent 0.8 em, descent 0.25): the pen's travel
+            // plus one em for the last glyph.
+            Node::Glyphs { origin, size, glyphs, .. } => {
+                let end = glyphs.iter().map(|g| g.dx).fold(0.0f32, f32::max) + size;
+                Rect::new(origin.x, origin.y - 0.8 * size, end, 1.05 * size)
+            }
         }
     }
 
     pub fn set_rect(&mut self, r: Rect) {
         match self {
             Node::Rect { rect, .. } | Node::Text { rect, .. } | Node::Stack { rect, .. } | Node::Scroll { rect, .. } => *rect = r,
-            Node::Path { .. } => {} // absolutely positioned — layout doesn't move it
+            Node::Path { .. } | Node::Glyphs { .. } => {} // absolutely positioned — layout doesn't move it
         }
     }
 
@@ -171,6 +188,14 @@ impl Node {
                 *p1 = map(p1.0, p1.1);
                 *width *= scale;
             }
+            Node::Glyphs { origin: o, size, glyphs, .. } => {
+                let (x, y) = map(o.x, o.y);
+                *o = crate::geom::Point::new(x, y);
+                *size *= scale;
+                if scale != 1.0 {
+                    *glyphs = glyphs.iter().map(|g| crate::glyphs::Glyph { dx: g.dx * scale, dy: g.dy * scale, ..*g }).collect();
+                }
+            }
         }
         self
     }
@@ -183,7 +208,7 @@ impl Node {
         match self {
             Node::Rect { rect, .. } | Node::Stack { rect, .. } | Node::Scroll { rect, .. } => rect.size,
             Node::Text { content, style, .. } => Self::measure_text(content, style),
-            Node::Path { .. } => self.rect().size,
+            Node::Path { .. } | Node::Glyphs { .. } => self.rect().size,
         }
     }
 

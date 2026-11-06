@@ -43,6 +43,7 @@ pub mod theme;
 pub mod view;
 pub mod widgets;
 pub mod window;
+pub mod glyphs;
 
 pub use app::App;
 pub use color::Color;

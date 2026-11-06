@@ -105,6 +105,10 @@ impl Surface for LogSurface {
                 "  set  id={:>3}  {at:<8} Path ({:>4.1},{:>4.1})→({:>4.1},{:>4.1}) w={:.1}",
                 id.0, p0.0, p0.1, p1.0, p1.1, width,
             ),
+            Node::Glyphs { origin, face, size, glyphs, .. } => println!(
+                "  set  id={:>3}  {at:<8} Glyphs ({:>4.0},{:>4.0}) {face:?} {size:.1}px ×{}",
+                id.0, origin.x, origin.y, glyphs.len(),
+            ),
             Node::Stack { .. } | Node::Scroll { .. } => unreachable!("commit() sends Stacks and Scrolls to set_group"),
         }
         Ok(())
@@ -156,7 +160,13 @@ pub struct FrescoSurface {
     /// What each scroll view last sent for its viewport group and
     /// backdrop, so a scroll frame sends only the content group.
     scrolls: std::collections::HashMap<u32, (fresco_protocol::GroupParams, Option<[f32; 9]>)>,
+    /// App-shaped text's glyphs; uploaded on first use.
+    atlas: crate::glyphs::Atlas,
+    atlas_bound: bool,
 }
+
+/// The window's glyph atlas texture slot.
+pub const ATLAS_SLOT: u32 = 0x00A7_1A50;
 
 /// The wire id of a filled Stack's background rect.
 fn background_id(id: NodeId) -> u32 {
@@ -165,7 +175,7 @@ fn background_id(id: NodeId) -> u32 {
 
 impl FrescoSurface {
     pub fn new(conn: fresco_client::Connection, window_id: u32) -> Self {
-        Self { conn, window_id, fonts: std::collections::HashMap::new(), scale: 1.0, scrolls: Default::default() }
+        Self { conn, window_id, fonts: std::collections::HashMap::new(), scale: 1.0, scrolls: Default::default(), atlas: crate::glyphs::Atlas::new(), atlas_bound: false }
     }
 
     pub fn window_id(&self) -> u32 { self.window_id }
@@ -186,6 +196,39 @@ impl FrescoSurface {
         }
         self.fonts.insert(family.to_string(), resp.font_id);
         Ok(resp.font_id)
+    }
+
+    /// A run's glyph instances, rastering what the atlas lacks; then the
+    /// atlas rows that changed go to frescod, before the run uses them.
+    fn glyph_run(&mut self, origin: crate::geom::Point, face: &crate::glyphs::Face, size: f32, color: crate::Color, glyphs: &[crate::glyphs::Glyph]) -> io::Result<fresco_protocol::GlyphRunParams> {
+        use crate::glyphs::{ATLAS_H, ATLAS_W};
+        let k = self.scale;
+        let mut out = Vec::with_capacity(glyphs.len());
+        for g in glyphs {
+            if let Some(e) = self.atlas.glyph(face, size * k, g.id) {
+                out.push(fresco_protocol::GlyphInstance {
+                    // Whole device pixels: the atlas has no sub-pixel variants.
+                    dx: (g.dx * k).round(), dy: (g.dy * k).round(),
+                    atlas_u: e.u, atlas_v: e.v, atlas_w: e.w, atlas_h: e.h,
+                    bearing_x: e.left, bearing_y: e.top,
+                });
+            }
+        }
+        if !self.atlas_bound {
+            let _ = self.atlas.take_dirty();
+            let hash = self.conn.upload_blob(self.atlas.pixels())?;
+            self.conn.slot_set_texture(ATLAS_SLOT, hash, ATLAS_W, ATLAS_H, fresco_protocol::TextureFormat::R8Unorm)?;
+            self.atlas_bound = true;
+        } else if let Some((y, rows, px)) = self.atlas.take_dirty() {
+            let px = px.to_vec();
+            self.conn.slot_update_region(ATLAS_SLOT, 0, y, ATLAS_W, rows, px)?;
+        }
+        Ok(fresco_protocol::GlyphRunParams {
+            x: (origin.x * k).round(), y: (origin.y * k).round(),
+            atlas_slot_id: ATLAS_SLOT, atlas_width: ATLAS_W, atlas_height: ATLAS_H,
+            r: color.r, g: color.g, b: color.b, a: color.a,
+            glyphs: out,
+        })
     }
 
     fn rect_params(&self, rect: crate::geom::Rect, fill: crate::Color, radius: f32) -> fresco_protocol::RectParams {
@@ -302,6 +345,10 @@ impl Surface for FrescoSurface {
                     r: color.r, g: color.g, b: color.b, a: color.a,
                 };
                 self.conn.scene_node_path(id.0, params)?;
+            }
+            Node::Glyphs { origin, face, size, color, glyphs } => {
+                let params = self.glyph_run(*origin, face, *size, *color, glyphs)?;
+                self.conn.scene_node_glyph_run(id.0, params)?;
             }
             Node::Stack { .. } | Node::Scroll { .. } => return self.set_group(id, node, group, order),
         }

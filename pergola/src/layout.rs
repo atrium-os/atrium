@@ -312,7 +312,7 @@ fn build(
                 )
                 .ok()
         }
-        Node::Rect { .. } | Node::Path { .. } => {
+        Node::Rect { .. } | Node::Path { .. } | Node::Glyphs { .. } => {
             let r = node.rect();
             style.size = Size { width: dim(r.size.w), height: dim(r.size.h) };
             taffy.new_leaf(style).ok()

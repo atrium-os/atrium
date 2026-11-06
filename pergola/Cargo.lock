@@ -625,6 +625,7 @@ dependencies = [
  "log",
  "postcard",
  "serde",
+ "swash",
  "tabula",
  "taffy",
  "tempfile",
