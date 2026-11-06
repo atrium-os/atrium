@@ -6,16 +6,19 @@
 //! - `LIMEN_DEFAULTS`: `role=app-id,...`, the provider of each user role
 //!   until Curia holds the user's choice (limen.md §3.2).
 //!
-//! Not wired yet: frescod's slot op (limen.md §12 L2) and portcullisd's
-//! embed-mode launch (L3). Until they land, binds and launches are refused
-//! and logged, so an embed stays unattached instead of half-working.
+//! - `LIMEN_USER`: limend's user name as worker rules name it (default `_limen`).
+//!
+//! User-role children start through portcullisd's `ExecInstance`
+//! ([`limen::launch`]). frescod's slot op (limen.md §12 L2) is not wired yet:
+//! binds are refused and logged, so an embed stays unattached instead of
+//! half-working.
 
 use std::os::fd::AsRawFd;
-use std::os::unix::net::{UnixListener, UnixStream};
+use std::os::unix::net::UnixListener;
 
 use limen::catalogue::SlotKind;
-use limen::daemon::{Compositor, Launcher, Shared};
-use limen::proto::{EmbedId, WindowToken};
+use limen::daemon::{Compositor, Shared};
+use limen::proto::WindowToken;
 
 struct NoSlotsYet;
 impl Compositor for NoSlotsYet {
@@ -27,13 +30,6 @@ impl Compositor for NoSlotsYet {
     }
 }
 
-struct NoLaunchYet;
-impl Launcher for NoLaunchYet {
-    fn launch(&mut self, app: &str, _: EmbedId, _: UnixStream) -> Result<u32, String> {
-        Err(format!("embed-mode launch of {app} is not built yet (limen.md §12 L3)"))
-    }
-    fn end(&mut self, _: EmbedId) {}
-}
 
 fn main() -> std::io::Result<()> {
     let path = std::env::var("LIMEN_SOCKET").unwrap_or_else(|_| limen::client::DEFAULT_SOCKET.into());
@@ -49,7 +45,7 @@ fn main() -> std::io::Result<()> {
     let defaults = Box::new(move |_user: &str, role: &str| {
         defaults.iter().find(|(r, _)| r == role).map(|(_, a)| a.clone())
     });
-    let shared = Shared::new(Box::new(NoSlotsYet), Box::new(NoLaunchYet), resolve, defaults);
+    let shared = Shared::new(Box::new(NoSlotsYet), Box::new(limen::launch::Portcullis::new(std::env::var("LIMEN_USER").unwrap_or_else(|_| "_limen".into()))), resolve, defaults);
     let _ = std::fs::remove_file(&path);
     let listener = UnixListener::bind(&path)?;
     eprintln!("limend: listening on {path}");

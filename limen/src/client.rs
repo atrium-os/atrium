@@ -131,15 +131,17 @@ impl Parent {
 pub struct Child(Wire<ChildEvent>);
 
 impl Child {
-    /// A child limend started: its channel is the descriptor in `LIMEN_FD`
-    /// (portcullisd's embed mode). `None` when not started as an embed.
-    pub fn inherited() -> Option<Result<Self, Error>> {
+    /// A child limend started through portcullisd: its channel is its stdin
+    /// (limen.md §4; `LIMEN_FD` names another descriptor, for development).
+    /// The first event is the `Attach`. Call this only in an app that is
+    /// started as a role provider: it takes stdin over.
+    pub fn embedded() -> Result<Self, Error> {
         use std::os::fd::FromRawFd;
-        let fd: i32 = std::env::var("LIMEN_FD").ok()?.parse().ok()?;
-        // SAFETY: portcullisd hands this descriptor to the child for limend
-        // and nothing else owns it.
+        let fd: i32 = std::env::var("LIMEN_FD").ok().and_then(|v| v.parse().ok()).unwrap_or(0);
+        // SAFETY: the descriptor is the limend channel portcullisd installed
+        // for this child, and nothing else in the process owns it.
         let s = unsafe { std::os::unix::net::UnixStream::from_raw_fd(fd) };
-        Some(Connection::wrap(s).map(Self::wrap).map_err(Error::Io))
+        Ok(Self::wrap(Connection::wrap(s)?))
     }
 
     /// A system provider connecting to limend's socket.

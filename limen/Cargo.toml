@@ -17,8 +17,8 @@ path = "src/bin/limend.rs"
 [dependencies]
 aqueduct        = { path = "../aqueduct" }
 portcullis-peer = { path = "../portcullis/portcullis-peer" }
+portcullis-ipc  = { path = "../portcullis/portcullis-ipc" }
+portcullis-policy = { path = "../portcullis/portcullis-policy" }
+libc            = "0.2"
 serde    = { version = "1", features = ["derive"] }
 postcard = { version = "1", features = ["use-std"] }
-
-[dev-dependencies]
-libc = "0.2"

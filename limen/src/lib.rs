@@ -11,4 +11,5 @@ pub mod catalogue;
 pub mod client;
 pub mod credential;
 pub mod daemon;
+pub mod launch;
 pub mod proto;

@@ -259,10 +259,17 @@ parent                    limend                 portcullisd       frescod      
   │ Send{embed, bytes} ────►│──── relay ─────────────┼────────────────┼────────────►│
 ```
 
-- **User roles**: limend asks portcullisd for an `ExecInstance` of the provider app in embed
-  mode. That's one jail per embed, discarded at exit, with the provider's own manifest
-  capabilities. The parent's identity goes to the child as data (`Attach { parent_app }`),
-  never as authority.
+- **User roles**: limend asks portcullisd for an `ExecInstance` of the provider app, as
+  frescod does for its renderers. That's one jail per embed, discarded at exit, with the
+  provider's own manifest capabilities. The child's stdin is its limend channel, its stdout
+  goes nowhere, and its stderr is limend's. Hanging up the request connection ends the jail.
+  The parent's identity goes to the child as data (`Attach { parent_app }`), never as
+  authority.
+- **The child runs as its own user, never as `_limen`.** `ExecInstance` runs a worker as its
+  caller unless the system policy has a worker rule for it, so every provider needs one:
+  `[workers."<app>"] callers = ["_limen"], run_as = "<its user>"`. limend refuses a launch
+  without one before asking portcullisd, and expects that uid to own the child's window. No
+  portcullisd change was needed (`limen::launch`).
 - **System roles**: limend asks the provider, which is already running, for a new instance
   over the provider's own connection. The provider opens a new window for it.
 - The child's window is not shown on its own until it is bound. frescod keeps a window
@@ -423,7 +430,7 @@ The C SDK waits for an Insula app that needs it.
 | L0 ✓ | `limen` crate: the role catalogue, `Parent` and `Child`, wire types for limend (`RequestEmbed`, `Attached`, `Send`, …) | Pergola thread |
 | L1 ✓ | `limend`: identity from the peer uid and the registry, window ownership checked with frescod, embeds, relay, limits, lifecycle. Linux tests with a fake launcher and a fake frescod | Pergola thread |
 | L2 | frescod: the general slot op with a kind, the `_limen` allowlist, and the `embed_pending` hint | Fresco thread |
-| L3 | portcullisd: `ExecInstance` in embed mode, with the channel inherited | Pergola thread, reviewed by portcullisd's owner |
+| L3 ✓ (not run on FreeBSD yet) | portcullisd: `ExecInstance` in embed mode, with the channel inherited | Pergola thread, reviewed by portcullisd's owner |
 | L4 | Pergola: `limen::Parent` as the `Window`'s `SlotBinder`, `CredentialField` on it, and the child side for Pergola apps | Pergola thread |
 | L5 | `credential` end to end against a stand-in Arca child, in the VM in split mode. The activation probe's covers are still refused | Pergola thread |
 | L6 | `doc-viewer` with the Navigator's document worker as the child | Pergola thread, with the Navigator thread |
