@@ -116,6 +116,9 @@ pub struct Shared {
     launcher: Mutex<Box<dyn Launcher>>,
     resolve: Resolve,
     defaults: Defaults,
+    /// System providers known by a fixed system uid rather than a registry
+    /// app id (arca-ui runs as `_arca-ui`, not as a Portcullis app).
+    system_uids: Mutex<HashMap<&'static str, u32>>,
 }
 
 impl Shared {
@@ -130,7 +133,14 @@ impl Shared {
             launcher: Mutex::new(launcher),
             resolve,
             defaults,
+            system_uids: Mutex::new(HashMap::new()),
         })
+    }
+
+    /// Recognise the system provider `app` (a catalogue `Provider::System`)
+    /// by `uid`, for a service that isn't a registry app.
+    pub fn set_system_uid(&self, app: &'static str, uid: u32) {
+        self.system_uids.lock().unwrap().insert(app, uid);
     }
 
     /// Live embeds (tests and logs).
@@ -390,10 +400,15 @@ fn emit(shared: &Arc<Shared>, conn: ConnId, m: proto::Emit) -> Result<Reply, Rep
 fn provide(shared: &Arc<Shared>, conn: ConnId, uid: u32, p: proto::Provide) -> Result<Reply, Reply> {
     let role = catalogue::role(&p.role).ok_or(Reply::Refused { reason: refusal::UNKNOWN_ROLE })?;
     let Provider::System(app) = role.provider else { return Err(Reply::Refused { reason: refusal::NOT_PROVIDER }) };
-    // Only the catalogue's own service, by its registry identity.
-    match (shared.resolve)(uid) {
-        Some((_, a)) if a == app => {}
-        _ => return Err(Reply::Refused { reason: refusal::NOT_PROVIDER }),
+    // Only the catalogue's own service: by its fixed system uid when one is
+    // configured, otherwise by its registry identity.
+    let fixed = shared.system_uids.lock().unwrap().get(app).copied();
+    let ok = match fixed {
+        Some(u) => u == uid,
+        None => matches!((shared.resolve)(uid), Some((_, a)) if a == app),
+    };
+    if !ok {
+        return Err(Reply::Refused { reason: refusal::NOT_PROVIDER });
     }
     shared.state.lock().unwrap().providers.insert(role.name, (conn, uid));
     Ok(Reply::Ok)

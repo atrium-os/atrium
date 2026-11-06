@@ -80,7 +80,10 @@ exist, and which slot each one is in.
 - A **child** is started by portcullisd at limend's request and inherits its end of the
   channel as a descriptor, so limend knows which embed it is without asking. A system
   provider that is already running (Arca, Vestibulum) instead connects to limend itself. It
-  is recognised by its uid, which the catalogue names (§2.0).
+  is recognised by its uid, which the catalogue names (§2.0). Arca's provider is `arca-ui`,
+  a jailed system service running as `_arca-ui` (65021). It is separate from `arcad`, which
+  parses nothing from outside. It is not a registry app, so limend recognises it by that
+  fixed uid (`LIMEN_ARCA_UID`).
 
 ## 2. Roles
 

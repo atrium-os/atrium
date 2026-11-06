@@ -266,6 +266,16 @@ fn a_spawned_child_gets_an_embed_only_frescod_connection_for_its_own_uid() {
 }
 
 #[test]
+fn a_fixed_system_uid_replaces_the_registry_for_its_provider() {
+    let w = World::new();
+    w.shared.set_system_uid(catalogue::ARCA, 65021);
+    // The registry's "Arca" is no longer enough...
+    assert_eq!(refused(provider(w.connect(ARCA_UID), "credential").map(|_| ())), refusal::NOT_PROVIDER);
+    // ...only arca-ui's uid, which has no registry entry at all.
+    assert!(provider(w.connect(65021), "credential").is_ok());
+}
+
+#[test]
 fn at_most_sixteen_embeds_per_parent() {
     let w = World::new();
     let _arca = w.arca();
