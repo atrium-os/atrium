@@ -130,8 +130,14 @@ the parent's process, cookies or other windows.
   ordinary windows, which a compromised player could use to put a convincing top-level window
   on screen. **Fix:** a connection that limend hands to an embed child is *embed-only*: every
   window it creates is `embed_pending`, and only limend can bind it. frescod marks the
-  connection when limend opens it for the child (a new op on the activation socket that
-  returns the client fd), so the child never sees the ordinary app socket. Owners: Fresco and
+  connection when limend opens it for the child, so the child never sees the ordinary app
+  socket. Shape agreed with the Pergola thread: limend opens a new connection to the
+  activation socket and sends `slot::op::EMBED_CONNECT` (0x0911, `EmbedConnect { owner_uid }`)
+  first; on `Ok` frescod turns that same stream into a client connection owned by
+  `owner_uid` (never a slot-allowlist uid) and marked embed-only, which in split mode the
+  broker enforces on the renderer's window records. limend passes the connected fd to the
+  child. User-role children only: system providers (Arca, Vestibulum) keep ordinary
+  connections, and a provider's embed instance doesn't get the app socket mounted. Owners: Fresco and
   Pergola threads; it applies to every Limen role, not only video.
 - *Its layers stay inside its window.* frescod clips every layer to its window's rect, and a
   layer takes its window's place in z-order, so it can never sit over another window or over
