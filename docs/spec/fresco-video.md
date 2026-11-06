@@ -143,5 +143,6 @@ V1 to V4 are ready to build once this is reviewed. P1 can start at once against 
    clean-room (MIT and public documents only), and AMD's VCN interface is less publicly
    documented than the rest of the GPU. *Recommend:* the GPU thread first reports what public
    documentation exists, and until then decode stays on the CPU, in the player's jail.
+   Findings: [2026-11-06-vcn-decode-feasibility.md](../reviews/2026-11-06-vcn-decode-feasibility.md).
 5. **v1's `protected` flag only keeps frames out of capture.** *Recommend yes.* It is honest
    about what it guarantees, and real protection waits for the CDM work.
