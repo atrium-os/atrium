@@ -36,6 +36,7 @@ use pergola::reactive::Mutable;
 use pergola::scroll::{DocRange, SourceEvent, Viewport};
 use pergola::view::{Ctx, Draw, View};
 use pergola::widgets::scroll_view::{ScrollState, ScrollView};
+use pergola::Color;
 
 pub use convert::{Faces, Skipped};
 
@@ -232,7 +233,10 @@ impl DocumentView {
             }
             ctx.pop();
         });
-        let mut v = ScrollView::new(self.state.clone(), self.rect, content);
+        // A document sits on its own canvas, white unless it paints one (as
+        // on the web): its colours are the author's, not the theme's, in dark
+        // mode too, until a page opts in with prefers-color-scheme.
+        let mut v = ScrollView::new(self.state.clone(), self.rect, content).backdrop(Color::rgba(1.0, 1.0, 1.0, 1.0));
         if let Some(k) = self.key {
             v = v.key(k);
         }

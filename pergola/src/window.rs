@@ -225,6 +225,12 @@ impl Window {
     /// animates (client-driven animation, pergola.md §4.1), else `cap`.
     /// Frames are paced at 120 Hz; the server presents at its own vsync.
     fn wait_for<V: View>(&self, app: &App<V>, cap: Option<Duration>) -> Option<Duration> {
+        // A socket timeout can't be zero: "now" is the shortest wait.
+        const NOW: Duration = Duration::from_micros(100);
+        self.wait_raw(app, cap).map(|d| d.max(NOW))
+    }
+
+    fn wait_raw<V: View>(&self, app: &App<V>, cap: Option<Duration>) -> Option<Duration> {
         if !app.wants_frame() {
             // A timer (a tooltip's delay) bounds the wait.
             let Some(at) = app.wake_at() else { return cap };

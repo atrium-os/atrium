@@ -415,10 +415,15 @@ impl View for Segmented {
         let t = ctx.theme;
         let n = self.labels.len().max(1);
         let chosen = self.value.get();
-        let r = self.rect;
+        let inset = 2.0;
+        let mut r = self.rect;
+        if r.w() <= 0.0 {
+            // No width given: every segment as wide as the widest label plus padding.
+            let widest = self.labels.iter().map(|l| Node::measure_text(l, &label_style(t.text_primary(), type_size::SM)).w).fold(0.0f32, f32::max);
+            r.size.w = n as f32 * (widest + 2.0 * crate::theme::space::MD) + inset * (n as f32 + 1.0);
+        }
         let ring = focus_ring(ctx, r, radius::SM);
         let track = ctx.tree.insert(None, Node::Rect { rect: r, fill: t.bg_surface(), radius: radius::SM });
-        let inset = 2.0;
         let seg_w = (r.w() - inset * 2.0 - inset * (n as f32 - 1.0)) / n as f32;
         for (i, label) in self.labels.iter().enumerate() {
             let s = Rect::new(r.x() + inset + i as f32 * (seg_w + inset), r.y() + inset, seg_w, r.h() - inset * 2.0);
