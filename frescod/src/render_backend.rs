@@ -306,16 +306,18 @@ impl<'a> Backend<'a> {
 
     /// Put the last rendered frame into scanout buffer `i`, signalling
     /// `signal` when it is there. CPU renderers read their pixels into
-    /// `staging` and copy them up (only screen rows `rows`, `[y0, y1)`,
-    /// when given: the buffer holds the rest already); the GPU renderer runs
-    /// the frame's kernels with buffer `i` as the target.
+    /// `staging` and copy them up (only the screen rect `rect`,
+    /// `[x0, y0, x1, y1)`, when given: the buffer holds the rest already,
+    /// and `staging` must hold the last frame everywhere else);
+    /// the GPU renderer runs the frame's kernels with buffer `i` as the
+    /// target.
     #[allow(clippy::too_many_arguments)]
     pub fn present(
         &mut self,
         scan: &Scanout<'_>,
         i: usize,
         staging: &mut [u8],
-        rows: Option<(u32, u32)>,
+        rect: Option<[u32; 4]>,
         deadline_ns: u32,
         signal: (&Syncobj<'_>, u64),
         hdr: Option<&crate::hdr::Encoder>,
@@ -324,18 +326,26 @@ impl<'a> Backend<'a> {
             Backend::Gpu(g) => g.submit(scan.buffer(i), deadline_ns, signal),
             Backend::Compute(c) => {
                 let pitch = c.width as usize * 4;
-                let (y0, y1) = rows.map_or((0, c.height), |(a, b)| (a.min(c.height), b.min(c.height)));
-                // The flip still needs its copy: one row at least.
-                let (y0, y1) = if y1 > y0 { (y0, y1) } else { (0, 1) };
-                let range = y0 as usize * pitch..y1 as usize * pitch;
-                let n = staging.len().min(c.target.len() * 4);
-                let range = range.start.min(n)..range.end.min(n);
-                for (d, w) in staging[range.clone()].chunks_exact_mut(4).zip(&c.target[range.start / 4..]) {
-                    d.copy_from_slice(&w.to_le_bytes());
+                let rows = (staging.len() / pitch).min(c.height as usize) as u32;
+                let [x0, y0, x1, y1] = rect.map_or([0, 0, c.width, rows], |r| [r[0].min(c.width), r[1].min(rows), r[2].min(c.width), r[3].min(rows)]);
+                // The flip still needs its copy: one pixel at least.
+                let [x0, y0, x1, y1] = if x1 > x0 && y1 > y0 { [x0, y0, x1, y1] } else { [0, 0, 1, 1] };
+                let (a, b) = (x0 as usize, x1 as usize);
+                for y in y0 as usize..y1 as usize {
+                    let line = &mut staging[y * pitch + a * 4..y * pitch + b * 4];
+                    let src = &c.target[y * c.width as usize + a..y * c.width as usize + b];
+                    for (d, w) in line.chunks_exact_mut(4).zip(src) {
+                        d.copy_from_slice(&w.to_le_bytes());
+                    }
+                    if let Some(e) = hdr {
+                        e.encode(line);
+                    }
                 }
-                if let Some(e) = hdr {
-                    e.encode(&mut staging[range.clone()]);
-                }
+                // `staging` is current everywhere (each frame converts at
+                // least what changed), so one span from the rect's first
+                // pixel to its last goes up as is: one copy, not one per
+                // line, and the columns beside the rect are what they were.
+                let range = y0 as usize * pitch + a * 4..(y1 as usize - 1) * pitch + b * 4;
                 scan.upload_range(i, staging, range, deadline_ns, Some(signal))?;
                 Ok(())
             }

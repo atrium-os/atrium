@@ -51,6 +51,59 @@ pub struct Pixels {
     pub since: Vec<(u64, [u32; 4])>,
 }
 
+/// Make `latest` the next drawing (`gen`, renderer `seq`), which differs
+/// from it only inside `damage`; `paint` draws that part. Patched in place
+/// when nothing else holds `latest`; otherwise `spare` (an earlier drawing
+/// of the window nothing holds any more) is brought up to date from
+/// `latest` and patched, so a frame costs what changed rather than a copy
+/// of the window. Returns the drawing to keep as the next spare.
+pub fn advance(
+    latest: &mut std::sync::Arc<Pixels>,
+    spare: Option<std::sync::Arc<Pixels>>,
+    gen: u64,
+    seq: u32,
+    damage: [u32; 4],
+    paint: impl FnOnce(&mut [u32]) -> Result<(), String>,
+) -> Result<Option<std::sync::Arc<Pixels>>, String> {
+    use std::sync::Arc;
+    let mut since = vec![(latest.gen, damage)];
+    let u = |r: [u32; 4]| [r[0].min(damage[0]), r[1].min(damage[1]), r[2].max(damage[2]), r[3].max(damage[3])];
+    since.extend(latest.since.iter().map(|&(g, r)| (g, u(r))));
+    since.truncate(SINCE_DEPTH);
+    if let Some(p) = Arc::get_mut(latest) {
+        paint(&mut p.px)?;
+        (p.since, p.gen, p.seq) = (since, gen, seq);
+        return Ok(spare);
+    }
+    let (w, h) = (latest.width, latest.height);
+    let mut next = match spare {
+        Some(mut sp) if Arc::strong_count(&sp) == 1 && Arc::weak_count(&sp) == 0 && sp.width == w && sp.height == h => {
+            let b = Arc::get_mut(&mut sp).expect("checked");
+            match latest.changed_since(b.gen) {
+                Some(None) => {}
+                Some(Some(r)) => copy_rect(&latest.px, &mut b.px, w, r),
+                None => b.px.copy_from_slice(&latest.px),
+            }
+            sp
+        }
+        _ => Arc::new(Pixels { gen: 0, width: w, height: h, px: latest.px.clone(), seq: 0, since: Vec::new() }),
+    };
+    let b = Arc::get_mut(&mut next).expect("unshared");
+    paint(&mut b.px)?;
+    (b.since, b.gen, b.seq) = (since, gen, seq);
+    Ok(Some(std::mem::replace(latest, next)))
+}
+
+/// Copy rect `r` (`[x0, y0, x1, y1)`, clamped) of a `width`-wide image.
+fn copy_rect(src: &[u32], dst: &mut [u32], width: u32, r: [u32; 4]) {
+    let w = width as usize;
+    let rows = src.len().min(dst.len()) / w.max(1);
+    let (x0, x1) = ((r[0] as usize).min(w), (r[2] as usize).min(w));
+    for y in (r[1] as usize).min(rows)..(r[3] as usize).min(rows) {
+        dst[y * w + x0..y * w + x1].copy_from_slice(&src[y * w + x0..y * w + x1]);
+    }
+}
+
 /// How many earlier drawings [`Pixels::since`] reaches back.
 pub const SINCE_DEPTH: usize = 6;
 
@@ -339,5 +392,55 @@ fn translate_path(p: &PathParams, ox: f32, oy: f32) -> PathNode {
         model: [p.cx + ox, p.cy + oy, p.length, p.width],
         extra: [p.angle, 0.0, 0.0, 0.0],
         color: [p.r, p.g, p.b, p.a],
+    }
+}
+
+#[cfg(test)]
+mod advance_tests {
+    use super::*;
+    use std::sync::Arc;
+
+    /// Drawings patched in place, through the spare, or by a copy, while
+    /// readers hold them at random: each one is exactly what was drawn.
+    #[test]
+    fn advance_keeps_every_drawing_exact() {
+        let (w, h) = (37u32, 23u32);
+        let mut truth = vec![0u32; (w * h) as usize];
+        let mut latest = Arc::new(Pixels { gen: 1, width: w, height: h, px: truth.clone(), seq: 1, since: Vec::new() });
+        let mut spare = None;
+        let mut held: Vec<Arc<Pixels>> = Vec::new();
+        let mut rng = 0x2545_f491_4f6c_dd1du64;
+        let mut next = || {
+            rng ^= rng << 13;
+            rng ^= rng >> 7;
+            rng ^= rng << 17;
+            rng
+        };
+        for step in 2..400u64 {
+            let x0 = (next() % w as u64) as u32;
+            let y0 = (next() % h as u64) as u32;
+            let x1 = x0 + 1 + (next() % (w - x0) as u64) as u32;
+            let y1 = y0 + 1 + (next() % (h - y0) as u64) as u32;
+            let paint = |px: &mut [u32]| {
+                for y in y0..y1 {
+                    for x in x0..x1 {
+                        px[(y * w + x) as usize] = (step as u32) << 8 | x ^ y;
+                    }
+                }
+                Ok(())
+            };
+            paint(&mut truth).unwrap();
+            // A reader holds the latest now and then, for a step or two.
+            if next() % 3 == 0 {
+                held.push(latest.clone());
+            }
+            if held.len() > 1 || next() % 2 == 0 {
+                held.clear();
+            }
+            spare = advance(&mut latest, spare, step, step as u32, [x0, y0, x1, y1], paint).unwrap();
+            assert_eq!(latest.px, truth, "step {step}");
+            assert_eq!((latest.gen, latest.seq), (step, step as u32));
+            assert_eq!(latest.since[0], (step - 1, [x0, y0, x1, y1]));
+        }
     }
 }

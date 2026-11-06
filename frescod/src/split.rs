@@ -93,7 +93,11 @@ pub struct Broker {
     /// Pixel mode: renderers raster their own windows (in their jails) and
     /// send pixels; the last good pixels of each window, by global id.
     pixels: bool,
-    drawn: Mutex<HashMap<u32, Arc<crate::pack::Pixels>>>,
+    drawn: Arc<Mutex<HashMap<u32, Arc<crate::pack::Pixels>>>>,
+    /// Each window's drawing before its latest, kept to be patched into
+    /// the next one while the latest is still being composed (so a frame
+    /// costs what changed, not a copy of the window).
+    spare: Mutex<HashMap<u32, Arc<crate::pack::Pixels>>>,
     drawings: std::sync::atomic::AtomicU64,
     renderers: Mutex<HashMap<u8, Arc<Renderer>>>,
     subs: Mutex<Option<EventSubs>>,
@@ -170,7 +174,8 @@ impl Broker {
             launch,
             frames: Mutex::new(HashMap::new()),
             pixels,
-            drawn: Mutex::new(HashMap::new()),
+            drawn: Arc::new(Mutex::new(HashMap::new())),
+            spare: Mutex::new(HashMap::new()),
             drawings: std::sync::atomic::AtomicU64::new(1),
             renderers: Mutex::new(HashMap::new()),
             subs: Mutex::new(None),
@@ -313,6 +318,18 @@ impl Broker {
     /// The last pixels a renderer drew for window `id` (pixel mode).
     pub fn pixels(&self, id: u32) -> Option<Arc<crate::pack::Pixels>> {
         self.drawn.lock().unwrap().get(&id).cloned()
+    }
+
+    /// Hit-testing for window `id`'s pixels: the alpha of its latest
+    /// drawing at a point. It looks them up when asked rather than holding
+    /// them, so the next drawing can still patch them in place.
+    pub fn alpha_probe(&self, id: u32) -> fresco_scene_server::window::AlphaProbe {
+        let drawn = Arc::downgrade(&self.drawn);
+        Arc::new(move |x, y| {
+            drawn.upgrade()
+                .and_then(|d| d.lock().unwrap().get(&id).map(|p| p.alpha_at(x, y)))
+                .unwrap_or(0)
+        })
     }
 
     /// Tell renderers the sizes the WM gave their windows since the last
@@ -567,7 +584,7 @@ impl Broker {
     /// drawing it follows is the one held (patched in place when nothing
     /// else holds that one), else all of it.
     fn take_pixels(&self, r: &Renderer, local: u32, global: u16, width: u32, height: u32, s: usize) -> std::result::Result<(), String> {
-        use crate::pack::{Pixels, SINCE_DEPTH};
+        use crate::pack::Pixels;
         use std::sync::atomic::Ordering::Relaxed;
         let wins = r.wins.lock().unwrap();
         let w = wins.get(&local).ok_or_else(|| format!("frame for unknown window {local}"))?;
@@ -578,24 +595,10 @@ impl Broker {
         let follows = |p: &Pixels| p.width == width && p.height == height && p.seq == seq.wrapping_sub(1);
         if let (Some(d), Some(prev)) = (damage, drawn.get_mut(&(global as u32))) {
             if follows(prev) {
-                let since = |p: &Pixels| {
-                    let mut v = vec![(p.gen, d)];
-                    let u = |r: [u32; 4]| [r[0].min(d[0]), r[1].min(d[1]), r[2].max(d[2]), r[3].max(d[3])];
-                    v.extend(p.since.iter().map(|&(g, r)| (g, u(r))));
-                    v.truncate(SINCE_DEPTH);
-                    v
-                };
-                if let Some(p) = Arc::get_mut(prev) {
-                    // Nothing else holds it: patch it in place.
-                    slot::copy_pixels(slot, width, height, &mut p.px, Some(d))?;
-                    p.since = since(p);
-                    p.gen = gen;
-                    p.seq = seq;
-                } else {
-                    let mut px = prev.px.clone();
-                    slot::copy_pixels(slot, width, height, &mut px, Some(d))?;
-                    let since = since(prev);
-                    *prev = Arc::new(Pixels { gen, width, height, px, seq, since });
+                let spare = self.spare.lock().unwrap().remove(&(global as u32));
+                let spare = crate::pack::advance(prev, spare, gen, seq, d, |px| slot::copy_pixels(slot, width, height, px, Some(d)))?;
+                if let Some(sp) = spare {
+                    self.spare.lock().unwrap().insert(global as u32, sp);
                 }
                 return Ok(());
             }
@@ -609,6 +612,7 @@ impl Broker {
     }
 
     fn drop_window(&self, r: &Renderer, global: u16) {
+        self.spare.lock().unwrap().remove(&(global as u32));
         self.comp.lock().unwrap().destroy_with_focus_shift(global, r.client_id as u32);
         self.frames.lock().unwrap().remove(&(global as u32));
         self.drawn.lock().unwrap().remove(&(global as u32));
@@ -838,3 +842,4 @@ fn wm_role(r: Role) -> WmRole {
         Role::Chrome => WmRole::Chrome,
     }
 }
+

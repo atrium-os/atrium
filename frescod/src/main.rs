@@ -697,8 +697,7 @@ fn present_head(
     let lacks = heads::Dirty::take(h, back);
     match renderer {
         Some(r) => {
-            let rows = lacks.map(|d| (d[1], d[3]));
-            r.present(&h.scan, back, desktop, rows, deadline_ns, (&h.copy_done, next), h.hdr_on.then_some(enc))
+            r.present(&h.scan, back, desktop, lacks, deadline_ns, (&h.copy_done, next), h.hdr_on.then_some(enc))
                 .map_err(io_other)?
         }
         None => {
@@ -1001,8 +1000,8 @@ fn render_one_frame(
         windows.push(c);
     }
     /* A window drawn as pixels (split pixel mode) answers from them. */
-    let drawn: std::collections::HashMap<u32, Arc<pack::Pixels>> =
-        windows.iter().filter_map(|w| w.pixels.clone().map(|p| (w.id, p))).collect();
+    let drawn: std::collections::HashSet<u32> =
+        windows.iter().filter(|w| w.pixels.is_some()).map(|w| w.id).collect();
     renderer.render(ScreenInput { windows, uploads, clears })?;
     /* Fills packed here that did not draw: their owners hear which. */
     let drops = renderer.take_fill_drops();
@@ -1019,8 +1018,8 @@ fn render_one_frame(
     let frames: std::collections::HashMap<u32, Arc<fresco_compute::Frame>> =
         renderer.frames().iter().cloned().collect();
     let shown = rects.into_iter().map(|(id, rect)| {
-        let alpha = if let Some(p) = drawn.get(&id).cloned() {
-            Some(Arc::new(move |x, y| p.alpha_at(x, y)) as fresco_scene_server::window::AlphaProbe)
+        let alpha = if let (true, Some(b)) = (drawn.contains(&id), split) {
+            Some(b.alpha_probe(id))
         } else {
             frames.get(&id).cloned().map(|f| -> fresco_scene_server::window::AlphaProbe {
                 Arc::new(move |x, y| fresco_compute::reference::alpha_at(&f, x, y))
