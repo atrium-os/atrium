@@ -306,6 +306,9 @@ supplies content (bands, §10.3), never scroll behaviour.
 Where it runs: client-driven first (§4.1), then the shift and blur move server-side with
 declarative animation (§4.2), so a busy app still scrolls smoothly. The strip redraw rides
 frescod's damage path (incremental drawing redraws only changed tiles), which the Fresco owners decide.
+The scene format it needs (a group node with transform, clip and a `SCROLL` flag, so a scroll is
+one transform change and the renderer shifts and draws the strip) is designed in
+[fresco-scene-groups.md](fresco-scene-groups.md) (2026-11-06, agreed with the user).
 
 ### §10.2 A document view any app can use
 
