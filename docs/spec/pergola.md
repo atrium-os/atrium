@@ -420,7 +420,8 @@ stays frescod's, drawn outside any app.
 - **Wire shape.** A `SCROLL` group at the view's origin, clipped to its box; an opaque backdrop
   rect at order 0 (theme window background unless the app picks another); the content group at
   order 1, whose translation is the offset rounded to whole device pixels. This is exactly the
-  shape frescod shifts (fresco-scene-groups.md §4, 442cd94). A scroll frame sends one `GROUP`
+  shape frescod shifts (fresco-scene-groups.md §4, 442cd94). frescod's pack test `pergolas_scroll_view_is_a_viewport`
+  (b19349d) checks this exact shape is recognised and a 7 px scroll is shifted. A scroll frame sends one `GROUP`
   message: the surface skips the viewport and backdrop when they are unchanged, and the content's
   nodes keep their content-group coordinates (tested: each fling frame's delta list is the
   scroll node alone).
@@ -451,5 +452,5 @@ stays frescod's, drawn outside any app.
 - **Not yet.** Horizontal scrolling, a scrollbar, blur on the wire (no renderer op;
   `Physics::motion_blur_px` gives the amount), placeholders drawn (`Viewport::placeholders` gives
   the ranges, used once a band source exists), `DocumentView`, gesture phases on the wire (would
-  replace the inferred release), and a run on frescod itself.
+  replace the inferred release), and a live run of a Pergola app on frescod.
 
