@@ -437,7 +437,12 @@ impl<'f> Banded<'f> {
         if first { self.stats.cross_leaves += cross.len() as u64 }
         let keys: Vec<GKey> = if keep { mine.iter().map(|&o| gkey(o as usize, &self.span_starts, &self.bands)).collect() } else { vec![] };
         let cross_keys: Vec<GKey> = cross.iter().map(|&o| gkey(o as usize, &self.span_starts, &self.bands)).collect();
-        let slot = BandSlot { range: (y0, y1), scene: keep.then(|| scene_of(&scene, &mine)), cross: scene_of(&scene, &cross), cross_ext,
+        let cross_scene = scene_of(&scene, &cross);
+        // A band holding every leaf its run painted keeps the run's scene
+        // itself (a one-band document is the whole layout: no copy).
+        let whole_run = mine.len() == scene.order.len() && mine.iter().enumerate().all(|(i, &o)| o as usize == i);
+        let band_scene = if !keep { None } else if whole_run { Some(scene) } else { Some(scene_of(&scene, &mine)) };
+        let slot = BandSlot { range: (y0, y1), scene: band_scene, cross: cross_scene, cross_ext,
                               keys, cross_keys, stale: false, cross_stale: false };
         if first { self.bands.push(slot) } else {
             let old = &mut self.bands[k];
@@ -510,10 +515,13 @@ impl<'f> Banded<'f> {
     /// paints UNDER some of them (a positioned note written above a section
     /// whose background covers it), in place. A host clips it to `range`.
     /// `None` unless resident.
-    pub fn group(&self, b: usize) -> Option<Scene> {
+    pub fn group(&self, b: usize) -> Option<Group<'_>> {
         let band = self.bands.get(b)?;
         let s = band.scene.as_ref()?;
         let foreign = self.foreign(b);
+        // Nothing from other bands goes in under its leaves: the band's own
+        // scene is the group, not a copy of it.
+        if foreign.iter().all(|x| x.0 >= s.order.len()) { return Some(Group::Band(s)) }
         let mut out = Scene { width: s.width, height: s.height, ..Default::default() };
         let (mut memo, mut memos) = (Memo::default(), HashMap::<usize, Memo>::new());
         let mut f = foreign.iter().filter(|x| x.0 < s.order.len()).peekable();
@@ -527,7 +535,7 @@ impl<'f> Banded<'f> {
             }
             append(&mut out, s, kind, i, None, &mut memo);
         }
-        Some(out)
+        Some(Group::Built(out))
     }
 
     /// ★ THE OVERLAY GROUP: the leaves bands painted outside themselves that
@@ -555,7 +563,10 @@ impl<'f> Banded<'f> {
     /// Band `b` as it is drawn: its group, then the overlay's leaves for it.
     /// For checking by pixels; `None` unless resident.
     pub fn composite(&self, b: usize) -> Option<Scene> {
-        let mut out = self.group(b)?;
+        let mut out = match self.group(b)? {
+            Group::Band(s) => scene_of(s, &(0..s.order.len() as u32).collect::<Vec<_>>()),
+            Group::Built(s) => s,
+        };
         let len = self.bands[b].keys.len();
         let mut memos = HashMap::<usize, Memo>::new();
         for (pos, j, n) in self.foreign(b) {
@@ -589,6 +600,15 @@ impl<'f> Banded<'f> {
 }
 
 const PX_MIN: U = 64;
+
+/// A band's group: its own scene when nothing from other bands goes in
+/// under its leaves (no copy), else one built with them in place.
+pub enum Group<'a> { Band(&'a Scene), Built(Scene) }
+
+impl std::ops::Deref for Group<'_> {
+    type Target = Scene;
+    fn deref(&self) -> &Scene { match self { Group::Band(s) => s, Group::Built(s) => s } }
+}
 
 /// Group ids already copied from one source scene.
 #[derive(Default)]

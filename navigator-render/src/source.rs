@@ -120,10 +120,12 @@ impl<'f> DocumentSource<'f> {
         // Lay the first pass out as far as the range reaches.
         while !self.doc.complete && self.doc.bands.last().is_none_or(|b| b.range.1 <= keep.1) {
             let k = self.doc.laid_out();
-            // Keep it only if it lands in the range (known once laid out).
-            self.doc.advance(false);
+            // Kept as laid out, and dropped at once unless it lands in the
+            // range (known only once laid out): laying it out a second time
+            // to keep it doubled a one-band document's cost.
+            self.doc.advance(true);
             let r = self.doc.bands[k].range;
-            if r.1 > keep.0 && r.0 < keep.1 { self.doc.ensure(k); }
+            if !(r.1 > keep.0 && r.0 < keep.1) { self.doc.evict(k); }
         }
         let wanted: BTreeSet<usize> = (0..self.doc.laid_out()).filter(|&k| { let r = self.doc.bands[k].range; r.1 > keep.0 && r.0 < keep.1 }).collect();
         for k in self.resident.keys().copied().collect::<Vec<_>>() {
