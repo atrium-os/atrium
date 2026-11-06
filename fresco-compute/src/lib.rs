@@ -271,6 +271,18 @@ impl Frame {
     /// [`Frame::pack`], and the fills it did not draw: `(index into
     /// scene.fills, fill::drop reason)`. A culled fill is not listed.
     pub fn pack_report(scene: &Scene, width: u32, height: u32, pitch: u32) -> (Frame, Vec<(usize, u8)>) {
+        Self::pack_cached(scene, width, height, pitch, None)
+    }
+
+    /// [`Frame::pack_report`], taking fills that did not change since an
+    /// earlier pack from `cache` (the frame is the same either way).
+    pub fn pack_cached(
+        scene: &Scene,
+        width: u32,
+        height: u32,
+        pitch: u32,
+        mut cache: Option<&mut fill::FillCache>,
+    ) -> (Frame, Vec<(usize, u8)>) {
         assert!(pitch >= width);
         let mut dropped = Vec::new();
         let mut ops = Vec::new();
@@ -318,46 +330,38 @@ impl Frame {
         // Filled paths: each one's tiled block in `texels` (see `fill`).
         let mut fill_ops = Vec::new();
         let (mut lines_total, mut indices_total) = (0usize, 0usize);
+        if let Some(c) = cache.as_deref_mut() {
+            c.begin();
+        }
         for (k, fl) in scene.fills.iter().enumerate() {
-            if fill::check(&fl.verbs, &fl.points, &fl.transform).is_err() {
-                dropped.push((k, fill::drop::MALFORMED));
-                continue;
-            }
-            if fl.gradient.as_ref().is_some_and(|g| fill::check_gradient(g).is_err()) {
-                dropped.push((k, fill::drop::BAD_PAINT));
-                continue;
-            }
-            let Some(lines) = fill::flatten(fl) else {
-                dropped.push((k, fill::drop::TOO_MANY_LINES));
-                continue;
+            let r = match cache.as_deref_mut() {
+                Some(c) => c.get(fl, width, height),
+                None => std::sync::Arc::new(fill::prepare(fl, width, height)),
             };
-            if lines_total + lines.len() > fill::MAX_FRAME_SEGMENTS {
-                dropped.push((k, fill::drop::FRAME_BUDGET));
-                continue;
-            }
-            let paint = fl.gradient.as_ref().map(|g| (g, &fl.transform));
-            let p = match fill::pack_paint(&lines, fl.rule, fl.clip, paint, width, height, texels.len() as u32) {
+            let p = match &*r {
                 Ok(p) => p,
                 Err(fill::CULLED) => continue,
                 Err(why) => {
-                    dropped.push((k, why));
+                    dropped.push((k, *why));
                     continue;
                 }
             };
-            if indices_total + p.indices > fill::MAX_FRAME_INDICES {
+            if lines_total + p.lines > fill::MAX_FRAME_SEGMENTS || indices_total + p.indices > fill::MAX_FRAME_INDICES {
                 dropped.push((k, fill::drop::FRAME_BUDGET));
                 continue;
             }
             lines_total += p.lines;
             indices_total += p.indices;
+            let base = texels.len();
             fill_ops.push(Op {
                 p0: p.clip,
                 p1: fl.color,
                 p2: [0.0; 4],
                 p3: p.bbox,
-                meta: [KIND_FILL, texels.len() as u32, 0, 0],
+                meta: [KIND_FILL, base as u32, 0, 0],
             });
             texels.extend_from_slice(&p.block);
+            fill::rebase(&mut texels[base..], base as u32);
         }
         // Fills draw after paths, before textures.
         ops.extend(fill_ops);

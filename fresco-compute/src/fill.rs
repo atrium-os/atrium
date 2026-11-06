@@ -341,6 +341,7 @@ pub const PAINT_RADIAL: u32 = 2;
 
 /// What a fill packs to: its block (to append to `texels` at word `base`)
 /// and its op's box and clip.
+#[derive(Clone, Debug)]
 pub struct Packed {
     pub block: Vec<u32>,
     /// Pixel box `[x0, y0, x1, y1)` (op `p3`).
@@ -601,4 +602,141 @@ pub fn coverage(acc: f32, even_odd: bool) -> f32 {
         }
     }
     if a >= 0.0 { if a <= 1.0 { a } else { 1.0 } } else { 0.0 }
+}
+
+
+/// One fill for a `width` x `height` target, packed at word 0 (move it with
+/// [`rebase`]), or why it is not drawn: `Err(CULLED)` or a [`drop`] reason.
+/// Everything but the frame-wide budgets ([`MAX_FRAME_SEGMENTS`],
+/// [`MAX_FRAME_INDICES`]), which [`crate::Frame::pack`] applies.
+pub fn prepare(f: &Fill, width: u32, height: u32) -> Result<Packed, u8> {
+    if check(&f.verbs, &f.points, &f.transform).is_err() {
+        return Err(drop::MALFORMED);
+    }
+    if f.gradient.as_ref().is_some_and(|g| check_gradient(g).is_err()) {
+        return Err(drop::BAD_PAINT);
+    }
+    let lines = flatten(f).ok_or(drop::TOO_MANY_LINES)?;
+    let paint = f.gradient.as_ref().map(|g| (g, &f.transform));
+    pack_paint(&lines, f.rule, f.clip, paint, width, height, 0)
+}
+
+/// Move a block packed at word 0 to word `base`: its absolute words (the
+/// line and stop starts, each tile's list start) gain `base`.
+pub fn rebase(block: &mut [u32], base: u32) {
+    if base == 0 || block.len() < HEADER_WORDS as usize {
+        return;
+    }
+    block[4] += base;
+    block[9] += base;
+    let n = (block[2] * block[3]) as usize;
+    for k in 0..n {
+        block[HEADER_WORDS as usize + k * ENTRY_WORDS as usize] += base;
+    }
+}
+
+/// [`rebase`] undone, for a block at word `base`: its absolute words made
+/// relative (wrapping; a malformed block's words stay malformed, and a
+/// grid bigger than the block is cut to it).
+pub fn unbase(block: &mut [u32], base: u32) {
+    if block.len() < HEADER_WORDS as usize {
+        return;
+    }
+    block[4] = block[4].wrapping_sub(base);
+    block[9] = block[9].wrapping_sub(base);
+    let n = (block[2] as usize).saturating_mul(block[3] as usize);
+    for k in 0..n {
+        let Some(w) = block.get_mut(HEADER_WORDS as usize + k * ENTRY_WORDS as usize) else { break };
+        *w = w.wrapping_sub(base);
+    }
+}
+
+/// [`prepare`]'s results kept across frames, so a fill that did not change
+/// (the colour and opacity aside, which are not in its block) is neither
+/// flattened nor tiled again. Keyed by the fill's exact bits and the target
+/// size, so a hit gives the very block a fresh pack would.
+#[derive(Default)]
+pub struct FillCache {
+    map: std::collections::HashMap<Vec<u32>, (u64, std::sync::Arc<Result<Packed, u8>>)>,
+    tick: u64,
+    words: usize,
+}
+
+/// Packs a cache entry lives without being used.
+const CACHE_LIFE: u64 = 64;
+/// Most block words a cache holds (64 MiB) before it starts over.
+const CACHE_MAX_WORDS: usize = 16 << 20;
+
+fn cache_key(f: &Fill, width: u32, height: u32) -> Vec<u32> {
+    let mut k = Vec::with_capacity(16 + f.verbs.len() + f.points.len() * 2);
+    k.extend([width, height, (f.rule == FillRule::EvenOdd) as u32, f.verbs.len() as u32, f.points.len() as u32]);
+    k.extend(f.verbs.iter().map(|&v| v as u32));
+    k.extend(f.points.iter().flat_map(|p| [p[0].to_bits(), p[1].to_bits()]));
+    k.extend(f.transform.iter().map(|v| v.to_bits()));
+    match f.clip {
+        None => k.push(0),
+        Some(c) => {
+            k.push(1);
+            k.extend(c.iter().map(|v| v.to_bits()));
+        }
+    }
+    match &f.gradient {
+        None => k.push(0),
+        Some(g) => {
+            match g.shape {
+                GradientShape::Linear { p0, p1 } => k.extend([1, p0[0].to_bits(), p0[1].to_bits(), p1[0].to_bits(), p1[1].to_bits()]),
+                GradientShape::Radial { center, radius } => k.extend([2, center[0].to_bits(), center[1].to_bits(), radius.to_bits()]),
+            }
+            k.push(g.stops.len() as u32);
+            for (o, c) in &g.stops {
+                k.push(o.to_bits());
+                k.extend(c.iter().map(|v| v.to_bits()));
+            }
+        }
+    }
+    k
+}
+
+impl FillCache {
+    /// Start a pack: entries unused for a while go.
+    pub fn begin(&mut self) {
+        self.tick += 1;
+        if self.words > CACHE_MAX_WORDS {
+            self.map.clear();
+            self.words = 0;
+        } else if self.tick % 16 == 0 {
+            let tick = self.tick;
+            let mut freed = 0;
+            self.map.retain(|_, (used, r)| {
+                let keep = *used + CACHE_LIFE >= tick;
+                if !keep {
+                    freed += r.as_ref().as_ref().map_or(0, |p| p.block.len());
+                }
+                keep
+            });
+            self.words -= freed;
+        }
+    }
+
+    /// [`prepare`], from the cache when it has it.
+    pub fn get(&mut self, f: &Fill, width: u32, height: u32) -> std::sync::Arc<Result<Packed, u8>> {
+        let key = cache_key(f, width, height);
+        if let Some((used, r)) = self.map.get_mut(&key) {
+            *used = self.tick;
+            return r.clone();
+        }
+        let r = std::sync::Arc::new(prepare(f, width, height));
+        self.words += r.as_ref().as_ref().map_or(0, |p| p.block.len());
+        self.map.insert(key, (self.tick, r.clone()));
+        r
+    }
+
+    /// Entries held.
+    pub fn len(&self) -> usize {
+        self.map.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.map.is_empty()
+    }
 }

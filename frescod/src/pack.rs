@@ -85,10 +85,12 @@ pub struct ScreenInput {
 const VK_FORMAT_R8_UNORM: i32 = 9;
 const VK_FORMAT_R8G8B8A8_SRGB: i32 = 43;
 
-/// The kernels' scene input across frames: the texture slot table.
+/// The kernels' scene input across frames: the texture slot table, and
+/// the fills already flattened and tiled.
 #[derive(Default)]
 pub struct SceneState {
     slots: HashMap<u32, fresco_compute::Texture>,
+    fills: std::sync::Mutex<fresco_compute::fill::FillCache>,
 }
 
 impl SceneState {
@@ -192,7 +194,10 @@ impl SceneState {
             }).collect();
             scene.glyph_batches.push(fc::GlyphBatch { atlas, runs });
         }
-        let (mut frame, drops) = fc::Frame::pack_report(&scene, width, height, width);
+        let (mut frame, drops) = {
+            let mut cache = self.fills.lock().unwrap_or_else(|e| e.into_inner());
+            fc::Frame::pack_cached(&scene, width, height, width, Some(&mut cache))
+        };
         // Window 0 is the screen's background; every other window's
         // surface is transparent where the window draws nothing.
         if f.id != 0 {

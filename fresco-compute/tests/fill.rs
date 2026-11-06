@@ -239,3 +239,84 @@ fn dropped_fills_are_reported_with_why() {
     ]);
     assert_eq!(frame.header.op_count, 1, "only the good one draws; the culled one is not a drop");
 }
+
+/// The words a frame's executors read.
+fn words(f: &Frame) -> (Vec<u8>, Vec<u8>, Vec<u32>) {
+    (bytes_of(&[f.header]).to_vec(), bytes_of(&f.ops).to_vec(), f.texels.clone())
+}
+
+#[test]
+fn cached_packs_are_the_same_frame() {
+    let fills = fuzz::fills();
+    let scene = |skip: usize, dx: f32| Scene {
+        fills: fills.iter().skip(skip).map(|f| {
+            let mut f = f.clone();
+            f.transform[4] += dx;
+            f
+        }).collect(),
+        ..Default::default()
+    };
+    let mut cache = FillCache::default();
+    // Hits at other bases, a moved fill, a dropped first one, back again.
+    for (skip, dx) in [(0, 0.0), (0, 0.0), (1, 0.0), (0, 3.5), (0, 0.0), (2, 0.0), (0, 0.0)] {
+        let s = scene(skip, dx);
+        let (a, da) = Frame::pack_report(&s, 96, 80, 96);
+        let (b, db) = Frame::pack_cached(&s, 96, 80, 96, Some(&mut cache));
+        assert_eq!(da, db);
+        assert!(words(&a) == words(&b), "skip {skip} dx {dx}: cached frame differs");
+    }
+    assert!(!cache.is_empty());
+}
+
+/// `cargo test --release --test fill -- --ignored --nocapture`: a 4,000-
+/// point chart and the fixed fills, packed afresh and from the cache.
+#[test]
+#[ignore]
+fn cache_speed() {
+    let n = 4000;
+    let mut points = vec![[0.0, 120.0]];
+    points.extend((0..n).map(|i| {
+        let x = i as f32 * 800.0 / n as f32;
+        [x, 60.0 + 40.0 * (x * 0.05).sin() + 10.0 * (x * 0.9).sin()]
+    }));
+    points.push([800.0, 120.0]);
+    let mut verbs = vec![VERB_MOVE];
+    verbs.extend(std::iter::repeat_n(VERB_LINE, points.len() - 1));
+    let mut fills = fuzz::fills();
+    fills.push(Fill { verbs, points, transform: [1.0, 0.0, 0.0, 1.0, 50.0, 430.0], color: [1.0; 4], ..Default::default() });
+    let s = Scene { fills, ..Default::default() };
+    let time = |f: &mut dyn FnMut()| {
+        let t = std::time::Instant::now();
+        for _ in 0..100 {
+            f();
+        }
+        t.elapsed().as_secs_f64() * 10.0
+    };
+    let fresh = time(&mut || { Frame::pack(&s, 900, 600, 900); });
+    let mut cache = FillCache::default();
+    let cached = time(&mut || { Frame::pack_cached(&s, 900, 600, 900, Some(&mut cache)); });
+    println!("pack: {fresh:.3} ms fresh, {cached:.3} ms cached");
+}
+
+#[test]
+fn a_fill_moving_in_texels_redraws_nothing() {
+    let fills = fuzz::fills();
+    let mut grown = fills.clone();
+    // The first fill doubles in size: every later block moves.
+    grown[0].transform = [2.0, 0.0, 0.0, 2.0, grown[0].transform[4], grown[0].transform[5]];
+    let a = Frame::pack(&Scene { fills: fills.clone(), ..Default::default() }, 160, 120, 160);
+    let b = Frame::pack(&Scene { fills: grown.clone(), ..Default::default() }, 160, 120, 160);
+    assert_ne!(a.ops[1].meta[1], b.ops[1].meta[1], "the later blocks moved");
+    // Only where the first fill was or is now differs.
+    let (sa, sb) = (damage::tile_signatures(&a), damage::tile_signatures(&b));
+    let first = |f: &Frame| f.ops[0].p3;
+    let (ba, bb) = (first(&a), first(&b));
+    let tx = a.header.tiles_x;
+    for (i, (x, y)) in sa.iter().zip(&sb).enumerate() {
+        let (cx, cy) = (((i as u32 % tx) * TILE) as f32, ((i as u32 / tx) * TILE) as f32);
+        let touches = |b: [f32; 4]| cx + TILE as f32 > b[0] && cx < b[2] && cy + TILE as f32 > b[1] && cy < b[3];
+        if !touches(ba) && !touches(bb) {
+            assert_eq!(x, y, "tile {i} away from the changed fill is dirty");
+        }
+    }
+}

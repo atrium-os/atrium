@@ -53,7 +53,12 @@ pub fn tile_signatures(f: &Frame) -> Vec<u64> {
         for v in [o.p0, o.p1, o.p2, o.p3] {
             oh = hash_words(oh, &v.map(f32::to_bits));
         }
-        oh = hash_words(oh, &o.meta);
+        if o.meta[0] == KIND_FILL {
+            // Where its block sits does not change what it draws.
+            oh = hash_words(oh, &[o.meta[0], o.meta[2], o.meta[3]]);
+        } else {
+            oh = hash_words(oh, &o.meta);
+        }
         if o.meta[0] == KIND_TEXTURE || o.meta[0] == KIND_GLYPH {
             oh = mix(oh, tex_hash.get(o.meta[1] as usize).copied().unwrap_or(0));
         }
@@ -63,7 +68,11 @@ pub fn tile_signatures(f: &Frame) -> Vec<u64> {
             let lo = (o.meta[1] as usize).min(f.texels.len());
             let n = f.texels.get(lo + 7).copied().unwrap_or(0) as usize;
             let hi = lo.saturating_add(n.max(crate::fill::HEADER_WORDS as usize)).min(f.texels.len());
-            oh = hash_words(oh, &f.texels[lo..hi]);
+            // Hashed as if at word 0: a fill earlier in the frame growing or
+            // shrinking moves this block, which redraws nothing.
+            let mut block = f.texels[lo..hi].to_vec();
+            crate::fill::unbase(&mut block, lo as u32);
+            oh = hash_words(oh, &block);
         }
         let (tx0, ty0) = (x0 as u32 / TILE, y0 as u32 / TILE);
         let (tx1, ty1) = ((x1 - 1) as u32 / TILE, (y1 - 1) as u32 / TILE);
