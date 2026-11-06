@@ -99,6 +99,32 @@ struct VirtualSpeaker {
 pub struct Virtualizer {
     spk: Vec<VirtualSpeaker>,
     lp_coeff: f32,
+    /// The measured HRTF renderer (lyra-spatial.md S3), when there is one for
+    /// this rate and period; the ITD/ILD model otherwise.
+    hrtf: Option<crate::convolve::PartitionedConvolver>,
+}
+
+/// The 7.1 bed rendered through FABIAN's measured HRTFs (CC BY 4.0; made by
+/// `scripts/hrtf-bed.py`, credits in `lyra/data/README.md`).
+static HRTF_BED: &[u8] = include_bytes!("../data/hrtf-bed-fabian-48k.bin");
+
+/// The bed's impulse responses from [`HRTF_BED`]: (rate, taps, [speaker][ear]
+/// responses), or `None` if the data is malformed.
+pub fn hrtf_bed() -> Option<(u32, usize, Vec<Vec<f32>>)> {
+    let (head, body) = (HRTF_BED.get(..24)?, &HRTF_BED[24..]);
+    let w = |i: usize| u32::from_le_bytes(head[i..i + 4].try_into().unwrap());
+    if &head[..4] != b"LYHR" || w(4) != 1 || w(16) != 8 || w(20) != 2 {
+        return None;
+    }
+    let (rate, taps) = (w(8), w(12) as usize);
+    if body.len() != 16 * taps * 4 {
+        return None;
+    }
+    let all: Vec<f32> = body.chunks_exact(4).map(|c| f32::from_le_bytes(c.try_into().unwrap())).collect();
+    if all.iter().any(|v| !v.is_finite() || v.abs() > 8.0) {
+        return None;
+    }
+    Some((rate, taps, all.chunks(taps).map(|c| c.to_vec()).collect()))
 }
 
 /// Azimuths of the 7.1 bed's channels (degrees, + = right); `None` for LFE.
@@ -133,12 +159,36 @@ impl Virtualizer {
             .collect();
         // One-pole low-pass at about 5 kHz.
         let lp_coeff = 1.0 - (-2.0 * std::f32::consts::PI * 5_000.0 / fs).exp();
-        Virtualizer { spk, lp_coeff }
+        Virtualizer { spk, lp_coeff, hrtf: None }
+    }
+
+    /// The measured-HRTF virtualizer for periods of `period` frames, if the
+    /// HRTF data is for rate `fs`; the ITD/ILD model otherwise. The
+    /// convolution runs in blocks of the largest power of two dividing the
+    /// period (at most 256), so it adds no latency.
+    pub fn for_period(fs: f32, period: usize) -> Self {
+        let mut v = Virtualizer::new(fs);
+        let block = 1usize << period.trailing_zeros().min(8);
+        if let Some((rate, taps, irs)) = hrtf_bed() {
+            if rate as f32 == fs && period > 0 && block >= 16 {
+                v.hrtf = Some(crate::convolve::PartitionedConvolver::new(block, 8, taps, |i, o| irs[i * 2 + o].clone()));
+            }
+        }
+        v
+    }
+
+    /// Whether the measured HRTFs render (not the ITD/ILD model).
+    pub fn is_hrtf(&self) -> bool {
+        self.hrtf.is_some()
     }
 
     /// Render `bed` (interleaved 7.1) and ADD it to `out` (interleaved
     /// stereo). No allocation: it runs on the mix thread.
     pub fn render_add(&mut self, bed: &[f32], out: &mut [f32]) {
+        if let Some(c) = &mut self.hrtf {
+            c.process_add(bed, out);
+            return;
+        }
         for (f, o) in bed.chunks_exact(8).zip(out.chunks_exact_mut(2)) {
             let (mut l, mut r) = (0.0f32, 0.0f32);
             for (c, (sp, &x)) in self.spk.iter_mut().zip(f).enumerate() {
@@ -165,6 +215,9 @@ impl Virtualizer {
     /// Forget the delay lines and filters (when it is switched on again, so
     /// an old tail doesn't play).
     pub fn reset(&mut self) {
+        if let Some(c) = &mut self.hrtf {
+            c.reset();
+        }
         for sp in &mut self.spk {
             sp.left.buf.iter_mut().for_each(|v| *v = 0.0);
             sp.right.buf.iter_mut().for_each(|v| *v = 0.0);
@@ -260,6 +313,70 @@ mod virtualizer_tests {
         let mut out = vec![0.0f32; 9600];
         v.render_add(&bed, &mut out);
         assert!(out.iter().all(|x| x.abs() <= 1.0 + 1e-5), "max {}", out.iter().cloned().fold(0.0, f32::max));
+    }
+
+    /// Steady tone `hz` in bed channel `ch` through `v`; (left, right) power.
+    fn bed_tone(v: &mut Virtualizer, ch: usize, hz: f32) -> (f32, f32) {
+        let bed: Vec<f32> = (0..9600).flat_map(|i| {
+            let mut f = [0.0f32; 8];
+            f[ch] = (2.0 * std::f32::consts::PI * hz * i as f32 / 48_000.0).sin();
+            f
+        }).collect();
+        let mut out = vec![0.0f32; 19200];
+        for (b, o) in bed.chunks(128 * 8).zip(out.chunks_mut(256)) {
+            v.render_add(b, o);
+        }
+        let p = |c: usize| out[9600..].iter().skip(c).step_by(2).map(|x| x * x).sum::<f32>() / 4800.0;
+        (p(0), p(1))
+    }
+
+    #[test]
+    fn the_measured_hrtfs_load_for_48k_and_whole_blocks_only() {
+        let (rate, taps, irs) = hrtf_bed().expect("bundled HRTF bed");
+        assert_eq!((rate, taps, irs.len()), (48_000, 256, 16));
+        assert!(Virtualizer::for_period(48_000.0, 128).is_hrtf());
+        assert!(Virtualizer::for_period(48_000.0, 480).is_hrtf(), "blocks of 32");
+        assert!(!Virtualizer::for_period(44_100.0, 128).is_hrtf(), "data is for 48 kHz");
+        assert!(!Virtualizer::for_period(48_000.0, 100).is_hrtf(), "blocks of 4 are too small");
+    }
+
+    #[test]
+    fn hrtf_places_the_sides_and_keeps_stereo_as_loud() {
+        let mut v = Virtualizer::for_period(48_000.0, 128);
+        // Left surround: louder and earlier at the left ear.
+        let (l, r) = bed_tone(&mut v, 4, 2000.0);
+        assert!(10.0 * (l / r).log10() > 8.0, "{l} {r}");
+        let mut v = Virtualizer::for_period(48_000.0, 128);
+        let mut imp = vec![0.0f32; 256 * 8];
+        imp[4] = 1.0;
+        let mut out = vec![0.0f32; 512];
+        v.render_add(&imp, &mut out);
+        let onset = |c: usize| out.iter().skip(c).step_by(2).position(|x| x.abs() > 0.05).unwrap();
+        assert!(onset(0) + 10 < onset(1), "ITD: left {} right {}", onset(0), onset(1));
+        // Right surround mirrors it.
+        let mut v = Virtualizer::for_period(48_000.0, 128);
+        let (l, r) = bed_tone(&mut v, 5, 2000.0);
+        assert!(10.0 * (r / l).log10() > 8.0);
+        // Stereo content (both fronts, coherent) is as loud as before on
+        // average over 100 Hz to 10 kHz (a sine has power 0.5); single tones
+        // vary with the head's comb and resonances, never by much.
+        let mut sum = 0.0;
+        let hzs: Vec<f32> = (0..12).map(|k| 100.0 * 100f32.powf(k as f32 / 11.0)).collect();
+        for &hz in &hzs {
+            let mut v = Virtualizer::for_period(48_000.0, 128);
+            let bed: Vec<f32> = (0..9600).flat_map(|i| {
+                let x = (2.0 * std::f32::consts::PI * hz * i as f32 / 48_000.0).sin();
+                [x, x, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+            }).collect();
+            let mut out = vec![0.0f32; 19200];
+            v.render_add(&bed, &mut out);
+            let p = out[9600..].iter().map(|x| x * x).sum::<f32>() / 9600.0;
+            sum += p / 0.5;
+            let db = 10.0 * (p / 0.5).log10();
+            assert!(db < 9.0 && db > -30.0, "{hz} Hz: {db:.1} dB");
+        }
+        let avg = 10.0 * (sum / hzs.len() as f32).log10();
+        assert!(avg.abs() < 1.5, "average {avg:.1} dB");
     }
 
     #[test]

@@ -14,9 +14,10 @@
 #   2  a hostile stream (NaN, infinity, wild ring header) beside a 1 kHz tone:
 #      lyrad lives and the tone is untouched.
 #   balance: the output's balance 0.5 takes the left 6 dB down, the right not.
-#   surround: headphone virtual surround on (lyra-spatial.md §3.1): a tone in
-#      a 7.1 stream's left surround reaches the left ear 5.5 dB above the
-#      right; a Pro stream beside it passes untouched.
+#   surround: headphone virtual surround on (lyra-spatial.md §3.1, rendered
+#      through FABIAN's measured HRTFs, S3): a 500 Hz tone in a 7.1 stream's
+#      left surround reaches the left ear 4.5 dB above the right; a Pro stream
+#      beside it passes untouched.
 #   7  kill lyrad while an app plays: the app is told, the supervisor restarts
 #      lyrad and choragusd, and a new stream plays.
 # Not here: 3 (no device in app jails) is portcullis-jail's devfs test plus
@@ -259,11 +260,11 @@ l0, r0 = amp(m[10] + S, m[11], 500, left), amp(m[10] + S, m[11], 500, right)
 l1, r1 = amp(m[11] + S, m[12], 500, left), amp(m[11] + S, m[12], 500, right)
 check('balance 0.5: left fades', l1 - l0, -6.02, 1.0)
 check('balance 0.5: right stays', r1 - r0, 0.0, 1.0)
-# Left surround at -110 deg: near ear 1, far ear 1 - 0.5 sin 110 = 0.53, both
-# scaled by 1/1.75; the tone is -12 dBFS.
+# Left surround at -110 deg through the bundled FABIAN HRTFs: at 500 Hz the
+# left ear's response is -1.0 dB, the right's -5.6 dB; the tone is -12 dBFS.
 sl, sr = amp(m[13] + S, m[14], 500, left), amp(m[13] + S, m[14], 500, right)
-check('surround: left surround, left ear', sl, -12.04 - 4.86, 1.0)
-check('surround: left surround, left over right ear', sl - sr, 5.51, 1.0)
+check('surround: left surround, left ear', sl, -12.04 - 1.0, 1.0)
+check('surround: left surround, left over right ear', sl - sr, 4.52, 1.0)
 pl, pr = amp(m[13] + S, m[14], 860, left), amp(m[13] + S, m[14], 860, right)
 check('surround: Pro stream untouched (left)', pl, -12.04, 0.5)
 check('surround: Pro stream untouched (right)', pr, -12.04, 0.5)

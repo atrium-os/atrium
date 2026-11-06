@@ -1,6 +1,6 @@
 # Lyra: HRTF datasets and their licences (for S3)
 
-Status: survey, 2026-11-06; licences re-checked at the source the same day (the sources
+Status: survey, 2026-11-06. **Decision (Shankar, 2026-11-06): FABIAN is the default; built as S3.** Licences re-checked at the source the same day (the sources
 are named in each row). Feeds [lyra-spatial.md](lyra-spatial.md) S3, the HRTF upgrade
 for headphone virtual surround (S1) and object audio (S2).
 
