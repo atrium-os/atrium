@@ -1,0 +1,59 @@
+# /etc/atrium/services.d/35-atrium-lyrad.toml
+#
+# The jailed launch of lyrad, Lyra's audio engine (docs/spec/lyra-v1.md §3).
+# atrium-portcullisd-bootstrap reads this, asks jaild to create the jail, and
+# supervises lyrad inside it. Numbered 35: before frescod (40) and the session,
+# and before choragusd, which connects to it.
+#
+# lyrad runs NON-ROOT (_lyra). It touches only the sound card and the deadline
+# lane, granted to _lyra through the atrium_audio devfs ruleset (24), which
+# jaild pins to this service. No app jail sees /dev/dsp*: apps play through
+# choragusd, which brokers each stream's shared-memory ring from lyrad.
+#
+# lyrad accepts connections on its socket only from _choragus (peer uid
+# checked on every connection; ATRIUM_LYRAD_PEERS below), and the socket's
+# directory is owned _lyra:_choragus 0750.
+#
+# REQUIRES (commission once per host; scripts/lyra-service.sh does all of it):
+#   1. The _lyra (65016) and _choragus (65017) system users. Both uids are in
+#      jaild.policy's allowed_system_uids.
+#   2. The atrium_audio devfs ruleset (etc/atrium.devfs.rules), loaded at boot;
+#      id 24 in jaild.policy [devfs_rulesets].allowed_ids, pinned to this service.
+#   3. sound(4) in bit-perfect mode, so the kernel neither mixes nor resamples
+#      (architecture §4.1 path A): hw.snd.maxautovchans=0 and
+#      dev.pcm.N.bitperfect=1 (lyra-service.sh writes /etc/sysctl.conf).
+#   4. `install -d -o _lyra -g _choragus -m 0750 /atrium/sockets/lyrad`.
+#   5. The rootfs mountpoint dirs: <path>/{dev,libexec,lib,usr/lib,usr/local/bin,atrium/sockets}.
+
+enabled       = true
+name          = "atrium-lyrad"
+path          = "/var/lib/atrium/jails/lyrad"
+children_max  = 0
+devfs_ruleset = 24                               # atrium_audio: basics + dsp/mixer/laminar (lyrad only)
+
+[[mounts]]
+source = "/libexec"
+dest   = "libexec"
+kind   = "ro_nullfs"
+[[mounts]]
+source = "/lib"
+dest   = "lib"
+kind   = "ro_nullfs"
+[[mounts]]
+source = "/usr/lib"
+dest   = "usr/lib"
+kind   = "ro_nullfs"
+[[mounts]]
+source = "/usr/local/bin"
+dest   = "usr/local/bin"
+kind   = "ro_nullfs"
+[[mounts]]
+source = "/atrium/sockets"                        # rw: lyrad BINDS lyrad/lyrad.sock here
+dest   = "atrium/sockets"
+kind   = "rw_nullfs"
+
+[exec]
+path = "/usr/local/bin/atrium-lyrad"
+argv = ["atrium-lyrad", "--serve"]
+uid  = 65016   # _lyra
+gid  = 65016

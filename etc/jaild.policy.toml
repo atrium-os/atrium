@@ -140,7 +140,8 @@ allowed = [
 # 22 = atrium_app      — basics + pty/fd; portcullis apps and one-shot workers,
 #      with each capability's unhide rules applied to that jail's own mount.
 # 23 = atrium_display  — atrium_gpu + display0: frescod's alone (pinned below).
-allowed_ids = [4, 20, 21, 22, 23]
+# 24 = atrium_audio    — dsp*, mixer*, laminar: lyrad's alone (pinned below).
+allowed_ids = [4, 20, 21, 22, 23, 24]
 
 # The display belongs to frescod. Only the frescod service may mount the
 # ruleset that shows /dev/atrium-display0, and before it starts jaild writes
@@ -153,6 +154,14 @@ jail_name = "atrium-frescod"
 exec_path = "/usr/local/bin/atrium-frescod"
 uid       = 65010
 leases    = ["dev.atrium_gpu_amd_display.0.lease"]
+
+# The sound card belongs to lyrad (lyra-v1.md §3): only the lyrad service may
+# mount the ruleset that shows /dev/dsp*. Apps reach audio through choragusd.
+[[devfs_rulesets.pinned]]
+id        = 24
+jail_name = "atrium-lyrad"
+exec_path = "/usr/local/bin/atrium-lyrad"
+uid       = 65016
 
 
 # ---------------------------------------------------------------
@@ -216,6 +225,8 @@ allowed_system_uids = [
     65014,   # _aqueduct-gpu: the GPU broker (aqueduct-gpu-bundle.sh creates it)
     65015,   # _aqueduct-gpu-app: per-app GPU executors, started for it by
              # portcullisd under the system policy's worker rule
+    65016,   # _lyra: the audio engine, lyrad (lyra-service.sh creates it)
+    65017,   # _choragus: the audio policy daemon, choragusd
 ]
 
 [gid]
@@ -225,6 +236,8 @@ allowed_system_gids = [
     65011,   # _fresco-render
     65014,   # _aqueduct-gpu
     65015,   # _aqueduct-gpu-app
+    65016,   # _lyra
+    65017,   # _choragus
 ]
 
 

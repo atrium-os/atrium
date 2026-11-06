@@ -40,6 +40,14 @@ impl Conn {
         self.0.write_all(&c.encode())?;
         self.0.flush()
     }
+    /// Ask lyrad for an open stream's data-plane ring and receive its fd on this
+    /// same connection (`Ctl::RingFor`). Ordered after the `OpenStream` sent
+    /// before it, and only choragusd's connection is accepted by lyrad.
+    pub fn ring_for(&mut self, stream: u32) -> std::io::Result<std::os::fd::OwnedFd> {
+        use std::os::fd::AsRawFd;
+        self.send(Ctl::RingFor { stream })?;
+        lyra_protocol::fdpass::recv_fd(self.0.as_raw_fd())
+    }
     /// Send the changes from a desired-state diff (gains/routes).
     pub fn apply(&mut self, changes: &[Change]) -> std::io::Result<()> {
         for c in changes {

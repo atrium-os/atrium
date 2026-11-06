@@ -1,4 +1,8 @@
-//! lyrad — the Lyra audio graph engine daemon (skeleton, phase L2).
+//! lyrad — the Lyra audio graph engine daemon.
+//!
+//! `lyrad --serve` is the service (lyra-v1.md §3, `lyra::server`): it mixes the
+//! streams choragusd opens and plays them to the OSS device until stopped. The
+//! other modes are the measurement and bring-up tools below.
 //!
 //! Brings up the deadline-broker side end to end against the modeled path: open
 //! `/dev/laminar`, build the canonical consumer graph (`source → mix → sink`),
@@ -28,9 +32,8 @@ fn main() {
         effect_mode(&args);
         return;
     }
-    if args.iter().any(|a| a == "--control") {
-        control_mode(&args);
-        return;
+    if args.iter().any(|a| a == "--serve" || a == "--control") {
+        serve_mode(&args);
     }
     let tone = args.iter().any(|a| a == "--tone");
 
@@ -471,182 +474,24 @@ fn effect_mode(args: &[String]) {
 /// The demo synth frequency for a stream id (real streams are ring-fed; the
 /// control-plane demo synthesises a distinct tone per id so the mix is audible
 /// and spectrally measurable). id 0 → 440 Hz, id 1 → 660 Hz, id 2 → 880 Hz, …
-fn demo_freq(id: u32) -> f32 {
-    220.0 * (id as f32 + 2.0)
-}
-
-/// `lyrad --control <socket> [secs]` — a real **dynamic mixer** with a live
-/// control plane (Aqueduct class 5). It starts with NO streams; choragusd
-/// commands the lifecycle: `OpenStream`/`CloseStream` create and tear down mixer
-/// slots, `SetGainDb` ramps a slot's gain through the zipper-free smoother. The
-/// engine holds no policy — it just realises the session the policy layer drives.
-/// Control frames cross a channel to the mix loop, applied at the period boundary
-/// (the glitch-free-reconfiguration shape).
-fn control_mode(args: &[String]) {
-    use lyra::gain::Gain;
-    use lyra_protocol::Ctl;
-    use std::io::Read;
-    use std::os::fd::AsRawFd;
-    use std::os::unix::net::UnixListener;
-    use std::sync::mpsc;
-
-    let idx = args.iter().position(|a| a == "--control").unwrap();
-    let socket = args.get(idx + 1).cloned().unwrap_or_else(|| "/tmp/lyrad.ctl".into());
-    let secs: u64 = args.get(idx + 2).and_then(|s| s.parse().ok()).unwrap_or(8);
-    let data_socket = format!("{socket}.data");
-
-    // mix-loop commands: a control change, or a fresh data-plane ring for a stream.
-    enum Cmd { Ctl(Ctl), Attach(u32, lyra::ring::Ring) }
-
-    let _ = std::fs::remove_file(&socket);
-    let listener = match UnixListener::bind(&socket) {
-        Ok(l) => l,
-        Err(e) => { eprintln!("lyrad: bind {socket}: {e}"); std::process::exit(1); }
+/// `lyrad --serve`: the service (lyra-v1.md §3). Socket and trusted peers from
+/// `ATRIUM_LYRAD_SOCK` / `ATRIUM_LYRAD_PEERS` (defaults
+/// `/atrium/sockets/lyrad/lyrad.sock`, `_choragus`).
+///
+/// `lyrad --control <socket>`: the same service for development, on `socket`,
+/// trusting only lyrad's own uid unless `ATRIUM_LYRAD_PEERS` says otherwise.
+fn serve_mode(args: &[String]) {
+    let mut cfg = match lyra::server::Config::from_env() {
+        Ok(c) => c,
+        Err(e) => { eprintln!("lyrad: {e}"); std::process::exit(1); }
     };
-    eprintln!("lyrad: control socket at {socket} (dynamic mixer, 0 streams)");
-    let (tx, rx) = mpsc::channel::<Cmd>();
-
-    // control thread: decode Ctl frames, forward to the mix loop.
-    {
-        let tx = tx.clone();
-        std::thread::spawn(move || {
-            for conn in listener.incoming() {
-                let mut conn = match conn { Ok(c) => c, Err(_) => continue };
-                let mut frame = [0u8; lyra_protocol::FRAME_LEN];
-                while conn.read_exact(&mut frame).is_ok() {
-                    if let Some(c) = Ctl::decode(&frame) {
-                        let _ = tx.send(Cmd::Ctl(c));
-                    }
-                }
-            }
-        });
-    }
-
-    // data thread: a source connects, sends a 4-byte stream id; lyrad creates an
-    // ANONYMOUS ring (no name → no race) and fd-passes it back, then hands the
-    // consumer end to the mix loop. The fd IS the capability to feed that stream.
-    {
-        let _ = std::fs::remove_file(&data_socket);
-        match UnixListener::bind(&data_socket) {
-            Ok(dl) => {
-                eprintln!("lyrad: data socket at {data_socket}");
-                std::thread::spawn(move || {
-                    for conn in dl.incoming() {
-                        let mut conn = match conn { Ok(c) => c, Err(_) => continue };
-                        let mut idb = [0u8; 4];
-                        if conn.read_exact(&mut idb).is_err() { continue; }
-                        let id = u32::from_le_bytes(idb);
-                        // lyrad is the CONSUMER; the source maps the producer end.
-                        match lyra::ring::Ring::create_anon(4096, 2, false) {
-                            Ok((ring, fd)) => {
-                                if lyra::fdpass::send_fd(conn.as_raw_fd(), fd.as_raw_fd()).is_ok() {
-                                    eprintln!("lyrad: source attached to stream {id} (fd-passed ring)");
-                                    let _ = tx.send(Cmd::Attach(id, ring));
-                                }
-                            }
-                            Err(e) => eprintln!("lyrad: create_anon: {e}"),
-                        }
-                    }
-                });
-            }
-            Err(e) => eprintln!("lyrad: no data socket ({e}); sources unavailable"),
+    if let Some(i) = args.iter().position(|a| a == "--control") {
+        if let Some(sock) = args.get(i + 1) {
+            cfg.socket = sock.into();
+        }
+        if std::env::var("ATRIUM_LYRAD_PEERS").is_err() {
+            cfg.peers.clear(); // own uid only
         }
     }
-
-    let sink = match OssSink::open(RATE, 2, FRAMES_PER_PERIOD, 8) {
-        Ok(s) => s,
-        Err(e) => { eprintln!("lyrad: no OSS sink ({e})"); let _ = std::fs::remove_file(&socket); std::process::exit(1); }
-    };
-
-    // the runtime stream table — created/destroyed by control commands. Each
-    // stream's audio comes from its data-plane ring `/lyra_pcm_<id>` when a
-    // source is feeding it; until then (or after it stops) the engine synthesises
-    // a demo tone keyed by id, so the mix is always audible/measurable.
-    struct St { id: u32, step: f32, phase: f32, gain: Gain, ring: Option<lyra::ring::Ring> }
-    let mut streams: Vec<St> = Vec::new();
-
-    use std::io::Write;
-    let mut dump = std::env::var("LYRA_DUMP").ok().and_then(|p| std::fs::File::create(p).ok());
-
-    let n = (FRAMES_PER_PERIOD * 2) as usize;
-    let mut mix = vec![0.0f32; n];
-    let mut tmp = vec![0.0f32; n];
-    let mut out = vec![0i16; n];
-    let periods = (secs * RATE as u64) / FRAMES_PER_PERIOD as u64;
-    for _ in 0..periods {
-        // apply all pending commands at this period boundary (atomic).
-        while let Ok(c) = rx.try_recv() {
-            match c {
-                Cmd::Ctl(Ctl::OpenStream { stream }) => {
-                    if !streams.iter().any(|s| s.id == stream) {
-                        streams.push(St {
-                            id: stream,
-                            step: 2.0 * std::f32::consts::PI * demo_freq(stream) / RATE as f32,
-                            phase: 0.0,
-                            gain: Gain::new(1.0, RATE as f32, 20.0),
-                            ring: None,
-                        });
-                        eprintln!("lyrad: ctl OpenStream stream={stream}; {} active", streams.len());
-                    }
-                }
-                Cmd::Ctl(Ctl::CloseStream { stream }) => {
-                    streams.retain(|s| s.id != stream);
-                    eprintln!("lyrad: ctl CloseStream stream={stream}; {} active", streams.len());
-                }
-                Cmd::Ctl(Ctl::SetGainDb { stream, db }) => {
-                    if let Some(st) = streams.iter_mut().find(|s| s.id == stream) {
-                        st.gain.set_target(10f32.powf(db / 20.0));
-                        eprintln!("lyrad: ctl SetGainDb stream={stream} {db:+.1} dB");
-                    }
-                }
-                Cmd::Ctl(Ctl::Reroute { stream, sink }) => {
-                    eprintln!("lyrad: ctl Reroute stream={stream} -> sink {sink} (noted; single-sink build)");
-                }
-                Cmd::Attach(stream, ring) => {
-                    // the fd-passed data-plane ring for this stream (no name).
-                    // create the slot if the source beat the control-plane open.
-                    if let Some(st) = streams.iter_mut().find(|s| s.id == stream) {
-                        st.ring = Some(ring);
-                    } else {
-                        streams.push(St {
-                            id: stream,
-                            step: 2.0 * std::f32::consts::PI * demo_freq(stream) / RATE as f32,
-                            phase: 0.0,
-                            gain: Gain::new(1.0, RATE as f32, 20.0),
-                            ring: Some(ring),
-                        });
-                    }
-                }
-            }
-        }
-
-        for v in mix.iter_mut() { *v = 0.0; }
-        for st in streams.iter_mut() {
-            if let Some(ring) = st.ring.as_ref() {
-                // real audio from the source; zero-fill any underrun tail.
-                let got = ring.read(&mut tmp) as usize;
-                for v in tmp[got * 2..].iter_mut() { *v = 0.0; }
-            } else {
-                // no source yet: synthesise the demo tone keyed by id.
-                for f in 0..FRAMES_PER_PERIOD as usize {
-                    let s = st.phase.sin() * 0.25;
-                    tmp[f * 2] = s;
-                    tmp[f * 2 + 1] = s;
-                    st.phase += st.step;
-                    if st.phase > 2.0 * std::f32::consts::PI { st.phase -= 2.0 * std::f32::consts::PI; }
-                }
-            }
-            st.gain.process(&mut tmp);
-            for (m, t) in mix.iter_mut().zip(&tmp) { *m += *t; }
-        }
-        for (o, m) in out.iter_mut().zip(&mix) { *o = (m.clamp(-1.0, 1.0) * 32767.0) as i16; }
-        if let Some(f) = dump.as_mut() {
-            let bytes = unsafe { std::slice::from_raw_parts(out.as_ptr() as *const u8, out.len() * 2) };
-            let _ = f.write_all(bytes);
-        }
-        if sink.write_i16(&out).is_err() { break; }
-    }
-    let _ = sink.drain();
-    let _ = std::fs::remove_file(&socket);
-    eprintln!("lyrad: control session done ({secs}s)");
+    lyra::server::run(cfg)
 }

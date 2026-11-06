@@ -53,11 +53,11 @@ $SEAT set alice
 echo "   active session = $($SEAT active)"
 
 echo "== start the engine (lyrad) — one DAC, seat-shared =="
-rm -f /tmp/lyrad.ctl /tmp/lyrad.ctl.data
-LYRA_DUMP=$DUMP $LYRAD --control /tmp/lyrad.ctl 12 &
+rm -f /tmp/lyrad.ctl
+LYRA_DUMP=$DUMP $LYRAD --control /tmp/lyrad.ctl &
 LYRAD_PID=$!
-# wait for the control + data sockets
-i=0; while [ ! -S /tmp/lyrad.ctl.data ] && [ $i -lt 50 ]; do sleep 0.1; i=$((i+1)); done
+# wait for lyrad's socket
+i=0; while [ ! -S /tmp/lyrad.ctl ] && [ $i -lt 50 ]; do sleep 0.1; i=$((i+1)); done
 
 echo "== start the session-aware policy daemon (choragusd --seat) =="
 rm -f /tmp/choragus.sock
@@ -82,7 +82,7 @@ echo "   active session = $($SEAT active)"
 echo "== WINDOW 2 (active=bob): expect 700 Hz only — audio follows the seat =="
 sleep 4
 
-wait $LYRAD_PID 2>/dev/null || true
+kill $LYRAD_PID 2>/dev/null || true  # lyrad serves until stopped
 kill $CHOR_PID 2>/dev/null || true
 
 echo

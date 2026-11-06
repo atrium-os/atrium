@@ -33,6 +33,11 @@ pub struct Ring {
     producer: bool,
     owns_map: bool,                      // unmap on drop (false for shared test maps)
     owns_shm: Option<std::ffi::CString>, // Some(name) on the creator → unlink on drop
+    /// Consumer only: its read position, kept in ITS OWN memory. The shared
+    /// header's `tail` is only a copy published for the producer to see; the
+    /// consumer never reads it back, so a hostile producer that rewrites `tail`
+    /// can't move the consumer's position (lyra-v1.md §5).
+    cursor: AtomicU64,
 }
 
 unsafe impl Send for Ring {}
@@ -41,8 +46,8 @@ impl Ring {
     fn from_map(map: *mut libc::c_void, map_len: usize, producer: bool, owns_map: bool) -> Self {
         let hdr = map as *mut Header;
         let data = unsafe { (map as *mut u8).add(std::mem::size_of::<Header>()) as *mut f32 };
-        let (capacity, frame_floats) =
-            unsafe { ((*hdr).capacity_frames, (*hdr).frame_floats) };
+        let (capacity, frame_floats, tail) =
+            unsafe { ((*hdr).capacity_frames, (*hdr).frame_floats, (*hdr).tail.load(Ordering::Acquire)) };
         Ring {
             hdr,
             data,
@@ -53,6 +58,25 @@ impl Ring {
             producer,
             owns_map,
             owns_shm: None,
+            cursor: AtomicU64::new(tail),
+        }
+    }
+
+    /// Check a header read from a mapping someone else initialised: a power-of-two
+    /// capacity, 1 to 8 channels, and a ring that fits inside the mapping. Without
+    /// this a peer that wrote the header could make this end index past the map.
+    fn header_fits(map: *mut libc::c_void, len: usize) -> io::Result<()> {
+        let hdr = map as *const Header;
+        let (cap, ff) = unsafe { ((*hdr).capacity_frames, (*hdr).frame_floats) };
+        let ok = cap.is_power_of_two()
+            && cap <= 1 << 24
+            && (1..=8).contains(&ff)
+            && Self::bytes_for(cap, ff) <= len;
+        if ok {
+            Ok(())
+        } else {
+            unsafe { libc::munmap(map, len) };
+            Err(io::Error::new(io::ErrorKind::InvalidData, "ring header does not fit its mapping"))
         }
     }
 
@@ -128,6 +152,7 @@ impl Ring {
         if map == libc::MAP_FAILED {
             return Err(io::Error::last_os_error());
         }
+        Self::header_fits(map, len)?;
         Ok(Self::from_map(map, len, producer, true))
     }
 
@@ -205,6 +230,7 @@ impl Ring {
             return Err(io::Error::last_os_error());
         }
         drop(fd); // mapping outlives the fd
+        Self::header_fits(map, len)?;
         Ok(Self::from_map(map, len, producer, true))
     }
 
@@ -215,9 +241,20 @@ impl Ring {
         unsafe { (*self.hdr).tail.load(Ordering::Acquire) }
     }
 
-    /// Frames available to read.
+    /// Frames available to read. On the consumer this is measured from its own
+    /// cursor and capped at the capacity, whatever the producer wrote to `head`.
     pub fn readable(&self) -> u64 {
-        self.head().wrapping_sub(self.tail())
+        if self.producer {
+            self.head().wrapping_sub(self.tail())
+        } else {
+            self.head().wrapping_sub(self.cursor.load(Ordering::Relaxed)).min(self.capacity)
+        }
+    }
+
+    /// Consumer: frames read since the ring was mapped, from its own cursor (the
+    /// stream position lyrad's clock counts; never anything the producer wrote).
+    pub fn consumed(&self) -> u64 {
+        self.cursor.load(Ordering::Relaxed)
     }
     /// Frames of free space to write.
     pub fn writable(&self) -> u64 {
@@ -250,7 +287,7 @@ impl Ring {
         debug_assert!(!self.producer);
         let want = out.len() as u64 / self.frame_floats;
         let n = want.min(self.readable());
-        let tail = self.tail();
+        let tail = self.cursor.load(Ordering::Relaxed);
         for i in 0..n {
             let slot = ((tail + i) % self.capacity) * self.frame_floats;
             for c in 0..self.frame_floats {
@@ -260,6 +297,7 @@ impl Ring {
                 }
             }
         }
+        self.cursor.store(tail + n, Ordering::Relaxed);
         unsafe { (*self.hdr).tail.store(tail + n, Ordering::Release) };
         n
     }
@@ -298,6 +336,39 @@ mod tests {
         let prod = Ring::from_map(map, len, true, false);
         let cons = Ring::from_map(map, len, false, false);
         (prod, cons, map)
+    }
+
+    /// ★ A hostile producer rewrites the shared `tail` and sets `head` far ahead:
+    /// the consumer's position only moves by what it read, and it never reads
+    /// more than the ring holds.
+    #[test]
+    fn consumer_ignores_a_rewritten_tail_and_a_wild_head() {
+        let (p, c, m) = pair(8, 1);
+        assert_eq!(p.write(&[1.0, 2.0, 3.0]), 3);
+        let hdr = m as *mut Header;
+        unsafe { (*hdr).tail.store(1_000_000, Ordering::Release) };
+        let mut out = [0.0f32; 8];
+        assert_eq!(c.read(&mut out), 3, "reads what was written, from its own cursor");
+        assert_eq!(&out[..3], &[1.0, 2.0, 3.0]);
+        assert_eq!(c.consumed(), 3);
+        unsafe { (*hdr).head.store(u64::MAX / 2, Ordering::Release) };
+        assert_eq!(c.readable(), 8, "capped at capacity");
+        assert_eq!(c.read(&mut out), 8);
+        assert_eq!(c.consumed(), 11, "moves forward by what it read, nothing else");
+    }
+
+    #[test]
+    fn a_header_that_does_not_fit_its_mapping_is_refused() {
+        for (cap, ff) in [(3u64, 2u64), (8, 0), (8, 9), (1 << 20, 2)] {
+            let len = Ring::bytes_for(8, 2);
+            let map = unsafe {
+                libc::mmap(std::ptr::null_mut(), len, libc::PROT_READ | libc::PROT_WRITE,
+                    libc::MAP_PRIVATE | libc::MAP_ANON, -1, 0)
+            };
+            let hdr = map as *mut Header;
+            unsafe { (*hdr).capacity_frames = cap; (*hdr).frame_floats = ff; }
+            assert!(Ring::header_fits(map, len).is_err(), "cap {cap} ff {ff}");
+        }
     }
 
     #[test]

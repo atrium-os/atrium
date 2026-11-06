@@ -20,7 +20,7 @@
 //!
 //! Control frame: a fixed **12 bytes**, little-endian.
 //! ```text
-//!   byte 0      : tag (1 = SetGainDb, 2 = Reroute, 3 = Open, 4 = Close)
+//!   byte 0      : tag (1 = SetGainDb, 2 = Reroute, 3 = Open, 4 = Close, 5 = RingFor)
 //!   bytes 1..4  : reserved (0)
 //!   bytes 4..8  : stream id        (u32)
 //!   bytes 8..12 : payload          (f32 dB bits for SetGainDb; u32 sink for Reroute)
@@ -29,6 +29,7 @@
 pub mod app;
 pub mod client;
 pub mod fdpass;
+pub mod peer;
 pub mod ring;
 
 pub const FRAME_LEN: usize = 12;
@@ -37,6 +38,7 @@ const TAG_SET_GAIN: u8 = 1;
 const TAG_REROUTE: u8 = 2;
 const TAG_OPEN: u8 = 3;
 const TAG_CLOSE: u8 = 4;
+const TAG_RING_FOR: u8 = 5;
 
 /// A control message from the session layer to the engine — a stream's lifecycle
 /// (open / close) or a level / routing change.
@@ -51,6 +53,13 @@ pub enum Ctl {
     SetGainDb { stream: u32, db: f32 },
     /// Move `stream` to `sink` (the glitch-free atomic-commit reconfig applies it).
     Reroute { stream: u32, sink: u32 },
+    /// Make the data-plane ring for an OPEN `stream`; lyrad answers on the same
+    /// connection with the ring's fd (`SCM_RIGHTS`), which choragusd passes on to
+    /// the app. On the control connection, so it is ordered after `OpenStream`
+    /// and only choragusd (the one peer lyrad accepts) can ask (lyra-v1.md §3).
+    /// lyrad answers with no fd (the connection's filler byte only) when the
+    /// stream is not open.
+    RingFor { stream: u32 },
 }
 
 impl Ctl {
@@ -59,7 +68,8 @@ impl Ctl {
             Ctl::OpenStream { stream }
             | Ctl::CloseStream { stream }
             | Ctl::SetGainDb { stream, .. }
-            | Ctl::Reroute { stream, .. } => stream,
+            | Ctl::Reroute { stream, .. }
+            | Ctl::RingFor { stream } => stream,
         }
     }
 
@@ -71,6 +81,7 @@ impl Ctl {
             Ctl::CloseStream { stream } => (TAG_CLOSE, stream, 0),
             Ctl::SetGainDb { stream, db } => (TAG_SET_GAIN, stream, db.to_bits()),
             Ctl::Reroute { stream, sink } => (TAG_REROUTE, stream, sink),
+            Ctl::RingFor { stream } => (TAG_RING_FOR, stream, 0),
         };
         f[0] = tag;
         f[4..8].copy_from_slice(&stream.to_le_bytes());
@@ -90,6 +101,7 @@ impl Ctl {
             TAG_CLOSE => Some(Ctl::CloseStream { stream }),
             TAG_SET_GAIN => Some(Ctl::SetGainDb { stream, db: f32::from_bits(payload) }),
             TAG_REROUTE => Some(Ctl::Reroute { stream, sink: payload }),
+            TAG_RING_FOR => Some(Ctl::RingFor { stream }),
             _ => None,
         }
     }
@@ -134,7 +146,7 @@ mod tests {
 
     #[test]
     fn open_and_close_round_trip() {
-        for c in [Ctl::OpenStream { stream: 2 }, Ctl::CloseStream { stream: 5 }] {
+        for c in [Ctl::OpenStream { stream: 2 }, Ctl::CloseStream { stream: 5 }, Ctl::RingFor { stream: 9 }] {
             assert_eq!(Ctl::decode(&c.encode()), Some(c));
         }
     }

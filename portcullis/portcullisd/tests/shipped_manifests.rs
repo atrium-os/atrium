@@ -31,6 +31,7 @@ const MANIFEST_DIRS: &[&str] = &[
     "memfed/etc/services.d",
     "stoa/etc/services.d",
     "frescod/etc/services.d",
+    "lyra/etc/services.d",
 ];
 
 #[test]
@@ -73,4 +74,20 @@ fn shipped_smoke_manifests_pass_the_shipped_policy() {
             panic!("{}: jaild would refuse it: {e:?}", m.name);
         }
     }
+}
+
+/// lyrad's manifest (lyra-v1.md §3) passes the shipped policy, including the
+/// pin on the atrium_audio ruleset (24): the sound card is lyrad's alone.
+#[test]
+fn lyrad_manifest_passes_the_shipped_policy_and_owns_the_audio_ruleset() {
+    let p = policy();
+    let out = load_dir(&repo().join("lyra/etc/services.d")).expect("read lyra/etc/services.d");
+    assert!(out.errors.is_empty(), "unparseable: {:?}", out.errors);
+    let m = out.manifests.iter().find(|m| m.name == "atrium-lyrad").expect("atrium-lyrad manifest");
+    let req = m.to_create_request();
+    if let Err(e) = validate_create(&req, &p) {
+        panic!("atrium-lyrad: jaild would refuse it: {e:?}");
+    }
+    let pin = p.devfs_rulesets.pin(24).expect("ruleset 24 is pinned");
+    assert_eq!((pin.jail_name.as_str(), pin.uid), ("atrium-lyrad", 65016));
 }

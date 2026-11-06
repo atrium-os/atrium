@@ -191,9 +191,6 @@ struct DState {
     /// If set, the Portcullis launch registry (`uid → (user, app-id)`): the app's
     /// identity is its dedicated uid via this binding, not its self-declared id.
     app_registry: Option<String>,
-    /// lyrad's data socket — where choragusd fetches a stream's ring fd to broker
-    /// to the app (so the app talks only to choragusd, one front door).
-    lyrad_data_sock: String,
     /// Session-aware: only the ACTIVE session's audio reaches the engine. When on,
     /// a stream owned by a non-active session is muted; a seat switch follows.
     seat_aware: bool,
@@ -203,17 +200,6 @@ struct DState {
 
 /// The gain (dB) for a stream muted because its session isn't the active one.
 const SEAT_MUTE_DB: f32 = -120.0;
-
-/// Fetch the data-plane ring fd for `stream` from lyrad (connect, send the id,
-/// receive the fd). The broker half of the single-front-door data path.
-fn fetch_ring_fd(data_sock: &str, stream: u32) -> std::io::Result<std::os::fd::OwnedFd> {
-    use std::io::Write;
-    use std::os::fd::AsRawFd;
-    use std::os::unix::net::UnixStream;
-    let mut s = UnixStream::connect(data_sock)?;
-    s.write_all(&stream.to_le_bytes())?;
-    lyra_protocol::fdpass::recv_fd(s.as_raw_fd())
-}
 
 /// Close a stream and apply the resulting policy change (e.g. un-duck media).
 fn close_stream(state: &std::sync::Mutex<DState>, stream: u32) {
@@ -326,12 +312,11 @@ fn handle_app(mut app: std::os::unix::net::UnixStream, state: std::sync::Arc<std
                 }
                 let id;
                 let nchanges;
-                let data_sock;
+                let ring;
                 {
                     let mut st = state.lock().unwrap();
                     id = st.next_id;
                     st.next_id += 1;
-                    data_sock = st.lyrad_data_sock.clone();
                     let before = st.sess.resolve();
                     let _ = st.sess.open(Stream::new(id, role));
                     let after = st.sess.resolve();
@@ -343,6 +328,9 @@ fn handle_app(mut app: std::os::unix::net::UnixStream, state: std::sync::Arc<std
                     // and if that session isn't the active one, mute it — its audio
                     // does not reach the engine until its session is bound.
                     st.stream_owner.insert(id, user.clone());
+                    // Broker the data-plane ring: ask lyrad on the control
+                    // connection (ordered after the OpenStream above).
+                    ring = st.conn.ring_for(id);
                     if st.seat_aware && !portcullis_peer::seat::is_active(&user) {
                         let _ = st.conn.send(Ctl::SetGainDb { stream: id, db: SEAT_MUTE_DB });
                         eprintln!("choragusd: stream {id} (session '{user}') not active — muted");
@@ -352,7 +340,7 @@ fn handle_app(mut app: std::os::unix::net::UnixStream, state: std::sync::Arc<std
                 let _ = app.write_all(&id.to_le_bytes());
                 // broker the data-plane ring: fetch its fd from lyrad and pass it
                 // on to the app (SCM_RIGHTS). The app talks only to choragusd.
-                match fetch_ring_fd(&data_sock, id) {
+                match ring {
                     Ok(fd) => {
                         use std::os::fd::AsRawFd;
                         let _ = lyra_protocol::fdpass::send_fd(app.as_raw_fd(), fd.as_raw_fd());
@@ -410,7 +398,6 @@ fn daemon(app_sock: &str, lyrad_sock: &str, grants_path: Option<&str>, portculli
         grants,
         portcullis_base: portcullis_base.map(String::from),
         app_registry: app_registry.map(String::from),
-        lyrad_data_sock: format!("{lyrad_sock}.data"),
         seat_aware,
         stream_owner: std::collections::HashMap::new(),
     }));

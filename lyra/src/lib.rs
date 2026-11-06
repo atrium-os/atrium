@@ -25,3 +25,4 @@ pub mod resampler;
 pub mod binaural;
 pub mod reverb;
 pub mod node_abi;
+pub mod server;
