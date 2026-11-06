@@ -234,9 +234,7 @@ BT.2020 to BT.709 primaries with clipping, and back to sRGB. The HLG OOTF is app
 channel, an approximation of BT.2100's luminance-based one. `VideoLayerCreate.protected`
 keeps the layer out of capture: today frescod's only capture is the headless PNG, where a
 protected layer shows black; any capture path added later must ask `video::CAPTURED` the same
-way. **Open (Shankar):** on an HDR monitor, HDR video is tone-mapped to SDR white like
-everything else. True PQ passthrough needs the desktop composed in wider than 8-bit sRGB,
-which is a larger change than V3 (decision card in the Fresco thread). The probe checks
+way. **Decided (Shankar, 2026-11-06):** on an HDR monitor, HDR video is tone-mapped to SDR white like everything else for now. True PQ passthrough waits for a wider-than-8-bit compose path, which is its own later step. The probe checks
 BT.601 full-range red, PQ peak to SDR white, PQ 100 cd/m² to grey, a refused matrix and
 a protected layer's black in the capture, in both modes.
 
