@@ -201,6 +201,19 @@ instance_root_dir = "/var/lib/atrium/jails"
 
 
 # ---------------------------------------------------------------
+# Arca's couriers (docs/spec/arca.md §5): arca-courierd (root) asks for one
+# jail per courier, named <name_prefix><uid> at <instance_root_dir>/<name>,
+# running exactly exec_path as that uid. Only these may take their caller's
+# stdio besides one-shot instances, and they may lock memory.
+# ---------------------------------------------------------------
+[couriers]
+name_prefix = "system-arca-courier-"
+exec_path   = "/usr/local/bin/atrium-arca-courier"
+uid_first   = 64000
+uid_last    = 64999
+
+
+# ---------------------------------------------------------------
 # Environment variable allow-list for execve. Anything not
 # matching is dropped.
 # ---------------------------------------------------------------

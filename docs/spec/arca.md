@@ -246,14 +246,56 @@ and wipes them afterwards.
     the app itself, all-or-nothing fills, cookies never by id, and couriers getting no
     other ops.
   - `scripts/arca-vm-test.sh` §4 runs the courier in the VM under its own uid against
-    the jailed arcad.
+    the jailed arcad (with `su`; §5.4 is the jailed launch).
 - **Not yet.**
-  - The launcher (a jail per courier with its own vnet, §5.2): the VM gate runs the
-    courier with `su`.
   - Capsicum for the courier after connect.
   - Handles from arca-ui are bound to the app, so they can't be redeemed by a courier
     yet. They need the field's endpoint (A3).
   - Pinned keys and revocation ([../TLS.md](../TLS.md)).
+
+### 5.4 As built: a jail per courier (2026-11-06)
+
+`arca/arca-courierd` starts every courier in its own jail. It runs as root, because
+jaild serves only root, and it is never jailed itself. It holds no secret and reads no
+item.
+
+- **Asking.** An app connects to `/atrium/sockets/arca-courier/courierd.sock` and sends
+  an endpoint in arcad's encoding (`u8 scheme=1 | str host | u16 port`). It reads one
+  status byte. On success the courier's socket comes with that byte (SCM_RIGHTS). The
+  app is the kernel's peer uid resolved through the launch registry, as in arcad. The
+  courier's persona is that app's endpoint persona. Partitions (web personas) are
+  refused here; they come with A2's web broker.
+- **The address.** The launcher resolves the host once, to IPv4 addresses that
+  navigator-fetch's policy admits (at most 8). No admitted address refuses the request.
+  The courier is given the same list (`ATRIUM_COURIER_ADDRS`) and connects only to it,
+  with the policy still applied.
+- **The uid.** The lowest free uid in 64000–64999, at most 16 live per app. Its label
+  is appended to the courier registry before the jail starts. When the courier exits,
+  the launcher first appends `uid retired`, then removes the jail, and only then frees
+  the uid. The registry is append-only while couriers run; it is truncated in place
+  when the launcher starts (never replaced: arcad's nullfs mount pins the file).
+- **The jail** (jaild `[couriers]`). It is named `system-arca-courier-<uid>` and rooted
+  at `/var/lib/atrium/jails/<name>`. It runs exactly `/usr/local/bin/atrium-arca-courier`
+  as that uid, with the app's socket as stdin and stdout. jaild lets only such a jail take
+  its caller's descriptors, apart from one-shot instances, and gives it `allow.mlock`.
+  It sees `/lib`, `/libexec`, `/usr/lib` and `/usr/local/bin` read-only, arcad's socket
+  directory, the courier registry read-only and a copy of the trust store. It sees
+  nothing of the user's. Its network is its own vnet (`Routed`), and its pf anchor
+  passes TCP only to the endpoint's addresses on its port, plus the host's resolvers,
+  which jaild adds to every restricted anchor.
+- **Teardown** removes only what the launcher wrote, then the empty directories. A
+  surviving mount is never removed recursively. At start the launcher reclaims every
+  courier jail a previous run left.
+- **Gates.**
+  - `arca-courierd/tests/launcher.rs` covers the wire, the address filter (no loopback,
+    LAN without the grant, metadata or IPv6), the per-app cap and uid reuse, the
+    descriptor passing, and the in-place registry reset.
+  - jaild's `a_courier_jail_and_only_a_courier_jail` checks that a wrong uid, root,
+    binary, name or range is an ordinary jail and is refused.
+  - `scripts/arca-vm-test.sh` §5 runs an app's courier in its jail against a TLS server
+    outside the VM. It checks the uid, the label, the pf anchor, the root's contents,
+    the token arriving and masked, the jail gone with its label retired and no mount
+    left when the app closes, and the refusals.
 
 ## 6. At rest and in memory
 

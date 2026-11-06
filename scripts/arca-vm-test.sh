@@ -1,5 +1,6 @@
 #!/bin/sh
-# Arca A0 gates in the FreeBSD dev VM (docs/spec/arca.md §11).
+# Arca gates in the FreeBSD dev VM (docs/spec/arca.md §5.3, §5.4, §11): §4 the
+# courier, §5 a jail per courier (arca-courierd).
 #
 #   sh scripts/cloud-vm.sh up        # VM running, Portcullis stack deployed
 #   sh scripts/arca-vm-test.sh       # cross-build, deploy, run the gates
@@ -32,7 +33,7 @@ check() { # name expected actual
 
 echo "=== cross-build"
 BINS=""
-for c in arca/arca-store arca/arcad arca/arca-ui arca/arca-courier; do
+for c in arca/arca-store arca/arcad arca/arca-ui arca/arca-courier arca/arca-courierd; do
     out=$(cd "$ROOT/$c" && RUSTFLAGS="$CROSS_RUSTFLAGS" cargo test --release --target "$TARGET" --no-run --message-format=json 2>/dev/null \
         | python3 -c 'import sys,json
 for l in sys.stdin:
@@ -44,10 +45,14 @@ done
 REL="$ROOT/arca/arcad/target/$TARGET/release"
 (cd "$ROOT/arca/arca-courier" && RUSTFLAGS="$CROSS_RUSTFLAGS" cargo build -q --release --target "$TARGET" --bins --examples)
 CREL="$ROOT/arca/arca-courier/target/$TARGET/release"
+(cd "$ROOT/arca/arca-courierd" && RUSTFLAGS="$CROSS_RUSTFLAGS" cargo build -q --release --target "$TARGET" --bins --examples)
+DREL="$ROOT/arca/arca-courierd/target/$TARGET/release"
+# The jailed couriers' TLS server runs here, on the machine running the VM.
+(cd "$ROOT/arca/arca-courier" && cargo build -q --example courier-test-server)
 
 echo "=== deploy"
 g "mkdir -p /root/arca-test && rm -f /root/arca-test/*"
-for b in $BINS "$REL/arcad" "$REL/arca-probe" "$CREL/arca-courier" "$CREL/examples/courier-vm-probe"; do
+for b in $BINS "$REL/arcad" "$REL/arca-probe" "$CREL/arca-courier" "$CREL/examples/courier-vm-probe" "$DREL/arca-courierd" "$DREL/examples/courierd-vm-probe"; do
     put "$b" /root/arca-test/
     h=$(sha256sum "$b" | cut -d' ' -f1)
     gh=$(g "sha256 -q /root/arca-test/$(basename "$b")")
@@ -176,6 +181,64 @@ r=$(g "/root/arca-test/courier-vm-probe evil.example /tmp/courier-ca.pem $TID \"
 check "courier for evil.example: Arca denies the token" "refused=Denied" "$(echo "$r" | head -1)"
 check "and evil.example's server got no token" false "$(echo "$r" | sed -n 's/^server_got_token=//p')"
 check "a courier uid is no app" "status=1 body=" "$(as arcacourier1 'store hunter3')"
+
+echo "=== 5. couriers in their own jails (arca-courierd)"
+# A TLS server on this machine for api.example and evil.example; the guest
+# reaches it as 10.0.2.2 (slirp), a LAN address, so the launcher's test
+# grant admits it.
+SRV=$(mktemp -d)
+"$ROOT/arca/arca-courier/target/debug/examples/courier-test-server" api.example,evil.example "$SRV/ca.pem" "$SRV/port" "$SRV/log" &
+SPID=$!
+trap 'kill $SPID 2>/dev/null' EXIT
+i=0; while [ $i -lt 50 ] && [ ! -s "$SRV/port" ]; do sleep 0.1; i=$((i+1)); done
+PORT=$(cat "$SRV/port")
+put "$SRV/ca.pem" /tmp/courierd-ca.pem
+g "grep -q ' api.example' /etc/hosts || printf '10.0.2.2 api.example evil.example\n' >> /etc/hosts"
+D=/atrium/sockets/arca-courier/courierd.sock
+g "pkill -x arca-courierd; sleep 1; install -m 755 /root/arca-test/arca-courier /usr/local/bin/atrium-arca-courier && install -m 755 /root/arca-test/arca-courierd /usr/local/bin/arca-courierd && install -m 755 /root/arca-test/courierd-vm-probe /usr/local/bin/courierd-vm-probe"
+g "rm -f /tmp/courierd.log; env ARCA_COURIERD_CA=/tmp/courierd-ca.pem ARCA_COURIERD_GRANT_PRIVATE_NETWORK=1 daemon -o /tmp/courierd.log /usr/local/bin/arca-courierd </dev/null >/dev/null 2>&1"
+i=0; while [ $i -lt 30 ] && ! g "test -S $D"; do sleep 1; i=$((i+1)); done
+check "launcher listening" yes "$(g "test -S $D && echo yes || echo no")"
+check "launcher reset the registry" 0 "$(g 'wc -l < /var/run/atrium/courier-registry' | tr -d ' ')"
+TID=$(as arcaapp1 "store-for api.example:$PORT hunter2-token" | sed -n 's/^status=0 body=//p')
+g "rm -f /tmp/courierd-hold"
+g "su -m arcaapp1 -c 'PROBE_HOLD=/tmp/courierd-hold courierd-vm-probe $D api.example $PORT $TID' </dev/null > /tmp/courierd-probe.out 2>&1 &"
+i=0; while [ $i -lt 60 ] && ! g "grep -q '^jail=' /tmp/courierd-probe.out"; do sleep 1; i=$((i+1)); done
+CJ=$(g "sed -n 's/^jail=//p' /tmp/courierd-probe.out")
+check "the courier has its own jail" system-arca-courier-64000 "$CJ"
+CPID=$(g "pgrep -j $CJ | head -1" || true)
+check "courier runs as its courier uid" 64000 "$(g "ps -o uid= -p $CPID" | tr -d ' ')"
+check "courier jail may lock memory" true "$(g "jls -j $CJ allow.mlock" | tr -d ' ')"
+check "courier labelled for the app's persona and api.example" "64000 alice $MP https api.example $PORT" "$(g 'cat /var/run/atrium/courier-registry')"
+A=$(g "pfctl -a atrium/$CJ -sr 2>/dev/null")
+echo "$A" | sed 's/^/    pf: /'
+check "pf passes the endpoint's address and port" 1 "$(echo "$A" | grep -c "^pass .* proto tcp .*to 10.0.2.2 port = $PORT ")"
+check "pf passes nothing else but DNS" 0 "$(echo "$A" | grep '^pass' | grep -v "to 10.0.2.2 port = $PORT" | grep -vc 'port = domain')"
+check "the jail's root holds no user data" "atrium dev etc lib libexec usr var" "$(g "ls /var/lib/atrium/jails/$CJ" | tr '\n' ' ' | sed 's/ $//')"
+g "touch /tmp/courierd-hold"
+i=0; while [ $i -lt 40 ] && ! g "grep -q '^jail_gone=' /tmp/courierd-probe.out"; do sleep 1; i=$((i+1)); done
+r=$(g "cat /tmp/courierd-probe.out")
+echo "$r" | sed 's/^/    /'
+check "jailed courier: 200" 200 "$(echo "$r" | sed -n 's/^status=//p')"
+check "jailed courier: the echoed token is masked" "echo *************" "$(echo "$r" | sed -n 's/^body=//p')"
+check "jailed courier: the redirect comes back, not followed" "302 https://evil.example/" "$(echo "$r" | sed -n 's/^redirect=//p')"
+check "the server got the token over TLS" 1 "$(grep -c '^GET /me HTTP/1.1 token=true' "$SRV/log")"
+check "the jail is gone when the app closes" true "$(echo "$r" | sed -n 's/^jail_gone=//p')"
+check "its label is retired" "64000 retired" "$(g 'tail -1 /var/run/atrium/courier-registry')"
+# A vnet jail is dying while its connections are in TIME_WAIT (about a
+# minute); the launcher waits that out, then unmounts.
+i=0; while [ $i -lt 120 ] && g "test -e /var/lib/atrium/jails/$CJ"; do sleep 1; i=$((i+1)); done
+check "its root is removed" gone "$(g "test -e /var/lib/atrium/jails/$CJ && echo left || echo gone")"
+check "no mounts left under it" 0 "$(g "mount -p | grep -c '/jails/$CJ'" || true)"
+N=$(wc -l < "$SRV/log")
+r=$(g "su -m arcaapp1 -c 'courierd-vm-probe $D evil.example $PORT $TID'")
+check "a courier for evil.example: Arca denies the token" "courier_refused=Denied" "$(echo "$r" | head -1)"
+# Arca refuses the fill after the handshake, so no request is ever sent.
+check "and evil.example's server got no request" "$N" "$(wc -l < "$SRV/log")"
+check "root is no app: refused" "refused=1" "$(g "courierd-vm-probe $D api.example $PORT $TID")"
+check "a host with no address: refused" "refused=3" "$(g "su -m arcaapp1 -c 'courierd-vm-probe $D no-such-host.invalid 443 $TID'")"
+check "the launcher logged no failure" 0 "$(g "grep -c ': .*\(refused\|failed\|errno\)' /tmp/courierd.log" || true)"
+g "pkill -x arca-courierd; true"
 
 echo "=== $pass passed, $fail failed"
 [ "$fail" = 0 ]

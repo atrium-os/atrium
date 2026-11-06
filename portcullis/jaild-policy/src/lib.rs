@@ -55,6 +55,23 @@ pub struct Policy {
     /// Which jails may lock memory (`allow.mlock`). Absent = none.
     #[serde(default)]
     pub mlock: MlockPolicy,
+    /// Arca's couriers (arca.md §5). Absent = none.
+    #[serde(default)]
+    pub couriers: Option<CourierPolicy>,
+}
+
+/// `[couriers]`: Arca's per-endpoint courier jails (arca.md §5, §5.2). One
+/// jail per courier, made by arca-courierd: named `<name_prefix><uid>`,
+/// rooted at `<exec_paths.instance_root_dir>/<name>`, running exactly
+/// `exec_path` as a uid in `uid_first..=uid_last` (gid = uid). Such a jail
+/// may take its caller's stdio (the client's socket) and lock memory (the
+/// secret it carries), and nothing else beyond an ordinary service.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct CourierPolicy {
+    pub name_prefix: String,
+    pub exec_path:   String,
+    pub uid_first:   u32,
+    pub uid_last:    u32,
 }
 
 /// `[mlock]`: jails whose processes may `mlock(2)`. A jail that holds secrets

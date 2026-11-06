@@ -1,0 +1,34 @@
+[package]
+name        = "arca-courierd"
+version     = "0.1.0"
+edition     = "2021"
+license     = "MIT OR Apache-2.0"
+publish     = false
+description = "Arca's courier launcher (docs/spec/arca.md §5.2): one jail per courier, under its own courier uid, whose network reaches only the addresses of its one endpoint; the client gets the courier's socket and nothing else."
+
+[lib]
+name = "arca_courierd"
+path = "src/lib.rs"
+
+[[bin]]
+name = "arca-courierd"
+path = "src/bin/arca-courierd.rs"
+
+[dependencies]
+arca-store      = { path = "../arca-store" }
+arcad           = { path = "../arcad" }
+navigator-fetch = { path = "../../navigator-fetch" }
+libc            = "0.2"
+
+[target.'cfg(target_os = "freebsd")'.dependencies]
+jaild               = { path = "../../portcullis/jaild" }
+portcullis-identity = { path = "../../portcullis/portcullis-identity" }
+portcullis-mounts   = { path = "../../portcullis/portcullis-mounts" }
+
+[dev-dependencies]
+tempfile     = "3"
+arca-courier = { path = "../arca-courier" }
+
+[[example]]
+name = "courierd-vm-probe"
+path = "examples/vm_probe.rs"

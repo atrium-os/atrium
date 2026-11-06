@@ -36,7 +36,7 @@ pub fn validate_create(
         validate_tmpfs_owner(m, req.exec.as_ref())?;
     }
     if let Some(exec) = &req.exec {
-        validate_exec(exec, policy, is_instance_root(req, policy))?;
+        validate_exec(exec, policy, is_instance_root(req, policy), is_courier(req, policy))?;
     }
     validate_host_identity(req)?;
     Ok(())
@@ -82,9 +82,31 @@ pub fn is_instance_root(req: &CreateJailRequest, policy: &Policy) -> bool {
         && std::path::Path::new(&req.path) == std::path::Path::new(dir).join(&req.name)
 }
 
-/// `allow.mlock` lets a jail wire memory, so it is allowlisted per jail.
+/// Whether `req` is one of Arca's courier jails (`[couriers]`, arca.md §5):
+/// named `<name_prefix><uid>` with `uid` in range, rooted at exactly
+/// `<instance_root_dir>/<name>`, and running exactly `exec_path` as `uid`.
+/// Anything else is judged as an ordinary jail.
+pub fn is_courier(req: &CreateJailRequest, policy: &Policy) -> bool {
+    let (Some(c), Some(dir), Some(exec)) =
+        (policy.couriers.as_ref(), policy.exec_paths.instance_root_dir.as_deref(), req.exec.as_ref())
+    else {
+        return false;
+    };
+    let Some(uid) = req.name.strip_prefix(c.name_prefix.as_str()).and_then(|u| u.parse::<u32>().ok()) else {
+        return false;
+    };
+    req.name == format!("{}{uid}", c.name_prefix)
+        && (c.uid_first..=c.uid_last).contains(&uid)
+        && exec.uid == uid
+        && exec.gid == uid
+        && exec.path == c.exec_path
+        && std::path::Path::new(&req.path) == std::path::Path::new(dir).join(&req.name)
+}
+
+/// `allow.mlock` lets a jail wire memory, so it is allowlisted per jail
+/// (and given to Arca's couriers, which carry a secret per request).
 fn validate_mlock(req: &CreateJailRequest, policy: &Policy) -> Result<(), JaildError> {
-    if !req.allow_mlock || policy.mlock.allow_jails.iter().any(|n| n == &req.name) {
+    if !req.allow_mlock || policy.mlock.allow_jails.iter().any(|n| n == &req.name) || is_courier(req, policy) {
         return Ok(());
     }
     Err(JaildError::PolicyViolation {
@@ -430,7 +452,7 @@ fn validate_mount(m: &MountSpec, policy: &Policy) -> Result<(), JaildError> {
     Ok(())
 }
 
-fn validate_exec(exec: &ExecSpec, policy: &Policy, instance_root: bool) -> Result<(), JaildError> {
+fn validate_exec(exec: &ExecSpec, policy: &Policy, instance_root: bool, courier: bool) -> Result<(), JaildError> {
     if instance_root {
         /* A one-shot's entry: anywhere inside the verified tree it runs in —
          * but a plain absolute path. execve resolves it after jail_attach, so
@@ -458,7 +480,7 @@ fn validate_exec(exec: &ExecSpec, policy: &Policy, instance_root: bool) -> Resul
      * descriptors are jaild's to choose (a log file); letting any jail be
      * handed arbitrary descriptors would widen every service's surface for a
      * feature exactly one lane needs. */
-    if exec.stdio && !instance_root {
+    if exec.stdio && !instance_root && !courier {
         return Err(JaildError::PolicyViolation {
             rule:   "exec.stdio.not_instance",
             detail: "only a one-shot instance root may take the caller's stdio".into(),
@@ -745,6 +767,41 @@ mod tests {
                 Err(JaildError::PolicyViolation { rule: "exec.path.instance_invalid", .. }) => {}
                 other => panic!("{entry}: {other:?}"),
             }
+        }
+    }
+
+    /// Arca's couriers: exactly the policy's name, root, binary and uid
+    /// may take the caller's stdio and lock memory; any deviation is an
+    /// ordinary jail again, and refused.
+    #[test]
+    fn a_courier_jail_and_only_a_courier_jail() {
+        let p = load_sample_policy();
+        let courier = |name: &str, path: &str, exe: &str, uid: u32| {
+            let mut r = instance_req(name, path, exe, true);
+            r.allow_mlock = true;
+            let e = r.exec.as_mut().unwrap();
+            e.uid = uid;
+            e.gid = uid;
+            r
+        };
+        let ok = courier("system-arca-courier-64001", "/var/lib/atrium/jails/system-arca-courier-64001",
+                         "/usr/local/bin/atrium-arca-courier", 64001);
+        assert!(is_courier(&ok, &p));
+        validate_create(&ok, &p).expect("a courier jail");
+        for (r, why) in [
+            (courier("system-arca-courier-64001", "/var/lib/atrium/jails/system-arca-courier-64001",
+                     "/usr/local/bin/atrium-arca-courier", 64002), "uid not the name's"),
+            (courier("system-arca-courier-63999", "/var/lib/atrium/jails/system-arca-courier-63999",
+                     "/usr/local/bin/atrium-arca-courier", 63999), "uid below the range"),
+            (courier("system-arca-courier-64001", "/var/lib/atrium/jails/elsewhere",
+                     "/usr/local/bin/atrium-arca-courier", 64001), "another root"),
+            (courier("system-arca-courier-64001", "/var/lib/atrium/jails/system-arca-courier-64001",
+                     "/usr/local/bin/atrium-svc", 64001), "another binary"),
+            (courier("system-arca-courier-064001", "/var/lib/atrium/jails/system-arca-courier-064001",
+                     "/usr/local/bin/atrium-arca-courier", 64001), "a non-canonical name"),
+        ] {
+            assert!(!is_courier(&r, &p), "{why}");
+            assert!(validate_create(&r, &p).is_err(), "{why}");
         }
     }
 

@@ -29,3 +29,7 @@ tempfile = "3"
 [[example]]
 name = "courier-vm-probe"
 path = "examples/vm_probe.rs"
+
+[[example]]
+name = "courier-test-server"
+path = "examples/test_server.rs"

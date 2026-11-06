@@ -10,7 +10,7 @@
 //! arca-probe SOCK list
 //! arca-probe SOCK mint ACCOUNT              # ed25519; prints id and pubkey
 //! arca-probe SOCK sign ID MESSAGE
-//! arca-probe SOCK store-for HOST VALUE      # an API token for https://HOST
+//! arca-probe SOCK store-for HOST[:PORT] VALUE  # an API token for https://HOST[:PORT]
 //! arca-probe SOCK list-for HOST
 //! arca-probe - persona PUBHEX APP            # the app's courier persona
 //! arca-probe SOCK accounts USER PUBHEX APP # as arca-ui's uid: the chip's list
@@ -62,12 +62,14 @@ fn main() -> ExitCode {
             w.u16(4);
             w.u8(2);
             w.str("probe-token");
-            arcad::proto::write_endpoint(&mut w, arg(3), 443);
+            let (h, port) = host_port(arg(3));
+            arcad::proto::write_endpoint(&mut w, h, port);
             w.bytes(arg(4).as_bytes());
             call(sock, op::STORE_FOR, &w.buf)
         }
         "list-for" => {
-            arcad::proto::write_endpoint(&mut w, arg(3), 443);
+            let (h, port) = host_port(arg(3));
+            arcad::proto::write_endpoint(&mut w, h, port);
             call(sock, op::LIST_FOR, &w.buf)
         }
         "unlock" => {
@@ -118,4 +120,12 @@ fn main() -> ExitCode {
     };
     println!("status={st} body={}", hex(&body));
     ExitCode::SUCCESS
+}
+
+/// `host` or `host:port` (443 by default).
+fn host_port(a: &str) -> (&str, u16) {
+    match a.rsplit_once(':') {
+        Some((h, p)) => (h, p.parse().unwrap_or(443)),
+        None => (a, 443),
+    }
 }
