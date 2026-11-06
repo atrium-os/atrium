@@ -77,12 +77,13 @@ Each of these was found by reading the code, not the spec.
   serving with no deadline lane (bigger buffer, a warning), as it does today.
 - **choragusd** runs as `_choragus` in its own jail. It reads the launch registry and each
   user's `policy.toml` read-only, and keeps user volumes in its own state directory
-  (`/var/db/atrium/choragus/<user>.toml`, writable only by it). It listens on
-  `/atrium/sockets/audio/audio.sock` for apps and on `/atrium/sockets/audio-control/`
-  for the volume UI. One choragusd serves the seat. Per-session instances (architecture
+  (`/var/db/atrium/choragus/<user>.toml`, writable only by it). It listens for apps
+  on one socket per audio capability, `/atrium/sockets/{audio,audio-capture,audio-monitor}/`,
+  and on `/atrium/sockets/audio-control/` for the volume UI. One choragusd serves the seat. Per-session instances (architecture
   §7.1) come later; the seat gating it already does covers fast user switching.
-- **Apps** get `audio.sock` mounted into their jail when they hold `audio` (or `microphone`),
-  and never a device node. `apply_audio` and `apply_microphone` stop unhiding `dsp*`.
+- **Apps** get the socket directory for each audio capability they hold (`audio/` for
+  `audio`, `audio-capture/` for `microphone`, `audio-monitor/` for `audio-monitor`), and
+  never a device node.
 - **Restart.** If lyrad exits, choragusd sees its socket close and tells every app its
   streams are gone (`StreamLost`); the app opens new ones when lyrad is back. If choragusd
   exits, lyrad closes every stream it brokered (their control connection is gone), and
@@ -96,7 +97,10 @@ Each of these was found by reading the code, not the spec.
   `(user, app id)`. An uid not in the registry is refused. The hello string an app sends today
   is dropped from the wire. The current fallback that trusts it stays only behind a
   `--dev-trust-hello` flag for the host tests.
-- **May it play:** `audio` in the user's approved policy for that app. Recording later needs
+- **May it play:** `audio` in the user's approved policy for that app, *and* the
+  connection arrived on a socket that allows it. The socket an app reaches caps what it
+  may ask for, and the grant is checked as well, because some jails (session
+  components) see the whole socket tree. Recording later needs
   `microphone`, and tapping the mix needs `audio-monitor` (architecture §9). v1 is playback;
   the grant bits are checked at the door as they are now.
 - **Seat:** a stream whose user is not the active session is held at silence, as now.

@@ -11,7 +11,7 @@
 //!   boot()        → request jaild to launch vestibulum (the login UI), full-screen
 //!   authenticate  → (pam; stubbed here) credential → human uid
 //!   login(human)  → bind the seat (`portcullis_peer::seat`) + launch the session
-//!                   layer (forum-wm + forum-bar + forum-dock + choragus for GUI;
+//!                   layer (forum-wm + forum-bar + forum-dock for GUI;
 //!                   a zsh console-shell for CLI)
 //!   logout()      → tear the session down + unbind the seat → back to vestibulum
 //!
@@ -103,13 +103,15 @@ fn session_layer(human: &str, frontend: Frontend) -> Vec<LaunchSpec> {
     match frontend {
         // The Forum desktop, each component its own jailed app (forum.md §3): the
         // WM core (sole window-management) + the chrome (graphics + forum-control,
-        // never window-management) + audio. App-ids/caps match each component's
+        // never window-management). App-ids/caps match each component's
         // atrium.toml. The overview is launched on-demand, not at session start.
+        // Audio policy (choragusd) is a system service for the seat, not a
+        // per-human component (lyra-v1.md §3, decision 3): it gates each
+        // stream on the active session itself.
         Frontend::Gui => vec![
             spec("org.atrium.forum-wm", human, "forum-wm", &[], vec!["graphics", "window-management", "notify"]),
             spec("org.atrium.forum-bar", human, "forum-bar", &[], vec!["graphics", "forum-control"]),
             spec("org.atrium.forum-dock", human, "forum-dock", &[], vec!["graphics", "forum-control"]),
-            spec("org.atrium.choragus", human, "choragusd", &[], vec!["audio"]),
         ],
         // Display-down fallback: a login zsh in the human's session jail (the
         // decided shell; the jail is the boundary, not a custom shell). No Forum.
@@ -511,7 +513,8 @@ mod tests {
         o.login("alice", Frontend::Gui).unwrap();
         assert_eq!(o.active_human().as_deref(), Some("alice"), "seat bound to the human");
         let apps: Vec<_> = o.launcher.launched.iter().map(|s| s.app_id.as_str()).collect();
-        assert!(apps.contains(&"org.atrium.forum-wm") && apps.contains(&"org.atrium.choragus"));
+        assert!(apps.contains(&"org.atrium.forum-wm"));
+        assert!(!apps.contains(&"org.atrium.choragus"), "choragusd is a system service, not a session component");
         assert!(o.launcher.launched.iter().all(|s| s.owner == "alice"), "all run as the human");
     }
 

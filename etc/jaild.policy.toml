@@ -63,6 +63,12 @@ ro_paths = [
     # without the grant simply don't see the directory. See
     # docs/spec/aqueduct.md §6.1.
     "/var/run/atrium/caps/portcullisd/",
+    # The Portcullis launch registry (uid -> user, app id), one file, for
+    # services that name their peers by uid: choragusd, arcad.
+    "/var/run/atrium/app-registry",
+    # Users' approved grants (<user>/policy.toml, 0644), read by choragusd to
+    # check audio capabilities. The host identity key here is root 0600.
+    "/var/db/atrium",
 ]
 rw_paths = [
     # Aqueduct service-socket directory (all jails that talk to

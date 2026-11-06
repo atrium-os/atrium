@@ -72,24 +72,34 @@ fn no_device_capability_means_no_grants() {
     assert!(param(&jc, "exec.prestart").is_none(), "{:?}", jc.params);
 }
 
-/// ★★ `audio` and `microphone` grant Choragus's socket, never the codec
-/// (lyra-v1.md §3, decision 2). An app that could open /dev/dsp would bypass
-/// every audio check, and with `microphone` record with no one in between.
+/// ★★ `audio`, `microphone` and `audio-monitor` each grant one of choragusd's
+/// sockets, never the codec (lyra-v1.md §3, decision 2). An app that could open
+/// /dev/dsp would bypass every audio check, and with `microphone` record with no
+/// one in between.
 #[test]
-fn audio_and_microphone_get_the_socket_and_no_sound_device() {
-    for caps in ["audio = true\n", "microphone = true\n", "audio = true\nmicrophone = true\n"] {
+fn audio_capabilities_get_their_socket_and_no_sound_device() {
+    let sock = |jc: &portcullis_jail::JailConfig, name: &str| {
+        jc.mounts.iter().filter(|m| m.dst.ends_with(format!("atrium/sockets/{name}"))).count()
+    };
+    for (caps, want) in [
+        ("audio = true\n", ["audio"].as_slice()),
+        ("microphone = true\n", ["audio-capture"].as_slice()),
+        ("audio-monitor = true\n", ["audio-monitor"].as_slice()),
+        ("audio = true\nmicrophone = true\naudio-monitor = true\n", ["audio", "audio-capture", "audio-monitor"].as_slice()),
+    ] {
         let jc = build(&manifest(&format!("[capabilities]\n{caps}")), &opts()).expect("builds");
         if let Some(Value::String(pre)) = param(&jc, "exec.prestart") {
             assert!(!pre.contains("dsp") && !pre.contains("mixer"), "{caps}: {pre}");
         }
         let conf = jc.render_jail_conf();
         assert!(!conf.contains("dsp") && !conf.contains("mixer"), "{caps}: {conf}");
-        let audio_mounts: Vec<_> = jc.mounts.iter()
-            .filter(|m| m.dst.ends_with("atrium/sockets/audio"))
-            .collect();
-        assert_eq!(audio_mounts.len(), 1, "{caps}: exactly one audio socket dir mount, got {:?}", jc.mounts);
+        for name in ["audio", "audio-capture", "audio-monitor"] {
+            let n = sock(&jc, name);
+            assert_eq!(n, want.contains(&name) as usize, "{caps}: {name} mounted {n} times");
+        }
     }
-    // No audio capability: no audio socket.
     let jc = build(&manifest(""), &opts()).expect("builds");
-    assert!(!jc.mounts.iter().any(|m| m.dst.ends_with("atrium/sockets/audio")), "{:?}", jc.mounts);
+    for name in ["audio", "audio-capture", "audio-monitor"] {
+        assert_eq!(sock(&jc, name), 0, "no capability, no {name} socket");
+    }
 }

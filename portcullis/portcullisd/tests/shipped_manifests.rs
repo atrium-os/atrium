@@ -32,6 +32,7 @@ const MANIFEST_DIRS: &[&str] = &[
     "stoa/etc/services.d",
     "frescod/etc/services.d",
     "lyra/etc/services.d",
+    "choragus/etc/services.d",
 ];
 
 #[test]
@@ -90,4 +91,16 @@ fn lyrad_manifest_passes_the_shipped_policy_and_owns_the_audio_ruleset() {
     }
     let pin = p.devfs_rulesets.pin(24).expect("ruleset 24 is pinned");
     assert_eq!((pin.jail_name.as_str(), pin.uid), ("atrium-lyrad", 65016));
+}
+
+/// choragusd's manifest (lyra-v1.md §3) passes the shipped policy.
+#[test]
+fn choragusd_manifest_passes_the_shipped_policy() {
+    let p = policy();
+    let out = load_dir(&repo().join("choragus/etc/services.d")).expect("read choragus/etc/services.d");
+    assert!(out.errors.is_empty(), "unparseable: {:?}", out.errors);
+    let m = out.manifests.iter().find(|m| m.name == "atrium-choragusd").expect("atrium-choragusd manifest");
+    if let Err(e) = validate_create(&m.to_create_request(), &p) {
+        panic!("atrium-choragusd: jaild would refuse it: {e:?}");
+    }
 }

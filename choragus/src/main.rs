@@ -68,7 +68,32 @@ fn main() {
         // --seat: session-aware — only the active session's audio reaches the
         // engine; a seat switch (active-session change) makes the audio follow.
         let seat = args.iter().any(|a| a == "--seat");
-        daemon(app_sock, lyrad_sock, grants, pcull, reg, seat);
+        use choragus::app::{CAP_AUDIO, CAP_MICROPHONE, CAP_MONITOR};
+        // Development: one socket that allows everything; identity falls back
+        // to the hello when no registry is given.
+        daemon(&[(app_sock.to_string(), CAP_AUDIO | CAP_MICROPHONE | CAP_MONITOR)], lyrad_sock, grants, pcull, reg, seat, false);
+        return;
+    }
+
+    // --serve: the service (lyra-v1.md §3–4). Strict identity from the launch
+    // registry, grants from each user's Portcullis policy, seat-aware, and one
+    // socket per audio capability. Paths from the environment (jaild passes
+    // ATRIUM_* only):
+    //   ATRIUM_CHORAGUS_SOCKETS  socket root   (default /atrium/sockets)
+    //   ATRIUM_LYRAD_SOCK        lyrad         (default /atrium/sockets/lyrad/lyrad.sock)
+    //   ATRIUM_APP_REGISTRY      registry      (default /var/run/atrium/app-registry)
+    //   ATRIUM_POLICY_BASE       user policies (default /var/db/atrium)
+    if args.iter().any(|a| a == "--serve") {
+        let env = |k: &str, d: &str| std::env::var(k).unwrap_or_else(|_| d.to_string());
+        let root = env("ATRIUM_CHORAGUS_SOCKETS", "/atrium/sockets");
+        let lyrad = env("ATRIUM_LYRAD_SOCK", "/atrium/sockets/lyrad/lyrad.sock");
+        let reg = env("ATRIUM_APP_REGISTRY", portcullis_peer::DEFAULT_REGISTRY);
+        let base = env("ATRIUM_POLICY_BASE", "/var/db/atrium");
+        let listeners = choragus::identity::SOCKETS
+            .iter()
+            .map(|(name, caps)| (format!("{root}/{name}/{name}.sock"), *caps))
+            .collect::<Vec<_>>();
+        daemon(&listeners, &lyrad, None, Some(&base), Some(&reg), true, true);
         return;
     }
 
@@ -191,6 +216,8 @@ struct DState {
     /// If set, the Portcullis launch registry (`uid → (user, app-id)`): the app's
     /// identity is its dedicated uid via this binding, not its self-declared id.
     app_registry: Option<String>,
+    /// The service: identity only from the launch registry, never the hello.
+    strict: bool,
     /// Session-aware: only the ACTIVE session's audio reaches the engine. When on,
     /// a stream owned by a non-active session is muted; a seat switch follows.
     seat_aware: bool,
@@ -232,7 +259,7 @@ fn apply_seat(state: &std::sync::Mutex<DState>) {
 
 /// Handle one app connection: register/close streams; on disconnect, close any
 /// the app left open (crash safety — an app dying un-ducks everyone else).
-fn handle_app(mut app: std::os::unix::net::UnixStream, state: std::sync::Arc<std::sync::Mutex<DState>>) {
+fn handle_app(mut app: std::os::unix::net::UnixStream, state: std::sync::Arc<std::sync::Mutex<DState>>, socket_caps: u8) {
     use choragus::app::{cap_names, AppMsg, APP_FRAME_LEN, DENIED};
     use choragus::control::Ctl;
     use choragus::policy::{diff, Stream};
@@ -251,46 +278,25 @@ fn handle_app(mut app: std::os::unix::net::UnixStream, state: std::sync::Arc<std
     };
 
     // pull what we need from the daemon state, then do the IO unlocked.
-    let (reg_path, pcull_base) = {
+    let (reg_path, pcull_base, strict) = {
         let st = state.lock().unwrap();
-        (st.app_registry.clone(), st.portcullis_base.clone())
+        (st.app_registry.clone(), st.portcullis_base.clone(), st.strict)
     };
-
-    // Resolve the VERIFIED identity. With a Portcullis launch registry, the uid
-    // IS the identity: an app cannot get another app's grant by claiming its id.
-    let (app_id, user, granted): (String, String, u8) = match &reg_path {
-        Some(rp) => {
-            let reg = AppRegistry::load(rp).unwrap_or_default();
-            match reg.resolve(uid) {
-                Some((owner, verified)) => {
-                    if verified != claimed {
-                        eprintln!("choragusd: SPOOF? uid {uid} claimed '{claimed}' but Portcullis launched '{verified}' — using the verified id");
-                    }
-                    let g = match &pcull_base {
-                        Some(base) => GrantStore::load_portcullis(base, owner).granted(verified),
-                        None => state.lock().unwrap().grants.granted(verified),
-                    };
-                    (verified.to_string(), owner.to_string(), g)
-                }
-                None => {
-                    // not launched by Portcullis at a known uid → no verified
-                    // identity → default-deny everything.
-                    eprintln!("choragusd: uid {uid} not in the launch registry (claimed '{claimed}') — denying");
-                    (claimed.clone(), format!("uid{uid}"), 0)
-                }
-            }
-        }
-        None => {
-            // legacy: no registry, trust the hello; grant scoped to the
-            // getpeereid'd user.
-            let user = portcullis_peer::username(uid).unwrap_or_else(|| format!("uid{uid}"));
-            let g = match &pcull_base {
-                Some(base) => GrantStore::load_portcullis(base, &user).granted(&claimed),
-                None => state.lock().unwrap().grants.granted(&claimed),
-            };
-            (claimed.clone(), user, g)
-        }
+    // Resolve the VERIFIED identity (choragus::identity): the uid through the
+    // launch registry, the user's grant, capped by the socket reached.
+    let registry = reg_path.as_deref().map(|rp| AppRegistry::load(rp).unwrap_or_default());
+    let grant = |user: &str, app: &str| match &pcull_base {
+        Some(base) => GrantStore::load_portcullis(base, user).granted(app),
+        None => state.lock().unwrap().grants.granted(app),
     };
+    let Some(v) = choragus::identity::resolve(uid, &claimed, registry.as_ref(), strict, socket_caps, grant) else {
+        eprintln!("choragusd: uid {uid} not in the launch registry (claimed '{claimed}') — refused");
+        return;
+    };
+    if registry.is_some() && v.app_id != claimed && !claimed.is_empty() {
+        eprintln!("choragusd: uid {uid} claimed '{claimed}' but Portcullis launched '{}' — using the verified id", v.app_id);
+    }
+    let (app_id, user, granted) = (v.app_id, v.user, v.caps);
     eprintln!("choragusd: app '{app_id}' connected (peer uid={uid} user={user}, granted {:?})",
         choragus::app::cap_names(granted));
 
@@ -363,7 +369,7 @@ fn handle_app(mut app: std::os::unix::net::UnixStream, state: std::sync::Arc<std
     }
 }
 
-fn daemon(app_sock: &str, lyrad_sock: &str, grants_path: Option<&str>, portcullis_base: Option<&str>, app_registry: Option<&str>, seat_aware: bool) {
+fn daemon(listeners: &[(String, u8)], lyrad_sock: &str, grants_path: Option<&str>, portcullis_base: Option<&str>, app_registry: Option<&str>, seat_aware: bool, strict: bool) {
     use choragus::control::Conn;
     use choragus::grant::GrantStore;
     use std::os::unix::net::UnixListener;
@@ -399,8 +405,23 @@ fn daemon(app_sock: &str, lyrad_sock: &str, grants_path: Option<&str>, portculli
         portcullis_base: portcullis_base.map(String::from),
         app_registry: app_registry.map(String::from),
         seat_aware,
+        strict,
         stream_owner: std::collections::HashMap::new(),
     }));
+
+    // lyrad gone = every stream gone. Exit so the supervisor restarts us and
+    // every app sees its connection end (lyra-v1.md §3, Restart). Peek, under
+    // the state lock so no RingFor reply is in flight, for end-of-file.
+    {
+        let state = Arc::clone(&state);
+        std::thread::spawn(move || loop {
+            std::thread::sleep(std::time::Duration::from_millis(500));
+            if state.lock().unwrap().conn.peer_closed() {
+                eprintln!("choragusd: lyrad closed the connection; exiting so the supervisor restarts us");
+                std::process::exit(1);
+            }
+        });
+    }
 
     // Seat awareness: watch the active session and, on a switch, re-gate streams
     // so only the bound session's audio reaches the engine (a switch follows).
@@ -425,23 +446,35 @@ fn daemon(app_sock: &str, lyrad_sock: &str, grants_path: Option<&str>, portculli
         });
     }
 
-    let _ = std::fs::remove_file(app_sock);
-    let listener = match UnixListener::bind(app_sock) {
-        Ok(l) => l,
-        Err(e) => { eprintln!("choragusd: bind {app_sock}: {e}"); std::process::exit(1); }
-    };
-    // The front door must be reachable by every app's dedicated uid (each app
-    // runs as its own 50000+ uid). Connecting is not what authorizes — the peer's
-    // getpeereid identity + its grant are — so the socket itself is open to all.
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let _ = std::fs::set_permissions(app_sock, std::fs::Permissions::from_mode(0o666));
+    // One listener per socket. The front doors must be reachable by every
+    // app's dedicated uid; reaching one is not what authorizes (the peer's
+    // registry identity and its grant are), but each socket caps what a
+    // connection on it may ask for, and Portcullis mounts each socket's
+    // directory only into jails holding that capability.
+    let mut handles = Vec::new();
+    for (path, caps) in listeners {
+        let _ = std::fs::remove_file(path);
+        let listener = match UnixListener::bind(path) {
+            Ok(l) => l,
+            Err(e) => { eprintln!("choragusd: bind {path}: {e}"); std::process::exit(1); }
+        };
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o666));
+        }
+        eprintln!("choragusd: apps at {path} (allows {:?}), driving lyrad at {lyrad_sock}",
+            choragus::app::cap_names(*caps));
+        let (state, caps) = (Arc::clone(&state), *caps);
+        handles.push(std::thread::spawn(move || {
+            for app in listener.incoming() {
+                let app = match app { Ok(a) => a, Err(_) => continue };
+                let state = Arc::clone(&state);
+                std::thread::spawn(move || handle_app(app, state, caps));
+            }
+        }));
     }
-    eprintln!("choragusd: session daemon up — apps at {app_sock}, driving lyrad at {lyrad_sock}");
-    for app in listener.incoming() {
-        let app = match app { Ok(a) => a, Err(_) => continue };
-        let state = Arc::clone(&state);
-        std::thread::spawn(move || handle_app(app, state));
+    for h in handles {
+        let _ = h.join();
     }
 }
 

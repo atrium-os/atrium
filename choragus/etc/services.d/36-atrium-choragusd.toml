@@ -1,0 +1,67 @@
+# /etc/atrium/services.d/36-atrium-choragusd.toml
+#
+# The jailed launch of choragusd, Lyra's audio policy daemon and the one front
+# door apps use for sound (docs/spec/lyra-v1.md §3–4). Numbered 36: after lyrad
+# (35), which it connects to, and before the session.
+#
+# choragusd runs NON-ROOT (_choragus), one for the seat (decision 3): it gates
+# each stream on the active session itself. It sees no device. It:
+#   - binds one socket per audio capability under /atrium/sockets: audio/,
+#     audio-capture/, audio-monitor/. Portcullis mounts each directory only
+#     into jails holding that capability, so the socket caps what an app may
+#     ask for;
+#   - names each app by its peer uid through the launch registry (ro, one file)
+#     and refuses any uid the registry can't name;
+#   - reads each user's approved grants from /var/db/atrium/<user>/policy.toml
+#     (ro; the host identity key there is root 0600 and stays unreadable);
+#   - reads the seat's active session from /atrium/sockets/ostiarius/;
+#   - connects to lyrad at /atrium/sockets/lyrad/lyrad.sock (group _choragus).
+#
+# REQUIRES (commission once per host; scripts/lyra-service.sh does all of it):
+#   1. The _choragus (65017) system user; 65017 in jaild.policy allowed_system_uids.
+#   2. `install -d -o _choragus -g _choragus -m 0755 /atrium/sockets/{audio,audio-capture,audio-monitor}`.
+#   3. /var/db/atrium and /var/run/atrium/app-registry in jaild.policy ro_paths.
+#   4. The rootfs mountpoints: <path>/{dev,libexec,lib,usr/lib,usr/local/bin,
+#      atrium/sockets,var/db/atrium,var/run/atrium} and an empty file
+#      <path>/var/run/atrium/app-registry (the nullfs file mount point).
+
+enabled       = true
+name          = "atrium-choragusd"
+path          = "/var/lib/atrium/jails/choragusd"
+children_max  = 0
+devfs_ruleset = 4
+
+[[mounts]]
+source = "/libexec"
+dest   = "libexec"
+kind   = "ro_nullfs"
+[[mounts]]
+source = "/lib"
+dest   = "lib"
+kind   = "ro_nullfs"
+[[mounts]]
+source = "/usr/lib"
+dest   = "usr/lib"
+kind   = "ro_nullfs"
+[[mounts]]
+source = "/usr/local/bin"
+dest   = "usr/local/bin"
+kind   = "ro_nullfs"
+[[mounts]]
+source = "/atrium/sockets"                        # rw: binds audio*/ (dirs owned _choragus)
+dest   = "atrium/sockets"
+kind   = "rw_nullfs"
+[[mounts]]
+source = "/var/db/atrium"                         # ro: users' approved grants
+dest   = "var/db/atrium"
+kind   = "ro_nullfs"
+[[mounts]]
+source = "/var/run/atrium/app-registry"           # ro: who each app uid is (one file)
+dest   = "var/run/atrium/app-registry"
+kind   = "ro_nullfs"
+
+[exec]
+path = "/usr/local/bin/atrium-choragusd"
+argv = ["atrium-choragusd", "--serve"]
+uid  = 65017   # _choragus
+gid  = 65017

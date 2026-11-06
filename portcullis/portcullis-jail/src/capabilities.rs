@@ -33,8 +33,14 @@ pub fn apply_all(
     if caps.open_uri == Some(true) {
         apply_socket("broker.sock", jc, opts);
     }
-    if caps.audio == Some(true) || caps.microphone == Some(true) {
+    if caps.audio == Some(true) {
         apply_audio(jc, opts);
+    }
+    if caps.microphone == Some(true) {
+        apply_microphone(jc, opts);
+    }
+    if caps.audio_monitor == Some(true) {
+        apply_audio_monitor(jc, opts);
     }
     if let Some(paths) = &caps.filesystem {
         for p in paths {
@@ -150,18 +156,31 @@ pub fn apply_socket(name: &str, jc: &mut JailConfig, opts: &BuildOpts) {
     jc.add_mount(&src, &dst_in_jail, "nullfs", &["rw"]);
 }
 
-/// `audio` (and `microphone`): Choragus's socket directory, and nothing else.
+/// `audio`: choragusd's playback socket directory (`audio/`), and nothing else.
 ///
 /// ★★ No `/dev/dsp*` or `/dev/mixer*` in any app jail (lyra-v1.md §3,
 /// decision 2). Only lyrad holds the device. An app that could open the codec
 /// itself would bypass Choragus — its identity check, the
 /// `microphone`/`audio-monitor` split, ducking, per-app volume and the seat —
 /// and with `microphone` it could record with no one in between. Samples
-/// reach lyrad through the shared-memory ring Choragus brokers over this
-/// socket. Recording is a grant bit Choragus checks at the door, so
-/// `microphone` mounts the same socket.
+/// reach lyrad through the shared-memory ring Choragus brokers over the socket.
+///
+/// Each audio capability has its own socket directory, so the socket an app
+/// reaches caps what choragusd lets it do (choragus::identity), on top of the
+/// user's grant.
 pub fn apply_audio(jc: &mut JailConfig, opts: &BuildOpts) {
     apply_socket("audio.sock", jc, opts);
+}
+
+/// `microphone`: choragusd's capture socket (`audio-capture/`). No device node.
+pub fn apply_microphone(jc: &mut JailConfig, opts: &BuildOpts) {
+    apply_socket("audio-capture.sock", jc, opts);
+}
+
+/// `audio-monitor`: choragusd's monitor socket (`audio-monitor/`), the one way
+/// to hear the system mix or another app's stream.
+pub fn apply_audio_monitor(jc: &mut JailConfig, opts: &BuildOpts) {
+    apply_socket("audio-monitor.sock", jc, opts);
 }
 
 pub fn apply_filesystem(spec: &str, jc: &mut JailConfig, opts: &BuildOpts) -> Result<(), BuildError> {

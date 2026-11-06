@@ -48,6 +48,16 @@ impl Conn {
         self.send(Ctl::RingFor { stream })?;
         lyra_protocol::fdpass::recv_fd(self.0.as_raw_fd())
     }
+    /// Whether lyrad has closed the connection (a non-blocking peek reads end of
+    /// file). Call with no `ring_for` reply in flight.
+    pub fn peer_closed(&self) -> bool {
+        use std::os::fd::AsRawFd;
+        let mut b = [0u8; 1];
+        let n = unsafe {
+            libc::recv(self.0.as_raw_fd(), b.as_mut_ptr() as *mut _, 1, libc::MSG_PEEK | libc::MSG_DONTWAIT)
+        };
+        n == 0
+    }
     /// Send the changes from a desired-state diff (gains/routes).
     pub fn apply(&mut self, changes: &[Change]) -> std::io::Result<()> {
         for c in changes {

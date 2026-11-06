@@ -3033,10 +3033,14 @@ vssh "/root/lyra-play /tmp/choragus.sock comms 2 org.atrium.meet"
 vssh "/root/lyra-play /tmp/choragus.sock media 1 org.evil.spyware monitor"  # DENIED
 ```
 
-**As a jailed service** (non-root `_lyra`, the atrium_audio devfs ruleset 24,
-socket `/atrium/sockets/lyrad/lyrad.sock` reachable only by `_choragus`):
-`sh scripts/lyra-service.sh <lyrad>` commissions it, then
-atrium-portcullisd-bootstrap starts `lyra/etc/services.d/35-atrium-lyrad.toml`.
+**As jailed services** (lyra-v1.md §3): lyrad as `_lyra` with the atrium_audio
+devfs ruleset 24 and its socket `/atrium/sockets/lyrad/lyrad.sock` reachable only
+by `_choragus`; choragusd as `_choragus` with no device, `--serve`, apps at
+`/atrium/sockets/{audio,audio-capture,audio-monitor}/` (one per capability),
+identity only from `/var/run/atrium/app-registry`. `sh scripts/lyra-service.sh
+<lyrad> <choragusd>` commissions both, then atrium-portcullisd-bootstrap starts
+`lyra/etc/services.d/35-atrium-lyrad.toml` and
+`choragus/etc/services.d/36-atrium-choragusd.toml`.
 
 > **Verify the mix spectrally** (the wav capture is lossy): `LYRA_DUMP=/root/x.raw`
 > on lyrad writes the exact mixed i16 stereo; pull it over 9p and Goertzel at the
