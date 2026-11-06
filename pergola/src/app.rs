@@ -282,6 +282,13 @@ impl<V: View> App<V> {
         }
     }
 
+    /// `handle_event` for a press frescod minted `activation` for: the
+    /// handlers it reaches can spend it on a copy or paste
+    /// ([`crate::clipboard`]).
+    pub fn handle_event_activated(&mut self, event: Event, activation: Option<crate::clipboard::Token>) {
+        crate::clipboard::with_activation(activation, || self.handle_event(event));
+    }
+
     pub fn handle_event(&mut self, event: Event) {
         match &event {
             Event::PointerDown { at } => {

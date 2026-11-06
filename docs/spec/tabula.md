@@ -210,6 +210,18 @@ A drop nobody consumes within 1 s, or a cancelled drag, frees the payload.
 - A drag source and drop target API over §4.
 - A share button and share receiving (the share sheet is a powerbox, insula.md §5.2).
 
+### 6.1 As built (2026-11-06)
+
+`pergola::clipboard`: `copy_text` / `paste_text` spend the activation of the input event being
+dispatched (`App::handle_event_activated` scopes it; outside a dispatch there is none and nothing
+is sent), over a `Backend` that is Tabula's socket in production (`TABULA_SOCKET`, else
+`/atrium/sockets/clipboard.sock`). `TextField`: Ctrl/Cmd chords are commands and are never typed
+(they used to append the letter); Ctrl-C/X copy or cut the whole field (no selection yet); Ctrl-V
+appends `text/plain` with control characters dropped; a `secret` field never copies or cuts.
+Tested in `text_field.rs` and against the real server code in `pergola/tests/clipboard_tabula.rs`.
+Live use waits for frescod's tokens: `Window` passes none until fresco-client's press events
+carry `activation`.
+
 ## 7. Order of work
 
 1. frescod: `activation` on key and button presses, the token table, `ACTIVATION_CONSUME`

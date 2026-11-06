@@ -110,9 +110,37 @@ impl View for TextField {
         // Make the bg focusable + register key handler.
         ctx.focusable(bg_id);
         let content = self.content.clone();
+        let secret = self.secret;
         ctx.on_key(bg_id, move |ev| {
-            let Event::Key { kind, key, chars, .. } = ev else { return };
+            let Event::Key { kind, key, chars, modifiers } = ev else { return };
             if *kind != KeyEventKind::Down {
+                return;
+            }
+            // Ctrl/Cmd chords are commands, never text.
+            if modifiers.ctrl || modifiers.meta {
+                // The field has no selection yet: copy and cut take it all.
+                // A password field never lets its text out; it takes pastes.
+                match (key, chars.as_str()) {
+                    (Key::Char, "c" | "C") if !secret => {
+                        let _ = crate::clipboard::copy_text(&content.get_cloned(), false);
+                    }
+                    (Key::Char, "x" | "X") if !secret => {
+                        if crate::clipboard::copy_text(&content.get_cloned(), false).is_ok() {
+                            content.set(String::new());
+                        }
+                    }
+                    (Key::Char, "v" | "V") => {
+                        if let Ok(Some(t)) = crate::clipboard::paste_text() {
+                            // One line: control characters (a pasted newline,
+                            // an escape sequence) are dropped.
+                            let t: String = t.chars().filter(|c| !c.is_control()).collect();
+                            let mut s = content.get_cloned();
+                            s.push_str(&t);
+                            content.set(s);
+                        }
+                    }
+                    _ => {}
+                }
                 return;
             }
             match key {
@@ -139,3 +167,105 @@ impl View for TextField {
 // widgets.
 #[allow(dead_code)]
 fn _arc_keepalive() -> Arc<()> { Arc::new(()) }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::app::App;
+    use crate::clipboard::{self, Backend, Error, Token};
+    use crate::event::Modifiers;
+    use crate::geom::Point;
+    use std::cell::RefCell;
+    use std::rc::Rc;
+
+    /// What reached the clipboard, and what it holds.
+    #[derive(Default)]
+    struct Log { sets: Vec<(Token, String, bool)>, holds: Option<String> }
+
+    struct Mem(Rc<RefCell<Log>>);
+    impl Backend for Mem {
+        fn set(&mut self, token: Token, f: &[(&str, &[u8])], sensitive: bool) -> Result<(), Error> {
+            let t = String::from_utf8(f[0].1.to_vec()).unwrap();
+            let mut l = self.0.borrow_mut();
+            l.sets.push((token, t.clone(), sensitive));
+            l.holds = Some(t);
+            Ok(())
+        }
+        fn get(&mut self, _: Token, _: &[&str]) -> Result<Option<(String, Vec<u8>)>, Error> {
+            Ok(self.0.borrow().holds.clone().map(|t| ("text/plain".into(), t.into_bytes())))
+        }
+    }
+
+    struct Form { field: TextField }
+    impl View for Form {
+        fn render(&self, ctx: &mut Ctx) { self.field.render(ctx) }
+    }
+
+    fn setup(secret: bool, text: &str) -> (App<Form>, Mutable<String>, Rc<RefCell<Log>>) {
+        let log = Rc::new(RefCell::new(Log::default()));
+        clipboard::set_backend(Box::new(Mem(log.clone())));
+        let dirty = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let content = Mutable::with_dirty(text.to_string(), dirty.clone());
+        let field = TextField::new(content.clone()).width(200.0).secret(secret);
+        let mut app = App::new_with_flag(Form { field }, dirty);
+        app.tick();
+        // Focus it.
+        app.handle_event(Event::PointerDown { at: Point::new(10.0, 10.0) });
+        app.handle_event(Event::PointerUp { at: Point::new(10.0, 10.0) });
+        assert!(app.focused().is_some());
+        (app, content, log)
+    }
+
+    fn chord(c: &str) -> Event {
+        Event::Key { kind: KeyEventKind::Down, key: Key::Char, modifiers: Modifiers { ctrl: true, ..Default::default() }, chars: c.into() }
+    }
+
+    const T: Token = [3; 16];
+
+    #[test]
+    fn a_chord_is_never_typed() {
+        let (mut app, content, _) = setup(false, "ab");
+        app.handle_event(chord("c"));
+        assert_eq!(content.get_cloned(), "ab");
+    }
+
+    #[test]
+    fn copy_needs_the_press_that_asked_for_it() {
+        let (mut app, _, log) = setup(false, "hello");
+        app.handle_event(chord("c"));
+        assert!(log.borrow().sets.is_empty(), "no activation, nothing sent");
+        app.handle_event_activated(chord("c"), Some(T));
+        assert_eq!(log.borrow().sets, vec![(T, "hello".to_string(), false)]);
+        // Outside the dispatch the token is gone.
+        assert_eq!(clipboard::current_activation(), None);
+    }
+
+    #[test]
+    fn a_password_never_leaves_its_field() {
+        let (mut app, content, log) = setup(true, "hunter2");
+        app.handle_event_activated(chord("c"), Some(T));
+        app.handle_event_activated(chord("x"), Some(T));
+        assert!(log.borrow().sets.is_empty());
+        assert_eq!(content.get_cloned(), "hunter2");
+    }
+
+    #[test]
+    fn paste_is_one_line_of_text() {
+        let (mut app, content, log) = setup(false, "a");
+        log.borrow_mut().holds = Some("b\nc\u{1b}[2Jd".into());
+        app.handle_event_activated(chord("v"), Some(T));
+        // The newline and the escape are dropped; what is left is inert text.
+        assert_eq!(content.get_cloned(), "abc[2Jd");
+        // Without a gesture nothing is asked for.
+        app.handle_event(chord("v"));
+        assert_eq!(content.get_cloned(), "abc[2Jd");
+    }
+
+    #[test]
+    fn cut_empties_the_field() {
+        let (mut app, content, log) = setup(false, "move me");
+        app.handle_event_activated(chord("x"), Some(T));
+        assert_eq!(content.get_cloned(), "");
+        assert_eq!(log.borrow().holds.as_deref(), Some("move me"));
+    }
+}

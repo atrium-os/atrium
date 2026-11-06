@@ -23,6 +23,7 @@
 //! lands in phase 4 alongside the `Window` API.
 
 pub mod app;
+pub mod clipboard;
 pub mod color;
 pub mod event;
 pub mod geom;

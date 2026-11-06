@@ -184,7 +184,7 @@ impl Window {
                 }
                 self.window_event(&ev, app);
                 if let Some(pev) = translate(&ev) {
-                    app.handle_event(pev);
+                    app.handle_event_activated(pev, activation_of(&ev));
                 }
                 StepResult::Event(ev)
             }
@@ -230,7 +230,7 @@ impl Window {
                 }
                 self.window_event(&ev, app);
                 if let Some(pev) = translate(&ev) {
-                    app.handle_event(pev);
+                    app.handle_event_activated(pev, activation_of(&ev));
                 }
             }
 
@@ -249,3 +249,11 @@ pub enum StepResult {
     /// The server asked the window to close.
     Closed,
 }
+
+/// The activation token frescod minted for a press (tabula.md §2.1).
+/// fresco-client does not carry it yet (the Fresco thread adds the field
+/// to its key and button events); until then no press can copy or paste.
+fn activation_of(_ev: &fresco_client::Event) -> Option<crate::clipboard::Token> {
+    None
+}
+

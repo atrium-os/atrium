@@ -16,9 +16,16 @@ fresco-protocol = { path = "../fresco-protocol" }
 futures-signals = "0.3"
 log             = "0.4"
 taffy = "0.12.2"
+# The clipboard service's wire (docs/spec/tabula.md); Pergola is a client.
+tabula          = { path = "../tabula" }
+aqueduct        = { path = "../aqueduct" }
+serde           = { version = "1", features = ["derive"] }
+postcard        = { version = "1", features = ["use-std"] }
 
 [dev-dependencies]
 env_logger = "0.11"
+tempfile = "3"
+libc = "0.2"
 
 [[example]]
 name = "hello"
