@@ -228,3 +228,30 @@ fn tier2_scattered_and_whole_partial_rasters_match_full() {
         }
     }
 }
+
+/// An op's whole-pixel box (p3) is its clip: a rect whose box is cut down
+/// draws only inside it, in the reference and in Tier-2 alike.
+#[test]
+fn op_box_clips_in_reference_and_tier2() {
+    let dir = tempfile::tempdir().unwrap();
+    tier2::Tier2::seed_cache(dir.path()).expect("cranelift");
+    let t2 = tier2::Tier2::new(dir.path().to_path_buf(), "/nonexistent/atrium-spv-compile".into()).expect("tier2 load");
+    let s = Scene {
+        rects: vec![Rect { position: [2.0, 3.0], size: [40.0, 30.0], color: [1.0, 0.0, 0.0, 1.0], radius: 4.0 }],
+        ..Default::default()
+    };
+    let mut f = Frame::pack(&s, 48, 40, 48);
+    f.header.clear = TRANSPARENT;
+    let clip = [10.0, 12.0, 21.0, 19.0];
+    f.ops[0].p3 = clip;
+    let want = reference::render(&f);
+    for y in 0..40u32 {
+        for x in 0..48u32 {
+            let inside = (x as f32) >= clip[0] && (x as f32) < clip[2] && (y as f32) >= clip[1] && (y as f32) < clip[3];
+            assert_eq!(want[(y * 48 + x) as usize] >> 24 != 0, inside, "pixel {x},{y}");
+        }
+    }
+    let mut got = vec![0u32; f.target_words()];
+    t2.render(&f, &mut got).unwrap();
+    assert_eq!(got, want);
+}

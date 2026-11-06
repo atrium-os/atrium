@@ -6,7 +6,7 @@ use crate::{Frame, Op, KIND_PATH, KIND_RECT, KIND_TEXTURE, TILE};
 /// Branch counters (feature `coverage`): what a corpus actually exercised.
 pub mod coverage {
     /// The branches counted, by index.
-    pub const NAMES: [&str; 25] = [
+    pub const NAMES: [&str; 26] = [
         "bin: empty bbox",
         "bin: bbox clipped to the target",
         "bin: bbox inside the target",
@@ -32,6 +32,7 @@ pub mod coverage {
         "fill: gradient stops out of range",
         "fill: linear gradient",
         "fill: radial gradient",
+        "outside p3 (the op's whole-pixel box: its clip)",
     ];
     #[cfg(feature = "coverage")]
     static HITS: [std::sync::atomic::AtomicU64; NAMES.len()] =
@@ -239,6 +240,13 @@ fn fill_shade(f: &Frame, o: &Op, pc: [f32; 2]) -> [f32; 4] {
 
 /// One op's straight-alpha colour at pixel centre `pc`.
 pub fn shade(f: &Frame, o: &Op, pc: [f32; 2]) -> [f32; 4] {
+    // The op's whole-pixel box is also its clip: nothing is drawn outside
+    // it (an ordered compare, so a NaN box draws nothing).
+    let b = o.p3;
+    if !(pc[0] >= b[0] && pc[0] < b[2] && pc[1] >= b[1] && pc[1] < b[3]) {
+        hit(25);
+        return [0.0; 4];
+    }
     let kind = o.meta[0];
     if kind == crate::KIND_FILL {
         return fill_shade(f, o, pc);

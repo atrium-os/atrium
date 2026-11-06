@@ -6,7 +6,8 @@
 //       FILL: clip x0, y0, x1, y1
 //   p1  colour, linear RGB, straight alpha (RECT, PATH, GLYPH)
 //   p2  RECT: radius.  PATH: cos, sin.  GLYPH: atlas u0, v0, u1, v1
-//   p3  bounding box x0, y0, x1, y1 in whole pixels (x1/y1 exclusive)
+//   p3  bounding box x0, y0, x1, y1 in whole pixels (x1/y1 exclusive); also
+//       the op's clip: raster draws nothing outside it
 //   p4  as uint bits: kind, texture index (FILL: its block's first texel word), 0, 0
 // The buffers are flat arrays indexed by hand: the Tier-2 frontend takes a
 // dynamic index only as the last step into a runtime array.

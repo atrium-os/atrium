@@ -214,7 +214,13 @@ vec4 shade(uint oi, vec2 pc) {
     vec4 p0 = opv[base];
     vec4 p1 = opv[base + 1u];
     vec4 p2 = opv[base + 2u];
+    vec4 p3 = opv[base + 3u];
     uvec4 meta = floatBitsToUint(opv[base + 4u]);
+    // The op's whole-pixel box is also its clip (ordered compares: a NaN
+    // box draws nothing).
+    if (!(pc.x >= p3.x && pc.x < p3.z && pc.y >= p3.y && pc.y < p3.w)) {
+        return vec4(0.0);
+    }
     uint kind = meta.x;
     if (kind == KIND_FILL) {
         return fill_shade(p0, p1, meta.y, pc);
