@@ -25,6 +25,7 @@
 pub mod app;
 pub mod clipboard;
 pub mod color;
+pub mod embed;
 pub mod event;
 pub mod geom;
 pub mod icon;
