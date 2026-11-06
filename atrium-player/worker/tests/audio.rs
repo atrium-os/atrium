@@ -41,6 +41,8 @@ struct Heard {
     flushes: u32,
     volume: Option<f32>,
     starts: u32,
+    /// (stream frame, index into `samples`) at each read.
+    marks: Vec<(u64, usize)>,
 }
 
 /// One app, one stream; the ring is drained at the stream's rate while it
@@ -91,6 +93,8 @@ fn fake_choragus(tag: &str) -> (String, Arc<Mutex<Heard>>) {
                     ToChoragus::Pause { .. } => playing = false,
                     ToChoragus::Flush { stream: s } => {
                         if let Some((_, cons, ..)) = stream.as_ref() {
+                            // A slow answer, as from a busy choragusd.
+                            std::thread::sleep(Duration::from_millis(150));
                             let pos = cons.discard();
                             h.lock().unwrap().flushes += 1;
                             wire::send(&mut c, &ToApp::Flushed { stream: s, frame: pos }).unwrap();
@@ -108,8 +112,11 @@ fn fake_choragus(tag: &str) -> (String, Arc<Mutex<Heard>>) {
                     if due > 0 {
                         last = Instant::now();
                         let mut out = vec![0f32; due * ch];
+                        let at = cons.consumed();
                         let got = cons.read(&mut out) as usize * ch;
                         let mut g = h.lock().unwrap();
+                        let len = g.samples.len();
+                        g.marks.push((at, len));
                         g.samples.extend_from_slice(&out[..got]);
                         g.log.push((Instant::now(), cons.consumed()));
                     }
@@ -264,4 +271,31 @@ fn a_faster_rate_plays_shorter_and_the_clock_runs_faster() {
     s.run(Duration::from_secs(8), &heard, short - 48_000 / 10);
     let got = heard.lock().unwrap().samples.len();
     assert!((got as f64 - short as f64).abs() < 0.02 * short as f64 + 4_000.0, "{got} samples heard, want about {short}");
+}
+
+#[test]
+fn quick_seeks_one_after_another_end_with_sound_and_clock_at_the_last_target() {
+    let want = reference_pcm("vp9-opus.webm");
+    let (sock, heard) = fake_choragus("quick");
+    let mut s = Session::new("vp9-opus.webm", sock);
+    s.run(Duration::from_millis(500), &heard, 0);
+    // Far right, let a little play, then straight back, then once more.
+    for (to, ms) in [(1_800_000_000i64, 200u64), (300_000_000, 0), (900_000_000, 200), (500_000_000, 0)] {
+        s.p.seek(to);
+        s.a.as_mut().unwrap().seek(to);
+        s.run(Duration::from_millis(ms), &heard, 0);
+    }
+    s.run(Duration::from_secs(5), &heard, 0);
+    let a = s.a.as_ref().unwrap();
+    let (frame0, media0) = a.anchor().expect("a run after the seeks");
+    assert!((500_000_000..501_000_000).contains(&media0), "the run starts at the last target ({media0})");
+    // What is heard from the anchor's frame on is the clip from the target.
+    let g = heard.lock().unwrap();
+    let &(f, i) = g.marks.iter().rev().find(|(f, _)| *f <= frame0).expect("heard from the anchor");
+    // (The clip is mono.)
+    let got = &g.samples[i + (frame0 - f) as usize..];
+    let start = (media0 as i128 * 48_000 / 1_000_000_000) as usize;
+    // Within WebM's millisecond timestamps of the target.
+    assert!(got.len().abs_diff(want.len() - start) <= 48, "the rest of the clip, once: {} frames, want {}", got.len(), want.len() - start);
+    assert!(got == &want[want.len() - got.len()..], "the stream frame the clock anchors starts the rest of the clip");
 }

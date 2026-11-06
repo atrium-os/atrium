@@ -55,8 +55,10 @@ pub struct AudioOut {
     anchor: Option<(u64, i64)>,
     /// Media time just after the last frame written.
     written_until: Option<i64>,
-    /// Waiting for `Flushed` after a seek: write nothing.
-    flushing: bool,
+    /// `Flushed` answers still to come, one per seek: write nothing until
+    /// the last, or frames written after an earlier answer would be thrown
+    /// away by a later flush and the anchor would point at the wrong frame.
+    flushing: u32,
     /// PCM before this media time is dropped (a seek's pre-roll).
     from_ns: Option<i64>,
     playing: bool,
@@ -86,7 +88,7 @@ impl AudioOut {
             next_frame: 0,
             anchor: None,
             written_until: None,
-            flushing: false,
+            flushing: 0,
             from_ns: None,
             playing: false,
             started: false,
@@ -119,7 +121,7 @@ impl AudioOut {
             self.lost |= self.client.pause(&self.stream).is_err();
         }
         self.lost |= self.client.flush(&self.stream).is_err();
-        self.flushing = true;
+        self.flushing += 1;
         self.anchor = None;
         self.written_until = None;
         self.from_ns = Some(to_ns);
@@ -159,7 +161,7 @@ impl AudioOut {
             match self.client.try_event() {
                 Ok(Some(ToApp::Flushed { frame, .. })) => {
                     self.next_frame = frame;
-                    self.flushing = false;
+                    self.flushing = self.flushing.saturating_sub(1);
                 }
                 Ok(Some(ToApp::Underrun { frames, .. })) => self.underruns += frames,
                 Ok(Some(ToApp::Drained { .. })) => self.drained = self.drain_sent,
@@ -171,7 +173,7 @@ impl AudioOut {
                 Ok(None) => break,
             }
         }
-        if self.lost || self.flushing {
+        if self.lost || self.flushing > 0 {
             return !self.lost;
         }
         let ch = self.channels;
