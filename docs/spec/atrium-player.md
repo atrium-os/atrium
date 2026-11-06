@@ -213,14 +213,27 @@ Fresco's layers land.
   supervisor, and fixed 32-byte records back. Layer buffers and the PCM ring are shared
   memory. The worker announces the video track only after decoding its first picture, so
   the bit depth (NV12 or P010) is known before buffers are made. `atrium-player --headless`
-  plays a file or a feed and prints frame hashes.
+  plays a file or a feed and prints frame hashes. The worker's descriptors are narrowed with
+  `cap_rights_limit` (a78962b).
+- M3 on FreeBSD (16-CURRENT arm64 VM): in capability mode the worker cannot open or connect.
+  Capsicum allows `fork`, so the worker also sets `RLIMIT_NPROC` to 0 before `cap_enter`;
+  root is exempt from that limit, so the worker must run unprivileged (it does in the jail).
+  Every clip, loaded or fed, gives the same layer hashes as on Linux and as ffmpeg.
+- M4: `player/src/fresco_sink.rs`. The video goes into a Fresco video layer under a
+  transparent window, letterboxed, with each frame's `present_ns` taken from a monotonic
+  clock (audio takes over as the master in M6). `VideoReleased` returns buffers to the
+  worker, and `VideoPresented` gives the skew. `atrium-player FILE` plays in a window; in the
+  VM's headless frescod, `red-blue.webm` shows red and then blue, scaled 2x into the window.
+  Headless frescod captures at most every 200 ms under TCG, so most frames are counted as
+  dropped there, and the skew it reports is the capture's, not the player's.
 - Test clips and reference hashes are made by `scripts/media-test-clips.sh` into
   `test-assets/media/` (ffmpeg, a dev tool). Every clip's decoded frames, and what lands in
   the layer buffers, match ffmpeg's `framemd5` exactly.
 - Known gaps: a WebM with its Cues at the end can only seek within what is read ahead,
   otherwise it reads again from the start and drops frames up to the target (reading Cues
-  through the SeekHead is an M7 item). Descriptor rights inside the sandbox
-  (`cap_rights_limit`) are not narrowed yet.
+  through the SeekHead is an M7 item). The stream's colour info isn't read yet, so the layer
+  keeps Fresco's default (BT.709 limited); `video_layer_color` from the decoder's colour
+  info is an M7 item.
 
 **Tests along the way:**
 - every demuxer limit has a test with a crafted file that exceeds it;

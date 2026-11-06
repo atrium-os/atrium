@@ -215,7 +215,13 @@ fn the_worker_is_sandboxed() {
     assert_eq!(sandboxed, cfg!(target_os = "freebsd"));
     let refused = probed.expect("probe answered");
     if cfg!(target_os = "freebsd") {
-        assert_eq!(refused, 7, "open, connect and fork all refused");
+        assert_eq!(refused & 3, 3, "open and connect refused");
+        // RLIMIT_NPROC stops fork, but root is exempt from it; the jail
+        // never runs the worker as root.
+        #[allow(unsafe_code)]
+        // SAFETY: plain syscall.
+        let root = unsafe { libc::geteuid() } == 0;
+        assert_eq!(refused & 4 != 0, !root, "fork refused unless root");
     } else {
         assert_eq!(refused & 1, 0, "unsandboxed can open");
     }

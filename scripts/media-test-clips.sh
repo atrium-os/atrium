@@ -18,6 +18,9 @@ $ff $src -pix_fmt yuv420p10le -c:v libvpx-vp9 -profile:v 2 -b:v 200k -g 24 -an v
 $ff $src -c:v libaom-av1 -cpu-used 8 -b:v 200k -g 24 -c:a libopus -b:a 48k -strict -2 av1-opus.mp4
 $ff $src -c:v libvpx-vp9 -b:v 200k -g 24 -c:a libopus -b:a 48k -strict -2 \
     -movflags frag_keyframe+empty_moov+default_base_moof vp9-opus-frag.mp4
+# Colour fields for the on-screen check (atrium-player M4): 1 s red, then 1 s blue.
+$ff -f lavfi -i color=c=red:s=160x96:r=24:d=1 -f lavfi -i color=c=blue:s=160x96:r=24:d=1 \
+    -filter_complex '[0][1]concat=n=2:v=1:a=0' -c:v libvpx-vp9 -b:v 100k -g 24 red-blue.webm
 # Reference hashes of every decoded frame (planar, as the decoder outputs).
 for f in *.webm *.mp4; do
     $ff -i "$f" -map 0:v -f framemd5 "$f.video.framemd5"

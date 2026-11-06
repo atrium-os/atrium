@@ -119,7 +119,7 @@ fn main() {
         eprintln!("atrium-player-decode: cap_rights_limit: {e}");
         std::process::exit(1);
     }
-    if let Err(e) = sys::limit_memory(mem) {
+    if let Err(e) = sys::limit_resources(mem) {
         eprintln!("atrium-player-decode: rlimit: {e}");
         std::process::exit(1);
     }

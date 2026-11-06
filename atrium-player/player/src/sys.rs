@@ -205,11 +205,24 @@ pub unsafe fn adopt(fd: RawFd) -> OwnedFd {
 }
 
 /// Cap the process's address space (worker setup, before the sandbox).
-pub fn limit_memory(bytes: u64) -> io::Result<()> {
+pub fn limit_resources(bytes: u64) -> io::Result<()> {
     let r = libc::rlimit { rlim_cur: bytes as _, rlim_max: bytes as _ };
     // SAFETY: plain syscall.
     if unsafe { libc::setrlimit(libc::RLIMIT_AS, &r) } != 0 {
         return Err(io::Error::last_os_error());
+    }
+    // Capsicum allows fork(): a child stays in capability mode, but could
+    // still spin up processes. No new processes at all, then. FreeBSD
+    // counts processes, not threads, against this, so the decoders' threads
+    // are unaffected (Linux counts threads, so it is FreeBSD only). Root is
+    // exempt, which is why the jail also runs us unprivileged.
+    #[cfg(target_os = "freebsd")]
+    {
+        let none = libc::rlimit { rlim_cur: 0, rlim_max: 0 };
+        // SAFETY: plain syscall.
+        if unsafe { libc::setrlimit(libc::RLIMIT_NPROC, &none) } != 0 {
+            return Err(io::Error::last_os_error());
+        }
     }
     Ok(())
 }

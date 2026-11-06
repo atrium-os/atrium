@@ -16,6 +16,8 @@ path = "src/bin/atrium-player.rs"
 
 [dependencies]
 libc     = "0.2"
+fresco-client   = { path = "../../fresco-client" }
+fresco-protocol = { path = "../../fresco-protocol" }
 serde    = { version = "1", features = ["derive"] }
 postcard = { version = "1", features = ["use-std"] }
 # --headless prints frame hashes comparable with ffmpeg's framemd5.

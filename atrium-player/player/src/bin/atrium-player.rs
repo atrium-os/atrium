@@ -9,17 +9,20 @@
 use std::fs::File;
 use std::time::Duration;
 
+use atrium_player::fresco_sink::FrescoSink;
 use atrium_player::supervisor::{LocalSink, Options, Player, PlayerEvent, Source};
 use md5::{Digest, Md5};
 
 fn usage() -> ! {
-    eprintln!("usage: atrium-player --headless [--feed] [--seek SECS] [--probe-sandbox] [--kill-worker-after N] FILE...");
+    eprintln!("usage: atrium-player [--size WxH] [--exit-at-end] FILE");
+    eprintln!("       atrium-player --headless [--feed] [--seek SECS] [--probe-sandbox] [--kill-worker-after N] FILE...");
     std::process::exit(2);
 }
 
 fn main() {
     let mut args = std::env::args().skip(1);
     let (mut headless, mut feed, mut seek, mut probe, mut kill_after) = (false, false, None, false, None);
+    let (mut exit_at_end, mut size) = (false, (640u32, 360u32));
     let mut files = Vec::new();
     while let Some(a) = args.next() {
         match a.as_str() {
@@ -28,13 +31,22 @@ fn main() {
             "--seek" => seek = args.next().and_then(|v| v.parse::<f64>().ok()),
             "--probe-sandbox" => probe = true,
             "--kill-worker-after" => kill_after = args.next().and_then(|v| v.parse::<usize>().ok()),
+            "--exit-at-end" => exit_at_end = true,
+            "--size" => {
+                size = args
+                    .next()
+                    .and_then(|v| v.split_once('x').and_then(|(w, h)| Some((w.parse().ok()?, h.parse().ok()?))))
+                    .unwrap_or_else(|| usage())
+            }
             "-h" | "--help" => usage(),
             _ => files.push(a),
         }
     }
-    if !headless || files.is_empty() {
-        // The windowed player (Limen child, Fresco layer) is M4 and M5.
+    if files.is_empty() {
         usage();
+    }
+    if !headless {
+        return windowed(&files[0], exit_at_end, size);
     }
     let sink = LocalSink::new(Box::new(|bytes, pts| println!("video {pts} {:x}", Md5::digest(bytes))));
     let source = if feed {
@@ -141,4 +153,67 @@ fn main() {
             }
         }
     }
+}
+
+/// Play `file` in a window of its own, the video in a Fresco layer under a
+/// transparent window (M4; the controls and the Limen embedding are M5).
+fn windowed(file: &str, exit_at_end: bool, size: (u32, u32)) {
+    let f = File::open(file).unwrap_or_else(|e| {
+        eprintln!("{file}: {e}");
+        std::process::exit(1)
+    });
+    let mut conn = fresco_client::Connection::connect_default().unwrap_or_else(|e| {
+        eprintln!("atrium-player: connecting to frescod: {e}");
+        std::process::exit(1)
+    });
+    let title = std::path::Path::new(file).file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+    let win = conn.window_create(size.0, size.1, title, fresco_protocol::WindowHints::default()).unwrap_or_else(|e| {
+        eprintln!("atrium-player: window: {e}");
+        std::process::exit(1)
+    });
+    conn.set_default_window(win as u16);
+    // An empty scene: every pixel transparent, so the layer under it shows.
+    let _ = conn.scene_frame_begin().and_then(|_| conn.scene_frame_end());
+    let sink = FrescoSink::new(conn, win, size);
+    let mut p = Player::new(Options::default(), sink, Source::File(f)).unwrap_or_else(|e| {
+        eprintln!("atrium-player: starting the decode worker: {e}");
+        std::process::exit(1)
+    });
+    let (mut frames, mut ended_at) = (0u32, None);
+    let mut pcm = vec![0f32; 48_000 * 2];
+    loop {
+        while let Some(ev) = p.poll(Duration::from_millis(1)) {
+            match ev {
+                PlayerEvent::VideoTrack { width, height, bit_depth } => println!("video-track {width}x{height} {bit_depth}-bit"),
+                PlayerEvent::Frame { .. } => frames += 1,
+                PlayerEvent::Ended => ended_at = Some(std::time::Instant::now()),
+                PlayerEvent::Error(c) => {
+                    println!("error {c}");
+                    std::process::exit(3);
+                }
+                _ => {}
+            }
+        }
+        // Audio waits for Lyra (M6): drop it so the worker keeps going.
+        while p.read_pcm(&mut pcm).0 > 0 {}
+        let released = match p.sink.pump(Duration::from_millis(4)) {
+            Ok(r) => r,
+            Err(e) => {
+                eprintln!("atrium-player: frescod: {e}");
+                std::process::exit(1);
+            }
+        };
+        for i in released {
+            p.release(i);
+        }
+        if p.sink.closed {
+            break;
+        }
+        if exit_at_end && ended_at.is_some_and(|t| t.elapsed() > Duration::from_millis(500)) {
+            break;
+        }
+    }
+    let s = p.sink.stats.clone();
+    let mean = if s.presented > 0 { s.skew_sum / s.presented as i64 } else { 0 };
+    println!("frames {frames} presented {} dropped {} skew mean {:.2} ms max {:.2} ms", s.presented, s.dropped, mean as f64 / 1e6, s.skew_max as f64 / 1e6);
 }
