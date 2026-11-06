@@ -1,0 +1,28 @@
+#!/bin/sh
+# Make atrium-player's test clips and ffmpeg's reference frame hashes.
+# ffmpeg is a dev tool here, never shipped (LICENSING-POLICY.md: tools).
+# Usage: sh scripts/media-test-clips.sh [outdir]   (default test-assets/media)
+set -eu
+out=${1:-$(dirname "$0")/../test-assets/media}
+mkdir -p "$out"
+cd "$out"
+ff="ffmpeg -hide_banner -loglevel error -y"
+src="-f lavfi -i testsrc2=size=160x90:rate=24:duration=2 -f lavfi -i sine=frequency=440:sample_rate=48000:duration=2"
+# WebM: the codecs YouTube serves.
+$ff $src -c:v libvpx-vp9 -b:v 200k -g 24 -c:a libopus -b:a 48k vp9-opus.webm
+$ff $src -c:v libaom-av1 -cpu-used 8 -b:v 200k -g 24 -c:a libopus -b:a 48k av1-opus.webm
+$ff $src -c:v libvpx -b:v 200k -g 24 -c:a libvorbis -q:a 2 vp8-vorbis.webm
+# 10-bit (P010 path).
+$ff $src -pix_fmt yuv420p10le -c:v libvpx-vp9 -profile:v 2 -b:v 200k -g 24 -an vp9-10bit.webm
+# MP4: plain (moov sample tables) and fragmented (what MSE feeds use).
+$ff $src -c:v libaom-av1 -cpu-used 8 -b:v 200k -g 24 -c:a libopus -b:a 48k -strict -2 av1-opus.mp4
+$ff $src -c:v libvpx-vp9 -b:v 200k -g 24 -c:a libopus -b:a 48k -strict -2 \
+    -movflags frag_keyframe+empty_moov+default_base_moof vp9-opus-frag.mp4
+# Reference hashes of every decoded frame (planar, as the decoder outputs).
+for f in *.webm *.mp4; do
+    $ff -i "$f" -map 0:v -f framemd5 "$f.video.framemd5"
+    # The video packets as the container states them: pts (s), key flag.
+    ffprobe -v error -select_streams v -show_entries packet=pts_time,flags -of csv=p=0 "$f" \
+        > "$f.video.packets"
+done
+ls -l

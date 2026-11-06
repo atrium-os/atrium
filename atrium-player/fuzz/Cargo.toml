@@ -1,0 +1,30 @@
+[package]
+name = "atrium-player-fuzz"
+version = "0.0.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+publish = false
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+atrium-media-demux = { path = "../demux" }
+
+# Not part of the player's workspace: cargo-fuzz builds it on its own.
+[workspace]
+
+[[bin]]
+name = "webm"
+path = "fuzz_targets/webm.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "mp4"
+path = "fuzz_targets/mp4.rs"
+test = false
+doc = false
+bench = false
