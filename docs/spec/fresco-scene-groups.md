@@ -235,6 +235,12 @@ document that is one table (one band); overlapping opacity groups 481 of 687, in
 documents; rotated text or images none; leaves outside their band 8,801 in 40 documents, about
 a quarter of their per-band entries in a band's group in place, the rest in the overlay.
 
+What follows: `ISOLATE` (§7 step 5) is needed, not optional, since multiplied alpha is wrong for
+most of those 481; bitmaps stand in until it lands. No rotation work is needed for now. The
+4,096 limit stays: for the one document over it (one table, one band, so evicting bands doesn't
+help), the worker merges run groups whose clip and transform are the band's own into the band
+group when a band would pass the limit.
+
 So DocumentView in a Pergola window and the Navigator's own surface send the same nodes, and a
 native control inside a document is a Pergola widget subtree under the document's group.
 
