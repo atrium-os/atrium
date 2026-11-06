@@ -1,6 +1,6 @@
 # atrium-player: picture-in-picture, media keys and now-playing
 
-Status: **proposal**, 2026-11-06. Owner: the media player thread (P1, atrium-player.md §7).
+Status: **accepted** by Shankar, 2026-11-06 (all four §7 recommendations). Owner: the media player thread (P1, atrium-player.md §7).
 It needs work from Forum (forum-wm, forum-ctl), limend, frescod and choragusd. §7 lists the
 decisions for Shankar.
 
@@ -168,7 +168,7 @@ screen is public. Controls work without unlocking: play, pause, next, previous.
    intents, then limend's request path, then the player's button and small layout.
 5. **Lock screen** controls.
 
-## 7. Decisions for Shankar
+## 7. Decisions (accepted 2026-11-06: all four as recommended)
 
 1. **Where the media-session registry lives.** *Recommend choragusd* (§4.1). The other
    choice is forum-wm.

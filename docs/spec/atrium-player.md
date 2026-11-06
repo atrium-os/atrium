@@ -180,7 +180,7 @@ The policy is the one Lyra's spec settled (§12.1).
   slot into a small floating window, and back. It needs a Limen message pair and Forum
   support. Media keys need an input route from Forum to "the playing media". Both are listed
   as later steps with their owners, because they are not the player's code alone.
-  The design is [atrium-player-pip-keys.md](atrium-player-pip-keys.md) (proposal).
+  The design is [atrium-player-pip-keys.md](atrium-player-pip-keys.md) (accepted 2026-11-06).
 
 ## 8. Build plan
 
