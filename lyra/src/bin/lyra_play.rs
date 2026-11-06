@@ -68,6 +68,15 @@ fn main() {
             let w = s.write(&buf[off * ch..]) as usize;
             off += w;
             if w == 0 {
+                // The ring is full: a moment to hear from choragusd.
+                match c.try_event() {
+                    Ok(Some(ToApp::StreamLost { .. })) | Err(_) => {
+                        eprintln!("lyra-play: stream lost");
+                        std::process::exit(2);
+                    }
+                    Ok(Some(ToApp::Underrun { frames, .. })) => eprintln!("lyra-play: underrun, {frames} frames"),
+                    _ => {}
+                }
                 if !started {
                     // ring primed: start playing.
                     let _ = c.start(&s);

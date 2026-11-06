@@ -15,11 +15,15 @@
 #   TESSERA_ROOT=1 sh scripts/cloud-vm.sh up   # boot from $VMDIR/devroot.img
 #   sh scripts/cloud-vm.sh down      # clean poweroff
 #   sh scripts/cloud-vm.sh e2e       # navigator-jail-e2e.sh --quick on a synthetic page
+#   sh scripts/cloud-vm.sh lyra      # lyra-vm-check.sh (boot with its qemu-args for sound)
 #   . scripts/cloud-vm.sh env        # (sourced) export CROSS_RUSTFLAGS for cross-builds
 #
 # ARCH=aarch64 (default) or ARCH=amd64 picks the guest. amd64 is the x86_64
 # port's VM (docs/spec/x86_64-port.md): q35 + OVMF, still TCG here; on a host
 # with /dev/kvm (the R9700 box) it uses KVM automatically.
+#
+# QEMU_EXTRA=<args> is appended to QEMU's command line (e.g. the sound card
+# scripts/lyra-vm-check.sh asks for).
 #
 # NETDEV_EXTRA=<opts> is appended to the slirp -netdev (e.g. net=, guestfwd=).
 # scripts/navigator-fetch-vm-check.sh uses it to put a hermetic "public"
@@ -137,7 +141,7 @@ boot() {
         -drive if=pflash,format=raw,unit=1,file="$VMDIR/vars.fd" \
         $DISKS \
         -netdev user,id=net0,hostfwd=tcp:127.0.0.1:2222-:22${NETDEV_EXTRA:+,$NETDEV_EXTRA} -device virtio-net-pci,netdev=net0 \
-        $GPUSIM_ARGS \
+        $GPUSIM_ARGS ${QEMU_EXTRA:-} \
         -display none \
         -serial unix:"$VMDIR/serial.sock",server,nowait \
         -monitor unix:"$VMDIR/mon.sock",server,nowait \
@@ -263,6 +267,7 @@ case "${1:-}" in
                sleep 3
            done; echo "  down" ;;
     e2e)   e2e ;;
+    lyra)  cross_env; sh "$ROOT/scripts/lyra-vm-check.sh" ;;
     env)   cross_env ;;
     *)     sed -n '2,20p' "$0"; exit 2 ;;
 esac

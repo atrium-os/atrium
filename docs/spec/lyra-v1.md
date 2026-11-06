@@ -253,6 +253,12 @@ Host tests run on Linux in the cloud; the rest run in the arm64 or amd64 VM with
 7. **Restart** (VM): kill lyrad while two apps play; both get `StreamLost`, reopen, and play
    again when the supervisor restarts it.
 
+**Run so far (2026-11-06, cloud arm64 VM under QEMU TCG, `scripts/lyra-vm-check.sh`):**
+2, 4, 5 and 7 pass (the turned-down app −12.0 dB, the other 0.0 dB; media ducked −18.0 dB
+and back; the 1 kHz tone unchanged beside the hostile stream, nothing else above −76 dBFS,
+no clipping; restart in one try). Ticket refusals in 4 are covered by the host e2e
+(`choragus/tests/e2e.rs`). Still to run: 6 on the Mac's HVF VM, where timing is real.
+
 ## 9. Work items
 
 | # | work | depends on |

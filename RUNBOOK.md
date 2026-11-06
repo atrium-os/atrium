@@ -5394,6 +5394,24 @@ touch other threads' files under `/orbis`; ask before installing packages.
 - Expected outputs, step by step: `/mnt/project-files/navigator/converter-jail-freebsd-runplan.md`
   and `jaild-limits-freebsd-runplan.md`.
 
+### 13.6a Lyra audio in the cloud VM (`scripts/lyra-vm-check.sh`)
+
+lyra-v1.md §8 checks 2, 4, 5 and 7 on a real sound(4) device: QEMU's HDA codec
+with no host audio, lyrad as `_lyra` and choragusd as `_choragus` under
+`daemon -r`, apps at registry uids, every level read back from `LYRA_DUMP`
+(Goertzel on the host). About 6 min after the VM is up.
+
+```sh
+sh scripts/cloud-vm.sh down
+QEMU_EXTRA="$(sh scripts/lyra-vm-check.sh qemu-args)" sh scripts/cloud-vm.sh up
+sh scripts/cloud-vm.sh lyra     # cross-builds, stages, commissions, runs; dump in ~/atrium-vm/lyra
+```
+
+Not covered there: check 6 (clock accuracy, ±2 ms over 10 min) needs real
+timing, so run it on the Mac's HVF VM; check 3 (no device in app jails) is
+portcullis-jail's devfs test plus portcullisd's shipped_manifests test (VM only:
+portcullisd doesn't build on Linux).
+
 ### 13.7 Navigator corpus (on the Mac, no VM)
 
 - Corpus: `~/src/navigator-corpus` (batch 1 + `batch2/`). Run recipe in its README.

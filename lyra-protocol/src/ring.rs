@@ -241,6 +241,19 @@ impl Ring {
         unsafe { (*self.hdr).tail.load(Ordering::Acquire) }
     }
 
+    /// Overwrite the shared header as a hostile producer could (it maps the
+    /// segment read-write anyway): for the VM's hostile-stream test only. The
+    /// consumer must not care (lyra-v1.md §8 test 2).
+    #[doc(hidden)]
+    pub fn scribble_header(&self, capacity: u64, frame_floats: u64, head: u64, tail: u64) {
+        unsafe {
+            std::ptr::write_volatile(std::ptr::addr_of_mut!((*self.hdr).capacity_frames), capacity);
+            std::ptr::write_volatile(std::ptr::addr_of_mut!((*self.hdr).frame_floats), frame_floats);
+            (*self.hdr).head.store(head, Ordering::Release);
+            (*self.hdr).tail.store(tail, Ordering::Release);
+        }
+    }
+
     /// Frames available to read. On the consumer this is measured from its own
     /// cursor and capped at the capacity, whatever the producer wrote to `head`.
     pub fn readable(&self) -> u64 {

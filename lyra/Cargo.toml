@@ -22,6 +22,10 @@ path = "src/bin/lyra_effect.rs"
 name = "lyra-play"
 path = "src/bin/lyra_play.rs"
 
+[[bin]]
+name = "lyra-vmtest"
+path = "src/bin/lyra_vmtest.rs"
+
 [dependencies]
 libc = "0.2"
 lyra-protocol = { path = "../lyra-protocol" }

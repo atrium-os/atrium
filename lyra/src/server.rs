@@ -183,6 +183,8 @@ struct Slot {
     stream_rate: u32,
     flush_epoch: u32,
     playing: bool,
+    /// Started at least once: from then on level changes ramp.
+    started: bool,
     /// Periods left before `Drained`, once the ring has run dry.
     drain: Option<Option<u32>>,
     underrun_frames: u64,
@@ -264,13 +266,16 @@ impl Engine {
                 clock.publish(&Clock { state: STATE_PAUSED, frame: 0, heard_ns: 0, rate_ppm: self.rate_ppm, flush_epoch: 0, rate: stream_rate });
                 self.slots.push(Slot {
                     id,
-                    gain: Gain::new(1.0, self.rate as f32, 20.0),
+                    // Silent until choragusd sets its level, so a stream the
+                    // user muted or turned down is never heard at full level.
+                    gain: Gain::new(0.0, self.rate as f32, 20.0),
                     ring,
                     adapter,
                     clock,
                     stream_rate,
                     flush_epoch: 0,
                     playing: false,
+                    started: false,
                     drain: None,
                     underrun_frames: 0,
                     periods_since_report: 0,
@@ -287,6 +292,7 @@ impl Engine {
             ToEngine::Start { stream } => {
                 if let Some(s) = self.slot(stream) {
                     s.playing = true;
+                    s.started = true;
                 }
             }
             ToEngine::Pause { stream } => {
@@ -314,7 +320,10 @@ impl Engine {
                 if let Some(s) = self.slot(stream) {
                     // A non-finite or absurd level from the wire is clamped too.
                     let db = if db.is_finite() { db.clamp(-120.0, 12.0) } else { -120.0 };
-                    s.gain.set_target(if db <= -120.0 { 0.0 } else { 10f32.powf(db / 20.0) });
+                    let g = if db <= -120.0 { 0.0 } else { 10f32.powf(db / 20.0) };
+                    // Nothing has heard it yet: no ramp to hear (a ramp from
+                    // the old level would play a muted stream for 20 ms).
+                    if s.started { s.gain.set_target(g) } else { s.gain.jump(g) }
                 }
             }
             ToEngine::Reroute { .. } => {} // single sink in v1
@@ -601,7 +610,9 @@ pub fn run(cfg: Config) -> ! {
     let mut out = vec![0i16; n];
     // Development: LYRA_DUMP=<file> writes the exact i16 stereo sent to the
     // device, for offline spectral checks (jaild passes no such variable).
-    let mut dump = std::env::var("LYRA_DUMP").ok().and_then(|p| std::fs::File::create(p).ok());
+    // Appended, so a restarted lyrad keeps what the last one wrote.
+    let mut dump = std::env::var("LYRA_DUMP").ok()
+        .and_then(|p| std::fs::OpenOptions::new().create(true).append(true).open(p).ok());
     loop {
         let sink = match OssSink::open(cfg.rate, cfg.channels, cfg.period_frames, cfg.nfrags) {
             Ok(s) => s,
@@ -668,6 +679,8 @@ mod tests {
 
     fn open(e: &mut Engine, gen: u64, id: u32, rate: u32, ch: u8, ring: Ring) {
         e.apply(Cmd::Open(gen, id, Box::new(Adapter::new(rate, ch, 48_000, 2).unwrap()), ring, writer()));
+        // choragusd sets every new stream's level before the app can start it.
+        e.apply(Cmd::Msg(gen, ToEngine::SetGain { stream: id, db: 0.0 }));
         e.apply(Cmd::Msg(gen, ToEngine::Start { stream: id }));
     }
 
@@ -709,6 +722,7 @@ mod tests {
         let mut e = Engine::new(48_000, 2, 8);
         e.apply(Cmd::Begin(1));
         e.apply(Cmd::Open(1, 1, Box::new(Adapter::new(48_000, 2, 48_000, 2).unwrap()), c, writer()));
+        e.apply(Cmd::Msg(1, ToEngine::SetGain { stream: 1, db: 0.0 }));
         p.write(&[0.5; 32]);
         let mut mix = [0.0f32; 16];
         e.mix(&mut mix, 0, 0);
@@ -818,6 +832,22 @@ mod tests {
         open(&mut e, 1, 8, 48_000, 2, c2);
         e.apply(Cmd::End(1));
         assert_eq!(e.streams(), 0, "the old session can't open or close anything");
+    }
+
+    #[test]
+    fn a_new_stream_starts_at_its_set_level_not_full() {
+        let (_p, c) = ring_pair("first-gain", 8, 2);
+        let mut e = Engine::new(48_000, 2, 4);
+        e.apply(Cmd::Begin(1));
+        e.apply(Cmd::Open(1, 1, Box::new(Adapter::new(48_000, 2, 48_000, 2).unwrap()), c, writer()));
+        assert_eq!(e.slots[0].gain.current(), 0.0, "silent before choragusd says");
+        e.apply(Cmd::Msg(1, ToEngine::SetGain { stream: 1, db: -120.0 }));
+        assert_eq!(e.slots[0].gain.current(), 0.0);
+        e.apply(Cmd::Msg(1, ToEngine::SetGain { stream: 1, db: -6.0 }));
+        assert!((e.slots[0].gain.current() - 0.501).abs() < 0.001, "jumps before it plays");
+        e.apply(Cmd::Msg(1, ToEngine::Start { stream: 1 }));
+        e.apply(Cmd::Msg(1, ToEngine::SetGain { stream: 1, db: 0.0 }));
+        assert!(e.slots[0].gain.current() < 0.6, "ramps once it plays");
     }
 
     #[test]

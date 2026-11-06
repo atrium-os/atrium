@@ -146,6 +146,27 @@ impl Client {
         wire::recv(&mut self.sock)
     }
 
+    /// An event if one has arrived, without waiting. An error means the
+    /// connection is gone (choragusd hung up: treat as `StreamLost`).
+    pub fn try_event(&mut self) -> io::Result<Option<ToApp>> {
+        if let Some(e) = self.pending.pop_front() {
+            return Ok(Some(e));
+        }
+        let mut b = [0u8; 1];
+        // SAFETY: a one-byte peek into a local buffer.
+        let n = unsafe {
+            libc::recv(self.sock.as_raw_fd(), b.as_mut_ptr() as *mut _, 1, libc::MSG_PEEK | libc::MSG_DONTWAIT)
+        };
+        let peeked = if n < 0 { Err(io::Error::last_os_error()) } else { Ok(n as usize) };
+        match peeked {
+            Ok(0) => Err(io::Error::new(io::ErrorKind::UnexpectedEof, "choragusd hung up")),
+            // A frame has started: read all of it, blocking.
+            Ok(_) => wire::recv(&mut self.sock).map(Some),
+            Err(e) if e.kind() == io::ErrorKind::WouldBlock => Ok(None),
+            Err(e) => Err(e),
+        }
+    }
+
     /// The socket, to poll for events.
     pub fn socket(&self) -> &UnixStream {
         &self.sock

@@ -24,6 +24,12 @@ impl Gain {
         self.target = g;
     }
 
+    /// Go to `g` at once, with no ramp (for a stream nothing has heard yet).
+    pub fn jump(&mut self, g: f32) {
+        self.target = g;
+        self.current = g;
+    }
+
     pub fn current(&self) -> f32 {
         self.current
     }
