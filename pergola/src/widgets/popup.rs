@@ -41,7 +41,7 @@ fn text(color: Color, sz: f32, family: &str, weight: Weight) -> TextStyle {
 /// A floating surface's body: the edge, then the fill. Returns the fill.
 fn surface(ctx: &mut Ctx, r: Rect, rad: f32) -> NodeId {
     let t = ctx.theme;
-    let e = ctx.tree.insert(None, Node::Rect { rect: r, fill: t.border_default(), radius: rad });
+    let e = ctx.add(Node::Rect { rect: r, fill: t.border_default(), radius: rad });
     ctx.tree.insert(Some(e), Node::Rect { rect: inflate(r, -stroke::DEFAULT), fill: t.bg_elevated(), radius: rad - stroke::DEFAULT })
 }
 
@@ -142,7 +142,7 @@ impl View for Menu {
         }
         let t = ctx.theme;
         // A press anywhere outside closes it, and goes no further.
-        let catcher = ctx.tree.insert(None, Node::Rect { rect: EVERYWHERE, fill: Color::TRANSPARENT, radius: 0.0 });
+        let catcher = ctx.add(Node::Rect { rect: EVERYWHERE, fill: Color::TRANSPARENT, radius: 0.0 });
         let s = self.state.clone();
         ctx.on_click(catcher, move || s.set(MenuState::default()));
 
@@ -262,9 +262,9 @@ impl View for Dropdown {
         let t = ctx.theme;
         let r = self.rect;
         let cur = self.value.get().min(self.options.len().saturating_sub(1));
-        let halo = ctx.tree.insert(None, Node::Rect { rect: inflate(r, 3.0), fill: Color::TRANSPARENT, radius: radius::SM + 3.0 });
-        let ring = ctx.tree.insert(None, Node::Rect { rect: inflate(r, 1.0), fill: Color::TRANSPARENT, radius: radius::SM + 1.0 });
-        let edge = ctx.tree.insert(None, Node::Rect { rect: r, fill: t.border_strong(), radius: radius::SM });
+        let halo = ctx.add(Node::Rect { rect: inflate(r, 3.0), fill: Color::TRANSPARENT, radius: radius::SM + 3.0 });
+        let ring = ctx.add(Node::Rect { rect: inflate(r, 1.0), fill: Color::TRANSPARENT, radius: radius::SM + 1.0 });
+        let edge = ctx.add(Node::Rect { rect: r, fill: t.border_strong(), radius: radius::SM });
         let base = t.bg_elevated();
         let body = if ctx.is_pressed(edge) {
             t.state_pressed().over(base)
@@ -366,7 +366,7 @@ impl View for Dialog {
             return;
         }
         let t = ctx.theme;
-        let scrim = ctx.tree.insert(None, Node::Rect { rect: EVERYWHERE, fill: t.scrim(), radius: 0.0 });
+        let scrim = ctx.add(Node::Rect { rect: EVERYWHERE, fill: t.scrim(), radius: 0.0 });
         let o = self.open.clone();
         ctx.on_click(scrim, move || o.set(false));
 

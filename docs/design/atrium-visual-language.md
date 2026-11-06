@@ -583,6 +583,9 @@ screen has it.
 | **Menu** | floating surface, 4px inset; items 28 high, padding 12, shortcut right in `text-tertiary`; separator a `Divider` with 4px above and below; submenu `caret-right` | the hovered or arrowed item takes `selection-bg` |
 | **Tooltip** | `bg-inverse`, text `text-inverse` `sm`, radius-xs, padding 4×8, 8 from the target; shows after 500 ms of hover, at once while another is showing, never on touch | — |
 | **Popover** | floating surface, padding 16, radius-md | — |
+| **Group box** | `bg-elevated`, 1px `border-default`, radius-md, padding 16; title `sm` semibold `text-secondary`; contents 12 apart | — |
+| **Section** | no frame; title `md` semibold `text-primary`, optional `sm` `text-secondary` line 4 below; contents 12 below; sections 24 apart | — |
+| **Form** | two columns: labels `md` `text-primary` at their natural width, fields fill the rest, 12 between, rows 8 apart, each row on one baseline | — |
 | **Dialog / sheet** | floating surface, radius-lg, padding 24, `scrim` behind; buttons bottom right, primary last; Esc and the scrim cancel | — |
 | **Scrollbar** | overlay, no track: a 6 wide pill, `neutral-500` at 50%, 2 from the edge; shows while scrolling and 800 ms after, widens to 10 on hover | — |
 | **Progress** | the existing `ProgressBar`: 4 high pill, `accent-mark` on `bg-surface`; indeterminate is a moving third | — |

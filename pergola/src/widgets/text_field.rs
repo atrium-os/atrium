@@ -113,9 +113,9 @@ impl View for TextField {
 
         // Node structure is the same in every state (ids stay stable):
         // focus halo, focus ring, edge, fill, selection, text, caret.
-        let halo_id = ctx.tree.insert(None, Node::Rect { rect: inflate(rect, 3.0), fill: crate::Color::TRANSPARENT, radius: radius::XS + 3.0 });
-        let ring_id = ctx.tree.insert(None, Node::Rect { rect: inflate(rect, 1.0), fill: crate::Color::TRANSPARENT, radius: radius::XS + 1.0 });
-        let bg_id = ctx.tree.insert(None, Node::Rect { rect, fill: theme.border_strong(), radius: radius::XS });
+        let halo_id = ctx.add(Node::Rect { rect: inflate(rect, 3.0), fill: crate::Color::TRANSPARENT, radius: radius::XS + 3.0 });
+        let ring_id = ctx.add(Node::Rect { rect: inflate(rect, 1.0), fill: crate::Color::TRANSPARENT, radius: radius::XS + 1.0 });
+        let bg_id = ctx.add(Node::Rect { rect, fill: theme.border_strong(), radius: radius::XS });
         let hovered = ctx.is_hovered(bg_id);
         let focused = ctx.is_focused(bg_id);
         if ctx.is_focus_visible(bg_id) {

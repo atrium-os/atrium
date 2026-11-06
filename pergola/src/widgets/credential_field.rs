@@ -104,6 +104,16 @@ impl CredentialField {
     }
 }
 
+impl crate::view::Widget for CredentialField {
+    fn natural_size(&self) -> crate::geom::Size {
+        self.rect.size
+    }
+    fn framed(mut self, r: Rect) -> Self {
+        self.rect = r;
+        self
+    }
+}
+
 impl View for CredentialField {
     fn render(&self, ctx: &mut Ctx) {
         let fill = ctx.theme.bg_canvas();

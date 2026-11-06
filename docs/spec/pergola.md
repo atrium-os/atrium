@@ -515,3 +515,42 @@ For apps that draw their own 2D content (vector drawing, flowcharts, diagrams). 
   Pergola's own client-side text), images on the canvas (`Node::Image` exists, `Item` doesn't
   carry one yet), a pixel buffer for paint programs (a texture slot updated by region; Fresco
   supports it, no widget until an app needs it), and box-shadow-like effects (no Fresco op).
+
+## §12. Layout of controls, grids and groups (asked by the user, 2026-11-06)
+
+Controls used to be placed only by hand (`.at(x, y)`), so they could not
+sit in a stack and nothing lined their labels up. As built:
+
+- **`Ctx::place(widget)`** puts any control in the current stack or grid.
+  A control that implements `view::Widget` says the size it wants
+  (`natural_size`, 0 on an axis meaning "stretch") and where its label's
+  baseline is. Layout gives its slot a rect (grow, `align_self`, min/max
+  via `place_with`), and the control then draws in that rect, so a grown
+  or stretched field draws at its grown size and its handlers and menus
+  use the right coordinates. Placed controls draw after the layout pass
+  (`Ctx::flush_overlays` runs layout → placements → overlays, round by
+  round), and what they draw is laid out in turn.
+  Button, TextField, Checkbox, Toggle, RadioGroup, Segmented, Tabs,
+  Dropdown, Slider and CredentialField implement it; `.at()` still works.
+- **Alignment**: stacks keep justify (start, centre, end, space-between),
+  align (stretch, start, centre, end), padding, gap, grow/shrink/basis,
+  min/max and absolute insets, and gain **`Align::Baseline`**: a row's
+  children line up on their label baselines (the widget's, a text leaf's
+  own, or the bottom). Labels themselves are optically centred (cap height
+  on the box's middle, `text::wire_top`), so controls of one height agree
+  even when centred.
+- **Grids**: `Ctx::grid(stack, Grid::new([Track::Auto, Track::Fr(1.0)]))`
+  lays a stack out as a grid (taffy's), children filling cells row by
+  row; tracks are px, auto or fr; `FlexStyle::span` spans columns,
+  `justify_self` aligns in a cell; `Align::Baseline` aligns each row. A
+  form is a two-column grid: labels auto, fields fr.
+- **Grouping**: `GroupBox::new(title).show(ctx, |ctx| …)` frames related
+  controls on a `bg-elevated` surface with a 1px `border-default` edge,
+  radius-md, padding 16, its title `sm` semibold `text-secondary`;
+  `Section::new(title).description(…)` heads controls with an `md`
+  semibold title and no frame. Both are vertical stacks, content `sm`
+  apart; sections `lg` apart. A Stack is also a group on the wire (moves,
+  clips and fades as one); RadioGroup, Segmented and Tabs are one Tab stop.
+- Tab order is now tree order (reading order), not node id order.
+
+Not yet: wrapping rows, a grid's explicit row/column placement, RTL.

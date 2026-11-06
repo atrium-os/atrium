@@ -94,24 +94,24 @@ impl View for Button {
         let theme = ctx.theme;
 
         let h = if self.rect.size.h > 0.0 { self.rect.size.h } else { size::BUTTON_HEIGHT_DEFAULT };
-        let rect = Rect::new(self.rect.x(), self.rect.y(), self.rect.size.w, h);
+        let rect = Rect::new(self.rect.x(), self.rect.y(), self.natural_width(), h);
 
         // Node structure is IDENTICAL in every state — state changes
         // colors, never node count — so ids stay stable across renders
         // and last frame's hover/press/focus (keyed by id) selects
         // this frame's look. Layers: focus halo, focus ring, body
         // (doubles as the border for Secondary), inner fill, label.
-        let halo_id = ctx.tree.insert(None, Node::Rect {
+        let halo_id = ctx.add(Node::Rect {
             rect: inflate(rect, 3.0),
             fill: crate::Color::TRANSPARENT,
             radius: radius::SM + 3.0,
         });
-        let ring_id = ctx.tree.insert(None, Node::Rect {
+        let ring_id = ctx.add(Node::Rect {
             rect: inflate(rect, 1.0),
             fill: crate::Color::TRANSPARENT,
             radius: radius::SM + 1.0,
         });
-        let bg_id = ctx.tree.insert(None, Node::Rect {
+        let bg_id = ctx.add(Node::Rect {
             rect,
             fill: crate::Color::TRANSPARENT,
             radius: radius::SM,

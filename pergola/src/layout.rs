@@ -43,6 +43,55 @@ pub enum Align {
     Start,
     Center,
     End,
+    /// Children's label baselines on one line (a row; a grid's rows).
+    /// A child's baseline is the one its widget reports
+    /// (`Widget::baseline`), a text leaf's own, or its bottom.
+    Baseline,
+}
+
+/// One grid track's size.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum Track {
+    /// Fixed px.
+    Px(f32),
+    /// As wide (tall) as its widest (tallest) cell.
+    Auto,
+    /// A share of what is left.
+    Fr(f32),
+}
+
+/// A stack laid out as a grid (`NodeTree::set_grid`, `Ctx::grid`): its
+/// children fill the cells row by row, left to right; a child spans
+/// columns with `FlexStyle::span`. Rows are as tall as their cells.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Grid {
+    pub columns: Vec<Track>,
+    pub column_gap: f32,
+    pub row_gap: f32,
+    /// Cells' vertical alignment in their row (`Baseline` lines up each
+    /// row's labels).
+    pub align: Align,
+    /// Cells' horizontal alignment in their column.
+    pub justify: Align,
+}
+
+impl Grid {
+    pub fn new(columns: impl Into<Vec<Track>>) -> Self {
+        Self { columns: columns.into(), column_gap: 0.0, row_gap: 0.0, align: Align::Stretch, justify: Align::Stretch }
+    }
+    pub fn gaps(mut self, column: f32, row: f32) -> Self {
+        self.column_gap = column;
+        self.row_gap = row;
+        self
+    }
+    pub fn align(mut self, a: Align) -> Self {
+        self.align = a;
+        self
+    }
+    pub fn justify(mut self, a: Align) -> Self {
+        self.justify = a;
+        self
+    }
 }
 
 /// Flex parameters attached to a node via the tree's side-table.
@@ -70,6 +119,12 @@ pub struct FlexStyle {
     /// own declared rect, never looks inside, and moves the whole subtree
     /// by however far the stack moved.
     pub free: bool,
+    /// The child's baseline, px below its top (set by `Ctx::place`).
+    pub baseline: Option<f32>,
+    /// Grid columns the child spans (0 and 1: one).
+    pub span: u16,
+    /// Horizontal alignment in a grid cell (overrides the grid's).
+    pub justify_self: Option<Align>,
     // — as a container (Stack nodes) —
     pub padding: f32,
     /// Per-axis padding overrides; fall back to `padding`.
@@ -92,6 +147,9 @@ impl Default for FlexStyle {
             max_height: None,
             absolute_inset: None,
             free: false,
+            baseline: None,
+            span: 0,
+            justify_self: None,
             padding: 0.0,
             padding_x: None,
             padding_y: None,
@@ -131,7 +189,7 @@ struct MeasureCtx {
 fn flex_subtree(tree: &mut NodeTree, root: PNodeId) {
     let mut taffy: TaffyTree<MeasureCtx> = TaffyTree::new();
 
-    let t_root = match build(tree, root, &mut taffy) {
+    let t_root = match build(tree, root, &mut taffy, 0.0) {
         Some(id) => id,
         None => return,
     };
@@ -229,11 +287,49 @@ fn shift(tree: &mut NodeTree, id: PNodeId, dx: f32, dy: f32) {
     }
 }
 
+fn align_self(a: Align) -> AlignSelf {
+    match a {
+        Align::Stretch => AlignSelf::STRETCH,
+        Align::Start | Align::Baseline => AlignSelf::FLEX_START,
+        Align::Center => AlignSelf::CENTER,
+        Align::End => AlignSelf::FLEX_END,
+    }
+}
+
+fn align_items(a: Align) -> AlignItems {
+    align_self(a)
+}
+
+/// A child's baseline, px below its top: what it reports, a text
+/// leaf's own, else its bottom.
+fn child_baseline(tree: &NodeTree, id: PNodeId) -> f32 {
+    if let Some(b) = tree.style(id).and_then(|s| s.baseline) {
+        return b;
+    }
+    match tree.get(id) {
+        Some(Node::Text { content, style, rect }) => {
+            let h = if rect.size.h > 0.0 { rect.size.h } else { crate::text::measure(content, style).h };
+            crate::text::baseline(h, style)
+        }
+        Some(n) => {
+            // A stack: its first child's (its first line).
+            if let Some(&c) = tree.children_of(id).first() {
+                if matches!(n, Node::Stack { .. }) && !tree.style(id).is_some_and(|s| s.free) {
+                    return child_baseline(tree, c);
+                }
+            }
+            n.rect().size.h
+        }
+        None => 0.0,
+    }
+}
+
 /// Recursively mirror the Pergola subtree into taffy nodes.
 fn build(
     tree: &NodeTree,
     id: PNodeId,
     taffy: &mut TaffyTree<MeasureCtx>,
+    margin_top: f32,
 ) -> Option<taffy::NodeId> {
     let node = tree.get(id)?;
     let fs = tree.style(id).copied().unwrap_or_default();
@@ -252,12 +348,9 @@ fn build(
         flex_grow: fs.grow,
         flex_shrink: fs.shrink,
         flex_basis: opt_dim(fs.basis),
-        align_self: fs.align_self.map(|a| match a {
-            Align::Stretch => AlignSelf::STRETCH,
-            Align::Start => AlignSelf::FLEX_START,
-            Align::Center => AlignSelf::CENTER,
-            Align::End => AlignSelf::FLEX_END,
-        }),
+        align_self: fs.align_self.map(align_self),
+        justify_self: fs.justify_self.map(align_self),
+        margin: taffy::Rect { left: zero(), right: zero(), top: length(margin_top), bottom: zero() },
         min_size: Size { width: opt_dim(fs.min_width), height: opt_dim(fs.min_height) },
         max_size: Size { width: opt_dim(fs.max_width), height: opt_dim(fs.max_height) },
         ..Style::default()
@@ -299,18 +392,59 @@ fn build(
                 Justify::End => JustifyContent::FLEX_END,
                 Justify::SpaceBetween => JustifyContent::SPACE_BETWEEN,
             });
-            style.align_items = Some(match fs.align {
-                Align::Stretch => AlignItems::STRETCH,
-                Align::Start => AlignItems::FLEX_START,
-                Align::Center => AlignItems::CENTER,
-                Align::End => AlignItems::FLEX_END,
-            });
+            style.align_items = Some(align_items(fs.align));
             style.size = Size { width: dim(rect.size.w), height: dim(rect.size.h) };
 
             let child_ids: Vec<PNodeId> = tree.children_of(id).to_vec();
+            // Which line each child is on, for baseline alignment.
+            let mut lines = vec![0usize; child_ids.len()];
+            let mut baseline = fs.align == Align::Baseline && *axis == Axis::Horizontal;
+            if let Some(g) = tree.grid(id) {
+                style.display = Display::Grid;
+                style.grid_template_columns = g.columns.iter().map(|t| match *t {
+                    Track::Px(v) => length(v),
+                    Track::Auto => auto(),
+                    Track::Fr(f) => fr(f),
+                }).collect();
+                style.gap = Size { width: length(g.column_gap), height: length(g.row_gap) };
+                style.align_items = Some(align_items(g.align));
+                style.justify_items = Some(align_items(g.justify));
+                baseline = g.align == Align::Baseline;
+                let n = g.columns.len().max(1);
+                let mut at = 0usize;
+                for (i, &c) in child_ids.iter().enumerate() {
+                    let span = tree.style(c).map_or(1, |s| s.span.max(1) as usize).min(n);
+                    if at % n + span > n {
+                        at += n - at % n;
+                    }
+                    lines[i] = at / n;
+                    at += span;
+                }
+            }
+            let mut tops = vec![0.0f32; child_ids.len()];
+            if baseline {
+                style.align_items = Some(AlignItems::FLEX_START);
+                let bs: Vec<f32> = child_ids.iter().map(|&c| child_baseline(tree, c)).collect();
+                let mut max = std::collections::HashMap::<usize, f32>::new();
+                for (i, b) in bs.iter().enumerate() {
+                    let m = max.entry(lines[i]).or_insert(0.0);
+                    *m = m.max(*b);
+                }
+                for (i, b) in bs.iter().enumerate() {
+                    tops[i] = max[&lines[i]] - b;
+                }
+            }
             let mut t_children = Vec::with_capacity(child_ids.len());
-            for c in child_ids {
-                if let Some(tc) = build(tree, c, taffy) {
+            for (i, c) in child_ids.into_iter().enumerate() {
+                if let Some(tc) = build(tree, c, taffy, tops[i]) {
+                    if let Some(g) = tree.grid(id) {
+                        let span = tree.style(c).map_or(1, |s| s.span.max(1)).min(g.columns.len().max(1) as u16);
+                        if span > 1 {
+                            let mut st = taffy.style(tc).cloned().unwrap_or_default();
+                            st.grid_column = taffy::Line { start: taffy::style_helpers::span(span), end: auto() };
+                            let _ = taffy.set_style(tc, st);
+                        }
+                    }
                     t_children.push(tc);
                 }
             }
@@ -330,7 +464,7 @@ fn build(
             style.padding = taffy::Rect { left: length(px), right: length(px), top: length(py), bottom: length(py) };
             let mut t_children = Vec::new();
             for &c in tree.children_of(id) {
-                if let Some(tc) = build(tree, c, taffy) {
+                if let Some(tc) = build(tree, c, taffy, 0.0) {
                     t_children.push(tc);
                 }
             }

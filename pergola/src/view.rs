@@ -52,6 +52,34 @@ pub struct Ctx<'a> {
     /// Layers drawn after the whole view, at the top level: menus,
     /// dropdowns, dialogs ([`Ctx::overlay`]).
     overlays: Vec<Overlay>,
+    /// Widgets placed in a layout ([`Ctx::place`]), drawn once layout has
+    /// given their slot its rect.
+    placements: Vec<(NodeId, Placement)>,
+}
+
+/// A placed widget waiting for its laid-out rect.
+pub type Placement = Box<dyn for<'b> FnOnce(&mut Ctx<'b>, crate::geom::Rect)>;
+
+/// A widget that can be placed in a layout: it says how big it wants to
+/// be, and draws itself in whatever rect layout gives it.
+pub trait Widget: View + 'static {
+    /// The size it wants (px). A 0 width or height means "as the layout
+    /// gives" (it stretches on that axis).
+    fn natural_size(&self) -> crate::geom::Size;
+    /// The widget, moved and sized to `r`.
+    fn framed(self, r: crate::geom::Rect) -> Self
+    where
+        Self: Sized;
+    /// Whether it takes all the width its parent gives (a field, a tab
+    /// row, a slider with no width set); `natural_size().w` is then its
+    /// least width.
+    fn fills(&self) -> bool {
+        false
+    }
+    /// Its label's baseline, px below its top, for baseline alignment.
+    fn baseline(&self, _size: crate::geom::Size) -> Option<f32> {
+        None
+    }
 }
 
 /// A deferred top-level layer.
@@ -72,7 +100,7 @@ impl<'a> Ctx<'a> {
         theme: Semantic,
         state: InteractionState,
     ) -> Self {
-        Self { tree, interactions, parent_stack: Vec::new(), theme, state, overlays: Vec::new() }
+        Self { tree, interactions, parent_stack: Vec::new(), theme, state, overlays: Vec::new(), placements: Vec::new() }
     }
 
     /// Whether `id` is the current hover target. Valid for nodes whose
@@ -152,9 +180,68 @@ impl<'a> Ctx<'a> {
         self.overlays.push(Box::new(f));
     }
 
-    /// Run the overlays queued so far (and any they queue), at top level.
+    /// Put `w` in the current stack as a laid-out child: a slot its
+    /// natural size takes part in layout (grow, align, baseline, grid
+    /// cell) and the widget draws in the rect layout gives the slot.
+    /// Returns the slot.
+    pub fn place<W: Widget>(&mut self, w: W) -> NodeId {
+        self.place_with(w, crate::layout::FlexStyle::default())
+    }
+
+    /// [`Ctx::place`] with the slot's flex parameters (grow, align_self,
+    /// min/max). A grown or stretched widget draws at its grown size.
+    pub fn place_with<W: Widget>(&mut self, w: W, style: crate::layout::FlexStyle) -> NodeId {
+        let s = w.natural_size();
+        let fills = w.fills();
+        let in_row = self.parent_stack.last().and_then(|p| self.tree.get(*p)).is_some_and(|n| matches!(n, Node::Stack { axis: crate::geom::Axis::Horizontal, .. }))
+            && !self.parent_stack.last().is_some_and(|p| self.tree.grid(*p).is_some());
+        let width = if fills { 0.0 } else { s.w };
+        let id = self.push(Node::stack(crate::geom::Axis::Vertical, crate::geom::Rect::new(0.0, 0.0, width, s.h), 0.0));
+        self.pop();
+        let baseline = w.baseline(s).or(style.baseline);
+        let mut style = crate::layout::FlexStyle { free: true, baseline, ..style };
+        if fills {
+            // Stretched across a column; in a row, it takes what is left.
+            style.min_width = style.min_width.or(Some(s.w));
+            if in_row {
+                style.grow = style.grow.max(1.0);
+            }
+        }
+        self.set_flex(id, style);
+        self.placements.push((id, Box::new(move |ctx: &mut Ctx, r| w.framed(r).render(ctx))));
+        id
+    }
+
+    /// Draw the placed widgets in their slots' rects, laying out what
+    /// they draw, until none is waiting.
+    fn run_placements(&mut self) {
+        while !self.placements.is_empty() {
+            for (slot, draw) in std::mem::take(&mut self.placements) {
+                let Some(r) = self.tree.get(slot).map(|n| n.rect()) else { continue };
+                let saved = std::mem::replace(&mut self.parent_stack, vec![slot]);
+                draw(self, r);
+                self.parent_stack = saved;
+                for c in self.tree.children_of(slot).to_vec() {
+                    crate::layout::layout(self.tree, c);
+                }
+            }
+        }
+    }
+
+    /// Lay out, draw the placed widgets, then the overlays queued so far
+    /// (and any they queue) at top level, each round laid out in turn.
     pub fn flush_overlays(&mut self) {
-        while !self.overlays.is_empty() {
+        let mut laid = 0;
+        loop {
+            let roots: Vec<NodeId> = self.tree.roots().skip(laid).collect();
+            laid += roots.len();
+            for r in roots {
+                crate::layout::layout(self.tree, r);
+            }
+            self.run_placements();
+            if self.overlays.is_empty() {
+                break;
+            }
             let saved = std::mem::take(&mut self.parent_stack);
             for f in std::mem::take(&mut self.overlays) {
                 f(self);
@@ -171,9 +258,10 @@ impl<'a> Ctx<'a> {
         if self.state.tip != Some(id) {
             return;
         }
-        let Some(anchor) = self.tree.get(id).map(|n| n.rect()) else { return };
         let text = text.into();
         self.overlay(move |ctx| {
+            // Read after layout: where the node ended up.
+            let Some(anchor) = ctx.tree.get(id).map(|n| n.rect()) else { return };
             use crate::theme::{font, radius, space, type_size, Weight};
             let t = ctx.theme;
             let style = crate::node::TextStyle { family: font::SANS.into(), size: type_size::SM, weight: Weight::Regular, color: t.text_inverse() };
@@ -204,6 +292,11 @@ impl<'a> Ctx<'a> {
     /// before it are inserted or removed. Keys are per parent.
     pub fn key(&mut self, key: u64) {
         self.tree.key_next(key);
+    }
+
+    /// Lay the stack `id` out as a grid ([`crate::layout::Grid`]).
+    pub fn grid(&mut self, id: NodeId, grid: crate::layout::Grid) {
+        self.tree.set_grid(id, grid);
     }
 
     /// Attach flex parameters (grow, alignment, container padding /

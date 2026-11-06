@@ -46,8 +46,8 @@ fn label_style(color: Color, sz: f32) -> TextStyle {
 /// The focus halo and ring around `r` (§14.1): emitted always, coloured
 /// only while `on`. Returns their ids so a caller can colour them later.
 fn focus_ring(ctx: &mut Ctx, r: Rect, rad: f32) -> (NodeId, NodeId) {
-    let halo = ctx.tree.insert(None, Node::Rect { rect: inflate(r, 3.0), fill: Color::TRANSPARENT, radius: rad + 3.0 });
-    let ring = ctx.tree.insert(None, Node::Rect { rect: inflate(r, 1.0), fill: Color::TRANSPARENT, radius: rad + 1.0 });
+    let halo = ctx.add(Node::Rect { rect: inflate(r, 3.0), fill: Color::TRANSPARENT, radius: rad + 3.0 });
+    let ring = ctx.add(Node::Rect { rect: inflate(r, 1.0), fill: Color::TRANSPARENT, radius: rad + 1.0 });
     (halo, ring)
 }
 
@@ -130,7 +130,7 @@ fn box_and_label(ctx: &mut Ctx, x: f32, y: f32, label: &str, round: bool, enable
     let rad = if round { BOX / 2.0 } else { radius::XS };
     let ring = focus_ring(ctx, bx, rad);
     // The hit target: transparent, the whole box and label.
-    let target = ctx.tree.insert(None, Node::Rect { rect: hit, fill: Color::TRANSPARENT, radius: 0.0 });
+    let target = ctx.add(Node::Rect { rect: hit, fill: Color::TRANSPARENT, radius: 0.0 });
     let edge = ctx.tree.insert(Some(target), Node::Rect { rect: bx, fill: t.border_control(), radius: rad });
     ctx.tree.insert(Some(target), Node::Text {
         rect: Rect::new(x + BOX + LABEL_GAP, y + (h - ls.h) / 2.0, ls.w, ls.h),
@@ -237,7 +237,7 @@ impl View for Toggle {
         let h = TOGGLE_H.max(ls.h);
         let track = Rect::new(self.x, self.y + (h - TOGGLE_H) / 2.0, TOGGLE_W, TOGGLE_H);
         let ring = focus_ring(ctx, track, TOGGLE_H / 2.0);
-        let target = ctx.tree.insert(None, Node::Rect {
+        let target = ctx.add(Node::Rect {
             rect: Rect::new(self.x, self.y, TOGGLE_W + LABEL_GAP + ls.w, h),
             fill: Color::TRANSPARENT,
             radius: 0.0,
@@ -352,7 +352,7 @@ impl View for RadioGroup {
         let chosen = self.value.get();
         let row_h = BOX.max(Node::measure_text("Mg", &label_style(t.text_primary(), type_size::MD)).h);
         let total = Rect::new(self.x, self.y, 0.0, self.labels.len() as f32 * (row_h + RADIO_ROW_GAP));
-        let group = ctx.tree.insert(None, Node::Rect { rect: total, fill: Color::TRANSPARENT, radius: 0.0 });
+        let group = ctx.add(Node::Rect { rect: total, fill: Color::TRANSPARENT, radius: 0.0 });
         let visible = ctx.is_focus_visible(group);
         for (i, label) in self.labels.iter().enumerate() {
             let y = self.y + i as f32 * (row_h + RADIO_ROW_GAP);
@@ -417,13 +417,9 @@ impl View for Segmented {
         let chosen = self.value.get();
         let inset = 2.0;
         let mut r = self.rect;
-        if r.w() <= 0.0 {
-            // No width given: every segment as wide as the widest label plus padding.
-            let widest = self.labels.iter().map(|l| Node::measure_text(l, &label_style(t.text_primary(), type_size::SM)).w).fold(0.0f32, f32::max);
-            r.size.w = n as f32 * (widest + 2.0 * crate::theme::space::MD) + inset * (n as f32 + 1.0);
-        }
+        r.size.w = self.natural_width();
         let ring = focus_ring(ctx, r, radius::SM);
-        let track = ctx.tree.insert(None, Node::Rect { rect: r, fill: t.bg_surface(), radius: radius::SM });
+        let track = ctx.add(Node::Rect { rect: r, fill: t.bg_surface(), radius: radius::SM });
         let seg_w = (r.w() - inset * 2.0 - inset * (n as f32 - 1.0)) / n as f32;
         for (i, label) in self.labels.iter().enumerate() {
             let s = Rect::new(r.x() + inset + i as f32 * (seg_w + inset), r.y() + inset, seg_w, r.h() - inset * 2.0);
@@ -490,7 +486,7 @@ impl View for Tabs {
             rings.push(focus_ring(ctx, inflate(Rect::new(x, r.y(), *w, r.h()), 2.0), radius::XS));
             x += w + TAB_GAP;
         }
-        let row = ctx.tree.insert(None, Node::Rect { rect: r, fill: Color::TRANSPARENT, radius: 0.0 });
+        let row = ctx.add(Node::Rect { rect: r, fill: Color::TRANSPARENT, radius: 0.0 });
         // The hairline under the row.
         ctx.tree.insert(Some(row), Node::Rect { rect: Rect::new(r.x(), r.y() + r.h() - stroke::DEFAULT, r.w(), stroke::DEFAULT), fill: t.border_default(), radius: 0.0 });
         let visible = ctx.is_focus_visible(row);

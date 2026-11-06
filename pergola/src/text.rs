@@ -37,9 +37,6 @@ pub fn clear_measurer() {
     *MEASURER.lock().unwrap() = None;
 }
 
-/// Measure `content` in `style`. Shaped width when a measurer is
-/// installed; the 0.55·size estimate otherwise. Single-line height by
-/// the toolkit convention either way.
 /// Where frescod's text run goes (`y` on the wire is the top of the
 /// font's ascender box) so the text sits optically centred in `rect`:
 /// the band from baseline to cap height centred on the rect's middle, as
@@ -56,6 +53,21 @@ pub fn wire_top(rect: crate::geom::Rect, style: &TextStyle) -> f32 {
     let baseline = rect.y() + rect.h() / 2.0 + cap * style.size / 2.0;
     baseline - asc * style.size
 }
+
+/// The baseline of text optically centred in a box `h` tall, px below
+/// the box's top (what [`wire_top`] draws): how labels line up across
+/// widgets of different heights.
+pub fn baseline(h: f32, style: &TextStyle) -> f32 {
+    let cap = match style.family.as_str() {
+        crate::theme::font::SANS | crate::theme::font::MONO | "IBMPlexSans" | "IBMPlexMono" => 0.698,
+        _ => 0.7,
+    };
+    h / 2.0 + cap * style.size / 2.0
+}
+
+/// Measure `content` in `style`. Shaped width when a measurer is
+/// installed; the 0.55·size estimate otherwise. Single-line height by
+/// the toolkit convention either way.
 
 pub fn measure(content: &str, style: &TextStyle) -> Size {
     let h = style.size * line_height::UI_SINGLE_LINE;

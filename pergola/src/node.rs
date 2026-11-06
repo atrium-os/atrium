@@ -370,6 +370,8 @@ pub struct NodeTree {
     /// out of the wire-facing `Node` payloads). Sparse: most nodes
     /// use defaults.
     styles: Vec<Option<crate::layout::FlexStyle>>,
+    /// Stacks laid out as grids instead ([`crate::layout::Grid`]).
+    grids: HashMap<NodeId, crate::layout::Grid>,
     keys: KeyAlloc,
     /// Set by `Ctx::key`: the key of the next node inserted.
     next_key: Option<u64>,
@@ -438,6 +440,16 @@ impl NodeTree {
         if let Some(&i) = self.index.get(&id) {
             self.styles[i] = Some(style);
         }
+    }
+
+    /// Lay the stack `id` out as a grid: its children fill the cells
+    /// row by row.
+    pub fn set_grid(&mut self, id: NodeId, grid: crate::layout::Grid) {
+        self.grids.insert(id, grid);
+    }
+
+    pub fn grid(&self, id: NodeId) -> Option<&crate::layout::Grid> {
+        self.grids.get(&id)
     }
 
     pub fn style(&self, id: NodeId) -> Option<&crate::layout::FlexStyle> {
