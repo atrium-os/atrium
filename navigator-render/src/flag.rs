@@ -201,7 +201,7 @@ pub fn doc_text_chars(html: &str) -> usize {
         .filter_map(|h| { let p = parse_sheet(&dom.text_content(h)); p.refused.is_none().then_some(p.sheet) }).collect();
     let styled = cascade(&dom, &sheets, &Env::default());
     let body = dom.by_tag_anywhere("body").into_iter().next().unwrap_or(dom.root());
-    fn walk(dom: &navigator_dom::Dom, st: &[Option<Style>], h: navigator_dom::Handle, shown: bool, n: &mut usize) {
+    fn walk(dom: &navigator_dom::Dom, st: &[Option<std::rc::Rc<Style>>], h: navigator_dom::Handle, shown: bool, n: &mut usize) {
         match &dom.nodes[h as usize].kind {
             Kind::Text(t) => if shown { *n += t.chars().filter(|c| !c.is_whitespace()).count() },
             Kind::Element(tag) if matches!(tag.to_ascii_lowercase().as_str(),

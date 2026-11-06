@@ -1314,6 +1314,38 @@ two table items) and the float and border-collapse layout items:
 Data: `~/src/navigator-corpus/bigdocs-2026-11-06/`. `convert.sh` produces `convert.txt`
 and `timing.tsv`; `worker.sh` produces `worker.tsv`; both tool builds are kept beside them.
 
+**Step 1 built: computed-style sharing (2026-11-06).** The renderer's cascade
+(`navigator-style`, used by layout and by the normalizer's table pre-measure) now shares
+one `Rc<Style>` between elements whose computed style must be equal.
+- *The key.* The parent's shared style (its address) and the declarations that apply, in
+  cascade order (layer, specificity, source position). The environment and the root font
+  size are the same for every element after the root.
+- Diagnostics produced while computing a style are reported again for each element that
+  shares it, so the output does not change.
+- An element no longer clones its parent's whole style to read from it.
+
+*Byte-identical.* All 421 identity documents give the same normalized documents and NSG.
+Every suite passes, and conformance is 64/64. Scene node counts are equal in every run
+below.
+
+*Measured* (`examples/bigdoc_measure`, one process per stage, the readable recordings,
+3 interleaved runs per arm, medians; before = 20ab1993):
+
+| document | worker peak, normalize stage | worker peak, layout + scene | normalize ms | layout ms |
+|---|---|---|---|---|
+| 100,000-row table | 5,174 → **1,091 MiB (−79%)** | 5,468 → **1,320 MiB (−76%)** | 5,366 → 3,702 | 4,675 → 3,095 |
+| HTML Living Standard | 3,932 → **1,206 MiB (−69%)** | 4,032 → **1,251 MiB (−69%)** | 3,720 → 2,716 | 2,512 → 1,594 |
+| HN thread | 1,133 → 500 MiB (−56%) | 1,262 → 613 MiB (−51%) | 3,934 → 3,646 | 1,145 → 865 |
+| coreutils manual | 699 → 318 MiB (−54%) | 742 → 361 MiB (−51%) | 1,625 → 1,484 | 449 → 304 |
+| War and Peace | 244 → 156 MiB (−36%) | 410 → 290 MiB (−29%) | 282 → 239 | 718 → 674 |
+| photo gallery | 54 → 48 MiB | 54 → 48 MiB | 113 → 108 | 15 → 13 |
+| endless feed | 18 → 17 MiB | 18 → 18 MiB | 1 → 1 | 1 → 1 |
+
+Peak memory per element falls from 10–15 KiB to about 2.5–8 KiB: the table holds 1.3 GiB
+for 500,000 elements. What remains is mostly the normalizer's own per-element
+declaration maps and the layout itself. Those are the next to share, and bands bound the
+layout.
+
 **Decisions to settle:**
 1. Raise the profile ceilings once bands and the image working set are in, or split very
    large documents into chapters at conversion? *Recommend raising them,* to levels

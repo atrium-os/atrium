@@ -132,7 +132,7 @@ fn kw<'a>(s: &'a Style, prop: &str) -> &'a str { match s.get(prop) { V::Kw(k) =>
 
 struct Cx<'a> {
     dom: &'a Dom,
-    styles: &'a [Option<Style>],
+    styles: &'a [Option<std::rc::Rc<Style>>],
     sh: Shaper<'a>,
     scene: Scene,
     report: Report,
@@ -679,7 +679,7 @@ struct Line { lh: U, underline: Option<u32>, strike: Option<u32>,
                iso: u32 }
 
 impl<'a> Cx<'a> {
-    fn st(&self, h: Handle) -> Option<&'a Style> { self.styles.get(h as usize).and_then(|s| s.as_ref()) }
+    fn st(&self, h: Handle) -> Option<&'a Style> { self.styles.get(h as usize).and_then(|s| s.as_deref()) }
     fn count(&mut self, what: &'static str) { *self.unimplemented.entry(what).or_default() += 1 }
 
     /// Every element with a non-initial value in a row the layout does not
@@ -5928,7 +5928,7 @@ fn edge(t: U, sx: U, sy: U, length: U, horiz: bool, style: &str, rgba: u32) -> V
 /// `inline` but a child is block-level (or was itself promoted). Doing this
 /// once is what keeps it O(n) — asking the question per element while
 /// laying out would walk the same subtrees again and again.
-fn promote_block_in_inline(dom: &Dom, styles: &[Option<Style>]) -> Vec<bool> {
+fn promote_block_in_inline(dom: &Dom, styles: &[Option<std::rc::Rc<Style>>]) -> Vec<bool> {
     let n = dom.nodes.len();
     let mut promoted = vec![false; n];
     let blockish = |h: Handle| -> bool {

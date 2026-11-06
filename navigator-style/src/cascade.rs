@@ -16,7 +16,7 @@ use crate::sheet::{parse_sheet, Diagnostic, Feature, MediaQuery, Stylesheet};
 use crate::token::{Pos, Tok, Token};
 use crate::values::{self, Calc, Length, Specified, Unit, V, ROWS};
 use navigator_dom::{Dom, Handle, Kind};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 
 pub const MAX_VAR_DEPTH: usize = 16;
 
@@ -64,7 +64,14 @@ pub struct Style {
 
 pub struct Styled {
     /// Indexed by handle; `None` for non-elements.
-    pub styles: Vec<Option<Style>>,
+    ///
+    /// ★ SHARED (2026-11-06, backend §4.8): elements whose computed style
+    /// must be equal — the same parent style and the same matched rules in
+    /// the same cascade order — hold ONE `Style`. A normalized document has
+    /// one class per distinct block, so most elements share; a full
+    /// computed-style vector per element was 10–15 KiB of worker memory for
+    /// each of them.
+    pub styles: Vec<Option<std::rc::Rc<Style>>>,
     pub diagnostics: Vec<Diagnostic>,
 }
 
@@ -373,7 +380,11 @@ pub fn cascade(dom: &Dom, authors: &[Stylesheet], env: &Env) -> Styled {
     let layers: Vec<&Stylesheet> = std::iter::once(&ua).chain(authors.iter()).collect();
     let props = longhands();
     let mut diagnostics = vec![];
-    let mut styles: Vec<Option<Style>> = vec![None; dom.nodes.len()];
+    let mut styles: Vec<Option<std::rc::Rc<Style>>> = vec![None; dom.nodes.len()];
+    // The style sharing cache: (parent style, matched rules in cascade
+    // order) → the style, and the diagnostics computing it produced (which
+    // a shared element reports again, so the output is unchanged).
+    let mut shared: HashMap<(usize, Vec<(usize, (u32, u32, u32), u32, u32)>), (std::rc::Rc<Style>, Vec<Diagnostic>)> = HashMap::new();
     // Each longhand's row, once (it was looked up per element per property).
     let gram: Vec<(&'static [values::A], &'static str, bool)> = props.iter().map(|p| values::grammar(p).expect("row")).collect();
     let prop_index: std::collections::HashMap<&str, usize> = props.iter().enumerate().map(|(i, p)| (*p, i)).collect();
@@ -413,6 +424,19 @@ pub fn cascade(dom: &Dom, authors: &[Stylesheet], env: &Env) -> Styled {
             }
         }
         hits.sort_by_key(|(k, _)| *k);
+        // ★ Everything this element's computed style depends on: its
+        // parent's computed style (shared, so its address names it; none for
+        // the root) and the declarations that apply, in cascade order. The
+        // environment and the root font size are the same for every element
+        // after the root.
+        let key = (parent.as_ref().map(|p| std::rc::Rc::as_ptr(p) as usize).unwrap_or(0),
+                   hits.iter().map(|((li, spec, pos), _)| (*li, *spec, pos.line, pos.col)).collect::<Vec<_>>());
+        if let Some((st, diags)) = shared.get(&key) {
+            styles[h as usize] = Some(st.clone());
+            diagnostics.extend(diags.iter().cloned());
+            continue;
+        }
+        let diags_from = diagnostics.len();
         let mut customs = parent.as_ref().map(|p| p.customs.clone()).unwrap_or_default();
         let mut specified: Vec<Option<(Specified, Pos)>> = vec![None; props.len()];
         for (_, rule) in &hits {
@@ -487,7 +511,9 @@ pub fn cascade(dom: &Dom, authors: &[Stylesheet], env: &Env) -> Styled {
                 }
             };
         }
-        styles[h as usize] = Some(Style { values, font_size_px: font_px, customs });
+        let st = std::rc::Rc::new(Style { values, font_size_px: font_px, customs });
+        shared.insert(key, (st.clone(), diagnostics[diags_from..].to_vec()));
+        styles[h as usize] = Some(st);
     }
     Styled { styles, diagnostics }
 }
