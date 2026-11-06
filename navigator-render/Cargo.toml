@@ -64,6 +64,10 @@ required-features = ["raster"]
 name = "first_screen_check"
 required-features = ["raster"]
 
+[[example]]
+name = "band_check"
+required-features = ["raster"]
+
 [dev-dependencies]
 # The frescod integration test (tests/fresco_integration.rs): Navigator's fills
 # through frescod's packing and its real kernels — Tier-2 (Cranelift) and the
@@ -72,3 +76,5 @@ fresco-compute = { path = "../fresco-compute", features = ["cranelift"] }
 atrium-gir = { path = "../atrium-gir" }
 atrium-spv-frontend = { path = "../atrium-spv-frontend" }
 tempfile = "3"
+# Peak resident set in examples/band_peak.
+libc = "0.2"

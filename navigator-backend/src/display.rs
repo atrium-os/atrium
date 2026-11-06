@@ -56,14 +56,24 @@ pub const MAX_LIMIT_PX: u32 = 8192;
 pub fn first_screen(recording: &[u8], current: Option<&str>, cached: Option<&[u8]>, limit_px: u32) -> Result<SceneAnswer, String> {
     if limit_px == 0 || limit_px > MAX_LIMIT_PX { return Err(format!("limit {limit_px} px is outside 1..={MAX_LIMIT_PX}")) }
     let json = std::str::from_utf8(recording).map_err(|_| "the recording is not UTF-8")?;
-    let r = navigator_normalize::recording::parse(json)?;
     let env = Env::default();
     let limit = limit_px as i64 * 64;
     with_fonts(|fonts| {
+        // ★ The recording is PARSED only when this worker normalizes: a
+        // stored normalized document needs nothing from it but the image
+        // sizes, which `subresources_from_recording_json` reads line by line
+        // without building the recording (the HTML standard's is 16 MiB of
+        // JSON; parsing it was most of the cached arm's peak, §4.8).
         let (normalized, produced) = match (current, cached) {
             (None, Some(c)) => (String::from_utf8(c.to_vec()).map_err(|_| "the cached normalized document is not UTF-8")?, false),
-            (None, None) => (navigator_normalize::normalize_and_measure(&r.document, &r.inputs, fonts, &env).0, true),
-            (Some(doc), _) => (navigator_normalize::normalize_and_measure(doc, &r.inputs, fonts, &env).0, false),
+            (None, None) => {
+                let r = navigator_normalize::recording::parse(json)?;
+                (navigator_normalize::normalize_and_measure(&r.document, &r.inputs, fonts, &env).0, true)
+            }
+            (Some(doc), _) => {
+                let r = navigator_normalize::recording::parse(json)?;
+                (navigator_normalize::normalize_and_measure(doc, &r.inputs, fonts, &env).0, false)
+            }
         };
         let subs = navigator_render::conformance::subresources_from_recording_json(json);
         let (out, _) = html::render_html_first(&normalized, fonts, &env, &subs, limit);

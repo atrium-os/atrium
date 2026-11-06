@@ -1071,6 +1071,7 @@ dependencies = [
  "fresco-compute",
  "fresco-protocol",
  "icu_segmenter",
+ "libc",
  "navigator-dom",
  "navigator-fonts",
  "navigator-style",

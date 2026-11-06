@@ -20,6 +20,7 @@ pub mod html;
 pub mod nsg;
 pub mod path;
 pub mod scroll;
+pub mod source;
 #[cfg(feature = "raster")]
 pub mod raster;
 
@@ -339,8 +340,13 @@ pub(crate) struct Shaper<'a> {
     /// and the text, so the result is cached here and everything that depends
     /// on the style (size, letter- and word-spacing) is applied per call,
     /// exactly as before.
-    cache: std::cell::RefCell<std::collections::HashMap<(usize, bool, String), std::rc::Rc<Vec<Shaped>>>>,
+    cache: ShapeCache,
 }
+
+/// The shaper's results (see `Shaper::cache`), shareable between layouts of
+/// one document: every band run of a `bands::Banded` uses the same one, so
+/// a band does not shape its words cold.
+pub(crate) type ShapeCache = std::rc::Rc<std::cell::RefCell<std::collections::HashMap<(usize, bool, String), std::rc::Rc<Vec<Shaped>>>>>;
 
 /// One glyph as the shaper returned it, in font units: id, x and y offset,
 /// x advance, and the byte offset of its cluster in the text.
@@ -354,6 +360,11 @@ impl<'a> Shaper<'a> {
         let tt = fonts.faces.iter().map(|f| ttf_parser::Face::parse(&f.bytes, 0).expect("pinned")).collect();
         let hb = fonts.faces.iter().map(|f| rustybuzz::Face::from_slice(&f.bytes, 0).expect("pinned")).collect();
         Shaper { fonts, tt, hb, cache: Default::default() }
+    }
+
+    /// With a cache shared with other layouts of the same document.
+    pub(crate) fn with_cache(fonts: &'a FontSet, cache: ShapeCache) -> Self {
+        Shaper { cache, ..Self::new(fonts) }
     }
 
     /// Split `text` by the first face in the stack that has each character,

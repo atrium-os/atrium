@@ -217,6 +217,8 @@ struct Cx<'a> {
     truncated: bool,
     /// Something skipped could paint above the cut (see the stop).
     stop_unsafe: bool,
+    /// ★ One band's run (backend §4.8 step 3, phase 2; `bands::Banded`).
+    band: Option<BandRun>,
     /// The region a box has opened and `block` will close: the attributes
     /// to restore, its clip, its transform, and the content's x, y, width.
     scroll_open: Option<(crate::Attrs, u32, u32, (U, U, U))>,
@@ -393,6 +395,119 @@ fn render_inner(html: &str, fonts: &FontSet, env: &Env, subs: &Subresources, geo
 }
 
 fn render_inner_t(html: &str, fonts: &FontSet, env: &Env, subs: &Subresources, geo: bool) -> (HtmlOut, Option<GeoLog>, Dom, bool) {
+    let p = prepare(html, fonts, env);
+    let (out, log, truncated, _) = lay_out(&p, fonts, env, subs, geo, None);
+    (out, log, p.dom, truncated)
+}
+
+/// ★ ONE BAND'S RUN (backend §4.8 step 3, phase 2). A band is laid out
+/// again from its CHECKPOINT: every block in plain block flow that an
+/// earlier band completed is skipped by its recorded outer height (margins
+/// never collapse and there are no floats, profile §3.1, so the next block
+/// starts exactly there), and the run stops before the next checkpoint's
+/// block. Checkpoints are only ever at such boundaries — in plain block flow,
+/// outside flex, grid, tables, trial measures, line boxes and out-of-flow
+/// boxes, with no inline content pending — so what a run lays out is laid out
+/// exactly as the whole layout lays it out.
+pub(crate) struct BandRun {
+    /// The band being laid out.
+    pub k: u32,
+    /// First pass: stop at the first checkpoint boundary below this.
+    pub limit: Option<U>,
+    /// A run again: stop before this block (the next band's checkpoint).
+    pub cut_at: Option<Handle>,
+    /// The vector-SVG share left at the checkpoint (it is spent in document
+    /// order, so a band laid out alone must start from the same balance).
+    pub vector_budget: usize,
+    /// How tall the canvas is, as far as the document is known.
+    pub canvas_h: U,
+    /// Every block completed in plain flow: (its outer height, the band
+    /// that completed it). The line boxes before it are `lines_before`.
+    pub done: HashMap<Handle, (U, u32)>,
+    /// The line boxes flushed just before a block: (their height, the band
+    /// that laid them out). Skipped by a later band even when it continues
+    /// the block itself (pubmed's skip link, written before the page's
+    /// content wrapper, was laid out again by every band).
+    pub lines_before: HashMap<Handle, (U, u32)>,
+    /// A container's final content bottom, once some band completed it: a
+    /// band that cuts it paints its box at its real height.
+    pub finals: HashMap<Handle, U>,
+    /// Out: where the run stopped (the next checkpoint's block and y).
+    pub fired: Option<(Handle, U)>,
+    /// Where each block in plain flow began, with the line boxes before it
+    /// (so a band continuing its container starts there directly).
+    pub at: HashMap<Handle, U>,
+    /// In: the document's shaping cache, shared by its band runs.
+    pub shape_cache: Option<crate::ShapeCache>,
+    /// In: this band's checkpoint block.
+    pub resume_at: Option<Handle>,
+    /// In: the ancestors of this band's checkpoint block — the boxes an
+    /// earlier band began and this one continues.
+    pub resume_path: std::collections::HashSet<Handle>,
+    /// Out: blocks (and line boxes) skipped so far.
+    pub skips: u64,
+    /// Out: leaves painted by a box that spans this band's edge — every band
+    /// it spans paints it, clipped to itself — with the box, its top, and
+    /// whether the box BEGAN in an earlier band (its paint then belongs, in
+    /// painting order, where the box began, not where this run emitted it;
+    /// an outline, painted after the content, does not).
+    pub spanning: Vec<(u8, usize, Handle, U, bool)>,
+    /// Out: boxes that began in an earlier band and were completed here:
+    /// (border-box top, whether it painted, whether it positions or
+    /// transforms what earlier bands laid out).
+    pub completed_spans: Vec<(U, bool, bool)>,
+    /// Out: a box was cut with no final size known, and painted nothing.
+    pub suppressed: usize,
+    /// Out: the root's height as laid out.
+    pub root_h: U,
+    /// Out: each entry of the run's (restacked) draw order: its stacking
+    /// key and emission index.
+    pub keys: Vec<(StackKey, u32)>,
+}
+
+impl BandRun {
+    pub(crate) fn new(k: u32) -> Self {
+        BandRun { k, limit: None, cut_at: None, vector_budget: crate::path::DOCUMENT_SEGMENT_SHARE, canvas_h: 0,
+                  done: HashMap::new(), lines_before: HashMap::new(), finals: HashMap::new(), fired: None, skips: 0, resume_path: Default::default(), at: HashMap::new(), resume_at: None, shape_cache: None, spanning: vec![], completed_spans: vec![], suppressed: 0, root_h: 0, keys: vec![] }
+    }
+}
+
+/// Lay a prepared document out whole.
+pub(crate) fn lay_out_whole(p: &Prepared, fonts: &FontSet, env: &Env, subs: &Subresources) -> HtmlOut {
+    lay_out(p, fonts, env, subs, false, None).0
+}
+
+/// Lay one band of a prepared document out (see `BandRun`).
+pub(crate) fn lay_out_band(p: &Prepared, fonts: &FontSet, env: &Env, subs: &Subresources, run: BandRun) -> (Scene, BandRun) {
+    let (out, _, _, run) = lay_out(p, fonts, env, subs, false, Some(run));
+    (out.scene, run.expect("a band run comes back"))
+}
+
+/// ★ A document parsed and styled, ready to be laid out — once, or band by
+/// band (backend §4.8 step 3, phase 2): parsing and the cascade are done
+/// once per document, and every band run lays out over the same tree.
+pub struct Prepared {
+    dom: Dom,
+    styles: Vec<Option<std::rc::Rc<Style>>>,
+    diagnostics: Vec<Diagnostic>,
+    promoted: Vec<bool>,
+}
+
+impl Prepared {
+    /// Nodes in the document (elements, text, …), for progress estimates.
+    pub fn node_count(&self) -> usize { self.dom.nodes.len() }
+
+    /// The elements `h` is inside.
+    pub(crate) fn ancestors(&self, h: Handle) -> std::collections::HashSet<Handle> {
+        let mut out = std::collections::HashSet::new();
+        let mut p = self.dom.get(h).and_then(|n| n.parent);
+        while let Some(x) = p { out.insert(x); p = self.dom.get(x).and_then(|n| n.parent) }
+        out
+    }
+}
+
+/// Parse and style `html` (see `Prepared`).
+pub fn prepare(html: &str, fonts: &FontSet, env: &Env) -> Prepared {
     // ★ At another text size the pre-measured columns are measured AGAIN,
     // exactly (backend §4.9, `remeasure_tables`).
     let remeasured;
@@ -428,13 +543,28 @@ fn render_inner_t(html: &str, fonts: &FontSet, env: &Env, subs: &Subresources, g
     }
     let styled = cascade(&dom, &sheets, env);
     diagnostics.extend(styled.diagnostics);
-    let mut cx = Cx { dom: &dom, styles: &styled.styles, sh: Shaper::new(fonts), scene: Scene { width: u(env.width_px), ..Default::default() },
+    let promoted = promote_block_in_inline(&dom, &styled.styles);
+    Prepared { dom, styles: styled.styles, diagnostics, promoted }
+}
+
+/// Lay a prepared document out: whole, to the first-screen limit
+/// (`STOP_AFTER`), or one band of it (`band`, `bands::Banded`).
+fn lay_out(p: &Prepared, fonts: &FontSet, env: &Env, subs: &Subresources, geo: bool, band: Option<BandRun>) -> (HtmlOut, Option<GeoLog>, bool, Option<BandRun>) {
+    let dom = &p.dom;
+    let styles: &[Option<std::rc::Rc<Style>>] = &p.styles;
+    let mut diagnostics = p.diagnostics.clone();
+    let sh = match band.as_ref().and_then(|b| b.shape_cache.clone()) { Some(c) => Shaper::with_cache(fonts, c), None => Shaper::new(fonts) };
+    let mut cx = Cx { dom, styles, sh, scene: Scene { width: u(env.width_px), ..Default::default() },
                       report: Report::default(), links: vec![], unimplemented: BTreeMap::new(), marker: None, baseline_probe: None, indent: None, iso_paths: vec![vec![]], iso_cur: 0, content_dy: 0, table_part: false, promoted: vec![], boxes: std::env::var_os("NSG_DUMP_BOXES").map(|_| vec![]), geo: None, inl_cur: 0,
                       viewport: (u(env.width_px), Some(u(env.height_px))), pos_cb: (0, 0, u(env.width_px), Some(u(env.height_px))),
-                      subs, placing_abs: false, pending_abs: vec![], deferred_abs: vec![], cb_open: false, canvas_src: None, abs_origin: None, flex_static: None, measured: HashMap::new(), contexts: vec![], hoists: vec![], diagnostics: vec![], vector_budget: crate::path::DOCUMENT_SEGMENT_SHARE, in_scroll: false, scroll_open: None, measured_tables: HashMap::new(), scroll_table: None, stop_after: None, stop_ok: true, table_stop: None, truncated: false, stop_unsafe: false };
+                      subs, placing_abs: false, pending_abs: vec![], deferred_abs: vec![], cb_open: false, canvas_src: None, abs_origin: None, flex_static: None, measured: HashMap::new(), contexts: vec![], hoists: vec![], diagnostics: vec![], vector_budget: crate::path::DOCUMENT_SEGMENT_SHARE, in_scroll: false, scroll_open: None, measured_tables: HashMap::new(), scroll_table: None, stop_after: None, stop_ok: true, table_stop: None, truncated: false, stop_unsafe: false, band: None };
     if geo { cx.geo = Some(GeoLog { inl_paths: vec![vec![]], ..Default::default() }) }
     cx.stop_after = STOP_AFTER.with(|c| c.get());
-    cx.promoted = promote_block_in_inline(&dom, &styled.styles);
+    if let Some(b) = band {
+        cx.vector_budget = b.vector_budget;
+        cx.band = Some(b);
+    }
+    cx.promoted = p.promoted.clone();
     cx.count_unread_rows();
     // The root element is the initial containing block's only child.
     let root = dom.element_children(dom.root()).into_iter().next();
@@ -444,12 +574,13 @@ fn render_inner_t(html: &str, fonts: &FontSet, env: &Env, subs: &Subresources, g
     // this, example.com — `body { background: #eee; width: 60vw }` — came
     // out as a grey column on white instead of a grey page.
     let body = root.and_then(|r| dom.element_children(r).into_iter().find(|c| dom.tag(*c) == Some("body")));
-    let bg_of = |h: Handle| styled.styles.get(h as usize).and_then(|s| s.as_ref()).map(|s| color_of(s, "background-color")).unwrap_or(0);
+    let bg_of = |h: Handle| styles.get(h as usize).and_then(|s| s.as_ref()).map(|s| color_of(s, "background-color")).unwrap_or(0);
     cx.canvas_src = [root, body].into_iter().flatten().find(|h| bg_of(*h) & 0xff != 0);
     let canvas = cx.canvas_src.map(|src| {
         cx.scene.rect(Rect { x: 0, y: 0, w: u(env.width_px), h: 0, rgba: bg_of(src), radii: [0; 4], ring: 0 });
         cx.scene.rects.len() - 1
     });
+    if let (Some(i), Some(b)) = (canvas, cx.band.as_mut()) { b.spanning.push((0, i, Handle::MAX, 0, b.k > 0)) }
     // The root's containing block is the viewport: definite in both axes.
     let h = match root { Some(r) => cx.block(r, 0, 0, u(env.width_px), Some(u(env.height_px)), (None, None)), None => 0 };
     // ★ The scene's extent is what a reader can scroll to, and that is the
@@ -464,8 +595,16 @@ fn render_inner_t(html: &str, fonts: &FontSet, env: &Env, subs: &Subresources, g
         .chain(cx.scene.grads.iter().map(|g| g.area.y + g.area.h))
         .max().unwrap_or(0);
     cx.scene.height = h.max(u(env.height_px)).max(bottom);
+    if let Some(b) = cx.band.as_mut() {
+        // A band run's root height is the height of what it laid out; the
+        // canvas covers the document as far as it is known.
+        b.root_h = h;
+        cx.scene.height = cx.scene.height.max(b.canvas_h);
+    }
     if let Some(i) = canvas { cx.scene.rects[i].h = cx.scene.height }
-    cx.scene.order = restack(&cx.scene.order, &cx.contexts, &cx.hoists);
+    let (order, keys) = restack_keyed(&cx.scene.order, &cx.contexts, &cx.hoists, cx.band.is_some());
+    cx.scene.order = order;
+    if let Some(b) = cx.band.as_mut() { b.keys = keys }
     cx.scene.resolve_xforms();
     diagnostics.extend(cx.diagnostics);
     if let Some(v) = &cx.boxes {
@@ -479,8 +618,10 @@ fn render_inner_t(html: &str, fonts: &FontSet, env: &Env, subs: &Subresources, g
     let log = cx.geo.take();
     let truncated = cx.truncated;
     STOP_UNSAFE.with(|c| c.set(cx.stop_unsafe));
+    let mut band = cx.band.take();
+    if let Some(b) = band.as_mut() { b.vector_budget = cx.vector_budget }
     let out = HtmlOut { scene: cx.scene, report: cx.report, diagnostics, unimplemented: cx.unimplemented };
-    (out, log, dom, truncated)
+    (out, log, truncated, band)
 }
 
 /// ★ §3.13's offline half: measure every table column's min-content and
@@ -510,7 +651,7 @@ pub fn premeasure_tables_at(html: &str, fonts: &FontSet, env: &Env) -> (String, 
                       report: Report::default(), links: vec![], unimplemented: BTreeMap::new(), marker: None, baseline_probe: None,
                       indent: None, iso_paths: vec![vec![]], iso_cur: 0, content_dy: 0, table_part: false, promoted: vec![], boxes: std::env::var_os("NSG_DUMP_BOXES").map(|_| vec![]), geo: None, inl_cur: 0, viewport: (u(env.width_px), Some(u(env.height_px))),
                       pos_cb: (0, 0, u(env.width_px), Some(u(env.height_px))), subs: &Subresources::new(),
-                      placing_abs: false, pending_abs: vec![], deferred_abs: vec![], cb_open: false, canvas_src: None, abs_origin: None, flex_static: None, measured: HashMap::new(), contexts: vec![], hoists: vec![], diagnostics: vec![], vector_budget: crate::path::DOCUMENT_SEGMENT_SHARE, in_scroll: false, scroll_open: None, measured_tables: HashMap::new(), scroll_table: None, stop_after: None, stop_ok: true, table_stop: None, truncated: false, stop_unsafe: false };
+                      placing_abs: false, pending_abs: vec![], deferred_abs: vec![], cb_open: false, canvas_src: None, abs_origin: None, flex_static: None, measured: HashMap::new(), contexts: vec![], hoists: vec![], diagnostics: vec![], vector_budget: crate::path::DOCUMENT_SEGMENT_SHARE, in_scroll: false, scroll_open: None, measured_tables: HashMap::new(), scroll_table: None, stop_after: None, stop_ok: true, table_stop: None, truncated: false, stop_unsafe: false, band: None };
     // (table, per-column (min, max), its first row's cells) for every table.
     let mut tables: Vec<(Handle, Vec<(U, U)>, Vec<Handle>)> = vec![];
     // ★ INNER TABLES FIRST: a cell holding a table is as wide as that
@@ -1102,6 +1243,10 @@ impl<'a> Cx<'a> {
         // text-indent (inherited) applies to this container's first line.
         self.indent = len(s.get("text-indent"), content_w).filter(|v| *v != 0);
         let mut cy = by + bt + pt + std::mem::take(&mut self.content_dy);
+        let mut skipped_any = false;
+        let skips0 = self.band.as_ref().map(|b| b.skips).unwrap_or(0);
+        let fired_before = self.band.as_ref().is_some_and(|b| b.fired.is_some());
+        let flow_ok = self.stop_ok;
         // Children: block-level children stack; runs of inline content
         // between them form anonymous block boxes of line boxes.
         if kw(s, "display") == "grid" {
@@ -1122,7 +1267,71 @@ impl<'a> Cx<'a> {
         } else {
             let mut inline: Vec<Item> = vec![];
             let mut stopped = false;
-            for c in self.dom.children_of(h) {
+            let mut kids = self.dom.children_of(h);
+            // ★ A box this band continues: start at the child on the way to
+            // the checkpoint, at the y it was laid out at, instead of walking
+            // every child before it (that walk made a band run cost the
+            // position of its checkpoint, and the first pass quadratic).
+            if self.stop_ok {
+                if let Some(b) = self.band.as_mut().filter(|b| b.resume_path.contains(&h)) {
+                    if let Some(i) = kids.iter().position(|c| b.resume_at == Some(*c) || b.resume_path.contains(c)) {
+                        if let Some(&y_at) = b.at.get(&kids[i]) {
+                            if i > 0 {
+                                kids.drain(..i);
+                                cy = y_at;
+                                if let Some(&(d, k0)) = b.lines_before.get(&kids[0]) { if k0 < b.k { cy += d } }
+                                self.indent = None;
+                                self.marker = None;
+                                skipped_any = true;
+                                b.skips += 1;
+                            }
+                        }
+                    }
+                }
+            }
+            for c in kids {
+                // ★ A band run (`BandRun`): nothing after its stop; blocks an
+                // earlier band completed are skipped by their height; the stop
+                // is only ever before a block in plain flow with no inline
+                // content pending.
+                if self.band.is_some() {
+                    if self.band.as_ref().is_some_and(|b| b.fired.is_some()) { break }
+                    if self.stop_ok && self.is_block_level(c) {
+                        let b = self.band.as_mut().unwrap();
+                        // The line boxes flushed before this block, laid out
+                        // by an earlier band (the block itself may be one
+                        // this band continues).
+                        if let Some(&(d, k0)) = b.lines_before.get(&c) {
+                            if k0 < b.k && !inline.is_empty() {
+                                inline.clear();
+                                self.pending_abs.clear();
+                                self.indent = None;
+                                self.marker = None;
+                                cy += d;
+                                skipped_any = true;
+                                b.skips += 1;
+                            }
+                        }
+                        if let Some(&(d, k0)) = b.done.get(&c) {
+                            if k0 < b.k {
+                                inline.clear();
+                                self.pending_abs.clear();
+                                // The first line is behind us: its indent and
+                                // a list item's marker went with it.
+                                self.indent = None;
+                                self.marker = None;
+                                cy += d;
+                                skipped_any = true;
+                                b.skips += 1;
+                                continue;
+                            }
+                        }
+                        if inline.is_empty() && (b.cut_at == Some(c) || (b.cut_at.is_none() && b.limit.is_some_and(|l| cy > l))) {
+                            b.fired = Some((c, cy));
+                            continue;
+                        }
+                    }
+                }
                 // ★ First screen only: nothing below the limit is laid out —
                 // stopping only BEFORE a block, never inside a paragraph
                 // (total-fit line breaking makes a line depend on the words
@@ -1151,9 +1360,20 @@ impl<'a> Cx<'a> {
                 }
                 if self.is_block_level(c) {
                     let ly = cy;
+                    if self.stop_ok {
+                        if let Some(b) = self.band.as_mut().filter(|b| b.fired.is_none()) { b.at.entry(c).or_insert(ly); }
+                    }
+                    let had_inline = !inline.is_empty();
                     cy += self.lines(std::mem::take(&mut inline), content_x, cy, content_w, s);
                     self.place_pending_abs(content_x, content_x + content_w, ly);
+                    if had_inline && self.stop_ok {
+                        if let Some(b) = self.band.as_mut().filter(|b| b.fired.is_none()) { b.lines_before.insert(c, (cy - ly, b.k)); }
+                    }
+                    let by0 = cy;
                     cy += self.block(c, content_x, cy, content_w, child_cb_h, (None, None));
+                    if self.stop_ok {
+                        if let Some(b) = self.band.as_mut().filter(|b| b.fired.is_none()) { b.done.insert(c, (cy - by0, b.k)); }
+                    }
                 } else {
                     self.collect_inline(c, &mut inline, s);
                 }
@@ -1161,6 +1381,24 @@ impl<'a> Cx<'a> {
             let ly = cy;
             cy += self.lines(inline, content_x, cy, content_w, s);
             self.place_pending_abs(content_x, content_x + content_w, ly);
+        }
+        // ★ A band run that cut this box paints it at its real height, once a
+        // band has completed it; until then it paints nothing (and the band
+        // is laid out again once that size is known, `bands::Banded`).
+        // ★ The box BEGAN in an earlier band exactly when it is an ancestor
+        // of this band's checkpoint block: anything else before the
+        // checkpoint was skipped whole. (Whether something inside it was
+        // skipped is not enough: the cut can fall before its first child.)
+        let _ = skips0;
+        let skipped_any = skipped_any || self.band.as_ref().is_some_and(|b| b.resume_path.contains(&h));
+        let mut suppress = false;
+        let fired_inside = !fired_before && self.band.as_ref().is_some_and(|b| b.fired.is_some());
+        if let Some(b) = self.band.as_mut() {
+            if fired_inside {
+                match b.finals.get(&h) { Some(&end) => cy = end, None => { suppress = true; b.suppressed += 1 } }
+            } else if flow_ok {
+                b.finals.insert(h, cy);
+            }
         }
         let content_h = cy - (by + bt + pt);
         let hgt = definite.unwrap_or_else(|| clamp(content_h + pt + pb + bt + bb).max(vframe).max(cell_floor.unwrap_or(0)));
@@ -1176,7 +1414,8 @@ impl<'a> Cx<'a> {
         self.scene.cur.0 = saved_attrs.0;
         // Paint: background over the border box, then borders — unless
         // visibility: hidden, which keeps the box and paints none of it.
-        let hidden = kw(s, "visibility") == "hidden";
+        let hidden = kw(s, "visibility") == "hidden" || suppress;
+        let lens0 = (self.scene.rects.len(), self.scene.shadows.len(), self.scene.grads.len(), self.scene.images.len(), self.scene.paths.len());
         let mut paint = vec![];
         // ★ border-radius: four corners, then CSS's overlap clamp — if two
         // radii on a side exceed it, ALL radii scale by the same factor.
@@ -1261,6 +1500,7 @@ impl<'a> Cx<'a> {
                 for r in edge(ow, sx, sy, length, horiz, ostyle, oc) { self.scene.rect(r) }
             }
         }
+        let outline_end = self.scene.rects.len();
         let n_paint = paint.len();
         // ★ The shadow goes BEHIND the box, so it is inserted at the slot
         // first and the box's own rects land after it. The spread inflates
@@ -1331,6 +1571,17 @@ impl<'a> Cx<'a> {
             }
         }
         let painted = slot - bg_slot;
+        if self.band.is_some() && (skipped_any || fired_inside) {
+            let lens1 = (self.scene.rects.len(), self.scene.shadows.len(), self.scene.grads.len(), self.scene.images.len(), self.scene.paths.len());
+            let b = self.band.as_mut().unwrap();
+            for (k, (a, z)) in [(0u8, (lens0.0, lens1.0)), (3, (lens0.1, lens1.1)), (4, (lens0.2, lens1.2)), (5, (lens0.3, lens1.3)), (6, (lens0.4, lens1.4))] {
+                b.spanning.extend((a..z).map(|i| (k, i, h, by, skipped_any && !(k == 0 && i < outline_end))));
+            }
+            if skipped_any && !fired_inside {
+                let painted_any = lens1 != lens0;
+                b.completed_spans.push((by, painted_any, positioned || xf_id.is_some()));
+            }
+        }
         // ★ Inserting this box's background at the slot reserved before the
         // children SHIFTS every entry after it, so the ranges the children
         // recorded no longer point at what they painted. Move them.
@@ -1365,6 +1616,14 @@ impl<'a> Cx<'a> {
     /// been placed in: its static position is the left end of it, or in an
     /// rtl containing block the RIGHT end (CSS 2.1 §10.3.7).
     fn abs_box(&mut self, h: Handle, static_x: U, static_r: U, static_y: U) {
+        // A band never stops inside an out-of-flow box: it is laid out whole.
+        let keep = self.stop_ok && self.band.is_none();
+        let so = std::mem::replace(&mut self.stop_ok, keep);
+        self.abs_box_inner(h, static_x, static_r, static_y);
+        self.stop_ok = so;
+    }
+
+    fn abs_box_inner(&mut self, h: Handle, static_x: U, static_r: U, static_y: U) {
         let fs = self.flex_static.take();
         let Some(s) = self.st(h) else { return };
         let rtl = self.dom.get(h).and_then(|n| n.parent).and_then(|p| self.st(p)).is_some_and(|ps| kw(ps, "direction") == "rtl");
@@ -3471,7 +3730,16 @@ impl<'a> Cx<'a> {
     }
 
     /// Greedy line breaking of `items` into line boxes; returns their height.
-    fn lines(&mut self, mut items: Vec<Item>, x: U, y: U, w: U, block: &Style) -> U {
+    fn lines(&mut self, items: Vec<Item>, x: U, y: U, w: U, block: &Style) -> U {
+        // A band never stops inside a line box (an inline-block's content).
+        let keep = self.stop_ok && self.band.is_none();
+        let so = std::mem::replace(&mut self.stop_ok, keep);
+        let r = self.lines_inner(items, x, y, w, block);
+        self.stop_ok = so;
+        r
+    }
+
+    fn lines_inner(&mut self, mut items: Vec<Item>, x: U, y: U, w: U, block: &Style) -> U {
         if items.iter().all(|i| matches!(i, Item::Space(..))) { return 0 }
         // A pending list marker: `inside` is the first inline item; `outside`
         // hangs left of the first line box, on its baseline.
@@ -5390,7 +5658,7 @@ mod tests {
                           report: Report::default(), links: vec![], unimplemented: BTreeMap::new(), marker: None,
                           baseline_probe: None, indent: None, iso_paths: vec![vec![]], iso_cur: 0, content_dy: 0, table_part: false, promoted: vec![], boxes: std::env::var_os("NSG_DUMP_BOXES").map(|_| vec![]), geo: None, inl_cur: 0,
                           viewport: (0, None), pos_cb: (0, 0, 0, None), subs: &Subresources::new(),
-                          placing_abs: false, pending_abs: vec![], deferred_abs: vec![], cb_open: false, canvas_src: None, abs_origin: None, flex_static: None, measured: HashMap::new(), contexts: vec![], hoists: vec![], diagnostics: vec![], vector_budget: crate::path::DOCUMENT_SEGMENT_SHARE, in_scroll: false, scroll_open: None, measured_tables: HashMap::new(), scroll_table: None, stop_after: None, stop_ok: true, table_stop: None, truncated: false, stop_unsafe: false };
+                          placing_abs: false, pending_abs: vec![], deferred_abs: vec![], cb_open: false, canvas_src: None, abs_origin: None, flex_static: None, measured: HashMap::new(), contexts: vec![], hoists: vec![], diagnostics: vec![], vector_budget: crate::path::DOCUMENT_SEGMENT_SHARE, in_scroll: false, scroll_open: None, measured_tables: HashMap::new(), scroll_table: None, stop_after: None, stop_ok: true, table_stop: None, truncated: false, stop_unsafe: false, band: None };
         cx.count_rows_outside(&held_out);
         // The non-initial value is counted once; the initial one is not.
         assert_eq!(cx.unimplemented.get("row text-align… (not implemented)"), Some(&1), "{:?}", cx.unimplemented);
@@ -6083,7 +6351,33 @@ fn promote_block_in_inline(dom: &Dom, styles: &[Option<std::rc::Rc<Style>>]) -> 
 }
 
 fn restack(order: &[(u8, usize)], real: &[(i64, usize, usize, usize)], hoist: &[(usize, usize)]) -> Vec<(u8, usize)> {
-    if real.is_empty() && hoist.is_empty() { return order.to_vec() }
+    restack_keyed(order, real, hoist, false).0
+}
+
+/// A leaf's place in painting order apart from where it was emitted: the
+/// z-index chain of the stacking contexts it is in, and whether it is
+/// hoisted (layer 6). Two leaves compare by this, then by emission order.
+pub(crate) type StackKey = (std::rc::Rc<[i64]>, u8);
+
+/// Compare two stacking keys (the emission order breaks a tie).
+pub(crate) fn stack_cmp(ka: &StackKey, kb: &StackKey) -> std::cmp::Ordering {
+    for (x, y) in ka.0.iter().zip(kb.0.iter()) { if x != y { return x.cmp(y) } }
+    let ord = match ka.0.len().cmp(&kb.0.len()) {
+        std::cmp::Ordering::Less => if kb.0[ka.0.len()] < 0 { std::cmp::Ordering::Greater } else { std::cmp::Ordering::Less },
+        std::cmp::Ordering::Greater => if ka.0[kb.0.len()] < 0 { std::cmp::Ordering::Less } else { std::cmp::Ordering::Greater },
+        std::cmp::Ordering::Equal => std::cmp::Ordering::Equal,
+    };
+    ord.then(ka.1.cmp(&kb.1))
+}
+
+/// `restack`, and (when `keyed`) each restacked entry's stacking key and
+/// emission index.
+fn restack_keyed(order: &[(u8, usize)], real: &[(i64, usize, usize, usize)], hoist: &[(usize, usize)], keyed: bool) -> (Vec<(u8, usize)>, Vec<(StackKey, u32)>) {
+    if real.is_empty() && hoist.is_empty() {
+        let none: std::rc::Rc<[i64]> = std::rc::Rc::from(Vec::new());
+        let keys = if keyed { (0..order.len()).map(|i| ((none.clone(), 0), i as u32)).collect() } else { vec![] };
+        return (order.to_vec(), keys);
+    }
     let key = |i: usize| -> (Vec<i64>, u8) {
         let mut chain: Vec<&(i64, usize, usize, usize)> = real.iter().filter(|c| i >= c.1 && i < c.2).collect();
         // Outer ranges first: they start earlier, and on a tie they end later.
@@ -6102,6 +6396,7 @@ fn restack(order: &[(u8, usize)], real: &[(i64, usize, usize, usize)], hoist: &[
     };
     let keys: Vec<(Vec<i64>, u8)> = (0..order.len()).map(key).collect();
     let mut idx: Vec<usize> = (0..order.len()).collect();
+    let mut out_keys = vec![];
     idx.sort_by(|a, b| {
         let (ka, kb) = (&keys[*a], &keys[*b]);
         for (x, y) in ka.0.iter().zip(kb.0.iter()) { if x != y { return x.cmp(y) } }
@@ -6114,7 +6409,14 @@ fn restack(order: &[(u8, usize)], real: &[(i64, usize, usize, usize)], hoist: &[
         };
         ord.then(ka.1.cmp(&kb.1)).then(a.cmp(b))
     });
-    idx.into_iter().map(|i| order[i]).collect()
+    if keyed {
+        let mut interned: HashMap<Vec<i64>, std::rc::Rc<[i64]>> = HashMap::new();
+        out_keys = idx.iter().map(|&i| {
+            let c = interned.entry(keys[i].0.clone()).or_insert_with(|| std::rc::Rc::from(keys[i].0.clone())).clone();
+            ((c, keys[i].1), i as u32)
+        }).collect();
+    }
+    (idx.into_iter().map(|i| order[i]).collect(), out_keys)
 }
 
 /// The matrix for a `transform` list, about `origin` (absolute, 1/64 px).
