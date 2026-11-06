@@ -28,6 +28,8 @@ struct Worker {
     sessions: Sessions,
     id: Option<SessionId>,
     progress: navigator_backend::progressive::Progress,
+    /// The recording as opened: its normalizer inputs, for the display path.
+    recording: Vec<u8>,
 }
 
 impl Worker {
@@ -41,7 +43,28 @@ impl Worker {
         let r = ingest(recording, &Limits::default()).map_err(|e| e.to_string())?;
         self.id = Some(self.sessions.open(&r, 0).map_err(|e| e.to_string())?);
         self.progress = navigator_backend::progressive::Progress::opened(recording);
+        self.recording = recording.to_vec();
         Ok(self.triggers())
+    }
+
+    /// The first screen (`display`): see `wire::REQ_SCENE` for the shape.
+    fn scene(&mut self, payload: &[u8]) -> Result<Vec<u8>, String> {
+        let nl = payload.iter().position(|&b| b == b'\n').filter(|&i| i <= 40).ok_or("no header line")?;
+        let head = std::str::from_utf8(&payload[..nl]).map_err(|_| "header is not text")?;
+        let f: Vec<&str> = head.split(' ').collect();
+        let [initial, limit, n] = f.as_slice() else { return Err("header is not three fields".into()) };
+        let initial = match *initial { "0" => false, "1" => true, _ => return Err("initial is not 0 or 1".into()) };
+        let limit: u32 = limit.parse().map_err(|_| "limit is not a number")?;
+        let n: usize = n.parse().map_err(|_| "length is not a number")?;
+        if nl + 1 + n != payload.len() { return Err("cached length does not match the payload".into()) }
+        let cached = (n > 0).then(|| &payload[nl + 1..]);
+        let current = if initial { None } else { Some(self.session()?.document().dom.serialize()) };
+        let a = navigator_backend::display::first_screen(&self.recording, current.as_deref(), cached, limit)?;
+        let norm = a.normalized.unwrap_or_default();
+        let mut out = format!("{}\n", norm.len()).into_bytes();
+        out.extend_from_slice(&norm);
+        out.extend_from_slice(a.nsg.as_bytes());
+        Ok(out)
     }
 
     fn session(&mut self) -> Result<&mut navigator_backend::session::Session, String> {
@@ -165,7 +188,7 @@ impl Worker {
 
 fn main() {
     let mut w = Worker { sessions: Sessions::new(SessionLimits { max_sessions: 1, ..SessionLimits::default() }), id: None,
-                         progress: Default::default() };
+                         progress: Default::default(), recording: vec![] };
     let mut input = BufReader::new(std::io::stdin());
     let mut output = std::io::stdout();
     loop {
@@ -197,6 +220,7 @@ fn main() {
             REQ_SWAP => w.swap(&f.text()).map(String::into_bytes),
             REQ_ATTACH => w.attach(&f.payload).map(String::into_bytes),
             REQ_HREF => w.links_to(&f.text()).map(|y| if y { "yes" } else { "no" }.into()),
+            REQ_SCENE => w.scene(&f.payload),
             other => Err(format!("unknown request {other:?}")),
         };
         let reply = match answer {

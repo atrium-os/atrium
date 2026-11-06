@@ -1508,6 +1508,7 @@ On the corpus (`examples/first_screen_check`: first screen 600 px, laid out to 1
   visit skips it. It is not. No such cache exists. The display path (normalize, layout,
   scene) is not wired into the broker's worker yet; `bigdoc_measure` and these examples
   model it. The cache keyed by recording and font-set version (§8.5) is a design.
+  (Since built: phase 1b, below.)
 - *Where a big document's worker memory is now* (after style sharing; peak resident set,
   `examples/bigdoc_measure` and `examples/layout_peak`):
 
@@ -1529,6 +1530,69 @@ On the corpus (`examples/first_screen_check`: first screen 600 px, laid out to 1
   differing frames over flings, page-down and jump on four documents. It caught a
   harness bug on the way: a full redraw at a fractional scroll position, drawn half a
   pixel off.
+
+**Step 3, phase 1b built: the display path in the worker, normalized once (2026-11-06).**
+This replaces the correction above. The display path is now in the broker's worker, and
+the normalized document is stored by content address.
+- *The request.* `Request::Scene { session, limit_px }` gets `Event::Scene { nsg,
+  from_cache }`: the session's first screen as NSG, down to `limit_px` (1..=8192). On the
+  wire it is `SCN`. The payload is `<initial> <limit_px> <cached_len>\n` plus the cached
+  document. The answer is `<normalized_len>\n` plus the normalized document plus the NSG.
+  The worker runs `display::first_screen`: `render_html_first`, then exactly the nodes
+  `bands::index(..).nodes_in(0, limit)` returns. An answer is therefore bounded by a
+  screen, not by the document.
+- *Normalized once.* A session's document is the recording's *initial state* until a
+  Navigate, Forward, Restore or Swap succeeds on it. While it is:
+  - the broker keys the recording by the BLAKE3 hash of the exact bytes that worker
+    processed;
+  - the first worker to show it normalizes and hands the normalized document back with
+    the scene;
+  - the broker stores the document in its blob store;
+  - every later worker showing that recording gets the document and only lays out.
+  
+  A navigated document is normalized again from its current serialization, and it is
+  never read from or written to the cache. The cache adds no capability. A worker can
+  only poison the entry for the recording it was given, which its own answers already
+  render. The broker checks every answer, `check_scene`:
+  - the NSG is at most 8 MiB and has an `nsg 0.` header;
+  - the normalized document is at most 16 MiB and is UTF-8.
+  
+  A jailed worker whose answer is malformed is retired.
+  The index from recording to normalized document lives in the broker's memory, so it
+  cannot outlive the binaries (and font set) that produced its entries. An index that
+  persists across restarts must add the font-set and normalizer versions to the key
+  (§8.5).
+- *Checked.* `tests/display.rs`, through the in-process and jailed hosts:
+  - the first scene normalizes (it applies the recording's stylesheet, and a recoloured
+    expectation fails);
+  - a second session on the same recording is served from the cache with identical NSG;
+  - a navigated session is not served from the cache and draws the revealed content;
+  - an out-of-range limit is refused and the session survives;
+  - a cached document that differs from the recording is what gets drawn, which proves
+    the cached arm lays out the stored document;
+  - malformed answers are refused.
+  
+  On the 6 big documents the NSG is byte-identical across two normalizing runs and the
+  cached run. No normalizer or renderer code changed, so the identity set is unaffected
+  by construction.
+- *Measured* (`examples/scene_peak`, one process per run, 3 runs per arm, limit 1,200 px;
+  the spread across runs is under 6%):
+
+  | document | normalizing (first worker) | from the stored normalized document |
+  |---|---|---|
+  | HTML Living Standard | 3,709–3,947 ms, 1,145 MiB | **659–665 ms, 720 MiB** |
+  | 100,000-row table | 4,715–4,857 ms, 1,157 MiB | **452–461 ms, 476 MiB** |
+  | HN thread | 5,301–5,514 ms, 611 MiB | **1,036–1,089 ms, 228 MiB** |
+  | coreutils manual | 1,846–1,873 ms, 319 MiB | **117–123 ms, 117 MiB** |
+  | War and Peace | 291–298 ms, 155 MiB | **56–58 ms, 135 MiB** |
+  | Commons gallery | 164–165 ms, 48 MiB | **32 ms, 27 MiB** |
+
+  - *What remains on the cached path.* The worker still parses the whole recording JSON
+    for the normalizer's inputs, which a cached document no longer needs: the standard's
+    recording is 16 MiB. Its peak of 720 MiB against 409 MiB for first-screen layout
+    alone (`layout_peak --first`) is mostly that. Next: hand the worker only the
+    subresources a cached document needs.
+  - *Parsing and styling the whole document* remain until phase 2.
 
 *Phase 2* (next): checkpoints at top-level block boundaries, so the worker can lay a band
 out again from its checkpoint, drop far regions, and lay out a far jump without the

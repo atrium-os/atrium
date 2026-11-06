@@ -88,6 +88,17 @@ pub trait DocumentHost {
     {
         Err("this host does not decode images".into())
     }
+    /// ★ The first screen of a session's document as NSG (`display`), down
+    /// to `limit_px`. `initial` is the BROKER's judgement that the document
+    /// is still its recording's untouched initial state; only then may
+    /// `cached` (a normalized document the broker stored for that state) be
+    /// used, and only then does the answer carry the normalized document
+    /// for the broker to store. The broker validates what comes back.
+    fn scene(&mut self, _id: SessionId, _cached: Option<&[u8]>, _initial: bool, _limit_px: u32, _now: Millis)
+        -> Result<crate::display::SceneAnswer, String>
+    {
+        Err("this host does not lay documents out".into())
+    }
     /// Whether an `<a>` or `<area>` in the session's CURRENT document — after
     /// whatever transitions the reader took — carries exactly `href`. The
     /// precise half of the link check; the broker's own bound (`carried`)
@@ -165,6 +176,9 @@ pub enum Request {
     /// (§5.4.5.7, the image-free first display). From the converter, like
     /// `Upgrade`; never from a page.
     Images { session: SessionId, images: Vec<u8> },
+    /// The first screen of a session's document, down to `limit_px` (backend
+    /// §4.8, bands step 1): answered by `Event::Scene`.
+    Scene { session: SessionId, limit_px: u32 },
 }
 
 /// What the UI hears back.
@@ -223,6 +237,10 @@ pub enum Event {
     /// the reader's anchor, and presents it in one frame, as for a swap.
     /// `complete`: no image of this document is pending any more.
     ImagesAttached { session: SessionId, arrived: Vec<String>, resized: Vec<String>, complete: bool },
+    /// A first screen as NSG text, checked by the broker (`check_scene`).
+    /// `from_cache`: laid out from the normalized document the broker had
+    /// stored for this recording, without normalizing again.
+    Scene { session: SessionId, nsg: String, from_cache: bool },
 }
 
 /// The broker.
@@ -251,6 +269,31 @@ pub struct Navigatord<H: DocumentHost> {
     /// for that session's images, so an image is decoded again at its new
     /// painted size after a zoom — within the same decode budget.
     zoom: std::collections::BTreeMap<SessionId, u32>,
+    /// ★ NORMALIZED ONCE (`display`): each recording's normalized initial
+    /// document, by the recording's BLAKE3 hex → the stored document's, in
+    /// `blobs`. Written only from a session the broker knows is untouched,
+    /// for the recording that session holds: a worker that lied could only
+    /// change what THAT recording shows, which its author controls anyway.
+    normalized: std::collections::HashMap<String, String>,
+    /// Sessions whose document is no longer its recording's untouched
+    /// initial state (navigated, forwarded, restored or swapped).
+    touched: std::collections::BTreeSet<SessionId>,
+}
+
+/// The largest first-screen scene a host may answer, bytes of NSG.
+pub const MAX_SCENE_BYTES: usize = 8 << 20;
+/// The largest normalized document a host may hand back to be stored.
+pub const MAX_NORMALIZED_BYTES: usize = 16 << 20;
+
+/// ★ The broker's own check of a scene answer, whatever host gave it:
+/// sizes, UTF-8 (a `String` already), and the NSG header. The scene graph's
+/// full validator is §4.2's (open); this bounds what is passed on.
+pub fn check_scene(a: &crate::display::SceneAnswer) -> Result<(), String> {
+    if a.nsg.len() > MAX_SCENE_BYTES { return Err(format!("scene is {} bytes, over {MAX_SCENE_BYTES}", a.nsg.len())) }
+    if !a.nsg.starts_with("nsg 0.") { return Err("scene does not start with an NSG header".into()) }
+    if a.normalized.as_ref().is_some_and(|n| n.len() > MAX_NORMALIZED_BYTES) { return Err("normalized document over its bound".into()) }
+    if a.normalized.as_ref().is_some_and(|n| std::str::from_utf8(n).is_err()) { return Err("normalized document is not UTF-8".into()) }
+    Ok(())
 }
 
 /// Page zoom bounds, in 1/64: 25% to 500%.
@@ -321,7 +364,7 @@ impl<H: DocumentHost> Navigatord<H> {
             return Err("navigatord refuses to start: the document host is not confined \
                         (configure a launcher, e.g. `portcullis exec --daemon --instance {instance}`)".into());
         }
-        Ok(Navigatord { host, now: 0, schemes: SchemeAllowlist::default(), blobs: None, decoded: Default::default(), device_scale: NSG_UNIT as u32, zoom: Default::default() })
+        Ok(Navigatord { host, now: 0, schemes: SchemeAllowlist::default(), blobs: None, decoded: Default::default(), device_scale: NSG_UNIT as u32, zoom: Default::default(), normalized: Default::default(), touched: Default::default() })
     }
 
     /// An unconfined broker, for tests: in-process hosts, bare worker
@@ -330,7 +373,7 @@ impl<H: DocumentHost> Navigatord<H> {
     /// so a shipped binary that calls it does not link.
     #[cfg(any(test, feature = "unconfined-for-testing"))]
     pub fn unconfined_for_testing(host: H) -> Self {
-        Navigatord { host, now: 0, schemes: SchemeAllowlist::default(), blobs: None, decoded: Default::default(), device_scale: NSG_UNIT as u32, zoom: Default::default() }
+        Navigatord { host, now: 0, schemes: SchemeAllowlist::default(), blobs: None, decoded: Default::default(), device_scale: NSG_UNIT as u32, zoom: Default::default(), normalized: Default::default(), touched: Default::default() }
     }
 
     /// The host, for an operator (or a test) inspecting it.
@@ -388,6 +431,7 @@ impl<H: DocumentHost> Navigatord<H> {
                 if let Some(e) = self.absent(session) { out.push(e); return out }
                 match self.host.navigate(session, &trigger, self.now) {
                     Ok(()) => {
+                        self.touched.insert(session);
                         let triggers = self.host.triggers(session);
                         out.push(Event::SceneReady { session, triggers });
                     }
@@ -408,6 +452,7 @@ impl<H: DocumentHost> Navigatord<H> {
                 if let Some(e) = self.absent(session) { out.push(e); return out }
                 match self.host.forward(session, self.now) {
                     Ok(how) => {
+                        self.touched.insert(session);
                         let triggers = self.host.triggers(session);
                         out.push(Event::Advanced { session, how, triggers });
                     }
@@ -428,6 +473,7 @@ impl<H: DocumentHost> Navigatord<H> {
             Request::Restore { saved } => {
                 match self.host.restore(&saved, self.now) {
                     Ok(session) => {
+                        self.touched.insert(session);
                         let triggers = self.host.triggers(session);
                         out.push(Event::SessionOpened { session, triggers });
                     }
@@ -477,6 +523,7 @@ impl<H: DocumentHost> Navigatord<H> {
                 if let Some(e) = self.absent(session) { out.push(e); return out }
                 match self.host.swap(session, &anchor, self.now) {
                     Ok(anchor) => {
+                        self.touched.insert(session);
                         // A new document names its own images: what the old
                         // one's decodes cost is given back.
                         self.decoded.remove(&session);
@@ -504,6 +551,13 @@ impl<H: DocumentHost> Navigatord<H> {
                 if let Some(e) = self.absent(session) { out.push(e); return out }
                 match self.host.images(session, &images, self.now) {
                     Ok(a) => out.push(Event::ImagesAttached { session, arrived: a.arrived, resized: a.resized, complete: a.complete }),
+                    Err(why) => out.push(Event::Blocked { session: Some(session), why }),
+                }
+            }
+            Request::Scene { session, limit_px } => {
+                if let Some(e) = self.absent(session) { out.push(e); return out }
+                match self.scene(session, limit_px) {
+                    Ok(e) => out.push(e),
                     Err(why) => out.push(Event::Blocked { session: Some(session), why }),
                 }
             }
@@ -552,6 +606,22 @@ impl<H: DocumentHost> Navigatord<H> {
     /// shared store), the bytes are read and hash-checked by the store, the
     /// remaining budget is sent with them, and the host's answer is validated
     /// for shape before it becomes an event.
+    /// ★ A FIRST SCREEN, normalized once per recording (see `normalized`).
+    fn scene(&mut self, session: SessionId, limit_px: u32) -> Result<Event, String> {
+        let key = blake3::hash(self.host.carried(session).ok_or("no such session")?.bytes()).to_hex().to_string();
+        let initial = !self.touched.contains(&session);
+        let cached = if initial {
+            match (self.normalized.get(&key), self.blobs.as_ref()) { (Some(h), Some(b)) => b.get(h).ok(), _ => None }
+        } else { None };
+        let a = self.host.scene(session, cached.as_deref(), initial, limit_px, self.now)?;
+        check_scene(&a)?;
+        if let (true, None, Some(n), Some(b)) = (initial, &cached, &a.normalized, self.blobs.as_mut()) {
+            let h = b.put(n)?;
+            self.normalized.insert(key, h);
+        }
+        Ok(Event::Scene { session, nsg: a.nsg, from_cache: cached.is_some() })
+    }
+
     fn image(&mut self, session: SessionId, address: String, painted: Option<(u32, u32)>) -> Result<Event, String> {
         if crate::image::address_hex(&address).is_none() {
             return Err(format!("{address:?} is not an image address (blake3:<64 hex>)"));
@@ -771,6 +841,14 @@ impl DocumentHost for InProcessHost {
     {
         if self.sessions.get(id).is_none() { return Err("no such session".into()) }
         crate::image::decode(address, bytes, c).map_err(|e| e.to_string())
+    }
+    fn scene(&mut self, id: SessionId, cached: Option<&[u8]>, initial: bool, limit_px: u32, _now: Millis)
+        -> Result<crate::display::SceneAnswer, String>
+    {
+        let s = self.sessions.get(id).ok_or("no such session")?;
+        let current = (!initial).then(|| s.document().dom.serialize());
+        let rec = self.carried.get(&id).ok_or("no recording for this session")?;
+        crate::display::first_screen(rec.bytes(), current.as_deref(), cached, limit_px)
     }
     fn status(&self, id: SessionId) -> Status { self.sessions.status(id) }
     fn bytes(&self) -> usize { self.sessions.bytes() }

@@ -52,6 +52,8 @@ impl Carried {
     }
 
     pub fn len(&self) -> usize { self.bytes.len() }
+    /// The recording's bytes, as the broker holds them.
+    pub fn bytes(&self) -> &[u8] { &self.bytes }
     pub fn is_empty(&self) -> bool { self.bytes.is_empty() }
 }
 

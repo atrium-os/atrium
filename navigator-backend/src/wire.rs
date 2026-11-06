@@ -146,5 +146,11 @@ pub const REQ_SWAP: &str = "SWAP";
 /// A transitions artifact. Answers `now` and one offered trigger per line,
 /// `with-swap`, or `needs-swap`.
 pub const REQ_ATTACH: &str = "ATCH";
+/// The document's first screen (`display`). Payload: `<initial 0|1>
+/// <limit_px> <cached_len>\n` and `cached_len` bytes of a normalized document
+/// the broker stored (0 for none); the answer is `<normalized_len>\n`, that
+/// many bytes of the normalized document this worker produced (0 for none),
+/// then the NSG text.
+pub const REQ_SCENE: &str = "SCN";
 pub const RSP_OK: &str = "OK";
 pub const RSP_ERR: &str = "ERR";

@@ -21,6 +21,13 @@ navigator-dom = { path = "../navigator-dom" }
 # hash, and the same pure-Rust build, as navigator-prerender's subresources
 # (spec §5: the store is Tessera, and Tessera is content-addressed).
 blake3 = { version = "1", features = ["pure"] }
+# ★ The DISPLAY PATH (backend §4.8, bands; `display`): the worker normalizes
+# its document and lays out its first screen with the same crates the
+# converter's tools measure. The layout crates do not depend back on this one
+# (pergola.md §10.3).
+navigator-normalize = { path = "../navigator-normalize" }
+navigator-render = { path = "../navigator-render" }
+navigator-style = { path = "../navigator-style" }
 # The WHATWG URL parser, for the one decision the broker makes on a URL: where
 # an activated link may go (src/links.rs). The converter resolves every URL it
 # meets with the same crate.
@@ -31,6 +38,7 @@ url = "2"
 # the crate's SIMD intrinsics (its `unsafe`); the scalar path decodes the
 # same images. gif without `color_quant` (an encoder concern).
 png = "0.17"
+libc = "0.2"
 zune-jpeg = { version = "0.5", default-features = false, features = ["std"] }
 zune-core = { version = "0.5", default-features = false, features = ["std"] }
 image-webp = "0.2.4"
@@ -65,3 +73,9 @@ jpeg-encoder = "0.7.1"
 # Tests and examples get the unconfined constructor; the library does not.
 navigator-backend = { path = ".", features = ["unconfined-for-testing"] }
 png = "0.17"
+libc = "0.2"
+
+# navigator-fonts vendors a one-line fix to pathfinder_simd; a dependent crate
+# must repeat the patch, because [patch] only applies at the build root.
+[patch.crates-io]
+pathfinder_simd = { path = "../navigator-fonts/vendor/pathfinder_simd" }

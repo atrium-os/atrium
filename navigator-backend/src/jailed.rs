@@ -498,6 +498,30 @@ impl DocumentHost for JailedHost {
         }
     }
 
+    /// The first screen (`display`), asked of the worker; an answer of the
+    /// wrong shape retires it, as a bad image does.
+    fn scene(&mut self, id: SessionId, cached: Option<&[u8]>, initial: bool, limit_px: u32, now: Millis)
+        -> Result<crate::display::SceneAnswer, String>
+    {
+        let deadline = self.config.deadline;
+        let w = self.workers.get_mut(&id).ok_or("no such session")?;
+        w.last_seen = w.last_seen.max(now);
+        let c = cached.unwrap_or(&[]);
+        let mut payload = format!("{} {limit_px} {}\n", initial as u8, c.len()).into_bytes();
+        payload.extend_from_slice(c);
+        let reply = match w.request_limited(&Frame::new(REQ_SCENE, payload), deadline, MAX_FRAME) {
+            Ok(r) => r,
+            Err(why) => { self.retire(id, Status::Failed); return Err(why) }
+        };
+        if reply.tag == RSP_ERR { return Err(reply.text()) }
+        let parsed = if reply.tag == RSP_OK { parse_scene(reply.payload) }
+                     else { Err(format!("worker sent an unknown reply {:?}", reply.tag)) };
+        match parsed.and_then(|a| crate::navigatord::check_scene(&a).map(|_| a)) {
+            Ok(a) => Ok(a),
+            Err(why) => { self.retire(id, Status::Failed); Err(format!("worker sent a bad scene: {why}")) }
+        }
+    }
+
     /// ★ Asked of the worker, whose answer is believed only as far as the
     /// broker's own bound allows (`Navigatord::carries_link` checks the
     /// recording first). An answer other than yes or no is a lie.
@@ -658,6 +682,19 @@ impl DocumentHost for JailedHost {
         v.sort_by_key(|(id, _)| *id);
         v
     }
+}
+
+/// `<normalized_len>\n`, that many bytes, then NSG text: digits only, the
+/// length within its bound and the payload, the rest UTF-8.
+fn parse_scene(p: Vec<u8>) -> Result<crate::display::SceneAnswer, String> {
+    let nl = p.iter().position(|&b| b == b'\n').filter(|&i| i <= 12).ok_or("no length line")?;
+    let head = std::str::from_utf8(&p[..nl]).map_err(|_| "length is not text")?;
+    if head.is_empty() || !head.bytes().all(|b| b.is_ascii_digit()) { return Err("length is not a number".into()) }
+    let n: usize = head.parse().map_err(|_| "length is not a number")?;
+    if n > crate::navigatord::MAX_NORMALIZED_BYTES || nl + 1 + n > p.len() { return Err("normalized length out of bounds".into()) }
+    let normalized = (n > 0).then(|| p[nl + 1..nl + 1 + n].to_vec());
+    let nsg = String::from_utf8(p[nl + 1 + n..].to_vec()).map_err(|_| "scene is not UTF-8")?;
+    Ok(crate::display::SceneAnswer { nsg, normalized })
 }
 
 /// A worker's pixel reply: `<width> <height>\n` and exactly the RGBA8 bytes

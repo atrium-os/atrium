@@ -14,6 +14,7 @@
 
 pub mod apply;
 pub mod carried;
+pub mod display;
 pub mod document;
 pub mod image;
 pub mod ingest;
