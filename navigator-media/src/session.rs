@@ -8,9 +8,10 @@
 //! but what its own UI asks (and, for a script's video, what [`crate::mse`]
 //! maps).
 //!
-//! `Load` goes once the file is whole: a descriptor of a file still being
-//! filled reads as ended at the fill point, and the role has no message to
-//! say "more is coming" (an open question for P1; nuntius.md §3.3).
+//! `Load` goes as soon as the fetcher hands over the file's descriptor, with
+//! `growing: true` while the fetch is still filling it; `LoadDone` follows
+//! when the fetch is whole (limen.md §2.2, e3fa293). A file fetched whole
+//! before the embed attached goes as an ordinary `Load`.
 //!
 //! The policy (limen.md §2.1): at most [`LIVE_MAX`] live media embeds per
 //! page, and one starts only on the reader's press on its slot, or by the
@@ -59,7 +60,9 @@ pub enum NotStarted {
 enum State { Requested, Loaded, Playing, Paused, Ended, Failed }
 
 struct Live { state: State, want_play: bool, looping: bool, attached: bool, load: ToChild, muted: bool,
-              file: Option<std::os::fd::OwnedFd>, fetched: bool }
+              file: Option<std::os::fd::OwnedFd>, fetched: bool,
+              /// `Load` went with `growing: true`, so `LoadDone` is owed when the file is whole.
+              growing_sent: bool }
 
 pub struct Sessions {
     base_url: String,
@@ -116,7 +119,7 @@ impl Sessions {
         if host.request(key).is_err() { return Err(NotStarted::TooMany) }
         if host.fetch(key, &url).is_err() { host.release(key); return Err(NotStarted::BadUrl) }
         self.live.insert(key, Live { state: State::Requested, want_play: true, looping: e.flags & embed_flags::LOOP != 0,
-                                     attached: false, load, muted: e.flags & embed_flags::MUTED != 0, file: None, fetched: false });
+                                     attached: false, load, muted: e.flags & embed_flags::MUTED != 0, file: None, fetched: false, growing_sent: false });
         Ok(())
     }
 
@@ -128,17 +131,31 @@ impl Sessions {
         let Some(l) = self.live.get_mut(&key) else { return };
         match (fd, done) {
             (Some(f), _) => { l.file = Some(f); if done { l.fetched = true } }
-            (None, true) if l.file.is_some() => l.fetched = true,
+            (None, true) if l.file.is_some() || l.growing_sent => l.fetched = true,
             _ => { self.live.remove(&key); host.release(key); return }
+        }
+        // A file already loaded while growing is now whole: tell the player.
+        if l.fetched && l.growing_sent {
+            l.growing_sent = false;
+            if host.send(key, &ToChild::LoadDone).is_err() { l.state = State::Failed }
+            return;
         }
         self.try_load(key, host);
     }
 
     fn try_load(&mut self, key: u64, host: &mut dyn MediaHost) {
         let Some(l) = self.live.get_mut(&key) else { return };
-        if !(l.attached && l.fetched && l.state == State::Requested) { return }
+        // ★ The player takes a file that is still being written (limen.md
+        // §2.2, `growing`): `Load` goes as soon as the descriptor exists, and
+        // `LoadDone` follows when the fetch is whole (`fetched`).
+        if !(l.attached && l.state == State::Requested) { return }
         let Some(fd) = l.file.take() else { return };
-        if host.send_fd(key, &l.load, fd).is_ok() { l.state = State::Loaded } else { l.state = State::Failed }
+        let growing = !l.fetched;
+        let load = match &l.load {
+            ToChild::Load { source, mime, .. } => ToChild::Load { source: source.clone(), mime: mime.clone(), growing },
+            other => other.clone(),
+        };
+        if host.send_fd(key, &load, fd).is_ok() { l.state = State::Loaded; l.growing_sent = growing } else { l.state = State::Failed }
     }
 
     /// The embed for `key` is attached (Limen `Attached`): silence it first
@@ -163,7 +180,10 @@ impl Sessions {
                 l.state = State::Ended;
                 if l.looping { let _ = host.send(key, &ToChild::Seek { secs: 0.0 }); let _ = host.send(key, &ToChild::Play); }
             }
-            ToParent::Error { .. } => l.state = State::Failed,
+            // A refusal for one track (`Some`) belongs to a segment feed, not
+            // to this file session; only the player's own failure (`None`)
+            // ends it.
+            ToParent::Error { track: None, .. } => l.state = State::Failed,
             _ => {}
         }
     }

@@ -113,11 +113,13 @@ fn a_press_starts_a_player_that_loads_the_resolved_url() {
     assert_eq!(host.fetches, vec![(file, "https://site.test/media/a.webm".to_string())], "the Navigator fetches the resolved URL");
     s.attached(file, &mut host);
     s.fetched(file, Some(fd()), false, &mut host);
-    assert!(host.players[&file].received.is_empty(), "no Load until the file is whole");
-    s.fetched(file, None, true, &mut host);
     assert_eq!(host.fds, 1);
+    assert_eq!(host.players[&file].received, vec![ToChild::Load { source: Source::Fd, mime: "video/webm".into(), growing: true }],
+               "Load goes with the descriptor while the file is still filling");
+    s.fetched(file, None, true, &mut host);
     let p = host.players.get_mut(&file).unwrap();
-    assert_eq!(p.received, vec![ToChild::Load { source: Source::Fd, mime: "video/webm".into(), growing: false }], "Load with the descriptor");
+    assert_eq!(p.received.last(), Some(&ToChild::LoadDone), "LoadDone once the fetch is whole");
+    assert_eq!(host.fds, 1, "one descriptor only");
     // Ready: the press asked to play.
     for m in p.deliver() { s.from_player(file, &m, &mut host) }
     let p = host.players.get_mut(&file).unwrap();
