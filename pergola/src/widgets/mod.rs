@@ -20,6 +20,7 @@ pub mod label;
 pub mod phosphor;
 pub mod scroll_view;
 pub mod text_field;
+pub mod virtual_list;
 
 pub use basics::{Avatar, Divider, Dot, ProgressBar};
 pub use button::Button;
