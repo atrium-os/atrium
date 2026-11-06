@@ -1,0 +1,21 @@
+[package]
+name        = "arca-store"
+version     = "0.1.0"
+edition     = "2021"
+license     = "MIT OR Apache-2.0"
+publish     = false
+description = "Arca's at-rest store (docs/spec/arca.md §6): the key hierarchy, recipient-bound records, classes and lock eviction. No network, no external parsers; only its own bounded file format."
+
+[lib]
+name = "arca_store"
+path = "src/lib.rs"
+
+[dependencies]
+chacha20poly1305 = { version = "0.10", default-features = false, features = ["alloc"] }
+argon2           = { version = "0.5", default-features = false, features = ["alloc"] }
+zeroize          = { version = "1", features = ["derive"] }
+getrandom        = { version = "0.2", features = ["std"] }
+libc             = "0.2"
+
+[dev-dependencies]
+tempfile = "3"

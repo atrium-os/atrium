@@ -64,7 +64,7 @@ A recipient is something the **system** can verify, never a string an app suppli
 | recipient | verified by | example |
 |---|---|---|
 | **network endpoint**: scheme, host, port, and for web items the partition (§8.2) | the courier's own TLS handshake: WebPKI name check, plus an optional pinned key | the cookie for `https://mail.example`; an API token for `https://api.github.com` |
-| **app**: publisher key plus app id | the signed manifest jaild verified at launch ([jaild-policy.md](jaild-policy.md)); Arca gets the label with the channel (§4.1), not from a message | a database password that a native client must hold itself |
+| **app**: publisher key plus app id | the signed manifest jaild verified at launch ([jaild-policy.md](jaild-policy.md)); Arca gets the label from the kernel peer uid and the launch registry (§4.1), not from a message | a database password that a native client must hold itself |
 | **the user** | a Vestibulum-verified presence check, then the trusted UI | "show password", copy to clipboard |
 | **a key operation** | not released at all: Arca does the operation | WebAuthn assertion for RP ID `example.com` |
 
@@ -72,7 +72,7 @@ A recipient is something the **system** can verify, never a string an app suppli
 recipient, but the release happens only after the system has checked that recipient:
 
 - the courier has completed TLS to the bound endpoint, or
-- the channel belongs to the bound app's jail, or
+- the connection's peer uid belongs to the bound app (§4.1), or
 - the user has passed Vestibulum's check.
 
 Matching is exact:
@@ -93,19 +93,30 @@ one app, and can be revoked. It is logged and shown in the trusted UI.
 
 ## 4. Who talks to Arca, and how Arca knows who they are
 
-### 4.1 Identity is the channel, not the message
+### 4.1 Identity is the kernel's answer, not the message
 
-Arca never reads "I am app X" from a request. Each client gets its channel at spawn:
+*Amended 2026-11-06 (user's decision): Arca uses the platform's one identity primitive
+instead of a socketpair of its own.*
 
-1. portcullisd asks jaild to start a jail for a client, labelled with its verified identity
-   (app: publisher key and app id; courier: user, persona, recipient endpoint).
-2. portcullisd asks Arca for a channel for that label. Arca creates a socketpair, keeps one
-   end tagged with the label, and hands the other back.
-3. portcullisd installs that end in the new jail as an inherited descriptor.
+Arca never reads "I am app X" from a request. It asks the kernel who is connected:
 
-So the label is fixed by jaild, portcullisd and Arca together. A compromised app can
-send any bytes it likes on its channel, but the channel's identity is not among them. No
-path, socket name or pid is ever trusted.
+1. portcullisd launches every app under a **dedicated per-app uid** (portcullis.md §9.0)
+   after verifying its signed manifest, and records `uid → (owning user, app id,
+   publisher key)` in the launch registry (`portcullis-peer`). Tabula, Praeco, Choragus
+   and Fresco read the same registry.
+2. Arca takes the peer's uid with `getpeereid` on each accepted connection and resolves it
+   in the registry. The label is (user, publisher key, app id). A uid with no registry
+   entry is not an app, and gets nothing.
+3. An app id that is re-installed under a different publisher key is a different
+   identity: its registry entry carries the new key, and none of the old items match
+   (§3, a changed recipient is a new item).
+4. Couriers (§5) run under uids from their own reserved range, recorded with their label
+   (user, persona, recipient endpoint) the same way. Vestibulum is a fixed system uid.
+
+So the label is fixed by jaild, portcullisd and the kernel. A compromised app can send any
+bytes it likes, but its uid is not among them. No path, socket name or pid is ever
+trusted. One mechanism for every service is also one thing to audit, rather than a
+second channel scheme only Arca uses.
 
 ### 4.2 The clients
 
@@ -236,7 +247,7 @@ user credential (passcode, biometric, recovery key)        — Vestibulum
 - **No network, no parser of anything external.** Arca reads only its own store and the
   structured records couriers send, under a small fixed schema.
 - **A jail of its own, Capsicum after start.** Its descriptors are its store directory,
-  the channels it creates and its Vestibulum and TPM links.
+  its listening socket, the launch registry (read-only) and its Vestibulum and TPM links.
 - **Memory.**
   - Every page holding a clear key or item is `mlock`ed, so it never reaches swap or the
     zram compressor ([atrium-memory-pressure.md](atrium-memory-pressure.md)).
@@ -251,7 +262,7 @@ user credential (passcode, biometric, recovery key)        — Vestibulum
 | attack | what stops it |
 |---|---|
 | **phishing**: a lookalike site asks for the password | Fill happens only for the bound origin, matched exactly (§3). Confusable hosts are refused (threat model §2.11). The fill chip is drawn by the trusted UI, not the page. Passkeys can't be phished, because the RP ID is checked against the origin the courier actually reached |
-| **a malicious app asks for another app's secret** | Identity is the channel label from the signed manifest (§4.1). There is no lookup by name |
+| **a malicious app asks for another app's secret** | Identity is the peer uid's registry label, from the signed manifest (§4.1). There is no lookup by name |
 | **a compromised app or renderer reads memory** | Keys: never there. Bearer secrets: only in the courier, after TLS, for one request (§5). App-held items are the stated exception (§4.3) |
 | **an open redirect carries a token away** | Couriers never follow a redirect to another endpoint (§5) |
 | **a man in the middle or a downgrade** | The courier attaches only after TLS verifies the bound host. An item from an `https` recipient is never sent over `http`. A user-installed root CA that intercepts is flagged in the trusted UI |
@@ -398,7 +409,7 @@ each step.
 
 | phase | work | gate |
 |---|---|---|
-| **A0** | Arca daemon, store format, key hierarchy, classes, channel identity from portcullisd; Vestibulum unlock and lock; move the keychain items out of `vestibulumd` | a test app gets EACCES on another app's item; the store fails to decrypt a record moved between recipients; the item is unreadable after lock (while-unlocked) |
+| **A0** | Arca daemon, store format, key hierarchy, classes, peer identity from the launch registry (§4.1); Vestibulum unlock and lock; move the keychain items out of `vestibulumd` | a test app gets EACCES on another app's item; the store fails to decrypt a record moved between recipients; the item is unreadable after lock (while-unlocked) |
 | **A1** | the courier for HTTP(S): fixed request schema, TLS-then-attach, no cross-endpoint redirects, Set-Cookie records; fuzz targets | a hostile-client fuzz run finds no read of an item; a redirect test proves no attach crosses endpoints |
 | **A2** | the web profile: cookies, partitioning, SameSite with broker context, private credentialed conversions | **this is the gate for any login in the Navigator** (replaces C0) |
 | **A3** | password secure input, slot-filled form POST, trusted save and fill UI | password login |
