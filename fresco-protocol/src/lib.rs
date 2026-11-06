@@ -60,6 +60,7 @@ pub fn decode<'de, T: Deserialize<'de>>(bytes: &'de [u8]) -> Result<T, CodecErro
 ///   0x0500..=0x05FF    Window management (WINDOW_*).
 ///   0x0600..=0x06FF    Reserved for D4.5 ANIMATION_* op family.
 ///   0x0700..=0x07FF    Input events (EV_INPUT_*).
+///   0x0900..=0x09FF    Activation tokens (`activation`, tabula.md §2), broker socket only.
 /// ```
 pub mod control {
     // Slot management
@@ -1320,6 +1321,84 @@ pub struct GlyphInstance {
 }
 
 // ── tests ────────────────────────────────────────────────────────────
+
+/// User-activation tokens (docs/spec/tabula.md §2): frescod mints one per
+/// key or button press it delivers, and the brokers on its allowlist
+/// (Tabula, the share broker, Praeco) consume it to prove a user gesture.
+/// Types only; frescod (Fresco thread) implements the table and the ops.
+pub mod activation {
+    use serde::{Deserialize, Serialize};
+
+    /// A token: 16 bytes from the kernel CSPRNG. All zero = none.
+    pub type Token = [u8; 16];
+    pub const NONE: Token = [0; 16];
+
+    /// Ops on frescod's activation socket (reachable only by the
+    /// allowlisted broker uids).
+    pub mod op {
+        /// `Consume` → `ConsumeResult`.
+        pub const CONSUME: u16 = 0x0900;
+        /// `Grant` → `GrantResult`; Forum's uid only.
+        pub const GRANT: u16 = 0x0901;
+    }
+
+    /// What a broker spends a token on (§2.2's table decides which kinds fit).
+    pub mod purpose {
+        pub const COPY: u8 = 1;
+        pub const PASTE: u8 = 2;
+        pub const DROP: u8 = 3;
+        pub const DRAG: u8 = 4;
+        pub const SHARE: u8 = 5;
+        pub const ACTION: u8 = 6;
+    }
+
+    /// What minted a token.
+    pub mod kind {
+        pub const BUTTON: u8 = 1;
+        pub const KEY: u8 = 2;
+        pub const DROP: u8 = 3;
+        pub const GRANTED: u8 = 4;
+    }
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+    pub struct Consume {
+        pub token: Token,
+        /// The uid of the client that presented the token to the broker
+        /// (the broker's `getpeereid` answer, never the client's claim).
+        pub presenter_uid: u32,
+        pub purpose: u8,
+    }
+
+    /// Refusal reasons, for the broker's audit log.
+    pub mod refusal {
+        pub const UNKNOWN: u8 = 1;
+        pub const EXPIRED: u8 = 2;
+        pub const WRONG_UID: u8 = 3;
+        pub const NOT_FOCUSED: u8 = 4;
+        pub const WRONG_KIND: u8 = 5;
+        pub const NOT_ALLOWED: u8 = 6;
+    }
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+    pub enum ConsumeResult {
+        Ok { window_id: u32, kind: u8, minted_ns: u64, drag_id: u64 },
+        Refused { reason: u8 },
+    }
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+    pub struct Grant {
+        /// The press in a Forum window being spent.
+        pub token: Token,
+        pub for_uid: u32,
+        pub purpose: u8,
+    }
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+    pub enum GrantResult {
+        Ok { token: Token },
+        Refused { reason: u8 },
+    }
+}
 
 #[cfg(test)]
 mod tests {

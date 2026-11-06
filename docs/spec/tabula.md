@@ -1,6 +1,9 @@
 # Tabula — clipboard and drag-and-drop, and the gesture interface with frescod
 
-Status: interface draft, 2026-11-06. Not built.
+Status: interface draft, 2026-11-06. `tabulad` built (crate `tabula/`, §3) and tested against a
+stand-in frescod; frescod's side (activation tokens) not yet. The token and consume types are
+`fresco_protocol::activation` (ops 0x0900 `CONSUME`, 0x0901 `GRANT`), on frescod's socket
+`/var/run/atrium/fresco-activation.sock`.
 
 Placement decided with the user 2026-11-06 (pergola.md §1). Ownership agreed between threads: the
 Pergola thread builds `tabulad`, `praecod`, the Pergola clients and widgets, Forum's toasts and
@@ -142,7 +145,7 @@ Reachable by apps whose manifest says `clipboard = true` (portcullis.md). Payloa
   document does (pergola.md §10.2). The receiving app treats every paste as hostile input.
 - **Proven possession.** `SET` uploads the bytes; it may not name a CAS hash it has not sent, or
   an app could probe whether content exists on the machine (aqueduct.md §6.6).
-- **Limits.** Per entry 256 MiB and 16 formats, mime names ≤ 127 bytes of `[a-z0-9.+/-]`; per app
+- **Limits.** Per format 16 MiB (one aqueduct upload), per entry 64 MiB and 16 formats, mime names ≤ 127 bytes of `[a-z0-9.+/-]`; per app
   one live entry and one pending drag; `tabulad` runs in its own jail as `_tabula` with no
   network.
 - **Sensitive entries.** `SET` may mark an entry `sensitive` (Arca does, for a copied password):
@@ -151,6 +154,19 @@ Reachable by apps whose manifest says `clipboard = true` (portcullis.md). Payloa
   reach another app only through a paste the user makes there with that jail's entry offered
   explicitly. Deferred past v1.
 - **Audit.** `tabulad` logs who copied and who pasted (uids and times, never contents).
+
+### 3.2 As built (2026-11-06)
+
+`tabula/` (lib + `tabulad`): `SET`, `OFFERS`, `GET`, `CLEAR` and `EV_CHANGED`; replies are
+`Reply::{Ok, Offers, Got, Empty, Refused{reason, detail}}` (postcard). A `SET` is validated
+(formats, names, sizes, possession) before its token is spent, so a bad request doesn't waste a
+gesture. Events go out on each client's own thread, between replies, so they never interleave
+with one. Fails closed: if frescod's activation socket does not answer within 500 ms, the
+request is refused. Tests (`tabula/tests/wire.rs`, over real sockets, two apps by uid): copy in
+one app and paste in another; a made-up, stolen (other uid), reused, expired or wrong-kind token
+is refused; no background overwrite or clear; naming a hash that wasn't uploaded is refused; a
+secret must be text; change events; the audit log holds uids and outcomes only. Not yet: drag
+(`DRAG_BEGIN`, `DROP_GET`), privacy mode, persistence across restarts (none planned for v1).
 
 ## 4. Drag and drop
 

@@ -1,0 +1,25 @@
+[package]
+name        = "tabula"
+version     = "0.1.0"
+edition     = "2021"
+license     = "MIT OR Apache-2.0"
+description = "Tabula, the Atrium clipboard service (docs/spec/tabula.md): one entry of up to 16 typed formats, every copy and paste spending a user-activation token that frescod minted and Tabula checks with frescod. Never parses content."
+publish     = false
+
+[lib]
+name = "tabula"
+path = "src/lib.rs"
+
+[[bin]]
+name = "tabulad"
+path = "src/bin/tabulad.rs"
+
+[dependencies]
+aqueduct        = { path = "../aqueduct" }
+fresco-protocol = { path = "../fresco-protocol" }
+portcullis-peer = { path = "../portcullis/portcullis-peer" }
+serde           = { version = "1", features = ["derive"] }
+postcard        = { version = "1", features = ["use-std"] }
+
+[dev-dependencies]
+tempfile = "3"
