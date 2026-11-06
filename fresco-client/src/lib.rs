@@ -77,6 +77,9 @@ pub enum Event {
     /// when that set changes, so an empty list means all of them draw
     /// again. Draw a dropped one some other way (a bitmap), or send less.
     FillsDropped   { window_id: u32, dropped: Vec<fresco_protocol::FillDrop> },
+    /// The token that names this window to limend (limen.md §5), sent once
+    /// after it is created. Hand it to limend only.
+    EmbedToken     { window_id: u32, token: [u8; 16] },
     /// A surface was created in this session. Window managers reconcile on
     /// this; ordinary clients ignore it (it's about other surfaces).
     WindowCreated  { window_id: u32 },
@@ -952,6 +955,10 @@ fn decode_event(op: u16, payload: &[u8]) -> Event {
         },
         EV_WINDOW_FILLS_DROPPED => match decode::<WindowFillsDroppedEvent>(payload) {
             Ok(p) => Event::FillsDropped { window_id: p.window_id, dropped: p.dropped },
+            Err(_) => Event::Unknown { op, payload: payload.to_vec() },
+        },
+        EV_WINDOW_EMBED_TOKEN => match decode::<fresco_protocol::EmbedTokenEvent>(payload) {
+            Ok(p) => Event::EmbedToken { window_id: p.window_id, token: p.token },
             Err(_) => Event::Unknown { op, payload: payload.to_vec() },
         },
         EV_WINDOW_CREATED => match decode::<WindowCreatedEvent>(payload) {

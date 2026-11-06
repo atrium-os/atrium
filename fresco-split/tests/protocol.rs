@@ -7,7 +7,8 @@ use fresco_split::{slot, DragPhase, Input, Msg, Role, MSG_BYTES};
 
 fn samples() -> Vec<Msg> {
     vec![
-        Msg::WindowCreate { window: 3, width: 640, height: 480, role: Role::Dialog, pos: Some((-20, 30)), title: "Ünïcode tïtle".into() },
+        Msg::WindowCreate { window: 3, width: 640, height: 480, role: Role::Dialog, pos: Some((-20, 30)), title: "Ünïcode tïtle".into(), embed_pending: false },
+        Msg::WindowCreate { window: 4, width: 200, height: 40, role: Role::Document, pos: None, title: String::new(), embed_pending: true },
         Msg::WindowDestroy { window: 3 },
         Msg::WindowTitle { window: 9, title: "x".repeat(64) },
         Msg::FrameReady { window: 1, slot: 1, seq: 77 },
@@ -29,6 +30,7 @@ fn samples() -> Vec<Msg> {
         Msg::Drag { window: 2, phase: DragPhase::Over, drag_id: u64::MAX, x: 1.0, y: 2.5 },
         Msg::Drop { window: 2, x: 4.0, y: 5.0, activation: [6; 16] },
         Msg::DragEnd { window: 3, drag_id: 7, dropped: true },
+        Msg::EmbedToken { window: 3, token: [7; 16] },
     ]
 }
 

@@ -372,6 +372,7 @@ fn declare(broker: &Chan, state: &Mutex<State>, comp: &Mutex<Compositor>, screen
                     role: role(w.role),
                     pos,
                     title: w.title.clone(),
+                    embed_pending: w.embed_pending,
                 };
                 (w.id as u32, m)
             })
@@ -581,6 +582,9 @@ fn from_broker(
             }
             Msg::DragEnd { drag_id, dropped, .. } => {
                 let _ = events.send(DisplayEvent::DragEnd { window_id: local, drag_id, dropped });
+            }
+            Msg::EmbedToken { token, .. } => {
+                let _ = events.send(DisplayEvent::EmbedToken { window_id: local, token });
             }
             _ => unreachable!("from_renderer() covers the rest"),
         }

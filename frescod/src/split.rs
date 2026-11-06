@@ -513,7 +513,7 @@ impl Broker {
     fn record(&self, r: &Renderer, uid: u32, m: Msg) -> Result<(), String> {
         let local = m.window();
         match m {
-            Msg::WindowCreate { width, height, role, pos, title, .. } => {
+            Msg::WindowCreate { width, height, role, pos, title, embed_pending, .. } => {
                 let mut wins = r.wins.lock().unwrap();
                 if wins.contains_key(&local) || wins.len() >= MAX_WINDOWS as usize {
                     return Err(format!("window {local}: already open, or too many windows"));
@@ -534,12 +534,22 @@ impl Broker {
                         if let Some((x, y)) = pos {
                             w.pos = (x as f32, y as f32);
                         }
+                        w.embed_pending = embed_pending;
+                    }
+                    if embed_pending {
+                        c.hide(g); // limen.md §4: off screen until bound
                     }
                     g
                 };
                 r.tell(&Msg::Slots { window: local, bytes: bytes as u32 }, &[a.fd(), b.fd()])
                     .and_then(|_| r.tell(&Msg::Geometry { window: local, width, height }, &[]))?;
                 wins.insert(local, Win { global, slots: [a, b], told: (width, height) });
+                drop(wins);
+                // Its embed token, for the client alone (limen.md §5).
+                let token = self.comp.lock().unwrap().windows.get(&global).map(|w| w.embed_token);
+                if let Some(token) = token.filter(|t| *t != [0; 16]) {
+                    r.tell(&Msg::EmbedToken { window: local, token }, &[])?;
+                }
             }
             Msg::WindowDestroy { .. } => {
                 let w = r.wins.lock().unwrap().remove(&local).ok_or_else(|| format!("destroy of unknown window {local}"))?;

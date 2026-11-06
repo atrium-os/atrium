@@ -308,6 +308,38 @@ Only limend may bind slots. The op has its own allowlist (`_limen`) instead of t
 window-management socket. `OP_WM_CREDENTIAL_SLOT` stays as the test stand-in until the general
 op lands.
 
+**As built in frescod (L2, 2026-11-06).** In split mode the window id an app knows is its
+renderer's, not frescod's, so windows are named by an **embed token** instead of an id:
+
+- frescod mints a random 16-byte token for every window it creates and sends it to the window's
+  owner alone, once, as `EV_WINDOW_EMBED_TOKEN` (0x0588, `EmbedTokenEvent { window_id, token }`,
+  with the app's own window id; fresco-client `Event::EmbedToken`). In split mode it travels as
+  the split record `EMBED_TOKEN` (0x124). The parent app and the child each hand theirs to
+  limend. A token dies with its window.
+- The bind op is on frescod's activation socket (`/var/run/atrium/fresco-activation.sock`),
+  which frescod serves itself in both modes: `fresco_protocol::slot::op::BIND` (0x0910),
+  `SlotBind { parent, child: [u8; 16], kind, rect: Option<[x, y, w, h]> }`, `rect` in the
+  parent's surface pixels and `None` to release. The answer is
+  `SlotBindResult::Ok { parent_uid, child_uid }`, so limend can check both owners against its
+  records, or `Refused { reason }`: `NOT_ALLOWED` (1, the caller's uid isn't in
+  `FRESCOD_SLOT_UIDS`, default `_limen`), `UNKNOWN_WINDOW` (2), or `INVALID` (3: the same window
+  twice, a parent that is itself a slot, a child that hosts slots, a notification, a child
+  already in another parent, a bad kind or rect).
+- `slot::kind::PLAIN` (0) and `CREDENTIAL` (1). Only `CREDENTIAL` gets the visibility record,
+  `FILL` and the frame.
+- `WindowHints.embed_pending` keeps a window off screen (not composed, hit or focused, and not
+  listed to the WM) until it is bound. A child of either kind goes off screen again when it is
+  released, or when its parent goes, so it never shows as a top-level window. A slot is clipped
+  to its parent's edges; one clipped away entirely, or whose parent is off screen, is off screen
+  too. The WM neither lists nor places slots.
+- `OP_WM_CREDENTIAL_SLOT` remains as an alias (WM socket, frescod's ids, kind `CREDENTIAL`)
+  until limend's binder moves to the token op.
+
+Tested by unit tests in fresco-scene-server and by `atrium-activation-probe` in the VM, in
+direct and split mode: an `embed_pending` window takes no click; once bound it takes the clicks
+in its slot; a made-up token and a slot as a parent are refused; after a release, or after its
+parent is destroyed, the click goes past it again; and a gone window's token is dead.
+
 ### 5.2 Placing, moving, hiding
 
 The parent's Pergola window reports each slot's window rect after layout

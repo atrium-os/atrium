@@ -340,6 +340,76 @@ fn main() {
         let _ = std::fs::copy(&png, format!("{png}.slot.png"));
     }
 
+    // Limen slots (limen.md §5): an embed child stays off screen until
+    // limend binds it, by the windows' embed tokens, and hides again when
+    // released or when its parent goes.
+    use fresco_protocol::slot::{kind as sk, op as sop, refusal as sno, SlotBind, SlotBindResult};
+    let token_of = |c: &mut Connection| match wait(c, |e| matches!(e, Event::EmbedToken { .. })) {
+        Some(Event::EmbedToken { token, .. }) => token,
+        _ => [0; 16],
+    };
+    let slot_bind = |p: &mut Probe, parent: [u8; 16], child: [u8; 16], kind: u8, rect: Option<[f32; 4]>| -> SlotBindResult {
+        let b = fresco_protocol::encode(&SlotBind { parent, child, kind, rect }).unwrap();
+        fresco_protocol::decode(&p.ask(sop::BIND, b)).unwrap()
+    };
+    // Whether a click at (x, y) reaches `c`'s window (tried for 2 s).
+    let hits = |p: &mut Probe, c: &mut Connection, x: i32, y: i32| -> bool {
+        while let Ok(Some(_)) = c.wait_event(Some(Duration::from_millis(50))) {}
+        p.inject(&format!("MOVE {x} {y}"));
+        for _ in 0..20 {
+            p.inject("BTN 1 1");
+            p.inject("BTN 1 0");
+            let until = Instant::now() + Duration::from_millis(100);
+            while Instant::now() < until {
+                if let Ok(Some(Event::PointerButton { pressed: true, .. })) = c.wait_event(Some(Duration::from_millis(20))) {
+                    return true;
+                }
+            }
+        }
+        false
+    };
+    let (mut lhost, lhost_id) = window(sock, (600, 100), (300, 200), [0.3, 0.6, 0.3, 1.0]);
+    let ht = token_of(&mut lhost);
+    let mut emb = Connection::connect(sock).expect("app socket");
+    let hints = WindowHints { initial_position: Some((650, 150)), embed_pending: true, ..WindowHints::default() };
+    let eid = emb.window_create(10, 10, "embed", hints).expect("window");
+    emb.set_default_window(eid as u16);
+    emb.scene_frame_begin().unwrap();
+    emb.scene_node_rect(1, RectParams { x: 0.0, y: 0.0, w: 2000.0, h: 2000.0, r: 0.2, g: 0.2, b: 0.9, a: 1.0, radius: 0.0 }).unwrap();
+    emb.scene_frame_end().unwrap();
+    let et = token_of(&mut emb);
+    p.check(ht != [0; 16] && et != [0; 16] && ht != et, "each window hears its own embed token");
+    still();
+    let h = !hits(&mut p, &mut emb, 655, 155);
+    p.check(h, "an embed_pending window is not on screen");
+    let ok = slot_bind(&mut p, ht, et, sk::PLAIN, Some([20.0, 20.0, 150.0, 60.0])); // screen (620, 120) to (770, 180)
+    let me = p.uid;
+    p.check(ok == SlotBindResult::Ok { parent_uid: me, child_uid: me }, &format!("limend binds it and learns both owners ({ok:?})"));
+    still();
+    let h = hits(&mut p, &mut emb, 700, 150);
+    p.check(h, "bound: it shows in its slot and takes the click");
+    let r = slot_bind(&mut p, [1; 16], et, sk::PLAIN, Some([0.0, 0.0, 50.0, 50.0]));
+    p.check(r == SlotBindResult::Refused { reason: sno::UNKNOWN_WINDOW }, &format!("a made-up token names no window ({r:?})"));
+    let r = slot_bind(&mut p, et, ht, sk::PLAIN, Some([0.0, 0.0, 50.0, 50.0]));
+    p.check(r == SlotBindResult::Refused { reason: sno::INVALID }, &format!("a slot can't host one ({r:?})"));
+    let r = slot_bind(&mut p, ht, et, sk::PLAIN, None);
+    p.check(matches!(r, SlotBindResult::Ok { .. }), "released");
+    still();
+    let h = !hits(&mut p, &mut emb, 700, 150);
+    p.check(h, "released: off screen again");
+    let h = hits(&mut p, &mut lhost, 700, 150);
+    p.check(h, "and the click goes to its parent");
+    let _ = slot_bind(&mut p, ht, et, sk::PLAIN, Some([20.0, 20.0, 150.0, 60.0]));
+    still();
+    let h = hits(&mut p, &mut emb, 700, 150);
+    p.check(h, "bound again");
+    lhost.window_destroy(lhost_id).unwrap();
+    still();
+    let h = !hits(&mut p, &mut emb, 700, 150);
+    p.check(h, "its parent went: off screen, not top-level");
+    let r = slot_bind(&mut p, ht, et, sk::PLAIN, Some([0.0, 0.0, 50.0, 50.0]));
+    p.check(r == SlotBindResult::Refused { reason: sno::UNKNOWN_WINDOW }, "a gone window's token is dead");
+
     if p.failed > 0 {
         println!("{} FAILED", p.failed);
         std::process::exit(1);

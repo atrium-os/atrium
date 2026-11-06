@@ -81,7 +81,9 @@ pub enum Msg {
     /// title, and where the client asked to be placed. The broker answers
     /// with [`Msg::Slots`] (and the slot fds). There is no `Hud` role: no
     /// app may claim the WM's own layer.
-    WindowCreate { window: u32, width: u32, height: u32, role: Role, pos: Option<(i32, i32)>, title: String },
+    /// `embed_pending`: an embed child (limen.md §4), kept off screen until
+    /// limend binds it.
+    WindowCreate { window: u32, width: u32, height: u32, role: Role, pos: Option<(i32, i32)>, title: String, embed_pending: bool },
     /// A client destroyed a window.
     WindowDestroy { window: u32 },
     /// A window's title changed.
@@ -130,6 +132,8 @@ pub enum Msg {
     Drop { window: u32, x: f32, y: f32, activation: [u8; 16] },
     /// The drag that started from `window` ended.
     DragEnd { window: u32, drag_id: u64, dropped: bool },
+    /// `window`'s embed token (limen.md §5), for its client alone.
+    EmbedToken { window: u32, token: [u8; 16] },
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -143,6 +147,9 @@ pub enum DragPhase {
 /// Why a record was refused.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Refused(pub &'static str);
+
+/// WINDOW_CREATE's role word carries the `embed_pending` flag in this bit.
+const EMBED_PENDING_BIT: u32 = 8;
 
 mod kind {
     pub const WINDOW_CREATE: u32 = 1;
@@ -166,6 +173,7 @@ mod kind {
     pub const DRAG: u32 = 0x121;
     pub const DROP: u32 = 0x122;
     pub const DRAG_END: u32 = 0x123;
+    pub const EMBED_TOKEN: u32 = 0x124;
 }
 
 /// Layout: word 0 kind, word 1 window, words 2..8 arguments, bytes 32..96
@@ -226,7 +234,8 @@ impl Msg {
             | Msg::DragOffer { window, .. }
             | Msg::Drag { window, .. }
             | Msg::Drop { window, .. }
-            | Msg::DragEnd { window, .. } => window,
+            | Msg::DragEnd { window, .. }
+            | Msg::EmbedToken { window, .. } => window,
             Msg::Client { .. } => 0,
         }
     }
@@ -235,11 +244,11 @@ impl Msg {
     pub fn encode(&self) -> [u8; MSG_BYTES] {
         use kind::*;
         let r = match self {
-            Msg::WindowCreate { window, width, height, role, pos, title } => {
+            Msg::WindowCreate { window, width, height, role, pos, title, embed_pending } => {
                 let mut r = Rec::new(WINDOW_CREATE, *window);
                 r.put(2, *width);
                 r.put(3, *height);
-                r.put(4, *role as u32);
+                r.put(4, *role as u32 | (*embed_pending as u32) << EMBED_PENDING_BIT);
                 if let Some((x, y)) = *pos {
                     r.put(5, 1);
                     r.put(6, x as u32);
@@ -362,6 +371,11 @@ impl Msg {
                 r.put(4, *dropped as u32);
                 r
             }
+            Msg::EmbedToken { window, token } => {
+                let mut r = Rec::new(EMBED_TOKEN, *window);
+                r.0[32..48].copy_from_slice(token);
+                r
+            }
         };
         r.0
     }
@@ -391,6 +405,7 @@ impl Msg {
             DRAG_BEGIN | DROP => (2, false),
             DRAG_END => (3, false),
             DRAG => (5, false),
+            EMBED_TOKEN => (0, false),
             _ => return Err(Refused("unknown kind")),
         };
         if (2 + args..8).any(|i| r.get(i) != 0) {
@@ -409,7 +424,7 @@ impl Msg {
             s.to_string()
         } else {
             // Key and button records carry the activation token in 32..48.
-            let tail = if matches!(k, KEY | BUTTON | DRAG_BEGIN | DROP) { 48 } else { 32 };
+            let tail = if matches!(k, KEY | BUTTON | DRAG_BEGIN | DROP | EMBED_TOKEN) { 48 } else { 32 };
             if r.0[tail..].iter().any(|&c| c != 0) {
                 return Err(Refused("unused field not zero"));
             }
@@ -422,7 +437,8 @@ impl Msg {
                 window,
                 width: dim(r.get(2))?,
                 height: dim(r.get(3))?,
-                role: Role::from_u32(r.get(4)).ok_or(Refused("unknown role"))?,
+                role: Role::from_u32(r.get(4) & !(1 << EMBED_PENDING_BIT)).ok_or(Refused("unknown role"))?,
+                embed_pending: r.get(4) & 1 << EMBED_PENDING_BIT != 0,
                 pos: match flag(r.get(5))? {
                     true => Some((r.get(6) as i32, r.get(7) as i32)),
                     false if r.get(6) == 0 && r.get(7) == 0 => None,
@@ -491,6 +507,7 @@ impl Msg {
             },
             DROP => Msg::Drop { window, x: finite(r.get(2))?, y: finite(r.get(3))?, activation: r.0[32..48].try_into().unwrap() },
             DRAG_END => Msg::DragEnd { window, drag_id: r.get(2) as u64 | (r.get(3) as u64) << 32, dropped: flag(r.get(4))? },
+            EMBED_TOKEN => Msg::EmbedToken { window, token: r.0[32..48].try_into().unwrap() },
             _ => unreachable!(),
         })
     }

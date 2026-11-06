@@ -39,7 +39,7 @@ pub fn observe_frame(comp: &Mutex<Compositor>, layers: &[(u32, [i32; 4])], scree
     let slots: Vec<(u32, bool)> = {
         let c = comp.lock().unwrap();
         c.windows.iter().filter_map(|(&id, w)| {
-            let s = w.credential?;
+            let s = w.slot.filter(|s| s.kind == fresco_protocol::slot::kind::CREDENTIAL)?;
             let p = c.windows.get(&s.parent)?;
             let [x, y, rw, rh] = s.rect;
             let inside = x >= 0.0 && y >= 0.0 && x + rw <= p.size.0 && y + rh <= p.size.1;

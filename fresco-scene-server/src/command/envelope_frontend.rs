@@ -1139,7 +1139,18 @@ impl EnvelopeFrontend {
             // Stamp the owning uid (resolved at connect) so WM_ENUMERATE carries
             // the surface's stable app identity for workspace assignment.
             win.owner_uid = uid.unwrap_or(0);
+            win.embed_pending = p.hints.embed_pending;
             let _ = p.parent_window_id;
+        }
+        /* An embed child stays off screen until limend binds it (limen.md
+         * §4); frescod (which mints tokens) decides, a renderer only
+         * passes the hint on. The token goes to the owner alone. */
+        if comp.mint_embed_tokens {
+            if p.hints.embed_pending {
+                comp.hide(new_id);
+            }
+            let token = comp.windows[&new_id].embed_token;
+            comp.emit(crate::window::DisplayEvent::EmbedToken { window_id: new_id as u32, token });
         }
         comp.layer_notifications();
 
@@ -1178,7 +1189,9 @@ impl EnvelopeFrontend {
         }
         let comp = self.compositor.lock().unwrap();
         let mut surfaces: Vec<WmSurfaceInfo> = comp.windows.values()
-            .filter(|w| w.id != 0) // window 0 is the implicit screen, not an app surface
+            // Window 0 is the implicit screen, not an app surface; slots
+            // and hidden embeds are frescod's to place, not the WM's.
+            .filter(|w| w.id != 0 && !w.hidden && w.slot.is_none())
             .map(|w| WmSurfaceInfo {
                 surface_id: w.id as u32,
                 owner_app:  format!("client:{}", w.owner),
@@ -1246,7 +1259,7 @@ impl EnvelopeFrontend {
 
         // 1. geometry — apply each declared rect to the surface it names.
         for slot in &layout.slots {
-            if let Some(w) = comp.windows.get_mut(&(slot.surface_id as u16)) {
+            if let Some(w) = comp.windows.get_mut(&(slot.surface_id as u16)).filter(|w| !w.hidden && w.slot.is_none()) {
                 w.pos  = (slot.rect.x as f32, slot.rect.y as f32);
                 w.size = (slot.rect.w as f32, slot.rect.h as f32);
             }
@@ -1256,7 +1269,7 @@ impl EnvelopeFrontend {
         //    highest-layer-first (so the lowest layer lands on top), then
         //    any unnamed surviving surface on top of all.
         let mut named: Vec<&fresco_protocol::WmSlot> = layout.slots.iter()
-            .filter(|s| comp.windows.contains_key(&(s.surface_id as u16)))
+            .filter(|s| comp.windows.get(&(s.surface_id as u16)).is_some_and(|w| !w.hidden))
             .collect();
         named.sort_by(|a, b| b.layer.cmp(&a.layer)); // highest layer = bottom
         let named_ids: std::collections::HashSet<u16> =
@@ -1266,8 +1279,9 @@ impl EnvelopeFrontend {
         if comp.windows.contains_key(&0) { new_z.push(0); }
         for s in &named { new_z.push(s.surface_id as u16); }
         // unnamed survivors (excluding screen + already-placed) on top.
-        let mut unnamed: Vec<u16> = comp.windows.keys().copied()
-            .filter(|&id| id != 0 && !named_ids.contains(&id))
+        let mut unnamed: Vec<u16> = comp.windows.iter()
+            .filter(|(&id, w)| id != 0 && !w.hidden && !named_ids.contains(&id))
+            .map(|(&id, _)| id)
             .collect();
         unnamed.sort();
         new_z.extend(unnamed);
@@ -1278,6 +1292,7 @@ impl EnvelopeFrontend {
         }
         comp.z_order = new_z;
         comp.layer_notifications();
+        comp.place_slots(); // each slot back right above its parent
 
         // 3. focus — set the declared focus (0 = leave unfocused). z is set
         //    above from roles, so focus here must not raise.

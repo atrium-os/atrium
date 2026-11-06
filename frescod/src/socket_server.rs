@@ -272,7 +272,8 @@ fn route(ev: &DisplayEvent, comp: &Arc<Mutex<Compositor>>) -> Route {
         E::WindowFillsDropped { window_id, .. }
         | E::Drag { window_id, .. }
         | E::Drop { window_id, .. }
-        | E::DragEnd { window_id, .. } => return Route::Owner(owner_of(window_id)),
+        | E::DragEnd { window_id, .. }
+        | E::EmbedToken { window_id, .. } => return Route::Owner(owner_of(window_id)),
     };
     if window_id == 0 {
         return Route::WmOnly;

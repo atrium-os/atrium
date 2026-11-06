@@ -171,6 +171,7 @@ fn main() -> std::io::Result<()> {
     let scene = Arc::new(Mutex::new(SceneGraph::new()));
     let slots = Arc::new(Mutex::new(SlotTable::new()));
     let comp  = Arc::new(Mutex::new(Compositor::new_with_window0(scene, slots)));
+    comp.lock().unwrap().mint_embed_tokens = true; // limen.md §5
 
     /* DisplayEvent sink: compositor pushes window events, input_reader
      * pushes keyboard events; fan-out thread encodes + broadcasts to
@@ -829,6 +830,7 @@ fn run_headless(png: &str) -> std::io::Result<()> {
     let scene = Arc::new(Mutex::new(SceneGraph::new()));
     let slots = Arc::new(Mutex::new(SlotTable::new()));
     let comp  = Arc::new(Mutex::new(Compositor::new_with_window0(scene, slots)));
+    comp.lock().unwrap().mint_embed_tokens = true; // limen.md §5
     let (ev_tx, ev_rx) = mpsc::channel();
     comp.lock().unwrap().set_event_sink(ev_tx.clone());
     /* Synthetic input injection — the headless interactive harness. No HID device

@@ -93,13 +93,33 @@ pub enum DisplayEvent {
     Drop { window_id: u32, x: f32, y: f32, activation: [u8; 16] },
     /// To the drag's source window: the drag ended.
     DragEnd { window_id: u32, drag_id: u64, dropped: bool },
+    /// To the window's owner alone: its embed token (limen.md §5).
+    EmbedToken { window_id: u32, token: [u8; 16] },
 }
 
-/// Where a credential slot sits: `rect` (`[x, y, w, h]`) in `parent`.
+/// Where a slot sits (limen.md §5): `rect` (`[x, y, w, h]`) in `parent`;
+/// `kind` is a `fresco_protocol::slot::kind`.
 #[derive(Clone, Copy, Debug, PartialEq)]
-pub struct CredentialSlot {
+pub struct Slot {
     pub parent: WindowId,
     pub rect: [f32; 4],
+    pub kind: u8,
+}
+
+/// A 16-byte token from the kernel's CSPRNG.
+pub fn random_token() -> [u8; 16] {
+    let mut t = [0u8; 16];
+    #[cfg(any(target_os = "freebsd", target_os = "macos"))]
+    // SAFETY: arc4random_buf fills exactly `len` bytes of the buffer.
+    unsafe {
+        libc::arc4random_buf(t.as_mut_ptr().cast(), t.len())
+    };
+    #[cfg(not(any(target_os = "freebsd", target_os = "macos")))]
+    {
+        use std::io::Read;
+        std::fs::File::open("/dev/urandom").and_then(|mut f| f.read_exact(&mut t)).expect("/dev/urandom");
+    }
+    t
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -207,6 +227,10 @@ pub fn encode_event(ev: &DisplayEvent)
             let p = DragEndEvent { window_id: *window_id, drag_id: *drag_id, dropped: *dropped };
             Ok((control::EV_DRAG_END, encode(&p)?))
         }
+        DisplayEvent::EmbedToken { window_id, token } => {
+            let p = fresco_protocol::EmbedTokenEvent { window_id: *window_id, token: *token };
+            Ok((control::EV_WINDOW_EMBED_TOKEN, encode(&p)?))
+        }
     }
 }
 
@@ -252,8 +276,15 @@ pub struct Window {
     /// The renderer honoring this (skip-compose) + the power-gate signal
     /// are the follow-up; for now it records the WM's decision.
     pub rendering: bool,
-    /// Bound as a credential slot in another window (arca-autofill.md §4).
-    pub credential: Option<CredentialSlot>,
+    /// Bound as a slot in another window (limen.md §5).
+    pub slot: Option<Slot>,
+    /// Off screen: not in `z_order`, so not drawn, hit or focused. An
+    /// embed child is, until it is bound and again once released.
+    pub hidden: bool,
+    /// Created with the `embed_pending` hint (a renderer passes it on).
+    pub embed_pending: bool,
+    /// Names the window to limend (limen.md §5); zero where none is minted.
+    pub embed_token: [u8; 16],
     /// Cached title-text glyphs: PathHeader hash + (x, y) baseline
     /// position in pixels relative to the title origin. Regenerated
     /// when title or theme changes; per-frame compose just translates
@@ -286,7 +317,10 @@ impl Window {
             focus: false,
             z:     0,
             rendering: true,
-            credential: None,
+            slot: None,
+            hidden: false,
+            embed_pending: false,
+            embed_token: [0; 16],
             title_glyphs: Vec::new(),
             role:  WmRole::Document,
             owner_uid: 0,
@@ -303,7 +337,10 @@ impl Window {
             slots, scene,
             focus: false, z: 0,
             rendering: true,
-            credential: None,
+            slot: None,
+            hidden: false,
+            embed_pending: false,
+            embed_token: [0; 16],
             title_glyphs: Vec::new(),
             role:  WmRole::Document,
             owner_uid: 0,
@@ -350,6 +387,9 @@ pub struct Compositor {
     pub shown:    Option<Vec<ShownLayer>>,
     pub z_order:  Vec<WindowId>,
     pub focus:    Option<WindowId>,
+    /// Mint each new window an embed token (frescod; a renderer's ids
+    /// and tokens would mean nothing to limend).
+    pub mint_embed_tokens: bool,
     pub cursor:   (f32, f32),
     pub next_id:  WindowId,
     /// Active titlebar drag: window id + (offset from cursor to
@@ -500,6 +540,7 @@ impl Compositor {
             shown:    None,
             z_order:  vec![0],
             focus:    Some(0),
+            mint_embed_tokens: false,
             cursor:   (0.0, 0.0),
             next_id:  1,
             dragging: None,
@@ -544,7 +585,7 @@ impl Compositor {
     /// Push an event to the sink if one is wired. No-op if not.
     /// Send failures (receiver dropped) are silently ignored — the
     /// connection is being torn down.
-    fn emit(&self, ev: DisplayEvent) {
+    pub fn emit(&self, ev: DisplayEvent) {
         if let Some(sink) = &self.event_sink {
             let _ = sink.send(ev);
         }
@@ -743,6 +784,9 @@ impl Compositor {
         self.next_id = id.checked_add(1).unwrap_or(1);
         let mut w = Window::new(id, owner, (size.0 as f32, size.1 as f32));
         w.z = self.z_order.len() as u32;
+        if self.mint_embed_tokens {
+            w.embed_token = random_token();
+        }
         self.windows.insert(id, w);
         self.z_order.push(id);
         /* Tell the session a surface appeared. The WM reconciles on this
@@ -807,6 +851,7 @@ impl Compositor {
         self.windows.remove(&id);
         self.fill_drops.remove(&id);
         self.z_order.retain(|&w| w != id);
+        self.release_slots_in(id);
         let shift = if self.focus == Some(id) {
             let new_focus = self.z_order.last().copied();
             self.focus = new_focus;
@@ -828,6 +873,7 @@ impl Compositor {
         if !allowed { return false; }
         self.windows.remove(&id);
         self.z_order.retain(|&w| w != id);
+        self.release_slots_in(id);
         if self.focus == Some(id) { self.focus = self.z_order.last().copied(); }
         self.emit(DisplayEvent::WindowDestroyed { window_id: id as u32 });
         true
@@ -1042,6 +1088,7 @@ impl Compositor {
     /// imply raise here (a focused document can sit under a HUD). Updates
     /// the per-window focus flags and emits the focus-change events.
     pub fn set_focus_no_raise(&mut self, id: Option<WindowId>) {
+        let id = id.filter(|i| !self.windows.get(i).is_some_and(|w| w.hidden));
         if self.focus == id { return; }
         let prev = self.focus;
         if let Some(p) = prev { if let Some(w) = self.windows.get_mut(&p) { w.focus = false; } }
@@ -1078,7 +1125,7 @@ impl Compositor {
     /// Keep notification windows inside `band` (`[x, y, w, h]`): shrink
     /// one that is larger (its client hears the new size) and move it in.
     pub fn clamp_notifications(&mut self, band: [i32; 4]) {
-        self.place_credentials();
+        self.place_slots();
         let (bx, by, bw, bh) = (band[0] as f32, band[1] as f32, band[2].max(1) as f32, band[3].max(1) as f32);
         let ids: Vec<WindowId> = self.windows.keys().copied().filter(|&id| self.is_notification(id)).collect();
         for id in ids {
@@ -1106,40 +1153,102 @@ impl Compositor {
     }
 
     /// Make `child` a credential slot at `rect` in `parent` (`None`:
-    /// release it). Both must exist and differ; a slot cannot host one.
+    /// release it): the window-management stand-in for limend.
     pub fn bind_credential(&mut self, child: WindowId, parent: WindowId, rect: Option<[f32; 4]>) -> bool {
-        let ok = child != 0 && parent != 0 && child != parent
-            && self.windows.contains_key(&parent)
-            && self.windows.get(&parent).is_some_and(|p| p.credential.is_none())
-            && self.windows.get(&child).is_some_and(|c| c.role != WmRole::Notification)
-            && rect.is_none_or(|r| r.iter().all(|v| v.is_finite()) && r[2] >= 1.0 && r[3] >= 1.0);
-        if !ok {
-            return false;
-        }
-        self.windows.get_mut(&child).unwrap().credential = rect.map(|rect| CredentialSlot { parent, rect });
-        self.place_credentials();
-        true
+        self.bind_slot(child, parent, fresco_protocol::slot::kind::CREDENTIAL, rect).is_ok()
     }
 
-    /// Put each credential slot where its parent says, at its size, right
-    /// above its parent (so the parent cannot draw over it); a slot whose
-    /// parent went is released.
-    pub fn place_credentials(&mut self) {
-        let slots: Vec<(WindowId, CredentialSlot)> =
-            self.windows.iter().filter_map(|(&id, w)| w.credential.map(|c| (id, c))).collect();
+    /// The window `token` names, if any lives.
+    pub fn window_by_token(&self, token: &[u8; 16]) -> Option<WindowId> {
+        if *token == [0; 16] {
+            return None;
+        }
+        self.windows.iter().find(|(_, w)| w.embed_token == *token).map(|(&id, _)| id)
+    }
+
+    /// Make `child` a slot of `kind` at `rect` in `parent`, shown right
+    /// above it; `None` releases it and hides `child` again. Refused
+    /// (a `fresco_protocol::slot::refusal`) for an unknown window, the
+    /// same window twice, a parent that is a slot itself, a child that
+    /// hosts slots, is a notification or sits in another parent, or a
+    /// bad kind or rect.
+    pub fn bind_slot(&mut self, child: WindowId, parent: WindowId, kind: u8, rect: Option<[f32; 4]>) -> Result<(), u8> {
+        use fresco_protocol::slot::{kind as k, refusal};
+        if child == 0 || parent == 0 || !self.windows.contains_key(&child) || !self.windows.contains_key(&parent) {
+            return Err(refusal::UNKNOWN_WINDOW);
+        }
+        let c = &self.windows[&child];
+        let ok = child != parent
+            && self.windows[&parent].slot.is_none()
+            && c.role != WmRole::Notification
+            && c.slot.is_none_or(|s| s.parent == parent)
+            && !self.windows.values().any(|w| w.slot.is_some_and(|s| s.parent == child))
+            && matches!(kind, k::PLAIN | k::CREDENTIAL)
+            && rect.is_none_or(|r| r.iter().all(|v| v.is_finite()) && r[2] >= 1.0 && r[3] >= 1.0);
+        if !ok {
+            return Err(refusal::INVALID);
+        }
+        match rect {
+            Some(rect) => {
+                let w = self.windows.get_mut(&child).unwrap();
+                w.slot = Some(Slot { parent, rect, kind });
+                w.hidden = false;
+                self.place_slots();
+            }
+            None => {
+                self.windows.get_mut(&child).unwrap().slot = None;
+                self.hide(child);
+            }
+        }
+        Ok(())
+    }
+
+    /// Release every slot in `parent` (it went): their windows hide.
+    fn release_slots_in(&mut self, parent: WindowId) {
+        let kids: Vec<WindowId> = self.windows.iter()
+            .filter(|(_, w)| w.slot.is_some_and(|s| s.parent == parent))
+            .map(|(&id, _)| id).collect();
+        for id in kids {
+            self.windows.get_mut(&id).unwrap().slot = None;
+            self.hide(id);
+        }
+    }
+
+    /// Take `id` off screen: out of `z_order`, and out of focus.
+    pub fn hide(&mut self, id: WindowId) {
+        let Some(w) = self.windows.get_mut(&id) else { return };
+        w.hidden = true;
+        self.z_order.retain(|&z| z != id);
+        if self.focus == Some(id) {
+            self.set_focus_no_raise(None);
+        }
+    }
+
+    /// Put each slot where its parent says, at its size clipped to the
+    /// parent, right above its parent (so the parent cannot draw over
+    /// it). A slot whose parent is off screen, or that the parent's edge
+    /// clips away entirely, is off screen too.
+    pub fn place_slots(&mut self) {
+        let slots: Vec<(WindowId, Slot)> =
+            self.windows.iter().filter_map(|(&id, w)| w.slot.map(|c| (id, c))).collect();
         for (id, c) in slots {
-            let Some(p) = self.windows.get(&c.parent).map(|p| p.pos) else {
-                self.windows.get_mut(&id).unwrap().credential = None;
+            let Some((ppos, psize)) = self.windows.get(&c.parent).map(|p| (p.pos, p.size)) else {
+                self.windows.get_mut(&id).unwrap().slot = None;
+                self.hide(id);
                 continue;
             };
-            let size = (c.rect[2].floor().max(1.0), c.rect[3].floor().max(1.0));
+            self.z_order.retain(|&w| w != id);
+            let [x, y, w, h] = c.rect;
+            let (w, h) = ((x + w).min(psize.0) - x.max(0.0), (y + h).min(psize.1) - y.max(0.0));
+            let Some(at) = self.z_order.iter().position(|&w| w == c.parent).filter(|_| w >= 1.0 && h >= 1.0) else {
+                continue;
+            };
+            let size = (w.floor(), h.floor());
             if self.windows[&id].size != size {
                 self.resize_window(id, size.0 as u32, size.1 as u32);
             }
-            self.windows.get_mut(&id).unwrap().pos = (p.0 + c.rect[0], p.1 + c.rect[1]);
-            self.z_order.retain(|&w| w != id);
-            let at = self.z_order.iter().position(|&w| w == c.parent).map_or(self.z_order.len(), |i| i + 1);
-            self.z_order.insert(at, id);
+            self.windows.get_mut(&id).unwrap().pos = (ppos.0 + x.max(0.0), ppos.1 + y.max(0.0));
+            self.z_order.insert(at + 1, id);
         }
         for (i, &id) in self.z_order.iter().enumerate() {
             if let Some(w) = self.windows.get_mut(&id) {
@@ -1525,5 +1634,37 @@ mod notification_tests {
         assert_eq!(c.z_order, vec![0, a, b, n]);
         assert_eq!((c.windows[&b].pos, c.windows[&b].size), ((110.0, 120.0), (150.0, 30.0)));
         assert!(!c.bind_credential(a, b, Some([0.0, 0.0, 10.0, 10.0])), "a slot hosts no slot");
+    }
+
+    #[test]
+    fn an_embed_shows_only_while_bound_in_its_parent() {
+        use fresco_protocol::slot::{kind, refusal};
+        let mut c = Compositor::new();
+        c.mint_embed_tokens = true;
+        let p = c.create(1, (400, 300));
+        let e = c.create(2, (10, 10));
+        let other = c.create(3, (100, 100));
+        c.hide(e); // what an embed_pending create does
+        assert!(!c.z_order.contains(&e));
+        c.set_focus_no_raise(Some(e));
+        assert_ne!(c.focus, Some(e), "a hidden window takes no focus");
+        assert_eq!(c.window_by_token(&c.windows[&e].embed_token), Some(e));
+        assert_eq!(c.window_by_token(&[0; 16]), None);
+
+        assert_eq!(c.bind_slot(e, p, kind::PLAIN, Some([350.0, 10.0, 100.0, 40.0])), Ok(()));
+        let at = c.z_order.iter().position(|&w| w == p).unwrap();
+        assert_eq!(c.z_order[at + 1], e, "right above its parent");
+        assert_eq!(c.windows[&e].size, (50.0, 40.0), "clipped to the parent's edge");
+        assert_eq!(c.bind_slot(e, other, kind::PLAIN, Some([0.0, 0.0, 10.0, 10.0])), Err(refusal::INVALID), "already in another parent");
+        assert_eq!(c.bind_slot(e, p, 9, Some([0.0, 0.0, 10.0, 10.0])), Err(refusal::INVALID));
+        assert_eq!(c.bind_slot(p, e, kind::PLAIN, Some([0.0, 0.0, 10.0, 10.0])), Err(refusal::INVALID), "a host can't be a slot");
+        assert_eq!(c.bind_slot(e, 999, kind::PLAIN, None), Err(refusal::UNKNOWN_WINDOW));
+
+        assert_eq!(c.bind_slot(e, p, kind::PLAIN, None), Ok(()));
+        assert!(c.windows[&e].hidden && !c.z_order.contains(&e), "released: hidden again");
+        assert_eq!(c.bind_slot(e, p, kind::CREDENTIAL, Some([10.0, 10.0, 200.0, 40.0])), Ok(()));
+        assert!(c.z_order.contains(&e));
+        assert!(c.destroy(p, 1));
+        assert!(c.windows[&e].slot.is_none() && !c.z_order.contains(&e), "its parent went: released and hidden");
     }
 }

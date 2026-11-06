@@ -171,6 +171,9 @@ pub mod control {
     /// fills it cannot tile, any node past the op budget
     /// (`WindowFillsDroppedEvent`), sent whenever that set changes.
     pub const EV_WINDOW_FILLS_DROPPED:   u16 = 0x0587;
+    /// `EmbedTokenEvent`, to the window's owner once, right after it is
+    /// created: the token that names the window to limend (limen.md §5).
+    pub const EV_WINDOW_EMBED_TOKEN:     u16 = 0x0588;
     /// The display's mode changed (a mode switch, or a monitor plugged in
     /// or swapped): payload `DisplayInfoResponse`. Every client gets it;
     /// anything laid out for the screen lays itself out again.
@@ -630,6 +633,9 @@ pub struct WindowHints {
     /// role instead of as an ordinary document. An app cannot request a
     /// privileged layer (`hud`) — that's refused; the hint only informs.
     pub role: Option<WmRole>,
+    /// An embed child (limen.md §4): kept off screen, with no input or
+    /// focus, until limend binds it into a slot.
+    pub embed_pending: bool,
 }
 
 /// `OP_WINDOW_REQUEST_CLOSE` — toolkit-initiated close. Server
@@ -887,6 +893,13 @@ pub mod fill_drop {
 pub struct FillDrop {
     pub node_id: u32,
     pub reason: u8,
+}
+
+/// `EV_WINDOW_EMBED_TOKEN` — `window_id` is the id the owner knows it by.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EmbedTokenEvent {
+    pub window_id: u32,
+    pub token: [u8; 16],
 }
 
 /// `EV_WINDOW_FILLS_DROPPED` — every node of the window that is not being
@@ -1441,6 +1454,56 @@ pub struct GlyphInstance {
     pub bearing_y: f32,
 }
 
+/// Slots (limen.md §5): a child window pinned into a rect of its parent.
+/// limend binds them on frescod's activation socket; windows are named by
+/// their embed tokens (`EV_WINDOW_EMBED_TOKEN`), since in split mode the
+/// ids apps know are their renderer's, not frescod's.
+pub mod slot {
+    use serde::{Deserialize, Serialize};
+
+    pub mod op {
+        /// `SlotBind` → `SlotBindResult`; uids on frescod's slot
+        /// allowlist only (`_limen`).
+        pub const BIND: u16 = 0x0910;
+    }
+
+    pub mod kind {
+        /// Pinned and clipped to the parent, nothing else.
+        pub const PLAIN: u8 = 0;
+        /// Also the visibility record, `FILL` and frescod's frame
+        /// (arca-autofill.md §4).
+        pub const CREDENTIAL: u8 = 1;
+    }
+
+    pub mod refusal {
+        /// The caller's uid may not bind slots.
+        pub const NOT_ALLOWED: u8 = 1;
+        /// No live window has that token.
+        pub const UNKNOWN_WINDOW: u8 = 2;
+        /// Same window twice, a parent that is itself a slot, a
+        /// notification, a child already in another parent, a bad kind
+        /// or rect.
+        pub const INVALID: u8 = 3;
+    }
+
+    #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+    pub struct SlotBind {
+        pub parent: [u8; 16],
+        pub child: [u8; 16],
+        pub kind: u8,
+        /// `[x, y, w, h]` in the parent's surface pixels; `None` releases
+        /// the slot and hides the child again.
+        pub rect: Option<[f32; 4]>,
+    }
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+    pub enum SlotBindResult {
+        /// The windows' owners, for limend to check against its records.
+        Ok { parent_uid: u32, child_uid: u32 },
+        Refused { reason: u8 },
+    }
+}
+
 // ── tests ────────────────────────────────────────────────────────────
 
 /// User-activation tokens (docs/spec/tabula.md §2): frescod mints one per
@@ -1652,6 +1715,7 @@ mod tests {
                 max_size: None,
                 initial_position: None,
                 role: None,
+                embed_pending: false,
             },
             parent_window_id: 0,
         };
@@ -1781,6 +1845,7 @@ mod tests {
             control::EV_WINDOW_CREATED,
             control::EV_WINDOW_DESTROYED,
             control::EV_WINDOW_FILLS_DROPPED,
+            control::EV_WINDOW_EMBED_TOKEN,
             control::OP_LANE_REQUEST,
             control::OP_WM_ENUMERATE,
             control::OP_WM_DECLARE_LAYOUT,

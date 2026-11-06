@@ -232,6 +232,37 @@ pub fn has_token(ev: &fresco_scene_server::window::DisplayEvent) -> bool {
 pub struct Callers {
     pub consumers: Vec<u32>,
     pub forum: Option<u32>,
+    /// May bind slots (limen.md §5): FRESCOD_SLOT_UIDS, else `_limen`'s.
+    pub binders: Vec<u32>,
+}
+
+/// The uids that may bind slots: `FRESCOD_SLOT_UIDS` (comma separated),
+/// else the user `_limen`.
+pub fn binders() -> Vec<u32> {
+    if let Ok(s) = std::env::var("FRESCOD_SLOT_UIDS") {
+        return s.split(',').filter_map(|u| u.trim().parse().ok()).collect();
+    }
+    uid_of("_limen").into_iter().collect()
+}
+
+/// `slot::op::BIND`: find both windows by token, bind, and name their
+/// owners so limend can check them against its own records.
+pub fn bind_slot(comp: &Mutex<fresco_scene_server::window::Compositor>, b: &fresco_protocol::slot::SlotBind) -> fresco_protocol::slot::SlotBindResult {
+    use fresco_protocol::slot::{refusal, SlotBindResult};
+    let r = {
+        let mut c = comp.lock().unwrap();
+        let (Some(parent), Some(child)) = (c.window_by_token(&b.parent), c.window_by_token(&b.child)) else {
+            return SlotBindResult::Refused { reason: refusal::UNKNOWN_WINDOW };
+        };
+        c.bind_slot(child, parent, b.kind, b.rect).map(|_| (parent, child))
+    };
+    match r {
+        Ok((parent, child)) => SlotBindResult::Ok {
+            parent_uid: crate::socket_server::window_owner_uid(parent as u32, comp).unwrap_or(0),
+            child_uid: crate::socket_server::window_owner_uid(child as u32, comp).unwrap_or(0),
+        },
+        Err(reason) => SlotBindResult::Refused { reason },
+    }
 }
 
 /// Forum's uid: FRESCOD_FORUM_UID, else `_forum`'s.
@@ -272,9 +303,10 @@ pub fn start(comp: Arc<Mutex<fresco_scene_server::window::Compositor>>) {
     if let Some(d) = path.parent() {
         let _ = std::fs::create_dir_all(d);
     }
-    let allowed = Callers { consumers: consumers(), forum: forum_uid() };
+    let allowed = Callers { consumers: consumers(), forum: forum_uid(), binders: binders() };
+    let slots = comp.clone();
     let focused: Arc<dyn Fn(u32) -> bool + Send + Sync> = Arc::new(move |w| w != 0 && focused_window(&comp) == w);
-    if let Err(e) = serve(path, allowed, focused) {
+    if let Err(e) = serve(path, allowed, focused, slots) {
         eprintln!("frescod: activation socket {}: {e}", path.display());
     }
 }
@@ -283,7 +315,7 @@ pub fn start(comp: Arc<Mutex<fresco_scene_server::window::Compositor>>) {
 /// `allowed`, `GRANT` for Forum's uid only; one aqueduct connection per
 /// caller, peer uid checked on connect. `focused(window)` answers from
 /// the compositor's focus.
-pub fn serve(path: &std::path::Path, allowed: Callers, focused: Arc<dyn Fn(u32) -> bool + Send + Sync>) -> std::io::Result<()> {
+pub fn serve(path: &std::path::Path, allowed: Callers, focused: Arc<dyn Fn(u32) -> bool + Send + Sync>, comp: Arc<Mutex<fresco_scene_server::window::Compositor>>) -> std::io::Result<()> {
     use std::os::unix::net::UnixListener;
     if path.exists() {
         let _ = std::fs::remove_file(path);
@@ -299,13 +331,14 @@ pub fn serve(path: &std::path::Path, allowed: Callers, focused: Arc<dyn Fn(u32) 
     std::thread::Builder::new().name("frescod-activation".into()).spawn(move || {
         for s in listener.incoming().flatten() {
             let uid = crate::socket_server::peer_xucred(&s).map(|(_, u)| u);
-            let Some(uid) = uid.filter(|u| allowed.consumers.contains(u) || allowed.forum == Some(*u)) else {
+            let Some(uid) = uid.filter(|u| allowed.consumers.contains(u) || allowed.forum == Some(*u) || allowed.binders.contains(u)) else {
                 eprintln!("frescod: activation socket: refused uid {uid:?}");
                 continue;
             };
             let (focused, may_consume, may_grant) = (focused.clone(), allowed.consumers.contains(&uid), allowed.forum == Some(uid));
+            let binder = allowed.binders.contains(&uid).then(|| comp.clone());
             let _ = std::thread::Builder::new().name("frescod-activation-conn".into()).spawn(move || {
-                if let Err(e) = conn_loop(s, uid, may_consume, may_grant, &*focused) {
+                if let Err(e) = conn_loop(s, uid, may_consume, may_grant, &*focused, binder.as_deref()) {
                     log::debug!("activation connection: {e}");
                 }
             });
@@ -316,7 +349,7 @@ pub fn serve(path: &std::path::Path, allowed: Callers, focused: Arc<dyn Fn(u32) 
 
 /// One caller's requests: `CONSUME` if it is a consumer, `GRANT` (with
 /// its own uid as the granter) if it is Forum; anything else is refused.
-fn conn_loop(s: std::os::unix::net::UnixStream, uid: u32, may_consume: bool, may_grant: bool, focused: &(dyn Fn(u32) -> bool + Send + Sync)) -> std::io::Result<()> {
+fn conn_loop(s: std::os::unix::net::UnixStream, uid: u32, may_consume: bool, may_grant: bool, focused: &(dyn Fn(u32) -> bool + Send + Sync), binder: Option<&Mutex<fresco_scene_server::window::Compositor>>) -> std::io::Result<()> {
     use aqueduct::envelope::flag;
     use fresco_protocol::activation::{op, Consume, Grant};
     let mut conn = aqueduct::Connection::wrap(s)?;
@@ -339,6 +372,14 @@ fn conn_loop(s: std::os::unix::net::UnixStream, uid: u32, may_consume: bool, may
                 Ok(_) => GrantResult::Refused { reason: refusal::NOT_ALLOWED },
                 Err(_) => GrantResult::Refused { reason: refusal::UNKNOWN },
             }),
+            fresco_protocol::slot::op::BIND => {
+                use fresco_protocol::slot::{refusal as no, SlotBind, SlotBindResult};
+                fresco_protocol::encode(&match (fresco_protocol::decode::<SlotBind>(&msg.payload), binder) {
+                    (Ok(b), Some(comp)) => bind_slot(comp, &b),
+                    (Ok(_), None) => SlotBindResult::Refused { reason: no::NOT_ALLOWED },
+                    (Err(_), _) => SlotBindResult::Refused { reason: no::INVALID },
+                })
+            }
             _ => continue,
         };
         conn.send_message(aqueduct::CLASS_DISPLAY, msg.op, flag::IS_RESPONSE, &payload.unwrap_or_default())?;

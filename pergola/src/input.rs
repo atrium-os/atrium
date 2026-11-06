@@ -51,6 +51,8 @@ pub fn translate(ev: &fresco_client::Event) -> Option<Event> {
         | fresco_client::Event::DisplayChanged(_)
         // Pergola draws no filled paths yet, so it has none to fall back for.
         | fresco_client::Event::FillsDropped { .. }
+        // The window's embed token goes to limend, not to views.
+        | fresco_client::Event::EmbedToken { .. }
         // Drag hover (no drop highlight yet) and the end of a drag this
         // window started (Pergola starts none yet).
         | fresco_client::Event::DragEnter { .. }
