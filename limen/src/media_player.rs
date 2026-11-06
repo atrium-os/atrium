@@ -71,7 +71,22 @@ pub enum ToChild {
     TextTrack { id: u8, lang: String, label: String },
     /// Which subtitles show (`TextTrack.mode = "showing"`).
     ShowText { text: TextChoice },
+    /// `navigator.mediaSession.metadata`, for now-playing (at most
+    /// `MEDIA_TEXT_MAX` bytes each).
+    MediaMetadata { title: String, artist: String, album: String },
+    /// The actions the page handles itself (`setActionHandler`), as
+    /// [`media_action`] bits. Play, pause and seeking the player does.
+    MediaActions { actions: u16 },
 }
+
+/// Bits of `MediaActions` and `ToParent::Action`.
+pub mod media_action {
+    pub const NEXT_TRACK: u16 = 1;
+    pub const PREVIOUS_TRACK: u16 = 2;
+    pub const ALL: u16 = NEXT_TRACK | PREVIOUS_TRACK;
+}
+
+pub const MEDIA_TEXT_MAX: usize = 128;
 
 /// What [`ToChild::ShowText`] shows.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -118,6 +133,12 @@ pub enum ToParent {
     /// append over the buffer cap: that append is dropped, no `Appended`
     /// follows, and the feed goes on). `None`: playback has failed.
     Error { code: u16, track: Option<u8> },
+    /// The user changed the volume in the player (keys, controls); 0 to 1.
+    /// The page's `volume` and `muted` follow (`volumechange`).
+    Volume { volume: f32, muted: bool },
+    /// The user asked for an action the page handles: one
+    /// [`media_action`] bit it declared with `MediaActions`.
+    Action { action: u16 },
 }
 
 fn finite_secs(s: f64) -> bool {
@@ -154,6 +175,8 @@ impl ToChild {
             ToChild::SetRate { rate } => (0.25..=4.0).contains(rate),
             ToChild::TextTrack { id, lang, label } => *id < TEXT_TRACKS_MAX && clean_text(lang, TEXT_NAME_MAX) && clean_text(label, TEXT_NAME_MAX),
             ToChild::ShowText { text } => !matches!(text, TextChoice::Page(id) if *id >= TEXT_TRACKS_MAX),
+            ToChild::MediaMetadata { title, artist, album } => [title, artist, album].iter().all(|s| clean_text(s, MEDIA_TEXT_MAX)),
+            ToChild::MediaActions { actions } => actions & !media_action::ALL == 0,
         };
         ok.then_some(m)
     }
@@ -181,6 +204,8 @@ impl ToParent {
             ToParent::Appended { track } => *track < TRACKS_MAX,
             ToParent::Time { secs } | ToParent::Waiting { secs } | ToParent::Seeking { secs } => finite_secs(*secs),
             ToParent::Error { track, .. } => track.is_none_or(|t| t < TRACKS_MAX),
+            ToParent::Volume { volume, .. } => (0.0..=1.0).contains(volume),
+            ToParent::Action { action } => action.count_ones() == 1 && action & !media_action::ALL == 0,
             ToParent::Playing | ToParent::Paused | ToParent::Ended => true,
         };
         ok.then_some(m)
@@ -203,6 +228,8 @@ mod tests {
             ToChild::TextTrack { id: 3, lang: "en".into(), label: "English".into() },
             ToChild::ShowText { text: TextChoice::Page(3) },
             ToChild::ShowText { text: TextChoice::None },
+            ToChild::MediaMetadata { title: "Song".into(), artist: "Band".into(), album: String::new() },
+            ToChild::MediaActions { actions: media_action::ALL },
             ToChild::OpenSource,
             ToChild::AddTrack { track: 0, mime: "video/webm; codecs=\"vp9\"".into() },
             ToChild::Append { track: 0, bytes: vec![1, 2, 3], timestamp_offset: Some(-2.5) },
@@ -225,6 +252,8 @@ mod tests {
             ToParent::Time { secs: 3.25 },
             ToParent::Ended,
             ToParent::Error { code: code::TOO_BIG, track: Some(1) },
+            ToParent::Volume { volume: 0.4, muted: true },
+            ToParent::Action { action: media_action::NEXT_TRACK },
         ];
         for m in to_parent {
             assert_eq!(ToParent::decode(&m.encode()), Some(m));
@@ -248,6 +277,8 @@ mod tests {
             ToChild::TextTrack { id: 0, lang: "en".into(), label: "x".repeat(TEXT_NAME_MAX + 1) },
             ToChild::TextTrack { id: 0, lang: "e\nn".into(), label: String::new() },
             ToChild::ShowText { text: TextChoice::Page(TEXT_TRACKS_MAX) },
+            ToChild::MediaMetadata { title: "x".repeat(MEDIA_TEXT_MAX + 1), artist: String::new(), album: String::new() },
+            ToChild::MediaActions { actions: 4 },
         ];
         for m in bad_child {
             assert_eq!(ToChild::decode(&m.encode()), None, "{m:?}");
@@ -259,6 +290,8 @@ mod tests {
             ToParent::Time { secs: f64::INFINITY },
             ToParent::CanPlay { mime: "x\u{7}".into(), supported: true },
             ToParent::Error { code: code::TOO_BIG, track: Some(TRACKS_MAX) },
+            ToParent::Volume { volume: 1.5, muted: false },
+            ToParent::Action { action: media_action::ALL },
         ];
         for m in bad_parent {
             assert_eq!(ToParent::decode(&m.encode()), None, "{m:?}");

@@ -157,7 +157,7 @@ screen is public. Controls work without unlocking: play, pause, next, previous.
 
 ## 6. Order of work
 
-1. **Player, now** (needs no one): keyboard shortcuts in the focused player (space and k,
+1. **Player, now** (needs no one; **built**, see atrium-player.md M7): keyboard shortcuts in the focused player (space and k,
    j and l for ±10 s, arrows ±5 s, up and down for volume, m to mute, c for subtitles,
    0 to 9 to jump), the Limen media-session messages (§4.4) and the player keeping them.
 2. **choragusd**: `Session`, `NowPlaying` and `Control`, the active-session rule, and a

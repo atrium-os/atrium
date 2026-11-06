@@ -189,6 +189,8 @@ There are two ways to feed it.
 | parent → child | `SetRate` | `rate: f32` (0.25 to 4) |
 | parent → child | `TextTrack` | `id: u8` (at most 16), `lang`, `label` (64 bytes each), with a WebVTT file as a regular-file descriptor: the page's `<track>` |
 | parent → child | `ShowText` | `text`: `None`, `InBand` (the default) or `Page(id)` |
+| parent → child | `MediaMetadata` | `title`, `artist`, `album` (128 bytes each): `navigator.mediaSession.metadata` |
+| parent → child | `MediaActions` | `actions: u16`: the `media_action` bits the page handles (`NEXT_TRACK`, `PREVIOUS_TRACK`) |
 | child → parent | `Ready` | `duration_secs: f64`, `width`, `height` |
 | child → parent | `CanPlay` | `mime`, `supported: bool`: the reply, for `MediaSource.isTypeSupported` |
 | child → parent | `Playing`, `Paused` | none: the play state changed, from the parent's message or the native controls |
@@ -198,6 +200,8 @@ There are two ways to feed it.
 | child → parent | `Waiting` | `secs: f64`: playback reached the end of what is buffered |
 | child → parent | `Seeking` | `secs: f64`: the user seeked in the native controls; the parent fetches from there |
 | child → parent | `Ended` | none |
+| child → parent | `Volume` | `volume` (0 to 1), `muted`: the user changed it in the player (`volumechange`) |
+| child → parent | `Action` | `action`: one `media_action` bit the page declared, asked for by the user |
 | child → parent | `Error` | `code: u16` (`DECODE`, `UNSUPPORTED`, `TOO_BIG`, `STATE`, `NETWORK`), `track: Option<u8>` (an append to this track was refused and the feed goes on; `None`: the player failed) |
 
 The types are `limen::media_player` (atrium-player.md M0).

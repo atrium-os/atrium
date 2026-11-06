@@ -319,6 +319,12 @@ Fresco's layers land.
   Nuntius fixes on FreeBSD: the anonymous file is `memfd_create` (a plain `SHM_ANON`
   object refuses writes past its size), and it is written at explicit offsets (the
   read-only descriptor is a dup that shares the file offset).
+- M7, keys and the page's media session (atrium-player-pip-keys.md §6 step 1): in the
+  focused player, space and k play or pause, j and l step 10 s, the arrows 5 s, up and down
+  change the volume, m mutes, c turns subtitles off and back on, Home, End and 0 to 9 jump.
+  A volume change is reported as `ToParent::Volume`. The page's `MediaMetadata` and
+  `MediaActions` are kept for now-playing; shift-N and shift-P send `ToParent::Action` when
+  the page handles next or previous.
 
 **Tests along the way:**
 - every demuxer limit has a test with a crafted file that exceeds it;

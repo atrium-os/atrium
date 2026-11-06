@@ -44,6 +44,13 @@ pub enum Action {
     Seek(f64),
     /// Step this many seconds.
     Step(f64),
+    /// Change the volume by this much (0 to 1 scale).
+    Volume(f32),
+    ToggleMute,
+    /// Subtitles off, or back on.
+    ToggleSubtitles,
+    /// A page's action (shift-N, shift-P): a `media_action` bit.
+    PageAction(u16),
 }
 
 #[derive(Debug, Clone, PartialEq, Default)]
@@ -195,13 +202,32 @@ impl Controls {
         None
     }
 
-    /// A key press, by HID usage.
-    pub fn key(&mut self, hid_usage: u16) -> Option<Action> {
+    /// A key press, by HID usage, with Fresco's modifier bits (bit 0 Shift).
+    pub fn key(&mut self, hid_usage: u16, modifiers: u8) -> Option<Action> {
         self.poke();
+        if modifiers & 1 != 0 {
+            return match hid_usage {
+                0x11 => Some(Action::PageAction(limen::media_player::media_action::NEXT_TRACK)), // N
+                0x13 => Some(Action::PageAction(limen::media_player::media_action::PREVIOUS_TRACK)), // P
+                _ => None,
+            };
+        }
+        // The keys most players share (YouTube's set, mostly).
         match hid_usage {
-            0x2C => Some(Action::Toggle),    // space
-            0x4F => Some(Action::Step(5.0)), // right
-            0x50 => Some(Action::Step(-5.0)),
+            0x2C | 0x0E => Some(Action::Toggle),  // space, k
+            0x4F => Some(Action::Step(5.0)),       // right
+            0x50 => Some(Action::Step(-5.0)),      // left
+            0x0F => Some(Action::Step(10.0)),      // l
+            0x0D => Some(Action::Step(-10.0)),     // j
+            0x52 => Some(Action::Volume(0.05)),    // up
+            0x51 => Some(Action::Volume(-0.05)),   // down
+            0x10 => Some(Action::ToggleMute),      // m
+            0x06 => Some(Action::ToggleSubtitles), // c
+            0x4A => Some(Action::Seek(0.0)),       // home
+            0x4D => Some(Action::Seek(1.0)),       // end
+            0x27 => Some(Action::Seek(0.0)),       // 0
+            // 1 to 9: a tenth of the way per digit.
+            0x1E..=0x26 => Some(Action::Seek((hid_usage - 0x1D) as f64 / 10.0)),
             _ => None,
         }
     }
@@ -335,6 +361,14 @@ mod tests {
         c.playing = false;
         c.shown_until = Instant::now() - Duration::from_secs(1);
         assert!(c.visible());
-        assert_eq!(c.key(0x2C), Some(Action::Toggle));
+        assert_eq!(c.key(0x2C, 0), Some(Action::Toggle));
+        assert_eq!(c.key(0x0E, 0), Some(Action::Toggle));
+        assert_eq!(c.key(0x0D, 0), Some(Action::Step(-10.0)));
+        assert_eq!(c.key(0x20, 0), Some(Action::Seek(0.3)), "3");
+        assert_eq!(c.key(0x26, 0), Some(Action::Seek(0.9)), "9");
+        assert_eq!(c.key(0x10, 0), Some(Action::ToggleMute));
+        assert_eq!(c.key(0x04, 0), None, "a");
+        assert_eq!(c.key(0x11, 1), Some(Action::PageAction(1)), "shift-N");
+        assert_eq!(c.key(0x0E, 1), None, "shift-K");
     }
 }

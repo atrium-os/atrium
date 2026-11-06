@@ -151,6 +151,14 @@ pub struct App<H: Host> {
     /// whenever it starts.
     texts: Vec<(u8, String, String, File)>,
     subtitles: Subtitles,
+    /// What `c` turns subtitles back on to.
+    subtitles_were: Subtitles,
+    /// Muted from the player's own keys (the page mutes with volume 0).
+    muted: bool,
+    /// The page's media session: metadata for now-playing, and the
+    /// actions it handles (atrium-player-pip-keys.md §4.4).
+    pub media_metadata: (String, String, String),
+    page_actions: u16,
 }
 
 fn secs(ns: i64) -> f64 {
@@ -206,6 +214,10 @@ impl<H: Host> App<H> {
             audio_wait: None,
             texts: Vec::new(),
             subtitles: Subtitles::InBand,
+            subtitles_were: Subtitles::InBand,
+            muted: false,
+            media_metadata: Default::default(),
+            page_actions: 0,
         }
     }
 
@@ -425,13 +437,21 @@ impl<H: Host> App<H> {
             ToChild::Seek { secs } => self.seek(secs, false),
             ToChild::SetVolume { volume } => {
                 self.volume = volume;
-                if let Some(a) = self.audio.as_mut() {
-                    a.set_volume(volume);
-                }
+                self.muted = false;
+                self.apply_volume();
             }
+            ToChild::MediaMetadata { title, artist, album } => self.media_metadata = (title, artist, album),
+            ToChild::MediaActions { actions } => self.page_actions = actions,
             ToChild::SetRate { rate } => self.set_rate(rate as f64),
         }
         Ok(())
+    }
+
+    fn apply_volume(&mut self) {
+        let v = if self.muted { 0.0 } else { self.volume };
+        if let Some(a) = self.audio.as_mut() {
+            a.set_volume(v);
+        }
     }
 
     fn ready(&mut self) {
@@ -452,8 +472,9 @@ impl<H: Host> App<H> {
                 if self.audio.is_none() {
                     match AudioOut::open(&self.audio_socket, self.host.audio_ticket(), rate, channels) {
                         Ok(mut a) => {
-                            if self.volume < 1.0 {
-                                a.set_volume(self.volume);
+                            let v = if self.muted { 0.0 } else { self.volume };
+                            if v < 1.0 {
+                                a.set_volume(v);
                             }
                             a.set_rate(self.rate);
                             self.audio = Some(a);
@@ -598,7 +619,7 @@ impl<H: Host> App<H> {
                 None
             }
             Event::PointerButton { x, y, button: 1, pressed: true, .. } => self.controls.press(x, y),
-            Event::Key { hid_usage, pressed: true, .. } => self.controls.key(hid_usage),
+            Event::Key { hid_usage, pressed: true, modifiers, .. } => self.controls.key(hid_usage, modifiers),
             _ => None,
         };
         match action {
@@ -611,7 +632,31 @@ impl<H: Host> App<H> {
                 let to = self.controls.position_s + s;
                 self.seek(to, true);
             }
-            None => {}
+            Some(Action::Volume(d)) => {
+                self.volume = (self.volume + d).clamp(0.0, 1.0);
+                self.muted = false;
+                self.apply_volume();
+                self.host.emit(ToParent::Volume { volume: self.volume, muted: self.muted });
+            }
+            Some(Action::ToggleMute) => {
+                self.muted = !self.muted;
+                self.apply_volume();
+                self.host.emit(ToParent::Volume { volume: self.volume, muted: self.muted });
+            }
+            Some(Action::ToggleSubtitles) => {
+                if self.subtitles == Subtitles::None {
+                    self.subtitles = self.subtitles_were;
+                } else {
+                    self.subtitles_were = self.subtitles;
+                    self.subtitles = Subtitles::None;
+                }
+                if let Some(p) = self.player.as_mut() {
+                    p.set_subtitles(self.subtitles);
+                }
+            }
+            // Only what the page said it handles.
+            Some(Action::PageAction(a)) if self.page_actions & a != 0 => self.host.emit(ToParent::Action { action: a }),
+            Some(Action::PageAction(_)) | None => {}
         }
     }
 }
