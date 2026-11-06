@@ -325,6 +325,9 @@ same-site context or a gesture, because it never holds a ticket.
   verification.
 - **Filling** happens only on a user gesture, on the trusted fill chip. It is refused on
   `http:`, on a confusable host, and in a tier-4 island unless the user confirms.
+  The full design, for every app and not only the Navigator, is
+  [arca-autofill.md](arca-autofill.md): a credential field is an Arca-owned Limen slot,
+  and the app holds a handle, never the value.
 
 ### 8.4 Passkeys (WebAuthn)
 
