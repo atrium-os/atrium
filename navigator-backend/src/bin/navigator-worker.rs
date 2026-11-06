@@ -30,6 +30,8 @@ struct Worker {
     progress: navigator_backend::progressive::Progress,
     /// The recording as opened: its normalizer inputs, for the display path.
     recording: Vec<u8>,
+    /// The document's content source, for the generation it was built for.
+    bands: Option<navigator_backend::display::Bands>,
 }
 
 impl Worker {
@@ -65,6 +67,41 @@ impl Worker {
         out.extend_from_slice(&norm);
         out.extend_from_slice(a.nsg.as_bytes());
         Ok(out)
+    }
+
+    /// The content source (`display::Bands`): see `wire::REQ_BANDS`.
+    fn bands(&mut self, payload: &[u8]) -> Result<Vec<u8>, String> {
+        use navigator_backend::display::{Bands, BandsAsk};
+        let nl = payload.iter().position(|&b| b == b'\n').filter(|&i| i <= 160).ok_or("no header line")?;
+        let head = std::str::from_utf8(&payload[..nl]).map_err(|_| "header is not text")?;
+        let f: Vec<&str> = head.split(' ').collect();
+        let [initial, generation, n, kind, a, b, c, d] = f.as_slice() else { return Err("header is not eight fields".into()) };
+        let int = |v: &str| -> Result<i64, String> {
+            let digits = v.strip_prefix('-').unwrap_or(v);
+            if digits.is_empty() || digits.len() > 19 || !digits.bytes().all(|x| x.is_ascii_digit()) { return Err(format!("{v:?} is not a number")) }
+            v.parse().map_err(|_| format!("{v:?} is not a number"))
+        };
+        let initial = match *initial { "0" => false, "1" => true, _ => return Err("initial is not 0 or 1".into()) };
+        let generation = u64::try_from(int(generation)?).map_err(|_| "generation is negative")?;
+        let n = usize::try_from(int(n)?).map_err(|_| "length is negative")?;
+        if nl + 1 + n != payload.len() { return Err("cached length does not match the payload".into()) }
+        let ask = match *kind {
+            "want" => BandsAsk::Want { range: (int(a)?, int(b)?), zoom_64: u32::try_from(int(c)?).map_err(|_| "zoom out of range")?, prefetch: int(d)? },
+            "idle" => BandsAsk::Idle { bands: u32::try_from(int(a)?).map_err(|_| "bands out of range")? },
+            _ => return Err("unknown ask".into()),
+        };
+        ask.check()?;
+        let mut produced = None;
+        if self.bands.as_ref().is_none_or(|x| x.generation != generation) {
+            let cached = (n > 0).then(|| &payload[nl + 1..]);
+            let current = if initial { None } else { Some(self.session()?.document().dom.serialize()) };
+            let (src, norm) = Bands::open(&self.recording, current.as_deref(), cached, generation)?;
+            produced = norm;
+            self.bands = Some(src);
+        }
+        let mut ans = self.bands.as_mut().expect("built").ask(ask)?;
+        ans.normalized = produced;
+        Ok(navigator_backend::display::encode_answer(&ans))
     }
 
     fn session(&mut self) -> Result<&mut navigator_backend::session::Session, String> {
@@ -188,7 +225,7 @@ impl Worker {
 
 fn main() {
     let mut w = Worker { sessions: Sessions::new(SessionLimits { max_sessions: 1, ..SessionLimits::default() }), id: None,
-                         progress: Default::default(), recording: vec![] };
+                         progress: Default::default(), recording: vec![], bands: None };
     let mut input = BufReader::new(std::io::stdin());
     let mut output = std::io::stdout();
     loop {
@@ -221,6 +258,7 @@ fn main() {
             REQ_ATTACH => w.attach(&f.payload).map(String::into_bytes),
             REQ_HREF => w.links_to(&f.text()).map(|y| if y { "yes" } else { "no" }.into()),
             REQ_SCENE => w.scene(&f.payload),
+            REQ_BANDS => w.bands(&f.payload),
             other => Err(format!("unknown request {other:?}")),
         };
         let reply = match answer {

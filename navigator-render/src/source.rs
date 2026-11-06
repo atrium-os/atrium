@@ -30,11 +30,11 @@ use std::collections::{BTreeMap, BTreeSet};
 
 /// view → source: keep `range` ready at `zoom_64` (64 = 100%), with
 /// `prefetch` more above and below (a hint: about a viewport).
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Want { pub range: (U, U), pub zoom_64: u32, pub prefetch: U }
 
 /// source → view.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Event {
     /// The document's height; `settled` once it is exact. Sent whenever it
     /// changes.

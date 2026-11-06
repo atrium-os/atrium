@@ -164,6 +164,8 @@ struct Worker {
     /// recording and its table, and one kept out as not different.
     staged: Option<Vec<u8>>,
     staged_table: Option<Vec<u8>>,
+    /// The document generation the worker's content source was built for.
+    bands_generation: Option<u64>,
     kept_out: Option<Vec<u8>>,
     /// The first document's images, as they arrive. Broker-side only: the
     /// worker's document does not change, and the worker is never asked
@@ -356,7 +358,7 @@ impl DocumentHost for JailedHost {
         self.workers.insert(id, Worker {
             child, stdin: Some(stdin), frames, charged, opened_at: now, last_seen: now,
             triggers: vec![], reply_limit, carried: Carried::new(recording),
-            staged: None, staged_table: None, kept_out: None,
+            staged: None, staged_table: None, kept_out: None, bands_generation: None,
             first_images: crate::progressive::FirstImages::opened(recording),
         });
 
@@ -495,6 +497,39 @@ impl DocumentHost for JailedHost {
         match parsed {
             Ok(p) => Ok(p),
             Err(why) => { self.retire(id, Status::Failed); Err(format!("worker sent a bad image: {why}")) }
+        }
+    }
+
+    /// The content source (`display::Bands`), asked of the worker; an answer
+    /// of the wrong shape retires it, as a bad scene does.
+    fn bands(&mut self, id: SessionId, ask: crate::display::BandsAsk, initial: bool, generation: u64,
+             cached: &mut dyn FnMut() -> Option<Vec<u8>>, now: Millis) -> Result<crate::display::BandsAnswer, String>
+    {
+        let deadline = self.config.deadline;
+        let w = self.workers.get_mut(&id).ok_or("no such session")?;
+        w.last_seen = w.last_seen.max(now);
+        // The stored document goes only to a worker building its source.
+        let c = if w.bands_generation != Some(generation) && initial { cached() } else { None };
+        let c = c.unwrap_or_default();
+        let a = match ask {
+            crate::display::BandsAsk::Want { range, zoom_64, prefetch } => format!("want {} {} {zoom_64} {prefetch}", range.0, range.1),
+            crate::display::BandsAsk::Idle { bands } => format!("idle {bands} 0 0 0"),
+        };
+        let mut payload = format!("{} {generation} {} {a}\n", initial as u8, c.len()).into_bytes();
+        payload.extend_from_slice(&c);
+        let reply = match w.request_limited(&Frame::new(REQ_BANDS, payload), deadline, MAX_FRAME) {
+            Ok(r) => r,
+            Err(why) => { self.retire(id, Status::Failed); return Err(why) }
+        };
+        if reply.tag == RSP_ERR { return Err(reply.text()) }
+        let parsed = if reply.tag == RSP_OK { crate::display::decode_answer(&reply.payload) }
+                     else { Err(format!("worker sent an unknown reply {:?}", reply.tag)) };
+        match parsed.and_then(|a| crate::navigatord::check_bands(&a).map(|_| a)) {
+            Ok(a) => {
+                if let Some(w) = self.workers.get_mut(&id) { w.bands_generation = Some(generation) }
+                Ok(a)
+            }
+            Err(why) => { self.retire(id, Status::Failed); Err(format!("worker sent bad bands: {why}")) }
         }
     }
 

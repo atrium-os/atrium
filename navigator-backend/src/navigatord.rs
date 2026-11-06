@@ -99,6 +99,18 @@ pub trait DocumentHost {
     {
         Err("this host does not lay documents out".into())
     }
+    /// ★ The session's CONTENT SOURCE (pergola.md §10.4, backend §4.8): a
+    /// `want` or background work, answered with the source's events and the
+    /// groups it wrote as NSG. `generation` changes whenever the session's
+    /// document does, and the host builds its source again then; `cached`
+    /// gives the normalized document the broker stored, read only when the
+    /// host builds from the untouched initial state (`initial`). The broker
+    /// validates what comes back (`check_bands`).
+    fn bands(&mut self, _id: SessionId, _ask: crate::display::BandsAsk, _initial: bool, _generation: u64,
+             _cached: &mut dyn FnMut() -> Option<Vec<u8>>, _now: Millis) -> Result<crate::display::BandsAnswer, String>
+    {
+        Err("this host does not lay documents out in bands".into())
+    }
     /// Whether an `<a>` or `<area>` in the session's CURRENT document — after
     /// whatever transitions the reader took — carries exactly `href`. The
     /// precise half of the link check; the broker's own bound (`carried`)
@@ -179,6 +191,13 @@ pub enum Request {
     /// The first screen of a session's document, down to `limit_px` (backend
     /// §4.8, bands step 1): answered by `Event::Scene`.
     Scene { session: SessionId, limit_px: u32 },
+    /// ★ A view's wish for a session's content (pergola.md §10.4): keep
+    /// `range` (1/64 px, the layout at `zoom_64`) ready, `prefetch` either
+    /// side. Answered by `Event::Bands`.
+    Want { session: SessionId, range: (i64, i64), zoom_64: u32, prefetch: i64 },
+    /// Background layout while the view is idle, up to `bands` bands;
+    /// answered by `Event::Bands`.
+    BandsIdle { session: SessionId, bands: u32 },
 }
 
 /// What the UI hears back.
@@ -241,6 +260,13 @@ pub enum Event {
     /// `from_cache`: laid out from the normalized document the broker had
     /// stored for this recording, without normalizing again.
     Scene { session: SessionId, nsg: String, from_cache: bool },
+    /// ★ What a session's content source did (pergola.md §10.4), checked
+    /// by the broker (`check_bands`): its events (`extent`, `band_ready`,
+    /// `band_updated`, `band_evicted`), the groups it wrote — each band's
+    /// group clipped to its range, and the overlay — as NSG, and the groups
+    /// it cleared. `from_cache` as for `Scene`.
+    Bands { session: SessionId, events: Vec<navigator_render::source::Event>, puts: Vec<crate::display::GroupPut>,
+            clears: Vec<navigator_render::source::GroupId>, from_cache: bool },
 }
 
 /// The broker.
@@ -278,6 +304,9 @@ pub struct Navigatord<H: DocumentHost> {
     /// Sessions whose document is no longer its recording's untouched
     /// initial state (navigated, forwarded, restored or swapped).
     touched: std::collections::BTreeSet<SessionId>,
+    /// Each session's document generation: bumped whenever its document
+    /// changes, so a host builds its content source again.
+    generation: std::collections::BTreeMap<SessionId, u64>,
 }
 
 /// The largest first-screen scene a host may answer, bytes of NSG.
@@ -291,6 +320,49 @@ pub const MAX_NORMALIZED_BYTES: usize = 16 << 20;
 pub fn check_scene(a: &crate::display::SceneAnswer) -> Result<(), String> {
     if a.nsg.len() > MAX_SCENE_BYTES { return Err(format!("scene is {} bytes, over {MAX_SCENE_BYTES}", a.nsg.len())) }
     if !a.nsg.starts_with("nsg 0.") { return Err("scene does not start with an NSG header".into()) }
+    if a.normalized.as_ref().is_some_and(|n| n.len() > MAX_NORMALIZED_BYTES) { return Err("normalized document over its bound".into()) }
+    if a.normalized.as_ref().is_some_and(|n| std::str::from_utf8(n).is_err()) { return Err("normalized document is not UTF-8".into()) }
+    Ok(())
+}
+
+/// What one bands answer may carry: events, groups and NSG bytes in all.
+pub const MAX_BAND_EVENTS: usize = 4096;
+pub const MAX_BAND_PUTS: usize = 64;
+pub const MAX_BANDS_BYTES: usize = 20 << 20;
+
+/// ★ The broker's check of a bands answer, whatever host gave it: counts
+/// and sizes within their bounds, every group NSG, every band group written
+/// only for a band the same answer announced (ready or updated) with a
+/// range that is a range, and the normalized document as for a scene.
+pub fn check_bands(a: &crate::display::BandsAnswer) -> Result<(), String> {
+    use navigator_render::source::{Event as E, GroupId};
+    if a.events.len() > MAX_BAND_EVENTS || a.clears.len() > MAX_BAND_EVENTS { return Err("too many band events".into()) }
+    if a.puts.len() > MAX_BAND_PUTS { return Err(format!("{} groups in one answer, over {MAX_BAND_PUTS}", a.puts.len())) }
+    let total: usize = a.puts.iter().map(|p| p.nsg.len()).sum();
+    if total > MAX_BANDS_BYTES { return Err(format!("{total} bytes of groups, over {MAX_BANDS_BYTES}")) }
+    let mut announced = std::collections::BTreeMap::new();
+    for e in &a.events {
+        match e {
+            E::BandReady { band, range } | E::BandUpdated { band, range } => {
+                if range.1 <= range.0 { return Err(format!("band {band} has an empty range")) }
+                announced.insert(*band, *range);
+            }
+            E::Extent { height, .. } => if *height < 0 { return Err("a negative extent".into()) },
+            E::BandEvicted { .. } => {}
+        }
+    }
+    for p in &a.puts {
+        if p.nsg.len() > MAX_SCENE_BYTES { return Err(format!("a group is {} bytes, over {MAX_SCENE_BYTES}", p.nsg.len())) }
+        if !p.nsg.starts_with("nsg 0.") { return Err("a group does not start with an NSG header".into()) }
+        match p.group {
+            GroupId::Band(b) => match announced.get(&b) {
+                Some(r) if p.clip == Some(*r) => {}
+                Some(_) => return Err(format!("band {b}'s group is not clipped to its range")),
+                None => return Err(format!("a group for band {b}, which the answer did not announce")),
+            },
+            GroupId::Overlay => if p.clip.is_some() { return Err("the overlay carries no band clip".into()) },
+        }
+    }
     if a.normalized.as_ref().is_some_and(|n| n.len() > MAX_NORMALIZED_BYTES) { return Err("normalized document over its bound".into()) }
     if a.normalized.as_ref().is_some_and(|n| std::str::from_utf8(n).is_err()) { return Err("normalized document is not UTF-8".into()) }
     Ok(())
@@ -364,7 +436,7 @@ impl<H: DocumentHost> Navigatord<H> {
             return Err("navigatord refuses to start: the document host is not confined \
                         (configure a launcher, e.g. `portcullis exec --daemon --instance {instance}`)".into());
         }
-        Ok(Navigatord { host, now: 0, schemes: SchemeAllowlist::default(), blobs: None, decoded: Default::default(), device_scale: NSG_UNIT as u32, zoom: Default::default(), normalized: Default::default(), touched: Default::default() })
+        Ok(Navigatord { host, now: 0, schemes: SchemeAllowlist::default(), blobs: None, decoded: Default::default(), device_scale: NSG_UNIT as u32, zoom: Default::default(), normalized: Default::default(), touched: Default::default(), generation: Default::default() })
     }
 
     /// An unconfined broker, for tests: in-process hosts, bare worker
@@ -373,7 +445,7 @@ impl<H: DocumentHost> Navigatord<H> {
     /// so a shipped binary that calls it does not link.
     #[cfg(any(test, feature = "unconfined-for-testing"))]
     pub fn unconfined_for_testing(host: H) -> Self {
-        Navigatord { host, now: 0, schemes: SchemeAllowlist::default(), blobs: None, decoded: Default::default(), device_scale: NSG_UNIT as u32, zoom: Default::default(), normalized: Default::default(), touched: Default::default() }
+        Navigatord { host, now: 0, schemes: SchemeAllowlist::default(), blobs: None, decoded: Default::default(), device_scale: NSG_UNIT as u32, zoom: Default::default(), normalized: Default::default(), touched: Default::default(), generation: Default::default() }
     }
 
     /// The host, for an operator (or a test) inspecting it.
@@ -432,6 +504,7 @@ impl<H: DocumentHost> Navigatord<H> {
                 match self.host.navigate(session, &trigger, self.now) {
                     Ok(()) => {
                         self.touched.insert(session);
+                        *self.generation.entry(session).or_default() += 1;
                         let triggers = self.host.triggers(session);
                         out.push(Event::SceneReady { session, triggers });
                     }
@@ -442,6 +515,7 @@ impl<H: DocumentHost> Navigatord<H> {
                 if let Some(e) = self.absent(session) { out.push(e); return out }
                 match self.host.back(session, self.now) {
                     Ok(how) => {
+                        *self.generation.entry(session).or_default() += 1;
                         let triggers = self.host.triggers(session);
                         out.push(Event::Rewound { session, how, triggers });
                     }
@@ -453,6 +527,7 @@ impl<H: DocumentHost> Navigatord<H> {
                 match self.host.forward(session, self.now) {
                     Ok(how) => {
                         self.touched.insert(session);
+                        *self.generation.entry(session).or_default() += 1;
                         let triggers = self.host.triggers(session);
                         out.push(Event::Advanced { session, how, triggers });
                     }
@@ -474,6 +549,7 @@ impl<H: DocumentHost> Navigatord<H> {
                 match self.host.restore(&saved, self.now) {
                     Ok(session) => {
                         self.touched.insert(session);
+                        *self.generation.entry(session).or_default() += 1;
                         let triggers = self.host.triggers(session);
                         out.push(Event::SessionOpened { session, triggers });
                     }
@@ -524,6 +600,7 @@ impl<H: DocumentHost> Navigatord<H> {
                 match self.host.swap(session, &anchor, self.now) {
                     Ok(anchor) => {
                         self.touched.insert(session);
+                        *self.generation.entry(session).or_default() += 1;
                         // A new document names its own images: what the old
                         // one's decodes cost is given back.
                         self.decoded.remove(&session);
@@ -557,6 +634,20 @@ impl<H: DocumentHost> Navigatord<H> {
             Request::Scene { session, limit_px } => {
                 if let Some(e) = self.absent(session) { out.push(e); return out }
                 match self.scene(session, limit_px) {
+                    Ok(e) => out.push(e),
+                    Err(why) => out.push(Event::Blocked { session: Some(session), why }),
+                }
+            }
+            Request::Want { session, range, zoom_64, prefetch } => {
+                if let Some(e) = self.absent(session) { out.push(e); return out }
+                match self.bands(session, crate::display::BandsAsk::Want { range, zoom_64, prefetch }) {
+                    Ok(e) => out.push(e),
+                    Err(why) => out.push(Event::Blocked { session: Some(session), why }),
+                }
+            }
+            Request::BandsIdle { session, bands } => {
+                if let Some(e) = self.absent(session) { out.push(e); return out }
+                match self.bands(session, crate::display::BandsAsk::Idle { bands }) {
                     Ok(e) => out.push(e),
                     Err(why) => out.push(Event::Blocked { session: Some(session), why }),
                 }
@@ -620,6 +711,34 @@ impl<H: DocumentHost> Navigatord<H> {
             self.normalized.insert(key, h);
         }
         Ok(Event::Scene { session, nsg: a.nsg, from_cache: cached.is_some() })
+    }
+
+    /// ★ A content-source ask (see `Request::Want`), normalized once per
+    /// recording as a scene is.
+    fn bands(&mut self, session: SessionId, ask: crate::display::BandsAsk) -> Result<Event, String> {
+        ask.check()?;
+        let key = blake3::hash(self.host.carried(session).ok_or("no such session")?.bytes()).to_hex().to_string();
+        let initial = !self.touched.contains(&session);
+        let generation = self.generation.get(&session).copied().unwrap_or(0);
+        let mut used_cache = false;
+        let a = {
+            let (normalized, blobs) = (&self.normalized, &self.blobs);
+            let mut cached = || -> Option<Vec<u8>> {
+                if !initial { return None }
+                let v = match (normalized.get(&key), blobs.as_ref()) { (Some(h), Some(b)) => b.get(h).ok(), _ => None };
+                used_cache = v.is_some();
+                v
+            };
+            self.host.bands(session, ask, initial, generation, &mut cached, self.now)?
+        };
+        check_bands(&a)?;
+        if let (true, Some(n), Some(b)) = (initial, &a.normalized, self.blobs.as_mut()) {
+            if !self.normalized.contains_key(&key) {
+                let h = b.put(n)?;
+                self.normalized.insert(key, h);
+            }
+        }
+        Ok(Event::Bands { session, events: a.events, puts: a.puts, clears: a.clears, from_cache: used_cache })
     }
 
     fn image(&mut self, session: SessionId, address: String, painted: Option<(u32, u32)>) -> Result<Event, String> {
@@ -687,6 +806,8 @@ pub struct InProcessHost {
     carried: std::collections::HashMap<SessionId, Carried>,
     /// Each session's way from its first document to its scripted one.
     progress: std::collections::HashMap<SessionId, crate::progressive::Progress>,
+    /// Each session's content source (`bands`).
+    bands: std::collections::HashMap<SessionId, crate::display::Bands>,
 }
 
 impl Default for InProcessHost {
@@ -696,7 +817,7 @@ impl Default for InProcessHost {
 impl InProcessHost {
     pub fn new(sessions: SessionLimits, limits: crate::Limits) -> Self {
         InProcessHost { sessions: Sessions::new(sessions), limits, store: None, recordings: Default::default(), carried: Default::default(),
-                        progress: Default::default() }
+                        progress: Default::default(), bands: Default::default() }
     }
 
     /// With a store, so sessions can be saved and restored.
@@ -822,6 +943,7 @@ impl DocumentHost for InProcessHost {
         self.recordings.remove(&id);
         self.carried.remove(&id);
         self.progress.remove(&id);
+        self.bands.remove(&id);
         self.sessions.close(id)
     }
     fn expire(&mut self, now: Millis) -> Vec<(SessionId, Expiry)> {
@@ -841,6 +963,23 @@ impl DocumentHost for InProcessHost {
     {
         if self.sessions.get(id).is_none() { return Err("no such session".into()) }
         crate::image::decode(address, bytes, c).map_err(|e| e.to_string())
+    }
+    fn bands(&mut self, id: SessionId, ask: crate::display::BandsAsk, initial: bool, generation: u64,
+             cached: &mut dyn FnMut() -> Option<Vec<u8>>, _now: Millis) -> Result<crate::display::BandsAnswer, String>
+    {
+        let mut produced = None;
+        if self.bands.get(&id).is_none_or(|b| b.generation != generation) {
+            let s = self.sessions.get(id).ok_or("no such session")?;
+            let current = (!initial).then(|| s.document().dom.serialize());
+            let rec = self.carried.get(&id).ok_or("no recording for this session")?;
+            let c = if initial { cached() } else { None };
+            let (b, n) = crate::display::Bands::open(rec.bytes(), current.as_deref(), c.as_deref(), generation)?;
+            produced = n;
+            self.bands.insert(id, b);
+        }
+        let mut a = self.bands.get_mut(&id).expect("built").ask(ask)?;
+        a.normalized = produced;
+        Ok(a)
     }
     fn scene(&mut self, id: SessionId, cached: Option<&[u8]>, initial: bool, limit_px: u32, _now: Millis)
         -> Result<crate::display::SceneAnswer, String>

@@ -152,5 +152,11 @@ pub const REQ_ATTACH: &str = "ATCH";
 /// many bytes of the normalized document this worker produced (0 for none),
 /// then the NSG text.
 pub const REQ_SCENE: &str = "SCN";
+/// ★ The session's content source (`display::Bands`; pergola.md §10.4).
+/// Payload: `<initial 0|1> <generation> <cached_len> want <y0> <y1> <zoom_64>
+/// <prefetch>\n` or `… idle <bands> 0 0 0\n`, then `cached_len` bytes of the
+/// stored normalized document (sent only when the worker builds its source
+/// for a new generation). The answer is `display::encode_answer`'s.
+pub const REQ_BANDS: &str = "BND";
 pub const RSP_OK: &str = "OK";
 pub const RSP_ERR: &str = "ERR";
