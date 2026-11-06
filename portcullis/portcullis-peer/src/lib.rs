@@ -25,13 +25,27 @@ pub const DEFAULT_REGISTRY: &str = "/var/run/atrium/app-registry";
 /// reserved app sub-range, well above typical human uids.
 pub const APP_UID_BASE: u32 = 50_000;
 
-/// Allocate a dedicated uid for a new app launch: the lowest free uid ≥
-/// [`APP_UID_BASE`] not already bound in the registry. Portcullis calls this,
-/// then [`register`]s the binding.
+/// Allocate a dedicated uid for a new app launch: the lowest uid ≥
+/// [`APP_UID_BASE`] that is neither bound in the registry nor already a host
+/// account other than an app account. Portcullis calls this, then
+/// [`register`]s the binding.
+///
+/// The second rule matters: system daemons (`_memoryd` 50090, `_memfed`
+/// 50091, `_ostiarius` 50093, `_stoad` 50094) have uids inside this range.
+/// Without it, the 91st app launched on a machine would be given 50090 and
+/// run as `_memoryd`, and services that trust that uid (Arca trusts
+/// `_ostiarius` to unlock stores) would trust the app.
 pub fn allocate(registry_path: &str) -> u32 {
     let reg = AppRegistry::load(registry_path).unwrap_or_default();
+    allocate_in(&reg, |uid| match username(uid) {
+        None => false,
+        Some(name) => name != app_username(uid),
+    })
+}
+
+fn allocate_in(reg: &AppRegistry, system_account: impl Fn(u32) -> bool) -> u32 {
     let mut uid = APP_UID_BASE;
-    while reg.map.contains_key(&uid) {
+    while reg.map.contains_key(&uid) || system_account(uid) {
         uid += 1;
     }
     uid
@@ -311,6 +325,14 @@ pub mod seat {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn allocation_skips_system_accounts_in_the_range() {
+        let reg = AppRegistry::parse("50000 alice a\n50001 alice b\n");
+        // 50002 is a system daemon's uid: skipped.
+        assert_eq!(allocate_in(&reg, |u| u == 50002 || u == 50003), 50004);
+        assert_eq!(allocate_in(&reg, |_| false), 50002);
+    }
 
     #[test]
     fn registry_records_the_publisher() {

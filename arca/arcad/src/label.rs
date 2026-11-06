@@ -38,18 +38,23 @@ pub const UNSIGNED_PUBLISHER: [u8; 32] = [0; 32];
 
 impl Resolver {
     pub fn resolve(&self, uid: u32) -> Label {
-        if Some(uid) == self.vestibulum_uid {
-            return Label::Vestibulum;
-        }
-        if Some(uid) == self.ui_uid {
-            return Label::TrustedUi;
-        }
         // Read fresh each time: portcullisd appends at every launch. A read
         // failure is "unknown": fail closed.
         let Ok(reg) = portcullis_peer::AppRegistry::load(self.registry.to_str().unwrap_or("")) else {
             return Label::Unknown;
         };
-        let Some((user, app_id)) = reg.resolve(uid) else { return Label::Unknown };
+        let system = Some(uid) == self.vestibulum_uid || Some(uid) == self.ui_uid;
+        let Some((user, app_id)) = reg.resolve(uid) else {
+            return match () {
+                _ if Some(uid) == self.vestibulum_uid => Label::Vestibulum,
+                _ if Some(uid) == self.ui_uid => Label::TrustedUi,
+                _ => Label::Unknown,
+            };
+        };
+        if system {
+            // A system uid that the launcher also gave to an app: trust neither.
+            return Label::Unknown;
+        }
         let publisher = match reg.publisher(uid) {
             Some(Some(p)) => p,
             Some(None) if self.allow_unsigned => UNSIGNED_PUBLISHER,

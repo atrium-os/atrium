@@ -197,6 +197,10 @@ fn resolver_fails_closed() {
     assert_eq!(r.resolve(65020), Label::Vestibulum);
     r.allow_unsigned = true;
     assert_eq!(r.resolve(50002), app("org.example.unsigned", 0));
+    // A system uid that also appears as an app in the registry is neither.
+    std::fs::write(&reg, "65020 alice org.example.squatter\n").unwrap();
+    r.registry = reg.clone();
+    assert_eq!(r.resolve(65020), Label::Unknown);
     r.registry = d.path().join("missing");
     assert_eq!(r.resolve(50001), Label::Unknown);
 }
