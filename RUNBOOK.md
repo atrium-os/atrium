@@ -5310,6 +5310,14 @@ build portcullis/opifex from `portcullis/`; sign the renderer bundle with
 `/root/e2e-key.pem` and install it with opifex. Known gaps: fonts are not in
 the renderer bundle; the Vulkan backend can't take pre-packed frames.
 
+CPU cost: `sh scripts/fresco-cpu.sh [SECONDS]` in the guest, while a client
+animates (`atrium-vector-demo` zooms a star at 10 fps), prints each Fresco
+process's CPU seconds; frescod's line splits off the time gpusim spends running
+submitted GPU work inside the submit's doorbell write (`emulated-gpu`), which
+hardware doesn't charge to frescod. Compare builds by `own`. For where the time
+goes: `kldload dtraceall`, then `profile-997` on frescod's pid. After a reboot,
+restart portcullisd after `service atrium-jaild start`, or no renderer starts.
+
 Shader tools in cloud sessions (GitHub release downloads are blocked):
 - Slang: `sh scripts/slangc-lite/setup.sh`, then
   `SLANGC=~/.cache/atrium-slangc-lite/slangc AQUEDUCT_SHADER_TOOL=true sh bundles/atrium-core/build.sh` (and `atrium-text`). `.spv` files are gitignored.
