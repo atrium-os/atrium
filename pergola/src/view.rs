@@ -47,7 +47,13 @@ pub struct Ctx<'a> {
     pub theme: Semantic,
     /// Hover/press/focus from the app, for state-dependent looks.
     pub state: InteractionState,
+    /// Layers drawn after the whole view, at the top level: menus,
+    /// dropdowns, dialogs ([`Ctx::overlay`]).
+    overlays: Vec<Overlay>,
 }
+
+/// A deferred top-level layer.
+pub type Overlay = Box<dyn for<'b> FnOnce(&mut Ctx<'b>)>;
 
 impl<'a> Ctx<'a> {
     pub fn new(
@@ -64,7 +70,7 @@ impl<'a> Ctx<'a> {
         theme: Semantic,
         state: InteractionState,
     ) -> Self {
-        Self { tree, interactions, parent_stack: Vec::new(), theme, state }
+        Self { tree, interactions, parent_stack: Vec::new(), theme, state, overlays: Vec::new() }
     }
 
     /// Whether `id` is the current hover target. Valid for nodes whose
@@ -135,6 +141,32 @@ impl<'a> Ctx<'a> {
     /// `on_scroll` handler.
     pub fn on_frame<F: Fn(f64, &Node) -> bool + 'static>(&mut self, id: NodeId, handler: F) {
         self.interactions.entry(id).on_frame = Some(Box::new(handler));
+    }
+
+    /// Draw `f` above everything the view draws, at the window's top
+    /// level, after the view has rendered: a menu or dialog escapes its
+    /// parent's layout and clip, and is hit before what it covers.
+    pub fn overlay(&mut self, f: impl for<'b> FnOnce(&mut Ctx<'b>) + 'static) {
+        self.overlays.push(Box::new(f));
+    }
+
+    /// Run the overlays queued so far (and any they queue), at top level.
+    pub fn flush_overlays(&mut self) {
+        while !self.overlays.is_empty() {
+            let saved = std::mem::take(&mut self.parent_stack);
+            for f in std::mem::take(&mut self.overlays) {
+                f(self);
+            }
+            self.parent_stack = saved;
+        }
+    }
+
+    /// Give `id` keyboard focus when it first appears (an opened menu or
+    /// dialog); focus goes back where it was when it goes.
+    pub fn autofocus(&mut self, id: NodeId) {
+        let h = self.interactions.entry(id);
+        h.focusable = true;
+        h.autofocus = true;
     }
 
     /// Mark a node as eligible for keyboard focus.
@@ -218,6 +250,7 @@ pub fn render_continuing<V: View>(
     {
         let mut ctx = Ctx::with_state(&mut tree, &mut interactions, theme, state);
         view.render(&mut ctx);
+        ctx.flush_overlays();
     }
     tree.sweep_keys();
     (tree, interactions)

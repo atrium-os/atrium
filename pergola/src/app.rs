@@ -47,6 +47,11 @@ pub struct App<V: View> {
     focus_visible: bool,
     /// The node following the held press (`Ctx::on_drag`), if any.
     dragging: Option<NodeId>,
+    /// Where focus was before an autofocus layer took it, to go back to.
+    focus_return: Option<NodeId>,
+    /// The autofocus layer that is up (a dialog, an open menu): Tab stays
+    /// inside it, and keys no one in it took go to it.
+    modal: Option<NodeId>,
     /// Current hover target — nearest interactive ancestor under the
     /// pointer. Drives widgets' hover looks via `InteractionState`.
     hovered: Option<NodeId>,
@@ -98,6 +103,8 @@ impl<V: View> App<V> {
             focused: None,
             focus_visible: false,
             dragging: None,
+            focus_return: None,
+            modal: None,
             hovered: None,
             pressed_vis: None,
             dirty,
@@ -225,10 +232,58 @@ impl<V: View> App<V> {
         } else {
             diff(&self.prev_tree, &next)
         };
+        self.follow_autofocus(&next, &interactions);
         self.prev_tree = next;
         self.interactions = interactions;
         self.place_slots();
         deltas
+    }
+
+    /// A layer that just appeared takes focus; when the focused node
+    /// goes, focus goes back to where it was before the layer.
+    fn follow_autofocus(&mut self, next: &NodeTree, interactions: &Interactions) {
+        let fresh = interactions.by_node.iter()
+            .filter(|(id, h)| h.autofocus && self.prev_tree.get(**id).is_none())
+            .map(|(id, _)| *id)
+            .max_by_key(|id| id.0);
+        if let Some(id) = fresh {
+            if self.focus_return.is_none() {
+                self.focus_return = self.focused;
+            }
+            self.focused = Some(id);
+            self.modal = Some(id);
+            self.dirty.store(true, Ordering::Release);
+        } else {
+            if self.modal.is_some_and(|m| next.get(m).is_none()) {
+                self.modal = None;
+            }
+            if let Some(f) = self.focused {
+                if next.get(f).is_none() {
+                    self.focused = self.focus_return.take().filter(|r| next.get(*r).is_some());
+                    self.dirty.store(true, Ordering::Release);
+                }
+            }
+        }
+    }
+
+    /// The root `id` sits under.
+    fn root_of(&self, mut id: NodeId) -> NodeId {
+        while let Some(p) = self.prev_tree.parent_of(id) {
+            id = p;
+        }
+        id
+    }
+
+    /// Whether `id` belongs to the modal layer: everything emitted from
+    /// the layer's root on (a layer is drawn after the content under it).
+    fn in_modal(&self, id: NodeId) -> bool {
+        let Some(m) = self.modal else { return true };
+        let roots: Vec<NodeId> = self.prev_tree.roots().collect();
+        let at = |r: NodeId| roots.iter().position(|&x| x == r);
+        match (at(self.root_of(m)), at(self.root_of(id))) {
+            (Some(layer), Some(node)) => node >= layer,
+            _ => true,
+        }
     }
 
     /// Diff the slots' window rects against the last placement.
@@ -297,7 +352,7 @@ impl<V: View> App<V> {
             .interactions
             .by_node
             .iter()
-            .filter(|(_, h)| h.focusable)
+            .filter(|(id, h)| h.focusable && self.in_modal(**id))
             .map(|(id, _)| *id)
             .collect();
         ids.sort_by_key(|id| id.0);
@@ -426,11 +481,30 @@ impl<V: View> App<V> {
                 }
                 let mut taken = false;
                 if let Some(id) = self.focused {
-                    if let Some(h) = self.interactions.get(id) {
-                        if let Some(cb) = &h.on_key {
+                    let h = self.interactions.get(id);
+                    let press = *kind == KeyEventKind::Down
+                        && (*key == Key::Enter || (*key == Key::Char && chars == " "))
+                        && !modifiers.ctrl && !modifiers.meta;
+                    // Space or Enter press a focused control that has no key
+                    // handler of its own (a button; §14.3).
+                    if let Some(cb) = h.filter(|h| press && h.on_key.is_none()).and_then(|h| h.on_click.as_ref()) {
+                        cb();
+                        taken = true;
+                    } else if let Some(t) = self.bubble_to(id, |h| h.on_key.is_some()) {
+                        // Otherwise the key goes to the nearest handler up the
+                        // tree: a dialog hears Escape from its focused button.
+                        if let Some(cb) = self.interactions.get(t).and_then(|h| h.on_key.as_ref()) {
                             cb(&event);
                             taken = true;
                         }
+                    }
+                }
+                // A key no one in the layer took goes to the layer itself: a
+                // dialog hears Escape from the button that has focus.
+                if !taken {
+                    if let Some(cb) = self.modal.filter(|m| Some(*m) != self.focused).and_then(|m| self.interactions.get(m)).and_then(|h| h.on_key.as_ref()) {
+                        cb(&event);
+                        taken = true;
                     }
                 }
                 // Navigation keys no focused widget took scroll the view

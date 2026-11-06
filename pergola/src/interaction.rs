@@ -58,6 +58,8 @@ pub struct Handlers {
     /// When `true`, this node can take keyboard focus. Pointer-down
     /// on a focusable node sets focus; Tab navigates among focusables.
     pub focusable: bool,
+    /// Take focus when this node first appears ([`crate::view::Ctx::autofocus`]).
+    pub autofocus: bool,
     /// Wheel, navigation keys and presses for a scroll view.
     pub on_scroll: Option<ScrollHandler>,
     /// A per-frame step (a fling, an eased jump, a zoom settling).

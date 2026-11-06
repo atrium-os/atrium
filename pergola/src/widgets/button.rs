@@ -24,6 +24,8 @@ pub enum Variant {
     Primary,
     Secondary,
     Ghost,
+    /// A primary action that destroys something (delete, discard).
+    Destructive,
 }
 
 /// `Arc<dyn Fn>` so `Button` is `Clone` (re-rendered each frame
@@ -52,6 +54,10 @@ impl Button {
 
     pub fn secondary(label: impl Into<String>) -> Self {
         Self { variant: Variant::Secondary, ..Self::primary(label) }
+    }
+
+    pub fn destructive(label: impl Into<String>) -> Self {
+        Self { variant: Variant::Destructive, ..Self::primary(label) }
     }
 
     pub fn ghost(label: impl Into<String>) -> Self {
@@ -134,6 +140,10 @@ impl View for Button {
                     theme.accent_fill()
                 };
                 (fill, crate::Color::TRANSPARENT, theme.text_on_accent())
+            }
+            Variant::Destructive => {
+                let base = crate::theme::palette::danger_500();
+                (overlay.map_or(base, |o| o.over(base)), crate::Color::TRANSPARENT, theme.text_on_accent())
             }
             Variant::Secondary => {
                 let base = theme.bg_elevated();
