@@ -337,3 +337,69 @@ share the layout code.
   content source and `ScrollView`: "give me the scene for this range of the document, at
   this zoom", with an estimated total extent that may settle later. A `DocumentView`, the
   Navigator worker and any long list (a mail index, a log) implement it alike.
+
+### §10.4 The band interface, zoom, and accessibility (settled 2026-11-06)
+
+*Asked by the Navigator thread, 2026-11-06, so the content side (navigator-render bands,
+5a86d41e) and `ScrollView` are not built twice. Built on scene groups
+([fresco-scene-groups.md](fresco-scene-groups.md)).*
+
+**Who owns what.** `ScrollView` owns the viewport: scroll position, fling physics, zoom
+gestures, prefetch, and anchoring. The content source (the Navigator worker, a
+`DocumentView`, a long list) owns content: where bands are cut (at checkpoints), what each
+band's scene is, and how much it keeps resident. The source never scrolls; `ScrollView`
+never lays out.
+
+**Coordinates.** Document space, vertical, in 1/64 px at zoom 1 (the Navigator's `U`).
+`ScrollView` maps document space to its content group with one transform: translation for
+scroll, uniform scale for zoom.
+
+**The contract** (host-agnostic; in-process it is a Rust trait, out of process the same
+messages over the doc-viewer role's channel, limen.md §2.1):
+
+| direction | message | meaning |
+|---|---|---|
+| view → source | `want { range, zoom, prefetch }` | keep `range` (document space) ready at `zoom`; `prefetch` is a hint, about one viewport above and below |
+| source → view | `extent { height, settled }` | estimated total height; `settled` once it is exact. Sent whenever it changes |
+| source → view | `band_ready { band, range }` | band `band` covers `range` and its scene is in the window, as one group the source wrote |
+| source → view | `band_updated { band, range }` | its content or extent changed (images arriving, a restyle) |
+| source → view | `band_evicted { band }` | gone; anything of it still visible shows placeholders (§10.1) |
+
+- **Scenes go straight to Fresco, not through `ScrollView`.** Each band is one scene group
+  (backend cuts bands only at checkpoints; leaves crossing a band edge go in the source's
+  overlay group, fresco-scene-groups.md §6). The source places band groups under a content
+  group the view names; in-process, `DocumentView` writes through Pergola's surface, out of
+  process the worker writes into its own embedded surface. `ScrollView` moves the content
+  group; it never copies scene data.
+- **Anchoring.** When an estimate above the viewport changes (`band_updated` or `extent`),
+  `ScrollView` keeps the first visible band and its offset fixed on screen and adjusts the
+  scroll position, so reading never jumps. Uses `navigator_render::anchor` semantics.
+- **Residency** is the source's: it may evict anything outside the last `want` range plus
+  prefetch. `ScrollView` treats an evicted band in view as not ready (placeholders), never
+  as an error.
+
+**Zoom and pinch.** `ScrollView` owns the gesture (trackpad pinch, Ctrl+wheel, Ctrl +/−/0).
+During it, the content group's scale changes (approximate: existing bands stretched,
+"approximate now, sharpen on settle"). When the gesture ends and input has been quiet for
+100 ms, `ScrollView` sends `want` with the new zoom and the anchor to keep; the source
+re-lays out at that zoom and replaces bands; `ScrollView` swaps them in keeping the anchor.
+The Navigator broker's per-session `set_zoom` becomes what that settle calls. Text size is
+a content setting, not a zoom, and goes to the source directly.
+
+**Accessibility with bands** (§5). The AX tree cannot depend on residency. The source sends
+a **semantic outline of the whole document** once layout knows it (headings, landmarks,
+tables, links and form controls, each with its document-space range), independent of
+which bands are resident. Resident bands add their full AX nodes under the outline. A
+screen reader moving to a node in a non-resident range makes `ScrollView` request that
+range, exactly as a scroll would. Find-in-page searches the source's text, not the scene.
+
+**Two engines, on purpose.** Pergola's own layout (taffy flexbox, widgets, a few hundred
+nodes) and document layout (profile, bands, tables, millions of nodes) stay separate. They
+meet only through scene groups: a `DocumentView` is a widget whose content group the
+document engine fills; a native control in a document is a Pergola widget subtree in a
+document group (profile §3.14).
+
+**Animation.** Client-driven animation (§4.1) is enough for scrolling now: with groups a
+scroll frame is one transform change (a few dozen bytes), and the renderer shifts what is
+drawn. Declarative animation (§4.2) is still needed so a busy app keeps scrolling, and for
+the fling blur; it is not blocking ScrollView.
