@@ -45,22 +45,55 @@ pub fn parse_line(line: &str) -> Option<(u32, CourierLabel)> {
     Some((uid, CourierLabel { user: f[1].into(), persona: f[2].into(), endpoint }))
 }
 
-/// The label of courier `uid`, read fresh from `path`. Two lines for the
-/// same uid void it: the registry is append-only per launch, and a uid
-/// reused without being retired is a launcher bug to fail closed on.
+/// The label of courier `uid`, read fresh from `path`.
+///
+/// The registry is append-only while couriers run (a nullfs file mount
+/// pins the file, so it is never replaced): `uid ...` starts a courier's
+/// label, `uid retired` ends it, and the launcher reuses a uid only after
+/// retiring it. A second label for a uid that is still live voids that uid
+/// for the rest of the file: a launcher bug, so fail closed.
 pub fn lookup(path: &str, uid: u32) -> Option<CourierLabel> {
     let text = std::fs::read_to_string(path).ok()?;
-    let mut found = None;
+    let mut live: Option<CourierLabel> = None;
+    let mut poisoned = false;
     for l in text.lines() {
-        if l.split_ascii_whitespace().next().and_then(|u| u.parse::<u32>().ok()) != Some(uid) {
+        let mut f = l.split_ascii_whitespace();
+        if f.next().and_then(|u| u.parse::<u32>().ok()) != Some(uid) {
             continue;
         }
-        if found.is_some() {
-            return None;
+        if f.next() == Some(RETIRED) && f.next().is_none() {
+            live = None;
+            continue;
         }
-        found = Some(parse_line(l)?);
+        match parse_line(l) {
+            Some((_, label)) if live.is_none() => live = Some(label),
+            _ => poisoned = true,
+        }
     }
-    found.map(|(_, l)| l)
+    if poisoned {
+        None
+    } else {
+        live
+    }
+}
+
+pub const RETIRED: &str = "retired";
+
+/// The launcher's side: one registry line, appended in place.
+pub fn append(path: &str, line: &str) -> std::io::Result<()> {
+    use std::io::Write;
+    let mut f = std::fs::OpenOptions::new().append(true).create(true).open(path)?;
+    f.write_all(format!("{line}\n").as_bytes())
+}
+
+pub fn label_line(uid: u32, l: &CourierLabel) -> Option<String> {
+    let Recipient::Endpoint { host, port, partition, .. } = &l.endpoint else { return None };
+    let mut s = format!("{uid} {} {} https {host} {port}", l.user, l.persona);
+    if let Some(p) = partition {
+        s.push(' ');
+        s.push_str(p);
+    }
+    Some(s)
 }
 
 /// The persona that holds an app's endpoint items (`STORE_FOR`): one per
@@ -104,14 +137,26 @@ mod tests {
     }
 
     #[test]
-    fn duplicate_uid_is_void() {
+    fn labels_retire_and_a_live_duplicate_voids() {
         let d = tempfile::tempdir().unwrap();
         let p = d.path().join("r");
-        std::fs::write(&p, "64001 alice p https a.example 443\n64002 bob p https b.example 443\n").unwrap();
         let p = p.to_str().unwrap();
+        let w = |t: &str| std::fs::write(p, t).unwrap();
+        w("64001 alice p https a.example 443\n64002 bob p https b.example 443\n");
         assert_eq!(lookup(p, 64002).unwrap().user, "bob");
-        std::fs::write(p, "64001 alice p https a.example 443\n64001 alice p https evil.example 443\n").unwrap();
-        assert_eq!(lookup(p, 64001), None);
+        w("64001 alice p https a.example 443\n64001 alice p https evil.example 443\n");
+        assert_eq!(lookup(p, 64001), None, "two live labels");
+        w("64001 alice p https a.example 443\n64001 retired\n64001 bob q https b.example 443\n");
+        assert_eq!(lookup(p, 64001).unwrap().user, "bob", "reused after retiring");
+        w("64001 alice p https a.example 443\n64001 retired\n");
+        assert_eq!(lookup(p, 64001), None, "retired");
+        w("64001 alice p https a.example 443\n64001 junk\n");
+        assert_eq!(lookup(p, 64001), None, "a garbled line voids");
+        // The launcher's own writer round-trips.
+        let l = parse_line("64003 carol web https news.example 443 news.example").unwrap().1;
+        w("");
+        append(p, &label_line(64003, &l).unwrap()).unwrap();
+        assert_eq!(lookup(p, 64003), Some(l));
     }
 
     #[test]
