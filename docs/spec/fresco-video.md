@@ -30,7 +30,8 @@ A window may own up to two **video layers**. A video layer is a small ring of fr
 that frescod allocates in shared memory, in one fixed format and size. The player writes a
 decoded frame into a free buffer and queues it with a **present time**. frescod itself
 composes the layer under the window's own drawing, at the layer's rect: it picks the right
-frame for each refresh, converts YUV to the screen's colour space and scales it. It then tells
+frame for each refresh, converts YUV to the screen's colour space and scales it (whether that
+conversion runs in frescod or in the window's renderer jail is decision 6). It then tells
 the player which frame showed at which vblank, and which buffers are free again. The player's
 controls and subtitles are its ordinary window drawing, drawn over the video with alpha.
 Nothing about decoding enters frescod.
@@ -110,7 +111,73 @@ not in this spec.
   frescod falls back to composing when the layer is covered, transformed or translucent.
   This is display pipeline work (D-series) on silicon.
 
-## 8. Who does what
+## 8. Security
+
+Who might be hostile, and what each can reach.
+
+**Hostile media** (a crafted file or stream). Demuxers and decoders are where media exploits
+land, so they run only in the player's jail (limen.md §2.2), one jail per embed, discarded at
+exit, with no network of its own beyond a filtered fetcher. A decoder that is taken over holds
+what that jail holds: its Limen channel, its frescod connection and its layers. It never gets
+the parent's process, cookies or other windows.
+
+**A compromised player** (the decoder was exploited). This is the case to design for.
+
+- *It can draw anything in its own slot*, as any window can, including a fake prompt. The slot
+  is pinned inside the parent and can't cover anything outside it, and frescod's strip still
+  names the focused window's origin.
+- *It must not escape the slot.* Today an embed child's frescod connection can also create
+  ordinary windows, which a compromised player could use to put a convincing top-level window
+  on screen. **Fix:** a connection that limend hands to an embed child is *embed-only*: every
+  window it creates is `embed_pending`, and only limend can bind it. frescod marks the
+  connection when limend opens it for the child (a new op on the activation socket that
+  returns the client fd), so the child never sees the ordinary app socket. Owners: Fresco and
+  Pergola threads; it applies to every Limen role, not only video.
+- *Its layers stay inside its window.* frescod clips every layer to its window's rect, and a
+  layer takes its window's place in z-order, so it can never sit over another window or over
+  a credential slot. frescod's visibility record (arca-autofill.md §4) counts a window's layers
+  as part of that window.
+- *Shared buffers can't hurt frescod.* Each buffer's size is fixed by format and size, so
+  nothing in it is parsed or used as a length or an index. The player may write a buffer while
+  it is being read; frescod copies out of it with plain loads, never forms a Rust reference to
+  shared memory, and the worst outcome is a torn frame in the player's own slot.
+- *It can't exhaust the compositor.* Converting and scaling video costs compose time in
+  frescod's broker, which is part of the trusted base. Limits: 4 layers and 64 MiB per client,
+  at most one frame per layer per refresh (extra frames are dropped, not converted), the
+  layer's source no larger than 3840x2160 unless the window covers most of the screen, and a
+  global cap of 256 MiB of video buffers across clients. **Alternative to weigh (decision 6):**
+  run the YUV conversion in the window's own renderer jail, as split pixel mode (F4g) already
+  does for drawing, so frescod only blends finished RGB surfaces and picks one per refresh.
+  That keeps frescod's work "compose only", at the cost of one more converted copy per frame.
+- *What it learns.* `PRESENTED` gives vblank times for its own layer, which a window's frame
+  callbacks already reveal, and whether its window is on screen, which Limen's `Suspended`
+  already tells it. It sees nothing of other windows.
+- *Brightness.* An HDR layer is limited to the desktop's peak, and a layer that is not
+  fullscreen is held to 2x SDR white, so a small embed can't flash full HDR brightness.
+
+**A hostile parent or page.** The parent only feeds bytes and controls; it never handles
+frames or decoded audio (limen.md §2.2), and can't read the slot's pixels, as no client can
+read another window. It can try to overload the player with appends, which limen.md §2.2's
+back-pressure and 150 MB limit cover.
+
+**Other apps and capture.** No client can read a layer. Screenshots and recording go through
+frescod's capture path, which skips `protected` layers (§6). Unprotected video is captured
+like any other window, by the same approved capture apps.
+
+**Hardware decode (G1) moves the parser into the GPU.** The VCN block and its firmware parse
+the bitstream, with DMA access. So hardware decode must run in the player's own GPU address
+space (its VMID), under the GPU ABI's isolation rules, with decode buffers scrubbed on free like
+other VRAM, and frames passed on only as sealed read-only buffers (§7). The firmware is a
+binary we may not inspect (amdgpu firmware licence), so hardware decode is an opt-in per
+codec, and the CPU decoders in the jail stay the default until the G1 thread reports on that
+isolation.
+
+**Streaming fetches.** A whole-resource `Load` is fetched by the player through a jailed
+fetcher with the Navigator's address filter (no LAN, loopback or rebinding), and with no cookies
+unless Arca attaches them for that origin. Segment feeds are fetched by the engine, so they
+are covered by the engine's own rules.
+
+## 9. Who does what
 
 | # | work | owner |
 |---|---|---|
@@ -121,14 +188,17 @@ not in this spec.
 | P1 | the native player behind `media-player` ([atrium-player.md](atrium-player.md)): demux (WebM, MP4), dav1d, libvpx, OpenH264, A/V sync from `PRESENTED`, native controls, PiP and media keys | a new thread (Shankar to allocate) |
 | P2 | audio: Lyra and Choragus exist (atrium-lyra-architecture.md §5.4); the player needs Lyra's audio presentation clock on the wire (§12.1), choragusd brokering the ring fd, and jail-verified identity (atrium-player.md §9.6) | a new thread (Shankar to allocate) |
 | P3 | the Navigator's `<video>` and `MediaSource` as a front end to the role | Navigator thread, with the Pergola thread |
-| G1 | hardware decode: the VCN block in atrium-gpu-amd, and a gpusim model of it | GPU thread; feasibility first (§9.4) |
+| G1 | hardware decode: the VCN block in atrium-gpu-amd, and a gpusim model of it | GPU thread; feasibility first (§10.4) |
 | G2 | GPU frames into layers (§7): sealed buffers from the player's context | GPU thread with Fresco thread, after F6 |
 | D1 | overlay planes for video on silicon | Fresco thread, after D5 |
 
 V1 to V4 are ready to build once this is reviewed. P1 can start at once against V1's
 `RGBA8` format and a CPU decoder. Nothing in it waits on G1.
 
-## 9. Decisions, with recommendations
+Added for security (§8): S1, embed-only frescod connections for every Limen child (Fresco
+thread with the Pergola thread), and the compose limits in V1.
+
+## 10. Decisions, with recommendations
 
 1. **frescod composes video itself, under the window**, rather than the player drawing frames
    into its window. *Recommend yes.* The controls aren't redrawn per frame, frescod owns the
@@ -146,3 +216,11 @@ V1 to V4 are ready to build once this is reviewed. P1 can start at once against 
    Findings: [2026-11-06-vcn-decode-feasibility.md](../reviews/2026-11-06-vcn-decode-feasibility.md).
 5. **v1's `protected` flag only keeps frames out of capture.** *Recommend yes.* It is honest
    about what it guarantees, and real protection waits for the CDM work.
+6. **Where YUV is converted** (§8): in frescod's broker, or in the window's renderer jail with
+   frescod only blending. *Recommend the renderer jail*, to match split pixel mode (F4g): a
+   bug in conversion, scaling or tone mapping then lands in an unprivileged per-window jail,
+   not in the compositor. It costs one extra RGB copy per frame, which is affordable up to
+   4K. With GPU frames (§7) the same rule holds: the conversion runs in the window's GPU
+   context, and frescod composes the result.
+7. **Embed-only connections for Limen children** (§8). *Recommend yes, before any media or
+   document role ships*, since otherwise a compromised child can open top-level windows.
