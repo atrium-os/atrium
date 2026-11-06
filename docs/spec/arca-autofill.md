@@ -1,6 +1,6 @@
 # Autofill: credentials filled without the app ever holding them
 
-Status: proposed, 2026-11-06 (Pergola thread). It extends [arca.md](arca.md) §8.3, which
+Status: accepted, 2026-11-06 (Pergola thread; the user agreed to all §10 recommendations). It extends [arca.md](arca.md) §8.3, which
 gives the rules for web passwords in one paragraph, into one mechanism for every app. It
 also uses the press tokens of [tabula.md](tabula.md) §2 and the embeds of
 [limen.md](limen.md).
@@ -178,6 +178,8 @@ go first, because they are useful on their own:
    broker placing slots over marked web fields.
 
 ## 10. Decisions, with recommendations
+
+**Accepted by the user, 2026-11-06: all five recommendations below.**
 
 1. **A credential field is an Arca-owned embed, not an app widget.** *Recommend yes.* It's
    the only way the app never holds the value, and it makes keystroke isolation, fill and
