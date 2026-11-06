@@ -18,6 +18,7 @@ path = "src/main.rs"
 pergola = { path = "../pergola" }
 praeco = { path = "../praeco" }
 aqueduct = { path = "../aqueduct" }
+fresco-client = { path = "../fresco-client" }
 fresco-protocol = { path = "../fresco-protocol" }
 portcullis-peer = { path = "../portcullis/portcullis-peer" }
 postcard = { version = "1", features = ["use-std"] }

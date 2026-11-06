@@ -47,20 +47,27 @@ fn main() -> std::io::Result<()> {
     let (tx, rx) = mpsc::channel();
     std::thread::spawn(move || listen(path, tx));
 
-    let mut desc = WindowDesc::new("forum-shelf", SizeSpec::FullScreen);
-    desc.hints = WindowHints { role: Some(WmRole::Chrome), ..Default::default() };
+    // A notification-layer window (tabula.md §5.2): frescod keeps it above
+    // the rest, clamps it into the top-right band and never gives it keys.
+    // It needs this app's uid in FRESCOD_NOTIFY_UIDS, else it is a Document.
+    let band = fresco_protocol::NOTIFICATION_BAND_W;
+    let mut desc = WindowDesc::new("forum-shelf", SizeSpec::Fixed(band, 720));
+    desc.hints = WindowHints { role: Some(WmRole::Notification), ..Default::default() };
     let mut window = Window::open(&desc)?;
     let dirty = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
     let shelf = Mutable::with_dirty(Shelf::new(user), dirty.clone());
     let dismissed = Mutable::with_dirty(None, dirty.clone());
-    let view = ShelfView { w: window.width, shelf: shelf.clone(), dismissed: dismissed.clone() };
+    let width = Mutable::with_dirty(window.width, dirty.clone());
+    let view = ShelfView { w: width.clone(), shelf: shelf.clone(), dismissed: dismissed.clone() };
     let mut app = App::new_with_flag(view, dirty);
     let t0 = Instant::now();
     let now = || t0.elapsed().as_secs_f64() * 1e3;
     window.paint(&mut app)?;
     loop {
-        if let StepResult::Closed = window.step(&mut app, Some(Duration::from_millis(250)))? {
-            return Ok(());
+        match window.step(&mut app, Some(Duration::from_millis(250)))? {
+            StepResult::Closed => return Ok(()),
+            StepResult::Event(fresco_client::Event::Resized { width: w, .. }) => width.set(w as f32),
+            _ => {}
         }
         let mut s = shelf.get_cloned();
         let mut changed = false;

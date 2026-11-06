@@ -92,7 +92,9 @@ impl Shelf {
 
 /// The toasts, stacked from the top right of a `w`-wide area.
 pub struct ShelfView {
-    pub w: f32,
+    /// The window's width: frescod sizes it to the notification band
+    /// (tabula.md §5.2) and the main loop follows its resizes.
+    pub w: Mutable<f32>,
     pub shelf: Mutable<Shelf>,
     /// Set by a click on a toast: its id (the main loop dismisses it).
     pub dismissed: Mutable<Option<u64>>,
@@ -102,12 +104,16 @@ impl View for ShelfView {
     fn render(&self, ctx: &mut Ctx) {
         let t = ctx.theme;
         let shelf = self.shelf.get_cloned();
-        let col = ctx.push(Node::vstack(Rect::new(self.w - TOAST_W - 16.0, 48.0, TOAST_W, 0.0), 8.0));
+        // The window is the band itself (below the strip), so toasts sit at
+        // its top right; a band narrower than a toast gets a narrower toast.
+        let w = self.w.get_cloned();
+        let tw = TOAST_W.min(w - 16.0).max(0.0);
+        let col = ctx.push(Node::vstack(Rect::new((w - tw - 8.0).max(0.0), 8.0, tw, 0.0), 8.0));
         ctx.set_flex(col, FlexStyle { align: pergola::Align::Stretch, ..FlexStyle::default() });
         for toast in shelf.visible() {
             // The id keys the toast, so one leaving doesn't redraw the rest.
             ctx.key(toast.n.id);
-            let card = ctx.push(Node::stack_filled(Axis::Vertical, Rect::new(0.0, 0.0, TOAST_W, 0.0), 4.0, t.bg_elevated(), 8.0));
+            let card = ctx.push(Node::stack_filled(Axis::Vertical, Rect::new(0.0, 0.0, tw, 0.0), 4.0, t.bg_elevated(), 8.0));
             ctx.set_flex(card, FlexStyle { padding: 12.0, ..FlexStyle::default() });
             // Whose it is, from the registry: never the app's own words.
             Label::new(toast.n.app.clone()).mono().size(type_size::XS).color(t.text_tertiary()).emit(ctx);
@@ -172,7 +178,7 @@ mod tests {
     fn the_view_names_the_app_from_the_registry() {
         let mut s = Shelf::new("me");
         s.posted(Notification { title: "org.atrium.system".into(), ..n(1, urgency::NORMAL, "me") }, 0.0);
-        let view = ShelfView { w: 1280.0, shelf: Mutable::new(s), dismissed: Mutable::new(None) };
+        let view = ShelfView { w: Mutable::new(420.0), shelf: Mutable::new(s), dismissed: Mutable::new(None) };
         let (tree, _) = pergola::view::render(&view, pergola::theme::Semantic::LIGHT);
         let texts: Vec<String> = tree.iter().filter_map(|(_, n)| match n {
             Node::Text { content, .. } => Some(content.clone()),

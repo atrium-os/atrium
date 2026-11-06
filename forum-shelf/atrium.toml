@@ -1,6 +1,7 @@
 # Forum shelf — notification toasts. A Forum chrome app: it subscribes to
 # praecod (only Forum's uid may) and draws toasts in Fresco's notification
-# layer. It holds no window-management.
+# layer (frescod grants the role only to uids in FRESCOD_NOTIFY_UIDS).
+# It holds no window-management.
 [app]
 id          = "org.atrium.forum-shelf"
 name        = "Forum Shelf"

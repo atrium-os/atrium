@@ -299,12 +299,12 @@ for the uids in `PRAECO_SUBSCRIBERS` (Forum's), which get the history (500) then
 Each notification carries the registry's user, and Forum shows only its own user's. Not yet:
 actions (need `CLASS_BROKER` delivery and `ACTIVATION_GRANT`), images, per-app mute.
 
-`forum-shelf/` draws the toasts (Pergola, chrome role): it subscribes to praecod, shows its own
+`forum-shelf/` draws the toasts (Pergola, `Notification` role, §5.2): it subscribes to praecod, shows its own
 user's only, three at a time from the top right, low 3 s, normal 5 s, high until dismissed and
 first in the queue; the first line of a toast is the registry's app id, so a title claiming to
-be the system reads as a title under the app's real name. A click dismisses. It runs as an
-ordinary chrome surface until frescod's notification layer exists, and must be listed in
-`PRAECO_SUBSCRIBERS`. Not run on frescod yet.
+be the system reads as a title under the app's real name. A click dismisses. It asks for a
+band-wide window (420 px) and draws at whatever size frescod gives it, following resizes. Its uid
+must be listed in both `PRAECO_SUBSCRIBERS` and `FRESCOD_NOTIFY_UIDS`. Not run on frescod yet.
 
 ### 5.2 The notification layer, as built in frescod (2026-11-06)
 
@@ -332,8 +332,7 @@ Tests:
 - `atrium-activation-probe`, run in the VM in both modes, opens a 2000x2000 toast at (0, 0). It
   lands at the band, (860, 24, 420, 348) on 1280x720 in split mode, and keys still reach the app.
 
-Still to do: forum-shelf should ask for `Notification` and a band-sized window instead of a
-full-screen chrome surface (Pergola thread).
+forum-shelf asks for `Notification` and a band-sized window (Pergola thread, 2026-11-06).
 
 ## 6. Pergola's part
 

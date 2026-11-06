@@ -163,6 +163,7 @@ name = "forum-shelf"
 version = "0.1.0"
 dependencies = [
  "aqueduct",
+ "fresco-client",
  "fresco-protocol",
  "pergola",
  "portcullis-peer",
