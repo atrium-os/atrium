@@ -152,8 +152,23 @@ Conditions, any one failing means the clip is drawn in full that frame (never wr
 the delta is a whole device pixel; it is smaller than the clip in that axis (pergola.md §10.1 as
 corrected in e2054f1: shift-and-strip is never worse than a full draw, so the only full draws are a
 scroll of the whole viewport or more, a jump, and the first frame); the group's first child is an
-opaque rect covering its clip, so the copied pixels don't carry a background that did not move.
-Pergola's ScrollView always draws that background.
+opaque rect covering its clip (exactly the clip, alpha 1, radius 0), so the copied pixels don't
+carry a background that did not move. Pergola's ScrollView always draws that background.
+
+**Tile signatures move with the pixels** (Fresco review, 2026-11-06). The pixel-mode renderer tracks
+damage by 16×16 tile signatures, so after the copy, tiles wholly inside the clip whose source was
+valid take the new frame's signatures; tiles straddling the clip edge, the exposed strip, and tiles
+touched by ops after the group are rastered. To tell "only the translation changed" without
+re-deriving it, **pack's output carries, per `SCROLL` group, a content hash of its subtree in local
+space (its own translation excluded) and the box of everything drawn after it**.
+
+**GPU renderer** (F4e): each window's VRAM surface persists and only dirty tiles are rastered, but
+there is no in-VRAM copy that handles overlap yet, so v1 draws the clip in full there (damage
+already confines that to the clip's tiles); a shift kernel comes later.
+
+**Fill flattening.** Composing a scroll translation into fill transforms would change the
+`FillCache` key every frame and re-flatten every fill in a band. The cache keeps flattened lines
+in group-local space and only re-tiles (Fresco owners).
 
 This is the Navigator scroll harness's shift-then-strip (8e79bd4: 0.1% missed frames at 120 Hz on
 the biggest documents, composed frames equal to a full redraw), moved from the harness into the
@@ -178,13 +193,24 @@ Pergola sends one transform change per frame, which is a few dozen bytes.
 
 ## 6. The Navigator on groups
 
+Revised after the Navigator thread's review (2026-11-06,
+/mnt/project-files/navigator/scene-groups-review-navigator.md). The Navigator scene is **not a
+tree**: clip, transform and opacity group are independent flat attributes per leaf, clips and
+transforms are already absolute, and paint order is re-sorted for stacking contexts. So:
+
 | Navigator scene | Groups |
 |---|---|
-| transform tree (`xforms`, `xform_parents`) | a group per transform; rotation or skew → its content sent as fills (§2.4) |
-| clips | a group with a clip |
-| opacity groups | group opacity (multiplied in v1; `ISOLATE` later) |
-| scroll regions (wide tables) | `SCROLL` groups |
-| bands (backend §4.8, pergola.md §10.3) | one group per band under the document's content group; evicted with one clear |
+| leaves | **one group per run of consecutive leaves (in paint order) with the same clip, transform and opacity**, under the band group; depth stays about 3 |
+| bands (backend §4.8, pergola.md §10.3) | one group per band, cut **only at checkpoint boundaries**; evicted with one clear; a band stays resident while its painted bounds meet the window |
+| leaves crossing a band edge (positioned, z-index, shadows) | an **overlay group** after the bands, so paint order holds |
+| transforms with rotation (the profile admits `rotate()`) | shapes → fills; a rotated subtree with text or images → one worker-drawn bitmap (texture) |
+| opacity groups | multiplied when their leaves don't overlap; the worker flags overlapping ones (a faded card: background plus text) and sends them as a bitmap until `ISOLATE` exists |
+| scroll regions (wide tables) | `SCROLL` groups; the worker adds the opaque backdrop rect when it knows it; a sticky column is a sibling group after the `SCROLL` group |
+| shadows | no Fresco op; drawn by the worker into a texture leaf at the shadow's place in paint order |
+| an SVG's bitmap fallback (dropped fills) | takes the dropped paths' place in the same group and order |
+
+The Navigator thread measures, on the corpus, groups per window against the 4,096 limit, and how
+often overlapping opacity groups, rotations and overlay leaves occur.
 
 So DocumentView in a Pergola window and the Navigator's own surface send the same nodes, and a
 native control inside a document is a Pergola widget subtree under the document's group.
@@ -192,7 +218,7 @@ native control inside a document is a Pergola widget subtree under the document'
 ## 7. Work, in order
 
 Steps 2 and the renderer half of 4 are the Fresco owners' (kernels, Tier-2); the rest is the
-Pergola thread's, except 5.
+Pergola thread's, except 5 and 6.
 
 1. `fresco-protocol` + `fresco-scene-server`: the two ops, the rules in §2.3, the tests below.
    frescod packs the tree (§3 steps 1–3). Interleaved order already fixes the popover bug.
@@ -201,7 +227,10 @@ Pergola thread's, except 5.
 3. `fresco-client`: `scene_group`, `scene_place`. Pergola moves Stack and the root onto groups.
 4. `SCROLL` shift in the pixel-mode renderer; Pergola `ScrollView`; judged with the scroll harness
    against the §10.1 gates.
-5. The Navigator surface sends groups (Navigator thread).
+5. `ISOLATE` (exact group opacity: draw the group to its own buffer, then blend), moved up at the
+   Navigator thread's request: a faded card is the commonest case and multiplied alpha gets it
+   wrong. Renderer work, Fresco owners; bitmaps stand in until it lands.
+6. The Navigator surface sends groups (Navigator thread).
 
 ## 8. Tests
 
@@ -216,9 +245,7 @@ Pergola thread's, except 5.
 - Refusals: cycles, a foreign parent, depth and count limits, a rotated v1 transform, NaN.
 - Fuzz: random trees through `fresco_compute::fuzz`.
 
-## 9. Questions for the Fresco owners
+## 9. Review
 
-- The raster kernel's box test (§3 step 4): acceptable, and is `p3` the right place?
-- Limits per window (depth, groups), and whether interleaving kinds costs Tier-2 anything measurable.
-- The scroll shift for the gpu renderer (F4e), which keeps no previous pixels today: full draws
-  there until it does?
+Fresco owners (2026-11-06): approved; `p3` clip test, limits, interleaving and the GPU-renderer
+v1 answered in §2.3, §3 and §4. Navigator thread (2026-11-06): approved with the §6 changes.
