@@ -211,7 +211,13 @@ pub fn recv_reply(s: &UnixStream) -> io::Result<(u8, Option<OwnedFd>)> {
     msg.msg_control = cbuf.as_mut_ptr().cast();
     msg.msg_controllen = space as _;
     // SAFETY: buffers outlive the call.
-    let n = unsafe { libc::recvmsg(s.as_raw_fd(), &mut msg, libc::MSG_CMSG_CLOEXEC) };
+    // Close-on-exec as it arrives where the kernel can (FreeBSD, Linux);
+    // elsewhere (macOS, the development host) it is set just after.
+    #[cfg(any(target_os = "freebsd", target_os = "linux"))]
+    let flags = libc::MSG_CMSG_CLOEXEC;
+    #[cfg(not(any(target_os = "freebsd", target_os = "linux")))]
+    let flags = 0;
+    let n = unsafe { libc::recvmsg(s.as_raw_fd(), &mut msg, flags) };
     if n != 1 {
         return Err(if n == 0 { io::ErrorKind::UnexpectedEof.into() } else { io::Error::last_os_error() });
     }
@@ -221,6 +227,8 @@ pub fn recv_reply(s: &UnixStream) -> io::Result<(u8, Option<OwnedFd>)> {
         let c = libc::CMSG_FIRSTHDR(&msg);
         if !c.is_null() && (*c).cmsg_level == libc::SOL_SOCKET && (*c).cmsg_type == libc::SCM_RIGHTS {
             let raw = std::ptr::read_unaligned(libc::CMSG_DATA(c).cast::<libc::c_int>());
+            #[cfg(not(any(target_os = "freebsd", target_os = "linux")))]
+            libc::fcntl(raw, libc::F_SETFD, libc::FD_CLOEXEC);
             fd = Some(OwnedFd::from_raw_fd(raw));
         }
     }

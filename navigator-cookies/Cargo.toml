@@ -1,0 +1,21 @@
+[package]
+name        = "navigator-cookies"
+version     = "0.1.0"
+edition     = "2021"
+license     = "MIT OR Apache-2.0"
+publish     = false
+description = "The Navigator broker's side of Arca's web cookies (arca.md §8.2, legacy-web §5.4.1e): which views are cookied, a ticket for each of their requests, and the request through that origin's courier."
+
+[dependencies]
+arca-store    = { path = "../arca/arca-store" }
+arcad         = { path = "../arca/arcad" }
+arca-courier  = { path = "../arca/arca-courier" }
+arca-courierd = { path = "../arca/arca-courierd" }
+url = "2"
+
+[dev-dependencies]
+navigator-fetch  = { path = "../navigator-fetch" }
+rcgen            = { version = "0.13", default-features = false, features = ["ring", "pem"] }
+rustls           = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+rustls-pki-types = { version = "1", features = ["std"] }
+tempfile         = "3"
