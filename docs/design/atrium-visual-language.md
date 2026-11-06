@@ -3,7 +3,8 @@
 > *The aesthetic foundation that every Pergola widget, every Atrium app,
 > and every system surface inherits.*
 > Locked: 2026-05-09 · Owner: Pergola track · Reviewed before phase 0 of
-> toolkit implementation.
+> toolkit implementation. · Rev. 2 (controls, contrast, appearance)
+> proposed 2026-11-06, see the revision log.
 
 This is a decisive document, not a survey. Each section commits to a
 choice. We can revise; we don't equivocate.
@@ -197,6 +198,11 @@ info-500      #4A7BAB    deep slate blue (when system info is needed)
 Each has the full ramp (50–950) but shells should default to the 500
 step. Brighter steps are for filled badges; darker for text on light.
 
+*(rev. 2)* The text steps, fixed so `-fg` tokens meet 4.5:1: danger-300 `#E58A84`,
+danger-600 `#962E2E`; warning-300 `#E2B45C`, warning-700 `#8A5E14`; success-300 `#5DBE88`,
+success-700 `#226B43`; info-300 `#86AEDA`, info-600 `#3B6690`. The rest of each ramp is drawn
+when a control first needs it.
+
 ### Semantic tokens (what widgets reference)
 
 Widgets do **not** reference raw color. They reference tokens, which
@@ -212,7 +218,11 @@ text-primary     neutral-900 / neutral-50
 text-secondary   neutral-600 / neutral-400
 text-tertiary    neutral-500 / neutral-500
 text-disabled    neutral-400 / neutral-600
-accent-fg        accent-400  / accent-300
+accent-fg        accent-600  / accent-300    (text and glyphs: links, accent labels — rev. 2, was 400 on light)
+accent-mark      accent-400  / accent-300    (non-text marks: dots, bars, indicators, selected edges — rev. 2)
+accent-fill      accent-500  / accent-500    (primary and filled controls at rest — rev. 2)
+accent-fill-hover   accent-600 / accent-600  (rev. 2)
+accent-fill-pressed accent-700 / accent-700  (rev. 2; replaces accent-pressed)
 accent-bg        accent-100  / accent-700
 accent-strong    accent-600  / accent-200    (hover/pressed text on accent-bg — rev. 1)
 accent-pressed   accent-500  / accent-500    (rev. 1)
@@ -221,7 +231,33 @@ focus-ring       accent-400  / accent-300
 terminal-bg      neutral-900 / neutral-950   (rev. 1 — terminal surfaces, both themes dark)
 terminal-text    neutral-200 / neutral-300   (rev. 1)
 scrim            neutral-950 @ 45% / #040608 @ 62%   (rev. 1 — overlay backdrop)
+state-hover      neutral-900 @ 6%  / neutral-50 @ 8%    (rev. 2 — overlay on any surface)
+state-pressed    neutral-900 @ 10% / neutral-50 @ 12%   (rev. 2)
+selection-bg     accent-100  / accent-700               (rev. 2 — text selection, selected rows, focused list)
+selection-idle   neutral-200 / neutral-800              (rev. 2 — the same when the window or list isn't focused)
+border-control   neutral-500 / neutral-500              (rev. 2 — edges that are a control's only affordance)
+bg-inverse       neutral-900 / neutral-100              (rev. 2 — tooltips, toasts)
+text-inverse     neutral-50  / neutral-900              (rev. 2)
+danger-fg        danger-600  / danger-300               (rev. 2 — and warning-, success-, info-fg: 700/300, 700/300, 600/300)
 ```
+
+**Contrast floor** *(rev. 2)*. Text that a user reads to act is at least 4.5:1 against what it
+sits on; a control's boundary, a focus ring or a mark that carries state is at least 3:1
+(WCAG 2.2, 1.4.3 and 1.4.11). Rev. 2 changed the tokens that missed it, measured:
+
+| pair | before | after |
+|---|---|---|
+| primary button label, light (on accent-400) | 3.24 | 4.62 (on accent-500) |
+| primary button label, dark (on accent-300) | 2.28 | 4.62 (on accent-500) |
+| accent text (links) on light canvas | 3.24 (accent-400) | 6.80 (accent-600) |
+| danger text on dark canvas | 3.08 (danger-500) | 7.18 (danger-300) |
+| warning / success text on light canvas | 2.70 / 4.10 | 5.49 / 6.23 (700 steps) |
+| checkbox, radio, toggle edge on light | 1.43 (border-strong) | 3.62 (border-control) |
+
+`text-tertiary` on light is 3.62:1, so it is for placeholders and hints only, never for
+information (timestamps and metadata use `text-secondary`). `border-default` and
+`border-strong` stay as they are: they separate regions, they don't identify controls.
+
 
 Adding a new token requires a meaningful gap; resist the urge.
 *(rev. 1 added accent-strong/-pressed, terminal-*, and scrim — all in
@@ -271,6 +307,9 @@ Drop-shadow policy:
   is communicated by background tone (`bg-elevated` is *lighter* on
   light theme, *darker* on dark theme).
 - One exception: floating popovers + dialogs get a single subtle
+  *(rev. 2: Fresco has no shadow op yet; until it has one, floating surfaces are drawn with the
+  1px `border-default` edge alone. The shadow is a rounded-rect blur op asked of the Fresco
+  owners, not a texture.)*
   shadow (`0 8px 24px rgba(0,0,0,0.12)`) for clarity-of-detachment.
 - Two shadows stacked is always wrong. One or zero.
 
@@ -433,8 +472,8 @@ A widget that references a raw value (`16px`, `#F2F4F6`, `200ms`)
 fails review. The whole point of the design language is that a future
 theme refresh changes one file (the token table), not 200 widgets.
 
-The token table lives at `pergola-theme/src/tokens.rs` once the crate
-exists. Light theme is the default; dark theme is an alternative
+The token table lives at `pergola/src/theme/tokens.rs` *(rev. 2: there is no separate
+`pergola-theme` crate)*. Light theme is the default; dark theme is an alternative
 loaded at the same surface.
 
 ---
@@ -496,6 +535,108 @@ tokens, then long stability.
 
 ---
 
+## §14. Controls *(rev. 2)*
+
+Every control is built from the same parts, so the desktop reads as one system: a **body**
+(fill and edge), a **label** (Sans, medium weight, `md` in apps and `sm` in the shell), an
+optional **glyph** (`icon-sm`, 4px from the label), and the **focus ring**. Sizes come from §8;
+no control invents its own height.
+
+### §14.1 States, one rule for all
+
+| state | how it shows |
+|---|---|
+| rest | the control's own fill and edge |
+| hover | `state-hover` over the body (filled controls: `accent-fill-hover`); pointer only, never on touch |
+| pressed | `state-pressed` over the body (filled: `accent-fill-pressed`); the label does not move |
+| focused (keyboard) | the focus ring; pointer focus shows no ring |
+| selected / on | `selection-bg` body, or the control's own on-look (checkbox, toggle, radio) |
+| disabled | label `text-disabled`, edge `border-default`, no hover or press; never faded with alpha |
+| invalid | edge and message in `danger-fg`, message below the control in `xs` |
+
+State changes colours, never size or position: a control's node count and box are the same in
+every state. Hover and press take `duration.fast`; the focus ring draws on with `spring-snappy`.
+
+**The focus ring** is the one Pergola already draws on Button: a 1px `focus-ring` stroke 1px
+outside the body, and a 2px `accent-bg` halo outside that (3px from the body in all), with the
+body's radius plus the offset. It shows on whatever has keyboard focus, and only one thing on
+screen has it.
+
+### §14.2 The controls
+
+| control | anatomy | on / selected |
+|---|---|---|
+| **Button** primary | `accent-fill`, label `text-on-accent`, radius-sm, padding 12 | — |
+| Button secondary | 1px `border-strong`, fill `bg-elevated`, label `text-primary` | — |
+| Button ghost | no edge or fill, label `text-secondary` | — |
+| Button destructive | `danger-500` fill, label `text-on-accent` (5.69:1) | — |
+| **Text field** | 32 high, fill `bg-canvas`, 1px `border-strong` (hover `border-control`), radius-xs, text 12 from the edge; caret 1.5px `accent-fg`, blinks 530 ms, still while typing; selection `selection-bg` | — |
+| Text area | the text field, many lines, `line-height.body`, its own ScrollView | — |
+| **Checkbox** | 16 box, 1px `border-control`, radius-xs, label 8 to its right; the hit area is box plus label | `accent-fill` box, check glyph `text-on-accent`; mixed: a 8×2 bar |
+| **Radio** | 16 circle, 1px `border-control` | `accent-fill` circle, 6 `text-on-accent` dot |
+| **Toggle** | 32×18 pill track, 1px `border-control`, 14 thumb `border-control` | track `accent-fill`, thumb `text-on-accent`, slides with `spring-snappy` |
+| **Slider** | 4 high pill track `border-strong`, filled part `accent-mark`, 16 thumb `bg-elevated` with 1px `border-control` | — |
+| **Dropdown** (select) | the secondary button's body, label left, `caret-down` glyph right; opens a menu aligned to its left edge, the current item under the pointer | — |
+| **Segmented control** | `bg-surface` track radius-sm, 2px inset; segments equal width | the selected segment is a `bg-elevated` pill with `border-default` |
+| **Tabs** (in a panel) | labels `text-secondary` 16 apart, a 2px `accent-mark` bar under the selected one, a 1px `border-default` line under the row | label `text-primary` |
+| **List row** | 32 (dense 24), padding 12, glyph `icon-md` | `selection-bg` when the list has focus, `selection-idle` when not |
+| **Menu** | floating surface, 4px inset; items 28 high, padding 12, shortcut right in `text-tertiary`; separator a `Divider` with 4px above and below; submenu `caret-right` | the hovered or arrowed item takes `selection-bg` |
+| **Tooltip** | `bg-inverse`, text `text-inverse` `sm`, radius-xs, padding 4×8, 8 from the target; shows after 500 ms of hover, at once while another is showing, never on touch | — |
+| **Popover** | floating surface, padding 16, radius-md | — |
+| **Dialog / sheet** | floating surface, radius-lg, padding 24, `scrim` behind; buttons bottom right, primary last; Esc and the scrim cancel | — |
+| **Scrollbar** | overlay, no track: a 6 wide pill, `neutral-500` at 50%, 2 from the edge; shows while scrolling and 800 ms after, widens to 10 on hover | — |
+| **Progress** | the existing `ProgressBar`: 4 high pill, `accent-mark` on `bg-surface`; indeterminate is a moving third | — |
+
+A **floating surface** (menu, popover, dialog, tooltip excepted) is `bg-elevated`, 1px
+`border-default`, and the one §5 shadow once Fresco draws it. Floating surfaces open with
+`spring-snappy`, 4px of travel from the direction of what opened them, and close by fading in
+`duration.fast`.
+
+### §14.3 Keyboard, the same everywhere
+
+Tab and Shift-Tab move focus in reading order; arrows move within a group (radios, segments,
+tabs, menus, lists). Space toggles or presses; Enter presses the focused button, or the
+dialog's primary one. Esc closes the topmost floating surface, and only that. A menu opened by
+keyboard has its first item selected; one opened by pointer has none.
+
+### §14.4 Trusted surfaces
+
+Surfaces that another app must not be able to imitate are drawn by their own service and marked
+by frescod, not by Pergola: the credential slot's gold ring and key tab (arca-autofill §4.1), the
+origin strip, and the Vestibulum lock screen. Inside them the controls follow this section, so
+Arca's field is a text field with Atrium's caret, selection and focus ring.
+
+## §15. Appearance, set once for the desktop *(rev. 2)*
+
+Light, dark, or follow the time of day is **one system setting**, not a per-app choice. frescod
+tells every client when it changes (a display event, the same path as a scale change), Pergola
+swaps `Semantic::LIGHT` and `DARK` and redraws, and every app follows in the same frame. Apps do
+not read an environment variable and do not offer their own switch; the Forum bar's toggle sets
+the system setting. A third table, high contrast (§11), is added the same way later. The accent
+stays Atrium's: no user accent colour in this revision.
+
+## §16. Where the code drifts today *(rev. 2, 2026-11-06)*
+
+What a review of Pergola, the Forum shell and arca-ui found against this document:
+
+| where | drift | fix |
+|---|---|---|
+| Pergola `Button` primary | rests on accent-400 (label 3.24:1); hover goes to accent-600, darker than pressed (500) | `accent-fill`, `-hover`, `-pressed` |
+| Pergola `TextField` | no edge at all; no caret or selection | §14.2 text field |
+| Pergola hover and press | each widget picks a neighbouring tone (`bg-surface`) | `state-hover` and `state-pressed` overlays |
+| forum-bar, forum-dock | theme from an environment variable; the bar's toggle changes only the bar | §15 |
+| forum-shelf | always light | §15 |
+| arca-ui | draws raw RGB, with a blue focus edge and caret (the "tech blue" §1 rejects) | Pergola's token table (arca-ui can depend on the theme module alone) |
+| floating surfaces | no shadow op in Fresco | edge only until the op exists (§5) |
+| motion | springs are specified but Pergola has no frame clock, so nothing animates | the frame clock in Pergola's order of work |
+| §12 reference render | rev. 1's before/after render was never captured; rev. 1 approval pending | the control sheet below, then a Pergola render of it |
+
+**The control sheet.** Rev. 2 is reviewed on a sheet that shows every control in §14.2 in every
+state of §14.1, light and dark, drawn from this table's values. Once the controls are built,
+the same sheet is rendered by Pergola through frescod and compared with it.
+
+---
+
 ## Revision log
 
 **Rev. 1 — 2026-08-07 — dense-shell reconciliation.** Trigger: the
@@ -517,3 +658,16 @@ dock-tile shadow **rejected** (shadow policy unamended). Render:
 `forum-demo` §12 reference screen, light + dark, before/after —
 see `scratch/m1-reference-render/` when captured. Approval: pending
 Pergola track owner.
+
+**Rev. 2 — 2026-11-06 — controls, contrast, appearance.** Trigger: the toolkit needs its
+remaining controls (menus, choice controls, tabs, text editing), and the document said how
+tokens look but not how a control does. Changes: §14 (one state model, the focus ring as built,
+anatomy of every control, keyboard rules, trusted surfaces); §15 (appearance is one system
+setting); §16 (drift found in the code); a contrast floor, with five token changes that missed it
+(primary fill accent-400 → accent-500, accent text 400 → 600 on light, `-fg` steps for status
+text, `border-control` for control edges); new tokens `accent-mark`, `accent-fill`
+(`-hover`, `-pressed`, replacing `accent-pressed`), `state-hover`, `state-pressed`,
+`selection-bg`, `selection-idle`, `border-control`, `bg-inverse`, `text-inverse`, `danger-fg`
+and its siblings; the floating shadow waits for a Fresco op; the token table's real path. Render: the rev. 2 control sheet, light
+and dark. Approval: pending.
+

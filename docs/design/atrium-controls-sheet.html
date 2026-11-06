@@ -1,0 +1,306 @@
+<title>Atrium Control Sheet</title>
+<meta name="claude:viewport-fit-sides" content="cover">
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500&family=IBM+Plex+Sans:wght@400;500;600;700&display=swap">
+<style>
+/* Layout: one page, the two themes side by side as two specimen boards; each board is the
+   whole control set of visual language rev. 2 §14.2 in every §14.1 state. Board colours are
+   Atrium's own tokens and do not follow the viewer's theme; the page around them does. */
+:root {
+  --page: #FAFBFC; --page-fg: #181C20; --page-muted: #5A636C; --page-line: #E4E8EC;
+  --sans: "IBM Plex Sans", system-ui, -apple-system, "Segoe UI", sans-serif;
+  --mono: "IBM Plex Mono", ui-monospace, "SFMono-Regular", Menlo, monospace;
+}
+@media (prefers-color-scheme: dark) { :root:not([data-theme="light"]) { --page: #0E1114; --page-fg: #FAFBFC; --page-muted: #A8B0B8; --page-line: #2A3137; color-scheme: dark } }
+:root[data-theme="dark"] { --page: #0E1114; --page-fg: #FAFBFC; --page-muted: #A8B0B8; --page-line: #2A3137; color-scheme: dark }
+
+/* Atrium semantic tokens, rev. 2 (atrium-visual-language.md §4). */
+.light {
+  --bg-canvas: #FAFBFC; --bg-surface: #F2F4F6; --bg-elevated: #FFFFFF;
+  --border-default: #E4E8EC; --border-strong: #CFD5DA; --border-control: #7C858E;
+  --text-primary: #181C20; --text-secondary: #5A636C; --text-tertiary: #7C858E; --text-disabled: #A8B0B8;
+  --accent-fg: #7B4F1E; --accent-mark: #BD7F3A; --accent-bg: #F4DEC0;
+  --accent-fill: #9E6628; --accent-fill-hover: #7B4F1E; --accent-fill-pressed: #4A3212;
+  --text-on-accent: #FAFBFC; --focus-ring: #BD7F3A;
+  --state-hover: rgba(24,28,32,.06); --state-pressed: rgba(24,28,32,.10);
+  --selection-bg: #F4DEC0; --selection-idle: #E4E8EC;
+  --bg-inverse: #181C20; --text-inverse: #FAFBFC;
+  --danger: #B23A3A; --danger-fg: #962E2E; --scroll: rgba(124,133,142,.5);
+  --scrim: rgba(14,17,20,.45);
+}
+.dark {
+  --bg-canvas: #12161A; --bg-surface: #181C20; --bg-elevated: #22282E;
+  --border-default: #2A3137; --border-strong: #3F484F; --border-control: #7C858E;
+  --text-primary: #FAFBFC; --text-secondary: #A8B0B8; --text-tertiary: #7C858E; --text-disabled: #5A636C;
+  --accent-fg: #D69E5C; --accent-mark: #D69E5C; --accent-bg: #4A3212;
+  --accent-fill: #9E6628; --accent-fill-hover: #7B4F1E; --accent-fill-pressed: #4A3212;
+  --text-on-accent: #FAFBFC; --focus-ring: #D69E5C;
+  --state-hover: rgba(250,251,252,.08); --state-pressed: rgba(250,251,252,.12);
+  --selection-bg: #4A3212; --selection-idle: #2A3137;
+  --bg-inverse: #F2F4F6; --text-inverse: #181C20;
+  --danger: #B23A3A; --danger-fg: #E58A84; --scroll: rgba(124,133,142,.5);
+  --scrim: rgba(4,6,8,.62);
+}
+
+* { box-sizing: border-box }
+body { background: var(--page); color: var(--page-fg); font-family: var(--sans); font-size: 14px; line-height: 1.45;
+  padding-left: max(16px, env(safe-area-inset-left, 0px)); padding-right: max(16px, env(safe-area-inset-right, 0px)); padding-block: 32px 48px }
+.wrap { max-width: 1320px; margin: 0 auto; display: grid; gap: 24px }
+header h1 { font-size: 28px; font-weight: 600; letter-spacing: -0.02em; margin: 0; text-wrap: balance }
+header p { margin: 6px 0 0; color: var(--page-muted); max-width: 68ch }
+.boards { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(100%, 600px), 1fr)); gap: 16px }
+
+.board { background: var(--bg-canvas); color: var(--text-primary); border: 1px solid var(--border-default); border-radius: 12px; padding: 24px; display: grid; gap: 24px; min-width: 0 }
+.board > h2 { margin: 0; font-size: 13px; font-weight: 500; color: var(--text-secondary); font-family: var(--mono); letter-spacing: .02em }
+.group { display: grid; gap: 8px; min-width: 0 }
+.group h3 { margin: 0; font-size: 11px; font-weight: 500; color: var(--text-secondary); letter-spacing: .04em; text-transform: uppercase }
+.row { display: flex; flex-wrap: wrap; gap: 12px; align-items: center }
+.cell { display: grid; gap: 4px; justify-items: start }
+.cap { font-family: var(--mono); font-size: 10.5px; color: var(--text-tertiary) }
+
+/* Focus ring as built: 1px ring 1px out, 2px halo outside it. */
+.focus { box-shadow: 0 0 0 1px var(--bg-canvas), 0 0 0 2px var(--focus-ring), 0 0 0 4px var(--accent-bg) }
+.focus-in { box-shadow: 0 0 0 2px var(--focus-ring), 0 0 0 4px var(--accent-bg) }
+
+.btn { height: 32px; padding: 0 12px; border-radius: 6px; font: 500 15px/1 var(--sans); display: inline-flex; align-items: center; border: 1px solid transparent; position: relative; background: transparent; color: var(--text-primary) }
+.btn.primary { background: var(--accent-fill); color: var(--text-on-accent) }
+.btn.primary.hover { background: var(--accent-fill-hover) }
+.btn.primary.pressed { background: var(--accent-fill-pressed) }
+.btn.secondary { background: var(--bg-elevated); border-color: var(--border-strong) }
+.btn.ghost { color: var(--text-secondary) }
+.btn.danger { background: var(--danger); color: var(--text-on-accent) }
+.btn.secondary.hover, .btn.ghost.hover { background-image: linear-gradient(var(--state-hover), var(--state-hover)) }
+.btn.secondary.pressed, .btn.ghost.pressed { background-image: linear-gradient(var(--state-pressed), var(--state-pressed)) }
+.btn.disabled { color: var(--text-disabled); background: transparent; border-color: var(--border-default) }
+.btn.primary.disabled, .btn.danger.disabled { background: var(--bg-surface) }
+
+.field { height: 32px; width: 200px; max-width: 100%; border-radius: 4px; background: var(--bg-canvas); border: 1px solid var(--border-strong); padding: 0 11px; display: flex; align-items: center; font: 400 15px/1 var(--sans); color: var(--text-primary); white-space: nowrap; overflow: hidden }
+.field.hover { border-color: var(--border-control) }
+.field .ph { color: var(--text-tertiary) }
+.field .sel { background: var(--selection-bg) }
+.caret { display: inline-block; width: 1.5px; height: 18px; background: var(--accent-fg); margin-left: 1px }
+.field.invalid { border-color: var(--danger-fg) }
+.field.disabled { color: var(--text-disabled); border-color: var(--border-default); background: var(--bg-surface) }
+.msg { font-size: 11px; color: var(--danger-fg) }
+
+.check { display: inline-flex; align-items: center; gap: 8px; font: 500 15px/1 var(--sans) }
+.box { width: 16px; height: 16px; border: 1px solid var(--border-control); border-radius: 4px; display: grid; place-items: center; background: var(--bg-canvas) }
+.box.on { background: var(--accent-fill); border-color: var(--accent-fill) }
+.box svg { width: 12px; height: 12px }
+.box.mixed::after { content: ""; width: 8px; height: 2px; background: var(--text-on-accent); border-radius: 1px }
+.radio { border-radius: 50% }
+.radio.on::after { content: ""; width: 6px; height: 6px; border-radius: 50%; background: var(--text-on-accent) }
+.check.disabled { color: var(--text-disabled) }
+.check.disabled .box { border-color: var(--border-default); background: var(--bg-surface) }
+
+.toggle { width: 32px; height: 18px; border-radius: 9px; border: 1px solid var(--border-control); position: relative; background: var(--bg-canvas) }
+.toggle::after { content: ""; position: absolute; top: 1px; left: 1px; width: 14px; height: 14px; border-radius: 50%; background: var(--border-control) }
+.toggle.on { background: var(--accent-fill); border-color: var(--accent-fill) }
+.toggle.on::after { left: 15px; background: var(--text-on-accent) }
+
+.slider { width: 180px; max-width: 100%; height: 16px; position: relative }
+.slider .track { position: absolute; top: 6px; left: 0; right: 0; height: 4px; border-radius: 2px; background: var(--border-strong) }
+.slider .fill { position: absolute; top: 6px; left: 0; width: 60%; height: 4px; border-radius: 2px; background: var(--accent-mark) }
+.slider .thumb { position: absolute; top: 0; left: calc(60% - 8px); width: 16px; height: 16px; border-radius: 50%; background: var(--bg-elevated); border: 1px solid var(--border-control) }
+
+.select { justify-content: space-between; width: 180px; max-width: 100% }
+.select svg { width: 16px; height: 16px; color: var(--text-secondary) }
+
+.seg { display: inline-flex; background: var(--bg-surface); border-radius: 6px; padding: 2px; gap: 2px }
+.seg span { height: 28px; padding: 0 12px; display: inline-flex; align-items: center; font: 500 13px/1 var(--sans); color: var(--text-secondary); border-radius: 5px; border: 1px solid transparent }
+.seg span.on { background: var(--bg-elevated); color: var(--text-primary); border-color: var(--border-default) }
+
+.tabs { display: flex; gap: 16px; border-bottom: 1px solid var(--border-default); width: 100% }
+.tabs span { padding: 8px 0; font: 500 15px/1 var(--sans); color: var(--text-secondary); position: relative }
+.tabs span.on { color: var(--text-primary) }
+.tabs span.on::after { content: ""; position: absolute; left: 0; right: 0; bottom: -1px; height: 2px; background: var(--accent-mark); border-radius: 1px }
+
+.list { width: 100%; max-width: 280px; border: 1px solid var(--border-default); border-radius: 8px; padding: 4px; background: var(--bg-canvas) }
+.li { height: 32px; padding: 0 12px; display: flex; align-items: center; gap: 8px; border-radius: 4px; font: 400 15px/1 var(--sans) }
+.li svg { width: 20px; height: 20px; color: var(--text-secondary); flex: none }
+.li.hover { background: var(--state-hover) }
+.li.sel { background: var(--selection-bg) }
+.li.idle { background: var(--selection-idle) }
+.li .cap { margin-left: auto }
+
+.float { background: var(--bg-elevated); border: 1px solid var(--border-default); border-radius: 8px }
+.menu { width: 220px; padding: 4px }
+.mi { height: 28px; padding: 0 12px; display: flex; align-items: center; justify-content: space-between; border-radius: 4px; font: 400 15px/1 var(--sans) }
+.mi .k { font: 400 12.5px/1 var(--mono); color: var(--text-tertiary) }
+.mi.sel { background: var(--selection-bg) }
+.mi.off { color: var(--text-disabled) }
+.mi.off .k { color: var(--text-disabled) }
+.sep { height: 1px; background: var(--border-default); margin: 4px 0 }
+.tip { background: var(--bg-inverse); color: var(--text-inverse); border-radius: 4px; padding: 4px 8px; font: 400 13px/1.25 var(--sans) }
+
+.stage { position: relative; width: 100%; max-width: 360px; height: 200px; border-radius: 8px; background: var(--bg-surface); overflow: hidden; border: 1px solid var(--border-default) }
+.stage .scrim { position: absolute; inset: 0; background: var(--scrim) }
+.dialog { position: absolute; left: 50%; top: 50%; transform: translate(-50%, -50%); width: calc(100% - 48px); border-radius: 12px; padding: 24px; display: grid; gap: 12px }
+.dialog h4 { margin: 0; font-size: 18px; font-weight: 600 }
+.dialog p { margin: 0; font-size: 13px; color: var(--text-secondary) }
+.dialog .acts { display: flex; justify-content: flex-end; gap: 8px }
+.dialog .btn { height: 28px; font-size: 13px }
+
+.scrollbox { position: relative; width: 120px; height: 96px; border-radius: 8px; border: 1px solid var(--border-default); background: var(--bg-canvas); overflow: hidden }
+.scrollbox .lines { padding: 8px; display: grid; gap: 6px }
+.scrollbox .lines i { display: block; height: 6px; border-radius: 3px; background: var(--border-default) }
+.bar { position: absolute; right: 2px; top: 10px; width: 6px; height: 36px; border-radius: 3px; background: var(--scroll) }
+.bar.wide { width: 10px }
+.prog { width: 180px; max-width: 100%; height: 4px; border-radius: 2px; background: var(--bg-surface); overflow: hidden }
+.prog i { display: block; width: 45%; height: 100%; background: var(--accent-mark) }
+
+.contrast { width: 100%; border-collapse: collapse; font-size: 13px; color: var(--text-primary) }
+.contrast th, .contrast td { text-align: left; padding: 6px 8px; border-bottom: 1px solid var(--border-default); vertical-align: middle }
+.contrast th { font-weight: 500; color: var(--text-secondary); font-size: 11px; text-transform: uppercase; letter-spacing: .04em }
+.contrast td.n { font-family: var(--mono); font-variant-numeric: tabular-nums }
+.fail { color: var(--danger-fg) }
+.chipx { display: inline-flex; height: 24px; padding: 0 9px; align-items: center; border-radius: 6px; font: 500 13px/1 var(--sans) }
+.tablewrap { overflow-x: auto }
+footer { color: var(--page-muted); font-size: 13px; max-width: 72ch }
+footer code { font-family: var(--mono); font-size: 12px }
+</style>
+
+<div class="wrap">
+  <header>
+    <h1>Atrium control sheet</h1>
+    <p>Every control in visual language rev. 2 (§14.2), in every state (§14.1), light and dark, drawn from the token table. It's for review before the controls are built in Pergola. Once they exist, the same sheet is rendered by Pergola through frescod and compared against this one.</p>
+  </header>
+  <div class="boards" id="boards"></div>
+  <footer>Source: <code>docs/design/atrium-visual-language.md</code> rev. 2, proposed 2026-11-06. The browser draws the boards with IBM Plex. Floating surfaces have their edge only, since Fresco has no shadow op yet (§5).</footer>
+</div>
+
+<template id="board">
+  <h2 data-name></h2>
+
+  <div class="group"><h3>Buttons · rest, hover, pressed, keyboard focus, disabled</h3>
+    <div class="row">
+      <span class="btn primary">Save</span><span class="btn primary hover">Save</span><span class="btn primary pressed">Save</span><span class="btn primary focus">Save</span><span class="btn primary disabled">Save</span>
+    </div>
+    <div class="row">
+      <span class="btn secondary">Cancel</span><span class="btn secondary hover">Cancel</span><span class="btn secondary pressed">Cancel</span><span class="btn secondary focus">Cancel</span><span class="btn secondary disabled">Cancel</span>
+    </div>
+    <div class="row">
+      <span class="btn ghost">Skip</span><span class="btn ghost hover">Skip</span><span class="btn ghost pressed">Skip</span><span class="btn danger">Delete</span><span class="btn danger focus">Delete</span>
+    </div>
+  </div>
+
+  <div class="group"><h3>Text field · empty, typing, selection, invalid, disabled</h3>
+    <div class="row">
+      <div class="cell"><span class="field"><span class="ph">Search mail</span></span><span class="cap">rest</span></div>
+      <div class="cell"><span class="field hover"><span class="ph">Search mail</span></span><span class="cap">hover</span></div>
+      <div class="cell"><span class="field focus">invoice march<span class="caret"></span></span><span class="cap">focused, caret</span></div>
+      <div class="cell"><span class="field focus">invoice&nbsp;<span class="sel">march</span></span><span class="cap">selection</span></div>
+      <div class="cell"><span class="field invalid">shankar@</span><span class="msg">Enter a full address, like name@example.org</span></div>
+      <div class="cell"><span class="field disabled">alice</span><span class="cap">disabled</span></div>
+    </div>
+  </div>
+
+  <div class="group"><h3>Choice · checkbox, radio, toggle</h3>
+    <div class="row">
+      <span class="check"><span class="box"></span>Off</span>
+      <span class="check"><span class="box on"><svg viewBox="0 0 12 12" fill="none"><path d="M2.5 6.2 5 8.6l4.5-5" stroke="var(--text-on-accent)" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/></svg></span>On</span>
+      <span class="check"><span class="box on mixed"></span>Mixed</span>
+      <span class="check"><span class="box focus-in"></span>Focus</span>
+      <span class="check disabled"><span class="box"></span>Disabled</span>
+    </div>
+    <div class="row">
+      <span class="check"><span class="box radio"></span>Daily</span>
+      <span class="check"><span class="box radio on"></span>Weekly</span>
+      <span class="check"><span class="box radio focus-in"></span>Never</span>
+      <span class="check"><span class="toggle"></span>Off</span>
+      <span class="check"><span class="toggle on"></span>On</span>
+      <span class="check"><span class="toggle focus-in"></span>Focus</span>
+    </div>
+  </div>
+
+  <div class="group"><h3>Value · slider, dropdown, segmented, progress</h3>
+    <div class="row">
+      <div class="slider"><span class="track"></span><span class="fill"></span><span class="thumb"></span></div>
+      <span class="btn secondary select">Weekly<svg viewBox="0 0 16 16" fill="none"><path d="m4 6 4 4 4-4" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></svg></span>
+      <span class="seg"><span>Day</span><span class="on">Week</span><span>Month</span></span>
+      <div class="prog"><i></i></div>
+    </div>
+  </div>
+
+  <div class="group"><h3>Tabs</h3>
+    <div class="tabs"><span class="on">General</span><span>Privacy</span><span>Sound</span></div>
+  </div>
+
+  <div class="group"><h3>List rows · rest, hover, selected (focused list), selected (list not focused)</h3>
+    <div class="row" style="align-items:flex-start">
+      <div class="list">
+        <div class="li"><svg viewBox="0 0 20 20" fill="none"><rect x="3" y="5" width="14" height="10" rx="1.5" stroke="currentColor" stroke-width="1.5"/><path d="m3.5 6 6.5 5 6.5-5" stroke="currentColor" stroke-width="1.5"/></svg>Inbox<span class="cap">12</span></div>
+        <div class="li hover"><svg viewBox="0 0 20 20" fill="none"><path d="M4 10h12M10 4v12" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/></svg>Drafts<span class="cap">3</span></div>
+        <div class="li sel"><svg viewBox="0 0 20 20" fill="none"><path d="M3.5 10.5 16.5 4l-4 12.5-3-5-6-1Z" stroke="currentColor" stroke-width="1.5" stroke-linejoin="round"/></svg>Sent</div>
+      </div>
+      <div class="list">
+        <div class="li">Inbox</div>
+        <div class="li idle">Sent</div>
+        <div class="li">Archive</div>
+      </div>
+    </div>
+  </div>
+
+  <div class="group"><h3>Floating · menu, tooltip, dialog over scrim</h3>
+    <div class="row" style="align-items:flex-start">
+      <div class="float menu">
+        <div class="mi">New window<span class="k">Ctrl N</span></div>
+        <div class="mi sel">Open…<span class="k">Ctrl O</span></div>
+        <div class="mi off">Save<span class="k">Ctrl S</span></div>
+        <div class="sep"></div>
+        <div class="mi">Close<span class="k">Ctrl W</span></div>
+      </div>
+      <div class="cell"><span class="tip">Reload this page</span><span class="cap">tooltip, 500 ms</span></div>
+      <div class="stage">
+        <div class="scrim"></div>
+        <div class="float dialog">
+          <h4>Delete 3 messages?</h4>
+          <p>They move to Trash and are deleted after 30 days.</p>
+          <div class="acts"><span class="btn secondary">Cancel</span><span class="btn danger focus">Delete</span></div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <div class="group"><h3>Scrollbar · while scrolling, hovered</h3>
+    <div class="row">
+      <div class="scrollbox"><div class="lines"><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i></div><span class="bar"></span></div>
+      <div class="scrollbox"><div class="lines"><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i></div><span class="bar wide"></span></div>
+    </div>
+  </div>
+
+  <div class="group"><h3>Contrast floor · before and after rev. 2</h3>
+    <div class="tablewrap"><table class="contrast" data-contrast></table></div>
+  </div>
+</template>
+
+<script>
+const boards = document.getElementById('boards');
+const tpl = document.getElementById('board');
+const rows = {
+  light: [
+    ['Primary button label', ['#FAFBFC', '#BD7F3A', 'Save', '3.24'], ['#FAFBFC', '#9E6628', 'Save', '4.62']],
+    ['Link text on canvas', ['#BD7F3A', '#FAFBFC', 'Open settings', '3.24'], ['#7B4F1E', '#FAFBFC', 'Open settings', '6.80']],
+    ['Warning text on canvas', ['#C99030', '#FAFBFC', 'Disk almost full', '2.70'], ['#8A5E14', '#FAFBFC', 'Disk almost full', '5.49']],
+    ['Checkbox edge on canvas', ['#CFD5DA', '#FAFBFC', '', '1.43'], ['#7C858E', '#FAFBFC', '', '3.62']],
+  ],
+  dark: [
+    ['Primary button label', ['#FAFBFC', '#D69E5C', 'Save', '2.28'], ['#FAFBFC', '#9E6628', 'Save', '4.62']],
+    ['Danger text on canvas', ['#B23A3A', '#12161A', 'Couldn’t save', '3.08'], ['#E58A84', '#12161A', 'Couldn’t save', '7.18']],
+    ['Checkbox edge on canvas', ['#3F484F', '#12161A', '', '1.95'], ['#7C858E', '#12161A', '', '4.85']],
+  ],
+};
+function sample([fg, bg, text]) {
+  if (!text) return `<span class="chipx" style="background:${bg};padding:0 4px"><span style="display:inline-block;width:16px;height:16px;border:1px solid ${fg};border-radius:4px"></span></span>`;
+  return `<span class="chipx" style="background:${bg};color:${fg}">${text}</span>`;
+}
+for (const mode of ['light', 'dark']) {
+  const el = document.createElement('section');
+  el.className = 'board ' + mode;
+  el.appendChild(tpl.content.cloneNode(true));
+  el.querySelector('[data-name]').textContent = mode === 'light' ? 'Semantic::LIGHT' : 'Semantic::DARK';
+  const t = el.querySelector('[data-contrast]');
+  t.innerHTML = '<tr><th>Pair</th><th>Before</th><th></th><th>After</th><th></th></tr>' + rows[mode].map(([name, b, a]) =>
+    `<tr><td>${name}</td><td>${sample(b)}</td><td class="n fail">${b[3]}</td><td>${sample(a)}</td><td class="n">${a[3]}</td></tr>`).join('');
+  boards.appendChild(el);
+}
+</script>
