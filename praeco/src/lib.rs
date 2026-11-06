@@ -142,7 +142,7 @@ pub mod text {
 
 pub mod policy {
     use std::collections::HashMap;
-    use std::time::{Duration, Instant};
+    use std::time::Instant;
 
     /// Per app: bursts of `BURST`, refilled at `PER_MINUTE` a minute.
     pub const BURST: f64 = 3.0;
