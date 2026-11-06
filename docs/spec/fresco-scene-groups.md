@@ -229,7 +229,11 @@ transforms are already absolute, and paint order is re-sorted for stacking conte
 | an SVG's bitmap fallback (dropped fills) | takes the dropped paths' place in the same group and order |
 
 The Navigator thread measures, on the corpus, groups per window against the 4,096 limit, and how
-often overlapping opacity groups, rotations and overlay leaves occur.
+often overlapping opacity groups, rotations and overlay leaves occur. **Measured 2026-11-06**
+(backend §4.8, phase 2): groups per band p50 8, p90 85, at most 2,237, over 4,096 only in a
+document that is one table (one band); overlapping opacity groups 481 of 687, in 19 corpus
+documents; rotated text or images none; leaves outside their band 8,801 in 40 documents, about
+a quarter of their per-band entries in a band's group in place, the rest in the overlay.
 
 So DocumentView in a Pergola window and the Navigator's own surface send the same nodes, and a
 native control inside a document is a Pergola widget subtree under the document's group.

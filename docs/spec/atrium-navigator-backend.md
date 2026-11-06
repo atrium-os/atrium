@@ -1151,7 +1151,8 @@ fuzzer, which has a `/4` seed and must reach `TemplateInstancesTruncated`.
 
 *Asked by the user, 2026-11-05: "memory management for pages with or without js or other
 scripting that are super big — we don't want an OOM. Scrolling a 1000 page document
-shouldn't choke the navigator too or feel laggy." Not built.*
+shouldn't choke the navigator too or feel laggy." Steps 1–2 and step 3 phases 1–2 built
+(below); the image working set and table-row checkpoints not yet.*
 
 **Today, a big page is safe, but by refusal.** Checked against the tree on 2026-11-05:
 
@@ -1587,16 +1588,153 @@ the normalized document is stored by content address.
   | War and Peace | 291–298 ms, 155 MiB | **56–58 ms, 135 MiB** |
   | Commons gallery | 164–165 ms, 48 MiB | **32 ms, 27 MiB** |
 
-  - *What remains on the cached path.* The worker still parses the whole recording JSON
+  - *What remains on the cached path.* The worker still parsed the whole recording JSON
     for the normalizer's inputs, which a cached document no longer needs: the standard's
-    recording is 16 MiB. Its peak of 720 MiB against 409 MiB for first-screen layout
-    alone (`layout_peak --first`) is mostly that. Next: hand the worker only the
-    subresources a cached document needs.
-  - *Parsing and styling the whole document* remain until phase 2.
+    recording is 16 MiB. **Since done (phase 2, 7ec529da):** `display::first_screen` parses
+    the recording only when it normalizes; a stored document needs only the image sizes,
+    which are read line by line. Cached arm, 3 runs each (`scene_peak`): HTML standard
+    720 → **441 MiB**, 100,000-row table 479 → **361 MiB**, War and Peace 137 → **59 MiB**,
+    coreutils 118 → **84 MiB**, HN 228 → 222 MiB. (Opening a session still ingests the
+    recording, in its own step.)
+  - *Parsing and styling the whole document* remain (phase 2 below bounds the layout).
 
-*Phase 2* (next): checkpoints at top-level block boundaries, so the worker can lay a band
-out again from its checkpoint, drop far regions, and lay out a far jump without the
-layout above it.
+**Step 3, phase 2 built: checkpoints, bands laid out on their own, and the content source
+(2026-11-06).** In `navigator-render`, so a `DocumentView` and the worker use it alike
+(pergola.md §10.3–§10.4).
+- *Styled once, laid out band by band.* `html::prepare` parses and styles the document once.
+  `bands::Banded` then lays it out one band at a time: the first time in document order, each
+  band from where the previous one stopped (the first pass), and again from the band's own
+  checkpoint whenever an evicted band is wanted back.
+- *Checkpoints.* A band is cut at the first block boundary below its height (one viewport),
+  and only at boundaries in plain block flow: never inside flex, grid, a table, a trial
+  measurement, a line box or an out-of-flow box, and never with inline content pending.
+  The checkpoint records the block, its y and the vector-SVG share left there. A band run:
+  - skips every block an earlier band completed, by its recorded outer height (margins never
+    collapse and there are no floats, profile §3.1, so the next block starts exactly there),
+    and the line boxes flushed before a block it continues;
+  - starts a box it continues (an ancestor of its checkpoint block) at the child on the way
+    to the checkpoint, at the y recorded for it, without walking the siblings before it;
+  - stops before the next band's checkpoint block.
+  Layout is deterministic, so a band laid out again is identical (tested, NSG byte for byte).
+- *Boxes that span bands* (a section's background, a wrapper's border) are painted by every
+  band they span, at their final size once a band has completed them. A band that cut a box
+  before its size was known painted nothing for it and is marked stale; it is laid out again
+  before it is shown (and before the overlay settles, when the box positions or transforms
+  what it holds).
+- *Leaves a band paints outside itself* (positioned and transformed boxes, shadows, a fixed
+  header written last) are keyed in the whole document's painting order: stacking key, then
+  (the band that emitted it, its emission index), a spanning box's paint keyed where the box
+  began. For each other resident band it reaches, such a leaf either goes into that band's
+  group at its place (the whole layout paints it under something there: a positioned note
+  written above a section whose background covers it) or into the **overlay group** after
+  the bands (it paints over everything there), clipped to that band. The overlay holds
+  entries for resident bands only, so it is bounded by the window too.
+- *One shaping cache* (per word) is shared by a document's band runs, bounded at 200,000
+  words; without it each band shaped cold and the first pass took twice as long.
+- *The content source* (`source::DocumentSource`, the `ContentSource` trait): `want {range,
+  zoom, prefetch}` in; `extent {height, settled}`, `band_ready`, `band_updated`,
+  `band_evicted` out; one scene group per band and the overlay group written through a
+  `SceneSink`; only the wanted range plus prefetch resident; idle work runs the first pass
+  in the background; a new zoom lays the document out again (§4.9). The extent is an
+  estimate (laid-out height over the fraction of the document's nodes reached) until the
+  first pass completes, then exact.
+
+*Checked.*
+- `tests/checkpoints.rs`, by pixels against the whole layout, with a planted-difference
+  control: every band of a page with spanning sections, lists, flex cards, a lifted box
+  with a shadow, an absolutely positioned note and a fixed header written last, at band
+  heights down to 60 px; a band laid out again is identical to its first run; list markers
+  survive a cut before an item's first line (fails with the old rule). `tests/source.rs`:
+  resident bands stay within want + prefetch while the whole document scrolls; a jump to
+  the end settles the extent; idle work settles without making anything resident; a new
+  zoom lays out again.
+- *The oracle on real documents* (`examples/band_check`, bands of 600 px; each band laid
+  out again from its checkpoint, drawn as a host draws it — its group, then the overlay's
+  leaves for it — and its whole pixel rows compared with the whole layout's at 8 bits):
+  - 129 corpus documents, 3,234 bands, 1,415 checked (at most 40 per document, evenly
+    spaced): **0 differ**; no document fell back to a whole layout.
+  - The 7 big documents, 6,403 bands, 127 checked: **0 differ**.
+  - Whole-layout NSG byte-identical before and after on all 136.
+- *What the oracle found on the way* (each fixed, each in the code's comments): leaves
+  under a transform that scales to zero (paint nothing; in no band); inline content
+  before a block a band continues, laid out again by every band (pubmed's skip link); a
+  block's recorded height counting the line boxes before it twice (nhs.uk, 48 px low); a
+  box whose first child holds the cut not seen as spanning, so drawn twice (figma, folha)
+  — the exact test is "an ancestor of the checkpoint block"; a list marker cleared when the
+  band that placed it was laid out again (the HTML standard's step "7.").
+
+*Measured* (`examples/band_peak`, one process per arm, 3 runs per arm, from the stored
+normalized document, so parsing and styling are in both arms; the source with bands of
+600 px and one viewport of prefetch; M4 Max):
+
+| document | bands | whole layout: ms, peak | first screen: ms, peak | first pass to the end: ms, peak | scrolled end to end: peak, resident | a jump, from a checkpoint |
+|---|---|---|---|---|---|---|
+| HTML Living Standard | 3,723 | 2,029–2,303 ms, 639–645 MiB | **576–601 ms, 409–410 MiB** | 2,082–2,372 ms, 468–472 MiB | **470–473 MiB**, 4 bands | 1–2 ms |
+| War and Peace | 1,979 | 914–992 ms, 201–203 MiB | **31–33 ms, 51 MiB** | 1,005–1,162 ms, 86–87 MiB | **86–88 MiB**, 4 | 0–2 ms |
+| coreutils manual | 694 | 417–441 ms, 119–120 MiB | **104–107 ms, 78–80 MiB** | 437–465 ms, 96–99 MiB | 99–101 MiB, 4 | 1–2 ms |
+| 100,000-row table | 1 | 4,458–4,515 ms, 656–663 MiB | 4,355–4,950 ms, 676–679 MiB | — | 676–679 MiB, 1 | — |
+| HN thread | 1 | 1,250–1,302 ms, 211–215 MiB | 1,203–1,251 ms, 211–215 MiB | — | 211–215 MiB, 1 | — |
+| Commons gallery | 3 | 18–20 ms, 23–25 MiB | 17–19 ms, 23–26 MiB | 4 ms | 23–26 MiB, 3 | 0–6 ms |
+| endless feed | 2 | 1–2 ms, 17–19 MiB | 1 ms, 17–19 MiB | 0 ms | 17–19 MiB, 2 | 0 ms |
+
+- **Worker memory now follows the window plus the parsed document,** not the layout: the
+  layout's share is gone (War and Peace 201 → 87 MiB, the standard 642 → 471 MiB, at most
+  4 bands and 7,772 leaves resident). What remains is the DOM and the cascade of the whole
+  document — 409 MiB of the standard's 471 — which phase 2 does not touch.
+- **A document that is one table is one band** (the table; HN, whose comments are one
+  table cell): checkpoints are between blocks in plain flow, and a table is laid out
+  whole. It costs what the whole layout costs (after a fix, 8bb1f10b: it first cost twice,
+  laid out once to find its range and again to keep it). Checkpoints between table rows
+  are the next step for these.
+- *Time to reach a jump target.* Once the first pass has passed it, a jump is one band
+  laid out from its checkpoint: 0–6 ms. Before that, the jump waits for the first pass to
+  get there; to the end that is the whole layout's time again (the pass costs what the
+  whole layout costs: the standard 2.1–2.4 s vs 2.0–2.3 s, with the same text work, 5.01 M
+  vs 5.00 M characters, after a fix in 70433d5f — a band whose checkpoint is a child of a
+  box it continues walked every sibling before it, 6.6× the text work).
+- *A scroll step* (a `want` a screen further, including any band laid out): p50 under
+  1 ms, p99 1 ms; the worst is 50–74 ms on the standard and coreutils, a single band
+  holding a large `pre` or table, on the worker, not the compositor.
+
+*The scroll harness with bands* (`scroll_bench --source`: the content source on its own
+clock, as the worker is its own process, laying out the rest in the background in the
+time each period leaves; bands at one viewport; strip compositing; 8 s; one run per cell,
+both arms: `source` and the whole scene `scene`):
+- **Frame gates pass in both arms, and the arms match**: the compositor's work does not
+  depend on where the bands came from. The HTML standard, measured alone on the machine:
+  60 Hz p99.9 9.7–16.0 ms, missed vsyncs 0.0%, 0 stalls in every pattern; 120 Hz p99.9
+  6.0–9.5 ms, missed 0.0–1.2%. The other documents: 60 Hz p99.9 12–20 ms, missed ≤ 3.1%
+  (page-down, which exposes a whole window per step, as before); 120 Hz missed up to 4.4%
+  in both arms (the harness compositor's frame cost, §10.5 of pergola.md). One cell is
+  left out as contaminated: the table's `scene` arm at 60 Hz (p99.9 63 ms, 10% missed)
+  ran while other measurements ran on the same machine; its `source` arm was clean.
+- **Placeholders**: none in flings, page-down or Pergola's physics on any document — the
+  source keeps a viewport ahead.
+- **The content gate fails for one case: a jump to the end in the first seconds**, before
+  the first pass has reached it. Real content replaces placeholders after 1.2–1.8 s on the
+  standard, 0.6 s on War and Peace, 75–100 ms on coreutils. After the first pass the same
+  jump costs one band. Ways to meet it, not built: lay out from the end first when the view
+  jumps there (needs an estimate of where the end's checkpoint is, which the first pass is
+  what provides), or a first pass that measures heights without painting.
+
+*Counted for the scene-groups review* (fresco-scene-groups.md §6, on the whole layouts):
+- **Leaves painted outside their own band** (the overlay's sources): 8,801 in 40 of the 129
+  corpus documents, none in the big documents. In the bands checked, 1,919 went into
+  another band's group in place (painted under something there) and 5,204 into the overlay
+  group (over everything there). Most are a few documents' positioned headers and cards.
+- **Opacity groups whose leaves overlap** (multiplied alpha would be wrong; `ISOLATE`):
+  481 of 687 groups, in 19 of 30 documents that have any (doc22 alone: 394). None in the
+  big documents.
+- **Rotated or skewed text and images**: none, on any document.
+- **Scene groups per band** (one per run of leaves with the same clip, transform and
+  opacity group): p50 8, p90 85, the most 2,237 (doc14); over the 4,096 limit only in the
+  HN thread's single band (4,764) — a one-band document, which table-row checkpoints fix.
+
+*Not yet:* the worker's wire protocol for `want` and its events (out of process, pergola
+§10.4: the same messages over the doc-viewer role's channel), so the broker's worker still
+answers only `Scene` with the first screen; table-row checkpoints; the image working set
+(part 3); checkpoints that survive a restyle (a navigated document is laid out again from
+the start).
 
 *Gates for bands (proposed):* at 60 Hz, 0 stalls over 100 ms after first display in every
 pattern, p99.9 frame time ≤ 2 periods, and missed vsyncs ≤ 1%. At 120 Hz, the same once
