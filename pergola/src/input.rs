@@ -44,6 +44,8 @@ pub fn translate(ev: &fresco_client::Event) -> Option<Event> {
         | fresco_client::Event::WindowDestroyed { .. }
         // The output changed mode: the App's window keeps its size.
         | fresco_client::Event::DisplayChanged(_)
+        // Pergola draws no filled paths yet, so it has none to fall back for.
+        | fresco_client::Event::FillsDropped { .. }
         | fresco_client::Event::Unknown { .. } => None,
     }
 }
