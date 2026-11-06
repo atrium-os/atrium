@@ -704,8 +704,13 @@ pub fn monotonic_ns() -> i64 {
 /// a timeshare thread reads it late. So the clock is a least-squares line
 /// through the readings of the last [`DeviceClock::WINDOW_NS`], in 50 ms
 /// buckets: its slope is the device's real rate, and it says when a given
-/// frame will be heard. A reading far off the line (an underrun, a stall)
-/// starts the line again.
+/// frame will be heard.
+///
+/// When the device ran dry (lyrad was late: the reading shows nothing
+/// queued), it sat silent for a while, so every later frame is heard that
+/// much later. The rate didn't change, so the line keeps its slope and
+/// moves to the reading. Any other reading far off the line (a device
+/// reset) starts the line again.
 pub struct DeviceClock {
     nominal: f64,
     /// Finished buckets: (mean time ns, mean position frames), relative to `base`.
@@ -717,6 +722,8 @@ pub struct DeviceClock {
     /// The fitted line: position = q0 + slope × (t − t0) (relative to `base`).
     fit: Option<(f64, f64, f64)>,
     last_report: i64,
+    /// Times the line moved because the device ran dry.
+    pub reanchors: u64,
 }
 
 impl DeviceClock {
@@ -731,7 +738,7 @@ impl DeviceClock {
 
     pub fn new(nominal: u32) -> Self {
         DeviceClock { nominal: nominal as f64, buckets: Default::default(), cur: (0.0, 0.0, 0), cur_start: 0,
-            base: (0, 0), fit: None, last_report: 0 }
+            base: (0, 0), fit: None, last_report: 0, reanchors: 0 }
     }
 
     fn restart(&mut self, now: i64, pos: i64) {
@@ -774,18 +781,24 @@ impl DeviceClock {
         }
     }
 
-    /// Feed one reading: the device is sounding frame `pos` at `now`.
-    pub fn sample(&mut self, now: i64, pos: u64) {
+    /// Feed one reading: the device is sounding frame `pos` at `now`;
+    /// `starved`: it had nothing queued (it ran dry, or was about to).
+    pub fn sample(&mut self, now: i64, pos: u64, starved: bool) {
         let pos = pos as i64;
         if self.cur.2 == 0 && self.buckets.is_empty() {
             self.restart(now, pos);
         }
-        let (t, q) = ((now - self.base.0) as f64, (pos - self.base.1) as f64);
+        let (t, mut q) = ((now - self.base.0) as f64, (pos - self.base.1) as f64);
         if let Some((t0, q0, slope)) = self.fit {
-            let off = (q - (q0 + slope * (t - t0))) / self.nominal;
-            if off.abs() > Self::RESET_S || q < 0.0 {
+            let behind = q - (q0 + slope * (t - t0));
+            if starved && behind < 0.0 {
+                // Silent for `behind` frames: move the line, keep its slope.
+                self.base.1 += behind.round() as i64;
+                self.reanchors += 1;
+                q = (pos - self.base.1) as f64;
+            } else if (behind / self.nominal).abs() > Self::RESET_S || q < 0.0 {
                 self.restart(now, pos);
-                return self.sample(now, pos as u64);
+                return self.sample(now, pos as u64, starved);
             }
         }
         self.cur.0 += t;
@@ -906,9 +919,16 @@ pub fn run(cfg: Config) -> ! {
             let delay = sink.delay_frames().unwrap_or(0);
             let now = monotonic_ns();
             // The frame the device is sounding now (see DeviceClock).
-            clock.sample(now, written.saturating_sub(delay));
+            clock.sample(now, written.saturating_sub(delay), delay == 0 && written > 0);
             if let Some(ppm) = clock.rate_ppm(now) {
                 engine.rate_ppm = ppm;
+                // Once a second, with the rate: did the device run dry?
+                // (Each time is a gap heard by everyone, and moves the clock.)
+                if let Ok(n) = sink.play_underruns() {
+                    if n > 0 {
+                        eprintln!("lyrad: the device ran dry {n} times in the last second (clock moved {} times so far)", clock.reanchors);
+                    }
+                }
             }
             if let Ok(played) = sink.played_frames() {
                 if let Some(w) = poslog.as_mut() {
@@ -974,7 +994,7 @@ mod tests {
             let mut last_ppm = None;
             let rate = 48_000.0 * (1.0 + ppm / 1e6);
             bursty(ppm, 30.0, |now, pos, _| {
-                c.sample(now, pos);
+                c.sample(now, pos, false);
                 if let Some(p) = c.rate_ppm(now) { last_ppm = Some(p); }
                 // After the first seconds: when is the frame 100 ms ahead heard?
                 if now > 4_000_000_000 {
@@ -998,7 +1018,7 @@ mod tests {
         let mut t = 0i64;
         let mut pos = 0u64;
         for _ in 0..2000 {
-            c.sample(t, pos);
+            c.sample(t, pos, false);
             t += 2_666_667;
             pos += 128;
         }
@@ -1007,11 +1027,40 @@ mod tests {
         // The device stalls for 200 ms (an underrun), then plays on.
         t += 200_000_000;
         for _ in 0..2000 {
-            c.sample(t, pos);
+            c.sample(t, pos, false);
             t += 2_666_667;
             pos += 128;
         }
         assert!((c.heard_at(pos).unwrap() - t).abs() < 100_000, "the line follows the stall");
+    }
+
+    #[test]
+    fn when_the_device_runs_dry_the_line_moves_and_keeps_its_rate() {
+        let mut c = DeviceClock::new(48_000);
+        // A device 500 ppm slow.
+        let step = (128.0 / (48_000.0 * (1.0 - 500e-6)) * 1e9) as i64;
+        let (mut t, mut pos) = (0i64, 0u64);
+        for _ in 0..4000 {
+            c.sample(t, pos, false);
+            t += step;
+            pos += 128;
+        }
+        // It runs dry for 12 ms (less than the restart threshold): lyrad
+        // sees nothing queued.
+        t += 12_000_000;
+        c.sample(t, pos, true);
+        assert_eq!(c.reanchors, 1);
+        // At once, not after a refit, the line says the next frames come 12 ms later.
+        let got = c.heard_at(pos + 4800).unwrap();
+        let want = t + (4800.0 / (48_000.0 * (1.0 - 500e-6)) * 1e9) as i64;
+        assert!((got - want).abs() < 200_000, "{} ms off", (got - want) as f64 / 1e6);
+        for _ in 0..4000 {
+            t += step;
+            pos += 128;
+            c.sample(t, pos, false);
+        }
+        let p = c.rate_ppm(t + 2_000_000_000).unwrap();
+        assert!((p + 500).abs() <= 1, "{p}");
     }
 
     use super::*;
