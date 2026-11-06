@@ -20,9 +20,10 @@ pub trait Vault {
     /// validates it; errors are Arca's to log.
     /// `ticket` is the request's, for a web courier.
     fn set_cookie(&mut self, name: &str, value: &[u8], attrs: &[u8], path: &str, ticket: Option<&[u8; 16]>);
-    /// The `Cookie` header Arca matched for a request to `path`, if any.
-    /// A web courier's request redeems its ticket here.
-    fn cookies(&mut self, path: &str, ticket: Option<&[u8; 16]>) -> Option<LockedBuf>;
+    /// The `Cookie` header Arca matched for this request (`method`, `path`,
+    /// `query` without its `?`), if any. A web courier's request redeems its
+    /// ticket here, for exactly this request.
+    fn cookies(&mut self, method: Method, path: &str, query: &str, ticket: Option<&[u8; 16]>) -> Option<LockedBuf>;
 }
 
 /// The one endpoint this courier serves, from its label.
@@ -103,7 +104,8 @@ impl<'a> Courier<'a> {
         // Arca's matching, after TLS like the fill. No cookies is no
         // refusal: the request goes without.
         let path = std::str::from_utf8(&req.path).map_err(|_| Refusal::Malformed)?;
-        let cookie = vault.cookies(path, req.ticket.as_ref());
+        let query = std::str::from_utf8(&req.query).map_err(|_| Refusal::Malformed)?;
+        let cookie = vault.cookies(req.method, path, query, req.ticket.as_ref());
         let wire = build(req, &self.endpoint, &values, cookie.as_ref())?;
         if s.write_all(wire.as_ref()).and_then(|_| s.flush()).is_err() {
             // The server closed a kept-alive connection: once more, fresh.

@@ -613,14 +613,17 @@ impl State {
             let reason = r.u8()?;
             let initiator = r.str(caps::HOST)?;
             let gesture = r.u8()?;
+            let query = if r.remaining() > 0 { r.str(QUERY_MAX)? } else { "" };
             r.end()?;
-            Ok::<_, Error>((ep, partition, method, path, reason, initiator, gesture))
+            Ok::<_, Error>((ep, partition, method, path, reason, initiator, gesture, query))
         })();
-        let Ok((ep, partition, method, path, reason, initiator, gesture)) = parsed else { return malformed() };
+        let Ok((ep, partition, method, path, reason, initiator, gesture, query)) = parsed else { return malformed() };
         let (Recipient::Endpoint { host, port, .. }, Some(reason)) = (ep, Reason::from_u8(reason)) else { return malformed() };
         if Recipient::endpoint(Scheme::Https, &host, port, Some(partition)).is_err()
             || !(1..=6).contains(&method)
             || !path.starts_with('/')
+            || !uri_text(path, true)
+            || !uri_text(query, false)
             || gesture > 1
             || (!initiator.is_empty() && Recipient::endpoint(Scheme::Https, initiator, 443, None).is_err())
         {
@@ -636,6 +639,7 @@ impl State {
             port,
             method,
             path: path.into(),
+            query: query.into(),
             reason,
             initiator: initiator.to_ascii_lowercase(),
             gesture: gesture == 1,
@@ -648,10 +652,14 @@ impl State {
 
     /// The ticket a web courier names for this request, checked against
     /// its own label.
-    fn courier_ticket(&mut self, c: &CourierLabel, path: &str, id: &[u8; 16], redeem: bool) -> Option<crate::tickets::Ticket> {
+    /// Redeeming names the whole request (`exact`: method and query) — a
+    /// ticket is for that one request; a response's Set-Cookies name only
+    /// the path of the request whose ticket was redeemed.
+    fn courier_ticket(&mut self, c: &CourierLabel, path: &str, exact: Option<(u8, &str)>, id: &[u8; 16], redeem: bool) -> Option<crate::tickets::Ticket> {
         let Recipient::Endpoint { host, port, partition: Some(partition), .. } = &c.endpoint else { return None };
         let ok = |t: &crate::tickets::Ticket| {
             t.user == c.user && &t.partition == partition && &t.host == host && t.port == *port && t.path == path
+                && exact.is_none_or(|(m, q)| t.method == m && t.query == q)
         };
         if redeem {
             self.tickets.redeem(id, ok)
@@ -741,7 +749,7 @@ impl State {
                 // request the broker ticketed; an app's courier has none.
                 match (partition, ticket) {
                     (None, None) => {}
-                    (Some(_), Some(t)) if self.courier_ticket(c, path, &t, false).is_some() => {}
+                    (Some(_), Some(t)) if self.courier_ticket(c, path, None, &t, false).is_some() => {}
                     _ => return reply(status::DENIED),
                 }
                 let now = (self.clock)();
@@ -808,7 +816,14 @@ impl State {
             }
             courier_op::COOKIES => {
                 let Ok(path) = r.str(PATH_MAX) else { return malformed() };
-                let ticket = if r.remaining() == 16 { r.array::<16>().ok() } else { None };
+                // A web courier's ticket comes with the request's method and
+                // query: it is redeemed only for exactly that request.
+                let ticket = if r.remaining() > 0 {
+                    match (r.array::<16>(), r.u8(), r.str(QUERY_MAX)) {
+                        (Ok(t), Ok(m), Ok(q)) => Some((t, m, q)),
+                        _ => return malformed(),
+                    }
+                } else { None };
                 if r.end().is_err() || !path.starts_with('/') {
                     return malformed();
                 }
@@ -817,7 +832,7 @@ impl State {
                 // request, and SameSite goes by it. An app's courier has none.
                 let ctx = match (partition, ticket) {
                     (None, None) => None,
-                    (Some(_), Some(t)) => match self.courier_ticket(c, path, &t, true) {
+                    (Some(_), Some((t, m, q))) => match self.courier_ticket(c, path, Some((m, q)), &t, true) {
                         Some(t) => Some(t),
                         None => return reply(status::DENIED),
                     },
@@ -873,6 +888,13 @@ const COOKIE_VALUE_MAX: usize = 4096;
 const COOKIE_ATTRS_MAX: usize = 4096;
 /// A request path as the courier sent it.
 const PATH_MAX: usize = 8192;
+const QUERY_MAX: usize = 8192;
+
+/// A request target's text as the courier's schema admits it: visible
+/// ASCII, no `#`, and in a path no `?`.
+fn uri_text(s: &str, path: bool) -> bool {
+    s.bytes().all(|c| (0x21..=0x7e).contains(&c) && c != b'#' && !(path && c == b'?'))
+}
 
 /// A strong password: four groups of five from [a-zA-Z0-9] joined by '-'
 /// (about 119 bits), typeable on any keyboard and accepted by nearly every

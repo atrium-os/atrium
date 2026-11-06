@@ -66,11 +66,15 @@ impl Vault for Arcad {
         let _ = self.call(courier_op::SET_COOKIE, &w.buf);
     }
 
-    fn cookies(&mut self, path: &str, ticket: Option<&[u8; 16]>) -> Option<LockedBuf> {
+    fn cookies(&mut self, method: crate::schema::Method, path: &str, query: &str, ticket: Option<&[u8; 16]>) -> Option<LockedBuf> {
         let mut w = Writer::new();
         w.str(path);
+        // A ticket is redeemed for exactly this request: its method and
+        // query go with it.
         if let Some(t) = ticket {
             w.raw(t);
+            w.u8(method as u8);
+            w.str(query);
         }
         match self.call(courier_op::COOKIES, &w.buf) {
             Ok((status::OK, b)) if !b.is_empty() => Some(b),
