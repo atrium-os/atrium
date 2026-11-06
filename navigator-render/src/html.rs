@@ -190,6 +190,9 @@ struct Cx<'a> {
     /// Inside a scroll region: a table in it does not open another (the
     /// outer one already scrolls it, and the compositor's model is flat).
     in_scroll: bool,
+    /// Tables already measured by `premeasure_tables`: their (min, max)
+    /// content widths, spacing included, for the cells that contain them.
+    measured_tables: HashMap<Handle, (U, U)>,
     /// The region a box has opened and `block` will close: the attributes
     /// to restore, its clip, its transform, and the content's x, y, width.
     scroll_open: Option<(crate::Attrs, u32, u32, (U, U, U))>,
@@ -368,7 +371,7 @@ fn render_inner(html: &str, fonts: &FontSet, env: &Env, subs: &Subresources, geo
     let mut cx = Cx { dom: &dom, styles: &styled.styles, sh: Shaper::new(fonts), scene: Scene { width: u(env.width_px), ..Default::default() },
                       report: Report::default(), links: vec![], unimplemented: BTreeMap::new(), marker: None, baseline_probe: None, indent: None, iso_paths: vec![vec![]], iso_cur: 0, content_dy: 0, table_part: false, promoted: vec![], boxes: std::env::var_os("NSG_DUMP_BOXES").map(|_| vec![]), geo: None, inl_cur: 0,
                       viewport: (u(env.width_px), Some(u(env.height_px))), pos_cb: (0, 0, u(env.width_px), Some(u(env.height_px))),
-                      subs, placing_abs: false, pending_abs: vec![], deferred_abs: vec![], cb_open: false, canvas_src: None, abs_origin: None, flex_static: None, measured: HashMap::new(), contexts: vec![], hoists: vec![], diagnostics: vec![], vector_budget: crate::path::DOCUMENT_SEGMENT_SHARE, in_scroll: false, scroll_open: None };
+                      subs, placing_abs: false, pending_abs: vec![], deferred_abs: vec![], cb_open: false, canvas_src: None, abs_origin: None, flex_static: None, measured: HashMap::new(), contexts: vec![], hoists: vec![], diagnostics: vec![], vector_budget: crate::path::DOCUMENT_SEGMENT_SHARE, in_scroll: false, scroll_open: None, measured_tables: HashMap::new() };
     if geo { cx.geo = Some(GeoLog { inl_paths: vec![vec![]], ..Default::default() }) }
     cx.promoted = promote_block_in_inline(&dom, &styled.styles);
     cx.count_unread_rows();
@@ -444,10 +447,14 @@ pub fn premeasure_tables_at(html: &str, fonts: &FontSet, env: &Env) -> (String, 
                       report: Report::default(), links: vec![], unimplemented: BTreeMap::new(), marker: None, baseline_probe: None,
                       indent: None, iso_paths: vec![vec![]], iso_cur: 0, content_dy: 0, table_part: false, promoted: vec![], boxes: std::env::var_os("NSG_DUMP_BOXES").map(|_| vec![]), geo: None, inl_cur: 0, viewport: (u(env.width_px), Some(u(env.height_px))),
                       pos_cb: (0, 0, u(env.width_px), Some(u(env.height_px))), subs: &Subresources::new(),
-                      placing_abs: false, pending_abs: vec![], deferred_abs: vec![], cb_open: false, canvas_src: None, abs_origin: None, flex_static: None, measured: HashMap::new(), contexts: vec![], hoists: vec![], diagnostics: vec![], vector_budget: crate::path::DOCUMENT_SEGMENT_SHARE, in_scroll: false, scroll_open: None };
+                      placing_abs: false, pending_abs: vec![], deferred_abs: vec![], cb_open: false, canvas_src: None, abs_origin: None, flex_static: None, measured: HashMap::new(), contexts: vec![], hoists: vec![], diagnostics: vec![], vector_budget: crate::path::DOCUMENT_SEGMENT_SHARE, in_scroll: false, scroll_open: None, measured_tables: HashMap::new() };
     // (table, per-column (min, max), its first row's cells) for every table.
     let mut tables: Vec<(Handle, Vec<(U, U)>, Vec<Handle>)> = vec![];
-    for t in 0..dom.nodes.len() as Handle {
+    // ★ INNER TABLES FIRST: a cell holding a table is as wide as that
+    // table's columns, which are known only once it is measured. In
+    // document order the outer cell met its nested table unmeasured and
+    // came out 1 px short; the nested table overhung it at 200% zoom.
+    for t in (0..dom.nodes.len() as Handle).rev() {
         let Some(ts) = cx.st(t) else { continue };
         if kw(ts, "display") != "table" { continue }
         let sx = match ts.get("border-spacing") { V::Pair(a, _) => len(a, 0).unwrap_or(0), _ => 0 };
@@ -517,8 +524,12 @@ pub fn premeasure_tables_at(html: &str, fonts: &FontSet, env: &Env) -> (String, 
             }
         }
         for i in 0..ncols { maxs[i] = maxs[i].max(mins[i]) }
+        let around = sx * (ncols as U + 1);
+        cx.measured_tables.insert(t, (mins.iter().sum::<U>() + around, maxs.iter().sum::<U>() + around));
         tables.push((t, mins.into_iter().zip(maxs).collect(), rows_cells.first().cloned().unwrap_or_default()));
     }
+    // Declared in document order, as before.
+    tables.reverse();
     let n: usize = tables.iter().map(|(_, c, _)| c.len()).sum();
     if n == 0 { return (html.to_string(), 0) }
     // ★ Emitted as `<col>` DECLARATIONS, one per column, in a `<colgroup>`
@@ -2904,6 +2915,17 @@ impl<'a> Cx<'a> {
                 return (if pct("width") || pct("max-width") { 0 } else { w }, w);
             }
         }
+        // ★ A TABLE's intrinsic widths are its declared columns' (§3.13),
+        // spacing included — what `block` sizes it from. Measured as a
+        // generic block it came out 1 px short of itself inside a cell at
+        // 200% zoom, and a nested table overhung its outer cell.
+        if !anon && kw(s, "display") == "table" {
+            let measured = self.measured_tables.get(&h).copied();
+            if let Some((a, b)) = measured.or_else(|| self.table_content(h, s, 0, false).zip(self.table_content(h, s, 0, true))) {
+                self.links.truncate(links); self.unimplemented = counts; self.pending_abs.truncate(pend);
+                return (a, b.max(a));
+            }
+        }
         // ★ A ROW FLEX CONTAINER is as wide as its items TOGETHER, not as
         // wide as its widest one: they sit side by side. Taking the max —
         // which is right for stacked blocks — measured MDN's breadcrumb as
@@ -5140,7 +5162,7 @@ mod tests {
                           report: Report::default(), links: vec![], unimplemented: BTreeMap::new(), marker: None,
                           baseline_probe: None, indent: None, iso_paths: vec![vec![]], iso_cur: 0, content_dy: 0, table_part: false, promoted: vec![], boxes: std::env::var_os("NSG_DUMP_BOXES").map(|_| vec![]), geo: None, inl_cur: 0,
                           viewport: (0, None), pos_cb: (0, 0, 0, None), subs: &Subresources::new(),
-                          placing_abs: false, pending_abs: vec![], deferred_abs: vec![], cb_open: false, canvas_src: None, abs_origin: None, flex_static: None, measured: HashMap::new(), contexts: vec![], hoists: vec![], diagnostics: vec![], vector_budget: crate::path::DOCUMENT_SEGMENT_SHARE, in_scroll: false, scroll_open: None };
+                          placing_abs: false, pending_abs: vec![], deferred_abs: vec![], cb_open: false, canvas_src: None, abs_origin: None, flex_static: None, measured: HashMap::new(), contexts: vec![], hoists: vec![], diagnostics: vec![], vector_budget: crate::path::DOCUMENT_SEGMENT_SHARE, in_scroll: false, scroll_open: None, measured_tables: HashMap::new() };
         cx.count_rows_outside(&held_out);
         // The non-initial value is counted once; the initial one is not.
         assert_eq!(cx.unimplemented.get("row text-align… (not implemented)"), Some(&1), "{:?}", cx.unimplemented);
