@@ -259,8 +259,8 @@ layer, the display sibling of seat-aware Choragus.
   the core's `handle_intent`; `forum-overview` (list/focus surfaces); the
   `forum-control` capability gating forum-ctl (grant/deny verified); `forum-dock`
   (app catalog + unprivileged launch request to portcullisd); `forum-bar` (session
-  status via ListSurfaces). Remaining: forum-shelf (needs the notification subsystem,
-  not just forum-ctl); the chrome apps DRAWING into their reserved-layer surfaces via
+  status via ListSurfaces). forum-shelf (toasts from praecod, tabula.md §5.1; 2026-11-06,
+  not yet run in-VM); the chrome apps DRAWING into their reserved-layer surfaces via
   Pergola, vs only driving intents/printing today.)*
 - **F4 — layouts as objects.** Tessera-backed save/restore; Stoa-roamed layouts.
 

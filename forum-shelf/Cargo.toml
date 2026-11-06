@@ -1,0 +1,23 @@
+[package]
+name = "forum-shelf"
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+publish = false
+description = "forum-shelf — Forum's notification toasts (docs/spec/forum.md §3, tabula.md §5): subscribes to praecod and draws the toasts with Pergola. Apps never draw their own notifications; the app name shown is the launch registry's, never the post's."
+
+[lib]
+name = "forum_shelf"
+path = "src/lib.rs"
+
+[[bin]]
+name = "forum-shelf"
+path = "src/main.rs"
+
+[dependencies]
+pergola = { path = "../pergola" }
+praeco = { path = "../praeco" }
+aqueduct = { path = "../aqueduct" }
+fresco-protocol = { path = "../fresco-protocol" }
+portcullis-peer = { path = "../portcullis/portcullis-peer" }
+postcard = { version = "1", features = ["use-std"] }

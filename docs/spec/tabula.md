@@ -218,8 +218,14 @@ zero-width characters dropped (so "invoice‮txt.exe" cannot read as a different
 kept as literal text; 3 a burst, 5 a minute per app; `WITHDRAW` only one's own; `SUBSCRIBE` only
 for the uids in `PRAECO_SUBSCRIBERS` (Forum's), which get the history (500) then a stream.
 Each notification carries the registry's user, and Forum shows only its own user's. Not yet:
-actions (need `CLASS_BROKER` delivery and `ACTIVATION_GRANT`), images, per-app mute, the Forum
-toast UI.
+actions (need `CLASS_BROKER` delivery and `ACTIVATION_GRANT`), images, per-app mute.
+
+`forum-shelf/` draws the toasts (Pergola, chrome role): it subscribes to praecod, shows its own
+user's only, three at a time from the top right, low 3 s, normal 5 s, high until dismissed and
+first in the queue; the first line of a toast is the registry's app id, so a title claiming to
+be the system reads as a title under the app's real name. A click dismisses. It runs as an
+ordinary chrome surface until frescod's notification layer exists, and must be listed in
+`PRAECO_SUBSCRIBERS`. Not run on frescod yet.
 
 ## 6. Pergola's part
 
