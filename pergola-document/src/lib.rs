@@ -52,7 +52,7 @@ struct Group {
 /// A document's state: its source, what is resident, and the viewport.
 pub struct Doc {
     source: Box<dyn ContentSource>,
-    faces: Faces,
+    faces: &'static Faces,
     images: Box<dyn Fn(&str) -> Option<Image>>,
     viewport: Viewport,
     groups: BTreeMap<GroupId, Group>,
@@ -91,16 +91,17 @@ fn event(e: source::Event) -> SourceEvent {
 }
 
 impl Doc {
-    /// A document from any band source.
-    pub fn new(source: Box<dyn ContentSource>, fonts: &FontSet, images: impl Fn(&str) -> Option<Image> + 'static) -> Self {
-        Doc { source, faces: Faces::new(fonts), images: Box::new(images), viewport: Viewport::new(), groups: BTreeMap::new(), skipped: Skipped::default() }
+    /// A document from any band source laid out with the shared font set
+    /// (`FontSet::shared`).
+    pub fn new(source: Box<dyn ContentSource>, images: impl Fn(&str) -> Option<Image> + 'static) -> Result<Self, String> {
+        Ok(Doc { source, faces: Faces::shared()?, images: Box::new(images), viewport: Viewport::new(), groups: BTreeMap::new(), skipped: Skipped::default() })
     }
 
     /// A normalized HTML document laid out `width` × `height` CSS px, cut
     /// into bands about a viewport tall.
-    pub fn html(html: String, fonts: &'static FontSet, subs: Subresources, width: f32, height: f32, images: impl Fn(&str) -> Option<Image> + 'static) -> Self {
-        let src = DocumentSource::new(html, fonts, subs, (width as f64, height as f64), (height * 64.0) as i64);
-        Self::new(Box::new(src), fonts, images)
+    pub fn html(html: String, subs: Subresources, width: f32, height: f32, images: impl Fn(&str) -> Option<Image> + 'static) -> Result<Self, String> {
+        let src = DocumentSource::new(html, FontSet::shared()?, subs, (width as f64, height as f64), (height * 64.0) as i64);
+        Self::new(Box::new(src), images)
     }
 
     /// The document's height (px) as known now, and whether it is exact.
@@ -117,7 +118,7 @@ impl Doc {
     /// reader's place, and whether more background work is waiting.
     fn sync(&mut self, top: f64, vh: f64, zoom: f64) -> (f64, bool) {
         let t = (top * 64.0).round() as i64;
-        let mut sink = Sink { faces: &self.faces, images: &*self.images, groups: &mut self.groups, skipped: &mut self.skipped };
+        let mut sink = Sink { faces: self.faces, images: &*self.images, groups: &mut self.groups, skipped: &mut self.skipped };
         let events = match self.viewport.want(t, vh, zoom) {
             Some(w) => self.source.want(
                 source::Want { range: (w.range.start, w.range.end), zoom_64: (zoom * 64.0).round().max(1.0) as u32, prefetch: w.prefetch },

@@ -8,7 +8,6 @@ use std::rc::Rc;
 use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 
-use navigator_render::fontset::FontSet;
 use pergola::app::App;
 use pergola::geom::Rect;
 use pergola::node::{Node, NodeDelta};
@@ -16,10 +15,6 @@ use pergola::reactive::Mutable;
 use pergola::view::{Ctx, View};
 use pergola::widgets::scroll_view::ScrollState;
 use pergola_document::{Doc, DocumentView};
-
-fn fonts() -> &'static FontSet {
-    Box::leak(Box::new(FontSet::load().unwrap()))
-}
 
 fn html(sections: usize) -> String {
     let mut b = String::from(r#"<html><head><style>body { margin: 8px } p { margin: 0px 0px 10px }
@@ -54,7 +49,7 @@ fn a_long_document_scrolls_with_a_few_screens_resident() {
     let dirty = Arc::new(AtomicBool::new(true));
     let state = Mutable::with_dirty(ScrollState::default(), dirty.clone());
     let more = Mutable::with_dirty(0u64, dirty.clone());
-    let doc = Rc::new(RefCell::new(Doc::html(html(200), fonts(), Default::default(), 800.0, 600.0, |_| None)));
+    let doc = Rc::new(RefCell::new(Doc::html(html(200), Default::default(), 800.0, 600.0, |_| None).unwrap()));
     let view = DocumentView::new(state.clone(), Rect::new(0.0, 0.0, 800.0, 600.0), doc.clone(), more);
     let mut app = App::new_with_flag(Page { view }, dirty);
 

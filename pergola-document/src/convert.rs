@@ -26,6 +26,13 @@ impl Faces {
     pub fn new(fonts: &FontSet) -> Self {
         Faces(fonts.faces.iter().map(|f| Face::new(f.bytes.clone(), 0)).collect())
     }
+
+    /// The shared set's faces, registered once per process (so every
+    /// document in a window shares atlas entries).
+    pub fn shared() -> Result<&'static Faces, String> {
+        static F: std::sync::OnceLock<Result<Faces, String>> = std::sync::OnceLock::new();
+        F.get_or_init(|| FontSet::shared().map(Faces::new)).as_ref().map_err(Clone::clone)
+    }
 }
 
 /// What a conversion left out, counted.
