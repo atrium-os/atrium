@@ -71,10 +71,11 @@ pub enum Event {
     FocusChanged   { window_id: u32, gained: bool },
     CloseRequested { window_id: u32 },
     DpiChanged     { window_id: u32, scale_factor: f32 },
-    /// The fills of this window that are not drawn (each with a
-    /// `fresco_protocol::fill_drop` reason): sent when that set changes,
-    /// so an empty list means all of them draw again. Draw a dropped
-    /// one some other way, as a bitmap say.
+    /// The nodes of this window that are not drawn (each with a
+    /// `fresco_protocol::fill_drop` reason): fills Fresco cannot tile, and
+    /// with `OP_BUDGET` any node past the window's 65,536-op budget. Sent
+    /// when that set changes, so an empty list means all of them draw
+    /// again. Draw a dropped one some other way (a bitmap), or send less.
     FillsDropped   { window_id: u32, dropped: Vec<fresco_protocol::FillDrop> },
     /// A surface was created in this session. Window managers reconcile on
     /// this; ordinary clients ignore it (it's about other surfaces).

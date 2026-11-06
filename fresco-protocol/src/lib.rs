@@ -163,7 +163,8 @@ pub mod control {
     /// every event; the WM is the consumer that cares.
     pub const EV_WINDOW_CREATED:         u16 = 0x0584;
     pub const EV_WINDOW_DESTROYED:       u16 = 0x0585;
-    /// Fills of the window frescod is not drawing because of a limit
+    /// Nodes of the window frescod is not drawing because of a limit:
+    /// fills it cannot tile, any node past the op budget
     /// (`WindowFillsDroppedEvent`), sent whenever that set changes.
     pub const EV_WINDOW_FILLS_DROPPED:   u16 = 0x0587;
     /// The display's mode changed (a mode switch, or a monitor plugged in
@@ -820,7 +821,8 @@ pub struct WindowDestroyedEvent {
     pub window_id: u32,
 }
 
-/// Why a fill is not drawn ([`FillDrop::reason`]).
+/// Why a node is not drawn ([`FillDrop::reason`]). All but `OP_BUDGET`
+/// are about fills.
 pub mod fill_drop {
     /// It flattens to more than 65,536 lines.
     pub const TOO_MANY_LINES: u8 = 1;
@@ -834,17 +836,25 @@ pub mod fill_drop {
     /// Malformed geometry (a broker in front of frescod refuses these
     /// before they arrive).
     pub const MALFORMED: u8 = 5;
+    /// The window's frame passed 65,536 kernel ops after culling (every
+    /// glyph is one). This node and every node painted after it are not
+    /// drawn; fewer or smaller nodes (a glyph run drawn as an image) fit.
+    /// Any node kind.
+    pub const OP_BUDGET: u8 = 6;
 }
 
+/// A node that is not drawn: any kind for `OP_BUDGET`, else a fill.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FillDrop {
     pub node_id: u32,
     pub reason: u8,
 }
 
-/// `EV_WINDOW_FILLS_DROPPED` — every fill of the window that is not being
-/// drawn, and why. Sent when the set changes; an empty list means all are
-/// drawn again. A client can draw a dropped one another way (a bitmap).
+/// `EV_WINDOW_FILLS_DROPPED` — every node of the window that is not being
+/// drawn, and why: fills Fresco cannot tile, and any node past the op
+/// budget (`fill_drop::OP_BUDGET`). Sent when the set changes; an empty
+/// list means all are drawn again. A client can draw a dropped one
+/// another way (a bitmap), or send less.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct WindowFillsDroppedEvent {
     pub window_id: u32,

@@ -166,6 +166,21 @@ pub struct GlyphBatch {
     pub runs: Vec<GlyphRun>,
 }
 
+/// A node of a [`Scene`], as pack reports one it did not draw.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub enum Node {
+    /// Index into [`Scene::rects`].
+    Rect(usize),
+    /// Index into [`Scene::paths`].
+    Path(usize),
+    /// Index into [`Scene::fills`].
+    Fill(usize),
+    /// Batch and quad of [`Scene::texture_batches`].
+    Quad(usize, usize),
+    /// Batch and run of [`Scene::glyph_batches`].
+    Run(usize, usize),
+}
+
 /// Everything one frame draws.
 #[derive(Clone, Debug, Default)]
 pub struct Scene {
@@ -261,6 +276,52 @@ fn bbox(x0: f32, y0: f32, x1: f32, y1: f32) -> [f32; 4] {
     [x0.floor(), y0.floor(), x1.ceil(), y1.ceil()]
 }
 
+/// Bring `ops` (packed from `scene`, `fill_nodes` naming the fills drawn)
+/// within [`MAX_OPS`]: drop the ops off the target, then every node from
+/// the one holding op `MAX_OPS` on, whole, reporting those as `OP_BUDGET`.
+/// Frames within the cap never come here, so they pack as before.
+fn budget(scene: &Scene, fill_nodes: &[usize], ops: &mut Vec<Op>, width: u32, height: u32, dropped: &mut Vec<(Node, u8)>) {
+    // The node of each op, in pack order.
+    let mut owner = Vec::with_capacity(ops.len());
+    owner.extend((0..scene.rects.len()).map(Node::Rect));
+    owner.extend((0..scene.paths.len()).map(Node::Path));
+    owner.extend(fill_nodes.iter().map(|&k| Node::Fill(k)));
+    for (b, t) in scene.texture_batches.iter().enumerate() {
+        owner.extend((0..t.quads.len()).map(|q| Node::Quad(b, q)));
+    }
+    for (b, g) in scene.glyph_batches.iter().enumerate() {
+        for (r, run) in g.runs.iter().enumerate() {
+            owner.extend(std::iter::repeat_n(Node::Run(b, r), run.glyphs.len()));
+        }
+    }
+    debug_assert_eq!(owner.len(), ops.len());
+    // Culled: no pixel centre of the target inside its box (raster
+    // clips every op to p3, so these draw nothing).
+    let (w, h) = (width as f32, height as f32);
+    let on = |o: &Op| {
+        let [x0, y0, x1, y1] = o.p3;
+        x0 < w && y0 < h && x1 > 0.0 && y1 > 0.0 && x1 > x0 && y1 > y0
+    };
+    let kept: Vec<(Op, Node)> = ops.iter().zip(owner).filter(|(o, _)| on(o)).map(|(o, n)| (*o, n)).collect();
+    ops.clear();
+    let cap = MAX_OPS as usize;
+    if kept.len() <= cap {
+        ops.extend(kept.into_iter().map(|(o, _)| o));
+        return;
+    }
+    // The node that crosses the cap goes whole, with all after it.
+    let first = kept[cap].1;
+    let cut = kept[..cap].iter().position(|(_, n)| *n == first).unwrap_or(cap);
+    ops.extend(kept[..cut].iter().map(|(o, _)| *o));
+    let mut last = None;
+    for (_, n) in &kept[cut..] {
+        if last != Some(*n) {
+            dropped.push((*n, fill::drop::OP_BUDGET));
+            last = Some(*n);
+        }
+    }
+}
+
 impl Frame {
     /// Pack `scene` for a `width` x `height` target with `pitch` pixels per
     /// line.
@@ -268,9 +329,12 @@ impl Frame {
         Self::pack_report(scene, width, height, pitch).0
     }
 
-    /// [`Frame::pack`], and the fills it did not draw: `(index into
-    /// scene.fills, fill::drop reason)`. A culled fill is not listed.
-    pub fn pack_report(scene: &Scene, width: u32, height: u32, pitch: u32) -> (Frame, Vec<(usize, u8)>) {
+    /// [`Frame::pack`], and the nodes it did not draw, with a `fill::drop`
+    /// reason: the fills it could not tile, then, when the frame passes
+    /// [`MAX_OPS`] ops after culling, every node in paint order from the
+    /// one that crosses it on (`OP_BUDGET`). A node that is off the target
+    /// (culled) is not listed.
+    pub fn pack_report(scene: &Scene, width: u32, height: u32, pitch: u32) -> (Frame, Vec<(Node, u8)>) {
         Self::pack_cached(scene, width, height, pitch, None)
     }
 
@@ -282,7 +346,7 @@ impl Frame {
         height: u32,
         pitch: u32,
         mut cache: Option<&mut fill::FillCache>,
-    ) -> (Frame, Vec<(usize, u8)>) {
+    ) -> (Frame, Vec<(Node, u8)>) {
         assert!(pitch >= width);
         let mut dropped = Vec::new();
         let mut ops = Vec::new();
@@ -329,6 +393,7 @@ impl Frame {
         }
         // Filled paths: each one's tiled block in `texels` (see `fill`).
         let mut fill_ops = Vec::new();
+        let mut fill_nodes = Vec::new();
         let (mut lines_total, mut indices_total) = (0usize, 0usize);
         if let Some(c) = cache.as_deref_mut() {
             c.begin();
@@ -342,14 +407,15 @@ impl Frame {
                 Ok(p) => p,
                 Err(fill::CULLED) => continue,
                 Err(why) => {
-                    dropped.push((k, *why));
+                    dropped.push((Node::Fill(k), *why));
                     continue;
                 }
             };
             if lines_total + p.lines > fill::MAX_FRAME_SEGMENTS || indices_total + p.indices > fill::MAX_FRAME_INDICES {
-                dropped.push((k, fill::drop::FRAME_BUDGET));
+                dropped.push((Node::Fill(k), fill::drop::FRAME_BUDGET));
                 continue;
             }
+            fill_nodes.push(k);
             lines_total += p.lines;
             indices_total += p.indices;
             let base = texels.len();
@@ -397,6 +463,9 @@ impl Frame {
                     });
                 }
             }
+        }
+        if ops.len() > MAX_OPS as usize {
+            budget(scene, &fill_nodes, &mut ops, width, height, &mut dropped);
         }
         if tex.is_empty() {
             tex.push([0; 4]);

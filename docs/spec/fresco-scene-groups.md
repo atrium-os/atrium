@@ -92,9 +92,10 @@ the same frame; frescod applies a frame atomically, so nothing is drawn half pla
 - **Limits** (per window, refused past them): depth ≤ 32, groups ≤ 4,096 (agreed with the Fresco
   owners 2026-11-06). Transforms are composed in f64 and the tree is walked iteratively.
 - **Op budget.** A window frame holds at most `MAX_OPS` = 65,536 kernel ops after culling, and every
-  glyph is an op. Today pack does not cap, so a frame past it fails validation and the window does
-  not draw at all (a bug now). Pack culls by clip first, then drops ops past the cap and reports
-  them, through the dropped-fill event generalised to any node (Fresco owners).
+  glyph is an op. Pack culls by clip first, then drops whole nodes from the one that crosses the cap
+  and reports them with reason `fill_drop::OP_BUDGET` (6), through `EV_WINDOW_FILLS_DROPPED`, which
+  now names any node kind. Frames within the cap pack unchanged. Done (Fresco owners, 2026-11-06);
+  before it, a frame past the cap failed validation and the window did not draw at all.
 - **Validation** as for fills: finite values, coordinates within ±`FILL_MAX_COORD`, `0 ≤ opacity ≤ 1`,
   a v1 transform that is not translate + positive uniform scale is refused.
 

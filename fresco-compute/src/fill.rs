@@ -324,14 +324,18 @@ pub fn flatten(f: &Fill) -> Option<Vec<[f32; 4]>> {
     (out.len() <= MAX_PATH_SEGMENTS && out.iter().flatten().all(|c| c.is_finite())).then_some(out)
 }
 
-/// Why [`crate::Frame::pack_report`] did not draw a fill (the values of
-/// `fresco_protocol::fill_drop`).
+/// Why [`crate::Frame::pack_report`] did not draw a node (the values of
+/// `fresco_protocol::fill_drop`). Only `OP_BUDGET` applies to nodes other
+/// than fills.
 pub mod drop {
     pub const TOO_MANY_LINES: u8 = 1;
     pub const TILE_TOO_DENSE: u8 = 2;
     pub const FRAME_BUDGET: u8 = 3;
     pub const BAD_PAINT: u8 = 4;
     pub const MALFORMED: u8 = 5;
+    /// The frame passed [`crate::MAX_OPS`] ops after culling; the node and
+    /// every one painted after it are not drawn.
+    pub const OP_BUDGET: u8 = 6;
 }
 
 /// Paint kinds in a block's header word 8.

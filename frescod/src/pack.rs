@@ -33,6 +33,13 @@ pub struct WindowFrame {
     pub fills: Vec<fresco_compute::fill::Fill>,
     /// The node id of each of `fills`, for reporting drops.
     pub fill_ids: Vec<u32>,
+    /// The node ids of `rects`, `paths`, each batch's nodes and each glyph
+    /// batch's runs, for reporting drops (empty when there are none to
+    /// report, as for the chrome).
+    pub rect_ids: Vec<u32>,
+    pub path_ids: Vec<u32>,
+    pub quad_ids: Vec<Vec<u32>>,
+    pub run_ids: Vec<Vec<u32>>,
 }
 
 /// A window's finished pixels, BGRA8, `width * height` words.
@@ -201,8 +208,8 @@ impl SceneState {
         self.pack_report(f, width, height).0
     }
 
-    /// `pack`, also naming the fills that were dropped (by node id, with
-    /// a `fresco_protocol::fill_drop` reason), in node id order.
+    /// `pack`, also naming the nodes that were dropped (by node id, with
+    /// a `fresco_protocol::fill_drop` reason).
     pub fn pack_report(&self, f: &WindowFrame, width: u32, height: u32) -> (fresco_compute::Frame, Vec<(u32, u8)>) {
         use fresco_compute as fc;
         let mut scene = fc::Scene {
@@ -225,15 +232,20 @@ impl SceneState {
             index.insert(slot, scene.textures.len() - 1);
             Some(scene.textures.len() - 1)
         };
-        for b in &f.batches {
+        // The frame's batch of each of the scene's (a batch whose slot is
+        // gone is left out).
+        let (mut quad_of, mut run_of) = (Vec::new(), Vec::new());
+        for (i, b) in f.batches.iter().enumerate() {
             let Some(texture) = tex_index(b.slot_id, &mut scene) else { continue };
+            quad_of.push(i);
             scene.texture_batches.push(fc::TextureBatch {
                 texture,
                 quads: b.nodes.iter().map(|n| n.model).collect(),
             });
         }
-        for b in &f.glyph_batches {
+        for (i, b) in f.glyph_batches.iter().enumerate() {
             let Some(atlas) = tex_index(b.atlas_slot_id, &mut scene) else { continue };
+            run_of.push(i);
             let runs = b.nodes.iter().map(|n| {
                 let (count, off) = (n.meta[0].max(0) as usize, n.meta[1].max(0) as usize);
                 let glyphs = b.glyphs.get(off..off + count).unwrap_or(&[]);
@@ -256,9 +268,16 @@ impl SceneState {
         if f.id != 0 {
             frame.header.clear = fc::TRANSPARENT;
         }
-        let drops = drops.into_iter()
-            .filter_map(|(i, why)| Some((*f.fill_ids.get(i)?, why)))
-            .collect();
+        let id = |n: fc::Node| -> Option<u32> {
+            match n {
+                fc::Node::Rect(i) => f.rect_ids.get(i).copied(),
+                fc::Node::Path(i) => f.path_ids.get(i).copied(),
+                fc::Node::Fill(i) => f.fill_ids.get(i).copied(),
+                fc::Node::Quad(b, q) => f.quad_ids.get(*quad_of.get(b)?)?.get(q).copied(),
+                fc::Node::Run(b, r) => f.run_ids.get(*run_of.get(b)?)?.get(r).copied(),
+            }
+        };
+        let drops = drops.into_iter().filter_map(|(n, why)| Some((id(n)?, why))).collect();
         (frame, drops)
     }
 }
@@ -284,11 +303,13 @@ pub fn window_frame(fe: &EnvelopeFrontend, id: u32, pos: (f32, f32), size: (f32,
     let mut rect_ids: Vec<&u32> = state.rect_nodes.keys().collect();
     rect_ids.sort_unstable();
     for id in rect_ids {
+        w.rect_ids.push(*id);
         w.rects.push(translate_rect(&state.rect_nodes[id], 0.0, 0.0));
     }
     let mut path_ids: Vec<&u32> = state.path_nodes.keys().collect();
     path_ids.sort_unstable();
     for id in path_ids {
+        w.path_ids.push(*id);
         w.paths.push(translate_path(&state.path_nodes[id], 0.0, 0.0));
     }
     let mut fill_ids: Vec<&u32> = state.fill_nodes.keys().collect();
@@ -297,34 +318,37 @@ pub fn window_frame(fe: &EnvelopeFrontend, id: u32, pos: (f32, f32), size: (f32,
         w.fill_ids.push(*id);
         w.fills.push(translate_fill(&state.fill_nodes[id]));
     }
-    let mut tex_by_slot: std::collections::BTreeMap<u32, Vec<TextureNode>> =
+    let mut tex_by_slot: std::collections::BTreeMap<u32, (Vec<TextureNode>, Vec<u32>)> =
         std::collections::BTreeMap::new();
     let mut tex_ids: Vec<&u32> = state.texture_nodes.keys().collect();
     tex_ids.sort_unstable();
     for id in tex_ids {
         let p = &state.texture_nodes[id];
-        tex_by_slot.entry(p.slot_id).or_default()
-            .push(translate_texture(p, 0.0, 0.0));
+        let e = tex_by_slot.entry(p.slot_id).or_default();
+        e.0.push(translate_texture(p, 0.0, 0.0));
+        e.1.push(*id);
     }
-    w.batches = tex_by_slot.into_iter()
-        .map(|(slot_id, nodes)| TextureBatch { slot_id, nodes })
-        .collect();
+    for (slot_id, (nodes, ids)) in tex_by_slot {
+        w.batches.push(TextureBatch { slot_id, nodes });
+        w.quad_ids.push(ids);
+    }
     /* glyph_run nodes grouped by atlas slot. Each batch's `glyphs`
      * vector concatenates all runs in slot, with each node's
      * meta[1] (glyph_offset) pointing at this batch's slice. */
-    let mut glyph_by_slot: std::collections::BTreeMap<u32, GlyphRunBatch> =
+    let mut glyph_by_slot: std::collections::BTreeMap<u32, (GlyphRunBatch, Vec<u32>)> =
         std::collections::BTreeMap::new();
     let mut glyph_ids: Vec<&u32> = state.glyph_run_nodes.keys().collect();
     glyph_ids.sort_unstable();
     for id in glyph_ids {
         let p = &state.glyph_run_nodes[id];
-        let entry = glyph_by_slot
+        let (entry, ids) = glyph_by_slot
             .entry(p.atlas_slot_id)
-            .or_insert_with(|| GlyphRunBatch {
+            .or_insert_with(|| (GlyphRunBatch {
                 atlas_slot_id: p.atlas_slot_id,
                 nodes:  Vec::new(),
                 glyphs: Vec::new(),
-            });
+            }, Vec::new()));
+        ids.push(*id);
         let glyph_offset = entry.glyphs.len() as i32;
         entry.nodes.push(GlyphRunNode {
             origin: [p.x, p.y, 0.0, 0.0],
@@ -343,7 +367,10 @@ pub fn window_frame(fe: &EnvelopeFrontend, id: u32, pos: (f32, f32), size: (f32,
             });
         }
     }
-    w.glyph_batches = glyph_by_slot.into_values().collect();
+    for (b, ids) in glyph_by_slot.into_values() {
+        w.glyph_batches.push(b);
+        w.run_ids.push(ids);
+    }
     Some(w)
 }
 
@@ -442,5 +469,45 @@ mod advance_tests {
             assert_eq!((latest.gen, latest.seq), (step, step as u32));
             assert_eq!(latest.since[0], (step - 1, [x0, y0, x1, y1]));
         }
+    }
+}
+
+#[cfg(test)]
+mod budget_tests {
+    use super::*;
+
+    /// Past the op budget, drops come back as the dropped nodes' ids,
+    /// across a glyph batch whose atlas is gone (left out of the scene).
+    #[test]
+    fn budget_drops_are_reported_by_node_id() {
+        let mut s = SceneState::default();
+        s.slots.insert(9, fresco_compute::Texture {
+            width: 8, height: 8, format: fresco_compute::TexFormat::R8, data: vec![255; 64],
+        });
+        let n = fresco_compute::MAX_OPS as usize - 2;
+        let rect = |i: usize| SceneNode {
+            position: [(i % 60) as f32, (i / 60 % 60) as f32], size: [2.0, 2.0],
+            color: [1.0, 0.0, 0.0, 1.0], ..Default::default()
+        };
+        let g = GlyphInstance { atlas_uv: [0.0, 0.0, 4.0, 4.0], bearing: [0.0, 4.0], ..Default::default() };
+        let run = |off: i32, count: i32| GlyphRunNode {
+            origin: [5.0, 20.0, 0.0, 0.0], color: [0.0, 0.0, 0.0, 1.0], meta: [count, off, 0, 0], ..Default::default()
+        };
+        let f = WindowFrame {
+            id: 1,
+            size: (64, 64),
+            rects: (0..n).map(rect).collect(),
+            rect_ids: (0..n as u32).map(|i| 1000 + i).collect(),
+            glyph_batches: vec![
+                GlyphRunBatch { atlas_slot_id: 5, nodes: vec![run(0, 3)], glyphs: vec![g; 3] },
+                GlyphRunBatch { atlas_slot_id: 9, nodes: vec![run(0, 5), run(5, 1)], glyphs: vec![g; 6] },
+            ],
+            run_ids: vec![vec![7], vec![20, 21]],
+            ..Default::default()
+        };
+        let (frame, drops) = s.pack_report(&f, 64, 64);
+        assert_eq!(frame.header.op_count as usize, n);
+        let why = fresco_protocol::fill_drop::OP_BUDGET;
+        assert_eq!(drops, vec![(20, why), (21, why)]);
     }
 }

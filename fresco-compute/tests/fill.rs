@@ -232,10 +232,10 @@ fn dropped_fills_are_reported_with_why() {
     let scene = Scene { fills: vec![tri(), malformed, bad_paint, long, dense, culled], ..Default::default() };
     let (frame, dropped) = Frame::pack_report(&scene, 64, 64, 64);
     assert_eq!(dropped, vec![
-        (1, drop::MALFORMED),
-        (2, drop::BAD_PAINT),
-        (3, drop::TOO_MANY_LINES),
-        (4, drop::TILE_TOO_DENSE),
+        (Node::Fill(1), drop::MALFORMED),
+        (Node::Fill(2), drop::BAD_PAINT),
+        (Node::Fill(3), drop::TOO_MANY_LINES),
+        (Node::Fill(4), drop::TILE_TOO_DENSE),
     ]);
     assert_eq!(frame.header.op_count, 1, "only the good one draws; the culled one is not a drop");
 }

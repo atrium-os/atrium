@@ -136,7 +136,7 @@ fn an_over_dense_path_is_dropped_with_reason_2_and_its_fallback_takes_its_place(
     let dense_at = fills.len();
     fills.push(translate_fill(&path::fill_params(&dense, None)));
     let (_, dropped) = Frame::pack_report(&Scene { fills, ..Default::default() }, W, H, W);
-    assert_eq!(dropped, vec![(dense_at, fresco_protocol::fill_drop::TILE_TOO_DENSE)], "dropped as too dense, and only it");
+    assert_eq!(dropped, vec![(fresco_compute::Node::Fill(dense_at), fresco_protocol::fill_drop::TILE_TOO_DENSE)], "dropped as too dense, and only it");
     // The UI's answer to the drop: the SVG's bitmap fallback.
     let (first, n, image) = path::fallback_for(&o.scene, 0).expect("a fallback for the first SVG");
     assert!(*n > 0 && *first == 0 && image.address.starts_with("blake3:"));

@@ -73,9 +73,10 @@ pub enum DisplayEvent {
     /// Pointer scroll (wheel / two-finger). `dy > 0` = content scrolls
     /// down (matches macOS/Wayland convention).
     InputPointerScroll { window_id: u32, dx: f32, dy: f32 },
-    /// The fills of this window that are not drawn, by node id with a
-    /// `fresco_protocol::fill_drop` reason. Sent whenever the set
-    /// changes, so an empty list says every fill draws again.
+    /// The nodes of this window that are not drawn (fills, or any node
+    /// past the op budget), by node id with a `fresco_protocol::fill_drop`
+    /// reason. Sent whenever the set changes, so an empty list says every
+    /// node draws again.
     WindowFillsDropped { window_id: u32, dropped: Vec<(u32, u8)> },
 }
 
@@ -463,7 +464,7 @@ impl Compositor {
         }
     }
 
-    /// Record which of window `id`'s fills the last drawing dropped
+    /// Record which of window `id`'s nodes the last drawing dropped
     /// (node id, `fresco_protocol::fill_drop` reason), telling its owner
     /// with `WindowFillsDropped` only when that set changes.
     pub fn set_fill_drops(&mut self, id: WindowId, dropped: Vec<(u32, u8)>) {
