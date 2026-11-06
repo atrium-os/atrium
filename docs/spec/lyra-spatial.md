@@ -1,6 +1,6 @@
 # Lyra: multichannel output and spatial audio
 
-Status: **accepted 2026-11-06** (Shankar agreed with all five §5 decisions). M1 (§2) and S1 (§3.1) are built; S2 waits for an app that needs objects. Follows
+Status: **accepted 2026-11-06** (Shankar agreed with all five §5 decisions). M1 (§2), S1 (§3.1) and S3 (FABIAN HRTFs, chosen by Shankar 2026-11-06) are built; S2 waits for an app that needs objects. Follows
 [lyra-v1.md](lyra-v1.md), which is built. Architecture: [atrium-lyra-architecture.md](atrium-lyra-architecture.md)
 §12 gap 2 (channel layouts, surround, spatial).
 
@@ -74,9 +74,16 @@ at ±30°, so it gains externalisation without being smeared.
   louder); bypassed streams add to the device mix after it, bit-perfect. The stream gain now
   ramps per frame, so a ramp takes as long in 7.1 as in stereo.
 - **Cost:** 8 renderers per device period, fixed, independent of the number of apps.
-- **Quality:** today's renderer is ITD/ILD only. A measured HRTF (convolution per virtual
-  speaker, with the partitioned-FFT convolver `lyra::convolve`) is the upgrade; it needs a
-  freely licensed HRTF set (e.g. MIT KEMAR, SADIE II: to be checked before shipping).
+- **Quality (S3, built):** the bed renders through measured HRTFs from the FABIAN database
+  (CC BY 4.0; survey and measurements in [lyra-hrtf-survey.md](lyra-hrtf-survey.md)).
+  `scripts/hrtf-bed.py` picks the eight bed directions, diffuse-field equalises them with
+  FABIAN's own CTF, resamples to 48 kHz, cuts to 256 taps and scales them so stereo stays as
+  loud on average; the result is `lyra/data/hrtf-bed-fabian-48k.bin` (16 KB, credited in
+  `lyra/data/README.md`), built into lyrad. `lyra::convolve::PartitionedConvolver` renders
+  it: overlap-save in blocks of the period (128 frames, so no added latency), two inputs
+  per FFT and both ears in one complex spectrum; about 0.8% of one x86 core. At another
+  device rate, or a period with no power-of-two block of at least 16, lyrad falls back to
+  the ITD/ILD model.
 
 ### 3.2 Object audio for apps (games, VR, immersive media)
 
@@ -118,7 +125,7 @@ smoothing position changes so a jump doesn't click.
 | M2 | VM check (QEMU's HDA codec is stereo only: today's check proves the fallback, sound(4) refusing 6 channels bit-perfect and lyrad staying at 2; the 5.1 path needs real hardware or a multichannel codec): 5.1 stream on a 5.1 output reaches all six channels untouched; on stereo, the downmix levels | M1 |
 | S1 ✓ | Headphone virtual surround: virtual 7.1 bed + 8 binaural renderers, spatial switch per output, Pro/user bypass | M1 |
 | S2 | Object streams: `Open` with objects, object page (app writes, lyrad reads, sanitised), per-period rendering to speakers or headphones, caps | M1 |
-| S3 | HRTF upgrade for S1/S2 once a licence-clean HRTF set is chosen (candidates: [lyra-hrtf-survey.md](lyra-hrtf-survey.md)) | S1 |
+| S3 ✓ | HRTF upgrade for S1 (FABIAN; S2 gets it when objects land, from a decimated full grid) | S1 |
 
 ## 5. Decisions, with recommendations
 

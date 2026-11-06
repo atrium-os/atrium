@@ -103,6 +103,13 @@ boot() {
     else
         MACH="-machine virt,gic-version=3 -accel tcg,thread=multi -cpu max,pauth-impdef=on"
     fi
+    # ICOUNT=<shift>: deterministic virtual time (one instruction = 2^shift
+    # ns; idle time skipped). The guest's clock and every device, the sound
+    # card included, then run on the same clock however slow the emulation
+    # is: for the Lyra clock test (lyra-vm-check.sh clock). Single-threaded.
+    if [ -n "${ICOUNT:-}" ]; then
+        MACH="$(echo "$MACH" | sed 's/thread=multi/thread=single/') -icount shift=$ICOUNT,sleep=off"
+    fi
     # Disks. vm.qcow2 is the ZFS root. A Tessera devroot ($VMDIR/devroot.img,
     # built by scripts/build-tessera-devroot.sh) rides along as the second
     # disk; TESSERA_ROOT=1 puts it FIRST (vtbd0, bootindex 0) so its loader
@@ -227,6 +234,10 @@ setup() {
     [ -f "$SYSROOT/usr/lib/Scrt1.o" ] || die "sysroot has no Scrt1.o"
     echo "  $(du -sh "$SYSROOT" | cut -f1) in $SYSROOT"
 
+    # SETUP_VM_ONLY=1: stop at a booted, reachable guest (no cross build of
+    # the portcullis stack), e.g. on a host that runs prebuilt binaries.
+    [ "${SETUP_VM_ONLY:-0}" = 1 ] && return
+
     say "portcullis stack (deploy-portcullis.sh)"
     cross_env
     RUSTFLAGS="$CROSS_RUSTFLAGS" sh "$ROOT/scripts/deploy-portcullis.sh" 2>&1 \
@@ -267,7 +278,7 @@ case "${1:-}" in
                sleep 3
            done; echo "  down" ;;
     e2e)   e2e ;;
-    lyra)  cross_env; sh "$ROOT/scripts/lyra-vm-check.sh" ;;
+    lyra)  cross_env; shift; sh "$ROOT/scripts/lyra-vm-check.sh" "$@" ;;
     env)   cross_env ;;
     *)     sed -n '2,20p' "$0"; exit 2 ;;
 esac

@@ -56,6 +56,9 @@ pub struct UserVolumes {
     pub master_muted: bool,
     #[serde(default)]
     pub apps: BTreeMap<String, Level>,
+    /// Titles and artists on the lock screen (atrium-player-pip-keys.md §4.5).
+    #[serde(default)]
+    pub lock_titles: bool,
 }
 
 fn one() -> f32 {
@@ -64,7 +67,7 @@ fn one() -> f32 {
 
 impl Default for UserVolumes {
     fn default() -> Self {
-        UserVolumes { master: 1.0, master_muted: false, apps: BTreeMap::new() }
+        UserVolumes { master: 1.0, master_muted: false, apps: BTreeMap::new(), lock_titles: false }
     }
 }
 

@@ -2,26 +2,30 @@
 //! window, for checking them on a live frescod (headless: its PNG is the
 //! screenshot). Runs `SHOWCASE_SECS` (default 40) then exits.
 //!
-//!   FRESCO_SOCKET=… showcase [dark]
+//!   FRESCO_SOCKET=… showcase [dark] [dialog]
 
 use std::cell::RefCell;
 use std::rc::Rc;
 use std::time::{Duration, Instant};
 
-use pergola::geom::{Point, Rect, Size};
+use pergola::geom::{Axis, Point, Rect, Size};
+use pergola::layout::{Align, FlexStyle, Grid, Track};
 use pergola::node::Node;
 use pergola::shape::{Paint, PathData, Shape, Stroke};
 use pergola::text_edit::TextEdit;
-use pergola::theme::{font, type_size, Semantic, Weight};
+use pergola::theme::{font, space, type_size, Semantic, Weight};
 use pergola::view::{Ctx, View};
 use pergola::widgets::canvas::{Canvas, Item};
-use pergola::widgets::{Check, Checkbox, ScrollState, Segmented, Slider, Tabs, Toggle};
+use pergola::widgets::{Check, Checkbox, Dialog, DialogButton, Dropdown, GroupBox, MenuState, ScrollState, Section, Segmented, Slider, Tabs, Toggle};
 use pergola::{App, Button, Color, Mutable, SizeSpec, TextField, TextStyle, Window, WindowDesc};
 use pergola_document::{Doc, DocumentView};
 
 struct Show {
     name: Mutable<TextEdit>,
     check: Mutable<Check>,
+    dialog: Mutable<bool>,
+    plan: Mutable<usize>,
+    plan_menu: Mutable<MenuState>,
     toggle: Mutable<bool>,
     seg: Mutable<usize>,
     tab: Mutable<usize>,
@@ -31,7 +35,16 @@ struct Show {
     doc: DocumentView,
 }
 
-fn label(ctx: &mut Ctx, x: f32, y: f32, s: &str) {
+fn text(ctx: &mut Ctx, s: &str) {
+    let t = ctx.theme;
+    ctx.add(Node::Text {
+        rect: Rect::ZERO_SIZED,
+        content: s.into(),
+        style: TextStyle { family: font::SANS.into(), size: type_size::MD, weight: Weight::Regular, color: t.text_primary() },
+    });
+}
+
+fn heading(ctx: &mut Ctx, x: f32, y: f32, s: &str) {
     let t = ctx.theme;
     ctx.add(Node::Text {
         rect: Rect::new(x, y, 0.0, 0.0),
@@ -40,29 +53,70 @@ fn label(ctx: &mut Ctx, x: f32, y: f32, s: &str) {
     });
 }
 
+/// A row of controls on one baseline.
+fn row(ctx: &mut Ctx, gap: f32, f: impl FnOnce(&mut Ctx)) {
+    let r = ctx.push(Node::stack(Axis::Horizontal, Rect::ZERO_SIZED, gap));
+    ctx.set_flex(r, FlexStyle { align: Align::Baseline, ..FlexStyle::default() });
+    f(ctx);
+    ctx.pop();
+}
+
 impl View for Show {
     fn render(&self, ctx: &mut Ctx) {
         let t = ctx.theme;
         ctx.add(Node::Rect { rect: Rect::new(0.0, 0.0, 1280.0, 800.0), fill: t.bg_surface(), radius: 0.0 });
-        label(ctx, 24.0, 20.0, "Controls");
-        Button::primary("Save").at(24.0, 48.0).width(96.0).on_click(|| {}).render(ctx);
-        Button::secondary("Cancel").at(128.0, 48.0).width(96.0).on_click(|| {}).render(ctx);
-        Button::ghost("More").at(232.0, 48.0).width(80.0).on_click(|| {}).tooltip("More actions").render(ctx);
-        Button::destructive("Delete").at(320.0, 48.0).width(96.0).on_click(|| {}).render(ctx);
-        TextField::new(self.name.clone()).placeholder("Your name").at(24.0, 100.0).width(392.0).render(ctx);
-        Checkbox::new(self.check.clone(), "Remember me").at(24.0, 152.0).render(ctx);
-        Toggle::new(self.toggle.clone(), "Wi-Fi").at(220.0, 152.0).render(ctx);
-        Segmented::new(self.seg.clone(), ["Day", "Week", "Month"]).at(24.0, 196.0).render(ctx);
-        Tabs::new(self.tab.clone(), ["General", "Privacy", "Advanced"]).at(24.0, 248.0).width(392.0).render(ctx);
-        Slider::new(self.vol.clone(), 0.0, 100.0).at(24.0, 304.0).width(392.0).render(ctx);
+        // The controls: one column of sections, laid out (no coordinates
+        // below this line but the column's).
+        let col = ctx.push(Node::stack(Axis::Vertical, Rect::new(24.0, 20.0, 392.0, 0.0), space::LG));
+        Section::new("Buttons").show(ctx, |ctx| {
+            // A wrapping row: what does not fit goes on the next line.
+            let r = ctx.push(Node::stack(Axis::Horizontal, Rect::ZERO_SIZED, space::XS));
+            ctx.set_flex(r, FlexStyle { align: Align::Baseline, wrap: true, ..FlexStyle::default() });
+            ctx.place(Button::primary("Save").on_click(|| {}));
+            ctx.place(Button::secondary("Cancel").on_click(|| {}));
+            ctx.place(Button::ghost("More").on_click(|| {}).tooltip("More actions"));
+            ctx.place(Button::destructive("Delete").on_click(|| {}));
+            for l in ["Archive", "Share", "Export"] {
+                ctx.place(Button::secondary(l).on_click(|| {}));
+            }
+            ctx.pop();
+        });
+        GroupBox::new("Account").show(ctx, |ctx| {
+            let g = ctx.push(Node::stack(Axis::Vertical, Rect::ZERO_SIZED, 0.0));
+            ctx.grid(g, Grid::new([Track::Auto, Track::Fr(1.0)]).gaps(space::SM, space::XS).align(Align::Baseline));
+            text(ctx, "Name");
+            ctx.place(TextField::new(self.name.clone()).placeholder("Your name"));
+            text(ctx, "Plan");
+            ctx.place(Dropdown::new(self.plan.clone(), self.plan_menu.clone(), ["Personal", "Family", "Team"]));
+            ctx.pop();
+            row(ctx, space::LG, |ctx| {
+                ctx.place(Checkbox::new(self.check.clone(), "Remember me"));
+                ctx.place(Toggle::new(self.toggle.clone(), "Wi-Fi"));
+            });
+        });
+        Section::new("View").description("Pick the range to show, the tab, and how loud alerts are. Changes apply at once and are kept for next time.").show(ctx, |ctx| {
+            row(ctx, space::SM, |ctx| {
+                ctx.place(Segmented::new(self.seg.clone(), ["Day", "Week", "Month"]));
+                text(ctx, "Week of 2 Nov");
+            });
+            ctx.place(Tabs::new(self.tab.clone(), ["General", "Privacy", "Advanced"]).width(0.0));
+            ctx.place(Slider::new(self.vol.clone(), 0.0, 100.0).width(0.0));
+        });
+        ctx.pop();
+        let _ = col;
 
-        label(ctx, 24.0, 344.0, "Canvas");
-        Canvas::new(self.canvas.clone(), Rect::new(24.0, 372.0, 392.0, 400.0), Size::new(392.0, 400.0), self.items.clone())
+        heading(ctx, 24.0, 508.0, "Canvas");
+        Canvas::new(self.canvas.clone(), Rect::new(24.0, 532.0, 392.0, 248.0), Size::new(392.0, 400.0), self.items.clone())
             .on_pointer(|_| {})
             .emit(ctx);
 
-        label(ctx, 448.0, 20.0, "DocumentView");
+        heading(ctx, 448.0, 20.0, "DocumentView");
         self.doc.render(ctx);
+        Dialog::new(self.dialog.clone(), Rect::new(0.0, 0.0, 1280.0, 720.0), "Discard changes?", "Your edits to this page have not been saved. If you discard them, the page goes back to how it was when you opened it, and this cannot be undone.", vec![
+            DialogButton::new("Keep editing", || {}),
+            DialogButton::new("Discard", || {}).destructive(),
+        ])
+        .render(ctx);
     }
 }
 
@@ -89,7 +143,8 @@ fn page() -> String {
     let mut b = String::from(r#"<html><head><style>body { margin: 16px; font-size: 15px }
         h1 { font-size: 26px; margin: 0px 0px 12px } h2 { font-size: 19px; margin: 18px 0px 8px }
         p { margin: 0px 0px 10px } .note { background-color: #eef4ff; padding: 8px 12px; border-radius: 6px }
-        code { background-color: #f1efe9 }</style></head><body><h1>Atrium document view</h1>
+        code { background-color: #f1efe9 }
+        @media (prefers-color-scheme: dark) { body { background-color: #16181d; color: #e6e8ec } .note { background-color: #1f2b3d } code { background-color: #2a2d33 } }</style></head><body><h1>Atrium document view</h1>
         <p class="note">This page is laid out by the document engine and drawn by Pergola: bands of the page become glyph runs, rects and fills.</p>"#);
     for s in 1..=40 {
         b.push_str(&format!("<h2>Section {s}</h2>"));
@@ -102,15 +157,18 @@ fn page() -> String {
 }
 
 fn main() -> std::io::Result<()> {
-    let dark = std::env::args().nth(1).as_deref() == Some("dark");
+    let dark = std::env::args().any(|a| a == "dark");
     let secs: u64 = std::env::var("SHOWCASE_SECS").ok().and_then(|s| s.parse().ok()).unwrap_or(40);
     let mut window = Window::open(&WindowDesc::new("Pergola showcase", SizeSpec::Fixed(1280, 800)))?;
     window.follow_appearance(false);
     let dirty = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
-    let doc = Rc::new(RefCell::new(Doc::html(page(), Default::default(), 800.0, 740.0, |_| None).map_err(std::io::Error::other)?));
+    let doc = Rc::new(RefCell::new(Doc::html(page(), Default::default(), 808.0, 740.0, dark, |_| None).map_err(std::io::Error::other)?));
     let view = Show {
         name: Mutable::with_dirty(TextEdit::new("Shankar"), dirty.clone()),
         check: Mutable::with_dirty(Check::On, dirty.clone()),
+        dialog: Mutable::with_dirty(std::env::args().any(|a| a == "dialog"), dirty.clone()),
+        plan: Mutable::with_dirty(1usize, dirty.clone()),
+        plan_menu: Mutable::with_dirty(MenuState::default(), dirty.clone()),
         toggle: Mutable::with_dirty(true, dirty.clone()),
         seg: Mutable::with_dirty(1usize, dirty.clone()),
         tab: Mutable::with_dirty(0usize, dirty.clone()),

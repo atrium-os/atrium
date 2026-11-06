@@ -36,9 +36,10 @@ pub struct Shelf {
 impl Shelf {
     pub fn new(user: impl Into<String>) -> Self { Self { user: user.into(), toasts: VecDeque::new() } }
 
-    /// A posted notification, at `now` ms. Another user's is ignored.
+    /// A posted notification, at `now` ms. Another user's is ignored; a
+    /// system service's (`SYSTEM_USER`) is everyone's.
     pub fn posted(&mut self, n: Notification, now: f64) {
-        if n.user != self.user {
+        if n.user != self.user && n.user != praeco::proto::SYSTEM_USER {
             return;
         }
         // High urgency goes to the front of the queue.
@@ -172,6 +173,8 @@ mod tests {
         let mut s = Shelf::new("me");
         s.posted(n(1, urgency::NORMAL, "someone-else"), 0.0);
         assert!(s.toasts.is_empty());
+        s.posted(n(2, urgency::NORMAL, praeco::proto::SYSTEM_USER), 0.0);
+        assert_eq!(s.toasts.len(), 1, "a system service's notice is everyone's");
     }
 
     #[test]

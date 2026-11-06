@@ -6,12 +6,17 @@
 //!   atrium-player --headless --feed FILE...  # one MSE track per FILE, appended in chunks
 //!   atrium-player [--size WxH] [--exit-at-end] FILE   # in a window, with controls
 //!   atrium-player --limen                    # a Limen media-player child
+//!   FILE may be an http(s) URL: atrium-player-fetch (the sandboxed
+//!   fetcher, a process of its own) downloads it and the player plays it
+//!   as it arrives. ATRIUM_PLAYER_FETCH_UNCONFINED=1 lets the fetcher run
+//!   without Capsicum off FreeBSD; ATRIUM_PLAYER_TRUST names its CA file.
 //!   options: --seek SECS (after the first frame), --probe-sandbox,
 //!            --kill-worker-after N (frames)
 use std::fs::File;
 use std::time::{Duration, Instant};
 
 use atrium_player::app::{App, LimenHost, Standalone};
+use atrium_player::fetch::{self, Fetcher, FromFetcher, UrlHost};
 use atrium_player::supervisor::{LocalSink, Options, Player, PlayerEvent, Source};
 use md5::{Digest, Md5};
 
@@ -53,7 +58,30 @@ fn main() {
         return windowed(&files[0], exit_at_end, size);
     }
     let sink = LocalSink::new(Box::new(|bytes, pts| println!("video {pts} {:x}", Md5::digest(bytes))));
-    let source = if feed {
+    // A URL: the fetcher's file, played as it grows.
+    let mut fetcher = None;
+    let source = if !feed && fetch::is_url(&files[0]) {
+        let mut f = start_fetcher(&files[0]);
+        let file = loop {
+            match f.poll(Duration::from_secs(1)) {
+                Ok(None) => {}
+                Ok(Some((FromFetcher::File { length, .. }, Some(fd)))) => {
+                    println!("fetching {} bytes", length.map_or("?".to_string(), |l| l.to_string()));
+                    break File::from(fd);
+                }
+                Ok(Some((FromFetcher::Failed { reason }, _))) => {
+                    eprintln!("{}: {reason}", files[0]);
+                    std::process::exit(1);
+                }
+                _ => {
+                    eprintln!("{}: the fetcher broke off", files[0]);
+                    std::process::exit(1);
+                }
+            }
+        };
+        fetcher = Some(f);
+        Source::File(file)
+    } else if feed {
         Source::Feed(files.iter().enumerate().map(|(i, f)| (i as u8, if f.ends_with(".mp4") { "video/mp4".into() } else { "video/webm".into() })).collect())
     } else {
         match File::open(&files[0]) {
@@ -64,7 +92,11 @@ fn main() {
             }
         }
     };
-    let mut p = match Player::new(Options::default(), sink, source) {
+    let started = match source {
+        Source::File(f) if fetcher.is_some() => Player::new_growing(Options::default(), sink, f),
+        source => Player::new(Options::default(), sink, source),
+    };
+    let mut p = match started {
         Ok(p) => p,
         Err(e) => {
             eprintln!("atrium-player: starting the decode worker: {e}");
@@ -94,6 +126,21 @@ fn main() {
     let mut pcm = vec![0f32; 48_000 * 8];
     let mut first_pcm_pts = None;
     loop {
+        if let Some(f) = fetcher.as_mut() {
+            match f.poll(Duration::ZERO) {
+                Ok(None) => {}
+                Ok(Some((FromFetcher::Done { bytes }, _))) => {
+                    println!("fetched {bytes} bytes");
+                    p.input_done();
+                    fetcher = None;
+                }
+                r => {
+                    eprintln!("atrium-player: the download stopped ({r:?}); playing what arrived");
+                    p.input_done();
+                    fetcher = None;
+                }
+            }
+        }
         let ev = p.poll(Duration::from_millis(20));
         let (n, t) = p.read_pcm(&mut pcm);
         if n > 0 {
@@ -163,26 +210,57 @@ fn main() {
 /// Play `file` in a window of its own: the video in a Fresco layer under a
 /// window that is transparent but for the controls.
 fn windowed(file: &str, exit_at_end: bool, size: (u32, u32)) {
-    let f = File::open(file).unwrap_or_else(|e| {
-        eprintln!("{file}: {e}");
-        std::process::exit(1)
-    });
+    let f = if fetch::is_url(file) {
+        None
+    } else {
+        Some(File::open(file).unwrap_or_else(|e| {
+            eprintln!("{file}: {e}");
+            std::process::exit(1)
+        }))
+    };
     let mut conn = fresco_client::Connection::connect_default().unwrap_or_else(|e| {
         eprintln!("atrium-player: connecting to frescod: {e}");
         std::process::exit(1)
     });
-    let title = std::path::Path::new(file).file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
-    let win = conn.window_create(size.0, size.1, title, fresco_protocol::WindowHints::default()).unwrap_or_else(|e| {
+    let title = std::path::Path::new(file.split(['?', '#']).next().unwrap_or(file)).file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+    let win = conn.window_create(size.0, size.1, title.clone(), fresco_protocol::WindowHints::default()).unwrap_or_else(|e| {
         eprintln!("atrium-player: window: {e}");
         std::process::exit(1)
     });
     conn.set_default_window(win as u16);
+    let Some(f) = f else {
+        let mut app = App::new(UrlHost::new(start_fetcher(file)), conn, win, size, Options::default());
+        app.set_exit_at_end(exit_at_end);
+        app.session_name = title.clone();
+        run(&mut app);
+        if let Some(why) = app.host.failed.take() {
+            eprintln!("{file}: {why}");
+            std::process::exit(1);
+        }
+        return;
+    };
     let mut app = App::new(Standalone, conn, win, size, Options::default());
+    app.session_name = title;
     if let Err(e) = app.play_file(f, exit_at_end) {
         eprintln!("atrium-player: starting the decode worker: {e}");
         std::process::exit(1);
     }
     run(&mut app);
+}
+
+/// The sandboxed fetcher, asked for `url`.
+fn start_fetcher(url: &str) -> Fetcher {
+    let mut extra = Vec::new();
+    if std::env::var("ATRIUM_PLAYER_FETCH_UNCONFINED").as_deref() == Ok("1") {
+        extra.push("--unconfined-for-testing".to_string());
+    }
+    if let Ok(t) = std::env::var("ATRIUM_PLAYER_TRUST") {
+        extra.extend(["--trust".to_string(), t]);
+    }
+    Fetcher::spawn(&fetch::default_fetcher(), url, &extra).unwrap_or_else(|e| {
+        eprintln!("atrium-player: starting the fetcher: {e}");
+        std::process::exit(1)
+    })
 }
 
 /// A Limen `media-player` child (limen.md §2.2): limend started us with its

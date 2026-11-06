@@ -130,6 +130,13 @@ pub struct Capabilities {
     /// blast another (lyra-v1.md §7).
     #[serde(rename = "audio-control")]
     pub audio_control: Option<bool>,
+    /// Now-playing and the media keys (Forum, the lock screen): see the
+    /// active media session (app, state; title only if the user allows it on
+    /// the lock screen) and send it play, pause, next, previous and seek over
+    /// choragusd's `media-control/` socket. Restricted so an app can't watch
+    /// what others play or steer them (atrium-player-pip-keys.md §4).
+    #[serde(rename = "media-control")]
+    pub media_control: Option<bool>,
     /// Unknown / future keys. Validator warns; doesn't reject.
     #[serde(flatten)]
     pub extra:      BTreeMap<String, toml::Value>,
@@ -258,6 +265,7 @@ pub fn merge_capabilities(base: &Capabilities, ovr: &Capabilities) -> Capabiliti
         forum_control:    ovr.forum_control.or(base.forum_control),
         app_launch:       ovr.app_launch.or(base.app_launch),
         audio_control:    ovr.audio_control.or(base.audio_control),
+        media_control:    ovr.media_control.or(base.media_control),
         extra:            {
             let mut e = base.extra.clone();
             for (k, v) in &ovr.extra { e.insert(k.clone(), v.clone()); }

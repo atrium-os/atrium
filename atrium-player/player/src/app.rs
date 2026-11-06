@@ -7,12 +7,12 @@ use std::io;
 use std::time::{Duration, Instant};
 
 use fresco_client::{Connection, Event};
-use limen::media_player::{code, Source as LoadSource, ToChild, ToParent, RANGES_MAX, TIME_HZ_MAX};
+use limen::media_player::{code, Source as LoadSource, TextChoice, ToChild, ToParent, RANGES_MAX, TIME_HZ_MAX};
 
 use crate::audio_out::AudioOut;
 use crate::controls::{Action, Controls};
 use crate::fresco_sink::FrescoSink;
-use crate::supervisor::{Options, Player, PlayerEvent, Source};
+use crate::supervisor::{Options, Player, PlayerEvent, Source, Subtitles};
 use crate::wire::err;
 
 /// Play that has not moved for this long is reported to the parent as
@@ -27,11 +27,15 @@ pub enum HostEvent {
     /// narrowed by limend; `true` if it is still being written (until
     /// `LoadDone`).
     Load(std::os::fd::OwnedFd, bool),
+    /// `TextTrack` with its WebVTT file.
+    TextTrack { id: u8, lang: String, label: String, file: std::os::fd::OwnedFd },
     /// The slot is hidden: pause, and keep the position.
     Suspend,
     Resume,
     /// The parent detached us, or the channel broke.
     Gone,
+    /// limend put our window into picture-in-picture, or took it back.
+    Pip(bool),
 }
 
 pub trait Host {
@@ -41,6 +45,15 @@ pub trait Host {
     /// Limen's attribution ticket for Lyra, for an embedded player.
     fn audio_ticket(&self) -> Option<[u8; 16]> {
         None
+    }
+    /// Whether this host can do picture-in-picture at all.
+    fn can_pip(&self) -> bool {
+        false
+    }
+    /// Ask for PiP (`on`) or to go back; `aspect` is the video's.
+    /// Answered with `HostEvent::Pip`; false if refused here.
+    fn pip(&mut self, _on: bool, _aspect: [u32; 2]) -> bool {
+        false
     }
 }
 
@@ -89,6 +102,7 @@ impl Host for LimenHost {
                     let fd = self.child.take_fd();
                     match (embed == self.embed, ToChild::decode(&bytes), fd) {
                         (true, Some(ToChild::Load { source: LoadSource::Fd, growing, .. }), Some(fd)) => out.push(HostEvent::Load(fd, growing)),
+                        (true, Some(ToChild::TextTrack { id, lang, label }), Some(fd)) => out.push(HostEvent::TextTrack { id, lang, label, file: fd }),
                         _ => self.dropped += 1,
                     }
                 }
@@ -96,6 +110,7 @@ impl Host for LimenHost {
                 ChildEvent::Resumed { embed } if embed == self.embed => out.push(HostEvent::Resume),
                 ChildEvent::Detaching { embed } if embed == self.embed => out.push(HostEvent::Gone),
                 ChildEvent::AudioTicket { embed, ticket } if embed == self.embed => self.ticket = Some(ticket),
+                ChildEvent::Pip { embed, on } if embed == self.embed => out.push(HostEvent::Pip(on)),
                 _ => {}
             }
         }
@@ -108,6 +123,14 @@ impl Host for LimenHost {
 
     fn audio_ticket(&self) -> Option<[u8; 16]> {
         self.ticket
+    }
+
+    fn can_pip(&self) -> bool {
+        true
+    }
+
+    fn pip(&mut self, on: bool, aspect: [u32; 2]) -> bool {
+        self.child.pip(self.embed, on, aspect).is_ok()
     }
 }
 
@@ -144,7 +167,30 @@ pub struct App<H: Host> {
     rate: f64,
     /// Since when play is waiting for the audio to start.
     audio_wait: Option<Instant>,
+    /// The page's subtitle files (id, language, label), for the player
+    /// whenever it starts.
+    texts: Vec<(u8, String, String, File)>,
+    subtitles: Subtitles,
+    /// What `c` turns subtitles back on to.
+    subtitles_were: Subtitles,
+    /// Muted from the player's own keys (the page mutes with volume 0).
+    muted: bool,
+    /// The page's media session: metadata for now-playing, and the
+    /// actions it handles (atrium-player-pip-keys.md §4.4).
+    pub media_metadata: (String, String, String),
+    page_actions: u16,
+    /// The session's name without the page's metadata (the standalone
+    /// player's file name).
+    pub session_name: String,
+    /// What was last sent to choragusd, and when.
+    session_sent: Option<(SessionKey, Instant)>,
+    /// In picture-in-picture (limend said so).
+    pip: bool,
 }
+
+/// A media session as last reported: state, title, artist, actions,
+/// duration in ms.
+type SessionKey = (u8, String, String, u16, Option<i64>);
 
 fn secs(ns: i64) -> f64 {
     ns as f64 / 1e9
@@ -197,6 +243,15 @@ impl<H: Host> App<H> {
             volume: 1.0,
             rate: 1.0,
             audio_wait: None,
+            texts: Vec::new(),
+            subtitles: Subtitles::InBand,
+            subtitles_were: Subtitles::InBand,
+            muted: false,
+            media_metadata: Default::default(),
+            page_actions: 0,
+            session_name: String::new(),
+            session_sent: None,
+            pip: false,
         }
     }
 
@@ -205,6 +260,11 @@ impl<H: Host> App<H> {
             Some(p) => &mut p.sink,
             None => self.sink.as_mut().expect("a sink until the player takes it"),
         }
+    }
+
+    /// Quit when playback ends (the standalone player).
+    pub fn set_exit_at_end(&mut self, yes: bool) {
+        self.exit_at_end = yes;
     }
 
     /// Start playing a whole resource now (the standalone player).
@@ -225,6 +285,12 @@ impl<H: Host> App<H> {
             Source::File(f) if growing => Player::new_growing(self.opts.clone(), sink, f)?,
             source => Player::new(self.opts.clone(), sink, source)?,
         };
+        for (id, _, _, f) in &self.texts {
+            if let Ok(f) = f.try_clone() {
+                let _ = p.add_text_file(*id, f);
+            }
+        }
+        p.set_subtitles(self.subtitles);
         // Paused until Play, with the first frame showing as the poster.
         p.set_paused(true);
         p.show_next();
@@ -312,6 +378,11 @@ impl<H: Host> App<H> {
                 self.done = true;
                 return Ok(());
             }
+            HostEvent::Pip(on) => {
+                self.pip = on;
+                self.controls.poke();
+                return Ok(());
+            }
             HostEvent::Suspend | HostEvent::Resume => {
                 self.suspended = matches!(ev, HostEvent::Suspend);
                 self.audio_wait = None;
@@ -319,6 +390,21 @@ impl<H: Host> App<H> {
                 return Ok(());
             }
             HostEvent::Load(fd, growing) => return self.start(Source::File(File::from(fd)), growing),
+            HostEvent::TextTrack { id, lang, label, file } => {
+                let file = File::from(file);
+                if !file.metadata().is_ok_and(|m| m.is_file()) {
+                    self.host.emit(ToParent::Error { code: code::STATE, track: None });
+                    return Ok(());
+                }
+                if let Some(p) = self.player.as_mut() {
+                    if let Ok(f) = file.try_clone() {
+                        let _ = p.add_text_file(id, f);
+                    }
+                }
+                self.texts.retain(|t| t.0 != id);
+                self.texts.push((id, lang, label, file));
+                return Ok(());
+            }
             HostEvent::Msg(m) => m,
         };
         fn feed<H: Host>(app: &mut App<H>) -> Option<&mut Player<FrescoSink>> {
@@ -332,6 +418,18 @@ impl<H: Host> App<H> {
             // it is out of place.
             ToChild::Load { source: LoadSource::Fd, .. } => self.host.emit(ToParent::Error { code: code::STATE, track: None }),
             ToChild::OpenSource => self.start(Source::Feed(Vec::new()), false)?,
+            // Its file comes with it, as HostEvent::TextTrack.
+            ToChild::TextTrack { .. } => self.host.emit(ToParent::Error { code: code::STATE, track: None }),
+            ToChild::ShowText { text } => {
+                self.subtitles = match text {
+                    TextChoice::None => Subtitles::None,
+                    TextChoice::InBand => Subtitles::InBand,
+                    TextChoice::Page(id) => Subtitles::Page(id),
+                };
+                if let Some(p) = self.player.as_mut() {
+                    p.set_subtitles(self.subtitles);
+                }
+            }
             ToChild::LoadDone => match self.player.as_mut() {
                 Some(p) => p.input_done(),
                 None => self.host.emit(ToParent::Error { code: code::STATE, track: None }),
@@ -378,13 +476,94 @@ impl<H: Host> App<H> {
             ToChild::Seek { secs } => self.seek(secs, false),
             ToChild::SetVolume { volume } => {
                 self.volume = volume;
-                if let Some(a) = self.audio.as_mut() {
-                    a.set_volume(volume);
-                }
+                self.muted = false;
+                self.apply_volume();
             }
+            ToChild::MediaMetadata { title, artist, album } => self.media_metadata = (title, artist, album),
+            ToChild::MediaActions { actions } => self.page_actions = actions,
+            ToChild::RequestPip => self.request_pip(true),
+            ToChild::ExitPip => self.request_pip(false),
             ToChild::SetRate { rate } => self.set_rate(rate as f64),
         }
         Ok(())
+    }
+
+    /// Tell choragusd how this player's session stands (once a second
+    /// while playing, and at every change), and act on what it asks.
+    fn media_session(&mut self) {
+        use lyra_protocol::wire::{action, MediaAction, SessionState};
+        let Some(a) = self.audio.as_mut() else { return };
+        for (act, offset, time) in std::mem::take(&mut a.session_actions) {
+            let pos = self.controls.position_s;
+            match act {
+                MediaAction::Play => self.set_playing(true),
+                MediaAction::Pause | MediaAction::Stop => self.set_playing(false),
+                // choragusd resolves Play/Pause to one of the two.
+                MediaAction::PlayPause => self.set_playing(!self.want_play),
+                MediaAction::SeekBackward => self.seek(pos - offset.unwrap_or(10.0), true),
+                MediaAction::SeekForward => self.seek(pos + offset.unwrap_or(10.0), true),
+                MediaAction::SeekTo => {
+                    if let Some(t) = time {
+                        self.seek(t, true)
+                    }
+                }
+                MediaAction::Next if self.page_actions & limen::media_player::media_action::NEXT_TRACK != 0 => {
+                    self.host.emit(ToParent::Action { action: limen::media_player::media_action::NEXT_TRACK })
+                }
+                MediaAction::Previous if self.page_actions & limen::media_player::media_action::PREVIOUS_TRACK != 0 => {
+                    self.host.emit(ToParent::Action { action: limen::media_player::media_action::PREVIOUS_TRACK })
+                }
+                MediaAction::Next | MediaAction::Previous => {}
+            }
+        }
+        let state = if self.want_play && !self.ended_sent { SessionState::Playing } else { SessionState::Paused };
+        let (title, artist) = if self.media_metadata.0.is_empty() {
+            (self.session_name.clone(), String::new())
+        } else {
+            (self.media_metadata.0.clone(), self.media_metadata.1.clone())
+        };
+        let mut actions = action::PLAY | action::PAUSE | action::STOP;
+        let duration = self.duration.filter(|d| d.is_finite() && *d > 0.0);
+        if duration.is_some() {
+            actions |= action::SEEK_BACKWARD | action::SEEK_FORWARD | action::SEEK_TO;
+        }
+        if self.page_actions & limen::media_player::media_action::NEXT_TRACK != 0 {
+            actions |= action::NEXT;
+        }
+        if self.page_actions & limen::media_player::media_action::PREVIOUS_TRACK != 0 {
+            actions |= action::PREVIOUS;
+        }
+        let key: SessionKey = (state as u8, title, artist, actions, duration.map(|d| (d * 1000.0) as i64));
+        let due = match &self.session_sent {
+            None => true,
+            Some((k, at)) => *k != key || (state == SessionState::Playing && at.elapsed() >= Duration::from_secs(1)),
+        };
+        if due {
+            let pos = self.player.as_ref().and_then(|p| p.position_ns()).map(|t| secs(t).max(0.0));
+            if let Some(a) = self.audio.as_mut() {
+                a.session(state, &key.1, &key.2, actions, duration, pos);
+            }
+            self.session_sent = Some((key, Instant::now()));
+        }
+    }
+
+    /// Into picture-in-picture or back. limend checks for a real press and
+    /// answers with `HostEvent::Pip`; a refusal leaves things as they are.
+    fn request_pip(&mut self, on: bool) {
+        if on == self.pip {
+            return;
+        }
+        let Some((w, h)) = self.video.filter(|v| v.0 > 0 && v.1 > 0) else { return };
+        if !self.host.pip(on, [w, h]) && on {
+            eprintln!("atrium-player: picture-in-picture refused");
+        }
+    }
+
+    fn apply_volume(&mut self) {
+        let v = if self.muted { 0.0 } else { self.volume };
+        if let Some(a) = self.audio.as_mut() {
+            a.set_volume(v);
+        }
     }
 
     fn ready(&mut self) {
@@ -399,14 +578,16 @@ impl<H: Host> App<H> {
         match ev {
             PlayerEvent::VideoTrack { width, height, bit_depth } => {
                 self.video = Some((width, height));
+                self.controls.pip_button = self.host.can_pip() && width > 0 && height > 0;
                 println!("video-track {width}x{height} {bit_depth}-bit");
             }
             PlayerEvent::AudioTrack { rate, channels } => {
                 if self.audio.is_none() {
                     match AudioOut::open(&self.audio_socket, self.host.audio_ticket(), rate, channels) {
                         Ok(mut a) => {
-                            if self.volume < 1.0 {
-                                a.set_volume(self.volume);
+                            let v = if self.muted { 0.0 } else { self.volume };
+                            if v < 1.0 {
+                                a.set_volume(v);
                             }
                             a.set_rate(self.rate);
                             self.audio = Some(a);
@@ -480,6 +661,7 @@ impl<H: Host> App<H> {
                 None => {}
             }
         }
+        self.media_session();
         let map = self.audio.as_ref().and_then(|a| a.map());
         self.sink().clock.av = map;
         self.sync_paused();
@@ -551,7 +733,7 @@ impl<H: Host> App<H> {
                 None
             }
             Event::PointerButton { x, y, button: 1, pressed: true, .. } => self.controls.press(x, y),
-            Event::Key { hid_usage, pressed: true, .. } => self.controls.key(hid_usage),
+            Event::Key { hid_usage, pressed: true, modifiers, .. } => self.controls.key(hid_usage, modifiers),
             _ => None,
         };
         match action {
@@ -564,7 +746,32 @@ impl<H: Host> App<H> {
                 let to = self.controls.position_s + s;
                 self.seek(to, true);
             }
-            None => {}
+            Some(Action::Volume(d)) => {
+                self.volume = (self.volume + d).clamp(0.0, 1.0);
+                self.muted = false;
+                self.apply_volume();
+                self.host.emit(ToParent::Volume { volume: self.volume, muted: self.muted });
+            }
+            Some(Action::ToggleMute) => {
+                self.muted = !self.muted;
+                self.apply_volume();
+                self.host.emit(ToParent::Volume { volume: self.volume, muted: self.muted });
+            }
+            Some(Action::ToggleSubtitles) => {
+                if self.subtitles == Subtitles::None {
+                    self.subtitles = self.subtitles_were;
+                } else {
+                    self.subtitles_were = self.subtitles;
+                    self.subtitles = Subtitles::None;
+                }
+                if let Some(p) = self.player.as_mut() {
+                    p.set_subtitles(self.subtitles);
+                }
+            }
+            // Only what the page said it handles.
+            Some(Action::PageAction(a)) if self.page_actions & a != 0 => self.host.emit(ToParent::Action { action: a }),
+            Some(Action::TogglePip) => self.request_pip(!self.pip),
+            Some(Action::PageAction(_)) | None => {}
         }
     }
 }

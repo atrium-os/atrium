@@ -66,9 +66,186 @@ impl Convolver {
     }
 }
 
+/// Many inputs to a stereo pair, each input with its own left and right
+/// impulse response, convolved by uniformly partitioned overlap-save FFT
+/// convolution. Both outputs are real, so they share one complex spectrum
+/// (left + j·right): per block of `block` frames it takes one forward FFT per
+/// pair of inputs (two real signals share one), one complex multiply-add per
+/// input and partition, and a single
+/// inverse FFT. Called with whole blocks it adds no latency. It allocates
+/// only in `new`, so it runs on the mix thread.
+pub struct PartitionedConvolver {
+    fft: crate::fft::Fft,
+    block: usize,
+    ins: usize,
+    parts: usize,
+    /// Kernel spectra, left + j·right: [input][partition] × 2·block.
+    k_re: Vec<f32>,
+    k_im: Vec<f32>,
+    /// Each input's last `parts` block spectra (a ring at `pos`).
+    x_re: Vec<f32>,
+    x_im: Vec<f32>,
+    pos: usize,
+    /// Each input's previous block (overlap-save keeps one block of history).
+    prev: Vec<f32>,
+    re: Vec<f32>,
+    im: Vec<f32>,
+    acc_re: Vec<f32>,
+    acc_im: Vec<f32>,
+}
+
+impl PartitionedConvolver {
+    /// `kernel(i, ear)` is the impulse response from input `i` to output
+    /// `ear` (0 left, 1 right); all are cut to `taps`. `block` is a power of
+    /// two.
+    pub fn new(block: usize, ins: usize, taps: usize, kernel: impl Fn(usize, usize) -> Vec<f32>) -> Self {
+        assert!(block.is_power_of_two() && ins > 0 && taps > 0);
+        let n = 2 * block;
+        let parts = taps.div_ceil(block);
+        let fft = crate::fft::Fft::new(n);
+        let mut k_re = vec![0.0; ins * parts * n];
+        let mut k_im = vec![0.0; ins * parts * n];
+        for i in 0..ins {
+            let (l, r) = (kernel(i, 0), kernel(i, 1));
+            for p in 0..parts {
+                let at = (i * parts + p) * n;
+                let (re, im) = (&mut k_re[at..at + n], &mut k_im[at..at + n]);
+                let take = block.min(taps.saturating_sub(p * block));
+                for (t, v) in l.iter().skip(p * block).take(take).enumerate() {
+                    re[t] = *v;
+                }
+                for (t, v) in r.iter().skip(p * block).take(take).enumerate() {
+                    im[t] = *v;
+                }
+                // FFT(l + j·r) = L + j·R, as the accumulator wants.
+                fft.forward(re, im);
+            }
+        }
+        PartitionedConvolver {
+            fft,
+            block,
+            ins,
+            parts,
+            k_re,
+            k_im,
+            x_re: vec![0.0; ins * parts * n],
+            x_im: vec![0.0; ins * parts * n],
+            pos: 0,
+            prev: vec![0.0; ins * block],
+            re: vec![0.0; n],
+            im: vec![0.0; n],
+            acc_re: vec![0.0; n],
+            acc_im: vec![0.0; n],
+        }
+    }
+
+    pub fn block(&self) -> usize {
+        self.block
+    }
+
+    /// Convolve `input` (interleaved, `ins` channels) and ADD the result to
+    /// `out` (interleaved stereo). Frames must be a whole number of blocks; a
+    /// trailing partial block is ignored.
+    pub fn process_add(&mut self, input: &[f32], out: &mut [f32]) {
+        let (b, n) = (self.block, 2 * self.block);
+        let frames = (input.len() / self.ins).min(out.len() / 2);
+        for blk in 0..frames / b {
+            let base = blk * b;
+            self.acc_re.iter_mut().for_each(|v| *v = 0.0);
+            self.acc_im.iter_mut().for_each(|v| *v = 0.0);
+            // Two real inputs share one FFT: z = a + j·b, then split the
+            // spectrum by its symmetry.
+            for i in (0..self.ins).step_by(2) {
+                let pair = i + 1 < self.ins;
+                self.im.iter_mut().for_each(|v| *v = 0.0);
+                for (j, dst) in [(i, 0usize), (i + 1, 1)] {
+                    if j >= self.ins {
+                        break;
+                    }
+                    let prev = &mut self.prev[j * b..(j + 1) * b];
+                    let buf = if dst == 0 { &mut self.re } else { &mut self.im };
+                    buf[..b].copy_from_slice(prev);
+                    for t in 0..b {
+                        let v = input[(base + t) * self.ins + j];
+                        buf[b + t] = v;
+                        prev[t] = v;
+                    }
+                }
+                self.fft.forward(&mut self.re, &mut self.im);
+                let at = (i * self.parts + self.pos) * n;
+                if pair {
+                    let bt = ((i + 1) * self.parts + self.pos) * n;
+                    for k in 0..n {
+                        let m = (n - k) & (n - 1);
+                        let (zr, zi, mr, mi) = (self.re[k], self.im[k], self.re[m], self.im[m]);
+                        self.x_re[at + k] = 0.5 * (zr + mr);
+                        self.x_im[at + k] = 0.5 * (zi - mi);
+                        self.x_re[bt + k] = 0.5 * (zi + mi);
+                        self.x_im[bt + k] = 0.5 * (mr - zr);
+                    }
+                } else {
+                    self.x_re[at..at + n].copy_from_slice(&self.re);
+                    self.x_im[at..at + n].copy_from_slice(&self.im);
+                }
+            }
+            for i in 0..self.ins {
+                for p in 0..self.parts {
+                    let xs = (i * self.parts + (self.pos + self.parts - p) % self.parts) * n;
+                    let ks = (i * self.parts + p) * n;
+                    let (xr, xi) = (&self.x_re[xs..xs + n], &self.x_im[xs..xs + n]);
+                    let (kr, ki) = (&self.k_re[ks..ks + n], &self.k_im[ks..ks + n]);
+                    for f in 0..n {
+                        self.acc_re[f] += xr[f] * kr[f] - xi[f] * ki[f];
+                        self.acc_im[f] += xr[f] * ki[f] + xi[f] * kr[f];
+                    }
+                }
+            }
+            self.fft.inverse(&mut self.acc_re, &mut self.acc_im);
+            for t in 0..b {
+                out[(base + t) * 2] += self.acc_re[b + t];
+                out[(base + t) * 2 + 1] += self.acc_im[b + t];
+            }
+            self.pos = (self.pos + 1) % self.parts;
+        }
+    }
+
+    pub fn reset(&mut self) {
+        self.x_re.iter_mut().for_each(|v| *v = 0.0);
+        self.x_im.iter_mut().for_each(|v| *v = 0.0);
+        self.prev.iter_mut().for_each(|v| *v = 0.0);
+        self.pos = 0;
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn partitioned_matches_direct_convolution_across_blocks() {
+        // Three inputs (a pair and an odd one) to a stereo pair, kernels
+        // longer than a block (3 partitions).
+        let k = |i: usize, o: usize| -> Vec<f32> { (0..40).map(|t| ((t * (i + 2) + o * 5) % 7) as f32 / 7.0 - 0.4).collect() };
+        let mut pc = PartitionedConvolver::new(16, 3, 40, k);
+        let input: Vec<f32> = (0..160 * 3).map(|j| ((j * 31 % 17) as f32 - 8.0) / 8.0).collect();
+        let mut out = vec![0.0f32; 160 * 2];
+        // Fed in two calls: streaming continuity across calls too.
+        let (a, b) = input.split_at(64 * 3);
+        let (oa, ob) = out.split_at_mut(64 * 2);
+        pc.process_add(a, oa);
+        pc.process_add(b, ob);
+        for o in 0..2 {
+            let mut want = vec![0.0f32; 160];
+            for i in 0..3 {
+                let x: Vec<f32> = input.iter().skip(i).step_by(3).copied().collect();
+                let mut c = Convolver::new(k(i, o));
+                want.iter_mut().zip(c.process(&x)).for_each(|(w, y)| *w += y);
+            }
+            for t in 0..160 {
+                assert!((out[t * 2 + o] - want[t]).abs() < 1e-4, "out {o} frame {t}: {} vs {}", out[t * 2 + o], want[t]);
+            }
+        }
+    }
 
     fn approx(a: &[f32], b: &[f32]) {
         assert_eq!(a.len(), b.len(), "len {} vs {}", a.len(), b.len());

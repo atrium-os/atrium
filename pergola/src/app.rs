@@ -22,7 +22,6 @@ use std::sync::Arc;
 
 use crate::event::{hit_test, Event, Key, KeyEventKind};
 use crate::interaction::Interactions;
-use crate::layout;
 use crate::node::{diff, NodeDelta, NodeId, NodeTree};
 use crate::reactive::Mutable;
 use crate::theme::Semantic;
@@ -280,14 +279,8 @@ impl<V: View> App<V> {
             focus_visible: self.focus_visible,
             tip: self.tip,
         };
-        let (mut next, interactions) = render_continuing(&self.view, self.theme, state, &mut self.prev_tree);
-        // Run layout from each root in the tree (a render pass may
-        // produce multiple top-level nodes; in practice it's one per
-        // window).
-        let roots: Vec<NodeId> = next.roots().collect();
-        for root in roots {
-            layout::layout(&mut next, root);
-        }
+        let (next, interactions) = render_continuing(&self.view, self.theme, state, &mut self.prev_tree);
+        // The render pass laid it out (`Ctx::flush_overlays`).
         let deltas = if std::mem::take(&mut self.resend) {
             diff(&NodeTree::new(), &next)
         } else {
@@ -407,17 +400,23 @@ impl<V: View> App<V> {
         self.dirty.store(true, Ordering::Release);
     }
 
-    /// Focusable node ids in id order — the Tab traversal sequence.
+    /// Focusable node ids in tree order (what draws first comes first):
+    /// the Tab traversal sequence.
     fn focusables(&self) -> Vec<NodeId> {
-        let mut ids: Vec<NodeId> = self
-            .interactions
-            .by_node
-            .iter()
-            .filter(|(id, h)| h.focusable && self.in_modal(**id))
-            .map(|(id, _)| *id)
-            .collect();
-        ids.sort_by_key(|id| id.0);
-        ids
+        fn walk(t: &NodeTree, id: NodeId, out: &mut Vec<NodeId>) {
+            out.push(id);
+            for &c in t.children_of(id) {
+                walk(t, c, out);
+            }
+        }
+        let mut order = Vec::new();
+        for r in self.prev_tree.roots() {
+            walk(&self.prev_tree, r, &mut order);
+        }
+        order
+            .into_iter()
+            .filter(|id| self.interactions.get(*id).is_some_and(|h| h.focusable) && self.in_modal(*id))
+            .collect()
     }
 
     /// Advance focus to the next/previous focusable (Tab / Shift-Tab),

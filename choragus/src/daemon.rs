@@ -16,14 +16,15 @@
 //! tickets: an embedded player that says one in `Hello` plays as its parent
 //! app, and only if the parent holds `audio` (lyra-v1.md §4, decision 4).
 
-use crate::app::{role_from_wire, CAP_ATTRIBUTION, CAP_AUDIO, CAP_CONTROL};
+use crate::app::{role_from_wire, CAP_ATTRIBUTION, CAP_AUDIO, CAP_CONTROL, CAP_MEDIA};
+use crate::media::MediaRegistry;
 use crate::grant::GrantStore;
 use crate::policy::{Device, DeviceKind, Session, Stream};
 use crate::volumes::{clamp, Level, OutputSettings, VolumeStore};
 use lyra_protocol::fdpass::{recv_fd, send_fd};
 use lyra_protocol::wire::{
-    self, AppEntry, DenyCode, FromAttribution, FromControl, FromEngine, Output, Role as WireRole, Ticket, ToApp,
-    ToAttribution, ToChoragus, ToControl, ToEngine,
+    self, AppEntry, DenyCode, FromAttribution, FromControl, FromEngine, FromMedia, NowPlaying, Output,
+    Role as WireRole, Ticket, ToApp, ToAttribution, ToChoragus, ToControl, ToEngine, ToMedia,
 };
 use portcullis_peer::AppRegistry;
 use std::collections::HashMap;
@@ -31,7 +32,7 @@ use std::io;
 use std::os::fd::AsRawFd;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 /// Level for a stream held silent (seat switch), in dB.
 pub const HELD_DB: f32 = -120.0;
@@ -104,8 +105,20 @@ struct ControlConn {
     user: String,
 }
 
+/// A now-playing connection (`media-control/`): Forum's bar, forum-wm, the
+/// lock screen.
+struct MediaConn {
+    writer: UnixStream,
+    user: String,
+    lock_screen: bool,
+    /// What it was last told, so it hears only changes.
+    last: Option<Option<NowPlaying>>,
+}
+
 struct State {
     sess: Session,
+    media: MediaRegistry,
+    media_conns: HashMap<u64, MediaConn>,
     volumes: VolumeStore,
     /// The outputs' balance (system-wide), and where it is kept.
     outputs: OutputSettings,
@@ -276,6 +289,43 @@ impl State {
     }
 }
 
+impl State {
+    /// What `conn` should see now: its user's active session, if that user
+    /// is the seat's; titles only off the lock screen or if the user allows.
+    fn now_playing_for(&mut self, conn: u64) -> Option<NowPlaying> {
+        let (user, lock) = self.media_conns.get(&conn).map(|c| (c.user.clone(), c.lock_screen))?;
+        if !self.active(&user) {
+            return None;
+        }
+        let titles = !lock || self.volumes.user(&user).lock_titles;
+        self.media.now_playing(&user, titles)
+    }
+
+    fn to_media(&mut self, conn: u64, msg: &FromMedia) {
+        if let Some(c) = self.media_conns.get_mut(&conn) {
+            if wire::send(&mut c.writer, msg).is_err() {
+                let _ = c.writer.shutdown(std::net::Shutdown::Both);
+            }
+        }
+    }
+
+    /// Tell `user`'s now-playing connections (or everyone's) what changed.
+    fn notify_media(&mut self, user: Option<&str>) {
+        let conns: Vec<u64> = self.media_conns.iter()
+            .filter(|(_, c)| user.map_or(true, |u| c.user == u))
+            .map(|(id, _)| *id).collect();
+        for conn in conns {
+            let np = self.now_playing_for(conn);
+            let c = self.media_conns.get_mut(&conn).unwrap();
+            if c.last.as_ref() == Some(&np) {
+                continue;
+            }
+            c.last = Some(np.clone());
+            self.to_media(conn, &FromMedia::NowPlaying(np));
+        }
+    }
+}
+
 type Shared = Arc<Mutex<State>>;
 
 /// Handle one app connection to its end.
@@ -414,9 +464,19 @@ fn serve_app(mut app: UnixStream, state: Shared, cfg: Arc<Config>, socket_caps: 
                     st.close_stream(stream);
                 }
             }
+            ToChoragus::Session { state, title, artist, actions, duration, position } => {
+                // Counted for the app it plays as (an embed's parent), so the
+                // bar shows "Navigator", not the embedded player.
+                if st.media.update(conn, &v.user, &v.app_id, state, &title, &artist, actions, duration, position, Instant::now()) {
+                    st.notify_media(Some(&v.user));
+                }
+            }
         }
     }
     let mut st = state.lock().unwrap();
+    if st.media.remove(conn).is_some() {
+        st.notify_media(Some(&v.user));
+    }
     if let Some(a) = st.apps.remove(&conn) {
         for id in a.streams {
             st.close_stream(id);
@@ -593,6 +653,91 @@ fn serve_control(mut c: UnixStream, state: Shared, cfg: Arc<Config>, socket_caps
     eprintln!("choragusd: volume UI '{}' (uid {uid}) disconnected", v.app_id);
 }
 
+/// Handle one now-playing connection (`media-control/`,
+/// atrium-player-pip-keys.md §4). It sees and steers only its own user's
+/// active session, and only while that user's session is the seat's.
+fn serve_media(mut c: UnixStream, state: Shared, cfg: Arc<Config>, socket_caps: u8) {
+    let uid = match lyra_protocol::peer::peer_uid(c.as_raw_fd()) {
+        Ok(u) => u,
+        Err(_) => return,
+    };
+    let _ = c.set_read_timeout(Some(Duration::from_secs(5)));
+    let lock_screen = match wire::recv::<_, ToMedia>(&mut c) {
+        Ok(ToMedia::Hello { lock_screen, .. }) => lock_screen,
+        _ => return,
+    };
+    let _ = c.set_read_timeout(None);
+    let registry = cfg.registry.as_deref().map(|p| AppRegistry::load(p).unwrap_or_default());
+    let grant = |user: &str, app_id: &str| match &cfg.policy_base {
+        Some(base) => GrantStore::load_portcullis(base, user).granted(app_id),
+        None => cfg.grants.granted(app_id),
+    };
+    let claimed = portcullis_peer::username(uid).unwrap_or_default();
+    let verified = crate::identity::resolve(uid, &claimed, registry.as_ref(), cfg.strict, socket_caps, grant);
+    let Some(v) = verified.filter(|v| v.caps & CAP_MEDIA != 0) else {
+        eprintln!("choragusd: uid {uid} refused on media-control (no media-control grant)");
+        let _ = wire::send(&mut c, &FromMedia::Denied { code: DenyCode::NotGranted });
+        return;
+    };
+    if wire::send(&mut c, &FromMedia::Welcome).is_err() {
+        return;
+    }
+    let Ok(writer) = c.try_clone() else { return };
+    let _ = writer.set_write_timeout(Some(Duration::from_secs(1)));
+    let conn = {
+        let mut st = state.lock().unwrap();
+        st.next_conn += 1;
+        let id = st.next_conn;
+        st.media_conns.insert(id, MediaConn { writer, user: v.user.clone(), lock_screen, last: None });
+        id
+    };
+    eprintln!("choragusd: now-playing '{}' (user {}, uid {uid}{}) connected", v.app_id, v.user,
+        if lock_screen { ", lock screen" } else { "" });
+    let user = v.user.as_str();
+    while let Ok(msg) = wire::recv::<_, ToMedia>(&mut c) {
+        let mut st = state.lock().unwrap();
+        match msg {
+            ToMedia::Hello { .. } => {}
+            ToMedia::NowPlaying => {
+                let np = st.now_playing_for(conn);
+                st.media_conns.get_mut(&conn).unwrap().last = Some(np.clone());
+                st.to_media(conn, &FromMedia::NowPlaying(np));
+            }
+            ToMedia::Control { action, seek_offset, seek_time } => {
+                if !st.active(user) {
+                    st.to_media(conn, &FromMedia::Denied { code: DenyCode::NotGranted });
+                    continue;
+                }
+                // Not offered, or nothing active: ignored (a key press with
+                // nothing playing does nothing).
+                if let Some((app, m)) = st.media.control(user, action, seek_offset, seek_time) {
+                    st.to_app(app, &m);
+                }
+            }
+            ToMedia::Focused { app_id } => {
+                if app_id.len() > wire::MAX_APP_ID {
+                    st.to_media(conn, &FromMedia::Denied { code: DenyCode::BadFormat });
+                    continue;
+                }
+                st.media.focused(user, &app_id);
+            }
+            ToMedia::SetLockTitles { on } => {
+                // The user's choice, made in settings: not by the lock screen.
+                if lock_screen {
+                    st.to_media(conn, &FromMedia::Denied { code: DenyCode::NotGranted });
+                    continue;
+                }
+                if let Err(e) = st.volumes.update(user, |u| u.lock_titles = on) {
+                    eprintln!("choragusd: saving {user}'s settings: {e}");
+                }
+                st.notify_media(Some(user));
+            }
+        }
+    }
+    state.lock().unwrap().media_conns.remove(&conn);
+    eprintln!("choragusd: now-playing '{}' (uid {uid}) disconnected", v.app_id);
+}
+
 fn new_ticket() -> io::Result<Ticket> {
     use std::io::Read;
     let mut t = [0u8; 16];
@@ -757,6 +902,8 @@ fn forward(state: &Shared, stream: u32, msg: ToApp) {
 fn apply_seat(state: &Shared, seat_path: &str) {
     let active = portcullis_peer::seat::active_at(seat_path);
     let mut st = state.lock().unwrap();
+    // Now-playing follows the seat (deduplicated, so this is quiet).
+    st.notify_media(None);
     let mut changed = Vec::new();
     for (id, r) in st.streams.iter_mut() {
         let held = active.as_deref() != Some(r.user.as_str());
@@ -791,6 +938,8 @@ pub fn run(cfg: Config) -> io::Error {
     let spk = Device { id: 0, kind: DeviceKind::Speakers };
     let state: Shared = Arc::new(Mutex::new(State {
         sess: Session::new(vec![spk], spk.id),
+        media: MediaRegistry::default(),
+        media_conns: HashMap::new(),
         volumes: VolumeStore::new(cfg.state_dir.clone()),
         outputs: OutputSettings::load(&cfg.state_dir),
         state_dir: cfg.state_dir.clone(),
@@ -835,6 +984,8 @@ pub fn run(cfg: Config) -> io::Error {
                     std::thread::spawn(move || serve_attribution(app, state, cfg));
                 } else if caps == CAP_CONTROL {
                     std::thread::spawn(move || serve_control(app, state, cfg, caps));
+                } else if caps == CAP_MEDIA {
+                    std::thread::spawn(move || serve_media(app, state, cfg, caps));
                 } else {
                     std::thread::spawn(move || serve_app(app, state, cfg, caps));
                 }

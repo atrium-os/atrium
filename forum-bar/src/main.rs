@@ -11,6 +11,7 @@
 use std::time::Duration;
 
 use forum_ctl::{Intent, Reply};
+use lyra_protocol::wire::{action, FromMedia, MediaAction, NowPlaying, SessionState, ToMedia};
 use fresco_protocol::{WindowHints, WmRole};
 use pergola::geom::{Axis, Rect};
 use pergola::reactive::Mutable;
@@ -64,6 +65,39 @@ struct BarView {
     /// Set by the light/dark switch; the main loop asks the WM to change
     /// the system appearance, and the bar follows it like every app.
     want_dark: Mutable<Option<bool>>,
+    /// What is playing (choragusd's active session), if anything.
+    now: Mutable<Option<NowShown>>,
+    /// Set by the now-playing button; the main loop sends it to choragusd.
+    want_media: Mutable<Option<MediaAction>>,
+}
+
+/// The bar's view of choragusd's `NowPlaying`.
+#[derive(Clone, PartialEq, Debug)]
+struct NowShown {
+    /// "title · app", cut to fit.
+    line: String,
+    playing: bool,
+    can_toggle: bool,
+}
+
+/// Longest now-playing line, in characters.
+const NOW_MAX: usize = 36;
+
+fn now_shown(np: &NowPlaying) -> Option<NowShown> {
+    if np.state == SessionState::None {
+        return None;
+    }
+    // The app's short name: the registry id's last part.
+    let app = np.app_id.rsplit('.').next().unwrap_or(&np.app_id);
+    let mut line = if np.title.is_empty() { app.to_string() } else { format!("{} · {app}", np.title) };
+    if line.chars().count() > NOW_MAX {
+        line = line.chars().take(NOW_MAX - 1).collect::<String>() + "…";
+    }
+    Some(NowShown {
+        line,
+        playing: np.state == SessionState::Playing,
+        can_toggle: np.actions & (action::PLAY | action::PAUSE) != 0,
+    })
 }
 
 /// A right-row icon: Phosphor glyph, hover → accent. A no-op click
@@ -179,6 +213,20 @@ impl View for BarView {
 
         let sp = ctx.add(Node::hstack(Rect::ZERO_SIZED, 0.0));
         ctx.set_flex(sp, FlexStyle::grow(1.0));
+
+        // Now playing: a note, what it is, and play/pause.
+        if let Some(n) = self.now.get_cloned() {
+            let np = ctx.push(Node::hstack(Rect::ZERO_SIZED, 6.0));
+            ctx.set_flex(np, FlexStyle { align: pergola::Align::Center, ..FlexStyle::default() });
+            Glyph::new(phosphor::MUSIC_NOTE_SIMPLE).size(13.0).color(t.accent_fg()).emit(ctx);
+            Label::new(n.line.clone()).size(type_size::XS).color(t.text_secondary()).emit(ctx);
+            if n.can_toggle {
+                let want = self.want_media.clone();
+                let g = if n.playing { phosphor::PAUSE } else { phosphor::PLAY };
+                icon_glyph(ctx, g, Some(Box::new(move || want.set(Some(MediaAction::PlayPause)))));
+            }
+            ctx.pop();
+        }
 
         // Right icon row.
         let row = ctx.push(Node::hstack(Rect::ZERO_SIZED, 14.0));
@@ -299,6 +347,34 @@ fn clock_now() -> (String, String) {
     (time, format!("{weekday} {d} {month}"))
 }
 
+/// choragusd's media-control socket, in the bar's jail (`media-control` grant).
+const MEDIA_SOCKET: &str = "/atrium/sockets/media-control/media-control.sock";
+
+/// Follow choragusd's now-playing on a thread of its own (it pushes every
+/// change), reconnecting when it restarts; `None` while nothing plays or
+/// choragusd is away.
+fn follow_now_playing() -> std::sync::mpsc::Receiver<Option<NowPlaying>> {
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || loop {
+        if let Ok(mut m) = lyra_protocol::client::Media::connect(MEDIA_SOCKET, false) {
+            if m.send(&ToMedia::NowPlaying).is_ok() {
+                while let Ok(ev) = m.recv() {
+                    if let FromMedia::NowPlaying(np) = ev {
+                        if tx.send(np).is_err() {
+                            return;
+                        }
+                    }
+                }
+            }
+            if tx.send(None).is_err() {
+                return;
+            }
+        }
+        std::thread::sleep(Duration::from_secs(5));
+    });
+    rx
+}
+
 fn main() -> std::io::Result<()> {
     // The system appearance decides (the Window follows it); `dark` only
     // seeds the first frame when frescod has none to give.
@@ -322,8 +398,14 @@ fn main() -> std::io::Result<()> {
     let time = Mutable::with_dirty(time0, dirty.clone());
     let date = Mutable::with_dirty(date0, dirty.clone());
     let want_dark = Mutable::with_dirty(None, dirty.clone());
+    let now = Mutable::with_dirty(None, dirty.clone());
+    let want_media = Mutable::with_dirty(None, dirty.clone());
+    let playing = follow_now_playing();
+    let mut control: Option<lyra_protocol::client::Media> = None;
 
     let view = BarView {
+        now: now.clone(),
+        want_media: want_media.clone(),
         w,
         chips: chips.clone(),
         workspace: workspace.clone(),
@@ -356,6 +438,24 @@ fn main() -> std::io::Result<()> {
                 }
             }
         }
+        // What is playing changed (choragusd pushes it).
+        while let Ok(np) = playing.try_recv() {
+            let shown = np.as_ref().and_then(now_shown);
+            if shown != now.get_cloned() {
+                now.set(shown);
+            }
+        }
+        // The play/pause click.
+        if let Some(a) = want_media.get() {
+            want_media.set(None);
+            if control.is_none() {
+                control = lyra_protocol::client::Media::connect(MEDIA_SOCKET, false).ok();
+            }
+            if control.as_mut().map(|c| c.control(a)).map_or(true, |r| r.is_err()) {
+                eprintln!("forum-bar: choragusd media-control is not reachable");
+                control = None;
+            }
+        }
         // The moon/sun click: ask the WM to switch the whole system. The
         // change comes back as an appearance event, which repaints the bar.
         if let Some(dark) = want_dark.get() {
@@ -384,7 +484,31 @@ mod tests {
             time: Mutable::new(time),
             date: Mutable::new(date),
             want_dark: Mutable::new(None),
+            now: Mutable::new(None),
+            want_media: Mutable::new(None),
         }
+    }
+
+    #[test]
+    fn now_playing_shows_title_and_app_and_a_play_pause_button() {
+        let np = NowPlaying {
+            app_id: "org.atrium.navigator".into(), title: "A very long song title that goes on and on".into(),
+            artist: String::new(), state: SessionState::Playing, actions: action::PLAY | action::PAUSE,
+            duration: None, position: None,
+        };
+        let n = now_shown(&np).unwrap();
+        assert_eq!(n.line.chars().count(), NOW_MAX);
+        assert!(n.line.ends_with('…') && n.playing && n.can_toggle);
+        let short = NowPlaying { title: "Song".into(), ..np.clone() };
+        assert_eq!(now_shown(&short).unwrap().line, "Song · navigator");
+        assert_eq!(now_shown(&NowPlaying { state: SessionState::None, ..np }), None);
+
+        pergola::text::clear_measurer();
+        let view = sample_view();
+        view.now.set(Some(n));
+        let (tree, _) = render(&view, Semantic::LIGHT);
+        let has = |c: char| tree.iter().any(|(_, x)| matches!(x, Node::Text { content, .. } if content.starts_with(c)));
+        assert!(has(phosphor::PAUSE) && has(phosphor::MUSIC_NOTE_SIMPLE));
     }
 
     /// The idle bar must go quiet: after one tick, a second tick with

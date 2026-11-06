@@ -187,6 +187,11 @@ There are two ways to feed it.
 | parent → child | `Seek` | `secs: f64` |
 | parent → child | `SetVolume` | `volume: f32` (0 to 1) |
 | parent → child | `SetRate` | `rate: f32` (0.25 to 4) |
+| parent → child | `TextTrack` | `id: u8` (at most 16), `lang`, `label` (64 bytes each), with a WebVTT file as a regular-file descriptor: the page's `<track>` |
+| parent → child | `ShowText` | `text`: `None`, `InBand` (the default) or `Page(id)` |
+| parent → child | `MediaMetadata` | `title`, `artist`, `album` (128 bytes each): `navigator.mediaSession.metadata` |
+| parent → child | `RequestPip`, `ExitPip` | none: `requestPictureInPicture()` during a user gesture, and `exitPictureInPicture()`; limend's `Pip` event says it happened |
+| parent → child | `MediaActions` | `actions: u16`: the `media_action` bits the page handles (`NEXT_TRACK`, `PREVIOUS_TRACK`) |
 | child → parent | `Ready` | `duration_secs: f64`, `width`, `height` |
 | child → parent | `CanPlay` | `mime`, `supported: bool`: the reply, for `MediaSource.isTypeSupported` |
 | child → parent | `Playing`, `Paused` | none: the play state changed, from the parent's message or the native controls |
@@ -196,6 +201,8 @@ There are two ways to feed it.
 | child → parent | `Waiting` | `secs: f64`: playback reached the end of what is buffered |
 | child → parent | `Seeking` | `secs: f64`: the user seeked in the native controls; the parent fetches from there |
 | child → parent | `Ended` | none |
+| child → parent | `Volume` | `volume` (0 to 1), `muted`: the user changed it in the player (`volumechange`) |
+| child → parent | `Action` | `action`: one `media_action` bit the page declared, asked for by the user |
 | child → parent | `Error` | `code: u16` (`DECODE`, `UNSUPPORTED`, `TOO_BIG`, `STATE`, `NETWORK`), `track: Option<u8>` (an append to this track was refused and the feed goes on; `None`: the player failed) |
 
 The types are `limen::media_player` (atrium-player.md M0).
@@ -232,8 +239,9 @@ OpenH264 is used for H.264 (as Firefox does), and AAC is decoded with a free dec
 it is legally available. Hardware decode, when the GPU stack has it, goes here and nowhere
 else.
 
-**DRM.** A content decryption module (CDM) runs below the player, in its own jail under
-Linux ABI emulation with no network (legacy-web §8.1). The player passes it encrypted
+**DRM.** A content decryption module (CDM) runs below the player with no network: in a
+bhyve micro-VM where the hardware allows, otherwise in its own jail under Linux ABI
+emulation as a Capsicum-restricted process (legacy-web §8.1, threat model §2.9). The player passes it encrypted
 samples and gets frames back. The engine relays licence messages without seeing a key.
 Messages for this (`LicenceRequest`, `LicenceResponse`) are added when a CDM is.
 

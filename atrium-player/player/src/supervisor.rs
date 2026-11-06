@@ -19,7 +19,8 @@ pub const WATCHDOG: Duration = Duration::from_secs(5);
 
 /// Where decoded frames go.
 /// Most subtitle cues a player keeps (a feature film has 1,000 to 2,000).
-const CUES_MAX: usize = 8192;
+/// All cues kept, of every source.
+const CUES_MAX: usize = 32768;
 
 /// A subtitle cue, as the worker sent it: plain text, lines split by `\n`.
 #[derive(Debug, Clone, PartialEq)]
@@ -27,6 +28,18 @@ pub struct Cue {
     pub start_ns: i64,
     pub end_ns: i64,
     pub text: String,
+    /// The page's text track, or `None` for the media's own.
+    pub source: Option<u8>,
+}
+
+/// Which subtitles show.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Subtitles {
+    None,
+    /// The media's own text track. The default.
+    InBand,
+    /// The page's text file with this id.
+    Page(u8),
 }
 
 pub trait Sink {
@@ -192,7 +205,10 @@ pub struct Player<S: Sink> {
     color: atrium_media_demux::Color,
     /// Subtitle cues so far, by start time, and one still arriving.
     cues: Vec<Cue>,
-    cue_partial: Option<(i64, i64, usize, Vec<u8>)>,
+    /// The page's subtitle files, kept to give a restarted worker.
+    text_files: Vec<(u8, File)>,
+    subtitles: Subtitles,
+    cue_partial: Option<(i64, i64, usize, Option<u8>, Vec<u8>)>,
     /// Media time of the last frame handed to the sink.
     last_pts: Option<i64>,
     /// Frames before this media time are dropped (after a seek).
@@ -242,6 +258,8 @@ impl<S: Sink> Player<S> {
             epoch: 0,
             color: atrium_media_demux::Color::default(),
             cues: Vec::new(),
+            text_files: Vec::new(),
+            subtitles: Subtitles::InBand,
             cue_partial: None,
             last_pts: None,
             show_from: None,
@@ -278,6 +296,13 @@ impl<S: Sink> Player<S> {
             }
         }
         self.w = Some(w);
+        self.cue_partial = None;
+        // A restarted worker reads the page's subtitles again (each cue is
+        // kept once).
+        let ids: Vec<u8> = self.text_files.iter().map(|(i, _)| *i).collect();
+        for id in ids {
+            self.send_text_file(id);
+        }
         self.video = None;
         self.audio = None;
         self.heard = std::time::Instant::now();
@@ -359,13 +384,47 @@ impl<S: Sink> Player<S> {
         let end = self.cues.partition_point(|c| c.start_ns <= t_ns);
         // Cues last at most a minute (the worker caps them).
         let from = self.cues[..end].partition_point(|c| c.start_ns < t_ns - 60_000_000_000);
-        self.cues[from..end].iter().filter(|c| t_ns < c.end_ns).map(|c| c.text.as_str()).collect()
+        let want = match self.subtitles {
+            Subtitles::None => return Vec::new(),
+            Subtitles::InBand => None,
+            Subtitles::Page(id) => Some(id),
+        };
+        self.cues[from..end].iter().filter(|c| t_ns < c.end_ns && c.source == want).map(|c| c.text.as_str()).collect()
+    }
+
+    pub fn set_subtitles(&mut self, s: Subtitles) {
+        self.subtitles = s;
+    }
+
+    /// A page's WebVTT file (a regular file: the worker reads it to its
+    /// end). One with the same `id` replaces it.
+    pub fn add_text_file(&mut self, id: u8, f: File) -> io::Result<()> {
+        if !f.metadata()?.is_file() {
+            return Err(io::Error::new(io::ErrorKind::InvalidInput, "not a regular file"));
+        }
+        self.cues.retain(|c| c.source != Some(id));
+        self.text_files.retain(|(i, _)| *i != id);
+        self.text_files.push((id, f));
+        self.send_text_file(id);
+        Ok(())
+    }
+
+    fn send_text_file(&mut self, id: u8) {
+        let Some((_, f)) = self.text_files.iter().find(|(i, _)| *i == id) else { return };
+        let fd = f.try_clone().and_then(|f| sys::restricted(&OwnedFd::from(f), sys::Rights::Input));
+        let ok = match (fd, self.w.as_ref()) {
+            (Ok(fd), Some(w)) => w.send(&ToWorker::TextFile { id }, &[&fd]).is_ok(),
+            _ => false,
+        };
+        if !ok {
+            self.worker_lost();
+        }
     }
 
     fn add_cue(&mut self, c: Cue) {
         let i = self.cues.partition_point(|x| x.start_ns <= c.start_ns);
         // Read again (a restarted worker, a re-read after a seek): once.
-        if self.cues[..i].iter().rev().take_while(|x| x.start_ns == c.start_ns).any(|x| x.text == c.text) {
+        if self.cues[..i].iter().rev().take_while(|x| x.start_ns == c.start_ns).any(|x| x.text == c.text && x.source == c.source) {
             return;
         }
         if self.cues.len() >= CUES_MAX {
@@ -721,30 +780,30 @@ impl<S: Sink> Player<S> {
                 self.waiting = false;
                 self.events.push_back(PlayerEvent::Error(code));
             }
-            Record::Cue { start_ns, end_ns, len } => {
-                if self.cue_partial.is_some() {
+            Record::Cue { start_ns, end_ns, len, source } => {
+                if self.cue_partial.is_some() || source.is_some_and(|s| !self.text_files.iter().any(|(i, _)| *i == s)) {
                     return self.worker_lost();
                 }
-                self.cue_partial = Some((start_ns, end_ns, len as usize, Vec::with_capacity(len as usize)));
+                self.cue_partial = Some((start_ns, end_ns, len as usize, source, Vec::with_capacity(len as usize)));
                 if len == 0 {
                     self.cue_partial = None;
                 }
             }
             Record::CueText { i, bytes } => {
-                let Some((start, end, len, mut text)) = self.cue_partial.take() else { return self.worker_lost() };
+                let Some((start, end, len, source, mut text)) = self.cue_partial.take() else { return self.worker_lost() };
                 if i as usize != text.len() / 24 {
                     return self.worker_lost();
                 }
                 text.extend_from_slice(&bytes[..(len - text.len()).min(24)]);
                 if text.len() < len {
-                    self.cue_partial = Some((start, end, len, text));
+                    self.cue_partial = Some((start, end, len, source, text));
                     return;
                 }
                 let Ok(text) = String::from_utf8(text) else { return self.worker_lost() };
                 if text.chars().any(|c| c.is_control() && c != '\n') {
                     return self.worker_lost();
                 }
-                self.add_cue(Cue { start_ns: start, end_ns: end, text });
+                self.add_cue(Cue { start_ns: start, end_ns: end, text, source });
             }
             Record::Color { primaries, transfer, matrix, range } => {
                 if self.video.is_none() {

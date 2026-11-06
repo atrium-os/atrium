@@ -1419,7 +1419,7 @@ impl EnvelopeFrontend {
                 Some(u) => uid.is_some_and(|uid| u.contains(&uid)),
             };
             win.role = match p.hints.role {
-                Some(fresco_protocol::WmRole::Hud) | None => fresco_protocol::WmRole::Document,
+                Some(fresco_protocol::WmRole::Hud | fresco_protocol::WmRole::Pip) | None => fresco_protocol::WmRole::Document,
                 Some(fresco_protocol::WmRole::Notification) if !may_notify => fresco_protocol::WmRole::Document,
                 Some(r) => r,
             };
@@ -1483,7 +1483,8 @@ impl EnvelopeFrontend {
                 surface_id: w.id as u32,
                 owner_app:  format!("client:{}", w.owner),
                 owner_uid:  w.owner_uid,
-                role:       w.role,
+                // A slot child kept on screen out of its slot is PiP.
+                role:       if w.kept_by.is_some() { fresco_protocol::WmRole::Pip } else { w.role },
                 rect: WmRect {
                     x: w.pos.0 as i32,
                     y: w.pos.1 as i32,
@@ -2052,7 +2053,7 @@ mod tests {
         let a = make_window(&mut f, 1, 100, 100);
         let out = |output, identity, x, scale_milli| WmOutput {
             output, identity, rect: WmRect { x, y: 0, w: 1920, h: 1080 },
-            refresh_mhz: 60000, present: true, scale_milli, scale_auto: true, mirror_of: 0,
+            refresh_mhz: 60000, present: true, scale_milli, scale_auto: true, mirror_of: 0, width_mm: 0, height_mm: 0, flapping: false,
         };
         f.set_outputs(vec![out(0, 10, 0, 1000), out(1, 20, 1920, 1500)]);
         let dpi = |rx: &std::sync::mpsc::Receiver<crate::window::DisplayEvent>| -> Vec<(u32, f32)> {
@@ -2094,7 +2095,7 @@ mod tests {
         f.grant_window_management(9);
         let out = |output, identity, mirror_of| WmOutput {
             output, identity, rect: WmRect { x: 0, y: 0, w: 1920, h: 1080 },
-            refresh_mhz: 60000, present: true, scale_milli: 1000, scale_auto: true, mirror_of,
+            refresh_mhz: 60000, present: true, scale_milli: 1000, scale_auto: true, mirror_of, width_mm: 0, height_mm: 0, flapping: false,
         };
         f.set_outputs(vec![out(0, 10, 0), out(1, 20, 10), out(2, 30, 0)]);
         let ask = |f: &mut EnvelopeFrontend, identity, of| {

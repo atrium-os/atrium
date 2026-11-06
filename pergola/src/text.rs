@@ -37,9 +37,77 @@ pub fn clear_measurer() {
     *MEASURER.lock().unwrap() = None;
 }
 
+/// Where frescod's text run goes (`y` on the wire is the top of the
+/// font's ascender box) so the text sits optically centred in `rect`:
+/// the band from baseline to cap height centred on the rect's middle, as
+/// UI labels are aligned (visual language §3). Centring the em box
+/// instead leaves IBM Plex about 0.18 em low, since its ascender (1.025
+/// em) is far taller than its descender (0.275 em). Icon fonts are drawn
+/// in a centred em square already and keep the plain top.
+pub fn wire_top(rect: crate::geom::Rect, style: &TextStyle) -> f32 {
+    // (ascender, cap height) in em, read from the shipped faces.
+    let (asc, cap) = match style.family.as_str() {
+        crate::theme::font::SANS | crate::theme::font::MONO | "IBMPlexSans" | "IBMPlexMono" => (1.025, 0.698),
+        _ => return rect.y(),
+    };
+    let baseline = rect.y() + rect.h() / 2.0 + cap * style.size / 2.0;
+    baseline - asc * style.size
+}
+
+/// The baseline of text optically centred in a box `h` tall, px below
+/// the box's top (what [`wire_top`] draws): how labels line up across
+/// widgets of different heights.
+pub fn baseline(h: f32, style: &TextStyle) -> f32 {
+    let cap = match style.family.as_str() {
+        crate::theme::font::SANS | crate::theme::font::MONO | "IBMPlexSans" | "IBMPlexMono" => 0.698,
+        _ => 0.7,
+    };
+    h / 2.0 + cap * style.size / 2.0
+}
+
 /// Measure `content` in `style`. Shaped width when a measurer is
 /// installed; the 0.55·size estimate otherwise. Single-line height by
 /// the toolkit convention either way.
+
+/// `content` broken into lines no wider than `width` (px): at spaces,
+/// greedily, and at every `\n`. A word wider than `width` gets a line
+/// of its own (it is not split). `f32::INFINITY` keeps each paragraph on
+/// one line.
+pub fn lines(content: &str, style: &TextStyle, width: f32) -> Vec<String> {
+    let mut out = Vec::new();
+    for para in content.split('\n') {
+        let mut line = String::new();
+        for word in para.split(' ').filter(|w| !w.is_empty()) {
+            if line.is_empty() {
+                line.push_str(word);
+                continue;
+            }
+            let wider = format!("{line} {word}");
+            if measure(&wider, style).w <= width + 0.01 {
+                line = wider;
+            } else {
+                out.push(std::mem::replace(&mut line, word.to_string()));
+            }
+        }
+        out.push(line);
+    }
+    out
+}
+
+/// The height of one line of wrapped text in `style` (px): body
+/// leading (`line-height.body`), so lines of a paragraph breathe.
+pub fn line_height(style: &TextStyle) -> f32 {
+    (style.size * line_height::BODY).round()
+}
+
+/// The size of `content` wrapped at `width`: its widest line, and its
+/// lines' height.
+pub fn measure_wrapped(content: &str, style: &TextStyle, width: f32) -> Size {
+    let ls = lines(content, style, width);
+    let w = ls.iter().map(|l| measure(l, style).w).fold(0.0, f32::max);
+    Size::new(w, ls.len() as f32 * line_height(style))
+}
+
 pub fn measure(content: &str, style: &TextStyle) -> Size {
     let h = style.size * line_height::UI_SINGLE_LINE;
     if let Some(m) = MEASURER.lock().unwrap().as_mut() {

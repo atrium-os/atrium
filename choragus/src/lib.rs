@@ -16,5 +16,6 @@ pub mod capability;
 pub mod daemon;
 pub mod grant;
 pub mod identity;
+pub mod media;
 pub mod policy;
 pub mod volumes;

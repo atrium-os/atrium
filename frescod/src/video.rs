@@ -127,6 +127,11 @@ impl Videos {
         self.layers.lock().unwrap().remove(&(window, layer));
     }
 
+    /// Window `window` has a video layer.
+    pub fn has_window(&self, window: u32) -> bool {
+        self.layers.lock().unwrap().keys().any(|&(w, _)| w == window)
+    }
+
     pub fn forget_window(&self, window: u32) {
         self.layers.lock().unwrap().retain(|&(w, _), _| w != window);
     }

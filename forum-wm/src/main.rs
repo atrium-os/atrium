@@ -146,6 +146,23 @@ fn screen_from(w: i32, h: i32, top: i32) -> Screen {
     Screen { rect: WmRect { x: 0, y: top, w, h: h - top }, bar_h: 24, dock_h: 48 }
 }
 
+/// Tell the user (Praeco, as a system poster: praecod's
+/// `PRAECO_SYSTEM_POSTERS` lists Forum's uid), off the event loop.
+fn post_notices(notices: Vec<(String, String)>) {
+    if notices.is_empty() {
+        return;
+    }
+    let sock = std::env::var_os("PRAECO_SOCKET").map_or_else(|| "/var/run/atrium/praecod.sock".into(), std::path::PathBuf::from);
+    std::thread::spawn(move || {
+        for (title, body) in notices {
+            match praeco::client::post(&sock, praeco::proto::urgency::NORMAL, &title, &body) {
+                Ok(id) => eprintln!("forum-wm: told the user: {title} (notification {id})"),
+                Err(e) => eprintln!("forum-wm: could not tell the user \"{title}: {body}\" ({}: {e})", sock.display()),
+            }
+        }
+    });
+}
+
 fn main() -> io::Result<()> {
     // The WM drives its cross-app ops over the DEDICATED window-management socket
     // (reachability = the window-management grant; frescod reads no policy), not
@@ -258,7 +275,12 @@ fn is_compositor_gone(e: &io::Error) -> bool {
 fn spawn_input_poller(core: Core) {
     std::thread::Builder::new()
         .name("forum-wm-input".into())
-        .spawn(move || loop {
+        .spawn(move || {
+          // Media keys and focus go to choragusd (atrium-player-pip-keys.md §4.3).
+          let mut media = forum_wm::media::Link::new(|| lyra_protocol::client::Media::connect(forum_wm::media::SOCKET, false));
+          let mut told_focus = u32::MAX;
+          let mut media_down = false;
+          loop {
             // Drain the event backlog under one short lock; keep the last
             // primary press (a later click supersedes an earlier one this tick)
             // and note whether the surface set changed (a window appeared or
@@ -274,6 +296,7 @@ fn spawn_input_poller(core: Core) {
             let mut snap_dir: Option<Snap> = None;
             let mut unsnap = false;
             let mut next_monitor = false;
+            let mut media_keys = Vec::new();
             let mut display: Option<fresco_protocol::DisplayInfoResponse> = None;
             {
                 let mut g = core.lock().unwrap();
@@ -324,6 +347,10 @@ fn spawn_input_poller(core: Core) {
                             if modifiers & MOD_GUI != 0 && modifiers & MOD_SHIFT == 0
                                 && hid_usage >= KEY_1 && hid_usage < KEY_1 + 9 =>
                             switch_ws = Some((hid_usage - KEY_1) as usize),
+                        // A media key: never the focused app's (§4.3).
+                        Ok(Some(Event::Key { hid_usage, pressed: true, .. }))
+                            if forum_wm::media::action(hid_usage).is_some() =>
+                            media_keys.extend(forum_wm::media::action(hid_usage)),
                         Ok(Some(_)) => {}        // other event — ignore
                         Ok(None) => break,       // backlog drained
                         Err(ref e) if is_compositor_gone(e) => {
@@ -372,6 +399,7 @@ fn spawn_input_poller(core: Core) {
                                     Ok(None) => {}
                                     Err(e) => eprintln!("forum-wm: relayout on monitor change: {e}"),
                                 }
+                                post_notices(std::mem::take(&mut wm.notices));
                             }
                             Err(e) => eprintln!("forum-wm: outputs: {e}"),
                         }
@@ -500,7 +528,37 @@ fn spawn_input_poller(core: Core) {
                 }
             }
 
+            // Tell choragusd when focus moves to another surface, then send
+            // the media keys. choragusd may be absent: said once, retried.
+            let focus_app = {
+                let mut g = core.lock().unwrap();
+                let (wm, conn) = { let c = &mut *g; (&mut c.0, &mut c.1) };
+                let f = wm.declared_focus();
+                if f != told_focus {
+                    told_focus = f;
+                    Some(wm.app_of(conn, f).unwrap_or_default())
+                } else {
+                    None
+                }
+            };
+            let mut sent = Ok(());
+            if let Some(app) = focus_app {
+                sent = media.focus(&app);
+            }
+            for a in media_keys {
+                sent = sent.and(media.key(a));
+            }
+            match sent {
+                Err(e) if !media_down => {
+                    eprintln!("forum-wm: choragusd media-control: {e} (media keys do nothing until it is back)");
+                    media_down = true;
+                }
+                Ok(()) => media_down = false,
+                Err(_) => {}
+            }
+
             std::thread::sleep(Duration::from_millis(16)); // ~60 Hz, lock released
+          }
         })
         .expect("spawn forum-wm input poller");
 }

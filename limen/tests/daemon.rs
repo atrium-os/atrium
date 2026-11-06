@@ -22,7 +22,10 @@ const W_VIEWER: WindowToken = [4; 16];
 
 /// frescod: window tokens → owner uids; records binds.
 #[derive(Clone, Default)]
-struct Fresco(Arc<Mutex<(HashMap<WindowToken, u32>, Vec<(WindowToken, WindowToken, SlotKind, Option<[f32; 4]>)>, Vec<(u32, UnixStream)>)>>);
+struct Fresco(Arc<Mutex<(HashMap<WindowToken, u32>, Vec<(WindowToken, WindowToken, SlotKind, Option<[f32; 4]>)>, Vec<(u32, UnixStream)>)>>, Arc<Mutex<Presses>>);
+/// Windows that saw a press lately, and the slots released for PiP.
+#[derive(Default)]
+struct Presses { pressed: Vec<WindowToken>, released: Vec<WindowToken> }
 impl Compositor for Fresco {
     fn bind(&mut self, p: WindowToken, c: WindowToken, k: SlotKind, r: Option<[f32; 4]>, _z: u8) -> Result<(u32, u32), u8> {
         let mut g = self.0.lock().unwrap();
@@ -38,6 +41,14 @@ impl Compositor for Fresco {
         let (a, b) = UnixStream::pair().unwrap();
         self.0.lock().unwrap().2.push((owner, b));
         Ok(a)
+    }
+    fn pressed_within(&mut self, w: WindowToken, ms: u32) -> bool {
+        assert_eq!(ms, catalogue::PIP_GESTURE_MS);
+        self.1.lock().unwrap().pressed.contains(&w)
+    }
+    fn release(&mut self, _p: WindowToken, c: WindowToken) -> Result<(), u8> {
+        self.1.lock().unwrap().released.push(c);
+        Ok(())
     }
 }
 impl Fresco {
@@ -392,4 +403,107 @@ fn a_player_gets_a_read_only_file_or_pipe_with_a_message_and_nothing_else() {
     let mut other = w.parent(OTHER);
     assert_eq!(refused(other.send_fd(e, b"x".to_vec(), ro.as_fd())), refusal::NOT_YOURS);
     let _ = std::fs::remove_file(&path);
+}
+
+/// forum-wm's PiP side: what is in the `pip` layer.
+#[derive(Clone, Default)]
+struct Forum(Arc<Mutex<Vec<WindowToken>>>, Arc<Mutex<bool>>);
+impl limen::daemon::Shell for Forum {
+    fn pip(&mut self, w: WindowToken, aspect: [u32; 2]) -> Result<(), u8> {
+        assert_eq!(aspect, [16, 9]);
+        if *self.1.lock().unwrap() { return Err(1) }
+        self.0.lock().unwrap().push(w);
+        Ok(())
+    }
+    fn pip_end(&mut self, w: WindowToken) { self.0.lock().unwrap().retain(|x| *x != w) }
+}
+
+const W_PLAYER: WindowToken = [5; 16];
+const W_PLAYER2: WindowToken = [6; 16];
+
+/// A player embedded in APP's window, its slot placed and its window bound.
+fn bound_player(w: &World, app: &mut Parent, window: WindowToken) -> (EmbedId, Child) {
+    w.fresco.0.lock().unwrap().0.insert(window, PLAYER_UID);
+    let e = app.request("media-player", W_APP).unwrap();
+    let (_, mut player) = w.spawned();
+    assert!(matches!(next_c(&mut player), ChildEvent::Attach { .. }));
+    app.place(e, RECT).unwrap();
+    player.ready(e, window).unwrap();
+    assert_eq!(next_p(app), ParentEvent::Attached { embed: e });
+    (e, player)
+}
+
+#[test]
+fn pip_needs_a_real_press_and_leaves_the_slot_for_forum_and_comes_back() {
+    let w = World::new();
+    let forum = Forum::default();
+    w.shared.set_shell(Box::new(forum.clone()));
+    let mut app = w.parent(APP);
+    let (e, mut player) = bound_player(&w, &mut app, W_PLAYER);
+
+    // No press lately: refused, whatever the player says.
+    assert_eq!(refused(player.pip(e, true, [16, 9])), refusal::NO_PIP);
+    // A press on the page (requestPictureInPicture in a click handler).
+    w.fresco.1.lock().unwrap().pressed.push(W_APP);
+    assert_eq!(refused(player.pip(e, true, [0, 9])), refusal::NO_PIP, "a sane aspect");
+    player.pip(e, true, [16, 9]).unwrap();
+    assert_eq!(next_p(&mut app), ParentEvent::Pip { embed: e, on: true });
+    assert_eq!(next_c(&mut player), ChildEvent::Pip { embed: e, on: true });
+    assert_eq!(w.fresco.1.lock().unwrap().released, vec![W_PLAYER]);
+    assert_eq!(*forum.0.lock().unwrap(), vec![W_PLAYER]);
+
+    // The tab goes to the background: no Suspended while in PiP.
+    let binds = w.fresco.binds().len();
+    app.set_visible(e, false).unwrap();
+    app.place(e, Some([0.0, 0.0, 320.0, 180.0])).unwrap();
+    assert!(app.poll(Duration::from_millis(50)).unwrap().is_none());
+    assert_eq!(w.fresco.binds().len(), binds, "the slot is left alone");
+
+    // Back, while the tab is still hidden: suspended then.
+    player.pip(e, false, [16, 9]).unwrap();
+    assert_eq!(next_p(&mut app), ParentEvent::Pip { embed: e, on: false });
+    assert_eq!(next_p(&mut app), ParentEvent::Suspended { embed: e });
+    assert!(forum.0.lock().unwrap().is_empty());
+    // Shown again: bound at the rect the parent last placed, and resumed.
+    app.set_visible(e, true).unwrap();
+    assert_eq!(next_p(&mut app), ParentEvent::Resumed { embed: e });
+    assert_eq!(w.fresco.binds().last().unwrap().3, Some([0.0, 0.0, 320.0, 180.0]));
+
+    // In and back with the tab shown: straight into the slot, no Resumed.
+    player.pip(e, true, [16, 9]).unwrap();
+    assert_eq!(next_p(&mut app), ParentEvent::Pip { embed: e, on: true });
+    player.pip(e, false, [16, 9]).unwrap();
+    assert_eq!(next_p(&mut app), ParentEvent::Pip { embed: e, on: false });
+    assert!(app.poll(Duration::from_millis(50)).unwrap().is_none());
+    assert_eq!(w.fresco.binds().last().unwrap().3, Some([0.0, 0.0, 320.0, 180.0]));
+}
+
+#[test]
+fn one_pip_at_a_time_and_none_outlives_its_embed() {
+    let w = World::new();
+    let forum = Forum::default();
+    w.shared.set_shell(Box::new(forum.clone()));
+    let mut app = w.parent(APP);
+    let (a, mut pa) = bound_player(&w, &mut app, W_PLAYER);
+    let (b, mut pb) = bound_player(&w, &mut app, W_PLAYER2);
+    w.fresco.1.lock().unwrap().pressed.push(W_PLAYER);
+    w.fresco.1.lock().unwrap().pressed.push(W_PLAYER2);
+    pa.pip(a, true, [16, 9]).unwrap();
+    assert_eq!(next_p(&mut app), ParentEvent::Pip { embed: a, on: true });
+    pb.pip(b, true, [16, 9]).unwrap();
+    // The first goes back to its slot as the second takes its place.
+    assert_eq!(next_p(&mut app), ParentEvent::Pip { embed: a, on: false });
+    assert_eq!(next_p(&mut app), ParentEvent::Pip { embed: b, on: true });
+    assert_eq!(next_c(&mut pa), ChildEvent::Pip { embed: a, on: true });
+    assert_eq!(next_c(&mut pa), ChildEvent::Pip { embed: a, on: false });
+    assert_eq!(*forum.0.lock().unwrap(), vec![W_PLAYER2]);
+    // Closing the tab ends the PiP with it.
+    app.detach(b).unwrap();
+    assert!(forum.0.lock().unwrap().is_empty());
+    drop(pb);
+
+    // Only a player may, and Forum may say no (the slot is rebound).
+    *forum.1.lock().unwrap() = true;
+    assert_eq!(refused(pa.pip(a, true, [16, 9])), refusal::NO_PIP);
+    assert_eq!(w.fresco.binds().last().unwrap().1, W_PLAYER, "back in its slot");
 }

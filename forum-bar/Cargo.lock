@@ -189,6 +189,7 @@ dependencies = [
  "forum-ctl",
  "fresco-client",
  "fresco-protocol",
+ "lyra-protocol",
  "pergola",
 ]
 

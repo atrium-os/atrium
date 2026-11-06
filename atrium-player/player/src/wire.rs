@@ -74,6 +74,9 @@ pub enum ToWorker {
     Init { mode: Mode, limits: Limits, growing: bool },
     /// A growing Load's file is complete.
     InputDone,
+    /// A page's WebVTT file, as descriptor 0 on this frame: its cues come
+    /// back as `Cue { source: Some(id) }`.
+    TextFile { id: u8 },
     AddTrack { track: u8, mime: String },
     Append { track: u8, bytes: Vec<u8>, timestamp_offset_ns: Option<i64> },
     Remove { track: u8, start_ns: i64, end_ns: i64 },
@@ -155,7 +158,8 @@ pub enum Record {
     Color { primaries: u8, transfer: u8, matrix: u8, range: u8 },
     /// A subtitle cue shown over `[start_ns, end_ns)`; its `len` bytes of
     /// UTF-8 follow in `CueText` records.
-    Cue { start_ns: i64, end_ns: i64, len: u32 },
+    /// `source`: the page's text track, or `None` for the media's own.
+    Cue { start_ns: i64, end_ns: i64, len: u32, source: Option<u8> },
     /// Piece `i` of a cue's text, 24 bytes (the last one zero-padded).
     CueText { i: u32, bytes: [u8; 24] },
     /// Static HDR metadata (CTA-861.3 units), after `Color`.
@@ -199,7 +203,7 @@ impl Record {
             Record::Color { primaries, transfer, matrix, range } => {
                 put(&mut b, tag::COLOR, u32::from_le_bytes([primaries, transfer, matrix, range]), 0, 0, 0)
             }
-            Record::Cue { start_ns, end_ns, len } => put(&mut b, tag::CUE, len, start_ns as u64, end_ns as u64, 0),
+            Record::Cue { start_ns, end_ns, len, source } => put(&mut b, tag::CUE, len, start_ns as u64, end_ns as u64, source.map_or(0xFF, |s| s as u64)),
             Record::CueText { i, bytes } => {
                 let w = |k: usize| u64::from_le_bytes(bytes[k * 8..k * 8 + 8].try_into().unwrap());
                 put(&mut b, tag::CUE_TEXT, i, w(0), w(1), w(2))
@@ -265,7 +269,9 @@ impl Record {
                 }
                 Record::Color { primaries, transfer, matrix, range }
             }
-            tag::CUE if a <= CUE_TEXT_MAX && (x as i64) <= (y as i64) => Record::Cue { start_ns: x as i64, end_ns: y as i64, len: a },
+            tag::CUE if a <= CUE_TEXT_MAX && (x as i64) <= (y as i64) && (z < 16 || z == 0xFF) => {
+                Record::Cue { start_ns: x as i64, end_ns: y as i64, len: a, source: (z != 0xFF).then_some(z as u8) }
+            }
             tag::CUE_TEXT if a < CUE_TEXT_MAX.div_ceil(24) => {
                 let mut bytes = [0u8; 24];
                 bytes[..8].copy_from_slice(&x.to_le_bytes());
@@ -307,7 +313,8 @@ mod tests {
             Record::Ready { sandboxed: true },
             Record::VideoTrack { track: 0, codec: 2, width: 1920, height: 1080, bit_depth: 10 },
             Record::Color { primaries: 9, transfer: 16, matrix: 9, range: 1 },
-            Record::Cue { start_ns: 200_000_000, end_ns: 900_000_000, len: 30 },
+            Record::Cue { start_ns: 200_000_000, end_ns: 900_000_000, len: 30, source: None },
+            Record::Cue { start_ns: 200_000_000, end_ns: 900_000_000, len: 30, source: Some(15) },
             Record::CueText { i: 1, bytes: *b"abcdefghijklmnopqrstuvwx" },
             Record::Hdr { primaries_x: [34000, 13250, 7500], primaries_y: [16000, 34500, 3000], white: [15635, 16450], luminance: [1000, 50], light: [1000, 400] },
             Record::AudioTrack { track: 1, codec: 5, rate: 48_000, channels: 2 },

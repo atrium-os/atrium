@@ -10,6 +10,9 @@ pub const CAP_MICROPHONE: u8 = 2;
 pub const CAP_MONITOR: u8 = 4;
 /// The volume UI: other apps' levels, the master, the output. No samples.
 pub const CAP_CONTROL: u8 = 8;
+/// Now-playing and the media keys (atrium-player-pip-keys.md §4): read and
+/// steer the active media session. No samples, no levels.
+pub const CAP_MEDIA: u8 = 0x10;
 /// Not a grant: marks limend's attribution socket among the listeners.
 pub const CAP_ATTRIBUTION: u8 = 0x80;
 
@@ -20,6 +23,7 @@ pub fn cap_names(bits: u8) -> Vec<&'static str> {
     if bits & CAP_MICROPHONE != 0 { v.push("microphone"); }
     if bits & CAP_MONITOR != 0 { v.push("audio_monitor"); }
     if bits & CAP_CONTROL != 0 { v.push("audio_control"); }
+    if bits & CAP_MEDIA != 0 { v.push("media_control"); }
     v
 }
 

@@ -49,6 +49,10 @@ pub struct Head<'a> {
     pub mirror_of: Option<u64>,
     /// Where each scanout buffer differs from the newest desktop frame.
     pub dirty: Dirty,
+    /// Per scanout buffer, the drawing of a spanning window it holds a
+    /// tile of (direct scanout, fresco-span.md §5), with the HDR and place
+    /// it was cut for; `None`: anything else.
+    pub direct: Vec<Option<(u64, bool, Viewport)>>,
 }
 
 /// Per scanout buffer, the desktop rect where it differs from the newest
@@ -317,6 +321,7 @@ pub fn reconfigure<'a>(
                     h.on_screen = 0;
                 }
                 h.staging = vec![0u8; (m.width * m.height * 4) as usize];
+                h.direct.clear();
                 h.hdr_on = hdr_on;
                 h.present = true;
             }
@@ -349,6 +354,7 @@ pub fn reconfigure<'a>(
                     present: true,
                     mirror_of: None,
                     dirty: Dirty::default(),
+                    direct: Vec::new(),
                     conn: p.conn,
                 });
             }

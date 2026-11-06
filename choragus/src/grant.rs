@@ -14,7 +14,7 @@
 //!   org.atrium.meet       audio,microphone
 //! ```
 
-use crate::app::{CAP_AUDIO, CAP_CONTROL, CAP_MICROPHONE, CAP_MONITOR};
+use crate::app::{CAP_AUDIO, CAP_CONTROL, CAP_MEDIA, CAP_MICROPHONE, CAP_MONITOR};
 use std::collections::HashMap;
 
 /// app-id → granted capability bits.
@@ -29,6 +29,7 @@ fn cap_bit(word: &str) -> Option<u8> {
         "microphone" | "mic" => CAP_MICROPHONE,
         "audio_monitor" | "monitor" => CAP_MONITOR,
         "audio_control" | "audio-control" => CAP_CONTROL,
+        "media_control" | "media-control" => CAP_MEDIA,
         "" => return Some(0),
         _ => return None,
     })
@@ -86,6 +87,9 @@ impl GrantStore {
             }
             if c.audio_control == Some(true) {
                 bits |= CAP_CONTROL;
+            }
+            if c.media_control == Some(true) {
+                bits |= CAP_MEDIA;
             }
             map.insert(app_id.clone(), bits);
         }

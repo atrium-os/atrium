@@ -43,6 +43,8 @@ struct Heard {
     starts: u32,
     /// (stream frame, index into `samples`) at each read.
     marks: Vec<(u64, usize)>,
+    /// `Session` messages: state, title, actions.
+    sessions: Vec<(wire::SessionState, String, u16)>,
 }
 
 /// One app, one stream; the ring is drained at the stream's rate while it
@@ -102,6 +104,14 @@ fn fake_choragus(tag: &str) -> (String, Arc<Mutex<Heard>>) {
                         }
                     }
                     ToChoragus::SetVolume { gain, .. } => h.lock().unwrap().volume = Some(gain),
+                    ToChoragus::Session { state, title, actions, .. } => {
+                        let first = h.lock().unwrap().sessions.is_empty();
+                        h.lock().unwrap().sessions.push((state, title, actions));
+                        if first {
+                            // A media key, as choragusd forwards it.
+                            wire::send(&mut c, &ToApp::SessionAction { action: wire::MediaAction::SeekTo, seek_offset: None, seek_time: Some(1.5) }).unwrap();
+                        }
+                    }
                     _ => {}
                 }
                 continue;
@@ -366,4 +376,21 @@ fn continuous_seeking_leaves_no_trace() {
         let want = reference_pcm(clip);
         assert!(got.len().abs_diff(want.len() - 48_000) <= 48, "{clip}: {} frames", got.len());
     }
+}
+
+#[test]
+fn the_media_session_reaches_choragus_and_its_actions_come_back() {
+    let (path, heard) = fake_choragus("session");
+    let mut p = Player::new(opts(), LocalSink::new(Box::new(|_, _| {})), Source::File(File::open(asset("vp9-opus.webm")).unwrap())).unwrap();
+    let mut a = AudioOut::open(&path, None, 48_000, 2).unwrap();
+    a.session(wire::SessionState::Playing, "Clip", "", wire::action::PLAY | wire::action::SEEK_TO, Some(2.0), Some(0.0));
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while a.session_actions.is_empty() {
+        assert!(Instant::now() < deadline, "the action comes back");
+        p.poll(Duration::from_millis(5));
+        a.pump(&mut p, false);
+    }
+    assert_eq!(a.session_actions, vec![(wire::MediaAction::SeekTo, None, Some(1.5))]);
+    assert_eq!(heard.lock().unwrap().sessions, vec![(wire::SessionState::Playing, "Clip".to_string(), wire::action::PLAY | wire::action::SEEK_TO)]);
+    assert!(!a.lost);
 }

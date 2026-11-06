@@ -54,6 +54,9 @@ pub struct Entry {
 pub struct Table {
     live: HashMap<[u8; 16], Entry>,
     counter: u64,
+    /// When a real key or button press last reached each window (ns), for
+    /// `slot::op::PRESSED`; dropped with the window's tokens' bound.
+    pressed: HashMap<u32, u64>,
 }
 
 fn refused(reason: u8) -> ConsumeResult {
@@ -196,11 +199,36 @@ pub fn mint_for(ev: &mut fresco_scene_server::window::DisplayEvent, uid: Option<
         return;
     }
     *slot = match uid {
-        Some(uid) if window_id != 0 => table().lock().unwrap().mint(Entry {
-            window_id, uid, kind, hid, mods, minted_ns: now_ns(), counter: 0, drag_id: 0, purpose: 0,
-        }),
+        Some(uid) if window_id != 0 => {
+            let mut t = table().lock().unwrap();
+            let now = now_ns();
+            t.pressed_at(window_id, now);
+            t.mint(Entry { window_id, uid, kind, hid, mods, minted_ns: now, counter: 0, drag_id: 0, purpose: 0 })
+        }
         _ => [0; 16],
     };
+}
+
+impl Table {
+    /// A press reached `window_id` at `now`.
+    pub fn pressed_at(&mut self, window_id: u32, now: u64) {
+        if self.pressed.len() >= MAX_LIVE && !self.pressed.contains_key(&window_id) {
+            // Bounded like the tokens: the stalest go first.
+            let horizon = now.saturating_sub(u64::from(fresco_protocol::slot::PRESSED_MAX_MS) * 1_000_000);
+            self.pressed.retain(|_, &mut t| t >= horizon);
+            if self.pressed.len() >= MAX_LIVE {
+                return;
+            }
+        }
+        self.pressed.insert(window_id, now);
+    }
+
+    /// Whether a press reached `window_id` within `within_ms` of `now`
+    /// (at most `PRESSED_MAX_MS`).
+    pub fn pressed_within(&self, window_id: u32, now: u64, within_ms: u32) -> bool {
+        let ms = within_ms.min(fresco_protocol::slot::PRESSED_MAX_MS);
+        self.pressed.get(&window_id).is_some_and(|&t| now.saturating_sub(t) <= u64::from(ms) * 1_000_000)
+    }
 }
 
 /// The same event with its token cleared: what the WM sees of a press in
@@ -279,7 +307,7 @@ pub fn bind_slot(comp: &Mutex<fresco_scene_server::window::Compositor>, b: &fres
         let (Some(parent), Some(child)) = (c.window_by_token(&b.parent), c.window_by_token(&b.child)) else {
             return SlotBindResult::Refused { reason: refusal::UNKNOWN_WINDOW };
         };
-        c.bind_slot(child, parent, b.kind, b.rect, b.z).map(|_| (parent, child))
+        c.bind_slot_keep(child, parent, b.kind, b.rect, b.z, b.keep_shown).map(|_| (parent, child))
     };
     match r {
         Ok((parent, child)) => SlotBindResult::Ok {
@@ -405,6 +433,17 @@ fn conn_loop(s: std::os::unix::net::UnixStream, uid: u32, may_consume: bool, may
                 Ok(_) => GrantResult::Refused { reason: refusal::NOT_ALLOWED },
                 Err(_) => GrantResult::Refused { reason: refusal::UNKNOWN },
             }),
+            fresco_protocol::slot::op::PRESSED => {
+                use fresco_protocol::slot::{refusal as no, PressedQuery, PressedResult};
+                fresco_protocol::encode(&match (fresco_protocol::decode::<PressedQuery>(&msg.payload), binder) {
+                    (Ok(q), Some(comp)) => match comp.lock().unwrap().window_by_token(&q.window) {
+                        Some(w) => PressedResult::Ok { pressed: table().lock().unwrap().pressed_within(u32::from(w), now_ns(), q.within_ms) },
+                        None => PressedResult::Refused { reason: no::UNKNOWN_WINDOW },
+                    },
+                    (Ok(_), None) => PressedResult::Refused { reason: no::NOT_ALLOWED },
+                    (Err(_), _) => PressedResult::Refused { reason: no::INVALID },
+                })
+            }
             fresco_protocol::slot::op::BIND => {
                 use fresco_protocol::slot::{refusal as no, SlotBind, SlotBindResult};
                 fresco_protocol::encode(&match (fresco_protocol::decode::<SlotBind>(&msg.payload), binder) {
@@ -508,6 +547,17 @@ mod tests {
         assert_eq!(why(t.consume(1, &enter, 1001, purpose::FILL, YES, |_, _| true)), 0);
         let typed = t.mint(key(0x04, 0, 0));
         assert_eq!(why(t.consume(1, &typed, 1001, purpose::FILL, YES, |_, _| true)), refusal::WRONG_KIND);
+    }
+
+    #[test]
+    fn a_press_is_seen_on_its_own_window_for_as_long_as_asked() {
+        let mut t = Table::default();
+        let s = 1_000_000_000u64;
+        t.pressed_at(7, 10 * s);
+        assert!(t.pressed_within(7, 10 * s + 900_000_000, 1000));
+        assert!(!t.pressed_within(7, 11 * s + 1, 1000), "a second and a bit later");
+        assert!(!t.pressed_within(8, 10 * s, 1000), "another window");
+        assert!(!t.pressed_within(7, 16 * s, 60_000), "never past PRESSED_MAX_MS");
     }
 
     #[test]

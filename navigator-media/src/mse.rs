@@ -426,6 +426,16 @@ impl Media {
                 }
                 if let Some(ms) = self.ms.as_mut() { for b in &mut ms.bufs { b.quota = true } }
             }
+            // The user turned it up, down or off in the player itself.
+            ToParent::Volume { volume, muted } => {
+                if (self.volume, self.muted) != (volume, muted) {
+                    self.volume = volume;
+                    self.muted = muted;
+                    self.events.push(Fire::Element("volumechange"));
+                }
+            }
+            // For the page's mediaSession action handler (not wired yet).
+            ToParent::Action { .. } => {}
             ToParent::Error { code: c, .. } => {
                 self.fail(match c { code::DECODE => 3, code::UNSUPPORTED => 4, code::NETWORK => 2, _ => 3 });
             }

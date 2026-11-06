@@ -253,7 +253,7 @@ impl Engine {
             balance: [Gain::new(1.0, rate as f32, 20.0), Gain::new(1.0, rate as f32, 20.0)],
             want_channels: None,
             spatial: false,
-            virt: Virtualizer::new(rate as f32),
+            virt: Virtualizer::for_period(rate as f32, period_frames),
             bed: vec![0.0; period_frames * BED_CHANNELS],
         }
     }
@@ -748,6 +748,13 @@ pub fn run(cfg: Config) -> ! {
     // Appended, so a restarted lyrad keeps what the last one wrote.
     let mut dump = std::env::var("LYRA_DUMP").ok()
         .and_then(|p| std::fs::OpenOptions::new().create(true).append(true).open(p).ok());
+    // Development: LYRA_POSLOG=<file> logs, each period, CLOCK_MONOTONIC, the
+    // device's consumed frames (GETOPTR), the frames written so far (the
+    // dump's frame index) and GETODELAY: the clock test's truth (§8 check 6).
+    let mut poslog = std::env::var("LYRA_POSLOG").ok()
+        .and_then(|p| std::fs::OpenOptions::new().create(true).append(true).open(p).ok())
+        .map(std::io::BufWriter::new);
+    let mut written: u64 = 0;
     loop {
         let sink = match OssSink::open(cfg.rate, channels, cfg.period_frames, cfg.nfrags) {
             Ok(s) => s,
@@ -793,6 +800,13 @@ pub fn run(cfg: Config) -> ! {
                 if let Some(ppm) = speed.sample(played, now) {
                     engine.rate_ppm = ppm;
                 }
+                if let Some(w) = poslog.as_mut() {
+                    use std::io::Write;
+                    let _ = writeln!(w, "{now} {played} {written} {delay}");
+                    if written % (cfg.rate as u64) < cfg.period_frames as u64 {
+                        let _ = w.flush();
+                    }
+                }
             }
             engine.mix(&mut mix, delay, now);
             let gen = engine.session();
@@ -807,6 +821,7 @@ pub fn run(cfg: Config) -> ! {
                 let bytes = unsafe { std::slice::from_raw_parts(out.as_ptr() as *const u8, out.len() * 2) };
                 let _ = f.write_all(bytes);
             }
+            written += cfg.period_frames as u64;
             if let Err(e) = sink.write_i16(&out) {
                 eprintln!("lyrad: device write failed ({e}); reopening");
                 break;
@@ -1019,17 +1034,24 @@ mod tests {
         e.apply(Cmd::Msg(1, ToEngine::SetGain { stream: 2, db: 0.0 }));
         e.apply(Cmd::Msg(1, ToEngine::Start { stream: 2 }));
         e.apply(Cmd::Msg(1, ToEngine::SetSpatial { sink: 0, on: true }));
-        let mut sl = [0.0f32; 64 * 8];
-        sl.iter_mut().skip(4).step_by(8).for_each(|v| *v = 0.5);
+        // A 2 kHz tone in the left surround (period 64 = 2/3 ms).
+        let tone_sl = |k: usize| -> Vec<f32> {
+            (0..64 * 8).map(|j| if j % 8 == 4 { 0.5 * (2.0 * std::f32::consts::PI * 2000.0 * ((k * 64 + j / 8) as f32) / 48_000.0).sin() } else { 0.0 }).collect()
+        };
         let mut mix = vec![0.0f32; 128];
-        for _ in 0..50 {
-            p1.write(&sl);
+        let (mut l, mut r) = (0.0f32, 0.0f32);
+        for k in 0..50 {
+            p1.write(&tone_sl(k));
             p2.write(&[0.0; 128]);
             e.mix(&mut mix, 0, 0);
+            if k >= 40 {
+                l += mix.iter().step_by(2).map(|x| x * x).sum::<f32>();
+                r += mix.iter().skip(1).step_by(2).map(|x| x * x).sum::<f32>();
+            }
         }
-        // Behind on the left: the left ear hears it louder.
-        let (l, r) = (mix[126], mix[127]);
-        assert!(l > 0.2 && r > 0.05 && l > 1.5 * r, "left {l} right {r}");
+        // Behind on the left: the left ear hears it much louder (FABIAN: 12.8 dB at 2 kHz).
+        let d = 10.0 * (l / r).log10();
+        assert!((d - 12.8).abs() < 1.5, "left over right {d:.1} dB");
 
         // The opted-out stream alone: bit-perfect even with surround on.
         p1.write(&[0.0; 64 * 8]);
@@ -1049,6 +1071,8 @@ mod tests {
         e.set_channels(6);
         open(&mut e, 1, 3, 48_000, 8, c3);
         e.apply(Cmd::Msg(1, ToEngine::Close { stream: 2 }));
+        let mut sl = [0.0f32; 64 * 8];
+        sl.iter_mut().skip(4).step_by(8).for_each(|v| *v = 0.5);
         let mut mix6 = vec![0.0f32; 64 * 6];
         for _ in 0..50 {
             p3.write(&sl);

@@ -202,6 +202,11 @@ impl Child {
         self.0.ok(op::EMIT, &proto::Emit { embed, bytes })
     }
 
+    /// Ask for picture-in-picture (`on`) or to go back into the slot.
+    pub fn pip(&mut self, embed: EmbedId, on: bool, aspect: [u32; 2]) -> Result<(), Error> {
+        self.0.ok(op::PIP, &proto::Pip { embed, on, aspect })
+    }
+
     pub fn focus_out(&mut self, embed: EmbedId, forward: bool) -> Result<(), Error> {
         self.0.ok(op::FOCUS_OUT, &proto::FocusOut { embed, forward })
     }

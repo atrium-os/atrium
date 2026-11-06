@@ -81,9 +81,9 @@ impl View for Slider {
 
         let thumb = Rect::new(cx - THUMB / 2.0, r.y(), THUMB, THUMB);
         // Focus ring around the thumb (§14.1), under everything.
-        let halo = ctx.tree.insert(None, Node::Rect { rect: grow(thumb, 3.0), fill: Color::TRANSPARENT, radius: THUMB / 2.0 + 3.0 });
-        let ring = ctx.tree.insert(None, Node::Rect { rect: grow(thumb, 1.0), fill: Color::TRANSPARENT, radius: THUMB / 2.0 + 1.0 });
-        let target = ctx.tree.insert(None, Node::Rect { rect: r, fill: Color::TRANSPARENT, radius: 0.0 });
+        let halo = ctx.add(Node::Rect { rect: grow(thumb, 3.0), fill: Color::TRANSPARENT, radius: THUMB / 2.0 + 3.0 });
+        let ring = ctx.add(Node::Rect { rect: grow(thumb, 1.0), fill: Color::TRANSPARENT, radius: THUMB / 2.0 + 1.0 });
+        let target = ctx.add(Node::Rect { rect: r, fill: Color::TRANSPARENT, radius: 0.0 });
         let (track, filled, edge) = if self.enabled {
             (t.border_strong(), t.accent_mark(), t.border_control())
         } else {

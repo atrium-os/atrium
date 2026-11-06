@@ -180,6 +180,7 @@ The policy is the one Lyra's spec settled (§12.1).
   slot into a small floating window, and back. It needs a Limen message pair and Forum
   support. Media keys need an input route from Forum to "the playing media". Both are listed
   as later steps with their owners, because they are not the player's code alone.
+  The design is [atrium-player-pip-keys.md](atrium-player-pip-keys.md) (accepted 2026-11-06).
 
 ## 8. Build plan
 
@@ -299,6 +300,40 @@ Fresco's layers land.
   ending (a note every second keeps the watchdog quiet), doesn't go looking for Cues that
   aren't written yet, and ends only after `LoadDone`. A seek back into what has arrived
   works meanwhile (`worker/tests/play.rs`).
+- M7, page subtitles: `TextTrack { id, lang, label }` carries a WebVTT file (`<track>`) as a
+  regular-file descriptor, and `ShowText { None | InBand | Page(id) }` picks what shows
+  (in-band by default). The decode worker parses the file (`cue::vtt_file`: signature,
+  timings, NOTE/STYLE/REGION skipped, markup stripped, 4 MiB and 8192 cues at most, a cue at
+  most a minute), so the supervisor still parses nothing. A restarted worker reads the
+  files again; a new file under an id replaces the old one's cues.
+- M7, a URL in the standalone player (`atrium-player URL`, windowed or `--headless`): the
+  player starts `atrium-player-fetch`, a process of its own that reads its trust store,
+  enters Capsicum (network through casper, as navigator-fetchd), and only then reads the
+  URL. It fetches through Nuntius with `Fd` delivery and hands back the read-only
+  descriptor as soon as the head is in; the player plays it as a growing `Load` and gets
+  `LoadDone` at `Done`. A download cut off part way plays what arrived. Neither the
+  supervisor nor the worker gets network. It stands in for nuntiusd and the `net.fetch`
+  launch (nuntius.md §6 steps 2 and 4) and should move to them when they exist.
+  In the FreeBSD VM the fetcher runs in capability mode, and `vp9-opus.webm` served at one
+  16 KiB piece a second plays with every frame matching ffmpeg's hashes. That needed two
+  Nuntius fixes on FreeBSD: the anonymous file is `memfd_create` (a plain `SHM_ANON`
+  object refuses writes past its size), and it is written at explicit offsets (the
+  read-only descriptor is a dup that shares the file offset).
+- M7, keys and the page's media session (atrium-player-pip-keys.md §6 step 1): in the
+  focused player, space and k play or pause, j and l step 10 s, the arrows 5 s, up and down
+  change the volume, m mutes, c turns subtitles off and back on, Home, End and 0 to 9 jump.
+  A volume change is reported as `ToParent::Volume`. The page's `MediaMetadata` and
+  `MediaActions` are kept for now-playing; shift-N and shift-P send `ToParent::Action` when
+  the page handles next or previous.
+- M7, now-playing and PiP (atrium-player-pip-keys.md §3, §4): the player reports its
+  session to choragusd on its stream's connection (so it counts for the parent): state,
+  the page's title and artist or the file name, and the actions it takes, at every change
+  and once a second while playing. Actions from media keys, Forum and the lock screen come
+  back as `SessionAction` and act like the player's own controls; next and previous go to
+  the page as `Action` when it handles them. An embedded player with video has a PiP button
+  (and `i`), and the page can send `RequestPip` and `ExitPip`; the player asks limend
+  (`Child::pip`), which checks the press, and follows limend's `Pip` event. With no sound
+  track there is no session yet (the session rides on the stream's connection).
 
 **Tests along the way:**
 - every demuxer limit has a test with a crafted file that exceeds it;

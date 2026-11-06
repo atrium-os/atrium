@@ -35,6 +35,26 @@ pub trait Compositor: Send {
     /// `owner_uid` (fresco-video.md §8 S1): every window it opens stays
     /// hidden until bound, so a child can't put a top-level window on screen.
     fn embed_connection(&mut self, owner_uid: u32) -> Result<UnixStream, u8>;
+
+    /// Whether frescod routed a pointer or key press to `window` in the
+    /// last `ms` (the PiP gesture check). No frescod support: never.
+    fn pressed_within(&mut self, _window: WindowToken, _ms: u32) -> bool {
+        false
+    }
+
+    /// Take `child` out of `parent`'s slot but keep it shown, for Forum to
+    /// place in the `pip` layer. A later `bind` puts it back.
+    fn release(&mut self, _parent: WindowToken, _child: WindowToken) -> Result<(), u8> {
+        Err(u8::MAX)
+    }
+}
+
+/// forum-wm, for picture-in-picture (over `forum-ctl`, with limend's
+/// narrow `forum-pip` grant): place a released child window in the `pip`
+/// layer, or drop it from there.
+pub trait Shell: Send {
+    fn pip(&mut self, window: WindowToken, aspect: [u32; 2]) -> Result<(), u8>;
+    fn pip_end(&mut self, window: WindowToken);
 }
 
 /// portcullisd's embed-mode `ExecInstance` (limen.md §4).
@@ -81,6 +101,8 @@ struct Embed {
     visible: bool,
     bound: bool,
     attached: bool,
+    /// In picture-in-picture: out of the slot, in Forum's `pip` layer.
+    pip: bool,
     to_child: Rate,
     to_parent: Rate,
 }
@@ -145,6 +167,7 @@ pub struct Shared {
     /// app id (arca-ui runs as `_arca-ui`, not as a Portcullis app).
     system_uids: Mutex<HashMap<&'static str, u32>>,
     attribution: Mutex<Option<Box<dyn Attribution>>>,
+    shell: Mutex<Option<Box<dyn Shell>>>,
 }
 
 impl Shared {
@@ -161,6 +184,7 @@ impl Shared {
             defaults,
             system_uids: Mutex::new(HashMap::new()),
             attribution: Mutex::new(None),
+            shell: Mutex::new(None),
         })
     }
 
@@ -174,6 +198,11 @@ impl Shared {
     /// embedded player gets no ticket and so plays nothing.
     pub fn set_attribution(&self, a: Box<dyn Attribution>) {
         *self.attribution.lock().unwrap() = Some(a);
+    }
+
+    /// Forum, for picture-in-picture. Without it, PiP is refused.
+    pub fn set_shell(&self, s: Box<dyn Shell>) {
+        *self.shell.lock().unwrap() = Some(s);
     }
 
     /// Live embeds (tests and logs).
@@ -268,6 +297,7 @@ fn handle(shared: &Arc<Shared>, conn: ConnId, uid: u32, opc: u16, payload: &[u8]
                 as_child(shared, conn, r.embed, |e| e.child_window = Some(r.window))
             }
             op::EMIT => emit(shared, conn, de(payload)?),
+            op::PIP => pip(shared, conn, de(payload)?),
             op::FOCUS_OUT => {
                 let f: proto::FocusOut = de(payload)?;
                 let st = shared.state.lock().unwrap();
@@ -342,7 +372,7 @@ fn request(shared: &Arc<Shared>, conn: ConnId, uid: u32, req: proto::Request) ->
         .flatten();
     let e = Embed {
         role, parent: conn, parent_uid: uid, parent_window: req.window, z: req.z, child, child_uid, spawned, audio_ticket,
-        child_window: None, rect: None, visible: true, bound: false, attached: false,
+        child_window: None, rect: None, visible: true, bound: false, attached: false, pip: false,
         to_child: Rate::default(), to_parent: Rate::default(),
     };
     st.to_child(&e, ChildEvent::Attach { embed, role: role.name.into(), parent_app: app, parent_uid: uid });
@@ -376,6 +406,11 @@ fn as_child(shared: &Arc<Shared>, conn: ConnId, embed: EmbedId, f: impl FnOnce(&
 /// Bring frescod's slot in line with what the parent and child have said.
 fn rebind(shared: &Arc<Shared>, st: &mut State, embed: EmbedId) {
     let Some(e) = st.embeds.get(&embed) else { return };
+    // In PiP the window is Forum's: the slot's place and visibility are
+    // kept for its return, and a hidden slot suspends nothing (§3.2).
+    if e.pip {
+        return;
+    }
     let want = match (e.visible, e.rect, e.child_window) {
         (true, Some(r), Some(c)) => Some((r, c)),
         _ => None,
@@ -470,6 +505,107 @@ fn emit(shared: &Arc<Shared>, conn: ConnId, m: proto::Emit) -> Result<Reply, Rep
     Ok(Reply::Ok)
 }
 
+/// The child's PiP request (atrium-player-pip-keys.md §3).
+fn pip(shared: &Arc<Shared>, conn: ConnId, p: proto::Pip) -> Result<Reply, Reply> {
+    let no = Err(Reply::Refused { reason: refusal::NO_PIP });
+    let mut st = shared.state.lock().unwrap();
+    let Some(e) = st.embeds.get(&p.embed).filter(|e| e.child == conn) else {
+        return Err(Reply::Refused { reason: refusal::NOT_YOURS });
+    };
+    if !p.on {
+        if !e.pip {
+            return Ok(Reply::Ok);
+        }
+        pip_off(shared, &mut st, p.embed);
+        return Ok(Reply::Ok);
+    }
+    if e.pip {
+        return Ok(Reply::Ok);
+    }
+    // Only a shown player: bound into a visible slot.
+    if !catalogue::PIP_ROLES.contains(&e.role.name) || !e.bound || p.aspect.contains(&0) || p.aspect.iter().any(|&v| v > 100_000) {
+        return no;
+    }
+    let (parent_w, child_w) = (e.parent_window, e.child_window.expect("bound"));
+    {
+        let mut comp = shared.compositor.lock().unwrap();
+        // A real press, routed by frescod, on the player or its page.
+        if !comp.pressed_within(child_w, catalogue::PIP_GESTURE_MS) && !comp.pressed_within(parent_w, catalogue::PIP_GESTURE_MS) {
+            return no;
+        }
+    }
+    if shared.shell.lock().unwrap().is_none() {
+        return no;
+    }
+    // One PiP at a time: the new one replaces the last.
+    let last: Vec<EmbedId> = st.embeds.iter().filter(|(_, e)| e.pip).map(|(k, _)| *k).collect();
+    for k in last {
+        pip_off(shared, &mut st, k);
+    }
+    let mut shell = shared.shell.lock().unwrap();
+    let sh = shell.as_mut().unwrap();
+    if let Err(r) = shared.compositor.lock().unwrap().release(parent_w, child_w) {
+        eprintln!("limend: embed {}: frescod would not release the slot for PiP ({r})", p.embed);
+        return no;
+    }
+    if let Err(r) = sh.pip(child_w, p.aspect) {
+        eprintln!("limend: embed {}: Forum refused PiP ({r})", p.embed);
+        drop(shell);
+        // Back into the slot as it was.
+        let e = st.embeds.get_mut(&p.embed).unwrap();
+        e.bound = false;
+        e.attached = true;
+        rebind_quiet(shared, &mut st, p.embed);
+        return no;
+    }
+    drop(shell);
+    let e = st.embeds.get_mut(&p.embed).unwrap();
+    e.pip = true;
+    e.bound = false;
+    let e = &st.embeds[&p.embed];
+    st.to_parent(e, ParentEvent::Pip { embed: p.embed, on: true });
+    st.to_child(e, ChildEvent::Pip { embed: p.embed, on: true });
+    Ok(Reply::Ok)
+}
+
+/// Out of PiP: Forum drops the window, and it goes back into its slot as
+/// the parent last placed it, or is suspended if the slot is hidden now.
+fn pip_off(shared: &Arc<Shared>, st: &mut State, embed: EmbedId) {
+    let Some(e) = st.embeds.get_mut(&embed) else { return };
+    e.pip = false;
+    if let (Some(c), Some(sh)) = (e.child_window, shared.shell.lock().unwrap().as_mut()) {
+        sh.pip_end(c);
+    }
+    let e = &st.embeds[&embed];
+    st.to_parent(e, ParentEvent::Pip { embed, on: false });
+    st.to_child(e, ChildEvent::Pip { embed, on: false });
+    let shown = e.visible && e.rect.is_some();
+    if shown {
+        rebind_quiet(shared, st, embed);
+    } else {
+        st.to_parent(e, ParentEvent::Suspended { embed });
+        st.to_child(e, ChildEvent::Suspended { embed });
+    }
+}
+
+/// `rebind`, without the `Resumed` a return to the slot would otherwise
+/// send (the `Pip` event said it).
+fn rebind_quiet(shared: &Arc<Shared>, st: &mut State, embed: EmbedId) {
+    if let Some(e) = st.embeds.get_mut(&embed) {
+        e.bound = true;
+    }
+    // Bound already as far as rebind knows, so it binds without telling.
+    let Some(e) = st.embeds.get(&embed) else { return };
+    let (Some(rect), Some(child)) = (e.rect, e.child_window) else { return };
+    let r = shared.compositor.lock().unwrap().bind(e.parent_window, child, e.role.slot, Some(rect), e.z);
+    if !matches!(r, Ok((pu, cu)) if pu == e.parent_uid && cu == e.child_uid) {
+        eprintln!("limend: embed {embed}: rebinding after PiP failed ({r:?})");
+        if let Some(e) = st.embeds.get_mut(&embed) {
+            e.bound = false;
+        }
+    }
+}
+
 fn provide(shared: &Arc<Shared>, conn: ConnId, uid: u32, p: proto::Provide) -> Result<Reply, Reply> {
     let role = catalogue::role(&p.role).ok_or(Reply::Refused { reason: refusal::UNKNOWN_ROLE })?;
     let Provider::System(app) = role.provider else { return Err(Reply::Refused { reason: refusal::NOT_PROVIDER }) };
@@ -490,6 +626,12 @@ fn provide(shared: &Arc<Shared>, conn: ConnId, uid: u32, p: proto::Provide) -> R
 /// Take `e` (already removed) down: release the slot, tell the child, end
 /// a spawned child's jail after the grace period.
 fn end(shared: &Arc<Shared>, st: &State, embed: EmbedId, e: Embed, tell_parent: bool) {
+    // PiP doesn't outlive the embed.
+    if e.pip {
+        if let (Some(c), Some(sh)) = (e.child_window, shared.shell.lock().unwrap().as_mut()) {
+            sh.pip_end(c);
+        }
+    }
     if e.bound {
         if let Some(c) = e.child_window {
             let _ = shared.compositor.lock().unwrap().bind(e.parent_window, c, e.role.slot, None, e.z);

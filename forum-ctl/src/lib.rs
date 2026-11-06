@@ -95,14 +95,29 @@ pub enum Intent {
     ToggleZoom,
     /// "Make outputs `outputs` a span group" (two or more, one mode,
     /// touching in a row or a grid), with `gap` hidden pixels between
-    /// neighbours for the bezels (0: none). Remembered for this set of
-    /// monitors; a monitor leaves any group it was in. One output alone
-    /// takes it out of its group.
-    SetSpanGroup { outputs: Vec<u32>, gap: u32 },
+    /// neighbours for the bezels (0: none), or with `gap_mm` (not 0) the
+    /// bezels as millimetres between the pictures, turned into pixels from
+    /// each monitor's physical size. Remembered for this set of monitors;
+    /// a monitor leaves any group it was in. One output alone takes it out
+    /// of its group.
+    SetSpanGroup { outputs: Vec<u32>, gap: u32, gap_mm: u32 },
     /// "Which span groups does this set of monitors have, and what spans?"
     ListSpanGroups,
     /// "Let app `app` span (true), or keep its zoom on one monitor."
     SetAppSpans { app: String, spans: bool },
+    /// "Move the picture-in-picture window to this corner" (a drag on it
+    /// ends as this; atrium-player-pip-keys.md §3.2). Remembered.
+    PipCorner { corner: Corner },
+}
+
+/// A corner of the work area, for picture-in-picture.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub enum Corner {
+    TopLeft,
+    TopRight,
+    BottomLeft,
+    #[default]
+    BottomRight,
 }
 
 /// A span group as the core reports it.
@@ -112,6 +127,9 @@ pub struct SpanGroupInfo {
     pub members: Vec<u64>,
     /// Hidden pixels between neighbours.
     pub gap: u32,
+    /// Or, when not 0, millimetres between neighbouring pictures (the two
+    /// bezels as a ruler measures them), in place of `gap`.
+    pub gap_mm: u32,
 }
 
 /// The core's answer to an `Intent`.

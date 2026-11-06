@@ -15,6 +15,13 @@
 //!   lyra-vmtest ctl <control_sock> spatial <0|1>
 //!   lyra-vmtest ctl <control_sock> app-spatial <app_id> <0|1>
 //!       The volume UI's requests (needs the `audio-control` grant).
+//!   lyra-vmtest clock <choragus_sock> <rate> <secs> <offset_s>
+//!       The clock test (lyra-v1.md §8 check 6): plays silence with a one-
+//!       sample click at stream frame round(rate × (k + offset_s)) for every
+//!       second k, and prints, for each click, the heard time the clock page
+//!       predicted 30–300 ms ahead: `click <rate> <k> <frame> <predicted_ns>
+//!       <rate_ppm>`. The host compares them with the dump and the device
+//!       position (scripts/lyra-vm-check.sh clock).
 //!   lyra-vmtest lyrad-raw <lyrad_sock>
 //!       Connect to lyrad directly and ask for a stream. Prints `refused` if
 //!       lyrad hangs up (only _choragus may talk to it), `ACCEPTED` otherwise.
@@ -88,6 +95,68 @@ fn ctl(sock: &str, args: &[String]) {
     }
 }
 
+fn clock(sock: &str, rate: u32, secs: f32, offset: f64) {
+    let mut c = Client::connect(sock, None).unwrap_or_else(|e| die(format!("connect {sock}: {e}")));
+    let params = StreamParams { role: Role::Media, rate, channels: 2, buffer_ms: 100, label: "Clock".into() };
+    let s = c.open(params).unwrap_or_else(|e| die(format!("open: {e}")));
+    let total = (secs as f64 * rate as f64) as u64;
+    let click_at = |k: u64| (rate as f64 * (k as f64 + offset)).round() as u64;
+    let mut next_pred = 0u64; // the first click not yet predicted
+    let mut pos = 0u64; // frames written
+    let mut started = false;
+    let chunk = 256u64;
+    let mut buf = vec![0.0f32; chunk as usize * 2];
+    while pos < total || click_at(next_pred) < total {
+        if pos < total {
+            for (f, v) in buf.chunks_exact_mut(2).enumerate() {
+                let n = pos + f as u64;
+                let k = (n as f64 / rate as f64 - offset).round().max(0.0) as u64;
+                let x = if click_at(k) == n { 0.9 } else { 0.0 };
+                v[0] = x;
+                v[1] = x;
+            }
+            let mut off = 0usize;
+            while off < chunk as usize {
+                let w = s.write(&buf[off * 2..]) as usize;
+                off += w;
+                if w == 0 {
+                    if !started {
+                        c.start(&s).unwrap_or_else(|e| die(format!("start: {e}")));
+                        started = true;
+                    }
+                    std::thread::sleep(Duration::from_millis(2));
+                    predict(&s, rate, &click_at, &mut next_pred);
+                }
+            }
+            pos += chunk;
+        } else {
+            std::thread::sleep(Duration::from_millis(2));
+            predict(&s, rate, &click_at, &mut next_pred);
+        }
+    }
+    std::thread::sleep(Duration::from_millis(300));
+}
+
+/// Print the clock's prediction for each click 30–300 ms before it is heard.
+fn predict(s: &lyra_protocol::client::Stream, rate: u32, click_at: &dyn Fn(u64) -> u64, next: &mut u64) {
+    let ck = s.clock();
+    if ck.state != 1 {
+        return;
+    }
+    let now = lyra::server::monotonic_ns();
+    loop {
+        let n = click_at(*next);
+        let ahead = ck.heard_at(n) - now;
+        if ahead > 300_000_000 {
+            return;
+        }
+        if ahead >= 30_000_000 {
+            println!("click {rate} {} {n} {} {}", *next, ck.heard_at(n), ck.rate_ppm);
+        }
+        *next += 1;
+    }
+}
+
 fn lyrad_raw(sock: &str) {
     let mut s = match std::os::unix::net::UnixStream::connect(sock) {
         Ok(s) => s,
@@ -112,6 +181,7 @@ fn main() {
         "hostile" => hostile(&a(2), a(3).parse().unwrap_or(5.0)),
         "ctl" => ctl(&a(2), &args[3.min(args.len())..]),
         "lyrad-raw" => lyrad_raw(&a(2)),
-        _ => die("usage: lyra-vmtest hostile|ctl|lyrad-raw ...".into()),
+        "clock" => clock(&a(2), a(3).parse().unwrap_or(48_000), a(4).parse().unwrap_or(600.0), a(5).parse().unwrap_or(0.0)),
+        _ => die("usage: lyra-vmtest hostile|ctl|clock|lyrad-raw ...".into()),
     }
 }

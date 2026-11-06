@@ -67,6 +67,10 @@ pub mod proto {
         Withdrawn { id: u64 },
     }
 
+    /// `Notification::user` of a post from a system service (praecod's
+    /// `PRAECO_SYSTEM_POSTERS`): shown to every user's shelf.
+    pub const SYSTEM_USER: &str = "*";
+
     /// Encode a v0 POST payload.
     pub fn encode_post(urgency: u8, title: &str, body: &str) -> Vec<u8> {
         let mut p = Vec::with_capacity(5 + title.len() + body.len());
@@ -315,6 +319,32 @@ pub mod server {
     fn send_ev(conn: &mut Connection, ev: &Event) -> io::Result<()> {
         let p = postcard::to_stdvec(ev).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
         conn.send_message(proto::CLASS, op::EV, flag::ASYNC_EVENT, &p)
+    }
+}
+
+/// Posting, for a system service (one of praecod's system posters).
+pub mod client {
+    use std::io;
+    use std::path::Path;
+
+    use aqueduct::{flag, Connection};
+
+    use crate::proto::{self, op, status};
+
+    /// Post a notification through praecod at `sock`; its id.
+    pub fn post(sock: &Path, urgency: u8, title: &str, body: &str) -> io::Result<u64> {
+        let mut c = Connection::connect(sock)?;
+        c.send_message(proto::CLASS, op::POST, flag::RESPONSE_EXPECTED, &proto::encode_post(urgency, title, body))?;
+        loop {
+            let m = c.recv_message()?;
+            if m.opcode_class == proto::CLASS && m.op == op::POST && m.flags & flag::IS_RESPONSE != 0 {
+                return match (m.payload.first(), m.payload.get(1..9)) {
+                    (Some(&status::OK), Some(id)) => Ok(u64::from_le_bytes(id.try_into().unwrap())),
+                    (Some(&st), _) => Err(io::Error::other(format!("praecod refused the post (status {st})"))),
+                    _ => Err(io::Error::new(io::ErrorKind::InvalidData, "short reply")),
+                };
+            }
+        }
     }
 }
 

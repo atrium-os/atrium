@@ -46,8 +46,12 @@ impl Screen {
 /// F1 "occluded surface render-gated" tie — the default arrangement is one focused
 /// document filling the work area, the rest stacked + gated (forum.md §2.3), not
 /// tiled (that's an F2 split/group intent).
-const DOC_FOCUSED: i32 = 4;
-const DOC_UNFOCUSED: i32 = 5;
+const DOC_FOCUSED: i32 = 5;
+const DOC_UNFOCUSED: i32 = 6;
+/// Picture-in-picture (atrium-player-pip-keys.md §3): above documents and
+/// panels, below chrome, HUDs and dialogs, so it never covers a prompt or a
+/// credential slot.
+pub const PIP_LAYER: i32 = 3;
 
 fn layer(role: WmRole) -> i32 {
     match role {
@@ -56,9 +60,10 @@ fn layer(role: WmRole) -> i32 {
         WmRole::Dialog => 0,
         WmRole::Hud => 1,
         WmRole::Chrome => 2,
-        WmRole::Panel => 3,
+        WmRole::Panel => 4,
+        WmRole::Pip => PIP_LAYER,
         WmRole::Document => DOC_FOCUSED,
-        WmRole::Background => 6,
+        WmRole::Background => 7,
     }
 }
 
@@ -100,7 +105,7 @@ fn resolve_focus(surfaces: &[WmSurfaceInfo], focus_intent: Option<u32>) -> u32 {
 
 /// App surfaces a person works in (what can be focused and moved).
 fn click_focusable_role(role: WmRole) -> bool {
-    matches!(role, WmRole::Document | WmRole::Dialog | WmRole::Panel)
+    matches!(role, WmRole::Document | WmRole::Dialog | WmRole::Panel | WmRole::Pip)
 }
 
 fn rect_for(screen: &Screen, role: WmRole) -> WmRect {
@@ -119,6 +124,9 @@ fn rect_for(screen: &Screen, role: WmRole) -> WmRect {
         WmRole::Hud | WmRole::Chrome => {
             WmRect { x: screen.rect.x, y: screen.rect.y, w: screen.rect.w, h: screen.bar_h }
         }
+        // The default corner and aspect; `Wm` places it by the player's
+        // aspect at the user's corner (`place_pip`).
+        WmRole::Pip => pip_rect(wa, (16, 9), forum_ctl::Corner::default()),
         // frescod's band for toasts (it clamps them there anyway).
         WmRole::Notification => {
             let top = (wa.y - screen.rect.y).max(0) as u32;
@@ -184,6 +192,69 @@ pub fn arrange_for(
         .collect();
 
     WmDeclareLayoutPayload { slots, focus, focus_cause: 0 }
+}
+
+/// Where the PiP window sits (forum_ctl::Corner), and where it is placed:
+/// `aspect` (width:height, from the player's hints; 0 → 16:9) at a quarter
+/// of the work area's width, no more than a quarter of its height, at least
+/// 160×90, `PIP_MARGIN` from the corner's edges.
+pub const PIP_MARGIN: i32 = 16;
+pub fn pip_rect(wa: WmRect, aspect: (u32, u32), corner: forum_ctl::Corner) -> WmRect {
+    use forum_ctl::Corner;
+    let (aw, ah) = if aspect.0 == 0 || aspect.1 == 0 { (16, 9) } else { aspect };
+    let ratio = ah as f64 / aw as f64;
+    let mut w = wa.w as f64 / 4.0;
+    let mut h = w * ratio;
+    if h > wa.h as f64 / 4.0 {
+        h = wa.h as f64 / 4.0;
+        w = h / ratio;
+    }
+    if w < 160.0 {
+        w = 160.0;
+        h = w * ratio;
+    }
+    if h < 90.0 {
+        h = 90.0;
+        w = h / ratio;
+    }
+    let (w, h) = (w.round() as i32, h.round() as i32);
+    let x = match corner {
+        Corner::TopLeft | Corner::BottomLeft => wa.x + PIP_MARGIN,
+        Corner::TopRight | Corner::BottomRight => wa.x + wa.w - PIP_MARGIN - w,
+    };
+    let y = match corner {
+        Corner::TopLeft | Corner::TopRight => wa.y + PIP_MARGIN,
+        Corner::BottomLeft | Corner::BottomRight => wa.y + wa.h - PIP_MARGIN - h,
+    };
+    WmRect { x, y, w, h }
+}
+
+/// Put each picture-in-picture surface in `layout` at `corner`, sized by
+/// its own aspect (the size it asked for), in the pip layer. One that the
+/// arrangement left out (zoom, snap) is added: PiP stays up over them.
+pub fn place_pip(layout: &mut WmDeclareLayoutPayload, screen: &Screen, active: &[WmSurfaceInfo], corner: forum_ctl::Corner) {
+    let wa = screen.work_area();
+    for s in active.iter().filter(|s| s.role == WmRole::Pip) {
+        let aspect = (s.rect.w.max(0) as u32, s.rect.h.max(0) as u32);
+        let slot = WmSlot { surface_id: s.surface_id, rect: pip_rect(wa, aspect, corner), layer: PIP_LAYER };
+        match layout.slots.iter_mut().find(|x| x.surface_id == s.surface_id) {
+            Some(x) => *x = slot,
+            None => layout.slots.push(slot),
+        }
+    }
+}
+
+/// The corner nearest `(x, y)`: where a PiP drag that ends there snaps.
+pub fn nearest_corner(wa: WmRect, x: i32, y: i32) -> forum_ctl::Corner {
+    use forum_ctl::Corner;
+    let right = x >= wa.x + wa.w / 2;
+    let bottom = y >= wa.y + wa.h / 2;
+    match (right, bottom) {
+        (false, false) => Corner::TopLeft,
+        (true, false) => Corner::TopRight,
+        (false, true) => Corner::BottomLeft,
+        (true, true) => Corner::BottomRight,
+    }
 }
 
 /// A snap target — a half of the work area (the snap intent, forum.md §2.3).
@@ -308,6 +379,8 @@ fn subtract(r: &WmRect, cut: &WmRect) -> Vec<WmRect> {
 /// scale <identity> <thousandths>
 /// set <identity>@<x>,<y>:<w>x<h> ... [mirror <identity>=<source> ...]
 /// ```
+pub mod media;
+
 pub mod displays {
     use fresco_protocol::{WmOutput, WmOutputPlacement};
     use std::collections::HashMap;
@@ -439,7 +512,7 @@ pub mod displays {
             spans.sort_by(|a, b| a.0.cmp(b.0));
             for (key, groups) in spans {
                 for g in groups {
-                    lines.push(format!("span {} {} {}", hex(key), hex(&g.members), g.gap));
+                    lines.push(format!("span {} {} {} {}", hex(key), hex(&g.members), g.gap, g.gap_mm));
                 }
             }
             for a in &self.no_span {
@@ -465,11 +538,11 @@ pub mod displays {
                             m.scales.insert(id, s);
                         }
                     }
-                    Some(&"span") if w.len() == 4 => {
+                    Some(&"span") if w.len() == 5 => {
                         let ids = |s: &str| -> Option<Vec<u64>> { s.split(',').map(|x| u64::from_str_radix(x, 16).ok()).collect() };
-                        if let (Some(key), Some(members), Ok(gap)) = (ids(w[1]), ids(w[2]), w[3].parse::<u32>()) {
+                        if let (Some(key), Some(members), Ok(gap), Ok(gap_mm)) = (ids(w[1]), ids(w[2]), w[3].parse::<u32>(), w[4].parse::<u32>()) {
                             if members.len() >= 2 {
-                                m.spans.entry(key).or_default().push(forum_ctl::SpanGroupInfo { members, gap });
+                                m.spans.entry(key).or_default().push(forum_ctl::SpanGroupInfo { members, gap, gap_mm });
                             }
                         }
                     }
@@ -552,6 +625,18 @@ pub mod daemon {
     use std::collections::{HashMap, HashSet};
     use std::io;
 
+    /// `mm` between neighbouring pictures in pixels of the monitors `outs`
+    /// (fresco-span.md §4): their mean density along one axis, `axis`
+    /// giving a monitor's (pixels, millimetres) on it; 0 if none says.
+    pub fn bezel_px(mm: u32, outs: &[&WmOutput], axis: impl Fn(&WmOutput) -> (i32, u32)) -> u32 {
+        let sized: Vec<(f64, f64)> = outs.iter().map(|o| axis(o)).filter(|&(px, mm)| px > 0 && mm > 0).map(|(px, mm)| (f64::from(px), f64::from(mm))).collect();
+        if sized.is_empty() {
+            return 0;
+        }
+        let per_mm = sized.iter().map(|(px, mm)| px / mm).sum::<f64>() / sized.len() as f64;
+        (f64::from(mm) * per_mm).round() as u32
+    }
+
     /// Default number of workspaces (virtual desktops) when no per-user config
     /// overrides it. App surfaces live on one workspace each; the user switches
     /// the active workspace (Super+1..N). Chrome + background are global.
@@ -572,9 +657,9 @@ pub mod daemon {
     /// Roles a pointer click moves keyboard focus to. Clicking chrome (bar /
     /// dock / hud) or the wallpaper must NOT steal focus from the document the
     /// human is working in — only app surfaces (a document, a dialog, a side
-    /// panel) are focus targets.
+    /// panel, a PiP window for its keys) are focus targets.
     fn click_focusable(role: WmRole) -> bool {
-        matches!(role, WmRole::Document | WmRole::Dialog | WmRole::Panel)
+        matches!(role, WmRole::Document | WmRole::Dialog | WmRole::Panel | WmRole::Pip)
     }
 
     /// Resolve a pointer click on surface `clicked` to a focus change, if any.
@@ -633,7 +718,8 @@ pub mod daemon {
     pub struct SpanUp {
         pub window: u32,
         pub members: Vec<u64>,
-        pub gap: u32,
+        /// Hidden pixels between columns and between rows.
+        pub gaps: (u32, u32),
         /// The desktop rect the window covers.
         pub rect: WmRect,
     }
@@ -677,6 +763,10 @@ pub mod daemon {
         /// any document on the active workspace is snapped, it enters snap mode
         /// (manual tile: snapped docs show in their halves, the rest gate).
         pub snapped: HashMap<u32, Snap>,
+        /// Where the picture-in-picture window sits (`Intent::PipCorner`).
+        pub pip_corner: forum_ctl::Corner,
+        /// The focus of the layout declared last (0: none).
+        declared_focus: std::cell::Cell<u32>,
         /// The monitors (display 3.0), as frescod places them on the desktop.
         /// With fewer than two present the WM lays out on `screen` alone.
         pub outputs: Vec<WmOutput>,
@@ -700,6 +790,9 @@ pub mod daemon {
         /// The last span frescod refused (window, members): not asked
         /// again until something changes, so a refusal doesn't loop.
         span_refused: RefCell<Option<(u32, Vec<u64>)>>,
+        /// Notifications for the user, (title, body), that the binary posts
+        /// to Praeco: a span member held out for flapping (fresco-span.md §6).
+        pub notices: Vec<(String, String)>,
     }
 
     pub use forum_ctl::Side;
@@ -719,6 +812,8 @@ pub mod daemon {
                 tiled_workspaces: HashSet::new(),
                 zoomed: None,
                 snapped: HashMap::new(),
+                pip_corner: forum_ctl::Corner::default(),
+                declared_focus: std::cell::Cell::new(0),
                 outputs: Vec::new(),
                 home: HashMap::new(),
                 top: RefCell::new(HashMap::new()),
@@ -727,6 +822,7 @@ pub mod daemon {
                 restoring: false,
                 span_up: RefCell::new(None),
                 span_refused: RefCell::new(None),
+                notices: Vec::new(),
             }
         }
 
@@ -775,6 +871,19 @@ pub mod daemon {
         {
             if outputs == self.outputs {
                 return Ok(None);
+            }
+            // A span member newly held out for flapping: say which.
+            for o in outputs.iter().filter(|o| o.flapping) {
+                if !self.outputs.iter().any(|p| p.identity == o.identity && p.flapping) {
+                    self.notices.push((
+                        "A monitor keeps disconnecting".into(),
+                        format!(
+                            "The monitor on output {} dropped out 3 times in a minute. Its part of the \
+                             game stays dark until it has stayed connected for 10 seconds; check its cable.",
+                            o.output
+                        ),
+                    ));
+                }
             }
             // The same monitors as before, moved: the session moved them, so
             // remember it. Another set: put it back where it was last left
@@ -1026,6 +1135,24 @@ pub mod daemon {
         /// (forum.md §2.3). Zoom on → that surface fills the screen, all else
         /// gates; zoom off → back to the arrangement. Returns the new zoom state.
         /// No-op (returns `false`) when there's no focusable surface.
+        /// The surface the last declared layout focused (0: none).
+        pub fn declared_focus(&self) -> u32 {
+            self.declared_focus.get()
+        }
+
+        /// The registry app id of `surface`'s owner.
+        pub fn app_of(&self, conn: &mut impl FrescoConn, surface: u32) -> Option<String> {
+            let s = conn.enumerate().ok()?.into_iter().find(|s| s.surface_id == surface)?;
+            self.registry.resolve(s.owner_uid).map(|(_, a)| a.to_string())
+        }
+
+        /// Move the PiP window to `corner` and lay out again.
+        pub fn set_pip_corner(&mut self, conn: &mut impl FrescoConn, corner: forum_ctl::Corner) -> io::Result<()> {
+            self.pip_corner = corner;
+            let surfaces = conn.enumerate()?;
+            self.declare(conn, &surfaces).map(|_| ())
+        }
+
         pub fn toggle_zoom(&mut self, conn: &mut impl FrescoConn) -> io::Result<bool> {
             let surfaces = conn.enumerate()?;
             let active: Vec<WmSurfaceInfo> = surfaces
@@ -1051,7 +1178,7 @@ pub mod daemon {
         /// in a span group of this set and the app may span, over the
         /// group's monitors still on the desktop (present, or within their
         /// grace: frescod keeps a member's place while it is briefly gone).
-        fn wanted_span(&self, active: &[WmSurfaceInfo]) -> Option<(u32, Vec<u64>, u32)> {
+        fn wanted_span(&self, active: &[WmSurfaceInfo]) -> Option<(u32, Vec<u64>, (u32, u32))> {
             let z = self.zoomed?;
             let s = active.iter().find(|s| s.surface_id == z)?;
             if self.displays.no_span.contains(&s.owner_app) {
@@ -1072,13 +1199,22 @@ pub mod daemon {
                 .copied()
                 .filter(|id| self.outputs.iter().any(|o| o.identity == *id && o.mirror_of == 0))
                 .collect();
-            (members.len() >= 2).then_some((z, members, g.gap))
+            if members.len() < 2 {
+                return None;
+            }
+            let gaps = if g.gap_mm == 0 {
+                (g.gap, g.gap)
+            } else {
+                let outs: Vec<&WmOutput> = members.iter().filter_map(|id| self.outputs.iter().find(|o| o.identity == *id)).collect();
+                (bezel_px(g.gap_mm, &outs, |o| (o.rect.w, o.width_mm)), bezel_px(g.gap_mm, &outs, |o| (o.rect.h, o.height_mm)))
+            };
+            Some((z, members, gaps))
         }
 
         /// Ask frescod for the span the zoom wants, or end the one up.
         fn sync_span(&self, conn: &mut impl FrescoConn, active: &[WmSurfaceInfo]) -> io::Result<()> {
             let want = self.wanted_span(active);
-            let now = self.span_up.borrow().as_ref().map(|s| (s.window, s.members.clone(), s.gap));
+            let now = self.span_up.borrow().as_ref().map(|s| (s.window, s.members.clone(), s.gaps));
             if want == now {
                 return Ok(());
             }
@@ -1098,7 +1234,7 @@ pub mod daemon {
                 eprintln!("forum-wm: span ended");
                 return ended.map(|_| ());
             }
-            let Some((window, members, gap)) = want else { return Ok(()) };
+            let Some((window, members, gaps)) = want else { return Ok(()) };
             let rects: Vec<WmRect> = members.iter().filter_map(|id| self.outputs.iter().find(|o| o.identity == *id)).map(|o| o.rect).collect();
             let distinct = |f: fn(&WmRect) -> i32| {
                 let mut v: Vec<i32> = rects.iter().map(f).collect();
@@ -1107,12 +1243,12 @@ pub mod daemon {
                 v.len()
             };
             let (cols, rows) = (distinct(|r| r.x), distinct(|r| r.y));
-            let gaps = |n: usize| if gap == 0 { Vec::new() } else { vec![gap; n.saturating_sub(1)] };
-            let p = fresco_protocol::WmSpanGroupPayload { window_id: window, members: members.clone(), gaps_x: gaps(cols), gaps_y: gaps(rows) };
+            let between = |n: usize, gap: u32| if gap == 0 { Vec::new() } else { vec![gap; n.saturating_sub(1)] };
+            let p = fresco_protocol::WmSpanGroupPayload { window_id: window, members: members.clone(), gaps_x: between(cols, gaps.0), gaps_y: between(rows, gaps.1) };
             match conn.span_group(p) {
                 Ok(rect) => {
                     eprintln!("forum-wm: window {window} spans {} monitors ({}x{})", members.len(), rect.w, rect.h);
-                    *self.span_up.borrow_mut() = Some(SpanUp { window, members, gap, rect });
+                    *self.span_up.borrow_mut() = Some(SpanUp { window, members, gaps, rect });
                     *self.span_refused.borrow_mut() = None;
                 }
                 Err(e) => {
@@ -1134,7 +1270,7 @@ pub mod daemon {
         /// two or more monitors, all at one mode, none a mirror. They
         /// leave any group they were in; one output alone just leaves.
         /// Remembered; a zoom on one of them now covers them all.
-        pub fn set_span_group(&mut self, conn: &mut impl FrescoConn, outs: &[u32], gap: u32) -> io::Result<()> {
+        pub fn set_span_group(&mut self, conn: &mut impl FrescoConn, outs: &[u32], gap: u32, gap_mm: u32) -> io::Result<()> {
             let bad = |m: &str| io::Error::new(io::ErrorKind::InvalidInput, m.to_string());
             let mut members = Vec::new();
             for &n in outs {
@@ -1161,6 +1297,12 @@ pub mod daemon {
                 if gap > 1000 {
                     return Err(bad("a bezel gap of more than 1000 pixels"));
                 }
+                if gap_mm > 200 {
+                    return Err(bad("a bezel of more than 200 mm"));
+                }
+                if gap_mm != 0 && members.iter().any(|id| self.outputs.iter().any(|o| o.identity == *id && o.width_mm == 0)) {
+                    return Err(bad("a monitor doesn't give its physical size: give the gap in pixels"));
+                }
             }
             let key = super::displays::set_of(&self.outputs);
             let groups = self.displays.spans.entry(key.clone()).or_default();
@@ -1169,7 +1311,7 @@ pub mod daemon {
             }
             groups.retain(|g| g.members.len() >= 2);
             if members.len() >= 2 {
-                groups.push(forum_ctl::SpanGroupInfo { members, gap });
+                groups.push(forum_ctl::SpanGroupInfo { members, gap: if gap_mm != 0 { 0 } else { gap }, gap_mm });
             }
             if groups.is_empty() {
                 self.displays.spans.remove(&key);
@@ -1302,6 +1444,14 @@ pub mod daemon {
         fn layout_on(&self, screen: &Screen, active: &[WmSurfaceInfo], focus_intent: Option<u32>)
             -> WmDeclareLayoutPayload
         {
+            let mut l = self.layout_on_roles(screen, active, focus_intent);
+            crate::place_pip(&mut l, screen, active, self.pip_corner);
+            l
+        }
+
+        fn layout_on_roles(&self, screen: &Screen, active: &[WmSurfaceInfo], focus_intent: Option<u32>)
+            -> WmDeclareLayoutPayload
+        {
             // Zoom wins: the zoomed surface alone fills the whole screen.
             if let Some(zid) = self.zoomed.filter(|z| active.iter().any(|s| s.surface_id == *z)) {
                 return WmDeclareLayoutPayload {
@@ -1336,6 +1486,7 @@ pub mod daemon {
             let mut layout = self.layout_active(&active);
             layout.focus_cause = self.focus_cause.take();
             conn.declare_layout(&layout)?;
+            self.declared_focus.set(layout.focus);
 
             let placed: HashSet<u32> = layout.slots.iter().map(|s| s.surface_id).collect();
             let mut decisions = rendering_decisions(&layout); // occlusion among placed
@@ -1559,7 +1710,7 @@ pub mod control {
                 Ok(_) => Reply::Ack,
                 Err(e) => Reply::Err { message: e.to_string() },
             },
-            Intent::SetSpanGroup { outputs, gap } => match wm.set_span_group(conn, &outputs, gap) {
+            Intent::SetSpanGroup { outputs, gap, gap_mm } => match wm.set_span_group(conn, &outputs, gap, gap_mm) {
                 Ok(()) => Reply::Ack,
                 Err(e) => Reply::Err { message: e.to_string() },
             },
@@ -1567,6 +1718,10 @@ pub mod control {
                 let (groups, spanning) = wm.span_groups();
                 Reply::SpanGroups { groups, spanning, no_span: wm.displays.no_span.iter().cloned().collect() }
             }
+            Intent::PipCorner { corner } => match wm.set_pip_corner(conn, corner) {
+                Ok(()) => Reply::Ack,
+                Err(e) => Reply::Err { message: e.to_string() },
+            },
             Intent::SetAppSpans { app, spans } => match wm.set_app_spans(conn, &app, spans) {
                 Ok(()) => Reply::Ack,
                 Err(e) => Reply::Err { message: e.to_string() },
@@ -2142,6 +2297,8 @@ mod tests {
         fresco_protocol::WmOutput {
             output, identity, rect: WmRect { x, y: 0, w, h }, refresh_mhz: 60000, present: true,
             scale_milli: 1000, scale_auto: true, mirror_of: 0,
+            // A 24" 1080p monitor's 0.275 mm pixels, at any size.
+            width_mm: (w as u32 * 11).div_ceil(40), height_mm: (h as u32 * 11).div_ceil(40), flapping: false,
         }
     }
 
@@ -2319,11 +2476,11 @@ mod tests {
         conn.outputs = mons.clone();
         wm.set_outputs(&mut conn, mons).unwrap();
         // Refused: mixed modes, a mirror-less unknown output.
-        assert!(wm.set_span_group(&mut conn, &[2, 3], 0).is_err(), "1080p and 1440p");
-        assert!(wm.set_span_group(&mut conn, &[0, 9], 0).is_err(), "no output 9");
-        wm.set_span_group(&mut conn, &[0, 1, 2], 40).unwrap();
+        assert!(wm.set_span_group(&mut conn, &[2, 3], 0, 0).is_err(), "1080p and 1440p");
+        assert!(wm.set_span_group(&mut conn, &[0, 9], 0, 0).is_err(), "no output 9");
+        wm.set_span_group(&mut conn, &[0, 1, 2], 40, 0).unwrap();
         assert!(conn.spans.is_empty(), "a group alone spans nothing");
-        assert_eq!(wm.span_groups().0, vec![forum_ctl::SpanGroupInfo { members: vec![10, 11, 12], gap: 40 }]);
+        assert_eq!(wm.span_groups().0, vec![forum_ctl::SpanGroupInfo { members: vec![10, 11, 12], gap: 40, gap_mm: 0 }]);
 
         wm.focus_new(&mut conn, 1).unwrap();
         wm.toggle_zoom(&mut conn).unwrap();
@@ -2357,13 +2514,33 @@ mod tests {
         wm.toggle_zoom(&mut conn).unwrap();
         let fewer = vec![mon(0, 10, 0, 1920, 1080), mon(1, 11, 1920, 1920, 1080), mon(3, 13, 3840, 2560, 1440)];
         conn.outputs = fewer.clone();
-        wm.set_outputs(&mut conn, fewer).unwrap();
+        wm.set_outputs(&mut conn, fewer.clone()).unwrap();
         assert_eq!(conn.spans.last().unwrap().members, vec![10, 11]);
         // The group is per set of monitors: the memory round-trips it.
         let m = crate::displays::DisplayMemory::from_text(&wm.displays.to_text());
         assert_eq!(m, wm.displays);
+        // A member held out for flapping: one notice naming its output.
+        let mut flap = conn.outputs.clone();
+        flap[1].flapping = true;
+        conn.outputs = flap.clone();
+        wm.set_outputs(&mut conn, flap.clone()).unwrap();
+        let mut again = flap.clone();
+        again[2].present = false;
+        wm.set_outputs(&mut conn, again).unwrap();
+        assert_eq!(wm.notices.len(), 1, "told once while it stays held");
+        assert!(wm.notices[0].1.contains("output 1"), "{:?}", wm.notices);
+        wm.notices.clear();
+        conn.outputs = fewer.clone();
+        wm.set_outputs(&mut conn, fewer.clone()).unwrap();
+        // A bezel in millimetres: 22 mm at 0.275 mm a pixel is 80 pixels,
+        // asked again at once for the span up.
+        wm.set_span_group(&mut conn, &[0, 1], 0, 22).unwrap();
+        assert_eq!(wm.span_groups().0[0].gap_mm, 22);
+        assert_eq!(conn.spans.last().unwrap().gaps_x, vec![80]);
+        let m = crate::displays::DisplayMemory::from_text(&wm.displays.to_text());
+        assert_eq!(m, wm.displays);
         // One output alone takes it out of the group.
-        wm.set_span_group(&mut conn, &[0, 1, 2], 0).ok();
+        wm.set_span_group(&mut conn, &[0, 1, 2], 0, 0).ok();
     }
 
     #[test]
@@ -2398,4 +2575,45 @@ mod tests {
         handle_intent(&mut wm, &mut conn, Intent::SetAppearance { dark: false });
         assert_eq!(conn.appearance.map(|a| a.scheme), Some(fresco_protocol::APPEARANCE_LIGHT));
     }
+
+#[cfg(test)]
+mod pip_tests {
+    use super::*;
+    use forum_ctl::Corner;
+
+    #[test]
+    fn pip_sits_in_its_corner_at_a_quarter_width_and_snaps_to_the_nearest() {
+        let wa = WmRect { x: 0, y: 48, w: 1920, h: 984 };
+        let r = pip_rect(wa, (16, 9), Corner::BottomRight);
+        assert_eq!((r.w, r.h), (437, 246), "height capped at a quarter of the work area");
+        assert_eq!((r.x + r.w, r.y + r.h), (1920 - PIP_MARGIN, 48 + 984 - PIP_MARGIN));
+        let r = pip_rect(wa, (0, 0), Corner::TopLeft);
+        assert_eq!((r.x, r.y), (PIP_MARGIN, 48 + PIP_MARGIN), "no aspect: 16:9");
+        // A small screen still gets 160×90 at least.
+        let r = pip_rect(WmRect { x: 0, y: 0, w: 400, h: 300 }, (16, 9), Corner::TopLeft);
+        assert!(r.w >= 160 && r.h >= 90);
+        assert_eq!(nearest_corner(wa, 100, 900), Corner::BottomLeft);
+        assert_eq!(nearest_corner(wa, 1800, 100), Corner::TopRight);
+        // Above documents and panels, below chrome, HUDs and dialogs.
+        assert!(PIP_LAYER < layer(WmRole::Panel) && PIP_LAYER < DOC_FOCUSED);
+        assert!(PIP_LAYER > layer(WmRole::Chrome) && PIP_LAYER > layer(WmRole::Dialog) && PIP_LAYER > layer(WmRole::Hud));
+    }
+
+    #[test]
+    fn a_pip_surface_is_placed_at_the_users_corner_and_never_focused() {
+        let screen = Screen { rect: WmRect { x: 0, y: 0, w: 1920, h: 1080 }, bar_h: 24, dock_h: 48 };
+        let surf = |id, role, w, h| WmSurfaceInfo { surface_id: id, owner_app: String::new(), owner_uid: 0, role, rect: WmRect { x: 0, y: 0, w, h } };
+        let active = [surf(1, WmRole::Document, 0, 0), surf(7, WmRole::Pip, 640, 480)];
+        let mut l = arrange(&screen, &active, None);
+        place_pip(&mut l, &screen, &active, Corner::TopLeft);
+        let p = l.slots.iter().find(|s| s.surface_id == 7).unwrap();
+        assert_eq!(p.layer, PIP_LAYER);
+        let wa = screen.work_area();
+        assert_eq!((p.rect.x, p.rect.y), (wa.x + PIP_MARGIN, wa.y + PIP_MARGIN));
+        assert_eq!(p.rect.w * 3, p.rect.h * 4, "its own 4:3");
+        assert_eq!(l.focus, 1, "keyboard focus stays with the document until the PiP is clicked");
+        assert!(click_focusable_role(WmRole::Pip), "a click gives it focus (for its keys)");
+    }
+}
+
 }

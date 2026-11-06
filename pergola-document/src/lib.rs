@@ -99,9 +99,11 @@ impl Doc {
     }
 
     /// A normalized HTML document laid out `width` × `height` CSS px, cut
-    /// into bands about a viewport tall.
-    pub fn html(html: String, subs: Subresources, width: f32, height: f32, images: impl Fn(&str) -> Option<Image> + 'static) -> Result<Self, String> {
-        let src = DocumentSource::new(html, FontSet::shared()?, subs, (width as f64, height as f64), (height * 64.0) as i64);
+    /// into bands about a viewport tall. `dark`: the reader's appearance,
+    /// for the page's `prefers-color-scheme` rules (its colours stay its
+    /// own otherwise).
+    pub fn html(html: String, subs: Subresources, width: f32, height: f32, dark: bool, images: impl Fn(&str) -> Option<Image> + 'static) -> Result<Self, String> {
+        let src = DocumentSource::new(html, FontSet::shared()?, subs, (width as f64, height as f64), (height * 64.0) as i64).with_dark(dark);
         Self::new(Box::new(src), images)
     }
 

@@ -296,7 +296,12 @@ title ≤ 64 and body ≤ 512 bytes, cut on a character boundary; control, bidi-
 zero-width characters dropped (so "invoice‮txt.exe" cannot read as a different name); markup is
 kept as literal text; 3 a burst, 5 a minute per app; `WITHDRAW` only one's own; `SUBSCRIBE` only
 for the uids in `PRAECO_SUBSCRIBERS` (Forum's), which get the history (500) then a stream.
-Each notification carries the registry's user, and Forum shows only its own user's. Not yet:
+Each notification carries the registry's user, and Forum shows only its own user's. System
+services that are not apps post as a name praecod is configured with, never one they send:
+`PRAECO_SYSTEM_POSTERS` lists `uid:name` pairs, and their posts carry the user `*`
+(`proto::SYSTEM_USER`), which every user's shelf shows. Forum posts this way (forum-wm, as
+`Forum`) to name a monitor a span holds out for flapping (fresco-span.md §6);
+`praeco::client::post` is the poster's side. Not yet:
 actions (need `CLASS_BROKER` delivery and `ACTIVATION_GRANT`), images, per-app mute.
 
 `forum-shelf/` draws the toasts (Pergola, `Notification` role, §5.2): it subscribes to praecod, shows its own

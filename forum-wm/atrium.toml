@@ -14,6 +14,7 @@ icon        = "settings"
 graphics           = "fresco"
 window-management  = true
 notify             = true
+media-control      = true   # media keys and focus to choragusd (now-playing)
 network            = "none"
 
 [supervision]

@@ -177,9 +177,9 @@ impl Worker {
     }
 
     /// A cue: its times, then its text in 24-byte pieces.
-    fn send_cue(&mut self, start_ns: i64, end_ns: i64, text: &str) -> std::io::Result<()> {
+    fn send_cue(&mut self, start_ns: i64, end_ns: i64, text: &str, source: Option<u8>) -> std::io::Result<()> {
         let b = text.as_bytes();
-        self.send(Record::Cue { start_ns, end_ns, len: b.len() as u32 })?;
+        self.send(Record::Cue { start_ns, end_ns, len: b.len() as u32, source })?;
         for (i, c) in b.chunks(24).enumerate() {
             let mut piece = [0u8; 24];
             piece[..c.len()].copy_from_slice(c);
@@ -281,6 +281,18 @@ impl Worker {
                 }
             }
             ToWorker::EndOfStream => self.end_of_stream = true,
+            ToWorker::TextFile { id } => {
+                let Some(fd) = fds.pop() else { self.fail(err::STATE); return true };
+                let mut data = Vec::new();
+                // A file that can't be read has no cues; playback goes on.
+                if File::from(fd).take(cue::FILE_MAX as u64).read_to_end(&mut data).is_ok() {
+                    for (start, end, text) in cue::vtt_file(&data) {
+                        if self.send_cue(start, end, &text, Some(id)).is_err() {
+                            return false;
+                        }
+                    }
+                }
+            }
             ToWorker::InputDone => {
                 if self.mode != Some(Mode::Load) {
                     self.fail(err::STATE);
@@ -389,7 +401,7 @@ impl Worker {
                         // supervisor shows each over its own time.
                         if let Some(t) = cue::text(codec, &s.data) {
                             let end = s.pts_ns.saturating_add(s.duration_ns.map_or(CUE_DEFAULT_NS, |d| d.min(CUE_MAX_NS as u64) as i64));
-                            let _ = self.send_cue(s.pts_ns, end, &t);
+                            let _ = self.send_cue(s.pts_ns, end, &t, None);
                         }
                     }
                 }

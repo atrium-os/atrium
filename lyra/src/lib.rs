@@ -19,6 +19,7 @@ pub mod passthrough;
 pub mod channels;
 pub mod spatial;
 pub mod convolve;
+pub mod fft;
 pub mod biquad;
 pub mod gain;
 pub mod resampler;

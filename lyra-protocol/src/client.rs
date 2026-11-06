@@ -15,7 +15,7 @@
 use crate::clock::{Clock, ClockReader};
 use crate::fdpass::recv_fd;
 use crate::ring::Ring;
-use crate::wire::{self, DenyCode, FromControl, StreamParams, ToApp, ToChoragus, ToControl};
+use crate::wire::{self, DenyCode, FromControl, FromMedia, MediaAction, SessionState, StreamParams, ToApp, ToChoragus, ToControl, ToMedia};
 use std::collections::VecDeque;
 use std::io;
 use std::os::fd::AsRawFd;
@@ -134,6 +134,13 @@ impl Client {
     pub fn set_volume(&mut self, s: &Stream, gain: f32) -> io::Result<()> {
         wire::send(&mut self.sock, &ToChoragus::SetVolume { stream: s.id, gain })
     }
+    /// Publish this connection's media session (atrium-player-pip-keys.md
+    /// §4.2). Actions the user asks for arrive as `ToApp::SessionAction`.
+    pub fn session(&mut self, state: SessionState, title: &str, artist: &str, actions: u16, duration: Option<f64>, position: Option<f64>) -> io::Result<()> {
+        let m = ToChoragus::Session { state, title: title.into(), artist: artist.into(), actions, duration, position };
+        wire::send(&mut self.sock, &m)
+    }
+
     pub fn close(&mut self, s: Stream) -> io::Result<()> {
         wire::send(&mut self.sock, &ToChoragus::Close { stream: s.id })
     }
@@ -198,5 +205,42 @@ impl Control {
     /// The next answer or change event (blocks).
     pub fn recv(&mut self) -> io::Result<FromControl> {
         wire::recv(&mut self.sock)
+    }
+}
+
+/// A media controller's connection to choragusd (`media-control/`,
+/// atrium-player-pip-keys.md §4): Forum's bar and key route, the lock screen.
+/// `NowPlaying` arrives through [`Media::recv`] on each change.
+pub struct Media {
+    sock: UnixStream,
+}
+
+impl Media {
+    pub fn connect(path: &str, lock_screen: bool) -> io::Result<Media> {
+        let mut sock = UnixStream::connect(path)?;
+        wire::send(&mut sock, &ToMedia::Hello { version: wire::VERSION, lock_screen })?;
+        match wire::recv(&mut sock)? {
+            FromMedia::Welcome => Ok(Media { sock }),
+            FromMedia::Denied { code } => Err(denied(code)),
+            m => Err(io::Error::new(io::ErrorKind::InvalidData, format!("unexpected {m:?}"))),
+        }
+    }
+
+    pub fn send(&mut self, m: &ToMedia) -> io::Result<()> {
+        wire::send(&mut self.sock, m)
+    }
+
+    /// Ask the active session for `action`.
+    pub fn control(&mut self, action: MediaAction) -> io::Result<()> {
+        self.send(&ToMedia::Control { action, seek_offset: None, seek_time: None })
+    }
+
+    /// The next `NowPlaying` (blocks).
+    pub fn recv(&mut self) -> io::Result<FromMedia> {
+        wire::recv(&mut self.sock)
+    }
+
+    pub fn socket(&self) -> &UnixStream {
+        &self.sock
     }
 }

@@ -46,3 +46,14 @@ fn only_the_bar_holds_the_volume_control() {
         assert_eq!(load(rel).capabilities.audio_control, None, "{rel}");
     }
 }
+
+#[test]
+fn the_bar_and_the_wm_hold_media_control() {
+    // The bar shows now-playing; forum-wm sends the media keys and focus.
+    for rel in ["forum-bar/atrium.toml", "forum-wm/atrium.toml"] {
+        assert_eq!(load(rel).capabilities.media_control, Some(true), "{rel}");
+    }
+    for rel in ["forum-dock/atrium.toml", "forum-overview/atrium.toml"] {
+        assert_eq!(load(rel).capabilities.media_control, None, "{rel}");
+    }
+}

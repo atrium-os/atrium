@@ -577,12 +577,15 @@ screen has it.
 | **Toggle** | 32×18 pill track, 1px `border-control`, 14 thumb `border-control` | track `accent-fill`, thumb `text-on-accent`, slides with `spring-snappy` |
 | **Slider** | 4 high pill track `border-strong`, filled part `accent-mark`, 16 thumb `bg-elevated` with 1px `border-control` | — |
 | **Dropdown** (select) | the secondary button's body, label left, `caret-down` glyph right; opens a menu aligned to its left edge, the current item under the pointer | — |
-| **Segmented control** | `bg-surface` track radius-sm, 2px inset; segments equal width | the selected segment is a `bg-elevated` pill with `border-default` |
+| **Segmented control** | `bg-surface` track with a 1px `border-default` edge (so it shows on `bg-surface` too), radius-sm, 2px inset; segments equal width | the selected segment is a `bg-elevated` pill with `border-default` |
 | **Tabs** (in a panel) | labels `text-secondary` 16 apart, a 2px `accent-mark` bar under the selected one, a 1px `border-default` line under the row | label `text-primary` |
 | **List row** | 32 (dense 24), padding 12, glyph `icon-md` | `selection-bg` when the list has focus, `selection-idle` when not |
 | **Menu** | floating surface, 4px inset; items 28 high, padding 12, shortcut right in `text-tertiary`; separator a `Divider` with 4px above and below; submenu `caret-right` | the hovered or arrowed item takes `selection-bg` |
 | **Tooltip** | `bg-inverse`, text `text-inverse` `sm`, radius-xs, padding 4×8, 8 from the target; shows after 500 ms of hover, at once while another is showing, never on touch | — |
 | **Popover** | floating surface, padding 16, radius-md | — |
+| **Group box** | `bg-elevated`, 1px `border-default`, radius-md, padding 16; title `sm` semibold `text-secondary`; contents 12 apart | — |
+| **Section** | no frame; title `md` semibold `text-primary`, optional `sm` `text-secondary` line 4 below; contents 12 below; sections 24 apart | — |
+| **Form** | two columns: labels `md` `text-primary` at their natural width, fields fill the rest, 12 between, rows 8 apart, each row on one baseline | — |
 | **Dialog / sheet** | floating surface, radius-lg, padding 24, `scrim` behind; buttons bottom right, primary last; Esc and the scrim cancel | — |
 | **Scrollbar** | overlay, no track: a 6 wide pill, `neutral-500` at 50%, 2 from the edge; shows while scrolling and 800 ms after, widens to 10 on hover | — |
 | **Progress** | the existing `ProgressBar`: 4 high pill, `accent-mark` on `bg-surface`; indeterminate is a moving third | — |

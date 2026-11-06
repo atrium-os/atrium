@@ -29,6 +29,9 @@ const N_TRACK: u32 = 13;
 const N_RANGE0: u32 = 20;
 const N_PLAYED: u32 = 40;
 const N_THUMB: u32 = 41;
+/// The PiP button: a screen, and the small window in its corner.
+const N_PIP: u32 = 42;
+const N_PIP2: u32 = 43;
 /// Subtitle lines: a backing box and a glyph run each.
 const N_SUB_BG0: u32 = 60;
 const N_SUB0: u32 = 70;
@@ -44,6 +47,15 @@ pub enum Action {
     Seek(f64),
     /// Step this many seconds.
     Step(f64),
+    /// Change the volume by this much (0 to 1 scale).
+    Volume(f32),
+    ToggleMute,
+    /// Subtitles off, or back on.
+    ToggleSubtitles,
+    /// A page's action (shift-N, shift-P): a `media_action` bit.
+    PageAction(u16),
+    /// Into picture-in-picture, or back.
+    TogglePip,
 }
 
 #[derive(Debug, Clone, PartialEq, Default)]
@@ -55,6 +67,7 @@ struct Drawn {
     played: i32,
     ranges: Vec<(i32, i32)>,
     subtitles: Vec<String>,
+    pip_button: bool,
 }
 
 pub struct Controls {
@@ -66,6 +79,9 @@ pub struct Controls {
     pub buffered: Vec<(f64, f64)>,
     /// Subtitle lines to show now (at most four), top to bottom.
     pub subtitles: Vec<String>,
+    /// A picture-in-picture button at the right of the bar (an embedded
+    /// player with video).
+    pub pip_button: bool,
     shown_until: Instant,
     drawn: Option<Drawn>,
     text: Option<Text>,
@@ -145,7 +161,7 @@ impl Text {
 
 impl Controls {
     pub fn new(size: (u32, u32)) -> Self {
-        Controls { size, playing: false, duration_s: 0.0, position_s: 0.0, buffered: Vec::new(), subtitles: Vec::new(), shown_until: Instant::now() + IDLE_HIDE, drawn: None, text: None }
+        Controls { size, playing: false, duration_s: 0.0, position_s: 0.0, buffered: Vec::new(), subtitles: Vec::new(), pip_button: false, shown_until: Instant::now() + IDLE_HIDE, drawn: None, text: None }
     }
 
     /// Pointer motion or a key: show for a while.
@@ -159,7 +175,8 @@ impl Controls {
 
     fn track(&self) -> (f32, f32, f32) {
         let x0 = BUTTON_W + PAD / 2.0;
-        let x1 = (self.size.0 as f32 - PAD).max(x0 + 1.0);
+        let right = if self.pip_button { BUTTON_W } else { 0.0 };
+        let x1 = (self.size.0 as f32 - PAD - right).max(x0 + 1.0);
         (x0, x1, self.size.1 as f32 - BAR_H / 2.0)
     }
 
@@ -188,6 +205,9 @@ impl Controls {
         if x < BUTTON_W {
             return Some(Action::Toggle);
         }
+        if self.pip_button && x >= w - BUTTON_W {
+            return Some(Action::TogglePip);
+        }
         let (x0, x1, _) = self.track();
         if self.duration_s > 0.0 && x >= x0 - THUMB && x <= x1 + THUMB {
             return Some(Action::Seek((((x - x0) / (x1 - x0)) as f64).clamp(0.0, 1.0)));
@@ -195,13 +215,33 @@ impl Controls {
         None
     }
 
-    /// A key press, by HID usage.
-    pub fn key(&mut self, hid_usage: u16) -> Option<Action> {
+    /// A key press, by HID usage, with Fresco's modifier bits (bit 0 Shift).
+    pub fn key(&mut self, hid_usage: u16, modifiers: u8) -> Option<Action> {
         self.poke();
+        if modifiers & 1 != 0 {
+            return match hid_usage {
+                0x11 => Some(Action::PageAction(limen::media_player::media_action::NEXT_TRACK)), // N
+                0x13 => Some(Action::PageAction(limen::media_player::media_action::PREVIOUS_TRACK)), // P
+                _ => None,
+            };
+        }
+        // The keys most players share (YouTube's set, mostly).
         match hid_usage {
-            0x2C => Some(Action::Toggle),    // space
-            0x4F => Some(Action::Step(5.0)), // right
-            0x50 => Some(Action::Step(-5.0)),
+            0x2C | 0x0E => Some(Action::Toggle),  // space, k
+            0x4F => Some(Action::Step(5.0)),       // right
+            0x50 => Some(Action::Step(-5.0)),      // left
+            0x0F => Some(Action::Step(10.0)),      // l
+            0x0D => Some(Action::Step(-10.0)),     // j
+            0x52 => Some(Action::Volume(0.05)),    // up
+            0x51 => Some(Action::Volume(-0.05)),   // down
+            0x10 => Some(Action::ToggleMute),      // m
+            0x06 => Some(Action::ToggleSubtitles), // c
+            0x0C => Some(Action::TogglePip),       // i
+            0x4A => Some(Action::Seek(0.0)),       // home
+            0x4D => Some(Action::Seek(1.0)),       // end
+            0x27 => Some(Action::Seek(0.0)),       // 0
+            // 1 to 9: a tenth of the way per digit.
+            0x1E..=0x26 => Some(Action::Seek((hid_usage - 0x1D) as f64 / 10.0)),
             _ => None,
         }
     }
@@ -211,7 +251,7 @@ impl Controls {
         ranges.truncate(RANGES_MAX);
         let mut subtitles = self.subtitles.iter().flat_map(|s| s.lines()).map(str::to_string).collect::<Vec<_>>();
         subtitles.truncate(SUB_LINES);
-        Drawn { visible: self.visible(), playing: self.playing, size: self.size, played: (self.x_of(self.position_s) * 10.0) as i32, ranges, subtitles }
+        Drawn { visible: self.visible(), playing: self.playing, size: self.size, played: (self.x_of(self.position_s) * 10.0) as i32, ranges, subtitles, pip_button: self.pip_button }
     }
 
     /// Subtitle lines, centred near the bottom (above the bar when it shows),
@@ -255,7 +295,7 @@ impl Controls {
         }
         if !st.visible {
             if was.is_some_and(|w| w.visible) {
-                for n in [N_BAR, N_ICON, N_ICON2, N_TRACK, N_PLAYED, N_THUMB].into_iter().chain(N_RANGE0..N_RANGE0 + RANGES_MAX as u32) {
+                for n in [N_BAR, N_ICON, N_ICON2, N_TRACK, N_PLAYED, N_THUMB, N_PIP, N_PIP2].into_iter().chain(N_RANGE0..N_RANGE0 + RANGES_MAX as u32) {
                     c.scene_node_clear(n)?;
                 }
             }
@@ -294,6 +334,14 @@ impl Controls {
         // The played part in the accent colour (linear RGB).
         c.scene_node_rect(N_PLAYED, RectParams { x: x0, y: ty - TRACK_H / 2.0, w: (px - x0).max(0.0), h: TRACK_H, r: 0.05, g: 0.45, b: 1.0, a: 1.0, radius: TRACK_H / 2.0 })?;
         c.scene_node_rect(N_THUMB, rect(px - THUMB / 2.0, ty - THUMB / 2.0, THUMB, THUMB, 1.0, 1.0, THUMB / 2.0))?;
+        if st.pip_button {
+            let (cx, cy) = (w - BUTTON_W / 2.0, h - BAR_H / 2.0);
+            c.scene_node_rect(N_PIP, rect(cx - 11.0, cy - 8.0, 22.0, 16.0, 1.0, 0.4, 2.0))?;
+            c.scene_node_rect(N_PIP2, rect(cx + 1.0, cy + 1.0, 8.0, 5.0, 1.0, 1.0, 1.0))?;
+        } else if was.is_some_and(|w| w.pip_button) {
+            c.scene_node_clear(N_PIP)?;
+            c.scene_node_clear(N_PIP2)?;
+        }
         c.scene_frame_end()
     }
 }
@@ -335,6 +383,22 @@ mod tests {
         c.playing = false;
         c.shown_until = Instant::now() - Duration::from_secs(1);
         assert!(c.visible());
-        assert_eq!(c.key(0x2C), Some(Action::Toggle));
+        assert_eq!(c.key(0x2C, 0), Some(Action::Toggle));
+        assert_eq!(c.key(0x0E, 0), Some(Action::Toggle));
+        assert_eq!(c.key(0x0D, 0), Some(Action::Step(-10.0)));
+        assert_eq!(c.key(0x20, 0), Some(Action::Seek(0.3)), "3");
+        assert_eq!(c.key(0x26, 0), Some(Action::Seek(0.9)), "9");
+        assert_eq!(c.key(0x10, 0), Some(Action::ToggleMute));
+        assert_eq!(c.key(0x04, 0), None, "a");
+        assert_eq!(c.key(0x11, 1), Some(Action::PageAction(1)), "shift-N");
+        assert_eq!(c.key(0x0E, 1), None, "shift-K");
+        assert_eq!(c.key(0x0C, 0), Some(Action::TogglePip), "i");
+        // The PiP button takes the bar's right end, and the track gives way.
+        let (_, x1, _) = c.track();
+        c.pip_button = true;
+        let (_, x1p, _) = c.track();
+        assert!(x1p < x1);
+        let (w, h) = (c.size.0 as f32, c.size.1 as f32);
+        assert_eq!(c.press(w - 10.0, h - 10.0), Some(Action::TogglePip));
     }
 }

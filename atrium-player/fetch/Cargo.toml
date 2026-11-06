@@ -1,0 +1,17 @@
+[package]
+name        = "atrium-player-fetch"
+version     = "0.1.0"
+edition.workspace = true
+license.workspace = true
+description = "The standalone player's fetcher process: Nuntius (the Navigator's sandboxed fetcher) in Capsicum, filling a file the player reads. The player itself has no network."
+publish     = false
+
+[[bin]]
+name = "atrium-player-fetch"
+path = "src/main.rs"
+
+[dependencies]
+libc   = "0.2"
+navigator-fetch = { path = "../../navigator-fetch" }
+# The wire (`fetch::{ToFetcher, FromFetcher}`) and the frame helpers.
+atrium-player   = { path = "../player" }

@@ -45,6 +45,9 @@ pub fn apply_all(
     if caps.audio_control == Some(true) {
         apply_audio_control(jc, opts);
     }
+    if caps.media_control == Some(true) {
+        apply_media_control(jc, opts);
+    }
     if let Some(paths) = &caps.filesystem {
         for p in paths {
             apply_filesystem(p, jc, opts)?;
@@ -190,6 +193,13 @@ pub fn apply_audio_monitor(jc: &mut JailConfig, opts: &BuildOpts) {
 /// the volume UI. It carries levels and app names, never samples.
 pub fn apply_audio_control(jc: &mut JailConfig, opts: &BuildOpts) {
     apply_socket("audio-control.sock", jc, opts);
+}
+
+/// `media-control`: choragusd's now-playing socket (`media-control/`), for
+/// Forum and the lock screen. It carries the active media session's app,
+/// state and (opt-in) title, and its actions; never samples or levels.
+pub fn apply_media_control(jc: &mut JailConfig, opts: &BuildOpts) {
+    apply_socket("media-control.sock", jc, opts);
 }
 
 pub fn apply_filesystem(spec: &str, jc: &mut JailConfig, opts: &BuildOpts) -> Result<(), BuildError> {
