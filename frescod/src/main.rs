@@ -32,6 +32,7 @@
 //! single-window apps render correctly.
 
 mod activation;
+mod credential;
 mod drag;
 mod notify;
 mod injector_reader;
@@ -936,8 +937,8 @@ fn render_one_frame(
     /* Toasts above every window, inside their band (tabula.md §5),
      * whatever the WM or the client asked; before sync, which passes
      * the sizes on to renderers. */
+    let top = frontend.lock().unwrap().reserved_top();
     {
-        let top = frontend.lock().unwrap().reserved_top();
         let band = fresco_protocol::notification_band(screen_w, screen_h, top);
         comp.lock().unwrap().clamp_notifications(band);
     }
@@ -1006,12 +1007,15 @@ fn render_one_frame(
         let (sw, sh) = render_backend::surface_size(w);
         (w.id, [x, y, x.saturating_add(sw as i32), y.saturating_add(sh as i32)])
     }).collect();
+    /* Credential slots (arca-autofill.md §4): what this frame shows of
+     * each, before frescod's own chrome goes on top. */
+    let slots = credential::observe_frame(comp, &rects, [0, top as i32, screen_w as i32, screen_h as i32], activation::now_ns());
     /* Trusted chrome (F4d), split mode: frescod's own layer, on top. */
     if let Some(b) = split {
         /* The focus read and released first: origin() takes the broker's
          * window locks, which a renderer's thread takes before comp. */
         let focus = comp.lock().unwrap().focus;
-        let mut c = chrome::build(screen_w, focus, |id| b.origin(id), &rects);
+        let mut c = chrome::build(screen_w, focus, |id| b.origin(id), &rects, &slots);
         c.size.1 = c.size.1.min(screen_h);
         rects.push((c.id, [0, 0, c.size.0 as i32, c.size.1 as i32]));
         windows.push(c);

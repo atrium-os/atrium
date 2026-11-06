@@ -598,6 +598,7 @@ impl EnvelopeFrontend {
             // ── Cross-app window management (gated by window-management) ──
             control::OP_WM_ENUMERATE         => self.handle_wm_enumerate(msg),
             control::OP_WM_DECLARE_LAYOUT    => self.handle_wm_declare_layout(msg),
+            control::OP_WM_CREDENTIAL_SLOT   => self.handle_wm_credential_slot(msg),
             control::OP_WM_SET_RENDERING     => self.handle_wm_set_rendering(msg),
             control::OP_WM_DISPLAY_MODES     => self.handle_wm_display_modes(),
             control::OP_WM_SET_DISPLAY_MODE  => self.handle_wm_set_display_mode(msg),
@@ -1214,6 +1215,25 @@ impl EnvelopeFrontend {
     /// (id 0) stays pinned at the bottom; any surface created in the race
     /// between enumerate and declare (not named in the layout) is kept on
     /// top so a brand-new window is never silently hidden.
+    /// `OP_WM_CREDENTIAL_SLOT` (arca-autofill.md §4): Limen's stand-in,
+    /// window management only.
+    fn handle_wm_credential_slot(&mut self, msg: &Message)
+        -> Result<Vec<Outbound>, DispatchError>
+    {
+        if !self.wm_capable.contains(&self.current_client) {
+            return Err(DispatchError::Forbidden);
+        }
+        let p: fresco_protocol::CredentialSlotPayload = decode(&msg.payload)
+            .map_err(|_| DispatchError::BadPayload)?;
+        let (Ok(child), Ok(parent)) = (u16::try_from(p.child), u16::try_from(p.parent)) else {
+            return Err(DispatchError::UnknownWindow);
+        };
+        if !self.compositor.lock().unwrap().bind_credential(child, parent, p.rect) {
+            return Err(DispatchError::UnknownWindow);
+        }
+        Ok(vec![Outbound { op: control::OP_WM_CREDENTIAL_SLOT, flags: aqueduct::envelope::flag::IS_RESPONSE, payload: Vec::new() }])
+    }
+
     fn handle_wm_declare_layout(&mut self, msg: &Message)
         -> Result<Vec<Outbound>, DispatchError>
     {

@@ -95,6 +95,13 @@ pub enum DisplayEvent {
     DragEnd { window_id: u32, drag_id: u64, dropped: bool },
 }
 
+/// Where a credential slot sits: `rect` (`[x, y, w, h]`) in `parent`.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct CredentialSlot {
+    pub parent: WindowId,
+    pub rect: [f32; 4],
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum DragPhase {
     Enter,
@@ -245,6 +252,8 @@ pub struct Window {
     /// The renderer honoring this (skip-compose) + the power-gate signal
     /// are the follow-up; for now it records the WM's decision.
     pub rendering: bool,
+    /// Bound as a credential slot in another window (arca-autofill.md §4).
+    pub credential: Option<CredentialSlot>,
     /// Cached title-text glyphs: PathHeader hash + (x, y) baseline
     /// position in pixels relative to the title origin. Regenerated
     /// when title or theme changes; per-frame compose just translates
@@ -277,6 +286,7 @@ impl Window {
             focus: false,
             z:     0,
             rendering: true,
+            credential: None,
             title_glyphs: Vec::new(),
             role:  WmRole::Document,
             owner_uid: 0,
@@ -293,6 +303,7 @@ impl Window {
             slots, scene,
             focus: false, z: 0,
             rendering: true,
+            credential: None,
             title_glyphs: Vec::new(),
             role:  WmRole::Document,
             owner_uid: 0,
@@ -1067,6 +1078,7 @@ impl Compositor {
     /// Keep notification windows inside `band` (`[x, y, w, h]`): shrink
     /// one that is larger (its client hears the new size) and move it in.
     pub fn clamp_notifications(&mut self, band: [i32; 4]) {
+        self.place_credentials();
         let (bx, by, bw, bh) = (band[0] as f32, band[1] as f32, band[2].max(1) as f32, band[3].max(1) as f32);
         let ids: Vec<WindowId> = self.windows.keys().copied().filter(|&id| self.is_notification(id)).collect();
         for id in ids {
@@ -1090,6 +1102,49 @@ impl Compositor {
         match self.focus.unwrap_or(0) {
             0 => self.z_order.iter().rev().find(|&&id| id != 0 && !self.is_notification(id)).copied().unwrap_or(0) as u32,
             f => f as u32,
+        }
+    }
+
+    /// Make `child` a credential slot at `rect` in `parent` (`None`:
+    /// release it). Both must exist and differ; a slot cannot host one.
+    pub fn bind_credential(&mut self, child: WindowId, parent: WindowId, rect: Option<[f32; 4]>) -> bool {
+        let ok = child != 0 && parent != 0 && child != parent
+            && self.windows.contains_key(&parent)
+            && self.windows.get(&parent).is_some_and(|p| p.credential.is_none())
+            && self.windows.get(&child).is_some_and(|c| c.role != WmRole::Notification)
+            && rect.is_none_or(|r| r.iter().all(|v| v.is_finite()) && r[2] >= 1.0 && r[3] >= 1.0);
+        if !ok {
+            return false;
+        }
+        self.windows.get_mut(&child).unwrap().credential = rect.map(|rect| CredentialSlot { parent, rect });
+        self.place_credentials();
+        true
+    }
+
+    /// Put each credential slot where its parent says, at its size, right
+    /// above its parent (so the parent cannot draw over it); a slot whose
+    /// parent went is released.
+    pub fn place_credentials(&mut self) {
+        let slots: Vec<(WindowId, CredentialSlot)> =
+            self.windows.iter().filter_map(|(&id, w)| w.credential.map(|c| (id, c))).collect();
+        for (id, c) in slots {
+            let Some(p) = self.windows.get(&c.parent).map(|p| p.pos) else {
+                self.windows.get_mut(&id).unwrap().credential = None;
+                continue;
+            };
+            let size = (c.rect[2].floor().max(1.0), c.rect[3].floor().max(1.0));
+            if self.windows[&id].size != size {
+                self.resize_window(id, size.0 as u32, size.1 as u32);
+            }
+            self.windows.get_mut(&id).unwrap().pos = (p.0 + c.rect[0], p.1 + c.rect[1]);
+            self.z_order.retain(|&w| w != id);
+            let at = self.z_order.iter().position(|&w| w == c.parent).map_or(self.z_order.len(), |i| i + 1);
+            self.z_order.insert(at, id);
+        }
+        for (i, &id) in self.z_order.iter().enumerate() {
+            if let Some(w) = self.windows.get_mut(&id) {
+                w.z = i as u32;
+            }
         }
     }
 
@@ -1462,5 +1517,13 @@ mod notification_tests {
         assert_eq!(c.z_order, vec![0, b, a, n], "a raise does not cover it");
         c.focus = None;
         assert_eq!(c.keyboard_window(), a as u32, "keys never fall to a toast");
+        // A credential slot rides just above its parent, at its rect.
+        assert!(c.bind_credential(b, a, Some([10.0, 20.0, 150.0, 30.0])));
+        c.windows.get_mut(&a).unwrap().pos = (100.0, 100.0);
+        c.raise(b);
+        c.clamp_notifications([1500, 24, 420, 500]);
+        assert_eq!(c.z_order, vec![0, a, b, n]);
+        assert_eq!((c.windows[&b].pos, c.windows[&b].size), ((110.0, 120.0), (150.0, 30.0)));
+        assert!(!c.bind_credential(a, b, Some([0.0, 0.0, 10.0, 10.0])), "a slot hosts no slot");
     }
 }

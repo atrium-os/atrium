@@ -71,6 +71,9 @@ fn fits(e: &Entry, p: u8) -> bool {
             ctrl || e.mods & MOD_ALT != 0 || e.hid == HID_ENTER || e.hid == HID_KP_ENTER || (ctrl && (e.hid == HID_C || e.hid == HID_X))
         }
         (kind::DROP, purpose::DROP) => true,
+        // Arca's chip: a click, or Enter on the picked account.
+        (kind::BUTTON, purpose::FILL) => true,
+        (kind::KEY, purpose::FILL) => e.hid == HID_ENTER || e.hid == HID_KP_ENTER,
         _ => false,
     }
 }
@@ -97,7 +100,9 @@ impl Table {
 
     /// Spend `token` for `presenter_uid` on `purpose`; `focused(window)`
     /// says whether that window still has focus.
-    pub fn consume(&mut self, now: u64, token: &Token, presenter_uid: u32, purpose: u8, focused: impl Fn(u32) -> bool) -> ConsumeResult {
+    /// For `FILL`, `visible(window, minted)` says whether that credential
+    /// slot was fully visible and still before the press (arca-autofill.md §4).
+    pub fn consume(&mut self, now: u64, token: &Token, presenter_uid: u32, purpose: u8, focused: impl Fn(u32) -> bool, visible: impl Fn(u32, u64) -> bool) -> ConsumeResult {
         let Some(e) = self.live.get(token).copied() else { return refused(refusal::UNKNOWN) };
         if now.saturating_sub(e.minted_ns) >= LIFETIME_NS {
             self.live.remove(token);
@@ -110,6 +115,11 @@ impl Table {
         }
         if !fits(&e, purpose) {
             return refused(refusal::WRONG_KIND);
+        }
+        // Visibility first: a slot under a cover is OBSCURED whichever
+        // window took focus.
+        if purpose == purpose::FILL && !visible(e.window_id, e.minted_ns) {
+            return refused(refusal::OBSCURED);
         }
         // A drop lands on whatever window is under the pointer, focused
         // or not; a granted token has no window.
@@ -236,7 +246,7 @@ pub fn consumers() -> Vec<u32> {
     if let Ok(s) = std::env::var("FRESCOD_ACTIVATION_UIDS") {
         return s.split(',').filter_map(|u| u.trim().parse().ok()).collect();
     }
-    ["_tabula", "_share", "_praeco"].iter().filter_map(|n| uid_of(n)).collect()
+    ["_tabula", "_share", "_praeco", "_arca"].iter().filter_map(|n| uid_of(n)).collect()
 }
 
 fn uid_of(name: &str) -> Option<u32> {
@@ -317,7 +327,10 @@ fn conn_loop(s: std::os::unix::net::UnixStream, uid: u32, may_consume: bool, may
         }
         let payload = match msg.op {
             op::CONSUME => fresco_protocol::encode(&match fresco_protocol::decode::<Consume>(&msg.payload) {
-                Ok(c) if may_consume => table().lock().unwrap().consume(now_ns(), &c.token, c.presenter_uid, c.purpose, focused),
+                Ok(c) if may_consume => {
+                    let now = now_ns();
+                    table().lock().unwrap().consume(now, &c.token, c.presenter_uid, c.purpose, focused, |w, minted| crate::credential::visible_for(w, minted, now))
+                }
                 Ok(_) => refused(refusal::NOT_ALLOWED),
                 Err(_) => refused(refusal::UNKNOWN),
             }),
@@ -343,6 +356,7 @@ mod tests {
         Entry { kind: kind::BUTTON, hid: 0, mods: 0, ..key(0, 0, at) }
     }
     const YES: fn(u32) -> bool = |_| true;
+    const NOVIS: fn(u32, u64) -> bool = |_, _| false;
 
     /// 0 when spent, else the refusal.
     fn why(r: ConsumeResult) -> u8 {
@@ -363,34 +377,34 @@ mod tests {
         let mut t = Table::default();
         let a = t.mint(button(0));
         assert_ne!(a, [0; 16]);
-        assert_eq!(why(t.consume(10, &a, 1002, purpose::PASTE, YES)), refusal::WRONG_UID, "another app");
-        let r = t.consume(10, &a, 1001, purpose::PASTE, YES);
+        assert_eq!(why(t.consume(10, &a, 1002, purpose::PASTE, YES, NOVIS)), refusal::WRONG_UID, "another app");
+        let r = t.consume(10, &a, 1001, purpose::PASTE, YES, NOVIS);
         assert!(matches!(r, ConsumeResult::Ok { window_id: 5, kind: kind::BUTTON, .. }));
-        assert_eq!(why(t.consume(11, &a, 1001, purpose::PASTE, YES)), refusal::UNKNOWN, "replayed");
+        assert_eq!(why(t.consume(11, &a, 1001, purpose::PASTE, YES, NOVIS)), refusal::UNKNOWN, "replayed");
         let b = t.mint(button(0));
-        assert_eq!(why(t.consume(LIFETIME_NS, &b, 1001, purpose::PASTE, YES)), refusal::EXPIRED, "expired");
+        assert_eq!(why(t.consume(LIFETIME_NS, &b, 1001, purpose::PASTE, YES, NOVIS)), refusal::EXPIRED, "expired");
         let c = t.mint(button(0));
-        assert_eq!(why(t.consume(5, &c, 1001, purpose::PASTE, |_| false)), refusal::NOT_FOCUSED, "window no longer focused");
-        assert_eq!(why(t.consume(6, &c, 1001, purpose::PASTE, YES)), 0, "a refusal did not spend it");
+        assert_eq!(why(t.consume(5, &c, 1001, purpose::PASTE, |_| false, NOVIS)), refusal::NOT_FOCUSED, "window no longer focused");
+        assert_eq!(why(t.consume(6, &c, 1001, purpose::PASTE, YES, NOVIS)), 0, "a refusal did not spend it");
     }
 
     #[test]
     fn typing_authorises_nothing_but_the_chords() {
         let mut t = Table::default();
         let typed = t.mint(key(0x04, 0, 0)); // 'a'
-        assert_eq!(why(t.consume(1, &typed, 1001, purpose::PASTE, YES)), refusal::WRONG_KIND);
-        assert_eq!(why(t.consume(1, &typed, 1001, purpose::COPY, YES)), refusal::WRONG_KIND);
+        assert_eq!(why(t.consume(1, &typed, 1001, purpose::PASTE, YES, NOVIS)), refusal::WRONG_KIND);
+        assert_eq!(why(t.consume(1, &typed, 1001, purpose::COPY, YES, NOVIS)), refusal::WRONG_KIND);
         let v = t.mint(key(HID_V, 0, 0)); // a bare 'v'
-        assert_eq!(why(t.consume(1, &v, 1001, purpose::PASTE, YES)), refusal::WRONG_KIND);
+        assert_eq!(why(t.consume(1, &v, 1001, purpose::PASTE, YES, NOVIS)), refusal::WRONG_KIND);
         let ctrl_v = t.mint(key(HID_V, MOD_CTRL, 0));
-        assert_eq!(why(t.consume(1, &ctrl_v, 1001, purpose::PASTE, YES)), 0);
+        assert_eq!(why(t.consume(1, &ctrl_v, 1001, purpose::PASTE, YES, NOVIS)), 0);
         let shift_ins = t.mint(key(HID_INSERT, MOD_SHIFT, 0));
-        assert_eq!(why(t.consume(1, &shift_ins, 1001, purpose::PASTE, YES)), 0);
+        assert_eq!(why(t.consume(1, &shift_ins, 1001, purpose::PASTE, YES, NOVIS)), 0);
         let ctrl_c = t.mint(key(HID_C, MOD_CTRL, 0));
-        assert_eq!(why(t.consume(1, &ctrl_c, 1001, purpose::PASTE, YES)), refusal::WRONG_KIND, "a copy chord is not a paste");
-        assert_eq!(why(t.consume(1, &ctrl_c, 1001, purpose::COPY, YES)), 0);
+        assert_eq!(why(t.consume(1, &ctrl_c, 1001, purpose::PASTE, YES, NOVIS)), refusal::WRONG_KIND, "a copy chord is not a paste");
+        assert_eq!(why(t.consume(1, &ctrl_c, 1001, purpose::COPY, YES, NOVIS)), 0);
         let ctrl_v2 = t.mint(key(HID_V, MOD_CTRL, 0));
-        assert_eq!(why(t.consume(1, &ctrl_v2, 1001, purpose::DROP, YES)), refusal::WRONG_KIND);
+        assert_eq!(why(t.consume(1, &ctrl_v2, 1001, purpose::DROP, YES, NOVIS)), refusal::WRONG_KIND);
     }
 
     #[test]
@@ -405,9 +419,21 @@ mod tests {
         let g = granted(t.grant(1, &press, forum, 1001, purpose::ACTION)).unwrap();
         assert_ne!(g, [0; 16]);
         assert_eq!(granted(t.grant(2, &press, forum, 1001, purpose::ACTION)), Err(refusal::UNKNOWN), "the press is spent");
-        assert_eq!(why(t.consume(2, &g, 1001, purpose::PASTE, YES)), refusal::WRONG_KIND, "only its purpose");
-        let r = t.consume(2, &g, 1001, purpose::ACTION, |_| false);
+        assert_eq!(why(t.consume(2, &g, 1001, purpose::PASTE, YES, NOVIS)), refusal::WRONG_KIND, "only its purpose");
+        let r = t.consume(2, &g, 1001, purpose::ACTION, |_| false, NOVIS);
         assert!(matches!(r, ConsumeResult::Ok { kind: kind::GRANTED, .. }), "granted tokens need no focus");
+    }
+
+    #[test]
+    fn a_fill_needs_a_click_or_enter_in_a_slot_seen_whole() {
+        let mut t = Table::default();
+        let click = t.mint(button(0));
+        assert_eq!(why(t.consume(1, &click, 1001, purpose::FILL, YES, NOVIS)), refusal::OBSCURED);
+        assert_eq!(why(t.consume(1, &click, 1001, purpose::FILL, YES, |w, m| w == 5 && m == 0)), 0, "the refusal did not spend it");
+        let enter = t.mint(key(HID_ENTER, 0, 0));
+        assert_eq!(why(t.consume(1, &enter, 1001, purpose::FILL, YES, |_, _| true)), 0);
+        let typed = t.mint(key(0x04, 0, 0));
+        assert_eq!(why(t.consume(1, &typed, 1001, purpose::FILL, YES, |_, _| true)), refusal::WRONG_KIND);
     }
 
     #[test]

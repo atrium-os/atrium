@@ -14,6 +14,10 @@
 //! - **a focus ring** just inside the focused window's edge, so the strip's
 //!   claim is tied to a window on screen.
 //!
+//! It also frames each credential slot that is fit to fill right now
+//! (arca-autofill.md §5): a ring and a key tab no app or Arca draws, so a
+//! look-alike field drawn by an app has none.
+//!
 //! Clicks on chrome pixels go to the WM, never to a window under them.
 //!
 //! Text is drawn with a built-in 5x9 font of exactly the characters an
@@ -94,6 +98,31 @@ fn rect(x: i32, y: i32, w: i32, h: i32, color: [f32; 4]) -> SceneNode {
     SceneNode { position: [x as f32, y as f32], size: [w as f32, h as f32], color, radius: 0.0, _pad: [0.0; 3] }
 }
 
+const SLOT_COLOR: [f32; 4] = [0.95, 0.75, 0.2, 1.0];
+const KEY_COLOR: [f32; 4] = [0.1, 0.1, 0.12, 1.0];
+/// The key tab's width, left of the slot.
+const TAB: i32 = 18;
+
+/// A credential slot's frame: a ring just outside `[x0, y0, x1, y1]` and
+/// a tab on its left with a key drawn in it. Returns its bottom edge.
+fn slot_frame(out: &mut Vec<SceneNode>, [x0, y0, x1, y1]: [i32; 4]) -> i32 {
+    let (w, h) = (x1 - x0, y1 - y0);
+    out.push(rect(x0 - RING, y0 - RING, w + 2 * RING, RING, SLOT_COLOR));
+    out.push(rect(x0 - RING, y1, w + 2 * RING, RING, SLOT_COLOR));
+    out.push(rect(x1, y0, RING, h, SLOT_COLOR));
+    let tx = x0 - RING - TAB;
+    out.push(rect(tx, y0 - RING, TAB + RING, h + 2 * RING, SLOT_COLOR));
+    // The key: a round bow, a shaft and two teeth, centred in the tab.
+    let cy = y0 + h / 2;
+    let mut bow = rect(tx + 3, cy - 4, 8, 8, KEY_COLOR);
+    bow.radius = 4.0;
+    out.push(bow);
+    out.push(rect(tx + 10, cy - 1, 6, 2, KEY_COLOR));
+    out.push(rect(tx + 13, cy + 1, 2, 3, KEY_COLOR));
+    out.push(rect(tx + 15, cy + 1, 1, 2, KEY_COLOR));
+    y1 + RING
+}
+
 /// `text` at (`x`, `y`), one rect per run of lit cells in a row, at most
 /// `max_w` pixels wide. Characters without a glyph are not drawn (origins
 /// are checked before they get here, so there are none).
@@ -130,10 +159,13 @@ const STRIP_COLOR: [f32; 4] = [0.08, 0.08, 0.1, 1.0];
 /// focused window and where each window is (`shown`: id and screen rect,
 /// as composed). It is in screen coordinates (a layer at (0, 0)), down to
 /// the bottom of the focused window's ring.
-pub fn build(screen_w: u32, focus: Option<u16>, origin: impl Fn(u16) -> Option<String>, shown: &[(u32, [i32; 4])]) -> WindowFrame {
+pub fn build(screen_w: u32, focus: Option<u16>, origin: impl Fn(u16) -> Option<String>, shown: &[(u32, [i32; 4])], slots: &[[i32; 4]]) -> WindowFrame {
     let sw = screen_w as i32;
     let mut rects = vec![rect(0, 0, sw, STRIP_H, STRIP_COLOR)];
     let mut bottom = STRIP_H;
+    for &s in slots {
+        bottom = bottom.max(slot_frame(&mut rects, s));
+    }
     let focused = focus.filter(|&f| f != 0).and_then(|f| shown.iter().find(|(id, _)| *id == f as u32).map(|&(_, r)| (f, r)));
     if let Some((f, [x0, y0, x1, y1])) = focused {
         // The ring, clipped to the screen below the strip.

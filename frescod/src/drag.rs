@@ -196,7 +196,7 @@ mod tests {
         assert_eq!((*window_id, *s), (dst, src));
         let mut table = crate::activation::table().lock().unwrap();
         let now = crate::activation::now_ns();
-        let got = table.consume(now, activation, 1000 + dst, purpose::DROP, |_| false);
+        let got = table.consume(now, activation, 1000 + dst, purpose::DROP, |_| false, |_, _| false);
         assert!(matches!(got, ConsumeResult::Ok { kind: kind::DROP, drag_id: 77, .. }), "{got:?}: a drop needs no focus");
         drop(table);
 

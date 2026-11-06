@@ -150,6 +150,9 @@ pub mod control {
     pub const OP_WM_SET_OUTPUT_SCALE:   u16 = 0x0527; // WmSetOutputScalePayload
     // Show one monitor's part of the desktop on another as well (mirroring).
     pub const OP_WM_MIRROR_OUTPUT:      u16 = 0x0528; // WmMirrorOutputPayload
+    // Bind a window as a credential slot in another (arca-autofill.md §4):
+    // Limen's stand-in, so window management only. CredentialSlotPayload.
+    pub const OP_WM_CREDENTIAL_SLOT:    u16 = 0x0529;
 
     // Async events (server → client). Sent with envelope flag
     // ASYNC_EVENT (aqueduct::envelope::flags::ASYNC_EVENT).
@@ -971,6 +974,26 @@ pub struct InputPointerScrollEvent {
     pub dy:        f32,
 }
 
+/// Credential slots (docs/spec/arca-autofill.md §4).
+pub mod credential {
+    /// The smallest slot that can be filled, logical px.
+    pub const MIN_W: f32 = 120.0;
+    pub const MIN_H: f32 = 24.0;
+    /// How long a slot must have been fully visible and still before the
+    /// press that fills it.
+    pub const STILL_NS: u64 = 500_000_000;
+}
+
+/// `OP_WM_CREDENTIAL_SLOT`: show window `child` (Arca's) as a credential
+/// slot at `rect` (`[x, y, w, h]`, in `parent`'s coordinates), right above
+/// `parent`; `rect: None` releases it. Sending it again moves the slot.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct CredentialSlotPayload {
+    pub child: u32,
+    pub parent: u32,
+    pub rect: Option<[f32; 4]>,
+}
+
 /// Limits on a drag's formats.
 pub mod drag {
     pub const MAX_FORMATS: usize = 8;
@@ -1448,6 +1471,10 @@ pub mod activation {
         pub const DRAG: u8 = 4;
         pub const SHARE: u8 = 5;
         pub const ACTION: u8 = 6;
+        /// Arca fills a credential slot (arca-autofill.md §3): a click, or
+        /// Enter, in the slot, which frescod must have seen whole,
+        /// uncovered and still for `credential::STILL_NS` before the press.
+        pub const FILL: u8 = 7;
     }
 
     /// What minted a token.
@@ -1475,6 +1502,8 @@ pub mod activation {
         pub const NOT_FOCUSED: u8 = 4;
         pub const WRONG_KIND: u8 = 5;
         pub const NOT_ALLOWED: u8 = 6;
+        /// `FILL`: the slot was not fully visible and still (arca-autofill.md §4).
+        pub const OBSCURED: u8 = 7;
     }
 
     #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -1764,6 +1793,7 @@ mod tests {
             control::EV_INPUT_POINTER_BUTTON,
             control::EV_INPUT_POINTER_SCROLL,
             control::OP_DRAG_BEGIN,
+            control::OP_WM_CREDENTIAL_SLOT,
             control::EV_DRAG_ENTER,
             control::EV_DRAG_OVER,
             control::EV_DRAG_LEAVE,

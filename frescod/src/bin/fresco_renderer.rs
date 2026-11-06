@@ -52,6 +52,9 @@ mod laminar;
 mod pack;
 #[path = "../redraw.rs"]
 mod redraw;
+#[path = "../credential.rs"]
+#[allow(dead_code)]
+mod credential;
 #[path = "../activation.rs"]
 #[allow(dead_code)]
 mod activation;

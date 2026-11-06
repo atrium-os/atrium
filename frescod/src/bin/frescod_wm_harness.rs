@@ -25,6 +25,9 @@ use fresco_scene_server::window::Compositor;
 mod laminar;
 #[path = "../redraw.rs"]
 mod redraw;
+#[path = "../credential.rs"]
+#[allow(dead_code)]
+mod credential;
 #[path = "../activation.rs"]
 #[allow(dead_code)]
 mod activation;

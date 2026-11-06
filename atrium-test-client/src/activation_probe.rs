@@ -235,6 +235,87 @@ fn main() {
     p.inject(&format!("KEY {HID_A} 0 0"));
     p.check(t != [0; 16], "keys still go to the app under it");
 
+    // Credential slots (arca-autofill.md §4): a FILL press counts only on
+    // a slot frescod saw whole, uncovered, big enough and still for 500 ms.
+    let window = |sock: &str, at: (i32, i32), size: (u32, u32), rgba: [f32; 4]| {
+        let mut c = Connection::connect(sock).expect("app socket");
+        let hints = WindowHints { initial_position: Some(at), ..WindowHints::default() };
+        let id = c.window_create(size.0, size.1, "w", hints).expect("window");
+        c.set_default_window(id as u16);
+        c.scene_frame_begin().unwrap();
+        c.scene_node_rect(1, RectParams { x: 0.0, y: 0.0, w: 2000.0, h: 2000.0, r: rgba[0], g: rgba[1], b: rgba[2], a: rgba[3], radius: 0.0 }).unwrap();
+        c.scene_frame_end().unwrap();
+        (c, id)
+    };
+    let (_host, _) = window(sock, (100, 300), (400, 200), [0.9, 0.9, 0.9, 1.0]);
+    let (mut arca, _) = window(sock, (700, 600), (10, 10), [1.0, 1.0, 1.0, 1.0]);
+    std::thread::sleep(Duration::from_millis(500));
+    let rects = p.wm.wm_enumerate().expect("enumerate");
+    let id_at = |x: i32, y: i32| rects.iter().find(|s| (s.rect.x, s.rect.y) == (x, y)).map(|s| s.surface_id);
+    let (Some(host), Some(slot)) = (id_at(100, 300), id_at(700, 600)) else {
+        p.check(false, "found the host and slot windows");
+        std::process::exit(1);
+    };
+    let bind = |p: &mut Probe, r: [f32; 4]| {
+        p.wm.wm_credential_slot(slot, host, Some(r)).unwrap();
+        std::thread::sleep(Duration::from_millis(100));
+    };
+    // A click on the slot at screen (x, y), spent as FILL.
+    let fill = |p: &mut Probe, arca: &mut Connection, x: i32, y: i32| -> u8 {
+        // Click until the slot sees a press: under TCG the first click can
+        // land before the frame that composes the slot there.
+        // Drop presses left over from an earlier round of clicks.
+        while let Ok(Some(_)) = arca.wait_event(Some(Duration::from_millis(50))) {}
+        p.inject(&format!("MOVE {x} {y}"));
+        for _ in 0..200 {
+            p.inject("BTN 1 1");
+            p.inject("BTN 1 0");
+            let until = std::time::Instant::now() + Duration::from_millis(100);
+            while std::time::Instant::now() < until {
+                if let Ok(Some(Event::PointerButton { pressed: true, activation, .. })) =
+                    arca.wait_event(Some(Duration::from_millis(20)))
+                {
+                    return refused(p.consume(activation, p.uid, purpose::FILL));
+                }
+            }
+        }
+        255
+    };
+    let still = || std::thread::sleep(Duration::from_millis(800));
+    bind(&mut p, [20.0, 20.0, 200.0, 40.0]); // screen (120, 320) to (320, 360)
+    let r = fill(&mut p, &mut arca, 220, 340);
+    p.check(r == refusal::OBSCURED, &format!("a slot that just appeared does not fill ({r})"));
+    still();
+    let r = fill(&mut p, &mut arca, 220, 340);
+    p.check(r == 0, &format!("a slot seen whole and still for 500 ms fills ({r})"));
+
+    let (mut cover, cid) = window(sock, (120, 320), (100, 40), [0.2, 0.2, 0.2, 1.0]);
+    still();
+    let r = fill(&mut p, &mut arca, 300, 340);
+    p.check(r == refusal::OBSCURED, &format!("a window over part of it: refused ({r})"));
+    cover.window_destroy(cid).unwrap();
+    let (mut fade, fid) = window(sock, (120, 320), (150, 40), [1.0, 1.0, 1.0, 0.3]);
+    still();
+    let r = fill(&mut p, &mut arca, 300, 340);
+    p.check(r == refusal::OBSCURED, &format!("a translucent veil over it: refused ({r})"));
+    fade.window_destroy(fid).unwrap();
+    still();
+    let r = fill(&mut p, &mut arca, 220, 340);
+    p.check(r == 0, &format!("uncovered and still again: fills ({r})"));
+
+    bind(&mut p, [40.0, 20.0, 200.0, 40.0]); // moved right by 20: (140, 320) to (340, 360)
+    let r = fill(&mut p, &mut arca, 330, 340);
+    p.check(r == refusal::OBSCURED, &format!("just moved under the pointer: refused ({r})"));
+    still();
+    bind(&mut p, [40.0, 20.0, 100.0, 20.0]); // shrunk below 120x24
+    still();
+    let r = fill(&mut p, &mut arca, 180, 330);
+    p.check(r == refusal::OBSCURED, &format!("too small: refused ({r})"));
+    bind(&mut p, [300.0, 20.0, 200.0, 40.0]); // past the host's right edge
+    still();
+    let r = fill(&mut p, &mut arca, 450, 330);
+    p.check(r == refusal::OBSCURED, &format!("sticking out of its window: refused ({r})"));
+
     if p.failed > 0 {
         println!("{} FAILED", p.failed);
         std::process::exit(1);

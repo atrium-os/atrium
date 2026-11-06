@@ -105,6 +105,54 @@ The 500 ms window is the clickjacking fix that Android and the major browsers co
 on: a target that appears, or slides under the pointer, just before a click is not the
 target the user meant.
 
+### 4.1 As built in frescod (2026-11-06), step 1 of §9
+
+Limen has no code yet, so a stand-in binds the slot. `OP_WM_CREDENTIAL_SLOT`
+(0x0529, `CredentialSlotPayload { child, parent, rect: Option<[x, y, w, h]> }`) is a
+window-management op; fresco-client calls it `wm_credential_slot`. It turns window `child`
+(Arca's) into a slot at `rect` in `parent`. Sending it again moves the slot, and `None`
+releases it. Every frame, before anything is drawn, frescod puts the slot at the parent's
+position plus `rect`, gives it `rect`'s size (Arca hears the resize), and places it directly
+above its parent in z-order.
+
+**Why this covers the rules.** The parent draws only into its own window, which sits below
+the slot. So it has no way to draw over, fade, blur, scale or transform the slot.
+
+**The visibility record** is `frescod/src/credential.rs`. On each composed frame, frescod checks
+every slot. The slot passes when all of these hold:
+
+- its rect is wholly inside the parent;
+- it is on screen and below frescod's strip;
+- no window composed above it overlaps it, including notifications and any translucent window;
+- it is at least 120x24;
+- it has not moved or changed size since the last frame.
+
+A frame where all of these hold continues the slot's visible run, and any frame where one fails
+ends the run.
+
+**When a fill counts.** In `fresco_protocol::activation`, purpose `FILL` is 7 and refusal
+`OBSCURED` is 7. A `FILL` press counts only if one visible run covered the whole 500 ms before
+the press and lasted until the press. A press that doesn't qualify is refused `OBSCURED` and is
+not spent. Visibility is checked before focus, so a click that lands while a cover is up answers
+`OBSCURED` even if the cover took focus. A `FILL` accepts a click, or Enter (or keypad Enter) in the slot; ordinary typing is
+refused `WRONG_KIND`. The default consumers gain `_arca`.
+
+**The frame.** In split mode, frescod's chrome draws a gold ring and a key tab around each slot
+that is fit to fill on this frame. No app, and not Arca either, can draw that frame.
+
+**Tests:**
+
+- unit tests of the record (just appeared, moved, covered, shrunk, partly off screen) and of
+  `FILL` in the token table;
+- `atrium-activation-probe` in the VM, in direct and split mode. It binds a slot and checks
+  that each attempt is refused `OBSCURED`: a click right after it appeared, a window over part
+  of it, a translucent veil, a move just before the click, shrinking below 120x24, and sticking
+  out of its window. It also checks that a slot that is still and clear fills, both before and
+  after the covers go.
+
+Not yet built: frames in direct mode, where there is no chrome, and Limen's own role and
+messages (§9 step 2).
+
 ## 5. What the user sees
 
 - **System chrome.** The slot carries a frame and a small key glyph drawn by frescod, not

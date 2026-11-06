@@ -466,6 +466,14 @@ impl Connection {
             &fresco_protocol::DragBegin { window_id, drag_id, activation, formats })
     }
 
+    /// Window management: show `child` as a credential slot at `rect`
+    /// (`[x, y, w, h]`) in `parent`, or release it (`None`); the stand-in
+    /// for Limen's `credential` role (arca-autofill.md §4, §8).
+    pub fn wm_credential_slot(&mut self, child: u32, parent: u32, rect: Option<[f32; 4]>) -> io::Result<()> {
+        self.send_window_managed(control::OP_WM_CREDENTIAL_SLOT,
+            &fresco_protocol::CredentialSlotPayload { child, parent, rect })
+    }
+
     pub fn window_destroy(&mut self, window_id: u32) -> io::Result<()> {
         self.send_window_managed(control::OP_WINDOW_DESTROY,
             &WindowDestroyPayload { window_id })
