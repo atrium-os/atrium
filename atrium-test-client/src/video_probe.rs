@@ -97,8 +97,86 @@ fn rgb_at(cap: &(u32, Vec<u8>), x: i32, y: i32) -> (u8, u8, u8) {
 fn red(c: (u8, u8, u8)) -> bool { c.0 > 230 && c.1 < 30 && c.2 < 30 }
 fn blue(c: (u8, u8, u8)) -> bool { c.0 < 30 && c.1 < 30 && c.2 > 230 }
 
+/// `--play SOCK FPS FRAMES`: play a clip of `FRAMES` frames at `FPS`
+/// through a layer, queued a little ahead on CLOCK_MONOTONIC as a player
+/// would, and report when each was presented against when it was due.
+/// Then hold a green frame for 30 s for a screen dump.
+fn play(sock: &str, fps: u32, frames: u32) -> u32 {
+    let mut p = Probe { failed: 0 };
+    let mut app = Connection::connect(sock).expect("app socket");
+    let hints = WindowHints { initial_position: Some(WIN_POS), ..WindowHints::default() };
+    let win = app.window_create(WIN.0, WIN.1, "player", hints).expect("window");
+    app.set_default_window(win as u16);
+    app.scene_frame_begin().unwrap();
+    app.scene_node_rect(1, RectParams { x: 0.0, y: 0.0, w: WIN.0 as f32, h: BAR_H, r: 1.0, g: 1.0, b: 1.0, a: 1.0, radius: 0.0 }).unwrap();
+    app.scene_frame_end().unwrap();
+    std::thread::sleep(Duration::from_millis(500));
+    let n_bufs = 4u32;
+    let Some((layer, fds)) = app.video_layer_create(win, format::NV12, SRC.0, SRC.1, n_bufs).unwrap() else {
+        p.check(false, "a layer");
+        return p.failed;
+    };
+    let len = buffer_bytes(format::NV12, SRC.0, SRC.1).unwrap() as usize;
+    let mut bufs: Vec<Buf> = fds.iter().map(|f| Buf::map(f, len)).collect();
+    app.video_layer_place(layer, Some([0.0, BAR_H, WIN.0 as f32, WIN.1 as f32 - BAR_H])).unwrap();
+    app.video_layer_rate(layer, fps * 1000).unwrap();
+    let period = 1_000_000_000 / u64::from(fps);
+    let t0 = now_ns() + 500_000_000;
+    let due = |i: u32| t0 + u64::from(i) * period;
+    let mut free: Vec<u32> = (0..n_bufs).collect();
+    let mut shown: Vec<(u32, u64, u32)> = Vec::new();
+    let mut next = 0u32;
+    let end = Instant::now() + Duration::from_secs(u64::from(frames / fps.max(1)) + 30);
+    while Instant::now() < end && (next < frames || shown.last().map(|s| s.0) != Some(frames - 1)) {
+        // Queue ahead: up to 250 ms before a frame is due.
+        while next < frames && !free.is_empty() && due(next) <= now_ns() + 250_000_000 {
+            let b = free.remove(0);
+            let k = (next % 6) as u8;
+            bufs[b as usize].nv12(40 + k * 30, 128, 128);
+            app.video_frame(layer, b, next, due(next)).unwrap();
+            next += 1;
+        }
+        match app.wait_event(Some(Duration::from_millis(5))) {
+            Ok(Some(Event::VideoReleased { buffer, .. })) => free.push(buffer),
+            Ok(Some(Event::VideoPresented { seq, vblank_ns, dropped, .. })) => shown.push((seq, vblank_ns, dropped)),
+            _ => {}
+        }
+        if next >= frames && shown.last().is_some_and(|s| s.0 == frames - 1) {
+            break;
+        }
+    }
+    let dropped: u32 = shown.iter().map(|s| s.2).sum();
+    let in_order = shown.windows(2).all(|w| w[0].0 < w[1].0);
+    let mut late: Vec<i64> = shown.iter().map(|s| (s.1 as i64 - due(s.0) as i64) / 1_000).collect();
+    late.sort_unstable();
+    let pct = |q: f64| late.get(((late.len() as f64 - 1.0) * q).round() as usize).copied().unwrap_or(0);
+    println!("played {frames} frames at {fps} fps: {} presented, {dropped} dropped", shown.len());
+    println!("presented after due, µs: min {} median {} p95 {} max {}", pct(0.0), pct(0.5), pct(0.95), pct(1.0));
+    p.check(shown.len() as u32 + dropped == frames, "every frame presented or counted dropped");
+    p.check(in_order, "presented in order");
+    p.check(late.first().is_some_and(|&l| l >= 0), "none early");
+    // Hold a reference frame: BT.709 limited green.
+    let b = free.first().copied().unwrap_or(0);
+    bufs[b as usize].nv12(173, 42, 26);
+    app.video_frame(layer, b, frames, 0).unwrap();
+    let _ = wait(&mut app, |e| matches!(e, Event::VideoPresented { seq, .. } if *seq == frames));
+    println!("HOLD green at {},{}", WIN_POS.0 + WIN.0 as i32 / 2, WIN_POS.1 + 140);
+    std::thread::sleep(Duration::from_secs(30));
+    drop(bufs);
+    p.failed
+}
+
 fn main() {
     let a: Vec<String> = std::env::args().skip(1).collect();
+    if a.first().map(String::as_str) == Some("--play") {
+        let (Some(sock), fps, n) = (a.get(1), a.get(2).and_then(|v| v.parse().ok()).unwrap_or(24), a.get(3).and_then(|v| v.parse().ok()).unwrap_or(96)) else {
+            eprintln!("usage: atrium-video-probe --play SOCK [FPS] [FRAMES]");
+            std::process::exit(2);
+        };
+        let failed = play(sock, fps, n);
+        println!("{}", if failed == 0 { "PASS" } else { "FAILED" });
+        std::process::exit(if failed == 0 { 0 } else { 1 });
+    }
     let [sock, inject] = &a[..] else {
         eprintln!("usage: atrium-video-probe SOCK INJECT_SOCK");
         std::process::exit(2);

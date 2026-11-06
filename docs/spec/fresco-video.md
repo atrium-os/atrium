@@ -240,6 +240,17 @@ which is a larger change than V3 (decision card in the Fresco thread). The probe
 BT.601 full-range red, PQ peak to SDR white, PQ 100 cd/m² to grey, a refused matrix and
 a protected layer's black in the capture, in both modes.
 
+**V4 as built (2026-11-06).** `atrium-video-probe --play SOCK FPS FRAMES` plays a clip the
+way a player does: frames queued up to 250 ms ahead on `CLOCK_MONOTONIC`, buffers reused as
+they come back, a reference frame held at the end. It checks every frame is presented or
+counted dropped, in order, none early, and reports how late. Run in the VM on frescod's real
+flip path (gpusim display, VRR on, 48–120 Hz monitor) and compared on scanout with a QEMU
+screen dump: the held BT.709 green reads (0, 255, 1) under the window's white bar, in both
+modes. Under TCG frescod composes 1–10 frames a second, so the numbers only say the pipeline
+is right, not fast: 1080p direct, 24 fps: 7 of 96 shown, 89 counted dropped; 720p split,
+10 fps: 37 of 40 shown, median 109 ms after due. Real timing (and the VRR repeat) wants the
+R9700 with a monitor (D5).
+
 ## 9. Who does what
 
 | # | work | owner |
