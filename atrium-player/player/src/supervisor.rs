@@ -55,6 +55,8 @@ pub enum PlayerEvent {
     Ended,
     /// A `wire::err` code. Fatal for this feed.
     Error(u32),
+    /// A feed append was refused (`TOO_BIG`: over the cap); the feed goes on.
+    AppendRefused { track: u8, code: u32 },
     /// The worker died and a fresh one took over.
     Restarted,
     Probe { refused: u32 },
@@ -687,7 +689,11 @@ impl<S: Sink> Player<S> {
                 self.ended = true;
                 self.events.push_back(PlayerEvent::Ended);
             }
-            Record::Error { code } => {
+            Record::Error { code, track: Some(track) } => {
+                self.waiting = false;
+                self.events.push_back(PlayerEvent::AppendRefused { track, code });
+            }
+            Record::Error { code, track: None } => {
                 self.waiting = false;
                 self.events.push_back(PlayerEvent::Error(code));
             }

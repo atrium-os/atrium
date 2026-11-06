@@ -186,7 +186,7 @@ fn player_errors_become_media_errors() {
     assert!(m.take_events().contains(&Fire::Element("error")));
     let mut m2 = Media::new();
     m2.attach_source().unwrap();
-    m2.from_player(ToParent::Error { code: code::DECODE });
+    m2.from_player(ToParent::Error { code: code::DECODE, track: None });
     assert_eq!(m2.error, Some(3));
 }
 

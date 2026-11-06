@@ -69,7 +69,9 @@ fn play(source: Source, o: Options, chunk: usize, files: &[&str], mut each: impl
         }
         let n = frames.borrow().len();
         each(&mut p, &ev, n);
-        let done = matches!(ev, PlayerEvent::Ended | PlayerEvent::Error(_));
+        // A refused append is answered by that alone: no Appended comes to
+        // send the next piece on.
+        let done = matches!(ev, PlayerEvent::Ended | PlayerEvent::Error(_) | PlayerEvent::AppendRefused { .. });
         run.events.push(ev);
         if done {
             loop {
@@ -156,7 +158,10 @@ fn a_killed_worker_is_replaced_and_playback_continues() {
 fn a_feed_over_its_cap_is_refused() {
     let o = Options { limits: Limits { feed_bytes: 20_000, ..Limits::default() }, ..opts() };
     let r = play(Source::Feed(vec![(0, "video/webm".into())]), o, 16_000, &["vp9-opus.webm"], |_, _, _| {});
-    assert!(r.events.contains(&PlayerEvent::Error(err::TOO_BIG)), "{:?}", r.events);
+    assert_eq!(r.events.last(), Some(&PlayerEvent::AppendRefused { track: 0, code: err::TOO_BIG }), "{:?}", r.events);
+    // Each accepted append: its Buffered, then its Appended.
+    let order: Vec<_> = r.events.iter().filter(|e| matches!(e, PlayerEvent::Appended { .. } | PlayerEvent::Buffered { .. })).collect();
+    assert!(order.len() >= 2 && order.chunks(2).all(|p| p.len() < 2 || matches!((p[0], p[1]), (PlayerEvent::Buffered { .. }, PlayerEvent::Appended { .. }))), "{order:?}");
 }
 
 #[test]

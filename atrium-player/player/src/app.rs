@@ -217,7 +217,7 @@ impl<H: Host> App<H> {
     fn start(&mut self, source: Source) -> io::Result<()> {
         let Some(sink) = self.sink.take() else {
             // One source per embed: a new `src` is a new embed.
-            self.host.emit(ToParent::Error { code: code::STATE });
+            self.host.emit(ToParent::Error { code: code::STATE, track: None });
             return Ok(());
         };
         let mut p = Player::new(self.opts.clone(), sink, source)?;
@@ -319,18 +319,18 @@ impl<H: Host> App<H> {
         };
         fn feed<H: Host>(app: &mut App<H>) -> Option<&mut Player<FrescoSink>> {
             if app.player.is_none() {
-                app.host.emit(ToParent::Error { code: code::STATE });
+                app.host.emit(ToParent::Error { code: code::STATE, track: None });
             }
             app.player.as_mut()
         }
         match m {
             // A `Load` of a descriptor comes as HostEvent::Load; without one
             // it is out of place.
-            ToChild::Load { source: LoadSource::Fd, .. } => self.host.emit(ToParent::Error { code: code::STATE }),
+            ToChild::Load { source: LoadSource::Fd, .. } => self.host.emit(ToParent::Error { code: code::STATE, track: None }),
             ToChild::OpenSource => self.start(Source::Feed(Vec::new()))?,
             ToChild::AddTrack { track, mime } => {
                 if !atrium_media_demux::mime_supported(&mime) {
-                    self.host.emit(ToParent::Error { code: code::UNSUPPORTED });
+                    self.host.emit(ToParent::Error { code: code::UNSUPPORTED, track: None });
                 } else if let Some(p) = feed(self) {
                     p.add_track(track, mime);
                 }
@@ -431,10 +431,11 @@ impl<H: Host> App<H> {
                 }
                 self.host.emit(ToParent::Buffered { track, ranges: r.into_iter().take(RANGES_MAX).collect() });
             }
+            PlayerEvent::AppendRefused { track, code } => self.host.emit(ToParent::Error { code: limen_code(code), track: Some(track) }),
             PlayerEvent::Ended => self.ended_at = Some(Instant::now()),
             PlayerEvent::Error(c) => {
                 println!("error {c}");
-                self.host.emit(ToParent::Error { code: limen_code(c) });
+                self.host.emit(ToParent::Error { code: limen_code(c), track: None });
                 if self.player.is_none() {
                     self.done = true;
                 }

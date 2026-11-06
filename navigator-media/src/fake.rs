@@ -52,7 +52,7 @@ impl FakePlayer {
                 self.loaded = true;
                 let Source::Fd = source;
                 let ok = self.supports.iter().any(|s| mime.starts_with(s));
-                self.pending.push_back(if ok { ToParent::Ready { duration_secs: 10.0, width: 640, height: 360 } } else { ToParent::Error { code: code::UNSUPPORTED } });
+                self.pending.push_back(if ok { ToParent::Ready { duration_secs: 10.0, width: 640, height: 360 } } else { ToParent::Error { code: code::UNSUPPORTED, track: None } });
             }
             ToChild::OpenSource => {
                 if self.loaded { self.violation("OpenSource after a source".into()) }
@@ -60,7 +60,7 @@ impl FakePlayer {
                 self.feed = true;
             }
             ToChild::AddTrack { track, mime } => {
-                if !self.feed { self.violation("AddTrack outside a feed".into()); self.pending.push_back(ToParent::Error { code: code::STATE }); return }
+                if !self.feed { self.violation("AddTrack outside a feed".into()); self.pending.push_back(ToParent::Error { code: code::STATE, track: None }); return }
                 if self.tracks[track as usize].is_some() { self.violation(format!("track {track} added twice")) }
                 self.tracks[track as usize] = Some((mime, 0, false));
             }
@@ -69,11 +69,11 @@ impl FakePlayer {
                 let cap = self.cap;
                 let Some(t) = self.tracks[track as usize].as_mut() else {
                     self.violation(format!("Append on track {track}, which was never added"));
-                    self.pending.push_back(ToParent::Error { code: code::STATE });
+                    self.pending.push_back(ToParent::Error { code: code::STATE, track: None });
                     return;
                 };
-                if t.2 { self.violation(format!("a second Append in flight on track {track}")); self.pending.push_back(ToParent::Error { code: code::STATE }); return }
-                if used + bytes.len() as u64 > cap { self.pending.push_back(ToParent::Error { code: code::TOO_BIG }); return }
+                if t.2 { self.violation(format!("a second Append in flight on track {track}")); self.pending.push_back(ToParent::Error { code: code::STATE, track: None }); return }
+                if used + bytes.len() as u64 > cap { self.pending.push_back(ToParent::Error { code: code::TOO_BIG, track: Some(track) }); return }
                 t.1 += bytes.len() as u64;
                 t.2 = true;
                 let end = t.1 as f64 / self.bytes_per_sec;

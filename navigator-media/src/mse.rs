@@ -410,10 +410,11 @@ impl Media {
                 if !self.paused { self.paused = true; self.events.push(Fire::Element("pause")) }
                 self.events.push(Fire::Element("ended"));
             }
-            ToParent::Error { code: c } if c == code::TOO_BIG => {
-                // The player is full: every append in flight ends, and the
-                // next appendBuffer throws QuotaExceededError until a remove.
-                let tracks: Vec<u8> = self.ms.as_ref().map(|m| m.bufs.iter().enumerate().filter(|(_, b)| b.updating && !b.removing).map(|(i, _)| i as u8).collect()).unwrap_or_default();
+            ToParent::Error { code: c, track } if c == code::TOO_BIG => {
+                // The player is full: the named track's append ends (every
+                // append in flight if none is named), and the next
+                // appendBuffer throws QuotaExceededError until a remove.
+                let tracks: Vec<u8> = self.ms.as_ref().map(|m| m.bufs.iter().enumerate().filter(|(i, b)| b.updating && !b.removing && track.is_none_or(|t| t as usize == *i)).map(|(i, _)| i as u8).collect()).unwrap_or_default();
                 for t in tracks {
                     let sb = self.sb(t).unwrap();
                     sb.chunks.clear();
@@ -425,7 +426,7 @@ impl Media {
                 }
                 if let Some(ms) = self.ms.as_mut() { for b in &mut ms.bufs { b.quota = true } }
             }
-            ToParent::Error { code: c } => {
+            ToParent::Error { code: c, .. } => {
                 self.fail(match c { code::DECODE => 3, code::UNSUPPORTED => 4, code::NETWORK => 2, _ => 3 });
             }
         }

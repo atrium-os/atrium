@@ -139,6 +139,7 @@ fn main() {
             }
             PlayerEvent::Probe { refused } => println!("probe open-refused={} connect-refused={} fork-refused={}", refused & 1 != 0, refused & 2 != 0, refused & 4 != 0),
             PlayerEvent::Restarted => println!("worker restarted"),
+            PlayerEvent::AppendRefused { track, code } => println!("append on track {track} refused ({code})"),
             PlayerEvent::Ended => {
                 loop {
                     let (n, _) = p.read_pcm(&mut pcm);

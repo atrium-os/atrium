@@ -182,7 +182,7 @@ impl Worker {
     fn fail(&mut self, code: u32) {
         if !self.failed {
             self.failed = true;
-            let _ = self.send(Record::Error { code });
+            let _ = self.send(Record::Error { code, track: None });
         }
     }
 
@@ -243,8 +243,10 @@ impl Worker {
                 }
             }
             ToWorker::Append { track, bytes, timestamp_offset_ns } => {
-                self.append(track, &bytes, timestamp_offset_ns);
-                let _ = self.send(Record::Appended { track });
+                // A refused append is answered by its Error alone.
+                if self.append(track, &bytes, timestamp_offset_ns) {
+                    let _ = self.send(Record::Appended { track });
+                }
             }
             ToWorker::Remove { track, start_ns, end_ns } => {
                 if let Some(fi) = self.feed_index(track) {
@@ -295,18 +297,23 @@ impl Worker {
         self.feeds.iter().position(|(t, _)| *t == track)
     }
 
-    fn append(&mut self, track: u8, bytes: &[u8], offset: Option<i64>) {
-        let Some(fi) = self.feed_index(track) else { return self.fail(err::STATE) };
+    /// Returns false if the append is refused (and answered) here.
+    fn append(&mut self, track: u8, bytes: &[u8], offset: Option<i64>) -> bool {
+        let Some(fi) = self.feed_index(track) else {
+            self.fail(err::STATE);
+            return true;
+        };
         let held: u64 = self.video.as_ref().map_or(0, |v| v.store.bytes()) + self.audio.as_ref().map_or(0, |a| a.store.bytes());
         if held + bytes.len() as u64 > self.limits.feed_bytes {
-            let _ = self.send(Record::Error { code: err::TOO_BIG });
-            return;
+            let _ = self.send(Record::Error { code: err::TOO_BIG, track: Some(track) });
+            return false;
         }
         if let Some(o) = offset {
             self.feeds[fi].1.offset_ns = o;
         }
         self.push_bytes(fi, bytes);
         self.report_buffered(track);
+        true
     }
 
     /// Push bytes into a feed's parser and route what comes out.

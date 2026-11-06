@@ -139,7 +139,9 @@ pub enum Record {
     Seeked { epoch: u32, pos: u64 },
     /// Everything has been decoded.
     Ended,
-    Error { code: u32 },
+    /// `track`: a feed track's append was refused (over the cap), and no
+    /// `Appended` follows for it; `None`: the worker has failed.
+    Error { code: u32, track: Option<u8> },
     /// `ProbeSandbox` results: bit 0 open refused, bit 1 connect refused,
     /// bit 2 fork refused.
     Probe { refused: u32 },
@@ -183,7 +185,7 @@ impl Record {
             }
             Record::Seeked { epoch, pos } => put(&mut b, tag::SEEKED, epoch, pos, 0, 0),
             Record::Ended => put(&mut b, tag::ENDED, 0, 0, 0, 0),
-            Record::Error { code } => put(&mut b, tag::ERROR, code, 0, 0, 0),
+            Record::Error { code, track } => put(&mut b, tag::ERROR, code, track.map_or(0xFF, |t| t as u64), 0, 0),
             Record::Probe { refused } => put(&mut b, tag::PROBE, refused, 0, 0, 0),
             Record::Color { primaries, transfer, matrix, range } => {
                 put(&mut b, tag::COLOR, u32::from_le_bytes([primaries, transfer, matrix, range]), 0, 0, 0)
@@ -244,7 +246,7 @@ impl Record {
             }
             tag::SEEKED => Record::Seeked { epoch: a, pos: x },
             tag::ENDED => Record::Ended,
-            tag::ERROR if (1..=4).contains(&a) => Record::Error { code: a },
+            tag::ERROR if (1..=4).contains(&a) && (x < 8 || x == 0xFF) => Record::Error { code: a, track: (x != 0xFF).then_some(x as u8) },
             tag::PROBE if a < 8 => Record::Probe { refused: a },
             tag::COLOR => {
                 let [primaries, transfer, matrix, range] = a.to_le_bytes();
@@ -307,7 +309,8 @@ mod tests {
             Record::Buffered { track: 0, i: 0, n: 0, start_ns: 0, end_ns: 0 },
             Record::Seeked { epoch: 4, pos: 77 },
             Record::Ended,
-            Record::Error { code: err::DECODE },
+            Record::Error { code: err::DECODE, track: None },
+            Record::Error { code: err::TOO_BIG, track: Some(2) },
             Record::Probe { refused: 7 },
         ];
         for r in rs {
@@ -326,7 +329,7 @@ mod tests {
             Record::Buffered { track: 0, i: 3, n: 2, start_ns: 0, end_ns: 1 }.encode(),
             Record::Buffered { track: 0, i: 0, n: 1, start_ns: 5, end_ns: 1 }.encode(),
             Record::Duration { secs: f64::NAN }.encode(),
-            Record::Error { code: 99 }.encode(),
+            Record::Error { code: 99, track: None }.encode(),
             [0xFF; RECORD_LEN],
         ];
         for b in bad {

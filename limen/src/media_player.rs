@@ -88,7 +88,10 @@ pub enum ToParent {
     Playing,
     Paused,
     Ended,
-    Error { code: u16 },
+    /// `track` names the feed track whose `Append` this ends (a `TOO_BIG`
+    /// append over the buffer cap: that append is dropped, no `Appended`
+    /// follows, and the feed goes on). `None`: playback has failed.
+    Error { code: u16, track: Option<u8> },
 }
 
 fn finite_secs(s: f64) -> bool {
@@ -149,7 +152,8 @@ impl ToParent {
             }
             ToParent::Appended { track } => *track < TRACKS_MAX,
             ToParent::Time { secs } | ToParent::Waiting { secs } | ToParent::Seeking { secs } => finite_secs(*secs),
-            ToParent::Playing | ToParent::Paused | ToParent::Ended | ToParent::Error { .. } => true,
+            ToParent::Error { track, .. } => track.is_none_or(|t| t < TRACKS_MAX),
+            ToParent::Playing | ToParent::Paused | ToParent::Ended => true,
         };
         ok.then_some(m)
     }
@@ -188,7 +192,7 @@ mod tests {
             ToParent::Appended { track: 0 },
             ToParent::Time { secs: 3.25 },
             ToParent::Ended,
-            ToParent::Error { code: code::TOO_BIG },
+            ToParent::Error { code: code::TOO_BIG, track: Some(1) },
         ];
         for m in to_parent {
             assert_eq!(ToParent::decode(&m.encode()), Some(m));
@@ -218,6 +222,7 @@ mod tests {
             ToParent::Buffered { track: 0, ranges: vec![(2.0, 1.0)] },
             ToParent::Time { secs: f64::INFINITY },
             ToParent::CanPlay { mime: "x\u{7}".into(), supported: true },
+            ToParent::Error { code: code::TOO_BIG, track: Some(TRACKS_MAX) },
         ];
         for m in bad_parent {
             assert_eq!(ToParent::decode(&m.encode()), None, "{m:?}");
