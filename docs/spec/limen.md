@@ -1,7 +1,8 @@
 # Limen — cross-jail embed broker
 
-Status: design sketch (pre-implementation).
-Last updated: 2026-05-21.
+Status: design sketch (pre-implementation). Reviewed and scoped 2026-11-06: see §16, which
+wins where it differs from the sections above.
+Last updated: 2026-11-06.
 
 **Limen** (Latin: *threshold, doorway*) is Insula's embed
 broker — the system service that mediates **cross-jail
@@ -722,3 +723,74 @@ as a picker via Limen.
 - `docs/NAMING.md` — naming reference (Limen entry).
 - Future sibling: `docs/spec/atrium-ax.md` — AX tree
   composition referenced from §9.
+
+## 16. Review and v1 scope (2026-11-06)
+
+This spec was sketched in May, before Fresco's split mode, Tabula, Praeco, Arca and the
+autofill design. Four things in it no longer match the system as built.
+
+### 16.1 What changes
+
+1. **A slot is a child window, not a region of the parent's surface.** frescod already does
+   this for credentials (`OP_WM_CREDENTIAL_SLOT`, arca-autofill.md §4.1). It pins the child
+   window at the parent's position plus the slot rect, sizes it, and keeps it directly above
+   the parent. That gives §5.1's guarantees with nothing new: the parent can't read the child's
+   pixels because they are another window's. Input routing (§6) is frescod's ordinary hit
+   testing and focus, because the child is the topmost window at that point. Drag and drop
+   across the boundary (§6.4) is Tabula's, unchanged.
+   - **Lost:** §5.1's "the parent can draw above the slot". A parent menu or popover over
+     an embed has to be its own window above both, which Pergola's popups will need anyway.
+     For credential slots, not being able to draw over them is the point.
+   - **Needed in frescod:** generalise the credential op to any role. The slot keeps a
+     `kind`, and only the `credential` kind gets the visibility record and the frame. The
+     op needs its own allowlist (`_limen`), not the whole WM socket.
+2. **Messages are postcard plus serde, one Rust module per role**, like `limen::credential`.
+   This replaces CBOR/CDDL (§2, §14) and matches every other Atrium wire format. limend
+   carries role messages as opaque bytes with a size cap. Each side decodes with the role's
+   type and refuses anything out of shape.
+3. **Identity is the channel, as in Arca** (arca.md §4.1). limend learns who the parent is from
+   the peer uid and the launch registry, never from a message. Children are started by
+   portcullisd, so the child is known by construction. A child's capabilities are its own
+   manifest's (§8.1, unchanged).
+4. **Rust first; the C SDK (§11.1, §11.2) waits for an Insula app that needs it.** The latency
+   targets in §12 are aims, not v1 gates.
+
+**System roles** are new. Some roles have exactly one provider, a system service, and the user
+never picks it: `credential` is Arca, `sign-in` is Vestibulum. Their provider is fixed in
+limend's catalogue, and §3's default-app selection doesn't apply.
+
+### 16.2 v1 scope
+
+| piece | what | owner | size |
+|---|---|---|---|
+| **limend** | Aqueduct socket. `request_embed(role, window_id, rect)` from the parent, which must own the window. A static catalogue: system roles, plus a configured default per user role. Start the child, or ask a running system provider for a new instance. Bind its window as the slot. Relay role messages both ways, opaque, at most 64 KiB, rate-limited. Lifecycle: `attached`, `child_lost`, `detached`, plus resize, visibility and detach from the parent. A parent that exits ends its embeds | this thread | about 1.5k lines plus tests, like tabulad and praecod together |
+| **frescod** | a general slot op with a kind and the `_limen` allowlist; release when either window goes | Fresco thread | small; it extends 3088743 |
+| **portcullisd** | an embed-mode launch for user-role children: `ExecInstance` per embed, with the parent's identity passed as data, never as authority | this thread, reviewed by whoever owns portcullisd | small |
+| **Pergola, parent side** | a `SlotBinder` that talks to limend, so `CredentialField` and later a doc-viewer embed widget get real children | this thread | small |
+| **Pergola, child side** | `limen::Child`: an embedded app learns its role and gets its channel at start, and its window is the slot | this thread | small |
+| **first roles** | `credential` against a stand-in Arca child (Arca isn't built), then `doc-viewer` for the Navigator's untrusted-document widget | this thread | the stand-in is small |
+
+**Tests.** The Linux tests run limend with a fake launcher and fake frescod, covering:
+- a parent can't embed into a window it doesn't own;
+- an unknown role is refused;
+- oversized or malformed messages are dropped;
+- a child crash reaches the parent as `child_lost`;
+- a parent's exit tears its children down.
+
+Then a VM run in split mode: a Pergola window with a `CredentialField` embeds a stand-in
+Arca child, and the activation probe's covers are refused as before.
+
+**Not in v1:**
+- default-app UI in Curia (§3.2), which needs Curia;
+- the install prompt (§3.3);
+- per-embed consent (§8.3), which is only for `payment`;
+- the accessibility bridge (§9, §13.3);
+- vendor roles;
+- more than one slot per child;
+- cross-host embeds.
+
+### 16.3 Verdict on size
+
+v1 is about the size of Tabula plus Praeco, which this thread built today, so it can stay
+here. It would be too big if it took in Curia's default-app UI or the accessibility bridge.
+Those are listed as later work, and either could go to another thread when it comes up.
