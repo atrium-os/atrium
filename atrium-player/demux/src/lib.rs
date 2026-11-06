@@ -196,7 +196,11 @@ pub trait Demuxer {
     fn seek(&mut self, t_ns: i64) -> bool;
     /// MSE `Abort`: drop a half-parsed segment, keep the track list.
     fn abort(&mut self);
-    /// No more bytes come: an error if a segment is half done.
+    /// The input is a file that can be read out of order, so the parser may
+    /// ask (by [`Self::wants_offset`]) for an index stored later in it.
+    fn set_seekable(&mut self, _yes: bool) {}
+    /// No more bytes come: an error if a segment is half done. A parser that
+    /// went ahead for an index may ask for an offset instead.
     fn finish(&mut self) -> Result<()>;
 }
 

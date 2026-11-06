@@ -13,6 +13,7 @@ const CLUSTER: u32 = 0x1F43_B675;
 const INFO: u32 = 0x1549_A966;
 const TRACKS: u32 = 0x1654_AE6B;
 const CUES: u32 = 0x1C53_BB6B;
+const SEEKHEAD: u32 = 0x114D_9B74;
 const TIMECODE: u32 = 0xE7;
 const SIMPLEBLOCK: u32 = 0xA3;
 const BLOCKGROUP: u32 = 0xA0;
@@ -28,7 +29,7 @@ fn cluster_child(id: u32) -> bool {
 
 /// Segment children the parser reads; the rest are skipped by size.
 fn parsed_in_segment(id: u32) -> bool {
-    matches!(id, INFO | TRACKS | CUES)
+    matches!(id, INFO | TRACKS | CUES | SEEKHEAD)
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -57,6 +58,12 @@ pub struct Parser {
     cluster_tc: Option<u64>,
     /// (time ns, absolute cluster offset), sorted by time.
     cues: Vec<(i64, u64)>,
+    /// Where the SeekHead says the Cues are (absolute), and whether the
+    /// input can be read out of order to fetch them from there.
+    cues_at: Option<u64>,
+    seekable: bool,
+    /// Gone to read the Cues: the first Cluster's offset, to come back to.
+    resume: Option<u64>,
     want: Option<u64>,
     out: VecDeque<Event>,
     /// The first error is sticky: the parser stops for good.
@@ -79,6 +86,9 @@ impl Parser {
             delay: Vec::new(),
             cluster_tc: None,
             cues: Vec::new(),
+            cues_at: None,
+            seekable: false,
+            resume: None,
             want: None,
             out: VecDeque::new(),
             failed: None,
@@ -134,6 +144,15 @@ impl Parser {
         }
 
         let top = self.stack.last().copied();
+        // Gone to read the Cues: anything else there means the SeekHead was
+        // wrong, so go back and play without them.
+        if let (Some(r), Some(SEGMENT)) = (self.resume, top.map(|t| t.id)) {
+            if id != CUES {
+                self.resume = None;
+                self.want = Some(r);
+                return Ok(true);
+            }
+        }
         // An unknown-size Cluster ends at the first element that can't be in it.
         if let Some(Open { id: CLUSTER, end: None }) = top {
             if !cluster_child(id) {
@@ -166,6 +185,17 @@ impl Parser {
             (None, 0xEC) => {}
             (None, _) => return Err(Error::Malformed("top-level element")),
             (Some(SEGMENT), CLUSTER) => {
+                // Cues after the clusters (as most muxers write them): read
+                // them first if the input allows, then come back here.
+                if self.seekable && self.cues.is_empty() && self.resume.is_none() {
+                    if let Some(at) = self.cues_at.take() {
+                        if at > pos && self.segment.and_then(|s| s.end).map_or(true, |e| at < e) {
+                            self.resume = Some(pos);
+                            self.want = Some(at);
+                            return Ok(true);
+                        }
+                    }
+                }
                 self.inp.consume(hlen);
                 self.cluster_tc = None;
                 self.stack.push(Open { id: CLUSTER, end });
@@ -190,7 +220,13 @@ impl Parser {
         match id {
             INFO => self.info(&body)?,
             TRACKS => self.parse_tracks(&body)?,
-            CUES => self.parse_cues(&body)?,
+            CUES => {
+                self.parse_cues(&body)?;
+                if let Some(r) = self.resume.take() {
+                    self.want = Some(r);
+                }
+            }
+            SEEKHEAD => self.parse_seekhead(&body)?,
             TIMECODE => self.cluster_tc = Some(be_uint(&body)?),
             SIMPLEBLOCK => self.block(&body, None, None)?,
             BLOCKGROUP => self.block_group(&body)?,
@@ -357,6 +393,32 @@ impl Parser {
         Ok((TrackInfo { index, id: number, codec, kind, config, default_duration_ns: default_duration, encrypted }, codec_delay as i64))
     }
 
+    /// The SeekHead's entry for the Cues, if it has one.
+    fn parse_seekhead(&mut self, b: &[u8]) -> Result<()> {
+        let Some(seg) = self.seg_data else { return Ok(()) };
+        for el in children(b) {
+            let (id, v) = el?;
+            if id != 0x4DBB {
+                continue;
+            }
+            let (mut sid, mut spos) = (None, None);
+            for el in children(v) {
+                let (id, v) = el?;
+                match id {
+                    0x53AB => sid = Some(v),
+                    0x53AC => spos = Some(be_uint(v)?),
+                    _ => {}
+                }
+            }
+            if let (Some(sid), Some(p)) = (sid, spos) {
+                if sid == CUES.to_be_bytes() && self.cues_at.is_none() && self.cues.is_empty() {
+                    self.cues_at = seg.checked_add(p);
+                }
+            }
+        }
+        Ok(())
+    }
+
     fn parse_cues(&mut self, b: &[u8]) -> Result<()> {
         let Some(seg) = self.seg_data else { return Ok(()) };
         let mut cues = Vec::new();
@@ -462,6 +524,12 @@ impl Demuxer for Parser {
             match self.step() {
                 Ok(true) => {}
                 Ok(false) => return Ok(None),
+                // Gone to read the Cues and found junk: the SeekHead was
+                // wrong, so go back and play without them.
+                Err(_) if self.resume.is_some() => {
+                    self.want = self.resume.take();
+                    self.skip = 0;
+                }
                 Err(e) => {
                     self.failed = Some(e.clone());
                     return Err(e);
@@ -506,7 +574,16 @@ impl Demuxer for Parser {
         self.failed = None;
     }
 
+    fn set_seekable(&mut self, yes: bool) {
+        self.seekable = yes;
+    }
+
     fn finish(&mut self) -> Result<()> {
+        // The SeekHead pointed past the end: play without the Cues.
+        if let Some(r) = self.resume.take() {
+            self.want = Some(r);
+            return Ok(());
+        }
         if !self.inp.is_empty() || self.skip > 0 {
             return Err(Error::Malformed("truncated at end"));
         }

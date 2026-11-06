@@ -94,6 +94,8 @@ struct Worker {
     failed: bool,
     /// A seek that came before the audio track did (a restarted worker).
     pending_drop: Option<i64>,
+    /// The input is a file, not a pipe: it can be read out of order.
+    seekable: bool,
 }
 
 fn main() {
@@ -144,6 +146,7 @@ fn main() {
         end_of_stream: false,
         failed: false,
         pending_drop: None,
+        seekable: false,
     };
     if w.send(Record::Ready { sandboxed }).is_err() {
         return;
@@ -199,8 +202,10 @@ impl Worker {
                     let mut f = File::from(fd);
                     // A restarted worker shares the file offset with the last
                     // one. A pipe has none: it plays once, front to back.
-                    if let Err(e) = f.seek(SeekFrom::Start(0)) {
-                        if e.raw_os_error() != Some(libc::ESPIPE) {
+                    match f.seek(SeekFrom::Start(0)) {
+                        Ok(_) => self.seekable = true,
+                        Err(e) if e.raw_os_error() == Some(libc::ESPIPE) => {}
+                        Err(_) => {
                             self.fail(err::STATE);
                             return true;
                         }
@@ -291,7 +296,9 @@ impl Worker {
             let fmt = demux::probe(bytes).or(if feed.mime.contains("mp4") { Some(demux::Format::Mp4) } else if feed.mime.contains("webm") { Some(demux::Format::Webm) } else { None });
             let Some(fmt) = fmt else { return self.fail(err::UNSUPPORTED) };
             let lim = demux::Limits { max_width: self.limits.max_width, max_height: self.limits.max_height, ..demux::Limits::default() };
-            feed.parser = Some(demux::open(fmt, lim));
+            let mut parser = demux::open(fmt, lim);
+            parser.set_seekable(self.seekable);
+            feed.parser = Some(parser);
         }
         feed.parser.as_mut().unwrap().push(bytes);
         self.drain_parser(fi);
@@ -476,6 +483,10 @@ impl Worker {
                         if p.finish().is_err() {
                             // A truncated file plays what it has.
                         }
+                    }
+                    // Or it went ahead for an index that wasn't there.
+                    if self.feeds[0].1.parser.is_some() {
+                        self.drain_parser(0);
                     }
                 }
                 Some(Ok(n)) => {

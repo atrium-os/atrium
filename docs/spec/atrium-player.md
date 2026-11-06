@@ -278,9 +278,12 @@ Fresco's layers land.
   The level is the same at every rate. Lyra's own VM check passes on the same boot. A/V skew
   against vblank isn't measured here, because headless frescod under TCG captures at most
   every 200 ms; that needs the Mac's VM or hardware.
-- Known gaps: a WebM with its Cues at the end can only seek within what is read ahead,
-  otherwise it reads again from the start and drops frames up to the target (reading Cues
-  through the SeekHead is an M7 item). The stream's colour info isn't read yet, so the layer
+- M7, WebM Cues: a file (not a pipe) whose Cues sit after the clusters, where ffmpeg puts
+  them, has them read through the SeekHead before the first cluster, then playback goes
+  back. A SeekHead that points past the end or at anything but Cues is ignored. Seeks start
+  sound 80 ms before the target (MP4 and WebM alike). A pipe, or a file with no Cues, still
+  reads again from the start and drops frames up to the target.
+- Known gaps: the stream's colour info isn't read yet, so the layer
   keeps Fresco's default (BT.709 limited); `video_layer_color` from the decoder's colour
   info is an M7 item.
 

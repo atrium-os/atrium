@@ -31,6 +31,8 @@ struct Out {
     tracks: Vec<TrackInfo>,
     duration: Option<f64>,
     samples: Vec<Sample>,
+    /// Offsets the parser asked for.
+    jumps: Vec<u64>,
 }
 
 /// Play a whole file through a parser, in chunks of `chunk` bytes, serving
@@ -48,19 +50,23 @@ fn run(file: &[u8], chunk: usize, d: &mut dyn Demuxer) -> Out {
             }
         }
         if let Some(off) = d.wants_offset() {
+            out.jumps.push(off);
             at = off as usize;
             d.input_at(off);
             continue;
         }
         if at >= file.len() {
-            break;
+            d.finish().expect("ends cleanly");
+            // A parser that went ahead for an index may come back.
+            if d.wants_offset().is_some() {
+                continue;
+            }
+            return out;
         }
         let end = (at + chunk).min(file.len());
         d.push(&file[at..end]);
         at = end;
     }
-    d.finish().expect("ends cleanly");
-    out
 }
 
 fn play(name: &str, chunk: usize) -> Out {
@@ -241,4 +247,75 @@ fn drain(d: &mut dyn Demuxer) {
         }
     }
     panic!("parser made no end");
+}
+
+/// Cues after the clusters (where ffmpeg puts them): a seekable input reads
+/// them through the SeekHead before the first cluster, so a seek works at
+/// once, and nothing else changes.
+#[test]
+fn webm_cues_at_the_end_are_read_first() {
+    for name in ["vp9-opus.webm", "av1-opus.webm", "vp8-vorbis.webm"] {
+        let f = clip(name);
+        let plain = run(&f, 1 << 16, open(probe(&f).unwrap(), Limits::default()).as_mut());
+        let mut d = open(probe(&f).unwrap(), Limits::default());
+        d.set_seekable(true);
+        // Up to the first sample: the parser asks for the Cues on the way.
+        d.push(&f[..4096.min(f.len())]);
+        let mut asked = None;
+        let mut at = 4096usize;
+        let mut first = None;
+        while first.is_none() {
+            while let Some(ev) = d.poll().unwrap() {
+                if let Event::Sample(s) = ev {
+                    first.get_or_insert(s);
+                }
+            }
+            if let Some(off) = d.wants_offset() {
+                asked.get_or_insert(off);
+                d.input_at(off);
+                at = off as usize;
+            } else {
+                d.push(&f[at..(at + 4096).min(f.len())]);
+                at = (at + 4096).min(f.len());
+            }
+        }
+        let cues_at = asked.expect("asks for the cues") as usize;
+        assert!(cues_at > f.len() / 2, "{name}: the cues are at the end ({cues_at} of {})", f.len());
+        assert!(d.seek(1_500_000_000), "{name}: can seek before reading on");
+        // The whole file the seekable way: the same samples.
+        let mut d = open(probe(&f).unwrap(), Limits::default());
+        d.set_seekable(true);
+        let seekable = run(&f, 1 << 16, d.as_mut());
+        assert_eq!(seekable.samples.len(), plain.samples.len(), "{name}");
+        assert!(seekable.samples.iter().zip(&plain.samples).all(|(a, b)| a.pts_ns == b.pts_ns && a.data == b.data), "{name}: same samples");
+    }
+}
+
+/// A SeekHead pointing at nonsense (past the end, or not at Cues) is
+/// ignored: the file plays the same.
+#[test]
+fn a_wrong_seekhead_is_ignored() {
+    let f = clip("vp9-opus.webm");
+    let plain = run(&f, 1 << 16, open(probe(&f).unwrap(), Limits::default()).as_mut());
+    // Find the SeekHead's entry for the Cues and point it elsewhere.
+    let id = [0x53, 0xAB, 0x84, 0x1C, 0x53, 0xBB, 0x6B];
+    let i = f.windows(id.len()).position(|w| w == id).expect("a SeekHead entry for the Cues");
+    let p = i + id.len();
+    assert_eq!(&f[p..p + 2], &[0x53, 0xAC], "SeekPosition follows");
+    let len = (f[p + 2] & 0x0F) as usize;
+    let max = (1u64 << (8 * len)) - 1;
+    // Past the end, mid-cluster, and the first byte of a cluster's payload.
+    for bad in [max, (f.len() as u64 * 3 / 5).min(max), (f.len() as u64 / 3).min(max)] {
+        let mut g = f.clone();
+        for k in 0..len {
+            g[p + 3 + k] = (bad >> (8 * (len - 1 - k))) as u8;
+        }
+        let mut d = open(probe(&g).unwrap(), Limits::default());
+        d.set_seekable(true);
+        let o = run(&g, 1 << 16, d.as_mut());
+        assert_eq!(o.samples.len(), plain.samples.len(), "SeekPosition {bad:#x}");
+        if bad != max {
+            assert_eq!(o.jumps.len(), 2, "SeekPosition {bad:#x}: went there and came back ({:?})", o.jumps);
+        }
+    }
 }
