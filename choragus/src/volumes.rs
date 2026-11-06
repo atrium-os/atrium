@@ -24,11 +24,19 @@ use std::io;
 pub struct Level {
     pub volume: f32,
     pub muted: bool,
+    /// The app's streams go through the output's virtual surround (the
+    /// user's opt-out is `false`; lyra-spatial.md §3.1).
+    #[serde(default = "yes")]
+    pub spatial: bool,
+}
+
+fn yes() -> bool {
+    true
 }
 
 impl Default for Level {
     fn default() -> Self {
-        Level { volume: 1.0, muted: false }
+        Level { volume: 1.0, muted: false, spatial: true }
     }
 }
 
@@ -156,6 +164,9 @@ pub struct OutputSettings {
     /// Speaker layout by output name: 2, 6 or 8 channels (default 2).
     #[serde(default)]
     pub layout: BTreeMap<String, u8>,
+    /// Headphone virtual surround by output name (default off).
+    #[serde(default)]
+    pub spatial: BTreeMap<String, bool>,
 }
 
 /// Speaker layouts an output may have: stereo, 5.1, 7.1.
@@ -193,6 +204,15 @@ impl OutputSettings {
         self.save(dir)
     }
 
+    pub fn spatial(&self, output: &str) -> bool {
+        self.spatial.get(output).copied().unwrap_or(false)
+    }
+
+    pub fn set_spatial(&mut self, dir: &Option<String>, output: &str, on: bool) -> io::Result<()> {
+        self.spatial.insert(output.to_string(), on);
+        self.save(dir)
+    }
+
     pub fn balance(&self, output: &str) -> f32 {
         self.balance.get(output).copied().unwrap_or(0.0)
     }
@@ -227,7 +247,7 @@ mod tests {
         let d = dir("persist");
         let mut s = VolumeStore::new(Some(d.clone()));
         s.update("alice", |v| {
-            v.apps.insert("org.atrium.player".into(), Level { volume: 0.25, muted: false });
+            v.apps.insert("org.atrium.player".into(), Level { volume: 0.25, muted: false, spatial: false });
             v.master = 0.5;
         }).unwrap();
         let mut s = VolumeStore::new(Some(d));

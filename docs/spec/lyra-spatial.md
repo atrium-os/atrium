@@ -1,6 +1,6 @@
 # Lyra: multichannel output and spatial audio
 
-Status: **proposal, 2026-11-06**, for Shankar's review. M1 (§2) is built (see §4); S1–S3 wait for the decisions in §5. Follows
+Status: **accepted 2026-11-06** (Shankar agreed with all five §5 decisions). M1 (§2) and S1 (§3.1) are built; S2 waits for an app that needs objects. Follows
 [lyra-v1.md](lyra-v1.md), which is built. Architecture: [atrium-lyra-architecture.md](atrium-lyra-architecture.md)
 §12 gap 2 (channel layouts, surround, spatial).
 
@@ -63,6 +63,16 @@ at ±30°, so it gains externalisation without being smeared.
 - **No app change.** Every app benefits; nothing on the app wire.
 - **Opt-outs:** `Role::Pro` streams (music production, measurement) bypass it, and so does
   any stream the user marks in the volume UI. The bypass mixes in after the binaural stage.
+- **As built (S1):** `ToControl::SetSpatial { output, on }` (kept in `.outputs.toml`, active
+  session only, shown as `Output.spatial`) and `ToControl::SetAppSpatial { app_id, on }` (the
+  user's per-app opt-out, kept with the app's level, shown as `AppEntry.spatial`). choragusd
+  sends lyrad `SetSpatial { sink, on }` and, before a stream's first level,
+  `SetStreamSpatial { stream, on }` (off for Pro and opted-out apps). lyrad renders only while
+  the device is stereo: on a 5.1/7.1 output the switch is kept but does nothing. A spatial
+  stream's adapter mixes to the 7.1 bed; `lyra::binaural::Virtualizer` renders the bed (rear
+  speakers low-passed at 5 kHz, output scaled by 1/1.75 so stereo content never gets
+  louder); bypassed streams add to the device mix after it, bit-perfect. The stream gain now
+  ramps per frame, so a ramp takes as long in 7.1 as in stereo.
 - **Cost:** 8 renderers per device period, fixed, independent of the number of apps.
 - **Quality:** today's renderer is ITD/ILD only. A measured HRTF (convolution per virtual
   speaker, with the partitioned-FFT convolver `lyra::convolve`) is the upgrade; it needs a
@@ -106,7 +116,7 @@ smoothing position changes so a jump doesn't click.
 |---|---|---|
 | M1 ✓ | Output speaker layout setting (choragusd, control wire), lyrad reopens the device with it, adapters rebuilt, `OutputChanged` to apps, balance across sides | — |
 | M2 | VM check (QEMU's HDA codec is stereo only: today's check proves the fallback, sound(4) refusing 6 channels bit-perfect and lyrad staying at 2; the 5.1 path needs real hardware or a multichannel codec): 5.1 stream on a 5.1 output reaches all six channels untouched; on stereo, the downmix levels | M1 |
-| S1 | Headphone virtual surround: virtual 7.1 bed + 8 binaural renderers, spatial switch per output, Pro/user bypass | M1 |
+| S1 ✓ | Headphone virtual surround: virtual 7.1 bed + 8 binaural renderers, spatial switch per output, Pro/user bypass | M1 |
 | S2 | Object streams: `Open` with objects, object page (app writes, lyrad reads, sanitised), per-period rendering to speakers or headphones, caps | M1 |
 | S3 | HRTF upgrade for S1/S2 once a licence-clean HRTF set is chosen | S1 |
 

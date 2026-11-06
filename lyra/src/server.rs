@@ -21,6 +21,7 @@
 //!
 //! The engine ([`Engine`]) is host-testable; [`run`] is the FreeBSD loop.
 
+use crate::binaural::Virtualizer;
 use crate::channels::{matrix, ChannelMap};
 use crate::gain::Gain;
 use crate::oss::OssSink;
@@ -197,6 +198,8 @@ struct Slot {
     playing: bool,
     /// Started at least once: from then on level changes ramp.
     started: bool,
+    /// Goes through the output's virtual surround when it is on.
+    spatial: bool,
     /// Periods left before `Drained`, once the ring has run dry.
     drain: Option<Option<u32>>,
     underrun_frames: u64,
@@ -219,7 +222,15 @@ pub struct Engine {
     balance: [Gain; 2],
     /// A layout choragusd asked for, until the run loop reopens the device.
     pub want_channels: Option<u8>,
+    /// Headphone virtual surround switched on for the output.
+    spatial: bool,
+    virt: Virtualizer,
+    /// The virtual 7.1 bed the spatial streams mix into (period × 8).
+    bed: Vec<f32>,
 }
+
+/// The virtual speaker bed: 7.1.
+const BED_CHANNELS: usize = 8;
 
 /// Left and right gains for a balance in −1..1: the far side fades, the near
 /// side stays at full level. Not a number counts as centred.
@@ -235,12 +246,39 @@ impl Engine {
             slots: Vec::new(),
             rate,
             period_frames,
-            tmp: vec![0.0; period_frames * channels],
+            tmp: vec![0.0; period_frames * channels.max(BED_CHANNELS)],
             events: Vec::new(),
             rate_ppm: 0,
             channels,
             balance: [Gain::new(1.0, rate as f32, 20.0), Gain::new(1.0, rate as f32, 20.0)],
             want_channels: None,
+            spatial: false,
+            virt: Virtualizer::new(rate as f32),
+            bed: vec![0.0; period_frames * BED_CHANNELS],
+        }
+    }
+
+    /// Virtual surround is rendered: switched on, and the device is stereo
+    /// (on real speakers the layout itself is the surround).
+    fn virtual_on(&self) -> bool {
+        self.spatial && self.channels == 2
+    }
+
+    /// The layout a stream's adapter mixes to: the bed for a spatial stream
+    /// while virtual surround is on, the device's otherwise.
+    fn target_channels(&self, stream_spatial: bool) -> usize {
+        if stream_spatial && self.virtual_on() { BED_CHANNELS } else { self.channels }
+    }
+
+    /// Point every stream's adapter at its layout (after a change of layout,
+    /// of the spatial switch, or of a stream's opt-out).
+    fn retarget(&mut self) {
+        let (virt, ch) = (self.virtual_on(), self.channels);
+        for s in &mut self.slots {
+            let t = if s.spatial && virt { BED_CHANNELS } else { ch };
+            if s.adapter.device_channels() != t {
+                s.adapter.set_device_channels(t as u8);
+            }
         }
     }
 
@@ -248,10 +286,8 @@ impl Engine {
     /// device was reopened with them). Every stream keeps its ring and clock.
     pub fn set_channels(&mut self, ch: usize) {
         self.channels = ch;
-        self.tmp.resize(self.period_frames * ch, 0.0);
-        for s in &mut self.slots {
-            s.adapter.set_device_channels(ch as u8);
-        }
+        self.tmp.resize(self.period_frames * ch.max(BED_CHANNELS), 0.0);
+        self.retarget();
     }
 
     pub fn channels(&self) -> usize {
@@ -300,8 +336,10 @@ impl Engine {
             Cmd::End(_) => {}
             Cmd::Msg(g, _) | Cmd::Open(g, ..) if g != self.gen => {}
             Cmd::Open(_, id, mut adapter, ring, clock) => {
-                // Made for the layout the connection thread knew of.
-                if adapter.device_channels() != self.channels && !adapter.set_device_channels(self.channels as u8) {
+                // Made for the layout the connection thread knew of. New
+                // streams are spatial until choragusd says otherwise.
+                let target = self.target_channels(true);
+                if adapter.device_channels() != target && !adapter.set_device_channels(target as u8) {
                     return;
                 }
                 if self.is_open(id) || self.slots.len() >= MAX_STREAMS {
@@ -321,6 +359,7 @@ impl Engine {
                     flush_epoch: 0,
                     playing: false,
                     started: false,
+                    spatial: true,
                     drain: None,
                     underrun_frames: 0,
                     periods_since_report: 0,
@@ -377,6 +416,19 @@ impl Engine {
                     self.want_channels = Some(channels);
                 }
             }
+            ToEngine::SetSpatial { on, .. } => {
+                if self.spatial != on {
+                    self.spatial = on;
+                    self.virt.reset();
+                    self.retarget();
+                }
+            }
+            ToEngine::SetStreamSpatial { stream, on } => {
+                if let Some(s) = self.slot(stream) {
+                    s.spatial = on;
+                }
+                self.retarget();
+            }
             ToEngine::SetBalance { balance, .. } => {
                 let [l, r] = balance_gains(balance);
                 self.balance[0].set_target(l);
@@ -391,6 +443,10 @@ impl Engine {
     /// first frame is heard `device_delay_frames` later.
     pub fn mix(&mut self, mix: &mut [f32], device_delay_frames: u64, now_ns: i64) {
         mix.iter_mut().for_each(|v| *v = 0.0);
+        let virt = self.virtual_on();
+        if virt {
+            self.bed.iter_mut().for_each(|v| *v = 0.0);
+        }
         let start_ns = now_ns + (device_delay_frames as i128 * 1_000_000_000 / self.rate as i128) as i64;
         let dev_rate = self.rate as f64;
         let ppm = self.rate_ppm;
@@ -404,7 +460,12 @@ impl Engine {
             // and is heard at start + k / device rate. Anchor on the first
             // whole stream frame at or after x0.
             let x0 = s.adapter.position(s.ring.consumed());
-            let got = s.adapter.pull(&s.ring, &mut self.tmp);
+            // A spatial stream mixes into the bed, the rest straight to
+            // the device (Pro and opted-out streams join after the
+            // binaural stage, untouched by it).
+            let into_bed = virt && s.adapter.device_channels() == BED_CHANNELS;
+            let tmp = &mut self.tmp[..self.period_frames * s.adapter.device_channels()];
+            let got = s.adapter.pull(&s.ring, tmp);
             if got > 0 {
                 let frame = x0.max(0.0).ceil();
                 let k = (frame - x0) / s.adapter.ratio();
@@ -430,11 +491,15 @@ impl Engine {
                 }
                 s.periods_since_report = 0;
             }
-            sanitize(&mut self.tmp);
-            s.gain.process(&mut self.tmp);
-            for (m, t) in mix.iter_mut().zip(&self.tmp) {
+            sanitize(tmp);
+            s.gain.process_frames(tmp, s.adapter.device_channels());
+            let dest: &mut [f32] = if into_bed { &mut self.bed } else { mix };
+            for (m, t) in dest.iter_mut().zip(tmp.iter()) {
                 *m += *t;
             }
+        }
+        if virt {
+            self.virt.render_add(&self.bed, mix);
         }
         // The output's balance: left-side speakers (FL, SL, RL) take the
         // left gain, right-side ones (FR, SR, RR) the right; FC and LFE none.
@@ -938,6 +1003,59 @@ mod tests {
         e.apply(Cmd::Msg(1, ToEngine::Start { stream: 1 }));
         e.apply(Cmd::Msg(1, ToEngine::SetGain { stream: 1, db: 0.0 }));
         assert!(e.slots[0].gain.current() < 0.6, "ramps once it plays");
+    }
+
+    #[test]
+    fn virtual_surround_places_the_bed_and_leaves_bypassed_streams_alone() {
+        let mut e = Engine::new(48_000, 2, 64);
+        e.apply(Cmd::Begin(1));
+        // A 7.1 stream with sound only in the left surround, and a stereo
+        // stream that opts out (as a Pro stream would).
+        let (p1, c1) = ring_pair("virt-sl", 4096, 8);
+        open(&mut e, 1, 1, 48_000, 8, c1);
+        let (p2, c2) = ring_pair("virt-pro", 4096, 2);
+        e.apply(Cmd::Open(1, 2, Box::new(Adapter::new(48_000, 2, 48_000, 2).unwrap()), c2, writer()));
+        e.apply(Cmd::Msg(1, ToEngine::SetStreamSpatial { stream: 2, on: false }));
+        e.apply(Cmd::Msg(1, ToEngine::SetGain { stream: 2, db: 0.0 }));
+        e.apply(Cmd::Msg(1, ToEngine::Start { stream: 2 }));
+        e.apply(Cmd::Msg(1, ToEngine::SetSpatial { sink: 0, on: true }));
+        let mut sl = [0.0f32; 64 * 8];
+        sl.iter_mut().skip(4).step_by(8).for_each(|v| *v = 0.5);
+        let mut mix = vec![0.0f32; 128];
+        for _ in 0..50 {
+            p1.write(&sl);
+            p2.write(&[0.0; 128]);
+            e.mix(&mut mix, 0, 0);
+        }
+        // Behind on the left: the left ear hears it louder.
+        let (l, r) = (mix[126], mix[127]);
+        assert!(l > 0.2 && r > 0.05 && l > 1.5 * r, "left {l} right {r}");
+
+        // The opted-out stream alone: bit-perfect even with surround on.
+        p1.write(&[0.0; 64 * 8]);
+        let tone: Vec<f32> = (0..128).map(|i| ((i as f32) * 0.37).sin() * 0.7).collect();
+        e.apply(Cmd::Msg(1, ToEngine::Close { stream: 1 }));
+        e.mix(&mut mix, 0, 0); // let the virtualizer's tail die out
+        e.apply(Cmd::Msg(1, ToEngine::SetSpatial { sink: 0, on: false }));
+        e.apply(Cmd::Msg(1, ToEngine::SetSpatial { sink: 0, on: true }));
+        p2.write(&tone);
+        e.mix(&mut mix, 0, 0);
+        // (The adapter holds one frame back for its interpolation.)
+        assert_eq!(mix[2..], tone[..126]);
+
+        // On a 5.1 output the surround switch does nothing: the speakers
+        // are real.
+        let (p3, c3) = ring_pair("virt-51", 4096, 8);
+        e.set_channels(6);
+        open(&mut e, 1, 3, 48_000, 8, c3);
+        e.apply(Cmd::Msg(1, ToEngine::Close { stream: 2 }));
+        let mut mix6 = vec![0.0f32; 64 * 6];
+        for _ in 0..50 {
+            p3.write(&sl);
+            e.mix(&mut mix6, 0, 0);
+        }
+        assert!((mix6[64 * 6 - 6 + 4] - 0.5).abs() < 1e-3, "{:?}", &mix6[64 * 6 - 6..]);
+        assert_eq!(mix6[64 * 6 - 6], 0.0);
     }
 
     #[test]

@@ -169,6 +169,15 @@ pub enum ToControl {
     /// codec can't see what is plugged in, so the user says. Kept across
     /// restarts; only the active session sets it. Answered by `Outputs`.
     SetLayout { output: u32, channels: u8 },
+    /// Headphone virtual surround on the output (off by default): the mix
+    /// is rendered as a 7.1 speaker bed around the listener. Only takes
+    /// effect while the output's layout is stereo. Kept across restarts;
+    /// only the active session sets it. Answered by `Outputs`.
+    SetSpatial { output: u32, on: bool },
+    /// Whether an app's streams go through virtual surround (default yes;
+    /// `Pro` streams never do). The user's setting, kept across restarts.
+    /// Answered by `Apps`.
+    SetAppSpatial { app_id: String, on: bool },
 }
 
 /// One app with a stream open, as the volume UI shows it.
@@ -182,6 +191,9 @@ pub struct AppEntry {
     pub volume: f32,
     pub muted: bool,
     pub streams: u8,
+    /// The app's streams go through virtual surround when it is on (the
+    /// user's per-app opt-out is `false`).
+    pub spatial: bool,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
@@ -191,6 +203,8 @@ pub struct Output {
     pub balance: f32,
     /// Its speaker layout (2, 6 or 8).
     pub channels: u8,
+    /// Headphone virtual surround switched on.
+    pub spatial: bool,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
@@ -252,6 +266,12 @@ pub enum ToEngine {
     /// The sink's speaker layout: 2, 6 (5.1) or 8 (7.1) channels. lyrad
     /// reopens the device with it between periods and answers `Layout`.
     SetLayout { sink: u32, channels: u8 },
+    /// Headphone virtual surround on the sink (only while it is stereo).
+    SetSpatial { sink: u32, on: bool },
+    /// Whether one stream goes through the sink's virtual surround (default
+    /// yes). choragusd turns it off for `Pro` streams and the apps the user
+    /// opted out, before the stream's first level.
+    SetStreamSpatial { stream: u32, on: bool },
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
@@ -343,6 +363,8 @@ mod tests {
             ToEngine::Open { stream: 1, rate: 44_100, channels: 6, ring_frames: 4096 },
             ToEngine::SetGain { stream: 1, db: -18.0 },
             ToEngine::Reroute { stream: 1, sink: 0 },
+            ToEngine::SetSpatial { sink: 0, on: true },
+            ToEngine::SetStreamSpatial { stream: 1, on: false },
         ] {
             let mut c = std::io::Cursor::new(encode(&m).unwrap());
             assert_eq!(recv::<_, ToEngine>(&mut c).unwrap(), m);
@@ -385,7 +407,7 @@ mod tests {
 
     #[test]
     fn a_full_apps_list_fits_one_frame() {
-        let e = AppEntry { app_id: "a".repeat(MAX_APP_ID), label: "l".repeat(MAX_LABEL), role: Role::Media, volume: 1.0, muted: false, streams: 8 };
+        let e = AppEntry { app_id: "a".repeat(MAX_APP_ID), label: "l".repeat(MAX_LABEL), role: Role::Media, volume: 1.0, muted: false, streams: 8, spatial: true };
         let m = FromControl::Apps { master: 1.0, master_muted: false, apps: vec![e; MAX_CONTROL_APPS] };
         assert!(encode(&m).is_ok());
     }

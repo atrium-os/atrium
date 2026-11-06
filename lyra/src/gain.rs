@@ -40,6 +40,16 @@ impl Gain {
         self.current
     }
 
+    /// Apply the (ramping) gain to interleaved frames of `ch` channels: one
+    /// ramp step per frame, the same gain on every channel of a frame, so the
+    /// ramp takes as long whatever the layout.
+    pub fn process_frames(&mut self, buf: &mut [f32], ch: usize) {
+        for f in buf.chunks_mut(ch.max(1)) {
+            self.current += (self.target - self.current) * self.coeff;
+            f.iter_mut().for_each(|s| *s *= self.current);
+        }
+    }
+
     /// Apply the (ramping) gain in place.
     pub fn process(&mut self, buf: &mut [f32]) {
         for s in buf.iter_mut() {

@@ -14,6 +14,9 @@
 #   2  a hostile stream (NaN, infinity, wild ring header) beside a 1 kHz tone:
 #      lyrad lives and the tone is untouched.
 #   balance: the output's balance 0.5 takes the left 6 dB down, the right not.
+#   surround: headphone virtual surround on (lyra-spatial.md §3.1): a tone in
+#      a 7.1 stream's left surround reaches the left ear 5.5 dB above the
+#      right; a Pro stream beside it passes untouched.
 #   7  kill lyrad while an app plays: the app is told, the supervisor restarts
 #      lyrad and choragusd, and a new stream plays.
 # Not here: 3 (no device in app jails) is portcullis-jail's devfs test plus
@@ -165,6 +168,16 @@ M12=$(mark)
 v "while pgrep -q lyra-play; do sleep 1; done"
 v "su -m appui -c '$BIN/lyra-vmtest ctl $T/control.sock balance 0'" >/dev/null
 
+say "surround: headphone virtual surround"
+v "su -m appui -c '$BIN/lyra-vmtest ctl $T/control.sock spatial 1'" | sed 's/^/  ui: /'
+M13=$(mark)
+v "su -m appa -c 'env LYRA_PLAY_FREQ=500 LYRA_PLAY_CHANNELS=8 LYRA_PLAY_ONLY=4 $BIN/lyra-play $T/audio.sock media 8' >$T/a.log 2>&1 </dev/null &
+   su -m appa -c 'env LYRA_PLAY_FREQ=860 $BIN/lyra-play $T/audio.sock pro 8' >$T/p.log 2>&1 </dev/null &
+   sleep 6"
+M14=$(mark)
+v "while pgrep -q lyra-play; do sleep 1; done"
+v "su -m appui -c '$BIN/lyra-vmtest ctl $T/control.sock spatial 0'" >/dev/null
+
 say "layout: the output set to 5.1"
 # QEMU's codec is stereo: sound(4) either converts 6 channels for it or
 # refuses them; either way the service must keep playing.
@@ -193,7 +206,7 @@ mkdir -p "$OUT"
 scp $SCP_OPTS "root@localhost:$DUMP" "$OUT/mix.raw" >/dev/null 2>&1 || die "pull the dump"
 v "cat $T/lyrad.log" > "$OUT/lyrad.log" 2>&1
 v "cat $T/choragusd.log" > "$OUT/choragusd.log" 2>&1
-python3 -I - "$OUT/mix.raw" "$M0" "$M1" "$M2" "$M3" "$M4" "$M5" "$M6" "$M7" "$M8" "$M9" "$M10" "$M11" "$M12" <<'PY' || FAILS=$((FAILS + 1))
+python3 -I - "$OUT/mix.raw" "$M0" "$M1" "$M2" "$M3" "$M4" "$M5" "$M6" "$M7" "$M8" "$M9" "$M10" "$M11" "$M12" "$M13" "$M14" <<'PY' || FAILS=$((FAILS + 1))
 import math, struct, sys
 path = sys.argv[1]
 m = [int(x) // 4 for x in sys.argv[2:]]   # byte offsets -> stereo frames
@@ -246,6 +259,14 @@ l0, r0 = amp(m[10] + S, m[11], 500, left), amp(m[10] + S, m[11], 500, right)
 l1, r1 = amp(m[11] + S, m[12], 500, left), amp(m[11] + S, m[12], 500, right)
 check('balance 0.5: left fades', l1 - l0, -6.02, 1.0)
 check('balance 0.5: right stays', r1 - r0, 0.0, 1.0)
+# Left surround at -110 deg: near ear 1, far ear 1 - 0.5 sin 110 = 0.53, both
+# scaled by 1/1.75; the tone is -12 dBFS.
+sl, sr = amp(m[13] + S, m[14], 500, left), amp(m[13] + S, m[14], 500, right)
+check('surround: left surround, left ear', sl, -12.04 - 4.86, 1.0)
+check('surround: left surround, left over right ear', sl - sr, 5.51, 1.0)
+pl, pr = amp(m[13] + S, m[14], 860, left), amp(m[13] + S, m[14], 860, right)
+check('surround: Pro stream untouched (left)', pl, -12.04, 0.5)
+check('surround: Pro stream untouched (right)', pr, -12.04, 0.5)
 sys.exit(1 if fails else 0)
 PY
 

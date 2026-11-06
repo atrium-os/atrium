@@ -7,7 +7,8 @@
 //!
 //! usage: lyra-play <choragus_sock> <role> <secs> [ignored...]
 //!   LYRA_PLAY_FREQ (Hz, default by role), LYRA_PLAY_RATE (default 48000),
-//!   LYRA_PLAY_CHANNELS (1, 2, 6 or 8; default 2), LYRA_PLAY_VOLUME (0..1).
+//!   LYRA_PLAY_CHANNELS (1, 2, 6 or 8; default 2), LYRA_PLAY_VOLUME (0..1),
+//!   LYRA_PLAY_ONLY (a channel index: the tone in that channel only).
 
 use lyra_protocol::client::Client;
 use lyra_protocol::wire::{Role, StreamParams, ToApp};
@@ -32,6 +33,7 @@ fn main() {
     let freq: f32 = env("LYRA_PLAY_FREQ").unwrap_or(base);
     let rate: u32 = env("LYRA_PLAY_RATE").unwrap_or(48_000);
     let channels: u8 = env("LYRA_PLAY_CHANNELS").unwrap_or(2);
+    let only: Option<usize> = env("LYRA_PLAY_ONLY");
 
     let mut c = match Client::connect(sock, None) {
         Ok(c) => c,
@@ -58,7 +60,7 @@ fn main() {
         for f in 0..CHUNK {
             let v = phase.sin() * 0.25;
             for k in 0..ch {
-                buf[f * ch + k] = v;
+                buf[f * ch + k] = if only.is_none_or(|o| o == k) { v } else { 0.0 };
             }
             phase += step;
             if phase > 2.0 * std::f32::consts::PI { phase -= 2.0 * std::f32::consts::PI; }

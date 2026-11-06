@@ -88,6 +88,8 @@ struct StreamRec {
     user_gain: f32,
     held: bool,
     sent_db: Option<f32>,
+    /// Whether lyrad was told the stream goes through virtual surround.
+    sent_spatial: Option<bool>,
     open: bool,
 }
 
@@ -146,6 +148,14 @@ impl State {
         }
         let mut sends = Vec::new();
         for (id, r) in self.streams.iter_mut() {
+            // Pro streams (production, measurement) never go through virtual
+            // surround, nor do the apps the user opted out. Sent before the
+            // stream's first level, so it is never heard the other way.
+            let spatial = r.role != WireRole::Pro && self.volumes.user(&r.user).app(&r.app_id).spatial;
+            if r.sent_spatial != Some(spatial) {
+                r.sent_spatial = Some(spatial);
+                sends.push(ToEngine::SetStreamSpatial { stream: *id, on: spatial });
+            }
             let db = Self::total_db(r);
             if r.sent_db.map_or(true, |s| (s - db).abs() > 1e-4) {
                 r.sent_db = Some(db);
@@ -188,19 +198,28 @@ impl State {
         let outputs = self.sess.devices.iter()
             .map(|d| {
                 let name = output_name(d);
-                Output { id: d.id, balance: self.outputs.balance(&name), channels: self.outputs.layout(&name), name }
+                Output {
+                    id: d.id,
+                    balance: self.outputs.balance(&name),
+                    channels: self.outputs.layout(&name),
+                    spatial: self.outputs.spatial(&name),
+                    name,
+                }
             })
             .collect();
         FromControl::Outputs { current: self.sess.default_device, outputs }
     }
 
-    /// Tell lyrad the current output's balance and speaker layout.
+    /// Tell lyrad the current output's balance, speaker layout and virtual
+    /// surround.
     fn send_balance(&mut self) {
         let sink = self.sess.default_device;
         let name = self.sess.devices.iter().find(|d| d.id == sink).map(output_name).unwrap_or_default();
         let (balance, channels) = (self.outputs.balance(&name), self.outputs.layout(&name));
         let _ = wire::send(&mut self.lyrad, &ToEngine::SetBalance { sink, balance });
         let _ = wire::send(&mut self.lyrad, &ToEngine::SetLayout { sink, channels });
+        let on = self.outputs.spatial(&name);
+        let _ = wire::send(&mut self.lyrad, &ToEngine::SetSpatial { sink, on });
     }
 
     /// Whether `user`'s session is the active one (always, without a seat).
@@ -230,7 +249,7 @@ impl State {
                 let l = self.volumes.user(user).app(&app_id);
                 let mut shown = app_id.clone();
                 shown.truncate(wire::MAX_APP_ID);
-                apps.push(AppEntry { app_id: shown, label, role, volume: l.volume, muted: l.muted, streams: 1 });
+                apps.push(AppEntry { app_id: shown, label, role, volume: l.volume, muted: l.muted, streams: 1, spatial: l.spatial });
             }
         }
         let v = self.volumes.user(user);
@@ -358,7 +377,7 @@ fn serve_app(mut app: UnixStream, state: Shared, cfg: Arc<Config>, socket_caps: 
                 st.streams.insert(id, StreamRec {
                     conn, user: v.user.clone(), app_id: v.app_id.clone(), label: params.label.clone(),
                     role: params.role, tag, ring_bytes: params.ring_bytes(),
-                    policy_db: 0.0, app_gain: 1.0, user_gain: 1.0, held, sent_db: None, open: false,
+                    policy_db: 0.0, app_gain: 1.0, user_gain: 1.0, held, sent_db: None, sent_spatial: None, open: false,
                 });
                 st.apps.get_mut(&conn).unwrap().streams.push(id);
                 let open = ToEngine::Open { stream: id, rate: params.rate, channels: params.channels, ring_frames: params.ring_frames() };
@@ -475,6 +494,7 @@ fn serve_control(mut c: UnixStream, state: Shared, cfg: Arc<Config>, socket_caps
             }
             ToControl::SetAppVolume { app_id, volume } => set_app(&mut st, &app_id, &|l| l.volume = clamp(volume)),
             ToControl::SetAppMute { app_id, muted } => set_app(&mut st, &app_id, &|l| l.muted = muted),
+            ToControl::SetAppSpatial { app_id, on } => set_app(&mut st, &app_id, &|l| l.spatial = on),
             ToControl::SetMaster { .. } | ToControl::SetMasterMute { .. } => {
                 let r = st.volumes.update(user, |u| match msg {
                     ToControl::SetMaster { volume } => u.master = clamp(volume),
@@ -503,6 +523,26 @@ fn serve_control(mut c: UnixStream, state: Shared, cfg: Arc<Config>, socket_caps
                 }
                 let dir = st.state_dir.clone();
                 if let Err(e) = st.outputs.set_layout(&dir, &output_name(&d), channels) {
+                    eprintln!("choragusd: saving output settings: {e}");
+                }
+                st.send_balance();
+                let m = st.outputs_msg();
+                for c in st.controls.keys().copied().collect::<Vec<_>>() {
+                    st.to_control(c, &m);
+                }
+            }
+            ToControl::SetSpatial { output, on } => {
+                // A system setting of the output, like its balance.
+                let Some(d) = st.sess.devices.iter().find(|d| d.id == output).copied() else {
+                    st.to_control(conn, &FromControl::Denied { code: DenyCode::NotGranted });
+                    continue;
+                };
+                if !st.active(user) {
+                    st.to_control(conn, &FromControl::Denied { code: DenyCode::NotGranted });
+                    continue;
+                }
+                let dir = st.state_dir.clone();
+                if let Err(e) = st.outputs.set_spatial(&dir, &output_name(&d), on) {
                     eprintln!("choragusd: saving output settings: {e}");
                 }
                 st.send_balance();

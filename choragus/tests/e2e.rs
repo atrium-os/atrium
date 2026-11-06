@@ -226,7 +226,10 @@ fn the_volume_ui_sets_the_users_levels_and_they_persist() {
     let mut c = Client::connect(s1[0].to_str().unwrap(), None).unwrap();
     let s = c.open(params()).unwrap();
     let (_, _, a) = apps(&mut ui, 1);
-    assert_eq!(a[0], AppEntry { app_id: "org.atrium.player".into(), label: "Video".into(), role: Role::Media, volume: 1.0, muted: false, streams: 1 });
+    assert_eq!(a[0], AppEntry { app_id: "org.atrium.player".into(), label: "Video".into(), role: Role::Media, volume: 1.0, muted: false, streams: 1, spatial: true });
+    // A new stream goes through virtual surround unless the user opted out.
+    let id = s.id;
+    next_engine(&eng, |m| *m == ToEngine::SetStreamSpatial { stream: id, on: true });
     // The user's level for the app becomes lyrad's gain: 0.5 -> about -6 dB.
     ui.send(&ToControl::SetAppVolume { app_id: "org.atrium.player".into(), volume: 0.5 }).unwrap();
     gain(&eng, -6.02);
@@ -253,7 +256,7 @@ fn the_volume_ui_sets_the_users_levels_and_they_persist() {
     loop {
         match ui.recv().unwrap() {
             FromControl::Outputs { current, outputs } => {
-                assert_eq!((current, outputs), (0, vec![Output { id: 0, name: "Speakers".into(), balance: 0.0, channels: 2 }]));
+                assert_eq!((current, outputs), (0, vec![Output { id: 0, name: "Speakers".into(), balance: 0.0, channels: 2, spatial: false }]));
                 break;
             }
             _ => continue,
@@ -273,6 +276,21 @@ fn the_volume_ui_sets_the_users_levels_and_they_persist() {
     assert_eq!(next_engine(&eng, |m| matches!(m, ToEngine::SetBalance { .. })), ToEngine::SetBalance { sink: 0, balance: 0.0 });
     ui.send(&ToControl::SetBalance { output: 0, balance: 0.25 }).unwrap();
     next_engine(&eng, |m| matches!(m, ToEngine::SetBalance { balance, .. } if *balance == 0.25));
+    // Virtual surround is the output's too; an app can be opted out of it.
+    ui.send(&ToControl::SetSpatial { output: 0, on: true }).unwrap();
+    assert_eq!(next_engine(&eng, |m| matches!(m, ToEngine::SetSpatial { on: true, .. })), ToEngine::SetSpatial { sink: 0, on: true });
+    loop {
+        if let FromControl::Outputs { outputs, .. } = ui.recv().unwrap() {
+            if outputs[0].spatial { break; }
+        }
+    }
+    ui.send(&ToControl::SetAppSpatial { app_id: "org.atrium.player".into(), on: false }).unwrap();
+    next_engine(&eng, |m| *m == ToEngine::SetStreamSpatial { stream: id, on: false });
+    loop {
+        if !apps(&mut ui, 1).2[0].spatial { break; }
+    }
+    ui.send(&ToControl::SetAppSpatial { app_id: "org.atrium.player".into(), on: true }).unwrap();
+    next_engine(&eng, |m| *m == ToEngine::SetStreamSpatial { stream: id, on: true });
     // The speaker layout: lyrad is told, and apps learn the new channel count.
     ui.send(&ToControl::SetLayout { output: 0, channels: 6 }).unwrap();
     assert_eq!(next_engine(&eng, |m| matches!(m, ToEngine::SetLayout { channels: 6, .. })), ToEngine::SetLayout { sink: 0, channels: 6 });
@@ -326,9 +344,15 @@ fn the_volume_ui_sets_the_users_levels_and_they_persist() {
         "a restarted choragusd gives lyrad the kept balance");
     assert_eq!(next_engine(&eng2, |m| matches!(m, ToEngine::SetLayout { .. })), ToEngine::SetLayout { sink: 0, channels: 6 },
         "and the kept layout");
+    assert_eq!(next_engine(&eng2, |m| matches!(m, ToEngine::SetSpatial { .. })), ToEngine::SetSpatial { sink: 0, on: true },
+        "and the kept virtual surround");
     let mut c = Client::connect(s2[0].to_str().unwrap(), None).unwrap();
     let _s = c.open(params()).unwrap();
     gain(&eng2, -6.02);
+    // A Pro stream never goes through virtual surround.
+    let pro = c.open(StreamParams { role: Role::Pro, ..params() }).unwrap();
+    let pid = pro.id;
+    next_engine(&eng2, |m| *m == ToEngine::SetStreamSpatial { stream: pid, on: false });
 }
 
 #[test]

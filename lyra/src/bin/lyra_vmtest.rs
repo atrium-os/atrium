@@ -12,6 +12,8 @@
 //!   lyra-vmtest ctl <control_sock> master <volume 0..1>
 //!   lyra-vmtest ctl <control_sock> balance <-1..1>
 //!   lyra-vmtest ctl <control_sock> layout <2|6|8>
+//!   lyra-vmtest ctl <control_sock> spatial <0|1>
+//!   lyra-vmtest ctl <control_sock> app-spatial <app_id> <0|1>
 //!       The volume UI's requests (needs the `audio-control` grant).
 //!   lyra-vmtest lyrad-raw <lyrad_sock>
 //!       Connect to lyrad directly and ask for a stream. Prints `refused` if
@@ -63,6 +65,8 @@ fn ctl(sock: &str, args: &[String]) {
         "master" => ToControl::SetMaster { volume: a(1).parse().unwrap_or(1.0) },
         "balance" => ToControl::SetBalance { output: 0, balance: a(1).parse().unwrap_or(0.0) },
         "layout" => ToControl::SetLayout { output: 0, channels: a(1).parse().unwrap_or(2) },
+        "spatial" => ToControl::SetSpatial { output: 0, on: a(1) == "1" },
+        "app-spatial" => ToControl::SetAppSpatial { app_id: a(1), on: a(2) == "1" },
         other => die(format!("unknown ctl command {other}")),
     };
     u.send(&req).unwrap_or_else(|e| die(format!("send: {e}")));
@@ -71,12 +75,12 @@ fn ctl(sock: &str, args: &[String]) {
         Ok(FromControl::Apps { master, master_muted, apps }) => {
             println!("master {master:.3}{}", if master_muted { " muted" } else { "" });
             for e in apps {
-                println!("{} \"{}\" {:?} volume {:.3}{} streams {}", e.app_id, e.label, e.role, e.volume, if e.muted { " muted" } else { "" }, e.streams);
+                println!("{} \"{}\" {:?} volume {:.3}{}{} streams {}", e.app_id, e.label, e.role, e.volume, if e.muted { " muted" } else { "" }, if e.spatial { "" } else { " no-surround" }, e.streams);
             }
         }
         Ok(FromControl::Outputs { current, outputs }) => {
             for o in outputs {
-                println!("output {} \"{}\" balance {:+.2} {} ch{}", o.id, o.name, o.balance, o.channels, if o.id == current { " (current)" } else { "" });
+                println!("output {} \"{}\" balance {:+.2} {} ch{}{}", o.id, o.name, o.balance, o.channels, if o.spatial { " surround" } else { "" }, if o.id == current { " (current)" } else { "" });
             }
         }
         Ok(m) => die(format!("unexpected {m:?}")),
