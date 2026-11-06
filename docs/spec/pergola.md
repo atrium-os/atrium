@@ -403,3 +403,8 @@ document group (profile §3.14).
 scroll frame is one transform change (a few dozen bytes), and the renderer shifts what is
 drawn. Declarative animation (§4.2) is still needed so a busy app keeps scrolling, and for
 the fling blur; it is not blocking ScrollView.
+
+**The Navigator's own UI is a Pergola app** (decided by the user, 2026-11-06): toolbar, tabs,
+find bar and zoom controls run on Pergola in the Navigator's trusted UI process, and each
+page is a jailed document surface embedded in it (Limen doc-viewer). frescod's origin strip
+stays frescod's, drawn outside any app.
