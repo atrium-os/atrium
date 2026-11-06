@@ -568,7 +568,139 @@ impl Prepared {
         while let Some(x) = p { out.insert(x); p = self.dom.get(x).and_then(|n| n.parent) }
         out
     }
+
+    /// Whether box `h` positions or transforms what it holds (`position`
+    /// other than static, or a transform): what a band laid out inside it
+    /// and painted outside itself depends on its final size (the
+    /// `completed_spans` test, `moves`).
+    pub(crate) fn moves(&self, h: Handle) -> bool {
+        self.styles.get(h as usize).and_then(|s| s.as_deref()).is_some_and(|s| {
+            kw(s, "position") != "static" && !kw(s, "position").is_empty() || matches!(s.get("transform"), V::Transform(l) if !l.is_empty())
+        })
+    }
+
+    /// The first element whose `id` is `id` (measurement and review tooling).
+    pub fn find_id(&self, id: &str) -> Option<Handle> {
+        (0..self.dom.nodes.len() as Handle).find(|&h| self.dom.connected(h) && self.dom.attr(h, "id") == Some(id))
+    }
+
+    /// The connected nodes in document (pre-)order.
+    pub(crate) fn preorder(&self) -> Vec<Handle> {
+        let mut out = Vec::with_capacity(self.dom.nodes.len());
+        let mut st = vec![self.dom.root()];
+        while let Some(h) = st.pop() {
+            out.push(h);
+            if let Some(n) = self.dom.get(h) { st.extend(n.children.iter().rev().copied()) }
+        }
+        out
+    }
+
+    /// ★ WHERE TWO STATES OF A DOCUMENT FIRST DIFFER, as the layout sees them
+    /// (backend §4.3, replay part 2): the first node, in document order,
+    /// whose handle, kind, parent, attributes, computed style or promotion
+    /// differs — `None` when the layout cannot tell them apart. Every node
+    /// before it is the same node (the same handle) laid out from the same
+    /// inputs, so a band that ends before it lays out the same.
+    ///
+    /// `class` is not compared: in a normalized document it names a
+    /// generated rule (renumbered whenever an earlier element's styles
+    /// change), and what it means is the computed style, which is.
+    /// Returns the old order's rank of the first difference and the
+    /// new document's handle there (`None` past its end).
+    pub fn first_difference(&self, new: &Prepared) -> Option<(usize, Option<Handle>)> {
+        self.difference(new).map(|d| (d.first, d.first_node))
+    }
+
+    /// `first_difference`, with what else differs: whether the tree's shape
+    /// is the same (every node the same handle, kind and parent), and if so
+    /// every node that differs (`None` past `DIFF_NODES_MAX`).
+    pub fn difference(&self, new: &Prepared) -> Option<Difference> {
+        let (a, b) = (self.preorder(), new.preorder());
+        let mut same_style: HashMap<(*const Style, *const Style), bool> = HashMap::new();
+        let n = a.len().min(b.len());
+        let mut out: Option<Difference> = None;
+        for i in 0..n {
+            let (x, y) = (a[i], b[i]);
+            let shape = |d: Option<Difference>| -> Option<Difference> {
+                Some(match d { Some(d) => Difference { same_shape: false, nodes: None, ..d }, None => Difference { first: i, first_node: Some(y), same_shape: false, nodes: None } })
+            };
+            if x != y { return shape(out) }
+            let (p, q) = (self.dom.get(x).expect("connected"), new.dom.get(y).expect("connected"));
+            if p.parent != q.parent || p.foreign != q.foreign { return shape(out) }
+            let mut differs = false;
+            if p.kind != q.kind {
+                // ★ A stylesheet's text is not drawn: what it means is in
+                // the computed styles, which are compared. (The normalized
+                // document's one sheet changes with almost any restyle; read
+                // as text, every click looked like a change at the top.)
+                let in_style = |dom: &Dom, n: &navigator_dom::Node| n.parent.and_then(|x| dom.tag(x)).is_some_and(|t| t.eq_ignore_ascii_case("style"));
+                match (&p.kind, &q.kind) {
+                    (Kind::Text(_), Kind::Text(_)) if in_style(&self.dom, p) && in_style(&new.dom, q) => {}
+                    (Kind::Text(_), Kind::Text(_)) | (Kind::Comment(_), Kind::Comment(_)) => differs = true,
+                    _ => return shape(out),
+                }
+            }
+            if !differs && (!p.attrs.is_empty() || !q.attrs.is_empty())
+                && !p.attrs.iter().filter(|(k, _)| k != "class").eq(q.attrs.iter().filter(|(k, _)| k != "class")) {
+                differs = true;
+            }
+            let i0 = x as usize;
+            if !differs {
+                match (self.styles.get(i0).and_then(|s| s.as_ref()), new.styles.get(i0).and_then(|s| s.as_ref())) {
+                    (None, None) => {}
+                    (Some(s), Some(t)) => {
+                        let key = (std::rc::Rc::as_ptr(s), std::rc::Rc::as_ptr(t));
+                        if !*same_style.entry(key).or_insert_with(|| **s == **t) { differs = true }
+                    }
+                    _ => differs = true,
+                }
+            }
+            if !differs && self.promoted.get(i0) != new.promoted.get(i0) { differs = true }
+            if differs {
+                let d = out.get_or_insert(Difference { first: i, first_node: Some(y), same_shape: true, nodes: Some(vec![]) });
+                if let Some(v) = d.nodes.as_mut() { if v.len() < DIFF_NODES_MAX { v.push(y) } else { d.nodes = None } }
+            }
+        }
+        if a.len() != b.len() {
+            return Some(match out { Some(d) => Difference { same_shape: false, nodes: None, ..d }, None => Difference { first: n, first_node: b.get(n).copied(), same_shape: false, nodes: None } });
+        }
+        out
+    }
+
+    /// ★ Whether box `table`'s row records (`row_cuts`, `table_rows`) stand
+    /// in `new`, where only `changed` differ and the tree has the same
+    /// shape: they read the rows' and cells' `display`, a cell's `rowspan`,
+    /// `position` and overflow, and percentage heights and offsets below a
+    /// cell — so a change to none of those, anywhere, leaves them as they
+    /// were.
+    pub(crate) fn table_records_stand(&self, new: &Prepared, changed: &[Handle]) -> bool {
+        changed.iter().all(|&c| {
+            if self.dom.attr(c, "rowspan") != new.dom.attr(c, "rowspan") { return false }
+            match (self.styles.get(c as usize).and_then(|s| s.as_deref()), new.styles.get(c as usize).and_then(|s| s.as_deref())) {
+                (None, None) => true,
+                (Some(s), Some(t)) => ["display", "position", "overflow-x", "overflow-y"].iter().all(|p| kw(s, p) == kw(t, p))
+                    && ["height", "min-height", "max-height", "top", "bottom"].iter().all(|p| pct_size(s, p) == pct_size(t, p)),
+                _ => false,
+            }
+        })
+    }
 }
+
+/// Where two prepared states differ (`Prepared::difference`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Difference {
+    /// The rank, in document order, of the first difference, and the new
+    /// state's node there (`None` past its end).
+    pub first: usize,
+    pub first_node: Option<Handle>,
+    /// Every node the same handle, kind and parent in both.
+    pub same_shape: bool,
+    /// With the same shape: every node that differs (`None` if more than
+    /// `DIFF_NODES_MAX`).
+    pub nodes: Option<Vec<Handle>>,
+}
+
+pub const DIFF_NODES_MAX: usize = 4096;
 
 /// Parse and style `html` (see `Prepared`).
 pub fn prepare(html: &str, fonts: &FontSet, env: &Env) -> Prepared {
@@ -665,9 +797,14 @@ fn lay_out(p: &Prepared, fonts: &FontSet, env: &Env, subs: &Subresources, geo: b
     cx.scene.height = h.max(u(env.height_px)).max(bottom);
     if let Some(b) = cx.band.as_mut() {
         // A band run's root height is the height of what it laid out; the
-        // canvas covers the document as far as it is known.
+        // canvas covers that (every band paints it, clipped to itself).
+        // ★ Not the document's height as far as it is known: that depends
+        // on when the band was laid out, so the same band of the same
+        // document came out with different bytes after a different history
+        // (replay part 2's oracle found it). A provisional band, placed
+        // before anything above it is known, still covers the estimate.
         b.root_h = h;
-        cx.scene.height = cx.scene.height.max(b.canvas_h);
+        if b.provisional { cx.scene.height = cx.scene.height.max(b.canvas_h) }
     }
     if let Some(i) = canvas { cx.scene.rects[i].h = cx.scene.height }
     let (order, keys) = restack_keyed(&cx.scene.order, &cx.contexts, &cx.hoists, cx.band.is_some());

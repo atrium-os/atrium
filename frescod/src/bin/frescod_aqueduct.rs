@@ -75,6 +75,8 @@
 //! - `FRESCOD_DAMAGE_THRESHOLD=<f32>` — override the level-3
 //!   partial-redraw threshold (0.0..=1.0; 0.0 disables level-3).
 
+#[path = "../consumer.rs"]
+mod consumer;
 #[path = "../input_reader.rs"]
 mod input_reader;
 #[path = "../screen.rs"]

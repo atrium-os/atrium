@@ -5,6 +5,11 @@ edition = "2021"
 description = "Tier-2 conversion instrument: run a page's scripts once, headlessly, and snapshot the resulting DOM. Its output is a measurement (docs/spec/atrium-navigator-legacy-web.md §11.4)."
 
 [dependencies]
+# ★ A COOKIED view's fetches (legacy-web §5.4.1e, arca.md §8.2): the driver,
+# as the web broker, asks Arca for a ticket per request and sends it through
+# Arca's courier. Only the unconfined driver links it; the jailed converter
+# never holds a ticket.
+navigator-cookies = { path = "../navigator-cookies" }
 # ★ annex-b is NOT on by default, and without it every script wrapped in the
 # legacy `<!-- ... //-->` HTML-comment idiom is a SyntaxError. That wrapper is
 # standardised JavaScript (ECMAScript Annex B.1.1, HTML-like comments) and

@@ -282,9 +282,10 @@ item.
   nothing of the user's. Its network is its own vnet (`Routed`), and its pf anchor
   passes TCP only to the endpoint's addresses on its port, plus the host's resolvers,
   which jaild adds to every restricted anchor.
-- **Teardown** removes only what the launcher wrote, then the empty directories. A
-  surviving mount is never removed recursively. At start the launcher reclaims every
-  courier jail a previous run left.
+- **Teardown** is the janitor's: it retries until the kernel frees the jail, then
+  unmounts, removes only what the launcher wrote and then the empty directories. A
+  surviving mount is never removed recursively. At start the launcher hands every
+  courier jail a previous run left to the janitor.
 - **Gates.**
   - `arca-courierd/tests/launcher.rs` covers the wire, the address filter (no loopback,
     LAN without the grant, metadata or IPv6), the per-app cap and uid reuse, the
@@ -497,10 +498,14 @@ same-site context or a gesture, because it never holds a ticket.
   arca-courierd for a courier with a partition. That courier carries the user's `web`
   persona, and each partition is a separate jar.
 - **Tickets** (`W_TICKET`, 0x70). The broker names the endpoint, partition, method, path,
-  reason (navigation, subresource or form), the initiating host ("" for the reader's
-  own navigation) and whether a user gesture started it.
+  query, reason (navigation, subresource or form), the initiating host ("" for the
+  reader's own navigation) and whether a user gesture started it.
   - A ticket lives 10 s and is redeemed once by `COOKIES`, from a courier whose label
-    matches its user, partition, host, port and path.
+    matches its user, partition, host and port, for exactly its method, path and query.
+    A web courier's `COOKIES` carries the request's method and query after the ticket;
+    a mismatch is refused and does not spend it. (Before 0bb0f5c3 a ticket named the
+    path alone, so one for `GET /a?x=1` also opened `/a?x=2` and a `HEAD` or `POST` to
+    `/a`.)
   - After redemption, it admits that response's `Set-Cookie`s for 60 s.
   - A web courier with no ticket, or the wrong one, gets no cookies and can set none.
   - An app's courier can't use a ticket.
@@ -523,8 +528,19 @@ same-site context or a gesture, because it never holds a ticket.
     a view closes.
   - `document.cookie` for the converter.
   - "Forget this site" in the trusted UI.
-  - The Navigator's broker issuing tickets. That is the Navigator thread's work, on
-    this API.
+  - ~~The Navigator's broker issuing tickets.~~ Built 2026-11-06 in `navigator-cookies`:
+    a ticket per request of a cookied view, sent through the courier for its
+    (partition, origin), with redirects followed by the broker (legacy-web §5.4.1e,
+    "Built"). `scripts/arca-vm-test.sh` §7 runs the broker's own clients through jailed
+    couriers: 7/7 in the dev VM, 2026-11-06.
+  - ~~**A teardown leak found by that run**~~ Fixed 2026-11-06. A courier jail that held
+    TCP connections stays dying for 2 MSL (TIME_WAIT). The launcher used to wait a fixed
+    time and then give up, which left the jail's six mounts behind. Now a janitor retries
+    each exited courier's teardown every 2 s with no deadline, and reports one still
+    pending after 5 minutes. The uid goes back to the pool only once nothing of its jail
+    is left. Leftovers from a previous launcher go to the janitor at start instead of
+    blocking it. `arca-vm-test.sh` now also checks, before stopping the launcher, that
+    every courier jail of the run is gone with no mount or root left: 79/79.
   - Password fill by form ticket and gesture (§8.3) comes with A3.
 
 ## 9. Native apps and other clients

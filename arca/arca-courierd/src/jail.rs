@@ -26,8 +26,6 @@ pub const EXEC_PATH: &str = "/usr/local/bin/atrium-arca-courier";
 /// The app devfs ruleset (portcullis_jail::APP_DEVFS_RULESET): null,
 /// zero, random and little else.
 const DEVFS_RULESET: u32 = 22;
-/// How many of portcullis_mounts' 10 s waits a dying jail gets.
-const DYING_TRIES: u32 = 18;
 
 pub struct Config {
     pub jaild: String,
@@ -63,17 +61,18 @@ pub fn launch(cfg: &Config, uid: u32, label: &CourierLabel, addrs: &[Ipv4Addr]) 
     let arca_store::Recipient::Endpoint { port, .. } = &label.endpoint else { return Err("label has no endpoint".into()) };
     let port = *port;
     let root = root(uid);
-    teardown(&name(uid), &root);
-    build_root(cfg, &root).inspect_err(|_| teardown(&name(uid), &root))?;
-    arcad::courier::append(&cfg.registry, &line).map_err(|e| {
-        teardown(&name(uid), &root);
-        format!("registry: {e}")
-    })?;
+    // The pool hands out a uid only after its last jail was torn down, so
+    // anything here is a leftover the janitor hasn't seen: refuse, don't wait.
+    if !try_teardown(uid) {
+        return Err(format!("{} is still being torn down", name(uid)));
+    }
+    build_root(cfg, &root)?;
+    arcad::courier::append(&cfg.registry, &line).map_err(|e| format!("registry: {e}"))?;
     match start(cfg, uid, &root, port, addrs) {
         Ok(c) => Ok(c),
         Err(e) => {
             retire(cfg, uid);
-            remove(cfg, uid);
+            release(cfg, uid);
             Err(e)
         }
     }
@@ -199,26 +198,42 @@ pub fn retire(cfg: &Config, uid: u32) {
     }
 }
 
-/// jaild's record, the jail's network and mounts, and the root.
-pub fn remove(cfg: &Config, uid: u32) {
+/// Drop jaild's record of the jail, with its network. Quick; the mounts and
+/// the root are [`try_teardown`]'s.
+pub fn release(cfg: &Config, uid: u32) {
     if let Ok(mut c) = jaild::client::Client::connect(&cfg.jaild) {
         let _ = c.send(&Request::RemoveJail { jid: None, name: Some(name(uid)) });
     }
-    teardown(&name(uid), &root(uid));
 }
 
-fn teardown(name: &str, root: &Path) {
-    let _ = std::process::Command::new("jail").arg("-r").arg(name).stderr(std::process::Stdio::null()).status();
-    // A vnet jail stays dying while its TCP connections sit in TIME_WAIT
-    // (2 MSL, about a minute), and its mounts stay pinned until it goes.
-    // This thread has nothing else to do: wait it out.
-    for _ in 0..DYING_TRIES {
-        if portcullis_mounts::wait_jail_gone(name, portcullis_mounts::JAIL_GONE_TIMEOUT) {
-            break;
-        }
+fn jail_exists(name: &str) -> bool {
+    std::process::Command::new("jls")
+        .args(["-d", "-j", name, "jid"])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .is_ok_and(|s| s.success())
+}
+
+/// One attempt to take `uid`'s jail apart; true once nothing of it is left.
+///
+/// A vnet jail stays dying while its TCP connections sit in TIME_WAIT (2
+/// MSL; 60 s with FreeBSD's default MSL), and its mounts stay pinned until
+/// the kernel frees it. So this never waits: it returns false while the
+/// jail is dying or a mount survives, and the janitor calls it again. (A
+/// fixed deadline here once left every mount of a run's couriers behind.)
+pub fn try_teardown(uid: u32) -> bool {
+    let (name, root) = (name(uid), root(uid));
+    let _ = std::process::Command::new("jail").arg("-r").arg(&name).stderr(std::process::Stdio::null()).status();
+    if jail_exists(&name) {
+        return false;
     }
-    let left = portcullis_mounts::converge(&[root], portcullis_mounts::Force::Yes);
-    portcullis_mounts::warn_survivors("arca-courierd", &left);
+    if !root.exists() {
+        return true;
+    }
+    if !portcullis_mounts::converge(&[root.as_path()], portcullis_mounts::Force::Yes).is_empty() {
+        return false;
+    }
     // ★ Never remove_dir_all: a mount that survived would take the
     // removal into /atrium/sockets/arca. Only what build_root wrote is
     // unlinked, then directories that are empty.
@@ -230,15 +245,23 @@ fn teardown(name: &str, root: &Path) {
     ] {
         let _ = std::fs::remove_dir(root.join(d));
     }
+    !root.exists()
 }
 
 /// At start: every courier jail a previous launcher left is wreckage.
-pub fn sweep(cfg: &Config) {
-    let Ok(rd) = std::fs::read_dir(JAILS_DIR) else { return };
+/// Their jaild records go now; the uids, for the janitor.
+pub fn sweep(cfg: &Config) -> Vec<u32> {
+    let Ok(rd) = std::fs::read_dir(JAILS_DIR) else { return Vec::new() };
+    let mut out = Vec::new();
     for e in rd.flatten() {
         let n = e.file_name().to_string_lossy().into_owned();
         let Some(uid) = n.strip_prefix(NAME_PREFIX).and_then(|u| u.parse::<u32>().ok()) else { continue };
+        if n != name(uid) || !(arcad::courier::UID_FIRST..=arcad::courier::UID_LAST).contains(&uid) {
+            continue;
+        }
         eprintln!("arca-courierd: reclaiming {n}");
-        remove(cfg, uid);
+        release(cfg, uid);
+        out.push(uid);
     }
+    out
 }

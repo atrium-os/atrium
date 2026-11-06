@@ -333,12 +333,38 @@ impl Document {
     /// `applied_with_undo` returns; `tests/apply_in_place.rs` holds every
     /// corpus step and rewind to that.
     pub fn apply_in_place_with_undo(&mut self, t: &Transition) -> Result<Transition, ApplyError> {
-        self.apply_in_place(t, true)
+        self.journaled(t, true)
     }
 
     /// `undone`, in place.
     pub fn undo_in_place(&mut self, undo: &Transition) -> Result<(), ApplyError> {
-        self.apply_in_place(undo, false).map(|_| ())
+        self.journaled(undo, false).map(|_| ())
+    }
+
+    /// A step in place, recorded in the journal when it lands (the exact
+    /// path replaces the document, so the journal is carried across it).
+    fn journaled(&mut self, t: &Transition, check_trigger: bool) -> Result<Transition, ApplyError> {
+        // Whether an attribute is written inside an <svg> (resolved before
+        // the step, against the document it applies to).
+        let in_svg = t.effects.iter().any(|e| match e {
+            Effect::Attribute { target, .. } => self.resolve(target).is_some_and(|h| {
+                let mut cur = Some(h);
+                while let Some(x) = cur {
+                    if self.dom.is_foreign(x) || self.dom.tag(x).is_some_and(|g| g.eq_ignore_ascii_case("svg")) { return true }
+                    cur = self.dom.get(x).and_then(|n| n.parent);
+                }
+                false
+            }),
+            _ => false,
+        });
+        let (journal, lineage) = (std::mem::take(&mut self.journal), self.lineage());
+        let r = self.apply_in_place(t, check_trigger);
+        // (The exact path builds its result as a new document: it is still
+        // this one.)
+        self.journal = journal;
+        self.lineage = lineage;
+        if r.is_ok() { self.journal.record(&t.effects, in_svg) }
+        r
     }
 
     fn apply_in_place(&mut self, t: &Transition, check_trigger: bool) -> Result<Transition, ApplyError> {

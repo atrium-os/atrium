@@ -88,7 +88,9 @@ pub mod op {
 pub mod broker_op {
     /// `endpoint | str partition | u8 method (the courier schema's) | str
     /// path | u8 reason (1 navigation, 2 subresource, 3 form) | str
-    /// initiator host ("" = the reader's own) | u8 gesture` → `ticket[16]`.
+    /// initiator host ("" = the reader's own) | u8 gesture [| str query]` →
+    /// `ticket[16]`. The ticket is for exactly that method, path and query
+    /// (none if omitted).
     pub const W_TICKET: u16 = 0x70;
 }
 
@@ -102,12 +104,13 @@ pub mod courier_op {
     /// attributes (the text after the first ';') | str request path` →
     /// nothing. Arca validates it (arcad::cookie); DENIED = ignored.
     pub const SET_COOKIE: u16 = 0x81;
-    /// After TLS is up: `str request path [| ticket[16]]` → the `Cookie`
-    /// header value for that request (empty: none). An app's courier sends
-    /// no ticket and gets every matching cookie. A web courier (its label
-    /// has a partition) must redeem the broker's ticket for exactly this
-    /// request; SameSite goes by the ticket. A web courier's SET_COOKIE
-    /// carries the same ticket at its end.
+    /// After TLS is up: `str request path [| ticket[16] | u8 method | str
+    /// query]` → the `Cookie` header value for that request (empty: none).
+    /// An app's courier sends no ticket and gets every matching cookie. A
+    /// web courier (its label has a partition) must redeem the broker's
+    /// ticket for exactly this request — its method, path and query; SameSite
+    /// goes by the ticket. A web courier's SET_COOKIE carries the same
+    /// ticket at its end.
     pub const COOKIES: u16 = 0x82;
 
     pub const SOURCE_ITEM: u8 = 1;

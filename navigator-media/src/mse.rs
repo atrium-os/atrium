@@ -28,6 +28,11 @@
 //! | `volume`, `muted` | `SetVolume` (0 while muted) | `volumechange` at once |
 //! | `playbackRate` | `SetRate` (0.25–4; else `NotSupportedError`) | `ratechange` at once |
 //! | | | `Time` → `timeupdate`; `Waiting` → `waiting`; `Seeking` (native controls) → `seeking`; `Ended` → `pause`, `ended` |
+//! | `requestPictureInPicture()` (in a user gesture, else `NotAllowedError`) | `RequestPip` | limend's `Pip { on }` → `enterpictureinpicture` / `leavepictureinpicture` |
+//! | `exitPictureInPicture()` | `ExitPip` | the same `Pip` event |
+//! | `mediaSession.metadata` | `MediaMetadata` (each field cut to 128 bytes) | |
+//! | `mediaSession.setActionHandler("nexttrack" \| "previoustrack", h)` | `MediaActions` (the bits with a handler) | `Action` → the handler, if still set |
+//! | | `Volume` (the user, in the player) | `volume`, `muted`, `volumechange` |
 //! | | `Error { TOO_BIG }` | the append in flight ends with `error`, `updateend`; the NEXT `appendBuffer` throws `QuotaExceededError` until a `remove` completes |
 //! | | `Error { DECODE \| UNSUPPORTED \| NETWORK }` | `video.error` (`MEDIA_ERR_DECODE` 3, `SRC_NOT_SUPPORTED` 4, `NETWORK` 2), `error` |
 //!
@@ -36,17 +41,18 @@
 //! `Appended`. And one gap: `Error` names no track, so `TOO_BIG` ends every
 //! append in flight.
 
-use limen::media_player::{code, ToChild, ToParent, APPEND_MAX, TRACKS_MAX};
+use limen::media_player::{code, media_action, ToChild, ToParent, APPEND_MAX, MEDIA_TEXT_MAX, TRACKS_MAX};
 use std::collections::{HashMap, VecDeque};
 
 /// What a call throws, as the DOM names it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum DomError { InvalidState, NotSupported, QuotaExceeded, Type, IndexSize }
+pub enum DomError { InvalidState, NotSupported, QuotaExceeded, Type, IndexSize, NotAllowed }
 
 /// A DOM event to dispatch: on the element, the `MediaSource`, or a
-/// `SourceBuffer` (by track).
+/// `SourceBuffer` (by track); or a call of the page's `mediaSession` action
+/// handler for one [`media_action`] bit.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum Fire { Element(&'static str), Source(&'static str), Buffer(u8, &'static str) }
+pub enum Fire { Element(&'static str), Source(&'static str), Buffer(u8, &'static str), SessionAction(u16) }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ReadyState { Closed, Open, Ended }
@@ -88,6 +94,10 @@ pub struct Media {
     pub error: Option<u16>,
     pub size: (u32, u32),
     file_buffered: Vec<(f64, f64)>,
+    /// In picture-in-picture: set only by limend's `Pip` event ([`Media::pip`]).
+    pub in_pip: bool,
+    /// The `mediaSession` actions the page handles ([`media_action`] bits).
+    session_actions: u16,
 }
 
 impl Default for Media { fn default() -> Self { Self::new() } }
@@ -96,7 +106,7 @@ impl Media {
     pub fn new() -> Self {
         Media { out: vec![], events: vec![], ms: None, can_play: HashMap::new(), asked: Default::default(), loaded: false,
                 paused: true, current_time: 0.0, duration: f64::NAN, volume: 1.0, muted: false, rate: 1.0, seeking: false,
-                ended: false, ready_state: 0, error: None, size: (0, 0), file_buffered: vec![] }
+                ended: false, ready_state: 0, error: None, size: (0, 0), file_buffered: vec![], in_pip: false, session_actions: 0 }
     }
 
     /// The messages to send to the embed, in order.
@@ -337,6 +347,59 @@ impl Media {
     pub fn updating(&self, track: u8) -> bool { self.ms.as_ref().and_then(|m| m.bufs.get(track as usize)).is_some_and(|b| b.updating) }
     /// `sb`'s type, as added.
     pub fn source_type(&self, track: u8) -> Option<&str> { self.ms.as_ref().and_then(|m| m.bufs.get(track as usize)).map(|b| b.mime.as_str()) }
+    // ---- picture-in-picture and mediaSession (atrium-player-pip-keys.md) ----
+
+    /// `video.requestPictureInPicture()`. Only during a user gesture (the
+    /// engine says whether one is active); limend checks the press again,
+    /// and only its `Pip` event ([`Media::pip`]) puts the element in PiP.
+    pub fn request_picture_in_picture(&mut self, user_gesture: bool) -> Result<(), DomError> {
+        if !user_gesture { return Err(DomError::NotAllowed) }
+        if self.ready_state < 1 { return Err(DomError::InvalidState) }
+        if !self.in_pip { self.out.push(ToChild::RequestPip) }
+        Ok(())
+    }
+
+    /// `document.exitPictureInPicture()` for this element.
+    pub fn exit_picture_in_picture(&mut self) -> Result<(), DomError> {
+        if !self.in_pip { return Err(DomError::InvalidState) }
+        self.out.push(ToChild::ExitPip);
+        Ok(())
+    }
+
+    /// limend's `ParentEvent::Pip` for this embed: the only source of truth.
+    pub fn pip(&mut self, on: bool) {
+        if on == self.in_pip { return }
+        self.in_pip = on;
+        self.events.push(Fire::Element(if on { "enterpictureinpicture" } else { "leavepictureinpicture" }));
+    }
+
+    /// `navigator.mediaSession.metadata = new MediaMetadata(...)`. Each
+    /// field is cut to the role's limit at a character boundary, and
+    /// control characters are dropped, so the message always passes the
+    /// player's check.
+    pub fn set_metadata(&mut self, title: &str, artist: &str, album: &str) {
+        fn clean(s: &str) -> String {
+            let mut o = String::new();
+            for c in s.chars().filter(|c| !c.is_control()) {
+                if o.len() + c.len_utf8() > MEDIA_TEXT_MAX { break }
+                o.push(c);
+            }
+            o
+        }
+        self.out.push(ToChild::MediaMetadata { title: clean(title), artist: clean(artist), album: clean(album) });
+    }
+
+    /// `navigator.mediaSession.setActionHandler(action, handler)` for
+    /// `"nexttrack"` and `"previoustrack"` (play, pause and seeking the
+    /// player does itself). `false` = the handler was set to `null`.
+    /// Other actions are accepted and ignored, as the role has no bit for them.
+    pub fn set_action_handler(&mut self, action: &str, present: bool) {
+        let bit = match action { "nexttrack" => media_action::NEXT_TRACK, "previoustrack" => media_action::PREVIOUS_TRACK, _ => return };
+        let was = self.session_actions;
+        if present { self.session_actions |= bit } else { self.session_actions &= !bit }
+        if self.session_actions != was { self.out.push(ToChild::MediaActions { actions: self.session_actions }) }
+    }
+
     pub fn source_duration(&self) -> f64 { self.ms.as_ref().map(|m| m.duration).unwrap_or(f64::NAN) }
 
     /// The Navigator's own fetch for this element failed after its retries
@@ -434,8 +497,11 @@ impl Media {
                     self.events.push(Fire::Element("volumechange"));
                 }
             }
-            // For the page's mediaSession action handler (not wired yet).
-            ToParent::Action { .. } => {}
+            // The user asked for next or previous in the player: call the
+            // page's handler, but only one the page still has.
+            ToParent::Action { action } => {
+                if action & self.session_actions != 0 { self.events.push(Fire::SessionAction(action)) }
+            }
             ToParent::Error { code: c, .. } => {
                 self.fail(match c { code::DECODE => 3, code::UNSUPPORTED => 4, code::NETWORK => 2, _ => 3 });
             }

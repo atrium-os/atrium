@@ -174,13 +174,60 @@ fn set_t(s: &mut State, c: &Label, name: &str, attrs: &str, path: &str, t: Optio
 }
 
 fn get_t(s: &mut State, c: &Label, path: &str, t: Option<[u8; 16]>) -> (u8, String) {
+    get_exact(s, c, 1, path, "", t)
+}
+
+/// A web courier's COOKIES for exactly this request: method, path, query.
+fn get_exact(s: &mut State, c: &Label, method: u8, path: &str, query: &str, t: Option<[u8; 16]>) -> (u8, String) {
     let r = s.handle(c, cop::COOKIES, &body(|w| {
         w.str(path);
         if let Some(t) = t {
             w.raw(&t);
+            w.u8(method);
+            w.str(query);
         }
     }));
     (r.status, String::from_utf8(r.body.bytes().to_vec()).unwrap())
+}
+
+fn ticket_q(s: &mut State, host: &str, partition: &str, method: u8, path: &str, query: &str) -> [u8; 16] {
+    let r = s.handle(&broker(), arcad::proto::broker_op::W_TICKET, &body(|w| {
+        arcad::proto::write_endpoint(w, host, 443);
+        w.str(partition);
+        w.u8(method);
+        w.str(path);
+        w.u8(1);
+        w.str("");
+        w.u8(1);
+        w.str(query);
+    }));
+    assert_eq!(r.status, status::OK);
+    r.body.bytes().try_into().unwrap()
+}
+
+#[test]
+fn a_ticket_is_for_one_method_path_and_query() {
+    let (_d, mut s) = setup();
+    let c = web("www.example.com", "example.com");
+    let t = ticket_q(&mut s, "www.example.com", "example.com", 1, "/a", "x=1");
+    assert_eq!(get_exact(&mut s, &c, 1, "/a", "x=2", Some(t)).0, status::DENIED, "another query");
+    assert_eq!(get_exact(&mut s, &c, 1, "/a", "", Some(t)).0, status::DENIED, "no query");
+    assert_eq!(get_exact(&mut s, &c, 2, "/a", "x=1", Some(t)).0, status::DENIED, "another method");
+    assert_eq!(get_exact(&mut s, &c, 1, "/a", "x=1", Some(t)).0, status::OK, "a refusal does not spend it");
+    assert_eq!(get_exact(&mut s, &c, 1, "/a", "x=1", Some(t)).0, status::DENIED, "spent");
+    // A ticket naming no query is for the bare path only.
+    let t = ticket(&mut s, "www.example.com", "example.com", 1, "/a", 1, "");
+    assert_eq!(get_exact(&mut s, &c, 1, "/a", "x=1", Some(t)).0, status::DENIED);
+    // And a web courier's COOKIES with a ticket but without the method and
+    // query is malformed, not redeemed.
+    let t = ticket(&mut s, "www.example.com", "example.com", 1, "/a", 1, "");
+    assert_eq!(s.handle(&c, cop::COOKIES, &body(|w| { w.str("/a"); w.raw(&t); })).status, status::MALFORMED);
+    // A query the schema would not carry is refused at issue.
+    let r = s.handle(&broker(), arcad::proto::broker_op::W_TICKET, &body(|w| {
+        arcad::proto::write_endpoint(w, "www.example.com", 443);
+        w.str("example.com"); w.u8(1); w.str("/a"); w.u8(1); w.str(""); w.u8(1); w.str("x=1#frag");
+    }));
+    assert_eq!(r.status, status::MALFORMED);
 }
 
 #[test]
@@ -235,7 +282,7 @@ fn samesite_goes_by_the_tickets_context() {
     }
     let mut ask = |method: u8, reason: u8, initiator: &str| {
         let t = ticket(&mut s, "www.example.com", "example.com", method, "/", reason, initiator);
-        let (st, h) = get_t(&mut s, &c, "/", Some(t));
+        let (st, h) = get_exact(&mut s, &c, method, "/", "", Some(t));
         assert_eq!(st, status::OK);
         let mut v: Vec<&str> = h.split("; ").map(|p| p.split('=').next().unwrap()).filter(|n| !n.is_empty()).collect();
         v.sort();

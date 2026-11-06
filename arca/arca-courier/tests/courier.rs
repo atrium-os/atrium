@@ -140,7 +140,7 @@ impl Vault for MockVault {
     fn set_cookie(&mut self, name: &str, value: &[u8], attrs: &[u8], path: &str, _: Option<&[u8; 16]>) {
         self.cookies.push((name.into(), value.into(), attrs.into(), path.into()));
     }
-    fn cookies(&mut self, path: &str, ticket: Option<&[u8; 16]>) -> Option<LockedBuf> {
+    fn cookies(&mut self, _: Method, path: &str, _: &str, ticket: Option<&[u8; 16]>) -> Option<LockedBuf> {
         self.asked.push(format!("{path}{}", ticket.map_or(String::new(), |t| format!(" ticket {}", t[0]))));
         self.jar.as_ref().map(|j| LockedBuf::from_slice(j).unwrap())
     }

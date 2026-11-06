@@ -518,9 +518,160 @@ steps: 830 µs at p50. 99% of it was outside the transition.
 | **after** | **0.79 / 1.54–1.58 / 20.8–21.0 µs** | **0.58 / 19.8–20.1 µs** |
 
 A click is now what its transition costs. `History::go` alone is p50 0.6–0.7 µs, and its
-p99 moved from 23 µs to 18 µs with the address and fragment caches. Part 2 (incremental
-restyle and relayout, repainting affected bands, the 16 ms click) follows bands and
-checkpoints (§4.8). After a DOM step it is the whole remaining cost.
+p99 moved from 23 µs to 18 µs with the address and fragment caches. After a DOM step the
+display update was then the whole remaining cost; part 2, below, deals with it.
+
+**Part 2: after a step, only what changed is drawn again (2026-11-06; asked by the user).**
+Target: a click's whole update (the DOM step, restyle, relayout, and the new scene of the
+bands that changed) under 16 ms, byte for byte what a full relayout gives.
+
+*Where a click's update went* (`examples/update_cost`, 33 corpus documents, 1,390 clicks and
+backs, before this part): **p50 328 ms, p99 840 ms**. Normalizing was about 90% of it
+(cascade 57 ms, margin collapsing 56, float fitting 84, emit 20, tables 17, box-sizing 15,
+all p50). Then prepare (parse and the flat cascade) at 14 ms, and layout and NSG for the
+view at 1 ms.
+
+*Why the restyle is not incremental.* The page's cascade is the normalizer's, and every pass
+after it works on the whole document: margin collapsing, float rows and float fitting,
+table premeasure, box-sizing and emit. Emit names its flat classes in document order, so
+one new style renames every later class, and a one-class toggle rewrites about the whole
+normalized text. Restyling only dirty subtrees means rebuilding the normalizer as an
+element-scoped compiler, which is a separate project (proposed below). Until then, a
+step's new state is normalized whole, either at the click or ahead of it.
+
+**How a change is shown** (`display::Bands::update`; the worker and the in-process host call
+it whenever the session's generation moves):
+
+1. *Proven inert: no work.* The document keeps a journal: each step bumps a version and
+   records the attributes it wrote, whether it changed the tree's shape, and whether it
+   wrote inside an `<svg>` (`Document::touched_since`). Neither the normalizer nor the
+   renderer reads `tabindex`, `aria-*` or `data-*` by name; only a selector can. A step that
+   wrote only those, outside any `<svg>`, to a document none of whose CSS mentions them
+   (every supplied sheet and `<style>`, lowercased, escapes dropped), changes nothing drawn.
+   Its update is nothing. (An inline SVG is serialized whole and addressed by hash, so no
+   attribute inside one is inert.)
+2. *A state known to look the same: no work.* A step the layout could not see joins the set
+   of state keys known to lay out as the one shown. Going to any of them is nothing.
+3. *A state laid out ahead: swapped in.* `History::key` chains the steps taken; a back
+   restores the key it had. The worker keeps laid-out states by key:
+   - the state just left;
+   - in idle time, the states a click can reach. Each offerable transition is applied to
+     a copy, normalized, prepared, and laid out for the current view
+     (`Bands::precompute`, one per idle ask);
+   - a state left by a click shown in place is turned into a whole source in idle time
+     (`prepare_back`).
+
+   A click to such a state swaps its source in (`DocumentSource::swap_in`) and sends only
+   the bands whose bytes differ from what the view holds. The source it replaces is kept
+   whole, so going back is a swap too.
+4. *Otherwise: normalized now, laid out again only from where it changed*
+   (`DocumentSource::replace`, `Banded::replace`):
+   - `Prepared::difference` walks both states in document order. It compares each node's
+     handle, kind, parent, attributes other than `class`, computed style and
+     block-in-inline promotion. The text of a `<style>` element is not compared; its meaning
+     is in the computed styles.
+   - The layout restarts at the last checkpoint whose block precedes the first difference.
+     Bands before it stay; the first pass resumes from there, lazily, as far as the view
+     asks.
+   - What later bands taught the kept ones is forgotten where the change can reach it:
+     - every per-block record of a dropped band;
+     - the final size of each box still open at the restart point. A kept band that
+       painted one is stale and paints it again without one, as in a first pass that has
+       not reached it.
+     - the overlay leaves of kept bands inside an open box that positions or transforms
+       what it holds, which are laid out again at once.
+   - An open table keeps its row records (`row_cuts`, row lists) when no changed node
+     differs in anything they read: `display`, `position`, overflow, percentage heights and
+     offsets, `rowspan` (`Prepared::table_records_stand`). Rebuilding them walks the whole
+     table.
+   - The checkpoint's own block keeps where it began. Without it, a run into a 2,300-row
+     table found its place again from the table's start: 450 ms instead of 17.
+
+   Then the window is synced to the last `want`, and `band_updated` names exactly the bands
+   whose range or NSG differ. The overlay is sent again only if its NSG differs.
+
+*Found on the way, and fixed* (each was there before this part; the oracle found them):
+- **A band laid out again was never sent again.** `sync` re-ran a stale resident band
+  inside `ensure`, which cleared `stale`. Its "send what changed" check looked only at the
+  band's foreign leaves, so the new scene, now painting a box sized by a later band, never
+  reached the view. Neither did a re-run by `Banded::settle`. A band slot now counts its
+  builds (`BandSlot::built`), and the view's record compares that count.
+- **The same band had different bytes depending on its history.** A band's scene height,
+  and the canvas rectangle sized from it, came from the document's estimated extent when
+  the band was laid out. A first-pass run and a re-run also differed. A band's scene is now
+  as tall as the band (the last band, as tall as what its run laid out). The overlay is as
+  tall as what it holds, not the extent when it was last sent. Visible pixels are
+  unchanged (the band pixel checks pass).
+
+*Kept byte for byte* (`tests/replace.rs`, `NAVIGATOR_RECORDINGS`):
+- *The relayout.* After every step and rewind, the view built from the updated source's
+  messages (puts and clears applied to a mirror) holds exactly what a source built fresh on
+  the new state gives it: every resident band's range and NSG, the overlay and the extent.
+  This is checked at once, against a fresh source whose first pass reached the same band,
+  and again after both settle, with every checkpoint and band range too. Three views: the
+  page's top, a third of the way down, and where the reader sees each `#id` trigger.
+- *The worker's path.* Inert steps, known-same states, swaps, prepared hits and misses,
+  through the answers the worker sends, against a `Bands` opened fresh on the new state.
+- A **broken control** (`bands::set_replace_control`: nothing laid out again) is caught.
+- **0 differ.** The relayout was checked 4,314 times: the 1,390 steps and rewinds of the
+  2026-11-05 explore recordings (858 and 532) and 48 on four big documents with
+  synthetic clicks (`examples/synth_clicks`: hide and restyle at 10, 50 and 90% of the
+  document), each at three views. The worker path covered 1,438 steps: 555 swaps or
+  prepared hits, 148 proven inert, 546 known-same and 189 misses.
+- After rebasing onto the dark-appearance change (`with_dark`), a subset was run again:
+  batch 2 at two views, batch 1 and the big documents at the trigger, and the worker path
+  over batch 2 and the big documents (580 steps). 0 differ.
+- The broken control: 10 of 60 steps differ.
+
+*Measured* (`examples/click_update`, in-process; the whole click: the step,
+`Bands::update`, and the `want` answer with its NSG. The view is where the reader sees the
+trigger for an `#id` trigger, else the page's first screen. M4 Max, nothing else running.)
+
+| | p50 | p90 | p99 | max |
+|---|---|---|---|---|
+| **before** (part 1b: a click's display update, `update_cost`, 1,390 steps) | 328 ms | 801 ms | 840 ms | 1,036 ms |
+| corpus, click laid out ahead (695 clicks, 2 runs) | **0.18 ms** | 3.1 ms | **9.0–9.3 ms** | 13.0–13.6 ms |
+| corpus, back (1,390, 2 runs) | **0.01 ms** | 0.5 ms | **5.8 ms** | 13.0–13.4 ms |
+| corpus, click not laid out ahead (695) | 5.7 ms | 764–791 ms | 785–816 ms | 990–1,038 ms |
+| …of which normalized at the click (353) | 173–176 ms | 769–796 ms | 943–985 ms | 990–1,038 ms |
+| big documents, back (48, view at the click) | 2.9 ms | 8.9 ms | 9.6 ms | 9.7 ms |
+| big documents, click laid out ahead (War and Peace, commons: 12) | 1.3 ms | 3.1 ms | 14.6–14.9 ms | 14.9 ms |
+| big documents, click normalized at it (24) | 1.48 s | 3.7 s | 3.7 s | 3.7 s |
+
+Of the 695 corpus clicks not laid out ahead, 148 were proven inert and 187 reached a state
+known to look the same, so they did no work (p50 5.7 ms is that half). The other 353 waited
+for the normalizer. With the view where the reader sees the trigger the numbers are the
+same as at the page's top. In run 1, one click of a document whose normalize sits at the
+1 s gate was not built ahead (1,007 ms).
+
+*The relayout alone* (the cold path's layout, against a full relayout to the same view;
+`examples/relayout_cost`, 2 runs each):
+
+| | incremental p50 / p90 / p99 / max | full relayout |
+|---|---|---|
+| corpus, 1,390 steps | 4.8 / 7.2–8.1 / 20 / 101–104 ms | 7.3–7.8 / 45 / 98–111 / 199–201 ms |
+| big documents, 48 steps, view at the click | 6.9 / 28–29 / 34 / 34 ms | 21 / 362 / 635–641 / 635–641 ms |
+
+*Memory.* A state laid out for a screen costs up to 24 times its normalized text
+(`examples/state_memory`). The HN thread is 106 MB per state for 4.5 MB of text; War and
+Peace is 7 MB for 3.9 MB. The worker keeps at most 6 states and an estimated 256 MiB:
+six of a corpus page's, two of the HN thread's. It builds a state ahead only when it fits
+beside the one just left. It also builds ahead only for a document that normalizes in under
+1 s (`PRECOMPUTE_MS_MAX`): the worker answers one request at a time, and a click arriving
+during a multi-second build would wait for it. The big documents' clicks therefore stay
+cold. Moving the normalize to a helper thread would lift that limit.
+
+*What is left.* A cold click is the normalizer, 175 ms at p50 on the corpus and 1.5–4 s on
+the big documents. The fix is an incremental normalizer:
+- the cascade element by element, with a rule index by subject (`sel::RuleIndex` is most
+  of it);
+- each later pass restricted to the boxes a change can reach (margin collapsing reaches
+  siblings and the parent chain; float rows reach a parent; float fitting reaches a
+  formatting context; tables reach a table);
+- generated classes named by content, so a restyle edits the normalized text locally.
+
+That is a project of its own, with this part's oracle as its test: a click's normalized
+text must stay byte-identical to a whole normalize.
 
 ### 4.4 Going back
 

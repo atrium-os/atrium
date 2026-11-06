@@ -69,27 +69,27 @@ pub fn baseline(h: f32, style: &TextStyle) -> f32 {
 /// installed; the 0.55·size estimate otherwise. Single-line height by
 /// the toolkit convention either way.
 
-/// `content` broken into lines no wider than `width` (px): at spaces,
-/// greedily, and at every `\n`. A word wider than `width` gets a line
-/// of its own (it is not split). `f32::INFINITY` keeps each paragraph on
-/// one line.
+/// `content` broken into lines no wider than `width` (px), by
+/// [`crate::wrap`]: at UAX #14 break opportunities, greedily, and at every
+/// `\n`. `f32::INFINITY` keeps each paragraph on one line.
 pub fn lines(content: &str, style: &TextStyle, width: f32) -> Vec<String> {
+    lines_with(content, style, width, &crate::wrap::Wrap::default())
+}
+
+/// [`lines`] with hyphenation and a line limit.
+pub fn lines_with(content: &str, style: &TextStyle, width: f32, wrap: &crate::wrap::Wrap) -> Vec<String> {
+    let m = |s: &str| measure(s, style).w;
     let mut out = Vec::new();
     for para in content.split('\n') {
-        let mut line = String::new();
-        for word in para.split(' ').filter(|w| !w.is_empty()) {
-            if line.is_empty() {
-                line.push_str(word);
-                continue;
-            }
-            let wider = format!("{line} {word}");
-            if measure(&wider, style).w <= width + 0.01 {
-                line = wider;
-            } else {
-                out.push(std::mem::replace(&mut line, word.to_string()));
-            }
+        out.extend(crate::wrap::break_paragraph(para, width, wrap, &m));
+        if wrap.max_lines > 0 && out.len() > wrap.max_lines as usize {
+            break;
         }
-        out.push(line);
+    }
+    if wrap.max_lines > 0 && width.is_finite() {
+        out = crate::wrap::truncate(out, wrap.max_lines, width, &m);
+    } else if wrap.max_lines > 0 {
+        out.truncate(wrap.max_lines as usize);
     }
     out
 }
@@ -102,8 +102,8 @@ pub fn line_height(style: &TextStyle) -> f32 {
 
 /// The size of `content` wrapped at `width`: its widest line, and its
 /// lines' height.
-pub fn measure_wrapped(content: &str, style: &TextStyle, width: f32) -> Size {
-    let ls = lines(content, style, width);
+pub fn measure_wrapped(content: &str, style: &TextStyle, width: f32, wrap: &crate::wrap::Wrap) -> Size {
+    let ls = lines_with(content, style, width, wrap);
     let w = ls.iter().map(|l| measure(l, style).w).fold(0.0, f32::max);
     Size::new(w, ls.len() as f32 * line_height(style))
 }

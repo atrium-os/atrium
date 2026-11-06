@@ -253,7 +253,32 @@ Host tests run on Linux in the cloud; the rest run in the arm64 or amd64 VM with
 6. **Clock accuracy** (VM): a client writes silence with a click at known frames; the
    clock page's predicted heard times are compared with where the clicks land in the
    device's output, read from the dump and the device position. Pass: within ±2 ms over a
-   10-minute run, and `rate_ppm` stable.
+   10-minute run, and `rate_ppm` stable. A click with a dry spell (the device had nothing
+   queued because lyrad was late) in the 400 ms before it is reported, not judged: the gap
+   moves every later frame and no prediction made before it can know it. Dry spells are a
+   scheduling failure, counted and printed by the check, and the deadline lane's job; at
+   least 80% of the clicks must be clear of them for the run to count.
+
+   *Mac runs (2026-11-06, Homebrew QEMU 10.2 HVF, stock FreeBSD 16 arm64 guest, no
+   Laminar).* Run 1 (4392d67) failed: lyrad measured the device speed from GETOPTR (on
+   FreeBSD the frames taken into the buffer, not played) and timed each period from one
+   raw GETODELAY reading; `rate_ppm` sat at ±1000. 9094ec5 replaced that with
+   `DeviceClock` (a 20 s least-squares line through written − delay). Run 2: median error
+   +0.001 ms and `rate_ppm` 4–8 between incidents, but the device ran dry in bursts on the
+   timeshare thread (`delay` 0, gaps between periods up to 72 ms against a 21 ms buffer),
+   giving errors to −196 ms. The clock now moves with a dry spell, keeping its slope, and
+   lyrad logs the device's own underrun count each second. Run 3 (f15241e): no dry spells
+   at all, median −0.001 ms, but one 10 s window where QEMU's HDA device (paced by a host
+   timer with `-audiodev none`) consumed 8.6% slow, giving −122 ms and `rate_ppm` −1000. A
+   real device's crystal doesn't do that, so this setup can't judge ±2 ms; check 6 needs a
+   device with a real clock (a host audio backend, or hardware). Run 4 (4033f13, QEMU
+   paced by the Mac's CoreAudio output, muted): the same, one window −48420 ppm, worst
+   −194 ms, median −0.005 ms; between excursions the device holds about +6 ppm in all four
+   runs. The check now also prints, for diagnosis only, the error on clicks outside 10 s
+   windows where the device ran more than 1000 ppm off its median: run 4, 1141 clicks
+   within −2.097 to +0.695 ms; run 3, 1122 clicks within −4.816 to +2.121 ms (the 20 s fit
+   still carries an excursion for a while after it). **Verdict pending real hardware**:
+   the clock arithmetic is right to about ±2 ms whenever the device keeps time.
 7. **Restart** (VM): kill lyrad while two apps play; both get `StreamLost`, reopen, and play
    again when the supervisor restarts it.
 

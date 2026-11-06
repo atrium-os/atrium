@@ -177,6 +177,15 @@ pub struct BandSlot {
     /// …and that box positions or transforms what this band laid out: its
     /// overlay leaves must be laid out again too.
     pub cross_stale: bool,
+    /// The lowest bottom of what its runs painted that is not a box cut at
+    /// its edge (the document's `bottom` is the most of these).
+    bottom: U,
+    /// The boxes cut at its edge that its runs painted (replay part 2: a
+    /// box still open where a change begins must be painted again).
+    spans: Vec<Handle>,
+    /// Counts the times its scene was built (a view holding it compares
+    /// this, so a band laid out again by any path is sent again).
+    pub built: u64,
 }
 
 /// What a `Banded` did, for measurement.
@@ -240,6 +249,8 @@ pub struct Banded<'f> {
     /// nodes (for the extent estimate).
     progress: f64,
     pub stats: BandStats,
+    /// Scenes built so far (`BandSlot::built`).
+    builds: u64,
     /// When checkpoints failed: the whole layout, as the only band.
     whole: Option<Scene>,
 }
@@ -259,6 +270,16 @@ fn gcmp(a: &GKey, b: &GKey) -> std::cmp::Ordering { html::stack_cmp(&a.stack, &b
 /// its first leaf there).
 type SpanStarts = HashMap<Handle, (u32, u32)>;
 
+thread_local! {
+    static REPLACE_CONTROL: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// ★ A BROKEN CONTROL for the replay-part-2 oracle: while set, `replace`
+/// lays nothing out again (it takes every change to begin past the
+/// layout). The oracle must catch it; a test that cannot fail tests nothing.
+#[doc(hidden)]
+pub fn set_replace_control(broken: bool) { REPLACE_CONTROL.with(|c| c.set(broken)) }
+
 const TOP: U = U::MIN / 4;
 const END: U = U::MAX / 4;
 
@@ -266,11 +287,112 @@ impl<'f> Banded<'f> {
     /// Parse and style `html`; nothing is laid out yet. `band_h` is the
     /// height a band is cut at (at the first checkpoint below it).
     pub fn new(html: &str, fonts: &'f FontSet, env: &Env, subs: &Subresources, band_h: U) -> Self {
-        let prep = html::prepare(html, fonts, env);
+        Self::from_prepared(html::prepare(html, fonts, env), fonts, env, subs, band_h)
+    }
+
+    /// The same, from a document already prepared at `env`.
+    pub fn from_prepared(prep: Prepared, fonts: &'f FontSet, env: &Env, subs: &Subresources, band_h: U) -> Self {
         Banded { prep, fonts, env: env.clone(), subs: subs.clone(), band_h: band_h.max(PX_MIN),
                  checkpoints: vec![Checkpoint { at: None, y: 0, vector_budget: crate::path::DOCUMENT_SEGMENT_SHARE }],
                  bands: vec![], done: HashMap::new(), lines_before: HashMap::new(), at: HashMap::new(), firsts: Default::default(), row_cuts: HashMap::new(), rows_cache: HashMap::new(), shapes: Default::default(), finals: HashMap::new(), span_starts: HashMap::new(), reach: Default::default(), complete: false, bottom: 0, root_h: 0,
-                 progress: 0.0, stats: BandStats::default(), whole: None }
+                 progress: 0.0, stats: BandStats::default(), builds: 0, whole: None }
+    }
+
+    /// ★ THE DOCUMENT CHANGED (backend §4.3, replay part 2): `prep` is its
+    /// new state, prepared at the same `env`. Only what the change can
+    /// reach is laid out again:
+    ///
+    /// - the bands before the last checkpoint whose block precedes the
+    ///   first difference (`Prepared::first_difference`) stay — they laid
+    ///   out the same nodes from the same inputs; the rest go, and the first
+    ///   pass resumes from that checkpoint (lazily, as far as the view asks);
+    /// - what the kept bands learned from later ones is forgotten where the
+    ///   change can reach it: a box still open at that checkpoint has no
+    ///   final size again, and a kept band that painted one is stale, as in
+    ///   a first pass that has not reached its end;
+    /// - every per-block record a dropped band made goes with it.
+    ///
+    /// Returns the first band laid out again (`None`: the layout cannot tell
+    /// the two states apart, and nothing changed). Checked byte for byte
+    /// against a source built on the new state (`tests/replace.rs`).
+    pub fn replace(&mut self, prep: Prepared) -> Option<usize> { self.replace_keeping(prep).0 }
+
+    /// `replace`, handing back the state replaced (`None` with nothing
+    /// changed: the new one is dropped and this one kept).
+    pub fn replace_keeping(&mut self, prep: Prepared) -> (Option<usize>, Option<Prepared>) {
+        let Some(diff) = self.prep.difference(&prep) else { return (None, None) };
+        let d = diff.first;
+        // A deliberately broken control (tests only): the change is taken
+        // to begin after everything laid out, so nothing is laid out again.
+        let d = if REPLACE_CONTROL.with(|c| c.get()) { u32::MAX - 1 } else { d as u32 };
+        *self.reach.borrow_mut() = None;
+        if self.whole.is_some() {
+            // Laid out whole (checkpoints failed): it is laid out again.
+            let shapes = self.shapes.clone();
+            let mut fresh = Banded::from_prepared(prep, self.fonts, &self.env.clone(), &self.subs.clone(), self.band_h);
+            fresh.shapes = shapes;
+            let old = std::mem::replace(self, fresh);
+            return (Some(0), Some(old.prep));
+        }
+        // Document order, of the new state; the nodes before the difference
+        // have the same handles in both.
+        let order = prep.preorder();
+        let mut rank: Vec<u32> = vec![u32::MAX; prep.node_count()];
+        for (i, &h) in order.iter().enumerate() { rank[h as usize] = i as u32 }
+        let rank_of = |h: Handle| rank.get(h as usize).copied().unwrap_or(u32::MAX);
+        // The last checkpoint whose block comes strictly before the change.
+        let kmax = self.bands.len().min(self.checkpoints.len().saturating_sub(1));
+        let k = (0..=kmax).rev().find(|&j| match self.checkpoints[j].at { None => true, Some(a) => rank_of(a) < d }).unwrap_or(0);
+        let at = self.checkpoints[k].at;
+        let cut = at.map(rank_of).unwrap_or(0);
+        let open: std::collections::HashSet<Handle> = match at { Some(a) => prep.ancestors(a), None => Default::default() };
+        let before = |h: Handle| rank_of(h) < cut;
+        let kk = k as u32;
+        self.done.retain(|_, v| v.1 < kk);
+        self.lines_before.retain(|_, v| v.1 < kk);
+        self.firsts.retain(|_, b| *b < kk);
+        // (The checkpoint's own block keeps where it began: the checkpoint.
+        // Without it the run found its place in the container again from the
+        // container's start — 450 ms in a 2,300-row table.)
+        self.at.retain(|h, _| before(*h) || Some(*h) == at);
+        self.finals.retain(|h, _| before(*h) && !open.contains(h));
+        // An open table keeps its row records when nothing they read
+        // changed (`Prepared::table_records_stand`): rebuilding them walks
+        // the whole table.
+        let tables_stand = diff.same_shape && diff.nodes.as_deref().is_some_and(|c| self.prep.table_records_stand(&prep, c));
+        self.row_cuts.retain(|h, _| before(*h) && (tables_stand || !open.contains(h)));
+        self.rows_cache.retain(|h, _| before(*h) && (tables_stand || !open.contains(h)));
+        self.span_starts.retain(|_, v| v.0 < kk);
+        self.bands.truncate(k);
+        self.checkpoints.truncate(k + 1);
+        self.complete = false;
+        self.root_h = 0;
+        let old = std::mem::replace(&mut self.prep, prep);
+        self.progress = at.map(|a| a as f64 / self.prep.node_count().max(1) as f64).unwrap_or(0.0);
+        self.bottom = self.bands.iter().map(|b| b.bottom).max().unwrap_or(0);
+        // A kept band that painted a box still open here painted it at a
+        // size the change may alter: it paints it again, without one, when
+        // it is next shown (as in a first pass that has not reached the
+        // box's end).
+        for j in 0..k {
+            if self.bands[j].spans.iter().any(|h| open.contains(h)) { self.bands[j].stale = true }
+        }
+        // ★ What a kept band painted OUTSIDE itself (the overlay's sources)
+        // depends on an open box only if that box positions or transforms
+        // what it holds (a box's own leaves are never among them): those
+        // bands are laid out again now, without its size, as a first pass
+        // would have. Every other kept band's overlay leaves stand.
+        let moving: Vec<U> = open.iter().filter(|&&a| self.prep.moves(a))
+            .map(|a| self.at.get(a).copied().unwrap_or(U::MIN)).collect();
+        if let Some(&top) = moving.iter().min() {
+            for j in 0..k {
+                if self.bands[j].cross.order.is_empty() || self.bands[j].range.1 <= top { continue }
+                let resident = self.bands[j].scene.is_some();
+                self.run(j, resident);
+                self.bands[j].stale = !resident && self.bands[j].stale;
+            }
+        }
+        (Some(k), Some(old))
     }
 
     /// A block, as its tag path (review tooling).
@@ -287,6 +409,22 @@ impl<'f> Banded<'f> {
         let known = self.checkpoints.last().map(|c| c.y).unwrap_or(0).max(self.bottom);
         let est = if self.progress > 0.0 { (known as f64 / self.progress) as U } else { known };
         (est.max(known).max(vh), false)
+    }
+
+    /// The band laid out so far that holds the start of the element with
+    /// this `id` (measurement: a view placed where a reader sees it).
+    pub fn band_of_id(&self, id: &str) -> Option<usize> {
+        let h = self.prep.find_id(id)?;
+        let order = self.prep.preorder();
+        let mut rank = vec![u32::MAX; self.prep.node_count()];
+        for (i, &x) in order.iter().enumerate() { rank[x as usize] = i as u32 }
+        let r = rank[h as usize];
+        (0..self.bands.len()).rev().find(|&k| match self.checkpoints[k].at { None => true, Some(a) => rank[a as usize] <= r })
+    }
+
+    #[doc(hidden)]
+    pub fn debug_state(&self) -> String {
+        format!("laid {} cp {:?} bottom {} progress {:.4} complete {}", self.bands.len(), self.checkpoints.last().map(|c| (c.at, c.y)), self.bottom, self.progress, self.complete)
     }
 
     /// Nothing left to lay out again: the overlay and every band's
@@ -343,7 +481,7 @@ impl<'f> Banded<'f> {
     fn run(&mut self, k: usize, keep: bool) {
         *self.reach.borrow_mut() = None;
         if let Some(w) = &self.whole {
-            if keep { if let Some(b) = self.bands.get_mut(k) { b.scene = Some(scene_of(w, &(0..w.order.len() as u32).collect::<Vec<_>>())) } }
+            if keep { if let Some(b) = self.bands.get_mut(k) { b.scene = Some(scene_of(w, &(0..w.order.len() as u32).collect::<Vec<_>>())); self.builds += 1; b.built = self.builds } }
             return;
         }
         let first = k == self.bands.len();
@@ -365,7 +503,7 @@ impl<'f> Banded<'f> {
         r.done = std::mem::take(&mut self.done);
         r.lines_before = std::mem::take(&mut self.lines_before);
         r.finals = std::mem::take(&mut self.finals);
-        let (scene, mut r) = html::lay_out_band(&self.prep, self.fonts, &self.env, &self.subs, r);
+        let (mut scene, mut r) = html::lay_out_band(&self.prep, self.fonts, &self.env, &self.subs, r);
         self.done = std::mem::take(&mut r.done);
         self.lines_before = std::mem::take(&mut r.lines_before);
         self.at = std::mem::take(&mut r.at);
@@ -389,6 +527,16 @@ impl<'f> Banded<'f> {
                 None => { self.complete = true; self.root_h = r.root_h; END }
             }
         } else { self.bands[k].range.1 };
+        // ★ A band's scene is as tall as the band, and so is the canvas it
+        // paints (the last band: as tall as what its run laid out). A run's
+        // own root height depends on whether it is the first pass (which
+        // stops at its limit) or a run again (which stops before the next
+        // checkpoint's block), so the same band came out with different
+        // bytes depending on its history (replay part 2's oracle).
+        if y1 < END {
+            scene.height = y1.max(0);
+            for &(kind, i, h, _, _) in &r.spanning { if kind == 0 && h == Handle::MAX { scene.rects[i].h = scene.height } }
+        }
         if first {
             // Boxes completed here that began in earlier bands: those bands
             // painted nothing for them (and positioned what they hold
@@ -426,11 +574,15 @@ impl<'f> Banded<'f> {
             GKey { stack, at }
         };
         let (mut mine, mut cross, mut cross_ext) = (vec![], vec![], vec![]);
+        let mut my_bottom = 0;
+        let mut spans: Vec<Handle> = r.spanning.iter().map(|s| s.2).collect();
+        spans.sort_unstable();
+        spans.dedup();
         for (o, &(kind, i)) in scene.order.iter().enumerate() {
             let e = extent(&scene, kind, i);
             // (A spanning box is the canvas or a box cut here: its bottom is
             // an estimate, or this run's, not the document's.)
-            if let Some((_, b)) = e { if b < END && !span.contains_key(&(kind, i)) { self.bottom = self.bottom.max(b) } }
+            if let Some((_, b)) = e { if b < END && !span.contains_key(&(kind, i)) { my_bottom = my_bottom.max(b) } }
             match e {
                 // Paints nothing (an empty box, a transform that scales to
                 // zero): in no band, as in `index`.
@@ -452,12 +604,20 @@ impl<'f> Banded<'f> {
         // itself (a one-band document is the whole layout: no copy).
         let whole_run = mine.len() == scene.order.len() && mine.iter().enumerate().all(|(i, &o)| o as usize == i);
         let band_scene = if !keep { None } else if whole_run { Some(scene) } else { Some(scene_of(&scene, &mine)) };
+        self.bottom = self.bottom.max(my_bottom);
+        self.builds += 1;
+        let built = if keep { self.builds } else { 0 };
         let slot = BandSlot { range: (y0, y1), scene: band_scene, cross: cross_scene, cross_ext,
-                              keys, cross_keys, stale: false, cross_stale: false };
+                              keys, cross_keys, stale: false, cross_stale: false, bottom: my_bottom, spans, built };
         if first { self.bands.push(slot) } else {
             let old = &mut self.bands[k];
-            let (sc, ks) = if keep { (slot.scene, slot.keys) } else { (old.scene.take(), std::mem::take(&mut old.keys)) };
-            *old = BandSlot { scene: sc, keys: ks, ..slot };
+            let (sc, ks, built) = if keep { (slot.scene, slot.keys, slot.built) } else { (old.scene.take(), std::mem::take(&mut old.keys), old.built) };
+            let bottom = old.bottom.max(slot.bottom);
+            let mut spans = std::mem::take(&mut old.spans);
+            spans.extend(slot.spans.iter().copied());
+            spans.sort_unstable();
+            spans.dedup();
+            *old = BandSlot { scene: sc, keys: ks, bottom, spans, built, ..slot };
         }
     }
 
@@ -512,7 +672,9 @@ impl<'f> Banded<'f> {
         self.root_h = s.height;
         self.bottom = s.height;
         self.complete = true;
-        self.bands.push(BandSlot { range: (TOP, END), scene: keep.then(|| scene_of(&s, &(0..s.order.len() as u32).collect::<Vec<_>>())), ..Default::default() });
+        self.builds += 1;
+        let built = if keep { self.builds } else { 0 };
+        self.bands.push(BandSlot { range: (TOP, END), scene: keep.then(|| scene_of(&s, &(0..s.order.len() as u32).collect::<Vec<_>>())), built, ..Default::default() });
         self.whole = Some(s);
     }
 
@@ -608,7 +770,11 @@ impl<'f> Banded<'f> {
                 append(&mut out, src, fk, fi, Some(self.bands[b].range), memos.entry(j).or_default());
             }
         }
-        out.height = self.extent().0;
+        // ★ As tall as what it holds, not the document's extent as known
+        // when it was built: the overlay is sent again only when its leaves
+        // change, so a height taken from the extent went stale in the view
+        // (the extent travels on its own, `Event::Extent`).
+        out.height = out.order.iter().filter_map(|&(k, i)| extent(&out, k, i)).map(|e| e.1).filter(|b| *b < END).max().unwrap_or(0).max(0);
         out
     }
 

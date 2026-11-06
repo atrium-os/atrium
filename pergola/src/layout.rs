@@ -136,6 +136,11 @@ pub struct FlexStyle {
     /// apart, as between children). On a text leaf: the text breaks into
     /// lines at the width layout gives it (`Ctx::paragraph`).
     pub wrap: bool,
+    /// A wrapping text leaf: hyphenate by dictionary (`wrap::Wrap::hyphens`).
+    pub hyphens: bool,
+    /// A wrapping text leaf: at most this many lines, the last ending in
+    /// "…" (0: no limit).
+    pub max_lines: u16,
 }
 
 impl Default for FlexStyle {
@@ -160,6 +165,8 @@ impl Default for FlexStyle {
             justify: Justify::Start,
             align: Align::Stretch,
             wrap: false,
+            hyphens: false,
+            max_lines: 0,
         }
     }
 }
@@ -189,8 +196,8 @@ pub fn layout(tree: &mut NodeTree, root: PNodeId) {
 struct MeasureCtx {
     content: String,
     style: TextStyle,
-    /// Breaks into lines at the width it is given.
-    wrap: bool,
+    /// Breaks into lines at the width it is given, so.
+    wrap: Option<crate::wrap::Wrap>,
 }
 
 fn flex_subtree(tree: &mut NodeTree, root: PNodeId) {
@@ -220,13 +227,14 @@ fn flex_subtree(tree: &mut NodeTree, root: PNodeId) {
         available,
         |known, _avail, _id, ctx: Option<&mut MeasureCtx>, _style| {
             let measured = match ctx {
-                Some(m) if m.wrap => {
-                    let w = known.width.unwrap_or(match _avail.width {
+                Some(MeasureCtx { wrap: Some(w), content, style }) => {
+                    let wrap = *w;
+                    let width = known.width.unwrap_or(match _avail.width {
                         AvailableSpace::Definite(w) => w,
                         AvailableSpace::MinContent => 0.0,
                         AvailableSpace::MaxContent => f32::INFINITY,
                     });
-                    crate::text::measure_wrapped(&m.content, &m.style, w)
+                    crate::text::measure_wrapped(content, style, width, &wrap)
                 }
                 Some(m) => crate::text::measure(&m.content, &m.style),
                 None => return Size::ZERO,
@@ -296,13 +304,14 @@ fn break_lines(tree: &mut NodeTree, id: PNodeId) {
     for c in tree.children_of(id).to_vec() {
         break_lines(tree, c);
     }
-    let wraps = tree.style(id).is_some_and(|s| s.wrap);
+    let fs0 = tree.style(id).copied().unwrap_or_default();
+    let wraps = fs0.wrap;
     let Some(Node::Text { rect, content, style }) = tree.get(id).cloned() else { return };
     if !wraps {
         return;
     }
     let lh = crate::text::line_height(&style);
-    let lines = crate::text::lines(&content, &style, rect.w());
+    let lines = crate::text::lines_with(&content, &style, rect.w(), &crate::wrap::Wrap { hyphens: fs0.hyphens, max_lines: fs0.max_lines });
     if let Some(n) = tree.get_mut(id) {
         *n = Node::stack(Axis::Vertical, rect, 0.0);
     }
@@ -520,7 +529,11 @@ fn build(
             taffy
                 .new_leaf_with_context(
                     style,
-                    MeasureCtx { content: content.clone(), style: text_style.clone(), wrap: fs.wrap },
+                    MeasureCtx {
+                        content: content.clone(),
+                        style: text_style.clone(),
+                        wrap: fs.wrap.then_some(crate::wrap::Wrap { hyphens: fs.hyphens, max_lines: fs.max_lines }),
+                    },
                 )
                 .ok()
         }
@@ -599,6 +612,25 @@ mod tests {
         assert_eq!(tree.get(after).unwrap().rect().y(), (3.0 * lh).round() + 4.0);
         let second = tree.get(tree.children_of(p)[1]).unwrap().rect();
         assert_eq!(second.y(), lh);
+    }
+
+    #[test]
+    fn a_paragraph_with_a_line_limit_ends_in_an_ellipsis() {
+        use crate::node::TextStyle;
+        use crate::theme::tokens::Weight;
+        crate::text::clear_measurer();
+        let style = TextStyle { family: "system-sans".into(), size: 10.0, weight: Weight::Regular, color: Color::TRANSPARENT };
+        let mut tree = NodeTree::new();
+        let col = tree.insert(None, Node::vstack(Rect::new(0.0, 0.0, 100.0, 0.0), 0.0));
+        let p = tree.insert(Some(col), Node::Text { rect: Rect::ZERO_SIZED, content: "aaaa bbbb cccc dddd eeee ffff gggg".into(), style: style.clone() });
+        tree.set_style(p, FlexStyle { wrap: true, shrink: 1.0, max_lines: 2, ..FlexStyle::default() });
+        layout(&mut tree, col);
+        let lines: Vec<String> = tree.children_of(p).iter().map(|c| match tree.get(*c) {
+            Some(Node::Text { content, .. }) => content.clone(),
+            _ => unreachable!(),
+        }).collect();
+        assert_eq!(lines, ["aaaa bbbb cccc", "dddd eeee ffff…"]);
+        assert_eq!(tree.get(p).unwrap().rect().h(), (2.0 * crate::text::line_height(&style)).round(), "two lines tall");
     }
 
     #[test]

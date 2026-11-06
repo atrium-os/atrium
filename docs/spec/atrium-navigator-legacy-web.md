@@ -568,6 +568,75 @@ did not itself send. Fetched from India, 2026-11-06, 01:12–01:35 IST.
 Data: `~/src/navigator-corpus/cookies-2026-11-06/`. `fetch.py` fetches and `analyze.py`
 reproduces the table; `cookies.tsv` has one row per URL.
 
+**Built (2026-11-06): step 4, tickets from the broker, and the cookied fetch path.** Arca's
+A2 jar (arca.md §8.7) is on main, so this follows its build order rather than waiting.
+
+- **Cookied only by the reader, or by a site that needs it.** `Request::Cookies { session,
+  allow }` is the reader's action: a consent or continue control, or the trusted UI's
+  "allow cookies for this site". It turns that session's view cookied with its partition,
+  which is the document's registrable domain, or turns it back
+  (`Navigatord::cookied`, `Event::Cookies`). `navigator_cookies::site_needs_cookies` is
+  refinement 1's narrower trigger: the cookieless chain set a cookie, came back to its own
+  origin, and then failed with an error status, a loop, or a URL naming a cookie error.
+  A session never turned cookied has no partition, and nothing ever asks Arca for a
+  ticket for it.
+- **A ticket per request** (`navigator_cookies::Broker`). For each https GET or HEAD of a
+  cookied view, the broker asks arcad for a ticket naming:
+  - the partition;
+  - the exact method, path and query;
+  - the reason (navigation or subresource);
+  - the initiating host, for SameSite (the page's host for a subresource; "" for the
+    reader's own navigation);
+  - the gesture.
+
+  arcad redeems it once, only for exactly that request, from the courier whose label is
+  that (partition, host, port) (arca.md §8.7, as changed by this step). The request goes
+  through that courier.
+- **Redirects.** The broker follows them, because a courier never does: at most 5, never
+  down to http, with a new ticket for each hop. A hop that passed through another site
+  makes the rest of the chain cross-site (RFC 6265bis §5.2), so a Strict cookie does not
+  ride a bounce through another site.
+- **What stays cookieless and plain:** http, a header peek (no peek is ticketed, as this
+  section says), and every request of an uncookied view. A cookied view's hints are not
+  passed on.
+- **Conversions** (`PRERENDER_COOKIED=1` with `PRERENDER_ARCAD` and `PRERENDER_COURIERD`).
+  The driver, as the web broker, relays each converter fetch through the broker. The
+  jailed converter never holds a ticket.
+- **Tests.** `navigator-cookies/tests/broker.rs` runs real arcad state and real couriers
+  over TLS to loopback servers:
+  - an uncookied view asks for no ticket and sends no cookie;
+  - a cookied view keeps and sends its site's cookies;
+  - a cross-site subresource gets only `SameSite=None`;
+  - partitions are separate jars;
+  - a ticket can't be replayed, or used for another query, path, method, partition or
+    host;
+  - a cookie-check redirect works, and a cross-site chain drops Strict;
+  - http, POST and a redirect down to http are refused.
+
+  A control that makes every ticket same-site fails two of them.
+  `navigator-backend/tests/cookies.rs` covers the reader's action.
+  `scripts/arca-vm-test.sh` §7 runs the broker's own socket clients through jailed
+  couriers. It passed 7/7 in the dev VM on 2026-11-06, judged from what the server got:
+  - the cookie went on the reader's navigation and on a ticket's own URL;
+  - it did not go on a cross-site subresource, a replayed ticket, or a ticket used for
+    another query;
+  - an uncookied view asked for no ticket.
+
+  The whole gate ran 74/76. The two failures are §5's teardown checks, unrelated to
+  tickets: arca.md §8.7.
+
+**Not yet:**
+- *Fetching the main document.* The batch driver reads the document from a file, so a
+  cookied view's navigation (`Broker::fetch` with `Fetch::navigation`) is its caller's.
+  The Navigator has no live open-a-URL path in the broker yet.
+- *Step 5, credentialed conversions:* keyed by URL plus a jar version, and kept private.
+- *Step 6, `document.cookie`.*
+- *Step 7, the reader-facing UI:* the cookied mark, and "forget this site".
+- *Refinement 2:* telling a banner, which should be a local transition, from a wall.
+  Today the reader's action is explicit.
+- *Session cookies dying with the view* (Arca §8.6).
+- *The EU-vantage measurement.*
+
 ### 5.4.2 Never emit an artifact worse than the input
 
 Because tier 2 is tier 1's DOM plus whatever the scripts changed, both artifacts are in

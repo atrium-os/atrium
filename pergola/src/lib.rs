@@ -38,6 +38,7 @@ pub mod scroll;
 pub mod slot;
 pub mod surface;
 pub mod text;
+pub mod wrap;
 pub mod text_edit;
 pub mod theme;
 pub mod view;

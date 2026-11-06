@@ -759,6 +759,12 @@ struct Driver {
     /// Total bytes one conversion may pull through the relay
     /// (`PRERENDER_FETCH_BUDGET`, bytes; default FetchBudget::DEFAULT).
     fetch_budget: u64,
+    /// ★ `PRERENDER_COOKIED=1`: these conversions are of a COOKIED view
+    /// (legacy-web §5.4.1e; the reader turned it cookied, or the site
+    /// needs it). Their fetches go through Arca's couriers with this
+    /// driver's tickets (`navigator_cookies`), over `PRERENDER_ARCAD` and
+    /// `PRERENDER_COURIERD`; without it no ticket is ever asked for.
+    cookied: Option<(String, String)>,
 }
 
 impl Driver {
@@ -784,6 +790,10 @@ impl Driver {
             mem_mb: std::env::var("PRERENDER_MEM_MB").ok().and_then(|v| v.parse().ok()).unwrap_or(4096),
             fetch_budget: std::env::var("PRERENDER_FETCH_BUDGET").ok().and_then(|v| v.parse().ok())
                 .unwrap_or(navigator_prerender::fetch::FetchBudget::DEFAULT),
+            cookied: on("PRERENDER_COOKIED").then(|| (
+                std::env::var("PRERENDER_ARCAD").unwrap_or_else(|_| "/atrium/sockets/arca/arcad.sock".into()),
+                std::env::var("PRERENDER_COURIERD").unwrap_or_else(|_| "/atrium/sockets/arca-courier/courierd.sock".into()),
+            )),
         }
     }
 
@@ -795,6 +805,9 @@ impl Driver {
             return Err("PRERENDER_REQUIRE_CONFINEMENT=1 but no PRERENDER_LAUNCHER: refusing to run page \
                         JavaScript unconfined".into());
         }
+        if net && self.cookied.is_some() && !self.cookied.as_ref().is_some_and(|(a, c)| !a.is_empty() && !c.is_empty()) {
+            return Err("PRERENDER_COOKIED=1 needs PRERENDER_ARCAD and PRERENDER_COURIERD".into());
+        }
         if net && self.fetchd.is_none() {
             return Err("PRERENDER_REQUIRE_CONFINEMENT=1 with PRERENDER_NET=1 but no PRERENDER_FETCHD: the \
                         network would be curl in this process, without the address rules (threat model §2.1)".into());
@@ -805,6 +818,10 @@ impl Driver {
 
 /// Where a relayed fetch goes.
 enum Upstream {
+    /// ★ A cookied view's: each fetch through Arca's courier with a ticket
+    /// (`navigator_cookies::Broker`); what may not carry cookies (`http`,
+    /// a header peek) goes to `plain`, cookieless.
+    Cookied { broker: navigator_cookies::Broker<navigator_cookies::ArcadSocket, navigator_cookies::Launcher>, page_host: String, plain: Box<Upstream> },
     Fetchd(navigator_prerender::fetch::FetchdFetcher),
     /// The measurement instrument (unconfined runs only; see HttpFetcher).
     Curl(HttpFetcher),
@@ -814,16 +831,32 @@ enum Upstream {
 impl Upstream {
     fn hint(&mut self, h: navigator_prerender::serve::Hint) {
         use navigator_prerender::serve::Hint;
+        // A cookied view's hints are not passed on: fetchd would pull a
+        // cookieless copy no request of the view uses (and §5.4.1e covers
+        // no prefetch with a ticket).
         if let Upstream::Fetchd(f) = self {
             match h { Hint::Body(u) => f.send_hint(u), Hint::Header(u) => f.send_hint_header(u) }
         }
     }
     fn budget(&mut self, bytes: u64) {
-        if let Upstream::Fetchd(f) = self { f.send_budget(bytes) }
+        match self {
+            Upstream::Fetchd(f) => f.send_budget(bytes),
+            Upstream::Cookied { plain, .. } => plain.budget(bytes),
+            _ => {}
+        }
     }
     fn reply(&mut self, ask: navigator_prerender::serve::Ask) -> navigator_prerender::fetch::Reply {
         use navigator_prerender::{fetch::Reply, serve::Ask};
         match (self, ask) {
+            (Upstream::Cookied { broker, page_host, plain }, Ask::Fetch(url)) => {
+                match broker.fetch(COOKIED_VIEW, &navigator_cookies::Fetch::subresource(url, page_host)) {
+                    Ok(f) => Reply::Ok { status: f.status, rest: format!("{} {} {}", f.redirects, f.body.len(), f.url), body: f.body },
+                    Err(e) if e.plain_instead() => plain.reply(ask),
+                    Err(e) => Reply::Err(format!("cookied fetch refused: {e:?}")),
+                }
+            }
+            // A header peek is never ticketed (§5.4.1e): the plain way.
+            (Upstream::Cookied { plain, .. }, ask) => plain.reply(ask),
             (Upstream::Fetchd(f), Ask::Fetch(url)) => f.exchange(url).unwrap_or_else(Reply::Err),
             (Upstream::Fetchd(f), Ask::Peek { url, start, len }) => f.exchange_peek(url, start, len).unwrap_or_else(Reply::Err),
             // The measurement instrument has no ranges: a peek is the slice
@@ -841,6 +874,9 @@ impl Upstream {
 }
 
 static INSTANCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// The one view a cookied conversion's broker knows.
+const COOKIED_VIEW: navigator_cookies::ViewId = 1;
 
 /// How long a child gets past its own deadline before its input is closed,
 /// and then again before it is killed. A jailed child normally exits on its
@@ -882,6 +918,7 @@ fn convert_in_child(
     let start = std::time::Instant::now();
 
     let (fetchd, blob_dir, stdin_d, emit) = (d.fetchd.clone(), d.blob_dir.clone(), stdin.clone(), d.emit_dir.is_some());
+    let (cookied, base_url) = (d.cookied.clone(), base.to_string());
     let fetch_instance = instance.clone();
     let budget_limit = d.fetch_budget;
     let budget = Arc::new(Mutex::new(navigator_prerender::fetch::FetchBudget::new(budget_limit)));
@@ -904,6 +941,16 @@ fn convert_in_child(
             }
             (true, None) => Upstream::Curl(HttpFetcher::new(std::env::temp_dir().join("prerender-relaycache"))),
         };
+        // ★ A cookied view: its fetches through Arca's couriers, the rest
+        // (http, peeks) the plain way. The view's partition is the
+        // document's site.
+        if let (true, Some((arcad, courierd))) = (net, cookied.clone()) {
+            let mut broker = navigator_cookies::Broker::new(navigator_cookies::ArcadSocket { path: arcad.into() }, navigator_cookies::Launcher::new(courierd));
+            broker.show(COOKIED_VIEW, &base_url).map_err(|e| format!("cookied: the document's URL {base_url:?}: {e:?}"))?;
+            broker.set_cookied(COOKIED_VIEW, navigator_cookies::Why::Reader).map_err(|e| format!("cookied: {e:?}"))?;
+            let page_host = url::Url::parse(&base_url).ok().and_then(|u| u.host_str().map(str::to_string)).unwrap_or_default();
+            up = Upstream::Cookied { broker, page_host, plain: Box::new(up) };
+        }
         let mut out = std::io::BufReader::new(stdout);
         // ★ The per-conversion byte budget is applied HERE, in the relay,
         // where the converter cannot reach it.

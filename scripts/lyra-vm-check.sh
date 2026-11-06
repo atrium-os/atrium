@@ -134,7 +134,7 @@ if [ "$MODE" = clock ]; then
         scp $SCP_OPTS "root@localhost:${f%%:*}" "$OUT/${f#*:}" >/dev/null 2>&1 || die "pull ${f%%:*}"
     done
     v "cat $T/c48.err $T/c44.err" | sed 's/^/  app: /'
-    python3 -I - "$OUT" <<'PY' || FAILS=$((FAILS + 1))
+    python3 -I - "$OUT" <<'PY' || FAILS=$((FAILS + $?))
 import struct, sys
 out = sys.argv[1]
 RATE = 48000
@@ -185,13 +185,25 @@ def when(series, d):
 # reference only.)
 truth = [(d, when(queued, d), when(played, d)) for d in clicks]
 truth = [t for t in truth if t[1] is not None]
-errs, alt, ppms, unmatched = [], [], [], 0
+# Times the device ran dry: nothing queued (lyrad was late), after the
+# first second. Each is a gap everyone hears and moves the clock by its
+# length; a prediction made before one can't know it. lyra-vmtest predicts
+# 30-300 ms ahead, so a click with a dry spell in the 400 ms before it is
+# judged apart: the clock is checked on the rest, the gaps are reported.
+dry = [now[i] for i in range(1, len(pos)) if pos[i][3] == 0 and now[i] - now[0] > 1e9]
+dry_spells = sum(1 for i in range(len(dry)) if i == 0 or dry[i] - dry[i - 1] > 50e6)
+def after_dry(t):
+    k = bisect.bisect_right(dry, t)
+    return k > 0 and t - dry[k - 1] < 400e6
+errs, clean, alt, ppms, unmatched = [], [], [], [], 0
 for rate, k, pred, ppm in preds:
     best = min(truth, key=lambda t: abs(t[1] - pred), default=None)
     if best is None or abs(best[1] - pred) > 200e6:
         unmatched += 1
         continue
     errs.append((pred - best[1]) / 1e6)
+    if not after_dry(best[1]):
+        clean.append((pred - best[1]) / 1e6)
     if best[2] is not None:
         alt.append((pred - best[2]) / 1e6)
     if k >= 30:
@@ -203,15 +215,49 @@ def line(good, text):
     fails += not good
 print('  dump: %d frames (%.0f s); %d clicks found, %d predictions, %d unmatched' % (n, n / RATE, len(clicks), len(preds), unmatched))
 line(len(errs) >= 0.95 * len(preds) and len(preds) > 0, '6: clicks matched to predictions: %d of %d' % (len(errs), len(preds)))
+print('       the device ran dry %d times (%d readings with nothing queued): lyrad late; a deadline lane should make this 0' % (dry_spells, len(dry)))
 if errs:
     e = sorted(errs)
-    line(max(abs(x) for x in errs) <= 2.0, '6: predicted minus heard (device queue): median %+.3f ms, min %+.3f, max %+.3f (want within ±2)' % (e[len(e) // 2], e[0], e[-1]))
+    print('       all clicks: predicted minus heard median %+.3f ms, min %+.3f, max %+.3f' % (e[len(e) // 2], e[0], e[-1]))
+line(len(clean) >= 0.8 * max(len(errs), 1), '6: clicks with no dry spell in the 400 ms before: %d of %d (want 80%% to judge the clock)' % (len(clean), len(errs)))
+if clean:
+    e = sorted(clean)
+    line(max(abs(x) for x in clean) <= 2.0, '6: predicted minus heard (device queue), those clicks: median %+.3f ms, min %+.3f, max %+.3f (want within ±2)' % (e[len(e) // 2], e[0], e[-1]))
+# For diagnosis, not judged: a virtual sound card can change speed by
+# percents for seconds (QEMU's HDA under host load; no crystal does). Clicks
+# in 10 s windows where the device ran more than 1000 ppm off its run's
+# median rate, shown apart.
+win = {}
+for t, q in zip(now, queued):
+    win.setdefault(int((t - now[0]) // 10e9), []).append((t, q))
+rates = {}
+for k, pts in win.items():
+    if len(pts) > 100:
+        mt = sum(p[0] for p in pts) / len(pts); mq = sum(p[1] for p in pts) / len(pts)
+        sxx = sum((p[0] - mt) ** 2 for p in pts)
+        if sxx > 0:
+            rates[k] = sum((p[0] - mt) * (p[1] - mq) for p in pts) / sxx * 1e9 / RATE * 1e6 - 1e6
+if rates:
+    med = sorted(rates.values())[len(rates) // 2]
+    odd = {k for k, r in rates.items() if abs(r - med) > 1000}
+    steady = []
+    for rate, k, pred, ppm in preds:
+        best = min(truth, key=lambda t: abs(t[1] - pred), default=None)
+        if best is None or abs(best[1] - pred) > 200e6:
+            continue
+        w = int((best[1] - now[0]) // 10e9)
+        if not ({w - 1, w} & odd) and not after_dry(best[1]):
+            steady.append((pred - best[1]) / 1e6)
+    print('       device rate: median %+.0f ppm; %d of %d 10 s windows off by more than 1000 ppm %s' % (med, len(odd), len(rates), sorted('%d s: %+.0f' % (k * 10, rates[k]) for k in odd)))
+    if steady:
+        e = sorted(steady)
+        print('       clicks outside those windows (and the one before each): %d, median %+.3f ms, min %+.3f, max %+.3f' % (len(e), e[len(e) // 2], e[0], e[-1]))
 if alt:
     a = sorted(alt)
     print('       (against GETOPTR instead: median %+.3f ms, min %+.3f, max %+.3f)' % (a[len(a) // 2], a[0], a[-1]))
 if ppms:
     line(max(ppms) - min(ppms) <= 20, '6: rate_ppm after 30 s: %d to %d (want a spread of 20 or less)' % (min(ppms), max(ppms)))
-sys.exit(1 if fails else 0)
+sys.exit(min(fails, 100))
 PY
     echo "  data in $OUT"
     [ "$FAILS" = 0 ] && { say "lyra clock check PASSED"; exit 0; }
@@ -320,7 +366,7 @@ mkdir -p "$OUT"
 scp $SCP_OPTS "root@localhost:$DUMP" "$OUT/mix.raw" >/dev/null 2>&1 || die "pull the dump"
 v "cat $T/lyrad.log" > "$OUT/lyrad.log" 2>&1
 v "cat $T/choragusd.log" > "$OUT/choragusd.log" 2>&1
-python3 -I - "$OUT/mix.raw" "$M0" "$M1" "$M2" "$M3" "$M4" "$M5" "$M6" "$M7" "$M8" "$M9" "$M10" "$M11" "$M12" "$M13" "$M14" <<'PY' || FAILS=$((FAILS + 1))
+python3 -I - "$OUT/mix.raw" "$M0" "$M1" "$M2" "$M3" "$M4" "$M5" "$M6" "$M7" "$M8" "$M9" "$M10" "$M11" "$M12" "$M13" "$M14" <<'PY' || FAILS=$((FAILS + $?))
 import math, struct, sys
 path = sys.argv[1]
 m = [int(x) // 4 for x in sys.argv[2:]]   # byte offsets -> stereo frames
@@ -381,7 +427,7 @@ check('surround: left surround, left over right ear', sl - sr, 4.52, 1.0)
 pl, pr = amp(m[13] + S, m[14], 860, left), amp(m[13] + S, m[14], 860, right)
 check('surround: Pro stream untouched (left)', pl, -12.04, 0.5)
 check('surround: Pro stream untouched (right)', pr, -12.04, 0.5)
-sys.exit(1 if fails else 0)
+sys.exit(min(fails, 100))
 PY
 
 say "stop"

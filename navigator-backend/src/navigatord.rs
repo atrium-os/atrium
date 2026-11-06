@@ -198,6 +198,15 @@ pub enum Request {
     /// Background layout while the view is idle, up to `bands` bands;
     /// answered by `Event::Bands`.
     BandsIdle { session: SessionId, bands: u32 },
+    /// ★ THE READER'S COOKIE ACTION (legacy-web §5.4.1e; arca.md §8.2):
+    /// `allow` turns the session's view COOKIED — a consent or continue
+    /// control pressed, the trusted UI's "allow cookies for this site" — or
+    /// back to anonymous. From then on that view's requests carry cookies
+    /// from its partition's jar (the site of its document), each with a
+    /// ticket the broker asks Arca for (`navigator_cookies`), and its
+    /// conversions are the reader's alone. Until it, no ticket is ever
+    /// asked for. Answered by `Event::Cookies`.
+    Cookies { session: SessionId, allow: bool },
 }
 
 /// What the UI hears back.
@@ -219,6 +228,9 @@ pub enum Event {
     /// The session was saved; `saved` is the address to restore it by.
     Saved { session: SessionId, saved: String },
     Closed { session: SessionId },
+    /// Whether the session's view is cookied now, and its partition (the
+    /// site whose jar it uses).
+    Cookies { session: SessionId, cookied: bool, partition: String },
     /// A session ended on its own. Unsolicited: the UI did not ask, and needs
     /// to know before a reader clicks into a session that is gone.
     Expired { session: SessionId, why: Expiry },
@@ -307,6 +319,9 @@ pub struct Navigatord<H: DocumentHost> {
     /// Each session's document generation: bumped whenever its document
     /// changes, so a host builds its content source again.
     generation: std::collections::BTreeMap<SessionId, u64>,
+    /// The sessions whose views are cookied (`Request::Cookies`), with
+    /// their partition. A session not here never causes a ticket.
+    cookied: std::collections::BTreeMap<SessionId, String>,
 }
 
 /// The largest first-screen scene a host may answer, bytes of NSG.
@@ -436,7 +451,7 @@ impl<H: DocumentHost> Navigatord<H> {
             return Err("navigatord refuses to start: the document host is not confined \
                         (configure a launcher, e.g. `portcullis exec --daemon --instance {instance}`)".into());
         }
-        Ok(Navigatord { host, now: 0, schemes: SchemeAllowlist::default(), blobs: None, decoded: Default::default(), device_scale: NSG_UNIT as u32, zoom: Default::default(), normalized: Default::default(), touched: Default::default(), generation: Default::default() })
+        Ok(Navigatord { host, now: 0, schemes: SchemeAllowlist::default(), blobs: None, decoded: Default::default(), device_scale: NSG_UNIT as u32, zoom: Default::default(), normalized: Default::default(), touched: Default::default(), generation: Default::default(), cookied: Default::default() })
     }
 
     /// An unconfined broker, for tests: in-process hosts, bare worker
@@ -445,7 +460,7 @@ impl<H: DocumentHost> Navigatord<H> {
     /// so a shipped binary that calls it does not link.
     #[cfg(any(test, feature = "unconfined-for-testing"))]
     pub fn unconfined_for_testing(host: H) -> Self {
-        Navigatord { host, now: 0, schemes: SchemeAllowlist::default(), blobs: None, decoded: Default::default(), device_scale: NSG_UNIT as u32, zoom: Default::default(), normalized: Default::default(), touched: Default::default(), generation: Default::default() }
+        Navigatord { host, now: 0, schemes: SchemeAllowlist::default(), blobs: None, decoded: Default::default(), device_scale: NSG_UNIT as u32, zoom: Default::default(), normalized: Default::default(), touched: Default::default(), generation: Default::default(), cookied: Default::default() }
     }
 
     /// The host, for an operator (or a test) inspecting it.
@@ -457,9 +472,16 @@ impl<H: DocumentHost> Navigatord<H> {
     /// when a reader next clicks. A UI that learned about an expiry only by
     /// failing a navigation would show a reader a page that is no longer
     /// there and then take it away under them.
+    /// The partition of a session's view if it is cookied
+    /// (`Request::Cookies`): what the conversion of its next document asks
+    /// tickets for. `None`: anonymous, and no ticket is ever asked for.
+    pub fn cookied(&self, session: SessionId) -> Option<&str> { self.cookied.get(&session).map(String::as_str) }
+
     pub fn tick(&mut self, now: Millis) -> Vec<Event> {
         self.now = self.now.max(now);
-        let out: Vec<Event> = self.host.expire(self.now).into_iter()
+        let gone = self.host.expire(self.now);
+        for (s, _) in &gone { self.cookied.remove(s); }
+        let out: Vec<Event> = gone.into_iter()
             .map(|(session, why)| Event::Expired { session, why })
             .collect();
         // A session that ended for any reason — expired, closed, or a worker
@@ -556,7 +578,25 @@ impl<H: DocumentHost> Navigatord<H> {
                     Err(why) => out.push(Event::Blocked { session: None, why }),
                 }
             }
+            Request::Cookies { session, allow } => {
+                if let Some(e) = self.absent(session) { out.push(e); return out }
+                let partition = self.host.document_url(session, self.now).ok().and_then(|u| navigator_cookies::partition_of(&u));
+                match partition {
+                    // Only a document with a site has a jar (an `https`
+                    // page; a file or about: page has none).
+                    Some(p) if allow => {
+                        self.cookied.insert(session, p.clone());
+                        out.push(Event::Cookies { session, cookied: true, partition: p });
+                    }
+                    Some(p) => {
+                        self.cookied.remove(&session);
+                        out.push(Event::Cookies { session, cookied: false, partition: p });
+                    }
+                    None => out.push(Event::Blocked { session: Some(session), why: "this document has no site to keep cookies for".into() }),
+                }
+            }
             Request::Close { session } => {
+                self.cookied.remove(&session);
                 if self.host.close(session) {
                     out.push(Event::Closed { session });
                 } else {
@@ -970,15 +1010,27 @@ impl DocumentHost for InProcessHost {
         let mut produced = None;
         if self.bands.get(&id).is_none_or(|b| b.generation != generation) {
             let s = self.sessions.get(id).ok_or("no such session")?;
-            let current = (!initial).then(|| s.document().dom.serialize());
             let rec = self.carried.get(&id).ok_or("no recording for this session")?;
-            let c = if initial { cached() } else { None };
-            let (b, n) = crate::display::Bands::open(rec.bytes(), current.as_deref(), c.as_deref(), generation)?;
-            produced = n;
-            self.bands.insert(id, b);
+            match self.bands.get_mut(&id) {
+                // ★ Only what changed is done again (replay part 2).
+                Some(b) if b.shown().is_some_and(|x| x.0 == s.document().lineage()) => { b.update(rec.bytes(), s.document(), s.state_key(), generation)?; }
+                _ => {
+                    let current = (!initial).then(|| s.document().dom.serialize());
+                    let c = if initial { cached() } else { None };
+                    let (mut b, n) = crate::display::Bands::open(rec.bytes(), current.as_deref(), c.as_deref(), generation)?;
+                    b.showing(s.document(), s.state_key());
+                    produced = n;
+                    self.bands.insert(id, b);
+                }
+            }
         }
         let mut a = self.bands.get_mut(&id).expect("built").ask(ask)?;
         a.normalized = produced;
+        if matches!(ask, crate::display::BandsAsk::Idle { .. }) {
+            if let (Some(b), Some(s), Some(rec)) = (self.bands.get_mut(&id), self.sessions.get(id), self.carried.get(&id)) {
+                if !b.prepare_back() { b.precompute(rec.bytes(), s.document(), &s.next_states(), 1)?; }
+            }
+        }
         Ok(a)
     }
     fn scene(&mut self, id: SessionId, cached: Option<&[u8]>, initial: bool, limit_px: u32, _now: Millis)

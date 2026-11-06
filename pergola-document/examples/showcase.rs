@@ -15,6 +15,7 @@ use pergola::shape::{Paint, PathData, Shape, Stroke};
 use pergola::text_edit::TextEdit;
 use pergola::theme::{font, space, type_size, Semantic, Weight};
 use pergola::view::{Ctx, View};
+use pergola::wrap::Wrap;
 use pergola::widgets::canvas::{Canvas, Item};
 use pergola::widgets::{Check, Checkbox, Dialog, DialogButton, Dropdown, GroupBox, MenuState, ScrollState, Section, Segmented, Slider, Tabs, Toggle};
 use pergola::{App, Button, Color, Mutable, SizeSpec, TextField, TextStyle, Window, WindowDesc};
@@ -24,6 +25,7 @@ struct Show {
     name: Mutable<TextEdit>,
     check: Mutable<Check>,
     dialog: Mutable<bool>,
+    text_demo: bool,
     plan: Mutable<usize>,
     plan_menu: Mutable<MenuState>,
     toggle: Mutable<bool>,
@@ -68,6 +70,9 @@ impl View for Show {
         // The controls: one column of sections, laid out (no coordinates
         // below this line but the column's).
         let col = ctx.push(Node::stack(Axis::Vertical, Rect::new(24.0, 20.0, 392.0, 0.0), space::LG));
+        if self.text_demo {
+            text_demo(ctx);
+        } else {
         Section::new("Buttons").show(ctx, |ctx| {
             // A wrapping row: what does not fit goes on the next line.
             let r = ctx.push(Node::stack(Axis::Horizontal, Rect::ZERO_SIZED, space::XS));
@@ -102,13 +107,16 @@ impl View for Show {
             ctx.place(Tabs::new(self.tab.clone(), ["General", "Privacy", "Advanced"]).width(0.0));
             ctx.place(Slider::new(self.vol.clone(), 0.0, 100.0).width(0.0));
         });
+        }
         ctx.pop();
         let _ = col;
 
-        heading(ctx, 24.0, 508.0, "Canvas");
-        Canvas::new(self.canvas.clone(), Rect::new(24.0, 532.0, 392.0, 248.0), Size::new(392.0, 400.0), self.items.clone())
-            .on_pointer(|_| {})
-            .emit(ctx);
+        if !self.text_demo {
+            heading(ctx, 24.0, 508.0, "Canvas");
+            Canvas::new(self.canvas.clone(), Rect::new(24.0, 532.0, 392.0, 248.0), Size::new(392.0, 400.0), self.items.clone())
+                .on_pointer(|_| {})
+                .emit(ctx);
+        }
 
         heading(ctx, 448.0, 20.0, "DocumentView");
         self.doc.render(ctx);
@@ -118,6 +126,33 @@ impl View for Show {
         ])
         .render(ctx);
     }
+}
+
+/// Wrapped text: plain, hyphenated, a word too long for a line, a
+/// limit of two lines, and a truncated label, each in a box its width.
+fn text_demo(ctx: &mut Ctx) {
+    let t = ctx.theme;
+    let body = TextStyle { family: font::SANS.into(), size: type_size::SM, weight: Weight::Regular, color: t.text_primary() };
+    let note = TextStyle { size: type_size::XS, weight: Weight::Semibold, color: t.text_secondary(), ..body.clone() };
+    let text = "Internationalization and accessibility considerations notwithstanding, comprehensive documentation substantially simplifies onboarding.";
+    let demo = |ctx: &mut Ctx, title: &str, w: f32, wrap: Wrap, content: &str| {
+        ctx.add(Node::Text { rect: Rect::ZERO_SIZED, content: title.into(), style: note.clone() });
+        let b = ctx.push(Node::stack(Axis::Vertical, Rect::new(0.0, 0.0, w, 0.0), 0.0));
+        ctx.set_flex(b, FlexStyle { padding: space::XS, align: Align::Stretch, ..FlexStyle::default() });
+        let edge = ctx.add(Node::Rect { rect: Rect::ZERO_SIZED, fill: t.border_default(), radius: 4.0 });
+        ctx.set_flex(edge, FlexStyle { absolute_inset: Some([Some(0.0), Some(0.0), Some(0.0), Some(0.0)]), ..FlexStyle::default() });
+        let fill = ctx.add(Node::Rect { rect: Rect::ZERO_SIZED, fill: t.bg_elevated(), radius: 3.0 });
+        ctx.set_flex(fill, FlexStyle { absolute_inset: Some([Some(1.0), Some(1.0), Some(1.0), Some(1.0)]), ..FlexStyle::default() });
+        ctx.paragraph_with(content, body.clone(), wrap);
+        ctx.pop();
+    };
+    Section::new("Wrapped text").show(ctx, |ctx| {
+        demo(ctx, "Breaks at spaces only", 300.0, Wrap::default(), text);
+        demo(ctx, "Hyphenated (en-US patterns)", 300.0, Wrap { hyphens: true, ..Wrap::default() }, text);
+        demo(ctx, "A word wider than the line", 300.0, Wrap::default(), "Key fingerprint 8f3a9c2e7b1d4f6a0c5e9b2d7f1a3c8e6b0d4f2a9c7e5b1d3f matches.");
+        demo(ctx, "At most two lines", 300.0, Wrap { max_lines: 2, ..Wrap::default() }, text);
+        demo(ctx, "One line, truncated", 300.0, Wrap { max_lines: 1, ..Wrap::default() }, "Quarterly report for the board – final version, with comments (3).pdf");
+    });
 }
 
 fn items() -> Rc<Vec<Item>> {
@@ -166,6 +201,7 @@ fn main() -> std::io::Result<()> {
     let view = Show {
         name: Mutable::with_dirty(TextEdit::new("Shankar"), dirty.clone()),
         check: Mutable::with_dirty(Check::On, dirty.clone()),
+        text_demo: std::env::args().any(|a| a == "text"),
         dialog: Mutable::with_dirty(std::env::args().any(|a| a == "dialog"), dirty.clone()),
         plan: Mutable::with_dirty(1usize, dirty.clone()),
         plan_menu: Mutable::with_dirty(MenuState::default(), dirty.clone()),

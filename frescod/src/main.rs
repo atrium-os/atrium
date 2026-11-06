@@ -52,6 +52,7 @@ mod heads;
 mod outputs;
 mod video;
 mod span;
+mod consumer;
 
 use atrium_gpu::amd::{Display, EventWatch, Gpu, ModeV2, OutputCommit, MODE_PREFERRED, NOTE_HOTPLUG, NOTE_RESET};
 

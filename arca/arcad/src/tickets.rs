@@ -44,6 +44,9 @@ pub struct Ticket {
     /// The courier schema's method number; 1 GET and 2 HEAD are safe.
     pub method: u8,
     pub path: String,
+    /// The query, without its `?` ("" for none): with the method and path,
+    /// the exact request (a ticket for `/a?x=1` is not one for `/a?x=2`).
+    pub query: String,
     pub reason: Reason,
     /// The initiating page's host; empty for the reader's own navigation
     /// (typed, a bookmark), which is same-site by definition.

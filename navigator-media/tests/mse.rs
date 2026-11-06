@@ -211,3 +211,52 @@ fn every_message_fits_the_role() {
     bad.receive(&[0xff, 0xff]);
     assert_eq!(bad.violations.len(), 3, "{:?}", bad.violations);
 }
+
+#[test]
+fn picture_in_picture_needs_a_gesture_and_limends_word() {
+    let mut m = Media::new();
+    assert_eq!(m.request_picture_in_picture(true), Err(DomError::InvalidState), "nothing loaded yet");
+    m.load_fd("video/webm").unwrap();
+    m.take_out();
+    m.from_player(ToParent::Ready { duration_secs: 10.0, width: 640, height: 360 });
+    m.take_events();
+    assert_eq!(m.request_picture_in_picture(false), Err(DomError::NotAllowed), "no user gesture");
+    assert!(m.take_out().is_empty());
+    m.request_picture_in_picture(true).unwrap();
+    assert_eq!(m.take_out(), vec![ToChild::RequestPip]);
+    assert!(!m.in_pip, "the request alone does not put it in PiP");
+    m.pip(true);
+    assert!(m.in_pip);
+    assert_eq!(m.take_events(), vec![Fire::Element("enterpictureinpicture")]);
+    m.pip(true);
+    assert!(m.take_events().is_empty(), "a repeated event changes nothing");
+    m.exit_picture_in_picture().unwrap();
+    assert_eq!(m.take_out(), vec![ToChild::ExitPip]);
+    m.pip(false);
+    assert_eq!(m.take_events(), vec![Fire::Element("leavepictureinpicture")]);
+    assert_eq!(m.exit_picture_in_picture(), Err(DomError::InvalidState));
+}
+
+#[test]
+fn media_session_metadata_and_track_actions() {
+    use limen::media_player::{media_action, MEDIA_TEXT_MAX};
+    let mut m = Media::new();
+    let long = "é".repeat(200);
+    m.set_metadata("Song\u{7}", &long, "");
+    let out = m.take_out();
+    let ToChild::MediaMetadata { title, artist, album } = &out[0] else { panic!("{out:?}") };
+    assert_eq!(title, "Song", "control characters dropped");
+    assert!(artist.len() <= MEDIA_TEXT_MAX && artist.chars().all(|c| c == 'é'), "cut at a character boundary");
+    assert!(album.is_empty());
+    assert!(out[0].clone().encode().len() > 0 && ToChild::decode(&out[0].encode()).is_some(), "passes the player's check");
+    m.set_action_handler("nexttrack", true);
+    m.set_action_handler("seekto", true);
+    assert_eq!(m.take_out(), vec![ToChild::MediaActions { actions: media_action::NEXT_TRACK }], "only the role's actions are sent");
+    m.from_player(ToParent::Action { action: media_action::NEXT_TRACK });
+    m.from_player(ToParent::Action { action: media_action::PREVIOUS_TRACK });
+    assert_eq!(m.take_events(), vec![Fire::SessionAction(media_action::NEXT_TRACK)], "only a handler the page set is called");
+    m.set_action_handler("nexttrack", false);
+    assert_eq!(m.take_out(), vec![ToChild::MediaActions { actions: 0 }]);
+    m.from_player(ToParent::Action { action: media_action::NEXT_TRACK });
+    assert!(m.take_events().is_empty(), "a handler removed in between is not called");
+}
