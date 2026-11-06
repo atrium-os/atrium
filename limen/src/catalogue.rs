@@ -47,6 +47,13 @@ pub const ROLES: &[Role] = &[
 /// limend asks choragusd for an attribution ticket for each embed.
 pub const AUDIO_ROLES: &[&str] = &["media-player"];
 
+/// Roles whose child may go picture-in-picture (atrium-player-pip-keys.md
+/// §3): its window leaves the slot for Forum's `pip` layer.
+pub const PIP_ROLES: &[&str] = &["media-player"];
+/// A PiP request needs a press routed to the child's or the parent's
+/// window within this long (§3.1 step 3).
+pub const PIP_GESTURE_MS: u32 = 1000;
+
 pub fn role(name: &str) -> Option<&'static Role> {
     ROLES.iter().find(|r| r.name == name)
 }

@@ -26,6 +26,9 @@ pub mod op {
     pub const READY: u16 = 0x11;
     pub const EMIT: u16 = 0x12;
     pub const FOCUS_OUT: u16 = 0x13;
+    /// [`Pip`](super::Pip): the child's window into or out of
+    /// picture-in-picture.
+    pub const PIP: u16 = 0x14;
     // events
     pub const EV_PARENT: u16 = 0x80;
     pub const EV_CHILD: u16 = 0x81;
@@ -46,6 +49,8 @@ pub mod refusal {
     pub const RATE: u8 = 12;
     /// The descriptor isn't a read-only regular file or pipe.
     pub const BAD_FD: u8 = 13;
+    /// PiP: not this role, no recent press, not shown, or Forum said no.
+    pub const NO_PIP: u8 = 14;
 }
 
 pub type EmbedId = u64;
@@ -94,6 +99,14 @@ pub struct Emit { pub embed: EmbedId, pub bytes: Vec<u8> }
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FocusOut { pub embed: EmbedId, pub forward: bool }
 
+/// The child asks for picture-in-picture (`on`), or to go back into its
+/// slot. `aspect` is its video's width:height, for Forum's sizing; going
+/// in needs a press on the child's or the parent's window within
+/// `catalogue::PIP_GESTURE_MS` (frescod routed it, so no one can fake it).
+/// One embed is in PiP at a time: a new one ends the last.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Pip { pub embed: EmbedId, pub on: bool, pub aspect: [u32; 2] }
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Reply {
     Ok,
@@ -114,6 +127,10 @@ pub enum ParentEvent {
     FocusOut { embed: EmbedId, forward: bool },
     /// The child went over the message rate; told once.
     Dropped { embed: EmbedId },
+    /// The child's window went into picture-in-picture (`on`: draw a
+    /// placeholder in the slot) or came back. From limend, so the parent
+    /// can trust it. No `Suspended` comes while in PiP.
+    Pip { embed: EmbedId, on: bool },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -137,4 +154,6 @@ pub enum ChildEvent {
     /// and its streams count as the parent's; there is none when the parent
     /// doesn't hold `audio` (lyra-v1.md §4). It dies with the embed.
     AudioTicket { embed: EmbedId, ticket: [u8; 16] },
+    /// PiP began or ended (also when another embed's PiP replaced this one).
+    Pip { embed: EmbedId, on: bool },
 }
