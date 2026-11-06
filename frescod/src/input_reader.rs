@@ -27,6 +27,7 @@
 
 use fresco_scene_server::window::{Compositor, DisplayEvent};
 
+use std::collections::HashMap;
 use std::fs::{File, OpenOptions};
 use std::io::Read;
 use std::os::unix::io::AsRawFd;
@@ -46,20 +47,16 @@ struct HidrawReportDescriptor {
     value: [u8; HID_MAX_DESCRIPTOR_SIZE],
 }
 
-/// True if `path`'s HID descriptor begins USAGE_PAGE(Generic Desktop)
-/// + USAGE(Keyboard).
-fn hidraw_is_keyboard(path: &str) -> bool {
-    let file = match OpenOptions::new().read(true).open(path) {
-        Ok(f) => f,
-        Err(_) => return false,
-    };
+/// `path`'s HID report descriptor.
+fn descriptor(path: &str) -> Option<Vec<u8>> {
+    let file = OpenOptions::new().read(true).open(path).ok()?;
     let fd = file.as_raw_fd();
     let mut size: i32 = 0;
     if unsafe { libc::ioctl(fd, HIDIOCGRDESCSIZE, &mut size) } < 0 {
-        return false;
+        return None;
     }
     if size < 4 || (size as usize) > HID_MAX_DESCRIPTOR_SIZE {
-        return false;
+        return None;
     }
     let mut desc = HidrawReportDescriptor {
         size: size as u32,
@@ -68,14 +65,27 @@ fn hidraw_is_keyboard(path: &str) -> bool {
     if unsafe {
         libc::ioctl(fd, HIDIOCGRDESC, &mut desc as *mut _ as *mut libc::c_void)
     } < 0 {
-        return false;
+        return None;
     }
+    Some(desc.value[..size as usize].to_vec())
+}
+
+/// True if `path`'s HID descriptor begins USAGE_PAGE(Generic Desktop)
+/// + USAGE(Keyboard).
+fn hidraw_is_keyboard(path: &str) -> bool {
     /* USAGE_PAGE(Generic Desktop) = 0x05 0x01
      * USAGE(Keyboard)             = 0x09 0x06 */
-    desc.value[0] == 0x05
-        && desc.value[1] == 0x01
-        && desc.value[2] == 0x09
-        && desc.value[3] == 0x06
+    descriptor(path).is_some_and(|d| d.starts_with(&[0x05, 0x01, 0x09, 0x06]))
+}
+
+/// The hidraw nodes other than a keyboard's that carry consumer-control
+/// keys (a headset, a remote, a keyboard's second interface).
+fn find_consumer_paths() -> Vec<(String, crate::consumer::Layout)> {
+    (0..16)
+        .map(|n| format!("/dev/hidraw{n}"))
+        .filter(|p| std::path::Path::new(p).exists() && !hidraw_is_keyboard(p))
+        .filter_map(|p| descriptor(&p).and_then(|d| crate::consumer::Layout::parse(&d)).map(|l| (p, l)))
+        .collect()
 }
 
 fn find_keyboard_path() -> Option<String> {
@@ -106,6 +116,25 @@ pub fn spawn(
 
 fn supervise(event_sink: Sender<DisplayEvent>, wm: Arc<Mutex<Compositor>>) {
     let mut worker: Option<(String, JoinHandle<()>)> = None;
+    /* Consumer-control readers, one per device. */
+    let mut media: HashMap<String, JoinHandle<()>> = HashMap::new();
+    let attach_media = |media: &mut HashMap<String, JoinHandle<()>>| {
+        media.retain(|_, h| !h.is_finished());
+        for (path, layout) in find_consumer_paths() {
+            if media.contains_key(&path) {
+                continue;
+            }
+            let sink = event_sink.clone();
+            let p2 = path.clone();
+            if let Ok(h) = std::thread::Builder::new()
+                .name(format!("frescod-media:{path}"))
+                .spawn(move || run_consumer(p2, layout, sink))
+            {
+                media.insert(path, h);
+            }
+        }
+    };
+    attach_media(&mut media);
 
     let try_attach = |worker: &mut Option<(String, JoinHandle<()>)>| {
         /* Reap a finished worker so a re-plug starts a fresh one. */
@@ -164,6 +193,7 @@ fn supervise(event_sink: Sender<DisplayEvent>, wm: Arc<Mutex<Compositor>>) {
                  * thread itself exits on EOF when its device disappears. */
                 eprintln!("frescod: hidraw event {devnode}; re-scanning");
                 try_attach(&mut worker);
+                attach_media(&mut media);
             }
             _ => {} /* ignore other devices */
         }
@@ -192,6 +222,9 @@ fn run_one(path: String,
         }
     };
     eprintln!("frescod: keyboard reading {path}");
+    /* A keyboard whose media keys share its node (numbered reports). */
+    let media = descriptor(&path).and_then(|d| crate::consumer::Layout::parse(&d)).filter(|l| !l.report_ids().contains(&0));
+    let mut held: Vec<u16> = Vec::new();
 
     /* 8-byte HID keyboard reports. Some keyboards emit longer reports
      * when LEDs / report-IDs are in use; we read the first 8 bytes
@@ -206,6 +239,10 @@ fn run_one(path: String,
             Ok(n)  => n,
             Err(e) => { eprintln!("frescod: keyboard read error: {e}"); return; }
         };
+        if let Some(pressed) = media.as_ref().and_then(|l| l.pressed(&report[..n])) {
+            send_media(&event_sink, &mut held, pressed);
+            continue;
+        }
         if n < 8 { continue; }
         let cur: &[u8; 8] = (&report[..8]).try_into().unwrap();
 
@@ -241,6 +278,47 @@ fn run_one(path: String,
 
         prev.copy_from_slice(cur);
     }
+}
+
+/// Read consumer-control reports from `path` until it goes.
+fn run_consumer(path: String, layout: crate::consumer::Layout, sink: Sender<DisplayEvent>) {
+    let mut file = match File::open(&path) {
+        Ok(f) => f,
+        Err(e) => {
+            eprintln!("frescod: cannot open media keys {path}: {e}");
+            return;
+        }
+    };
+    eprintln!("frescod: media keys reading {path}");
+    let mut report = [0u8; 64];
+    let mut held: Vec<u16> = Vec::new();
+    loop {
+        match file.read(&mut report) {
+            Ok(0) => { eprintln!("frescod: media keys EOF on {path}"); return; }
+            Ok(n) => {
+                if let Some(pressed) = layout.pressed(&report[..n]) {
+                    send_media(&sink, &mut held, pressed);
+                }
+            }
+            Err(e) => { eprintln!("frescod: media keys read error on {path}: {e}"); return; }
+        }
+    }
+}
+
+/// Media keys go to the WM alone (window 0), as `0x0C00 | usage`, with no
+/// activation token: presses newly in `pressed`, releases of those gone.
+fn send_media(sink: &Sender<DisplayEvent>, held: &mut Vec<u16>, pressed: Vec<u16>) {
+    for &u in pressed.iter().filter(|u| !held.contains(u)) {
+        let _ = sink.send(DisplayEvent::InputKey {
+            window_id: 0, hid_usage: crate::consumer::wire_usage(u), pressed: true, modifiers: 0, activation: [0; 16],
+        });
+    }
+    for &u in held.iter().filter(|u| !pressed.contains(u)) {
+        let _ = sink.send(DisplayEvent::InputKey {
+            window_id: 0, hid_usage: crate::consumer::wire_usage(u), pressed: false, modifiers: 0, activation: [0; 16],
+        });
+    }
+    *held = pressed;
 }
 
 fn send(
