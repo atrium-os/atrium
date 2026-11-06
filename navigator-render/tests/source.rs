@@ -70,11 +70,18 @@ fn a_jump_to_the_end_settles_the_extent_and_shows_the_last_band() {
     let mut sink = Sink::default();
     src.want(Want { range: (0, 600 * PX), zoom_64: 64, prefetch: 0 }, &mut sink);
     let end = full.height;
-    let ev = src.want(Want { range: (end - 600 * PX, end), zoom_64: 64, prefetch: 0 }, &mut sink);
+    let mut ev = src.want(Want { range: (end - 600 * PX, end), zoom_64: 64, prefetch: 0 }, &mut sink);
     assert!(ev.iter().any(|e| matches!(e, Event::BandEvicted { band: 0 })), "the first screen left: {ev:?}");
+    // Far ahead of the first pass, the view gets a provisional band at once;
+    // idle work settles the document and the exact last band replaces it.
+    for _ in 0..100 {
+        if ev.iter().any(|e| matches!(e, Event::Extent { settled: true, .. })) { break }
+        ev.extend(src.idle(8, &mut sink));
+    }
     let last = src.banded().laid_out() as u32 - 1;
     assert!(ev.iter().any(|e| matches!(e, Event::BandReady { band, .. } if *band == last)), "{ev:?}");
     assert!(ev.iter().any(|e| *e == Event::Extent { height: full.height, settled: true }), "{ev:?}");
+    assert!(bands_in(&sink).iter().all(|b| *b < navigator_render::source::PROVISIONAL), "no provisional band left");
     // Back to the top: laid out again from its checkpoint.
     let before = src.banded().stats.reruns;
     src.want(Want { range: (0, 600 * PX), zoom_64: 64, prefetch: 0 }, &mut sink);
@@ -111,4 +118,43 @@ fn a_new_zoom_lays_the_document_out_again() {
     assert!(ev.iter().any(|e| matches!(e, Event::BandReady { band: 0, .. })), "{ev:?}");
     for _ in 0..100 { src.idle(8, &mut sink); }
     assert!(src.banded().extent().0 > h1, "at 200% the page is laid out at half the width, so it is taller");
+}
+
+#[derive(Default)]
+struct Texts { groups: BTreeMap<GroupId, Vec<String>> }
+impl SceneSink for Texts {
+    fn put(&mut self, g: GroupId, _: Option<(U, U)>, s: &Scene) { self.groups.insert(g, s.runs.iter().map(|r| r.text.clone()).collect()); }
+    fn clear(&mut self, g: GroupId) { self.groups.remove(&g); }
+}
+
+#[test]
+fn a_far_jump_shows_a_provisional_band_at_once_and_the_exact_one_later() {
+    use navigator_render::source::PROVISIONAL;
+    let fonts = FontSet::load().unwrap();
+    let html = doc(400);
+    let full = render_html(&html, &fonts, &Env::default()).scene;
+    let mut src = DocumentSource::new(html, &fonts, Default::default(), (800.0, 600.0), 600 * PX);
+    let mut sink = Texts::default();
+    src.want(Want { range: (0, 600 * PX), zoom_64: 64, prefetch: 600 * PX }, &mut sink);
+    // Three quarters of the way down, long before the first pass is there.
+    let y = full.height * 3 / 4;
+    let ev = src.want(Want { range: (y, y + 600 * PX), zoom_64: 64, prefetch: 600 * PX }, &mut sink);
+    let prov = ev.iter().find_map(|e| match e { Event::BandReady { band, range } if *band >= PROVISIONAL => Some((*band, *range)), _ => None })
+        .unwrap_or_else(|| panic!("a provisional band: {ev:?}"));
+    assert!(prov.1 .0 <= y && prov.1 .1 >= y + 600 * PX, "it covers the wanted rows: {:?}", prov.1);
+    assert!(src.banded().laid_out() < 20, "without laying out what is above: {} bands", src.banded().laid_out());
+    // Its text is the document's, from about where the reader jumped.
+    let texts = &sink.groups[&GroupId::Band(prov.0)];
+    let n: Vec<usize> = texts.iter().filter_map(|t| t.trim_end_matches(':').split('.').next().and_then(|v| v.parse().ok())).collect();
+    assert!(!n.is_empty(), "it holds the document's paragraphs: {texts:?}");
+    assert!(n.iter().any(|&s| (240..360).contains(&s)), "from about three quarters through: {n:?}");
+    // Idle work reaches it: the provisional band goes and exact ones come.
+    let mut evicted = false;
+    for _ in 0..400 {
+        let ev = src.idle(8, &mut sink);
+        if ev.iter().any(|e| *e == Event::BandEvicted { band: prov.0 }) { evicted = true; break }
+    }
+    assert!(evicted, "the exact bands replaced it");
+    assert!(!sink.groups.keys().any(|g| matches!(g, GroupId::Band(b) if *b >= PROVISIONAL)));
+    assert!(sink.groups.keys().any(|g| matches!(g, GroupId::Band(b) if *b < PROVISIONAL)));
 }

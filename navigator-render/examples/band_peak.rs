@@ -62,15 +62,21 @@ fn main() {
             src.want(w(0), &mut sink);
             let first_ms = ms(t);
             let first_peak = peak_mib();
-            // Jump to the end: follow the estimate until it settles.
+            // Jump to the end at once: what the view shows (a provisional
+            // band when the first pass is far behind), then idle work until
+            // the extent settles and the end is exact.
             let t = Instant::now();
-            let mut wants = 0;
+            let (e0, _) = src.banded().extent();
+            src.want(w((e0 - vh).max(0)), &mut sink);
+            let jump_ms = ms(t);
+            let mut wants = 1;
             loop {
-                let (e, settled) = src.banded().extent();
-                src.want(w((e - vh).max(0)), &mut sink);
+                if src.banded().extent().1 { break }
+                src.idle(16, &mut sink);
                 wants += 1;
-                if settled && src.banded().extent().1 { break }
             }
+            let (e, _) = src.banded().extent();
+            src.want(w((e - vh).max(0)), &mut sink);
             let end_ms = ms(t);
             let (extent, _) = src.banded().extent();
             let end_peak = peak_mib();
@@ -95,7 +101,7 @@ fn main() {
             steps.sort_by(|a, b| a.partial_cmp(b).unwrap());
             let q = |p: f64| steps[((steps.len() as f64 - 1.0) * p).round() as usize];
             let st = src.banded().stats;
-            println!("{stem}\tsource\tfirst_ms={first_ms:.0}\tfirst_peak={first_peak:.0}\tend_ms={end_ms:.0}\tend_wants={wants}\tend_peak={end_peak:.0}\ttop_ms={top_ms:.1}\tmid_ms={mid_ms:.1}\tbands={}\tscroll_steps={}\tstep_p50={:.1}\tstep_p99={:.1}\tstep_max={:.1}\tresident_max={most}\twindow_leaves_max={most_leaves}\tpeak={:.0}\tnow={:.0}\textent_px={}\twhole={}\tbase={base:.0}",
+            println!("{stem}\tsource\tfirst_ms={first_ms:.0}\tfirst_peak={first_peak:.0}\tjump_ms={jump_ms:.1}\tend_ms={end_ms:.0}\tend_wants={wants}\tend_peak={end_peak:.0}\ttop_ms={top_ms:.1}\tmid_ms={mid_ms:.1}\tbands={}\tscroll_steps={}\tstep_p50={:.1}\tstep_p99={:.1}\tstep_max={:.1}\tresident_max={most}\twindow_leaves_max={most_leaves}\tpeak={:.0}\tnow={:.0}\textent_px={}\twhole={}\tbase={base:.0}",
                      src.banded().laid_out(), steps.len(), q(0.5), q(0.99), q(1.0), peak_mib(), now_mib(), extent / PX, st.whole as u8);
         }
         m => panic!("mode {m}?"),

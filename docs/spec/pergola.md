@@ -287,7 +287,9 @@ scrolling and flings "belong ideally to the UI", and "I'm wondering if this beco
 kind of a rich text/layout widget for the UI so other apps can get the same features".
 Agreed: yes. Status: `ScrollView` prototype built 2026-11-06 (below, §10.5); the document band
 source built 2026-11-06 (`navigator_render::source`, the §10.4 contract in process; backend
-§4.8 step 3 phase 2); `DocumentView` and the out-of-process messages not yet.*
+§4.8 step 3 phase 2), and its messages out of process through the Navigator broker
+(`Request::Want` / `Event::Bands`, phase 4; `Viewport` drives a jailed worker in
+navigator-backend's tests); `DocumentView` and the Limen doc-viewer channel not yet.*
 
 ### §10.1 Scrolling is Pergola's, not the Navigator's
 

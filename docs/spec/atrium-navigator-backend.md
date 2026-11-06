@@ -1151,8 +1151,8 @@ fuzzer, which has a `/4` seed and must reach `TemplateInstancesTruncated`.
 
 *Asked by the user, 2026-11-05: "memory management for pages with or without js or other
 scripting that are super big — we don't want an OOM. Scrolling a 1000 page document
-shouldn't choke the navigator too or feel laggy." Steps 1–2 and step 3 phases 1–3 built
-(below; phase 3 is table rows); the image working set not yet.*
+shouldn't choke the navigator too or feel laggy." Steps 1–2 and step 3 phases 1–4 built
+(below: bands, table rows, the wire and far jumps); the image working set not yet.*
 
 **Today, a big page is safe, but by refusal.** Checked against the tree on 2026-11-05:
 
@@ -1730,11 +1730,10 @@ both arms: `source` and the whole scene `scene`):
   opacity group): p50 8, p90 85, the most 2,237 (doc14); over the 4,096 limit only in the
   HN thread's single band (4,764) — a one-band document, which table-row checkpoints fix.
 
-*Not yet:* the worker's wire protocol for `want` and its events (out of process, pergola
-§10.4: the same messages over the doc-viewer role's channel), so the broker's worker still
-answers only `Scene` with the first screen; ~~table-row checkpoints~~ (built, below); the
-image working set (part 3); checkpoints that survive a restyle (a navigated document is laid
-out again from the start).
+*Not yet:* ~~the worker's wire protocol for `want`~~ (built, phase 4 below);
+~~table-row checkpoints~~ (built, phase 3 below); the image working set (part 3);
+checkpoints that survive a restyle (a navigated document is laid out again from the
+start).
 
 **Step 3, phase 3 built: checkpoints between table rows (2026-11-06).** A document that is
 one big table was one band (above). Now:
@@ -1781,6 +1780,66 @@ one big table was one band (above). Now:
   only for a jump to the end in the first seconds:** the table waits 3.7–4.1 s, the standard
   1.2 s, War and Peace 0.27 s; HN 33–50 ms and coreutils none pass it. Laying out from the
   end first, or a first pass that sizes rows without painting them, is what would meet it.
+
+**Step 3, phase 4 built: bands over the wire, and far jumps without the layout above
+(2026-11-06).**
+- *The protocol* (pergola.md §10.4, now the broker's). `Request::Want { session, range,
+  zoom_64, prefetch }` and `Request::BandsIdle { session, bands }` are answered by
+  `Event::Bands`: the source's events (`extent`, `band_ready`, `band_updated`,
+  `band_evicted`), each band's group clipped to its range and the overlay as NSG, and the
+  groups cleared. The worker holds the session's source (`display::Bands`, wire `BND`),
+  built from the normalized document — normalized once per recording and stored by the
+  broker, as for `Scene` — and built again when the broker's per-session document
+  generation changes (navigate, back, forward, restore, swap). The stored document is sent
+  only to a worker building its source.
+- *Checked by the broker* (`check_bands`), whatever host answers: at most 4,096 events, 64
+  groups and 20 MiB of NSG an answer, each group NSG and at most 8 MiB; a band's group only
+  for a band the same answer announced, clipped to exactly its announced range; no clip on
+  the overlay; the normalized document as for a scene; asks bounded before a worker sees
+  them (coordinates within ±2⁴⁰, zoom 25–500%, at most 64 bands of idle work). A malformed
+  jailed answer retires the worker; the wire form's parser is strict.
+- *Tested* (`navigator-backend/tests/bands.rs`): both hosts through the broker (first screen,
+  a second session from the store with identical groups, idle to settled, a jump evicting the
+  top, a navigated document's source rebuilt, refusals); the broker's refusals and the wire
+  round trip; and **Pergola's own scroll physics and `Viewport`** (pergola/src/scroll.rs,
+  compiled in) **driving a jailed worker** through swipes and flings down the document, with
+  no frame showing a placeholder and at most 5 bands held.
+- *Far jumps.* When a `want` is far beyond the first pass, the source lays out two more bands
+  of it and, if that does not reach, a **provisional band** at once (`Banded::provisional`):
+  from the block at the fraction of the document the target is of the estimated extent
+  (`Prepared::jump_target`: the first block at or after that node, climbed to the box just
+  inside its flow container), placed at the target y, with nothing above it laid out. Its
+  text and boxes are the document's; its y is an estimate, and a box it starts inside of
+  paints nothing. It has an id of its own (`source::PROVISIONAL | n`); the first pass goes on
+  in idle time, and when it reaches the range the exact bands are made ready and the
+  provisional one evicted in the same answer (the view anchors the change, §10.4). It never
+  touches the exact bands' state: the oracle and byte identity are unchanged.
+- *Re-checked.* Oracle: 129 corpus documents, 1,427 bands, 0 differ; the 7 big documents,
+  0 differ. Whole-layout NSG byte-identical on all 136. `tests/source.rs`: a jump three
+  quarters down a 400-section page gets a provisional band covering the rows, without laying
+  out what is above, holding paragraphs from about three quarters through, replaced by exact
+  bands once idle work arrives.
+- *Measured* (`band_peak`, 3 runs per arm; "jump" is from the first screen straight to the
+  estimated end):
+
+  | document | first screen | the jump: content shown | exact end (first pass, in idle time) | peak |
+  |---|---|---|---|---|
+  | 100,000-row table | 340–344 ms | **3.3–3.5 ms** | 4,463–4,494 ms | 414–416 MiB |
+  | HTML Living Standard | 445–453 ms | **3.9 ms** | 1,661–1,742 ms | 471 MiB |
+  | HN thread | 184–191 ms | **3.7–4.0 ms** | 597–617 ms | 177–178 MiB |
+  | War and Peace | 24 ms | **0.8 ms** | 793–804 ms | 85–88 MiB |
+  | coreutils manual | 80–82 ms | **1.3 ms** | 296–305 ms | 87–88 MiB |
+
+- *The scroll harness* (both arms, alone on the machine; the harness now times a gap from
+  when it appears, and applies an eviction when its answer arrives, with what replaced it):
+  **every 60 Hz gate passes, the early jump included**, and at 120 Hz every one but
+  page-down's missed vsyncs on HN and coreutils (2.8–3.2%, the same in both arms: the
+  harness compositor's cost of a page-down's strips, as before). Frame p99.9 at most 14.2 ms
+  at 60 Hz and 11.3 ms at 120 Hz, 0 stalls.
+  A jump to the end one second after display shows real content within **17 ms** of the
+  scroll settling on all five big documents (the gate is 100 ms; it was 0.27–4.1 s); the
+  exact bands follow 0.18–0.25 s later on HN, 0.7–0.8 s on War and Peace, 2.2–2.3 s on the
+  standard, 3.0 s on the table, as the first pass reaches the end.
 
 *Gates for bands (proposed):* at 60 Hz, 0 stalls over 100 ms after first display in every
 pattern, p99.9 frame time ≤ 2 periods, and missed vsyncs ≤ 1%. At 120 Hz, the same once

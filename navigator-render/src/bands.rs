@@ -189,6 +189,8 @@ pub struct BandStats {
     pub cross_leaves: u64,
     /// Whether checkpoints failed and the document was laid out whole.
     pub whole: bool,
+    /// Provisional bands laid out for far jumps (`Banded::provisional`).
+    pub provisional: u64,
 }
 
 /// ★ A DOCUMENT LAID OUT BAND BY BAND. Parsing and the cascade are done
@@ -455,6 +457,48 @@ impl<'f> Banded<'f> {
             let (sc, ks) = if keep { (slot.scene, slot.keys) } else { (old.scene.take(), std::mem::take(&mut old.keys)) };
             *old = BandSlot { scene: sc, keys: ks, ..slot };
         }
+    }
+
+    /// ★ A FAR JUMP, WITHOUT THE LAYOUT ABOVE IT. When the view wants `y`
+    /// far beyond what the first pass has reached, the band for it cannot be
+    /// exact yet (its y depends on everything above). This lays out
+    /// `[y, y + h)` PROVISIONALLY: from the block at the fraction of the
+    /// document `y` is of the estimated extent (`Prepared::jump_target`),
+    /// placed at `y`, with nothing above it laid out. Its text and boxes are
+    /// the document's; its y is an estimate, and a box it starts inside of
+    /// paints nothing. The first pass replaces it with exact bands when it
+    /// gets there (`source::DocumentSource`). `None` when `y` is not beyond
+    /// the first pass, or the document is complete.
+    pub fn provisional(&mut self, y: U, h: U) -> Option<((U, U), Scene)> {
+        if self.complete || self.whole.is_some() { return None }
+        let frontier = self.bands.last().map(|b| b.range.1).unwrap_or(0);
+        if y <= frontier { return None }
+        let (est, _) = self.extent();
+        let f = (y as f64 / est.max(1) as f64).clamp(0.0, 1.0);
+        let at_node = (f * self.prep.node_count() as f64) as usize;
+        let target = self.prep.jump_target(at_node)?;
+        let mut r = BandRun::new(u32::MAX);
+        r.limit = Some(y + h);
+        r.provisional = true;
+        r.resume_path = self.prep.ancestors(target);
+        r.resume_at = Some(target);
+        // Every box on the way to the target starts its children at `y`.
+        r.at.insert(target, y);
+        for &a in &r.resume_path { r.at.insert(a, y); }
+        r.vector_budget = self.checkpoints.last().map(|c| c.vector_budget).unwrap_or(crate::path::DOCUMENT_SEGMENT_SHARE);
+        r.canvas_h = est;
+        r.shape_cache = Some(self.shapes.clone());
+        r.row_cuts = std::mem::take(&mut self.row_cuts);
+        r.rows_cache = std::mem::take(&mut self.rows_cache);
+        let (scene, mut r) = html::lay_out_band(&self.prep, self.fonts, &self.env, &self.subs, r);
+        self.row_cuts = std::mem::take(&mut r.row_cuts);
+        self.rows_cache = std::mem::take(&mut r.rows_cache);
+        self.stats.provisional += 1;
+        let y1 = r.fired.map(|f| f.1).unwrap_or(y + h).max(y + 1);
+        let keep: Vec<u32> = scene.order.iter().enumerate()
+            .filter(|(_, &(k, i))| extent(&scene, k, i).is_some_and(|(a, b)| b > y && a < y1))
+            .map(|(o, _)| o as u32).collect();
+        Some(((y, y1), scene_of(&scene, &keep)))
     }
 
     fn fall_back_whole(&mut self, keep: bool) {

@@ -428,15 +428,21 @@ fn main() {
     }
     let t = Instant::now();
     let mut src = source_on.then(|| navigator_render::source::DocumentSource::new(html.clone(), &fonts, Default::default(), (vw, vh), (vh as i64) * PX));
-    let mut ready: HashMap<u32, f64> = HashMap::new();
+    // Each band the view holds: when it is ready, and its range.
+    let mut ready: HashMap<u32, (f64, (i64, i64))> = HashMap::new();
+    // Bands evicted, and when: an eviction takes effect when the answer
+    // carrying it arrives, with whatever replaced it in the same answer.
+    let mut gone: HashMap<u32, f64> = HashMap::new();
     let (mut worker_free, mut last_range) = (0.0f64, None::<(i64, i64)>);
     let mut worker_ms: Vec<f64> = vec![];
     let (mut placeholder_frames, mut settled_since, mut content_lags) = (0usize, None::<f64>, Vec::<(f64, f64)>::new());
     let mut lag_open: Option<f64> = None;
+    let (mut approx_frames, mut exact_open, mut exact_lags) = (0usize, None::<f64>, Vec::<(f64, f64)>::new());
+    let (mut covered_after_settle, mut exact_after_settle) = (false, false);
     if let Some(sr) = src.as_mut() {
         // The first screen, before first display (as the worker answers it).
         for e in navigator_render::source::ContentSource::want(sr, navigator_render::source::Want { range: (0, (vh as i64) * PX), zoom_64: 64, prefetch: (vh as i64) * PX }, &mut Sink) {
-            if let navigator_render::source::Event::BandReady { band, .. } = e { ready.insert(band, 0.0); }
+            if let navigator_render::source::Event::BandReady { band, range } = e { ready.insert(band, (0.0, range)); }
         }
         println!("source	first_screen_ms {:.0}", t.elapsed().as_secs_f64() * 1e3);
         last_range = Some((0, (vh as i64) * PX));
@@ -480,23 +486,44 @@ fn main() {
                 worker_free = t + ms;
                 for e in ev {
                     match e {
-                        Event::BandReady { band, .. } | Event::BandUpdated { band, .. } => { ready.insert(band, t + ms); }
-                        Event::BandEvicted { band } => { ready.remove(&band); }
+                        Event::BandReady { band, range } | Event::BandUpdated { band, range } => { ready.insert(band, (t + ms, range)); gone.remove(&band); }
+                        Event::BandEvicted { band } => { gone.insert(band, t + ms); }
                         _ => {}
                     }
                 }
             }
             // What is shown: real content only where every band is ready.
             let (a, b) = (shown_y as i64, shown_y as i64 + (vh as i64) * PX);
-            let bd = sr.banded();
-            let covered = bd.bands.iter().enumerate().filter(|(_, x)| x.range.1 > a && x.range.0 < b).all(|(k, _)| ready.get(&(k as u32)).is_some_and(|&r| r <= t))
-                && (bd.complete || bd.bands.last().is_some_and(|x| x.range.1 >= b));
+            // Shown rows covered by bands ready by now (provisional ones too,
+            // or only exact ones).
+            let covers = |exact: bool| {
+                let mut rs: Vec<(i64, i64)> = ready.iter().filter(|(id, (rt, _))| *rt <= t && gone.get(id).is_none_or(|g| t < *g) && (!exact || **id < navigator_render::source::PROVISIONAL))
+                    .map(|(_, (_, r))| *r).filter(|r| r.1 > a && r.0 < b).collect();
+                rs.sort();
+                let mut at = a;
+                for r in rs { if r.0 > at { break } at = at.max(r.1); }
+                at >= b
+            };
+            let covered = covers(false);
+            let exact = covers(true);
             if !covered { placeholder_frames += 1 }
+            if !exact { approx_frames += 1 }
             let still = (goal - prev_goal).abs() <= 0.5 && (goal - shown_y).abs() <= 0.5;
             if still { settled_since.get_or_insert(t); } else { settled_since = None }
+            // A gap is timed from the settle, or from when it appeared if
+            // the rows were covered after the settle.
+            if covered && settled_since.is_some() { covered_after_settle = true }
+            if settled_since.is_none() { covered_after_settle = false }
+            if exact && settled_since.is_some() { exact_after_settle = true }
+            if settled_since.is_none() { exact_after_settle = false }
             match (covered, settled_since, lag_open) {
-                (false, Some(s0), None) => lag_open = Some(s0),
+                (false, Some(s0), None) => lag_open = Some(if covered_after_settle { t } else { s0 }),
                 (true, _, Some(s0)) => { content_lags.push((s0, t - s0)); lag_open = None }
+                _ => {}
+            }
+            match (exact, settled_since, exact_open) {
+                (false, Some(s0), None) => exact_open = Some(if exact_after_settle { t } else { s0 }),
+                (true, _, Some(s0)) => { exact_lags.push((s0, t - s0)); exact_open = None }
                 _ => {}
             }
         }
@@ -589,6 +616,9 @@ fn main() {
     let max_lag_px = rows.iter().map(|r| (r.1 - r.2).abs()).fold(0.0, f64::max);
     if src.is_some() {
         if let Some(s0) = lag_open { content_lags.push((s0, rows.last().map(|r| r.0).unwrap_or(0.0) - s0)) }
+        if let Some(s0) = exact_open { exact_lags.push((s0, rows.last().map(|r| r.0).unwrap_or(0.0) - s0)) }
+        let exact_worst = exact_lags.iter().map(|l| l.1).fold(0.0, f64::max);
+        println!("source\texact\tnot_exact_frames {approx_frames}\texact_after_settle_worst_ms {exact_worst:.0}\tprovisional_bands {}", src.as_ref().unwrap().banded().stats.provisional);
         let worst = content_lags.iter().map(|l| l.1).fold(0.0, f64::max);
         let over = content_lags.iter().filter(|l| l.1 > 100.0).count();
         let mut w = worker_ms.clone();

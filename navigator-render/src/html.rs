@@ -459,6 +459,9 @@ pub(crate) struct BandRun {
     pub shape_cache: Option<crate::ShapeCache>,
     /// In: this band's checkpoint block.
     pub resume_at: Option<Handle>,
+    /// In: a PROVISIONAL run (`bands::Banded::provisional`): the path is
+    /// placed at the y given for it even where nothing before it is skipped.
+    pub provisional: bool,
     /// In: the ancestors of this band's checkpoint block — the boxes an
     /// earlier band began and this one continues.
     pub resume_path: std::collections::HashSet<Handle>,
@@ -486,7 +489,7 @@ pub(crate) struct BandRun {
 impl BandRun {
     pub(crate) fn new(k: u32) -> Self {
         BandRun { k, limit: None, cut_at: None, vector_budget: crate::path::DOCUMENT_SEGMENT_SHARE, canvas_h: 0,
-                  done: HashMap::new(), lines_before: HashMap::new(), finals: HashMap::new(), fired: None, skips: 0, resume_path: Default::default(), at: HashMap::new(), resume_at: None, shape_cache: None, firsts: Default::default(), row_cuts: HashMap::new(), rows_cache: HashMap::new(), spanning: vec![], completed_spans: vec![], suppressed: 0, root_h: 0, keys: vec![] }
+                  done: HashMap::new(), lines_before: HashMap::new(), finals: HashMap::new(), fired: None, skips: 0, resume_path: Default::default(), at: HashMap::new(), resume_at: None, provisional: false, shape_cache: None, firsts: Default::default(), row_cuts: HashMap::new(), rows_cache: HashMap::new(), spanning: vec![], completed_spans: vec![], suppressed: 0, root_h: 0, keys: vec![] }
     }
 }
 
@@ -531,6 +534,31 @@ impl Prepared {
             p = self.dom.get(x).and_then(|n| n.parent);
         }
         out.join(" < ")
+    }
+
+    /// ★ Where to lay out from for a far jump (`bands::Banded::provisional`):
+    /// the first block at or after node `n` in document order, climbed to
+    /// the block-level box just inside its nearest flow container — a block
+    /// in a block container, or a table row — so the run starts at a block
+    /// boundary, as a checkpoint does.
+    pub(crate) fn jump_target(&self, n: usize) -> Option<Handle> {
+        let disp = |h: Handle| self.styles.get(h as usize).and_then(|s| s.as_deref()).map(|s| kw(s, "display").to_string());
+        let blockish = |d: &str| matches!(d, "block" | "flex" | "grid" | "table" | "table-row" | "list-item");
+        let flow = |d: &str| matches!(d, "block" | "list-item" | "table-cell");
+        let body = self.dom.by_tag_anywhere("body").into_iter().next()?;
+        let n = n.min(self.dom.nodes.len().saturating_sub(1));
+        // The first block at or after `n`; near the end, the last before it.
+        let mut h = (n..self.dom.nodes.len()).map(|i| i as Handle).find(|&i| disp(i).is_some_and(|d| blockish(&d)))
+            .or_else(|| (0..n).rev().map(|i| i as Handle).find(|&i| disp(i).is_some_and(|d| blockish(&d))))?;
+        // Climb to the nearest box in a flow container, and no higher than
+        // a child of the body.
+        loop {
+            let p = self.dom.get(h).and_then(|x| x.parent)?;
+            if p == body { return Some(h) }
+            let (dh, dp) = (disp(h).unwrap_or_default(), disp(p).unwrap_or_default());
+            if blockish(&dh) && (flow(&dp) || (dh == "table-row")) { return Some(h) }
+            h = p;
+        }
     }
 
     /// The elements `h` is inside.
@@ -1320,7 +1348,7 @@ impl<'a> Cx<'a> {
                 if let Some(b) = self.band.as_mut().filter(|b| b.resume_path.contains(&h)) {
                     if let Some(i) = kids.iter().position(|c| b.resume_at == Some(*c) || b.resume_path.contains(c)) {
                         if let Some(&y_at) = b.at.get(&kids[i]) {
-                            if i > 0 {
+                            if i > 0 || b.provisional {
                                 kids.drain(..i);
                                 cy = y_at;
                                 if let Some(&(d, k0)) = b.lines_before.get(&kids[0]) { if k0 < b.k { cy += d } }

@@ -86,7 +86,14 @@ pub struct DocumentSource<'f> {
     last_extent: Option<(U, bool)>,
     overlay_sig: Option<(usize, u64)>,
     last_want: Option<Want>,
+    /// The provisional band shown for a far jump, while the first pass has
+    /// not reached it: (its id, its range).
+    prov: Option<(u32, (U, U))>,
+    prov_seq: u32,
 }
+
+/// Provisional bands' ids: `PROVISIONAL | n`, apart from exact bands'.
+pub const PROVISIONAL: u32 = 1 << 30;
 
 impl<'f> DocumentSource<'f> {
     /// A normalized document in a `window` (CSS px), cut into bands at the
@@ -94,7 +101,7 @@ impl<'f> DocumentSource<'f> {
     pub fn new(html: String, fonts: &'f FontSet, subs: Subresources, window: (f64, f64), band_h: U) -> Self {
         let doc = Banded::new(&html, fonts, &Env::zoomed(window.0, window.1, 64), &subs, band_h);
         DocumentSource { html, fonts, subs, window, zoom_64: 64, band_h, doc, resident: BTreeMap::new(),
-                         last_extent: None, overlay_sig: None, last_want: None }
+                         last_extent: None, overlay_sig: None, last_want: None, prov: None, prov_seq: 0 }
     }
 
     /// The layout state (for measurement and checks).
@@ -110,6 +117,7 @@ impl<'f> DocumentSource<'f> {
         }
         sink.clear(GroupId::Overlay);
         self.overlay_sig = None;
+        self.drop_prov(sink, ev);
         self.zoom_64 = zoom_64;
         self.doc = Banded::new(&self.html, self.fonts, &Env::zoomed(self.window.0, self.window.1, zoom_64), &self.subs, self.band_h);
     }
@@ -117,6 +125,41 @@ impl<'f> DocumentSource<'f> {
     /// Bring the window up to date with `keep`: bands in it resident and
     /// current, the rest evicted, the overlay and extent sent if changed.
     fn sync(&mut self, keep: (U, U), sink: &mut dyn SceneSink, ev: &mut Vec<Event>) {
+        // ★ A FAR JUMP: the range is well beyond the first pass. A little of
+        // the pass now, and if that does not reach it, a PROVISIONAL band
+        // for the range at once (`Banded::provisional`) instead of laying
+        // out everything above it first; the pass goes on in idle time and
+        // replaces it with exact bands when it gets there.
+        let frontier = |d: &Banded| d.bands.last().map(|b| b.range.1).unwrap_or(0);
+        if !self.doc.complete && keep.0 > frontier(&self.doc) + 2 * self.band_h {
+            for _ in 0..2 { if self.doc.advance(false).is_none() { break } }
+            if !self.doc.complete && keep.0 > frontier(&self.doc) + 2 * self.band_h {
+                let covered = self.prov.is_some_and(|(_, r)| r.0 <= keep.0 && r.1 >= keep.1.min(r.0 + (keep.1 - keep.0)));
+                if !covered {
+                    self.drop_prov(sink, ev);
+                    if let Some((range, scene)) = self.doc.provisional(keep.0, keep.1 - keep.0) {
+                        let id = PROVISIONAL | (self.prov_seq & (PROVISIONAL - 1));
+                        self.prov_seq = self.prov_seq.wrapping_add(1);
+                        sink.put(GroupId::Band(id), Some(range), &scene);
+                        ev.push(Event::BandReady { band: id, range });
+                        self.prov = Some((id, range));
+                    }
+                }
+                // Exact bands outside the range go, as ever.
+                for k in self.resident.keys().copied().collect::<Vec<_>>() {
+                    let r = self.doc.bands[k].range;
+                    if !(r.1 > keep.0 && r.0 < keep.1) {
+                        self.resident.remove(&k);
+                        self.doc.evict(k);
+                        sink.clear(GroupId::Band(k as u32));
+                        ev.push(Event::BandEvicted { band: k as u32 });
+                    }
+                }
+                let e = self.doc.extent();
+                if self.last_extent != Some(e) { self.last_extent = Some(e); ev.push(Event::Extent { height: e.0, settled: e.1 }) }
+                return;
+            }
+        }
         // Lay the first pass out as far as the range reaches.
         while !self.doc.complete && self.doc.bands.last().is_none_or(|b| b.range.1 <= keep.1) {
             let k = self.doc.laid_out();
@@ -159,6 +202,8 @@ impl<'f> DocumentSource<'f> {
                 ev.push(Event::BandUpdated { band: k as u32, range });
             }
         }
+        // The exact bands are in: the provisional one goes.
+        self.drop_prov(sink, ev);
         let ov = self.doc.overlay();
         let sig = (ov.order.len(), fingerprint(&ov));
         if self.overlay_sig != Some(sig) {
@@ -169,6 +214,15 @@ impl<'f> DocumentSource<'f> {
         if self.last_extent != Some(e) {
             self.last_extent = Some(e);
             ev.push(Event::Extent { height: e.0, settled: e.1 });
+        }
+    }
+}
+
+impl DocumentSource<'_> {
+    fn drop_prov(&mut self, sink: &mut dyn SceneSink, ev: &mut Vec<Event>) {
+        if let Some((id, _)) = self.prov.take() {
+            sink.clear(GroupId::Band(id));
+            ev.push(Event::BandEvicted { band: id });
         }
     }
 }
