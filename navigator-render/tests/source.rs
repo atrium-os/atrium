@@ -158,3 +158,27 @@ fn a_far_jump_shows_a_provisional_band_at_once_and_the_exact_one_later() {
     assert!(!sink.groups.keys().any(|g| matches!(g, GroupId::Band(b) if *b >= PROVISIONAL)));
     assert!(sink.groups.keys().any(|g| matches!(g, GroupId::Band(b) if *b < PROVISIONAL)));
 }
+
+/// The reader's dark appearance reaches the cascade: a page's
+/// `prefers-color-scheme: dark` rules apply only when the host says so.
+#[test]
+fn dark_appearance_applies_the_pages_dark_rules() {
+    struct Colors(Vec<u32>);
+    impl SceneSink for Colors {
+        fn put(&mut self, _: GroupId, _: Option<(U, U)>, s: &Scene) { self.0.extend(s.rects.iter().map(|r| r.rgba)) }
+        fn clear(&mut self, _: GroupId) {}
+    }
+    let fonts = FontSet::load().unwrap();
+    let html = r#"<html><head><style>div { background-color: #ffffff; height: 40px }
+        @media (prefers-color-scheme: dark) { div { background-color: #102030 } }</style></head>
+        <body><div>x</div></body></html>"#.to_string();
+    let colors = |dark: bool| {
+        let mut src = DocumentSource::new(html.clone(), &fonts, Default::default(), (800.0, 600.0), 600 * PX).with_dark(dark);
+        let mut sink = Colors(vec![]);
+        src.want(Want { range: (0, 600 * PX), zoom_64: 64, prefetch: 0 }, &mut sink);
+        sink.0
+    };
+    let (light, dark) = (colors(false), colors(true));
+    assert!(light.contains(&0xffffffff) && !light.contains(&0x102030ff), "light: {light:x?}");
+    assert!(dark.contains(&0x102030ff), "dark: {dark:x?}");
+}
