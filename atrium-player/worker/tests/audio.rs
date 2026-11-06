@@ -53,6 +53,7 @@ fn fake_choragus(tag: &str) -> (String, Arc<Mutex<Heard>>) {
     let l = UnixListener::bind(&path).unwrap();
     let heard = Arc::new(Mutex::new(Heard::default()));
     let h = heard.clone();
+    let flush_ms = if tag == "quick" { 150 } else { 5 };
     let tag = tag.to_string();
     std::thread::spawn(move || {
         let (mut c, _) = l.accept().unwrap();
@@ -94,7 +95,7 @@ fn fake_choragus(tag: &str) -> (String, Arc<Mutex<Heard>>) {
                     ToChoragus::Flush { stream: s } => {
                         if let Some((_, cons, ..)) = stream.as_ref() {
                             // A slow answer, as from a busy choragusd.
-                            std::thread::sleep(Duration::from_millis(150));
+                            std::thread::sleep(Duration::from_millis(flush_ms));
                             let pos = cons.discard();
                             h.lock().unwrap().flushes += 1;
                             wire::send(&mut c, &ToApp::Flushed { stream: s, frame: pos }).unwrap();
@@ -159,12 +160,14 @@ struct Session {
     a: Option<AudioOut>,
     sock: String,
     ended: bool,
+    frames: u64,
+    errors: u32,
 }
 
 impl Session {
     fn new(clip: &str, sock: String) -> Self {
         let p = Player::new(opts(), LocalSink::new(Box::new(|_, _| {})), Source::File(File::open(asset(clip)).unwrap())).unwrap();
-        Session { p, a: None, sock, ended: false }
+        Session { p, a: None, sock, ended: false, frames: 0, errors: 0 }
     }
     /// Run for `d`, or until the audio has all been heard.
     fn run(&mut self, d: Duration, heard: &Arc<Mutex<Heard>>, total: usize) {
@@ -178,6 +181,8 @@ impl Session {
                         self.a = Some(a);
                     }
                     PlayerEvent::Ended => self.ended = true,
+                    PlayerEvent::Frame { .. } => self.frames += 1,
+                    PlayerEvent::Error(_) => self.errors += 1,
                     _ => {}
                 }
             }
@@ -298,4 +303,67 @@ fn quick_seeks_one_after_another_end_with_sound_and_clock_at_the_last_target() {
     // Within WebM's millisecond timestamps of the target.
     assert!(got.len().abs_diff(want.len() - start) <= 48, "the rest of the clip, once: {} frames, want {}", got.len(), want.len() - start);
     assert!(got == &want[want.len() - got.len()..], "the stream frame the clock anchors starts the rest of the clip");
+}
+
+/// Play `clip`, seeking at random for `storm_ms` (a seek every 1 to 16 ms,
+/// as a finger dragging the thumb, with Lyra flushing behind), then let go
+/// at 1 s and play to the end. Returns what was heard from the last run's
+/// anchor on, and the number of seeks.
+fn storm(clip: &str, tag: &str, storm_ms: u64) -> (Vec<f32>, u32) {
+    let (sock, heard) = fake_choragus(tag);
+    let mut s = Session::new(clip, sock);
+    s.run(Duration::from_millis(300), &heard, 0);
+    let pid = s.p.worker_pid();
+    let mut x: u64 = 0x2545_f491_4f6c_dd1d;
+    let mut next = || {
+        x ^= x << 13;
+        x ^= x >> 7;
+        x ^= x << 17;
+        x
+    };
+    let (mut seeks, until) = (0, Instant::now() + Duration::from_millis(storm_ms));
+    while Instant::now() < until {
+        let to = (next() % 2_000_000_000) as i64;
+        s.p.seek(to);
+        s.a.as_mut().unwrap().seek(to);
+        seeks += 1;
+        s.run(Duration::from_millis(1 + next() % 16), &heard, 0);
+    }
+    s.p.seek(1_000_000_000);
+    s.a.as_mut().unwrap().seek(1_000_000_000);
+    let frames0 = s.frames;
+    s.run(Duration::from_secs(5), &heard, 0);
+    assert_eq!(s.p.worker_pid(), pid, "{clip}: the worker never died ({seeks} seeks)");
+    assert_eq!(s.errors, 0, "{clip}: no errors");
+    assert!(s.ended, "{clip}: plays to the end");
+    assert!(s.frames - frames0 >= 20, "{clip}: video after letting go ({} frames)", s.frames - frames0);
+    let a = s.a.as_ref().unwrap();
+    let (frame0, media0) = a.anchor().expect("a run after letting go");
+    assert!((1_000_000_000..1_001_000_000).contains(&media0), "{clip}: from the last target ({media0})");
+    let g = heard.lock().unwrap();
+    let &(f, i) = g.marks.iter().rev().find(|(f, _)| *f <= frame0).expect("heard from the anchor");
+    (g.samples[i + (frame0 - f) as usize..].to_vec(), seeks)
+}
+
+#[test]
+fn continuous_seeking_leaves_no_trace() {
+    for (k, clip) in ["vp9-opus.webm", "av1-opus.mp4"].into_iter().enumerate() {
+        let (calm, _) = storm(clip, &format!("calm{k}"), 0);
+        let (got, seeks) = storm(clip, &format!("storm{k}"), 3000);
+        assert!(seeks > 100, "{seeks} seeks");
+        let diff: Vec<usize> = (0..got.len().min(calm.len())).filter(|&j| got[j] != calm[j]).collect();
+        let md = diff.iter().map(|&j| (got[j] - calm[j]).abs()).fold(0f32, f32::max);
+        eprintln!("{clip}: {} differ, first {:?} last {:?}, max {md}", diff.len(), diff.first(), diff.last());
+        // The same sound as one clean seek to 1 s, at the same stream frames.
+        // Not always bit for bit: after a storm the packets may already be in
+        // the store, and decoding starts from a packet a little nearer the
+        // target than a fresh read from the cue does. Opus converges either
+        // way; what is left is below -40 dB of full scale.
+        assert_eq!(got.len(), calm.len(), "{clip}: after {seeks} seeks, as long as after one");
+        assert!(md < 0.01, "{clip}: after {seeks} seeks, the sound differs by up to {md}");
+        // And that is the rest of the clip (Opus decoded from the pre-roll
+        // converges on the straight-through decode rather than matching it).
+        let want = reference_pcm(clip);
+        assert!(got.len().abs_diff(want.len() - 48_000) <= 48, "{clip}: {} frames", got.len());
+    }
 }

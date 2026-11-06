@@ -724,9 +724,22 @@ impl Demuxer for Parser {
         else {
             return false;
         };
-        self.pending = self.index.iter().filter(|s| s.offset >= k.offset).copied().collect();
+        // Other tracks (sound) from their sample at or before the pre-roll
+        // point, which in the file can come before the video's key sample:
+        // a decoder needs that much before the target to converge.
+        let pre = t_ns.min(k.pts) - crate::AUDIO_PREROLL_NS;
+        let mut from: Vec<(u8, u64)> = Vec::new();
+        for t in self.tracks.iter().filter(|t| t.index != vt) {
+            let first = self.index.iter().filter(|s| s.track == t.index && s.pts <= pre).max_by_key(|s| s.pts)
+                .or_else(|| self.index.iter().filter(|s| s.track == t.index).min_by_key(|s| s.pts));
+            if let Some(f) = first {
+                from.push((t.index, f.offset));
+            }
+        }
+        let start = |s: &Pending| if s.track == vt { k.offset } else { from.iter().find(|f| f.0 == s.track).map_or(k.offset, |f| f.1) };
+        self.pending = self.index.iter().filter(|s| s.offset >= start(s)).copied().collect();
         self.out.clear();
-        self.want = Some(k.offset);
+        self.want = Some(from.iter().map(|f| f.1).fold(k.offset, u64::min));
         true
     }
 

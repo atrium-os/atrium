@@ -434,7 +434,7 @@ impl Worker {
             a.dec.reset();
             a.pcm.clear();
             // Decode from 80 ms before the target and drop that (RFC 7845 §4.6).
-            in_store &= a.store.seek(t_ns - 80_000_000);
+            in_store &= a.store.seek(t_ns - atrium_media_demux::AUDIO_PREROLL_NS);
             a.drop_before = Some(t_ns);
         }
         if !in_store && self.mode == Some(Mode::Load) {

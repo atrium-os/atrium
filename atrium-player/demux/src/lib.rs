@@ -20,6 +20,10 @@ pub mod webm;
 
 use std::fmt;
 
+/// How far before a seek target sound is decoded from, and the result
+/// dropped, so the decoder has converged by the target (RFC 7845 §4.6).
+pub const AUDIO_PREROLL_NS: i64 = 80_000_000;
+
 /// Hard limits. Defaults suit everything up to 8K video.
 #[derive(Debug, Clone, Copy)]
 pub struct Limits {
@@ -185,7 +189,8 @@ pub trait Demuxer {
     fn wants_offset(&self) -> Option<u64>;
     /// The input continues at this absolute offset; pending bytes are dropped.
     fn input_at(&mut self, offset: u64);
-    /// Move to the keyframe at or before `t_ns` (random-access input only).
+    /// Move to the keyframe at or before `t_ns` (random-access input only),
+    /// with other tracks' samples from [`AUDIO_PREROLL_NS`] before that.
     /// Returns whether the parser knows where that is; when it does,
     /// [`Self::wants_offset`] says where to read from.
     fn seek(&mut self, t_ns: i64) -> bool;

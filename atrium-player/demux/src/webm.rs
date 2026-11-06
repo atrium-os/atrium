@@ -484,7 +484,9 @@ impl Demuxer for Parser {
     }
 
     fn seek(&mut self, t_ns: i64) -> bool {
-        let i = self.cues.partition_point(|&(t, _)| t <= t_ns);
+        // Clusters interleave the tracks, so the cue at or before the sound's
+        // pre-roll point also has the video's key frame before the target.
+        let i = self.cues.partition_point(|&(t, _)| t <= t_ns - crate::AUDIO_PREROLL_NS);
         let Some(&(_, off)) = self.cues.get(i.saturating_sub(1)) else { return false };
         if self.segment.is_none() {
             return false;
