@@ -735,7 +735,13 @@ fn recv_with_fds(s: &UnixStream, buf: &mut [u8]) -> io::Result<(usize, Vec<Owned
         m.msg_iovlen = 1;
         m.msg_control = cbuf.as_mut_ptr().cast();
         m.msg_controllen = space as _;
-        let n = libc::recvmsg(s.as_raw_fd(), &mut m, libc::MSG_CMSG_CLOEXEC);
+        // macOS has no MSG_CMSG_CLOEXEC: close-on-exec is set on each fd
+        // below instead (this process doesn't fork in between).
+        #[cfg(not(target_vendor = "apple"))]
+        let flags = libc::MSG_CMSG_CLOEXEC;
+        #[cfg(target_vendor = "apple")]
+        let flags = 0;
+        let n = libc::recvmsg(s.as_raw_fd(), &mut m, flags);
         if n < 0 {
             return Err(io::Error::last_os_error());
         }
@@ -747,6 +753,8 @@ fn recv_with_fds(s: &UnixStream, buf: &mut [u8]) -> io::Result<(usize, Vec<Owned
                 let len = (*c).cmsg_len as usize - (data as usize - c as usize);
                 for i in 0..len / std::mem::size_of::<RawFd>() {
                     let fd = OwnedFd::from_raw_fd(std::ptr::read_unaligned(data.add(i)));
+                    #[cfg(target_vendor = "apple")]
+                    libc::fcntl(fd.as_raw_fd(), libc::F_SETFD, libc::FD_CLOEXEC);
                     if fds.len() < MAX_FDS_PER_MESSAGE {
                         fds.push(fd);
                     }
