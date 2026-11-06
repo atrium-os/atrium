@@ -22,6 +22,8 @@ portcullis-ipc  = { path = "../portcullis/portcullis-ipc" }
 portcullis-toml  = { path = "../portcullis/portcullis-toml" }
 portcullis-policy = { path = "../portcullis/portcullis-policy" }
 libc            = "0.2"
+# choragusd's attribution wire (embedded players play as their parent).
+lyra-protocol   = { path = "../lyra-protocol" }
 serde    = { version = "1", features = ["derive"] }
 postcard = { version = "1", features = ["use-std"] }
 

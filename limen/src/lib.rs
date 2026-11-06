@@ -5,8 +5,10 @@
 //! - [`daemon`]: limend itself, over traits for frescod and the launcher so
 //!   it can be tested without either.
 //! - [`client`]: the parent's and the child's ends.
+//! - [`audio`]: choragusd's attribution tickets for embedded players.
 //! - one module per role's messages: [`credential`], [`media_player`].
 
+pub mod audio;
 pub mod catalogue;
 pub mod client;
 pub mod credential;

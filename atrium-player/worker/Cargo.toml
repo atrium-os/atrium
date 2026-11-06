@@ -1,0 +1,20 @@
+[package]
+name        = "atrium-player-decode"
+version     = "0.1.0"
+edition.workspace = true
+license.workspace = true
+description = "atrium-player's decode worker: demux and decode in Capsicum capability mode (docs/spec/atrium-player.md §2)."
+publish     = false
+
+[[bin]]
+name = "atrium-player-decode"
+path = "src/main.rs"
+
+[dependencies]
+atrium-player       = { path = "../player" }
+atrium-media-demux  = { path = "../demux" }
+atrium-media-decode = { path = "../decode" }
+libc = "0.2"
+
+[dev-dependencies]
+md-5 = "0.10"

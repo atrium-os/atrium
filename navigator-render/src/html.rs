@@ -160,7 +160,7 @@ struct Cx<'a> {
     table_part: bool,
     /// Elements whose `display` is inline but which contain block-level
     /// content, computed once bottom-up (see `is_block_level`).
-    promoted: Vec<bool>,
+    promoted: std::rc::Rc<Vec<bool>>,
     /// ★ REVIEW TOOLING, off unless asked for: every block box, so a person
     /// can ask WHICH ELEMENT is where. The scene says what was painted; it
     /// cannot say which element painted it, and that is the question every
@@ -219,6 +219,11 @@ struct Cx<'a> {
     stop_unsafe: bool,
     /// ★ One band's run (backend §4.8 step 3, phase 2; `bands::Banded`).
     band: Option<BandRun>,
+    /// The boxes the pending list marker and text-indent belong to, and how
+    /// deep in trial layouts we are (a trial's first line places nothing).
+    marker_owner: Handle,
+    indent_owner: Handle,
+    trials: u32,
     /// The region a box has opened and `block` will close: the attributes
     /// to restore, its clip, its transform, and the content's x, y, width.
     scroll_open: Option<(crate::Attrs, u32, u32, (U, U, U))>,
@@ -437,6 +442,9 @@ pub(crate) struct BandRun {
     /// Where each block in plain flow began, with the line boxes before it
     /// (so a band continuing its container starts there directly).
     pub at: HashMap<Handle, U>,
+    /// The boxes whose first line some band placed (it took their list
+    /// marker and text-indent).
+    pub firsts: HashMap<Handle, u32>,
     /// In: the document's shaping cache, shared by its band runs.
     pub shape_cache: Option<crate::ShapeCache>,
     /// In: this band's checkpoint block.
@@ -468,7 +476,7 @@ pub(crate) struct BandRun {
 impl BandRun {
     pub(crate) fn new(k: u32) -> Self {
         BandRun { k, limit: None, cut_at: None, vector_budget: crate::path::DOCUMENT_SEGMENT_SHARE, canvas_h: 0,
-                  done: HashMap::new(), lines_before: HashMap::new(), finals: HashMap::new(), fired: None, skips: 0, resume_path: Default::default(), at: HashMap::new(), resume_at: None, shape_cache: None, spanning: vec![], completed_spans: vec![], suppressed: 0, root_h: 0, keys: vec![] }
+                  done: HashMap::new(), lines_before: HashMap::new(), finals: HashMap::new(), fired: None, skips: 0, resume_path: Default::default(), at: HashMap::new(), resume_at: None, shape_cache: None, firsts: Default::default(), spanning: vec![], completed_spans: vec![], suppressed: 0, root_h: 0, keys: vec![] }
     }
 }
 
@@ -490,12 +498,25 @@ pub struct Prepared {
     dom: Dom,
     styles: Vec<Option<std::rc::Rc<Style>>>,
     diagnostics: Vec<Diagnostic>,
-    promoted: Vec<bool>,
+    promoted: std::rc::Rc<Vec<bool>>,
 }
 
 impl Prepared {
     /// Nodes in the document (elements, text, …), for progress estimates.
     pub fn node_count(&self) -> usize { self.dom.nodes.len() }
+
+    /// `h` and its ancestors' tags, innermost first (for review tooling).
+    pub fn describe(&self, h: Handle) -> String {
+        let mut out = vec![];
+        let mut p = Some(h);
+        while let Some(x) = p {
+            let n = self.dom.get(x).map(|n| n.children.len()).unwrap_or(0);
+            out.push(format!("{}[{} children, index {}]", self.dom.tag(x).unwrap_or("#"), n,
+                self.dom.get(x).and_then(|n| n.parent).and_then(|q| self.dom.get(q)).and_then(|q| q.children.iter().position(|c| *c == x)).unwrap_or(0)));
+            p = self.dom.get(x).and_then(|n| n.parent);
+        }
+        out.join(" < ")
+    }
 
     /// The elements `h` is inside.
     pub(crate) fn ancestors(&self, h: Handle) -> std::collections::HashSet<Handle> {
@@ -544,7 +565,7 @@ pub fn prepare(html: &str, fonts: &FontSet, env: &Env) -> Prepared {
     let styled = cascade(&dom, &sheets, env);
     diagnostics.extend(styled.diagnostics);
     let promoted = promote_block_in_inline(&dom, &styled.styles);
-    Prepared { dom, styles: styled.styles, diagnostics, promoted }
+    Prepared { dom, styles: styled.styles, diagnostics, promoted: std::rc::Rc::new(promoted) }
 }
 
 /// Lay a prepared document out: whole, to the first-screen limit
@@ -552,12 +573,14 @@ pub fn prepare(html: &str, fonts: &FontSet, env: &Env) -> Prepared {
 fn lay_out(p: &Prepared, fonts: &FontSet, env: &Env, subs: &Subresources, geo: bool, band: Option<BandRun>) -> (HtmlOut, Option<GeoLog>, bool, Option<BandRun>) {
     let dom = &p.dom;
     let styles: &[Option<std::rc::Rc<Style>>] = &p.styles;
-    let mut diagnostics = p.diagnostics.clone();
+    // (A band run reports no diagnostics: the document's are the whole
+    // layout's, and copying them per band cost the document's size.)
+    let mut diagnostics = if band.is_some() { vec![] } else { p.diagnostics.clone() };
     let sh = match band.as_ref().and_then(|b| b.shape_cache.clone()) { Some(c) => Shaper::with_cache(fonts, c), None => Shaper::new(fonts) };
     let mut cx = Cx { dom, styles, sh, scene: Scene { width: u(env.width_px), ..Default::default() },
-                      report: Report::default(), links: vec![], unimplemented: BTreeMap::new(), marker: None, baseline_probe: None, indent: None, iso_paths: vec![vec![]], iso_cur: 0, content_dy: 0, table_part: false, promoted: vec![], boxes: std::env::var_os("NSG_DUMP_BOXES").map(|_| vec![]), geo: None, inl_cur: 0,
+                      report: Report::default(), links: vec![], unimplemented: BTreeMap::new(), marker: None, baseline_probe: None, indent: None, iso_paths: vec![vec![]], iso_cur: 0, content_dy: 0, table_part: false, promoted: Default::default(), boxes: std::env::var_os("NSG_DUMP_BOXES").map(|_| vec![]), geo: None, inl_cur: 0,
                       viewport: (u(env.width_px), Some(u(env.height_px))), pos_cb: (0, 0, u(env.width_px), Some(u(env.height_px))),
-                      subs, placing_abs: false, pending_abs: vec![], deferred_abs: vec![], cb_open: false, canvas_src: None, abs_origin: None, flex_static: None, measured: HashMap::new(), contexts: vec![], hoists: vec![], diagnostics: vec![], vector_budget: crate::path::DOCUMENT_SEGMENT_SHARE, in_scroll: false, scroll_open: None, measured_tables: HashMap::new(), scroll_table: None, stop_after: None, stop_ok: true, table_stop: None, truncated: false, stop_unsafe: false, band: None };
+                      subs, placing_abs: false, pending_abs: vec![], deferred_abs: vec![], cb_open: false, canvas_src: None, abs_origin: None, flex_static: None, measured: HashMap::new(), contexts: vec![], hoists: vec![], diagnostics: vec![], vector_budget: crate::path::DOCUMENT_SEGMENT_SHARE, in_scroll: false, scroll_open: None, measured_tables: HashMap::new(), scroll_table: None, stop_after: None, stop_ok: true, table_stop: None, truncated: false, stop_unsafe: false, band: None, marker_owner: Handle::MAX, indent_owner: Handle::MAX, trials: 0 };
     if geo { cx.geo = Some(GeoLog { inl_paths: vec![vec![]], ..Default::default() }) }
     cx.stop_after = STOP_AFTER.with(|c| c.get());
     if let Some(b) = band {
@@ -565,7 +588,7 @@ fn lay_out(p: &Prepared, fonts: &FontSet, env: &Env, subs: &Subresources, geo: b
         cx.band = Some(b);
     }
     cx.promoted = p.promoted.clone();
-    cx.count_unread_rows();
+    if cx.band.is_none() { cx.count_unread_rows() }
     // The root element is the initial containing block's only child.
     let root = dom.element_children(dom.root()).into_iter().next();
     // ★ THE CANVAS. The root's background paints the whole canvas, not the
@@ -649,9 +672,9 @@ pub fn premeasure_tables_at(html: &str, fonts: &FontSet, env: &Env) -> (String, 
     let styled = cascade(&dom, &sheets, env);
     let mut cx = Cx { dom: &dom, styles: &styled.styles, sh: Shaper::new(fonts), scene: Scene { width: u(env.width_px), ..Default::default() },
                       report: Report::default(), links: vec![], unimplemented: BTreeMap::new(), marker: None, baseline_probe: None,
-                      indent: None, iso_paths: vec![vec![]], iso_cur: 0, content_dy: 0, table_part: false, promoted: vec![], boxes: std::env::var_os("NSG_DUMP_BOXES").map(|_| vec![]), geo: None, inl_cur: 0, viewport: (u(env.width_px), Some(u(env.height_px))),
+                      indent: None, iso_paths: vec![vec![]], iso_cur: 0, content_dy: 0, table_part: false, promoted: Default::default(), boxes: std::env::var_os("NSG_DUMP_BOXES").map(|_| vec![]), geo: None, inl_cur: 0, viewport: (u(env.width_px), Some(u(env.height_px))),
                       pos_cb: (0, 0, u(env.width_px), Some(u(env.height_px))), subs: &Subresources::new(),
-                      placing_abs: false, pending_abs: vec![], deferred_abs: vec![], cb_open: false, canvas_src: None, abs_origin: None, flex_static: None, measured: HashMap::new(), contexts: vec![], hoists: vec![], diagnostics: vec![], vector_budget: crate::path::DOCUMENT_SEGMENT_SHARE, in_scroll: false, scroll_open: None, measured_tables: HashMap::new(), scroll_table: None, stop_after: None, stop_ok: true, table_stop: None, truncated: false, stop_unsafe: false, band: None };
+                      placing_abs: false, pending_abs: vec![], deferred_abs: vec![], cb_open: false, canvas_src: None, abs_origin: None, flex_static: None, measured: HashMap::new(), contexts: vec![], hoists: vec![], diagnostics: vec![], vector_budget: crate::path::DOCUMENT_SEGMENT_SHARE, in_scroll: false, scroll_open: None, measured_tables: HashMap::new(), scroll_table: None, stop_after: None, stop_ok: true, table_stop: None, truncated: false, stop_unsafe: false, band: None, marker_owner: Handle::MAX, indent_owner: Handle::MAX, trials: 0 };
     // (table, per-column (min, max), its first row's cells) for every table.
     let mut tables: Vec<(Handle, Vec<(U, U)>, Vec<Handle>)> = vec![];
     // ★ INNER TABLES FIRST: a cell holding a table is as wide as that
@@ -1162,6 +1185,7 @@ impl<'a> Cx<'a> {
             if let Some(t) = text {
                 let (st, line) = self.font_style(s);
                 self.marker = Some((t, st, line, kw(s, "list-style-position") == "outside"));
+                self.marker_owner = h;
             }
         }
         // ★ overflow: anything but `visible` clips this box's CONTENT and its
@@ -1242,6 +1266,7 @@ impl<'a> Cx<'a> {
         let content_w = (w - frame).max(0);
         // text-indent (inherited) applies to this container's first line.
         self.indent = len(s.get("text-indent"), content_w).filter(|v| *v != 0);
+        self.indent_owner = h;
         let mut cy = by + bt + pt + std::mem::take(&mut self.content_dy);
         let mut skipped_any = false;
         let skips0 = self.band.as_ref().map(|b| b.skips).unwrap_or(0);
@@ -1280,8 +1305,8 @@ impl<'a> Cx<'a> {
                                 kids.drain(..i);
                                 cy = y_at;
                                 if let Some(&(d, k0)) = b.lines_before.get(&kids[0]) { if k0 < b.k { cy += d } }
-                                self.indent = None;
-                                self.marker = None;
+                                if b.firsts.get(&self.indent_owner).is_some_and(|&k0| k0 < b.k) { self.indent = None }
+                                if b.firsts.get(&self.marker_owner).is_some_and(|&k0| k0 < b.k) { self.marker = None }
                                 skipped_any = true;
                                 b.skips += 1;
                             }
@@ -1305,8 +1330,10 @@ impl<'a> Cx<'a> {
                             if k0 < b.k && !inline.is_empty() {
                                 inline.clear();
                                 self.pending_abs.clear();
-                                self.indent = None;
-                                self.marker = None;
+                                // A first line an earlier band placed took
+                                // the indent and a list item's marker with it.
+                                if b.firsts.get(&self.indent_owner).is_some_and(|&k0| k0 < b.k) { self.indent = None }
+                                if b.firsts.get(&self.marker_owner).is_some_and(|&k0| k0 < b.k) { self.marker = None }
                                 cy += d;
                                 skipped_any = true;
                                 b.skips += 1;
@@ -1316,10 +1343,8 @@ impl<'a> Cx<'a> {
                             if k0 < b.k {
                                 inline.clear();
                                 self.pending_abs.clear();
-                                // The first line is behind us: its indent and
-                                // a list item's marker went with it.
-                                self.indent = None;
-                                self.marker = None;
+                                if b.firsts.get(&self.indent_owner).is_some_and(|&k0| k0 < b.k) { self.indent = None }
+                                if b.firsts.get(&self.marker_owner).is_some_and(|&k0| k0 < b.k) { self.marker = None }
                                 cy += d;
                                 skipped_any = true;
                                 b.skips += 1;
@@ -2098,7 +2123,9 @@ impl<'a> Cx<'a> {
     /// size must be the full layout's.
     fn measure(&mut self, h: Handle, cb_w: U, cb_h: Option<U>, force: (Option<U>, Option<U>)) -> U {
         let so = std::mem::replace(&mut self.stop_ok, false);
+        self.trials += 1;
         let r = self.measure_inner(h, cb_w, cb_h, force);
+        self.trials -= 1;
         self.stop_ok = so;
         r
     }
@@ -3744,6 +3771,12 @@ impl<'a> Cx<'a> {
         // A pending list marker: `inside` is the first inline item; `outside`
         // hangs left of the first line box, on its baseline.
         let mut outside_marker = None;
+        if self.trials == 0 {
+            if let Some(b) = self.band.as_mut() {
+                if self.marker.is_some() { b.firsts.entry(self.marker_owner).or_insert(b.k); }
+                if self.indent.is_some() { b.firsts.entry(self.indent_owner).or_insert(b.k); }
+            }
+        }
         if let Some((text, st, line, outside)) = self.marker.take() {
             if outside { outside_marker = Some((text, st)) }
             else { items.insert(0, Item::Space(st.clone(), line)); items.insert(0, Item::Word(text, st, line)) }
@@ -5656,9 +5689,9 @@ mod tests {
         let held_out: Vec<u8> = READ_ROWS.iter().copied().filter(|r| *r != 39).collect();
         let mut cx = Cx { dom: &dom, styles: &styled.styles, sh: Shaper::new(&fonts), scene: Scene::default(),
                           report: Report::default(), links: vec![], unimplemented: BTreeMap::new(), marker: None,
-                          baseline_probe: None, indent: None, iso_paths: vec![vec![]], iso_cur: 0, content_dy: 0, table_part: false, promoted: vec![], boxes: std::env::var_os("NSG_DUMP_BOXES").map(|_| vec![]), geo: None, inl_cur: 0,
+                          baseline_probe: None, indent: None, iso_paths: vec![vec![]], iso_cur: 0, content_dy: 0, table_part: false, promoted: Default::default(), boxes: std::env::var_os("NSG_DUMP_BOXES").map(|_| vec![]), geo: None, inl_cur: 0,
                           viewport: (0, None), pos_cb: (0, 0, 0, None), subs: &Subresources::new(),
-                          placing_abs: false, pending_abs: vec![], deferred_abs: vec![], cb_open: false, canvas_src: None, abs_origin: None, flex_static: None, measured: HashMap::new(), contexts: vec![], hoists: vec![], diagnostics: vec![], vector_budget: crate::path::DOCUMENT_SEGMENT_SHARE, in_scroll: false, scroll_open: None, measured_tables: HashMap::new(), scroll_table: None, stop_after: None, stop_ok: true, table_stop: None, truncated: false, stop_unsafe: false, band: None };
+                          placing_abs: false, pending_abs: vec![], deferred_abs: vec![], cb_open: false, canvas_src: None, abs_origin: None, flex_static: None, measured: HashMap::new(), contexts: vec![], hoists: vec![], diagnostics: vec![], vector_budget: crate::path::DOCUMENT_SEGMENT_SHARE, in_scroll: false, scroll_open: None, measured_tables: HashMap::new(), scroll_table: None, stop_after: None, stop_ok: true, table_stop: None, truncated: false, stop_unsafe: false, band: None, marker_owner: Handle::MAX, indent_owner: Handle::MAX, trials: 0 };
         cx.count_rows_outside(&held_out);
         // The non-initial value is counted once; the initial one is not.
         assert_eq!(cx.unimplemented.get("row text-align… (not implemented)"), Some(&1), "{:?}", cx.unimplemented);

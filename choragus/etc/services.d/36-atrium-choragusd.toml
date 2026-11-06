@@ -7,7 +7,9 @@
 # choragusd runs NON-ROOT (_choragus), one for the seat (decision 3): it gates
 # each stream on the active session itself. It sees no device. It:
 #   - binds one socket per audio capability under /atrium/sockets: audio/,
-#     audio-capture/, audio-monitor/, and audio-control/ for the volume UI.
+#     audio-capture/, audio-monitor/, audio-control/ for the volume UI, and
+#     audio-attribution/ where limend gets tickets for embedded players (only
+#     the uid given by --limen-uid; add it to argv once _limen exists).
 #     Portcullis mounts each directory only
 #     into jails holding that capability, so the socket caps what an app may
 #     ask for;
@@ -21,7 +23,7 @@
 #
 # REQUIRES (commission once per host; scripts/lyra-service.sh does all of it):
 #   1. The _choragus (65017) system user; 65017 in jaild.policy allowed_system_uids.
-#   2. `install -d -o _choragus -g _choragus -m 0755 /atrium/sockets/{audio,audio-capture,audio-monitor,audio-control}`,
+#   2. `install -d -o _choragus -g _choragus -m 0755 /atrium/sockets/{audio,audio-capture,audio-monitor,audio-control,audio-attribution}`,
 #      and `install -d -o _choragus -g _choragus -m 0700 /var/db/choragus`.
 #   3. /var/db/atrium and /var/run/atrium/app-registry in jaild.policy ro_paths;
 #      /var/db/choragus in rw_paths.

@@ -7,13 +7,14 @@ use std::time::Duration;
 
 use limen::catalogue::{self, SlotKind};
 use limen::client::{Child, Error, Parent};
-use limen::daemon::{serve, Compositor, Launcher, Shared};
+use limen::daemon::{serve, Attribution, Compositor, Launcher, Shared};
 use limen::proto::{refusal, ChildEvent, EmbedId, ParentEvent, WindowToken};
 
 const APP: u32 = 1001;
 const OTHER: u32 = 1002;
 const ARCA_UID: u32 = 900;
 const VIEWER_UID: u32 = 1500;
+const PLAYER_UID: u32 = 1600;
 const W_APP: WindowToken = [1; 16];
 const W_OTHER: WindowToken = [2; 16];
 const W_ARCA: WindowToken = [3; 16];
@@ -48,9 +49,9 @@ impl Fresco {
 struct Launch(mpsc::Sender<(EmbedId, UnixStream)>, Arc<Mutex<Vec<EmbedId>>>);
 impl Launcher for Launch {
     fn launch(&mut self, app: &str, embed: EmbedId, ch: UnixStream) -> Result<u32, String> {
-        assert_eq!(app, "org.example.viewer");
+        assert!(app == "org.example.viewer" || app == "org.example.player", "{app}");
         self.0.send((embed, ch)).unwrap();
-        Ok(VIEWER_UID)
+        Ok(if app == "org.example.player" { PLAYER_UID } else { VIEWER_UID })
     }
     fn end(&mut self, embed: EmbedId) { self.1.lock().unwrap().push(embed) }
 }
@@ -80,7 +81,11 @@ impl World {
             ARCA_UID => Some(("ana".into(), catalogue::ARCA.into())),
             _ => None,
         });
-        let defaults = Box::new(|_: &str, role: &str| (role == "doc-viewer").then(|| "org.example.viewer".to_string()));
+        let defaults = Box::new(|_: &str, role: &str| match role {
+            "doc-viewer" => Some("org.example.viewer".to_string()),
+            "media-player" => Some("org.example.player".to_string()),
+            _ => None,
+        });
         let shared = Shared::new(Box::new(fresco.clone()), Box::new(Launch(tx, ended.clone())), resolve, defaults);
         World { shared, fresco, launched: rx, ended }
     }
@@ -284,4 +289,43 @@ fn at_most_sixteen_embeds_per_parent() {
         app.request("credential", W_APP).unwrap();
     }
     assert_eq!(refused(app.request("credential", W_APP)), refusal::TOO_MANY);
+}
+
+/// choragusd: issues a ticket only for a parent that holds audio (APP).
+#[derive(Clone, Default)]
+struct Tickets(Arc<Mutex<(Vec<(u32, u32)>, Vec<[u8; 16]>)>>);
+impl Attribution for Tickets {
+    fn issue(&mut self, child: u32, parent: u32) -> Option<[u8; 16]> {
+        self.0.lock().unwrap().0.push((child, parent));
+        (parent == APP).then_some([child as u8; 16])
+    }
+    fn cancel(&mut self, t: [u8; 16]) { self.0.lock().unwrap().1.push(t) }
+}
+
+#[test]
+fn an_embedded_player_gets_an_audio_ticket_that_dies_with_the_embed() {
+    let w = World::new();
+    let tickets = Tickets::default();
+    w.shared.set_attribution(Box::new(tickets.clone()));
+    let mut app = w.parent(APP);
+    let e = app.request("media-player", W_APP).unwrap();
+    let (_, mut player) = w.spawned();
+    assert!(matches!(next_c(&mut player), ChildEvent::Attach { embed, .. } if embed == e));
+    assert_eq!(next_c(&mut player), ChildEvent::AudioTicket { embed: e, ticket: [PLAYER_UID as u8; 16] });
+    // Asked for the player's uid (from limend's own launch) under the parent's.
+    assert_eq!(tickets.0.lock().unwrap().0, vec![(PLAYER_UID, APP)]);
+    app.detach(e).unwrap();
+    assert_eq!(tickets.0.lock().unwrap().1, vec![[PLAYER_UID as u8; 16]], "cancelled when the embed ends");
+
+    // A parent choragusd refuses (no audio): the player gets no ticket.
+    let mut other = w.parent(OTHER);
+    let e = other.request("media-player", W_OTHER).unwrap();
+    let (_, mut player) = w.spawned();
+    assert!(matches!(next_c(&mut player), ChildEvent::Attach { .. }));
+    other.detach(e).unwrap();
+    assert_eq!(next_c(&mut player), ChildEvent::Detaching { embed: e }, "no AudioTicket in between");
+    // Roles that don't play sound never ask.
+    let _ = app.request("doc-viewer", W_APP).unwrap();
+    let _ = w.spawned();
+    assert_eq!(tickets.0.lock().unwrap().0.len(), 2);
 }

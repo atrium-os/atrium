@@ -27,6 +27,7 @@ fn page(n: usize) -> String {
         header { position: fixed; top: 0px; left: 0px; width: 800px; height: 24px; background-color: #222244; color: #ffffff }
         h2 { margin: 12px 0px; color: #333366 }
         ol { margin: 0px 0px 10px; padding-left: 30px }
+        .anchor { height: 0px }
         </style></head><body><h2>Title</h2><div class="wrap"><div class="note">A positioned note</div>"#);
     for s in 0..n {
         b.push_str(&format!("<section><h2>Section {s}</h2>"));
@@ -34,7 +35,7 @@ fn page(n: usize) -> String {
             match i {
                 2 => b.push_str(&format!(r#"<div class="card"><div>Left {s}.{i}</div><div>Right side {s}.{i} with more words in it</div></div>"#)),
                 4 => b.push_str(&format!(r#"<div class="lift">Lifted {s}.{i}: a box that sits above its place, with a shadow below it.</div>"#)),
-                6 => b.push_str(&format!("<ol><li>First item {s}</li><li>Second item {s}, long enough to wrap onto a second line of text in the list.</li><li>Third</li></ol>")),
+                6 => b.push_str(&format!("<ol><li>First item {s}</li><li>Second item {s}, long enough to wrap onto a second line of text in the list.</li><li>Third</li><li><div class=\"anchor\"></div><p>Fourth {s}: a list item whose first child is an empty block, so its marker waits for this line.</p></li></ol>")),
                 7 => b.push_str(&format!(r#"<div class="inner"><p>Inner {s}.{i} one.</p><p>Inner {s}.{i} two, a little longer than the first one is.</p></div>"#)),
                 _ => b.push_str(&format!("<p>Paragraph {s}.{i}: the quick brown fox jumps over the lazy dog, again and again, until the line wraps at least once here.</p>")),
             }
@@ -170,4 +171,22 @@ fn a_page_that_fits_is_one_band() {
     b.ensure(0);
     let full = render_html(doc, &fonts, &env).scene;
     assert_eq!(nsg::write(&b.composite(0).unwrap(), &fonts), nsg::write(&full, &fonts));
+}
+
+#[test]
+fn list_markers_survive_a_cut_before_the_first_line() {
+    // whatwg's algorithm steps: `<li>` then white space, then the step's
+    // `<p>`. A band cut before that `<p>` must leave the item's marker for
+    // the line it begins — in the band's first run and when laid out again.
+    let mut doc = String::from("<html><head><style>body { margin: 8px } p { margin: 0px 0px 6px } ol { padding-left: 40px } li { padding-top: 14px }</style></head><body><ol>");
+    for i in 0..80 {
+        doc.push_str(&format!("<li>\n  <p>Step {i}: if the input is a range, then take the first part of it and go on with the next step.</p>"));
+        if i % 9 == 4 { doc.push_str("<ol><li><p>A nested step.</p></li><li><div></div><p>Another, after an empty block.</p></li></ol>") }
+        doc.push_str("</li>");
+    }
+    doc.push_str("</ol></body></html>");
+    for band in [60, 97, 150, 211, 333] {
+        let (n, _) = check_every_band(&doc, band);
+        assert!(n > 12, "{n} bands at {band} px");
+    }
 }

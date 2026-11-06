@@ -9,6 +9,8 @@
 //! - `LIMEN_ARCA_UID`: the uid of arca-ui, the `credential` provider
 //!   (default 65021, `_arca-ui`); only it may provide that role.
 //! - `LIMEN_USER`: limend's user name as worker rules name it (default `_limen`).
+//! - `LIMEN_CHORAGUS`: choragusd's attribution socket, for embedded players'
+//!   audio tickets (default /atrium/sockets/audio-attribution/audio-attribution.sock).
 //!
 //! User-role children start through portcullisd's `ExecInstance`
 //! ([`limen::launch`]). Slots are bound with frescod's slot op on its
@@ -39,6 +41,8 @@ fn main() -> std::io::Result<()> {
     // arca-ui, the credential provider, is a system service (`_arca-ui`),
     // not a registry app.
     shared.set_system_uid(limen::catalogue::ARCA, arca_uid);
+    shared.set_attribution(Box::new(limen::audio::Choragus::new(
+        std::env::var("LIMEN_CHORAGUS").unwrap_or_else(|_| limen::audio::DEFAULT_SOCKET.into()))));
     let _ = std::fs::remove_file(&path);
     let listener = UnixListener::bind(&path)?;
     eprintln!("limend: listening on {path}");

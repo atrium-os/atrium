@@ -1,6 +1,6 @@
 //! scroll_bench <normalized.html> [--hz 60|120] [--pattern fling|flings|page|jump|pergola] [--secs N]
 //!              [--scale 1|2] [--csv out.csv] [--inject-stall MS@T]
-//!              [--compose full|strip] [--fast PX_PER_S] [--blur] [--bands]
+//!              [--compose full|strip] [--fast PX_PER_S] [--blur] [--bands] [--source]
 //!
 //! ★ THE SCROLL HARNESS (backend §4.8, step 2): what scrolling a document
 //! costs, frame by frame, with the TAIL and the TIMELINE reported — not just
@@ -36,6 +36,17 @@
 //! `--inject-stall MS@T`: the frame starting at or after T ms takes MS ms
 //! longer — the POSITIVE CONTROL: a harness that reports no stalls must be
 //! shown to report one it was given (and its catch-up).
+//!
+//! `--source`: the content comes from bands (`source::DocumentSource`, the
+//! worker's content source, bands at one viewport, one viewport of
+//! prefetch). The source runs on its OWN clock, as the worker is its own
+//! process: each vsync it is free it gets a `want` for the target's range
+//! (or, when the range has not changed, two bands of idle work), and what
+//! it laid out is ready when that work ends. A vsync whose shown rows are
+//! not all in ready bands shows placeholders (pergola.md §10.1): counted as
+//! shown for frame rate, not for lag — the gate is that real content
+//! replaces them within 100 ms of the scroll settling. The compositor still
+//! draws the whole layout's nodes there (a placeholder would cost less).
 //!
 //! Output: one summary block (TSV-friendly `key value` lines), and with
 //! `--csv` one row per vsync: `t_ms target_y shown_y age_ms cost_ms missed`.
@@ -406,6 +417,30 @@ fn main() {
         c.index = Some(navigator_render::bands::index(&nsg, (vh as i64) * PX));
         println!("bands\tindex_ms {:.0}\tbands {}", t.elapsed().as_secs_f64() * 1e3, c.index.as_ref().unwrap().bands.len());
     }
+    // ---- The content source (`--source`). ----
+    let source_on = args.iter().any(|a| a == "--source");
+    // `--no-background`: the source lays out only what is wanted.
+    let background_off = args.iter().any(|a| a == "--no-background");
+    struct Sink;
+    impl navigator_render::source::SceneSink for Sink {
+        fn put(&mut self, _: navigator_render::source::GroupId, _: Option<(i64, i64)>, _: &navigator_render::Scene) {}
+        fn clear(&mut self, _: navigator_render::source::GroupId) {}
+    }
+    let t = Instant::now();
+    let mut src = source_on.then(|| navigator_render::source::DocumentSource::new(html.clone(), &fonts, Default::default(), (vw, vh), (vh as i64) * PX));
+    let mut ready: HashMap<u32, f64> = HashMap::new();
+    let (mut worker_free, mut last_range) = (0.0f64, None::<(i64, i64)>);
+    let mut worker_ms: Vec<f64> = vec![];
+    let (mut placeholder_frames, mut settled_since, mut content_lags) = (0usize, None::<f64>, Vec::<(f64, f64)>::new());
+    let mut lag_open: Option<f64> = None;
+    if let Some(sr) = src.as_mut() {
+        // The first screen, before first display (as the worker answers it).
+        for e in navigator_render::source::ContentSource::want(sr, navigator_render::source::Want { range: (0, (vh as i64) * PX), zoom_64: 64, prefetch: (vh as i64) * PX }, &mut Sink) {
+            if let navigator_render::source::Event::BandReady { band, .. } = e { ready.insert(band, 0.0); }
+        }
+        println!("source	first_screen_ms {:.0}", t.elapsed().as_secs_f64() * 1e3);
+        last_range = Some((0, (vh as i64) * PX));
+    }
     // ---- The replay. ----
     let period = 1000.0 / hz;
     let mut swipes = (pattern == "pergola").then(|| PergolaSwipes::new(max_y));
@@ -422,6 +457,49 @@ fn main() {
         let t = k as f64 * period;
         if let Some((at, y, sampled)) = pending { if at <= t + 1e-9 { shown_y = y; shown_sampled = sampled; pending = None } }
         let goal = match swipes.as_mut() { Some(s) => s.at(t), None => target(&pattern, t, max_y, vh) };
+        if let Some(sr) = src.as_mut() {
+            use navigator_render::source::{ContentSource, Event, Want};
+            // The worker, on its own clock.
+            if worker_free <= t + 1e-9 {
+                let range = ((goal as i64).max(0), goal as i64 + (vh as i64) * PX);
+                let s0 = Instant::now();
+                let ev = if last_range != Some(range) { last_range = Some(range); sr.want(Want { range, zoom_64: 64, prefetch: (vh as i64) * PX }, &mut Sink) }
+                         else { sr.idle(2, &mut Sink) };
+                let mut ev = ev;
+                let mut ms = s0.elapsed().as_secs_f64() * 1e3;
+                worker_ms.push(ms);
+                // The rest of the period: the first pass, in the background
+                // (decision 2), one band at a time.
+                if !background_off {
+                    while ms < period && !sr.banded().settled() {
+                        let s1 = Instant::now();
+                        ev.extend(sr.idle(1, &mut Sink));
+                        ms += s1.elapsed().as_secs_f64() * 1e3;
+                    }
+                }
+                worker_free = t + ms;
+                for e in ev {
+                    match e {
+                        Event::BandReady { band, .. } | Event::BandUpdated { band, .. } => { ready.insert(band, t + ms); }
+                        Event::BandEvicted { band } => { ready.remove(&band); }
+                        _ => {}
+                    }
+                }
+            }
+            // What is shown: real content only where every band is ready.
+            let (a, b) = (shown_y as i64, shown_y as i64 + (vh as i64) * PX);
+            let bd = sr.banded();
+            let covered = bd.bands.iter().enumerate().filter(|(_, x)| x.range.1 > a && x.range.0 < b).all(|(k, _)| ready.get(&(k as u32)).is_some_and(|&r| r <= t))
+                && (bd.complete || bd.bands.last().is_some_and(|x| x.range.1 >= b));
+            if !covered { placeholder_frames += 1 }
+            let still = (goal - prev_goal).abs() <= 0.5 && (goal - shown_y).abs() <= 0.5;
+            if still { settled_since.get_or_insert(t); } else { settled_since = None }
+            match (covered, settled_since, lag_open) {
+                (false, Some(s0), None) => lag_open = Some(s0),
+                (true, _, Some(s0)) => { content_lags.push((s0, t - s0)); lag_open = None }
+                _ => {}
+            }
+        }
         let mut cost = 0.0;
         let busy = free_at > t + 1e-9;
         if !busy {
@@ -509,6 +587,15 @@ fn main() {
     }).fold((0.0, 0.0), |m, x| if x.0 > m.0 { x } else { m });
     let max_age = rows.iter().map(|r| r.3).fold(0.0, f64::max);
     let max_lag_px = rows.iter().map(|r| (r.1 - r.2).abs()).fold(0.0, f64::max);
+    if src.is_some() {
+        if let Some(s0) = lag_open { content_lags.push((s0, rows.last().map(|r| r.0).unwrap_or(0.0) - s0)) }
+        let worst = content_lags.iter().map(|l| l.1).fold(0.0, f64::max);
+        let over = content_lags.iter().filter(|l| l.1 > 100.0).count();
+        let mut w = worker_ms.clone();
+        println!("source\tplaceholder_frames {placeholder_frames}\tcontent_after_settle_worst_ms {worst:.0}\tover_100ms {over}\tworker_ms p50 {:.2} p99 {:.2} max {:.1}\tbands {}\tsettled {}",
+                 q(&mut w, 0.5), q(&mut w, 0.99), q(&mut w, 1.0), src.as_ref().unwrap().banded().laid_out(), src.as_ref().unwrap().banded().settled() as u8);
+        for (s0, l) in content_lags.iter().filter(|l| l.1 > 100.0).take(5) { println!("content_stall\tsettled_at {s0:.0}\twaited {l:.0}") }
+    }
     println!("doc\t{}", args[0]);
     println!("pattern\t{pattern}\thz\t{hz}\tsecs\t{secs}\tscale\t{scale}");
     println!("scene\tnodes {}\textent_px {}\tfirst_display_ms {first_ms:.0}", nsg.order.len(), nsg.height / PX);

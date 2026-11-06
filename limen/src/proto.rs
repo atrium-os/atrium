@@ -117,4 +117,9 @@ pub enum ChildEvent {
     Resumed { embed: EmbedId },
     /// The parent is gone or detached it: stop, the jail ends shortly.
     Detaching { embed: EmbedId },
+    /// Right after `Attach`, for a role that plays sound (`media-player`):
+    /// choragusd's attribution ticket. The child puts it in its Lyra `Hello`
+    /// and its streams count as the parent's; there is none when the parent
+    /// doesn't hold `audio` (lyra-v1.md §4). It dies with the embed.
+    AudioTicket { embed: EmbedId, ticket: [u8; 16] },
 }

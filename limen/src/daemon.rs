@@ -45,6 +45,16 @@ pub trait Launcher: Send {
     fn end(&mut self, embed: EmbedId);
 }
 
+/// choragusd's attribution tickets (lyra-v1.md §4): an embedded player plays
+/// as its parent, and only if the parent holds `audio`.
+pub trait Attribution: Send {
+    /// A ticket for the instance running as `child_uid` to play for the app
+    /// with `parent_uid`, or `None` (refused, or choragusd isn't there).
+    fn issue(&mut self, child_uid: u32, parent_uid: u32) -> Option<[u8; 16]>;
+    /// The embed ended.
+    fn cancel(&mut self, ticket: [u8; 16]);
+}
+
 /// uid → (user, app id), from the launch registry.
 pub type Resolve = Box<dyn Fn(u32) -> Option<(String, String)> + Send + Sync>;
 /// (user, role) → the app that provides it (the user's default; limen.md §3.2).
@@ -61,6 +71,8 @@ struct Embed {
     /// Known once the child connects (spawned: at launch; system: the provider).
     child_uid: u32,
     spawned: bool,
+    /// choragusd's ticket, for a role that plays sound.
+    audio_ticket: Option<[u8; 16]>,
     child_window: Option<WindowToken>,
     rect: Option<[f32; 4]>,
     visible: bool,
@@ -119,6 +131,7 @@ pub struct Shared {
     /// System providers known by a fixed system uid rather than a registry
     /// app id (arca-ui runs as `_arca-ui`, not as a Portcullis app).
     system_uids: Mutex<HashMap<&'static str, u32>>,
+    attribution: Mutex<Option<Box<dyn Attribution>>>,
 }
 
 impl Shared {
@@ -134,6 +147,7 @@ impl Shared {
             resolve,
             defaults,
             system_uids: Mutex::new(HashMap::new()),
+            attribution: Mutex::new(None),
         })
     }
 
@@ -141,6 +155,12 @@ impl Shared {
     /// by `uid`, for a service that isn't a registry app.
     pub fn set_system_uid(&self, app: &'static str, uid: u32) {
         self.system_uids.lock().unwrap().insert(app, uid);
+    }
+
+    /// Where attribution tickets come from (choragusd). Without one, an
+    /// embedded player gets no ticket and so plays nothing.
+    pub fn set_attribution(&self, a: Box<dyn Attribution>) {
+        *self.attribution.lock().unwrap() = Some(a);
     }
 
     /// Live embeds (tests and logs).
@@ -284,12 +304,20 @@ fn request(shared: &Arc<Shared>, conn: ConnId, uid: u32, req: proto::Request) ->
             (id, child_uid, true)
         }
     };
+    // A player's ticket: choragusd checks the parent's `audio` grant. Only a
+    // spawned child, whose uid limend knows from its own launch.
+    let audio_ticket = (spawned && catalogue::AUDIO_ROLES.contains(&role.name))
+        .then(|| shared.attribution.lock().unwrap().as_mut().and_then(|a| a.issue(child_uid, uid)))
+        .flatten();
     let e = Embed {
-        role, parent: conn, parent_uid: uid, parent_window: req.window, child, child_uid, spawned,
+        role, parent: conn, parent_uid: uid, parent_window: req.window, child, child_uid, spawned, audio_ticket,
         child_window: None, rect: None, visible: true, bound: false, attached: false,
         to_child: Rate::default(), to_parent: Rate::default(),
     };
     st.to_child(&e, ChildEvent::Attach { embed, role: role.name.into(), parent_app: app, parent_uid: uid });
+    if let Some(ticket) = audio_ticket {
+        st.to_child(&e, ChildEvent::AudioTicket { embed, ticket });
+    }
     st.embeds.insert(embed, e);
     Ok(Reply::Embed { embed })
 }
@@ -423,6 +451,11 @@ fn end(shared: &Arc<Shared>, st: &State, embed: EmbedId, e: Embed, tell_parent: 
         }
     }
     st.to_child(&e, ChildEvent::Detaching { embed });
+    if let Some(t) = e.audio_ticket {
+        if let Some(a) = shared.attribution.lock().unwrap().as_mut() {
+            a.cancel(t);
+        }
+    }
     if tell_parent {
         st.to_parent(&e, ParentEvent::Detached { embed });
     }

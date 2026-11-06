@@ -197,6 +197,31 @@ M0 to M3 start now and wait on nothing. A headless `atrium-player --sink=hash` p
 end to end and prints per-frame hashes and timing, so the whole pipeline is tested before
 Fresco's layers land.
 
+**As built (2026-11-06), in `atrium-player/` (its own cargo workspace):**
+- M0 (48caf43): `limen::media_player`, the role's messages with a checked `decode` on both
+  sides. `CanPlay` became a query and an answer, and `Playing`/`Paused` were added
+  (limen.md §2.2 updated).
+- M1 (b5ffd58): `demux/` (`atrium-media-demux`), push parsers for WebM and MP4 (plain and
+  fragmented) with `#![forbid(unsafe_code)]`. A plain MP4 whose `moov` comes last asks the
+  driver for an offset. Seeks use WebM cues and the MP4 sample table. `fuzz/` has cargo-fuzz
+  targets for both.
+- M2 (fd41298): `decode/` (`atrium-media-decode`). Each library sits behind a C shim
+  (`decode/shim/`) compiled against its real headers, so no struct layout is copied into
+  Rust. One `unsafe` FFI module, and safe NV12/P010 conversion.
+- M3 (a3f567f): `player/` (`atrium-player`, the supervisor, which links no decoder) and
+  `worker/` (`atrium-player-decode`). The wire is framed postcard with descriptors from the
+  supervisor, and fixed 32-byte records back. Layer buffers and the PCM ring are shared
+  memory. The worker announces the video track only after decoding its first picture, so
+  the bit depth (NV12 or P010) is known before buffers are made. `atrium-player --headless`
+  plays a file or a feed and prints frame hashes.
+- Test clips and reference hashes are made by `scripts/media-test-clips.sh` into
+  `test-assets/media/` (ffmpeg, a dev tool). Every clip's decoded frames, and what lands in
+  the layer buffers, match ffmpeg's `framemd5` exactly.
+- Known gaps: a WebM with its Cues at the end can only seek within what is read ahead,
+  otherwise it reads again from the start and drops frames up to the target (reading Cues
+  through the SeekHead is an M7 item). Descriptor rights inside the sandbox
+  (`cap_rights_limit`) are not narrowed yet.
+
 **Tests along the way:**
 - every demuxer limit has a test with a crafted file that exceeds it;
 - fuzzing runs on each demuxer and on the worker's whole input path for a fixed time in CI;

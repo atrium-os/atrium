@@ -10,6 +10,8 @@ pub const CAP_MICROPHONE: u8 = 2;
 pub const CAP_MONITOR: u8 = 4;
 /// The volume UI: other apps' levels, the master, the output. No samples.
 pub const CAP_CONTROL: u8 = 8;
+/// Not a grant: marks limend's attribution socket among the listeners.
+pub const CAP_ATTRIBUTION: u8 = 0x80;
 
 /// Human-readable names of the set capability bits, for logs.
 pub fn cap_names(bits: u8) -> Vec<&'static str> {
