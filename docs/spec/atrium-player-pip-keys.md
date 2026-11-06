@@ -201,6 +201,37 @@ screen is public. Controls work without unlocking: play, pause, next, previous.
    intents, then limend's request path, then the player's button and small layout.
 5. **Lock screen** controls.
 
+## 6.1 As built: limend and Forum (2026-11-06)
+
+- **limend** (4a60909, 876e9aa): the child asks with op `PIP` (`Pip { embed, on,
+  aspect }`, `limen::client::Child::pip`). Going in needs the `media-player` role, a
+  bound (shown) slot, a sane aspect, and a press frescod routed to the child's *or the
+  parent's* window within `catalogue::PIP_GESTURE_MS` (1 s; frescod `slot::op::PRESSED`).
+  limend then unbinds with `keep_shown` and tells both sides with
+  `ParentEvent::Pip` / `ChildEvent::Pip` (from limend, so the parent can trust it). One
+  PiP at a time: a new one sends the last back. While in PiP the parent's `Place` and
+  `SetVisible` are kept but change nothing, so no `Suspended`. Going back rebinds at
+  the parent's last rect without a `Resumed`, or suspends if the slot is hidden by
+  then. Detach, a closed tab or a crashed child ends PiP with the embed.
+- **No forum-pip grant or `Intent::Pip`** (changed from §3.1 with the Fresco thread):
+  frescod reports a `keep_shown` child as `WmRole::Pip` in WM_ENUMERATE while it is
+  out of its slot (d5d73c2), so forum-wm places it without being told and limend's
+  unbind is the only authority. forum-wm puts it in the pip layer (above documents and
+  panels, below chrome, HUD and dialogs) at the user's corner, a quarter of the work
+  area wide at its own aspect, at least 160×90, over zoom and snap too.
+  `Intent::PipCorner { corner }` moves it (a drag that ends near a corner asks for
+  that one, `nearest_corner`). A click on it gives it keyboard focus, nothing else
+  does.
+- **Media keys** (forum-wm `media`): consumer-page usages arrive as key events with
+  `media::CONSUMER` (0x0C00) set on the usage. Play/Pause, Play, Pause, Stop, Next and
+  Previous go to choragusd as `ToMedia::Control` and never to the focused app.
+  forum-wm sends `ToMedia::Focused { app_id }` whenever focus moves to another app,
+  and again after choragusd restarts.
+- **forum-bar** shows now-playing: a note glyph, "title · app" (at most 36
+  characters), and play/pause when the session offers it. The `input.media_keys`
+  exception (a DAW gets the keys) is not built yet: it needs frescod to hand those
+  keys to the focused window when forum-wm says so.
+
 ## 7. Decisions (accepted 2026-11-06: all four as recommended)
 
 1. **Where the media-session registry lives.** *Recommend choragusd* (§4.1). The other

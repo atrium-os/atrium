@@ -105,7 +105,7 @@ fn resolve_focus(surfaces: &[WmSurfaceInfo], focus_intent: Option<u32>) -> u32 {
 
 /// App surfaces a person works in (what can be focused and moved).
 fn click_focusable_role(role: WmRole) -> bool {
-    matches!(role, WmRole::Document | WmRole::Dialog | WmRole::Panel)
+    matches!(role, WmRole::Document | WmRole::Dialog | WmRole::Panel | WmRole::Pip)
 }
 
 fn rect_for(screen: &Screen, role: WmRole) -> WmRect {
@@ -124,13 +124,9 @@ fn rect_for(screen: &Screen, role: WmRole) -> WmRect {
         WmRole::Hud | WmRole::Chrome => {
             WmRect { x: screen.rect.x, y: screen.rect.y, w: screen.rect.w, h: screen.bar_h }
         }
-        // Placeholder: a quarter of the work area wide, bottom right, at
-        // 16:9, until forum-wm's pip placement.
-        WmRole::Pip => {
-            let w = wa.w / 4;
-            let h = w * 9 / 16;
-            WmRect { x: wa.x + wa.w - w, y: wa.y + wa.h - h, w, h }
-        }
+        // The default corner and aspect; `Wm` places it by the player's
+        // aspect at the user's corner (`place_pip`).
+        WmRole::Pip => pip_rect(wa, (16, 9), forum_ctl::Corner::default()),
         // frescod's band for toasts (it clamps them there anyway).
         WmRole::Notification => {
             let top = (wa.y - screen.rect.y).max(0) as u32;
@@ -231,6 +227,21 @@ pub fn pip_rect(wa: WmRect, aspect: (u32, u32), corner: forum_ctl::Corner) -> Wm
         Corner::BottomLeft | Corner::BottomRight => wa.y + wa.h - PIP_MARGIN - h,
     };
     WmRect { x, y, w, h }
+}
+
+/// Put each picture-in-picture surface in `layout` at `corner`, sized by
+/// its own aspect (the size it asked for), in the pip layer. One that the
+/// arrangement left out (zoom, snap) is added: PiP stays up over them.
+pub fn place_pip(layout: &mut WmDeclareLayoutPayload, screen: &Screen, active: &[WmSurfaceInfo], corner: forum_ctl::Corner) {
+    let wa = screen.work_area();
+    for s in active.iter().filter(|s| s.role == WmRole::Pip) {
+        let aspect = (s.rect.w.max(0) as u32, s.rect.h.max(0) as u32);
+        let slot = WmSlot { surface_id: s.surface_id, rect: pip_rect(wa, aspect, corner), layer: PIP_LAYER };
+        match layout.slots.iter_mut().find(|x| x.surface_id == s.surface_id) {
+            Some(x) => *x = slot,
+            None => layout.slots.push(slot),
+        }
+    }
 }
 
 /// The corner nearest `(x, y)`: where a PiP drag that ends there snaps.
@@ -368,6 +379,8 @@ fn subtract(r: &WmRect, cut: &WmRect) -> Vec<WmRect> {
 /// scale <identity> <thousandths>
 /// set <identity>@<x>,<y>:<w>x<h> ... [mirror <identity>=<source> ...]
 /// ```
+pub mod media;
+
 pub mod displays {
     use fresco_protocol::{WmOutput, WmOutputPlacement};
     use std::collections::HashMap;
@@ -644,9 +657,9 @@ pub mod daemon {
     /// Roles a pointer click moves keyboard focus to. Clicking chrome (bar /
     /// dock / hud) or the wallpaper must NOT steal focus from the document the
     /// human is working in — only app surfaces (a document, a dialog, a side
-    /// panel) are focus targets.
+    /// panel, a PiP window for its keys) are focus targets.
     fn click_focusable(role: WmRole) -> bool {
-        matches!(role, WmRole::Document | WmRole::Dialog | WmRole::Panel)
+        matches!(role, WmRole::Document | WmRole::Dialog | WmRole::Panel | WmRole::Pip)
     }
 
     /// Resolve a pointer click on surface `clicked` to a focus change, if any.
@@ -752,6 +765,8 @@ pub mod daemon {
         pub snapped: HashMap<u32, Snap>,
         /// Where the picture-in-picture window sits (`Intent::PipCorner`).
         pub pip_corner: forum_ctl::Corner,
+        /// The focus of the layout declared last (0: none).
+        declared_focus: std::cell::Cell<u32>,
         /// The monitors (display 3.0), as frescod places them on the desktop.
         /// With fewer than two present the WM lays out on `screen` alone.
         pub outputs: Vec<WmOutput>,
@@ -798,6 +813,7 @@ pub mod daemon {
                 zoomed: None,
                 snapped: HashMap::new(),
                 pip_corner: forum_ctl::Corner::default(),
+                declared_focus: std::cell::Cell::new(0),
                 outputs: Vec::new(),
                 home: HashMap::new(),
                 top: RefCell::new(HashMap::new()),
@@ -1119,6 +1135,17 @@ pub mod daemon {
         /// (forum.md §2.3). Zoom on → that surface fills the screen, all else
         /// gates; zoom off → back to the arrangement. Returns the new zoom state.
         /// No-op (returns `false`) when there's no focusable surface.
+        /// The surface the last declared layout focused (0: none).
+        pub fn declared_focus(&self) -> u32 {
+            self.declared_focus.get()
+        }
+
+        /// The registry app id of `surface`'s owner.
+        pub fn app_of(&self, conn: &mut impl FrescoConn, surface: u32) -> Option<String> {
+            let s = conn.enumerate().ok()?.into_iter().find(|s| s.surface_id == surface)?;
+            self.registry.resolve(s.owner_uid).map(|(_, a)| a.to_string())
+        }
+
         /// Move the PiP window to `corner` and lay out again.
         pub fn set_pip_corner(&mut self, conn: &mut impl FrescoConn, corner: forum_ctl::Corner) -> io::Result<()> {
             self.pip_corner = corner;
@@ -1417,6 +1444,14 @@ pub mod daemon {
         fn layout_on(&self, screen: &Screen, active: &[WmSurfaceInfo], focus_intent: Option<u32>)
             -> WmDeclareLayoutPayload
         {
+            let mut l = self.layout_on_roles(screen, active, focus_intent);
+            crate::place_pip(&mut l, screen, active, self.pip_corner);
+            l
+        }
+
+        fn layout_on_roles(&self, screen: &Screen, active: &[WmSurfaceInfo], focus_intent: Option<u32>)
+            -> WmDeclareLayoutPayload
+        {
             // Zoom wins: the zoomed surface alone fills the whole screen.
             if let Some(zid) = self.zoomed.filter(|z| active.iter().any(|s| s.surface_id == *z)) {
                 return WmDeclareLayoutPayload {
@@ -1451,6 +1486,7 @@ pub mod daemon {
             let mut layout = self.layout_active(&active);
             layout.focus_cause = self.focus_cause.take();
             conn.declare_layout(&layout)?;
+            self.declared_focus.set(layout.focus);
 
             let placed: HashSet<u32> = layout.slots.iter().map(|s| s.surface_id).collect();
             let mut decisions = rendering_decisions(&layout); // occlusion among placed
@@ -2561,6 +2597,22 @@ mod pip_tests {
         // Above documents and panels, below chrome, HUDs and dialogs.
         assert!(PIP_LAYER < layer(WmRole::Panel) && PIP_LAYER < DOC_FOCUSED);
         assert!(PIP_LAYER > layer(WmRole::Chrome) && PIP_LAYER > layer(WmRole::Dialog) && PIP_LAYER > layer(WmRole::Hud));
+    }
+
+    #[test]
+    fn a_pip_surface_is_placed_at_the_users_corner_and_never_focused() {
+        let screen = Screen { rect: WmRect { x: 0, y: 0, w: 1920, h: 1080 }, bar_h: 24, dock_h: 48 };
+        let surf = |id, role, w, h| WmSurfaceInfo { surface_id: id, owner_app: String::new(), owner_uid: 0, role, rect: WmRect { x: 0, y: 0, w, h } };
+        let active = [surf(1, WmRole::Document, 0, 0), surf(7, WmRole::Pip, 640, 480)];
+        let mut l = arrange(&screen, &active, None);
+        place_pip(&mut l, &screen, &active, Corner::TopLeft);
+        let p = l.slots.iter().find(|s| s.surface_id == 7).unwrap();
+        assert_eq!(p.layer, PIP_LAYER);
+        let wa = screen.work_area();
+        assert_eq!((p.rect.x, p.rect.y), (wa.x + PIP_MARGIN, wa.y + PIP_MARGIN));
+        assert_eq!(p.rect.w * 3, p.rect.h * 4, "its own 4:3");
+        assert_eq!(l.focus, 1, "keyboard focus stays with the document until the PiP is clicked");
+        assert!(click_focusable_role(WmRole::Pip), "a click gives it focus (for its keys)");
     }
 }
 
