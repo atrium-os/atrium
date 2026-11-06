@@ -154,7 +154,7 @@ pub type Attrs = (Option<u32>, Option<u32>, Option<u32>);
 pub const XF_ONE: i64 = 65536;
 pub type Xform = [i64; 6];
 
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
 pub struct Scene {
     pub width: U,
     pub height: U,

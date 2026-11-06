@@ -84,7 +84,7 @@ pub struct DocumentSource<'f> {
     doc: Banded<'f>,
     /// Bands whose groups are in the window, with what their group was
     /// built from (so a change is noticed and sent as `band_updated`).
-    resident: BTreeMap<usize, Vec<(usize, usize, usize)>>,
+    resident: BTreeMap<usize, (Vec<(usize, usize, usize)>, u64)>,
     last_extent: Option<(U, bool)>,
     overlay_sig: Option<(usize, u64)>,
     last_want: Option<Want>,
@@ -92,6 +92,10 @@ pub struct DocumentSource<'f> {
     /// not reached it: (its id, its range).
     prov: Option<(u32, (U, U))>,
     prov_seq: u32,
+    /// The band the last `replace` laid out again from (`None`: nothing).
+    replaced_from: Option<usize>,
+    /// The state the last `replace` replaced: its normalized text, prepared.
+    previous: Option<(String, crate::html::Prepared)>,
 }
 
 /// Provisional bands' ids: `PROVISIONAL | n`, apart from exact bands'.
@@ -103,7 +107,7 @@ impl<'f> DocumentSource<'f> {
     pub fn new(html: String, fonts: &'f FontSet, subs: Subresources, window: (f64, f64), band_h: U) -> Self {
         let doc = Banded::new(&html, fonts, &Env::zoomed(window.0, window.1, 64), &subs, band_h);
         DocumentSource { html, fonts, subs, window, zoom_64: 64, dark: false, band_h, doc, resident: BTreeMap::new(),
-                         last_extent: None, overlay_sig: None, last_want: None, prov: None, prov_seq: 0 }
+                         last_extent: None, overlay_sig: None, last_want: None, prov: None, prov_seq: 0, replaced_from: None, previous: None }
     }
 
     /// The reader's dark appearance, so a page's `prefers-color-scheme: dark`
@@ -122,8 +126,150 @@ impl<'f> DocumentSource<'f> {
     /// The layout state (for measurement and checks).
     pub fn banded(&self) -> &Banded<'f> { &self.doc }
 
+    /// The band the last `replace` laid out again from (`None`: the change
+    /// made no difference the layout can see).
+    pub fn replaced_from(&self) -> Option<usize> { self.replaced_from }
+
+    /// The state the last `replace` replaced (its normalized text, and that
+    /// prepared at this zoom), once: a caller keeping laid-out states (the
+    /// worker's, for going back) takes it.
+    pub fn take_previous(&mut self) -> Option<(String, crate::html::Prepared)> { self.previous.take() }
+
+    /// The zoom this source lays out at (64 = 100%).
+    pub fn zoom_64(&self) -> u32 { self.zoom_64 }
+
+    /// Whether it lays out in the dark appearance (`with_dark`).
+    pub fn dark(&self) -> bool { self.dark }
+
     /// The bands resident now.
     pub fn resident(&self) -> Vec<usize> { self.resident.keys().copied().collect() }
+
+    /// ★ THE DOCUMENT CHANGED (backend §4.3, replay part 2): `html` is its
+    /// new normalized state, and `prep` that state prepared at this
+    /// source's zoom when the caller already has it. The layout is redone
+    /// only from the checkpoint above the first change (`Banded::replace`),
+    /// the window is brought up to date with the last `want`, and a band is
+    /// sent again only if what it shows changed: `band_updated` names
+    /// exactly the bands whose range or scene differ.
+    pub fn replace(&mut self, html: String, prep: Option<crate::html::Prepared>, sink: &mut dyn SceneSink) -> Vec<Event> {
+        let mut ev = vec![];
+        let prep = prep.unwrap_or_else(|| crate::html::prepare(&html, self.fonts, &self.env(self.zoom_64)));
+        let shown = self.shown();
+        let old_html = std::mem::take(&mut self.html);
+        let (from, old) = self.doc.replace_keeping(prep);
+        self.replaced_from = from;
+        self.previous = old.map(|p| (old_html, p));
+        self.html = html;
+        if self.replaced_from.is_none() { return ev }
+        self.drop_prov(sink, &mut ev);
+        self.resync(shown, sink, &mut ev);
+        ev
+    }
+
+    /// A source on a document already prepared at `zoom_64` (and the
+    /// appearance `dark`: `with_dark`).
+    pub fn from_prepared(html: String, prep: crate::html::Prepared, fonts: &'f FontSet, subs: Subresources, window: (f64, f64), band_h: U, zoom_64: u32, dark: bool) -> Self {
+        let doc = Banded::from_prepared(prep, fonts, &Env { dark, ..Env::zoomed(window.0, window.1, zoom_64) }, &subs, band_h);
+        DocumentSource { html, fonts, subs, window, zoom_64, dark, band_h, doc, resident: BTreeMap::new(),
+                         last_extent: None, overlay_sig: None, last_want: None, prov: None, prov_seq: 0, replaced_from: None, previous: None }
+    }
+
+    /// Lay out what `w` would show, sending nothing (a state laid out
+    /// ahead, to be swapped in by `swap_in`).
+    pub fn prime(&mut self, w: Want) {
+        struct Null;
+        impl SceneSink for Null { fn put(&mut self, _: GroupId, _: Option<(U, U)>, _: &Scene) {} fn clear(&mut self, _: GroupId) {} }
+        let _ = self.want(w, &mut Null);
+    }
+
+    /// The size of its normalized text (memory accounting).
+    pub fn html_len(&self) -> usize { self.html.len() }
+
+    /// The last `want` (the view's place).
+    pub fn last_want(&self) -> Option<Want> { self.last_want }
+
+    /// ★ A STATE LAID OUT AHEAD, SHOWN (replay part 2): `other` — a source
+    /// on the new state, built and primed in idle time — takes this one's
+    /// place in the view: the window is brought up to date with this one's
+    /// last `want`, and only what differs from what the view holds is sent,
+    /// as `replace` does. Returns the source it replaced (kept by a caller
+    /// for going back). `other` must lay out at this source's zoom and
+    /// appearance.
+    pub fn swap_in(&mut self, mut other: DocumentSource<'f>, sink: &mut dyn SceneSink) -> (Vec<Event>, DocumentSource<'f>) {
+        let mut ev = vec![];
+        let shown = self.shown();
+        self.drop_prov(sink, &mut ev);
+        other.last_want = self.last_want;
+        other.last_extent = self.last_extent;
+        // What priming laid out was never sent: the view holds this one's.
+        other.prov = None;
+        other.prov_seq = other.prov_seq.max(self.prov_seq);
+        let old = std::mem::replace(self, other);
+        self.resync(shown, sink, &mut ev);
+        (ev, old)
+    }
+
+    /// What the view holds now: each resident band's range and group (NSG),
+    /// and the overlay (`None`: none sent).
+    fn shown(&self) -> Shown {
+        Shown {
+            bands: self.resident.keys().filter_map(|&k| self.doc.group(k).map(|g| (k, (self.doc.bands[k].range, crate::nsg::write(&g, self.fonts))))).collect(),
+            overlay: self.overlay_sig.filter(|s| s.0 > 0).map(|_| crate::nsg::write(&self.doc.overlay(), self.fonts)),
+        }
+    }
+
+    /// Bring the view, which holds `shown`, up to date with this source at
+    /// the last `want`, sending only what differs.
+    fn resync(&mut self, shown: Shown, sink: &mut dyn SceneSink, ev: &mut Vec<Event>) {
+        let Some(w) = self.last_want else {
+            for k in shown.bands.into_keys() { sink.clear(GroupId::Band(k as u32)); ev.push(Event::BandEvicted { band: k as u32 }) }
+            if shown.overlay.is_some() { sink.clear(GroupId::Overlay) }
+            self.resident.clear();
+            return;
+        };
+        self.resident.clear();
+        self.overlay_sig = None;
+        let mut cap = Capture::default();
+        let mut got = vec![];
+        let p = w.prefetch.max(0);
+        self.sync((w.range.0.saturating_sub(p), w.range.1.saturating_add(p)), &mut cap, &mut got);
+        // Bands the view held that are no longer there.
+        for &k in shown.bands.keys() {
+            if !self.resident.contains_key(&k) { sink.clear(GroupId::Band(k as u32)); ev.push(Event::BandEvicted { band: k as u32 }) }
+        }
+        let mut sent: BTreeMap<GroupId, (Option<(U, U)>, Scene)> = BTreeMap::new();
+        let mut overlay_cleared = false;
+        for c in cap.0 {
+            match c {
+                Cap::Put(g, clip, scene) => { sent.insert(g, (clip, scene)); }
+                Cap::Clear(GroupId::Overlay) => { sent.remove(&GroupId::Overlay); overlay_cleared = true }
+                Cap::Clear(g) => { sent.remove(&g); if !matches!(g, GroupId::Band(k) if shown.bands.contains_key(&(k as usize))) { sink.clear(g) } }
+            }
+        }
+        // The overlay: sent again only if it differs from what the view
+        // holds; gone if the new layout has none or the view is waiting on
+        // a provisional band (which a source built on this state would show
+        // with no overlay).
+        match (sent.remove(&GroupId::Overlay), &shown.overlay) {
+            (Some((_, scene)), Some(old)) if *old == crate::nsg::write(&scene, self.fonts) => {}
+            (Some((clip, scene)), _) => sink.put(GroupId::Overlay, clip, &scene),
+            (None, Some(_)) if overlay_cleared || self.prov.is_some() => { sink.clear(GroupId::Overlay); self.overlay_sig = None }
+            (None, _) => {}
+        }
+        for (g, (clip, scene)) in sent {
+            match g {
+                GroupId::Band(k) => match shown.bands.get(&(k as usize)) {
+                    Some((r, s)) if Some(*r) == clip && *s == crate::nsg::write(&scene, self.fonts) => {}
+                    Some(_) => { sink.put(g, clip, &scene); ev.push(Event::BandUpdated { band: k, range: clip.unwrap_or_default() }) }
+                    None => { sink.put(g, clip, &scene); ev.push(Event::BandReady { band: k, range: clip.unwrap_or_default() }) }
+                },
+                GroupId::Overlay => unreachable!("taken above"),
+            }
+        }
+        // Extent and eviction events as `sync` produced them; its ready and
+        // updated ones are replaced by the comparison above.
+        ev.extend(got.into_iter().filter(|e| matches!(e, Event::Extent { .. } | Event::BandEvicted { .. })));
+    }
 
     fn rezoom(&mut self, zoom_64: u32, sink: &mut dyn SceneSink, ev: &mut Vec<Event>) {
         for (&k, _) in std::mem::take(&mut self.resident).iter() {
@@ -194,12 +340,17 @@ impl<'f> DocumentSource<'f> {
                 ev.push(Event::BandEvicted { band: k as u32 });
             }
         }
-        for &k in &wanted { self.doc.ensure(k); }
+        // ★ A band laid out again here (stale: a box it cuts was sized by a
+        // later band) is sent again even when its foreign leaves are the
+        // same: `ensure` clears `stale`, so the loop for stale bands below
+        // never saw it, and the view kept the band without the box.
+        let mut relaid = BTreeSet::new();
+        for &k in &wanted { if self.doc.ensure(k) { relaid.insert(k); } }
         for &k in &wanted {
-            let sig = self.doc.foreign_sig(k);
+            let sig = (self.doc.foreign_sig(k), self.doc.bands[k].built);
             let range = self.doc.bands[k].range;
             match self.resident.get(&k) {
-                Some(old) if *old == sig => continue,
+                Some(old) if *old == sig && !relaid.contains(&k) => continue,
                 Some(_) => ev.push(Event::BandUpdated { band: k as u32, range }),
                 None => ev.push(Event::BandReady { band: k as u32, range }),
             }
@@ -213,7 +364,7 @@ impl<'f> DocumentSource<'f> {
                 self.doc.ensure(k);
                 let range = self.doc.bands[k].range;
                 sink.put(GroupId::Band(k as u32), Some(range), &self.doc.group(k).expect("resident"));
-                self.resident.insert(k, self.doc.foreign_sig(k));
+                self.resident.insert(k, (self.doc.foreign_sig(k), self.doc.bands[k].built));
                 ev.push(Event::BandUpdated { band: k as u32, range });
             }
         }
@@ -231,6 +382,18 @@ impl<'f> DocumentSource<'f> {
             ev.push(Event::Extent { height: e.0, settled: e.1 });
         }
     }
+}
+
+/// What a view holds (`DocumentSource::shown`).
+struct Shown { bands: BTreeMap<usize, ((U, U), String)>, overlay: Option<String> }
+
+/// A sink that keeps what it is given, in order (`DocumentSource::replace`).
+#[derive(Default)]
+struct Capture(Vec<Cap>);
+enum Cap { Put(GroupId, Option<(U, U)>, Scene), Clear(GroupId) }
+impl SceneSink for Capture {
+    fn put(&mut self, group: GroupId, clip: Option<(U, U)>, scene: &Scene) { self.0.push(Cap::Put(group, clip, scene.clone())) }
+    fn clear(&mut self, group: GroupId) { self.0.push(Cap::Clear(group)) }
 }
 
 impl DocumentSource<'_> {
