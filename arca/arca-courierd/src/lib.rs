@@ -142,7 +142,12 @@ impl Pool {
         Ok(uid)
     }
 
-    /// Only after the uid's label is retired.
+    /// Hold `uid` (a leftover the janitor is reclaiming) out of the pool.
+    pub fn reserve(&mut self, uid: u32, owner: &str) {
+        self.live.insert(uid, owner.to_string());
+    }
+
+    /// Only after the uid's label is retired and its jail is gone.
     pub fn give_back(&mut self, uid: u32) {
         self.live.remove(&uid);
     }

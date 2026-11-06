@@ -282,9 +282,10 @@ item.
   nothing of the user's. Its network is its own vnet (`Routed`), and its pf anchor
   passes TCP only to the endpoint's addresses on its port, plus the host's resolvers,
   which jaild adds to every restricted anchor.
-- **Teardown** removes only what the launcher wrote, then the empty directories. A
-  surviving mount is never removed recursively. At start the launcher reclaims every
-  courier jail a previous run left.
+- **Teardown** is the janitor's: it retries until the kernel frees the jail, then
+  unmounts, removes only what the launcher wrote and then the empty directories. A
+  surviving mount is never removed recursively. At start the launcher hands every
+  courier jail a previous run left to the janitor.
 - **Gates.**
   - `arca-courierd/tests/launcher.rs` covers the wire, the address filter (no loopback,
     LAN without the grant, metadata or IPv6), the per-app cap and uid reuse, the
@@ -532,12 +533,14 @@ same-site context or a gesture, because it never holds a ticket.
     (partition, origin), with redirects followed by the broker (legacy-web §5.4.1e,
     "Built"). `scripts/arca-vm-test.sh` §7 runs the broker's own clients through jailed
     couriers: 7/7 in the dev VM, 2026-11-06.
-  - **A teardown leak found by that run** (§5, not a ticket matter). Two checks failed:
-    "its root is removed" and "no mounts left". A courier jail that held TCP
-    connections is still dying after jaild's 10 s wait, because its sockets sit in
-    TIME_WAIT (`net.inet.tcp.msl` 30 s). Nothing unmounts it once it is freed: minutes
-    later no jail was dying, and all six mounts of each of the run's four courier jails
-    were still there. The rest of the gate passed (74/76).
+  - ~~**A teardown leak found by that run**~~ Fixed 2026-11-06. A courier jail that held
+    TCP connections stays dying for 2 MSL (TIME_WAIT). The launcher used to wait a fixed
+    time and then give up, which left the jail's six mounts behind. Now a janitor retries
+    each exited courier's teardown every 2 s with no deadline, and reports one still
+    pending after 5 minutes. The uid goes back to the pool only once nothing of its jail
+    is left. Leftovers from a previous launcher go to the janitor at start instead of
+    blocking it. `arca-vm-test.sh` now also checks, before stopping the launcher, that
+    every courier jail of the run is gone with no mount or root left: 79/79.
   - Password fill by form ticket and gesture (§8.3) comes with A3.
 
 ## 9. Native apps and other clients

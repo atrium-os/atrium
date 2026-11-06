@@ -240,7 +240,7 @@ check "the jail is gone when the app closes" true "$(echo "$r" | sed -n 's/^jail
 check "its label is retired" "64000 retired" "$(g 'tail -1 /var/run/atrium/courier-registry')"
 # A vnet jail is dying while its connections are in TIME_WAIT (about a
 # minute); the launcher waits that out, then unmounts.
-i=0; while [ $i -lt 120 ] && g "test -e /var/lib/atrium/jails/$CJ"; do sleep 1; i=$((i+1)); done
+i=0; while [ $i -lt 180 ] && g "test -e /var/lib/atrium/jails/$CJ"; do sleep 1; i=$((i+1)); done
 check "its root is removed" gone "$(g "test -e /var/lib/atrium/jails/$CJ && echo left || echo gone")"
 check "no mounts left under it" 0 "$(g "mount -p | grep -c '/jails/$CJ'" || true)"
 N=$(wc -l < "$SRV/log")
@@ -282,6 +282,13 @@ check "a cross-site subresource: the Lax cookie stays home" - "$(C /c2)"
 check "a ticket replayed through its courier: no cookie" - "$(C '/c1?q=1' 2)"
 check "a ticket for /c3?a=1 used for /c3?a=2: no cookie" - "$(C '/c3?a=2')"
 check "…and the same ticket for its own URL: the cookie" "sid=vm-cookie" "$(C '/c3?a=1')"
+# Every courier the run started is taken apart by the launcher's janitor
+# once the kernel frees its jail (TIME_WAIT keeps a vnet jail dying for
+# about a minute); before the launcher stops.
+i=0; while [ $i -lt 240 ] && [ "$(g "mount -p | grep -c '/jails/system-arca-courier-'" || true)" != 0 ]; do sleep 2; i=$((i+2)); done
+check "every courier jail torn down: no mounts left" 0 "$(g "mount -p | grep -c '/jails/system-arca-courier-'" || true)"
+check "every courier jail torn down: no roots left" 0 "$(g "ls /var/lib/atrium/jails | grep -c '^system-arca-courier-'" || true)"
+check "nothing torn down late" 0 "$(g "grep -c 'not torn down' /tmp/courierd.log" || true)"
 g "pkill -x arca-courierd; true"
 
 echo "=== $pass passed, $fail failed"

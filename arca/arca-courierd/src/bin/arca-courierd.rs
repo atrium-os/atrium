@@ -50,6 +50,9 @@ mod freebsd {
         resolver: Resolver,
         policy: addr::Policy,
         pool: Mutex<Pool>,
+        /// Couriers that exited, whose jails are still to be taken apart:
+        /// (uid, since).
+        janitor: Mutex<Vec<(u32, std::time::Instant)>>,
     }
 
     pub fn main() -> ExitCode {
@@ -79,10 +82,18 @@ mod freebsd {
             },
             policy: addr::Policy { grant_private_network: grant },
             pool: Mutex::new(Pool::default()),
+            janitor: Mutex::new(Vec::new()),
         });
         // No courier is live before the first launch: whatever a previous
         // launcher left goes, then its labels.
-        jail::sweep(&d.cfg);
+        for uid in jail::sweep(&d.cfg) {
+            d.pool.lock().unwrap().reserve(uid, "reclaim");
+            d.janitor.lock().unwrap().push((uid, std::time::Instant::now()));
+        }
+        {
+            let d = d.clone();
+            std::thread::spawn(move || janitor(&d));
+        }
         if let Err(e) = reset_registry(&registry) {
             eprintln!("arca-courierd: registry {registry}: {e}");
             return ExitCode::FAILURE;
@@ -138,8 +149,30 @@ mod freebsd {
             eprintln!("arca-courierd: wait {}: {e}", c.uid);
         }
         jail::retire(&d.cfg, c.uid);
-        jail::remove(&d.cfg, c.uid);
-        d.pool.lock().unwrap().give_back(c.uid);
+        jail::release(&d.cfg, c.uid);
+        d.janitor.lock().unwrap().push((c.uid, std::time::Instant::now()));
+    }
+
+    /// Take exited couriers' jails apart as the kernel frees them, with no
+    /// deadline; a uid goes back to the pool only once nothing of its jail
+    /// is left. One that stays for five minutes is reported once.
+    fn janitor(d: &Daemon) {
+        const SLOW: std::time::Duration = std::time::Duration::from_secs(300);
+        let mut told: Vec<u32> = Vec::new();
+        loop {
+            std::thread::sleep(std::time::Duration::from_secs(2));
+            let pending: Vec<(u32, std::time::Instant)> = d.janitor.lock().unwrap().clone();
+            for (uid, since) in pending {
+                if jail::try_teardown(uid) {
+                    d.janitor.lock().unwrap().retain(|p| p.0 != uid);
+                    d.pool.lock().unwrap().give_back(uid);
+                    told.retain(|u| *u != uid);
+                } else if since.elapsed() > SLOW && !told.contains(&uid) {
+                    eprintln!("arca-courierd: {} not torn down after {}s; still trying", jail::name(uid), SLOW.as_secs());
+                    told.push(uid);
+                }
+            }
+        }
     }
 
     fn ask(d: &Daemon, s: &mut UnixStream) -> Result<jail::Courier, u8> {
@@ -176,7 +209,7 @@ mod freebsd {
             }
             Err(e) => {
                 eprintln!("arca-courierd: courier {cuid} for {app_id} to {host}:{port}: {e}");
-                d.pool.lock().unwrap().give_back(cuid);
+                d.janitor.lock().unwrap().push((cuid, std::time::Instant::now()));
                 Err(reply::FAILED)
             }
         }
