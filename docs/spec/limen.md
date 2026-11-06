@@ -1,6 +1,7 @@
 # Limen: the cross-jail embed broker
 
-Status: v1 design, for review (rewritten 2026-11-06 from the May 2026 sketch). Nothing is
+Status: v1 design, accepted 2026-11-06 (the user agreed to all §13 recommendations;
+rewritten that day from the May 2026 sketch). Nothing is
 built except the `credential` role's message types (`limen/`, e710f18) and Pergola's slot
 plumbing (`pergola::slot`, `CredentialField`).
 
@@ -439,6 +440,8 @@ The C SDK waits for an Insula app that needs it.
 - the C SDK.
 
 ## 13. Decisions, with recommendations
+
+**Accepted by the user, 2026-11-06: all five recommendations below.**
 
 1. **Slots are child windows pinned by frescod**, not regions of the parent's surface.
    *Recommend yes.* It reuses what frescod just built for credentials, and it makes "no
