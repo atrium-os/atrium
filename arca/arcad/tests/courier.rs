@@ -109,17 +109,18 @@ fn a_fill_is_all_or_nothing_and_couriers_get_no_other_ops() {
 fn set_cookie_records_replace_and_never_fill_by_id() {
     let (_d, mut s) = setup();
     let c = courier(7, "org.example.mail", "api.example");
-    let set = |s: &mut State, v: &[u8]| s.handle(&c, cop::SET_COOKIE, &body(|w| { w.str("sid"); w.bytes(v); w.bytes(b"Path=/; HttpOnly"); })).status;
+    let set = |s: &mut State, v: &[u8]| s.handle(&c, cop::SET_COOKIE, &body(|w| { w.str("sid"); w.bytes(v); w.bytes(b"Path=/; HttpOnly"); w.str("/login"); })).status;
     assert_eq!(set(&mut s, b"v1"), status::OK);
     assert_eq!(set(&mut s, b"v2"), status::OK);
-    assert_eq!(s.handle(&c, cop::SET_COOKIE, &body(|w| { w.str("bad name"); w.bytes(b"x"); w.bytes(b""); })).status, status::MALFORMED);
+    assert_eq!(s.handle(&c, cop::SET_COOKIE, &body(|w| { w.str("bad name"); w.bytes(b"x"); w.bytes(b""); w.str("/"); })).status, status::DENIED, "ignored");
+    assert_eq!(s.handle(&c, cop::SET_COOKIE, &body(|w| { w.str("sid"); w.bytes(b"x"); w.bytes(b""); })).status, status::MALFORMED, "no path");
     // The app lists one cookie record for that endpoint, the latest.
     let r = s.handle(&app(7, "org.example.mail"), op::LIST_FOR, &body(|w| write_endpoint(w, "api.example", 443)));
     let mut rd = Reader::new(r.body.bytes());
     assert_eq!(rd.u32().unwrap(), 1);
     let id = rd.array::<16>().unwrap();
     assert_eq!(rd.u16().unwrap(), 2, "a Cookie");
-    assert_eq!(fill(&mut s, &c, &[(cop::SOURCE_ITEM, id)]).0, status::DENIED, "cookies only by Arca's matching (A2)");
+    assert_eq!(fill(&mut s, &c, &[(cop::SOURCE_ITEM, id)]).0, status::DENIED, "cookies only by Arca's matching");
 }
 
 #[test]
@@ -139,7 +140,7 @@ fn courier_uids_resolve_only_through_the_courier_registry() {
     // An app line claiming a courier uid is ignored.
     std::fs::write(&reg, format!("64001 alice org.example.mail {}\n", "ab".repeat(32))).unwrap();
     std::fs::write(&creg, "64001 alice app-x https api.example 443\n").unwrap();
-    let r = Resolver { registry: reg, vestibulum_uid: None, ui_uid: None, allow_unsigned: false, courier_registry: Some(creg.clone()) };
+    let r = Resolver { registry: reg, vestibulum_uid: None, ui_uid: None, allow_unsigned: false, courier_registry: Some(creg.clone()), web_broker: None };
     match r.resolve(64001) {
         Label::Courier(c) => assert_eq!((c.user.as_str(), c.persona.as_str()), ("alice", "app-x")),
         l => panic!("{l:?}"),

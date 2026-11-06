@@ -92,6 +92,7 @@ fn main() {
             headers: vec![(Header::Accept, b"*/*".to_vec())],
             slots: vec![Slot { source: SOURCE_ITEM, reference: item, place: Place::Bearer }],
             body: vec![],
+            ticket: None,
         };
         arca_courier::send::write_frame(&mut tx, &r.encode()).unwrap();
         let f = arca_courier::send::read_frame(&mut rx).unwrap().unwrap_or_default();

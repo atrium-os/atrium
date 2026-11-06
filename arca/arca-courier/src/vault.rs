@@ -54,11 +54,27 @@ impl Vault for Arcad {
         Ok(out)
     }
 
-    fn set_cookie(&mut self, name: &str, value: &[u8], attrs: &[u8]) {
+    fn set_cookie(&mut self, name: &str, value: &[u8], attrs: &[u8], path: &str, ticket: Option<&[u8; 16]>) {
         let mut w = Writer::new();
         w.str(name);
         w.bytes(value);
         w.bytes(attrs);
+        w.str(path);
+        if let Some(t) = ticket {
+            w.raw(t);
+        }
         let _ = self.call(courier_op::SET_COOKIE, &w.buf);
+    }
+
+    fn cookies(&mut self, path: &str, ticket: Option<&[u8; 16]>) -> Option<LockedBuf> {
+        let mut w = Writer::new();
+        w.str(path);
+        if let Some(t) = ticket {
+            w.raw(t);
+        }
+        match self.call(courier_op::COOKIES, &w.buf) {
+            Ok((status::OK, b)) if !b.is_empty() => Some(b),
+            _ => None,
+        }
     }
 }

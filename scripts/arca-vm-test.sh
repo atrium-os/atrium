@@ -99,7 +99,11 @@ tmpd=$(mktemp -d)
 g 'cat /etc/atrium/jaild.policy.toml' > "$tmpd/live.toml"
 sh "$ROOT/scripts/jaild-policy-merge.sh" "$ROOT/etc/jaild.policy.toml" "$tmpd/live.toml" > "$tmpd/jaild.policy.toml" 2>/dev/null
 put "$tmpd/jaild.policy.toml" /etc/atrium/jaild.policy.toml
-put "$ROOT/arca/arcad/etc/services.d/42-atrium-arcad.toml" /etc/atrium/services.d/42-atrium-arcad.toml
+# The web broker (§6): a test app id and publisher, as the Navigator's will be.
+BROKER_PUB=$(printf 'b%.0s' $(seq 64))
+sed "s|^env  = \[|env  = [{ key = \"ARCA_WEB_BROKER\", value = \"org.atrium.navigator $BROKER_PUB\" }, |" \
+    "$ROOT/arca/arcad/etc/services.d/42-atrium-arcad.toml" > "$tmpd/42-atrium-arcad.toml"
+put "$tmpd/42-atrium-arcad.toml" /etc/atrium/services.d/42-atrium-arcad.toml
 # Only Arca's manifest: the smoke manifests would churn the bootstrap log.
 g "mkdir -p /etc/atrium/services.d.off && mv /etc/atrium/services.d/*-atrium-smoke-*.toml /etc/atrium/services.d.off/ 2>/dev/null; true"
 g "service atrium-jaild restart >/dev/null 2>&1; sleep 2; service atrium-portcullisd-bootstrap onestart >/dev/null 2>&1; true"
@@ -118,6 +122,8 @@ echo "=== 3. identity over the socket"
 S=/atrium/sockets/arca/arcad.sock
 g "pw usershow arcaapp1 >/dev/null 2>&1 || pw useradd arcaapp1 -u 50801 -d /nonexistent -s /usr/sbin/nologin"
 g "pw usershow arcaapp2 >/dev/null 2>&1 || pw useradd arcaapp2 -u 50802 -d /nonexistent -s /usr/sbin/nologin"
+g "pw usershow arcabroker >/dev/null 2>&1 || pw useradd arcabroker -u 50803 -d /nonexistent -s /usr/sbin/nologin"
+g "grep -q '^50803 ' /var/run/atrium/app-registry || printf '50803 alice org.atrium.navigator $BROKER_PUB\n' >> /var/run/atrium/app-registry"
 PUB=$(printf 'a%.0s' $(seq 64))
 g "grep -q '^50801 ' /var/run/atrium/app-registry || printf '50801 alice org.example.mail $PUB\n50802 alice org.example.evil $PUB\n' >> /var/run/atrium/app-registry"
 P=/usr/local/bin/arca-probe
@@ -196,7 +202,7 @@ put "$SRV/ca.pem" /tmp/courierd-ca.pem
 g "grep -q ' api.example' /etc/hosts || printf '10.0.2.2 api.example evil.example\n' >> /etc/hosts"
 D=/atrium/sockets/arca-courier/courierd.sock
 g "pkill -x arca-courierd; sleep 1; install -m 755 /root/arca-test/arca-courier /usr/local/bin/atrium-arca-courier && install -m 755 /root/arca-test/arca-courierd /usr/local/bin/arca-courierd && install -m 755 /root/arca-test/courierd-vm-probe /usr/local/bin/courierd-vm-probe"
-g "rm -f /tmp/courierd.log; env ARCA_COURIERD_CA=/tmp/courierd-ca.pem ARCA_COURIERD_GRANT_PRIVATE_NETWORK=1 daemon -o /tmp/courierd.log /usr/local/bin/arca-courierd </dev/null >/dev/null 2>&1"
+g "rm -f /tmp/courierd.log; env ARCA_COURIERD_CA=/tmp/courierd-ca.pem ARCA_COURIERD_GRANT_PRIVATE_NETWORK=1 ARCA_WEB_BROKER='org.atrium.navigator $BROKER_PUB' daemon -o /tmp/courierd.log /usr/local/bin/arca-courierd </dev/null >/dev/null 2>&1"
 i=0; while [ $i -lt 30 ] && ! g "test -S $D"; do sleep 1; i=$((i+1)); done
 check "launcher listening" yes "$(g "test -S $D && echo yes || echo no")"
 check "launcher reset the registry" 0 "$(g 'wc -l < /var/run/atrium/courier-registry' | tr -d ' ')"
@@ -237,6 +243,20 @@ check "a courier for evil.example: Arca denies the token" "courier_refused=Denie
 check "and evil.example's server got no request" "$N" "$(wc -l < "$SRV/log")"
 check "root is no app: refused" "refused=1" "$(g "courierd-vm-probe $D api.example $PORT $TID")"
 check "a host with no address: refused" "refused=3" "$(g "su -m arcaapp1 -c 'courierd-vm-probe $D no-such-host.invalid 443 $TID'")"
+check "the courier sent Arca's cookie on its next request" 1 "$(grep -c '^GET /redirect HTTP/1.1 token=true cookie=sid=vm-cookie$' "$SRV/log")"
+check "an app can't ask for a web courier" "refused=1" "$(g "su -m arcaapp1 -c 'courierd-vm-probe $D api.example $PORT web api.example $S'")"
+
+echo "=== 6. web couriers and tickets (A2)"
+N=$(wc -l < "$SRV/log")
+r=$(g "su -m arcabroker -c 'courierd-vm-probe $D api.example $PORT web api.example $S'")
+echo "$r" | sed 's/^/    /'
+tail -n +$((N+1)) "$SRV/log" | sed 's/^/    server: /'
+L() { tail -n +$((N+1)) "$SRV/log" | sed -n "${1}p" | sed 's/.*cookie=//'; }
+check "web courier: four requests answered" "web0=200 web1=200 web2=200 web3=200" "$(echo "$r" | tr '\n' ' ' | sed 's/ $//')"
+check "the reader's own navigation: no cookie yet, Set-Cookie kept" - "$(L 1)"
+check "a cross-site subresource: the Lax cookie stays home" - "$(L 2)"
+check "a same-site navigation: the cookie goes" sid=vm-cookie "$(L 3)"
+check "no ticket: no cookie" - "$(L 4)"
 check "the launcher logged no failure" 0 "$(g "grep -c ': .*\(refused\|failed\|errno\)' /tmp/courierd.log" || true)"
 g "pkill -x arca-courierd; true"
 

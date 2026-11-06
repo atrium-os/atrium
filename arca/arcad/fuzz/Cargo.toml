@@ -1,0 +1,21 @@
+[package]
+name = "arcad-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+arcad = { path = ".." }
+
+[[bin]]
+name = "set_cookie"
+path = "fuzz_targets/set_cookie.rs"
+test = false
+doc = false
+bench = false
+
+[workspace]

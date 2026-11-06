@@ -8,6 +8,7 @@
 //!          | u8 n | n × (u8 header | bytes value)
 //!          | u8 n | n × (u8 source | ref[16] | u8 place)
 //!          | u16 n | n × segment
+//!          | u8 0 | u8 1 ticket[16]       -- the web broker's ticket (arca.md §8.2)
 //! segment  = u8 0 | bytes literal          -- body bytes as given
 //!          | u8 1 | u8 slot | u8 encoding  -- a slot's value, encoded
 //! response = u8 0 | u16 status | u8 n | n × (str name | str value) | bytes body
@@ -148,6 +149,9 @@ pub struct Request {
     pub headers: Vec<(Header, Vec<u8>)>,
     pub slots: Vec<Slot>,
     pub body: Vec<Segment>,
+    /// A web courier's ticket from the broker, for this request; an app's
+    /// courier sends none.
+    pub ticket: Option<[u8; 16]>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -161,6 +165,7 @@ pub enum Malformed {
     Header,
     Slot,
     Body,
+    Ticket,
 }
 
 /// Visible ASCII, no '#'; the path also no '?'.
@@ -263,8 +268,13 @@ impl Request {
                 return Err(Slot);
             }
         }
+        let ticket = match r.u8().map_err(t)? {
+            0 => None,
+            1 => Some(r.array::<16>().map_err(t)?),
+            _ => return Err(Ticket),
+        };
         r.end().map_err(|_| Trailing)?;
-        Ok(Request { method, path, query, headers, slots, body })
+        Ok(Request { method, path, query, headers, slots, body, ticket })
     }
 
     pub fn encode(&self) -> Vec<u8> {
@@ -296,6 +306,13 @@ impl Request {
                     w.u8(*slot);
                     w.u8(*encoding as u8);
                 }
+            }
+        }
+        match &self.ticket {
+            None => w.u8(0),
+            Some(t) => {
+                w.u8(1);
+                w.raw(t);
             }
         }
         w.buf

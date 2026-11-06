@@ -16,8 +16,13 @@ use crate::schema::{Encoding, Method, Place, Refusal, Request, Response, Segment
 pub trait Vault {
     /// The values for these (source, ref) pairs, all or nothing.
     fn fill(&mut self, refs: &[(u8, [u8; 16])]) -> Result<Vec<LockedBuf>, Refusal>;
-    /// A `Set-Cookie` from the endpoint. Errors are Arca's to log.
-    fn set_cookie(&mut self, name: &str, value: &[u8], attrs: &[u8]);
+    /// A `Set-Cookie` from the endpoint, for a request to `path`. Arca
+    /// validates it; errors are Arca's to log.
+    /// `ticket` is the request's, for a web courier.
+    fn set_cookie(&mut self, name: &str, value: &[u8], attrs: &[u8], path: &str, ticket: Option<&[u8; 16]>);
+    /// The `Cookie` header Arca matched for a request to `path`, if any.
+    /// A web courier's request redeems its ticket here.
+    fn cookies(&mut self, path: &str, ticket: Option<&[u8; 16]>) -> Option<LockedBuf>;
 }
 
 /// The one endpoint this courier serves, from its label.
@@ -95,7 +100,11 @@ impl<'a> Courier<'a> {
             let refs: Vec<(u8, [u8; 16])> = req.slots.iter().map(|s| (s.source, s.reference)).collect();
             vault.fill(&refs)?
         };
-        let wire = build(req, &self.endpoint, &values)?;
+        // Arca's matching, after TLS like the fill. No cookies is no
+        // refusal: the request goes without.
+        let path = std::str::from_utf8(&req.path).map_err(|_| Refusal::Malformed)?;
+        let cookie = vault.cookies(path, req.ticket.as_ref());
+        let wire = build(req, &self.endpoint, &values, cookie.as_ref())?;
         if s.write_all(wire.as_ref()).and_then(|_| s.flush()).is_err() {
             // The server closed a kept-alive connection: once more, fresh.
             // The values are already in hand; the new connection is past
@@ -108,7 +117,7 @@ impl<'a> Courier<'a> {
         if keep {
             self.conn = Some(s);
         }
-        Ok(scrub(resp, &values, vault))
+        Ok(scrub(resp, &values, cookie.as_ref(), path, req.ticket.as_ref(), vault))
     }
 }
 
@@ -184,7 +193,7 @@ fn encode(v: &[u8], e: Encoding) -> Result<LockedBuf, Refusal> {
 }
 
 /// The whole request in locked memory: the only place a value is written.
-pub fn build(req: &Request, ep: &Endpoint, values: &[LockedBuf]) -> Result<LockedBuf, Refusal> {
+pub fn build(req: &Request, ep: &Endpoint, values: &[LockedBuf], cookie: Option<&LockedBuf>) -> Result<LockedBuf, Refusal> {
     let mut body: Vec<LockedBuf> = Vec::new();
     for g in &req.body {
         body.push(match g {
@@ -229,7 +238,13 @@ pub fn build(req: &Request, ep: &Endpoint, values: &[LockedBuf]) -> Result<Locke
         }
         None => 0,
     };
-    let total = head.len() + auth_len + 2 + body_len;
+    // Arca's header: names are tokens, values have no controls or ';'.
+    let cookie = cookie.filter(|c| !c.is_empty());
+    if cookie.is_some_and(|c| !c.as_ref().iter().all(|&b| b == b'\t' || (0x20..0x7f).contains(&b))) {
+        return Err(Refusal::Internal);
+    }
+    let cookie_len = cookie.map_or(0, |c| "Cookie: ".len() + c.len() + 2);
+    let total = head.len() + auth_len + cookie_len + 2 + body_len;
     let mut out = LockedBuf::zeroed(total).map_err(|_| Refusal::Internal)?;
     let o = out.as_mut();
     let mut at = 0;
@@ -241,6 +256,11 @@ pub fn build(req: &Request, ep: &Endpoint, values: &[LockedBuf]) -> Result<Locke
     if let Some(i) = bearer {
         put(b"Authorization: Bearer ");
         put(values[i].as_ref());
+        put(b"\r\n");
+    }
+    if let Some(c) = cookie {
+        put(b"Cookie: ");
+        put(c.as_ref());
         put(b"\r\n");
     }
     put(b"\r\n");
@@ -269,16 +289,27 @@ fn mask(hay: &mut [u8], needle: &[u8]) -> bool {
     hit
 }
 
+/// Cookie values shorter than this aren't masked: a session id is long,
+/// and masking every `true` in a page would break it.
+const COOKIE_MASK_MIN: usize = 16;
+
 /// What the client gets: no `Set-Cookie` (those go to Arca), and no echo
-/// of a value this request carried (arca.md §8.3).
-fn scrub(resp: navigator_fetch::http::Response, values: &[LockedBuf], vault: &mut dyn Vault) -> Response {
+/// of a value this request carried (arca.md §8.3), nor of a cookie's.
+fn scrub(
+    resp: navigator_fetch::http::Response,
+    values: &[LockedBuf],
+    cookie: Option<&LockedBuf>,
+    path: &str,
+    ticket: Option<&[u8; 16]>,
+    vault: &mut dyn Vault,
+) -> Response {
     let navigator_fetch::http::Response { status, headers, mut body } = resp;
     let mut out = Vec::with_capacity(headers.len());
     for (k, v) in headers {
         if k == "set-cookie" {
             if let Some((nv, attrs)) = Some(v.split_once(';').unwrap_or((v.as_str(), ""))) {
                 if let Some((n, val)) = nv.split_once('=') {
-                    vault.set_cookie(n.trim(), val.trim().as_bytes(), attrs.trim().as_bytes());
+                    vault.set_cookie(n.trim(), val.trim().as_bytes(), attrs.trim().as_bytes(), path, ticket);
                 }
             }
             continue;
@@ -288,6 +319,25 @@ fn scrub(resp: navigator_fetch::http::Response, values: &[LockedBuf], vault: &mu
             mask(&mut vb, val.as_ref());
         }
         out.push((k, String::from_utf8(vb).unwrap_or_default()));
+    }
+    let cookie_values: Vec<&[u8]> = cookie
+        .map(|c| {
+            c.as_ref()
+                .split(|&b| b == b';')
+                .filter_map(|p| p.iter().position(|&b| b == b'=').map(|i| &p[i + 1..]))
+                .filter(|v| v.len() >= COOKIE_MASK_MIN)
+                .collect()
+        })
+        .unwrap_or_default();
+    for (_, v) in out.iter_mut() {
+        let mut vb = std::mem::take(v).into_bytes();
+        for c in &cookie_values {
+            mask(&mut vb, c);
+        }
+        *v = String::from_utf8(vb).unwrap_or_default();
+    }
+    for c in &cookie_values {
+        mask(&mut body, c);
     }
     for val in values {
         mask(&mut body, val.as_ref());

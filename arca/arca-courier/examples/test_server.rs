@@ -5,7 +5,8 @@
 //!
 //! HOSTS (comma separated) are the certificate's names, signed by a
 //! throwaway CA written to CA_OUT. The port goes to PORT_OUT; each request
-//! head, one line per request (`<request line> token=<bool>`), goes to LOG.
+//! head, one line per request (`<request line> token=<bool> cookie=<value|->`),
+//! goes to LOG.
 //! Answers as courier-vm-probe's server does.
 
 use std::io::{Read, Write};
@@ -51,8 +52,9 @@ fn main() {
                 let req = String::from_utf8_lossy(&b).to_string();
                 let token = req.contains("Authorization: Bearer hunter2-token\r\n");
                 let first = req.lines().next().unwrap_or("").to_string();
+                let cookie = req.lines().find_map(|l| l.strip_prefix("Cookie: ")).unwrap_or("-").to_string();
                 if let Ok(mut f) = std::fs::OpenOptions::new().append(true).create(true).open(&log) {
-                    let _ = writeln!(f, "{first} token={token}");
+                    let _ = writeln!(f, "{first} token={token} cookie={cookie}");
                 }
                 let resp = if req.starts_with("GET /redirect") {
                     "HTTP/1.1 302 Found\r\nLocation: https://evil.example/\r\nContent-Length: 0\r\n\r\n".to_string()

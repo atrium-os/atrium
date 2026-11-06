@@ -20,7 +20,7 @@ fn login_unlocks_and_logout_locks() {
         vestibulum_uid: Some(me),
         ui_uid: None,
         allow_unsigned: false,
-        courier_registry: None,
+        courier_registry: None, web_broker: None
     };
     std::fs::write(&resolver.registry, "").unwrap();
     let mut st = State::new(d.path().join("db")).unwrap();

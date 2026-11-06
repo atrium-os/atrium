@@ -4,6 +4,8 @@
 //! - `ARCA_DIR` (default `/var/db/arca`): the per-user stores and audit log.
 //! - `ARCA_SOCKET` (default `/atrium/sockets/arca/arcad.sock`).
 //! - `ARCA_APP_REGISTRY` (default the launch registry).
+//! - `ARCA_WEB_BROKER`: `app_id publisher-hex`, the app that issues web
+//!   tickets (arca.md §8.2); unset, no web courier gets a cookie.
 //! - `ARCA_VESTIBULUM_UID`, `ARCA_UI_UID`: the system uids allowed the
 //!   Vestibulum and trusted-UI ops. Unset = nobody.
 //! - `ARCA_ALLOW_UNSIGNED=1`: development only; serves apps launched without
@@ -44,6 +46,7 @@ fn main() -> ExitCode {
         courier_registry: Some(
             std::env::var("ARCA_COURIER_REGISTRY").unwrap_or_else(|_| arcad::courier::DEFAULT_REGISTRY.into()).into(),
         ),
+        web_broker: std::env::var("ARCA_WEB_BROKER").ok().and_then(|s| arcad::label::parse_web_broker(&s)),
     };
     if resolver.allow_unsigned {
         eprintln!("arcad: WARNING ARCA_ALLOW_UNSIGNED=1: unsigned apps are served; development only");

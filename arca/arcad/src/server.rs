@@ -11,12 +11,12 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use arca_store::codec::{Reader, Writer};
 use arca_store::model::{caps, valid_user};
 use arca_store::secret::LockedBuf;
-use arca_store::{flags, Access, KdfParams, Class, Error, ItemId, Kind, LockState, NewItem, Provenance, Recipient, RootKey, Shape, Store};
+use arca_store::{flags, Access, KdfParams, Class, Error, ItemId, Kind, LockState, NewItem, Provenance, Recipient, RootKey, Scheme, Shape, Store};
 use ed25519_dalek::{Signer, SigningKey};
 
 use crate::courier::{app_persona, CourierLabel};
 use crate::label::Label;
-use crate::proto::{courier_op, op, status, MAX_SIGN_MSG};
+use crate::proto::{broker_op, courier_op, op, status, MAX_SIGN_MSG};
 
 /// Personas arrive with the label once insula.md §13.6 lands; until then
 /// every app item is in the user's main persona.
@@ -30,6 +30,13 @@ pub struct State {
     stores: HashMap<String, Store>,
     audit: Option<File>,
     handles: crate::handles::Handles,
+    tickets: crate::tickets::Tickets,
+    /// Unix seconds; tests move it to expire cookies.
+    pub clock: fn() -> u64,
+}
+
+fn system_now() -> u64 {
+    SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0)
 }
 
 /// A reply body. Secret bodies stay in locked memory up to the socket.
@@ -100,13 +107,18 @@ impl State {
     pub fn new(dir: PathBuf) -> std::io::Result<State> {
         std::fs::DirBuilder::new().recursive(true).create(&dir)?;
         let audit = OpenOptions::new().create(true).append(true).mode(0o600).open(dir.join("audit.log")).ok();
-        Ok(State { dir, kdf_default: KdfParams::NO_TPM, stores: HashMap::new(), audit, handles: Default::default() })
+        Ok(State { dir, kdf_default: KdfParams::NO_TPM, stores: HashMap::new(), audit, handles: Default::default(), tickets: Default::default(), clock: system_now })
     }
 
     pub fn handle(&mut self, who: &Label, op: u16, body: &[u8]) -> Reply {
         let mut item: Option<ItemId> = None;
         let r = match who {
             Label::App { user, publisher, app_id } => match Recipient::app(*publisher, app_id) {
+                Ok(me) => self.app_op(user, &me, op, body, &mut item),
+                Err(_) => reply(status::UNKNOWN_PEER),
+            },
+            Label::WebBroker { user, .. } if op == broker_op::W_TICKET => self.broker_ticket(user, body),
+            Label::WebBroker { user, publisher, app_id } => match Recipient::app(*publisher, app_id) {
                 Ok(me) => self.app_op(user, &me, op, body, &mut item),
                 Err(_) => reply(status::UNKNOWN_PEER),
             },
@@ -129,6 +141,7 @@ impl State {
                 let p: String = publisher[..6].iter().map(|b| format!("{b:02x}")).collect();
                 format!("app:{app_id}/{p}@{user}")
             }
+            Label::WebBroker { user, app_id, .. } => format!("broker:{app_id}@{user}"),
             Label::Vestibulum => "vestibulum".into(),
             Label::TrustedUi => "ui".into(),
             Label::Courier(c) => match &c.endpoint {
@@ -585,6 +598,68 @@ impl State {
         }
     }
 
+    // ── the web broker ───────────────────────────────────────────────────
+
+    /// A ticket for one credentialed request (arca.md §8.2). Only for a
+    /// user whose store is open: a ticket is useless otherwise.
+    fn broker_ticket(&mut self, user: &str, body: &[u8]) -> Reply {
+        use crate::tickets::{Reason, Ticket};
+        let mut r = Reader::new(body);
+        let parsed = (|| {
+            let ep = crate::proto::read_endpoint(&mut r)?;
+            let partition = r.str(caps::HOST)?;
+            let method = r.u8()?;
+            let path = r.str(PATH_MAX)?;
+            let reason = r.u8()?;
+            let initiator = r.str(caps::HOST)?;
+            let gesture = r.u8()?;
+            r.end()?;
+            Ok::<_, Error>((ep, partition, method, path, reason, initiator, gesture))
+        })();
+        let Ok((ep, partition, method, path, reason, initiator, gesture)) = parsed else { return malformed() };
+        let (Recipient::Endpoint { host, port, .. }, Some(reason)) = (ep, Reason::from_u8(reason)) else { return malformed() };
+        if Recipient::endpoint(Scheme::Https, &host, port, Some(partition)).is_err()
+            || !(1..=6).contains(&method)
+            || !path.starts_with('/')
+            || gesture > 1
+            || (!initiator.is_empty() && Recipient::endpoint(Scheme::Https, initiator, 443, None).is_err())
+        {
+            return malformed();
+        }
+        if !self.stores.contains_key(user) {
+            return reply(status::LOCKED);
+        }
+        let t = Ticket {
+            user: user.into(),
+            partition: partition.into(),
+            host,
+            port,
+            method,
+            path: path.into(),
+            reason,
+            initiator: initiator.to_ascii_lowercase(),
+            gesture: gesture == 1,
+        };
+        match self.tickets.issue(t) {
+            Ok(id) => ok(id.to_vec()),
+            Err(_) => reply(status::FULL),
+        }
+    }
+
+    /// The ticket a web courier names for this request, checked against
+    /// its own label.
+    fn courier_ticket(&mut self, c: &CourierLabel, path: &str, id: &[u8; 16], redeem: bool) -> Option<crate::tickets::Ticket> {
+        let Recipient::Endpoint { host, port, partition: Some(partition), .. } = &c.endpoint else { return None };
+        let ok = |t: &crate::tickets::Ticket| {
+            t.user == c.user && &t.partition == partition && &t.host == host && t.port == *port && t.path == path
+        };
+        if redeem {
+            self.tickets.redeem(id, ok)
+        } else {
+            self.tickets.response(id, ok)
+        }
+    }
+
     // ── couriers ─────────────────────────────────────────────────────────
 
     /// A courier asks only after its TLS handshake with its endpoint, and
@@ -655,35 +730,123 @@ impl State {
                     let name = r.str(COOKIE_NAME_MAX)?;
                     let value = r.bytes(COOKIE_VALUE_MAX)?;
                     let attrs = r.bytes(COOKIE_ATTRS_MAX)?;
+                    let path = r.str(PATH_MAX)?;
+                    let ticket = if r.remaining() == 16 { Some(r.array::<16>()?) } else { None };
                     r.end()?;
-                    Ok::<_, Error>((name, value, attrs))
+                    Ok::<_, Error>((name, value, attrs, path, ticket))
                 })();
-                let Ok((name, value, attrs)) = parsed else { return malformed() };
-                if name.is_empty() || !name.bytes().all(is_token_char) {
-                    return malformed();
+                let Ok((name, value, attrs, path, ticket)) = parsed else { return malformed() };
+                let Recipient::Endpoint { host, port, partition, .. } = &c.endpoint else { return reply(status::DENIED) };
+                // A web courier's cookies come only from a response to a
+                // request the broker ticketed; an app's courier has none.
+                match (partition, ticket) {
+                    (None, None) => {}
+                    (Some(_), Some(t)) if self.courier_ticket(c, path, &t, false).is_some() => {}
+                    _ => return reply(status::DENIED),
                 }
+                let now = (self.clock)();
+                let sc = match crate::cookie::parse(name, value, attrs, host, path, now) {
+                    Ok(sc) => sc,
+                    // Ignored, as a browser ignores it; the courier drops the header either way.
+                    Err(_) => return reply(status::DENIED),
+                };
+                let Ok(rec) = Recipient::endpoint(Scheme::Https, &sc.domain, *port, partition.as_deref()) else {
+                    return reply(status::DENIED);
+                };
+                let who = Access { persona: &c.persona, recipient: &rec };
                 let Some(store) = self.stores.get_mut(&c.user) else { return reply(status::LOCKED) };
-                // One record per (endpoint, name): a new Set-Cookie replaces it.
-                let old: Vec<ItemId> = tri!(store.list(&who))
+                let mut sc = sc;
+                let mut cookies: Vec<(ItemId, Option<crate::cookie::Attrs>, String)> = tri!(store.list(&who))
                     .into_iter()
-                    .filter(|m| m.kind == Kind::Cookie && m.account == name)
-                    .map(|m| m.id)
+                    .filter(|m| m.kind == Kind::Cookie)
+                    .map(|m| (m.id, crate::cookie::Attrs::decode(&m.scope), m.account))
                     .collect();
-                for id in old {
-                    tri!(store.delete(&id, &who));
+                // One cookie per (name, domain, path, host-only): a new one
+                // replaces it, keeping its creation time; an expired one
+                // deletes it. An unreadable scope is dropped.
+                let same = |a: &Option<crate::cookie::Attrs>, n: &str| {
+                    a.as_ref().is_none_or(|a| n == sc.name && a.path == sc.attrs.path && a.host_only == sc.attrs.host_only)
+                };
+                for (id, a, n) in &cookies {
+                    if same(a, n) {
+                        if let Some(a) = a {
+                            sc.attrs.created = a.created;
+                        }
+                        tri!(store.delete(id, &who));
+                    }
                 }
+                cookies.retain(|(_, a, n)| !same(a, n));
+                if sc.expired(now) {
+                    return ok(Vec::new());
+                }
+                // Expired ones go; then, if the group is full, the oldest.
+                let mut live: Vec<(ItemId, u64)> = Vec::new();
+                for (id, a, _) in &cookies {
+                    match a {
+                        Some(a) if a.expires.is_none_or(|e| e > now) => live.push((*id, a.created)),
+                        _ => tri!(store.delete(id, &who)),
+                    }
+                }
+                live.sort_by_key(|c| c.1);
+                let excess = (live.len() + 1).saturating_sub(crate::cookie::PER_GROUP);
+                for (id, _) in live.iter().take(excess) {
+                    tri!(store.delete(id, &who));
+                }
+                let scope = sc.attrs.encode();
                 let m = tri!(store.add(NewItem {
                     persona: &c.persona,
-                    recipient: c.endpoint.clone(),
+                    recipient: rec.clone(),
                     class: Class::AfterFirstUnlock,
                     kind: Kind::Cookie,
                     provenance: Provenance::ServerSet,
-                    account: name,
-                    scope: attrs,
-                    value,
+                    account: &sc.name,
+                    scope: &scope,
+                    value: &sc.value,
                 }));
                 *item = Some(m.id);
                 ok(Vec::new())
+            }
+            courier_op::COOKIES => {
+                let Ok(path) = r.str(PATH_MAX) else { return malformed() };
+                let ticket = if r.remaining() == 16 { r.array::<16>().ok() } else { None };
+                if r.end().is_err() || !path.starts_with('/') {
+                    return malformed();
+                }
+                let Recipient::Endpoint { host, port, partition, .. } = &c.endpoint else { return reply(status::DENIED) };
+                // A web courier redeems the broker's ticket for exactly this
+                // request, and SameSite goes by it. An app's courier has none.
+                let ctx = match (partition, ticket) {
+                    (None, None) => None,
+                    (Some(_), Some(t)) => match self.courier_ticket(c, path, &t, true) {
+                        Some(t) => Some(t),
+                        None => return reply(status::DENIED),
+                    },
+                    _ => return reply(status::DENIED),
+                };
+                let now = (self.clock)();
+                let Some(store) = self.stores.get_mut(&c.user) else { return reply(status::LOCKED) };
+                let mut found = Vec::new();
+                for d in crate::cookie::candidate_domains(host) {
+                    let Ok(rec) = Recipient::endpoint(Scheme::Https, &d, *port, partition.as_deref()) else { continue };
+                    let who = Access { persona: &c.persona, recipient: &rec };
+                    for m in tri!(store.list(&who)).into_iter().filter(|m| m.kind == Kind::Cookie) {
+                        let Some(a) = crate::cookie::Attrs::decode(&m.scope) else { continue };
+                        if a.expires.is_some_and(|e| e <= now) {
+                            tri!(store.delete(&m.id, &who));
+                            continue;
+                        }
+                        if crate::cookie::applies(&d, &a, host, path, now)
+                            && ctx.as_ref().is_none_or(|t| crate::cookie::same_site_allows(&a, t))
+                        {
+                            let (_, v) = tri!(store.release(&m.id, &who, None));
+                            found.push((m.account, v, a.path.len(), a.created));
+                        }
+                    }
+                }
+                if found.is_empty() {
+                    return ok(Vec::new());
+                }
+                Reply { status: status::OK, body: Body::Secret(tri!(crate::cookie::header(found).map_err(Error::Io))) }
             }
             _ => reply(status::DENIED),
         }
@@ -708,11 +871,8 @@ impl State {
 const COOKIE_NAME_MAX: usize = 256;
 const COOKIE_VALUE_MAX: usize = 4096;
 const COOKIE_ATTRS_MAX: usize = 4096;
-
-/// RFC 9110 token characters.
-fn is_token_char(c: u8) -> bool {
-    c.is_ascii_alphanumeric() || b"!#$%&'*+-.^_`|~".contains(&c)
-}
+/// A request path as the courier sent it.
+const PATH_MAX: usize = 8192;
 
 /// A strong password: four groups of five from [a-zA-Z0-9] joined by '-'
 /// (about 119 bits), typeable on any keyboard and accepted by nearly every
