@@ -1419,7 +1419,7 @@ impl EnvelopeFrontend {
                 Some(u) => uid.is_some_and(|uid| u.contains(&uid)),
             };
             win.role = match p.hints.role {
-                Some(fresco_protocol::WmRole::Hud) | None => fresco_protocol::WmRole::Document,
+                Some(fresco_protocol::WmRole::Hud | fresco_protocol::WmRole::Pip) | None => fresco_protocol::WmRole::Document,
                 Some(fresco_protocol::WmRole::Notification) if !may_notify => fresco_protocol::WmRole::Document,
                 Some(r) => r,
             };
@@ -1483,7 +1483,8 @@ impl EnvelopeFrontend {
                 surface_id: w.id as u32,
                 owner_app:  format!("client:{}", w.owner),
                 owner_uid:  w.owner_uid,
-                role:       w.role,
+                // A slot child kept on screen out of its slot is PiP.
+                role:       if w.kept_by.is_some() { fresco_protocol::WmRole::Pip } else { w.role },
                 rect: WmRect {
                     x: w.pos.0 as i32,
                     y: w.pos.1 as i32,

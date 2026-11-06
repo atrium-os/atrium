@@ -449,7 +449,7 @@ fn role(r: WmRole) -> Role {
         WmRole::Dialog => Role::Dialog,
         WmRole::Chrome => Role::Chrome,
         WmRole::Notification => Role::Notification,
-        WmRole::Document | WmRole::Hud => Role::Document,
+        WmRole::Document | WmRole::Hud | WmRole::Pip => Role::Document,
     }
 }
 

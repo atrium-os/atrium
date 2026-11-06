@@ -61,6 +61,7 @@ fn layer(role: WmRole) -> i32 {
         WmRole::Hud => 1,
         WmRole::Chrome => 2,
         WmRole::Panel => 4,
+        WmRole::Pip => PIP_LAYER,
         WmRole::Document => DOC_FOCUSED,
         WmRole::Background => 7,
     }
@@ -122,6 +123,13 @@ fn rect_for(screen: &Screen, role: WmRole) -> WmRect {
         }
         WmRole::Hud | WmRole::Chrome => {
             WmRect { x: screen.rect.x, y: screen.rect.y, w: screen.rect.w, h: screen.bar_h }
+        }
+        // Placeholder: a quarter of the work area wide, bottom right, at
+        // 16:9, until forum-wm's pip placement.
+        WmRole::Pip => {
+            let w = wa.w / 4;
+            let h = w * 9 / 16;
+            WmRect { x: wa.x + wa.w - w, y: wa.y + wa.h - h, w, h }
         }
         // frescod's band for toasts (it clamps them there anyway).
         WmRole::Notification => {

@@ -291,6 +291,12 @@ pub enum WmRole {
     /// role only to the uids it is configured with (Forum's shelf). Any
     /// other client asking for it gets `Document`.
     Notification,
+    /// Picture-in-picture (atrium-player-pip-keys.md §3.1): a slot child
+    /// limend released with `SlotBind::keep_shown`. Only frescod reports it
+    /// (WM_ENUMERATE), for as long as the child is out of its slot; a
+    /// client asking for it gets `Document`. Its aspect ratio is the
+    /// window's own size.
+    Pip,
 }
 
 /// Where notification surfaces may be, for a screen `width` x `height`
