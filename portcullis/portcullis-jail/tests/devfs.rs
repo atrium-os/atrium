@@ -85,6 +85,7 @@ fn audio_capabilities_get_their_socket_and_no_sound_device() {
         ("audio = true\n", ["audio"].as_slice()),
         ("microphone = true\n", ["audio-capture"].as_slice()),
         ("audio-monitor = true\n", ["audio-monitor"].as_slice()),
+        ("audio-control = true\n", ["audio-control"].as_slice()),
         ("audio = true\nmicrophone = true\naudio-monitor = true\n", ["audio", "audio-capture", "audio-monitor"].as_slice()),
     ] {
         let jc = build(&manifest(&format!("[capabilities]\n{caps}")), &opts()).expect("builds");
@@ -93,13 +94,13 @@ fn audio_capabilities_get_their_socket_and_no_sound_device() {
         }
         let conf = jc.render_jail_conf();
         assert!(!conf.contains("dsp") && !conf.contains("mixer"), "{caps}: {conf}");
-        for name in ["audio", "audio-capture", "audio-monitor"] {
+        for name in ["audio", "audio-capture", "audio-monitor", "audio-control"] {
             let n = sock(&jc, name);
             assert_eq!(n, want.contains(&name) as usize, "{caps}: {name} mounted {n} times");
         }
     }
     let jc = build(&manifest(""), &opts()).expect("builds");
-    for name in ["audio", "audio-capture", "audio-monitor"] {
+    for name in ["audio", "audio-capture", "audio-monitor", "audio-control"] {
         assert_eq!(sock(&jc, name), 0, "no capability, no {name} socket");
     }
 }

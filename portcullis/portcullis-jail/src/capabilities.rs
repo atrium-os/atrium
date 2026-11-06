@@ -42,6 +42,9 @@ pub fn apply_all(
     if caps.audio_monitor == Some(true) {
         apply_audio_monitor(jc, opts);
     }
+    if caps.audio_control == Some(true) {
+        apply_audio_control(jc, opts);
+    }
     if let Some(paths) = &caps.filesystem {
         for p in paths {
             apply_filesystem(p, jc, opts)?;
@@ -181,6 +184,12 @@ pub fn apply_microphone(jc: &mut JailConfig, opts: &BuildOpts) {
 /// to hear the system mix or another app's stream.
 pub fn apply_audio_monitor(jc: &mut JailConfig, opts: &BuildOpts) {
     apply_socket("audio-monitor.sock", jc, opts);
+}
+
+/// `audio-control`: choragusd's volume-control socket (`audio-control/`), for
+/// the volume UI. It carries levels and app names, never samples.
+pub fn apply_audio_control(jc: &mut JailConfig, opts: &BuildOpts) {
+    apply_socket("audio-control.sock", jc, opts);
 }
 
 pub fn apply_filesystem(spec: &str, jc: &mut JailConfig, opts: &BuildOpts) -> Result<(), BuildError> {

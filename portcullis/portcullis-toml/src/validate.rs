@@ -156,6 +156,11 @@ fn validate_capabilities(c: &Capabilities, ctx: &str, r: &mut Report) {
             "{ctx}.usb-hid = true: typically restricted to input services; \
              requires explicit policy approval"));
     }
+    if c.audio_control == Some(true) {
+        r.warnings.push(format!(
+            "{ctx}.audio-control = true: restricted to the volume UI (Forum, Curia); \
+             requires explicit policy approval"));
+    }
     if c.camera == Some(true) {
         r.warnings.push(format!(
             "{ctx}.camera = true: requires user prompt; document the use case"));

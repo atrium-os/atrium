@@ -41,6 +41,8 @@ dependencies = [
  "portcullis-peer",
  "portcullis-policy",
  "portcullis-toml",
+ "serde",
+ "toml",
 ]
 
 [[package]]

@@ -8,6 +8,8 @@ use lyra_protocol::wire;
 pub const CAP_AUDIO: u8 = 1;
 pub const CAP_MICROPHONE: u8 = 2;
 pub const CAP_MONITOR: u8 = 4;
+/// The volume UI: other apps' levels, the master, the output. No samples.
+pub const CAP_CONTROL: u8 = 8;
 
 /// Human-readable names of the set capability bits, for logs.
 pub fn cap_names(bits: u8) -> Vec<&'static str> {
@@ -15,6 +17,7 @@ pub fn cap_names(bits: u8) -> Vec<&'static str> {
     if bits & CAP_AUDIO != 0 { v.push("audio"); }
     if bits & CAP_MICROPHONE != 0 { v.push("microphone"); }
     if bits & CAP_MONITOR != 0 { v.push("audio_monitor"); }
+    if bits & CAP_CONTROL != 0 { v.push("audio_control"); }
     v
 }
 

@@ -3035,7 +3035,8 @@ vssh "LYRA_PLAY_RATE=44100 LYRA_PLAY_CHANNELS=1 /root/lyra-play /tmp/choragus.so
 **As jailed services** (lyra-v1.md §3): lyrad as `_lyra` with the atrium_audio
 devfs ruleset 24 and its socket `/atrium/sockets/lyrad/lyrad.sock` reachable only
 by `_choragus`; choragusd as `_choragus` with no device, `--serve`, apps at
-`/atrium/sockets/{audio,audio-capture,audio-monitor}/` (one per capability),
+`/atrium/sockets/{audio,audio-capture,audio-monitor}/` (one per capability)
+and the volume UI's `audio-control/`, users' volumes in `/var/db/choragus/`,
 identity only from `/var/run/atrium/app-registry`. `sh scripts/lyra-service.sh
 <lyrad> <choragusd>` commissions both, then atrium-portcullisd-bootstrap starts
 `lyra/etc/services.d/35-atrium-lyrad.toml` and

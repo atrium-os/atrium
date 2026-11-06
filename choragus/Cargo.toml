@@ -13,6 +13,9 @@ path = "src/lib.rs"
 [dependencies]
 lyra-protocol = { path = "../lyra-protocol" }
 libc = "0.2"
+# The user volume store (<state>/<user>.toml).
+serde = { version = "1", features = ["derive"] }
+toml = "0.8"
 # Choragus reads the REAL Portcullis grant (the per-user policy portcullisd
 # writes after user approval) — the capability authority for the platform.
 portcullis-policy = { path = "../portcullis/portcullis-policy" }

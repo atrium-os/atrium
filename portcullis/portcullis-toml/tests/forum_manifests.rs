@@ -38,3 +38,11 @@ fn chrome_apps_drive_but_never_manage() {
         assert_eq!(m.capabilities.window_management, None, "{rel}");
     }
 }
+
+#[test]
+fn only_the_bar_holds_the_volume_control() {
+    assert_eq!(load("forum-bar/atrium.toml").capabilities.audio_control, Some(true));
+    for rel in ["forum-wm/atrium.toml", "forum-dock/atrium.toml", "forum-overview/atrium.toml"] {
+        assert_eq!(load(rel).capabilities.audio_control, None, "{rel}");
+    }
+}

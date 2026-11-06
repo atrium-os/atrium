@@ -17,3 +17,4 @@ pub mod daemon;
 pub mod grant;
 pub mod identity;
 pub mod policy;
+pub mod volumes;
