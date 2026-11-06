@@ -68,7 +68,9 @@ pub use fresco_protocol::TextMeasureResponse as TextMetrics;
 #[derive(Debug, Clone)]
 pub enum Event {
     Resized        { window_id: u32, width: u32, height: u32 },
-    FocusChanged   { window_id: u32, gained: bool },
+    /// `cause`: what moved it (`fresco_protocol::focus_cause`): show a
+    /// focus ring only for `KEYBOARD`.
+    FocusChanged   { window_id: u32, gained: bool, cause: u8 },
     CloseRequested { window_id: u32 },
     DpiChanged     { window_id: u32, scale_factor: f32 },
     /// The nodes of this window that are not drawn (each with a
@@ -88,6 +90,11 @@ pub enum Event {
     /// The display's mode changed (a switch, or a monitor plugged or
     /// swapped): the new screen. Lay out again for it.
     DisplayChanged(DisplayInfoResponse),
+    /// The system appearance changed (light/dark): draw in it.
+    Appearance(fresco_protocol::AppearancePayload),
+    /// This window spans several monitors (fresco-span.md): each monitor's
+    /// tile of it and the hidden bezel strips; no tiles = the span ended.
+    Span(fresco_protocol::WindowSpanEvent),
     /// Keyboard press/release. `window_id == 0` indicates broadcast
     /// (no focused window).
     Key {
@@ -686,6 +693,26 @@ impl Connection {
         self.wm_response(control::OP_WM_MIRROR_OUTPUT).map(|_| ())
     }
 
+    /// Span window `window_id` over the monitors `members` (identities), with
+    /// bezel gaps between columns and rows (WM only; `OP_WM_SPAN_GROUP`,
+    /// fresco-span.md). Returns the rect the window must cover; lay it out
+    /// there. No members, or window 0, ends the span (the rect is zero).
+    pub fn wm_span_group(&mut self, window_id: u32, members: Vec<u64>, gaps_x: Vec<u32>, gaps_y: Vec<u32>) -> io::Result<fresco_protocol::WmRect> {
+        let p = fresco_protocol::WmSpanGroupPayload { window_id, members, gaps_x, gaps_y };
+        self.send_window_managed(control::OP_WM_SPAN_GROUP, &p)?;
+        let m = self.wm_response(control::OP_WM_SPAN_GROUP)?;
+        decode::<fresco_protocol::WmSpanGroupReply>(&m.payload)
+            .map(|r| r.rect)
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, format!("decode SPAN_GROUP reply: {e}")))
+    }
+
+    /// Set the system appearance (WM only; `OP_WM_SET_APPEARANCE`): every
+    /// client gets [`Event::Appearance`].
+    pub fn wm_set_appearance(&mut self, a: fresco_protocol::AppearancePayload) -> io::Result<()> {
+        self.send_window_managed(control::OP_WM_SET_APPEARANCE, &a)?;
+        self.wm_response(control::OP_WM_SET_APPEARANCE).map(|_| ())
+    }
+
     /// Set a monitor's scale in thousandths (0 = automatic), by identity
     /// (WM only; `OP_WM_SET_OUTPUT_SCALE`).
     pub fn wm_set_output_scale(&mut self, identity: u64, scale_milli: u32) -> io::Result<()> {
@@ -801,6 +828,19 @@ impl Connection {
     /// or anchors to an edge needs it, and the ones that need it most — jailed
     /// apps — cannot be told out-of-band, because jail(8) does not carry an
     /// environment in.
+    /// The system appearance now (light or dark); changes arrive as
+    /// [`Event::Appearance`].
+    pub fn appearance(&mut self) -> io::Result<fresco_protocol::AppearancePayload> {
+        self.send_payload(control::OP_APPEARANCE, 0, &())?;
+        loop {
+            let m = self.recv_reply()?;
+            if m.opcode_class == CLASS_DISPLAY && m.op == control::OP_APPEARANCE && m.flags & flag::IS_RESPONSE != 0 {
+                return decode(&m.payload)
+                    .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, format!("decode APPEARANCE reply: {e}")));
+            }
+        }
+    }
+
     pub fn display_info(&mut self) -> io::Result<DisplayInfoResponse> {
         self.send_payload(control::OP_DISPLAY_INFO, 0, &())?;
         loop {
@@ -1053,7 +1093,7 @@ fn decode_event(op: u16, payload: &[u8]) -> Event {
         },
         EV_WINDOW_FOCUS_CHANGED => match decode::<WindowFocusChangedEvent>(payload) {
             Ok(p) => Event::FocusChanged {
-                window_id: p.window_id, gained: p.gained,
+                window_id: p.window_id, gained: p.gained, cause: p.cause,
             },
             Err(_) => Event::Unknown { op, payload: payload.to_vec() },
         },
@@ -1091,6 +1131,14 @@ fn decode_event(op: u16, payload: &[u8]) -> Event {
         },
         EV_WINDOW_DESTROYED => match decode::<WindowDestroyedEvent>(payload) {
             Ok(p) => Event::WindowDestroyed { window_id: p.window_id },
+            Err(_) => Event::Unknown { op, payload: payload.to_vec() },
+        },
+        control::EV_APPEARANCE_CHANGED => match decode::<fresco_protocol::AppearancePayload>(payload) {
+            Ok(p) => Event::Appearance(p),
+            Err(_) => Event::Unknown { op, payload: payload.to_vec() },
+        },
+        control::EV_WINDOW_SPAN => match decode::<fresco_protocol::WindowSpanEvent>(payload) {
+            Ok(p) => Event::Span(p),
             Err(_) => Event::Unknown { op, payload: payload.to_vec() },
         },
         control::EV_DISPLAY_CHANGED => match decode::<DisplayInfoResponse>(payload) {
@@ -1161,10 +1209,10 @@ mod tests {
             other => panic!("expected Resized, got {other:?}"),
         }
 
-        let p = WindowFocusChangedEvent { window_id: 3, gained: true };
+        let p = WindowFocusChangedEvent { window_id: 3, gained: true, cause: 2 };
         let bytes = encode(&p).unwrap();
         match decode_event(EV_WINDOW_FOCUS_CHANGED, &bytes) {
-            Event::FocusChanged { window_id: 3, gained: true } => {}
+            Event::FocusChanged { window_id: 3, gained: true, cause: 2 } => {}
             other => panic!("expected FocusChanged, got {other:?}"),
         }
 

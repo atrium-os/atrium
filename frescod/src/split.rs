@@ -451,7 +451,13 @@ impl Broker {
 
         // Its windows' events, as records.
         let (ev_tx, ev_rx) = mpsc::channel::<DisplayEvent>();
-        subs.lock().unwrap().push(Sub { client_id, wm: false, tx: SubTx::Split(ev_tx) });
+        {
+            /* The appearance now, then every change after it, in order. */
+            let mut s = subs.lock().unwrap();
+            let now = *socket_server::APPEARANCE.lock().unwrap();
+            let _ = ev_tx.send(DisplayEvent::AppearanceChanged(now));
+            s.push(Sub { client_id, wm: false, tx: SubTx::Split(ev_tx) });
+        }
         {
             let r = r.clone();
             std::thread::Builder::new().name(format!("frescod-split-ev-{client_id}")).spawn(move || {
@@ -935,6 +941,14 @@ fn event_records(r: &Renderer, ev: &DisplayEvent) -> Vec<Msg> {
         E::DragEnd { window_id, drag_id, dropped } => {
             r.local_of(*window_id).map(|window| Msg::DragEnd { window, drag_id: *drag_id, dropped: *dropped }).into_iter().collect()
         }
+        E::AppearanceChanged(a) => vec![Msg::Appearance { scheme: a.scheme, high_contrast: a.high_contrast, accent: a.accent }],
+        E::WindowSpan { window_id, tiles, hidden } => {
+            let Some(window) = r.local_of(*window_id) else { return Vec::new() };
+            let mut v: Vec<Msg> = tiles.iter().map(|t| Msg::SpanTile { window, rect: t.rect, present: t.present }).collect();
+            v.extend(hidden.iter().map(|&rect| Msg::SpanHidden { window, rect }));
+            v.push(Msg::SpanDone { window });
+            v
+        }
         _ => event_record(r, ev).into_iter().collect(),
     }
 }
@@ -942,7 +956,7 @@ fn event_records(r: &Renderer, ev: &DisplayEvent) -> Vec<Msg> {
 fn event_record(r: &Renderer, ev: &DisplayEvent) -> Option<Msg> {
     use DisplayEvent as E;
     let (global, input) = match *ev {
-        E::WindowFocusChanged { window_id, gained } => return Some(Msg::Focus { window: r.local_of(window_id)?, gained }),
+        E::WindowFocusChanged { window_id, gained, cause } => return Some(Msg::Focus { window: r.local_of(window_id)?, gained, cause }),
         E::WindowCloseRequested { window_id } => return Some(Msg::CloseRequested { window: r.local_of(window_id)? }),
         E::VideoPresented { window_id, layer, seq, vblank_ns, dropped } => {
             return Some(Msg::VideoPresented { window: r.local_of(window_id)?, layer, seq, vblank_ns, dropped });

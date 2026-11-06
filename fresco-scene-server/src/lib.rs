@@ -20,3 +20,4 @@ pub mod render;
 pub mod window;
 pub mod text;
 pub mod video;
+pub mod span;

@@ -194,6 +194,11 @@ fn fan_out(subs: &EventSubs, comp: &Arc<Mutex<Compositor>>, ev: DisplayEvent, ba
     };
     let owner = to.owner();
     let mut s = subs.lock().unwrap();
+    if let DisplayEvent::AppearanceChanged(a) = &ev {
+        /* Under the subscriber lock: a split renderer that subscribes
+         * takes the value and the later changes in one order. */
+        *APPEARANCE.lock().unwrap() = *a;
+    }
     s.retain(|sub| {
         if !to.reaches(sub) {
             return true;
@@ -208,6 +213,10 @@ fn fan_out(subs: &EventSubs, comp: &Arc<Mutex<Compositor>>, ev: DisplayEvent, ba
         }
     });
 }
+
+/// The system appearance as last told to clients, for a split renderer
+/// that starts after the change. Written under the subscriber lock.
+pub static APPEARANCE: Mutex<fresco_protocol::AppearancePayload> = Mutex::new(fresco_protocol::AppearancePayload { scheme: 0, high_contrast: false, accent: 0 });
 
 /// Set by frescod (not the renderer, which shares this file): turns each
 /// event into the drag events it causes.
@@ -268,14 +277,15 @@ fn route(ev: &DisplayEvent, comp: &Arc<Mutex<Compositor>>) -> Route {
         | E::InputPointerMotion { window_id, .. }
         | E::InputPointerButton { window_id, .. }
         | E::InputPointerScroll { window_id, .. } => window_id,
-        E::DisplayChanged { .. } => return Route::All,
+        E::DisplayChanged { .. } | E::AppearanceChanged(_) => return Route::All,
         E::WindowFillsDropped { window_id, .. }
         | E::Drag { window_id, .. }
         | E::Drop { window_id, .. }
         | E::DragEnd { window_id, .. }
         | E::EmbedToken { window_id, .. }
         | E::VideoReleased { window_id, .. }
-        | E::VideoPresented { window_id, .. } => return Route::Owner(owner_of(window_id)),
+        | E::VideoPresented { window_id, .. }
+        | E::WindowSpan { window_id, .. } => return Route::Owner(owner_of(window_id)),
     };
     if window_id == 0 {
         return Route::WmOnly;

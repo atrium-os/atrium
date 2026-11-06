@@ -1593,7 +1593,7 @@ pub unsafe extern "C" fn atrium_window_poll_event(
                     kind: ATRIUM_EV_WINDOW_RESIZED, _pad: 0,
                     window_id, arg1: width, arg2: height,
                 },
-                fresco_client::Event::FocusChanged { window_id, gained } => AtriumWindowEvent {
+                fresco_client::Event::FocusChanged { window_id, gained, .. } => AtriumWindowEvent {
                     kind: ATRIUM_EV_WINDOW_FOCUS_CHANGED, _pad: 0,
                     window_id, arg1: if gained { 1 } else { 0 }, arg2: 0,
                 },

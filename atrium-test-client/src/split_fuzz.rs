@@ -184,7 +184,7 @@ fn renderer(seed: u64) {
                 [
                     Msg::Geometry { window, width: 10, height: 10 },
                     Msg::FrameDone { window, slot: 0 },
-                    Msg::Focus { window, gained: true },
+                    Msg::Focus { window, gained: true, cause: 1 },
                     Msg::Client { width: 1, height: 1, refresh_mhz: 1, pixels: false },
                 ][r.below(4) as usize]
                     .encode()

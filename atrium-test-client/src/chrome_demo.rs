@@ -84,6 +84,7 @@ fn main() -> std::io::Result<()> {
         wm.wm_declare_layout(&WmDeclareLayoutPayload {
             slots: vec![slot(ids[0], 100, 100, 1), slot(ids[1], 500, 250, 0)],
             focus,
+            focus_cause: 0,
         })?;
         eprintln!("step {step}: focus {focus}");
         for c in [&mut d1, &mut d2, &mut wm] {

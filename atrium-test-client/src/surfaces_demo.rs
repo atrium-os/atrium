@@ -67,6 +67,7 @@ fn main() -> std::io::Result<()> {
                 slot(c, cx, 250, cw, ch, 0),
             ],
             focus: c,
+            focus_cause: 0,
         })?;
         eprintln!("step {step}: C at x={cx}");
         // Drain events so the server's writer never blocks on us.

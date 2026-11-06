@@ -129,7 +129,8 @@ pub enum Msg {
     /// The WM gave `window` this size (the surface the next frame fills).
     Geometry { window: u32, width: u32, height: u32 },
     /// Focus gained or lost.
-    Focus { window: u32, gained: bool },
+    /// `cause`: what moved it (`fresco_protocol::focus_cause`, 0..=3).
+    Focus { window: u32, gained: bool, cause: u8 },
     /// The user asked to close the window.
     CloseRequested { window: u32 },
     /// The window is on a monitor of this scale (thousandths, 500..=4000):
@@ -155,6 +156,17 @@ pub enum Msg {
     /// Frame `seq` of the layer first showed at `vblank_ns`, `dropped`
     /// frames skipped since the last one.
     VideoPresented { window: u32, layer: u32, seq: u32, vblank_ns: u64, dropped: u32 },
+    /// The system appearance (window 0): sent after [`Msg::Client`] and on
+    /// every change. `scheme` 0 light, 1 dark.
+    Appearance { scheme: u32, high_contrast: bool, accent: u32 },
+    /// One tile of `window`'s span (fresco-span.md), `[x, y, w, h]` in
+    /// window pixels; the tiles and hidden strips of one update precede
+    /// its [`Msg::SpanDone`].
+    SpanTile { window: u32, rect: [u32; 4], present: bool },
+    /// One hidden bezel strip of `window`'s span.
+    SpanHidden { window: u32, rect: [u32; 4] },
+    /// The span update is complete (with no tiles: the span ended).
+    SpanDone { window: u32 },
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -203,6 +215,10 @@ mod kind {
     pub const VIDEO_SLOTS: u32 = 0x130;
     pub const VIDEO_DONE: u32 = 0x131;
     pub const VIDEO_PRESENTED: u32 = 0x132;
+    pub const APPEARANCE: u32 = 0x140;
+    pub const SPAN_TILE: u32 = 0x141;
+    pub const SPAN_HIDDEN: u32 = 0x142;
+    pub const SPAN_DONE: u32 = 0x143;
 }
 
 /// Layout: word 0 kind, word 1 window, words 2..8 arguments, bytes 32..96
@@ -272,8 +288,11 @@ impl Msg {
             | Msg::VideoRate { window, .. }
             | Msg::VideoSlots { window, .. }
             | Msg::VideoDone { window, .. }
-            | Msg::VideoPresented { window, .. } => window,
-            Msg::Client { .. } => 0,
+            | Msg::VideoPresented { window, .. }
+            | Msg::SpanTile { window, .. }
+            | Msg::SpanHidden { window, .. }
+            | Msg::SpanDone { window } => window,
+            Msg::Client { .. } | Msg::Appearance { .. } => 0,
         }
     }
 
@@ -330,9 +349,10 @@ impl Msg {
                 r.put(3, *height);
                 r
             }
-            Msg::Focus { window, gained } => {
+            Msg::Focus { window, gained, cause } => {
                 let mut r = Rec::new(FOCUS, *window);
                 r.put(2, *gained as u32);
+                r.put(3, *cause as u32);
                 r
             }
             Msg::CloseRequested { window } => Rec::new(CLOSE, *window),
@@ -475,6 +495,29 @@ impl Msg {
                 r.put(6, *dropped);
                 r
             }
+            Msg::Appearance { scheme, high_contrast, accent } => {
+                let mut r = Rec::new(APPEARANCE, 0);
+                r.put(2, *scheme);
+                r.put(3, *high_contrast as u32);
+                r.put(4, *accent);
+                r
+            }
+            Msg::SpanTile { window, rect, present } => {
+                let mut r = Rec::new(SPAN_TILE, *window);
+                for (i, v) in rect.iter().enumerate() {
+                    r.put(2 + i, *v);
+                }
+                r.put(6, *present as u32);
+                r
+            }
+            Msg::SpanHidden { window, rect } => {
+                let mut r = Rec::new(SPAN_HIDDEN, *window);
+                for (i, v) in rect.iter().enumerate() {
+                    r.put(2 + i, *v);
+                }
+                r
+            }
+            Msg::SpanDone { window } => Rec::new(SPAN_DONE, *window),
         };
         r.0
     }
@@ -487,7 +530,7 @@ impl Msg {
         let b: [u8; MSG_BYTES] = bytes.try_into().map_err(|_| Refused("record size"))?;
         let r = Rec(b);
         let (k, window) = (r.get(0), r.get(1));
-        if (k == CLIENT) != (window == 0) || window > u16::MAX as u32 {
+        if matches!(k, CLIENT | APPEARANCE) != (window == 0) || window > u16::MAX as u32 {
             return Err(Refused("window id out of range"));
         }
         // Words 2.. this kind uses, and whether it carries a title.
@@ -496,7 +539,8 @@ impl Msg {
             WINDOW_TITLE => (0, true),
             WINDOW_DESTROY | CLOSE => (0, false),
             FRAME_READY | GEOMETRY | MOTION | SCROLL => (2, false),
-            SLOTS | FRAME_DONE | FOCUS | SCALE => (1, false),
+            SLOTS | FRAME_DONE | SCALE => (1, false),
+            FOCUS => (2, false),
             KEY => (3, false),
             CLIENT => (4, false),
             BUTTON => (5, false),
@@ -511,6 +555,10 @@ impl Msg {
             VIDEO_DESTROY => (1, false),
             VIDEO_RATE => (2, false),
             VIDEO_SLOTS | VIDEO_DONE => (2, false),
+            APPEARANCE => (3, false),
+            SPAN_TILE => (5, false),
+            SPAN_HIDDEN => (4, false),
+            SPAN_DONE => (0, false),
             _ => return Err(Refused("unknown kind")),
         };
         if (2 + args..8).any(|i| r.get(i) != 0) {
@@ -558,7 +606,11 @@ impl Msg {
             SLOTS => Msg::Slots { window, bytes: r.get(2) },
             FRAME_DONE => Msg::FrameDone { window, slot: slot(r.get(2))? },
             GEOMETRY => Msg::Geometry { window, width: dim(r.get(2))?, height: dim(r.get(3))? },
-            FOCUS => Msg::Focus { window, gained: flag(r.get(2))? },
+            FOCUS => Msg::Focus {
+                window,
+                gained: flag(r.get(2))?,
+                cause: if r.get(3) <= 3 { r.get(3) as u8 } else { return Err(Refused("focus cause")) },
+            },
             CLOSE => Msg::CloseRequested { window },
             SCALE => {
                 let scale_milli = r.get(2);
@@ -643,6 +695,24 @@ impl Msg {
                 vblank_ns: r.get(4) as u64 | (r.get(5) as u64) << 32,
                 dropped: r.get(6),
             },
+            APPEARANCE => {
+                if r.get(2) > 1 {
+                    return Err(Refused("unknown appearance"));
+                }
+                Msg::Appearance { scheme: r.get(2), high_contrast: flag(r.get(3))?, accent: r.get(4) }
+            }
+            SPAN_TILE | SPAN_HIDDEN => {
+                let rect = [r.get(2), r.get(3), r.get(4), r.get(5)];
+                let max = MAX_WINDOW_DIM;
+                if rect[0] > max || rect[1] > max || rect[2] > max || rect[3] > max {
+                    return Err(Refused("span rect out of range"));
+                }
+                match k {
+                    SPAN_TILE => Msg::SpanTile { window, rect, present: flag(r.get(6))? },
+                    _ => Msg::SpanHidden { window, rect },
+                }
+            }
+            SPAN_DONE => Msg::SpanDone { window },
             _ => unreachable!(),
         })
     }

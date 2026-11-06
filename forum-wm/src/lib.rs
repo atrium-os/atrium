@@ -183,7 +183,7 @@ pub fn arrange_for(
         })
         .collect();
 
-    WmDeclareLayoutPayload { slots, focus }
+    WmDeclareLayoutPayload { slots, focus, focus_cause: 0 }
 }
 
 /// A snap target — a half of the work area (the snap intent, forum.md §2.3).
@@ -228,7 +228,7 @@ pub fn arrange_snapped(
             r => slots.push(WmSlot { surface_id: s.surface_id, rect: rect_for(screen, r), layer: layer(r) }),
         }
     }
-    WmDeclareLayoutPayload { slots, focus }
+    WmDeclareLayoutPayload { slots, focus, focus_cause: 0 }
 }
 
 /// From a declared layout, the occlusion-driven rendering decisions: a surface
@@ -601,6 +601,9 @@ pub mod daemon {
     pub struct Wm {
         pub screen: Screen,
         pub focus_intent: Option<u32>,
+        /// What moved the focus since the last layout
+        /// (`fresco_protocol::focus_cause`), declared with it.
+        focus_cause: std::cell::Cell<u8>,
         /// Number of workspaces (virtual desktops).
         pub workspaces: usize,
         /// The currently-visible workspace (0-based).
@@ -658,6 +661,7 @@ pub mod daemon {
             Wm {
                 screen,
                 focus_intent: None,
+                focus_cause: std::cell::Cell::new(0),
                 workspaces: DEFAULT_WORKSPACES,
                 active: 0,
                 assignment: HashMap::new(),
@@ -1066,7 +1070,7 @@ pub mod daemon {
                 }
                 slots.extend(l.slots);
             }
-            WmDeclareLayoutPayload { slots, focus }
+            WmDeclareLayoutPayload { slots, focus, focus_cause: 0 }
         }
 
         /// [`Self::layout_active`] on one screen.
@@ -1078,6 +1082,7 @@ pub mod daemon {
                 return WmDeclareLayoutPayload {
                     slots: vec![WmSlot { surface_id: zid, rect: screen.rect, layer: 0 }],
                     focus: zid,
+                    focus_cause: 0,
                 };
             }
             // Snap: if any visible document is snapped, enter snap mode.
@@ -1102,7 +1107,8 @@ pub mod daemon {
                 .filter(|s| shown_in_workspace(s, &self.assignment, self.active))
                 .cloned()
                 .collect();
-            let layout = self.layout_active(&active);
+            let mut layout = self.layout_active(&active);
+            layout.focus_cause = self.focus_cause.take();
             conn.declare_layout(&layout)?;
 
             let placed: HashSet<u32> = layout.slots.iter().map(|s| s.surface_id).collect();
@@ -1160,6 +1166,7 @@ pub mod daemon {
             match resolve_click_focus(&active, clicked, Some(resolved)) {
                 Some(id) => {
                     self.focus_intent = Some(id);
+                    self.focus_cause.set(fresco_protocol::focus_cause::POINTER);
                     let layout = self.declare(conn, &surfaces)?;
                     Ok(Some(layout.focus))
                 }
@@ -1206,6 +1213,7 @@ pub mod daemon {
                 // workspace you're looking at (a rule may send it elsewhere).
                 if s.role == WmRole::Document && ws == self.active {
                     self.focus_intent = Some(new_id);
+                    self.focus_cause.set(fresco_protocol::focus_cause::PROGRAM);
                 }
             }
             self.declare(conn, &surfaces)
@@ -1234,6 +1242,7 @@ pub mod daemon {
             match next_document(&docs, current) {
                 Some(next) if next != current => {
                     self.focus_intent = Some(next);
+                    self.focus_cause.set(fresco_protocol::focus_cause::KEYBOARD);
                     let layout = self.declare(conn, &surfaces)?;
                     Ok(Some(layout.focus))
                 }
@@ -1413,6 +1422,7 @@ mod tests {
                 WmSlot { surface_id: 2, rect: WmRect { x: 0, y: 0, w: 500, h: 1080 }, layer: 0 },   // covers left half
             ],
             focus: 1,
+            focus_cause: 0,
         };
         let r = rendering_decisions(&layout);
         assert!(r.iter().find(|x| x.surface_id == 1).unwrap().rendering, "partial occlusion still renders (Fresco clips)");

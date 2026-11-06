@@ -49,6 +49,10 @@ pub fn translate(ev: &fresco_client::Event) -> Option<Event> {
         | fresco_client::Event::WindowDestroyed { .. }
         // The output changed mode: the App's window keeps its size.
         | fresco_client::Event::DisplayChanged(_)
+        // The system appearance: the App's theme follows it, not input.
+        | fresco_client::Event::Appearance(_)
+        // Pergola apps do not span monitors; games do.
+        | fresco_client::Event::Span(_)
         // Pergola draws no filled paths yet, so it has none to fall back for.
         | fresco_client::Event::FillsDropped { .. }
         // The window's embed token goes to limend, not to views.

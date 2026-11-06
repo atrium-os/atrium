@@ -17,7 +17,7 @@ fn samples() -> Vec<Msg> {
         Msg::Slots { window: 1, bytes: slot::DEFAULT_SLOT_BYTES },
         Msg::FrameDone { window: 1, slot: 0 },
         Msg::Geometry { window: 2, width: 1920, height: 1080 },
-        Msg::Focus { window: 2, gained: true },
+        Msg::Focus { window: 2, gained: true, cause: 2 },
         Msg::CloseRequested { window: 2 },
         Msg::Scale { window: 2, scale_milli: 1500 },
         Msg::Input { window: 4, input: Input::Key { usage: 0x04, pressed: true, modifiers: 2, activation: [9; 16] } },

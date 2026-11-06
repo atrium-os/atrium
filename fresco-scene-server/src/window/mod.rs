@@ -39,7 +39,7 @@ pub enum DisplayEvent {
     /// dragged corner; DPI scaling shift).
     WindowResized        { window_id: u32, width: u32, height: u32 },
     /// Focus gained or lost. Toolkits redraw active-state visuals.
-    WindowFocusChanged   { window_id: u32, gained: bool },
+    WindowFocusChanged   { window_id: u32, gained: bool, cause: u8 },
     /// User clicked X (or equivalent gesture). Toolkit decides
     /// whether to confirm; not the same as a server-initiated
     /// close (which destroys directly).
@@ -54,6 +54,11 @@ pub enum DisplayEvent {
     WindowDestroyed      { window_id: u32 },
     /// The display's mode changed; every client lays out again.
     DisplayChanged       { width: u32, height: u32, refresh_mhz: u32, reserved_top: u32 },
+    /// The system appearance changed (light/dark); every client redraws.
+    AppearanceChanged(fresco_protocol::AppearancePayload),
+    /// The window spans several monitors (fresco-span.md): its tiles and
+    /// the hidden bezel strips, to its owner only; no tiles = ended.
+    WindowSpan { window_id: u32, tiles: Vec<fresco_protocol::SpanTile>, hidden: Vec<[u32; 4]> },
 
     /// Keyboard press/release routed to the focused window's owner.
     /// `window_id == 0` = no focus, broadcast to all clients. See
@@ -147,9 +152,9 @@ pub fn encode_event(ev: &DisplayEvent)
             };
             Ok((control::EV_WINDOW_RESIZED, encode(&p)?))
         }
-        DisplayEvent::WindowFocusChanged { window_id, gained } => {
+        DisplayEvent::WindowFocusChanged { window_id, gained, cause } => {
             let p = WindowFocusChangedEvent {
-                window_id: *window_id, gained: *gained,
+                window_id: *window_id, gained: *gained, cause: *cause,
             };
             Ok((control::EV_WINDOW_FOCUS_CHANGED, encode(&p)?))
         }
@@ -170,6 +175,11 @@ pub fn encode_event(ev: &DisplayEvent)
         DisplayEvent::WindowDestroyed { window_id } => {
             let p = WindowDestroyedEvent { window_id: *window_id };
             Ok((control::EV_WINDOW_DESTROYED, encode(&p)?))
+        }
+        DisplayEvent::AppearanceChanged(p) => Ok((control::EV_APPEARANCE_CHANGED, encode(p)?)),
+        DisplayEvent::WindowSpan { window_id, tiles, hidden } => {
+            let p = fresco_protocol::WindowSpanEvent { window_id: *window_id, tiles: tiles.clone(), hidden: hidden.clone() };
+            Ok((control::EV_WINDOW_SPAN, encode(&p)?))
         }
         DisplayEvent::DisplayChanged { width, height, refresh_mhz, reserved_top } => {
             let p = fresco_protocol::DisplayInfoResponse {
@@ -871,7 +881,7 @@ impl Compositor {
         } else { None };
         if let Some(fc) = &shift {
             self.emit(DisplayEvent::WindowFocusChanged {
-                window_id: fc.new as u32, gained: true,
+                window_id: fc.new as u32, gained: true, cause: fresco_protocol::focus_cause::PROGRAM,
             });
         }
         self.emit(DisplayEvent::WindowDestroyed { window_id: id as u32 });
@@ -1100,6 +1110,12 @@ impl Compositor {
     /// imply raise here (a focused document can sit under a HUD). Updates
     /// the per-window focus flags and emits the focus-change events.
     pub fn set_focus_no_raise(&mut self, id: Option<WindowId>) {
+        self.set_focus_no_raise_by(id, fresco_protocol::focus_cause::UNKNOWN)
+    }
+
+    /// [`Self::set_focus_no_raise`], saying what moved the focus
+    /// (`fresco_protocol::focus_cause`): the WM declares it.
+    pub fn set_focus_no_raise_by(&mut self, id: Option<WindowId>, cause: u8) {
         let id = id.filter(|i| !self.windows.get(i).is_some_and(|w| w.hidden));
         if self.focus == id { return; }
         let prev = self.focus;
@@ -1107,10 +1123,10 @@ impl Compositor {
         if let Some(n) = id  { if let Some(w) = self.windows.get_mut(&n) { w.focus = true; } }
         self.focus = id;
         if let Some(p) = prev {
-            self.emit(DisplayEvent::WindowFocusChanged { window_id: p as u32, gained: false });
+            self.emit(DisplayEvent::WindowFocusChanged { window_id: p as u32, gained: false, cause });
         }
         if let Some(n) = id {
-            self.emit(DisplayEvent::WindowFocusChanged { window_id: n as u32, gained: true });
+            self.emit(DisplayEvent::WindowFocusChanged { window_id: n as u32, gained: true, cause });
         }
     }
 
@@ -1283,11 +1299,11 @@ impl Compositor {
         } else {
             if let Some(p) = prev {
                 self.emit(DisplayEvent::WindowFocusChanged {
-                    window_id: p as u32, gained: false,
+                    window_id: p as u32, gained: false, cause: fresco_protocol::focus_cause::UNKNOWN,
                 });
             }
             self.emit(DisplayEvent::WindowFocusChanged {
-                window_id: id as u32, gained: true,
+                window_id: id as u32, gained: true, cause: fresco_protocol::focus_cause::UNKNOWN,
             });
             Some(FocusChange { prev, new: id })
         }
@@ -1487,11 +1503,11 @@ mod event_tests {
         assert_eq!(fc.new, a);
         /* Two events: window 0 lost focus, window a gained. */
         match expect_event(&rx) {
-            DisplayEvent::WindowFocusChanged { window_id: 0, gained: false } => {}
+            DisplayEvent::WindowFocusChanged { window_id: 0, gained: false, .. } => {}
             other => panic!("expected window 0 lost focus, got {other:?}"),
         }
         match expect_event(&rx) {
-            DisplayEvent::WindowFocusChanged { window_id, gained: true } => {
+            DisplayEvent::WindowFocusChanged { window_id, gained: true, .. } => {
                 assert_eq!(window_id, a as u32);
             }
             other => panic!("expected window a gained focus, got {other:?}"),

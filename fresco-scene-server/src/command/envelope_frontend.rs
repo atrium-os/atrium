@@ -326,6 +326,14 @@ pub struct EnvelopeFrontend {
     scale_requests: Vec<fresco_protocol::WmSetOutputScalePayload>,
     /// Mirrorings `OP_WM_MIRROR_OUTPUT` asked for, in order.
     mirror_requests: Vec<fresco_protocol::WmMirrorOutputPayload>,
+    /// Spans `OP_WM_SPAN_GROUP` asked for, in order (fresco-span.md), and
+    /// where the monitors a span up now moved apart were before it
+    /// (frescod sets it with the outputs), so the next span is laid out
+    /// from the desktop as arranged.
+    span_requests: Vec<fresco_protocol::WmSpanGroupPayload>,
+    span_moved: Vec<(u64, i32, i32)>,
+    /// The system appearance (`OP_APPEARANCE`, `OP_WM_SET_APPEARANCE`).
+    appearance: fresco_protocol::AppearancePayload,
 }
 
 impl EnvelopeFrontend {
@@ -362,6 +370,9 @@ impl EnvelopeFrontend {
             arrange_request: None,
             scale_requests: Vec::new(),
             mirror_requests: Vec::new(),
+            span_requests: Vec::new(),
+            span_moved: Vec::new(),
+            appearance: fresco_protocol::AppearancePayload::default(),
         }
     }
 
@@ -402,6 +413,46 @@ impl EnvelopeFrontend {
     pub fn set_outputs(&mut self, outputs: Vec<fresco_protocol::WmOutput>) {
         self.outputs = fresco_protocol::WmOutputsReply { outputs };
         self.update_window_scales();
+    }
+
+    /// The monitors a span moved apart for its bezels, at the places they
+    /// had before it (empty: none moved). Set with the outputs.
+    pub fn set_span_moved(&mut self, moved: Vec<(u64, i32, i32)>) {
+        self.span_moved = moved;
+    }
+
+    /// The system appearance now.
+    pub fn appearance(&self) -> fresco_protocol::AppearancePayload {
+        self.appearance
+    }
+
+    /// Set the system appearance and tell every client
+    /// (`EV_APPEARANCE_CHANGED`) if it changed. A split-mode renderer calls
+    /// it with what the broker sent.
+    pub fn set_appearance(&mut self, a: fresco_protocol::AppearancePayload) {
+        if a != self.appearance {
+            self.appearance = a;
+            self.compositor.lock().unwrap().emit(crate::window::DisplayEvent::AppearanceChanged(a));
+        }
+    }
+
+    /// Spans the WM asked for since the last call.
+    pub fn take_span_requests(&mut self) -> Vec<fresco_protocol::WmSpanGroupPayload> {
+        std::mem::take(&mut self.span_requests)
+    }
+
+    /// The desktop's monitors as arranged (before any span moved them),
+    /// mirrors left out: what a span is laid out over.
+    pub fn span_places(&self) -> Vec<crate::span::Place> {
+        self.outputs
+            .outputs
+            .iter()
+            .filter(|o| o.mirror_of == 0)
+            .map(|o| {
+                let (x, y) = self.span_moved.iter().find(|m| m.0 == o.identity).map_or((o.rect.x, o.rect.y), |m| (m.1, m.2));
+                crate::span::Place { identity: o.identity, x, y, w: o.rect.w.max(0) as u32, h: o.rect.h.max(0) as u32 }
+            })
+            .collect()
     }
 
     /// Mirrorings the WM asked for since the last call.
@@ -607,6 +658,10 @@ impl EnvelopeFrontend {
             control::OP_TEXT_RUN_INSTALL   => self.handle_text_run_install(msg),
             control::OP_TEXT_MEASURE       => self.handle_text_measure(msg),
             control::OP_DISPLAY_INFO       => self.handle_display_info(),
+            control::OP_APPEARANCE         => {
+                let payload = encode(&self.appearance).map_err(|_| DispatchError::BadPayload)?;
+                Ok(vec![Outbound { op: control::OP_APPEARANCE, flags: flag::IS_RESPONSE, payload, fds: Vec::new() }])
+            }
 
             // ── Window management ops (window_id is in payload) ──
             control::OP_WINDOW_CREATE        => self.handle_window_create(msg),
@@ -636,6 +691,8 @@ impl EnvelopeFrontend {
             control::OP_WM_ARRANGE_OUTPUTS   => self.handle_wm_arrange_outputs(msg),
             control::OP_WM_SET_OUTPUT_SCALE  => self.handle_wm_set_output_scale(msg),
             control::OP_WM_MIRROR_OUTPUT     => self.handle_wm_mirror_output(msg),
+            control::OP_WM_SPAN_GROUP        => self.handle_wm_span_group(msg),
+            control::OP_WM_SET_APPEARANCE    => self.handle_wm_set_appearance(msg),
 
             op => Err(DispatchError::UnknownOp(op)),
         }
@@ -1196,6 +1253,50 @@ impl EnvelopeFrontend {
         Ok(vec![Outbound { op: control::OP_WM_MIRROR_OUTPUT, flags: flag::IS_RESPONSE, payload: Vec::new(), fds: Vec::new() }])
     }
 
+    /// `OP_WM_SET_APPEARANCE` — set the system appearance (WM only): light
+    /// or dark; high contrast and the accent are reserved (false, 0).
+    fn handle_wm_set_appearance(&mut self, msg: &Message) -> Result<Vec<Outbound>, DispatchError> {
+        if !self.wm_capable.contains(&self.current_client) {
+            return Err(DispatchError::Forbidden);
+        }
+        let a: fresco_protocol::AppearancePayload = decode(&msg.payload).map_err(|_| DispatchError::BadPayload)?;
+        if a.scheme > fresco_protocol::APPEARANCE_DARK || a.high_contrast || a.accent != 0 {
+            return Err(DispatchError::BadPayload);
+        }
+        self.set_appearance(a);
+        Ok(vec![Outbound { op: control::OP_WM_SET_APPEARANCE, flags: flag::IS_RESPONSE, payload: Vec::new(), fds: Vec::new() }])
+    }
+
+    /// `OP_WM_SPAN_GROUP` — queue a span (WM only, fresco-span.md): the
+    /// window exists and the monitors make a span (`span::layout`), or the
+    /// span ends (no members, or window 0). The reply is the rect the
+    /// window must cover, laid out from the desktop as arranged.
+    fn handle_wm_span_group(&mut self, msg: &Message) -> Result<Vec<Outbound>, DispatchError> {
+        if !self.wm_capable.contains(&self.current_client) {
+            return Err(DispatchError::Forbidden);
+        }
+        let p: fresco_protocol::WmSpanGroupPayload = decode(&msg.payload).map_err(|_| DispatchError::BadPayload)?;
+        let mut rect = fresco_protocol::WmRect { x: 0, y: 0, w: 0, h: 0 };
+        if p.window_id != 0 && !p.members.is_empty() {
+            let exists = u16::try_from(p.window_id)
+                .ok()
+                .is_some_and(|id| self.compositor.lock().unwrap().windows.contains_key(&id));
+            if !exists {
+                return Err(DispatchError::BadPayload);
+            }
+            let refresh = |id: u64| self.outputs.outputs.iter().find(|o| o.identity == id).map(|o| o.refresh_mhz);
+            if p.members.iter().any(|&id| refresh(id) != refresh(p.members[0])) {
+                return Err(DispatchError::BadPayload);
+            }
+            let l = crate::span::layout(&self.span_places(), &p.members, &p.gaps_x, &p.gaps_y)
+                .map_err(|_| DispatchError::BadPayload)?;
+            rect = fresco_protocol::WmRect { x: l.rect[0], y: l.rect[1], w: l.rect[2], h: l.rect[3] };
+        }
+        self.span_requests.push(p);
+        let payload = encode(&fresco_protocol::WmSpanGroupReply { rect }).map_err(|_| DispatchError::BadPayload)?;
+        Ok(vec![Outbound { op: control::OP_WM_SPAN_GROUP, flags: flag::IS_RESPONSE, payload, fds: Vec::new() }])
+    }
+
     /// `OP_WM_SET_OUTPUT_SCALE` — queue a monitor's scale (WM only): a
     /// monitor on the desktop, 0 (automatic) or within the range.
     fn handle_wm_set_output_scale(&mut self, msg: &Message) -> Result<Vec<Outbound>, DispatchError> {
@@ -1485,7 +1586,7 @@ impl EnvelopeFrontend {
         let new_focus = (layout.focus != 0
             && comp.windows.contains_key(&(layout.focus as u16)))
             .then_some(layout.focus as u16);
-        comp.set_focus_no_raise(new_focus);
+        comp.set_focus_no_raise_by(new_focus, layout.focus_cause);
         drop(comp);
         self.update_window_scales();
 
@@ -1966,6 +2067,7 @@ mod tests {
         let to = |x| WmDeclareLayoutPayload {
             slots: vec![WmSlot { surface_id: a, rect: WmRect { x, y: 0, w: 800, h: 600 }, layer: 4 }],
             focus: a,
+            focus_cause: 0,
         };
         f.dispatch(&msg(control::OP_WM_DECLARE_LAYOUT, 0, encode(&to(1800)).unwrap()), 9).unwrap();
         assert_eq!(dpi(&rx), vec![(a, 1.5)]);
@@ -2022,6 +2124,7 @@ mod tests {
                 WmSlot { surface_id: b, rect: WmRect { x: 720, y: 380, w: 480, h: 320 }, layer: 0 },
             ],
             focus: b,
+            focus_cause: 0,
         };
         f.dispatch(&msg(control::OP_WM_DECLARE_LAYOUT, 0, encode(&layout).unwrap()), 9)
             .expect("declare layout");
@@ -2047,6 +2150,7 @@ mod tests {
         let layout = WmDeclareLayoutPayload {
             slots: vec![WmSlot { surface_id: a, rect: WmRect { x: 0, y: 0, w: 10, h: 10 }, layer: 4 }],
             focus: a,
+            focus_cause: 0,
         };
         // client 1 (not the shell) cannot declare a layout.
         let r = f.dispatch(&msg(control::OP_WM_DECLARE_LAYOUT, 0, encode(&layout).unwrap()), 1);

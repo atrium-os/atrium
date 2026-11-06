@@ -295,6 +295,9 @@ struct State {
     wins: HashMap<u32, Win>,
     /// Formats of the drag the next DRAG Enter brings.
     drag_offers: Vec<String>,
+    /// The span the next SPAN_DONE completes: its window, tiles and
+    /// hidden strips.
+    span: Option<(u32, Vec<fresco_protocol::SpanTile>, Vec<[u32; 4]>)>,
 }
 
 /// Where the bundle carries the precompiled kernels.
@@ -416,9 +419,9 @@ fn main() {
 
     // The broker's records.
     {
-        let (state, comp, redraw, broker) = (state.clone(), comp.clone(), redraw.clone(), broker.clone());
+        let (state, comp, redraw, broker, fe) = (state.clone(), comp.clone(), redraw.clone(), broker.clone(), frontend.clone());
         std::thread::spawn(move || {
-            from_broker(&broker, &state, &rings, &comp, ev_tx, &redraw);
+            from_broker(&broker, &state, &rings, &comp, &fe, ev_tx, &redraw);
             std::process::exit(0);
         });
     }
@@ -592,6 +595,7 @@ fn from_broker(
     state: &Mutex<State>,
     rings: &VRings,
     comp: &Mutex<Compositor>,
+    fe: &Mutex<EnvelopeFrontend>,
     events: mpsc::Sender<DisplayEvent>,
     redraw: &redraw::Redraw,
 ) {
@@ -635,8 +639,8 @@ fn from_broker(
                 // Tells the client, which lays out again.
                 comp.lock().unwrap().resize_window(local as u16, width, height);
             }
-            Msg::Focus { gained, .. } => {
-                let _ = events.send(DisplayEvent::WindowFocusChanged { window_id: local, gained });
+            Msg::Focus { gained, cause, .. } => {
+                let _ = events.send(DisplayEvent::WindowFocusChanged { window_id: local, gained, cause });
             }
             Msg::CloseRequested { .. } => {
                 comp.lock().unwrap().request_close(local as u16);
@@ -709,6 +713,29 @@ fn from_broker(
             }
             Msg::VideoPresented { layer, seq, vblank_ns, dropped, .. } => {
                 let _ = events.send(DisplayEvent::VideoPresented { window_id: local, layer, seq, vblank_ns, dropped });
+            }
+            Msg::Appearance { scheme, high_contrast, accent } => {
+                fe.lock().unwrap().set_appearance(fresco_protocol::AppearancePayload { scheme, high_contrast, accent });
+            }
+            Msg::SpanTile { .. } | Msg::SpanHidden { .. } => {
+                let mut s = state.lock().unwrap();
+                let (w, tiles, hidden) = s.span.get_or_insert_with(|| (local, Vec::new(), Vec::new()));
+                if *w != local || tiles.len() + hidden.len() >= 3 * fresco_protocol::SPAN_MAX_MONITORS {
+                    s.span = None;
+                    return log::warn!("fresco-renderer: span records out of order");
+                }
+                match m {
+                    Msg::SpanTile { rect, present, .. } => tiles.push(fresco_protocol::SpanTile { rect, present }),
+                    Msg::SpanHidden { rect, .. } => hidden.push(rect),
+                    _ => {}
+                }
+            }
+            Msg::SpanDone { .. } => {
+                let (window, tiles, hidden) = state.lock().unwrap().span.take().unwrap_or((local, Vec::new(), Vec::new()));
+                if window != local {
+                    return log::warn!("fresco-renderer: SPAN_DONE for another window");
+                }
+                let _ = events.send(DisplayEvent::WindowSpan { window_id: local, tiles, hidden });
             }
             _ => unreachable!("from_renderer() covers the rest"),
         }

@@ -68,7 +68,7 @@ fn poll_event_decodes_close_focus_resize() {
 
         let p_focus = postcard::to_stdvec(
             &fresco_protocol::WindowFocusChangedEvent {
-                window_id: 99, gained: true,
+                window_id: 99, gained: true, cause: 0,
             }
         ).unwrap();
         write_envelope(&mut stream, EV_WINDOW_FOCUS_CHANGED, 0, &p_focus);

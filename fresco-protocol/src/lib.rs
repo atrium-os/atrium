@@ -100,6 +100,10 @@ pub mod control {
     /// Synchronous query: what is the display actually running at?
     /// → response with `DisplayInfoResponse` (mode + reserved chrome edges).
     pub const OP_DISPLAY_INFO:       u16 = 0x0054;
+    /// Synchronous query: the system appearance (light or dark, and later
+    /// high contrast and the accent) → `AppearancePayload`. Changes come
+    /// as `EV_APPEARANCE_CHANGED`.
+    pub const OP_APPEARANCE:         u16 = 0x0055;
 
     // ── Window management (§3.8.1) ──
     // Control (client → server)
@@ -153,6 +157,12 @@ pub mod control {
     // Bind a window as a credential slot in another (arca-autofill.md §4):
     // Limen's stand-in, so window management only. CredentialSlotPayload.
     pub const OP_WM_CREDENTIAL_SLOT:    u16 = 0x0529;
+    // Span a zoomed window over several monitors as one surface
+    // (fresco-span.md): WmSpanGroupPayload → WmSpanGroupReply.
+    pub const OP_WM_SPAN_GROUP:         u16 = 0x052a;
+    // The system appearance (visual language §15): the session sets it,
+    // every client gets EV_APPEARANCE_CHANGED. AppearancePayload.
+    pub const OP_WM_SET_APPEARANCE:     u16 = 0x052b;
 
     // Async events (server → client). Sent with envelope flag
     // ASYNC_EVENT (aqueduct::envelope::flags::ASYNC_EVENT).
@@ -174,6 +184,12 @@ pub mod control {
     /// `EmbedTokenEvent`, to the window's owner once, right after it is
     /// created: the token that names the window to limend (limen.md §5).
     pub const EV_WINDOW_EMBED_TOKEN:     u16 = 0x0588;
+    /// `WindowSpanEvent`, to the window's owner: where each monitor is
+    /// inside its window while it spans several (fresco-span.md §3).
+    pub const EV_WINDOW_SPAN:            u16 = 0x0589;
+    /// `AppearancePayload`, to every client: the system appearance
+    /// changed (light/dark). Redraw in it.
+    pub const EV_APPEARANCE_CHANGED:     u16 = 0x058a;
     /// The display's mode changed (a mode switch, or a monitor plugged in
     /// or swapped): payload `DisplayInfoResponse`. Every client gets it;
     /// anything laid out for the screen lays itself out again.
@@ -328,6 +344,21 @@ pub struct WmSlot {
 pub struct WmDeclareLayoutPayload {
     pub slots: Vec<WmSlot>,
     pub focus: u32,
+    /// Why focus moves, if it does (`focus_cause::*`): passed on in
+    /// `EV_WINDOW_FOCUS_CHANGED`.
+    pub focus_cause: u8,
+}
+
+/// What moved the focus (`WindowFocusChangedEvent::cause`), so a toolkit can
+/// show a focus ring for keyboard focus only (visual language §14.1).
+pub mod focus_cause {
+    pub const UNKNOWN: u8 = 0;
+    /// A click or tap.
+    pub const POINTER: u8 = 1;
+    /// Tab, the switcher, or another key.
+    pub const KEYBOARD: u8 = 2;
+    /// The system or an app (a window opened, one closed).
+    pub const PROGRAM: u8 = 3;
 }
 
 /// One mode the monitor offers, as `OP_WM_DISPLAY_MODES` lists it.
@@ -408,6 +439,81 @@ pub struct WmMirrorOutputPayload {
 pub struct WmSetOutputScalePayload {
     pub identity: u64,
     pub scale_milli: u32,
+}
+
+/// `OP_WM_SPAN_GROUP` — window `window_id`, zoomed by the WM, spans the
+/// monitors `members` (identities) as one surface (fresco-span.md §3, §5).
+/// frescod locks their timing, flips them together and tells the window's
+/// owner its tiles (`EV_WINDOW_SPAN`). The members must be on the desktop,
+/// not mirrors, all at one mode, landscape, and form a row or a grid.
+///
+/// Bezel compensation: `gaps_x` (between columns, left to right) and
+/// `gaps_y` (between rows) are hidden strips in desktop pixels. While the
+/// span is up frescod moves the members apart by them (and whatever lies
+/// past the group with them), so the window covers the strips and they are
+/// never scanned out; it puts them back when the span ends. Empty: none.
+///
+/// The reply is the rect the window must cover: the WM lays it out there
+/// (`OP_WM_DECLARE_LAYOUT`). `members` empty, or `window_id` 0, ends the
+/// span. `EV_DISPLAY_CHANGED` follows either way.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct WmSpanGroupPayload {
+    pub window_id: u32,
+    pub members: Vec<u64>,
+    pub gaps_x: Vec<u32>,
+    pub gaps_y: Vec<u32>,
+}
+
+/// Reply to `OP_WM_SPAN_GROUP`: the desktop rect the spanning window must
+/// cover (all zero once a span ends).
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub struct WmSpanGroupReply {
+    pub rect: WmRect,
+}
+
+/// The system appearance (docs/design/atrium-visual-language.md §15): one
+/// setting for the whole system, set by the session (`OP_WM_SET_APPEARANCE`),
+/// read by any client (`OP_APPEARANCE`) and broadcast on change
+/// (`EV_APPEARANCE_CHANGED`).
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub struct AppearancePayload {
+    /// `APPEARANCE_LIGHT` or `APPEARANCE_DARK`.
+    pub scheme: u32,
+    /// Reserved for high contrast: false for now.
+    pub high_contrast: bool,
+    /// Reserved for the accent colour's index: 0 for now.
+    pub accent: u32,
+}
+
+pub const APPEARANCE_LIGHT: u32 = 0;
+pub const APPEARANCE_DARK: u32 = 1;
+
+/// The largest span surface, per side (`MAX_WINDOW_DIM`).
+pub const SPAN_MAX_DIM: u32 = 16384;
+/// The most monitors one span covers.
+pub const SPAN_MAX_MONITORS: usize = 16;
+
+/// One monitor's part of a spanning window, in window pixels.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SpanTile {
+    /// x, y, width, height inside the window.
+    pub rect: [u32; 4],
+    /// false while the monitor is out (a dropout, or one held out for
+    /// flapping, fresco-span.md §6): a game may stop drawing that tile.
+    pub present: bool,
+}
+
+/// `EV_WINDOW_SPAN` — the window spans several monitors: `tiles` is each
+/// monitor's part of it (in the members' order), `hidden` the bezel strips
+/// that no monitor shows. A game that cares renders one view per tile, with
+/// that monitor's angle; one that doesn't renders one wide frame. Sent when
+/// the span starts and whenever a tile changes; no tiles means it ended.
+/// To the window's owner only.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct WindowSpanEvent {
+    pub window_id: u32,
+    pub tiles: Vec<SpanTile>,
+    pub hidden: Vec<[u32; 4]>,
 }
 
 /// The scale range `OP_WM_SET_OUTPUT_SCALE` accepts (thousandths).
@@ -857,6 +963,8 @@ pub struct WindowResizedEvent {
 pub struct WindowFocusChangedEvent {
     pub window_id: u32,
     pub gained:    bool,
+    /// What moved it (`focus_cause::*`).
+    pub cause:     u8,
 }
 
 /// `EV_WINDOW_CLOSE_REQUESTED` — user clicked the X (or equivalent
@@ -1999,7 +2107,7 @@ mod tests {
 
     #[test]
     fn roundtrip_window_focus_changed_event() {
-        let e = WindowFocusChangedEvent { window_id: 7, gained: true };
+        let e = WindowFocusChangedEvent { window_id: 7, gained: true, cause: focus_cause::KEYBOARD };
         let bytes = encode(&e).expect("encode");
         let back: WindowFocusChangedEvent = decode(&bytes).expect("decode");
         assert!(back.gained);
@@ -2010,6 +2118,30 @@ mod tests {
         let e = WindowCloseRequestedEvent { window_id: 7 };
         let (n, _, _) = roundtrip!(WindowCloseRequestedEvent, e);
         assert_eq!(n, 1);
+    }
+
+    #[test]
+    fn roundtrip_appearance() {
+        let p = AppearancePayload { scheme: APPEARANCE_DARK, high_contrast: false, accent: 0 };
+        let back: AppearancePayload = decode(&encode(&p).expect("encode")).expect("decode");
+        assert_eq!(back, p);
+    }
+
+    #[test]
+    fn roundtrip_span() {
+        let p = WmSpanGroupPayload { window_id: 9, members: vec![1, 2, 3], gaps_x: vec![40, 40], gaps_y: vec![] };
+        let back: WmSpanGroupPayload = decode(&encode(&p).expect("encode")).expect("decode");
+        assert_eq!(back, p);
+        let e = WindowSpanEvent {
+            window_id: 9,
+            tiles: vec![
+                SpanTile { rect: [0, 0, 1920, 1080], present: true },
+                SpanTile { rect: [1960, 0, 1920, 1080], present: false },
+            ],
+            hidden: vec![[1920, 0, 40, 1080]],
+        };
+        let back: WindowSpanEvent = decode(&encode(&e).expect("encode")).expect("decode");
+        assert_eq!(back, e);
     }
 
     #[test]
@@ -2096,6 +2228,7 @@ mod tests {
                 WmSlot { surface_id: 2, rect: WmRect { x: 720, y: 380, w: 480, h: 320 }, layer: 0 },
             ],
             focus: 2,
+            focus_cause: 0,
         };
         let back: WmDeclareLayoutPayload = decode(&encode(&layout).unwrap()).unwrap();
         assert_eq!(back, layout);
