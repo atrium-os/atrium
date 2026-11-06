@@ -15,6 +15,9 @@ pub struct Store {
     s: VecDeque<Sample>,
     cursor: usize,
     bytes: u64,
+    /// A seek to a time not yet buffered (a segment feed): nothing is
+    /// decoded until appends cover it, then the cursor goes there.
+    pending: Option<i64>,
 }
 
 impl Store {
@@ -37,11 +40,18 @@ impl Store {
             }
             _ => self.s.push_back(s),
         }
+        if let Some(t) = self.pending {
+            self.seek(t);
+        }
     }
 
     pub fn next(&self) -> Option<&Sample> {
+        if self.pending.is_some() {
+            return None;
+        }
         self.s.get(self.cursor)
     }
+
 
     pub fn advance(&mut self) {
         self.cursor = (self.cursor + 1).min(self.s.len());
@@ -53,6 +63,9 @@ impl Store {
 
     /// Samples not yet decoded.
     pub fn ahead(&self) -> usize {
+        if self.pending.is_some() {
+            return 0;
+        }
         self.s.len() - self.cursor
     }
 
@@ -72,6 +85,7 @@ impl Store {
         self.s.clear();
         self.cursor = 0;
         self.bytes = 0;
+        self.pending = None;
     }
 
     /// Drop what's been decoded (`Load` mode).
@@ -85,8 +99,15 @@ impl Store {
     }
 
     /// Move the cursor to the keyframe at or before `t_ns`, if that and
-    /// `t_ns` itself are buffered.
+    /// `t_ns` itself are buffered. If not, hold decoding until appends
+    /// cover it (or the caller clears the store and reads again).
     pub fn seek(&mut self, t_ns: i64) -> bool {
+        let found = self.find(t_ns);
+        self.pending = (!found).then_some(t_ns);
+        found
+    }
+
+    fn find(&mut self, t_ns: i64) -> bool {
         let covered = self.ranges().iter().any(|&(a, b)| a <= t_ns.max(self.s.front().map_or(0, |x| x.pts_ns)) && t_ns < b);
         if !covered {
             return false;
@@ -168,7 +189,12 @@ mod tests {
         assert!(st.seek(1_050_000_000));
         assert_eq!(st.next().unwrap().pts_ns, 1_000_000_000);
         assert!(!st.seek(500_000_000), "a gap isn't buffered");
-        st.remove(0, 500_000_000);
+        assert!(st.next().is_none(), "nothing to decode until it is");
+        st.push(s(480, true));
+        st.push(s(520, false));
+        assert_eq!(st.next().unwrap().pts_ns, 480_000_000, "the append covering it moves the cursor there");
+        assert!(st.seek(1_050_000_000));
+        st.remove(0, 900_000_000);
         assert_eq!(st.ranges(), vec![(1_000_000_000, 1_080_000_000)]);
         assert_eq!(st.bytes(), 20);
         assert_eq!(st.next().unwrap().pts_ns, 1_000_000_000);

@@ -16,6 +16,14 @@ typedef struct {
     const uint8_t *plane[3];
     ptrdiff_t stride[3];  /* bytes */
     int64_t pts;
+    /* Colour from the bitstream, H.273 code points (2: unspecified);
+     * range 0 unspecified, 1 limited, 2 full. */
+    uint8_t primaries, transfer, matrix, range;
+    /* Static HDR metadata in CTA-861.3 units (has_hdr != 0): R, G, B x
+     * then y (0.00002), white x, y, max (cd/m2), min (0.0001 cd/m2),
+     * max CLL, max FALL. */
+    uint32_t has_hdr;
+    uint16_t hdr[12];
 } atr_picture;
 
 enum { ATR_OK = 0, ATR_AGAIN = 1, ATR_NONE = 0, ATR_GOT = 1, ATR_ERR = -1, ATR_TOO_BIG = -2, ATR_NOMEM = -3 };

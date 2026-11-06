@@ -339,7 +339,7 @@ impl Parser {
             return Err(Error::Malformed("trak without id or timescale"));
         }
         let stbl = stbl.ok_or(Error::Malformed("trak without stbl"))?;
-        let mut info = TrackInfo { index: idx, id: id as u64, codec: Codec::Unknown, kind: Kind::Other, config: Vec::new(), default_duration_ns: None, encrypted: false };
+        let mut info = TrackInfo { index: idx, id: id as u64, codec: Codec::Unknown, kind: Kind::Other, config: Vec::new(), default_duration_ns: None, encrypted: false, color: None };
         let samples = self.stbl(stbl, &mut info, &handler, ts, shift, room)?;
         Ok((info, ts, shift, samples))
     }
@@ -520,13 +520,46 @@ impl Parser {
         }
         let mut config = Vec::new();
         let mut opus_head = None;
+        let (mut color, mut nclx, mut hdr) = (None::<crate::Color>, false, None::<crate::Hdr>);
         for bx in boxes(r.rest()) {
             let (cty, cv) = bx?;
             if cv.len() > self.lim.max_config {
                 return Err(Error::TooBig("codec config"));
             }
             match &cty {
-                b"av1C" | b"vpcC" | b"avcC" | b"esds" => config = cv.to_vec(),
+                b"av1C" | b"vpcC" | b"avcC" | b"esds" => {
+                    config = cv.to_vec();
+                    // vpcC 1: profile, level, depth|subsampling|full range,
+                    // then primaries, transfer, matrix. A colr box wins.
+                    if &cty == b"vpcC" && cv.len() >= 10 && cv[0] == 1 && !nclx {
+                        color = Some(crate::Color { primaries: cv[7], transfer: cv[8], matrix: cv[9], range: 1 + (cv[6] & 1), hdr: None });
+                    }
+                }
+                b"colr" if cv.len() >= 11 && &cv[..4] == b"nclx" => {
+                    let u = |i: usize| u16::from_be_bytes([cv[i], cv[i + 1]]).min(255) as u8;
+                    color = Some(crate::Color { primaries: u(4), transfer: u(6), matrix: u(8), range: 1 + (cv[10] >> 7), hdr: None });
+                    nclx = true;
+                }
+                // Mastering display (G, B, R order, as in HEVC's SEI), then
+                // content light level.
+                b"mdcv" if cv.len() >= 24 => {
+                    let u = |i: usize| u16::from_be_bytes([cv[i], cv[i + 1]]);
+                    let l = |i: usize| u32::from_be_bytes([cv[i], cv[i + 1], cv[i + 2], cv[i + 3]]);
+                    let h = hdr.get_or_insert_with(Default::default);
+                    for (k, rgb) in [1usize, 2, 0].into_iter().enumerate() {
+                        h.primaries_x[rgb] = u(4 * k);
+                        h.primaries_y[rgb] = u(4 * k + 2);
+                    }
+                    h.white_x = u(12);
+                    h.white_y = u(14);
+                    h.max_luminance = (l(16) / 10_000).min(65535) as u16;
+                    h.min_luminance = l(20).min(65535) as u16;
+                }
+                b"clli" if cv.len() >= 4 => {
+                    let h = hdr.get_or_insert_with(Default::default);
+                    h.max_cll = u16::from_be_bytes([cv[0], cv[1]]);
+                    h.max_fall = u16::from_be_bytes([cv[2], cv[3]]);
+                }
                 b"dOps" => opus_head = Some(dops_to_opushead(cv)?),
                 b"sinf" => {
                     info.encrypted = true;
@@ -554,6 +587,13 @@ impl Parser {
         };
         info.config = opus_head.unwrap_or(config);
         info.kind = kind;
+        if video {
+            info.color = match (color, hdr) {
+                (Some(c), h) => Some(crate::Color { hdr: h, ..c }),
+                (None, Some(h)) => Some(crate::Color { hdr: Some(h), ..Default::default() }),
+                (None, None) => None,
+            };
+        }
         Ok(())
     }
 

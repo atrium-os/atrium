@@ -226,3 +226,74 @@ fn the_worker_is_sandboxed() {
         assert_eq!(refused & 1, 0, "unsandboxed can open");
     }
 }
+
+/// Streaming: a seek past what the page has appended waits, however long
+/// the network takes (past the hung-worker watchdog), then plays from the
+/// target once the segment arrives; a seek back into what is buffered plays
+/// at once.
+#[test]
+fn a_feed_seek_waits_for_its_segment() {
+    let name = "vp9-opus.webm";
+    let f = std::fs::read(asset(name)).unwrap();
+    let clusters: Vec<usize> = f.windows(4).enumerate().filter(|(_, w)| *w == [0x1F, 0x43, 0xB6, 0x75]).map(|(i, _)| i).collect();
+    assert!(clusters.len() >= 2, "{} clusters", clusters.len());
+    let refs = layer_refs(name);
+    let frames = Rc::new(RefCell::new(Vec::new()));
+    let f2 = frames.clone();
+    let sink = LocalSink::new(Box::new(move |b, pts| f2.borrow_mut().push((pts, format!("{:x}", Md5::digest(b))))));
+    let mut p = Player::new(opts(), sink, Source::Feed(vec![(0, "video/webm".into())])).unwrap();
+    let pid = p.worker_pid();
+    let mut pcm = vec![0f32; 1 << 16];
+    let mut errors = Vec::new();
+    let mut pump = |p: &mut Player<LocalSink>, d: Duration| {
+        let until = Instant::now() + d;
+        while Instant::now() < until {
+            if let Some(PlayerEvent::Error(e)) = p.poll(Duration::from_millis(10)) {
+                errors.push(e);
+            }
+            p.read_pcm(&mut pcm);
+        }
+    };
+    // The page has the init segment and the first cluster.
+    p.append(0, f[..clusters[1]].to_vec(), None);
+    pump(&mut p, Duration::from_millis(800));
+    assert!(!frames.borrow().is_empty(), "plays what it has");
+    // Seek ahead of it; the next segment takes longer than the watchdog.
+    p.seek(1_500_000_000);
+    let n0 = frames.borrow().len();
+    pump(&mut p, crate_watchdog() + Duration::from_millis(1500));
+    assert_eq!(frames.borrow().len(), n0, "nothing shown while the target isn't there");
+    assert_eq!(p.worker_pid(), pid, "the worker is not taken for hung");
+    // It arrives: playback starts at the target.
+    p.append(0, f[clusters[1]..].to_vec(), None);
+    pump(&mut p, Duration::from_millis(1500));
+    let after: Vec<_> = frames.borrow()[n0..].to_vec();
+    assert!(!after.is_empty(), "plays once the segment is there");
+    assert_eq!(after[0].1, refs[36], "from the target's frame ({} ns)", after[0].0);
+    // Back into what is buffered: at once.
+    p.seek(200_000_000);
+    let n1 = frames.borrow().len();
+    pump(&mut p, Duration::from_millis(800));
+    let back = frames.borrow()[n1..].to_vec();
+    assert!(!back.is_empty(), "plays after seeking back");
+    assert_eq!(back[0].1, refs[5], "from the frame at 0.2 s ({} ns)", back[0].0);
+    // The page evicts the first second, then the user seeks back into it:
+    // nothing from later on is shown while it is fetched again.
+    pump(&mut p, Duration::from_millis(300));
+    p.remove(0, 0, 1_000_000_000);
+    p.seek(500_000_000);
+    let n2 = frames.borrow().len();
+    pump(&mut p, Duration::from_millis(1000));
+    assert_eq!(frames.borrow().len(), n2, "nothing shown before the evicted part is back");
+    p.append(0, f[clusters[0]..clusters[1]].to_vec(), None);
+    pump(&mut p, Duration::from_millis(1000));
+    let again = frames.borrow()[n2..].to_vec();
+    assert!(!again.is_empty(), "plays once it is back ({errors:?})");
+    assert_eq!(again[0].1, refs[12], "from the frame at 0.5 s ({} ns)", again[0].0);
+    assert!(errors.is_empty(), "{errors:?}");
+    assert_eq!(p.worker_pid(), pid);
+}
+
+fn crate_watchdog() -> Duration {
+    atrium_player::supervisor::WATCHDOG
+}

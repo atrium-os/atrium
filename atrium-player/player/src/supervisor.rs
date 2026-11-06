@@ -367,6 +367,10 @@ impl<S: Sink> Player<S> {
         self.epoch += 1;
         self.ended = false;
         self.show_from = Some(t_ns);
+        // The worker owes `Seeked` at once; frames too for a whole resource.
+        // A feed's frames wait on the parent's appends, however slow the
+        // network: that is not a hung worker.
+        self.heard = std::time::Instant::now();
         self.waiting = true;
         let epoch = self.epoch;
         self.send(ToWorker::Seek { t_ns, epoch });
@@ -616,6 +620,9 @@ impl<S: Sink> Player<S> {
                 }
             }
             Record::Seeked { epoch, pos } => {
+                if epoch == self.epoch && matches!(self.source, Source::Feed(_)) {
+                    self.waiting = false;
+                }
                 if epoch == self.epoch {
                     if let Some(a) = self.audio.as_mut() {
                         a.runs.clear();

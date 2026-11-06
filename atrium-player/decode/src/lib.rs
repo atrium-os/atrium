@@ -69,6 +69,9 @@ pub struct Picture<'a> {
     pub planes: [&'a [u8]; 3],
     pub strides: [usize; 3],
     pub pts_ns: i64,
+    /// What the bitstream says of its colour (VP9: matrix and range only;
+    /// VP8: nothing).
+    pub color: atrium_media_demux::Color,
 }
 
 pub trait VideoDecoder: Send {

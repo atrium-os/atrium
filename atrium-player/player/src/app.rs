@@ -15,6 +15,10 @@ use crate::fresco_sink::FrescoSink;
 use crate::supervisor::{Options, Player, PlayerEvent, Source};
 use crate::wire::err;
 
+/// Play that has not moved for this long is reported to the parent as
+/// `Waiting` (the page shows it is loading; Time resumes after).
+const WAITING_AFTER: Duration = Duration::from_millis(500);
+
 /// What the app hears from whoever embeds it.
 #[derive(Debug)]
 pub enum HostEvent {
@@ -118,6 +122,10 @@ pub struct App<H: Host> {
     want_play: bool,
     suspended: bool,
     last_time: Instant,
+    /// The position last seen moving, and when: play that stops moving
+    /// (a feed waiting for its next segment) is reported as `Waiting`.
+    moved: (Option<i64>, Instant),
+    waiting_sent: bool,
     last_frame: Instant,
     ended_sent: bool,
     exit_at_end: bool,
@@ -173,6 +181,8 @@ impl<H: Host> App<H> {
             want_play: false,
             suspended: false,
             last_time: Instant::now(),
+            moved: (None, Instant::now()),
+            waiting_sent: false,
             last_frame: Instant::now(),
             ended_sent: false,
             exit_at_end: false,
@@ -282,6 +292,7 @@ impl<H: Host> App<H> {
             a.seek(ns(to));
         }
         self.audio_wait = None;
+        self.moved.1 = Instant::now();
         self.sink().clock.av = None;
         self.ended_sent = false;
         self.ended_at = None;
@@ -493,6 +504,15 @@ impl<H: Host> App<H> {
                     p.set_paused(true);
                 }
             }
+        }
+        let pos = self.player.as_ref().and_then(|p| p.position_ns());
+        if pos != self.moved.0 {
+            self.moved = (pos, Instant::now());
+            self.waiting_sent = false;
+        } else if self.want_play && !self.suspended && !self.ended_sent && !self.waiting_sent && self.moved.1.elapsed() >= WAITING_AFTER {
+            self.waiting_sent = true;
+            let at = pos.map_or(self.controls.position_s, secs).max(0.0);
+            self.host.emit(ToParent::Waiting { secs: at });
         }
         if self.want_play && !self.suspended && self.last_time.elapsed() >= Duration::from_millis(1000 / TIME_HZ_MAX as u64) {
             self.last_time = Instant::now();

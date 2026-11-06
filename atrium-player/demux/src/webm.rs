@@ -183,6 +183,12 @@ impl Parser {
                 return Ok(true);
             }
             (None, 0xEC) => {}
+            // Past the Segment's stated end: a media segment appended later
+            // (MSE ignores the Segment's size), or a seek back into it.
+            (None, CLUSTER | CUES) if self.segment.is_some() => {
+                self.stack.push(Open { id: SEGMENT, end: None });
+                return Ok(true);
+            }
             (None, _) => return Err(Error::Malformed("top-level element")),
             (Some(SEGMENT), CLUSTER) => {
                 // Cues after the clusters (as most muxers write them): read
@@ -298,6 +304,7 @@ impl Parser {
         let (mut number, mut ttype, mut codec_id, mut private) = (0u64, 0u64, String::new(), Vec::new());
         let (mut w, mut h, mut rate, mut channels) = (0u64, 0u64, 0f64, 1u64);
         let (mut default_duration, mut encrypted, mut codec_delay) = (None, false, 0u64);
+        let mut color = None;
         for el in children(b) {
             let (id, v) = el?;
             match id {
@@ -327,6 +334,7 @@ impl Parser {
                         match id {
                             0xB0 => w = be_uint(v)?,
                             0xBA => h = be_uint(v)?,
+                            0x55B0 => color = Some(colour(v)?),
                             _ => {}
                         }
                     }
@@ -390,7 +398,7 @@ impl Parser {
             Codec::Vorbis => vorbis_headers(&private)?,
             _ => private,
         };
-        Ok((TrackInfo { index, id: number, codec, kind, config, default_duration_ns: default_duration, encrypted }, codec_delay as i64))
+        Ok((TrackInfo { index, id: number, codec, kind, config, default_duration_ns: default_duration, encrypted, color }, codec_delay as i64))
     }
 
     /// The SeekHead's entry for the Cues, if it has one.
@@ -589,6 +597,66 @@ impl Demuxer for Parser {
         }
         Ok(())
     }
+}
+
+/// A Video's Colour element. Its code points are H.273's.
+fn colour(b: &[u8]) -> Result<crate::Color> {
+    let mut c = crate::Color::default();
+    let code = |v: &[u8]| -> Result<u8> { Ok(be_uint(v)?.min(255) as u8) };
+    let (mut hdr, mut have_hdr) = (crate::Hdr::default(), false);
+    // Chromaticity in 0.00002 units, luminance in cd/m² and 0.0001 cd/m².
+    let unit = |v: &[u8], scale: f64| -> Result<u16> {
+        let x = be_float(v)? * scale;
+        Ok(if x.is_finite() { x.round().clamp(0.0, 65535.0) as u16 } else { 0 })
+    };
+    for el in children(b) {
+        let (id, v) = el?;
+        match id {
+            0x55B1 => c.matrix = code(v)?,
+            0x55B9 => {
+                c.range = match be_uint(v)? {
+                    1 => 1,
+                    2 => 2,
+                    _ => 0,
+                }
+            }
+            0x55BA => c.transfer = code(v)?,
+            0x55BB => c.primaries = code(v)?,
+            0x55BC => {
+                hdr.max_cll = be_uint(v)?.min(65535) as u16;
+                have_hdr = true;
+            }
+            0x55BD => {
+                hdr.max_fall = be_uint(v)?.min(65535) as u16;
+                have_hdr = true;
+            }
+            0x55D0 => {
+                for el in children(v) {
+                    let (id, v) = el?;
+                    match id {
+                        0x55D1..=0x55D6 => {
+                            let k = (id - 0x55D1) as usize;
+                            let x = unit(v, 50_000.0)?;
+                            if k % 2 == 0 {
+                                hdr.primaries_x[k / 2] = x;
+                            } else {
+                                hdr.primaries_y[k / 2] = x;
+                            }
+                        }
+                        0x55D7 => hdr.white_x = unit(v, 50_000.0)?,
+                        0x55D8 => hdr.white_y = unit(v, 50_000.0)?,
+                        0x55D9 => hdr.max_luminance = unit(v, 1.0)?,
+                        0x55DA => hdr.min_luminance = unit(v, 10_000.0)?,
+                        _ => continue,
+                    }
+                    have_hdr = true;
+                }
+            }
+            _ => {}
+        }
+    }
+    c.hdr = have_hdr.then_some(hdr);
+    Ok(c)
 }
 
 fn check_ebml_header(b: &[u8]) -> Result<()> {

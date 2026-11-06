@@ -9,6 +9,7 @@ typedef struct {
     vpx_codec_iface_t *ifc;
     vpx_codec_iter_t iter;
     uint32_t max_w, max_h;
+    int vp9;
     /* pts per decode call; libvpx gives one shown frame per call for
      * VP8 and VP9 (hidden frames in a superframe aren't output). */
     int64_t pts[16];
@@ -22,6 +23,7 @@ void *atr_vpx_new(int vp9, int threads, uint32_t max_w, uint32_t max_h) {
     vpx_codec_iface_t *ifc = vp9 ? vpx_codec_vp9_dx() : vpx_codec_vp8_dx();
     if (vpx_codec_dec_init(&s->c, ifc, &cfg, 0) != VPX_CODEC_OK) { free(s); return NULL; }
     s->ifc = ifc;
+    s->vp9 = vp9;
     s->max_w = max_w;
     s->max_h = max_h;
     return s;
@@ -68,6 +70,19 @@ int atr_vpx_get(void *d, atr_picture *out) {
         out->stride[i] = img->stride[i];
     }
     out->pts = s->head != s->tail ? s->pts[s->tail++ % 16] : 0;
+    /* VP9 says only the matrix and the range; VP8 says neither. */
+    out->primaries = out->transfer = 2;
+    switch (img->cs) {
+    case VPX_CS_BT_601: case VPX_CS_SMPTE_170: out->matrix = 6; break;
+    case VPX_CS_BT_709: out->matrix = 1; break;
+    case VPX_CS_SMPTE_240: out->matrix = 7; break;
+    case VPX_CS_BT_2020: out->matrix = 9; break;
+    case VPX_CS_SRGB: out->matrix = 0; break;
+    default: out->matrix = 2; break;
+    }
+    out->range = s->vp9 ? (img->range == VPX_CR_FULL_RANGE ? 2 : 1) : 0;
+    out->has_hdr = 0;
+    for (int i = 0; i < 12; i++) out->hdr[i] = 0;
     return ATR_GOT;
 }
 

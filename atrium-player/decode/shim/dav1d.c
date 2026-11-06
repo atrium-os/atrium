@@ -68,6 +68,36 @@ int atr_dav1d_get(void *d, atr_picture *out) {
     out->stride[0] = s->pic.stride[0];
     out->stride[1] = out->stride[2] = s->pic.stride[1];
     out->pts = s->pic.m.timestamp;
+    out->primaries = out->transfer = out->matrix = 2;
+    out->range = 0;
+    out->has_hdr = 0;
+    if (s->pic.seq_hdr) {
+        const Dav1dSequenceHeader *q = s->pic.seq_hdr;
+        out->primaries = (uint8_t)q->pri;
+        out->transfer = (uint8_t)q->trc;
+        out->matrix = (uint8_t)q->mtrx;
+        out->range = q->color_range ? 2 : 1;
+    }
+    for (int i = 0; i < 12; i++) out->hdr[i] = 0;
+    if (s->pic.mastering_display) {
+        const Dav1dMasteringDisplay *m = s->pic.mastering_display;
+        /* 0.16 fixed point to 0.00002 units; 24.8 to cd/m2; 18.14 to 0.0001. */
+        for (int c = 0; c < 3; c++) {
+            out->hdr[c] = (uint16_t)(((uint64_t)m->primaries[c][0] * 50000 + 32768) >> 16);
+            out->hdr[3 + c] = (uint16_t)(((uint64_t)m->primaries[c][1] * 50000 + 32768) >> 16);
+        }
+        out->hdr[6] = (uint16_t)(((uint64_t)m->white_point[0] * 50000 + 32768) >> 16);
+        out->hdr[7] = (uint16_t)(((uint64_t)m->white_point[1] * 50000 + 32768) >> 16);
+        uint64_t mx = m->max_luminance >> 8, mn = ((uint64_t)m->min_luminance * 10000) >> 14;
+        out->hdr[8] = (uint16_t)(mx > 65535 ? 65535 : mx);
+        out->hdr[9] = (uint16_t)(mn > 65535 ? 65535 : mn);
+        out->has_hdr = 1;
+    }
+    if (s->pic.content_light) {
+        out->hdr[10] = s->pic.content_light->max_content_light_level;
+        out->hdr[11] = s->pic.content_light->max_frame_average_light_level;
+        out->has_hdr = 1;
+    }
     return ATR_GOT;
 }
 

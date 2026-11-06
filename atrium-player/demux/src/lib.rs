@@ -109,6 +109,41 @@ pub enum Kind {
     Other,
 }
 
+/// How a video track's samples are to be read as colour, in ITU-T H.273
+/// code points (2: unspecified), as the container says it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Color {
+    pub primaries: u8,
+    pub transfer: u8,
+    pub matrix: u8,
+    /// 0: unspecified, 1: limited, 2: full.
+    pub range: u8,
+    pub hdr: Option<Hdr>,
+}
+
+impl Default for Color {
+    fn default() -> Self {
+        Color { primaries: 2, transfer: 2, matrix: 2, range: 0, hdr: None }
+    }
+}
+
+/// Static HDR metadata, in CTA-861.3's units.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct Hdr {
+    /// R, G, B chromaticity of the mastering display, units of 0.00002.
+    pub primaries_x: [u16; 3],
+    pub primaries_y: [u16; 3],
+    pub white_x: u16,
+    pub white_y: u16,
+    /// Peak, cd/m².
+    pub max_luminance: u16,
+    /// Black, units of 0.0001 cd/m².
+    pub min_luminance: u16,
+    /// Brightest pixel and brightest frame average, cd/m² (0: unknown).
+    pub max_cll: u16,
+    pub max_fall: u16,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct TrackInfo {
     /// Index into the track list; what [`Sample::track`] refers to.
@@ -125,6 +160,8 @@ pub struct TrackInfo {
     /// Encrypted (`ContentEncryption`, `encv`/`enca`): the player can't
     /// decode it without a CDM.
     pub encrypted: bool,
+    /// Video: the container's colour description, if it has one.
+    pub color: Option<Color>,
 }
 
 #[derive(Clone, PartialEq)]

@@ -17,11 +17,17 @@ struct RawPicture {
     plane: [*const u8; 3],
     stride: [isize; 3],
     pts: i64,
+    primaries: u8,
+    transfer: u8,
+    matrix: u8,
+    range: u8,
+    has_hdr: u32,
+    hdr: [u16; 12],
 }
 
 impl Default for RawPicture {
     fn default() -> Self {
-        RawPicture { width: 0, height: 0, bit_depth: 0, layout: 0, plane: [std::ptr::null(); 3], stride: [0; 3], pts: 0 }
+        RawPicture { width: 0, height: 0, bit_depth: 0, layout: 0, plane: [std::ptr::null(); 3], stride: [0; 3], pts: 0, primaries: 2, transfer: 2, matrix: 2, range: 0, has_hdr: 0, hdr: [0; 12] }
     }
 }
 
@@ -100,7 +106,19 @@ unsafe fn picture<'a>(raw: &RawPicture, max_w: u32, max_h: u32) -> Result<Pictur
         out[i] = unsafe { std::slice::from_raw_parts(raw.plane[i], len) };
         strides[i] = stride as usize;
     }
-    Ok(Picture { width: w, height: h, bit_depth: raw.bit_depth as u8, layout, planes: out, strides, pts_ns: raw.pts })
+    let hv = &raw.hdr;
+    let hdr = (raw.has_hdr != 0).then(|| atrium_media_demux::Hdr {
+        primaries_x: [hv[0], hv[1], hv[2]],
+        primaries_y: [hv[3], hv[4], hv[5]],
+        white_x: hv[6],
+        white_y: hv[7],
+        max_luminance: hv[8],
+        min_luminance: hv[9],
+        max_cll: hv[10],
+        max_fall: hv[11],
+    });
+    let color = atrium_media_demux::Color { primaries: raw.primaries, transfer: raw.transfer, matrix: raw.matrix, range: raw.range.min(2), hdr };
+    Ok(Picture { width: w, height: h, bit_depth: raw.bit_depth as u8, layout, planes: out, strides, pts_ns: raw.pts, color })
 }
 
 pub struct Dav1d {
