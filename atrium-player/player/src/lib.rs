@@ -18,3 +18,4 @@ pub mod ring;
 pub mod supervisor;
 pub mod sys;
 pub mod wire;
+pub mod wsola;

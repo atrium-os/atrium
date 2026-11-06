@@ -238,3 +238,30 @@ fn pause_stops_the_stream_and_a_seek_flushes_and_starts_at_the_target() {
     // or take WebM's millisecond timestamps.
     assert!((24_600..=24_700).contains(&after), "{after} frames after the seek");
 }
+
+#[test]
+fn a_faster_rate_plays_shorter_and_the_clock_runs_faster() {
+    let want = reference_pcm("vp9-opus.webm");
+    let (sock, heard) = fake_choragus("rate");
+    let mut s = Session::new("vp9-opus.webm", sock);
+    let mut first = true;
+    let until = Instant::now() + Duration::from_millis(800);
+    while Instant::now() < until {
+        s.run(Duration::from_millis(10), &heard, 0);
+        if first && s.a.is_some() {
+            first = false;
+            s.a.as_mut().unwrap().set_rate(1.5);
+        }
+    }
+    let a = s.a.as_ref().expect("a stream");
+    let (t0, p0) = (now_ns(), a.position_ns(now_ns()).expect("playing"));
+    s.run(Duration::from_millis(500), &heard, 0);
+    let (t1, p1) = (now_ns(), s.a.as_ref().unwrap().position_ns(now_ns()).unwrap());
+    let (ran, wall) = ((p1 - p0) as f64 / 1e6, (t1 - t0) as f64 / 1e6);
+    assert!((ran - 1.5 * wall).abs() < 40.0, "the media clock ran {ran:.1} ms in {wall:.1} ms at 1.5x");
+    // The whole clip, a third shorter (WSOLA keeps its last segment).
+    let short = (want.len() as f64 / 1.5) as usize;
+    s.run(Duration::from_secs(8), &heard, short - 48_000 / 10);
+    let got = heard.lock().unwrap().samples.len();
+    assert!((got as f64 - short as f64).abs() < 0.02 * short as f64 + 4_000.0, "{got} samples heard, want about {short}");
+}

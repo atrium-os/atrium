@@ -25,17 +25,25 @@ pub fn monotonic_ns() -> i64 {
 /// Media time to wall time. With sound, the audio clock is the master
 /// (`av`, from [`crate::audio_out`]); without, `CLOCK_MONOTONIC`, started at
 /// the first frame after play or a seek.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct Clock {
     base: Option<(i64, i64)>,
     /// How far ahead of now the first frame is scheduled.
     pub lead_ns: i64,
     pub av: Option<crate::audio_out::AvMap>,
+    /// Playback rate (media seconds per second), for the monotonic path.
+    pub rate: f64,
+}
+
+impl Default for Clock {
+    fn default() -> Self {
+        Clock::new(0)
+    }
 }
 
 impl Clock {
     pub fn new(lead_ns: i64) -> Self {
-        Clock { base: None, lead_ns, av: None }
+        Clock { base: None, lead_ns, av: None, rate: 1.0 }
     }
     pub fn present_at(&mut self, pts_ns: i64) -> i64 {
         if let Some(m) = self.av {
@@ -43,7 +51,7 @@ impl Clock {
         }
         let lead = self.lead_ns;
         let (m, p) = *self.base.get_or_insert_with(|| (monotonic_ns() + lead, pts_ns));
-        m + (pts_ns - p)
+        m + ((pts_ns - p) as f64 / self.rate) as i64
     }
     pub fn reset(&mut self) {
         self.base = None;

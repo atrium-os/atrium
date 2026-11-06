@@ -14,6 +14,7 @@ use lyra_protocol::clock::{Clock, STATE_PLAYING};
 use lyra_protocol::wire::{Role, StreamParams, ToApp};
 
 use crate::supervisor::{Player, Sink};
+use crate::wsola::Wsola;
 
 /// Where choragusd listens inside an app's jail (lyra-v1.md §5).
 pub const DEFAULT_SOCKET: &str = "/atrium/sockets/audio/audio.sock";
@@ -30,20 +31,23 @@ pub struct AvMap {
     pub clock: Clock,
     pub frame0: u64,
     pub media0: i64,
+    /// Playback rate: media seconds per second heard.
+    pub rate: f64,
 }
 
 impl AvMap {
     /// When media time `pts_ns` is (or was) heard.
     pub fn at(&self, pts_ns: i64) -> i64 {
         let speed = 1.0 + self.clock.rate_ppm as f64 / 1e6;
-        self.clock.heard_at(self.frame0) + ((pts_ns - self.media0) as f64 / speed) as i64
+        self.clock.heard_at(self.frame0) + ((pts_ns - self.media0) as f64 / self.rate / speed) as i64
     }
 }
 
 pub struct AudioOut {
     client: Client,
     stream: Stream,
-    rate: u32,
+    /// The stream's sample rate.
+    rate_hz: u32,
     channels: usize,
     /// The stream position of the next frame written.
     next_frame: u64,
@@ -60,6 +64,9 @@ pub struct AudioOut {
     pub lost: bool,
     pub underruns: u64,
     buf: Vec<f32>,
+    /// Rate other than 1: the PCM goes through WSOLA first.
+    stretch: Option<Wsola>,
+    rate: f64,
 }
 
 impl AudioOut {
@@ -71,7 +78,7 @@ impl AudioOut {
         Ok(AudioOut {
             client,
             stream,
-            rate,
+            rate_hz: rate,
             channels: channels as usize,
             next_frame: 0,
             anchor: None,
@@ -83,6 +90,8 @@ impl AudioOut {
             lost: false,
             underruns: 0,
             buf: vec![0f32; 48_000 * 8],
+            stretch: None,
+            rate: 1.0,
         })
     }
 
@@ -109,14 +118,31 @@ impl AudioOut {
         self.anchor = None;
         self.written_until = None;
         self.from_ns = Some(to_ns);
+        self.stretch = None;
+    }
+
+    /// Play at `rate` (0.25 to 4) with the pitch kept. Takes effect from
+    /// the next run: the caller seeks to where it is, which flushes.
+    pub fn set_rate(&mut self, rate: f64) {
+        self.rate = rate.clamp(0.25, 4.0);
+        self.stretch = None;
     }
 
     pub fn set_volume(&mut self, v: f32) {
         self.lost |= self.client.set_volume(&self.stream, v.clamp(0.0, 1.0)).is_err();
     }
 
+    fn rate_hz(&self) -> u32 {
+        self.rate_hz
+    }
+
+    /// The playback rate.
+    pub fn rate(&self) -> f64 {
+        self.rate
+    }
+
     fn ns_of(&self, frames: u64) -> i64 {
-        (frames as i128 * 1_000_000_000 / self.rate as i128) as i64
+        (frames as i128 * 1_000_000_000 / self.rate_hz as i128) as i64
     }
 
     /// Move decoded audio into the stream, as much as it has room for, and
@@ -142,11 +168,28 @@ impl AudioOut {
         }
         let ch = self.channels;
         loop {
+            // Stretched output waiting for room goes first.
+            if let Some(w) = self.stretch.as_mut() {
+                while w.ready() > 0 {
+                    let room = self.stream.writable() as usize;
+                    if room == 0 {
+                        break;
+                    }
+                    let mut out = vec![0f32; room.min(w.ready()) * ch];
+                    let n = w.pull(&mut out);
+                    self.next_frame += self.stream.write(&out[..n * ch]);
+                }
+                if w.ready() > 0 {
+                    break;
+                }
+            }
             let room = self.stream.writable() as usize;
             if room == 0 {
                 break;
             }
-            let want = (room * ch).min(self.buf.len() / ch * ch);
+            // Input for that much output.
+            let room_in = ((room as f64 * self.rate) as usize).max(1);
+            let want = (room_in * ch).min(self.buf.len() / ch * ch);
             let mut buf = std::mem::take(&mut self.buf);
             let (n, pts) = p.read_pcm(&mut buf[..want]);
             if n == 0 {
@@ -160,7 +203,7 @@ impl AudioOut {
             let mut start = 0;
             if let Some(from) = self.from_ns {
                 if pts < from {
-                    let skip = (((from - pts) as i128 * self.rate as i128 / 1_000_000_000) as usize).min(n);
+                    let skip = (((from - pts) as i128 * self.rate_hz() as i128 / 1_000_000_000) as usize).min(n);
                     start = skip;
                     pts += self.ns_of(skip as u64);
                 }
@@ -174,18 +217,27 @@ impl AudioOut {
                 // within that, the sample count is the truth.
                 let contiguous = self.written_until.is_some_and(|w| (pts - w).abs() <= JITTER_NS.max(self.ns_of(1)));
                 if !contiguous {
+                    // A new run: what WSOLA still holds belongs to the old one.
+                    self.stretch = None;
                     self.anchor = Some((self.next_frame, pts));
                 }
                 let frames = &buf[start * ch..n * ch];
-                let w = self.stream.write(frames) as usize;
-                self.next_frame += w as u64;
-                self.written_until = Some(pts + self.ns_of(w as u64));
+                if self.rate == 1.0 {
+                    let w = self.stream.write(frames) as usize;
+                    self.next_frame += w as u64;
+                    self.written_until = Some(pts + self.ns_of(w as u64));
+                } else {
+                    let (rate_hz, rate) = (self.rate_hz(), self.rate);
+                    let w = self.stretch.get_or_insert_with(|| Wsola::new(rate_hz, ch, rate));
+                    w.push(frames);
+                    self.written_until = Some(pts + self.ns_of((n - start) as u64));
+                }
             }
             self.buf = buf;
         }
         if self.playing && !self.started {
             let queued = self.anchor.map_or(0, |(f0, _)| self.next_frame.saturating_sub(f0));
-            if queued * 1000 >= PRIME_MS * self.rate as u64 || (ended && queued > 0) {
+            if queued * 1000 >= PRIME_MS * self.rate_hz as u64 || (ended && queued > 0) {
                 self.started = true;
                 self.lost |= self.client.start(&self.stream).is_err();
             }
@@ -202,13 +254,13 @@ impl AudioOut {
     pub fn map(&self) -> Option<AvMap> {
         let clock = self.stream.clock();
         let (frame0, media0) = self.anchor?;
-        (self.started && clock.state == STATE_PLAYING).then_some(AvMap { clock, frame0, media0 })
+        (self.started && clock.state == STATE_PLAYING).then_some(AvMap { clock, frame0, media0, rate: self.rate })
     }
 
     /// Media time being heard now, if playing.
     pub fn position_ns(&self, now_ns: i64) -> Option<i64> {
         let m = self.map()?;
         let speed = 1.0 + m.clock.rate_ppm as f64 / 1e6;
-        Some(m.media0 + ((now_ns - m.clock.heard_at(m.frame0)) as f64 * speed) as i64)
+        Some(m.media0 + ((now_ns - m.clock.heard_at(m.frame0)) as f64 * speed * m.rate) as i64)
     }
 }

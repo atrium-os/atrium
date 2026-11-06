@@ -131,6 +131,8 @@ pub struct App<H: Host> {
     /// choragusd's socket.
     pub audio_socket: String,
     volume: f32,
+    /// Playback rate, pitch kept.
+    rate: f64,
     /// Since when play is waiting for the audio to start.
     audio_wait: Option<Instant>,
 }
@@ -182,6 +184,7 @@ impl<H: Host> App<H> {
             audio: None,
             audio_socket: std::env::var("ATRIUM_AUDIO_SOCKET").unwrap_or_else(|_| crate::audio_out::DEFAULT_SOCKET.into()),
             volume: 1.0,
+            rate: 1.0,
             audio_wait: None,
         }
     }
@@ -246,6 +249,25 @@ impl<H: Host> App<H> {
         if let Some(p) = self.player.as_mut() {
             p.set_paused(!(run && (audio_ready || ended)));
         }
+    }
+
+    /// Change the playback rate: the new rate applies from where playback
+    /// is now, by a seek there (which flushes what is queued at the old one).
+    fn set_rate(&mut self, rate: f64) {
+        let rate = rate.clamp(0.25, 4.0);
+        if rate == self.rate {
+            return;
+        }
+        self.rate = rate;
+        if let Some(a) = self.audio.as_mut() {
+            a.set_rate(rate);
+        }
+        self.sink().clock.rate = rate;
+        if self.player.is_none() {
+            return;
+        }
+        let at = self.player.as_ref().and_then(|p| p.position_ns()).map_or(self.controls.position_s, secs);
+        self.seek(at.max(0.0), false);
     }
 
     fn seek(&mut self, to: f64, from_controls: bool) {
@@ -343,8 +365,7 @@ impl<H: Host> App<H> {
                     a.set_volume(volume);
                 }
             }
-            // Rate (WSOLA) is still to come; the value is checked by decode.
-            ToChild::SetRate { .. } => {}
+            ToChild::SetRate { rate } => self.set_rate(rate as f64),
         }
         Ok(())
     }
@@ -370,6 +391,7 @@ impl<H: Host> App<H> {
                             if self.volume < 1.0 {
                                 a.set_volume(self.volume);
                             }
+                            a.set_rate(self.rate);
                             self.audio = Some(a);
                             self.sync_paused();
                         }
