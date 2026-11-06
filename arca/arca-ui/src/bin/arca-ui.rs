@@ -27,6 +27,10 @@ use limen::client::Child;
 use limen::credential::ToChild;
 use limen::proto::{ChildEvent, EmbedId};
 
+/// Until frescod's FocusChanged says pointer or keyboard, a focus this soon
+/// after a press in the window is taken as a click.
+const RING_AFTER_PRESS: Duration = Duration::from_millis(100);
+
 fn env(k: &str, d: &str) -> String {
     std::env::var(k).unwrap_or_else(|_| d.to_string())
 }
@@ -38,7 +42,10 @@ struct Embed {
     parent: Option<Parent>,
     field: Field,
     size: (f32, f32),
-    hover: bool,
+    look: view::Look,
+    /// The last pointer press in this window: a focus that follows one
+    /// within RING_AFTER_PRESS came by click and shows no ring.
+    pressed_at: Option<Instant>,
     dirty: bool,
 }
 
@@ -191,7 +198,7 @@ fn main() -> ExitCode {
                     if parent.is_none() {
                         field.notice = Some(Notice::UnknownApp);
                     }
-                    let mut e = Embed { win, window_id, font, parent, field, size: (240.0, 36.0), hover: false, dirty: true };
+                    let mut e = Embed { win, window_id, font, parent, field, size: (240.0, 36.0), look: view::Look::default(), pressed_at: None, dirty: true };
                     if let Err(err) = cx.child.ready(embed, token) {
                         eprintln!("arca-ui: ready {embed}: {err:?}");
                         let _ = e.win.window_destroy(window_id);
@@ -249,21 +256,30 @@ fn main() -> ExitCode {
                         e.size = (width as f32, height as f32);
                         vec![Do::Redraw]
                     }
-                    Event::PointerMotion { .. } if !e.hover => {
-                        e.hover = true;
+                    Event::PointerMotion { .. } if !e.look.hover => {
+                        e.look.hover = true;
                         vec![Do::Redraw]
                     }
                     Event::FocusChanged { gained, .. } => {
-                        e.hover = false;
+                        e.look.hover = false;
+                        e.look.ring = gained && e.pressed_at.is_none_or(|t| t.elapsed() > RING_AFTER_PRESS);
                         if gained {
                             cx.refresh_accounts(e);
                         }
                         e.field.focus(gained)
                     }
                     Event::Key { hid_usage, pressed: true, modifiers, activation, .. } => {
+                        // Typing in the field is keyboard use: the ring returns.
+                        if !e.look.ring {
+                            e.look.ring = true;
+                            e.dirty = true;
+                        }
                         e.field.key(keymap::decode(hid_usage, modifiers), activation)
                     }
                     Event::PointerButton { x, y, pressed: true, activation, .. } => {
+                        e.pressed_at = Some(Instant::now());
+                        e.look.ring = false;
+                        e.dirty = true;
                         let l = view::layout(&e.field, e.size.0, e.size.1);
                         if l.chip.is_some_and(|c| c.contains(x, y)) {
                             e.field.press_chip(activation)
@@ -290,7 +306,7 @@ fn main() -> ExitCode {
             if e.dirty {
                 e.dirty = false;
                 let who = e.parent.as_ref().map_or("unknown app", |p| p.app_id.as_str()).to_string();
-                if let Err(err) = view::draw(&mut e.win, e.font, &e.field, &who, e.hover, e.size.0, e.size.1) {
+                if let Err(err) = view::draw(&mut e.win, e.font, &e.field, &who, e.look, e.size.0, e.size.1) {
                     eprintln!("arca-ui: draw {id}: {err}");
                 }
             }

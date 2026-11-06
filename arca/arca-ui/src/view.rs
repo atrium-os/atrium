@@ -85,19 +85,29 @@ fn rgba(c: pergola::Color) -> [f32; 4] {
     [c.r, c.g, c.b, c.a]
 }
 
+/// Pointer state the field's look depends on.
+#[derive(Clone, Copy, Default)]
+pub struct Look {
+    /// The pointer is over the field.
+    pub hover: bool,
+    /// Focus came by keyboard: show the focus ring (rev. 2 §14.1). A
+    /// click focuses without it.
+    pub ring: bool,
+}
+
 /// Draw with Pergola's semantic tokens (visual language rev. 2). Light
 /// until the system setting for the mode lands.
-pub fn draw(conn: &mut Connection, font: u32, f: &Field, recipient: &str, hover: bool, w: f32, h: f32) -> io::Result<()> {
+pub fn draw(conn: &mut Connection, font: u32, f: &Field, recipient: &str, look: Look, w: f32, h: f32) -> io::Result<()> {
     let t = Semantic::LIGHT;
     let l = layout(f, w, h);
     let mut fr = conn.frame()?;
-    if f.focused {
+    if f.focused && look.ring {
         // A 2 px accent halo, the 1 px focus ring, then the field's fill.
         fr.rect(rect(0.0, 0.0, w, h, t.accent_bg(), 6.0))?;
         fr.rect(rect(2.0, 2.0, w - 4.0, h - 4.0, t.focus_ring(), 5.0))?;
         fr.rect(rect(3.0, 3.0, w - 6.0, h - 6.0, t.bg_canvas(), 4.0))?;
     } else {
-        let edge = if hover { t.border_control() } else { t.border_strong() };
+        let edge = if look.hover || f.focused { t.border_control() } else { t.border_strong() };
         fr.rect(rect(0.0, 0.0, w, h, t.bg_canvas(), 0.0))?;
         fr.rect(rect(3.0, 3.0, w - 6.0, h - 6.0, edge, 4.0))?;
         fr.rect(rect(4.0, 4.0, w - 8.0, h - 8.0, t.bg_canvas(), 3.0))?;
