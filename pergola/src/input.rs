@@ -7,7 +7,7 @@
 //! Larger key coverage (function keys, full unicode IME) layers in
 //! when those features are added.
 
-use crate::event::{Event, Key, KeyEventKind, Modifiers};
+use crate::event::{Event, Key, KeyEventKind, Modifiers, ScrollPhase};
 use crate::geom::Point;
 
 /// Map a fresco-client event to Pergola's input model. Returns `None`
@@ -26,16 +26,27 @@ pub fn translate(ev: &fresco_client::Event) -> Option<Event> {
         fresco_client::Event::PointerMotion { x, y, .. } => {
             Some(Event::PointerMove { at: Point::new(*x, *y) })
         }
-        fresco_client::Event::Key { hid_usage, pressed, modifiers, .. } => {
+        fresco_client::Event::Key { hid_usage, pressed, modifiers, repeat, .. } => {
             let mods = decode_modifiers(*modifiers);
-            let kind = if *pressed { KeyEventKind::Down } else { KeyEventKind::Up };
+            let kind = match (*pressed, *repeat) {
+                (true, true) => KeyEventKind::Repeat,
+                (true, false) => KeyEventKind::Down,
+                (false, _) => KeyEventKind::Up,
+            };
             let (key, chars) = decode_key(*hid_usage, &mods);
             Some(Event::Key { kind, key, modifiers: mods, chars })
         }
         // A wheel or trackpad delta, at wherever the pointer last was
         // (the App knows; the event does not say).
-        fresco_client::Event::PointerScroll { dx, dy, .. } => {
-            Some(Event::Scroll { at: None, dx: *dx, dy: *dy, modifiers: Modifiers::default() })
+        fresco_client::Event::PointerScroll { dx, dy, phase, .. } => {
+            use fresco_protocol::scroll_phase as p;
+            let phase = match *phase {
+                p::BEGIN => ScrollPhase::Begin,
+                p::UPDATE => ScrollPhase::Update,
+                p::END => ScrollPhase::End,
+                _ => ScrollPhase::None,
+            };
+            Some(Event::Scroll { at: None, dx: *dx, dy: *dy, modifiers: Modifiers::default(), phase })
         }
         fresco_client::Event::Drop { x, y, .. } => Some(Event::Drop { at: Point::new(*x, *y) }),
         // Window lifecycle events not yet routed through Pergola's

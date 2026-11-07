@@ -35,8 +35,9 @@ pub const FLING_MAX_PX_PER_S: f64 = 20_000.0;
 /// set the release velocity.
 pub const DRAG_WINDOW_MS: f64 = 80.0;
 /// A drag with no new delta for this long (ms) has been released: about
-/// three input reports at 120 Hz. The wire carries no gesture phases yet
-/// (fresco `PointerScroll` is a bare delta), so a release is inferred.
+/// three input reports at 120 Hz, for input with no gesture phases (a
+/// wheel, or a device that does not say): there a release is inferred.
+/// A touchpad's phases end the drag exactly ([`Physics::release`]).
 /// Until it is, a drag whose next delta is late coasts at its speed, and
 /// the fling continues from the coast: no pause and no jump at release.
 pub const RELEASE_AFTER_MS: f64 = 30.0;
@@ -48,7 +49,7 @@ enum Motion {
     Idle,
     /// Following input; `last` is the time of the latest delta and
     /// `y_last` the position it left.
-    Drag { last: f64, y_last: f64 },
+    Drag { last: f64, y_last: f64, held: bool },
     /// Released: speed `v0` (px/s, signed) at `t0`, from `y0`.
     Fling { t0: f64, y0: f64, v0: f64 },
     /// Easing from `y0` to `y1` over `JUMP_MS` from `t0`.
@@ -115,7 +116,30 @@ impl Physics {
         self.samples[i] = (t, dy);
         self.n_samples += 1;
         self.y = (self.y + dy).clamp(0.0, self.max);
-        self.motion = Motion::Drag { last: t, y_last: self.y };
+        self.motion = Motion::Drag { last: t, y_last: self.y, held: false };
+    }
+
+    /// A delta of a gesture whose fingers are known to be down (touchpad
+    /// phases): like [`drag`](Self::drag), but no release is inferred
+    /// when the deltas pause; [`release`](Self::release) ends it.
+    pub fn hold(&mut self, dy: f64, t: f64) {
+        self.drag(dy, t);
+        if let Motion::Drag { held, .. } = &mut self.motion {
+            *held = true;
+        }
+    }
+
+    /// The fingers lifted at `t` ms: fling at the drag's speed, unless
+    /// they had stopped moving first.
+    pub fn release(&mut self, t: f64) {
+        let Motion::Drag { last, .. } = self.motion else { return };
+        let v = if t - last <= DRAG_WINDOW_MS { self.release_velocity() } else { 0.0 };
+        if v.abs() >= FLING_MIN_PX_PER_S {
+            self.motion = Motion::Fling { t0: t, y0: self.y, v0: v };
+            self.velocity = v;
+        } else {
+            self.stop();
+        }
     }
 
     /// The release speed: the deltas of the last [`DRAG_WINDOW_MS`] over
@@ -185,7 +209,11 @@ impl Physics {
     pub fn step(&mut self, t: f64) -> f64 {
         match self.motion {
             Motion::Idle => {}
-            Motion::Drag { last, y_last } => {
+            // Fingers down and still: nothing moves until they do or lift.
+            Motion::Drag { held: true, last, .. } => {
+                self.velocity = if t - last <= DRAG_WINDOW_MS { self.release_velocity() } else { 0.0 };
+            }
+            Motion::Drag { last, y_last, held: false } => {
                 let v = self.release_velocity();
                 // A delta is late once a report interval has passed: from
                 // then the content coasts at the drag's speed, as the next
@@ -491,6 +519,36 @@ mod tests {
             p.drag(dy, t + i as f64 * dt);
         }
         t + (n - 1) as f64 * dt
+    }
+
+    #[test]
+    fn touchpad_phases_hold_still_and_fling_on_lift() {
+        let mut p = Physics::new(10_000.0);
+        let mut t = 0.0;
+        for _ in 0..8 {
+            t += 8.0;
+            p.hold(16.0, t);
+        }
+        let y = p.y;
+        // Fingers resting on the pad: no coast, no fling, however long.
+        assert_eq!(p.step(t + 200.0), y);
+        assert!(p.is_moving(), "still a gesture");
+        // Lifted after resting: no fling.
+        p.release(t + 200.0);
+        assert!(!p.is_moving());
+
+        // Moving, then lifted: it flings from the lift, at the drag's speed.
+        for _ in 0..8 {
+            t += 8.0;
+            p.hold(16.0, t);
+        }
+        let y = p.y;
+        p.release(t + 4.0);
+        assert!((p.velocity - 2000.0).abs() < 1.0, "{}", p.velocity);
+        assert!(p.step(t + 104.0) > y + 100.0);
+        // Fingers down again catch it.
+        p.stop();
+        assert!(!p.is_moving());
     }
 
     #[test]

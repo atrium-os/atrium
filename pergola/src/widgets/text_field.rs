@@ -184,7 +184,8 @@ impl View for TextField {
         let submit = self.on_submit.clone();
         ctx.on_key(bg_id, move |ev| {
             let Event::Key { kind, key, chars, modifiers } = ev else { return };
-            if *kind != KeyEventKind::Down {
+            // Held keys type and move again; a held Enter submits once.
+            if !kind.pressed() || (*kind == KeyEventKind::Repeat && *key == crate::event::Key::Enter) {
                 return;
             }
             let mut e = state.get_cloned();
@@ -368,8 +369,23 @@ mod tests {
         app.tick();
         app.handle_event(Event::PointerDown { at: Point::new(10.0, 10.0) });
         app.handle_event(Event::PointerUp { at: Point::new(10.0, 10.0) });
+        // A held Enter submits once.
+        let held = Event::Key { kind: KeyEventKind::Repeat, key: Key::Enter, modifiers: Modifiers::default(), chars: String::new() };
+        app.handle_event(held);
+        assert_eq!(got.borrow().as_deref(), None);
         app.handle_event(key(Key::Enter, Modifiers::default()));
         assert_eq!(got.borrow().as_deref(), Some("alice"));
+    }
+
+    #[test]
+    fn a_held_backspace_keeps_deleting() {
+        let (mut app, content, _) = setup(false, "hello");
+        app.handle_event(key(Key::End, Modifiers::default()));
+        app.handle_event(key(Key::Backspace, Modifiers::default()));
+        for _ in 0..2 {
+            app.handle_event(Event::Key { kind: KeyEventKind::Repeat, key: Key::Backspace, modifiers: Modifiers::default(), chars: String::new() });
+        }
+        assert_eq!(text(&content), "he");
     }
 
     #[test]

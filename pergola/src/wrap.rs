@@ -12,7 +12,7 @@
 use std::sync::OnceLock;
 
 use hyphenation::{Hyphenator, Language, Load, Standard};
-use unicode_linebreak::{linebreaks, BreakOpportunity};
+use unicode_linebreak::linebreaks;
 use unicode_segmentation::UnicodeSegmentation;
 
 const SHY: char = '\u{00AD}';

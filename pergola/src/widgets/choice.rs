@@ -74,8 +74,8 @@ fn is_space(ev: &Event) -> bool {
 /// Arrow keys as a step through a group: -1, +1, or none.
 fn arrow(ev: &Event) -> Option<isize> {
     match ev {
-        Event::Key { kind: KeyEventKind::Down, key: Key::Left | Key::Up, .. } => Some(-1),
-        Event::Key { kind: KeyEventKind::Down, key: Key::Right | Key::Down, .. } => Some(1),
+        Event::Key { kind: KeyEventKind::Down | KeyEventKind::Repeat, key: Key::Left | Key::Up, .. } => Some(-1),
+        Event::Key { kind: KeyEventKind::Down | KeyEventKind::Repeat, key: Key::Right | Key::Down, .. } => Some(1),
         _ => None,
     }
 }

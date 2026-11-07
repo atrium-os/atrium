@@ -194,7 +194,14 @@ impl View for Menu {
         ctx.on_click(body, || {});
         let (s, pick, items) = (self.state.clone(), self.on_pick.clone(), self.items.clone());
         ctx.on_key(body, move |ev| {
-            let Event::Key { kind: KeyEventKind::Down, key, chars, .. } = ev else { return };
+            let Event::Key { kind, key, chars, .. } = ev else { return };
+            if !kind.pressed() {
+                return;
+            }
+            // Held arrows walk the menu; a held Enter or Space picks once.
+            if *kind == KeyEventKind::Repeat && !matches!(key, Key::Down | Key::Up) {
+                return;
+            }
             let mut st = s.get();
             match key {
                 Key::Down => st.highlight = Menu::step(&items, st.highlight, 1),

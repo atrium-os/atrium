@@ -20,8 +20,9 @@ pub enum Event {
     /// A wheel or trackpad delta in px (positive `dy` scrolls the content
     /// up, revealing what is below). `at` is the pointer, when known; the
     /// App fills it from the last pointer position, and `modifiers` from
-    /// the last key event (Ctrl + wheel zooms).
-    Scroll { at: Option<Point>, dx: f32, dy: f32, modifiers: Modifiers },
+    /// the last key event (Ctrl + wheel zooms). `phase` says whether the
+    /// fingers are on a touchpad.
+    Scroll { at: Option<Point>, dx: f32, dy: f32, modifiers: Modifiers, phase: ScrollPhase },
     /// A keyboard key transition (down or up). `key` is the
     /// USB-HID-usage-code-style identifier from `Key`. `chars` is
     /// any text input the platform decoded for this event (printable
@@ -40,8 +41,37 @@ pub enum Event {
     Drop { at: Point },
 }
 
+/// Where a scroll is in its gesture (`fresco_protocol::scroll_phase`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ScrollPhase {
+    /// No gesture: a wheel, or a device that does not say. A release is
+    /// inferred when the deltas stop.
+    #[default]
+    None,
+    /// Fingers went down on a touchpad (catches a fling), maybe with motion.
+    Begin,
+    /// Fingers moving.
+    Update,
+    /// Fingers lifted; no motion. A scroll view flings from here.
+    End,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum KeyEventKind { Down, Up }
+pub enum KeyEventKind {
+    Down,
+    /// The key is still held: the system's key repeat. Text entry, arrows
+    /// and scrolling act on it again; a toggle or a button acts once per
+    /// press, on `Down` only.
+    Repeat,
+    Up,
+}
+
+impl KeyEventKind {
+    /// A press or a repeat: anything that should act again while held.
+    pub fn pressed(self) -> bool {
+        matches!(self, KeyEventKind::Down | KeyEventKind::Repeat)
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct Modifiers {

@@ -518,11 +518,11 @@ impl<V: View> App<V> {
                     self.touch();
                 }
             }
-            Event::Scroll { at, dx, dy, modifiers } => {
+            Event::Scroll { at, dx, dy, modifiers, phase } => {
                 let at = at.or(self.pointer);
                 let mods = if *modifiers == Default::default() { self.modifiers } else { *modifiers };
                 let hit = at.and_then(|p| hit_test(&self.prev_tree, p));
-                let kind = crate::interaction::ScrollKind::Wheel { at, dx: *dx, dy: *dy, modifiers: mods };
+                let kind = crate::interaction::ScrollKind::Wheel { at, dx: *dx, dy: *dy, modifiers: mods, phase: *phase };
                 self.scroll_to(hit, kind);
             }
             Event::Drop { at } => {
@@ -536,12 +536,12 @@ impl<V: View> App<V> {
             }
             Event::Key { kind, key, modifiers, chars } => {
                 self.modifiers = *modifiers;
-                if *kind == KeyEventKind::Down {
+                if kind.pressed() {
                     self.close_tip(false);
                 }
                 // Tab is focus traversal, owned by the App; focused
                 // widgets never see it.
-                if *kind == KeyEventKind::Down && *key == Key::Tab {
+                if kind.pressed() && *key == Key::Tab {
                     self.cycle_focus(modifiers.shift);
                     return;
                 }
@@ -575,7 +575,7 @@ impl<V: View> App<V> {
                 }
                 // Navigation keys no focused widget took scroll the view
                 // that has focus inside it, else the one under the pointer.
-                if !taken && *kind == KeyEventKind::Down && is_scroll_key(*key, chars, modifiers) {
+                if !taken && kind.pressed() && is_scroll_key(*key, chars, modifiers) {
                     let k = crate::interaction::ScrollKind::Key {
                         key: *key,
                         chars: chars.chars().next().unwrap_or('\0'),

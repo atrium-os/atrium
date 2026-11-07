@@ -16,7 +16,7 @@
 //! and sent at the settled zoom; while a pinch runs the content group
 //! stretches it, and text keeps its size until the zoom settles.
 
-use crate::event::Key;
+use crate::event::{Key, ScrollPhase};
 use crate::geom::{Point, Rect};
 use crate::interaction::{ScrollInput, ScrollKind};
 use crate::node::{Node, NodeId};
@@ -68,6 +68,18 @@ impl ScrollState {
                 let z0 = self.zoom.live;
                 self.zoom.pinch((-(dy as f64) * WHEEL_ZOOM_PER_PX).exp(), t);
                 self.refocus(z0, focus, node);
+            }
+            // A touchpad that says where the fingers are: they follow it,
+            // fingers down catch a fling, and lifting them throws one.
+            ScrollKind::Wheel { dy, phase, .. } if phase != ScrollPhase::None => {
+                if phase == ScrollPhase::Begin {
+                    self.physics.stop();
+                }
+                if phase == ScrollPhase::End {
+                    self.physics.release(t);
+                } else if dy != 0.0 {
+                    self.physics.hold(dy as f64 / self.zoom.live, t);
+                }
             }
             ScrollKind::Wheel { dy, .. } => {
                 let d = dy as f64 / self.zoom.live;
@@ -258,7 +270,7 @@ mod tests {
     }
 
     fn wheel(dy: f32) -> Event {
-        Event::Scroll { at: Some(Point::new(100.0, 100.0)), dx: 0.0, dy, modifiers: Modifiers::default() }
+        Event::Scroll { at: Some(Point::new(100.0, 100.0)), dx: 0.0, dy, modifiers: Modifiers::default(), phase: crate::event::ScrollPhase::None }
     }
 
     #[test]
@@ -337,7 +349,7 @@ mod tests {
         let (mut app, state) = app();
         let ctrl = Modifiers { ctrl: true, ..Default::default() };
         app.set_time(0.0);
-        app.handle_event(Event::Scroll { at: Some(Point::new(100.0, 0.0)), dx: 0.0, dy: -100.0, modifiers: ctrl });
+        app.handle_event(Event::Scroll { at: Some(Point::new(100.0, 0.0)), dx: 0.0, dy: -100.0, modifiers: ctrl, phase: crate::event::ScrollPhase::None });
         let st = state.get();
         assert!(st.zoom.live > 1.0 && st.zoom.settled == 1.0);
         let frames = run_frames(&mut app, 0.0, 200.0);

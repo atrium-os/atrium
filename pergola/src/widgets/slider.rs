@@ -6,7 +6,7 @@
 
 use std::rc::Rc;
 
-use crate::event::{Event, Key, KeyEventKind};
+use crate::event::{Event, Key};
 use crate::geom::{Point, Rect};
 use crate::interaction::DragPhase;
 use crate::node::Node;
@@ -137,7 +137,10 @@ impl View for Slider {
         let value = self.value.clone();
         let unit = if step > 0.0 { step } else { span / 100.0 };
         ctx.on_key(target, move |ev| {
-            let Event::Key { kind: KeyEventKind::Down, key, .. } = ev else { return };
+            let Event::Key { kind, key, .. } = ev else { return };
+            if !kind.pressed() {
+                return;
+            }
             let v = value.get();
             match key {
                 Key::Left | Key::Down => set(v - unit),
@@ -203,7 +206,7 @@ mod tests {
         let mut app = App::new_with_flag(One(Slider::new(v.clone(), 0.0, 100.0).step(5.0)), d);
         app.tick();
         let key = |app: &mut App<One>, k| {
-            app.handle_event(Event::Key { kind: KeyEventKind::Down, key: k, modifiers: Modifiers::default(), chars: String::new() });
+            app.handle_event(Event::Key { kind: crate::event::KeyEventKind::Down, key: k, modifiers: Modifiers::default(), chars: String::new() });
             app.tick();
         };
         key(&mut app, Key::Tab);

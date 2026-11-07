@@ -24,7 +24,7 @@ pub type KeyHandler = Box<dyn Fn(&Event) + 'static>;
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum ScrollKind {
     /// A wheel or trackpad delta (px) with the pointer at `at`.
-    Wheel { at: Option<Point>, dx: f32, dy: f32, modifiers: Modifiers },
+    Wheel { at: Option<Point>, dx: f32, dy: f32, modifiers: Modifiers, phase: crate::event::ScrollPhase },
     /// A navigation key: arrows, Page Up/Down, Home/End, Space, and with
     /// Ctrl the zoom keys (`+`, `-`, `0` arrive as `Key::Char` + `chars`).
     Key { key: Key, chars: char, modifiers: Modifiers },

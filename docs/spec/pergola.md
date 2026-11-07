@@ -464,10 +464,17 @@ stays frescod's, drawn outside any app.
   scroll node alone).
 - **Input.** `Event::Scroll` (from fresco `PointerScroll`, at the last pointer position). Deltas of
   30 px or more are wheel notches and ease; smaller ones follow the finger and fling on release.
-  The wire has no gesture phases, so release is inferred after 30 ms without a delta; a late
-  delta coasts at the drag's speed and the fling takes over from the coast, so release neither
-  pauses nor jumps (tested at 1 ms steps). Arrows, Page Up/Down, Space, Home/End go to the
+  A touchpad's phases (`ScrollPhase`, from fresco's `scroll_phase`) say where the fingers are:
+  Begin catches a fling, Begin and Update deltas follow the fingers (never as notches, and
+  resting fingers hold still), and End flings at once at the drag's speed, or not at all if the
+  fingers had stopped. A wheel or a device without phases has its release inferred after 30 ms
+  without a delta; a late delta coasts at the drag's speed and the fling takes over from the
+  coast, so release neither pauses nor jumps (tested at 1 ms steps). Arrows, Page Up/Down, Space, Home/End go to the
   focused scroll view, else the one under the pointer. A press catches a fling.
+- **Key repeat.** A held key arrives as `KeyEventKind::Repeat` (Tactus generates the repeats).
+  Text entry, arrows, sliders, menus' arrows and scroll keys act on it again
+  (`KeyEventKind::pressed`); Space and Enter on a button, a toggle or a menu item, and Enter in a
+  text field, act once per press.
 - **Frames.** Client-driven (§4.1): `on_frame` handlers run every frame while something moves;
   `Window` waits at most one 120 Hz frame while the app animates and blocks otherwise.
 - **Zoom.** Content is laid out at zoom 1 and sent at the settled zoom (payloads and text sizes
@@ -488,8 +495,7 @@ stays frescod's, drawn outside any app.
   Runs on a shared 4-core cloud machine vary by a point or two of missed frames.
 - **Not yet.** Horizontal scrolling, a scrollbar, blur on the wire (no renderer op;
   `Physics::motion_blur_px` gives the amount), placeholders drawn (`Viewport::placeholders` gives
-  the ranges, used once a band source exists), `DocumentView`, gesture phases on the wire (would
-  replace the inferred release), and a live run of a Pergola app on frescod.
+  the ranges, used once a band source exists), `DocumentView`, and a live run of a Pergola app on frescod.
 
 
 ## §11. Vector drawing: `Canvas` (asked by the user, 2026-11-06)
