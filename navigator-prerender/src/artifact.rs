@@ -210,8 +210,14 @@ pub fn media_block(document: &str, mse_scripts: usize) -> String {
             VideoSource::Unplayable => ("unplayable", String::new(), String::new()),
         };
         let flag = |a: &str| dom.attr(*v, a).is_some();
-        s.push_str(&format!("    {{ \"class\": {}, \"src\": {}, \"type\": {}, \"sources\": {sources}, \"poster\": {}, \"autoplay\": {}, \"muted\": {} }}",
-            json_str(class), json_str(&src), json_str(&mime), flag("poster"), flag("autoplay"), flag("muted")));
+        // Its <track>s: every one (any kind), and the subtitles and
+        // captions the player is given (navigator_dom::media::text_tracks).
+        let track_elements = dom.element_children(*v).into_iter().filter(|c| dom.tag(*c) == Some("track")).count();
+        let tracks: Vec<String> = navigator_dom::media::text_tracks(&dom, *v).iter().map(|t| format!(
+            "{{ \"src\": {}, \"kind\": {}, \"srclang\": {}, \"label\": {}, \"default\": {} }}",
+            json_str(&t.src), json_str(t.kind.as_str()), json_str(&t.srclang), json_str(&t.label), t.default)).collect();
+        s.push_str(&format!("    {{ \"class\": {}, \"src\": {}, \"type\": {}, \"sources\": {sources}, \"poster\": {}, \"autoplay\": {}, \"muted\": {}, \"track_elements\": {track_elements}, \"tracks\": [{}] }}",
+            json_str(class), json_str(&src), json_str(&mime), flag("poster"), flag("autoplay"), flag("muted"), tracks.join(", ")));
     }
     s.push_str("\n  ] },\n");
     s
