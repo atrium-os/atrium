@@ -280,6 +280,7 @@ fn spawn_input_poller(core: Core) {
           let mut media = forum_wm::media::Link::new(|| lyra_protocol::client::Media::connect(forum_wm::media::SOCKET, false));
           let mut told_focus = u32::MAX;
           let mut media_down = false;
+          let volume = forum_wm::media::VolumeLink::spawn();
           loop {
             // Drain the event backlog under one short lock; keep the last
             // primary press (a later click supersedes an earlier one this tick)
@@ -297,6 +298,7 @@ fn spawn_input_poller(core: Core) {
             let mut unsnap = false;
             let mut next_monitor = false;
             let mut media_keys = Vec::new();
+            let mut volume_keys = Vec::new();
             let mut display: Option<fresco_protocol::DisplayInfoResponse> = None;
             {
                 let mut g = core.lock().unwrap();
@@ -351,6 +353,10 @@ fn spawn_input_poller(core: Core) {
                         Ok(Some(Event::Key { hid_usage, pressed: true, .. }))
                             if forum_wm::media::action(hid_usage).is_some() =>
                             media_keys.extend(forum_wm::media::action(hid_usage)),
+                        // A volume key: choragusd's master level.
+                        Ok(Some(Event::Key { hid_usage, pressed: true, .. }))
+                            if forum_wm::media::volume(hid_usage).is_some() =>
+                            volume_keys.extend(forum_wm::media::volume(hid_usage)),
                         Ok(Some(_)) => {}        // other event — ignore
                         Ok(None) => break,       // backlog drained
                         Err(ref e) if is_compositor_gone(e) => {
@@ -544,6 +550,9 @@ fn spawn_input_poller(core: Core) {
             let mut sent = Ok(());
             if let Some(app) = focus_app {
                 sent = media.focus(&app);
+            }
+            for k in volume_keys {
+                volume.key(k);
             }
             for a in media_keys {
                 sent = sent.and(media.key(a));

@@ -15,6 +15,7 @@ graphics           = "fresco"
 window-management  = true
 notify             = true
 media-control      = true   # media keys and focus to choragusd (now-playing)
+audio-control      = true   # volume keys: the master level, never samples
 network            = "none"
 
 [supervision]

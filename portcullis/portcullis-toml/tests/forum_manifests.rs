@@ -40,9 +40,12 @@ fn chrome_apps_drive_but_never_manage() {
 }
 
 #[test]
-fn only_the_bar_holds_the_volume_control() {
-    assert_eq!(load("forum-bar/atrium.toml").capabilities.audio_control, Some(true));
-    for rel in ["forum-wm/atrium.toml", "forum-dock/atrium.toml", "forum-overview/atrium.toml"] {
+fn the_bar_and_the_wm_hold_the_volume_control() {
+    // The bar is the volume control; forum-wm sends the volume keys.
+    for rel in ["forum-bar/atrium.toml", "forum-wm/atrium.toml"] {
+        assert_eq!(load(rel).capabilities.audio_control, Some(true), "{rel}");
+    }
+    for rel in ["forum-dock/atrium.toml", "forum-overview/atrium.toml"] {
         assert_eq!(load(rel).capabilities.audio_control, None, "{rel}");
     }
 }

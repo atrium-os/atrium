@@ -405,19 +405,6 @@ fn a_player_gets_a_read_only_file_or_pipe_with_a_message_and_nothing_else() {
     let _ = std::fs::remove_file(&path);
 }
 
-/// forum-wm's PiP side: what is in the `pip` layer.
-#[derive(Clone, Default)]
-struct Forum(Arc<Mutex<Vec<WindowToken>>>, Arc<Mutex<bool>>);
-impl limen::daemon::Shell for Forum {
-    fn pip(&mut self, w: WindowToken, aspect: [u32; 2]) -> Result<(), u8> {
-        assert_eq!(aspect, [16, 9]);
-        if *self.1.lock().unwrap() { return Err(1) }
-        self.0.lock().unwrap().push(w);
-        Ok(())
-    }
-    fn pip_end(&mut self, w: WindowToken) { self.0.lock().unwrap().retain(|x| *x != w) }
-}
-
 const W_PLAYER: WindowToken = [5; 16];
 const W_PLAYER2: WindowToken = [6; 16];
 
@@ -436,8 +423,6 @@ fn bound_player(w: &World, app: &mut Parent, window: WindowToken) -> (EmbedId, C
 #[test]
 fn pip_needs_a_real_press_and_leaves_the_slot_for_forum_and_comes_back() {
     let w = World::new();
-    let forum = Forum::default();
-    w.shared.set_shell(Box::new(forum.clone()));
     let mut app = w.parent(APP);
     let (e, mut player) = bound_player(&w, &mut app, W_PLAYER);
 
@@ -449,8 +434,8 @@ fn pip_needs_a_real_press_and_leaves_the_slot_for_forum_and_comes_back() {
     player.pip(e, true, [16, 9]).unwrap();
     assert_eq!(next_p(&mut app), ParentEvent::Pip { embed: e, on: true });
     assert_eq!(next_c(&mut player), ChildEvent::Pip { embed: e, on: true });
+    // Released with keep_shown: frescod marks it a PiP window for forum-wm.
     assert_eq!(w.fresco.1.lock().unwrap().released, vec![W_PLAYER]);
-    assert_eq!(*forum.0.lock().unwrap(), vec![W_PLAYER]);
 
     // The tab goes to the background: no Suspended while in PiP.
     let binds = w.fresco.binds().len();
@@ -463,7 +448,6 @@ fn pip_needs_a_real_press_and_leaves_the_slot_for_forum_and_comes_back() {
     player.pip(e, false, [16, 9]).unwrap();
     assert_eq!(next_p(&mut app), ParentEvent::Pip { embed: e, on: false });
     assert_eq!(next_p(&mut app), ParentEvent::Suspended { embed: e });
-    assert!(forum.0.lock().unwrap().is_empty());
     // Shown again: bound at the rect the parent last placed, and resumed.
     app.set_visible(e, true).unwrap();
     assert_eq!(next_p(&mut app), ParentEvent::Resumed { embed: e });
@@ -481,8 +465,6 @@ fn pip_needs_a_real_press_and_leaves_the_slot_for_forum_and_comes_back() {
 #[test]
 fn one_pip_at_a_time_and_none_outlives_its_embed() {
     let w = World::new();
-    let forum = Forum::default();
-    w.shared.set_shell(Box::new(forum.clone()));
     let mut app = w.parent(APP);
     let (a, mut pa) = bound_player(&w, &mut app, W_PLAYER);
     let (b, mut pb) = bound_player(&w, &mut app, W_PLAYER2);
@@ -496,14 +478,10 @@ fn one_pip_at_a_time_and_none_outlives_its_embed() {
     assert_eq!(next_p(&mut app), ParentEvent::Pip { embed: b, on: true });
     assert_eq!(next_c(&mut pa), ChildEvent::Pip { embed: a, on: true });
     assert_eq!(next_c(&mut pa), ChildEvent::Pip { embed: a, on: false });
-    assert_eq!(*forum.0.lock().unwrap(), vec![W_PLAYER2]);
+    assert_eq!(w.fresco.1.lock().unwrap().released, vec![W_PLAYER, W_PLAYER2]);
+    assert_eq!(w.fresco.binds().last().unwrap().1, W_PLAYER, "a is back in its slot");
     // Closing the tab ends the PiP with it.
     app.detach(b).unwrap();
-    assert!(forum.0.lock().unwrap().is_empty());
+    assert!(matches!(next_c(&mut pb), ChildEvent::Pip { on: true, .. }));
     drop(pb);
-
-    // Only a player may, and Forum may say no (the slot is rebound).
-    *forum.1.lock().unwrap() = true;
-    assert_eq!(refused(pa.pip(a, true, [16, 9])), refusal::NO_PIP);
-    assert_eq!(w.fresco.binds().last().unwrap().1, W_PLAYER, "back in its slot");
 }

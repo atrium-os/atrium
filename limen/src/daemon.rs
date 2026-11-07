@@ -49,14 +49,6 @@ pub trait Compositor: Send {
     }
 }
 
-/// forum-wm, for picture-in-picture (over `forum-ctl`, with limend's
-/// narrow `forum-pip` grant): place a released child window in the `pip`
-/// layer, or drop it from there.
-pub trait Shell: Send {
-    fn pip(&mut self, window: WindowToken, aspect: [u32; 2]) -> Result<(), u8>;
-    fn pip_end(&mut self, window: WindowToken);
-}
-
 /// portcullisd's embed-mode `ExecInstance` (limen.md §4).
 pub trait Launcher: Send {
     /// Start `app_id` for `embed` with `channel` as its limend connection.
@@ -167,7 +159,6 @@ pub struct Shared {
     /// app id (arca-ui runs as `_arca-ui`, not as a Portcullis app).
     system_uids: Mutex<HashMap<&'static str, u32>>,
     attribution: Mutex<Option<Box<dyn Attribution>>>,
-    shell: Mutex<Option<Box<dyn Shell>>>,
 }
 
 impl Shared {
@@ -184,7 +175,6 @@ impl Shared {
             defaults,
             system_uids: Mutex::new(HashMap::new()),
             attribution: Mutex::new(None),
-            shell: Mutex::new(None),
         })
     }
 
@@ -198,11 +188,6 @@ impl Shared {
     /// embedded player gets no ticket and so plays nothing.
     pub fn set_attribution(&self, a: Box<dyn Attribution>) {
         *self.attribution.lock().unwrap() = Some(a);
-    }
-
-    /// Forum, for picture-in-picture. Without it, PiP is refused.
-    pub fn set_shell(&self, s: Box<dyn Shell>) {
-        *self.shell.lock().unwrap() = Some(s);
     }
 
     /// Live embeds (tests and logs).
@@ -534,31 +519,17 @@ fn pip(shared: &Arc<Shared>, conn: ConnId, p: proto::Pip) -> Result<Reply, Reply
             return no;
         }
     }
-    if shared.shell.lock().unwrap().is_none() {
-        return no;
-    }
     // One PiP at a time: the new one replaces the last.
     let last: Vec<EmbedId> = st.embeds.iter().filter(|(_, e)| e.pip).map(|(k, _)| *k).collect();
     for k in last {
         pip_off(shared, &mut st, k);
     }
-    let mut shell = shared.shell.lock().unwrap();
-    let sh = shell.as_mut().unwrap();
+    // Released with keep_shown, frescod tells forum-wm it is a PiP window
+    // (WmRole::Pip), and forum-wm puts it in the pip layer.
     if let Err(r) = shared.compositor.lock().unwrap().release(parent_w, child_w) {
         eprintln!("limend: embed {}: frescod would not release the slot for PiP ({r})", p.embed);
         return no;
     }
-    if let Err(r) = sh.pip(child_w, p.aspect) {
-        eprintln!("limend: embed {}: Forum refused PiP ({r})", p.embed);
-        drop(shell);
-        // Back into the slot as it was.
-        let e = st.embeds.get_mut(&p.embed).unwrap();
-        e.bound = false;
-        e.attached = true;
-        rebind_quiet(shared, &mut st, p.embed);
-        return no;
-    }
-    drop(shell);
     let e = st.embeds.get_mut(&p.embed).unwrap();
     e.pip = true;
     e.bound = false;
@@ -573,9 +544,8 @@ fn pip(shared: &Arc<Shared>, conn: ConnId, p: proto::Pip) -> Result<Reply, Reply
 fn pip_off(shared: &Arc<Shared>, st: &mut State, embed: EmbedId) {
     let Some(e) = st.embeds.get_mut(&embed) else { return };
     e.pip = false;
-    if let (Some(c), Some(sh)) = (e.child_window, shared.shell.lock().unwrap().as_mut()) {
-        sh.pip_end(c);
-    }
+    // Bound into its slot again (below), it is no longer frescod's PiP
+    // window, and forum-wm drops it from the pip layer.
     let e = &st.embeds[&embed];
     st.to_parent(e, ParentEvent::Pip { embed, on: false });
     st.to_child(e, ChildEvent::Pip { embed, on: false });
@@ -626,12 +596,7 @@ fn provide(shared: &Arc<Shared>, conn: ConnId, uid: u32, p: proto::Provide) -> R
 /// Take `e` (already removed) down: release the slot, tell the child, end
 /// a spawned child's jail after the grace period.
 fn end(shared: &Arc<Shared>, st: &State, embed: EmbedId, e: Embed, tell_parent: bool) {
-    // PiP doesn't outlive the embed.
-    if e.pip {
-        if let (Some(c), Some(sh)) = (e.child_window, shared.shell.lock().unwrap().as_mut()) {
-            sh.pip_end(c);
-        }
-    }
+    // PiP doesn't outlive the embed: the child's window goes with it.
     if e.bound {
         if let Some(c) = e.child_window {
             let _ = shared.compositor.lock().unwrap().bind(e.parent_window, c, e.role.slot, None, e.z);

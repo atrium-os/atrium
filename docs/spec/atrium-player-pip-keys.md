@@ -216,7 +216,8 @@ screen is public. Controls work without unlocking: play, pause, next, previous.
 - **No forum-pip grant or `Intent::Pip`** (changed from §3.1 with the Fresco thread):
   frescod reports a `keep_shown` child as `WmRole::Pip` in WM_ENUMERATE while it is
   out of its slot (d5d73c2), so forum-wm places it without being told and limend's
-  unbind is the only authority. forum-wm puts it in the pip layer (above documents and
+  unbind is the only authority (limend has no Forum link at all; the `aspect` in
+  `op::PIP` is checked but the window's own size sets the PiP's). forum-wm puts it in the pip layer (above documents and
   panels, below chrome, HUD and dialogs) at the user's corner, a quarter of the work
   area wide at its own aspect, at least 160×90, over zoom and snap too.
   `Intent::PipCorner { corner }` moves it (a drag that ends near a corner asks for
@@ -227,6 +228,11 @@ screen is public. Controls work without unlocking: play, pause, next, previous.
   Previous go to choragusd as `ToMedia::Control` and never to the focused app.
   forum-wm sends `ToMedia::Focused { app_id }` whenever focus moves to another app,
   and again after choragusd restarts.
+- **Volume keys** (0x0CE9 up, 0x0CEA down, 0x0CE2 mute) go to choragusd's master
+  level on `audio-control.sock` (forum-wm holds `audio-control` for this, beside the
+  bar): up and down move it a sixteenth, snapped to the sixteenths, and up unmutes;
+  mute toggles. forum-wm follows the `Apps` events for the current level and steps
+  ahead of choragusd's echo, so quick presses add up. No level overlay yet.
 - **forum-bar** shows now-playing: a note glyph, "title · app" (at most 36
   characters), and play/pause when the session offers it. The `input.media_keys`
   exception (a DAW gets the keys) is not built yet: it needs frescod to hand those

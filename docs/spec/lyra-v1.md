@@ -222,7 +222,8 @@ A stream's clock says nothing about other apps or what they play.
   streams use the parent's entry (A7).
 - `audio-control.sock` (`/atrium/sockets/audio-control/`) is for the volume UI only: a
   restricted capability `audio-control` (like `window-management`), held by the Forum bar
-  today and by Curia when it exists. It speaks its own dictionary (`ToControl`,
+  and forum-wm (the volume keys, atrium-player-pip-keys.md §6.1) today and by Curia when
+  it exists. It speaks its own dictionary (`ToControl`,
   `FromControl` in `lyra_protocol::wire`; `lyra_protocol::client::Control`), names apps,
   never streams, and carries no samples. Messages: `List` (the user's apps with a stream
   open: app id, label, role, level, muted, stream count; at most 16), `SetAppVolume`,

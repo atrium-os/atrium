@@ -206,6 +206,12 @@ impl Control {
     pub fn recv(&mut self) -> io::Result<FromControl> {
         wire::recv(&mut self.sock)
     }
+
+    /// A second handle on the same connection: one thread reads the change
+    /// events while another sends.
+    pub fn try_clone(&self) -> io::Result<Control> {
+        Ok(Control { sock: self.sock.try_clone()? })
+    }
 }
 
 /// A media controller's connection to choragusd (`media-control/`,

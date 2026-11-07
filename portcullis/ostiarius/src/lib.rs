@@ -109,7 +109,7 @@ fn session_layer(human: &str, frontend: Frontend) -> Vec<LaunchSpec> {
         // per-human component (lyra-v1.md §3, decision 3): it gates each
         // stream on the active session itself.
         Frontend::Gui => vec![
-            spec("org.atrium.forum-wm", human, "forum-wm", &[], vec!["graphics", "window-management", "notify", "media-control"]),
+            spec("org.atrium.forum-wm", human, "forum-wm", &[], vec!["graphics", "window-management", "notify", "media-control", "audio-control"]),
             spec("org.atrium.forum-bar", human, "forum-bar", &[], vec!["graphics", "forum-control", "audio-control", "media-control"]),
             spec("org.atrium.forum-dock", human, "forum-dock", &[], vec!["graphics", "forum-control"]),
         ],
