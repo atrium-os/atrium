@@ -1,6 +1,7 @@
 # Lyra: external output devices (Bluetooth first)
 
-Status: **proposal**, 2026-11-07. The lyrad side of [bluetooth.md](bluetooth.md) §11
+Status: **proposal**, 2026-11-07; the Bluetooth thread agreed (persistent id, initial delay,
+low rates and reconfiguration added at its request). The lyrad side of [bluetooth.md](bluetooth.md) §11
 (Vinculum B5). Builds on [lyra-v1.md](lyra-v1.md) (the app wire, the clock page, choragusd's
 sockets) and [atrium-player-pip-keys.md](atrium-player-pip-keys.md) §4.6 (media sessions).
 
@@ -82,11 +83,24 @@ anyway by not sending packets. It cannot reach any other stream or lyrad's memor
 
 `ToDevice` (device → choragusd):
 - `Hello { version }`
-- `Announce { name, kind: Headphones | Headset | Speaker | Car, rate, channels, hw_volume: bool }`.
-  `rate` is 44100 or 48000 and `channels` is 1 or 2. `name` is cleaned like session titles,
-  because it is the remote device's own name.
+- `Announce { persistent_id: u64, name, kind: Headphones | Headset | Speaker | Car, rate,
+  channels, hw_volume: bool, initial_delay_frames }`.
+  - `persistent_id` is the Vinculum device handle: stable across reconnects, and not the
+    Bluetooth address. choragusd keys the device's remembered volume and routing on it.
+  - `rate` is one of 8000, 16000, 24000, 32000, 44100 or 48000 (HFP and LE Audio need the
+    low ones), and `channels` is 1 or 2.
+  - `initial_delay_frames` is the device's estimate (codec plus controller) until its first
+    page write, since A2DP delay reports arrive only after streaming starts. It is clamped
+    like the page's.
+  - `name` is cleaned like session titles, because it is the remote device's own name.
 - `Volume { volume }`: the headset's volume buttons (AVRCP absolute volume), 0 to 1.
 - `Gone`: the link dropped. Closing the socket means the same.
+
+**Reconfiguration** (an AVDTP reconfigure, or A2DP giving way to HFP for a call) can change
+the rate or channels. The device sends `Gone` and then a new `Announce` on the same socket;
+nothing on the page changes rate live. A new announcement with the same `persistent_id`
+within 2 s of its `Gone` is the same output: it keeps its place in the output list and
+stays current, and choragusd neither pauses media nor switches back to the speakers.
 
 `FromDevice` (choragusd → device):
 - `Ready { device }`, followed by the two fds.
@@ -114,7 +128,7 @@ headset counts as a lock screen: app and state only, unless the user turned titl
   one backend and opens the other between periods, the same way a layout change reopens
   the OSS device. Playing on speakers and headphones at once, or on two headsets, waits for
   multi-sink lyrad.
-- **Disconnect.** choragusd removes the device and returns to the previous output. If the
+- **Disconnect.** After 2 s without a re-announcement (§5), choragusd removes the device and returns to the previous output. If the
   device was current and was headphones or a headset, the active media session is
   paused first (`SessionAction::Pause`), so the music doesn't carry on through the speakers.
 
