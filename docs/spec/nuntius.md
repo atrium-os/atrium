@@ -4,8 +4,9 @@
 > `navigator-fetchd`), made into a system component any app can use to fetch a URL.
 
 **Status:** accepted by the user, 2026-11-06 (name and interface, all recommendations).
-Build step 1 and the fetcher side of step 3 are **built inside `navigator-fetch`** (§6.1);
-steps 2, 4 and 5 are not. Owner: the Navigator thread.
+Steps 1 and 3 are built inside `navigator-fetch` (§6.1). Step 2, the `nuntius` crate and
+`nuntiusd` on an Aqueduct channel, was built 2026-11-07 (§6.2). Steps 4 and 5 are not built
+yet. Owner: the Navigator thread.
 
 **Asked by the user, 2026-11-06:** "the navigator's sandboxed fetcher is the right one... used
 as a widget, third party apps can use it too." The same day, the user chose that the media
@@ -217,6 +218,47 @@ server: slow, stalled mid-body, dropped, 5xx and 4xx, a changed resource, flow c
 exact-credit resume, cancel, connect timeout, range checks, Fd read-only, the address and
 redirect rules, and the concurrency cap. `navigator-media/tests/feed.rs` runs P3's segment
 feed through it (fresco-video P3).
+
+### 6.2 Step 2: the crate and the channel (2026-11-07)
+
+- **`nuntius` crate** (`nuntius/`). It has no network code, so an app links it without TLS
+  or a resolver. It holds:
+  - the §3 types (`Open`, `Request`, `Event`, and so on) and the §3.5 caps;
+  - the wire (`wire`): Aqueduct `CLASS_FETCH` (15), postcard payloads, `OP_REQUEST` from
+    the client, `OP_EVENT` back, and `OP_EVENT_FD` for `Fd` with its descriptor attached;
+  - `Client` (one channel; `split()` gives a sending and a receiving half for two threads);
+  - `server::channel`, the fetcher's end.
+- **Both ends check what they decode:**
+  - URLs are at most 8 KiB, other strings at most 512 bytes, with no control characters;
+  - `Data` is at most 60 KiB;
+  - no trailing bytes;
+  - an `Fd` must arrive with exactly one descriptor, under its own op.
+  - Strings the fetcher took from a server are cut to fit, not refused. A client's request
+    over the limits is refused before it is sent.
+- **`navigator_fetch::nuntius` uses the crate's types**, so the in-process instance and the
+  channel share one interface.
+- **`serve_channel`** runs one instance for one channel, starting with 1 MiB of credit:
+  - requests go in and events come back in order;
+  - when the client hangs up, every request is cancelled;
+  - a message out of shape ends the channel.
+- **`nuntiusd`** (a binary in `navigator-fetch`) serves the channel on its standard input,
+  which must be a socket.
+  - On FreeBSD it reads the trust store, then enters capability mode with casper `cap_net`
+    before its first request, as `navigator-fetchd` does.
+  - Elsewhere it refuses unless run with `--unconfined-for-testing`.
+  - `navigator-fetchd` and its line protocol stay for the converter.
+- **Fixed on the way:** a whole resource of known length now ends at that length. With
+  credit spent exactly, a `Stream` request had waited for more credit before it read the
+  end of the body, until its deadline. Ranges already ended at their length.
+- **Tests:**
+  - `nuntius/tests/wire.rs` (3): round trips, refusals, and a lying peer.
+  - `navigator-fetch/tests/nuntiusd.rs` (7) runs the client against `serve_channel` over a
+    socket pair and a loopback server. It covers: no `Data` without credit; exact credit
+    ending at the length; absolute offsets; `Fd` read-only; `Cancel` from a split client;
+    refused oversized requests; garbage ending the channel; and hang-up.
+  - The same file runs the `nuntiusd` process itself: loopback and the metadata endpoint
+    are refused by policy without the grant, it exits cleanly on hang-up, and it refuses a
+    standard input that is not a socket.
 
 ## 7. Open questions
 

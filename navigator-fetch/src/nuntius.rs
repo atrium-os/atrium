@@ -30,93 +30,16 @@ use std::sync::mpsc::Sender;
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
-/// Most bytes in one `Data` event.
-pub const DATA_MAX: usize = 60 * 1024;
-/// Caps per instance (§3.5).
-pub const MAX_REQUESTS: usize = 64;
-pub const FD_MAX_BYTES: u64 = 1 << 30;
-pub const STREAM_TOTAL_MS_MAX: u64 = 10 * 60 * 1000;
-pub const CONNECT_MS_MAX: u64 = 30_000;
-pub const IDLE_MS_MAX: u64 = 60_000;
-pub const ATTEMPTS_MAX: u32 = 8;
-pub const BACKOFF_MS_MAX: u64 = 30_000;
+// ★ The interface is the `nuntius` crate's, so a client moving from this
+// in-process instance to the channel (`nuntiusd`) keeps its types.
+pub use nuntius::{Deliver, ErrorCode, Event, Limits, Method, Open, Request, Retry, Validator,
+                  ATTEMPTS_MAX, BACKOFF_MS_MAX, CONNECT_MS_MAX, DATA_MAX, FD_MAX_BYTES, IDLE_MS_MAX, MAX_REQUESTS, STREAM_TOTAL_MS_MAX};
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Method { Get, Head }
-
-/// A resource's validator, from `Head`: an `ETag` (preferred) or a
-/// `Last-Modified`.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum Validator { ETag(String), LastModified(String) }
-
-impl Validator {
-    fn header(&self) -> &str { match self { Validator::ETag(v) | Validator::LastModified(v) => v } }
-    fn of(h: &crate::http::Head) -> Option<Validator> {
-        // A weak ETag cannot validate a range (RFC 9110 §13.1.5).
-        if let Some(e) = h.header("etag").filter(|e| !e.starts_with("W/")) { return Some(Validator::ETag(e.to_string())) }
-        h.header("last-modified").map(|v| Validator::LastModified(v.to_string()))
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Deliver { Stream, Fd }
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct Limits { pub max_bytes: u64, pub connect_ms: u64, pub idle_ms: u64, pub total_ms: u64 }
-impl Default for Limits { fn default() -> Self { Limits { max_bytes: u64::MAX, connect_ms: 10_000, idle_ms: 15_000, total_ms: 60_000 } } }
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct Retry { pub max_attempts: u32, pub backoff_ms: u64 }
-impl Default for Retry { fn default() -> Self { Retry { max_attempts: 4, backoff_ms: 250 } } }
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Open {
-    pub id: u32,
-    pub url: String,
-    pub method: Method,
-    /// `(first byte, length)`; `None` for the whole resource.
-    pub range: Option<(u64, Option<u64>)>,
-    pub if_range: Option<Validator>,
-    pub deliver: Deliver,
-    pub limits: Limits,
-    pub retry: Retry,
-    pub priority: u8,
-    pub accept: Option<String>,
-}
-
-impl Open {
-    pub fn get(id: u32, url: &str) -> Open {
-        Open { id, url: url.to_string(), method: Method::Get, range: None, if_range: None, deliver: Deliver::Stream,
-               limits: Limits::default(), retry: Retry::default(), priority: 1, accept: None }
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum Request { Open(Open), Cancel { id: u32 }, Budget { bytes: u64 } }
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ErrorCode { Policy, Dns, Connect, Tls, Http(u16), Timeout, TooBig, Cancelled, Malformed }
-
-#[derive(Debug)]
-pub enum Event {
-    Head { id: u32, status: u16, final_url: String, redirects: usize, content_type: Option<String>, length: Option<u64>,
-           accept_ranges: bool, validator: Option<Validator> },
-    /// `offset` is absolute in the resource, so a resumed request continues
-    /// the same numbering.
-    Data { id: u32, offset: u64, bytes: Vec<u8> },
-    /// The read-only descriptor of the file being filled.
-    Fd { id: u32, fd: std::os::fd::OwnedFd },
-    Progress { id: u32, received: u64 },
-    Retrying { id: u32, attempt: u32, reason: String },
-    Done { id: u32, bytes: u64 },
-    Error { id: u32, code: ErrorCode },
-}
-
-impl Event {
-    pub fn id(&self) -> u32 {
-        match self { Event::Head { id, .. } | Event::Data { id, .. } | Event::Fd { id, .. } | Event::Progress { id, .. }
-                   | Event::Retrying { id, .. } | Event::Done { id, .. } | Event::Error { id, .. } => *id }
-    }
+/// A response's validator: an `ETag` (preferred) or a `Last-Modified`.
+fn validator_of(h: &crate::http::Head) -> Option<Validator> {
+    // A weak ETag cannot validate a range (RFC 9110 §13.1.5).
+    if let Some(e) = h.header("etag").filter(|e| !e.starts_with("W/")) { return Some(Validator::ETag(e.to_string())) }
+    h.header("last-modified").map(|v| Validator::LastModified(v.to_string()))
 }
 
 struct Ctl { cancelled: AtomicBool, sock: Mutex<Option<TcpStream>> }
@@ -140,6 +63,12 @@ impl Nuntius {
     /// `events`, with `budget` bytes of initial credit.
     pub fn new(conv: Conversation<'static>, events: Sender<Event>, budget: u64) -> Nuntius {
         Nuntius { conv, events, inner: Arc::new(Inner { budget: Mutex::new(budget), credit: Condvar::new(), live: Mutex::new(HashMap::new()) }) }
+    }
+
+    /// Cancel every request in flight (the client has gone).
+    pub fn cancel_all(&self) {
+        let ids: Vec<u32> = self.inner.live.lock().unwrap().keys().copied().collect();
+        for id in ids { self.request(Request::Cancel { id }) }
     }
 
     /// Requests in flight.
@@ -181,6 +110,32 @@ impl Nuntius {
             }
         }
     }
+}
+
+/// Byte credit an instance on a channel starts with, before the client's
+/// first `Budget`.
+pub const CHANNEL_CREDIT: u64 = 1 << 20;
+
+/// ★ SERVE ONE CLIENT ON ITS CHANNEL (nuntius.md §6 step 2): `nuntiusd`'s
+/// loop, and the same in-process for tests. Requests from `s` go to one
+/// instance over `conv`; its events go back in order, `Fd` with its
+/// descriptor. Returns when the client hangs up (every request is then
+/// cancelled), or with `InvalidData` when it sends something out of shape —
+/// the channel ends rather than guess.
+pub fn serve_channel(s: std::os::unix::net::UnixStream, conv: Conversation<'static>, credit: u64) -> std::io::Result<()> {
+    let (mut reqs, mut out) = nuntius::server::channel(s)?;
+    let (tx, rx) = std::sync::mpsc::channel();
+    let n = Nuntius::new(conv, tx, credit);
+    std::thread::spawn(move || { for e in rx { if out.send(e).is_err() { break } } });
+    let r = loop {
+        match reqs.recv() {
+            Ok(Some(r)) => n.request(r),
+            Ok(None) => break Ok(()),
+            Err(e) => break Err(e),
+        }
+    };
+    n.cancel_all();
+    r
 }
 
 /// Clamp what the client asked to the instance's caps.
@@ -231,6 +186,9 @@ fn run(mut conv: Conversation<'static>, o: Open, ctl: &Ctl, inner: &Inner, ev: &
     let deadline = start + Duration::from_millis(o.limits.total_ms);
     let first = o.range.map(|r| r.0).unwrap_or(0);
     let want_len = o.range.and_then(|r| r.1);
+    // Where the request is complete, in bytes from `first`: the range's
+    // length, else (once `Head` gives it) the rest of the resource.
+    let mut end = want_len;
     // Bytes of the resource delivered (from `first`), all attempts' reads,
     // the validator, whether Head went out, and the file for Fd delivery.
     let (mut got, mut read_total, mut attempt) = (0u64, 0u64, 0u32);
@@ -248,7 +206,7 @@ fn run(mut conv: Conversation<'static>, o: Open, ctl: &Ctl, inner: &Inner, ev: &
         if want_len.is_some() && len == Some(0) { return Event::Done { id, bytes: got } }
         let ranged = o.range.is_some() || got > 0;
         let range = ranged.then_some((from, len));
-        let if_range = if ranged { validator.as_ref().map(|v| v.header().to_string()) } else { None };
+        let if_range = if ranged { validator.as_ref().map(|v| v.value().to_string()) } else { None };
         let head_wait = Duration::from_millis(o.limits.connect_ms).min(deadline.saturating_duration_since(Instant::now()));
         let failure: Fail = 'attempt: {
             let mut s = match conv.open_stream(&o.url, o.method == Method::Head, range, if_range.as_deref(), o.accept.as_deref(), head_wait) {
@@ -275,7 +233,7 @@ fn run(mut conv: Conversation<'static>, o: Open, ctl: &Ctl, inner: &Inner, ev: &
                 if got > 0 || o.if_range.is_some() { return Event::Error { id, code: ErrorCode::Malformed } }
                 skip = from;
             }
-            let v_now = Validator::of(&s.head);
+            let v_now = validator_of(&s.head);
             if got > 0 && v_now.is_some() && validator.is_some() && v_now != validator {
                 return Event::Error { id, code: ErrorCode::Malformed };
             }
@@ -291,6 +249,11 @@ fn run(mut conv: Conversation<'static>, o: Open, ctl: &Ctl, inner: &Inner, ev: &
                                    accept_ranges: st == 206 || s.head.header("accept-ranges").is_some_and(|v| v.contains("bytes")),
                                    validator: v_now });
                 if o.method == Method::Head { return Event::Done { id, bytes: 0 } }
+                // ★ A whole resource of known length is complete when that
+                // length is in hand, as a range is: with the credit spent
+                // exactly, waiting for credit before reading the server's
+                // end of body waited until the deadline.
+                if end.is_none() { end = length.map(|t| t.saturating_sub(first)) }
                 if deliver == Deliver::Fd {
                     if length.is_none() { deliver = Deliver::Stream }
                     else if length.unwrap_or(0) > o.limits.max_bytes { return Event::Error { id, code: ErrorCode::TooBig } }
@@ -310,7 +273,7 @@ fn run(mut conv: Conversation<'static>, o: Open, ctl: &Ctl, inner: &Inner, ev: &
                 // never wait for credit (or the server's close) it will not
                 // use — with the budget spent exactly, that wait was until
                 // the deadline.
-                if want_len.is_some_and(|l| got >= l) {
+                if end.is_some_and(|l| got >= l) {
                     send(Event::Progress { id, received: got });
                     return Event::Done { id, bytes: got };
                 }
@@ -327,12 +290,12 @@ fn run(mut conv: Conversation<'static>, o: Open, ctl: &Ctl, inner: &Inner, ev: &
                     if *b == 0 { continue }
                     max = max.min(*b as usize);
                 }
-                if let Some(l) = want_len { max = max.min(l.saturating_sub(got) as usize).max(1) }
+                if let Some(l) = end { max = max.min(l.saturating_sub(got) as usize).max(1) }
                 let piece = match s.read(max) {
                     Ok(Some(p)) => p,
                     Ok(None) => {
                         // The body's end: complete only if the length is.
-                        if want_len.is_some_and(|l| got < l) { break 'attempt Fail::Retry("short", ErrorCode::Connect) }
+                        if end.is_some_and(|l| got < l) { break 'attempt Fail::Retry("short", ErrorCode::Connect) }
                         send(Event::Progress { id, received: got });
                         return Event::Done { id, bytes: got };
                     }
@@ -342,7 +305,7 @@ fn run(mut conv: Conversation<'static>, o: Open, ctl: &Ctl, inner: &Inner, ev: &
                 if read_total > o.limits.max_bytes.saturating_add(first) { return Event::Error { id, code: ErrorCode::TooBig } }
                 let mut p = &piece[..];
                 if skip > 0 { let n = (skip as usize).min(p.len()); skip -= n as u64; p = &p[n..] }
-                if let Some(l) = want_len { p = &p[..p.len().min(l.saturating_sub(got) as usize)] }
+                if let Some(l) = end { p = &p[..p.len().min(l.saturating_sub(got) as usize)] }
                 if p.is_empty() { continue }
                 if got + p.len() as u64 > o.limits.max_bytes { return Event::Error { id, code: ErrorCode::TooBig } }
                 match (&mut file, deliver) {

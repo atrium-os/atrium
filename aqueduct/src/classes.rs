@@ -135,6 +135,11 @@ pub const CLASS_TABELLARIUS: u8 = 13;
 /// placement, role messages relayed between a parent and its child.
 pub const CLASS_LIMEN:     u8 = 14;
 
+/// Nuntius, the system's jailed fetcher (docs/spec/nuntius.md): one
+/// instance per client. Requests and events are postcard payloads
+/// (the `nuntius` crate); an `Fd` event carries one descriptor.
+pub const CLASS_FETCH:     u8 = 15;
+
 /// Smoke-test / fuzzing service. Not part of the production
 /// surface; used by aqueduct-echo and unit tests.
 pub const CLASS_ECHO:      u8 = 63;
@@ -158,6 +163,7 @@ pub fn class_name(c: u8) -> &'static str {
         CLASS_GPU        => "gpu",
         CLASS_LOG        => "log",
         CLASS_VESTIBULUM => "vestibulum",
+        CLASS_FETCH      => "fetch",
         CLASS_NET        => "net",
         CLASS_TABELLARIUS => "tabellarius",
         CLASS_LIMEN      => "limen",

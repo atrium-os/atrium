@@ -15,7 +15,15 @@ rustls = { version = "0.23", default-features = false, features = ["ring", "std"
 rustls-pki-types = { version = "1", features = ["std"] }
 url = "2"
 libc = "0.2"
+nuntius = { path = "../nuntius" }
+
+[[bin]]
+name = "nuntiusd"
+path = "src/bin/nuntiusd.rs"
 
 [[bin]]
 name = "navigator-fetchd"
 path = "src/bin/navigator-fetchd.rs"
+
+[dev-dependencies]
+aqueduct = { path = "../aqueduct" }

@@ -1,0 +1,121 @@
+//! ★ NUNTIUS (docs/spec/nuntius.md): the system's jailed fetcher, as a
+//! client sees it. One instance per client (portcullisd starts it in the
+//! fetcher's jail); one Aqueduct channel to it; many concurrent requests,
+//! each with an id the client chooses; events in order per request.
+//!
+//! - [`Request`]: `Open`, `Cancel`, `Budget` (§3.1);
+//! - [`Event`]: `Head`, `Data`, `Fd`, `Progress`, `Retrying`, `Done`,
+//!   `Error` (§3.2), `Head` always first;
+//! - [`wire`]: their encoding on the channel (`CLASS_FETCH`, postcard),
+//!   checked on the way in by both ends;
+//! - [`Client`]: the client's end; [`server::Channel`]: the fetcher's.
+//!
+//! This crate has no network code, so an app links it without TLS or a
+//! resolver. The fetcher (`nuntiusd`, in `navigator-fetch`) uses the same
+//! types in-process (`navigator_fetch::nuntius`), so moving a user from the
+//! in-process instance to the channel changes the transport, not the
+//! interface.
+
+use serde::{Deserialize, Serialize};
+
+pub mod client;
+pub mod server;
+pub mod wire;
+
+pub use client::{Client, Events, Requests};
+
+/// Most bytes in one `Data` event.
+pub const DATA_MAX: usize = 60 * 1024;
+/// Caps per instance (§3.5); asked values past them are clamped.
+pub const MAX_REQUESTS: usize = 64;
+pub const FD_MAX_BYTES: u64 = 1 << 30;
+pub const STREAM_TOTAL_MS_MAX: u64 = 10 * 60 * 1000;
+pub const CONNECT_MS_MAX: u64 = 30_000;
+pub const IDLE_MS_MAX: u64 = 60_000;
+pub const ATTEMPTS_MAX: u32 = 8;
+pub const BACKOFF_MS_MAX: u64 = 30_000;
+/// Longest URL, `Accept` value, header-derived string and reason on the wire.
+pub const URL_MAX: usize = 8192;
+pub const TEXT_MAX: usize = 512;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Method { Get, Head }
+
+/// A resource's validator, from `Head`: an `ETag` (preferred) or a
+/// `Last-Modified`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Validator { ETag(String), LastModified(String) }
+
+impl Validator {
+    /// The header value (`If-Range` takes either kind as is).
+    pub fn value(&self) -> &str { match self { Validator::ETag(v) | Validator::LastModified(v) => v } }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Deliver { Stream, Fd }
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Limits { pub max_bytes: u64, pub connect_ms: u64, pub idle_ms: u64, pub total_ms: u64 }
+impl Default for Limits { fn default() -> Self { Limits { max_bytes: u64::MAX, connect_ms: 10_000, idle_ms: 15_000, total_ms: 60_000 } } }
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Retry { pub max_attempts: u32, pub backoff_ms: u64 }
+impl Default for Retry { fn default() -> Self { Retry { max_attempts: 4, backoff_ms: 250 } } }
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Open {
+    pub id: u32,
+    pub url: String,
+    pub method: Method,
+    /// `(first byte, length)`; `None` for the whole resource.
+    pub range: Option<(u64, Option<u64>)>,
+    pub if_range: Option<Validator>,
+    pub deliver: Deliver,
+    pub limits: Limits,
+    pub retry: Retry,
+    /// 0 is highest: a media playhead before a prefetch.
+    pub priority: u8,
+    pub accept: Option<String>,
+}
+
+impl Open {
+    pub fn get(id: u32, url: &str) -> Open {
+        Open { id, url: url.to_string(), method: Method::Get, range: None, if_range: None, deliver: Deliver::Stream,
+               limits: Limits::default(), retry: Retry::default(), priority: 1, accept: None }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Request {
+    Open(Open),
+    Cancel { id: u32 },
+    /// More byte credit for `Stream` delivery (added to what is left).
+    Budget { bytes: u64 },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ErrorCode { Policy, Dns, Connect, Tls, Http(u16), Timeout, TooBig, Cancelled, Malformed }
+
+#[derive(Debug)]
+pub enum Event {
+    Head { id: u32, status: u16, final_url: String, redirects: usize, content_type: Option<String>, length: Option<u64>,
+           accept_ranges: bool, validator: Option<Validator> },
+    /// `offset` is absolute in the resource, so a resumed request continues
+    /// the same numbering.
+    Data { id: u32, offset: u64, bytes: Vec<u8> },
+    /// The read-only descriptor of the file being filled.
+    Fd { id: u32, fd: std::os::fd::OwnedFd },
+    Progress { id: u32, received: u64 },
+    Retrying { id: u32, attempt: u32, reason: String },
+    Done { id: u32, bytes: u64 },
+    Error { id: u32, code: ErrorCode },
+}
+
+impl Event {
+    pub fn id(&self) -> u32 {
+        match self { Event::Head { id, .. } | Event::Data { id, .. } | Event::Fd { id, .. } | Event::Progress { id, .. }
+                   | Event::Retrying { id, .. } | Event::Done { id, .. } | Event::Error { id, .. } => *id }
+    }
+    /// The request's last event.
+    pub fn is_last(&self) -> bool { matches!(self, Event::Done { .. } | Event::Error { .. }) }
+}

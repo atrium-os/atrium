@@ -1,0 +1,15 @@
+[package]
+name        = "nuntius"
+version     = "0.1.0"
+edition     = "2021"
+license     = "MIT OR Apache-2.0"
+description = "Nuntius, the system's jailed fetcher (docs/spec/nuntius.md): requests and events, their Aqueduct wire (CLASS_FETCH), and the client and server ends of the channel. No network code: the fetcher itself is nuntiusd (navigator-fetch)."
+publish     = false
+
+[dependencies]
+aqueduct = { path = "../aqueduct" }
+serde    = { version = "1", features = ["derive"] }
+postcard = { version = "1", features = ["use-std"] }
+
+[dev-dependencies]
+aqueduct = { path = "../aqueduct" }
