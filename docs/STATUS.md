@@ -157,6 +157,11 @@ Spec [spec/atrium-zram-v2.md](spec/atrium-zram-v2.md).
 Also settled: islands + DRM approach (legacy-web §8.1); honest UA, never solve
 bot challenges (§5.4.1b).
 
+Open (2026-11-07): how to host the CDM without the linuxulator — scoping study
+`docs/reviews/2026-11-07-linux-compat-scoping.md` recommends an own foreign-library host
+(ELF loader + glibc shim, no kernel Linux ABI) for the CDM and OpenH264, and a micro-VM lane
+for any future Linux apps; six decisions in §9 await Shankar.
+
 ## 6. Navigator exploration coverage
 
 Measurement in legacy-web §5.4.5.6a (`3dd3fb7`); raw tables in
