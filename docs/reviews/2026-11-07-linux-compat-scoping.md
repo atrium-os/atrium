@@ -218,8 +218,8 @@ proves unacceptable for the apps people actually want.
   agreement. Without one, Navigator is an unlicensed host: Google can revoke, and services
   allow-list clients (the `foreign-cdm` users were refused until they faked a Windows user
   agent). We do not impersonate browsers (legacy-web), so **DRM playback realistically
-  requires approaching Google for a Widevine agreement**, whatever we build. Ask before
-  building anything Widevine-specific.
+  requires approaching Google for a Widevine agreement**, whatever we build. Decided
+  2026-11-07: build the host first and approach Google with it (§8 step 3).
 - **Reverse engineering:** Chrome's and Widevine's terms forbid it, and we follow the same
   stance as for amdgpu firmware. Everything in §2 and §5 comes from the public CDM
   interface, the library's dynamic symbol table (what any dynamic linker reads), behaviour
@@ -237,8 +237,10 @@ proves unacceptable for the apps people actually want.
    file it opens. Same for OpenH264. Output: the exact shim list and the raw-syscall answer.
 1. Loader + shim with ClearKey and OpenH264 (no Widevine needed).
 2. Decoder-jail profile; H.264 behind the player's build feature.
-3. Widevine host and island channel, only after a Widevine agreement (or a decision to
-   proceed for personal use without one).
+3. Widevine host and island channel, built before any agreement (Shankar, 2026-11-07: a
+   working, visible implementation is what gets Google to answer). Demonstrate it with
+   ClearKey and Widevine's public test content; do not fake a user agent or target a
+   commercial service's allow-list while unlicensed. Then approach Google with it.
 4. Optional: D inside a bhyve micro-VM on hardware that supports it.
 
 ## 9. Decisions for Shankar
@@ -251,8 +253,9 @@ proves unacceptable for the apps people actually want.
    linuxulator fallback". The linuxulator leaves the CDM path entirely.
    *Recommend yes:* D's surface equals our other decoder jails, it runs on the Mac, and E
    adds a guest kernel and VM plumbing for a marginal gain.
-3. **Widevine agreement first.** Approach Google before any Widevine-specific work; never
-   fake a user agent. *Recommend yes.*
+3. **Widevine agreement.** ~~Approach Google before any Widevine-specific work.~~
+   **Decided (Shankar, 2026-11-07): build first, then approach Google with a working
+   implementation**, since a cold request may go unanswered. Never fake a user agent.
 4. **Start with OpenH264.** Build loader + shim when the player's H.264 question is taken
    up, with OpenH264 as the first customer and ClearKey as the test CDM.
    *Recommend yes;* until then this stays parked like the rest of DRM.
