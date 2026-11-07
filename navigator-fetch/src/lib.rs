@@ -134,6 +134,9 @@ pub struct Conversation<'a> {
     shared: Arc<std::sync::Mutex<Shared>>,
     /// Keep connections open and reuse them (legacy-web §5.4.5.7, step 4).
     reuse: bool,
+    /// ★ The app's site list (nuntius.md §4), checked on EVERY hop before
+    /// any lookup; `None` is unrestricted.
+    sites: Option<Arc<::nuntius::Sites>>,
 }
 
 #[derive(Default)]
@@ -181,17 +184,28 @@ impl Conn {
 
 impl<'a> Conversation<'a> {
     pub fn new(net: &'a (dyn Connect + Sync), tls: Arc<rustls::ClientConfig>, policy: addr::Policy) -> Self {
-        Conversation { net, tls, policy, shared: Default::default(), reuse: false }
+        Conversation { net, tls, policy, shared: Default::default(), reuse: false, sites: None }
     }
 
     /// Keep connections open between requests to the same origin, and
     /// reuse them. Off by default: one connection per request, as before.
     pub fn with_reuse(mut self, on: bool) -> Self { self.reuse = on; self }
 
+    /// ★ Narrow this conversation to `sites` (nuntius.md §4): a URL or a
+    /// redirect to any other host is refused before it is looked up.
+    pub fn with_sites(mut self, sites: Option<::nuntius::Sites>) -> Self { self.sites = sites.map(Arc::new); self }
+
+    fn site_check(&self, host: &str) -> Result<(), FetchError> {
+        match &self.sites {
+            Some(s) if !s.admits(host) => Err(FetchError::Refused(format!("{host} is not one of this app's sites"))),
+            _ => Ok(()),
+        }
+    }
+
     /// ★ Another handle on THIS conversation, for another thread: the same
     /// pins, the same idle connections, the same policy.
     pub fn sibling(&self) -> Conversation<'a> {
-        Conversation { net: self.net, tls: self.tls.clone(), policy: self.policy, shared: self.shared.clone(), reuse: self.reuse }
+        Conversation { net: self.net, tls: self.tls.clone(), policy: self.policy, shared: self.shared.clone(), reuse: self.reuse, sites: self.sites.clone() }
     }
 
     pub fn policy(&self) -> addr::Policy { self.policy }
@@ -304,6 +318,7 @@ impl<'a> Conversation<'a> {
         let host = u.host_str().ok_or_else(|| FetchError::BadUrl("no host".into()))?.to_string();
         let port = u.port_or_known_default().unwrap_or(0);
         if port != 80 && port != 443 { return Err(FetchError::Refused(format!("port {port}"))) }
+        self.site_check(&host)?;
         let literal = match u.host() {
             Some(url::Host::Ipv4(a)) => Some(IpAddr::V4(a)),
             Some(url::Host::Ipv6(a)) => Some(IpAddr::V6(a)),
@@ -389,6 +404,7 @@ impl<'a> Conversation<'a> {
             let host = current.host_str().ok_or_else(|| FetchError::BadUrl("no host".into()))?.to_string();
             let port = current.port_or_known_default().unwrap_or(0);
             if port != 80 && port != 443 { return Err(FetchError::Refused(format!("port {port}"))) }
+            self.site_check(&host)?;
             let literal = match current.host() {
                 Some(url::Host::Ipv4(a)) => Some(IpAddr::V4(a)),
                 Some(url::Host::Ipv6(a)) => Some(IpAddr::V6(a)),
@@ -716,6 +732,32 @@ mod policy_tests {
             other => panic!("{other:?}"),
         }
         assert_eq!(net.connected.lock().unwrap().len(), 1, "only the public hop connected");
+    }
+
+    #[test]
+    fn a_site_list_refuses_other_hosts_and_redirects_before_any_lookup() {
+        let sites = || Some(::nuntius::Sites::parse(&["example.com", "*.cdn.example.net"]).unwrap());
+        // A host that is not listed: refused before resolve or connect.
+        let net = Scripted::new(vec![], vec![]);
+        let mut c = Conversation::new(&net, tls(), addr::Policy::default()).with_sites(sites());
+        assert!(matches!(c.fetch("http://elsewhere.example/"), Err(FetchError::Refused(_))));
+        assert!(matches!(c.open_stream("http://elsewhere.example/", false, None, None, None, Duration::from_secs(5)), Err(FetchError::Refused(_))));
+        assert!(net.resolved.lock().unwrap().is_empty() && net.connected.lock().unwrap().is_empty());
+        // A listed host redirecting off the list: refused at the hop, in both
+        // the whole-body path and the stream path.
+        let redirect = "HTTP/1.1 302 Found\r\nLocation: http://tracker.example/x\r\nContent-Length: 0\r\n\r\n";
+        let net = Scripted::new(vec![vec![PUBLIC]], vec![redirect, redirect]);
+        let mut c = Conversation::new(&net, tls(), addr::Policy::default()).with_sites(sites());
+        assert!(matches!(c.fetch("http://example.com/"), Err(FetchError::Refused(m)) if m.contains("tracker.example")));
+        assert!(matches!(c.open_stream("http://example.com/", false, None, None, None, Duration::from_secs(5)), Err(FetchError::Refused(_))));
+        assert_eq!(net.resolved.lock().unwrap().len(), 1, "only the listed name was looked up");
+        // A listed redirect target is followed; a sibling keeps the list.
+        let net = Scripted::new(vec![vec![PUBLIC], vec![PUBLIC]],
+            vec!["HTTP/1.1 302 Found\r\nLocation: http://a.cdn.example.net/v\r\nContent-Length: 0\r\n\r\n",
+                 "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok"]);
+        let mut c = Conversation::new(&net, tls(), addr::Policy::default()).with_sites(sites());
+        assert_eq!(c.fetch("http://example.com/").unwrap().response.body, b"ok");
+        assert!(matches!(c.sibling().fetch("http://elsewhere.example/"), Err(FetchError::Refused(_))));
     }
 
     #[test]

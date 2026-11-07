@@ -8,6 +8,10 @@
 //!                                     CGNAT and ULA (also
 //!                                     NAVIGATOR_FETCH_GRANT_PRIVATE_NETWORK=1).
 //!                                     Off by default. Never admits metadata.
+//!   ATRIUM_NUNTIUS_SITES=a.com,*.b.org  narrow every hop to these sites
+//!                                     (nuntius.md §4; set by portcullisd from
+//!                                     the app's `net-fetch-sites`). A list
+//!                                     that does not parse refuses to start.
 //!
 //! ★ It enters capability mode BEFORE reading its first request, as
 //! navigator-fetchd does: casper's `cap_net` is its only way out, and no
@@ -42,6 +46,20 @@ fn channel() -> std::os::unix::net::UnixStream {
     unsafe { std::os::unix::net::UnixStream::from_raw_fd(0) }
 }
 
+/// The site list portcullisd passed, if any. ★ Read before the sandbox, and
+/// a list that does not parse is fatal: never serve unlimited by mistake.
+fn sites() -> Option<nuntius::Sites> {
+    match std::env::var(nuntius::sites::SITES_ENV) {
+        Ok(v) => {
+            let s = nuntius::Sites::from_env_value(&v).unwrap_or_else(|e| fail(format!("{}: {e}", nuntius::sites::SITES_ENV)));
+            eprintln!("nuntiusd: narrowed to sites [{}]", s.to_env_value());
+            Some(s)
+        }
+        Err(std::env::VarError::NotPresent) => None,
+        Err(e) => fail(format!("{}: {e}", nuntius::sites::SITES_ENV)),
+    }
+}
+
 fn serve(conv: Conversation<'static>) -> ! {
     let s = channel();
     match navigator_fetch::nuntius::serve_channel(s, conv, navigator_fetch::nuntius::CHANNEL_CREDIT) {
@@ -62,7 +80,7 @@ fn main() {
     }
     let tls = std::fs::read(&trust).map_err(|e| e.to_string()).and_then(|p| tls_config(&p)).unwrap_or_else(|e| fail(format!("{trust}: {e}")));
     eprintln!("nuntiusd: ★ UNCONFINED, for testing: no sandbox");
-    serve(Conversation::new(&navigator_fetch::Direct, tls, policy))
+    serve(Conversation::new(&navigator_fetch::Direct, tls, policy).with_sites(sites()))
 }
 
 #[cfg(target_os = "freebsd")]
@@ -71,11 +89,12 @@ fn main() {
     let (_, trust, policy) = args();
     if policy.grant_private_network { eprintln!("nuntiusd: ★ PRIVATE NETWORK GRANTED — loopback and LAN addresses are reachable") }
     // Everything that needs a name happens here, before the sandbox.
+    let sites = sites();
     let pem = std::fs::read(&trust).unwrap_or_else(|e| fail(format!("{trust}: {e}")));
     let tls = tls_config(&pem).unwrap_or_else(|e| fail(e));
     let net = sandbox::enter().unwrap_or_else(|e| fail(format!("sandbox: {e}")));
     if !sandbox::in_capability_mode() { fail("kernel reports NOT in capability mode — refusing to serve".into()) }
     let locked: &'static navigator_fetch::Locked<sandbox::Net> = Box::leak(Box::new(navigator_fetch::Locked(std::sync::Mutex::new(net))));
     // (fstat on the channel is allowed in capability mode.)
-    serve(Conversation::new(locked, tls, policy))
+    serve(Conversation::new(locked, tls, policy).with_sites(sites))
 }

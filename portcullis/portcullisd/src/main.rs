@@ -322,7 +322,7 @@ fn serve(stream: UnixStream, shared: Arc<Mutex<Tenants>>) -> std::io::Result<()>
             let limits = (memory_mb, cpu_pct, require_memory_limit);
             let rule = Policy::load_system(std::path::Path::new(SYSTEM_PATH)).ok()
                 .and_then(|p| p.worker_rule(&app_id, &owner).cloned());
-            handle_exec_instance(app_id, instance, tmpfs_mb, limits, rule, &owner, &shared,
+            handle_exec_instance(app_id, instance, tmpfs_mb, limits, rule, Vec::new(), &owner, &shared,
                                  &LIMITER, &mut writer, &reader)?;
             continue;
         }
@@ -345,6 +345,18 @@ fn serve(stream: UnixStream, shared: Arc<Mutex<Tenants>>) -> std::io::Result<()>
                 write_response(&mut writer, &refuse("cap.net_fetch.denied: this app's manifest does not hold net-fetch".into()))?;
                 continue;
             }
+            // ★ The app's site list (nuntius.md §4), from its INSTALLED
+            // manifest, checked here so a bad list is the caller's error
+            // and not a fetcher that dies at start.
+            let sites = match launch::app_fetch_sites(&app) {
+                Ok(s) => s,
+                Err(why) => {
+                    eprintln!("portcullisd: fetcher for {app} REFUSED: {why}");
+                    write_response(&mut writer, &refuse(format!("net-fetch-sites: {why}")))?;
+                    continue;
+                }
+            };
+            let extra_env: Vec<(String, String)> = sites.map(|s| (nuntius::sites::SITES_ENV.to_string(), s)).into_iter().collect();
             let Some(rule) = Policy::load_system(std::path::Path::new(SYSTEM_PATH)).ok()
                 .and_then(|p| p.workers.get(portcullis_ipc::NUNTIUS_APP).cloned()) else {
                 eprintln!("portcullisd: fetcher for {app} REFUSED: no system worker rule for {}", portcullis_ipc::NUNTIUS_APP);
@@ -354,7 +366,7 @@ fn serve(stream: UnixStream, shared: Arc<Mutex<Tenants>>) -> std::io::Result<()>
             let instance = fetcher_instance(uid);
             eprintln!("portcullisd: fetcher {instance} for {app} (uid {uid})");
             // A fetcher needs no scratch space beyond its own small tmpfs.
-            handle_exec_instance(portcullis_ipc::NUNTIUS_APP.to_string(), Some(instance), 16, (None, None, true), Some(rule),
+            handle_exec_instance(portcullis_ipc::NUNTIUS_APP.to_string(), Some(instance), 16, (None, None, true), Some(rule), extra_env,
                                  &owner, &shared, &LIMITER, &mut writer, &reader)?;
             continue;
         }
@@ -499,6 +511,7 @@ fn handle_exec_instance(
     tmpfs_mb: u32,
     limits:   (Option<u64>, Option<u32>, bool),
     rule:     Option<portcullis_policy::WorkerRule>,
+    extra_env: Vec<(String, String)>,
     user:     &str,
     shared:   &Mutex<Tenants>,
     limiter:  &Arc<Mutex<portcullisd::ratelimit::Limiter>>,
@@ -619,6 +632,7 @@ fn handle_exec_instance(
         // The home jail(8) chdirs into is resolved from this user's passwd
         // inside portcullis_oneshot — see Spec::user_name.
         user_name: rule.as_ref().map(|r| r.run_as.clone()).unwrap_or_else(|| user.to_string()),
+        extra_env,
     };
     /* ★ A worker does not outlive its caller. The caller holds this
      * connection for the jail's whole life; if it hangs up (it exited, or it

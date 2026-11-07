@@ -24,6 +24,8 @@ pub mod client;
 #[cfg(feature = "launch")]
 pub mod launch;
 pub mod server;
+pub mod sites;
+pub use sites::Sites;
 pub mod wire;
 
 pub use client::{Client, Events, Requests};

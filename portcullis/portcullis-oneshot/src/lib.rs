@@ -83,6 +83,11 @@ pub struct Spec {
     /// the host's passwd, never supplied by the caller. ★ Must not be root:
     /// a one-shot worker never runs as uid 0 inside its jail (refused).
     pub user_name: String,
+    /// ★ Environment the CALLER of this lane adds for the worker, on top of
+    /// the clean environment — set only by portcullisd from what it read
+    /// itself (the fetcher's site list, nuntius.md §4), never from a
+    /// requester. Keys must start with `ATRIUM_` (jaild's allow-list).
+    pub extra_env: Vec<(String, String)>,
 }
 
 /// Whether the kernel can enforce an rctl rule at all.
@@ -223,6 +228,9 @@ pub fn run_with_stdio(spec: &Spec, stdio: Option<[std::os::fd::OwnedFd; 3]>) -> 
         return OneShot::Refused(
             "a one-shot jail is created by root; an unprivileged caller asks \
              portcullisd (`portcullis exec --daemon`, portcullis.md §6.5.2a)".into());
+    }
+    if let Some((k, _)) = spec.extra_env.iter().find(|(k, v)| !k.starts_with("ATRIUM_") || k.contains(['=', '\0']) || v.contains('\0')) {
+        return OneShot::Refused(format!("worker environment {k:?}: only ATRIUM_ keys without '=' or NUL"));
     }
     let target = spec.target.as_str();
     let instance = spec.instance.clone();
@@ -397,7 +405,8 @@ pub fn run_with_stdio(spec: &Spec, stdio: Option<[std::os::fd::OwnedFd; 3]>) -> 
         exec: Some(jaild::protocol::ExecSpec {
             path:  entry.clone(),
             argv:  vec![entry],
-            env:   clean_env(&pw),
+            env:   clean_env(&pw).into_iter().chain(spec.extra_env.iter()
+                       .map(|(k, v)| jaild::protocol::EnvPair { key: k.clone(), value: v.clone() })).collect(),
             uid:   pw.uid,
             gid:   pw.gid,
             stdio: true,

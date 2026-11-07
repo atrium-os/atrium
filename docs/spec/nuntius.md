@@ -7,7 +7,7 @@
 Steps 1 and 3 are built inside `navigator-fetch` (§6.1). Step 2, the `nuntius` crate and
 `nuntiusd` on an Aqueduct channel, was built 2026-11-07 (§6.2). So was step 4's launch,
 portcullisd's `OpenFetcher` and the `net-fetch` capability (§6.3), checked jailed on FreeBSD
-the same day (`scripts/nuntius-vm-check.sh`, 20/20). Wiring the standalone player and step 5 (the C ABI) are not built. Owner:
+the same day (`scripts/nuntius-vm-check.sh`, 20/20). The standalone player fetches through it when it holds `net-fetch` (4c8fedf), and per-app site limits (§4) are built. Step 5 (the C ABI) is not built. Owner:
 the Navigator thread.
 
 **Asked by the user, 2026-11-06:** "the navigator's sandboxed fetcher is the right one... used
@@ -146,8 +146,18 @@ for `Stream` media and 60 s otherwise. Numbers to tune by measurement.
 - **Credentials:** never through Nuntius. A request that needs one is made by Arca's courier
   instead, after TLS to the bound endpoint (arca.md §5), with the same `Open` shape. The
   client never sees the secret.
-- **Origins:** an app's manifest may narrow its fetcher to listed origins. The Navigator's
-  instances are unrestricted, since the reader chooses where to go.
+- **Sites:** an app's manifest may narrow its fetcher to listed sites with
+  `net-fetch-sites = ["example.com", "*.cdn.example.net"]` under `[capabilities]`. An entry
+  is a host name, matched exactly, or `*.` and a name, matching every name below it but not
+  the name itself. Names are compared in ASCII lower case, an internationalised name is
+  written in its `xn--` form, and an address, port, scheme or path is not an entry. The
+  list only takes away, so it asks no consent. An empty list means no sites.
+  portcullisd reads the list from the installed manifest (never from the caller), refuses
+  the fetcher if it does not parse, and passes it to nuntiusd in `ATRIUM_NUNTIUS_SITES`.
+  nuntiusd also refuses to start on a list it cannot read. Every hop is checked, redirects
+  included, before any lookup, and a refusal is an `Error` with code `Policy`. The
+  Navigator's instances are unrestricted, since the reader chooses where to go. (Built
+  2026-11-07.)
 
 ## 5. Clients, first to last
 
@@ -312,8 +322,7 @@ feed through it (fresco-video P3).
     2026-11-07 the guard's `failure()` gives portcullisd's reason, but `open()` still
     returns before the start is known. Confirming the start before `ReadyForFds` would
     need a portcullisd change.
-  - The standalone player still uses its own `atrium-player-fetch`.
-  - Origin narrowing from the manifest (§4) and the per-client private-network grant.
+  - The per-client private-network grant (§4); it needs a permissions UI first.
   - The Navigator's own instances, which stay in-process for now.
 
 ## 7. Open questions

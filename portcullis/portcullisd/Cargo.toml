@@ -58,6 +58,8 @@ portcullis-protocol = { path = "../portcullis-protocol" }
 jaild               = { path = "../jaild" }
 atrium-volumes      = { path = "../atrium-volumes" }
 aqueduct            = { path = "../../aqueduct" }
+# The fetcher's site-list syntax (nuntius.md §4), checked before spawn.
+nuntius             = { path = "../../nuntius", default-features = false }
 sockmux             = { path = "../sockmux" }
 libc                = "0.2"
 serde               = { version = "1", features = ["derive"] }

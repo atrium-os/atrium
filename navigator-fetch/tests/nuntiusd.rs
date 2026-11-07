@@ -206,3 +206,28 @@ fn nuntiusd_serves_its_channel_with_the_address_policy() {
         .stdin(std::process::Stdio::null()).stderr(std::process::Stdio::null()).status().unwrap();
     assert_eq!(st.code(), Some(1));
 }
+
+/// ★ The site list portcullisd passes (nuntius.md §4): a host off the list
+/// is refused by policy, and a list that does not parse refuses to start.
+#[test]
+fn nuntiusd_narrows_to_its_sites_and_refuses_a_bad_list() {
+    let exe = env!("CARGO_BIN_EXE_nuntiusd");
+    let Some(pem) = ["/etc/ssl/cert.pem", "/etc/ssl/certs/ca-certificates.crt"].iter().map(std::path::Path::new).find(|p| p.exists()) else {
+        eprintln!("no system trust store; skipped");
+        return;
+    };
+    let (a, b) = UnixStream::pair().unwrap();
+    let mut child = std::process::Command::new(exe).args(["--unconfined-for-testing", "--trust", pem.to_str().unwrap()])
+        .env(nuntius::sites::SITES_ENV, "media.example.org")
+        .stdin(std::process::Stdio::from(std::os::fd::OwnedFd::from(b))).stderr(std::process::Stdio::null()).spawn().unwrap();
+    let mut c = Client::from_stream(a).unwrap();
+    c.open(Open::get(3, "https://elsewhere.example/")).unwrap();
+    match next(&mut c) { Event::Error { id: 3, code: ErrorCode::Policy } => {}, other => panic!("{other:?}") }
+    drop(c);
+    assert!(child.wait().unwrap().success());
+    let (_a, b) = UnixStream::pair().unwrap();
+    let st = std::process::Command::new(exe).args(["--unconfined-for-testing", "--trust", pem.to_str().unwrap()])
+        .env(nuntius::sites::SITES_ENV, "10.0.0.1")
+        .stdin(std::process::Stdio::from(std::os::fd::OwnedFd::from(b))).stderr(std::process::Stdio::null()).status().unwrap();
+    assert_eq!(st.code(), Some(1), "an unreadable list must not serve unlimited");
+}

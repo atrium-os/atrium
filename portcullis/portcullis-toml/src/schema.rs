@@ -150,6 +150,12 @@ pub struct Capabilities {
     /// and the user sees the difference.
     #[serde(rename = "net-fetch")]
     pub net_fetch: Option<bool>,
+    /// ★ Narrow the fetcher to these sites (nuntius.md §4): host names,
+    /// exact (`example.com`) or every name below one (`*.example.com`).
+    /// Absent: unrestricted. Only takes away, so it asks no consent; a list
+    /// that does not parse refuses the fetcher rather than run it unlimited.
+    #[serde(rename = "net-fetch-sites")]
+    pub net_fetch_sites: Option<Vec<String>>,
     /// Unknown / future keys. Validator warns; doesn't reject.
     #[serde(flatten)]
     pub extra:      BTreeMap<String, toml::Value>,
@@ -281,6 +287,7 @@ pub fn merge_capabilities(base: &Capabilities, ovr: &Capabilities) -> Capabiliti
         media_control:    ovr.media_control.or(base.media_control),
         audio_device:     ovr.audio_device.or(base.audio_device),
         net_fetch:        ovr.net_fetch.or(base.net_fetch),
+        net_fetch_sites:  ovr.net_fetch_sites.clone().or_else(|| base.net_fetch_sites.clone()),
         extra:            {
             let mut e = base.extra.clone();
             for (k, v) in &ovr.extra { e.insert(k.clone(), v.clone()); }

@@ -507,6 +507,7 @@ mod tests {
             media_control: None,
             audio_device: None,
             net_fetch: None,
+            net_fetch_sites: None,
             extra:      Default::default(),
         }
     }

@@ -660,6 +660,22 @@ pub fn app_may_fetch(app_id: &str) -> bool {
     m.capabilities.net_fetch == Some(true)
 }
 
+/// The site list this app's INSTALLED manifest narrows its fetcher to
+/// (`net-fetch-sites`, nuntius.md §4), in the fetcher's environment form;
+/// `Ok(None)` is unrestricted. A list that does not parse is an error, so
+/// the fetcher is refused rather than started unlimited.
+pub fn app_fetch_sites(app_id: &str) -> Result<Option<String>, String> {
+    let path = PathBuf::from(APPS_DIR).join(app_id).join("atrium.toml");
+    let text = fs::read_to_string(&path).map_err(|e| format!("{}: {e}", path.display()))?;
+    let m = Manifest::from_str(&text).map_err(|e| format!("{}: {e}", path.display()))?;
+    fetch_sites_of(m.capabilities.net_fetch_sites.as_deref())
+}
+
+/// `app_fetch_sites` without the file.
+pub fn fetch_sites_of(list: Option<&[String]>) -> Result<Option<String>, String> {
+    list.map(|l| nuntius::Sites::parse(l).map(|s| s.to_env_value())).transpose()
+}
+
 /// The jid of a running jail for `app_id`, or `None`.
 ///
 /// Asks jls(8) rather than tracking state in-process: portcullisd can be
@@ -687,4 +703,19 @@ pub fn is_single_instance(app_id: &str) -> bool {
         m.supervision.as_ref().and_then(|s| s.instances),
         Some(portcullis_toml::InstancesPolicy::Multi)
     )
+}
+
+#[cfg(test)]
+mod fetch_sites_tests {
+    use super::fetch_sites_of;
+
+    #[test]
+    fn a_site_list_is_checked_before_the_fetcher_starts() {
+        assert_eq!(fetch_sites_of(None), Ok(None));
+        let l = vec!["Example.com".to_string(), "*.cdn.example.net".into()];
+        assert_eq!(fetch_sites_of(Some(&l)), Ok(Some("example.com,*.cdn.example.net".into())));
+        assert_eq!(fetch_sites_of(Some(&[])), Ok(Some(String::new())), "an empty list is no sites, not unlimited");
+        assert!(fetch_sites_of(Some(&["10.0.0.1".to_string()])).is_err());
+        assert!(fetch_sites_of(Some(&["a.com,b.com".to_string()])).is_err());
+    }
 }
