@@ -42,6 +42,7 @@ impl MediaHost for Host {
     }
     fn release(&mut self, key: u64) { self.released.push(key); self.players.remove(&key); }
     fn fetch(&mut self, key: u64, url: &str) -> Result<(), String> { self.fetches.push((key, url.to_string())); Ok(()) }
+    fn fetch_track(&mut self, _: u64, _: u8, _: &str, _: u64) -> Result<(), String> { Ok(()) }
     fn cancel_fetch(&mut self, key: u64) { self.cancelled.push(key) }
 }
 

@@ -29,6 +29,9 @@ pub struct FakePlayer {
     ready_sent: bool,
     time: f64,
     bytes_per_sec: f64,
+    /// Page text tracks received, by id, and what `ShowText` last chose.
+    pub text_tracks: Vec<u8>,
+    pub showing: Option<limen::media_player::TextChoice>,
 }
 
 impl Default for FakePlayer { fn default() -> Self { Self::new() } }
@@ -37,7 +40,7 @@ impl FakePlayer {
     pub fn new() -> Self {
         FakePlayer { received: vec![], violations: vec![], cap: FEED_BYTES_MAX, supports: vec!["video/webm", "audio/webm", "video/mp4", "audio/mp4"],
                      feed: false, loaded: false, tracks: vec![None; TRACKS_MAX as usize], pending: VecDeque::new(), ready_sent: false,
-                     time: 0.0, bytes_per_sec: 100_000.0 }
+                     time: 0.0, bytes_per_sec: 100_000.0, text_tracks: vec![], showing: None }
     }
 
     fn violation(&mut self, v: String) { self.violations.push(v) }
@@ -109,7 +112,20 @@ impl FakePlayer {
             ToChild::Stop => {}
             ToChild::LoadDone => { if !self.loaded || self.feed { self.violation("LoadDone without a Load".into()) } }
             ToChild::Seek { secs } => { self.time = secs; self.pending.push_back(ToParent::Time { secs }) }
-            ToChild::SetVolume { .. } | ToChild::SetRate { .. } | ToChild::TextTrack { .. } | ToChild::ShowText { .. }
+            // A page's text track goes with a source: before one, the
+            // player has nothing to show it over.
+            ToChild::TextTrack { id, .. } => {
+                if !self.loaded { self.violation("TextTrack before a source".into()) }
+                if !self.text_tracks.contains(&id) { self.text_tracks.push(id) }
+            }
+            // Showing a page track the player was never given is an error.
+            ToChild::ShowText { text } => {
+                if let limen::media_player::TextChoice::Page(id) = text {
+                    if !self.text_tracks.contains(&id) { self.violation(format!("ShowText Page({id}) for a track never sent")) }
+                }
+                self.showing = Some(text);
+            }
+            ToChild::SetVolume { .. } | ToChild::SetRate { .. }
             | ToChild::MediaMetadata { .. } | ToChild::MediaActions { .. } | ToChild::RequestPip | ToChild::ExitPip => {}
         }
     }

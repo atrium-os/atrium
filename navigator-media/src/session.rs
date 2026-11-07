@@ -19,7 +19,7 @@
 //! slot that leaves (its band evicted) releases its embed.
 
 use crate::slots::{Changes, Slots};
-use limen::media_player::{Source, ToChild, ToParent};
+use limen::media_player::{Source, TextChoice, ToChild, ToParent};
 use navigator_render::{embed_flags, EmbedSource};
 use std::collections::BTreeMap;
 
@@ -39,8 +39,17 @@ pub trait MediaHost {
     fn release(&mut self, key: u64);
     /// Fetch `url` whole into a descriptor (Nuntius `Fd`), for `key`.
     fn fetch(&mut self, key: u64, url: &str) -> Result<(), String>;
+    /// Fetch text track `id`'s WebVTT file the same way, refusing past
+    /// `max_bytes` (Nuntius `Limits::max_bytes`); its answer comes back as
+    /// [`Sessions::track_fetched`].
+    fn fetch_track(&mut self, key: u64, id: u8, url: &str, max_bytes: u64) -> Result<(), String>;
+    /// Stop every fetch for `key`: its video's and its tracks'.
     fn cancel_fetch(&mut self, key: u64);
 }
+
+/// The largest WebVTT file a track may be: a feature film's subtitles are
+/// well under 200 KiB.
+pub const TRACK_BYTES_MAX: u64 = 512 * 1024;
 
 /// Why a slot was not started, for the UI (the lane indicator, a tooltip).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -62,7 +71,19 @@ enum State { Requested, Loaded, Playing, Paused, Ended, Failed }
 struct Live { state: State, want_play: bool, looping: bool, attached: bool, load: ToChild, muted: bool,
               file: Option<std::os::fd::OwnedFd>, fetched: bool,
               /// `Load` went with `growing: true`, so `LoadDone` is owed when the file is whole.
-              growing_sent: bool }
+              growing_sent: bool,
+              /// Its `<track>`s, and whether `ShowText` has gone.
+              tracks: Vec<Track>, show_sent: bool }
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TrackState { Fetching, Ready, Sent, Failed }
+
+/// A text track's fetch, held until the player has its `Load`.
+struct Track { id: u8, lang: String, label: String, default: bool, state: TrackState, file: Option<std::os::fd::OwnedFd> }
+
+/// Where a track stands, for the UI (its subtitle menu) and checks.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TrackStatus { Fetching, Ready, Sent, Failed }
 
 pub struct Sessions {
     base_url: String,
@@ -118,9 +139,73 @@ impl Sessions {
         if ToChild::decode(&load.encode()).is_none() { return Err(NotStarted::BadUrl) }
         if host.request(key).is_err() { return Err(NotStarted::TooMany) }
         if host.fetch(key, &url).is_err() { host.release(key); return Err(NotStarted::BadUrl) }
+        // ★ Its text tracks, fetched beside the video by the same rules
+        // (resolved against the document, `https` or `http`), each capped.
+        // One that cannot be fetched is only a missing subtitle: the video
+        // plays.
+        let tracks = e.tracks.iter().take(limen::media_player::TEXT_TRACKS_MAX as usize).map(|t| {
+            let ok = crate::url::resolve(&self.base_url, &t.src).is_some_and(|u| host.fetch_track(key, t.id, &u, TRACK_BYTES_MAX).is_ok());
+            Track { id: t.id, lang: t.srclang.clone(), label: t.label.clone(), default: t.default,
+                    state: if ok { TrackState::Fetching } else { TrackState::Failed }, file: None }
+        }).collect();
         self.live.insert(key, Live { state: State::Requested, want_play: true, looping: e.flags & embed_flags::LOOP != 0,
-                                     attached: false, load, muted: e.flags & embed_flags::MUTED != 0, file: None, fetched: false, growing_sent: false });
+                                     attached: false, load, muted: e.flags & embed_flags::MUTED != 0, file: None, fetched: false, growing_sent: false,
+                                     tracks, show_sent: false });
         Ok(())
+    }
+
+    /// The fetcher's answer for text track `id` of `key`: its descriptor and
+    /// whether the file is whole, or `None` when the fetch failed (refused,
+    /// past [`TRACK_BYTES_MAX`], or after its retries). A track is sent only
+    /// whole, and only after the player has the video's `Load`; a failed one
+    /// is left out and the video plays without it.
+    pub fn track_fetched(&mut self, key: u64, id: u8, fd: Option<std::os::fd::OwnedFd>, done: bool, host: &mut dyn MediaHost) {
+        let Some(l) = self.live.get_mut(&key) else { return };
+        let Some(t) = l.tracks.iter_mut().find(|t| t.id == id) else { return };
+        if t.state != TrackState::Fetching { return }
+        match (fd, done) {
+            (Some(f), true) => { t.file = Some(f); t.state = TrackState::Ready }
+            (Some(f), false) => t.file = Some(f),
+            (None, true) if t.file.is_some() => t.state = TrackState::Ready,
+            _ => { t.file = None; t.state = TrackState::Failed }
+        }
+        self.send_tracks(key, host);
+    }
+
+    /// Where each of `key`'s text tracks stands, by id.
+    pub fn tracks(&self, key: u64) -> Vec<(u8, TrackStatus)> {
+        self.live.get(&key).map(|l| l.tracks.iter().map(|t| (t.id, match t.state {
+            TrackState::Fetching => TrackStatus::Fetching, TrackState::Ready => TrackStatus::Ready,
+            TrackState::Sent => TrackStatus::Sent, TrackState::Failed => TrackStatus::Failed,
+        })).collect()).unwrap_or_default()
+    }
+
+    /// ★ The tracks that are whole go to the player once it has `Load`
+    /// (limen: `TextTrack` with the WebVTT file), then which one shows:
+    /// `Page(default)` once the default track is with the player, else the
+    /// media's own (`InBand`) — when there is no default, or it failed.
+    fn send_tracks(&mut self, key: u64, host: &mut dyn MediaHost) {
+        let Some(l) = self.live.get_mut(&key) else { return };
+        if matches!(l.state, State::Requested | State::Failed) { return }
+        for t in l.tracks.iter_mut().filter(|t| t.state == TrackState::Ready) {
+            let msg = ToChild::TextTrack { id: t.id, lang: t.lang.clone(), label: t.label.clone() };
+            let fd = t.file.take().expect("a ready track holds its file");
+            // (Checked as the player will check it.)
+            let ok = ToChild::decode(&msg.encode()).is_some() && host.send_fd(key, &msg, fd).is_ok();
+            t.state = if ok { TrackState::Sent } else { TrackState::Failed };
+        }
+        // (A video with no page tracks keeps the player's default, its own
+        // text: nothing to say.)
+        if l.show_sent || l.tracks.is_empty() { return }
+        let show = match l.tracks.iter().find(|t| t.default) {
+            Some(t) if t.state == TrackState::Sent => Some(TextChoice::Page(t.id)),
+            Some(t) if t.state == TrackState::Fetching => None,
+            _ => Some(TextChoice::InBand),
+        };
+        if let Some(text) = show {
+            l.show_sent = true;
+            let _ = host.send(key, &ToChild::ShowText { text });
+        }
     }
 
     /// The fetcher's answer for `key`: the file's descriptor (Nuntius `Fd`)
@@ -156,6 +241,7 @@ impl Sessions {
             other => other.clone(),
         };
         if host.send_fd(key, &load, fd).is_ok() { l.state = State::Loaded; l.growing_sent = growing } else { l.state = State::Failed }
+        self.send_tracks(key, host);
     }
 
     /// The embed for `key` is attached (Limen `Attached`): silence it first
