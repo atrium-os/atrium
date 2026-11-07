@@ -209,6 +209,12 @@ pub struct Initiator {
     deadline: u64,
 }
 
+impl std::fmt::Debug for Initiator {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Initiator").field("state", &self.state).field("method", &self.method).finish_non_exhaustive()
+    }
+}
+
 impl Drop for Initiator {
     fn drop(&mut self) {
         self.dhkey.zeroize();

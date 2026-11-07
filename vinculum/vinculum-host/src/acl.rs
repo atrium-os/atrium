@@ -83,6 +83,11 @@ impl Credits {
         true
     }
 
+    /// Packets sent on `handle` that the controller has not completed.
+    pub fn outstanding(&self, handle: u16) -> u16 {
+        self.outstanding.get(&handle).map_or(0, |(_, n)| *n)
+    }
+
     /// Number Of Completed Packets for one handle.
     pub fn completed(&mut self, handle: u16, n: u16) {
         let Some((p, out)) = self.outstanding.get_mut(&handle) else {

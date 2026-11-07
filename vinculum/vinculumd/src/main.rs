@@ -9,12 +9,20 @@
 //! ```text
 //! vinculumd --transport unix:PATH|tcp:HOST:PORT
 //!           [--scan SECS] [--connect NAME] [--att-mtu] [--timeout SECS]
+//!           [--pair [--reconnect] [--passkey-file PATH]]
 //! ```
 //!
 //! `--connect NAME` scans until a device advertising NAME appears, connects
 //! over LE, and with `--att-mtu` sends an ATT Exchange MTU Request on the
 //! fixed ATT channel and waits for the response, then disconnects. Exit 0
 //! when everything asked for happened.
+//!
+//! `--pair` pairs (LE Secure Connections, KeyboardDisplay) after
+//! connecting, answering every prompt "yes" (development only: the real
+//! daemon asks the user through the trusted UI, spec §7). A displayed
+//! passkey is written to `--passkey-file` for the test peer to type. With
+//! `--reconnect` it then disconnects, reconnects and encrypts with the
+//! bond's key.
 
 use std::io::{Read, Write};
 use std::net::TcpStream;
@@ -23,7 +31,8 @@ use std::os::unix::net::UnixStream;
 use std::time::Instant;
 
 use vinculum_hci_proto::h4::Decoder;
-use vinculum_host::{Host, HostEvent};
+use vinculum_host::{Host, HostEvent, PairConfig, Prompt};
+use vinculum_smp::pairing::{Bond, IoCap};
 
 enum Link {
     Unix(UnixStream),
@@ -76,14 +85,17 @@ struct Opts {
     connect: Option<String>,
     att_mtu: bool,
     timeout_secs: u64,
+    pair: bool,
+    reconnect: bool,
+    passkey_file: Option<String>,
 }
 
 fn opts() -> Opts {
     let usage = || -> ! {
-        eprintln!("usage: vinculumd --transport unix:PATH|tcp:HOST:PORT [--scan SECS] [--connect NAME] [--att-mtu] [--timeout SECS]");
+        eprintln!("usage: vinculumd --transport unix:PATH|tcp:HOST:PORT [--scan SECS] [--connect NAME] [--att-mtu] [--timeout SECS] [--pair [--reconnect] [--passkey-file PATH]]");
         std::process::exit(2)
     };
-    let mut o = Opts { transport: String::new(), scan_secs: None, connect: None, att_mtu: false, timeout_secs: 20 };
+    let mut o = Opts { transport: String::new(), scan_secs: None, connect: None, att_mtu: false, timeout_secs: 20, pair: false, reconnect: false, passkey_file: None };
     let mut a = std::env::args().skip(1);
     while let Some(k) = a.next() {
         match k.as_str() {
@@ -91,6 +103,9 @@ fn opts() -> Opts {
             "--scan" => o.scan_secs = Some(a.next().and_then(|v| v.parse().ok()).unwrap_or_else(|| usage())),
             "--connect" => o.connect = Some(a.next().unwrap_or_else(|| usage())),
             "--att-mtu" => o.att_mtu = true,
+            "--pair" => o.pair = true,
+            "--reconnect" => o.reconnect = true,
+            "--passkey-file" => o.passkey_file = Some(a.next().unwrap_or_else(|| usage())),
             "--timeout" => o.timeout_secs = a.next().and_then(|v| v.parse().ok()).unwrap_or_else(|| usage()),
             _ => usage(),
         }
@@ -107,6 +122,9 @@ enum Phase {
     Scanning,
     Connecting,
     WaitAtt(u16),
+    Pairing(u16),
+    Encrypting(u16),
+    Reconnecting,
     Disconnecting,
     Done,
 }
@@ -127,6 +145,7 @@ fn main() {
     let mut scan_until: Option<u64> = None;
     let mut ok = true;
     let mut pending_events: Vec<HostEvent> = Vec::new();
+    let mut bond: Option<Box<Bond>> = None;
 
     host.start(now());
     loop {
@@ -182,7 +201,22 @@ fn main() {
                 }
                 HostEvent::Connected { handle, peer, transport, central } => {
                     println!("connected: handle {handle} {peer} {transport:?} {}", if central { "central" } else { "peripheral" });
-                    if o.att_mtu {
+                    if let Some(b) = &bond {
+                        if let Err(e) = host.encrypt(handle, b.ltk, now()) {
+                            eprintln!("vinculumd: encrypt: {e}");
+                            ok = false;
+                        }
+                        phase = Phase::Encrypting(handle);
+                    } else if o.pair {
+                        // Development IRK; the real daemon keeps one per
+                        // controller in the key store.
+                        let cfg = PairConfig { io_cap: IoCap::KeyboardDisplay, irk: [0x5C; 16] };
+                        if let Err(e) = host.pair(handle, cfg, now()) {
+                            eprintln!("vinculumd: pair: {e}");
+                            ok = false;
+                        }
+                        phase = Phase::Pairing(handle);
+                    } else if o.att_mtu {
                         // ATT Exchange MTU Request (opcode 0x02), client MTU 512.
                         if let Err(e) = host.send_l2cap(handle, 0x0004, &[0x02, 0x00, 0x02], now()) {
                             eprintln!("vinculumd: send: {e}");
@@ -211,7 +245,63 @@ fn main() {
                     println!("disconnected: handle {handle} ({reason})");
                     if phase == Phase::Disconnecting {
                         phase = Phase::Done;
+                    } else if phase == Phase::Reconnecting {
+                        println!("reconnecting");
+                        host.le_scan(true, now());
+                        phase = Phase::Scanning;
+                    } else if matches!(phase, Phase::Pairing(h) | Phase::Encrypting(h) | Phase::WaitAtt(h) if h == handle) {
+                        eprintln!("vinculumd: link lost");
+                        ok = false;
+                        phase = Phase::Done;
                     }
+                }
+                HostEvent::PairingPrompt { handle, prompt } => {
+                    match prompt {
+                        Prompt::Confirm { number: Some(n) } => println!("pairing: confirm {n:06} (auto-yes)"),
+                        Prompt::Confirm { number: None } => println!("pairing: just works (auto-yes)"),
+                        Prompt::Display { passkey } => {
+                            println!("pairing: passkey {passkey:06}");
+                            if let Some(p) = &o.passkey_file {
+                                let _ = std::fs::write(p, format!("{passkey}\n"));
+                            }
+                        }
+                        Prompt::EnterPasskey => {
+                            eprintln!("vinculumd: cannot enter a passkey in development mode");
+                            host.pairing_passkey(handle, None, now());
+                        }
+                    }
+                    if matches!(prompt, Prompt::Confirm { .. }) {
+                        host.pairing_confirm(handle, true, now());
+                    }
+                }
+                HostEvent::Encrypted { handle, key_size } => {
+                    println!("encrypted: handle {handle} key size {key_size}");
+                    if phase == Phase::Encrypting(handle) {
+                        println!("reconnect: encrypted with the stored key");
+                        host.disconnect(handle, now());
+                        phase = Phase::Disconnecting;
+                    }
+                }
+                HostEvent::EncryptionFailed { handle, status } => {
+                    eprintln!("vinculumd: encryption on handle {handle} failed: {status}");
+                    ok = false;
+                    host.disconnect(handle, now());
+                    phase = Phase::Disconnecting;
+                }
+                HostEvent::Paired { handle, bond: b } => {
+                    println!("paired: {b:?}");
+                    bond = Some(b);
+                    host.disconnect(handle, now());
+                    phase = if o.reconnect { Phase::Reconnecting } else { Phase::Disconnecting };
+                }
+                HostEvent::PairingFailed { handle, reason, why } => {
+                    eprintln!("vinculumd: pairing on handle {handle} failed: 0x{reason:02x} {why}");
+                    ok = false;
+                    host.disconnect(handle, now());
+                    phase = Phase::Disconnecting;
+                }
+                HostEvent::SecurityRequest { handle, auth_req } => {
+                    println!("security request: handle {handle} auth 0x{auth_req:02x}");
                 }
                 HostEvent::CommandFailed { op, status } => {
                     eprintln!("vinculumd: {op} failed: {status}");

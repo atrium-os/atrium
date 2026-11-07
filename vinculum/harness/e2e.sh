@@ -1,8 +1,9 @@
 #!/bin/sh
-# Vinculum B1 e2e (docs/spec/bluetooth.md §15): Rootcanal controller ->
-# vinculum-hci (allowlist relay) -> vinculumd (host core). vinculumd scans,
-# finds the Bumble peer "VinculumPeer", connects over LE, does an ATT MTU
-# exchange through ACL credits and L2CAP reassembly, and disconnects.
+# Vinculum e2e (docs/spec/bluetooth.md §15): Rootcanal controller ->
+# vinculum-hci (allowlist relay) -> vinculumd (host core), against a Bumble
+# peer "VinculumPeer". Scenarios: B1 connect + ATT MTU exchange (ACL credits,
+# L2CAP reassembly); B2 LE Secure Connections pairing in each association
+# model, then reconnecting and encrypting with the stored key.
 #
 #   sh vinculum/harness/e2e.sh
 #
@@ -34,14 +35,6 @@ until nc -z 127.0.0.1 "$port" 2>/dev/null; do
     sleep 0.1
 done
 
-"$venv/bin/python" "$here/peer_advertiser.py" "tcp-client:127.0.0.1:$port" VinculumPeer 60 >"$work/peer.log" 2>&1 &
-peer_pid=$!
-i=0
-until grep -q advertising "$work/peer.log" 2>/dev/null; do
-    i=$((i + 1)); [ $i -gt 100 ] && { cat "$work/peer.log"; echo "FAIL: peer did not start"; exit 1; }
-    sleep 0.1
-done
-
 "$bin/vinculum-hci" --controller "tcp:127.0.0.1:$port" --host-listen "$work/hci.sock" 2>"$work/hci.log" &
 hci_pid=$!
 i=0
@@ -50,9 +43,38 @@ until [ -S "$work/hci.sock" ]; do
     sleep 0.1
 done
 
-if "$bin/vinculumd" --transport "unix:$work/hci.sock" --connect VinculumPeer --att-mtu --timeout 20; then
-    echo "PASS: vinculum B1 e2e"
+# scenario NAME PEER_IOCAP VINCULUMD_ARGS... : a fresh peer, one vinculumd run.
+fails=0
+scenario() {
+    name=$1 iocap=$2; shift 2
+    rm -f "$work/passkey"
+    : >"$work/peer.log"
+    "$venv/bin/python" "$here/peer_advertiser.py" "tcp-client:127.0.0.1:$port" VinculumPeer 60 "$iocap" "$work/passkey" >"$work/peer.log" 2>&1 &
+    peer_pid=$!
+    i=0
+    until grep -q advertising "$work/peer.log" 2>/dev/null; do
+        i=$((i + 1)); [ $i -gt 100 ] && { cat "$work/peer.log"; echo "FAIL: peer did not start"; exit 1; }
+        sleep 0.1
+    done
+    if "$bin/vinculumd" --transport "unix:$work/hci.sock" --connect VinculumPeer --timeout 30 --passkey-file "$work/passkey" "$@" >"$work/d.log" 2>&1; then
+        echo "ok   $name"
+    else
+        echo "FAIL $name"; echo "--- vinculumd"; cat "$work/d.log"; echo "--- peer"; cat "$work/peer.log"
+        fails=$((fails + 1))
+    fi
+    kill $peer_pid 2>/dev/null || true
+    wait $peer_pid 2>/dev/null || true
+    peer_pid=
+}
+
+scenario "B1 connect + ATT MTU" none --att-mtu
+scenario "B2 Just Works, reconnect with stored key" none --pair --reconnect
+scenario "B2 numeric comparison, reconnect" display-yes-no --pair --reconnect
+scenario "B2 passkey (we display, peer types)" keyboard --pair
+
+if [ $fails -eq 0 ]; then
+    echo "PASS: vinculum e2e"
 else
-    echo "--- vinculum-hci"; cat "$work/hci.log"; echo "--- peer"; cat "$work/peer.log"
-    echo "FAIL: vinculum B1 e2e"; exit 1
+    echo "--- vinculum-hci"; cat "$work/hci.log"
+    echo "FAIL: vinculum e2e ($fails)"; exit 1
 fi

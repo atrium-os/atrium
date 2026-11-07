@@ -5461,13 +5461,17 @@ override). Rootcanal's wheel has Linux x86_64 and macOS arm64 binaries.
 ```sh
 sh vinculum/harness/run.sh                      # probe scans, expects "VinculumPeer"
 sh vinculum/harness/run.sh --record out.btsnoop # also keep the HCI trace (keys zeroed)
-sh vinculum/harness/e2e.sh                      # vinculumd -> vinculum-hci -> Rootcanal: connect + ATT MTU
+sh vinculum/harness/e2e.sh                      # vinculumd -> vinculum-hci -> Rootcanal: connect + ATT MTU,
+                                                # then LE SC pairing (Just Works, numeric comparison,
+                                                # passkey) and reconnect with the stored key
 (cd vinculum && cargo test)                      # incl. replay of the recorded trace
-(cd vinculum/fuzz && cargo fuzz run hci_event)   # also hci_command gap h4_stream host_frames
+(cd vinculum/fuzz && cargo fuzz run hci_event)   # also hci_command gap h4_stream host_frames smp_initiator
 ```
 
 The packet parsers are generated at build time by a patched, vendored pdl-compiler
 (`vinculum/third_party/README.md`). `VINCULUM_TRACE=1` makes vinculumd print every frame.
+`peer_advertiser.py NAME SECS IOCAP PASSKEY_FILE` sets the Bumble peer's pairing I/O
+capability; `vinculumd --pair` answers every prompt yes (development only).
 
 ### 13.7 Navigator corpus (on the Mac, no VM)
 

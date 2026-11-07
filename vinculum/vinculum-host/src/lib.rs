@@ -8,12 +8,16 @@
 //! B1 scope: command flow control, controller bring-up, LE scanning and
 //! connections, the connection table with its bound, ACL credits and L2CAP
 //! reassembly. Classic connection requests are refused (no bonds exist yet,
-//! spec §7). Pairing, L2CAP channels and GATT come in B2–B4.
+//! spec §7). B2: LE Secure Connections pairing as central (`security`),
+//! and encryption with a stored key. L2CAP channels and GATT come in B3–B4.
 #![forbid(unsafe_code)]
 
 pub mod acl;
 pub mod cmd;
+mod security;
 pub mod testing;
+
+pub use security::{PairConfig, Prompt};
 
 use std::collections::{HashMap, VecDeque};
 
@@ -25,6 +29,8 @@ use vinculum_hci_proto::{gap, Packet};
 
 /// Most connections one controller may hold (spec §6.1).
 pub const MAX_CONNECTIONS: usize = 16;
+/// How long a disconnect waits for the link's queued data to go out.
+pub const DISCONNECT_DRAIN_MS: u64 = 1000;
 /// Protocol violations from one connection before it is dropped.
 pub const MAX_LINK_VIOLATIONS: u32 = 8;
 
@@ -108,6 +114,20 @@ pub enum HostEvent {
     L2cap { handle: u16, cid: u16, payload: Vec<u8> },
     /// A command the caller asked for failed.
     CommandFailed { op: String, status: String },
+    /// Pairing needs the user (answer with `pairing_confirm` or
+    /// `pairing_passkey`).
+    PairingPrompt { handle: u16, prompt: Prompt },
+    /// Pairing finished; the caller stores the bond.
+    Paired { handle: u16, bond: Box<vinculum_smp::pairing::Bond> },
+    PairingFailed { handle: u16, reason: u8, why: String },
+    /// The link is encrypted (after pairing, or with a stored key).
+    Encrypted { handle: u16, key_size: u8 },
+    /// Encryption with a stored key failed (the peer lost the bond, or the
+    /// key is wrong). The link is left unencrypted.
+    EncryptionFailed { handle: u16, status: String },
+    /// The peripheral asks the central to secure the link (SMP Security
+    /// Request); the caller decides between `encrypt` and `pair`.
+    SecurityRequest { handle: u16, auth_req: u8 },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -132,6 +152,8 @@ enum Tag {
     /// Issued by policy (rejects, disconnects of misbehaving links);
     /// failures are logged only.
     Policy,
+    /// LE Start Encryption on a connection.
+    Encrypt(u16),
 }
 
 #[derive(Debug)]
@@ -140,6 +162,11 @@ struct Connection {
     transport: Transport,
     reassembly: Reassembler,
     violations: u32,
+    central: bool,
+    smp: Option<vinculum_smp::pairing::Initiator>,
+    /// LE Start Encryption sent, Encryption Change not yet seen.
+    encrypting: bool,
+    encrypted: bool,
 }
 
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
@@ -160,6 +187,8 @@ pub struct Host {
     conns: HashMap<u16, Connection>,
     /// ACL packets waiting for a credit, per connection, in order.
     acl_out: VecDeque<(u16, Vec<u8>)>,
+    /// Disconnects waiting for their link's data to drain, with deadlines.
+    closing: Vec<(u16, u64)>,
     out_frames: VecDeque<Frame>,
     out_events: VecDeque<HostEvent>,
     stats: Stats,
@@ -198,6 +227,7 @@ impl Host {
             credits: Credits::new(0, 0),
             conns: HashMap::new(),
             acl_out: VecDeque::new(),
+            closing: Vec::new(),
             out_frames: VecDeque::new(),
             out_events: VecDeque::new(),
             stats: Stats::default(),
@@ -251,13 +281,19 @@ impl Host {
 
     /// When [`Host::tick`] must next be called, if ever.
     pub fn deadline(&self) -> Option<u64> {
-        self.cmds.deadline()
+        let smp = self.conns.values().filter_map(|c| c.smp.as_ref()?.deadline()).chain(self.closing.iter().map(|c| c.1)).min();
+        match (self.cmds.deadline(), smp) {
+            (Some(a), Some(b)) => Some(a.min(b)),
+            (a, b) => a.or(b),
+        }
     }
 
     pub fn tick(&mut self, now_ms: u64) {
         if let Some(op) = self.cmds.expired(now_ms) {
             self.fatal(format!("{op:?}: no completion within {} ms", cmd::COMMAND_TIMEOUT_MS));
         }
+        self.smp_tick(now_ms);
+        self.pump(now_ms);
     }
 
     // ---- requests from the caller -------------------------------------
@@ -302,17 +338,25 @@ impl Host {
         self.pump(now_ms);
     }
 
+    /// Disconnects once the data already queued on the link has reached the
+    /// peer (the controller completed it), or after [`DISCONNECT_DRAIN_MS`].
+    /// A last PDU such as SMP key distribution is not lost to the race.
     pub fn disconnect(&mut self, handle: u16, now_ms: u64) {
-        self.issue(
-            to_cmd(hci::Disconnect { connection_handle: handle, reason: hci::DisconnectReason::RemoteUserTerminatedConnection }),
-            Tag::User,
-        );
+        if !self.closing.iter().any(|c| c.0 == handle) {
+            self.closing.push((handle, now_ms + DISCONNECT_DRAIN_MS));
+        }
         self.pump(now_ms);
     }
 
     /// Queues an L2CAP PDU on a connection, fragmented to the controller's
     /// buffer size. Fails if the handle is unknown or the host is not ready.
     pub fn send_l2cap(&mut self, handle: u16, cid: u16, payload: &[u8], now_ms: u64) -> Result<(), &'static str> {
+        self.queue_l2cap(handle, cid, payload)?;
+        self.pump(now_ms);
+        Ok(())
+    }
+
+    fn queue_l2cap(&mut self, handle: u16, cid: u16, payload: &[u8]) -> Result<(), &'static str> {
         if !self.ready {
             return Err("controller not ready");
         }
@@ -338,7 +382,6 @@ impl Host {
             };
             self.acl_out.push_back((handle, acl.encode_to_vec().map_err(|_| "encode")?));
         }
-        self.pump(now_ms);
         Ok(())
     }
 
@@ -350,7 +393,7 @@ impl Host {
         }
         match f.kind {
             Kind::Event => self.on_event(&f.packet),
-            Kind::Acl => self.on_acl(&f.packet),
+            Kind::Acl => self.on_acl(&f.packet, now_ms),
             // SCO and ISO have no consumer before B5/B7; commands never come
             // from a controller.
             Kind::Sco | Kind::Iso => {}
@@ -409,6 +452,14 @@ impl Host {
                     self.out_events.push_back(HostEvent::ConnectFailed { peer: Some(peer), status: format!("{:?}", c.status) });
                 }
             }
+            EventChild::EncryptionChange(e) => {
+                let on = e.encryption_enabled != hci::EncryptionEnabled::Off;
+                self.on_encryption_change(e.connection_handle, e.status, on, None)
+            }
+            EventChild::EncryptionChangeV2(e) => {
+                let on = e.encryption_enabled != hci::EncryptionEnabled::Off;
+                self.on_encryption_change(e.connection_handle, e.status, on, Some(e.key_size))
+            }
             EventChild::LeMetaEvent(m) => self.on_le_meta(m),
             EventChild::HardwareError(h) => self.fatal(format!("controller hardware error 0x{:02x}", h.hardware_code)),
             _ => {}
@@ -445,6 +496,11 @@ impl Host {
             LeMetaEventChild::LeEnhancedConnectionCompleteV2(c) => {
                 self.le_connected(c.status, c.connection_handle, Peer::from_hci(c.peer_address, c.peer_address_type), c.role)
             }
+            LeMetaEventChild::LeLongTermKeyRequest(r) => {
+                // Vinculum is never the LE peripheral, so it holds no key a
+                // central could ask for.
+                self.issue(to_cmd(hci::LeLongTermKeyRequestNegativeReply { connection_handle: r.connection_handle }), Tag::Policy);
+            }
             _ => {}
         }
     }
@@ -480,12 +536,26 @@ impl Host {
             );
             return;
         }
-        self.conns.insert(handle, Connection { peer, transport, reassembly: Reassembler::default(), violations: 0 });
+        self.conns.insert(
+            handle,
+            Connection {
+                peer,
+                transport,
+                reassembly: Reassembler::default(),
+                violations: 0,
+                central,
+                smp: None,
+                encrypting: false,
+                encrypted: false,
+            },
+        );
         self.out_events.push_back(HostEvent::Connected { handle, peer, transport, central });
     }
 
     fn drop_connection(&mut self, handle: u16) {
+        // Dropping the Initiator zeroes its keys.
         self.conns.remove(&handle);
+        self.closing.retain(|c| c.0 != handle);
         self.credits.disconnected(handle);
         self.acl_out.retain(|(h, _)| *h != handle);
     }
@@ -498,7 +568,7 @@ impl Host {
         );
     }
 
-    fn on_acl(&mut self, bytes: &[u8]) {
+    fn on_acl(&mut self, bytes: &[u8], now_ms: u64) {
         let Ok(acl) = hci::Acl::decode_full(bytes) else {
             self.stats.link_violations += 1;
             return;
@@ -516,7 +586,11 @@ impl Host {
             Ok(p) => {
                 bad = p.interrupted;
                 if let Some(pdu) = p.pdu {
-                    self.out_events.push_back(HostEvent::L2cap { handle, cid: pdu.cid, payload: pdu.payload });
+                    if pdu.cid == security::SMP_CID && conn.transport == Transport::Le {
+                        self.on_smp(handle, &pdu.payload, now_ms);
+                    } else {
+                        self.out_events.push_back(HostEvent::L2cap { handle, cid: pdu.cid, payload: pdu.payload });
+                    }
                 }
             }
             Err(ReassemblyError::Orphan) => bad = true,
@@ -553,15 +627,36 @@ impl Host {
         if self.dead {
             return;
         }
+        if self.ready {
+            self.pump_acl();
+            self.pump_closing(now_ms);
+        }
         while let Some(c) = self.cmds.next_to_send(now_ms) {
             match c.encode_to_vec() {
                 Ok(packet) => self.out_frames.push_back(Frame { kind: Kind::Command, packet }),
                 Err(e) => self.fatal(format!("encode {:?}: {e:?}", c.op_code)),
             }
         }
-        if !self.ready {
-            return;
+    }
+
+    fn pump_closing(&mut self, now_ms: u64) {
+        let mut i = 0;
+        while i < self.closing.len() {
+            let (h, deadline) = self.closing[i];
+            let drained = !self.acl_out.iter().any(|(x, _)| *x == h) && self.credits.outstanding(h) == 0;
+            if drained || now_ms >= deadline || !self.conns.contains_key(&h) {
+                self.closing.swap_remove(i);
+                self.issue(
+                    to_cmd(hci::Disconnect { connection_handle: h, reason: hci::DisconnectReason::RemoteUserTerminatedConnection }),
+                    Tag::User,
+                );
+            } else {
+                i += 1;
+            }
         }
+    }
+
+    fn pump_acl(&mut self) {
         let mut held = VecDeque::new();
         while let Some((handle, pkt)) = self.acl_out.pop_front() {
             let pool = match self.conns.get(&handle).map(|c| c.transport) {
@@ -588,6 +683,11 @@ impl Host {
                 }
             }
             Tag::Policy => {}
+            Tag::Encrypt(handle) => {
+                if status != hci::ErrorCode::Success {
+                    self.on_encryption_change(handle, status, false, None);
+                }
+            }
             Tag::Init(step) => self.init_step(step, status, cc),
         }
     }

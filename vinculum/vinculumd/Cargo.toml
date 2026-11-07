@@ -8,4 +8,5 @@ license.workspace = true
 [dependencies]
 vinculum-hci-proto = { path = "../vinculum-hci-proto" }
 vinculum-host = { path = "../vinculum-host" }
+vinculum-smp = { path = "../vinculum-smp" }
 libc = "0.2"

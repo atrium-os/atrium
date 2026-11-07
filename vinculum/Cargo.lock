@@ -703,6 +703,7 @@ name = "vinculum-host"
 version = "0.1.0"
 dependencies = [
  "vinculum-hci-proto",
+ "vinculum-smp",
 ]
 
 [[package]]
@@ -734,6 +735,7 @@ dependencies = [
  "libc",
  "vinculum-hci-proto",
  "vinculum-host",
+ "vinculum-smp",
 ]
 
 [[package]]
