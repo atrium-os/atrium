@@ -1,6 +1,6 @@
 # Vinculum: the Bluetooth service
 
-**Status:** proposal, 2026-11-07. Decisions in §16 pending (9 since 2026-11-07). **Owner:** the Bluetooth thread.
+**Status:** accepted 2026-11-07 (Shankar: all nine §16 decisions as recommended; decision 3 settled as Rust throughout). Being built. **Owner:** the Bluetooth thread.
 Interfaces agreed with the input thread (Tactus, [atrium-input.md](atrium-input.md) rev. 2 §3.3)
 and to be agreed with the audio thread ([lyra-v1.md](lyra-v1.md)).
 
@@ -524,6 +524,8 @@ B3 and B4 are what Tactus needs (its T6). B5 is what headphones need. MediaTek a
 firmware, UART, Auracast, OBEX come after.
 
 ## 16. Decisions, with recommendations
+
+**Accepted by Shankar, 2026-11-07: all nine, as recommended (decision 3 as amended).**
 
 1. **A new user-space stack, not netgraph.** *Recommend yes,* for §2: the old stack lacks SSP,
    all of LE security and GATT, and all audio, so nearly all the work is new either way, and
