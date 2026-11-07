@@ -37,6 +37,8 @@ use std::os::fd::{AsRawFd, RawFd};
 use std::os::unix::net::UnixStream;
 use std::time::Instant;
 
+mod policy;
+
 use vinculum_hci_proto::h4::Decoder;
 use vinculum_host::{Host, HostEvent, PairConfig, Prompt};
 use vinculum_keys::{Address, KeyStore, MemoryStore};
@@ -176,13 +178,13 @@ fn open_store(o: &Opts) -> Box<dyn KeyStore> {
 fn main() {
     let o = opts();
     let mut store = open_store(&o);
-    let mut bonds: Vec<vinculum_keys::Bond> = Vec::new();
+    let mut bonds: Vec<(vinculum_keys::Id, vinculum_keys::Bond)> = Vec::new();
     for (id, b) in store.load_all().unwrap_or_else(|e| {
         eprintln!("vinculumd: key store: {e}");
         std::process::exit(1)
     }) {
         match b {
-            Ok(b) => bonds.push(b),
+            Ok(b) => bonds.push((id, b)),
             Err(e) => eprintln!("vinculumd: bond {id:02x?} unusable ({e}); that device must pair again"),
         }
     }
@@ -203,6 +205,11 @@ fn main() {
     let mut ok = true;
     let mut pending_events: Vec<HostEvent> = Vec::new();
 
+    let mut pairable = policy::Pairable::default();
+    if o.pair {
+        // Development: running with --pair is the user asking to pair.
+        pairable.asked(now());
+    }
     host.start(now());
     loop {
         // Events can queue frames (a scan start after Ready), and frames
@@ -259,7 +266,7 @@ fn main() {
                 HostEvent::Connected { handle, peer, transport, central } => {
                     println!("connected: handle {handle} {peer} {transport:?} {}", if central { "central" } else { "peripheral" });
                     let at = Address::from_msb(peer.address, peer.random);
-                    if let Some(b) = vinculum_keys::find(&bonds, &at) {
+                    if let Some(b) = vinculum_keys::find(bonds.iter().map(|(_, b)| b), &at) {
                         println!("bonded: {} ({}authenticated)", b.name, if b.authenticated { "" } else { "un" });
                         if let Err(e) = host.encrypt(handle, b.ltk, now()) {
                             eprintln!("vinculumd: encrypt: {e}");
@@ -267,13 +274,7 @@ fn main() {
                         }
                         phase = Phase::Encrypting(handle);
                     } else if o.pair {
-                        // Development IRK; the real daemon keeps one per
-                        // controller in the key store.
-                        let cfg = PairConfig { io_cap: IoCap::KeyboardDisplay, irk: [0x5C; 16] };
-                        if let Err(e) = host.pair(handle, cfg, now()) {
-                            eprintln!("vinculumd: pair: {e}");
-                            ok = false;
-                        }
+                        ok &= start_pair(&mut host, &pairable, handle, now());
                         phase = Phase::Pairing(handle);
                     } else if o.att_mtu {
                         // ATT Exchange MTU Request (opcode 0x02), client MTU 512.
@@ -343,9 +344,17 @@ fn main() {
                 }
                 HostEvent::EncryptionFailed { handle, status } => {
                     eprintln!("vinculumd: encryption on handle {handle} failed: {status}");
-                    ok = false;
-                    host.disconnect(handle, now());
-                    phase = Phase::Disconnecting;
+                    if o.pair && pairable.is_open(now()) {
+                        // The device lost its bond; the user asked to pair,
+                        // so pair again (the new bond must not be weaker).
+                        println!("pairing again");
+                        ok &= start_pair(&mut host, &pairable, handle, now());
+                        phase = Phase::Pairing(handle);
+                    } else {
+                        ok = false;
+                        host.disconnect(handle, now());
+                        phase = Phase::Disconnecting;
+                    }
                 }
                 HostEvent::Paired { handle, bond: b } => {
                     println!("paired: {b:?}");
@@ -353,15 +362,35 @@ fn main() {
                     let name = names.get(&peer).cloned().unwrap_or_default();
                     // Development: paired by the invoking user.
                     let uid = getuid();
-                    let rec = vinculum_keys::Bond::from_pairing(&b, Address::from_msb(peer.address, peer.random), uid, &name);
+                    let at = Address::from_msb(peer.address, peer.random);
+                    let rec = vinculum_keys::Bond::from_pairing(&b, at, uid, &name);
+                    let old = bonds.iter().position(|(_, x)| vinculum_keys::find([x], &at).is_some() || x.identity.is_some() && x.identity == rec.identity);
+                    let verdict = policy::new_bond(old.map(|i| &bonds[i].1), &rec);
+                    if let policy::NewBond::Refuse(why) = verdict {
+                        eprintln!("vinculumd: pairing refused: {why}; keeping the stored bond");
+                        ok = false;
+                        host.disconnect(handle, now());
+                        phase = Phase::Disconnecting;
+                        continue;
+                    }
+                    println!("keyboard reports: {}", if policy::keyboard_allowed(&rec) { "allowed" } else { "not allowed (pair with passkey or numeric comparison)" });
                     match store.store(&rec) {
-                        Ok(_) => println!("stored bond for {name}"),
+                        Ok(id) => {
+                            println!("stored bond for {name}");
+                            if let Some(i) = old {
+                                let (old_id, _) = bonds.remove(i);
+                                if let Err(e) = store.delete(&old_id) {
+                                    eprintln!("vinculumd: removing the replaced bond: {e}");
+                                }
+                                println!("replaced the stored bond");
+                            }
+                            bonds.push((id, rec));
+                        }
                         Err(e) => {
                             eprintln!("vinculumd: storing the bond: {e}");
                             ok = false;
                         }
                     }
-                    bonds.push(rec);
                     host.disconnect(handle, now());
                     phase = if o.reconnect { Phase::Reconnecting } else { Phase::Disconnecting };
                 }
@@ -373,6 +402,19 @@ fn main() {
                 }
                 HostEvent::SecurityRequest { handle, auth_req } => {
                     println!("security request: handle {handle} auth 0x{auth_req:02x}");
+                    let bond = host
+                        .peer(handle)
+                        .and_then(|p| vinculum_keys::find(bonds.iter().map(|(_, b)| b), &Address::from_msb(p.address, p.random)))
+                        .map(|b| b.ltk);
+                    match policy::on_security_request(bond.is_some(), pairable.is_open(now())) {
+                        policy::OnSecurityRequest::Encrypt => {
+                            let _ = host.encrypt(handle, bond.expect("bonded"), now());
+                        }
+                        policy::OnSecurityRequest::Pair => {
+                            start_pair(&mut host, &pairable, handle, now());
+                        }
+                        policy::OnSecurityRequest::Ignore => println!("ignored: not bonded and not pairable"),
+                    }
                 }
                 HostEvent::CommandFailed { op, status } => {
                     eprintln!("vinculumd: {op} failed: {status}");
@@ -448,6 +490,22 @@ fn main() {
         ok = false;
     }
     std::process::exit(if ok { 0 } else { 1 })
+}
+
+/// Starts pairing if the pairable window is open (spec §7).
+fn start_pair(host: &mut Host, pairable: &policy::Pairable, handle: u16, now_ms: u64) -> bool {
+    if !pairable.is_open(now_ms) {
+        eprintln!("vinculumd: not pairable now; pairing refused");
+        return false;
+    }
+    // Development IRK; the real daemon keeps one per controller in the key
+    // store.
+    let cfg = PairConfig { io_cap: IoCap::KeyboardDisplay, irk: [0x5C; 16] };
+    if let Err(e) = host.pair(handle, cfg, now_ms) {
+        eprintln!("vinculumd: pair: {e}");
+        return false;
+    }
+    true
 }
 
 fn getuid() -> u32 {

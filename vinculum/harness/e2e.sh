@@ -59,7 +59,14 @@ scenario() {
         sleep 0.1
     done
     d() { "$bin/vinculumd" --transport "unix:$work/hci.sock" --connect VinculumPeer --timeout 30 --passkey-file "$work/passkey" "$@"; }
-    if d "$@" >"$work/d.log" 2>&1 && { [ -z "$AGAIN" ] || d $AGAIN >>"$work/d.log" 2>&1; }; then
+    if [ -n "${EXPECT_FAIL:-}" ]; then
+        # The run must fail, saying EXPECT_FAIL.
+        if ! d "$@" >"$work/d.log" 2>&1 && grep -q "$EXPECT_FAIL" "$work/d.log"; then
+            echo "ok   $name"
+        else
+            echo "FAIL $name (expected: $EXPECT_FAIL)"; cat "$work/d.log"; fails=$((fails + 1))
+        fi
+    elif d "$@" >"$work/d.log" 2>&1 && { [ -z "$AGAIN" ] || d $AGAIN >>"$work/d.log" 2>&1; }; then
         echo "ok   $name"
     else
         echo "FAIL $name"; echo "--- vinculumd"; cat "$work/d.log"; echo "--- peer"; cat "$work/peer.log"
@@ -80,6 +87,11 @@ AGAIN="--pair --keys $work/keys --machine-key $work/machine.key"
 scenario "B2 bond survives a restart (file store)" display-yes-no --pair --keys "$work/keys" --machine-key "$work/machine.key"
 AGAIN=
 grep -q "reconnect: encrypted with the stored key" "$work/d.log" || { echo "FAIL second run did not use the stored bond"; cat "$work/d.log"; fails=$((fails + 1)); }
+# No downgrade: the same device, having lost its keys, comes back able to do
+# only Just Works. Re-pairing must not replace the authenticated bond.
+EXPECT_FAIL="pairing refused: the new key is unauthenticated"
+scenario "B2 no key downgrade (authenticated bond kept)" none --pair --keys "$work/keys" --machine-key "$work/machine.key"
+EXPECT_FAIL=
 
 if [ $fails -eq 0 ]; then
     echo "PASS: vinculum e2e"
