@@ -13,6 +13,7 @@ vinculum-hci-proto = { path = "../vinculum-hci-proto" }
 vinculum-host = { path = "../vinculum-host" }
 vinculum-smp = { path = "../vinculum-smp" }
 vinculum-sdp = { path = "../vinculum-sdp" }
+vinculum-gatt = { path = "../vinculum-gatt" }
 
 # Its own workspace, like every cargo-fuzz crate.
 [workspace]
@@ -59,5 +60,11 @@ doc = false
 [[bin]]
 name = "sdp"
 path = "fuzz_targets/sdp.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "hogp"
+path = "fuzz_targets/hogp.rs"
 test = false
 doc = false

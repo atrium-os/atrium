@@ -989,6 +989,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "vinculum-gatt"
+version = "0.1.0"
+
+[[package]]
 name = "vinculum-hci"
 version = "0.1.0"
 dependencies = [
@@ -1066,6 +1070,7 @@ version = "0.1.0"
 dependencies = [
  "libc",
  "vinculum-control",
+ "vinculum-gatt",
  "vinculum-hci-proto",
  "vinculum-hid-wire",
  "vinculum-host",

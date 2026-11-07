@@ -30,6 +30,8 @@ use crate::policy::{self, NewBond, OnSecurityRequest, Pairable};
 use crate::Link;
 
 pub const MAX_CLIENTS: usize = 8;
+/// An LE connection attempt is cancelled after this long.
+pub const LE_CONNECT_TIMEOUT_MS: u64 = 30_000;
 
 struct Client {
     sock: UnixStream,
@@ -61,7 +63,13 @@ struct Daemon {
     bonds: Vec<(Id, Bond)>,
     pairable: Pairable,
     clients: Vec<Client>,
+    /// The controller is scanning (for a user's scan, or in the
+    /// background for bonded LE devices that want to reconnect).
     scanning: bool,
+    /// A control client asked for a scan.
+    user_scan: bool,
+    /// Our LE connection attempt in flight, and when we give up on it.
+    le_connecting: Option<(Addr, Option<u64>)>,
     /// A device the user asked to pair, waiting for its connection.
     pending_pair: Option<Addr>,
     conns: HashMap<u16, Addr>,
@@ -185,18 +193,20 @@ impl Daemon {
         }
     }
 
-    /// A Classic link is encrypted with a stored bond: run HID on it.
+    /// A link is encrypted with a stored bond: run HID on it (SDP and
+    /// L2CAP channels on Classic, HID over GATT on LE).
     fn start_hid(&mut self, handle: u16) {
-        if self.host.transport(handle) != Some(vinculum_host::Transport::BrEdr) {
-            return;
-        }
         let Some(&a) = self.conns.get(&handle) else { return };
         let Some(k) = self.bond_for(a) else { return };
         let b = &self.bonds[k].1;
         let (name, kb) = (b.name.clone(), policy::keyboard_allowed(b));
         let now = self.now();
-        let incoming = self.incoming.contains(&handle);
-        self.hid.start(&mut self.host, handle, a, incoming, &name, kb, now);
+        if self.host.transport(handle) == Some(vinculum_host::Transport::BrEdr) {
+            let incoming = self.incoming.contains(&handle);
+            self.hid.start(&mut self.host, handle, a, incoming, &name, kb, now);
+        } else {
+            self.hid.start_le(&mut self.host, handle, a, &name, kb, now);
+        }
     }
 
     // ---- requests -------------------------------------------------------
@@ -218,7 +228,7 @@ impl Daemon {
             Request::Status => Event::Status {
                 ready: self.host.is_ready(),
                 address: self.host.info().address.map(|a| Addr { bytes: a, random: false }),
-                scanning: self.scanning,
+                scanning: self.user_scan,
                 pairable: self.pairable.is_open(now),
                 agents: self.agents() as u32,
                 connections: self.conns.len() as u32,
@@ -227,10 +237,8 @@ impl Daemon {
                 if !self.host.is_ready() {
                     Event::Error { why: "controller not ready".into() }
                 } else {
-                    if on != self.scanning {
-                        self.host.le_scan(on, now);
-                        self.scanning = on;
-                    }
+                    self.user_scan = on;
+                    self.update_scan();
                     Event::Ok
                 }
             }
@@ -246,8 +254,7 @@ impl Daemon {
                     if classic {
                         self.host.classic_connect(peer(address), now);
                     } else {
-                        self.stop_scan();
-                        self.host.le_connect(peer(address), now);
+                        self.le_connect(address);
                     }
                     Event::Ok
                 }
@@ -286,6 +293,7 @@ impl Daemon {
                     }
                     let r = self.store.delete(&id);
                     self.update_page_scan();
+                    self.update_scan();
                     match r {
                         Ok(()) => Event::Ok,
                         Err(e) => Event::Error { why: format!("key store: {e}") },
@@ -317,12 +325,35 @@ impl Daemon {
         self.send(i, &reply);
     }
 
-    fn stop_scan(&mut self) {
-        if self.scanning {
+    /// Bonded LE devices reconnect by advertising: while one is away and
+    /// HID is on, scan for it in the background (its resolvable address is
+    /// matched against the bond's IRK), then connect.
+    fn background_scan_wanted(&self) -> bool {
+        self.hid.enabled()
+            && self.pending_pair.is_none()
+            && self.bonds.iter().any(|(_, b)| !b.classic && !self.conns.values().any(|x| vinculum_keys::find([b], &keys_addr(*x)).is_some()))
+    }
+
+    fn update_scan(&mut self) {
+        let want = self.host.is_ready() && self.le_connecting.is_none() && (self.user_scan || self.background_scan_wanted());
+        if want != self.scanning {
             let now = self.now();
-            self.host.le_scan(false, now);
-            self.scanning = false;
+            self.host.le_scan(want, now);
+            self.scanning = want;
         }
+    }
+
+    /// One LE connection attempt at a time; the scan pauses meanwhile.
+    fn le_connect(&mut self, a: Addr) {
+        let now = self.now();
+        self.le_connecting = Some((a, Some(now + LE_CONNECT_TIMEOUT_MS)));
+        self.update_scan();
+        self.host.le_connect(peer(a), now);
+    }
+
+    fn le_connect_done(&mut self) {
+        self.le_connecting = None;
+        self.update_scan();
     }
 
     fn req_pair(&mut self, address: Addr, classic: bool) -> Event {
@@ -348,8 +379,11 @@ impl Daemon {
         if classic {
             self.host.classic_connect(peer(address), now);
         } else {
-            self.stop_scan();
-            self.host.le_connect(peer(address), now);
+            if self.le_connecting.is_some() {
+                self.pending_pair = None;
+                return Event::Error { why: "another connection is in progress; try again".into() };
+            }
+            self.le_connect(address);
         }
         Event::Ok
     }
@@ -362,6 +396,7 @@ impl Daemon {
             HostEvent::Ready(info) => {
                 eprintln!("vinculumd: controller ready, HCI version {}, {} bonds", info.hci_version, self.bonds.len());
                 self.update_page_scan();
+                self.update_scan();
             }
             HostEvent::Fatal(why) => {
                 // The service manager restarts us with a fresh controller.
@@ -373,13 +408,21 @@ impl Daemon {
                 if let Some(n) = &name {
                     self.names.insert(a, n.clone());
                 }
-                if self.scanning {
+                if self.user_scan {
                     self.broadcast(&Event::Found { address: a, name, rssi });
                 }
+                // A bonded LE device that is away, advertising: reconnect.
+                let away = self.bond_for(a).is_some_and(|k| !self.bonds[k].1.classic) && self.handle_of(a).is_none();
+                if away && self.le_connecting.is_none() && self.pending_pair.is_none() && self.hid.enabled() {
+                    self.le_connect(a);
+                }
             }
-            HostEvent::Connected { handle, peer, .. } => {
+            HostEvent::Connected { handle, peer, transport, .. } => {
                 let a = addr(peer);
                 self.conns.insert(handle, a);
+                if transport == vinculum_host::Transport::Le {
+                    self.le_connect_done();
+                }
                 if self.paged_by.remove(&a) {
                     self.incoming.insert(handle);
                 }
@@ -403,6 +446,10 @@ impl Daemon {
             HostEvent::ConnectFailed { peer, status } => {
                 if let Some(p) = peer {
                     self.paged_by.remove(&addr(p));
+                    // A cancelled attempt may not name the peer.
+                    if self.le_connecting.is_some_and(|(a, _)| a == addr(p)) || status.contains("UnknownConnection") {
+                        self.le_connect_done();
+                    }
                 }
                 if let (Some(p), Some(pp)) = (peer, self.pending_pair) {
                     if addr(p) == pp {
@@ -418,10 +465,14 @@ impl Daemon {
                 if let Some(a) = self.conns.remove(&handle) {
                     self.broadcast(&Event::Disconnected { address: a, reason });
                 }
+                self.update_scan();
             }
-            HostEvent::L2cap { .. } => {
-                // No profile channels before B3/B4; nothing is handed to
-                // anyone on a link (§7).
+            HostEvent::L2cap { handle, cid, payload } => {
+                // ATT on LE links running HID over GATT; nothing else is
+                // handed to anyone on a link (§7).
+                if cid == vinculum_gatt::ATT_CID {
+                    self.hid.on_att(&mut self.host, handle, &payload, now);
+                }
             }
             HostEvent::CommandFailed { op, status } => {
                 eprintln!("vinculumd: {op} failed: {status}");
@@ -476,8 +527,9 @@ impl Daemon {
                         self.broadcast(&Event::Paired { address: a, authenticated, keyboard_allowed });
                         if classic {
                             self.update_page_scan();
-                            self.start_hid(handle);
                         }
+                        self.update_scan();
+                        self.start_hid(handle);
                     }
                     Err(e) => {
                         // A bond we can't keep is no bond: drop the link.
@@ -608,6 +660,8 @@ pub fn run(cfg: Config, mut link: Link, store: Box<dyn KeyStore>, bonds: Vec<(Id
         pairable: Pairable::default(),
         clients: Vec::new(),
         scanning: false,
+        user_scan: false,
+        le_connecting: None,
         pending_pair: None,
         conns: HashMap::new(),
         names: HashMap::new(),
@@ -640,7 +694,8 @@ pub fn run(cfg: Config, mut link: Link, store: Box<dyn KeyStore>, bonds: Vec<(Id
         }
         d.clients.retain(|c| !c.dead);
         let now = d.now();
-        let next = [d.host.deadline(), d.pairable.deadline()].into_iter().flatten().min();
+        let le_deadline = d.le_connecting.and_then(|(_, t)| t);
+        let next = [d.host.deadline(), d.pairable.deadline(), d.hid.deadline(), le_deadline].into_iter().flatten().min();
         let wait_ms = next.map_or(-1, |n| n.saturating_sub(now).min(60_000) as i32);
         let mut fds = vec![link.fd(), listener.as_raw_fd()];
         fds.extend(d.clients.iter().map(|c| c.sock.as_raw_fd()));
@@ -692,5 +747,17 @@ pub fn run(cfg: Config, mut link: Link, store: Box<dyn KeyStore>, bonds: Vec<(Id
         }
         let now = d.now();
         d.host.tick(now);
+        if let Some((a, Some(t))) = d.le_connecting {
+            if now >= t {
+                // Not there: give up; ConnectFailed then restarts the scan.
+                d.le_connecting = Some((a, None));
+                d.host.le_connect_cancel(now);
+            }
+        }
+        for h in d.hid.timed_out(now) {
+            eprintln!("vinculumd: ATT transaction timed out; dropping the link");
+            d.hid.link_gone(h);
+            d.host.disconnect(h, now);
+        }
     }
 }

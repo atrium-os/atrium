@@ -725,11 +725,16 @@ name = "vinculum-fuzz"
 version = "0.0.0"
 dependencies = [
  "libfuzzer-sys",
+ "vinculum-gatt",
  "vinculum-hci-proto",
  "vinculum-host",
  "vinculum-sdp",
  "vinculum-smp",
 ]
+
+[[package]]
+name = "vinculum-gatt"
+version = "0.1.0"
 
 [[package]]
 name = "vinculum-hci-proto"

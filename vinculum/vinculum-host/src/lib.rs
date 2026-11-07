@@ -351,6 +351,12 @@ impl Host {
         self.pump(now_ms);
     }
 
+    /// Cancels a pending `le_connect`; it ends with `ConnectFailed`.
+    pub fn le_connect_cancel(&mut self, now_ms: u64) {
+        self.issue(to_cmd(hci::LeCreateConnectionCancel {}), Tag::Policy);
+        self.pump(now_ms);
+    }
+
     /// Page scan on or off (BR/EDR): bonded Classic devices such as HID
     /// keyboards reconnect by paging us. Never inquiry scan: we are not
     /// discoverable (§7). Incoming pages arrive as `ConnectionRequest`.

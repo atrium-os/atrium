@@ -4,10 +4,11 @@
 # peer "VinculumPeer". Scenarios: B1 connect + ATT MTU exchange (ACL credits,
 # L2CAP reassembly); B2 LE Secure Connections pairing in each association
 # model, then reconnecting and encrypting with the stored key; Classic SSP;
-# the control socket; B3 a Classic HID keyboard handed to a real tactusd.
+# the control socket; B3 a Classic HID keyboard and B4 a HID-over-GATT mouse
+# handed to a real tactusd.
 #
 #   sh vinculum/harness/e2e.sh
-#   VINCULUM_E2E=hid sh vinculum/harness/e2e.sh   # only the HID scenario
+#   VINCULUM_E2E=hid sh vinculum/harness/e2e.sh   # only the Classic HID scenario (hogp: the LE one)
 #
 # Same requirements as run.sh.
 set -eu
@@ -25,7 +26,7 @@ bin=$(cargo metadata -q --manifest-path "$ws/Cargo.toml" --format-version 1 | py
 
 work=$(mktemp -d)
 rc_pid= peer_pid= hci_pid= d_pid=
-cleanup() { kill ${t_pid:-} ${w_pid:-} $d_pid $hci_pid $peer_pid $rc_pid 2>/dev/null || true; rm -rf "$work"; }
+cleanup() { kill ${t_pid:-} ${w_pid:-} $d_pid $hci_pid $peer_pid $rc_pid 2>/dev/null || true; [ -n "${VINCULUM_KEEP:-}" ] && echo "logs kept in $work" || rm -rf "$work"; }
 trap cleanup EXIT INT TERM
 
 "$venv/bin/python" -m rootcanal --hci_port "$port" --link_port $((port + 1)) \
@@ -164,6 +165,7 @@ tactus_ws=$(dirname "$ws")/tactus
 cargo build -q --manifest-path "$tactus_ws/Cargo.toml" 2>/dev/null
 tbin=$(cargo metadata -q --manifest-path "$tactus_ws/Cargo.toml" --format-version 1 | python3 -c 'import json,sys; print(json.load(sys.stdin)["target_directory"])')/debug
 t_pid= w_pid=
+if [ "$only" = all ] || [ "$only" = hid ]; then
 "$bin/vinculumd" --transport "unix:$work/hci.sock" --control "$work/ctl5.sock" --hid "$work/hid.sock" \
     --keys "$work/keys5" --machine-key "$work/machine.key" >"$work/svc5.log" 2>&1 &
 d_pid=$!
@@ -207,6 +209,54 @@ fi
 kill $d_pid $peer_pid $t_pid $w_pid 2>/dev/null || true
 wait $d_pid $peer_pid $t_pid $w_pid 2>/dev/null || true
 d_pid= peer_pid=
+fi
+
+# B4: a HID-over-GATT mouse over LE. Paired through vinculum-ctl, vinculumd
+# discovers its GATT database, tactusd gets the device and its motion and
+# clicks; battery changes reach vinculumd; after the mouse drops the link
+# and advertises again, vinculumd reconnects by itself and it works again.
+if [ "$only" = all ] || [ "$only" = hogp ]; then
+"$bin/vinculumd" --transport "unix:$work/hci.sock" --control "$work/ctl6.sock" --hid "$work/hid6.sock" \
+    --keys "$work/keys6" --machine-key "$work/machine.key" >"$work/svc6.log" 2>&1 &
+d_pid=$!
+until [ -S "$work/hid6.sock" ]; do sleep 0.1; done
+TACTUS_PEERS=any TACTUS_BLUETOOTH_SOCKET="$work/hid6.sock" "$tbin/tactusd" --socket "$work/tactus6.sock" >"$work/tactus6.log" 2>&1 &
+t_pid=$!
+until [ -S "$work/tactus6.sock" ]; do sleep 0.1; done
+"$tbin/tactusd" --watch "$work/tactus6.sock" >"$work/watch6.log" 2>&1 &
+w_pid=$!
+"$venv/bin/python" "$here/peer_hogp_mouse.py" "tcp-client:127.0.0.1:$port" 30 >"$work/mouse.log" 2>&1 &
+peer_pid=$!
+until grep -q advertising "$work/mouse.log" 2>/dev/null; do sleep 0.1; done
+ctl() { "$bin/vinculum-ctl" -s "$work/ctl6.sock" "$@"; }
+i=0
+until ctl status 2>/dev/null | grep -q "ready: true"; do
+    i=$((i + 1)); [ $i -gt 50 ] && break
+    sleep 0.1
+done
+hogp_ok=1
+ctl pair VinculumMouse --yes >"$work/ctl6.log" 2>&1 || hogp_ok=0
+# No `connect`: vinculumd scans in the background for the bonded mouse and
+# reconnects when it advertises again.
+i=0
+until [ "$(grep -c "raw_dx: 10" "$work/watch6.log" 2>/dev/null)" -ge 6 ]; do
+    i=$((i + 1)); [ $i -gt 150 ] && break
+    sleep 0.1
+done
+[ "$(grep -c "raw_dx: 10" "$work/watch6.log")" -ge 6 ] || hogp_ok=0
+grep -q "Button {.*down: true" "$work/watch6.log" || hogp_ok=0
+grep -q "Device {.*Bluetooth.*vendor: 4660, product: 22136" "$work/watch6.log" || hogp_ok=0
+grep -q "battery 60%" "$work/svc6.log" || hogp_ok=0
+if [ $hogp_ok -eq 1 ]; then
+    echo "ok   B4 HID-over-GATT mouse to tactusd, battery, automatic reconnect"
+else
+    echo "FAIL B4 HOGP mouse"; for f in ctl6 svc6 mouse tactus6 watch6; do echo "--- $f"; cat "$work/$f.log"; done
+    fails=$((fails + 1))
+fi
+kill $d_pid $peer_pid $t_pid $w_pid 2>/dev/null || true
+wait $d_pid $peer_pid $t_pid $w_pid 2>/dev/null || true
+d_pid= peer_pid=
+fi
 
 if [ $fails -eq 0 ]; then
     echo "PASS: vinculum e2e"

@@ -17,6 +17,7 @@ members = [
     "vinculum-ctl",
     "vinculum-hid-wire",
     "vinculum-sdp",
+    "vinculum-gatt",
 ]
 
 [workspace.package]

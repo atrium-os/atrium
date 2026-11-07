@@ -1,5 +1,9 @@
-//! The Classic HID host and the hand-off to Tactus (docs/spec/bluetooth.md
-//! §10).
+//! The HID host (Classic, and HID over GATT on LE) and the hand-off to
+//! Tactus (docs/spec/bluetooth.md §10).
+//!
+//! LE links run [`vinculum_gatt::Hogp`] on the ATT channel instead of SDP
+//! and L2CAP channels; the rest (Attach, reports, Detach) is shared, plus
+//! `Battery` from the Battery service.
 //!
 //! For each bonded Classic link that comes up encrypted: ask the device's
 //! SDP server for its HID record (the report descriptor) and its PnP
@@ -32,6 +36,7 @@ use std::time::Duration;
 use vinculum_control::Addr;
 use vinculum_hid_wire::{self as bt, Kind, ReportHeader, ToTactus, ToVinculum};
 use vinculum_host::{Host, HostEvent};
+use vinculum_gatt::{Hogp, Out as GattOut, ATT_CID};
 use vinculum_sdp::{self as sdp, attr, uuid, Query};
 
 pub const PSM_CONTROL: u16 = 0x0011;
@@ -111,6 +116,9 @@ struct Link {
     ctrl: Option<Chan>,
     intr: Option<Chan>,
     device: Option<Device>,
+    /// LE: HID over GATT on the ATT channel instead of SDP and channels.
+    gatt: Option<Hogp>,
+    battery: Option<u8>,
 }
 
 struct Tactus {
@@ -204,8 +212,95 @@ impl Hid {
             ctrl: None,
             intr: None,
             device: None,
+            gatt: None,
+            battery: None,
         };
         self.links.insert(handle, link);
+    }
+
+    /// A bonded LE link is encrypted: run HID over GATT on it.
+    pub fn start_le(&mut self, host: &mut Host, handle: u16, addr: Addr, name: &str, keyboard_allowed: bool, now: u64) {
+        if !self.enabled() || self.links.contains_key(&handle) {
+            return;
+        }
+        let mut gatt = Hogp::new();
+        let outs = gatt.start(now);
+        let link = Link {
+            addr,
+            incoming: false,
+            keyboard_allowed,
+            record: bt::Record { name: name.to_string(), vendor: 0, product: 0, version: 0 },
+            sdp: None,
+            sdp_done: true,
+            descriptor: None,
+            report_ids: false,
+            ctrl: None,
+            intr: None,
+            device: None,
+            gatt: Some(gatt),
+            battery: None,
+        };
+        self.links.insert(handle, link);
+        self.gatt_outs(host, handle, outs, now);
+    }
+
+    /// An ATT PDU on an LE link; false if we are not running HOGP there.
+    pub fn on_att(&mut self, host: &mut Host, handle: u16, pdu: &[u8], now: u64) -> bool {
+        let Some(g) = self.links.get_mut(&handle).and_then(|l| l.gatt.as_mut()) else { return false };
+        let outs = g.on_pdu(pdu, now);
+        self.gatt_outs(host, handle, outs, now);
+        true
+    }
+
+    fn gatt_outs(&mut self, host: &mut Host, handle: u16, outs: Vec<GattOut>, now: u64) {
+        let ts_ns = monotonic_ns();
+        for o in outs {
+            match o {
+                GattOut::Send(p) => {
+                    let _ = host.send_l2cap(handle, ATT_CID, &p, now);
+                }
+                GattOut::Ready(dev) => {
+                    let Some(l) = self.links.get_mut(&handle) else { return };
+                    l.record.vendor = dev.vendor;
+                    l.record.product = dev.product;
+                    l.record.version = dev.version;
+                    l.battery = dev.battery;
+                    l.descriptor = Some(dev.report_map);
+                    self.attach(handle);
+                }
+                GattOut::Report { id, data } => self.deliver(handle, Kind::Input, id, &data, ts_ns),
+                GattOut::Battery(p) => {
+                    let Some(l) = self.links.get_mut(&handle) else { return };
+                    if l.battery != Some(p) {
+                        eprintln!("vinculumd: {}: battery {p}%", l.addr);
+                    }
+                    l.battery = Some(p);
+                    if let Some(id) = l.device.as_ref().map(|d| d.id) {
+                        self.send_tactus(&ToTactus::Battery { device: id, percent: p });
+                    }
+                }
+                GattOut::Failed(why) => {
+                    if let Some(l) = self.links.remove(&handle) {
+                        eprintln!("vinculumd: {}: HID over GATT: {why}", l.addr);
+                        if let Some(d) = l.device {
+                            self.detach(d);
+                        }
+                    }
+                    return;
+                }
+            }
+        }
+    }
+
+    /// The earliest ATT transaction timeout.
+    pub fn deadline(&self) -> Option<u64> {
+        self.links.values().filter_map(|l| l.gatt.as_ref()?.deadline()).min()
+    }
+
+    /// Links whose ATT transaction timed out: ATT is dead there (Vol 3
+    /// Part F §3.3.3), so the caller drops them.
+    pub fn timed_out(&self, now: u64) -> Vec<u16> {
+        self.links.iter().filter(|(_, l)| l.gatt.as_ref().and_then(|g| g.deadline()).is_some_and(|d| now >= d)).map(|(h, _)| *h).collect()
     }
 
     /// The link is gone.
@@ -308,10 +403,16 @@ impl Hid {
             (true, None) => return,
             (false, _) => (0, body),
         };
+        let report = report.to_vec();
+        self.deliver(handle, kind, report_id, &report, ts_ns);
+    }
+
+    /// Writes one report to the device's fd without blocking.
+    fn deliver(&mut self, handle: u16, kind: Kind, report_id: u8, report: &[u8], ts_ns: u64) {
         if report.len() + bt::HEADER_LEN > bt::MAX_PACKET {
             return;
         }
-        let Some(d) = l.device.as_mut() else { return };
+        let Some(d) = self.links.get_mut(&handle).and_then(|l| l.device.as_mut()) else { return };
         let fd = d.fd.as_raw_fd();
         if d.dropped > 0 {
             let note = bt::packet(ReportHeader { kind: Kind::Dropped, report_id: 0, ts_ns }, &d.dropped.to_le_bytes());
@@ -441,7 +542,10 @@ impl Hid {
     }
 
     fn ready(l: &Link) -> bool {
-        l.descriptor.is_some() && l.ctrl.is_some_and(|c| c.open) && l.intr.is_some_and(|c| c.open)
+        match &l.gatt {
+            Some(g) => l.descriptor.is_some() && g.is_ready(),
+            None => l.descriptor.is_some() && l.ctrl.is_some_and(|c| c.open) && l.intr.is_some_and(|c| c.open),
+        }
     }
 
     /// Hands a complete device to tactusd, if it is connected.
@@ -462,7 +566,11 @@ impl Hid {
         };
         let id = self.next_device;
         self.next_device += 1;
-        let msgs = ToTactus::attach(id, l.record.clone(), bt::Transport::Classic, l.keyboard_allowed, l.descriptor.as_deref().expect("ready"));
+        let transport = if l.gatt.is_some() { bt::Transport::Le } else { bt::Transport::Classic };
+        let mut msgs = ToTactus::attach(id, l.record.clone(), transport, l.keyboard_allowed, l.descriptor.as_deref().expect("ready"));
+        if let Some(p) = l.battery {
+            msgs.push(ToTactus::Battery { device: id, percent: p });
+        }
         eprintln!("vinculumd: {}: HID device {id} {:?} to tactusd", l.addr, l.record.name);
         l.device = Some(Device { id, fd: ours, dropped: 0 });
         let t = self.tactus.as_mut().expect("checked");
@@ -557,6 +665,16 @@ impl Hid {
             return;
         }
         let Some((h, report)) = bt::parse_packet(&buf[..n as usize]) else { return };
+        if let Some(g) = &l.gatt {
+            // LE: output reports as Write Commands; feature reports are not
+            // carried yet (B4).
+            if h.kind == Kind::Output {
+                if let Some(p) = g.output(h.report_id, report) {
+                    let _ = host.send_l2cap(handle, ATT_CID, &p, now);
+                }
+            }
+            return;
+        }
         let (header, cid) = match h.kind {
             Kind::Output => (hidp::DATA_OUTPUT, l.intr),
             Kind::FeatureSet => (hidp::SET_REPORT_FEATURE, l.ctrl),

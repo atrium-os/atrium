@@ -15,6 +15,7 @@ vinculum-smp = { path = "../vinculum-smp" }
 vinculum-keys = { path = "../vinculum-keys" }
 vinculum-control = { path = "../vinculum-control" }
 vinculum-sdp = { path = "../vinculum-sdp" }
+vinculum-gatt = { path = "../vinculum-gatt" }
 vinculum-hid-wire = { path = "../vinculum-hid-wire" }
 zeroize = "1"
 libc = "0.2"
