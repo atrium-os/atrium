@@ -1,6 +1,6 @@
 # Vinculum: the Bluetooth service
 
-**Status:** proposal, 2026-11-07. Decisions in §16 pending. **Owner:** the Bluetooth thread.
+**Status:** proposal, 2026-11-07. Decisions in §16 pending (9 since 2026-11-07). **Owner:** the Bluetooth thread.
 Interfaces agreed with the input thread (Tactus, [atrium-input.md](atrium-input.md) rev. 2 §3.3)
 and to be agreed with the audio thread ([lyra-v1.md](lyra-v1.md)).
 
@@ -152,6 +152,39 @@ other end goes to `vinculumd` over its transport socket (peer uid `_vinculum-hci
 and owners see their channels close; the supervisor restarts it and it reloads firmware. If
 `vinculumd` exits, the transports reset their controllers (so no link survives without a host
 that knows its keys) and every owner's channel closes.
+
+### 4.1 Vanilla FreeBSD: the same stack, without Atrium
+
+Vinculum is built so a stock FreeBSD machine can use it too, like Tessera and Laminar
+(Shankar, 2026-11-07). FreeBSD's own Bluetooth has the gaps of §1 on every FreeBSD laptop,
+and because the stack needs no kernel code and no base changes, it can ship as a port
+(`comms/vinculum`). This follows the portability doctrine ([portability.md](portability.md)):
+a portable core behind a thin seam, with Atrium as one host of it.
+
+**The rule:** the protocol crates and the three programs depend on no Atrium crate. Everything
+Atrium-specific sits behind six small traits in `vinculumd` and `vinculum-audio`, each with
+an Atrium implementation and a plain FreeBSD one, picked at build time (cargo feature `atrium`)
+and at start (config file). CI builds and tests the core with the `atrium` feature off.
+
+| seam | on Atrium | on stock FreeBSD |
+|---|---|---|
+| **key store** | Arca machine store (§9) | `/var/db/vinculum/keys`, mode 0600, owned by the `vinculum` user, sealed with a machine key in a separate root-only file |
+| **process start and confinement** | portcullisd jails, services.d, `_vinculum*` users | an `rc.d` script; the same three processes as their own users, each in Capsicum after start; an optional jail per process for those who want it |
+| **controller discovery** | `atrium-devevents` → portcullisd starts `vinculum-hci` | a `devd` rule starts `vinculum-hci` for the `ugen` node; `devmatch_blocklist="ng_ubt"` in `rc.conf` stops the kernel driver taking the controller |
+| **HID sink** | tactusd over the §10 socket | a `vinculum-hid` adapter that turns the §10 channel into what stock desktops read today: an `evdev` `uinput` device (what libinput, Xorg and Wayland compositors consume) and `vkbd` for the console, as `bthidd` does |
+| **audio sink** | lyrad external device (§11) | a `cuse`/`virtual_oss` output, so any OSS program plays to the headphones as a `/dev/dsp` |
+| **control and pairing UI** | `bluetooth-control` socket, Curia and the Forum bar | the same socket and wire, with `vinculum-ctl` (CLI and a pairing agent); a desktop can write its own GUI against the wire |
+
+Atrium-only, by design: the app `bluetooth` capability and chooser (§12) need Portcullis's
+launch registry; on stock FreeBSD apps get nothing beyond the control socket, which root
+can grant by group. The security defaults of §7, the transport split (§5.3) and the parsers
+are the same on both, so stock FreeBSD gets the security work too.
+
+Where the code lives: in this repo under `vinculum/`, as its own workspace with no path
+dependency outside it, so it can move to a separate repository (or be offered to FreeBSD
+as a port) without changes. Rust in FreeBSD base is not settled upstream, so a port is the
+realistic route; base would also need its netgraph Bluetooth kept for compatibility, which
+is upstream's call, not ours.
 
 ## 5. Transport and firmware: `vinculum-hci`
 
@@ -470,6 +503,13 @@ firmware, UART, Auracast, OBEX come after.
    Mac's HVF VM; plus whichever Bluetooth keyboard, mouse and headphones you already have.
 8. **The name Vinculum** (`vinculumd`, `vinculum-hci`, `vinculum-audio`). If agreed it goes
    into `docs/NAMING.md`.
+
+9. **Usable on stock FreeBSD** (§4.1): the core depends on no Atrium crate, Atrium parts
+   sit behind six seams with plain FreeBSD versions (file key store, rc.d + Capsicum,
+   devd, evdev/vkbd for HID, cuse/virtual_oss for audio, a CLI for pairing), CI builds it without Atrium, and
+   it ships as a port. *Recommend yes;* the cost is a trait per seam and a second, small
+   implementation of each, and the FreeBSD gap it fills is real. The app capability and
+   chooser stay Atrium-only.
 
 ## References
 
