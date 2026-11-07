@@ -345,6 +345,14 @@ The smallest kernel change that fixes that:
 - **Where it lives:** a patch in our FreeBSD fork, in C because it sits in
   `syscallenter()`, a few hundred lines. Worth offering upstream as a jail feature. Effort:
   2–4 weeks for the mechanism and VM tests, then a few weeks of profiles.
+- **Performance is a hard requirement** (Shankar 2026-11-07: jails are prized for running at
+  near-native speed, and this must not change that). So: no interpreter (no BPF) on the
+  syscall path; a jail with no filter takes the existing path unchanged (one predictable
+  branch); a filtered syscall costs one bit test on data already in cache, and argument
+  checks run only inside `ioctl`/`setsockopt`, never on other calls. Gate before merge:
+  LMbench `lat_syscall` and a `getpid`/`read` loop within noise (target under 1%), and the
+  existing Navigator, Fresco and Tessera benchmarks unchanged, on arm64 and amd64, filter
+  off and on.
 - **What it will not do:** calls every app needs (kqueue, poll/select, unix sockets, mmap)
   stay reachable, and so do their bugs. The design note should count, from the data file,
   how many A rows each candidate profile would have closed.
