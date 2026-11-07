@@ -6,8 +6,10 @@
 //! socket. Runs jailed as `_tactus` with only the input device nodes
 //! and its socket directory.
 //!
-//! Sources today: hidbus through `/dev/hidraw*` (USB and I2C). PS/2
-//! and Bluetooth HID are later steps (spec §8, T4/T6).
+//! Sources today: hidbus through `/dev/hidraw*` (USB and I2C), and
+//! Bluetooth HID devices that vinculumd hands over (bluetooth.md §10):
+//! one SEQPACKET fd per device, read like a hidraw node. PS/2 is a later
+//! step (spec §8, T4).
 //!
 //! Usage:
 //!   tactusd [--socket PATH]   serve (default /atrium/sockets/tactus/tactus.sock)
@@ -16,11 +18,14 @@
 //!
 //! Environment: TACTUS_PEERS (uids allowed to connect, comma-separated, or
 //! `any`; default 65010 (_frescod) and 0), TACTUS_REPEAT,
-//! TACTUS_POINTER (see tactus::repeat / tactus::pointer).
+//! TACTUS_POINTER (see tactus::repeat / tactus::pointer),
+//! TACTUS_BLUETOOTH_SOCKET (vinculumd's HID socket, default
+//! /atrium/sockets/bluetooth-hid/hid.sock; `off` to not connect).
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs::File;
-use std::io::Read;
+use std::io::{Read, Write};
+use std::os::fd::OwnedFd;
 use std::os::unix::io::AsRawFd;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::sync::{Arc, Condvar, Mutex};
@@ -32,6 +37,7 @@ use tactus::pointer::{Curve, Stage};
 use tactus::repeat::{Repeat, Settings};
 use tactus::touchpad::{Out as TouchOut, Settings as TouchSettings, Touchpad};
 use tactus::wire::{self, Bus, Message};
+use vinculum_hid_wire as bt;
 
 const DEFAULT_SOCKET: &str = "/atrium/sockets/tactus/tactus.sock";
 const MAX_HIDRAW: u32 = 64;
@@ -200,20 +206,50 @@ fn scan(hub: &Arc<Hub>, devs: &Arc<Mutex<Devices>>) {
     }
 }
 
-fn read_device(hub: &Hub, id: u32, mut file: File, mut dec: Decoder) {
+fn read_device(hub: &Hub, id: u32, mut file: File, dec: Decoder) {
+    run_device(hub, id, dec, true, |buf| match file.read(buf) {
+        Ok(0) | Err(_) => Got::Gone,
+        Ok(n) => Got::Report(n),
+    });
+}
+
+/// What a source's read gave.
+enum Got {
+    /// A report of this many bytes, report id first if the descriptor
+    /// uses ids (as hidraw gives it).
+    Report(usize),
+    /// The source lost reports: release what is held.
+    Dropped,
+    /// Nothing this time (a packet that is not an input report).
+    Skip,
+    Gone,
+}
+
+/// Reads one device until it goes away, decoding and sending its events.
+/// `keyboard`: false drops keyboard-page keys (a Bluetooth bond without
+/// keyboard rights, bluetooth.md §7).
+fn run_device(hub: &Hub, id: u32, mut dec: Decoder, keyboard: bool, mut read: impl FnMut(&mut [u8]) -> Got) {
     let mut stage = Stage::new(hub.curve);
     let mut pad = Touchpad::new(TouchSettings::default());
     let mut buf = vec![0u8; 65536];
     let mut ev = Vec::new();
     loop {
-        let n = match file.read(&mut buf) {
-            Ok(0) | Err(_) => break,
-            Ok(n) => n,
+        let n = match read(&mut buf) {
+            Got::Gone => break,
+            Got::Skip => continue,
+            Got::Dropped => {
+                release(hub, id, &mut dec, &mut ev, keyboard);
+                continue;
+            }
+            Got::Report(n) => n,
         };
         let ts_ns = wire::now_ns();
         let now = Instant::now();
         ev.clear();
         dec.report(&buf[..n], &mut ev);
+        if !keyboard {
+            ev.retain(|e| !matches!(e, Input::Key { usage, .. } if usage >> 16 == 0x07));
+        }
         if ev.is_empty() {
             continue;
         }
@@ -258,8 +294,22 @@ fn read_device(hub: &Hub, id: u32, mut file: File, mut dec: Decoder) {
         hub.wake.notify_all();
     }
     // Gone: release what it held, then say so.
+    release(hub, id, &mut dec, &mut ev, keyboard);
+    let mut s = hub.state.lock().unwrap();
+    s.devices.remove(&id);
+    s.send(&Message::Gone { id });
+    hub.wake.notify_all();
+}
+
+/// Releases every key and button device `id` holds and stops its repeat
+/// (keyboard keys only if they were sent: `keyboard`).
+fn release(hub: &Hub, id: u32, dec: &mut Decoder, ev: &mut Vec<Input>, keyboard: bool) {
     let ts_ns = wire::now_ns();
-    dec.release_all(&mut ev);
+    ev.clear();
+    dec.release_all(ev);
+    if !keyboard {
+        ev.retain(|e| !matches!(e, Input::Key { usage, .. } if usage >> 16 == 0x07));
+    }
     let mut s = hub.state.lock().unwrap();
     s.repeat.gone(id);
     for e in ev.drain(..) {
@@ -269,8 +319,6 @@ fn read_device(hub: &Hub, id: u32, mut file: File, mut dec: Decoder) {
             _ => {}
         }
     }
-    s.devices.remove(&id);
-    s.send(&Message::Gone { id });
     hub.wake.notify_all();
 }
 
@@ -287,6 +335,160 @@ fn repeat_loop(hub: &Hub) {
             None => hub.wake.wait(s).unwrap(),
         };
     }
+}
+
+// ---- Bluetooth HID (bluetooth.md §10) --------------------------------
+
+const BT_SOCKET: &str = "/atrium/sockets/bluetooth-hid/hid.sock";
+
+/// Connects to vinculumd's HID socket, retrying every 2 s while the
+/// Bluetooth service is down or absent.
+fn bluetooth(hub: &Arc<Hub>, devs: &Arc<Mutex<Devices>>, path: &str) {
+    let mut said = false;
+    loop {
+        match UnixStream::connect(path) {
+            Ok(c) => {
+                eprintln!("tactusd: Bluetooth HID from {path}");
+                said = false;
+                let e = bt_session(hub, devs, c);
+                eprintln!("tactusd: Bluetooth HID connection ended: {e}");
+            }
+            Err(e) if !said => {
+                eprintln!("tactusd: no Bluetooth HID at {path} ({e}); retrying");
+                said = true;
+            }
+            Err(_) => {}
+        }
+        std::thread::sleep(Duration::from_secs(2));
+    }
+}
+
+/// A device whose descriptor is still arriving.
+struct BtPending {
+    fd: OwnedFd,
+    record: bt::Record,
+    keyboard_allowed: bool,
+    len: usize,
+    desc: Vec<u8>,
+}
+
+fn bt_session(hub: &Arc<Hub>, devs: &Arc<Mutex<Devices>>, mut c: UnixStream) -> std::io::Error {
+    if let Err(e) = c.write_all(&bt::encode(&bt::ToVinculum::Hello { version: bt::VERSION })) {
+        return e;
+    }
+    let mut r = bt::Reader::default();
+    // Fds arrive with the first byte of their Attach, so in Attach order.
+    let mut fds: VecDeque<OwnedFd> = VecDeque::new();
+    let mut pending: HashMap<u64, BtPending> = HashMap::new();
+    let mut buf = vec![0u8; 2 * bt::MAX_MESSAGE];
+    loop {
+        let (n, got) = match bt::recv_with_fd(&c, &mut buf) {
+            Ok((0, _)) => return std::io::Error::new(std::io::ErrorKind::UnexpectedEof, "vinculumd closed"),
+            Ok(x) => x,
+            Err(e) => return e,
+        };
+        fds.extend(got);
+        r.push(&buf[..n]);
+        loop {
+            let m = match r.next::<bt::ToTactus>() {
+                Ok(Some(m)) => m,
+                Ok(None) => break,
+                Err(e) => return std::io::Error::other(format!("bad message from vinculumd: {e:?}")),
+            };
+            match m {
+                bt::ToTactus::Attach { device, record, transport, keyboard_allowed, descriptor_len, descriptor } => {
+                    let Some(fd) = fds.pop_front() else {
+                        return std::io::Error::other("Attach without an fd");
+                    };
+                    let len = descriptor_len as usize;
+                    if len > bt::MAX_DESCRIPTOR || descriptor.len() > len {
+                        eprintln!("tactusd: Bluetooth device {device:x}: bad descriptor length {len}");
+                        continue;
+                    }
+                    eprintln!("tactusd: Bluetooth device {device:x} {:?} ({transport:?})", record.name);
+                    pending.insert(device, BtPending { fd, record, keyboard_allowed, len, desc: descriptor });
+                }
+                bt::ToTactus::Descriptor { device, offset, bytes } => {
+                    let ok = pending
+                        .get_mut(&device)
+                        .is_some_and(|p| offset as usize == p.desc.len() && p.desc.len() + bytes.len() <= p.len);
+                    if !ok {
+                        eprintln!("tactusd: Bluetooth device {device:x}: descriptor chunk out of order; dropped");
+                        pending.remove(&device);
+                        continue;
+                    }
+                    pending.get_mut(&device).unwrap().desc.extend(bytes);
+                }
+                // Its fd reaches EOF too, which ends its reader.
+                bt::ToTactus::Detach { device } => {
+                    pending.remove(&device);
+                }
+                bt::ToTactus::Battery { .. } => {}
+            }
+        }
+        let done: Vec<u64> = pending.iter().filter(|(_, p)| p.desc.len() == p.len).map(|(&d, _)| d).collect();
+        for d in done {
+            let p = pending.remove(&d).unwrap();
+            bt_start(hub, devs, d, p);
+        }
+    }
+}
+
+fn bt_start(hub: &Arc<Hub>, devs: &Arc<Mutex<Devices>>, device: u64, p: BtPending) {
+    let Some(desc) = Descriptor::parse(&p.desc) else {
+        eprintln!("tactusd: Bluetooth device {device:x}: descriptor did not parse");
+        return;
+    };
+    let dec = Decoder::new(desc);
+    if !dec.decodes_anything() {
+        eprintln!("tactusd: Bluetooth device {device:x}: nothing to decode");
+        return;
+    }
+    let id = {
+        let mut d = devs.lock().unwrap();
+        d.next_id += 1;
+        d.next_id
+    };
+    let classes = dec.descriptor().classes();
+    let bt::Record { name, vendor, product, .. } = p.record;
+    eprintln!(
+        "tactusd: device {id} bluetooth:{device:x}: {name:?} {vendor:04x}:{product:04x} {classes:?}{}",
+        if p.keyboard_allowed { "" } else { " (no keyboard rights)" }
+    );
+    let rec = Message::Device { id, bus: Bus::Bluetooth, classes, vendor, product, name };
+    {
+        let mut s = hub.state.lock().unwrap();
+        s.send(&rec);
+        s.devices.insert(id, rec);
+    }
+    let hub = hub.clone();
+    let keyboard = p.keyboard_allowed;
+    let mut file = File::from(p.fd);
+    let _ = std::thread::Builder::new().name(format!("tactus:bt:{device:x}")).spawn(move || {
+        let mut pkt = vec![0u8; bt::MAX_PACKET];
+        run_device(&hub, id, dec, keyboard, |buf| {
+            let n = match file.read(&mut pkt) {
+                Ok(0) | Err(_) => return Got::Gone,
+                Ok(n) => n,
+            };
+            match bt::parse_packet(&pkt[..n]) {
+                Some((h, report)) if h.kind == bt::Kind::Input => {
+                    // The common decoder takes reports as hidraw gives them:
+                    // report id first when the descriptor uses ids.
+                    let off = usize::from(h.report_id != 0);
+                    if off + report.len() > buf.len() {
+                        return Got::Skip;
+                    }
+                    buf[0] = h.report_id;
+                    buf[off..off + report.len()].copy_from_slice(report);
+                    Got::Report(off + report.len())
+                }
+                Some((h, _)) if h.kind == bt::Kind::Dropped => Got::Dropped,
+                _ => Got::Skip,
+            }
+        });
+        eprintln!("tactusd: device {id} bluetooth:{device:x} gone");
+    });
 }
 
 // ---- clients ---------------------------------------------------------
@@ -386,6 +588,13 @@ fn main() {
     {
         let hub = hub.clone();
         std::thread::spawn(move || repeat_loop(&hub));
+    }
+    {
+        let (hub, devs) = (hub.clone(), devs.clone());
+        let path = std::env::var("TACTUS_BLUETOOTH_SOCKET").ok().filter(|s| !s.is_empty()).unwrap_or_else(|| BT_SOCKET.into());
+        if path != "off" {
+            std::thread::spawn(move || bluetooth(&hub, &devs, &path));
+        }
     }
     scan(&hub, &devs);
     hotplug(&hub, &devs);

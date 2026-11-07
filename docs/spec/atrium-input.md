@@ -492,6 +492,14 @@ zoomable views. The wire to apps stays HID-faithful.
    keyboard and plain mouse path.
 5. **T5 Gamepads.** Rev. 1 §4.4/§5.3, plus exclusive grants.
 6. **T6 Bluetooth HID source**, once the Bluetooth service exists.
+   *Built (tactusd side, 2026-11-07):* tactusd connects to vinculumd's
+   `hid.sock` (`TACTUS_BLUETOOTH_SOCKET`, retry every 2 s) with the
+   `vinculum-hid-wire` crate, takes each Attach's fd and descriptor
+   (chunks included), prepends the report id and feeds the same decoder
+   as hidraw; `Dropped` releases what the device holds; a bond without
+   keyboard rights (bluetooth.md §7) gets no keyboard-page keys. Tested
+   against a stand-in vinculumd (`tactus/tests/bluetooth.rs`); the
+   end-to-end run waits on vinculumd's Classic HID (B3).
 7. **Later:** touch screens and pens, CLASS_INPUT for the app wire,
    accessibility consumers (sticky keys, slow keys sit in Tactus).
 

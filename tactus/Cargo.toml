@@ -18,6 +18,7 @@ path = "src/bin/tactusd.rs"
 serde    = { version = "1", features = ["derive"] }
 postcard = { version = "1", features = ["use-std"] }
 libc     = "0.2"
+vinculum-hid-wire = { path = "../vinculum/vinculum-hid-wire" }
 
 [target.'cfg(target_os = "freebsd")'.dependencies]
 atrium-devevents = { path = "../atrium-devevents" }
