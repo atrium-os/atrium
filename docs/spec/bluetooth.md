@@ -175,6 +175,20 @@ and at start (config file). CI builds and tests the core with the `atrium` featu
 | **audio sink** | lyrad external device (§11) | a `cuse`/`virtual_oss` output, so any OSS program plays to the headphones as a `/dev/dsp` |
 | **control and pairing UI** | `bluetooth-control` socket, Curia and the Forum bar | the same socket and wire, with `vinculum-ctl` (CLI and a pairing agent); a desktop can write its own GUI against the wire |
 
+**Living next to FreeBSD's own stack.** A controller has one host: two stacks issuing HCI
+commands to one controller would fight over its state. So on stock FreeBSD each controller
+is owned either by the netgraph stack or by Vinculum, never both. Vinculum takes a
+controller when `ng_ubt` is not attached to it (blocklisted in `rc.conf`, or detached with
+`devctl detach` for one controller) and the `devd` rule starts `vinculum-hci` on its `ugen`
+node; the same rule must not also run FreeBSD's `iwmbtfw`/`rtlbtfw`, since `vinculum-hci`
+loads the firmware itself. A machine with two controllers can run one of each. Programs
+written for FreeBSD's sockets (`hccontrol`, `bthidd`, `sdpd`, `obexapp`, `virtual_oss`'s
+Bluetooth path) keep working on netgraph-owned controllers and do not see Vinculum's; there
+is no `AF_BLUETOOTH` emulation, because it would bring back the kernel-shaped API this design
+leaves. In the `ng_ubt` fallback of §2.3, the kernel driver stays attached but its hook is
+connected to an `ng_socket` that `vinculum-hci` reads, instead of to `ng_hci`, so that
+controller too belongs to Vinculum alone.
+
 Atrium-only, by design: the app `bluetooth` capability and chooser (§12) need Portcullis's
 launch registry; on stock FreeBSD apps get nothing beyond the control socket, which root
 can grant by group. The security defaults of §7, the transport split (§5.3) and the parsers
