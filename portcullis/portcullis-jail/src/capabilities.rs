@@ -312,6 +312,7 @@ mod tests {
             instance: None,
             persist: true,
             host_identity: portcullis_identity::derive(&[7u8; 32], "org.atrium.test"),
+            sysfil: None,
         }
     }
 

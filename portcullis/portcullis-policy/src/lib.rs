@@ -194,6 +194,9 @@ pub struct CapabilityDelta {
     pub audio_device:    bool,
     pub net_fetch:       bool,
     pub tessera_cas_read: bool,
+    /// The manifest asks for the `terminal` system call class, which is
+    /// wider than an app's (jail-sysfil.md §5.2).
+    pub syscalls_terminal: bool,
     /// Filesystem paths in manifest but not in granted list.
     pub filesystem_added: Vec<String>,
     /// Font paths in manifest but not in granted list.
@@ -224,6 +227,7 @@ impl CapabilityDelta {
             && !self.audio_device
             && !self.net_fetch
             && !self.tessera_cas_read
+            && !self.syscalls_terminal
             && self.filesystem_added.is_empty()
             && self.fonts_added.is_empty()
             && self.network_upgrade.is_none()
@@ -255,6 +259,7 @@ impl CapabilityDelta {
         if self.audio_device    { out.push("Add a sound output and play the system's sound through it".into()); }
         if self.net_fetch       { out.push("Fetch from the internet through the system's fetcher (no direct network access)".into()); }
         if self.tessera_cas_read{ out.push("Read the global Tessera CAS (privileged)".into()); }
+        if self.syscalls_terminal { out.push("Run other programs and control terminals (the terminal system call profile)".into()); }
         for p in &self.filesystem_added {
             out.push(format!("Read and write {p}"));
         }
@@ -337,6 +342,14 @@ pub fn compute_delta(
     bool_cap!(audio_device);
     bool_cap!(net_fetch);
     bool_cap!(tessera_cas_read);
+
+    /* Only `terminal` widens what the app may call; the other classes
+     * narrow it and need no consent. */
+    if requested.syscalls.as_deref() == Some("terminal")
+        && g.and_then(|c| c.syscalls.as_deref()) != Some("terminal")
+    {
+        d.syscalls_terminal = true;
+    }
 
     if let Some(req_paths) = &requested.filesystem {
         let granted_paths: Vec<&String> = g
@@ -508,6 +521,7 @@ mod tests {
             audio_device: None,
             net_fetch: None,
             net_fetch_sites: None,
+            syscalls: None,
             extra:      Default::default(),
         }
     }
@@ -590,6 +604,22 @@ mod tests {
         assert_eq!(h1, h2);
         assert!(h1.starts_with("sha256:"));
         assert_ne!(h1, hash_manifest(b"world"));
+    }
+
+    #[test]
+    fn only_the_terminal_syscall_class_asks_for_consent() {
+        let mut req = caps_full();
+        let granted = caps_full();
+        for narrowing in ["renderer", "app", "networked"] {
+            req.syscalls = Some(narrowing.into());
+            assert!(!compute_delta(&req, Some(&granted), None, "h").syscalls_terminal, "{narrowing}");
+        }
+        req.syscalls = Some("terminal".into());
+        let d = compute_delta(&req, Some(&granted), None, "h");
+        assert!(d.syscalls_terminal && !d.is_empty());
+        let mut g2 = caps_full();
+        g2.syscalls = Some("terminal".into());
+        assert!(!compute_delta(&req, Some(&g2), None, "h").syscalls_terminal);
     }
 
     // ---- system policy + decide ----

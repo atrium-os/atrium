@@ -226,9 +226,29 @@ a cycle check and a depth limit of 8). They are checked with log mode (§3.5).
 ### 5.2 Where the class comes from
 
 Portcullis decides, not the app. The manifest's `[capabilities] syscalls = "<class>"` names
-the class; `network` implies `networked`; `terminal` is a restricted capability that only
-system bundles and user-approved apps get, like `window-management`. System bundles
-(renderers, Nuntius, Navigator workers) name theirs in their own manifests.
+the class; without it, a `network` capability other than `none` means `networked`, and
+anything else is `app` (`portcullis_jail::sysfil_class`). `renderer`, `app` and
+`networked` only narrow what the app can call and ask for no consent; `terminal` widens it,
+so it is a consent item like a new capability (`CapabilityDelta::syscalls_terminal`: "Run
+other programs and control terminals"). System bundles (renderers, Nuntius, Navigator
+workers) name theirs in their own manifests. A class name that is not lowercase letters,
+digits, `-` and `_` is a manifest error; one the policy does not define fails the launch.
+
+Both launch paths apply it:
+
+- **Named app launches** (`portcullisd::launch`, through jail(8)): portcullisd resolves the
+  class from jaild's policy file (`/etc/atrium/jaild.policy.toml`) and
+  `portcullis_jail::build` renders the lists as `sysfil.*` lines in the jail.conf section,
+  so jail(8) passes them to `jail_set(2)` with the rest and the filter exists before
+  jail(8) attaches the app. jail(8)'s child then runs `setgid`, `setusercontext(3)` and
+  `execvp` inside the filtered jail, which is why the base profile also allows what
+  `setusercontext` calls.
+- **One-shot workers** (`portcullis-oneshot`, through jaild): the class goes on
+  `CreateJailRequest.syscall_profile` and jaild resolves it (§5.3).
+
+Both drop the filter, with a warning, on a kernel without sysfil, unless
+`policy.sysfil.required` is set, in which case the launch is refused. The `portcullis` dev
+CLI launches unfiltered.
 
 ### 5.3 jaild
 
@@ -280,14 +300,16 @@ The kernel patch is written to be offered to FreeBSD as it is:
 | design note and advisory scoring | this document |
 | kernel mechanism (syscalls, ioctls, sockopts, families, largepage, log/deny/kill, inherit-and-narrow, read-back) | done; atrium-os/freebsd-src `atrium-os` 93437440e; amd64 GENERIC-NODEBUG builds with `-Werror` |
 | ATF tests | 13/13 pass under kyua on the patched amd64 kernel (cloud VM, TCG) |
-| stock jail tests (`tests/sys/kern/jail*`, `usr.sbin/jail`) on the patched kernel | see below |
+| stock jail tests (`tests/sys/kern/jail*`, `usr.sbin/jail`) on the patched kernel | 28/28 pass (jailmeta `keyvalue` and `keyvalue_contention` excluded: they hang the unpatched kernel the same way, see below). The first run found a sysfil bug: `jls -n` failed on every jail because the eight sysfil strings (16 KB each) overflowed the 64 KB a `jail_get(2)` request may carry. Fixed in 5cb2b284b (sizes from the longest read-back, static assertion, ATF case `all_params`); the ATF suite is now 14/14 |
 | jaild + policy | done: 81 jaild unit tests and 8 jaild-policy tests pass in the VM, plus the `sysfil_reaches_the_kernel` round trip (jaild creates a filtered jail, `jls` reads the filter back) |
+| jail(8) launch path, as portcullisd renders it (`exec.clean`, `exec.system_jail_user`, `exec.jail_user`) | log mode found what `setusercontext(3)` calls after the attach (`setloginclass`, `setpriority`, `setrlimit`, `seteuid`, `setegid`), now in `base`; in deny mode `/bin/echo` and the Rust std probe then run as the app user with 0 denials |
 | profiles against real binaries | `app` in deny mode runs a Rust std probe (threads, files, sockets, timers, env, process) with 0 denials; `renderer` in deny mode runs `sysfil-bench` with 0 denials. Real Pergola apps, Fresco renderers and Nuntius: pending, through `learn.sh` |
-| Portcullis manifest `[capabilities] syscalls` to class | pending (jaild takes the class; Portcullis does not yet pass one) |
+| Portcullis manifest `[capabilities] syscalls` to class | done: schema, validation, consent for `terminal`, both launch paths; unit tests in portcullis-jail (`tests/sysfil.rs`, including every shipped app manifest resolving), portcullis-policy and jaild |
 | arm64 build and VM run | pending |
 | overhead, cloud TCG (sanity) | done, below |
 | overhead under 1%, HVF (Mac, arm64) and KVM (R9700, amd64) | pending |
 | Navigator, Fresco, Tessera benchmarks with the filter | pending |
+| shipped `policy.sysfil.mode` | **1 (log only)** until the profiles have been run against the real apps (Pergola apps, Fresco renderers, Lyra clients, the player, Nuntius); then 2 |
 | jail(8) man page section | pending |
 
 **Unfiltered path, by instruction count.** On amd64 the patch adds exactly three
@@ -325,9 +347,27 @@ cost on hardware, but it is the number to check first on HVF and KVM.
 - **No setuid transitions on exec in a filtered jail**, as capability mode already does
   (`kern_exec.c`). It would close SA-26:39, SA-26:32 and SA-24:06 even for `terminal`.
   Mounting app roots `nosuid` does the same from user space; jaild does not do that yet.
-- **Filter starts at exec** (§3.6): closes SA-26:39 and SA-26:13 for every app class.
+- **Filter starts at exec** (§3.6): closes SA-26:39 and SA-26:13 for every app class, and
+  takes the launcher's own calls (`setgroups`, `setuid`, `setloginclass`, `setrlimit` and the
+  rest of `setusercontext(3)`) out of every profile.
+- **No core dumps on the jail(8) path.** jaild sets `RLIMIT_CORE` to 0; jail(8) takes the
+  limit from the login class, so named app launches do not have the "+ no core dumps" rows
+  of §2 yet. A login class for app users with `coredumpsize=0` would do it.
 - **Narrowing a running jail** (§6).
 - **Socket-option level 0 is ambiguous.** `SOL_LOCAL` and `IPPROTO_IP` are both 0, so
   allowing `0:LOCAL_PEERCRED` (1) also allows `IP_OPTIONS` (1) on an inet socket. The
   profiles that allow inet sockets do not rely on the distinction today; a v2 check could
   key level 0 on the socket's domain.
+
+## 9. Found on the way: a jailmeta hang in the base system
+
+Not a sysfil bug, but found by the regression run. In `kern_jailmeta.c`,
+`jm_osd_method_get()` looks a key up with `while ((p = strstr(p, key)) != NULL) { …; p +=
+keylen; }`. For an empty key (the parameter `meta.` or `env.`), `strstr` returns `p` itself
+and `keylen` is 0, so the loop never ends, and it runs with `allprison_lock` held: every
+later jail operation on the machine blocks. During the jailmeta `keyvalue` tests a
+`jls -jj meta.` process spun in `kern_jail_get()` this way and wedged both the patched and
+the unpatched kernel in the cloud VM. `jail_get(2)` needs no privilege, so any local user can do this.
+To be reported to FreeBSD with a fix (refuse an empty key in the check and get methods),
+with Shankar's go-ahead.
+

@@ -9,4 +9,5 @@ description = "Translates an atrium.toml Manifest into a jail.conf section + mou
 [dependencies]
 portcullis-identity = { path = "../portcullis-identity" }
 portcullis-toml = { path = "../portcullis-toml" }
+jaild-policy    = { path = "../jaild-policy" }
 thiserror       = "1"

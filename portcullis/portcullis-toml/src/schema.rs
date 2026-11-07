@@ -156,6 +156,13 @@ pub struct Capabilities {
     /// that does not parse refuses the fetcher rather than run it unlimited.
     #[serde(rename = "net-fetch-sites")]
     pub net_fetch_sites: Option<Vec<String>>,
+    /// ★ The system call filter class the app's jail gets
+    /// (docs/spec/jail-sysfil.md §5): a profile name from the `[sysfil]`
+    /// section of jaild's policy, e.g. `renderer`. Absent: `networked` if the
+    /// app has a `network` capability, `app` otherwise. `terminal` (exec,
+    /// tty control) is restricted and asks for consent; the others only
+    /// narrow what the app can call.
+    pub syscalls: Option<String>,
     /// Unknown / future keys. Validator warns; doesn't reject.
     #[serde(flatten)]
     pub extra:      BTreeMap<String, toml::Value>,
@@ -288,6 +295,7 @@ pub fn merge_capabilities(base: &Capabilities, ovr: &Capabilities) -> Capabiliti
         audio_device:     ovr.audio_device.or(base.audio_device),
         net_fetch:        ovr.net_fetch.or(base.net_fetch),
         net_fetch_sites:  ovr.net_fetch_sites.clone().or_else(|| base.net_fetch_sites.clone()),
+        syscalls:         ovr.syscalls.clone().or_else(|| base.syscalls.clone()),
         extra:            {
             let mut e = base.extra.clone();
             for (k, v) in &ovr.extra { e.insert(k.clone(), v.clone()); }

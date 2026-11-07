@@ -61,6 +61,30 @@ pub fn resolve_sysfil(
     }
 }
 
+/// A resolved filter on a kernel that may not have sysfil. A stock kernel
+/// would refuse the `sysfil.*` parameters and fail the jail, so without the
+/// kernel side the filter is dropped with a warning, unless
+/// `policy.sysfil.required` says a jail without one must not be made.
+pub fn sysfil_on_this_kernel(
+    req: &CreateJailRequest,
+    policy: &Policy,
+    sysfil: Option<jaild_policy::SysfilParams>,
+    kernel_has_sysfil: bool,
+) -> Result<Option<jaild_policy::SysfilParams>, JaildError> {
+    match sysfil {
+        Some(_) if !kernel_has_sysfil && policy.sysfil.required => Err(JaildError::PolicyViolation {
+            rule:   "sysfil.kernel",
+            detail: format!("jail {:?}: this kernel has no system call filter and policy.sysfil.required is set", req.name),
+        }),
+        Some(_) if !kernel_has_sysfil => {
+            eprintln!("jaild: {}: kernel has no sysfil; creating without the {:?} filter",
+                      req.name, req.syscall_profile.as_deref().unwrap_or(""));
+            Ok(None)
+        }
+        s => Ok(s),
+    }
+}
+
 /// The synthetic host identity (portcullis.md §9.1c): a plain DNS-ish
 /// hostname, a non-zero hostid, and a lowercase 8-4-4-4-12 UUID. Values only —
 /// jaild cannot tell a synthetic identity from a real one, so this checks the
@@ -757,7 +781,7 @@ mod tests {
         assert_eq!(resolve_sysfil(&r, &p).unwrap(), None);
         r.syscall_profile = Some("renderer".into());
         let f = resolve_sysfil(&r, &p).unwrap().unwrap();
-        assert_eq!(f.mode, 2);
+        assert_eq!(f.mode, p.sysfil.mode);
         assert_eq!(f.families.as_deref(), Some("unix"));
         validate_create(&r, &p).unwrap();
         r.syscall_profile = Some("everything".into());
@@ -767,6 +791,24 @@ mod tests {
         p.sysfil.required = true;
         assert!(matches!(validate_create(&r, &p),
             Err(JaildError::PolicyViolation { rule: "sysfil.required", .. })));
+    }
+
+    /// ★ On a kernel without sysfil the filter is dropped (the jail would
+    /// otherwise fail on the unknown parameters) unless it is required.
+    #[test]
+    fn a_kernel_without_sysfil_drops_the_filter_unless_required() {
+        let mut p = load_sample_policy();
+        let mut r = instance_req("app-org-atrium-navigator-worker--1",
+            "/var/lib/atrium/jails/app-org-atrium-navigator-worker--1",
+            "/bin/navigator-worker", true);
+        r.syscall_profile = Some("renderer".into());
+        let f = resolve_sysfil(&r, &p).unwrap();
+        assert!(sysfil_on_this_kernel(&r, &p, f.clone(), true).unwrap().is_some());
+        assert_eq!(sysfil_on_this_kernel(&r, &p, f.clone(), false).unwrap(), None);
+        p.sysfil.required = true;
+        assert!(matches!(sysfil_on_this_kernel(&r, &p, f, false),
+            Err(JaildError::PolicyViolation { rule: "sysfil.kernel", .. })));
+        assert_eq!(sysfil_on_this_kernel(&r, &p, None, false).unwrap(), None);
     }
 
     /// ★ A one-shot instance root runs its signed tree's entry wherever the

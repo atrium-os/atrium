@@ -143,6 +143,23 @@ fn validate_capabilities(c: &Capabilities, ctx: &str, r: &mut Report) {
         }
     }
 
+    if let Some(class) = &c.syscalls {
+        if class.is_empty() || !class.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-' || b == b'_') {
+            r.errors.push(format!(
+                "{ctx}.syscalls = {class:?}: a profile name is lowercase letters, digits, '-' and '_'"));
+        } else if !["renderer", "app", "networked", "terminal"].contains(&class.as_str()) {
+            r.warnings.push(format!(
+                "{ctx}.syscalls = {class:?}: not one of the shipped classes \
+                 (renderer, app, networked, terminal); the launch fails unless jaild's \
+                 policy defines it"));
+        }
+        if class == "terminal" {
+            r.warnings.push(format!(
+                "{ctx}.syscalls = \"terminal\": restricted (runs programs, controls \
+                 terminals); requires explicit approval"));
+        }
+    }
+
     /* Restricted capabilities: warn so users notice. Policy
      * enforcement (deny unless explicitly granted by admin) lives
      * in portcullisd, not the parser. */

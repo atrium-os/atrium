@@ -194,6 +194,23 @@ pub fn create_persistent_jail(spec: &JailCreateSpec) -> io::Result<CreatedJail> 
     Ok(CreatedJail { jid })
 }
 
+/// Does the running kernel have the per-jail system call filter
+/// (jail-sysfil.md)? Asks for the `sysfil.mode` jail parameter's sysctl,
+/// which exists exactly when the kernel can take the parameter.
+#[cfg(target_os = "freebsd")]
+pub fn sysfil_supported() -> bool {
+    let name = c"security.jail.param.sysfil.mode";
+    let mut len: libc::size_t = 0;
+    // SAFETY: a size query; no output buffer is written.
+    unsafe {
+        libc::sysctlbyname(name.as_ptr(), std::ptr::null_mut(), &mut len,
+                           std::ptr::null(), 0) == 0
+    }
+}
+
+#[cfg(not(target_os = "freebsd"))]
+pub fn sysfil_supported() -> bool { false }
+
 /// `RLIMIT_CORE` = 0, soft and hard, for the calling (child) process.
 pub fn disable_core_dumps() -> io::Result<()> {
     let rl = libc::rlimit { rlim_cur: 0, rlim_max: 0 };

@@ -116,6 +116,7 @@ pub fn launch_with_stdio(
      * app will: a licence registered during setup must still match at run. */
     let host_identity = portcullis_identity::for_app(&manifest.app.id)
         .map_err(|e| LaunchError::Failed("identity", e.to_string()))?;
+    let sysfil = app_sysfil(&manifest)?;
     let opts = BuildOpts {
         root_path:    jail_path.clone(),
         host_sockets: PathBuf::from("/atrium/sockets"),
@@ -129,6 +130,7 @@ pub fn launch_with_stdio(
         instance: None,
         persist: true,
         host_identity,
+        sysfil,
     };
 
     /* Mount overlay once; both setup and runtime jails see the same
@@ -352,6 +354,27 @@ fn run_one_jail(
 }
 
 const JAILD_SOCK: &str = "/var/run/atrium/jaild.sock";
+const JAILD_POLICY: &str = "/etc/atrium/jaild.policy.toml";
+
+/// The app jail's system call filter (docs/spec/jail-sysfil.md §5.2): the
+/// manifest's class, resolved from jaild's policy, so a jail(8) launch and a
+/// jaild launch of the same app get the same lists. `None` on a kernel
+/// without sysfil, which would refuse the parameters, unless the policy
+/// says a filter is required.
+fn app_sysfil(manifest: &Manifest) -> Result<Option<jaild_policy::SysfilParams>, LaunchError> {
+    let fail = |s: String| LaunchError::Failed("sysfil", s);
+    let policy = jaild_policy::Policy::load(JAILD_POLICY)
+        .map_err(|e| fail(format!("{JAILD_POLICY}: {e}")))?;
+    if !jaild::ffi::sysfil_supported() {
+        if policy.sysfil.required {
+            return Err(fail("this kernel has no system call filter and policy.sysfil.required is set".into()));
+        }
+        return Ok(None);
+    }
+    let class = portcullis_jail::sysfil_class(&manifest.capabilities);
+    policy.sysfil.resolve(&class).map(Some)
+        .map_err(|e| fail(format!("{}: class {class:?}: {e}", manifest.app.id)))
+}
 
 fn run_one_jail_inner(
     jc:        &JailConfig,

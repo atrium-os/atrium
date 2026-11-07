@@ -26,6 +26,7 @@ fn opts(instance: Option<&str>) -> BuildOpts {
         instance: instance.map(str::to_string),
         persist: true,
         host_identity: portcullis_identity::derive(&[7u8; 32], "org.atrium.test"),
+        sysfil: None,
     }
 }
 

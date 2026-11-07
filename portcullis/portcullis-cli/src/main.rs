@@ -342,6 +342,9 @@ fn cmd_launch(tree_arg: &str, dry_run: bool, no_prompt: bool) -> ExitCode {
                 Err(e) => { eprintln!("portcullis: host identity: {e}"); return ExitCode::from(1) }
             }
         },
+        /* Dev launches run unfiltered; portcullisd's launch path applies the
+         * app's system call filter (jail-sysfil.md §5.2). */
+        sysfil: None,
     };
 
     let jc = match build(&manifest, &opts) {

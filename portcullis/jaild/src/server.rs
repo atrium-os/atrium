@@ -792,6 +792,7 @@ fn handle_create(
     // The filter the kernel will hold for the jail's whole life
     // (jail-sysfil.md §5.3), resolved once here from the policy.
     let sysfil = validator::resolve_sysfil(req, policy)?;
+    let sysfil = validator::sysfil_on_this_kernel(req, policy, sysfil, ffi::sysfil_supported())?;
     let sysfil = sysfil.as_ref();
 
     /* Persistent-jail name uniqueness: refuse to step on an

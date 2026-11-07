@@ -486,7 +486,10 @@ max_simultaneous_per_user = 32
 # accept-filter, reuseport-LB and KTLS socket options; largepage shm.
 # ---------------------------------------------------------------
 [sysfil]
-mode     = 2        # 1 = log only (development), 2 = deny, 3 = deny + SIGSYS
+# 1 = log only, 2 = deny, 3 = deny + SIGSYS.  Log only until the profiles
+# have been run against the real apps (scripts/sysfil/learn.sh; the kernel
+# logs each missing call as "sysfil: ... would deny ..."); then 2.
+mode     = 1
 required = false    # true once every launcher names a class
 
 [sysfil.profiles.base]
@@ -497,14 +500,22 @@ syscalls = [
     "sysarch", "__sysctl", "__sysctlbyname", "getrlimit", "getrusage",
     "cpuset_getaffinity", "cap_getmode", "cap_enter", "cap_rights_limit",
     "cap_ioctls_limit", "cap_fcntls_limit", "exterrctl", "getrandom",
-    "umask",
-    # the launcher, which runs inside the jail before execve
-    "setgroups", "setgid", "setuid", "execve",
+    "umask", "getpgrp", "getsid", "getpriority", "sched_yield",
+    "msync", "mlock", "munlock",
+    # shared memory: SHM_ANON / memfd_create buffers (Lyra rings, Fresco
+    # surfaces, the player); largepage objects stay gated by FIOSSHMLPGCNF
+    "shm_open2",
+    # the launcher, which runs inside the jail before execve: jaild's
+    # (setgroups, setgid, setuid) and jail(8)'s setusercontext(3), which also
+    # sets the login class, priority, limits and effective ids
+    "setgroups", "setgid", "setuid", "execve", "setloginclass",
+    "setpriority", "setrlimit", "seteuid", "setegid",
     # threads and signals (libthr)
     "thr_new", "thr_exit", "thr_self", "thr_kill", "thr_wake",
     "thr_set_name", "_umtx_op", "rtprio_thread", "sigaltstack",
     "sigprocmask", "sigaction", "sigreturn", "getcontext", "setcontext",
     "sigfastblock", "kill", "sigwait", "sigtimedwait", "sigsuspend",
+    "sigpending",
     # time
     "clock_gettime", "clock_getres", "clock_nanosleep", "nanosleep",
     "gettimeofday",
@@ -517,6 +528,7 @@ syscalls = [
     "mkdirat", "rename", "renameat", "unlink", "unlinkat", "rmdir",
     "access", "faccessat", "chmod", "fchmod", "fchmodat", "futimens",
     "utimensat", "symlinkat", "linkat", "posix_fallocate", "ioctl",
+    "statfs", "pathconf", "fpathconf", "lpathconf",
     # sockets (the families list decides which kinds)
     "socket", "socketpair", "bind", "listen", "accept", "accept4",
     "connect", "shutdown", "sendto", "recvfrom", "sendmsg", "recvmsg",

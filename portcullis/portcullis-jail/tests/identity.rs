@@ -15,6 +15,7 @@ fn opts(id: portcullis_identity::HostIdentity) -> BuildOpts {
         instance: None,
         persist: true,
         host_identity: id,
+        sysfil: None,
     }
 }
 

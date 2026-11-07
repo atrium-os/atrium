@@ -102,6 +102,26 @@ pub struct BuildOpts {
     /// a zero UUID, and making it a compile error is how every entrance is
     /// covered.
     pub host_identity: portcullis_identity::HostIdentity,
+    /// ★ The jail's system call filter (docs/spec/jail-sysfil.md), already
+    /// resolved from jaild's policy for [`sysfil_class`] of the manifest.
+    /// Rendered as `sysfil.*` jail parameters, so the filter exists before
+    /// jail(8) attaches the first process. REQUIRED like `host_identity`:
+    /// `None` is a decision the launch path makes (no kernel support, a dev
+    /// dry run), never a default it forgot.
+    pub sysfil: Option<jaild_policy::SysfilParams>,
+}
+
+/// The system call filter class for a manifest (jail-sysfil.md §5.2): the
+/// `syscalls` capability if it names one, else `networked` for an app with
+/// a `network` capability other than `none`, else `app`.
+pub fn sysfil_class(caps: &portcullis_toml::Capabilities) -> String {
+    if let Some(c) = &caps.syscalls {
+        return c.clone();
+    }
+    match caps.network.as_ref().map(|n| n.mode()) {
+        Some(portcullis_toml::NetworkCap::Loopback) | Some(portcullis_toml::NetworkCap::Full) => "networked".into(),
+        _ => "app".into(),
+    }
 }
 
 /// Jail name for one instance of an app.
@@ -237,6 +257,17 @@ pub fn build(manifest: &Manifest, opts: &BuildOpts) -> Result<JailConfig, BuildE
         jc.needs_routed_net = Some(opts.host_identity.mac.clone());
         jc.routed_net_spec = manifest.capabilities.network.clone()
             .map(|s| (manifest.app.id.clone(), s));
+    }
+
+    /* The system call filter, fixed at creation (jail-sysfil.md §3.2). */
+    if let Some(f) = &opts.sysfil {
+        jc.set("sysfil.mode", Value::Number(f.mode as i64));
+        for (key, val) in [("sysfil.syscalls", &f.syscalls), ("sysfil.ioctls", &f.ioctls),
+                           ("sysfil.sockopts", &f.sockopts), ("sysfil.families", &f.families)] {
+            if let Some(v) = val {
+                jc.set(key, Value::String(v.clone()));
+            }
+        }
     }
 
     /* Network defaults to "none" if no capability set it. */

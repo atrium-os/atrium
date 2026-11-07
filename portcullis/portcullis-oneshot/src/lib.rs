@@ -298,6 +298,8 @@ pub fn run_with_stdio(spec: &Spec, stdio: Option<[std::os::fd::OwnedFd; 3]>) -> 
         // BuildOpts::persist. (jaild's exec path creates with persist=0.)
         persist: false,
         host_identity: host_identity.clone(),
+        // The filter goes on jaild's request below, which resolves the class.
+        sysfil: None,
     };
     let jc = match build(&manifest, &opts) {
         Ok(jc) => jc,
@@ -416,7 +418,8 @@ pub fn run_with_stdio(spec: &Spec, stdio: Option<[std::os::fd::OwnedFd; 3]>) -> 
         hostid:   Some(host_identity.hostid),
         hostuuid: Some(host_identity.hostuuid.clone()),
         allow_mlock: false,
-        syscall_profile: None,
+        // jail-sysfil.md §5.2; jaild drops it on a kernel without sysfil.
+        syscall_profile: Some(portcullis_jail::sysfil_class(&manifest.capabilities)),
     });
     let outcome = run_via_jaild(&req, stdio);
 
