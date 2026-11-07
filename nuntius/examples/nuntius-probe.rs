@@ -26,7 +26,7 @@ fn main() {
         Ok(f) => f,
         Err(e) => { println!("refused {e}"); std::process::exit(1) }
     };
-    let (mut c, _guard) = f.into_parts();
+    let (mut c, guard) = f.into_parts();
     for (i, u) in urls.iter().enumerate() {
         let _ = std::io::stdout().flush();
         if let Some(t) = u.strip_prefix("sleep:") {
@@ -60,7 +60,12 @@ fn main() {
                 Ok(Some(Event::Error { code, .. })) => { println!("err {code:?} {u}"); break }
                 Ok(Some(_)) => {}
                 Ok(None) => { println!("err timeout {u}"); break }
-                Err(e) => { println!("err channel {e} {u}"); std::process::exit(1) }
+                Err(e) => {
+                    // The fetcher's own end, if portcullisd gave a reason.
+                    std::thread::sleep(Duration::from_millis(200));
+                    println!("err channel {e} {u}{}", guard.failure().map(|w| format!(" ({w})")).unwrap_or_default());
+                    std::process::exit(1)
+                }
             }
         }
     }

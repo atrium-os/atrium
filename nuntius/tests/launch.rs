@@ -57,6 +57,28 @@ fn a_fetcher_is_opened_used_and_ended_on_drop() {
 }
 
 #[test]
+fn a_refusal_after_the_handoff_is_reported_with_its_reason() {
+    let (app, d) = UnixStream::pair().unwrap();
+    let h = std::thread::spawn(move || {
+        let mut r = BufReader::new(d.try_clone().unwrap());
+        let mut w = d;
+        read_request(&mut r).unwrap();
+        write_response(&mut w, &Response::Hello { version: portcullis_ipc::PROTO_VERSION }).unwrap();
+        read_request(&mut r).unwrap();
+        write_response(&mut w, &Response::ReadyForFds).unwrap();
+        let _fds = recv_fds(&w, 3).unwrap();
+        write_response(&mut w, &Response::LaunchFailed { stage: "oneshot".into(), message: "rctl.disabled".into() }).unwrap();
+    });
+    let f = nuntius::launch::open_at(app).unwrap();
+    h.join().unwrap();
+    let (mut c, guard) = f.into_parts();
+    assert!(c.recv_timeout(Duration::from_secs(5)).is_err(), "the channel closes");
+    let t = std::time::Instant::now();
+    while !guard.exited() && t.elapsed() < Duration::from_secs(5) { std::thread::sleep(Duration::from_millis(10)) }
+    assert_eq!(guard.failure().as_deref(), Some("oneshot: rctl.disabled"));
+}
+
+#[test]
 fn an_app_without_net_fetch_is_refused() {
     let (s, d) = daemon(false);
     let e = nuntius::launch::open_at(s).err().expect("refused");

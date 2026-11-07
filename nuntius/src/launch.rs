@@ -16,16 +16,28 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
+/// How the fetcher ended, as portcullisd reports it.
+#[derive(Default)]
+struct End { done: AtomicBool, failure: std::sync::Mutex<Option<String>> }
+impl End {
+    fn done(&self) -> bool { self.done.load(Ordering::Acquire) }
+    fn failure(&self) -> Option<String> { self.failure.lock().unwrap().clone() }
+}
+
 /// A running fetcher: its channel, and the connection that keeps it alive.
 pub struct Fetcher {
     pub client: Client,
     control: UnixStream,
-    exited: Arc<AtomicBool>,
+    exited: Arc<End>,
 }
 
 impl Fetcher {
     /// Whether portcullisd has reported the fetcher's end.
-    pub fn exited(&self) -> bool { self.exited.load(Ordering::Acquire) }
+    pub fn exited(&self) -> bool { self.exited.done() }
+    /// Why the fetcher never ran, when portcullisd refused it after the
+    /// handoff (a missing racct, a jail that could not be built): the app
+    /// sees its channel close, and this says why.
+    pub fn failure(&self) -> Option<String> { self.exited.failure() }
     /// The channel, keeping the fetcher alive as long as the returned guard.
     pub fn into_parts(self) -> (Client, FetcherGuard) {
         let this = std::mem::ManuallyDrop::new(self);
@@ -36,8 +48,12 @@ impl Fetcher {
 }
 
 /// Holds a fetcher's jail open; dropping it ends the fetcher.
-pub struct FetcherGuard { _control: UnixStream, exited: Arc<AtomicBool> }
-impl FetcherGuard { pub fn exited(&self) -> bool { self.exited.load(Ordering::Acquire) } }
+pub struct FetcherGuard { _control: UnixStream, exited: Arc<End> }
+impl FetcherGuard {
+    pub fn exited(&self) -> bool { self.exited.done() }
+    /// See [`Fetcher::failure`].
+    pub fn failure(&self) -> Option<String> { self.exited.failure() }
+}
 
 // ★ Shut the connection down, not just drop it: the thread waiting for
 // portcullisd's answer holds a clone of it, so a plain drop would never hang
@@ -74,11 +90,14 @@ pub fn open_at(mut s: UnixStream) -> io::Result<Fetcher> {
     send_fds(&s, &[theirs.as_raw_fd(), theirs.as_raw_fd(), null.as_raw_fd()])?;
     drop(theirs);
     s.set_read_timeout(None)?;
-    let exited = Arc::new(AtomicBool::new(false));
+    let exited = Arc::new(End::default());
     let (mut r, e) = (s.try_clone()?, exited.clone());
     std::thread::Builder::new().name("nuntius-launch".into()).spawn(move || {
-        let _ = read_response(&mut r);
-        e.store(true, Ordering::Release);
+        // ★ Recorded BEFORE `done`, so a reader that sees the end sees why.
+        if let Ok(Response::LaunchFailed { stage, message }) = read_response(&mut r) {
+            *e.failure.lock().unwrap() = Some(format!("{stage}: {message}"));
+        }
+        e.done.store(true, Ordering::Release);
     })?;
     Ok(Fetcher { client: Client::from_stream(mine)?, control: s, exited })
 }

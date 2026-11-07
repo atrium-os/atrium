@@ -307,11 +307,11 @@ feed through it (fresco-video P3).
     refused. No fetcher jail, mount or process is left after the app exits. The guest
     needs `kern.racct.enable=1`: every fetcher requires a memory limit.
 - **Not done:**
-  - A refused fetcher start is silent to the app. `open()` returns once the descriptors
-    are sent, and a later `LaunchFailed` (for example, jaild refusing a required memory
-    limit when racct is off) only marks the guard exited; the app sees its channel close
-    with no reason. `open()` should wait briefly for an early `LaunchFailed`, or the
-    fetcher's start should be confirmed before `ReadyForFds`.
+  - A fetcher start refused after the handoff (for example, jaild refusing the required
+    memory limit when racct is off) shows the app only its channel closing. Since
+    2026-11-07 the guard's `failure()` gives portcullisd's reason, but `open()` still
+    returns before the start is known. Confirming the start before `ReadyForFds` would
+    need a portcullisd change.
   - The standalone player still uses its own `atrium-player-fetch`.
   - Origin narrowing from the manifest (§4) and the per-client private-network grant.
   - The Navigator's own instances, which stay in-process for now.
