@@ -105,6 +105,7 @@ compute route chosen; security conditions F1–F6 in
 | forum-wm lays out below the strip (`DISPLAY_INFO.reserved_top`) | done | `11984d2` |
 | F3 broker fuzzing (`atrium-split-fuzz`, `scripts/fresco-split-fuzz.sh`; broker never blocks on a renderer) | done | `9d8429a` |
 | App GPU channel in frescod (F6 G2–G4) | done | `4cf6395`, `a8a595d` |
+| Tactus input layer T1–T2 (atrium-input.md rev. 2): jailed tactusd (`_tactus`, devfs 26) reads hidraw and serves frescod; frescod's own readers and its hidraw nodes removed | done; `scripts/vm-tactus-check.sh` 0 failed; T3 touchpads, T4 PS/2, T5 gamepads, T6 Bluetooth HID next | this commit |
 | F4f secure password input to frescod | waits on F5 + Navigator C0 | — |
 | F5 | deferred (Shankar) | — |
 | Display lease: only frescod's jail and uid may open `/dev/atrium-display0` (jaild writes the lease; devfs ruleset 23 pinned to frescod) | done; host root and other jails get EPERM in the VM | `1441356` and the jaild commit after it |

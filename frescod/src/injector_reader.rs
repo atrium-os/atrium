@@ -1,8 +1,8 @@
 //! frescod/src/injector_reader.rs — synthetic input injection (headless/dev harness).
 //!
 //! Reads a tiny line protocol from a UNIX socket and feeds the **same**
-//! `DisplayEvent` pipeline the real `/dev/hidraw*` readers use
-//! (`input_reader` / `pointer_reader`), through the same compositor cursor +
+//! `DisplayEvent` pipeline real input from tactusd uses
+//! (`tactus_client`), through the same compositor cursor +
 //! hit-test + focus logic — so an injected event routes to a window identically
 //! to a real one. This is the interactive harness for environments with no
 //! HID/GPU device (the headless VM): drive and debug the input → event → WM →
@@ -57,7 +57,7 @@ fn serve(sink: Sender<DisplayEvent>, comp: Arc<Mutex<Compositor>>, sw: f32, sh: 
         Ok(l) => l,
         Err(e) => { eprintln!("frescod: injector bind {path}: {e}"); return; }
     };
-    /* Seed the cursor at screen center, same as pointer_reader. */
+    /* Seed the cursor at screen center, same as tactus_client. */
     { comp.lock().unwrap().cursor = (sw / 2.0, sh / 2.0); }
     eprintln!("frescod: input injector listening on {path}");
     for stream in listener.incoming() {
@@ -116,7 +116,7 @@ fn handle(sink: &Sender<DisplayEvent>, comp: &Arc<Mutex<Compositor>>, sw: f32, s
 }
 
 /// Set the cursor to `(x, y)`, hit-test, return `(local_x, local_y, target)` —
-/// the same critical-section shape `pointer_reader` uses.
+/// the same critical-section shape `tactus_client` uses.
 fn cursor_to(comp: &Arc<Mutex<Compositor>>, x: f32, y: f32) -> (f32, f32, u32) {
     let mut g = comp.lock().unwrap();
     g.cursor = (x, y);
@@ -134,7 +134,7 @@ fn hit(g: &Compositor, x: f32, y: f32) -> (f32, f32, u32) {
     (lx, ly, target as u32)
 }
 
-/// The focused window (or the topmost non-screen window), mirroring `input_reader`.
+/// The focused window (or the topmost non-screen window), mirroring `tactus_client`.
 fn focused_window(comp: &Arc<Mutex<Compositor>>) -> u32 {
     comp.lock().unwrap().keyboard_window()
 }

@@ -1,6 +1,6 @@
 # Atrium input pipeline: Tactus
 
-**Status:** design rev. 2, 2026-11-07, decisions in §10 pending.
+**Status:** design rev. 2, 2026-11-07; ACCEPTED by Shankar 2026-11-07 (all five §10 decisions, "proceed as recommended").
 Rev. 1 (2026-05-08) planned a USB-only `uhid(4)` reader inside
 frescod; what got built is several ad-hoc `hidraw(4)` readers in
 frescod. Rev. 2 names the layer between the kernel and frescod
@@ -90,10 +90,12 @@ which a malicious device can do anyway, but not the compositor's
 memory or other apps.
 
 **Trust.** frescod accepts device events only from tactusd's socket
-(peer uid `_tactus`) and mints activation tokens only for them, as
-it does now for its own readers. The injector moves into tactusd as a
-dev-only source and stays marked synthetic (no tokens unless
-`FRESCOD_INJECT_ACTIVATION=1`, tabula.md §2.1).
+and mints activation tokens for their presses; tactusd accepts only
+frescod's uid (and root). frescod has no input fallback: with tactusd
+down it waits and gets no input, and its jail shows no input nodes.
+The injector stays in frescod (its commands are in screen coordinates,
+which are frescod's), for tests only, and stays synthetic (no tokens
+unless `FRESCOD_INJECT_ACTIVATION=1`, tabula.md §2.1).
 
 ## 3. Sources
 
@@ -163,8 +165,8 @@ common decoder, and a `Dropped` packet releases held keys.
 
 - QEMU's `usb-kbd` / `usb-tablet` arrive through hidraw (the tablet is
   an absolute pointer, §5.2), which is what the VM tests use today.
-- The injector line protocol (`MOVE`, `BTN`, `KEY`, `SCROLL`) moves
-  from frescod into tactusd unchanged, dev builds only.
+- The injector line protocol (`MOVE`, `BTN`, `KEY`, `SCROLL`) stays in
+  frescod (§2, Trust), tests only.
 - A replay source plays recorded descriptor + report traces, so real
   devices' quirks become host tests.
 
@@ -195,7 +197,10 @@ report separately.
 ### 4.0 tactusd to frescod
 
 One stream socket, length-prefixed postcard messages (the Lyra
-choice, lyra-v1.md), versioned by a hello:
+choice, lyra-v1.md), versioned by a hello. As built (T2,
+`tactus::wire`) it carries `Hello`, `Device`, `Gone`, `Key`, `Button`,
+`Motion`, `Absolute` (0..1 across the device) and `Scroll`; the rest
+below lands with T3 and T5. Planned:
 
 ```
 Device   { id, bus: Usb|I2c|Ps2|Bluetooth|Virtual, classes, vendor,
@@ -442,8 +447,22 @@ zoomable views. The wire to apps stays HID-faithful.
    combined keyboard + consumer + system devices).
 2. **T2 `tactusd`.** Hotplug, hidraw source, the socket to frescod,
    jail and `_tactus` user (commissioned like `_lyra`). frescod's
-   four readers are replaced by one client; injector moves over.
-   VM tests (span e2e and chaos, the input tests) must pass unchanged.
+   four readers are replaced by one client.
+   **Built 2026-11-07.** Crate `tactus/` (hid, decode, repeat,
+   pointer, wire; 12 host tests) and `tactusd` (hidraw source,
+   hotplug by devd or a 2 s rescan inside the jail, `--list`,
+   `--watch`). frescod's `input_reader`, `pointer_reader` and
+   `consumer` are gone; `tactus_client` maps events as they did
+   (modifier keys as bits, media keys to the WM only, no tokens for
+   them, repeats not yet passed to apps: the app wire has no repeat
+   flag). Jail `atrium-tactusd` (services.d 38, `_tactus` 65018,
+   devfs ruleset `atrium_input=26` pinned; `hidraw*` removed from
+   rulesets 21 and 23), commissioned by `scripts/tactus-service.sh`.
+   `scripts/vm-tactus-check.sh` (cloud amd64 VM with QEMU USB keyboard,
+   tablet and mouse) passes with 0 failures: keys with shift, a token
+   on each press and none on releases, one press for a held key, click
+   with token, motion, scroll, a hot-plugged keyboard, and input again
+   after tactusd restarts.
 3. **T3 Touchpads.** Precision Touchpad over hidbus, contact tracking,
    taps, scroll phases, gestures. QEMU has no multi-touch pad, so the
    replay source carries the tests, plus a laptop run.

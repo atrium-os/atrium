@@ -1811,6 +1811,8 @@ Four-app multi-window demo: `atrium-edit-socket` + `atrium-term-socket` + `atriu
 
 **D1 step 2(c.15) (mouse routing + drag/resize/close-button)** — DONE (2026-04-29). New `pointer_dispatch` module owns WM intercepts (close button → resize edge → titlebar → content+raise+focus) and per-window event routing; both readers feed it cooked events. Software cursor overlay drawn directly into the tiny-skia pixmap each frame. Click auto-raises and focuses; drag/resize match the existing macOS-path semantics (emits `COMP_WINDOW_RESIZED` to the owner on release).
 
+> **Superseded 2026-11-07:** frescod no longer reads input devices; `input_reader`/`pointer_reader` are gone and tactusd (Tactus, docs/spec/atrium-input.md) reads hidraw in its own jail. See §13.4 "Input (Tactus)". Kept for history.
+
 **D1 step 2(c.16) (native keyboard + pointer via /dev/hidraw*)** — DONE (2026-04-29). Both readers open the kernel's hidraw cdev directly; no AT-scancode translation, no Linux-shape evdev. Identification is by HID report descriptor (`HIDIOCGRDESC` ioctl):
 
 - `input_reader` finds the first hidraw whose descriptor starts with USAGE_PAGE(Generic Desktop) ; USAGE(Keyboard) (`05 01 09 06`). Reads 8-byte USB HID Keyboard boot reports. Bytes are *already in the wire format we want* — bytes 2..7 carry HID Usage Page 0x07 codes verbatim. Press/release derived by diffing successive reports' key sets; modifier byte at offset 0 maps to the wire's 3-bit shift/ctrl/alt bitmap.
@@ -5325,6 +5327,24 @@ shown, no window is off-screen, and a set of monitors comes back as it was
 left; it ends with `chaos: N steps, M failed` (~25 min for 60 steps). After changing gpusim's QEMU device, copy `qemu-device/gpusim.c`
 into the QEMU fork and rebuild it, then restart the VM and gpusim-server. Don't
 `kldunload` the GPU modules while frescod or a renderer runs; reboot.
+
+Input (Tactus, docs/spec/atrium-input.md): frescod reads no input devices; it
+connects to tactusd at `/atrium/sockets/tactus/tactus.sock`
+(`FRESCOD_TACTUS_SOCKET` overrides) and, while tactusd is down, logs "tactusd
+not reachable" and has no input (only the test injector). Commission tactusd
+with `sh scripts/tactus-service.sh <tactusd>` (user `_tactus` 65018, devfs
+ruleset `atrium_input=26`, services.d 38; jaild.policy needs 26 in
+allowed_ids, its pin and 65018), then start it through
+portcullisd-bootstrap. `tactusd --list` prints the devices it decodes;
+`tactusd --watch SOCK` prints its events (allowed peers: 65010 and root, or
+`TACTUS_PEERS`). `scripts/vm-tactus-check.sh` (host side) runs it end to end
+in the cloud amd64 VM started with QEMU's USB keyboard, tablet and mouse
+(`QEMU_EXTRA="-device qemu-xhci -device usb-kbd -device usb-tablet -device
+usb-mouse"`, `QEMU_BIN` = the atrium-os QEMU fork: stock Ubuntu QEMU's TCG
+panicked the guest in zfs's AVX2 sha256), typing and clicking through the
+QEMU monitor; it ends `tactus: N failed`. QEMU monitor `mouse_move` always
+drives the relative mouse here, so the tablet's absolute path is covered by
+host tests only.
 
 Broker fuzzing (F3): `scripts/fresco-split-fuzz.sh` in the guest runs `atrium-split-fuzz` (hostile renderers + Navigator) against an animated probe client; `FUZZ_GPU=1` adds `atrium-gpu-fuzz` against the GPU channel. Kill leftover fuzz renderers between runs.
 

@@ -1,0 +1,23 @@
+[package]
+name = "tactus"
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+publish = false
+description = "Tactus: Atrium's input layer. HID descriptor parsing, report decoding, key repeat and the pointer stage (docs/spec/atrium-input.md), plus tactusd, the jailed service that reads every input bus and serves frescod."
+
+[lib]
+name = "tactus"
+path = "src/lib.rs"
+
+[[bin]]
+name = "tactusd"
+path = "src/bin/tactusd.rs"
+
+[dependencies]
+serde    = { version = "1", features = ["derive"] }
+postcard = { version = "1", features = ["use-std"] }
+libc     = "0.2"
+
+[target.'cfg(target_os = "freebsd")'.dependencies]
+atrium-devevents = { path = "../atrium-devevents" }

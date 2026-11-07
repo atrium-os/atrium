@@ -1,0 +1,261 @@
+//! Reports to canonical events (docs/spec/atrium-input.md §5): keys and
+//! buttons as presses and releases by HID usage, relative motion,
+//! absolute position, wheels. One [`Decoder`] per device; it keeps what
+//! is held so each report turns into the changes since the last.
+
+use crate::hid::{self, Class, Descriptor, Usage};
+
+/// What one report says, before the pointer stage and key repeat.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Input {
+    /// A key (keyboard page 0x07, consumer page 0x0C, system control).
+    Key { usage: Usage, down: bool },
+    /// A pointer button (page 0x09).
+    Button { usage: Usage, down: bool },
+    /// Relative motion in device counts.
+    Motion { dx: i32, dy: i32 },
+    /// Absolute position, 0..=1 across the device's range.
+    Absolute { x: f32, y: f32 },
+    /// Wheel detents (HID sign: positive is away from the user / right).
+    Scroll { axis: Axis, detents: i32 },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum Axis {
+    Vertical,
+    Horizontal,
+}
+
+pub struct Decoder {
+    desc: Descriptor,
+    /// Per application collection, what was held after the last report.
+    held: Vec<Vec<Usage>>,
+    /// Last absolute position per collection, to send only changes.
+    abs: Vec<Option<(f32, f32)>>,
+}
+
+/// Classes whose reports this decoder turns into events. Gamepads,
+/// touch and touchpads get their own stages (spec §8, T3/T5).
+fn decoded(c: Class) -> bool {
+    matches!(c, Class::Pointer | Class::Keyboard | Class::SystemKeys | Class::MediaKeys)
+}
+
+/// Keyboard usages 1..=3 are ErrorRollOver, POSTFail, ErrorUndefined:
+/// the keyboard cannot say what is held, so keep the last state.
+fn phantom(u: Usage) -> bool {
+    u >> 16 == u32::from(hid::PAGE_KEYBOARD) && (1..=3).contains(&(u & 0xffff))
+}
+
+impl Decoder {
+    pub fn new(desc: Descriptor) -> Decoder {
+        let n = desc.apps.len();
+        Decoder { desc, held: vec![Vec::new(); n], abs: vec![None; n] }
+    }
+
+    pub fn descriptor(&self) -> &Descriptor {
+        &self.desc
+    }
+
+    /// The report ids this device sends input on (0 if unnumbered).
+    pub fn decodes_anything(&self) -> bool {
+        self.desc.apps.iter().any(|a| decoded(a.class))
+    }
+
+    /// Turn one report (as read from hidraw: the id byte first on a
+    /// numbered device) into events, appended to `out`.
+    pub fn report(&mut self, report: &[u8], out: &mut Vec<Input>) {
+        let (id, body) = if self.desc.numbered {
+            match report.split_first() {
+                Some((id, body)) => (*id, body),
+                None => return,
+            }
+        } else {
+            (0, report)
+        };
+        for app in 0..self.desc.apps.len() {
+            if !decoded(self.desc.apps[app].class) {
+                continue;
+            }
+            let fields: Vec<&hid::Field> =
+                self.desc.fields.iter().filter(|f| f.app == app && f.report_id == id).collect();
+            if fields.is_empty() {
+                continue;
+            }
+            let mut pressed: Vec<Usage> = Vec::new();
+            let (mut dx, mut dy) = (0i32, 0i32);
+            let (mut ax, mut ay) = (None, None);
+            let mut phantom_state = false;
+            let mut short = false;
+            for f in fields {
+                for k in 0..f.count {
+                    let Some(v) = f.value(body, k) else {
+                        short = true;
+                        break;
+                    };
+                    if f.array {
+                        if let Some(u) = f.usage_of_index(v) {
+                            phantom_state |= phantom(u);
+                            if !pressed.contains(&u) {
+                                pressed.push(u);
+                            }
+                        }
+                        continue;
+                    }
+                    let Some(u) = f.usage_at(k) else { continue };
+                    if f.relative {
+                        let v = v.clamp(i32::MIN.into(), i32::MAX.into()) as i32;
+                        match u {
+                            hid::X => dx = dx.saturating_add(v),
+                            hid::Y => dy = dy.saturating_add(v),
+                            hid::WHEEL if v != 0 => out.push(Input::Scroll { axis: Axis::Vertical, detents: v }),
+                            hid::AC_PAN if v != 0 => out.push(Input::Scroll { axis: Axis::Horizontal, detents: v }),
+                            _ => {}
+                        }
+                    } else if u == hid::X || u == hid::Y {
+                        let span = (f.logical_max - f.logical_min).max(1) as f32;
+                        let t = ((v - i64::from(f.logical_min)) as f32 / span).clamp(0.0, 1.0);
+                        if u == hid::X { ax = Some(t) } else { ay = Some(t) }
+                    } else if v != 0 && u & 0xffff != 0 && !pressed.contains(&u) {
+                        // A one-bit (or on/off) control: buttons, modifiers,
+                        // bitmap keyboards, media-key bits.
+                        pressed.push(u);
+                    }
+                }
+            }
+            if short && pressed.is_empty() {
+                // A truncated report says nothing about what is held.
+                continue;
+            }
+            if dx != 0 || dy != 0 {
+                out.push(Input::Motion { dx, dy });
+            }
+            if let (Some(x), Some(y)) = (ax, ay) {
+                if self.abs[app] != Some((x, y)) {
+                    self.abs[app] = Some((x, y));
+                    out.push(Input::Absolute { x, y });
+                }
+            }
+            if phantom_state {
+                continue;
+            }
+            let held = &mut self.held[app];
+            let event = |usage: Usage, down: bool| {
+                if usage >> 16 == u32::from(hid::PAGE_BUTTON) {
+                    Input::Button { usage, down }
+                } else {
+                    Input::Key { usage, down }
+                }
+            };
+            for &u in held.iter().filter(|u| !pressed.contains(u)) {
+                out.push(event(u, false));
+            }
+            for &u in pressed.iter().filter(|u| !held.contains(u)) {
+                out.push(event(u, true));
+            }
+            *held = pressed;
+        }
+    }
+
+    /// Releases for everything held: the device went away.
+    pub fn release_all(&mut self, out: &mut Vec<Input>) {
+        for held in &mut self.held {
+            for u in held.drain(..) {
+                out.push(if u >> 16 == u32::from(hid::PAGE_BUTTON) {
+                    Input::Button { usage: u, down: false }
+                } else {
+                    Input::Key { usage: u, down: false }
+                });
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::hid::tests::{BOOT_KEYBOARD, GAMING_MOUSE, QEMU_TABLET};
+    use crate::hid::usage;
+
+    fn dec(d: &[u8]) -> Decoder {
+        Decoder::new(Descriptor::parse(d).unwrap())
+    }
+    fn run(d: &mut Decoder, r: &[u8]) -> Vec<Input> {
+        let mut v = Vec::new();
+        d.report(r, &mut v);
+        v
+    }
+    fn key(id: u16, down: bool) -> Input {
+        Input::Key { usage: usage(7, id), down }
+    }
+
+    #[test]
+    fn keys_and_modifiers_press_and_release() {
+        let mut d = dec(BOOT_KEYBOARD);
+        assert_eq!(run(&mut d, &[0x02, 0, 0x04, 0, 0, 0, 0, 0]), vec![key(0xe1, true), key(0x04, true)], "shift, a");
+        assert_eq!(run(&mut d, &[0x02, 0, 0x04, 0x05, 0, 0, 0, 0]), vec![key(0x05, true)]);
+        assert_eq!(run(&mut d, &[0, 0, 0x05, 0, 0, 0, 0, 0]), vec![key(0xe1, false), key(0x04, false)]);
+        assert_eq!(run(&mut d, &[0, 0, 1, 1, 1, 1, 1, 1]), vec![], "rollover keeps the last state");
+        assert_eq!(run(&mut d, &[0; 8]), vec![key(0x05, false)]);
+        assert_eq!(run(&mut d, &[0; 3]), vec![], "short report");
+    }
+
+    #[test]
+    fn an_nkro_bitmap_keyboard() {
+        // Report 1: 8 modifier bits, then a 104-bit bitmap from usage 0.
+        let desc = [
+            0x05, 0x01, 0x09, 0x06, 0xa1, 0x01, 0x85, 0x01, 0x05, 0x07, 0x19, 0xe0, 0x29, 0xe7, 0x15, 0x00, 0x25, 0x01,
+            0x75, 0x01, 0x95, 0x08, 0x81, 0x02, 0x19, 0x00, 0x29, 0x67, 0x95, 0x68, 0x81, 0x02, 0xc0,
+        ];
+        let mut d = dec(&desc);
+        let mut r = [0u8; 15];
+        r[0] = 1;
+        r[2] = 0b0001_0000; // usage 4 (a)
+        r[3] = 0b0000_0001; // usage 8 (e)
+        assert_eq!(run(&mut d, &r), vec![key(0x04, true), key(0x08, true)]);
+    }
+
+    #[test]
+    fn the_tablet_moves_absolutely_and_scrolls() {
+        let mut d = dec(QEMU_TABLET);
+        let ev = run(&mut d, &[0b001, 0xff, 0x3f, 0xff, 0x7f, 0x01]);
+        assert_eq!(ev[0], Input::Scroll { axis: Axis::Vertical, detents: 1 });
+        let Input::Absolute { x, y } = ev[1] else { panic!("{ev:?}") };
+        assert!((x - 0.5).abs() < 0.001 && (y - 1.0).abs() < 0.001);
+        assert_eq!(ev[2], Input::Button { usage: usage(9, 1), down: true });
+        assert_eq!(run(&mut d, &[0b001, 0xff, 0x3f, 0xff, 0x7f, 0]), vec![], "nothing changed");
+    }
+
+    #[test]
+    fn a_report_protocol_mouse() {
+        let mut d = dec(GAMING_MOUSE);
+        let r = [1, 0x00, 0x80, 0x10, 0x00, 0xf0, 0xff, 0xff, 0x01];
+        assert_eq!(
+            run(&mut d, &r),
+            vec![
+                Input::Scroll { axis: Axis::Vertical, detents: -1 },
+                Input::Scroll { axis: Axis::Horizontal, detents: 1 },
+                Input::Motion { dx: 16, dy: -16 },
+                Input::Button { usage: usage(9, 16), down: true },
+            ]
+        );
+        assert_eq!(run(&mut d, &[2, 1, 2, 3]), vec![], "another report id");
+        let mut out = Vec::new();
+        d.release_all(&mut out);
+        assert_eq!(out, vec![Input::Button { usage: usage(9, 16), down: false }]);
+    }
+
+    #[test]
+    fn media_keys_through_the_same_decoder() {
+        // A keyboard's second interface (consumer.rs's ARRAY descriptor).
+        let desc = [
+            0x05, 0x01, 0x09, 0x80, 0xa1, 0x01, 0x85, 0x01, 0x19, 0x81, 0x29, 0x83, 0x15, 0x00, 0x25, 0x01, 0x75, 0x01,
+            0x95, 0x03, 0x81, 0x02, 0x95, 0x05, 0x81, 0x01, 0xc0, 0x05, 0x0c, 0x09, 0x01, 0xa1, 0x01, 0x85, 0x02, 0x19,
+            0x00, 0x2a, 0x3c, 0x02, 0x15, 0x00, 0x26, 0x3c, 0x02, 0x75, 0x10, 0x95, 0x01, 0x81, 0x00, 0xc0,
+        ];
+        let mut d = dec(&desc);
+        assert_eq!(d.descriptor().classes(), vec![Class::SystemKeys, Class::MediaKeys]);
+        assert_eq!(run(&mut d, &[2, 0xcd, 0]), vec![Input::Key { usage: usage(0x0c, 0xcd), down: true }]);
+        assert_eq!(run(&mut d, &[2, 0, 0]), vec![Input::Key { usage: usage(0x0c, 0xcd), down: false }]);
+        assert_eq!(run(&mut d, &[1, 0b010]), vec![Input::Key { usage: usage(1, 0x82), down: true }], "sleep");
+    }
+}

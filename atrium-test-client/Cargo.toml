@@ -100,6 +100,11 @@ path = "src/activation_probe.rs"
 name = "atrium-video-probe"
 path = "src/video_probe.rs"
 
+# Prints the input events its window gets (atrium-input.md T2 VM check).
+[[bin]]
+name = "atrium-input-probe"
+path = "src/input_probe.rs"
+
 [dependencies]
 aqueduct        = { path = "../aqueduct" }
 fresco-client   = { path = "../fresco-client" }

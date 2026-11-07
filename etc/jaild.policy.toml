@@ -135,9 +135,9 @@ rw_subtrees = [
 [devfs_rulesets]
 allowed = [
     "atrium-baseline",   # null, zero, random, urandom, tty
-    "atrium-gpu",        # baseline + atrium-gpu0 + hidraw
+    "atrium-gpu",        # baseline + atrium-gpu0
     "atrium-display",    # atrium-gpu + atrium-display0; pinned to frescod
-    "atrium-input",      # baseline + input/event*
+    "atrium-input",      # baseline + hidraw*; pinned to tactusd
     "atrium-tty",        # baseline + a specific allocated tty
 ]
 # Numeric ruleset ids jaild may mount a jail's devfs with. The rulesets
@@ -154,12 +154,13 @@ allowed = [
 #  4 = devfsrules_jail (FreeBSD-standard, /etc/defaults/devfs.rules) — session
 #      apps' per-jail devfs (ostiarius SESSION_DEVFS_RULESET).
 # 20 = atrium_governor — basics + /dev/pressure (memoryd, memfed).
-# 21 = atrium_gpu      — basics + gpu0/hidraw* (no display).
+# 21 = atrium_gpu      — basics + gpu0 (no display, no input).
 # 22 = atrium_app      — basics + pty/fd; portcullis apps and one-shot workers,
 #      with each capability's unhide rules applied to that jail's own mount.
 # 23 = atrium_display  — atrium_gpu + display0: frescod's alone (pinned below).
 # 24 = atrium_audio    — dsp*, mixer*, laminar: lyrad's alone (pinned below).
-allowed_ids = [4, 20, 21, 22, 23, 24]
+# 26 = atrium_input    — hidraw*: tactusd's alone (pinned below).
+allowed_ids = [4, 20, 21, 22, 23, 24, 26]
 
 # The display belongs to frescod. Only the frescod service may mount the
 # ruleset that shows /dev/atrium-display0, and before it starts jaild writes
@@ -180,6 +181,15 @@ id        = 24
 jail_name = "atrium-lyrad"
 exec_path = "/usr/local/bin/atrium-lyrad"
 uid       = 65016
+
+# Input devices belong to tactusd (atrium-input.md §2): only the tactusd
+# service may mount the ruleset that shows /dev/hidraw*. frescod and apps get
+# input from it, never from the devices.
+[[devfs_rulesets.pinned]]
+id        = 26
+jail_name = "atrium-tactusd"
+exec_path = "/usr/local/bin/atrium-tactusd"
+uid       = 65018
 
 
 # ---------------------------------------------------------------
@@ -266,6 +276,7 @@ allowed_system_uids = [
              # portcullisd under the system policy's worker rule
     65016,   # _lyra: the audio engine, lyrad (lyra-service.sh creates it)
     65017,   # _choragus: the audio policy daemon, choragusd
+    65018,   # _tactus: the input service, tactusd (tactus-service.sh creates it)
     65020,   # _arca: the secret store (docs/spec/arca.md)
     65022,   # _limen: the embed broker, limend (docs/spec/limen.md); choragusd
              # knows it by this uid (--limen-uid) for embedded players' audio tickets
@@ -285,6 +296,7 @@ allowed_system_gids = [
     65015,   # _aqueduct-gpu-app
     65016,   # _lyra
     65017,   # _choragus
+    65018,   # _tactus
     65020,   # _arca
     65022,   # _limen
     65023,   # _nuntius

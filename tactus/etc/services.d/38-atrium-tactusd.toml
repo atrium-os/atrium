@@ -1,0 +1,59 @@
+# /etc/atrium/services.d/38-atrium-tactusd.toml
+#
+# The jailed launch of tactusd, Atrium's input service
+# (docs/spec/atrium-input.md §2). atrium-portcullisd-bootstrap reads this, asks
+# jaild to create the jail, and supervises tactusd inside it. Numbered 38:
+# before frescod (40), which connects to it.
+#
+# tactusd runs NON-ROOT (_tactus) with no network. It sees only the HID nodes,
+# through the atrium_input devfs ruleset (26), which jaild pins to this
+# service; frescod's jail shows no input nodes. It parses every device's report
+# descriptor and reports, so that untrusted parsing stays out of the
+# compositor.
+#
+# tactusd serves one socket, /atrium/sockets/tactus/tactus.sock, whose
+# directory is owned _tactus:_frescod 0750, and accepts only frescod's uid
+# (65010) and root, checked on every connection (TACTUS_PEERS overrides).
+#
+# Hotplug: devd's socket is not in the jail, so tactusd rescans the HID nodes
+# every 2 s (a new keyboard or mouse works within 2 s of plugging in).
+#
+# REQUIRES (commission once per host; scripts/tactus-service.sh does all of it):
+#   1. The _tactus (65018) system user, in jaild.policy's allowed_system_uids.
+#   2. The atrium_input devfs ruleset (etc/atrium.devfs.rules), loaded at boot;
+#      id 26 in jaild.policy [devfs_rulesets].allowed_ids, pinned to this service.
+#   3. `install -d -o _tactus -g _frescod -m 0750 /atrium/sockets/tactus`.
+#   4. The rootfs mountpoint dirs: <path>/{dev,libexec,lib,usr/lib,usr/local/bin,atrium/sockets}.
+
+enabled       = true
+name          = "atrium-tactusd"
+path          = "/var/lib/atrium/jails/tactusd"
+children_max  = 0
+devfs_ruleset = 26                               # atrium_input: basics + hidraw* (tactusd only)
+
+[[mounts]]
+source = "/libexec"
+dest   = "libexec"
+kind   = "ro_nullfs"
+[[mounts]]
+source = "/lib"
+dest   = "lib"
+kind   = "ro_nullfs"
+[[mounts]]
+source = "/usr/lib"
+dest   = "usr/lib"
+kind   = "ro_nullfs"
+[[mounts]]
+source = "/usr/local/bin"
+dest   = "usr/local/bin"
+kind   = "ro_nullfs"
+[[mounts]]
+source = "/atrium/sockets"                        # rw: tactusd BINDS tactus/tactus.sock here
+dest   = "atrium/sockets"
+kind   = "rw_nullfs"
+
+[exec]
+path = "/usr/local/bin/atrium-tactusd"
+argv = ["atrium-tactusd"]
+uid  = 65018   # _tactus
+gid  = 65018

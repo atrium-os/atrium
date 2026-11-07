@@ -11,7 +11,7 @@
 # equiv), and the only privileged thing it touches is the GPU device — granted to
 # _frescod via the atrium_display devfs ruleset (23), since the atrium-gpu-amd kmod
 # gates only on device-node perms (no priv_check). Isolated: own rootfs (sees no
-# host fs), per-jail devfs (only basics + gpu0/display0/hidraw*).
+# host fs), per-jail devfs (only basics + gpu0/display0; input comes from tactusd).
 #
 # This is the compute (default) and gpu renderers' jail: frescod reads no
 # fonts, shader bundles or Vulkan ICDs, because each client's text and scene
@@ -44,7 +44,7 @@ enabled       = true
 name          = "atrium-frescod"
 path          = "/var/lib/atrium/jails/frescod"
 children_max  = 0
-devfs_ruleset = 23                               # atrium_display: basics + gpu/display/hidraw (frescod only)
+devfs_ruleset = 23                               # atrium_display: basics + gpu/display (frescod only)
 
 [[mounts]]
 source = "/libexec"

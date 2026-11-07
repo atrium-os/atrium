@@ -36,10 +36,9 @@ mod credential;
 mod drag;
 mod notify;
 mod injector_reader;
-mod input_reader;
 mod laminar;
 mod pack;
-mod pointer_reader;
+mod tactus_client;
 mod redraw;
 mod render_backend;
 mod socket_server;
@@ -52,7 +51,6 @@ mod heads;
 mod outputs;
 mod video;
 mod span;
-mod consumer;
 
 use atrium_gpu::amd::{Display, EventWatch, Gpu, ModeV2, OutputCommit, MODE_PREFERRED, NOTE_HOTPLUG, NOTE_RESET};
 
@@ -188,7 +186,7 @@ fn main() -> std::io::Result<()> {
     let comp  = Arc::new(Mutex::new(Compositor::new_with_window0(scene, slots)));
     comp.lock().unwrap().mint_embed_tokens = true; // limen.md §5
 
-    /* DisplayEvent sink: compositor pushes window events, input_reader
+    /* DisplayEvent sink: compositor pushes window events, tactus_client
      * pushes keyboard events; fan-out thread encodes + broadcasts to
      * all per-connection writer mpscs. Senders are cheaply cloneable
      * so each producer keeps its own. */
@@ -250,13 +248,10 @@ fn main() -> std::io::Result<()> {
     activation::start(comp.clone());
     drag::install(comp.clone());
 
-    /* Native FreeBSD keyboard + pointer input. Both read /dev/hidraw*
-     * directly (boot-protocol HID), update server cursor / focus state,
-     * and push DisplayEvents through the shared event sink. Fail-soft:
-     * frescod runs without input if no matching /dev/hidraw* is found. */
     let ev_main = ev_tx.clone();	/* EV_DISPLAY_CHANGED on a mode switch */
-    input_reader::spawn(ev_tx.clone(), comp.clone());
-    pointer_reader::spawn(ev_tx.clone(), comp.clone(), dw, dh);
+    /* Device input comes only from tactusd (Tactus, docs/spec/atrium-input.md):
+     * frescod parses no device reports and its jail has no input nodes. */
+    tactus_client::spawn(ev_tx.clone(), comp.clone(), tactus_client::socket(), (dw, dh));
     /* Synthetic input injection (dev/test harness): feeds the same event sink as
      * the HID readers, so scripted input routes through hit-test/focus identically.
      * Lets us drive the input loop without an HID device. */
@@ -1220,10 +1215,12 @@ fn run_headless(png: &str) -> std::io::Result<()> {
     comp.lock().unwrap().set_event_sink(ev_tx.clone());
     /* Synthetic input injection — the headless interactive harness. No HID device
      * needed: scripted input over a socket feeds the same event sink + hit-test as
-     * real /dev/hidraw input, so we can drive + debug the input→WM→render loop. */
+     * real input from tactusd, so we can drive + debug the input→WM→render loop. */
     if let Ok(isock) = std::env::var("FRESCOD_INPUT_SOCK") {
         injector_reader::spawn(ev_tx.clone(), comp.clone(), W, H, isock);
     }
+    /* Real input in headless mode too, when tactusd runs (VM input tests). */
+    tactus_client::spawn(ev_tx.clone(), comp.clone(), tactus_client::socket(), (W, H));
     let frontend = Arc::new(Mutex::new(EnvelopeFrontend::new(cas, comp.clone())));
     frontend.lock().unwrap().set_notification_uids(Some(notify::uids().to_vec()));
     /* Headless has no connector, but clients still need an answer — the surface

@@ -26,9 +26,9 @@ add include $devfsrules_unhide_basic
 add path pressure unhide
 add path pressure mode 0644
 
-# GPU + HID input, no display. Baseline plus the GPU and HID input nodes, made
-# openable (0666) inside the jail's own devfs instance so a non-root uid can use
-# them. The atrium-gpu-amd kmod gates only on
+# GPU, no display. Baseline plus the GPU node, made openable (0666) inside the
+# jail's own devfs instance so a non-root uid can use it. No input nodes: input
+# comes from tactusd (atrium_input=26). The atrium-gpu-amd kmod gates only on
 # node permissions (no priv_check), so this grant alone lets frescod run without
 # root. atrium-gpu0ctl (device reset, scheduler, power gating) is deliberately
 # NOT unhidden here or in any jail ruleset: it is the host broker's alone. The host's nodes stay 0600 root:wheel — these rules change only this
@@ -38,8 +38,6 @@ add include $devfsrules_hide_all
 add include $devfsrules_unhide_basic
 add path 'atrium-gpu0' unhide
 add path 'atrium-gpu0' mode 0666
-add path 'hidraw*' unhide
-add path 'hidraw*' mode 0666
 
 # The jailed, NON-ROOT compositor (frescod): atrium_gpu plus the display. This
 # ruleset is frescod's alone: jaild.policy.toml pins id 23 to the frescod
@@ -53,8 +51,6 @@ add path 'atrium-gpu0' unhide
 add path 'atrium-gpu0' mode 0666
 add path 'atrium-display0' unhide
 add path 'atrium-display0' mode 0666
-add path 'hidraw*' unhide
-add path 'hidraw*' mode 0666
 
 # The jailed, NON-ROOT audio engine (lyrad, lyra-v1.md §3): the sound card
 # (dsp*, mixer*) and the deadline lane, openable inside this jail's own devfs.
@@ -79,3 +75,13 @@ add path 'laminar' mode 0666
 add include $devfsrules_hide_all
 add include $devfsrules_unhide_basic
 add include $devfsrules_unhide_login
+
+# The jailed, NON-ROOT input service (tactusd, atrium-input.md §2): the HID
+# nodes (USB and I2C devices through hidbus), openable inside this jail's own
+# devfs. tactusd's alone (jaild.policy.toml pins id 26); frescod's rulesets
+# show no input nodes.
+[atrium_input=26]
+add include $devfsrules_hide_all
+add include $devfsrules_unhide_basic
+add path 'hidraw*' unhide
+add path 'hidraw*' mode 0666

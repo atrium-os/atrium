@@ -8,8 +8,7 @@
 //!   │ CAS + SceneGraph + SlotTable + Compositor              │
 //!   │ EnvelopeFrontend (fresco-protocol dispatcher)          │
 //!   │ socket_server (per-client fan-in/fan-out)              │
-//!   │ input_reader  (keyboard via /dev/input)                │
-//!   │ pointer_reader (mouse)                                  │
+//!   │ tactus_client (keyboard, pointer, media keys via tactusd)│
 //!   │ atrium_gpu::{Gpu, Display, Bo}  + page-flip            │
 //!   └─────────────────────────────────────────────────────────┘
 //!
@@ -75,15 +74,11 @@
 //! - `FRESCOD_DAMAGE_THRESHOLD=<f32>` — override the level-3
 //!   partial-redraw threshold (0.0..=1.0; 0.0 disables level-3).
 
-#[path = "../consumer.rs"]
-mod consumer;
-#[path = "../input_reader.rs"]
-mod input_reader;
+#[path = "../tactus_client.rs"]
+mod tactus_client;
 #[path = "../screen.rs"]
 #[allow(dead_code)]
 mod screen;
-#[path = "../pointer_reader.rs"]
-mod pointer_reader;
 #[path = "../laminar.rs"]
 mod laminar;
 #[path = "../redraw.rs"]
@@ -338,9 +333,8 @@ fn main() -> std::io::Result<()> {
     )?;
     socket_server::spawn_event_fanout(ev_rx, event_subs, redraw, comp.clone());
 
-    // Input readers (same as the standalone frescod).
-    input_reader::spawn(ev_tx.clone(), comp.clone());
-    pointer_reader::spawn(ev_tx, comp.clone(), mode.width, mode.height);
+    // Device input from tactusd (same as the standalone frescod).
+    tactus_client::spawn(ev_tx, comp.clone(), tactus_client::socket(), (mode.width, mode.height));
 
     // ── Frame loop ───────────────────────────────────────────────
     let mut timeline: u64 = 0;
