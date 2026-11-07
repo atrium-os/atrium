@@ -1,139 +1,223 @@
-# Atrium input pipeline
+# Atrium input pipeline: Tactus
 
-**Status:** design, 2026-05-08.
-**Owner:** atrium-devevents + fresco-server input thread + Pergola.
+**Status:** design rev. 2, 2026-11-07, decisions in §10 pending.
+Rev. 1 (2026-05-08) planned a USB-only `uhid(4)` reader inside
+frescod; what got built is several ad-hoc `hidraw(4)` readers in
+frescod. Rev. 2 names the layer between the kernel and frescod
+**Tactus** and gives it every input bus, not just USB.
+**Owner:** Fresco display thread (Tactus, frescod routing) + Pergola.
 
-How HID input devices (keyboards, mice, gamepads, joysticks,
-trackpads) flow from the kernel to the focused jail's app, with
-the per-device-class semantics each app category needs.
+How input devices (keyboards, mice, touchpads, touch screens,
+gamepads, media keys, specialty HID) flow from the kernel to the
+focused app, on every bus a FreeBSD machine has: USB, I2C, PS/2,
+Bluetooth.
 
-> **Position.** Atrium reads input from `/dev/uhid<N>` directly.
-> Not from `/dev/input/event*`. FreeBSD ships an evdev compatibility
-> layer for porting Linux input drivers; that layer is exactly the
-> kind of Linux-shape shim our policy rejects (`feedback_no_linuxkpi`,
-> `feedback_no_linux_keycodes`). Pure FreeBSD primitives — `uhid(4)`
-> + `libusbhid(3)` — for everything.
+> **Position.** No evdev. FreeBSD ships an evdev compatibility layer
+> (`/dev/input/event*`) for porting Linux input drivers and Xorg's
+> libinput stack; it is exactly the Linux-shape shim our policy
+> rejects (`feedback_no_linuxkpi`, `feedback_no_linux_keycodes`), and
+> it would not save the work below anyway: evdev hands over Linux
+> keycodes and raw axes, and libinput-class work (acceleration,
+> touchpad gestures) still has to be written. Tactus is our own
+> evdev-equivalent: one parsed, normalised event stream in **HID
+> usages**, whatever the bus.
 
-## 1. Architecture
+## 1. Why a named layer
+
+Today frescod has four readers, each its own small parser:
+`input_reader.rs` (keyboards, boot 8-byte layout only),
+`pointer_reader.rs` (boot-protocol mice), `consumer.rs` (media keys,
+the only one that parses report descriptors) and `injector_reader.rs`
+(the dev harness). They see USB and I2C devices (through `hidbus` and
+`hidraw`), nothing else. Adding touchpads, PS/2, Bluetooth and
+gamepads to that would scatter the same descriptor parsing, hotplug
+and normalisation across frescod. Three reasons to pull it out:
+
+1. **Untrusted parsing.** Report descriptors and reports come from
+   whatever is plugged in. A malicious USB device is a classic attack;
+   its parser should not run in the compositor, which holds every
+   window's pixels and mints activation tokens.
+2. **More than one consumer.** frescod routes, but the lock screen,
+   games (raw deltas, gamepads), tests (the span chaos and probe
+   scripts) and later accessibility want the same normalised stream.
+3. **One place for the hard parts:** pointer acceleration, touchpad
+   contact tracking and gestures, key repeat, PS/2 scancode
+   translation. These are libinput's job on Linux; here they have a
+   name and an owner.
+
+## 2. Architecture
 
 ```
-┌────────────────────────────────────────────────────────────────┐
-│  USB HID device (kbd, mouse, gamepad, …)                       │
-└──────────────────────────┬─────────────────────────────────────┘
-                           │ USB
-                           ▼
-┌────────────────────────────────────────────────────────────────┐
-│  FreeBSD kernel: uhid(4), exposes /dev/uhid<N>                 │
-│    - raw HID reports                                           │
-│    - HID descriptor via USB_GET_REPORT_DESC ioctl              │
-└──────────────────────────┬─────────────────────────────────────┘
-                           │ devd / kqueue
-                           ▼
-┌────────────────────────────────────────────────────────────────┐
-│  atrium-devevents (per BSD; tiny parser, not a daemon)         │
-│    - watches /dev/uhid<N> appear / disappear                   │
-│    - on appear: read descriptor via libusbhid                  │
-│    - classify (HID Usage Page + Usage → device class)          │
-│    - publish "device-attached" event                           │
-└──────────────────────────┬─────────────────────────────────────┘
-                           │
-                           ▼
-┌────────────────────────────────────────────────────────────────┐
-│  atrium-input-router (today: thread in fresco-server;          │
-│                       future: dedicated daemon)                │
-│    - opens /dev/uhid<N>, reads raw HID reports                 │
-│    - decodes per parsed descriptor                             │
-│    - emits canonical aqueduct events (CLASS_INPUT = 7)         │
-│    - routes per WM focus + per-jail capability                 │
-└──────────────────────────┬─────────────────────────────────────┘
-                           │ aqueduct
-                           ▼
-┌────────────────────────────────────────────────────────────────┐
-│  Pergola in app process                                        │
-│    - subscribes to input events                                │
-│    - delivers via SurfaceRenderer callbacks + signals          │
-└────────────────────────────────────────────────────────────────┘
+ USB HID ─┐                        PS/2 kbd ── atkbd ─┐
+ I2C HID ─┴─ hidbus ── /dev/hidraw*    PS/2 aux ── psm ── /dev/psm*
+                 │                                    │
+ Bluetooth ── Bluetooth service ── HID channels (§3.3)│
+                 │                                    │
+                 ▼                                    ▼
+ ┌──────────────────────────────────────────────────────────────┐
+ │ tactusd  (jailed, user _tactus, no network)                  │
+ │   sources: hidraw, PS/2, Bluetooth HID, (dev) injector       │
+ │   crate `tactus`: descriptor parser, report decoder,         │
+ │     scancode→HID, pointer stage, touchpad, key repeat        │
+ └──────────────────────────────┬───────────────────────────────┘
+                                │ one socket, postcard (§4.0)
+                                ▼
+ ┌──────────────────────────────────────────────────────────────┐
+ │ frescod: cursor position, hit-test, focus, pointer lock,     │
+ │   activation tokens, WM-only keys, capability gating         │
+ └──────────────────────────────┬───────────────────────────────┘
+                                │ fresco protocol input events
+                                ▼
+                      Pergola in the app process
 ```
 
-## 2. Device discovery
+**Split of work.** Tactus knows devices and nothing about windows: it
+turns reports into canonical events with a device id and a timestamp.
+frescod knows windows and nothing about devices: it integrates
+pointer motion into the cursor (it owns display geometry), hit-tests,
+routes by focus and capability, and mints activation tokens. Kinetic
+scrolling (flings) stays in Pergola's ScrollView (decision
+2026-11-06); Tactus only marks where a finger scroll ends.
 
-`atrium-devevents` is the per-BSD device-hotplug parser library
-(`feedback_bsd_devevents_shape`). On FreeBSD it watches `devd`
-events for HID device attach/detach and parses the resulting
-state.
+**Crate and service.** `tactus` is a pure library (no I/O): parsers,
+decoders and the stages, all unit-testable on the host with recorded
+descriptors and reports, like `consumer.rs` is today. `tactusd` is
+the service: hotplug through `atrium-devevents`, the device fds, the
+socket. It runs as `_tactus` in a jail whose devfs ruleset shows only
+`hidraw*`, `psm*`, the PS/2 keyboard node (§3.2) and its socket
+directory, with no network. Compromise of tactusd means forged input,
+which a malicious device can do anyway, but not the compositor's
+memory or other apps.
 
-For each new `/dev/uhid<N>`:
+**Trust.** frescod accepts device events only from tactusd's socket
+(peer uid `_tactus`) and mints activation tokens only for them, as
+it does now for its own readers. The injector moves into tactusd as a
+dev-only source and stays marked synthetic (no tokens unless
+`FRESCOD_INJECT_ACTIVATION=1`, tabula.md §2.1).
 
-1. `open(2)` for descriptor query (no exclusive grab — multiple
-   readers OK at this stage).
-2. `ioctl(USB_GET_REPORT_DESC)` retrieves the raw descriptor bytes.
-3. `libusbhid` parses the descriptor into a structured form
-   (collections, fields, usages, value ranges).
-4. The top-level collection's Usage Page + Usage classifies the
-   device:
+## 3. Sources
+
+Every source produces the same thing: a device record (§4.0) and,
+where it can, HID reports with a report descriptor. Non-HID buses are
+translated to HID usages at the source, so everything after it sees
+one vocabulary.
+
+### 3.1 hidbus: USB and I2C
+
+FreeBSD's `hidbus(4)` sits under USB HID (`usbhid`) and I2C HID
+(`iichid`, which is how most laptop touchpads and touch screens
+attach), and `hidraw(4)` exposes every top-level collection as
+`/dev/hidraw<N>` with `HIDIOCGRDESC` for its descriptor. Reading
+hidraw runs alongside the kernel's own drivers (`hkbd`, `hms`,
+`hmt`), which keep feeding the console. This is the main source and
+replaces rev. 1's `uhid(4)`, which is USB-only.
+
+Tactus parses the descriptor in full (generalising `consumer.rs`:
+collections, report ids, arrays and variables, logical/physical
+ranges, units) and classifies each top-level collection (§3.5). It no
+longer assumes boot-protocol layouts.
+
+### 3.2 PS/2
+
+Still common on laptops: the built-in keyboard and, on many, the
+touchpad sit on the i8042 controller.
+
+- **Keyboard (`atkbd`).** Scancodes (set 1 or 2), translated to HID
+  page 0x07 usages with the published scancode-to-HID table (the one
+  Microsoft documents for its keyboard stack), not Linux keycodes.
+  Node to verify on hardware: the `atkbd` cdev (`KBD_INSTALL_CDEV`)
+  detached from `kbdmux`, or a vt tty in `K_RAW` as Xorg's keyboard
+  driver did. Either way the console keeps a path when tactusd is not
+  running.
+- **Pointer (`psm`).** `/dev/psm0` at `MOUSE_SETLEVEL 2` gives native
+  packets. Plain PS/2 mice decode to buttons and deltas; Synaptics,
+  Elantech and ALPS touchpads decode to finger contacts and feed the
+  same touchpad stage (§5.3) as an I2C precision touchpad. Trackpoints
+  arrive as a pass-through stream on the same port.
+
+### 3.3 Bluetooth
+
+Bluetooth carries more than input (A2DP and hands-free audio, file
+transfer, LE sensors), so it is **not** part of Tactus. A system
+Bluetooth service owns the controller (HCI, scanning, pairing, link
+keys in Arca, which profiles each device may use) and hands each
+profile's channel to the service that owns that kind of data: HID to
+Tactus, audio to Lyra. Its design, including whether to extend
+FreeBSD's netgraph stack (`ng_ubt`/`ng_h4`, HCI and L2CAP sockets;
+Classic only, no LE above HCI) or build a new one, belongs to its own
+spec (Bluetooth thread, 2026-11-07). Tactus assumes only that it gets
+HID channels from that service.
+
+For Tactus, a Bluetooth HID device is a source like hidraw: Classic
+HID gives the descriptor from SDP and reports on the interrupt
+channel; HID over GATT gives the Report Map and report
+characteristics. Both are HID descriptors and reports, so §3.1's
+parser handles them unchanged. Tactus gets the channels over a socket
+from the Bluetooth service and never touches HCI.
+
+### 3.4 Virtual and test sources
+
+- QEMU's `usb-kbd` / `usb-tablet` arrive through hidraw (the tablet is
+  an absolute pointer, §5.2), which is what the VM tests use today.
+- The injector line protocol (`MOVE`, `BTN`, `KEY`, `SCROLL`) moves
+  from frescod into tactusd unchanged, dev builds only.
+- A replay source plays recorded descriptor + report traces, so real
+  devices' quirks become host tests.
+
+### 3.5 Classification
+
+Per top-level collection, as rev. 1:
 
 | Usage Page | Usage | Class |
 |---|---|---|
-| `0x01` (Generic Desktop) | `0x02` (Mouse) | Pointer |
-| `0x01` | `0x04` (Joystick) | Joystick |
-| `0x01` | `0x05` (Game Pad) | Gamepad |
-| `0x01` | `0x06` (Keyboard) | Keyboard |
-| `0x01` | `0x07` (Keypad) | Keyboard (numeric) |
-| `0x0D` (Digitizers) | `0x04` (Touch Screen) | Touch |
-| `0x0D` | `0x05` (Touch Pad) | Touchpad |
+| `0x01` Generic Desktop | `0x02` Mouse | Pointer |
+| `0x01` | `0x04` Joystick | Joystick |
+| `0x01` | `0x05` Game Pad | Gamepad |
+| `0x01` | `0x06` Keyboard | Keyboard |
+| `0x01` | `0x07` Keypad | Keyboard |
+| `0x01` | `0x80` System Control | System keys (power, sleep) |
+| `0x0C` Consumer | `0x01` Consumer Control | Media keys |
+| `0x0D` Digitizers | `0x04` Touch Screen | Touch |
+| `0x0D` | `0x05` Touch Pad | Touchpad |
+| `0x0D` | `0x02` Pen | Pen (later) |
 
-5. Devices that don't match a known class are still discovered
-   but tagged `Class::Raw` — apps with the right capability can
-   open and parse them themselves.
-
-`atrium-devevents` publishes a typed event:
-
-```rust
-pub enum DeviceEvent {
-    Attached  { id: DeviceId, class: DeviceClass, descriptor: HidDescriptor,
-                vendor: u16, product: u16, name: String },
-    Detached  { id: DeviceId },
-}
-```
-
-`DeviceId` is a stable identifier surviving suspend/resume (mapped
-via vendor+product+serial when serial is available, else session-
-local).
-
-## 3. Routing
-
-The atrium-input-router holds the open file descriptors for all
-discovered devices and drives the read loops. Today it lives as a
-thread inside fresco-server; future split into a dedicated daemon
-is an internal refactor with no wire-format impact.
-
-**Focus-driven routing.** For each input event, the router looks up
-the WM's currently-focused window, identifies the owning jail,
-and emits the canonical input event on that jail's aqueduct
-connection. Unfocused jails see nothing.
-
-**Exclusive routing for locked devices.** When an app holds a
-pointer-lock or gamepad-exclusive grant, the router routes those
-specific devices to that app even if focus moves elsewhere — until
-the grant is released. Modal popups break exclusivity (see §6.2).
-
-**Capability gating.** Per-jail manifest declares which device
-classes it may receive:
-
-```toml
-[capabilities]
-input.keyboard = true       # most jails
-input.pointer  = true       # most jails
-input.gamepad  = true       # games + couch-input apps
-input.raw_hid  = false      # rare; specialty hardware apps only
-```
-
-Capability checked at subscription time; without it, the router
-silently does not deliver events of that class to the jail's
-aqueduct connection. Default-grant for keyboard+pointer
-(everything is a UI), default-deny for gamepad and raw.
+Anything else is `Raw`: apps holding `input.raw_hid` can get its
+reports (§4.6). One physical device commonly has several collections
+(keyboard + media keys + system control); they share a device id and
+report separately.
 
 ## 4. Wire format
+
+### 4.0 tactusd to frescod
+
+One stream socket, length-prefixed postcard messages (the Lyra
+choice, lyra-v1.md), versioned by a hello:
+
+```
+Device   { id, bus: Usb|I2c|Ps2|Bluetooth|Virtual, classes, vendor,
+           product, name, physical_mm? }          // attach, or update
+Gone     { id }
+Key      { id, ts_ns, usage: u32 /* page<<16|usage */, down, repeat }
+Motion   { id, ts_ns, dx, dy, raw_dx, raw_dy }    // accelerated + raw
+Absolute { id, ts_ns, x, y, range_x, range_y }     // tablets, touch
+Button   { id, ts_ns, usage, down }
+Scroll   { id, ts_ns, axis, value_120, pixels?, phase: None|Begin|Update|End }
+Gesture  { id, ts_ns, kind: Swipe|Pinch|Hold, fingers, phase, dx, dy, scale }
+Contacts { id, ts_ns, contacts[] }                 // touch screens, raw touchpad
+Axis     { id, ts_ns, usage, value: i16 }          // gamepads
+Raw      { id, ts_ns, report }                     // Raw class only
+```
+
+`value_120` is the high-resolution wheel convention (120 per detent).
+Usages are full 32-bit page:usage, so media keys (`0x000C_00CD`) need
+no `0x0C00|` packing on this hop; frescod keeps the current packing
+toward apps until CLASS_INPUT lands.
+
+### 4.1 frescod to apps
+
+As built, frescod sends `InputKey`, `InputPointerMotion`,
+`InputPointerButton` and `InputPointerScroll` (fresco-protocol). The
+plan below moves them to their own class:
 
 New opcode class:
 
@@ -146,7 +230,7 @@ display/scenegraph (CLASS_DISPLAY = 1) — keeps the two evolving
 independently and allows future input-only consumers (accessibility
 narrators, automation tools, screen recorders).
 
-### 4.1 Common shape
+#### Common shape
 
 All input events carry:
 
@@ -156,26 +240,26 @@ ts_ns      : u64     // host monotonic clock at HID-report time
 window_id  : u32     // owning window (for focus context)
 ```
 
-### 4.2 Keyboard ops
+#### Keyboard ops
 
 ```
 KEY_DOWN    device_id, ts_ns, window_id, hid_usage, modifiers
 KEY_UP      device_id, ts_ns, window_id, hid_usage, modifiers
 KEY_REPEAT  device_id, ts_ns, window_id, hid_usage, modifiers
-            (synthesized by router from kernel auto-repeat)
+            (synthesized by Tactus, per-user delay and rate)
 
 modifiers : u16   bitfield: shift, ctrl, alt, super, fn, capslock
                   (extracted from current modifier-key state, NOT
                   passed through the wire from the device — modifier
-                  state is router-side state)
+                  state is frescod-side state)
 ```
 
 Key codes are HID Usage Page 0x07 directly — no translation.
 Modifier keys themselves emit `KEY_DOWN`/`KEY_UP` with their HID
-usages (0xE0..0xE7) AND update the router's modifier state used in
+usages (0xE0..0xE7) AND update frescod's modifier state used in
 subsequent events' `modifiers` fields.
 
-### 4.3 Pointer ops
+#### Pointer ops
 
 ```
 POINTER_MOTION_ABS  device_id, ts_ns, window_id, x, y
@@ -208,15 +292,15 @@ POINTER_LOCK_LOST   window_id, reason  (server → client event)
 
 - App calls `POINTER_LOCK Lock` after user interaction (typically
   pointer-down inside the window). Without that initial gesture,
-  router refuses — prevents a hostile background app from grabbing
+  frescod refuses — prevents a hostile background app from grabbing
   the cursor.
 - Lock survives until: (a) user presses Escape; (b) WM moves focus
   away; (c) a modal popup grabs focus; (d) app explicitly unlocks.
-- On release the router emits `POINTER_LOCK_LOST` with reason.
+- On release frescod emits `POINTER_LOCK_LOST` with reason.
 - Re-acquisition requires a fresh `POINTER_LOCK Lock` request after
   user gesture.
 
-### 4.4 Gamepad ops
+#### Gamepad ops
 
 ```
 GAMEPAD_CONNECT     device_id, vendor, product, name,
@@ -228,7 +312,7 @@ GAMEPAD_BUTTON      device_id, ts_ns, hid_usage, pressed
                     not by synthesized index)
 GAMEPAD_AXIS        device_id, ts_ns, hid_usage, value
                     (value: i16 normalized -32768..32767;
-                    router scales raw report to this range using
+                    Tactus scales the raw report to this range using
                     descriptor's logical_min/logical_max)
 ```
 
@@ -236,7 +320,7 @@ No `window_id` — gamepad events route to whoever has the gamepad
 exclusively granted (see §6.3) or to the focused window if no
 exclusive grant.
 
-### 4.5 Touch ops (deferred to V1)
+#### Touch ops (deferred)
 
 ```
 TOUCH_BEGIN  device_id, ts_ns, window_id, slot, x, y, pressure
@@ -247,7 +331,7 @@ TOUCH_END    device_id, ts_ns, window_id, slot
 Multi-touch slots per HID Usage Page 0x0D conventions. Not
 gaming-blocking on desktop; punted.
 
-### 4.6 Raw HID ops (specialty escape hatch)
+#### Raw HID ops (specialty escape hatch)
 
 ```
 RAW_HID_REPORT  device_id, ts_ns, report_bytes[]
@@ -255,48 +339,49 @@ RAW_HID_REPORT  device_id, ts_ns, report_bytes[]
 ```
 
 For apps that need direct HID access — flight-sim throttles, VR
-trackers, MIDI-over-HID, etc. The router still owns the open file
-descriptor (kept in one process for atomicity); raw bytes flow
-through the wire.
+trackers, MIDI-over-HID, etc. tactusd still owns the open file
+descriptor; raw bytes flow through frescod to the app.
 
 ## 5. Per-device-class detail
 
 ### 5.1 Keyboards
 
-Already largely shipped (D1 step 2c.14), but with a substrate gap:
-the existing `input_reader` thread reads `/dev/input/eventN` (the
-evdev shim). Migration path:
-
-1. Add a `/dev/uhid<N>` reader path alongside the existing evdev
-   path; both feed the same canonical-event emitter.
-2. Verify HID-direct path produces equivalent events on the same
-   physical hardware.
-3. Cut over: remove the evdev path; keep the canonical-event
-   emitter unchanged.
-
-Wire format doesn't change — we already emit HID Usage Page 0x07
-codes; only the input substrate changes.
+Any descriptor layout, not just boot protocol (N-key rollover
+keyboards report a bitmap). PS/2 scancodes are translated at the
+source (§3.2). Key repeat is synthesised in Tactus from per-user delay
+and rate, so every source repeats the same way; frescod drops repeats
+of keys whose window lost focus. Modifier state stays frescod's (it is
+per seat, across keyboards).
 
 ### 5.2 Pointers
 
-Mouse motion comes from HID Usage Page 0x01 Usage 0x30/0x31 (X, Y)
-in the descriptor's "relative" data field. The router maintains an
-internal absolute-position cursor by accumulating deltas and
-clamping to the current display geometry; emits `POINTER_MOTION_ABS`
-with the resulting position when in `Unlock`/`Confine` modes, and
-emits `POINTER_MOTION_REL` directly with the raw deltas when in
-`Lock` mode.
+Relative devices (mice, trackpoints) go through the **pointer stage**:
+a per-user acceleration curve on deltas scaled by the device's
+resolution when the descriptor gives one, so a 400 and a 3200 DPI
+mouse feel alike. Both the accelerated and the raw delta are sent;
+frescod uses raw under pointer lock (rev. 1 §4.3, unchanged).
+Absolute devices (tablets, QEMU's usb-tablet, touch screens in mouse
+mode) send `Absolute`, which frescod maps to the output they belong to.
+Wheels: high-resolution wheel (`Resolution Multiplier`) when present,
+else 120 per detent.
 
-Wheel scrolling: HID Usage 0x38 (Wheel) → `POINTER_SCROLL`.
-Buttons: HID Usage Page 0x09 → `POINTER_BUTTON`.
+### 5.3 Touchpads
 
-DPI / acceleration: the router applies *no* OS-side acceleration
-in `Lock` mode — apps get raw deltas straight from the device.
-In `Unlock`/`Confine` mode it may apply a configurable
-acceleration curve (operator policy), so the cursor feels right
-at varying device DPI.
+Two inputs, one stage: Windows Precision Touchpad reports over hidbus
+(contacts with ids, confidence and the button) and PS/2 native packets
+(§3.2). The stage tracks contacts and produces:
 
-### 5.3 Gamepads
+- pointer motion from one finger, with palm and thumb rejection
+  (confidence bit, contact size, edge zones) and typing suppression
+  shortly after a key press;
+- tap-to-click, two- and three-finger taps, clickpad button areas
+  or finger-count clicking (a user setting);
+- two-finger scroll as `Scroll` with pixels and phases, so Pergola's
+  ScrollView flings on `End`;
+- `Gesture` swipe and pinch, which Forum uses for workspace and
+  overview gestures and apps get for zoom.
+
+### 5.4 Gamepads
 
 USB gamepads / DualShock / Xbox controllers follow HID Usage Page
 0x01 Usage 0x05 with vendor-defined collections. Most modern
@@ -307,158 +392,89 @@ controllers expose:
 - Triggers via Usage Page 0x01 Usage 0x32, 0x35 (Z, Rz) typically
 - D-pad via Usage Page 0x01 Usage 0x39 (Hat Switch)
 
-The router decodes per the device's actual descriptor — it does
+Tactus decodes per the device's actual descriptor — it does
 *not* maintain a per-vendor remap table. If the controller says
 "button at usage 0x09:0x01 is `A`," that's the wire output. App-
 side libraries (`pergola-gamepad`) may layer convenience mappings
 ("XInput-style: button 0 = A") on top, but the wire stays
 HID-faithful.
 
-### 5.4 Touch (deferred)
+### 5.5 Touch (deferred)
 
 HID Usage Page 0x0D + the multi-touch report descriptor convention.
 Not implemented in V1; spec'd here for forward compatibility.
 
 ## 6. Capability mediation
 
-Per-jail `[capabilities]` controls:
+Unchanged from rev. 1, enforced by frescod:
 
 ```toml
 [capabilities]
-input.keyboard         = true           # most apps
-input.pointer          = true           # most apps
-input.pointer_lock     = true           # games / 3D modelers
-input.gamepad          = true           # games
-input.gamepad_exclusive = true          # require exclusive grant
-                                         # (refuses if another app
-                                         # already holds a controller)
-input.raw_hid          = false          # rare; specialty hardware
-input.system_keys      = false          # Cmd-Tab, Win, etc.
-                                         # V1 default-deny
+input.keyboard          = true   # most apps
+input.pointer           = true   # most apps
+input.pointer_lock      = true   # games / 3D modellers
+input.gamepad           = true   # games
+input.gamepad_exclusive = true   # exclusive controller grant
+input.raw_hid           = false  # specialty hardware
+input.system_keys       = false  # Cmd-Tab, Win etc.; WM owns them
 ```
 
-The router enforces per-class delivery:
-
-- Without `input.keyboard`, no `KEY_*` ops reach the jail.
-- Without `input.gamepad`, gamepad events skip the jail even if
-  it's focused.
-- `input.pointer_lock` is a separate grant from `input.pointer`:
-  many apps want pointer events but should never lock the cursor
-  (a notification-display app, a settings panel).
-- `input.system_keys` controls whether the WM forwards system
-  shortcuts (Cmd-Tab, Win key, etc.) instead of consuming them.
-  V1: default-deny; the WM owns these unconditionally. V2+: the
-  capability-prompt UI (Forum / D3) can grant per-app.
-
-Capabilities are checked at subscription time and on each grant
-upgrade (e.g. `POINTER_LOCK Lock` request).
+Media keys go to the WM only (atrium-player-pip-keys.md §4.3), and
+system-control keys (power, sleep) go to the session, never to apps.
 
 ## 7. Pergola integration
 
-The toolkit subscribes to input events on the app's aqueduct
-connection and surfaces them as:
-
-**Signals** for normal UI (most apps):
-
-```rust
-fn root(s: &State, input: &InputSignals) -> impl View {
-    let cursor = input.pointer_pos.get();
-    let pressed = input.keys_down.get();        // Set<HidUsage>
-
-    column((
-        text(format!("Mouse at {:?}", cursor)),
-        if_signal(pressed.contains(0x07_29), || text("ESC pressed")),
-    ))
-}
-```
-
-`InputSignals` exposes high-level reactive state for the app's
-focused window: `pointer_pos: Signal<(f32,f32)>`, `keys_down:
-Signal<Set<HidUsage>>`, `modifiers: Signal<Modifiers>`. Mostly used
-for the kind of UI logic that doesn't need event timestamps.
-
-**Direct callbacks** on `SurfaceRenderer` for games / GPU surfaces:
-
-```rust
-impl SurfaceRenderer for MyGame {
-    fn on_pointer_motion_rel(&mut self, dx: f32, dy: f32, ts: u64) {
-        self.camera.yaw   += dx * self.sens;
-        self.camera.pitch += dy * self.sens;
-    }
-    fn on_key(&mut self, usage: HidUsage, pressed: bool, ts: u64) { ... }
-    fn on_gamepad_button(&mut self, dev: DeviceId, usage: HidUsage, pressed: bool) { ... }
-    fn on_gamepad_axis(&mut self, dev: DeviceId, usage: HidUsage, value: i16) { ... }
-}
-```
-
-Surface-renderer callbacks run synchronously, with full event
-timestamps. Games typically work entirely off these and ignore the
-signal layer (input-loop state is the renderer's, not Pergola's).
-
-**`pergola-gamepad`** (separate crate, like `pergola-wgpu`) layers
-XInput-style convenience over the HID-native events:
-
-```rust
-let pad = gamepad::wait_for_connection().await;
-match pad.button(Button::A) {
-    ButtonState::Pressed => ...,
-    ...
-}
-```
-
-Convenience mappings (`Button::A`, `Stick::Left`, `Trigger::Right`)
-are app-side translations of HID usages; the wire stays
-HID-faithful so per-vendor quirks don't leak into the platform
-layer.
+As rev. 1: `InputSignals` for ordinary UI, direct callbacks on
+`SurfaceRenderer` for games, `pergola-gamepad` for XInput-style names
+over HID usages, plus scroll phases and gestures for ScrollView and
+zoomable views. The wire to apps stays HID-faithful.
 
 ## 8. Implementation order
 
-1. **`/dev/uhid<N>` reader + libusbhid descriptor parser**
-   — foundation; replaces the current evdev path. ~3 days.
-2. **CLASS_INPUT = 7 + ops; `KEY_*`, `POINTER_MOTION_ABS/REL`,
-   `POINTER_BUTTON`, `POINTER_SCROLL`** — wire format + router
-   delivery. ~2 days. Existing keyboard demos verify equivalence.
-3. **`POINTER_LOCK` + `POINTER_LOCK_LOST`** — cursor lock
-   semantics. Enables FPS-class games. ~2 days. Verify with a
-   Bevy mouse-look demo running through `pergola-wgpu`.
-4. **Gamepad classification + ops** — `GAMEPAD_*` family,
-   `pergola-gamepad` adapter. ~4 days. Verify with a USB Xbox
-   controller.
-5. **Existing keyboard cutover** — remove evdev reader, route all
-   keyboard input through `/dev/uhid<N>`. ~1 day; bounded refactor.
-6. **(Future) Touch ops, capability prompt UI for
-   `input.system_keys`** — D3 / Forum work.
+1. **T1 `tactus` crate.** Full descriptor parser and report decoder
+   (from `consumer.rs`), classification, keyboard and pointer decoding
+   for any layout, key repeat, the pointer stage. Host tests from
+   recorded descriptors (boot and NKRO keyboards, gaming mice,
+   combined keyboard + consumer + system devices).
+2. **T2 `tactusd`.** Hotplug, hidraw source, the socket to frescod,
+   jail and `_tactus` user (commissioned like `_lyra`). frescod's
+   four readers are replaced by one client; injector moves over.
+   VM tests (span e2e and chaos, the input tests) must pass unchanged.
+3. **T3 Touchpads.** Precision Touchpad over hidbus, contact tracking,
+   taps, scroll phases, gestures. QEMU has no multi-touch pad, so the
+   replay source carries the tests, plus a laptop run.
+4. **T4 PS/2.** atkbd scancodes and psm packets (plain, Synaptics,
+   Elantech, ALPS, trackpoint pass-through). QEMU's i8042 gives the
+   keyboard and plain mouse path.
+5. **T5 Gamepads.** Rev. 1 §4.4/§5.3, plus exclusive grants.
+6. **T6 Bluetooth HID source**, once the Bluetooth service exists.
+7. **Later:** touch screens and pens, CLASS_INPUT for the app wire,
+   accessibility consumers (sticky keys, slow keys sit in Tactus).
 
 ## 9. Open questions
 
-1. **`atrium-input-router` as a dedicated daemon?** Today the
-   logic lives in fresco-server's input thread. Splitting it out
-   would let the wm-vs-input concern be cleaner and allow other
-   consumers (recording, automation) to read independently. Worth
-   doing once the input pipeline stabilizes; probably D5 territory.
+1. **PS/2 keyboard node.** atkbd cdev or vt `K_RAW` (§3.2): pick on
+   real hardware; both keep the console working without tactusd.
+2. **Multi-seat.** One seat for now; device records leave room for a
+   seat id.
+3. **Per-device settings.** Acceleration, tap-to-click and scroll
+   direction per device or per class; stored with the user's display
+   settings in Forum.
+4. **Per-display pointer state** under lock across monitors
+   (rev. 1 question 5), now that spanning exists (fresco-span.md).
 
-2. **Hot-pluggable USB devices during a session.** atrium-devevents
-   handles attach/detach events; the router needs to gracefully
-   open/close fds in response. Largely a small implementation
-   detail, but worth a smoke test on a real laptop with USB
-   ports + receivers.
+## 10. Decisions
 
-3. **Bluetooth HID.** uhid handles USB; Bluetooth HID lands at a
-   different kernel path (`/dev/bthidev*`). For V1 we punt — wired
-   first. The wire format and router design accommodate it
-   trivially (just another `/dev/<X>` source); that's a libusbhid-
-   adjacent integration when prioritized.
-
-4. **MIDI / specialty input devices** — typically use HID classes
-   not in the table above. `Class::Raw` covers them; apps with
-   `input.raw_hid` get raw report bytes. No first-class wire
-   support beyond that for V1.
-
-5. **Per-display pointer state on multi-monitor.** When the cursor
-   is locked on display A and the app's window straddles a display
-   boundary, what happens? Probably: lock confines to the originating
-   display's window region. Worth a real test once multi-monitor
-   lands.
+1. **Name and shape:** a named layer, Tactus, as a crate plus a
+   jailed `tactusd`, not a thread inside frescod.
+2. **Vocabulary:** HID usages on every bus, PS/2 translated at the
+   source; no evdev, no Linux keycodes.
+3. **Bluetooth:** not part of Tactus; a separate system service
+   (own spec) hands HID channels to Tactus and audio to Lyra.
+4. **Touchpad work in Tactus** (contacts, taps, scroll phases,
+   gestures), flings in Pergola.
+5. **Order:** T1-T2 first (no behaviour change, readers move out of
+   frescod), then touchpads before PS/2.
 
 ## References
 
@@ -469,6 +485,11 @@ layer.
   surface model that consumes pointer-lock + gamepad.
 - `feedback_no_linuxkpi`, `feedback_no_linux_keycodes`,
   `feedback_bsd_devevents_shape` — substrate policy.
-- FreeBSD `uhid(4)`, `libusbhid(3)` man pages.
+- FreeBSD `hidbus(4)`, `hidraw(4)`, `iichid(4)`, `psm(4)`, `atkbd(4)`,
+  `ng_hci(4)`, `ng_l2cap(4)` man pages.
+- [`spec/lyra-v1.md`](lyra-v1.md) — postcard wire; Bluetooth audio sink.
+- [`spec/atrium-player-pip-keys.md`](atrium-player-pip-keys.md) — media keys.
+- Microsoft "Keyboard scan code to HID usage" table; Windows Precision
+  Touchpad HID spec.
 - USB-IF HID Usage Tables — the canonical reference for usage page
   meanings.
