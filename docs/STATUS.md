@@ -161,7 +161,8 @@ bot challenges (§5.4.1b).
 Open (2026-11-07): how to host the CDM without the linuxulator — scoping study
 `docs/reviews/2026-11-07-linux-compat-scoping.md` recommends an own foreign-library host
 (ELF loader + glibc shim, no kernel Linux ABI) for the CDM and OpenH264, and a micro-VM lane
-for any future Linux apps; six decisions in §9 await Shankar.
+for any future Linux apps. Accepted by Shankar 2026-11-07 (build first, then approach
+Google for a licence and a native CDM build); specs amended.
 
 ## 6. Navigator exploration coverage
 

@@ -408,7 +408,7 @@ Conscious omissions, to be added when prioritized:
 - **IME / complex text input.** Composition + commit events. Protocol extension.
 - **Tabula (clipboard) + drag-and-drop.** Clipboard entries are CAS blobs with format declarations; DnD piggybacks the same shape.
 - **More GPU drivers.** Beyond virtio-gpu (D0): Raspberry Pi VideoCore VI/VII, Mali via Panfrost docs, AMD RDNA via partnerships, then Intel, NVIDIA, Apple Silicon (Asahi-style RE).
-- **Linux app compat.** Linuxulator + a Fresco-X11/Wayland bridge. Optional, but a viable bridge for ecosystem pull-through.
+- **Linux app compat.** A micro-VM lane: user-installed Linux guest per app or trust group, virtio-gpu native context, a Wayland bridge into Fresco, virtio-fs onto Tessera volumes. Not the linuxulator, not a syscall layer (decided 2026-11-07, docs/reviews/2026-11-07-linux-compat-scoping.md §6). Optional, for ecosystem pull-through.
 - **Opifex (package manager) full implementation.** Distribution is jail trees; tooling for fetch / verify / install / update / rollback. Bootstrapped by `pkg` early; full Opifex is its own milestone.
 
 These slot in opportunistically, not blocking the main spine.

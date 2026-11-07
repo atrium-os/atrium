@@ -2421,8 +2421,10 @@ processor's tokenisation iframe), embedded editors (Figma), and DRM playback.
 
 **Nesting: a CDM is an island inside an island.** Where DRM applies (§11.8.3: Spotify,
 paid video), the decryption module is the only part that must be a closed binary. Settled
-with the user: it runs in **its own jail under Linux ABI emulation**, inside the media
-island and below it.
+with the user: it runs in **its own jail**, inside the media island and below it. Since
+2026-11-07 it is hosted by our foreign-library host (own ELF loader + glibc-ABI shim in a
+capability-mode native process), not under the linuxulator
+(docs/reviews/2026-11-07-linux-compat-scoping.md).
 
 - The CDM is installed by the user, never shipped with Atrium (the licence forbids
   redistribution; this is the route Raspberry Pi OS and Asahi Linux take).

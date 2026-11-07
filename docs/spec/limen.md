@@ -239,9 +239,10 @@ OpenH264 is used for H.264 (as Firefox does), and AAC is decoded with a free dec
 it is legally available. Hardware decode, when the GPU stack has it, goes here and nowhere
 else.
 
-**DRM.** A content decryption module (CDM) runs below the player with no network: in a
-bhyve micro-VM where the hardware allows, otherwise in its own jail under Linux ABI
-emulation as a Capsicum-restricted process (legacy-web §8.1, threat model §2.9). The player passes it encrypted
+**DRM.** A content decryption module (CDM) runs below the player with no network: : in our
+foreign-library host (own ELF loader + glibc shim, capability mode, own jail; no Linux ABI
+in the kernel), optionally inside a bhyve micro-VM (legacy-web §8.1, threat model §2.9,
+docs/reviews/2026-11-07-linux-compat-scoping.md). The player passes it encrypted
 samples and gets frames back. The engine relays licence messages without seeing a key.
 Messages for this (`LicenceRequest`, `LicenceResponse`) are added when a CDM is.
 
