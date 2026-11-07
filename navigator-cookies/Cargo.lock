@@ -536,6 +536,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "hex"
+version = "0.4.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7f24254aa9a54b5c858eaee2f5bccdb46aaf0e486a595ed5fd8f86ba55232a70"
+
+[[package]]
 name = "icu_collections"
 version = "2.4.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -808,6 +814,7 @@ name = "nuntius"
 version = "0.1.0"
 dependencies = [
  "aqueduct",
+ "portcullis-ipc",
  "postcard",
  "serde",
 ]
@@ -892,6 +899,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "portcullis-ipc"
+version = "0.1.0"
+dependencies = [
+ "libc",
+ "portcullis-policy",
+ "portcullis-toml",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "portcullis-jail"
 version = "0.1.0"
 dependencies = [
@@ -912,6 +930,17 @@ name = "portcullis-peer"
 version = "0.1.0"
 dependencies = [
  "libc",
+]
+
+[[package]]
+name = "portcullis-policy"
+version = "0.1.0"
+dependencies = [
+ "hex",
+ "portcullis-toml",
+ "serde",
+ "sha2",
+ "toml",
 ]
 
 [[package]]
