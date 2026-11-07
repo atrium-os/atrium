@@ -3,9 +3,11 @@
 # vinculum-hci (allowlist relay) -> vinculumd (host core), against a Bumble
 # peer "VinculumPeer". Scenarios: B1 connect + ATT MTU exchange (ACL credits,
 # L2CAP reassembly); B2 LE Secure Connections pairing in each association
-# model, then reconnecting and encrypting with the stored key.
+# model, then reconnecting and encrypting with the stored key; Classic SSP;
+# the control socket; B3 a Classic HID keyboard handed to a real tactusd.
 #
 #   sh vinculum/harness/e2e.sh
+#   VINCULUM_E2E=hid sh vinculum/harness/e2e.sh   # only the HID scenario
 #
 # Same requirements as run.sh.
 set -eu
@@ -23,7 +25,7 @@ bin=$(cargo metadata -q --manifest-path "$ws/Cargo.toml" --format-version 1 | py
 
 work=$(mktemp -d)
 rc_pid= peer_pid= hci_pid= d_pid=
-cleanup() { kill $d_pid $hci_pid $peer_pid $rc_pid 2>/dev/null || true; rm -rf "$work"; }
+cleanup() { kill ${t_pid:-} ${w_pid:-} $d_pid $hci_pid $peer_pid $rc_pid 2>/dev/null || true; rm -rf "$work"; }
 trap cleanup EXIT INT TERM
 
 "$venv/bin/python" -m rootcanal --hci_port "$port" --link_port $((port + 1)) \
@@ -83,6 +85,8 @@ scenario() {
     peer_pid=
 }
 
+only=${VINCULUM_E2E:-all}
+if [ "$only" = all ]; then
 scenario "B1 connect + ATT MTU" none --att-mtu
 scenario "B2 Just Works, reconnect with stored key" none --pair --reconnect
 scenario "B2 numeric comparison, reconnect" display-yes-no --pair --reconnect
@@ -148,6 +152,60 @@ else
 fi
 kill $d_pid $peer_pid 2>/dev/null || true
 wait $d_pid $peer_pid 2>/dev/null || true
+d_pid= peer_pid=
+fi
+
+# B3: a Classic HID keyboard. vinculumd (control + HID sockets) pairs it via
+# vinculum-ctl, reads its SDP record, opens control and interrupt and hands
+# it to a real tactusd on hid.sock; `tactusd --watch` must see the keys.
+# Then the keyboard drops the link and pages us itself (page scan), opens
+# the channels from its side, and types again.
+tactus_ws=$(dirname "$ws")/tactus
+cargo build -q --manifest-path "$tactus_ws/Cargo.toml" 2>/dev/null
+tbin=$(cargo metadata -q --manifest-path "$tactus_ws/Cargo.toml" --format-version 1 | python3 -c 'import json,sys; print(json.load(sys.stdin)["target_directory"])')/debug
+t_pid= w_pid=
+"$bin/vinculumd" --transport "unix:$work/hci.sock" --control "$work/ctl5.sock" --hid "$work/hid.sock" \
+    --keys "$work/keys5" --machine-key "$work/machine.key" >"$work/svc5.log" 2>&1 &
+d_pid=$!
+until [ -S "$work/hid.sock" ]; do sleep 0.1; done
+TACTUS_PEERS=any TACTUS_BLUETOOTH_SOCKET="$work/hid.sock" "$tbin/tactusd" --socket "$work/tactus.sock" >"$work/tactus.log" 2>&1 &
+t_pid=$!
+until [ -S "$work/tactus.sock" ]; do sleep 0.1; done
+"$tbin/tactusd" --watch "$work/tactus.sock" >"$work/watch.log" 2>&1 &
+w_pid=$!
+ctl() { "$bin/vinculum-ctl" -s "$work/ctl5.sock" "$@"; }
+i=0
+until ctl status 2>/dev/null | grep -q "ready: true"; do
+    i=$((i + 1)); [ $i -gt 50 ] && break
+    sleep 0.1
+done
+host_addr=$(ctl status | sed -n 's/.*bytes: \[\([^]]*\)\].*/\1/p' | python3 -c 'import sys; print(":".join("%02X" % int(x) for x in sys.stdin.read().split(",")))')
+"$venv/bin/python" "$here/peer_hid_keyboard.py" "tcp-client:127.0.0.1:$port" 20 "$host_addr" >"$work/kbd.log" 2>&1 &
+peer_pid=$!
+until grep -q "classic address" "$work/kbd.log" 2>/dev/null; do sleep 0.1; done
+kaddr=$(sed -n 's/^classic address //p' "$work/kbd.log")
+hid_ok=1
+ctl pair "$kaddr" --classic --yes >"$work/ctl5.log" 2>&1 || hid_ok=0
+grep -q "paired .*(authenticated; keyboard allowed)" "$work/ctl5.log" || hid_ok=0
+# Usages 0x070004..6 are a, b, c.
+i=0
+until grep -q "usage: 458758, down: true" "$work/watch.log" 2>/dev/null; do
+    i=$((i + 1)); [ $i -gt 200 ] && break
+    sleep 0.1
+done
+for u in 458756 458757 458758; do
+    grep -q "usage: $u, down: true" "$work/watch.log" || hid_ok=0
+    grep -q "usage: $u, down: false" "$work/watch.log" || hid_ok=0
+done
+grep -q "Device {.*Bluetooth.*vendor: 4660, product: 22136" "$work/watch.log" || hid_ok=0
+if [ $hid_ok -eq 1 ]; then
+    echo "ok   B3 Classic HID keyboard to tactusd, pair + keyboard-initiated reconnect"
+else
+    echo "FAIL B3 Classic HID"; for f in ctl5 svc5 kbd tactus watch; do echo "--- $f"; cat "$work/$f.log"; done
+    fails=$((fails + 1))
+fi
+kill $d_pid $peer_pid $t_pid $w_pid 2>/dev/null || true
+wait $d_pid $peer_pid $t_pid $w_pid 2>/dev/null || true
 d_pid= peer_pid=
 
 if [ $fails -eq 0 ]; then

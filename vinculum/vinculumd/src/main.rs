@@ -47,6 +47,7 @@ use std::os::unix::net::UnixStream;
 use std::time::Instant;
 
 mod daemon;
+mod hid;
 mod policy;
 
 use vinculum_hci_proto::h4::Decoder;
@@ -113,12 +114,14 @@ struct Opts {
     arca: Option<String>,
     control: Option<String>,
     control_uids: Vec<u32>,
+    hid: Option<String>,
+    hid_uids: Vec<u32>,
     classic: Option<vinculum_control::Addr>,
 }
 
 fn opts() -> Opts {
     let usage = || -> ! {
-        eprintln!("usage: vinculumd --transport unix:PATH|tcp:HOST:PORT [--scan SECS] [--connect NAME] [--att-mtu] [--timeout SECS] [--pair [--reconnect] [--passkey-file PATH]] [--keys DIR --machine-key PATH | --arca SOCKET] [--classic ADDR] [--control PATH [--control-uid UID]...]");
+        eprintln!("usage: vinculumd --transport unix:PATH|tcp:HOST:PORT [--scan SECS] [--connect NAME] [--att-mtu] [--timeout SECS] [--pair [--reconnect] [--passkey-file PATH]] [--keys DIR --machine-key PATH | --arca SOCKET] [--classic ADDR] [--control PATH [--control-uid UID]... [--hid PATH [--hid-uid UID]...]]");
         std::process::exit(2)
     };
     let mut o = Opts { transport: String::new(), scan_secs: None, connect: None, att_mtu: false, timeout_secs: 20, pair: false,
@@ -129,6 +132,8 @@ fn opts() -> Opts {
         arca: None,
         control: None,
         control_uids: Vec::new(),
+        hid: None,
+        hid_uids: Vec::new(),
         classic: None,
     };
     let mut a = std::env::args().skip(1);
@@ -146,6 +151,8 @@ fn opts() -> Opts {
             "--arca" => o.arca = Some(a.next().unwrap_or_else(|| usage())),
             "--classic" => o.classic = Some(a.next().and_then(|v| v.parse().ok()).unwrap_or_else(|| usage())),
             "--control" => o.control = Some(a.next().unwrap_or_else(|| usage())),
+            "--hid" => o.hid = Some(a.next().unwrap_or_else(|| usage())),
+            "--hid-uid" => o.hid_uids.push(a.next().and_then(|v| v.parse().ok()).unwrap_or_else(|| usage())),
             "--control-uid" => o.control_uids.push(a.next().and_then(|v| v.parse().ok()).unwrap_or_else(|| usage())),
             "--timeout" => o.timeout_secs = a.next().and_then(|v| v.parse().ok()).unwrap_or_else(|| usage()),
             _ => usage(),
@@ -214,7 +221,7 @@ fn main() {
         std::process::exit(1)
     });
     if let Some(path) = o.control.clone() {
-        let cfg = daemon::Config { control_path: path, allowed_uids: o.control_uids.clone(), io_cap: IoCap::KeyboardDisplay, irk: [0x5C; 16] };
+        let cfg = daemon::Config { control_path: path, allowed_uids: o.control_uids.clone(), io_cap: IoCap::KeyboardDisplay, irk: [0x5C; 16], hid_path: o.hid.clone(), hid_uids: o.hid_uids.clone() };
         daemon::run(cfg, link, store, bonds);
     }
     let t0 = Instant::now();

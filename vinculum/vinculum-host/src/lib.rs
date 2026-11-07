@@ -351,6 +351,15 @@ impl Host {
         self.pump(now_ms);
     }
 
+    /// Page scan on or off (BR/EDR): bonded Classic devices such as HID
+    /// keyboards reconnect by paging us. Never inquiry scan: we are not
+    /// discoverable (§7). Incoming pages arrive as `ConnectionRequest`.
+    pub fn page_scan(&mut self, on: bool, now_ms: u64) {
+        let s = if on { hci::ScanEnable::PageScanOnly } else { hci::ScanEnable::NoScans };
+        self.issue(to_cmd(hci::WriteScanEnable { scan_enable: s }), Tag::User);
+        self.pump(now_ms);
+    }
+
     pub fn le_connect(&mut self, peer: Peer, now_ms: u64) {
         let (address, peer_address_type) = peer.to_hci();
         self.issue(

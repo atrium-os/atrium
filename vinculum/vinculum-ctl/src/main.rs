@@ -4,7 +4,7 @@
 //! vinculum-ctl [-s SOCKET] status
 //! vinculum-ctl [-s SOCKET] devices
 //! vinculum-ctl [-s SOCKET] scan [SECS]
-//! vinculum-ctl [-s SOCKET] pair NAME|ADDR [--yes] [--timeout SECS]
+//! vinculum-ctl [-s SOCKET] pair NAME|ADDR [--classic] [--yes] [--timeout SECS]
 //! vinculum-ctl [-s SOCKET] connect|disconnect|remove ADDR
 //! vinculum-ctl [-s SOCKET] agent [--yes]
 //! ```
@@ -13,7 +13,8 @@
 //! acts as the pairing agent meanwhile: it shows the number to compare or
 //! the passkey to type and asks on the terminal, or answers yes with
 //! `--yes` (scripts and tests; on a real machine the point of the prompt
-//! is that a person checks it). `agent` stays connected and answers prompts
+//! is that a person checks it). `--classic` pages a Classic (BR/EDR)
+//! device by address instead. `agent` stays connected and answers prompts
 //! for pairings started elsewhere.
 
 use std::io::{BufRead, Read, Write};
@@ -147,6 +148,7 @@ fn main() {
     }
     let flag = |a: &mut Vec<String>, f: &str| a.iter().position(|x| x == f).map(|i| a.remove(i)).is_some();
     let yes = flag(&mut args, "--yes");
+    let classic = flag(&mut args, "--classic");
     let timeout = match args.iter().position(|x| x == "--timeout") {
         Some(i) if i + 1 < args.len() => {
             let v = args[i + 1].parse().unwrap_or_else(|_| die("--timeout SECS"));
@@ -231,7 +233,7 @@ fn main() {
                     found
                 }
             };
-            c.ok(Request::Pair { address });
+            c.ok(if classic { Request::PairClassic { address } } else { Request::Pair { address } });
             loop {
                 match c.next(Some(end)) {
                     Some(Event::Prompt { address: a, prompt }) => answer(&mut c, a, prompt, yes),
@@ -260,6 +262,6 @@ fn main() {
                 }
             }
         }
-        _ => die("usage: vinculum-ctl [-s SOCKET] status|devices|scan [SECS]|pair NAME|ADDR [--yes]|connect|disconnect|remove ADDR|agent [--yes]"),
+        _ => die("usage: vinculum-ctl [-s SOCKET] status|devices|scan [SECS]|pair NAME|ADDR [--classic] [--yes]|connect|disconnect|remove ADDR|agent [--yes]"),
     }
 }

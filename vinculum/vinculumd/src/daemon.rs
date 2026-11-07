@@ -12,7 +12,7 @@
 //! that sends a malformed message, or can't keep up with its events, is
 //! dropped.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io::{ErrorKind, Read, Write};
 use std::os::fd::{AsRawFd, RawFd};
 use std::os::unix::fs::PermissionsExt;
@@ -25,6 +25,7 @@ use vinculum_host::{Host, HostEvent, PairConfig, Peer, Prompt};
 use vinculum_keys::{Address, Bond, Id, KeyStore};
 use vinculum_smp::pairing::IoCap;
 
+use crate::hid::{self, Hid};
 use crate::policy::{self, NewBond, OnSecurityRequest, Pairable};
 use crate::Link;
 
@@ -47,6 +48,10 @@ pub struct Config {
     pub io_cap: IoCap,
     /// Our IRK (development: fixed; the real one lives in the key store).
     pub irk: [u8; 16],
+    /// The HID hand-off socket for tactusd (§10), and the uids allowed on
+    /// it beyond our own (`_tactus`).
+    pub hid_path: Option<String>,
+    pub hid_uids: Vec<u32>,
 }
 
 struct Daemon {
@@ -61,6 +66,13 @@ struct Daemon {
     pending_pair: Option<Addr>,
     conns: HashMap<u16, Addr>,
     names: HashMap<Addr, String>,
+    /// Links where we started pairing and `Paired` has not come yet.
+    pairing: HashSet<u16>,
+    /// Classic devices we accepted a page from, until their link is up;
+    /// then their handles.
+    paged_by: HashSet<Addr>,
+    incoming: HashSet<u16>,
+    hid: Hid,
     t0: Instant,
 }
 
@@ -83,7 +95,7 @@ fn from_keys(a: Address) -> Addr {
 }
 
 /// The uid on the other end of a Unix socket.
-fn peer_uid(s: &UnixStream) -> Option<u32> {
+pub(crate) fn peer_uid(s: &UnixStream) -> Option<u32> {
     let fd = s.as_raw_fd();
     #[cfg(target_os = "linux")]
     {
@@ -103,7 +115,7 @@ fn peer_uid(s: &UnixStream) -> Option<u32> {
     }
 }
 
-fn getuid() -> u32 {
+pub(crate) fn getuid() -> u32 {
     // SAFETY: getuid(2) has no preconditions and cannot fail.
     unsafe { libc::getuid() }
 }
@@ -159,7 +171,32 @@ impl Daemon {
             return Err("no pairing agent: open the pairing UI".into());
         }
         let now = self.now();
-        self.host.pair(handle, PairConfig { io_cap: self.cfg.io_cap, irk: self.cfg.irk }, now).map_err(|e| e.to_string())
+        self.host.pair(handle, PairConfig { io_cap: self.cfg.io_cap, irk: self.cfg.irk }, now).map_err(|e| e.to_string())?;
+        self.pairing.insert(handle);
+        Ok(())
+    }
+
+    /// Page scan while there are Classic bonds, so they can reconnect.
+    fn update_page_scan(&mut self) {
+        if self.host.is_ready() && self.hid.enabled() {
+            let on = self.bonds.iter().any(|(_, b)| b.classic);
+            let now = self.now();
+            self.host.page_scan(on, now);
+        }
+    }
+
+    /// A Classic link is encrypted with a stored bond: run HID on it.
+    fn start_hid(&mut self, handle: u16) {
+        if self.host.transport(handle) != Some(vinculum_host::Transport::BrEdr) {
+            return;
+        }
+        let Some(&a) = self.conns.get(&handle) else { return };
+        let Some(k) = self.bond_for(a) else { return };
+        let b = &self.bonds[k].1;
+        let (name, kb) = (b.name.clone(), policy::keyboard_allowed(b));
+        let now = self.now();
+        let incoming = self.incoming.contains(&handle);
+        self.hid.start(&mut self.host, handle, a, incoming, &name, kb, now);
     }
 
     // ---- requests -------------------------------------------------------
@@ -197,15 +234,21 @@ impl Daemon {
                     Event::Ok
                 }
             }
-            Request::Pair { address } => self.req_pair(address),
+            Request::Pair { address } => self.req_pair(address, false),
+            Request::PairClassic { address } => self.req_pair(address, true),
             Request::Connect { address } => {
                 if self.bond_for(address).is_none() {
                     Event::Error { why: "not a bonded device; pair it first".into() }
                 } else if self.handle_of(address).is_some() {
                     Event::Ok
                 } else {
-                    self.stop_scan();
-                    self.host.le_connect(peer(address), now);
+                    let classic = self.bond_for(address).is_some_and(|k| self.bonds[k].1.classic);
+                    if classic {
+                        self.host.classic_connect(peer(address), now);
+                    } else {
+                        self.stop_scan();
+                        self.host.le_connect(peer(address), now);
+                    }
                     Event::Ok
                 }
             }
@@ -241,7 +284,9 @@ impl Daemon {
                     if let Some(h) = conn {
                         self.host.disconnect(h, now);
                     }
-                    match self.store.delete(&id) {
+                    let r = self.store.delete(&id);
+                    self.update_page_scan();
+                    match r {
                         Ok(()) => Event::Ok,
                         Err(e) => Event::Error { why: format!("key store: {e}") },
                     }
@@ -280,7 +325,7 @@ impl Daemon {
         }
     }
 
-    fn req_pair(&mut self, address: Addr) -> Event {
+    fn req_pair(&mut self, address: Addr, classic: bool) -> Event {
         if self.agents() == 0 {
             return Event::Error { why: "no pairing agent: open the pairing UI".into() };
         }
@@ -299,9 +344,13 @@ impl Daemon {
         if self.pending_pair.is_some() {
             return Event::Error { why: "another pairing is in progress".into() };
         }
-        self.stop_scan();
         self.pending_pair = Some(address);
-        self.host.le_connect(peer(address), now);
+        if classic {
+            self.host.classic_connect(peer(address), now);
+        } else {
+            self.stop_scan();
+            self.host.le_connect(peer(address), now);
+        }
         Event::Ok
     }
 
@@ -312,6 +361,7 @@ impl Daemon {
         match ev {
             HostEvent::Ready(info) => {
                 eprintln!("vinculumd: controller ready, HCI version {}, {} bonds", info.hci_version, self.bonds.len());
+                self.update_page_scan();
             }
             HostEvent::Fatal(why) => {
                 // The service manager restarts us with a fresh controller.
@@ -330,6 +380,9 @@ impl Daemon {
             HostEvent::Connected { handle, peer, .. } => {
                 let a = addr(peer);
                 self.conns.insert(handle, a);
+                if self.paged_by.remove(&a) {
+                    self.incoming.insert(handle);
+                }
                 self.broadcast(&Event::Connected { address: a, encrypted: false });
                 if self.pending_pair == Some(a) {
                     self.pending_pair = None;
@@ -348,6 +401,9 @@ impl Daemon {
                 }
             }
             HostEvent::ConnectFailed { peer, status } => {
+                if let Some(p) = peer {
+                    self.paged_by.remove(&addr(p));
+                }
                 if let (Some(p), Some(pp)) = (peer, self.pending_pair) {
                     if addr(p) == pp {
                         self.pending_pair = None;
@@ -356,6 +412,9 @@ impl Daemon {
                 }
             }
             HostEvent::Disconnected { handle, reason } => {
+                self.pairing.remove(&handle);
+                self.incoming.remove(&handle);
+                self.hid.link_gone(handle);
                 if let Some(a) = self.conns.remove(&handle) {
                     self.broadcast(&Event::Disconnected { address: a, reason });
                 }
@@ -413,7 +472,12 @@ impl Daemon {
                         let (authenticated, keyboard_allowed) = (rec.authenticated, policy::keyboard_allowed(&rec));
                         self.bonds.push((id, rec));
                         self.pairable.close();
+                        self.pairing.remove(&handle);
                         self.broadcast(&Event::Paired { address: a, authenticated, keyboard_allowed });
+                        if classic {
+                            self.update_page_scan();
+                            self.start_hid(handle);
+                        }
                     }
                     Err(e) => {
                         // A bond we can't keep is no bond: drop the link.
@@ -423,6 +487,7 @@ impl Daemon {
                 }
             }
             HostEvent::PairingFailed { handle, why, .. } => {
+                self.pairing.remove(&handle);
                 if let Some(&a) = self.conns.get(&handle) {
                     self.broadcast(&Event::PairingFailed { address: a, why });
                 }
@@ -432,6 +497,10 @@ impl Daemon {
                 if let Some(&a) = self.conns.get(&handle) {
                     self.broadcast(&Event::Connected { address: a, encrypted: true });
                 }
+                // A fresh pairing starts HID once its bond is stored.
+                if !self.pairing.contains(&handle) {
+                    self.start_hid(handle);
+                }
             }
             HostEvent::EncryptionFailed { handle, status } => {
                 if let Some(&a) = self.conns.get(&handle) {
@@ -439,12 +508,15 @@ impl Daemon {
                 }
                 self.host.disconnect(handle, now);
             }
-            HostEvent::ChannelOpen { .. } | HostEvent::ChannelData { .. } | HostEvent::ChannelClosed { .. } | HostEvent::ChannelFailed { .. } => {}
+            e @ (HostEvent::ChannelOpen { .. } | HostEvent::ChannelData { .. } | HostEvent::ChannelClosed { .. } | HostEvent::ChannelFailed { .. }) => {
+                self.hid.on_event(&mut self.host, &e, now);
+            }
             HostEvent::ConnectionRequest { peer: p, .. } => {
                 // A Classic device paging us: only bonded devices get a
                 // link, and it is authenticated by us before use (§7).
                 let bonded = self.bond_for(addr(p)).is_some_and(|k| self.bonds[k].1.classic);
                 if bonded {
+                    self.paged_by.insert(addr(p));
                     self.host.accept_connection(p, now);
                 } else {
                     self.host.reject_connection(p, now);
@@ -522,9 +594,15 @@ pub fn run(cfg: Config, mut link: Link, store: Box<dyn KeyStore>, bonds: Vec<(Id
         std::process::exit(1)
     });
     let _ = std::fs::set_permissions(&cfg.control_path, std::fs::Permissions::from_mode(0o660));
+    let hid = Hid::new(cfg.hid_path.as_deref(), cfg.hid_uids.clone());
+    let mut host = Host::new();
+    if hid.enabled() {
+        host.register_psm(hid::PSM_CONTROL);
+        host.register_psm(hid::PSM_INTERRUPT);
+    }
     let mut d = Daemon {
         cfg,
-        host: Host::new(),
+        host,
         store,
         bonds,
         pairable: Pairable::default(),
@@ -533,6 +611,10 @@ pub fn run(cfg: Config, mut link: Link, store: Box<dyn KeyStore>, bonds: Vec<(Id
         pending_pair: None,
         conns: HashMap::new(),
         names: HashMap::new(),
+        pairing: HashSet::new(),
+        paged_by: HashSet::new(),
+        incoming: HashSet::new(),
+        hid,
         t0: Instant::now(),
     };
     let trace = std::env::var_os("VINCULUM_TRACE").is_some();
@@ -562,6 +644,9 @@ pub fn run(cfg: Config, mut link: Link, store: Box<dyn KeyStore>, bonds: Vec<(Id
         let wait_ms = next.map_or(-1, |n| n.saturating_sub(now).min(60_000) as i32);
         let mut fds = vec![link.fd(), listener.as_raw_fd()];
         fds.extend(d.clients.iter().map(|c| c.sock.as_raw_fd()));
+        let nclients = d.clients.len();
+        let hid_fds = d.hid.fds();
+        fds.extend(hid_fds.iter().map(|(fd, _)| *fd));
         let ready = poll(&fds, wait_ms);
         if ready[0] {
             let n = link.read(&mut buf).unwrap_or(0);
@@ -585,7 +670,13 @@ pub fn run(cfg: Config, mut link: Link, store: Box<dyn KeyStore>, bonds: Vec<(Id
         // Clients first (indices are stable until the retain below), then
         // new ones.
         let mut drop = Vec::new();
-        for (i, r) in ready[2..].iter().enumerate() {
+        for (k, (_, which)) in hid_fds.iter().enumerate() {
+            if ready[2 + nclients + k] {
+                let now = d.now();
+                d.hid.readable(&mut d.host, *which, now);
+            }
+        }
+        for (i, r) in ready[2..2 + nclients].iter().enumerate() {
             if *r && !d.client_readable(i) {
                 drop.push(i);
             }

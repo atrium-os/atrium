@@ -85,6 +85,9 @@ pub enum Request {
     Confirm { address: Addr, yes: bool },
     /// An agent's answer to `Prompt::EnterPasskey`; None cancels.
     Passkey { address: Addr, passkey: Option<u32> },
+    /// `Pair` for a Classic (BR/EDR) device, paged by address: Classic
+    /// devices are not found by an LE scan.
+    PairClassic { address: Addr },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

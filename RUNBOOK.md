@@ -5463,9 +5463,11 @@ sh vinculum/harness/run.sh                      # probe scans, expects "Vinculum
 sh vinculum/harness/run.sh --record out.btsnoop # also keep the HCI trace (keys zeroed)
 sh vinculum/harness/e2e.sh                      # vinculumd -> vinculum-hci -> Rootcanal: connect + ATT MTU,
                                                 # then LE SC pairing (Just Works, numeric comparison,
-                                                # passkey) and reconnect with the stored key
+                                                # passkey) and reconnect with the stored key; Classic SSP;
+                                                # control socket; Classic HID keyboard to real tactusd
+VINCULUM_E2E=hid sh vinculum/harness/e2e.sh     # only the HID scenario (builds ../tactus too)
 (cd vinculum && cargo test)                      # incl. replay of the recorded trace
-(cd vinculum/fuzz && cargo fuzz run hci_event)   # also hci_command gap h4_stream host_frames smp_initiator
+(cd vinculum/fuzz && cargo fuzz run hci_event)   # also hci_command gap h4_stream host_frames smp_initiator sdp
 ```
 
 The packet parsers are generated at build time by a patched, vendored pdl-compiler
@@ -5477,6 +5479,8 @@ capability; `vinculumd --pair` answers every prompt yes (development only).
 As a service: `vinculumd --transport unix:HCI.sock --control ctl.sock --keys DIR --machine-key PATH`,
 then `vinculum-ctl -s ctl.sock pair NAME` (asks on the terminal; `--yes` for scripts),
 `devices`, `connect ADDR`, `remove ADDR`, `agent`.
+`--hid hid.sock [--hid-uid UID]` adds the HID hand-off for tactusd (`TACTUS_BLUETOOTH_SOCKET=hid.sock`);
+Classic devices pair with `vinculum-ctl pair ADDR --classic`. `peer_hid_keyboard.py` is the Bumble keyboard.
 
 ### 13.7 Navigator corpus (on the Mac, no VM)
 

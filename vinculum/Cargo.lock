@@ -1067,8 +1067,10 @@ dependencies = [
  "libc",
  "vinculum-control",
  "vinculum-hci-proto",
+ "vinculum-hid-wire",
  "vinculum-host",
  "vinculum-keys",
+ "vinculum-sdp",
  "vinculum-smp",
  "zeroize",
 ]
