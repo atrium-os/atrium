@@ -69,9 +69,17 @@ lock:
 |---|---|
 | `seq` | odd while the device writes |
 | `state` | 0 stopped, 1 streaming (lyrad mixes only while streaming) |
-| `delay_frames` | frames taken from the ring but not yet heard: encoder queue, L2CAP and controller buffers, plus the sink's AVDTP delay report (A2DP 1.3), converted to frames. Keep it current as the queue drains between reads (at least every millisecond or two), not only when reading: lyrad samples it each period |
+| `delay_frames` | frames taken from the ring but not yet heard, as of `at_ns`: encoder queue, L2CAP and controller buffers, plus the sink's AVDTP delay report (A2DP 1.3), converted to frames |
+| `at_ns` | `CLOCK_MONOTONIC` time at which `delay_frames` was true; lyrad counts the delay down at the device rate from there |
+| `consumed` | frames the device had taken from the ring when `delay_frames` was true |
 | `underruns` | times the device found the ring empty (counter) |
 | `rate` | the frame rate it reads at (must equal the announced rate) |
+
+Write the page after every read from the ring (and at least every 20 ms while streaming),
+with `at_ns` the time the delay was measured (normally the read itself). lyrad pairs `delay_frames` with
+`consumed`, not with the ring's live count, so it never matches a new read with an old
+delay, and it needs no faster updates than the reads. A page older than 50 ms, or one that
+claims frames the ring hasn't given, is taken as current; `at_ns` 0 means the same.
 
 lyrad trusts none of it beyond its effect on this one device. `delay_frames` is clamped to
 one second (logged if it was more), a page that never settles (a writer stuck mid-update)
@@ -176,6 +184,22 @@ E1 to E3 need nothing from Vinculum, so they can start now.
   policy delta, jail socket mount); `lyra-service.sh` makes the socket directory. e2e:
   connect, take over, volume both ways, reconfigure, leave and pause; grant and rate
   refusals.
+
+- **E3** (2026-11-07): `lyra-vmtest device` (a test device: absolute `CLOCK_MONOTONIC`
+  ticks, 256-frame reads, a set delay, prints when each click is heard) and
+  `CLOCK_DEVICE=1 lyra-vm-check.sh clock`, which judges check 6 against the device's own
+  heard times as well as lyrad's log. Running it end to end on the host found two error
+  sources, both fixed: a page rewritten every millisecond is up to a millisecond stale
+  (a +0.6 ms bias), so the page now carries `at_ns` and `consumed` (§4); and the clock's
+  start-up wait, before anything is heard, skewed the slope for the first 20 s, so
+  `DeviceClock` ignores readings until something is heard. `Ring::create_anon` uses a
+  memfd on Linux, so the whole path runs on the host: 120 clicks over 60 s, all within
+  0.013 ms of when heard, `rate_ppm` 0 throughout. A short read shows on the line only from
+  the device's next read, so lyrad allows a re-anchor for 50 ms after the underrun count
+  moves (without it, each gap tilted the rate by 200 ppm for 20 s). **Cloud VM** (TCG,
+  optimised build, `LYRA_RELEASE=1`; a debug lyrad can't mix in real time there): 10 minutes,
+  1200 clicks, all within +0.009 to +0.014 ms of the device's own heard times, `rate_ppm`
+  0 throughout. **E3's gate is met** (±2 ms over 10 minutes).
 
 ## 9. Decisions, with recommendations
 

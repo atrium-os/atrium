@@ -30,7 +30,8 @@
 //!       chunk over the next 256 frames' time, delay_ms later. The page says
 //!       so after each read (delay = delay_ms + the chunk, at the read's
 //!       tick, against the frames read so far). Prints `heard <ns>` for each click it reads
-//!       (a sample above 0.5): the time the listener hears it. A device with
+//!       (a sample above 0.5): the time the listener hears it, and `short
+//!       <ns>` for each read that found the ring short (a gap heard). A device with
 //!       a perfectly steady clock, so check 6 judges lyrad's arithmetic alone.
 //!   lyra-vmtest lyrad-raw <lyrad_sock>
 //!       Connect to lyrad directly and ask for a stream. Prints `refused` if
@@ -213,6 +214,7 @@ fn device(sock: &str, secs: f32, delay_ms: u32) {
             let got = dev.ring.read(&mut buf);
             if got < CHUNK && k > 0 {
                 underruns += 1;
+                println!("short {tk}");
             }
             for j in 0..got as usize {
                 if buf[j * 2] > 0.5 {

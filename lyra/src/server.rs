@@ -991,6 +991,9 @@ impl DeviceClock {
 struct DevIo<'a> {
     dump: Option<&'a mut std::fs::File>,
     poslog: Option<&'a mut std::io::BufWriter<std::fs::File>>,
+    /// Frames in the dump so far (all outputs), so the poslog's positions
+    /// are dump frame indices on every output.
+    dumped: u64,
 }
 
 fn sleep_ns(ns: i64) {
@@ -1022,6 +1025,7 @@ fn run_external(engine: &mut Engine, rx: &mpsc::Receiver<Cmd>, ev_tx: &mpsc::Sen
     let mut clock = DeviceClock::new(rate);
     let mut next = monotonic_ns();
     let mut last_underruns: Option<u32> = None;
+    let mut starved_until = 0i64;
     let mut last_consumed = 0u64;
     let mut progress_at = monotonic_ns();
     let mut stalled = false;
@@ -1081,8 +1085,13 @@ fn run_external(engine: &mut Engine, rx: &mpsc::Receiver<Cmd>, ev_tx: &mpsc::Sen
         let heard = device_heard(now, page, consumed, initial_delay, max_delay, rate);
         let delay = consumed - heard;
         let underruns = page.map_or(0, |p| p.underruns);
-        let starved = last_underruns.is_some_and(|l| l != underruns);
+        // A short read shows on the line only from the device's next read,
+        // so a re-anchor stays allowed for a while after the count moves.
+        if last_underruns.is_some_and(|l| l != underruns) {
+            starved_until = now + STARVED_HOLD_NS;
+        }
         last_underruns = Some(underruns);
+        let starved = now < starved_until;
         let written = d.ring.written();
         let start = if feeding {
             clock.sample(now, heard, starved);
@@ -1105,26 +1114,35 @@ fn run_external(engine: &mut Engine, rx: &mpsc::Receiver<Cmd>, ev_tx: &mpsc::Sen
             *v = v.clamp(-1.0, 1.0);
         }
         let Some(d) = engine.device(id) else { continue };
-        d.ring.write(&mix);
+        let ring_base = io.dumped - d.ring.written().min(io.dumped);
+        let put = d.ring.write(&mix);
+        io.dumped += put;
         if let Some(f) = io.dump.as_mut() {
             use std::io::Write;
             for (o, m) in out16.iter_mut().zip(&mix) {
                 *o = (m * 32767.0) as i16;
             }
-            let bytes = unsafe { std::slice::from_raw_parts(out16.as_ptr() as *const u8, out16.len() * 2) };
+            let n = put as usize * ch;
+            let bytes = unsafe { std::slice::from_raw_parts(out16.as_ptr() as *const u8, n * 2) };
             let _ = f.write_all(bytes);
         }
         if let Some(w) = io.poslog.as_mut() {
             // Columns as for the OSS device, so `written − delay` is the
             // frame heard now: here `consumed − delay`.
             use std::io::Write;
-            let _ = writeln!(w, "{now} {consumed} {consumed} {delay}");
+            // Ring counts, moved to the dump's frame index.
+            let c = consumed + ring_base;
+            let _ = writeln!(w, "{now} {c} {c} {delay}");
             if written % (rate as u64) < period {
                 let _ = w.flush();
             }
         }
     }
 }
+
+/// How long after an external device's underrun count moves the clock may
+/// re-anchor (a few of the device's reads).
+const STARVED_HOLD_NS: i64 = 50_000_000;
 
 /// A page older than this is not counted down (the device stopped writing it).
 const MAX_PAGE_AGE_NS: i64 = 50_000_000;
@@ -1193,8 +1211,9 @@ pub fn run(cfg: Config) -> ! {
             let _ = ev_tx.send((engine.session(), FromEngine::OutputInUse { device: engine.output }));
         }
         if engine.output != 0 {
-            let mut io = DevIo { dump: dump.as_mut(), poslog: poslog.as_mut() };
+            let mut io = DevIo { dump: dump.as_mut(), poslog: poslog.as_mut(), dumped: written };
             run_external(&mut engine, &rx, &ev_tx, &cfg, &mut io);
+            written = io.dumped;
             continue;
         }
         engine.set_rate(cfg.rate);
@@ -1463,7 +1482,7 @@ mod tests {
         let cfg = Config { socket: "/nonexistent".into(), peers: vec![], rate: 48_000, channels: 2, period_frames: 128, nfrags: 8 };
         let mix = std::thread::spawn(move || {
             let (ev_tx, _ev_rx) = mpsc::channel();
-            let mut io = DevIo { dump: None, poslog: None };
+            let mut io = DevIo { dump: None, poslog: None, dumped: 0 };
             run_external(&mut e, &rx, &ev_tx, &cfg, &mut io);
             e.output
         });

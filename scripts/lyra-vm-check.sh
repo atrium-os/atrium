@@ -37,7 +37,8 @@
 #      is the system clock, so this judges lyrad's arithmetic and the
 #      external path anywhere, the cloud VM included.
 #
-# Needs CROSS_RUSTFLAGS and TARGET (cloud-vm.sh's cross_env sets them).
+# LYRA_RELEASE=1 builds optimised binaries (under TCG a debug lyrad can't mix
+# in real time). Needs CROSS_RUSTFLAGS and TARGET (cloud-vm.sh's cross_env sets them).
 set -u
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 VSSH="$ROOT/scripts/vssh"
@@ -50,6 +51,7 @@ POSLOG=/var/tmp/lyra-pos.log
 MODE="${1:-all}"
 CLOCK_SECS="${CLOCK_SECS:-600}"
 CLOCK_DEVICE="${CLOCK_DEVICE:-0}"
+PROFILE=debug; [ -n "${LYRA_RELEASE:-}" ] && PROFILE=release
 FAILS=0
 
 if [ "${1:-}" = qemu-args ]; then
@@ -74,7 +76,7 @@ say "cross-build (host)"
 : "${TARGET:?run through scripts/cloud-vm.sh lyra}"
 for c in lyra choragus; do
     (cd "$ROOT/$c" && RUSTFLAGS="${CROSS_RUSTFLAGS:-}" cargo +nightly build --quiet --target "$TARGET" \
-        -Z build-std=std,panic_abort --bins) || die "$c cross-build"
+        -Z build-std=std,panic_abort --bins ${LYRA_RELEASE:+--release}) || die "$c cross-build"
 done
 echo "  built"
 fi
@@ -84,7 +86,7 @@ v true >/dev/null 2>&1 || die "cannot reach the VM (sh scripts/cloud-vm.sh up)"
 v "pkill -f 'daemon.*lyra-test' ; pkill lyrad ; pkill choragusd ; pkill lyra-play ; true" >/dev/null 2>&1
 for b in lyra/lyrad lyra/lyra-play lyra/lyra-vmtest choragus/choragusd; do
     name="${b#*/}"
-    if [ -n "${LYRA_PREBUILT:-}" ]; then src="$LYRA_PREBUILT/$name"; else src="$ROOT/${b%/*}/target/$TARGET/debug/$name"; fi
+    if [ -n "${LYRA_PREBUILT:-}" ]; then src="$LYRA_PREBUILT/$name"; else src="$ROOT/${b%/*}/target/$TARGET/$PROFILE/$name"; fi
     h=$(sha256sum "$src" | cut -d' ' -f1)
     for try in 1 2 3; do
         v "rm -f $BIN/$name" >/dev/null 2>&1
@@ -204,6 +206,10 @@ truth = [t for t in truth if t[1] is not None]
 # 30-300 ms ahead, so a click with a dry spell in the 400 ms before it is
 # judged apart: the clock is checked on the rest, the gaps are reported.
 dry = [now[i] for i in range(1, len(pos)) if pos[i][3] == 0 and now[i] - now[0] > 1e9]
+# The test external device never reports zero delay: it says when it read short.
+dev_short = [int(l.split()[1]) for l in open(out + '/dev.txt') if l.startswith('short ')]
+if dev_short or any(l.startswith('heard ') for l in open(out + '/dev.txt')):
+    dry = sorted(t for t in dev_short if t - now[0] > 1e9)
 dry_spells = sum(1 for i in range(len(dry)) if i == 0 or dry[i] - dry[i - 1] > 50e6)
 def after_dry(t):
     k = bisect.bisect_right(dry, t)
@@ -272,14 +278,18 @@ if alt:
 # itself, not lyrad's own log.
 heard = [int(l.split()[1]) for l in open(out + '/dev.txt') if l.startswith('heard ')]
 if heard:
-    he = []
+    he, hall = [], []
     for rate, k, pred, ppm in preds:
         h = min(heard, key=lambda x: abs(x - pred))
         if abs(h - pred) < 200e6:
-            he.append((pred - h) / 1e6)
-    e = sorted(he)
-    line(len(he) >= 0.95 * len(preds) and max(abs(x) for x in he) <= 2.0,
-         '6: predicted minus heard (the device\'s own times): %d of %d clicks, median %+.3f ms, min %+.3f, max %+.3f (want within ±2)' % (len(he), len(preds), e[len(e) // 2], e[0], e[-1]))
+            hall.append((pred - h) / 1e6)
+            if not after_dry(h):
+                he.append((pred - h) / 1e6)
+    a = sorted(hall)
+    print('       all clicks, by the device\'s own times: median %+.3f ms, min %+.3f, max %+.3f' % (a[len(a) // 2], a[0], a[-1]))
+    e = sorted(he) or [99.0]
+    line(len(hall) >= 0.95 * len(preds) and len(he) >= 0.8 * len(hall) and max(abs(x) for x in e) <= 2.0,
+         '6: predicted minus heard (the device\'s own times), %d of %d clicks with no gap in the 400 ms before: median %+.3f ms, min %+.3f, max %+.3f (want within ±2)' % (len(he), len(hall), e[len(e) // 2], e[0], e[-1]))
 if ppms:
     line(max(ppms) - min(ppms) <= 20, '6: rate_ppm after 30 s: %d to %d (want a spread of 20 or less)' % (min(ppms), max(ppms)))
 sys.exit(min(fails, 100))
