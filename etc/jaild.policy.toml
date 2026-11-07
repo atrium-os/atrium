@@ -465,3 +465,129 @@ children_max = 32              # for app jails
 allowed_exec_root         = "/usr/local/share/atrium/apps"
 default_devfs_ruleset     = "atrium-baseline"
 max_simultaneous_per_user = 32
+
+
+# ---------------------------------------------------------------
+# Per-jail system call filter (docs/spec/jail-sysfil.md §5). A request names
+# a class in CreateJailRequest.syscall_profile; jaild hands the kernel the
+# resolved lists as sysfil.* jail parameters when it creates the jail, and
+# they can never be widened after that. Each class's lists are its includes'
+# lists plus its own. A list left out is unrestricted; [] allows nothing.
+#
+# The base set was learned in log mode (sysfil.mode=1) from
+# scripts/sysfil/sysfil-probe (Rust std: threads, files, unix sockets,
+# poll, time) launched the way jaild launches (attach, setgroups/setgid/
+# setuid, execve inside the jail), plus kqueue/kevent for mio-style event
+# loops. Learn a real app's needs the same way:
+#   sh scripts/sysfil/learn.sh <class> <binary> [args...]
+# Never in an app class: ktrace, ptrace, setcred, jail_*, kqueuex, sigqueue,
+# thr_kill2, procctl, aio/lio_listio, sendfile, mount; tty control ioctls
+# outside "terminal"; route/key/netlink sockets; IPv6 multicast filter,
+# accept-filter, reuseport-LB and KTLS socket options; largepage shm.
+# ---------------------------------------------------------------
+[sysfil]
+mode     = 2        # 1 = log only (development), 2 = deny, 3 = deny + SIGSYS
+required = false    # true once every launcher names a class
+
+[sysfil.profiles.base]
+syscalls = [
+    # process and memory
+    "_exit", "getpid", "getppid", "getuid", "geteuid", "getgid", "getegid",
+    "issetugid", "mmap", "munmap", "mprotect", "madvise", "minherit",
+    "sysarch", "__sysctl", "__sysctlbyname", "getrlimit", "getrusage",
+    "cpuset_getaffinity", "cap_getmode", "cap_enter", "cap_rights_limit",
+    "cap_ioctls_limit", "cap_fcntls_limit", "exterrctl", "getrandom",
+    "umask",
+    # the launcher, which runs inside the jail before execve
+    "setgroups", "setgid", "setuid", "execve",
+    # threads and signals (libthr)
+    "thr_new", "thr_exit", "thr_self", "thr_kill", "thr_wake",
+    "thr_set_name", "_umtx_op", "rtprio_thread", "sigaltstack",
+    "sigprocmask", "sigaction", "sigreturn", "getcontext", "setcontext",
+    "sigfastblock", "kill", "sigwait", "sigtimedwait", "sigsuspend",
+    # time
+    "clock_gettime", "clock_getres", "clock_nanosleep", "nanosleep",
+    "gettimeofday",
+    # files and directories
+    "read", "write", "readv", "writev", "pread", "pwrite", "preadv",
+    "pwritev", "open", "openat", "close", "close_range", "lseek", "fstat",
+    "fstatat", "fstatfs", "getdirentries", "fcntl", "flock", "fsync",
+    "fdatasync", "ftruncate", "dup", "dup2", "pipe2", "chdir", "fchdir",
+    "__getcwd", "readlink", "readlinkat", "__realpathat", "mkdir",
+    "mkdirat", "rename", "renameat", "unlink", "unlinkat", "rmdir",
+    "access", "faccessat", "chmod", "fchmod", "fchmodat", "futimens",
+    "utimensat", "symlinkat", "linkat", "posix_fallocate", "ioctl",
+    # sockets (the families list decides which kinds)
+    "socket", "socketpair", "bind", "listen", "accept", "accept4",
+    "connect", "shutdown", "sendto", "recvfrom", "sendmsg", "recvmsg",
+    "getsockname", "getpeername", "getsockopt", "setsockopt",
+    # waiting
+    "poll", "ppoll", "select", "pselect", "kqueue", "kevent",
+]
+ioctls = [
+    "0x20006601",   # FIOCLEX
+    "0x20006602",   # FIONCLEX
+    "0x4004667f",   # FIONREAD
+    "0x8004667e",   # FIONBIO
+    "0x402c7413",   # TIOCGETA (isatty)
+    "0x40087468",   # TIOCGWINSZ
+]
+sockopts = [
+    "0xffff:4",     # SO_REUSEADDR
+    "0xffff:8",     # SO_KEEPALIVE
+    "0xffff:128",   # SO_LINGER
+    "0xffff:2048",  # SO_NOSIGPIPE
+    "0xffff:4097",  # SO_SNDBUF
+    "0xffff:4098",  # SO_RCVBUF
+    "0xffff:4101",  # SO_SNDTIMEO
+    "0xffff:4102",  # SO_RCVTIMEO
+    "0xffff:4103",  # SO_ERROR
+    "0xffff:4104",  # SO_TYPE
+    "0:1",          # LOCAL_PEERCRED (getpeereid); level 0 is also IPPROTO_IP
+]
+families = ["unix"]
+
+# Fresco renderers, decoders, the Tier-2 executor, Navigator workers.
+[sysfil.profiles.renderer]
+include = ["base"]
+
+# Ordinary apps.
+[sysfil.profiles.app]
+include = ["base"]
+
+# Nuntius fetchers and apps with the network capability.
+[sysfil.profiles.networked]
+include  = ["base"]
+families = ["inet", "inet6"]
+sockopts = [
+    "6:1",          # TCP_NODELAY
+    "6:256",        # TCP_KEEPIDLE
+    "6:512",        # TCP_KEEPINTVL
+    "6:1024",       # TCP_KEEPCNT
+    "41:27",        # IPV6_V6ONLY
+    "0:3",          # IP_TOS
+    "0:4",          # IP_TTL
+    "41:4",         # IPV6_UNICAST_HOPS
+]
+
+# The shell and what it runs.
+[sysfil.profiles.terminal]
+include  = ["networked"]
+syscalls = [
+    "fork", "vfork", "pdfork", "wait4", "wait6", "setsid", "setpgid",
+    "getpgid", "getpgrp", "getsid", "copy_file_range", "ktimer_create",
+    "ktimer_settime", "ktimer_gettime", "ktimer_delete", "setitimer",
+    "getitimer", "setpriority", "getpriority", "chown", "fchown", "lchown",
+    "fchownat", "statfs", "getfsstat", "pathconf", "fpathconf",
+]
+ioctls = [
+    "0x20007461",   # TIOCSCTTY
+    "0x20007471",   # TIOCNOTTY
+    "0x802c7414",   # TIOCSETA
+    "0x802c7415",   # TIOCSETAW
+    "0x802c7416",   # TIOCSETAF
+    "0x80087467",   # TIOCSWINSZ
+    "0x80047476",   # TIOCSPGRP
+    "0x40047477",   # TIOCGPGRP
+    "0x40047463",   # TIOCGSID
+]

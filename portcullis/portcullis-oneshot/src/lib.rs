@@ -416,6 +416,7 @@ pub fn run_with_stdio(spec: &Spec, stdio: Option<[std::os::fd::OwnedFd; 3]>) -> 
         hostid:   Some(host_identity.hostid),
         hostuuid: Some(host_identity.hostuuid.clone()),
         allow_mlock: false,
+        syscall_profile: None,
     });
     let outcome = run_via_jaild(&req, stdio);
 

@@ -1,0 +1,10 @@
+[package]
+name = "sysfil-probe"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+# Standalone: not part of any workspace in the tree.
+[workspace]
+
+[dependencies]

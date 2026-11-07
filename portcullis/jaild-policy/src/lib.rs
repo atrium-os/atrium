@@ -58,6 +58,119 @@ pub struct Policy {
     /// Arca's couriers (arca.md §5). Absent = none.
     #[serde(default)]
     pub couriers: Option<CourierPolicy>,
+    /// Per-jail system call filter profiles (jail-sysfil.md §5). Absent =
+    /// no profiles, and a request that names one is refused.
+    #[serde(default)]
+    pub sysfil: SysfilPolicy,
+}
+
+/// `[sysfil]`: the system call filter profiles jaild may put on a jail
+/// (docs/spec/jail-sysfil.md §5). A request names a profile by class
+/// (`CreateJailRequest.syscall_profile`); jaild passes the resolved lists to
+/// the kernel as `sysfil.*` jail parameters when it creates the jail.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct SysfilPolicy {
+    /// Refuse an exec'd jail that names no profile.
+    #[serde(default)]
+    pub required: bool,
+    /// The kernel's `sysfil.mode` for every profile: 1 log only, 2 deny,
+    /// 3 deny and SIGSYS. 1 on a development box turns every app's
+    /// denials into a list of what its profile is missing.
+    #[serde(default = "default_sysfil_mode")]
+    pub mode: i32,
+    #[serde(default)]
+    pub profiles: BTreeMap<String, SysfilProfile>,
+}
+
+fn default_sysfil_mode() -> i32 { 2 }
+
+impl Default for SysfilPolicy {
+    fn default() -> Self {
+        SysfilPolicy { required: false, mode: default_sysfil_mode(), profiles: BTreeMap::new() }
+    }
+}
+
+/// One class. A list left out is unrestricted (unless an included profile
+/// restricts it); an empty list allows nothing of that kind.
+#[derive(Debug, Default, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct SysfilProfile {
+    /// Profiles whose lists this one adds to, e.g. `["base"]`.
+    #[serde(default)]
+    pub include:  Vec<String>,
+    pub syscalls: Option<Vec<String>>,
+    /// ioctl command numbers, as the kernel takes them (`0x4004667f`).
+    pub ioctls:   Option<Vec<String>>,
+    /// `level:name`, numbers (`0xffff:4097`).
+    pub sockopts: Option<Vec<String>>,
+    /// Address family names or numbers (`unix`, `inet6`).
+    pub families: Option<Vec<String>>,
+}
+
+/// A profile with its includes folded in, in the kernel's string form:
+/// comma-joined lists, `None` for an unrestricted class.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SysfilParams {
+    pub mode:     i32,
+    pub syscalls: Option<String>,
+    pub ioctls:   Option<String>,
+    pub sockopts: Option<String>,
+    pub families: Option<String>,
+}
+
+impl SysfilPolicy {
+    /// Resolve a profile by name, following `include`s (no cycles, depth 8).
+    pub fn resolve(&self, name: &str) -> Result<SysfilParams, String> {
+        if !(1..=3).contains(&self.mode) {
+            return Err(format!("sysfil.mode {} is not 1, 2 or 3", self.mode));
+        }
+        let mut acc: [Option<std::collections::BTreeSet<String>>; 4] = Default::default();
+        self.fold(name, &mut acc, &mut Vec::new())?;
+        let join = |s: &Option<std::collections::BTreeSet<String>>| {
+            s.as_ref().map(|v| v.iter().cloned().collect::<Vec<_>>().join(","))
+        };
+        Ok(SysfilParams {
+            mode:     self.mode,
+            syscalls: join(&acc[0]),
+            ioctls:   join(&acc[1]),
+            sockopts: join(&acc[2]),
+            families: join(&acc[3]),
+        })
+    }
+
+    fn fold(&self, name: &str,
+            acc: &mut [Option<std::collections::BTreeSet<String>>; 4],
+            path: &mut Vec<String>) -> Result<(), String> {
+        if path.iter().any(|p| p == name) {
+            return Err(format!("sysfil profile include cycle: {} -> {name}", path.join(" -> ")));
+        }
+        if path.len() >= 8 {
+            return Err(format!("sysfil profile includes nest deeper than 8 at {name}"));
+        }
+        let prof = self.profiles.get(name)
+            .ok_or_else(|| format!("no sysfil profile {name:?}"))?;
+        path.push(name.to_string());
+        for inc in &prof.include {
+            self.fold(inc, acc, path)?;
+        }
+        path.pop();
+        let lists = [&prof.syscalls, &prof.ioctls, &prof.sockopts, &prof.families];
+        for (i, l) in lists.iter().enumerate() {
+            if let Some(items) = l {
+                let set = acc[i].get_or_insert_with(Default::default);
+                for it in items.iter() {
+                    let it = it.trim();
+                    // The kernel splits on commas; an entry must be one token.
+                    if it.is_empty() || !it.chars().all(|c| c.is_ascii_alphanumeric() || "_:.".contains(c)) {
+                        return Err(format!("sysfil profile {name:?}: bad entry {it:?}"));
+                    }
+                    set.insert(it.to_string());
+                }
+            }
+        }
+        Ok(())
+    }
 }
 
 /// `[couriers]`: Arca's per-endpoint courier jails (arca.md §5, §5.2). One
@@ -372,6 +485,68 @@ impl Policy {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn sysfil_sample() -> SysfilPolicy {
+        toml::from_str(r#"
+            mode = 2
+            [profiles.base]
+            syscalls = ["read", "write", "_exit"]
+            ioctls   = ["0x4004667f"]
+            families = ["unix"]
+            [profiles.net]
+            include  = ["base"]
+            families = ["inet6", "inet"]
+            [profiles.loop1]
+            include  = ["loop2"]
+            [profiles.loop2]
+            include  = ["loop1"]
+            [profiles.bad]
+            syscalls = ["read,write"]
+        "#).unwrap()
+    }
+
+    #[test]
+    fn sysfil_resolves_includes_and_leaves_unlisted_classes_open() {
+        let p = sysfil_sample().resolve("net").unwrap();
+        assert_eq!(p.mode, 2);
+        assert_eq!(p.syscalls.as_deref(), Some("_exit,read,write"));
+        assert_eq!(p.ioctls.as_deref(), Some("0x4004667f"));
+        assert_eq!(p.families.as_deref(), Some("inet,inet6,unix"));
+        assert_eq!(p.sockopts, None, "a class no profile names stays unrestricted");
+    }
+
+    #[test]
+    fn sysfil_refuses_cycles_unknown_names_bad_entries_and_modes() {
+        let s = sysfil_sample();
+        assert!(s.resolve("loop1").unwrap_err().contains("cycle"));
+        assert!(s.resolve("nope").unwrap_err().contains("no sysfil profile"));
+        // A comma would let one entry smuggle in several.
+        assert!(s.resolve("bad").unwrap_err().contains("bad entry"));
+        let mut m = s.clone();
+        m.mode = 0;
+        assert!(m.resolve("base").is_err(), "mode 0 would be no filter at all");
+    }
+
+    #[test]
+    fn shipped_sysfil_profiles_resolve() {
+        let crate_dir = env!("CARGO_MANIFEST_DIR");
+        let sample = std::path::Path::new(crate_dir).parent().unwrap().parent().unwrap()
+            .join("etc/jaild.policy.toml");
+        let p = Policy::load(&sample).unwrap();
+        for class in ["renderer", "app", "networked", "terminal"] {
+            let r = p.sysfil.resolve(class).unwrap_or_else(|e| panic!("{class}: {e}"));
+            let sys = r.syscalls.unwrap();
+            for never in ["ktrace", "ptrace", "setcred", "jail_set", "kqueuex", "procctl",
+                          "thr_kill2", "sigqueue", "sendfile", "lio_listio", "mount"] {
+                assert!(!sys.split(',').any(|s| s == never), "{class} allows {never}");
+            }
+            let fam = r.families.unwrap();
+            assert!(!fam.split(',').any(|f| f == "route"), "{class} allows route sockets");
+        }
+        let app = p.sysfil.resolve("app").unwrap();
+        assert!(!app.ioctls.unwrap().contains("0x20007461"), "TIOCSCTTY outside terminal");
+        assert_eq!(app.families.as_deref(), Some("unix"));
+    }
 
     /// Parse the shipped sample at etc/jaild.policy.toml.
     /// Confirms the schema is internally consistent + serde-able

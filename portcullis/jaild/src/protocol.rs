@@ -308,6 +308,14 @@ pub struct CreateJailRequest {
     /// jails named in `policy.mlock.allow_jails` (Arca, arca.md §6.3).
     #[serde(default)]
     pub allow_mlock: bool,
+
+    /// The jail's system call filter class (jail-sysfil.md §5): a profile
+    /// name from the policy's `[sysfil.profiles]`. The kernel gets the
+    /// resolved lists as `sysfil.*` parameters at jail creation, and they
+    /// can never be widened afterwards. `None` = no filter, refused when
+    /// `policy.sysfil.required` is set.
+    #[serde(default)]
+    pub syscall_profile: Option<String>,
 }
 
 /// One mount applied inside a jail. `source` is a path on the host
@@ -643,6 +651,7 @@ mod tests {
             hostid: None,
             hostuuid: None,
             allow_mlock: false,
+            syscall_profile: None,
         });
         let bytes = serde_json::to_vec(&req).unwrap();
         let back: Request = serde_json::from_slice(&bytes).unwrap();

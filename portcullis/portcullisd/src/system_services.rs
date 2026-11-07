@@ -472,6 +472,7 @@ impl ServiceManifest {
             hostid: None,
             hostuuid: None,
             allow_mlock: self.allow_mlock,
+            syscall_profile: None,
         }
     }
 }

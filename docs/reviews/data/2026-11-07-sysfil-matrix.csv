@@ -1,0 +1,45 @@
+advisory,bug_class,requirements,note,none (today),"syscall bitmap only, no argument filters",renderer / decoder,document worker,GUI app (default),networked app,app classes if the filter started at exec (v2),terminal,"shipped profile ""renderer""","shipped profile ""app""","shipped profile ""networked""","shipped profile ""terminal"""
+FreeBSD-SA-26:66.jail,logic,none,"renameat(2), SCM_RIGHTS and fdescfs open: calls every app uses",,,,,,,,,,,,
+FreeBSD-SA-26:65.kqueue,temporal,sys:kqueuex,KQUEUE_CPONFORK is only reachable through kqueuex(2); kqueue(2) cannot set it,,closed,closed,closed,closed,closed,closed,closed,closed,closed,closed,closed
+FreeBSD-SA-26:63.posixshm,temporal,ioctl:FIOSSHMLPGCNF,largepage configuration ioctl,,,closed,closed,closed,closed,closed,closed,closed,closed,closed,closed
+FreeBSD-SA-26:62.tty,temporal,ioctl:TIOCSCTTY,tty ioctl,,,closed,closed,closed,closed,closed,,closed,closed,closed,
+FreeBSD-SA-26:57.unix,temporal,none,unix SOCK_STREAM receive with SCM_RIGHTS: every app's IPC,,,,,,,,,,,,
+FreeBSD-SA-26:55.elf,spatial,core,"core dump of an rfork(RFMEM) process; reached by crashing, not by a call",closed,closed,closed,closed,closed,closed,closed,closed,closed,closed,closed,closed
+FreeBSD-SA-26:53.ktrace,logic,sys:ktrace,ktrace(2) by jailed root,,closed,closed,closed,closed,closed,closed,closed,closed,closed,closed,closed
+FreeBSD-SA-26:51.ktimer,uninit,sys:ktimer_settime,POSIX timer syscalls,,closed,closed,closed,closed,closed,closed,,closed,closed,closed,
+FreeBSD-SA-26:50.kqueue,temporal,sys:kqueuex,KQUEUE_CPONFORK via kqueuex(2),,closed,closed,closed,closed,closed,closed,closed,closed,closed,closed,closed
+FreeBSD-SA-26:44.posixshm,temporal,largepage,needs a largepage object: shm_open2(SHM_LARGEPAGE),,,closed,closed,closed,closed,closed,closed,closed,closed,closed,closed
+FreeBSD-SA-26:42.unlinkat,logic,none,unlinkat(2) with AT_RESOLVE_BENEATH: a call every app uses,,,,,,,,,,,,
+FreeBSD-SA-26:39.execve,logic,sys:execve|sys:fexecve,"execve of a setuid binary, raced through procfs",,closed,,,,,closed,,,,,
+FreeBSD-SA-26:38.jail,temporal,sys:jail_set|sys:jail_get,jail_set/jail_get with JAIL_AT_DESC,,closed,closed,closed,closed,closed,closed,closed,closed,closed,closed,closed
+FreeBSD-SA-26:32.elf,logic,sys:procctl;sys:execve|sys:fexecve,procctl(PROC_ASLR_CTL) then exec of a setuid binary: either gate closes it,,closed,closed,closed,closed,closed,closed,closed,closed,closed,closed,closed
+FreeBSD-SA-26:29.ip6_multicast,temporal,sockopt:IPV6_MSFILTER,IPv6 socket option,,,closed,closed,closed,closed,closed,closed,closed,closed,closed,closed
+FreeBSD-SA-26:28.capsicum,logic,sys:sigqueue,sigqueue(2),,closed,closed,closed,closed,closed,closed,closed,closed,closed,closed,closed
+FreeBSD-SA-26:26.ktls,logic,sockopt:TCP_RXTLS_ENABLE;sys:sendfile,KTLS receive fed by sendfile over loopback: either gate closes it,,closed,closed,closed,closed,closed,closed,closed,closed,closed,closed,closed
+FreeBSD-SA-26:25.thr,logic,sys:thr_kill2,thr_kill2(2) (libthr signals its own threads with thr_kill),,closed,closed,closed,closed,closed,closed,closed,closed,closed,closed,closed
+FreeBSD-SA-26:21.ptrace,spatial,sys:ptrace,ptrace(PT_SC_REMOTE),,closed,closed,closed,closed,closed,closed,closed,closed,closed,closed,closed
+FreeBSD-SA-26:19.file,temporal,none,poll/select racing close on some descriptor types: every app polls,,,,,,,,,,,,
+FreeBSD-SA-26:18.setcred,spatial,sys:setcred,setcred(2),,closed,closed,closed,closed,closed,closed,closed,closed,closed,closed,closed
+FreeBSD-SA-26:13.exec,spatial,sys:execve|sys:fexecve,execve argument copy,,closed,,,,,closed,,,,,
+FreeBSD-SA-26:11.amd64,logic,largepage,pkru range update over a 1 GB largepage mapping,,,closed,closed,closed,closed,closed,closed,closed,closed,closed,closed
+FreeBSD-SA-26:10.tty,temporal,ioctl:TIOCNOTTY,tty ioctl,,,closed,closed,closed,closed,closed,,closed,closed,closed,
+FreeBSD-SA-26:05.route,spatial,af:route,"PF_ROUTE socket, RTM_GET",,,closed,closed,closed,closed,closed,closed,closed,closed,closed,closed
+FreeBSD-SA-26:04.jail,logic,none,unix-socket descriptor exchange between jails sharing a nullfs mount,,,,,,,,,,,,
+FreeBSD-SA-25:09.netinet,logic,sockopt:SO_REUSEPORT_LB,socket option,,,closed,closed,closed,closed,closed,closed,closed,closed,closed,closed
+FreeBSD-SA-25:04.ktrace,uninit,sys:ktrace,ktrace(2) sockaddr record,,closed,closed,closed,closed,closed,closed,closed,closed,closed,closed,closed
+FreeBSD-SA-24:14.umtx,temporal,none,_umtx_op(UMTX_OP_SHM): _umtx_op is in every threaded app; needs a sub-operation filter (not in v1),,,,,,,,,,,,
+FreeBSD-SA-24:06.ktrace,logic,sys:ktrace;sys:execve|sys:fexecve,ktrace across a setuid exec,,closed,closed,closed,closed,closed,closed,closed,closed,closed,closed,closed
+FreeBSD-SA-24:02.tty,logic,none,kern.ttys sysctl; needs a sysctl filter (not in v1),,,,,,,,,,,,
+FreeBSD-SA-23:13.capsicum,logic,sys:copy_file_range,copy_file_range(2) offsets,,closed,closed,closed,closed,closed,closed,,closed,closed,closed,
+FreeBSD-SA-22:11.vm,logic,none,mmap/fork shadow chains: every app,,,,,,,,,,,,
+FreeBSD-SA-22:10.aio,leak,sys:lio_listio,lio_listio(2),,closed,closed,closed,closed,closed,closed,closed,closed,closed,closed,closed
+FreeBSD-SA-22:09.elf,spatial,core,core dump note,closed,closed,closed,closed,closed,closed,closed,closed,closed,closed,closed,closed
+FreeBSD-SA-21:11.smap,logic,none,copyin fault path,,,,,,,,,,,,
+FreeBSD-SA-21:09.accept_filter,temporal,sockopt:SO_ACCEPTFILTER,socket option,,,closed,closed,closed,closed,closed,closed,closed,closed,closed,closed
+FreeBSD-SA-21:08.vm,logic,none,mmap/fork shadow chains: every app,,,,,,,,,,,,
+FreeBSD-SA-21:01.fsdisclosure,uninit,none,getdirentries(2) on tmpfs and others,,,,,,,,,,,,
+FreeBSD-SA-20:24.ipv6,temporal,none,IPv6 hop-by-hop options sent as sendmsg(2) ancillary data; needs a control-message filter (not in v1),,,,,,,,,,,,
+FreeBSD-SA-20:20.ipv6,temporal,sockopt:IPV6_2292PKTOPTIONS,socket option,,,closed,closed,closed,closed,closed,closed,closed,closed,closed,closed
+FreeBSD-SA-20:08.jail,spatial,sys:jail_set,jail_set(2) osrelease,,closed,closed,closed,closed,closed,closed,closed,closed,closed,closed,closed
+FreeBSD-SA-20:07.epair,spatial,ioctl:SIOCSIFxxx,epair interface ioctl by vnet jail root,,,closed,closed,closed,closed,closed,closed,closed,closed,closed,closed
+FreeBSD-SA-20:03.thrmisc,uninit,core,core dump thrmisc note,closed,closed,closed,closed,closed,closed,closed,closed,closed,closed,closed,closed

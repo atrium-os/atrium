@@ -19,7 +19,7 @@ use sockmux::{LengthPrefixed, Mux};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 
-use jaild_policy::Policy;
+use jaild_policy::{Policy, SysfilParams};
 use log::{error, info, warn};
 
 use crate::ffi::{self, JailCreateSpec};
@@ -789,6 +789,10 @@ fn handle_create(
     state_path: &Path,
 ) -> Result<CreateOutcome, JaildError> {
     validator::validate_create(req, policy)?;
+    // The filter the kernel will hold for the jail's whole life
+    // (jail-sysfil.md §5.3), resolved once here from the policy.
+    let sysfil = validator::resolve_sysfil(req, policy)?;
+    let sysfil = sysfil.as_ref();
 
     /* Persistent-jail name uniqueness: refuse to step on an
      * existing record. (The kernel would reject the duplicate
@@ -958,15 +962,15 @@ fn handle_create(
      * the app before its network existed. */
     let pre_created = match &req.network {
         NetworkConfig::Routed { mac, grants } =>
-            Some(create_routed(req, mac, grants.as_ref(), state, state_path)?),
-        NetworkConfig::Loopback => Some(create_loopback(req)?),
+            Some(create_routed(req, mac, grants.as_ref(), state, state_path, sysfil)?),
+        NetworkConfig::Loopback => Some(create_loopback(req, sysfil)?),
         _ => None,
     };
 
     if let Some(exec) = &req.exec {
         let r = handle_create_with_exec(
             req, exec, stdio, lo0_alias, ip4_addr_no_cidr, ip4_inherit, state, state_path,
-            policy.mount_sources.max_tmpfs_mb, pre_created,
+            policy.mount_sources.max_tmpfs_mb, pre_created, sysfil,
         );
         match &r {
             Ok(_) if limits.is_some() => {
@@ -1000,6 +1004,7 @@ fn handle_create(
         hostid:         req.hostid,
         hostuuid:       req.hostuuid.as_deref(),
         allow_mlock:    req.allow_mlock,
+        sysfil,
     };
     let created = ffi::create_persistent_jail(&spec).map_err(|e| {
         /* Roll back the lo0 alias if jail_set failed. */
@@ -1127,11 +1132,11 @@ fn release_routed(jail_name: &str, state: &mut PersistentState, state_path: &Pat
 
 /// The (persistent, for now) jail for `Loopback`: an own vnet whose lo0 is
 /// brought up before anything runs. Returns the jid.
-fn create_loopback(req: &CreateJailRequest) -> Result<i32, JaildError> {
+fn create_loopback(req: &CreateJailRequest, sysfil: Option<&SysfilParams>) -> Result<i32, JaildError> {
     let sys = |name: &'static str, e: std::io::Error| JaildError::Syscall {
         name, errno: e.raw_os_error().unwrap_or(-1), msg: format!("{e}"),
     };
-    let jid = ffi::create_persistent_jail(&isolated_spec(req)).map_err(|e| sys("jail_set", e))?.jid;
+    let jid = ffi::create_persistent_jail(&isolated_spec(req, sysfil)).map_err(|e| sys("jail_set", e))?.jid;
     if let Err(e) = crate::routed::configure_loopback(&req.name) {
         let _ = ffi::remove_jail(jid);
         return Err(sys("ifconfig", e));
@@ -1141,7 +1146,7 @@ fn create_loopback(req: &CreateJailRequest) -> Result<i32, JaildError> {
 }
 
 /// The persistent vnet=new jail both pre-networked modes start from.
-fn isolated_spec(req: &CreateJailRequest) -> JailCreateSpec<'_> {
+fn isolated_spec<'a>(req: &'a CreateJailRequest, sysfil: Option<&'a SysfilParams>) -> JailCreateSpec<'a> {
     JailCreateSpec {
         name:          &req.name,
         path:          &req.path,
@@ -1155,6 +1160,7 @@ fn isolated_spec(req: &CreateJailRequest) -> JailCreateSpec<'_> {
         hostid:        req.hostid,
         hostuuid:      req.hostuuid.as_deref(),
         allow_mlock:   req.allow_mlock,
+        sysfil,
     }
 }
 
@@ -1166,13 +1172,14 @@ fn create_routed(
     grants:     Option<&crate::protocol::NetGrants>,
     state:      &mut PersistentState,
     state_path: &Path,
+    sysfil:     Option<&SysfilParams>,
 ) -> Result<i32, JaildError> {
     use crate::routed;
     let sys = |name: &'static str, e: std::io::Error| JaildError::Syscall {
         name, errno: e.raw_os_error().unwrap_or(-1), msg: format!("{e}"),
     };
     let (slot, a, b) = allocate_host_end()(state)?;
-    let jid = match ffi::create_persistent_jail(&isolated_spec(req)) {
+    let jid = match ffi::create_persistent_jail(&isolated_spec(req, sysfil)) {
         Ok(c) => c.jid,
         Err(e) => { let _ = routed::destroy(&a); return Err(sys("jail_set", e)); }
     };
@@ -1211,6 +1218,7 @@ fn handle_create_with_exec(
     state_path:  &Path,
     tmpfs_ceiling: u64,
     pre_created: Option<i32>,
+    sysfil:      Option<&SysfilParams>,
 ) -> Result<CreateOutcome, JaildError> {
     /* Pre-resolve mount targets into absolute paths under the jail
      * root so the child can apply them with a single nmount per
@@ -1301,7 +1309,18 @@ fn handle_create_with_exec(
             hostid:         req.hostid,
             hostuuid:       req.hostuuid.as_deref(),
             allow_mlock:    req.allow_mlock,
+            sysfil,
         };
+        // No core dumps from a filtered jail: three of the advisories the
+        // filter is measured against are in the ELF core writer, reached by
+        // crashing rather than by a call (jail-sysfil.md §2). Hard limit too,
+        // so the app cannot raise it back.
+        if sysfil.is_some() {
+            if let Err(e) = ffi::disable_core_dumps() {
+                eprintln!("jaild-child: setrlimit(RLIMIT_CORE): {e}");
+                ffi::child_exit(105);
+            }
+        }
         let attached = match pre_created {
             // A Routed jail already exists, network and all: just join it.
             Some(jid) => ffi::jail_attach(jid),

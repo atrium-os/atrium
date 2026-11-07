@@ -39,7 +39,26 @@ pub fn validate_create(
         validate_exec(exec, policy, is_instance_root(req, policy), is_courier(req, policy))?;
     }
     validate_host_identity(req)?;
+    resolve_sysfil(req, policy)?;
     Ok(())
+}
+
+/// The jail's system call filter, resolved from its class
+/// (jail-sysfil.md §5.3). `Ok(None)` = the request asks for no filter.
+pub fn resolve_sysfil(
+    req: &CreateJailRequest,
+    policy: &Policy,
+) -> Result<Option<jaild_policy::SysfilParams>, JaildError> {
+    match &req.syscall_profile {
+        Some(name) => policy.sysfil.resolve(name).map(Some).map_err(|detail| {
+            JaildError::PolicyViolation { rule: "sysfil.profile", detail }
+        }),
+        None if policy.sysfil.required && req.exec.is_some() => Err(JaildError::PolicyViolation {
+            rule:   "sysfil.required",
+            detail: format!("jail {:?} names no syscall_profile and policy.sysfil.required is set", req.name),
+        }),
+        None => Ok(None),
+    }
 }
 
 /// The synthetic host identity (portcullis.md §9.1c): a plain DNS-ish
@@ -697,6 +716,7 @@ mod tests {
             hostid: None,
             hostuuid: None,
             allow_mlock: false,
+            syscall_profile: None,
         };
         validate_create(&req, &p).unwrap();
     }
@@ -722,7 +742,31 @@ mod tests {
             hostid: None,
             hostuuid: None,
             allow_mlock: false,
+            syscall_profile: None,
         }
+    }
+
+    /// The syscall filter class resolves from the policy; an unknown class
+    /// is refused, and `required` refuses an exec'd jail that names none.
+    #[test]
+    fn syscall_profile_resolves_or_is_refused() {
+        let mut p = load_sample_policy();
+        let mut r = instance_req("app-org-atrium-navigator-worker--1",
+            "/var/lib/atrium/jails/app-org-atrium-navigator-worker--1",
+            "/bin/navigator-worker", true);
+        assert_eq!(resolve_sysfil(&r, &p).unwrap(), None);
+        r.syscall_profile = Some("renderer".into());
+        let f = resolve_sysfil(&r, &p).unwrap().unwrap();
+        assert_eq!(f.mode, 2);
+        assert_eq!(f.families.as_deref(), Some("unix"));
+        validate_create(&r, &p).unwrap();
+        r.syscall_profile = Some("everything".into());
+        assert!(matches!(validate_create(&r, &p),
+            Err(JaildError::PolicyViolation { rule: "sysfil.profile", .. })));
+        r.syscall_profile = None;
+        p.sysfil.required = true;
+        assert!(matches!(validate_create(&r, &p),
+            Err(JaildError::PolicyViolation { rule: "sysfil.required", .. })));
     }
 
     /// ★ A one-shot instance root runs its signed tree's entry wherever the
@@ -872,6 +916,7 @@ mod tests {
             hostid: None,
             hostuuid: None,
             allow_mlock: false,
+            syscall_profile: None,
         };
         let err = validate_create(&req, &p).unwrap_err();
         match err {
@@ -894,6 +939,7 @@ mod tests {
             hostid: None,
             hostuuid: None,
             allow_mlock: false,
+            syscall_profile: None,
         }
     }
 

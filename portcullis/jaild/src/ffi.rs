@@ -129,12 +129,29 @@ pub struct JailCreateSpec<'a> {
     /// Validator-gated to `policy.mlock.allow_jails`; Arca needs it so no
     /// secret reaches swap or the zram compressor (arca.md §6.3).
     pub allow_mlock:    bool,
+    /// The kernel system call filter (`sysfil.*`, jail-sysfil.md). Only
+    /// settable at creation; `None` = no filter.
+    pub sysfil:         Option<&'a jaild_policy::SysfilParams>,
 }
 
 impl IovBuilder {
     /// The host.* parameters. ★ `host.hostid` is an `unsigned long` in the
     /// kernel (kern_jail.c copies `sizeof(unsigned long)`), so it is passed as
     /// 8 native bytes — a 4-byte value would be rejected or misread.
+    /// `sysfil.mode` is an int; the lists are strings the kernel parses
+    /// once, at creation. A class left out stays unrestricted.
+    fn add_sysfil(&mut self, spec: &JailCreateSpec) -> io::Result<()> {
+        let Some(f) = spec.sysfil else { return Ok(()) };
+        self.add_i32("sysfil.mode", f.mode);
+        for (key, val) in [("sysfil.syscalls", &f.syscalls), ("sysfil.ioctls", &f.ioctls),
+                           ("sysfil.sockopts", &f.sockopts), ("sysfil.families", &f.families)] {
+            if let Some(v) = val {
+                self.add_string(key, v)?;
+            }
+        }
+        Ok(())
+    }
+
     fn add_host_identity(&mut self, spec: &JailCreateSpec) -> io::Result<()> {
         self.add_string("host.hostname", spec.hostname)?;
         if let Some(id) = spec.hostid {
@@ -166,6 +183,7 @@ pub fn create_persistent_jail(spec: &JailCreateSpec) -> io::Result<CreatedJail> 
     }
     iob.add_network(spec.ip4_addr, spec.ip4_inherit, spec.isolated)?;
     iob.add_host_identity(spec)?;
+    iob.add_sysfil(spec)?;
     if spec.allow_mlock {
         // A jail boolean takes an int value (kern_jail.c copies sizeof(int)).
         iob.add_i32("allow.mlock", 1);
@@ -174,6 +192,16 @@ pub fn create_persistent_jail(spec: &JailCreateSpec) -> io::Result<CreatedJail> 
     iob.add_buf("errmsg", &mut errmsg);
     let jid = iob.run(JAIL_CREATE, &errmsg)?;
     Ok(CreatedJail { jid })
+}
+
+/// `RLIMIT_CORE` = 0, soft and hard, for the calling (child) process.
+pub fn disable_core_dumps() -> io::Result<()> {
+    let rl = libc::rlimit { rlim_cur: 0, rlim_max: 0 };
+    // SAFETY: setrlimit reads one stack struct; no aliasing.
+    if unsafe { libc::setrlimit(libc::RLIMIT_CORE, &rl) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
 }
 
 /// Set or clear `persist` on a live jail (`jail_set(JAIL_UPDATE)`). Clearing
@@ -295,6 +323,7 @@ pub fn jail_create_and_attach(spec: &JailCreateSpec) -> io::Result<i32> {
     }
     iob.add_network(spec.ip4_addr, spec.ip4_inherit, spec.isolated)?;
     iob.add_host_identity(spec)?;
+    iob.add_sysfil(spec)?;
     if spec.allow_mlock {
         // A jail boolean takes an int value (kern_jail.c copies sizeof(int)).
         iob.add_i32("allow.mlock", 1);
@@ -1355,5 +1384,41 @@ mod privilege_drop_tests {
         let err = verify_dropped(uid.wrapping_add(1), gid)
             .expect_err("a mismatched uid must be refused");
         assert!(err.to_string().contains("uid"), "{err}");
+    }
+
+    /// The filter reaches the kernel through jail_set as jaild builds it,
+    /// and reads back as the kernel holds it. Needs root and a kernel with
+    /// sysfil (jail-sysfil.md); run in the VM with `--ignored`.
+    #[cfg(target_os = "freebsd")]
+    #[test]
+    #[ignore]
+    fn sysfil_reaches_the_kernel() {
+        let f = jaild_policy::SysfilParams {
+            mode:     2,
+            syscalls: Some("_exit,getpid,read,write".into()),
+            ioctls:   Some(String::new()),
+            sockopts: None,
+            families: Some("unix".into()),
+        };
+        let name = format!("jaild-sysfil-test-{}", std::process::id());
+        let spec = JailCreateSpec {
+            name: &name, path: "/", persist: 1, children_max: 0, devfs_ruleset: 0,
+            ip4_addr: None, ip4_inherit: false, isolated: false, hostname: "sysfil-test",
+            hostid: None, hostuuid: None, allow_mlock: false, sysfil: Some(&f),
+        };
+        let jid = create_persistent_jail(&spec).expect("jail_set with sysfil").jid;
+        let get = |p: &str| {
+            let o = std::process::Command::new("jls")
+                .args(["-j", &jid.to_string(), "-h", p]).output().unwrap();
+            String::from_utf8(o.stdout).unwrap().lines().last().unwrap_or("").to_string()
+        };
+        let got = (get("sysfil.mode"), get("sysfil.syscalls"), get("sysfil.ioctls"),
+                   get("sysfil.sockopts"), get("sysfil.families"));
+        remove_jail(jid).unwrap();
+        assert_eq!(got.0, "2");
+        assert_eq!(got.1, "_exit,read,write,getpid", "kernel order: by syscall number");
+        assert_eq!(got.2, "\"\"", "empty list: allows no ioctl");
+        assert_eq!(got.3, "*", "not given: unrestricted");
+        assert_eq!(got.4, "unix");
     }
 }

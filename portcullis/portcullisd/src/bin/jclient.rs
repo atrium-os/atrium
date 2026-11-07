@@ -68,6 +68,7 @@ fn main() -> ExitCode {
                 hostid: None,
                 hostuuid: None,
                 allow_mlock: false,
+                syscall_profile: None,
             })
         }
         "remove" => {
@@ -108,6 +109,7 @@ fn main() -> ExitCode {
                 hostid: None,
                 hostuuid: None,
                 allow_mlock: false,
+                syscall_profile: None,
             })
         }
         "attach" => {
