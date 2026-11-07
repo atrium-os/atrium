@@ -1,0 +1,81 @@
+# syzkaller description of the Atrium Rust kmod spike devices (ABI:
+# kmod-rust-spike/spike_abi.h).  The same calls drive /dev/rspike (Rust) and
+# /dev/cspike (its C twin).  Copy into syzkaller's sys/freebsd/ with the
+# .const file next to it, then `make generate && make TARGETOS=freebsd`.
+#
+# SPDX-License-Identifier: BSD-2-Clause
+
+include <sys/types.h>
+include <sys/ioccom.h>
+include <fcntl.h>
+
+resource fd_spike[fd]
+
+openat$rspike(fd const[AT_FDCWD], file ptr[in, string["/dev/rspike"]], flags flags[open_flags], mode const[0]) fd_spike
+openat$cspike(fd const[AT_FDCWD], file ptr[in, string["/dev/cspike"]], flags flags[open_flags], mode const[0]) fd_spike
+
+ioctl$SPIKE_IOC_NOP(fd fd_spike, cmd const[SPIKE_IOC_NOP], arg const[0])
+ioctl$SPIKE_IOC_SET(fd fd_spike, cmd const[SPIKE_IOC_SET], arg ptr[in, spike_buf_in])
+ioctl$SPIKE_IOC_GET(fd fd_spike, cmd const[SPIKE_IOC_GET], arg ptr[inout, spike_buf_out])
+ioctl$SPIKE_IOC_PARSE(fd fd_spike, cmd const[SPIKE_IOC_PARSE], arg ptr[inout, spike_parse])
+ioctl$SPIKE_IOC_PARSE_RAW(fd fd_spike, cmd const[SPIKE_IOC_PARSE], arg ptr[inout, spike_parse_raw])
+ioctl$SPIKE_IOC_STATS(fd fd_spike, cmd const[SPIKE_IOC_STATS], arg ptr[out, spike_stats])
+write$spike(fd fd_spike, buf buffer[in], count len[buf])
+read$spike(fd fd_spike, buf buffer[out], count len[buf])
+
+spike_buf_in {
+	ptr	ptr64[in, array[int8]]
+	len	len[ptr, int32]
+	flags	int32[0:1]
+}
+
+spike_buf_out {
+	ptr	ptr64[out, array[int8]]
+	len	len[ptr, int32]
+	flags	int32[0:1]
+}
+
+# A well-formed-ish record stream (the fuzzer mutates it into malformed ones),
+# with containers nested so the depth limit is reachable.
+spike_rec_leaf {
+	type	int8[1:254]
+	flags	int8[0:1]
+	len	bytesize[value, int16]
+	value	array[int8, 0:64]
+} [packed]
+
+spike_rec_box {
+	type	const[0xff, int8]
+	flags	const[0, int8]
+	len	bytesize[inner, int16]
+	inner	array[spike_rec]
+} [packed]
+
+spike_rec [
+	leaf	spike_rec_leaf
+	box	spike_rec_box
+] [varlen]
+
+spike_parse {
+	ptr	ptr64[in, array[spike_rec]]
+	len	bytesize[ptr, int32]
+	count	int32
+	sum	int64
+}
+
+spike_parse_raw {
+	ptr	ptr64[in, array[int8]]
+	len	len[ptr, int32]
+	count	int32
+	sum	int64
+}
+
+spike_stats {
+	nops		int64
+	sets		int64
+	gets		int64
+	parses		int64
+	parse_errors	int64
+	bytes_in	int64
+	bytes_out	int64
+}

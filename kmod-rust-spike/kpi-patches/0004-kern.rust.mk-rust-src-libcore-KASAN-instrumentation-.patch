@@ -1,0 +1,141 @@
+From 2c604bebeeda0b2a647ccdde5f208bd0f8b90407 Mon Sep 17 00:00:00 2001
+From: Atrium <noreply@anthropic.com>
+Date: Sat, 7 Nov 2026 19:47:42 +0000
+Subject: [PATCH 4/4] kern.rust.mk: rust-src libcore, KASAN instrumentation,
+ pac-ret
+
+- RUST_LIB_SRC: build libcore from rustup's rust-src component.
+- With options KASAN, instrument Rust code (-Zsanitizer=kernel-address,
+  FreeBSD's shadow offset on arm64) and set --cfg kasan so usercopy goes
+  through the KASAN copyin/copyout interceptors.  The sanitizer flags are
+  filtered out of the CFLAGS given to bindgen, whose libclang rejects
+  -fsanitize=kernel-address for the bare arm64 target.
+- arm64: -Zbranch-protection=bti,pac-ret (was bti only), matching the
+  C kernel's -mbranch-protection=standard.
+- Under KASAN, call the kasan_atomic_* interceptors that
+  sys/atomic_san.h substitutes for atomic_readandclear_32/atomic_set_32.
+- Add usercopy.rs to RUST_KPI_SOURCES.
+---
+ kern.rust.mk   | 40 +++++++++++++++++++++++++++++++++++++---
+ kpi/src/lib.rs | 14 ++++++++++++--
+ 2 files changed, 49 insertions(+), 5 deletions(-)
+
+diff --git a/kern.rust.mk b/kern.rust.mk
+index efbbf07..01be45a 100644
+--- a/kern.rust.mk
++++ b/kern.rust.mk
+@@ -16,6 +16,22 @@ BINDGEN_VERSION= ${:!${BINDGEN} --version!}
+ .warn unexpected bindgen version: ${BINDGEN_VERSION}, expected: ${BINDGEN_VERSION_EXPECT}
+ .endif
+ 
++# The rust library sources libcore is built from. Either rustup's rust-src component (set
++# RUST_LIB_SRC=`rustc --print sysroot`/lib/rustlib/src/rust; it always matches the installed
++# toolchain, so no commit check is needed) or a checkout of the compiler repo in sys/rust/compiler
++# at the host compiler's commit.
++.if defined(RUST_LIB_SRC) && !empty(RUST_LIB_SRC)
++RUST_COMPILER_DIR= ${RUST_LIB_SRC}
++.if !exists(${RUST_COMPILER_DIR}/library/core/src/lib.rs)
++.error RUST_LIB_SRC=${RUST_LIB_SRC} has no library/core (install it: rustup component add rust-src)
++.endif
++RUSTC_BIN_INFO_CMD= ${RUSTC} --version --verbose
++RUSTC_BIN_NIGHTLY= ${:!${RUSTC_BIN_INFO_CMD}!:[2]:M*nightly}
++.if ${RUSTC_BIN_NIGHTLY} == ""
++.error Host rust compiler must be a nightly release
++.endif
++RUSTC_BIN_VERSION= ${:!${RUSTC_BIN_INFO_CMD}!:[2]:R}
++.else
+ RUST_COMPILER_DIR= ${SRCTOP}/sys/rust/compiler
+ RUSTC_BIN_INFO_CMD= ${RUSTC} --version --verbose
+ # Figure out the rust repo commit hash that the host compiler was built from
+@@ -46,14 +62,18 @@ RUSTC_REPO_HASH= ${:!${GIT_CMD} -C ${RUST_COMPILER_DIR} rev-parse HEAD!}
+ 	`git -C sys/rust/compiler fetch --depth 1 origin ${RUSTC_BIN_HASH} && git -C sys/rust/compiler checkout FETCH_HEAD`.
+ .endif
+ 
++.endif
++
+ # crate-independent build flags
+-RUSTFLAGS= --target=${RUST_TARGET} --edition 2024 -Copt-level=3 -Ccodegen-units=1 -Cembed-bitcode=yes -Clto=thin -Awarnings -Dunused_must_use -Cdebuginfo=full
++RUSTFLAGS= --target=${RUST_TARGET} --edition 2024 --check-cfg 'cfg(kasan)' -Copt-level=3 -Ccodegen-units=1 -Cembed-bitcode=yes -Clto=thin -Awarnings -Dunused_must_use -Cdebuginfo=full
+ 
+ .if ${TARGET_ARCH} == aarch64
+ 
+ RUST_TARGET= aarch64-unknown-none-softfloat
+ RUST_KPI_FEATURES= --cfg 'feature="intrng"'
+-RUSTFLAGS+= -Zfixed-x18 -Zbranch-protection=bti -Cforce-frame-pointers=true
++# bti,pac-ret matches the C kernel (kern.mk: -mbranch-protection=standard); bti alone left
++# rust return addresses unsigned.
++RUSTFLAGS+= -Zfixed-x18 -Zbranch-protection=bti,pac-ret -Cforce-frame-pointers=true
+ 
+ .if ${MK_FDT} != "no"
+ RUST_KPI_FEATURES+= --cfg 'feature="fdt"'
+@@ -76,6 +96,19 @@ RUSTFLAGS+= -Ccode-model=kernel \
+ 
+ .endif
+ 
++# KASAN kernels: instrument rust code the way kern.mk instruments C (same shadow mapping), and
++# route copyin/copyout through the kasan_ interceptors (usercopy.rs checks cfg(kasan)).
++.if defined(KERN_OPTS) && !empty(KERN_OPTS:MKASAN)
++RUSTFLAGS+= -Zsanitizer=kernel-address --cfg kasan \
++	-Cllvm-args=-asan-stack=true \
++	-Cllvm-args=-asan-globals=true \
++	-Cllvm-args=-asan-use-after-scope=true \
++	-Cllvm-args=-asan-instrumentation-with-call-threshold=0
++.if ${TARGET_ARCH} == aarch64
++RUSTFLAGS+= -Cllvm-args=-asan-mapping-offset=0xdfff208000000000
++.endif
++.endif
++
+ # TODO: Use the depfile
+ BINDGEN_DEPS= bindgen.d
+ BINDGEN_GENERATED_SRC= bindgen_inlines.c
+@@ -181,6 +214,7 @@ RUST_KPI_SOURCES= \
+ 	${SRCTOP}/sys/rust/kpi/src/boxed.rs \
+ 	${SRCTOP}/sys/rust/kpi/src/panic.rs \
+ 	${SRCTOP}/sys/rust/kpi/src/malloc.rs \
++	${SRCTOP}/sys/rust/kpi/src/usercopy.rs \
+ 
+ BINDINGS_RS= bindings.rs
+ 
+@@ -212,7 +246,7 @@ ${BINDGEN_INLINE_SRC}: ${BINDINGS_RS} ${RUST_MAKEFILE}
+ 	printf "${BINDGEN_DEFINES:C/$/\n/g:C/-D/#define /g}#include \"${BINDGEN_GENERATED_SRC}\"" > ${BINDGEN_INLINE_SRC}
+ 
+ ${BINDINGS_RS}: ${SRCTOP}/sys/rust/bindings.h ${RUST_MAKEFILE}
+-	${BINDGEN} ${BINDGEN_FLAGS} ${SRCTOP}/sys/rust/bindings.h -- ${CFLAGS} ${BINDGEN_DEFINES} > bindings.rs
++	${BINDGEN} ${BINDGEN_FLAGS} ${SRCTOP}/sys/rust/bindings.h -- ${CFLAGS:N-fsanitize=*:N-mllvm:N-asan-*} ${BINDGEN_DEFINES} > bindings.rs
+ 
+ ${RUST_KPI}: ${RUST_FAKE_BUILTINS} ${BINDINGS_RS} ${RUST_KPI_SOURCES}
+ 	OUT_DIR=${.OBJDIR} ${RLIB_RULE} --crate-name kpi ${RUST_KPI_FEATURES} ${SRCTOP}/sys/rust/kpi/src/lib.rs -o ${.TARGET}
+diff --git a/kpi/src/lib.rs b/kpi/src/lib.rs
+index 0f5e4d0..b0c58d3 100644
+--- a/kpi/src/lib.rs
++++ b/kpi/src/lib.rs
+@@ -198,14 +198,24 @@ pub mod misc {
+         let val = unsafe { bindings::mp_maxid };
+         val as usize
+     }
+-    #[cfg(target_arch = "aarch64")]
++    // Under KASAN, sys/atomic_san.h turns these into the kasan_atomic_*
++    // interceptors, so the inline versions are not in the bindings.
++    #[cfg(all(target_arch = "aarch64", not(kasan)))]
+     pub fn atomic_readandclear_32(p: &AtomicU32) -> u32 {
+         unsafe { bindings::atomic_readandclear_32(p.as_ptr()) }
+     }
+-    #[cfg(target_arch = "aarch64")]
++    #[cfg(all(target_arch = "aarch64", kasan))]
++    pub fn atomic_readandclear_32(p: &AtomicU32) -> u32 {
++        unsafe { bindings::kasan_atomic_readandclear_32(p.as_ptr()) }
++    }
++    #[cfg(all(target_arch = "aarch64", not(kasan)))]
+     pub fn atomic_set_32(p: &AtomicU32, x: u32) {
+         unsafe { bindings::atomic_set_32(p.as_ptr(), x) }
+     }
++    #[cfg(all(target_arch = "aarch64", kasan))]
++    pub fn atomic_set_32(p: &AtomicU32, x: u32) {
++        unsafe { bindings::kasan_atomic_set_32(p.as_ptr(), x) }
++    }
+     pub fn CPU_SET(cpu: u_int, set: *mut cpuset_t) {
+         unsafe { bindings::rust_bindings_CPU_SET(cpu, set) }
+     }
+-- 
+2.43.0
+

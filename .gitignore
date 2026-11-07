@@ -120,3 +120,6 @@ atrium-tessera/core/build-host/
 atrium-tessera/core/build-host-san/
 atrium-tessera/core/build-fuzz/
 atrium-tessera/core/fuzz/artifacts/
+
+# Rust kmod spike build outputs (scripts/rust-kmod-spike.sh build).
+kmod-rust-spike/out/

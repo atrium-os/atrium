@@ -18,6 +18,11 @@
 #            plain main() (fuzz/replay_main.c). Catches memory errors. Needs
 #            NOTHING beyond the default toolchain.
 #
+# On Linux (e.g. a cloud container) clang's libFuzzer and ASAN work together,
+# so FUZZ_ASAN=1 adds address to EXPLORE: memory errors are caught while the
+# corpus grows, not only on replay. There: FUZZ_CC=clang-18 CC=clang-18
+# FUZZ_ASAN=1 FUZZ_LIBS=-lmd (libmd-dev for <sha256.h>; libclang-rt-18-dev).
+#
 # The corpus is committed, so REPLAY is a deterministic regression test that
 # runs anywhere. That is the half worth wiring into the normal test suite;
 # EXPLORE stays on demand.
@@ -81,7 +86,7 @@ if [ "$REPLAY_ONLY" = 0 ]; then
 #include <stddef.h>
 int LLVMFuzzerTestOneInput(const uint8_t *d, size_t s) { (void)d; (void)s; return 0; }
 EOF
-        "$c" -fsanitize=fuzzer,undefined "$OBJ/probe.c" -o "$OBJ/probe" 2>/dev/null || continue
+        "$c" -fsanitize=fuzzer,undefined${FUZZ_ASAN:+,address} "$OBJ/probe.c" -o "$OBJ/probe" 2>/dev/null || continue
         # ★ Bound the probe. The failure we are screening for is a HANG, and an
         # unbounded probe would inherit it — the check would never fail, it
         # would just never finish.
@@ -107,7 +112,7 @@ EOF
         # UBSAN only — see the header. -fsanitize=fuzzer-no-link on the library
         # so every core object gets coverage instrumentation.
         FZFLAGS="-g -O1 -fno-strict-aliasing -Wall \
-                 -fsanitize=fuzzer-no-link,undefined -fno-sanitize-recover=all \
+                 -fsanitize=fuzzer-no-link,undefined${FUZZ_ASAN:+,address} -fno-sanitize-recover=all \
                  -fno-omit-frame-pointer"
         # shellcheck disable=SC2086
         build_core "$OBJ/explore" "$FZCC" $FZFLAGS || exit 1
@@ -116,7 +121,7 @@ EOF
             [ -f "$CORE/fuzz/$t.c" ] || { echo "no such target: $t"; exit 2; }
             # shellcheck disable=SC2086
             $FZCC $FZFLAGS $INC -fsanitize=fuzzer -o "$OBJ/$t" \
-                "$CORE/fuzz/$t.c" "$OBJ/explore/libcore.a" || exit 1
+                "$CORE/fuzz/$t.c" "$OBJ/explore/libcore.a" ${FUZZ_LIBS:-} || exit 1
             mkdir -p "$CORPUS/$t"
             # ★ libFuzzer's default -max_len is 4096. tessera_pack_open()
             # rejects anything shorter than two 4096-B sectors, so at the
@@ -179,7 +184,7 @@ for t in $TARGETS; do
     [ -f "$CORE/fuzz/$t.c" ] || continue
     # shellcheck disable=SC2086
     $CC $SANFLAGS $INC -o "$OBJ/$t.replay" "$CORE/fuzz/$t.c" \
-        "$CORE/fuzz/replay_main.c" "$OBJ/replay/libcore.a" || exit 1
+        "$CORE/fuzz/replay_main.c" "$OBJ/replay/libcore.a" ${FUZZ_LIBS:-} || exit 1
 
     set -- "$CORPUS/$t"/* "$ARTIFACTS/$t-"*
     files=""

@@ -1,0 +1,75 @@
+From 050d17b1a95eb1fbed99f54f18379ec827c56efd Mon Sep 17 00:00:00 2001
+From: Atrium <noreply@anthropic.com>
+Date: Sat, 7 Nov 2026 19:47:42 +0000
+Subject: [PATCH 3/4] kpi: destroy mtx and sx locks on drop
+
+Neither Mutex nor SxLock called mtx_destroy/sx_destroy, so freeing a
+softc left WITNESS and lock-profiling state for the lock and, under
+INVARIANTS, a later mtx_init/sx_init of reused memory panics on
+LO_INITIALIZED.
+---
+ bindings.h          |  1 +
+ kpi/src/sync/mtx.rs | 12 ++++++++++++
+ kpi/src/sync/sx.rs  | 11 +++++++++++
+ 3 files changed, 24 insertions(+)
+
+diff --git a/bindings.h b/bindings.h
+index ed814bc..c71d4fa 100644
+--- a/bindings.h
++++ b/bindings.h
+@@ -212,6 +212,7 @@ FN1(mtx_lock, void, struct mtx*);
+ FN1(mtx_lock_spin, void, struct mtx*);
+ FN1(mtx_unlock, void, struct mtx*);
+ FN1(mtx_unlock_spin, void, struct mtx*);
++FN1(mtx_destroy, void, struct mtx*);
+ 
+ FN2(sx_init, void, struct sx *, const char *);
+ FN1(sx_slock, void, struct sx *);
+diff --git a/kpi/src/sync/mtx.rs b/kpi/src/sync/mtx.rs
+index 096cd02..64546d1 100644
+--- a/kpi/src/sync/mtx.rs
++++ b/kpi/src/sync/mtx.rs
+@@ -125,6 +125,18 @@ impl MtxCommon {
+     }
+ }
+ 
++impl Drop for MtxCommon {
++    // A lock that was mtx_init'ed must be mtx_destroy'ed before its memory is freed: WITNESS and
++    // lock profiling keep state for it, and INVARIANTS kernels panic on re-initialising memory
++    // that still carries LO_INITIALIZED.
++    fn drop(&mut self) {
++        let p = self.inner.get();
++        if unsafe { bindings::fn_mtx_initialized(p) } != 0 {
++            unsafe { bindings::fn_mtx_destroy(p) };
++        }
++    }
++}
++
+ unsafe impl<T: Send> Send for Mutex<T> {}
+ unsafe impl<T: Send> Sync for Mutex<T> {}
+ 
+diff --git a/kpi/src/sync/sx.rs b/kpi/src/sync/sx.rs
+index 36f9998..5cb2f07 100644
+--- a/kpi/src/sync/sx.rs
++++ b/kpi/src/sync/sx.rs
+@@ -80,6 +80,17 @@ impl<T> Drop for SxExclusiveGuard<'_, T> {
+     }
+ }
+ 
++impl<T> Drop for SxLock<T> {
++    // See MtxCommon's Drop: an initialised sx must be destroyed before it is freed.
++    fn drop(&mut self) {
++        let p = self.inner.get();
++        let flags = unsafe { (*p).lock_object.lo_flags };
++        if flags & (bindings::LO_INITIALIZED as u32) != 0 {
++            unsafe { bindings::sx_destroy(p) };
++        }
++    }
++}
++
+ unsafe impl<T: Send + Sync> Send for SxLock<T> {}
+ unsafe impl<T: Send + Sync> Sync for SxLock<T> {}
+ 
+-- 
+2.43.0
+

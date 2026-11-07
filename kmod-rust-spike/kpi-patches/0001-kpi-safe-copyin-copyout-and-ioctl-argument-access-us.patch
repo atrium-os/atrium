@@ -1,0 +1,303 @@
+From 19649aea7f0be6e4b698bec96488c270205ba2e4 Mon Sep 17 00:00:00 2001
+From: Atrium <noreply@anthropic.com>
+Date: Sat, 7 Nov 2026 19:47:42 +0000
+Subject: [PATCH 1/4] kpi: safe copyin/copyout and ioctl argument access
+ (usercopy)
+
+UserSlice carries a user address that can only be used through
+copyin/copyout; IoctlData is the kernel copy of an ioctl argument with
+size-checked typed access through the FromBytes/AsBytes marker traits.
+---
+ kpi/src/lib.rs      |   2 +
+ kpi/src/usercopy.rs | 266 ++++++++++++++++++++++++++++++++++++++++++++
+ 2 files changed, 268 insertions(+)
+ create mode 100644 kpi/src/usercopy.rs
+
+diff --git a/kpi/src/lib.rs b/kpi/src/lib.rs
+index b7681f2..0f5e4d0 100644
+--- a/kpi/src/lib.rs
++++ b/kpi/src/lib.rs
+@@ -101,6 +101,8 @@ pub mod taskqueue;
+ pub mod tty;
+ /// The `Vec` type to manage a contiguous growable array on the heap
+ pub mod vec;
++/// copyin/copyout and ioctl argument access
++pub mod usercopy;
+ 
+ const _VERSION_CHECK: () = {
+     if bindings::__FreeBSD_version / 100000 != 16 {
+diff --git a/kpi/src/usercopy.rs b/kpi/src/usercopy.rs
+new file mode 100644
+index 0000000..8f16fbb
+--- /dev/null
++++ b/kpi/src/usercopy.rs
+@@ -0,0 +1,266 @@
++/*-
++ * SPDX-License-Identifier: BSD-2-Clause
++ *
++ * Copyright (c) 2026 The Atrium Project
++ *
++ * Redistribution and use in source and binary forms, with or without
++ * modification, are permitted provided that the following conditions
++ * are met:
++ * 1. Redistributions of source code must retain the above copyright
++ *    notice, this list of conditions and the following disclaimer.
++ * 2. Redistributions in binary form must reproduce the above copyright
++ *    notice, this list of conditions and the following disclaimer in the
++ *    documentation and/or other materials provided with the distribution.
++ *
++ * THIS SOFTWARE IS PROVIDED BY THE AUTHOR AND CONTRIBUTORS ``AS IS'' AND
++ * ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
++ * IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
++ * ARE DISCLAIMED.  IN NO EVENT SHALL THE AUTHOR OR CONTRIBUTORS BE LIABLE
++ * FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL
++ * DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS
++ * OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION)
++ * HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT
++ * LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY
++ * OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF
++ * SUCH DAMAGE.
++ */
++
++//! Safe access to user memory (`copyin(9)`/`copyout(9)`) and to ioctl argument buffers.
++//!
++//! A user-space address is never dereferenced from Rust: it is carried as a [`UserSlice`], an
++//! address and a length that can only be used through `copyin`/`copyout`, which fault safely on
++//! a bad address and return `EFAULT`. Kernel-side buffers are always Rust slices, so the length
++//! of every copy is checked against the kernel buffer by the type system rather than by the
++//! caller.
++//!
++//! Typed copies go through [`FromBytes`] (a type for which every bit pattern is a valid value, so
++//! bytes from user space cannot produce an invalid value) and [`AsBytes`] (a type with no padding
++//! or other uninitialised bytes, so a copy to user space cannot leak kernel stack contents).
++
++use crate::bindings;
++use crate::malloc::{Malloc, MallocFlags};
++use crate::prelude::*;
++use crate::vec::Vec;
++use crate::ErrCode;
++use core::ffi::c_void;
++use core::marker::PhantomData;
++use core::mem::{MaybeUninit, size_of};
++
++/// Types for which every bit pattern of `size_of::<Self>()` bytes is a valid value.
++///
++/// # Safety
++///
++/// Implement only for types with no invalid bit patterns: integers, arrays of them, and
++/// `#[repr(C)]` structs made only of such fields. Not for `bool`, `char`, enums, references or
++/// pointers.
++pub unsafe trait FromBytes: Sized {}
++
++/// Types whose every byte is initialised: no padding between or after fields.
++///
++/// # Safety
++///
++/// Implement only for `#[repr(C)]` types whose fields leave no padding (check with a
++/// `const _: () = assert!(size_of::<T>() == <sum of field sizes>);`) and are themselves
++/// `AsBytes`.
++pub unsafe trait AsBytes: Sized {}
++
++macro_rules! plain_data {
++    ($($t:ty)*) => {
++        $(
++            unsafe impl FromBytes for $t {}
++            unsafe impl AsBytes for $t {}
++        )*
++    };
++}
++plain_data!(u8 u16 u32 u64 usize i8 i16 i32 i64 isize);
++unsafe impl<T: FromBytes, const N: usize> FromBytes for [T; N] {}
++unsafe impl<T: AsBytes, const N: usize> AsBytes for [T; N] {}
++
++fn as_bytes<T: AsBytes>(v: &T) -> &[u8] {
++    // SAFETY: T: AsBytes has no uninitialised bytes, and the slice borrows `v`.
++    unsafe { core::slice::from_raw_parts((v as *const T).cast::<u8>(), size_of::<T>()) }
++}
++
++#[cfg(kasan)]
++unsafe extern "C" {
++    fn kasan_copyin(uaddr: *const c_void, kaddr: *mut c_void, len: usize) -> i32;
++    fn kasan_copyout(kaddr: *const c_void, uaddr: *mut c_void, len: usize) -> i32;
++}
++
++/// `copyin(9)`, or its KASAN interceptor in a KASAN kernel (which also checks the kernel side).
++unsafe fn raw_copyin(uaddr: usize, kaddr: *mut u8, len: usize) -> Result<()> {
++    #[cfg(kasan)]
++    let r = unsafe { kasan_copyin(uaddr as *const c_void, kaddr.cast(), len) };
++    #[cfg(not(kasan))]
++    let r = unsafe { bindings::copyin(uaddr as *const c_void, kaddr.cast(), len) };
++    if r == 0 { Ok(()) } else { Err(ErrCode::from(r)) }
++}
++
++/// `copyout(9)`, or its KASAN interceptor.
++unsafe fn raw_copyout(kaddr: *const u8, uaddr: usize, len: usize) -> Result<()> {
++    #[cfg(kasan)]
++    let r = unsafe { kasan_copyout(kaddr.cast(), uaddr as *mut c_void, len) };
++    #[cfg(not(kasan))]
++    let r = unsafe { bindings::copyout(kaddr.cast(), uaddr as *mut c_void, len) };
++    if r == 0 { Ok(()) } else { Err(ErrCode::from(r)) }
++}
++
++/// A range of user-space memory: an address and a length taken from an ioctl argument or a
++/// syscall. It cannot be dereferenced, only copied from or to.
++#[derive(Copy, Clone, Debug)]
++pub struct UserSlice {
++    addr: usize,
++    len: usize,
++}
++
++impl UserSlice {
++    /// A user range of `len` bytes at `addr`. Nothing is checked here: `copyin`/`copyout`
++    /// reject kernel or unmapped addresses with `EFAULT` when the range is used.
++    pub fn new(addr: u64, len: usize) -> Self {
++        Self { addr: addr as usize, len }
++    }
++
++    pub fn len(&self) -> usize {
++        self.len
++    }
++
++    pub fn is_empty(&self) -> bool {
++        self.len == 0
++    }
++
++    /// Copy the first `dst.len()` bytes of the range into `dst`. `EINVAL` if the range is
++    /// shorter than `dst`.
++    pub fn copy_in(&self, dst: &mut [u8]) -> Result<()> {
++        if dst.len() > self.len {
++            return Err(EINVAL);
++        }
++        // SAFETY: dst is a valid, writable kernel buffer of dst.len() bytes.
++        unsafe { raw_copyin(self.addr, dst.as_mut_ptr(), dst.len()) }
++    }
++
++    /// Copy the whole range into a new kernel vector. `EINVAL` if it is longer than `max`, so a
++    /// caller cannot be made to allocate an arbitrary amount.
++    pub fn copy_in_vec<M: Malloc>(&self, max: usize, flags: MallocFlags) -> Result<Vec<u8, M>> {
++        if self.len > max {
++            return Err(EINVAL);
++        }
++        let mut v = Vec::<u8, M>::try_with_capacity(self.len, flags)?;
++        v.fill_to_capacity(0);
++        self.copy_in(&mut v[..self.len])?;
++        Ok(v)
++    }
++
++    /// Read one `T` from the start of the range.
++    pub fn read_obj<T: FromBytes>(&self) -> Result<T> {
++        if size_of::<T>() > self.len {
++            return Err(EINVAL);
++        }
++        let mut v = MaybeUninit::<T>::uninit();
++        // SAFETY: v is size_of::<T>() writable bytes; T: FromBytes makes any bytes a valid T.
++        unsafe {
++            raw_copyin(self.addr, v.as_mut_ptr().cast::<u8>(), size_of::<T>())?;
++            Ok(v.assume_init())
++        }
++    }
++
++    /// Copy `src` to the start of the range. `EINVAL` if the range is shorter than `src`.
++    pub fn copy_out(&self, src: &[u8]) -> Result<()> {
++        if src.len() > self.len {
++            return Err(EINVAL);
++        }
++        // SAFETY: src is a valid kernel buffer of src.len() bytes.
++        unsafe { raw_copyout(src.as_ptr(), self.addr, src.len()) }
++    }
++
++    /// Write one `T` to the start of the range.
++    pub fn write_obj<T: AsBytes>(&self, v: &T) -> Result<()> {
++        self.copy_out(as_bytes(v))
++    }
++}
++
++/// An ioctl command number, with the direction and size bits of `sys/ioccom.h`.
++#[derive(Copy, Clone, Debug, PartialEq, Eq)]
++pub struct IoctlCmd(pub bindings::u_long);
++
++impl IoctlCmd {
++    pub fn raw(self) -> bindings::u_long {
++        self.0
++    }
++    /// The argument size encoded in the command (`IOCPARM_LEN`).
++    pub fn param_len(self) -> usize {
++        ((self.0 >> 16) & (bindings::IOCPARM_MASK as bindings::u_long)) as usize
++    }
++    /// The kernel copied the argument in from user space (`IOC_IN`).
++    pub fn is_in(self) -> bool {
++        self.0 & (bindings::IOC_IN as bindings::u_long) != 0
++    }
++    /// The kernel copies the argument back out on success (`IOC_OUT`).
++    pub fn is_out(self) -> bool {
++        self.0 & (bindings::IOC_OUT as bindings::u_long) != 0
++    }
++}
++
++/// The in-kernel argument buffer of an ioctl. `sys_ioctl` has already copied the argument in
++/// (for `IOC_IN`) and copies it back out (for `IOC_OUT`), so this is kernel memory of exactly
++/// `IOCPARM_LEN(cmd)` bytes. Typed access checks the size of the type against it.
++pub struct IoctlData<'a> {
++    ptr: *mut u8,
++    len: usize,
++    _marker: PhantomData<&'a mut [u8]>,
++}
++
++impl<'a> IoctlData<'a> {
++    /// # Safety
++    ///
++    /// `data` must be the `caddr_t` the kernel passed to `d_ioctl` for `cmd`.
++    #[doc(hidden)]
++    pub unsafe fn from_raw(cmd: bindings::u_long, data: bindings::caddr_t) -> Self {
++        let len = IoctlCmd(cmd).param_len();
++        // sys_ioctl passes a pointer to an int for an IOC_VOID command with an int argument
++        // (IOCPARM_LEN 0); treat it as empty: the int form is not supported here.
++        let ptr = if len == 0 { core::ptr::null_mut() } else { data.cast::<u8>() };
++        Self { ptr, len, _marker: PhantomData }
++    }
++
++    pub fn len(&self) -> usize {
++        self.len
++    }
++
++    pub fn is_empty(&self) -> bool {
++        self.len == 0
++    }
++
++    pub fn as_bytes(&self) -> &[u8] {
++        if self.len == 0 {
++            return &[];
++        }
++        // SAFETY: from_raw's contract: ptr is len bytes of kernel memory owned by sys_ioctl.
++        unsafe { core::slice::from_raw_parts(self.ptr, self.len) }
++    }
++
++    pub fn as_bytes_mut(&mut self) -> &mut [u8] {
++        if self.len == 0 {
++            return &mut [];
++        }
++        // SAFETY: as above, and &mut self makes the access unique.
++        unsafe { core::slice::from_raw_parts_mut(self.ptr, self.len) }
++    }
++
++    /// The argument as a `T`. `EINVAL` unless the command's size is exactly `size_of::<T>()`.
++    pub fn read<T: FromBytes>(&self) -> Result<T> {
++        if size_of::<T>() != self.len {
++            return Err(EINVAL);
++        }
++        // SAFETY: len bytes are readable and T: FromBytes; read_unaligned for any alignment.
++        Ok(unsafe { self.ptr.cast::<T>().read_unaligned() })
++    }
++
++    /// Store `v` as the argument (copied back out by the kernel for `IOC_OUT` commands).
++    pub fn write<T: AsBytes>(&mut self, v: &T) -> Result<()> {
++        if size_of::<T>() != self.len {
++            return Err(EINVAL);
++        }
++        self.as_bytes_mut().copy_from_slice(as_bytes(v));
++        Ok(())
++    }
++}
+-- 
+2.43.0
+

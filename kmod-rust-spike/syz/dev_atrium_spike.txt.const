@@ -1,0 +1,9 @@
+# Written by hand from spike_abi.h (_IO/_IOW/_IOWR/_IOR of sys/ioccom.h);
+# regenerate with syz-extract on a FreeBSD host to check.
+arches = amd64, arm64
+AT_FDCWD = 18446744073709551516
+SPIKE_IOC_NOP = 536892160
+SPIKE_IOC_SET = 2148553473
+SPIKE_IOC_GET = 3222295298
+SPIKE_IOC_PARSE = 3222819587
+SPIKE_IOC_STATS = 1077433092

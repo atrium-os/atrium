@@ -1,0 +1,129 @@
+From d542204d5af62a8a529cd1340ab02f085ac69bd6 Mon Sep 17 00:00:00 2001
+From: Atrium <noreply@anthropic.com>
+Date: Sat, 7 Nov 2026 19:47:42 +0000
+Subject: [PATCH 2/4] kpi: d_ioctl in CDevSw; fix uiomove_read/uiomove_write
+ mutability
+
+uiomove_write copies user data INTO the kernel buffer but took &[u8],
+so uiomove wrote through a shared reference (undefined behaviour), and
+uiomove_read took &mut for a buffer it only reads. Swap them, and refuse
+buffers over INT_MAX instead of truncating the length.
+---
+ demos/echodev/echodev.rs |  4 ++--
+ kpi/src/cdev.rs          | 42 ++++++++++++++++++++++++++++------------
+ 2 files changed, 32 insertions(+), 14 deletions(-)
+
+diff --git a/demos/echodev/echodev.rs b/demos/echodev/echodev.rs
+index 85fc99e..05eb447 100644
+--- a/demos/echodev/echodev.rs
++++ b/demos/echodev/echodev.rs
+@@ -132,7 +132,7 @@ impl CDevSw for EchoDev {
+         }
+ 
+         let todo = min(uio.resid(), state.valid);
+-        let res = uiomove_read(&mut state.buf[..todo], uio);
++        let res = uiomove_read(&state.buf[..todo], uio);
+         if res.is_ok() {
+             /* Wakeup any waiting writers. */
+             if state.valid == state.buf.len() {
+@@ -182,7 +182,7 @@ impl CDevSw for EchoDev {
+             }
+ 
+             let todo = min(uio.resid(), state.buf.len() - state.valid);
+-            res = uiomove_write(&state.buf[state.valid..state.valid + todo], uio);
++            res = uiomove_write(&mut state.buf[state.valid..state.valid + todo], uio);
+             if res.is_ok() {
+                 /* Wakeup any waiting readers. */
+                 if state.valid == 0 {
+diff --git a/kpi/src/cdev.rs b/kpi/src/cdev.rs
+index f8c0988..3d5918b 100644
+--- a/kpi/src/cdev.rs
++++ b/kpi/src/cdev.rs
+@@ -34,6 +34,7 @@ use crate::kobj::AsRustType;
+ use crate::malloc::{Malloc, MallocType};
+ use crate::misc::Thread;
+ use crate::prelude::*;
++pub use crate::usercopy::{IoctlCmd, IoctlData};
+ use core::ffi::{CStr, c_int, c_void};
+ use core::marker::PhantomData;
+ use core::ptr::{NonNull, drop_in_place};
+@@ -68,6 +69,17 @@ pub trait CDevSw: CDevSwInternal {
+     fn d_write(sc: &Softc<Self::Softc>, uio: UioRef, ioflag: c_int) -> Result<()> {
+         unimplemented!()
+     }
++    /// `d_ioctl`. `data` is the kernel copy of the argument (see [`IoctlData`]); user pointers
++    /// inside it are reached through [`UserSlice`][crate::usercopy::UserSlice].
++    fn d_ioctl(
++        sc: &Softc<Self::Softc>,
++        cmd: IoctlCmd,
++        data: IoctlData<'_>,
++        fflag: i32,
++        td: Thread,
++    ) -> Result<()> {
++        unimplemented!()
++    }
+ }
+ 
+ define_interface! {
+@@ -76,6 +88,14 @@ define_interface! {
+     fn d_close(dev: *mut bindings::cdev, fflag: i32, devtype: i32, td: *mut bindings::thread) -> i32;
+     fn d_read(dev: *mut bindings::cdev, uio: *mut bindings::uio, iof: i32) -> i32;
+     fn d_write(dev: *mut bindings::cdev, uio: *mut bindings::uio, iof: i32) -> i32;
++    fn d_ioctl(dev: *mut bindings::cdev, cmd: bindings::u_long, data: bindings::caddr_t,
++        fflag: i32, td: *mut bindings::thread) -> i32,
++        with init glue {
++            let data: $crate::bindings::caddr_t = data;
++            // SAFETY: data is the argument buffer sys_ioctl passed for cmd.
++            let data = unsafe { $crate::usercopy::IoctlData::from_raw(cmd, data) };
++            let cmd = $crate::usercopy::IoctlCmd(cmd);
++        };
+ }
+ 
+ pub struct MakeDevArgs<T, M: Malloc> {
+@@ -260,16 +280,15 @@ pub mod wrappers {
+         unsafe { free(sc_ptr.cast::<c_void>(), mtype) };
+     }
+ 
+-    pub fn uiomove_read(buf: &mut [u8], uio_ref: UioRef) -> Result<()> {
++    /// `d_read`: copy `buf` (kernel memory, only read) out to the caller's buffers.
++    pub fn uiomove_read(buf: &[u8], uio_ref: UioRef) -> Result<()> {
+         if uio_ref.is_write() {
+             return Err(EDOOFUS);
+         }
++        let len: i32 = buf.len().try_into().map_err(|_| EINVAL)?;
++        // uiomove takes a non-const pointer, but for UIO_READ it only reads from it.
+         let res = unsafe {
+-            bindings::uiomove(
+-                buf.as_mut_ptr().cast::<c_void>(),
+-                buf.len() as i32,
+-                uio_ref.0.as_ptr(),
+-            )
++            bindings::uiomove(buf.as_ptr().cast_mut().cast::<c_void>(), len, uio_ref.0.as_ptr())
+         };
+         if res != 0 {
+             Err(ErrCode::from(res))
+@@ -278,16 +297,15 @@ pub mod wrappers {
+         }
+     }
+ 
+-    pub fn uiomove_write(buf: &[u8], uio_ref: UioRef) -> Result<()> {
++    /// `d_write`: copy the caller's data into `buf`. It writes kernel memory, so it takes
++    /// `&mut`; taking `&[u8]` here would let uiomove write through a shared reference.
++    pub fn uiomove_write(buf: &mut [u8], uio_ref: UioRef) -> Result<()> {
+         if uio_ref.is_read() {
+             return Err(EDOOFUS);
+         }
++        let len: i32 = buf.len().try_into().map_err(|_| EINVAL)?;
+         let res = unsafe {
+-            bindings::uiomove(
+-                buf.as_ptr().cast_mut().cast::<c_void>(),
+-                buf.len() as i32,
+-                uio_ref.0.as_ptr(),
+-            )
++            bindings::uiomove(buf.as_mut_ptr().cast::<c_void>(), len, uio_ref.0.as_ptr())
+         };
+         if res != 0 {
+             Err(ErrCode::from(res))
+-- 
+2.43.0
+
