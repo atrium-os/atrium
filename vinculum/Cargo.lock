@@ -364,6 +364,14 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ca718471876992059f251e33aafc334346ada08042b7661dd1fe313a9bced557"
 
 [[package]]
+name = "vinculum-hci"
+version = "0.1.0"
+dependencies = [
+ "libc",
+ "vinculum-hci-proto",
+]
+
+[[package]]
 name = "vinculum-hci-proto"
 version = "0.1.0"
 dependencies = [
@@ -373,10 +381,26 @@ dependencies = [
 ]
 
 [[package]]
+name = "vinculum-host"
+version = "0.1.0"
+dependencies = [
+ "vinculum-hci-proto",
+]
+
+[[package]]
 name = "vinculum-probe"
 version = "0.1.0"
 dependencies = [
  "vinculum-hci-proto",
+]
+
+[[package]]
+name = "vinculumd"
+version = "0.1.0"
+dependencies = [
+ "libc",
+ "vinculum-hci-proto",
+ "vinculum-host",
 ]
 
 [[package]]

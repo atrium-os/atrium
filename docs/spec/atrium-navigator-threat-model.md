@@ -1134,10 +1134,12 @@ pipe, and the typed island channel.
 - **The CDM's Linux ABI emulation is extra kernel surface.** The linuxulator has a long
   CVE history, and the CDM is an unauditable binary.
   - The CDM jail already has no network and no filesystem beyond its own state.
-  - **Prefer a bhyve micro-VM for the CDM island** when the hardware allows. A guest kernel
-    boundary is far stronger than a syscall translation layer.
-  - Where the hardware doesn't allow it, run the CDM inside a Capsicum-restricted process
-    under the jail, not as a bare process in the jail.
+  - **Superseded 2026-11-07** (docs/reviews/2026-11-07-linux-compat-scoping.md, accepted):
+    the CDM runs in our own **foreign-library host**: an ELF loader plus glibc-ABI shim in a
+    native FreeBSD process, in capability mode, in its own jail. No Linux ABI emulation in
+    the kernel, so the linuxulator leaves this path entirely; the CDM reaches only what our
+    other decoder jails reach. A bhyve micro-VM around the host is optional extra hardening
+    where the hardware allows, no longer the default.
 - **Typed island channel.** Treat it like the worker pipe: bounded frames, a fixed message
   set, fuzzed, and the document side never trusts a value from the island.
 
@@ -1253,7 +1255,7 @@ These belong in the model because they are *wins*, not because they need work:
 | P2 | One jailed renderer per window, one GPU VM per window, fixed `compose` kernel; input routed by layer list (§2.5.2) | cross-window exposure | medium | §2.5.2 |
 | P2 | Fuzz Fresco scene ingest and the GPU ioctl surface; Fresco takes outlines, not fonts | A1 against the shared compositor | medium | §2.5 |
 | P2 | Broker rules for replayed request templates | A3, CSRF | design-time, with §5.4.5 | §2.7 |
-| P2 | Unobscured-input rule for islands; bhyve for the CDM | A2 clickjacking, kernel surface | medium, with §8.1 | §2.9 |
+| P2 | Unobscured-input rule for islands; CDM in the foreign-library host (2026-11-07) | A2 clickjacking, kernel surface | medium, with §8.1 | §2.9 |
 | P2 ✔ scheme allowlist built, in the broker (2026-11-05); ✔ only carried hrefs activate (2026-11-05); download marking open | Scheme allowlist on link activation; download marking | A1/A2 | small | §2.10 |
 | P3 | Origin chrome, punycode for confusables, form warnings | A2 | product work | §2.11 |
 | gate | No login support before §6's vault and per-origin fetcher (C0) | account takeover | — | §6 |

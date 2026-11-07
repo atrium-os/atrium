@@ -10,6 +10,7 @@ cargo-fuzz = true
 [dependencies]
 libfuzzer-sys = "0.4"
 vinculum-hci-proto = { path = "../vinculum-hci-proto" }
+vinculum-host = { path = "../vinculum-host" }
 
 # Its own workspace, like every cargo-fuzz crate.
 [workspace]
@@ -38,5 +39,11 @@ doc = false
 [[bin]]
 name = "gap"
 path = "fuzz_targets/gap.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "host_frames"
+path = "fuzz_targets/host_frames.rs"
 test = false
 doc = false

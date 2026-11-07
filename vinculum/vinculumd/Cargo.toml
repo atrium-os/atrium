@@ -1,0 +1,11 @@
+[package]
+name = "vinculumd"
+version = "0.1.0"
+description = "Vinculum's host daemon (spec §6): runs vinculum-host against a transport"
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+vinculum-hci-proto = { path = "../vinculum-hci-proto" }
+vinculum-host = { path = "../vinculum-host" }
+libc = "0.2"

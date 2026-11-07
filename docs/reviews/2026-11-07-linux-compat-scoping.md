@@ -1,6 +1,7 @@
 # Scoping: our own secure Linux compatibility layer
 
-**Status:** scoping study, 2026-11-07. Nothing built. Decisions in §9 are open.
+**Status:** scoping study, 2026-11-07. Nothing built. §9 decisions 1–3 and 6 decided by
+Shankar 2026-11-07; 4–5 stand as recommended.
 **Question (Shankar):** FreeBSD's Linux emulation (the linuxulator) has a long CVE history,
 which is why the Widevine CDM was headed for a bhyve micro-VM. Should Atrium instead build
 its own secure Linux layer, use it as a "Linux jail" for the CDM, and later for Linux apps?
@@ -243,16 +244,23 @@ proves unacceptable for the apps people actually want.
    commercial service's allow-list while unlicensed. Then approach Google with it.
 4. Optional: D inside a bhyve micro-VM on hardware that supports it.
 
+**Design rule from this (Shankar, 2026-11-07):** when we approach Google, also ask for a
+native FreeBSD or Atrium build of the CDM. So keep the CDM host (`cdm::Host` interface,
+island channel, storage, jail profile) separate from the loader and glibc shim. A native
+build then drops in with no Linux shim at all, and the shim stays for OpenH264 and other
+Linux-only blobs.
+
 ## 9. Decisions for Shankar
 
 1. **Split the two jobs.** CDM (and OpenH264) get a foreign-library host (D); Linux apps, if
    ever, get a micro-VM lane (§6). No general Linux syscall layer.
-   *Recommend yes.*
+   **Accepted (Shankar, 2026-11-07).**
 2. **CDM default containment.** Make D in a capability-mode jail the default everywhere,
    with bhyve as optional extra hardening, replacing threat model §2.9's "bhyve preferred,
    linuxulator fallback". The linuxulator leaves the CDM path entirely.
    *Recommend yes:* D's surface equals our other decoder jails, it runs on the Mac, and E
    adds a guest kernel and VM plumbing for a marginal gain.
+   **Accepted (Shankar, 2026-11-07),** with decision 1.
 3. **Widevine agreement.** ~~Approach Google before any Widevine-specific work.~~
    **Decided (Shankar, 2026-11-07): build first, then approach Google with a working
    implementation**, since a cold request may go unanswered. Never fake a user agent.
@@ -261,7 +269,7 @@ proves unacceptable for the apps people actually want.
    *Recommend yes;* until then this stays parked like the rest of DRM.
 5. **Raw-syscall hook.** Add the SIGSYS trap hook only if step 0 shows the CDM makes raw
    syscalls. *Recommend yes (conditional).*
-6. **Docs.** If 1–2 are accepted: amend threat model §2.9, limen.md's DRM paragraph,
+6. **Docs.** Done 2026-11-07: amended threat model §2.9, limen.md's DRM paragraph,
    legacy-web §8.1, sandbox.md and the ROADMAP Linux-apps line.
 
 ## Sources

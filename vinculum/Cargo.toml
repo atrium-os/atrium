@@ -8,6 +8,9 @@ resolver = "2"
 members = [
     "vinculum-hci-proto",
     "vinculum-probe",
+    "vinculum-host",
+    "vinculum-hci",
+    "vinculumd",
 ]
 
 [workspace.package]

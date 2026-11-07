@@ -5461,12 +5461,13 @@ override). Rootcanal's wheel has Linux x86_64 and macOS arm64 binaries.
 ```sh
 sh vinculum/harness/run.sh                      # probe scans, expects "VinculumPeer"
 sh vinculum/harness/run.sh --record out.btsnoop # also keep the HCI trace (keys zeroed)
+sh vinculum/harness/e2e.sh                      # vinculumd -> vinculum-hci -> Rootcanal: connect + ATT MTU
 (cd vinculum && cargo test)                      # incl. replay of the recorded trace
-(cd vinculum/fuzz && cargo fuzz run hci_event)   # targets: hci_event hci_command gap h4_stream
+(cd vinculum/fuzz && cargo fuzz run hci_event)   # also hci_command gap h4_stream host_frames
 ```
 
 The packet parsers are generated at build time by a patched, vendored pdl-compiler
-(`vinculum/third_party/README.md`).
+(`vinculum/third_party/README.md`). `VINCULUM_TRACE=1` makes vinculumd print every frame.
 
 ### 13.7 Navigator corpus (on the Mac, no VM)
 

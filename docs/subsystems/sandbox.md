@@ -155,7 +155,7 @@ This mirrors the macOS / Android model. It's restrictive but secure. Open questi
 
 ## What about Linux apps?
 
-Linuxulator + a Fresco-X11 / Fresco-Wayland bridge can run Linux apps inside FreeBSD jails. Each Linux app runs in a jail just like a native Fresco app, but its graphics goes through a translation layer that speaks X11 or Wayland on one side and Fresco on the other. Performance penalty + compatibility lossage but viable.
+Decided 2026-11-07 (docs/reviews/2026-11-07-linux-compat-scoping.md §6): Linux apps, if supported, run in **lightweight bhyve micro-VMs** with a user-installed Linux guest, not under the linuxulator and not under a syscall-translation layer. Graphics goes through virtio-gpu native context (GPU ABI §6.3) and a Wayland bridge into Fresco; files through virtio-fs onto Tessera volumes. This is the WSL2 / Crostini / Apple Containerization shape. Closed Linux *libraries* (the Widevine CDM, Cisco's OpenH264) are different: they run in our foreign-library host, a native capability-mode process with no Linux ABI in the kernel.
 
 This is **not** the architectural target — Linux apps don't get the dedup + capability + native-graphics benefits. It's a transition tool for ecosystem pull-through.
 

@@ -159,23 +159,13 @@ impl Ring {
         Ok(Self::from_map(map, len, producer, true))
     }
 
-    /// Create an **anonymous** shared ring (FreeBSD `SHM_ANON`) and return the
-    /// handle plus the fd to hand the peer over `SCM_RIGHTS`. There is **no
-    /// name** — so no name-reuse race, and the fd itself is the capability to
-    /// access the ring (the data-plane analog of the doorbell grant). This end is
-    /// `producer`; the peer maps the other end via [`Ring::from_fd`].
-    #[cfg(not(target_os = "freebsd"))]
-    pub fn create_anon(
-        _capacity_frames: u64,
-        _frame_floats: u64,
-        _producer: bool,
-    ) -> io::Result<(Self, std::os::fd::OwnedFd)> {
-        // FreeBSD's SHM_ANON has no portable equivalent; the data plane runs in
-        // the guest. The host build only needs this to compile.
-        Err(io::Error::new(io::ErrorKind::Unsupported, "anonymous shm is FreeBSD-only"))
-    }
-
-    #[cfg(target_os = "freebsd")]
+    /// Create an **anonymous** shared ring (FreeBSD `SHM_ANON`; a memfd on
+    /// Linux, for host tests) and return the handle plus the fd to hand the
+    /// peer over `SCM_RIGHTS`. There is **no name**, so no name-reuse race,
+    /// and the fd itself is the capability to access the ring (the data-plane
+    /// analog of the doorbell grant). This end is `producer`; the peer maps the
+    /// other end via [`Ring::from_fd`].
+    #[cfg(any(target_os = "freebsd", target_os = "linux"))]
     pub fn create_anon(
         capacity_frames: u64,
         frame_floats: u64,
@@ -184,8 +174,11 @@ impl Ring {
         use std::os::fd::FromRawFd;
         assert!(capacity_frames.is_power_of_two(), "capacity must be 2^n");
         let len = Self::bytes_for(capacity_frames, frame_floats);
-        // FreeBSD's SHM_ANON = a nameless segment shared only by fd-passing.
+        // A nameless segment shared only by fd-passing.
+        #[cfg(target_os = "freebsd")]
         let fd = unsafe { libc::shm_open(libc::SHM_ANON, libc::O_RDWR | libc::O_CREAT, 0o600) };
+        #[cfg(target_os = "linux")]
+        let fd = unsafe { libc::memfd_create(c"lyra-ring".as_ptr(), libc::MFD_CLOEXEC) };
         if fd < 0 {
             return Err(io::Error::last_os_error());
         }
@@ -210,6 +203,11 @@ impl Ring {
             (*hdr).tail = AtomicU64::new(0);
         }
         Ok((Self::from_map(map, len, producer, true), unsafe { std::os::fd::OwnedFd::from_raw_fd(fd) }))
+    }
+
+    #[cfg(not(any(target_os = "freebsd", target_os = "linux")))]
+    pub fn create_anon(_capacity_frames: u64, _frame_floats: u64, _producer: bool) -> io::Result<(Self, std::os::fd::OwnedFd)> {
+        Err(io::Error::new(io::ErrorKind::Unsupported, "no anonymous shared memory on this host"))
     }
 
     /// Map a ring from a received fd (the peer of [`Ring::create_anon`]). Sizes
