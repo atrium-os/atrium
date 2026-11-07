@@ -307,13 +307,32 @@ The kernel patch is written to be offered to FreeBSD as it is:
 | Portcullis manifest `[capabilities] syscalls` to class | done: schema, validation, consent for `terminal`, both launch paths; unit tests in portcullis-jail (`tests/sysfil.rs`, including every shipped app manifest resolving), portcullis-policy and jaild |
 | arm64 build and VM run | pending |
 | overhead, cloud TCG (sanity) | done, below |
-| overhead under 1%, HVF (Mac, arm64) and KVM (R9700, amd64) | pending |
+| overhead under 1%, HVF (Mac, arm64) | outside filtered jails: **passes** (patched vs stock within ±0.5% on every operation). Inside a filtered jail, at fbsd 09e74dabf: null +1.9% (+1.5 ns), sockopt +1.9%, ioctl +4.3%; fbsd 302660e88 inlines the bitmap test and open-codes the list searches, re-measure pending. Table below |
+| overhead under 1%, KVM (R9700, amd64) | pending |
 | Navigator, Fresco, Tessera benchmarks with the filter | pending |
 | shipped `policy.sysfil.mode` | **1 (log only)** until the profiles have been run against the real apps (Pergola apps, Fresco renderers, Lyra clients, the player, Nuntius); then 2 |
 | jail(8) man page section | pending |
 
+**HVF latency (arm64, Apple M4 Max, QEMU 10.2 `-accel hvf -cpu host`, fbsd 09e74dabf against
+34a110a9b).** `sysfil-bench`, 3 boots per kernel alternating, 5 rounds per boot, pooled;
+best / median / spread in ns:
+
+| | null | nullio | ioctl | sockopt | socket |
+|---|---|---|---|---|---|
+| stock, host | 77.5 / 77.6 / 0.9 | 95.1 / 95.5 / 0.6 | 94.9 / 97.1 / 4.4 | 113.8 / 114.1 / 2.0 | 346.3 / 356.1 / 47.5 |
+| stock, open jail | 77.5 / 77.6 / 1.0 | 95.2 / 95.4 / 0.5 | 96.9 / 98.8 / 2.8 | 113.7 / 114.0 / 2.0 | 351.0 / 361.0 / 45.5 |
+| patched, host | 77.5 / 77.7 / 1.0 | 94.6 / 95.0 / 1.2 | 97.3 / 98.6 / 3.1 | 114.1 / 114.3 / 2.7 | 342.1 / 361.2 / 33.7 |
+| patched, open jail | 77.6 / 77.6 / 0.9 | 94.6 / 95.0 / 1.1 | 97.4 / 99.3 / 3.1 | 114.1 / 114.4 / 2.5 | 347.2 / 362.3 / 42.1 |
+| patched, filtered jail | 78.7 / 79.2 / 1.5 | 95.4 / 95.8 / 1.1 | 100.9 / 102.8 / 4.0 | 116.1 / 116.5 / 3.0 | 349.7 / 364.2 / 35.8 |
+
+Medians, patched open jail against stock open jail: null 0.00%, nullio -0.42%, ioctl
++0.51%, sockopt +0.35%, socket +0.36%. The ioctl noise floor is about 2% (stock host against
+stock open jail differ by 1.75%). `sysfil.denied` stayed 0 in every filtered run, and a
+positive control (`sh -c 'ls; mkfifo'` in the same jail) was denied.
+
 **Unfiltered path, by instruction count.** On amd64 the patch adds exactly three
-instructions to `amd64_syscall` for a process outside a filtered jail (from the
+instructions to `amd64_syscall` (arm64: `ldr` td_ucred, `ldrb` cr_flags, `tbnz` in
+`do_el0_sync`) for a process outside a filtered jail (from the
 disassembly of the built kernel): `mov 0x188(%rbx),%rax` (td_ucred), `testb $0x4,0x2c(%rax)`
 (cr_flags), and a not-taken `jne`. `td_ucred` is already in cache, read a few instructions
 later by the capability-mode test.
