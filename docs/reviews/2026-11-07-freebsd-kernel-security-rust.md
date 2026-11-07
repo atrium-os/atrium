@@ -1,6 +1,6 @@
 # Scoping: FreeBSD kernel and base security, and whether to port to Rust
 
-**Status:** scoping study, 2026-11-07. Nothing built. Decisions in §10 are open for Shankar.
+**Status:** scoping study, 2026-11-07. Nothing built. Shankar 2026-11-07: incremental path (§8.3) taken, no rewrite (D1); D2 is decided after the step-3 Rust kmod spike; new rule D9 (user space first for hostile-input parsers) agreed. D3–D8 stand as recommended.
 **Question (Shankar):** how stable and secure are the FreeBSD kernel and its core? What do
 the CVEs say, especially memory bugs that come from C? Does it make sense to port it to
 Rust? A port would be a very large commitment, so the analysis should be good enough now to
@@ -327,14 +327,15 @@ numbers that tell us whether 4 and 5 are worth it. Steps 3–5 need D2.
 
 | # | decision | recommendation |
 |---|---|---|
-| **D1** | Port the FreeBSD kernel to Rust (a full rewrite, §8.1, or a fork that rewrites core subsystems, §8.2)? | **No.** Stay on upstream FreeBSD, with our fork kept a thin patch set. Take the incremental path (§8.3) |
-| **D2** | Change LANGUAGE-POLICY.md from "Kernel = C" to "**new Atrium-authored kernel code is Rust by default** once the step-3 spike passes; C stays for VFS/newbus glue and for code we import"? | **Yes, gated on the spike.** It applies the reasoning we already use for userspace (untrusted-input parsing dominates) to our own kmods |
+| **D1** | Port the FreeBSD kernel to Rust (a full rewrite, §8.1, or a fork that rewrites core subsystems, §8.2)? | **Decided 2026-11-07: no.** Stay on upstream FreeBSD, with our fork kept a thin patch set. Take the incremental path (§8.3) |
+| **D2** | Change LANGUAGE-POLICY.md from "Kernel = C" to "**new Atrium-authored kernel code is Rust by default** once the step-3 spike passes; C stays for VFS/newbus glue and for code we import"? | **Decided after the step-3 spike (Shankar 2026-11-07).** Recommended yes if it passes. It applies the reasoning we already use for userspace (untrusted-input parsing dominates) to our own kmods |
 | **D3** | First Rust kernel target? | **Tessera's on-disk decoders** (step 4): freestanding, parser-heavy, already has Rust crates and a test harness. GPU validation (step 5) second |
 | **D4** | Ship a stripped `ATRIUM` kernel config and the hardening sysctls in step 0? | **Yes, now.** Cheapest win in this review |
 | **D5** | Build a per-app syscall/ioctl profile (MAC module + capability mode by app class), step 2? | **Yes**, design note first, measured against the data file |
 | **D6** | Which FreeBSD branch does a shipped Atrium follow? Development stays on 16-CURRENT; a release needs a branch with advisories | **Ship on a supported `stable`/`releng` branch with a fast update path** (pkgbase), move to 16 when 16.0 releases. Patch latency matters more than ever in 2026 |
 | **D7** | Work with FreeBSD upstream on Rust KPI bindings instead of keeping private ones? | **Yes**, if their licence fits; report what we learn from the spike |
 | **D8** | Run an AI-assisted audit of Atrium's own kernel modules now (step 1)? | **Yes**, before more kernel code lands |
+| **D9** | Kernel modules cannot be jailed: a bug in any module is a bug in the whole kernel. Make it a rule that new code which parses hostile input (radio, devices, network formats, disk images from removable media) goes into a jailed user-space daemon first, and into the kernel only when performance requires it (as Tactus and Vinculum already do)? | **Yes. Agreed by Shankar 2026-11-07.** Tessera and the GPU fast paths stay in the kernel; for them the answer is Rust (D2) plus fuzzing (step 1) |
 
 ## 11. Caveats
 
