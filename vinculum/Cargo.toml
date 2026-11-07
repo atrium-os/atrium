@@ -11,6 +11,7 @@ members = [
     "vinculum-host",
     "vinculum-hci",
     "vinculumd",
+    "vinculum-smp",
 ]
 
 [workspace.package]

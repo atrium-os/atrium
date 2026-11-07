@@ -1,0 +1,21 @@
+[package]
+name = "vinculum-smp"
+version = "0.1.0"
+description = "Vinculum's LE Security Manager: Secure Connections pairing (sans-I/O) and its crypto"
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+aes = "0.8"
+cmac = "0.7"
+p256 = { version = "0.13", default-features = false, features = ["ecdh", "arithmetic", "std"] }
+rand_core = { version = "0.6", features = ["getrandom"] }
+zeroize = "1"
+pdl-runtime = "0.4"
+bytes = "1"
+
+[build-dependencies]
+pdl-compiler = "=0.5.2"
+
+[dev-dependencies]
+hex-literal = "0.4"

@@ -1,0 +1,98 @@
+// Vinculum's own PDL: Security Manager Protocol (Core 6.0 Vol 3 Part H §3).
+// Copyright (c) 2026, Atrium contributors. BSD-2-Clause.
+
+little_endian_packets
+
+enum Code : 8 {
+  PAIRING_REQUEST = 0x01,
+  PAIRING_RESPONSE = 0x02,
+  PAIRING_CONFIRM = 0x03,
+  PAIRING_RANDOM = 0x04,
+  PAIRING_FAILED = 0x05,
+  ENCRYPTION_INFORMATION = 0x06,
+  CENTRAL_IDENTIFICATION = 0x07,
+  IDENTITY_INFORMATION = 0x08,
+  IDENTITY_ADDRESS_INFORMATION = 0x09,
+  SIGNING_INFORMATION = 0x0A,
+  SECURITY_REQUEST = 0x0B,
+  PAIRING_PUBLIC_KEY = 0x0C,
+  PAIRING_DHKEY_CHECK = 0x0D,
+  PAIRING_KEYPRESS_NOTIFICATION = 0x0E,
+}
+
+packet Smp {
+  code : Code,
+  _payload_,
+}
+
+// io_capability, oob_data_flag and auth_req are kept as raw octets: the
+// state machine validates them (reserved values are a pairing failure, not
+// a parse error), and f6 needs the exact bytes.
+packet PairingRequest : Smp (code = PAIRING_REQUEST) {
+  io_capability : 8,
+  oob_data_flag : 8,
+  auth_req : 8,
+  maximum_encryption_key_size : 8,
+  initiator_key_distribution : 8,
+  responder_key_distribution : 8,
+}
+
+packet PairingResponse : Smp (code = PAIRING_RESPONSE) {
+  io_capability : 8,
+  oob_data_flag : 8,
+  auth_req : 8,
+  maximum_encryption_key_size : 8,
+  initiator_key_distribution : 8,
+  responder_key_distribution : 8,
+}
+
+packet PairingConfirm : Smp (code = PAIRING_CONFIRM) {
+  confirm_value : 8[16],
+}
+
+packet PairingRandom : Smp (code = PAIRING_RANDOM) {
+  random_value : 8[16],
+}
+
+packet PairingFailed : Smp (code = PAIRING_FAILED) {
+  reason : 8,
+}
+
+packet EncryptionInformation : Smp (code = ENCRYPTION_INFORMATION) {
+  long_term_key : 8[16],
+}
+
+packet CentralIdentification : Smp (code = CENTRAL_IDENTIFICATION) {
+  ediv : 16,
+  rand : 8[8],
+}
+
+packet IdentityInformation : Smp (code = IDENTITY_INFORMATION) {
+  identity_resolving_key : 8[16],
+}
+
+packet IdentityAddressInformation : Smp (code = IDENTITY_ADDRESS_INFORMATION) {
+  addr_type : 8,
+  bd_addr : 8[6],
+}
+
+packet SigningInformation : Smp (code = SIGNING_INFORMATION) {
+  signature_key : 8[16],
+}
+
+packet SecurityRequest : Smp (code = SECURITY_REQUEST) {
+  auth_req : 8,
+}
+
+packet PairingPublicKey : Smp (code = PAIRING_PUBLIC_KEY) {
+  public_key_x : 8[32],
+  public_key_y : 8[32],
+}
+
+packet PairingDhKeyCheck : Smp (code = PAIRING_DHKEY_CHECK) {
+  dhkey_check : 8[16],
+}
+
+packet PairingKeypressNotification : Smp (code = PAIRING_KEYPRESS_NOTIFICATION) {
+  notification_type : 8,
+}
