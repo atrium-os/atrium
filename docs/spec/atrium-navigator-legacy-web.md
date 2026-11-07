@@ -2507,6 +2507,9 @@ dispatches `take_events` in order.
 | `currentTime = t` | `Seek` | `seeking` at once; the next `Time` → `seeked`, `timeupdate` |
 | `volume`, `muted` | `SetVolume` (0 while muted) | `volumechange` at once |
 | `playbackRate` | `SetRate` (0.25 to 4; anything else is `NotSupportedError`) | `ratechange` at once |
+| a `<track>` (subtitles, captions) | in `textTracks` with its id; its WebVTT file, when the engine has it, as `TextTrack { id, lang, label }` with that descriptor, after the source | `addtrack`; the default track starts `showing` |
+| `textTracks[i].mode = m` | `ShowText`: the first `showing` subtitles or captions track whose file the player has → `Page(id)`; none showing, once the page has set a mode → `None`; before that, or with no page tracks → nothing (the player keeps its own, `InBand`) | `change` on `textTracks`; an unknown value is ignored |
+| `addTextTrack(kind, label, lang)` | listed (the next free id under 16, `hidden`); its cues are the script's and are **out of scope** (the player shows WebVTT files only), so showing it shows no page text | `addtrack`; an unknown kind is a `TypeError`, a 17th `NotSupportedError` |
 | | | `Time` → `timeupdate`; `Waiting` → `waiting`; `Seeking` from the native controls → `seeking`; `Ended` → `pause`, `ended` |
 | | `Error { TOO_BIG }` | the append in flight → `error`, `updateend`; the next `appendBuffer` throws `QuotaExceededError` until a `remove` completes |
 | | `Error { DECODE, UNSUPPORTED, NETWORK }` | `video.error` (`MEDIA_ERR_DECODE` 3, `SRC_NOT_SUPPORTED` 4, `NETWORK` 2), then `error`; a later `play()` or seek clears it |
@@ -2523,13 +2526,25 @@ knows, not a page's own MSE script):
 - A segment that still fails moves to its next alternate URL. With none left, the feed
   reports `NETWORK`, and a later play or seek starts afresh, so no refresh is ever needed.
 
-**Assumptions for P1 to confirm, and gaps:**
+**Caption tracks** (2026-11-06). A `<video>`'s `<track>` children of kind subtitles (also
+a missing kind) or captions ride its embed leaf, at most 16. Their names are cut to the
+player's 64 bytes, and only the first `default` counts (`navigator_dom::media::text_tracks`,
+NSG `track` lines). When the document lane starts the video, each track's file is fetched
+beside it. A track uses the video's URL rules, Nuntius `Fd`, and a 512 KiB cap. A track
+whole before `Load` is held. After `Load`, each whole track goes as `TextTrack` with its
+file. `ShowText` then picks `Page(default)` once the default track is with the player, and
+otherwise `InBand`: when there is no default, or the default failed. A track that fails
+never touches playback. A video with no page tracks sends no `ShowText`. On the corpus
+(138 recorded documents) there are 3 video tracks, in 2 documents. 97 more belong to
+`<audio>` elements, which no video embed carries.
+
+**Assumptions for P1 to confirm:**
 
 - The player answers in the order it is sent.
 - An `Append`'s `Buffered` comes before its `Appended`.
-- `Error` names no track, so a `TOO_BIG` ends every append in flight.
-- A plain file is loaded only once it is whole. Progressive `Load { Fd }` needs a
-  "more is coming" signal on the role.
+
+(Settled on the role since: progressive `Load { Fd, growing }` then `LoadDone`, and
+`Error` naming its track.)
 
 ## 9. Honest costs
 

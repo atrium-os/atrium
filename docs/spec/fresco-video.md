@@ -274,8 +274,11 @@ R9700 with a monitor (D5).
   legacy-web §8.1.1), and the seek-driven segment feed over Nuntius `Stream`.
 - The feed is tested against a server that is slow, stalls, drops connections, answers 5xx,
   has a dead primary, or never answers.
-- Waiting on P1: answer order, `Buffered` before `Appended`, a track on `Error`, and a
-  "more is coming" signal for progressive `Load { Fd }`.
+- Caption tracks (2026-11-06): `<track>` subtitles and captions go to the player as
+  `TextTrack` with their WebVTT files after `Load`, and `ShowText` picks the default, or
+  `InBand`. `textTracks` modes and `addTextTrack` map onto `ShowText`; cues a page adds
+  by script are out of scope (legacy-web §8.1.1).
+- Waiting on P1: answer order, and `Buffered` before `Appended`.
 - Waiting on the Pergola UI: the real `Embeds` wiring (before L6).
 
 V1 to V4 are ready to build once this is reviewed. P1 can start at once against V1's
