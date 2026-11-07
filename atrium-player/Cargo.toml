@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["demux", "decode", "fetch", "player", "worker"]
+members = ["demux", "decode", "player", "worker"]
 
 [workspace.package]
 edition = "2021"

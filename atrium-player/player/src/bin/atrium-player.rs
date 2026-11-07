@@ -6,10 +6,9 @@
 //!   atrium-player --headless --feed FILE...  # one MSE track per FILE, appended in chunks
 //!   atrium-player [--size WxH] [--exit-at-end] FILE   # in a window, with controls
 //!   atrium-player --limen                    # a Limen media-player child
-//!   FILE may be an http(s) URL: atrium-player-fetch (the sandboxed
-//!   fetcher, a process of its own) downloads it and the player plays it
-//!   as it arrives. ATRIUM_PLAYER_FETCH_UNCONFINED=1 lets the fetcher run
-//!   without Capsicum off FreeBSD; ATRIUM_PLAYER_TRUST names its CA file.
+//!   FILE may be an http(s) URL: the system fetcher (a jailed Nuntius
+//!   portcullisd starts for a player holding net-fetch) downloads it and
+//!   the player plays it as it arrives.
 //!   options: --seek SECS (after the first frame), --probe-sandbox,
 //!            --kill-worker-after N (frames)
 use std::fs::File;
@@ -248,38 +247,12 @@ fn windowed(file: &str, exit_at_end: bool, size: (u32, u32)) {
     run(&mut app);
 }
 
-/// The fetcher, asked for `url`: the system's (portcullisd, `net-fetch`)
-/// when the player may have one, else the helper (fetch.rs).
+/// The system fetcher (portcullisd's `OpenFetcher`), asked for `url`. ★ The
+/// player has no other way to the network: without `net-fetch` in its
+/// manifest, or outside portcullisd, a URL is refused.
 fn start_fetcher(url: &str) -> Fetcher {
-    let want = std::env::var("ATRIUM_PLAYER_FETCHER").unwrap_or_default();
-    if want == "system" || (want != "helper" && portcullis_reachable()) {
-        match Fetcher::system(url) {
-            Ok(f) => return f,
-            Err(e) if want == "system" => {
-                eprintln!("atrium-player: the system fetcher: {e}");
-                std::process::exit(1)
-            }
-            Err(e) => eprintln!("atrium-player: no system fetcher ({e}); using atrium-player-fetch"),
-        }
-    }
-    start_helper(url)
-}
-
-fn portcullis_reachable() -> bool {
-    ["/atrium/sockets/portcullis/portcullis.sock", "/atrium/sockets/portcullis.sock"].iter().any(|p| std::path::Path::new(p).exists())
-}
-
-/// The helper process (`atrium-player-fetch`), asked for `url`.
-fn start_helper(url: &str) -> Fetcher {
-    let mut extra = Vec::new();
-    if std::env::var("ATRIUM_PLAYER_FETCH_UNCONFINED").as_deref() == Ok("1") {
-        extra.push("--unconfined-for-testing".to_string());
-    }
-    if let Ok(t) = std::env::var("ATRIUM_PLAYER_TRUST") {
-        extra.extend(["--trust".to_string(), t]);
-    }
-    Fetcher::spawn(&fetch::default_fetcher(), url, &extra).unwrap_or_else(|e| {
-        eprintln!("atrium-player: starting the fetcher: {e}");
+    Fetcher::system(url).unwrap_or_else(|e| {
+        eprintln!("atrium-player: the system fetcher: {e} (a URL needs the player launched by portcullisd with net-fetch)");
         std::process::exit(1)
     })
 }

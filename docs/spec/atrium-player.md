@@ -307,15 +307,17 @@ Fresco's layers land.
   most a minute), so the supervisor still parses nothing. A restarted worker reads the
   files again; a new file under an id replaces the old one's cues.
 - M7, a URL in the standalone player (`atrium-player URL`, windowed or `--headless`): the
-  player starts `atrium-player-fetch`, a process of its own that reads its trust store,
-  enters Capsicum (network through casper, as navigator-fetchd), and only then reads the
-  URL. It fetches through Nuntius with `Fd` delivery and hands back the read-only
-  descriptor as soon as the head is in; the player plays it as a growing `Load` and gets
-  `LoadDone` at `Done`. A download cut off part way plays what arrived. Neither the
-  supervisor nor the worker gets network. It stands in for nuntiusd and the `net.fetch`
-  launch (nuntius.md §6 steps 2 and 4) and should move to them when they exist.
-  In the FreeBSD VM the fetcher runs in capability mode, and `vp9-opus.webm` served at one
-  16 KiB piece a second plays with every frame matching ffmpeg's hashes. That needed two
+  player asks portcullisd for a fetcher of its own (`OpenFetcher`, nuntius.md §6.3), which
+  needs `net-fetch` in the player's manifest. It is a jailed nuntiusd running as
+  `_nuntius`, and it fetches with `Fd` delivery. The player gets the read-only descriptor
+  as soon as the head is in, plays it as a growing `Load` and gets `LoadDone` at `Done`. A
+  download cut off part way plays what arrived. Neither the supervisor nor the worker gets
+  network, and a player not launched by portcullisd with `net-fetch` refuses URLs. The
+  first version started a helper of its own, `atrium-player-fetch` (Capsicum, network
+  through casper); it was removed on 2026-11-07 once the system fetcher was wired
+  (4c8fedf), so the player has one way to the network.
+  With that helper, in the FreeBSD VM, `vp9-opus.webm` served at one
+  16 KiB piece a second played with every frame matching ffmpeg's hashes. That needed two
   Nuntius fixes on FreeBSD: the anonymous file is `memfd_create` (a plain `SHM_ANON`
   object refuses writes past its size), and it is written at explicit offsets (the
   read-only descriptor is a dup that shares the file offset).

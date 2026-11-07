@@ -1,28 +1,14 @@
 //! Opening a URL in the standalone player (atrium-player.md §6). The
-//! player has no network: it starts `atrium-player-fetch`, a separate
-//! process holding the Navigator's sandboxed fetcher (Nuntius, nuntius.md
-//! §5 client 2), which hands back a read-only descriptor of the file it is
-//! filling. The player plays that as a growing `Load` and is told when the
-//! download is complete. Neither the supervisor nor the decode worker ever
+//! player has no network: portcullisd starts a jailed Nuntius of its own
+//! (nuntius.md §6.3, `OpenFetcher`) when the player's manifest holds
+//! `net-fetch`, running as `_nuntius` in its own jail. A thread here turns
+//! its events into [`FromFetcher`] messages: a read-only descriptor of the
+//! file being filled, which the player plays as a growing `Load`, then
+//! `Done` or `Failed`. Neither the supervisor nor the decode worker ever
 //! gets a socket to the network.
-//!
-//! ★ Two ways to the same messages ([`FromFetcher`]):
-//! - **the system fetcher** (nuntius.md §6.3): when the player runs as an
-//!   app whose manifest holds `net-fetch`, portcullisd starts a jailed
-//!   Nuntius of its own ([`Fetcher::system`]), running as `_nuntius` in its
-//!   own jail; a thread here turns its events into the messages below;
-//! - **the helper** (`atrium-player-fetch`, [`Fetcher::spawn`]): a child in
-//!   Capsicum, for a player not launched by portcullisd (development, the
-//!   VM checks).
-//!
-//! `ATRIUM_PLAYER_FETCHER=system|helper` picks one; by default the system
-//! fetcher is tried when portcullisd is reachable, and the helper used
-//! otherwise.
 use std::io;
 use std::os::fd::{AsRawFd, OwnedFd};
 use std::os::unix::net::UnixStream;
-use std::path::PathBuf;
-use std::process::{Child, Command};
 use std::time::Duration;
 
 use limen::media_player::{code, ToChild, ToParent};
@@ -35,11 +21,6 @@ use crate::sys;
 pub const URL_MAX: usize = 8192;
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub enum ToFetcher {
-    Get { url: String },
-}
-
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum FromFetcher {
     /// The file being filled, as descriptor 0 on this frame (read-only).
     /// `length` when the server said.
@@ -47,17 +28,6 @@ pub enum FromFetcher {
     /// The download is complete.
     Done { bytes: u64 },
     Failed { reason: String },
-}
-
-impl ToFetcher {
-    pub fn encode(&self) -> Vec<u8> {
-        postcard::to_stdvec(self).expect("encodes")
-    }
-    pub fn decode(b: &[u8]) -> Option<Self> {
-        let m: Self = postcard::from_bytes(b).ok()?;
-        let ToFetcher::Get { url } = &m;
-        (url.len() <= URL_MAX && !url.chars().any(char::is_control)).then_some(m)
-    }
 }
 
 impl FromFetcher {
@@ -80,43 +50,14 @@ pub fn is_url(s: &str) -> bool {
     s.starts_with("https://") || s.starts_with("http://")
 }
 
-/// `atrium-player-fetch` next to this executable, unless
-/// `ATRIUM_PLAYER_FETCH` says otherwise.
-pub fn default_fetcher() -> PathBuf {
-    if let Some(p) = std::env::var_os("ATRIUM_PLAYER_FETCH") {
-        return p.into();
-    }
-    std::env::current_exe().unwrap_or_default().with_file_name("atrium-player-fetch")
-}
-
 /// The fetcher, asked for one URL.
 pub struct Fetcher {
-    how: How,
+    /// The guard keeps the fetcher's jail; dropping it ends it.
+    _guard: nuntius::launch::FetcherGuard,
     sock: UnixStream,
 }
 
-enum How {
-    Helper(Child),
-    /// The system fetcher: the guard keeps its jail; dropping it ends it.
-    System(#[allow(dead_code)] nuntius::launch::FetcherGuard),
-}
-
 impl Fetcher {
-    /// `extra`: arguments for the fetcher (`--unconfined-for-testing` off
-    /// FreeBSD, `--trust PEM`).
-    pub fn spawn(exe: &std::path::Path, url: &str, extra: &[String]) -> io::Result<Fetcher> {
-        let (mine, theirs) = UnixStream::pair()?;
-        let mut cmd = Command::new(exe);
-        cmd.arg("--fd").arg(theirs.as_raw_fd().to_string()).args(extra).stdin(std::process::Stdio::null());
-        sys::pass_fd(&mut cmd, theirs.as_raw_fd());
-        let child = cmd.spawn()?;
-        drop(theirs);
-        // The URL goes after the fetcher is sandboxed: it reads its request
-        // only once it can't open a file.
-        sys::send_frame(&mine, &ToFetcher::Get { url: url.to_string() }.encode(), &[])?;
-        Ok(Fetcher { how: How::Helper(child), sock: mine })
-    }
-
     /// ★ The system fetcher (portcullisd's `OpenFetcher`), asked for `url`.
     /// `PermissionDenied` when the player's manifest does not hold
     /// `net-fetch`.
@@ -133,7 +74,7 @@ impl Fetcher {
         let (mine, theirs) = UnixStream::pair()?;
         let url = url.to_string();
         std::thread::Builder::new().name("player-fetch".into()).spawn(move || translate(client, &url, &theirs))?;
-        Ok(Fetcher { how: How::System(guard), sock: mine })
+        Ok(Fetcher { _guard: guard, sock: mine })
     }
 
     /// The next message, waiting at most `wait`. `Err` when the fetcher is
@@ -155,19 +96,10 @@ impl Fetcher {
     }
 }
 
-impl Drop for Fetcher {
-    fn drop(&mut self) {
-        if let How::Helper(c) = &mut self.how {
-            let _ = c.kill();
-            let _ = c.wait();
-        }
-    }
-}
-
-/// ★ The system fetcher's events as the helper's messages, on `out` (the
+/// ★ The system fetcher's events as the player's messages, on `out` (the
 /// same frames [`Fetcher::poll`] reads): `Fd` delivery, with a file of our
-/// own filled from `Data` when the response has no length, as the helper
-/// does. Ends with `Done` or `Failed`, or when the player hangs up.
+/// own filled from `Data` when the response has no length. Ends with `Done`
+/// or `Failed`, or when the player hangs up.
 fn translate(mut c: nuntius::Client, url: &str, out: &UnixStream) {
     use nuntius::{Deliver, Event, Limits, Open};
     use std::io::Write;
@@ -315,7 +247,6 @@ mod tests {
             assert_eq!(FromFetcher::decode(&m.encode()), Some(m));
         }
         assert_eq!(FromFetcher::decode(&FromFetcher::Failed { reason: "a\u{1b}".into() }.encode()), None);
-        assert_eq!(ToFetcher::decode(&ToFetcher::Get { url: "https://a/\n".into() }.encode()), None);
         assert!(is_url("https://example.org/v.webm") && !is_url("/tmp/v.webm"));
     }
 }
