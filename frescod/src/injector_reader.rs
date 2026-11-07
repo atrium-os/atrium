@@ -102,13 +102,13 @@ fn handle(sink: &Sender<DisplayEvent>, comp: &Arc<Mutex<Compositor>>, sw: f32, s
             if let (Some(hid_usage), Some(pressed)) = (usage, pressed) {
                 let target = focused_window(comp);
                 eprintln!("frescod: inject KEY {hid_usage} {} -> window {target}", pressed as u8);
-                let _ = sink.send(DisplayEvent::InputKey { window_id: target, hid_usage, pressed, modifiers: mods, activation: injected(pressed) });
+                let _ = sink.send(DisplayEvent::InputKey { window_id: target, hid_usage, pressed, modifiers: mods, activation: injected(pressed), repeat: false });
             }
         }
         "SCROLL" => {
             if let Some(dy) = next_f32(&mut it) {
                 let (_lx, _ly, target) = cursor_here(comp);
-                let _ = sink.send(DisplayEvent::InputPointerScroll { window_id: target, dx: 0.0, dy });
+                let _ = sink.send(DisplayEvent::InputPointerScroll { window_id: target, dx: 0.0, dy, phase: 0 });
             }
         }
         other => eprintln!("frescod: injector: unknown command {other:?}"),

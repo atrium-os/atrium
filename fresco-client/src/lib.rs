@@ -105,6 +105,10 @@ pub enum Event {
         /// The press's activation token, for Tabula (docs/spec/tabula.md
         /// §2): zero on releases.
         activation: [u8; 16],
+        /// A key repeat while the key is held: `pressed` is true and it
+        /// carries no token. Text input treats it as a press; toggles
+        /// should ignore it.
+        repeat: bool,
     },
     /// Pointer motion in window-local logical pixels.
     PointerMotion { window_id: u32, x: f32, y: f32 },
@@ -119,7 +123,14 @@ pub enum Event {
         activation: [u8; 16],
     },
     /// Pointer scroll delta in logical pixels.
-    PointerScroll { window_id: u32, dx: f32, dy: f32 },
+    PointerScroll {
+        window_id: u32,
+        dx: f32,
+        dy: f32,
+        /// `fresco_protocol::scroll_phase`: NONE for a wheel; a
+        /// touchpad's BEGIN, UPDATE, then END when the fingers lift.
+        phase: u8,
+    },
     /// A drag (docs/spec/tabula.md §4) came over the window, offering
     /// these MIME `formats`.
     DragEnter { window_id: u32, drag_id: u64, x: f32, y: f32, formats: Vec<String> },
@@ -1149,6 +1160,7 @@ fn decode_event(op: u16, payload: &[u8]) -> Event {
             Ok(p) => Event::Key {
                 window_id: p.window_id, hid_usage: p.hid_usage,
                 pressed: p.pressed, modifiers: p.modifiers, activation: p.activation,
+                repeat: p.repeat,
             },
             Err(_) => Event::Unknown { op, payload: payload.to_vec() },
         },
@@ -1167,7 +1179,7 @@ fn decode_event(op: u16, payload: &[u8]) -> Event {
         },
         EV_INPUT_POINTER_SCROLL => match decode::<InputPointerScrollEvent>(payload) {
             Ok(p) => Event::PointerScroll {
-                window_id: p.window_id, dx: p.dx, dy: p.dy,
+                window_id: p.window_id, dx: p.dx, dy: p.dy, phase: p.phase,
             },
             Err(_) => Event::Unknown { op, payload: payload.to_vec() },
         },
@@ -1246,10 +1258,11 @@ mod tests {
             window_id: 4, hid_usage: 0x04, /* 'a' */
             pressed: true, modifiers: 0x01, /* shift */
             activation: [7; 16],
+            repeat: false,
         };
         let bytes = encode(&p).unwrap();
         match decode_event(EV_INPUT_KEY, &bytes) {
-            Event::Key { window_id: 4, hid_usage: 0x04, pressed: true, modifiers: 0x01, activation: [7, ..] } => {}
+            Event::Key { window_id: 4, hid_usage: 0x04, pressed: true, modifiers: 0x01, activation: [7, ..], repeat: false } => {}
             other => panic!("expected Key, got {other:?}"),
         }
 
@@ -1272,10 +1285,10 @@ mod tests {
             other => panic!("expected PointerButton, got {other:?}"),
         }
 
-        let p = InputPointerScrollEvent { window_id: 3, dx: 0.0, dy: -8.5 };
+        let p = InputPointerScrollEvent { window_id: 3, dx: 0.0, dy: -8.5, phase: 0 };
         let bytes = encode(&p).unwrap();
         match decode_event(EV_INPUT_POINTER_SCROLL, &bytes) {
-            Event::PointerScroll { window_id: 3, dx, dy } => {
+            Event::PointerScroll { window_id: 3, dx, dy, phase: 0 } => {
                 assert_eq!((dx, dy), (0.0, -8.5));
             }
             other => panic!("expected PointerScroll, got {other:?}"),

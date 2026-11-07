@@ -70,6 +70,8 @@ pub enum DisplayEvent {
         modifiers: u8,
         /// See [`MINT_HERE`] and `fresco_protocol::InputKeyEvent::activation`.
         activation: [u8; 16],
+        /// See `fresco_protocol::InputKeyEvent::repeat`.
+        repeat: bool,
     },
     /// Pointer cursor moved over a window's content region.
     InputPointerMotion { window_id: u32, x: f32, y: f32 },
@@ -85,7 +87,8 @@ pub enum DisplayEvent {
     },
     /// Pointer scroll (wheel / two-finger). `dy > 0` = content scrolls
     /// down (matches macOS/Wayland convention).
-    InputPointerScroll { window_id: u32, dx: f32, dy: f32 },
+    /// `phase`: `fresco_protocol::scroll_phase`.
+    InputPointerScroll { window_id: u32, dx: f32, dy: f32, phase: u8 },
     /// The nodes of this window that are not drawn (fills, or any node
     /// past the op budget), by node id with a `fresco_protocol::fill_drop`
     /// reason. Sent whenever the set changes, so an empty list says every
@@ -189,13 +192,14 @@ pub fn encode_event(ev: &DisplayEvent)
             };
             Ok((control::EV_DISPLAY_CHANGED, encode(&p)?))
         }
-        DisplayEvent::InputKey { window_id, hid_usage, pressed, modifiers, activation } => {
+        DisplayEvent::InputKey { window_id, hid_usage, pressed, modifiers, activation, repeat } => {
             let p = InputKeyEvent {
                 window_id: *window_id,
                 hid_usage: *hid_usage,
                 pressed:   *pressed,
                 modifiers: *modifiers,
                 activation: if *activation == MINT_HERE { [0; 16] } else { *activation },
+                repeat: *repeat,
             };
             Ok((control::EV_INPUT_KEY, encode(&p)?))
         }
@@ -213,9 +217,9 @@ pub fn encode_event(ev: &DisplayEvent)
             };
             Ok((control::EV_INPUT_POINTER_BUTTON, encode(&p)?))
         }
-        DisplayEvent::InputPointerScroll { window_id, dx, dy } => {
+        DisplayEvent::InputPointerScroll { window_id, dx, dy, phase } => {
             let p = InputPointerScrollEvent {
-                window_id: *window_id, dx: *dx, dy: *dy,
+                window_id: *window_id, dx: *dx, dy: *dy, phase: *phase,
             };
             Ok((control::EV_INPUT_POINTER_SCROLL, encode(&p)?))
         }

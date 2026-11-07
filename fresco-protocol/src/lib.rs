@@ -1088,6 +1088,10 @@ pub struct InputKeyEvent {
     /// one use, for this window's app; all zero on releases and on input
     /// that did not come from a real device.
     pub activation: [u8; 16],
+    /// A key repeat (Tactus makes them while a key is held,
+    /// docs/spec/atrium-input.md §5.1): `pressed` is true, there was no
+    /// release since the press, and it carries no activation token.
+    pub repeat: bool,
 }
 
 /// `EV_INPUT_POINTER_MOTION` — cursor moved. Coordinates are in
@@ -1125,6 +1129,18 @@ pub struct InputPointerScrollEvent {
     pub window_id: u32,
     pub dx:        f32,
     pub dy:        f32,
+    /// [`scroll_phase`]: a wheel's steps have none; a touchpad's two
+    /// fingers begin, update, and end (fingers lifted, no motion: a
+    /// scroll view may fling from here).
+    pub phase:     u8,
+}
+
+/// `InputPointerScrollEvent::phase` values.
+pub mod scroll_phase {
+    pub const NONE: u8 = 0;
+    pub const BEGIN: u8 = 1;
+    pub const UPDATE: u8 = 2;
+    pub const END: u8 = 3;
 }
 
 /// Credential slots (docs/spec/arca-autofill.md §4).

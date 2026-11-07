@@ -9,6 +9,7 @@ use serde::{Deserialize, Serialize};
 
 pub use crate::decode::Axis;
 pub use crate::hid::Class;
+pub use crate::touchpad::{GestureKind, Phase};
 
 pub const VERSION: u32 = 1;
 /// No message is near this; a longer length is a broken stream.
@@ -38,6 +39,13 @@ pub enum Message {
     Absolute { id: u32, ts_ns: u64, x: f32, y: f32 },
     /// 120 per wheel detent; HID sign (positive is away from the user, or right).
     Scroll { id: u32, ts_ns: u64, axis: Axis, value_120: i32 },
+    /// Two fingers on a touchpad moved this many pixels (finger
+    /// direction: positive is right / towards the user). `End` has no
+    /// motion: the fingers lifted, so a scroll view may fling.
+    ScrollPixels { id: u32, ts_ns: u64, dx: f32, dy: f32, phase: Phase },
+    /// A touchpad swipe (three or more fingers, pixels) or pinch (two,
+    /// `scale` against the start).
+    Gesture { id: u32, ts_ns: u64, kind: GestureKind, fingers: u8, phase: Phase, dx: f32, dy: f32, scale: f32 },
 }
 
 pub fn write(w: &mut impl Write, m: &Message) -> io::Result<()> {

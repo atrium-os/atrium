@@ -15,9 +15,12 @@
 //!   bitmap and are not sent themselves;
 //! - consumer-page keys go to the WM only (window 0, `0x0C00 | usage`, no
 //!   token: atrium-player-pip-keys.md §4.3);
-//! - key repeats are not passed on yet (the app wire has no repeat flag);
+//! - key repeats go to the window the press went to, flagged `repeat`
+//!   and without a token, and stop if that window loses the keyboard;
 //! - pointer buttons, motion (relative or absolute) and wheels move the
-//!   cursor and go to the window under it.
+//!   cursor and go to the window under it; a touchpad's two-finger scroll
+//!   goes, with its phases, to the window it began over, content following
+//!   the fingers; swipes and pinches are not routed yet.
 //! Every press from tactusd mints an activation token: tactusd is the
 //! only peer on that socket (its directory is _tactus:_frescod 0750).
 
@@ -27,7 +30,8 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use fresco_scene_server::window::{Compositor, DisplayEvent, MINT_HERE};
-use tactus::wire::{self, Axis, Message};
+use fresco_protocol::scroll_phase;
+use tactus::wire::{self, Axis, Message, Phase};
 
 pub const DEFAULT_SOCKET: &str = "/atrium/sockets/tactus/tactus.sock";
 
@@ -73,6 +77,8 @@ struct Seat {
     /// Keys sent as pressed, with the window they went to.
     keys: Vec<(u32, u16)>,
     buttons: Vec<u8>,
+    /// The window a touchpad scroll is going to, between Begin and End.
+    scrolling: Option<u32>,
 }
 
 /// The HID modifier byte to the wire's bits (shift 1, ctrl 2, alt 4).
@@ -116,10 +122,13 @@ impl Seat {
                 eprintln!("frescod: input device {id} {name:?} ({bus:?}, {classes:?})");
             }
             Message::Key { usage, down, repeat, .. } => {
+                let (page, id) = ((usage >> 16) as u16, (usage & 0xffff) as u16);
                 if repeat {
+                    if page == 0x07 {
+                        self.repeat(sink, comp, id);
+                    }
                     return;
                 }
-                let (page, id) = ((usage >> 16) as u16, (usage & 0xffff) as u16);
                 match page {
                     0x07 if (0xe0..=0xe7).contains(&id) => {
                         let bit = 1u8 << (id - 0xe0);
@@ -137,6 +146,7 @@ impl Seat {
                             pressed: down,
                             modifiers: 0,
                             activation: [0; 16],
+                            repeat: false,
                         });
                     }
                     _ => {}
@@ -176,8 +186,31 @@ impl Seat {
                     Axis::Vertical => (0.0, -v),
                     Axis::Horizontal => (v, 0.0),
                 };
-                let _ = sink.send(DisplayEvent::InputPointerScroll { window_id: target as u32, dx, dy });
+                let _ = sink.send(DisplayEvent::InputPointerScroll { window_id: target as u32, dx, dy, phase: scroll_phase::NONE });
             }
+            Message::ScrollPixels { dx, dy, phase, .. } => {
+                // Content follows the fingers ("natural" scrolling): fingers
+                // up scroll the content up, i.e. the view down (+dy). The
+                // whole scroll goes to the window it began over.
+                let window_id = match (phase, self.scrolling) {
+                    (Phase::Begin, _) | (_, None) => {
+                        let g = comp.lock().unwrap();
+                        let (x, y) = g.cursor;
+                        g.pointer_target(x, y).0 as u32
+                    }
+                    (_, Some(w)) => w,
+                };
+                self.scrolling = (phase != Phase::End).then_some(window_id);
+                let phase = match phase {
+                    Phase::Begin => scroll_phase::BEGIN,
+                    Phase::Update => scroll_phase::UPDATE,
+                    Phase::End => scroll_phase::END,
+                };
+                let _ = sink.send(DisplayEvent::InputPointerScroll { window_id, dx: -dx, dy: -dy, phase });
+            }
+            // Swipes and pinches have no route to Forum or apps yet
+            // (atrium-input.md §8 T3 follow-up).
+            Message::Gesture { .. } => {}
             Message::Gone { id } => eprintln!("frescod: input device {id} gone"),
             Message::Hello { .. } => {}
         }
@@ -201,6 +234,24 @@ impl Seat {
             pressed: down,
             modifiers: wire_mods(self.mods),
             activation: if down { MINT_HERE } else { [0; 16] },
+            repeat: false,
+        });
+    }
+
+    /// A repeat of held key `id`, to the window its press went to while
+    /// that window still has the keyboard.
+    fn repeat(&mut self, sink: &Sender<DisplayEvent>, comp: &Arc<Mutex<Compositor>>, id: u16) {
+        let Some(&(window_id, _)) = self.keys.iter().find(|&&(_, k)| k == id) else { return };
+        if comp.lock().unwrap().keyboard_window() != window_id {
+            return;
+        }
+        let _ = sink.send(DisplayEvent::InputKey {
+            window_id,
+            hid_usage: id,
+            pressed: true,
+            modifiers: wire_mods(self.mods),
+            activation: [0; 16],
+            repeat: true,
         });
     }
 

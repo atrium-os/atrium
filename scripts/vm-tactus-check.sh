@@ -15,8 +15,8 @@
 # jaild policy entries), starts it through portcullisd-bootstrap, runs a
 # headless frescod (no GPU needed) and the probe window, then types and
 # clicks through the QEMU monitor and checks what the window got:
-# keys with shift, a token on each press and none on releases, repeats not
-# passed on, a click with a token, motion, a scroll, a hot-plugged keyboard
+# keys with shift, a token on each press and none on releases or repeats,
+# a held key repeating, a click with a token, motion, a scroll, a hot-plugged keyboard
 # and frescod waiting for tactusd when it restarts. Ends "tactus: N failed".
 set -u
 TD=$1 FD=$2 PROBE=$3
@@ -96,7 +96,10 @@ P=/tmp/tactus-probe.log
 grep -q "usage=0x0004 pressed=1 mods=1 token" $P && ok "shift-a: a with shift, token" || bad "shift-a"
 grep -q "usage=0x0004 pressed=0 mods=1 no-token" $P && ok "release without token" || bad "a release"
 grep -q "usage=0x00e1" $P && bad "modifier sent as a key" || ok "modifiers only as bits"
-[ "$(grep -c "usage=0x0006 pressed=1" $P)" = 1 ] && ok "held c: one press, repeats not passed on" || bad "held c pressed $(grep -c 'usage=0x0006 pressed=1' $P) times"
+[ "$(grep -c "usage=0x0006 pressed=1 mods=0 token$" $P)" = 1 ] && ok "held c: one press with a token" || bad "held c pressed $(grep -c 'usage=0x0006 pressed=1 mods=0 token$' $P) times"
+n=$(grep -c "usage=0x0006 pressed=1 mods=0 no-token repeat" $P)
+[ "$n" -ge 15 ] && [ "$n" -le 40 ] && ok "held c 1.5 s: $n repeats, no tokens" || bad "held c: $n repeats"
+grep "repeat" $P | grep -qv "usage=0x0006" && bad "repeats of other keys" || ok "only the held key repeats"
 grep -q "button window=[1-9][0-9]* button=1 pressed=1 token" $P && ok "click with token" || bad "click"
 grep -q "^motion window=" $P && ok "motion" || bad "motion"
 grep -q "^scroll window=" $P && ok "scroll" || bad "scroll"

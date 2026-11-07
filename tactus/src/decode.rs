@@ -18,6 +18,37 @@ pub enum Input {
     Absolute { x: f32, y: f32 },
     /// Wheel detents (HID sign: positive is away from the user / right).
     Scroll { axis: Axis, detents: i32 },
+    /// One touchpad frame: every contact the pad reported (lifted ones
+    /// with `tip` false) and whether its button is down.
+    Touch { contacts: Vec<Contact>, button: bool },
+}
+
+/// One finger on a touchpad, in millimetres from the pad's corner.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Contact {
+    pub id: u32,
+    pub x: f32,
+    pub y: f32,
+    /// Touching (else this report says the finger lifted).
+    pub tip: bool,
+    /// The pad thinks it is a finger, not a palm (Confidence usage;
+    /// true when the pad does not say).
+    pub confident: bool,
+}
+
+const FINGER: Usage = hid::usage(hid::PAGE_DIGITIZER, 0x22);
+const TIP: Usage = hid::usage(hid::PAGE_DIGITIZER, 0x42);
+const CONFIDENCE: Usage = hid::usage(hid::PAGE_DIGITIZER, 0x47);
+const CONTACT_ID: Usage = hid::usage(hid::PAGE_DIGITIZER, 0x51);
+const CONTACT_COUNT: Usage = hid::usage(hid::PAGE_DIGITIZER, 0x54);
+
+/// A touchpad frame being put together: hybrid-mode pads send a frame's
+/// contacts over several reports, the count in the first.
+#[derive(Debug, Default)]
+struct Pending {
+    expect: usize,
+    contacts: Vec<Contact>,
+    button: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -32,12 +63,14 @@ pub struct Decoder {
     held: Vec<Vec<Usage>>,
     /// Last absolute position per collection, to send only changes.
     abs: Vec<Option<(f32, f32)>>,
+    /// Per collection, a touchpad frame in progress.
+    touch: Vec<Pending>,
 }
 
 /// Classes whose reports this decoder turns into events. Gamepads,
 /// touch and touchpads get their own stages (spec §8, T3/T5).
 fn decoded(c: Class) -> bool {
-    matches!(c, Class::Pointer | Class::Keyboard | Class::SystemKeys | Class::MediaKeys)
+    matches!(c, Class::Pointer | Class::Keyboard | Class::SystemKeys | Class::MediaKeys | Class::Touchpad)
 }
 
 /// Keyboard usages 1..=3 are ErrorRollOver, POSTFail, ErrorUndefined:
@@ -49,7 +82,7 @@ fn phantom(u: Usage) -> bool {
 impl Decoder {
     pub fn new(desc: Descriptor) -> Decoder {
         let n = desc.apps.len();
-        Decoder { desc, held: vec![Vec::new(); n], abs: vec![None; n] }
+        Decoder { desc, held: vec![Vec::new(); n], abs: vec![None; n], touch: (0..n).map(|_| Pending::default()).collect() }
     }
 
     pub fn descriptor(&self) -> &Descriptor {
@@ -74,6 +107,10 @@ impl Decoder {
         };
         for app in 0..self.desc.apps.len() {
             if !decoded(self.desc.apps[app].class) {
+                continue;
+            }
+            if self.desc.apps[app].class == Class::Touchpad {
+                self.touchpad(app, id, body, out);
                 continue;
             }
             let fields: Vec<&hid::Field> =
@@ -153,6 +190,75 @@ impl Decoder {
                 out.push(event(u, true));
             }
             *held = pressed;
+        }
+    }
+
+    /// The pad's size in millimetres (its X and Y ranges), for a touchpad.
+    pub fn pad_mm(&self) -> Option<(f32, f32)> {
+        let f = |u| {
+            self.desc
+                .fields
+                .iter()
+                .find(|f| self.desc.apps[f.app].class == Class::Touchpad && f.collection_usage == FINGER && f.usage_at(0) == Some(u))
+                .map(|f| (f.logical_max - f.logical_min) as f32 * f.mm_per_unit().unwrap_or(0.1))
+        };
+        Some((f(hid::X)?, f(hid::Y)?))
+    }
+
+    fn touchpad(&mut self, app: usize, id: u8, body: &[u8], out: &mut Vec<Input>) {
+        let fields: Vec<&hid::Field> = self.desc.fields.iter().filter(|f| f.app == app && f.report_id == id).collect();
+        if fields.is_empty() {
+            return;
+        }
+        let mut fingers: Vec<(u32, Contact)> = Vec::new();
+        let (mut count, mut button) = (None, false);
+        for f in fields {
+            for k in 0..f.count {
+                let Some(v) = f.value(body, k) else { return };
+                let Some(u) = (if f.array { f.usage_of_index(v) } else { f.usage_at(k) }) else { continue };
+                if f.collection_usage != FINGER {
+                    match u {
+                        CONTACT_COUNT => count = Some(v.max(0) as usize),
+                        _ if u >> 16 == u32::from(hid::PAGE_BUTTON) => button |= v != 0,
+                        _ => {}
+                    }
+                    continue;
+                }
+                let c = match fingers.iter_mut().find(|(c, _)| *c == f.collection) {
+                    Some((_, c)) => c,
+                    None => {
+                        fingers.push((f.collection, Contact { id: 0, x: 0.0, y: 0.0, tip: false, confident: true }));
+                        &mut fingers.last_mut().unwrap().1
+                    }
+                };
+                let mm = |v: i64| (v - i64::from(f.logical_min)) as f32 * f.mm_per_unit().unwrap_or(0.1);
+                match u {
+                    TIP => c.tip = v != 0,
+                    CONFIDENCE => c.confident = v != 0,
+                    CONTACT_ID => c.id = v as u32,
+                    hid::X => c.x = mm(v),
+                    hid::Y => c.y = mm(v),
+                    _ => {}
+                }
+            }
+        }
+        let p = &mut self.touch[app];
+        match count {
+            // Without a count field every report is a whole frame.
+            None => *p = Pending { expect: fingers.len(), contacts: Vec::new(), button },
+            Some(n) if n > 0 => *p = Pending { expect: n, contacts: Vec::new(), button },
+            // A continuation report (hybrid mode), or an empty frame.
+            Some(_) if p.expect == 0 => *p = Pending { expect: 0, contacts: Vec::new(), button },
+            Some(_) => p.button |= button,
+        }
+        for (_, c) in fingers {
+            if p.contacts.len() < p.expect {
+                p.contacts.push(c);
+            }
+        }
+        if p.contacts.len() >= p.expect {
+            let p = std::mem::take(p);
+            out.push(Input::Touch { contacts: p.contacts, button: p.button });
         }
     }
 
@@ -257,5 +363,80 @@ mod tests {
         assert_eq!(run(&mut d, &[2, 0xcd, 0]), vec![Input::Key { usage: usage(0x0c, 0xcd), down: true }]);
         assert_eq!(run(&mut d, &[2, 0, 0]), vec![Input::Key { usage: usage(0x0c, 0xcd), down: false }]);
         assert_eq!(run(&mut d, &[1, 0b010]), vec![Input::Key { usage: usage(1, 0x82), down: true }], "sleep");
+    }
+
+    /// A short item: `prefix` is the item byte with size bits 0; the
+    /// size follows the value.
+    fn item(d: &mut Vec<u8>, prefix: u8, v: i64) {
+        let b = v.to_le_bytes();
+        let n = if (-128..=127).contains(&v) || (0..=255).contains(&v) && prefix & 0xf0 != 0x10 { 1 } else if (-32768..=65535).contains(&v) { 2 } else { 4 };
+        let n = if v > 127 && prefix == 0x14 { 2 } else { n };
+        d.push(prefix | [0, 1, 2, 0, 3][n]);
+        d.extend_from_slice(&b[..n]);
+    }
+
+    /// A Precision Touchpad: report 1, `fingers` Finger collections
+    /// (confidence, tip, 4-bit id, 16-bit X/Y over 100 x 60 mm), scan
+    /// time, contact count, one button.
+    fn ptp(fingers: usize) -> Vec<u8> {
+        let mut d = Vec::new();
+        let i = |d: &mut Vec<u8>, p, v| item(d, p, v);
+        i(&mut d, 0x04, 0x0d); i(&mut d, 0x08, 0x05); i(&mut d, 0xa0, 1); i(&mut d, 0x84, 1);
+        for _ in 0..fingers {
+            i(&mut d, 0x04, 0x0d); i(&mut d, 0x08, 0x22); i(&mut d, 0xa0, 2);
+            i(&mut d, 0x14, 0); i(&mut d, 0x24, 1); i(&mut d, 0x74, 1); i(&mut d, 0x94, 1);
+            i(&mut d, 0x08, 0x47); i(&mut d, 0x80, 2); i(&mut d, 0x08, 0x42); i(&mut d, 0x80, 2);
+            i(&mut d, 0x94, 6); i(&mut d, 0x80, 3);
+            i(&mut d, 0x74, 8); i(&mut d, 0x94, 1); i(&mut d, 0x24, 15); i(&mut d, 0x08, 0x51); i(&mut d, 0x80, 2);
+            i(&mut d, 0x04, 0x01); i(&mut d, 0x74, 16); i(&mut d, 0x54, 0x0e); i(&mut d, 0x64, 0x11);
+            i(&mut d, 0x34, 0); i(&mut d, 0x44, 1000); i(&mut d, 0x24, 1000); i(&mut d, 0x08, 0x30); i(&mut d, 0x80, 2);
+            i(&mut d, 0x44, 600); i(&mut d, 0x24, 600); i(&mut d, 0x08, 0x31); i(&mut d, 0x80, 2);
+            i(&mut d, 0x44, 0); i(&mut d, 0x54, 0); i(&mut d, 0x64, 0);
+            d.push(0xc0);
+        }
+        i(&mut d, 0x04, 0x0d); i(&mut d, 0x74, 16); i(&mut d, 0x24, 0xffff); i(&mut d, 0x08, 0x56); i(&mut d, 0x80, 2);
+        i(&mut d, 0x74, 8); i(&mut d, 0x24, 127); i(&mut d, 0x08, 0x54); i(&mut d, 0x80, 2);
+        i(&mut d, 0x04, 0x09); i(&mut d, 0x08, 1); i(&mut d, 0x24, 1); i(&mut d, 0x74, 1); i(&mut d, 0x80, 2);
+        i(&mut d, 0x94, 7); i(&mut d, 0x80, 3);
+        d.push(0xc0);
+        d
+    }
+
+    /// One finger's bytes: flags, id, X, Y (device units: 0.1 mm).
+    fn finger(tip: bool, id: u8, x: u16, y: u16) -> Vec<u8> {
+        let mut v = vec![u8::from(tip) << 1 | 1, id];
+        v.extend_from_slice(&x.to_le_bytes());
+        v.extend_from_slice(&y.to_le_bytes());
+        v
+    }
+
+    #[test]
+    fn a_precision_touchpad_in_parallel_and_hybrid_mode() {
+        let mut d = dec(&ptp(2));
+        assert_eq!(d.descriptor().classes(), vec![Class::Touchpad]);
+        let (w, h) = d.pad_mm().unwrap();
+        assert!((w - 100.0).abs() < 0.01 && (h - 60.0).abs() < 0.01, "{w} x {h}");
+        // Parallel: both fingers in one report, count 2, button down.
+        let mut r = vec![1];
+        r.extend(finger(true, 3, 100, 200));
+        r.extend(finger(true, 4, 500, 200));
+        r.extend([0x10, 0x00, 2, 1]);
+        let ev = run(&mut d, &r);
+        let [Input::Touch { contacts, button: true }] = &ev[..] else { panic!("{ev:?}") };
+        assert_eq!(contacts.len(), 2);
+        assert_eq!((contacts[1].id, contacts[1].tip, contacts[1].confident), (4, true, true));
+        assert!((contacts[1].x - 50.0).abs() < 0.01 && (contacts[1].y - 20.0).abs() < 0.01);
+        // Hybrid on a one-finger-per-report pad: count 2, then the second.
+        let mut d = dec(&ptp(1));
+        let mut a = vec![1];
+        a.extend(finger(true, 1, 10, 10));
+        a.extend([0, 0, 2, 0]);
+        assert_eq!(run(&mut d, &a), vec![], "waits for the second contact");
+        let mut b = vec![1];
+        b.extend(finger(false, 2, 20, 20));
+        b.extend([0, 0, 0, 0]);
+        let ev = run(&mut d, &b);
+        let [Input::Touch { contacts, button: false }] = &ev[..] else { panic!("{ev:?}") };
+        assert_eq!(contacts.iter().map(|c| (c.id, c.tip)).collect::<Vec<_>>(), vec![(1, true), (2, false)]);
     }
 }

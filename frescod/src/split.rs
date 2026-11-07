@@ -968,20 +968,20 @@ fn event_record(r: &Renderer, ev: &DisplayEvent) -> Option<Msg> {
             }
             return Some(Msg::Scale { window: r.local_of(window_id)?, scale_milli });
         }
-        E::InputKey { window_id, hid_usage, pressed, modifiers, activation } => {
-            (window_id, Input::Key { usage: hid_usage, pressed, modifiers, activation })
+        E::InputKey { window_id, hid_usage, pressed, modifiers, activation, repeat } => {
+            (window_id, Input::Key { usage: hid_usage, pressed, modifiers, activation, repeat })
         }
         E::InputPointerMotion { window_id, x, y } => (window_id, Input::Motion { x, y }),
         E::InputPointerButton { window_id, x, y, button, pressed, modifiers, activation } => {
             (window_id, Input::Button { x, y, button, pressed, modifiers, activation })
         }
-        E::InputPointerScroll { window_id, dx, dy } => (window_id, Input::Scroll { dx, dy }),
+        E::InputPointerScroll { window_id, dx, dy, phase } => (window_id, Input::Scroll { dx, dy, phase }),
         _ => return None,
     };
     let ok = |v: f32| v.is_finite();
     match input {
         Input::Motion { x, y } | Input::Button { x, y, .. } if !(ok(x) && ok(y)) => return None,
-        Input::Scroll { dx, dy } if !(ok(dx) && ok(dy)) => return None,
+        Input::Scroll { dx, dy, .. } if !(ok(dx) && ok(dy)) => return None,
         _ => {}
     }
     Some(Msg::Input { window: r.local_of(global)?, input })

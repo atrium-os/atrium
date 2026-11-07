@@ -402,3 +402,9 @@ mod tests {
         assert_eq!(c.press(w - 10.0, h - 10.0), Some(Action::TogglePip));
     }
 }
+
+/// Keys whose action repeats while held: the arrows (step, volume) and
+/// j/l (step); toggles act once per press.
+pub fn repeats(hid_usage: u16) -> bool {
+    matches!(hid_usage, 0x4F..=0x52 | 0x0D | 0x0F)
+}

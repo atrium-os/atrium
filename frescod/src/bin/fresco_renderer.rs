@@ -651,14 +651,14 @@ fn from_broker(
             Msg::Input { input, .. } => {
                 let window_id = local;
                 let _ = events.send(match input {
-                    Input::Key { usage, pressed, modifiers, activation } => {
-                        DisplayEvent::InputKey { window_id, hid_usage: usage, pressed, modifiers, activation }
+                    Input::Key { usage, pressed, modifiers, activation, repeat } => {
+                        DisplayEvent::InputKey { window_id, hid_usage: usage, pressed, modifiers, activation, repeat }
                     }
                     Input::Motion { x, y } => DisplayEvent::InputPointerMotion { window_id, x, y },
                     Input::Button { x, y, button, pressed, modifiers, activation } => {
                         DisplayEvent::InputPointerButton { window_id, x, y, button, pressed, modifiers, activation }
                     }
-                    Input::Scroll { dx, dy } => DisplayEvent::InputPointerScroll { window_id, dx, dy },
+                    Input::Scroll { dx, dy, phase } => DisplayEvent::InputPointerScroll { window_id, dx, dy, phase },
                 });
             }
             Msg::DragOffer { format, .. } => {

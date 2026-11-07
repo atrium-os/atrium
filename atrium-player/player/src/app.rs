@@ -733,7 +733,9 @@ impl<H: Host> App<H> {
                 None
             }
             Event::PointerButton { x, y, button: 1, pressed: true, .. } => self.controls.press(x, y),
-            Event::Key { hid_usage, pressed: true, modifiers, .. } => self.controls.key(hid_usage, modifiers),
+            // A held key repeats only for steps and volume, not toggles.
+            Event::Key { hid_usage, pressed: true, modifiers, repeat, .. }
+                if !repeat || crate::controls::repeats(hid_usage) => self.controls.key(hid_usage, modifiers),
             _ => None,
         };
         match action {

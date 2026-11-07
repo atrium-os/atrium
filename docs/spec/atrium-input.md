@@ -463,9 +463,30 @@ zoomable views. The wire to apps stays HID-faithful.
    on each press and none on releases, one press for a held key, click
    with token, motion, scroll, a hot-plugged keyboard, and input again
    after tactusd restarts.
+   Key repeats (2026-11-07): `InputKeyEvent.repeat` on the app wire
+   (and fresco-split's KEY record); frescod sends a repeat only to the
+   window that got the press while it keeps the keyboard, never with a
+   token. Forum's toggles, snaps, workspace keys and media keys and the
+   player's toggles ignore repeats; Pergola text input takes them as
+   presses. VM check: a key held 1.5 s gives one press and ~30 repeats.
 3. **T3 Touchpads.** Precision Touchpad over hidbus, contact tracking,
    taps, scroll phases, gestures. QEMU has no multi-touch pad, so the
    replay source carries the tests, plus a laptop run.
+   **Built 2026-11-07** (host tests only so far: QEMU has no touchpad):
+   the parser keeps each field's collection and physical units;
+   `decode` turns Precision Touchpad reports (parallel and hybrid,
+   contact count, confidence, button) into frames of contacts in mm;
+   `touchpad` gives pointer motion with speed gain, one/two/three-finger
+   taps (primary/secondary/middle), clickpad clicks (secondary with
+   two fingers), palm (confidence) and typing rejection (fingers landing
+   within 300 ms of a key press), two-finger scroll with Begin/Update/End,
+   and recognises pinch and 3+ finger swipe. Scroll phases reach apps
+   (`InputPointerScrollEvent.phase`, `fresco_protocol::scroll_phase`),
+   content following the fingers, latched to the window the scroll
+   began over. Not yet: routing swipes and pinches to Forum and apps
+   (needs a gesture event on the app wire and a Forum design), setting
+   a pad's Input Mode feature report ourselves (today `hmt(4)` does it
+   when it attaches), the replay source, and a laptop run.
 4. **T4 PS/2.** atkbd scancodes and psm packets (plain, Synaptics,
    Elantech, ALPS, trackpoint pass-through). QEMU's i8042 gives the
    keyboard and plain mouse path.

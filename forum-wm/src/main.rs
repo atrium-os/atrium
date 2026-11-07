@@ -320,37 +320,39 @@ fn spawn_input_poller(core: Core) {
                         // a window-management gesture, not app text input.
                         Ok(Some(Event::Key { hid_usage: KEY_TAB, pressed: true, modifiers, .. }))
                             if modifiers & MOD_GUI != 0 => cycle = true,
+                        // (Held keys repeat: Super+Tab keeps cycling, but toggles,
+                        // snaps, workspace moves and media keys act once per press.)
                         // Super+S: toggle split (tiled) layout for the active workspace.
-                        Ok(Some(Event::Key { hid_usage: KEY_S, pressed: true, modifiers, .. }))
+                        Ok(Some(Event::Key { hid_usage: KEY_S, pressed: true, repeat: false, modifiers, .. }))
                             if modifiers & MOD_GUI != 0 => split = true,
                         // Super+F: toggle zoom (fullscreen) for the focused surface.
-                        Ok(Some(Event::Key { hid_usage: KEY_F, pressed: true, modifiers, .. }))
+                        Ok(Some(Event::Key { hid_usage: KEY_F, pressed: true, repeat: false, modifiers, .. }))
                             if modifiers & MOD_GUI != 0 => zoom = true,
                         // Super+Left / Right: snap the focused document to a half.
                         // Super+Shift+Right: send the focused window to the next monitor
                         // (must precede the plain Super+Right snap arm).
-                        Ok(Some(Event::Key { hid_usage: KEY_RIGHT, pressed: true, modifiers, .. }))
+                        Ok(Some(Event::Key { hid_usage: KEY_RIGHT, pressed: true, repeat: false, modifiers, .. }))
                             if modifiers & MOD_GUI != 0 && modifiers & MOD_SHIFT != 0 => next_monitor = true,
-                        Ok(Some(Event::Key { hid_usage: KEY_LEFT, pressed: true, modifiers, .. }))
+                        Ok(Some(Event::Key { hid_usage: KEY_LEFT, pressed: true, repeat: false, modifiers, .. }))
                             if modifiers & MOD_GUI != 0 => snap_dir = Some(Snap::Left),
-                        Ok(Some(Event::Key { hid_usage: KEY_RIGHT, pressed: true, modifiers, .. }))
+                        Ok(Some(Event::Key { hid_usage: KEY_RIGHT, pressed: true, repeat: false, modifiers, .. }))
                             if modifiers & MOD_GUI != 0 => snap_dir = Some(Snap::Right),
                         // Super+Up: un-snap the focused document.
-                        Ok(Some(Event::Key { hid_usage: KEY_UP, pressed: true, modifiers, .. }))
+                        Ok(Some(Event::Key { hid_usage: KEY_UP, pressed: true, repeat: false, modifiers, .. }))
                             if modifiers & MOD_GUI != 0 => unsnap = true,
                         // Super+Shift+1..N: MOVE the focused window to workspace N
                         // (must precede the plain Super+N arm, which it also matches).
-                        Ok(Some(Event::Key { hid_usage, pressed: true, modifiers, .. }))
+                        Ok(Some(Event::Key { hid_usage, pressed: true, repeat: false, modifiers, .. }))
                             if modifiers & MOD_GUI != 0 && modifiers & MOD_SHIFT != 0
                                 && hid_usage >= KEY_1 && hid_usage < KEY_1 + 9 =>
                             move_ws = Some((hid_usage - KEY_1) as usize),
                         // Super+1..N: switch the active workspace.
-                        Ok(Some(Event::Key { hid_usage, pressed: true, modifiers, .. }))
+                        Ok(Some(Event::Key { hid_usage, pressed: true, repeat: false, modifiers, .. }))
                             if modifiers & MOD_GUI != 0 && modifiers & MOD_SHIFT == 0
                                 && hid_usage >= KEY_1 && hid_usage < KEY_1 + 9 =>
                             switch_ws = Some((hid_usage - KEY_1) as usize),
                         // A media key: never the focused app's (§4.3).
-                        Ok(Some(Event::Key { hid_usage, pressed: true, .. }))
+                        Ok(Some(Event::Key { hid_usage, pressed: true, repeat: false, .. }))
                             if forum_wm::media::action(hid_usage).is_some() =>
                             media_keys.extend(forum_wm::media::action(hid_usage)),
                         // A volume key: choragusd's master level.

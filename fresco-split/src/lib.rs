@@ -67,10 +67,11 @@ impl Role {
 pub enum Input {
     /// `activation`: the press's token (docs/spec/tabula.md §2), passed on
     /// to the client as is; zero on releases.
-    Key { usage: u16, pressed: bool, modifiers: u8, activation: [u8; 16] },
+    Key { usage: u16, pressed: bool, modifiers: u8, activation: [u8; 16], repeat: bool },
     Motion { x: f32, y: f32 },
     Button { x: f32, y: f32, button: u8, pressed: bool, modifiers: u8, activation: [u8; 16] },
-    Scroll { dx: f32, dy: f32 },
+    /// `phase`: fresco_protocol::scroll_phase.
+    Scroll { dx: f32, dy: f32, phase: u8 },
 }
 
 /// One record.
@@ -362,11 +363,12 @@ impl Msg {
                 r
             }
             Msg::Input { window, input } => match *input {
-                Input::Key { usage, pressed, modifiers, activation } => {
+                Input::Key { usage, pressed, modifiers, activation, repeat } => {
                     let mut r = Rec::new(KEY, *window);
                     r.put(2, usage as u32);
                     r.put(3, pressed as u32);
                     r.put(4, modifiers as u32);
+                    r.put(5, repeat as u32);
                     r.0[32..48].copy_from_slice(&activation);
                     r
                 }
@@ -386,10 +388,11 @@ impl Msg {
                     r.0[32..48].copy_from_slice(&activation);
                     r
                 }
-                Input::Scroll { dx, dy } => {
+                Input::Scroll { dx, dy, phase } => {
                     let mut r = Rec::new(SCROLL, *window);
                     r.put(2, dx.to_bits());
                     r.put(3, dy.to_bits());
+                    r.put(4, phase as u32);
                     r
                 }
             },
@@ -538,10 +541,11 @@ impl Msg {
             WINDOW_CREATE => (6, true),
             WINDOW_TITLE => (0, true),
             WINDOW_DESTROY | CLOSE => (0, false),
-            FRAME_READY | GEOMETRY | MOTION | SCROLL => (2, false),
+            FRAME_READY | GEOMETRY | MOTION => (2, false),
+            SCROLL => (3, false),
             SLOTS | FRAME_DONE | SCALE => (1, false),
             FOCUS => (2, false),
-            KEY => (3, false),
+            KEY => (4, false), // usage, pressed, modifiers, repeat
             CLIENT => (4, false),
             BUTTON => (5, false),
             DRAG_FORMAT | DRAG_OFFER => (0, true),
@@ -623,7 +627,7 @@ impl Msg {
                 let usage = u16::try_from(r.get(2)).map_err(|_| Refused("key usage"))?;
                 let modifiers = u8::try_from(r.get(4)).map_err(|_| Refused("modifiers"))?;
                 let activation = r.0[32..48].try_into().unwrap();
-                Msg::Input { window, input: Input::Key { usage, pressed: flag(r.get(3))?, modifiers, activation } }
+                Msg::Input { window, input: Input::Key { usage, pressed: flag(r.get(3))?, modifiers, activation, repeat: flag(r.get(5))? } }
             }
             MOTION => Msg::Input { window, input: Input::Motion { x: finite(r.get(2))?, y: finite(r.get(3))? } },
             BUTTON => {
@@ -635,7 +639,10 @@ impl Msg {
                     input: Input::Button { x: finite(r.get(2))?, y: finite(r.get(3))?, button, pressed: flag(r.get(5))?, modifiers, activation },
                 }
             }
-            SCROLL => Msg::Input { window, input: Input::Scroll { dx: finite(r.get(2))?, dy: finite(r.get(3))? } },
+            SCROLL => {
+                let phase = u8::try_from(r.get(4)).ok().filter(|p| *p <= 3).ok_or(Refused("scroll phase"))?;
+                Msg::Input { window, input: Input::Scroll { dx: finite(r.get(2))?, dy: finite(r.get(3))?, phase } }
+            }
             DRAG_FORMAT | DRAG_OFFER => {
                 if title.is_empty() || !title.bytes().all(|b| (0x21..0x7f).contains(&b)) {
                     return Err(Refused("a format must be printable ASCII"));

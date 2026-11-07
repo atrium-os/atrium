@@ -30,14 +30,20 @@ use tactus::decode::{Decoder, Input};
 use tactus::hid::Descriptor;
 use tactus::pointer::{Curve, Stage};
 use tactus::repeat::{Repeat, Settings};
+use tactus::touchpad::{Out as TouchOut, Settings as TouchSettings, Touchpad};
 use tactus::wire::{self, Bus, Message};
 
 const DEFAULT_SOCKET: &str = "/atrium/sockets/tactus/tactus.sock";
 const MAX_HIDRAW: u32 = 64;
+/// Touchpad fingers landing this soon after a key press are ignored.
+const TYPING: Duration = Duration::from_millis(300);
 /// _frescod, the one client in production.
 const FRESCOD_UID: u32 = 65010;
 
 struct State {
+    /// The last key press, from any keyboard: touchpad fingers landing
+    /// soon after it are palms (the typing hand), not pointing.
+    last_key: Option<Instant>,
     clients: Vec<UnixStream>,
     devices: HashMap<u32, Message>,
     repeat: Repeat,
@@ -196,6 +202,7 @@ fn scan(hub: &Arc<Hub>, devs: &Arc<Mutex<Devices>>) {
 
 fn read_device(hub: &Hub, id: u32, mut file: File, mut dec: Decoder) {
     let mut stage = Stage::new(hub.curve);
+    let mut pad = Touchpad::new(TouchSettings::default());
     let mut buf = vec![0u8; 65536];
     let mut ev = Vec::new();
     loop {
@@ -215,7 +222,28 @@ fn read_device(hub: &Hub, id: u32, mut file: File, mut dec: Decoder) {
             let m = match e {
                 Input::Key { usage, down } => {
                     s.repeat.key(id, usage, down, now);
+                    if down {
+                        s.last_key = Some(now);
+                    }
                     Message::Key { id, ts_ns, usage, down, repeat: false }
+                }
+                Input::Touch { contacts, button } => {
+                    let typing = s.last_key.is_some_and(|t| now.saturating_duration_since(t) < TYPING);
+                    let mut out = Vec::new();
+                    pad.frame(now, &contacts, button, typing, &mut out);
+                    for o in out {
+                        s.send(&match o {
+                            TouchOut::Motion { dx, dy } => {
+                                Message::Motion { id, ts_ns, dx, dy, raw_dx: dx.round() as i32, raw_dy: dy.round() as i32 }
+                            }
+                            TouchOut::Button { button, down } => Message::Button { id, ts_ns, usage: 0x0009_0000 | u32::from(button), down },
+                            TouchOut::Scroll { dx, dy, phase } => Message::ScrollPixels { id, ts_ns, dx, dy, phase },
+                            TouchOut::Gesture { kind, fingers, phase, dx, dy, scale } => {
+                                Message::Gesture { id, ts_ns, kind, fingers, phase, dx, dy, scale }
+                            }
+                        });
+                    }
+                    continue;
                 }
                 Input::Button { usage, down } => Message::Button { id, ts_ns, usage, down },
                 Input::Motion { dx, dy } => {
@@ -345,7 +373,7 @@ fn main() {
         }
     };
     let hub = Arc::new(Hub {
-        state: Mutex::new(State { clients: Vec::new(), devices: HashMap::new(), repeat: Repeat::new(Settings::from_env()) }),
+        state: Mutex::new(State { last_key: None, clients: Vec::new(), devices: HashMap::new(), repeat: Repeat::new(Settings::from_env()) }),
         wake: Condvar::new(),
         curve: Curve::from_env(),
     });

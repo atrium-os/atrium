@@ -78,9 +78,38 @@ pub struct Field {
     pub usage_max: Usage,
     pub logical_min: i32,
     pub logical_max: i32,
+    /// Physical range (equal to the logical range when the descriptor
+    /// gives none) and its unit, for sizes in millimetres.
+    pub physical_min: i32,
+    pub physical_max: i32,
+    pub unit: u32,
+    pub unit_exponent: i32,
+    /// The innermost collection the field sits in (a number unique in
+    /// the descriptor; 0 for the application itself) and its usage: a
+    /// touchpad's Finger collections group each contact's fields.
+    pub collection: u32,
+    pub collection_usage: Usage,
 }
 
 impl Field {
+    /// Millimetres per logical unit, when the field has a length unit
+    /// (centimetres or inches, as HID allows).
+    pub fn mm_per_unit(&self) -> Option<f32> {
+        let span = (self.logical_max - self.logical_min) as f32;
+        let phys = (self.physical_max - self.physical_min) as f32;
+        if span <= 0.0 || phys <= 0.0 {
+            return None;
+        }
+        // Unit: nibble 0 system (1 SI linear: cm, 3 English linear: inch),
+        // nibble 1 length exponent (1).
+        let per = match (self.unit & 0xf, self.unit >> 4 & 0xf) {
+            (1, 1) => 10.0,
+            (3, 1) => 25.4,
+            _ => return None,
+        };
+        Some(phys / span * per * 10f32.powi(self.unit_exponent))
+    }
+
     /// The usage of value `k` of a variable field.
     pub fn usage_at(&self, k: u32) -> Option<Usage> {
         if !self.usages.is_empty() {
@@ -140,6 +169,10 @@ pub struct Descriptor {
 struct Globals {
     page: u16,
     logical_min: i32,
+    physical_min: i32,
+    physical_max: Option<i32>,
+    unit: u32,
+    unit_exponent: i32,
     /// Raw logical maximum and its byte count: read signed or unsigned
     /// at the main item, once the minimum is known.
     logical_max: (u32, usize),
@@ -175,6 +208,9 @@ impl Descriptor {
         let mut at: HashMap<u8, u32> = HashMap::new();
         let mut depth = 0u32;
         let mut app: Option<usize> = None;
+        // Collections opened so far, and the open ones (number, usage).
+        let mut colls = 0u32;
+        let mut coll_stack: Vec<(u32, Usage)> = Vec::new();
         let mut out = Descriptor::default();
         let mut i = 0;
         while i < desc.len() {
@@ -195,6 +231,14 @@ impl Descriptor {
                 (1, 0) => g.page = u as u16,
                 (1, 1) => g.logical_min = signed(data),
                 (1, 2) => g.logical_max = (u, n),
+                (1, 3) => g.physical_min = signed(data),
+                (1, 4) => g.physical_max = Some(signed(data)),
+                (1, 5) => {
+                    // A 4-bit two's-complement exponent.
+                    let e = (u & 0xf) as i32;
+                    g.unit_exponent = if e > 7 { e - 16 } else { e };
+                }
+                (1, 6) => g.unit = u,
                 (1, 7) => g.size = u,
                 (1, 8) => {
                     g.report_id = u as u8;
@@ -217,6 +261,8 @@ impl Descriptor {
                 (2, 2) => umax = Some(with_page(u)),
                 (0, 10) => {
                     // Collection.
+                    colls += 1;
+                    coll_stack.push((colls, usages.first().copied().unwrap_or(0)));
                     if depth == 0 && data.first().copied().unwrap_or(0) == 1 {
                         let usage = usages.first().copied().unwrap_or(0);
                         out.apps.push(App { usage, class: Class::of(usage) });
@@ -228,6 +274,7 @@ impl Descriptor {
                     }
                 }
                 (0, 12) => {
+                    coll_stack.pop();
                     depth = depth.saturating_sub(1);
                     if depth == 0 {
                         app = None;
@@ -263,6 +310,12 @@ impl Descriptor {
                                 usage_max: umax.unwrap_or(0),
                                 logical_min: g.logical_min,
                                 logical_max,
+                                physical_min: if g.physical_max.is_some() { g.physical_min } else { g.logical_min },
+                                physical_max: g.physical_max.filter(|_| g.physical_min != 0 || g.physical_max != Some(0)).unwrap_or(logical_max),
+                                unit: g.unit,
+                                unit_exponent: g.unit_exponent,
+                                collection: if coll_stack.len() > 1 { coll_stack.last().unwrap().0 } else { 0 },
+                                collection_usage: coll_stack.last().map(|c| c.1).unwrap_or(0),
                             });
                         }
                     }

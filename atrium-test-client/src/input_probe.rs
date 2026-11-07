@@ -26,14 +26,15 @@ fn main() -> std::io::Result<()> {
     while Instant::now() < end {
         let Some(ev) = conn.wait_event(Some(Duration::from_millis(500)))? else { continue };
         match ev {
-            Event::Key { window_id, hid_usage, pressed, modifiers, activation } => {
-                println!("key window={window_id} usage=0x{hid_usage:04x} pressed={} mods={modifiers} {}", pressed as u8, tok(&activation))
+            Event::Key { window_id, hid_usage, pressed, modifiers, activation, repeat } => {
+                let r = if repeat { " repeat" } else { "" };
+                println!("key window={window_id} usage=0x{hid_usage:04x} pressed={} mods={modifiers} {}{r}", pressed as u8, tok(&activation))
             }
             Event::PointerButton { window_id, button, pressed, activation, .. } => {
                 println!("button window={window_id} button={button} pressed={} {}", pressed as u8, tok(&activation))
             }
             Event::PointerMotion { window_id, x, y } => println!("motion window={window_id} x={x:.0} y={y:.0}"),
-            Event::PointerScroll { window_id, dx, dy } => println!("scroll window={window_id} dx={dx} dy={dy}"),
+            Event::PointerScroll { window_id, dx, dy, phase } => println!("scroll window={window_id} dx={dx} dy={dy} phase={phase}"),
             _ => {}
         }
         use std::io::Write;
