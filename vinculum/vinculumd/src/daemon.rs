@@ -392,7 +392,8 @@ impl Daemon {
                 // The pairing user is the agent that confirmed it; with
                 // several agents, the first.
                 let uid = self.clients.iter().find(|c| c.agent).map_or(getuid(), |c| c.uid);
-                let rec = Bond::from_pairing(&bond, keys_addr(a), uid, &name);
+                let classic = self.host.transport(handle) == Some(vinculum_host::Transport::BrEdr);
+                let rec = Bond::from_pairing(&bond, keys_addr(a), classic, uid, &name);
                 let old = self.bonds.iter().position(|(_, x)| {
                     vinculum_keys::find([x], &rec.address).is_some() || (x.identity.is_some() && x.identity == rec.identity)
                 });
@@ -437,6 +438,16 @@ impl Daemon {
                     self.broadcast(&Event::Error { why: format!("{a}: encryption with the stored bond failed ({status}); pair it again") });
                 }
                 self.host.disconnect(handle, now);
+            }
+            HostEvent::ConnectionRequest { peer: p, .. } => {
+                // A Classic device paging us: only bonded devices get a
+                // link, and it is authenticated by us before use (§7).
+                let bonded = self.bond_for(addr(p)).is_some_and(|k| self.bonds[k].1.classic);
+                if bonded {
+                    self.host.accept_connection(p, now);
+                } else {
+                    self.host.reject_connection(p, now);
+                }
             }
             HostEvent::SecurityRequest { handle, .. } => {
                 let Some(&a) = self.conns.get(&handle) else { return };

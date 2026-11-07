@@ -13,6 +13,7 @@
 #![forbid(unsafe_code)]
 
 pub mod acl;
+mod classic;
 pub mod cmd;
 mod security;
 pub mod testing;
@@ -128,6 +129,9 @@ pub enum HostEvent {
     /// The peripheral asks the central to secure the link (SMP Security
     /// Request); the caller decides between `encrypt` and `pair`.
     SecurityRequest { handle: u16, auth_req: u8 },
+    /// A Classic device asks to connect; answer with `accept_connection`
+    /// or `reject_connection` (the daemon accepts bonded devices only).
+    ConnectionRequest { peer: Peer, class_of_device: u32 },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -142,6 +146,8 @@ enum Step {
     LeReadBufferSizeV1,
     SetEventMask,
     LeSetEventMask,
+    WriteSimplePairingMode,
+    WriteScHostSupport,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -152,8 +158,11 @@ enum Tag {
     /// Issued by policy (rejects, disconnects of misbehaving links);
     /// failures are logged only.
     Policy,
-    /// LE Start Encryption on a connection.
+    /// LE Start Encryption, or Classic Authentication Requested / Set
+    /// Connection Encryption, on a connection.
     Encrypt(u16),
+    /// Read Encryption Key Size on a Classic connection.
+    KeySize(u16),
 }
 
 #[derive(Debug)]
@@ -167,6 +176,7 @@ struct Connection {
     /// LE Start Encryption sent, Encryption Change not yet seen.
     encrypting: bool,
     encrypted: bool,
+    classic: Option<classic::ClassicSec>,
 }
 
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
@@ -194,9 +204,11 @@ pub struct Host {
     stats: Stats,
 }
 
-/// Event mask: the spec default plus Encryption Key Refresh (bit 47) and
-/// LE Meta (bit 61).
-const EVENT_MASK: u64 = 0x0000_1FFF_FFFF_FFFF | (1 << 47) | (1 << 61);
+/// Event mask: the spec default plus Encryption Key Refresh (bit 47), the
+/// Secure Simple Pairing events (IO Capability Request/Response, User
+/// Confirmation/Passkey Request, Remote OOB, Simple Pairing Complete: bits
+/// 48–53; User Passkey Notification: bit 58) and LE Meta (bit 61).
+const EVENT_MASK: u64 = 0x0000_1FFF_FFFF_FFFF | (1 << 47) | (0x3F << 48) | (1 << 58) | (1 << 61);
 /// LE event mask: connection complete, advertising report, connection
 /// update, remote features, LTK request, remote connection parameter request,
 /// data length change, enhanced connection complete, extended advertising
@@ -258,6 +270,11 @@ impl Host {
 
     pub fn connections(&self) -> usize {
         self.conns.len()
+    }
+
+    /// The transport of a connection.
+    pub fn transport(&self, handle: u16) -> Option<Transport> {
+        self.conns.get(&handle).map(|c| c.transport)
     }
 
     /// The peer on a connection.
@@ -438,11 +455,19 @@ impl Host {
                 }
             }
             EventChild::ConnectionRequest(r) => {
-                // No bonds yet (B2), so no Classic peer may connect (spec §7).
-                self.issue(
-                    to_cmd(hci::RejectConnectionRequest { bd_addr: r.bd_addr, reason: hci::RejectConnectionReason::SecurityReasons }),
-                    Tag::Policy,
-                );
+                if r.link_type != hci::ConnectionRequestLinkType::Acl {
+                    // No SCO/eSCO before HFP (B5).
+                    self.issue(
+                        to_cmd(hci::RejectConnectionRequest {
+                            bd_addr: r.bd_addr,
+                            reason: hci::RejectConnectionReason::LimitedResources,
+                        }),
+                        Tag::Policy,
+                    );
+                } else {
+                    let peer = Peer::from_hci(r.bd_addr, hci::AddressType::PublicDeviceAddress);
+                    self.out_events.push_back(HostEvent::ConnectionRequest { peer, class_of_device: r.class_of_device });
+                }
             }
             EventChild::ConnectionComplete(c) => {
                 let peer = Peer::from_hci(c.bd_addr, hci::AddressType::PublicDeviceAddress);
@@ -453,16 +478,24 @@ impl Host {
                 }
             }
             EventChild::EncryptionChange(e) => {
-                let on = e.encryption_enabled != hci::EncryptionEnabled::Off;
-                self.on_encryption_change(e.connection_handle, e.status, on, None)
+                if self.is_classic(e.connection_handle) {
+                    self.on_classic_encryption_change(e.connection_handle, e.status, e.encryption_enabled)
+                } else {
+                    let on = e.encryption_enabled != hci::EncryptionEnabled::Off;
+                    self.on_encryption_change(e.connection_handle, e.status, on, None)
+                }
             }
             EventChild::EncryptionChangeV2(e) => {
-                let on = e.encryption_enabled != hci::EncryptionEnabled::Off;
-                self.on_encryption_change(e.connection_handle, e.status, on, Some(e.key_size))
+                if self.is_classic(e.connection_handle) {
+                    self.on_classic_encryption_change(e.connection_handle, e.status, e.encryption_enabled)
+                } else {
+                    let on = e.encryption_enabled != hci::EncryptionEnabled::Off;
+                    self.on_encryption_change(e.connection_handle, e.status, on, Some(e.key_size))
+                }
             }
             EventChild::LeMetaEvent(m) => self.on_le_meta(m),
             EventChild::HardwareError(h) => self.fatal(format!("controller hardware error 0x{:02x}", h.hardware_code)),
-            _ => {}
+            other => self.on_classic_event(other),
         }
     }
 
@@ -547,6 +580,7 @@ impl Host {
                 smp: None,
                 encrypting: false,
                 encrypted: false,
+                classic: None,
             },
         );
         self.out_events.push_back(HostEvent::Connected { handle, peer, transport, central });
@@ -685,8 +719,16 @@ impl Host {
             Tag::Policy => {}
             Tag::Encrypt(handle) => {
                 if status != hci::ErrorCode::Success {
-                    self.on_encryption_change(handle, status, false, None);
+                    if self.is_classic(handle) {
+                        self.classic_fail(handle, &format!("{op:?} failed: {status:?}"));
+                    } else {
+                        self.on_encryption_change(handle, status, false, None);
+                    }
                 }
+            }
+            Tag::KeySize(handle) => {
+                let size = cc.and_then(|cc| hci::ReadEncryptionKeySizeComplete::try_from(cc).ok()).map_or(0, |r| r.key_size);
+                self.on_key_size(handle, status, size);
             }
             Tag::Init(step) => self.init_step(step, status, cc),
         }
@@ -698,6 +740,11 @@ impl Host {
         if step == LeReadBufferSizeV2 && status != hci::ErrorCode::Success {
             self.issue(to_cmd(hci::LeReadBufferSizeV1 {}), Tag::Init(LeReadBufferSizeV1));
             return;
+        }
+        // BR/EDR security setup is optional: without it Classic pairing
+        // fails (and policy refuses non-SC keys anyway); LE still works.
+        if matches!(step, WriteSimplePairingMode | WriteScHostSupport) && status != hci::ErrorCode::Success {
+            return self.finish_bring_up();
         }
         if status != hci::ErrorCode::Success {
             self.fatal(format!("bring-up {step:?}: {status:?}"));
@@ -766,18 +813,35 @@ impl Host {
                 Err(_) => return self.fatal(bad("LE buffer size")),
             },
             SetEventMask => Some((to_cmd(hci::LeSetEventMask { le_event_mask: LE_EVENT_MASK }), LeSetEventMask)),
+            // BR/EDR: Secure Simple Pairing with Secure Connections. An
+            // LE-only controller (LMP feature bit 37, "BR/EDR not
+            // supported") skips these.
+            LeSetEventMask if self.info.lmp_features & (1 << 37) == 0 => {
+                Some((to_cmd(hci::WriteSimplePairingMode { simple_pairing_mode: hci::Enable::Enabled }), WriteSimplePairingMode))
+            }
             LeSetEventMask => None,
+            WriteSimplePairingMode => Some((
+                to_cmd(hci::WriteSecureConnectionsHostSupport { secure_connections_host_support: hci::Enable::Enabled }),
+                WriteScHostSupport,
+            )),
+            WriteScHostSupport => None,
         };
         match next {
             Some((c, s)) => self.issue(c, Tag::Init(s)),
-            None => {
-                if self.info.acl_buffers == 0 && self.info.le_buffers == 0 {
-                    return self.fatal("controller reports no ACL buffers".into());
-                }
-                self.credits = Credits::new(self.info.acl_buffers, self.info.le_buffers);
-                self.ready = true;
-                self.out_events.push_back(HostEvent::Ready(self.info.clone()));
-            }
+            None => self.finish_bring_up(),
         }
+    }
+
+    fn finish_bring_up(&mut self) {
+        if self.info.acl_buffers == 0 && self.info.le_buffers == 0 {
+            return self.fatal("controller reports no ACL buffers".into());
+        }
+        self.credits = Credits::new(self.info.acl_buffers, self.info.le_buffers);
+        self.ready = true;
+        self.out_events.push_back(HostEvent::Ready(self.info.clone()));
+    }
+
+    fn is_classic(&self, handle: u16) -> bool {
+        self.conns.get(&handle).is_some_and(|c| c.transport == Transport::BrEdr)
     }
 }

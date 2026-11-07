@@ -61,8 +61,13 @@ async def main(transport: str, name: str, seconds: float, iocap: str, passkey_fi
         device = Device.with_hci(name, Address("F0:F1:F2:F3:F4:F5"), source, sink)
         delegate = Delegate(IOCAPS[iocap], passkey_file)
         device.pairing_config_factory = lambda _c: PairingConfig(sc=True, mitm=True, bonding=True, delegate=delegate)
+        # Classic too (page scan, SSP with Secure Connections), so the
+        # BR/EDR scenarios can connect to the same peer by address.
+        device.classic_enabled = True
         await device.power_on()
         device.keystore = MemoryKeyStore()
+        await device.set_connectable(True)
+        print(f"classic address {device.public_address.to_string(with_type_qualifier=False)}", flush=True)
 
         @device.on("connection")
         def on_connection(conn):

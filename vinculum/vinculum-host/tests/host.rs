@@ -61,17 +61,19 @@ fn command_timeout_is_fatal() {
 }
 
 #[test]
-fn classic_connection_requests_are_refused() {
+fn classic_connection_requests_go_to_the_caller_and_sco_is_refused() {
     let mut h = ready_host(3);
-    h.on_frame(
-        event(hci::ConnectionRequest {
-            bd_addr: hci::Address::try_from(1u64).unwrap(),
-            class_of_device: 0x002540, // keyboard
-            link_type: hci::ConnectionRequestLinkType::Acl,
-        }),
-        0,
-    );
+    let req = |link_type| {
+        event(hci::ConnectionRequest { bd_addr: hci::Address::try_from(1u64).unwrap(), class_of_device: 0x002540, link_type })
+    };
+    h.on_frame(req(hci::ConnectionRequestLinkType::Acl), 0);
+    assert!(sent_ops(&mut h).is_empty(), "nothing accepted on its own");
+    let Some(HostEvent::ConnectionRequest { peer, class_of_device: 0x002540 }) = h.poll_event() else { panic!("no request event") };
+    h.reject_connection(peer, 0);
     assert_eq!(sent_ops(&mut h), vec![OpCode::RejectConnectionRequest]);
+    h.on_frame(vinculum_host::testing::status(OpCode::RejectConnectionRequest, ErrorCode::Success), 0);
+    h.on_frame(req(hci::ConnectionRequestLinkType::Sco), 0);
+    assert_eq!(sent_ops(&mut h), vec![OpCode::RejectConnectionRequest], "no SCO before HFP");
 }
 
 #[test]

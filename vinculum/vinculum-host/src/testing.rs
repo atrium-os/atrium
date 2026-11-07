@@ -85,6 +85,10 @@ pub fn answer(cmd: &Frame, le_buffers: u8) -> Option<Frame> {
         }),
         OpCode::SetEventMask => complete(hci::SetEventMaskComplete { status: ok, num_hci_command_packets: 1 }),
         OpCode::LeSetEventMask => complete(hci::LeSetEventMaskComplete { status: ok, num_hci_command_packets: 1 }),
+        OpCode::WriteSimplePairingMode => complete(hci::WriteSimplePairingModeComplete { status: ok, num_hci_command_packets: 1 }),
+        OpCode::WriteSecureConnectionsHostSupport => {
+            complete(hci::WriteSecureConnectionsHostSupportComplete { status: ok, num_hci_command_packets: 1 })
+        }
         _ => return None,
     })
 }

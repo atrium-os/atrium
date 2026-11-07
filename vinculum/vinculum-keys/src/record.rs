@@ -4,7 +4,7 @@
 //!
 //! ```text
 //! u8 version (1) | u8 flags (bit 0 SC, bit 1 authenticated, bit 2 has IRK,
-//!                  bit 3 has identity) | u8 key_size
+//!                  bit 3 has identity, bit 4 BR/EDR) | u8 key_size
 //! u8 addr_type | addr[6]                      address paired from
 //! u8 id_type | id[6]                          identity address (zero if none)
 //! ltk[16] | irk[16]                           irk zero if none
@@ -55,6 +55,8 @@ impl std::fmt::Display for Address {
 #[derive(Clone, PartialEq, Eq)]
 pub struct Bond {
     pub address: Address,
+    /// A BR/EDR (Classic) bond: `ltk` holds the link key.
+    pub classic: bool,
     pub identity: Option<Address>,
     pub ltk: [u8; 16],
     pub key_size: u8,
@@ -71,6 +73,7 @@ impl std::fmt::Debug for Bond {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Bond")
             .field("address", &self.address)
+            .field("classic", &self.classic)
             .field("identity", &self.identity)
             .field("ltk", &"<redacted>")
             .field("key_size", &self.key_size)
@@ -97,13 +100,14 @@ pub struct DecodeError(pub &'static str);
 
 impl Bond {
     /// The record for a finished pairing with the peer at `address`.
-    pub fn from_pairing(p: &vinculum_smp::pairing::Bond, address: Address, paired_by: u32, name: &str) -> Bond {
+    pub fn from_pairing(p: &vinculum_smp::pairing::Bond, address: Address, classic: bool, paired_by: u32, name: &str) -> Bond {
         let mut name = name.to_string();
         while name.len() > MAX_NAME {
             name.pop();
         }
         Bond {
             address,
+            classic,
             identity: p.peer_identity.map(|(kind, bytes)| Address { kind, bytes }),
             ltk: p.ltk,
             key_size: p.key_size,
@@ -132,7 +136,8 @@ impl Bond {
         let flags = self.secure_connections as u8
             | (self.authenticated as u8) << 1
             | (self.peer_irk.is_some() as u8) << 2
-            | (self.identity.is_some() as u8) << 3;
+            | (self.identity.is_some() as u8) << 3
+            | (self.classic as u8) << 4;
         v.extend_from_slice(&[VERSION, flags, self.key_size, self.address.kind]);
         v.extend_from_slice(&self.address.bytes);
         let id = self.identity.unwrap_or(Address { kind: 0, bytes: [0; 6] });
@@ -155,7 +160,7 @@ impl Bond {
             return Err(DecodeError("unknown record version"));
         }
         let flags = b[1];
-        if flags & !0x0F != 0 {
+        if flags & !0x1F != 0 {
             return Err(DecodeError("unknown flags"));
         }
         let addr = |o: usize| -> Result<Address, DecodeError> {
@@ -180,6 +185,7 @@ impl Bond {
         }
         Ok(Bond {
             address,
+            classic: flags & 0x10 != 0,
             identity,
             ltk,
             key_size,

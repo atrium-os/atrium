@@ -6,6 +6,7 @@ use vinculum_smp::crypto::ah;
 fn bond(n: u8) -> Bond {
     Bond {
         address: Address { kind: 1, bytes: [n, 2, 3, 4, 5, 0xC6] },
+        classic: n == 3,
         identity: Some(Address { kind: 0, bytes: [n, 9, 9, 9, 9, 9] }),
         ltk: [n; 16],
         key_size: 16,

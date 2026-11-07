@@ -210,3 +210,118 @@ fn disconnect_waits_for_queued_data() {
     h.tick(DISCONNECT_DRAIN_MS);
     assert_eq!(drain(&mut h).0, vec![OpCode::Disconnect]);
 }
+
+// ---- BR/EDR ---------------------------------------------------------------
+
+const BD: u64 = 0x0000_A1A2_A3A4_A5A6;
+
+fn bd() -> hci::Address {
+    hci::Address::try_from(BD).unwrap()
+}
+
+fn classic_host() -> Host {
+    let mut h = ready_host(4);
+    h.on_frame(
+        event(hci::ConnectionComplete {
+            status: ErrorCode::Success,
+            connection_handle: 7,
+            bd_addr: bd(),
+            link_type: hci::LinkType::Acl,
+            encryption_enabled: hci::Enable::Disabled,
+        }),
+        0,
+    );
+    events(&mut h);
+    drain(&mut h);
+    h
+}
+
+fn ok(h: &mut Host, op: OpCode) {
+    h.on_frame(status(op, ErrorCode::Success), 0);
+}
+
+fn auth_complete(h: &mut Host) {
+    h.on_frame(event(hci::AuthenticationComplete { status: ErrorCode::Success, connection_handle: 7 }), 0);
+}
+
+#[test]
+fn classic_pairing_refuses_legacy_keys() {
+    let mut h = classic_host();
+    h.pair(7, cfg(), 0).unwrap();
+    assert_eq!(drain(&mut h).0, vec![OpCode::AuthenticationRequested]);
+    ok(&mut h, OpCode::AuthenticationRequested);
+    h.on_frame(event(hci::LinkKeyRequest { bd_addr: bd() }), 0);
+    assert_eq!(drain(&mut h).0, vec![OpCode::LinkKeyRequestNegativeReply], "no key yet");
+    h.on_frame(vinculum_host::testing::complete(hci::LinkKeyRequestNegativeReplyComplete { status: ErrorCode::Success, bd_addr: bd(), num_hci_command_packets: 1 }), 0);
+    h.on_frame(event(hci::IoCapabilityRequest { bd_addr: bd() }), 0);
+    assert_eq!(drain(&mut h).0, vec![OpCode::IoCapabilityRequestReply]);
+    h.on_frame(
+        event(hci::LinkKeyNotification { bd_addr: bd(), link_key: [9; 16], key_type: hci::KeyType::AuthenticatedP192 }),
+        0,
+    );
+    auth_complete(&mut h);
+    assert!(matches!(events(&mut h).as_slice(), [HostEvent::PairingFailed { handle: 7, .. }]));
+    assert!(!h.is_encrypted(7));
+}
+
+#[test]
+fn unsolicited_classic_pairing_refused() {
+    let mut h = classic_host();
+    h.on_frame(event(hci::IoCapabilityRequest { bd_addr: bd() }), 0);
+    assert_eq!(drain(&mut h).0, vec![OpCode::IoCapabilityRequestNegativeReply]);
+    assert_eq!(h.stats().link_violations, 1);
+}
+
+#[test]
+fn classic_e0_on_an_sc_bond_and_short_keys_drop_the_link() {
+    // Reconnect with a stored (SC) key, controller comes up with E0.
+    let mut h = classic_host();
+    h.encrypt(7, [5; 16], 0).unwrap();
+    assert_eq!(drain(&mut h).0, vec![OpCode::AuthenticationRequested]);
+    ok(&mut h, OpCode::AuthenticationRequested);
+    h.on_frame(event(hci::LinkKeyRequest { bd_addr: bd() }), 0);
+    assert_eq!(drain(&mut h).0, vec![OpCode::LinkKeyRequestReply]);
+    h.on_frame(vinculum_host::testing::complete(hci::LinkKeyRequestReplyComplete { status: ErrorCode::Success, bd_addr: bd(), num_hci_command_packets: 1 }), 0);
+    auth_complete(&mut h);
+    assert_eq!(drain(&mut h).0, vec![OpCode::SetConnectionEncryption]);
+    ok(&mut h, OpCode::SetConnectionEncryption);
+    h.on_frame(
+        event(hci::EncryptionChange { status: ErrorCode::Success, connection_handle: 7, encryption_enabled: hci::EncryptionEnabled::On }),
+        0,
+    );
+    assert!(matches!(events(&mut h).as_slice(), [HostEvent::EncryptionFailed { handle: 7, .. }]));
+    assert!(drain(&mut h).0.contains(&OpCode::Disconnect));
+
+    // AES-CCM, but the controller reports a 7-byte key.
+    let mut h = classic_host();
+    h.encrypt(7, [5; 16], 0).unwrap();
+    ok(&mut h, OpCode::AuthenticationRequested);
+    auth_complete(&mut h);
+    ok(&mut h, OpCode::SetConnectionEncryption);
+    h.on_frame(
+        event(hci::EncryptionChange { status: ErrorCode::Success, connection_handle: 7, encryption_enabled: hci::EncryptionEnabled::BrEdrAesCcm }),
+        0,
+    );
+    let (cmds, _) = drain(&mut h);
+    assert_eq!(cmds.last(), Some(&OpCode::ReadEncryptionKeySize));
+    h.on_frame(
+        vinculum_host::testing::complete(hci::ReadEncryptionKeySizeComplete {
+            status: ErrorCode::Success,
+            connection_handle: 7,
+            key_size: 7,
+            num_hci_command_packets: 1,
+        }),
+        0,
+    );
+    assert!(matches!(events(&mut h).as_slice(), [HostEvent::EncryptionFailed { handle: 7, .. }]));
+    assert!(drain(&mut h).0.contains(&OpCode::Disconnect));
+    assert!(!h.is_encrypted(7));
+}
+
+#[test]
+fn authentication_complete_nobody_asked_for_is_a_violation() {
+    let mut h = classic_host();
+    auth_complete(&mut h);
+    assert_eq!(h.stats().link_violations, 1);
+    assert!(events(&mut h).is_empty());
+}

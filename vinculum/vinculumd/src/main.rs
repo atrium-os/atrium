@@ -10,7 +10,7 @@
 //! vinculumd --transport unix:PATH|tcp:HOST:PORT
 //!           [--scan SECS] [--connect NAME] [--att-mtu] [--timeout SECS]
 //!           [--pair [--reconnect] [--passkey-file PATH]]
-//!           [--keys DIR --machine-key PATH | --arca SOCKET]
+//!           [--keys DIR --machine-key PATH | --arca SOCKET] [--classic ADDR]
 //! vinculumd --transport ... --control PATH [--control-uid UID]... [key store]
 //! ```
 //!
@@ -37,7 +37,8 @@
 //! is the stock-FreeBSD sealed file store, `--arca SOCKET` the Arca machine
 //! store (built with the `atrium` feature). Without either they live in
 //! memory for the run. A peer with a stored bond is encrypted with it on
-//! connect instead of being paired again.
+//! connect instead of being paired again. `--classic ADDR` connects to a
+//! BR/EDR device by address (page) instead of scanning over LE.
 
 use std::io::{Read, Write};
 use std::net::TcpStream;
@@ -112,11 +113,12 @@ struct Opts {
     arca: Option<String>,
     control: Option<String>,
     control_uids: Vec<u32>,
+    classic: Option<vinculum_control::Addr>,
 }
 
 fn opts() -> Opts {
     let usage = || -> ! {
-        eprintln!("usage: vinculumd --transport unix:PATH|tcp:HOST:PORT [--scan SECS] [--connect NAME] [--att-mtu] [--timeout SECS] [--pair [--reconnect] [--passkey-file PATH]] [--keys DIR --machine-key PATH | --arca SOCKET]");
+        eprintln!("usage: vinculumd --transport unix:PATH|tcp:HOST:PORT [--scan SECS] [--connect NAME] [--att-mtu] [--timeout SECS] [--pair [--reconnect] [--passkey-file PATH]] [--keys DIR --machine-key PATH | --arca SOCKET] [--classic ADDR] [--control PATH [--control-uid UID]...]");
         std::process::exit(2)
     };
     let mut o = Opts { transport: String::new(), scan_secs: None, connect: None, att_mtu: false, timeout_secs: 20, pair: false,
@@ -127,6 +129,7 @@ fn opts() -> Opts {
         arca: None,
         control: None,
         control_uids: Vec::new(),
+        classic: None,
     };
     let mut a = std::env::args().skip(1);
     while let Some(k) = a.next() {
@@ -141,6 +144,7 @@ fn opts() -> Opts {
             "--keys" => o.keys = Some(a.next().unwrap_or_else(|| usage())),
             "--machine-key" => o.machine_key = Some(a.next().unwrap_or_else(|| usage())),
             "--arca" => o.arca = Some(a.next().unwrap_or_else(|| usage())),
+            "--classic" => o.classic = Some(a.next().and_then(|v| v.parse().ok()).unwrap_or_else(|| usage())),
             "--control" => o.control = Some(a.next().unwrap_or_else(|| usage())),
             "--control-uid" => o.control_uids.push(a.next().and_then(|v| v.parse().ok()).unwrap_or_else(|| usage())),
             "--timeout" => o.timeout_secs = a.next().and_then(|v| v.parse().ok()).unwrap_or_else(|| usage()),
@@ -254,7 +258,11 @@ fn main() {
                         a[0], a[1], a[2], a[3], a[4], a[5], info.hci_version, info.acl_buffers, info.acl_mtu,
                         info.le_buffers, info.le_mtu, info.iso_buffers, info.iso_mtu
                     );
-                    if o.scan_secs.is_some() || o.connect.is_some() {
+                    if let Some(c) = o.classic {
+                        println!("connecting to {c} over BR/EDR");
+                        host.classic_connect(vinculum_host::Peer { address: c.bytes, random: false }, now());
+                        phase = Phase::Connecting;
+                    } else if o.scan_secs.is_some() || o.connect.is_some() {
                         host.le_scan(true, now());
                         phase = Phase::Scanning;
                         scan_until = o.scan_secs.map(|s| now() + s * 1000);
@@ -382,7 +390,8 @@ fn main() {
                     // Development: paired by the invoking user.
                     let uid = getuid();
                     let at = Address::from_msb(peer.address, peer.random);
-                    let rec = vinculum_keys::Bond::from_pairing(&b, at, uid, &name);
+                    let classic = host.transport(handle) == Some(vinculum_host::Transport::BrEdr);
+                    let rec = vinculum_keys::Bond::from_pairing(&b, at, classic, uid, &name);
                     let old = bonds.iter().position(|(_, x)| vinculum_keys::find([x], &at).is_some() || x.identity.is_some() && x.identity == rec.identity);
                     let verdict = policy::new_bond(old.map(|i| &bonds[i].1), &rec);
                     if let policy::NewBond::Refuse(why) = verdict {
@@ -418,6 +427,10 @@ fn main() {
                     ok = false;
                     host.disconnect(handle, now());
                     phase = Phase::Disconnecting;
+                }
+                HostEvent::ConnectionRequest { peer, .. } => {
+                    println!("connection request from {peer}: refused (development mode)");
+                    host.reject_connection(peer, now());
                 }
                 HostEvent::SecurityRequest { handle, auth_req } => {
                     println!("security request: handle {handle} auth 0x{auth_req:02x}");

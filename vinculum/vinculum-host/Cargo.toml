@@ -8,3 +8,4 @@ license.workspace = true
 [dependencies]
 vinculum-hci-proto = { path = "../vinculum-hci-proto" }
 vinculum-smp = { path = "../vinculum-smp" }
+zeroize = "1"

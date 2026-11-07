@@ -56,11 +56,16 @@ impl Host {
     pub fn pair(&mut self, handle: u16, cfg: PairConfig, now_ms: u64) -> Result<(), &'static str> {
         let own = self.info.address.ok_or("controller not ready")?;
         let conn = self.conns.get(&handle).ok_or("no such connection")?;
-        if conn.transport != Transport::Le || !conn.central {
-            return Err("pairing needs an LE link where we are central");
+        if !conn.central {
+            return Err("pairing needs a link where we are central");
         }
-        if conn.smp.is_some() || conn.encrypting {
+        if conn.smp.is_some() || conn.encrypting || conn.classic.is_some() {
             return Err("security procedure already running");
+        }
+        if conn.transport == Transport::BrEdr {
+            self.classic_pair(handle, cfg.io_cap);
+            self.pump(now_ms);
+            return Ok(());
         }
         // SMP addresses: 6 bytes little-endian, then the type (§2.2.7).
         let a = smp_addr(own, false);
@@ -75,6 +80,10 @@ impl Host {
 
     /// The user's answer to `Prompt::Confirm`.
     pub fn pairing_confirm(&mut self, handle: u16, yes: bool, now_ms: u64) {
+        if self.is_classic(handle) {
+            self.classic_confirm(handle, yes);
+            return self.pump(now_ms);
+        }
         let Some(init) = self.conns.get_mut(&handle).and_then(|c| c.smp.as_mut()) else { return };
         let a = init.confirmed(yes);
         self.smp_actions(handle, a);
@@ -83,23 +92,31 @@ impl Host {
 
     /// The user's answer to `Prompt::EnterPasskey`; None cancels.
     pub fn pairing_passkey(&mut self, handle: u16, passkey: Option<u32>, now_ms: u64) {
+        if self.is_classic(handle) {
+            self.classic_passkey(handle, passkey);
+            return self.pump(now_ms);
+        }
         let Some(init) = self.conns.get_mut(&handle).and_then(|c| c.smp.as_mut()) else { return };
         let a = init.passkey_entered(passkey);
         self.smp_actions(handle, a);
         self.pump(now_ms);
     }
 
-    /// Encrypts a link with a stored LE Secure Connections key (EDIV and
-    /// Rand are zero for SC keys). Result: `Encrypted` or `EncryptionFailed`.
+    /// Encrypts a link with a stored key: LE (EDIV and Rand are zero for SC
+    /// keys) or a Classic link key (authenticate, then encrypt). Result: `Encrypted` or `EncryptionFailed`.
     pub fn encrypt(&mut self, handle: u16, ltk: [u8; 16], now_ms: u64) -> Result<(), &'static str> {
         let conn = self.conns.get_mut(&handle).ok_or("no such connection")?;
-        if conn.transport != Transport::Le || !conn.central {
-            return Err("encryption needs an LE link where we are central");
+        if !conn.central {
+            return Err("encryption needs a link where we are central");
         }
-        if conn.smp.is_some() || conn.encrypting {
+        if conn.smp.is_some() || conn.encrypting || conn.classic.is_some() {
             return Err("security procedure already running");
         }
-        self.start_encryption(handle, ltk);
+        if conn.transport == Transport::BrEdr {
+            self.classic_encrypt(handle, ltk);
+        } else {
+            self.start_encryption(handle, ltk);
+        }
         self.pump(now_ms);
         Ok(())
     }

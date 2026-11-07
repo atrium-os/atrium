@@ -105,6 +105,7 @@ mod tests {
     fn bond(sc: bool, auth: bool, size: u8) -> Bond {
         Bond {
             address: Address { kind: 1, bytes: [1; 6] },
+            classic: false,
             identity: None,
             ltk: [0; 16],
             key_size: size,

@@ -58,7 +58,13 @@ scenario() {
         i=$((i + 1)); [ $i -gt 100 ] && { cat "$work/peer.log"; echo "FAIL: peer did not start"; exit 1; }
         sleep 0.1
     done
-    d() { "$bin/vinculumd" --transport "unix:$work/hci.sock" --connect VinculumPeer --timeout 30 --passkey-file "$work/passkey" "$@"; }
+    if [ -n "${CLASSIC:-}" ]; then
+        until grep -q "classic address" "$work/peer.log"; do sleep 0.1; done
+        target="--classic $(sed -n 's/^classic address //p' "$work/peer.log")"
+    else
+        target="--connect VinculumPeer"
+    fi
+    d() { "$bin/vinculumd" --transport "unix:$work/hci.sock" $target --timeout 30 --passkey-file "$work/passkey" "$@"; }
     if [ -n "${EXPECT_FAIL:-}" ]; then
         # The run must fail, saying EXPECT_FAIL.
         if ! d "$@" >"$work/d.log" 2>&1 && grep -q "$EXPECT_FAIL" "$work/d.log"; then
@@ -92,6 +98,16 @@ grep -q "reconnect: encrypted with the stored key" "$work/d.log" || { echo "FAIL
 EXPECT_FAIL="pairing refused: the new key is unauthenticated"
 scenario "B2 no key downgrade (authenticated bond kept)" none --pair --keys "$work/keys" --machine-key "$work/machine.key"
 EXPECT_FAIL=
+
+# BR/EDR: Secure Simple Pairing (Secure Connections) by address, then a
+# second process authenticates and encrypts with the stored link key.
+CLASSIC=1
+AGAIN="--pair --keys $work/keys4 --machine-key $work/machine.key"
+scenario "B2 Classic SSP numeric comparison, bond survives a restart" display-yes-no --pair --keys "$work/keys4" --machine-key "$work/machine.key"
+AGAIN=
+grep -q "reconnect: encrypted with the stored key" "$work/d.log" || { echo "FAIL Classic second run did not use the stored bond"; cat "$work/d.log"; fails=$((fails + 1)); }
+scenario "B2 Classic SSP just works" none --pair
+CLASSIC=
 
 # The service: vinculumd with the bluetooth-control socket, driven by
 # vinculum-ctl as the pairing agent (spec §13).
