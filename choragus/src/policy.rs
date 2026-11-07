@@ -21,6 +21,9 @@ pub enum DeviceKind {
     Speakers,
     Headset,
     Hdmi,
+    /// An external output that doesn't take over by itself (a Bluetooth
+    /// speaker, a car). External headphones are `Headset`.
+    External,
 }
 
 pub type DeviceId = u32;

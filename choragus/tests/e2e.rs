@@ -3,14 +3,14 @@
 //! to the app, volumes composed into lyrad's gain, events forwarded, and that
 //! an app can only name its own streams.
 
-use choragus::app::{CAP_AUDIO, CAP_CONTROL, CAP_MEDIA, CAP_MICROPHONE, CAP_MONITOR};
+use choragus::app::{CAP_AUDIO, CAP_CONTROL, CAP_DEVICE, CAP_MEDIA, CAP_MICROPHONE, CAP_MONITOR};
 use choragus::daemon::{self, Config};
 use choragus::grant::GrantStore;
-use lyra_protocol::client::{Client, Control, Media};
+use lyra_protocol::client::{Announce, Client, Control, Device, Media};
 use lyra_protocol::ring::Ring;
 use lyra_protocol::wire::{
     self, AppEntry, DenyCode, FromAttribution, FromControl, FromEngine, Output, Role, StreamParams, ToApp, ToAttribution, ToChoragus,
-    ToControl, ToEngine, ToMedia, FromMedia, MediaAction, SessionState, action,
+    ToControl, ToEngine, ToMedia, FromMedia, MediaAction, SessionState, action, FromDevice,
 };
 use std::os::fd::AsRawFd;
 use std::os::unix::net::{UnixListener, UnixStream};
@@ -60,6 +60,18 @@ fn fake_lyrad(sock: PathBuf, tag: &'static str) -> (mpsc::Receiver<ToEngine>, mp
                 }
                 ToEngine::Flush { stream } => {
                     wire::send(&mut c, &FromEngine::Flushed { stream: *stream, frame: 42 }).unwrap();
+                }
+                ToEngine::AddDevice { device, channels, .. } => {
+                    n += 1;
+                    let name = format!("/chor-e2e-{tag}-{}-d{n}", std::process::id());
+                    let p = Ring::create(&name, 4096, *channels as u64).unwrap();
+                    let fd = std::fs::OpenOptions::new().read(true).write(true)
+                        .open(format!("/dev/shm{name}")).unwrap();
+                    let (page, pfd) = lyra_protocol::device::create().unwrap();
+                    wire::send(&mut c, &FromEngine::DeviceAdded { device: *device, ring_frames: 4096 }).unwrap();
+                    lyra_protocol::fdpass::send_fd(c.as_raw_fd(), fd.as_raw_fd()).unwrap();
+                    lyra_protocol::fdpass::send_fd(c.as_raw_fd(), pfd.as_raw_fd()).unwrap();
+                    std::mem::forget((p, page));
                 }
                 _ => {}
             }
@@ -478,4 +490,92 @@ fn an_embedded_player_plays_as_its_parent_only_with_a_ticket() {
     assert!(Client::connect(app, Some(ticket)).is_err(), "limend's tickets die with it");
     // A forged ticket is nothing.
     assert!(Client::connect(app, Some([9; 16])).is_err());
+}
+
+fn headphones(rate: u32) -> Announce {
+    Announce {
+        persistent_id: 0xB7,
+        name: "Bob's Buds\u{202e}".into(),
+        kind: wire::OutputKind::Headphones,
+        rate,
+        channels: 2,
+        hw_volume: true,
+        initial_delay_frames: 7200,
+    }
+}
+
+fn outputs(ui: &mut Control) -> (u32, Vec<Output>) {
+    ui.socket().set_read_timeout(Some(Duration::from_secs(3))).unwrap();
+    loop {
+        if let FromControl::Outputs { current, outputs } = ui.recv().expect("outputs") {
+            return (current, outputs);
+        }
+    }
+}
+
+#[test]
+fn headphones_connect_take_over_set_their_volume_and_pause_media_when_they_leave() {
+    let reg = format!("{} alice org.atrium.player\n", me());
+    let grants = "org.atrium.player audio,audio-control,audio-device\n";
+    let (s, eng, _r) = start_with("device", &reg, grants,
+        &[("audio.sock", CAP_AUDIO), ("audio-control.sock", CAP_CONTROL), ("audio-device.sock", CAP_DEVICE)], Some(dir("device-state")));
+    let mut ui = Control::connect(s[1].to_str().unwrap()).expect("ui");
+    let mut app = Client::connect(s[0].to_str().unwrap(), None).expect("app");
+    let st = app.open(params()).expect("stream");
+    next_engine(&eng, |m| matches!(m, ToEngine::SetGain { .. }));
+    app.session(SessionState::Playing, "Song", "Band", action::PLAY | action::PAUSE, None, None).unwrap();
+    // Headphones connect: they get their ring and page, and become the output.
+    let mut dev = Device::connect(s[2].to_str().unwrap(), &headphones(48_000)).expect("ready");
+    assert_eq!(dev.device, 1);
+    assert!(matches!(next_engine(&eng, |m| matches!(m, ToEngine::AddDevice { .. })),
+        ToEngine::AddDevice { device: 1, rate: 48_000, channels: 2, initial_delay_frames: 7200 }));
+    next_engine(&eng, |m| *m == ToEngine::UseOutput { device: 1 });
+    let (current, outs) = outputs(&mut ui);
+    assert_eq!(current, 1);
+    assert_eq!(outs.iter().map(|o| o.name.as_str()).collect::<Vec<_>>(), ["Speakers", "Bob's Buds"]);
+    // The master volume goes to the headphones, not into the stream's gain.
+    dev.socket().set_read_timeout(Some(Duration::from_secs(3))).unwrap();
+    ui.send(&ToControl::SetMaster { volume: 0.5 }).unwrap();
+    loop {
+        if let FromDevice::SetVolume { volume } = dev.recv().unwrap() {
+            if (volume - 0.5).abs() < 1e-6 { break; }
+        }
+    }
+    // The headset's own buttons move the master the volume UI shows.
+    dev.volume(0.25).unwrap();
+    loop {
+        if let (m, false, _) = apps(&mut ui, 1) {
+            if (m - 0.25).abs() < 1e-6 { break; }
+        }
+    }
+    // A reconfiguration (say, to a call's 16 kHz) keeps the same output.
+    let dev = dev.reconfigure(&headphones(16_000)).expect("ready again");
+    assert_eq!(dev.device, 1);
+    assert!(matches!(next_engine(&eng, |m| matches!(m, ToEngine::AddDevice { .. })),
+        ToEngine::AddDevice { device: 2, rate: 16_000, .. }));
+    next_engine(&eng, |m| *m == ToEngine::UseOutput { device: 2 });
+    next_engine(&eng, |m| *m == ToEngine::RemoveDevice { device: 1 });
+    // They leave for good: back to the speakers, and the music pauses.
+    drop(dev);
+    next_engine(&eng, |m| *m == ToEngine::RemoveDevice { device: 2 });
+    next_engine(&eng, |m| *m == ToEngine::UseOutput { device: 0 });
+    app.socket().set_read_timeout(Some(Duration::from_secs(3))).unwrap();
+    loop {
+        match app.next_event().expect("pause") {
+            ToApp::SessionAction { action: MediaAction::Pause, .. } => break,
+            _ => {}
+        }
+    }
+    drop(st);
+}
+
+#[test]
+fn only_the_audio_device_grant_adds_an_output() {
+    let reg = format!("{} alice org.atrium.player\n", me());
+    let (s, _e, _r) = start_with("device-nogrant", &reg, "org.atrium.player audio,media-control\n", &[("audio-device.sock", CAP_DEVICE)], None);
+    let err = Device::connect(s[0].to_str().unwrap(), &headphones(48_000)).err().expect("refused");
+    assert_eq!(err.kind(), std::io::ErrorKind::PermissionDenied);
+    // A bad format is refused too.
+    let (s, _e, _r) = start_with("device-badrate", &reg, "org.atrium.player audio-device\n", &[("audio-device.sock", CAP_DEVICE)], None);
+    assert!(Device::connect(s[0].to_str().unwrap(), &headphones(22_050)).is_err());
 }

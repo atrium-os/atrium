@@ -89,6 +89,9 @@ fn main() {
         if let Some(p) = arg(&args, "--control") {
             listeners.push((p.to_string(), choragus::app::CAP_CONTROL));
         }
+        if let Some(p) = arg(&args, "--device") {
+            listeners.push((p.to_string(), choragus::app::CAP_DEVICE));
+        }
         if let Some(p) = arg(&args, "--media") {
             listeners.push((p.to_string(), choragus::app::CAP_MEDIA));
         }

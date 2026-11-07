@@ -15,7 +15,8 @@
 use crate::clock::{Clock, ClockReader};
 use crate::fdpass::recv_fd;
 use crate::ring::Ring;
-use crate::wire::{self, DenyCode, FromControl, FromMedia, MediaAction, SessionState, StreamParams, ToApp, ToChoragus, ToControl, ToMedia};
+use crate::device::DeviceWriter;
+use crate::wire::{self, DenyCode, FromControl, FromDevice, FromMedia, MediaAction, OutputKind, SessionState, StreamParams, ToApp, ToChoragus, ToControl, ToDevice, ToMedia};
 use std::collections::VecDeque;
 use std::io;
 use std::os::fd::AsRawFd;
@@ -188,6 +189,10 @@ pub struct Control {
 }
 
 impl Control {
+    pub fn socket(&self) -> &UnixStream {
+        &self.sock
+    }
+
     pub fn connect(path: &str) -> io::Result<Control> {
         let mut sock = UnixStream::connect(path)?;
         wire::send(&mut sock, &ToControl::Hello { version: wire::VERSION })?;
@@ -243,6 +248,92 @@ impl Media {
 
     /// The next `NowPlaying` (blocks).
     pub fn recv(&mut self) -> io::Result<FromMedia> {
+        wire::recv(&mut self.sock)
+    }
+
+    pub fn socket(&self) -> &UnixStream {
+        &self.sock
+    }
+}
+
+/// An output device driver's connection to choragusd (`audio-device/`,
+/// lyra-external-device.md): announce, then read lyrad's mix from `ring` and
+/// keep `page` current.
+pub struct Device {
+    sock: UnixStream,
+    /// The output's id, as the volume UI shows it.
+    pub device: u32,
+    pub ring: Ring,
+    pub page: DeviceWriter,
+}
+
+/// What a device announces.
+#[derive(Clone, Debug)]
+pub struct Announce {
+    pub persistent_id: u64,
+    pub name: String,
+    pub kind: OutputKind,
+    pub rate: u32,
+    pub channels: u8,
+    pub hw_volume: bool,
+    pub initial_delay_frames: u32,
+}
+
+impl Device {
+    pub fn connect(path: &str, a: &Announce) -> io::Result<Device> {
+        let mut sock = UnixStream::connect(path)?;
+        wire::send(&mut sock, &ToDevice::Hello { version: wire::VERSION })?;
+        match wire::recv(&mut sock)? {
+            FromDevice::Welcome => {}
+            FromDevice::Denied { code } => return Err(denied(code)),
+            m => return Err(io::Error::new(io::ErrorKind::InvalidData, format!("unexpected {m:?}"))),
+        }
+        Self::announce(sock, a)
+    }
+
+    fn announce(mut sock: UnixStream, a: &Announce) -> io::Result<Device> {
+        wire::send(&mut sock, &ToDevice::Announce {
+            persistent_id: a.persistent_id,
+            name: a.name.clone(),
+            kind: a.kind,
+            rate: a.rate,
+            channels: a.channels,
+            hw_volume: a.hw_volume,
+            initial_delay_frames: a.initial_delay_frames,
+        })?;
+        loop {
+            match wire::recv(&mut sock)? {
+                FromDevice::Ready { device, .. } => {
+                    let ring = Ring::from_fd(recv_fd(sock.as_raw_fd())?, false)?;
+                    let page = DeviceWriter::from_fd(recv_fd(sock.as_raw_fd())?)?;
+                    return Ok(Device { sock, device, ring, page });
+                }
+                FromDevice::Denied { code } => return Err(denied(code)),
+                // A volume before Ready: the next recv() would have it anyway.
+                FromDevice::SetVolume { .. } | FromDevice::Welcome => {}
+            }
+        }
+    }
+
+    /// The link changed its format (a codec reconfiguration): `Gone`, then a
+    /// new announcement on the same socket, so the output stays the same.
+    pub fn reconfigure(mut self, a: &Announce) -> io::Result<Device> {
+        wire::send(&mut self.sock, &ToDevice::Gone)?;
+        let sock = self.sock.try_clone()?;
+        drop(self);
+        Self::announce(sock, a)
+    }
+
+    pub fn volume(&mut self, volume: f32) -> io::Result<()> {
+        wire::send(&mut self.sock, &ToDevice::Volume { volume })
+    }
+
+    pub fn gone(&mut self) -> io::Result<()> {
+        wire::send(&mut self.sock, &ToDevice::Gone)
+    }
+
+    /// The next message from choragusd (blocks): `SetVolume`.
+    pub fn recv(&mut self) -> io::Result<FromDevice> {
         wire::recv(&mut self.sock)
     }
 

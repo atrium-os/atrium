@@ -16,15 +16,16 @@
 //! tickets: an embedded player that says one in `Hello` plays as its parent
 //! app, and only if the parent holds `audio` (lyra-v1.md §4, decision 4).
 
-use crate::app::{role_from_wire, CAP_ATTRIBUTION, CAP_AUDIO, CAP_CONTROL, CAP_MEDIA};
+use crate::app::{role_from_wire, CAP_ATTRIBUTION, CAP_AUDIO, CAP_CONTROL, CAP_DEVICE, CAP_MEDIA};
 use crate::media::MediaRegistry;
 use crate::grant::GrantStore;
 use crate::policy::{Device, DeviceKind, Session, Stream};
 use crate::volumes::{clamp, Level, OutputSettings, VolumeStore};
 use lyra_protocol::fdpass::{recv_fd, send_fd};
 use lyra_protocol::wire::{
-    self, AppEntry, DenyCode, FromAttribution, FromControl, FromEngine, FromMedia, NowPlaying, Output,
-    Role as WireRole, Ticket, ToApp, ToAttribution, ToChoragus, ToControl, ToEngine, ToMedia,
+    self, AppEntry, DenyCode, FromAttribution, FromControl, FromDevice, FromEngine, FromMedia, MediaAction, NowPlaying,
+    Output, OutputKind, Role as WireRole, SessionState, Ticket, ToApp, ToAttribution, ToChoragus, ToControl, ToDevice,
+    ToEngine, ToMedia,
 };
 use portcullis_peer::AppRegistry;
 use std::collections::HashMap;
@@ -115,8 +116,41 @@ struct MediaConn {
     last: Option<Option<NowPlaying>>,
 }
 
+/// An external output (lyra-external-device.md): a device driver's output,
+/// known to the volume UI by its output id, to lyrad by `engine`.
+struct ExtOutput {
+    persistent_id: u64,
+    name: String,
+    kind: OutputKind,
+    hw_volume: bool,
+    /// lyrad's id for the device now (a new one after each reconfiguration),
+    /// and the one it replaces until lyrad has the new one.
+    engine: u32,
+    old_engine: Option<u32>,
+    /// The driver's connection while it is there.
+    writer: Option<UnixStream>,
+    /// Gone, waiting the grace period out: which time it went.
+    gone: Option<u64>,
+    /// Shown as an output (lyrad had it at least once).
+    listed: bool,
+    /// The output that was current when this one took over.
+    previous: crate::policy::DeviceId,
+}
+
+/// A device announced again within this long keeps its output.
+const DEVICE_GRACE: Duration = Duration::from_secs(2);
+
 struct State {
     sess: Session,
+    ext: HashMap<u32, ExtOutput>,
+    /// lyrad device id → output id, until lyrad answers `AddDevice`.
+    pending_devices: HashMap<u32, u32>,
+    next_output: u32,
+    next_engine: u32,
+    gone_seq: u64,
+    /// The user whose volume a device's own volume control moves when there
+    /// is no seat (development): the last one to connect.
+    last_user: Option<String>,
     media: MediaRegistry,
     media_conns: HashMap<u64, MediaConn>,
     volumes: VolumeStore,
@@ -150,8 +184,11 @@ impl State {
         let keys: Vec<(u32, String, String)> =
             self.streams.iter().map(|(id, r)| (*id, r.user.clone(), r.app_id.clone())).collect();
         for (id, user, app) in keys {
+            // With a device that has its own volume, the master is applied
+            // there, not here (twice would be double attenuation).
+            let hw = self.hw_volume_active();
             let v = self.volumes.user(&user);
-            let g = v.app(&app).gain() * v.master_gain();
+            let g = v.app(&app).gain() * if hw { 1.0 } else { v.master_gain() };
             self.streams.get_mut(&id).unwrap().user_gain = g;
         }
         for d in self.sess.resolve() {
@@ -210,13 +247,13 @@ impl State {
     fn outputs_msg(&self) -> FromControl {
         let outputs = self.sess.devices.iter()
             .map(|d| {
-                let name = output_name(d);
+                let key = self.output_key(d);
                 Output {
                     id: d.id,
-                    balance: self.outputs.balance(&name),
-                    channels: self.outputs.layout(&name),
-                    spatial: self.outputs.spatial(&name),
-                    name,
+                    balance: self.outputs.balance(&key),
+                    channels: self.outputs.layout(&key),
+                    spatial: self.outputs.spatial(&key),
+                    name: self.output_label(d),
                 }
             })
             .collect();
@@ -227,7 +264,7 @@ impl State {
     /// surround.
     fn send_balance(&mut self) {
         let sink = self.sess.default_device;
-        let name = self.sess.devices.iter().find(|d| d.id == sink).map(output_name).unwrap_or_default();
+        let name = self.sess.devices.iter().find(|d| d.id == sink).map(|d| self.output_key(d)).unwrap_or_default();
         let (balance, channels) = (self.outputs.balance(&name), self.outputs.layout(&name));
         let _ = wire::send(&mut self.lyrad, &ToEngine::SetBalance { sink, balance });
         let _ = wire::send(&mut self.lyrad, &ToEngine::SetLayout { sink, channels });
@@ -326,6 +363,146 @@ impl State {
     }
 }
 
+impl State {
+    /// The key an output's settings are kept under.
+    fn output_key(&self, d: &Device) -> String {
+        if let Some(e) = self.ext.get(&d.id) {
+            return format!("device-{:016x}", e.persistent_id);
+        }
+        match d.kind {
+            DeviceKind::Speakers => "Speakers",
+            DeviceKind::Headset => "Headset",
+            DeviceKind::Hdmi => "HDMI",
+            DeviceKind::External => "External",
+        }
+        .to_string()
+    }
+
+    /// The name the volume UI shows.
+    fn output_label(&self, d: &Device) -> String {
+        match self.ext.get(&d.id) {
+            Some(e) => e.name.clone(),
+            None => self.output_key(d),
+        }
+    }
+
+    /// lyrad's id for an output (0: the built-in device).
+    fn engine_output(&self, id: crate::policy::DeviceId) -> u32 {
+        self.ext.get(&id).map_or(0, |e| e.engine)
+    }
+
+    /// The current output is a device that sets its own volume.
+    fn hw_volume_active(&self) -> bool {
+        self.ext.get(&self.sess.default_device).is_some_and(|e| e.hw_volume && e.writer.is_some())
+    }
+
+    /// Whose master volume a device's volume control moves: the seat's
+    /// user, or (without a seat) the last user to connect.
+    fn volume_user(&self) -> Option<String> {
+        match &self.seat {
+            Some(p) => portcullis_peer::seat::active_at(p),
+            None => self.last_user.clone(),
+        }
+    }
+
+    /// Tell the current output's device its volume, if it sets its own.
+    fn send_device_volume(&mut self) {
+        if !self.hw_volume_active() {
+            return;
+        }
+        let Some(user) = self.volume_user() else { return };
+        let v = self.volumes.user(&user);
+        let volume = if v.master_muted { 0.0 } else { v.master };
+        let id = self.sess.default_device;
+        if let Some(w) = self.ext.get_mut(&id).and_then(|e| e.writer.as_mut()) {
+            let _ = wire::send(w, &FromDevice::SetVolume { volume });
+        }
+    }
+
+    /// Make the session's current output lyrad's, and tell everyone.
+    fn use_output(&mut self) {
+        let engine = self.engine_output(self.sess.default_device);
+        let _ = wire::send(&mut self.lyrad, &ToEngine::UseOutput { device: engine });
+        self.send_balance();
+        self.send_device_volume();
+        self.recompute();
+        let m = self.outputs_msg();
+        for c in self.controls.keys().copied().collect::<Vec<_>>() {
+            self.to_control(c, &m);
+        }
+    }
+
+    /// The grace period ran out: the output goes. If it was current, the one
+    /// before it comes back, and if it was headphones, what was playing pauses
+    /// (it would otherwise carry on through the speakers).
+    fn remove_output(&mut self, id: u32) {
+        let Some(e) = self.ext.remove(&id) else { return };
+        let _ = wire::send(&mut self.lyrad, &ToEngine::RemoveDevice { device: e.engine });
+        let was_current = self.sess.default_device == id;
+        self.sess.devices.retain(|d| d.id != id);
+        eprintln!("choragusd: output '{}' gone", e.name);
+        if was_current {
+            let back = if self.sess.devices.iter().any(|d| d.id == e.previous) { e.previous } else { 0 };
+            self.sess.default_device = back;
+            if matches!(e.kind, OutputKind::Headphones | OutputKind::Headset) {
+                if let Some(user) = self.volume_user() {
+                    let playing = self.media.active(&user).is_some_and(|(_, s)| s.state == SessionState::Playing);
+                    if playing {
+                        if let Some((conn, m)) = self.media.control(&user, MediaAction::Pause, None, None) {
+                            self.to_app(conn, &m);
+                        }
+                    }
+                }
+            }
+        }
+        self.use_output();
+    }
+
+    /// lyrad made the device: hand it to the driver, and show or switch the output.
+    fn device_added(&mut self, engine: u32, ring_frames: u64, ring: &std::os::fd::OwnedFd, page: &std::os::fd::OwnedFd) {
+        let Some(id) = self.pending_devices.remove(&engine) else {
+            let _ = wire::send(&mut self.lyrad, &ToEngine::RemoveDevice { device: engine });
+            return;
+        };
+        let current = self.sess.default_device == id;
+        let Some(e) = self.ext.get_mut(&id).filter(|e| e.engine == engine && e.writer.is_some()) else {
+            let _ = wire::send(&mut self.lyrad, &ToEngine::RemoveDevice { device: engine });
+            return;
+        };
+        let w = e.writer.as_mut().unwrap();
+        let sent = wire::send(w, &FromDevice::Ready { device: id, ring_frames }).is_ok()
+            && send_fd(w.as_raw_fd(), ring.as_raw_fd()).is_ok()
+            && send_fd(w.as_raw_fd(), page.as_raw_fd()).is_ok();
+        if !sent {
+            let _ = w.shutdown(std::net::Shutdown::Both);
+        }
+        if let Some(old) = e.old_engine.take() {
+            // A reconfiguration: the same output, a new lyrad device.
+            if current {
+                let _ = wire::send(&mut self.lyrad, &ToEngine::UseOutput { device: engine });
+            }
+            let _ = wire::send(&mut self.lyrad, &ToEngine::RemoveDevice { device: old });
+            self.send_device_volume();
+            return;
+        }
+        if e.listed {
+            return;
+        }
+        e.listed = true;
+        let takes_over = matches!(e.kind, OutputKind::Headphones | OutputKind::Headset);
+        let kind = if takes_over { DeviceKind::Headset } else { DeviceKind::External };
+        eprintln!("choragusd: output '{}' added{}", e.name, if takes_over { "; now current" } else { "" });
+        if takes_over {
+            e.previous = self.sess.default_device;
+        }
+        self.sess.devices.push(Device { id, kind });
+        if takes_over {
+            self.sess.default_device = id;
+        }
+        self.use_output();
+    }
+}
+
 type Shared = Arc<Mutex<State>>;
 
 /// Handle one app connection to its end.
@@ -386,6 +563,7 @@ fn serve_app(mut app: UnixStream, state: Shared, cfg: Arc<Config>, socket_caps: 
         st.next_conn += 1;
         let c = st.next_conn;
         st.apps.insert(c, AppConn { writer, streams: Vec::new() });
+        st.last_user = Some(v.user.clone());
         if let Some(r) = ticket.and_then(|t| st.tickets.get_mut(&t)) {
             r.conn = Some(c);
         } else if ticket.is_some() {
@@ -485,13 +663,134 @@ fn serve_app(mut app: UnixStream, state: Shared, cfg: Arc<Config>, socket_caps: 
     eprintln!("choragusd: '{}' (uid {uid}) disconnected", v.app_id);
 }
 
-fn output_name(d: &Device) -> String {
-    match d.kind {
-        DeviceKind::Speakers => "Speakers",
-        DeviceKind::Headset => "Headset",
-        DeviceKind::Hdmi => "HDMI",
+/// Handle one output device driver (`audio-device/`,
+/// lyra-external-device.md §5).
+fn serve_device(mut c: UnixStream, state: Shared, cfg: Arc<Config>, socket_caps: u8) {
+    let uid = match lyra_protocol::peer::peer_uid(c.as_raw_fd()) {
+        Ok(u) => u,
+        Err(_) => return,
+    };
+    let _ = c.set_read_timeout(Some(Duration::from_secs(5)));
+    if !matches!(wire::recv::<_, ToDevice>(&mut c), Ok(ToDevice::Hello { .. })) {
+        return;
     }
-    .to_string()
+    let _ = c.set_read_timeout(None);
+    let registry = cfg.registry.as_deref().map(|p| AppRegistry::load(p).unwrap_or_default());
+    let grant = |user: &str, app_id: &str| match &cfg.policy_base {
+        Some(base) => GrantStore::load_portcullis(base, user).granted(app_id),
+        None => cfg.grants.granted(app_id),
+    };
+    let claimed = portcullis_peer::username(uid).unwrap_or_default();
+    let verified = crate::identity::resolve(uid, &claimed, registry.as_ref(), cfg.strict, socket_caps, grant);
+    let Some(v) = verified.filter(|v| v.caps & CAP_DEVICE != 0) else {
+        eprintln!("choragusd: uid {uid} refused on audio-device (no audio-device grant)");
+        let _ = wire::send(&mut c, &FromDevice::Denied { code: DenyCode::NotGranted });
+        return;
+    };
+    if wire::send(&mut c, &FromDevice::Welcome).is_err() {
+        return;
+    }
+    eprintln!("choragusd: device driver '{}' (uid {uid}) connected", v.app_id);
+    let mut mine: Option<u32> = None;
+    while let Ok(msg) = wire::recv::<_, ToDevice>(&mut c) {
+        match msg {
+            ToDevice::Hello { .. } => {}
+            ToDevice::Announce { persistent_id, name, kind, rate, channels, hw_volume, initial_delay_frames } => {
+                let deny = |c: &mut UnixStream, code| { let _ = wire::send(c, &FromDevice::Denied { code }); };
+                if mine.is_some() || !wire::DEVICE_RATES.contains(&rate) || !(1..=2).contains(&channels) {
+                    deny(&mut c, DenyCode::BadFormat);
+                    continue;
+                }
+                let mut name = crate::media::clean(&name);
+                while name.len() > wire::MAX_DEVICE_NAME {
+                    name.pop();
+                }
+                if name.is_empty() {
+                    name = "Bluetooth".into();
+                }
+                let Ok(writer) = c.try_clone() else { break };
+                let _ = writer.set_write_timeout(Some(Duration::from_secs(1)));
+                let mut st = state.lock().unwrap();
+                let back = st.ext.iter().find(|(_, e)| e.persistent_id == persistent_id).map(|(id, e)| (*id, e.gone.is_some()));
+                if back.is_some_and(|(_, gone)| !gone) || st.ext.len() >= 8 {
+                    drop(st);
+                    deny(&mut c, DenyCode::NotGranted);
+                    continue;
+                }
+                let engine = st.next_engine;
+                st.next_engine = st.next_engine.wrapping_add(1).max(1);
+                let id = match back {
+                    Some((id, _)) => {
+                        let e = st.ext.get_mut(&id).unwrap();
+                        let old = e.engine;
+                        *e = ExtOutput { name, kind, hw_volume, engine, old_engine: Some(old), writer: Some(writer), gone: None, ..*e };
+                        eprintln!("choragusd: output '{}' announced again ({rate} Hz, {channels} ch)", e.name);
+                        id
+                    }
+                    None => {
+                        let id = st.next_output;
+                        st.next_output += 1;
+                        st.ext.insert(id, ExtOutput {
+                            persistent_id, name, kind, hw_volume, engine, old_engine: None, writer: Some(writer),
+                            gone: None, listed: false, previous: 0,
+                        });
+                        id
+                    }
+                };
+                st.pending_devices.insert(engine, id);
+                let add = ToEngine::AddDevice { device: engine, rate, channels, initial_delay_frames };
+                let _ = wire::send(&mut st.lyrad, &add);
+                mine = Some(id);
+            }
+            ToDevice::Volume { volume } => {
+                let mut st = state.lock().unwrap();
+                let Some(id) = mine else { continue };
+                if !st.ext.get(&id).is_some_and(|e| e.hw_volume) || st.sess.default_device != id {
+                    continue;
+                }
+                let Some(user) = st.volume_user() else { continue };
+                let volume = clamp(volume);
+                if let Err(e) = st.volumes.update(&user, |u| { u.master = volume; u.master_muted = false; }) {
+                    eprintln!("choragusd: saving {user}'s volumes: {e}");
+                }
+                st.recompute();
+                st.notify_controls(Some(&user));
+            }
+            ToDevice::Gone => {
+                if let Some(id) = mine.take() {
+                    device_gone(&state, id);
+                }
+            }
+        }
+    }
+    if let Some(id) = mine {
+        device_gone(&state, id);
+    }
+    eprintln!("choragusd: device driver '{}' (uid {uid}) disconnected", v.app_id);
+}
+
+/// The device dropped: keep its output for [`DEVICE_GRACE`] in case it comes
+/// back (a reconfiguration), then remove it.
+fn device_gone(state: &Shared, id: u32) {
+    let seq = {
+        let mut st = state.lock().unwrap();
+        st.gone_seq += 1;
+        let seq = st.gone_seq;
+        let Some(e) = st.ext.get_mut(&id) else { return };
+        e.gone = Some(seq);
+        e.writer = None;
+        // Its volume control is gone too: the master applies digitally again.
+        st.recompute();
+        seq
+    };
+    let state = state.clone();
+    std::thread::spawn(move || {
+        std::thread::sleep(DEVICE_GRACE);
+        let mut st = state.lock().unwrap();
+        if st.ext.get(&id).is_some_and(|e| e.gone == Some(seq)) {
+            st.remove_output(id);
+        }
+    });
 }
 
 /// Handle one volume UI connection (`audio-control/`, lyra-v1.md §7). It may
@@ -529,6 +828,7 @@ fn serve_control(mut c: UnixStream, state: Shared, cfg: Arc<Config>, socket_caps
         st.next_conn += 1;
         let id = st.next_conn;
         st.controls.insert(id, ControlConn { writer, user: v.user.clone() });
+        st.last_user = Some(v.user.clone());
         id
     };
     eprintln!("choragusd: volume UI '{}' (user {}, uid {uid}) connected", v.app_id, v.user);
@@ -566,6 +866,9 @@ fn serve_control(mut c: UnixStream, state: Shared, cfg: Arc<Config>, socket_caps
                 }
                 st.recompute();
                 st.notify_controls(Some(user));
+                if st.volume_user().as_deref() == Some(user) {
+                    st.send_device_volume();
+                }
             }
             ToControl::ListOutputs => {
                 let m = st.outputs_msg();
@@ -582,7 +885,8 @@ fn serve_control(mut c: UnixStream, state: Shared, cfg: Arc<Config>, socket_caps
                     continue;
                 }
                 let dir = st.state_dir.clone();
-                if let Err(e) = st.outputs.set_layout(&dir, &output_name(&d), channels) {
+                let key = st.output_key(&d);
+                if let Err(e) = st.outputs.set_layout(&dir, &key, channels) {
                     eprintln!("choragusd: saving output settings: {e}");
                 }
                 st.send_balance();
@@ -602,7 +906,8 @@ fn serve_control(mut c: UnixStream, state: Shared, cfg: Arc<Config>, socket_caps
                     continue;
                 }
                 let dir = st.state_dir.clone();
-                if let Err(e) = st.outputs.set_spatial(&dir, &output_name(&d), on) {
+                let key = st.output_key(&d);
+                if let Err(e) = st.outputs.set_spatial(&dir, &key, on) {
                     eprintln!("choragusd: saving output settings: {e}");
                 }
                 st.send_balance();
@@ -622,7 +927,8 @@ fn serve_control(mut c: UnixStream, state: Shared, cfg: Arc<Config>, socket_caps
                     continue;
                 }
                 let dir = st.state_dir.clone();
-                if let Err(e) = st.outputs.set_balance(&dir, &output_name(&d), balance) {
+                let key = st.output_key(&d);
+                if let Err(e) = st.outputs.set_balance(&dir, &key, balance) {
                     eprintln!("choragusd: saving output settings: {e}");
                 }
                 st.send_balance();
@@ -639,7 +945,7 @@ fn serve_control(mut c: UnixStream, state: Shared, cfg: Arc<Config>, socket_caps
                 }
                 let before = st.sess.resolve();
                 st.sess.default_device = output;
-                st.send_balance();
+                st.use_output();
                 for ch in crate::policy::diff(&before, &st.sess.resolve()) {
                     if let crate::policy::Change::Reroute { stream, to_sink } = ch {
                         let _ = wire::send(&mut st.lyrad, &ToEngine::Reroute { stream, sink: to_sink });
@@ -864,13 +1170,29 @@ fn serve_lyrad(mut rd: UnixStream, state: Shared) -> io::Error {
             FromEngine::Flushed { stream, frame } => forward(&state, stream, ToApp::Flushed { stream, frame }),
             FromEngine::Drained { stream } => forward(&state, stream, ToApp::Drained { stream }),
             FromEngine::Underrun { stream, frames } => forward(&state, stream, ToApp::Underrun { stream, frames }),
-            // External devices: lyra-external-device.md E2.
-            FromEngine::DeviceAdded { .. } | FromEngine::DeviceFailed { .. } | FromEngine::OutputInUse { .. } => {}
+            FromEngine::DeviceAdded { device, ring_frames } => {
+                let (ring, page) = match (recv_fd(rd.as_raw_fd()), recv_fd(rd.as_raw_fd())) {
+                    (Ok(r), Ok(p)) => (r, p),
+                    (Err(e), _) | (_, Err(e)) => return e,
+                };
+                state.lock().unwrap().device_added(device, ring_frames, &ring, &page);
+            }
+            FromEngine::DeviceFailed { device } => {
+                let mut st = state.lock().unwrap();
+                if let Some(id) = st.pending_devices.remove(&device) {
+                    eprintln!("choragusd: lyrad couldn't make device {device}");
+                    if let Some(w) = st.ext.get_mut(&id).and_then(|e| e.writer.as_mut()) {
+                        let _ = wire::send(w, &FromDevice::Denied { code: DenyCode::EngineUnavailable });
+                    }
+                }
+            }
+            FromEngine::OutputInUse { device } => eprintln!("choragusd: lyrad mixes for output {device}"),
             FromEngine::Layout { channels } => {
                 let mut st = state.lock().unwrap();
                 // The device refused a layout: keep what it has, and show it.
                 let sink = st.sess.default_device;
-                if let Some(name) = st.sess.devices.iter().find(|d| d.id == sink).map(output_name) {
+                let builtin = st.sess.devices.iter().find(|d| d.id == sink && !st.ext.contains_key(&d.id)).copied();
+                if let Some(name) = builtin.map(|d| st.output_key(&d)) {
                     if st.outputs.layout(&name) != channels {
                         eprintln!("choragusd: {name} can't take {} channels; kept at {channels}", st.outputs.layout(&name));
                         let dir = st.state_dir.clone();
@@ -924,6 +1246,7 @@ fn apply_seat(state: &Shared, seat_path: &str) {
         st.to_app(conn, &ToApp::Held { stream, held });
     }
     st.notify_controls(None);
+    st.send_device_volume();
 }
 
 /// Run the daemon. Returns only on an error: binding a socket, reaching lyrad,
@@ -940,6 +1263,12 @@ pub fn run(cfg: Config) -> io::Error {
     let spk = Device { id: 0, kind: DeviceKind::Speakers };
     let state: Shared = Arc::new(Mutex::new(State {
         sess: Session::new(vec![spk], spk.id),
+        ext: HashMap::new(),
+        pending_devices: HashMap::new(),
+        next_output: 1,
+        next_engine: 1,
+        gone_seq: 0,
+        last_user: None,
         media: MediaRegistry::default(),
         media_conns: HashMap::new(),
         volumes: VolumeStore::new(cfg.state_dir.clone()),
@@ -988,6 +1317,8 @@ pub fn run(cfg: Config) -> io::Error {
                     std::thread::spawn(move || serve_control(app, state, cfg, caps));
                 } else if caps == CAP_MEDIA {
                     std::thread::spawn(move || serve_media(app, state, cfg, caps));
+                } else if caps == CAP_DEVICE {
+                    std::thread::spawn(move || serve_device(app, state, cfg, caps));
                 } else {
                     std::thread::spawn(move || serve_app(app, state, cfg, caps));
                 }

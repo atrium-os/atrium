@@ -161,6 +161,11 @@ fn validate_capabilities(c: &Capabilities, ctx: &str, r: &mut Report) {
             "{ctx}.audio-control = true: restricted to the volume UI (Forum, Curia); \
              requires explicit policy approval"));
     }
+    if c.audio_device == Some(true) {
+        r.warnings.push(format!(
+            "{ctx}.audio-device = true: restricted to output device drivers \
+             (vinculum-audio); requires explicit policy approval"));
+    }
     if c.media_control == Some(true) {
         r.warnings.push(format!(
             "{ctx}.media-control = true: restricted to now-playing and the media keys \

@@ -137,6 +137,11 @@ pub struct Capabilities {
     /// what others play or steer them (atrium-player-pip-keys.md §4).
     #[serde(rename = "media-control")]
     pub media_control: Option<bool>,
+    /// An output device driver (vinculum-audio): add an output to choragusd
+    /// and read that output's mix over `audio-device/`. It hears no app's
+    /// own samples and sets no app's level (lyra-external-device.md).
+    #[serde(rename = "audio-device")]
+    pub audio_device: Option<bool>,
     /// Fetch URLs through the system's jailed fetcher, Nuntius
     /// (docs/spec/nuntius.md §2): portcullisd starts a fetcher of the app's
     /// own on request and hands it the channel. No raw sockets: the address
@@ -274,6 +279,7 @@ pub fn merge_capabilities(base: &Capabilities, ovr: &Capabilities) -> Capabiliti
         app_launch:       ovr.app_launch.or(base.app_launch),
         audio_control:    ovr.audio_control.or(base.audio_control),
         media_control:    ovr.media_control.or(base.media_control),
+        audio_device:     ovr.audio_device.or(base.audio_device),
         net_fetch:        ovr.net_fetch.or(base.net_fetch),
         extra:            {
             let mut e = base.extra.clone();

@@ -257,6 +257,53 @@ pub enum FromMedia {
     Denied { code: DenyCode },
 }
 
+// ── external device ⟷ choragusd (audio-device/, lyra-external-device.md §5) ─
+
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
+pub enum OutputKind {
+    Headphones,
+    Headset,
+    Speaker,
+    Car,
+}
+
+/// Longest device name kept (bytes, cut on a character).
+pub const MAX_DEVICE_NAME: usize = 64;
+
+/// What an output device driver (vinculum-audio; the `audio-device`
+/// capability) may say.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+pub enum ToDevice {
+    Hello { version: u16 },
+    /// `persistent_id`: stable across reconnects (not a hardware address).
+    /// `rate` one of [`DEVICE_RATES`], `channels` 1 or 2.
+    Announce {
+        persistent_id: u64,
+        name: String,
+        kind: OutputKind,
+        rate: u32,
+        channels: u8,
+        hw_volume: bool,
+        initial_delay_frames: u32,
+    },
+    /// The device's own volume control (AVRCP absolute volume), 0 to 1.
+    Volume { volume: f32 },
+    /// The link dropped (closing the socket says the same). Announce again on
+    /// the same socket within 2 s to keep the same output (reconfiguration).
+    Gone,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+pub enum FromDevice {
+    Welcome,
+    /// Followed by two fds: the ring (consumer end), then the device page.
+    /// `device` is the output's id as the volume UI shows it.
+    Ready { device: u32, ring_frames: u64 },
+    /// The output's volume (only for a device with `hw_volume`), 0 to 1.
+    SetVolume { volume: f32 },
+    Denied { code: DenyCode },
+}
+
 // ── volume UI ⟷ choragusd (audio-control/, lyra-v1.md §7) ──────────────────
 
 /// Apps an `Apps` message lists (so it fits one frame).

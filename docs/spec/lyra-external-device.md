@@ -163,6 +163,20 @@ E1 to E3 need nothing from Vinculum, so they can start now.
   fake device with a 150 ms delay; a click predicted a second ahead lands within about
   0.2 ms.
 
+- **E2** (2026-11-07): `wire::ToDevice`/`FromDevice`/`OutputKind`, `client::Device`
+  (connect, `reconfigure`, `volume`, `gone`); choragusd `serve_device` on
+  `audio-device/` (`CAP_DEVICE`), outputs keyed `device-<persistent id>` for their settings
+  and shown by the device's cleaned name; headphones and headsets become current (policy
+  kind `Headset`), speakers and cars are listed (`External`); a reconfiguration keeps the
+  output id and swaps lyrad's device under it; 2 s grace, then removal, the previous output
+  back, and the active session paused if it was playing through headphones; with
+  `hw_volume` the master goes to the device (`SetVolume`) and out of the digital gain, and
+  the device's `Volume` sets the master (the seat's user, or the last user to connect
+  without a seat). Portcullis: restricted `audio-device` capability (schema, validate,
+  policy delta, jail socket mount); `lyra-service.sh` makes the socket directory. e2e:
+  connect, take over, volume both ways, reconfigure, leave and pause; grant and rate
+  refusals.
+
 ## 9. Decisions, with recommendations
 
 1. **Devices announce to choragusd, not lyrad**, through a new restricted `audio-device`

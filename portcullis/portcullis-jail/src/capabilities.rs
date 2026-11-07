@@ -48,6 +48,9 @@ pub fn apply_all(
     if caps.media_control == Some(true) {
         apply_media_control(jc, opts);
     }
+    if caps.audio_device == Some(true) {
+        apply_audio_device(jc, opts);
+    }
     if let Some(paths) = &caps.filesystem {
         for p in paths {
             apply_filesystem(p, jc, opts)?;
@@ -207,6 +210,13 @@ pub fn apply_audio_control(jc: &mut JailConfig, opts: &BuildOpts) {
 /// state and (opt-in) title, and its actions; never samples or levels.
 pub fn apply_media_control(jc: &mut JailConfig, opts: &BuildOpts) {
     apply_socket("media-control.sock", jc, opts);
+}
+
+/// `audio-device`: choragusd's socket for output device drivers
+/// (`audio-device/`, lyra-external-device.md), for vinculum-audio: it adds an
+/// output and reads that output's mix, nothing else.
+pub fn apply_audio_device(jc: &mut JailConfig, opts: &BuildOpts) {
+    apply_socket("audio-device.sock", jc, opts);
 }
 
 pub fn apply_filesystem(spec: &str, jc: &mut JailConfig, opts: &BuildOpts) -> Result<(), BuildError> {
