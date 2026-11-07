@@ -125,10 +125,10 @@ BrakTooth (controller and LE stack crashes from malformed packets).
 | `vinculum-hci` | `_vinculum-hci` (65024) | own; devfs ruleset 25 `atrium_bluetooth` shows only its controller's `ugen`/`usb` nodes or tty | the device; firmware files read-only | only packet framing (lengths) |
 | `vinculumd` | `_vinculum` (65023) | own; no devices, no network | one socket per controller to `vinculum-hci`; service sockets; Arca link | yes, everything from the air up to the profile boundary |
 | `vinculum-audio` | `_vinculum-audio` (65025) | own; no devices, no network | channels from vinculumd; a ring to lyrad; choragusd control | AVDTP, AVRCP, HFP AT commands, codec frames |
-| `tactusd` | `_tactus` | input thread's jail | HID fds from vinculumd | HID descriptors and reports (as for USB) |
+| `tactusd` | `_tactus` (65018) | input thread's jail | HID fds from vinculumd | HID descriptors and reports (as for USB) |
 
 uids are proposals; they get reserved in `jaild.policy.toml` when B1 lands, clear of whatever
-the input thread takes for `_tactus`.
+the input thread's `_tactus` (65018). The input thread accepted §10 as written (2026-11-07).
 
 **Why three of ours and not one.**
 - `vinculum-hci` is separate so that a compromised `vinculumd` cannot talk to the USB device
