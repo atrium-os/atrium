@@ -269,6 +269,8 @@ allowed_system_uids = [
     65020,   # _arca: the secret store (docs/spec/arca.md)
     65022,   # _limen: the embed broker, limend (docs/spec/limen.md); choragusd
              # knows it by this uid (--limen-uid) for embedded players' audio tickets
+    65023,   # _nuntius: the system fetcher, started per app by portcullisd
+             # (OpenFetcher) under the system worker rule (nuntius-bundle.sh)
 ]
 
 [gid]
@@ -282,6 +284,7 @@ allowed_system_gids = [
     65017,   # _choragus
     65020,   # _arca
     65022,   # _limen
+    65023,   # _nuntius
 ]
 
 

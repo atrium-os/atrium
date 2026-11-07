@@ -311,9 +311,51 @@ fn serve(stream: UnixStream, shared: Arc<Mutex<Tenants>>) -> std::io::Result<()>
             Err(e) => return Err(e),
         };
         if let Request::ExecInstance { app_id, instance, tmpfs_mb, memory_mb, cpu_pct, require_memory_limit } = req {
+            /* ★ The fetcher only through OpenFetcher: started here, it would
+             * skip the caller's `net-fetch` check, and the system grant of the
+             * fetcher's own network would make it anyone's raw fetch. */
+            if app_id == portcullis_ipc::NUNTIUS_APP {
+                write_response(&mut writer, &Response::LaunchFailed { stage: "policy".into(),
+                    message: format!("{app_id} is started only by OpenFetcher, for an app holding net-fetch") })?;
+                continue;
+            }
             let limits = (memory_mb, cpu_pct, require_memory_limit);
-            handle_exec_instance(app_id, instance, tmpfs_mb, limits, &owner, &shared,
+            let rule = Policy::load_system(std::path::Path::new(SYSTEM_PATH)).ok()
+                .and_then(|p| p.worker_rule(&app_id, &owner).cloned());
+            handle_exec_instance(app_id, instance, tmpfs_mb, limits, rule, &owner, &shared,
                                  &LIMITER, &mut writer, &reader)?;
+            continue;
+        }
+        /* ★ OpenFetcher (docs/spec/nuntius.md §2): a Nuntius of the caller's
+         * own. Gated like Catalog, on the PEER UID through the launch
+         * registry: the caller's INSTALLED manifest must hold `net-fetch`.
+         * The fetcher always runs as the system worker rule's uid for
+         * NUNTIUS_APP, never as the caller; without that rule it is refused. */
+        if matches!(req, Request::OpenFetcher) {
+            let app = portcullis_peer::AppRegistry::load(portcullis_peer::DEFAULT_REGISTRY)
+                .unwrap_or_default().resolve(uid).map(|(_, app)| app.to_string());
+            let refuse = |why: String| Response::LaunchFailed { stage: "net-fetch".into(), message: why };
+            let Some(app) = app else {
+                eprintln!("portcullisd: fetcher DENIED to uid {uid}: not a launched app");
+                write_response(&mut writer, &refuse("cap.net_fetch.denied: caller is not a launched app".into()))?;
+                continue;
+            };
+            if !launch::app_may_fetch(&app) {
+                eprintln!("portcullisd: fetcher DENIED to {app} (uid {uid}): no net-fetch capability");
+                write_response(&mut writer, &refuse("cap.net_fetch.denied: this app's manifest does not hold net-fetch".into()))?;
+                continue;
+            }
+            let Some(rule) = Policy::load_system(std::path::Path::new(SYSTEM_PATH)).ok()
+                .and_then(|p| p.workers.get(portcullis_ipc::NUNTIUS_APP).cloned()) else {
+                eprintln!("portcullisd: fetcher for {app} REFUSED: no system worker rule for {}", portcullis_ipc::NUNTIUS_APP);
+                write_response(&mut writer, &refuse(format!("no system worker rule for {}: the fetcher never runs as its caller", portcullis_ipc::NUNTIUS_APP)))?;
+                continue;
+            };
+            let instance = fetcher_instance(uid);
+            eprintln!("portcullisd: fetcher {instance} for {app} (uid {uid})");
+            // A fetcher needs no scratch space beyond its own small tmpfs.
+            handle_exec_instance(portcullis_ipc::NUNTIUS_APP.to_string(), Some(instance), 16, (None, None, true), Some(rule),
+                                 &owner, &shared, &LIMITER, &mut writer, &reader)?;
             continue;
         }
         if let Request::Launch { app_id, bypass_policy } = req {
@@ -456,6 +498,7 @@ fn handle_exec_instance(
     instance: Option<String>,
     tmpfs_mb: u32,
     limits:   (Option<u64>, Option<u32>, bool),
+    rule:     Option<portcullis_policy::WorkerRule>,
     user:     &str,
     shared:   &Mutex<Tenants>,
     limiter:  &Arc<Mutex<portcullisd::ratelimit::Limiter>>,
@@ -470,8 +513,6 @@ fn handle_exec_instance(
      * not delegate a uid): `user` may start this app as a worker that runs
      * as the rule's `run_as`, on the rule's own budget. Without one, the
      * worker runs as the caller, as it always has. */
-    let rule = Policy::load_system(std::path::Path::new(SYSTEM_PATH)).ok()
-        .and_then(|p| p.worker_rule(&app_id, user).cloned());
     if let Some(r) = &rule {
         eprintln!("portcullisd: {user} starts {app_id} as {} (system worker rule)", r.run_as);
     }
@@ -602,6 +643,13 @@ fn handle_exec_instance(
     drop(slot);
     if let Some(done) = watch { done.store(true, std::sync::atomic::Ordering::Release) }
     write_response(writer, &resp)
+}
+
+/// A fetcher's jail instance: unique per start (the caller's uid and a
+/// sequence number), within the 64 bytes a jail name may take.
+fn fetcher_instance(uid: u32) -> String {
+    static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    format!("u{uid}-{}", SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed))
 }
 
 fn jail_name_for(spec: &portcullis_oneshot::Spec) -> Option<String> {
@@ -1189,6 +1237,9 @@ fn handle(req: Request, user: &str, shared: &Mutex<Tenants>) -> Response {
          * receive the caller's descriptors. */
         Request::ExecInstance { .. } => Response::Error {
             message: "ExecInstance must be routed through the fd-passing path".into(),
+        },
+        Request::OpenFetcher => Response::Error {
+            message: "OpenFetcher must be routed through the peer-uid, fd-passing path".into(),
         },
         Request::Launch { .. } => Response::Error {
             /* Caught by serve() before reaching here. */

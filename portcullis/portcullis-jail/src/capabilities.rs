@@ -79,6 +79,13 @@ pub fn apply_all(
     if caps.app_launch == Some(true) {
         apply_app_launch(jc, opts);
     }
+    // `net-fetch`: the app asks portcullisd for a fetcher (OpenFetcher), so
+    // it reaches portcullisd's socket, as the launcher does. portcullisd
+    // gates every verb on the caller's own installed manifest, so the mount
+    // grants nothing else.
+    if caps.net_fetch == Some(true) && caps.app_launch != Some(true) {
+        apply_app_launch(jc, opts);
+    }
     Ok(())
 }
 

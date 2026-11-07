@@ -62,6 +62,9 @@ pub fn resolve_socket_path() -> Option<&'static str> {
 /// get `Response::ProtoMismatch` and the daemon closes the connection.
 pub const PROTO_VERSION: u32 = 1;
 
+/// The fetcher `OpenFetcher` starts (docs/spec/nuntius.md).
+pub const NUNTIUS_APP: &str = "org.atrium.nuntius";
+
 /// The bounded reclaim signal a memory governor may request — mirrors jaild's
 /// `ReapSignal` but keeps this app-protocol crate free of a jaild dependency
 /// (portcullisd maps one to the other). No raw signal numbers cross the wire.
@@ -151,6 +154,17 @@ pub enum Request {
         #[serde(default)]
         require_memory_limit: bool,
     },
+
+    /// ★ A fetcher of the caller's own: Nuntius (docs/spec/nuntius.md §2),
+    /// the system's jailed fetcher, one instance per request. Requires the
+    /// caller's INSTALLED manifest to hold `net-fetch`; the caller is
+    /// identified by the launch registry (peer uid), never by anything it
+    /// sends. The handoff is `ExecInstance`'s: `ReadyForFds`, then three
+    /// descriptors (the channel's socket as stdin and stdout, and stderr),
+    /// and the fetcher runs until the caller hangs up on this connection.
+    /// The fetcher is always the system's installed one (`NUNTIUS_APP`), run
+    /// as its own uid under the system worker rule, never as the caller.
+    OpenFetcher,
 
     /// "What may I launch?" — the installed-app catalog, for the launcher UI
     /// (Forum's dock). Requires the caller's manifest to hold `app-launch`.

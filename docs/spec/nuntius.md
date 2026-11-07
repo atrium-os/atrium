@@ -5,8 +5,10 @@
 
 **Status:** accepted by the user, 2026-11-06 (name and interface, all recommendations).
 Steps 1 and 3 are built inside `navigator-fetch` (§6.1). Step 2, the `nuntius` crate and
-`nuntiusd` on an Aqueduct channel, was built 2026-11-07 (§6.2). Steps 4 and 5 are not built
-yet. Owner: the Navigator thread.
+`nuntiusd` on an Aqueduct channel, was built 2026-11-07 (§6.2). So was step 4's launch,
+portcullisd's `OpenFetcher` and the `net-fetch` capability (§6.3), but it has not yet been
+run on FreeBSD. Wiring the standalone player and step 5 (the C ABI) are not built. Owner:
+the Navigator thread.
 
 **Asked by the user, 2026-11-06:** "the navigator's sandboxed fetcher is the right one... used
 as a widget, third party apps can use it too." The same day, the user chose that the media
@@ -259,6 +261,46 @@ feed through it (fresco-video P3).
   - The same file runs the `nuntiusd` process itself: loopback and the metadata endpoint
     are refused by policy without the grant, it exits cleanly on hang-up, and it refuses a
     standard input that is not a socket.
+
+### 6.3 Step 4: the launch and `net-fetch` (2026-11-07)
+
+- **The capability.** An app's manifest holds `net-fetch = true` (portcullis-toml). It
+  goes through the usual grant flow, and the permissions prompt says "Fetch from the
+  internet through the system's fetcher (no direct network access)". The jail gets
+  portcullisd's socket directory and nothing else.
+- **`OpenFetcher`** (portcullis-ipc) is a new portcullisd verb.
+  - **Who may ask.** The caller is identified by the launch registry from its peer uid,
+    never by anything it sends, as `Catalog` is. Its installed manifest must hold
+    `net-fetch`.
+  - **Uid.** The fetcher is always `org.atrium.nuntius`, run as the system worker rule's
+    uid (`_nuntius`, 65023) and never as the caller. Without that rule, portcullisd
+    refuses.
+  - **Jail.** The handoff is `ExecInstance`'s: `ReadyForFds`, then three descriptors. Each
+    fetcher gets a one-shot jail instance of its own, `u<uid>-<n>`, which is removed when
+    the app hangs up.
+  - **`ExecInstance` refuses `org.atrium.nuntius`.** Otherwise the fetcher's system-wide
+    network grant would be anyone's raw fetch.
+- **Client.** `nuntius::launch::open()` does the handshake and returns the `Client`. A
+  guard keeps the jail alive: dropping it shuts the connection, so portcullisd removes the
+  jail. The connection must be shut, not just dropped, because a thread holds a clone of
+  it.
+- **Install.** `scripts/nuntius-bundle.sh` builds the signed bundle in the guest:
+  `nuntiusd`, the trust store, and the resolver's files. It also creates the system grant,
+  `_nuntius`, and the worker rule (`callers = []`). `etc/jaild.policy.toml` admits uid
+  65023.
+- **Tests:**
+  - `nuntius/tests/launch.rs` runs against a stand-in portcullisd: handshake, channel as
+    stdin and stdout, hang-up on drop, and a refusal surfacing as `PermissionDenied`.
+  - portcullis-toml, portcullis-policy and portcullis-ipc unit tests pass.
+  - portcullisd and `nuntiusd` type-check for FreeBSD (`x86_64-unknown-freebsd`).
+  - `nuntius-probe` (an example in the crate) is the app side of the jailed check.
+- **Not done:**
+  - A run on FreeBSD: an app holding `net-fetch` fetching through its own jailed fetcher,
+    and one without it refused. This cloud container cannot download a FreeBSD image, so
+    it needs the Mac.
+  - The standalone player still uses its own `atrium-player-fetch`.
+  - Origin narrowing from the manifest (§4) and the per-client private-network grant.
+  - The Navigator's own instances, which stay in-process for now.
 
 ## 7. Open questions
 

@@ -10,6 +10,12 @@ publish     = false
 aqueduct = { path = "../aqueduct" }
 serde    = { version = "1", features = ["derive"] }
 postcard = { version = "1", features = ["use-std"] }
+# `launch`: asking portcullisd for a fetcher (OpenFetcher).
+portcullis-ipc = { path = "../portcullis/portcullis-ipc", optional = true }
+
+[features]
+default = ["launch"]
+launch = ["dep:portcullis-ipc"]
 
 [dev-dependencies]
 aqueduct = { path = "../aqueduct" }

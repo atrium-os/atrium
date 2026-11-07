@@ -8,7 +8,9 @@
 //!   `Error` (§3.2), `Head` always first;
 //! - [`wire`]: their encoding on the channel (`CLASS_FETCH`, postcard),
 //!   checked on the way in by both ends;
-//! - [`Client`]: the client's end; [`server::Channel`]: the fetcher's.
+//! - [`Client`]: the client's end; [`server::channel`]: the fetcher's;
+//! - [`launch::open`]: a fetcher of the app's own, from portcullisd
+//!   (`OpenFetcher`, for an app whose manifest holds `net-fetch`).
 //!
 //! This crate has no network code, so an app links it without TLS or a
 //! resolver. The fetcher (`nuntiusd`, in `navigator-fetch`) uses the same
@@ -19,6 +21,8 @@
 use serde::{Deserialize, Serialize};
 
 pub mod client;
+#[cfg(feature = "launch")]
+pub mod launch;
 pub mod server;
 pub mod wire;
 

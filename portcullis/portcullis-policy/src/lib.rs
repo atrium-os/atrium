@@ -191,6 +191,7 @@ pub struct CapabilityDelta {
     pub app_launch:      bool,
     pub audio_control:   bool,
     pub media_control:   bool,
+    pub net_fetch:       bool,
     pub tessera_cas_read: bool,
     /// Filesystem paths in manifest but not in granted list.
     pub filesystem_added: Vec<String>,
@@ -219,6 +220,7 @@ impl CapabilityDelta {
             && !self.app_launch
             && !self.audio_control
             && !self.media_control
+            && !self.net_fetch
             && !self.tessera_cas_read
             && self.filesystem_added.is_empty()
             && self.fonts_added.is_empty()
@@ -248,6 +250,7 @@ impl CapabilityDelta {
         if self.app_launch      { out.push("List the installed apps and ask to launch them".into()); }
         if self.audio_control   { out.push("Change other apps' volume and the sound output (the volume control)".into()); }
         if self.media_control   { out.push("See what is playing and control it (now-playing and the media keys)".into()); }
+        if self.net_fetch       { out.push("Fetch from the internet through the system's fetcher (no direct network access)".into()); }
         if self.tessera_cas_read{ out.push("Read the global Tessera CAS (privileged)".into()); }
         for p in &self.filesystem_added {
             out.push(format!("Read and write {p}"));
@@ -328,6 +331,7 @@ pub fn compute_delta(
     bool_cap!(app_launch);
     bool_cap!(audio_control);
     bool_cap!(media_control);
+    bool_cap!(net_fetch);
     bool_cap!(tessera_cas_read);
 
     if let Some(req_paths) = &requested.filesystem {
@@ -497,6 +501,7 @@ mod tests {
             app_launch: None,
             audio_control: None,
             media_control: None,
+            net_fetch: None,
             extra:      Default::default(),
         }
     }

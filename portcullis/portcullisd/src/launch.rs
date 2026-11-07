@@ -651,6 +651,15 @@ pub fn app_may_launch_apps(app_id: &str) -> bool {
     m.capabilities.app_launch == Some(true)
 }
 
+/// Does this app's INSTALLED manifest hold `net-fetch` (docs/spec/nuntius.md
+/// §2)? Read from the app tree, never from anything the caller sends.
+pub fn app_may_fetch(app_id: &str) -> bool {
+    let path = PathBuf::from(APPS_DIR).join(app_id).join("atrium.toml");
+    let Ok(text) = fs::read_to_string(path) else { return false };
+    let Ok(m) = Manifest::from_str(&text) else { return false };
+    m.capabilities.net_fetch == Some(true)
+}
+
 /// The jid of a running jail for `app_id`, or `None`.
 ///
 /// Asks jls(8) rather than tracking state in-process: portcullisd can be
