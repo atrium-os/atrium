@@ -589,6 +589,7 @@ name = "nuntius"
 version = "0.1.0"
 dependencies = [
  "aqueduct",
+ "libc",
  "portcullis-ipc",
  "postcard",
  "serde",

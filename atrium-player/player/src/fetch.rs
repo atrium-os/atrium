@@ -6,8 +6,18 @@
 //! download is complete. Neither the supervisor nor the decode worker ever
 //! gets a socket to the network.
 //!
-//! Until nuntiusd and portcullisd's `net.fetch` launch exist (nuntius.md
-//! §6 steps 2 and 4), this helper is the fetcher's process.
+//! ★ Two ways to the same messages ([`FromFetcher`]):
+//! - **the system fetcher** (nuntius.md §6.3): when the player runs as an
+//!   app whose manifest holds `net-fetch`, portcullisd starts a jailed
+//!   Nuntius of its own ([`Fetcher::system`]), running as `_nuntius` in its
+//!   own jail; a thread here turns its events into the messages below;
+//! - **the helper** (`atrium-player-fetch`, [`Fetcher::spawn`]): a child in
+//!   Capsicum, for a player not launched by portcullisd (development, the
+//!   VM checks).
+//!
+//! `ATRIUM_PLAYER_FETCHER=system|helper` picks one; by default the system
+//! fetcher is tried when portcullisd is reachable, and the helper used
+//! otherwise.
 use std::io;
 use std::os::fd::{AsRawFd, OwnedFd};
 use std::os::unix::net::UnixStream;
@@ -79,10 +89,16 @@ pub fn default_fetcher() -> PathBuf {
     std::env::current_exe().unwrap_or_default().with_file_name("atrium-player-fetch")
 }
 
-/// The fetcher process, asked for one URL.
+/// The fetcher, asked for one URL.
 pub struct Fetcher {
-    child: Child,
+    how: How,
     sock: UnixStream,
+}
+
+enum How {
+    Helper(Child),
+    /// The system fetcher: the guard keeps its jail; dropping it ends it.
+    System(#[allow(dead_code)] nuntius::launch::FetcherGuard),
 }
 
 impl Fetcher {
@@ -98,7 +114,26 @@ impl Fetcher {
         // The URL goes after the fetcher is sandboxed: it reads its request
         // only once it can't open a file.
         sys::send_frame(&mine, &ToFetcher::Get { url: url.to_string() }.encode(), &[])?;
-        Ok(Fetcher { child, sock: mine })
+        Ok(Fetcher { how: How::Helper(child), sock: mine })
+    }
+
+    /// ★ The system fetcher (portcullisd's `OpenFetcher`), asked for `url`.
+    /// `PermissionDenied` when the player's manifest does not hold
+    /// `net-fetch`.
+    pub fn system(url: &str) -> io::Result<Fetcher> {
+        Self::over(nuntius::launch::open()?, url)
+    }
+
+    /// The same, over a fetcher already opened (tests open one by hand).
+    pub fn over(f: nuntius::launch::Fetcher, url: &str) -> io::Result<Fetcher> {
+        if url.len() > URL_MAX || url.chars().any(char::is_control) {
+            return Err(io::Error::new(io::ErrorKind::InvalidInput, "a URL the fetcher won't take"));
+        }
+        let (client, guard) = f.into_parts();
+        let (mine, theirs) = UnixStream::pair()?;
+        let url = url.to_string();
+        std::thread::Builder::new().name("player-fetch".into()).spawn(move || translate(client, &url, &theirs))?;
+        Ok(Fetcher { how: How::System(guard), sock: mine })
     }
 
     /// The next message, waiting at most `wait`. `Err` when the fetcher is
@@ -122,8 +157,75 @@ impl Fetcher {
 
 impl Drop for Fetcher {
     fn drop(&mut self) {
-        let _ = self.child.kill();
-        let _ = self.child.wait();
+        if let How::Helper(c) = &mut self.how {
+            let _ = c.kill();
+            let _ = c.wait();
+        }
+    }
+}
+
+/// ★ The system fetcher's events as the helper's messages, on `out` (the
+/// same frames [`Fetcher::poll`] reads): `Fd` delivery, with a file of our
+/// own filled from `Data` when the response has no length, as the helper
+/// does. Ends with `Done` or `Failed`, or when the player hangs up.
+fn translate(mut c: nuntius::Client, url: &str, out: &UnixStream) {
+    use nuntius::{Deliver, Event, Limits, Open};
+    use std::io::Write;
+    let send = |m: FromFetcher, fd: Option<&OwnedFd>| {
+        let raw: Vec<_> = fd.map(|f| f.as_raw_fd()).into_iter().collect();
+        sys::send_frame(out, &m.encode(), &raw).is_ok()
+    };
+    let mut o = Open::get(1, url);
+    o.deliver = Deliver::Fd;
+    o.limits = Limits { max_bytes: nuntius::FD_MAX_BYTES, connect_ms: 10_000, idle_ms: 20_000, total_ms: nuntius::STREAM_TOTAL_MS_MAX };
+    o.accept = Some("video/*, audio/*;q=0.9, */*;q=0.5".into());
+    if c.open(o).is_err() {
+        send(FromFetcher::Failed { reason: "the fetcher's channel".into() }, None);
+        return;
+    }
+    let mut head: (Option<u64>, Option<String>) = (None, None);
+    let mut own: Option<std::fs::File> = None;
+    let mut sent_file = false;
+    loop {
+        let ev = match c.recv() {
+            Ok(ev) => ev,
+            Err(_) => { send(FromFetcher::Failed { reason: "the fetcher stopped".into() }, None); return }
+        };
+        let ok = match ev {
+            Event::Head { status, .. } if !(200..300).contains(&status) => {
+                send(FromFetcher::Failed { reason: format!("HTTP {status}") }, None);
+                return;
+            }
+            Event::Head { length, content_type, .. } => {
+                head = (length, content_type.map(|c| c.chars().filter(|c| !c.is_control()).take(256).collect()));
+                true
+            }
+            Event::Fd { fd, .. } if !sent_file => { sent_file = true; send(FromFetcher::File { length: head.0, content_type: head.1.clone() }, Some(&fd)) }
+            Event::Data { bytes, .. } => {
+                if own.is_none() {
+                    let Ok((w, ro)) = nuntius::anon_file() else { send(FromFetcher::Failed { reason: "a file".into() }, None); return };
+                    own = Some(w);
+                    sent_file = true;
+                    if !send(FromFetcher::File { length: None, content_type: head.1.clone() }, Some(&ro)) { return }
+                }
+                if own.as_mut().unwrap().write_all(&bytes).is_err() {
+                    send(FromFetcher::Failed { reason: "the file is full".into() }, None);
+                    return;
+                }
+                c.budget(bytes.len() as u64).is_ok()
+            }
+            Event::Done { bytes, .. } => {
+                if !sent_file {
+                    // An empty body.
+                    if let Ok((_, ro)) = nuntius::anon_file() { send(FromFetcher::File { length: Some(0), content_type: None }, Some(&ro)); }
+                }
+                send(FromFetcher::Done { bytes }, None);
+                return;
+            }
+            Event::Error { code, .. } => { send(FromFetcher::Failed { reason: format!("{code:?}") }, None); return }
+            Event::Fd { .. } | Event::Progress { .. } | Event::Retrying { .. } => true,
+        };
+        if !ok { return }
     }
 }
 

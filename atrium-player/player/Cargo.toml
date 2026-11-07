@@ -29,6 +29,9 @@ swash           = "0.1"
 atrium-media-demux = { path = "../demux" }
 serde    = { version = "1", features = ["derive"] }
 postcard = { version = "1", features = ["use-std"] }
+# The system fetcher (nuntius.md §5 client 2): asked of portcullisd when
+# the player is an app holding net-fetch.
+nuntius  = { path = "../../nuntius" }
 # --headless prints frame hashes comparable with ffmpeg's framemd5.
 md-5     = "0.10"
 
@@ -36,6 +39,8 @@ md-5     = "0.10"
 # examples/media_probe.rs: limend in process, and the capture.
 aqueduct = { path = "../../aqueduct" }
 png      = "0.17"
+# tests/system_fetcher.rs: a stand-in portcullisd.
+portcullis-ipc = { path = "../../portcullis/portcullis-ipc" }
 
 [[example]]
 name = "atrium-audio-play"

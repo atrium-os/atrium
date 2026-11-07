@@ -350,57 +350,7 @@ fn run(mut conv: Conversation<'static>, o: Open, ctl: &Ctl, inner: &Inner, ev: &
     }
 }
 
-/// ★ An anonymous file to fill, and a READ-ONLY descriptor of it for the
-/// client (nuntius.md §3.3): `memfd_create` (an `SHM_ANON` object that grows on write) with the descriptor
-/// narrowed to read, seek and fstat on FreeBSD (allowed in capability
-/// mode); `memfd_create` and a read-only reopen on Linux; elsewhere (the
-/// macOS dev host) an unlinked temporary file.
-pub fn anon_file() -> std::io::Result<(std::fs::File, std::os::fd::OwnedFd)> {
-    #[allow(unused_imports)]
-    use std::os::fd::{FromRawFd, OwnedFd};
-    #[cfg(target_os = "freebsd")]
-    unsafe {
-        // memfd_create is shm_open2(SHM_ANON) with SHM_GROW_ON_WRITE: a
-        // plain SHM_ANON object refuses writes past its size, so filling it
-        // with write(2) failed at the first byte. Allowed in capability mode.
-        let fd = libc::memfd_create(c"nuntius".as_ptr(), libc::MFD_CLOEXEC);
-        if fd < 0 { return Err(std::io::Error::last_os_error()) }
-        let ro = libc::dup(fd);
-        if ro < 0 { libc::close(fd); return Err(std::io::Error::last_os_error()) }
-        let mut rights: libc::cap_rights_t = std::mem::zeroed();
-        libc::__cap_rights_init(libc::CAP_RIGHTS_VERSION, &mut rights, libc::CAP_READ, libc::CAP_SEEK, libc::CAP_FSTAT, 0u64);
-        if libc::cap_rights_limit(ro, &rights) != 0 { libc::close(fd); libc::close(ro); return Err(std::io::Error::last_os_error()) }
-        return Ok((std::fs::File::from_raw_fd(fd), OwnedFd::from_raw_fd(ro)));
-    }
-    #[cfg(target_os = "linux")]
-    unsafe {
-        let fd = libc::memfd_create(c"nuntius".as_ptr(), libc::MFD_CLOEXEC);
-        if fd < 0 { return Err(std::io::Error::last_os_error()) }
-        let path = std::ffi::CString::new(format!("/proc/self/fd/{fd}")).unwrap();
-        let ro = libc::open(path.as_ptr(), libc::O_RDONLY | libc::O_CLOEXEC);
-        if ro < 0 { libc::close(fd); return Err(std::io::Error::last_os_error()) }
-        return Ok((std::fs::File::from_raw_fd(fd), OwnedFd::from_raw_fd(ro)));
-    }
-    #[allow(unreachable_code)]
-    {
-        // ★ A counter, not the clock alone: two threads asking within the
-        // clock's resolution got the same name, and `create_new` failed
-        // (seen as an intermittent test failure). A name taken by anything
-        // else is passed over.
-        static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-        let n = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_nanos()).unwrap_or(0);
-        let mut tries = 0;
-        let (w, p) = loop {
-            let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            let p = std::env::temp_dir().join(format!("nuntius-{}-{n}-{seq}", std::process::id()));
-            match std::fs::OpenOptions::new().read(true).write(true).create_new(true).open(&p) {
-                Ok(w) => break (w, p),
-                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists && tries < 16 => tries += 1,
-                Err(e) => return Err(e),
-            }
-        };
-        let ro = std::fs::File::open(&p)?;
-        let _ = std::fs::remove_file(&p);
-        Ok((w, OwnedFd::from(ro)))
-    }
-}
+/// ★ An anonymous file to fill, and a read-only descriptor of it for the
+/// client (nuntius.md §3.3): the `nuntius` crate's, so a client filling a
+/// file of its own (a stream of unknown length) makes the same kind.
+pub use nuntius::anon_file;

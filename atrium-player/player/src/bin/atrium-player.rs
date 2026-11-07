@@ -248,8 +248,29 @@ fn windowed(file: &str, exit_at_end: bool, size: (u32, u32)) {
     run(&mut app);
 }
 
-/// The sandboxed fetcher, asked for `url`.
+/// The fetcher, asked for `url`: the system's (portcullisd, `net-fetch`)
+/// when the player may have one, else the helper (fetch.rs).
 fn start_fetcher(url: &str) -> Fetcher {
+    let want = std::env::var("ATRIUM_PLAYER_FETCHER").unwrap_or_default();
+    if want == "system" || (want != "helper" && portcullis_reachable()) {
+        match Fetcher::system(url) {
+            Ok(f) => return f,
+            Err(e) if want == "system" => {
+                eprintln!("atrium-player: the system fetcher: {e}");
+                std::process::exit(1)
+            }
+            Err(e) => eprintln!("atrium-player: no system fetcher ({e}); using atrium-player-fetch"),
+        }
+    }
+    start_helper(url)
+}
+
+fn portcullis_reachable() -> bool {
+    ["/atrium/sockets/portcullis/portcullis.sock", "/atrium/sockets/portcullis.sock"].iter().any(|p| std::path::Path::new(p).exists())
+}
+
+/// The helper process (`atrium-player-fetch`), asked for `url`.
+fn start_helper(url: &str) -> Fetcher {
     let mut extra = Vec::new();
     if std::env::var("ATRIUM_PLAYER_FETCH_UNCONFINED").as_deref() == Ok("1") {
         extra.push("--unconfined-for-testing".to_string());
