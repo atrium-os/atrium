@@ -5204,6 +5204,20 @@ make.py ... installkernel DESTDIR=$HOME/stage -DNO_ROOT KODIR=/boot/kernel.atriu
 - Fork userland for amd64: `scripts/cross-build-world.sh` (~62 min). Stop the VM during it (the guest got OOM-killed).
 - Never run two make.py builds on one objdir.
 - An ATRIUM (WITNESS) kernel takes ~10 min to boot under TCG; watch `serial.sock`.
+- ATRIUM configs (2026-11-07): `ATRIUM-NODEBUG` to ship and measure, `ATRIUM-KASAN`,
+  `ATRIUM-SYZKALLER` (KASAN + KCOV), on arm64 and amd64; shared removals in
+  `sys/conf/std.atrium`. Check a booted guest with `sh scripts/kernel-hardening.sh install`
+  then `check` (docs/spec/kernel-hardening.md). `kern.elf64.allow_wx=0` breaks the syzkaller
+  executor (it maps its data segment RWX): set it to 1 for a fuzzing run, then back.
+- Rust kmods: `SRC=~/freebsd-src OBJ=~/obj sh scripts/rust-kmod-spike.sh prepare|build|deploy|test`
+  (`KERNCONF=` picks the kernel; kmod-rust-spike/README.md). `prepare` checks out
+  freebsd-kpi-rs into `$SRC/sys/rust` and applies `kmod-rust-spike/kpi-patches`.
+- syzkaller against the cloud VM: `type: isolated`, target `127.0.0.1:2222`. The guest needs
+  `/root/bin/dmesg` (a `dmesg -w` emulation; FreeBSD's has no `-w`), `PATH` with `/root/bin`
+  first in `/root/.ssh/environment`, and `PermitUserEnvironment PATH` in sshd_config.
+  Build the executor with the same `GIT_REVISION` as the manager, including any `+`.
+- To find where a hung kernel is, `info registers -a` on `mon.sock` and `llvm-symbolizer` on
+  the PC and X30 against the kernel in the objdir.
 
 ### 13.3 amd64 VM with gpusim (GPU driver + Fresco)
 
