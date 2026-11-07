@@ -1,6 +1,6 @@
 # Scoping: FreeBSD kernel and base security, and whether to port to Rust
 
-**Status:** scoping study, 2026-11-07. Nothing built. Shankar 2026-11-07: incremental path (§8.3) taken, no rewrite (D1); D2 is decided after the step-3 Rust kmod spike; new rule D9 (user space first for hostile-input parsers) agreed. D3–D8 stand as recommended.
+**Status:** scoping study, 2026-11-07. Nothing built. Shankar 2026-11-07: incremental path (§8.3) taken, no rewrite (D1); D2 is decided after the step-3 Rust kmod spike; new rule D9 (user space first for hostile-input parsers) agreed. D3–D8 accepted as recommended (Shankar 2026-11-07), including the per-jail syscall filter (§9.1), offering it upstream, and measuring profiles against past advisories first. Upstream-quality bar: built and tested carefully enough that FreeBSD could accept it.
 **Question (Shankar):** how stable and secure are the FreeBSD kernel and its core? What do
 the CVEs say, especially memory bugs that come from C? Does it make sense to port it to
 Rust? A port would be a very large commitment, so the analysis should be good enough now to
