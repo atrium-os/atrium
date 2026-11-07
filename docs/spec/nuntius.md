@@ -6,8 +6,8 @@
 **Status:** accepted by the user, 2026-11-06 (name and interface, all recommendations).
 Steps 1 and 3 are built inside `navigator-fetch` (§6.1). Step 2, the `nuntius` crate and
 `nuntiusd` on an Aqueduct channel, was built 2026-11-07 (§6.2). So was step 4's launch,
-portcullisd's `OpenFetcher` and the `net-fetch` capability (§6.3), but it has not yet been
-run on FreeBSD. Wiring the standalone player and step 5 (the C ABI) are not built. Owner:
+portcullisd's `OpenFetcher` and the `net-fetch` capability (§6.3), checked jailed on FreeBSD
+the same day (`scripts/nuntius-vm-check.sh`, 20/20). Wiring the standalone player and step 5 (the C ABI) are not built. Owner:
 the Navigator thread.
 
 **Asked by the user, 2026-11-06:** "the navigator's sandboxed fetcher is the right one... used
@@ -294,10 +294,24 @@ feed through it (fresco-video P3).
   - portcullis-toml, portcullis-policy and portcullis-ipc unit tests pass.
   - portcullisd and `nuntiusd` type-check for FreeBSD (`x86_64-unknown-freebsd`).
   - `nuntius-probe` (an example in the crate) is the app side of the jailed check.
+  - **FreeBSD, jailed (2026-11-07, arm64 16-CURRENT under TCG in the cloud):**
+    `scripts/nuntius-vm-check.sh` passes 20/20. A signed app with `net-fetch`, launched
+    by portcullisd, fetches http, https, by name and a 100 KB body by `Fd` from the
+    hermetic public fixture (navigator-fetch-vm-check.sh's network). Its fetcher is
+    `nuntiusd` in jail `app-org-atrium-nuntius--u<uid>-<n>` as `_nuntius` (65023), a
+    different jail from the app's own uid. The app itself has no network (raw connect:
+    network unreachable). The fetcher refuses 127.0.0.1, localhost, 169.254.169.254, and
+    public redirects to the metadata endpoint and to localhost. An app without `net-fetch`
+    (but with portcullisd's socket via `app-launch`) and an unlaunched caller are both
+    refused with `cap.net_fetch.denied`. `ExecInstance` of `org.atrium.nuntius` is
+    refused. No fetcher jail, mount or process is left after the app exits. The guest
+    needs `kern.racct.enable=1`: every fetcher requires a memory limit.
 - **Not done:**
-  - A run on FreeBSD: an app holding `net-fetch` fetching through its own jailed fetcher,
-    and one without it refused. This cloud container cannot download a FreeBSD image, so
-    it needs the Mac.
+  - A refused fetcher start is silent to the app. `open()` returns once the descriptors
+    are sent, and a later `LaunchFailed` (for example, jaild refusing a required memory
+    limit when racct is off) only marks the guard exited; the app sees its channel close
+    with no reason. `open()` should wait briefly for an early `LaunchFailed`, or the
+    fetcher's start should be confirmed before `ReadyForFds`.
   - The standalone player still uses its own `atrium-player-fetch`.
   - Origin narrowing from the manifest (§4) and the per-client private-network grant.
   - The Navigator's own instances, which stay in-process for now.

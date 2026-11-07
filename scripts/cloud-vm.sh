@@ -225,8 +225,11 @@ setup() {
 
     say "guest prep"
     "$ROOT/scripts/vssh" 'mkdir -p /usr/local/bin /usr/local/etc/rc.d /usr/local/lib
-        id navtest >/dev/null 2>&1 || pw useradd navtest -m' || die "guest prep"
-    echo "  /usr/local dirs, broker user navtest"
+        id navtest >/dev/null 2>&1 || pw useradd navtest -m
+        grep -q "^kern.racct.enable" /boot/loader.conf || echo "kern.racct.enable=1" >> /boot/loader.conf' || die "guest prep"
+    # ★ racct takes effect at the next boot. Without it a one-shot that
+    # requires a memory limit (every Nuntius fetcher) is refused.
+    echo "  /usr/local dirs, broker user navtest, kern.racct.enable=1 (next boot)"
 
     say "cross sysroot from the guest"
     mkdir -p "$SYSROOT"
