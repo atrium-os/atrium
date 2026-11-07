@@ -33,6 +33,8 @@ pub struct Entry {
     pub src: EmbedSource,
     /// `navigator_render::embed_flags`.
     pub flags: u8,
+    /// Its `<track>` subtitles and captions.
+    pub tracks: Vec<navigator_render::TextTrack>,
 }
 
 /// What changed since the last [`Slots::take_changes`].
@@ -57,10 +59,10 @@ impl Slots {
     /// A group was written (`SceneSink::put`, `Event::Bands`' puts).
     pub fn put(&mut self, group: GroupId, nsg: &str) {
         let mut now = BTreeSet::new();
-        for (key, role, rect, flags, src) in navigator_render::nsg::embeds(nsg) {
-            let key = key as u64 | MEDIA_KEY_BIT;
+        for slot in navigator_render::nsg::embeds(nsg) {
+            let key = slot.key as u64 | MEDIA_KEY_BIT;
             now.insert(key);
-            let e = Entry { key, rect, role, src, flags };
+            let e = Entry { key, rect: slot.rect, role: slot.role, src: slot.source, flags: slot.flags, tracks: slot.tracks };
             match self.entries.get(&key) {
                 None => { self.changes.added.push(key); self.entries.insert(key, e); }
                 Some(old) if old.rect != e.rect => { self.changes.moved.push(key); self.entries.insert(key, e); }

@@ -27,6 +27,7 @@
 //!       path unit) then `;<rrggbbaa>@<offset 1/1024>` per stop; k: the
 //!       path's own clip, 1/64 px)
 //! embed <role> k<key> <x> <y> <w> <h> a<flags> url "<src>" "<mime>" | script | unplayable [c<i>] [g<i>] [x<i>]
+//! track k<key> <id> subtitles|captions <default 0|1> "<src>" "<srclang>" "<label>"   (after its embed)
 //!      (a slot another process fills: a video element's media player)
 //! fallback p<first>+<count> <address> <x> <y> <w> <h> t<tx>,<ty>,<tw>,<th> <fit>
 //!      (the bitmap a vector SVG's paths fall back to when Fresco drops one)
@@ -168,6 +169,10 @@ pub fn write(scene: &Scene, fonts: &FontSet) -> String {
                 }
                 attrs(&mut o, scene.embed_attrs.get(i));
                 o.push('\n');
+                // Its text tracks, each on a line of its own after it.
+                for t in &e.tracks {
+                    let _ = writeln!(o, "track k{} {} {} {} {} {} {}", e.key, t.id, t.kind.as_str(), t.default as u8, quote(&t.src), quote(&t.srclang), quote(&t.label));
+                }
             }
             _ => {
                 let l = &scene.links[i];
@@ -192,7 +197,7 @@ pub fn write(scene: &Scene, fonts: &FontSet) -> String {
 /// the UI reads them to bind Limen embeds: (key, role, box, flags, source).
 /// Lines that are not `embed` are skipped; an `embed` line out of shape is
 /// skipped too, never half read.
-pub fn embeds(nsg: &str) -> Vec<(u32, String, (i64, i64, i64, i64), u8, crate::EmbedSource)> {
+pub fn embeds(nsg: &str) -> Vec<EmbedSlot> {
     let unquote = |s: &str| -> Option<(String, usize)> {
         if !s.starts_with('"') { return None }
         let mut out = String::new();
@@ -221,7 +226,35 @@ pub fn embeds(nsg: &str) -> Vec<(u32, String, (i64, i64, i64, i64), u8, crate::E
         } else if tail == "script" || tail.starts_with("script ") { crate::EmbedSource::Script }
         else if tail == "unplayable" || tail.starts_with("unplayable ") { crate::EmbedSource::Unplayable }
         else { continue };
-        out.push((key, f[0].to_string(), (x, y, w, h), fl, source));
+        out.push(EmbedSlot { key, role: f[0].to_string(), rect: (x, y, w, h), flags: fl, source, tracks: vec![] });
+    }
+    // The `track` lines, onto their embeds (one out of shape is skipped).
+    for line in nsg.lines() {
+        let Some(rest) = line.strip_prefix("track ") else { continue };
+        let f: Vec<&str> = rest.splitn(5, ' ').collect();
+        if f.len() < 5 { continue }
+        let (Some(key), Ok(id), Some(kind), Some(default)) = (f[0].strip_prefix('k').and_then(|v| v.parse::<u32>().ok()), f[1].parse::<u8>(),
+            crate::TrackKind::parse(f[2]), match f[3] { "0" => Some(false), "1" => Some(true), _ => None }) else { continue };
+        let Some((src, n)) = unquote(f[4]) else { continue };
+        let t2 = f[4][n..].trim_start();
+        let Some((srclang, n2)) = unquote(t2) else { continue };
+        let Some((label, _)) = unquote(t2[n2..].trim_start()) else { continue };
+        if let Some(e) = out.iter_mut().find(|e| e.key == key) {
+            if e.tracks.len() < navigator_dom::media::TEXT_TRACKS_MAX && !e.tracks.iter().any(|t| t.id == id) {
+                e.tracks.push(crate::TextTrack { id, src, kind, srclang, label, default });
+            }
+        }
     }
     out
+}
+
+/// One embed slot an NSG text holds (`embeds`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EmbedSlot {
+    pub key: u32,
+    pub role: String,
+    pub rect: (i64, i64, i64, i64),
+    pub flags: u8,
+    pub source: crate::EmbedSource,
+    pub tracks: Vec<crate::TextTrack>,
 }

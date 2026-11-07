@@ -80,10 +80,10 @@ fn the_slot_is_in_the_nsg_and_reads_back() {
     assert!(text.contains("embed media-player k"), "{text}");
     let e = nsg::embeds(&text);
     assert_eq!(e.len(), 2);
-    assert_eq!(e[0].2, (s.embeds[0].x, s.embeds[0].y, 320 * PX, 180 * PX));
-    assert_eq!(e[0].4, EmbedSource::Url { src: "https://a.test/a b.webm".into(), mime: "video/webm".into() });
-    assert_eq!(e[0].3, navigator_render::embed_flags::AUTOPLAY | navigator_render::embed_flags::MUTED);
-    assert_eq!(e[1].4, EmbedSource::Script);
+    assert_eq!(e[0].rect, (s.embeds[0].x, s.embeds[0].y, 320 * PX, 180 * PX));
+    assert_eq!(e[0].source, EmbedSource::Url { src: "https://a.test/a b.webm".into(), mime: "video/webm".into() });
+    assert_eq!(e[0].flags, navigator_render::embed_flags::AUTOPLAY | navigator_render::embed_flags::MUTED);
+    assert_eq!(e[1].source, EmbedSource::Script);
     // Out-of-shape lines are skipped, never half read.
     assert!(nsg::embeds("embed media-player kx 0 0 1 1 a0 script\nembed media-player k1 0 0 1 1 a0 url \"unterminated").is_empty());
 }
@@ -103,4 +103,21 @@ fn a_slot_belongs_to_its_band_and_goes_with_it() {
     let k = holding[0];
     assert!(b.evict(k));
     assert!(b.scene(k).is_none(), "evicting the band drops the slot with it");
+}
+
+#[test]
+fn a_videos_tracks_ride_its_embed_through_the_nsg() {
+    use navigator_render::TrackKind;
+    let fonts = FontSet::load().unwrap();
+    let s = scene(r#"<video src="v.webm" width="320" height="180"><track src="en.vtt" srclang="en" label="English" default><track kind="captions" src="cc \"q\".vtt" srclang="en" label="CC"><track kind="chapters" src="ch.vtt"></video>"#);
+    assert_eq!(s.embeds[0].tracks.len(), 2, "chapters are not shown as text");
+    let text = nsg::write(&s, &fonts);
+    assert!(text.lines().filter(|l| l.starts_with("track k")).count() == 2, "{text}");
+    let e = nsg::embeds(&text);
+    assert_eq!(e[0].tracks, s.embeds[0].tracks, "read back as written");
+    assert_eq!((e[0].tracks[0].kind, e[0].tracks[0].default, e[0].tracks[1].kind), (TrackKind::Subtitles, true, TrackKind::Captions));
+    // A track line for no embed, or out of shape, is skipped.
+    let e = nsg::embeds("embed media-player k1 0 0 1 1 a0 script\ntrack k2 0 subtitles 0 \"a\" \"en\" \"x\"\ntrack k1 0 bogus 0 \"a\" \"\" \"\"\ntrack k1 1 captions 1 \"b.vtt\" \"de\" \"Deutsch\"");
+    assert_eq!(e[0].tracks.len(), 1);
+    assert_eq!(e[0].tracks[0].label, "Deutsch");
 }

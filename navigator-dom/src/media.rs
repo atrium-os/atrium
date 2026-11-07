@@ -70,3 +70,102 @@ pub fn playable(mime: &str) -> bool {
     }
 }
 
+
+/// What a `<track>` is for (only these two are shown as text).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum TrackKind { Subtitles, Captions }
+
+impl TrackKind {
+    pub fn as_str(self) -> &'static str { match self { TrackKind::Subtitles => "subtitles", TrackKind::Captions => "captions" } }
+    pub fn parse(s: &str) -> Option<TrackKind> {
+        match s { "subtitles" => Some(TrackKind::Subtitles), "captions" => Some(TrackKind::Captions), _ => None }
+    }
+}
+
+/// One `<track>` of a video, as its player's subtitle menu lists it.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct TextTrack {
+    /// The player's id for it: its place among the video's tracks.
+    pub id: u8,
+    /// As the document writes it (resolved by the UI, like the video's).
+    pub src: String,
+    pub kind: TrackKind,
+    /// BCP 47, and the label the menu shows: at most [`TEXT_NAME_MAX`] bytes,
+    /// no control characters (limen's `TextTrack` check).
+    pub srclang: String,
+    pub label: String,
+    pub default: bool,
+}
+
+/// Most tracks per video, and the length of a language or label: limen's
+/// `TEXT_TRACKS_MAX` and `TEXT_NAME_MAX`.
+pub const TEXT_TRACKS_MAX: usize = 16;
+pub const TEXT_NAME_MAX: usize = 64;
+
+/// A name as the player takes it: trimmed, control characters dropped, cut
+/// at a character boundary to [`TEXT_NAME_MAX`] bytes.
+fn clean_name(s: &str) -> String {
+    let mut out = String::new();
+    for c in s.trim().chars().filter(|c| !c.is_control()) {
+        if out.len() + c.len_utf8() > TEXT_NAME_MAX { break }
+        out.push(c);
+    }
+    out
+}
+
+/// ★ A `<video>`'s text tracks (fresco-video P3, captions): its `<track>`
+/// children of kind `subtitles` (also the kind a missing `kind` means) or
+/// `captions`, with a `src`, in document order, at most
+/// [`TEXT_TRACKS_MAX`]. An unknown `kind` is HTML's `metadata`, and
+/// `descriptions`, `chapters` and `metadata` are not shown as text: left
+/// out. Only the first `default` one is the default (HTML: at most one per
+/// video among subtitles and captions).
+pub fn text_tracks(dom: &Dom, h: Handle) -> Vec<TextTrack> {
+    let mut out: Vec<TextTrack> = vec![];
+    for c in dom.element_children(h) {
+        if dom.tag(c) != Some("track") || out.len() == TEXT_TRACKS_MAX { continue }
+        let kind = match dom.attr(c, "kind").map(|k| k.trim().to_ascii_lowercase()) {
+            None => TrackKind::Subtitles,
+            Some(k) if k.is_empty() => TrackKind::Subtitles,
+            Some(k) => match TrackKind::parse(&k) { Some(k) => k, None => continue },
+        };
+        let Some(src) = dom.attr(c, "src").map(str::trim).filter(|s| !s.is_empty() && !s.starts_with("blob:")) else { continue };
+        let default = dom.attr(c, "default").is_some() && !out.iter().any(|t| t.default);
+        out.push(TextTrack { id: out.len() as u8, src: src.to_string(), kind,
+                             srclang: clean_name(dom.attr(c, "srclang").unwrap_or("")), label: clean_name(dom.attr(c, "label").unwrap_or("")), default });
+    }
+    out
+}
+
+#[cfg(test)]
+mod track_tests {
+    use super::*;
+
+    fn video(inner: &str) -> (Dom, Handle) {
+        let d = crate::parse(&format!("<video src=a.webm>{inner}</video>"));
+        let v = d.by_tag_anywhere("video")[0];
+        (d, v)
+    }
+
+    #[test]
+    fn subtitles_and_captions_with_a_src_in_order() {
+        let (d, v) = video(r#"<track src=en.vtt srclang=en label=English default><track kind=captions src=cc.vtt srclang="en-US" label=" CC "><track kind=chapters src=ch.vtt><track kind=bogus src=x.vtt><track kind=subtitles><track kind=SUBTITLES src=fr.vtt srclang=fr default>"#);
+        let t = text_tracks(&d, v);
+        assert_eq!(t.len(), 3);
+        assert_eq!((t[0].id, t[0].kind, t[0].src.as_str(), t[0].default), (0, TrackKind::Subtitles, "en.vtt", true));
+        assert_eq!((t[1].id, t[1].kind, t[1].label.as_str(), t[1].srclang.as_str()), (1, TrackKind::Captions, "CC", "en-US"));
+        assert_eq!((t[2].id, t[2].srclang.as_str(), t[2].default), (2, "fr", false), "only the first default is the default");
+    }
+
+    #[test]
+    fn at_most_sixteen_and_names_within_the_players_limits() {
+        let many: String = (0..20).map(|i| format!("<track src=t{i}.vtt>")).collect();
+        let (d, v) = video(&many);
+        assert_eq!(text_tracks(&d, v).len(), TEXT_TRACKS_MAX);
+        let long = format!("<track src=a.vtt label=\"{}\u{e9}tail\" srclang=\"en\u{7}x\">", "x".repeat(63));
+        let (d, v) = video(&long);
+        let t = &text_tracks(&d, v)[0];
+        assert_eq!(t.label.len(), 63, "cut before a two-byte character that would pass 64");
+        assert_eq!(t.srclang, "enx", "control characters dropped");
+    }
+}

@@ -118,7 +118,11 @@ pub struct Embed {
     pub source: EmbedSource,
     /// `autoplay`, `loop`, `muted`, `controls` (bits 0-3), as written.
     pub flags: u8,
+    /// Its `<track>` subtitles and captions (`navigator_dom::media::text_tracks`).
+    pub tracks: Vec<TextTrack>,
 }
+
+pub use navigator_dom::media::{TextTrack, TrackKind};
 
 pub mod embed_flags { pub const AUTOPLAY: u8 = 1; pub const LOOP: u8 = 2; pub const MUTED: u8 = 4; pub const CONTROLS: u8 = 8; }
 
