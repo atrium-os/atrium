@@ -76,7 +76,7 @@ L2CAP, RFCOMM) are the smallest and oldest layers.
 - **Nothing at run time** except USB (`ugen(4)`/`libusb`) and UART (`uart(4)`) as the raw pipe
   to the controller (§5). `ng_ubt`, `ng_hci`, `ng_l2cap`, `ng_btsocket` are not loaded.
 - **Knowledge:** the firmware loaders (`iwmbtfw`, `rtlbtfw`, `bcmfw`, `ath3kfw`, BSD-2) are
-  reused, in C, inside the transport (§5.2, §6.4); `hccontrol` is a reference for command coverage.
+  ported to Rust into the transport (§5.2); `hccontrol` is a reference for command coverage.
 - **A fallback transport:** if isochronous USB through `libusb` proves unreliable for SCO, the
   kernel's `ng_ubt` can be wired straight to an `ng_socket` node (no `ng_hci`, no
   `ng_l2cap`), which gives user space framed HCI packets with no kernel parsing above USB.
@@ -133,7 +133,7 @@ the input thread's `_tactus` (65018). The input thread accepted §10 as written 
 **Why three of ours and not one.**
 - `vinculum-hci` is separate so that a compromised `vinculumd` cannot talk to the USB device
   directly, and cannot send vendor commands that write controller RAM or firmware patches
-  (persistence in the radio). It filters commands (§5.3). It is small and written in C (§6.4).
+  (persistence in the radio). It filters commands (§5.3). It is small.
 - `vinculumd` is the big parser. It is in Rust with no `unsafe` outside a reviewed allowlist,
   its parsers are generated (§6.1), and it holds link keys for paired devices but nothing else
   worth stealing: no user files, no network, no display.
@@ -219,7 +219,7 @@ is upstream's call, not ours.
 Modern controllers need a firmware patch or full image at every power-up: Intel (AX2xx/BE2xx
 `ibt-*.sfi`/`.ddc`), Realtek (`rtl_bt/*`), MediaTek (`BT_RAM_CODE_*`), Broadcom (`.hcd`).
 `vinculum-hci` runs the vendor's init sequence and loads the file from
-`/usr/local/share/atrium/firmware/bluetooth/` (read-only mount), reusing FreeBSD's loaders' C code
+`/usr/local/share/atrium/firmware/bluetooth/` (read-only mount), porting the logic of FreeBSD's loaders (BSD-2)
 (BSD-2) and adding MediaTek. Each vendor's firmware licence is checked before we
 ship it (as was done for amdgpu, project memory `amdgpu-firmware-license`); files we may not
 redistribute are fetched at install by the user's action. After init the vendor commands are
@@ -284,7 +284,7 @@ profiles are allowed (§8), the user who paired it, and for each key its strengt
 legacy, MITM or not, key size). Keys themselves are in Arca (§9). Owners never learn the
 Bluetooth address: the address is a tracking identifier, and no owner needs it.
 
-### 6.4 Language: why the host is Rust and the transport is C
+### 6.4 Language: Rust throughout (decided 2026-11-07)
 
 Asked 2026-11-07: Tessera and Laminar are C in FreeBSD's conventions and stock FreeBSD uses
 them directly; should Vinculum be C too, with Rust only on the Atrium side?
@@ -313,18 +313,11 @@ as `tessera-sys` does. That is workable but it is two build systems and an FFI b
 the middle of the most security-sensitive process, for a benefit (base inclusion) we are
 not seeking. With a Rust host, the Atrium side is ordinary Rust crates.
 
-**Where C does fit: `vinculum-hci`.** The transport parses only frame lengths, talks to
-`libusb` and `uart`, and runs the vendor firmware loaders, which already exist in C in
-FreeBSD (`iwmbtfw`, `rtlbtfw`, `bcmfw`, `ath3kfw`, BSD-2). Written in C to style(9), it
-reuses that code instead of porting it, builds with FreeBSD's `bsd.prog.mk`, and is the
-piece most useful to stock FreeBSD on its own (one firmware-loading, command-filtering HCI
-transport for every vendor). Its interface to the host is the plain H4 frame of §5.1, so
-the language boundary costs nothing: no FFI, no shared structs.
-
-**Result:** C for `vinculum-hci` (small, kernel-adjacent, FreeBSD style); Rust for
-`vinculumd` and `vinculum-audio`, with the six seams of §4.1 for stock FreeBSD; ship as a
-port. If FreeBSD ever wants it in base, the host can offer a C ABI (`libvinculum` through
-`cbindgen`) without a rewrite, but that is upstream's choice.
+**And the transport?** A C `vinculum-hci` reusing FreeBSD's firmware loaders was considered.
+Shankar decided against it (2026-11-07): the transport only loads firmware and frames
+packets, so on its own it is of little use to FreeBSD, and one language keeps one build and
+one set of tools. **Everything is Rust**: `vinculum-hci`, `vinculumd`, `vinculum-audio`.
+The loaders' logic is ported. Stock FreeBSD uses the whole stack as a port (§4.1).
 
 ## 7. Security policy
 
@@ -539,11 +532,9 @@ firmware, UART, Auracast, OBEX come after.
 2. **Three processes: transport, host, audio, each jailed, plus Tactus for HID** (§4).
    *Recommend yes.* The transport split keeps a compromised host from reflashing the radio;
    the audio split keeps the biggest profile parser away from link keys.
-3. **Rust for the host and audio, with packet parsers generated from PDL** (AOSP's grammar
-   files as the start); **C, in FreeBSD style, for the transport** `vinculum-hci`, reusing
-   FreeBSD's firmware loaders (§6.4).
-   *Recommend yes:* memory safety where the radio is parsed (the host also types into the
-   session), C where FreeBSD code already exists. Both work on stock FreeBSD as a port.
+3. **Rust throughout, with packet parsers generated from PDL** (AOSP's grammar files as the
+   start). **Decided by Shankar, 2026-11-07** (§6.4): all three processes in Rust, no C
+   transport; usable on stock FreeBSD as a port.
 4. **Bonds are machine-wide and their keys live in a new Arca machine store** usable before
    login (TPM-sealed where present), so a Bluetooth keyboard works at the login screen.
    *Recommend yes.* The alternative (per-user bonds in the user's Arca) means no Bluetooth
