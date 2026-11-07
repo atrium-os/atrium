@@ -1,0 +1,9 @@
+[package]
+name = "vinculum-probe"
+version = "0.1.0"
+description = "Dev tool: drive a controller over H4 (Rootcanal TCP or a serial line), print parsed HCI traffic, record btsnoop"
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+vinculum-hci-proto = { path = "../vinculum-hci-proto" }

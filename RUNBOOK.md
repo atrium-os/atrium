@@ -5431,6 +5431,23 @@ timing, so run it on the Mac's HVF VM; check 3 (no device in app jails) is
 portcullis-jail's devfs test plus portcullisd's shipped_manifests test (VM only:
 portcullisd doesn't build on Linux).
 
+### 13.6b Bluetooth (Vinculum) harness: Rootcanal + Bumble, no radio
+
+`vinculum/` is its own cargo workspace ([spec/bluetooth.md](docs/spec/bluetooth.md)).
+Rootcanal (Android's virtual controller) and Bumble (scripted peers) come from PyPI;
+the script makes a venv in `~/.cache/vinculum-venv` on first run (`VINCULUM_VENV` to
+override). Rootcanal's wheel has Linux x86_64 and macOS arm64 binaries.
+
+```sh
+sh vinculum/harness/run.sh                      # probe scans, expects "VinculumPeer"
+sh vinculum/harness/run.sh --record out.btsnoop # also keep the HCI trace (keys zeroed)
+(cd vinculum && cargo test)                      # incl. replay of the recorded trace
+(cd vinculum/fuzz && cargo fuzz run hci_event)   # targets: hci_event hci_command gap h4_stream
+```
+
+The packet parsers are generated at build time by a patched, vendored pdl-compiler
+(`vinculum/third_party/README.md`).
+
 ### 13.7 Navigator corpus (on the Mac, no VM)
 
 - Corpus: `~/src/navigator-corpus` (batch 1 + `batch2/`). Run recipe in its README.

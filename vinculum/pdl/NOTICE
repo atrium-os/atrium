@@ -1,0 +1,8 @@
+hci_packets.pdl is the HCI packet grammar from Android's Bluetooth stack, as
+published in google/rootcanal (packets/hci_packets.pdl, fetched 2026-11-07).
+
+Copyright The Android Open Source Project.
+Licensed under the Apache License, Version 2.0:
+http://www.apache.org/licenses/LICENSE-2.0
+
+Local changes, if any, are listed in pdl/CHANGES.md.

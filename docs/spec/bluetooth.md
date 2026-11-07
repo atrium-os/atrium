@@ -122,13 +122,13 @@ BrakTooth (controller and LE stack crashes from malformed packets).
 
 | process | user (proposed uid) | jail | holds | parses remote data |
 |---|---|---|---|---|
-| `vinculum-hci` | `_vinculum-hci` (65024) | own; devfs ruleset 25 `atrium_bluetooth` shows only its controller's `ugen`/`usb` nodes or tty | the device; firmware files read-only | only packet framing (lengths) |
-| `vinculumd` | `_vinculum` (65023) | own; no devices, no network | one socket per controller to `vinculum-hci`; service sockets; Arca link | yes, everything from the air up to the profile boundary |
-| `vinculum-audio` | `_vinculum-audio` (65025) | own; no devices, no network | channels from vinculumd; a ring to lyrad; choragusd control | AVDTP, AVRCP, HFP AT commands, codec frames |
+| `vinculum-hci` | `_vinculum-hci` (65025) | own; devfs ruleset 25 `atrium_bluetooth` shows only its controller's `ugen`/`usb` nodes or tty | the device; firmware files read-only | only packet framing (lengths) |
+| `vinculumd` | `_vinculum` (65024) | own; no devices, no network | one socket per controller to `vinculum-hci`; service sockets; Arca link | yes, everything from the air up to the profile boundary |
+| `vinculum-audio` | `_vinculum-audio` (65026) | own; no devices, no network | channels from vinculumd; a ring to lyrad; choragusd control | AVDTP, AVRCP, HFP AT commands, codec frames |
 | `tactusd` | `_tactus` (65018) | input thread's jail | HID fds from vinculumd | HID descriptors and reports (as for USB) |
 
-uids are proposals; they get reserved in `jaild.policy.toml` when B1 lands, clear of whatever
-the input thread's `_tactus` (65018). The input thread accepted §10 as written (2026-11-07).
+uids are reserved (as comments) in `jaild.policy.toml` and become grants when B1 lands;
+65018 is `_tactus`, 65023 `_nuntius`. The input thread accepted §10 as written (2026-11-07).
 
 **Why three of ours and not one.**
 - `vinculum-hci` is separate so that a compromised `vinculumd` cannot talk to the USB device
@@ -377,12 +377,16 @@ connection. So:
   only an administrator or that user may remove it.
 - They need an Arca store that is **not tied to a user's unlock**: a machine store, its key
   sealed to the TPM where there is one (and from a machine secret on disk otherwise, with the
-  same warning Arca's setup gives), class "after boot". This does not exist in arca.md today
-  (its key hierarchy starts at a user credential, §6.1), so it is decision 4.
-- At start, `vinculumd` asks Arca for its items once and keeps them in `mlock`ed memory
+  same warning Arca's setup gives), class "after boot". Built by the Arca thread as arca.md §6.4
+  (2026-11-07): `vinculumd` reaches `/atrium/sockets/arca/arcad.sock`, arcad knows it by
+  uid (`ARCA_SERVICES=vinculumd=65024`), and it uses STORE / RELEASE / LIST / DELETE on
+  item kind 7 (BluetoothKey), class 1 (after boot). No other service, app or root can
+  reach those items; LOCKED means no machine store is open, and `vinculumd` then fails
+  closed (no bonds, no pairing).
+- At start, `vinculumd` lists and releases its items once and keeps them in `mlock`ed memory
   (jail allowlisted for `allow.mlock`, as `atrium-arcad` is), because it must answer
   `Link_Key_Request` and LE encryption requests without a round trip. New keys go to Arca
-  at once (`arca_store`, recipient `vinculumd`); removing a device destroys its item.
+  at once (STORE); removing a device destroys its item.
 - Peer IRKs are loaded into the controller's resolving list so reconnection works with
   rotating addresses.
 

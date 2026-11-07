@@ -271,6 +271,9 @@ allowed_system_uids = [
              # knows it by this uid (--limen-uid) for embedded players' audio tickets
     65023,   # _nuntius: the system fetcher, started per app by portcullisd
              # (OpenFetcher) under the system worker rule (nuntius-bundle.sh)
+    # 65024 = _vinculum        (reserved: Bluetooth host, docs/spec/bluetooth.md §4)
+    # 65025 = _vinculum-hci    (reserved: Bluetooth transport, one per controller)
+    # 65026 = _vinculum-audio  (reserved: Bluetooth audio profiles)
 ]
 
 [gid]

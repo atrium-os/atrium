@@ -1,0 +1,18 @@
+// Vinculum's own PDL: GAP advertising data (Core Supplement Part A, §1).
+// An advertising or EIR payload is a sequence of AD structures:
+// length (covers the type byte and the data), type, data.
+// Copyright (c) 2026, Atrium contributors. BSD-2-Clause.
+
+little_endian_packets
+
+// The length byte counts the type byte too, so the type is kept as the
+// first byte of `body` (pdl-compiler 0.5.2 does not apply a `[+1]` size
+// modifier when decoding). vinculum_hci_proto::gap splits it off.
+struct AdStructure {
+  _size_(body) : 8,
+  body : 8[],
+}
+
+packet AdvertisingData {
+  structures : AdStructure[],
+}

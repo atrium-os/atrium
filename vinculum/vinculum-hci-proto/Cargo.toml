@@ -1,0 +1,13 @@
+[package]
+name = "vinculum-hci-proto"
+version = "0.1.0"
+description = "HCI packets for Vinculum: generated from PDL, plus H4 framing and btsnoop traces"
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+bytes = "1"
+pdl-runtime = "0.4"
+
+[build-dependencies]
+pdl-compiler = "=0.5.2"

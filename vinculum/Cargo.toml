@@ -1,0 +1,19 @@
+# Vinculum, the Bluetooth service (docs/spec/bluetooth.md).
+#
+# Its own workspace with no path dependency outside vinculum/, so it builds
+# and runs on stock FreeBSD too (spec §4.1). Atrium-only parts sit behind the
+# `atrium` feature of the crates that need it.
+[workspace]
+resolver = "2"
+members = [
+    "vinculum-hci-proto",
+    "vinculum-probe",
+]
+
+[workspace.package]
+edition = "2021"
+license = "BSD-2-Clause"
+
+# Patched pdl-compiler: see third_party/README.md.
+[patch.crates-io]
+pdl-compiler = { path = "third_party/pdl-compiler" }

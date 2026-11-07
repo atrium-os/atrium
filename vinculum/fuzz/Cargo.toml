@@ -1,0 +1,42 @@
+[package]
+name = "vinculum-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+vinculum-hci-proto = { path = "../vinculum-hci-proto" }
+
+# Its own workspace, like every cargo-fuzz crate.
+[workspace]
+
+[patch.crates-io]
+pdl-compiler = { path = "../third_party/pdl-compiler" }
+
+[[bin]]
+name = "h4_stream"
+path = "fuzz_targets/h4_stream.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "hci_event"
+path = "fuzz_targets/hci_event.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "hci_command"
+path = "fuzz_targets/hci_command.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "gap"
+path = "fuzz_targets/gap.rs"
+test = false
+doc = false
