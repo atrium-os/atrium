@@ -115,9 +115,9 @@ BrakTooth (controller and LE stack crashes from malformed packets).
                                          tactusd   vinculum-audio  Curia /   arcad
                                          (_tactus) (_vinculum-audio) Forum   (_arca)
                                                     │      │  bar
-                                          ring+clock│      │media-control,
-                                                    ▼      ▼audio-control
-                                                  lyrad  choragusd
+                                                    │      │audio-device (ring, page),
+                                                    │      ▼media-control
+                                                    │   choragusd ── lyrad
 ```
 
 | process | user (proposed uid) | jail | holds | parses remote data |
@@ -439,9 +439,12 @@ is the audio thread's to design.
   channel.
 - **To Lyra: a Bluetooth sink is an output device.** The architecture already names it a
   clock domain of its own ([atrium-lyra-architecture.md](atrium-lyra-architecture.md) §3).
-  Proposed: lyrad gains an **external device** backend: instead of OSS, it writes the
-  device's mix into a shared ring that `vinculum-audio` reads, with the device's rate and
-  delay published back. The A2DP source is paced by our own monotonic clock (A2DP has no
+  lyrad gains an **external device** backend, designed by the audio thread in
+  [lyra-external-device.md](lyra-external-device.md): `vinculum-audio` talks only to
+  choragusd, on `/atrium/sockets/audio-device/` (restricted capability `audio-device`),
+  announces the device and gets the consumer end of an f32 ring plus a device page it
+  writes (state, `delay_frames`, underruns, rate). A codec change (AVDTP reconfigure, A2DP
+  to HFP) is a Gone and a new Announce with the same device handle. The A2DP source is paced by our own monotonic clock (A2DP has no
   clock of its own; the sink adapts), so the domain is "system clock at the negotiated
   rate". AVDTP delay reports (A2DP 1.3) and our encode and controller buffering give the
   output delay, which lyrad puts in the clock page so the player keeps lip sync
@@ -452,8 +455,9 @@ is the audio thread's to design.
   LDAC are left out until their licensing is looked at (decision 6).
 - **AVRCP.** As target: play/pause/next from the headset go to choragusd as media-control
   actions (`ToMedia::Control`, the path media keys already use), so `vinculum-audio` holds
-  the `media-control` capability. As controller: absolute volume maps to the output's
-  volume in choragusd (`audio-control`), so the headset's volume and the Forum bar agree.
+  the `media-control` capability. As controller: absolute volume goes both ways on the
+  `audio-device` socket (`hw_volume`) and maps to the master volume, so the headset and the
+  Forum bar agree without `vinculum-audio` holding `audio-control`.
 - **HFP.** RFCOMM AT commands are text from the headset; their parser lives here, fuzzed.
   Voice needs a capture path, so it waits for Lyra L5.
 - **Output choice** (which device plays) stays choragusd's: when headphones connect they
