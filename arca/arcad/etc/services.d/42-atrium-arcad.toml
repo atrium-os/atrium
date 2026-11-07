@@ -79,4 +79,7 @@ gid  = 65020
 # ARCA_WEB_BROKER = "<app id> <publisher hex>" names the Navigator's broker,
 # the one app that issues web tickets (arca.md §8.2); without it no web
 # courier gets a cookie. Set once the Navigator ships signed.
-env  = [{ key = "ARCA_VESTIBULUM_UID", value = "50093" }, { key = "ARCA_UI_UID", value = "65021" }]
+# ARCA_SERVICES names the system services the machine store serves
+# (arca.md §6.4): vinculumd (_vinculum, 65024) for Bluetooth bonds, usable
+# at the login screen.
+env  = [{ key = "ARCA_VESTIBULUM_UID", value = "50093" }, { key = "ARCA_UI_UID", value = "65021" }, { key = "ARCA_SERVICES", value = "vinculumd=65024" }]

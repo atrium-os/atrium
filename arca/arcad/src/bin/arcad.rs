@@ -47,12 +47,20 @@ fn main() -> ExitCode {
             std::env::var("ARCA_COURIER_REGISTRY").unwrap_or_else(|_| arcad::courier::DEFAULT_REGISTRY.into()).into(),
         ),
         web_broker: std::env::var("ARCA_WEB_BROKER").ok().and_then(|s| arcad::label::parse_web_broker(&s)),
+        services: std::env::var("ARCA_SERVICES").ok().map(|s| arcad::label::parse_services(&s)).unwrap_or_default(),
     };
     if resolver.allow_unsigned {
         eprintln!("arcad: WARNING ARCA_ALLOW_UNSIGNED=1: unsigned apps are served; development only");
     }
     let state = match arcad::server::State::new(dir.clone().into()) {
-        Ok(s) => Arc::new(Mutex::new(s)),
+        Ok(mut s) => {
+            // The machine store (§6.4) serves system services at the login
+            // screen; a failure here leaves users' stores working.
+            if let Err(e) = s.open_machine() {
+                eprintln!("arcad: machine store: {e:?}");
+            }
+            Arc::new(Mutex::new(s))
+        }
         Err(e) => {
             eprintln!("arcad: state dir {dir}: {e}");
             return ExitCode::FAILURE;

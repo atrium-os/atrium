@@ -22,6 +22,11 @@ use crate::proto::{broker_op, courier_op, op, status, MAX_SIGN_MSG};
 /// every app item is in the user's main persona.
 pub const PERSONA: &str = "main";
 
+/// The machine store's user and persona (arca.md §6.4). It lives in
+/// `<dir>/machine`, apart from `<dir>/users/*`, so no login can name it.
+pub const MACHINE_USER: &str = "_machine";
+pub const MACHINE_PERSONA: &str = "machine";
+
 pub struct State {
     dir: PathBuf,
     /// The parameters new users get. Tests lower it; shipped builds use
@@ -31,6 +36,8 @@ pub struct State {
     audit: Option<File>,
     handles: crate::handles::Handles,
     tickets: crate::tickets::Tickets,
+    /// The machine store (arca.md §6.4): open from boot, for services.
+    machine: Option<Store>,
     /// Unix seconds; tests move it to expire cookies.
     pub clock: fn() -> u64,
 }
@@ -107,7 +114,7 @@ impl State {
     pub fn new(dir: PathBuf) -> std::io::Result<State> {
         std::fs::DirBuilder::new().recursive(true).create(&dir)?;
         let audit = OpenOptions::new().create(true).append(true).mode(0o600).open(dir.join("audit.log")).ok();
-        Ok(State { dir, kdf_default: KdfParams::NO_TPM, stores: HashMap::new(), audit, handles: Default::default(), tickets: Default::default(), clock: system_now })
+        Ok(State { dir, kdf_default: KdfParams::NO_TPM, stores: HashMap::new(), audit, handles: Default::default(), tickets: Default::default(), machine: None, clock: system_now })
     }
 
     pub fn handle(&mut self, who: &Label, op: u16, body: &[u8]) -> Reply {
@@ -125,6 +132,7 @@ impl State {
             Label::Vestibulum => self.vestibulum_op(op, body),
             Label::TrustedUi => self.ui_op(op, body, &mut item),
             Label::Courier(c) => self.courier_op(c, op, body, &mut item),
+            Label::Service(name) => self.service_op(name, op, body, &mut item),
             Label::Unknown => reply(status::UNKNOWN_PEER),
         };
         self.audit(who, op, item.as_ref(), r.status);
@@ -144,6 +152,7 @@ impl State {
             Label::WebBroker { user, app_id, .. } => format!("broker:{app_id}@{user}"),
             Label::Vestibulum => "vestibulum".into(),
             Label::TrustedUi => "ui".into(),
+            Label::Service(n) => format!("service:{n}"),
             Label::Courier(c) => match &c.endpoint {
                 Recipient::Endpoint { host, port, .. } => format!("courier:{host}:{port}/{}@{}", c.persona, c.user),
                 _ => "courier:?".into(),
@@ -237,8 +246,9 @@ impl State {
                 let value = field!(r.bytes(caps::VALUE));
                 field!(r.end());
                 let Ok(kind) = Kind::from_u16(kind) else { return malformed() };
-                if kind.shape() != Shape::Bearer {
-                    // Keys are minted inside Arca, never imported by an app.
+                if kind.shape() != Shape::Bearer || kind == Kind::BluetoothKey {
+                    // Keys are minted inside Arca, never imported by an app;
+                    // bond keys are the machine store's (§6.4).
                     return reply(status::UNSUPPORTED);
                 }
                 let m = tri!(store.add(NewItem {
@@ -321,6 +331,130 @@ impl State {
                 let i = rep!(id(&mut r));
                 field!(r.end());
                 tri!(store.delete(&i, &who));
+                ok(Vec::new())
+            }
+            _ => reply(status::DENIED),
+        }
+    }
+
+    // ── the machine store ────────────────────────────────────────────────
+
+    /// Open the machine store (arca.md §6.4), creating it and its key on
+    /// first boot. Until TPM sealing lands (A4) the root key is a machine
+    /// secret in `<dir>/machine.key` (0600, arcad's own directory): it keeps
+    /// the store's files useless without that file, not against root.
+    pub fn open_machine(&mut self) -> Result<(), Error> {
+        use std::io::Read;
+        let dir = self.dir.join("machine");
+        let key_path = self.dir.join("machine.key");
+        let mut raw = LockedBuf::zeroed(32)?;
+        match File::open(&key_path) {
+            Ok(mut f) => {
+                f.read_exact(raw.as_mut())?;
+                if f.read(&mut [0u8; 1])? != 0 {
+                    return Err(Error::Corrupt("machine.key length"));
+                }
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                getrandom::getrandom(raw.as_mut()).map_err(std::io::Error::other)?;
+                let mut f = OpenOptions::new().write(true).create_new(true).mode(0o600).open(&key_path)?;
+                f.write_all(raw.as_ref())?;
+                f.sync_all()?;
+                File::open(&self.dir)?.sync_all()?;
+            }
+            Err(e) => return Err(Error::Io(e)),
+        }
+        eprintln!(
+            "arcad: WARNING the machine store's key is a file ({}), not TPM-sealed: root on this machine can read Bluetooth bonds",
+            key_path.display()
+        );
+        let root = RootKey::from_bytes(raw.as_ref())?;
+        drop(raw);
+        let store = if dir.join("store").exists() || dir.exists() && std::fs::read_dir(&dir)?.next().is_some() {
+            let mut s = Store::open(&dir, MACHINE_USER)?;
+            s.unlock(&root)?;
+            s
+        } else {
+            Store::create(&dir, MACHINE_USER, &root)?
+        };
+        self.machine = Some(store);
+        Ok(())
+    }
+
+    /// A system service's own items in the machine store: the app ops'
+    /// wire, class after boot only, values released to the service itself
+    /// (it hands them to hardware: a controller asks for a link key within
+    /// milliseconds).
+    fn service_op(&mut self, name: &str, op: u16, body: &[u8], item: &mut Option<ItemId>) -> Reply {
+        let Ok(me) = Recipient::service(name) else { return reply(status::UNKNOWN_PEER) };
+        let Some(store) = self.machine.as_mut() else { return reply(status::LOCKED) };
+        let who = Access { persona: MACHINE_PERSONA, recipient: &me };
+        let mut r = Reader::new(body);
+        macro_rules! field {
+            ($e:expr) => {
+                match $e {
+                    Ok(v) => v,
+                    Err(_) => return malformed(),
+                }
+            };
+        }
+        match op {
+            op::STORE => {
+                let kind = field!(r.u16());
+                let class = field!(r.u8());
+                let account = field!(r.str(caps::ACCOUNT));
+                let value = field!(r.bytes(caps::VALUE));
+                field!(r.end());
+                let Ok(kind) = Kind::from_u16(kind) else { return malformed() };
+                // The machine store has one class: after boot.
+                if class != Class::AfterFirstUnlock as u8 {
+                    return reply(status::UNSUPPORTED);
+                }
+                if kind.shape() != Shape::Bearer || kind == Kind::Cookie {
+                    return reply(status::UNSUPPORTED);
+                }
+                let m = tri!(store.add(NewItem {
+                    persona: MACHINE_PERSONA,
+                    recipient: me.clone(),
+                    class: Class::AfterFirstUnlock,
+                    kind,
+                    provenance: Provenance::AppMinted,
+                    account,
+                    scope: b"",
+                    value,
+                }));
+                *item = Some(m.id);
+                ok(m.id.0.to_vec())
+            }
+            op::RELEASE => {
+                let id = ItemId(field!(r.array::<16>()));
+                field!(r.end());
+                *item = Some(id);
+                let (_, v) = tri!(store.release(&id, &who, None));
+                let mut out = tri!(LockedBuf::zeroed(4 + v.len()).map_err(Error::Io));
+                out.as_mut()[..4].copy_from_slice(&(v.len() as u32).to_le_bytes());
+                out.as_mut()[4..].copy_from_slice(v.as_ref());
+                Reply { status: status::OK, body: Body::Secret(out) }
+            }
+            op::LIST => {
+                field!(r.end());
+                let items = tri!(store.list(&who));
+                let mut w = Writer::new();
+                w.u32(items.len() as u32);
+                for m in items {
+                    w.raw(&m.id.0);
+                    w.u16(m.kind as u16);
+                    w.u8(m.class as u8);
+                    w.u32(m.flags);
+                    w.str(&m.account);
+                }
+                ok(w.buf)
+            }
+            op::DELETE => {
+                let id = ItemId(field!(r.array::<16>()));
+                field!(r.end());
+                *item = Some(id);
+                tri!(store.delete(&id, &who));
                 ok(Vec::new())
             }
             _ => reply(status::DENIED),

@@ -20,6 +20,9 @@ pub enum Label {
     /// names by publisher and app id. It issues tickets; otherwise it is
     /// that app.
     WebBroker { user: String, publisher: [u8; 32], app_id: String },
+    /// An Atrium system service with a fixed uid (`ARCA_SERVICES`): its own
+    /// items in the machine store (arca.md §6.4), e.g. vinculumd's bonds.
+    Service(String),
     /// A courier (arca.md §5): carries one persona's items to one endpoint.
     Courier(crate::courier::CourierLabel),
     /// Anything else: refused every op.
@@ -41,6 +44,26 @@ pub struct Resolver {
     pub courier_registry: Option<PathBuf>,
     /// The web broker's (publisher, app id); `None`: no web profile.
     pub web_broker: Option<([u8; 32], String)>,
+    /// System services by uid (`ARCA_SERVICES`); each reaches only its own
+    /// items in the machine store.
+    pub services: Vec<(u32, String)>,
+}
+
+/// `ARCA_SERVICES`: `name=uid[,name=uid...]`, e.g. `vinculumd=65023`. A
+/// malformed entry is dropped; a uid or name given twice drops both.
+pub fn parse_services(s: &str) -> Vec<(u32, String)> {
+    let all: Vec<(u32, String)> = s
+        .split(',')
+        .filter_map(|e| {
+            let (n, u) = e.trim().split_once('=')?;
+            let uid: u32 = u.trim().parse().ok()?;
+            (arca_store::model::valid_service(n.trim()) && uid != 0).then(|| (uid, n.trim().to_string()))
+        })
+        .collect();
+    all.iter()
+        .filter(|(u, n)| all.iter().filter(|(u2, n2)| u2 == u || n2 == n).count() == 1)
+        .cloned()
+        .collect()
 }
 
 /// `ARCA_WEB_BROKER`: `app_id publisher-hex` (64 hex). Unsigned brokers
@@ -76,11 +99,13 @@ impl Resolver {
         let Ok(reg) = portcullis_peer::AppRegistry::load(self.registry.to_str().unwrap_or("")) else {
             return Label::Unknown;
         };
-        let system = Some(uid) == self.vestibulum_uid || Some(uid) == self.ui_uid;
+        let service = self.services.iter().find(|(u, _)| *u == uid).map(|(_, n)| n.clone());
+        let system = Some(uid) == self.vestibulum_uid || Some(uid) == self.ui_uid || service.is_some();
         let Some((user, app_id)) = reg.resolve(uid) else {
             return match () {
                 _ if Some(uid) == self.vestibulum_uid => Label::Vestibulum,
                 _ if Some(uid) == self.ui_uid => Label::TrustedUi,
+                _ if service.is_some() => Label::Service(service.unwrap()),
                 _ => Label::Unknown,
             };
         };

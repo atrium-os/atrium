@@ -79,6 +79,7 @@ mod freebsd {
                 allow_unsigned: std::env::var_os("ARCA_ALLOW_UNSIGNED").is_some(),
                 courier_registry: None,
                 web_broker: std::env::var("ARCA_WEB_BROKER").ok().and_then(|s| arcad::label::parse_web_broker(&s)),
+                services: Vec::new(),
             },
             policy: addr::Policy { grant_private_network: grant },
             pool: Mutex::new(Pool::default()),

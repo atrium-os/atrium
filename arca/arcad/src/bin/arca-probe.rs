@@ -94,6 +94,14 @@ fn main() -> ExitCode {
             w.bytes(arg(3).as_bytes());
             call(sock, op::STORE, &w.buf)
         }
+        // A system service's bond key in the machine store (§6.4).
+        "store-bond" => {
+            w.u16(7);
+            w.u8(1);
+            w.str("probe-bond");
+            w.bytes(arg(3).as_bytes());
+            call(sock, op::STORE, &w.buf)
+        }
         "release" => call(sock, op::RELEASE, &unhex(arg(3))),
         "list" => call(sock, op::LIST, &[]),
         "mint" => {

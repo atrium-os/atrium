@@ -312,6 +312,9 @@ user credential (passcode, biometric, recovery key)        — Vestibulum
                        └─ items  (XChaCha20-Poly1305; AAD = user, persona, class, recipient, item id, version)
 ```
 
+The machine store (§6.4) has the same shape under a **machine root key** (sealed to the TPM,
+or a machine secret on disk) instead of a user's, with one class, after boot.
+
 - **The AAD binds each record to its recipient.** Copying an encrypted record from one
   recipient's file to another's makes it fail to decrypt. Recipient binding then holds even
   against someone who can edit the store.
@@ -358,6 +361,40 @@ user credential (passcode, biometric, recovery key)        — Vestibulum
 - **Logs never contain values**, only item ids and recipients.
 - **Small and fuzzed.** The request schema, the Set-Cookie record and the store format
   each have a fuzz target and a positive control.
+
+### 6.4 The machine store
+
+Some secrets belong to the machine, not to a user: Bluetooth bonds are machine-wide, and a
+keyboard has to work at the login screen, before anyone has unlocked anything
+([bluetooth.md](bluetooth.md) §9, decision 4). These live in one **machine store**, beside
+the per-user ones and in the same format (§6.1's AAD and per-recipient keys), with its own
+root key.
+
+- **Who.** A system service, named by uid in `ARCA_SERVICES` (`name=uid,...`, e.g.
+  `vinculumd=65024`, _vinculum). Its label is `Service(name)` and its recipient
+  `service:<name>`. A configured uid that also appears in the launch registry is no one,
+  as for every system uid. Root is no one, and no app, user or other service reaches a
+  service's items: there is no grant, and no op that names another recipient.
+- **When.** One class, *after boot*: the store opens when arcad starts and stays open until
+  shutdown. No user's unlock or lock touches it.
+- **What.** Bearer items only: `Kind::BluetoothKey` (7) for link keys, LTKs and IRKs, or
+  another bearer kind. Cookies and keys are refused; apps are refused kind 7 everywhere.
+- **The wire** is the app ops' (§4.2), on arcad's socket:
+  - `STORE 0x04`: `u16 kind | u8 class (1) | str account | bytes value` → `id[16]`.
+  - `RELEASE 0x05`: `id[16]` → `u32 len | value`. The value goes to the service, which hands
+    it to hardware. No user is asked; nobody else can ask.
+  - `LIST 0x06`: empty → `u32 n | n × (id[16] | u16 kind | u8 class | u32 flags | str account)`.
+  - `DELETE 0x07`: `id[16]`.
+  - Any other op is `DENIED`; with no machine store open, `LOCKED`.
+- **The key.** With a TPM, the machine root key is sealed to it (A4; boot-state PCRs, so a
+  disk moved to another machine or booted into another OS can't open it). Until then, and on
+  machines without one, the key is 32 random bytes in `/var/db/arca/machine.key` (0600,
+  `_arca`, written once with `create_new`), and arcad warns at every start. That keeps the
+  store's files useless apart from that file; it does not hold against root on the running
+  machine, and setup says so.
+- **Losing the key fails closed.** A store whose key no longer opens it stays unopened; arcad
+  never replaces it with a new empty one. Service ops answer `LOCKED` and users' stores
+  work as before.
 
 ## 7. Common attacks, and what stops each one
 

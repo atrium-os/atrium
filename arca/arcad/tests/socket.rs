@@ -16,7 +16,7 @@ fn identity_is_the_peer_uid_not_the_message() {
     let me = unsafe { libc::getuid() };
     let reg = d.path().join("registry");
     std::fs::write(&reg, format!("{me} alice org.example.mail {}\n", "07".repeat(32))).unwrap();
-    let resolver = Resolver { registry: reg, vestibulum_uid: None, ui_uid: None, allow_unsigned: false, courier_registry: None, web_broker: None };
+    let resolver = Resolver { registry: reg, vestibulum_uid: None, ui_uid: None, allow_unsigned: false, courier_registry: None, web_broker: None, services: vec![] };
     let state = Arc::new(Mutex::new(State::new(d.path().join("db")).unwrap()));
     // Vestibulum makes alice's store (directly; it would be another uid).
     let mut w = Writer::new();

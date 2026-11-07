@@ -108,7 +108,8 @@ sh "$ROOT/scripts/jaild-policy-merge.sh" "$ROOT/etc/jaild.policy.toml" "$tmpd/li
 put "$tmpd/jaild.policy.toml" /etc/atrium/jaild.policy.toml
 # The web broker (§6): a test app id and publisher, as the Navigator's will be.
 BROKER_PUB=$(printf 'b%.0s' $(seq 64))
-sed "s|^env  = \[|env  = [{ key = \"ARCA_WEB_BROKER\", value = \"org.atrium.navigator $BROKER_PUB\" }, |" \
+# And a test system service for the machine store (§3, uid 50804).
+sed -e "s|^env  = \[|env  = [{ key = \"ARCA_WEB_BROKER\", value = \"org.atrium.navigator $BROKER_PUB\" }, |" -e "s|vinculumd=65024|vinculumd=50804|" \
     "$ROOT/arca/arcad/etc/services.d/42-atrium-arcad.toml" > "$tmpd/42-atrium-arcad.toml"
 put "$tmpd/42-atrium-arcad.toml" /etc/atrium/services.d/42-atrium-arcad.toml
 # Only Arca's manifest: the smoke manifests would churn the bootstrap log.
@@ -136,11 +137,20 @@ g "grep -q '^50801 ' /var/run/atrium/app-registry || printf '50801 alice org.exa
 P=/usr/local/bin/arca-probe
 as() { g "su -m $1 -c '$P $S $2'"; }
 check "root is no one" "status=5 body=" "$(g "$P $S list")"
+# The machine store (§6.4): a system service's bond key, with no user
+# unlocked (arcad was just restarted, so every user store is locked).
+g "pw usershow arcabt >/dev/null 2>&1 || pw useradd arcabt -u 50804 -d /nonexistent -s /usr/sbin/nologin"
+BID=$(as arcabt 'store-bond bond-key-0xfeed' | sed -n 's/^status=0 body=//p')
+check "a service stores a bond key with no user unlocked" 32 "${#BID}"
+check "and gets it back" "status=0 body=$(printf '0f000000'; printf 'bond-key-0xfeed' | od -An -tx1 | tr -d ' \n')" "$(as arcabt "release $BID")"
+check "a bond key on disk is not in clear" 0 "$(g 'grep -rl bond-key-0xfeed /var/db/arca | wc -l' | tr -d ' ')"
 check "app can't unlock" "status=1 body=" "$(as arcaapp1 'state alice')"
 r=$(as _ostiarius 'unlock alice correct-horse')
 case "$r" in unlocked*) check "ostiarius unlocks (first login creates)" ok ok ;; *) check "ostiarius unlocks" ok "$r" ;; esac
 ID=$(as arcaapp1 'store hunter2' | sed -n 's/^status=0 body=//p')
 check "app stores its secret" 32 "${#ID}"
+check "an app can't reach a bond key" "status=1 body=" "$(as arcaapp1 "release $BID")"
+check "an app can't store a bond key" "status=12 body=" "$(as arcaapp1 'store-bond x')"
 check "app-held needs the user's grant" "status=8 body=" "$(as arcaapp1 "release $ID")"
 check "another app: EACCES" "status=1 body=" "$(as arcaapp2 "release $ID")"
 check "another app lists nothing" "status=0 body=00000000" "$(as arcaapp2 list)"

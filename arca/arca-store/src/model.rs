@@ -66,6 +66,9 @@ pub enum Kind {
     ApiKey = 4,
     HttpAuth = 5,
     Totp = 6,
+    /// A Bluetooth bond key (link key, LTK, IRK): a machine-store item that
+    /// its service hands to the controller (bluetooth.md §9).
+    BluetoothKey = 7,
     /// An ed25519 signing key (per-service keypairs, insula.md §13.3).
     Ed25519 = 0x100,
     /// A P-256 key (passkeys, ES256).
@@ -85,6 +88,7 @@ impl Kind {
             4 => ApiKey,
             5 => HttpAuth,
             6 => Totp,
+            7 => BluetoothKey,
             0x100 => Ed25519,
             0x101 => P256,
             0x102 => Symmetric,
@@ -146,6 +150,14 @@ pub enum Recipient {
     User,
     /// A WebAuthn relying party ID: the key is used, never released.
     RpId(String),
+    /// An Atrium system service, verified by its fixed uid (arcad's
+    /// configuration): `vinculumd` for Bluetooth bonds. Machine store only.
+    Service(String),
+}
+
+/// A service name: lowercase letters, digits, '-' and '_', at most 64.
+pub fn valid_service(s: &str) -> bool {
+    !s.is_empty() && s.len() <= 64 && s.bytes().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == b'-' || c == b'_')
 }
 
 /// A lowercase ASCII DNS name (already IDNA-encoded by whoever verified
@@ -191,6 +203,13 @@ impl Recipient {
         Ok(Recipient::App { publisher, app_id: app_id.into() })
     }
 
+    pub fn service(name: &str) -> Result<Recipient, Error> {
+        if !valid_service(name) {
+            return Err(Error::BadRecipient);
+        }
+        Ok(Recipient::Service(name.into()))
+    }
+
     pub fn rp_id(id: &str) -> Result<Recipient, Error> {
         if !valid_host(id) {
             return Err(Error::BadRecipient);
@@ -223,6 +242,10 @@ impl Recipient {
             Recipient::RpId(id) => {
                 w.u8(4);
                 w.str(id);
+            }
+            Recipient::Service(n) => {
+                w.u8(5);
+                w.str(n);
             }
         }
     }
@@ -260,6 +283,7 @@ impl Recipient {
             }
             3 => Ok(Recipient::User),
             4 => Recipient::rp_id(r.str(caps::RP_ID)?).map_err(|_| Error::Corrupt("recipient")),
+            5 => Recipient::service(r.str(64)?).map_err(|_| Error::Corrupt("recipient")),
             _ => Err(Error::Corrupt("recipient tag")),
         }
     }

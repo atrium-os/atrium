@@ -140,7 +140,7 @@ fn courier_uids_resolve_only_through_the_courier_registry() {
     // An app line claiming a courier uid is ignored.
     std::fs::write(&reg, format!("64001 alice org.example.mail {}\n", "ab".repeat(32))).unwrap();
     std::fs::write(&creg, "64001 alice app-x https api.example 443\n").unwrap();
-    let r = Resolver { registry: reg, vestibulum_uid: None, ui_uid: None, allow_unsigned: false, courier_registry: Some(creg.clone()), web_broker: None };
+    let r = Resolver { registry: reg, vestibulum_uid: None, ui_uid: None, allow_unsigned: false, courier_registry: Some(creg.clone()), web_broker: None, services: vec![] };
     match r.resolve(64001) {
         Label::Courier(c) => assert_eq!((c.user.as_str(), c.persona.as_str()), ("alice", "app-x")),
         l => panic!("{l:?}"),
