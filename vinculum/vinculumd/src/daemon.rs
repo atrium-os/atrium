@@ -439,6 +439,7 @@ impl Daemon {
                 }
                 self.host.disconnect(handle, now);
             }
+            HostEvent::ChannelOpen { .. } | HostEvent::ChannelData { .. } | HostEvent::ChannelClosed { .. } | HostEvent::ChannelFailed { .. } => {}
             HostEvent::ConnectionRequest { peer: p, .. } => {
                 // A Classic device paging us: only bonded devices get a
                 // link, and it is authenticated by us before use (§7).

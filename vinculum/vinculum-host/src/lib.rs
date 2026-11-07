@@ -15,6 +15,7 @@
 pub mod acl;
 mod classic;
 pub mod cmd;
+pub mod l2cap;
 mod security;
 pub mod testing;
 
@@ -132,6 +133,12 @@ pub enum HostEvent {
     /// A Classic device asks to connect; answer with `accept_connection`
     /// or `reject_connection` (the daemon accepts bonded devices only).
     ConnectionRequest { peer: Peer, class_of_device: u32 },
+    /// A dynamic L2CAP channel (BR/EDR) is open, either way round.
+    ChannelOpen { handle: u16, cid: u16, psm: u16, peer_mtu: u16 },
+    ChannelData { handle: u16, cid: u16, payload: Vec<u8> },
+    ChannelClosed { handle: u16, cid: u16 },
+    /// A channel we asked for was refused or timed out.
+    ChannelFailed { handle: u16, psm: u16, why: String },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -177,6 +184,7 @@ struct Connection {
     encrypting: bool,
     encrypted: bool,
     classic: Option<classic::ClassicSec>,
+    sig: l2cap::Signaling,
 }
 
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
@@ -199,6 +207,8 @@ pub struct Host {
     acl_out: VecDeque<(u16, Vec<u8>)>,
     /// Disconnects waiting for their link's data to drain, with deadlines.
     closing: Vec<(u16, u64)>,
+    /// PSMs incoming dynamic channels may open.
+    psms: Vec<u16>,
     out_frames: VecDeque<Frame>,
     out_events: VecDeque<HostEvent>,
     stats: Stats,
@@ -240,6 +250,7 @@ impl Host {
             conns: HashMap::new(),
             acl_out: VecDeque::new(),
             closing: Vec::new(),
+            psms: Vec::new(),
             out_frames: VecDeque::new(),
             out_events: VecDeque::new(),
             stats: Stats::default(),
@@ -298,7 +309,13 @@ impl Host {
 
     /// When [`Host::tick`] must next be called, if ever.
     pub fn deadline(&self) -> Option<u64> {
-        let smp = self.conns.values().filter_map(|c| c.smp.as_ref()?.deadline()).chain(self.closing.iter().map(|c| c.1)).min();
+        let smp = self
+            .conns
+            .values()
+            .filter_map(|c| c.smp.as_ref()?.deadline())
+            .chain(self.conns.values().filter_map(|c| c.sig.deadline()))
+            .chain(self.closing.iter().map(|c| c.1))
+            .min();
         match (self.cmds.deadline(), smp) {
             (Some(a), Some(b)) => Some(a.min(b)),
             (a, b) => a.or(b),
@@ -310,6 +327,7 @@ impl Host {
             self.fatal(format!("{op:?}: no completion within {} ms", cmd::COMMAND_TIMEOUT_MS));
         }
         self.smp_tick(now_ms);
+        self.l2cap_tick(now_ms);
         self.pump(now_ms);
     }
 
@@ -581,6 +599,7 @@ impl Host {
                 encrypting: false,
                 encrypted: false,
                 classic: None,
+                sig: l2cap::Signaling::default(),
             },
         );
         self.out_events.push_back(HostEvent::Connected { handle, peer, transport, central });
@@ -622,6 +641,8 @@ impl Host {
                 if let Some(pdu) = p.pdu {
                     if pdu.cid == security::SMP_CID && conn.transport == Transport::Le {
                         self.on_smp(handle, &pdu.payload, now_ms);
+                    } else if conn.transport == Transport::BrEdr && (pdu.cid == l2cap::SIGNALING_CID || pdu.cid >= 0x0040) {
+                        self.on_l2cap_pdu(handle, pdu.cid, pdu.payload, now_ms);
                     } else {
                         self.out_events.push_back(HostEvent::L2cap { handle, cid: pdu.cid, payload: pdu.payload });
                     }

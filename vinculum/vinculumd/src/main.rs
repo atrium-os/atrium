@@ -428,6 +428,7 @@ fn main() {
                     host.disconnect(handle, now());
                     phase = Phase::Disconnecting;
                 }
+                HostEvent::ChannelOpen { .. } | HostEvent::ChannelData { .. } | HostEvent::ChannelClosed { .. } | HostEvent::ChannelFailed { .. } => {}
                 HostEvent::ConnectionRequest { peer, .. } => {
                     println!("connection request from {peer}: refused (development mode)");
                     host.reject_connection(peer, now());
