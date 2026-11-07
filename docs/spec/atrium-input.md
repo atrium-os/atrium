@@ -153,7 +153,11 @@ HID gives the descriptor from SDP and reports on the interrupt
 channel; HID over GATT gives the Report Map and report
 characteristics. Both are HID descriptors and reports, so §3.1's
 parser handles them unchanged. Tactus gets the channels over a socket
-from the Bluetooth service and never touches HCI.
+from the Bluetooth service and never touches HCI. The hand-off is
+[`bluetooth.md`](bluetooth.md) §10 (proposal): vinculumd passes one
+hidraw-like SEQPACKET fd per device with its descriptor; packets
+carry the report id separately, so tactusd prepends it before the
+common decoder, and a `Dropped` packet releases held keys.
 
 ### 3.4 Virtual and test sources
 
