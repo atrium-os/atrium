@@ -41,7 +41,7 @@
 //! `Appended`. And one gap: `Error` names no track, so `TOO_BIG` ends every
 //! append in flight.
 
-use limen::media_player::{code, media_action, ToChild, ToParent, APPEND_MAX, MEDIA_TEXT_MAX, TRACKS_MAX};
+use limen::media_player::{code, media_action, TextChoice, ToChild, ToParent, APPEND_MAX, MEDIA_TEXT_MAX, TEXT_NAME_MAX, TEXT_TRACKS_MAX, TRACKS_MAX};
 use std::collections::{HashMap, VecDeque};
 
 /// What a call throws, as the DOM names it.
@@ -52,7 +52,37 @@ pub enum DomError { InvalidState, NotSupported, QuotaExceeded, Type, IndexSize, 
 /// `SourceBuffer` (by track); or a call of the page's `mediaSession` action
 /// handler for one [`media_action`] bit.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum Fire { Element(&'static str), Source(&'static str), Buffer(u8, &'static str), SessionAction(u16) }
+pub enum Fire { Element(&'static str), Source(&'static str), Buffer(u8, &'static str), SessionAction(u16),
+                /// On `video.textTracks` (`change`, `addtrack`).
+                TextTracks(&'static str) }
+
+/// `TextTrack.mode`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TrackMode { Disabled, Hidden, Showing }
+
+impl TrackMode {
+    pub fn parse(s: &str) -> Option<TrackMode> {
+        match s { "disabled" => Some(TrackMode::Disabled), "hidden" => Some(TrackMode::Hidden), "showing" => Some(TrackMode::Showing), _ => None }
+    }
+    pub fn as_str(self) -> &'static str { match self { TrackMode::Disabled => "disabled", TrackMode::Hidden => "hidden", TrackMode::Showing => "showing" } }
+}
+
+/// One entry of `video.textTracks`, as a page reads it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PageTrack {
+    /// The player's id (`TextChoice::Page`): a `<track>`'s place, or the
+    /// next free one for `addTextTrack`.
+    pub id: u8,
+    pub kind: String,
+    pub label: String,
+    pub language: String,
+    pub mode: TrackMode,
+    /// A `<track>` element's (its file can reach the player); `false`: one
+    /// the page made with `addTextTrack`.
+    pub element: bool,
+    /// Its WebVTT file is queued for the player (`text_track_file`).
+    has_file: bool,
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ReadyState { Closed, Open, Ended }
@@ -98,6 +128,13 @@ pub struct Media {
     pub in_pip: bool,
     /// The `mediaSession` actions the page handles ([`media_action`] bits).
     session_actions: u16,
+    text_tracks: Vec<PageTrack>,
+    /// `TextTrack`s queued before the source, sent right after it.
+    pending_files: Vec<ToChild>,
+    shown_text: Option<TextChoice>,
+    /// The page has set a track's mode (until then, no page text showing
+    /// leaves the player's own, `InBand`).
+    page_chose: bool,
 }
 
 impl Default for Media { fn default() -> Self { Self::new() } }
@@ -106,7 +143,8 @@ impl Media {
     pub fn new() -> Self {
         Media { out: vec![], events: vec![], ms: None, can_play: HashMap::new(), asked: Default::default(), loaded: false,
                 paused: true, current_time: 0.0, duration: f64::NAN, volume: 1.0, muted: false, rate: 1.0, seeking: false,
-                ended: false, ready_state: 0, error: None, size: (0, 0), file_buffered: vec![], in_pip: false, session_actions: 0 }
+                ended: false, ready_state: 0, error: None, size: (0, 0), file_buffered: vec![], in_pip: false, session_actions: 0,
+                text_tracks: vec![], pending_files: vec![], shown_text: None, page_chose: false }
     }
 
     /// The messages to send to the embed, in order.
@@ -133,6 +171,7 @@ impl Media {
         if self.loaded { return Err(DomError::InvalidState) } // one source per embed (atrium-player M5)
         self.loaded = true;
         self.out.push(ToChild::Load { source: limen::media_player::Source::Fd, mime: mime.to_string(), growing: false });
+        self.sync_text();
         Ok(())
     }
 
@@ -142,6 +181,7 @@ impl Media {
         self.loaded = true;
         self.ms = Some(Ms { ready: ReadyState::Open, duration: f64::NAN, bufs: vec![] });
         self.out.push(ToChild::OpenSource);
+        self.sync_text();
         self.events.push(Fire::Source("sourceopen"));
         Ok(())
     }
@@ -198,6 +238,97 @@ impl Media {
         if self.loaded { self.out.push(ToChild::SetRate { rate: self.rate }) }
         self.events.push(Fire::Element("ratechange"));
         Ok(())
+    }
+
+    // ── text tracks ───────────────────────────────────────────────────
+
+    /// ★ A `<track>` element of this video (its kind subtitles or
+    /// captions: `navigator_dom::media::text_tracks`), in `textTracks` with
+    /// its id. HTML's default track starts `showing`; the others
+    /// `disabled`. Its file reaches the player through `text_track_file`.
+    pub fn element_text_track(&mut self, t: &navigator_render::TextTrack) {
+        if self.text_tracks.iter().any(|x| x.id == t.id) || t.id >= TEXT_TRACKS_MAX { return }
+        let mode = if t.default && !self.text_tracks.iter().any(|x| x.element && x.mode == TrackMode::Showing) { TrackMode::Showing } else { TrackMode::Disabled };
+        self.text_tracks.push(PageTrack { id: t.id, kind: t.kind.as_str().into(), label: t.label.clone(), language: t.srclang.clone(),
+                                          mode, element: true, has_file: false });
+        self.text_tracks.sort_by_key(|x| x.id);
+        self.events.push(Fire::TextTracks("addtrack"));
+    }
+
+    /// The engine has element track `id`'s WebVTT file: the `TextTrack`
+    /// this queues goes with that file's descriptor (as `Load` does), after
+    /// the source.
+    pub fn text_track_file(&mut self, id: u8) -> Result<(), DomError> {
+        let t = self.text_tracks.iter_mut().find(|t| t.id == id && t.element).ok_or(DomError::NotSupported)?;
+        if t.has_file { return Ok(()) }
+        t.has_file = true;
+        let msg = ToChild::TextTrack { id, lang: t.language.clone(), label: t.label.clone() };
+        if self.loaded { self.out.push(msg) } else { self.pending_files.push(msg) }
+        self.sync_text();
+        Ok(())
+    }
+
+    /// `video.addTextTrack(kind, label, language)`. Its cues are the page
+    /// script's (`addCue`), and passing cues to the player is OUT OF SCOPE:
+    /// the player shows only WebVTT files. So a script's track is listed and
+    /// its mode kept, but showing it shows no page text (`ShowText None`).
+    pub fn add_text_track(&mut self, kind: &str, label: &str, language: &str) -> Result<u8, DomError> {
+        if !matches!(kind, "subtitles" | "captions" | "descriptions" | "chapters" | "metadata") { return Err(DomError::Type) }
+        let id = (0..TEXT_TRACKS_MAX).find(|i| !self.text_tracks.iter().any(|t| t.id == *i)).ok_or(DomError::NotSupported)?;
+        let clean = |s: &str| -> String {
+            let mut o = String::new();
+            for c in s.chars().filter(|c| !c.is_control()) { if o.len() + c.len_utf8() > TEXT_NAME_MAX { break } o.push(c) }
+            o
+        };
+        // A track made by script starts `hidden` (HTML).
+        self.text_tracks.push(PageTrack { id, kind: kind.into(), label: clean(label), language: clean(language),
+                                          mode: TrackMode::Hidden, element: false, has_file: false });
+        self.text_tracks.sort_by_key(|x| x.id);
+        self.events.push(Fire::TextTracks("addtrack"));
+        Ok(id)
+    }
+
+    /// `textTracks[i].mode = m`: a value that is not one of the three is
+    /// ignored, as an unknown enum value is. A change fires `change` and
+    /// may change what the player shows (`ShowText`).
+    pub fn set_text_track_mode(&mut self, id: u8, mode: &str) -> Result<(), DomError> {
+        let Some(m) = TrackMode::parse(mode) else { return Ok(()) };
+        let t = self.text_tracks.iter_mut().find(|t| t.id == id).ok_or(DomError::NotSupported)?;
+        if t.mode == m { return Ok(()) }
+        t.mode = m;
+        self.page_chose = true;
+        self.events.push(Fire::TextTracks("change"));
+        self.sync_text();
+        Ok(())
+    }
+
+    /// `video.textTracks`, in id order.
+    pub fn text_tracks(&self) -> &[PageTrack] { &self.text_tracks }
+
+    /// ★ THE MODE MAPPING: the player shows one text. The first `showing`
+    /// subtitles or captions track whose file the player has is
+    /// `Page(id)`; with tracks but none such (all hidden or disabled, or
+    /// only a script's) once the page has set a mode, `None`; before that,
+    /// or with no page tracks at all, the player keeps its own default
+    /// (`InBand`) and nothing is sent. Sent only when
+    /// it changes, and only after the source (files queued before it go
+    /// first). An element's showing track whose file is still coming is
+    /// waited for, rather than saying `None` first.
+    fn sync_text(&mut self) {
+        if !self.loaded || self.text_tracks.is_empty() { return }
+        self.out.append(&mut self.pending_files);
+        let want = self.text_tracks.iter()
+            .find(|t| t.mode == TrackMode::Showing && t.element && t.has_file && matches!(t.kind.as_str(), "subtitles" | "captions"))
+            .map(|t| TextChoice::Page(t.id)).unwrap_or(TextChoice::None);
+        let waiting = self.text_tracks.iter().any(|t| t.mode == TrackMode::Showing && t.element && !t.has_file);
+        if waiting && self.shown_text.is_none() && want == TextChoice::None { return }
+        // No page track showing and the page has chosen nothing: the
+        // player keeps the media's own text, as the document lane leaves it.
+        if want == TextChoice::None && self.shown_text.is_none() && !self.page_chose { return }
+        if self.shown_text != Some(want) {
+            self.shown_text = Some(want);
+            self.out.push(ToChild::ShowText { text: want });
+        }
     }
 
     /// `video.buffered`: a file's, or every source buffer's intersected.

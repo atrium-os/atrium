@@ -420,9 +420,22 @@ pub fn anon_file() -> std::io::Result<(std::fs::File, std::os::fd::OwnedFd)> {
     }
     #[allow(unreachable_code)]
     {
+        // ★ A counter, not the clock alone: two threads asking within the
+        // clock's resolution got the same name, and `create_new` failed
+        // (seen as an intermittent test failure). A name taken by anything
+        // else is passed over.
+        static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         let n = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_nanos()).unwrap_or(0);
-        let p = std::env::temp_dir().join(format!("nuntius-{}-{n}", std::process::id()));
-        let w = std::fs::OpenOptions::new().read(true).write(true).create_new(true).open(&p)?;
+        let mut tries = 0;
+        let (w, p) = loop {
+            let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let p = std::env::temp_dir().join(format!("nuntius-{}-{n}-{seq}", std::process::id()));
+            match std::fs::OpenOptions::new().read(true).write(true).create_new(true).open(&p) {
+                Ok(w) => break (w, p),
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists && tries < 16 => tries += 1,
+                Err(e) => return Err(e),
+            }
+        };
         let ro = std::fs::File::open(&p)?;
         let _ = std::fs::remove_file(&p);
         Ok((w, OwnedFd::from(ro)))
