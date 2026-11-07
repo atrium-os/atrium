@@ -243,6 +243,12 @@ proves unacceptable for the apps people actually want.
    commercial service's allow-list while unlicensed. Then approach Google with it.
 4. Optional: D inside a bhyve micro-VM on hardware that supports it.
 
+**Design rule from this (Shankar, 2026-11-07):** when we approach Google, also ask for a
+native FreeBSD or Atrium build of the CDM. So keep the CDM host (`cdm::Host` interface,
+island channel, storage, jail profile) separate from the loader and glibc shim. A native
+build then drops in with no Linux shim at all, and the shim stays for OpenH264 and other
+Linux-only blobs.
+
 ## 9. Decisions for Shankar
 
 1. **Split the two jobs.** CDM (and OpenH264) get a foreign-library host (D); Linux apps, if
