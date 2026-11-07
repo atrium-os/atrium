@@ -307,7 +307,7 @@ The kernel patch is written to be offered to FreeBSD as it is:
 | Portcullis manifest `[capabilities] syscalls` to class | done: schema, validation, consent for `terminal`, both launch paths; unit tests in portcullis-jail (`tests/sysfil.rs`, including every shipped app manifest resolving), portcullis-policy and jaild |
 | arm64 build and VM run | pending |
 | overhead, cloud TCG (sanity) | done, below |
-| overhead under 1%, HVF (Mac, arm64) | outside filtered jails: **passes** (patched vs stock within ±0.5% on every operation). Inside a filtered jail, at fbsd 09e74dabf: null +1.9% (+1.5 ns), sockopt +1.9%, ioctl +4.3%; fbsd 302660e88 inlines the bitmap test and open-codes the list searches, re-measure pending. Table below |
+| overhead under 1%, HVF (Mac, arm64) | outside filtered jails: **passes** (patched vs stock within ±0.5% on every operation). Inside a filtered jail, at fbsd 09e74dabf: null +1.9% (+1.5 ns), sockopt +1.9%, ioctl +4.3%. At fbsd 302660e88 (bitmap test inline in `syscallenter`, open-coded list searches): **null +0.65% (+0.5 ns), nullio +0.42%, sockopt +1.05% (+1.2 ns), ioctl +2.8% (+2.8 ns, noise floor 1–2%)**, unfiltered path still within noise. Tables below |
 | overhead under 1%, KVM (R9700, amd64) | pending |
 | Navigator, Fresco, Tessera benchmarks with the filter | pending |
 | shipped `policy.sysfil.mode` | **1 (log only)** until the profiles have been run against the real apps (Pergola apps, Fresco renderers, Lyra clients, the player, Nuntius); then 2 |
@@ -325,7 +325,14 @@ best / median / spread in ns:
 | patched, open jail | 77.6 / 77.6 / 0.9 | 94.6 / 95.0 / 1.1 | 97.4 / 99.3 / 3.1 | 114.1 / 114.4 / 2.5 | 347.2 / 362.3 / 42.1 |
 | patched, filtered jail | 78.7 / 79.2 / 1.5 | 95.4 / 95.8 / 1.1 | 100.9 / 102.8 / 4.0 | 116.1 / 116.5 / 3.0 | 349.7 / 364.2 / 35.8 |
 
-Medians, patched open jail against stock open jail: null 0.00%, nullio -0.42%, ioctl
+At fbsd 302660e88, same protocol (medians, ns): stock host 77.8 / 95.5 / 97.6 / 114.0 /
+361.4; patched host 77.4 / 94.9 / 98.6 / 114.3 / 355.6; patched filtered jail 77.9 / 95.3 /
+101.4 / 115.5 / 364.7 (null / nullio / ioctl / sockopt / socket). The filtered jail's
+allowed system call is now four dependent loads and a bit test with no call; ioctl and
+socket options still call into `kern_jail_sysfil.c`, and inlining those the same way is
+the next step if the gate has to hold for them too.
+
+Medians at 09e74dabf, patched open jail against stock open jail: null 0.00%, nullio -0.42%, ioctl
 +0.51%, sockopt +0.35%, socket +0.36%. The ioctl noise floor is about 2% (stock host against
 stock open jail differ by 1.75%). `sysfil.denied` stayed 0 in every filtered run, and a
 positive control (`sh -c 'ls; mkfifo'` in the same jail) was denied.
