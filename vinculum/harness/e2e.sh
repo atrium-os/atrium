@@ -18,12 +18,12 @@ if [ ! -x "$venv/bin/python" ]; then
     python3 -m venv "$venv"
     "$venv/bin/pip" install -q rootcanal bumble
 fi
-cargo build -q --manifest-path "$ws/Cargo.toml" -p vinculum-hci -p vinculumd 2>/dev/null
+cargo build -q --manifest-path "$ws/Cargo.toml" -p vinculum-hci -p vinculumd -p vinculum-ctl 2>/dev/null
 bin=$(cargo metadata -q --manifest-path "$ws/Cargo.toml" --format-version 1 | python3 -c 'import json,sys; print(json.load(sys.stdin)["target_directory"])')/debug
 
 work=$(mktemp -d)
-rc_pid= peer_pid= hci_pid=
-cleanup() { kill $hci_pid $peer_pid $rc_pid 2>/dev/null || true; rm -rf "$work"; }
+rc_pid= peer_pid= hci_pid= d_pid=
+cleanup() { kill $d_pid $hci_pid $peer_pid $rc_pid 2>/dev/null || true; rm -rf "$work"; }
 trap cleanup EXIT INT TERM
 
 "$venv/bin/python" -m rootcanal --hci_port "$port" --link_port $((port + 1)) \
@@ -92,6 +92,47 @@ grep -q "reconnect: encrypted with the stored key" "$work/d.log" || { echo "FAIL
 EXPECT_FAIL="pairing refused: the new key is unauthenticated"
 scenario "B2 no key downgrade (authenticated bond kept)" none --pair --keys "$work/keys" --machine-key "$work/machine.key"
 EXPECT_FAIL=
+
+# The service: vinculumd with the bluetooth-control socket, driven by
+# vinculum-ctl as the pairing agent (spec §13).
+"$venv/bin/python" "$here/peer_advertiser.py" "tcp-client:127.0.0.1:$port" VinculumPeer 60 display-yes-no >"$work/peer.log" 2>&1 &
+peer_pid=$!
+until grep -q advertising "$work/peer.log" 2>/dev/null; do sleep 0.1; done
+"$bin/vinculumd" --transport "unix:$work/hci.sock" --control "$work/ctl.sock" --keys "$work/keys3" --machine-key "$work/machine.key" >"$work/svc.log" 2>&1 &
+d_pid=$!
+until [ -S "$work/ctl.sock" ]; do sleep 0.1; done
+ctl() { "$bin/vinculum-ctl" -s "$work/ctl.sock" "$@"; }
+control_ok=1
+i=0
+until ctl status 2>/dev/null | grep -q "ready: true"; do
+    i=$((i + 1)); [ $i -gt 50 ] && break
+    sleep 0.1
+done
+ctl status >"$work/ctl.log" 2>&1 || control_ok=0
+ctl pair VinculumPeer --yes >>"$work/ctl.log" 2>&1 || control_ok=0
+grep -q "paired .*(authenticated; keyboard allowed)" "$work/ctl.log" || control_ok=0
+addr=$(sed -n 's/^found VinculumPeer at //p' "$work/ctl.log" | head -1)
+ctl devices >"$work/dev.log" 2>&1 || control_ok=0
+grep -q "VinculumPeer.*authenticated.*connected" "$work/dev.log" || control_ok=0
+ctl disconnect "$addr" >>"$work/ctl.log" 2>&1 || control_ok=0
+sleep 0.5
+ctl connect "$addr" >>"$work/ctl.log" 2>&1 || control_ok=0
+grep -q "connected .* (encrypted)" "$work/ctl.log" || control_ok=0
+ctl devices >"$work/dev2.log" 2>&1 || control_ok=0
+grep -q "connected" "$work/dev2.log" || control_ok=0
+ctl remove "$addr" >>"$work/ctl.log" 2>&1 || control_ok=0
+ctl devices >"$work/dev3.log" 2>&1 || control_ok=0
+[ -s "$work/dev3.log" ] && control_ok=0
+[ -z "$(ls -A "$work/keys3")" ] || control_ok=0
+if [ $control_ok -eq 1 ]; then
+    echo "ok   B2 control socket: pair, list, reconnect, remove (vinculum-ctl)"
+else
+    echo "FAIL B2 control socket"; for f in ctl dev dev2 dev3 svc peer; do echo "--- $f"; cat "$work/$f.log"; done
+    fails=$((fails + 1))
+fi
+kill $d_pid $peer_pid 2>/dev/null || true
+wait $d_pid $peer_pid 2>/dev/null || true
+d_pid= peer_pid=
 
 if [ $fails -eq 0 ]; then
     echo "PASS: vinculum e2e"

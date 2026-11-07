@@ -1,0 +1,9 @@
+[package]
+name = "vinculum-ctl"
+version = "0.1.0"
+description = "Vinculum's control CLI and pairing agent (spec §13), until Curia's Bluetooth page exists"
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+vinculum-control = { path = "../vinculum-control" }

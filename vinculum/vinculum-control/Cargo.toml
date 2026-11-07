@@ -1,0 +1,10 @@
+[package]
+name = "vinculum-control"
+version = "0.1.0"
+description = "Vinculum's bluetooth-control wire (spec §13): pairing, devices, scan; shared by vinculumd and its clients"
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+postcard = { version = "1", features = ["use-std"] }

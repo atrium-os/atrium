@@ -13,5 +13,6 @@ vinculum-hci-proto = { path = "../vinculum-hci-proto" }
 vinculum-host = { path = "../vinculum-host" }
 vinculum-smp = { path = "../vinculum-smp" }
 vinculum-keys = { path = "../vinculum-keys" }
+vinculum-control = { path = "../vinculum-control" }
 zeroize = "1"
 libc = "0.2"

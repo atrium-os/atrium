@@ -11,6 +11,14 @@
 //!           [--scan SECS] [--connect NAME] [--att-mtu] [--timeout SECS]
 //!           [--pair [--reconnect] [--passkey-file PATH]]
 //!           [--keys DIR --machine-key PATH | --arca SOCKET]
+//! vinculumd --transport ... --control PATH [--control-uid UID]... [key store]
+//! ```
+//!
+//! With `--control` it runs as the service: the `bluetooth-control` socket
+//! (spec §13, `daemon.rs`) takes requests from the pairing UI or
+//! `vinculum-ctl`, and the development modes below are off.
+//!
+//! ```text
 //! ```
 //!
 //! `--connect NAME` scans until a device advertising NAME appears, connects
@@ -37,6 +45,7 @@ use std::os::fd::{AsRawFd, RawFd};
 use std::os::unix::net::UnixStream;
 use std::time::Instant;
 
+mod daemon;
 mod policy;
 
 use vinculum_hci_proto::h4::Decoder;
@@ -101,6 +110,8 @@ struct Opts {
     keys: Option<String>,
     machine_key: Option<String>,
     arca: Option<String>,
+    control: Option<String>,
+    control_uids: Vec<u32>,
 }
 
 fn opts() -> Opts {
@@ -114,6 +125,8 @@ fn opts() -> Opts {
         keys: None,
         machine_key: None,
         arca: None,
+        control: None,
+        control_uids: Vec::new(),
     };
     let mut a = std::env::args().skip(1);
     while let Some(k) = a.next() {
@@ -128,6 +141,8 @@ fn opts() -> Opts {
             "--keys" => o.keys = Some(a.next().unwrap_or_else(|| usage())),
             "--machine-key" => o.machine_key = Some(a.next().unwrap_or_else(|| usage())),
             "--arca" => o.arca = Some(a.next().unwrap_or_else(|| usage())),
+            "--control" => o.control = Some(a.next().unwrap_or_else(|| usage())),
+            "--control-uid" => o.control_uids.push(a.next().and_then(|v| v.parse().ok()).unwrap_or_else(|| usage())),
             "--timeout" => o.timeout_secs = a.next().and_then(|v| v.parse().ok()).unwrap_or_else(|| usage()),
             _ => usage(),
         }
@@ -194,6 +209,10 @@ fn main() {
         eprintln!("vinculumd: transport {}: {e}", o.transport);
         std::process::exit(1)
     });
+    if let Some(path) = o.control.clone() {
+        let cfg = daemon::Config { control_path: path, allowed_uids: o.control_uids.clone(), io_cap: IoCap::KeyboardDisplay, irk: [0x5C; 16] };
+        daemon::run(cfg, link, store, bonds);
+    }
     let t0 = Instant::now();
     let now = || t0.elapsed().as_millis() as u64;
     let give_up = o.timeout_secs * 1000;

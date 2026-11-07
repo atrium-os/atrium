@@ -5474,6 +5474,9 @@ The packet parsers are generated at build time by a patched, vendored pdl-compil
 capability; `vinculumd --pair` answers every prompt yes (development only).
 `--keys DIR --machine-key PATH` keeps bonds in the sealed file store across runs;
 `--arca SOCKET` (built with `--features atrium`) uses Arca's machine store.
+As a service: `vinculumd --transport unix:HCI.sock --control ctl.sock --keys DIR --machine-key PATH`,
+then `vinculum-ctl -s ctl.sock pair NAME` (asks on the terminal; `--yes` for scripts),
+`devices`, `connect ADDR`, `remove ADDR`, `agent`.
 
 ### 13.7 Navigator corpus (on the Mac, no VM)
 

@@ -13,6 +13,8 @@ members = [
     "vinculumd",
     "vinculum-smp",
     "vinculum-keys",
+    "vinculum-control",
+    "vinculum-ctl",
 ]
 
 [workspace.package]
