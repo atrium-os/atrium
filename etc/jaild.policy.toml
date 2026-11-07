@@ -137,7 +137,7 @@ allowed = [
     "atrium-baseline",   # null, zero, random, urandom, tty
     "atrium-gpu",        # baseline + atrium-gpu0
     "atrium-display",    # atrium-gpu + atrium-display0; pinned to frescod
-    "atrium-input",      # baseline + hidraw*; pinned to tactusd
+    "atrium-input",      # baseline + hidraw*, atkbd*, bpsm*; pinned to tactusd
     "atrium-tty",        # baseline + a specific allocated tty
 ]
 # Numeric ruleset ids jaild may mount a jail's devfs with. The rulesets
@@ -159,7 +159,7 @@ allowed = [
 #      with each capability's unhide rules applied to that jail's own mount.
 # 23 = atrium_display  — atrium_gpu + display0: frescod's alone (pinned below).
 # 24 = atrium_audio    — dsp*, mixer*, laminar: lyrad's alone (pinned below).
-# 26 = atrium_input    — hidraw*: tactusd's alone (pinned below).
+# 26 = atrium_input    — hidraw*, atkbd*, bpsm*: tactusd's alone (pinned below).
 allowed_ids = [4, 20, 21, 22, 23, 24, 26]
 
 # The display belongs to frescod. Only the frescod service may mount the
@@ -183,7 +183,7 @@ exec_path = "/usr/local/bin/atrium-lyrad"
 uid       = 65016
 
 # Input devices belong to tactusd (atrium-input.md §2): only the tactusd
-# service may mount the ruleset that shows /dev/hidraw*. frescod and apps get
+# service may mount the ruleset that shows /dev/hidraw*, atkbd*, bpsm*. frescod and apps get
 # input from it, never from the devices.
 [[devfs_rulesets.pinned]]
 id        = 26

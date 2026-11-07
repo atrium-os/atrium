@@ -5344,7 +5344,18 @@ usb-mouse"`, `QEMU_BIN` = the atrium-os QEMU fork: stock Ubuntu QEMU's TCG
 panicked the guest in zfs's AVX2 sha256), typing and clicking through the
 QEMU monitor; it ends `tactus: N failed`. QEMU monitor `mouse_move` always
 drives the relative mouse here, so the tablet's absolute path is covered by
-host tests only.
+host tests only. PS/2: pass tactus-console as the second argument of
+tactus-service.sh (installs rc.d `atrium_tactus_console`, which hands
+`atkbd0` from the console's kbdmux to tactusd while it runs and back when it
+stops; its log lines go to /var/log/messages). Check it with the VM started
+with `QEMU_EXTRA=""` (QEMU's i8042 keyboard and mouse only) and `PS2=1 sh
+scripts/vm-tactus-check.sh TACTUSD FRESCOD PROBE TACTUS_CONSOLE`, booted on
+the fork kernel (`nextboot -k kernel.atrium`): stock kbd.c livelocks Giant
+once atkbd0 and psm are both read (fixed in fbsd:34a110a9b). QEMU's
+`mouse_move 0 0 N` reaches psm (Explorer) with buttons 4 and 5 set besides
+the wheel step; that is QEMU's packet, not Tactus. Bluetooth:
+tactusd connects to vinculumd's `/atrium/sockets/bluetooth-hid/hid.sock`
+(`TACTUS_BLUETOOTH_SOCKET`, `off` to skip).
 
 Broker fuzzing (F3): `scripts/fresco-split-fuzz.sh` in the guest runs `atrium-split-fuzz` (hostile renderers + Navigator) against an animated probe client; `FUZZ_GPU=1` adds `atrium-gpu-fuzz` against the GPU channel. Kill leftover fuzz renderers between runs.
 

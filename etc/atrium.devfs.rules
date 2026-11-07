@@ -77,11 +77,16 @@ add include $devfsrules_unhide_basic
 add include $devfsrules_unhide_login
 
 # The jailed, NON-ROOT input service (tactusd, atrium-input.md §2): the HID
-# nodes (USB and I2C devices through hidbus), openable inside this jail's own
-# devfs. tactusd's alone (jaild.policy.toml pins id 26); frescod's rulesets
-# show no input nodes.
+# nodes (USB and I2C devices through hidbus) and the i8042 PS/2 keyboard and
+# pointer (atkbd*; bpsm*, psm's blocking node; tactus-console hands atkbd0
+# over from the console's kbdmux), openable inside this jail's own devfs. tactusd's alone
+# (jaild.policy.toml pins id 26); frescod's rulesets show no input nodes.
 [atrium_input=26]
 add include $devfsrules_hide_all
 add include $devfsrules_unhide_basic
 add path 'hidraw*' unhide
 add path 'hidraw*' mode 0666
+add path 'atkbd*' unhide
+add path 'atkbd*' mode 0666
+add path 'bpsm*' unhide
+add path 'bpsm*' mode 0666

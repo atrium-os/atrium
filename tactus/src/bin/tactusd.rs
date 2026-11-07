@@ -8,8 +8,10 @@
 //!
 //! Sources today: hidbus through `/dev/hidraw*` (USB and I2C), and
 //! Bluetooth HID devices that vinculumd hands over (bluetooth.md §10):
-//! one SEQPACKET fd per device, read like a hidraw node. PS/2 is a later
-//! step (spec §8, T4).
+//! one SEQPACKET fd per device, read like a hidraw node, and the i8042
+//! PS/2 keyboard (`/dev/atkbd0` in K_RAW, scancode set 1; tactus-console
+//! hands it over from the console) and pointer (`/dev/bpsm0`, sysmouse
+//! packets).
 //!
 //! Usage:
 //!   tactusd [--socket PATH]   serve (default /atrium/sockets/tactus/tactus.sock)
@@ -32,8 +34,9 @@ use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
 use tactus::decode::{Decoder, Input};
-use tactus::hid::Descriptor;
+use tactus::hid::{Class, Descriptor};
 use tactus::pointer::{Curve, Stage};
+use tactus::ps2::{self, Source};
 use tactus::repeat::{Repeat, Settings};
 use tactus::touchpad::{Out as TouchOut, Settings as TouchSettings, Touchpad};
 use tactus::wire::{self, Bus, Message};
@@ -228,7 +231,7 @@ enum Got {
 /// Reads one device until it goes away, decoding and sending its events.
 /// `keyboard`: false drops keyboard-page keys (a Bluetooth bond without
 /// keyboard rights, bluetooth.md §7).
-fn run_device(hub: &Hub, id: u32, mut dec: Decoder, keyboard: bool, mut read: impl FnMut(&mut [u8]) -> Got) {
+fn run_device(hub: &Hub, id: u32, mut dec: impl Source, keyboard: bool, mut read: impl FnMut(&mut [u8]) -> Got) {
     let mut stage = Stage::new(hub.curve);
     let mut pad = Touchpad::new(TouchSettings::default());
     let mut buf = vec![0u8; 65536];
@@ -303,7 +306,7 @@ fn run_device(hub: &Hub, id: u32, mut dec: Decoder, keyboard: bool, mut read: im
 
 /// Releases every key and button device `id` holds and stops its repeat
 /// (keyboard keys only if they were sent: `keyboard`).
-fn release(hub: &Hub, id: u32, dec: &mut Decoder, ev: &mut Vec<Input>, keyboard: bool) {
+fn release(hub: &Hub, id: u32, dec: &mut impl Source, ev: &mut Vec<Input>, keyboard: bool) {
     let ts_ns = wire::now_ns();
     ev.clear();
     dec.release_all(ev);
@@ -335,6 +338,95 @@ fn repeat_loop(hub: &Hub) {
             None => hub.wake.wait(s).unwrap(),
         };
     }
+}
+
+// ---- PS/2 (atrium-input.md §3.2) -------------------------------------
+
+/// The i8042 keyboard and pointer nodes, tried every 2 s while not open.
+/// `/dev/atkbd0` is busy until tactus-console releases it from the
+/// console's kbdmux; `/dev/bpsm0` (psm's blocking node: `/dev/psm0` reads
+/// never wait) until nothing else has it open.
+const PS2_KEYBOARD: &str = "/dev/atkbd0";
+const PS2_POINTER: &str = "/dev/bpsm0";
+
+// sys/kbio.h KDSKBMODE (_IOWINT('K', 7)), sys/mouse.h MOUSE_SETLEVEL
+// (_IOW('M', 5, int)).
+const KDSKBMODE: libc::c_ulong = 0x2004_4b07;
+const K_RAW: libc::c_int = 0;
+const MOUSE_SETLEVEL: libc::c_ulong = 0x8004_4d05;
+
+fn ps2_loop(hub: &Arc<Hub>, devs: &Arc<Mutex<Devices>>) {
+    let mut said: HashSet<&str> = HashSet::new();
+    loop {
+        for path in [PS2_KEYBOARD, PS2_POINTER] {
+            if devs.lock().unwrap().claimed.contains(path) || !std::path::Path::new(path).exists() {
+                continue;
+            }
+            match ps2_open(path) {
+                Ok(f) => {
+                    said.remove(path);
+                    ps2_start(hub, devs, path, f);
+                }
+                Err(e) if said.insert(path) => eprintln!("tactusd: {path}: {e}; trying again every 2 s"),
+                Err(_) => {}
+            }
+        }
+        std::thread::sleep(Duration::from_secs(2));
+    }
+}
+
+fn ps2_open(path: &str) -> std::io::Result<File> {
+    let f = File::open(path)?;
+    let fd = f.as_raw_fd();
+    // SAFETY: plain ioctls on our fd; KDSKBMODE takes its int by value,
+    // MOUSE_SETLEVEL by pointer.
+    let r = if path == PS2_KEYBOARD {
+        unsafe { libc::ioctl(fd, KDSKBMODE as _, K_RAW) }
+    } else {
+        let mut level: libc::c_int = 1;
+        unsafe { libc::ioctl(fd, MOUSE_SETLEVEL as _, &mut level as *mut libc::c_int) }
+    };
+    if r < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(f)
+}
+
+fn ps2_start(hub: &Arc<Hub>, devs: &Arc<Mutex<Devices>>, path: &'static str, mut file: File) {
+    let keyboard = path == PS2_KEYBOARD;
+    let id = {
+        let mut d = devs.lock().unwrap();
+        d.claimed.insert(path.to_string());
+        d.next_id += 1;
+        d.next_id
+    };
+    let node = path.trim_start_matches("/dev/");
+    let (name, classes) = if keyboard {
+        (format!("AT keyboard ({node})"), vec![Class::Keyboard, Class::MediaKeys, Class::SystemKeys])
+    } else {
+        (format!("PS/2 pointer ({node})"), vec![Class::Pointer])
+    };
+    eprintln!("tactusd: device {id} {path}: {name:?} Ps2 {classes:?}");
+    let rec = Message::Device { id, bus: Bus::Ps2, classes, vendor: 0, product: 0, name };
+    {
+        let mut s = hub.state.lock().unwrap();
+        s.send(&rec);
+        s.devices.insert(id, rec);
+    }
+    let (hub, devs) = (hub.clone(), devs.clone());
+    let _ = std::thread::Builder::new().name(format!("tactus:{node}")).spawn(move || {
+        let read = |buf: &mut [u8]| match file.read(buf) {
+            Ok(0) | Err(_) => Got::Gone,
+            Ok(n) => Got::Report(n),
+        };
+        if keyboard {
+            run_device(&hub, id, ps2::Set1::new(), true, read);
+        } else {
+            run_device(&hub, id, ps2::SysMouse::new(), true, read);
+        }
+        eprintln!("tactusd: device {id} {path} gone");
+        devs.lock().unwrap().claimed.remove(path);
+    });
 }
 
 // ---- Bluetooth HID (bluetooth.md §10) --------------------------------
@@ -588,6 +680,10 @@ fn main() {
     {
         let hub = hub.clone();
         std::thread::spawn(move || repeat_loop(&hub));
+    }
+    {
+        let (hub, devs) = (hub.clone(), devs.clone());
+        std::thread::spawn(move || ps2_loop(&hub, &devs));
     }
     {
         let (hub, devs) = (hub.clone(), devs.clone());

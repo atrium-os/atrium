@@ -1,0 +1,24 @@
+#!/bin/sh
+#
+# PROVIDE: atrium_tactus_console
+# REQUIRE: LOGIN
+# KEYWORD: shutdown
+#
+# tactus-console: hands the PS/2 keyboard (atkbd0) from the console's
+# kbdmux to tactusd while tactusd runs, and back when it stops
+# (docs/spec/atrium-input.md §3.2). Root, unjailed, nothing else.
+# Installed by scripts/tactus-service.sh.
+
+. /etc/rc.subr
+
+name=atrium_tactus_console
+rcvar=atrium_tactus_console_enable
+pidfile=/var/run/${name}.pid
+procname=/usr/sbin/daemon
+command=/usr/sbin/daemon
+command_args="-r -P ${pidfile} -S -T atrium-tactus-console /usr/local/sbin/atrium-tactus-console"
+
+load_rc_config $name
+: ${atrium_tactus_console_enable:=NO}
+
+run_rc_command "$1"

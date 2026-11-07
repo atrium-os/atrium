@@ -127,10 +127,9 @@ touchpad sit on the i8042 controller.
 - **Keyboard (`atkbd`).** Scancodes (set 1 or 2), translated to HID
   page 0x07 usages with the published scancode-to-HID table (the one
   Microsoft documents for its keyboard stack), not Linux keycodes.
-  Node to verify on hardware: the `atkbd` cdev (`KBD_INSTALL_CDEV`)
-  detached from `kbdmux`, or a vt tty in `K_RAW` as Xorg's keyboard
-  driver did. Either way the console keeps a path when tactusd is not
-  running.
+  The node is the `atkbd` cdev (`KBD_INSTALL_CDEV`) detached from
+  `kbdmux` by tactus-console while tactusd runs, so the console keeps
+  the keyboard when tactusd is not running (§8 T4).
 - **Pointer (`psm`).** `/dev/psm0` at `MOUSE_SETLEVEL 2` gives native
   packets. Plain PS/2 mice decode to buttons and deltas; Synaptics,
   Elantech and ALPS touchpads decode to finger contacts and feed the
@@ -490,6 +489,29 @@ zoomable views. The wire to apps stays HID-faithful.
 4. **T4 PS/2.** atkbd scancodes and psm packets (plain, Synaptics,
    Elantech, ALPS, trackpoint pass-through). QEMU's i8042 gives the
    keyboard and plain mouse path.
+   *Built, part 1 (2026-11-07):* keyboard and pointer, without touchpad
+   contacts. The keyboard is the `atkbd0` cdev (GENERIC has
+   `KBD_INSTALL_CDEV`) in `K_RAW`, scancode set 1 translated by
+   `tactus::ps2::Set1`; the keyboard's typematic repeats are dropped (Tactus
+   repeats). The vt `K_RAW` alternative was rejected: vt's raw mode carries
+   every keyboard in kbdmux, so USB keyboards would arrive twice (hidraw and
+   the tty). kbdmux holds atkbd0 at boot, so a root helper,
+   `tactus-console` (rc.d `atrium_tactus_console`), releases it from kbdmux
+   while it can connect to tactusd and adds it back when tactusd goes away:
+   the console keeps the built-in keyboard whenever Tactus is down. The
+   pointer is `psm0` at `MOUSE_SETLEVEL 1` (its blocking node `bpsm0`): psm's own 8-byte sysmouse
+   packets for every protocol it speaks (PS/2, IntelliMouse, Explorer;
+   touchpads as plain pointers), decoded by `tactus::ps2::SysMouse`. Both
+   nodes are in devfs ruleset 26 only. Reading atkbd0 needs the FreeBSD
+   fork's kbd.c fix (fbsd:34a110a9b): stock `genkbd_event` loops on
+   `NOKEY` while the PS/2 mouse has a byte pending, spinning the keyboard
+   interrupt thread with Giant held, so input stops (and the deadlock
+   detector panics at shutdown). `PS2=1 scripts/vm-tactus-check.sh` on
+   that kernel: 0 failed (typing, held-key repeat, click, motion, wheel,
+   atkbd0 back to the console while tactusd is down, input after its
+   restart). Part 2, native packets
+   (`MOUSE_SETLEVEL 2`) from Synaptics, Elantech and ALPS touchpads as
+   contacts for the touchpad stage, waits on a laptop to test against.
 5. **T5 Gamepads.** Rev. 1 §4.4/§5.3, plus exclusive grants.
 6. **T6 Bluetooth HID source**, once the Bluetooth service exists.
    *Built (tactusd side, 2026-11-07):* tactusd connects to vinculumd's
@@ -505,8 +527,8 @@ zoomable views. The wire to apps stays HID-faithful.
 
 ## 9. Open questions
 
-1. **PS/2 keyboard node.** atkbd cdev or vt `K_RAW` (§3.2): pick on
-   real hardware; both keep the console working without tactusd.
+1. **PS/2 keyboard node.** Settled 2026-11-07: the atkbd cdev, handed
+   over by tactus-console (§8 T4). Still to confirm on a laptop.
 2. **Multi-seat.** One seat for now; device records leave room for a
    seat id.
 3. **Per-device settings.** Acceleration, tap-to-click and scroll

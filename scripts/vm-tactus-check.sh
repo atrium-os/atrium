@@ -18,8 +18,18 @@
 # keys with shift, a token on each press and none on releases or repeats,
 # a held key repeating, a click with a token, motion, a scroll, a hot-plugged keyboard
 # and frescod waiting for tactusd when it restarts. Ends "tactus: N failed".
+#
+# PS/2 (T4): start the VM with no USB input (QEMU_EXTRA=""), so QEMU's
+# i8042 keyboard and mouse are the only ones, and pass tactus-console:
+#
+#   PS2=1 sh scripts/vm-tactus-check.sh TACTUSD FRESCOD INPUT_PROBE TACTUS_CONSOLE
+#
+# The same typing and clicking then goes through atkbd0 (K_RAW, handed over
+# from the console's kbdmux by tactus-console) and psm0; the hot-plug step is
+# skipped, and the restart step also checks the console gets atkbd0 back.
 set -u
-TD=$1 FD=$2 PROBE=$3
+TD=$1 FD=$2 PROBE=$3 CON=${4:-}
+PS2=${PS2:-0}
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
 VMDIR=${VMDIR:-$HOME/atrium-vm-amd64}
 K="-i $HOME/.ssh/fresco_bsd_ed25519 -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR"
@@ -42,9 +52,14 @@ scp -q $K -P 2222 "$PROBE" root@localhost:/root/t/atrium-input-probe
 scp -q $K -P 2222 "$ROOT/scripts/tactus-service.sh" root@localhost:/root/t/scripts/
 scp -q $K -P 2222 "$ROOT/tactus/etc/services.d/38-atrium-tactusd.toml" root@localhost:/root/t/tactus/etc/services.d/
 scp -q $K -P 2222 "$ROOT/etc/atrium.devfs.rules" root@localhost:/root/t/
+if [ -n "$CON" ]; then
+  V 'mkdir -p /root/t/tactus/etc/rc.d'
+  scp -q $K -P 2222 "$CON" root@localhost:/root/t/tactus-console
+  scp -q $K -P 2222 "$ROOT/tactus/etc/rc.d/atrium_tactus_console" root@localhost:/root/t/tactus/etc/rc.d/
+fi
 
 echo "== commission tactusd (jailed, devfs ruleset 26)"
-V 'sh -s' <<'EOF'
+V "CON=${CON:+/root/t/tactus-console} sh -s" <<'EOF'
 cd /root/t
 pkill -f "tactusd" ; pkill -x frescod; pkill -f atrium-input-probe
 install -m 0644 atrium.devfs.rules /usr/local/etc/atrium/devfs.rules
@@ -61,7 +76,7 @@ grep -q 'atrium-tactusd' $P || {
 }
 grep -c "65018" $P | sed 's/^/  policy mentions 65018: /'
 service atrium-jaild restart >/dev/null 2>&1; sleep 2
-sh scripts/tactus-service.sh /root/t/tactusd | tail -1
+sh scripts/tactus-service.sh /root/t/tactusd $CON | tail -1
 mkdir -p /tmp/tsvc && cp /etc/atrium/services.d/38-atrium-tactusd.toml /tmp/tsvc/
 pkill -f "services-dir /tmp/tsvc"
 daemon -f -o /var/log/atrium/tsvc-bootstrap.log /usr/local/bin/atrium-portcullisd-bootstrap --socket /var/run/atrium/jaild.sock --services-dir /tmp/tsvc
@@ -87,9 +102,15 @@ EOF
 echo "== type and click (QEMU monitor)"
 mon "mouse_set 5" "sendkey shift-a" "sendkey b" "sendkey c 1500" "mouse_move 20 10" "mouse_button 1" "mouse_button 0" "mouse_move 0 0 2"
 sleep 4
+if [ "$PS2" = 1 ]; then
+  V 'grep -E "atkbd0|bpsm0" /var/log/atrium/atrium-tactusd.log | tail -4; grep tactus-console /var/log/messages | tail -3'
+  V 'grep -q "device [0-9]* /dev/atkbd0" /var/log/atrium/atrium-tactusd.log' && ok "tactusd has atkbd0" || bad "tactusd has no atkbd0"
+  V 'grep -q "device [0-9]* /dev/bpsm0" /var/log/atrium/atrium-tactusd.log' && ok "tactusd has bpsm0" || bad "tactusd has no bpsm0"
+else
 mon "device_add usb-kbd,id=tk2"; sleep 8
 mon "sendkey d"; sleep 3
 mon "device_del tk2"; sleep 5
+fi
 V 'cat /tmp/probe.log' > /tmp/tactus-probe.log
 cat /tmp/tactus-probe.log | head -40
 P=/tmp/tactus-probe.log
@@ -103,10 +124,15 @@ grep "repeat" $P | grep -qv "usage=0x0006" && bad "repeats of other keys" || ok 
 grep -q "button window=[1-9][0-9]* button=1 pressed=1 token" $P && ok "click with token" || bad "click"
 grep -q "^motion window=" $P && ok "motion" || bad "motion"
 grep -q "^scroll window=" $P && ok "scroll" || bad "scroll"
-grep -q "usage=0x0007 pressed=1" $P && ok "hot-plugged keyboard types" || bad "hot-plugged keyboard"
+[ "$PS2" = 1 ] || { grep -q "usage=0x0007 pressed=1" $P && ok "hot-plugged keyboard types" || bad "hot-plugged keyboard"; }
 
 echo "== tactusd restarts: frescod waits, then gets input again"
 V 'pkill -x atrium-tactusd; sleep 8; ps -axo command | grep -c "[a]trium-tactusd"; grep -c "input from tactusd" /tmp/frescod-t.log; tail -3 /tmp/frescod-t.log'
+if [ "$PS2" = 1 ]; then
+  V 'grep -q "back to the console" /var/log/messages' && ok "atkbd0 back to the console while tactusd was down" || bad "console did not get atkbd0 back"
+  V 'grep -c "atkbd0 to tactusd" /var/log/messages' | sed 's/^/  atkbd0 handed to tactusd times: /'
+  sleep 4
+fi
 mon "sendkey e"; sleep 3
 V 'grep -q "usage=0x0008 pressed=1" /tmp/probe.log' && ok "input after tactusd restart" || bad "no input after tactusd restart"
 V 'echo $(ls /var/lib/atrium/jails/tactusd/dev)' | sed 's/^/  tactusd jail \/dev: /'

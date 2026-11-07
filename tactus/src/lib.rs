@@ -8,6 +8,7 @@
 pub mod decode;
 pub mod hid;
 pub mod pointer;
+pub mod ps2;
 pub mod repeat;
 pub mod touchpad;
 pub mod wire;

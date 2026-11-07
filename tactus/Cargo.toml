@@ -14,6 +14,10 @@ path = "src/lib.rs"
 name = "tactusd"
 path = "src/bin/tactusd.rs"
 
+[[bin]]
+name = "tactus-console"
+path = "src/bin/tactus-console.rs"
+
 [dependencies]
 serde    = { version = "1", features = ["derive"] }
 postcard = { version = "1", features = ["use-std"] }
