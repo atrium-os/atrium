@@ -1,0 +1,11 @@
+[package]
+name = "vinculum-hid-wire"
+version = "0.1.0"
+description = "The Bluetooth HID hand-off wire (bluetooth.md §10): vinculumd to tactusd, one SOCK_SEQPACKET fd per device"
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+postcard = { version = "1", features = ["use-std"] }
+libc = "0.2"

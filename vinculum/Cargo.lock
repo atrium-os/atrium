@@ -1006,6 +1006,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "vinculum-hid-wire"
+version = "0.1.0"
+dependencies = [
+ "libc",
+ "postcard",
+ "serde",
+]
+
+[[package]]
 name = "vinculum-host"
 version = "0.1.0"
 dependencies = [
