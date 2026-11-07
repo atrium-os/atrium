@@ -135,6 +135,7 @@ fn start(cfg: &Config, uid: u32, root: &Path, port: u16, addrs: &[Ipv4Addr]) -> 
         hostid: Some(id.hostid),
         hostuuid: Some(id.hostuuid.clone()),
         allow_mlock: true,
+        syscall_profile: None,
     });
 
     let (app, courier) = std::os::unix::net::UnixStream::pair().map_err(|e| format!("socketpair: {e}"))?;
