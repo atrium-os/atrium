@@ -43,8 +43,10 @@ until [ -S "$work/hci.sock" ]; do
     sleep 0.1
 done
 
-# scenario NAME PEER_IOCAP VINCULUMD_ARGS... : a fresh peer, one vinculumd run.
+# scenario NAME PEER_IOCAP VINCULUMD_ARGS... : a fresh peer, one vinculumd run
+# (two runs against the same peer when AGAIN holds the second run's args).
 fails=0
+AGAIN=
 scenario() {
     name=$1 iocap=$2; shift 2
     rm -f "$work/passkey"
@@ -56,7 +58,8 @@ scenario() {
         i=$((i + 1)); [ $i -gt 100 ] && { cat "$work/peer.log"; echo "FAIL: peer did not start"; exit 1; }
         sleep 0.1
     done
-    if "$bin/vinculumd" --transport "unix:$work/hci.sock" --connect VinculumPeer --timeout 30 --passkey-file "$work/passkey" "$@" >"$work/d.log" 2>&1; then
+    d() { "$bin/vinculumd" --transport "unix:$work/hci.sock" --connect VinculumPeer --timeout 30 --passkey-file "$work/passkey" "$@"; }
+    if d "$@" >"$work/d.log" 2>&1 && { [ -z "$AGAIN" ] || d $AGAIN >>"$work/d.log" 2>&1; }; then
         echo "ok   $name"
     else
         echo "FAIL $name"; echo "--- vinculumd"; cat "$work/d.log"; echo "--- peer"; cat "$work/peer.log"
@@ -71,6 +74,12 @@ scenario "B1 connect + ATT MTU" none --att-mtu
 scenario "B2 Just Works, reconnect with stored key" none --pair --reconnect
 scenario "B2 numeric comparison, reconnect" display-yes-no --pair --reconnect
 scenario "B2 passkey (we display, peer types)" keyboard --pair
+# Persistence: pair into the sealed file store, then a new vinculumd process
+# finds the bond and encrypts with it.
+AGAIN="--pair --keys $work/keys --machine-key $work/machine.key"
+scenario "B2 bond survives a restart (file store)" display-yes-no --pair --keys "$work/keys" --machine-key "$work/machine.key"
+AGAIN=
+grep -q "reconnect: encrypted with the stored key" "$work/d.log" || { echo "FAIL second run did not use the stored bond"; cat "$work/d.log"; fails=$((fails + 1)); }
 
 if [ $fails -eq 0 ]; then
     echo "PASS: vinculum e2e"

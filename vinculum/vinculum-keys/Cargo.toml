@@ -1,0 +1,20 @@
+[package]
+name = "vinculum-keys"
+version = "0.1.0"
+description = "Vinculum's bond records and key store seam (spec §4.1, §9): a sealed file store for stock FreeBSD, the Arca machine store on Atrium"
+edition.workspace = true
+license.workspace = true
+
+[features]
+# The Arca machine store client (arca.md §6.4). Speaks arcad's wire only; no
+# Atrium crate dependency.
+atrium = []
+
+[dependencies]
+vinculum-smp = { path = "../vinculum-smp" }
+aes-gcm = "0.10"
+rand_core = { version = "0.6", features = ["getrandom"] }
+zeroize = "1"
+
+[dev-dependencies]
+tempfile = "3"

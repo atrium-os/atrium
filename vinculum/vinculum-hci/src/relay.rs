@@ -22,7 +22,14 @@ pub struct Relay {
     from_host: Decoder,
     pub refused: u32,
     pub dropped: u32,
+    /// The relay reset the controller itself (the host left): everything
+    /// from the controller up to that Reset's completion is the old
+    /// session's and is dropped, and no new host is accepted until then.
+    pub resetting: bool,
 }
+
+/// HCI_Reset as H4 bytes.
+pub const HCI_RESET: [u8; 4] = [0x01, 0x03, 0x0C, 0x00];
 
 /// The H4 bytes of a Command Status event refusing `opcode`.
 pub fn refusal(opcode: u16) -> Vec<u8> {
@@ -41,10 +48,25 @@ impl Relay {
         self.from_host.reset();
     }
 
+    /// The host left: reset the controller so the next host starts from
+    /// a clean controller, with nothing of this session leaking into it.
+    pub fn host_left(&mut self, out: &mut Vec<Out>) {
+        out.retain(|o| matches!(o, Out::ToController(_)));
+        out.push(Out::ToController(HCI_RESET.to_vec()));
+        self.resetting = true;
+    }
+
     pub fn from_controller(&mut self, data: &[u8], out: &mut Vec<Out>) -> Result<(), h4::Error> {
         let mut frames = Vec::new();
         self.from_controller.push(data, |f| frames.push(f))?;
         for f in frames {
+            if self.resetting {
+                // Command Complete (0x0E) for Reset (opcode 0x0C03).
+                if f.kind == Kind::Event && f.packet.len() >= 5 && f.packet[0] == 0x0E && f.packet[3..5] == [0x03, 0x0C] {
+                    self.resetting = false;
+                }
+                continue;
+            }
             if f.kind == Kind::Command {
                 self.dropped += 1;
                 continue;
@@ -120,5 +142,21 @@ mod tests {
         r.from_host(&[0x04, 0x0E, 0x00], &mut out).unwrap(); // an "event" from the host
         assert!(out.is_empty());
         assert_eq!(r.dropped, 2);
+    }
+
+    #[test]
+    fn old_session_frames_dropped_until_the_reset_completes() {
+        let mut r = Relay::new();
+        let mut out = vec![Out::ToHost(vec![1]), Out::ToController(vec![2])];
+        r.host_left(&mut out);
+        assert_eq!(out, vec![Out::ToController(vec![2]), Out::ToController(HCI_RESET.to_vec())]);
+        out.clear();
+        // A late completion for the old host's command, then the Reset's.
+        r.from_controller(&[0x04, 0x0E, 0x04, 0x01, 0x09, 0x10, 0x00], &mut out).unwrap();
+        assert!(out.is_empty() && r.resetting);
+        r.from_controller(&[0x04, 0x0E, 0x04, 0x01, 0x03, 0x0C, 0x00], &mut out).unwrap();
+        assert!(out.is_empty() && !r.resetting);
+        r.from_controller(&[0x04, 0x0E, 0x04, 0x01, 0x03, 0x0C, 0x00], &mut out).unwrap();
+        assert_eq!(out.len(), 1, "the next host's traffic passes");
     }
 }

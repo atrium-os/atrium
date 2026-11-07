@@ -12,6 +12,7 @@ members = [
     "vinculum-hci",
     "vinculumd",
     "vinculum-smp",
+    "vinculum-keys",
 ]
 
 [workspace.package]

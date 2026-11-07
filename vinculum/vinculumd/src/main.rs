@@ -10,6 +10,7 @@
 //! vinculumd --transport unix:PATH|tcp:HOST:PORT
 //!           [--scan SECS] [--connect NAME] [--att-mtu] [--timeout SECS]
 //!           [--pair [--reconnect] [--passkey-file PATH]]
+//!           [--keys DIR --machine-key PATH | --arca SOCKET]
 //! ```
 //!
 //! `--connect NAME` scans until a device advertising NAME appears, connects
@@ -23,6 +24,12 @@
 //! passkey is written to `--passkey-file` for the test peer to type. With
 //! `--reconnect` it then disconnects, reconnects and encrypts with the
 //! bond's key.
+//!
+//! Bonds persist in a key store (spec §9): `--keys DIR --machine-key PATH`
+//! is the stock-FreeBSD sealed file store, `--arca SOCKET` the Arca machine
+//! store (built with the `atrium` feature). Without either they live in
+//! memory for the run. A peer with a stored bond is encrypted with it on
+//! connect instead of being paired again.
 
 use std::io::{Read, Write};
 use std::net::TcpStream;
@@ -32,7 +39,8 @@ use std::time::Instant;
 
 use vinculum_hci_proto::h4::Decoder;
 use vinculum_host::{Host, HostEvent, PairConfig, Prompt};
-use vinculum_smp::pairing::{Bond, IoCap};
+use vinculum_keys::{Address, KeyStore, MemoryStore};
+use vinculum_smp::pairing::IoCap;
 
 enum Link {
     Unix(UnixStream),
@@ -88,14 +96,23 @@ struct Opts {
     pair: bool,
     reconnect: bool,
     passkey_file: Option<String>,
+    keys: Option<String>,
+    machine_key: Option<String>,
+    arca: Option<String>,
 }
 
 fn opts() -> Opts {
     let usage = || -> ! {
-        eprintln!("usage: vinculumd --transport unix:PATH|tcp:HOST:PORT [--scan SECS] [--connect NAME] [--att-mtu] [--timeout SECS] [--pair [--reconnect] [--passkey-file PATH]]");
+        eprintln!("usage: vinculumd --transport unix:PATH|tcp:HOST:PORT [--scan SECS] [--connect NAME] [--att-mtu] [--timeout SECS] [--pair [--reconnect] [--passkey-file PATH]] [--keys DIR --machine-key PATH | --arca SOCKET]");
         std::process::exit(2)
     };
-    let mut o = Opts { transport: String::new(), scan_secs: None, connect: None, att_mtu: false, timeout_secs: 20, pair: false, reconnect: false, passkey_file: None };
+    let mut o = Opts { transport: String::new(), scan_secs: None, connect: None, att_mtu: false, timeout_secs: 20, pair: false,
+        reconnect: false,
+        passkey_file: None,
+        keys: None,
+        machine_key: None,
+        arca: None,
+    };
     let mut a = std::env::args().skip(1);
     while let Some(k) = a.next() {
         match k.as_str() {
@@ -106,11 +123,14 @@ fn opts() -> Opts {
             "--pair" => o.pair = true,
             "--reconnect" => o.reconnect = true,
             "--passkey-file" => o.passkey_file = Some(a.next().unwrap_or_else(|| usage())),
+            "--keys" => o.keys = Some(a.next().unwrap_or_else(|| usage())),
+            "--machine-key" => o.machine_key = Some(a.next().unwrap_or_else(|| usage())),
+            "--arca" => o.arca = Some(a.next().unwrap_or_else(|| usage())),
             "--timeout" => o.timeout_secs = a.next().and_then(|v| v.parse().ok()).unwrap_or_else(|| usage()),
             _ => usage(),
         }
     }
-    if o.transport.is_empty() {
+    if o.transport.is_empty() || o.keys.is_some() != o.machine_key.is_some() || (o.keys.is_some() && o.arca.is_some()) {
         usage()
     }
     o
@@ -129,8 +149,45 @@ enum Phase {
     Done,
 }
 
+fn open_store(o: &Opts) -> Box<dyn KeyStore> {
+    let fail = |e: vinculum_keys::Error| -> ! {
+        // Fail closed: no store, no bonds and no pairing (spec §9).
+        eprintln!("vinculumd: key store: {e}");
+        std::process::exit(1)
+    };
+    if let (Some(dir), Some(kp)) = (&o.keys, &o.machine_key) {
+        let mut k = vinculum_keys::load_or_create_machine_key(std::path::Path::new(kp)).unwrap_or_else(|e| fail(e));
+        let s = vinculum_keys::FileStore::open(std::path::Path::new(dir), &k);
+        zeroize::Zeroize::zeroize(&mut k);
+        return Box::new(s.unwrap_or_else(|e| fail(e)));
+    }
+    if let Some(_sock) = &o.arca {
+        #[cfg(feature = "atrium")]
+        return Box::new(vinculum_keys::arca::ArcaStore::connect(std::path::Path::new(_sock)).unwrap_or_else(|e| fail(e)));
+        #[cfg(not(feature = "atrium"))]
+        {
+            eprintln!("vinculumd: --arca needs the atrium build");
+            std::process::exit(2)
+        }
+    }
+    Box::new(MemoryStore::default())
+}
+
 fn main() {
     let o = opts();
+    let mut store = open_store(&o);
+    let mut bonds: Vec<vinculum_keys::Bond> = Vec::new();
+    for (id, b) in store.load_all().unwrap_or_else(|e| {
+        eprintln!("vinculumd: key store: {e}");
+        std::process::exit(1)
+    }) {
+        match b {
+            Ok(b) => bonds.push(b),
+            Err(e) => eprintln!("vinculumd: bond {id:02x?} unusable ({e}); that device must pair again"),
+        }
+    }
+    println!("bonds: {}", bonds.len());
+    let mut names: std::collections::HashMap<vinculum_host::Peer, String> = Default::default();
     let mut link = Link::open(&o.transport).unwrap_or_else(|e| {
         eprintln!("vinculumd: transport {}: {e}", o.transport);
         std::process::exit(1)
@@ -145,7 +202,6 @@ fn main() {
     let mut scan_until: Option<u64> = None;
     let mut ok = true;
     let mut pending_events: Vec<HostEvent> = Vec::new();
-    let mut bond: Option<Box<Bond>> = None;
 
     host.start(now());
     loop {
@@ -187,6 +243,7 @@ fn main() {
                 HostEvent::Advertisement { peer, rssi, name } => {
                     if phase == Phase::Scanning {
                         if let (Some(want), Some(n)) = (&o.connect, &name) {
+                            names.insert(peer, n.clone());
                             if want == n {
                                 println!("found {n} at {peer} (rssi {rssi}); connecting");
                                 host.le_scan(false, now());
@@ -201,7 +258,9 @@ fn main() {
                 }
                 HostEvent::Connected { handle, peer, transport, central } => {
                     println!("connected: handle {handle} {peer} {transport:?} {}", if central { "central" } else { "peripheral" });
-                    if let Some(b) = &bond {
+                    let at = Address::from_msb(peer.address, peer.random);
+                    if let Some(b) = vinculum_keys::find(&bonds, &at) {
+                        println!("bonded: {} ({}authenticated)", b.name, if b.authenticated { "" } else { "un" });
                         if let Err(e) = host.encrypt(handle, b.ltk, now()) {
                             eprintln!("vinculumd: encrypt: {e}");
                             ok = false;
@@ -290,7 +349,19 @@ fn main() {
                 }
                 HostEvent::Paired { handle, bond: b } => {
                     println!("paired: {b:?}");
-                    bond = Some(b);
+                    let Some(peer) = host.peer(handle) else { continue };
+                    let name = names.get(&peer).cloned().unwrap_or_default();
+                    // Development: paired by the invoking user.
+                    let uid = getuid();
+                    let rec = vinculum_keys::Bond::from_pairing(&b, Address::from_msb(peer.address, peer.random), uid, &name);
+                    match store.store(&rec) {
+                        Ok(_) => println!("stored bond for {name}"),
+                        Err(e) => {
+                            eprintln!("vinculumd: storing the bond: {e}");
+                            ok = false;
+                        }
+                    }
+                    bonds.push(rec);
                     host.disconnect(handle, now());
                     phase = if o.reconnect { Phase::Reconnecting } else { Phase::Disconnecting };
                 }
@@ -377,4 +448,9 @@ fn main() {
         ok = false;
     }
     std::process::exit(if ok { 0 } else { 1 })
+}
+
+fn getuid() -> u32 {
+    // SAFETY: getuid(2) has no preconditions and cannot fail.
+    unsafe { libc::getuid() }
 }

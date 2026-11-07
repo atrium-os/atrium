@@ -57,13 +57,14 @@ impl Controller {
     }
 }
 
-/// poll(2) on up to two fds; returns which are readable.
-fn wait(fds: &[RawFd]) -> Vec<bool> {
+/// poll(2) on up to two fds, `timeout_ms` (-1 forever); returns which are
+/// readable.
+fn wait(fds: &[RawFd], timeout_ms: i32) -> Vec<bool> {
     let mut p: Vec<libc::pollfd> = fds.iter().map(|&fd| libc::pollfd { fd, events: libc::POLLIN, revents: 0 }).collect();
     loop {
         // SAFETY: `p` is a valid, exclusively borrowed array of pollfd for
         // the duration of the call; its length is passed alongside.
-        let r = unsafe { libc::poll(p.as_mut_ptr(), p.len() as libc::nfds_t, -1) };
+        let r = unsafe { libc::poll(p.as_mut_ptr(), p.len() as libc::nfds_t, timeout_ms) };
         if r >= 0 {
             break;
         }
@@ -74,7 +75,9 @@ fn wait(fds: &[RawFd]) -> Vec<bool> {
     p.iter().map(|x| x.revents & (libc::POLLIN | libc::POLLHUP | libc::POLLERR) != 0).collect()
 }
 
-const HCI_RESET: [u8; 4] = [0x01, 0x03, 0x0C, 0x00];
+/// How long to wait for the controller to finish a reset before taking a
+/// new host anyway (the new host's own Reset then sorts it out).
+const RESET_WAIT_MS: u64 = 3000;
 
 fn main() {
     let mut controller_spec = None;
@@ -109,9 +112,24 @@ fn main() {
     let mut host: Option<UnixStream> = None;
     let mut buf = vec![0u8; 8192];
     let mut out = Vec::new();
+    let mut reset_since: Option<std::time::Instant> = None;
     loop {
+        if relay.resetting && reset_since.is_some_and(|t| t.elapsed().as_millis() as u64 >= RESET_WAIT_MS) {
+            eprintln!("vinculum-hci: controller did not complete the reset; taking the next host anyway");
+            relay.resetting = false;
+        }
+        if !relay.resetting {
+            reset_since = None;
+        }
         let host_fd = host.as_ref().map(|h| h.as_raw_fd()).unwrap_or(listener.as_raw_fd());
-        let ready = wait(&[ctl.fd(), host_fd]);
+        // While the controller resets, a waiting host is not accepted yet.
+        let ready = if relay.resetting && host.is_none() {
+            let mut r = wait(&[ctl.fd()], 100);
+            r.push(false);
+            r
+        } else {
+            wait(&[ctl.fd(), host_fd], -1)
+        };
         if ready[0] {
             let n = ctl.read(&mut buf).unwrap_or(0);
             if n == 0 {
@@ -138,8 +156,8 @@ fn main() {
                     if n == 0 || bad {
                         eprintln!("vinculum-hci: host {}; resetting the controller", if bad { "sent a malformed stream" } else { "left" });
                         host = None;
-                        out.retain(|o| matches!(o, Out::ToController(_)));
-                        out.push(Out::ToController(HCI_RESET.to_vec()));
+                        relay.host_left(&mut out);
+                        reset_since = Some(std::time::Instant::now());
                     }
                 }
             }

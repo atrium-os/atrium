@@ -5472,6 +5472,8 @@ The packet parsers are generated at build time by a patched, vendored pdl-compil
 (`vinculum/third_party/README.md`). `VINCULUM_TRACE=1` makes vinculumd print every frame.
 `peer_advertiser.py NAME SECS IOCAP PASSKEY_FILE` sets the Bumble peer's pairing I/O
 capability; `vinculumd --pair` answers every prompt yes (development only).
+`--keys DIR --machine-key PATH` keeps bonds in the sealed file store across runs;
+`--arca SOCKET` (built with `--features atrium`) uses Arca's machine store.
 
 ### 13.7 Navigator corpus (on the Mac, no VM)
 
