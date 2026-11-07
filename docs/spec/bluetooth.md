@@ -520,6 +520,7 @@ bar menu cover it, as `forum-ctl` did for displays.
 |---|---|---|
 | **B0** | `vinculum-hci-proto` from PDL, H4 framing, Rootcanal + Bumble harness in the repo | Bumble peer's HCI traffic parsed by the host tests |
 | **B1** | `vinculum-hci` (USB via libusb, H4 test transport, Intel + Realtek firmware, allowlist) and `vinculumd` skeleton (HCI flow control, LE + Classic connections); users, ruleset 25, services.d | controller up in the VM via Rootcanal; on a real dongle on the Mac |
+| | *As built 2026-11-07:* host side done (`vinculum-host`, `vinculum-hci` with TCP/UART + allowlist, `vinculumd`; `harness/e2e.sh` passes). **B1b** left: USB via libusb, firmware loaders, users/ruleset/services.d and the VM run | |
 | **B2** | security manager: SSP + BR/EDR SC, LE SC, legacy by override, key-size check, no-downgrade; Arca machine store items; `bluetooth-control` + `vinculum-ctl` | pair a Bumble keyboard with numeric comparison; KNOB/BIAS/BLURtooth tests refused |
 | **B3** | SDP client, Classic HID, HID hand-off to tactusd (§10) | keystrokes from a Bumble Classic keyboard reach a window in the VM; unpaired injection refused |
 | **B4** | ATT/GATT client, BAS/DIS, HOGP | HOGP mouse moves the pointer; battery in the Forum bar |

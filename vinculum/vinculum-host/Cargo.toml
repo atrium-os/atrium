@@ -1,0 +1,9 @@
+[package]
+name = "vinculum-host"
+version = "0.1.0"
+description = "Vinculum's host core, sans-I/O: HCI command flow, controller bring-up, connections, ACL credits, L2CAP reassembly"
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+vinculum-hci-proto = { path = "../vinculum-hci-proto" }

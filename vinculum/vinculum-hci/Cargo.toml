@@ -1,0 +1,14 @@
+[package]
+name = "vinculum-hci"
+version = "0.1.0"
+description = "Vinculum's transport: owns one controller, frames H4, filters the host's commands (spec §5)"
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+vinculum-hci-proto = { path = "../vinculum-hci-proto" }
+libc = "0.2"
+
+[[bin]]
+name = "vinculum-hci"
+path = "src/main.rs"
