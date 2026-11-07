@@ -27,6 +27,7 @@ use crate::gain::Gain;
 use crate::oss::OssSink;
 use crate::ring::Ring;
 use lyra_protocol::clock::{self, Clock, ClockWriter, STATE_PAUSED, STATE_PLAYING};
+use lyra_protocol::device::{DeviceReader, STATE_STREAMING};
 use lyra_protocol::wire::{self, FromEngine, ToEngine};
 use std::io;
 use std::os::fd::AsRawFd;
@@ -87,6 +88,12 @@ impl Adapter {
 
     pub fn device_channels(&self) -> usize {
         self.dev_ch
+    }
+
+    /// Convert to another device rate from the next period on (the output
+    /// changed to a device in another clock domain).
+    pub fn set_device_rate(&mut self, rate: u32, dev_rate: u32) {
+        self.ratio = rate as f64 / dev_rate as f64;
     }
 
     pub fn new(rate: u32, channels: u8, dev_rate: u32, dev_channels: u8) -> Option<Adapter> {
@@ -185,7 +192,23 @@ pub enum Cmd {
     /// A stream made by session `gen`'s `Open`: the consumer end of its ring
     /// and the writer of its clock page.
     Open(u64, u32, Box<Adapter>, Ring, ClockWriter),
+    /// An external device made by session `gen`'s `AddDevice`.
+    AddDevice(u64, Box<ExtDevice>),
 }
+
+/// An external output device (lyra-external-device.md): lyrad writes its mix
+/// into `ring`, the device reads it and reports its delay on `page`.
+pub struct ExtDevice {
+    pub id: u32,
+    pub ring: Ring,
+    pub page: DeviceReader,
+    pub rate: u32,
+    pub channels: u8,
+    pub initial_delay: u32,
+}
+
+/// Most external devices at once.
+pub const MAX_DEVICES: usize = 8;
 
 struct Slot {
     id: u32,
@@ -227,6 +250,13 @@ pub struct Engine {
     virt: Virtualizer,
     /// The virtual 7.1 bed the spatial streams mix into (period × 8).
     bed: Vec<f32>,
+    /// External devices choragusd added, and the output mixed for (0: the
+    /// built-in device).
+    devices: Vec<ExtDevice>,
+    pub output: u32,
+    /// An output choragusd asked for (or 0 after the current device went),
+    /// until the run loop switches.
+    pub want_output: Option<u32>,
 }
 
 /// The virtual speaker bed: 7.1.
@@ -255,6 +285,39 @@ impl Engine {
             spatial: false,
             virt: Virtualizer::for_period(rate as f32, period_frames),
             bed: vec![0.0; period_frames * BED_CHANNELS],
+            devices: Vec::new(),
+            output: 0,
+            want_output: None,
+        }
+    }
+
+    /// Mix at another device rate from the next period on: every stream's
+    /// adapter resamples to it, and its clock page follows.
+    pub fn set_rate(&mut self, rate: u32) {
+        if rate == self.rate {
+            return;
+        }
+        self.rate = rate;
+        for s in &mut self.slots {
+            s.adapter.set_device_rate(s.stream_rate, rate);
+        }
+        // The measured HRTFs are 48 kHz; at other rates the model renders.
+        self.virt = Virtualizer::for_period(rate as f32, self.period_frames);
+        self.balance = [Gain::new(self.balance[0].target(), rate as f32, 20.0), Gain::new(self.balance[1].target(), rate as f32, 20.0)];
+    }
+
+    pub fn rate(&self) -> u32 {
+        self.rate
+    }
+
+    pub fn device(&self, id: u32) -> Option<&ExtDevice> {
+        self.devices.iter().find(|d| d.id == id)
+    }
+
+    fn drop_devices(&mut self) {
+        self.devices.clear();
+        if self.output != 0 {
+            self.want_output = Some(0);
         }
     }
 
@@ -325,6 +388,7 @@ impl Engine {
                 self.slots.clear();
                 self.events.clear();
                 self.gen = g;
+                self.drop_devices();
             }
             Cmd::End(g) if g == self.gen => {
                 if !self.slots.is_empty() {
@@ -332,9 +396,15 @@ impl Engine {
                 }
                 self.slots.clear();
                 self.events.clear();
+                self.drop_devices();
             }
             Cmd::End(_) => {}
-            Cmd::Msg(g, _) | Cmd::Open(g, ..) if g != self.gen => {}
+            Cmd::Msg(g, _) | Cmd::Open(g, ..) | Cmd::AddDevice(g, _) if g != self.gen => {}
+            Cmd::AddDevice(_, d) => {
+                if self.device(d.id).is_none() && self.devices.len() < MAX_DEVICES && d.id != 0 {
+                    self.devices.push(*d);
+                }
+            }
             Cmd::Open(_, id, mut adapter, ring, clock) => {
                 // Made for the layout the connection thread knew of. New
                 // streams are spatial until choragusd says otherwise.
@@ -371,7 +441,18 @@ impl Engine {
 
     fn apply_msg(&mut self, m: ToEngine) {
         match m {
-            ToEngine::Open { .. } => {} // made by the connection thread
+            ToEngine::Open { .. } | ToEngine::AddDevice { .. } => {} // made by the connection thread
+            ToEngine::RemoveDevice { device } => {
+                self.devices.retain(|d| d.id != device);
+                if self.output == device && device != 0 {
+                    self.want_output = Some(0);
+                }
+            }
+            ToEngine::UseOutput { device } => {
+                if device == 0 || self.device(device).is_some() {
+                    self.want_output = Some(device);
+                }
+            }
             ToEngine::Close { stream } => self.slots.retain(|s| s.id != stream),
             ToEngine::Start { stream } => {
                 if let Some(s) = self.slot(stream) {
@@ -596,6 +677,33 @@ fn make_stream(cfg: &Config, rate: u32, channels: u8, ring_frames: u64) -> Optio
     Some((Box::new(adapter), ring, fd, clock, clock_fd))
 }
 
+/// The fill lyrad keeps in an external device's ring: 40 ms (enough for the
+/// device's largest read) plus one period. More would only add delay.
+pub fn device_target_fill(rate: u32, period: u32) -> u64 {
+    rate as u64 / 25 + period as u64
+}
+
+impl ExtDevice {
+    pub fn ring_frames(&self) -> u64 {
+        self.ring.writable() + self.ring.readable()
+    }
+}
+
+/// Make an external device for an `AddDevice`, or `None` if its format is
+/// out of range.
+#[allow(clippy::type_complexity)]
+fn make_device(cfg: &Config, id: u32, rate: u32, channels: u8, initial_delay: u32)
+    -> Option<(Box<ExtDevice>, std::os::fd::OwnedFd, std::os::fd::OwnedFd)> {
+    if id == 0 || !wire::DEVICE_RATES.contains(&rate) || !(1..=2).contains(&channels) {
+        return None;
+    }
+    let ring_frames = device_target_fill(rate, cfg.period_frames).next_power_of_two();
+    let (ring, ring_fd) = Ring::create_anon(ring_frames, channels as u64, true).ok()?;
+    let (page, page_fd) = lyra_protocol::device::create().ok()?;
+    let initial_delay = initial_delay.min(rate * wire::MAX_DEVICE_DELAY_S);
+    Some((Box::new(ExtDevice { id, ring, page, rate, channels, initial_delay }), ring_fd, page_fd))
+}
+
 /// Serve one trusted connection as session `gen`.
 fn serve_session(mut conn: UnixStream, gen: u64, cfg: Config, tx: mpsc::Sender<Cmd>, writer: Writer) {
     let _ = tx.send(Cmd::Begin(gen));
@@ -626,6 +734,27 @@ fn serve_session(mut conn: UnixStream, gen: u64, cfg: Config, tx: mpsc::Sender<C
                         && crate::fdpass::send_fd(w.as_raw_fd(), fd.as_raw_fd()).is_ok()
                         && crate::fdpass::send_fd(w.as_raw_fd(), clock_fd.as_raw_fd()).is_ok(),
                     None => wire::send(w, &FromEngine::OpenFailed { stream }).is_ok(),
+                };
+                if !ok {
+                    break;
+                }
+            }
+            ToEngine::AddDevice { device, rate, channels, initial_delay_frames } => {
+                let made = make_device(&cfg, device, rate, channels, initial_delay_frames);
+                let mut w = writer.lock().unwrap();
+                let Some((g, w)) = w.as_mut() else { break };
+                if *g != gen {
+                    break;
+                }
+                let ok = match made {
+                    Some((dev, ring_fd, page_fd)) => {
+                        let ring_frames = dev.ring_frames();
+                        let _ = tx.send(Cmd::AddDevice(gen, dev));
+                        wire::send(w, &FromEngine::DeviceAdded { device, ring_frames }).is_ok()
+                            && crate::fdpass::send_fd(w.as_raw_fd(), ring_fd.as_raw_fd()).is_ok()
+                            && crate::fdpass::send_fd(w.as_raw_fd(), page_fd.as_raw_fd()).is_ok()
+                    }
+                    None => wire::send(w, &FromEngine::DeviceFailed { device }).is_ok(),
                 };
                 if !ok {
                     break;
@@ -735,6 +864,8 @@ impl DeviceClock {
     const MIN_RATE_NS: f64 = 5e9;
     /// A reading this far off the line (seconds) restarts it.
     const RESET_S: f64 = 0.030;
+    /// Buckets that place the line (half a second).
+    const RECENT_BUCKETS: usize = 10;
 
     pub fn new(nominal: u32) -> Self {
         DeviceClock { nominal: nominal as f64, buckets: Default::default(), cur: (0.0, 0.0, 0), cur_start: 0,
@@ -771,7 +902,13 @@ impl DeviceClock {
             self.fit = None;
             return;
         }
-        self.fit = Some((mt, mq, slope));
+        // The slope from the whole window, the line's place from the last
+        // half second: a shift (a dry spell, a start-up with a short read, a
+        // device that changed its reported delay) is followed in half a
+        // second instead of being averaged over the window.
+        let k = n.min(Self::RECENT_BUCKETS);
+        let (rt, rq) = self.buckets.iter().skip(n - k).fold((0.0, 0.0), |(a, b), (t, q)| (a + t, b + q));
+        self.fit = Some((rt / k as f64, rq / k as f64, slope));
     }
 
     fn span_ns(&self) -> f64 {
@@ -821,9 +958,14 @@ impl DeviceClock {
     /// `CLOCK_MONOTONIC`, once the line is long enough to trust.
     pub fn heard_at(&self, pos: u64) -> Option<i64> {
         let (t0, q0, slope) = self.fit?;
-        if self.span_ns() < Self::MIN_FIT_NS {
+        let span = self.span_ns();
+        if span < Self::MIN_FIT_NS {
             return None;
         }
+        // Until the line spans enough to measure the rate, take the nominal
+        // one (a real device is within a few hundred ppm of it; a short fit
+        // over a start-up can be off by percents).
+        let slope = if span < Self::MIN_RATE_NS { self.nominal / 1e9 } else { slope };
         let q = (pos as i64 - self.base.1) as f64;
         Some(self.base.0 + (t0 + (q - q0) / slope).round() as i64)
     }
@@ -838,6 +980,147 @@ impl DeviceClock {
         self.last_report = now;
         let ppm = (slope * 1e9 / self.nominal - 1.0) * 1e6;
         Some(ppm.clamp(-1000.0, 1000.0).round() as i32)
+    }
+}
+
+/// Development outputs shared by both backends.
+struct DevIo<'a> {
+    dump: Option<&'a mut std::fs::File>,
+    poslog: Option<&'a mut std::io::BufWriter<std::fs::File>>,
+}
+
+fn sleep_ns(ns: i64) {
+    if ns > 0 {
+        std::thread::sleep(std::time::Duration::from_nanos(ns as u64));
+    }
+}
+
+/// Mix for the current external device until the output changes or the
+/// device goes (lyra-external-device.md §3). The device paces: lyrad keeps
+/// its ring at [`device_target_fill`]. A device that is stopped, or has read
+/// nothing for a second, gets no samples: lyrad then paces itself on
+/// `CLOCK_MONOTONIC`, so streams and their clocks keep moving.
+fn run_external(engine: &mut Engine, rx: &mpsc::Receiver<Cmd>, ev_tx: &mpsc::Sender<(u64, FromEngine)>, cfg: &Config, io: &mut DevIo) {
+    let id = engine.output;
+    let Some(d) = engine.device(id) else { return };
+    let (rate, ch, initial_delay) = (d.rate, d.channels as usize, d.initial_delay);
+    eprintln!("lyrad: mixing for external device {id} ({rate} Hz, {ch} ch)");
+    engine.set_rate(rate);
+    engine.set_channels(ch);
+    let _ = ev_tx.send((engine.session(), FromEngine::Layout { channels: ch as u8 }));
+    let period = cfg.period_frames as u64;
+    let target = device_target_fill(rate, cfg.period_frames);
+    let period_ns = (period as i128 * 1_000_000_000 / rate as i128) as i64;
+    let frames_ns = |f: u64| (f as i128 * 1_000_000_000 / rate as i128) as i64;
+    let max_delay = rate * wire::MAX_DEVICE_DELAY_S;
+    let mut mix = vec![0.0f32; period as usize * ch];
+    let mut out16 = vec![0i16; mix.len()];
+    let mut clock = DeviceClock::new(rate);
+    let mut next = monotonic_ns();
+    let mut last_underruns: Option<u32> = None;
+    let mut last_consumed = 0u64;
+    let mut progress_at = monotonic_ns();
+    let mut stalled = false;
+    let mut warned_delay = false;
+    loop {
+        while let Ok(c) = rx.try_recv() {
+            engine.apply(c);
+        }
+        if engine.want_output.is_some_and(|o| o != id) {
+            return;
+        }
+        engine.want_output = None;
+        if engine.want_channels.take().is_some() {
+            // The device's channel count is the device's: answer with it.
+            let _ = ev_tx.send((engine.session(), FromEngine::Layout { channels: ch as u8 }));
+        }
+        let Some(d) = engine.device(id) else {
+            eprintln!("lyrad: external device {id} went away");
+            engine.want_output = Some(0);
+            return;
+        };
+        let page = d.page.read();
+        let now = monotonic_ns();
+        let consumed = d.ring.peer_consumed().max(last_consumed);
+        if consumed > last_consumed {
+            last_consumed = consumed;
+            progress_at = now;
+            if stalled {
+                eprintln!("lyrad: external device {id} reads again");
+                stalled = false;
+            }
+        }
+        let queued = d.ring.readable();
+        let streaming = page.is_some_and(|p| p.state == STATE_STREAMING);
+        if streaming && !stalled && queued >= target && now - progress_at > 1_000_000_000 {
+            eprintln!("lyrad: external device {id} read nothing for a second; pacing on our own clock");
+            stalled = true;
+        }
+        let feeding = streaming && !stalled;
+        if feeding && queued + period > target {
+            // Wait for the device to make room, the time the surplus takes.
+            sleep_ns(frames_ns(queued + period - target).clamp(200_000, 20_000_000));
+            continue;
+        }
+        if feeding {
+            next = now + period_ns;
+        } else {
+            sleep_ns(next - now);
+            next = next.max(now) + period_ns;
+        }
+        let delay = match page {
+            Some(p) if p.rate != 0 => {
+                if p.delay_frames > max_delay && !warned_delay {
+                    eprintln!("lyrad: external device {id} reports {} frames of delay; clamped to {max_delay}", p.delay_frames);
+                    warned_delay = true;
+                }
+                p.delay_frames.min(max_delay)
+            }
+            _ => initial_delay,
+        } as u64;
+        let underruns = page.map_or(0, |p| p.underruns);
+        let starved = last_underruns.is_some_and(|l| l != underruns);
+        last_underruns = Some(underruns);
+        let written = d.ring.written();
+        let start = if feeding {
+            clock.sample(now, consumed.saturating_sub(delay), starved);
+            if let Some(ppm) = clock.rate_ppm(now) {
+                engine.rate_ppm = ppm;
+            }
+            clock.heard_at(written).unwrap_or(now + frames_ns(queued + delay))
+        } else {
+            now
+        };
+        engine.mix_at(&mut mix, queued + delay, start);
+        let gen = engine.session();
+        for ev in engine.take_events() {
+            let _ = ev_tx.send((gen, ev));
+        }
+        if !feeding {
+            continue;
+        }
+        for v in mix.iter_mut() {
+            *v = v.clamp(-1.0, 1.0);
+        }
+        let Some(d) = engine.device(id) else { continue };
+        d.ring.write(&mix);
+        if let Some(f) = io.dump.as_mut() {
+            use std::io::Write;
+            for (o, m) in out16.iter_mut().zip(&mix) {
+                *o = (m * 32767.0) as i16;
+            }
+            let bytes = unsafe { std::slice::from_raw_parts(out16.as_ptr() as *const u8, out16.len() * 2) };
+            let _ = f.write_all(bytes);
+        }
+        if let Some(w) = io.poslog.as_mut() {
+            // Columns as for the OSS device, so `written − delay` is the
+            // frame heard now: here `consumed − delay`.
+            use std::io::Write;
+            let _ = writeln!(w, "{now} {consumed} {consumed} {delay}");
+            if written % (rate as u64) < period {
+                let _ = w.flush();
+            }
+        }
     }
 }
 
@@ -878,6 +1161,19 @@ pub fn run(cfg: Config) -> ! {
         .map(std::io::BufWriter::new);
     let mut written: u64 = 0;
     loop {
+        if let Some(o) = engine.want_output.take() {
+            if o != engine.output {
+                eprintln!("lyrad: output {} -> {o}", engine.output);
+            }
+            engine.output = if o == 0 || engine.device(o).is_some() { o } else { 0 };
+            let _ = ev_tx.send((engine.session(), FromEngine::OutputInUse { device: engine.output }));
+        }
+        if engine.output != 0 {
+            let mut io = DevIo { dump: dump.as_mut(), poslog: poslog.as_mut() };
+            run_external(&mut engine, &rx, &ev_tx, &cfg, &mut io);
+            continue;
+        }
+        engine.set_rate(cfg.rate);
         let sink = match OssSink::open(cfg.rate, channels, cfg.period_frames, cfg.nfrags) {
             Ok(s) => s,
             Err(e) if channels != engine.channels() as u32 => {
@@ -893,6 +1189,7 @@ pub fn run(cfg: Config) -> ! {
                 let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
                 while let Some(left) = deadline.checked_duration_since(std::time::Instant::now()) {
                     if let Ok(c) = rx.recv_timeout(left) { engine.apply(c); }
+                    if engine.want_output.is_some() { break; }
                 }
                 continue;
             }
@@ -907,6 +1204,11 @@ pub fn run(cfg: Config) -> ! {
             while let Ok(c) = rx.try_recv() {
                 engine.apply(c);
             }
+            if engine.want_output.is_some_and(|o| o != 0) {
+                // Closing the OSS device: the next output is an external one.
+                break;
+            }
+            engine.want_output = engine.want_output.filter(|&o| o != 0);
             if let Some(w) = engine.want_channels.take() {
                 if w as u32 != channels {
                     eprintln!("lyrad: output layout {channels} -> {w} channels; reopening the device");
@@ -996,8 +1298,9 @@ mod tests {
             bursty(ppm, 30.0, |now, pos, _| {
                 c.sample(now, pos, false);
                 if let Some(p) = c.rate_ppm(now) { last_ppm = Some(p); }
-                // After the first seconds: when is the frame 100 ms ahead heard?
-                if now > 4_000_000_000 {
+                // Once the rate is measured (5 s): when is the frame 100 ms
+                // ahead heard? (Before, the nominal rate stands in.)
+                if now > 7_000_000_000 {
                     let f = pos + 4800;
                     // The true time (the position is floored to 480-frame steps,
                     // so the true line runs half a step above the steps).
@@ -1083,6 +1386,122 @@ mod tests {
         // choragusd sets every new stream's level before the app can start it.
         e.apply(Cmd::Msg(gen, ToEngine::SetGain { stream: id, db: 0.0 }));
         e.apply(Cmd::Msg(gen, ToEngine::Start { stream: id }));
+    }
+
+    /// lyra-external-device.md E1: a fake device reads lyrad's ring on its
+    /// own clock and reports a 150 ms delay (kept current as its queue
+    /// drains). A click the app writes at 2 s is heard when the app's clock
+    /// page, read a second earlier, said it would be.
+    #[test]
+    fn an_external_device_plays_and_the_clock_includes_its_delay() {
+        use lyra_protocol::clock::ClockReader;
+        use lyra_protocol::device::{DeviceState, DeviceWriter};
+        const RATE: u64 = 48_000;
+        const D: u64 = 7_200;
+        const N: u64 = 96_000;
+        let name = format!("/lyra-test-extdev-{}", std::process::id());
+        let dev_ring = Ring::create(&name, 4096, 2).unwrap();
+        let (page, page_fd) = lyra_protocol::device::create().unwrap();
+        let mut e = Engine::new(48_000, 2, 128);
+        e.apply(Cmd::Begin(1));
+        e.apply(Cmd::AddDevice(1, Box::new(ExtDevice { id: 5, ring: dev_ring, page, rate: 48_000, channels: 2, initial_delay: D as u32 })));
+        let (p, c) = ring_pair("extdev-stream", 16384, 2);
+        let (cw, cfd) = clock::create().unwrap();
+        e.apply(Cmd::Open(1, 1, Box::new(Adapter::new(48_000, 2, 48_000, 2).unwrap()), c, cw));
+        e.apply(Cmd::Msg(1, ToEngine::SetGain { stream: 1, db: 0.0 }));
+        e.apply(Cmd::Msg(1, ToEngine::Start { stream: 1 }));
+        e.apply(Cmd::Msg(1, ToEngine::UseOutput { device: 5 }));
+        e.output = 5;
+        e.want_output = None;
+        let reader = ClockReader::from_fd(cfd).unwrap();
+        let (tx, rx) = mpsc::channel();
+        let (heard_tx, heard_rx) = mpsc::channel();
+        let cfg = Config { socket: "/nonexistent".into(), peers: vec![], rate: 48_000, channels: 2, period_frames: 128, nfrags: 8 };
+        let mix = std::thread::spawn(move || {
+            let (ev_tx, _ev_rx) = mpsc::channel();
+            let mut io = DevIo { dump: None, poslog: None };
+            run_external(&mut e, &rx, &ev_tx, &cfg, &mut io);
+            e.output
+        });
+        // The app: silence with one click at stream frame N.
+        let app = std::thread::spawn(move || {
+            let mut f = 0u64;
+            let mut buf = vec![0.0f32; 256];
+            while f < N + 48_000 {
+                if p.writable() >= 128 {
+                    for (i, v) in buf.iter_mut().enumerate() {
+                        *v = if f + (i as u64 / 2) == N { 0.9 } else { 0.0 };
+                    }
+                    p.write(&buf);
+                    f += 128;
+                } else {
+                    std::thread::sleep(std::time::Duration::from_micros(500));
+                }
+            }
+        });
+        // The device: reads 256 frames every 256 frames' time, and plays each
+        // chunk out over the next 256 frames' time, D frames later.
+        let dev = std::thread::spawn(move || {
+            let ring = Ring::open(&name, false).unwrap();
+            let w = DeviceWriter::from_fd(page_fd).unwrap();
+            let t0 = monotonic_ns();
+            let mut buf = vec![0.0f32; 512];
+            let mut k = 0u64;
+            let mut last_read = t0;
+            let mut last_got = 0u64;
+            let mut underruns = 0u32;
+            while monotonic_ns() - t0 < 3_500_000_000 {
+                let now = monotonic_ns();
+                let tk = t0 + (k * 256 * 1_000_000_000 / RATE) as i64;
+                if now >= tk {
+                    let got = ring.read(&mut buf);
+                    last_read = tk;
+                    last_got = got;
+                    if got < 256 {
+                        underruns += 1;
+                    }
+                    if let Some(j) = (0..got as usize).find(|&j| buf[j * 2] > 0.5) {
+                        let _ = heard_tx.send(tk + ((D + j as u64) * 1_000_000_000 / RATE) as i64);
+                    }
+                    k += 1;
+                }
+                let left = last_got.saturating_sub(((monotonic_ns() - last_read).max(0) as u64) * RATE / 1_000_000_000);
+                w.publish(&DeviceState { state: STATE_STREAMING, delay_frames: (D + left) as u32, underruns, rate: 48_000 });
+                std::thread::sleep(std::time::Duration::from_micros(300));
+            }
+        });
+        // A second before the click: when does the clock page say it is heard?
+        std::thread::sleep(std::time::Duration::from_millis(1600));
+        let ck = reader.read();
+        assert_eq!(ck.state, STATE_PLAYING);
+        let predicted = ck.heard_at(N);
+        let heard = heard_rx.recv_timeout(std::time::Duration::from_secs(3)).expect("the click reached the device");
+        let err_ms = (predicted - heard) as f64 / 1e6;
+        eprintln!("external device: predicted minus heard {err_ms:.3} ms");
+        assert!(err_ms.abs() < 1.0, "predicted minus heard {err_ms:.3} ms");
+        dev.join().unwrap();
+        app.join().unwrap();
+        tx.send(Cmd::Msg(1, ToEngine::RemoveDevice { device: 5 })).unwrap();
+        assert_eq!(mix.join().unwrap(), 5, "left the device loop when the device went");
+    }
+
+    #[test]
+    fn a_device_at_another_rate_resamples_every_stream_to_it() {
+        let (p, c) = ring_pair("rate-switch", 32768, 2);
+        let mut e = Engine::new(48_000, 2, 128);
+        e.apply(Cmd::Begin(1));
+        open(&mut e, 1, 1, 48_000, 2, c);
+        p.write(&vec![0.1f32; 2 * 30_000]);
+        e.set_rate(44_100);
+        let mut mix = vec![0.0f32; 256];
+        for _ in 0..100 {
+            e.mix_at(&mut mix, 0, 0);
+        }
+        // 12,800 device frames at 44.1 kHz take 12,800 × 48/44.1 stream frames.
+        let want = (12_800.0 * 48_000.0 / 44_100.0) as i64;
+        let used = 30_000 - p.readable() as i64;
+        assert!((used - want).abs() <= 3, "used {used} stream frames, want about {want}");
+        assert!(mix.iter().all(|v| (v - 0.1).abs() < 1e-3));
     }
 
     #[test]

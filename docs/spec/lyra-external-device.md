@@ -69,7 +69,7 @@ lock:
 |---|---|
 | `seq` | odd while the device writes |
 | `state` | 0 stopped, 1 streaming (lyrad mixes only while streaming) |
-| `delay_frames` | frames taken from the ring but not yet heard: encoder queue, L2CAP and controller buffers, plus the sink's AVDTP delay report (A2DP 1.3), converted to frames |
+| `delay_frames` | frames taken from the ring but not yet heard: encoder queue, L2CAP and controller buffers, plus the sink's AVDTP delay report (A2DP 1.3), converted to frames. Keep it current as the queue drains between reads (at least every millisecond or two), not only when reading: lyrad samples it each period |
 | `underruns` | times the device found the ring empty (counter) |
 | `rate` | the frame rate it reads at (must equal the announced rate) |
 
@@ -149,6 +149,19 @@ external path. The OSS path still needs real hardware.
 | E4 | with the Bluetooth thread: vinculum-audio on the real path | B5's gate: a Bumble sink decodes the tone, A/V offset within lyra-v1 §8's bound |
 
 E1 to E3 need nothing from Vinculum, so they can start now.
+
+## 8a. As built
+
+- **E1** (2026-11-07): `lyra_protocol::device` (the page), `ToEngine::AddDevice`,
+  `RemoveDevice` and `UseOutput`, `FromEngine::DeviceAdded`, `DeviceFailed` and
+  `OutputInUse`; lyrad's `run_external` loop (fill to 40 ms plus a period; a stopped device,
+  or one that read nothing for a second, gets no samples and lyrad paces itself); the
+  engine switches rate per output (`Engine::set_rate`; the measured HRTFs only at 48 kHz,
+  the model elsewhere). The ring's producer end now keeps its own cursor, so a hostile
+  consumer can't make lyrad write past the ring. `DeviceClock` places its line from the
+  last half second and uses the nominal rate until it has 5 s to measure one. Host test: a
+  fake device with a 150 ms delay; a click predicted a second ahead lands within about
+  0.2 ms.
 
 ## 9. Decisions, with recommendations
 

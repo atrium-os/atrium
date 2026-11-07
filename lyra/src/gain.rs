@@ -36,6 +36,10 @@ impl Gain {
         self.current = g;
     }
 
+    pub fn target(&self) -> f32 {
+        self.target
+    }
+
     pub fn current(&self) -> f32 {
         self.current
     }

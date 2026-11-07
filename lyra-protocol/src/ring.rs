@@ -33,10 +33,11 @@ pub struct Ring {
     producer: bool,
     owns_map: bool,                      // unmap on drop (false for shared test maps)
     owns_shm: Option<std::ffi::CString>, // Some(name) on the creator → unlink on drop
-    /// Consumer only: its read position, kept in ITS OWN memory. The shared
-    /// header's `tail` is only a copy published for the producer to see; the
-    /// consumer never reads it back, so a hostile producer that rewrites `tail`
-    /// can't move the consumer's position (lyra-v1.md §5).
+    /// This end's own position, kept in ITS OWN memory: the read position on
+    /// the consumer, the write position on the producer. The shared header's
+    /// copy is only published for the other end to see and never read back,
+    /// so a hostile peer that rewrites it can't move this end (lyra-v1.md §5;
+    /// lyra-external-device.md §4 for a hostile consumer).
     cursor: AtomicU64,
 }
 
@@ -46,8 +47,10 @@ impl Ring {
     fn from_map(map: *mut libc::c_void, map_len: usize, producer: bool, owns_map: bool) -> Self {
         let hdr = map as *mut Header;
         let data = unsafe { (map as *mut u8).add(std::mem::size_of::<Header>()) as *mut f32 };
-        let (capacity, frame_floats, tail) =
-            unsafe { ((*hdr).capacity_frames, (*hdr).frame_floats, (*hdr).tail.load(Ordering::Acquire)) };
+        let (capacity, frame_floats, own) = unsafe {
+            let own = if producer { &(*hdr).head } else { &(*hdr).tail };
+            ((*hdr).capacity_frames, (*hdr).frame_floats, own.load(Ordering::Acquire))
+        };
         Ring {
             hdr,
             data,
@@ -58,7 +61,7 @@ impl Ring {
             producer,
             owns_map,
             owns_shm: None,
-            cursor: AtomicU64::new(tail),
+            cursor: AtomicU64::new(own),
         }
     }
 
@@ -258,7 +261,10 @@ impl Ring {
     /// cursor and capped at the capacity, whatever the producer wrote to `head`.
     pub fn readable(&self) -> u64 {
         if self.producer {
-            self.head().wrapping_sub(self.tail())
+            // A consumer claiming to have read more than was written, or less
+            // than a ring ago, reads as a full ring: nothing more is written.
+            let used = self.cursor.load(Ordering::Relaxed).wrapping_sub(self.tail());
+            used.min(self.capacity)
         } else {
             self.head().wrapping_sub(self.cursor.load(Ordering::Relaxed)).min(self.capacity)
         }
@@ -279,6 +285,21 @@ impl Ring {
     pub fn consumed(&self) -> u64 {
         self.cursor.load(Ordering::Relaxed)
     }
+    /// Producer: how far the consumer says it has read, kept within the last
+    /// ring's worth of what was written (lyrad's clock for an external
+    /// device; the consumer is not trusted).
+    pub fn peer_consumed(&self) -> u64 {
+        debug_assert!(self.producer);
+        let head = self.cursor.load(Ordering::Relaxed);
+        head - self.readable().min(head)
+    }
+
+    /// Producer: frames written since the ring was made, from its own cursor.
+    pub fn written(&self) -> u64 {
+        debug_assert!(self.producer);
+        self.cursor.load(Ordering::Relaxed)
+    }
+
     /// Frames of free space to write.
     pub fn writable(&self) -> u64 {
         self.capacity - self.readable()
@@ -290,7 +311,7 @@ impl Ring {
         debug_assert!(self.producer);
         let want = frames.len() as u64 / self.frame_floats;
         let n = want.min(self.writable());
-        let head = self.head();
+        let head = self.cursor.load(Ordering::Relaxed);
         for i in 0..n {
             let slot = ((head + i) % self.capacity) * self.frame_floats;
             for c in 0..self.frame_floats {
@@ -300,6 +321,7 @@ impl Ring {
                 }
             }
         }
+        self.cursor.store(head + n, Ordering::Relaxed);
         unsafe { (*self.hdr).head.store(head + n, Ordering::Release) };
         n
     }
@@ -392,6 +414,23 @@ mod tests {
             unsafe { (*hdr).capacity_frames = cap; (*hdr).frame_floats = ff; }
             assert!(Ring::header_fits(map, len).is_err(), "cap {cap} ff {ff}");
         }
+    }
+
+    /// A hostile consumer rewrites `tail` (and `head`): the producer never
+    /// writes past what the ring holds, and reports only a sane position.
+    #[test]
+    fn producer_ignores_a_wild_tail_and_head() {
+        let (p, _c, m) = pair(8, 1);
+        assert_eq!(p.write(&[1.0; 5]), 5);
+        let hdr = m as *mut Header;
+        unsafe { (*hdr).tail.store(1_000_000, Ordering::Release) };
+        assert_eq!(p.writable(), 0, "a tail beyond the head reads as full");
+        assert_eq!(p.peer_consumed(), 0);
+        unsafe { (*hdr).tail.store(3, Ordering::Release); (*hdr).head.store(0, Ordering::Release) };
+        assert_eq!(p.peer_consumed(), 3);
+        assert_eq!(p.writable(), 6, "from its own cursor, not the rewritten head");
+        assert_eq!(p.write(&[2.0; 8]), 6);
+        assert_eq!(p.written(), 11);
     }
 
     #[test]

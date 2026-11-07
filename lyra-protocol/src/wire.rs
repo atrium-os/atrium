@@ -391,7 +391,22 @@ pub enum ToEngine {
     /// yes). choragusd turns it off for `Pro` streams and the apps the user
     /// opted out, before the stream's first level.
     SetStreamSpatial { stream: u32, on: bool },
+    /// An external output device (lyra-external-device.md): lyrad makes its
+    /// ring (lyrad produces, the device consumes) and device page, and answers
+    /// `DeviceAdded` + the two fds for the device, or `DeviceFailed`. `device`
+    /// is choragusd's id for it, never 0 (the built-in device).
+    AddDevice { device: u32, rate: u32, channels: u8, initial_delay_frames: u32 },
+    RemoveDevice { device: u32 },
+    /// Mix for this output from the next period on: 0 is the built-in (OSS)
+    /// device, anything else a device added with `AddDevice`.
+    UseOutput { device: u32 },
 }
+
+/// Rates an external device may run at (HFP's 8 and 16 kHz, LC3's 16 to
+/// 48 kHz, A2DP's 44.1 and 48 kHz).
+pub const DEVICE_RATES: [u32; 6] = [8_000, 16_000, 24_000, 32_000, 44_100, 48_000];
+/// The longest delay a device may report, in seconds; more is clamped.
+pub const MAX_DEVICE_DELAY_S: u32 = 1;
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
 pub enum FromEngine {
@@ -405,6 +420,13 @@ pub enum FromEngine {
     /// The device is open with this many channels (each time lyrad opens it;
     /// after a `SetLayout` the device refused, the old count again).
     Layout { channels: u8 },
+    /// Followed by two fds, both for the device: the ring (consumer end), then
+    /// the device page (read-write).
+    DeviceAdded { device: u32, ring_frames: u64 },
+    DeviceFailed { device: u32 },
+    /// lyrad now mixes for this output (after `UseOutput`, or 0 when the
+    /// current external device went away).
+    OutputInUse { device: u32 },
 }
 
 // ── framing ─────────────────────────────────────────────────────────────────

@@ -864,6 +864,8 @@ fn serve_lyrad(mut rd: UnixStream, state: Shared) -> io::Error {
             FromEngine::Flushed { stream, frame } => forward(&state, stream, ToApp::Flushed { stream, frame }),
             FromEngine::Drained { stream } => forward(&state, stream, ToApp::Drained { stream }),
             FromEngine::Underrun { stream, frames } => forward(&state, stream, ToApp::Underrun { stream, frames }),
+            // External devices: lyra-external-device.md E2.
+            FromEngine::DeviceAdded { .. } | FromEngine::DeviceFailed { .. } | FromEngine::OutputInUse { .. } => {}
             FromEngine::Layout { channels } => {
                 let mut st = state.lock().unwrap();
                 // The device refused a layout: keep what it has, and show it.
