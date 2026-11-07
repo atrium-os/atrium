@@ -8,7 +8,7 @@
 
 use std::io;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
-use std::sync::atomic::{fence, AtomicU32, Ordering};
+use std::sync::atomic::{fence, AtomicU32, AtomicU64, Ordering};
 
 #[repr(C)]
 struct DevicePage {
@@ -17,6 +17,9 @@ struct DevicePage {
     delay_frames: AtomicU32,
     underruns: AtomicU32,
     rate: AtomicU32,
+    _pad: AtomicU32,
+    at_ns: AtomicU64,
+    consumed: AtomicU64,
 }
 
 pub const PAGE_LEN: usize = 4096;
@@ -32,6 +35,15 @@ pub struct DeviceState {
     /// Times the device found the ring empty.
     pub underruns: u32,
     pub rate: u32,
+    /// `CLOCK_MONOTONIC` time at which `delay_frames` was true (0: unknown,
+    /// take it as now). lyrad counts the delay down at the device rate from
+    /// there, so the page need only be written after each read.
+    pub at_ns: u64,
+    /// Frames the device had taken from the ring when `delay_frames` was
+    /// true (0 with `at_ns` 0: lyrad uses the ring's own count). Ties the
+    /// delay to the read it follows, so lyrad never pairs a new read with an
+    /// old delay.
+    pub consumed: u64,
 }
 
 fn map(fd: &OwnedFd, prot: libc::c_int) -> io::Result<*mut DevicePage> {
@@ -71,6 +83,8 @@ impl DeviceReader {
                 delay_frames: p.delay_frames.load(Ordering::Relaxed),
                 underruns: p.underruns.load(Ordering::Relaxed),
                 rate: p.rate.load(Ordering::Relaxed),
+                at_ns: p.at_ns.load(Ordering::Relaxed),
+                consumed: p.consumed.load(Ordering::Relaxed),
             };
             fence(Ordering::Acquire);
             if p.seq.load(Ordering::Relaxed) == s1 {
@@ -108,6 +122,8 @@ impl DeviceWriter {
         p.delay_frames.store(d.delay_frames, Ordering::Relaxed);
         p.underruns.store(d.underruns, Ordering::Relaxed);
         p.rate.store(d.rate, Ordering::Relaxed);
+        p.at_ns.store(d.at_ns, Ordering::Relaxed);
+        p.consumed.store(d.consumed, Ordering::Relaxed);
         p.seq.store(s.wrapping_add(2), Ordering::Release);
     }
 }
@@ -148,7 +164,7 @@ mod tests {
         let (r, fd) = create().unwrap();
         assert_eq!(r.read(), Some(DeviceState::default()));
         let w = DeviceWriter::from_fd(fd).unwrap();
-        let d = DeviceState { state: STATE_STREAMING, delay_frames: 7200, underruns: 2, rate: 48_000 };
+        let d = DeviceState { state: STATE_STREAMING, delay_frames: 7200, underruns: 2, rate: 48_000, at_ns: 123_456_789, consumed: 96_000 };
         w.publish(&d);
         assert_eq!(r.read(), Some(d));
     }

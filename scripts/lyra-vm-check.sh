@@ -30,6 +30,12 @@
 #      the frame, LYRA_POSLOG the device position over CLOCK_MONOTONIC).
 #      Pass: every click within ±2 ms, rate_ppm stable. Needs real timing:
 #      run it on the Mac's VM (HVF), not under TCG.
+#   CLOCK_DEVICE=1 sh scripts/lyra-vm-check.sh clock
+#      The same against a test external device (lyra-external-device.md §7,
+#      E3): `lyra-vmtest device` takes lyrad's mix at 48 kHz on CLOCK_MONOTONIC
+#      with 150 ms of delay, and prints when each click is heard. Its clock
+#      is the system clock, so this judges lyrad's arithmetic and the
+#      external path anywhere, the cloud VM included.
 #
 # Needs CROSS_RUSTFLAGS and TARGET (cloud-vm.sh's cross_env sets them).
 set -u
@@ -43,6 +49,7 @@ DUMP=/var/tmp/lyra-mix.raw
 POSLOG=/var/tmp/lyra-pos.log
 MODE="${1:-all}"
 CLOCK_SECS="${CLOCK_SECS:-600}"
+CLOCK_DEVICE="${CLOCK_DEVICE:-0}"
 FAILS=0
 
 if [ "${1:-}" = qemu-args ]; then
@@ -98,14 +105,14 @@ v "set -e
     sysctl -q dev.pcm.0.bitperfect=1 >/dev/null 2>&1 || true
     id _lyra >/dev/null 2>&1 || pw useradd _lyra -u 65016 -d /nonexistent -s /usr/sbin/nologin
     id _choragus >/dev/null 2>&1 || pw useradd _choragus -u 65017 -d /nonexistent -s /usr/sbin/nologin
-    for u in appa:50001 appb:50002 appc:50003 appui:50004 stranger:50009; do
+    for u in appa:50001 appb:50002 appc:50003 appui:50004 appdev:50005 stranger:50009; do
         id \${u%:*} >/dev/null 2>&1 || pw useradd \${u%:*} -u \${u#*:} -d /nonexistent -s /usr/sbin/nologin
     done
     install -d -o _lyra -g _choragus -m 0750 /atrium/sockets/lyrad
     rm -rf $T /var/db/choragus; install -d -o _choragus -g _choragus -m 0755 $T
     install -d -o _choragus -g _choragus -m 0700 /var/db/choragus
-    printf '50001 alice org.test.a\n50002 alice org.test.b\n50003 alice org.test.c\n50004 alice org.test.ui\n' > $T/registry
-    printf 'org.test.a audio\norg.test.b audio\norg.test.ui audio-control\n' > $T/grants
+    printf '50001 alice org.test.a\n50002 alice org.test.b\n50003 alice org.test.c\n50004 alice org.test.ui\n50005 alice org.test.dev\n' > $T/registry
+    printf 'org.test.a audio\norg.test.b audio\norg.test.ui audio-control\norg.test.dev audio-device\n' > $T/grants
     chmod 644 $T/registry $T/grants
     rm -f $DUMP $POSLOG; install -o _lyra -m 0644 /dev/null $DUMP; install -o _lyra -m 0644 /dev/null $POSLOG
     chmod 666 /dev/dsp0" || die "commission"
@@ -115,7 +122,7 @@ say "start lyrad (_lyra) and choragusd (_choragus) under daemon(8) -r"
 v "daemon -r -R 1 -u _lyra -o $T/lyrad.log -t lyra-test-lyrad env LYRA_DUMP=$DUMP LYRA_POSLOG=$POSLOG $BIN/lyrad --serve </dev/null >/dev/null 2>&1
    daemon -r -R 1 -u _choragus -o $T/choragusd.log -t lyra-test-choragusd \
        $BIN/choragusd --daemon $T/audio.sock /atrium/sockets/lyrad/lyrad.sock \
-       --grants $T/grants --app-registry $T/registry --control $T/control.sock --state /var/db/choragus </dev/null >/dev/null 2>&1
+       --grants $T/grants --app-registry $T/registry --control $T/control.sock --device $T/device.sock --state /var/db/choragus </dev/null >/dev/null 2>&1
    for i in \$(seq 1 30); do [ -S $T/audio.sock ] && [ -S $T/control.sock ] && break; sleep 1; done
    [ -S $T/audio.sock ]" || die "services did not come up: $(v "cat $T/lyrad.log $T/choragusd.log")"
 # Let the device open and the dump start.
@@ -124,16 +131,22 @@ echo "  up"
 
 if [ "$MODE" = clock ]; then
     say "6: clock accuracy ($CLOCK_SECS s; two apps, 48 and 44.1 kHz)"
+    v "rm -f $T/dev.txt; touch $T/dev.txt"
+    if [ "$CLOCK_DEVICE" = 1 ]; then
+        echo "  on the test external device (150 ms delay)"
+        v "su -m appdev -c '$BIN/lyra-vmtest device $T/device.sock $((CLOCK_SECS + 15)) 150' >$T/dev.txt 2>$T/dev.err </dev/null &
+           sleep 3; cat $T/dev.err"
+    fi
     v "su -m appa -c '$BIN/lyra-vmtest clock $T/audio.sock 48000 $CLOCK_SECS 0.25' >$T/c48.txt 2>$T/c48.err </dev/null &
        su -m appb -c '$BIN/lyra-vmtest clock $T/audio.sock 44100 $CLOCK_SECS 0.75' >$T/c44.txt 2>$T/c44.err </dev/null &
        sleep 2; while pgrep -q lyra-vmtest; do sleep 5; done"
     v "pkill -f 'daemon.*lyra-test'; pkill -u _lyra lyrad; pkill -u _choragus choragusd; true" >/dev/null 2>&1
     mkdir -p "$OUT"
-    for f in "$DUMP:mix.raw" "$POSLOG:pos.log" "$T/c48.txt:c48.txt" "$T/c44.txt:c44.txt" "$T/lyrad.log:lyrad.log"; do
+    for f in "$DUMP:mix.raw" "$POSLOG:pos.log" "$T/c48.txt:c48.txt" "$T/c44.txt:c44.txt" "$T/lyrad.log:lyrad.log" "$T/dev.txt:dev.txt"; do
         # shellcheck disable=SC2086
         scp $SCP_OPTS "root@localhost:${f%%:*}" "$OUT/${f#*:}" >/dev/null 2>&1 || die "pull ${f%%:*}"
     done
-    v "cat $T/c48.err $T/c44.err" | sed 's/^/  app: /'
+    v "cat $T/c48.err $T/c44.err; [ $CLOCK_DEVICE = 1 ] && cat $T/dev.err" | sed 's/^/  app: /'
     python3 -I - "$OUT" <<'PY' || FAILS=$((FAILS + $?))
 import struct, sys
 out = sys.argv[1]
@@ -255,6 +268,18 @@ if rates:
 if alt:
     a = sorted(alt)
     print('       (against GETOPTR instead: median %+.3f ms, min %+.3f, max %+.3f)' % (a[len(a) // 2], a[0], a[-1]))
+# The test external device says when each click was heard: the truth
+# itself, not lyrad's own log.
+heard = [int(l.split()[1]) for l in open(out + '/dev.txt') if l.startswith('heard ')]
+if heard:
+    he = []
+    for rate, k, pred, ppm in preds:
+        h = min(heard, key=lambda x: abs(x - pred))
+        if abs(h - pred) < 200e6:
+            he.append((pred - h) / 1e6)
+    e = sorted(he)
+    line(len(he) >= 0.95 * len(preds) and max(abs(x) for x in he) <= 2.0,
+         '6: predicted minus heard (the device\'s own times): %d of %d clicks, median %+.3f ms, min %+.3f, max %+.3f (want within ±2)' % (len(he), len(preds), e[len(e) // 2], e[0], e[-1]))
 if ppms:
     line(max(ppms) - min(ppms) <= 20, '6: rate_ppm after 30 s: %d to %d (want a spread of 20 or less)' % (min(ppms), max(ppms)))
 sys.exit(min(fails, 100))

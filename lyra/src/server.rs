@@ -27,7 +27,7 @@ use crate::gain::Gain;
 use crate::oss::OssSink;
 use crate::ring::Ring;
 use lyra_protocol::clock::{self, Clock, ClockWriter, STATE_PAUSED, STATE_PLAYING};
-use lyra_protocol::device::{DeviceReader, STATE_STREAMING};
+use lyra_protocol::device::{DeviceReader, DeviceState, STATE_STREAMING};
 use lyra_protocol::wire::{self, FromEngine, ToEngine};
 use std::io;
 use std::os::fd::AsRawFd;
@@ -921,6 +921,10 @@ impl DeviceClock {
     /// Feed one reading: the device is sounding frame `pos` at `now`;
     /// `starved`: it had nothing queued (it ran dry, or was about to).
     pub fn sample(&mut self, now: i64, pos: u64, starved: bool) {
+        if pos == 0 {
+            // Nothing heard yet: the start-up wait isn't the device's pace.
+            return;
+        }
         let pos = pos as i64;
         if self.cur.2 == 0 && self.buckets.is_empty() {
             self.restart(now, pos);
@@ -1068,22 +1072,20 @@ fn run_external(engine: &mut Engine, rx: &mpsc::Receiver<Cmd>, ev_tx: &mpsc::Sen
             sleep_ns(next - now);
             next = next.max(now) + period_ns;
         }
-        let delay = match page {
-            Some(p) if p.rate != 0 => {
-                if p.delay_frames > max_delay && !warned_delay {
-                    eprintln!("lyrad: external device {id} reports {} frames of delay; clamped to {max_delay}", p.delay_frames);
-                    warned_delay = true;
-                }
-                p.delay_frames.min(max_delay)
+        if let Some(p) = page.filter(|p| p.rate != 0 && p.delay_frames > max_delay) {
+            if !warned_delay {
+                eprintln!("lyrad: external device {id} reports {} frames of delay; clamped to {max_delay}", p.delay_frames);
+                warned_delay = true;
             }
-            _ => initial_delay,
-        } as u64;
+        }
+        let heard = device_heard(now, page, consumed, initial_delay, max_delay, rate);
+        let delay = consumed - heard;
         let underruns = page.map_or(0, |p| p.underruns);
         let starved = last_underruns.is_some_and(|l| l != underruns);
         last_underruns = Some(underruns);
         let written = d.ring.written();
         let start = if feeding {
-            clock.sample(now, consumed.saturating_sub(delay), starved);
+            clock.sample(now, heard, starved);
             if let Some(ppm) = clock.rate_ppm(now) {
                 engine.rate_ppm = ppm;
             }
@@ -1122,6 +1124,28 @@ fn run_external(engine: &mut Engine, rx: &mpsc::Receiver<Cmd>, ev_tx: &mpsc::Sen
             }
         }
     }
+}
+
+/// A page older than this is not counted down (the device stopped writing it).
+const MAX_PAGE_AGE_NS: i64 = 50_000_000;
+
+/// The frame an external device's listener hears at `now`, at most
+/// `consumed` (the ring's count of frames the device has taken). The page's
+/// delay is counted down at the device rate from the time it was true, and
+/// taken from the read it follows (`page.consumed`) when the page says so;
+/// otherwise it is taken as current. Nothing heard yet reads as 0.
+pub fn device_heard(now: i64, page: Option<DeviceState>, consumed: u64, initial_delay: u32, max_delay: u32, rate: u32) -> u64 {
+    let Some(p) = page.filter(|p| p.rate != 0) else {
+        return consumed.saturating_sub(initial_delay as u64);
+    };
+    let delay = p.delay_frames.min(max_delay) as i64;
+    let age = now - p.at_ns as i64;
+    let heard = if p.at_ns != 0 && (0..=MAX_PAGE_AGE_NS).contains(&age) && p.consumed <= consumed {
+        p.consumed as i64 - delay + (age as i128 * rate as i128 / 1_000_000_000) as i64
+    } else {
+        consumed as i64 - delay
+    };
+    heard.clamp(0, consumed as i64) as u64
 }
 
 /// The service: listen, then mix to the device forever, reopening it if it goes.
@@ -1388,6 +1412,26 @@ mod tests {
         e.apply(Cmd::Msg(gen, ToEngine::Start { stream: id }));
     }
 
+    #[test]
+    fn the_device_delay_counts_down_from_when_it_was_true() {
+        let p = |delay, at_ns, consumed| Some(DeviceState { state: STATE_STREAMING, delay_frames: delay, underruns: 0, rate: 48_000, at_ns, consumed });
+        let max = 48_000;
+        // No page yet: the announced delay.
+        assert_eq!(device_heard(0, None, 10_000, 7_200, max, 48_000), 2_800);
+        // An untimed page is taken as current.
+        assert_eq!(device_heard(5, p(7_456, 0, 0), 10_000, 7_200, max, 48_000), 2_544);
+        // Timed: 1 ms (48 frames) after it was written, against the read it follows,
+        // even though the device has since read another chunk.
+        assert_eq!(device_heard(3_000_000, p(7_456, 2_000_000, 10_000), 10_256, 7_200, max, 48_000), 2_592);
+        // Too old, or claiming frames the ring hasn't given: taken as current.
+        assert_eq!(device_heard(200_000_000, p(7_456, 2_000_000, 10_000), 10_000, 7_200, max, 48_000), 2_544);
+        assert_eq!(device_heard(3_000_000, p(7_456, 2_000_000, 99_999), 10_000, 7_200, max, 48_000), 2_544);
+        // Clamped: never more delay than a second, never past what was taken, never negative.
+        assert_eq!(device_heard(5, p(u32::MAX, 0, 0), 100_000, 7_200, max, 48_000), 52_000);
+        assert_eq!(device_heard(40_000_000, p(0, 1, 10_000), 10_000, 7_200, max, 48_000), 10_000);
+        assert_eq!(device_heard(5, p(7_456, 0, 0), 1_000, 7_200, max, 48_000), 0);
+    }
+
     /// lyra-external-device.md E1: a fake device reads lyrad's ring on its
     /// own clock and reports a 150 ms delay (kept current as its queue
     /// drains). A click the app writes at 2 s is heard when the app's clock
@@ -1395,7 +1439,7 @@ mod tests {
     #[test]
     fn an_external_device_plays_and_the_clock_includes_its_delay() {
         use lyra_protocol::clock::ClockReader;
-        use lyra_protocol::device::{DeviceState, DeviceWriter};
+        use lyra_protocol::device::DeviceWriter;
         const RATE: u64 = 48_000;
         const D: u64 = 7_200;
         const N: u64 = 96_000;
@@ -1447,16 +1491,12 @@ mod tests {
             let t0 = monotonic_ns();
             let mut buf = vec![0.0f32; 512];
             let mut k = 0u64;
-            let mut last_read = t0;
-            let mut last_got = 0u64;
             let mut underruns = 0u32;
             while monotonic_ns() - t0 < 3_500_000_000 {
                 let now = monotonic_ns();
                 let tk = t0 + (k * 256 * 1_000_000_000 / RATE) as i64;
                 if now >= tk {
                     let got = ring.read(&mut buf);
-                    last_read = tk;
-                    last_got = got;
                     if got < 256 {
                         underruns += 1;
                     }
@@ -1464,9 +1504,11 @@ mod tests {
                         let _ = heard_tx.send(tk + ((D + j as u64) * 1_000_000_000 / RATE) as i64);
                     }
                     k += 1;
+                    // After each read: at tk the listener hears the frame D
+                    // before this chunk, so the delay is D plus the chunk.
+                    w.publish(&DeviceState { state: STATE_STREAMING, delay_frames: (D + got) as u32, underruns, rate: 48_000,
+                        at_ns: tk as u64, consumed: ring.consumed() });
                 }
-                let left = last_got.saturating_sub(((monotonic_ns() - last_read).max(0) as u64) * RATE / 1_000_000_000);
-                w.publish(&DeviceState { state: STATE_STREAMING, delay_frames: (D + left) as u32, underruns, rate: 48_000 });
                 std::thread::sleep(std::time::Duration::from_micros(300));
             }
         });

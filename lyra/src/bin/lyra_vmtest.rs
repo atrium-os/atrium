@@ -22,6 +22,16 @@
 //!       predicted 30–300 ms ahead: `click <rate> <k> <frame> <predicted_ns>
 //!       <rate_ppm>`. The host compares them with the dump and the device
 //!       position (scripts/lyra-vm-check.sh clock).
+//!   lyra-vmtest device <device_sock> <secs> <delay_ms>
+//!       A test output device (lyra-external-device.md §7, E3): announces
+//!       headphones at 48 kHz on choragusd's `audio-device/` socket (needs the
+//!       `audio-device` grant), reads 256 frames from lyrad's ring every 256
+//!       frames' time on absolute CLOCK_MONOTONIC deadlines, and "plays" each
+//!       chunk over the next 256 frames' time, delay_ms later. The page says
+//!       so after each read (delay = delay_ms + the chunk, at the read's
+//!       tick, against the frames read so far). Prints `heard <ns>` for each click it reads
+//!       (a sample above 0.5): the time the listener hears it. A device with
+//!       a perfectly steady clock, so check 6 judges lyrad's arithmetic alone.
 //!   lyra-vmtest lyrad-raw <lyrad_sock>
 //!       Connect to lyrad directly and ask for a stream. Prints `refused` if
 //!       lyrad hangs up (only _choragus may talk to it), `ACCEPTED` otherwise.
@@ -157,6 +167,73 @@ fn predict(s: &lyra_protocol::client::Stream, rate: u32, click_at: &dyn Fn(u64) 
     }
 }
 
+fn monotonic_ns() -> i64 {
+    let mut ts = libc::timespec { tv_sec: 0, tv_nsec: 0 };
+    unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut ts) };
+    ts.tv_sec as i64 * 1_000_000_000 + ts.tv_nsec as i64
+}
+
+fn sleep_until(ns: i64) {
+    let ts = libc::timespec { tv_sec: (ns / 1_000_000_000) as _, tv_nsec: (ns % 1_000_000_000) as _ };
+    while unsafe { libc::clock_nanosleep(libc::CLOCK_MONOTONIC, libc::TIMER_ABSTIME, &ts, std::ptr::null_mut()) } == libc::EINTR {}
+}
+
+fn device(sock: &str, secs: f32, delay_ms: u32) {
+    use lyra_protocol::client::{Announce, Device};
+    use lyra_protocol::device::{DeviceState, STATE_STREAMING};
+    const RATE: u64 = 48_000;
+    const CHUNK: u64 = 256;
+    let d = RATE * delay_ms as u64 / 1000;
+    let a = Announce {
+        persistent_id: 1,
+        name: "Test device".into(),
+        kind: wire::OutputKind::Headphones,
+        rate: RATE as u32,
+        channels: 2,
+        hw_volume: false,
+        initial_delay_frames: d as u32,
+    };
+    let dev = Device::connect(sock, &a).unwrap_or_else(|e| die(format!("connect {sock}: {e}")));
+    eprintln!("device: output {} ready, delay {d} frames", dev.device);
+    let chunk_ns = |k: u64| (k * CHUNK * 1_000_000_000 / RATE) as i64;
+    let mut buf = vec![0.0f32; CHUNK as usize * 2];
+    let (mut k, mut underruns, mut late) = (0u64, 0u32, 0u64);
+    let t0 = monotonic_ns() + 10_000_000;
+    let end = t0 + (secs as f64 * 1e9) as i64;
+    while t0 + chunk_ns(k) < end {
+        sleep_until(t0 + chunk_ns(k));
+        let now = monotonic_ns();
+        // Every tick that has come: a late wake reads the ticks it missed, so
+        // the device's pace stays the ideal one, as a sink's DAC does.
+        while t0 + chunk_ns(k) <= now {
+            let tk = t0 + chunk_ns(k);
+            if now - tk > chunk_ns(1) {
+                late += 1;
+            }
+            let got = dev.ring.read(&mut buf);
+            if got < CHUNK && k > 0 {
+                underruns += 1;
+            }
+            for j in 0..got as usize {
+                if buf[j * 2] > 0.5 {
+                    println!("heard {}", tk + ((d + j as u64) * 1_000_000_000 / RATE) as i64);
+                }
+            }
+            // At tk the listener hears the frame `d` before this chunk.
+            dev.page.publish(&DeviceState {
+                state: STATE_STREAMING,
+                delay_frames: (d + got) as u32,
+                underruns,
+                rate: RATE as u32,
+                at_ns: tk as u64,
+                consumed: dev.ring.consumed(),
+            });
+            k += 1;
+        }
+    }
+    eprintln!("device: {k} reads, {underruns} short, {late} more than a chunk late");
+}
+
 fn lyrad_raw(sock: &str) {
     let mut s = match std::os::unix::net::UnixStream::connect(sock) {
         Ok(s) => s,
@@ -182,6 +259,7 @@ fn main() {
         "ctl" => ctl(&a(2), &args[3.min(args.len())..]),
         "lyrad-raw" => lyrad_raw(&a(2)),
         "clock" => clock(&a(2), a(3).parse().unwrap_or(48_000), a(4).parse().unwrap_or(600.0), a(5).parse().unwrap_or(0.0)),
-        _ => die("usage: lyra-vmtest hostile|ctl|clock|lyrad-raw ...".into()),
+        "device" => device(&a(2), a(3).parse().unwrap_or(600.0), a(4).parse().unwrap_or(150)),
+        _ => die("usage: lyra-vmtest hostile|ctl|clock|device|lyrad-raw ...".into()),
     }
 }
