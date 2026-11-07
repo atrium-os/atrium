@@ -290,8 +290,10 @@ write_record(tessera_journal_t *j, tessera_record_type_t type,
 	}
 	tessera_free(blk);
 	uint32_t remaining = body_len - in_first;
-	const uint8_t *src = (const uint8_t *)body + in_first;
 	if (remaining > 0) {
+		/* Only here: body may be NULL when body_len is 0, and NULL + 0
+		 * is undefined in C (UBSAN, fuzz_journal 2026-11-07). */
+		const uint8_t *src = (const uint8_t *)body + in_first;
 		uint8_t *cont = tessera_zalloc(BLK);
 		if (cont == NULL) return TESSERA_ENOMEM;
 		for (uint32_t k = 1; k < need; k++) {

@@ -191,8 +191,12 @@ carillon_ioctl(struct cdev *cdev, u_long cmd, caddr_t data,
 		struct carillon_wait *w = (struct carillon_wait *)data;
 		int timo, err;
 
+		/*
+		 * Audit C1 (2026-11-07): clamp, or a timeout_ms above ~24.8
+		 * days (at hz=1000) overflowed int into a negative timo.
+		 */
 		timo = (w->timeout_ms == 0) ? 0 :
-		    (int)((uint64_t)w->timeout_ms * hz / 1000);
+		    (int)MIN((uint64_t)w->timeout_ms * hz / 1000, INT_MAX);
 		if (w->timeout_ms != 0 && timo == 0)
 			timo = 1;
 

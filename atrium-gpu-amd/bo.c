@@ -97,6 +97,14 @@ amd_dma_page_free(struct atrium_amd_dma_page *p)
 
 /* --- buffer objects: fd-backed, mapped into a VM --- */
 
+/* Free the struct itself, after its backing store (both free paths). */
+void
+amd_bo_free_struct(struct atrium_amd_bo *bo)
+{
+	sx_destroy(&bo->bind_lock);
+	free(bo, M_DEVBUF);
+}
+
 /*
  * Reclaim a BO: unmap every page from its VM, drop the VM reference, release the
  * DMA mapping/memory/tag and the struct. Safe before the mapping/VM-ref are
@@ -138,7 +146,7 @@ amd_bo_destroy(struct atrium_amd_bo *bo, struct thread *td)
 		return;
 	}
 	sc->backend->bo_free(bo);	/* backing store + bo_count-- */
-	free(bo, M_DEVBUF);
+	amd_bo_free_struct(bo);
 }
 
 static int
@@ -341,9 +349,10 @@ amd_bo_create_fd(struct atrium_amd_softc *sc, struct thread *td, uint64_t size,
 
 	bo = malloc(sizeof(*bo), M_DEVBUF, M_WAITOK | M_ZERO);
 	bo->sc = sc;
+	sx_init(&bo->bind_lock, "amdbobind");
 	err = sc->backend->bo_alloc(sc, bo, size, flags);
 	if (err != 0) {
-		free(bo, M_DEVBUF);	/* bo_alloc unwound its own backing */
+		amd_bo_free_struct(bo);	/* bo_alloc unwound its own backing */
 		return (err);
 	}
 
@@ -371,16 +380,36 @@ amd_bo_create_fd(struct atrium_amd_softc *sc, struct thread *td, uint64_t size,
 uint64_t
 amd_bo_gpu_va(struct atrium_amd_bo *bo, struct atrium_amd_vm *vm)
 {
+	uint64_t va = 0;	/* 0: not bound in this vm */
 	int b;
 
+	sx_slock(&bo->bind_lock);
 	for (b = 0; b < bo->n_bindings; b++)
-		if (bo->bindings[b].vm == vm)
-			return (bo->bindings[b].gpu_va);
-	return (0);	/* not bound in this vm */
+		if (bo->bindings[b].vm == vm) {
+			va = bo->bindings[b].gpu_va;
+			break;
+		}
+	sx_sunlock(&bo->bind_lock);
+	return (va);
 }
+
+static int amd_bo_bind_locked(struct atrium_amd_bo *, struct atrium_amd_vm *,
+    struct file *, uint64_t *, uint32_t);
 
 int
 amd_bo_bind(struct atrium_amd_bo *bo, struct atrium_amd_vm *vm,
+    struct file *vm_fp, uint64_t *va, uint32_t bind_flags)
+{
+	int err;
+
+	sx_xlock(&bo->bind_lock);
+	err = amd_bo_bind_locked(bo, vm, vm_fp, va, bind_flags);
+	sx_xunlock(&bo->bind_lock);
+	return (err);
+}
+
+static int
+amd_bo_bind_locked(struct atrium_amd_bo *bo, struct atrium_amd_vm *vm,
     struct file *vm_fp, uint64_t *va, uint32_t bind_flags)
 {
 	struct atrium_amd_softc *sc = bo->sc;

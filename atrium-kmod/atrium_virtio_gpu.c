@@ -23,6 +23,7 @@
 #include <sys/malloc.h>
 #include <sys/lock.h>
 #include <sys/mutex.h>
+#include <sys/rwlock.h>
 #include <sys/condvar.h>
 #include <sys/taskqueue.h>
 #include <sys/rman.h>
@@ -43,6 +44,9 @@
 
 #include <vm/vm.h>
 #include <vm/pmap.h>
+#include <vm/vm_object.h>
+#include <vm/vm_page.h>
+#include <vm/vm_pager.h>
 
 #include <dev/pci/pcireg.h>
 #include <dev/pci/pcivar.h>
@@ -119,9 +123,9 @@ SYSCTL_INT(_kern_atrium_gpu, OID_AUTO, bos_outstanding,
  * RESOURCE_ATTACH_BACKING in step 2c); the pa is the start physical
  * address, and size is page-aligned. Userspace receives:
  *   - handle (u32) — opaque ABI handle
- *   - mmap_offset = handle * ATRIUM_BO_STRIDE — synthetic; lets
- *     `d_mmap` decode the BO from the offset alone (cdev mmap doesn't
- *     get fd context).
+ *   - mmap_offset = handle * ATRIUM_BO_STRIDE — synthetic; d_mmap_single
+ *     resolves it against the calling fd's acl, so a fd can map only
+ *     the BOs it allocated or imported.
  *
  * BO_STRIDE = 1 GiB; BO_MAX_SIZE = 1 GiB. Plenty for v0.1.
  */
@@ -141,10 +145,17 @@ struct atrium_gpu_bo {
 	 * Liveness is NOT tied to the minter; an importing fd can keep
 	 * the BO alive even after the minter closes. See `refcount`. */
 	struct atrium_gpu_file    *owner;
+	/* The device. Audit V4 (2026-11-07): atrium_bo_free used to reach
+	 * the softc through `owner`, which dangles once the minter closes
+	 * while an importer (or a mapping) keeps the BO alive. */
+	struct atrium_gpu_softc   *sc;
 	/* Refcount: bumps once per fd that has the BO in its
 	 * `mmap_acl` (minter at alloc time = 1; each successful
-	 * IOC_GPU_IMPORT_REGION = +1). Decremented by IOC_GPU_FREE on a
-	 * fd that holds a ref, and by fd-close walking that fd's acl.
+	 * IOC_GPU_IMPORT_REGION = +1; +1 while a user mapping exists, held
+	 * by its VM object; +1 for the duration of an ioctl that uses the
+	 * BO after dropping bo_lock). Decremented by IOC_GPU_FREE on a
+	 * fd that holds a ref, by fd-close walking that fd's acl, by the
+	 * mapping object's destructor and at the end of such an ioctl.
 	 * BO is freed when refcount hits 0. Guarded by softc->bo_lock. */
 	uint32_t                   refcount;
 
@@ -155,8 +166,7 @@ struct atrium_gpu_bo {
 	uint32_t                   scanout_height;
 };
 
-/* Per-fd access entry — one node per BO this fd can free + (in
- * future, when the cdev mmap path gets per-fd auth) mmap. Each entry
+/* Per-fd access entry — one node per BO this fd can free and mmap. Each entry
  * holds one count of the BO's refcount. */
 struct atrium_gpu_bo_ref {
 	TAILQ_ENTRY(atrium_gpu_bo_ref) link;
@@ -471,7 +481,7 @@ static void
 atrium_bo_free(struct atrium_gpu_bo *bo)
 {
 	if (bo->flags & ATRIUM_BO_INT_HOST_BLOB) {
-		struct atrium_gpu_softc *sc = bo->owner ? bo->owner->sc : NULL;
+		struct atrium_gpu_softc *sc = bo->sc;
 		if (sc != NULL && sc->shm_initialized) {
 			uint64_t bar_offset = bo->pa - sc->shm_pa;
 			uint32_t npages = bo->size / ATRIUM_HOST_PAGE_SIZE;
@@ -530,6 +540,25 @@ atrium_bo_decref_locked(struct atrium_gpu_softc *sc, struct atrium_gpu_bo *bo)
 	return (true);
 }
 
+/* Take a temporary reference so `bo` stays valid after bo_lock is
+ * dropped (audit V3, 2026-11-07: SUBMIT, RESOURCE_ATTACH, SET_MODE and
+ * PAGE_FLIP used the BO unlocked, so a concurrent IOC_GPU_FREE freed it
+ * under them). Caller holds bo_lock. Release with atrium_bo_drop. */
+static void
+atrium_bo_hold_locked(struct atrium_gpu_softc *sc, struct atrium_gpu_bo *bo)
+{
+	mtx_assert(&sc->bo_lock, MA_OWNED);
+	bo->refcount++;
+}
+
+static void
+atrium_bo_drop(struct atrium_gpu_softc *sc, struct atrium_gpu_bo *bo)
+{
+	mtx_lock(&sc->bo_lock);
+	(void)atrium_bo_decref_locked(sc, bo);
+	mtx_unlock(&sc->bo_lock);
+}
+
 /* On fd close, drop every BO this fd had access to (minted or
  * imported). Each acl entry holds one count of the BO's refcount. */
 static void
@@ -578,14 +607,14 @@ atrium_display_file_dtor(void *arg)
 static d_open_t  atrium_gpu_open;
 static d_close_t atrium_gpu_close;
 static d_ioctl_t atrium_gpu_ioctl;
-static d_mmap_t  atrium_gpu_mmap;
+static d_mmap_single_t atrium_gpu_mmap_single;
 
 static struct cdevsw atrium_gpu_cdevsw = {
 	.d_version = D_VERSION,
 	.d_open    = atrium_gpu_open,
 	.d_close   = atrium_gpu_close,
 	.d_ioctl   = atrium_gpu_ioctl,
-	.d_mmap    = atrium_gpu_mmap,
+	.d_mmap_single = atrium_gpu_mmap_single,	/* no d_mmap fallback */
 	.d_name    = "atrium-gpu",
 };
 
@@ -686,6 +715,7 @@ atrium_gpu_ioc_alloc(struct atrium_gpu_softc *sc, struct atrium_gpu_file *f,
 	bo->size  = aligned;
 	bo->flags = args->flags;
 	bo->owner = f;
+	bo->sc    = sc;
 	bo->refcount = 0;  /* acl_add bumps to 1 */
 
 	mtx_lock(&sc->bo_lock);
@@ -719,11 +749,15 @@ atrium_gpu_ioc_free(struct atrium_gpu_softc *sc, struct atrium_gpu_file *f,
 	 * BO it allocated; an importer can also call FREE to drop its
 	 * imported ref. The BO is freed (and any pending tokens retired)
 	 * only when its refcount hits zero across all fds. */
-	r = atrium_gpu_acl_find(f, handle);
-	if (r == NULL)
-		return (ENOENT);
-	TAILQ_REMOVE(&f->mmap_acl, r, link);
+	/* The acl is mutated under bo_lock (audit V5, 2026-11-07: two
+	 * threads freeing on one fd raced on the unlocked list). */
 	mtx_lock(&sc->bo_lock);
+	r = atrium_gpu_acl_find(f, handle);
+	if (r == NULL) {
+		mtx_unlock(&sc->bo_lock);
+		return (ENOENT);
+	}
+	TAILQ_REMOVE(&f->mmap_acl, r, link);
 	(void)atrium_bo_decref_locked(sc, r->bo);
 	mtx_unlock(&sc->bo_lock);
 	free(r, M_ATRIUM_GPU);
@@ -782,22 +816,24 @@ atrium_gpu_ioc_submit(struct atrium_gpu_softc *sc, struct atrium_gpu_file *f,
 		return (EINVAL);
 	}
 	cmd_va = (void *)(cmd_bo->kva + (vm_offset_t)args->cmd_offset);
+	atrium_bo_hold_locked(sc, cmd_bo);
 	mtx_unlock(&sc->bo_lock);
 
 	bzero(&resp, sizeof(resp));
 	sglist_init(&sg, 2, segs);
-	if ((err = sglist_append(&sg, cmd_va, args->cmd_size)) != 0)
-		return (err);
-	if ((err = sglist_append(&sg, &resp, sizeof(resp))) != 0)
-		return (err);
-
-	mtx_lock(&sc->ctrl_lock);
-	err = virtqueue_enqueue(sc->ctrl_vq, &resp, &sg, 1, 1);
+	err = sglist_append(&sg, cmd_va, args->cmd_size);
+	if (err == 0)
+		err = sglist_append(&sg, &resp, sizeof(resp));
 	if (err == 0) {
-		virtqueue_notify(sc->ctrl_vq);
-		virtqueue_poll(sc->ctrl_vq, NULL);
+		mtx_lock(&sc->ctrl_lock);
+		err = virtqueue_enqueue(sc->ctrl_vq, &resp, &sg, 1, 1);
+		if (err == 0) {
+			virtqueue_notify(sc->ctrl_vq);
+			virtqueue_poll(sc->ctrl_vq, NULL);
+		}
+		mtx_unlock(&sc->ctrl_lock);
 	}
-	mtx_unlock(&sc->ctrl_lock);
+	atrium_bo_drop(sc, cmd_bo);	/* the device is done with cmd_va */
 	if (err != 0)
 		return (err);
 
@@ -932,11 +968,13 @@ atrium_gpu_ioc_resource_attach(struct atrium_gpu_softc *sc,
 	}
 	resource_id = ++sc->next_resource_id;
 	bo->virtio_resource_id = resource_id;
+	atrium_bo_hold_locked(sc, bo);
 	mtx_unlock(&sc->bo_lock);
 
 	err = atrium_vgpu_resource_create_blob(sc, f->ctx_id, resource_id,
 	    args->blob_mem, args->blob_flags, args->blob_id, bo->size,
 	    bo->pa, (uint32_t)bo->size);
+	atrium_bo_drop(sc, bo);
 	if (err != 0)
 		return (err);
 	err = atrium_vgpu_ctx_attach_resource(sc, f->ctx_id, resource_id);
@@ -1049,6 +1087,7 @@ atrium_gpu_alloc_scanout_bo(struct atrium_gpu_softc *sc,
 	bo->kva   = 0;
 	bo->pa    = sc->shm_pa + bar_offset;
 	bo->owner = f;
+	bo->sc    = sc;
 
 	/* 4. RESOURCE_CREATE_BLOB(HOST3D) on the scanout ctx. blob_id=0
 	 *    means "shmem-backed" (vs venus's per-VkDeviceMemory id). */
@@ -1152,6 +1191,7 @@ atrium_gpu_ioc_host_blob(struct atrium_gpu_softc *sc,
 	bo->kva         = 0;
 	bo->pa          = sc->shm_pa + bar_offset;
 	bo->owner       = f;
+	bo->sc          = sc;
 
 	/* Send RESOURCE_CREATE_BLOB(HOST3D) — host allocates shm; venus
 	 * sees blob_id (0 for shmem, the venus mem_id for VkDeviceMemory). */
@@ -1294,15 +1334,19 @@ atrium_gpu_ioc_mint_token(struct atrium_gpu_softc *sc,
 	struct atrium_gpu_bo_ref *r;
 	struct atrium_gpu_token_entry *te;
 
-	r = atrium_gpu_acl_find(f, args->handle);
-	if (r == NULL)
-		return (ENOENT);
-
 	te = malloc(sizeof(*te), M_ATRIUM_GPU, M_WAITOK | M_ZERO);
 	arc4rand(te->token, ATRIUM_GPU_TOKEN_LEN, /*reseed=*/0);
-	te->bo = r->bo;
 
+	/* Look up under bo_lock (audit V5): an unlocked lookup could
+	 * record a BO a concurrent FREE on this fd was about to free. */
 	mtx_lock(&sc->bo_lock);
+	r = atrium_gpu_acl_find(f, args->handle);
+	if (r == NULL) {
+		mtx_unlock(&sc->bo_lock);
+		free(te, M_ATRIUM_GPU);
+		return (ENOENT);
+	}
+	te->bo = r->bo;
 	TAILQ_INSERT_TAIL(&sc->tokens, te, link);
 	atrium_gpu_tokens_outstanding++;
 	mtx_unlock(&sc->bo_lock);
@@ -1464,35 +1508,122 @@ atrium_gpu_ioctl(struct cdev *cdev, u_long cmd, caddr_t data,
 	}
 }
 
+/*
+ * mmap: one device-pager VM object per BO (audit V1/V2, 2026-11-07).
+ *
+ * The old d_mmap decoded the BO from the offset alone, so (V1) any fd
+ * on the node could map any BO, including ones it was never given a
+ * token for, and (V2) the device pager cached the physical pages: after
+ * the last IOC_GPU_FREE the BO's memory went back to the kernel while
+ * user space still had it mapped. Now the fd must hold the BO in its
+ * acl, and the object holds a BO reference that only its destructor
+ * drops, i.e. after the last mapping is gone.
+ */
 static int
-atrium_gpu_mmap(struct cdev *cdev, vm_ooffset_t offset, vm_paddr_t *paddr,
-    int nprot __unused, vm_memattr_t *memattr)
+atrium_bo_pg_ctor(void *handle, vm_ooffset_t size, vm_prot_t prot,
+    vm_ooffset_t foff, struct ucred *cred, u_short *color)
+{
+	struct atrium_gpu_bo *bo = handle;
+
+	/* The caller of cdev_pager_allocate holds a temporary ref. */
+	mtx_lock(&bo->sc->bo_lock);
+	atrium_bo_hold_locked(bo->sc, bo);
+	mtx_unlock(&bo->sc->bo_lock);
+	*color = 0;
+	return (0);
+}
+
+static void
+atrium_bo_pg_dtor(void *handle)
+{
+	struct atrium_gpu_bo *bo = handle;
+
+	/* The object is OBJ_DEAD here, so a lookup by this handle can no
+	 * longer find it even if the BO's memory is reused at once. */
+	atrium_bo_drop(bo->sc, bo);
+}
+
+static int
+atrium_bo_pg_fault(vm_object_t object, vm_ooffset_t offset, int prot,
+    vm_page_t *mres)
+{
+	struct atrium_gpu_bo *bo = object->handle;
+	vm_memattr_t memattr;
+	vm_paddr_t paddr;
+	vm_page_t page;
+
+	VM_OBJECT_ASSERT_WLOCKED(object);
+	if (offset < 0 || (uint64_t)offset >= bo->size)
+		return (VM_PAGER_FAIL);
+	paddr = bo->pa + offset;
+	/* HOST_BLOB pages live in the host_visible BAR. QEMU backs the BAR
+	 * with shm pages (cacheable on the host); WB on the guest matches
+	 * the host policy and is what venus expects for shmem-ring +
+	 * VkDeviceMemory (DEVICE would make the ring ~100x slower and break
+	 * some atomics). Guest-RAM BOs keep the page's own attribute. */
+	memattr = (bo->flags & ATRIUM_BO_INT_HOST_BLOB) ?
+	    VM_MEMATTR_WRITE_BACK : VM_MEMATTR_DEFAULT;
+	if (((*mres)->flags & PG_FICTITIOUS) != 0) {
+		page = *mres;
+		vm_page_updatefake(page, paddr, memattr);
+	} else {
+		VM_OBJECT_WUNLOCK(object);
+		page = vm_page_getfake(paddr, memattr);
+		VM_OBJECT_WLOCK(object);
+		vm_page_replace(page, object, (*mres)->pindex, *mres);
+		*mres = page;
+	}
+	vm_page_valid(page);
+	return (VM_PAGER_OK);
+}
+
+static struct cdev_pager_ops atrium_bo_pg_ops = {
+	.cdev_pg_fault = atrium_bo_pg_fault,
+	.cdev_pg_ctor  = atrium_bo_pg_ctor,
+	.cdev_pg_dtor  = atrium_bo_pg_dtor,
+};
+
+static int
+atrium_gpu_mmap_single(struct cdev *cdev, vm_ooffset_t *offset,
+    vm_size_t size, vm_object_t *object, int nprot)
 {
 	struct atrium_gpu_softc *sc = cdev->si_drv1;
-	struct atrium_gpu_bo *bo;
-	uint64_t bo_off;
+	struct atrium_gpu_file *f;
+	struct atrium_gpu_bo_ref *r;
+	struct atrium_gpu_bo *bo = NULL;
+	uint64_t bo_off = 0;
+	vm_object_t obj;
+	int err;
+
+	err = devfs_get_cdevpriv((void **)&f);
+	if (err != 0)
+		return (err);
 
 	mtx_lock(&sc->bo_lock);
-	TAILQ_FOREACH(bo, &sc->bos, link) {
-		if ((uint64_t)offset < bo->mmap_offset)
+	TAILQ_FOREACH(r, &f->mmap_acl, link) {
+		if ((uint64_t)*offset < r->bo->mmap_offset)
 			continue;
-		bo_off = (uint64_t)offset - bo->mmap_offset;
-		if (bo_off >= bo->size)
+		bo_off = (uint64_t)*offset - r->bo->mmap_offset;
+		if (bo_off >= r->bo->size || size > r->bo->size - bo_off)
 			continue;
-		*paddr = bo->pa + bo_off;
-		/* HOST_BLOB pages live in the host_visible BAR. QEMU backs
-		 * the BAR with shm pages (cacheable on the host); WB on the
-		 * guest matches the host policy and is what venus expects
-		 * for shmem-ring + VkDeviceMemory. The default (NULL = leave
-		 * memattr untouched, ARM64 picks DEVICE) would make the ring
-		 * uncacheable and ~100x slower, plus break some atomics. */
-		if (bo->flags & ATRIUM_BO_INT_HOST_BLOB)
-			*memattr = VM_MEMATTR_WRITE_BACK;
-		mtx_unlock(&sc->bo_lock);
-		return (0);
+		bo = r->bo;
+		break;
 	}
+	if (bo == NULL) {
+		mtx_unlock(&sc->bo_lock);
+		return (EACCES);	/* not a BO this fd holds */
+	}
+	atrium_bo_hold_locked(sc, bo);	/* across cdev_pager_allocate */
 	mtx_unlock(&sc->bo_lock);
-	return (EINVAL);
+
+	obj = cdev_pager_allocate(bo, OBJT_DEVICE, &atrium_bo_pg_ops,
+	    bo->size, nprot, 0, curthread->td_ucred);
+	atrium_bo_drop(sc, bo);
+	if (obj == NULL)
+		return (EINVAL);
+	*object = obj;
+	*offset = bo_off;
+	return (0);
 }
 
 /* ------------------------------------------------------------------------- */
@@ -1839,12 +1970,15 @@ atrium_display_wait_vblank(struct atrium_gpu_softc *sc,
 	return (err);
 }
 
+static int atrium_display_set_mode_bo(struct atrium_gpu_softc *,
+    struct atrium_display_set_mode *, struct atrium_gpu_bo *);
+
 static int
 atrium_display_set_mode(struct atrium_gpu_softc *sc,
     struct atrium_display_set_mode *args)
 {
 	struct atrium_gpu_bo *bo;
-	uint32_t w, h, rid;
+	uint32_t w, h;
 	int err;
 
 	if ((err = atrium_vgpu_ensure_display_info(sc)) != 0)
@@ -1859,10 +1993,25 @@ atrium_display_set_mode(struct atrium_gpu_softc *sc,
 
 	mtx_lock(&sc->bo_lock);
 	bo = atrium_bo_find_locked(sc, args->scanout_handle);
+	if (bo != NULL)
+		atrium_bo_hold_locked(sc, bo);	/* audit V3 */
 	mtx_unlock(&sc->bo_lock);
 	if (bo == NULL)
 		return (ENOENT);
+	err = atrium_display_set_mode_bo(sc, args, bo);
+	atrium_bo_drop(sc, bo);
+	return (err);
+}
 
+static int
+atrium_display_set_mode_bo(struct atrium_gpu_softc *sc,
+    struct atrium_display_set_mode *args, struct atrium_gpu_bo *bo)
+{
+	uint32_t w, h, rid;
+	int err;
+
+	w = args->mode.width;
+	h = args->mode.height;
 	if ((err = atrium_promote_bo_to_resource(sc, bo,
 	    VIRTIO_GPU_FORMAT_B8G8R8A8_UNORM, w, h)) != 0)
 		return (err);
@@ -1893,12 +2042,16 @@ atrium_display_set_mode(struct atrium_gpu_softc *sc,
 	return (0);
 }
 
+static int atrium_display_page_flip_bo(struct atrium_gpu_softc *,
+    struct atrium_display_page_flip *, struct atrium_gpu_bo *, uint32_t,
+    uint32_t, uint32_t);
+
 static int
 atrium_display_page_flip(struct atrium_gpu_softc *sc,
     struct atrium_display_page_flip *args)
 {
 	struct atrium_gpu_bo *bo;
-	uint32_t rid, w, h, cur_rid, conn;
+	uint32_t w, h, cur_rid, conn;
 	int err;
 
 	if (args->flags & FRESCO_PAGE_FLIP_INCLUDE_CURSOR)
@@ -1912,13 +2065,30 @@ atrium_display_page_flip(struct atrium_gpu_softc *sc,
 	cur_rid = sc->current_scanout_rid[conn];
 	w = sc->scanout_width [conn];
 	h = sc->scanout_height[conn];
-	mtx_unlock(&sc->bo_lock);
-	if (bo == NULL || bo->virtio_resource_id == 0)
+	if (bo == NULL || bo->virtio_resource_id == 0) {
+		mtx_unlock(&sc->bo_lock);
 		return (ENOENT);
+	}
 	if (cur_rid == 0 || w == 0 || h == 0) {
 		/* No set_mode has run on this connector yet. */
+		mtx_unlock(&sc->bo_lock);
 		return (ENXIO);
 	}
+	atrium_bo_hold_locked(sc, bo);	/* audit V3 */
+	mtx_unlock(&sc->bo_lock);
+	err = atrium_display_page_flip_bo(sc, args, bo, cur_rid, w, h);
+	atrium_bo_drop(sc, bo);
+	return (err);
+}
+
+static int
+atrium_display_page_flip_bo(struct atrium_gpu_softc *sc,
+    struct atrium_display_page_flip *args, struct atrium_gpu_bo *bo,
+    uint32_t cur_rid, uint32_t w, uint32_t h)
+{
+	uint32_t rid, conn = args->connector_id;
+	int err;
+
 	rid = bo->virtio_resource_id;
 
 	/* Queued (vsync-aligned) path: pre-promote the BO now (sleepable

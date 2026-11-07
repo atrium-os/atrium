@@ -29,6 +29,9 @@
 #include <sys/module.h>
 #include <sys/mutex.h>
 #include <sys/pcpu.h>
+#include <sys/priv.h>
+#include <sys/proc.h>
+#include <sys/jail.h>
 #include <sys/smp.h>
 #include <sys/sbuf.h>
 #include <sys/sysctl.h>
@@ -1237,6 +1240,22 @@ zram_strategy(struct bio *bp)
  * Self-test: under each codec, store a zero page, a compressible page and an
  * incompressible (random) page; load each back and verify; report the sizes.
  */
+/*
+ * Audit Z1 (2026-11-07): the selftest and bench sysctls touch the
+ * compressor and, for bench, decompress live swapped-out pages of every
+ * process.  Readable by anyone they were an unprivileged DoS and a
+ * compressed-size side channel; restrict them to unjailed root.
+ */
+static int
+zram_debug_sysctl_allowed(struct sysctl_req *req)
+{
+	if (req->td == NULL)
+		return (0);
+	if (jailed(req->td->td_ucred))
+		return (EPERM);
+	return (priv_check(req->td, PRIV_SYSCTL_DEBUG));
+}
+
 static int
 zram_selftest(SYSCTL_HANDLER_ARGS)
 {
@@ -1251,6 +1270,10 @@ zram_selftest(SYSCTL_HANDLER_ARGS)
 	char *p, *back, res[320];
 	int i, k, codec, fails = 0, n = 0;
 	uint32_t bytes;
+	int perr;
+
+	if ((perr = zram_debug_sysctl_allowed(req)) != 0)
+		return (perr);
 
 	p = malloc(ZRAM_PAGE, M_ZRAM, M_WAITOK);
 	back = malloc(ZRAM_PAGE, M_ZRAM, M_WAITOK);
@@ -1318,6 +1341,10 @@ zram_bench_sysctl(SYSCTL_HANDLER_ARGS)
 	uint32_t ci, j;
 	int n = 0, k, i, error, r;
 	size_t clen;
+	int perr;
+
+	if ((perr = zram_debug_sysctl_allowed(req)) != 0)
+		return (perr);
 
 	pages = malloc((size_t)ZRAM_BENCH_N * ZRAM_PAGE, M_ZRAM, M_WAITOK);
 	back = malloc(ZRAM_PAGE, M_ZRAM, M_WAITOK);

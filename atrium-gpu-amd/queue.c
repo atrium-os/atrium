@@ -448,7 +448,7 @@ amd_hwq_reap(struct atrium_amd_softc *sc)
 
 	TAILQ_FOREACH_SAFE(d, &done, link, tmp) {
 		sc->backend->bo_free(d->bo);
-		free(d->bo, M_DEVBUF);
+		amd_bo_free_struct(d->bo);
 		free(d, M_DEVBUF);
 		n++;
 	}

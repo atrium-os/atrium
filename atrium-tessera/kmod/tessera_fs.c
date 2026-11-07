@@ -31609,6 +31609,32 @@ tessera_vop_ioctl(struct vop_ioctl_args *ap)
 	 * tessera_fs_flush, which turns this shape into EDEADLK instead of a
 	 * wedge if it ever recurs by another route.
 	 */
+	/*
+	 * Administrative commands are for the host's volume service
+	 * (atrium-volumes, root outside any jail), not for whoever can open a
+	 * directory on the mount. Without this check any process that could
+	 * open a directory, including every app in a jail with a Tessera
+	 * volume, could lift its own quota (QUOTA_SET/DETACH), re-enable
+	 * global dedup on its domain and so reopen the cross-tenant dedup
+	 * oracle (DEDUP_POLICY), and spend the mount's time in GC or in
+	 * console output (GC, QUOTA_DUMP). Kmod audit 2026-11-07, T1.
+	 */
+	switch (ap->a_command) {
+	case TESSERA_IOC_QUOTA_SET:
+	case TESSERA_IOC_GC:
+	case TESSERA_IOC_DEDUP_POLICY:
+	case TESSERA_IOC_QUOTA_DUMP:
+	case TESSERA_IOC_QUOTA_DETACH: {
+		if (jailed(ap->a_cred))
+			return (EPERM);
+		int perr = priv_check_cred(ap->a_cred, PRIV_VFS_ADMIN);
+		if (perr != 0)
+			return (perr);
+		break;
+	}
+	default:
+		break;
+	}
 	int gated = (ap->a_vp->v_type == VDIR) && tmp_->flush_mtx_init &&
 	    ap->a_command != TESSERA_IOC_GC;
 	if (gated) tessera_fs_flush_gate_enter(tmp_);

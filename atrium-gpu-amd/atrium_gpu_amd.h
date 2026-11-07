@@ -576,6 +576,15 @@ struct atrium_amd_bo_binding {
 
 struct atrium_amd_bo {
 	struct atrium_amd_softc *sc;
+	/*
+	 * bind_lock guards bindings[]/n_bindings. A BO fd can be used by two
+	 * threads (or passed to another process) at once, so two VM_BINDs of
+	 * one BO race: both pass the n_bindings < MAX check and the second
+	 * writes bindings[MAX], past the array (kmod audit 2026-11-07, G1).
+	 * Exclusive in amd_bo_bind (which may sleep in map_page), shared in
+	 * amd_bo_gpu_va; teardown runs at last close with no other user.
+	 */
+	struct sx	 bind_lock;
 	struct atrium_amd_bo_binding bindings[ATRIUM_AMD_BO_MAX_BIND];
 	int		 n_bindings;	/* VMs this BO is currently bound into */
 	void		*kva;		/* CPU mapping (bus_dmamem, page-contiguous) */
@@ -999,6 +1008,7 @@ int	 amd_bo_bind(struct atrium_amd_bo *bo, struct atrium_amd_vm *vm,
 	    struct file *vm_fp, uint64_t *va, uint32_t bind_flags);
 /* The BO's base GPU-VA in `vm`, or 0 if it is not bound there. */
 uint64_t amd_bo_gpu_va(struct atrium_amd_bo *bo, struct atrium_amd_vm *vm);
+void	 amd_bo_free_struct(struct atrium_amd_bo *bo);
 /* amd backend: allocate/free a BO's backing (bus_dma System pages or a VRAM
  * bump); the front-end owns the struct/fd/bindings. */
 int	 amd_bo_backing_alloc(struct atrium_amd_softc *sc,
