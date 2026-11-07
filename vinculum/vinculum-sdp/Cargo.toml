@@ -1,0 +1,8 @@
+[package]
+name = "vinculum-sdp"
+version = "0.1.0"
+description = "Vinculum's SDP client, sans-I/O (Core Vol 3 Part B): bounded data-element parser and ServiceSearchAttribute queries"
+edition.workspace = true
+license.workspace = true
+
+[dependencies]

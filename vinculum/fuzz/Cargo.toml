@@ -12,6 +12,7 @@ libfuzzer-sys = "0.4"
 vinculum-hci-proto = { path = "../vinculum-hci-proto" }
 vinculum-host = { path = "../vinculum-host" }
 vinculum-smp = { path = "../vinculum-smp" }
+vinculum-sdp = { path = "../vinculum-sdp" }
 
 # Its own workspace, like every cargo-fuzz crate.
 [workspace]
@@ -52,5 +53,11 @@ doc = false
 [[bin]]
 name = "smp_initiator"
 path = "fuzz_targets/smp_initiator.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "sdp"
+path = "fuzz_targets/sdp.rs"
 test = false
 doc = false
