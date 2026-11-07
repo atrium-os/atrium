@@ -1,6 +1,6 @@
 # Lyra: external output devices (Bluetooth first)
 
-Status: **proposal**, 2026-11-07; the Bluetooth thread agreed (persistent id, initial delay,
+Status: **accepted** by Shankar, 2026-11-07 (all four §9 recommendations); the Bluetooth thread agreed (persistent id, initial delay,
 low rates and reconfiguration added at its request). The lyrad side of [bluetooth.md](bluetooth.md) §11
 (Vinculum B5). Builds on [lyra-v1.md](lyra-v1.md) (the app wire, the clock page, choragusd's
 sockets) and [atrium-player-pip-keys.md](atrium-player-pip-keys.md) §4.6 (media sessions).
