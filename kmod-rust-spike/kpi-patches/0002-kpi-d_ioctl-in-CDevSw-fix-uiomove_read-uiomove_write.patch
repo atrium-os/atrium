@@ -1,7 +1,7 @@
 From d542204d5af62a8a529cd1340ab02f085ac69bd6 Mon Sep 17 00:00:00 2001
 From: Atrium <noreply@anthropic.com>
 Date: Sat, 7 Nov 2026 19:47:42 +0000
-Subject: [PATCH 2/4] kpi: d_ioctl in CDevSw; fix uiomove_read/uiomove_write
+Subject: [PATCH 2/5] kpi: d_ioctl in CDevSw; fix uiomove_read/uiomove_write
  mutability
 
 uiomove_write copies user data INTO the kernel buffer but took &[u8],

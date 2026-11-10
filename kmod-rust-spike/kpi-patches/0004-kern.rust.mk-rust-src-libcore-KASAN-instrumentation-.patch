@@ -1,7 +1,7 @@
 From 2c604bebeeda0b2a647ccdde5f208bd0f8b90407 Mon Sep 17 00:00:00 2001
 From: Atrium <noreply@anthropic.com>
 Date: Sat, 7 Nov 2026 19:47:42 +0000
-Subject: [PATCH 4/4] kern.rust.mk: rust-src libcore, KASAN instrumentation,
+Subject: [PATCH 4/5] kern.rust.mk: rust-src libcore, KASAN instrumentation,
  pac-ret
 
 - RUST_LIB_SRC: build libcore from rustup's rust-src component.

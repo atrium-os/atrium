@@ -1,0 +1,105 @@
+From 8f99b2b696c8cb8d811e03af021436c4f13f4784 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Tue, 10 Nov 2026 16:22:51 +0000
+Subject: [PATCH 5/5] kpi: cheaper Vec allocation, fill and copy_in_vec
+
+Found by the Atrium spike's latency bench on HVF: SET (64 bytes) and
+PARSE (256 bytes) were 18-28% slower than the C twin.
+
+- fill_to_capacity() pushed one element at a time, and push() re-checks
+  the capacity each time, so LLVM could not turn the loop into a memset:
+  for Vec<u8> it zeroed a byte per iteration. Write the spare slots
+  directly and set the length once.
+- copy_in_vec() no longer zero-fills at all: copyin() writes every byte or
+  fails, and a failed Vec is dropped with length 0. Adds Vec::set_len
+  (unsafe, as in alloc).
+- malloc_aligned() calls malloc(9) when align <= 16, which malloc(9)
+  already guarantees. malloc_aligned(9) goes through malloc_domainset()
+  and its domain iterator on every call.
+---
+ kpi/src/malloc.rs   |  8 ++++++++
+ kpi/src/usercopy.rs |  9 +++++++--
+ kpi/src/vec.rs      | 20 ++++++++++++++++++--
+ 3 files changed, 33 insertions(+), 4 deletions(-)
+
+diff --git a/kpi/src/malloc.rs b/kpi/src/malloc.rs
+index b9079ba..c2a6880 100644
+--- a/kpi/src/malloc.rs
++++ b/kpi/src/malloc.rs
+@@ -129,6 +129,14 @@ pub mod wrappers {
+                 return null_mut();
+             }
+         };
++        // malloc(9) already returns memory "suitably aligned for storage of any type of
++        // object" (max_align_t: 16 bytes on arm64 and amd64). malloc_aligned(9) goes through
++        // malloc_domainset(), which sets up a domain iterator on every call; for a 64-byte
++        // Vec<u8> that was a measurable part of the cost. Only ask for it when needed.
++        // (Userspace unit tests only shim malloc_aligned: a shim named malloc would clash with libc.)
++        if !cfg!(test) && align <= 16 {
++            return unsafe { bindings::malloc(size, ty.0, flags.0) };
++        }
+         unsafe { bindings::malloc_aligned(size, align, ty.0, flags.0) }
+     }
+ 
+diff --git a/kpi/src/usercopy.rs b/kpi/src/usercopy.rs
+index 8f16fbb..77ae460 100644
+--- a/kpi/src/usercopy.rs
++++ b/kpi/src/usercopy.rs
+@@ -145,8 +145,13 @@ impl UserSlice {
+             return Err(EINVAL);
+         }
+         let mut v = Vec::<u8, M>::try_with_capacity(self.len, flags)?;
+-        v.fill_to_capacity(0);
+-        self.copy_in(&mut v[..self.len])?;
++        // No zero fill first: copyin() writes every byte or fails, and on failure the Vec
++        // is dropped with length 0, so the uninitialised bytes are never read.
++        // SAFETY: the allocation has self.len writable bytes.
++        unsafe {
++            raw_copyin(self.addr, v.as_mut_ptr(), self.len)?;
++            v.set_len(self.len);
++        }
+         Ok(v)
+     }
+ 
+diff --git a/kpi/src/vec.rs b/kpi/src/vec.rs
+index 567c58b..fddf4dc 100644
+--- a/kpi/src/vec.rs
++++ b/kpi/src/vec.rs
+@@ -86,6 +86,15 @@ impl<T, M: Malloc> Vec<T, M> {
+         self.ptr.as_ptr()
+     }
+ 
++    /// Set the length without touching the elements, as `alloc::vec::Vec::set_len`.
++    ///
++    /// # Safety
++    /// `len <= capacity`, and the first `len` elements must be initialised.
++    pub unsafe fn set_len(&mut self, len: usize) {
++        debug_assert!(len <= self.capacity);
++        self.len = len;
++    }
++
+     pub const fn as_mut_ptr(&self) -> *mut T {
+         self.ptr.as_ptr()
+     }
+@@ -261,9 +270,16 @@ impl<T: Copy, M: Malloc> Vec<T, M> {
+     }
+ 
+     pub fn fill_to_capacity(&mut self, value: T) {
+-        for _ in self.len..self.capacity {
+-            self.push(value);
++        // Write the spare slots directly and set the length once. Going through push()
++        // re-checks the capacity for every element, which keeps LLVM from turning the loop
++        // into a memset: it ran a byte at a time for Vec<u8>.
++        let p = self.as_mut_ptr();
++        for i in self.len..self.capacity {
++            // SAFETY: i < capacity, so p.add(i) is inside the allocation; T: Copy has no
++            // drop, so overwriting an uninitialised slot is fine.
++            unsafe { write(p.add(i), value) };
+         }
++        self.len = self.capacity;
+     }
+ }
+ 
+-- 
+2.43.0
+

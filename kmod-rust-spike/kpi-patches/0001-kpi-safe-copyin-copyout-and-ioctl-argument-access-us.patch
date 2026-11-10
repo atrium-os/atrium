@@ -1,7 +1,7 @@
 From 19649aea7f0be6e4b698bec96488c270205ba2e4 Mon Sep 17 00:00:00 2001
 From: Atrium <noreply@anthropic.com>
 Date: Sat, 7 Nov 2026 19:47:42 +0000
-Subject: [PATCH 1/4] kpi: safe copyin/copyout and ioctl argument access
+Subject: [PATCH 1/5] kpi: safe copyin/copyout and ioctl argument access
  (usercopy)
 
 UserSlice carries a user address that can only be used through

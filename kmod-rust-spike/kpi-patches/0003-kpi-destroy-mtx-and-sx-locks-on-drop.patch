@@ -1,7 +1,7 @@
 From 050d17b1a95eb1fbed99f54f18379ec827c56efd Mon Sep 17 00:00:00 2001
 From: Atrium <noreply@anthropic.com>
 Date: Sat, 7 Nov 2026 19:47:42 +0000
-Subject: [PATCH 3/4] kpi: destroy mtx and sx locks on drop
+Subject: [PATCH 3/5] kpi: destroy mtx and sx locks on drop
 
 Neither Mutex nor SxLock called mtx_destroy/sx_destroy, so freeing a
 softc left WITNESS and lock-profiling state for the lock and, under
