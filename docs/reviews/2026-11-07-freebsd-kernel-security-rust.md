@@ -365,7 +365,7 @@ numbers that tell us whether 4 and 5 are worth it. Steps 3–5 need D2.
 | # | decision | recommendation |
 |---|---|---|
 | **D1** | Port the FreeBSD kernel to Rust (a full rewrite, §8.1, or a fork that rewrites core subsystems, §8.2)? | **Decided 2026-11-07: no.** Stay on upstream FreeBSD, with our fork kept a thin patch set. Take the incremental path (§8.3) |
-| **D2** | Change LANGUAGE-POLICY.md from "Kernel = C" to "**new Atrium-authored kernel code is Rust by default** once the step-3 spike passes; C stays for VFS/newbus glue and for code we import"? | **Decided after the step-3 spike (Shankar 2026-11-07).** Recommended yes if it passes. It applies the reasoning we already use for userspace (untrusted-input parsing dominates) to our own kmods |
+| **D2** | Change LANGUAGE-POLICY.md from "Kernel = C" to "**new Atrium-authored kernel code is Rust by default** once the step-3 spike passes; C stays for VFS/newbus glue and for code we import"? | **Yes. Decided by Shankar 2026-11-10** after the step-3 spike ([results](../../kmod-rust-spike/README.md)); LANGUAGE-POLICY.md updated. It applies the reasoning we already use for userspace (untrusted-input parsing dominates) to our own kmods |
 | **D3** | First Rust kernel target? | **Tessera's on-disk decoders** (step 4): freestanding, parser-heavy, already has Rust crates and a test harness. GPU validation (step 5) second |
 | **D4** | Ship a stripped `ATRIUM` kernel config and the hardening sysctls in step 0? | **Yes, now.** Cheapest win in this review |
 | **D5** | Build a per-app syscall/ioctl profile (step 2)? | **Yes** (Shankar 2026-11-07: worth implementing in the kernel). Mechanism sketched in §9.1; design note first, measured against the data file |

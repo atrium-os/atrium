@@ -1,18 +1,19 @@
 # Language policy
 
-> **Kernel = C. Userspace = Rust by default. Public APIs = C ABI.**
+> **New Atrium kernel code = Rust by default (C for VFS/newbus glue and imported code). Userspace = Rust by default. Public APIs = C ABI.**
 >
 > Carve-out: C is acceptable in userspace where (a) inherited from upstream, (b) the code lives in the smallest-TCB tier and a maintainer makes a written case for it, or (c) it's a thin C-ABI shim layer over a Rust implementation.
 
 This document records a one-time architectural decision so contributors know the rule and the reasoning behind it. Re-litigating the question costs more than it saves; that's the only reason this document exists.
 
-Last revised: 2026-05-07. Revisions are themselves rare and require a written case (see §Practical consequences).
+Last revised: 2026-11-10 (kernel rule, decision D2 of [the kernel security review](reviews/2026-11-07-freebsd-kernel-security-rust.md), after the [Rust kmod spike](../kmod-rust-spike/README.md)). Before that: 2026-05-07. Revisions are themselves rare and require a written case (see §Practical consequences).
 
 ## The rule
 
 | Layer | Language | Why |
 |---|---|---|
-| Kernel modules (`atrium-kmod`, future GPU/display/Tessera drivers) | **C** | Required — FreeBSD kernel doesn't accept Rust |
+| New Atrium kernel code (new kmods, and the Tessera decoders first, D3) | **Rust** by default, built in-tree with freebsd-kpi-rs (`sys/rust`, our patches in `kmod-rust-spike/kpi-patches/`) | Our C kmods are the densest source of memory-safety bugs we control (kmod audit 2026-11-07). The spike showed safe Rust at C speed (within 2–4% per call on HVF), KASAN- and syzkaller-clean |
+| Existing C kmods, VFS/newbus glue, code imported from FreeBSD | **C** | No rewrite (D1); port parts to Rust when they are reworked anyway |
 | Public ABIs (`libfresco`, `libatrium-gpu`, `libcastellum`, ...) | **C headers** | Universal consumption — vendors, contributors, other languages |
 | Rust binding crates (`fresco-rs`, `atrium-gpu-rs`, ...) | Rust | Ergonomic safe wrappers over the C ABIs |
 | Display server (`fresco-server`) | **Rust** | Multi-client, multi-threaded, performance-critical, security-critical |
@@ -118,12 +119,12 @@ We're not modifying FreeBSD base. Atrium is a parallel stack on top. The ports t
 
 - Every Atrium service that is a useful integration point ships a **C-callable library** with a stable C header — `libfresco.h`, `libatrium-gpu.h`, `libcastellum.h`. A C, Zig, Go, or Swift program can build against Atrium without ever touching Rust.
 - Every wire-format spec describes byte layouts, not Rust types. `repr(C)` types in our Rust code reproduce the spec; they aren't the source of truth.
-- Kernel modules — the layer that touches FreeBSD's actual code — are C. There is no Rust-in-the-kernel proposal in this document.
+- Kernel modules: new Atrium kernel code is Rust (since 2026-11-10), but the interface it implements is FreeBSD's own (cdevsw, ioctl numbers, on-disk formats), so nothing outside the module sees the language. Existing C kmods stay C.
 
 So a C-preferring contributor can:
 - Implement a Fresco client in C (already supported via `libfresco`).
 - Write a system service that speaks Castellum in C (`libcastellum` will exist).
-- Author a kernel driver targeting the Atrium GPU ABI in C (no other choice).
+- Author a kernel driver targeting the Atrium GPU ABI in C (the ABI is C; Atrium's own drivers are written in Rust by default).
 - Build their own desktop on top of Fresco in any language.
 
 The only friction is "you can't write a privileged Atrium daemon for our reference desktop in C, because we already wrote it in Rust." That's a packaging choice, not an exclusionary one.
@@ -175,7 +176,7 @@ and what the reflector expects.
 ## Practical consequences
 
 - New service from scratch → Rust crate, vendored deps via `cargo`, published as a port that wraps the cargo build.
-- New kernel driver → C source under `atrium-kmod/`, `bsd.kmod.mk` Makefile.
+- New kernel code → Rust, `RUST_SRCS` in a `bsd.kmod.mk` Makefile (see `kmod-rust-spike/rspike/`), `#![deny(unsafe_code)]` in the module itself; any `unsafe` belongs in the bindings crate with a `SAFETY:` comment. C only for VFS/newbus glue the bindings don't cover yet.
 - New public API → C header under each repo's `include/`, with a Rust binding crate alongside (`<service>-rs`).
 - New smallest-TCB component (rare; jaild and the deferred atrium-authd are the only known cases) → Rust with the discipline rules from §The smallest-TCB carve-out. C is defensible if a maintainer makes the written case; default is still Rust.
 - Pull request reviews don't ask "should this be in C instead?" — the choice is settled — except for the smallest-TCB cases, where the question has a documented answer.
