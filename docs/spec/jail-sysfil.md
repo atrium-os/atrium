@@ -305,7 +305,7 @@ The kernel patch is written to be offered to FreeBSD as it is:
 | jail(8) launch path, as portcullisd renders it (`exec.clean`, `exec.system_jail_user`, `exec.jail_user`) | log mode found what `setusercontext(3)` calls after the attach (`setloginclass`, `setpriority`, `setrlimit`, `seteuid`, `setegid`), now in `base`; in deny mode `/bin/echo` and the Rust std probe then run as the app user with 0 denials |
 | profiles against real binaries | `app` in deny mode runs a Rust std probe (threads, files, sockets, timers, env, process) with 0 denials; `renderer` in deny mode runs `sysfil-bench` with 0 denials. Real Pergola apps, Fresco renderers and Nuntius: pending, through `learn.sh` |
 | Portcullis manifest `[capabilities] syscalls` to class | done: schema, validation, consent for `terminal`, both launch paths; unit tests in portcullis-jail (`tests/sysfil.rs`, including every shipped app manifest resolving), portcullis-policy and jaild |
-| arm64 build and VM run | pending |
+| arm64 build and VM run | done on HVF (Mac): GENERIC-NODEBUG at 62c6fd2a9 boots, filtered runs 0 denials, positive control denied |
 | overhead, cloud TCG (sanity) | done, below |
 | overhead under 1%, HVF (Mac, arm64) | outside filtered jails: **passes** (patched vs stock within ±0.5% on every operation). Inside a filtered jail, at fbsd 09e74dabf: null +1.9% (+1.5 ns), sockopt +1.9%, ioctl +4.3%. At fbsd 302660e88 (bitmap test inline in `syscallenter`, open-coded list searches): **null +0.65% (+0.5 ns), nullio +0.42%, sockopt +1.05% (+1.2 ns), ioctl +2.8% (+2.8 ns, noise floor 1–2%)**, unfiltered path still within noise. Tables below |
 | overhead under 1%, KVM (R9700, amd64) | pending |
@@ -331,9 +331,35 @@ At fbsd 302660e88, same protocol (medians, ns): stock host 77.8 / 95.5 / 97.6 / 
 allowed system call is now four dependent loads and a bit test with no call; fbsd 8e5fafe2f
 does the same for ioctls and socket options: the leading fields of the filter are declared
 in `sys/jail.h` as `struct sysfil_hot` and the hooks search the sorted lists inline, calling
-into `kern_jail_sysfil.c` only for an operation not on the list. Shankar's call
-(2026-11-08): optimize, then accept the remaining filtered-jail cost as the price of a
-filter; the gate stays under 1% for everything outside filtered jails.
+into `kern_jail_sysfil.c` only for an operation not on the list. clang emitted those
+`__inline` helpers out of line at 8e5fafe2f (measured there: filtered/host ioctl +2.44%,
+sockopt +0.69%); fbsd 62c6fd2a9 marks them `__always_inline`, and `llvm-nm` shows no
+`sysfil_*_ok` symbol on either arch.
+
+**Final, fbsd 62c6fd2a9 (2026-11-10).** Same protocol, 3 valid boots per kernel (a boot
+whose host load passed 3 was repeated), host noisier than on 11-08 (1-min load 1.6–2.9,
+base null 78.2–79.1 ns against 77.6). Pooled medians, ns:
+
+| | null | nullio | ioctl | sockopt | socket |
+|---|---|---|---|---|---|
+| stock, host | 78.3 | 97.0 | 99.3 | 115.3 | 378.5 |
+| stock, open jail | 78.4 | 96.6 | 99.5 | 115.9 | 379.1 |
+| patched, host | 79.2 | 98.3 | 103.5 | 119.0 | 380.4 |
+| patched, open jail | 79.3 | 99.7 | 103.9 | 119.0 | 386.7 |
+| patched, filtered jail | 79.6 | 99.2 | 105.5 | 119.2 | 381.1 |
+| **filtered / patched host** | **+0.51%** | **+0.92%** | **+1.93%** | **+0.17%** | **+0.18%** |
+| filtered / patched open jail | +0.38% | -0.50% | +1.54% | +0.17% | -1.45% |
+
+Filtered against host is measured in the same boot, interleaved, so it is the reliable
+comparison: everything is under 1% except ioctl (+0.3 to +2.9 ns per boot), at the noise
+floor. Patched against stock (separate boots) read +1 to +4% this time, uniformly across
+operations including the null call, which 62c6fd2a9 does not touch; `do_el0_sync` and the
+unfiltered head of `kern_ioctl` are byte-identical to 8e5fafe2f, which measured within
+noise on a quiet host, so this is host drift, not code. Pinning it again needs a quiet Mac
+(load ~1.1). Shankar's call (2026-11-08): optimize, then accept the remaining
+filtered-jail cost as the price of a filter; the gate stays under 1% for everything
+outside filtered jails. With 62c6fd2a9 the optimization is done and the residual ioctl
+cost (~2 ns) is accepted.
 
 Medians at 09e74dabf, patched open jail against stock open jail: null 0.00%, nullio -0.42%, ioctl
 +0.51%, sockopt +0.35%, socket +0.36%. The ioctl noise floor is about 2% (stock host against
