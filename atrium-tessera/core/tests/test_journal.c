@@ -16,6 +16,7 @@
 #include "tessera/error.h"
 #include "tessera/format.h"
 #include "tessera/crc.h"
+#include "tessera/codec.h"
 
 #include <stddef.h>
 
@@ -40,10 +41,12 @@ static int failures = 0;
 struct mem_disk {
 	uint8_t blocks[MAX_SECTORS][4096];
 	uint8_t valid[MAX_SECTORS];
+	unsigned reads;
 };
 
 static int mem_read(void *ctx, uint64_t s, uint8_t *out) {
 	struct mem_disk *d = ctx;
+	d->reads++;
 	if (s >= MAX_SECTORS || !d->valid[s]) return -1;
 	memcpy(out, d->blocks[s], 4096);
 	return 0;
@@ -374,6 +377,80 @@ test_short_reason_tag(void)
 	free(d);
 }
 
+/* head_block/tail_block come off disk; out of 1..length-1 they used to
+ * send replay outside the journal. A record body over the 1 MiB cap is
+ * refused on append and, if found on disk, on replay. */
+static void
+set_head_tail(struct mem_disk *d, uint64_t start, uint64_t head, uint64_t tail)
+{
+	tessera_journal_header_t h;
+	CHECK(tessera_decode_journal_header(d->blocks[start], &h) == TESSERA_OK);
+	h.head_block = head;
+	h.tail_block = tail;
+	CHECK(tessera_encode_journal_header(&h, d->blocks[start]) == TESSERA_OK);
+}
+
+static void
+test_bad_head_tail_and_body_cap(void)
+{
+	struct mem_disk *d = calloc(1, sizeof *d);
+	tessera_block_io_t io = mk_io(d);
+	const uint64_t START = 4, LEN = 32;
+	tessera_journal_format(&io, START, LEN);
+	tessera_journal_t *j;
+
+	const uint64_t bad[][2] = { {0, 1}, {1, 0}, {LEN, 1}, {1, LEN},
+	    {UINT64_MAX, 1}, {1, UINT64_MAX} };
+	for (size_t i = 0; i < sizeof bad / sizeof bad[0]; i++) {
+		set_head_tail(d, START, bad[i][0], bad[i][1]);
+		j = tessera_journal_open(&io, START, LEN);
+		CHECK(j == NULL);
+		tessera_journal_close(j);
+	}
+	set_head_tail(d, START, LEN - 1, LEN - 1);
+	j = tessera_journal_open(&io, START, LEN);
+	CHECK(j != NULL);
+	tessera_journal_close(j);
+	set_head_tail(d, START, 1, 1);
+
+	/* Append over the cap: refused before anything is written. */
+	j = tessera_journal_open(&io, START, LEN);
+	CHECK(j != NULL);
+	uint64_t tx = 0;
+	CHECK(tessera_journal_tx_begin(j, &tx, "cap") == TESSERA_OK);
+	static uint8_t big[(1u << 20) + 1];
+	CHECK(tessera_journal_append(j, tx, TESSERA_INODE_WRITE, big,
+	    sizeof big) == TESSERA_EINVAL);
+	uint8_t body[16] = {0};
+	CHECK(tessera_journal_append(j, tx, TESSERA_INODE_WRITE, body,
+	    sizeof body) == TESSERA_OK);
+	CHECK(tessera_journal_tx_commit(j, tx) == TESSERA_OK);
+	tessera_journal_close(j);
+
+	/* A record on disk claiming 2 MiB (block count consistent, header CRC
+	 * restamped) in a journal big enough to hold it: replay must refuse it
+	 * rather than allocate. Record 2 is the INODE_WRITE. */
+	const uint32_t bl = 2u << 20;
+	corrupt_record_field(d, START + 2,
+	    offsetof(tessera_record_header_t, body_length), bl);
+	corrupt_record_field(d, START + 2,
+	    offsetof(tessera_record_header_t, block_count),
+	    (64u + bl + 4095u) / 4096u);
+	j = tessera_journal_open(&io, START, 1u << 20);
+	CHECK(j != NULL);
+	struct cap_ctx cc = {0};
+	d->reads = 0;
+	int rc = tessera_journal_replay(j, cap_cb, &cc);
+	CHECK(rc == TESSERA_OK || rc == TESSERA_ECORRUPT);
+	CHECK(cc.count == 0);
+	/* Refused at its first block: without the cap replay went on to read
+	 * the 2 MiB body's 512 continuation blocks. */
+	CHECK(d->reads <= 4);
+	cap_free(&cc);
+	tessera_journal_close(j);
+	free(d);
+}
+
 int
 main(void)
 {
@@ -385,6 +462,7 @@ main(void)
 	test_multiblock_body();
 	test_corrupt_block_count_terminates();
 	test_short_reason_tag();
+	test_bad_head_tail_and_body_cap();
 	if (failures > 0) {
 		fprintf(stderr, "%d failure(s)\n", failures);
 		return 1;

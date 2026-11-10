@@ -11,16 +11,21 @@ pub fn sectors_for(body_len: u32) -> u64 {
     (RECORD_HEADER_SIZE as u64 + u64::from(body_len)).div_ceil(SECTOR as u64)
 }
 
+/// Largest record body (the C `MAX_BODY` in core/src/journal.c). Real records
+/// are a few hundred bytes; the cap bounds the allocation replay makes.
+pub const MAX_BODY: u32 = 1 << 20;
+
 /// Header magic and CRC, then the geometry rule (#126): the body fits in the
 /// journal's `cap` data blocks and `block_count` is exactly what the body
-/// needs. `blk` is the record's first block.
+/// needs, and the body is at most [`MAX_BODY`]. `blk` is the record's first
+/// block.
 pub fn record_check(blk: &[u8; SECTOR], cap: u64) -> Result<()> {
     let hdr: &[u8; RECORD_HEADER_SIZE] =
         blk.get(..RECORD_HEADER_SIZE).and_then(|h| h.try_into().ok()).ok_or(ECORRUPT)?;
     codec::record_header(hdr)?;
     let bl = u32_at(hdr, off::RH_BODY_LENGTH).ok_or(ECORRUPT)?;
     let bc = u32_at(hdr, off::RH_BLOCK_COUNT).ok_or(ECORRUPT)?;
-    if u64::from(bl) > cap.saturating_mul(SECTOR as u64) {
+    if u64::from(bl) > cap.saturating_mul(SECTOR as u64) || bl > MAX_BODY {
         return Err(ECORRUPT);
     }
     if u64::from(bc) != sectors_for(bl) {
@@ -73,6 +78,15 @@ mod tests {
             assert!(record_check(&block(bl, want + 1), cap).is_err(), "bl {bl} +1");
             assert!(record_check(&block(bl, want - 1), cap).is_err(), "bl {bl} -1");
         }
+    }
+
+    #[test]
+    fn body_cap() {
+        let cap = u64::MAX;
+        let ok = |bl: u32| record_check(&block(bl, sectors_for(bl) as u32), cap).is_ok();
+        assert!(ok(MAX_BODY));
+        assert!(!ok(MAX_BODY + 1));
+        assert!(!ok(u32::MAX - 4096));
     }
 
     #[test]

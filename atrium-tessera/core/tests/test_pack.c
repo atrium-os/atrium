@@ -21,6 +21,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <unistd.h>
 
 static int failures = 0;
 #define CHECK(cond) do {                                                 \
@@ -161,6 +162,44 @@ test_corruption_detected(void)
 	tessera_pack_free(pb);
 }
 
+/* bloom_hash_count comes off disk. A pack claiming 2^32-1 made every
+ * lookup of a present blob loop 2^32 times; the reader caps probes at 64.
+ * alarm() turns a regression into a failure instead of a hang. */
+static void
+test_bloom_probe_cap(void)
+{
+	const uint8_t pack_id[16] = { 'P','A','C','K','B','L','O','O','M','C','A','P','T','E','S','T' };
+	tessera_pack_builder_t *pb = tessera_pack_begin(0, pack_id, 0);
+	uint8_t bytes[100];
+	memset(bytes, 0x77, sizeof bytes);
+	tessera_hash_t h;
+	tessera_sha256(bytes, sizeof bytes, h);
+	CHECK(tessera_pack_add_blob(pb, h, bytes, sizeof bytes, 0) == TESSERA_OK);
+	size_t need = 0;
+	(void)tessera_pack_finalize(pb, NULL, 0, &need);
+	uint8_t *pack = malloc(need); size_t sz = 0;
+	CHECK(tessera_pack_finalize(pb, pack, need, &sz) == TESSERA_OK);
+
+	tessera_pack_header_t hh;
+	CHECK(tessera_decode_pack_header(pack, &hh) == TESSERA_OK);
+	hh.bloom_hash_count = UINT32_MAX;
+	CHECK(tessera_encode_pack_header(&hh, pack) == TESSERA_OK);
+	/* Every bit set, so no probe can end the loop early. */
+	memset(pack + TESSERA_SECTOR_SIZE * (1 + hh.index_blocks), 0xff,
+	    hh.bloom_bytes);
+
+	tessera_pack_reader_t *pr = tessera_pack_open(pack, sz);
+	CHECK(pr != NULL);
+	if (pr != NULL) {
+		alarm(10);
+		CHECK(tessera_pack_bloom_might_contain(pr, h) == 1);
+		alarm(0);
+		tessera_pack_close(pr);
+	}
+	free(pack);
+	tessera_pack_free(pb);
+}
+
 int
 main(void)
 {
@@ -168,6 +207,7 @@ main(void)
 	test_round_trip();
 	test_duplicate_rejected();
 	test_corruption_detected();
+	test_bloom_probe_cap();
 	if (failures > 0) {
 		fprintf(stderr, "%d failure(s)\n", failures);
 		return 1;

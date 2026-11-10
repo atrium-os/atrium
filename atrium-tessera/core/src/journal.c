@@ -44,6 +44,11 @@
 
 #define BLK 4096u
 #define HDR 64u                /* sizeof(tessera_record_header_t) */
+/* Largest record body written or read. Real records are a few hundred bytes
+ * (a dirent record carries at most a 255-byte name); the cap stops a corrupt
+ * header from making replay allocate up to 4 GiB (kernel malloc M_WAITOK).
+ * Same value as MAX_BODY in rs/tessera-decode/src/journal.rs. */
+#define MAX_BODY (1u << 20)
 
 struct tessera_journal {
 	tessera_block_io_t io;
@@ -198,6 +203,15 @@ tessera_journal_open(const tessera_block_io_t *io, uint64_t start,
 	j->tail_block = h->tail_block;
 	j->next_tx_id = 1;
 	tessera_free(h);
+	/* head_block and tail_block come off disk and index the ring of data
+	 * blocks 1..length-1. Out of range, replay read blocks outside the
+	 * journal (past it, into the metadata zone) and free_sectors went
+	 * negative. The header CRC does not catch a header written wrong. */
+	if (j->head_block < 1 || j->head_block > length - 1 ||
+	    j->tail_block < 1 || j->tail_block > length - 1) {
+		tessera_free(j);
+		return NULL;
+	}
 	return j;
 }
 
@@ -260,6 +274,7 @@ static int
 write_record(tessera_journal_t *j, tessera_record_type_t type,
              const void *body, uint32_t body_len, uint64_t seq)
 {
+	if (body_len > MAX_BODY) return TESSERA_EINVAL;
 	const uint32_t need = sectors_for(body_len);
 	if (free_sectors(j) < need) return TESSERA_ENOSPC;
 
@@ -440,7 +455,11 @@ read_record(tessera_journal_t *j, uint64_t *block,
 	 * replay spinning on one record forever) and block_count enormous
 	 * (which jumped the cursor to an unrelated block, forming a ring —
 	 * see the loop bound in tessera_journal_replay). */
-	if (out_hdr->body_length > cap * BLK) { tessera_free(blk); return TESSERA_ECORRUPT; }
+	if (out_hdr->body_length > cap * BLK ||
+	    out_hdr->body_length > MAX_BODY) {
+		tessera_free(blk);
+		return TESSERA_ECORRUPT;
+	}
 	if (out_hdr->block_count != sectors_for(out_hdr->body_length)) {
 		tessera_free(blk);
 		return TESSERA_ECORRUPT;

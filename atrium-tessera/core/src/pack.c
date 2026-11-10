@@ -38,6 +38,7 @@
 #include "tessera_rs.h"
 
 #define BLOB_DATA_ALIGN  64u
+#define BLOOM_MAX_PROBES 64u   /* reader cap; rs MAX_BLOOM_PROBES */
 #define BLOOM_BITS_PER_BLOB 10u
 #define BLOOM_MIN_BYTES  64u
 
@@ -78,6 +79,11 @@ bloom_test(const uint8_t *bloom, size_t bloom_bits, uint32_t k_hashes,
 {
 	uint64_t h1, h2;
 	bloom_h1_h2(hash, &h1, &h2);
+	/* k_hashes comes off disk: a hostile pack claimed 2^32-1 and stalled
+	 * every lookup. The builder writes at most 16; testing fewer bits only
+	 * turns "absent" into "might contain", which lookup then settles, so
+	 * the cap never hides a blob. Same cap as the Rust reader. */
+	if (k_hashes > BLOOM_MAX_PROBES) k_hashes = BLOOM_MAX_PROBES;
 	for (uint32_t i = 0; i < k_hashes; i++) {
 		uint64_t bit = (h1 + (uint64_t)i * h2) % bloom_bits;
 		if ((bloom[bit >> 3] & (1u << (bit & 7))) == 0) return 0;

@@ -24361,7 +24361,7 @@ static int
 tessera_fs_dir_btree_insert_at(struct tessera_mount *tmp_,
     const tessera_hash_t node_hash, uint64_t key, uint64_t inode_no,
     const char *name, uint16_t namelen,
-    struct tessera_btree_op_result *out);
+    struct tessera_btree_op_result *out, int depth);
 
 /* Insert into a leaf node. Builds new leaf (with the inserted entry)
  * and either KEEPs (if size <= FANOUT) or SPLITs into two halves. */
@@ -24528,8 +24528,13 @@ static int
 tessera_fs_dir_btree_insert_at(struct tessera_mount *tmp_,
     const tessera_hash_t node_hash, uint64_t key, uint64_t inode_no,
     const char *name, uint16_t namelen,
-    struct tessera_btree_op_result *out)
+    struct tessera_btree_op_result *out, int depth)
 {
+	/* The tree's height comes from the image: bound the recursion like
+	 * the walk (TESSERA_DIR_BTREE_MAX_DEPTH) so a crafted chain of inner
+	 * nodes cannot run the kernel stack out. */
+	if (depth >= TESSERA_DIR_BTREE_MAX_DEPTH)
+		return (EIO);
 	uint8_t  *blob = NULL;
 	uint32_t  blob_len = 0;
 	if (tessera_fs_fetch_blob(tmp_, node_hash, &blob, &blob_len) != 0)
@@ -24570,7 +24575,7 @@ tessera_fs_dir_btree_insert_at(struct tessera_mount *tmp_,
 	struct tessera_btree_op_result child_res;
 	memset(&child_res, 0, sizeof child_res);
 	rc = tessera_fs_dir_btree_insert_at(tmp_, child, key, inode_no,
-	    name, namelen, &child_res);
+	    name, namelen, &child_res, depth + 1);
 	if (rc != 0) {
 		free(blob, M_TESSERA);
 		return (rc);
@@ -24610,7 +24615,7 @@ tessera_fs_dir_btree_insert(struct tessera_mount *tmp_,
 	}
 
 	int rc = tessera_fs_dir_btree_insert_at(tmp_, root_hash, key,
-	    inode_no, name, namelen, &res);
+	    inode_no, name, namelen, &res, 0);
 	if (rc != 0) return (rc);
 
 	if (res.kind == TESSERA_BTREE_KEEP) {
@@ -24631,14 +24636,16 @@ static int
 tessera_fs_dir_btree_remove_at(struct tessera_mount *tmp_,
     const tessera_hash_t node_hash, uint64_t key,
     const char *name, uint16_t namelen, uint64_t verify_inode,
-    struct tessera_btree_op_result *out);
+    struct tessera_btree_op_result *out, int depth);
 
 static int
 tessera_fs_dir_btree_remove_at(struct tessera_mount *tmp_,
     const tessera_hash_t node_hash, uint64_t key,
     const char *name, uint16_t namelen, uint64_t verify_inode,
-    struct tessera_btree_op_result *out)
+    struct tessera_btree_op_result *out, int depth)
 {
+	if (depth >= TESSERA_DIR_BTREE_MAX_DEPTH)   /* as insert_at */
+		return (EIO);
 	uint8_t  *blob = NULL;
 	uint32_t  blob_len = 0;
 	if (tessera_fs_fetch_blob(tmp_, node_hash, &blob, &blob_len) != 0)
@@ -24731,7 +24738,7 @@ tessera_fs_dir_btree_remove_at(struct tessera_mount *tmp_,
 	struct tessera_btree_op_result child_res;
 	memset(&child_res, 0, sizeof child_res);
 	rc = tessera_fs_dir_btree_remove_at(tmp_, child, key, name,
-	    namelen, verify_inode, &child_res);
+	    namelen, verify_inode, &child_res, depth + 1);
 	if (rc != 0) { free(blob, M_TESSERA); return (rc); }
 
 	/* Rebuild this inner: replace target entry with new child (or
@@ -24789,7 +24796,7 @@ tessera_fs_dir_btree_remove(struct tessera_mount *tmp_,
 	struct tessera_btree_op_result res;
 	memset(&res, 0, sizeof res);
 	int rc = tessera_fs_dir_btree_remove_at(tmp_, root_hash, key,
-	    name, namelen, verify_inode, &res);
+	    name, namelen, verify_inode, &res, 0);
 	if (rc != 0) return (rc);
 	if (res.kind == TESSERA_BTREE_DROPPED) {
 		*out_dropped = 1;

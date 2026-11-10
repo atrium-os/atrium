@@ -364,15 +364,23 @@ pub unsafe extern "C" fn tessera_rs_btree_node_check(
     out_hdr: *mut u8, out_fail: *mut c_int, out_found_kind: *mut u8,
 ) -> c_int {
     let Some(b) = (unsafe { bytes(block, block_len) }) else { return EINVAL };
-    if !out_hdr.is_null() {
-        if let Some(h) = b.get(..BTREE_NODE_HEADER_SIZE).and_then(|h| <&[u8; BTREE_NODE_HEADER_SIZE]>::try_from(h).ok()) {
-            if codec::btree_node_header(h).is_ok() {
+    let shape = Shape { tree_kind, key_size, value_size, leaf_fanout, inner_fanout };
+    // Magic and CRC once: the header goes to out_hdr if they are good, then
+    // the remaining checks run on it.
+    let hdr = b
+        .get(..BTREE_NODE_HEADER_SIZE)
+        .and_then(|h| <&[u8; BTREE_NODE_HEADER_SIZE]>::try_from(h).ok())
+        .filter(|h| codec::btree_node_header(h).is_ok());
+    let res = match hdr {
+        Some(h) => {
+            if !out_hdr.is_null() {
                 unsafe { copy_out(h, out_hdr) };
             }
+            btree::node_fields(h, &shape)
         }
-    }
-    let shape = Shape { tree_kind, key_size, value_size, leaf_fanout, inner_fanout };
-    match btree::node_check(b, &shape) {
+        None => btree::node_check(b, &shape),
+    };
+    match res {
         Ok(()) => {
             unsafe { put(out_fail, btree::FAIL_NONE) };
             OK

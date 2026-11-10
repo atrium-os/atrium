@@ -100,21 +100,28 @@ boundaries and single-value holes are what sweeps catch and random inputs do not
   #114 failure mode: arm64 faults in a loop instead of panicking). That is the C write path
   and the stack-depth item T2, not the decoders; KASAN kernels need more `KSTACK_PAGES` for
   this workload, and the write path's depth is worth measuring on NODEBUG too.
-- Cost: B-tree lookups through the core, host x86_64, callgrind: decoder work 974M
-  instructions against C's 724M for the same 500k lookups, about 5% of the whole lookup
-  (block copies dominate). Causes: the per-probe bounds arithmetic in the node search, no
-  inlining across the C/Rust boundary, and a header decode the C glue still repeats. Wall
-  time within noise on a loaded host. Kernel timing on HVF is a follow-up.
+- Cost: B-tree lookups through the core, host x86_64, callgrind, 100k lookups in a
+  20k-entry blob-index tree. First cut: 4,765M instructions against C's 4,557M (about 5%
+  more). Causes: per-probe bounds arithmetic in the node search, a byte-at-a-time key
+  compare, the node header CRC computed twice per node (once in the C glue, once in Rust),
+  and no inlining across the C/Rust boundary. After the fixes (keys compared in 8-byte
+  big-endian words, the search loop's bounds math simplified, one CRC per node, and
+  `load_node_h` handing the decoded header to the lookup instead of decoding it again):
+  4,439M against C's 4,354M (the C side gained from the shared glue fix too), about 2%. The
+  rest is the call boundary; cross-language LTO is the remaining lever. Wall time within
+  noise on a loaded host. Kernel timing on HVF is a follow-up.
+- Rerun after the perf and bug fixes (2026-11-10): host suite 36/36 both ways, differential
+  replay and 120 s exploration clean, cloud VM e2e PASS on both modules.
 
 ## Bugs found on the way
 
 | where | what | status |
 |-------|------|--------|
-| `pack.c` `bloom_test` | probe count comes from the header (`bloom_hash_count`), up to 2^32 loops per lookup: a hostile image stalls the reader | Rust caps at 64 probes; C unchanged (reference only in the Rust build) |
+| `pack.c` `bloom_test` | probe count comes from the header (`bloom_hash_count`), up to 2^32 loops per lookup: a hostile image stalls the reader | fixed: both cap at 64 probes (the builder writes at most 16); `test_bloom_probe_cap` |
 | `kmod/tessera_fs.c` directory B-tree | leaf insert/remove walked `count` entries without a bounds check; `cap = count + 1` could overflow; an inner node with `count == 0` indexed `count - 1` | fixed: node blobs go through the Rust `dir_btree_node` check first |
 | `kmod/tessera_fs.c` `tessera_fs_dir_btree_walk` | recursion depth came from the image | fixed: bounded at 32 levels |
-| `kmod/tessera_fs.c` dir-btree insert and remove | recursion still unbounded | open |
-| `journal.c` | `sectors_for` in 32 bits wraps for a huge `body_length`; `journal_open` does not check `head_block`/`tail_block`; a huge body length can make the kernel `malloc(M_WAITOK)` up to 4 GB | sector count fixed in Rust; head/tail and the allocation cap open |
+| `kmod/tessera_fs.c` dir-btree insert and remove | recursion depth came from the image | fixed: bounded at 32 levels, as the walk |
+| `journal.c` | `sectors_for` in 32 bits wraps for a huge `body_length`; `journal_open` did not check `head_block`/`tail_block`; a huge body length could make the kernel `malloc(M_WAITOK)` up to 4 GB | fixed: open rejects head or tail outside 1..length-1; record bodies capped at 1 MiB on append and replay (C and Rust), which also keeps the 32-bit sector count from wrapping; `test_bad_head_tail_and_body_cap` |
 
 ## Not moved yet (phase 2)
 
@@ -124,8 +131,7 @@ boundaries and single-value holes are what sweeps catch and random inputs do not
   still link the C decoders.
 - The loader (`libsa`) stays C: no Rust in the boot loader for now.
 - The encoders and the write paths (btree insert/split, journal write, pack write).
-- HVF timing on the Mac VM; cross-language LTO; drop the repeated header decode in
-  `btree.c`.
+- HVF timing on the Mac VM; cross-language LTO.
 
 ## How to run
 

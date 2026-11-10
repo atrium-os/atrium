@@ -68,12 +68,14 @@ is not committed; the J1 input is, as `fuzz/corpus/fuzz_journal/regress-2026-11-
   largest frame 112 bytes, checked by `scripts/tessera-decode-check.sh`). The other three
   frames are still open.
 - Found during D3 (2026-11-10, [rust-decoders.md](../../atrium-tessera/docs/rust-decoders.md)):
-  the C pack reader's bloom probe count comes from the image (up to 2^32 loops per lookup);
-  the kmod's directory B-tree insert and remove walked `count` entries unchecked and an empty
-  inner node indexed `count - 1` (fixed by the Rust node check); directory B-tree walk
-  recursion was unbounded (fixed, 32 levels; insert and remove recursion still open);
-  `journal_open` does not check `head_block`/`tail_block`, and a huge record body length can
-  make the kernel `malloc(M_WAITOK)` up to 4 GB (open).
+  the C pack reader's bloom probe count comes from the image (up to 2^32 loops per lookup;
+  fixed, capped at 64 like the Rust); the kmod's directory B-tree insert and remove walked
+  `count` entries unchecked and an empty inner node indexed `count - 1` (fixed by the Rust
+  node check); directory B-tree walk, insert and remove recursion came from the image (all
+  three fixed, 32 levels); `journal_open` did not check `head_block`/`tail_block`, and a huge
+  record body length could make the kernel `malloc(M_WAITOK)` up to 4 GB (both fixed: open
+  rejects an out-of-ring head or tail, record bodies are capped at 1 MiB on write and read).
+  Each fix has a host test that fails without it.
 - KASAN run of the Tessera e2e workload (2026-11-10, first time Tessera ran under KASAN):
   `tessera_journal_tx_begin` read past its short reason-tag literal (16-byte copy of
   `"log_drain"`). Fixed, with a host regression test. A second KASAN run hung `cp` on a kernel stack

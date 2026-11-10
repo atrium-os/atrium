@@ -160,8 +160,11 @@ tessera_btree_kind_name(uint8_t kind)
 	}
 }
 
+/* load_node, also handing back the decoded header of an accepted node, so
+ * a caller does not decode (and CRC) it a second time. */
 static int
-load_node(tessera_btree_t *t, uint64_t sector, uint8_t *block)
+load_node_h(tessera_btree_t *t, uint64_t sector, uint8_t *block,
+    tessera_btree_node_header_t *out_h)
 {
 	int r = t->io.read_block(t->io.ctx, sector, block);
 	if (r != 0) {
@@ -290,7 +293,15 @@ load_node(tessera_btree_t *t, uint64_t sector, uint8_t *block)
 	}
 #endif
 	t->last_fail = TESSERA_BTREE_FAIL_NONE;
+	*out_h = h;
 	return TESSERA_OK;
+}
+
+static int
+load_node(tessera_btree_t *t, uint64_t sector, uint8_t *block)
+{
+	tessera_btree_node_header_t h;
+	return load_node_h(t, sector, block, &h);
 }
 
 tessera_btree_fail_t
@@ -577,10 +588,9 @@ tessera_btree_get_impl(tessera_btree_t *t, const void *key, void *out_value,
 	if (tr) { tr->depth = 0; tr->leaf_entries = 0; }
 	for (uint32_t depth = 0; depth < MAX_DEPTH; depth++) {
 		if (tr && depth < 16) { tr->path[depth] = cur; tr->depth = depth + 1; }
-		int r = load_node(t, cur, block);
-		if (r != TESSERA_OK) { _rc = r; goto out; }
 		tessera_btree_node_header_t h;
-		(void)read_header(block, &h);
+		int r = load_node_h(t, cur, block, &h);
+		if (r != TESSERA_OK) { _rc = r; goto out; }
 		if (h.node_kind == 0) {                  /* leaf */
 			if (tr) tr->leaf_entries = h.entry_count;
 			int exact;
