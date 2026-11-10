@@ -35,6 +35,7 @@
 #include "tessera/error.h"
 #include "tessera/format.h"
 #include "tessera_compat.h"
+#include "tessera_rs.h"
 
 #define BLOB_DATA_ALIGN  64u
 #define BLOOM_BITS_PER_BLOB 10u
@@ -70,6 +71,7 @@ bloom_set(uint8_t *bloom, size_t bloom_bits, uint32_t k_hashes,
 	}
 }
 
+#ifndef TESSERA_RUST_DECODE
 static int
 bloom_test(const uint8_t *bloom, size_t bloom_bits, uint32_t k_hashes,
            const uint8_t hash[32])
@@ -82,6 +84,7 @@ bloom_test(const uint8_t *bloom, size_t bloom_bits, uint32_t k_hashes,
 	}
 	return 1;
 }
+#endif
 
 /* ── Builder ─────────────────────────────────────────────────────── */
 
@@ -290,6 +293,74 @@ tessera_pack_finalize(tessera_pack_builder_t *b,
 
 /* ── Reader ──────────────────────────────────────────────────────── */
 
+#ifdef TESSERA_RUST_DECODE
+/* D3: the reader in Rust (tessera_rs.h, rs/tessera-decode/src/pack.rs).
+ * C keeps the buffer, the decoded header (for pack_id) and the validated
+ * geometry; every byte of the pack is read by Rust. */
+struct tessera_pack_reader {
+	const uint8_t          *data;
+	size_t                  len;
+	tessera_pack_header_t   header;
+	tessera_rs_pack_geom_t  geom;
+};
+
+tessera_pack_reader_t *
+tessera_pack_open(const uint8_t *data, size_t len)
+{
+	if (data == NULL || len < TESSERA_SECTOR_SIZE * 2) return NULL;
+	tessera_pack_reader_t *r = tessera_zalloc(sizeof *r);
+	if (r == NULL) return NULL;
+	if (tessera_rs_pack_open(data, len, &r->geom, &r->header) != TESSERA_OK) {
+		tessera_free(r);
+		return NULL;
+	}
+	r->data = data;
+	r->len  = len;
+	return r;
+}
+
+uint32_t
+tessera_pack_blob_count(const tessera_pack_reader_t *r)
+{
+	return r ? r->header.blob_count : 0;
+}
+
+const uint8_t *
+tessera_pack_pack_id(const tessera_pack_reader_t *r)
+{
+	return (r->header.pack_id);
+}
+
+int
+tessera_pack_bloom_might_contain(const tessera_pack_reader_t *r,
+                                 const tessera_hash_t blob_hash)
+{
+	if (r == NULL) return 1;
+	return tessera_rs_pack_bloom_might_contain(r->data, r->len, &r->geom,
+	    blob_hash);
+}
+
+int
+tessera_pack_lookup(const tessera_pack_reader_t *r,
+                    const tessera_hash_t blob_hash,
+                    const uint8_t **out_bytes, uint32_t *out_len)
+{
+	if (r == NULL) return TESSERA_EINVAL;
+	return tessera_rs_pack_lookup(r->data, r->len, &r->geom, blob_hash,
+	    out_bytes, out_len);
+}
+
+int
+tessera_pack_blob_hash_at(const tessera_pack_reader_t *r, uint32_t index,
+                          tessera_hash_t out)
+{
+	if (r == NULL) return TESSERA_EINVAL;
+	return tessera_rs_pack_blob_hash_at(r->data, r->len, &r->geom, index,
+	    out);
+}
+
+#else /* !TESSERA_RUST_DECODE */
+
 struct tessera_pack_reader {
 	const uint8_t          *data;
 	size_t                  len;
@@ -464,6 +535,8 @@ tessera_pack_blob_hash_at(const tessera_pack_reader_t *r, uint32_t index,
 	memcpy(out, e, 32);
 	return TESSERA_OK;
 }
+
+#endif /* TESSERA_RUST_DECODE */
 
 void
 tessera_pack_close(tessera_pack_reader_t *r)

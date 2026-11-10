@@ -64,6 +64,24 @@ TESTS=$(awk '/^TEST_NAMES=/{f=1;next} f&&/^$/{exit} f{gsub(/\\/,"");print}' \
 CC=${CC:-cc}
 BASE_CFLAGS="-g -fno-strict-aliasing -I$CORE/include -I$CORE/src -Wall"
 
+# Linux has SHA-256 in libmd (apt: libmd-dev); macOS resolves it through
+# CommonCrypto in hash.c. CORE_LIBS overrides.
+LIBS="${CORE_LIBS-}"
+[ -z "${CORE_LIBS+x}" ] && [ "$(uname)" = Linux ] && LIBS="-lmd"
+BASELIBS="$LIBS"
+
+# RUST_DECODE=1: the D3 build. The on-disk decoders come from Rust
+# (rs/tessera-decode, linked as a static library) and the C entry points
+# forward to them, as in tessera_fs.ko. Without it: the C decoders.
+SUFFIX=""
+if [ "${RUST_DECODE:-0}" = 1 ]; then
+    RSLIBS=$(sh "$(dirname "$0")/tessera-decode-lib.sh") || exit 1
+    BASE_CFLAGS="$BASE_CFLAGS -DTESSERA_RUST_DECODE"
+    LIBS="$LIBS $RSLIBS"
+    SUFFIX="-rs"
+    echo "== RUST_DECODE=1: decoders from rs/tessera-decode =="
+fi
+
 # -fno-sanitize-recover: UBSAN's default is to PRINT and CARRY ON, which means a
 # test still exits 0 and the finding scrolls past. Abort instead, so an
 # undefined-behaviour hit fails the suite like any other failure.
@@ -105,7 +123,7 @@ run_suite() {
         [ -f "$CORE/tests/$t.c" ] || { echo "== $t: NO SOURCE, skipped =="; continue; }
         # shellcheck disable=SC2086
         if ! $CC $cflags -o "$obj/$t" "$CORE/tests/$t.c" "$obj/libtessera_core.a" \
-             2>"$obj/$t.buildlog"; then
+             $LIBS 2>"$obj/$t.buildlog"; then
             echo "== [$label] $t: BUILD FAILED =="
             sed 's/^/     /' "$obj/$t.buildlog" | head -6
             fail=$((fail+1)); total_failed="$total_failed $label/$t"
@@ -132,7 +150,7 @@ run_suite() {
     return 0
 }
 
-run_suite plain "$CORE/build-host" "-O2" || exit $?
+run_suite plain$SUFFIX "$CORE/build-host$SUFFIX" "-O2" || exit $?
 
 if [ "$WANT_SAN" = 1 ]; then
     # ★ Probe with a REAL program. The first version of this compiled empty
@@ -144,7 +162,7 @@ if [ "$WANT_SAN" = 1 ]; then
     if echo 'int main(void){return 0;}' \
        | $CC -fsanitize=address,undefined -x c -o /dev/null - 2>/dev/null; then
         echo
-        run_suite asan+ubsan "$CORE/build-host-san" "$SAN_CFLAGS" || exit $?
+        run_suite asan+ubsan$SUFFIX "$CORE/build-host-san$SUFFIX" "$SAN_CFLAGS" || exit $?
     else
         echo
         echo "WARNING: $CC cannot build with -fsanitize=address,undefined — sanitizer pass SKIPPED"
@@ -163,11 +181,13 @@ fi
 # permanent regression test. #124's out-of-bounds pack geometry is in there.
 if [ "$WANT_SAN" = 1 ] && [ -d "$CORE/fuzz/corpus" ]; then
     echo
-    if sh "$(dirname "$0")/core-fuzz.sh" --replay-only > "$CORE/build-host/replay.log" 2>&1; then
-        grep -E "^== REPLAY" "$CORE/build-host/replay.log" | sed 's/^/   /'
+    mkdir -p "$CORE/build-host$SUFFIX"
+    if FUZZ_LIBS="$BASELIBS" sh "$(dirname "$0")/core-fuzz.sh" --replay-only \
+           > "$CORE/build-host$SUFFIX/replay.log" 2>&1; then
+        grep -E "^== REPLAY" "$CORE/build-host$SUFFIX/replay.log" | sed 's/^/   /'
     else
         echo "FUZZ REPLAY FAILED:"
-        tail -25 "$CORE/build-host/replay.log" | sed 's/^/     /'
+        tail -25 "$CORE/build-host$SUFFIX/replay.log" | sed 's/^/     /'
         total_fail=$((total_fail+1)); total_failed="$total_failed fuzz-replay"
     fi
 fi

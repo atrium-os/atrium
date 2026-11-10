@@ -1,0 +1,18 @@
+[package]
+name         = "tessera-decode"
+description  = "Tessera on-disk decoders in safe no_std Rust, shared by tessera_fs.ko and userspace (D3)"
+version.workspace    = true
+license.workspace    = true
+repository.workspace = true
+# The kernel build (freebsd-kpi-rs kmod.rust.mk) compiles these same files with
+# --edition 2024, so the crate is written for 2024 here too.
+edition      = "2024"
+rust-version = "1.85"
+
+[lib]
+path = "src/lib.rs"
+
+[features]
+# Export the C ABI (tessera_rs_*). On for the C core and the kernel module;
+# Rust users call the safe API directly.
+ffi = []

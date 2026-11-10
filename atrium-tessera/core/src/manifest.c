@@ -30,6 +30,7 @@
 #include "tessera/hash.h"
 
 #include "tessera_compat.h"
+#include "tessera_rs.h"
 
 #define HEADER_SIZE 32u
 
@@ -422,6 +423,126 @@ struct tessera_manifest_parser {
 	size_t                     body_len;
 };
 
+#ifdef TESSERA_RUST_DECODE
+/* D3: the parser in Rust (tessera_rs.h). The C below is the reference. */
+tessera_manifest_parser_t *
+tessera_manifest_parse(const uint8_t *data, size_t len)
+{
+	if (data == NULL || len < HEADER_SIZE) return NULL;
+	tessera_manifest_parser_t *p = tessera_zalloc(sizeof *p);
+	if (p == NULL) return NULL;
+	if (tessera_rs_manifest_parse(data, len, &p->header) != TESSERA_OK) {
+		tessera_free(p);
+		return NULL;
+	}
+	p->body     = data + HEADER_SIZE;
+	p->body_len = len - HEADER_SIZE;
+	return p;
+}
+
+tessera_manifest_kind_t
+tessera_manifest_parser_kind(const tessera_manifest_parser_t *p)
+{
+	return p ? (tessera_manifest_kind_t)p->header.manifest_kind : 0;
+}
+
+uint64_t
+tessera_manifest_parser_size(const tessera_manifest_parser_t *p)
+{
+	return p ? p->header.logical_size : 0;
+}
+
+uint32_t
+tessera_manifest_parser_count(const tessera_manifest_parser_t *p)
+{
+	return p ? p->header.entry_count : 0;
+}
+
+/* Every accessor hands the stored header and the body back to Rust, which
+ * does all the walking (rs/tessera-decode/src/manifest.rs). */
+#define RS_P(p)	&(p)->header, (p)->body, (p)->body_len
+
+int
+tessera_manifest_chunk_at(const tessera_manifest_parser_t *p,
+                          uint32_t index, tessera_chunk_record_t *out)
+{
+	if (p == NULL) return TESSERA_EINVAL;
+	return tessera_rs_manifest_chunk_at(RS_P(p), index, out);
+}
+
+int
+tessera_manifest_tree_at(const tessera_manifest_parser_t *p,
+                         uint32_t index, tessera_tree_record_t *out)
+{
+	if (p == NULL) return TESSERA_EINVAL;
+	return tessera_rs_manifest_tree_at(RS_P(p), index, out);
+}
+
+int
+tessera_manifest_dir_bucket_at(const tessera_manifest_parser_t *p,
+                               uint32_t index,
+                               tessera_dir_bucket_record_t *out)
+{
+	if (p == NULL) return TESSERA_EINVAL;
+	return tessera_rs_manifest_dir_bucket_at(RS_P(p), index, out);
+}
+
+int
+tessera_manifest_inline_data(const tessera_manifest_parser_t *p,
+                             const uint8_t **out_data, size_t *out_len)
+{
+	if (p == NULL) return TESSERA_EINVAL;
+	return tessera_rs_manifest_inline_data(RS_P(p), out_data, out_len);
+}
+
+int
+tessera_manifest_xattr_at(const tessera_manifest_parser_t *p, uint32_t idx,
+                          const char **out_name, uint16_t *out_name_len,
+                          const uint8_t **out_value, uint16_t *out_value_len)
+{
+	if (p == NULL) return TESSERA_EINVAL;
+	return tessera_rs_manifest_xattr_at(RS_P(p), idx, out_name,
+	    out_name_len, out_value, out_value_len);
+}
+
+int
+tessera_manifest_dir_btree_is_leaf(const tessera_manifest_parser_t *p)
+{
+	if (p == NULL) return -1;
+	return tessera_rs_manifest_dir_btree_is_leaf(RS_P(p));
+}
+
+int
+tessera_manifest_dir_btree_inner_at(const tessera_manifest_parser_t *p,
+                                    uint32_t idx, tessera_hash_t out_child)
+{
+	if (p == NULL) return TESSERA_EINVAL;
+	return tessera_rs_manifest_dir_btree_inner_at(RS_P(p), idx, out_child);
+}
+
+int
+tessera_manifest_dirent_at(const tessera_manifest_parser_t *p, uint32_t idx,
+                           uint64_t *out_inode, const char **out_name,
+                           uint16_t *out_name_len)
+{
+	if (p == NULL) return TESSERA_EINVAL;
+	return tessera_rs_manifest_dirent_at(RS_P(p), idx, out_inode, out_name,
+	    out_name_len);
+}
+
+int
+tessera_manifest_dir_btree_leaf_at(const tessera_manifest_parser_t *p,
+                                   uint32_t idx, uint64_t *out_inode,
+                                   const char **out_name, uint16_t *out_name_len)
+{
+	if (p == NULL) return TESSERA_EINVAL;
+	return tessera_rs_manifest_dir_btree_leaf_at(RS_P(p), idx, out_inode,
+	    out_name, out_name_len);
+}
+#undef RS_P
+
+#else /* !TESSERA_RUST_DECODE */
+
 tessera_manifest_parser_t *
 tessera_manifest_parse(const uint8_t *data, size_t len)
 {
@@ -635,6 +756,8 @@ tessera_manifest_dir_btree_leaf_at(const tessera_manifest_parser_t *p,
 	}
 	return TESSERA_ENOENT;
 }
+
+#endif /* TESSERA_RUST_DECODE */
 
 void
 tessera_manifest_parser_free(tessera_manifest_parser_t *p)

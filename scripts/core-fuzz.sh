@@ -56,6 +56,20 @@ SRCS="error.c hash.c crc.c codec.c cdc.c btree.c manifest.c pack.c journal.c
       b3_blake3.c b3_blake3_portable.c b3_shim.c tessera_reader.c"
 
 INC="-I$CORE/include -I$CORE/src"
+
+# RUST_DECODE=1: build the core the way tessera_fs.ko is built (D3), with the
+# on-disk decoders from rs/tessera-decode. The fuzzers then exercise the Rust
+# decoders under the same harnesses; the C code around them is still
+# instrumented. (fuzz_diff compares the two implementations directly and
+# always links both; see below.)
+RSLIBS=""
+if [ "${RUST_DECODE:-0}" = 1 ]; then
+    RSLIBS=$(sh "$ROOT/scripts/tessera-decode-lib.sh") || exit 2
+    INC="$INC -DTESSERA_RUST_DECODE"
+    OBJ="$OBJ-rs"
+    echo "core-fuzz: RUST_DECODE=1, decoders from rs/tessera-decode"
+fi
+FUZZ_LIBS="${FUZZ_LIBS:-} $RSLIBS"
 mkdir -p "$OBJ" "$ARTIFACTS" || exit 2
 
 # build_core <objdir> <cc> <cflags...>
@@ -150,12 +164,14 @@ EOF
             #
             # ★ Log to a FILE and tail the file. Piping into `tail` would make
             # $? the status of tail — 0 whether or not the fuzzer crashed.
-            UBSAN_OPTIONS=print_stacktrace=1 \
             # ★ -timeout: libFuzzer's default is 1200s per input. Journal
             # replay loops on values read off disk, so a non-terminating input
             # is a REAL possible finding — and at the default the fuzzer would
             # hang for 20 minutes rather than report it. 20s is far above any
-            # legitimate input here.
+            # legitimate input here. (This comment used to sit between the
+            # UBSAN_OPTIONS line and the command, which ended the command at
+            # the assignment: the fuzzer ran without it.)
+            UBSAN_OPTIONS=print_stacktrace=1 \
             "$OBJ/$t" "$CORPUS/$t" -max_total_time="$SECS" -max_len="$MAXLEN" \
                 -timeout=20 -use_value_profile=1 -print_final_stats=1 \
                 -artifact_prefix="$ARTIFACTS/$t-" > "$OBJ/$t.explore.log" 2>&1

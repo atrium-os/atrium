@@ -1,0 +1,15 @@
+[package]
+name         = "tessera-decode-c"
+description  = "tessera-decode's C ABI as a static library, for the userspace C core built with -DTESSERA_RUST_DECODE"
+version.workspace    = true
+license.workspace    = true
+repository.workspace = true
+edition      = "2024"
+rust-version = "1.85"
+
+[lib]
+crate-type = ["staticlib"]
+path = "src/lib.rs"
+
+[dependencies]
+tessera-decode = { path = "../tessera-decode", features = ["ffi"] }

@@ -33,6 +33,19 @@ CFLAGS+=    -I${.CURDIR}/../core/include
 CFLAGS+=    -I${.CURDIR}/../core/src
 CFLAGS+=    -DTESSERA_KERNEL=1
 
+# ★ D3 (kernel security review 2026-11-07): the on-disk decoders are Rust.
+# tessera_decode.rs is the crate root for ../rs/tessera-decode/src; built by
+# freebsd-kpi-rs's kmod.rust.mk (sys/rust in the source tree, our patches in
+# kmod-rust-spike/kpi-patches; scripts/tessera-kmod-rust.sh sets it up). With
+# TESSERA_RUST_DECODE the C decoders in codec.c, manifest.c, pack.c, btree.c
+# and journal.c become calls into it (../core/src/tessera_rs.h).
+#
+# TESSERA_C_DECODE=1 builds the old all-C module, for comparison runs only.
+.if !defined(TESSERA_C_DECODE) || empty(TESSERA_C_DECODE)
+CFLAGS+=    -DTESSERA_RUST_DECODE
+RUST_SRCS=  tessera_decode.rs
+.endif
+
 # ★ #94: BLAKE3 NEON in the kernel, arm64 only.
 #
 # NEON/ASIMD is MANDATORY in ARMv8-A, so there is no runtime feature test to

@@ -5212,6 +5212,12 @@ make.py ... installkernel DESTDIR=$HOME/stage -DNO_ROOT KODIR=/boot/kernel.atriu
 - Rust kmods: `SRC=~/freebsd-src OBJ=~/obj sh scripts/rust-kmod-spike.sh prepare|build|deploy|test`
   (`KERNCONF=` picks the kernel; kmod-rust-spike/README.md). `prepare` checks out
   freebsd-kpi-rs into `$SRC/sys/rust` and applies `kmod-rust-spike/kpi-patches`.
+- Tessera with Rust decoders (D3): `sh scripts/tessera-kmod-rust.sh prepare` (same as the
+  spike's), then `build` gives `atrium-tessera/kmod/out/<target>-<kernconf>/tessera_fs.ko`
+  (Rust decoders) and `tessera_fs-c.ko` (all C, `TESSERA_C_DECODE=1`). Host side:
+  `scripts/tessera-decode-check.sh` (tests, no-panic and frame check),
+  `RUST_DECODE=1 scripts/core-host-tests.sh`, `scripts/tessera-decode-diff.sh [-t secs]`
+  (C vs Rust); atrium-tessera/docs/rust-decoders.md.
 - syzkaller against the cloud VM: `type: isolated`, target `127.0.0.1:2222`. The guest needs
   `/root/bin/dmesg` (a `dmesg -w` emulation; FreeBSD's has no `-w`), `PATH` with `/root/bin`
   first in `/root/.ssh/environment`, and `PermitUserEnvironment PATH` in sshd_config.

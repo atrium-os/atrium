@@ -79,6 +79,7 @@
 #include "tessera/manifest.h"
 #include "tessera/pack.h"
 #include "tessera/volume.h"
+#include "tessera_rs.h"	/* D3: Rust on-disk decoders (core/src) */
 
 MALLOC_DEFINE(M_TESSERA, "tessera", "Tessera filesystem");
 
@@ -98,6 +99,16 @@ MALLOC_DEFINE(M_TESSERA, "tessera", "Tessera filesystem");
  */
 static SYSCTL_NODE(_kern, OID_AUTO, tessera,
     CTLFLAG_RW | CTLFLAG_MPSAFE, NULL, "Tessera filesystem");
+/* Which on-disk decoders this module was built with (D3,
+ * atrium-tessera/docs/rust-decoders.md): "rust", or "c" for a
+ * TESSERA_C_DECODE comparison build. */
+#ifdef TESSERA_RUST_DECODE
+static const char tessera_decoders[] = "rust";
+#else
+static const char tessera_decoders[] = "c";
+#endif
+SYSCTL_CONST_STRING(_kern_tessera, OID_AUTO, decoders, CTLFLAG_RD,
+    tessera_decoders, "On-disk decoders: rust or c");
 /* Singleton ref to the most-recently-mounted tessera. Used by debug /
  * test sysctls (kern.tessera.repack_one) that need to reach the live
  * mount without iterating mountlist. NULL when nothing's mounted. */
@@ -24086,6 +24097,22 @@ tessera_fs_dir_btree_decode(uint8_t *blob, uint32_t blob_len,
     int *out_leaf, const uint8_t **out_body, size_t *out_body_len,
     uint32_t *out_count)
 {
+#ifdef TESSERA_RUST_DECODE
+	/* ★ D3: the whole node is checked in Rust before any caller walks it
+	 * (rs/tessera-decode/src/manifest.rs dir_btree_node). The header's
+	 * entry_count used to be trusted as is: leaf insert/remove walked that
+	 * many entries with no bounds check and sized arrays as count + 1 (0 for
+	 * 2^32-1), and an inner node with count 0 indexed child count - 1, so a
+	 * crafted directory blob read and wrote past kernel heap buffers. Now
+	 * *out_count entries are guaranteed to lie inside *out_body, and an inner
+	 * node has at least one child. */
+	int leaf = 0;
+	if (tessera_rs_dir_btree_node(blob, blob_len, &leaf, out_body,
+	    out_body_len, out_count) != TESSERA_OK)
+		return (EIO);
+	*out_leaf = leaf;
+	return (0);
+#else
 	if (blob_len < 32 + 8) return (EIO);
 	tessera_manifest_parser_t *p = tessera_manifest_parse(blob, blob_len);
 	if (p == NULL) return (EIO);
@@ -24100,6 +24127,7 @@ tessera_fs_dir_btree_decode(uint8_t *blob, uint32_t blob_len,
 	*out_body = body + 8;
 	*out_body_len = blob_len - 32 - 8;
 	return (0);
+#endif
 }
 
 /* Walk a leaf node: callback per (inode_no, name, name_len). Returns
@@ -24124,11 +24152,31 @@ tessera_fs_dir_btree_walk_leaf(const uint8_t *body, size_t body_len,
 	return (0);
 }
 
-/* Recursive walker. Reads node, dispatches by kind. */
+/* Recursive walker. Reads node, dispatches by kind.
+ *
+ * ★ Depth-bounded, like tessera_fs_dir_btree_lookup (32). Content
+ * addressing rules out a cycle, but not a crafted chain of thousands of
+ * one-child inner nodes, and each level here is a kernel stack frame plus a
+ * held blob: unbounded, that chain overflowed the 16 KiB kernel stack. A
+ * tree deeper than 32 could never be looked up anyway. */
+#define TESSERA_DIR_BTREE_MAX_DEPTH 32
+static int tessera_fs_dir_btree_walk_d(struct tessera_mount *,
+    const tessera_hash_t, tessera_dirent_cb_t, void *, int);
+
 static int
 tessera_fs_dir_btree_walk(struct tessera_mount *tmp_,
     const tessera_hash_t node_hash, tessera_dirent_cb_t cb, void *ctx)
 {
+	return (tessera_fs_dir_btree_walk_d(tmp_, node_hash, cb, ctx, 0));
+}
+
+static int
+tessera_fs_dir_btree_walk_d(struct tessera_mount *tmp_,
+    const tessera_hash_t node_hash, tessera_dirent_cb_t cb, void *ctx,
+    int depth)
+{
+	if (depth >= TESSERA_DIR_BTREE_MAX_DEPTH)
+		return (EIO);
 	uint8_t  *blob = NULL;
 	uint32_t  blob_len = 0;
 	if (tessera_fs_fetch_blob(tmp_, node_hash, &blob, &blob_len) != 0)
@@ -24151,7 +24199,8 @@ tessera_fs_dir_btree_walk(struct tessera_mount *tmp_,
 			}
 			tessera_hash_t child;
 			memcpy(child, body + off + 8, TESSERA_HASH_SIZE);
-			rc = tessera_fs_dir_btree_walk(tmp_, child, cb, ctx);
+			rc = tessera_fs_dir_btree_walk_d(tmp_, child, cb, ctx,
+			    depth + 1);
 			off += 8 + TESSERA_HASH_SIZE;
 		}
 	}

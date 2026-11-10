@@ -37,6 +37,7 @@
 #include "tessera/format.h"
 
 #include "tessera_compat.h"
+#include "tessera_rs.h"
 
 #define BLOCK_SIZE     TESSERA_SECTOR_SIZE
 #define HEADER_SIZE    64u                 /* sizeof(tessera_btree_node_header_t) */
@@ -168,6 +169,44 @@ load_node(tessera_btree_t *t, uint64_t sector, uint8_t *block)
 		t->last_fail_sector = sector;
 		return TESSERA_EIO;
 	}
+#ifdef TESSERA_RUST_DECODE
+	/* D3: every check below, in Rust (rs/tessera-decode/src/btree.rs).
+	 * Only the diagnostics stay here. */
+	tessera_btree_node_header_t h;
+	memset(&h, 0, sizeof h);
+	int fail = TESSERA_BTREE_FAIL_NONE;
+	uint8_t found_kind = 0;
+	if (tessera_rs_btree_node_check(block, BLOCK_SIZE, t->tree_kind,
+	    t->key_size, t->value_size, t->leaf_fanout, t->inner_fanout,
+	    &h, &fail, &found_kind) != TESSERA_OK) {
+		if (fail == TESSERA_BTREE_FAIL_KIND) {
+			if (!t->quiet_kind_mismatch)
+				tessera_debugf("btree load_node: sector %llu holds a "
+				    "%s node but was reached as %s — that root is "
+				    "STALE and its tree's contents are LOST. Run "
+				    "tessera-fsck on an UNMOUNTED volume.\n",
+				    (unsigned long long)sector,
+				    tessera_btree_kind_name(found_kind),
+				    tessera_btree_kind_name(t->tree_kind));
+			t->last_fail_found_kind = found_kind;
+		} else if (h.magic[0] != 0) {
+			/* The header decoded; the count or geometry did not fit. */
+			tessera_debugf("btree load_node: sector %llu refused: %s "
+			    "node claims %u entries, key=%u val=%u; this %s tree "
+			    "holds at most %u/%u entries, key=%u val=%u\n",
+			    (unsigned long long)sector,
+			    h.node_kind == 0 ? "leaf" : "internal",
+			    (unsigned)h.entry_count, (unsigned)h.key_size,
+			    (unsigned)h.value_size,
+			    tessera_btree_kind_name(t->tree_kind),
+			    (unsigned)t->leaf_fanout, (unsigned)t->inner_fanout,
+			    (unsigned)t->key_size, (unsigned)t->value_size);
+		}
+		t->last_fail = (tessera_btree_fail_t)fail;
+		t->last_fail_sector = sector;
+		return TESSERA_ECORRUPT;
+	}
+#else
 	tessera_btree_node_header_t h;
 	if (read_header(block, &h) != TESSERA_OK) {
 		t->last_fail = TESSERA_BTREE_FAIL_HEADER;
@@ -249,6 +288,7 @@ load_node(tessera_btree_t *t, uint64_t sector, uint8_t *block)
 		t->last_fail_sector = sector;
 		return TESSERA_ECORRUPT;
 	}
+#endif
 	t->last_fail = TESSERA_BTREE_FAIL_NONE;
 	return TESSERA_OK;
 }
@@ -378,6 +418,10 @@ search_leaf(const uint8_t *block, uint32_t entry_count,
             uint32_t key_size, uint32_t entry_size,
             const void *key, int *out_exact)
 {
+#ifdef TESSERA_RUST_DECODE
+	return tessera_rs_btree_search(block, BLOCK_SIZE, entry_count, key_size,
+	    entry_size, key, out_exact);
+#else
 	*out_exact = 0;
 	int lo = 0, hi = (int)entry_count - 1, best = -1;
 	while (lo <= hi) {
@@ -390,6 +434,7 @@ search_leaf(const uint8_t *block, uint32_t entry_count,
 		else        { hi = mid - 1; }
 	}
 	return best;
+#endif
 }
 
 /* For internal nodes: route a probe-key down to a child. Returns the

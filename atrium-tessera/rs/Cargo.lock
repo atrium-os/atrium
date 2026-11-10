@@ -133,6 +133,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "tessera-decode"
+version = "0.1.0"
+
+[[package]]
+name = "tessera-decode-c"
+version = "0.1.0"
+dependencies = [
+ "tessera-decode",
+]
+
+[[package]]
 name = "tessera-sys"
 version = "0.1.0"
 dependencies = [

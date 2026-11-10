@@ -28,7 +28,7 @@ carillon-kmod. "Reachable by" means who can trigger it on a default Atrium insta
 | **Z1** | atrium-zram | `kern.zram.bench` and `kern.zram.selftest` were `CTLFLAG_RD` handlers anyone could read. The bench decompresses live swapped-out pages of every process | any local user, any jail | DoS, compressed-size side channel on other processes' memory | **fixed**: unjailed root only (`PRIV_SYSCTL_DEBUG`) |
 | C1 | carillon-kmod | `CARILLON_WAIT` converted `timeout_ms` to ticks in an `int`; above ~24.8 days at hz=1000 it went negative | root (node is 0600) | odd sleep timing | **fixed**: clamp |
 | J1 | atrium-tessera core | `write_record` computed `body + in_first` with `body == NULL` and length 0: undefined behaviour in C (UBSAN), harmless in practice since nothing is read | fuzzer input | none observed | **fixed** |
-| T2 | atrium-tessera | stack frames over the 1 KiB warning: `tessera_decode_pack_extent_list` 4160 bytes, `tessera_fs_gc_data_zone_ex` 2896, `tessera_blake3_256` 2000, `tessera_vop_readdir` 1808. The kernel stack is 16 KiB on arm64 and a VFS call chain already uses a good part of it | normal use | kernel stack overflow under deep call chains | open (medium; move the buffers to the heap) |
+| T2 | atrium-tessera | stack frames over the 1 KiB warning: `tessera_decode_pack_extent_list` 4160 bytes, `tessera_fs_gc_data_zone_ex` 2896, `tessera_blake3_256` 2000, `tessera_vop_readdir` 1808. The kernel stack is 16 KiB on arm64 and a VFS call chain already uses a good part of it | normal use | kernel stack overflow under deep call chains | **partly fixed** 2026-11-10: the pack extent list decoder is Rust now (D3) and needs 112 bytes; `gc_data_zone_ex`, `blake3_256` and `vop_readdir` remain (medium; move the buffers to the heap) |
 | F1 | fresco-kmod, carillon-kmod | any opener can map the whole ivshmem region | root (0600, dev transport only) | none on a production install | open (by design: VM transport) |
 
 The two most serious bugs (V1, V2) are in the virtio-gpu driver that the Mac VM uses for
@@ -64,9 +64,22 @@ is not committed; the J1 input is, as `fuzz/corpus/fuzz_journal/regress-2026-11-
 
 ## 4. Follow-ups
 
-- T2 stack frames: worth doing before the Tessera decoders move to Rust (D3), since the Rust
-  port would otherwise copy the same layout.
+- T2 stack frames: the decoder frame went with D3 (the Rust decoders read fields in place;
+  largest frame 112 bytes, checked by `scripts/tessera-decode-check.sh`). The other three
+  frames are still open.
+- Found during D3 (2026-11-10, [rust-decoders.md](../../atrium-tessera/docs/rust-decoders.md)):
+  the C pack reader's bloom probe count comes from the image (up to 2^32 loops per lookup);
+  the kmod's directory B-tree insert and remove walked `count` entries unchecked and an empty
+  inner node indexed `count - 1` (fixed by the Rust node check); directory B-tree walk
+  recursion was unbounded (fixed, 32 levels; insert and remove recursion still open);
+  `journal_open` does not check `head_block`/`tail_block`, and a huge record body length can
+  make the kernel `malloc(M_WAITOK)` up to 4 GB (open).
+- KASAN run of the Tessera e2e workload (2026-11-10, first time Tessera ran under KASAN):
+  `tessera_journal_tx_begin` read past its short reason-tag literal (16-byte copy of
+  `"log_drain"`). Fixed, with a host regression test. A second KASAN run hung `cp` on a kernel stack
+  overflow: a timer interrupt landed while the write path was deep in
+  `blake3_hash_many_neon`, and KASAN's frames took it past 16 KiB (T2, #114). Open.
 - G2 per-client accounting, G3 static assert, V6 offset spaces: small, not urgent.
-- `scripts/core-fuzz.sh`: the `UBSAN_OPTIONS=... \` line is followed by a comment, so the
-  variable never reaches the command. Pre-existing; fix with the next fuzz change.
+- `scripts/core-fuzz.sh`: the `UBSAN_OPTIONS=... \` line was followed by a comment, so the
+  variable never reached the command. Fixed 2026-11-10 with the D3 fuzz changes.
 - Syzkaller descriptions for the GPU and Tessera ioctls, after the spike run proves the setup.

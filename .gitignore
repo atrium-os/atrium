@@ -119,7 +119,12 @@ vm/atrium-apps.img
 atrium-tessera/core/build-host/
 atrium-tessera/core/build-host-san/
 atrium-tessera/core/build-fuzz/
+atrium-tessera/core/build-fuzz-rs/
+atrium-tessera/core/build-host-rs/
+atrium-tessera/core/build-host-san-rs/
+atrium-tessera/core/build-diff/
 atrium-tessera/core/fuzz/artifacts/
 
 # Rust kmod spike build outputs (scripts/rust-kmod-spike.sh build).
 kmod-rust-spike/out/
+atrium-tessera/kmod/out/

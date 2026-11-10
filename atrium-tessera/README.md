@@ -25,8 +25,11 @@ atrium-tessera/
 # tessera-core (userspace static + shared lib)
 cd core && make
 
-# tessera-fs.ko (FreeBSD kernel module; build inside the VM)
-cd kmod && make
+# tessera-fs.ko (FreeBSD kernel module). The on-disk decoders are Rust
+# (rs/tessera-decode, docs/rust-decoders.md), so the build needs
+# freebsd-kpi-rs in sys/rust; from a Linux host:
+sh ../scripts/tessera-kmod-rust.sh prepare && sh ../scripts/tessera-kmod-rust.sh build
+# all-C module, for comparison only: TESSERA_C_DECODE=1
 
 # Rust crates + tools (cross-compile from host)
 cd rs    && cargo build --release --target aarch64-unknown-freebsd
@@ -38,6 +41,8 @@ cd tools && cargo build --release --target aarch64-unknown-freebsd
 ```sh
 cd core && make check         # C unit tests
 cd rs   && cargo test         # Rust unit + property tests
+sh ../scripts/tessera-decode-check.sh       # decoders: no panic path, frames <= 512 B
+sh ../scripts/tessera-decode-diff.sh        # decoders: C vs Rust on every corpus
 cd tests/property && cargo test --release
 ```
 

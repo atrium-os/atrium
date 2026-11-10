@@ -353,6 +353,27 @@ test_corrupt_block_count_terminates(void)
 	free(d);
 }
 
+/* The kmod passes short literals ("log_drain") as the char[16] reason
+ * tag; tx_begin used to copy a fixed 16 bytes and read past them (KASAN,
+ * 2026-11-10). An exact-size heap copy puts ASAN's redzone right after it. */
+static void
+test_short_reason_tag(void)
+{
+	struct mem_disk *d = calloc(1, sizeof *d);
+	tessera_block_io_t io = mk_io(d);
+	tessera_journal_format(&io, 4, 32);
+	tessera_journal_t *j = tessera_journal_open(&io, 4, 32);
+	CHECK(j != NULL);
+	char *tag = malloc(sizeof "log_drain");
+	memcpy(tag, "log_drain", sizeof "log_drain");
+	uint64_t tx = 0;
+	CHECK(tessera_journal_tx_begin(j, &tx, tag) == TESSERA_OK);
+	CHECK(tessera_journal_tx_commit(j, tx) == TESSERA_OK);
+	free(tag);
+	tessera_journal_close(j);
+	free(d);
+}
+
 int
 main(void)
 {
@@ -363,6 +384,7 @@ main(void)
 	test_torn_then_committed();
 	test_multiblock_body();
 	test_corrupt_block_count_terminates();
+	test_short_reason_tag();
 	if (failures > 0) {
 		fprintf(stderr, "%d failure(s)\n", failures);
 		return 1;

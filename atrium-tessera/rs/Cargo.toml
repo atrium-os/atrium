@@ -5,6 +5,8 @@ members = [
     "tessera",
     "tessera-test-harness",
     "tessera-tools",
+    "tessera-decode",
+    "tessera-decode-c",
 ]
 
 [workspace.package]

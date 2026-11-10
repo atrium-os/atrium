@@ -40,6 +40,7 @@
 #include "tessera/error.h"
 #include "tessera/format.h"
 #include "tessera_compat.h"
+#include "tessera_rs.h"
 
 #define BLK 4096u
 #define HDR 64u                /* sizeof(tessera_record_header_t) */
@@ -328,7 +329,12 @@ tessera_journal_tx_begin(tessera_journal_t *j, uint64_t *out_tx_id,
 	uint64_t tx = j->next_tx_id++;
 	uint8_t body[16];
 	memset(body, 0, sizeof body);
-	if (reason_tag) memcpy(body, reason_tag, 16);
+	/* reason_tag is declared char[16] but every caller passes a string
+	 * literal ("log_drain" is 10 bytes): copying a fixed 16 read past the
+	 * literal (KASAN, 2026-11-10). Copy up to the NUL, at most 16. */
+	if (reason_tag)
+		for (size_t i = 0; i < sizeof body && reason_tag[i] != '\0'; i++)
+			body[i] = (uint8_t)reason_tag[i];
 	int r = write_record(j, TESSERA_TX_BEGIN, body, sizeof body,
 	    j->head_seq);
 	if (r != TESSERA_OK) { j->next_tx_id--; return r; }
@@ -411,6 +417,12 @@ read_record(tessera_journal_t *j, uint64_t *block,
 		return TESSERA_EIO;
 	}
 
+#ifdef TESSERA_RUST_DECODE
+	/* D3: header magic + CRC and the #126 geometry rule, in Rust
+	 * (rs/tessera-decode/src/journal.rs). */
+	int r = tessera_rs_journal_record_check(blk, cap, out_hdr);
+	if (r != TESSERA_OK) { tessera_free(blk); return r; }
+#else
 	int r = tessera_decode_record_header(blk, out_hdr);
 	if (r != TESSERA_OK) { tessera_free(blk); return r; }
 
@@ -433,6 +445,8 @@ read_record(tessera_journal_t *j, uint64_t *block,
 		tessera_free(blk);
 		return TESSERA_ECORRUPT;
 	}
+
+#endif
 
 	const uint32_t bl = out_hdr->body_length;
 	uint8_t *body = NULL;
@@ -477,7 +491,11 @@ read_record(tessera_journal_t *j, uint64_t *block,
 	 * MILLION iterations to compute a modular add. Data blocks are numbered
 	 * 1..cap and wrap, and block_count is now bounded above, but the closed
 	 * form is both correct and free. */
+#ifdef TESSERA_RUST_DECODE
+	*block = tessera_rs_journal_advance(*block, out_hdr->block_count, cap);
+#else
 	*block = ((*block - 1u + out_hdr->block_count) % cap) + 1u;
+#endif
 	*out_body = body;
 	return TESSERA_OK;
 }
