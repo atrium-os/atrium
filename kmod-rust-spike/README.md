@@ -66,7 +66,7 @@ upstream.
 | differential test, ATRIUM-NODEBUG | 1,000,000 iterations + FIFO, 0 mismatches | 1,000,000 iterations + FIFO, 0 mismatches (after the GET fix below) |
 | differential test, ATRIUM-KASAN (Rust code instrumented: 48 `__asan` call sites) | 200,000 iterations, 0 mismatches, no KASAN report | not run (the Rust code is the same; arm64 covers it) |
 | syzkaller, ATRIUM-SYZKALLER (KASAN + KCOV), both devices | 1 h, 8,204 programs, 72-program corpus, 2,058 coverage points, **0 crashes**. Slow: TCG plus KASAN plus KCOV runs about 2 programs a second. A run on real timing would cover far more | not run |
-| latency, Rust/C | not measured: TCG timing is meaningless; needs the Mac (HVF) or the R9700 (KVM) | |
+| latency, Rust/C (median of 11 × 200,000 calls, 3 runs, HVF on the Mac) | nop 1.02–1.03×, set64 0.99–1.03×, get64 1.03–1.04×, write+read64 1.03×, parse256 0.85× (see §5) | not measured |
 
 What the spike turned up on the way, all fixed and written to be offered upstream:
 
@@ -90,3 +90,38 @@ The Rust module needed no `unsafe` beyond the two layout promises, and compiled 
 patched bindings at the first attempt once its imports were right. Size: `rspike.ko` is
 142 KB against `cspike.ko`'s 13 KB on arm64 and 124 KB against 16 KB on amd64 (NODEBUG), almost all of it the KPI crate's generic code
 and bindgen wrappers that every Rust module carries once.
+
+## 5. Latency (2026-11-10, Mac16,6, qemu `-accel hvf -cpu host -smp 4`, ATRIUM-NODEBUG)
+
+`spike-bench bench 200000 11`, run three times, both devices interleaved and the order alternated
+per round. Ratios are within one run. Absolute times differ between the two sessions by about
+10% because the Mac's load differed (1.0 and 2.5), so compare them only within a run.
+
+| op | C ns | Rust ns, first run | Rust/C | C ns | Rust ns, with patch 0005 | Rust/C |
+|----|------|------|--------|------|------|--------|
+| nop | 104 | 106 | 1.02× | 118 | 120 | 1.02–1.03× |
+| set64 | 132 | 167 | **1.18–1.28×** | 148 | 152 | 0.99–1.03× |
+| get64 | 131 | 135 | 1.04× | 146 | 152 | 1.03–1.04× |
+| parse256 | 219 | 279 | **1.25–1.28×** | 241 | 204 | 0.85× |
+| write+read64 | 228 | 234 | 1.03× | 256 | 264 | 1.03× |
+
+The first run found a real cost, in the bindings rather than in the language. `copy_in_vec`
+zeroed its buffer a byte at a time: `fill_to_capacity` called `push()`, which re-checks the
+capacity for each element, so LLVM could not turn it into a `memset`. It also allocated through
+`malloc_aligned(9)`, whose `malloc_domainset()` path sets up a domain iterator on every call.
+Patch 0005 fixes both (raw fill loop; no zero fill before `copyin`; plain `malloc(9)` when the
+alignment is 16 or less).
+
+What remains:
+
+- **About 2–4 ns per call (2–4%) on every operation.** This is fixed overhead in the generated
+  glue: the argument struct is read byte by byte (`IoctlData::read` copies through an
+  unaligned byte view), the ioctl number is decoded twice, and stats go through a closure. It
+  is small next to the system-call cost and can be cut in the bindings.
+- **parse256 at 0.85× is not a like-for-like win.** C still allocates with `M_ZERO` and Rust
+  no longer zero-fills, so C pays to zero 256 bytes that `copyin` then overwrites. Without
+  `M_ZERO` in C the two should be about level. The same applies to set64 with 64 bytes.
+
+Verdict against the pass criterion "no measurable latency cost": not met in the strict sense,
+since a fixed cost of 2–4% is measurable. The cost does not grow with the work done, and the
+parser itself (bounds-checked slices) is no slower than the C pointer arithmetic.
