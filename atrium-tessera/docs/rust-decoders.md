@@ -96,10 +96,10 @@ boundaries and single-value holes are what sweeps catch and random inputs do not
   passed 16-character tags, which is why it was never seen.
   A second KASAN run (with the fix) reported nothing, but `cp` hung: a timer interrupt
   arrived while the thread was deep in the write path inside `blake3_hash_many_neon`, and
-  KASAN's larger frames pushed the interrupt past the end of the 16 KiB kernel stack (the
+  KASAN's larger frames pushed the interrupt past the end of the 24 KiB KASAN kernel stack (the
   #114 failure mode: arm64 faults in a loop instead of panicking). That is the C write path
-  and the stack-depth item T2, not the decoders; KASAN kernels need more `KSTACK_PAGES` for
-  this workload, and the write path's depth is worth measuring on NODEBUG too.
+  and the stack-depth item T2, not the decoders. Fixed 2026-11-11: the cause was a
+  flush nested inside the write path; see kmod-audit T2.
 - Cost: B-tree lookups through the core, host x86_64, callgrind, 100k lookups in a
   20k-entry blob-index tree. First cut: 4,765M instructions against C's 4,557M (about 5%
   more). Causes: per-probe bounds arithmetic in the node search, a byte-at-a-time key

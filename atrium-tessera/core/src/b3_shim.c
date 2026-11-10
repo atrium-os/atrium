@@ -33,6 +33,7 @@
 #include "b3_blake3_impl.h"
 
 #include "tessera/hash.h"
+#include "tessera_compat.h"
 
 #if BLAKE3_USE_X86
 /*
@@ -206,27 +207,68 @@ blake3_simd_degree(void)
 #if defined(TESSERA_KERNEL) && TESSERA_B3_SIMD
 #define TESSERA_B3_FPU_SLICE	(64u * 1024u)
 
-void
-tessera_blake3_256(const uint8_t *data, size_t len, tessera_hash_t out)
+static void
+b3_hash_with(blake3_hasher *hasher, const uint8_t *data, size_t len,
+    tessera_hash_t out)
 {
-	blake3_hasher hasher;
 	size_t off = 0;
 
-	blake3_hasher_init(&hasher);
+	blake3_hasher_init(hasher);
 	while (off < len) {
 		size_t n = len - off;
 
 		if (n > TESSERA_B3_FPU_SLICE)
 			n = TESSERA_B3_FPU_SLICE;
 		fpu_kern_enter(curthread, NULL, FPU_KERN_NORMAL | FPU_KERN_NOCTX);
-		blake3_hasher_update(&hasher, data + off, n);
+		blake3_hasher_update(hasher, data + off, n);
 		(void)fpu_kern_leave(curthread, NULL);
 		off += n;
 	}
 	/* finalize touches the same SIMD compression path */
 	fpu_kern_enter(curthread, NULL, FPU_KERN_NORMAL | FPU_KERN_NOCTX);
-	blake3_hasher_finalize(&hasher, out, TESSERA_HASH_SIZE);
+	blake3_hasher_finalize(hasher, out, TESSERA_HASH_SIZE);
 	(void)fpu_kern_leave(curthread, NULL);
+}
+#else
+static void
+b3_hash_with(blake3_hasher *hasher, const uint8_t *data, size_t len,
+    tessera_hash_t out)
+{
+	blake3_hasher_init(hasher);
+	blake3_hasher_update(hasher, data, len);
+	blake3_hasher_finalize(hasher, out, TESSERA_HASH_SIZE);
+}
+#endif
+
+#ifdef TESSERA_KERNEL
+/*
+ * ★ T2: the hasher is 1.9 KiB (its chaining-value stack is 55 x 32 bytes)
+ * and it sat in this frame at the bottom of the deepest write path
+ * (flush -> append -> fetch -> verify -> hash), where a timer interrupt on
+ * top overran the 16 KiB kernel stack under KASAN (kmod-audit T2). So it
+ * comes from the heap. M_NOWAIT, because callers may hold a mutex; if that
+ * fails the hash still happens, on the stack, in a frame of its own that
+ * the normal path never enters.
+ */
+static __noinline void
+b3_hash_on_stack(const uint8_t *data, size_t len, tessera_hash_t out)
+{
+	blake3_hasher hasher;
+
+	b3_hash_with(&hasher, data, len, out);
+}
+
+void
+tessera_blake3_256(const uint8_t *data, size_t len, tessera_hash_t out)
+{
+	blake3_hasher *hasher = malloc(sizeof *hasher, M_TESSERA, M_NOWAIT);
+
+	if (hasher == NULL) {
+		b3_hash_on_stack(data, len, out);
+		return;
+	}
+	b3_hash_with(hasher, data, len, out);
+	free(hasher, M_TESSERA);
 }
 #else
 void
@@ -234,8 +276,6 @@ tessera_blake3_256(const uint8_t *data, size_t len, tessera_hash_t out)
 {
 	blake3_hasher hasher;
 
-	blake3_hasher_init(&hasher);
-	blake3_hasher_update(&hasher, data, len);
-	blake3_hasher_finalize(&hasher, out, TESSERA_HASH_SIZE);
+	b3_hash_with(&hasher, data, len, out);
 }
 #endif

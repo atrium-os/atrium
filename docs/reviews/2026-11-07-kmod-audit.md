@@ -28,7 +28,7 @@ carillon-kmod. "Reachable by" means who can trigger it on a default Atrium insta
 | **Z1** | atrium-zram | `kern.zram.bench` and `kern.zram.selftest` were `CTLFLAG_RD` handlers anyone could read. The bench decompresses live swapped-out pages of every process | any local user, any jail | DoS, compressed-size side channel on other processes' memory | **fixed**: unjailed root only (`PRIV_SYSCTL_DEBUG`) |
 | C1 | carillon-kmod | `CARILLON_WAIT` converted `timeout_ms` to ticks in an `int`; above ~24.8 days at hz=1000 it went negative | root (node is 0600) | odd sleep timing | **fixed**: clamp |
 | J1 | atrium-tessera core | `write_record` computed `body + in_first` with `body == NULL` and length 0: undefined behaviour in C (UBSAN), harmless in practice since nothing is read | fuzzer input | none observed | **fixed** |
-| T2 | atrium-tessera | stack frames over the 1 KiB warning: `tessera_decode_pack_extent_list` 4160 bytes, `tessera_fs_gc_data_zone_ex` 2896, `tessera_blake3_256` 2000, `tessera_vop_readdir` 1808. The kernel stack is 16 KiB on arm64 and a VFS call chain already uses a good part of it | normal use | kernel stack overflow under deep call chains | **partly fixed** 2026-11-10: the pack extent list decoder is Rust now (D3) and needs 112 bytes; `gc_data_zone_ex`, `blake3_256` and `vop_readdir` remain (medium; move the buffers to the heap) |
+| T2 | atrium-tessera | stack frames over the 1 KiB warning: `tessera_decode_pack_extent_list` 4160 bytes, `tessera_fs_gc_data_zone_ex` 2896, `tessera_blake3_256` 2000, `tessera_vop_readdir` 1808. The kernel stack is 16 KiB on arm64 and a VFS call chain already uses a good part of it | normal use | kernel stack overflow under deep call chains | **fixed** 2026-11-11: the pack extent list decoder is Rust now (D3, 112 bytes); the BLAKE3 hasher and the GC walk stack moved to the heap (`gc_data_zone_ex` 2912 to 1248, `blake3_256` 2000 to 48); `vop_readdir` 1808 to 1632. The real cause of the KASAN overflow was a nested flush, see below |
 | F1 | fresco-kmod, carillon-kmod | any opener can map the whole ivshmem region | root (0600, dev transport only) | none on a production install | open (by design: VM transport) |
 
 The two most serious bugs (V1, V2) are in the virtio-gpu driver that the Mac VM uses for
@@ -80,7 +80,24 @@ is not committed; the J1 input is, as `fuzz/corpus/fuzz_journal/regress-2026-11-
   `tessera_journal_tx_begin` read past its short reason-tag literal (16-byte copy of
   `"log_drain"`). Fixed, with a host regression test. A second KASAN run hung `cp` on a kernel stack
   overflow: a timer interrupt landed while the write path was deep in
-  `blake3_hash_many_neon`, and KASAN's frames took it past 16 KiB (T2, #114). Open.
+  `blake3_hash_many_neon` (T2, #114). Fixed 2026-11-11. `scripts/kmod-stack-depth.py`
+  (static: frames from the prologues, deepest direct-call chain) found why: `mark_dirty`
+  runs a synchronous flush, and it is called from deep inside the publish path that a flush
+  itself runs (publish, `dead_extent_record`, `mark_dirty`, flush), so a write could nest a
+  whole second flush pipeline. `vop_write`'s deepest chain in the module alone was 8 KiB on
+  NODEBUG (16 KiB stack) and 22.5 KiB on KASAN (24 KiB stack). Now the inline flush runs only
+  when enough stack is left (`GET_STACK_USAGE`, as `geom_io` does for direct dispatch: 8 KiB
+  NODEBUG, 18 KiB KASAN, the flush chain being 5.7 and 14.5 KiB); deeper, it goes to the
+  flush taskqueue (`kern.tessera.flush_stack_deferred` counts these;
+  `kern.tessera.flush_stack_need` sets the bound, and a huge value forces the queued path for
+  testing). With the two heap moves, the deepest chain is 6.2 KiB NODEBUG and 15.7 KiB KASAN.
+  The e2e workload under KASAN (`KERNCONF=ATRIUM-KASAN scripts/tessera-decode-vm-e2e.sh`) now
+  passes on both modules with no KASAN reports, also with `SYSCTLS=` dropping the flush
+  thresholds to 1 (a flush every few mutations) and with `flush_stack_need` huge. No flush
+  was deferred in any run, because the async threshold flush keeps `dirty_count` under the
+  synchronous backstop: the nested inline flush is rare, and the hasher move is what took
+  the chain that hung off the stack's end. The queued path is the same `taskqueue_enqueue`
+  the async threshold already uses on every run.
 - G2 per-client accounting, G3 static assert, V6 offset spaces: small, not urgent.
 - `scripts/core-fuzz.sh`: the `UBSAN_OPTIONS=... \` line was followed by a comment, so the
   variable never reached the command. Fixed 2026-11-10 with the D3 fuzz changes.

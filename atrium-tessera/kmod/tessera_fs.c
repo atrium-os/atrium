@@ -33,6 +33,7 @@
 #include <sys/namei.h>
 #include <sys/jail.h>
 #include <sys/proc.h>
+#include <machine/stack.h>	/* GET_STACK_USAGE (T2) */
 #include <sys/sysctl.h>
 #include <sys/sbuf.h>		/* verify_mft_kinds breakdown (#90) */
 #ifdef __aarch64__
@@ -1367,6 +1368,34 @@ static unsigned long tessera_stat_mark_dirty_meta_flushes = 0;
 SYSCTL_ULONG(_kern_tessera, OID_AUTO, mark_dirty_meta_flushes, CTLFLAG_RD,
     &tessera_stat_mark_dirty_meta_flushes, 0,
     "synchronous flushes run inline by mark_dirty's meta-reserve trigger");
+/*
+ * ★ T2: mark_dirty's synchronous flushes run the whole drain -> publish ->
+ * fetch -> verify -> hash pipeline on the CALLER's stack, and mark_dirty is
+ * called from deep inside that same pipeline (publish -> dead_extent_record
+ * -> mark_dirty), so a write could nest a second copy of it. Static
+ * analysis of the arm64 module put vop_write's deepest chain at 8 KiB on
+ * NODEBUG and 22.5 KiB under KASAN (24 KiB stack), and a timer interrupt on
+ * top overflowed it. So the inline flush only runs while at least this much
+ * stack is left; deeper, it is handed to the flush taskqueue, as geom_io
+ * does for direct dispatch. The bound is the flush chain's own depth (5.7
+ * KiB NODEBUG, 14.5 KiB KASAN, 2026-11-11) plus room for an interrupt.
+ */
+#if defined(KASAN) || defined(KMSAN)
+#define TESSERA_FLUSH_STACK_NEED (18 * 1024)
+#else
+#define TESSERA_FLUSH_STACK_NEED (8 * 1024)
+#endif
+static int tessera_flush_stack_need = TESSERA_FLUSH_STACK_NEED;
+SYSCTL_INT(_kern_tessera, OID_AUTO, flush_stack_need, CTLFLAG_RW,
+    &tessera_flush_stack_need, 0,
+    "bytes of kernel stack mark_dirty needs left to run a synchronous flush "
+    "inline; less, and the flush is queued (tests set it huge to force the "
+    "queued path)");
+static unsigned long tessera_stat_flush_stack_deferred = 0;
+SYSCTL_ULONG(_kern_tessera, OID_AUTO, flush_stack_deferred, CTLFLAG_RD,
+    &tessera_stat_flush_stack_deferred, 0,
+    "synchronous mark_dirty flushes sent to the flush taskqueue because the "
+    "caller's kernel stack was too deep to run one inline");
 static int tessera_pinscan_tight_bypass = 1;
 SYSCTL_INT(_kern_tessera, OID_AUTO, pinscan_tight_bypass, CTLFLAG_RW,
     &tessera_pinscan_tight_bypass, 0,
@@ -10095,7 +10124,9 @@ tessera_dirent_reclen(uint16_t namlen)
  *   ENAMETOOLONG the name itself is bigger than our static buffer.
  *   any  uiomove error (rare).
  */
-static int
+/* __noinline (T2): its 288-byte buffer was inlined into vop_readdir's frame,
+ * which then stays live under everything readdir calls. */
+static __noinline int
 tessera_emit_dirent(struct uio *uio, ino_t fileno, uint8_t type,
                     const char *name, uint16_t namlen)
 {
@@ -12834,6 +12865,27 @@ tessera_fs_flush_callout(void *arg)
 	(void)taskqueue_enqueue(tmp_->flush_tq, &tmp_->flush_task);
 }
 
+/* mark_dirty's synchronous flush: inline when the stack allows it (the
+ * writer is throttled, which is the point), else queued (T2, above). A
+ * deferred backstop or meta-reserve flush is caught up by the task, by the
+ * next shallower mark_dirty, and by admission's own flush scheduling.
+ * __noinline so the stack it measures is mark_dirty's caller's, plus one
+ * small frame. */
+static __noinline void
+tessera_fs_flush_sync_or_defer(struct tessera_mount *tmp_)
+{
+	size_t total, used;
+
+	GET_STACK_USAGE(total, used);
+	if (total - used >= (size_t)tessera_flush_stack_need) {
+		(void)tessera_fs_flush(tmp_);
+		return;
+	}
+	tessera_stat_flush_stack_deferred++;
+	if (tmp_->flush_co_init && !tmp_->flush_unmounting)
+		(void)taskqueue_enqueue(tmp_->flush_tq, &tmp_->flush_task);
+}
+
 static void
 tessera_fs_mark_dirty(struct tessera_mount *tmp_)
 {
@@ -12902,7 +12954,7 @@ tessera_fs_mark_dirty(struct tessera_mount *tmp_)
 	    (tmp_->dirty_count > 4u * (uint32_t)tessera_dirty_flush_async ||
 	     tmp_->dirent_log_count >
 	         4u * (uint32_t)tessera_dirent_log_threshold)) {
-		(void)tessera_fs_flush(tmp_);
+		tessera_fs_flush_sync_or_defer(tmp_);
 		return;
 	}
 	if (tmp_->dirty_init &&
@@ -12957,7 +13009,7 @@ tessera_fs_mark_dirty(struct tessera_mount *tmp_)
 		}
 		if (fire) {
 			tessera_stat_mark_dirty_meta_flushes++;
-			(void)tessera_fs_flush(tmp_);
+			tessera_fs_flush_sync_or_defer(tmp_);
 		}
 	}
 
@@ -20020,6 +20072,11 @@ tessera_fs_gc_data_zone_ex(struct tessera_mount *tmp_,
 	uint32_t seen_cap = 256;                 /* power of two, >= 2*live_cap */
 	uint32_t *seen = malloc(seen_cap * sizeof(*seen), M_TESSERA,
 	    M_WAITOK | M_ZERO);
+	/* ★ T2: the manifest walk's work stack (64 hashes, 2 KiB) used to be a
+	 * local in _GC_WALK_RECORD, which made this the largest frame in the
+	 * module (2.8 KiB). One heap buffer serves every walk. */
+	tessera_hash_t *gc_walk_stack = malloc(64 * sizeof(tessera_hash_t),
+	    M_TESSERA, M_WAITOK);
 	int _gc_push_dup = 0;
 
 #define _GC_SEEN_REHASH() do {                                            \
@@ -20085,7 +20142,7 @@ tessera_fs_gc_data_zone_ex(struct tessera_mount *tmp_,
 	 * cycle can't loop forever. Inline lambda via nested macro for
 	 * conciseness — pure C function follows. */
 #define _GC_WALK_RECORD(_ino) do {                                       \
-		tessera_hash_t _stack[64];                                \
+		tessera_hash_t *_stack = gc_walk_stack;                   \
 		int _sp = 0;                                              \
 		if (!tessera_hash_is_null(_ino.manifest_hash)) {          \
 			if (tessera_gc_walk_trust_leaf &&                 \
@@ -20713,6 +20770,7 @@ snap_next:
 		}
 		free(live, M_TESSERA);
 		free(seen, M_TESSERA);
+		free(gc_walk_stack, M_TESSERA);
 		_GC_CLOSE_SCAN_TREES();
 		return (0);
 	}
@@ -20806,6 +20864,7 @@ snap_next:
 		tessera_stat_gc_aborts++;
 		free(live, M_TESSERA);
 		free(seen, M_TESSERA);
+		free(gc_walk_stack, M_TESSERA);
 		_GC_CLOSE_SCAN_TREES();
 		return (0);
 	}
@@ -20845,6 +20904,7 @@ snap_next:
 		tessera_stat_gc_aborts++;
 		free(live, M_TESSERA);
 		free(seen, M_TESSERA);
+		free(gc_walk_stack, M_TESSERA);
 		_GC_CLOSE_SCAN_TREES();
 		return (0);
 	}
@@ -21199,6 +21259,7 @@ next_p:
 #undef _GC_HASH_IS_LIVE
 	free(live, M_TESSERA);
 	free(seen, M_TESSERA);
+	free(gc_walk_stack, M_TESSERA);
 	_GC_CLOSE_SCAN_TREES();
 	printf("tessera_fs: gc pass2 done — %u dead packs\n", dead_count);
 

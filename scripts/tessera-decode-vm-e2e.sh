@@ -25,6 +25,7 @@ TOOLS="${TOOLS:-$ROOT/atrium-tessera/rs/target/aarch64-unknown-freebsd/release}"
 VSSH="${VSSH:-$ROOT/scripts/vssh}"
 NFILES="${NFILES:-2500}"
 # MODULES="a.ko b.ko ..." picks the modules and order (one boot, loaded in turn).
+# SYSCTLS="kern.tessera.x=1 ..." are set after each load (e.g. to force flushes).
 
 deploy() {
     for f in "$OUT/tessera_fs.ko" "$OUT/tessera_fs-c.ko" "$TOOLS/mkfs-tessera" "$TOOLS/tessera-fsck"; do
@@ -51,7 +52,8 @@ umount $M 2>/dev/null
 for k in tessera_fs tessera_fs.ko tessera_fs-c.ko; do kldunload $k 2>/dev/null; done
 for u in $(mdconfig -l); do mdconfig -lv -u $u | grep -q d3.img && mdconfig -d -u $u; done
 kldload $KO || fail kldload
-echo "module: $1, decoders: $(sysctl -n kern.tessera.decoders)"
+for kv in ${3:-}; do sysctl "$kv" >/dev/null || fail "sysctl $kv"; done
+echo "module: $1, decoders: $(sysctl -n kern.tessera.decoders)${3:+, $3}"
 rm -f $IMG; truncate -s 512m $IMG
 DEV=/dev/$(mdconfig -a -t vnode -f $IMG) || fail mdconfig
 mkfs-tessera $DEV >/dev/null 2>&1 || fail mkfs
@@ -80,6 +82,7 @@ umount $M || fail umount2
 tessera-fsck $DEV > /root/d3/fsck.log 2>&1; frc=$?
 p=$(grep -ciE 'dangling|orphan|nlink|leaked|overlap|missing|corrupt|problem' /root/d3/fsck.log)
 mdconfig -d -u ${DEV#/dev/md}; rm -f $IMG
+echo "flush_stack_deferred=$(sysctl -n kern.tessera.flush_stack_deferred 2>/dev/null)"
 kldunload $1 || fail kldunload
 dmesg | tail -40 | grep -iE 'panic|tessera.*(refused|corrupt)' | tail -3
 echo "files=$(wc -l < /root/d3/after | tr -d ' ') big=$na write_secs=$((t1-t0)) fsck_rc=$frc fsck_problems=$p"
@@ -91,7 +94,7 @@ EOF
 guest_run() {
     log=/root/d3/run-$1.log
     guest_script | "$VSSH" 'cat > /root/d3/run.sh' || return 1
-    "$VSSH" "rm -f $log; nohup sh /root/d3/run.sh $1 $NFILES > $log 2>&1 < /dev/null &" || return 1
+    "$VSSH" "rm -f $log; nohup sh /root/d3/run.sh $1 $NFILES '${SYSCTLS:-}' > $log 2>&1 < /dev/null &" || return 1
     # Poll until the run prints PASS or FAIL; ssh failures in between are
     # the slow guest, not a result. POLL_MAX tries of 30 s (default 2 h).
     n=0
