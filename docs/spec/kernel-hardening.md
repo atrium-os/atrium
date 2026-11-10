@@ -46,8 +46,16 @@ before `link_elf_ireloc()` resolves it. Our fork fixes this in `amd64/amd64/mach
 `KERN_INIT_ALL` is defined (by `kern.mk` whenever INIT_ALL is not `none`), `memset`, `memcpy`
 and `memmove` are ordinary functions that branch on `cpu_stdext_feature & CPUID_STDEXT_ERMS`.
 That field is zero until CPU identification, so early calls take the `_std` versions, which
-work on any CPU. The cost is one load and a predictable branch per call. This is a candidate
-to offer upstream once it has booted on real hardware.
+work on any CPU. The cost is one load and a predictable branch per call.
+
+arm64 hits the same problem (FreeBSD does not mark it broken there): `memset` is an ifunc on
+MOPS, and `link_elf_ireloc()`'s own zero-initialised locals call it before it is resolved, so
+the kernel hangs before the console starts. The fork does the same there, branching on
+`elf_hwcap2 & HWCAP2_MOPS`.
+
+Checked 2026-11-10: ATRIUM-NODEBUG with `INIT_ALL=zero` boots and passes `check` on both
+arm64 and amd64 (QEMU TCG). Both fixes are candidates to offer upstream once they have booted
+on real hardware.
 
 ## 4. The sysctls
 

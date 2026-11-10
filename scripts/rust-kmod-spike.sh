@@ -15,7 +15,9 @@
 #   TOOLCHAIN  rustup toolchain (default nightly-2025-07-23, the KPI's CI pin)
 #   VSSH       ssh wrapper for the guest (default scripts/vssh)
 #
-# Cross-builds from Linux use tools/build/make.py with clang-18 (RUNBOOK §13).
+# Cross-builds from Linux use tools/build/make.py with clang-18 for arm64 and
+# clang-19 for amd64 (LLVM=N overrides; RUNBOOK §13).  OBJ for amd64 is
+# usually a separate objdir (e.g. ~/obj-amd64).
 # The KPI is ayrtonm/freebsd-kpi-rs (BSD-2-Clause sources) at KPI_REV, with
 # kmod-rust-spike/kpi-patches applied; see kmod-rust-spike/README.md.
 set -eu
@@ -25,10 +27,12 @@ SRC="${SRC:-$HOME/freebsd-src}"
 OBJ="${OBJ:-$HOME/obj}"
 TARGET="${TARGET:-arm64}"
 case "$TARGET" in
-    arm64) TARGET_ARCH=aarch64; CTRIPLE=aarch64-unknown-freebsd16 ;;
-    amd64) TARGET_ARCH=amd64;   CTRIPLE=x86_64-unknown-freebsd16 ;;
+    arm64) TARGET_ARCH=aarch64; CTRIPLE=aarch64-unknown-freebsd16; LLVM_DEF=18 ;;
+    # amd64 kmods need LLVM 19: clang 18 emits GOTPCRELX, which kldload rejects.
+    amd64) TARGET_ARCH=amd64;   CTRIPLE=x86_64-unknown-freebsd16;  LLVM_DEF=19 ;;
     *) echo "TARGET must be arm64 or amd64" >&2; exit 2 ;;
 esac
+LLVM="${LLVM:-$LLVM_DEF}"
 KERNCONF="${KERNCONF:-ATRIUM-NODEBUG}"
 TOOLCHAIN="${TOOLCHAIN:-nightly-2025-07-23}"
 KPI_URL="https://github.com/ayrtonm/freebsd-kpi-rs"
@@ -38,14 +42,14 @@ SYSROOT="${SYSROOT:-$HOME/atrium-vm/sysroot}"
 [ "$TARGET" = amd64 ] && SYSROOT="${SYSROOT_AMD64:-$HOME/atrium-vm-amd64/sysroot}"
 
 make_py() {
-    env CC=/usr/bin/clang-18 CXX=/usr/bin/clang++-18 CPP=/usr/bin/clang-cpp-18 \
+    env CC=/usr/bin/clang-$LLVM CXX=/usr/bin/clang++-$LLVM CPP=/usr/bin/clang-cpp-$LLVM \
         MAKEOBJDIRPREFIX="$OBJ" \
         RUSTC="$(rustup which --toolchain "$TOOLCHAIN" rustc)" \
         RUSTFMT="$(rustup which --toolchain "$TOOLCHAIN" rustfmt)" \
         BINDGEN="$(command -v bindgen)" \
         RUST_LIB_SRC="$(rustc +"$TOOLCHAIN" --print sysroot)/lib/rustlib/src/rust" \
-        XOBJCOPY=/usr/lib/llvm-18/bin/llvm-objcopy \
-        "$SRC/tools/build/make.py" --cross-bindir=/usr/lib/llvm-18/bin \
+        XOBJCOPY=/usr/lib/llvm-$LLVM/bin/llvm-objcopy \
+        "$SRC/tools/build/make.py" --cross-bindir=/usr/lib/llvm-$LLVM/bin \
         TARGET="$TARGET" TARGET_ARCH="$TARGET_ARCH" "$@"
 }
 
@@ -74,7 +78,7 @@ build() {
     for m in cspike rspike; do
         cp "$K/modules$SPIKE/$m/$m.ko" "$SPIKE/out/$TARGET-$KERNCONF/"
     done
-    clang-18 --target="$CTRIPLE" --sysroot="$SYSROOT" -fuse-ld=lld -O2 -Wall \
+    clang-$LLVM --target="$CTRIPLE" --sysroot="$SYSROOT" -fuse-ld=lld -O2 -Wall \
         -o "$SPIKE/out/$TARGET-$KERNCONF/spike-bench" "$SPIKE/bench/spike-bench.c"
     ls -l "$SPIKE/out/$TARGET-$KERNCONF"
 }

@@ -58,14 +58,14 @@ upstream.
    kernel has `options KASAN`, and `-Zbranch-protection=bti,pac-ret` on arm64 (upstream had
    BTI only, so Rust code lost the PAC return-address protection the C kernel has).
 
-## 4. Results (2026-11-07, arm64, QEMU TCG on the cloud host)
+## 4. Results (arm64 2026-11-07, amd64 2026-11-10; QEMU TCG on the cloud host)
 
 | check | arm64 | amd64 |
 |-------|-------|-------|
-| builds against ATRIUM-NODEBUG / -KASAN / -SYZKALLER, loads, unloads, reloads | pass | not run yet |
-| differential test, ATRIUM-NODEBUG | 1,000,000 iterations + FIFO, 0 mismatches | |
-| differential test, ATRIUM-KASAN (Rust code instrumented: 48 `__asan` call sites) | 200,000 iterations, 0 mismatches, no KASAN report | |
-| syzkaller, ATRIUM-SYZKALLER (KASAN + KCOV), both devices | 1 h, 8,204 programs, 72-program corpus, 2,058 coverage points, **0 crashes**. Slow: TCG plus KASAN plus KCOV runs about 2 programs a second. A run on real timing would cover far more | |
+| builds against ATRIUM-NODEBUG / -KASAN / -SYZKALLER, loads, unloads, reloads | pass | ATRIUM-NODEBUG: pass (needs LLVM 19, see below) |
+| differential test, ATRIUM-NODEBUG | 1,000,000 iterations + FIFO, 0 mismatches | 1,000,000 iterations + FIFO, 0 mismatches (after the GET fix below) |
+| differential test, ATRIUM-KASAN (Rust code instrumented: 48 `__asan` call sites) | 200,000 iterations, 0 mismatches, no KASAN report | not run (the Rust code is the same; arm64 covers it) |
+| syzkaller, ATRIUM-SYZKALLER (KASAN + KCOV), both devices | 1 h, 8,204 programs, 72-program corpus, 2,058 coverage points, **0 crashes**. Slow: TCG plus KASAN plus KCOV runs about 2 programs a second. A run on real timing would cover far more | not run |
 | latency, Rust/C | not measured: TCG timing is meaningless; needs the Mac (HVF) or the R9700 (KVM) | |
 
 What the spike turned up on the way, all fixed and written to be offered upstream:
@@ -76,10 +76,17 @@ What the spike turned up on the way, all fixed and written to be offered upstrea
   load on a KASAN kernel. Both in atrium-os/freebsd-src.
 - **freebsd-kpi-rs:** the uiomove mutability swap (undefined behaviour on every device write),
   locks never destroyed, BTI without PAC, no KASAN support (patches 0002–0004).
+- **amd64 toolchain:** clang 18 emits `R_X86_64_GOTPCRELX` relocations that `kldload` refuses,
+  so amd64 modules are built with LLVM 19 (`rust-kmod-spike.sh` picks it; `LLVM=` overrides).
+- **A twin divergence only amd64 showed:** `SPIKE_IOC_GET` with nothing to copy and a
+  kernel-range user pointer returned 0 from C and `EFAULT` from Rust (3 in 1,000,000). C skips
+  `copyout` when the length is 0; the Rust version called it, and amd64's `copyout` checks the
+  address even for 0 bytes where arm64's returns at once. The Rust module now skips it too. Not
+  a memory-safety issue, but it is the kind of difference the differential test exists to find.
 - **syzkaller:** its isolated-VM mode streams the console with Linux `dmesg -w`; on FreeBSD the
   guest needs a small wrapper (`/root/bin/dmesg`, RUNBOOK §13).
 
 The Rust module needed no `unsafe` beyond the two layout promises, and compiled against the
 patched bindings at the first attempt once its imports were right. Size: `rspike.ko` is
-142 KB against `cspike.ko`'s 13 KB (NODEBUG), almost all of it the KPI crate's generic code
+142 KB against `cspike.ko`'s 13 KB on arm64 and 124 KB against 16 KB on amd64 (NODEBUG), almost all of it the KPI crate's generic code
 and bindgen wrappers that every Rust module carries once.

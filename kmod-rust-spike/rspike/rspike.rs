@@ -193,7 +193,12 @@ impl CDevSw for RSpike {
                 {
                     let st = sx_slock(&sc.state);
                     n = min(b.len as usize, st.blob.len());
-                    UserSlice::new(b.ptr, b.len as usize).copy_out(&st.blob[..n])?;
+                    // Like the C twin, copy nothing (and so check no address) when there is
+                    // nothing to copy: amd64's copyout() refuses a kernel-range address even
+                    // for 0 bytes, arm64's does not.
+                    if n > 0 {
+                        UserSlice::new(b.ptr, b.len as usize).copy_out(&st.blob[..n])?;
+                    }
                     b.len = st.blob.len() as u32;
                 }
                 data.write(&b)?;
