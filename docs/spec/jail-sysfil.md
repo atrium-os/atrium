@@ -328,9 +328,12 @@ best / median / spread in ns:
 At fbsd 302660e88, same protocol (medians, ns): stock host 77.8 / 95.5 / 97.6 / 114.0 /
 361.4; patched host 77.4 / 94.9 / 98.6 / 114.3 / 355.6; patched filtered jail 77.9 / 95.3 /
 101.4 / 115.5 / 364.7 (null / nullio / ioctl / sockopt / socket). The filtered jail's
-allowed system call is now four dependent loads and a bit test with no call; ioctl and
-socket options still call into `kern_jail_sysfil.c`, and inlining those the same way is
-the next step if the gate has to hold for them too.
+allowed system call is now four dependent loads and a bit test with no call; fbsd 8e5fafe2f
+does the same for ioctls and socket options: the leading fields of the filter are declared
+in `sys/jail.h` as `struct sysfil_hot` and the hooks search the sorted lists inline, calling
+into `kern_jail_sysfil.c` only for an operation not on the list. Shankar's call
+(2026-11-08): optimize, then accept the remaining filtered-jail cost as the price of a
+filter; the gate stays under 1% for everything outside filtered jails.
 
 Medians at 09e74dabf, patched open jail against stock open jail: null 0.00%, nullio -0.42%, ioctl
 +0.51%, sockopt +0.35%, socket +0.36%. The ioctl noise floor is about 2% (stock host against
@@ -394,6 +397,7 @@ and `keylen` is 0, so the loop never ends, and it runs with `allprison_lock` hel
 later jail operation on the machine blocks. During the jailmeta `keyvalue` tests a
 `jls -jj meta.` process spun in `kern_jail_get()` this way and wedged both the patched and
 the unpatched kernel in the cloud VM. `jail_get(2)` needs no privilege, so any local user can do this.
-To be reported to FreeBSD with a fix (refuse an empty key in the check and get methods),
-with Shankar's go-ahead.
+Fixed in our fork (fbsd 09e74dabf, with an ATF case `empty_key`). FreeBSD's own main
+branch already refuses the empty key in the get method (checked 2026-11-10), so nothing
+needs reporting; our fork's base simply predates that fix.
 
