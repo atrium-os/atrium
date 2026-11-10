@@ -308,7 +308,7 @@ The kernel patch is written to be offered to FreeBSD as it is:
 | arm64 build and VM run | done on HVF (Mac): GENERIC-NODEBUG at 62c6fd2a9 boots, filtered runs 0 denials, positive control denied |
 | overhead, cloud TCG (sanity) | done, below |
 | overhead under 1%, HVF (Mac, arm64) | outside filtered jails: **passes** (patched vs stock within ±0.5% on every operation). Inside a filtered jail, at fbsd 09e74dabf: null +1.9% (+1.5 ns), sockopt +1.9%, ioctl +4.3%. At fbsd 302660e88 (bitmap test inline in `syscallenter`, open-coded list searches): **null +0.65% (+0.5 ns), nullio +0.42%, sockopt +1.05% (+1.2 ns), ioctl +2.8% (+2.8 ns, noise floor 1–2%)**, unfiltered path still within noise. Tables below |
-| overhead under 1%, KVM (R9700, amd64) | pending |
+| overhead under 1%, KVM (R9700, amd64) | skipped (Shankar, 2026-11-10): the HVF result is within noise |
 | Navigator, Fresco, Tessera benchmarks with the filter | pending |
 | shipped `policy.sysfil.mode` | **1 (log only)** until the profiles have been run against the real apps (Pergola apps, Fresco renderers, Lyra clients, the player, Nuntius); then 2 |
 | jail(8) man page section | pending |
