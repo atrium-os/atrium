@@ -30,7 +30,7 @@ dependencies: MIT, BSD-2/3, Apache-2.0, ISC, Zlib allowed).
 
 | project | licence | state | verdict |
 |---------|---------|-------|---------|
-| **ayrtonm/freebsd-kpi-rs** (Ayrton Muñoz) | every source file has an `SPDX-License-Identifier: BSD-2-Clause` header; **the repository has no LICENSE file**, and the build glue (`kern.rust.mk`, `kmod.rust.mk`, `kern.rustroot.mk`), `kpi/src/net.rs` and `patches/*.diff` carry no notice | active (545 commits, head 4434e53 on 2026-11-02), builds in-tree as `sys/rust`, targets arm64 and amd64 | **usable**: BSD-2 is allowed. Before we ship anything built on it, ask the author to add a LICENSE file and headers to the unlabelled files (an external contact: needs Shankar's OK) |
+| **ayrtonm/freebsd-kpi-rs** (Ayrton Muñoz) | every source file has an `SPDX-License-Identifier: BSD-2-Clause` header; **the repository has no LICENSE file**, and the build glue (`kern.rust.mk`, `kmod.rust.mk`, `kern.rustroot.mk`), `kpi/src/net.rs` and `patches/*.diff` carry no notice | active (545 commits, head 4434e53 on 2026-11-02), builds in-tree as `sys/rust`, targets arm64 and amd64 | **usable**: BSD-2 is allowed. Before we ship anything built on it, ask the author to add a LICENSE file and headers to the unlabelled files: requested by Shankar in an issue on the project, 2026-11-10 |
 | asomers/freebsd-kernel-module-rust | BSD-2-Clause | old, out-of-tree, cargo-based | not used |
 | kev009/rustkpi | BSD-2-Clause (fork of Linux work) | dormant | not used |
 | freebsd-kmi-rs | custom licence | | not allowed |
