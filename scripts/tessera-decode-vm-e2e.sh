@@ -24,17 +24,20 @@ OUT="$ROOT/atrium-tessera/kmod/out/$TARGET-$KERNCONF"
 TOOLS="${TOOLS:-$ROOT/atrium-tessera/rs/target/aarch64-unknown-freebsd/release}"
 VSSH="${VSSH:-$ROOT/scripts/vssh}"
 NFILES="${NFILES:-2500}"
-# MODULES="a.ko b.ko ..." picks the modules and order (one boot, loaded in turn).
+# MODULES="a.ko b.ko ..." picks the modules (deploy and run) and order (one
+# boot, loaded in turn), e.g. MODULES="tessera_fs-lto.ko tessera_fs.ko".
 # SYSCTLS="kern.tessera.x=1 ..." are set after each load (e.g. to force flushes).
 
 deploy() {
-    for f in "$OUT/tessera_fs.ko" "$OUT/tessera_fs-c.ko" "$TOOLS/mkfs-tessera" "$TOOLS/tessera-fsck"; do
+    mods=${MODULES:-tessera_fs.ko tessera_fs-c.ko}
+    for f in $(for m in $mods; do echo "$OUT/$m"; done) "$TOOLS/mkfs-tessera" "$TOOLS/tessera-fsck"; do
         [ -f "$f" ] || { echo "missing $f" >&2; exit 1; }
     done
     st=$(mktemp -d)
-    cp "$OUT/tessera_fs.ko" "$OUT/tessera_fs-c.ko" "$TOOLS/mkfs-tessera" "$TOOLS/tessera-fsck" "$st/"
-    tar cf - -C "$st" . | "$VSSH" 'mkdir -p /root/d3 && tar xf - -C /root/d3 && cd /root/d3 && sha256 -q tessera_fs.ko tessera_fs-c.ko'
-    sha256sum "$st/tessera_fs.ko" "$st/tessera_fs-c.ko" | cut -d' ' -f1
+    for m in $mods; do cp "$OUT/$m" "$st/"; done
+    cp "$TOOLS/mkfs-tessera" "$TOOLS/tessera-fsck" "$st/"
+    tar cf - -C "$st" . | "$VSSH" "mkdir -p /root/d3 && tar xf - -C /root/d3 && cd /root/d3 && sha256 -q $mods"
+    (cd "$st" && sha256sum $mods | cut -d' ' -f1)
     rm -r "$st"
 }
 
@@ -49,7 +52,7 @@ KO=/root/d3/$1; N=$2; T=/root/d3; M=/mnt/d3; IMG=/var/tmp/d3.img
 PATH=$T:$PATH
 fail() { echo "FAIL: $*"; exit 1; }
 umount $M 2>/dev/null
-for k in tessera_fs tessera_fs.ko tessera_fs-c.ko; do kldunload $k 2>/dev/null; done
+for id in $(kldstat | awk '/tessera_fs/ {print $1}'); do kldunload -i $id 2>/dev/null; done
 for u in $(mdconfig -l); do mdconfig -lv -u $u | grep -q d3.img && mdconfig -d -u $u; done
 kldload $KO || fail kldload
 for kv in ${3:-}; do sysctl "$kv" >/dev/null || fail "sysctl $kv"; done
@@ -120,7 +123,7 @@ case "${1:-}" in
             echo "$out" | sed 's/^/   /'
             echo "$out" | grep -q '^PASS$' || rc=1
         done
-        [ $rc -eq 0 ] && echo "tessera-decode-vm-e2e: both modules PASS" || echo "tessera-decode-vm-e2e: FAILED"
+        [ $rc -eq 0 ] && echo "tessera-decode-vm-e2e: all modules PASS" || echo "tessera-decode-vm-e2e: FAILED"
         exit $rc ;;
     *) sed -n '2,18p' "$0"; exit 2 ;;
 esac

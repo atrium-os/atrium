@@ -46,6 +46,16 @@ CFLAGS+=    -DTESSERA_RUST_DECODE
 RUST_SRCS=  tessera_decode.rs
 .endif
 
+# Cross-language LTO (TESSERA_LTO=1, scripts/tessera-kmod-rust.sh lto): C and
+# Rust both become LLVM bitcode and are optimised together when ld.lld links
+# the module (the -r link in kmod.mk), so the decoders can inline into the C
+# that calls them. CC and ld.lld must be the Rust toolchain's LLVM version.
+# The SIMD files below opt out: their functions run inside fpu_kern regions
+# only, and keeping them separate objects keeps vector code from moving.
+.if defined(TESSERA_LTO) && !empty(TESSERA_LTO)
+CFLAGS+=    -flto=thin
+.endif
+
 # ★ #94: BLAKE3 NEON in the kernel, arm64 only.
 #
 # NEON/ASIMD is MANDATORY in ARMv8-A, so there is no runtime feature test to
@@ -108,7 +118,7 @@ OBJS+=      b3_blake3_neon.o
 # armv8crypto pattern) cannot work across two different toolchains.
 NEON_RESOURCE_DIR!=	${CC} -print-resource-dir 2>/dev/null || echo /nonexistent
 b3_blake3_neon.o: b3_blake3_neon.c
-	${CC} -c ${CFLAGS:N-mgeneral-regs-only} -I${.CURDIR}/neon-compat \
+	${CC} -c ${CFLAGS:N-mgeneral-regs-only:N-flto*} -I${.CURDIR}/neon-compat \
 	    -idirafter ${NEON_RESOURCE_DIR}/include ${WERROR} ${PROF} ${.IMPSRC}
 	${CTFCONVERT_CMD}
 .endif
@@ -132,7 +142,7 @@ b3_blake3_neon.o: b3_blake3_neon.c
 CFLAGS+=    -DBLAKE3_USE_X86=1
 OBJS+=      b3_blake3_sse41.o b3_blake3_avx2.o
 X86_RESOURCE_DIR!=	${CC} -print-resource-dir 2>/dev/null || echo /nonexistent
-X86_SIMD_CFLAGS=	${CFLAGS:N-mno-sse*:N-mno-avx*:N-mno-mmx:N-msoft-float:N-mno-aes} \
+X86_SIMD_CFLAGS=	${CFLAGS:N-mno-sse*:N-mno-avx*:N-mno-mmx:N-msoft-float:N-mno-aes:N-flto*} \
 		-I${.CURDIR}/neon-compat -idirafter ${X86_RESOURCE_DIR}/include \
 		-Wno-cast-qual -Wno-cast-align	# vendored verbatim (upstream casts)
 b3_blake3_sse41.o: b3_blake3_sse41.c
@@ -144,3 +154,37 @@ b3_blake3_avx2.o: b3_blake3_avx2.c
 .endif
 
 .include <bsd.kmod.mk>
+
+# The Rust half of TESSERA_LTO: every crate (core, kpi, tessera_decode) as
+# bitcode for the linker, in place of rustc's own thin LTO. After the include:
+# kern.rust.mk sets RUSTFLAGS and the rules expand it when they run.
+#
+# -strict-align: the aarch64-unknown-none-softfloat target turns it on and C
+# does not, and LLVM inlines only where the callee's features are a subset of
+# the caller's, so with it no decoder inlines into C. The kernel's C already
+# assumes unaligned loads work.
+#
+# ld -r keeps every global symbol, so linking rustroot.a's bitcode as it is
+# would carry all of core and kpi into the module (+260 KB of text). Instead
+# its crates are merged into rustroot-lto.o and everything but the
+# tessera_rs_* entry points is internalised and dropped before the link; the
+# C side then sees the same symbols the non-LTO staticlib exports.
+# (compiler_builtins is an empty native object and is left out.)
+.if defined(TESSERA_LTO) && !empty(TESSERA_LTO) && defined(RUST_SRCS)
+RUSTFLAGS:= ${RUSTFLAGS:N-Clto=*} -Clinker-plugin-lto -Ctarget-feature=-strict-align
+TESSERA_LLVMBIN?=	/usr/bin
+RUST_OBJS:=	${RUST_OBJS:N${RUSTROOT_A}} rustroot-lto.o
+${KMOD}.kld ${FULLPROG}: rustroot-lto.o
+rustroot-lto.o: ${RUSTROOT_A}
+	rm -rf rustroot-lto.d && mkdir rustroot-lto.d
+	(cd rustroot-lto.d && ${TESSERA_LLVMBIN}/llvm-ar x ../${RUSTROOT_A})
+	${TESSERA_LLVMBIN}/llvm-link -o rustroot-lto.d/all.bc \
+	    `for f in rustroot-lto.d/*.o; do \
+	        [ "$$(head -c2 $$f)" = BC ] && echo $$f; \
+	    done`
+	${TESSERA_LLVMBIN}/opt -passes=internalize,globaldce -thinlto-bc \
+	    -internalize-public-api-list='tessera_rs_*' \
+	    -o ${.TARGET} rustroot-lto.d/all.bc
+CLEANFILES+=	rustroot-lto.o
+CLEANDIRS+=	rustroot-lto.d
+.endif

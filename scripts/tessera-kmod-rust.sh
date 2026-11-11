@@ -5,6 +5,7 @@
 #
 #   sh scripts/tessera-kmod-rust.sh prepare   # freebsd-kpi-rs into $SRC/sys/rust (once)
 #   sh scripts/tessera-kmod-rust.sh build     # out/<target>-<kernconf>/tessera_fs{,-c}.ko
+#   LLVMBIN=/root/llvm20/bin sh scripts/tessera-kmod-rust.sh lto   # tessera_fs-lto.ko
 #
 # The kernel for $KERNCONF must already be built in $OBJ (RUNBOOK §13.2):
 # like the Rust kmod spike, this runs buildkernel -DKERNFAST with
@@ -25,17 +26,21 @@ LLVM="${LLVM:-$LLVM_DEF}"
 KERNCONF="${KERNCONF:-ATRIUM-NODEBUG}"
 TOOLCHAIN="${TOOLCHAIN:-nightly-2025-07-23}"
 OUT="$ROOT/atrium-tessera/kmod/out/$TARGET-$KERNCONF"
-NM=/usr/lib/llvm-$LLVM/bin/llvm-nm
+# LLVMBIN: a directory with clang, ld.lld, llvm-objcopy, ... (default the
+# distro's llvm-$LLVM). The LTO build needs one whose LLVM is the Rust
+# toolchain's (see build_lto).
+LLVMBIN="${LLVMBIN:-/usr/lib/llvm-$LLVM/bin}"
+NM="$LLVMBIN/llvm-nm"
 
 make_py() {
-    env CC=/usr/bin/clang-$LLVM CXX=/usr/bin/clang++-$LLVM CPP=/usr/bin/clang-cpp-$LLVM \
+    env CC="$LLVMBIN/clang" CXX="$LLVMBIN/clang++" CPP="$LLVMBIN/clang-cpp" \
         MAKEOBJDIRPREFIX="$OBJ" \
         RUSTC="$(rustup which --toolchain "$TOOLCHAIN" rustc)" \
         RUSTFMT="$(rustup which --toolchain "$TOOLCHAIN" rustfmt)" \
         BINDGEN="$(command -v bindgen)" \
         RUST_LIB_SRC="$(rustc +"$TOOLCHAIN" --print sysroot)/lib/rustlib/src/rust" \
-        XOBJCOPY=/usr/lib/llvm-$LLVM/bin/llvm-objcopy \
-        "$SRC/tools/build/make.py" --cross-bindir=/usr/lib/llvm-$LLVM/bin \
+        XOBJCOPY="$LLVMBIN/llvm-objcopy" \
+        "$SRC/tools/build/make.py" --cross-bindir="$LLVMBIN" \
         TARGET="$TARGET" TARGET_ARCH="$TARGET_ARCH" "$@"
 }
 
@@ -75,8 +80,30 @@ build() {
     ls -l "$OUT"
 }
 
+# Cross-language LTO (TESSERA_LTO=1): the C objects and every Rust crate are
+# LLVM bitcode, optimised together when the module is linked, so the Rust
+# decoders can inline into their C callers. Bitcode from two LLVM versions
+# does not mix: LLVMBIN must hold a clang and ld.lld of the same LLVM as
+# $TOOLCHAIN's rustc (nightly-2025-07-23: LLVM 20.1.8).
+build_lto() {
+    want=$(rustc +"$TOOLCHAIN" -vV | sed -n 's/^LLVM version: //p')
+    have=$("$LLVMBIN/clang" --version | sed -n '1s/.*clang version \([0-9.]*\).*/\1/p')
+    lld=$("$LLVMBIN/ld.lld" --version | sed -n 's/^LLD \([0-9.]*\).*/\1/p')
+    [ "$want" = "$have" ] && [ "$want" = "$lld" ] || {
+        echo "LTO needs clang and ld.lld $want (rustc +$TOOLCHAIN); $LLVMBIN has clang $have, lld $lld" >&2
+        exit 1
+    }
+    build_one tessera_fs-lto.ko TESSERA_LTO=1 TESSERA_LLVMBIN="$LLVMBIN"
+    # Inlined? Count the calls into Rust that are left (non-LTO: ~32 call
+    # sites; LTO: a handful, the decoders too big to inline).
+    n=$("$LLVMBIN/llvm-objdump" -d "$OUT/tessera_fs-lto.ko" | grep -c 'bl.*<tessera_rs_' || true)
+    echo "tessera_fs-lto.ko: $n direct calls into tessera_rs_* left"
+    ls -l "$OUT"
+}
+
 case "${1:-}" in
     prepare) SRC="$SRC" OBJ="$OBJ" TARGET="$TARGET" sh "$ROOT/scripts/rust-kmod-spike.sh" prepare ;;
     build)   build ;;
-    *)       sed -n '2,13p' "$0"; exit 2 ;;
+    lto)     build_lto ;;
+    *)       sed -n '2,14p' "$0"; exit 2 ;;
 esac

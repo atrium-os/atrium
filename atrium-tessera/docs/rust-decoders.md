@@ -208,6 +208,56 @@ replay and 4 minutes of fuzzing agree. Fuzzing did not catch a planted one-secto
 in the C reference (reserve allowed to start one sector inside the journal), so
 `test_layout_checked` checks every boundary exactly, both ways; it catches it in either build.
 
+## Phase 2: cross-language LTO (2026-11-11)
+
+`TESSERA_LTO=1` (`LLVMBIN=... sh scripts/tessera-kmod-rust.sh lto`, giving
+`tessera_fs-lto.ko`) builds the module's C with `-flto=thin` and every Rust crate (core, kpi,
+tessera_decode) with `-Clinker-plugin-lto`, so ld.lld's `-r` link optimises both as one
+program and the decoders inline into the C that calls them. The bitcode has to come from one
+LLVM: the kmod Rust toolchain (nightly-2025-07-23) is LLVM 20.1.8, so the module needs clang
+and ld.lld 20.1.8 (`build_lto` refuses a mismatch). The default nightly is LLVM 23, which is
+what the host benchmark uses.
+
+Two things had to be fixed before anything inlined (`kmod/Makefile` explains both):
+
+- `aarch64-unknown-none-softfloat` turns on `+strict-align`, C does not, and LLVM inlines only
+  where the callee's target features are a subset of the caller's. The first LTO build had
+  146 direct calls into `tessera_rs_*` (more than the 32 without LTO: the C forwarders
+  inlined, the Rust behind them did not). The LTO build passes `-Ctarget-feature=-strict-align`;
+  the kernel's C already assumes unaligned loads work.
+- `ld -r` keeps every global symbol, so rustroot.a as bitcode brought all of core and kpi into
+  the module (+260 KB of text, and 60 more kernel symbols to resolve at load). The crates are
+  now merged into `rustroot-lto.o`, everything except `tessera_rs_*` is internalised and
+  dropped (`opt -passes=internalize,globaldce`), and it is written as ThinLTO bitcode (a plain
+  bitcode module goes to the regular-LTO partition and does not inline into the thin C
+  modules either).
+
+Result: 6 direct calls into Rust left on NODEBUG (`dir_btree_node`, `pack_index_find`, the
+pack header and superblock-layout checks: too big to inline), 28 on KASAN (instrumentation
+raises the inline cost). Text 573 KB against 541 KB without LTO; the same undefined kernel
+symbols.
+
+- Stack (`scripts/kmod-stack-depth.py`, with the usual `--cut`/`--cold`): NODEBUG 6.1 KiB
+  (6.2 without LTO). KASAN 17.6 KiB (15.7 without): under KASAN every inlined decoder keeps
+  its own redzoned stack slots, and `tessera_fs_gc_data_zone_ex` calls the manifest accessors
+  at many sites, so its frame goes from 4,192 to 8,288 bytes. That is inside the 24 KiB KASAN
+  stack; NODEBUG, which is what ships, barely moves (that frame is 1,328 bytes against 1,248).
+- VM e2e (cloud, TCG): NODEBUG `tessera_fs-lto.ko`, `tessera_fs.ko` and `tessera_fs-c.ko` all
+  PASS in one boot. KASAN: `tessera_fs-lto.ko` PASS, no KASAN reports in dmesg.
+- Cost, host x86_64, callgrind, 20k-key blob-index tree, 100k lookups
+  (`scripts/tessera-lto-bench.sh`, clang 23 and rust-lld for all four):
+
+  | build | instructions | vs |
+  |-------|--------------|----|
+  | C | 3,908M | |
+  | Rust | 3,996M | +2.3% vs C |
+  | C, LTO | 3,863M | |
+  | Rust, LTO | 3,877M | +0.4% vs C with LTO |
+
+  With LTO the Rust decoders cost what the C ones do to within half a percent, and 0.8% less
+  than the C build without LTO. Kernel timing (HVF on the Mac) is still to do, with
+  `tessera_fs-lto.ko`; building it there needs clang and ld.lld 20.1.8 as well.
+
 ## Not moved yet (phase 2)
 
 - The kernel module's GC index enumerator (`tessera_fs_gc_pack_index_hashes`) keeps its
@@ -220,7 +270,7 @@ in the C reference (reserve allowed to start one sector inside the journal), so
   from disk, which is the class of bug the Rust move removes. In the B-tree, the batch's
   internal-node splice and `batch_emit` also stay C (counts computed, not read from disk).
 - The loader (`libsa`) stays C: no Rust in the boot loader for now.
-- HVF timing on the Mac VM; cross-language LTO.
+- HVF timing on the Mac VM (non-LTO and LTO modules).
 
 ## How to run
 
@@ -231,4 +281,6 @@ sh scripts/tessera-decode-diff.sh           # C vs Rust on every corpus
 sh scripts/tessera-decode-diff.sh -t 600 -j 2
 sh scripts/tessera-tools-cross.sh          # guest tools (mkfs, fsck) with Rust decoders
 (cd atrium-tessera/rs && cargo run --release -p tessera-test-harness --bin tessera-property-tests)
+LLVMBIN=/path/to/llvm20/bin sh scripts/tessera-kmod-rust.sh lto   # tessera_fs-lto.ko
+CLANG=clang-23 sh scripts/tessera-lto-bench.sh                    # C / Rust / LTO instruction counts
 ```

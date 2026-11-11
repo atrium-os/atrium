@@ -125,6 +125,7 @@ atrium-tessera/core/build-host-san-rs/
 atrium-tessera/core/build-cross-rs/
 atrium-tessera/core/build-cross-c/
 atrium-tessera/core/build-diff/
+atrium-tessera/core/build-bench/
 atrium-tessera/core/fuzz/artifacts/
 
 # Rust kmod spike build outputs (scripts/rust-kmod-spike.sh build).
