@@ -39,22 +39,53 @@ pub fn open(data: &[u8]) -> Result<Geometry> {
     }
     let hdr: &[u8; SECTOR] = data.get(..SECTOR).and_then(|h| h.try_into().ok()).ok_or(EINVAL)?;
     codec::pack_header(hdr)?;
-    let rd32 = |o| u32_at(hdr, o).ok_or(ECORRUPT);
-    let rd64 = |o| u64_at(hdr, o).ok_or(ECORRUPT);
-    if rd64(off::PH_TOTAL_PACK_BYTES)? != len as u64 {
+    if u64_at(hdr, off::PH_TOTAL_PACK_BYTES) != Some(len as u64) {
         return Err(ECORRUPT);
     }
+    let g = layout(hdr, len)?;
+
+    // Footer: magic, blob count, CRC over the data region.
+    let foot_off = len - SECTOR;
+    let footer: &[u8; SECTOR] = data.get(foot_off..).and_then(|f| f.try_into().ok()).ok_or(ECORRUPT)?;
+    codec::pack_footer(footer)?;
+    let region = range(data, usize_of(g.data_off).ok_or(ECORRUPT)?, usize_of(g.data_len).ok_or(ECORRUPT)?)
+        .ok_or(ECORRUPT)?;
+    if u32_at(footer, off::PF_BLOB_COUNT_CHECK) != Some(g.blob_count)
+        || u32_at(footer, off::PF_CRC32_PACK) != Some(crc32(region))
+    {
+        return Err(ECORRUPT);
+    }
+    Ok(g)
+}
+
+/// `tessera_pack_geom_from_header`: the kernel reads a pack's header sector
+/// and index without the rest of the pack, so it cannot run `open`. This is
+/// `open` minus the footer: header magic and CRC, then the same region
+/// containment against the size the header claims, which must be at least
+/// two sectors and fit in the `pack_len` bytes the caller has on disk.
+pub fn geom_from_header(hdr: &[u8; SECTOR], pack_len: u64) -> Result<Geometry> {
+    codec::pack_header(hdr)?;
+    let total = u64_at(hdr, off::PH_TOTAL_PACK_BYTES).ok_or(ECORRUPT)?;
+    if total < (SECTOR * 2) as u64 || total > pack_len {
+        return Err(ECORRUPT);
+    }
+    layout(hdr, usize_of(total).ok_or(ECORRUPT)?)
+}
+
+/// Region containment (#124) for a pack of `len >= 2 * SECTOR` bytes, written
+/// so nothing can wrap: every region lies between the header and the footer.
+fn layout(hdr: &[u8; SECTOR], len: usize) -> Result<Geometry> {
+    let rd32 = |o| u32_at(hdr, o).ok_or(ECORRUPT);
+    let rd64 = |o| u64_at(hdr, o).ok_or(ECORRUPT);
     let blob_count = rd32(off::PH_BLOB_COUNT)?;
     let index_blocks = rd32(off::PH_INDEX_BLOCKS)? as usize;
     let bloom_bytes = rd32(off::PH_BLOOM_BYTES)? as usize;
     let data_off = rd64(off::PH_DATA_OFFSET)?;
     let data_len = rd64(off::PH_DATA_LENGTH)?;
 
-    // Same containment rules as pack.c (#124), written so nothing can wrap:
-    // every region lies between the header and the footer.
     let index_off = SECTOR;
-    let foot_off = len - SECTOR; // len >= 2 sectors
-    if index_blocks > (foot_off - index_off) / SECTOR {
+    let foot_off = len.checked_sub(SECTOR).ok_or(ECORRUPT)?;
+    if foot_off < index_off || index_blocks > (foot_off - index_off) / SECTOR {
         return Err(ECORRUPT);
     }
     let index_bytes = index_blocks * SECTOR;
@@ -69,18 +100,6 @@ pub fn open(data: &[u8]) -> Result<Geometry> {
     if data_off > foot || data_len > foot - data_off {
         return Err(ECORRUPT);
     }
-
-    // Footer: magic, blob count, CRC over the data region.
-    let footer: &[u8; SECTOR] = data.get(foot_off..).and_then(|f| f.try_into().ok()).ok_or(ECORRUPT)?;
-    codec::pack_footer(footer)?;
-    let region = range(data, usize_of(data_off).ok_or(ECORRUPT)?, usize_of(data_len).ok_or(ECORRUPT)?)
-        .ok_or(ECORRUPT)?;
-    if u32_at(footer, off::PF_BLOB_COUNT_CHECK) != Some(blob_count)
-        || u32_at(footer, off::PF_CRC32_PACK) != Some(crc32(region))
-    {
-        return Err(ECORRUPT);
-    }
-
     Ok(Geometry {
         index_off: index_off as u64,
         bloom_off: bloom_off as u64,
@@ -90,6 +109,43 @@ pub fn open(data: &[u8]) -> Result<Geometry> {
         blob_count,
         k_hashes: rd32(off::PH_BLOOM_HASH_COUNT)?,
     })
+}
+
+/// `tessera_pack_index_find`: binary search of an index the caller read on
+/// its own (`idx` starts at `g.index_off` within the pack). Returns the
+/// pack-relative offset of the blob's descriptor and the blob's size, both
+/// checked to lie inside the data region, so the caller may allocate and read
+/// them. Same probe order as `lookup`.
+pub fn index_find(idx: &[u8], g: &Geometry, hash: &[u8; HASH_SIZE]) -> Result<(u64, u32)> {
+    let (mut lo, mut hi) = (0i64, i64::from(g.blob_count) - 1);
+    while lo <= hi {
+        let mid = lo + (hi - lo) / 2;
+        let at = usize::try_from(mid).ok().and_then(|m| m.checked_mul(PACK_INDEX_ENTRY_SIZE)).ok_or(ECORRUPT)?;
+        let e = range(idx, at, PACK_INDEX_ENTRY_SIZE).ok_or(ECORRUPT)?;
+        let key = e.get(..HASH_SIZE).ok_or(ECORRUPT)?;
+        match key.cmp(&hash[..]) {
+            Ordering::Less => lo = mid + 1,
+            Ordering::Greater => hi = mid - 1,
+            Ordering::Equal => return entry_span(e, g),
+        }
+    }
+    Err(ENOENT)
+}
+
+/// An index entry's blob, as (pack offset of its descriptor, data size), inside
+/// the data region.
+fn entry_span(e: &[u8], g: &Geometry) -> Result<(u64, u32)> {
+    let doff = u64_at(e, off::IE_DATA_OFFSET).ok_or(ECORRUPT)?;
+    let dsize = u32_at(e, off::IE_DATA_SIZE).ok_or(ECORRUPT)?;
+    if doff > g.data_len {
+        return Err(ECORRUPT);
+    }
+    let avail = g.data_len - doff;
+    let desc = BLOB_DESCRIPTOR_SIZE as u64;
+    if avail < desc || u64::from(dsize) > avail - desc {
+        return Err(ECORRUPT);
+    }
+    Ok((g.data_off.checked_add(doff).ok_or(ECORRUPT)?, dsize))
 }
 
 fn sub(data: &[u8], off: u64, len: u64) -> Option<&[u8]> {
@@ -145,17 +201,8 @@ pub fn lookup(data: &[u8], g: &Geometry, hash: &[u8; HASH_SIZE]) -> Result<(usiz
 }
 
 fn found(data: &[u8], g: &Geometry, e: &[u8]) -> Result<(usize, u32)> {
-    let doff = u64_at(e, off::IE_DATA_OFFSET).ok_or(ECORRUPT)?;
-    let dsize = u32_at(e, off::IE_DATA_SIZE).ok_or(ECORRUPT)?;
-    if doff > g.data_len {
-        return Err(ECORRUPT);
-    }
-    let avail = g.data_len - doff;
+    let (at, dsize) = entry_span(e, g)?;
     let desc = BLOB_DESCRIPTOR_SIZE as u64;
-    if avail < desc || u64::from(dsize) > avail - desc {
-        return Err(ECORRUPT);
-    }
-    let at = g.data_off.checked_add(doff).ok_or(ECORRUPT)?;
     let bd: &[u8; BLOB_DESCRIPTOR_SIZE] =
         sub(data, at, desc).and_then(|b| b.try_into().ok()).ok_or(ECORRUPT)?;
     codec::blob_descriptor(bd).map_err(|_| ECORRUPT)?;
@@ -211,5 +258,38 @@ mod boundary_tests {
         let (data, mut g, e) = case(0, 0, 0);
         g.data_len -= 1;
         assert!(found(&data, &g, &e).is_err());
+    }
+}
+
+#[cfg(test)]
+mod span_tests {
+    use super::*;
+
+    fn entry(doff: u64, dsize: u32) -> [u8; PACK_INDEX_ENTRY_SIZE] {
+        let mut e = [0u8; PACK_INDEX_ENTRY_SIZE];
+        e[off::IE_DATA_OFFSET..][..8].copy_from_slice(&doff.to_le_bytes());
+        e[off::IE_DATA_SIZE..][..4].copy_from_slice(&dsize.to_le_bytes());
+        e
+    }
+
+    /// Every (offset, size) near the end of the data region and near 2^64:
+    /// exact boundaries are what sweeps catch and random inputs miss.
+    #[test]
+    fn entry_span_boundaries() {
+        let g = Geometry { data_off: 8192, data_len: 4096, ..Default::default() };
+        let desc = BLOB_DESCRIPTOR_SIZE as u64;
+        for doff in (g.data_len - 200)..=(g.data_len + 2) {
+            for dsize in 0u32..=200 {
+                let fits = doff <= g.data_len && g.data_len - doff >= desc + u64::from(dsize);
+                let r = entry_span(&entry(doff, dsize), &g);
+                assert_eq!(r.is_ok(), fits, "doff {doff} dsize {dsize}");
+                if fits {
+                    assert_eq!(r, Ok((g.data_off + doff, dsize)));
+                }
+            }
+        }
+        for doff in [u64::MAX, u64::MAX - desc, u64::MAX - 8] {
+            assert!(entry_span(&entry(doff, 8), &g).is_err());
+        }
     }
 }

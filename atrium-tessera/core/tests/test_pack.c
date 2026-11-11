@@ -200,6 +200,84 @@ test_bloom_probe_cap(void)
 	tessera_pack_free(pb);
 }
 
+/* Partial-read API (the kernel's path): geometry from the header sector
+ * alone, and a search of a separately read index, must agree with the
+ * whole-pack reader and refuse entries that point outside the data. */
+static void
+test_partial_read_api(void)
+{
+	const uint8_t pack_id[16] = { 'P','A','C','K','P','A','R','T','I','A','L','R','E','A','D','S' };
+	tessera_pack_builder_t *pb = tessera_pack_begin(0, pack_id, 0);
+	enum { N = 40 };
+	uint8_t *bytes[N]; uint32_t lens[N]; tessera_hash_t hs[N];
+	for (uint32_t i = 0; i < N; i++) {
+		gen_blob(i, &bytes[i], &lens[i], hs[i]);
+		CHECK(tessera_pack_add_blob(pb, hs[i], bytes[i], lens[i], 0) == TESSERA_OK);
+	}
+	size_t need = 0;
+	(void)tessera_pack_finalize(pb, NULL, 0, &need);
+	uint8_t *pack = malloc(need); size_t sz = 0;
+	CHECK(tessera_pack_finalize(pb, pack, need, &sz) == TESSERA_OK);
+	tessera_pack_reader_t *pr = tessera_pack_open(pack, sz);
+	CHECK(pr != NULL);
+
+	tessera_pack_geom_t g;
+	CHECK(tessera_pack_geom_from_header(pack, sz, &g) == TESSERA_OK);
+	CHECK(g.blob_count == N);
+	/* More bytes on disk than the pack claims is fine (sector padding);
+	 * fewer is not. */
+	CHECK(tessera_pack_geom_from_header(pack, sz + 8192, &g) == TESSERA_OK);
+	CHECK(tessera_pack_geom_from_header(pack, sz - 1, &g) == TESSERA_ECORRUPT);
+	const uint8_t *idx = pack + g.index_off;
+	const size_t idx_len = (size_t)(g.bloom_off - g.index_off);
+	for (uint32_t i = 0; i < N && pr != NULL; i++) {
+		uint64_t off = 0; uint32_t n = 0;
+		const uint8_t *want = NULL; uint32_t wn = 0;
+		CHECK(tessera_pack_index_find(idx, idx_len, &g, hs[i], &off, &n) == TESSERA_OK);
+		CHECK(tessera_pack_lookup(pr, hs[i], &want, &wn) == TESSERA_OK);
+		CHECK(n == wn && n == lens[i]);
+		CHECK(pack + off + sizeof(tessera_blob_descriptor_t) == want);
+	}
+	tessera_hash_t absent;
+	memset(absent, 0x5a, sizeof absent);
+	uint64_t off; uint32_t n;
+	CHECK(tessera_pack_index_find(idx, idx_len, &g, absent, &off, &n) == TESSERA_ENOENT);
+	/* An index shorter than blob_count entries is refused, not overread. */
+	CHECK(tessera_pack_index_find(idx, 48, &g, hs[N - 1], &off, &n) == TESSERA_ECORRUPT);
+
+	/* An entry whose data_offset sits near 2^64: offset + size wraps, the
+	 * old kernel check passed it, and the read left the pack. */
+	tessera_pack_index_entry_t *e = (tessera_pack_index_entry_t *)
+	    (pack + g.index_off);
+	e->data_offset = UINT64_MAX - 8;
+	CHECK(tessera_pack_index_find(idx, idx_len, &g, e->blob_hash, &off, &n) == TESSERA_ECORRUPT);
+	e->data_offset = g.data_len - 4;
+	CHECK(tessera_pack_index_find(idx, idx_len, &g, e->blob_hash, &off, &n) == TESSERA_ECORRUPT);
+	/* Exact boundary: descriptor plus data ending at the region's end is
+	 * fine, one byte more is not (sweeps catch this, fuzzing did not). */
+	const uint64_t dsz = sizeof(tessera_blob_descriptor_t);
+	for (uint32_t k = 0; k < 64; k++) {
+		e->data_offset = g.data_len - dsz - k;
+		e->data_size = k;
+		CHECK(tessera_pack_index_find(idx, idx_len, &g, e->blob_hash, &off, &n) == TESSERA_OK);
+		CHECK(off == g.data_off + g.data_len - dsz - k && n == k);
+		e->data_size = k + 1;
+		CHECK(tessera_pack_index_find(idx, idx_len, &g, e->blob_hash, &off, &n) == TESSERA_ECORRUPT);
+	}
+
+	/* A header whose data region runs past its own size. */
+	tessera_pack_header_t hh;
+	CHECK(tessera_decode_pack_header(pack, &hh) == TESSERA_OK);
+	hh.data_length = hh.total_pack_bytes;
+	CHECK(tessera_encode_pack_header(&hh, pack) == TESSERA_OK);
+	CHECK(tessera_pack_geom_from_header(pack, sz, &g) == TESSERA_ECORRUPT);
+
+	tessera_pack_close(pr);
+	for (uint32_t i = 0; i < N; i++) free(bytes[i]);
+	free(pack);
+	tessera_pack_free(pb);
+}
+
 int
 main(void)
 {
@@ -208,6 +286,7 @@ main(void)
 	test_duplicate_rejected();
 	test_corruption_detected();
 	test_bloom_probe_cap();
+	test_partial_read_api();
 	if (failures > 0) {
 		fprintf(stderr, "%d failure(s)\n", failures);
 		return 1;

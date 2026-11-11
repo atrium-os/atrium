@@ -67,6 +67,39 @@ int tessera_pack_bloom_might_contain(const tessera_pack_reader_t *,
 
 void tessera_pack_close(tessera_pack_reader_t *);
 
+/* ── Partial reads (the kernel module) ───────────────────────────────
+ *
+ * The kernel reads a pack's header sector and index without reading the
+ * whole pack, so it cannot use tessera_pack_open. These two give it the same
+ * checks over what it did read. All offsets are pack-relative bytes.
+ */
+typedef struct {
+	uint64_t index_off;
+	uint64_t bloom_off;
+	uint64_t bloom_bytes;
+	uint64_t data_off;
+	uint64_t data_len;
+	uint32_t blob_count;
+	uint32_t k_hashes;
+} tessera_pack_geom_t;
+
+/* Header magic and CRC, then tessera_pack_open's region containment against
+ * the size the header claims, which must be at least two sectors and at most
+ * pack_len (the bytes the caller has on disk). No footer check. */
+int tessera_pack_geom_from_header(const uint8_t hdr[TESSERA_SECTOR_SIZE],
+                                  uint64_t pack_len,
+                                  tessera_pack_geom_t *out);
+
+/* Binary search of an index the caller read itself: idx holds idx_len bytes
+ * starting at geom->index_off. On a hit, the blob's descriptor offset and
+ * its data size, both checked to lie inside the data region, so the caller
+ * can allocate and read them. TESSERA_ENOENT if absent, TESSERA_ECORRUPT if
+ * the index or the entry does not fit. */
+int tessera_pack_index_find(const uint8_t *idx, size_t idx_len,
+                            const tessera_pack_geom_t *geom,
+                            const tessera_hash_t hash,
+                            uint64_t *out_desc_off, uint32_t *out_size);
+
 #ifdef __cplusplus
 }
 #endif

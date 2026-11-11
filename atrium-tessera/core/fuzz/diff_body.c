@@ -240,6 +240,45 @@ run_manifest(const uint8_t *data, size_t len, diff_trace_t *t)
 
 #define PACK_CAP 256u
 
+/* The kernel's partial-read API (pack.h): geometry from the header sector
+ * against a pack_len the input varies around the real size, then index
+ * searches over an index buffer whose length the input also varies, so
+ * short indexes and entries pointing anywhere are reached. */
+static void
+run_pack_partial(const uint8_t *buf, size_t len, uint8_t knob,
+    diff_trace_t *t)
+{
+	static const int64_t dl[] = { 0, -1, -(int64_t)SECT, (int64_t)SECT,
+	    (int64_t)SECT * 1000 };
+	const uint64_t plen = (uint64_t)((int64_t)len + dl[knob % 5]);
+	tessera_pack_geom_t g;
+	memset(&g, 0, sizeof g);
+	int rc = tessera_pack_geom_from_header(buf, plen, &g);
+	diff_put(t, (uint64_t)(int64_t)rc);
+	if (rc != TESSERA_OK) return;
+	diff_put(t, g.index_off); diff_put(t, g.bloom_off);
+	diff_put(t, g.bloom_bytes); diff_put(t, g.data_off);
+	diff_put(t, g.data_len); diff_put(t, g.blob_count);
+	diff_put(t, g.k_hashes);
+	if (g.index_off > len) return;
+	size_t idx_len = (size_t)(g.bloom_off - g.index_off);
+	if (idx_len > len - g.index_off) idx_len = len - g.index_off;
+	if (knob & 0x80) idx_len /= 2;          /* a short index */
+	const uint8_t *idx = buf + g.index_off;
+	uint32_t n = g.blob_count < PACK_CAP ? g.blob_count : PACK_CAP;
+	for (uint32_t i = 0; i <= n; i++) {
+		tessera_hash_t hh;
+		if (i < n && (size_t)i * TESSERA_PACK_INDEX_ENTRY_SIZE + 32 <= idx_len)
+			memcpy(hh, idx + (size_t)i * TESSERA_PACK_INDEX_ENTRY_SIZE, 32);
+		else
+			memcpy(hh, buf + SECT + 7, sizeof hh);
+		uint64_t off = 0; uint32_t sz = 0;
+		diff_put(t, (uint64_t)(int64_t)tessera_pack_index_find(idx, idx_len,
+		    &g, hh, &off, &sz));
+		diff_put(t, off); diff_put(t, sz);
+	}
+}
+
 static void
 run_pack(const uint8_t *data, size_t len, diff_trace_t *t)
 {
@@ -270,6 +309,8 @@ run_pack(const uint8_t *data, size_t len, diff_trace_t *t)
 	uint32_t hcrc = tessera_crc32(buf, crc_off);
 	memcpy(buf + crc_off, &hcrc, 4);
 
+	run_pack_partial(buf, len, data[len - 2], t);
+
 	tessera_pack_reader_t *r = tessera_pack_open(buf, len);
 	diff_put(t, r != NULL);
 	if (r == NULL) { free(buf); return; }
@@ -277,10 +318,6 @@ run_pack(const uint8_t *data, size_t len, diff_trace_t *t)
 	diff_put(t, count);
 	diff_put(t, rel(tessera_pack_pack_id(r), buf, len) == UINT64_MAX - 1
 	    ? tessera_crc32(tessera_pack_pack_id(r), 16) : 0);
-	/* bloom_hash_count above the Rust cap (64) may turn a C "absent" into
-	 * a Rust "might contain" (pack.rs MAX_BLOOM_PROBES); never the reverse,
-	 * and lookup still decides. */
-	const int k_capped = h->bloom_hash_count > 64;
 	uint32_t n = count < PACK_CAP ? count : PACK_CAP;
 	for (uint32_t i = 0; i <= n; i++) {
 		tessera_hash_t hh;
@@ -295,13 +332,9 @@ run_pack(const uint8_t *data, size_t len, diff_trace_t *t)
 		const uint8_t *bytes = NULL; uint32_t sz = 0;
 		diff_put(t, (uint64_t)(int64_t)tessera_pack_lookup(r, hh, &bytes, &sz));
 		diff_put(t, rel(bytes, buf, len)); diff_put(t, sz);
-		/* Not called at all past the cap: the C reader loops
-		 * bloom_hash_count times, up to 2^32 per call (found by this
-		 * test as a libFuzzer timeout; the Rust reader caps it). */
-		if (k_capped)
-			diff_put(t, DIFF_ANY);
-		else
-			diff_put(t, (uint64_t)tessera_pack_bloom_might_contain(r, hh));
+		/* Both readers cap probes at 64 (the C one looped up to 2^32
+		 * times; found by this test as a libFuzzer timeout). */
+		diff_put(t, (uint64_t)tessera_pack_bloom_might_contain(r, hh));
 	}
 	uint32_t edge[] = { count, count + 1, 0x7fffffffu, 0x80000000u, 0xffffffffu };
 	for (unsigned e = 0; e < sizeof edge / sizeof edge[0]; e++) {

@@ -549,3 +549,128 @@ tessera_pack_close(tessera_pack_reader_t *r)
 {
 	tessera_free(r);
 }
+
+/* ── Partial reads (pack.h) ──────────────────────────────────────── */
+
+#ifdef TESSERA_RUST_DECODE
+_Static_assert(sizeof(tessera_pack_geom_t) == sizeof(tessera_rs_pack_geom_t),
+    "tessera_pack_geom_t must match pack::Geometry");
+
+int
+tessera_pack_geom_from_header(const uint8_t hdr[TESSERA_SECTOR_SIZE],
+                              uint64_t pack_len, tessera_pack_geom_t *out)
+{
+	return tessera_rs_pack_geom_from_header(hdr, pack_len,
+	    (tessera_rs_pack_geom_t *)out);
+}
+
+int
+tessera_pack_index_find(const uint8_t *idx, size_t idx_len,
+                        const tessera_pack_geom_t *geom,
+                        const tessera_hash_t hash,
+                        uint64_t *out_desc_off, uint32_t *out_size)
+{
+	return tessera_rs_pack_index_find(idx, idx_len,
+	    (const tessera_rs_pack_geom_t *)geom, hash, out_desc_off, out_size);
+}
+#else
+static uint32_t
+geom_rd32(const uint8_t *p, size_t off)
+{
+	uint32_t v;
+	memcpy(&v, p + off, sizeof v);
+	return v;
+}
+
+static uint64_t
+geom_rd64(const uint8_t *p, size_t off)
+{
+	uint64_t v;
+	memcpy(&v, p + off, sizeof v);
+	return v;
+}
+
+int
+tessera_pack_geom_from_header(const uint8_t hdr[TESSERA_SECTOR_SIZE],
+                              uint64_t pack_len, tessera_pack_geom_t *out)
+{
+	if (hdr == NULL || out == NULL) return TESSERA_EINVAL;
+	if (memcmp(hdr, TESSERA_MAGIC_PACK, 8) != 0) return TESSERA_ECORRUPT;
+	const size_t crc_off = offsetof(tessera_pack_header_t, crc32_header);
+	if (geom_rd32(hdr, crc_off) != tessera_crc32(hdr, crc_off))
+		return TESSERA_ECORRUPT;
+
+	const uint64_t sect  = TESSERA_SECTOR_SIZE;
+	const uint64_t total = geom_rd64(hdr,
+	    offsetof(tessera_pack_header_t, total_pack_bytes));
+	if (total < 2 * sect || total > pack_len) return TESSERA_ECORRUPT;
+
+	/* tessera_pack_open's containment (#124), against `total`. */
+	const uint32_t blob_count   = geom_rd32(hdr,
+	    offsetof(tessera_pack_header_t, blob_count));
+	const uint64_t index_blocks = geom_rd32(hdr,
+	    offsetof(tessera_pack_header_t, index_blocks));
+	const uint64_t bloom_bytes  = geom_rd32(hdr,
+	    offsetof(tessera_pack_header_t, bloom_bytes));
+	const uint64_t data_off     = geom_rd64(hdr,
+	    offsetof(tessera_pack_header_t, data_offset));
+	const uint64_t data_len     = geom_rd64(hdr,
+	    offsetof(tessera_pack_header_t, data_length));
+	const uint64_t index_off = sect;
+	const uint64_t foot_off  = total - sect;
+	if (index_blocks > (foot_off - index_off) / sect) return TESSERA_ECORRUPT;
+	const uint64_t index_bytes = index_blocks * sect;
+	if (blob_count > index_bytes / TESSERA_PACK_INDEX_ENTRY_SIZE)
+		return TESSERA_ECORRUPT;
+	const uint64_t bloom_off = index_off + index_bytes;
+	if (bloom_bytes > foot_off - bloom_off) return TESSERA_ECORRUPT;
+	if (data_off > foot_off || data_len > foot_off - data_off)
+		return TESSERA_ECORRUPT;
+
+	out->index_off   = index_off;
+	out->bloom_off   = bloom_off;
+	out->bloom_bytes = bloom_bytes;
+	out->data_off    = data_off;
+	out->data_len    = data_len;
+	out->blob_count  = blob_count;
+	out->k_hashes    = geom_rd32(hdr,
+	    offsetof(tessera_pack_header_t, bloom_hash_count));
+	return TESSERA_OK;
+}
+
+int
+tessera_pack_index_find(const uint8_t *idx, size_t idx_len,
+                        const tessera_pack_geom_t *geom,
+                        const tessera_hash_t hash,
+                        uint64_t *out_desc_off, uint32_t *out_size)
+{
+	if (idx == NULL || geom == NULL || hash == NULL ||
+	    out_desc_off == NULL || out_size == NULL)
+		return TESSERA_EINVAL;
+	int64_t lo = 0, hi = (int64_t)geom->blob_count - 1;
+	while (lo <= hi) {
+		const int64_t mid = lo + (hi - lo) / 2;
+		const uint64_t at = (uint64_t)mid * TESSERA_PACK_INDEX_ENTRY_SIZE;
+		if (at > idx_len || idx_len - at < TESSERA_PACK_INDEX_ENTRY_SIZE)
+			return TESSERA_ECORRUPT;
+		const uint8_t *e = idx + at;
+		const int c = memcmp(e, hash, 32);
+		if (c < 0) { lo = mid + 1; continue; }
+		if (c > 0) { hi = mid - 1; continue; }
+		const uint64_t doff = geom_rd64(e,
+		    offsetof(tessera_pack_index_entry_t, data_offset));
+		const uint32_t dsize = geom_rd32(e,
+		    offsetof(tessera_pack_index_entry_t, data_size));
+		/* Subtraction against the data region, as tessera_pack_lookup. */
+		if (doff > geom->data_len) return TESSERA_ECORRUPT;
+		const uint64_t avail = geom->data_len - doff;
+		const uint64_t desc  = sizeof(tessera_blob_descriptor_t);
+		if (avail < desc || dsize > avail - desc) return TESSERA_ECORRUPT;
+		if (doff > UINT64_MAX - geom->data_off) return TESSERA_ECORRUPT;
+		*out_desc_off = geom->data_off + doff;
+		*out_size     = dsize;
+		return TESSERA_OK;
+	}
+	return TESSERA_ENOENT;
+}
+#endif

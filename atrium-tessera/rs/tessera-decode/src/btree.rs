@@ -6,7 +6,7 @@
 //! after it, `search` indexes entries through checked sub-slices as well.
 
 use crate::codec::{self, BTREE_NODE_HEADER_SIZE, off};
-use crate::le::{range, u32_at, u8_at};
+use crate::le::{u32_at, u8_at};
 use core::cmp::Ordering;
 
 /// `tessera_btree_fail_t`.

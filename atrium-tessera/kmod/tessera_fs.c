@@ -18620,49 +18620,31 @@ tessera_fs_pack_extract_blob(const uint8_t *pack, uint32_t packlen,
     uint32_t hash_alg, const tessera_hash_t hash, uint8_t *dst,
     uint64_t dst_cap, uint8_t **out_buf, uint32_t *out_len, int mflags)
 {
-	if (packlen < TESSERA_SECTOR_SIZE) return (EIO);
-	/* Read the few header fields we need straight out of the (already
-	 * validated, in-RAM) pack via a packed-struct overlay. Avoids a
-	 * malloc(4096,M_WAITOK)+decode+free per blob — that per-chunk header
-	 * alloc, done under the pack-cache mutex, was the whole post-cache
-	 * read bottleneck (~3 ms/chunk). The pack was CRC-checked when it was
-	 * read into the cache, so re-decoding it here buys nothing. */
-	const tessera_pack_header_t *hdr = (const tessera_pack_header_t *)pack;
-	if (memcmp(hdr->magic, TESSERA_MAGIC_PACK, 8) != 0) return (EIO);
-	const uint32_t bc           = hdr->blob_count;
-	const uint32_t index_blocks = hdr->index_blocks;
-	const uint64_t hdr_data_off = hdr->data_offset;
-	if (bc == 0) return (ENOENT);
-
-	const uint64_t idx_bytes = (uint64_t)index_blocks * TESSERA_SECTOR_SIZE;
-	if (idx_bytes == 0 ||
-	    TESSERA_SECTOR_SIZE + idx_bytes > packlen ||
-	    (uint64_t)bc * TESSERA_PACK_INDEX_ENTRY_SIZE > idx_bytes)
+	if (packlen < 2 * TESSERA_SECTOR_SIZE) return (EIO);
+	/*
+	 * ★ Phase 2 (D3): the header, the index search and the blob's bounds
+	 * go through the checked partial-read API (Rust in the default build,
+	 * pack.h). This used to read the header through a packed-struct
+	 * overlay and trust it because the pack was CRC-checked into the
+	 * cache, but a CRC proves the bytes are the ones written, not that they
+	 * are sane: an index entry with data_offset near 2^64 made
+	 * `blob_off + descriptor + dlen` wrap, pass the `> packlen` check, and
+	 * memcpy from far outside the pack. No allocation here either: the
+	 * header CRC is checked in place (a few us per blob, against the hash
+	 * verify that follows).
+	 */
+	tessera_pack_geom_t g;
+	if (tessera_pack_geom_from_header(pack, packlen, &g) != TESSERA_OK)
 		return (EIO);
-	const uint8_t *idx = pack + TESSERA_SECTOR_SIZE;
-
-	int lo = 0, hi = (int)bc - 1, found = 0;
-	tessera_pack_index_entry_t ie;
-	while (lo <= hi) {
-		const int mid = lo + (hi - lo) / 2;
-		const uint8_t *e = idx +
-		    (size_t)mid * TESSERA_PACK_INDEX_ENTRY_SIZE;
-		const int c = memcmp(e, hash, 32);
-		if (c == 0) {
-			if (tessera_decode_pack_index_entry(e, &ie) != TESSERA_OK)
-				return (EIO);
-			found = 1;
-			break;
-		}
-		if (c < 0) lo = mid + 1; else hi = mid - 1;
-	}
-	if (!found) return (ENOENT);
-
-	const uint64_t blob_off = hdr_data_off + ie.data_offset;
-	const uint32_t dlen = ie.data_size;
-	if (blob_off + sizeof(tessera_blob_descriptor_t) +
-	    (uint64_t)dlen > packlen)
-		return (EIO);
+	if (g.blob_count == 0) return (ENOENT);
+	uint64_t blob_off;
+	uint32_t dlen;
+	int fr = tessera_pack_index_find(pack + g.index_off,
+	    (size_t)(g.bloom_off - g.index_off), &g, hash, &blob_off, &dlen);
+	if (fr == TESSERA_ENOENT) return (ENOENT);
+	if (fr != TESSERA_OK) return (EIO);
+	/* blob_off .. + descriptor + dlen is inside the data region, which is
+	 * inside the pack's total_pack_bytes <= packlen. */
 	tessera_blob_descriptor_t bd;
 	if (tessera_decode_blob_descriptor(pack + blob_off, &bd) != TESSERA_OK ||
 	    bd.uncompressed_size != dlen)
@@ -18794,58 +18776,50 @@ tessera_fs_pack_fetch_ondemand(struct tessera_mount *tmp_,
     const tessera_hash_t hash, const uint8_t *warm_pack_id,
     uint8_t **out_buf, uint32_t *out_len)
 {
-	/* Heap, not stack: both the 4 KiB sector buffer AND the decoded
-	 * header (tessera_pack_header_t is itself 4096 bytes) would blow the
-	 * kernel stack on the deep VFS read chain. Pull the few fields we
-	 * need into scalars, then drop the big buffers immediately. */
+	/* Heap, not stack: the 4 KiB sector buffer would blow the kernel stack
+	 * on the deep VFS read chain.
+	 *
+	 * ★ Phase 2 (D3): header, index search and blob bounds go through the
+	 * checked partial-read API (Rust in the default build, pack.h). The
+	 * old inline code allocated the blob from the index entry's data_size
+	 * (up to 4 GiB, M_WAITOK) before checking that it fit the pack, and
+	 * never bounded the index against the pack's size. Now the geometry is
+	 * checked against what the extents hold, and the entry against the
+	 * data region, before anything is allocated or read. */
 	uint8_t *hdrsec = malloc(TESSERA_SECTOR_SIZE, M_TESSERA, M_WAITOK);
-	tessera_pack_header_t *hdr =
-	    malloc(sizeof *hdr, M_TESSERA, M_WAITOK);
+	tessera_pack_geom_t g;
 	if (tessera_fs_pack_bread_sector(tmp_, exts, nexts, 0, hdrsec) != 0 ||
-	    tessera_decode_pack_header(hdrsec, hdr) != TESSERA_OK) {
+	    total_sectors > UINT64_MAX / TESSERA_SECTOR_SIZE ||
+	    tessera_pack_geom_from_header(hdrsec,
+	        total_sectors * TESSERA_SECTOR_SIZE, &g) != TESSERA_OK) {
 		free(hdrsec, M_TESSERA);
-		free(hdr, M_TESSERA);
 		return (EIO);
 	}
-	const uint32_t bc          = hdr->blob_count;
-	const uint32_t index_blocks = hdr->index_blocks;
-	const uint64_t hdr_data_off = hdr->data_offset;
 	free(hdrsec, M_TESSERA);
-	free(hdr, M_TESSERA);
+	const uint32_t bc = g.blob_count;
 	if (bc == 0) return (ENOENT);
 
 	/* Read the whole index (index_blocks sectors from sector 1) — a few
-	 * KiB even for a full fan-out — then binary-search it in RAM. */
-	const uint64_t idx_bytes =
-	    (uint64_t)index_blocks * TESSERA_SECTOR_SIZE;
-	if (idx_bytes == 0 ||
-	    (uint64_t)bc * TESSERA_PACK_INDEX_ENTRY_SIZE > idx_bytes)
-		return (EIO);
+	 * KiB even for a full fan-out — then binary-search it in RAM. The
+	 * geometry check put it inside the pack. */
+	const uint64_t idx_bytes = g.bloom_off - g.index_off;
 	uint8_t *idx = malloc(idx_bytes, M_TESSERA, M_NOWAIT);
 	if (idx == NULL) return (ENOMEM);
 	if (tessera_fs_pack_read_range(tmp_, exts, nexts, total_sectors,
-	    TESSERA_SECTOR_SIZE, idx_bytes, idx) != 0) {
+	    g.index_off, idx_bytes, idx) != 0) {
 		free(idx, M_TESSERA);
 		return (EIO);
 	}
 
-	int lo = 0, hi = (int)bc - 1, found = 0;
-	tessera_pack_index_entry_t ie;
-	while (lo <= hi) {
-		const int mid = lo + (hi - lo) / 2;
-		const uint8_t *e = idx +
-		    (size_t)mid * TESSERA_PACK_INDEX_ENTRY_SIZE;
-		const int c = memcmp(e, hash, 32);
-		if (c == 0) {
-			if (tessera_decode_pack_index_entry(e, &ie) != TESSERA_OK) {
-				free(idx, M_TESSERA);
-				return (EIO);
-			}
-			found = 1;
-			break;
-		}
-		if (c < 0) lo = mid + 1; else hi = mid - 1;
+	uint64_t blob_off = 0;
+	uint32_t dlen = 0;
+	const int fr = tessera_pack_index_find(idx, (size_t)idx_bytes, &g, hash,
+	    &blob_off, &dlen);
+	if (fr != TESSERA_OK && fr != TESSERA_ENOENT) {
+		free(idx, M_TESSERA);
+		return (EIO);
 	}
+	const int found = (fr == TESSERA_OK);
 
 	/* Warm the location cache for every blob in this pack (cheap; the
 	 * index is already in RAM). Snapshot up to 4 extents inline. */
@@ -18866,11 +18840,8 @@ tessera_fs_pack_fetch_ondemand(struct tessera_mount *tmp_,
 	free(idx, M_TESSERA);
 	if (!found) return (ENOENT);
 
-	/* Read the blob: 16-byte descriptor + data_size bytes at
-	 * header.data_offset + index.data_offset. */
-	const uint64_t blob_off = hdr_data_off + ie.data_offset;
-	const uint32_t dlen = ie.data_size;
-
+	/* Read the blob: descriptor + data_size bytes at blob_off, both
+	 * inside the pack's data region (tessera_pack_index_find). */
 	uint8_t descbuf[sizeof(tessera_blob_descriptor_t)];
 	if (tessera_fs_pack_read_range(tmp_, exts, nexts, total_sectors,
 	    blob_off, sizeof descbuf, descbuf) != 0)
@@ -18880,7 +18851,13 @@ tessera_fs_pack_fetch_ondemand(struct tessera_mount *tmp_,
 	    bd.uncompressed_size != dlen)
 		return (EIO);
 
-	uint8_t *buf = malloc(dlen ? dlen : 1, M_TESSERA, M_WAITOK);
+	/* dlen is now bounded by the pack, but the pack's size comes from its
+	 * extent list on disk. A blob larger than the pack cache's 64 MiB pack
+	 * bound is allocated without sleeping, so a forged size fails the read
+	 * instead of parking the thread in malloc. */
+	uint8_t *buf = malloc(dlen ? dlen : 1, M_TESSERA,
+	    dlen <= (64u << 20) ? M_WAITOK : M_NOWAIT);
+	if (buf == NULL) return (ENOMEM);
 	if (dlen > 0) {
 		if (tessera_fs_pack_read_range(tmp_, exts, nexts, total_sectors,
 		    blob_off + sizeof(tessera_blob_descriptor_t), dlen,

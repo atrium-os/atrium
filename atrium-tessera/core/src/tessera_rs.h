@@ -92,6 +92,11 @@ typedef struct {
 
 int tessera_rs_pack_open(const uint8_t *data, size_t len,
     tessera_rs_pack_geom_t *out_geom, void *out_hdr);
+int tessera_rs_pack_geom_from_header(const uint8_t *hdr, uint64_t pack_len,
+    tessera_rs_pack_geom_t *out_geom);
+int tessera_rs_pack_index_find(const uint8_t *idx, size_t idx_len,
+    const tessera_rs_pack_geom_t *geom, const uint8_t *hash,
+    uint64_t *out_desc_off, uint32_t *out_size);
 int tessera_rs_pack_bloom_might_contain(const uint8_t *data, size_t len,
     const tessera_rs_pack_geom_t *geom, const uint8_t *hash);
 int tessera_rs_pack_lookup(const uint8_t *data, size_t len,

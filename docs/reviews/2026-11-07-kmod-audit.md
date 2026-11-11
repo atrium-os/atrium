@@ -98,6 +98,11 @@ is not committed; the J1 input is, as `fuzz/corpus/fuzz_journal/regress-2026-11-
   synchronous backstop: the nested inline flush is rare, and the hasher move is what took
   the chain that hung off the stack's end. The queued path is the same `taskqueue_enqueue`
   the async threshold already uses on every run.
+- D3 phase 2 (2026-11-11): the kmod's whole-pack cache reader could read outside the pack
+  (an index `data_offset` near 2^64 wrapped the bounds check), and its on-demand reader
+  allocated a blob size from disk (up to 4 GiB, `M_WAITOK`) before checking it. Both now
+  use the checked Rust partial-read API (`tessera_pack_geom_from_header`,
+  `tessera_pack_index_find`); see rust-decoders.md.
 - G2 per-client accounting, G3 static assert, V6 offset spaces: small, not urgent.
 - `scripts/core-fuzz.sh`: the `UBSAN_OPTIONS=... \` line was followed by a comment, so the
   variable never reached the command. Fixed 2026-11-10 with the D3 fuzz changes.

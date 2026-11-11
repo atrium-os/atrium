@@ -16,7 +16,7 @@ and for the loader.
 | `codec` | `codec.c` `tessera_decode_*` (14 decoders) | superblock, journal header, record header, pack header and footer, blob descriptor, manifest header, B-tree node header, pack extent list (magic, CRC, count 1..253, no zero-length extent, lengths sum to the total) |
 | `crc` | `crc.c` (for the decoders) | CRC-32, slice-by-8, const table |
 | `manifest` | `manifest.c` parser half | header, body bounds, chunk/tree/bucket/xattr/dirent/dir-btree accessors, and a whole-node check for directory B-tree nodes (`dir_btree_node`) |
-| `pack` | `pack.c` reader | pack geometry (the #124 checks plus the footer), bloom probe, binary search of the index, descriptor bounds |
+| `pack` | `pack.c` reader; the kmod's two pack readers (phase 2) | pack geometry (the #124 checks plus the footer, or from the header sector alone), bloom probe, binary search of the index, descriptor bounds |
 | `btree` | `btree.c` `load_node` checks and `search_leaf` | node header, tree kind, fan-out cap, key/value geometry, binary search |
 | `journal` | `journal.c` record read and advance | record header, sector count (64-bit), body inside the ring |
 
@@ -123,10 +123,36 @@ boundaries and single-value holes are what sweeps catch and random inputs do not
 | `kmod/tessera_fs.c` dir-btree insert and remove | recursion depth came from the image | fixed: bounded at 32 levels, as the walk |
 | `journal.c` | `sectors_for` in 32 bits wraps for a huge `body_length`; `journal_open` did not check `head_block`/`tail_block`; a huge body length could make the kernel `malloc(M_WAITOK)` up to 4 GB | fixed: open rejects head or tail outside 1..length-1; record bodies capped at 1 MiB on append and replay (C and Rust), which also keeps the 32-bit sector count from wrapping; `test_bad_head_tail_and_body_cap` |
 
+## Phase 2: the kernel module's pack readers (2026-11-11)
+
+The module reads packs two ways that `tessera_pack_open` cannot serve, because they do not
+hold the whole pack: the whole-pack cache (`tessera_fs_pack_extract_blob`, a RAM copy) and
+the on-demand reader (`tessera_fs_pack_fetch_ondemand`, header sector, then index, then one
+blob). Both parsed the header and index inline, and both had bugs:
+
+- the cache reader trusted the header because the pack had been CRC-checked into the cache.
+  A CRC proves the bytes are the ones written, not that they are sane: an index entry with
+  `data_offset` near 2^64 made `offset + descriptor + size` wrap, pass the `> packlen`
+  check, and `memcpy` from outside the pack;
+- the on-demand reader allocated the blob from the entry's `data_size` (up to 4 GiB,
+  `M_WAITOK`) before checking it fit, and never bounded the index by the pack's size.
+
+Two entry points in `pack.h` replace that code: `tessera_pack_geom_from_header` (`open`'s
+containment rules over the header sector alone, against the bytes the extents hold) and
+`tessera_pack_index_find` (binary search of a separately read index; returns a descriptor
+offset and size already checked against the data region). Rust in the default build, with a
+C reference, both in the differential harness (`run_pack_partial`). A planted off-by-one in
+the entry bound was missed by replay and fuzzing, so `pack::span_tests` and
+`test_partial_read_api` sweep it exhaustively. The on-demand reader also allocates blobs over
+64 MiB without sleeping, since the pack's size still comes from its extent list.
+
 ## Not moved yet (phase 2)
 
-- The kernel module's own inline walkers over manifests and packs in `tessera_fs.c`
-  (the flat dirent loops already bounds-check). They should call the crate.
+- The kernel module's own inline walkers: the pack readers are done (below); manifests
+  already went through the crate's parser. The GC's index enumerator
+  (`tessera_fs_gc_pack_index_hashes`) keeps its own subtraction-style checks.
+- The userspace tools and the write paths (encoders, btree insert/split, journal write,
+  pack write) are next.
 - The userspace tools (`mkfs-tessera`, `tessera-fsck`, the Rust tools via `tessera-sys`)
   still link the C decoders.
 - The loader (`libsa`) stays C: no Rust in the boot loader for now.

@@ -292,6 +292,49 @@ pub unsafe extern "C" fn tessera_rs_pack_open(data: *const u8, len: usize, out_g
     }
 }
 
+/// Geometry from a header sector alone (the kernel's partial pack reads).
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn tessera_rs_pack_geom_from_header(hdr: *const u8, pack_len: u64, out_geom: *mut Geometry) -> c_int {
+    let Some(h) = (unsafe { arr::<SECTOR>(hdr) }) else { return EINVAL };
+    if out_geom.is_null() {
+        return EINVAL;
+    }
+    match pack::geom_from_header(h, pack_len) {
+        Ok(g) => {
+            unsafe { put(out_geom, g) };
+            OK
+        }
+        Err(e) => e,
+    }
+}
+
+/// Binary search of a separately read index; the blob's descriptor offset
+/// (pack-relative) and size, both inside the data region.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn tessera_rs_pack_index_find(
+    idx: *const u8, idx_len: usize, geom: *const Geometry, hash: *const u8,
+    out_desc_off: *mut u64, out_size: *mut u32,
+) -> c_int {
+    let (Some(i), Some(g), Some(h)) =
+        (unsafe { bytes(idx, idx_len) }, unsafe { geom.as_ref() }, unsafe { arr::<HASH_SIZE>(hash) })
+    else {
+        return EINVAL;
+    };
+    if out_desc_off.is_null() || out_size.is_null() {
+        return EINVAL;
+    }
+    match pack::index_find(i, g, h) {
+        Ok((at, n)) => {
+            unsafe {
+                put(out_desc_off, at);
+                put(out_size, n);
+            }
+            OK
+        }
+        Err(e) => e,
+    }
+}
+
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn tessera_rs_pack_bloom_might_contain(
     data: *const u8, len: usize, geom: *const Geometry, hash: *const u8,
