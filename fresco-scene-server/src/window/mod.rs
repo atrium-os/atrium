@@ -89,6 +89,11 @@ pub enum DisplayEvent {
     /// down (matches macOS/Wayland convention).
     /// `phase`: `fresco_protocol::scroll_phase`.
     InputPointerScroll { window_id: u32, dx: f32, dy: f32, phase: u8 },
+    /// A touchpad pinch (`fresco_protocol::InputPointerMagnifyEvent`).
+    InputPointerMagnify { window_id: u32, x: f32, y: f32, scale: f32, phase: u8 },
+    /// A three- or four-finger swipe, to the WM (window 0) only
+    /// (`fresco_protocol::InputSwipeEvent`).
+    InputSwipe { window_id: u32, fingers: u8, dx: f32, dy: f32, phase: u8 },
     /// The nodes of this window that are not drawn (fills, or any node
     /// past the op budget), by node id with a `fresco_protocol::fill_drop`
     /// reason. Sent whenever the set changes, so an empty list says every
@@ -222,6 +227,14 @@ pub fn encode_event(ev: &DisplayEvent)
                 window_id: *window_id, dx: *dx, dy: *dy, phase: *phase,
             };
             Ok((control::EV_INPUT_POINTER_SCROLL, encode(&p)?))
+        }
+        DisplayEvent::InputPointerMagnify { window_id, x, y, scale, phase } => {
+            let p = InputPointerMagnifyEvent { window_id: *window_id, x: *x, y: *y, scale: *scale, phase: *phase };
+            Ok((control::EV_INPUT_POINTER_MAGNIFY, encode(&p)?))
+        }
+        DisplayEvent::InputSwipe { window_id, fingers, dx, dy, phase } => {
+            let p = InputSwipeEvent { window_id: *window_id, fingers: *fingers, dx: *dx, dy: *dy, phase: *phase };
+            Ok((control::EV_INPUT_SWIPE, encode(&p)?))
         }
         DisplayEvent::WindowFillsDropped { window_id, dropped } => {
             let p = WindowFillsDroppedEvent {

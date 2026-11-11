@@ -659,6 +659,7 @@ fn from_broker(
                         DisplayEvent::InputPointerButton { window_id, x, y, button, pressed, modifiers, activation }
                     }
                     Input::Scroll { dx, dy, phase } => DisplayEvent::InputPointerScroll { window_id, dx, dy, phase },
+                    Input::Magnify { x, y, scale, phase } => DisplayEvent::InputPointerMagnify { window_id, x, y, scale, phase },
                 });
             }
             Msg::DragOffer { format, .. } => {

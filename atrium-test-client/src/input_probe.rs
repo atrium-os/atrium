@@ -35,6 +35,7 @@ fn main() -> std::io::Result<()> {
             }
             Event::PointerMotion { window_id, x, y } => println!("motion window={window_id} x={x:.0} y={y:.0}"),
             Event::PointerScroll { window_id, dx, dy, phase } => println!("scroll window={window_id} dx={dx} dy={dy} phase={phase}"),
+            Event::PointerMagnify { window_id, x, y, scale, phase } => println!("magnify window={window_id} x={x:.0} y={y:.0} scale={scale:.2} phase={phase}"),
             _ => {}
         }
         use std::io::Write;

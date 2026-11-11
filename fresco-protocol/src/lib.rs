@@ -204,6 +204,12 @@ pub mod control {
     pub const EV_INPUT_POINTER_MOTION:  u16 = 0x0701;
     pub const EV_INPUT_POINTER_BUTTON:  u16 = 0x0702;
     pub const EV_INPUT_POINTER_SCROLL:  u16 = 0x0703;
+    /// A touchpad pinch, to the window it began over
+    /// ([`InputPointerMagnifyEvent`]).
+    pub const EV_INPUT_POINTER_MAGNIFY: u16 = 0x0704;
+    /// A three- or four-finger touchpad swipe, to the WM only
+    /// ([`InputSwipeEvent`]).
+    pub const EV_INPUT_SWIPE:           u16 = 0x0705;
 
     // ── Drag and drop between windows (docs/spec/tabula.md §4) ──
     /// Client → server, no reply: start dragging from the client's window
@@ -1135,7 +1141,41 @@ pub struct InputPointerScrollEvent {
     pub phase:     u8,
 }
 
-/// `InputPointerScrollEvent::phase` values.
+/// `EV_INPUT_POINTER_MAGNIFY` — a two-finger pinch on a touchpad
+/// (docs/spec/atrium-input.md §5.3), for zoom. The whole pinch goes to
+/// the window it began over.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct InputPointerMagnifyEvent {
+    pub window_id: u32,
+    /// The pointer, window-local logical px, where the pinch began: the
+    /// point to zoom about.
+    pub x: f32,
+    pub y: f32,
+    /// The fingers' spread against where the pinch began: 1.0 is no
+    /// change, 2.0 twice as far apart (zoom in). `END` repeats the last
+    /// value.
+    pub scale: f32,
+    /// [`scroll_phase`] `BEGIN`, `UPDATE` or `END` (fingers lifted).
+    pub phase: u8,
+}
+
+/// `EV_INPUT_SWIPE` — a swipe of three or more fingers on a touchpad:
+/// a system gesture (workspaces, overview), sent to the WM only
+/// (window 0), never to apps.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct InputSwipeEvent {
+    pub window_id: u32,
+    pub fingers: u8,
+    /// Total movement since `BEGIN`, logical px, positive right and
+    /// down; `END` repeats the total.
+    pub dx: f32,
+    pub dy: f32,
+    /// [`scroll_phase`] `BEGIN`, `UPDATE` or `END`.
+    pub phase: u8,
+}
+
+/// `InputPointerScrollEvent::phase` values (also the phases of
+/// [`InputPointerMagnifyEvent`] and [`InputSwipeEvent`]).
 pub mod scroll_phase {
     pub const NONE: u8 = 0;
     pub const BEGIN: u8 = 1;
@@ -2260,6 +2300,8 @@ mod tests {
             control::EV_INPUT_POINTER_MOTION,
             control::EV_INPUT_POINTER_BUTTON,
             control::EV_INPUT_POINTER_SCROLL,
+            control::EV_INPUT_POINTER_MAGNIFY,
+            control::EV_INPUT_SWIPE,
             control::OP_DRAG_BEGIN,
             control::OP_WM_CREDENTIAL_SLOT,
             control::EV_DRAG_ENTER,

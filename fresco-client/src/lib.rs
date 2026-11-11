@@ -131,6 +131,13 @@ pub enum Event {
         /// touchpad's BEGIN, UPDATE, then END when the fingers lift.
         phase: u8,
     },
+    /// A touchpad pinch over the window: `scale` is the fingers' spread
+    /// against the start (1.0 = none), about window-local (`x`, `y`);
+    /// `phase` BEGIN, UPDATE, END (`fresco_protocol::scroll_phase`).
+    PointerMagnify { window_id: u32, x: f32, y: f32, scale: f32, phase: u8 },
+    /// A three- or four-finger swipe (WM only, window 0): total `dx`/`dy`
+    /// since BEGIN in logical px.
+    Swipe { window_id: u32, fingers: u8, dx: f32, dy: f32, phase: u8 },
     /// A drag (docs/spec/tabula.md §4) came over the window, offering
     /// these MIME `formats`.
     DragEnter { window_id: u32, drag_id: u64, x: f32, y: f32, formats: Vec<String> },
@@ -1181,6 +1188,14 @@ fn decode_event(op: u16, payload: &[u8]) -> Event {
             Ok(p) => Event::PointerScroll {
                 window_id: p.window_id, dx: p.dx, dy: p.dy, phase: p.phase,
             },
+            Err(_) => Event::Unknown { op, payload: payload.to_vec() },
+        },
+        control::EV_INPUT_POINTER_MAGNIFY => match decode::<fresco_protocol::InputPointerMagnifyEvent>(payload) {
+            Ok(p) => Event::PointerMagnify { window_id: p.window_id, x: p.x, y: p.y, scale: p.scale, phase: p.phase },
+            Err(_) => Event::Unknown { op, payload: payload.to_vec() },
+        },
+        control::EV_INPUT_SWIPE => match decode::<fresco_protocol::InputSwipeEvent>(payload) {
+            Ok(p) => Event::Swipe { window_id: p.window_id, fingers: p.fingers, dx: p.dx, dy: p.dy, phase: p.phase },
             Err(_) => Event::Unknown { op, payload: payload.to_vec() },
         },
         control::EV_DRAG_ENTER | control::EV_DRAG_OVER | control::EV_DRAG_LEAVE => match decode::<fresco_protocol::DragEvent>(payload) {

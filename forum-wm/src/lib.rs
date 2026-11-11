@@ -2617,3 +2617,34 @@ mod pip_tests {
 }
 
 }
+
+/// How far (logical px) a three- or four-finger swipe must travel, mostly
+/// sideways, to switch workspace.
+pub const SWIPE_SWITCH_PX: f32 = 120.0;
+
+/// The workspace a finished horizontal swipe switches to (atrium-input.md
+/// §5.3): fingers moving left bring in the workspace to the right, as
+/// content follows the fingers. `None` for a short or mostly vertical
+/// swipe, or past either end.
+pub fn swipe_workspace(active: usize, count: usize, dx: f32, dy: f32) -> Option<usize> {
+    if !(dx.abs() >= SWIPE_SWITCH_PX && dx.abs() > 2.0 * dy.abs()) {
+        return None;
+    }
+    let ws = if dx < 0.0 { active.checked_add(1)? } else { active.checked_sub(1)? };
+    (ws < count).then_some(ws)
+}
+
+#[cfg(test)]
+mod swipe_tests {
+    use super::swipe_workspace;
+
+    #[test]
+    fn swipes_switch_one_workspace() {
+        assert_eq!(swipe_workspace(1, 4, -200.0, 10.0), Some(2));
+        assert_eq!(swipe_workspace(1, 4, 200.0, 10.0), Some(0));
+        assert_eq!(swipe_workspace(0, 4, 200.0, 0.0), None);
+        assert_eq!(swipe_workspace(3, 4, -200.0, 0.0), None);
+        assert_eq!(swipe_workspace(1, 4, -60.0, 0.0), None);
+        assert_eq!(swipe_workspace(1, 4, -200.0, 150.0), None);
+    }
+}

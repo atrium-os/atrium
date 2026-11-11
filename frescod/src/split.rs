@@ -976,12 +976,14 @@ fn event_record(r: &Renderer, ev: &DisplayEvent) -> Option<Msg> {
             (window_id, Input::Button { x, y, button, pressed, modifiers, activation })
         }
         E::InputPointerScroll { window_id, dx, dy, phase } => (window_id, Input::Scroll { dx, dy, phase }),
+        E::InputPointerMagnify { window_id, x, y, scale, phase } => (window_id, Input::Magnify { x, y, scale, phase }),
         _ => return None,
     };
     let ok = |v: f32| v.is_finite();
     match input {
         Input::Motion { x, y } | Input::Button { x, y, .. } if !(ok(x) && ok(y)) => return None,
         Input::Scroll { dx, dy, .. } if !(ok(dx) && ok(dy)) => return None,
+        Input::Magnify { x, y, scale, .. } if !(ok(x) && ok(y) && ok(scale) && scale > 0.0) => return None,
         _ => {}
     }
     Some(Msg::Input { window: r.local_of(global)?, input })

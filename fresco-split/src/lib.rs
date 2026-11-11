@@ -72,6 +72,9 @@ pub enum Input {
     Button { x: f32, y: f32, button: u8, pressed: bool, modifiers: u8, activation: [u8; 16] },
     /// `phase`: fresco_protocol::scroll_phase.
     Scroll { dx: f32, dy: f32, phase: u8 },
+    /// A touchpad pinch: about (`x`, `y`), `scale` against its start,
+    /// `phase` BEGIN..END.
+    Magnify { x: f32, y: f32, scale: f32, phase: u8 },
 }
 
 /// One record.
@@ -201,6 +204,7 @@ mod kind {
     pub const MOTION: u32 = 0x111;
     pub const BUTTON: u32 = 0x112;
     pub const SCROLL: u32 = 0x113;
+    pub const MAGNIFY: u32 = 0x114;
     pub const DRAG_FORMAT: u32 = 5;
     pub const DRAG_BEGIN: u32 = 6;
     pub const DRAG_OFFER: u32 = 0x120;
@@ -395,6 +399,14 @@ impl Msg {
                     r.put(4, phase as u32);
                     r
                 }
+                Input::Magnify { x, y, scale, phase } => {
+                    let mut r = Rec::new(MAGNIFY, *window);
+                    r.put(2, x.to_bits());
+                    r.put(3, y.to_bits());
+                    r.put(4, scale.to_bits());
+                    r.put(5, phase as u32);
+                    r
+                }
             },
             Msg::DragFormat { window, format } | Msg::DragOffer { window, format } => {
                 let mut r = Rec::new(if matches!(self, Msg::DragFormat { .. }) { DRAG_FORMAT } else { DRAG_OFFER }, *window);
@@ -543,6 +555,7 @@ impl Msg {
             WINDOW_DESTROY | CLOSE => (0, false),
             FRAME_READY | GEOMETRY | MOTION => (2, false),
             SCROLL => (3, false),
+            MAGNIFY => (4, false),
             SLOTS | FRAME_DONE | SCALE => (1, false),
             FOCUS => (2, false),
             KEY => (4, false), // usage, pressed, modifiers, repeat
@@ -642,6 +655,14 @@ impl Msg {
             SCROLL => {
                 let phase = u8::try_from(r.get(4)).ok().filter(|p| *p <= 3).ok_or(Refused("scroll phase"))?;
                 Msg::Input { window, input: Input::Scroll { dx: finite(r.get(2))?, dy: finite(r.get(3))?, phase } }
+            }
+            MAGNIFY => {
+                let phase = u8::try_from(r.get(5)).ok().filter(|p| (1..=3).contains(p)).ok_or(Refused("magnify phase"))?;
+                let scale = finite(r.get(4))?;
+                if !(scale > 0.0) {
+                    return Err(Refused("magnify scale"));
+                }
+                Msg::Input { window, input: Input::Magnify { x: finite(r.get(2))?, y: finite(r.get(3))?, scale, phase } }
             }
             DRAG_FORMAT | DRAG_OFFER => {
                 if title.is_empty() || !title.bytes().all(|b| (0x21..0x7f).contains(&b)) {

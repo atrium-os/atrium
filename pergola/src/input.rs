@@ -68,6 +68,10 @@ pub fn translate(ev: &fresco_client::Event) -> Option<Event> {
         | fresco_client::Event::FillsDropped { .. }
         // The window's embed token goes to limend, not to views.
         | fresco_client::Event::EmbedToken { .. }
+        // A pinch: for ScrollView's zoom, not wired yet (it zooms on
+        // Ctrl+wheel today). Swipes go to the WM only.
+        | fresco_client::Event::PointerMagnify { .. }
+        | fresco_client::Event::Swipe { .. }
         // Drag hover (no drop highlight yet) and the end of a drag this
         // window started (Pergola starts none yet).
         | fresco_client::Event::DragEnter { .. }

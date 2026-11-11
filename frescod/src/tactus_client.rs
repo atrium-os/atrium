@@ -20,7 +20,11 @@
 //! - pointer buttons, motion (relative or absolute) and wheels move the
 //!   cursor and go to the window under it; a touchpad's two-finger scroll
 //!   goes, with its phases, to the window it began over, content following
-//!   the fingers; swipes and pinches are not routed yet.
+//!   the fingers;
+//! - a pinch goes to the window it began over as `InputPointerMagnify`
+//!   (scale against the start, about where it began); three- and
+//!   four-finger swipes go to the WM only (window 0) as `InputSwipe`,
+//!   with the total movement since they began.
 //! Every press from tactusd mints an activation token: tactusd is the
 //! only peer on that socket (its directory is _tactus:_frescod 0750).
 
@@ -31,7 +35,7 @@ use std::time::Duration;
 
 use fresco_scene_server::window::{Compositor, DisplayEvent, MINT_HERE};
 use fresco_protocol::scroll_phase;
-use tactus::wire::{self, Axis, Message, Phase};
+use tactus::wire::{self, Axis, GestureKind, Message, Phase};
 
 pub const DEFAULT_SOCKET: &str = "/atrium/sockets/tactus/tactus.sock";
 
@@ -79,6 +83,19 @@ struct Seat {
     buttons: Vec<u8>,
     /// The window a touchpad scroll is going to, between Begin and End.
     scrolling: Option<u32>,
+    /// A pinch going on: its window, where it began (window-local) and
+    /// the last scale.
+    magnify: Option<(u32, f32, f32, f32)>,
+    /// A swipe going on: fingers and total movement so far.
+    swipe: Option<(u8, f32, f32)>,
+}
+
+fn wire_phase(p: Phase) -> u8 {
+    match p {
+        Phase::Begin => scroll_phase::BEGIN,
+        Phase::Update => scroll_phase::UPDATE,
+        Phase::End => scroll_phase::END,
+    }
 }
 
 /// The HID modifier byte to the wire's bits (shift 1, ctrl 2, alt 4).
@@ -201,16 +218,45 @@ impl Seat {
                     (_, Some(w)) => w,
                 };
                 self.scrolling = (phase != Phase::End).then_some(window_id);
-                let phase = match phase {
-                    Phase::Begin => scroll_phase::BEGIN,
-                    Phase::Update => scroll_phase::UPDATE,
-                    Phase::End => scroll_phase::END,
-                };
+                let phase = wire_phase(phase);
                 let _ = sink.send(DisplayEvent::InputPointerScroll { window_id, dx: -dx, dy: -dy, phase });
             }
-            // Swipes and pinches have no route to Forum or apps yet
-            // (atrium-input.md §8 T3 follow-up).
-            Message::Gesture { .. } => {}
+            // A pinch goes, whole, to the window it began over, about the
+            // pointer where it began; tactusd's END carries no scale, so the
+            // last one is repeated.
+            Message::Gesture { kind: GestureKind::Pinch, phase, scale, .. } => {
+                let (window_id, x, y) = match (phase, self.magnify) {
+                    (Phase::Begin, _) | (_, None) => {
+                        let g = comp.lock().unwrap();
+                        let (cx, cy) = g.cursor;
+                        let (w, (x, y)) = g.pointer_target(cx, cy);
+                        (w as u32, x, y)
+                    }
+                    (_, Some((w, x, y, _))) => (w, x, y),
+                };
+                let scale = match phase {
+                    Phase::End => self.magnify.map_or(1.0, |m| m.3),
+                    _ if scale.is_finite() && scale > 0.0 => scale,
+                    _ => return,
+                };
+                self.magnify = (phase != Phase::End).then_some((window_id, x, y, scale));
+                let phase = wire_phase(phase);
+                let _ = sink.send(DisplayEvent::InputPointerMagnify { window_id, x, y, scale, phase });
+            }
+            // Three- and four-finger swipes are system gestures: to the WM
+            // (window 0) only, as the total since the swipe began.
+            Message::Gesture { kind: GestureKind::Swipe, fingers, phase, dx, dy, .. } => {
+                let (tx, ty) = match (phase, self.swipe) {
+                    (Phase::Begin, _) | (_, None) => (0.0, 0.0),
+                    (_, Some((_, x, y))) => (x, y),
+                };
+                let (tx, ty) = if phase == Phase::End { (tx, ty) } else { (tx + dx, ty + dy) };
+                if !(tx.is_finite() && ty.is_finite()) {
+                    return;
+                }
+                self.swipe = (phase != Phase::End).then_some((fingers, tx, ty));
+                let _ = sink.send(DisplayEvent::InputSwipe { window_id: 0, fingers, dx: tx, dy: ty, phase: wire_phase(phase) });
+            }
             Message::Gone { id } => eprintln!("frescod: input device {id} gone"),
             Message::Hello { .. } => {}
         }
@@ -281,8 +327,17 @@ impl Seat {
         let _ = sink.send(DisplayEvent::InputPointerMotion { window_id: target as u32, x: lx, y: ly });
     }
 
-    /// tactusd went away: release what it held.
+    /// tactusd went away: release what it held and end what was going on.
     fn release(&mut self, sink: &Sender<DisplayEvent>, comp: &Arc<Mutex<Compositor>>) {
+        if let Some(window_id) = self.scrolling.take() {
+            let _ = sink.send(DisplayEvent::InputPointerScroll { window_id, dx: 0.0, dy: 0.0, phase: scroll_phase::END });
+        }
+        if let Some((window_id, x, y, scale)) = self.magnify.take() {
+            let _ = sink.send(DisplayEvent::InputPointerMagnify { window_id, x, y, scale, phase: scroll_phase::END });
+        }
+        if let Some((fingers, dx, dy)) = self.swipe.take() {
+            let _ = sink.send(DisplayEvent::InputSwipe { window_id: 0, fingers, dx, dy, phase: scroll_phase::END });
+        }
         for (_, k) in self.keys.clone() {
             self.key(sink, comp, k, false);
         }
@@ -301,4 +356,54 @@ fn screen() -> (f32, f32) {
         (w, h) = FALLBACK.get().copied().unwrap_or((1, 1));
     }
     (w.max(1) as f32, h.max(1) as f32)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::mpsc::channel;
+    use tactus::wire::GestureKind::{Pinch, Swipe};
+
+    fn gesture(kind: GestureKind, fingers: u8, phase: Phase, dx: f32, dy: f32, scale: f32) -> Message {
+        Message::Gesture { id: 1, ts_ns: 0, kind, fingers, phase, dx, dy, scale }
+    }
+
+    #[test]
+    fn pinch_and_swipe_routes() {
+        let comp = Arc::new(Mutex::new(Compositor::new()));
+        comp.lock().unwrap().cursor = (40.0, 30.0);
+        let (tx, rx) = channel();
+        let mut seat = Seat::default();
+        // A pinch: latched where it began, END repeats the last scale.
+        seat.handle(gesture(Pinch, 2, Phase::Begin, 0.0, 0.0, 1.2), &tx, &comp);
+        comp.lock().unwrap().cursor = (90.0, 90.0);
+        seat.handle(gesture(Pinch, 2, Phase::Update, 0.0, 0.0, 1.5), &tx, &comp);
+        seat.handle(gesture(Pinch, 2, Phase::End, 0.0, 0.0, 1.0), &tx, &comp);
+        let got: Vec<_> = rx.try_iter().collect();
+        let m: Vec<(f32, f32, f32, u8)> = got
+            .iter()
+            .map(|e| match *e {
+                DisplayEvent::InputPointerMagnify { x, y, scale, phase, .. } => (x, y, scale, phase),
+                ref e => panic!("{e:?}"),
+            })
+            .collect();
+        assert_eq!(m, vec![(40.0, 30.0, 1.2, 1), (40.0, 30.0, 1.5, 2), (40.0, 30.0, 1.5, 3)]);
+        // A three-finger swipe: totals, to window 0, END repeats the total.
+        seat.handle(gesture(Swipe, 3, Phase::Begin, 10.0, 1.0, 1.0), &tx, &comp);
+        seat.handle(gesture(Swipe, 3, Phase::Update, 15.0, -1.0, 1.0), &tx, &comp);
+        seat.handle(gesture(Swipe, 3, Phase::End, 0.0, 0.0, 1.0), &tx, &comp);
+        let s: Vec<_> = rx
+            .try_iter()
+            .map(|e| match e {
+                DisplayEvent::InputSwipe { window_id: 0, fingers: 3, dx, dy, phase } => (dx, dy, phase),
+                e => panic!("{e:?}"),
+            })
+            .collect();
+        assert_eq!(s, vec![(10.0, 1.0, 1), (25.0, 0.0, 2), (25.0, 0.0, 3)]);
+        // tactusd going away mid-pinch ends it.
+        seat.handle(gesture(Pinch, 2, Phase::Begin, 0.0, 0.0, 0.8), &tx, &comp);
+        let _ = rx.try_iter().count();
+        seat.release(&tx, &comp);
+        assert!(matches!(rx.try_iter().last(), Some(DisplayEvent::InputPointerMagnify { scale, phase: 3, .. }) if scale == 0.8));
+    }
 }

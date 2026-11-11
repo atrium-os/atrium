@@ -387,7 +387,18 @@ Two inputs, one stage: Windows Precision Touchpad reports over hidbus
 - two-finger scroll as `Scroll` with pixels and phases, so Pergola's
   ScrollView flings on `End`;
 - `Gesture` swipe and pinch, which Forum uses for workspace and
-  overview gestures and apps get for zoom.
+  overview gestures and apps get for zoom. frescod sends a pinch,
+  whole, to the window it began over as `EV_INPUT_POINTER_MAGNIFY`
+  (`InputPointerMagnifyEvent`: window-local point where it began,
+  scale against the start, `scroll_phase` BEGIN/UPDATE/END; END repeats
+  the last scale). Three- and four-finger swipes are system gestures:
+  `EV_INPUT_SWIPE` (`InputSwipeEvent`: fingers, total dx/dy since
+  BEGIN) to the WM only (window 0), never to apps. Forum switches to
+  the next or previous workspace when a mostly sideways swipe of at
+  least 120 px ends (fingers left bring in the workspace on the
+  right); vertical swipes are reserved for the overview, which the WM
+  cannot open yet. Split renderers carry the pinch as fresco-split's
+  `MAGNIFY` record.
 
 ### 5.4 Gamepads
 
@@ -482,8 +493,9 @@ zoomable views. The wire to apps stays HID-faithful.
    and recognises pinch and 3+ finger swipe. Scroll phases reach apps
    (`InputPointerScrollEvent.phase`, `fresco_protocol::scroll_phase`),
    content following the fingers, latched to the window the scroll
-   began over. Not yet: routing swipes and pinches to Forum and apps
-   (needs a gesture event on the app wire and a Forum design), setting
+   began over. Gestures routed 2026-11-11 (§5.3): pinch to apps as
+   `EV_INPUT_POINTER_MAGNIFY`, swipes to Forum as `EV_INPUT_SWIPE`
+   (workspace switch); unit-tested, no touchpad in QEMU. Not yet: setting
    a pad's Input Mode feature report ourselves (today `hmt(4)` does it
    when it attaches), the replay source, and a laptop run.
 4. **T4 PS/2.** atkbd scancodes and psm packets (plain, Synaptics,

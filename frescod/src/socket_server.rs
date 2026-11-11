@@ -276,7 +276,9 @@ fn route(ev: &DisplayEvent, comp: &Arc<Mutex<Compositor>>) -> Route {
         | E::InputKey { window_id, .. }
         | E::InputPointerMotion { window_id, .. }
         | E::InputPointerButton { window_id, .. }
-        | E::InputPointerScroll { window_id, .. } => window_id,
+        | E::InputPointerScroll { window_id, .. }
+        | E::InputPointerMagnify { window_id, .. }
+        | E::InputSwipe { window_id, .. } => window_id,
         E::DisplayChanged { .. } | E::AppearanceChanged(_) => return Route::All,
         E::WindowFillsDropped { window_id, .. }
         | E::Drag { window_id, .. }

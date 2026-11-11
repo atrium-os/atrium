@@ -292,6 +292,7 @@ fn spawn_input_poller(core: Core) {
             let mut cycle = false;
             let mut switch_ws: Option<usize> = None;
             let mut move_ws: Option<usize> = None;
+            let mut swipe: Option<(f32, f32)> = None;
             let mut split = false;
             let mut zoom = false;
             let mut snap_dir: Option<Snap> = None;
@@ -351,6 +352,10 @@ fn spawn_input_poller(core: Core) {
                             if modifiers & MOD_GUI != 0 && modifiers & MOD_SHIFT == 0
                                 && hid_usage >= KEY_1 && hid_usage < KEY_1 + 9 =>
                             switch_ws = Some((hid_usage - KEY_1) as usize),
+                        // A three- or four-finger swipe sideways, when the
+                        // fingers lift: the next or previous workspace.
+                        Ok(Some(Event::Swipe { fingers, dx, dy, phase: fresco_protocol::scroll_phase::END, .. }))
+                            if fingers >= 3 => swipe = Some((dx, dy)),
                         // A media key: never the focused app's (§4.3).
                         Ok(Some(Event::Key { hid_usage, pressed: true, repeat: false, .. }))
                             if forum_wm::media::action(hid_usage).is_some() =>
@@ -455,6 +460,13 @@ fn spawn_input_poller(core: Core) {
                     }
                     Ok(None) => {}               // nothing focused / out of range
                     Err(e) => eprintln!("forum-wm: move_focused_to_workspace error: {e}"),
+                }
+            }
+
+            if let Some((dx, dy)) = swipe {
+                let g = core.lock().unwrap();
+                if let Some(ws) = forum_wm::swipe_workspace(g.0.active, g.0.workspaces, dx, dy) {
+                    switch_ws = Some(ws);
                 }
             }
 

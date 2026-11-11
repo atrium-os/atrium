@@ -24,6 +24,7 @@ fn samples() -> Vec<Msg> {
         Msg::Input { window: 4, input: Input::Motion { x: 1.5, y: -2.0 } },
         Msg::Input { window: 4, input: Input::Button { x: 3.0, y: 4.0, button: 1, pressed: false, modifiers: 0, activation: [0; 16] } },
         Msg::Input { window: 4, input: Input::Scroll { dx: 0.0, dy: 3.0, phase: 3 } },
+        Msg::Input { window: 4, input: Input::Magnify { x: 10.0, y: 20.5, scale: 1.25, phase: 2 } },
         Msg::DragFormat { window: 3, format: "text/plain;charset=utf-8".into() },
         Msg::DragBegin { window: 3, drag_id: 0x1234_5678_9abc_def0, activation: [5; 16] },
         Msg::DragOffer { window: 2, format: "image/png".into() },
