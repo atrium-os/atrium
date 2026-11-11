@@ -636,6 +636,10 @@ pub struct GpuCompute<'a> {
     wins: HashMap<u32, WinVm<'a>>,
     /// Bumped each time a window's surface is redrawn.
     version: HashMap<u32, u64>,
+    /// Per window, the recent versions and the surface rect each changed
+    /// (window pixels): a scanout buffer a few versions behind composes
+    /// only their union. A version missing here means the whole surface.
+    changes: HashMap<u32, Vec<(u64, [u32; 4])>>,
     /// Per scanout buffer (by GPU address): the windows, layers and
     /// surface versions it was last composed from.
     composed: HashMap<u64, (Vec<u32>, Vec<Layer>, HashMap<u32, u64>)>,
@@ -715,6 +719,32 @@ fn on_screen(l: &Layer, w: u32, h: u32) -> Option<[u32; 4]> {
     (r[2] > r[0] && r[3] > r[1]).then_some(r)
 }
 
+/// How many versions of each window's changes are kept: a scanout buffer
+/// further behind than this composes the whole window.
+const CHANGE_LOG: usize = 8;
+
+/// Where layer `l` changed on screen between surface versions `since` and
+/// `now`: the union of the logged changes, or the whole layer if the log
+/// does not reach back to `since`.
+fn changed_on_screen(l: &Layer, log: Option<&Vec<(u64, [u32; 4])>>, since: u64, now: u64, w: u32, h: u32) -> Option<[u32; 4]> {
+    let whole = on_screen(l, w, h)?;
+    let log = log.map(Vec::as_slice).unwrap_or(&[]);
+    let first = log.first().map_or(u64::MAX, |e| e.0);
+    if since >= now || since + 1 < first || !log.iter().any(|e| e.0 == now) {
+        return Some(whole);
+    }
+    let r = log.iter().filter(|e| e.0 > since && e.0 <= now).map(|e| e.1).fold([0; 4], union);
+    if r[0] >= r[2] || r[1] >= r[3] {
+        return None;
+    }
+    // Window pixels to screen: `ox, oy` is where surface pixel (0, 0) shows.
+    let (ox, oy) = (l.origin[0] as i64, l.origin[1] as i64);
+    let c = |v: i64, lo: u32, hi: u32| v.clamp(lo as i64, hi as i64) as u32;
+    let s = [c(r[0] as i64 + ox, whole[0], whole[2]), c(r[1] as i64 + oy, whole[1], whole[3]),
+             c(r[2] as i64 + ox, whole[0], whole[2]), c(r[3] as i64 + oy, whole[1], whole[3])];
+    (s[2] > s[0] && s[3] > s[1]).then_some(s)
+}
+
 /// The smallest rect holding `a` and `b`; an empty rect (`x0 >= x1` or
 /// `y0 >= y1`) holds nothing.
 pub fn union(a: [u32; 4], b: [u32; 4]) -> [u32; 4] {
@@ -776,6 +806,7 @@ impl<'a> GpuCompute<'a> {
             ring,
             wins: HashMap::new(),
             version: HashMap::new(),
+            changes: HashMap::new(),
             composed: HashMap::new(),
         })
     }
@@ -788,6 +819,7 @@ impl<'a> GpuCompute<'a> {
         // Windows that are gone take their VMs with them.
         self.wins.retain(|id, _| f.windows.iter().any(|w| w.id == *id));
         self.version.retain(|id, _| f.windows.iter().any(|w| w.id == *id));
+        self.changes.retain(|id, _| f.windows.iter().any(|w| w.id == *id));
         let gpu = self.vm.gpu();
         let mut frames = Vec::with_capacity(f.windows.len());
         let mut scrolls = HashMap::new();
@@ -798,6 +830,7 @@ impl<'a> GpuCompute<'a> {
                 self.wins.remove(&w.id);
                 self.wins.insert(w.id, WinVm::new(gpu, self.vm, &self.code, sw, sh)?);
                 *self.version.entry(w.id).or_insert(0) += 1;
+                self.changes.remove(&w.id);
                 self.composed.clear();
             }
             frames.push((w.id, frame_of(&self.scene, w, [0, sw, sw, sh], &mut self.fill_drops)));
@@ -828,7 +861,7 @@ impl<'a> GpuCompute<'a> {
     }
 
     fn submit(&mut self, target: &Bo<'_>, deadline_ns: u32, signal: (&Syncobj<'_>, u64)) -> Result<()> {
-        use fresco_compute::{binding, compose::binding as cb, damage};
+        use fresco_compute::{binding, compose::binding as cb, damage, TILE};
         let mut p = self.pending.take().ok_or("present before render")?;
         if (self.width * self.height) as u64 * 4 > target.size() {
             return Err("scanout buffer smaller than the screen".into());
@@ -867,7 +900,16 @@ impl<'a> GpuCompute<'a> {
             if rects.is_empty() && moves.is_empty() {
                 continue;
             }
-            *self.version.entry(*id).or_insert(0) += 1;
+            let ver = self.version.entry(*id).or_insert(0);
+            *ver += 1;
+            let changed = moves.iter().map(|m| m.dst)
+                .chain(rects.iter().map(|t| [t[0] * TILE, t[1] * TILE, (t[2] * TILE).min(fw), (t[3] * TILE).min(fh)]))
+                .fold([0; 4], union);
+            let log = self.changes.entry(*id).or_default();
+            log.push((*ver, changed));
+            if log.len() > CHANGE_LOG {
+                log.remove(0);
+            }
             let mut stage = Vec::new();
             let mut offs = [0u64; binding::COUNT];
             for (b, bytes) in f.buffers().into_iter().enumerate() {
@@ -948,7 +990,9 @@ impl<'a> GpuCompute<'a> {
                         r.extend(on_screen(old, w, h));
                         r.extend(on_screen(l, w, h));
                     } else if held.get(id) != versions.get(id) {
-                        r.extend(on_screen(l, w, h));
+                        let since = held.get(id).copied().unwrap_or(0);
+                        let now = versions.get(id).copied().unwrap_or(0);
+                        r.extend(changed_on_screen(l, self.changes.get(id), since, now, w, h));
                     }
                 }
                 Some(r)
@@ -1026,6 +1070,25 @@ mod tests {
             ..Default::default()
         };
         ScreenInput { windows: vec![a, b], uploads: Vec::new(), clears: Vec::new() }
+    }
+
+    /// A scanout buffer a few versions behind composes the union of what
+    /// changed since, on screen and clipped to the layer; past the log, or
+    /// with a gap, the whole layer.
+    #[test]
+    fn compose_covers_what_changed_since() {
+        let l = Layer::at([0, 100, 100, 50], 300, 200, 1.0);
+        let log = vec![(5, [10, 10, 20, 20]), (6, [0, 40, 100, 50]), (7, [90, 0, 120, 8])];
+        let (w, h) = (1920, 1080);
+        assert_eq!(changed_on_screen(&l, Some(&log), 6, 7, w, h), Some([390, 200, 400, 208]), "clipped to the layer");
+        assert_eq!(changed_on_screen(&l, Some(&log), 4, 7, w, h), Some([300, 200, 400, 250]));
+        assert_eq!(changed_on_screen(&l, Some(&log), 5, 6, w, h), Some([300, 240, 400, 250]), "older entries only up to now");
+        let whole = Some([300, 200, 400, 250]);
+        assert_eq!(changed_on_screen(&l, Some(&log), 3, 7, w, h), whole, "log does not reach back");
+        assert_eq!(changed_on_screen(&l, Some(&log), 6, 8, w, h), whole, "now is not logged");
+        assert_eq!(changed_on_screen(&l, None, 6, 7, w, h), whole);
+        let off = Layer::at([0, 100, 100, 50], 1900, -20, 1.0);
+        assert_eq!(changed_on_screen(&off, Some(&log), 4, 5, w, h), None, "changed part is off screen");
     }
 
     /// Drawing only what changed gives the same screen as drawing it all.
