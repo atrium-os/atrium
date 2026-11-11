@@ -59,6 +59,9 @@ impl MemDisk {
             alloc:       Some(md_alloc),
             free:        Some(md_free),
             ctx:         disk as *mut c_void,
+            reader_enter:   None,
+            reader_exit:    None,
+            root_published: None,
         }
     }
 }
@@ -155,6 +158,9 @@ impl WriteRecorder {
             alloc:       Some(rec_alloc),
             free:        Some(rec_free),
             ctx:         rec as *mut c_void,
+            reader_enter:   None,
+            reader_exit:    None,
+            root_published: None,
         }
     }
 

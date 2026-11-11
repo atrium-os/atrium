@@ -146,17 +146,33 @@ the entry bound was missed by replay and fuzzing, so `pack::span_tests` and
 `test_partial_read_api` sweep it exhaustively. The on-demand reader also allocates blobs over
 64 MiB without sleeping, since the pack's size still comes from its extent list.
 
+## Phase 2: the userspace tools (2026-11-11)
+
+The Rust tools (`mkfs-tessera`, `tessera-fsck`, `tessera-stat`, ...) link the C core through
+`tessera-sys`. It now always links `tessera-decode` (with `ffi`) and, on hosts where it
+compiles the core itself, builds it with `-DTESSERA_RUST_DECODE`; `TESSERA_C_DECODE=1` gives
+the all-C core. For the guest, `scripts/tessera-tools-cross.sh` compiles the core archive
+from `core/Makefile`'s `SRCS` against the cloud sysroot, the same way, and cross-builds the
+tools (on the Mac, `bootstrap-atrium.sh`'s corelib phase still builds the archive with bmake;
+add `-DTESSERA_RUST_DECODE` there when the Mac flow is next run).
+
+Checked: the property tests (`tessera-property-tests`, all scenarios, with either core); the
+cloud VM e2e with the new mkfs and fsck on both kernel modules; and C-built against
+Rust-built `tessera-fsck` on the same image, clean and with 60 single-byte flips in the first
+64 MiB: identical output and exit status every time (8 of the flips were detected, both
+tools reporting them the same way; the rest landed in unused space).
+
+Fixed on the way: the tools did not link on Linux hosts (`tessera-sys` now links libmd there
+too), and the property tests had stopped compiling (block-io and format-options fields added
+since) and, once compiled, used volumes below the format minimum.
+
 ## Not moved yet (phase 2)
 
-- The kernel module's own inline walkers: the pack readers are done (below); manifests
-  already went through the crate's parser. The GC's index enumerator
-  (`tessera_fs_gc_pack_index_hashes`) keeps its own subtraction-style checks.
-- The userspace tools and the write paths (encoders, btree insert/split, journal write,
-  pack write) are next.
-- The userspace tools (`mkfs-tessera`, `tessera-fsck`, the Rust tools via `tessera-sys`)
-  still link the C decoders.
+- The kernel module's GC index enumerator (`tessera_fs_gc_pack_index_hashes`) keeps its
+  own subtraction-style checks; the module's other pack readers and all manifest parsing
+  now go through the crate (above).
+- The encoders and the write paths (btree insert/split, journal write, pack write): next.
 - The loader (`libsa`) stays C: no Rust in the boot loader for now.
-- The encoders and the write paths (btree insert/split, journal write, pack write).
 - HVF timing on the Mac VM; cross-language LTO.
 
 ## How to run
@@ -166,4 +182,6 @@ sh scripts/tessera-decode-check.sh          # cargo test, no-panic and frame che
 RUST_DECODE=1 sh scripts/core-host-tests.sh # core suite with Rust decoders
 sh scripts/tessera-decode-diff.sh           # C vs Rust on every corpus
 sh scripts/tessera-decode-diff.sh -t 600 -j 2
+sh scripts/tessera-tools-cross.sh          # guest tools (mkfs, fsck) with Rust decoders
+(cd atrium-tessera/rs && cargo run --release -p tessera-test-harness --bin tessera-property-tests)
 ```

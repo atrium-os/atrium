@@ -122,6 +122,8 @@ atrium-tessera/core/build-fuzz/
 atrium-tessera/core/build-fuzz-rs/
 atrium-tessera/core/build-host-rs/
 atrium-tessera/core/build-host-san-rs/
+atrium-tessera/core/build-cross-rs/
+atrium-tessera/core/build-cross-c/
 atrium-tessera/core/build-diff/
 atrium-tessera/core/fuzz/artifacts/
 

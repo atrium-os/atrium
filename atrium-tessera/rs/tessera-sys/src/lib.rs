@@ -9,6 +9,11 @@
 
 use core::ffi::{c_int, c_void};
 
+// Links the Rust decoders' C ABI (tessera_rs_*) that the core calls when built
+// with -DTESSERA_RUST_DECODE; this keeps the dependency from being dropped.
+#[doc(hidden)]
+pub use tessera_decode::ffi as decode_ffi;
+
 /* ── error codes ─────────────────────────────────────────────── */
 
 pub type tessera_errno_t = c_int;

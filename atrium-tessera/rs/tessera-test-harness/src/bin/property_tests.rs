@@ -34,7 +34,9 @@ fn random_uuid(rng: &Xorshift64) -> [u8; 16] {
 fn scenario_volume_round_trip() -> Result<(), String> {
     let rng = Xorshift64::new(0xc0ffee_0001);
     for _ in 0..32 {
-        let total_sectors = 512 + (rng.range(2048) as usize);
+        // The metadata zone is at least 1024 sectors (volume.c), so a
+        // volume needs more than 4 + journal + 1024 sectors.
+        let total_sectors = 1280 + (rng.range(2048) as usize);
         let journal_sectors = 32 + (rng.range(96) as usize);
         let mut disk = MemDisk::new(total_sectors);
         let io = MemDisk::block_io(&mut disk);
@@ -45,6 +47,7 @@ fn scenario_volume_round_trip() -> Result<(), String> {
             seed_dirent_name: std::ptr::null(), seed_dirent_name_len: 0, seed_dirent_inode: 0,
             seed_content_data: std::ptr::null(), seed_content_len: 0,
             seed_chunk_size: 0,
+            hash_alg: 1, // BLAKE3, the default since 2026-07-09
         };
         let r = unsafe { tessera_volume_format(&io, &opts) };
         if r != 0 {
@@ -519,7 +522,7 @@ fn scenario_pack_corruption_fuzz() -> Result<(), String> {
 
 fn scenario_format_crash_partial() -> Result<(), String> {
     let rng = Xorshift64::new(0xc0ffee_0006);
-    let total_sectors = 1024usize;
+    let total_sectors = 2048usize; // > 4 + journal + the 1024-sector metadata zone
     let mut rec = Box::new(WriteRecorder::new(total_sectors));
     let io = WriteRecorder::block_io(&mut *rec as *mut _);
 
@@ -530,6 +533,7 @@ fn scenario_format_crash_partial() -> Result<(), String> {
             seed_dirent_name: std::ptr::null(), seed_dirent_name_len: 0, seed_dirent_inode: 0,
             seed_content_data: std::ptr::null(), seed_content_len: 0,
             seed_chunk_size: 0,
+            hash_alg: 1, // BLAKE3, the default since 2026-07-09
     };
     let r = unsafe { tessera_volume_format(&io, &opts) };
     if r != 0 { return Err(format!("baseline format → {r}")); }
@@ -1002,6 +1006,7 @@ fn scenario_format_size_boundary() -> Result<(), String> {
             seed_dirent_name: std::ptr::null(), seed_dirent_name_len: 0, seed_dirent_inode: 0,
             seed_content_data: std::ptr::null(), seed_content_len: 0,
             seed_chunk_size: 0,
+            hash_alg: 1, // BLAKE3, the default since 2026-07-09
         };
         unsafe { tessera_volume_format(&io, &opts) }
     };

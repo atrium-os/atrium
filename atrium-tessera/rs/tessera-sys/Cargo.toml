@@ -18,3 +18,8 @@ cc = "1"
 # we hand-write a minimal subset to keep the toolchain dependency light.
 
 [dependencies]
+# D3: the C core's on-disk decoders forward to these Rust exports
+# (tessera_rs_*, core/src/tessera_rs.h) when it is built with
+# -DTESSERA_RUST_DECODE, which is the default (TESSERA_C_DECODE=1 opts out).
+# Always linked, so a core archive built either way links.
+tessera-decode = { path = "../tessera-decode", features = ["ffi"] }

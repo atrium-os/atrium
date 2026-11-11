@@ -12,6 +12,7 @@ use std::path::PathBuf;
 fn main() {
     println!("cargo:rerun-if-env-changed=TESSERA_CORE_LIB");
     println!("cargo:rerun-if-env-changed=TESSERA_CORE_INCLUDE");
+    println!("cargo:rerun-if-env-changed=TESSERA_C_DECODE");
 
     // ── linking the C core ──────────────────────────────────────────────
     //
@@ -40,7 +41,10 @@ fn main() {
     // the cross-target (set by cargo); cfg!(target_os = ...) in
     // build.rs evaluates the build host, which is wrong for our
     // macOS → FreeBSD flow.
-    if env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("freebsd") {
+    // Linux hosts (cloud sessions) get the same SHA256Init/Update/Final from
+    // libmd (libmd-dev); without it no tool linked there. macOS uses
+    // CommonCrypto inside hash.c.
+    if matches!(env::var("CARGO_CFG_TARGET_OS").as_deref(), Ok("freebsd") | Ok("linux")) {
         println!("cargo:rustc-link-lib=md");
     }
 
@@ -71,6 +75,11 @@ fn build_core_for_host() {
     b.include(core.join("include")).include(core.join("src"))
         .flag_if_supported("-fno-strict-aliasing")
         .warnings(false);
+    // D3: on-disk decoders in Rust (tessera-decode, linked by this crate),
+    // as in tessera_fs.ko. TESSERA_C_DECODE=1 builds the all-C reference.
+    if env::var("TESSERA_C_DECODE").as_deref() != Ok("1") {
+        b.define("TESSERA_RUST_DECODE", None);
+    }
     for f in &srcs {
         let p = core.join("src").join(f);
         println!("cargo:rerun-if-changed={}", p.display());
