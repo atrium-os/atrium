@@ -2,7 +2,7 @@
 
 **Status:** proposed architecture, 2026-11-11. H0 measured 2026-11-11
 (`docs/reviews/2026-11-11-hospes-h0.md`): the CDM makes raw syscalls, so K1 is required;
-findings folded in below. Decisions in §14.
+findings folded in below. §14 decisions accepted 2026-11-11.
 **Follows:** `docs/reviews/2026-11-07-linux-compat-scoping.md` (accepted 2026-11-07: closed
 Linux libraries run in our own loader and glibc shim in a capability-mode jail; no Linux ABI
 in the kernel; Linux apps, if ever, get micro-VMs).
@@ -418,6 +418,8 @@ to four days. It needs the user's consent to download the two libraries (§14 de
   content (player §9.3 to weigh this).
 
 ## 14. Decisions
+
+**All accepted by Shankar 2026-11-11, as recommended.**
 
 1. **The name Hospes** for the component, with crates `hospes-elf`, `hospes-rt`,
    `hospes-glibc`, `hospes-proto`, `hospes-cdm`, `hospes-codec`, `hospes-probe` in a new
