@@ -1,6 +1,6 @@
 # Per-app capabilities in frescod
 
-Status: **proposed** 2026-11-11, for review before any code.
+Status: **accepted** 2026-11-11 (Shankar accepted all six §10 decisions as recommended).
 Owner: Fresco thread. Prerequisite for exclusive gamepad grants and the
 `input.*` gating in atrium-input.md §6.
 

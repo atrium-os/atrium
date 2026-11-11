@@ -453,7 +453,7 @@ Not implemented in V1; spec'd here for forward compatibility.
 
 Unchanged from rev. 1, enforced by frescod. How frescod looks the
 grants up, the defaults and the exclusive-grant rules are in
-[fresco-capabilities.md](fresco-capabilities.md) (proposed 2026-11-11).
+[fresco-capabilities.md](fresco-capabilities.md) (accepted 2026-11-11).
 
 ```toml
 [capabilities]
