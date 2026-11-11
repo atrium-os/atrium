@@ -557,9 +557,11 @@ zoomable views. The wire to apps stays HID-faithful.
    `fresco-client` exposes `Event::Gamepad*`. VM run: unjailed tactusd
    fed by `tactus/examples/fake-pad.rs` (a stand-in vinculumd playing an
    LE gamepad) and two `input-probe` windows; the pad moved between them
-   with releases, snapshot and disconnect as specified. Not yet run: the
-   jailed tactusd path, split mode end to end (record round-trips
-   only), a real USB pad. Exclusive grants wait on capabilities.
+   with releases, snapshot and disconnect as specified. Since repeated
+   with the jailed tactusd (default Bluetooth socket) and split-mode
+   frescod: `GAMEPAD=1 scripts/vm-tactus-check.sh`, 10 checks, 0 failed
+   (2026-11-11). Not yet run: a real USB pad. Exclusive grants wait on
+   capabilities.
 6. **T6 Bluetooth HID source**, once the Bluetooth service exists.
    *Built (tactusd side, 2026-11-07):* tactusd connects to vinculumd's
    `hid.sock` (`TACTUS_BLUETOOTH_SOCKET`, retry every 2 s) with the

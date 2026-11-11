@@ -27,9 +27,21 @@
 # The same typing and clicking then goes through atkbd0 (K_RAW, handed over
 # from the console's kbdmux by tactus-console) and psm0; the hot-plug step is
 # skipped, and the restart step also checks the console gets atkbd0 back.
+#
+# Gamepads (T5): no USB input needed. A stand-in vinculumd
+# (tactus/examples/fake-pad.rs) binds the jailed tactusd's default Bluetooth
+# HID socket and plays an LE gamepad; frescod runs in split mode with an
+# unconfined fresco-renderer (FRESCOD_RENDERER_LAUNCHER=unconfined), so the
+# pad events cross the split records; two probe windows check that the pad
+# follows focus (releases and disconnect to the old owner, connect and an
+# axis snapshot to the new one):
+#
+#   GAMEPAD=1 FAKE_PAD=.../examples/fake-pad RENDERER=.../fresco-renderer \
+#     sh scripts/vm-tactus-check.sh TACTUSD FRESCOD INPUT_PROBE
 set -u
 TD=$1 FD=$2 PROBE=$3 CON=${4:-}
 PS2=${PS2:-0}
+GAMEPAD=${GAMEPAD:-0}
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
 VMDIR=${VMDIR:-$HOME/atrium-vm-amd64}
 K="-i $HOME/.ssh/fresco_bsd_ed25519 -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR"
@@ -56,6 +68,10 @@ if [ -n "$CON" ]; then
   V 'mkdir -p /root/t/tactus/etc/rc.d'
   scp -q $K -P 2222 "$CON" root@localhost:/root/t/tactus-console
   scp -q $K -P 2222 "$ROOT/tactus/etc/rc.d/atrium_tactus_console" root@localhost:/root/t/tactus/etc/rc.d/
+fi
+if [ "$GAMEPAD" = 1 ]; then
+  scp -q $K -P 2222 "$FAKE_PAD" root@localhost:/root/t/fake-pad
+  scp -q $K -P 2222 "$RENDERER" root@localhost:/root/t/fresco-renderer
 fi
 
 echo "== commission tactusd (jailed, devfs ruleset 26)"
@@ -87,10 +103,12 @@ ls -l /atrium/sockets/tactus/
 EOF
 
 echo "== frescod (headless) and the probe window"
-V 'sh -s' <<'EOF'
+V "GAMEPAD=$GAMEPAD sh -s" <<'EOF'
 cd /root/t
 rm -rf /tmp/hl /tmp/frescod-t.log; mkdir -p /tmp/hl /atrium/sockets/fresco
-daemon -f -o /tmp/frescod-t.log env FRESCOD_HEADLESS_PNG=/tmp/hl/f FRESCOD_SPLIT=0 FRESCOD_SOCK=/tmp/fresco-t.sock FRESCOD_WM_SOCK=/tmp/fresco-wm-t.sock ./frescod
+SPLIT="FRESCOD_SPLIT=0"
+[ "$GAMEPAD" = 1 ] && SPLIT="FRESCOD_SPLIT=1 FRESCOD_RENDERER=compute FRESCOD_RENDERER_LAUNCHER=unconfined"
+daemon -f -o /tmp/frescod-t.log env FRESCOD_HEADLESS_PNG=/tmp/hl/f $SPLIT FRESCOD_SOCK=/tmp/fresco-t.sock FRESCOD_WM_SOCK=/tmp/fresco-wm-t.sock ./frescod
 sleep 8
 grep -E "tactus|input" /tmp/frescod-t.log | head -5
 S=$(grep -o "/[^ ]*fresco[^ ]*\.sock" /tmp/frescod-t.log | head -1); [ -S /tmp/fresco-t.sock ] && S=/tmp/fresco-t.sock
@@ -98,6 +116,42 @@ echo "  frescod socket $S"
 rm -f /tmp/probe.log; daemon -f -o /tmp/probe.log ./atrium-input-probe $S 600
 sleep 5; cat /tmp/probe.log
 EOF
+
+if [ "$GAMEPAD" = 1 ]; then
+  echo "== gamepad: fake Bluetooth pad -> jailed tactusd -> split frescod -> windows"
+  V 'sh -s' <<'EOF'
+cd /root/t
+S=/tmp/fresco-t.sock
+mkdir -p /atrium/sockets/bluetooth-hid; chmod 0755 /atrium/sockets/bluetooth-hid
+rm -f /tmp/pad.log
+(umask 0; daemon -f -o /tmp/pad.log ./fake-pad /atrium/sockets/bluetooth-hid/hid.sock 25)
+# tactusd retries the socket every 2 s; then four steps 1.5 s apart.
+i=0; until grep -q "pausing" /tmp/pad.log || [ $i -ge 60 ]; do sleep 1; i=$((i+1)); done
+sleep 3
+rm -f /tmp/probe2.log; daemon -f -o /tmp/probe2.log ./atrium-input-probe $S 600
+i=0; until grep -q "detached" /tmp/pad.log || [ $i -ge 90 ]; do sleep 1; i=$((i+1)); done
+sleep 3
+cat /tmp/pad.log
+EOF
+  V 'grep pad- /tmp/probe.log' > /tmp/tactus-pad1.log
+  V 'grep pad- /tmp/probe2.log' > /tmp/tactus-pad2.log
+  echo "-- window 1"; cat /tmp/tactus-pad1.log; echo "-- window 2"; cat /tmp/tactus-pad2.log
+  P1=/tmp/tactus-pad1.log P2=/tmp/tactus-pad2.log
+  grep -q 'pad-connect .*id=1234:5678 buttons=15 axes=7 name="Fake Pad"' $P1 && ok "window 1: connect with counts and name" || bad "window 1 connect"
+  grep -q "pad-axis .*usage=0x00010030 value=32767" $P1 && ok "window 1: stick right" || bad "window 1 stick"
+  grep -q "pad-button .*usage=0x00090001 pressed=1" $P1 && grep -q "pad-button .*usage=0x00090001 pressed=0" $P1 && ok "window 1: button 1 press and release" || bad "window 1 button 1"
+  grep -q "pad-axis .*usage=0x00010039 value=2" $P1 && ok "window 1: hat right" || bad "window 1 hat"
+  tail -1 $P1 | grep -q "pad-disconnect" && ok "window 1: disconnect when focus moved" || bad "window 1 not disconnected last"
+  grep -q "usage=0x00090002" $P1 && bad "window 1 got button 2 after losing the pad" || ok "window 1: nothing after losing the pad"
+  head -1 $P2 | grep -q "pad-connect" && ok "window 2: connect first" || bad "window 2 connect"
+  grep -q "pad-axis .*usage=0x00010039 value=2" $P2 && ok "window 2: snapshot has the hat" || bad "window 2 snapshot"
+  grep -q "pad-button .*usage=0x00090002 pressed=1" $P2 && grep -q "pad-button .*usage=0x00090002 pressed=0" $P2 && ok "window 2: button 2" || bad "window 2 button 2"
+  tail -1 $P2 | grep -q "pad-disconnect" && ok "window 2: disconnect on detach" || bad "window 2 detach"
+  V 'grep "split mode" /tmp/frescod-t.log | head -2'
+  V 'jls -n name | grep -c atrium-tactusd' | sed 's/^/  tactusd jails: /'
+  echo "tactus: $fails failed"
+  exit $fails
+fi
 
 echo "== type and click (QEMU monitor)"
 mon "mouse_set 5" "sendkey shift-a" "sendkey b" "sendkey c 1500" "mouse_move 20 10" "mouse_button 1" "mouse_button 0" "mouse_move 0 0 2"
