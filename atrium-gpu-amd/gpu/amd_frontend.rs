@@ -26,3 +26,5 @@ pub mod ioctl;
 pub mod doorbell;
 #[path = "../rs/defer.rs"]
 pub mod defer;
+#[path = "../rs/queue.rs"]
+pub mod queue;

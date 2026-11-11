@@ -1,0 +1,88 @@
+From d473c5ac6a6a48787312fec45e90d44bf545adbd Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Wed, 11 Nov 2026 11:12:50 +0000
+Subject: [PATCH] kpi: sx_init_flags, sx_try_xlock, and holds across two calls
+
+sx_init_flags (SX_DUPOK for a family of locks taken in a fixed order),
+sx_try_xlock returning an optional guard, and SxExclusiveGuard::leak with
+SxLock::xunlock_leaked for a hold that spans a prepare/restore pair of
+calls from C (device reset).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ bindings.h         |  1 +
+ kpi/src/sync/sx.rs | 32 ++++++++++++++++++++++++++++++++
+ 2 files changed, 33 insertions(+)
+
+diff --git a/bindings.h b/bindings.h
+index b614cc0..eea50ad 100644
+--- a/bindings.h
++++ b/bindings.h
+@@ -235,6 +235,7 @@ FN1(sx_slock, void, struct sx *);
+ FN1(sx_sunlock, void, struct sx *);
+ FN1(sx_xlock, void, struct sx *);
+ FN1(sx_xunlock, void, struct sx *);
++FN1(sx_try_xlock, int, struct sx *);
+ FN5(sx_sleep, int, void *, struct sx *, int, const char *, int);
+ 
+ FN1(callout_drain, int, struct callout*);
+diff --git a/kpi/src/sync/sx.rs b/kpi/src/sync/sx.rs
+index 5cb2f07..514bba0 100644
+--- a/kpi/src/sync/sx.rs
++++ b/kpi/src/sync/sx.rs
+@@ -73,6 +73,14 @@ impl<T> DerefMut for SxExclusiveGuard<'_, T> {
+     }
+ }
+ 
++impl<'a, T> SxExclusiveGuard<'a, T> {
++    /// Keep the lock held past this guard, for a hold that spans two calls from C (a
++    /// prepare/restore pair). Release it with [`SxLock::xunlock_leaked`].
++    pub fn leak(self) {
++        core::mem::forget(self);
++    }
++}
++
+ impl<T> Drop for SxExclusiveGuard<'_, T> {
+     fn drop(&mut self) {
+         let sx_ptr = self.lock.inner.get();
+@@ -117,6 +125,16 @@ impl<T> SxLock<T> {
+     pub fn get_mut(&mut self) -> &mut T {
+         unsafe { self.data_ptr().as_mut().unwrap() }
+     }
++
++    /// Release an exclusive hold whose guard was [`leak`](SxExclusiveGuard::leak)ed.
++    ///
++    /// # Safety
++    ///
++    /// The calling thread holds the lock exclusively through a leaked guard, and nothing
++    /// uses that guard's borrow any more.
++    pub unsafe fn xunlock_leaked(&self) {
++        unsafe { bindings::fn_sx_xunlock(self.inner.get()) }
++    }
+ }
+ 
+ #[doc(inline)]
+@@ -133,6 +151,20 @@ pub mod wrappers {
+         unsafe { bindings::fn_sx_init(sx_ptr, name_ptr) }
+     }
+ 
++    /// `sx_init_flags(9)`: `opts` is `SX_DUPOK`, `SX_RECURSE`, ...
++    pub fn sx_init_flags<T>(lock: Pin<&SxLock<T>>, name: &'static CStr, opts: c_int) {
++        unsafe { bindings::sx_init_flags(lock.inner.get(), name.as_ptr(), opts) }
++    }
++
++    /// Take the lock exclusively if no one holds it.
++    pub fn sx_try_xlock<T>(lock: &SxLock<T>) -> Option<SxExclusiveGuard<'_, T>> {
++        if unsafe { bindings::fn_sx_try_xlock(lock.inner.get()) } != 0 {
++            Some(SxExclusiveGuard { lock })
++        } else {
++            None
++        }
++    }
++
+     pub fn sx_slock<T>(lock: &SxLock<T>) -> SxSharedGuard<'_, T> {
+         let sx_ptr = lock.inner.get();
+         unsafe { bindings::fn_sx_slock(sx_ptr) };
+-- 
+2.43.0
+

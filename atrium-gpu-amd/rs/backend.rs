@@ -90,28 +90,27 @@ impl Dev {
     }
 
     /// Which hardware queues may still be running work under any of `vmids`, and each queue's
-    /// generation now (queue.c). Busy queues hold up a BO's free.
+    /// generation now (queue.rs). Busy queues hold up a BO's free.
     pub fn busy_snapshot(self, vmids: &[u16]) -> BusyAt {
-        let mut vm = [0u16; sys::ATRIUM_AMD_BO_MAX_BIND as usize];
-        let n = vmids.len().min(vm.len());
-        vm[..n].copy_from_slice(&vmids[..n]);
-        let mut gens = [0u64; sys::ATRIUM_AMD_NHWQ as usize];
-        let mask = unsafe { sys::amd_hwq_busy_snapshot(self.0, vm.as_mut_ptr(), n as c_int, gens.as_mut_ptr()) };
-        BusyAt { mask, gens }
+        self.state().queues.snapshot(self, Some(vmids))
     }
 
-    /// Which queues are busy now (under any VM), and each queue's generation (queue.c).
+    /// Which queues are busy now (under any VM), and each queue's generation.
     pub fn queues_now(self) -> BusyAt {
-        let mut gens = [0u64; sys::ATRIUM_AMD_NHWQ as usize];
-        let mask = unsafe { sys::amd_hwq_busy_now(self.0, gens.as_mut_ptr()) };
-        BusyAt { mask, gens }
+        self.state().queues.snapshot(self, None)
     }
 
     /// The front-end's per-device state.
     pub fn state(self) -> &'static DevState {
+        self.try_state().expect("rs_state set at attach")
+    }
+
+    /// The per-device state, if attach has set it up (and detach not yet torn it down).
+    pub fn try_state(self) -> Option<&'static DevState> {
+        let p = unsafe { sys::amd_rs_state(self.0) };
         // SAFETY: set at attach (amd_hwq_init) and freed at detach after every object made
         // from this device is gone.
-        unsafe { DevState::from_raw(sys::amd_rs_state(self.0)) }
+        (!p.is_null()).then(|| unsafe { DevState::from_raw(p) })
     }
 
     /// Account deferred frees: `now` more (or fewer) waiting, `reaped` more completed.
@@ -124,7 +123,7 @@ impl Dev {
         unsafe { sys::amd_hwq_defer_kick(self.0) }
     }
 
-    // --- submission and queues ---
+    // --- submission (the backend op queue.rs implements for amd) ---
 
     #[allow(clippy::too_many_arguments)]
     pub fn submit(
@@ -152,8 +151,8 @@ impl Dev {
         Ok(off)
     }
 
-    /// The doorbell mmap (queue.c): the backend checks the offset belongs to a queue `client`
-    /// owns and returns a revocable pager object.
+    /// The doorbell mmap (queue.rs): checks the offset belongs to a queue `client` owns and
+    /// returns a revocable pager object.
     ///
     /// # Safety
     ///
@@ -169,9 +168,81 @@ impl Dev {
         unsafe { (self.ops().mmap_single.unwrap())(self.0, client, offset, size, object, nprot) }
     }
 
-    /// Give back any queue `client` owns and revoke its doorbell mappings.
+    /// Give back any queue `client` owns and revoke its doorbell mappings (queue.rs).
     pub fn client_close(self, client: *mut sys::atrium_amd_client) {
-        unsafe { sys::amd_hwq_client_close(self.0, client) }
+        unsafe { crate::queue::amd_hwq_client_close(self.0, client) }
+    }
+
+    // --- queue hardware and the completions a queue owes (queue.c helpers, cp.c) ---
+
+    /// Program `engine`'s queue to run the ring at `ring_va` under `vmid`; the doorbell offset.
+    pub fn queue_program(self, ring_va: u64, engine: u32, vmid: u16) -> Result<u32> {
+        let mut off = 0u32;
+        check(unsafe { sys::amd_queue_program(self.0, ring_va, engine, vmid, &mut off) })?;
+        Ok(off)
+    }
+
+    /// Halt queue `qid`, dropping what it had queued.
+    pub fn queue_stop(self, qid: u32) {
+        unsafe { sys::amd_queue_stop(self.0, qid) }
+    }
+
+    /// The queue's read pointer.
+    pub fn q_rptr(self, qid: u32) -> u32 {
+        unsafe { sys::amd_rs_q_rptr(self.0, qid) }
+    }
+
+    /// Does the queue still owe a completion (an EOP not yet seen)?
+    pub fn q_owes(self, qid: u32) -> bool {
+        unsafe { sys::amd_rs_q_owes(self.0, qid) != 0 }
+    }
+
+    /// Is there room on the queue's list for one more completion?
+    pub fn q_room(self, qid: u32) -> bool {
+        unsafe { sys::amd_rs_q_room(self.0, qid) != 0 }
+    }
+
+    /// New work was programmed: register its completion (if `so`) and restart the hang clock.
+    pub fn q_started(self, qid: u32, so: *mut sys::atrium_amd_syncobj, value: u64) {
+        unsafe { sys::amd_rs_q_started(self.0, qid, so, value) }
+    }
+
+    /// The queue was stopped: fail what it owed (EIO).
+    pub fn q_stopped(self, qid: u32, was_busy: bool) {
+        unsafe { sys::amd_rs_q_stopped(self.0, qid, was_busy as c_int) }
+    }
+
+    /// Must this busy kernel-rung queue be stopped (it faulted, or made no progress for
+    /// hang_ms)? Logs and counts the reason.
+    pub fn q_hang(self, qid: u32, vmid: u16, rptr: u32) -> bool {
+        unsafe { sys::amd_rs_q_hang(self.0, qid, vmid, rptr) != 0 }
+    }
+
+    pub fn q_count(self, what: u32) {
+        unsafe { sys::amd_rs_q_count(self.0, what as c_int) }
+    }
+
+    pub fn q_deadline(self, ns: u32) {
+        unsafe { sys::amd_rs_q_deadline(self.0, ns) }
+    }
+
+    pub fn q_doorbell(self, off: u32, wptr: u32) {
+        unsafe { sys::amd_rs_q_doorbell(self.0, off, wptr) }
+    }
+
+    /// The doorbell BAR's base physical address, 0 if it cannot be mapped.
+    pub fn doorbell_pa(self) -> u64 {
+        unsafe { sys::amd_rs_doorbell_pa(self.0) }
+    }
+
+    /// Point `vmid` at the all-invalid page directory.
+    pub fn vm_null_pd(self, vmid: u16) {
+        unsafe { sys::amd_rs_vm_null_pd(self.0, vmid) }
+    }
+
+    /// Make sure the hang watchdog is running (there is kernel-rung work).
+    pub fn watchdog_arm(self) {
+        unsafe { sys::amd_rs_watchdog_arm(self.0) }
     }
 
     // --- syncobjs ---

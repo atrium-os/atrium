@@ -9,24 +9,22 @@
  * kernel can take the page back out of every process that mapped it: on
  * revoke, faults fail (SIGBUS) and the page is removed from every mapping.
  *
- * Queue ownership and its lock stay in queue.c, which decides who may map
- * which doorbell and when to revoke. queue.c holds one object reference per
- * live grant (hwq->grant_obj) and hands out further references to mmap.
+ * queue.rs decides who may map which doorbell and when to revoke; it holds
+ * one object reference per live grant and hands out further references to
+ * mmap.
  * What lives here is the part user space reaches by touching the mapping:
  * the fault handler, and the grant's lifetime. The pager only ever inserts a
  * fictitious (device) page that no other object holds, whatever the grant
  * answers.
  *
- * Lock order (queue.c): hwq->lock, then the grant object's lock, then sc->lock.
+ * Lock order (queue.rs): a queue's lock, then the grant object's lock, then sc->lock.
  */
 
 use crate::backend::Dev;
-use crate::sys;
 use core::ffi::c_int;
 use core::sync::atomic::{AtomicBool, Ordering};
-use kpi::bindings::{PAGE_SIZE, vm_object_t};
+use kpi::bindings::PAGE_SIZE;
 use kpi::boxed::Box;
-use kpi::kobj::AsCType;
 use kpi::pager::{MgtDevHandle, VmObject};
 use kpi::prelude::*;
 
@@ -59,50 +57,28 @@ impl Drop for Grant {
     }
 }
 
-/// queue.c's references to grant objects.
-type GrantObj = VmObject<Grant>;
+/// A reference to a grant's pager object. queue.rs holds one per live grant (QState::grant)
+/// and hands clones to mmap.
+pub type GrantObj = VmObject<Grant>;
 
-/// A new grant for the doorbell page at `pa`; `*out` gets a reference to its object.
-///
-/// # Safety
-///
-/// `sc` is a live softc, `out` is writable, and the caller holds the queue's lock.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn amd_db_grant_create(
-    sc: *mut sys::atrium_amd_softc,
-    pa: u64,
-    nprot: c_int,
-    out: *mut vm_object_t,
-) -> c_int {
-    let dev = unsafe { Dev::from_raw(sc) };
-    // Counted before the object exists, as the Drop above undoes it; a failed allocation
+/// A new grant for the doorbell page at `pa`. Called with the queue's lock held.
+pub fn grant(dev: Dev, pa: u64, nprot: c_int) -> Result<GrantObj> {
+    // Counted before the object exists, as Grant's drop undoes it; a failed allocation
     // drops the grant and so undoes it too.
     dev.grant_count(1, true);
     let g = Box::new(Grant { dev, pa, revoked: AtomicBool::new(false) }, M_WAITOK);
     let cred = unsafe { (*kpi::file::curthread()).td_ucred };
-    match GrantObj::mgtdev(g, PAGE_SIZE as u64, nprot, cred) {
-        Ok(obj) => {
-            unsafe { *out = obj.into_raw() };
-            0
-        }
-        Err(e) => e.as_c_type(),
-    }
+    GrantObj::mgtdev(g, PAGE_SIZE as u64, nprot, cred)
 }
 
-/// Take the doorbell page back from every mapping of the grant, and give up queue.c's
-/// reference (the grant itself goes when the last mapping does).
-///
-/// # Safety
-///
-/// `obj` is queue.c's reference from `amd_db_grant_create`, not used after this; the caller
-/// holds the queue's lock, and not the object's.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn amd_db_grant_revoke(obj: vm_object_t) {
-    let obj = unsafe { GrantObj::from_raw(obj) };
+/// Take the doorbell page back from every mapping of the grant, and give up the queue's
+/// reference (the grant itself goes when the last mapping does). Called with the queue's
+/// lock held, and not the object's.
+pub fn revoke(obj: GrantObj) {
     {
         let _g = obj.lock();
         obj.handle().revoked.store(true, Ordering::Relaxed);
     }
     obj.free_pages(); // pmap_remove_all and remove from the object
-    // `obj` drops here: queue.c's reference is gone.
+    // `obj` drops here: the queue's reference is gone.
 }

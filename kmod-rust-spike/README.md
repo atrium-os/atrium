@@ -76,6 +76,8 @@ upstream.
    driver can revoke. The handle (`Box<T>`) belongs to the object and is freed by the pager
    destructor. `T` only picks the physical address for a fault, and the fault path refuses any
    page that is not an unowned fictitious page. atrium-gpu-amd's doorbell grants use it.
+10. **sx additions**: `sx_init_flags` (`SX_DUPOK`), `sx_try_xlock`, and `leak`/`xunlock_leaked`
+    for a hold that spans a prepare/restore pair of calls from C (atrium-gpu-amd's reset).
 
 ## 4. Results (arm64 2026-11-07, amd64 2026-11-10; QEMU TCG on the cloud host)
 

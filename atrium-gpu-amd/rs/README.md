@@ -12,13 +12,15 @@ layer that faces clients. The hardware half stays C for now.
 | GPU address spaces as fds: the VA arena and the VM's lifetime (`vm.rs`) | the hardware side of a VM: VMID, page tables, PTE writes (`vm.c`) |
 | buffer objects as fds: binding into VMs, unbinding, deferred free (`bo.rs`) | DMA pages and VRAM backing, scanout export (`bo.c`) |
 | timeline syncobjs: wait, kqueue, the display's watcher (`syncobj.rs`) | the EOP interrupt, which signals or fails a syncobj (`irq.c`) |
-| doorbell mapping grants: the device pager's fault handler, the grant's lifetime, revoke (`doorbell.rs`, on `kpi::pager`) | queues: ownership, programming, the hang watchdog, and which doorbell a client may map and when it is revoked (`queue.c`) |
-| deferred BO frees: the list and the reaper (`defer.rs`); a BO stays a Rust `Box` until it is freed, C never owns it | the reaper's timer and the per-queue busy/generation state it reads (`queue.c`) |
+| hardware queues: each queue's state behind its own lock, ownership, submit, QUEUE_MAP, the doorbell mmap, waiting for another VM's work, the hang check, reset (`queue.rs`) | queue registers, programming and stopping a queue (`cp.c`), the completions a queue owes, which the interrupt handler drains (`irq.c`), and the small helpers, timers and sysctls (`queue.c`) |
+| doorbell mapping grants: the device pager's fault handler, the grant's lifetime, revoke (`doorbell.rs`, on `kpi::pager`) | |
+| deferred BO frees: the list and the reaper (`defer.rs`); a BO stays a Rust `Box` until it is freed, C never owns it | the reaper's and watchdog's timers (`queue.c`) |
 | the single place Rust calls C (`backend.rs`) | |
 
 C reaches the Rust objects through a few `#[no_mangle]` exports: `amd_syncobj_*`,
-`amd_bo_fget`, `amd_rs_reap`/`amd_rs_dev_init`/`amd_rs_dev_fini`, and `amd_db_grant_create`/`amd_db_grant_revoke`
-(called by `queue.c` under the queue's lock). VM and BO are `#[repr(C)]`, and their
+`amd_bo_fget`, `amd_rs_reap`/`amd_rs_dev_init`/`amd_rs_dev_fini`, `amd_rs_watchdog`, and the
+queue entry points that keep their C names (`amd_hwq_submit`, `_map`, `_mmap_single`,
+`_client_close`, `_vm_gone`, `_reset_prepare`/`_restore`). VM and BO are `#[repr(C)]`, and their
 first field is the C backend struct, so a C pointer and a Rust pointer to the same object are
 the same address. Syncobjs and clients are opaque to C. The softc is opaque to Rust and is
 reached only through the `amd_rs_*` helpers in `../glue.c`. The cdevsw tables are also in
@@ -56,7 +58,7 @@ sh scripts/gpu-kmod-rust.sh build     # KERNCONF=ATRIUM-NODEBUG by default
 ```
 
 The modules go to `atrium-gpu-amd/out/<target>-<kernconf>/`. The script defaults to amd64,
-which needs LLVM 19. It needs KPI patches 0006 to 0009 (file objects, kqueue, vmem, sleep,
+which needs LLVM 19. It needs KPI patches 0006 to 0010 (file objects, kqueue, vmem, sleep,
 cdevpriv, and per-module bindgen). `gpu/Makefile` sets `RUST_SRCS`, `RUST_BINDGEN_HDR` and
 `RUST_BINDGEN_ALLOW`. The bindgen input is `rs/sys.h`.
 

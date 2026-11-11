@@ -18,6 +18,7 @@
 
 use crate::backend::Dev;
 use crate::bo::Bo;
+use crate::queue::Queues;
 use crate::sys;
 use core::ffi::{c_int, c_void};
 use core::pin::Pin;
@@ -55,6 +56,8 @@ struct Deferred {
 /// The front-end's per-device state (sc->rs_state).
 pub struct DevState {
     deferred: Mutex<Option<Box<Deferred>>>,
+    /// The hardware queues' state (queue.rs).
+    pub queues: Queues,
 }
 
 // SAFETY: everything is behind the mutex; a Bo is Send.
@@ -120,9 +123,12 @@ pub fn reap(dev: Dev) -> bool {
 /// Attach: the per-device state. NULL on failure.
 #[unsafe(no_mangle)]
 pub extern "C" fn amd_rs_dev_init() -> *mut c_void {
-    let s: Box<DevState> = Box::new(DevState { deferred: Mutex::new(None) }, M_WAITOK);
-    // SAFETY: boxed, never moves again; destroyed by the Mutex's drop.
-    unsafe { mtx_init(Pin::new_unchecked(&s.deferred), c"amd_defer", None, None) };
+    let s: Box<DevState> = Box::new(DevState { deferred: Mutex::new(None), queues: Queues::new() }, M_WAITOK);
+    // SAFETY: boxed, never moves again; the locks are destroyed by their drops.
+    unsafe {
+        mtx_init(Pin::new_unchecked(&s.deferred), c"amd_defer", None, None);
+        s.queues.init();
+    }
     Box::into_raw(s).cast()
 }
 

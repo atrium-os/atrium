@@ -701,19 +701,6 @@ struct atrium_amd_reset_hooks {
 
 struct atrium_amd_client;	/* one open of the client node (rs/ioctl.rs) */
 
-struct atrium_amd_hwq {
-	struct sx	 lock;		/* program + doorbell + ownership */
-	uint32_t	 qid;
-	uint32_t	 engine;
-	uint32_t	 doorbell_off;
-	uint16_t	 vmid;		/* VMID programmed now, 0 = none */
-	uint32_t	 wptr;		/* last wptr the kernel rang, 0 = none */
-	uint64_t	 gen;		/* bumped by every program and dequeue */
-	struct atrium_amd_client *owner; /* user-mode owner, NULL = kernel */
-	struct atrium_amd_vm *owner_vm;
-	vm_object_t	 grant_obj;	/* our reference on the doorbell grant
-					 * (rs/doorbell.rs), NULL = none */
-};
 
 struct atrium_amd_isolation_stats {
 	uint64_t	 queue_waits;	/* submits that waited for another VM */
@@ -891,7 +878,6 @@ struct atrium_amd_softc {
 
 	/* GPU isolation state (queue.c). */
 	struct cdev	*ctl_cdev;	/* /dev/atrium-gpuNctl: reset/sched/powergate */
-	struct atrium_amd_hwq hwq[ATRIUM_AMD_NHWQ];
 	int		 hwq_inited;
 	struct atrium_amd_dma_page null_pd; /* all-invalid page directory */
 	int		 db_fict_registered;
@@ -1049,11 +1035,15 @@ int	 amd_queue_program(struct atrium_amd_softc *sc, uint64_t ring_va,
 	    uint32_t engine, uint16_t vmid, uint32_t *doorbell_off);
 void	 amd_queue_stop(struct atrium_amd_softc *sc, uint32_t qid);
 
-/* queue.c — queue ownership, in-flight tracking, doorbell grants, deferred
- * frees (GPU isolation, review §A3 breaks 1-3) */
+/* queue.c — the C half of queue management: timers, sysctls, the helpers
+ * rs/queue.rs calls (rs/glue.h). */
 int	 amd_hwq_init(struct atrium_amd_softc *sc, device_t dev);
 void	 amd_hwq_fini(struct atrium_amd_softc *sc);
 int	 amd_hwq_busy_refs(struct atrium_amd_softc *sc);
+void	 amd_hwq_defer_kick(struct atrium_amd_softc *sc);
+
+/* rs/queue.rs — queue ownership, submit, the hang check, reset (GPU
+ * isolation, review §A3 breaks 1 and 3, §A2.6): Rust, called from C. */
 int	 amd_hwq_submit(struct atrium_amd_softc *sc,
 	    struct atrium_amd_client *client, uint64_t ring_va,
 	    uint32_t n_dwords, uint32_t engine, struct atrium_amd_vm *vm,
@@ -1068,12 +1058,6 @@ int	 amd_hwq_mmap_single(struct atrium_amd_softc *sc,
 void	 amd_hwq_client_close(struct atrium_amd_softc *sc,
 	    struct atrium_amd_client *client);
 void	 amd_hwq_vm_gone(struct atrium_amd_softc *sc, uint16_t vmid);
-uint32_t amd_hwq_busy_snapshot(struct atrium_amd_softc *sc,
-	    const uint16_t *vmids, int nvmids, uint64_t *gen);
-/* Which queues are busy now (any VM), with their generations (rs/defer.rs). */
-uint32_t amd_hwq_busy_now(struct atrium_amd_softc *sc, uint64_t *gen);
-/* Run the deferred-free reaper soon (rs/defer.rs). */
-void	 amd_hwq_defer_kick(struct atrium_amd_softc *sc);
 void	 amd_hwq_reset_prepare(struct atrium_amd_softc *sc);
 void	 amd_hwq_reset_restore(struct atrium_amd_softc *sc);
 

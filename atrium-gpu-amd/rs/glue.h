@@ -21,15 +21,27 @@ d_ioctl_t	amd_rs_ioctl;
 d_mmap_single_t	amd_rs_mmap_single;
 d_ioctl_t	amd_rs_ctl_ioctl;
 
-/*
- * Rust, for C (rs/doorbell.rs): doorbell grants, called by queue.c with the
- * queue's lock held. create gives a reference to a new managed device-pager
- * object; revoke takes the page back from every mapping and consumes that
- * reference.
- */
-int	amd_db_grant_create(struct atrium_amd_softc *sc, uint64_t pa, int nprot,
-	    vm_object_t *out);
-void	amd_db_grant_revoke(vm_object_t obj);
+/* C, for Rust (queue.c): queue registers and the completions a queue owes. */
+enum amd_rs_q_count { AMD_RS_Q_REFUSED, AMD_RS_Q_WAIT, AMD_RS_Q_REVOKE };
+uint32_t amd_rs_q_rptr(struct atrium_amd_softc *sc, uint32_t qid);
+int	amd_rs_q_owes(struct atrium_amd_softc *sc, uint32_t qid);
+int	amd_rs_q_room(struct atrium_amd_softc *sc, uint32_t qid);
+void	amd_rs_q_started(struct atrium_amd_softc *sc, uint32_t qid,
+	    struct atrium_amd_syncobj *so, uint64_t value);
+void	amd_rs_q_stopped(struct atrium_amd_softc *sc, uint32_t qid, int was_busy);
+int	amd_rs_q_hang(struct atrium_amd_softc *sc, uint32_t qid, uint16_t vmid,
+	    uint32_t rptr);
+void	amd_rs_q_count(struct atrium_amd_softc *sc, int what);
+void	amd_rs_q_deadline(struct atrium_amd_softc *sc, uint32_t ns);
+void	amd_rs_q_doorbell(struct atrium_amd_softc *sc, uint32_t off, uint32_t wptr);
+uint64_t amd_rs_doorbell_pa(struct atrium_amd_softc *sc);
+void	amd_rs_vm_null_pd(struct atrium_amd_softc *sc, uint16_t vmid);
+void	amd_rs_watchdog_arm(struct atrium_amd_softc *sc);
+
+/* Rust, for C (rs/queue.rs): the watchdog pass (1 while a kernel-rung queue
+ * is busy) and detach's stop-everything. */
+int	amd_rs_watchdog(struct atrium_amd_softc *sc);
+void	amd_rs_queues_stop(struct atrium_amd_softc *sc);
 
 /* Rust, for C (rs/defer.rs): the front-end's per-device state, and the
  * deferred BO-free pass (returns 1 while BOs still wait). */
