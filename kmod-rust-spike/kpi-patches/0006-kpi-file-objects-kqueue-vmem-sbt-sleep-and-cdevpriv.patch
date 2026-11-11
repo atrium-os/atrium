@@ -1,0 +1,891 @@
+From b968bcc0a0564ba988d2ef90fd80b90ea443ce6a Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Wed, 11 Nov 2026 08:24:20 +0000
+Subject: [PATCH 6/7] kpi: file objects, kqueue, vmem, sbt sleep and cdevpriv
+
+file.rs: struct file-backed objects (install, FileRef with type check,
+default fileops, fo_close frees the Box). event.rs: selinfo/knlist on an
+existing mutex and knote helpers. vmem.rs: vmem arenas. mtx.rs:
+msleep_sbt returning the raw errno (ERESTART), sbinuptime. cdev.rs:
+devfs_set_cdevpriv/devfs_get_cdevpriv for a boxed per-open state.
+usercopy.rs: raw copy_in/copy_out for #[repr(C)] structs.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ bindings.h          |  40 +++++++
+ kpi/src/cdev.rs     |  41 +++++++
+ kpi/src/event.rs    | 192 +++++++++++++++++++++++++++++++
+ kpi/src/file.rs     | 272 ++++++++++++++++++++++++++++++++++++++++++++
+ kpi/src/lib.rs      |   7 ++
+ kpi/src/sync/mtx.rs |  40 +++++++
+ kpi/src/usercopy.rs |  20 ++++
+ kpi/src/vmem.rs     | 139 ++++++++++++++++++++++
+ 8 files changed, 751 insertions(+)
+ create mode 100644 kpi/src/event.rs
+ create mode 100644 kpi/src/file.rs
+ create mode 100644 kpi/src/vmem.rs
+
+diff --git a/bindings.h b/bindings.h
+index c71d4fa..e875e1e 100644
+--- a/bindings.h
++++ b/bindings.h
+@@ -37,8 +37,12 @@
+ #include <sys/param.h>
+ #include <sys/conf.h>
+ #include <sys/bus.h>
++#include <sys/capsicum.h>
+ #include <sys/cpuset.h>
++#include <sys/event.h>
+ #include <sys/fcntl.h>
++#include <sys/file.h>
++#include <sys/filedesc.h>
+ #include <sys/firmware.h>
+ #ifdef INTRNG
+ #include <sys/intr.h>
+@@ -51,12 +55,18 @@
+ #include <sys/proc.h>
+ #include <sys/refcount.h>
+ #include <sys/rman.h>
++#include <sys/selinfo.h>
+ #include <sys/sglist.h>
+ #include <sys/smp.h>
++#include <sys/stat.h>
+ #include <sys/sx.h>
+ #include <sys/systm.h>
+ #include <sys/taskqueue.h>
+ #include <sys/uio.h>
++#include <sys/user.h>
++#include <sys/vmem.h>
++
++#include <vm/vm.h>
+ 
+ #include <machine/_inttypes.h>
+ #include <machine/bus.h>
+@@ -243,3 +253,33 @@ BUS_N(4, uint32_t);
+ #if defined(__aarch64__)
+ BUS_N(8, uint64_t);
+ #endif
++
++/*
++ * File objects, kqueue and deadline sleeps (kpi/src/file.rs, event.rs): the macros behind
++ * them, as functions.
++ */
++struct thread *
++rust_bindings_curthread(void) {
++    return curthread;
++}
++
++void
++rust_bindings_fdrop(struct file *fp, struct thread *td) {
++    (void)fdrop(fp, td);
++}
++
++bool
++rust_bindings_fhold(struct file *fp) {
++    return fhold(fp);
++}
++
++cap_rights_t *
++rust_bindings_cap_rights_init_none(cap_rights_t *rights) {
++    return cap_rights_init(rights);
++}
++
++void
++rust_bindings_knote_locked(struct knlist *list, long hint) {
++    KNOTE_LOCKED(list, hint);
++}
++
+diff --git a/kpi/src/cdev.rs b/kpi/src/cdev.rs
+index 3d5918b..e075d8b 100644
+--- a/kpi/src/cdev.rs
++++ b/kpi/src/cdev.rs
+@@ -34,6 +34,7 @@ use crate::kobj::AsRustType;
+ use crate::malloc::{Malloc, MallocType};
+ use crate::misc::Thread;
+ use crate::prelude::*;
++use crate::ErrCode;
+ pub use crate::usercopy::{IoctlCmd, IoctlData};
+ use core::ffi::{CStr, c_int, c_void};
+ use core::marker::PhantomData;
+@@ -333,3 +334,43 @@ mod tests {
+         }
+     }
+ }
++
++/// Per-open driver state (`devfs_set_cdevpriv(9)`): one `T` per open file of a cdev, dropped
++/// when the last reference to that open file goes away.
++///
++/// # Safety
++///
++/// Every `d_open` of the cdevs this type is used with sets a `T` and nothing else, so that
++/// [`with_cdevpriv`] may read the per-open pointer as a `T`.
++pub unsafe trait CdevPriv: Send + Sync + Sized + 'static {}
++
++unsafe extern "C" fn cdevpriv_dtor<T: CdevPriv>(p: *mut core::ffi::c_void) {
++    // SAFETY: set by set_cdevpriv::<T> from Box::into_raw.
++    drop(unsafe { crate::boxed::Box::<T>::from_raw(p.cast::<T>()) });
++}
++
++/// Attach `priv_` to the open in progress (call from `d_open`).
++pub fn set_cdevpriv<T: CdevPriv>(priv_: crate::boxed::Box<T>) -> Result<()> {
++    let p = crate::boxed::Box::into_raw(priv_);
++    // SAFETY: plain KPI call; on success devfs owns p and frees it through the dtor.
++    let err = unsafe { bindings::devfs_set_cdevpriv(p.cast(), Some(cdevpriv_dtor::<T>)) };
++    if err != 0 {
++        // SAFETY: devfs did not take it.
++        drop(unsafe { crate::boxed::Box::<T>::from_raw(p) });
++        return Err(ErrCode::from(err));
++    }
++    Ok(())
++}
++
++/// Run `f` on the current open's state (from `d_ioctl`, `d_mmap_single`, ...). The reference
++/// can't leave `f`: the state lives only as long as the thread's hold on the open file.
++pub fn with_cdevpriv<T: CdevPriv, R>(f: impl FnOnce(&T) -> R) -> Result<R> {
++    let mut p: *mut core::ffi::c_void = core::ptr::null_mut();
++    // SAFETY: plain KPI call.
++    let err = unsafe { bindings::devfs_get_cdevpriv(&mut p) };
++    if err != 0 {
++        return Err(ErrCode::from(err));
++    }
++    // SAFETY: CdevPriv's contract: the pointer is a T, live during this call.
++    Ok(f(unsafe { &*p.cast::<T>() }))
++}
+diff --git a/kpi/src/event.rs b/kpi/src/event.rs
+new file mode 100644
+index 0000000..96c09f0
+--- /dev/null
++++ b/kpi/src/event.rs
+@@ -0,0 +1,192 @@
++/*-
++ * SPDX-License-Identifier: BSD-2-Clause
++ *
++ * Copyright (c) 2026 The Atrium Authors
++ *
++ * Redistribution and use in source and binary forms, with or without
++ * modification, are permitted provided that the following conditions
++ * are met:
++ * 1. Redistributions of source code must retain the above copyright
++ *    notice, this list of conditions and the following disclaimer.
++ * 2. Redistributions in binary form must reproduce the above copyright
++ *    notice, this list of conditions and the following disclaimer in the
++ *    documentation and/or other materials provided with the distribution.
++ *
++ * THIS SOFTWARE IS PROVIDED BY THE AUTHOR AND CONTRIBUTORS ``AS IS'' AND
++ * ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
++ * IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
++ * ARE DISCLAIMED.  IN NO EVENT SHALL THE AUTHOR OR CONTRIBUTORS BE LIABLE
++ * FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL
++ * DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS
++ * OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION)
++ * HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT
++ * LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY
++ * OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF
++ * SUCH DAMAGE.
++ */
++
++//! kqueue(2) sources: a knote list guarded by a [`Mutex`], and the knotes on it.
++//!
++//! A driver object that can be waited on with kevent() embeds a [`SelInfo`], initialises its
++//! knote list with the object's mutex once the object has its final address, and calls
++//! [`SelInfo::knote_locked`] with that mutex held whenever the condition may have changed. The
++//! filter functions the kernel calls (`f_event`, `f_detach`) receive a [`Knote`].
++
++use crate::bindings::{self, filterops, knote};
++use crate::sync::mtx::{Mutex, MutexGuard};
++use core::cell::UnsafeCell;
++use core::ffi::c_long;
++use core::mem::MaybeUninit;
++
++/// A `struct selinfo`: the knote list (and select/poll waiters) of one object.
++pub struct SelInfo {
++    inner: UnsafeCell<bindings::selinfo>,
++    inited: UnsafeCell<bool>,
++}
++
++// SAFETY: every access after init goes through the knlist's own lock.
++unsafe impl Send for SelInfo {}
++unsafe impl Sync for SelInfo {}
++
++impl SelInfo {
++    pub const fn new() -> Self {
++        // SAFETY: an all-zero selinfo is what C drivers get from M_ZERO before knlist_init.
++        Self {
++            inner: UnsafeCell::new(unsafe { MaybeUninit::zeroed().assume_init() }),
++            inited: UnsafeCell::new(false),
++        }
++    }
++
++    /// Initialise the knote list, locked by `lock` (`knlist_init_mtx`).
++    ///
++    /// # Safety
++    ///
++    /// Call once, after `self` and `lock` are at their final addresses (inside a `Box`), with
++    /// `lock` initialised and outliving `self`; neither may move afterwards.
++    pub unsafe fn init_mtx<T>(&self, lock: &Mutex<T>) {
++        unsafe {
++            bindings::knlist_init_mtx(&raw mut (*self.inner.get()).si_note, lock.raw_mtx());
++            *self.inited.get() = true;
++        }
++    }
++
++    /// The `struct knlist`, for `knlist_add`/`knlist_remove` in a filter.
++    pub fn knlist(&self) -> *mut bindings::knlist {
++        // SAFETY: address only.
++        unsafe { &raw mut (*self.inner.get()).si_note }
++    }
++
++    /// Run every knote's `f_event` (`KNOTE_LOCKED`). The guard proves the list's lock is held.
++    pub fn knote_locked<T>(&self, _held: &MutexGuard<'_, T>, hint: c_long) {
++        // SAFETY: the list is initialised (guards exist only for initialised mutexes, and the
++        // caller pairs this SelInfo with that mutex) and its lock is held.
++        unsafe { bindings::rust_bindings_knote_locked(self.knlist(), hint) };
++    }
++
++    /// Add a knote (from `fo_kqfilter`). `islocked`: the list's lock is already held.
++    ///
++    /// # Safety
++    ///
++    /// `kn` is the knote the kernel passed to the kqfilter, with `kn_fop` and `kn_hook` set.
++    pub unsafe fn add(&self, kn: *mut knote, islocked: bool) {
++        unsafe { bindings::knlist_add(self.knlist(), kn, islocked as _) };
++    }
++
++    /// Remove a knote (from `f_detach`).
++    ///
++    /// # Safety
++    ///
++    /// `kn` is on this list.
++    pub unsafe fn remove(&self, kn: *mut knote, islocked: bool) {
++        unsafe { bindings::knlist_remove(self.knlist(), kn, islocked as _) };
++    }
++}
++
++impl Drop for SelInfo {
++    fn drop(&mut self) {
++        // SAFETY: we are the last user; the lock (outliving us, see init_mtx) is still valid.
++        unsafe {
++            if *self.inited.get() {
++                bindings::seldrain(self.inner.get());
++                bindings::knlist_destroy(self.knlist());
++            }
++        }
++    }
++}
++
++/// A knote handed to a filter function.
++pub struct Knote(*mut knote);
++
++impl Knote {
++    /// # Safety
++    ///
++    /// `kn` is a live knote passed by the kernel to a filter function.
++    pub unsafe fn from_raw(kn: *mut knote) -> Self {
++        Knote(kn)
++    }
++
++    pub fn as_ptr(&self) -> *mut knote {
++        self.0
++    }
++
++    /// The filter's own pointer (`kn_hook`), set in the kqfilter.
++    pub fn hook<T>(&self) -> *mut T {
++        unsafe { (*self.0).kn_hook.cast() }
++    }
++
++    /// # Safety
++    ///
++    /// `hook` lives at least until `f_detach`.
++    pub unsafe fn set_ops(&self, ops: &'static FilterOps, hook: *const core::ffi::c_void) {
++        unsafe {
++            (*self.0).kn_fop = &ops.0;
++            (*self.0).kn_hook = hook.cast_mut();
++        }
++    }
++
++    pub fn filter(&self) -> i16 {
++        unsafe { (*self.0).kn_kevent.filter }
++    }
++
++    /// The `data` the caller put in its kevent (`kn_sdata`).
++    pub fn sdata(&self) -> i64 {
++        unsafe { (*self.0).kn_sdata as i64 }
++    }
++
++    /// The `data` returned to the caller (`kn_data`).
++    pub fn set_data(&self, v: i64) {
++        unsafe { (*self.0).kn_kevent.data = v as _ };
++    }
++
++    /// Report end-of-file with `fflags` (an errno, by convention of the source).
++    pub fn set_eof(&self, fflags: u32) {
++        unsafe {
++            (*self.0).kn_kevent.flags |= bindings::EV_EOF as u16;
++            (*self.0).kn_kevent.fflags = fflags;
++        }
++    }
++}
++
++/// A `struct filterops`, for a static.
++#[repr(transparent)]
++pub struct FilterOps(pub filterops);
++
++// SAFETY: immutable function pointers and flags.
++unsafe impl Sync for FilterOps {}
++
++impl FilterOps {
++    /// A descriptor-backed filter (`f_isfd = 1`) with the given detach and event functions and
++    /// the trivial copy.
++    pub const fn fd(
++        detach: unsafe extern "C" fn(*mut knote),
++        event: unsafe extern "C" fn(*mut knote, c_long) -> core::ffi::c_int,
++    ) -> Self {
++        // SAFETY: filterops is function pointers and an int; all-zero is valid.
++        let mut f: filterops = unsafe { MaybeUninit::zeroed().assume_init() };
++        f.f_isfd = 1;
++        f.f_detach = Some(detach);
++        f.f_event = Some(event);
++        f.f_copy = Some(bindings::knote_triv_copy);
++        FilterOps(f)
++    }
++}
+diff --git a/kpi/src/file.rs b/kpi/src/file.rs
+new file mode 100644
+index 0000000..ae22e44
+--- /dev/null
++++ b/kpi/src/file.rs
+@@ -0,0 +1,272 @@
++/*-
++ * SPDX-License-Identifier: BSD-2-Clause
++ *
++ * Copyright (c) 2026 The Atrium Authors
++ *
++ * Redistribution and use in source and binary forms, with or without
++ * modification, are permitted provided that the following conditions
++ * are met:
++ * 1. Redistributions of source code must retain the above copyright
++ *    notice, this list of conditions and the following disclaimer.
++ * 2. Redistributions in binary form must reproduce the above copyright
++ *    notice, this list of conditions and the following disclaimer in the
++ *    documentation and/or other materials provided with the distribution.
++ *
++ * THIS SOFTWARE IS PROVIDED BY THE AUTHOR AND CONTRIBUTORS ``AS IS'' AND
++ * ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
++ * IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
++ * ARE DISCLAIMED.  IN NO EVENT SHALL THE AUTHOR OR CONTRIBUTORS BE LIABLE
++ * FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL
++ * DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS
++ * OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION)
++ * HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT
++ * LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY
++ * OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF
++ * SUCH DAMAGE.
++ */
++
++//! Kernel objects handed to user space as file descriptors (`struct file` with a module's own
++//! `fileops`), the way kqueue, eventfd and DRM-style buffer objects are.
++//!
++//! The lifetime rule is the one C drivers get wrong: the object lives exactly as long as the
++//! `struct file` holds it, and the last `fdrop` runs `fo_close`, which frees it. Here:
++//!
++//! - [`install`] moves a `Box<T>` into a new file and returns the descriptor. From then on the
++//!   file owns it; the `fo_close` that [`file_ops!`] installs takes it back and drops it.
++//! - [`FileRef::get`] resolves a descriptor to a held reference, checks that the file really is a
++//!   `T` (its `f_ops` is `T`'s table), and derefs to `&T`. Dropping it is the `fdrop`, so a
++//!   reference can't be leaked on an error path or used after it is released.
++//!
++//! An object reachable through a `FileRef` is shared (several threads, several processes after
++//! SCM_RIGHTS), so `T` only ever hands out `&T`: mutable state inside it needs a lock.
++
++use crate::bindings::{self, file, fileops, filedesc, kinfo_file, stat, thread, ucred};
++use crate::boxed::Box;
++use crate::prelude::*;
++use crate::ErrCode;
++use core::ffi::c_int;
++use core::marker::PhantomData;
++use core::mem::MaybeUninit;
++use core::ops::Deref;
++use core::ptr::{NonNull, null_mut};
++
++/// A file-operations table, built by [`file_ops!`].
++#[repr(transparent)]
++pub struct FileOps(pub bindings::fileops);
++
++// SAFETY: a fileops table is immutable function pointers and flags.
++unsafe impl Sync for FileOps {}
++
++/// A kernel object that lives in a `struct file`.
++///
++/// # Safety
++///
++/// `fileops()` must return a table made by [`file_ops!`] for this same type and used for no
++/// other type: its `fo_close` frees `f_data` as a `Box<Self>`, and [`FileRef::get`] trusts the
++/// table's identity to know what `f_data` points to.
++pub unsafe trait FileObject: Send + Sync + Sized + 'static {
++    fn fileops() -> &'static FileOps;
++}
++
++/// The calling thread.
++pub fn curthread() -> *mut thread {
++    unsafe { bindings::rust_bindings_curthread() }
++}
++
++/// `fo_close` for a [`FileObject`]: take the object out of the file and drop it.
++///
++/// # Safety
++///
++/// Called by the kernel only, through a table from [`file_ops!`] for `T`.
++pub unsafe extern "C" fn close_trampoline<T: FileObject>(fp: *mut file, _td: *mut thread) -> c_int {
++    // SAFETY: the kernel passes the file being closed; nobody else holds a reference to it.
++    let data = unsafe { core::mem::replace(&mut (*fp).f_data, null_mut()) };
++    if !data.is_null() {
++        // SAFETY: f_data was set by `install::<T>` from `Box::into_raw`.
++        drop(unsafe { Box::<T>::from_raw(data.cast::<T>()) });
++    }
++    0
++}
++
++/// `fo_stat`: a character-device-like object with no other attributes.
++pub unsafe extern "C" fn stat_chr(_fp: *mut file, sb: *mut stat, _cred: *mut ucred) -> c_int {
++    // SAFETY: the kernel passes a stat buffer to fill.
++    unsafe {
++        core::ptr::write_bytes(sb, 0, 1);
++        (*sb).st_mode = bindings::S_IFCHR as _;
++    }
++    0
++}
++
++/// `fo_fill_kinfo`: report the object as a device.
++pub unsafe extern "C" fn fill_kinfo_dev(
++    _fp: *mut file,
++    kif: *mut kinfo_file,
++    _fdp: *mut filedesc,
++) -> c_int {
++    // SAFETY: the kernel passes a kinfo_file to fill.
++    unsafe { (*kif).kf_type = bindings::KF_TYPE_DEV as _ };
++    0
++}
++
++/// The defaults [`file_ops!`] starts from: no read/write/ioctl/poll/kqueue, character-device
++/// stat, passable over a unix socket, and the `fo_close` that frees the object.
++pub const fn default_fileops<T: FileObject>() -> fileops {
++    // SAFETY: fileops is function pointers (None) and integers; all-zero is valid.
++    let mut ops: fileops = unsafe { MaybeUninit::zeroed().assume_init() };
++    ops.fo_read = Some(bindings::invfo_rdwr);
++    ops.fo_write = Some(bindings::invfo_rdwr);
++    ops.fo_truncate = Some(bindings::invfo_truncate);
++    ops.fo_ioctl = Some(bindings::invfo_ioctl);
++    ops.fo_poll = Some(bindings::invfo_poll);
++    ops.fo_kqfilter = Some(bindings::invfo_kqfilter);
++    ops.fo_stat = Some(stat_chr);
++    ops.fo_close = Some(close_trampoline::<T>);
++    ops.fo_chmod = Some(bindings::invfo_chmod);
++    ops.fo_chown = Some(bindings::invfo_chown);
++    ops.fo_sendfile = Some(bindings::invfo_sendfile);
++    ops.fo_fill_kinfo = Some(fill_kinfo_dev);
++    ops.fo_cmp = Some(bindings::file_kcmp_generic);
++    ops.fo_flags = bindings::DFLAG_PASSABLE as _;
++    ops
++}
++
++/// Define the `fileops` table of a [`FileObject`] and implement the trait.
++///
++/// ```ignore
++/// file_ops!(SyncObj);                                      // defaults only
++/// file_ops!(SyncObj, |ops| { ops.fo_kqfilter = Some(my_kqfilter); });
++/// ```
++#[macro_export]
++macro_rules! file_ops {
++    ($ty:ty) => {
++        $crate::file_ops!($ty, |_ops| {});
++    };
++    ($ty:ty, |$ops:ident| $body:block) => {
++        const _: () = {
++            static OPS: $crate::file::FileOps = $crate::file::FileOps({
++                #[allow(unused_mut)]
++                let mut $ops = $crate::file::default_fileops::<$ty>();
++                $body
++                // Whatever the body did, fo_close is the one that frees a Box<$ty>.
++                $ops.fo_close = Some($crate::file::close_trampoline::<$ty>);
++                $ops
++            });
++            // SAFETY: OPS is this type's own table and its fo_close frees a Box<$ty>.
++            unsafe impl $crate::file::FileObject for $ty {
++                fn fileops() -> &'static $crate::file::FileOps {
++                    &OPS
++                }
++            }
++        };
++    };
++}
++
++/// Give `obj` to a new file and install it in the calling process's descriptor table.
++/// `fflags` are the file's `f_flag` (FREAD, FWRITE). Returns the descriptor.
++pub fn install<T: FileObject>(obj: Box<T>, fflags: c_int) -> Result<c_int> {
++    let td = curthread();
++    let mut fp: *mut file = null_mut();
++    // SAFETY: plain KPI call; fp is written on success.
++    let err = unsafe { bindings::_falloc_noinstall(td, &mut fp, 1) };
++    if err != 0 {
++        return Err(ErrCode::from(err)); // obj dropped here
++    }
++    let ops = core::ptr::from_ref(&T::fileops().0).cast_mut();
++    // SAFETY: fp is a fresh file we hold the only reference to; from here the file owns the
++    // object, and its fo_close (close_trampoline::<T>) frees it.
++    unsafe {
++        bindings::finit(fp, fflags as _, bindings::DTYPE_DEV as _, Box::into_raw(obj).cast(), ops)
++    };
++    let mut fd: c_int = -1;
++    // SAFETY: fp is initialised; finstall takes its own reference on success.
++    let err = unsafe { bindings::finstall(td, fp, &mut fd, 0, null_mut()) };
++    // Our allocation reference: on failure this is the last one, and fo_close frees the object.
++    unsafe { bindings::rust_bindings_fdrop(fp, td) };
++    if err != 0 {
++        return Err(ErrCode::from(err));
++    }
++    Ok(fd)
++}
++
++/// A held reference to a file that holds a `T`. Derefs to the object; drop releases the file.
++pub struct FileRef<T: FileObject> {
++    fp: NonNull<file>,
++    _t: PhantomData<T>,
++}
++
++// SAFETY: the file reference is a refcount; T is Sync, so &T may go to other threads.
++unsafe impl<T: FileObject> Send for FileRef<T> {}
++unsafe impl<T: FileObject> Sync for FileRef<T> {}
++
++impl<T: FileObject> FileRef<T> {
++    /// Resolve a descriptor of the calling process. `EBADF` if it isn't open, `EINVAL` if it is
++    /// not a `T`.
++    pub fn get(fd: c_int) -> Result<Self> {
++        let td = curthread();
++        let mut rights = MaybeUninit::<bindings::cap_rights_t>::uninit();
++        let mut fp: *mut file = null_mut();
++        // SAFETY: rights is initialised (no rights required) before fget reads it.
++        let err = unsafe {
++            bindings::rust_bindings_cap_rights_init_none(rights.as_mut_ptr());
++            bindings::fget(td, fd, rights.as_mut_ptr(), &mut fp)
++        };
++        if err != 0 {
++            return Err(ErrCode::from(err));
++        }
++        let r = FileRef::<T> { fp: NonNull::new(fp).ok_or(EBADF)?, _t: PhantomData };
++        // SAFETY: we hold a reference, so the file is live.
++        let (ops, data) = unsafe { ((*fp).f_ops, (*fp).f_data) };
++        if !core::ptr::eq(ops, &T::fileops().0) {
++            return Err(EINVAL); // r drops the reference
++        }
++        if data.is_null() {
++            return Err(EBADF);
++        }
++        Ok(r)
++    }
++
++    /// The `struct file`, for C code that keeps its own reference or compares identity.
++    pub fn as_file_ptr(&self) -> *mut file {
++        self.fp.as_ptr()
++    }
++
++    /// Hand the reference to C code, which releases it with `fdrop(fp, td)`.
++    pub fn into_raw(self) -> *mut file {
++        let fp = self.fp.as_ptr();
++        core::mem::forget(self);
++        fp
++    }
++
++    /// The object, as the raw pointer C code knows it by.
++    pub fn as_ptr(&self) -> *mut T {
++        // SAFETY: a held, type-checked file with non-NULL f_data (checked in get()).
++        unsafe { (*self.fp.as_ptr()).f_data.cast::<T>() }
++    }
++}
++
++impl<T: FileObject> Deref for FileRef<T> {
++    type Target = T;
++    fn deref(&self) -> &T {
++        // SAFETY: f_data stays set until fo_close, which runs only after the last reference
++        // (including ours) is dropped.
++        unsafe { &*self.as_ptr() }
++    }
++}
++
++impl<T: FileObject> Clone for FileRef<T> {
++    fn clone(&self) -> Self {
++        // SAFETY: we hold a reference, so the count is non-zero and fhold can't fail except on
++        // overflow, which the kernel refuses rather than wrapping.
++        let ok = unsafe { bindings::rust_bindings_fhold(self.fp.as_ptr()) };
++        assert!(ok, "file reference count overflow");
++        FileRef { fp: self.fp, _t: PhantomData }
++    }
++}
++
++impl<T: FileObject> Drop for FileRef<T> {
++    fn drop(&mut self) {
++        // SAFETY: we own one reference.
++        unsafe { bindings::rust_bindings_fdrop(self.fp.as_ptr(), curthread()) };
++    }
++}
+diff --git a/kpi/src/lib.rs b/kpi/src/lib.rs
+index b0c58d3..bcae6e3 100644
+--- a/kpi/src/lib.rs
++++ b/kpi/src/lib.rs
+@@ -77,6 +77,11 @@ pub mod collections;
+ pub mod device;
+ /// Contains a macro and trait for defining drivers
+ pub mod driver;
++/// kqueue sources: knote lists and filter functions
++pub mod event;
++/// Kernel objects exposed as file descriptors
++#[macro_use]
++pub mod file;
+ /// `CString`, `SubClass` and other FFI utilities
+ pub mod ffi;
+ /// Interrupt functions, config hook, callout and tsleep
+@@ -103,6 +108,8 @@ pub mod tty;
+ pub mod vec;
+ /// copyin/copyout and ioctl argument access
+ pub mod usercopy;
++/// vmem(9) resource arenas
++pub mod vmem;
+ 
+ const _VERSION_CHECK: () = {
+     if bindings::__FreeBSD_version / 100000 != 16 {
+diff --git a/kpi/src/sync/mtx.rs b/kpi/src/sync/mtx.rs
+index 64546d1..b255df9 100644
+--- a/kpi/src/sync/mtx.rs
++++ b/kpi/src/sync/mtx.rs
+@@ -167,6 +167,11 @@ impl<T> Mutex<T> {
+     pub fn get_mut(&mut self) -> &mut T {
+         unsafe { self.data_ptr().as_mut().unwrap() }
+     }
++
++    /// The `struct mtx`, for KPIs that take the lock itself (`knlist_init_mtx`, `msleep`).
++    pub fn raw_mtx(&self) -> *mut mtx {
++        self.mtx_impl.inner.get()
++    }
+ }
+ 
+ #[derive(Debug, Default)]
+@@ -341,6 +346,41 @@ pub mod wrappers {
+         (new_guard, result)
+     }
+ 
++    /// Sleep on `chan` with the mutex released, until woken, `sbt` passes (`C_ABSOLUTE` in
++    /// `flags`: `sbt` is a deadline on the `sbinuptime()` clock) or, with `PCATCH` in `pri`, a
++    /// signal. `msleep_sbt(9)`. The guard comes back re-acquired either way, with the raw
++    /// result: 0, `EWOULDBLOCK`, `EINTR` or `ERESTART`. Raw because `ERESTART` is negative,
++    /// which [`ErrCode`] can't hold, and a syscall has to return it as it is to be restarted.
++    pub fn mtx_sleep_sbt<'a, T>(
++        chan: *const c_void,
++        guard: MutexGuard<'a, T>,
++        pri: c_int,
++        wmesg: &'static CStr,
++        sbt: bindings::sbintime_t,
++        pr: bindings::sbintime_t,
++        flags: c_int,
++    ) -> (MutexGuard<'a, T>, c_int) {
++        let lock = guard.lock;
++        let mtx_ptr = lock.mtx_impl.inner.get();
++        let lock_obj_ptr = unsafe { &raw mut (*mtx_ptr).lock_object };
++
++        core::mem::forget(guard);
++
++        let res = unsafe {
++            bindings::_sleep(chan.cast_mut(), lock_obj_ptr, pri, wmesg.as_ptr(), sbt, pr, flags)
++        };
++
++        (MutexGuard { lock, _marker: PhantomData }, res)
++    }
++
++    /// The uptime clock deadline sleeps use (`sbinuptime(9)`).
++    pub fn sbinuptime() -> bindings::sbintime_t {
++        unsafe { bindings::sbinuptime() }
++    }
++
++    /// One millisecond in `sbintime_t` (`SBT_1MS`).
++    pub const SBT_1MS: bindings::sbintime_t = (1i64 << 32) / 1000;
++
+     pub fn mtx_unlock<T>(guard: MutexGuard<T>) {
+         drop(guard)
+     }
+diff --git a/kpi/src/usercopy.rs b/kpi/src/usercopy.rs
+index 77ae460..a9dfda9 100644
+--- a/kpi/src/usercopy.rs
++++ b/kpi/src/usercopy.rs
+@@ -181,6 +181,26 @@ impl UserSlice {
+     pub fn write_obj<T: AsBytes>(&self, v: &T) -> Result<()> {
+         self.copy_out(as_bytes(v))
+     }
++
++    /// Copy the whole range into kernel memory that is not a Rust object: DMA memory a device
++    /// also reads and writes, so no `&mut [u8]` may be formed over it.
++    ///
++    /// # Safety
++    ///
++    /// `dst` is valid for writes of `self.len()` bytes for the duration of the call.
++    pub unsafe fn copy_in_raw(&self, dst: *mut u8) -> Result<()> {
++        unsafe { raw_copyin(self.addr, dst, self.len) }
++    }
++
++    /// Copy `self.len()` bytes of kernel memory that is not a Rust object (device-shared DMA
++    /// memory) out to the range.
++    ///
++    /// # Safety
++    ///
++    /// `src` is valid for reads of `self.len()` bytes for the duration of the call.
++    pub unsafe fn copy_out_raw(&self, src: *const u8) -> Result<()> {
++        unsafe { raw_copyout(src, self.addr, self.len) }
++    }
+ }
+ 
+ /// An ioctl command number, with the direction and size bits of `sys/ioccom.h`.
+diff --git a/kpi/src/vmem.rs b/kpi/src/vmem.rs
+new file mode 100644
+index 0000000..e6c8a58
+--- /dev/null
++++ b/kpi/src/vmem.rs
+@@ -0,0 +1,139 @@
++/*-
++ * SPDX-License-Identifier: BSD-2-Clause
++ *
++ * Copyright (c) 2026 The Atrium Authors
++ *
++ * Redistribution and use in source and binary forms, with or without
++ * modification, are permitted provided that the following conditions
++ * are met:
++ * 1. Redistributions of source code must retain the above copyright
++ *    notice, this list of conditions and the following disclaimer.
++ * 2. Redistributions in binary form must reproduce the above copyright
++ *    notice, this list of conditions and the following disclaimer in the
++ *    documentation and/or other materials provided with the distribution.
++ *
++ * THIS SOFTWARE IS PROVIDED BY THE AUTHOR AND CONTRIBUTORS ``AS IS'' AND
++ * ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
++ * IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
++ * ARE DISCLAIMED.  IN NO EVENT SHALL THE AUTHOR OR CONTRIBUTORS BE LIABLE
++ * FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL
++ * DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS
++ * OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION)
++ * HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT
++ * LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY
++ * OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF
++ * SUCH DAMAGE.
++ */
++
++
++//! vmem(9) resource arenas: an address range handed out in quantum-sized pieces.
++
++use crate::bindings::{self, vmem_addr_t, vmem_size_t};
++use crate::prelude::*;
++use crate::ErrCode;
++use core::ffi::CStr;
++use core::ptr::NonNull;
++
++/// An arena owned by Rust code. Destroyed (`vmem_destroy`) on drop; every range must have
++/// been freed by then, which `vmem_destroy` checks on INVARIANTS kernels.
++pub struct VmemArena(NonNull<bindings::vmem_t>);
++
++// SAFETY: vmem arenas carry their own lock.
++unsafe impl Send for VmemArena {}
++unsafe impl Sync for VmemArena {}
++
++/// Allocation policy for [`VmemArena::alloc`].
++#[derive(Copy, Clone, Debug, PartialEq, Eq)]
++pub enum Fit {
++    Best,
++    First,
++    /// Next-fit: a freed range comes back only after the cursor has lapped the arena.
++    Next,
++}
++
++impl Fit {
++    fn flag(self) -> core::ffi::c_int {
++        (match self {
++            Fit::Best => bindings::M_BESTFIT,
++            Fit::First => bindings::M_FIRSTFIT,
++            Fit::Next => bindings::M_NEXTFIT,
++        }) as _
++    }
++}
++
++impl VmemArena {
++    /// An arena over `[base, base + size)` handing out multiples of `quantum`. May sleep.
++    pub fn new(name: &'static CStr, base: u64, size: u64, quantum: u64) -> Result<Self> {
++        // SAFETY: plain KPI call; the name is static.
++        let p = unsafe {
++            bindings::vmem_create(
++                name.as_ptr(),
++                base as vmem_addr_t,
++                size as vmem_size_t,
++                quantum as vmem_size_t,
++                0,
++                bindings::M_WAITOK as _,
++            )
++        };
++        NonNull::new(p).map(VmemArena).ok_or(ENOMEM)
++    }
++
++    /// Allocate `size` bytes anywhere, without sleeping.
++    pub fn alloc(&self, size: u64, fit: Fit) -> Result<u64> {
++        let mut addr: vmem_addr_t = 0;
++        let flags = fit.flag() | bindings::M_NOWAIT as core::ffi::c_int;
++        // SAFETY: live arena; addr is written on success.
++        let err = unsafe { bindings::vmem_alloc(self.0.as_ptr(), size as _, flags, &mut addr) };
++        if err != 0 {
++            return Err(ErrCode::from(err));
++        }
++        Ok(addr as u64)
++    }
++
++    /// Allocate exactly `[addr, addr + size)`, without sleeping. `EEXIST` if any of it is taken
++    /// or outside the arena.
++    pub fn alloc_at(&self, addr: u64, size: u64) -> Result<()> {
++        let end = addr.checked_add(size).ok_or(EINVAL)?;
++        let mut got: vmem_addr_t = 0;
++        let flags = (bindings::M_BESTFIT | bindings::M_NOWAIT) as core::ffi::c_int;
++        // SAFETY: live arena; got is written on success.
++        let err = unsafe {
++            bindings::vmem_xalloc(
++                self.0.as_ptr(),
++                size as _,
++                0,
++                0,
++                0,
++                addr as _,
++                end as _,
++                flags,
++                &mut got,
++            )
++        };
++        if err != 0 {
++            return Err(EEXIST);
++        }
++        if got as u64 != addr {
++            // SAFETY: we were just given [got, got + size).
++            unsafe { bindings::vmem_free(self.0.as_ptr(), got, size as _) };
++            return Err(EEXIST);
++        }
++        Ok(())
++    }
++
++    /// Give back a range from `alloc` or `alloc_at`.
++    ///
++    /// # Safety
++    ///
++    /// `[addr, addr + size)` is exactly a range this arena handed out and not yet freed.
++    pub unsafe fn free(&self, addr: u64, size: u64) {
++        unsafe { bindings::vmem_free(self.0.as_ptr(), addr as _, size as _) };
++    }
++}
++
++impl Drop for VmemArena {
++    fn drop(&mut self) {
++        // SAFETY: we own the arena.
++        unsafe { bindings::vmem_destroy(self.0.as_ptr()) };
++    }
++}
+-- 
+2.43.0
+

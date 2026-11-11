@@ -15,6 +15,11 @@
 # build against the SAME freebsd-src the running kernel came from, which the
 # recipe above does by construction.
 #
+# ★ Since 2026-11-11 gpu/ has a Rust front-end (rs/README.md): SYSDIR must be the
+# Atrium fork's tree with freebsd-kpi-rs prepared at sys/rust (and LLVM 19 on amd64).
+# `sh scripts/gpu-kmod-rust.sh prepare|build` does both; a tree without sys/rust
+# fails at the kmod.rust.mk include.
+#
 #   base/    atrium_gpu_amd_pci.ko     — PCI bring-up + BARs + MSI-X + shared softc
 #   gpu/     atrium_gpu_amd.ko         — compute/render, /dev/atrium-gpu0  (DEPEND pci)
 #   display/ atrium_gpu_amd_display.ko — display engine, /dev/atrium-display0 (DEPEND pci)

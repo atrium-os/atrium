@@ -1,0 +1,85 @@
+From f09f54746ad894a4206d59be415a6cce918e7a54 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Wed, 11 Nov 2026 08:24:20 +0000
+Subject: [PATCH 7/7] kmod.rust.mk: per-module bindgen; kern.rust.mk: blocklist
+ ktr_get_tracevp
+
+A module can now name a C header (RUST_BINDGEN_HDR) and an allowlist
+(RUST_BINDGEN_ALLOW); bindgen writes ${OUT_DIR}/modsys.rs, which the
+crate include!()s on top of kpi::bindings. ktr_get_tracevp's static
+inline wrapper names struct proc_ and broke the kpi bindings build once
+sys/file.h was included.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ kern.rust.mk |  4 ++++
+ kmod.rust.mk | 28 ++++++++++++++++++++++++++--
+ 2 files changed, 30 insertions(+), 2 deletions(-)
+
+diff --git a/kern.rust.mk b/kern.rust.mk
+index 01be45a..9b385b8 100644
+--- a/kern.rust.mk
++++ b/kern.rust.mk
+@@ -141,6 +141,7 @@ BINDGEN_FLAGS= \
+ 	--blocklist-function 'fo_chmod' \
+ 	--blocklist-function 'fo_chown' \
+ 	--blocklist-function 'fo_sendfile' \
++	--blocklist-function 'ktr_get_tracevp' \
+ 	--no-debug _device \
+ 	--no-debug mdproc \
+ 	--no-debug nvme_namespace_data \
+@@ -215,6 +216,9 @@ RUST_KPI_SOURCES= \
+ 	${SRCTOP}/sys/rust/kpi/src/panic.rs \
+ 	${SRCTOP}/sys/rust/kpi/src/malloc.rs \
+ 	${SRCTOP}/sys/rust/kpi/src/usercopy.rs \
++	${SRCTOP}/sys/rust/kpi/src/file.rs \
++	${SRCTOP}/sys/rust/kpi/src/event.rs \
++	${SRCTOP}/sys/rust/kpi/src/vmem.rs \
+ 
+ BINDINGS_RS= bindings.rs
+ 
+diff --git a/kmod.rust.mk b/kmod.rust.mk
+index ced5ce8..966e5f6 100644
+--- a/kmod.rust.mk
++++ b/kmod.rust.mk
+@@ -11,11 +11,35 @@ RUST_MAKEFILE=	${SRCTOP}/sys/rust/kmod.rust.mk
+ RUSTFLAGS:=	${RUSTFLAGS:N-Crelocation-model=*} -Crelocation-model=pic
+ .endif
+ 
++# A module's own C declarations, for its Rust code. RUST_BINDGEN_HDR names a header (relative
++# to .CURDIR); bindgen writes ${RUST_BINDGEN_RS} into the objdir and the crate includes it with
++#   include!(concat!(env!("OUT_DIR"), "/modsys.rs"));
++# Only items matching the RUST_BINDGEN_ALLOW regex are generated (not what they refer to): the
++# kernel types they use resolve to kpi::bindings, so a `struct file *` in a module struct is the
++# same Rust type the KPI's file wrappers take. Function-like macros and static inline functions
++# are not translated; give the header plain declarations.
++.if defined(RUST_BINDGEN_HDR) && !empty(RUST_BINDGEN_HDR)
++RUST_BINDGEN_RS?=	modsys.rs
++RUST_BINDGEN_ALLOW?=	.*
++RUST_MOD_DEP=		${RUST_BINDGEN_RS}
++
++${RUST_BINDGEN_RS}: ${.CURDIR}/${RUST_BINDGEN_HDR} ${BINDINGS_RS} ${RUST_MAKEFILE}
++	${BINDGEN} --use-core --rust-edition 2024 --rust-target ${RUSTC_BIN_VERSION} \
++	    --no-layout-tests --no-prepend-enum-name --default-macro-constant-type signed \
++	    --allowlist-item '${RUST_BINDGEN_ALLOW}' --no-recursive-allowlist \
++	    ${RUST_BINDGEN_FLAGS} \
++	    --raw-line 'use kpi::bindings::*;' \
++	    ${.CURDIR}/${RUST_BINDGEN_HDR} -- ${CFLAGS:N-fsanitize=*:N-mllvm:N-asan-*} > ${.TARGET}.tmp
++	mv ${.TARGET}.tmp ${.TARGET}
++
++CLEANFILES+=	${RUST_BINDGEN_RS}
++.endif
++
+ .for _rs in ${RUST_SRCS}
+ RLIBS+=	lib${_rs:R}.rlib
+ 
+-lib${_rs:R}.rlib: ${.CURDIR}/${_rs} ${RUST_DEFAULT_DEP} ${RUST_MAKEFILE}
+-	${NORMAL_R}
++lib${_rs:R}.rlib: ${.CURDIR}/${_rs} ${RUST_DEFAULT_DEP} ${RUST_MAKEFILE} ${RUST_MOD_DEP}
++	OUT_DIR=${.OBJDIR} ${NORMAL_R}
+ .endfor
+ 
+ .include "${SYSDIR}/rust/kern.rustroot.mk"
+-- 
+2.43.0
+

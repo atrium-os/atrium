@@ -57,6 +57,21 @@ upstream.
    KASAN instrumentation (`-Zsanitizer=kernel-address` with FreeBSD's shadow offset) when the
    kernel has `options KASAN`, and `-Zbranch-protection=bti,pac-ret` on arm64 (upstream had
    BTI only, so Rust code lost the PAC return-address protection the C kernel has).
+5. **Cheaper `Vec`**: allocation, fill and `copy_in_vec` without a zero fill first (see §5).
+6. **File objects, kqueue, vmem, sleep, cdevpriv** (for the atrium-gpu-amd front-end,
+   `atrium-gpu-amd/rs/README.md`): `file.rs` puts a `Box<T>` behind a `struct file` (`install`,
+   a type-checked `FileRef<T>` from an fd, default fileops whose `fo_close` frees the box);
+   `event.rs` is `selinfo`/`knlist` on an existing mutex plus knote helpers; `vmem.rs` wraps
+   vmem arenas; `mtx.rs` gains `msleep_sbt` (returning the raw errno, since `ErrCode` cannot hold
+   `ERESTART`) and `sbinuptime`; `cdev.rs` gains `devfs_set_cdevpriv`/`devfs_get_cdevpriv` for a
+   boxed per-open state.
+7. **Per-module bindgen** in `kmod.rust.mk`: a module names a C header (`RUST_BINDGEN_HDR`) and an
+   allowlist (`RUST_BINDGEN_ALLOW`), and the crate `include!`s the result on top of
+   `kpi::bindings`. Also blocklists `ktr_get_tracevp`, whose inline wrapper broke the kpi
+   bindings once `sys/file.h` was included.
+8. **amd64 KASAN shadow offset**: 0004 set the offset for arm64 only, so on amd64 rustc used its
+   user-space default and the first stack poison faulted (found 2026-11-11, the first amd64
+   KASAN run of a Rust module). Now `0xdffff7c000000000`, the offset clang uses for the C kernel.
 
 ## 4. Results (arm64 2026-11-07, amd64 2026-11-10; QEMU TCG on the cloud host)
 
@@ -64,7 +79,7 @@ upstream.
 |-------|-------|-------|
 | builds against ATRIUM-NODEBUG / -KASAN / -SYZKALLER, loads, unloads, reloads | pass | ATRIUM-NODEBUG: pass (needs LLVM 19, see below) |
 | differential test, ATRIUM-NODEBUG | 1,000,000 iterations + FIFO, 0 mismatches | 1,000,000 iterations + FIFO, 0 mismatches (after the GET fix below) |
-| differential test, ATRIUM-KASAN (Rust code instrumented: 48 `__asan` call sites) | 200,000 iterations, 0 mismatches, no KASAN report | not run (the Rust code is the same; arm64 covers it) |
+| differential test, ATRIUM-KASAN (Rust code instrumented: 48 `__asan` call sites) | 200,000 iterations, 0 mismatches, no KASAN report | not run here; the atrium-gpu-amd run (2026-11-11) found that amd64 KASAN needed patch 0008 |
 | syzkaller, ATRIUM-SYZKALLER (KASAN + KCOV), both devices | 1 h, 8,204 programs, 72-program corpus, 2,058 coverage points, **0 crashes**. Slow: TCG plus KASAN plus KCOV runs about 2 programs a second. A run on real timing would cover far more | not run |
 | latency, Rust/C (median of 11 × 200,000 calls, 3 runs, HVF on the Mac) | nop 1.02–1.03×, set64 0.99–1.03×, get64 1.03–1.04×, write+read64 1.03×, parse256 0.85× (see §5) | not measured |
 

@@ -8,9 +8,12 @@
  *   module.c    newbus probe/attach/detach + /dev/atrium-gpu0 cdev + teardown
  *   firmware.c  PSP/MES bring-up: reset, CP firmware load, MES init
  *   gmc.c       Graphics Memory Controller: GPUVM page tables, GMC/IH init
- *   bo.c        DMA-page allocator + buffer-object handle table
+ *   bo.c        DMA-page allocator + BO backing store (System pages, VRAM)
+ *   vm.c        GPUVM: VMIDs, page tables, PTEs
  *   cp.c        Command Processor: queue map + doorbell submit, compute state
- *   ioctl.c     the ATRIUM_GPU_IOC_* switch (the userspace ABI handlers)
+ *   glue.c      cdevsw tables + softc accessors for the Rust front-end
+ *   rs/         the front-end, in Rust (rs/README.md): the ATRIUM_GPU_IOC_*
+ *               switch, and the VM, BO and syncobj fd objects
  */
 #ifndef _ATRIUM_GPU_AMD_H_
 #define _ATRIUM_GPU_AMD_H_
@@ -496,6 +499,9 @@ struct atrium_gpu_backend_ops {
 	/* Install (fn != NULL) or clear the syncobj's one watcher. */
 	void	(*syncobj_watch)(struct atrium_amd_syncobj *so,
 		    void (*fn)(void *), void *arg);
+	/* Has the timeline reached `value`? 1 yes, 0 not yet, -errno if the
+	 * work that would reach it was lost. */
+	int	(*syncobj_ready)(struct atrium_amd_syncobj *so, uint64_t value);
 	/* mmap a device aperture into userspace (amd: the doorbell page of a queue
 	 * this client owns, as a revocable managed-pager object). */
 	int	(*mmap_single)(struct atrium_amd_softc *sc,
@@ -533,12 +539,18 @@ struct atrium_gpu_backend_ops {
  */
 struct atrium_amd_vm {
 	struct atrium_amd_softc *sc;
-	struct file	*fp;		/* our own file (for KASSERT/debug) */
 	uint16_t	 vmid;		/* 1..15 */
 	struct atrium_amd_dma_page pdb;	/* page-directory page */
 	struct atrium_amd_dma_page pt[ATRIUM_AMD_VM_NUM_PT]; /* page-table pages */
-	vmem_t		*va_arena;	/* this VM's GPU-VA window (vmem(9)) */
 };
+/*
+ * Front-end/back-end split (rs/README.md). The struct above is the backend's
+ * part of a VM: the hardware address space. The fd object, its GPU-VA arena
+ * and its lifetime are the Rust front-end's (rs/vm.rs), which embeds this
+ * struct as its first field, so a `struct atrium_amd_vm *` is also a pointer
+ * to the whole object. The same holds for BOs below; syncobjs and clients are
+ * the front-end's alone and opaque to C.
+ */
 
 /*
  * A buffer object: a DMA page mapped into a VM's GPUVM and exposed to userspace
@@ -566,27 +578,12 @@ struct atrium_amd_vm {
 #define ATRIUM_AMD_BO_MAX_PAGES	(64 * 1024)
 #define ATRIUM_AMD_BO_MAX_BIND	8	/* VMs a BO can be shared into at once */
 
-/* One mapping of a BO into a VM: its address space, a held ref on it, and the
- * base GPU-VA the BO occupies there (each VM assigns its own VA). */
-struct atrium_amd_bo_binding {
-	struct atrium_amd_vm *vm;
-	struct file	*vm_fp;		/* held reference keeping that vm alive */
-	uint64_t	 gpu_va;	/* base GPU-VA of the BO in that vm */
-};
-
+/*
+ * The backend's part of a BO: its backing store. The bindings into VMs (and
+ * their lock, kmod audit 2026-11-07 G1) are the front-end's (rs/bo.rs).
+ */
 struct atrium_amd_bo {
 	struct atrium_amd_softc *sc;
-	/*
-	 * bind_lock guards bindings[]/n_bindings. A BO fd can be used by two
-	 * threads (or passed to another process) at once, so two VM_BINDs of
-	 * one BO race: both pass the n_bindings < MAX check and the second
-	 * writes bindings[MAX], past the array (kmod audit 2026-11-07, G1).
-	 * Exclusive in amd_bo_bind (which may sleep in map_page), shared in
-	 * amd_bo_gpu_va; teardown runs at last close with no other user.
-	 */
-	struct sx	 bind_lock;
-	struct atrium_amd_bo_binding bindings[ATRIUM_AMD_BO_MAX_BIND];
-	int		 n_bindings;	/* VMs this BO is currently bound into */
 	void		*kva;		/* CPU mapping (bus_dmamem, page-contiguous) */
 	bus_dma_tag_t	 dmat;		/* per-BO DMA tag */
 	bus_dmamap_t	 dmamap;	/* the BO's DMA mapping */
@@ -607,21 +604,7 @@ struct atrium_amd_bo {
  * separate per-threshold event_fd is deferred; the syncobj fd is the kqueue
  * source for now.) The struct-file refcount is its lifetime.
  */
-struct atrium_amd_syncobj {
-	struct atrium_amd_softc *sc;	/* for scrubbing the pending list on close */
-	struct mtx	 lock;	/* guards value + the knote list */
-	struct selinfo	 sel;	/* sel.si_note = the kqueue knlist */
-	uint64_t	 value;
-	int		 error;	/* sticky: a completion owed here was lost (EIO) */
-	/*
-	 * One in-kernel watcher (the display's in-fence): called under `lock`
-	 * after every signal or failure. It must not sleep or take sc->lock
-	 * (the order is sc->lock, then this lock); the display only enqueues a
-	 * task. Set and cleared under `lock` (amd_syncobj_watch).
-	 */
-	void		(*watch)(void *);
-	void		*watch_arg;
-};
+struct atrium_amd_syncobj;	/* rs/syncobj.rs; opaque here */
 
 /*
  * A completion the ISR owes a syncobj. A submission that signals a syncobj
@@ -713,9 +696,7 @@ struct atrium_amd_reset_hooks {
 #define ATRIUM_AMD_QUEUE_WAIT_MS 2000	/* wait for another VM's work to drain */
 #define ATRIUM_AMD_HANG_MS	5000	/* default watchdog limit (sysctl hang_ms) */
 
-struct atrium_amd_client {
-	struct atrium_amd_softc *sc;
-};
+struct atrium_amd_client;	/* one open of the client node (rs/ioctl.rs) */
 
 /* One doorbell mapping grant: the pager handle of one owner's mapping. */
 struct atrium_amd_db_grant {
@@ -997,17 +978,13 @@ amd_ih_set_handler(struct atrium_amd_softc *sc, int cause,
 		sc->ih_handler[cause] = fn;
 	mtx_unlock(&sc->lock);
 }
-int	 amd_bo_create_fd(struct atrium_amd_softc *sc, struct thread *td,
-	    uint64_t size, uint32_t flags, int *out_fd);
+/* Front-end (Rust, rs/bo.rs). amd_bo_fget holds a file reference the caller
+ * drops with fdrop(). */
 int	 amd_bo_fget(struct thread *td, int fd, struct file **out_fp,
 	    struct atrium_amd_bo **out_bo);
-/* Bind a BO into `vm` at *va (0 = auto), adding a binding (a BO may be bound
- * into several VMs — sharing). On success the binding takes over vm_fp; on error
- * the caller keeps it. */
-int	 amd_bo_bind(struct atrium_amd_bo *bo, struct atrium_amd_vm *vm,
-	    struct file *vm_fp, uint64_t *va, uint32_t bind_flags);
 /* The BO's base GPU-VA in `vm`, or 0 if it is not bound there. */
 uint64_t amd_bo_gpu_va(struct atrium_amd_bo *bo, struct atrium_amd_vm *vm);
+/* Free a BO whose backing the deferred-free reaper has released. */
 void	 amd_bo_free_struct(struct atrium_amd_bo *bo);
 /* amd backend: allocate/free a BO's backing (bus_dma System pages or a VRAM
  * bump); the front-end owns the struct/fd/bindings. */
@@ -1017,14 +994,9 @@ void	 amd_bo_backing_free(struct atrium_amd_bo *bo);
 /* amd backend: export a VRAM BO as a {vram_offset, size} scanout handle. */
 int	 amd_export_scanout(struct atrium_amd_bo *bo, uint64_t *vram_offset,
 	    uint64_t *size);
-/* amd backend: mmap the per-queue doorbell page (the capability grant). */
-extern const struct fileops atrium_amd_bo_fileops;
 
-/* vm.c — per-process GPU address spaces (fd-backed) + GPUVM page tables */
-int	 amd_vm_create_fd(struct atrium_amd_softc *sc, struct thread *td,
-	    int *out_fd);
-int	 amd_vm_fget(struct thread *td, int fd, struct file **out_fp,
-	    struct atrium_amd_vm **out_vm);
+/* vm.c — the backend's GPUVM: VMIDs, page tables, PTEs. The VM fd object is
+ * the front-end's (rs/vm.rs). */
 int	 amd_vm_map(struct atrium_amd_vm *vm, uint64_t va, vm_paddr_t phys,
 	    int vram, int writable);
 void	 amd_vm_unmap(struct atrium_amd_vm *vm, uint64_t va);
@@ -1147,16 +1119,16 @@ int	 amd_powergate(struct atrium_amd_softc *sc, struct atrium_gpu_powergate *p);
  */
 #define ATRIUM_AMD_DOORBELL_MMAP_OFF	0
 
-/* sync.c — timeline syncobj fd (kqueue-able) */
-int	 amd_syncobj_create_fd(struct atrium_amd_softc *sc, struct thread *td,
-	    int *out_fd);
+/* Timeline syncobj fd, kqueue-able (Rust, rs/syncobj.rs). signal and fail
+ * may be called with sc->lock held (the order is sc->lock, then the
+ * syncobj's own lock). */
 int	 amd_syncobj_fget(struct thread *td, int fd, struct file **out_fp,
 	    struct atrium_amd_syncobj **out_so);
 void	 amd_syncobj_signal(struct atrium_amd_syncobj *so, uint64_t value);
 void	 amd_syncobj_fail(struct atrium_amd_syncobj *so, int error);
 void	 amd_syncobj_watch(struct atrium_amd_syncobj *so, void (*fn)(void *),
 	    void *arg);
-extern const struct fileops atrium_amd_syncobj_fileops;
+int	 amd_syncobj_ready(struct atrium_amd_syncobj *so, uint64_t value);
 
 /* ih.c (BASE module) — MSI-X interrupt setup + the device-global IH ring ISR */
 int	 amd_irq_setup(struct atrium_amd_softc *sc);
@@ -1181,7 +1153,7 @@ int	 amd_pending_fail_locked(struct atrium_amd_softc *sc, uint32_t qid,
 void	 amd_pending_scrub(struct atrium_amd_softc *sc,
 	    struct atrium_amd_syncobj *so);
 
-/* ioctl.c — the client and control character-device switches */
+/* glue.c — the client and control cdevsws (entry points in rs/ioctl.rs) */
 extern struct cdevsw atrium_amd_cdevsw;
 extern struct cdevsw atrium_amd_ctl_cdevsw;
 

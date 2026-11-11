@@ -1,11 +1,13 @@
 /*
  * atrium-gpu-amd — from-scratch FreeBSD kernel driver for AMD RDNA4 GPUs.
  *
- * KERNEL side of the Atrium GPU split (kernel = C, userspace = Rust),
- * exercised against the gpusim functional model (vendor 0x1002 / device
- * 0x7550) before real silicon. This file owns newbus probe/attach/detach, the
- * /dev/atrium-gpu0 cdev, and resource teardown; the per-block work lives in
- * firmware.c / gmc.c / bo.c / cp.c / ioctl.c (design §4.2). Milestones (§8):
+ * KERNEL side of the Atrium GPU split, exercised against the gpusim functional
+ * model (vendor 0x1002 / device 0x7550) before real silicon. This file owns
+ * newbus probe/attach/detach, the /dev/atrium-gpu0 cdev, and resource
+ * teardown; the per-block work lives in firmware.c / gmc.c / bo.c / cp.c
+ * (design §4.2). The client-facing front-end (ioctls, VM / BO / syncobj fd
+ * objects) is Rust since 2026-11 (rs/README.md); the milestone notes below
+ * name the C files it replaced. Milestones (§8):
  *
  *   M1  PCI bring-up + BAR map + first register read (GRBM_STATUS), gated
  *       behind COMMAND.MSE/BME.
@@ -153,6 +155,7 @@ static const struct atrium_gpu_backend_ops amd_backend = {
 	.syncobj_signal = amd_syncobj_signal,
 	.syncobj_fail = amd_syncobj_fail,
 	.syncobj_watch = amd_syncobj_watch,
+	.syncobj_ready = amd_syncobj_ready,
 	.mmap_single = amd_hwq_mmap_single,
 	.get_caps = amd_get_caps,
 	.queue_map = amd_hwq_map,

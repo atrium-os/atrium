@@ -5218,6 +5218,15 @@ make.py ... installkernel DESTDIR=$HOME/stage -DNO_ROOT KODIR=/boot/kernel.atriu
   `scripts/tessera-decode-check.sh` (tests, no-panic and frame check),
   `RUST_DECODE=1 scripts/core-host-tests.sh`, `scripts/tessera-decode-diff.sh [-t secs]`
   (C vs Rust); atrium-tessera/docs/rust-decoders.md.
+- atrium-gpu-amd with its Rust front-end: `sh scripts/gpu-kmod-rust.sh prepare` (same KPI
+  patches as the spike's), then `[KERNCONF=ATRIUM-KASAN] sh scripts/gpu-kmod-rust.sh build`
+  gives `atrium-gpu-amd/out/<target>-<kernconf>/*.ko` (amd64 by default; needs `SRC`, `OBJ`).
+  Copy them over the old ones in the kernel's module dir and reboot (the PCI module will not
+  unload). atrium-gpu-amd/rs/README.md. For a KASAN/WITNESS run, `installkernel
+  KERNCONF=ATRIUM-KASAN KODIR=/boot/kernel.kasan` to a stage dir, add the modules, tar it to
+  the guest and set `kernel="kernel.kasan"` in loader.conf.
+- During test_gpu_isolation part F, ssh to the TCG guest can time out for minutes while the
+  VRAM churn runs; the test still finishes. Run it detached (`... > log 2>&1 &`) and poll.
 - syzkaller against the cloud VM: `type: isolated`, target `127.0.0.1:2222`. The guest needs
   `/root/bin/dmesg` (a `dmesg -w` emulation; FreeBSD's has no `-w`), `PATH` with `/root/bin`
   first in `/root/.ssh/environment`, and `PermitUserEnvironment PATH` in sshd_config.

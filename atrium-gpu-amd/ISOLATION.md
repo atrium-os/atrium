@@ -9,11 +9,11 @@ mechanism in this driver, and records how the five breaks from the
 
 | | Mechanism | Code |
 |---|---|---|
-| **I1** per-context VA space | Each VM fd owns a VMID and its own page directory and page tables, programmed only by the kernel (`VM_CTX_PT_BASE`). Userspace never writes a PTE. | `vm.c` |
-| **I2** per-context BO ownership | Handles are fds. A BO is reachable only through an fd the process holds, and only at the VAs the kernel bound it to in a VM. Another VM's VA misses in that VM's page table and faults. | `bo.c`, `vm.c` |
+| **I1** per-context VA space | Each VM fd owns a VMID and its own page directory and page tables, programmed only by the kernel (`VM_CTX_PT_BASE`). Userspace never writes a PTE. | `vm.c`, `rs/vm.rs` |
+| **I2** per-context BO ownership | Handles are fds. A BO is reachable only through an fd the process holds, and only at the VAs the kernel bound it to in a VM. Another VM's VA misses in that VM's page table and faults. | `rs/bo.rs`, `vm.c` |
 | **I3** no DMA outside the context's BOs | Every GPU access goes through the submitting queue's VMID. A queue runs one VMID at a time and is never switched while work is in flight (break 1). Scanout is bounded by the BO it was given (break 4). On silicon the IOMMU is a second line. | `queue.c`, `display/display_dev.c` |
-| **I4** no privileged commands | Clients submit PM4 rings that the CP runs under their VMID; queue programming, VMIDs, page tables and doorbell routing are kernel-only MMIO. Reset, scheduler and power gating are on the root-only control node (break 5). | `cp.c`, `ioctl.c` |
-| **I5** cleanup on teardown | Closing a BO clears its PTEs (with TLB flush) and frees its pages only once no queue that could still use them is busy (break 2). Closing a VM stops every queue under its VMID and points the VMID at an all-invalid page directory before its page tables and VMID are freed. New BOs are zeroed. Closing the device gives back owned queues and revokes their doorbell mappings. | `bo.c`, `vm.c`, `queue.c` |
+| **I4** no privileged commands | Clients submit PM4 rings that the CP runs under their VMID; queue programming, VMIDs, page tables and doorbell routing are kernel-only MMIO. Reset, scheduler and power gating are on the root-only control node (break 5). | `cp.c`, `rs/ioctl.rs` |
+| **I5** cleanup on teardown | Closing a BO clears its PTEs (with TLB flush) and frees its pages only once no queue that could still use them is busy (break 2). Closing a VM stops every queue under its VMID and points the VMID at an all-invalid page directory before its page tables and VMID are freed. New BOs are zeroed. Closing the device gives back owned queues and revokes their doorbell mappings. | `rs/bo.rs`, `rs/vm.rs`, `vm.c`, `queue.c` |
 
 ## The five breaks
 

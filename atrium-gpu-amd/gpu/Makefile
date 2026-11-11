@@ -4,11 +4,22 @@
 # Depends on the base module.
 KMOD=	atrium_gpu_amd
 # The display engine is its own module now (../display/) — see the §4.1 split.
-SRCS=	module.c firmware.c gmc.c bo.c cp.c irq.c sync.c vm.c ioctl.c pgate.c queue.c clear.c
+SRCS=	module.c firmware.c gmc.c bo.c cp.c irq.c vm.c glue.c pgate.c queue.c clear.c
 SRCS+=	device_if.h bus_if.h pci_if.h
 
 .PATH:	${.CURDIR}/..
 CFLAGS+= -I${.CURDIR}/..
+
+# The front-end (client node ioctls, VM/BO/syncobj fd objects) is Rust
+# (../rs/README.md, kernel security review 2026-11-07 D2): amd_frontend.rs is
+# the crate root, compiled by freebsd-kpi-rs's kmod.rust.mk (sys/rust in the
+# source tree; our patches are kmod-rust-spike/kpi-patches;
+# scripts/gpu-kmod-rust.sh sets it up and builds). bindgen turns ../rs/sys.h
+# into the crate's C declarations, only these items; the softc is opaque
+# (declared in ../rs/sys.rs).
+RUST_SRCS=	amd_frontend.rs
+RUST_BINDGEN_HDR= ../rs/sys.h
+RUST_BINDGEN_ALLOW= atrium_amd_(bo|vm|dma_page|syncobj|client)|atrium_gpu_.*|ATRIUM_GPU_.*|ATRIUM_AMD_(BO_MAX_PAGES|BO_MAX_BIND|NHWQ|BO_VA_BASE|VM_MAX_BO|VM_NUM_PT)|atrium_rs_ioc|ATRIUM_RS_IOC_.*|amd_rs_(backend|irqs|syncobj_count|cdev_softc)|amd_pending_scrub|amd_hwq_(busy_snapshot|defer_bo|client_close)
 
 # Build identity for the gpu-isolation attestation gate (gpu-isolation.md,
 # "Attestation freshness"): the last commit that touched the driver tree, with

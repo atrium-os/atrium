@@ -1,0 +1,33 @@
+/*
+ * rs/sys.h — what bindgen turns into the front-end's C declarations (sys.rs).
+ * The allowlist is RUST_BINDGEN_ALLOW in gpu/Makefile; kernel types the
+ * allowlisted items use come from the KPI crate's bindings.
+ */
+#include "atrium_gpu_amd.h"
+#include "atrium_gpu_amd_abi.h"
+#include "rs/glue.h"
+
+/*
+ * The ioctl numbers. _IOWR() and friends are function-like macros, which
+ * bindgen does not expand; enumerators it evaluates. The Rust side checks each
+ * argument struct's size against the number's IOCPARM_LEN as well.
+ */
+enum atrium_rs_ioc : unsigned long {
+	ATRIUM_RS_IOC_BO_ALLOC =	ATRIUM_GPU_IOC_BO_ALLOC,
+	ATRIUM_RS_IOC_BO_WRITE =	ATRIUM_GPU_IOC_BO_WRITE,
+	ATRIUM_RS_IOC_BO_READ =		ATRIUM_GPU_IOC_BO_READ,
+	ATRIUM_RS_IOC_SUBMIT =		ATRIUM_GPU_IOC_SUBMIT,
+	ATRIUM_RS_IOC_GET_IRQS =	ATRIUM_GPU_IOC_GET_IRQS,
+	ATRIUM_RS_IOC_SYNCOBJ_CREATE =	ATRIUM_GPU_IOC_SYNCOBJ_CREATE,
+	ATRIUM_RS_IOC_SYNCOBJ_SIGNAL =	ATRIUM_GPU_IOC_SYNCOBJ_SIGNAL,
+	ATRIUM_RS_IOC_SYNCOBJ_QUERY =	ATRIUM_GPU_IOC_SYNCOBJ_QUERY,
+	ATRIUM_RS_IOC_SYNCOBJ_WAIT =	ATRIUM_GPU_IOC_SYNCOBJ_WAIT,
+	ATRIUM_RS_IOC_VM_CREATE =	ATRIUM_GPU_IOC_VM_CREATE,
+	ATRIUM_RS_IOC_VM_BIND =		ATRIUM_GPU_IOC_VM_BIND,
+	ATRIUM_RS_IOC_VM_BIND2 =	ATRIUM_GPU_IOC_VM_BIND2,
+	ATRIUM_RS_IOC_QUEUE_MAP =	ATRIUM_GPU_IOC_QUEUE_MAP,
+	ATRIUM_RS_IOC_QUERY_CAPS =	ATRIUM_GPU_IOC_QUERY_CAPS,
+	ATRIUM_RS_IOC_GPU_RESET =	ATRIUM_GPU_IOC_GPU_RESET,
+	ATRIUM_RS_IOC_SCHED =		ATRIUM_GPU_IOC_SCHED,
+	ATRIUM_RS_IOC_POWERGATE =	ATRIUM_GPU_IOC_POWERGATE,
+};

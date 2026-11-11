@@ -131,3 +131,4 @@ atrium-tessera/core/fuzz/artifacts/
 # Rust kmod spike build outputs (scripts/rust-kmod-spike.sh build).
 kmod-rust-spike/out/
 atrium-tessera/kmod/out/
+atrium-gpu-amd/out/

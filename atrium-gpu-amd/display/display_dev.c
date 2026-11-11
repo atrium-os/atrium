@@ -880,21 +880,14 @@ display_flip_next(struct display_output *o)
 }
 
 static int
-display_fence_ready(struct atrium_amd_syncobj *so, uint64_t value)
+display_fence_ready(struct atrium_amd_softc *sc, struct atrium_amd_syncobj *so,
+    uint64_t value)
 {
-	int ready;
-
 	if (so == NULL)
 		return (1);
-	mtx_lock(&so->lock);
-	if (so->value >= value)
-		ready = 1;
-	else if (so->error != 0)
-		ready = -so->error;	/* the render will never finish */
-	else
-		ready = 0;
-	mtx_unlock(&so->lock);
-	return (ready);
+	/* 1 reached, 0 not yet, -errno: the render will never finish. A
+	 * syncobj only exists while the gpu module (and its vtable) does. */
+	return (sc->backend->syncobj_ready(so, value));
 }
 
 /*
@@ -915,7 +908,7 @@ display_try_fence(struct display_output *o)
 	mtx_assert(&sc->lock, MA_OWNED);
 	if (o->next_state != 1)
 		return;
-	ready = display_fence_ready(o->in_so, o->in_value);
+	ready = display_fence_ready(sc, o->in_so, o->in_value);
 	if (ready < 0) {
 		if (o->out_so != NULL && sc->backend != NULL)
 			sc->backend->syncobj_fail(o->out_so, -ready);
@@ -1171,7 +1164,7 @@ display_queue_flip(struct display_req *r)
 	 * before the check so a signal in between is not missed. */
 	if (r->in_so != NULL)
 		sc->backend->syncobj_watch(r->in_so, display_fence_kick, o);
-	if (display_fence_ready(r->in_so, c->in_fence_value) > 0) {
+	if (display_fence_ready(sc, r->in_so, c->in_fence_value) > 0) {
 		fault = display_flip_next(o);
 		if (fault != 0) {
 			/* Refused now: report it to the caller, keep its
@@ -1442,7 +1435,8 @@ display_topology(struct atrium_amd_softc *sc, struct display_req *rq,
 			return (EBUSY);
 		}
 		/* A mode set applies at once: its frame must be rendered. */
-		ready = display_fence_ready(rq[i].in_so, rq[i].c->in_fence_value);
+		ready = display_fence_ready(sc, rq[i].in_so,
+		    rq[i].c->in_fence_value);
 		if (ready <= 0) {
 			mtx_unlock(&sc->lock);
 			return (ready < 0 ? -ready : EAGAIN);
