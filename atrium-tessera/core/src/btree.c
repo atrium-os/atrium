@@ -467,6 +467,12 @@ static tessera_btree_t *
 make_handle(const tessera_block_io_t *io, uint8_t tree_kind,
             uint32_t key_size, uint32_t value_size)
 {
+	/* put keeps a split key in a 64-byte buffer (struct put_result,
+	 * put_impl's left_min_key); every tree today uses <= 32. The value
+	 * bound keeps key + value from wrapping the fanout divisor. */
+	if (key_size == 0 || key_size > TESSERA_BTREE_MAX_KEY ||
+	    value_size > BLOCK_SIZE)
+		return NULL;
 	tessera_btree_t *t = tessera_zalloc(sizeof *t);
 	if (t == NULL) return NULL;
 	t->io           = *io;
@@ -652,7 +658,7 @@ tessera_btree_get_traced(tessera_btree_t *t, const void *key, void *out_value,
 struct put_result {
 	uint64_t  new_left;          /* always set */
 	int       split;             /* 0/1 */
-	uint8_t   split_key[64];     /* up to key_size bytes (we cap at 64) */
+	uint8_t   split_key[TESSERA_BTREE_MAX_KEY];  /* make_handle caps key_size */
 	uint64_t  new_right;
 };
 
@@ -765,8 +771,12 @@ out:
 static int
 put_into_internal(tessera_btree_t *t, uint64_t old_sector,
                   const void *key, const void *value,
-                  struct put_result *res)
+                  struct put_result *res, uint32_t depth)
 {
+	/* Entry bytes are not under the header CRC: a child pointer aimed
+	 * back up the tree is a cycle, and unbounded recursion would run the
+	 * kernel stack out. Same bound as get's descent. */
+	if (depth + 1 >= MAX_DEPTH) return TESSERA_ECORRUPT;
 	uint8_t *block = tessera_zalloc(BLOCK_SIZE);
 	uint8_t *cblk = NULL, *left_block = NULL, *right_block = NULL;
 	uint8_t *flat = NULL;
@@ -810,7 +820,8 @@ put_into_internal(tessera_btree_t *t, uint64_t old_sector,
 	if (ch.node_kind == 0)
 		rc = put_into_leaf(t, child_sector, key, value, &child_res);
 	else
-		rc = put_into_internal(t, child_sector, key, value, &child_res);
+		rc = put_into_internal(t, child_sector, key, value, &child_res,
+		    depth + 1);
 	if (rc != TESSERA_OK) goto out;
 
 	memcpy(child_entry + t->key_size, &child_res.new_left, 8);
@@ -930,7 +941,7 @@ tessera_btree_put_impl(tessera_btree_t *t, const void *key, const void *value,
 	if (h.node_kind == 0)
 		rc = put_into_leaf(t, t->root, key, value, &res);
 	else
-		rc = put_into_internal(t, t->root, key, value, &res);
+		rc = put_into_internal(t, t->root, key, value, &res, 0);
 	if (rc != TESSERA_OK) goto out;
 
 	if (!res.split) {
@@ -944,7 +955,7 @@ tessera_btree_put_impl(tessera_btree_t *t, const void *key, const void *value,
 	if (lb == NULL) { rc = TESSERA_ENOMEM; goto out; }
 	rc = load_node(t, res.new_left, lb);
 	if (rc != TESSERA_OK) goto out;
-	uint8_t left_min_key[64];
+	uint8_t left_min_key[TESSERA_BTREE_MAX_KEY];
 	const uint8_t *first = leaf_entries_const(lb);
 	memcpy(left_min_key, first, t->key_size);
 
@@ -1074,8 +1085,9 @@ static int
 batch_recurse(tessera_btree_t *t, uint64_t cur,
               const uint8_t *keys, const uint8_t *vals, uint32_t n,
               struct batch_repl *out,
-              tessera_btree_displaced_cb_t cb, void *cbctx)
+              tessera_btree_displaced_cb_t cb, void *cbctx, uint32_t depth)
 {
+	if (depth >= MAX_DEPTH) return TESSERA_ECORRUPT;    /* cycle */
 	uint8_t *block = tessera_zalloc(BLOCK_SIZE);
 	uint8_t *flat = NULL;
 	int rc;
@@ -1170,7 +1182,7 @@ batch_recurse(tessera_btree_t *t, uint64_t cur,
 		rc = batch_recurse(t, child,
 		    keys + (size_t)j * t->key_size,
 		    vals + (size_t)j * t->value_size, jend - j, &sub,
-		    cb, cbctx);
+		    cb, cbctx, depth + 1);
 		if (rc != TESSERA_OK) { batch_repl_free(&sub); goto out; }
 		if (total + sub.m > flat_cap) {
 			uint32_t nc = flat_cap * 2 + sub.m;
@@ -1257,7 +1269,8 @@ batch_put_impl(tessera_btree_t *t, const void *keys, const void *values,
 {
 	struct batch_repl repl;
 	memset(&repl, 0, sizeof repl);
-	int rc = batch_recurse(t, t->root, keys, values, n, &repl, cb, ctx);
+	int rc = batch_recurse(t, t->root, keys, values, n, &repl, cb, ctx,
+	    0);
 	if (rc != TESSERA_OK) { batch_repl_free(&repl); return rc; }
 
 	/* Add root levels until a single node remains. */
@@ -1295,8 +1308,9 @@ batch_put_impl(tessera_btree_t *t, const void *keys, const void *values,
 
 static int
 delete_recurse(tessera_btree_t *t, uint64_t cur, const void *key,
-               uint64_t *out_new, int *out_dropped)
+               uint64_t *out_new, int *out_dropped, uint32_t depth)
 {
+	if (depth >= MAX_DEPTH) return TESSERA_ECORRUPT;    /* cycle */
 	uint8_t *block = tessera_zalloc(BLOCK_SIZE);
 	int rc;
 	if (block == NULL) { rc = TESSERA_ENOMEM; goto out; }
@@ -1349,7 +1363,8 @@ delete_recurse(tessera_btree_t *t, uint64_t cur, const void *key,
 
 	uint64_t new_child = 0;
 	int dropped = 0;
-	rc = delete_recurse(t, child_sector, key, &new_child, &dropped);
+	rc = delete_recurse(t, child_sector, key, &new_child, &dropped,
+	    depth + 1);
 	if (rc != TESSERA_OK) { tessera_free(parent); goto out; }
 
 	if (dropped) {
@@ -1417,7 +1432,7 @@ tessera_btree_delete_impl(tessera_btree_t *t, const void *key,
 {
 	uint64_t new_root = 0;
 	int dropped = 0;
-	int r = delete_recurse(t, t->root, key, &new_root, &dropped);
+	int r = delete_recurse(t, t->root, key, &new_root, &dropped, 0);
 	if (r != TESSERA_OK) return r;
 	if (dropped) {
 		/* Tree empty — re-create an empty leaf root. */
@@ -1442,7 +1457,13 @@ tessera_btree_delete_impl(tessera_btree_t *t, const void *key,
 		if (r != TESSERA_OK) { tessera_free(block); return r; }
 		tessera_btree_node_header_t h;
 		(void)read_header(block, &h);
+		uint32_t hops = 0;
 		while (h.node_kind == 1 && h.entry_count == 1) {
+			/* a one-child node pointing at itself spins here */
+			if (++hops >= MAX_DEPTH) {
+				tessera_free(block);
+				return TESSERA_ECORRUPT;
+			}
 			uint64_t only_child;
 			memcpy(&only_child,
 			    leaf_entries_const(block) + t->key_size, 8);
@@ -1464,8 +1485,9 @@ tessera_btree_delete_impl(tessera_btree_t *t, const void *key,
 static int
 walk_recursive(tessera_btree_t *t, uint64_t sector,
                tessera_btree_node_visitor_t cb,
-               tessera_btree_node_visitor_t post, void *ctx)
+               tessera_btree_node_visitor_t post, void *ctx, uint32_t depth)
 {
+	if (depth >= MAX_DEPTH) return TESSERA_ECORRUPT;    /* cycle */
 	int rc = cb(ctx, sector);
 	/* Already-seen subtree: report nothing below it, but this is not an
 	 * error and the caller's walk continues with our siblings. */
@@ -1497,7 +1519,7 @@ walk_recursive(tessera_btree_t *t, uint64_t sector,
 	}
 	tessera_free(block);
 	for (uint32_t i = 0; i < n; i++) {
-		rc = walk_recursive(t, children[i], cb, post, ctx);
+		rc = walk_recursive(t, children[i], cb, post, ctx, depth + 1);
 		if (rc != TESSERA_OK) break;
 	}
 	tessera_free(children);
@@ -1523,7 +1545,7 @@ tessera_btree_walk_nodes_ex(tessera_btree_t *t,
 	if (t == NULL || pre == NULL) return TESSERA_EINVAL;
 	uint64_t tok = 0;
 	int act = rd_enter(t, &tok);
-	int rc = walk_recursive(t, t->root, pre, post, ctx);
+	int rc = walk_recursive(t, t->root, pre, post, ctx, 0);
 	rd_exit(t, act, tok);
 	return rc;
 }

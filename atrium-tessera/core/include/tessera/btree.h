@@ -55,6 +55,9 @@ typedef struct {
 
 typedef struct tessera_btree tessera_btree_t;
 
+/* Widest key open/create accept (1..64 bytes). */
+#define TESSERA_BTREE_MAX_KEY 64u
+
 /* Open an existing B+tree. `tree_kind` matches tessera_btree_node_header. */
 tessera_btree_t *tessera_btree_open(const tessera_block_io_t *io,
                                     uint64_t root_sector,

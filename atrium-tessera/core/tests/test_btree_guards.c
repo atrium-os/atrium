@@ -274,6 +274,93 @@ test_healthy_tree_unaffected(void)
 	CHECK(found == 200);
 }
 
+/* ── cycles and handle geometry ──────────────────────────────────── */
+
+/*
+ * Entry bytes are not covered by the header CRC, so pointing an internal
+ * node's child at itself is a one-word edit to the image. get() already
+ * stopped at MAX_DEPTH; put, delete, the sorted batch and the node walk
+ * recursed with no bound and ran the stack out (a kernel panic in the
+ * kmod). Each must now return ECORRUPT. The walk's visitor never prunes,
+ * so the bound alone has to stop it.
+ */
+static int walk_count;
+static int walk_visit(void *ctx, uint64_t s) { (void)ctx; (void)s; walk_count++; return 0; }
+
+static uint64_t
+build_cyclic(void)
+{
+	io_init();
+	uint64_t root = build_tree(TESSERA_BTREE_KIND_INODE, 400);
+	uint8_t blk[BLOCK_SIZE];
+	tessera_btree_node_header_t h;
+	if (mem_read(disk, root, blk) != 0 ||
+	    tessera_decode_btree_node_header(blk, &h) != TESSERA_OK ||
+	    h.node_kind != 1) {
+		fprintf(stderr, "FAIL: 400 keys did not give an internal root\n");
+		failures++;
+		return root;
+	}
+	/* every child of the root -> the root */
+	for (uint32_t i = 0; i < h.entry_count; i++)
+		memcpy(blk + HEADER_SIZE + (size_t)i * (KEY_SIZE + 8u) + KEY_SIZE,
+		    &root, 8);
+	mem_write(disk, root, blk);
+	return root;
+}
+
+static void
+test_cycle_bounded(void)
+{
+	uint8_t key[KEY_SIZE] = { 0, 0, 0, 7 }, val[VAL_SIZE] = { 0 };
+	uint64_t nr;
+
+	uint64_t root = build_cyclic();
+	CHECK(get_key1(root, TESSERA_BTREE_KIND_INODE) == TESSERA_ECORRUPT);
+
+	tessera_btree_t *t = tessera_btree_open(&io, root,
+	    TESSERA_BTREE_KIND_INODE, KEY_SIZE, VAL_SIZE);
+	CHECK(tessera_btree_put(t, key, val, &nr) == TESSERA_ECORRUPT);
+	tessera_btree_close(t);
+
+	root = build_cyclic();
+	t = tessera_btree_open(&io, root, TESSERA_BTREE_KIND_INODE,
+	    KEY_SIZE, VAL_SIZE);
+	CHECK(tessera_btree_delete(t, key, &nr) == TESSERA_ECORRUPT);
+	tessera_btree_close(t);
+
+	root = build_cyclic();
+	t = tessera_btree_open(&io, root, TESSERA_BTREE_KIND_INODE,
+	    KEY_SIZE, VAL_SIZE);
+	CHECK(tessera_btree_put_sorted_batch(t, key, val, 1, &nr) ==
+	    TESSERA_ECORRUPT);
+	tessera_btree_close(t);
+
+	root = build_cyclic();
+	t = tessera_btree_open(&io, root, TESSERA_BTREE_KIND_INODE,
+	    KEY_SIZE, VAL_SIZE);
+	walk_count = 0;
+	CHECK(tessera_btree_walk_nodes(t, walk_visit, NULL) ==
+	    TESSERA_ECORRUPT);
+	CHECK(walk_count > 0 && walk_count < 100000);
+	tessera_btree_close(t);
+}
+
+static void
+test_handle_geometry(void)
+{
+	/* put's split key and the root split's left-min key are 64-byte
+	 * buffers, so a wider key must be refused at open, not overflow
+	 * them on the first split. key + value overflowing 32 bits once
+	 * wrapped the fanout divisor to zero. */
+	io_init();
+	CHECK(tessera_btree_open(&io, 1, 0, 64, 8) != NULL);
+	CHECK(tessera_btree_open(&io, 1, 0, 65, 8) == NULL);
+	CHECK(tessera_btree_open(&io, 1, 0, 0, 8) == NULL);
+	CHECK(tessera_btree_open(&io, 1, 0, 1, 0xffffffffu) == NULL);
+	CHECK(tessera_btree_open(&io, 1, 0, 8, 0xfffffff8u) == NULL);
+}
+
 int
 main(void)
 {
@@ -282,6 +369,8 @@ main(void)
 	test_geometry();
 	test_tree_kind();
 	test_healthy_tree_unaffected();
+	test_cycle_bounded();
+	test_handle_geometry();
 
 	if (failures != 0) {
 		fprintf(stderr, "%d failure(s)\n", failures);
