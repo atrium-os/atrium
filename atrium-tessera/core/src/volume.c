@@ -711,6 +711,8 @@ tessera_volume_open(const tessera_block_io_t *io, tessera_volume_t **out)
 	if ((active->hash_alg != TESSERA_HASH_ALG_SHA256) !=
 	    ((active->incompat_flags & TESSERA_INCOMPAT_HASH_ALG) != 0))
 		return TESSERA_ECORRUPT;
+	if (tessera_superblock_layout(active, 0, NULL, NULL) != TESSERA_OK)
+		return TESSERA_ECORRUPT;
 
 	tessera_volume_t *v = tessera_zalloc(sizeof *v);
 	if (v == NULL) return TESSERA_ENOMEM;

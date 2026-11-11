@@ -100,6 +100,14 @@ check_layout(void)
 		sizeof(tessera_quota_domain_t),
 		sizeof(tessera_registry_entry_t),
 		sizeof(tessera_free_extent_t),
+		offsetof(tessera_superblock_t, total_sectors),
+		offsetof(tessera_superblock_t, journal_start),
+		offsetof(tessera_superblock_t, journal_length),
+		offsetof(tessera_superblock_t, pack_zone_start),
+		offsetof(tessera_superblock_t, pack_zone_length),
+		offsetof(tessera_superblock_t, meta_reserve_start),
+		offsetof(tessera_superblock_t, meta_reserve_length),
+		offsetof(tessera_superblock_t, meta_reserve_bump),
 	};
 	const size_t n = sizeof want / sizeof want[0];
 	for (size_t i = 0; i < n; i++) {

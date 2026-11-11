@@ -3925,6 +3925,9 @@ struct tessera_mount {
 	tessera_btree_t          *dead_extent_tree;
 	tessera_btree_t          *snapshots_tree;     /* v2: time-machine */
 	tessera_extent_alloc_t   *extent_alloc;
+	/* The pack zone from tessera_superblock_layout: the only sectors the
+	 * extent allocator may hold or hand out. */
+	uint64_t                  zone_lo, zone_hi;
 	tessera_journal_t        *journal;
 	/*
 	 * Metadata-reserve recycler (Round 7-step2). The bump pointer
@@ -7443,6 +7446,30 @@ tessera_mountfs(struct vnode *devvp, struct mount *mp, uint64_t requested_gen,
 		goto fail_close;
 	}
 
+	/* The CRC proves the superblock is the one written, not that its
+	 * regions are sane. Journal, metadata reserve and pack zone must not
+	 * overlap each other or the superblocks and must fit the device:
+	 * otherwise the free-extent allocator can hand out the journal or a
+	 * superblock and the next pack write overwrites it. */
+	uint64_t zone_lo = 0, zone_hi = 0;
+	if (tessera_superblock_layout(active,
+	    (uint64_t)cp->provider->mediasize / TESSERA_SECTOR_SIZE,
+	    &zone_lo, &zone_hi) != TESSERA_OK) {
+		printf("tessera_fs: superblock regions overlap or exceed the "
+		    "device (total %ju, device %ju, journal %ju+%ju, reserve "
+		    "%ju+%ju, pack zone %ju+%ju); refusing\n",
+		    (uintmax_t)active->total_sectors,
+		    (uintmax_t)(cp->provider->mediasize / TESSERA_SECTOR_SIZE),
+		    (uintmax_t)active->journal_start,
+		    (uintmax_t)active->journal_length,
+		    (uintmax_t)active->meta_reserve_start,
+		    (uintmax_t)active->meta_reserve_length,
+		    (uintmax_t)active->pack_zone_start,
+		    (uintmax_t)active->pack_zone_length);
+		err = EINVAL;
+		goto fail_close;
+	}
+
 	/* Self-heal: if either SB failed to decode, or both decoded but
 	 * generations differ, rewrite the stale/corrupt copy from the
 	 * active one. The dual-SB scheme only earns its keep if we keep
@@ -7485,6 +7512,8 @@ tessera_mountfs(struct vnode *devvp, struct mount *mp, uint64_t requested_gen,
 	tmp_->cp    = cp;
 	tmp_->dev   = dev;
 	tmp_->sb    = *active;
+	tmp_->zone_lo = zone_lo;
+	tmp_->zone_hi = zone_hi;
 	tmp_->ronly = ronly;
 	/* Device write access mirrors gvfs_writers: a from-scratch ro mount
 	 * (or forensic tessera.gen) opened the consumer read-only. */
@@ -8007,12 +8036,14 @@ tessera_mountfs(struct vnode *devvp, struct mount *mp, uint64_t requested_gen,
 	/* Open the free-extent allocator off the on-disk tree. Powers
 	 * future kbio_alloc / _free calls (round 6+ mutation paths).
 	 * For round 6a it's loaded but unused. */
-	tmp_->extent_alloc = tessera_extent_open(&tmp_->bio,
-	    tmp_->sb.free_extent_root);
+	tmp_->extent_alloc = tessera_extent_open_bounded(&tmp_->bio,
+	    tmp_->sb.free_extent_root, tmp_->zone_lo, tmp_->zone_hi);
 	if (tmp_->extent_alloc == NULL)
 		printf("tessera_fs: warning — free-extent open at sector %lu "
-		    "failed; mutation paths will fail to allocate\n",
-		    (unsigned long)tmp_->sb.free_extent_root);
+		    "failed (unreadable, or an extent outside the pack zone "
+		    "%ju..%ju); mutation paths will fail to allocate\n",
+		    (unsigned long)tmp_->sb.free_extent_root,
+		    (uintmax_t)tmp_->zone_lo, (uintmax_t)tmp_->zone_hi);
 	else
 		printf("tessera_fs: extent allocator loaded — %lu free sectors, "
 		    "largest run %lu\n",

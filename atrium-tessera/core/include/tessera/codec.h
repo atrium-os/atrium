@@ -22,6 +22,16 @@ int tessera_encode_superblock(const tessera_superblock_t *in,
 int tessera_decode_superblock(const uint8_t in[TESSERA_SECTOR_SIZE],
                               tessera_superblock_t *out);
 
+/* Check a decoded superblock's regions, in mkfs order: superblocks at 0 and
+ * 1, then the journal, the metadata reserve (bump inside it) and the pack
+ * zone, all inside total_sectors, itself inside the device (device_sectors,
+ * 0 if unknown). ECORRUPT on any overlap, wrap or overrun; on success the
+ * pack zone [*out_lo, *out_hi), the only range the free-extent allocator may
+ * use. tessera_volume_open runs it with device_sectors 0. */
+int tessera_superblock_layout(const tessera_superblock_t *sb,
+                              uint64_t device_sectors,
+                              uint64_t *out_lo, uint64_t *out_hi);
+
 /* Journal header. */
 int tessera_encode_journal_header(const tessera_journal_header_t *in,
                                   uint8_t out[TESSERA_SECTOR_SIZE]);

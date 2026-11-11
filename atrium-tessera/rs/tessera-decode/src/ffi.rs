@@ -110,6 +110,26 @@ pub extern "C" fn tessera_rs_layout(i: usize) -> usize {
     codec::LAYOUT.get(i).copied().unwrap_or(usize::MAX)
 }
 
+/// `codec::superblock_layout` over a decoded superblock (4096 bytes; the
+/// struct is the on-disk bytes). On success the pack zone goes to
+/// `*out_lo` / `*out_hi`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn tessera_rs_superblock_layout(
+    sb: *const u8, device_sectors: u64, out_lo: *mut u64, out_hi: *mut u64,
+) -> c_int {
+    let Some(b) = (unsafe { arr::<SECTOR>(sb) }) else { return EINVAL };
+    match codec::superblock_layout(b, device_sectors) {
+        Ok((lo, hi)) => {
+            unsafe {
+                put(out_lo, lo);
+                put(out_hi, hi);
+            }
+            OK
+        }
+        Err(e) => e,
+    }
+}
+
 // ---- manifest.h -----------------------------------------------------------
 
 /// The parser object C keeps: the decoded header and the body slice.

@@ -50,6 +50,8 @@ struct tessera_extent_alloc {
 	 * tessera_extent_flush_via. Every mutator sets `dirty`. */
 	uint64_t            root;
 	int                 dirty;
+	/* Every free extent lies in [lo, hi) (0, UINT64_MAX unbounded). */
+	uint64_t            lo, hi;
 };
 
 static int
@@ -85,8 +87,19 @@ lower_bound(const tessera_extent_alloc_t *a, uint64_t s)
 tessera_extent_alloc_t *
 tessera_extent_open(const tessera_block_io_t *io, uint64_t free_root_sector)
 {
+	return tessera_extent_open_bounded(io, free_root_sector, 0, UINT64_MAX);
+}
+
+tessera_extent_alloc_t *
+tessera_extent_open_bounded(const tessera_block_io_t *io,
+                            uint64_t free_root_sector, uint64_t lo,
+                            uint64_t hi)
+{
+	if (lo >= hi) return NULL;
 	tessera_extent_alloc_t *a = tessera_zalloc(sizeof *a);
 	if (a == NULL) return NULL;
+	a->lo = lo;
+	a->hi = hi;
 	if (io != NULL) {
 		a->io = *io;
 		a->has_io = 1;
@@ -448,6 +461,10 @@ tessera_extent_free(tessera_extent_alloc_t *a, uint64_t start,
 	if (a != NULL) a->dirty = 1;   /* see tessera_extent_flush_via */
 	if (a == NULL) return TESSERA_EINVAL;
 	if (n_sectors == 0) return TESSERA_EINVAL;
+	/* start and n often come from disk (the free tree, pack registry
+	 * entries): a wrapping end would slip past the overlap checks. */
+	if (start > UINT64_MAX - n_sectors) return TESSERA_EINVAL;
+	if (start < a->lo || start + n_sectors > a->hi) return TESSERA_EINVAL;
 
 	const uint64_t end = start + n_sectors;       /* exclusive */
 	const size_t idx = lower_bound(a, start);     /* first extent >= start */

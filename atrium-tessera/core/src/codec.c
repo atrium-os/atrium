@@ -96,6 +96,50 @@ tessera_decode_superblock(const uint8_t in[TESSERA_SECTOR_SIZE],
 #endif
 }
 
+/* ── superblock layout ───────────────────────────────────────────── */
+
+int
+tessera_superblock_layout(const tessera_superblock_t *sb,
+                          uint64_t device_sectors,
+                          uint64_t *out_lo, uint64_t *out_hi)
+{
+	if (sb == NULL) return TESSERA_EINVAL;
+#ifdef TESSERA_RUST_DECODE
+	return tessera_rs_superblock_layout(sb, device_sectors, out_lo, out_hi);
+#else
+	const uint64_t total = sb->total_sectors;
+	if (device_sectors != 0 && total > device_sectors)
+		return TESSERA_ECORRUPT;
+	const uint64_t js = sb->journal_start, jl = sb->journal_length;
+	if (js < 2 || jl < 2 || js > UINT64_MAX - jl || js + jl > total)
+		return TESSERA_ECORRUPT;
+	uint64_t floor = js + jl;
+	const uint64_t ms = sb->meta_reserve_start;
+	const uint64_t ml = sb->meta_reserve_length;
+	if (ml != 0) {
+		if (ms > UINT64_MAX - ml) return TESSERA_ECORRUPT;
+		const uint64_t me = ms + ml;
+		if (ms < floor || me > total ||
+		    sb->meta_reserve_bump < ms || sb->meta_reserve_bump > me)
+			return TESSERA_ECORRUPT;
+		floor = me;
+	}
+	uint64_t lo, hi;
+	const uint64_t ps = sb->pack_zone_start, pl = sb->pack_zone_length;
+	if (pl == 0) {
+		if (floor >= total) return TESSERA_ECORRUPT;
+		lo = floor; hi = total;
+	} else {
+		if (ps > UINT64_MAX - pl) return TESSERA_ECORRUPT;
+		if (ps < floor || ps + pl > total) return TESSERA_ECORRUPT;
+		lo = ps; hi = ps + pl;
+	}
+	if (out_lo) *out_lo = lo;
+	if (out_hi) *out_hi = hi;
+	return TESSERA_OK;
+#endif
+}
+
 /* ── journal header ──────────────────────────────────────────────── */
 
 int

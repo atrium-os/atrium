@@ -737,6 +737,26 @@ run_superblock(const uint8_t *data, size_t len, diff_trace_t *t)
 	memcpy(img, data + 1, (size_t)sectors * SECT);
 	if (ctl & 1) stamp(img, TESSERA_MAGIC_SUPERBLOCK, 8, offsetof(tessera_superblock_t, crc32));
 	if (ctl & 2) stamp(img + SECT, TESSERA_MAGIC_SUPERBLOCK, 8, offsetof(tessera_superblock_t, crc32));
+	/* Region checks on each copy, against a device size from the input:
+	 * the fuzzer controls every field, the CRC is stamped above. Bit 2
+	 * of ctl folds the fields into a small range, where the boundary
+	 * comparisons (not the overflow guards) decide. */
+	for (uint64_t c = 0; c < 2 && c < sectors; c++) {
+		tessera_superblock_t sb;
+		if (tessera_decode_superblock(img + c * SECT, &sb) != TESSERA_OK)
+			continue;
+		if (ctl & 4) {
+			sb.total_sectors       %= 4096; sb.journal_start  %= 64;
+			sb.journal_length      %= 4096; sb.pack_zone_start %= 4096;
+			sb.pack_zone_length    %= 4096; sb.meta_reserve_start %= 4096;
+			sb.meta_reserve_length %= 4096; sb.meta_reserve_bump %= 4096;
+		}
+		uint64_t dev = (ctl & 8) ? sb.total_sectors - (ctl >> 7) : 0;
+		uint64_t lo = 0, hi = 0;
+		diff_put(t, (uint64_t)(int64_t)tessera_superblock_layout(&sb, dev,
+		    &lo, &hi));
+		diff_put(t, lo); diff_put(t, hi);
+	}
 	struct img m = { img, sectors };
 	tessera_block_io_t io = { img_read, img_write, img_alloc, img_free, &m };
 	tessera_volume_t *v = NULL;

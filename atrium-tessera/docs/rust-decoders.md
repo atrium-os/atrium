@@ -13,7 +13,7 @@ and for the loader.
 
 | module | replaces (C) | what it checks |
 |--------|--------------|----------------|
-| `codec` | `codec.c` `tessera_decode_*` (14 decoders) | superblock, journal header, record header, pack header and footer, blob descriptor, manifest header, B-tree node header, pack extent list (magic, CRC, count 1..253, no zero-length extent, lengths sum to the total) |
+| `codec` | `codec.c` `tessera_decode_*` (14 decoders); `tessera_superblock_layout` (phase 2) | superblock, journal header, record header, pack header and footer, blob descriptor, manifest header, B-tree node header, pack extent list (magic, CRC, count 1..253, no zero-length extent, lengths sum to the total) |
 | `crc` | `crc.c` (for the decoders) | CRC-32, slice-by-8, const table |
 | `manifest` | `manifest.c` parser half | header, body bounds, chunk/tree/bucket/xattr/dirent/dir-btree accessors, and a whole-node check for directory B-tree nodes (`dir_btree_node`) |
 | `pack` | `pack.c` reader; the kmod's two pack readers (phase 2) | pack geometry (the #124 checks plus the footer, or from the header sector alone), bloom probe, binary search of the index, descriptor bounds |
@@ -124,6 +124,7 @@ boundaries and single-value holes are what sweeps catch and random inputs do not
 | `kmod/tessera_fs.c` dir-btree insert and remove | recursion depth came from the image | fixed: bounded at 32 levels, as the walk |
 | `btree.c` put, delete, sorted batch, node walk | recursion depth came from the image: entry bytes are outside the header CRC, so a child pointer aimed back at the root is a one-word edit, and each of the four recursed until the stack ran out (segfault in the host test, a panic in the kmod); `get` alone stopped at 16 levels. Delete's root collapse could also spin on a one-child node pointing at itself | fixed (c3c5d45): all bounded at 16 levels, `ECORRUPT`; `test_cycle_bounded` |
 | `btree.c` `make_handle` | no cap on `key_size`, but put keeps the split key in 64-byte buffers; `key_size + value_size` could wrap to 0 and divide by zero | fixed (c3c5d45): key 1..64 bytes, value up to 4096; every tree uses 32 or less. Not reachable from disk (sizes are constants in callers) |
+| superblock regions (`volume.c`, kmod mount) | nothing checked them: the CRC proves the superblock is the one written, not that it is sane. A pack zone over the journal or a superblock, or past the device, became free space, and the next pack write overwrote it. The free-extent allocator also took any free extent from disk (the free tree, and pack-registry and dead-extent entries GC frees), and a wrapping `start + length` slipped past its overlap checks | fixed: `tessera_superblock_layout` (Rust, C reference) requires superblocks, journal, metadata reserve (bump inside it) and pack zone in order, inside `total_sectors` and the device; `tessera_volume_open` and the kmod mount refuse a volume that fails it. The kmod opens the allocator bounded to the pack zone (`tessera_extent_open_bounded`), so an outside extent fails the load and a later free outside it is refused; wrap refused everywhere. `test_layout_checked`, `test_bounds`; on the VM a tampered superblock (pack zone over the journal, valid CRC) is refused at mount |
 | `journal.c` | `sectors_for` in 32 bits wraps for a huge `body_length`; `journal_open` did not check `head_block`/`tail_block`; a huge body length could make the kernel `malloc(M_WAITOK)` up to 4 GB | fixed: open rejects head or tail outside 1..length-1; record bodies capped at 1 MiB on append and replay (C and Rust), which also keeps the 32-bit sector count from wrapping; `test_bad_head_tail_and_body_cap` |
 
 ## Phase 2: the kernel module's pack readers (2026-11-11)
@@ -198,6 +199,14 @@ to each parent on the way back up, so put costs a fixed ~0.6 KiB (NODEBUG) or ~1
 at any depth. Allocation, write and free order are the recursive version's: an old-vs-new
 build gave identical traces (every return code, root and image CRC) on all 921 inputs of the
 `btree` and `btree_ops` targets.
+
+## Phase 2: superblock regions and free-space bounds (2026-11-11)
+
+See the table above. The layout check also runs in the differential harness (`superblock`
+target, on each copy, raw and folded into a small range, against a device size from the input);
+replay and 4 minutes of fuzzing agree. Fuzzing did not catch a planted one-sector boundary bug
+in the C reference (reserve allowed to start one sector inside the journal), so
+`test_layout_checked` checks every boundary exactly, both ways; it catches it in either build.
 
 ## Not moved yet (phase 2)
 

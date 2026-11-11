@@ -134,6 +134,10 @@ int tessera_rs_btree_leaf_merge(const uint8_t *block, size_t block_len,
     const void *vals, uint32_t n, uint8_t *out, size_t out_len,
     tessera_rs_displaced_cb_t cb, void *cbctx, uint32_t *out_total);
 
+/* volume.c: superblock region checks; the pack zone on success. */
+int tessera_rs_superblock_layout(const void *sb, uint64_t device_sectors,
+    uint64_t *out_lo, uint64_t *out_hi);
+
 /* journal.c: read_record's header and geometry checks, and the ring step. */
 int tessera_rs_journal_record_check(const uint8_t *blk, uint64_t cap,
     void *out_hdr);

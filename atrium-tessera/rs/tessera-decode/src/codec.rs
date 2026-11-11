@@ -36,6 +36,14 @@ pub const PEL_MAX_EXTENTS: u32 = 253;
 /// Byte offsets of the fields the decoders read (format.h).
 pub mod off {
     pub const SB_CRC32: usize = 4060;
+    pub const SB_TOTAL_SECTORS: usize = 48;
+    pub const SB_JOURNAL_START: usize = 64;
+    pub const SB_JOURNAL_LENGTH: usize = 72;
+    pub const SB_PACK_ZONE_START: usize = 128;
+    pub const SB_PACK_ZONE_LENGTH: usize = 136;
+    pub const SB_META_RESERVE_START: usize = 184;
+    pub const SB_META_RESERVE_LENGTH: usize = 192;
+    pub const SB_META_RESERVE_BUMP: usize = 200;
     pub const JH_CRC32: usize = 48;
     pub const JH_HEAD_BLOCK: usize = 32;
     pub const JH_TAIL_BLOCK: usize = 40;
@@ -163,7 +171,118 @@ pub const LAYOUT: &[usize] = &[
     RECORD_HEADER_SIZE, BTREE_NODE_HEADER_SIZE, MANIFEST_HEADER_SIZE,
     BLOB_DESCRIPTOR_SIZE, PACK_INDEX_ENTRY_SIZE, INODE_RECORD_SIZE,
     QUOTA_DOMAIN_SIZE, REGISTRY_ENTRY_SIZE, EXTENT_ENTRY_SIZE,
+    off::SB_TOTAL_SECTORS, off::SB_JOURNAL_START, off::SB_JOURNAL_LENGTH,
+    off::SB_PACK_ZONE_START, off::SB_PACK_ZONE_LENGTH, off::SB_META_RESERVE_START,
+    off::SB_META_RESERVE_LENGTH, off::SB_META_RESERVE_BUMP,
 ];
+
+/// A superblock's regions, in mkfs order: the two superblock copies (sectors 0
+/// and 1), the journal, the metadata reserve, the pack zone, all inside
+/// `total_sectors`, which is inside the device (`device_sectors`, 0 if not
+/// known). Returns the pack zone `[start, end)`: the only sectors the
+/// free-extent allocator may hand out. The CRC proves the superblock is the
+/// one written, not that it is sane; without this a free list or pack entry
+/// over the journal or a superblock is allocated and overwritten.
+///
+/// A volume with no metadata reserve (length 0) or no recorded pack zone
+/// (length 0) is accepted; the zone is then everything after the journal and
+/// reserve.
+pub fn superblock_layout(sb: &[u8; SECTOR], device_sectors: u64) -> Result<(u64, u64)> {
+    let f = |o| u64_at(sb, o).ok_or(ECORRUPT);
+    let end = |a: u64, n: u64| a.checked_add(n).ok_or(ECORRUPT);
+    let total = f(off::SB_TOTAL_SECTORS)?;
+    if device_sectors != 0 && total > device_sectors {
+        return Err(ECORRUPT);
+    }
+    let (js, jl) = (f(off::SB_JOURNAL_START)?, f(off::SB_JOURNAL_LENGTH)?);
+    let je = end(js, jl)?;
+    if js < 2 || jl < 2 || je > total {
+        return Err(ECORRUPT);
+    }
+    let (ms, ml) = (f(off::SB_META_RESERVE_START)?, f(off::SB_META_RESERVE_LENGTH)?);
+    let mut floor = je;
+    if ml != 0 {
+        let me = end(ms, ml)?;
+        let bump = f(off::SB_META_RESERVE_BUMP)?;
+        if ms < je || me > total || bump < ms || bump > me {
+            return Err(ECORRUPT);
+        }
+        floor = me;
+    }
+    let (ps, pl) = (f(off::SB_PACK_ZONE_START)?, f(off::SB_PACK_ZONE_LENGTH)?);
+    if pl == 0 {
+        return if floor < total { Ok((floor, total)) } else { Err(ECORRUPT) };
+    }
+    let pe = end(ps, pl)?;
+    if ps < floor || pe > total {
+        return Err(ECORRUPT);
+    }
+    Ok((ps, pe))
+}
+
+#[cfg(test)]
+mod layout_tests {
+    use super::*;
+
+    /// mkfs's layout for a 100 000-sector volume: journal 4..1028, reserve
+    /// 1028..9220, pack zone 9220..100000.
+    fn sb() -> [u8; SECTOR] {
+        let mut b = [0u8; SECTOR];
+        for (o, v) in [
+            (off::SB_TOTAL_SECTORS, 100_000u64),
+            (off::SB_JOURNAL_START, 4),
+            (off::SB_JOURNAL_LENGTH, 1024),
+            (off::SB_META_RESERVE_START, 1028),
+            (off::SB_META_RESERVE_LENGTH, 8192),
+            (off::SB_META_RESERVE_BUMP, 1100),
+            (off::SB_PACK_ZONE_START, 9220),
+            (off::SB_PACK_ZONE_LENGTH, 90_780),
+        ] {
+            b[o..o + 8].copy_from_slice(&v.to_le_bytes());
+        }
+        b
+    }
+    fn with(o: usize, v: u64) -> [u8; SECTOR] {
+        let mut b = sb();
+        b[o..o + 8].copy_from_slice(&v.to_le_bytes());
+        b
+    }
+
+    #[test]
+    fn good_and_boundaries() {
+        assert_eq!(superblock_layout(&sb(), 0), Ok((9220, 100_000)));
+        assert_eq!(superblock_layout(&sb(), 100_000), Ok((9220, 100_000)));
+        assert_eq!(superblock_layout(&sb(), 99_999), Err(ECORRUPT));
+        // bump at both ends of the reserve
+        assert!(superblock_layout(&with(off::SB_META_RESERVE_BUMP, 1028), 0).is_ok());
+        assert!(superblock_layout(&with(off::SB_META_RESERVE_BUMP, 9220), 0).is_ok());
+        assert_eq!(superblock_layout(&with(off::SB_META_RESERVE_BUMP, 9221), 0), Err(ECORRUPT));
+        assert_eq!(superblock_layout(&with(off::SB_META_RESERVE_BUMP, 1027), 0), Err(ECORRUPT));
+        // no reserve, no recorded zone
+        let mut b = with(off::SB_META_RESERVE_LENGTH, 0);
+        b[off::SB_PACK_ZONE_LENGTH..off::SB_PACK_ZONE_LENGTH + 8].fill(0);
+        assert_eq!(superblock_layout(&b, 0), Ok((1028, 100_000)));
+    }
+
+    #[test]
+    fn overlaps_and_wraps() {
+        for (o, v) in [
+            (off::SB_JOURNAL_START, 1),             // over SB-B
+            (off::SB_JOURNAL_LENGTH, 1),
+            (off::SB_JOURNAL_LENGTH, u64::MAX),     // wraps
+            (off::SB_META_RESERVE_START, 1027),     // into the journal
+            (off::SB_META_RESERVE_LENGTH, u64::MAX - 1000),
+            (off::SB_PACK_ZONE_START, 9219),        // into the reserve
+            (off::SB_PACK_ZONE_START, 0),           // over the superblocks
+            (off::SB_PACK_ZONE_LENGTH, 90_781),     // past the end
+            (off::SB_PACK_ZONE_LENGTH, u64::MAX),
+            (off::SB_TOTAL_SECTORS, 99_999),
+            (off::SB_TOTAL_SECTORS, 0),
+        ] {
+            assert_eq!(superblock_layout(&with(o, v), 0), Err(ECORRUPT), "off {o} = {v}");
+        }
+    }
+}
 
 #[cfg(test)]
 mod tests {

@@ -20,6 +20,7 @@
 #include "tessera/extent.h"
 #include "tessera/format.h"
 
+#include <stddef.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -279,6 +280,89 @@ test_inode_and_pack_roots_reachable(void)
 	free(d);
 }
 
+/*
+ * The superblock's CRC proves it is the one written, not that its regions
+ * make sense. A pack zone over the journal (or superblocks, or past the end)
+ * hands those sectors to the free-extent allocator, and the next pack write
+ * overwrites them. Each mutation is re-encoded so the CRC is valid.
+ */
+static void
+test_layout_checked(void)
+{
+	struct mem_disk *d = calloc(1, sizeof *d);
+	d->next_sector = 1;
+	tessera_block_io_t io = mk_io(d);
+	tessera_format_opts_t opts;
+	memset(&opts, 0, sizeof opts);
+	opts.total_sectors = 2048;
+	opts.journal_sectors = 64;
+	CHECK(tessera_volume_format(&io, &opts) == TESSERA_OK);
+
+	uint8_t blk[4096];
+	tessera_superblock_t good;
+	CHECK(md_read(d, 0, blk) == 0);
+	CHECK(tessera_decode_superblock(blk, &good) == TESSERA_OK);
+	uint64_t lo = 0, hi = 0;
+	CHECK(tessera_superblock_layout(&good, 0, &lo, &hi) == TESSERA_OK);
+	CHECK(lo == good.pack_zone_start && hi == 2048);
+	CHECK(tessera_superblock_layout(&good, 2048, NULL, NULL) == TESSERA_OK);
+	CHECK(tessera_superblock_layout(&good, 2047, NULL, NULL) == TESSERA_ECORRUPT);
+
+	struct { const char *what; size_t off; uint64_t v; } bad[] = {
+#define F(f) offsetof(tessera_superblock_t, f)
+		{ "zone over journal",  F(pack_zone_start), 10 },
+		{ "zone over SB",       F(pack_zone_start), 0 },
+		{ "zone past end",      F(pack_zone_length), 2048 },
+		{ "zone wraps",         F(pack_zone_length), UINT64_MAX - 5 },
+		{ "journal over SB-B",  F(journal_start), 1 },
+		{ "journal past end",   F(journal_length), 4096 },
+		{ "reserve in journal", F(meta_reserve_start), 5 },
+		{ "bump past reserve",  F(meta_reserve_bump), 2048 },
+		/* the exact boundaries: one sector of overlap or overrun */
+		{ "reserve 1 into journal", F(meta_reserve_start), 4 + 64 - 1 },
+		{ "zone 1 into reserve",    F(pack_zone_start),
+		  4 + 64 + TESSERA_METADATA_ZONE_SECTORS - 1 },
+		{ "zone 1 past end",        F(pack_zone_length),
+		  2048 - (4 + 64 + TESSERA_METADATA_ZONE_SECTORS) + 1 },
+		{ "bump 1 past reserve",    F(meta_reserve_bump),
+		  4 + 64 + TESSERA_METADATA_ZONE_SECTORS + 1 },
+		{ "journal 1 into SB-B",    F(journal_start), 1 },
+#undef F
+	};
+	/* and the same boundaries one sector the other way are accepted */
+	CHECK(good.meta_reserve_start == 4 + 64);
+	CHECK(good.pack_zone_start == 4 + 64 + TESSERA_METADATA_ZONE_SECTORS);
+	CHECK(good.pack_zone_start + good.pack_zone_length == 2048);
+	{
+		tessera_superblock_t sb = good;
+		uint64_t me = good.meta_reserve_start + good.meta_reserve_length;
+		memcpy((uint8_t *)&sb + offsetof(tessera_superblock_t,
+		    meta_reserve_bump), &me, 8);
+		CHECK(tessera_superblock_layout(&sb, 0, NULL, NULL) == TESSERA_OK);
+		uint64_t two = 2;   /* journal right after SB-B */
+		memcpy((uint8_t *)&sb + offsetof(tessera_superblock_t,
+		    journal_start), &two, 8);
+		CHECK(tessera_superblock_layout(&sb, 0, NULL, NULL) == TESSERA_OK);
+	}
+	for (size_t i = 0; i < sizeof bad / sizeof bad[0]; i++) {
+		tessera_superblock_t sb = good;
+		memcpy((uint8_t *)&sb + bad[i].off, &bad[i].v, 8);
+		if (tessera_superblock_layout(&sb, 0, NULL, NULL) != TESSERA_ECORRUPT) {
+			fprintf(stderr, "FAIL layout accepted: %s\n", bad[i].what);
+			failures++;
+		}
+		/* and volume_open refuses it once written with a good CRC */
+		uint8_t enc[4096];
+		CHECK(tessera_encode_superblock(&sb, enc) == TESSERA_OK);
+		md_write(d, 0, enc);
+		md_write(d, 1, enc);
+		tessera_volume_t *v = NULL;
+		CHECK(tessera_volume_open(&io, &v) == TESSERA_ECORRUPT);
+		CHECK(v == NULL);
+	}
+	free(d);
+}
+
 int
 main(void)
 {
@@ -290,6 +374,7 @@ main(void)
 	test_dual_corruption();
 	test_free_extent_tree_reachable();
 	test_inode_and_pack_roots_reachable();
+	test_layout_checked();
 	if (failures > 0) {
 		fprintf(stderr, "%d failure(s)\n", failures);
 		return 1;

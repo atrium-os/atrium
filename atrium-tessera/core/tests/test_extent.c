@@ -357,6 +357,53 @@ test_btree_round_trip(void)
 	free(d);
 }
 
+/*
+ * Free extents come from disk: the free tree at mount, and pack registry or
+ * dead-extent entries freed by GC. One over the journal or a superblock is
+ * handed out by the next alloc and overwritten. Bounded allocators refuse
+ * them; a wrapping start+length is refused everywhere.
+ */
+static void
+test_bounds(void)
+{
+	tessera_extent_alloc_t *a = tessera_extent_open(NULL, 0);
+	CHECK(tessera_extent_free(a, UINT64_MAX - 1, 4) == TESSERA_EINVAL);
+	CHECK(tessera_extent_free(a, UINT64_MAX - 4, 4) == TESSERA_OK);
+	tessera_extent_close(a);
+
+	a = tessera_extent_open_bounded(NULL, 0, 100, 1000);
+	CHECK(a != NULL);
+	CHECK(tessera_extent_free(a, 50, 10) == TESSERA_EINVAL);
+	CHECK(tessera_extent_free(a, 99, 2) == TESSERA_EINVAL);
+	CHECK(tessera_extent_free(a, 990, 11) == TESSERA_EINVAL);
+	CHECK(tessera_extent_free(a, 100, 900) == TESSERA_OK);
+	CHECK(tessera_extent_free_blocks(a) == 900);
+	tessera_extent_close(a);
+	CHECK(tessera_extent_open_bounded(NULL, 0, 5, 5) == NULL);
+
+	/* An on-disk free tree with an extent over sector 0. */
+	struct mem_disk *d = calloc(1, sizeof *d);
+	d->next_sector = 1;
+	tessera_block_io_t io = {
+		.read_block = md_read, .write_block = md_write,
+		.alloc      = md_alloc, .free       = md_free,
+		.ctx        = d,
+	};
+	a = tessera_extent_open(&io, 0);
+	CHECK(tessera_extent_free(a, 0, 8) == TESSERA_OK);
+	CHECK(tessera_extent_free(a, 500, 100) == TESSERA_OK);
+	uint64_t root = 0;
+	CHECK(tessera_extent_flush(a, &root) == TESSERA_OK);
+	tessera_extent_close(a);
+	a = tessera_extent_open_bounded(&io, root, 100, 1000);
+	CHECK(a == NULL);
+	tessera_extent_close(a);
+	a = tessera_extent_open_bounded(&io, root, 0, 1000);
+	CHECK(a != NULL && tessera_extent_free_blocks(a) == 108);
+	tessera_extent_close(a);
+	free(d);
+}
+
 /* ★ The regression that emptied the dev root's metadata reserve at boot.
  *
  * tessera_extent_flush_via rebuilt the whole free-extent tree with one
@@ -443,6 +490,7 @@ main(void)
 	test_random_stress();
 	test_btree_round_trip();
 	test_flush_cost_many_extents();
+	test_bounds();
 	if (failures > 0) {
 		fprintf(stderr, "%d failure(s)\n", failures);
 		return 1;

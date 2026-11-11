@@ -20,6 +20,16 @@ typedef struct tessera_extent_alloc tessera_extent_alloc_t;
 tessera_extent_alloc_t *tessera_extent_open(const tessera_block_io_t *io,
                                               uint64_t free_root_sector);
 
+/* As tessera_extent_open, but every free extent must lie in [lo, hi), the
+ * volume's pack zone (tessera_superblock_layout): an on-disk entry outside
+ * it fails the open (NULL), and a later tessera_extent_free outside it is
+ * EINVAL. The free list and the extents callers free (pack registry
+ * entries, dead extents) come from disk; unbounded, an entry over the
+ * journal or a superblock is handed out and overwritten. */
+tessera_extent_alloc_t *tessera_extent_open_bounded(const tessera_block_io_t *io,
+                                                      uint64_t free_root_sector,
+                                                      uint64_t lo, uint64_t hi);
+
 /* Allocate `n_sectors` contiguous. Returns 0 on success, ENOSPC on
  * failure. On success *out_start is the start sector. */
 int tessera_extent_alloc(tessera_extent_alloc_t *,

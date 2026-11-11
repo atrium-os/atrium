@@ -93,6 +93,7 @@ int tessera_volume_open(const tessera_block_io_t *io,
 
 void tessera_volume_close(tessera_volume_t *);
 
+
 /* Offline-repair commit (tessera-fsck --repair). Overrides the roots a
  * consistency repair can legitimately move, bumps the superblock
  * generation, and writes both SB copies. All other SB fields are
