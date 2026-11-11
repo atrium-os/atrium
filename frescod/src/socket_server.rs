@@ -448,6 +448,15 @@ fn alloc(uid: Option<u32>) -> Option<u8> {
     None
 }
 
+/// The live clients: id, peer uid, and whether embed-only.
+#[allow(dead_code)]
+pub fn live_clients() -> Vec<(u8, Option<u32>, bool)> {
+    let live = *LIVE_CLIENTS.lock().unwrap();
+    let uids = *CLIENT_UID.lock().unwrap();
+    let embed = *EMBED_ONLY.lock().unwrap();
+    (1..=255u8).filter(|&i| live[i as usize]).map(|i| (i, uids[i as usize], embed[i as usize])).collect()
+}
+
 pub fn free_client_id(id: u8) {
     EMBED_ONLY.lock().unwrap()[id as usize] = false;
     crate::caps::forget(id);

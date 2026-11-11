@@ -47,6 +47,8 @@ pub fn socket() -> String {
 /// `fallback`: the screen size while no mode is set (headless).
 pub fn spawn(sink: Sender<DisplayEvent>, comp: Arc<Mutex<Compositor>>, path: String, fallback: (u32, u32)) {
     let _ = FALLBACK.set(fallback);
+    // A grant taken away moves the pads at once (fresco-capabilities.md §6).
+    crate::caps::watch(crate::socket_server::live_clients, caps_changed);
     std::thread::Builder::new()
         .name("frescod-tactus".into())
         .spawn(move || {
@@ -122,6 +124,15 @@ pub fn claim(client: u8, window: u32, device: u32, on: bool) {
     }
 }
 
+/// Client `client`'s grants changed: claims it may no longer hold end,
+/// and every connected pad goes where it now should.
+pub fn caps_changed(client: u8) {
+    let active = ACTIVE.lock().unwrap().clone();
+    if let Some((pads, sink, comp)) = active {
+        pads.lock().unwrap().regrant(&sink, &comp, client, crate::caps::of(client));
+    }
+}
+
 /// The window pad `id` goes to now: the one holding it, else the focused
 /// window if its app may have gamepads (`input.gamepad`), else none.
 fn pad_target(claims: &std::collections::BTreeMap<u32, u32>, id: u32, comp: &Mutex<Compositor>) -> u32 {
@@ -140,6 +151,27 @@ fn pad_target(claims: &std::collections::BTreeMap<u32, u32>, id: u32, comp: &Mut
 }
 
 impl Pads {
+    /// See [`caps_changed`].
+    fn regrant(&mut self, sink: &Sender<DisplayEvent>, comp: &Mutex<Compositor>, client: u8, caps: crate::caps::Caps) {
+        let mut ended = Vec::new();
+        if !caps.has(crate::caps::Caps::GAMEPAD_EXCLUSIVE) {
+            let g = comp.lock().unwrap();
+            let mine = |w: u32| u16::try_from(w).ok().and_then(|w| g.windows.get(&w)).is_some_and(|w| w.owner as u8 == client);
+            ended = self.claims.iter().filter(|&(_, &w)| mine(w)).map(|(&d, &w)| (d, w)).collect();
+        }
+        for &(dev, _) in &ended {
+            self.claims.remove(&dev);
+        }
+        for (&id, p) in self.map.iter_mut() {
+            if p.owner.is_some() {
+                pad_follow(sink, id, p, pad_target(&self.claims, id, comp));
+            }
+        }
+        for (dev, window) in ended {
+            let _ = sink.send(DisplayEvent::Gamepad { window_id: window, kind: control::EV_GAMEPAD_CLAIM, device_id: dev, usage: 0, value: 0 });
+        }
+    }
+
     /// Hold or give back a pad; see [`claim`].
     #[allow(clippy::too_many_arguments)]
     fn claim(&mut self, sink: &Sender<DisplayEvent>, comp: &Mutex<Compositor>, client: u8, caps: crate::caps::Caps, window: u32, device: u32, on: bool) {
@@ -734,7 +766,22 @@ mod tests {
         caps::set(4, Caps::GAMEPAD.union(Caps::GAMEPAD_EXCLUSIVE));
         claim(4, b, true);
         assert_eq!(ev(&rx), vec![(b, control::EV_GAMEPAD_CLAIM, 0)]);
-        // Unplugged: the claim goes with it.
+        // The exclusive grant is taken away: the claim ends and the pad
+        // follows focus (b); then input.gamepad goes too: b loses it.
+        caps::set(3, Caps::GAMEPAD);
+        pads.lock().unwrap().regrant(&tx, &comp, 3, Caps::GAMEPAD);
+        assert_eq!(
+            ev(&rx),
+            vec![(a, control::EV_GAMEPAD_DISCONNECT, 0), (b, control::EV_GAMEPAD_CONNECT, 0), (a, control::EV_GAMEPAD_CLAIM, 0)]
+        );
+        caps::set(4, Caps::NONE);
+        pads.lock().unwrap().regrant(&tx, &comp, 4, Caps::NONE);
+        assert_eq!(ev(&rx), vec![(b, control::EV_GAMEPAD_DISCONNECT, 0)]);
+        // Unplugged: the claim goes with it (a holds it again first).
+        caps::set(3, Caps::GAMEPAD.union(Caps::GAMEPAD_EXCLUSIVE));
+        focus(a);
+        claim(3, a, true);
+        assert_eq!(ev(&rx), vec![(a, control::EV_GAMEPAD_CONNECT, 0), (a, control::EV_GAMEPAD_CLAIM, 1)]);
         seat.handle(Message::Gone { id: 7 }, &tx, &comp);
         assert_eq!(ev(&rx), vec![(a, control::EV_GAMEPAD_DISCONNECT, 0)]);
         assert!(seat.pads.lock().unwrap().claims.is_empty());

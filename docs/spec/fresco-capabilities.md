@@ -103,8 +103,11 @@ app.
 
 ## 6. Revocation and change
 
-frescod watches `<base>/<user>/policy.toml` (kqueue `EVFILT_VNODE`) for
-each user with a connection. On change it recomputes each connection's
+frescod watches `<base>/<user>/policy.toml` for each user with a
+connection, with the registry and the system policy. *As built:* a check
+once a second of each path's size and modification time, because
+Portcullis replaces a policy by rename, which a vnode watch on the old
+file would miss. On change it recomputes each connection's
 `Caps`. A lost capability takes effect at once: an exclusive claim is
 released as in §4, and a pointer lock ends.
 
@@ -159,6 +162,12 @@ tests 53/53 in the amd64 VM (TCG_CPU=Haswell-noTSX), and
 the fake pad and keeps it while window 2 has focus); the plain
 `GAMEPAD=1` run still passes 16/0. A claim while tactusd is down gets no
 answer, since there are no pads to hold.
+
+*Built (2026-11-11):* C4, the watch and revocation (`caps::watch`,
+`tactus_client::caps_changed`). Checked: frescod unit tests 54/54 in the
+VM; `GAMEPAD=1 CLAIM=1 REVOKE=1` 7/0 (the exclusive grant is taken out of
+the policy while window 1 holds the pad: window 1 gets `DISCONNECT` and
+`EV_GAMEPAD_CLAIM` 0, and the pad follows focus to window 2).
 
 The Forum controller menu and Guide long-press (§4) belong to the Forum
 thread. Until they exist, ending the holder's app is the user's only

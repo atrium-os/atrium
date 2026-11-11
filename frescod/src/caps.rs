@@ -104,6 +104,71 @@ fn granted(base: &Path, system: &Path, user: &str, app_id: &str) -> Caps {
     // system_keys is never honoured for apps (decision 2).
 }
 
+impl Source {
+    /// What a change to any grant that can matter shows up in: the
+    /// registry, the system policy, and the policy of each user with a
+    /// client (§6). Policies are replaced by rename, so the size and
+    /// modification time of the path are compared, not a watch on a file.
+    fn stamp(&self, uids: &[Option<u32>]) -> Vec<(PathBuf, Option<(std::time::SystemTime, u64)>)> {
+        let st = |p: &Path| std::fs::metadata(p).ok().map(|m| (m.modified().unwrap_or(std::time::UNIX_EPOCH), m.len()));
+        let registry = AppRegistry::load(&self.registry.to_string_lossy()).unwrap_or_default();
+        let mut paths = vec![self.registry.clone(), self.system_policy.clone()];
+        for user in uids.iter().flatten().filter_map(|&u| registry.resolve(u)).map(|(user, _)| user) {
+            if !user.contains('/') && !user.starts_with('.') {
+                let p = self.policy_base.join(user).join("policy.toml");
+                if !paths.contains(&p) {
+                    paths.push(p);
+                }
+            }
+        }
+        paths.into_iter().map(|p| { let s = st(&p); (p, s) }).collect()
+    }
+}
+
+/// Once a second, look for changed grants; on a change, work out every
+/// live client's capabilities again and call `changed` for each one whose
+/// capabilities changed (fresco-capabilities.md §6). `live` lists the
+/// clients as (id, peer uid, embed-only).
+pub fn watch(live: fn() -> Vec<(u8, Option<u32>, bool)>, changed: fn(u8)) {
+    static STARTED: std::sync::Once = std::sync::Once::new();
+    STARTED.call_once(|| {
+        std::thread::Builder::new()
+            .name("frescod-caps".into())
+            .spawn(move || {
+                let src = SOURCE.get_or_init(Source::from_env);
+                let mut last = None;
+                loop {
+                    std::thread::sleep(std::time::Duration::from_secs(1));
+                    let clients = live();
+                    let uids: Vec<_> = clients.iter().map(|c| c.1).collect();
+                    let stamp = src.stamp(&uids);
+                    if last.as_ref() == Some(&stamp) {
+                        continue;
+                    }
+                    last = Some(stamp);
+                    for id in recompute(src, &clients) {
+                        changed(id);
+                    }
+                }
+            })
+            .ok();
+    });
+}
+
+/// Work the clients' capabilities out again; the ids whose changed.
+fn recompute(src: &Source, clients: &[(u8, Option<u32>, bool)]) -> Vec<u8> {
+    let mut out = Vec::new();
+    for &(id, uid, embed) in clients {
+        let new = src.caps_for(uid, embed);
+        let old = std::mem::replace(&mut CLIENT_CAPS.lock().unwrap()[id as usize], new);
+        if old != new {
+            log::info!("frescod: client {id} uid {uid:?} input caps {old:?} -> {new:?}");
+            out.push(id);
+        }
+    }
+    out
+}
+
 /// Running as `_frescod`, or inside a jail.
 fn production() -> bool {
     let uid = unsafe { libc::getuid() };
@@ -197,6 +262,27 @@ graphics = "fresco"
         assert_eq!(s.caps_for(Some(50002), false), Caps::NONE, "editor declared no gamepad");
         assert_eq!(s.caps_for(Some(50003), false), Caps::NONE, "bob never granted the game");
         assert_eq!(s.caps_for(Some(50001), true), Caps::NONE, "an embed gets none of its owner's");
+        std::fs::remove_dir_all(d).ok();
+    }
+
+    /// §6: a changed policy shows in the stamp, and recomputing takes the
+    /// grant away from a live client.
+    #[test]
+    fn a_changed_policy_is_seen_and_revokes() {
+        let (s, d) = setup("revoke");
+        // Ids 200-201 are not used by the other tests.
+        set(200, s.caps_for(Some(50001), false));
+        set(201, s.caps_for(Some(50002), false));
+        let clients = [(200, Some(50001), false), (201, Some(50002), false)];
+        let before = s.stamp(&[Some(50001), Some(50002)]);
+        assert_eq!(before.len(), 3, "registry, system policy, alice's policy: {before:?}");
+        assert!(recompute(&s, &clients).is_empty());
+        let p = d.join("alice/policy.toml");
+        let text = std::fs::read_to_string(&p).unwrap().replace("input.gamepad_exclusive = true\n", "");
+        std::fs::write(&p, text).unwrap();
+        assert_ne!(s.stamp(&[Some(50001), Some(50002)]), before);
+        assert_eq!(recompute(&s, &clients), vec![200]);
+        assert!(of(200).has(Caps::GAMEPAD) && !of(200).has(Caps::GAMEPAD_EXCLUSIVE));
         std::fs::remove_dir_all(d).ok();
     }
 

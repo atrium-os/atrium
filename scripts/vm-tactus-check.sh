@@ -46,6 +46,10 @@ GAMEPAD=${GAMEPAD:-0}
 # through a test launch registry and policy, claims the pad, and keeps it when
 # window 2 takes focus (docs/spec/fresco-capabilities.md §4).
 CLAIM=${CLAIM:-0}
+# REVOKE=1 (with CLAIM=1): the exclusive grant is taken out of the policy
+# while window 1 holds the pad; the claim ends and the pad follows focus to
+# window 2 (§6).
+REVOKE=${REVOKE:-0}
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
 VMDIR=${VMDIR:-$HOME/atrium-vm-amd64}
 K="-i $HOME/.ssh/fresco_bsd_ed25519 -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR"
@@ -135,7 +139,7 @@ EOF
 
 if [ "$GAMEPAD" = 1 ]; then
   echo "== gamepad: fake Bluetooth pad -> jailed tactusd -> split frescod -> windows"
-  V 'sh -s' <<'EOF'
+  V "REVOKE=$REVOKE sh -s" <<'EOF'
 cd /root/t
 S=/tmp/fresco-t.sock
 mkdir -p /atrium/sockets/bluetooth-hid; chmod 0755 /atrium/sockets/bluetooth-hid
@@ -145,6 +149,11 @@ rm -f /tmp/pad.log
 i=0; until grep -q "pausing" /tmp/pad.log || [ $i -ge 60 ]; do sleep 1; i=$((i+1)); done
 sleep 3
 rm -f /tmp/probe2.log; daemon -f -o /tmp/probe2.log ./atrium-input-probe $S 600
+if [ "$REVOKE" = 1 ]; then
+  sleep 4
+  grep -v gamepad_exclusive /tmp/cappol/root/policy.toml > /tmp/cappol/p.new && mv /tmp/cappol/p.new /tmp/cappol/root/policy.toml
+  echo "revoked input.gamepad_exclusive"
+fi
 i=0; until grep -q "detached" /tmp/pad.log || [ $i -ge 90 ]; do sleep 1; i=$((i+1)); done
 sleep 3
 cat /tmp/pad.log
@@ -155,6 +164,17 @@ EOF
   V 'grep "^pad-std " /tmp/probe2.log' > /tmp/tactus-std2.log
   echo "-- window 1"; cat /tmp/tactus-pad1.log; echo "-- window 2"; cat /tmp/tactus-pad2.log
   P1=/tmp/tactus-pad1.log P2=/tmp/tactus-pad2.log
+  if [ "$CLAIM" = 1 ] && [ "$REVOKE" = 1 ]; then
+    grep -q "pad-claim .*held=1" $P1 && ok "window 1: claim granted" || bad "window 1 claim not granted"
+    tail -1 $P1 | grep -q "pad-claim .*held=0" && ok "window 1: claim ended by the revocation, last" || bad "window 1 claim not ended"
+    grep -q "pad-disconnect" $P1 && ok "window 1: disconnected" || bad "window 1 not disconnected"
+    grep -q "usage=0x00090002" $P1 && bad "window 1 got button 2 after the revocation" || ok "window 1: nothing after the revocation"
+    head -1 $P2 | grep -q "pad-connect" && ok "window 2: connect (follows focus)" || bad "window 2 connect"
+    grep -q "pad-button .*usage=0x00090002 pressed=1" $P2 && ok "window 2: button 2" || bad "window 2 button 2"
+    tail -1 $P2 | grep -q "pad-disconnect" && ok "window 2: disconnect on detach" || bad "window 2 detach"
+    echo "tactus: $fails failed"
+    exit $fails
+  fi
   if [ "$CLAIM" = 1 ]; then
     V 'grep "input caps" /tmp/frescod-t.log | head -3'
     grep -q 'pad-connect .*name="Fake Pad"' $P1 && ok "window 1: connect" || bad "window 1 connect"
