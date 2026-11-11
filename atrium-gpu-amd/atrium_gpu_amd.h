@@ -472,9 +472,12 @@ struct atrium_gpu_backend_ops {
 	void	(*unmap_page)(struct atrium_amd_vm *vm, uint64_t va);
 	/* Submit a prepared ring on an engine in a VM (amd: PM4 ring + doorbell,
 	 * under the queue's lock; EBUSY if another client owns the queue or
-	 * another VM's work on it does not drain). */
+	 * another VM's work on it does not drain). The front-end has checked
+	 * the arguments: the ring is bound in `vm` at `ring_va`, holds at least
+	 * `n_dwords` (> 0), and the caller holds the ring's and VM's files. The
+	 * backend checks only what is its own: `engine`. */
 	int	(*submit)(struct atrium_amd_softc *sc,
-		    struct atrium_amd_client *client, struct atrium_amd_bo *ring,
+		    struct atrium_amd_client *client, uint64_t ring_va,
 		    uint32_t n_dwords, uint32_t engine, struct atrium_amd_vm *vm,
 		    uint32_t deadline_ns, struct atrium_amd_syncobj *so,
 		    uint64_t signal_value);
@@ -975,8 +978,6 @@ amd_ih_set_handler(struct atrium_amd_softc *sc, int cause,
  * drops with fdrop(). */
 int	 amd_bo_fget(struct thread *td, int fd, struct file **out_fp,
 	    struct atrium_amd_bo **out_bo);
-/* The BO's base GPU-VA in `vm`, or 0 if it is not bound there. */
-uint64_t amd_bo_gpu_va(struct atrium_amd_bo *bo, struct atrium_amd_vm *vm);
 /* Free a BO whose backing the deferred-free reaper has released. */
 void	 amd_bo_free_struct(struct atrium_amd_bo *bo);
 /* amd backend: allocate/free a BO's backing (bus_dma System pages or a VRAM
@@ -1069,7 +1070,7 @@ int	 amd_hwq_init(struct atrium_amd_softc *sc, device_t dev);
 void	 amd_hwq_fini(struct atrium_amd_softc *sc);
 int	 amd_hwq_busy_refs(struct atrium_amd_softc *sc);
 int	 amd_hwq_submit(struct atrium_amd_softc *sc,
-	    struct atrium_amd_client *client, struct atrium_amd_bo *ring,
+	    struct atrium_amd_client *client, uint64_t ring_va,
 	    uint32_t n_dwords, uint32_t engine, struct atrium_amd_vm *vm,
 	    uint32_t deadline_ns, struct atrium_amd_syncobj *so,
 	    uint64_t signal_value);

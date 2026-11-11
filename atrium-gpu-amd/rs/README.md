@@ -8,7 +8,7 @@ layer that faces clients. The hardware half stays C for now.
 
 | Rust (`rs/`) | C (`../*.c`) |
 |---|---|
-| ioctl dispatch for the client node and the ctl node, and per-open client state (`ioctl.rs`) | PCI attach, firmware, GMC, IH, MES, the CP rings, VRAM, reset, power gating |
+| ioctl dispatch for the client node and the ctl node, per-open client state, and every check on submit's arguments (`ioctl.rs`; the command stream itself is not parsed: app GPU code is confined by its VMID, F6 Option A) | PCI attach, firmware, GMC, IH, MES, the CP rings, VRAM, reset, power gating |
 | GPU address spaces as fds: the VA arena and the VM's lifetime (`vm.rs`) | the hardware side of a VM: VMID, page tables, PTE writes (`vm.c`) |
 | buffer objects as fds: binding into VMs, unbinding, deferred free (`bo.rs`) | DMA pages and VRAM backing, scanout export (`bo.c`) |
 | timeline syncobjs: wait, kqueue, the display's watcher (`syncobj.rs`) | the EOP interrupt, which signals or fails a syncobj (`irq.c`) |
@@ -16,7 +16,7 @@ layer that faces clients. The hardware half stays C for now.
 | the single place Rust calls C (`backend.rs`) | |
 
 C reaches the Rust objects through a few `#[no_mangle]` exports: `amd_syncobj_*`,
-`amd_bo_fget`, `amd_bo_gpu_va`, `amd_bo_free_struct`, and `amd_db_grant_create`/`amd_db_grant_revoke`
+`amd_bo_fget`, `amd_bo_free_struct`, and `amd_db_grant_create`/`amd_db_grant_revoke`
 (called by `queue.c` under the queue's lock). VM and BO are `#[repr(C)]`, and their
 first field is the C backend struct, so a C pointer and a Rust pointer to the same object are
 the same address. Syncobjs and clients are opaque to C. The softc is opaque to Rust and is
@@ -81,7 +81,6 @@ grows from 78 KB to 189 KB, mostly Rust's libcore pieces.
 
 ## Next
 
-- Submit validation, moved into Rust.
 - R9700 runs through Remote Control on the Mac, when the GPU is quiet.
 - PCI, MSI-X and firmware(9) bindings are deferred until bring-up moves too. Bindings that
   nothing calls would be untested code.

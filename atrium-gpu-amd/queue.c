@@ -465,23 +465,18 @@ amd_hwq_watchdog_task(void *arg, int pending __unused)
 
 int
 amd_hwq_submit(struct atrium_amd_softc *sc, struct atrium_amd_client *client,
-    struct atrium_amd_bo *ring, uint32_t n_dwords, uint32_t engine,
+    uint64_t ring_va, uint32_t n_dwords, uint32_t engine,
     struct atrium_amd_vm *vm, uint32_t deadline_ns,
     struct atrium_amd_syncobj *so, uint64_t signal_value)
 {
 	struct atrium_amd_hwq *q;
 	uint32_t doorbell_off;
-	uint64_t ring_va;
 	int err;
 
+	/* The arguments were checked by the front-end (rs/ioctl.rs). */
 	q = amd_hwq_for_engine(sc, engine);
 	if (q == NULL)
 		return (EINVAL);
-	if (n_dwords == 0)
-		return (EINVAL);
-	ring_va = amd_bo_gpu_va(ring, vm);	/* the ring's VA in the submit VM */
-	if (ring_va == 0)
-		return (EINVAL);		/* ring not bound in this VM */
 
 	sx_xlock(&q->lock);
 	if (q->owner != NULL) {

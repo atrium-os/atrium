@@ -281,10 +281,13 @@ fn bo_xfer(a: &sys::atrium_gpu_bo_xfer, write: bool) -> Result<()> {
 fn submit(dev: Dev, client: &Client, a: &sys::atrium_gpu_submit) -> Result<()> {
     let vm = FileRef::<Vm>::get(fd(a.vm_fd))?;
     let ring = FileRef::<BoFile>::get(fd(a.ring_fd))?;
-    // The ring must fit the BO (each dword is 4 bytes).
-    if a.n_dwords as u64 * 4 > ring.size() {
+    // A non-empty ring that fits the BO (each dword is 4 bytes)...
+    if a.n_dwords == 0 || a.n_dwords as u64 * 4 > ring.size() {
         return Err(EINVAL);
     }
+    // ...bound in the VM it runs under. The binding cannot go away during the submit: only
+    // the BO file's last close removes it, and we hold the file.
+    let ring_va = ring.gpu_va(&vm).ok_or(EINVAL)?;
     let so = if a.signal_syncobj_fd >= 0 {
         Some(FileRef::<SyncObj>::get(a.signal_syncobj_fd)?)
     } else {
@@ -295,7 +298,7 @@ fn submit(dev: Dev, client: &Client, a: &sys::atrium_gpu_submit) -> Result<()> {
     // that queue's list BEFORE ringing the doorbell (the ISR signals it on the end-of-pipe
     // interrupt, which for a ring parked on a cross-queue WAIT comes on a later doorbell), and
     // rings it, all under the queue's lock.
-    dev.submit(client.as_c(), ring.as_c(), a.n_dwords, a.engine, vm.as_c(), a.deadline_ns, so_ptr, a.signal_value)
+    dev.submit(client.as_c(), ring_va, a.n_dwords, a.engine, vm.as_c(), a.deadline_ns, so_ptr, a.signal_value)
 }
 
 /// A TLV writer over a fixed buffer: every record is bounds-checked.

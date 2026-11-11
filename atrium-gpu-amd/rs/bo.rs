@@ -257,18 +257,6 @@ pub unsafe extern "C" fn amd_bo_fget(
     }
 }
 
-/// For queue.c's submit: the ring BO's VA in the submitting VM, 0 if it is not bound there.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn amd_bo_gpu_va(
-    bo: *mut sys::atrium_amd_bo,
-    vm: *mut sys::atrium_amd_vm,
-) -> u64 {
-    // SAFETY: the caller holds both files (the ioctl's references).
-    let bo = unsafe { Bo::from_c(bo) };
-    let vm = unsafe { &*vm.cast::<Vm>() };
-    bo.gpu_va(vm).unwrap_or(0)
-}
-
 /// For queue.c's deferred-free reaper, after the backend's bo_free: free the BO itself.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn amd_bo_free_struct(bo: *mut sys::atrium_amd_bo) {

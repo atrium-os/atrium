@@ -115,7 +115,7 @@ impl Dev {
     pub fn submit(
         self,
         client: *mut sys::atrium_amd_client,
-        ring: *mut sys::atrium_amd_bo,
+        ring_va: u64,
         n_dwords: u32,
         engine: u32,
         vm: *mut sys::atrium_amd_vm,
@@ -124,7 +124,7 @@ impl Dev {
         signal_value: u64,
     ) -> Result<()> {
         check(unsafe {
-            (self.ops().submit.unwrap())(self.0, client, ring, n_dwords, engine, vm, deadline_ns, so, signal_value)
+            (self.ops().submit.unwrap())(self.0, client, ring_va, n_dwords, engine, vm, deadline_ns, so, signal_value)
         })
     }
 
