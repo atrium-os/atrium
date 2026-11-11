@@ -20,7 +20,7 @@ carillon-kmod. "Reachable by" means who can trigger it on a default Atrium insta
 | **V3** | atrium-kmod | SUBMIT, RESOURCE_ATTACH, SET_MODE and PAGE_FLIP looked the BO up under `bo_lock`, dropped the lock and kept using it; a concurrent FREE freed it underneath (SUBMIT's comment called this "UB; the server must serialise") | any GPU fd holder, against itself | kernel use-after-free | **fixed**: `atrium_bo_hold_locked` / `atrium_bo_drop` around each use |
 | **V4** | atrium-kmod | `atrium_bo_free` reached the softc through `bo->owner`, the minting fd, which is freed when the minter closes while an importer keeps the BO | minter closes before importer | kernel use-after-free on BO free | **fixed**: `bo->sc` |
 | **V5** | atrium-kmod | FREE and MINT_TOKEN walked and edited the per-fd acl without `bo_lock`; two threads on one fd raced | any GPU fd holder | list corruption, use-after-free | **fixed**: acl edits under `bo_lock` |
-| V6 | atrium-kmod | HOST_BLOB BOs use the BAR offset as `mmap_offset`, ordinary BOs `handle << 30`; the two spaces can overlap within one fd | own fd only | maps the wrong one of the caller's own BOs | open (ABI change; low) |
+| **V6** | atrium-kmod | HOST_BLOB BOs use the BAR offset as `mmap_offset`, ordinary BOs `handle << 30`; the two spaces can overlap within one fd | own fd only | maps the wrong one of the caller's own BOs | **fixed** 2026-11-11: host-visible BOs get their own range (`ATRIUM_HOST_MMAP_BASE` 2^62 + BAR offset), disjoint from `handle << 30` by a static assert. Offsets stay opaque to userspace, so no ABI change in practice; builds clean, not yet run on the Mac VM's host-blob path |
 | **G1** | atrium-gpu-amd | two concurrent `VM_BIND` calls on one BO both passed the "slot free" check and the second wrote `bindings[MAX]`, one past the array | any GPU fd holder | kernel heap overflow | **fixed**: per-BO `bind_lock` (sx) |
 | G2 | atrium-gpu-amd | no per-client BO accounting: one client can allocate VRAM until others fail | any GPU fd holder | DoS | open (medium; goes with the scheduler work) |
 | G3 | atrium-gpu-amd | QUERY_CAPS fills a 256-byte buffer with no static size check | none today | future overflow if the caps struct grows | open (low; add `_Static_assert`) |
@@ -103,7 +103,7 @@ is not committed; the J1 input is, as `fuzz/corpus/fuzz_journal/regress-2026-11-
   allocated a blob size from disk (up to 4 GiB, `M_WAITOK`) before checking it. Both now
   use the checked Rust partial-read API (`tessera_pack_geom_from_header`,
   `tessera_pack_index_find`); see rust-decoders.md.
-- G2 per-client accounting, G3 static assert, V6 offset spaces: small, not urgent.
+- G2 per-client accounting and G3 caps size check: taken by the GPU driver Rust port (G3 closed there by the bounds-checked Rust QUERY_CAPS). V6 fixed 2026-11-11.
 - `scripts/core-fuzz.sh`: the `UBSAN_OPTIONS=... \` line was followed by a comment, so the
   variable never reached the command. Fixed 2026-11-10 with the D3 fuzz changes.
 - Syzkaller descriptions for the GPU and Tessera ioctls, after the spike run proves the setup.

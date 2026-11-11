@@ -128,9 +128,19 @@ SYSCTL_INT(_kern_atrium_gpu, OID_AUTO, bos_outstanding,
  *     the BOs it allocated or imported.
  *
  * BO_STRIDE = 1 GiB; BO_MAX_SIZE = 1 GiB. Plenty for v0.1.
+ *
+ * Host-visible BOs (HOST_BLOB and scanout blobs) live in the BAR window and
+ * can be up to 4 GiB, so they get their own range: ATRIUM_HOST_MMAP_BASE plus
+ * the BAR offset (windows never overlap, so neither do these). Ordinary BOs
+ * end below 2^32 * 1 GiB = 2^62, so the two ranges cannot meet. Audit V6:
+ * host blobs used the bare BAR offset, which could fall inside an ordinary
+ * BO's [handle << 30, +size) range on the same fd and map the wrong BO.
  */
 #define ATRIUM_BO_STRIDE     (1ULL << 30)
 #define ATRIUM_BO_MAX_SIZE   ATRIUM_BO_STRIDE
+#define ATRIUM_HOST_MMAP_BASE (1ULL << 62)
+_Static_assert((uint64_t)UINT32_MAX * ATRIUM_BO_STRIDE + ATRIUM_BO_MAX_SIZE <=
+    ATRIUM_HOST_MMAP_BASE, "ordinary BO offsets must stay below the host range");
 
 struct atrium_gpu_bo {
 	TAILQ_ENTRY(atrium_gpu_bo) link;
@@ -1118,13 +1128,13 @@ atrium_gpu_alloc_scanout_bo(struct atrium_gpu_softc *sc,
 	}
 	bo->virtio_resource_id = resource_id;
 
-	/* 5. Publish handle + mmap_offset. mmap_offset uses the BAR
-	 *    window offset so it's globally unique (no two HOST blobs
-	 *    share a window). */
+	/* 5. Publish handle + mmap_offset: the host range plus the BAR
+	 *    window offset, unique since no two HOST blobs share a window
+	 *    (see ATRIUM_HOST_MMAP_BASE). */
 	bo->refcount = 0;
 	mtx_lock(&sc->bo_lock);
 	bo->handle      = ++sc->next_handle;
-	bo->mmap_offset = bar_offset;
+	bo->mmap_offset = ATRIUM_HOST_MMAP_BASE + bar_offset;
 	TAILQ_INSERT_TAIL(&sc->bos, bo, link);
 	atrium_gpu_bos_outstanding++;
 	err = atrium_gpu_acl_add(f, bo);
@@ -1226,12 +1236,12 @@ atrium_gpu_ioc_host_blob(struct atrium_gpu_softc *sc,
 	bo->virtio_resource_id = resource_id;
 	bo->refcount = 0;
 
-	/* Publish BO with a unique mmap_offset and handle. mmap_offset uses
-	 * BAR offset for unique-by-construction (no two HOST blobs share a
-	 * window) — userspace passes this to mmap(). */
+	/* Publish BO with a unique mmap_offset and handle: the host range
+	 * plus the BAR offset (no two HOST blobs share a window; see
+	 * ATRIUM_HOST_MMAP_BASE). Userspace passes it to mmap() unchanged. */
 	mtx_lock(&sc->bo_lock);
 	bo->handle      = ++sc->next_handle;
-	bo->mmap_offset = bar_offset; /* uniqueness inherited from window */
+	bo->mmap_offset = ATRIUM_HOST_MMAP_BASE + bar_offset; /* unique per window */
 	TAILQ_INSERT_TAIL(&sc->bos, bo, link);
 	atrium_gpu_bos_outstanding++;
 	err = atrium_gpu_acl_add(f, bo);
