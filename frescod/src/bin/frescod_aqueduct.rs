@@ -89,6 +89,9 @@ mod credential;
 #[path = "../activation.rs"]
 #[allow(dead_code)]
 mod activation;
+#[path = "../caps.rs"]
+#[allow(dead_code)]
+mod caps;
 #[path = "../socket_server.rs"]
 mod socket_server;
 

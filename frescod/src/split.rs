@@ -618,6 +618,10 @@ impl Broker {
                 }
                 f.push(format);
             }
+            Msg::PadClaim { device, claim, .. } => {
+                let global = r.wins.lock().unwrap().get(&local).map(|w| w.global as u32).ok_or("pad claim for unknown window")?;
+                crate::tactus_client::claim(r.client_id, global, device, claim);
+            }
             Msg::DragBegin { drag_id, activation, .. } => {
                 let formats = std::mem::take(&mut *r.drag_formats.lock().unwrap());
                 let global = r.wins.lock().unwrap().get(&local).map(|w| w.global as u32);
@@ -986,6 +990,7 @@ fn event_record(r: &Renderer, ev: &DisplayEvent) -> Option<Msg> {
                 c::EV_GAMEPAD_DISCONNECT => fresco_split::PAD_DISCONNECT,
                 c::EV_GAMEPAD_BUTTON => fresco_split::PAD_BUTTON,
                 c::EV_GAMEPAD_AXIS => fresco_split::PAD_AXIS,
+                c::EV_GAMEPAD_CLAIM => fresco_split::PAD_CLAIMED,
                 _ => return None,
             };
             return Some(Msg::Pad { window: r.local_of(window_id)?, kind, device: device_id, usage, value });

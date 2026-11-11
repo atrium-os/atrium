@@ -218,6 +218,16 @@ pub mod control {
     pub const EV_GAMEPAD_DISCONNECT:    u16 = 0x0707;
     pub const EV_GAMEPAD_BUTTON:        u16 = 0x0708;
     pub const EV_GAMEPAD_AXIS:          u16 = 0x0709;
+    /// Whether the window holds pad `device_id` exclusively
+    /// (fresco-capabilities.md §4): a [`GamepadEvent`] with `usage` 0 and
+    /// `value` 1 (held: the pad stays with this window when focus moves)
+    /// or 0 (not held: refused, released, or moved by the user).
+    pub const EV_GAMEPAD_CLAIM:         u16 = 0x070a;
+    /// Client → server, no reply but `EV_GAMEPAD_CLAIM`: hold a pad
+    /// whatever has focus, or give it back ([`PadClaim`]). Needs the
+    /// `input.gamepad_exclusive` grant and the window to have focus; a
+    /// pad another window holds is refused.
+    pub const OP_PAD_CLAIM:             u16 = 0x070b;
 
     // ── Drag and drop between windows (docs/spec/tabula.md §4) ──
     /// Client → server, no reply: start dragging from the client's window
@@ -1199,6 +1209,15 @@ pub struct GamepadConnectEvent {
     pub axes: u16,
     /// As the device names itself, at most 63 bytes.
     pub name: String,
+}
+
+/// `OP_PAD_CLAIM`: hold pad `device_id` (0: the one used last) for
+/// `window_id`, or (`claim` false) give it back.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct PadClaim {
+    pub window_id: u32,
+    pub device_id: u32,
+    pub claim: bool,
 }
 
 /// `EV_GAMEPAD_DISCONNECT`, `EV_GAMEPAD_BUTTON`, `EV_GAMEPAD_AXIS`: one
@@ -2351,6 +2370,8 @@ mod tests {
             control::EV_GAMEPAD_DISCONNECT,
             control::EV_GAMEPAD_BUTTON,
             control::EV_GAMEPAD_AXIS,
+            control::EV_GAMEPAD_CLAIM,
+            control::OP_PAD_CLAIM,
             control::OP_DRAG_BEGIN,
             control::OP_WM_CREDENTIAL_SLOT,
             control::EV_DRAG_ENTER,

@@ -147,6 +147,19 @@ This spec leaves them alone. Folding them into Portcullis's
 - **C4.** The policy watch and revocation, with a VM check that edits
   the policy and sees the claim end.
 
+*Built (2026-11-11):* C1 (af32fbf) and C2-C3. frescod's `caps.rs` does
+the lookup at connect (`FRESCOD_APP_REGISTRY`, `ATRIUM_POLICY_BASE`,
+`FRESCOD_DEV_CAPS`); the pad router (`tactus_client.rs`) sends a pad only
+to a window whose app has `input.gamepad`, or to the window holding it.
+Wire: `OP_PAD_CLAIM` 0x070b (`PadClaim`), answered by `EV_GAMEPAD_CLAIM`
+0x070a (a `GamepadEvent`, `value` 1 held, 0 not); split records
+`PAD_CLAIM` (renderer to broker) and `PAD_CLAIMED`. Checked: frescod unit
+tests 53/53 in the amd64 VM (TCG_CPU=Haswell-noTSX), and
+`GAMEPAD=1 CLAIM=1 sh scripts/vm-tactus-check.sh` 5/0 (window 1 claims
+the fake pad and keeps it while window 2 has focus); the plain
+`GAMEPAD=1` run still passes 16/0. A claim while tactusd is down gets no
+answer, since there are no pads to hold.
+
 The Forum controller menu and Guide long-press (§4) belong to the Forum
 thread. Until they exist, ending the holder's app is the user's only
 override.

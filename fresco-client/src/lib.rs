@@ -148,6 +148,9 @@ pub enum Event {
     /// An axis by HID usage: -32768..=32767; the hat (`0x0001_0039`) is
     /// 0..=7 clockwise from up, -1 centred.
     GamepadAxis { window_id: u32, device_id: u32, usage: u32, value: i32 },
+    /// The answer to [`Connection::pad_claim`], or the claim ended:
+    /// `held` while the pad stays with this window whatever has focus.
+    GamepadClaim { window_id: u32, device_id: u32, held: bool },
     /// A drag (docs/spec/tabula.md §4) came over the window, offering
     /// these MIME `formats`.
     DragEnter { window_id: u32, drag_id: u64, x: f32, y: f32, formats: Vec<String> },
@@ -594,6 +597,14 @@ impl Connection {
     pub fn drag_begin(&mut self, window_id: u32, drag_id: u64, activation: [u8; 16], formats: Vec<String>) -> io::Result<()> {
         self.send_window_managed(control::OP_DRAG_BEGIN,
             &fresco_protocol::DragBegin { window_id, drag_id, activation, formats })
+    }
+
+    /// Hold gamepad `device_id` (0: the one used last) for `window_id`
+    /// whatever has focus, or give it back (fresco-capabilities.md §4).
+    /// Needs `input.gamepad_exclusive` and the window focused. No reply:
+    /// the answer is [`Event::GamepadClaim`].
+    pub fn pad_claim(&mut self, window_id: u32, device_id: u32, claim: bool) -> io::Result<()> {
+        self.send_window_managed(control::OP_PAD_CLAIM, &fresco_protocol::PadClaim { window_id, device_id, claim })
     }
 
     /// Window management: show `child` as a credential slot at `rect`
@@ -1215,9 +1226,10 @@ fn decode_event(op: u16, payload: &[u8]) -> Event {
             },
             Err(_) => Event::Unknown { op, payload: payload.to_vec() },
         },
-        control::EV_GAMEPAD_DISCONNECT | control::EV_GAMEPAD_BUTTON | control::EV_GAMEPAD_AXIS => {
+        control::EV_GAMEPAD_DISCONNECT | control::EV_GAMEPAD_BUTTON | control::EV_GAMEPAD_AXIS | control::EV_GAMEPAD_CLAIM => {
             match decode::<fresco_protocol::GamepadEvent>(payload) {
                 Ok(p) => match op {
+                    control::EV_GAMEPAD_CLAIM => Event::GamepadClaim { window_id: p.window_id, device_id: p.device_id, held: p.value != 0 },
                     control::EV_GAMEPAD_DISCONNECT => Event::GamepadDisconnect { window_id: p.window_id, device_id: p.device_id },
                     control::EV_GAMEPAD_BUTTON => {
                         Event::GamepadButton { window_id: p.window_id, device_id: p.device_id, usage: p.usage, pressed: p.value != 0 }

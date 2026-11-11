@@ -155,9 +155,15 @@ pub enum Msg {
     EmbedToken { window: u32, token: [u8; 16] },
     /// Gamepad `device` is now `window`'s (atrium-input.md §4.1).
     PadConnect { window: u32, device: u32, vendor: u16, product: u16, buttons: u16, axes: u16, name: String },
-    /// `kind`: [`PAD_DISCONNECT`], [`PAD_BUTTON`] (value 0 or 1) or
-    /// [`PAD_AXIS`] (-32768..=32767, the hat -1..=7).
+    /// `kind`: [`PAD_DISCONNECT`], [`PAD_BUTTON`] (value 0 or 1),
+    /// [`PAD_AXIS`] (-32768..=32767, the hat -1..=7) or [`PAD_CLAIMED`]
+    /// (value 1: `window` now holds the pad exclusively; 0: it does not,
+    /// refused or ended; fresco-capabilities.md §4).
     Pad { window: u32, kind: u32, device: u32, usage: u32, value: i32 },
+    /// From the renderer: the client asks to hold gamepad `device` (0:
+    /// the one used last) for `window` whatever has focus, or (`claim`
+    /// false) gives it back.
+    PadClaim { window: u32, device: u32, claim: bool },
     /// Two video slots of `bytes` each for the layer follow as fds.
     VideoSlots { window: u32, layer: u32, bytes: u32 },
     /// The broker has copied video slot `slot` out; it may be filled again.
@@ -193,7 +199,7 @@ pub struct Refused(pub &'static str);
 /// WINDOW_CREATE's role word carries the `embed_pending` flag in this bit.
 const EMBED_PENDING_BIT: u32 = 8;
 
-pub use kind::{PAD_AXIS, PAD_BUTTON, PAD_DISCONNECT};
+pub use kind::{PAD_AXIS, PAD_BUTTON, PAD_CLAIMED, PAD_DISCONNECT};
 
 mod kind {
     pub const WINDOW_CREATE: u32 = 1;
@@ -223,6 +229,8 @@ mod kind {
     pub const PAD_DISCONNECT: u32 = 0x116;
     pub const PAD_BUTTON: u32 = 0x117;
     pub const PAD_AXIS: u32 = 0x118;
+    pub const PAD_CLAIMED: u32 = 0x119;
+    pub const PAD_CLAIM: u32 = 12;
     pub const VIDEO_RING: u32 = 7;
     pub const VIDEO_FRAME: u32 = 8;
     pub const VIDEO_PLACE: u32 = 9;
@@ -299,6 +307,7 @@ impl Msg {
             | Msg::EmbedToken { window, .. }
             | Msg::PadConnect { window, .. }
             | Msg::Pad { window, .. }
+            | Msg::PadClaim { window, .. }
             | Msg::VideoRing { window, .. }
             | Msg::VideoFrame { window, .. }
             | Msg::VideoPlace { window, .. }
@@ -477,6 +486,12 @@ impl Msg {
                 r.put(4, *value as u32);
                 r
             }
+            Msg::PadClaim { window, device, claim } => {
+                let mut r = Rec::new(PAD_CLAIM, *window);
+                r.put(2, *device);
+                r.put(3, *claim as u32);
+                r
+            }
             Msg::VideoRing { window, layer, width, height } => {
                 let mut r = Rec::new(VIDEO_RING, *window);
                 r.put(2, *layer);
@@ -597,7 +612,8 @@ impl Msg {
             EMBED_TOKEN => (0, false),
             PAD_CONNECT => (3, true),
             PAD_DISCONNECT => (1, false),
-            PAD_BUTTON | PAD_AXIS => (3, false),
+            PAD_BUTTON | PAD_AXIS | PAD_CLAIMED => (3, false),
+            PAD_CLAIM => (2, false),
             VIDEO_RING => (3, false),
             VIDEO_FRAME | VIDEO_PRESENTED => (5, false),
             VIDEO_PLACE => (6, false),
@@ -783,9 +799,10 @@ impl Msg {
                 name: title,
             },
             PAD_DISCONNECT => Msg::Pad { window, kind: k, device: r.get(2), usage: 0, value: 0 },
-            PAD_BUTTON | PAD_AXIS => {
+            PAD_CLAIM => Msg::PadClaim { window, device: r.get(2), claim: flag(r.get(3))? },
+            PAD_BUTTON | PAD_AXIS | PAD_CLAIMED => {
                 let value = r.get(4) as i32;
-                let ok = if k == PAD_BUTTON { (0..=1).contains(&value) } else { (-32768..=32767).contains(&value) };
+                let ok = if k == PAD_AXIS { (-32768..=32767).contains(&value) } else { (0..=1).contains(&value) };
                 if !ok {
                     return Err(Refused("pad value out of range"));
                 }
@@ -811,6 +828,7 @@ impl Msg {
                 | Msg::VideoPlace { .. }
                 | Msg::VideoDestroy { .. }
                 | Msg::VideoRate { .. }
+                | Msg::PadClaim { .. }
         )
     }
 }

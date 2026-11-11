@@ -60,6 +60,12 @@ mod credential;
 mod activation;
 #[path = "../socket_server.rs"]
 mod socket_server;
+/// Renderers hold no capabilities (fresco-capabilities.md §2): the front
+/// end decides them. The shared socket code's calls are no-ops here.
+mod caps {
+    pub fn admit(_id: u8, _uid: Option<u32>, _embed: bool) {}
+    pub fn forget(_id: u8) {}
+}
 
 /// The client's id inside this renderer: it is the only one.
 const CLIENT: u8 = 1;
@@ -379,6 +385,16 @@ fn main() {
             true
         }));
     }
+    // A gamepad claim goes to frescod, which holds the pads and decides.
+    {
+        let (broker, comp) = (broker.clone(), comp.clone());
+        let _ = socket_server::PAD_CLAIM.set(Box::new(move |_, c| {
+            let known = u16::try_from(c.window_id).is_ok_and(|id| id != 0 && comp.lock().unwrap().windows.contains_key(&id));
+            if known {
+                send(&broker, &Msg::PadClaim { window: c.window_id, device: c.device_id, claim: c.claim });
+            }
+        }));
+    }
     let wstream = client.try_clone().expect("clone the client socket");
     std::thread::spawn(move || socket_server::writer_loop(wstream, rx, CLIENT, None));
     {
@@ -637,6 +653,7 @@ fn from_broker(
                 let kind = match kind {
                     fresco_split::PAD_DISCONNECT => c::EV_GAMEPAD_DISCONNECT,
                     fresco_split::PAD_BUTTON => c::EV_GAMEPAD_BUTTON,
+                    fresco_split::PAD_CLAIMED => c::EV_GAMEPAD_CLAIM,
                     _ => c::EV_GAMEPAD_AXIS,
                 };
                 let _ = events.send(DisplayEvent::Gamepad { window_id: local, kind, device_id: device, usage, value });

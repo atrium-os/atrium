@@ -32,6 +32,7 @@
 //! single-window apps render correctly.
 
 mod activation;
+mod caps;
 mod credential;
 mod drag;
 mod notify;

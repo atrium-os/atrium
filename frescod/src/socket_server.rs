@@ -227,6 +227,11 @@ pub static OBSERVE: std::sync::OnceLock<fn(&DisplayEvent, &Arc<Mutex<Compositor>
 pub type DragBeginFn = Box<dyn Fn(u8, &fresco_protocol::DragBegin) -> bool + Send + Sync>;
 pub static DRAG_BEGIN: std::sync::OnceLock<DragBeginFn> = std::sync::OnceLock::new();
 
+/// What `OP_PAD_CLAIM` from a client does: frescod decides it (answering
+/// with `EV_GAMEPAD_CLAIM`), a renderer passes it to frescod.
+pub type PadClaimFn = Box<dyn Fn(u8, &fresco_protocol::PadClaim) + Send + Sync>;
+pub static PAD_CLAIM: std::sync::OnceLock<PadClaimFn> = std::sync::OnceLock::new();
+
 /// Who an event goes to (threat model §2.5.2 "input splits the same way").
 /// Every event names a window. It reaches that window's owner and the WM
 /// (TCB) only: a client never sees another client's keystrokes, pointer
@@ -445,6 +450,7 @@ fn alloc(uid: Option<u32>) -> Option<u8> {
 
 pub fn free_client_id(id: u8) {
     EMBED_ONLY.lock().unwrap()[id as usize] = false;
+    crate::caps::forget(id);
     let mut live = LIVE_CLIENTS.lock().unwrap();
     live[id as usize] = false;
     CLIENT_UID.lock().unwrap()[id as usize] = None;
@@ -495,6 +501,7 @@ fn serve_client(stream: UnixStream, uid: Option<u32>, wm_grant: bool, embed_only
         }
     };
     EMBED_ONLY.lock().unwrap()[client_id as usize] = embed_only;
+    crate::caps::admit(client_id, uid, embed_only);
     if embed_only {
         shared.frontend.lock().unwrap().mark_embed_only(client_id);
     }
@@ -632,6 +639,15 @@ pub fn reader_loop(
                     flags: flag::ASYNC_EVENT,
                     payload: fresco_protocol::encode(&end).unwrap_or_default(), fds: Vec::new(),
                 });
+            }
+            continue;
+        }
+
+        /* An exclusive gamepad claim (fresco-capabilities.md §4). No reply;
+         * the answer is EV_GAMEPAD_CLAIM. */
+        if msg.op == fresco_protocol::control::OP_PAD_CLAIM {
+            if let (Ok(c), Some(f)) = (fresco_protocol::decode::<fresco_protocol::PadClaim>(&msg.payload), PAD_CLAIM.get()) {
+                f(client_id, &c);
             }
             continue;
         }

@@ -5,6 +5,9 @@
 //! check (`GAMEPAD=1`) reads its pad lines, and the `pad-std` lines
 //! pergola-gamepad derives from them (standard names).
 //!
+//! With `PROBE_PAD_CLAIM=1` it claims the first pad it is given
+//! (fresco-capabilities.md §4) and prints `pad-claim` lines.
+//!
 //! Usage: atrium-input-probe [fresco socket] [seconds]
 
 use std::time::{Duration, Instant};
@@ -25,6 +28,7 @@ fn main() -> std::io::Result<()> {
     println!("input-probe: window {win}");
     let end = Instant::now() + Duration::from_secs(secs);
     let mut pads = pergola_gamepad::Pads::new();
+    let mut claim = std::env::var("PROBE_PAD_CLAIM").is_ok_and(|v| v == "1");
     let tok = |a: &[u8; 16]| if a.iter().any(|&b| b != 0) { "token" } else { "no-token" };
     while Instant::now() < end {
         let Some(ev) = conn.wait_event(Some(Duration::from_millis(500)))? else { continue };
@@ -49,7 +53,13 @@ fn main() -> std::io::Result<()> {
             Event::PointerScroll { window_id, dx, dy, phase } => println!("scroll window={window_id} dx={dx} dy={dy} phase={phase}"),
             Event::PointerMagnify { window_id, x, y, scale, phase } => println!("magnify window={window_id} x={x:.0} y={y:.0} scale={scale:.2} phase={phase}"),
             Event::GamepadConnect { window_id, device_id, vendor, product, buttons, axes, name } => {
-                println!("pad-connect window={window_id} device={device_id} id={vendor:04x}:{product:04x} buttons={buttons} axes={axes} name={name:?}")
+                println!("pad-connect window={window_id} device={device_id} id={vendor:04x}:{product:04x} buttons={buttons} axes={axes} name={name:?}");
+                if std::mem::take(&mut claim) {
+                    conn.pad_claim(window_id, device_id, true)?;
+                }
+            }
+            Event::GamepadClaim { window_id, device_id, held } => {
+                println!("pad-claim window={window_id} device={device_id} held={}", held as u8)
             }
             Event::GamepadDisconnect { window_id, device_id } => println!("pad-disconnect window={window_id} device={device_id}"),
             Event::GamepadButton { window_id, device_id, usage, pressed } => {

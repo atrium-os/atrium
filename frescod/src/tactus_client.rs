@@ -57,7 +57,9 @@ pub fn spawn(sink: Sender<DisplayEvent>, comp: Arc<Mutex<Compositor>>, path: Str
                         eprintln!("frescod: input from tactusd ({path})");
                         said = false;
                         let mut seat = Seat::default();
+                        *ACTIVE.lock().unwrap() = Some((seat.pads.clone(), sink.clone(), comp.clone()));
                         let e = seat.run(s, &sink, &comp);
+                        *ACTIVE.lock().unwrap() = None;
                         eprintln!("frescod: tactusd connection ended: {e}");
                         // Whatever was held is released: tactusd is gone.
                         seat.release(&sink, &comp);
@@ -88,8 +90,106 @@ struct Seat {
     magnify: Option<(u32, f32, f32, f32)>,
     /// A swipe going on: fingers and total movement so far.
     swipe: Option<(u8, f32, f32)>,
-    /// Gamepads and joysticks, by tactus device id.
-    pads: std::collections::BTreeMap<u32, Pad>,
+    /// Gamepads and joysticks, shared with the clients' claims.
+    pads: Arc<Mutex<Pads>>,
+}
+
+/// The seat's gamepads and joysticks, by tactus device id, and who holds
+/// which exclusively (fresco-capabilities.md §4).
+#[derive(Default)]
+struct Pads {
+    map: std::collections::BTreeMap<u32, Pad>,
+    /// Pad -> the window that claimed it: it goes there whatever has focus.
+    claims: std::collections::BTreeMap<u32, u32>,
+    /// The pad that sent input last; a claim of device 0 takes it.
+    recent: Option<u32>,
+}
+
+/// The connected seat's pads and where its events go, for claims.
+type Active = (Arc<Mutex<Pads>>, Sender<DisplayEvent>, Arc<Mutex<Compositor>>);
+static ACTIVE: Mutex<Option<Active>> = Mutex::new(None);
+
+/// `OP_PAD_CLAIM` from client `client` (fresco-capabilities.md §4): answered
+/// with `EV_GAMEPAD_CLAIM` to `window` unless the window is not the client's.
+pub fn claim(client: u8, window: u32, device: u32, on: bool) {
+    let active = ACTIVE.lock().unwrap().clone();
+    match active {
+        Some((pads, sink, comp)) => {
+            pads.lock().unwrap().claim(&sink, &comp, client, crate::caps::of(client), window, device, on);
+        }
+        // No tactusd, so no pads to hold.
+        None => log::info!("frescod: client {client}: pad claim with no input service"),
+    }
+}
+
+/// The window pad `id` goes to now: the one holding it, else the focused
+/// window if its app may have gamepads (`input.gamepad`), else none.
+fn pad_target(claims: &std::collections::BTreeMap<u32, u32>, id: u32, comp: &Mutex<Compositor>) -> u32 {
+    let g = comp.lock().unwrap();
+    if let Some(&w) = claims.get(&id) {
+        if u16::try_from(w).is_ok_and(|w| g.windows.contains_key(&w)) {
+            return w;
+        }
+    }
+    let w = g.keyboard_window();
+    let owner = u16::try_from(w).ok().and_then(|i| g.windows.get(&i)).map(|x| x.owner);
+    match owner {
+        Some(o) if crate::caps::of(o as u8).has(crate::caps::Caps::GAMEPAD) => w,
+        _ => 0,
+    }
+}
+
+impl Pads {
+    /// Hold or give back a pad; see [`claim`].
+    #[allow(clippy::too_many_arguments)]
+    fn claim(&mut self, sink: &Sender<DisplayEvent>, comp: &Mutex<Compositor>, client: u8, caps: crate::caps::Caps, window: u32, device: u32, on: bool) {
+        let (owned, focused) = {
+            let g = comp.lock().unwrap();
+            let owned = u16::try_from(window).ok().and_then(|w| g.windows.get(&w)).is_some_and(|w| w.owner as u8 == client && window != 0);
+            (owned, g.keyboard_window() == window)
+        };
+        if !owned {
+            log::info!("frescod: client {client}: pad claim for window {window}, not its own");
+            return;
+        }
+        let dev = if device == 0 { self.recent.unwrap_or(0) } else { device };
+        let tell = |held: bool| {
+            let _ = sink.send(DisplayEvent::Gamepad { window_id: window, kind: control::EV_GAMEPAD_CLAIM, device_id: dev, usage: 0, value: i32::from(held) });
+        };
+        if !on {
+            if self.claims.get(&dev) == Some(&window) {
+                self.claims.remove(&dev);
+                let target = pad_target(&self.claims, dev, comp);
+                if let Some(p) = self.map.get_mut(&dev) {
+                    if p.owner.is_some() {
+                        pad_follow(sink, dev, p, target);
+                    }
+                }
+            }
+            tell(false);
+            return;
+        }
+        let why = if !caps.has(crate::caps::Caps::GAMEPAD_EXCLUSIVE) {
+            Some("no input.gamepad_exclusive grant")
+        } else if !focused {
+            Some("window not focused")
+        } else if !self.map.contains_key(&dev) {
+            Some("no such pad")
+        } else if self.claims.get(&dev).is_some_and(|&w| w != window && pad_target(&self.claims, dev, comp) == w) {
+            Some("held by another window")
+        } else {
+            None
+        };
+        if let Some(why) = why {
+            log::info!("frescod: client {client}: claim of pad {dev} for window {window} refused: {why}");
+            tell(false);
+            return;
+        }
+        self.claims.insert(dev, window);
+        let p = self.map.get_mut(&dev).expect("checked");
+        pad_follow(sink, dev, p, window);
+        tell(true);
+    }
 }
 
 /// A gamepad (spec §4.1): it belongs to the focused window, which got
@@ -162,12 +262,13 @@ impl Seat {
             Message::Device { id, bus, classes, name, vendor, product } => {
                 eprintln!("frescod: input device {id} {name:?} ({bus:?}, {classes:?})");
                 if classes.iter().any(|c| matches!(c, tactus::wire::Class::Gamepad | tactus::wire::Class::Joystick)) {
-                    self.pads.insert(id, Pad { name, vendor, product, ..Pad::default() });
+                    self.pads.lock().unwrap().map.insert(id, Pad { name, vendor, product, ..Pad::default() });
                 }
             }
             Message::PadLayout { id, buttons, axes } => {
-                let target = comp.lock().unwrap().keyboard_window();
-                if let Some(p) = self.pads.get_mut(&id) {
+                let mut pads = self.pads.lock().unwrap();
+                let target = pad_target(&pads.claims, id, comp);
+                if let Some(p) = pads.map.get_mut(&id) {
                     p.buttons = u16::try_from(buttons.len()).unwrap_or(u16::MAX);
                     p.axes = u16::try_from(axes.len()).unwrap_or(u16::MAX);
                     // Plugged in: the focused window has it from now.
@@ -175,8 +276,10 @@ impl Seat {
                 }
             }
             Message::PadButton { id, usage, down, .. } => {
-                let target = comp.lock().unwrap().keyboard_window();
-                let Some(p) = self.pads.get_mut(&id) else { return };
+                let mut pads = self.pads.lock().unwrap();
+                let target = pad_target(&pads.claims, id, comp);
+                pads.recent = Some(id);
+                let Some(p) = pads.map.get_mut(&id) else { return };
                 pad_follow(sink, id, p, target);
                 let Some(window_id) = p.owner else { return };
                 if down {
@@ -193,8 +296,10 @@ impl Seat {
                 let _ = sink.send(DisplayEvent::Gamepad { window_id, kind: control::EV_GAMEPAD_BUTTON, device_id: id, usage, value: i32::from(down) });
             }
             Message::PadAxis { id, usage, value, .. } => {
-                let target = comp.lock().unwrap().keyboard_window();
-                let Some(p) = self.pads.get_mut(&id) else { return };
+                let mut pads = self.pads.lock().unwrap();
+                let target = pad_target(&pads.claims, id, comp);
+                pads.recent = Some(id);
+                let Some(p) = pads.map.get_mut(&id) else { return };
                 match p.state.iter_mut().find(|(u, _)| *u == usage) {
                     Some((_, v)) => *v = value,
                     None => p.state.push((usage, value)),
@@ -328,7 +433,12 @@ impl Seat {
             }
             Message::Gone { id } => {
                 eprintln!("frescod: input device {id} gone");
-                if let Some(mut p) = self.pads.remove(&id) {
+                let mut pads = self.pads.lock().unwrap();
+                pads.claims.remove(&id);
+                if pads.recent == Some(id) {
+                    pads.recent = None;
+                }
+                if let Some(mut p) = pads.map.remove(&id) {
                     pad_follow(sink, id, &mut p, 0);
                 }
             }
@@ -337,15 +447,14 @@ impl Seat {
     }
 
     /// Hand every gamepad to the focused window, if focus moved (a click
-    /// or a key usually moves it, so this runs after each).
+    /// or a key usually moves it, so this runs after each), unless a
+    /// window holds it.
     fn pads_follow(&mut self, sink: &Sender<DisplayEvent>, comp: &Arc<Mutex<Compositor>>) {
-        if self.pads.values().all(|p| p.owner.is_none()) {
-            return;
-        }
-        let target = comp.lock().unwrap().keyboard_window();
-        for (&id, p) in self.pads.iter_mut() {
+        let mut pads = self.pads.lock().unwrap();
+        let Pads { map, claims, .. } = &mut *pads;
+        for (&id, p) in map.iter_mut() {
             if p.owner.is_some() {
-                pad_follow(sink, id, p, target);
+                pad_follow(sink, id, p, pad_target(claims, id, comp));
             }
         }
     }
@@ -432,7 +541,9 @@ impl Seat {
         for b in std::mem::take(&mut self.buttons) {
             self.button(sink, comp, b, false);
         }
-        for (id, mut p) in std::mem::take(&mut self.pads) {
+        let mut pads = self.pads.lock().unwrap();
+        pads.claims.clear();
+        for (id, mut p) in std::mem::take(&mut pads.map) {
             pad_follow(sink, id, &mut p, 0);
         }
         self.mods = 0;
@@ -504,6 +615,8 @@ mod tests {
             g.set_focus_no_raise(Some(a));
             (u32::from(a), u32::from(b))
         };
+        crate::caps::set(1, crate::caps::Caps::GAMEPAD);
+        crate::caps::set(2, crate::caps::Caps::GAMEPAD);
         let (tx, rx) = channel();
         let mut seat = Seat::default();
         let ev = |rx: &std::sync::mpsc::Receiver<DisplayEvent>| -> Vec<(u32, u16, u32, i32)> {
@@ -542,6 +655,89 @@ mod tests {
         assert_eq!(ev(&rx), vec![]);
         seat.handle(Message::Gone { id: 7 }, &tx, &comp);
         assert_eq!(ev(&rx), vec![(b, control::EV_GAMEPAD_DISCONNECT, 0, 0)]);
+    }
+
+    /// fresco-capabilities.md §3-§4: a pad reaches only apps granted
+    /// `input.gamepad`; a claim holds it across focus, needs the exclusive
+    /// grant and focus, cannot take a held pad, and gives it back to focus.
+    #[test]
+    fn gamepad_grants_and_exclusive_claims() {
+        use crate::caps::{self, Caps};
+        let comp = Arc::new(Mutex::new(Compositor::new()));
+        let (a, b, c) = {
+            let mut g = comp.lock().unwrap();
+            let a = g.create(3, (100, 100));
+            let b = g.create(4, (100, 100));
+            let c = g.create(5, (100, 100));
+            g.set_focus_no_raise(Some(a));
+            (u32::from(a), u32::from(b), u32::from(c))
+        };
+        caps::set(3, Caps::GAMEPAD.union(Caps::GAMEPAD_EXCLUSIVE));
+        caps::set(4, Caps::GAMEPAD);
+        caps::set(5, Caps::NONE);
+        let (tx, rx) = channel();
+        let mut seat = Seat::default();
+        let ev = |rx: &std::sync::mpsc::Receiver<DisplayEvent>| -> Vec<(u32, u16, i32)> {
+            rx.try_iter()
+                .map(|e| match e {
+                    DisplayEvent::GamepadConnect { window_id, .. } => (window_id, control::EV_GAMEPAD_CONNECT, 0),
+                    DisplayEvent::Gamepad { window_id, kind, value, .. } => (window_id, kind, value),
+                    e => panic!("{e:?}"),
+                })
+                .collect()
+        };
+        let focus = |w: u32| comp.lock().unwrap().set_focus_no_raise(Some(w as u16));
+        let dev = Message::Device { id: 7, bus: tactus::wire::Bus::Usb, classes: vec![tactus::wire::Class::Gamepad], vendor: 1, product: 2, name: "pad".into() };
+        seat.handle(dev, &tx, &comp);
+        seat.handle(Message::PadLayout { id: 7, buttons: vec![0x0009_0001], axes: vec![] }, &tx, &comp);
+        assert_eq!(ev(&rx), vec![(a, control::EV_GAMEPAD_CONNECT, 0)]);
+        // c has no input.gamepad: the pad leaves a and goes to no one.
+        focus(c);
+        seat.handle(Message::PadButton { id: 7, ts_ns: 0, usage: 0x0009_0001, down: true }, &tx, &comp);
+        assert_eq!(ev(&rx), vec![(a, control::EV_GAMEPAD_DISCONNECT, 0)]);
+        seat.handle(Message::PadButton { id: 7, ts_ns: 0, usage: 0x0009_0001, down: false }, &tx, &comp);
+        // a claims the pad it used last (device 0), unfocused: refused.
+        let pads = seat.pads.clone();
+        let claim = |client: u8, w: u32, on: bool| pads.lock().unwrap().claim(&tx, &comp, client, caps::of(client), w, 0, on);
+        claim(3, a, true);
+        assert_eq!(ev(&rx), vec![(a, control::EV_GAMEPAD_CLAIM, 0)]);
+        // Focused, it holds the pad; it stays when focus moves to b.
+        focus(a);
+        claim(3, a, true);
+        assert_eq!(ev(&rx), vec![(a, control::EV_GAMEPAD_CONNECT, 0), (a, control::EV_GAMEPAD_CLAIM, 1)]);
+        focus(b);
+        seat.pads_follow(&tx, &comp);
+        seat.handle(Message::PadButton { id: 7, ts_ns: 0, usage: 0x0009_0001, down: true }, &tx, &comp);
+        assert_eq!(ev(&rx), vec![(a, control::EV_GAMEPAD_BUTTON, 1)]);
+        // b has no exclusive grant; and a claim for another app's window
+        // gets no answer at all.
+        claim(4, b, true);
+        claim(4, a, true);
+        assert_eq!(ev(&rx), vec![(b, control::EV_GAMEPAD_CLAIM, 0)]);
+        // a gives it back: the pad follows focus to b.
+        claim(3, a, false);
+        assert_eq!(
+            ev(&rx),
+            vec![
+                (a, control::EV_GAMEPAD_BUTTON, 0),
+                (a, control::EV_GAMEPAD_DISCONNECT, 0),
+                (b, control::EV_GAMEPAD_CONNECT, 0),
+                (a, control::EV_GAMEPAD_CLAIM, 0),
+            ]
+        );
+        // A held pad cannot be taken: a holds it, then (as if granted) b,
+        // focused, tries.
+        focus(a);
+        claim(3, a, true);
+        let _ = ev(&rx);
+        focus(b);
+        caps::set(4, Caps::GAMEPAD.union(Caps::GAMEPAD_EXCLUSIVE));
+        claim(4, b, true);
+        assert_eq!(ev(&rx), vec![(b, control::EV_GAMEPAD_CLAIM, 0)]);
+        // Unplugged: the claim goes with it.
+        seat.handle(Message::Gone { id: 7 }, &tx, &comp);
+        assert_eq!(ev(&rx), vec![(a, control::EV_GAMEPAD_DISCONNECT, 0)]);
+        assert!(seat.pads.lock().unwrap().claims.is_empty());
     }
 
     #[test]

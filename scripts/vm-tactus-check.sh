@@ -42,6 +42,10 @@ set -u
 TD=$1 FD=$2 PROBE=$3 CON=${4:-}
 PS2=${PS2:-0}
 GAMEPAD=${GAMEPAD:-0}
+# CLAIM=1 (with GAMEPAD=1): window 1's app is granted input.gamepad_exclusive
+# through a test launch registry and policy, claims the pad, and keeps it when
+# window 2 takes focus (docs/spec/fresco-capabilities.md §4).
+CLAIM=${CLAIM:-0}
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
 VMDIR=${VMDIR:-$HOME/atrium-vm-amd64}
 K="-i $HOME/.ssh/fresco_bsd_ed25519 -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR"
@@ -103,17 +107,29 @@ ls -l /atrium/sockets/tactus/
 EOF
 
 echo "== frescod (headless) and the probe window"
-V "GAMEPAD=$GAMEPAD sh -s" <<'EOF'
+V "GAMEPAD=$GAMEPAD CLAIM=$CLAIM sh -s" <<'EOF'
 cd /root/t
 rm -rf /tmp/hl /tmp/frescod-t.log; mkdir -p /tmp/hl /atrium/sockets/fresco
 SPLIT="FRESCOD_SPLIT=0"
 [ "$GAMEPAD" = 1 ] && SPLIT="FRESCOD_SPLIT=1 FRESCOD_RENDERER=compute FRESCOD_RENDERER_LAUNCHER=unconfined"
-daemon -f -o /tmp/frescod-t.log env FRESCOD_HEADLESS_PNG=/tmp/hl/f $SPLIT FRESCOD_SOCK=/tmp/fresco-t.sock FRESCOD_WM_SOCK=/tmp/fresco-wm-t.sock ./frescod
+CAPS="FRESCOD_APP_REGISTRY=/tmp/capreg/none"
+CLAIMENV=""
+if [ "$CLAIM" = 1 ]; then
+  # The probes run as root: name root's uid as an app, granted the pad.
+  rm -rf /tmp/capreg /tmp/cappol; mkdir -p /tmp/capreg /tmp/cappol/root
+  echo "0 root org.test.game" > /tmp/capreg/registry
+  printf '%s\n' '[grants."org.test.game"]' 'manifest_hash = "test"' 'granted_at = "test"' \
+    '[grants."org.test.game".capabilities]' 'graphics = "fresco"' 'input.gamepad = true' 'input.gamepad_exclusive = true' \
+    > /tmp/cappol/root/policy.toml
+  CAPS="FRESCOD_APP_REGISTRY=/tmp/capreg/registry ATRIUM_POLICY_BASE=/tmp/cappol"
+  CLAIMENV="PROBE_PAD_CLAIM=1"
+fi
+daemon -f -o /tmp/frescod-t.log env FRESCOD_HEADLESS_PNG=/tmp/hl/f $SPLIT $CAPS FRESCOD_SOCK=/tmp/fresco-t.sock FRESCOD_WM_SOCK=/tmp/fresco-wm-t.sock ./frescod
 sleep 8
 grep -E "tactus|input" /tmp/frescod-t.log | head -5
 S=$(grep -o "/[^ ]*fresco[^ ]*\.sock" /tmp/frescod-t.log | head -1); [ -S /tmp/fresco-t.sock ] && S=/tmp/fresco-t.sock
 echo "  frescod socket $S"
-rm -f /tmp/probe.log; daemon -f -o /tmp/probe.log ./atrium-input-probe $S 600
+rm -f /tmp/probe.log; daemon -f -o /tmp/probe.log env $CLAIMENV ./atrium-input-probe $S 600
 sleep 5; cat /tmp/probe.log
 EOF
 
@@ -133,12 +149,22 @@ i=0; until grep -q "detached" /tmp/pad.log || [ $i -ge 90 ]; do sleep 1; i=$((i+
 sleep 3
 cat /tmp/pad.log
 EOF
-  V 'grep -E "^pad-(connect|disconnect|button|axis) " /tmp/probe.log' > /tmp/tactus-pad1.log
-  V 'grep -E "^pad-(connect|disconnect|button|axis) " /tmp/probe2.log' > /tmp/tactus-pad2.log
+  V 'grep -E "^pad-(connect|disconnect|button|axis|claim) " /tmp/probe.log' > /tmp/tactus-pad1.log
+  V 'grep -E "^pad-(connect|disconnect|button|axis|claim) " /tmp/probe2.log' > /tmp/tactus-pad2.log
   V 'grep "^pad-std " /tmp/probe.log' > /tmp/tactus-std1.log
   V 'grep "^pad-std " /tmp/probe2.log' > /tmp/tactus-std2.log
   echo "-- window 1"; cat /tmp/tactus-pad1.log; echo "-- window 2"; cat /tmp/tactus-pad2.log
   P1=/tmp/tactus-pad1.log P2=/tmp/tactus-pad2.log
+  if [ "$CLAIM" = 1 ]; then
+    V 'grep "input caps" /tmp/frescod-t.log | head -3'
+    grep -q 'pad-connect .*name="Fake Pad"' $P1 && ok "window 1: connect" || bad "window 1 connect"
+    grep -q "pad-claim .*held=1" $P1 && ok "window 1: claim granted" || bad "window 1 claim not granted"
+    grep -q "pad-button .*usage=0x00090002 pressed=1" $P1 && grep -q "pad-button .*usage=0x00090002 pressed=0" $P1 && ok "window 1: button 2 after window 2 took focus" || bad "window 1 lost the claimed pad"
+    tail -1 $P1 | grep -q "pad-disconnect" && ok "window 1: disconnect on detach" || bad "window 1 detach"
+    [ -s $P2 ] && bad "window 2 got pad events while window 1 held the pad" || ok "window 2: nothing while the pad is held"
+    echo "tactus: $fails failed"
+    exit $fails
+  fi
   grep -q 'pad-connect .*id=1234:5678 buttons=15 axes=7 name="Fake Pad"' $P1 && ok "window 1: connect with counts and name" || bad "window 1 connect"
   grep -q "pad-axis .*usage=0x00010030 value=32767" $P1 && ok "window 1: stick right" || bad "window 1 stick"
   grep -q "pad-button .*usage=0x00090001 pressed=1" $P1 && grep -q "pad-button .*usage=0x00090001 pressed=0" $P1 && ok "window 1: button 1 press and release" || bad "window 1 button 1"
