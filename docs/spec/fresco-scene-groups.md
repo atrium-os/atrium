@@ -284,7 +284,9 @@ Pergola thread's, except 5 and 6.
 4. `SCROLL` shift in the pixel-mode renderer; Pergola `ScrollView`; judged with the scroll harness
    against the §10.1 gates. Renderer half done (442cd94). **Pergola half done 2026-11-06**: the
    prototype ScrollView builds the §4 shape and passes the 60 Hz gates in the harness
-   (pergola.md §10.5).
+   (pergola.md §10.5). GPU renderer shift done 2026-11-11 (e9c903e); live gpusim run the same day
+   (`scripts/vm-gpu-scroll.sh`): shifted and redrawn frames both equal the compute renderer's
+   screen bit for bit.
 5. `ISOLATE` (exact group opacity: draw the group to its own buffer, then blend), moved up at the
    Navigator thread's request: a faded card is the commonest case and multiplied alpha gets it
    wrong. Renderer work, Fresco owners. **Done 2026-11-11** as a per-pixel layer in the raster

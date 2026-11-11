@@ -4,7 +4,9 @@
 //! wave every tenth row), and a floating button drawn over it. Each frame
 //! moves only the content group.
 //!
-//! Usage: atrium-scroll-demo [SOCK] [SECONDS] [PX_PER_FRAME] [FPS]
+//! Usage: atrium-scroll-demo [SOCK] [SECONDS] [PX_PER_FRAME] [FPS] [FRAMES]
+//! FRAMES > 0 stops scrolling after that many frames and holds the window
+//! until SECONDS pass, so a screenshot can be compared across renderers.
 //! A whole-pixel step lets the renderer shift; a fractional one (6.5)
 //! makes it draw the viewport in full, for comparison.
 
@@ -30,6 +32,7 @@ fn main() -> std::io::Result<()> {
     let secs: u64 = args.next().and_then(|s| s.parse().ok()).unwrap_or(600);
     let step: f32 = args.next().and_then(|s| s.parse().ok()).unwrap_or(7.0);
     let fps: u64 = args.next().and_then(|s| s.parse().ok()).unwrap_or(30);
+    let frames: u64 = args.next().and_then(|s| s.parse().ok()).unwrap_or(0);
     let mut conn = Connection::connect(&sock)?;
     let win = conn.window_create(900, 600, "scrolling", WindowHints::default())?;
     conn.set_default_window(win as u16);
@@ -85,6 +88,10 @@ fn main() -> std::io::Result<()> {
     let mut frame = 0u64;
     while start.elapsed() < Duration::from_secs(secs) {
         std::thread::sleep(Duration::from_millis(1000 / fps));
+        if frames > 0 && frame >= frames {
+            while conn.poll_event()?.is_some() {}
+            continue;
+        }
         off += dir * step;
         if off < -max || off > 0.0 {
             dir = -dir;
@@ -99,7 +106,7 @@ fn main() -> std::io::Result<()> {
             }
         }
         frame += 1;
-        if frame % 100 == 0 {
+        if frame % 100 == 0 || frame == frames {
             eprintln!("frame {frame}: offset {off}");
         }
     }
