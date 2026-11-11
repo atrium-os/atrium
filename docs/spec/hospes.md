@@ -453,7 +453,7 @@ to four days. It needs the user's consent to download the two libraries (§14 de
 | Step | What | Done when | Estimate |
 |---|---|---|---|
 | H0 ✔ | Measure both libraries on Linux (§10) | done 2026-11-11: `docs/reviews/2026-11-11-hospes-h0.md`, data in `hospes/probe/h0-data/` | — |
-| H1 ✔ | `hospes-elf`, `hospes-rt`: parse, map, relocate, TLS, threads, allocator; loader fixtures pass on FreeBSD arm64 and amd64 | §11.1 and §11.2 green; isolation probe green | done 2026-11-11: `docs/reviews/2026-11-11-hospes-h1.md` (fixtures `-nostdlib` for now; glibc-built ones with H2) |
+| H1 ✔ | `hospes-elf`, `hospes-rt`: parse, map, relocate, TLS, threads, allocator; loader fixtures pass on FreeBSD arm64 and amd64 | §11.1 and §11.2 green; isolation probe green | done 2026-11-11: `docs/reviews/2026-11-11-hospes-h1.md` (fixtures `-nostdlib` for now; glibc-built ones and the §11.2 layout check move to H2 with the shim's `glibc-abi` structs) |
 | H2 | `hospes-glibc` for OpenH264's import set; `hospes-codec`; player integration behind the H.264 build feature | conformance MD5s match Linux (§11.5); player plays an H.264 MP4 in the VM | 2–3 weeks |
 | H3 | `hospes-proto`, `hospes-cdm` with the test CDM; CENC/CBCS info from the demuxers; control and data channels; per-origin store | Clear Key content plays through Hospes; outputs equal the Linux reference host | 3 weeks |
 | H4 | Widevine: shim extended to its imports, provisioning flow, install route, public test content | Shaka's Widevine test stream plays in the amd64 VM | 3–4 weeks |
