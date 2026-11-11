@@ -210,6 +210,14 @@ pub mod control {
     /// A three- or four-finger touchpad swipe, to the WM only
     /// ([`InputSwipeEvent`]).
     pub const EV_INPUT_SWIPE:           u16 = 0x0705;
+    /// Gamepads (docs/spec/atrium-input.md §4.1, §5.4): to the focused
+    /// window, which gets `CONNECT` when a pad becomes its own and
+    /// `DISCONNECT` when it stops being so ([`GamepadConnectEvent`],
+    /// [`GamepadEvent`]).
+    pub const EV_GAMEPAD_CONNECT:       u16 = 0x0706;
+    pub const EV_GAMEPAD_DISCONNECT:    u16 = 0x0707;
+    pub const EV_GAMEPAD_BUTTON:        u16 = 0x0708;
+    pub const EV_GAMEPAD_AXIS:          u16 = 0x0709;
 
     // ── Drag and drop between windows (docs/spec/tabula.md §4) ──
     /// Client → server, no reply: start dragging from the client's window
@@ -1172,6 +1180,41 @@ pub struct InputSwipeEvent {
     pub dy: f32,
     /// [`scroll_phase`] `BEGIN`, `UPDATE` or `END`.
     pub phase: u8,
+}
+
+/// `EV_GAMEPAD_CONNECT` — a gamepad or joystick is now this window's: it
+/// gets the pad's events until `EV_GAMEPAD_DISCONNECT` (the pad was
+/// unplugged, or the window lost focus). Every axis follows at once as an
+/// `EV_GAMEPAD_AXIS`, so the window knows where the sticks are.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct GamepadConnectEvent {
+    pub window_id: u32,
+    /// The pad, the same number in all its events (per session).
+    pub device_id: u32,
+    pub vendor: u16,
+    pub product: u16,
+    /// How many buttons and axes (the hat counts as one) its descriptor
+    /// has.
+    pub buttons: u16,
+    pub axes: u16,
+    /// As the device names itself, at most 63 bytes.
+    pub name: String,
+}
+
+/// `EV_GAMEPAD_DISCONNECT`, `EV_GAMEPAD_BUTTON`, `EV_GAMEPAD_AXIS`: one
+/// control of pad `device_id`, named by its HID usage (`page << 16 |
+/// id`) as the descriptor gives it; the wire maps nothing to "A" or
+/// "start" (§5.4).
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct GamepadEvent {
+    pub window_id: u32,
+    pub device_id: u32,
+    /// The button or axis (0 for `DISCONNECT`).
+    pub usage: u32,
+    /// `BUTTON`: 1 pressed, 0 released. `AXIS`: the logical range scaled
+    /// to -32768..=32767; the hat switch (`0x0001_0039`) is 0..=7
+    /// clockwise from up, or -1 centred.
+    pub value: i32,
 }
 
 /// `InputPointerScrollEvent::phase` values (also the phases of
@@ -2304,6 +2347,10 @@ mod tests {
             control::EV_INPUT_POINTER_SCROLL,
             control::EV_INPUT_POINTER_MAGNIFY,
             control::EV_INPUT_SWIPE,
+            control::EV_GAMEPAD_CONNECT,
+            control::EV_GAMEPAD_DISCONNECT,
+            control::EV_GAMEPAD_BUTTON,
+            control::EV_GAMEPAD_AXIS,
             control::OP_DRAG_BEGIN,
             control::OP_WM_CREDENTIAL_SLOT,
             control::EV_DRAG_ENTER,

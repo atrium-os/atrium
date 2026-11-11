@@ -46,6 +46,14 @@ pub enum Message {
     /// A touchpad swipe (three or more fingers, pixels) or pinch (two,
     /// `scale` against the start).
     Gesture { id: u32, ts_ns: u64, kind: GestureKind, fingers: u8, phase: Phase, dx: f32, dy: f32, scale: f32 },
+    /// Sent after `Device` for a gamepad or joystick: its buttons and
+    /// axes by HID usage, in descriptor order (spec §4.1 GAMEPAD_CONNECT).
+    PadLayout { id: u32, buttons: Vec<u32>, axes: Vec<u32> },
+    /// A gamepad button, by the usage the descriptor gives it.
+    PadButton { id: u32, ts_ns: u64, usage: u32, down: bool },
+    /// A gamepad axis: the logical range scaled to -32768..=32767; the hat
+    /// switch (0x0001_0039) is 0..=7 clockwise from up, or -1 centred.
+    PadAxis { id: u32, ts_ns: u64, usage: u32, value: i16 },
 }
 
 pub fn write(w: &mut impl Write, m: &Message) -> io::Result<()> {
@@ -91,6 +99,9 @@ mod tests {
             Message::Key { id: 3, ts_ns: 9, usage: 0x0007_0004, down: true, repeat: false },
             Message::Motion { id: 3, ts_ns: 10, dx: 1.5, dy: -2.0, raw_dx: 1, raw_dy: -1 },
             Message::Scroll { id: 3, ts_ns: 11, axis: Axis::Vertical, value_120: -120 },
+            Message::PadLayout { id: 4, buttons: vec![0x0009_0001], axes: vec![0x0001_0030, 0x0001_0039] },
+            Message::PadButton { id: 4, ts_ns: 12, usage: 0x0009_0001, down: true },
+            Message::PadAxis { id: 4, ts_ns: 13, usage: 0x0001_0030, value: -32768 },
         ];
         let mut buf = Vec::new();
         for m in &ms {

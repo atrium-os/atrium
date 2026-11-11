@@ -216,6 +216,17 @@ Axis     { id, ts_ns, usage, value: i16 }          // gamepads
 Raw      { id, ts_ns, report }                     // Raw class only
 ```
 
+*Built (T5):* gamepads use three messages instead of `Axis`:
+
+```
+PadLayout { id, buttons, axes }                    // after Device
+PadButton { id, ts_ns, usage, down }
+PadAxis   { id, ts_ns, usage, value: i16 }
+```
+
+so frescod knows a pad (and its counts) from the first message and can
+replay held buttons and axis state when the pad changes owner.
+
 `value_120` is the high-resolution wheel convention (120 per detent).
 Usages are full 32-bit page:usage, so media keys (`0x000C_00CD`) need
 no `0x0C00|` packing on this hop; frescod keeps the current packing
@@ -327,6 +338,21 @@ GAMEPAD_AXIS        device_id, ts_ns, hid_usage, value
 No `window_id` — gamepad events route to whoever has the gamepad
 exclusively granted (see §6.3) or to the focused window if no
 exclusive grant.
+
+*Built (T5, 2026-11-11):* `EV_GAMEPAD_CONNECT` 0x0706 carries
+`window_id, device_id, vendor, product, buttons, axes, name` (≤63
+bytes); per-axis ranges are not sent because every axis is already
+scaled to -32768..32767 (the hat, `0x0001_0039`, is 0..7 clockwise from
+up and -1 centred). `EV_GAMEPAD_DISCONNECT` 0x0707, `EV_GAMEPAD_BUTTON`
+0x0708 and `EV_GAMEPAD_AXIS` 0x0709 share one record
+`{window_id, device_id, usage, value: i32}`; `window_id` names the
+receiving window. A pad follows keyboard focus: the old owner gets
+releases for held buttons and `DISCONNECT`, the new owner gets
+`CONNECT` and a snapshot of every axis. Events go to the owner only,
+never to the WM. Split mode carries them as `PAD_*` records. Buttons
+are page 9 plus Generic Desktop 0x90–0x93 (D-pad). Exclusive grants
+and the `input.gamepad` capability wait on per-app capabilities in
+frescod; until then any focused window gets the pad.
 
 #### Touch ops (deferred)
 
@@ -525,6 +551,15 @@ zoomable views. The wire to apps stays HID-faithful.
    (`MOUSE_SETLEVEL 2`) from Synaptics, Elantech and ALPS touchpads as
    contacts for the touchpad stage, waits on a laptop to test against.
 5. **T5 Gamepads.** Rev. 1 §4.4/§5.3, plus exclusive grants.
+   *Built (2026-11-11), except exclusive grants:* Tactus decodes Game
+   Pad and Joystick collections (§4.0 `PadLayout`/`PadButton`/
+   `PadAxis`), frescod routes them to the focused window (§4.1), and
+   `fresco-client` exposes `Event::Gamepad*`. VM run: unjailed tactusd
+   fed by `tactus/examples/fake-pad.rs` (a stand-in vinculumd playing an
+   LE gamepad) and two `input-probe` windows; the pad moved between them
+   with releases, snapshot and disconnect as specified. Not yet run: the
+   jailed tactusd path, split mode end to end (record round-trips
+   only), a real USB pad. Exclusive grants wait on capabilities.
 6. **T6 Bluetooth HID source**, once the Bluetooth service exists.
    *Built (tactusd side, 2026-11-07):* tactusd connects to vinculumd's
    `hid.sock` (`TACTUS_BLUETOOTH_SOCKET`, retry every 2 s) with the

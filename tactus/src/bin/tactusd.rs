@@ -54,7 +54,8 @@ struct State {
     /// soon after it are palms (the typing hand), not pointing.
     last_key: Option<Instant>,
     clients: Vec<UnixStream>,
-    devices: HashMap<u32, Message>,
+    /// Each device's `Device` (and `PadLayout`), for new clients.
+    devices: HashMap<u32, Vec<Message>>,
     repeat: Repeat,
 }
 
@@ -195,11 +196,7 @@ fn scan(hub: &Arc<Hub>, devs: &Arc<Mutex<Devices>>) {
         let classes = dec.descriptor().classes();
         eprintln!("tactusd: device {id} {path}: {name:?} {bus:?} {vendor:04x}:{product:04x} {classes:?}");
         let rec = Message::Device { id, bus, classes, vendor, product, name };
-        {
-            let mut s = hub.state.lock().unwrap();
-            s.send(&rec);
-            s.devices.insert(id, rec);
-        }
+        announce(hub, id, rec, &dec);
         let (hub, devs) = (hub.clone(), devs.clone());
         let _ = std::thread::Builder::new().name(format!("tactus:{path}")).spawn(move || {
             read_device(&hub, id, file, dec);
@@ -207,6 +204,20 @@ fn scan(hub: &Arc<Hub>, devs: &Arc<Mutex<Devices>>) {
             devs.lock().unwrap().claimed.remove(&path);
         });
     }
+}
+
+/// Tell clients about device `id` (and a gamepad's layout), and keep the
+/// records for clients that connect later.
+fn announce(hub: &Hub, id: u32, rec: Message, dec: &Decoder) {
+    let mut recs = vec![rec];
+    if let Some(l) = dec.pad_layout() {
+        recs.push(Message::PadLayout { id, buttons: l.buttons, axes: l.axes });
+    }
+    let mut s = hub.state.lock().unwrap();
+    for r in &recs {
+        s.send(r);
+    }
+    s.devices.insert(id, recs);
 }
 
 fn read_device(hub: &Hub, id: u32, mut file: File, dec: Decoder) {
@@ -291,6 +302,8 @@ fn run_device(hub: &Hub, id: u32, mut dec: impl Source, keyboard: bool, mut read
                 }
                 Input::Absolute { x, y } => Message::Absolute { id, ts_ns, x, y },
                 Input::Scroll { axis, detents } => Message::Scroll { id, ts_ns, axis, value_120: detents.saturating_mul(120) },
+                Input::PadButton { usage, down } => Message::PadButton { id, ts_ns, usage, down },
+                Input::PadAxis { usage, value } => Message::PadAxis { id, ts_ns, usage, value },
             };
             s.send(&m);
         }
@@ -319,6 +332,7 @@ fn release(hub: &Hub, id: u32, dec: &mut impl Source, ev: &mut Vec<Input>, keybo
         match e {
             Input::Key { usage, .. } => s.send(&Message::Key { id, ts_ns, usage, down: false, repeat: false }),
             Input::Button { usage, .. } => s.send(&Message::Button { id, ts_ns, usage, down: false }),
+            Input::PadButton { usage, .. } => s.send(&Message::PadButton { id, ts_ns, usage, down: false }),
             _ => {}
         }
     }
@@ -411,7 +425,7 @@ fn ps2_start(hub: &Arc<Hub>, devs: &Arc<Mutex<Devices>>, path: &'static str, mut
     {
         let mut s = hub.state.lock().unwrap();
         s.send(&rec);
-        s.devices.insert(id, rec);
+        s.devices.insert(id, vec![rec]);
     }
     let (hub, devs) = (hub.clone(), devs.clone());
     let _ = std::thread::Builder::new().name(format!("tactus:{node}")).spawn(move || {
@@ -548,11 +562,7 @@ fn bt_start(hub: &Arc<Hub>, devs: &Arc<Mutex<Devices>>, device: u64, p: BtPendin
         if p.keyboard_allowed { "" } else { " (no keyboard rights)" }
     );
     let rec = Message::Device { id, bus: Bus::Bluetooth, classes, vendor, product, name };
-    {
-        let mut s = hub.state.lock().unwrap();
-        s.send(&rec);
-        s.devices.insert(id, rec);
-    }
+    announce(hub, id, rec, &dec);
     let hub = hub.clone();
     let keyboard = p.keyboard_allowed;
     let mut file = File::from(p.fd);
@@ -621,7 +631,7 @@ fn serve_clients(hub: &Hub, listener: UnixListener) {
         let mut hello = vec![Message::Hello { version: wire::VERSION }];
         let mut ids: Vec<&u32> = s.devices.keys().collect();
         ids.sort();
-        hello.extend(ids.into_iter().map(|i| s.devices[i].clone()));
+        hello.extend(ids.into_iter().flat_map(|i| s.devices[i].iter().cloned()));
         if hello.iter().all(|m| wire::write(&mut c, m).is_ok()) {
             eprintln!("tactusd: client connected (uid {uid:?})");
             s.clients.push(c);

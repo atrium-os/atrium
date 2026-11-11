@@ -94,6 +94,11 @@ pub enum DisplayEvent {
     /// A three- or four-finger swipe, to the WM (window 0) only
     /// (`fresco_protocol::InputSwipeEvent`).
     InputSwipe { window_id: u32, fingers: u8, dx: f32, dy: f32, phase: u8 },
+    /// A gamepad became this window's (`fresco_protocol::GamepadConnectEvent`).
+    GamepadConnect { window_id: u32, device_id: u32, vendor: u16, product: u16, buttons: u16, axes: u16, name: String },
+    /// `kind`: `fresco_protocol::control::EV_GAMEPAD_DISCONNECT`, `_BUTTON`
+    /// or `_AXIS` (`fresco_protocol::GamepadEvent`).
+    Gamepad { window_id: u32, kind: u16, device_id: u32, usage: u32, value: i32 },
     /// The nodes of this window that are not drawn (fills, or any node
     /// past the op budget), by node id with a `fresco_protocol::fill_drop`
     /// reason. Sent whenever the set changes, so an empty list says every
@@ -235,6 +240,23 @@ pub fn encode_event(ev: &DisplayEvent)
         DisplayEvent::InputSwipe { window_id, fingers, dx, dy, phase } => {
             let p = InputSwipeEvent { window_id: *window_id, fingers: *fingers, dx: *dx, dy: *dy, phase: *phase };
             Ok((control::EV_INPUT_SWIPE, encode(&p)?))
+        }
+        DisplayEvent::GamepadConnect { window_id, device_id, vendor, product, buttons, axes, name } => {
+            let mut name = name.clone();
+            let mut cut = name.len().min(63);
+            while !name.is_char_boundary(cut) {
+                cut -= 1;
+            }
+            name.truncate(cut);
+            let p = fresco_protocol::GamepadConnectEvent {
+                window_id: *window_id, device_id: *device_id, vendor: *vendor, product: *product,
+                buttons: *buttons, axes: *axes, name,
+            };
+            Ok((control::EV_GAMEPAD_CONNECT, encode(&p)?))
+        }
+        DisplayEvent::Gamepad { window_id, kind, device_id, usage, value } => {
+            let p = fresco_protocol::GamepadEvent { window_id: *window_id, device_id: *device_id, usage: *usage, value: *value };
+            Ok((*kind, encode(&p)?))
         }
         DisplayEvent::WindowFillsDropped { window_id, dropped } => {
             let p = WindowFillsDroppedEvent {

@@ -21,6 +21,77 @@ pub enum Input {
     /// One touchpad frame: every contact the pad reported (lifted ones
     /// with `tip` false) and whether its button is down.
     Touch { contacts: Vec<Contact>, button: bool },
+    /// A gamepad or joystick button, by the usage the descriptor gives it
+    /// (page 0x09, or a one-bit control such as a D-pad direction).
+    PadButton { usage: Usage, down: bool },
+    /// A gamepad or joystick axis changed (spec §5.4): `value` is the
+    /// logical range scaled to -32768..=32767. The hat switch
+    /// ([`HAT`]) is 0..=7 clockwise from up, or -1 when centred.
+    PadAxis { usage: Usage, value: i16 },
+}
+
+/// The hat switch (Generic Desktop 0x39): a gamepad's D-pad.
+pub const HAT: Usage = hid::usage(hid::PAGE_DESKTOP, 0x39);
+const PAGE_SIMULATION: u16 = 0x02;
+
+/// What a gamepad's controls are: its buttons and axes by usage, in
+/// descriptor order.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct PadLayout {
+    pub buttons: Vec<Usage>,
+    pub axes: Vec<Usage>,
+}
+
+/// How a gamepad field's value is read.
+#[derive(Clone, Copy, PartialEq)]
+enum PadControl {
+    Button,
+    Axis,
+    Hat,
+    Ignored,
+}
+
+fn pad_control(f: &hid::Field, u: Usage) -> PadControl {
+    let page = (u >> 16) as u16;
+    if f.relative || u & 0xffff == 0 {
+        return PadControl::Ignored;
+    }
+    if u == HAT {
+        return PadControl::Hat;
+    }
+    // Buttons, and the D-pad as four one-bit Generic Desktop controls
+    // (0x90..=0x93: up, down, right, left).
+    if page == hid::PAGE_BUTTON || (page == hid::PAGE_DESKTOP && (0x90..=0x93).contains(&(u & 0xffff))) {
+        return PadControl::Button;
+    }
+    if (page == hid::PAGE_DESKTOP || page == PAGE_SIMULATION) && f.logical_max > f.logical_min {
+        return PadControl::Axis;
+    }
+    PadControl::Ignored
+}
+
+/// `v` in `lo..=hi` scaled to `i16`, ends to ends.
+fn scale_axis(v: i64, lo: i32, hi: i32) -> i16 {
+    let (lo, hi) = (i64::from(lo), i64::from(hi));
+    let t = (v.clamp(lo, hi) - lo) * 65535 / (hi - lo);
+    (t - 32768) as i16
+}
+
+/// A hat switch's position, 0..=7 clockwise from up (a 4-way hat's
+/// positions are doubled), or -1 for a value outside its range (centred).
+fn hat_position(v: i64, lo: i32, hi: i32) -> i16 {
+    let (lo, hi) = (i64::from(lo), i64::from(hi));
+    if v < lo || v > hi {
+        return -1;
+    }
+    let n = hi - lo + 1;
+    if n == 4 {
+        return ((v - lo) * 2) as i16;
+    }
+    if n != 8 {
+        return -1;
+    }
+    (v - lo) as i16
 }
 
 /// One finger on a touchpad, in millimetres from the pad's corner.
@@ -65,12 +136,18 @@ pub struct Decoder {
     abs: Vec<Option<(f32, f32)>>,
     /// Per collection, a touchpad frame in progress.
     touch: Vec<Pending>,
+    /// Per collection, each gamepad axis's last value.
+    pad: Vec<Vec<(Usage, i16)>>,
 }
 
-/// Classes whose reports this decoder turns into events. Gamepads,
-/// touch and touchpads get their own stages (spec §8, T3/T5).
+/// Classes whose reports this decoder turns into events (touch screens
+/// and pens come later, spec §8).
 fn decoded(c: Class) -> bool {
-    matches!(c, Class::Pointer | Class::Keyboard | Class::SystemKeys | Class::MediaKeys | Class::Touchpad)
+    matches!(c, Class::Pointer | Class::Keyboard | Class::SystemKeys | Class::MediaKeys | Class::Touchpad | Class::Gamepad | Class::Joystick)
+}
+
+fn is_pad(c: Class) -> bool {
+    matches!(c, Class::Gamepad | Class::Joystick)
 }
 
 /// Keyboard usages 1..=3 are ErrorRollOver, POSTFail, ErrorUndefined:
@@ -82,7 +159,13 @@ fn phantom(u: Usage) -> bool {
 impl Decoder {
     pub fn new(desc: Descriptor) -> Decoder {
         let n = desc.apps.len();
-        Decoder { desc, held: vec![Vec::new(); n], abs: vec![None; n], touch: (0..n).map(|_| Pending::default()).collect() }
+        Decoder {
+            desc,
+            held: vec![Vec::new(); n],
+            abs: vec![None; n],
+            touch: (0..n).map(|_| Pending::default()).collect(),
+            pad: vec![Vec::new(); n],
+        }
     }
 
     pub fn descriptor(&self) -> &Descriptor {
@@ -111,6 +194,10 @@ impl Decoder {
             }
             if self.desc.apps[app].class == Class::Touchpad {
                 self.touchpad(app, id, body, out);
+                continue;
+            }
+            if is_pad(self.desc.apps[app].class) {
+                self.gamepad(app, id, body, out);
                 continue;
             }
             let fields: Vec<&hid::Field> =
@@ -262,11 +349,103 @@ impl Decoder {
         }
     }
 
+    /// A gamepad's buttons and axes, if it has a gamepad or joystick
+    /// collection.
+    pub fn pad_layout(&self) -> Option<PadLayout> {
+        let mut l = PadLayout::default();
+        let mut any = false;
+        for f in self.desc.fields.iter().filter(|f| is_pad(self.desc.apps[f.app].class)) {
+            any = true;
+            for k in 0..f.count {
+                if f.array {
+                    let n = (i64::from(f.logical_max) - i64::from(f.logical_min) + 1).clamp(0, 256);
+                    for v in 0..n {
+                        if let Some(u) = f.usage_of_index(i64::from(f.logical_min) + v) {
+                            if !l.buttons.contains(&u) {
+                                l.buttons.push(u);
+                            }
+                        }
+                    }
+                    break;
+                }
+                let Some(u) = f.usage_at(k) else { continue };
+                let list = match pad_control(f, u) {
+                    PadControl::Button => &mut l.buttons,
+                    PadControl::Axis | PadControl::Hat => &mut l.axes,
+                    PadControl::Ignored => continue,
+                };
+                if !list.contains(&u) {
+                    list.push(u);
+                }
+            }
+        }
+        any.then_some(l)
+    }
+
+    fn gamepad(&mut self, app: usize, id: u8, body: &[u8], out: &mut Vec<Input>) {
+        let fields: Vec<&hid::Field> = self.desc.fields.iter().filter(|f| f.app == app && f.report_id == id).collect();
+        if fields.is_empty() {
+            return;
+        }
+        let mut pressed: Vec<Usage> = Vec::new();
+        let mut axes: Vec<(Usage, i16)> = Vec::new();
+        for f in fields {
+            for k in 0..f.count {
+                // A short report says nothing reliable: drop it whole.
+                let Some(v) = f.value(body, k) else { return };
+                if f.array {
+                    if let Some(u) = f.usage_of_index(v) {
+                        if !pressed.contains(&u) {
+                            pressed.push(u);
+                        }
+                    }
+                    continue;
+                }
+                let Some(u) = f.usage_at(k) else { continue };
+                match pad_control(f, u) {
+                    PadControl::Button => {
+                        if v != 0 && !pressed.contains(&u) {
+                            pressed.push(u);
+                        }
+                    }
+                    PadControl::Axis => axes.push((u, scale_axis(v, f.logical_min, f.logical_max))),
+                    PadControl::Hat => axes.push((u, hat_position(v, f.logical_min, f.logical_max))),
+                    PadControl::Ignored => {}
+                }
+            }
+        }
+        let last = &mut self.pad[app];
+        for (u, v) in axes {
+            match last.iter_mut().find(|(l, _)| *l == u) {
+                Some((_, old)) if *old == v => {}
+                Some((_, old)) => {
+                    *old = v;
+                    out.push(Input::PadAxis { usage: u, value: v });
+                }
+                None => {
+                    last.push((u, v));
+                    out.push(Input::PadAxis { usage: u, value: v });
+                }
+            }
+        }
+        let held = &mut self.held[app];
+        for &u in held.iter().filter(|u| !pressed.contains(u)) {
+            out.push(Input::PadButton { usage: u, down: false });
+        }
+        for &u in pressed.iter().filter(|u| !held.contains(u)) {
+            out.push(Input::PadButton { usage: u, down: true });
+        }
+        *held = pressed;
+    }
+
     /// Releases for everything held: the device went away.
     pub fn release_all(&mut self, out: &mut Vec<Input>) {
-        for held in &mut self.held {
+        for (app, held) in self.held.iter_mut().enumerate() {
+            let pad = is_pad(self.desc.apps[app].class);
             for u in held.drain(..) {
-                out.push(if u >> 16 == u32::from(hid::PAGE_BUTTON) {
+                out.push(if pad {
+                    Input::PadButton { usage: u, down: false }
+                } else if u >> 16 == u32::from(hid::PAGE_BUTTON) {
                     Input::Button { usage: u, down: false }
                 } else {
                     Input::Key { usage: u, down: false }
@@ -279,7 +458,7 @@ impl Decoder {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::hid::tests::{BOOT_KEYBOARD, GAMING_MOUSE, QEMU_TABLET};
+    use crate::hid::tests::{BOOT_KEYBOARD, GAMEPAD_16BIT, GAMING_MOUSE, GENERIC_JOYSTICK, QEMU_TABLET};
     use crate::hid::usage;
 
     fn dec(d: &[u8]) -> Decoder {
@@ -292,6 +471,76 @@ mod tests {
     }
     fn key(id: u16, down: bool) -> Input {
         Input::Key { usage: usage(7, id), down }
+    }
+
+    fn pad_axis(id: u16, value: i16) -> Input {
+        Input::PadAxis { usage: usage(1, id), value }
+    }
+    fn pad_button(id: u16, down: bool) -> Input {
+        Input::PadButton { usage: usage(9, id), down }
+    }
+
+    /// A generic USB joystick (DragonRise-style): four 8-bit axes, an
+    /// 8-way hat with a null state, twelve buttons, vendor bits.
+    #[test]
+    fn joystick_axes_hat_and_buttons() {
+        let mut d = dec(GENERIC_JOYSTICK);
+        assert_eq!(d.descriptor().apps[0].class, Class::Joystick);
+        let l = d.pad_layout().unwrap();
+        assert_eq!(l.axes, vec![usage(1, 0x30), usage(1, 0x31), usage(1, 0x32), usage(1, 0x35), HAT]);
+        assert_eq!(l.buttons, (1..=12).map(|b| usage(9, b)).collect::<Vec<_>>(), "vendor bits are not buttons");
+        // Centred: every axis once, the hat centred (null state 0xf).
+        assert_eq!(
+            run(&mut d, &[0x80, 0x80, 0x80, 0x80, 0x0f, 0, 0xff, 0xff]),
+            vec![pad_axis(0x30, 128), pad_axis(0x31, 128), pad_axis(0x32, 128), pad_axis(0x35, 128), Input::PadAxis { usage: HAT, value: -1 }]
+        );
+        // Same report again: nothing.
+        assert_eq!(run(&mut d, &[0x80, 0x80, 0x80, 0x80, 0x0f, 0, 0, 0]), vec![]);
+        // X hard left, hat up-right, button 1.
+        assert_eq!(
+            run(&mut d, &[0x00, 0x80, 0x80, 0x80, 0x11, 0, 0, 0]),
+            vec![pad_axis(0x30, -32768), Input::PadAxis { usage: HAT, value: 1 }, pad_button(1, true)]
+        );
+        // X hard right, button 12 too, then release all.
+        assert_eq!(run(&mut d, &[0xff, 0x80, 0x80, 0x80, 0x11, 0x80, 0, 0]), vec![pad_axis(0x30, 32767), pad_button(12, true)]);
+        let mut out = Vec::new();
+        d.release_all(&mut out);
+        assert_eq!(out, vec![pad_button(1, false), pad_button(12, false)]);
+        // A short report is dropped whole.
+        assert_eq!(run(&mut d, &[0x00, 0x80]), vec![]);
+    }
+
+    /// A Bluetooth-style gamepad: numbered report, 16-bit sticks, 10-bit
+    /// trigger and brake (Simulation page), a 1..=8 hat, fifteen buttons.
+    #[test]
+    fn gamepad_sticks_triggers_hat() {
+        let mut d = dec(GAMEPAD_16BIT);
+        assert_eq!(d.descriptor().apps[0].class, Class::Gamepad);
+        let l = d.pad_layout().unwrap();
+        assert_eq!(l.axes, vec![usage(1, 0x30), usage(1, 0x31), usage(1, 0x33), usage(1, 0x34), usage(1, 0x32), usage(2, 0xc5), HAT]);
+        assert_eq!(l.buttons.len(), 15);
+        let report = |lx: u16, z: u16, hat: u8, buttons: u16| {
+            let mut r = vec![1];
+            for v in [lx, 0x8000, 0x8000, 0x8000] {
+                r.extend(v.to_le_bytes());
+            }
+            r.extend(z.to_le_bytes());
+            r.extend(0u16.to_le_bytes());
+            r.push(hat);
+            r.extend(buttons.to_le_bytes());
+            r
+        };
+        let first = run(&mut d, &report(0x8000, 0, 0, 0));
+        assert_eq!(first.len(), 7, "every axis once: {first:?}");
+        assert_eq!(first[0], pad_axis(0x30, 0));
+        assert_eq!(first[4], pad_axis(0x32, -32768));
+        assert_eq!(first[6], Input::PadAxis { usage: HAT, value: -1 }, "0 is outside 1..=8: centred");
+        assert_eq!(
+            run(&mut d, &report(0xffff, 1023, 3, 0b101)),
+            vec![pad_axis(0x30, 32767), pad_axis(0x32, 32767), Input::PadAxis { usage: HAT, value: 2 }, pad_button(1, true), pad_button(3, true)]
+        );
+        // Another report id: not this collection's.
+        assert_eq!(run(&mut d, &[2, 0, 0]), vec![]);
     }
 
     #[test]

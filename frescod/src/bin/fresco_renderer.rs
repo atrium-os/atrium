@@ -629,6 +629,18 @@ fn from_broker(
                     Input::Magnify { x, y, scale, phase } => DisplayEvent::InputPointerMagnify { window_id, x, y, scale, phase },
                 });
             }
+            Msg::PadConnect { device, vendor, product, buttons, axes, name, .. } => {
+                let _ = events.send(DisplayEvent::GamepadConnect { window_id: local, device_id: device, vendor, product, buttons, axes, name });
+            }
+            Msg::Pad { kind, device, usage, value, .. } => {
+                use fresco_protocol::control as c;
+                let kind = match kind {
+                    fresco_split::PAD_DISCONNECT => c::EV_GAMEPAD_DISCONNECT,
+                    fresco_split::PAD_BUTTON => c::EV_GAMEPAD_BUTTON,
+                    _ => c::EV_GAMEPAD_AXIS,
+                };
+                let _ = events.send(DisplayEvent::Gamepad { window_id: local, kind, device_id: device, usage, value });
+            }
             Msg::DragOffer { format, .. } => {
                 let mut s = state.lock().unwrap();
                 if s.drag_offers.len() < fresco_protocol::drag::MAX_FORMATS {

@@ -153,6 +153,11 @@ pub enum Msg {
     DragEnd { window: u32, drag_id: u64, dropped: bool },
     /// `window`'s embed token (limen.md §5), for its client alone.
     EmbedToken { window: u32, token: [u8; 16] },
+    /// Gamepad `device` is now `window`'s (atrium-input.md §4.1).
+    PadConnect { window: u32, device: u32, vendor: u16, product: u16, buttons: u16, axes: u16, name: String },
+    /// `kind`: [`PAD_DISCONNECT`], [`PAD_BUTTON`] (value 0 or 1) or
+    /// [`PAD_AXIS`] (-32768..=32767, the hat -1..=7).
+    Pad { window: u32, kind: u32, device: u32, usage: u32, value: i32 },
     /// Two video slots of `bytes` each for the layer follow as fds.
     VideoSlots { window: u32, layer: u32, bytes: u32 },
     /// The broker has copied video slot `slot` out; it may be filled again.
@@ -188,6 +193,8 @@ pub struct Refused(pub &'static str);
 /// WINDOW_CREATE's role word carries the `embed_pending` flag in this bit.
 const EMBED_PENDING_BIT: u32 = 8;
 
+pub use kind::{PAD_AXIS, PAD_BUTTON, PAD_DISCONNECT};
+
 mod kind {
     pub const WINDOW_CREATE: u32 = 1;
     pub const WINDOW_DESTROY: u32 = 2;
@@ -212,6 +219,10 @@ mod kind {
     pub const DROP: u32 = 0x122;
     pub const DRAG_END: u32 = 0x123;
     pub const EMBED_TOKEN: u32 = 0x124;
+    pub const PAD_CONNECT: u32 = 0x115;
+    pub const PAD_DISCONNECT: u32 = 0x116;
+    pub const PAD_BUTTON: u32 = 0x117;
+    pub const PAD_AXIS: u32 = 0x118;
     pub const VIDEO_RING: u32 = 7;
     pub const VIDEO_FRAME: u32 = 8;
     pub const VIDEO_PLACE: u32 = 9;
@@ -286,6 +297,8 @@ impl Msg {
             | Msg::Drop { window, .. }
             | Msg::DragEnd { window, .. }
             | Msg::EmbedToken { window, .. }
+            | Msg::PadConnect { window, .. }
+            | Msg::Pad { window, .. }
             | Msg::VideoRing { window, .. }
             | Msg::VideoFrame { window, .. }
             | Msg::VideoPlace { window, .. }
@@ -448,6 +461,22 @@ impl Msg {
                 r.0[32..48].copy_from_slice(token);
                 r
             }
+            Msg::PadConnect { window, device, vendor, product, buttons, axes, name } => {
+                let mut r = Rec::new(PAD_CONNECT, *window);
+                r.put(2, *device);
+                r.put(3, u32::from(*vendor) << 16 | u32::from(*product));
+                r.put(4, u32::from(*buttons) << 16 | u32::from(*axes));
+                // Control characters would be refused: drop them here.
+                r.title(&name.chars().filter(|c| !c.is_control()).collect::<String>());
+                r
+            }
+            Msg::Pad { window, kind, device, usage, value } => {
+                let mut r = Rec::new(*kind, *window);
+                r.put(2, *device);
+                r.put(3, *usage);
+                r.put(4, *value as u32);
+                r
+            }
             Msg::VideoRing { window, layer, width, height } => {
                 let mut r = Rec::new(VIDEO_RING, *window);
                 r.put(2, *layer);
@@ -566,6 +595,9 @@ impl Msg {
             DRAG_END => (3, false),
             DRAG => (5, false),
             EMBED_TOKEN => (0, false),
+            PAD_CONNECT => (3, true),
+            PAD_DISCONNECT => (1, false),
+            PAD_BUTTON | PAD_AXIS => (3, false),
             VIDEO_RING => (3, false),
             VIDEO_FRAME | VIDEO_PRESENTED => (5, false),
             VIDEO_PLACE => (6, false),
@@ -741,6 +773,24 @@ impl Msg {
                 }
             }
             SPAN_DONE => Msg::SpanDone { window },
+            PAD_CONNECT => Msg::PadConnect {
+                window,
+                device: r.get(2),
+                vendor: (r.get(3) >> 16) as u16,
+                product: r.get(3) as u16,
+                buttons: (r.get(4) >> 16) as u16,
+                axes: r.get(4) as u16,
+                name: title,
+            },
+            PAD_DISCONNECT => Msg::Pad { window, kind: k, device: r.get(2), usage: 0, value: 0 },
+            PAD_BUTTON | PAD_AXIS => {
+                let value = r.get(4) as i32;
+                let ok = if k == PAD_BUTTON { (0..=1).contains(&value) } else { (-32768..=32767).contains(&value) };
+                if !ok {
+                    return Err(Refused("pad value out of range"));
+                }
+                Msg::Pad { window, kind: k, device: r.get(2), usage: r.get(3), value }
+            }
             _ => unreachable!(),
         })
     }

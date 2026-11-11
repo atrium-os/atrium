@@ -138,6 +138,16 @@ pub enum Event {
     /// A three- or four-finger swipe (WM only, window 0): total `dx`/`dy`
     /// since BEGIN in logical px.
     Swipe { window_id: u32, fingers: u8, dx: f32, dy: f32, phase: u8 },
+    /// Gamepad `device_id` is now this window's (docs/spec/atrium-input.md
+    /// §4.1); its axes follow as [`Event::GamepadAxis`].
+    GamepadConnect { window_id: u32, device_id: u32, vendor: u16, product: u16, buttons: u16, axes: u16, name: String },
+    /// The pad was unplugged or the window lost focus: forget its state.
+    GamepadDisconnect { window_id: u32, device_id: u32 },
+    /// A button by HID usage (`page << 16 | id`).
+    GamepadButton { window_id: u32, device_id: u32, usage: u32, pressed: bool },
+    /// An axis by HID usage: -32768..=32767; the hat (`0x0001_0039`) is
+    /// 0..=7 clockwise from up, -1 centred.
+    GamepadAxis { window_id: u32, device_id: u32, usage: u32, value: i32 },
     /// A drag (docs/spec/tabula.md §4) came over the window, offering
     /// these MIME `formats`.
     DragEnter { window_id: u32, drag_id: u64, x: f32, y: f32, formats: Vec<String> },
@@ -1198,6 +1208,25 @@ fn decode_event(op: u16, payload: &[u8]) -> Event {
             Ok(p) => Event::Swipe { window_id: p.window_id, fingers: p.fingers, dx: p.dx, dy: p.dy, phase: p.phase },
             Err(_) => Event::Unknown { op, payload: payload.to_vec() },
         },
+        control::EV_GAMEPAD_CONNECT => match decode::<fresco_protocol::GamepadConnectEvent>(payload) {
+            Ok(p) => Event::GamepadConnect {
+                window_id: p.window_id, device_id: p.device_id, vendor: p.vendor, product: p.product,
+                buttons: p.buttons, axes: p.axes, name: p.name,
+            },
+            Err(_) => Event::Unknown { op, payload: payload.to_vec() },
+        },
+        control::EV_GAMEPAD_DISCONNECT | control::EV_GAMEPAD_BUTTON | control::EV_GAMEPAD_AXIS => {
+            match decode::<fresco_protocol::GamepadEvent>(payload) {
+                Ok(p) => match op {
+                    control::EV_GAMEPAD_DISCONNECT => Event::GamepadDisconnect { window_id: p.window_id, device_id: p.device_id },
+                    control::EV_GAMEPAD_BUTTON => {
+                        Event::GamepadButton { window_id: p.window_id, device_id: p.device_id, usage: p.usage, pressed: p.value != 0 }
+                    }
+                    _ => Event::GamepadAxis { window_id: p.window_id, device_id: p.device_id, usage: p.usage, value: p.value },
+                },
+                Err(_) => Event::Unknown { op, payload: payload.to_vec() },
+            }
+        }
         control::EV_DRAG_ENTER | control::EV_DRAG_OVER | control::EV_DRAG_LEAVE => match decode::<fresco_protocol::DragEvent>(payload) {
             Ok(p) => match op {
                 control::EV_DRAG_ENTER => Event::DragEnter { window_id: p.window_id, drag_id: p.drag_id, x: p.x, y: p.y, formats: p.formats },

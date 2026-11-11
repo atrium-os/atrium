@@ -977,6 +977,19 @@ fn event_record(r: &Renderer, ev: &DisplayEvent) -> Option<Msg> {
         }
         E::InputPointerScroll { window_id, dx, dy, phase } => (window_id, Input::Scroll { dx, dy, phase }),
         E::InputPointerMagnify { window_id, x, y, scale, phase } => (window_id, Input::Magnify { x, y, scale, phase }),
+        E::GamepadConnect { window_id, device_id, vendor, product, buttons, axes, ref name } => {
+            return Some(Msg::PadConnect { window: r.local_of(window_id)?, device: device_id, vendor, product, buttons, axes, name: name.clone() });
+        }
+        E::Gamepad { window_id, kind, device_id, usage, value } => {
+            use fresco_protocol::control as c;
+            let kind = match kind {
+                c::EV_GAMEPAD_DISCONNECT => fresco_split::PAD_DISCONNECT,
+                c::EV_GAMEPAD_BUTTON => fresco_split::PAD_BUTTON,
+                c::EV_GAMEPAD_AXIS => fresco_split::PAD_AXIS,
+                _ => return None,
+            };
+            return Some(Msg::Pad { window: r.local_of(window_id)?, kind, device: device_id, usage, value });
+        }
         _ => return None,
     };
     let ok = |v: f32| v.is_finite();

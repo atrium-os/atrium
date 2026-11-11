@@ -1,7 +1,8 @@
 //! atrium-input-probe — a window that prints every input event it gets,
 //! one line each, with whether a press carried an activation token. The
 //! Tactus VM check (scripts/vm-tactus-check.sh) sends keys and pointer
-//! moves through QEMU's USB devices and reads these lines.
+//! moves through QEMU's USB devices and reads these lines; the gamepad
+//! check (`GAMEPAD=1`) reads its pad lines.
 //!
 //! Usage: atrium-input-probe [fresco socket] [seconds]
 
@@ -36,6 +37,16 @@ fn main() -> std::io::Result<()> {
             Event::PointerMotion { window_id, x, y } => println!("motion window={window_id} x={x:.0} y={y:.0}"),
             Event::PointerScroll { window_id, dx, dy, phase } => println!("scroll window={window_id} dx={dx} dy={dy} phase={phase}"),
             Event::PointerMagnify { window_id, x, y, scale, phase } => println!("magnify window={window_id} x={x:.0} y={y:.0} scale={scale:.2} phase={phase}"),
+            Event::GamepadConnect { window_id, device_id, vendor, product, buttons, axes, name } => {
+                println!("pad-connect window={window_id} device={device_id} id={vendor:04x}:{product:04x} buttons={buttons} axes={axes} name={name:?}")
+            }
+            Event::GamepadDisconnect { window_id, device_id } => println!("pad-disconnect window={window_id} device={device_id}"),
+            Event::GamepadButton { window_id, device_id, usage, pressed } => {
+                println!("pad-button window={window_id} device={device_id} usage=0x{usage:08x} pressed={}", pressed as u8)
+            }
+            Event::GamepadAxis { window_id, device_id, usage, value } => {
+                println!("pad-axis window={window_id} device={device_id} usage=0x{usage:08x} value={value}")
+            }
             _ => {}
         }
         use std::io::Write;

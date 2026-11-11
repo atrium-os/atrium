@@ -287,7 +287,10 @@ fn route(ev: &DisplayEvent, comp: &Arc<Mutex<Compositor>>) -> Route {
         | E::EmbedToken { window_id, .. }
         | E::VideoReleased { window_id, .. }
         | E::VideoPresented { window_id, .. }
-        | E::WindowSpan { window_id, .. } => return Route::Owner(owner_of(window_id)),
+        | E::WindowSpan { window_id, .. }
+        // A gamepad is the focused window's alone (not the WM's too).
+        | E::GamepadConnect { window_id, .. }
+        | E::Gamepad { window_id, .. } => return Route::Owner(owner_of(window_id)),
     };
     if window_id == 0 {
         return Route::WmOnly;
