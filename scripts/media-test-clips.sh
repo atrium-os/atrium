@@ -32,6 +32,8 @@ $ff $c -c:v libaom-av1 -cpu-used 8 -b:v 50k -color_primaries bt709 -color_trc bt
 c2="-f lavfi -i testsrc2=size=64x36:rate=24:duration=2"
 $ff $c2 -i subs.vtt -map 0 -map 1 -c:v libvpx-vp9 -b:v 50k -c:s webvtt subs-vtt.webm
 $ff $c2 -i subs.vtt -map 0 -map 1 -c:v libaom-av1 -cpu-used 8 -b:v 50k -c:s mov_text subs-tx3g.mp4
+# H.264 Baseline (hospes-codec / OpenH264, atrium-player.md §9.3, behind the h264 feature).
+$ff $src -c:v libx264 -profile:v baseline -g 24 -b:v 200k -c:a libopus -b:a 48k -strict -2 h264-baseline.mp4
 # Reference hashes of every decoded frame (planar, as the decoder outputs).
 for f in *.webm *.mp4; do
     $ff -i "$f" -map 0:v -f framemd5 "$f.video.framemd5"

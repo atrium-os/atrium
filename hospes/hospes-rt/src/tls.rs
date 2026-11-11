@@ -77,6 +77,9 @@ pub struct ThreadState {
     /// The TCB allocation, for freeing.
     pub region: usize,
     pub region_len: usize,
+    /// The thread's stack mapping (0 for the main thread), for freeing at join.
+    pub stack: usize,
+    pub stack_len: usize,
     /// For the shim (H2): pthread keys, cleanup handlers, etc.
     pub shim: [usize; 32],
 }
@@ -92,9 +95,14 @@ pub struct Tcb {
     pub state: *mut ThreadState,
 }
 
-/// Fresh random canary and pointer guard for this process. glibc zeroes the canary's low
+/// Fresh random canary and pointer guard for this process (once; the host may call it
+/// before loading so it can publish the canary, e.g. as aarch64's `__stack_chk_guard`). glibc zeroes the canary's low
 /// byte so string overflows cannot reproduce it; we do the same.
 pub fn init_process_secrets() {
+    static ONCE: AtomicUsize = AtomicUsize::new(0);
+    if ONCE.swap(1, Ordering::AcqRel) != 0 {
+        return;
+    }
     let mut b = [0u8; 16];
     let _ = sys::getrandom(&mut b);
     let c = usize::from_le_bytes(b[..8].try_into().unwrap()) & !0xff;

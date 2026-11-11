@@ -10,7 +10,8 @@ hospes-elf = { path = "../hospes-elf" }
 
 [features]
 default = ["global"]
-# Install the runtime's allocator as #[global_allocator] and its panic handler.
+# For host binaries: our _start, the #[global_allocator] and the panic handler.
+# Libraries (hospes-glibc) depend on hospes-rt without it, so their tests can use std.
 global = []
 
 [lib]

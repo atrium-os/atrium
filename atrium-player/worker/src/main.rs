@@ -51,6 +51,18 @@ fn codec_id(c: Codec) -> u32 {
     }
 }
 
+/// The decoder for a video track. H.264 goes to hospes-codec, if the supervisor started one;
+/// there is one codec process per worker, so a second H.264 track finds none left.
+fn video_decoder(t: &TrackInfo, cfg: &decode::Config, h264: &mut Option<UnixStream>) -> decode::Result<Box<dyn decode::VideoDecoder>> {
+    #[cfg(feature = "h264")]
+    if t.codec == Codec::H264 && !t.encrypted {
+        let sock = h264.take().ok_or(decode::Error::Unsupported)?;
+        return Ok(Box::new(decode::hospes::Openh264::new(t, cfg.max_width, cfg.max_height, sock)?));
+    }
+    let _ = h264;
+    decode::video(t, cfg)
+}
+
 /// One byte stream: the whole file, or one MSE track's appends.
 struct Feed {
     parser: Option<Box<dyn Demuxer + Send>>,
@@ -111,15 +123,19 @@ struct Worker {
     growing: bool,
     /// At a growing file's end, waiting; when we last said so.
     starved: Option<std::time::Instant>,
+    /// The socket to hospes-codec (OpenH264 under Hospes), if the supervisor started one.
+    h264: Option<UnixStream>,
 }
 
 fn main() {
     let mut args = std::env::args().skip(1);
     let mut fd = None;
+    let mut h264_fd = None;
     let mut mem: u64 = 768 << 20;
     while let Some(a) = args.next() {
         match a.as_str() {
             "--fd" => fd = args.next().and_then(|v| v.parse::<i32>().ok()),
+            "--h264-fd" => h264_fd = args.next().and_then(|v| v.parse::<i32>().ok()),
             "--mem-mib" => mem = args.next().and_then(|v| v.parse::<u64>().ok()).unwrap_or(768) << 20,
             _ => {}
         }
@@ -135,6 +151,15 @@ fn main() {
     if let Err(e) = sys::limit(&std::os::fd::OwnedFd::from(sock.try_clone().unwrap()), sys::Rights::Socket) {
         eprintln!("atrium-player-decode: cap_rights_limit: {e}");
         std::process::exit(1);
+    }
+    #[allow(unsafe_code)]
+    // SAFETY: as for --fd.
+    let h264 = h264_fd.map(|f| UnixStream::from(unsafe { sys::adopt(f) }));
+    if let Some(h) = &h264 {
+        if let Err(e) = sys::limit(&std::os::fd::OwnedFd::from(h.try_clone().unwrap()), sys::Rights::Socket) {
+            eprintln!("atrium-player-decode: cap_rights_limit: {e}");
+            std::process::exit(1);
+        }
     }
     if let Err(e) = sys::limit_resources(mem) {
         eprintln!("atrium-player-decode: rlimit: {e}");
@@ -164,6 +189,7 @@ fn main() {
         seekable: false,
         growing: false,
         starved: None,
+        h264,
     };
     if w.send(Record::Ready { sandboxed }).is_err() {
         return;
@@ -427,7 +453,7 @@ impl Worker {
         if self.video.is_none() {
             if let Some(t) = tracks.iter().find(|t| t.codec.is_video()) {
                 let cfg = decode::Config { threads: self.limits.threads, max_width: self.limits.max_width, max_height: self.limits.max_height };
-                match decode::video(t, &cfg) {
+                match video_decoder(t, &cfg, &mut self.h264) {
                     Ok(dec) => {
                         let Kind::Video { width, height } = t.kind else { return };
                         feed.video = Some(t.index);
@@ -674,6 +700,9 @@ impl Worker {
                         // dav1d hands out its last pictures only to a get
                         // that follows a get with no send between them.
                         if input_done {
+                            if v.drain_tries == 0 {
+                                v.dec.finish();
+                            }
                             v.drain_tries += 1;
                             if v.drain_tries < 3 {
                                 continue;

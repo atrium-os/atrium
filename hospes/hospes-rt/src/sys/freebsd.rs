@@ -206,3 +206,41 @@ pub fn linux_hwcap(auxv: &[(usize, usize)]) -> (usize, usize) {
 /// On FreeBSD the kernel passes a pointer to argc in the first argument register; the
 /// stack pointer is not at argc on amd64.
 pub const ENTRY_ARG_IS_FIRST_REG: bool = true;
+
+const SYS_NANOSLEEP: usize = 240;
+
+/// CLOCK_REALTIME (0 on both FreeBSD and Linux): (seconds, nanoseconds).
+pub fn realtime() -> (i64, i64) {
+    let mut ts = [0i64; 2];
+    let _ = call(SYS_CLOCK_GETTIME, [0, ts.as_mut_ptr() as usize, 0, 0, 0, 0]);
+    (ts[0], ts[1])
+}
+
+pub fn nanosleep(sec: i64, nsec: i64) {
+    let ts = [sec, nsec];
+    let _ = call(SYS_NANOSLEEP, [ts.as_ptr() as usize, 0, 0, 0, 0, 0]);
+}
+
+/// Sleep while `*addr == val`, until CLOCK_REALTIME reaches `(sec, nsec)`. True if it
+/// timed out.
+pub unsafe fn futex_wait_until_realtime(addr: *const u32, val: u32, sec: i64, nsec: i64) -> bool {
+    #[repr(C)]
+    struct UmtxTime {
+        ts: [i64; 2],
+        flags: u32,
+        clockid: u32,
+    }
+    let t = UmtxTime { ts: [sec, nsec], flags: 1 /* UMTX_ABSTIME */, clockid: 0 };
+    let r = call(
+        SYS_UMTX_OP,
+        [addr as usize, UMTX_OP_WAIT_UINT, val as usize, core::mem::size_of::<UmtxTime>(), &t as *const UmtxTime as usize, 0],
+    );
+    r == Err(Errno(60)) // ETIMEDOUT
+}
+
+/// Create or truncate `path` (NUL-terminated) for writing, mode 0644. Only before cap_enter.
+pub fn create(path: &[u8]) -> R<i32> {
+    debug_assert!(path.last() == Some(&0));
+    // O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC
+    call(SYS_OPENAT, [AT_FDCWD as usize, path.as_ptr() as usize, 0x1 | 0x200 | 0x400 | O_CLOEXEC, 0o644, 0, 0]).map(|v| v as i32)
+}

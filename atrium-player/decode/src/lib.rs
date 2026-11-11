@@ -9,6 +9,8 @@
 
 pub mod convert;
 mod ffi;
+#[cfg(feature = "h264")]
+pub mod hospes;
 
 use atrium_media_demux::{Codec, Kind, TrackInfo};
 
@@ -83,6 +85,9 @@ pub trait VideoDecoder: Send {
     fn receive(&mut self) -> Result<Option<Picture<'_>>>;
     /// Drop everything in flight (a seek).
     fn flush(&mut self);
+    /// The input has ended: release pictures held for reordering, so the following
+    /// [`Self::receive`] calls return them. Decoders that drain by being polled ignore it.
+    fn finish(&mut self) {}
 }
 
 pub trait AudioDecoder: Send {
@@ -114,9 +119,10 @@ impl Default for Config {
     }
 }
 
-/// Codecs this build decodes (atrium-player.md §9.3–9.4: no H.264, no AAC).
+/// Codecs this build decodes (atrium-player.md §9.3–9.4: no AAC; H.264 only with the
+/// `h264` feature, through Hospes, and only when the supervisor found OpenH264 installed).
 pub fn supported(codec: Codec) -> bool {
-    matches!(codec, Codec::Av1 | Codec::Vp9 | Codec::Vp8 | Codec::Opus | Codec::Vorbis)
+    matches!(codec, Codec::Av1 | Codec::Vp9 | Codec::Vp8 | Codec::Opus | Codec::Vorbis) || (cfg!(feature = "h264") && codec == Codec::H264)
 }
 
 /// Answer for `MediaSource.isTypeSupported` (lives with the demuxers so the

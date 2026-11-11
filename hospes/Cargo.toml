@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["hospes-elf", "hospes-rt", "hospes-fixture-runner"]
+members = ["hospes-elf", "hospes-rt", "hospes-glibc", "hospes-codec-wire", "hospes-codec", "hospes-fixture-runner"]
 
 [workspace.package]
 edition = "2021"

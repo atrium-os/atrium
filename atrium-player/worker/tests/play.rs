@@ -451,3 +451,41 @@ fn page_subtitles_show_when_chosen() {
     assert_eq!(p.worker_pid(), pid);
     let _ = std::fs::remove_file(&fr);
 }
+
+/// H.264 Baseline through hospes-codec (Cisco's OpenH264 under Hospes), against ffmpeg's
+/// own decode. Needs `ATRIUM_PLAYER_OPENH264` (the user-installed library) and
+/// `ATRIUM_PLAYER_HOSPES_CODEC` (a built hospes-codec: `scripts/hospes-build.sh codec`);
+/// skipped without them.
+#[cfg(feature = "h264")]
+fn h264_opts() -> Option<Options> {
+    let library: PathBuf = std::env::var_os("ATRIUM_PLAYER_OPENH264")?.into();
+    let codec: PathBuf = std::env::var_os("ATRIUM_PLAYER_HOSPES_CODEC")?.into();
+    Some(Options { h264: Some(atrium_player::supervisor::H264 { codec, library, mem_mib: 256 }), ..opts() })
+}
+
+#[cfg(feature = "h264")]
+#[test]
+fn h264_through_hospes_matches_ffmpeg() {
+    let Some(o) = h264_opts() else {
+        eprintln!("skipped: set ATRIUM_PLAYER_OPENH264 and ATRIUM_PLAYER_HOSPES_CODEC");
+        return;
+    };
+    let name = "h264-baseline.mp4";
+    let r = play(load(name), o.clone(), 0, &[], |_, _, _| {});
+    assert!(matches!(r.events.last(), Some(PlayerEvent::Ended)), "{name}: {:?}", r.events);
+    let hashes: Vec<_> = r.frames.iter().map(|f| f.1.clone()).collect();
+    assert_eq!(hashes, layer_refs(name), "{name}: layer contents");
+    assert!((95_000..=98_000).contains(&r.pcm), "{name}: {} PCM frames", r.pcm);
+
+    // A killed worker (and with it its codec) is replaced, and the H.264 track goes on.
+    let mut killed = false;
+    let r = play(load(name), o, 0, &[], |p, ev, n| {
+        if !killed && n >= 10 && matches!(ev, PlayerEvent::Frame { .. }) {
+            killed = true;
+            p.kill_worker();
+        }
+    });
+    assert!(killed);
+    assert!(r.events.contains(&PlayerEvent::Restarted), "{:?}", r.events);
+    assert!(matches!(r.events.last(), Some(PlayerEvent::Ended)), "{:?}", r.events.last());
+}

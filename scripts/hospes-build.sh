@@ -3,8 +3,14 @@
 #
 #   sh scripts/hospes-build.sh fixtures            # rebuild hospes/fixtures/bin/{x86_64,aarch64}
 #   sh scripts/hospes-build.sh runner TRIPLE       # static no_std runner for TRIPLE
+#   sh scripts/hospes-build.sh codec TRIPLE        # hospes-codec (OpenH264 host) for TRIPLE
 #   sh scripts/hospes-build.sh test-linux          # x86_64 native + aarch64 under qemu-user
 #   sh scripts/hospes-build.sh test RUNNER FIXDIR  # run every fixture with RUNNER (any OS)
+#   sh scripts/hospes-build.sh conform CODEC LIB STREAMDIR REF.sha  # H2 conformance (any OS)
+#
+# conform: decode every stream in STREAMDIR with hospes-codec --file and compare the I420
+# output's SHA-256 with REF.sha ("<sha256> <stream name>" lines), made by the H0 reference
+# host (hospes/probe/h264host.c) running the same OpenH264 binary under real glibc.
 #
 # The fixtures are -nostdlib shared objects built with clang + lld for both machines; every
 # import comes from the runner's host table, so they test the loader before the glibc shim
@@ -41,15 +47,18 @@ build_fixtures() {
     done
 }
 
-build_runner() {
-    triple="$1"
+# build_bin TRIPLE PACKAGE: a static no_std Hospes binary.
+build_bin() {
+    triple="$1"; pkg="$2"
     cd "$H"
     RUSTFLAGS="-C relocation-model=static -C target-feature=+crt-static -C linker=rust-lld -C linker-flavor=ld.lld -C link-arg=-static -C link-arg=--no-dynamic-linker -C link-arg=-z -C link-arg=noexecstack" \
-        cargo build --release -p hospes-fixture-runner --target "$triple" \
+        cargo build --release -p "$pkg" --target "$triple" \
         -Z build-std=core,alloc -Z build-std-features=compiler-builtins-mem \
         --config 'profile.release.panic="abort"' >&2
-    echo "$H/target/$triple/release/hospes-fixture-runner"
+    echo "$H/target/$triple/release/$pkg"
 }
+
+build_runner() { build_bin "$1" hospes-fixture-runner; }
 
 # run_all RUNNER FIXDIR [WRAPPER]
 run_all() {
@@ -79,10 +88,36 @@ run_all() {
     [ "$fails" -eq 0 ]
 }
 
+sha() { if command -v sha256sum >/dev/null; then sha256sum < "$1" | cut -d' ' -f1; else sha256 -q "$1"; fi; }
+
+conform() {
+    codec="$1"; lib="$2"; dir="$3"; ref="$4"
+    out="${TMPDIR:-/tmp}/hospes-conform.$$"
+    mkdir -p "$out"
+    fails=0; n=0
+    while read -r want name; do
+        n=$((n + 1))
+        if ! $codec --file "$lib" "$dir/$name" "$out/$name.yuv" 2>"$out/$name.log"; then
+            echo "FAIL $name: $(tail -1 "$out/$name.log")" >&2; fails=$((fails + 1)); continue
+        fi
+        got=$(sha "$out/$name.yuv")
+        if [ "$got" = "$want" ]; then
+            echo "MATCH $name ($(tail -1 "$out/$name.log" | sed 's/hospes-codec: //'))" >&2
+        else
+            echo "DIFF $name" >&2; fails=$((fails + 1))
+        fi
+    done < "$ref"
+    rm -rf "$out"
+    echo "hospes conformance: $((n - fails))/$n match" >&2
+    [ "$fails" -eq 0 ]
+}
+
 case "${1:-}" in
     fixtures) build_fixtures ;;
     runner) build_runner "$2" ;;
+    codec) build_bin "$2" hospes-codec ;;
     test) run_all "$2" "$3" ;;
+    conform) conform "$2" "$3" "$4" "$5" ;;
     test-linux)
         x=$(build_runner x86_64-unknown-linux-gnu)
         a=$(build_runner aarch64-unknown-linux-gnu)

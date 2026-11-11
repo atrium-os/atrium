@@ -52,6 +52,19 @@ pub fn spawn(f: Entry, arg: usize, stack_len: usize) -> sys::R<Thread> {
 }
 
 impl Thread {
+    /// The thread's identity (its state pointer), which `pthread_t` carries.
+    pub fn into_raw(self) -> *mut ThreadState {
+        unsafe {
+            (*self.state).stack = self.stack;
+            (*self.state).stack_len = self.stack_len;
+        }
+        self.state
+    }
+    /// Take back a thread from [`Thread::into_raw`].
+    pub unsafe fn from_raw(state: *mut ThreadState) -> Thread {
+        Thread { state, stack: (*state).stack, stack_len: (*state).stack_len }
+    }
+
     /// Wait for the thread to finish and return its result.
     pub fn join(self) -> usize {
         unsafe {

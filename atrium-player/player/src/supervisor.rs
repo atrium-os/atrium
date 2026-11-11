@@ -82,6 +82,35 @@ pub struct Options {
     pub limits: Limits,
     pub buffers: u32,
     pub worker_mem_mib: u64,
+    /// H.264 through Hospes: start this codec host beside every worker (hospes.md §9).
+    pub h264: Option<H264>,
+}
+
+/// Where `hospes-codec` and the user-installed OpenH264 binary are (hospes.md §12).
+#[derive(Clone, Debug)]
+pub struct H264 {
+    pub codec: PathBuf,
+    pub library: PathBuf,
+    pub mem_mib: u64,
+}
+
+impl H264 {
+    /// From `ATRIUM_PLAYER_HOSPES_CODEC` (default: `hospes-codec` next to this executable)
+    /// and `ATRIUM_PLAYER_OPENH264` (no default: the user installs Cisco's binary). Only in
+    /// builds with the `h264` feature, and only when the library is there.
+    pub fn from_env() -> Option<H264> {
+        if !cfg!(feature = "h264") {
+            return None;
+        }
+        let library: PathBuf = std::env::var_os("ATRIUM_PLAYER_OPENH264")?.into();
+        if !library.is_file() {
+            return None;
+        }
+        let codec = std::env::var_os("ATRIUM_PLAYER_HOSPES_CODEC")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| std::env::current_exe().unwrap_or_default().with_file_name("hospes-codec"));
+        Some(H264 { codec, library, mem_mib: 512 })
+    }
 }
 
 impl Options {
@@ -98,12 +127,14 @@ impl Options {
 
 impl Default for Options {
     fn default() -> Self {
-        Options { worker: Self::default_worker(), limits: Limits::default(), buffers: 4, worker_mem_mib: 768 }
+        Options { worker: Self::default_worker(), limits: Limits::default(), buffers: 4, worker_mem_mib: 768, h264: H264::from_env() }
     }
 }
 
 struct Proc {
     child: Child,
+    /// hospes-codec, started with the worker and killed with it.
+    codec: Option<Child>,
     sock: UnixStream,
     /// Bytes of a record read so far.
     partial: Vec<u8>,
@@ -115,6 +146,25 @@ impl Proc {
         let mut cmd = Command::new(&o.worker);
         cmd.arg("--fd").arg(theirs.as_raw_fd().to_string()).arg("--mem-mib").arg(o.worker_mem_mib.to_string()).stdin(std::process::Stdio::null());
         sys::pass_fd(&mut cmd, theirs.as_raw_fd());
+        // The codec host: a socket to the worker and the library, read-only, as its only
+        // descriptors. It enters capability mode before it parses the library.
+        let mut codec = None;
+        let mut worker_end = None;
+        if let Some(h) = &o.h264 {
+            let (w_end, c_end) = UnixStream::pair()?;
+            let lib = File::open(&h.library)?;
+            let mut c = Command::new(&h.codec);
+            c.arg("--sock").arg(c_end.as_raw_fd().to_string()).arg("--lib").arg(lib.as_raw_fd().to_string());
+            c.arg("--mem").arg(h.mem_mib.to_string());
+            c.arg("--max").arg(format!("{}x{}", o.limits.max_width, o.limits.max_height));
+            c.stdin(std::process::Stdio::null());
+            sys::pass_fd(&mut c, c_end.as_raw_fd());
+            sys::pass_fd(&mut c, lib.as_raw_fd());
+            codec = Some(c.spawn()?);
+            cmd.arg("--h264-fd").arg(w_end.as_raw_fd().to_string());
+            sys::pass_fd(&mut cmd, w_end.as_raw_fd());
+            worker_end = Some(w_end);
+        }
         // ETXTBSY: a worker binary just written can be briefly busy while
         // another thread's fork still holds it open for writing.
         let mut tries = 0;
@@ -128,7 +178,8 @@ impl Proc {
             }
         };
         drop(theirs);
-        Ok(Proc { child, sock: mine, partial: Vec::new() })
+        drop(worker_end);
+        Ok(Proc { child, codec, sock: mine, partial: Vec::new() })
     }
 
     fn send(&self, m: &ToWorker, fds: &[&OwnedFd]) -> io::Result<()> {
@@ -157,6 +208,10 @@ impl Proc {
     fn kill(&mut self) {
         let _ = self.child.kill();
         let _ = self.child.wait();
+        if let Some(c) = &mut self.codec {
+            let _ = c.kill();
+            let _ = c.wait();
+        }
     }
 }
 

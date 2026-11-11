@@ -367,6 +367,10 @@ Fresco's layers land.
    under Hospes without a kernel hook, but decodes only Baseline and B-frame-free High
    correctly; Main/High with B-frames (most web H.264) came out wrong. So this route gives
    WebRTC/Baseline H.264, not general playback; weigh that here.
+   *Hospes H2 (2026-11-11, `docs/reviews/2026-11-11-hospes-h2.md`):* the worker now decodes
+   H.264 through `hospes-codec` (Cisco's binary in its own capability-mode process) behind
+   the `h264` build feature; frames match ffmpeg on Linux and in the FreeBSD VM. `CanPlay`
+   still answers false for `avc1` until the install route (hospes.md §12) exists.
 4. **No AAC in v1.** There is no permissive, mature AAC decoder in C, and Symphonia's Rust
    one is MPL-2.0, which the policy reviews case by case. AAC mostly travels with H.264 in
    MP4, so *recommend* deciding it together with item 3.

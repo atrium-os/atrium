@@ -72,11 +72,13 @@ pub fn info() -> &'static StartInfo {
     unsafe { &*INFO.load(Ordering::Acquire) }
 }
 
+#[cfg(feature = "global")]
 extern "Rust" {
     /// Provided by the host binary.
     fn hospes_main(info: &'static StartInfo) -> i32;
 }
 
+#[cfg(feature = "global")]
 #[no_mangle]
 unsafe extern "C" fn hospes_rt_entry(sp: *const usize) -> ! {
     let argc = *sp;
@@ -99,7 +101,7 @@ unsafe extern "C" fn hospes_rt_entry(sp: *const usize) -> ! {
     crate::sys::exit(code)
 }
 
-#[cfg(all(target_arch = "x86_64", target_os = "freebsd"))]
+#[cfg(all(feature = "global", target_arch = "x86_64", target_os = "freebsd"))]
 core::arch::global_asm!(
     ".globl _start",
     ".type _start,@function",
@@ -109,7 +111,7 @@ core::arch::global_asm!(
     "call hospes_rt_entry",
     "ud2",
 );
-#[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+#[cfg(all(feature = "global", target_arch = "x86_64", target_os = "linux"))]
 core::arch::global_asm!(
     ".globl _start",
     ".type _start,@function",
@@ -120,7 +122,7 @@ core::arch::global_asm!(
     "call hospes_rt_entry",
     "ud2",
 );
-#[cfg(target_arch = "aarch64")]
+#[cfg(all(feature = "global", target_arch = "aarch64"))]
 core::arch::global_asm!(
     ".globl _start",
     ".type _start,%function",
@@ -140,7 +142,7 @@ core::arch::global_asm!(
 
 
 // FreeBSD brands static binaries by this note (NT_FREEBSD_ABI_TAG).
-#[cfg(target_os = "freebsd")]
+#[cfg(all(feature = "global", target_os = "freebsd"))]
 core::arch::global_asm!(
     ".section .note.tag,\"a\",%note",
     ".p2align 2",

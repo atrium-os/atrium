@@ -16,6 +16,9 @@ atrium-media-demux  = { path = "../demux" }
 atrium-media-decode = { path = "../decode" }
 libc = "0.2"
 
+[features]
+h264 = ["atrium-media-decode/h264", "atrium-player/h264"]
+
 [dev-dependencies]
 md-5 = "0.10"
 # tests/audio.rs: a stand-in choragusd.

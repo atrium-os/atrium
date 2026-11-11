@@ -26,6 +26,7 @@ mod nr {
     pub const EXIT_GROUP: usize = 231;
     pub const OPENAT: usize = 257;
     pub const GETRANDOM: usize = 318;
+    pub const NANOSLEEP: usize = 35;
 }
 #[cfg(target_arch = "aarch64")]
 mod nr {
@@ -46,6 +47,7 @@ mod nr {
     pub const MPROTECT: usize = 226;
     pub const MADVISE: usize = 233;
     pub const GETRANDOM: usize = 278;
+    pub const NANOSLEEP: usize = 101;
 }
 pub const SYS_EXIT: usize = nr::EXIT;
 const SYS_CLONE: usize = if cfg!(target_arch = "x86_64") { 56 } else { 220 };
@@ -237,3 +239,28 @@ pub fn linux_hwcap(auxv: &[(usize, usize)]) -> (usize, usize) {
 
 /// On Linux the stack pointer points at argc at entry.
 pub const ENTRY_ARG_IS_FIRST_REG: bool = false;
+
+pub fn realtime() -> (i64, i64) {
+    let mut ts = [0i64; 2];
+    let _ = call(nr::CLOCK_GETTIME, [0, ts.as_mut_ptr() as usize, 0, 0, 0, 0]);
+    (ts[0], ts[1])
+}
+
+pub fn nanosleep(sec: i64, nsec: i64) {
+    let ts = [sec, nsec];
+    let _ = call(nr::NANOSLEEP, [ts.as_ptr() as usize, 0, 0, 0, 0, 0]);
+}
+
+/// FUTEX_WAIT_BITSET | FUTEX_CLOCK_REALTIME with an absolute deadline. True if it timed out.
+pub unsafe fn futex_wait_until_realtime(addr: *const u32, val: u32, sec: i64, nsec: i64) -> bool {
+    let ts = [sec, nsec];
+    let r = call(nr::FUTEX, [addr as usize, 9 | 256, val as usize, ts.as_ptr() as usize, 0, 0xffff_ffff]);
+    r == Err(Errno(110))
+}
+
+/// Create or truncate `path` (NUL-terminated) for writing, mode 0644.
+pub fn create(path: &[u8]) -> R<i32> {
+    debug_assert!(path.last() == Some(&0));
+    // O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC
+    call(nr::OPENAT, [AT_FDCWD as usize, path.as_ptr() as usize, 0x1 | 0x40 | 0x200 | O_CLOEXEC, 0o644, 0, 0]).map(|v| v as i32)
+}

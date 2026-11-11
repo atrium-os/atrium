@@ -10,6 +10,12 @@ build       = "build.rs"
 
 [dependencies]
 atrium-media-demux = { path = "../demux" }
+hospes-codec-wire = { path = "../../hospes/hospes-codec-wire", features = ["std"], optional = true }
+
+[features]
+# H.264 through Cisco's OpenH264 binary under Hospes (hospes.md §9; off by default,
+# atrium-player.md §9.3).
+h264 = ["dep:hospes-codec-wire"]
 
 [build-dependencies]
 cc         = "1"

@@ -179,7 +179,10 @@ official arm64 CDM exists, OpenH264 only decodes Baseline/no-B-frame content cor
 H1 done 2026-11-11 (`docs/reviews/2026-11-11-hospes-h1.md`): `hospes-elf` parser, `no_std`
 `hospes-rt` (raw syscalls, allocator, glibc-shaped TLS, threads, loader); 11/11 fixtures pass
 on FreeBSD amd64 and arm64 incl. the capability-mode isolation probe; real CDM and OpenH264
-map and relocate. Next: H2 (glibc shim for OpenH264, `hospes-codec`). Run: `scripts/hospes-build.sh`.
+map and relocate. H2 done 2026-11-11 (`docs/reviews/2026-11-11-hospes-h2.md`): `hospes-glibc`
+shim for OpenH264's 71 imports, `hospes-codec` (capability mode), player `h264` feature; 12/12
+conformance streams bit-identical to glibc on Linux and FreeBSD amd64/arm64, player plays
+H.264 in the FreeBSD arm64 VM. Next: H3 (`hospes-cdm` with the test CDM). Run: `scripts/hospes-build.sh`.
 
 ## 6. Navigator exploration coverage
 

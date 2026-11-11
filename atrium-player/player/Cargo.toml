@@ -35,6 +35,10 @@ nuntius  = { path = "../../nuntius" }
 # --headless prints frame hashes comparable with ffmpeg's framemd5.
 md-5     = "0.10"
 
+[features]
+# Start hospes-codec beside the worker when OpenH264 is installed (hospes.md §9).
+h264 = []
+
 [dev-dependencies]
 # examples/media_probe.rs: limend in process, and the capture.
 aqueduct = { path = "../../aqueduct" }
