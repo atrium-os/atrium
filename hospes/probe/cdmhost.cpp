@@ -60,6 +60,15 @@ struct H : Host_10 {
 static void pump(double secs);
 static std::vector<uint8_t> slurp(const std::string &p) { std::vector<uint8_t> v; FILE *f = fopen(p.c_str(), "rb"); if (!f) return v;
   fseek(f, 0, SEEK_END); long n = ftell(f); fseek(f, 0, SEEK_SET); v.resize(n); if (fread(v.data(), 1, n, f) != (size_t)n) v.clear(); fclose(f); return v; }
+// Chrome's MP4 parser hands the CDM Annex-B H.264 (start codes, SPS/PPS before each IDR),
+// not the container's length-prefixed form. H0_ANNEXB=1 does the same here.
+static std::vector<uint8_t> to_annexb(const uint8_t *smp, uint32_t sz, std::vector<SubsampleEntry> &subs, const std::vector<uint8_t> &ps) {
+  std::vector<uint8_t> v(smp, smp + sz); bool idr = false;
+  for (size_t q = 0; q + 5 <= v.size();) { uint32_t l = (v[q] << 24) | (v[q+1] << 16) | (v[q+2] << 8) | v[q+3];
+    if ((v[q+4] & 0x1f) == 5) idr = true; v[q] = v[q+1] = v[q+2] = 0; v[q+3] = 1; q += 4 + l; }
+  if (idr) { v.insert(v.begin(), ps.begin(), ps.end()); if (!subs.empty()) subs[0].clear_bytes += ps.size(); }
+  return v;
+}
 static int play() {
   std::vector<uint8_t> resp; for (int i = 0; i < 600 && resp.empty(); i++) { pump(0.05); resp = slurp(dir + "/resp.bin"); }
   if (resp.empty()) { printf("no licence response\n"); return 3; }
@@ -69,8 +78,10 @@ static int play() {
   std::vector<uint8_t> kid(16); { std::vector<uint8_t> k = slurp(dir + "/kid.hex"); for (int i = 0; i < 16; i++) { char h[3] = {(char)k[2*i], (char)k[2*i+1], 0}; kid[i] = strtol(h, 0, 16); } }
   std::vector<uint8_t> in = slurp(dir + "/samples.bin"), ps = slurp(dir + "/paramsets.h264");
   if (getenv("H0_DECODE")) { // decrypt-and-decode path: the CDM decodes and returns I420 frames
-    std::vector<uint8_t> avcc = slurp(dir + "/avcc.bin");
-    VideoDecoderConfig_2 vc{}; vc.codec = kCodecH264; vc.profile = kH264ProfileBaseline; vc.format = kI420; vc.coded_size = {192, 144};
+    std::vector<uint8_t> avcc = getenv("H0_ANNEXB") ? std::vector<uint8_t>() : slurp(dir + "/avcc.bin");
+    bool vp9 = getenv("H0_CODEC") && !strcmp(getenv("H0_CODEC"), "vp9");
+    int W = getenv("H0_W") ? atoi(getenv("H0_W")) : 192, Hh = getenv("H0_H") ? atoi(getenv("H0_H")) : 144;
+    VideoDecoderConfig_2 vc{}; vc.codec = vp9 ? kCodecVp9 : kCodecH264; vc.profile = vp9 ? kVP9Profile0 : kH264ProfileBaseline; vc.format = kI420; vc.coded_size = {W, Hh};
     vc.extra_data = avcc.data(); vc.extra_data_size = avcc.size(); vc.encryption_scheme = EncryptionScheme::kCenc;
     printf("InitializeVideoDecoder -> %u\n", cdmi->InitializeVideoDecoder(vc));
     struct VF : VideoFrame { VideoFormat f{}; cdm::Size sz{}; Buffer *b = 0; uint32_t off[3]{}, st[3]{}; int64_t ts = 0;
@@ -85,6 +96,7 @@ static int play() {
       uint32_t sz; memcpy(&sz, &in[p], 4); uint8_t enc = in[p+4]; p += 5; const uint8_t *smp = &in[p]; p += sz;
       uint8_t iv[16]; memcpy(iv, &in[p+1], 16); p += 17; uint32_t ns; memcpy(&ns, &in[p], 4); p += 4;
       std::vector<SubsampleEntry> subs(ns); for (uint32_t i = 0; i < ns; i++) { memcpy(&subs[i].clear_bytes, &in[p], 4); memcpy(&subs[i].cipher_bytes, &in[p+4], 4); p += 8; }
+      std::vector<uint8_t> ab; if (getenv("H0_ANNEXB")) { ab = to_annexb(smp, sz, subs, ps); smp = ab.data(); sz = ab.size(); }
       InputBuffer_2 ib{}; ib.data = smp; ib.data_size = sz; ib.timestamp = idx * 1000;
       if (enc) { ib.encryption_scheme = EncryptionScheme::kCenc; ib.key_id = kid.data(); ib.key_id_size = 16; ib.iv = iv; ib.iv_size = 16; ib.subsamples = ns ? subs.data() : nullptr; ib.num_subsamples = ns; }
       VF vf; Status st = cdmi->DecryptAndDecodeFrame(ib, &vf); stats[st]++;
@@ -98,22 +110,29 @@ static int play() {
     fclose(yuv); for (auto &kv : stats) printf("status %d: %d\n", kv.first, kv.second);
     cdmi->Destroy(); return stats[kSuccess] ? 0 : 6;
   }
-  FILE *out = fopen((dir + "/clear.h264").c_str(), "wb"); fwrite(ps.data(), 1, ps.size(), out);
+  bool ivf = getenv("H0_CODEC") && !strcmp(getenv("H0_CODEC"), "vp9"); int nfr = 0;
+  FILE *out = fopen((dir + (ivf ? "/clear.ivf" : "/clear.h264")).c_str(), "wb");
+  if (ivf) { uint8_t h[32] = {'D','K','I','F',0,0,32,0,'V','P','9','0'}; int W = getenv("H0_W") ? atoi(getenv("H0_W")) : 0, Hh = getenv("H0_H") ? atoi(getenv("H0_H")) : 0;
+    h[12] = W & 255; h[13] = W >> 8; h[14] = Hh & 255; h[15] = Hh >> 8; h[16] = 24; h[20] = 1; fwrite(h, 1, 32, out); }
+  else fwrite(ps.data(), 1, ps.size(), out);
   size_t p = 0; int ok = 0, fail = 0, clear = 0;
   while (p + 5 <= in.size()) {
     uint32_t sz; memcpy(&sz, &in[p], 4); uint8_t enc = in[p+4]; p += 5; const uint8_t *smp = &in[p]; p += sz;
     uint8_t ivlen = in[p]; uint8_t iv[16]; memcpy(iv, &in[p+1], 16); p += 17; uint32_t ns; memcpy(&ns, &in[p], 4); p += 4;
     std::vector<SubsampleEntry> subs(ns); for (uint32_t i = 0; i < ns; i++) { memcpy(&subs[i].clear_bytes, &in[p], 4); memcpy(&subs[i].cipher_bytes, &in[p+4], 4); p += 8; }
-    std::vector<uint8_t> plain;
+    std::vector<uint8_t> plain, ab;
+    if (getenv("H0_ANNEXB")) { ab = to_annexb(smp, sz, subs, ps); smp = ab.data(); sz = ab.size(); }
     if (enc) {
       InputBuffer_2 ib{}; ib.data = smp; ib.data_size = sz; ib.encryption_scheme = EncryptionScheme::kCenc; ib.key_id = kid.data(); ib.key_id_size = 16;
       ib.iv = iv; ib.iv_size = 16; (void)ivlen; ib.subsamples = ns ? subs.data() : nullptr; ib.num_subsamples = ns; ib.timestamp = 0;
       struct DB : DecryptedBlock { Buffer *b = 0; int64_t ts = 0; void SetDecryptedBuffer(Buffer *x) override { b = x; } Buffer *DecryptedBuffer() override { return b; }
         void SetTimestamp(int64_t t) override { ts = t; } int64_t Timestamp() const override { return ts; } } db;
       Status st = cdmi->Decrypt(ib, &db);
-      if (st != kSuccess || !db.b) { fail++; static int last = -2; int idx = ok + fail + clear - 1; if (idx != last + 1) printf("Decrypt failed: %u from sample %d (size %u, subsamples %u)\n", st, idx, sz, ns); last = idx; continue; }
+      if (st != kSuccess || !db.b) { fail++; { static FILE *fl = fopen((dir + "/failed.txt").c_str(), "w"); fprintf(fl, "%d\n", ok + fail + clear - 1); fflush(fl); } static int last = -2; int idx = ok + fail + clear - 1; if (idx != last + 1) printf("Decrypt failed: %u from sample %d (size %u, subsamples %u)\n", st, idx, sz, ns); last = idx; continue; }
       plain.assign(db.b->Data(), db.b->Data() + db.b->Size()); db.b->Destroy(); ok++;
     } else { plain.assign(smp, smp + sz); clear++; }
+    if (!ab.empty()) { fwrite(plain.data(), 1, plain.size(), out); continue; }
+    if (ivf) { uint32_t l = plain.size(); uint64_t ts = nfr++; fwrite(&l, 4, 1, out); fwrite(&ts, 8, 1, out); fwrite(plain.data(), 1, l, out); continue; }
     for (size_t q = 0; q + 4 <= plain.size();) { uint32_t l = (plain[q] << 24) | (plain[q+1] << 16) | (plain[q+2] << 8) | plain[q+3]; q += 4;
       if (q + l > plain.size()) break; static const uint8_t sc[4] = {0,0,0,1}; fwrite(sc, 1, 4, out); fwrite(&plain[q], 1, l, out); q += l; }
   }

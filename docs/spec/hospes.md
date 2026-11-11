@@ -289,10 +289,12 @@ The CDM advertises what it supports; Hospes uses the first that works:
    I420 frames in slots; the worker converts them into the Fresco video layer as it already
    does for dav1d output.
 
-**H0b (2026-11-11):** with a real test licence, decrypt-only returned clear samples for 940
-of 1,300 encrypted H.264 samples and `kNoKey` for the rest, deterministically. The CDM may
-require the decrypt-and-decode path for codecs it can decode; that path has not produced
-frames in our harness yet. The preference order is settled in H3 on Linux.
+**H0b (2026-11-11) settles the order: video uses decrypt-and-decode.** Widevine refuses part
+of every decrypt-only video stream (VP9 keyframes; 28% of H.264 non-IDR samples), so a
+decrypt-only stream cannot play. Its decrypt-and-decode path returned every frame for H.264
+and VP9, bit-identical to ffmpeg where comparable. Hospes must hand it H.264 in **Annex-B**
+with SPS/PPS before each IDR (as Chrome's MP4 parser does), adjusting the first subsample's
+clear bytes. Decrypt-only remains the path for audio. Decision 7 is revised accordingly.
 
 Either way the worker checks every returned size against the slot and the declared frame
 size before copying anything. At Widevine L3 nothing here is a protected path; the frames are
@@ -443,8 +445,8 @@ to four days. It needs the user's consent to download the two libraries (§14 de
    both.*
 6. **Storage id:** a random per-origin id, wiped with site data, rather than none (which
    some services reject) or one per device (a tracking identifier). *Recommend per-origin.*
-7. **Decrypt-only preferred** (§8.3) whenever the CDM offers it, so decoding stays in our
-   hardened decoders. *Recommend yes.*
+7. ~~**Decrypt-only preferred**~~ **Revised by H0b:** video must use decrypt-and-decode (the
+   CDM refuses part of every decrypt-only video stream); decrypt-only for audio (§8.3).
 
 ## 15. Build order
 
