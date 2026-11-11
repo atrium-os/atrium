@@ -1,5 +1,7 @@
 # Scoping: our own secure Linux compatibility layer
 
+> Architecture for option D: `docs/spec/hospes.md` (2026-11-11).
+
 **Status:** scoping study, 2026-11-07. Nothing built. §9 decisions 1–3 and 6 decided by
 Shankar 2026-11-07; 4–5 stand as recommended.
 **Question (Shankar):** FreeBSD's Linux emulation (the linuxulator) has a long CVE history,

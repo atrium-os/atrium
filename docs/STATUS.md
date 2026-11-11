@@ -172,6 +172,8 @@ Open (2026-11-07): how to host the CDM without the linuxulator — scoping study
 (ELF loader + glibc shim, no kernel Linux ABI) for the CDM and OpenH264, and a micro-VM lane
 for any future Linux apps. Accepted by Shankar 2026-11-07 (build first, then approach
 Google for a licence and a native CDM build); specs amended.
+Architecture proposed 2026-11-11: `docs/spec/hospes.md` (Hospes; build order H0–H5, seven
+decisions in §14 await Shankar).
 
 ## 6. Navigator exploration coverage
 
