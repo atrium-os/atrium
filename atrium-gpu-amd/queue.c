@@ -834,7 +834,8 @@ amd_hwq_init(struct atrium_amd_softc *sc, device_t dev)
 		struct atrium_amd_hwq *q = &sc->hwq[i];
 
 		bzero(q, sizeof(*q));
-		sx_init(&q->lock, "atrium_amd_hwq");
+		/* DUPOK: amd_hwq_reset_prepare holds them all, always in index order. */
+		sx_init_flags(&q->lock, "atrium_amd_hwq", SX_DUPOK);
 		q->qid = i;
 		q->engine = (i == ATRIUM_AMD_GFX_QID) ?
 		    ATRIUM_GPU_ENGINE_GFX : ATRIUM_GPU_ENGINE_COMPUTE;

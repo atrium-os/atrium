@@ -62,15 +62,14 @@ cdevpriv, and per-module bindgen). `gpu/Makefile` sets `RUST_SRCS`, `RUST_BINDGE
 | kernel | atrium_gpu_test | test_gpu_isolation |
 |---|---|---|
 | ATRIUM-NODEBUG | ALL OK | 71/71, ALL OK (part F: 9216 MiB VRAM churn, no ENOMEM, no scrub failure) |
-| ATRIUM-KASAN (KASAN + INVARIANTS + WITNESS) | ALL OK | 71/71, ALL OK; no KASAN report; WITNESS only flags the C reset path (below) |
+| ATRIUM-KASAN (KASAN + INVARIANTS + WITNESS) | ALL OK | 71/71, ALL OK; no KASAN report, no WITNESS report from the driver |
 
 The first KASAN run panicked in `amd_rs_open`. The cause was not the driver: KPI patch 0004
 had set the KASAN shadow offset for arm64 only, so on amd64 every instrumented Rust function
 faulted on its first stack poison. Patch 0008 fixes it.
 
-WITNESS reports "acquiring duplicate lock of same type atrium_amd_hwq" from
-`amd_hwq_reset_prepare` (`queue.c`, C, unchanged by the port). It takes every queue's sx in
-index order, so it cannot deadlock; `SX_DUPOK` on that lock would silence it.
+WITNESS also flagged the C reset path (`amd_hwq_reset_prepare` takes every queue lock, in
+index order). The queue locks are now `SX_DUPOK`.
 
 The all-C module from before the port gives the same results on the same kernel (re-run the same day). Neither version's PCI module unloads (EBUSY), so reload means reboot, as before. The module
 grows from 78 KB to 189 KB, mostly Rust's libcore pieces.

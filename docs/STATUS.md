@@ -72,7 +72,7 @@ header `include/atrium/gpu_abi_v2.h` is normative).
 - **Client layer in Rust** (2026-11-11, [atrium-gpu-amd/rs/README.md](../atrium-gpu-amd/rs/README.md)):
   ioctls, VM/BO/syncobj fds, VM_BIND and per-open state are Rust; the hardware backend stays C
   behind `backend.rs`. G1 is now enforced by the type (binding table inside an `SxLock`).
-  gpusim amd64, NODEBUG and KASAN+WITNESS: suite ALL OK, isolation 71/71, same as the all-C module; no KASAN report. KPI patches 0006–0008 (0008: amd64 Rust KASAN shadow offset). Open: WITNESS duplicate-lock warning in C `amd_hwq_reset_prepare` (needs `SX_DUPOK`).
+  gpusim amd64, NODEBUG and KASAN+WITNESS: suite ALL OK, isolation 71/71, same as the all-C module; no KASAN report. KPI patches 0006–0008 (0008: amd64 Rust KASAN shadow offset).
   Next: the doorbell mmap path, then submit validation; R9700 run when the GPU is quiet.
 - jaild policy lists atrium-gpu-amd as **experimental (passed, not granted)**;
   a silicon run of `test_gpu_isolation` is required before production.
