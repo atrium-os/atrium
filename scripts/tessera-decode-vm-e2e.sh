@@ -36,7 +36,9 @@ deploy() {
     st=$(mktemp -d)
     for m in $mods; do cp "$OUT/$m" "$st/"; done
     cp "$TOOLS/mkfs-tessera" "$TOOLS/tessera-fsck" "$st/"
-    tar cf - -C "$st" . | "$VSSH" "mkdir -p /root/d3 && tar xf - -C /root/d3 && cd /root/d3 && sha256 -q $mods"
+    # --no-xattrs: macOS tar would carry com.apple.provenance, which the
+    # guest's tar cannot restore; it then exits non-zero and the && stops.
+    tar --no-xattrs -cf - -C "$st" . | "$VSSH" "mkdir -p /root/d3 && tar xf - -C /root/d3 && cd /root/d3 && sha256 -q $mods"
     (cd "$st" && sha256sum $mods | cut -d' ' -f1)
     rm -r "$st"
 }
