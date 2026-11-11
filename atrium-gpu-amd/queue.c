@@ -33,8 +33,9 @@
  *            a queue, for any reason, fails what it owed with EIO, so a waiter
  *            learns its work is gone and the next VM gets the queue.
  *
- * Lock order: hwq->lock (sx), then a pager object's lock or sc->defer_lock,
- * then sc->lock. Nothing here sleeps holding sc->lock or defer_lock.
+ * Lock order: hwq->lock (sx), then a pager object's lock or the deferred
+ * list's lock (rs/defer.rs), then sc->lock. Nothing sleeps holding sc->lock
+ * or the deferred list's lock.
  */
 #include "atrium_gpu_amd.h"
 #include "atrium_gpu_amd_abi.h"
@@ -318,83 +319,41 @@ amd_hwq_busy_snapshot(struct atrium_amd_softc *sc, const uint16_t *vmids,
 	return (mask);
 }
 
-void
-amd_hwq_defer_bo(struct atrium_amd_softc *sc, struct atrium_amd_bo *bo,
-    uint32_t busy_mask, const uint64_t *gen)
+/* Which queues are busy now, under any VM, with their generations. */
+uint32_t
+amd_hwq_busy_now(struct atrium_amd_softc *sc, uint64_t *gen)
 {
-	struct atrium_amd_deferred *d;
+	uint32_t mask = 0;
 	int i;
 
-	d = malloc(sizeof(*d), M_DEVBUF, M_WAITOK | M_ZERO);
-	d->bo = bo;
-	d->busy_mask = busy_mask;
-	for (i = 0; i < ATRIUM_AMD_NHWQ; i++)
-		d->gen[i] = gen[i];
-	mtx_lock(&sc->defer_lock);
-	TAILQ_INSERT_TAIL(&sc->deferred, d, link);
-	mtx_unlock(&sc->defer_lock);
-	mtx_lock(&sc->lock);
-	sc->iso.deferred++;
-	sc->iso.deferred_now++;
-	mtx_unlock(&sc->lock);
+	for (i = 0; i < ATRIUM_AMD_NHWQ; i++) {
+		struct atrium_amd_hwq *q = &sc->hwq[i];
+
+		sx_slock(&q->lock);
+		gen[i] = q->gen;
+		if (amd_hwq_busy(sc, q))
+			mask |= 1u << i;
+		sx_sunlock(&q->lock);
+	}
+	return (mask);
+}
+
+void
+amd_hwq_defer_kick(struct atrium_amd_softc *sc)
+{
 	taskqueue_enqueue_timeout(taskqueue_thread, &sc->defer_task,
 	    AMD_REAP_TICKS);
 }
 
 /*
- * Free every deferred BO whose queues have moved on: each queue that was busy
- * at close time is now idle, or has been reprogrammed or stopped since (its
- * generation changed, which only happens once it drained or was dequeued).
+ * The deferred-free list itself is the front-end's (rs/defer.rs): it frees
+ * every BO whose queues have moved on. Run it, and again later while BOs wait.
  */
 static void
 amd_hwq_reap(struct atrium_amd_softc *sc)
 {
-	TAILQ_HEAD(, atrium_amd_deferred) done = TAILQ_HEAD_INITIALIZER(done);
-	struct atrium_amd_deferred *d, *tmp;
-	uint64_t gen[ATRIUM_AMD_NHWQ];
-	bool busy[ATRIUM_AMD_NHWQ];
-	int i, n = 0, left;
-
-	for (i = 0; i < ATRIUM_AMD_NHWQ; i++) {
-		sx_slock(&sc->hwq[i].lock);
-		gen[i] = sc->hwq[i].gen;
-		busy[i] = amd_hwq_busy(sc, &sc->hwq[i]);
-		sx_sunlock(&sc->hwq[i].lock);
-	}
-	mtx_lock(&sc->defer_lock);
-	TAILQ_FOREACH_SAFE(d, &sc->deferred, link, tmp) {
-		bool retired = true;
-
-		for (i = 0; i < ATRIUM_AMD_NHWQ; i++) {
-			if ((d->busy_mask & (1u << i)) != 0 &&
-			    gen[i] == d->gen[i] && busy[i]) {
-				retired = false;
-				break;
-			}
-		}
-		if (retired) {
-			TAILQ_REMOVE(&sc->deferred, d, link);
-			TAILQ_INSERT_TAIL(&done, d, link);
-		}
-	}
-	left = !TAILQ_EMPTY(&sc->deferred);
-	mtx_unlock(&sc->defer_lock);
-
-	TAILQ_FOREACH_SAFE(d, &done, link, tmp) {
-		sc->backend->bo_free(d->bo);
-		amd_bo_free_struct(d->bo);
-		free(d, M_DEVBUF);
-		n++;
-	}
-	if (n > 0) {
-		mtx_lock(&sc->lock);
-		sc->iso.reaped += n;
-		sc->iso.deferred_now -= n;
-		mtx_unlock(&sc->lock);
-	}
-	if (left)
-		taskqueue_enqueue_timeout(taskqueue_thread, &sc->defer_task,
-		    AMD_REAP_TICKS);
+	if (amd_rs_reap(sc))
+		amd_hwq_defer_kick(sc);
 }
 
 static void
@@ -756,8 +715,7 @@ amd_hwq_init(struct atrium_amd_softc *sc, device_t dev)
 		q->doorbell_off = (i == ATRIUM_AMD_GFX_QID) ?
 		    ATRIUM_AMD_GFX_DOORBELL : ATRIUM_AMD_COMPUTE_DOORBELL;
 	}
-	mtx_init(&sc->defer_lock, "atrium_amd_defer", NULL, MTX_DEF);
-	TAILQ_INIT(&sc->deferred);
+	sc->rs_state = amd_rs_dev_init();
 	TIMEOUT_TASK_INIT(taskqueue_thread, &sc->defer_task, 0,
 	    amd_hwq_reap_task, sc);
 	TIMEOUT_TASK_INIT(taskqueue_thread, &sc->watchdog_task, 0,
@@ -856,6 +814,7 @@ amd_hwq_fini(struct atrium_amd_softc *sc)
 	amd_dma_page_free(&sc->null_pd);
 	for (i = 0; i < ATRIUM_AMD_NHWQ; i++)
 		sx_destroy(&sc->hwq[i].lock);
-	mtx_destroy(&sc->defer_lock);
+	amd_rs_dev_fini(sc->rs_state);
+	sc->rs_state = NULL;
 	sc->hwq_inited = 0;
 }

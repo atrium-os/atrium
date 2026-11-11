@@ -40,6 +40,23 @@ amd_rs_grant_count(struct atrium_amd_softc *sc, int live, int created)
 	mtx_unlock(&sc->lock);
 }
 
+void *
+amd_rs_state(struct atrium_amd_softc *sc)
+{
+	return (sc->rs_state);
+}
+
+void
+amd_rs_defer_count(struct atrium_amd_softc *sc, int now, int reaped)
+{
+	mtx_lock(&sc->lock);
+	sc->iso.deferred_now += now;	/* amd_hwq_busy_refs holds detach for these */
+	if (now > 0)
+		sc->iso.deferred += now;
+	sc->iso.reaped += reaped;
+	mtx_unlock(&sc->lock);
+}
+
 struct atrium_amd_softc *
 amd_rs_cdev_softc(struct cdev *cdev)
 {

@@ -19,7 +19,7 @@ CFLAGS+= -I${.CURDIR}/..
 # (declared in ../rs/sys.rs).
 RUST_SRCS=	amd_frontend.rs
 RUST_BINDGEN_HDR= ../rs/sys.h
-RUST_BINDGEN_ALLOW= atrium_amd_(bo|vm|dma_page|syncobj|client)|atrium_gpu_.*|ATRIUM_GPU_.*|ATRIUM_AMD_(BO_MAX_PAGES|BO_MAX_BIND|NHWQ|BO_VA_BASE|VM_MAX_BO|VM_NUM_PT)|atrium_rs_ioc|ATRIUM_RS_IOC_.*|amd_rs_(backend|irqs|syncobj_count|grant_count|cdev_softc)|amd_pending_scrub|amd_hwq_(busy_snapshot|defer_bo|client_close)
+RUST_BINDGEN_ALLOW= atrium_amd_(bo|vm|dma_page|syncobj|client)|atrium_gpu_.*|ATRIUM_GPU_.*|ATRIUM_AMD_(BO_MAX_PAGES|BO_MAX_BIND|NHWQ|BO_VA_BASE|VM_MAX_BO|VM_NUM_PT)|atrium_rs_ioc|ATRIUM_RS_IOC_.*|amd_rs_(backend|irqs|syncobj_count|grant_count|cdev_softc|state|defer_count)|amd_pending_scrub|amd_hwq_(busy_snapshot|busy_now|defer_kick|client_close)
 
 # Build identity for the gpu-isolation attestation gate (gpu-isolation.md,
 # "Attestation freshness"): the last commit that touched the driver tree, with

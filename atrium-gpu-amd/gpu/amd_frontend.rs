@@ -24,3 +24,5 @@ pub mod bo;
 pub mod ioctl;
 #[path = "../rs/doorbell.rs"]
 pub mod doorbell;
+#[path = "../rs/defer.rs"]
+pub mod defer;

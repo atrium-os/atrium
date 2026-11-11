@@ -13,10 +13,11 @@ layer that faces clients. The hardware half stays C for now.
 | buffer objects as fds: binding into VMs, unbinding, deferred free (`bo.rs`) | DMA pages and VRAM backing, scanout export (`bo.c`) |
 | timeline syncobjs: wait, kqueue, the display's watcher (`syncobj.rs`) | the EOP interrupt, which signals or fails a syncobj (`irq.c`) |
 | doorbell mapping grants: the device pager's fault handler, the grant's lifetime, revoke (`doorbell.rs`, on `kpi::pager`) | queues: ownership, programming, the hang watchdog, and which doorbell a client may map and when it is revoked (`queue.c`) |
+| deferred BO frees: the list and the reaper (`defer.rs`); a BO stays a Rust `Box` until it is freed, C never owns it | the reaper's timer and the per-queue busy/generation state it reads (`queue.c`) |
 | the single place Rust calls C (`backend.rs`) | |
 
 C reaches the Rust objects through a few `#[no_mangle]` exports: `amd_syncobj_*`,
-`amd_bo_fget`, `amd_bo_free_struct`, and `amd_db_grant_create`/`amd_db_grant_revoke`
+`amd_bo_fget`, `amd_rs_reap`/`amd_rs_dev_init`/`amd_rs_dev_fini`, and `amd_db_grant_create`/`amd_db_grant_revoke`
 (called by `queue.c` under the queue's lock). VM and BO are `#[repr(C)]`, and their
 first field is the C backend struct, so a C pointer and a Rust pointer to the same object are
 the same address. Syncobjs and clients are opaque to C. The softc is opaque to Rust and is

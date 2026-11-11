@@ -13,6 +13,7 @@
  * ends, by design: the hardware half stays C for now.
  */
 
+use crate::defer::{BusyAt, DevState};
 use crate::sys;
 use core::ffi::{c_int, c_void};
 use kpi::prelude::*;
@@ -90,23 +91,37 @@ impl Dev {
 
     /// Which hardware queues may still be running work under any of `vmids`, and each queue's
     /// generation now (queue.c). Busy queues hold up a BO's free.
-    pub fn busy_snapshot(self, vmids: &[u16]) -> (u32, [u64; sys::ATRIUM_AMD_NHWQ as usize]) {
+    pub fn busy_snapshot(self, vmids: &[u16]) -> BusyAt {
         let mut vm = [0u16; sys::ATRIUM_AMD_BO_MAX_BIND as usize];
         let n = vmids.len().min(vm.len());
         vm[..n].copy_from_slice(&vmids[..n]);
         let mut gens = [0u64; sys::ATRIUM_AMD_NHWQ as usize];
-        let busy = unsafe { sys::amd_hwq_busy_snapshot(self.0, vm.as_mut_ptr(), n as c_int, gens.as_mut_ptr()) };
-        (busy, gens)
+        let mask = unsafe { sys::amd_hwq_busy_snapshot(self.0, vm.as_mut_ptr(), n as c_int, gens.as_mut_ptr()) };
+        BusyAt { mask, gens }
     }
 
-    /// Hand a BO to the deferred-free list: queue.c calls bo_free and then amd_bo_free_struct
-    /// once every queue in `busy` has drained past `gens` or been stopped.
-    ///
-    /// # Safety
-    ///
-    /// `bo` is a front-end BO with no bindings and no other user; ownership passes to C.
-    pub unsafe fn defer_bo(self, bo: *mut sys::atrium_amd_bo, busy: u32, mut gens: [u64; sys::ATRIUM_AMD_NHWQ as usize]) {
-        unsafe { sys::amd_hwq_defer_bo(self.0, bo, busy, gens.as_mut_ptr()) }
+    /// Which queues are busy now (under any VM), and each queue's generation (queue.c).
+    pub fn queues_now(self) -> BusyAt {
+        let mut gens = [0u64; sys::ATRIUM_AMD_NHWQ as usize];
+        let mask = unsafe { sys::amd_hwq_busy_now(self.0, gens.as_mut_ptr()) };
+        BusyAt { mask, gens }
+    }
+
+    /// The front-end's per-device state.
+    pub fn state(self) -> &'static DevState {
+        // SAFETY: set at attach (amd_hwq_init) and freed at detach after every object made
+        // from this device is gone.
+        unsafe { DevState::from_raw(sys::amd_rs_state(self.0)) }
+    }
+
+    /// Account deferred frees: `now` more (or fewer) waiting, `reaped` more completed.
+    pub fn defer_count(self, now: c_int, reaped: c_int) {
+        unsafe { sys::amd_rs_defer_count(self.0, now, reaped) }
+    }
+
+    /// Make sure the reaper runs soon.
+    pub fn defer_kick(self) {
+        unsafe { sys::amd_hwq_defer_kick(self.0) }
     }
 
     // --- submission and queues ---

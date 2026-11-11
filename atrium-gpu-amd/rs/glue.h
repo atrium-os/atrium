@@ -11,6 +11,8 @@ const struct atrium_gpu_backend_ops *amd_rs_backend(struct atrium_amd_softc *sc)
 void	amd_rs_irqs(struct atrium_amd_softc *sc, uint64_t *count, uint32_t *msix);
 void	amd_rs_syncobj_count(struct atrium_amd_softc *sc, int delta);
 void	amd_rs_grant_count(struct atrium_amd_softc *sc, int live, int created);
+void	*amd_rs_state(struct atrium_amd_softc *sc);
+void	amd_rs_defer_count(struct atrium_amd_softc *sc, int now, int reaped);
 struct atrium_amd_softc *amd_rs_cdev_softc(struct cdev *cdev);
 
 /* Rust, for C (rs/ioctl.rs): the cdevsw entry points. */
@@ -28,5 +30,11 @@ d_ioctl_t	amd_rs_ctl_ioctl;
 int	amd_db_grant_create(struct atrium_amd_softc *sc, uint64_t pa, int nprot,
 	    vm_object_t *out);
 void	amd_db_grant_revoke(vm_object_t obj);
+
+/* Rust, for C (rs/defer.rs): the front-end's per-device state, and the
+ * deferred BO-free pass (returns 1 while BOs still wait). */
+void	*amd_rs_dev_init(void);
+void	amd_rs_dev_fini(void *state);
+int	amd_rs_reap(struct atrium_amd_softc *sc);
 
 #endif

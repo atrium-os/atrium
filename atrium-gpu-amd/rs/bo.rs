@@ -21,6 +21,7 @@
  */
 
 use crate::backend::Dev;
+use crate::defer;
 use crate::sys;
 use crate::vm::Vm;
 use core::ffi::c_int;
@@ -47,7 +48,7 @@ struct Binding {
 #[repr(C)]
 pub struct Bo {
     /// The backend's part. Must stay the first field (C casts between the two).
-    hw: sys::atrium_amd_bo,
+    pub(crate) hw: sys::atrium_amd_bo,
     /// The bindings. A BO fd can be used by two threads (or passed to another process) at
     /// once, so two VM_BINDs of one BO race; in C both passed the "slot free" check and the
     /// second wrote one past the array (kmod audit 2026-11-07, G1). Here the slots can only
@@ -201,19 +202,19 @@ impl Drop for BoFile {
         // Work already queued under one of those VMs may still be using the pages (isolation
         // break 2): note which queues are busy now, before dropping the VM references (the
         // last one tears the VM down, which stops its queues).
-        let (busy, gens) = dev.busy_snapshot(&vmids[..n]);
+        let at = dev.busy_snapshot(&vmids[..n]);
         for b in binds.iter_mut() {
             *b = None; // drops the VM reference
         }
-        if busy != 0 {
-            // queue.c owns it now: bo_free + amd_bo_free_struct once the queues drain.
-            // SAFETY: no bindings left, and this was the last user.
-            unsafe { dev.defer_bo(bo.as_c(), busy, gens) };
+        // SAFETY: created by create_fd with Box; this was the last user and nothing else
+        // refers to it (no bindings left).
+        let mut bo = unsafe { Box::<Bo>::from_raw(self.0.as_ptr()) };
+        if at.mask != 0 {
+            // Freed by the reaper once those queues have moved on (defer.rs).
+            defer::defer(dev, bo, at);
             return;
         }
         dev.bo_free(&mut bo.hw); // backing store + bo_count--
-        // SAFETY: created by create_fd with Box; nothing refers to it any more.
-        drop(unsafe { Box::<Bo>::from_raw(self.0.as_ptr()) });
     }
 }
 
@@ -257,9 +258,3 @@ pub unsafe extern "C" fn amd_bo_fget(
     }
 }
 
-/// For queue.c's deferred-free reaper, after the backend's bo_free: free the BO itself.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn amd_bo_free_struct(bo: *mut sys::atrium_amd_bo) {
-    // SAFETY: a BO from create_fd whose BoFile has handed it on (bindings empty).
-    drop(unsafe { Box::<Bo>::from_raw(bo.cast::<Bo>()) });
-}

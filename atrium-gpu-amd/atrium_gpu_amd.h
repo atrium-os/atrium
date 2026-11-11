@@ -715,18 +715,6 @@ struct atrium_amd_hwq {
 					 * (rs/doorbell.rs), NULL = none */
 };
 
-/*
- * A BO whose pages could still be in use by queued GPU work when its last fd
- * closed (break 2). Its PTEs are already gone; the pages are freed once every
- * queue that was busy at close time has drained or been dequeued.
- */
-struct atrium_amd_deferred {
-	TAILQ_ENTRY(atrium_amd_deferred) link;
-	uint32_t	 busy_mask;
-	uint64_t	 gen[ATRIUM_AMD_NHWQ];
-	struct atrium_amd_bo *bo;
-};
-
 struct atrium_amd_isolation_stats {
 	uint64_t	 queue_waits;	/* submits that waited for another VM */
 	uint64_t	 queue_refused;	/* EBUSY: owned, or did not drain */
@@ -907,8 +895,7 @@ struct atrium_amd_softc {
 	int		 hwq_inited;
 	struct atrium_amd_dma_page null_pd; /* all-invalid page directory */
 	int		 db_fict_registered;
-	struct mtx	 defer_lock;
-	TAILQ_HEAD(, atrium_amd_deferred) deferred;
+	void		*rs_state;	/* the Rust front-end's (rs/defer.rs) */
 	struct timeout_task defer_task;
 	struct atrium_amd_isolation_stats iso;
 	struct timeout_task watchdog_task;
@@ -978,8 +965,6 @@ amd_ih_set_handler(struct atrium_amd_softc *sc, int cause,
  * drops with fdrop(). */
 int	 amd_bo_fget(struct thread *td, int fd, struct file **out_fp,
 	    struct atrium_amd_bo **out_bo);
-/* Free a BO whose backing the deferred-free reaper has released. */
-void	 amd_bo_free_struct(struct atrium_amd_bo *bo);
 /* amd backend: allocate/free a BO's backing (bus_dma System pages or a VRAM
  * bump); the front-end owns the struct/fd/bindings. */
 int	 amd_bo_backing_alloc(struct atrium_amd_softc *sc,
@@ -1085,8 +1070,10 @@ void	 amd_hwq_client_close(struct atrium_amd_softc *sc,
 void	 amd_hwq_vm_gone(struct atrium_amd_softc *sc, uint16_t vmid);
 uint32_t amd_hwq_busy_snapshot(struct atrium_amd_softc *sc,
 	    const uint16_t *vmids, int nvmids, uint64_t *gen);
-void	 amd_hwq_defer_bo(struct atrium_amd_softc *sc, struct atrium_amd_bo *bo,
-	    uint32_t busy_mask, const uint64_t *gen);
+/* Which queues are busy now (any VM), with their generations (rs/defer.rs). */
+uint32_t amd_hwq_busy_now(struct atrium_amd_softc *sc, uint64_t *gen);
+/* Run the deferred-free reaper soon (rs/defer.rs). */
+void	 amd_hwq_defer_kick(struct atrium_amd_softc *sc);
 void	 amd_hwq_reset_prepare(struct atrium_amd_softc *sc);
 void	 amd_hwq_reset_restore(struct atrium_amd_softc *sc);
 
