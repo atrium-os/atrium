@@ -270,6 +270,16 @@ vec4 shade(uint oi, vec2 pc) {
     return vec4(p1.rgb, p1.a * cov);
 }
 
+// Blend the open layer, at its opacity, over what was under it.
+#define POP_LAYER { \
+    float ga = da * o0; \
+    dr = dr * o0 + s0r * (1.0 - ga); \
+    dg = dg * o0 + s0g * (1.0 - ga); \
+    db = db * o0 + s0b * (1.0 - ga); \
+    da = ga + s0a * (1.0 - ga); \
+    sp = sp - 1u; \
+}
+
 uint encode(float v) {
     uint lo = 0u;
     for (uint step = 128u; step > 0u; step = step / 2u) {
@@ -291,8 +301,17 @@ void main() {
     uint tile = (y / TILE) * F.tiles_x + (x / TILE);
     // Premultiplied linear RGB and alpha: a surface's clear may be
     // transparent (compose blends it), the screen's is opaque.
-    vec3 dst = F.clear.rgb;
+    // Premultiplied colour and alpha, and the open layer (ISOLATE_DEPTH is
+    // 1): what was under it and its opacity. Scalars (no arrays, no vector
+    // selects), so every executor keeps them in registers; a deeper stack
+    // made the RDNA4 code spill.
+    float dr = F.clear.r;
+    float dg = F.clear.g;
+    float db = F.clear.b;
     float da = F.clear.a;
+    float s0r = 0.0; float s0g = 0.0; float s0b = 0.0; float s0a = 0.0; float o0 = 0.0;
+    uint sp = 0u;
+    uint over = 0u;
     for (uint w = 0u; w < F.wpt; w++) {
         uint bits = mask[tile * F.wpt + w];
         while (bits != 0u) {
@@ -302,14 +321,46 @@ void main() {
             if (oi >= F.op_count) {
                 break;
             }
-            vec4 src = shade(oi, pc);
-            dst = src.rgb * src.a + dst * (1.0 - src.a);
-            da = src.a + da * (1.0 - src.a);
+            // Whole-vector loads: the Tier-2 frontend takes no constant
+            // index after a dynamic one.
+            uvec4 meta = floatBitsToUint(opv[oi * OP_VEC4S + 4u]);
+            vec4 p1 = opv[oi * OP_VEC4S + 1u];
+            uint kind = meta.x;
+            if (kind == KIND_PUSH) {
+                if (sp >= ISOLATE_DEPTH) {
+                    over = over + 1u;
+                } else {
+                    s0r = dr; s0g = dg; s0b = db; s0a = da;
+                    o0 = clamp_(p1.x, 0.0, 1.0);
+                    sp = sp + 1u;
+                    dr = 0.0;
+                    dg = 0.0;
+                    db = 0.0;
+                    da = 0.0;
+                }
+            } else if (kind == KIND_POP) {
+                if (over > 0u) {
+                    over = over - 1u;
+                } else if (sp > 0u) {
+                    POP_LAYER
+                }
+            } else {
+                vec4 src = shade(oi, pc);
+                dr = src.r * src.a + dr * (1.0 - src.a);
+                dg = src.g * src.a + dg * (1.0 - src.a);
+                db = src.b * src.a + db * (1.0 - src.a);
+                da = src.a + da * (1.0 - src.a);
+            }
         }
     }
-    uint r = encode(dst.r);
-    uint g = encode(dst.g);
-    uint b = encode(dst.b);
+    for (uint k = 0u; k < ISOLATE_DEPTH; k++) {
+        if (sp > 0u) {
+            POP_LAYER
+        }
+    }
+    uint r = encode(dr);
+    uint g = encode(dg);
+    uint b = encode(db);
     uint a = uint(clamp_(da, 0.0, 1.0) * 255.0 + 0.5);
     target[y * F.pitch + x] = b | (g << 8) | (r << 16) | (a << 24);
 }

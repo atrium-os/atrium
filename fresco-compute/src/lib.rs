@@ -77,6 +77,15 @@ pub const KIND_TEXTURE: u32 = 2;
 pub const KIND_GLYPH: u32 = 3;
 /// A filled path ([`fill`]).
 pub const KIND_FILL: u32 = 4;
+/// Start an isolated layer (exact group opacity, fresco-scene-groups.md
+/// §2.4): `p1[0]` is its opacity, `p3` the group's box.
+pub const KIND_PUSH: u32 = 5;
+/// Blend the newest layer over what was under it (`p3` as its PUSH).
+pub const KIND_POP: u32 = 6;
+/// How many layers the raster kernel keeps open at once; pack draws
+/// isolated groups inside one with multiplied alpha instead. One: each
+/// more made the RDNA4 code spill (raster.comp).
+pub const ISOLATE_DEPTH: u32 = 1;
 
 /// The default clear colour, linear RGB (encodes to `#0A808C`), the same as
 /// `fresco_vulkan::HeadlessRenderer`.
@@ -185,6 +194,13 @@ pub enum Node {
     Quad(usize, usize),
     /// Batch and run of [`Scene::glyph_batches`].
     Run(usize, usize),
+    /// In [`Frame::pack_ordered`]'s order only: start an isolated group
+    /// whose opacity has these `f32` bits ([`KIND_PUSH`]); what follows up
+    /// to its [`Node::Pop`] is drawn into a layer, then blended at that
+    /// opacity (fresco-scene-groups.md §2.4, `ISOLATE`).
+    Push(u32),
+    /// Ends the newest [`Node::Push`].
+    Pop,
 }
 
 /// Everything one frame draws.
@@ -327,6 +343,11 @@ fn budget_owned(owned: Vec<(Op, Node)>, ops: &mut Vec<Op>, width: u32, height: u
     ops.extend(kept[..cut].iter().map(|(o, _)| *o));
     let mut last = None;
     for (_, n) in &kept[cut..] {
+        // A group's PUSH or POP is not a node a client sent; the kernel
+        // closes a layer left open by the cut.
+        if matches!(n, Node::Push(_) | Node::Pop) {
+            continue;
+        }
         if last != Some(*n) {
             dropped.push((*n, fill::drop::OP_BUDGET));
             last = Some(*n);
@@ -590,7 +611,39 @@ impl Frame {
         // Fills not drawn are reported in paint order, once each.
         let mut dropped = Vec::new();
         let mut owned: Vec<(Op, Node)> = Vec::new();
+        // Where each open group's PUSH sits in `owned`.
+        let mut open: Vec<usize> = Vec::new();
+        // Close the newest group: its PUSH and POP get the box of what it
+        // drew (so both bin to the same tiles); a group that drew nothing
+        // leaves no ops.
+        let close = |owned: &mut Vec<(Op, Node)>, at: usize| {
+            let b = owned[at + 1..].iter().map(|(o, _)| o.p3).filter(|b| b[0] < b[2] && b[1] < b[3]).reduce(|a, b| {
+                [a[0].min(b[0]), a[1].min(b[1]), a[2].max(b[2]), a[3].max(b[3])]
+            });
+            match b {
+                None => owned.truncate(at),
+                Some(b) => {
+                    owned[at].0.p3 = b;
+                    owned.push((Op { p3: b, meta: [KIND_POP, 0, 0, 0], ..Op::default() }, Node::Pop));
+                }
+            }
+        };
         for pl in order {
+            match pl.item {
+                Node::Push(bits) => {
+                    open.push(owned.len());
+                    let o = Op { p1: [f32::from_bits(bits), 0.0, 0.0, 0.0], meta: [KIND_PUSH, 0, 0, 0], ..Op::default() };
+                    owned.push((o, pl.item));
+                    continue;
+                }
+                Node::Pop => {
+                    if let Some(at) = open.pop() {
+                        close(&mut owned, at);
+                    }
+                    continue;
+                }
+                _ => {}
+            }
             let slice: &[Op] = match pl.item {
                 Node::Rect(i) => k.rects.get(i..=i).unwrap_or(&[]),
                 Node::Path(i) => k.paths.get(i..=i).unwrap_or(&[]),
@@ -605,8 +658,12 @@ impl Frame {
                 },
                 Node::Quad(b, q) => k.quads.get(b).and_then(|v| v.get(q..=q)).unwrap_or(&[]),
                 Node::Run(b, r) => k.runs.get(b).and_then(|v| v.get(r)).map(|v| v.as_slice()).unwrap_or(&[]),
+                Node::Push(_) | Node::Pop => unreachable!(),
             };
             owned.extend(slice.iter().filter_map(|op| clip_op(op, pl.clip)).map(|op| (op, pl.item)));
+        }
+        while let Some(at) = open.pop() {
+            close(&mut owned, at);
         }
         let mut ops: Vec<Op>;
         if owned.len() > MAX_OPS as usize {

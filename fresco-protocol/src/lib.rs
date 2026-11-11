@@ -1656,7 +1656,9 @@ pub mod group_flags {
     /// A scroll viewport: its translation is the scroll offset, and the
     /// renderer may shift what is drawn instead of redrawing it (§4).
     pub const SCROLL: u32 = 1 << 0;
-    /// Reserved: exact group opacity (draw to its own buffer, then blend).
+    /// Exact group opacity: the group is drawn into a layer, then blended at
+    /// its opacity (§2.4). One level: an isolated group inside another
+    /// multiplies its opacity down instead.
     pub const ISOLATE: u32 = 1 << 1;
     pub const KNOWN: u32 = SCROLL | ISOLATE;
 }

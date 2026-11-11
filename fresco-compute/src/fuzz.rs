@@ -196,15 +196,28 @@ pub fn corrupt(r: &mut Rng, f: &mut Frame) {
     // Extra ops past the scene's, then rewrite some fields of any op.
     for _ in 0..r.below(4) {
         let mut o = f.ops[r.below(f.ops.len() as u32) as usize];
-        o.meta[0] = r.below(5);
+        o.meta[0] = r.below(7);
         f.ops.push(o);
+    }
+    // Layers (KIND_PUSH / KIND_POP): runs of PUSHes, deeper than the
+    // kernel's stack at times, and stray POPs, anywhere in the list.
+    if r.chance(30) {
+        let n = f.ops.len() as u32;
+        for _ in 0..1 + r.below(ISOLATE_DEPTH + 3) {
+            let mut o = f.ops[r.below(n) as usize];
+            o.meta[0] = if r.chance(75) { KIND_PUSH } else { KIND_POP };
+            o.p3 = [-1.0, -1.0, fw + 1.0, fh + 1.0];
+            o.p1[0] = r.wild(-0.5, 1.5);
+            let at = r.below(f.ops.len() as u32 + 1) as usize;
+            f.ops.insert(at, o);
+        }
     }
     for o in f.ops.iter_mut() {
         if !r.chance(40) {
             continue;
         }
         match r.below(6) {
-            0 => o.meta[0] = if r.chance(70) { r.below(5) } else { r.word(8) },
+            0 => o.meta[0] = if r.chance(70) { r.below(7) } else { r.word(8) },
             1 => o.meta[1] = r.word(n_tex + 2),
             2 => {
                 let k = r.below(4) as usize;

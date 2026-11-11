@@ -59,7 +59,7 @@ pub struct GroupParams {
     pub clip: Option<[f32; 4]>,
     /// Multiplies every descendant's alpha (v1; see §2.4).
     pub opacity: f32,
-    /// group_flags: SCROLL (bit 0), ISOLATE (bit 1, reserved).
+    /// group_flags: SCROLL (bit 0), ISOLATE (bit 1, exact group opacity, §2.4).
     pub flags: u32,
 }
 ```
@@ -105,10 +105,22 @@ the same frame; frescod applies a frame atomically, so nothing is drawn half pla
 - **Rotation and skew of groups.** Rects, glyphs and textures are axis-aligned ops in the kernels,
   so a rotated group cannot be drawn without kernel work. A document that rotates content sends it
   as fills (which take a full affine already). Lifting this is a later kernel change.
-- **Exact group opacity.** v1 multiplies the group's opacity into each descendant's alpha. That
-  equals true group compositing only where descendants don't overlap; the Navigator's own notes say
-  nested opacity groups are not the same as multiplied alphas. `ISOLATE` is reserved for the exact
-  version (draw the group to its own buffer, then blend), which needs renderer work.
+- **Exact group opacity.** By default a group's opacity multiplies into each descendant's alpha.
+  That equals true group compositing only where descendants don't overlap; the Navigator's own
+  notes say nested opacity groups are not the same as multiplied alphas. A group with `ISOLATE`
+  set is drawn exactly. **Built 2026-11-11**: pack wraps the group's ops in two new kernel ops,
+  `KIND_PUSH` (its opacity, times what it inherited) and `KIND_POP`. Both carry the box of what
+  the group drew, so they bin to the same tiles. The raster kernel keeps a layer per pixel, in
+  registers: PUSH saves the colour so far and starts from transparent, and POP blends the layer
+  at its opacity over what it saved. There is no extra buffer or pass. The kernel keeps **one
+  open layer** (`ISOLATE_DEPTH` = 1): with four, the RDNA4 code needed 256 VGPRs and spilled, and
+  frescod gives the kernel no scratch. So an isolated group inside another isolated group is
+  drawn with multiplied alpha within the outer layer; the outer one is still exact. Raising the
+  depth waits on the RDNA4 compiler's register allocation (one layer already costs 50 VGPRs, from
+  193 to 243). Hostile frames: a POP with no layer open, and a PUSH past the depth (with its POP),
+  are ignored, and a layer still open after the last op is blended then. The fuzzer covers all
+  three. Applies to the compute, pixel-mode and gpu renderers; the legacy Vulkan renderer ignores
+  it, and an isolated group's content draws there without its opacity.
 - **The embedded surface** (a Limen slot). A later leaf kind that names another client's surface
   by a frescod-issued handle, sized and clipped like any leaf in a group. It builds on this note.
 
@@ -230,7 +242,7 @@ transforms are already absolute, and paint order is re-sorted for stacking conte
 | bands (backend §4.8, pergola.md §10.3) | one group per band, cut **only at checkpoint boundaries**; evicted with one clear; a band stays resident while its painted bounds meet the window |
 | leaves crossing a band edge (positioned, z-index, shadows) | an **overlay group** after the bands, so paint order holds |
 | transforms with rotation (the profile admits `rotate()`) | shapes → fills; a rotated subtree with text or images → one worker-drawn bitmap (texture) |
-| opacity groups | multiplied when their leaves don't overlap; the worker flags overlapping ones (a faded card: background plus text) and sends them as a bitmap until `ISOLATE` exists |
+| opacity groups | multiplied when their leaves don't overlap; overlapping ones (a faded card: background plus text) set `ISOLATE` (built 2026-11-11, one level exact; §2.4) |
 | scroll regions (wide tables) | `SCROLL` groups; the worker adds the opaque backdrop rect when it knows it; a sticky column is a sibling group after the `SCROLL` group |
 | shadows | no Fresco op; drawn by the worker into a texture leaf at the shadow's place in paint order |
 | an SVG's bitmap fallback (dropped fills) | takes the dropped paths' place in the same group and order |
@@ -275,7 +287,10 @@ Pergola thread's, except 5 and 6.
    (pergola.md §10.5).
 5. `ISOLATE` (exact group opacity: draw the group to its own buffer, then blend), moved up at the
    Navigator thread's request: a faded card is the commonest case and multiplied alpha gets it
-   wrong. Renderer work, Fresco owners; bitmaps stand in until it lands.
+   wrong. Renderer work, Fresco owners. **Done 2026-11-11** as a per-pixel layer in the raster
+   kernel (§2.4), one level deep; tests: `fresco-compute/tests/isolate.rs` (reference, Tier-2,
+   GIR), the fuzzer, frescod's `isolated_groups_blend_their_layer`, gpusim
+   `fresco_isolate_layers_match_the_reference` (also in the R9700 corpus).
 6. The Navigator surface sends groups (Navigator thread).
 
 ## 8. Tests

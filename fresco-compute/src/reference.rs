@@ -6,7 +6,7 @@ use crate::{Frame, Op, KIND_PATH, KIND_RECT, KIND_TEXTURE, TILE};
 /// Branch counters (feature `coverage`): what a corpus actually exercised.
 pub mod coverage {
     /// The branches counted, by index.
-    pub const NAMES: [&str; 26] = [
+    pub const NAMES: [&str; 31] = [
         "bin: empty bbox",
         "bin: bbox clipped to the target",
         "bin: bbox inside the target",
@@ -33,6 +33,11 @@ pub mod coverage {
         "fill: linear gradient",
         "fill: radial gradient",
         "outside p3 (the op's whole-pixel box: its clip)",
+        "push",
+        "push past ISOLATE_DEPTH (ignored)",
+        "pop",
+        "pop with no layer open (ignored)",
+        "layer still open after the last op",
     ];
     #[cfg(feature = "coverage")]
     static HITS: [std::sync::atomic::AtomicU64; NAMES.len()] =
@@ -300,6 +305,77 @@ pub fn shade(f: &Frame, o: &Op, pc: [f32; 2]) -> [f32; 4] {
     [o.p1[0], o.p1[1], o.p1[2], o.p1[3] * cov]
 }
 
+/// raster.comp's colour and layer stack (`KIND_PUSH` / `KIND_POP`).
+struct Layers {
+    dst: [f32; 3],
+    da: f32,
+    /// Open layers, newest last: what was under each, and its opacity.
+    stack: Vec<([f32; 4], f32)>,
+    over: u32,
+}
+
+impl Layers {
+    fn new(dst: [f32; 3], da: f32) -> Self {
+        Layers { dst, da, stack: Vec::with_capacity(crate::ISOLATE_DEPTH as usize), over: 0 }
+    }
+
+    /// Src-over one shaded op.
+    fn blend(&mut self, s: [f32; 4]) {
+        for c in 0..3 {
+            self.dst[c] = s[c] * s[3] + self.dst[c] * (1.0 - s[3]);
+        }
+        self.da = s[3] + self.da * (1.0 - s[3]);
+    }
+
+    /// A PUSH or POP: applied, true; any other kind: false.
+    fn op(&mut self, o: &Op) -> bool {
+        match o.meta[0] {
+            crate::KIND_PUSH => {
+                hit(26);
+                if self.stack.len() as u32 >= crate::ISOLATE_DEPTH {
+                    hit(27);
+                    self.over += 1;
+                } else {
+                    let [r, g, b] = self.dst;
+                    self.stack.push(([r, g, b, self.da], clamp_(o.p1[0], 0.0, 1.0)));
+                    self.dst = [0.0; 3];
+                    self.da = 0.0;
+                }
+                true
+            }
+            crate::KIND_POP => {
+                hit(28);
+                if self.over > 0 {
+                    self.over -= 1;
+                } else if !self.stack.is_empty() {
+                    self.pop();
+                } else {
+                    hit(29);
+                }
+                true
+            }
+            _ => false,
+        }
+    }
+
+    fn pop(&mut self) {
+        let (s, o) = self.stack.pop().unwrap();
+        let ga = self.da * o;
+        for c in 0..3 {
+            self.dst[c] = self.dst[c] * o + s[c] * (1.0 - ga);
+        }
+        self.da = ga + s[3] * (1.0 - ga);
+    }
+
+    /// Layers still open after the last op are blended.
+    fn finish(&mut self) {
+        while !self.stack.is_empty() {
+            hit(30);
+            self.pop();
+        }
+    }
+}
+
 /// Linear to an sRGB byte through the LUT's thresholds.
 pub fn encode(lut: &[f32], v: f32) -> u32 {
     let enc = &lut[256..];
@@ -319,8 +395,7 @@ pub fn pixel(f: &Frame, mask: &[u32], x: u32, y: u32) -> u32 {
     let h = &f.header;
     let pc = [x as f32 + 0.5, y as f32 + 0.5];
     let tile = (y / TILE) * h.tiles_x + x / TILE;
-    let mut dst = [h.clear[0], h.clear[1], h.clear[2]];
-    let mut da = h.clear[3];
+    let mut l = Layers::new([h.clear[0], h.clear[1], h.clear[2]], h.clear[3]);
     for w in 0..h.wpt {
         let mut bits = mask[(tile * h.wpt + w) as usize];
         while bits != 0 {
@@ -330,13 +405,14 @@ pub fn pixel(f: &Frame, mask: &[u32], x: u32, y: u32) -> u32 {
             if oi >= h.op_count {
                 break;
             }
-            let s = shade(f, &f.ops[oi as usize], pc);
-            for c in 0..3 {
-                dst[c] = s[c] * s[3] + dst[c] * (1.0 - s[3]);
+            let o = &f.ops[oi as usize];
+            if !l.op(o) {
+                l.blend(shade(f, o, pc));
             }
-            da = s[3] + da * (1.0 - s[3]);
         }
     }
+    l.finish();
+    let (dst, da) = (l.dst, l.da);
     let (r, g, b) = (encode(&f.lut, dst[0]), encode(&f.lut, dst[1]), encode(&f.lut, dst[2]));
     let a = (clamp_(da, 0.0, 1.0) * 255.0 + 0.5) as u32;
     b | (g << 8) | (r << 16) | (a << 24)
@@ -353,7 +429,7 @@ pub fn alpha_at(f: &Frame, x: u32, y: u32) -> u8 {
     }
     let (fw, fh) = (h.width as f32, h.height as f32);
     let pc = [x as f32 + 0.5, y as f32 + 0.5];
-    let mut da = h.clear[3];
+    let mut l = Layers::new([h.clear[0], h.clear[1], h.clear[2]], h.clear[3]);
     for o in &f.ops[..(h.op_count as usize).min(f.ops.len())] {
         let b = o.p3;
         let x0 = clamp_(b[0], 0.0, fw) as i32;
@@ -370,10 +446,12 @@ pub fn alpha_at(f: &Frame, x: u32, y: u32) -> u8 {
         if tx < t(x0 as u32) || tx > t((x1 - 1) as u32) || ty < t(y0 as u32) || ty > t((y1 - 1) as u32) {
             continue;
         }
-        let s = shade(f, o, pc);
-        da = s[3] + da * (1.0 - s[3]);
+        if !l.op(o) {
+            l.blend(shade(f, o, pc));
+        }
     }
-    (clamp_(da, 0.0, 1.0) * 255.0 + 0.5) as u8
+    l.finish();
+    (clamp_(l.da, 0.0, 1.0) * 255.0 + 0.5) as u8
 }
 
 /// Both kernels: the target, `pitch * height` BGRA8 words (padding 0).

@@ -4,7 +4,7 @@
 // An op is five vec4s (80 bytes):
 //   p0  RECT/TEXTURE/GLYPH: x, y, w, h.  PATH: cx, cy, length, width.
 //       FILL: clip x0, y0, x1, y1
-//   p1  colour, linear RGB, straight alpha (RECT, PATH, GLYPH)
+//   p1  colour, linear RGB, straight alpha (RECT, PATH, GLYPH); PUSH: opacity in x
 //   p2  RECT: radius.  PATH: cos, sin.  GLYPH: atlas u0, v0, u1, v1
 //   p3  bounding box x0, y0, x1, y1 in whole pixels (x1/y1 exclusive); also
 //       the op's clip: raster draws nothing outside it
@@ -37,6 +37,15 @@ float clamp_(float v, float lo, float hi) { return v >= lo ? (v <= hi ? v : hi) 
 #define KIND_TEXTURE 2u
 #define KIND_GLYPH   3u
 #define KIND_FILL    4u
+// Exact group opacity (fresco-scene-groups.md §2.4, ISOLATE): PUSH starts a
+// layer (p1.x its opacity), POP blends it over what was under it. Both carry
+// the group's box in p3 so they bin to the same tiles. ISOLATE_DEPTH layers
+// may be open at once (raster.comp keeps one); a PUSH past that is ignored
+// with its POP, a POP with no layer open is ignored, and a layer still open
+// after the last op is blended then.
+#define KIND_PUSH    5u
+#define KIND_POP     6u
+#define ISOLATE_DEPTH 1u
 
 #define TILE 16u
 

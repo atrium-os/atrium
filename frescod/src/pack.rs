@@ -379,6 +379,7 @@ impl SceneState {
                 fc::Node::Fill(i) => f.fill_ids.get(i).copied(),
                 fc::Node::Quad(b, q) => f.quad_ids.get(*quad_of.get(b)?)?.get(q).copied(),
                 fc::Node::Run(b, r) => f.run_ids.get(*run_of.get(b)?)?.get(r).copied(),
+                fc::Node::Push(_) | fc::Node::Pop => None,
             }
         };
         let drops = drops.into_iter().filter_map(|(n, why)| Some((id(n)?, why))).collect();
@@ -677,19 +678,28 @@ fn grouped_frame(state: &fresco_scene_server::command::envelope_frontend::Window
     for v in kids.values_mut() {
         v.sort_unstable();
     }
-    // Iterative depth-first walk (§2.3): a stack of (node, transform,
-    // opacity, clip), children pushed in reverse so they pop in order.
-    let mut stack: Vec<(u32, Xf, f32, Option<[f32; 4]>)> = Vec::new();
-    let push_kids = |stack: &mut Vec<_>, of: Option<u32>, x: Xf, op: f32, clip: Option<[f32; 4]>| {
+    // Iterative depth-first walk (§2.3): a stack of nodes with their
+    // transform, opacity and clip, children pushed in reverse so they pop in
+    // order; an isolated group's end is a stack entry too.
+    let mut stack: Vec<Walk> = Vec::new();
+    let push_kids = |stack: &mut Vec<Walk>, of: Option<u32>, at: At| {
         if let Some(v) = kids.get(&of) {
             for &(_, id) in v.iter().rev() {
-                stack.push((id, x, op, clip));
+                stack.push(Walk::Node(id, at));
             }
         }
     };
-    push_kids(&mut stack, None, Xf::ID, 1.0, None);
+    push_kids(&mut stack, None, At { x: Xf::ID, op: 1.0, seen: 1.0, clip: None, layers: 0 });
     let mut viewports = Vec::new();
-    while let Some((id, x, op, clip)) = stack.pop() {
+    while let Some(entry) = stack.pop() {
+        let (id, at) = match entry {
+            Walk::Node(id, at) => (id, at),
+            Walk::End(id) => {
+                order.push(OrderItem { item: Item::Pop, clip: None, node: id });
+                continue;
+            }
+        };
+        let At { x, op, clip, .. } = at;
         if let Some(g) = state.group_nodes.get(&id) {
             // The group's clip is in its parent's space: map it with `x`.
             let c = meet(clip, g.clip.map(|c| x.rect(c)));
@@ -697,11 +707,22 @@ fn grouped_frame(state: &fresco_scene_server::command::envelope_frontend::Window
                 continue; // nothing of it can show: skip the subtree
             }
             if g.flags & fresco_protocol::group_flags::SCROLL != 0 {
-                if let Some(v) = viewport(state, &kids, id, g, x, op, c, w.size) {
+                if let Some(v) = viewport(state, &kids, id, g, x, at.seen, c, w.size) {
                     viewports.push(v);
                 }
             }
-            push_kids(&mut stack, Some(id), x.then(&g.transform), op * g.opacity, c);
+            let mut inner = At { x: x.then(&g.transform), op: op * g.opacity, seen: at.seen * g.opacity, clip: c, layers: at.layers };
+            // ISOLATE (§2.4): the group is drawn into a layer, then blended
+            // at its opacity (and what it inherited), exactly. Past the
+            // kernel's depth, or at opacity 1, opacity multiplies down.
+            let isolate = g.flags & fresco_protocol::group_flags::ISOLATE != 0;
+            if isolate && inner.op < 1.0 && at.layers < fresco_compute::ISOLATE_DEPTH {
+                order.push(OrderItem { item: Item::Push(inner.op.to_bits()), clip: None, node: id });
+                stack.push(Walk::End(id));
+                inner.op = 1.0;
+                inner.layers += 1;
+            }
+            push_kids(&mut stack, Some(id), inner);
         } else {
             emit(w, &mut order, id, x, op, clip);
         }
@@ -727,6 +748,26 @@ fn grouped_frame(state: &fresco_scene_server::command::envelope_frontend::Window
         w.scrolls.push(s);
     }
     w.order = Some(order);
+}
+
+/// Where the walk in [`grouped_frame`] is.
+#[derive(Clone, Copy)]
+struct At {
+    x: Xf,
+    /// Multiplied into leaves' alpha.
+    op: f32,
+    /// Every ancestor's opacity, isolated ones too (what a viewport is
+    /// seen through).
+    seen: f32,
+    clip: Option<[f32; 4]>,
+    /// Isolated layers open around this node.
+    layers: u32,
+}
+
+enum Walk {
+    Node(u32, At),
+    /// The end of isolated group `id`.
+    End(u32),
 }
 
 /// A `SCROLL` group `id` (composed transform `x` of its parent, opacity
@@ -831,6 +872,7 @@ fn hash_ser<T: serde::Serialize, H: std::hash::Hasher>(h: &mut H, v: &T) {
 fn item_box(w: &WindowFrame, item: fresco_compute::Node) -> Option<[f32; 4]> {
     use fresco_compute::Node;
     Some(match item {
+        Node::Push(_) | Node::Pop => return None,
         Node::Rect(i) => {
             let r = w.rects.get(i)?;
             [r.position[0], r.position[1], r.position[0] + r.size[0], r.position[1] + r.size[1]]
@@ -1141,6 +1183,48 @@ mod group_tests {
         place(&mut s, 1, Some(101), 0);
         let w = grouped(&s);
         assert_eq!(w.rects[0].color[3], 0.25);
+    }
+
+    /// ISOLATE (§2.4): a faded card's overlapping leaves are drawn into a
+    /// layer and blended at the group's opacity (and what it inherited);
+    /// inside, alpha is no longer multiplied. Past the kernel's depth,
+    /// opacity multiplies again.
+    #[test]
+    fn isolated_groups_blend_their_layer() {
+        use fresco_protocol::group_flags::ISOLATE;
+        let iso = |s: &mut WindowSceneState, id, parent, opacity| {
+            s.set_group(id, GroupParams { parent, order: 0, transform: ID, clip: None, opacity, flags: ISOLATE }, 1).unwrap();
+        };
+        let mut s = WindowSceneState::new();
+        s.set_group(99, GroupParams { parent: None, order: 0, transform: ID, clip: None, opacity: 0.5, flags: 0 }, 1).unwrap();
+        iso(&mut s, 100, Some(99), 0.5);
+        rect(&mut s, 1, 0.0, 0.0, 20.0, 20.0, RED);
+        rect(&mut s, 2, 10.0, 10.0, 20.0, 20.0, BLUE);
+        place(&mut s, 1, Some(100), 0);
+        place(&mut s, 2, Some(100), 1);
+        let w = grouped(&s);
+        assert_eq!((w.rects[0].color[3], w.rects[1].color[3]), (1.0, 1.0));
+        let items: Vec<_> = w.order.as_ref().unwrap().iter().map(|o| o.item).collect();
+        assert_eq!(items[0], fresco_compute::Node::Push(0.25f32.to_bits()));
+        assert_eq!(items[3], fresco_compute::Node::Pop);
+        // In the overlap only blue shows, at a quarter: as blue alone at 0.25.
+        let px = draw(&w);
+        let mut b = WindowSceneState::new();
+        rect(&mut b, 2, 10.0, 10.0, 20.0, 20.0, [0.0, 0.0, 1.0, 0.25]);
+        let want = draw(&grouped(&b));
+        assert_eq!(px[(15 * W + 15) as usize], want[(15 * W + 15) as usize]);
+        // ISOLATE_DEPTH isolated groups nest; the next multiplies.
+        let mut s = WindowSceneState::new();
+        let n = fresco_compute::ISOLATE_DEPTH + 1;
+        for k in 0..n {
+            iso(&mut s, 100 + k, k.checked_sub(1).map(|p| 100 + p), 0.5);
+        }
+        rect(&mut s, 1, 0.0, 0.0, 8.0, 8.0, RED);
+        place(&mut s, 1, Some(100 + n - 1), 0);
+        let w = grouped(&s);
+        let pushes = w.order.as_ref().unwrap().iter().filter(|o| matches!(o.item, fresco_compute::Node::Push(_))).count();
+        assert_eq!(pushes as u32, fresco_compute::ISOLATE_DEPTH);
+        assert_eq!(w.rects[0].color[3], 0.5);
     }
 
     /// A ScrollView (§5): viewport group 200 (SCROLL, clip y 8..56) holding
