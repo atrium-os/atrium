@@ -642,7 +642,23 @@ pub struct GpuCompute<'a> {
     changes: HashMap<u32, Vec<(u64, [u32; 4])>>,
     /// Per scanout buffer (by GPU address): the windows, layers and
     /// surface versions it was last composed from.
-    composed: HashMap<u64, (Vec<u32>, Vec<Layer>, HashMap<u32, u64>)>,
+    composed: HashMap<u64, Composed>,
+    /// The scanout buffer composed last.
+    last_target: Option<u64>,
+}
+
+/// What a scanout buffer was last composed from: the windows, their
+/// layers, and each surface's version.
+type Composed = (Vec<u32>, Vec<Layer>, HashMap<u32, u64>);
+
+/// The scanout buffer to copy into `target` before composing, if any:
+/// `target` does not hold the window list `ids` (a new buffer, or a list
+/// that changed since it was composed) but the buffer composed last does.
+fn composed_source(composed: &HashMap<u64, Composed>, target: u64, last: Option<u64>, ids: &[u32]) -> Option<u64> {
+    if composed.get(&target).is_some_and(|c| c.0 == ids) {
+        return None;
+    }
+    last.filter(|&l| l != target && composed.get(&l).is_some_and(|c| c.0 == ids))
 }
 
 /// One window's address space.
@@ -808,6 +824,7 @@ impl<'a> GpuCompute<'a> {
             version: HashMap::new(),
             changes: HashMap::new(),
             composed: HashMap::new(),
+            last_target: None,
         })
     }
 
@@ -981,7 +998,16 @@ impl<'a> GpuCompute<'a> {
         let (layers, heap_va, heap_words) = self.layers(&p.frames, &p.pos)?;
         let versions: HashMap<u32, u64> = p.frames.iter().map(|(id, _)| (*id, self.version.get(id).copied().unwrap_or(0))).collect();
         let ids: Vec<u32> = p.frames.iter().map(|(id, _)| *id).collect();
-        let screen_rects: Option<Vec<[u32; 4]>> = match self.composed.get(&target.gpu_va()) {
+        // A scanout buffer that holds another window list (or nothing yet,
+        // its first frame) starts as a copy of the buffer composed last, if
+        // that one holds this list: one DMA copy instead of composing the
+        // whole screen; then only what changed since that buffer is composed.
+        let copy_from = composed_source(&self.composed, target.gpu_va(), self.last_target, &ids);
+        let held_state = match copy_from {
+            Some(src) => self.composed.get(&src).cloned(),
+            None => self.composed.get(&target.gpu_va()).cloned(),
+        };
+        let screen_rects: Option<Vec<[u32; 4]>> = match held_state.as_ref() {
             Some((held_ids, old_layers, held)) if *held_ids == ids => {
                 let (w, h) = (self.width, self.height);
                 let mut r = Vec::new();
@@ -1002,6 +1028,12 @@ impl<'a> GpuCompute<'a> {
         let compose = Compose::new(&layers, self.width, self.height, self.width, heap_words);
         compose.validate(compose.target_words(), heap_words as usize)?;
         let mut ib = self.arch.stream();
+        if let Some(src) = copy_from {
+            // The source's compose may still be running on the queue.
+            ib.barrier();
+            ib.copy(src, target.gpu_va(), self.width as u64 * self.height as u64 * 4);
+            ib.barrier();
+        }
         if screen_rects.as_ref().is_none_or(|r| !r.is_empty()) {
             let mut stage = Vec::new();
             let [chdr, clayers, clut] = compose.buffers();
@@ -1024,6 +1056,7 @@ impl<'a> GpuCompute<'a> {
         }
         log::debug!("gpu: {} windows, compose {:?}", p.frames.len(), screen_rects.as_ref().map(|r| r.len()));
         self.composed.insert(target.gpu_va(), (ids, layers, versions));
+        self.last_target = Some(target.gpu_va());
         // End of pipe: the fence, then the interrupt that signals `signal`.
         ib.end(self.ring.gpu_va() + FENCE_OFFSET);
         if let Err(e) = run(self.vm, &self.ring, &*ib, signal, deadline_ns) {
@@ -1070,6 +1103,22 @@ mod tests {
             ..Default::default()
         };
         ScreenInput { windows: vec![a, b], uploads: Vec::new(), clears: Vec::new() }
+    }
+
+    /// A scanout buffer without this window list starts as a copy of the
+    /// buffer composed last, when that one has the list.
+    #[test]
+    fn a_new_scanout_buffer_copies_the_last_one() {
+        let c = |ids: &[u32]| (ids.to_vec(), Vec::new(), HashMap::new());
+        let mut m: HashMap<u64, Composed> = HashMap::new();
+        assert_eq!(composed_source(&m, 0x2000, None, &[1]), None, "nothing composed yet");
+        m.insert(0x1000, c(&[1]));
+        assert_eq!(composed_source(&m, 0x2000, Some(0x1000), &[1]), Some(0x1000), "first frame of a buffer");
+        assert_eq!(composed_source(&m, 0x1000, Some(0x1000), &[1]), None, "it holds the list");
+        assert_eq!(composed_source(&m, 0x2000, Some(0x1000), &[1, 2]), None, "the last buffer has another list");
+        m.insert(0x2000, c(&[1]));
+        m.insert(0x1000, c(&[1, 2]));
+        assert_eq!(composed_source(&m, 0x2000, Some(0x1000), &[1, 2]), Some(0x1000), "a window opened");
     }
 
     /// A scanout buffer a few versions behind composes the union of what
