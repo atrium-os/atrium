@@ -23,6 +23,10 @@ pub enum Event {
     /// the last key event (Ctrl + wheel zooms). `phase` says whether the
     /// fingers are on a touchpad.
     Scroll { at: Option<Point>, dx: f32, dy: f32, modifiers: Modifiers, phase: ScrollPhase },
+    /// A touchpad pinch about `at` (where it began). `scale` is the
+    /// fingers' spread against the start (1 = no change), so it is
+    /// cumulative over the gesture; `End` repeats the last one.
+    Magnify { at: Point, scale: f32, phase: ScrollPhase },
     /// A keyboard key transition (down or up). `key` is the
     /// USB-HID-usage-code-style identifier from `Key`. `chars` is
     /// any text input the platform decoded for this event (printable

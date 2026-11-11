@@ -469,7 +469,10 @@ stays frescod's, drawn outside any app.
   resting fingers hold still), and End flings at once at the drag's speed, or not at all if the
   fingers had stopped. A wheel or a device without phases has its release inferred after 30 ms
   without a delta; a late delta coasts at the drag's speed and the fling takes over from the
-  coast, so release neither pauses nor jumps (tested at 1 ms steps). Arrows, Page Up/Down, Space, Home/End go to the
+  coast, so release neither pauses nor jumps (tested at 1 ms steps). A touchpad pinch (`Event::Magnify`, from
+  fresco's `PointerMagnify`) zooms the scroll view under where it began, about that point; its
+  scale is the spread against the start, so the zoom follows the fingers exactly, and it settles
+  (content laid out again) only after the fingers lift. Arrows, Page Up/Down, Space, Home/End go to the
   focused scroll view, else the one under the pointer. A press catches a fling.
 - **Key repeat.** A held key arrives as `KeyEventKind::Repeat` (Tactus generates the repeats).
   Text entry, arrows, sliders, menus' arrows and scroll keys act on it again

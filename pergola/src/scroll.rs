@@ -297,10 +297,12 @@ pub struct Zoom {
     pub live: f64,
     pub settled: f64,
     last_input: Option<f64>,
+    /// A pinch's fingers are down: no settling, however still they are.
+    held: bool,
 }
 
 impl Default for Zoom {
-    fn default() -> Self { Self { live: 1.0, settled: 1.0, last_input: None } }
+    fn default() -> Self { Self { live: 1.0, settled: 1.0, last_input: None, held: false } }
 }
 
 impl Zoom {
@@ -331,6 +333,13 @@ impl Zoom {
         self.last_input = Some(t);
     }
 
+    /// Fingers down (`true`) or lifted on a pinch: it settles only once
+    /// they lift and input has then been quiet.
+    pub fn hold(&mut self, held: bool, t: f64) {
+        self.held = held;
+        self.last_input = Some(t);
+    }
+
     /// Whether a gesture is waiting to settle.
     pub fn is_pending(&self) -> bool { self.last_input.is_some() }
 
@@ -342,7 +351,7 @@ impl Zoom {
     /// zoom when it settles.
     pub fn step(&mut self, t: f64) -> Option<f64> {
         let last = self.last_input?;
-        if t - last < ZOOM_SETTLE_MS { return None; }
+        if self.held || t - last < ZOOM_SETTLE_MS { return None; }
         self.last_input = None;
         if (self.live - self.settled).abs() < 1e-9 { return None; }
         self.settled = self.live;

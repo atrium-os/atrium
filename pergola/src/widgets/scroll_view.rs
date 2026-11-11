@@ -43,6 +43,8 @@ pub struct ScrollState {
     pub physics: Physics,
     pub zoom: Zoom,
     pub reduce_motion: bool,
+    /// The running pinch's scale at its last step (0: no pinch).
+    pub pinch_last: f64,
 }
 
 impl ScrollState {
@@ -63,6 +65,27 @@ impl ScrollState {
         let vh = Self::viewport_h(node) / self.zoom.live;
         match kind {
             ScrollKind::Press => self.physics.stop(),
+            ScrollKind::Magnify { at, scale, phase } => {
+                let s = scale as f64;
+                if !(s.is_finite() && s > 0.0) {
+                    return;
+                }
+                // A new pinch: from its own start, and it catches a fling.
+                if phase == ScrollPhase::Begin || self.pinch_last <= 0.0 {
+                    self.pinch_last = 1.0;
+                    self.physics.stop();
+                }
+                let focus = (at.y - node.rect().y()) as f64;
+                let z0 = self.zoom.live;
+                self.zoom.pinch(s / self.pinch_last, t);
+                self.pinch_last = s;
+                let down = matches!(phase, ScrollPhase::Begin | ScrollPhase::Update);
+                self.zoom.hold(down, t);
+                if !down {
+                    self.pinch_last = 0.0;
+                }
+                self.refocus(z0, focus, node);
+            }
             ScrollKind::Wheel { at, dy, modifiers, .. } if modifiers.ctrl => {
                 let focus = at.map(|p| (p.y - node.rect().y()) as f64).unwrap_or(0.0);
                 let z0 = self.zoom.live;
@@ -361,5 +384,38 @@ mod tests {
             NodeDelta::Changed { node: Node::Rect { rect, .. }, .. } if (rect.w() - 200.0 * z).abs() < 1e-3));
         assert!(resized, "rows sent at zoom {z}");
         assert!(!app.wants_frame());
+    }
+
+    #[test]
+    fn a_pinch_zooms_about_its_point_and_settles_when_lifted() {
+        use crate::event::ScrollPhase::*;
+        let (mut app, state) = app();
+        let mut st = state.get();
+        st.physics.set_max(1700.0);
+        st.physics.set_position(400.0);
+        state.set(st);
+        app.tick();
+        app.set_time(0.0);
+        let at = Point::new(100.0, 100.0);
+        let pinch = |scale, phase| Event::Magnify { at, scale, phase };
+        // The content under the pinch point: 400 + 100 at zoom 1.
+        app.handle_event(pinch(1.0, Begin));
+        app.handle_event(pinch(1.5, Update));
+        app.handle_event(pinch(2.0, Update));
+        let st = state.get();
+        assert!((st.zoom.live - 2.0).abs() < 1e-9, "the spread, not its steps: {}", st.zoom.live);
+        assert!((st.physics.y + 100.0 / 2.0 - 500.0).abs() < 1e-6, "kept under the fingers: {}", st.physics.y);
+        // Fingers resting: no settling.
+        run_frames(&mut app, 0.0, 300.0);
+        assert_eq!(state.get().zoom.settled, 1.0);
+        app.handle_event(pinch(2.0, End));
+        run_frames(&mut app, 300.0, 300.0);
+        let st = state.get();
+        assert_eq!(st.zoom.settled, 2.0);
+        assert_eq!(st.pinch_last, 0.0);
+        // The next pinch starts from its own 1.0.
+        app.handle_event(pinch(1.0, Begin));
+        app.handle_event(pinch(0.5, Update));
+        assert!((state.get().zoom.live - 1.0).abs() < 1e-9);
     }
 }

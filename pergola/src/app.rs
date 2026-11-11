@@ -525,6 +525,11 @@ impl<V: View> App<V> {
                 let kind = crate::interaction::ScrollKind::Wheel { at, dx: *dx, dy: *dy, modifiers: mods, phase: *phase };
                 self.scroll_to(hit, kind);
             }
+            Event::Magnify { at, scale, phase } => {
+                let hit = hit_test(&self.prev_tree, *at);
+                let kind = crate::interaction::ScrollKind::Magnify { at: *at, scale: *scale, phase: *phase };
+                self.scroll_to(hit, kind);
+            }
             Event::Drop { at } => {
                 self.pointer = Some(*at);
                 let hit = hit_test(&self.prev_tree, *at);

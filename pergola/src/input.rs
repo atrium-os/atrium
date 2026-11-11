@@ -39,14 +39,10 @@ pub fn translate(ev: &fresco_client::Event) -> Option<Event> {
         // A wheel or trackpad delta, at wherever the pointer last was
         // (the App knows; the event does not say).
         fresco_client::Event::PointerScroll { dx, dy, phase, .. } => {
-            use fresco_protocol::scroll_phase as p;
-            let phase = match *phase {
-                p::BEGIN => ScrollPhase::Begin,
-                p::UPDATE => ScrollPhase::Update,
-                p::END => ScrollPhase::End,
-                _ => ScrollPhase::None,
-            };
-            Some(Event::Scroll { at: None, dx: *dx, dy: *dy, modifiers: Modifiers::default(), phase })
+            Some(Event::Scroll { at: None, dx: *dx, dy: *dy, modifiers: Modifiers::default(), phase: scroll_phase(*phase) })
+        }
+        fresco_client::Event::PointerMagnify { x, y, scale, phase, .. } => {
+            Some(Event::Magnify { at: Point::new(*x, *y), scale: *scale, phase: scroll_phase(*phase) })
         }
         fresco_client::Event::Drop { x, y, .. } => Some(Event::Drop { at: Point::new(*x, *y) }),
         // Window lifecycle events not yet routed through Pergola's
@@ -70,7 +66,6 @@ pub fn translate(ev: &fresco_client::Event) -> Option<Event> {
         | fresco_client::Event::EmbedToken { .. }
         // A pinch: for ScrollView's zoom, not wired yet (it zooms on
         // Ctrl+wheel today). Swipes go to the WM only.
-        | fresco_client::Event::PointerMagnify { .. }
         | fresco_client::Event::Swipe { .. }
         // Drag hover (no drop highlight yet) and the end of a drag this
         // window started (Pergola starts none yet).
@@ -82,6 +77,16 @@ pub fn translate(ev: &fresco_client::Event) -> Option<Event> {
         | fresco_client::Event::VideoPresented { .. }
         | fresco_client::Event::VideoReleased { .. }
         | fresco_client::Event::Unknown { .. } => None,
+    }
+}
+
+fn scroll_phase(phase: u8) -> ScrollPhase {
+    use fresco_protocol::scroll_phase as p;
+    match phase {
+        p::BEGIN => ScrollPhase::Begin,
+        p::UPDATE => ScrollPhase::Update,
+        p::END => ScrollPhase::End,
+        _ => ScrollPhase::None,
     }
 }
 
