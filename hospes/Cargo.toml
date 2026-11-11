@@ -1,0 +1,13 @@
+[workspace]
+resolver = "2"
+members = ["hospes-elf", "hospes-rt", "hospes-fixture-runner"]
+
+[workspace.package]
+edition = "2021"
+license = "MIT OR Apache-2.0"
+
+# panic=abort for the no_std runtime is passed by scripts/hospes-build.sh (cargo --config),
+# because tests need unwinding and the repo builds std with build-std.
+[profile.release]
+debug = 1
+opt-level = 2

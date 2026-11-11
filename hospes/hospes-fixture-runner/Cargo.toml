@@ -1,0 +1,14 @@
+[package]
+name = "hospes-fixture-runner"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+description = "Loads one Hospes loader fixture under hospes-rt and runs it"
+
+[[bin]]
+name = "hospes-fixture-runner"
+path = "src/main.rs"
+test = false
+
+[dependencies]
+hospes-rt = { path = "../hospes-rt" }

@@ -1,0 +1,23 @@
+[package]
+name = "hospes-fuzz"
+version = "0.0.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+publish = false
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+hospes-elf = { path = "../hospes-elf" }
+
+# Not part of the hospes workspace: cargo-fuzz builds it on its own.
+[workspace]
+
+[[bin]]
+name = "elf"
+path = "fuzz_targets/elf.rs"
+test = false
+doc = false
+bench = false
