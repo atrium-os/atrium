@@ -289,6 +289,11 @@ The CDM advertises what it supports; Hospes uses the first that works:
    I420 frames in slots; the worker converts them into the Fresco video layer as it already
    does for dav1d output.
 
+**H0b (2026-11-11):** with a real test licence, decrypt-only returned clear samples for 940
+of 1,300 encrypted H.264 samples and `kNoKey` for the rest, deterministically. The CDM may
+require the decrypt-and-decode path for codecs it can decode; that path has not produced
+frames in our harness yet. The preference order is settled in H3 on Linux.
+
 Either way the worker checks every returned size against the slot and the declared frame
 size before copying anything. At Widevine L3 nothing here is a protected path; the frames are
 ordinary video (legacy-web §8.1).
