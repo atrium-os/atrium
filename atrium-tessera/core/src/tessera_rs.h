@@ -115,6 +115,25 @@ int tessera_rs_btree_search(const uint8_t *block, size_t block_len,
     uint32_t entry_count, uint32_t key_size, uint32_t entry_size,
     const void *key, int *out_exact);
 
+/* btree.c node edits: put, delete and the sorted batch's leaf merge. */
+typedef void (*tessera_rs_displaced_cb_t)(void *ctx, const void *key,
+    const void *old_value, const void *new_value);
+int tessera_rs_btree_entry_write(uint8_t *block, size_t block_len,
+    uint32_t es, uint32_t idx, uint32_t at, const void *src, uint32_t len);
+int tessera_rs_btree_insert(uint8_t *block, size_t block_len, uint32_t count,
+    uint32_t es, uint32_t ins, const void *key, uint32_t ks,
+    const void *val, uint32_t vs);
+int tessera_rs_btree_remove(uint8_t *block, size_t block_len, uint32_t count,
+    uint32_t es, uint32_t idx);
+int tessera_rs_btree_split_insert(const uint8_t *block, size_t block_len,
+    uint32_t count, uint32_t es, uint32_t ins, const void *key, uint32_t ks,
+    const void *val, uint32_t vs, uint8_t *left, uint8_t *right,
+    uint32_t *out_left_n, uint32_t *out_right_n);
+int tessera_rs_btree_leaf_merge(const uint8_t *block, size_t block_len,
+    uint32_t count, uint32_t ks, uint32_t vs, const void *keys,
+    const void *vals, uint32_t n, uint8_t *out, size_t out_len,
+    tessera_rs_displaced_cb_t cb, void *cbctx, uint32_t *out_total);
+
 /* journal.c: read_record's header and geometry checks, and the ring step. */
 int tessera_rs_journal_record_check(const uint8_t *blk, uint64_t cap,
     void *out_hdr);

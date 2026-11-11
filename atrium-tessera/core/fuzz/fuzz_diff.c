@@ -47,6 +47,7 @@ diff_put(diff_trace_t *t, uint64_t x)
 
 static const char *const NAMES[DIFF_NTARGETS] = {
 	"codec", "manifest", "pack", "btree", "journal", "superblock",
+	"btree_ops",
 };
 
 static void
@@ -160,7 +161,7 @@ main(int argc, char **argv)
 {
 	if (argc < 3) {
 		fprintf(stderr, "usage: %s <codec|manifest|pack|btree|journal|"
-		    "superblock|auto> <file>...\n", argv[0]);
+		    "superblock|btree_ops|auto> <file>...\n", argv[0]);
 		return 2;
 	}
 	int target = -1;

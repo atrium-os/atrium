@@ -18,7 +18,7 @@ use crate::error::{EINVAL, OK, Result};
 use crate::journal;
 use crate::manifest::Manifest;
 use crate::pack::{self, Geometry};
-use core::ffi::{c_char, c_int};
+use core::ffi::{c_char, c_int, c_void};
 
 // ---- pointer helpers ------------------------------------------------------
 
@@ -451,6 +451,118 @@ pub unsafe extern "C" fn tessera_rs_btree_search(
     let (idx, exact) = btree::search(b, entry_count, key_size, entry_size, k);
     unsafe { put(out_exact, exact as c_int) };
     idx
+}
+
+/// `len` writable bytes at `p`; None for NULL.
+unsafe fn bytes_mut<'a>(p: *mut u8, len: usize) -> Option<&'a mut [u8]> {
+    if p.is_null() {
+        return None;
+    }
+    // SAFETY: caller contract — p points to len writable bytes, not aliased
+    // by any other slice this call makes.
+    Some(unsafe { core::slice::from_raw_parts_mut(p, len) })
+}
+
+/// Node edits (`btree::insert` and the rest). `block`, `left` and `right` are
+/// `block_len`-byte node buffers; `key` is `ks` bytes, `val` is `vs`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn tessera_rs_btree_entry_write(
+    block: *mut u8, block_len: usize, es: u32, idx: u32, at: u32, src: *const u8, len: u32,
+) -> c_int {
+    let (Some(b), Some(s)) = (unsafe { bytes_mut(block, block_len) }, unsafe { bytes(src, len as usize) }) else {
+        return EINVAL;
+    };
+    rc(btree::entry_write(b, es, idx, at, s))
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn tessera_rs_btree_insert(
+    block: *mut u8, block_len: usize, count: u32, es: u32, ins: u32,
+    key: *const u8, ks: u32, val: *const u8, vs: u32,
+) -> c_int {
+    let (Some(b), Some(k), Some(v)) =
+        (unsafe { bytes_mut(block, block_len) }, unsafe { bytes(key, ks as usize) }, unsafe { bytes(val, vs as usize) })
+    else {
+        return EINVAL;
+    };
+    rc(btree::insert(b, count, es, ins, k, v))
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn tessera_rs_btree_remove(block: *mut u8, block_len: usize, count: u32, es: u32, idx: u32) -> c_int {
+    let Some(b) = (unsafe { bytes_mut(block, block_len) }) else { return EINVAL };
+    rc(btree::remove(b, count, es, idx))
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn tessera_rs_btree_split_insert(
+    block: *const u8, block_len: usize, count: u32, es: u32, ins: u32,
+    key: *const u8, ks: u32, val: *const u8, vs: u32,
+    left: *mut u8, right: *mut u8, out_left_n: *mut u32, out_right_n: *mut u32,
+) -> c_int {
+    if left == right {
+        return EINVAL;
+    }
+    let (Some(b), Some(k), Some(v), Some(l), Some(r)) = (
+        unsafe { bytes(block, block_len) },
+        unsafe { bytes(key, ks as usize) },
+        unsafe { bytes(val, vs as usize) },
+        unsafe { bytes_mut(left, block_len) },
+        unsafe { bytes_mut(right, block_len) },
+    ) else {
+        return EINVAL;
+    };
+    match btree::split_insert(b, count, es, ins, k, v, l, r) {
+        Ok((ln, rn)) => {
+            unsafe {
+                put(out_left_n, ln);
+                put(out_right_n, rn);
+            }
+            OK
+        }
+        Err(e) => e,
+    }
+}
+
+/// `tessera_btree_displaced_cb_t`.
+pub type DisplacedCb = Option<unsafe extern "C" fn(ctx: *mut c_void, key: *const u8, old: *const u8, new: *const u8)>;
+
+/// `btree::leaf_merge`. `keys` holds `n * ks` bytes, `vals` `n * vs`, `out`
+/// `out_len`; `cb` (may be NULL) gets each displaced entry, with `cbctx`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn tessera_rs_btree_leaf_merge(
+    block: *const u8, block_len: usize, count: u32, ks: u32, vs: u32,
+    keys: *const u8, vals: *const u8, n: u32, out: *mut u8, out_len: usize,
+    cb: DisplacedCb, cbctx: *mut c_void, out_total: *mut u32,
+) -> c_int {
+    let (Some(kl), Some(vl)) = (
+        (n as usize).checked_mul(ks as usize),
+        (n as usize).checked_mul(vs as usize),
+    ) else {
+        return EINVAL;
+    };
+    let (Some(b), Some(k), Some(v), Some(o)) = (
+        unsafe { bytes(block, block_len) },
+        unsafe { bytes(keys, kl) },
+        unsafe { bytes(vals, vl) },
+        unsafe { bytes_mut(out, out_len) },
+    ) else {
+        return EINVAL;
+    };
+    let mut displaced = |key: &[u8], old: &[u8], new: &[u8]| {
+        if let Some(f) = cb {
+            // SAFETY: the C callback's contract — three pointers into
+            // buffers that live for the call.
+            unsafe { f(cbctx, key.as_ptr(), old.as_ptr(), new.as_ptr()) }
+        }
+    };
+    match btree::leaf_merge(b, count, ks, vs, k, v, n, o, &mut displaced) {
+        Ok(t) => {
+            unsafe { put(out_total, t) };
+            OK
+        }
+        Err(e) => e,
+    }
 }
 
 // ---- journal.c --------------------------------------------------------------

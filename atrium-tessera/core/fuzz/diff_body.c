@@ -361,7 +361,7 @@ static void
 walk_cursor(tessera_btree_cursor_t *c, uint32_t ks, uint32_t vs,
             diff_trace_t *t)
 {
-	uint8_t key[64], val[512];
+	uint8_t key[64], val[1024];	/* btree_ops values reach 1000 */
 	diff_put(t, c != NULL);
 	for (unsigned n = 0; c != NULL && n < MAX_STEPS; n++) {
 		int r = tessera_btree_cursor_get(c, key, val);
@@ -447,6 +447,181 @@ run_btree(const uint8_t *data, size_t len, diff_trace_t *t)
 	diff_put(t, fs); diff_put(t, fk);
 	tessera_btree_close(bt);
 	free(img);
+}
+
+
+/* ── B-tree writes: put / delete / sorted batch on one image ────────────
+ *
+ * The node edits (insert, split, remove, the batch's leaf merge) run on a
+ * tree both cores grow from empty with the same operations. Each side's
+ * allocator is deterministic (lowest free sector), so identical edits give
+ * byte-identical images; the trace records every return code, the root, each
+ * displaced entry, and the image's CRC at intervals and at the end.
+ *
+ * The input picks the geometry (four from 4-entry leaves to 64-byte keys),
+ * seeds the operation stream, and with bit 7 of the first byte corrupts
+ * entry bytes of live nodes between operations (entries are outside the
+ * header CRC), so edits on unsorted or self-referencing nodes are compared
+ * too. */
+
+#define OPS_SECTORS 1024u
+
+static const struct { uint32_t key; uint32_t val; } OPS_GEOM[] = {
+	{ 4,  TESSERA_INODE_RECORD_SIZE },	/* inode tree: fanout 27 */
+	{ 8,  1000 },				/* 4-entry leaves: split often */
+	{ 64, 8 },				/* widest key */
+	{ 8,  8 },				/* free-extent: fanout 252 */
+};
+
+struct ops_img {
+	struct img m;
+	uint8_t    used[OPS_SECTORS];
+};
+
+static int
+ops_alloc(void *c, uint64_t n, uint64_t *o)
+{
+	struct ops_img *d = c;
+	if (n != 1) return -1;
+	for (uint32_t i = 1; i < OPS_SECTORS; i++)
+		if (!d->used[i]) { d->used[i] = 1; *o = i; return 0; }
+	return -1;
+}
+
+static int
+ops_free(void *c, uint64_t s, uint64_t n)
+{
+	struct ops_img *d = c;
+	if (n != 1 || s == 0 || s >= OPS_SECTORS || !d->used[s]) return -1;
+	d->used[s] = 0;
+	return 0;
+}
+
+static uint64_t
+ops_rand(uint64_t *x)
+{
+	*x ^= *x << 13; *x ^= *x >> 7; *x ^= *x << 17;
+	return *x;
+}
+
+static void
+ops_key(uint8_t *k, uint32_t ks, uint32_t id, uint8_t fill)
+{
+	memset(k, fill, ks);
+	/* big-endian id at the end, so the key order is the id order */
+	uint32_t at = ks >= 4 ? ks - 4 : 0;
+	for (uint32_t i = 0; i < 4 && at + i < ks; i++)
+		k[at + i] = (uint8_t)(id >> (24 - 8 * i));
+}
+
+static diff_trace_t *ops_trace;
+static void
+ops_displaced(void *ctx, const void *key, const void *old, const void *new_)
+{
+	const uint32_t *g = ctx;
+	diff_put(ops_trace, tessera_crc32(key, g[0]));
+	diff_put(ops_trace, tessera_crc32(old, g[1]));
+	diff_put(ops_trace, tessera_crc32(new_, g[1]));
+}
+
+static uint64_t
+ops_image_crc(const struct ops_img *d)
+{
+	uint32_t c = 0;
+	for (uint32_t i = 1; i < OPS_SECTORS; i++)
+		if (d->used[i])
+			c = tessera_crc32(d->m.base + (size_t)i * SECT, SECT) ^
+			    (c * 31u + i);
+	return c;
+}
+
+static void
+run_btree_ops(const uint8_t *data, size_t len, diff_trace_t *t)
+{
+	if (len < 4) return;
+	const uint8_t ctl = data[0];
+	const unsigned g = ctl % (sizeof OPS_GEOM / sizeof OPS_GEOM[0]);
+	const uint32_t ks = OPS_GEOM[g].key, vs = OPS_GEOM[g].val;
+	const uint32_t kspace = 16u + (uint32_t)data[1] * 4u;
+	const uint32_t nops = 64u + (uint32_t)data[2] * 4u;
+	uint64_t x = 0x9e3779b97f4a7c15ULL;
+	for (size_t i = 0; i < len; i++) { x ^= data[i]; ops_rand(&x); }
+	if (x == 0) x = 1;
+
+	struct ops_img *d = calloc(1, sizeof *d);
+	uint8_t *img = d ? calloc(OPS_SECTORS, SECT) : NULL;
+	uint8_t *keys = malloc(64u * 64u), *vals = malloc(64u * 1000u);
+	if (d == NULL || img == NULL || keys == NULL || vals == NULL) goto out;
+	d->m.base = img; d->m.sectors = OPS_SECTORS;
+	tessera_block_io_t io = { img_read, img_write, ops_alloc, ops_free, d };
+	uint64_t root = 0;
+	tessera_btree_t *bt = tessera_btree_create(&io, 0, ks, vs, &root);
+	diff_put(t, bt != NULL);
+	if (bt == NULL) goto out;
+	uint32_t geom[2] = { ks, vs };
+	ops_trace = t;
+
+	uint8_t key[64], val[1000];
+	for (uint32_t op = 0; op < nops; op++) {
+		const uint8_t b = data[3 + op % (len - 3)];
+		uint64_t r = ops_rand(&x);
+		uint32_t id = (uint32_t)(r % kspace);
+		int rc;
+		switch ((b ^ (uint8_t)(r >> 32)) % 8) {
+		case 0: case 1: case 2: case 3:		/* put */
+			ops_key(key, ks, id, 0x5a);
+			memset(val, (int)(r >> 40), vs);
+			rc = tessera_btree_put(bt, key, val, &root);
+			break;
+		case 4: case 5:				/* delete */
+			ops_key(key, ks, id, 0x5a);
+			rc = tessera_btree_delete(bt, key, &root);
+			break;
+		case 6: {				/* sorted batch */
+			uint32_t n = 1 + (uint32_t)(r >> 48) % 64u, k = 0;
+			uint32_t step = 1 + (uint32_t)(r >> 56) % 4u;
+			for (uint32_t i = 0; i < n && id + i * step < kspace * 2; i++, k++) {
+				ops_key(keys + (size_t)k * ks, ks, id + i * step, 0x5a);
+				memset(vals + (size_t)k * vs, (int)(op + i), vs);
+			}
+			rc = tessera_btree_put_sorted_batch_ex(bt, keys, vals, k,
+			    &root, ops_displaced, geom);
+			break;
+		}
+		default:				/* get */
+			ops_key(key, ks, id, 0x5a);
+			memset(val, 0, vs);
+			rc = tessera_btree_get(bt, key, val);
+			diff_put(t, tessera_crc32(val, vs));
+			break;
+		}
+		diff_put(t, (uint64_t)(int64_t)rc);
+		diff_put(t, tessera_btree_root(bt));
+		if ((op & 31) == 31)
+			diff_put(t, ops_image_crc(d));
+		/* Damage a live node's entry bytes (not its header). */
+		if ((ctl & 0x80) && (r & 0xf) == 0) {
+			uint32_t s = 1 + (uint32_t)(r >> 8) % (OPS_SECTORS - 1);
+			for (uint32_t i = 0; i < OPS_SECTORS && !d->used[s]; i++)
+				s = s % (OPS_SECTORS - 1) + 1;
+			if (d->used[s]) {
+				uint32_t off = 64u + (uint32_t)(r >> 20) % (SECT - 64u);
+				uint8_t *p = img + (size_t)s * SECT + off;
+				if ((r >> 30) & 1) {
+					/* point an 8-byte child slot at the root */
+					uint64_t rt = tessera_btree_root(bt);
+					if (off + 8 <= SECT) memcpy(p, &rt, 8);
+				} else {
+					*p ^= (uint8_t)(r >> 32) | 1;
+				}
+			}
+		}
+	}
+	diff_put(t, ops_image_crc(d));
+	walk_cursor(tessera_btree_seek_first(bt), ks, vs, t);
+	tessera_btree_close(bt);
+out:
+	free(keys); free(vals); free(img); free(d);
 }
 
 /* ── journal: build, damage, replay (fuzz_journal.c input shape) ──────── */
@@ -586,6 +761,7 @@ ENTRY(int target, const uint8_t *data, size_t len, diff_trace_t *t)
 	case DIFF_BTREE:      run_btree(data, len, t); break;
 	case DIFF_JOURNAL:    run_journal(data, len, t); break;
 	case DIFF_SUPERBLOCK: run_superblock(data, len, t); break;
+	case DIFF_BTREE_OPS:  run_btree_ops(data, len, t); break;
 	default: break;
 	}
 }

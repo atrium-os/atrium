@@ -12,7 +12,7 @@
 
 enum {
 	DIFF_CODEC, DIFF_MANIFEST, DIFF_PACK, DIFF_BTREE, DIFF_JOURNAL,
-	DIFF_SUPERBLOCK, DIFF_NTARGETS
+	DIFF_SUPERBLOCK, DIFF_BTREE_OPS, DIFF_NTARGETS
 };
 
 /* A trace value that matches anything (a documented, allowed difference). */

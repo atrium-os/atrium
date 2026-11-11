@@ -100,6 +100,10 @@ done
 # (and the fuzz_diff corpus when there is one).
 printf '== diff %-10s ' "codec:"
 replay codec "$CORPUS"/fuzz_*/*
+# btree_ops grows its own tree; any bytes seed it. Every corpus file is one
+# operation stream (geometry, key space, length and damage from its bytes).
+printf '== diff %-10s ' "btree_ops:"
+replay btree_ops "$CORPUS"/fuzz_*/*
 if [ -d "$CORPUS/fuzz_diff" ] && [ -n "$(ls "$CORPUS/fuzz_diff")" ]; then
     printf '== diff %-10s ' "auto:"
     replay auto "$CORPUS"/fuzz_diff/*
@@ -115,8 +119,8 @@ link "$OBJ/fuzz_diff" -fsanitize=fuzzer || exit 1
 SEED="$OBJ/seed"; mkdir -p "$SEED" "$CORPUS/fuzz_diff"
 # Seed with every target's corpus, prefixed by that target's selector byte.
 i=0
-for t in codec manifest pack btree journal superblock; do
-    src="$t"; [ "$t" = codec ] && src=superblock
+for t in codec manifest pack btree journal superblock btree_ops; do
+    src="$t"; [ "$t" = codec ] && src=superblock; [ "$t" = btree_ops ] && src=btree
     for f in "$CORPUS/fuzz_$src"/*; do
         [ -f "$f" ] || continue
         { printf "\\$(printf %03o $i)"; cat "$f"; } > "$SEED/$t-$(basename "$f")"

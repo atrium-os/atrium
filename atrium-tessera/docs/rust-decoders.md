@@ -17,7 +17,7 @@ and for the loader.
 | `crc` | `crc.c` (for the decoders) | CRC-32, slice-by-8, const table |
 | `manifest` | `manifest.c` parser half | header, body bounds, chunk/tree/bucket/xattr/dirent/dir-btree accessors, and a whole-node check for directory B-tree nodes (`dir_btree_node`) |
 | `pack` | `pack.c` reader; the kmod's two pack readers (phase 2) | pack geometry (the #124 checks plus the footer, or from the header sector alone), bloom probe, binary search of the index, descriptor bounds |
-| `btree` | `btree.c` `load_node` checks and `search_leaf` | node header, tree kind, fan-out cap, key/value geometry, binary search |
+| `btree` | `btree.c` `load_node` checks and `search_leaf`; the node edits of put, delete and the sorted batch (phase 2) | node header, tree kind, fan-out cap, key/value geometry, binary search; insert, remove, split, slot writes and the batch's leaf merge, all inside the block |
 | `journal` | `journal.c` record read and advance | record header, sector count (64-bit), body inside the ring |
 
 The C entry points keep their names. Under `-DTESSERA_RUST_DECODE` each forwards to a
@@ -29,7 +29,8 @@ error return, never a panic. `scripts/tessera-decode-check.sh` proves that on th
 targets: it compiles the crate for `aarch64-unknown-none-softfloat` and
 `x86_64-unknown-none` and fails if the object references anything other than `memcmp`,
 `memcpy` and `memmove` (a panic path would pull in `core::panicking`). It also fails on any
-stack frame over 512 bytes. The largest today is 112 bytes on aarch64 and 56 on x86_64. The
+stack frame over 512 bytes. The largest today is 176 bytes on aarch64 (`split_insert`) and 136
+on x86_64 (`leaf_merge`). The
 C pack extent list decoder used 4160 bytes (kmod audit T2).
 
 ## Three ways the crate is built
@@ -50,7 +51,7 @@ C pack extent list decoder used 4160 bytes (kmod audit T2).
 and the Rust-decoder one with its global symbols renamed `rsmode_*` (`objcopy
 --redefine-syms`). `fuzz/diff_body.c` is compiled once per side and records a trace of every
 result; `fuzz/fuzz_diff.c` compares the traces and aborts on any difference. Targets: codec,
-manifest, pack, btree, journal, superblock. Both sides run under ASAN+UBSan.
+manifest, pack, btree, journal, superblock, btree_ops (phase 2, below). Both sides run under ASAN+UBSan.
 
 - With no arguments it replays every committed corpus through both sides. All agree.
 - `-t secs [-j N]` explores with libFuzzer. The Rust side is built with SanitizerCoverage
@@ -121,6 +122,8 @@ boundaries and single-value holes are what sweeps catch and random inputs do not
 | `kmod/tessera_fs.c` directory B-tree | leaf insert/remove walked `count` entries without a bounds check; `cap = count + 1` could overflow; an inner node with `count == 0` indexed `count - 1` | fixed: node blobs go through the Rust `dir_btree_node` check first |
 | `kmod/tessera_fs.c` `tessera_fs_dir_btree_walk` | recursion depth came from the image | fixed: bounded at 32 levels |
 | `kmod/tessera_fs.c` dir-btree insert and remove | recursion depth came from the image | fixed: bounded at 32 levels, as the walk |
+| `btree.c` put, delete, sorted batch, node walk | recursion depth came from the image: entry bytes are outside the header CRC, so a child pointer aimed back at the root is a one-word edit, and each of the four recursed until the stack ran out (segfault in the host test, a panic in the kmod); `get` alone stopped at 16 levels. Delete's root collapse could also spin on a one-child node pointing at itself | fixed (c3c5d45): all bounded at 16 levels, `ECORRUPT`; `test_cycle_bounded` |
+| `btree.c` `make_handle` | no cap on `key_size`, but put keeps the split key in 64-byte buffers; `key_size + value_size` could wrap to 0 and divide by zero | fixed (c3c5d45): key 1..64 bytes, value up to 4096; every tree uses 32 or less. Not reachable from disk (sizes are constants in callers) |
 | `journal.c` | `sectors_for` in 32 bits wraps for a huge `body_length`; `journal_open` did not check `head_block`/`tail_block`; a huge body length could make the kernel `malloc(M_WAITOK)` up to 4 GB | fixed: open rejects head or tail outside 1..length-1; record bodies capped at 1 MiB on append and replay (C and Rust), which also keeps the 32-bit sector count from wrapping; `test_bad_head_tail_and_body_cap` |
 
 ## Phase 2: the kernel module's pack readers (2026-11-11)
@@ -166,12 +169,41 @@ Fixed on the way: the tools did not link on Linux hosts (`tessera-sys` now links
 too), and the property tests had stopped compiling (block-io and format-options fields added
 since) and, once compiled, used volumes below the format minimum.
 
+## Phase 2: B-tree node edits (2026-11-11)
+
+`btree.c` keeps the I/O, allocation and copy-on-write order of put, delete and the sorted
+batch; the byte moves inside a node are now five helpers (`node_insert`, `node_remove`,
+`node_split_insert`, `node_entry_write`, `node_leaf_merge`) that call the Rust in the default
+build and keep the original C as the reference. In Rust every edit goes through checked
+sub-slices of the 4 KiB block, so a count that got past the callers' fan-out checks is
+`EINVAL`, not a write past the block. The split writes the two halves straight into the new
+blocks, so the default build no longer allocates a temporary entry array per split.
+
+Tests: unit tests insert and split at every position for four entry sizes up to 1008 bytes
+and full nodes, remove at every position, and check every bound. The differential harness
+gained `btree_ops`: both cores grow a tree from empty with the same stream of puts, deletes,
+sorted batches and gets (four geometries, from 4-entry leaves to 64-byte keys; deterministic
+allocator), optionally damaging entry bytes of live nodes between operations, and compare every
+return code, root, displaced entry and image CRC. It agrees on all 921 corpus inputs and on
+about 145,000 fuzzed ones (7 min, 4 jobs), and caught 4 of 4 planted bugs in the Rust edits
+(a remove one byte short, an insert shift one byte short, the wrong displaced value, a merge
+comparing one key byte short). Host suite 36/36 both builds, property tests pass, cloud VM e2e
+passes with the Rust and C modules on NODEBUG and the Rust module on KASAN.
+
+Stack: the static worst path is unchanged (6.2 KiB NODEBUG, 15.7 KiB KASAN). Put is still
+recursive, one frame per level (480 bytes NODEBUG, 864 KASAN for `put_into_internal`): real
+trees are 3 to 4 levels, but a crafted image can chain 16, which is about 7.5 KiB NODEBUG and
+13 KiB KASAN on top of the caller. That fits the 16 and 24 KiB stacks but not by much; an
+iterative put with the path on the heap would remove it.
+
 ## Not moved yet (phase 2)
 
 - The kernel module's GC index enumerator (`tessera_fs_gc_pack_index_hashes`) keeps its
   own subtraction-style checks; the module's other pack readers and all manifest parsing
   now go through the crate (above).
-- The encoders and the write paths (btree insert/split, journal write, pack write): next.
+- The encoders (node headers, records) and the journal and pack write paths: next. In the
+  B-tree, the batch's internal-node splice and `batch_emit` still copy entries in C (counts
+  computed, not read from disk).
 - The loader (`libsa`) stays C: no Rust in the boot loader for now.
 - HVF timing on the Mac VM; cross-language LTO.
 

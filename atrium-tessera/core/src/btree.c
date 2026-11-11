@@ -461,6 +461,146 @@ search_internal(const uint8_t *block, uint32_t entry_count,
 	return idx < 0 ? 0 : idx;
 }
 
+
+/* ── node edits ─────────────────────────────────────────────────────
+ *
+ * The entry-moving half of put, delete and the sorted batch. Under
+ * TESSERA_RUST_DECODE these are the bounds-checked Rust edits
+ * (tessera-decode btree.rs); otherwise the original C, kept as the
+ * reference for the differential test. The callers have already bounded
+ * every count by the fanout, so an error here is a caller bug; it comes
+ * back as EINVAL rather than a write outside the block. */
+
+/* Overwrite `len` bytes at offset `at` of entry `idx`. */
+static int
+node_entry_write(uint8_t *block, uint32_t es, uint32_t idx, uint32_t at,
+                 const void *src, uint32_t len)
+{
+#ifdef TESSERA_RUST_DECODE
+	return tessera_rs_btree_entry_write(block, BLOCK_SIZE, es, idx, at,
+	    src, len);
+#else
+	memcpy(leaf_entries(block) + (size_t)idx * es + at, src, len);
+	return TESSERA_OK;
+#endif
+}
+
+/* Insert key‖val at `ins` of a node holding `count` (room for one more). */
+static int
+node_insert(uint8_t *block, uint32_t count, uint32_t es, uint32_t ins,
+            const void *key, uint32_t ks, const void *val, uint32_t vs)
+{
+#ifdef TESSERA_RUST_DECODE
+	return tessera_rs_btree_insert(block, BLOCK_SIZE, count, es, ins,
+	    key, ks, val, vs);
+#else
+	uint8_t *base = leaf_entries(block);
+	memmove(base + (size_t)(ins + 1) * es, base + (size_t)ins * es,
+	    (size_t)(count - ins) * es);
+	memcpy(base + (size_t)ins * es, key, ks);
+	memcpy(base + (size_t)ins * es + ks, val, vs);
+	return TESSERA_OK;
+#endif
+}
+
+/* Remove entry `idx` of `count`. */
+static int
+node_remove(uint8_t *block, uint32_t count, uint32_t es, uint32_t idx)
+{
+#ifdef TESSERA_RUST_DECODE
+	return tessera_rs_btree_remove(block, BLOCK_SIZE, count, es, idx);
+#else
+	uint8_t *base = leaf_entries(block);
+	memmove(base + (size_t)idx * es, base + (size_t)(idx + 1) * es,
+	    (size_t)(count - idx - 1) * es);
+	return TESSERA_OK;
+#endif
+}
+
+/* The count+1 entries of `block` with key‖val at `ins`: the first half
+ * to `left`, the rest to `right` (entries only; headers are the
+ * caller's). The split key is right's first key. */
+static int
+node_split_insert(const uint8_t *block, uint32_t count, uint32_t es,
+                  uint32_t ins, const void *key, uint32_t ks,
+                  const void *val, uint32_t vs,
+                  uint8_t *left, uint8_t *right,
+                  uint32_t *out_left_n, uint32_t *out_right_n)
+{
+#ifdef TESSERA_RUST_DECODE
+	return tessera_rs_btree_split_insert(block, BLOCK_SIZE, count, es, ins,
+	    key, ks, val, vs, left, right, out_left_n, out_right_n);
+#else
+	const uint32_t total = count + 1;
+	uint8_t *flat = tessera_malloc((size_t)total * es);
+	if (flat == NULL) return TESSERA_ENOMEM;
+	const uint8_t *base = leaf_entries_const(block);
+	memcpy(flat, base, (size_t)ins * es);
+	memcpy(flat + (size_t)ins * es, key, ks);
+	memcpy(flat + (size_t)ins * es + ks, val, vs);
+	memcpy(flat + (size_t)(ins + 1) * es, base + (size_t)ins * es,
+	    (size_t)(count - ins) * es);
+	const uint32_t left_n = total / 2, right_n = total - left_n;
+	memcpy(leaf_entries(left), flat, (size_t)left_n * es);
+	memcpy(leaf_entries(right), flat + (size_t)left_n * es,
+	    (size_t)right_n * es);
+	tessera_free(flat);
+	*out_left_n = left_n;
+	*out_right_n = right_n;
+	return TESSERA_OK;
+#endif
+}
+
+/* The sorted batch's leaf merge into `flat` (room for count + n). */
+static int
+node_leaf_merge(const tessera_btree_t *t, const uint8_t *block, uint32_t count,
+                const uint8_t *keys, const uint8_t *vals, uint32_t n,
+                uint8_t *flat, size_t flat_len,
+                tessera_btree_displaced_cb_t cb, void *cbctx,
+                uint32_t *out_total)
+{
+#ifdef TESSERA_RUST_DECODE
+	return tessera_rs_btree_leaf_merge(block, BLOCK_SIZE, count,
+	    t->key_size, t->value_size, keys, vals, n, flat, flat_len,
+	    (tessera_rs_displaced_cb_t)cb, cbctx, out_total);
+#else
+	(void)flat_len;
+	const uint32_t es = leaf_entry_size(t);
+	const uint8_t *ex = leaf_entries_const(block);
+	uint32_t i = 0, j = 0, total = 0;
+	while (i < count || j < n) {
+		int c;
+		if (i >= count)  c = 1;
+		else if (j >= n) c = -1;
+		else c = key_compare(ex + (size_t)i * es,
+		    keys + (size_t)j * t->key_size, t->key_size);
+		uint8_t *dst = flat + (size_t)total * es;
+		if (c < 0) {
+			memcpy(dst, ex + (size_t)i * es, es);
+			i++;
+		} else {
+			memcpy(dst, keys + (size_t)j * t->key_size, t->key_size);
+			memcpy(dst + t->key_size, vals + (size_t)j * t->value_size,
+			    t->value_size);
+			if (c == 0) {       /* replace */
+				/* The merge is the only place that knows this
+				 * key collided: hand the displaced value to the
+				 * caller before it is overwritten. */
+				if (cb != NULL)
+					cb(cbctx, ex + (size_t)i * es,
+					    ex + (size_t)i * es + t->key_size,
+					    vals + (size_t)j * t->value_size);
+				i++;
+			}
+			j++;
+		}
+		total++;
+	}
+	*out_total = total;
+	return TESSERA_OK;
+#endif
+}
+
 /* ── open / create / close ───────────────────────────────────────── */
 
 static tessera_btree_t *
@@ -672,7 +812,6 @@ put_into_leaf(tessera_btree_t *t, uint64_t old_sector,
 	 * arrays at every recursion level. */
 	uint8_t *block = tessera_zalloc(BLOCK_SIZE);
 	uint8_t *left_block = NULL, *right_block = NULL;
-	uint8_t *flat = NULL;
 	int rc;
 	if (block == NULL) { rc = TESSERA_ENOMEM; goto out; }
 	rc = load_node(t, old_sector, block);
@@ -687,8 +826,9 @@ put_into_leaf(tessera_btree_t *t, uint64_t old_sector,
 	    &exact);
 
 	if (exact) {
-		uint8_t *e = leaf_entries(block) + (size_t)idx * es;
-		memcpy(e + t->key_size, value, t->value_size);
+		rc = node_entry_write(block, es, (uint32_t)idx, t->key_size,
+		    value, t->value_size);
+		if (rc != TESSERA_OK) goto out;
 
 		uint64_t s;
 		if (alloc_node(t, &s) != TESSERA_OK) { rc = TESSERA_ENOSPC; goto out; }
@@ -702,13 +842,9 @@ put_into_leaf(tessera_btree_t *t, uint64_t old_sector,
 
 	int ins = idx + 1;
 	if (h.entry_count + 1 <= t->leaf_fanout) {
-		uint8_t *base = leaf_entries(block);
-		memmove(base + (size_t)(ins + 1) * es,
-		        base + (size_t)ins * es,
-		        (size_t)(h.entry_count - ins) * es);
-		memcpy(base + (size_t)ins * es, key, t->key_size);
-		memcpy(base + (size_t)ins * es + t->key_size, value,
-		    t->value_size);
+		rc = node_insert(block, h.entry_count, es, (uint32_t)ins,
+		    key, t->key_size, value, t->value_size);
+		if (rc != TESSERA_OK) goto out;
 
 		uint64_t s;
 		if (alloc_node(t, &s) != TESSERA_OK) { rc = TESSERA_ENOSPC; goto out; }
@@ -720,31 +856,22 @@ put_into_leaf(tessera_btree_t *t, uint64_t old_sector,
 		rc = TESSERA_OK; goto out;
 	}
 
-	const uint32_t total = h.entry_count + 1;
-	flat = tessera_malloc((size_t)total * es);
-	if (flat == NULL) { rc = TESSERA_ENOMEM; goto out; }
-	const uint8_t *base = leaf_entries_const(block);
-	memcpy(flat, base, (size_t)ins * es);
-	memcpy(flat + (size_t)ins * es, key, t->key_size);
-	memcpy(flat + (size_t)ins * es + t->key_size, value, t->value_size);
-	memcpy(flat + (size_t)(ins + 1) * es,
-	       base + (size_t)ins * es,
-	       (size_t)(h.entry_count - ins) * es);
-
-	const uint32_t left_n  = total / 2;
-	const uint32_t right_n = total - left_n;
-
+	uint32_t left_n, right_n;
 	left_block  = tessera_zalloc(BLOCK_SIZE);
 	right_block = tessera_zalloc(BLOCK_SIZE);
 	if (left_block == NULL || right_block == NULL) { rc = TESSERA_ENOMEM; goto out; }
-	write_header(left_block,  t, 0, left_n);
-	write_header(right_block, t, 0, right_n);
-	memcpy(leaf_entries(left_block),  flat,
-	    (size_t)left_n * es);
-	memcpy(leaf_entries(right_block), flat + (size_t)left_n * es,
-	    (size_t)right_n * es);
-
-	memcpy(res->split_key, flat + (size_t)left_n * es, t->key_size);
+	/* write_header zeroes the entry area, so headers first; the
+	 * split's own counts must agree with them. */
+	write_header(left_block,  t, 0, (h.entry_count + 1) / 2);
+	write_header(right_block, t, 0, h.entry_count + 1 - (h.entry_count + 1) / 2);
+	rc = node_split_insert(block, h.entry_count, es, (uint32_t)ins,
+	    key, t->key_size, value, t->value_size, left_block, right_block,
+	    &left_n, &right_n);
+	if (rc != TESSERA_OK) goto out;
+	if (left_n != (h.entry_count + 1) / 2 || left_n + right_n != h.entry_count + 1) {
+		rc = TESSERA_EINVAL; goto out;
+	}
+	memcpy(res->split_key, leaf_entries_const(right_block), t->key_size);
 
 	uint64_t sl, sr;
 	if (alloc_node(t, &sl) != TESSERA_OK) { rc = TESSERA_ENOSPC; goto out; }
@@ -764,7 +891,6 @@ out:
 	if (block)       tessera_free(block);
 	if (left_block)  tessera_free(left_block);
 	if (right_block) tessera_free(right_block);
-	if (flat)        tessera_free(flat);
 	return rc;
 }
 
@@ -779,7 +905,6 @@ put_into_internal(tessera_btree_t *t, uint64_t old_sector,
 	if (depth + 1 >= MAX_DEPTH) return TESSERA_ECORRUPT;
 	uint8_t *block = tessera_zalloc(BLOCK_SIZE);
 	uint8_t *cblk = NULL, *left_block = NULL, *right_block = NULL;
-	uint8_t *flat = NULL;
 	int rc;
 	if (block == NULL) { rc = TESSERA_ENOMEM; goto out; }
 	rc = load_node(t, old_sector, block);
@@ -806,8 +931,10 @@ put_into_internal(tessera_btree_t *t, uint64_t old_sector,
 	 * by the batch-merge A/B test; random-keyed trees like the pack
 	 * registry were exposed in production). We are already COWing
 	 * this node, so the fix is one memcpy. */
-	if (idx == 0 && key_compare(key, child_entry, t->key_size) < 0)
-		memcpy(child_entry, key, t->key_size);
+	if (idx == 0 && key_compare(key, child_entry, t->key_size) < 0) {
+		rc = node_entry_write(block, es, 0, 0, key, t->key_size);
+		if (rc != TESSERA_OK) goto out;
+	}
 
 	struct put_result child_res;
 	cblk = tessera_zalloc(BLOCK_SIZE);
@@ -824,7 +951,9 @@ put_into_internal(tessera_btree_t *t, uint64_t old_sector,
 		    depth + 1);
 	if (rc != TESSERA_OK) goto out;
 
-	memcpy(child_entry + t->key_size, &child_res.new_left, 8);
+	rc = node_entry_write(block, es, (uint32_t)idx, t->key_size,
+	    &child_res.new_left, 8);
+	if (rc != TESSERA_OK) goto out;
 
 	if (!child_res.split) {
 		uint64_t s;
@@ -839,13 +968,9 @@ put_into_internal(tessera_btree_t *t, uint64_t old_sector,
 
 	int ins = idx + 1;
 	if (h.entry_count + 1 <= t->inner_fanout) {
-		uint8_t *base = leaf_entries(block);
-		memmove(base + (size_t)(ins + 1) * es,
-		        base + (size_t)ins * es,
-		        (size_t)(h.entry_count - ins) * es);
-		memcpy(base + (size_t)ins * es, child_res.split_key, t->key_size);
-		memcpy(base + (size_t)ins * es + t->key_size,
-		       &child_res.new_right, 8);
+		rc = node_insert(block, h.entry_count, es, (uint32_t)ins,
+		    child_res.split_key, t->key_size, &child_res.new_right, 8);
+		if (rc != TESSERA_OK) goto out;
 
 		uint64_t s;
 		if (alloc_node(t, &s) != TESSERA_OK) { rc = TESSERA_ENOSPC; goto out; }
@@ -857,32 +982,22 @@ put_into_internal(tessera_btree_t *t, uint64_t old_sector,
 		rc = TESSERA_OK; goto out;
 	}
 
-	const uint32_t total = h.entry_count + 1;
-	flat = tessera_malloc((size_t)total * es);
-	if (flat == NULL) { rc = TESSERA_ENOMEM; goto out; }
-	const uint8_t *base = leaf_entries_const(block);
-	memcpy(flat, base, (size_t)ins * es);
-	memcpy(flat + (size_t)ins * es, child_res.split_key, t->key_size);
-	memcpy(flat + (size_t)ins * es + t->key_size,
-	       &child_res.new_right, 8);
-	memcpy(flat + (size_t)(ins + 1) * es,
-	       base + (size_t)ins * es,
-	       (size_t)(h.entry_count - ins) * es);
-
-	const uint32_t left_n  = total / 2;
-	const uint32_t right_n = total - left_n;
-
+	uint32_t left_n, right_n;
 	left_block  = tessera_zalloc(BLOCK_SIZE);
 	right_block = tessera_zalloc(BLOCK_SIZE);
 	if (left_block == NULL || right_block == NULL) { rc = TESSERA_ENOMEM; goto out; }
-	write_header(left_block,  t, 1, left_n);
-	write_header(right_block, t, 1, right_n);
-	memcpy(leaf_entries(left_block),  flat,
-	    (size_t)left_n * es);
-	memcpy(leaf_entries(right_block), flat + (size_t)left_n * es,
-	    (size_t)right_n * es);
-
-	memcpy(res->split_key, flat + (size_t)left_n * es, t->key_size);
+	/* write_header zeroes the entry area, so headers first; the
+	 * split's own counts must agree with them. */
+	write_header(left_block,  t, 1, (h.entry_count + 1) / 2);
+	write_header(right_block, t, 1, h.entry_count + 1 - (h.entry_count + 1) / 2);
+	rc = node_split_insert(block, h.entry_count, es, (uint32_t)ins,
+	    child_res.split_key, t->key_size, &child_res.new_right, 8,
+	    left_block, right_block, &left_n, &right_n);
+	if (rc != TESSERA_OK) goto out;
+	if (left_n != (h.entry_count + 1) / 2 || left_n + right_n != h.entry_count + 1) {
+		rc = TESSERA_EINVAL; goto out;
+	}
+	memcpy(res->split_key, leaf_entries_const(right_block), t->key_size);
 
 	uint64_t sl, sr;
 	if (alloc_node(t, &sl) != TESSERA_OK) { rc = TESSERA_ENOSPC; goto out; }
@@ -903,7 +1018,6 @@ out:
 	if (cblk)        tessera_free(cblk);
 	if (left_block)  tessera_free(left_block);
 	if (right_block) tessera_free(right_block);
-	if (flat)        tessera_free(flat);
 	return rc;
 }
 
@@ -1100,43 +1214,13 @@ batch_recurse(tessera_btree_t *t, uint64_t cur,
 	if (h.node_kind == 0) {
 		/* Leaf: two-pointer merge (replace on equal key). */
 		const uint32_t es = leaf_entry_size(t);
-		flat = tessera_zalloc((size_t)(h.entry_count + n) * es);
+		const size_t flat_len = (size_t)(h.entry_count + n) * es;
+		flat = tessera_zalloc(flat_len);
 		if (flat == NULL) { rc = TESSERA_ENOMEM; goto out; }
-		const uint8_t *ex = leaf_entries_const(block);
-		uint32_t i = 0, j = 0, total = 0;
-		while (i < h.entry_count || j < n) {
-			int c;
-			if (i >= h.entry_count)       c = 1;
-			else if (j >= n)              c = -1;
-			else c = key_compare(ex + (size_t)i * es,
-			    keys + (size_t)j * t->key_size, t->key_size);
-			uint8_t *dst = flat + (size_t)total * es;
-			if (c < 0) {
-				memcpy(dst, ex + (size_t)i * es, es);
-				i++;
-			} else {
-				memcpy(dst, keys + (size_t)j * t->key_size,
-				    t->key_size);
-				memcpy(dst + t->key_size,
-				    vals + (size_t)j * t->value_size,
-				    t->value_size);
-				if (c == 0) {       /* replace */
-					/* The merge is the only place that
-					 * knows this key collided — hand the
-					 * displaced value to the caller before
-					 * it is overwritten. */
-					if (cb != NULL)
-						cb(cbctx, ex + (size_t)i * es,
-						    ex + (size_t)i * es +
-						    t->key_size,
-						    vals + (size_t)j *
-						    t->value_size);
-					i++;
-				}
-				j++;
-			}
-			total++;
-		}
+		uint32_t total = 0;
+		rc = node_leaf_merge(t, block, h.entry_count, keys, vals, n,
+		    flat, flat_len, cb, cbctx, &total);
+		if (rc != TESSERA_OK) goto out;
 		rc = batch_emit(t, flat, total, es, 0, t->leaf_fanout, out);
 		if (rc == TESSERA_OK)
 			(void)free_node(t, cur);
@@ -1333,10 +1417,8 @@ delete_recurse(tessera_btree_t *t, uint64_t cur, const void *key,
 			rc = TESSERA_OK; goto out;
 		}
 
-		uint8_t *base = leaf_entries(block);
-		memmove(base + (size_t)idx * es,
-		        base + (size_t)(idx + 1) * es,
-		        (size_t)(h.entry_count - idx - 1) * es);
+		rc = node_remove(block, h.entry_count, es, (uint32_t)idx);
+		if (rc != TESSERA_OK) goto out;
 
 		uint64_t s;
 		if (alloc_node(t, &s) != TESSERA_OK) { rc = TESSERA_ENOSPC; goto out; }
@@ -1374,10 +1456,9 @@ delete_recurse(tessera_btree_t *t, uint64_t cur, const void *key,
 			tessera_free(parent);
 			rc = TESSERA_OK; goto out;
 		}
-		uint8_t *base = leaf_entries(parent);
-		memmove(base + (size_t)saved_idx * es,
-		        base + (size_t)(saved_idx + 1) * es,
-		        (size_t)(saved_entry_count - saved_idx - 1) * es);
+		rc = node_remove(parent, saved_entry_count, es,
+		    (uint32_t)saved_idx);
+		if (rc != TESSERA_OK) { tessera_free(parent); goto out; }
 		uint64_t s;
 		if (alloc_node(t, &s) != TESSERA_OK) {
 			tessera_free(parent);
@@ -1393,8 +1474,9 @@ delete_recurse(tessera_btree_t *t, uint64_t cur, const void *key,
 		rc = TESSERA_OK; goto out;
 	}
 
-	uint8_t *new_child_entry = leaf_entries(parent) + (size_t)saved_idx * es;
-	memcpy(new_child_entry + t->key_size, &new_child, 8);
+	rc = node_entry_write(parent, es, (uint32_t)saved_idx, t->key_size,
+	    &new_child, 8);
+	if (rc != TESSERA_OK) { tessera_free(parent); goto out; }
 	uint64_t s;
 	if (alloc_node(t, &s) != TESSERA_OK) {
 		tessera_free(parent);
