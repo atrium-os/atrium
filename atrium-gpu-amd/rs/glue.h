@@ -15,6 +15,13 @@ void	*amd_rs_state(struct atrium_amd_softc *sc);
 void	amd_rs_defer_count(struct atrium_amd_softc *sc, int now, int reaped);
 struct atrium_amd_softc *amd_rs_cdev_softc(struct cdev *cdev);
 
+/* C, for Rust (glue.c): per-uid BO accounting (rs/quota.rs). The calling
+ * thread's real uid, the cap in bytes for VRAM (vram != 0) or System BOs, and
+ * the refusal counter. */
+uint32_t amd_rs_cur_ruid(void);
+uint64_t amd_rs_quota_limit(struct atrium_amd_softc *sc, int vram);
+void	amd_rs_quota_refused(struct atrium_amd_softc *sc);
+
 /* Rust, for C (rs/ioctl.rs): the cdevsw entry points. */
 d_open_t	amd_rs_open;
 d_ioctl_t	amd_rs_ioctl;

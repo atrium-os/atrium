@@ -22,6 +22,7 @@
 
 use crate::backend::Dev;
 use crate::defer;
+use crate::quota::Charge;
 use crate::sys;
 use crate::vm::Vm;
 use core::ffi::c_int;
@@ -55,6 +56,8 @@ pub struct Bo {
     /// be reached through the exclusive guard, and a full table is an error, not an index.
     /// Exclusive in bind (which may sleep in map_page), shared in gpu_va.
     binds: SxLock<[Option<Binding>; MAX_BIND]>,
+    /// What the BO holds against its allocator's uid (quota.rs); `None` until charged.
+    charge: Option<Charge>,
 }
 
 // SAFETY: the backing store is written only by the backend at alloc/free (no other user then)
@@ -214,7 +217,16 @@ impl Drop for BoFile {
             defer::defer(dev, bo, at);
             return;
         }
-        dev.bo_free(&mut bo.hw); // backing store + bo_count--
+        free_backing(dev, &mut bo);
+    }
+}
+
+/// Free a BO's backing store (bo_count--) and give its charge back. Only once no queue can
+/// still reach it: at the last close, or from the deferred-free reaper.
+pub(crate) fn free_backing(dev: Dev, bo: &mut Bo) {
+    dev.bo_free(&mut bo.hw);
+    if let Some(c) = bo.charge.take() {
+        dev.state().quotas.uncharge(c);
     }
 }
 
@@ -224,11 +236,25 @@ pub fn create_fd(dev: Dev, size: u64, flags: u32) -> Result<c_int> {
     // which bo_alloc fills in (the C front-end used M_ZERO).
     let mut hw: sys::atrium_amd_bo = unsafe { MaybeUninit::zeroed().assume_init() };
     hw.sc = dev.raw();
-    let mut bo: Box<Bo> = Box::new(Bo { hw, binds: SxLock::new([const { None }; MAX_BIND]) }, M_WAITOK);
+    // Charged first, so two threads of one uid can't both pass the cap; whole pages, as
+    // allocated. The size check is bo_alloc's too, made here first so that a bad size is
+    // EINVAL whatever the uid has charged.
+    if size == 0 || size > sys::ATRIUM_AMD_BO_MAX_PAGES as u64 * PAGE_SIZE {
+        return Err(EINVAL);
+    }
+    let vram = flags & sys::ATRIUM_GPU_BO_VRAM as u32 != 0;
+    let bytes = (size + PAGE_SIZE - 1) & !(PAGE_SIZE - 1);
+    let charge = dev.state().quotas.charge(dev, vram, bytes)?;
+    let mut bo: Box<Bo> =
+        Box::new(Bo { hw, binds: SxLock::new([const { None }; MAX_BIND]), charge: None }, M_WAITOK);
     // SAFETY: boxed, never moves again.
     unsafe { sx_init(Pin::new_unchecked(&bo.binds), c"amdbobind") };
     // Self-cleaning on failure; the Box then frees the struct.
-    dev.bo_alloc(&mut bo.hw, size, flags)?;
+    if let Err(e) = dev.bo_alloc(&mut bo.hw, size, flags) {
+        dev.state().quotas.uncharge(charge);
+        return Err(e);
+    }
+    bo.charge = Some(charge);
     // From here the BoFile owns the BO: if install fails, its drop frees the backing.
     let raw = Box::into_raw(bo);
     // SAFETY: Box::into_raw is never null.

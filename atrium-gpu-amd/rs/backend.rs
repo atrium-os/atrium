@@ -261,6 +261,20 @@ impl Dev {
 
     /// Account a doorbell grant: `live` grant objects more (or fewer), and one more created.
     /// Live grants hold up module detach (amd_hwq_busy_refs).
+    /// The calling thread's real uid: what its BOs are charged to (quota.rs).
+    pub fn cur_ruid(self) -> u32 {
+        unsafe { sys::amd_rs_cur_ruid() }
+    }
+
+    /// The per-uid cap in bytes, for VRAM or for System BOs.
+    pub fn quota_limit(self, vram: bool) -> u64 {
+        unsafe { sys::amd_rs_quota_limit(self.0, vram as c_int) }
+    }
+
+    pub fn quota_refused(self) {
+        unsafe { sys::amd_rs_quota_refused(self.0) }
+    }
+
     pub fn grant_count(self, live: c_int, created: bool) {
         unsafe { sys::amd_rs_grant_count(self.0, live, created as c_int) }
     }

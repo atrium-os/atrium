@@ -15,6 +15,7 @@ layer that faces clients. The hardware half stays C for now.
 | hardware queues: each queue's state behind its own lock, ownership, submit, QUEUE_MAP, the doorbell mmap, waiting for another VM's work, the hang check, reset (`queue.rs`) | queue registers, programming and stopping a queue (`cp.c`), the completions a queue owes, which the interrupt handler drains (`irq.c`), and the small helpers, timers and sysctls (`queue.c`) |
 | doorbell mapping grants: the device pager's fault handler, the grant's lifetime, revoke (`doorbell.rs`, on `kpi::pager`) | |
 | deferred BO frees: the list and the reaper (`defer.rs`); a BO stays a Rust `Box` until it is freed, C never owns it | the reaper's and watchdog's timers (`queue.c`) |
+| per-uid BO caps, kmod audit G2: the accounts, charge at BO_ALLOC, give back at free (`quota.rs`) | the cap sysctls and the caller's uid (`queue.c`, `glue.c`) |
 | the single place Rust calls C (`backend.rs`) | |
 
 C reaches the Rust objects through a few `#[no_mangle]` exports: `amd_syncobj_*`,

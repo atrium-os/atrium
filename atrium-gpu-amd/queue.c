@@ -313,6 +313,28 @@ amd_iso_sysctl_hang_ms(SYSCTL_HANDLER_ARGS)
 	return (0);
 }
 
+/* vram_limit_pct / sys_limit_pct: arg2 is the field's offset in the softc. */
+static int
+amd_iso_sysctl_pct(SYSCTL_HANDLER_ARGS)
+{
+	struct atrium_amd_softc *sc = arg1;
+	int *field = (int *)((char *)sc + arg2);
+	int v, err;
+
+	mtx_lock(&sc->lock);
+	v = *field;
+	mtx_unlock(&sc->lock);
+	err = sysctl_handle_int(oidp, &v, 0, req);
+	if (err != 0 || req->newptr == NULL)
+		return (err);
+	if (v < 1 || v > 100)
+		return (EINVAL);
+	mtx_lock(&sc->lock);
+	*field = v;
+	mtx_unlock(&sc->lock);
+	return (0);
+}
+
 int
 amd_hwq_init(struct atrium_amd_softc *sc, device_t dev)
 {
@@ -330,6 +352,8 @@ amd_hwq_init(struct atrium_amd_softc *sc, device_t dev)
 	bzero(sc->qpend, sizeof(sc->qpend));
 	sc->watchdog_armed = 0;
 	sc->hang_ms = ATRIUM_AMD_HANG_MS;
+	sc->vram_limit_pct = ATRIUM_AMD_VRAM_LIMIT_PCT;
+	sc->sys_limit_pct = ATRIUM_AMD_SYS_LIMIT_PCT;
 	sc->hwq_inited = 1;
 
 	err = amd_dma_page_alloc(sc, &sc->null_pd);	/* zeroed: all invalid */
@@ -373,6 +397,8 @@ amd_hwq_init(struct atrium_amd_softc *sc, device_t dev)
 	AMD_ISO_U64("vm_faults", vm_faults, "GPU VM fault interrupts");
 	AMD_ISO_U64("fences_failed", fences_failed,
 	    "owed completions failed with EIO (queue stopped or reset)");
+	AMD_ISO_U64("quota_refused", quota_refused,
+	    "BO allocations refused: over the owner's per-uid cap");
 	AMD_ISO_INT("deferred_now", deferred_now, "deferred BO frees pending");
 	AMD_ISO_INT("grants_live", grants_live, "doorbell grant objects alive");
 #undef AMD_ISO_U64
@@ -384,6 +410,16 @@ amd_hwq_init(struct atrium_amd_softc *sc, device_t dev)
 	    CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_MPSAFE, sc, 0,
 	    amd_iso_sysctl_hang_ms, "I",
 	    "stop a kernel-rung queue after this long without progress");
+	SYSCTL_ADD_PROC(ctx, SYSCTL_CHILDREN(tree), OID_AUTO, "vram_limit_pct",
+	    CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_MPSAFE, sc,
+	    offsetof(struct atrium_amd_softc, vram_limit_pct),
+	    amd_iso_sysctl_pct, "I",
+	    "VRAM one uid's BOs may hold, in % of VRAM (kmod audit G2)");
+	SYSCTL_ADD_PROC(ctx, SYSCTL_CHILDREN(tree), OID_AUTO, "sys_limit_pct",
+	    CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_MPSAFE, sc,
+	    offsetof(struct atrium_amd_softc, sys_limit_pct),
+	    amd_iso_sysctl_pct, "I",
+	    "System memory one uid's BOs may hold, in % of RAM");
 	return (0);
 }
 

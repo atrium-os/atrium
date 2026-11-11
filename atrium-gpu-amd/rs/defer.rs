@@ -19,6 +19,7 @@
 use crate::backend::Dev;
 use crate::bo::Bo;
 use crate::queue::Queues;
+use crate::quota::Quotas;
 use crate::sys;
 use core::ffi::{c_int, c_void};
 use core::pin::Pin;
@@ -58,6 +59,8 @@ pub struct DevState {
     deferred: Mutex<Option<Box<Deferred>>>,
     /// The hardware queues' state (queue.rs).
     pub queues: Queues,
+    /// Per-uid BO charges (quota.rs).
+    pub quotas: Quotas,
 }
 
 // SAFETY: everything is behind the mutex; a Bo is Send.
@@ -108,7 +111,7 @@ pub fn reap(dev: Dev) -> bool {
     let mut cur = done;
     while let Some(mut d) = cur {
         cur = d.next.take();
-        dev.bo_free(&mut d.bo.hw); // backing store + bo_count--
+        crate::bo::free_backing(dev, &mut d.bo); // backing store, bo_count--, uncharge
         n += 1;
         // `d` (and its Box<Bo>) drops here.
     }
@@ -123,11 +126,15 @@ pub fn reap(dev: Dev) -> bool {
 /// Attach: the per-device state. NULL on failure.
 #[unsafe(no_mangle)]
 pub extern "C" fn amd_rs_dev_init() -> *mut c_void {
-    let s: Box<DevState> = Box::new(DevState { deferred: Mutex::new(None), queues: Queues::new() }, M_WAITOK);
+    let s: Box<DevState> = Box::new(
+        DevState { deferred: Mutex::new(None), queues: Queues::new(), quotas: Quotas::new() },
+        M_WAITOK,
+    );
     // SAFETY: boxed, never moves again; the locks are destroyed by their drops.
     unsafe {
         mtx_init(Pin::new_unchecked(&s.deferred), c"amd_defer", None, None);
         s.queues.init();
+        s.quotas.init();
     }
     Box::into_raw(s).cast()
 }

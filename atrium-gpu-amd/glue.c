@@ -8,6 +8,10 @@
  * softc stays a C type the Rust side only holds pointers to.
  */
 #include "atrium_gpu_amd.h"
+
+#include <sys/proc.h>
+#include <sys/ucred.h>
+
 #include "rs/glue.h"
 
 const struct atrium_gpu_backend_ops *
@@ -54,6 +58,33 @@ amd_rs_defer_count(struct atrium_amd_softc *sc, int now, int reaped)
 	if (now > 0)
 		sc->iso.deferred += now;
 	sc->iso.reaped += reaped;
+	mtx_unlock(&sc->lock);
+}
+
+uint32_t
+amd_rs_cur_ruid(void)
+{
+	return (curthread->td_ucred->cr_ruid);
+}
+
+uint64_t
+amd_rs_quota_limit(struct atrium_amd_softc *sc, int vram)
+{
+	uint64_t total;
+	int pct;
+
+	mtx_lock(&sc->lock);
+	pct = vram ? sc->vram_limit_pct : sc->sys_limit_pct;
+	mtx_unlock(&sc->lock);
+	total = vram ? sc->vram.total : ptoa((uint64_t)physmem);
+	return (total / 100 * (uint64_t)pct);
+}
+
+void
+amd_rs_quota_refused(struct atrium_amd_softc *sc)
+{
+	mtx_lock(&sc->lock);
+	sc->iso.quota_refused++;
 	mtx_unlock(&sc->lock);
 }
 

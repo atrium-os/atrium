@@ -28,3 +28,5 @@ pub mod doorbell;
 pub mod defer;
 #[path = "../rs/queue.rs"]
 pub mod queue;
+#[path = "../rs/quota.rs"]
+pub mod quota;

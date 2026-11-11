@@ -14,6 +14,8 @@
  *   /tmp/test_gpu_isolation [--attest]
  * --attest prints the jaild.policy.toml stanza for this build on success.
  * Part F (VRAM scrubbing) needs gpusim with DMA_DATA fill (see gpusim pm4.rs).
+ * Part G (per-uid BO caps) changes and restores the isolation.*_limit_pct
+ * sysctls.
  */
 #include "atrium_gpu_amd_abi.h"
 #include "atrium_display_abi.h"
@@ -1138,7 +1140,7 @@ part_f(void)
 		}
 		close((int)a.bo_fd);
 	}
-	ok = vram_settle(10000);
+	ok = vram_settle(30000);	/* the last scrub can lag under TCG */
 	CHECK(n == 0 && ok, "allocated and freed %llu MiB of VRAM (%.1fx the "
 	    "device) in %.1f s with no ENOMEM",
 	    (unsigned long long)(i * 64), (double)(i * (64ULL << 20)) / total,
@@ -1148,6 +1150,113 @@ part_f(void)
 	    "VRAM in use is back where it started; no scrub failed");
 	close(vmb);
 	close(fdb);
+}
+
+/* ---------------------------------------------------------------------------
+ * Part G: per-uid BO caps (kmod audit 2026-11-07, G2). One uid's BOs may hold
+ * at most vram_limit_pct of VRAM and sys_limit_pct of RAM; past that BO_ALLOC
+ * fails with EDQUOT, while another uid still allocates, and freeing gives the
+ * charge back.
+ */
+#define G_BO	(1ULL << 20)
+
+static void
+iso_set_int(const char *name, int v)
+{
+	char oid[128];
+
+	snprintf(oid, sizeof(oid), ISO "%s", name);
+	if (sysctlbyname(oid, NULL, NULL, &v, sizeof(v)) != 0) {
+		fprintf(stderr, "sysctl %s=%d: %s\n", oid, v, strerror(errno));
+		exit(2);
+	}
+}
+
+static int
+bo_try(int fd, uint32_t flags, int *bo)
+{
+	struct atrium_gpu_bo_alloc a;
+
+	memset(&a, 0, sizeof(a));
+	a.size = G_BO;
+	a.flags = flags;
+	if (ioctl(fd, ATRIUM_GPU_IOC_BO_ALLOC, &a) != 0)
+		return (errno);
+	*bo = (int)a.bo_fd;
+	return (0);
+}
+
+static void
+part_g_one(const char *what, const char *knob, uint32_t flags, uint64_t total,
+    uint64_t held)
+{
+	static int bos[4096];
+	uint64_t refused0, limit;
+	int old, pct, fd, n, err, i, bo, status;
+	pid_t pid;
+
+	old = (int)iso(knob);
+	refused0 = iso("quota_refused");
+	/* A cap of a few dozen MiB at most, so the test stays quick. */
+	pct = (int)((64ULL << 20) * 100 / total);
+	pct = pct < 1 ? 1 : pct > 50 ? 50 : pct;
+	limit = total / 100 * (uint64_t)pct;
+	iso_set_int(knob, pct);
+	CHECK(iso(knob) == (uint64_t)pct, "%s set to %d%% (%llu MiB)", knob,
+	    pct, (unsigned long long)(limit >> 20));
+
+	fd = xopen(GPU);
+	for (n = 0, err = 0; n < (int)(sizeof(bos) / sizeof(bos[0])); n++)
+		if ((err = bo_try(fd, flags, &bos[n])) != 0)
+			break;
+	/* `held`: what root may hold already (the display keeps the last
+	 * scanout BO it was given; it stays charged to its allocator). */
+	CHECK(err == EDQUOT && (uint64_t)n * G_BO <= limit &&
+	    (uint64_t)(n + 1) * G_BO + held > limit,
+	    "%s: %d one-MiB BOs, then EDQUOT (%s)", what, n, strerror(err));
+	CHECK(iso("quota_refused") == refused0 + 1, "counted as one refusal");
+
+	/* Another uid has its own budget. The node is root-only, so the child
+	 * opens it first and then becomes nobody: BOs are charged to the uid
+	 * that allocates them, not to whoever opened the node. */
+	pid = fork();
+	if (pid == 0) {
+		int cfd = open(GPU, O_RDWR);
+
+		if (cfd < 0 || setgid(65534) != 0 || setuid(65534) != 0)
+			_exit(3);
+		_exit(bo_try(cfd, flags, &bo) == 0 ? 0 : 1);
+	}
+	waitpid(pid, &status, 0);
+	CHECK(WIFEXITED(status) && WEXITSTATUS(status) == 0,
+	    "%s: another uid can still allocate", what);
+
+	for (i = 0; i < n; i++)
+		close(bos[i]);
+	err = bo_try(fd, flags, &bo);
+	CHECK(err == 0, "%s: freeing gives the charge back (%s)", what,
+	    strerror(err));
+	if (err == 0)
+		close(bo);
+	close(fd);
+	iso_set_int(knob, old);
+}
+
+static void
+part_g(void)
+{
+	uint64_t ram = 0;
+	size_t len = sizeof(ram);
+
+	printf("Part G: per-uid BO caps\n");
+	CHECK(iso("vram_limit_pct") == 75 && iso("sys_limit_pct") == 50,
+	    "defaults: 75%% of VRAM, 50%% of RAM per uid");
+	vram_settle(5000);
+	part_g_one("VRAM", "vram_limit_pct", ATRIUM_GPU_BO_VRAM, vram("total"),
+	    vram("used"));
+	sysctlbyname("hw.physmem", &ram, &len, NULL, 0);
+	part_g_one("System", "sys_limit_pct", 0, ram, 0);
+	vram_settle(5000);
 }
 
 static void
@@ -1189,6 +1298,7 @@ main(int argc, char **argv)
 	part_d();
 	part_e();
 	part_f();
+	part_g();
 	if (argc > 1 && strcmp(argv[1], "--attest") == 0)
 		attest();
 	printf(failures == 0 ? "ALL OK\n" : "%d FAILURES\n", failures);

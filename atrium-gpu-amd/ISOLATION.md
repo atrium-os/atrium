@@ -123,6 +123,25 @@ must read zero; then 1.1x the device's VRAM is churned in 64 MiB BOs with no
 `ENOMEM` and no failed scrub). Lock order: the clear lock comes before the
 hwq locks (a device reset takes it first and drops it last).
 
+## Per-uid caps (kmod audit G2)
+
+Without a cap, anyone holding a GPU fd could allocate VRAM, or wired System
+memory, until every other client's `BO_ALLOC` failed. `rs/quota.rs` charges
+each BO to the real uid of the thread that allocates it, before the backing
+is allocated, and gives the charge back when the backing is freed (for a BO
+a queue may still be using, when the deferred free reaps it). An allocation
+that would take the uid over its cap fails with `EDQUOT`. The caps are
+`sysctl dev.atrium_gpu_amd.0.isolation.vram_limit_pct` (default 75, of the
+device's VRAM) and `sys_limit_pct` (default 50, of RAM); refusals are
+counted in `quota_refused`. The key is the uid, not the open, because a
+client can open the node as often as it likes. frescod (`_frescod`) and the
+renderers (`_fresco-render`) are separate uids, so app renderers together
+can never take more than their share from the compositor. A BO fd passed to
+another process stays charged to the uid that allocated it. Test:
+`test_gpu_isolation` part G (fill one uid to a lowered cap, `EDQUOT`;
+another uid still allocates; freeing gives the charge back; for VRAM and
+for System BOs).
+
 ## Known limits (not isolation breaks, but worth knowing)
 
 - The device still has only two shared queues (gfx and compute). A client

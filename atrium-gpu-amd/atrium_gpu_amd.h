@@ -698,6 +698,8 @@ struct atrium_amd_reset_hooks {
 #define ATRIUM_AMD_NHWQ		2
 #define ATRIUM_AMD_QUEUE_WAIT_MS 2000	/* wait for another VM's work to drain */
 #define ATRIUM_AMD_HANG_MS	5000	/* default watchdog limit (sysctl hang_ms) */
+#define ATRIUM_AMD_VRAM_LIMIT_PCT 75	/* default per-uid VRAM cap (kmod audit G2) */
+#define ATRIUM_AMD_SYS_LIMIT_PCT 50	/* default per-uid System BO cap */
 
 struct atrium_amd_client;	/* one open of the client node (rs/ioctl.rs) */
 
@@ -713,6 +715,7 @@ struct atrium_amd_isolation_stats {
 	uint64_t	 hangs;		/* queues the watchdog stopped */
 	uint64_t	 fences_failed;	/* completions failed with EIO */
 	uint64_t	 vm_faults;	/* VM fault interrupts */
+	uint64_t	 quota_refused;	/* BO_ALLOCs refused with EDQUOT */
 	int		 deferred_now;	/* deferred BO frees outstanding */
 	int		 grants_live;	/* grant pager objects alive */
 };
@@ -886,6 +889,8 @@ struct atrium_amd_softc {
 	struct atrium_amd_isolation_stats iso;
 	struct timeout_task watchdog_task;
 	int		 hang_ms;	/* no progress this long = hung */
+	int		 vram_limit_pct; /* per-uid VRAM cap, % of VRAM (rs/quota.rs) */
+	int		 sys_limit_pct;	/* per-uid System BO cap, % of RAM */
 	int		 watchdog_armed; /* watchdog_task scheduled (sc->lock) */
 	struct atrium_amd_vram vram;	/* device VRAM allocator (base, vram.c) */
 	struct amd_clear_engine clear;	/* VRAM clear engine (gpu, clear.c) */
