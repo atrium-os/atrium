@@ -81,6 +81,7 @@ dependencies = [
  "fresco-split",
  "fresco-text",
  "libc",
+ "pergola-gamepad",
  "png",
 ]
 
@@ -377,6 +378,10 @@ dependencies = [
  "adler2",
  "simd-adler32",
 ]
+
+[[package]]
+name = "pergola-gamepad"
+version = "0.1.0"
 
 [[package]]
 name = "png"

@@ -114,5 +114,6 @@ atrium-gpu-app  = { path = "../atrium-gpu-app" }
 atrium-rdna4-isa = { path = "../atrium-rdna4-isa" }
 fresco-compute  = { path = "../fresco-compute" }
 fresco-text     = { path = "../fresco-text" }
+pergola-gamepad = { path = "../pergola-gamepad" }
 libc            = "0.2"
 png             = "0.17"

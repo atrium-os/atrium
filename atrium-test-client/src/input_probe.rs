@@ -2,7 +2,8 @@
 //! one line each, with whether a press carried an activation token. The
 //! Tactus VM check (scripts/vm-tactus-check.sh) sends keys and pointer
 //! moves through QEMU's USB devices and reads these lines; the gamepad
-//! check (`GAMEPAD=1`) reads its pad lines.
+//! check (`GAMEPAD=1`) reads its pad lines, and the `pad-std` lines
+//! pergola-gamepad derives from them (standard names).
 //!
 //! Usage: atrium-input-probe [fresco socket] [seconds]
 
@@ -23,9 +24,19 @@ fn main() -> std::io::Result<()> {
     conn.scene_frame_end()?;
     println!("input-probe: window {win}");
     let end = Instant::now() + Duration::from_secs(secs);
+    let mut pads = pergola_gamepad::Pads::new();
     let tok = |a: &[u8; 16]| if a.iter().any(|&b| b != 0) { "token" } else { "no-token" };
     while Instant::now() < end {
         let Some(ev) = conn.wait_event(Some(Duration::from_millis(500)))? else { continue };
+        let std = match &ev {
+            Event::GamepadConnect { device_id, vendor, product, buttons, axes, name, .. } => {
+                pads.connect(*device_id, *vendor, *product, *buttons, *axes, name)
+            }
+            Event::GamepadDisconnect { device_id, .. } => pads.disconnect(*device_id),
+            Event::GamepadButton { device_id, usage, pressed, .. } => pads.button(*device_id, *usage, *pressed),
+            Event::GamepadAxis { device_id, usage, value, .. } => pads.axis(*device_id, *usage, *value),
+            _ => Vec::new(),
+        };
         match ev {
             Event::Key { window_id, hid_usage, pressed, modifiers, activation, repeat } => {
                 let r = if repeat { " repeat" } else { "" };
@@ -48,6 +59,9 @@ fn main() -> std::io::Result<()> {
                 println!("pad-axis window={window_id} device={device_id} usage=0x{usage:08x} value={value}")
             }
             _ => {}
+        }
+        for c in std {
+            println!("pad-std {c:?}");
         }
         use std::io::Write;
         std::io::stdout().flush()?;

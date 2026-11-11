@@ -474,6 +474,19 @@ As rev. 1: `InputSignals` for ordinary UI, direct callbacks on
 over HID usages, plus scroll phases and gestures for ScrollView and
 zoomable views. The wire to apps stays HID-faithful.
 
+*Built (2026-11-11):* `pergola-gamepad` (no dependencies) turns the
+gamepad events into the W3C "standard" layout with XInput-style face
+names (`Button::South` is A / Cross) and sticks -1..1, triggers 0..1,
+with radial stick and linear trigger dead zones. Mappings: Sony
+DualShock 4 / DualSense by vendor and product, else a generic one (page 9
+buttons in standard order; X/Y left stick; Rx/Ry, or else Z/Rz, right
+stick; Brake/Accelerator, or else free Z/Rz, triggers; hat and D-pad
+usages the D-pad). The generic one decides its axes once the pad has
+reported as many axes as its connect counted (or a button arrives). Apps
+can remap per pad. `atrium-input-probe` prints its `pad-std` lines, and
+`GAMEPAD=1 scripts/vm-tactus-check.sh` checks them. Not yet: a vendor
+table beyond Sony, rumble, wiring into Pergola's `SurfaceRenderer`.
+
 ## 8. Implementation order
 
 1. **T1 `tactus` crate.** Full descriptor parser and report decoder

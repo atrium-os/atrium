@@ -133,8 +133,10 @@ i=0; until grep -q "detached" /tmp/pad.log || [ $i -ge 90 ]; do sleep 1; i=$((i+
 sleep 3
 cat /tmp/pad.log
 EOF
-  V 'grep pad- /tmp/probe.log' > /tmp/tactus-pad1.log
-  V 'grep pad- /tmp/probe2.log' > /tmp/tactus-pad2.log
+  V 'grep -E "^pad-(connect|disconnect|button|axis) " /tmp/probe.log' > /tmp/tactus-pad1.log
+  V 'grep -E "^pad-(connect|disconnect|button|axis) " /tmp/probe2.log' > /tmp/tactus-pad2.log
+  V 'grep "^pad-std " /tmp/probe.log' > /tmp/tactus-std1.log
+  V 'grep "^pad-std " /tmp/probe2.log' > /tmp/tactus-std2.log
   echo "-- window 1"; cat /tmp/tactus-pad1.log; echo "-- window 2"; cat /tmp/tactus-pad2.log
   P1=/tmp/tactus-pad1.log P2=/tmp/tactus-pad2.log
   grep -q 'pad-connect .*id=1234:5678 buttons=15 axes=7 name="Fake Pad"' $P1 && ok "window 1: connect with counts and name" || bad "window 1 connect"
@@ -147,6 +149,12 @@ EOF
   grep -q "pad-axis .*usage=0x00010039 value=2" $P2 && ok "window 2: snapshot has the hat" || bad "window 2 snapshot"
   grep -q "pad-button .*usage=0x00090002 pressed=1" $P2 && grep -q "pad-button .*usage=0x00090002 pressed=0" $P2 && ok "window 2: button 2" || bad "window 2 button 2"
   tail -1 $P2 | grep -q "pad-disconnect" && ok "window 2: disconnect on detach" || bad "window 2 detach"
+  echo "-- standard names (pergola-gamepad), window 1"; cat /tmp/tactus-std1.log
+  S1=/tmp/tactus-std1.log S2=/tmp/tactus-std2.log
+  grep -q "button: South, pressed: true" $S1 && ok "std: button 1 is South (A)" || bad "std South"
+  grep -q "axis: LeftX, value: 1.0" $S1 && ok "std: left stick right" || bad "std LeftX"
+  grep -q "button: DpadRight, pressed: true" $S1 && grep -q "button: DpadRight, pressed: false" $S1 && ok "std: hat right holds DpadRight, released on disconnect" || bad "std DpadRight"
+  grep -q "button: East, pressed: true" $S2 && ok "std: window 2 button 2 is East (B)" || bad "std East"
   V 'grep "split mode" /tmp/frescod-t.log | head -2'
   V 'jls -n name | grep -c atrium-tactusd' | sed 's/^/  tactusd jails: /'
   echo "tactus: $fails failed"

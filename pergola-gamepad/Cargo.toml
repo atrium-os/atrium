@@ -1,0 +1,9 @@
+[package]
+name = "pergola-gamepad"
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+publish = false
+description = "Standard gamepad names (XInput-style A/B/X/Y, sticks, triggers, d-pad) over Fresco's HID-faithful gamepad events (atrium-input.md §5.4, §7)."
+
+[dependencies]
