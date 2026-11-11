@@ -190,20 +190,26 @@ about 145,000 fuzzed ones (7 min, 4 jobs), and caught 4 of 4 planted bugs in the
 comparing one key byte short). Host suite 36/36 both builds, property tests pass, cloud VM e2e
 passes with the Rust and C modules on NODEBUG and the Rust module on KASAN.
 
-Stack: the static worst path is unchanged (6.2 KiB NODEBUG, 15.7 KiB KASAN). Put is still
-recursive, one frame per level (480 bytes NODEBUG, 864 KASAN for `put_into_internal`): real
-trees are 3 to 4 levels, but a crafted image can chain 16, which is about 7.5 KiB NODEBUG and
-13 KiB KASAN on top of the caller. That fits the 16 and 24 KiB stacks but not by much; an
-iterative put with the path on the heap would remove it.
+Stack: the static worst path is unchanged (6.2 KiB NODEBUG, 15.7 KiB KASAN). Put was
+recursive, one frame per level (480 bytes NODEBUG, 864 KASAN): real trees are 3 to 4 levels,
+but a crafted image can chain 16, about 7.5 KiB NODEBUG and 13 KiB KASAN on top of the caller.
+Put is now a loop: the descent keeps each node on a heap path and the leaf's result is applied
+to each parent on the way back up, so put costs a fixed ~0.6 KiB (NODEBUG) or ~1.4 KiB (KASAN)
+at any depth. Allocation, write and free order are the recursive version's: an old-vs-new
+build gave identical traces (every return code, root and image CRC) on all 921 inputs of the
+`btree` and `btree_ops` targets.
 
 ## Not moved yet (phase 2)
 
 - The kernel module's GC index enumerator (`tessera_fs_gc_pack_index_hashes`) keeps its
   own subtraction-style checks; the module's other pack readers and all manifest parsing
   now go through the crate (above).
-- The encoders (node headers, records) and the journal and pack write paths: next. In the
-  B-tree, the batch's internal-node splice and `batch_emit` still copy entries in C (counts
-  computed, not read from disk).
+- The encoders and the journal and pack writers, by decision: reviewed 2026-11-11 and left in
+  C. The encoders copy a fixed-size struct the code itself filled and add a CRC; the pack
+  writer sizes everything from blobs in memory; the journal writer's only on-disk inputs (ring
+  head and tail) are checked at open. Nothing they write is steered by a length or index read
+  from disk, which is the class of bug the Rust move removes. In the B-tree, the batch's
+  internal-node splice and `batch_emit` also stay C (counts computed, not read from disk).
 - The loader (`libsa`) stays C: no Rust in the boot loader for now.
 - HVF timing on the Mac VM; cross-language LTO.
 

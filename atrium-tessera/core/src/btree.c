@@ -723,8 +723,8 @@ tessera_btree_get_impl(tessera_btree_t *t, const void *key, void *out_value,
 	 * -> btree_get). It does not panic cleanly: it faults in a loop, so
 	 * the thread pins a CPU at 100% in state R with no wchan, emits NOTHING
 	 * to the console, cannot be killed, and will not even stop for ddb.
-	 * put_into_leaf below already heap-allocates for exactly this reason
-	 * (see its comment) — the READ path was missed.
+	 * put (below) keeps its node buffers on the heap for the same reason;
+	 * the READ path was missed.
 	 * Verified: with this change the same GC that hung now walks the
 	 * blob index (root sector 325, depth 0 -> 1) and returns rc=0. */
 	uint8_t *block = tessera_zalloc(BLOCK_SIZE);
@@ -790,11 +790,10 @@ tessera_btree_get_traced(tessera_btree_t *t, const void *key, void *out_value,
 	return rc;
 }
 
-/* ── put — recursive COW with split propagation ──────────────────── */
+/* ── put — copy-on-write descent, splits applied bottom-up ──────── */
 
-/* Result returned from a recursive put: either (no_split) the descendant
- * was rewritten in-place (new sector), or (split) the descendant split
- * and the parent must absorb (split_key | new_right_sector). */
+/* What rewriting one node hands its parent: the node's new sector and,
+ * if it split, the split key and the right half's sector. */
 struct put_result {
 	uint64_t  new_left;          /* always set */
 	int       split;             /* 0/1 */
@@ -802,199 +801,59 @@ struct put_result {
 	uint64_t  new_right;
 };
 
+/* One node on put's root-to-leaf path, as loaded. */
+struct put_level {
+	uint64_t  sector;
+	uint8_t  *block;             /* BLOCK_SIZE, heap */
+	uint32_t  count;
+	uint32_t  idx;               /* internal: the child descended into */
+	uint8_t   kind;              /* 0 leaf, 1 internal */
+};
+
+/* Write the edited node to a fresh sector and free the old one. */
 static int
-put_into_leaf(tessera_btree_t *t, uint64_t old_sector,
-              const void *key, const void *value,
-              struct put_result *res)
+put_cow(tessera_btree_t *t, const struct put_level *lv, uint32_t count,
+        struct put_result *res)
 {
-	/* All BLOCK_SIZE buffers heap-allocated: stack budget in the
-	 * FreeBSD kmod context (4-page kstack) cannot afford 4 KiB stack
-	 * arrays at every recursion level. */
-	uint8_t *block = tessera_zalloc(BLOCK_SIZE);
-	uint8_t *left_block = NULL, *right_block = NULL;
-	int rc;
-	if (block == NULL) { rc = TESSERA_ENOMEM; goto out; }
-	rc = load_node(t, old_sector, block);
-	if (rc != TESSERA_OK) goto out;
-
-	tessera_btree_node_header_t h;
-	(void)read_header(block, &h);
-	const uint32_t es = leaf_entry_size(t);
-
-	int exact;
-	int idx = search_leaf(block, h.entry_count, t->key_size, es, key,
-	    &exact);
-
-	if (exact) {
-		rc = node_entry_write(block, es, (uint32_t)idx, t->key_size,
-		    value, t->value_size);
-		if (rc != TESSERA_OK) goto out;
-
-		uint64_t s;
-		if (alloc_node(t, &s) != TESSERA_OK) { rc = TESSERA_ENOSPC; goto out; }
-		if (flush_node(t, s, block, 0, h.entry_count) != TESSERA_OK) {
-			rc = TESSERA_EIO; goto out;
-		}
-		(void)free_node(t, old_sector);
-		res->split = 0; res->new_left = s;
-		rc = TESSERA_OK; goto out;
-	}
-
-	int ins = idx + 1;
-	if (h.entry_count + 1 <= t->leaf_fanout) {
-		rc = node_insert(block, h.entry_count, es, (uint32_t)ins,
-		    key, t->key_size, value, t->value_size);
-		if (rc != TESSERA_OK) goto out;
-
-		uint64_t s;
-		if (alloc_node(t, &s) != TESSERA_OK) { rc = TESSERA_ENOSPC; goto out; }
-		if (flush_node(t, s, block, 0, h.entry_count + 1) != TESSERA_OK) {
-			rc = TESSERA_EIO; goto out;
-		}
-		(void)free_node(t, old_sector);
-		res->split = 0; res->new_left = s;
-		rc = TESSERA_OK; goto out;
-	}
-
-	uint32_t left_n, right_n;
-	left_block  = tessera_zalloc(BLOCK_SIZE);
-	right_block = tessera_zalloc(BLOCK_SIZE);
-	if (left_block == NULL || right_block == NULL) { rc = TESSERA_ENOMEM; goto out; }
-	/* write_header zeroes the entry area, so headers first; the
-	 * split's own counts must agree with them. */
-	write_header(left_block,  t, 0, (h.entry_count + 1) / 2);
-	write_header(right_block, t, 0, h.entry_count + 1 - (h.entry_count + 1) / 2);
-	rc = node_split_insert(block, h.entry_count, es, (uint32_t)ins,
-	    key, t->key_size, value, t->value_size, left_block, right_block,
-	    &left_n, &right_n);
-	if (rc != TESSERA_OK) goto out;
-	if (left_n != (h.entry_count + 1) / 2 || left_n + right_n != h.entry_count + 1) {
-		rc = TESSERA_EINVAL; goto out;
-	}
-	memcpy(res->split_key, leaf_entries_const(right_block), t->key_size);
-
-	uint64_t sl, sr;
-	if (alloc_node(t, &sl) != TESSERA_OK) { rc = TESSERA_ENOSPC; goto out; }
-	if (alloc_node(t, &sr) != TESSERA_OK) {
-		(void)free_node(t, sl);
-		rc = TESSERA_ENOSPC; goto out;
-	}
-	if (flush_node(t, sl, left_block,  0, left_n)  != TESSERA_OK ||
-	    flush_node(t, sr, right_block, 0, right_n) != TESSERA_OK) {
-		rc = TESSERA_EIO; goto out;
-	}
-	(void)free_node(t, old_sector);
-
-	res->split = 1; res->new_left = sl; res->new_right = sr;
-	rc = TESSERA_OK;
-out:
-	if (block)       tessera_free(block);
-	if (left_block)  tessera_free(left_block);
-	if (right_block) tessera_free(right_block);
-	return rc;
+	uint64_t s;
+	if (alloc_node(t, &s) != TESSERA_OK) return TESSERA_ENOSPC;
+	if (flush_node(t, s, lv->block, lv->kind, count) != TESSERA_OK)
+		return TESSERA_EIO;
+	(void)free_node(t, lv->sector);
+	res->split = 0;
+	res->new_left = s;
+	return TESSERA_OK;
 }
 
+/* Insert key‖val at `ins` of the node, splitting it in two when full. */
 static int
-put_into_internal(tessera_btree_t *t, uint64_t old_sector,
-                  const void *key, const void *value,
-                  struct put_result *res, uint32_t depth)
+put_absorb(tessera_btree_t *t, const struct put_level *lv, uint32_t ins,
+           const void *key, const void *val, uint32_t vs,
+           struct put_result *res)
 {
-	/* Entry bytes are not under the header CRC: a child pointer aimed
-	 * back up the tree is a cycle, and unbounded recursion would run the
-	 * kernel stack out. Same bound as get's descent. */
-	if (depth + 1 >= MAX_DEPTH) return TESSERA_ECORRUPT;
-	uint8_t *block = tessera_zalloc(BLOCK_SIZE);
-	uint8_t *cblk = NULL, *left_block = NULL, *right_block = NULL;
+	const uint32_t es = lv->kind ? inner_entry_size(t) : leaf_entry_size(t);
+	const uint32_t fanout = lv->kind ? t->inner_fanout : t->leaf_fanout;
 	int rc;
-	if (block == NULL) { rc = TESSERA_ENOMEM; goto out; }
-	rc = load_node(t, old_sector, block);
-	if (rc != TESSERA_OK) goto out;
-
-	tessera_btree_node_header_t h;
-	(void)read_header(block, &h);
-	const uint32_t es = inner_entry_size(t);
-
-	int idx = search_internal(block, h.entry_count, t->key_size, es, key);
-	uint8_t *child_entry = leaf_entries(block) + (size_t)idx * es;
-	uint64_t child_sector;
-	memcpy(&child_sector, child_entry + t->key_size, 8);
-
-	/* Maintain the documented invariant that entry[0].key is the
-	 * SMALLEST key in child 0. Routing a key below entries[0].key
-	 * descends into child 0 (leftmost-descent rule) -- without
-	 * lowering the routing key here, child 0 silently accumulates
-	 * keys below its key, and the NEXT split of child 0 then hands
-	 * this node a split_key SMALLER than entries[0].key, which the
-	 * idx+1 insertion below places out of order. An unsorted
-	 * internal node makes binary-search routing undefined: gets miss
-	 * live keys and puts create DUPLICATES in sibling leaves (found
-	 * by the batch-merge A/B test; random-keyed trees like the pack
-	 * registry were exposed in production). We are already COWing
-	 * this node, so the fix is one memcpy. */
-	if (idx == 0 && key_compare(key, child_entry, t->key_size) < 0) {
-		rc = node_entry_write(block, es, 0, 0, key, t->key_size);
-		if (rc != TESSERA_OK) goto out;
+	if (lv->count + 1 <= fanout) {
+		rc = node_insert(lv->block, lv->count, es, ins, key, t->key_size,
+		    val, vs);
+		if (rc != TESSERA_OK) return rc;
+		return put_cow(t, lv, lv->count + 1, res);
 	}
 
-	struct put_result child_res;
-	cblk = tessera_zalloc(BLOCK_SIZE);
-	if (cblk == NULL) { rc = TESSERA_ENOMEM; goto out; }
-	rc = load_node(t, child_sector, cblk);
-	if (rc != TESSERA_OK) goto out;
-	tessera_btree_node_header_t ch;
-	(void)read_header(cblk, &ch);
-	tessera_free(cblk); cblk = NULL;  /* free before recursion to keep heap pressure low */
-	if (ch.node_kind == 0)
-		rc = put_into_leaf(t, child_sector, key, value, &child_res);
-	else
-		rc = put_into_internal(t, child_sector, key, value, &child_res,
-		    depth + 1);
-	if (rc != TESSERA_OK) goto out;
-
-	rc = node_entry_write(block, es, (uint32_t)idx, t->key_size,
-	    &child_res.new_left, 8);
-	if (rc != TESSERA_OK) goto out;
-
-	if (!child_res.split) {
-		uint64_t s;
-		if (alloc_node(t, &s) != TESSERA_OK) { rc = TESSERA_ENOSPC; goto out; }
-		if (flush_node(t, s, block, 1, h.entry_count) != TESSERA_OK) {
-			rc = TESSERA_EIO; goto out;
-		}
-		(void)free_node(t, old_sector);
-		res->split = 0; res->new_left = s;
-		rc = TESSERA_OK; goto out;
-	}
-
-	int ins = idx + 1;
-	if (h.entry_count + 1 <= t->inner_fanout) {
-		rc = node_insert(block, h.entry_count, es, (uint32_t)ins,
-		    child_res.split_key, t->key_size, &child_res.new_right, 8);
-		if (rc != TESSERA_OK) goto out;
-
-		uint64_t s;
-		if (alloc_node(t, &s) != TESSERA_OK) { rc = TESSERA_ENOSPC; goto out; }
-		if (flush_node(t, s, block, 1, h.entry_count + 1) != TESSERA_OK) {
-			rc = TESSERA_EIO; goto out;
-		}
-		(void)free_node(t, old_sector);
-		res->split = 0; res->new_left = s;
-		rc = TESSERA_OK; goto out;
-	}
-
+	const uint32_t total = lv->count + 1;
 	uint32_t left_n, right_n;
-	left_block  = tessera_zalloc(BLOCK_SIZE);
-	right_block = tessera_zalloc(BLOCK_SIZE);
+	uint8_t *left_block  = tessera_zalloc(BLOCK_SIZE);
+	uint8_t *right_block = tessera_zalloc(BLOCK_SIZE);
 	if (left_block == NULL || right_block == NULL) { rc = TESSERA_ENOMEM; goto out; }
 	/* write_header zeroes the entry area, so headers first; the
 	 * split's own counts must agree with them. */
-	write_header(left_block,  t, 1, (h.entry_count + 1) / 2);
-	write_header(right_block, t, 1, h.entry_count + 1 - (h.entry_count + 1) / 2);
-	rc = node_split_insert(block, h.entry_count, es, (uint32_t)ins,
-	    child_res.split_key, t->key_size, &child_res.new_right, 8,
-	    left_block, right_block, &left_n, &right_n);
+	write_header(left_block,  t, lv->kind, total / 2);
+	write_header(right_block, t, lv->kind, total - total / 2);
+	rc = node_split_insert(lv->block, lv->count, es, ins, key, t->key_size,
+	    val, vs, left_block, right_block, &left_n, &right_n);
 	if (rc != TESSERA_OK) goto out;
-	if (left_n != (h.entry_count + 1) / 2 || left_n + right_n != h.entry_count + 1) {
+	if (left_n != total / 2 || left_n + right_n != total) {
 		rc = TESSERA_EINVAL; goto out;
 	}
 	memcpy(res->split_key, leaf_entries_const(right_block), t->key_size);
@@ -1005,17 +864,14 @@ put_into_internal(tessera_btree_t *t, uint64_t old_sector,
 		(void)free_node(t, sl);
 		rc = TESSERA_ENOSPC; goto out;
 	}
-	if (flush_node(t, sl, left_block,  1, left_n)  != TESSERA_OK ||
-	    flush_node(t, sr, right_block, 1, right_n) != TESSERA_OK) {
+	if (flush_node(t, sl, left_block,  lv->kind, left_n)  != TESSERA_OK ||
+	    flush_node(t, sr, right_block, lv->kind, right_n) != TESSERA_OK) {
 		rc = TESSERA_EIO; goto out;
 	}
-	(void)free_node(t, old_sector);
-
+	(void)free_node(t, lv->sector);
 	res->split = 1; res->new_left = sl; res->new_right = sr;
 	rc = TESSERA_OK;
 out:
-	if (block)       tessera_free(block);
-	if (cblk)        tessera_free(cblk);
 	if (left_block)  tessera_free(left_block);
 	if (right_block) tessera_free(right_block);
 	return rc;
@@ -1034,32 +890,106 @@ tessera_btree_put(tessera_btree_t *t, const void *key, const void *value,
 	return op_end(t, tessera_btree_put_impl(t, key, value, out_new_root));
 }
 
+/*
+ * A loop, not recursion: the descent records each node on a heap path,
+ * then the leaf is edited and each parent absorbs its child's result on
+ * the way back up. Stack use is one frame however deep the tree is; the
+ * recursive version cost ~480 bytes per level (864 under KASAN), so a
+ * crafted 16-level tree took 7.5-13 KiB of kernel stack. Allocation,
+ * write and free order is the recursive version's, so images are the same.
+ *
+ * Entry bytes are not under the header CRC, so a child pointer aimed back
+ * up the tree is a cycle: the descent stops at MAX_DEPTH, as get's does.
+ */
 static int
 tessera_btree_put_impl(tessera_btree_t *t, const void *key, const void *value,
                        uint64_t *out_new_root)
 {
-
-	struct put_result res;
-	memset(&res, 0, sizeof res);
-
-	uint8_t *block = tessera_zalloc(BLOCK_SIZE);
+	struct put_level *path = tessera_zalloc(MAX_DEPTH * sizeof *path);
+	struct put_result *res = tessera_zalloc(2 * sizeof *res);
 	uint8_t *lb = NULL, *newroot = NULL;
+	uint32_t n = 0;
 	int rc;
-	if (block == NULL) { rc = TESSERA_ENOMEM; goto out; }
-	rc = load_node(t, t->root, block);
-	if (rc != TESSERA_OK) goto out;
-	tessera_btree_node_header_t h;
-	(void)read_header(block, &h);
-	tessera_free(block); block = NULL;  /* free before recursing */
+	if (path == NULL || res == NULL) { rc = TESSERA_ENOMEM; goto out; }
 
-	if (h.node_kind == 0)
-		rc = put_into_leaf(t, t->root, key, value, &res);
-	else
-		rc = put_into_internal(t, t->root, key, value, &res, 0);
-	if (rc != TESSERA_OK) goto out;
+	/* Descend. */
+	const uint32_t ies = inner_entry_size(t);
+	uint64_t cur = t->root;
+	for (;;) {
+		if (n >= MAX_DEPTH) { rc = TESSERA_ECORRUPT; goto out; }
+		struct put_level *lv = &path[n++];
+		lv->sector = cur;
+		lv->block = tessera_zalloc(BLOCK_SIZE);
+		if (lv->block == NULL) { rc = TESSERA_ENOMEM; goto out; }
+		rc = load_node(t, cur, lv->block);
+		if (rc != TESSERA_OK) goto out;
+		tessera_btree_node_header_t h;
+		(void)read_header(lv->block, &h);
+		lv->count = h.entry_count;
+		lv->kind = h.node_kind == 0 ? 0 : 1;
+		if (lv->kind == 0) break;
 
-	if (!res.split) {
-		set_root(t, res.new_left);
+		int idx = search_internal(lv->block, lv->count, t->key_size,
+		    ies, key);
+		lv->idx = (uint32_t)idx;
+		/* Keep entry[0].key the smallest key in child 0. A key below
+		 * it routes to child 0 (leftmost-descent rule); without
+		 * lowering the routing key here, child 0 accumulates keys below
+		 * it, and its next split hands this node a split key smaller
+		 * than entry[0].key, inserted out of order at idx+1. An unsorted
+		 * internal node makes routing undefined: gets miss live keys
+		 * and puts create duplicates in sibling leaves (found by the
+		 * batch-merge A/B test). The node is being rewritten anyway. */
+		if (idx == 0 && key_compare(key, leaf_entries_const(lv->block),
+		    t->key_size) < 0) {
+			rc = node_entry_write(lv->block, ies, 0, 0, key,
+			    t->key_size);
+			if (rc != TESSERA_OK) goto out;
+		}
+		memcpy(&cur, leaf_entries_const(lv->block) +
+		    (size_t)idx * ies + t->key_size, 8);
+	}
+
+	/* The leaf: replace in place, or insert (splitting when full). */
+	unsigned r = 0;                       /* res[r] is the latest result */
+	{
+		const struct put_level *lv = &path[n - 1];
+		const uint32_t es = leaf_entry_size(t);
+		int exact;
+		int idx = search_leaf(lv->block, lv->count, t->key_size, es,
+		    key, &exact);
+		if (exact) {
+			rc = node_entry_write(lv->block, es, (uint32_t)idx,
+			    t->key_size, value, t->value_size);
+			if (rc == TESSERA_OK)
+				rc = put_cow(t, lv, lv->count, &res[r]);
+		} else {
+			rc = put_absorb(t, lv, (uint32_t)(idx + 1), key, value,
+			    t->value_size, &res[r]);
+		}
+		if (rc != TESSERA_OK) goto out;
+	}
+
+	/* Back up: each parent points at its child's new sector and takes
+	 * the child's split, if any. */
+	for (uint32_t i = n - 1; i-- > 0; ) {
+		const struct put_level *lv = &path[i];
+		const struct put_result *child = &res[r];
+		struct put_result *out = &res[r ^ 1];
+		rc = node_entry_write(lv->block, ies, lv->idx, t->key_size,
+		    &child->new_left, 8);
+		if (rc != TESSERA_OK) goto out;
+		if (!child->split)
+			rc = put_cow(t, lv, lv->count, out);
+		else
+			rc = put_absorb(t, lv, lv->idx + 1, child->split_key,
+			    &child->new_right, 8, out);
+		if (rc != TESSERA_OK) goto out;
+		r ^= 1;
+	}
+
+	if (!res[r].split) {
+		set_root(t, res[r].new_left);
 		*out_new_root = t->root;
 		rc = TESSERA_OK; goto out;
 	}
@@ -1067,21 +997,17 @@ tessera_btree_put_impl(tessera_btree_t *t, const void *key, const void *value,
 	/* Root split: build a new internal root with two entries. */
 	lb = tessera_zalloc(BLOCK_SIZE);
 	if (lb == NULL) { rc = TESSERA_ENOMEM; goto out; }
-	rc = load_node(t, res.new_left, lb);
+	rc = load_node(t, res[r].new_left, lb);
 	if (rc != TESSERA_OK) goto out;
-	uint8_t left_min_key[TESSERA_BTREE_MAX_KEY];
-	const uint8_t *first = leaf_entries_const(lb);
-	memcpy(left_min_key, first, t->key_size);
 
 	newroot = tessera_zalloc(BLOCK_SIZE);
 	if (newroot == NULL) { rc = TESSERA_ENOMEM; goto out; }
-	const uint32_t es = inner_entry_size(t);
 	write_header(newroot, t, 1, 2);
 	uint8_t *base = leaf_entries(newroot);
-	memcpy(base, left_min_key, t->key_size);
-	memcpy(base + t->key_size, &res.new_left, 8);
-	memcpy(base + es, res.split_key, t->key_size);
-	memcpy(base + es + t->key_size, &res.new_right, 8);
+	memcpy(base, leaf_entries_const(lb), t->key_size);
+	memcpy(base + t->key_size, &res[r].new_left, 8);
+	memcpy(base + ies, res[r].split_key, t->key_size);
+	memcpy(base + ies + t->key_size, &res[r].new_right, 8);
 
 	uint64_t rs;
 	if (alloc_node(t, &rs) != TESSERA_OK) { rc = TESSERA_ENOSPC; goto out; }
@@ -1092,7 +1018,11 @@ tessera_btree_put_impl(tessera_btree_t *t, const void *key, const void *value,
 	*out_new_root = rs;
 	rc = TESSERA_OK;
 out:
-	if (block)   tessera_free(block);
+	if (path != NULL)
+		for (uint32_t i = 0; i < n; i++)
+			if (path[i].block) tessera_free(path[i].block);
+	if (path)    tessera_free(path);
+	if (res)     tessera_free(res);
 	if (lb)      tessera_free(lb);
 	if (newroot) tessera_free(newroot);
 	return rc;
