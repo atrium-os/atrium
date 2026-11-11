@@ -40,12 +40,12 @@ float clamp_(float v, float lo, float hi) { return v >= lo ? (v <= hi ? v : hi) 
 // Exact group opacity (fresco-scene-groups.md §2.4, ISOLATE): PUSH starts a
 // layer (p1.x its opacity), POP blends it over what was under it. Both carry
 // the group's box in p3 so they bin to the same tiles. ISOLATE_DEPTH layers
-// may be open at once (raster.comp keeps one); a PUSH past that is ignored
+// may be open at once (raster.comp keeps four); a PUSH past that is ignored
 // with its POP, a POP with no layer open is ignored, and a layer still open
 // after the last op is blended then.
 #define KIND_PUSH    5u
 #define KIND_POP     6u
-#define ISOLATE_DEPTH 1u
+#define ISOLATE_DEPTH 4u
 
 #define TILE 16u
 

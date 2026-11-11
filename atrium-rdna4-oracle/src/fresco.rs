@@ -188,8 +188,9 @@ fn damaged_frame_of(name: &str, before: Option<&Scene>, scene: &Scene, w: u32, h
 }
 
 /// Exact group opacity (`ISOLATE`, fresco-scene-groups.md §2.4): the test
-/// scene with its elements wrapped in nested isolated groups (two levels,
-/// then a third past one of them) and a stray POP, against the reference.
+/// scene with its elements wrapped in nested isolated groups (two levels;
+/// then four, and a fifth past ISOLATE_DEPTH) and a stray POP, against the
+/// reference.
 pub fn isolate() -> Option<Case> {
     let s = scene();
     let p = |item| Placed { item, clip: None };
@@ -199,14 +200,15 @@ pub fn isolate() -> Option<Case> {
     order.push(p(Node::Pop));
     order.extend((0..s.fills.len()).map(|i| p(Node::Fill(i))));
     order.push(p(Node::Pop));
-    order.push(push(0.7));
+    order.extend([push(0.7), push(0.9), push(0.8)]);
     for (b, t) in s.texture_batches.iter().enumerate() {
         order.extend((0..t.quads.len()).map(|q| p(Node::Quad(b, q))));
     }
+    order.extend([push(0.75), push(0.5)]);
     for (b, g) in s.glyph_batches.iter().enumerate() {
         order.extend((0..g.runs.len()).map(|r| p(Node::Run(b, r))));
     }
-    // The last group is left open: the kernel closes it after the last op.
+    // The last groups are left open: the kernel closes them after the last op.
     let (f, _) = Frame::pack_ordered(&s, &order, W, H, PITCH, None);
     let (hx, hy) = (f.header.tiles_x, f.header.tiles_y);
     frame_case("fresco_isolate", &f, f.buffers(), &[[0, 0, hx, hy]], false)

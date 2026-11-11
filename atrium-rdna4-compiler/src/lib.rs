@@ -117,6 +117,22 @@ pub fn compile_with(f: &Function, o: &Options) -> Result<Binary, Error> {
     is.run()?;
     coalesce::run(&mut is.mi, &is.vregs);
     coalesce::merge(&mut is.mi, &is.vregs);
+    if std::env::var_os("ATRIUM_RDNA4_PRESSURE").is_some() {
+        let (start, end) = regalloc::intervals(&is.mi, is.vregs.len());
+        let (peak, at) = regalloc::pressure(&is.vregs, &start, &end);
+        eprintln!("rdna4 {}: peak VGPR pressure {peak} at instruction {at} of {}", f.name, is.mi.len());
+        if std::env::var_os("ATRIUM_RDNA4_PRESSURE_LIVE").is_some() {
+            let loops: Vec<usize> = is.mi.iter().enumerate().filter(|(_, m)| matches!(m, mir::MI::LoopBegin | mir::MI::LoopEnd)).map(|(i, _)| i).collect();
+            eprintln!("  loop markers {loops:?}");
+            for r in 0..is.vregs.len() {
+                if start[r] != usize::MAX && is.vregs[r].class == mir::Class::V && start[r] <= at && end[r] >= at {
+                    let def = is.mi.iter().position(|m| m.regs().1.contains(&(r as u32)));
+                    let name = def.map(|d| format!("{:?}", is.mi[d]).chars().take(90).collect::<String>()).unwrap_or_default();
+                    eprintln!("  v{r} x{} [{}..{}] def@{def:?} {name}", is.vregs[r].size, start[r], end[r]);
+                }
+            }
+        }
+    }
     let (asg, scratch_dwords) = spill::allocate(&mut is.mi, &mut is.vregs, 1, abi.user_sgprs(), o.max_vgprs.min(256), o.max_sgprs.min(106))?;
     let code = emit::emit(&is.mi, &is.vregs, &asg);
     Ok(Binary { code, vgprs: asg.vgprs, sgprs: asg.sgprs, abi, local_size: f.local_size, lds_bytes: f.workgroup_bytes, scratch_dwords })

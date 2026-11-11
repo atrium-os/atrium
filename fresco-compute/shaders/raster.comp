@@ -270,13 +270,22 @@ vec4 shade(uint oi, vec2 pc) {
     return vec4(p1.rgb, p1.a * cov);
 }
 
-// Blend the open layer, at its opacity, over what was under it.
+// The open layers, newest first: what was under each (s<k>) and its
+// opacity (o<k>). ISOLATE_DEPTH (lib.rs) is 4. Scalars (no arrays, no
+// vector selects), so every executor keeps them in registers; a push
+// shifts them down one, a pop shifts them back up.
+#define SAVE_LAYER(k, j) { s##k##r = s##j##r; s##k##g = s##j##g; s##k##b = s##j##b; s##k##a = s##j##a; o##k = o##j; }
+
+// Blend the newest layer, at its opacity, over what was under it.
 #define POP_LAYER { \
     float ga = da * o0; \
     dr = dr * o0 + s0r * (1.0 - ga); \
     dg = dg * o0 + s0g * (1.0 - ga); \
     db = db * o0 + s0b * (1.0 - ga); \
     da = ga + s0a * (1.0 - ga); \
+    SAVE_LAYER(0, 1) \
+    SAVE_LAYER(1, 2) \
+    SAVE_LAYER(2, 3) \
     sp = sp - 1u; \
 }
 
@@ -301,15 +310,15 @@ void main() {
     uint tile = (y / TILE) * F.tiles_x + (x / TILE);
     // Premultiplied linear RGB and alpha: a surface's clear may be
     // transparent (compose blends it), the screen's is opaque.
-    // Premultiplied colour and alpha, and the open layer (ISOLATE_DEPTH is
-    // 1): what was under it and its opacity. Scalars (no arrays, no vector
-    // selects), so every executor keeps them in registers; a deeper stack
-    // made the RDNA4 code spill.
+    // Premultiplied colour and alpha, and the open layers (see SAVE_LAYER).
     float dr = F.clear.r;
     float dg = F.clear.g;
     float db = F.clear.b;
     float da = F.clear.a;
     float s0r = 0.0; float s0g = 0.0; float s0b = 0.0; float s0a = 0.0; float o0 = 0.0;
+    float s1r = 0.0; float s1g = 0.0; float s1b = 0.0; float s1a = 0.0; float o1 = 0.0;
+    float s2r = 0.0; float s2g = 0.0; float s2b = 0.0; float s2a = 0.0; float o2 = 0.0;
+    float s3r = 0.0; float s3g = 0.0; float s3b = 0.0; float s3a = 0.0; float o3 = 0.0;
     uint sp = 0u;
     uint over = 0u;
     for (uint w = 0u; w < F.wpt; w++) {
@@ -330,6 +339,9 @@ void main() {
                 if (sp >= ISOLATE_DEPTH) {
                     over = over + 1u;
                 } else {
+                    SAVE_LAYER(3, 2)
+                    SAVE_LAYER(2, 1)
+                    SAVE_LAYER(1, 0)
                     s0r = dr; s0g = dg; s0b = db; s0a = da;
                     o0 = clamp_(p1.x, 0.0, 1.0);
                     sp = sp + 1u;

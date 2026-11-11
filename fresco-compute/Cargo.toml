@@ -33,3 +33,7 @@ libc = "0.2"
 # The lavapipe golden (tests/golden.rs): the Vulkan renderer it replaces.
 fresco-vulkan = { path = "../fresco-vulkan" }
 ash = "0.38"
+
+[[example]]
+name = "rdna4_regs"
+required-features = ["rdna4"]

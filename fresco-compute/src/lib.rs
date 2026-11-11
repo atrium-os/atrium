@@ -82,10 +82,10 @@ pub const KIND_FILL: u32 = 4;
 pub const KIND_PUSH: u32 = 5;
 /// Blend the newest layer over what was under it (`p3` as its PUSH).
 pub const KIND_POP: u32 = 6;
-/// How many layers the raster kernel keeps open at once; pack draws
-/// isolated groups inside one with multiplied alpha instead. One: each
-/// more made the RDNA4 code spill (raster.comp).
-pub const ISOLATE_DEPTH: u32 = 1;
+/// How many layers the raster kernel keeps open at once (raster.comp's
+/// `SAVE_LAYER` registers); pack draws isolated groups nested deeper with
+/// multiplied alpha instead.
+pub const ISOLATE_DEPTH: u32 = 4;
 
 /// The default clear colour, linear RGB (encodes to `#0A808C`), the same as
 /// `fresco_vulkan::HeadlessRenderer`.

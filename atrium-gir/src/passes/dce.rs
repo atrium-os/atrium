@@ -4,6 +4,13 @@
 //! results (with their `yield`/`break` operands), loop parameters that only
 //! feed themselves, empty `if`s, and code after a node that never falls
 //! through.
+//!
+//! Also dead carried values ([`carried`]): a loop parameter, loop result or
+//! `if` result that only ever flows into other such slots, never into an
+//! instruction that matters. mem2reg carries every variable a loop body
+//! stores, so a variable written before it is read in each iteration (a
+//! temporary declared in the loop) became a parameter that went round the
+//! loop through the `if`s that write it, live for the whole loop.
 
 use crate::*;
 use std::collections::HashMap;
@@ -145,9 +152,138 @@ fn sweep(r: &mut Region, uses: &HashMap<ValueId, usize>) -> bool {
     changed
 }
 
+/// Mark what matters, propagating through carried slots only where the
+/// slot they feed matters.
+fn mark(r: &Region, live: &mut std::collections::HashSet<ValueId>, ifs: &mut Vec<Vec<ValueId>>, loops: &mut Vec<(Vec<ValueId>, Vec<ValueId>)>) {
+    let add = |v: ValueId, live: &mut std::collections::HashSet<ValueId>| {
+        live.insert(v);
+    };
+    for (idx, n) in r.iter().enumerate() {
+        match n {
+            Node::Inst(i) => match &i.op {
+                // A yield ends its own arm: slot k matters if the if's result k does.
+                Op::Yield(v) if idx + 1 == r.len() => {
+                    if let Some(res) = ifs.last() {
+                        for (k, x) in v.iter().enumerate() {
+                            if res.get(k).is_some_and(|rv| live.contains(rv)) {
+                                add(*x, live);
+                            }
+                        }
+                    }
+                }
+                Op::Continue(v) | Op::Break(v) => {
+                    let is_break = matches!(i.op, Op::Break(_));
+                    if let Some((params, results)) = loops.last() {
+                        let slots = if is_break { results } else { params };
+                        for (k, x) in v.iter().enumerate() {
+                            if slots.get(k).is_some_and(|sv| live.contains(sv)) {
+                                add(*x, live);
+                            }
+                        }
+                    }
+                }
+                op if op.is_pure() || matches!(op, Op::Load(..) | Op::Subgroup(..)) => {
+                    if i.result.is_some_and(|v| live.contains(&v)) {
+                        for o in op.operands() {
+                            add(o, live);
+                        }
+                    }
+                }
+                op => {
+                    for o in op.operands() {
+                        add(o, live);
+                    }
+                }
+            },
+            Node::If { cond, then, els, results } => {
+                add(*cond, live);
+                ifs.push(results.clone());
+                mark(then, live, ifs, loops);
+                mark(els, live, ifs, loops);
+                ifs.pop();
+            }
+            Node::Loop { inits, params, body, results } => {
+                for (k, x) in inits.iter().enumerate() {
+                    if live.contains(&params[k]) {
+                        add(*x, live);
+                    }
+                }
+                loops.push((params.clone(), results.clone()));
+                // Nested ifs inside the loop see their own yields; a fresh
+                // if-stack keeps a yield from reaching an outer if.
+                let mut inner_ifs = Vec::new();
+                mark(body, live, &mut inner_ifs, loops);
+                loops.pop();
+            }
+        }
+    }
+}
+
+/// Drop carried slots nothing needs (see the module docs).
+fn drop_dead_slots(r: &mut Region, live: &std::collections::HashSet<ValueId>) -> bool {
+    let mut changed = false;
+    for n in r.iter_mut() {
+        match n {
+            Node::Inst(_) => {}
+            Node::If { then, els, results, .. } => {
+                changed |= drop_dead_slots(then, live);
+                changed |= drop_dead_slots(els, live);
+                let mut k = results.len();
+                while k > 0 {
+                    k -= 1;
+                    if !live.contains(&results[k]) {
+                        results.remove(k);
+                        drop_yield_slot(then, k);
+                        drop_yield_slot(els, k);
+                        changed = true;
+                    }
+                }
+            }
+            Node::Loop { inits, params, body, results } => {
+                changed |= drop_dead_slots(body, live);
+                let mut k = results.len();
+                while k > 0 {
+                    k -= 1;
+                    if !live.contains(&results[k]) {
+                        results.remove(k);
+                        drop_loop_slot(body, k, true);
+                        changed = true;
+                    }
+                }
+                let mut k = params.len();
+                while k > 0 {
+                    k -= 1;
+                    if !live.contains(&params[k]) {
+                        params.remove(k);
+                        inits.remove(k);
+                        drop_loop_slot(body, k, false);
+                        changed = true;
+                    }
+                }
+            }
+        }
+    }
+    changed
+}
+
+/// Remove dead carried values: loop parameters, loop results and `if`
+/// results whose values only flow into other carried slots. Returns true
+/// if anything changed.
+pub fn carried(f: &mut Function) -> bool {
+    let mut live = std::collections::HashSet::new();
+    loop {
+        let before = live.len();
+        mark(&f.body, &mut live, &mut Vec::new(), &mut Vec::new());
+        if live.len() == before {
+            break;
+        }
+    }
+    drop_dead_slots(&mut f.body, &live)
+}
+
 /// Run DCE to a fixed point. Returns true if anything changed.
 pub fn dce(f: &mut Function) -> bool {
-    let mut any = false;
+    let mut any = carried(f);
     loop {
         let mut uses = HashMap::new();
         count_uses(&f.body, &mut uses);

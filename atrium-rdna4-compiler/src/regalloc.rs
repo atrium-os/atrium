@@ -89,6 +89,27 @@ pub fn intervals(mi: &[MI], n: usize) -> (Vec<usize>, Vec<usize>) {
     (start, end)
 }
 
+/// The most VGPR dwords live at once over the intervals, and where.
+pub fn pressure(vregs: &[VRegInfo], start: &[usize], end: &[usize]) -> (u32, usize) {
+    let mut ev: Vec<(usize, i64)> = vec![];
+    for r in 0..vregs.len() {
+        if start[r] != usize::MAX && vregs[r].class == Class::V {
+            ev.push((start[r], vregs[r].size as i64));
+            ev.push((end[r] + 1, -(vregs[r].size as i64)));
+        }
+    }
+    ev.sort();
+    let (mut live, mut peak, mut at) = (0i64, 0i64, 0usize);
+    for (pos, d) in ev {
+        live += d;
+        if live > peak {
+            peak = live;
+            at = pos;
+        }
+    }
+    (peak as u32, at)
+}
+
 /// First-fit assignment over the intervals, with at most `v_limit` VGPRs
 /// and `s_limit` SGPRs.
 pub fn assign(vregs: &[VRegInfo], start: &[usize], end: &[usize], v_first: u8, s_first: u8, v_limit: u32, s_limit: u32) -> Result<Assignment, Failure> {
