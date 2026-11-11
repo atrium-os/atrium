@@ -100,6 +100,7 @@ compute route chosen; security conditions F1–F6 in
 | D2/D3 `fresco-compute` bin + raster kernels, Tier-2 matches reference; `FRESCOD_RENDERER=compute` | done | `ce1d804`, golden `6ca05f0` |
 | GPU renderer: `FRESCOD_RENDERER=gpu` draws via RDNA4 kernels on gpusim; architecture behind `fresco_compute::gpu::Arch` (RDNA4 the one built in) | done | `7c1ec1b` |
 | `compute` is frescod's default renderer (Vulkan opt-in); gpu renderer arch from `CAP_ISA` | done | `1455488`, `da65060` |
+| GPU renderer scroll: a scrolled viewport's pixels move in VRAM (`shift.comp` via a scratch buffer, two passes), then only exposed tiles are rastered ([fresco-scene-groups.md §4](spec/fresco-scene-groups.md)) | done on gpusim; oracle `fresco_shift_matches_the_cpu_scroll` equals the CPU renderer's scroll bit for bit; queued in the R9700 corpus | `3a1b1d2`, gpusim `38a0524` |
 | F4e one GPU VM per window (gpu renderer); compose maps surfaces read-only | done | `e7c3187` |
 | F4g compute renderer: each client's jailed renderer rasters its windows, frescod composes pixels only | done | `9a01b97` |
 | Damage tracking (only dirty tiles re-rastered; 15 s → 0.4 s/frame on gpusim) | done | `57035bc` |
