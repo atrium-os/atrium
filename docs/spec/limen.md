@@ -235,7 +235,7 @@ and the video element already expose to the page. It gets no frames, no frame ti
 running the player out of process adds no new channel.
 
 **Codecs** are royalty-free: dav1d for AV1, libvpx for VP9, and Opus and Vorbis for audio.
-OpenH264 is used for H.264 (as Firefox does), and AAC is decoded with a free decoder where
+OpenH264 is used for H.264 (as Firefox does for WebRTC; it decodes only Baseline and B-frame-free content correctly, Hospes H0), and AAC is decoded with a free decoder where
 it is legally available. Hardware decode, when the GPU stack has it, goes here and nowhere
 else.
 

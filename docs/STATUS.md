@@ -173,7 +173,9 @@ Open (2026-11-07): how to host the CDM without the linuxulator — scoping study
 for any future Linux apps. Accepted by Shankar 2026-11-07 (build first, then approach
 Google for a licence and a native CDM build); specs amended.
 Architecture proposed 2026-11-11: `docs/spec/hospes.md` (Hospes; build order H0–H5, seven
-decisions in §14 await Shankar).
+decisions in §14 await Shankar). H0 measured 2026-11-11
+(`docs/reviews/2026-11-11-hospes-h0.md`): Widevine makes raw syscalls (K1 hook required),
+official arm64 CDM exists, OpenH264 only decodes Baseline/no-B-frame content correctly.
 
 ## 6. Navigator exploration coverage
 

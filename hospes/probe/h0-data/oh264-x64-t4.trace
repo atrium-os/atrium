@@ -1,0 +1,56 @@
+EXEC nr=9 len=1126400 prot=5 from=ld-linux-x86-64.so.2
+EXEC nr=9 len=1343488 prot=5 from=ld-linux-x86-64.so.2
+EXEC nr=9 len=147456 prot=5 from=ld-linux-x86-64.so.2
+EXEC nr=9 len=1609728 prot=5 from=ld-linux-x86-64.so.2
+EXEC nr=9 len=1609728 prot=5 from=ld-linux-x86-64.so.2
+EXEC nr=9 len=32768 prot=7 from=libc.so.6
+EXEC nr=9 len=4096 prot=5 from=ld-linux-x86-64.so.2
+EXEC nr=9 len=520192 prot=5 from=ld-linux-x86-64.so.2
+PATH /etc/ld.so.cache nr=257 flags=0x80000 from=ld-linux-x86-64.so.2
+PATH /etc/ld.so.cache nr=257 flags=0x80000 from=ld-linux-x86-64.so.2
+PATH /etc/ld.so.cache nr=257 flags=0x80000 from=ld-linux-x86-64.so.2
+PATH /etc/ld.so.preload nr=21 flags=0x4 from=ld-linux-x86-64.so.2
+PATH /lib/x86_64-linux-gnu/ld-linux-x86-64.so.2 nr=257 flags=0x80000 from=ld-linux-x86-64.so.2
+PATH /lib/x86_64-linux-gnu/libc.so.6 nr=257 flags=0x80000 from=ld-linux-x86-64.so.2
+PATH /lib/x86_64-linux-gnu/libc.so.6 nr=257 flags=0x80000 from=ld-linux-x86-64.so.2
+PATH /lib/x86_64-linux-gnu/libgcc_s.so.1 nr=257 flags=0x80000 from=ld-linux-x86-64.so.2
+PATH /lib/x86_64-linux-gnu/libm.so.6 nr=257 flags=0x80000 from=ld-linux-x86-64.so.2
+PATH /lib/x86_64-linux-gnu/libstdc++.so.6 nr=257 flags=0x80000 from=ld-linux-x86-64.so.2
+SIGACTION sig=33 set=1 from=libc.so.6
+SYS ld-linux-x86-64.so.2 0 8
+SYS ld-linux-x86-64.so.2 10 10
+SYS ld-linux-x86-64.so.2 11 3
+SYS ld-linux-x86-64.so.2 12 1
+SYS ld-linux-x86-64.so.2 158 1
+SYS ld-linux-x86-64.so.2 17 4
+SYS ld-linux-x86-64.so.2 21 1
+SYS ld-linux-x86-64.so.2 218 1
+SYS ld-linux-x86-64.so.2 257 11
+SYS ld-linux-x86-64.so.2 273 1
+SYS ld-linux-x86-64.so.2 3 11
+SYS ld-linux-x86-64.so.2 334 1
+SYS ld-linux-x86-64.so.2 5 11
+SYS ld-linux-x86-64.so.2 9 38
+SYS libc.so.6 0 3
+SYS libc.so.6 1 124
+SYS libc.so.6 10 15
+SYS libc.so.6 11 96
+SYS libc.so.6 12 43
+SYS libc.so.6 13 1
+SYS libc.so.6 14 13
+SYS libc.so.6 202 1710
+SYS libc.so.6 204 1
+SYS libc.so.6 231 1
+SYS libc.so.6 257 2
+SYS libc.so.6 273 3
+SYS libc.so.6 28 3
+SYS libc.so.6 3 1
+SYS libc.so.6 302 2
+SYS libc.so.6 318 2
+SYS libc.so.6 334 3
+SYS libc.so.6 435 3
+SYS libc.so.6 5 4
+SYS libc.so.6 59 1
+SYS libc.so.6 60 3
+SYS libc.so.6 8 2
+SYS libc.so.6 9 102

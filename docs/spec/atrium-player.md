@@ -363,6 +363,10 @@ Fresco's layers land.
    feature for development, answer `CanPlay` false for `avc1`, and decide later between
    Cisco's binary under Linux ABI emulation (the CDM route) and no H.264. YouTube and most
    MSE sites fall back to VP9 or AV1.
+   *H0 finding (2026-11-11, `docs/reviews/2026-11-11-hospes-h0.md`):* Cisco's binary runs
+   under Hospes without a kernel hook, but decodes only Baseline and B-frame-free High
+   correctly; Main/High with B-frames (most web H.264) came out wrong. So this route gives
+   WebRTC/Baseline H.264, not general playback; weigh that here.
 4. **No AAC in v1.** There is no permissive, mature AAC decoder in C, and Symphonia's Rust
    one is MPL-2.0, which the policy reviews case by case. AAC mostly travels with H.264 in
    MP4, so *recommend* deciding it together with item 3.

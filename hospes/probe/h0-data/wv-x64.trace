@@ -1,0 +1,101 @@
+EXEC nr=9 len=1343488 prot=5 from=ld-linux-x86-64.so.2
+EXEC nr=9 len=147456 prot=5 from=ld-linux-x86-64.so.2
+EXEC nr=9 len=1609728 prot=5 from=ld-linux-x86-64.so.2
+EXEC nr=9 len=1609728 prot=5 from=ld-linux-x86-64.so.2
+EXEC nr=9 len=32768 prot=7 from=libc.so.6
+EXEC nr=9 len=4096 prot=5 from=ld-linux-x86-64.so.2
+EXEC nr=9 len=4096 prot=5 from=ld-linux-x86-64.so.2
+EXEC nr=9 len=4096 prot=5 from=ld-linux-x86-64.so.2
+EXEC nr=9 len=520192 prot=5 from=ld-linux-x86-64.so.2
+EXEC nr=9 len=7090176 prot=5 from=ld-linux-x86-64.so.2
+PATH /dev/urandom nr=257 flags=0x80000 from=libc.so.6
+PATH /etc/ld.so.cache nr=257 flags=0x80000 from=ld-linux-x86-64.so.2
+PATH /etc/ld.so.cache nr=257 flags=0x80000 from=ld-linux-x86-64.so.2
+PATH /etc/ld.so.cache nr=257 flags=0x80000 from=ld-linux-x86-64.so.2
+PATH /etc/ld.so.preload nr=21 flags=0x4 from=ld-linux-x86-64.so.2
+PATH /lib/x86_64-linux-gnu/ld-linux-x86-64.so.2 nr=257 flags=0x80000 from=ld-linux-x86-64.so.2
+PATH /lib/x86_64-linux-gnu/libc.so.6 nr=257 flags=0x80000 from=ld-linux-x86-64.so.2
+PATH /lib/x86_64-linux-gnu/libc.so.6 nr=257 flags=0x80000 from=ld-linux-x86-64.so.2
+PATH /lib/x86_64-linux-gnu/libdl.so.2 nr=257 flags=0x80000 from=ld-linux-x86-64.so.2
+PATH /lib/x86_64-linux-gnu/libgcc_s.so.1 nr=257 flags=0x80000 from=ld-linux-x86-64.so.2
+PATH /lib/x86_64-linux-gnu/libm.so.6 nr=257 flags=0x80000 from=ld-linux-x86-64.so.2
+PATH /lib/x86_64-linux-gnu/libpthread.so.0 nr=257 flags=0x80000 from=ld-linux-x86-64.so.2
+PATH /lib/x86_64-linux-gnu/libstdc++.so.6 nr=257 flags=0x80000 from=ld-linux-x86-64.so.2
+PATH /proc/net/unix nr=257 flags=0x0 from=wv-x64.so
+PATH /proc/net/unix nr=257 flags=0x0 from=wv-x64.so
+PATH /proc/net/unix nr=257 flags=0x0 from=wv-x64.so
+PATH /proc/net/unix nr=257 flags=0x0 from=wv-x64.so
+PATH /proc/net/unix nr=257 flags=0x0 from=wv-x64.so
+PATH /proc/self/maps nr=257 flags=0x0 from=wv-x64.so
+PATH /proc/self/maps nr=257 flags=0x0 from=wv-x64.so
+PATH /proc/self/maps nr=257 flags=0x0 from=wv-x64.so
+PATH /proc/self/maps nr=257 flags=0x0 from=wv-x64.so
+PATH /proc/self/maps nr=257 flags=0x0 from=wv-x64.so
+PATH /proc/self/maps nr=257 flags=0x0 from=wv-x64.so
+PATH /proc/self/maps nr=257 flags=0x0 from=wv-x64.so
+PATH /proc/self/maps nr=257 flags=0x0 from=wv-x64.so
+PATH /proc/self/maps nr=257 flags=0x0 from=wv-x64.so
+PATH /sys/fs/cgroup/cpuset/chrome nr=4 flags=0x7f6d741fec10 from=libc.so.6
+PATH /sys/fs/cgroup/schedtune/chrome nr=4 flags=0x7f6d741fec10 from=libc.so.6
+PATH msg-licreq.bin nr=257 flags=0x241 from=libc.so.6
+PRCTL op=1398164801 from=libc.so.6
+PRCTL op=1398164801 from=libc.so.6
+PRCTL op=1398164801 from=libc.so.6
+PRCTL op=1398164801 from=libc.so.6
+PRCTL op=1398164801 from=libc.so.6
+PRCTL op=1398164801 from=libc.so.6
+PRCTL op=1398164801 from=libc.so.6
+SIGACTION sig=31 set=0 from=libc.so.6
+SIGACTION sig=31 set=0 from=wv-x64.so
+SIGACTION sig=33 set=1 from=libc.so.6
+SIGACTION sig=4 set=0 from=libc.so.6
+SIGACTION sig=4 set=0 from=wv-x64.so
+SIGACTION sig=5 set=0 from=libc.so.6
+SIGACTION sig=5 set=0 from=wv-x64.so
+SIGACTION sig=6 set=0 from=libc.so.6
+SIGACTION sig=6 set=0 from=wv-x64.so
+SYS ld-linux-x86-64.so.2 0 10
+SYS ld-linux-x86-64.so.2 10 11
+SYS ld-linux-x86-64.so.2 11 3
+SYS ld-linux-x86-64.so.2 12 1
+SYS ld-linux-x86-64.so.2 158 1
+SYS ld-linux-x86-64.so.2 17 4
+SYS ld-linux-x86-64.so.2 21 1
+SYS ld-linux-x86-64.so.2 218 1
+SYS ld-linux-x86-64.so.2 257 13
+SYS ld-linux-x86-64.so.2 273 1
+SYS ld-linux-x86-64.so.2 3 13
+SYS ld-linux-x86-64.so.2 334 1
+SYS ld-linux-x86-64.so.2 5 13
+SYS ld-linux-x86-64.so.2 9 50
+SYS libc.so.6 1 376
+SYS libc.so.6 10 65
+SYS libc.so.6 11 2
+SYS libc.so.6 12 2
+SYS libc.so.6 13 5
+SYS libc.so.6 14 5
+SYS libc.so.6 141 1
+SYS libc.so.6 157 7
+SYS libc.so.6 186 15
+SYS libc.so.6 202 4
+SYS libc.so.6 230 934
+SYS libc.so.6 231 1
+SYS libc.so.6 257 3
+SYS libc.so.6 273 1
+SYS libc.so.6 28 91
+SYS libc.so.6 3 1
+SYS libc.so.6 302 2
+SYS libc.so.6 318 14
+SYS libc.so.6 334 1
+SYS libc.so.6 39 3
+SYS libc.so.6 4 2
+SYS libc.so.6 435 1
+SYS libc.so.6 5 3
+SYS libc.so.6 59 1
+SYS libc.so.6 60 1
+SYS libc.so.6 63 1
+SYS libc.so.6 9 12
+SYS wv-x64.so 0 44
+SYS wv-x64.so 13 4
+SYS wv-x64.so 257 14
+SYS wv-x64.so 3 14

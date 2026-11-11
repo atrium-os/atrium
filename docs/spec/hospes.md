@@ -1,6 +1,8 @@
 # Hospes: the foreign-library host
 
-**Status:** proposed architecture, 2026-11-11. Nothing built. Decisions in §14.
+**Status:** proposed architecture, 2026-11-11. H0 measured 2026-11-11
+(`docs/reviews/2026-11-11-hospes-h0.md`): the CDM makes raw syscalls, so K1 is required;
+findings folded in below. Decisions in §14.
 **Follows:** `docs/reviews/2026-11-07-linux-compat-scoping.md` (accepted 2026-11-07: closed
 Linux libraries run in our own loader and glibc shim in a capability-mode jail; no Linux ABI
 in the kernel; Linux apps, if ever, get micro-VMs).
@@ -121,14 +123,19 @@ there is nothing to swap.
 bounds-checked reads and a fuzz target. It accepts only:
 
 - `ET_DYN`, matching machine (`EM_AARCH64` or `EM_X86_64`), little-endian, ELF64;
-- `PT_LOAD` segments with `p_align` ≤ the page size and no overlap; `PT_DYNAMIC`, `PT_TLS`,
+- `PT_LOAD` segments whose `p_align` is a multiple of the page size (Widevine and OpenH264
+  on arm64 use 64 KiB), with offsets congruent to addresses and no overlap; `PT_DYNAMIC`, `PT_TLS`,
   `PT_GNU_RELRO`, `PT_GNU_STACK` (must be non-executable), `PT_GNU_EH_FRAME`, `PT_NOTE`;
 - no `DT_TEXTREL`, no `PT_INTERP` (we do not run programs).
 
 ### 5.2 Mapping and relocation
 
 - Reserve the whole image span, then map each `PT_LOAD` from the blob fd at its offset
-  (`MAP_FIXED` inside our reservation), zero-fill `.bss`.
+  (`MAP_FIXED` inside our reservation), zero-fill `.bss` (Widevine's is about 59 MiB).
+- **Symbol lookup order:** the library's own exports first, then the shim, as glibc's global
+  scope would give (OpenH264 references its own symbols through the GOT). Weak undefined
+  symbols with no definition (`OPENSSL_memory_*`, `__gmon_start__`, `_ITM_*`, `__gcov_*`)
+  stay zero.
 - **Eager binding only.** Every relocation is applied at load, `DT_BIND_NOW` behaviour,
   then `PT_GNU_RELRO` is made read-only. No lazy PLT, so the GOT is never writable after load.
 - **Relocations supported:** `RELATIVE`, `GLOB_DAT`, `JUMP_SLOT`, `ABS64`/`64`,
@@ -191,11 +198,14 @@ From the CDM's and OpenH264's needs (scoping §2; exact list from H0, §10):
 | Signals | `sigaction`, `sigprocmask`, `sigemptyset` family, `raise` | recorded, not delivered, except `abort` |
 | Dynamic linking | `dlopen` (only names we provide), `dlsym`, `dlerror`, `dladdr`, `dl_iterate_phdr`, `__tls_get_addr` | |
 | C++ runtime glue | `__cxa_atexit`, `__cxa_finalize`, `__cxa_thread_atexit_impl`, `__stack_chk_fail`, `__libc_single_threaded` | |
-| Unwinding | `_Unwind_*` if imported (libgcc_s) | LLVM libunwind built freestanding (Apache-2.0 with LLVM exception) if H0 shows the library needs it; most likely it carries its own |
+| Unwinding | `_Unwind_*` (libgcc_s): both libraries import it | LLVM libunwind built freestanding (Apache-2.0 with LLVM exception), reading the library's `PT_GNU_EH_FRAME` |
+| C++ runtime (OpenH264) | `operator new/delete`, `__cxa_guard_*`, `__cxa_pure_virtual`, `__cxa_throw_bad_array_new_length`, `__gxx_personality_v0`, the `__class_type_info` family of vtables as data objects | libc++abi pieces, built freestanding (same licence) |
+| Old and locale ABI (CDM) | `__xstat64`, `__fxstat64`, `newlocale`/`uselocale`/`freelocale`, `strtod_l` family, `strftime_l`, `catopen`/`catgets`/`catclose`, `__ctype_*_loc`, `mbrtowc` family | C locale only; message catalogues always fail |
+| Semaphores, fork hooks | `sem_*`, `__register_atfork`, `setpriority`, `sched_setscheduler` | `sem_*` on `_umtx_op`; the rest accepted and ignored |
 | Math | `libm` subset | Rust `libm` (MIT/Apache) |
 | Atomics helpers | `__aarch64_ldadd4_acq_rel` and the other LSE outline helpers | trivial, implemented directly |
 | Logging | `fprintf(stderr)`, `vsnprintf`, `syslog` | formatted into our log channel, rate-limited |
-| Indirect syscalls | `syscall(long nr, ...)` | a Linux-number dispatcher for the few the library uses (`futex`, `gettid`, `getrandom`), everything else `ENOSYS` |
+| Indirect syscalls | `syscall(long nr, ...)` | a Linux-number dispatcher; H0 saw `gettid` and `getrandom` from the CDM; everything else `ENOSYS` |
 
 ### 6.3 Behaviour rules
 
@@ -224,12 +234,15 @@ A fixed table. Nothing else exists.
 | `/proc/self/maps`, `/proc/<pid>/maps` | generated from our mapping table, Linux format, real addresses and permissions |
 | `/proc/self/auxv` | the Linux-shaped auxiliary vector we computed |
 | `/proc/self/status` | minimal, consistent fields (Name, Pid, TracerPid 0) |
+| `/proc/net/unix` | the header line only (the CDM reads it five times in H0) |
+| `/dev/urandom` | reads served from `getrandom` |
 | `/sys/devices/system/cpu/online`, `possible` | from the real CPU count |
 | `/opt/hospes/lib/<name>` | the library's own bytes, from the blob fd |
 | `/etc/localtime` | UTC |
 
-The final list comes from H0's trace of every path the library opens on Linux. Any other
-path returns `ENOENT`. The CDM's persistent data never goes through this table; it uses the
+H0 saw the CDM open `/proc/self/maps` nine times and `/proc/net/unix` five times with raw
+`openat`, `/dev/urandom` through `open64`, and `stat` two Chrome cgroup paths (which return
+`ENOENT`, as on a machine without them). Any other path returns `ENOENT`. The CDM's persistent data never goes through this table; it uses the
 CDM interface's `FileIO` (§8.4).
 
 ## 8. The CDM host (`hospes-cdm`)
@@ -305,8 +318,10 @@ For Cisco's OpenH264 decoder. Its API is `WelsCreateDecoder` / `WelsDestroyDecod
 
 - Worker sends access units; Hospes returns decoded I420 planes in shared slots with width,
   height, strides and PTS. The worker converts into the layer as for dav1d.
-- Limits set before decode: maximum picture size (7680×4320, as the layer), threads (Cisco's
-  decoder is single-threaded per instance), and the worker's per-call watchdog.
+- Limits set before decode: maximum picture size (7680×4320, as the layer), **one decoder
+  thread** (H0: its threaded mode changes output), and the worker's per-call watchdog.
+- Coverage: Baseline and B-frame-free High only (H0, R7). Streams it cannot decode correctly
+  are refused by profile/B-frame check, not played wrong.
 - Lives in the player jail, spawned by the supervisor, killed with it.
 
 ## 10. Measuring first: H0
@@ -373,26 +388,34 @@ to four days. It needs the user's consent to download the two libraries (§14 de
 
 ## 13. Risks
 
-- **R1. Raw syscalls in the CDM.** If H0 finds the CDM's own code issuing system calls, they
-  hit FreeBSD's table with Linux numbers; in capability mode that is an error or a crash, not
-  an escape, but the CDM fails. Remedy: a small kernel hook, a `procctl` that makes any
+- **R1. Raw syscalls in the CDM — confirmed by H0.** The CDM's own code issues `openat`,
+  `read`, `close` and `rt_sigaction` (queries for `SIGILL`, `SIGTRAP`, `SIGABRT`, `SIGSYS`).
+  Unhandled, they hit FreeBSD's table with Linux numbers (Linux `read` is 0, FreeBSD's
+  indirect `syscall`); in capability mode that is an error or a crash, not an escape, but the
+  CDM fails. Remedy, **now required for Widevine (step K1)**: a small kernel hook, a `procctl` that makes any
   syscall instruction executed from registered address ranges deliver `SIGSYS` with the
   registers; the shim's handler emulates it from its Linux-number table. A few hundred lines,
   written in Rust per the 2026-11-10 kernel decision, upstreamable as FreeBSD's equivalent of
-  Linux's syscall user dispatch. Built only if H0 shows the need.
+  Linux's syscall user dispatch. The `SIGSYS` handler answers `rt_sigaction` queries truthfully
+  (our trap handler is visible, as Firefox's seccomp handler is, and Widevine runs there).
 - **R2. Anti-tamper checks.** The CDM may check `/proc/self/maps`, its own file, debugger
   presence, timing. Hospes answers consistently and has no debugger attached. If a check
   still fails it shows in H0 as a difference between Linux and Hospes, and we do not work
   around it by patching the library.
 - **R3. Self-modifying code.** If the obfuscated CDM writes code at run time, it needs
   write-then-execute. We allow the transition with logging, never simultaneous write+execute.
-- **R4. Unwinder.** If the library relies on libgcc_s for C++ exceptions, Hospes needs a
-  freestanding unwinder (LLVM libunwind). Measured in H0.
+- **R4. Unwinder.** Confirmed: both libraries import libgcc_s's unwinder, and OpenH264
+  libstdc++'s personality routine. Hospes carries freestanding LLVM libunwind and libc++abi
+  pieces.
 - **R5. Revocation and service refusal.** Outside our control until a licence; stated in the
   scoping doc.
-- **R6. arm64 availability.** The x86_64 CDM is easy to get; arm64 comes from ChromeOS images
-  or a future Chrome for arm64 Linux. OpenH264 has both. So OpenH264 runs on the Mac VM
-  first; Widevine likely starts on x86_64 (the amd64 VM).
+- **R6. arm64 availability — resolved.** Google's Chrome for arm64 Linux ships the arm64 CDM
+  (same version, 4.10.3112.0). Both architectures can be developed; arm64 dynamic behaviour
+  is still to be measured on a Linux VM on the Mac.
+- **R7. OpenH264's coverage.** H0: Cisco's decoder is bit-exact on Baseline and on High
+  without B-frames, wrong on Main/High with B-frames (most web H.264), and its threaded mode
+  changes output. Hospes runs it single-threaded; its product value is WebRTC and Baseline
+  content (player §9.3 to weigh this).
 
 ## 14. Decisions
 
@@ -404,7 +427,7 @@ to four days. It needs the user's consent to download the two libraries (§14 de
    class and shrinks the process to our code plus the library.
 3. **Placement:** hospes-codec as a sibling process in the player's jail; hospes-cdm in its
    own one-shot jail per island, with control and data channels (§3). *Recommend yes.*
-4. **H0 now:** download Cisco's OpenH264 binary and Google's Chrome for Linux package onto a
+4. ~~**H0 now:**~~ **Done 2026-11-11** (Shankar approved; cloud container). Was: download Cisco's OpenH264 binary and Google's Chrome for Linux package onto a
    Linux machine for measurement (needs `ciscobinary.openh264.org` and `dl.google.com` allowed
    in the cloud environment, or the R9700 box). *Recommend yes,* cloud container for x86_64,
    a Linux VM on the Mac for arm64.
@@ -420,13 +443,14 @@ to four days. It needs the user's consent to download the two libraries (§14 de
 
 | Step | What | Done when | Estimate |
 |---|---|---|---|
-| H0 | Measure both libraries on Linux (§10) | report + generated import tables committed | 3–4 days |
+| H0 ✔ | Measure both libraries on Linux (§10) | done 2026-11-11: `docs/reviews/2026-11-11-hospes-h0.md`, data in `hospes/probe/h0-data/` | — |
 | H1 | `hospes-elf`, `hospes-rt`: parse, map, relocate, TLS, threads, allocator; loader fixtures pass on FreeBSD arm64 and amd64 | §11.1 and §11.2 green; isolation probe green | 3 weeks |
 | H2 | `hospes-glibc` for OpenH264's import set; `hospes-codec`; player integration behind the H.264 build feature | conformance MD5s match Linux (§11.5); player plays an H.264 MP4 in the VM | 2–3 weeks |
 | H3 | `hospes-proto`, `hospes-cdm` with the test CDM; CENC/CBCS info from the demuxers; control and data channels; per-origin store | Clear Key content plays through Hospes; outputs equal the Linux reference host | 3 weeks |
 | H4 | Widevine: shim extended to its imports, provisioning flow, install route, public test content | Shaka's Widevine test stream plays in the amd64 VM | 3–4 weeks |
-| H5 | Hardening: fuzz targets, version-watch CI, R1 hook if needed, optional bhyve wrapper | fuzzers run clean 1 h each; CI job live | 1–2 weeks |
+| K1 | The `SIGSYS` trap hook (`procctl`, Rust, §13 R1) and the shim's Linux-syscall handler for `openat`/`read`/`close`/`rt_sigaction` | the H0 CDM run's raw syscalls all handled under Hospes; isolation probe still green | 1–2 weeks, before H4 |
+| H5 | Hardening: fuzz targets, version-watch CI, optional bhyve wrapper | fuzzers run clean 1 h each; CI job live | 1–2 weeks |
 
-About three months in all, with OpenH264 usable after H2 (about six weeks in). EME in the
+About three months in all plus K1, with OpenH264 usable after H2 (about six weeks in). EME in the
 Navigator engine (the page-facing `requestMediaKeySystemAccess` and friends) is the Navigator
 thread's side and is not in this spec; it only needs the control messages of §8.2.

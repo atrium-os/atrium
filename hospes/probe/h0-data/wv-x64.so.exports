@@ -1,0 +1,5 @@
+CreateCdmInstance
+DeinitializeCdmModule
+GetCdmVersion
+InitializeCdmModule_4
+VerifyCdmHost_0
