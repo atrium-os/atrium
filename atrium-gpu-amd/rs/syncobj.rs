@@ -94,7 +94,7 @@ impl SyncObj {
     /// # Safety
     ///
     /// `so` came from `as_c` on a syncobj that is still alive.
-    unsafe fn from_c<'a>(so: *mut sys::atrium_amd_syncobj) -> &'a SyncObj {
+    pub(crate) unsafe fn from_c<'a>(so: *mut sys::atrium_amd_syncobj) -> &'a SyncObj {
         unsafe { &*so.cast::<SyncObj>() }
     }
 

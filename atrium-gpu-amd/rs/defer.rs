@@ -20,6 +20,7 @@ use crate::backend::Dev;
 use crate::bo::Bo;
 use crate::queue::Queues;
 use crate::quota::Quotas;
+use crate::pending::Pending;
 use crate::sys;
 use core::ffi::{c_int, c_void};
 use core::pin::Pin;
@@ -61,6 +62,8 @@ pub struct DevState {
     pub queues: Queues,
     /// Per-uid BO charges (quota.rs).
     pub quotas: Quotas,
+    /// The completions each queue owes (pending.rs; guarded by sc->lock).
+    pub pending: Pending,
 }
 
 // SAFETY: everything is behind the mutex; a Bo is Send.
@@ -127,7 +130,7 @@ pub fn reap(dev: Dev) -> bool {
 #[unsafe(no_mangle)]
 pub extern "C" fn amd_rs_dev_init() -> *mut c_void {
     let s: Box<DevState> = Box::new(
-        DevState { deferred: Mutex::new(None), queues: Queues::new(), quotas: Quotas::new() },
+        DevState { deferred: Mutex::new(None), queues: Queues::new(), quotas: Quotas::new(), pending: Pending::new() },
         M_WAITOK,
     );
     // SAFETY: boxed, never moves again; the locks are destroyed by their drops.

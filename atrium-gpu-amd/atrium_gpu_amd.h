@@ -618,25 +618,9 @@ struct atrium_amd_syncobj;	/* rs/syncobj.rs; opaque here */
  * under sc->lock, which serializes against the ISR (no refcount / no ISR free).
  */
 #define ATRIUM_AMD_MAX_PENDING	16	/* signalled submits in flight per queue */
-struct atrium_amd_pending {
-	struct atrium_amd_syncobj *so;
-	uint64_t	 value;
-};
+/* The completions each queue owes, and its hang clock, are rs/pending.rs
+ * (guarded by sc->lock, which the ISR holds). */
 
-/*
- * The completions one hardware queue owes, in submission order (review
- * §A2.2). An EOP cookie names its queue (ring_id), so it retires the head of
- * that queue's list only. Guarded by sc->lock (the ISR walks it).
- * `progress` is the tick of the queue's last sign of life (a submit, an EOP,
- * or the watchdog seeing its read pointer move), for the hang watchdog.
- */
-struct atrium_amd_qpend {
-	struct atrium_amd_pending e[ATRIUM_AMD_MAX_PENDING];
-	int		 head, n;
-	int		 progress;
-	uint32_t	 last_rptr;
-	int		 faulted;	/* its current work hit a VM fault */
-};
 #define ATRIUM_AMD_IH_CAUSE_EOP	1	/* IH cookie cause: end-of-pipe (device.rs) */
 #define ATRIUM_AMD_IH_CAUSE_VBLANK 2	/* IH cookie cause: DCN vertical blank */
 #define ATRIUM_AMD_IH_CAUSE_FLIP 3	/* IH cookie cause: DCN flip landed on screen */
@@ -867,7 +851,6 @@ struct atrium_amd_softc {
 	u_int		 irq_count;	/* interrupts serviced (atomic vs reader) */
 	struct mtx	 lock;		/* guards fence-wait sleep/wakeup + pending */
 	int		 lock_inited;
-	struct atrium_amd_qpend qpend[ATRIUM_AMD_NHWQ]; /* owed, per queue */
 	uint32_t	 ih_eop_ring[ATRIUM_AMD_NHWQ]; /* this ISR pass's EOPs */
 	uint32_t	 ih_fault_ring[ATRIUM_AMD_NHWQ]; /* ... and VM faults */
 	uint32_t	 ih_fault_vmid[ATRIUM_AMD_NHWQ]; /* last fault's VMID */
@@ -1106,22 +1089,15 @@ void	 amd_ih_rearm(struct atrium_amd_softc *sc);
 void	 amd_irq_teardown(struct atrium_amd_softc *sc);
 
 /*
- * irq.c (GPU module) — the EOP cause handler + the per-queue pending lists. The
- * base ISR routes IH_CAUSE_EOP here (registered via amd_ih_set_handler), with
- * sc->ih_eop_ring[] holding this pass's EOPs per queue. Called with sc->lock
- * HELD: retires each queue's completions onto their syncobjs in order. An entry
- * is pushed (sc->lock held) before its submit's doorbell, failed with EIO when
- * its queue is stopped or hangs, and scrubbed by a syncobj's fo_close.
+ * irq.c (GPU module) — the EOP and VM-fault cause handlers. The base ISR
+ * routes IH_CAUSE_EOP and IH_CAUSE_VM_FAULT here (amd_ih_set_handler), with
+ * sc->ih_eop_ring[] / ih_fault_ring[] holding this pass's counts per queue.
+ * Called with sc->lock HELD. The completion lists they retire are Rust
+ * (rs/pending.rs, amd_rs_eop).
  */
 void	 amd_eop_handler(struct atrium_amd_softc *sc, int count);
 void	 amd_fault_handler(struct atrium_amd_softc *sc, int count);
 void	 amd_hwq_kick_watchdog(struct atrium_amd_softc *sc);
-int	 amd_pending_push_locked(struct atrium_amd_softc *sc, uint32_t qid,
-	    struct atrium_amd_syncobj *so, uint64_t value);
-int	 amd_pending_fail_locked(struct atrium_amd_softc *sc, uint32_t qid,
-	    int error);
-void	 amd_pending_scrub(struct atrium_amd_softc *sc,
-	    struct atrium_amd_syncobj *so);
 
 /* glue.c — the client and control cdevsws (entry points in rs/ioctl.rs) */
 extern struct cdevsw atrium_amd_cdevsw;

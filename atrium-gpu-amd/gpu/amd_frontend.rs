@@ -30,3 +30,5 @@ pub mod defer;
 pub mod queue;
 #[path = "../rs/quota.rs"]
 pub mod quota;
+#[path = "../rs/pending.rs"]
+pub mod pending;

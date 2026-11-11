@@ -194,28 +194,62 @@ impl Dev {
 
     /// Does the queue still owe a completion (an EOP not yet seen)?
     pub fn q_owes(self, qid: u32) -> bool {
-        unsafe { sys::amd_rs_q_owes(self.0, qid) != 0 }
+        crate::pending::owes(self, qid)
     }
 
     /// Is there room on the queue's list for one more completion?
     pub fn q_room(self, qid: u32) -> bool {
-        unsafe { sys::amd_rs_q_room(self.0, qid) != 0 }
+        crate::pending::has_room(self, qid)
     }
 
     /// New work was programmed: register its completion (if `so`) and restart the hang clock.
     pub fn q_started(self, qid: u32, so: *mut sys::atrium_amd_syncobj, value: u64) {
-        unsafe { sys::amd_rs_q_started(self.0, qid, so, value) }
+        crate::pending::started(self, qid, so, value)
     }
 
     /// The queue was stopped: fail what it owed (EIO).
     pub fn q_stopped(self, qid: u32, was_busy: bool) {
-        unsafe { sys::amd_rs_q_stopped(self.0, qid, was_busy as c_int) }
+        crate::pending::stopped(self, qid, was_busy)
     }
 
     /// Must this busy kernel-rung queue be stopped (it faulted, or made no progress for
     /// hang_ms)? Logs and counts the reason.
     pub fn q_hang(self, qid: u32, vmid: u16, rptr: u32) -> bool {
-        unsafe { sys::amd_rs_q_hang(self.0, qid, vmid, rptr) != 0 }
+        crate::pending::hung(self, qid, vmid, rptr)
+    }
+
+    // --- sc->lock, for pending.rs's ScLocked ---
+
+    pub fn sc_mtx_lock(self) {
+        unsafe { sys::amd_rs_sc_lock(self.0) }
+    }
+
+    pub fn sc_mtx_unlock(self) {
+        unsafe { sys::amd_rs_sc_unlock(self.0) }
+    }
+
+    pub fn sc_mtx_assert(self) {
+        unsafe { sys::amd_rs_sc_assert(self.0) }
+    }
+
+    /// The kernel's tick counter (wraps; compare with wrapping_sub).
+    pub fn ticks(self) -> c_int {
+        unsafe { sys::amd_rs_ticks() }
+    }
+
+    /// hang_ms in ticks. sc->lock held.
+    pub fn hang_ticks_locked(self) -> c_int {
+        unsafe { sys::amd_rs_hang_ticks_locked(self.0) }
+    }
+
+    /// Add `n` to an isolation counter (AMD_RS_CNT_*). sc->lock held.
+    pub fn count_locked(self, what: u32, n: u32) {
+        unsafe { sys::amd_rs_count_locked(self.0, what as c_int, n) }
+    }
+
+    /// Log why the hang check stopped a queue (AMD_RS_STOP_*). Without sc->lock.
+    pub fn q_report_stop(self, qid: u32, vmid: u16, what: u32) {
+        unsafe { sys::amd_rs_q_report_stop(self.0, qid, vmid, what as c_int) }
     }
 
     pub fn q_count(self, what: u32) {
@@ -250,7 +284,7 @@ impl Dev {
     /// Forget every completion the ISR still owes `so` (it is about to be freed). Takes
     /// sc->lock, so the ISR is not using `so` once this returns.
     pub fn pending_scrub(self, so: *mut sys::atrium_amd_syncobj) {
-        unsafe { sys::amd_pending_scrub(self.0, so) }
+        crate::pending::scrub(self, so)
     }
 
     pub fn syncobj_count(self, delta: c_int) {

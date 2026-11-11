@@ -11,20 +11,21 @@ layer that faces clients. The hardware half stays C for now.
 | ioctl dispatch for the client node and the ctl node, per-open client state, and every check on submit's arguments (`ioctl.rs`; the command stream itself is not parsed: app GPU code is confined by its VMID, F6 Option A) | PCI attach, firmware, GMC, IH, MES, the CP rings, VRAM, reset, power gating |
 | GPU address spaces as fds: the VA arena and the VM's lifetime (`vm.rs`) | the hardware side of a VM: VMID, page tables, PTE writes (`vm.c`) |
 | buffer objects as fds: binding into VMs, unbinding, deferred free (`bo.rs`) | DMA pages and VRAM backing, scanout export (`bo.c`) |
-| timeline syncobjs: wait, kqueue, the display's watcher (`syncobj.rs`) | the EOP interrupt, which signals or fails a syncobj (`irq.c`) |
-| hardware queues: each queue's state behind its own lock, ownership, submit, QUEUE_MAP, the doorbell mmap, waiting for another VM's work, the hang check, reset (`queue.rs`) | queue registers, programming and stopping a queue (`cp.c`), the completions a queue owes, which the interrupt handler drains (`irq.c`), and the small helpers, timers and sysctls (`queue.c`) |
+| timeline syncobjs: wait, kqueue, the display's watcher (`syncobj.rs`) | |
+| the completions each queue owes, retiring them on EOP, failing them on a stop or fault, and the hang clock (`pending.rs`; guarded by sc->lock through an `ScLocked` token, since the base ISR holds that C lock) | the EOP and VM-fault cause handlers the base ISR calls (`irq.c`), the counters and log lines (`queue.c`) |
+| hardware queues: each queue's state behind its own lock, ownership, submit, QUEUE_MAP, the doorbell mmap, waiting for another VM's work, the hang check, reset (`queue.rs`) | queue registers, programming and stopping a queue (`cp.c`), and the small helpers, timers and sysctls (`queue.c`) |
 | doorbell mapping grants: the device pager's fault handler, the grant's lifetime, revoke (`doorbell.rs`, on `kpi::pager`) | |
 | deferred BO frees: the list and the reaper (`defer.rs`); a BO stays a Rust `Box` until it is freed, C never owns it | the reaper's and watchdog's timers (`queue.c`) |
 | per-uid BO caps, kmod audit G2: the accounts, charge at BO_ALLOC, give back at free (`quota.rs`) | the cap sysctls and the caller's uid (`queue.c`, `glue.c`) |
 | the single place Rust calls C (`backend.rs`) | |
 
 C reaches the Rust objects through a few `#[no_mangle]` exports: `amd_syncobj_*`,
-`amd_bo_fget`, `amd_rs_reap`/`amd_rs_dev_init`/`amd_rs_dev_fini`, `amd_rs_watchdog`, and the
+`amd_bo_fget`, `amd_rs_reap`/`amd_rs_dev_init`/`amd_rs_dev_fini`, `amd_rs_watchdog`, `amd_rs_eop`/`amd_rs_q_faulted_locked` (from the ISR, sc->lock held), and the
 queue entry points that keep their C names (`amd_hwq_submit`, `_map`, `_mmap_single`,
 `_client_close`, `_vm_gone`, `_reset_prepare`/`_restore`). VM and BO are `#[repr(C)]`, and their
 first field is the C backend struct, so a C pointer and a Rust pointer to the same object are
 the same address. Syncobjs and clients are opaque to C. The softc is opaque to Rust and is
-reached only through the `amd_rs_*` helpers in `../glue.c`. The cdevsw tables are also in
+reached only through the `amd_rs_*` helpers in `../glue.c` and `../queue.c`. The cdevsw tables are also in
 `glue.c`, and they point at the Rust entry points.
 
 The display module used to read a syncobj's fields directly. It now asks through the backend

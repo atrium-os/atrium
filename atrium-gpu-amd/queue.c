@@ -39,94 +39,66 @@ amd_rs_q_rptr(struct atrium_amd_softc *sc, uint32_t qid)
 	    qid * ATRIUM_AMD_Q_STRIDE + ATRIUM_AMD_QF_RPTR));
 }
 
-int
-amd_rs_q_owes(struct atrium_amd_softc *sc, uint32_t qid)
-{
-	int owes;
-
-	mtx_lock(&sc->lock);
-	owes = sc->qpend[qid].n > 0;
-	mtx_unlock(&sc->lock);
-	return (owes);
-}
-
-int
-amd_rs_q_room(struct atrium_amd_softc *sc, uint32_t qid)
-{
-	int room;
-
-	mtx_lock(&sc->lock);
-	room = sc->qpend[qid].n < ATRIUM_AMD_MAX_PENDING;
-	mtx_unlock(&sc->lock);
-	return (room);
-}
-
-/* New work was programmed on `qid` (the caller holds the queue and rings the
- * doorbell after this, so a synchronous drain still finds the entry). */
 void
-amd_rs_q_started(struct atrium_amd_softc *sc, uint32_t qid,
-    struct atrium_amd_syncobj *so, uint64_t value)
+amd_rs_sc_lock(struct atrium_amd_softc *sc)
 {
-	struct atrium_amd_qpend *qp = &sc->qpend[qid];
-
 	mtx_lock(&sc->lock);
-	/* New work, possibly another VM's: a fault reported before this
-	 * point belonged to the work before it, unless that work still owes
-	 * completions (same VM), which must still fail. */
-	if (qp->n == 0)
-		qp->faulted = 0;
-	if (so != NULL)
-		(void)amd_pending_push_locked(sc, qid, so, value);
-	qp->progress = ticks;
-	qp->last_rptr = 0;
-	mtx_unlock(&sc->lock);
 }
 
-/* `qid` was stopped: the stopped work will raise no EOP, so fail what it owed. */
 void
-amd_rs_q_stopped(struct atrium_amd_softc *sc, uint32_t qid, int was_busy)
+amd_rs_sc_unlock(struct atrium_amd_softc *sc)
 {
-	mtx_lock(&sc->lock);
-	amd_pending_fail_locked(sc, qid, EIO);
-	sc->qpend[qid].faulted = 0;
-	if (was_busy)
-		sc->iso.dequeues++;
 	mtx_unlock(&sc->lock);
 }
 
-/*
- * The hang check's clock (review §A2.6), for a busy kernel-rung queue: 1 if
- * it must be stopped now (a VM fault, or no progress, meaning read-pointer
- * movement or an EOP, for hang_ms), 0 otherwise.
- */
-int
-amd_rs_q_hang(struct atrium_amd_softc *sc, uint32_t qid, uint16_t vmid,
-    uint32_t rptr)
+void
+amd_rs_sc_assert(struct atrium_amd_softc *sc)
 {
-	struct atrium_amd_qpend *qp = &sc->qpend[qid];
-	int limit, hung = 0;
+	mtx_assert(&sc->lock, MA_OWNED);
+}
 
-	mtx_lock(&sc->lock);
-	limit = MAX(1, (int)(((int64_t)sc->hang_ms * hz) / 1000));
-	if (qp->faulted) {
-		/* A VM fault: its work is already wrong; stop it now. */
-		mtx_unlock(&sc->lock);
+int
+amd_rs_ticks(void)
+{
+	return (ticks);
+}
+
+/* hang_ms in ticks, at least one. */
+int
+amd_rs_hang_ticks_locked(struct atrium_amd_softc *sc)
+{
+	mtx_assert(&sc->lock, MA_OWNED);
+	return (MAX(1, (int)(((int64_t)sc->hang_ms * hz) / 1000)));
+}
+
+void
+amd_rs_count_locked(struct atrium_amd_softc *sc, int what, uint32_t n)
+{
+	mtx_assert(&sc->lock, MA_OWNED);
+	switch (what) {
+	case AMD_RS_CNT_FENCES_FAILED:
+		sc->iso.fences_failed += n;
+		break;
+	case AMD_RS_CNT_DEQUEUES:
+		sc->iso.dequeues += n;
+		break;
+	case AMD_RS_CNT_HANGS:
+		sc->iso.hangs += n;
+		break;
+	}
+}
+
+/* The hang check stopped `qid` (called without sc->lock). */
+void
+amd_rs_q_report_stop(struct atrium_amd_softc *sc, uint32_t qid, uint16_t vmid,
+    int what)
+{
+	if (what == AMD_RS_STOP_FAULT)
 		device_printf(sc->dev, "queue %u (VMID %u) faulted: stopped\n",
 		    qid, vmid);
-		return (1);
-	}
-	if (rptr != qp->last_rptr) {
-		qp->last_rptr = rptr;
-		qp->progress = ticks;
-	} else if (ticks - qp->progress >= limit) {
-		hung = 1;
-		sc->iso.hangs++;
-	}
-	mtx_unlock(&sc->lock);
-	if (hung)
+	else
 		device_printf(sc->dev, "queue %u (VMID %u) made no progress "
 		    "for %d ms: stopped\n", qid, vmid, sc->hang_ms);
-	return (hung);
 }
 
 void
@@ -349,7 +321,6 @@ amd_hwq_init(struct atrium_amd_softc *sc, device_t dev)
 	    amd_hwq_reap_task, sc);
 	TIMEOUT_TASK_INIT(taskqueue_thread, &sc->watchdog_task, 0,
 	    amd_hwq_watchdog_task, sc);
-	bzero(sc->qpend, sizeof(sc->qpend));
 	sc->watchdog_armed = 0;
 	sc->hang_ms = ATRIUM_AMD_HANG_MS;
 	sc->vram_limit_pct = ATRIUM_AMD_VRAM_LIMIT_PCT;

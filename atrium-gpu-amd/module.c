@@ -197,10 +197,9 @@ amd_teardown(struct atrium_amd_softc *sc)
 	/*
 	 * Reset this module's footprint in the SHARED softc back to the pristine
 	 * state the base left it in, so a re-attach (driver hot-swap,
-	 * docs/spec/gpu-driver-hotswap.md Protocol A) starts clean: forget any
-	 * completions the ISR still owed (their syncobjs are gone with the fds).
+	 * docs/spec/gpu-driver-hotswap.md Protocol A) starts clean. (The
+	 * completions the ISR owed went with the Rust state in amd_hwq_fini.)
 	 */
-	bzero(sc->qpend, sizeof(sc->qpend));
 	sc->backend = NULL;	/* points into this module; gone after kldunload */
 	/*
 	 * The IH ring + ISR, the BAR resources, and the softc mutex all belong to

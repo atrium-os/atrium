@@ -58,7 +58,7 @@ build() {
     done
     # A parallel make has linked a .ko with objects missing and exited 0
     # before (bootstrap-atrium.sh): gate on symbols from both languages.
-    for s in amd_rs_ioctl amd_syncobj_signal amd_rs_reap amd_rs_watchdog amd_hwq_reset_prepare amd_hwq_submit amd_vm_setup; do
+    for s in amd_rs_ioctl amd_syncobj_signal amd_rs_reap amd_rs_eop amd_rs_watchdog amd_hwq_reset_prepare amd_hwq_submit amd_vm_setup; do
         "$NM" "$OUT/atrium_gpu_amd.ko" | grep -q " [tT] $s\$" \
             || { echo "atrium_gpu_amd.ko: $s missing" >&2; exit 1; }
     done
