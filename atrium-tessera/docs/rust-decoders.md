@@ -255,8 +255,23 @@ symbols.
   | Rust, LTO | 3,877M | +0.4% vs C with LTO |
 
   With LTO the Rust decoders cost what the C ones do to within half a percent, and 0.8% less
-  than the C build without LTO. Kernel timing (HVF on the Mac) is still to do, with
-  `tessera_fs-lto.ko`; building it there needs clang and ld.lld 20.1.8 as well.
+  than the C build without LTO.
+- Kernel timing (2026-11-11, Mac, qemu HVF, ATRIUM-NODEBUG at fbsd 62c6fd2a9 under ULE;
+  `scripts/tessera-decode-timing.sh 11`: 20000 files, 256 MiB file, module order rotated
+  per round, median seconds; other host load paused). Two runs:
+
+  | module | stat | small files | 256 MiB read |
+  |--------|------|-------------|--------------|
+  | C | 0.230 / 0.220 | 0.210 / 0.210 | 3.300 / 3.360 |
+  | Rust | 0.957 / 1.000x | 1.000 / 1.000x | 1.009 / 1.006x |
+  | Rust, LTO | 0.913 / 1.000x | 0.952 / 1.000x | 1.012 / 0.979x |
+
+  The Rust decoders cost nothing measurable in the kernel (read +0.6 to +0.9%, inside the
+  round-to-round spread of about 10%); LTO is within noise of both. stat and small are 2 to 3
+  ticks of `/usr/bin/time`'s 10 ms, so their differences are tick noise. Resolving below ~2%
+  would need more files or a finer timer. Built on the Mac with Homebrew llvm@20 and lld@20
+  (20.1.8) for the LTO module (6 calls into Rust left, as on the cloud build). An earlier run
+  with a fuzzer loading the host (load 6) gave the same picture with a wider spread.
 
 ## Not moved yet (phase 2)
 
@@ -270,7 +285,6 @@ symbols.
   from disk, which is the class of bug the Rust move removes. In the B-tree, the batch's
   internal-node splice and `batch_emit` also stay C (counts computed, not read from disk).
 - The loader (`libsa`) stays C: no Rust in the boot loader for now.
-- HVF timing on the Mac VM (non-LTO and LTO modules).
 
 ## How to run
 
