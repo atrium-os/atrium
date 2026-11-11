@@ -73,6 +73,12 @@ pub fn translate(ev: &fresco_client::Event) -> Option<Event> {
         | fresco_client::Event::DragOver { .. }
         | fresco_client::Event::DragLeave { .. }
         | fresco_client::Event::DragEnd { .. }
+        // Gamepads go to games, which read them from fresco-client directly.
+        | fresco_client::Event::GamepadConnect { .. }
+        | fresco_client::Event::GamepadDisconnect { .. }
+        | fresco_client::Event::GamepadButton { .. }
+        | fresco_client::Event::GamepadAxis { .. }
+        | fresco_client::Event::GamepadClaim { .. }
         // Video layers: Pergola makes none yet.
         | fresco_client::Event::VideoPresented { .. }
         | fresco_client::Event::VideoReleased { .. }
