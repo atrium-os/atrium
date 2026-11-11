@@ -163,9 +163,58 @@ pub struct Capabilities {
     /// tty control) is restricted and asks for consent; the others only
     /// narrow what the app can call.
     pub syscalls: Option<String>,
+    /// ★ Input from frescod (atrium-input.md §6, fresco-capabilities.md §3),
+    /// written `input.gamepad = true` etc. Keyboard and pointer come with
+    /// `graphics`; frescod enforces the rest per app from the user's grant.
+    pub input: Option<InputCaps>,
     /// Unknown / future keys. Validator warns; doesn't reject.
     #[serde(flatten)]
     pub extra:      BTreeMap<String, toml::Value>,
+}
+
+/// `[capabilities] input.*` (fresco-capabilities.md §3). Underscored as
+/// atrium-input.md §6 writes them; the kebab spelling the other keys use is
+/// accepted too.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct InputCaps {
+    /// Implied by `graphics`; written for clarity only.
+    pub keyboard: Option<bool>,
+    /// Implied by `graphics`; written for clarity only.
+    pub pointer: Option<bool>,
+    /// Game controller events while the app's window has focus. No prompt.
+    pub gamepad: Option<bool>,
+    /// Claim a controller so it stays with the app when focus moves. Asks.
+    #[serde(alias = "gamepad-exclusive")]
+    pub gamepad_exclusive: Option<bool>,
+    /// Hide the cursor and take relative motion while focused. Asks.
+    #[serde(alias = "pointer-lock")]
+    pub pointer_lock: Option<bool>,
+    /// Raw reports from a named HID device. Restricted.
+    #[serde(alias = "raw-hid")]
+    pub raw_hid: Option<bool>,
+    /// System shortcuts (Cmd-Tab and the like). Never granted to apps: the
+    /// window manager has them through `window-management`.
+    #[serde(alias = "system-keys")]
+    pub system_keys: Option<bool>,
+}
+
+impl InputCaps {
+    fn merge(base: Option<InputCaps>, ovr: Option<InputCaps>) -> Option<InputCaps> {
+        match (base, ovr) {
+            (None, o) => o,
+            (b, None) => b,
+            (Some(b), Some(o)) => Some(InputCaps {
+                keyboard:          o.keyboard.or(b.keyboard),
+                pointer:           o.pointer.or(b.pointer),
+                gamepad:           o.gamepad.or(b.gamepad),
+                gamepad_exclusive: o.gamepad_exclusive.or(b.gamepad_exclusive),
+                pointer_lock:      o.pointer_lock.or(b.pointer_lock),
+                raw_hid:           o.raw_hid.or(b.raw_hid),
+                system_keys:       o.system_keys.or(b.system_keys),
+            }),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
@@ -296,6 +345,7 @@ pub fn merge_capabilities(base: &Capabilities, ovr: &Capabilities) -> Capabiliti
         net_fetch:        ovr.net_fetch.or(base.net_fetch),
         net_fetch_sites:  ovr.net_fetch_sites.clone().or_else(|| base.net_fetch_sites.clone()),
         syscalls:         ovr.syscalls.clone().or_else(|| base.syscalls.clone()),
+        input:            InputCaps::merge(base.input, ovr.input),
         extra:            {
             let mut e = base.extra.clone();
             for (k, v) in &ovr.extra { e.insert(k.clone(), v.clone()); }
@@ -418,5 +468,38 @@ floor = "256M"
         }
         // An unknown key is a parse error (deny_unknown_fields), not ignored.
         assert!(crate::Manifest::from_str(&POOLED.replace("floor = \"256M\"", "flor = \"256M\"")).is_err());
+    }
+    const GAME: &str = r#"
+[app]
+id = "org.example.game"
+name = "Game"
+version = "1"
+entry = "bin/game"
+[capabilities]
+graphics = "fresco"
+input.gamepad = true
+input.gamepad-exclusive = true
+input.pointer_lock = true
+"#;
+
+    #[test]
+    fn input_capabilities_parse_and_merge() {
+        use super::super::{merge_capabilities, Capabilities, InputCaps};
+        let m = crate::Manifest::from_str(GAME).unwrap();
+        let i = m.capabilities.input.unwrap();
+        assert_eq!((i.gamepad, i.gamepad_exclusive, i.pointer_lock, i.raw_hid), (Some(true), Some(true), Some(true), None));
+        assert!(m.capabilities.extra.is_empty(), "input is not an unknown key: {:?}", m.capabilities.extra);
+        let r = crate::validate(&m);
+        assert!(r.errors.is_empty() && r.warnings.iter().all(|w| !w.contains("input")), "{r:?}");
+        // A setup override drops one key and keeps the rest.
+        let ovr = Capabilities { input: Some(InputCaps { pointer_lock: Some(false), ..Default::default() }), ..Default::default() };
+        let mi = merge_capabilities(&m.capabilities, &ovr).input.unwrap();
+        assert_eq!((mi.gamepad, mi.pointer_lock), (Some(true), Some(false)));
+        // A misspelt input key is an error, not silently ignored.
+        assert!(crate::Manifest::from_str(&GAME.replace("input.gamepad = true", "input.gamepd = true")).is_err());
+        // Restricted and never-for-apps keys warn.
+        let m = crate::Manifest::from_str(&GAME.replace("input.gamepad = true", "input.raw_hid = true\ninput.system_keys = true")).unwrap();
+        let w = crate::validate(&m).warnings;
+        assert!(w.iter().any(|w| w.contains("raw_hid")) && w.iter().any(|w| w.contains("system_keys")), "{w:?}");
     }
 }

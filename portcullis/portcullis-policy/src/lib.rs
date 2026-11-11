@@ -197,6 +197,12 @@ pub struct CapabilityDelta {
     /// The manifest asks for the `terminal` system call class, which is
     /// wider than an app's (jail-sysfil.md §5.2).
     pub syscalls_terminal: bool,
+    /// `input.gamepad_exclusive`, `input.pointer_lock`, `input.raw_hid`
+    /// (fresco-capabilities.md §3). `input.gamepad` asks nothing: it reaches
+    /// no further than focus already does, so it rides on the grant.
+    pub input_gamepad_exclusive: bool,
+    pub input_pointer_lock: bool,
+    pub input_raw_hid: bool,
     /// Filesystem paths in manifest but not in granted list.
     pub filesystem_added: Vec<String>,
     /// Font paths in manifest but not in granted list.
@@ -228,6 +234,9 @@ impl CapabilityDelta {
             && !self.net_fetch
             && !self.tessera_cas_read
             && !self.syscalls_terminal
+            && !self.input_gamepad_exclusive
+            && !self.input_pointer_lock
+            && !self.input_raw_hid
             && self.filesystem_added.is_empty()
             && self.fonts_added.is_empty()
             && self.network_upgrade.is_none()
@@ -259,6 +268,9 @@ impl CapabilityDelta {
         if self.audio_device    { out.push("Add a sound output and play the system's sound through it".into()); }
         if self.net_fetch       { out.push("Fetch from the internet through the system's fetcher (no direct network access)".into()); }
         if self.tessera_cas_read{ out.push("Read the global Tessera CAS (privileged)".into()); }
+        if self.input_gamepad_exclusive { out.push("Keep a game controller when you switch to another window".into()); }
+        if self.input_pointer_lock { out.push("Hide and capture the pointer while its window has focus (Escape releases it)".into()); }
+        if self.input_raw_hid   { out.push("Read raw reports from input devices (specialty hardware)".into()); }
         if self.syscalls_terminal { out.push("Run other programs and control terminals (the terminal system call profile)".into()); }
         for p in &self.filesystem_added {
             out.push(format!("Read and write {p}"));
@@ -342,6 +354,18 @@ pub fn compute_delta(
     bool_cap!(audio_device);
     bool_cap!(net_fetch);
     bool_cap!(tessera_cas_read);
+
+    macro_rules! input_cap {
+        ($field:ident, $out:ident) => {
+            if requested.input.and_then(|i| i.$field) == Some(true) {
+                let was = g.and_then(|c| c.input).and_then(|i| i.$field).unwrap_or(false);
+                if !was { d.$out = true; }
+            }
+        };
+    }
+    input_cap!(gamepad_exclusive, input_gamepad_exclusive);
+    input_cap!(pointer_lock, input_pointer_lock);
+    input_cap!(raw_hid, input_raw_hid);
 
     /* Only `terminal` widens what the app may call; the other classes
      * narrow it and need no consent. */
@@ -522,8 +546,23 @@ mod tests {
             net_fetch: None,
             net_fetch_sites: None,
             syscalls: None,
+            input: None,
             extra:      Default::default(),
         }
+    }
+
+    #[test]
+    fn input_gamepad_asks_nothing_exclusive_and_lock_ask() {
+        let mut req = Capabilities { graphics: Some("fresco".into()), ..Default::default() };
+        let granted = req.clone();
+        req.input = Some(portcullis_toml::InputCaps { gamepad: Some(true), ..Default::default() });
+        assert!(compute_delta(&req, Some(&granted), None, "h").is_empty(), "gamepad alone needs no consent");
+        req.input = Some(portcullis_toml::InputCaps {
+            gamepad: Some(true), gamepad_exclusive: Some(true), pointer_lock: Some(true), ..Default::default() });
+        let d = compute_delta(&req, Some(&granted), None, "h");
+        assert!(d.input_gamepad_exclusive && d.input_pointer_lock && !d.input_raw_hid);
+        assert_eq!(d.describe().len(), 2);
+        assert!(compute_delta(&req, Some(&req.clone()), None, "h").is_empty(), "granted: nothing to ask");
     }
 
     #[test]

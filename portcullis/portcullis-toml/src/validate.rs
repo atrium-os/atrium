@@ -188,6 +188,23 @@ fn validate_capabilities(c: &Capabilities, ctx: &str, r: &mut Report) {
             "{ctx}.media-control = true: restricted to now-playing and the media keys \
              (Forum, the lock screen); requires explicit policy approval"));
     }
+    if let Some(i) = &c.input {
+        if c.graphics.is_none() {
+            r.warnings.push(format!(
+                "{ctx}.input: frescod only delivers input to windows; \
+                 without `graphics` it has no effect"));
+        }
+        if i.raw_hid == Some(true) {
+            r.warnings.push(format!(
+                "{ctx}.input.raw_hid = true: restricted to specialty hardware \
+                 apps; requires explicit policy approval"));
+        }
+        if i.system_keys == Some(true) {
+            r.warnings.push(format!(
+                "{ctx}.input.system_keys = true: never granted to apps; the \
+                 window manager receives system keys through window-management"));
+        }
+    }
     if c.camera == Some(true) {
         r.warnings.push(format!(
             "{ctx}.camera = true: requires user prompt; document the use case"));

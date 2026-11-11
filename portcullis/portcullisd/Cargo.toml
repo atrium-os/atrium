@@ -56,6 +56,8 @@ portcullis-peer     = { path = "../portcullis-peer" }
 portcullis-ipc      = { path = "../portcullis-ipc" }
 portcullis-protocol = { path = "../portcullis-protocol" }
 jaild               = { path = "../jaild" }
+# The sysfil class table (app_sysfil in launch.rs), not only the tests.
+jaild-policy        = { path = "../jaild-policy" }
 atrium-volumes      = { path = "../atrium-volumes" }
 aqueduct            = { path = "../../aqueduct" }
 # The fetcher's site-list syntax (nuntius.md §4), checked before spawn.
@@ -70,4 +72,3 @@ env_logger          = "0.11"
 
 [dev-dependencies]
 tempfile = "3"
-jaild-policy = { path = "../jaild-policy" }

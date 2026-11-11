@@ -20,7 +20,7 @@ pub mod validate;
 
 pub use schema::{
     merge_capabilities,
-    AppSection, Capabilities, FontsCap, InstancesPolicy, Manifest,
+    AppSection, Capabilities, FontsCap, InputCaps, InstancesPolicy, Manifest,
     NetworkCap, PoolSection, ResourcesSection, RestartPolicy, SetupSection,
     SupervisionSection,
 };

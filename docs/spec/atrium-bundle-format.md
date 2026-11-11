@@ -88,6 +88,9 @@ notify            = true
 filesystem        = ["~/Documents"]
 network           = "none"          # none | loopback | full
 fonts             = { mode = "read-only", paths = ["/usr/share/fonts"] }
+input.gamepad     = true            # controllers while focused; no prompt
+input.gamepad_exclusive = true      # asks: keep a controller across focus
+                                    # (fresco-capabilities.md §3)
 # … the full vocab from portcullis-toml::Capabilities …
 
 # Richer app-platform sections (from insula-manifest), all OPTIONAL:

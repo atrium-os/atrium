@@ -37,8 +37,14 @@
 #      `mkdir -p /atrium/sockets/fresco /atrium/sockets/fresco-wm &&
 #       chown _frescod:_frescod /atrium/sockets/fresco /atrium/sockets/fresco-wm`.
 #   4. The rootfs mountpoint dirs: <path>/{dev,libexec,lib,usr/lib,usr/local/lib,
-#      usr/local/bin,usr/local/share/atrium,atrium/sockets}.
+#      usr/local/bin,usr/local/share/atrium,atrium/sockets,var/db/atrium,
+#      var/run/atrium} and the file in 6.
 #   5. Disable the old root rc.d: `sysrc atrium_frescod_enable=NO`.
+#   6. Per-app input capabilities (docs/spec/fresco-capabilities.md §2):
+#      frescod names each client by peer uid through the launch registry and
+#      reads that user's approved grants, as choragusd does. Both are read-only
+#      and already in jaild.policy ro_paths. Mount points: <path>/var/db/atrium
+#      and an empty file <path>/var/run/atrium/app-registry.
 
 enabled       = true
 name          = "atrium-frescod"
@@ -69,6 +75,14 @@ kind   = "ro_nullfs"
 [[mounts]]
 source = "/usr/local/share/atrium"               # fresco-kernels/: Tier-2 code, precompiled
 dest   = "usr/local/share/atrium"
+kind   = "ro_nullfs"
+[[mounts]]
+source = "/var/db/atrium"                         # ro: users' approved grants (input.*)
+dest   = "var/db/atrium"
+kind   = "ro_nullfs"
+[[mounts]]
+source = "/var/run/atrium/app-registry"           # ro: who each app uid is (one file)
+dest   = "var/run/atrium/app-registry"
 kind   = "ro_nullfs"
 [[mounts]]
 source = "/atrium/sockets"                        # rw: frescod BINDS its sockets here
