@@ -198,6 +198,46 @@ pub struct SceneState {
     next_gen: u64,
 }
 
+/// A window's scroll viewports, each with its key: the content hash and
+/// the uploads of the slots it samples (see [`shifts`]).
+pub fn keyed_scrolls(scene: &SceneState, scrolls: &[Scroll]) -> Vec<(Scroll, u64)> {
+    use std::hash::{Hash, Hasher};
+    scrolls
+        .iter()
+        .map(|s| {
+            let mut h = std::collections::hash_map::DefaultHasher::new();
+            (s.hash, scene.slot_gens(&s.slots)).hash(&mut h);
+            (s.clone(), h.finish())
+        })
+        .collect()
+}
+
+/// The shifts that bring the scroll viewports of a drawing (`prev`, with
+/// their keys) to those of the next frame (`now`): a viewport in the same
+/// place showing the same content moved by whole pixels, less than its
+/// size (fresco-scene-groups.md §4).
+pub fn shifts(prev: &[(Scroll, u64)], now: &[(Scroll, u64)]) -> Vec<fresco_compute::damage::Shift> {
+    let mut out = Vec::new();
+    for (s, key) in now {
+        let Some((p, _)) = prev.iter().find(|(p, k)| p.group == s.group && p.area == s.area && k == key) else {
+            continue;
+        };
+        let d = [s.offset[0] - p.offset[0], s.offset[1] - p.offset[1]];
+        let r = d.map(f64::round);
+        let (aw, ah) = ((s.area[2] - s.area[0]) as f64, (s.area[3] - s.area[1]) as f64);
+        if (d[0] - r[0]).abs() > 1e-4 || (d[1] - r[1]).abs() > 1e-4 || r == [0.0, 0.0] || r[0].abs() >= aw || r[1].abs() >= ah {
+            continue;
+        }
+        out.push(fresco_compute::damage::Shift {
+            area: s.area,
+            d: [r[0] as i32, r[1] as i32],
+            over: s.over.clone(),
+            over_before: p.over.clone(),
+        });
+    }
+    out
+}
+
 impl SceneState {
     /// A hash of the upload generations of `slots`: equal across two
     /// frames when none of them was written in between.

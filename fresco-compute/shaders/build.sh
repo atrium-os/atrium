@@ -4,7 +4,7 @@
 # to SSA, which keeps the Tier-2 and GIR frontends on their well-trodden path.
 set -e
 cd "$(dirname "$0")"
-for s in bin raster compose; do
+for s in bin raster compose shift; do
     glslangValidator -V --target-env vulkan1.1 -o "$s.comp.raw.spv" "$s.comp"
     spirv-opt -O "$s.comp.raw.spv" -o "$s.comp.spv"
     spirv-val "$s.comp.spv"

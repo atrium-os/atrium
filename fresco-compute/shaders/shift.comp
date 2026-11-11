@@ -1,0 +1,38 @@
+#version 450
+// shift: copy a rectangle of words from one buffer to another, one
+// invocation per word (fresco-scene-groups.md §4, the GPU renderer's
+// scroll). frescod moves a scrolled viewport within a window surface in two
+// passes through a scratch buffer, so every copy reads the drawing as it
+// was (src and dst never overlap within one dispatch). The header is
+// frescod's; reads and writes stay below the word counts it gives.
+
+layout(local_size_x = 8, local_size_y = 8) in;
+
+layout(std430, set = 0, binding = 0) readonly buffer HeaderB {
+    uint w;          // rectangle size in words
+    uint h;
+    uint src_off;    // first word of the rectangle in src
+    uint src_pitch;  // words a line
+    uint dst_off;
+    uint dst_pitch;
+    uint src_words;  // words of src[] that may be read
+    uint dst_words;  // words of dst[] that may be written
+} H;
+
+layout(std430, set = 0, binding = 1) readonly buffer SrcB { uint src[]; };
+layout(std430, set = 0, binding = 2) writeonly buffer DstB { uint dst[]; };
+
+void main() {
+    uvec3 gid = gl_GlobalInvocationID; // whole-vector load: GIR takes no access chain into a builtin
+    uint x = gid.x;
+    uint y = gid.y;
+    if (x >= H.w || y >= H.h) {
+        return;
+    }
+    uint s = H.src_off + y * H.src_pitch + x;
+    uint d = H.dst_off + y * H.dst_pitch + x;
+    if (s >= H.src_words || d >= H.dst_words) {
+        return;
+    }
+    dst[d] = src[s];
+}

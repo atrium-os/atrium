@@ -27,8 +27,8 @@ pub trait Arch: Send {
     /// [`Arch::code_align`]-aligned address.
     fn code(&self) -> Vec<u8>;
 
-    /// Offsets of bin, raster and compose in [`Arch::code`].
-    fn code_offsets(&self) -> [u64; 3];
+    /// Offsets of bin, raster, compose and shift in [`Arch::code`].
+    fn code_offsets(&self) -> [u64; 4];
 
     /// Alignment the code's upload address needs.
     fn code_align(&self) -> u64;
@@ -52,6 +52,16 @@ pub trait Stream {
     /// (`[x0, y0, x1, y1)`), or the whole target if `rects` is empty.
     /// `buffers` is by [`compose::binding`] number.
     fn compose(&mut self, code: u64, buffers: &[u64; compose::binding::COUNT], c: &Compose, rects: &[[u32; 4]]) -> Result<(), Error>;
+
+    /// Copy a rectangle of `size` words (shaders/shift.comp) as the header
+    /// at `header` ([`crate::damage::move_header`]) says, from the buffer
+    /// at `src` to the one at `dst`; they must not overlap. Sees every
+    /// write before it; later commands see the copy only after
+    /// [`Stream::barrier`].
+    fn shift(&mut self, code: u64, header: u64, src: u64, dst: u64, size: [u32; 2]) -> Result<(), Error>;
+
+    /// Wait for every dispatch before it and make its writes visible.
+    fn barrier(&mut self);
 
     /// Once everything before it is done, write `1` to `fence` and raise
     /// the interrupt that signals the submission's syncobj.

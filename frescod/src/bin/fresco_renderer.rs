@@ -130,32 +130,6 @@ fn union(a: slot::Rect, b: slot::Rect) -> slot::Rect {
 /// Raster `frame` into `w.px`: only the tiles whose signatures changed.
 /// `Ok(Some(damage))`: the drawing changed, inside `damage` against the
 /// previous one (`None`: anywhere); `Ok(None)`: not a pixel changed.
-/// The shifts that bring the scroll viewports of the drawing in `w.px`
-/// (`w.scrolls`) to those of the next frame (`now`, with their keys):
-/// a viewport in the same place showing the same content moved by whole
-/// pixels, less than its size (fresco-scene-groups.md §4).
-fn shifts(w: &Win, now: &[(pack::Scroll, u64)]) -> Vec<fresco_compute::damage::Shift> {
-    let mut out = Vec::new();
-    for (s, key) in now {
-        let Some((p, _)) = w.scrolls.iter().find(|(p, k)| p.group == s.group && p.area == s.area && k == key) else {
-            continue;
-        };
-        let d = [s.offset[0] - p.offset[0], s.offset[1] - p.offset[1]];
-        let r = d.map(f64::round);
-        let (aw, ah) = ((s.area[2] - s.area[0]) as f64, (s.area[3] - s.area[1]) as f64);
-        if (d[0] - r[0]).abs() > 1e-4 || (d[1] - r[1]).abs() > 1e-4 || r == [0.0, 0.0] || r[0].abs() >= aw || r[1].abs() >= ah {
-            continue;
-        }
-        out.push(fresco_compute::damage::Shift {
-            area: s.area,
-            d: [r[0] as i32, r[1] as i32],
-            over: s.over.clone(),
-            over_before: p.over.clone(),
-        });
-    }
-    out
-}
-
 fn raster(
     t2: &fresco_compute::tier2::Tier2,
     w: &mut Win,
@@ -178,7 +152,7 @@ fn raster(
         w.scrolls = scrolls;
         return Ok(Some(None));
     }
-    let sh = shifts(w, &scrolls);
+    let sh = pack::shifts(&w.scrolls, &scrolls);
     w.scrolls = scrolls;
     let held = w.tiles.as_mut().unwrap();
     let out = if sh.is_empty() { damage::Shifted::default() } else { damage::shift(&mut w.px, width, height, &sig, held, &sh) };
@@ -528,14 +502,7 @@ fn draw(broker: &Chan, state: &Mutex<State>, fe: &Mutex<EnvelopeFrontend>, scene
         let written = match t2 {
             // Pixel mode: raster here (only what changed), send the pixels.
             Some(t2) => {
-                let scrolls = wf.scrolls.iter().map(|s| {
-                    let key = {
-                        let mut h = std::collections::hash_map::DefaultHasher::new();
-                        (s.hash, scene.slot_gens(&s.slots)).hash(&mut h);
-                        h.finish()
-                    };
-                    (s.clone(), key)
-                }).collect();
+                let scrolls = pack::keyed_scrolls(&scene, &wf.scrolls);
                 let damage = match raster(t2, w, &frame, width, height, scrolls) {
                     Ok(Some(d)) => d,
                     Ok(None) => {

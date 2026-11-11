@@ -39,6 +39,12 @@ pub mod tier2;
 pub const BIN_SPV: &[u8] = include_bytes!("../shaders/bin.comp.spv");
 /// SPIR-V of the raster kernel (local size 8x8).
 pub const RASTER_SPV: &[u8] = include_bytes!("../shaders/raster.comp.spv");
+/// SPIR-V of the shift kernel (local size 8x8): copies a rectangle of
+/// words, for the GPU renderer's scroll ([`damage::plan`],
+/// [`damage::move_header`]).
+pub const SHIFT_SPV: &[u8] = include_bytes!("../shaders/shift.comp.spv");
+/// The shift kernel's workgroup edge.
+pub const SHIFT_LOCAL: u32 = 8;
 
 /// Bindings (set 0).
 pub mod binding {

@@ -143,20 +143,56 @@ impl Compose {
     }
 }
 
-/// RDNA4 as a [`crate::gpu::Arch`]: the three kernels, and PM4 for the
+/// `shift.comp` for RDNA4: copies a rectangle of words, the GPU
+/// renderer's scroll ([`crate::damage::plan`]).
+pub struct Shift {
+    pub kernel: Kernel,
+}
+
+impl Shift {
+    pub fn new() -> Result<Self, Error> {
+        let kernel = Kernel::from_spirv(crate::SHIFT_SPV, &Options::default())?;
+        if kernel.uses_push_constants() {
+            return Err(Error::Binding("shift: unexpected push constants".into()));
+        }
+        Ok(Shift { kernel })
+    }
+
+    /// The code, to upload at a [`CODE_ALIGN`]-aligned address.
+    pub fn code(&self) -> Vec<u8> {
+        self.kernel.code()
+    }
+
+    /// Append one copy: make earlier writes visible, dispatch over `size`
+    /// words. No wait after it; the caller waits before reading `dst`.
+    pub fn record(&self, ib: &mut Blob, code_va: u64, header: u64, src: u64, dst: u64, size: [u32; 2]) -> Result<(), Error> {
+        let (gx, gy) = (size[0].div_ceil(crate::SHIFT_LOCAL), size[1].div_ceil(crate::SHIFT_LOCAL));
+        if gx == 0 || gy == 0 {
+            return Ok(());
+        }
+        let bind = [((0, 0), header), ((0, 1), src), ((0, 2), dst)];
+        ib.acquire_all();
+        self.kernel.record_at(ib, code_va, &bind, None, [0, 0, 0], [gx, gy, 1])?;
+        Ok(())
+    }
+}
+
+/// RDNA4 as a [`crate::gpu::Arch`]: the four kernels, and PM4 for the
 /// copies and the end-of-frame fence.
 pub struct Rdna4Arch {
     k: Rdna4,
     c: Compose,
-    offsets: [u64; 3],
+    s: Shift,
+    offsets: [u64; 4],
 }
 
 impl Rdna4Arch {
     pub fn new() -> Result<Self, Error> {
-        let (k, c) = (Rdna4::new()?, Compose::new()?);
+        let (k, c, s) = (Rdna4::new()?, Compose::new()?, Shift::new()?);
         let (raster_off, end) = k.code_layout();
-        let offsets = [0, raster_off, end.next_multiple_of(CODE_ALIGN)];
-        Ok(Rdna4Arch { k, c, offsets })
+        let compose_off = end.next_multiple_of(CODE_ALIGN);
+        let shift_off = (compose_off + c.code().len() as u64).next_multiple_of(CODE_ALIGN);
+        Ok(Rdna4Arch { k, c, s, offsets: [0, raster_off, compose_off, shift_off] })
     }
 }
 
@@ -178,10 +214,12 @@ impl crate::gpu::Arch for Rdna4Arch {
         code.extend(raster);
         code.resize(self.offsets[2] as usize, 0);
         code.extend(self.c.code());
+        code.resize(self.offsets[3] as usize, 0);
+        code.extend(self.s.code());
         code
     }
 
-    fn code_offsets(&self) -> [u64; 3] {
+    fn code_offsets(&self) -> [u64; 4] {
         self.offsets
     }
 
@@ -219,6 +257,14 @@ impl crate::gpu::Stream for Rdna4Stream<'_> {
 
     fn compose(&mut self, code: u64, buffers: &[u64; crate::compose::binding::COUNT], c: &crate::compose::Compose, rects: &[[u32; 4]]) -> Result<(), crate::gpu::Error> {
         Ok(self.arch.c.record(&mut self.ib, code + self.arch.offsets[2], buffers, c, rects)?)
+    }
+
+    fn shift(&mut self, code: u64, header: u64, src: u64, dst: u64, size: [u32; 2]) -> Result<(), crate::gpu::Error> {
+        Ok(self.arch.s.record(&mut self.ib, code + self.arch.offsets[3], header, src, dst, size)?)
+    }
+
+    fn barrier(&mut self) {
+        self.ib.cs_partial_flush();
     }
 
     fn end(&mut self, fence: u64) {

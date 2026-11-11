@@ -179,9 +179,16 @@ or moved by a fraction of a pixel is drawn by ordinary tile damage. Fills are fl
 space (`fill::flatten_local`) and `FillCache` keeps those lines, so a scrolled fill is only tiled
 again.
 
-**GPU renderer** (F4e): each window's VRAM surface persists and only dirty tiles are rastered, but
-there is no in-VRAM copy that handles overlap yet, so v1 draws the clip in full there (damage
-already confines that to the clip's tiles); a shift kernel comes later.
+**GPU renderer** (F4e; shift built 2026-11-11): each window's VRAM surface persists, and frescod's
+`GpuCompute` keeps each window's viewports the same way. `damage::plan` gives the moves (and the
+pixels left to draw) without touching pixels on the CPU. Each move is copied by `shift.comp` from
+the surface into a scratch buffer in the window's own VM, then, after a barrier, back to its new
+place, so overlapping moves read the drawing as it was. Then only the tiles left to draw
+(`damage::tiles_after_plan`: tiles whose signature changed, plus those the exposed strip and the
+`over` boxes touch) are rastered. The oracle case `fresco::shift` (gpusim test
+`fresco_shift_matches_the_cpu_scroll`, also in the R9700 corpus) checks that the GPU's result equals
+the CPU renderer's for the same frames, bit for bit. A filled path moved by whole pixels can differ
+from a fresh raster of it by one step in a few pixels' channels, on both renderers alike.
 
 **Fill flattening.** Composing a scroll translation into fill transforms would change the
 `FillCache` key every frame and re-flatten every fill in a band. The cache keeps flattened lines

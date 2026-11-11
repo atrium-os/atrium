@@ -313,3 +313,183 @@ pub fn compose_corpus(seed: u64, n: usize) -> Vec<Case> {
         })
         .collect()
 }
+
+/// A scrolled frame as frescod's GPU renderer records it
+/// (fresco-scene-groups.md §4): the target starts with the test scene
+/// rendered, the next frame shows it moved by `d` whole pixels, and the
+/// command stream copies what is still on screen there through a scratch
+/// buffer with shift.comp (two passes, a barrier after each), then rasters
+/// only the tiles [`damage::plan`] leaves to draw. The result must equal,
+/// bit for bit, what the CPU renderer makes of the same frames
+/// ([`shifted_reference`]): the moved scene's full render, except that a
+/// filled path moved by whole pixels can differ from a fresh raster by one
+/// step in a few pixels' channels.
+pub fn shift() -> Option<Case> {
+    shift_by("fresco_shift", [0, -7])
+}
+
+/// [`shift`] by any `d`.
+pub fn shift_by(name: &str, d: [i32; 2]) -> Option<Case> {
+    use fresco_compute::damage;
+    use fresco_compute::gpu::Arch;
+    let before = scene();
+    let after = moved(&before, d);
+    let (fb, f) = (Frame::pack(&before, W, H, PITCH), Frame::pack(&after, W, H, PITCH));
+    let sig = damage::tile_signatures(&f);
+    let mut held = damage::tile_signatures(&fb);
+    let s = damage::Shift { area: [0, 0, W, H], d, over: vec![], over_before: vec![] };
+    let (moves, out) = damage::plan(W, H, &sig, &mut held, &[s]);
+    if moves.is_empty() {
+        return None;
+    }
+    let rects = damage::tiles_after_plan(W, H, &sig, &held, &out.pixels, 16);
+
+    let target_words = f.target_words() as u32;
+    let mut scratch_words = 0;
+    let mut hdrs = Vec::new();
+    for m in &moves {
+        let size = [m.dst[2] - m.dst[0], m.dst[3] - m.dst[1]];
+        let sr = m.src();
+        let (src, dst) = (sr[1] * PITCH + sr[0], m.dst[1] * PITCH + m.dst[0]);
+        hdrs.push((size, scratch_words, src, dst));
+        scratch_words += size[0] * size[1];
+    }
+    // Header pairs (out, back), 256 bytes apart.
+    let mut header = Vec::new();
+    for &(size, at, src, dst) in &hdrs {
+        for h in [
+            damage::move_header(size, (src, PITCH, target_words), (at, size[0], scratch_words)),
+            damage::move_header(size, (at, size[0], scratch_words), (dst, PITCH, target_words)),
+        ] {
+            header.resize(header.len().next_multiple_of(256), 0);
+            header.extend(bytes(&h));
+        }
+    }
+
+    let arch = fresco_compute::rdna4::Rdna4Arch::new().ok()?;
+    let mut init = f.buffers();
+    init[binding::TARGET as usize] = bytes(&reference::render(&fb));
+    let pages = |n: usize| (n as u64).next_multiple_of(0x1000).max(0x1000);
+    let mut next = data_va(0);
+    let mut alloc = |n: usize| {
+        let v = next;
+        next += pages(n);
+        v
+    };
+    let va: [u64; binding::COUNT] = std::array::from_fn(|b| alloc(init[b].len()));
+    let header_va = alloc(header.len());
+    let scratch_va = alloc(scratch_words as usize * 4);
+
+    let mut ib = arch.stream();
+    let surf = va[binding::TARGET as usize];
+    for (i, &(size, ..)) in hdrs.iter().enumerate() {
+        ib.shift(CODE_VA, header_va + 512 * i as u64, surf, scratch_va, size).ok()?;
+    }
+    ib.barrier();
+    for (i, &(size, ..)) in hdrs.iter().enumerate() {
+        ib.shift(CODE_VA, header_va + 512 * i as u64 + 256, scratch_va, surf, size).ok()?;
+    }
+    ib.barrier();
+    if !rects.is_empty() {
+        ib.frame(CODE_VA, &va, &f, &rects).ok()?;
+    }
+    let mut blob = Blob::compute();
+    blob.dw = ib.bytes().chunks(4).map(|c| u32::from_le_bytes(c.try_into().unwrap())).collect();
+    blob.pad(8);
+
+    let mut code = arch.code();
+    let ib_off = (code.len() as u64).next_multiple_of(0x1000);
+    code.resize(ib_off as usize, 0);
+    code.extend(blob.bytes());
+    let size = (code.len() as u64).next_multiple_of(0x1000);
+    let mut buffers = vec![Buffer { name: "code".into(), va: CODE_VA, size, init: code, expect: None, unordered: None }];
+    let target = bytes(&shifted_reference(&before, &after, d));
+    for (b, init) in init.into_iter().enumerate() {
+        let expect = (b as u32 == binding::TARGET).then(|| target.clone());
+        buffers.push(Buffer { name: format!("b0_{b}"), va: va[b], size: pages(init.len()), init, expect, unordered: None });
+    }
+    buffers.push(Buffer { name: "shift_hdr".into(), va: header_va, size: pages(header.len()), init: header, expect: None, unordered: None });
+    buffers.push(Buffer { name: "scratch".into(), va: scratch_va, size: pages(scratch_words as usize * 4), init: vec![], expect: None, unordered: None });
+    Some(Case { name: name.into(), buffers, ib: ("code".into(), ib_off, blob.dw.len() as u64), ip: "compute" })
+}
+
+/// What the CPU renderer draws for `after` over `before`'s render when
+/// the whole target scrolled by `d`: [`damage::shift`], then the tiles
+/// left to draw from a full render of `after`.
+pub fn shifted_reference(before: &Scene, after: &Scene, d: [i32; 2]) -> Vec<u32> {
+    use fresco_compute::damage;
+    let (fb, f) = (Frame::pack(before, W, H, PITCH), Frame::pack(after, W, H, PITCH));
+    let sig = damage::tile_signatures(&f);
+    let mut held = damage::tile_signatures(&fb);
+    let s = damage::Shift { area: [0, 0, W, H], d, over: vec![], over_before: vec![] };
+    let mut px = reference::render(&fb);
+    let out = damage::shift(&mut px, PITCH, H, &sig, &mut held, &[s]);
+    let want = reference::render(&f);
+    for r in damage::tiles_after_plan(W, H, &sig, &held, &out.pixels, 16) {
+        for y in r[1] * TILE..(r[3] * TILE).min(H) {
+            for x in r[0] * TILE..(r[2] * TILE).min(W) {
+                let i = (y * PITCH + x) as usize;
+                px[i] = want[i];
+            }
+        }
+    }
+    px
+}
+
+/// `s` with everything moved by `d` whole pixels.
+pub fn moved(s: &Scene, d: [i32; 2]) -> Scene {
+    let (dx, dy) = (d[0] as f32, d[1] as f32);
+    let mut s = s.clone();
+    for r in &mut s.rects {
+        r.position[0] += dx;
+        r.position[1] += dy;
+    }
+    for p in &mut s.paths {
+        p.model[0] += dx;
+        p.model[1] += dy;
+    }
+    for f in &mut s.fills {
+        f.transform[4] += dx;
+        f.transform[5] += dy;
+        if let Some(c) = &mut f.clip {
+            *c = [c[0] + dx, c[1] + dy, c[2] + dx, c[3] + dy];
+        }
+    }
+    for b in &mut s.texture_batches {
+        for q in &mut b.quads {
+            q[0] += dx;
+            q[1] += dy;
+        }
+    }
+    for b in &mut s.glyph_batches {
+        for r in &mut b.runs {
+            r.origin[0] += dx;
+            r.origin[1] += dy;
+        }
+    }
+    s
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The CPU model the gpusim case checks against is a scroll: within
+    /// one step per channel of a full render (filled paths are not exact
+    /// under whole-pixel moves), and exact without fills.
+    #[test]
+    fn shifted_reference_is_a_scroll() {
+        for d in [[0, -7], [0, 9], [-5, 3]] {
+            let s = scene();
+            let got = shifted_reference(&s, &moved(&s, d), d);
+            let want = reference::render(&Frame::pack(&moved(&s, d), W, H, PITCH));
+            for (i, (a, b)) in got.iter().zip(&want).enumerate() {
+                let close = (0..4).all(|c| ((a >> (8 * c)) & 0xff).abs_diff((b >> (8 * c)) & 0xff) <= 1);
+                assert!(close, "d {d:?} at word {i}: {a:#x} vs {b:#x}");
+            }
+            let mut s = scene();
+            s.fills.clear();
+            assert_eq!(shifted_reference(&s, &moved(&s, d), d), reference::render(&Frame::pack(&moved(&s, d), W, H, PITCH)), "d {d:?}");
+        }
+    }
+}

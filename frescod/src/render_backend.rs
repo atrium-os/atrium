@@ -653,6 +653,10 @@ struct WinVm<'a> {
     size: (u32, u32),
     /// Tile signatures of what the surface holds.
     held: Option<Vec<u64>>,
+    /// The scroll viewports of the drawing it holds, with their keys.
+    scrolls: Vec<(crate::pack::Scroll, u64)>,
+    /// Where a scroll's moves stage the pixels they copy.
+    scratch: Option<Bo<'a>>,
     data: Option<Bo<'a>>,
     staging: Bo<'a>,
     ring: Bo<'a>,
@@ -672,6 +676,8 @@ impl<'a> WinVm<'a> {
             surface,
             size: (w, h),
             held: None,
+            scrolls: Vec::new(),
+            scratch: None,
             data: None,
             // The CPU fills these; the GPU only reads them.
             staging: vm.alloc_readonly(1 << 20, 0)?,
@@ -686,6 +692,8 @@ impl<'a> WinVm<'a> {
 struct Pending {
     /// Each window's id and packed frame.
     frames: Vec<(u32, Arc<fresco_compute::Frame>)>,
+    /// Each window's scroll viewports, with their keys.
+    scrolls: HashMap<u32, Vec<(crate::pack::Scroll, u64)>>,
     /// Each window's screen position.
     pos: HashMap<u32, (i32, i32)>,
 }
@@ -782,6 +790,7 @@ impl<'a> GpuCompute<'a> {
         self.version.retain(|id, _| f.windows.iter().any(|w| w.id == *id));
         let gpu = self.vm.gpu();
         let mut frames = Vec::with_capacity(f.windows.len());
+        let mut scrolls = HashMap::new();
         for w in &f.windows {
             let (sw, sh) = surface_size(w);
             if self.wins.get(&w.id).is_none_or(|v| v.size != (sw, sh)) {
@@ -792,10 +801,11 @@ impl<'a> GpuCompute<'a> {
                 self.composed.clear();
             }
             frames.push((w.id, frame_of(&self.scene, w, [0, sw, sw, sh], &mut self.fill_drops)));
+            scrolls.insert(w.id, crate::pack::keyed_scrolls(&self.scene, &w.scrolls));
         }
         self.last = frames.clone();
         let pos = f.windows.iter().map(|w| (w.id, (w.pos.0.round() as i32, w.pos.1.round() as i32))).collect();
-        self.pending = Some(Pending { frames, pos });
+        self.pending = Some(Pending { frames, scrolls, pos });
         Ok(())
     }
 
@@ -819,7 +829,7 @@ impl<'a> GpuCompute<'a> {
 
     fn submit(&mut self, target: &Bo<'_>, deadline_ns: u32, signal: (&Syncobj<'_>, u64)) -> Result<()> {
         use fresco_compute::{binding, compose::binding as cb, damage};
-        let p = self.pending.take().ok_or("present before render")?;
+        let mut p = self.pending.take().ok_or("present before render")?;
         if (self.width * self.height) as u64 * 4 > target.size() {
             return Err("scanout buffer smaller than the screen".into());
         }
@@ -834,13 +844,27 @@ impl<'a> GpuCompute<'a> {
             .then(|| p.frames.first().and_then(|(id, _)| self.wins.get(id)).map(|v| v.shown.gpu_va()))
             .flatten();
         // Each window whose tiles changed: its dirty rects, in its own VM.
+        // A scrolled viewport first moves what it shows on the GPU
+        // (fresco-scene-groups.md §4); then only what that left to draw.
         for (n, (id, f)) in p.frames.iter().enumerate() {
             let v = self.wins.get_mut(id).ok_or("window without a VM")?;
             let sig = damage::tile_signatures(f);
-            let dirty = damage::dirty(&sig, v.held.as_deref());
-            let rects = damage::rects(&dirty, f.header.tiles_x, f.header.tiles_y, MAX_DAMAGE_RECTS);
+            let now = p.scrolls.remove(id).unwrap_or_default();
+            let (fw, fh) = (f.header.width, f.header.height);
+            let (moves, rects) = match v.held.as_mut() {
+                Some(held) if held.len() == sig.len() && (fw, fh) == v.size => {
+                    let sh = crate::pack::shifts(&v.scrolls, &now);
+                    let (moves, out) = if sh.is_empty() { Default::default() } else { damage::plan(fw, fh, &sig, held, &sh) };
+                    (moves, damage::tiles_after_plan(fw, fh, &sig, held, &out.pixels, MAX_DAMAGE_RECTS))
+                }
+                _ => {
+                    let dirty = damage::dirty(&sig, None);
+                    (Vec::new(), damage::rects(&dirty, f.header.tiles_x, f.header.tiles_y, MAX_DAMAGE_RECTS))
+                }
+            };
             v.held = Some(sig);
-            if rects.is_empty() {
+            v.scrolls = now;
+            if rects.is_empty() && moves.is_empty() {
                 continue;
             }
             *self.version.entry(*id).or_insert(0) += 1;
@@ -850,6 +874,28 @@ impl<'a> GpuCompute<'a> {
                 if b as u32 != binding::TARGET {
                     offs[b] = place(&mut stage, &bytes);
                 }
+            }
+            // Each move goes surface -> scratch, then scratch -> surface, so
+            // every move reads the drawing as it was.
+            let surface_words = v.size.0 * v.size.1;
+            let pitch = v.size.0;
+            let mut scratch_words = 0u32;
+            let mut hdrs = Vec::with_capacity(moves.len());
+            for m in &moves {
+                let [x0, y0, x1, y1] = m.dst;
+                let s = m.src();
+                let size = [x1 - x0, y1 - y0];
+                hdrs.push((size, scratch_words, [s[1] * pitch + s[0], y0 * pitch + x0]));
+                scratch_words += size[0] * size[1];
+            }
+            let mut move_offs = Vec::with_capacity(hdrs.len());
+            for &(size, at, [src, dst]) in &hdrs {
+                let out = damage::move_header(size, (src, pitch, surface_words), (at, size[0], scratch_words));
+                let back = damage::move_header(size, (at, size[0], scratch_words), (dst, pitch, surface_words));
+                move_offs.push((size, place(&mut stage, &fresco_compute::bytes_of(&out)), place(&mut stage, &fresco_compute::bytes_of(&back))));
+            }
+            if scratch_words > 0 {
+                v.scratch = Some(grow(&v.vm, v.scratch.take(), scratch_words as u64 * 4, BO_VRAM)?);
             }
             v.data = Some(grow(&v.vm, v.data.take(), stage.len() as u64, BO_VRAM)?);
             if v.staging.size() < stage.len() as u64 {
@@ -864,7 +910,20 @@ impl<'a> GpuCompute<'a> {
             };
             let mut ib = self.arch.stream();
             ib.copy(v.staging.gpu_va(), data_va, stage.len() as u64);
-            ib.frame(v.code.gpu_va(), &va, f, &rects).map_err(|e| format!("{name} record: {e}"))?;
+            if let Some(scratch) = v.scratch.as_ref().filter(|_| !move_offs.is_empty()) {
+                let (surf, scr) = (va[binding::TARGET as usize], scratch.gpu_va());
+                for &(size, out, _) in &move_offs {
+                    ib.shift(v.code.gpu_va(), data_va + out, surf, scr, size).map_err(|e| format!("{name} shift: {e}"))?;
+                }
+                ib.barrier();
+                for &(size, _, back) in &move_offs {
+                    ib.shift(v.code.gpu_va(), data_va + back, scr, surf, size).map_err(|e| format!("{name} shift: {e}"))?;
+                }
+                ib.barrier();
+            }
+            if !rects.is_empty() {
+                ib.frame(v.code.gpu_va(), &va, f, &rects).map_err(|e| format!("{name} record: {e}"))?;
+            }
             ib.end(v.ring.gpu_va() + FENCE_OFFSET);
             v.seq += 1;
             run(&v.vm, &v.ring, &*ib, (&v.sync, v.seq), deadline_ns)?;
