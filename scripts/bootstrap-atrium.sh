@@ -466,12 +466,18 @@ ph_corelib() {
     # emptied by running `bmake check` on macOS, where the host-side test
     # target re-archives into the same in-tree path.)
     rm -f "$cd_core/libtessera_core.a"
+    # D3: the core's on-disk decoders forward to the Rust tessera-decode crate,
+    # as in tessera_fs.ko and the cloud cross-build (tessera-tools-cross.sh);
+    # tessera-sys always links that crate. TESSERA_C_DECODE=1 builds the
+    # all-C reference instead (atrium-tessera/docs/rust-decoders.md).
+    decode_def="-DTESSERA_RUST_DECODE"
+    [ "${TESSERA_C_DECODE:-}" = 1 ] && decode_def=""
     head_ "cross-building libtessera_core.a"
     ( cd "$cd_core" && bmake -s libtessera_core.a \
         CC="$L/bin/clang" AR="$L/bin/llvm-ar" RANLIB="$L/bin/llvm-ranlib" \
         CFLAGS="-O2 -fPIC -fno-strict-aliasing --target=aarch64-unknown-freebsd16.0 \
                 --sysroot=$SYSROOT -isystem $SYSROOT/usr/include \
-                -I$cd_core/include -I$cd_core/src -D__libtessera_core__" ) \
+                -I$cd_core/include -I$cd_core/src -D__libtessera_core__ $decode_def" ) \
         > "$LOGS/corelib.log" 2>&1 \
         || die "libtessera_core build failed" "See $LOGS/corelib.log"
 
@@ -499,6 +505,12 @@ ph_corelib() {
         || die "libtessera_core.a contains host objects, not aarch64" \
                "The cross flags did not reach bmake. See $LOGS/corelib.log"
     rm -f "/tmp/$obj"
+    # The flag must have reached the compiler: the forwarders call tessera_rs_*.
+    if [ -n "$decode_def" ]; then
+        "$L/bin/llvm-nm" -u "$a" 2>/dev/null | grep -q ' tessera_rs_' \
+            || die "libtessera_core.a was built without the Rust decoders" \
+                   "-DTESSERA_RUST_DECODE did not reach bmake. See $LOGS/corelib.log"
+    fi
     ok "libtessera_core.a ($(( $(stat -f %z "$a") / 1024 )) KiB, aarch64, $nmemb objects)"
 }
 
