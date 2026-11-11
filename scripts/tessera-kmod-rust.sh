@@ -88,7 +88,7 @@ build() {
 build_lto() {
     want=$(rustc +"$TOOLCHAIN" -vV | sed -n 's/^LLVM version: //p')
     have=$("$LLVMBIN/clang" --version | sed -n '1s/.*clang version \([0-9.]*\).*/\1/p')
-    lld=$("$LLVMBIN/ld.lld" --version | sed -n 's/^LLD \([0-9.]*\).*/\1/p')
+    lld=$("$LLVMBIN/ld.lld" --version | sed -n 's/^\(.* \)\{0,1\}LLD \([0-9.]*\).*/\2/p')
     [ "$want" = "$have" ] && [ "$want" = "$lld" ] || {
         echo "LTO needs clang and ld.lld $want (rustc +$TOOLCHAIN); $LLVMBIN has clang $have, lld $lld" >&2
         exit 1
