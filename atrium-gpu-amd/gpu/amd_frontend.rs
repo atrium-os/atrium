@@ -22,3 +22,5 @@ pub mod vm;
 pub mod bo;
 #[path = "../rs/ioctl.rs"]
 pub mod ioctl;
+#[path = "../rs/doorbell.rs"]
+pub mod doorbell;

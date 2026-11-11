@@ -171,6 +171,14 @@ impl Dev {
         unsafe { sys::amd_rs_syncobj_count(self.0, delta) }
     }
 
+    // --- doorbell grants ---
+
+    /// Account a doorbell grant: `live` grant objects more (or fewer), and one more created.
+    /// Live grants hold up module detach (amd_hwq_busy_refs).
+    pub fn grant_count(self, live: c_int, created: bool) {
+        unsafe { sys::amd_rs_grant_count(self.0, live, created as c_int) }
+    }
+
     // --- device-wide ---
 
     pub fn caps(self) -> sys::atrium_gpu_backend_caps {

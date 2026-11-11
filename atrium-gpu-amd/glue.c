@@ -2,7 +2,7 @@
  * glue.c — the C side of the boundary with the Rust front-end (rs/).
  *
  * The client node's ioctls, its per-open state, and the VM, BO and syncobj fd
- * objects are Rust (rs/README.md). What stays here is what Rust should not
+ * objects, and the doorbell grant pager, are Rust (rs/README.md). What stays here is what Rust should not
  * reach into: the two cdevsw tables (module.c makes the devices from them),
  * and small accessors for the few softc fields the front-end needs, so the
  * softc stays a C type the Rust side only holds pointers to.
@@ -28,6 +28,16 @@ amd_rs_syncobj_count(struct atrium_amd_softc *sc, int delta)
 {
 	/* module.c's detach waits for this to reach 0. */
 	atomic_add_int(&sc->syncobj_count, delta);
+}
+
+void
+amd_rs_grant_count(struct atrium_amd_softc *sc, int live, int created)
+{
+	mtx_lock(&sc->lock);
+	sc->iso.grants_live += live;	/* amd_hwq_busy_refs holds detach for these */
+	if (created)
+		sc->iso.grants++;
+	mtx_unlock(&sc->lock);
 }
 
 struct atrium_amd_softc *

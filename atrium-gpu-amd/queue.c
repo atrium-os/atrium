@@ -38,6 +38,7 @@
  */
 #include "atrium_gpu_amd.h"
 #include "atrium_gpu_amd_abi.h"
+#include "rs/glue.h"
 
 #include <sys/rwlock.h>
 
@@ -150,71 +151,9 @@ amd_hwq_for_engine(struct atrium_amd_softc *sc, uint32_t engine)
 }
 
 /* ---------------------------------------------------------------------------
- * Doorbell grants: a managed device pager per grant, so the kernel can take the
- * page back out of every process that mapped it.
+ * Doorbell grants: a managed device pager per grant (rs/doorbell.rs), so the
+ * kernel can take the page back out of every process that mapped it.
  */
-
-static int
-amd_db_pg_ctor(void *handle, vm_ooffset_t size, vm_prot_t prot,
-    vm_ooffset_t foff, struct ucred *cred, u_short *color)
-{
-	*color = 0;
-	return (0);
-}
-
-static void
-amd_db_pg_dtor(void *handle)
-{
-	struct atrium_amd_db_grant *g = handle;
-	struct atrium_amd_softc *sc = g->sc;
-
-	mtx_lock(&sc->lock);
-	sc->iso.grants_live--;
-	mtx_unlock(&sc->lock);
-	free(g, M_DEVBUF);
-}
-
-static int
-amd_db_pg_fault(vm_object_t object, vm_ooffset_t offset, int prot,
-    vm_page_t *mres)
-{
-	struct atrium_amd_db_grant *g = object->handle;
-	vm_pindex_t pidx;
-	vm_page_t page;
-
-	/*
-	 * VM_PAGER_ERROR, not VM_PAGER_FAIL: FAIL means "no page here" and
-	 * vm_fault would quietly zero-fill an anonymous page in its place. A
-	 * revoked doorbell should fault (SIGBUS) so the client knows.
-	 */
-	VM_OBJECT_ASSERT_WLOCKED(object);
-	if (g->revoked || offset != 0)
-		return (VM_PAGER_ERROR);
-	pidx = OFF_TO_IDX(offset);
-	page = PHYS_TO_VM_PAGE(g->pa);
-	if (page == NULL || (page->flags & PG_FICTITIOUS) == 0)
-		return (VM_PAGER_ERROR);
-	/* Only one grant holds the page at a time: a revoke removes it from the
-	 * old object before a new grant exists. Refuse rather than steal. */
-	if (page->object != NULL)
-		return (VM_PAGER_ERROR);
-	vm_page_busy_acquire(page, 0);
-	vm_page_valid(page);
-	if (*mres != NULL)
-		vm_page_replace(page, object, pidx, *mres);
-	else if (vm_page_insert(page, object, pidx) != 0) {
-		vm_page_xunbusy(page);
-		return (VM_PAGER_ERROR);
-	}
-	*mres = page;
-	return (VM_PAGER_OK);
-}
-
-static struct cdev_pager_ops amd_db_pg_ops = {
-	.cdev_pg_fault = amd_db_pg_fault,
-	.cdev_pg_ctor = amd_db_pg_ctor,
-	.cdev_pg_dtor = amd_db_pg_dtor,
-};
 
 /* Take the doorbell page back from every mapping of the queue's grant. */
 static void
@@ -225,13 +164,8 @@ amd_hwq_revoke(struct atrium_amd_softc *sc, struct atrium_amd_hwq *q)
 	sx_assert(&q->lock, SA_XLOCKED);
 	if (obj == NULL)
 		return;
-	VM_OBJECT_WLOCK(obj);
-	q->grant->revoked = 1;
-	VM_OBJECT_WUNLOCK(obj);
-	cdev_mgtdev_pager_free_pages(obj);	/* pmap_remove_all + remove */
-	q->grant = NULL;
 	q->grant_obj = NULL;
-	vm_object_deallocate(obj);	/* the dtor frees the grant at last ref */
+	amd_db_grant_revoke(obj);	/* faults now fail; pages unmapped */
 	mtx_lock(&sc->lock);
 	sc->iso.revokes++;
 	mtx_unlock(&sc->lock);
@@ -642,8 +576,6 @@ amd_hwq_mmap_single(struct atrium_amd_softc *sc,
     struct atrium_amd_client *client, vm_ooffset_t *offset, vm_size_t size,
     vm_object_t *object, int nprot)
 {
-	struct atrium_amd_db_grant *g;
-	vm_object_t obj;
 	int i;
 
 	if (size != PAGE_SIZE || sc->doorbell == NULL || !sc->db_fict_registered)
@@ -657,27 +589,14 @@ amd_hwq_mmap_single(struct atrium_amd_softc *sc,
 			continue;
 		}
 		if (q->grant_obj == NULL) {
-			g = malloc(sizeof(*g), M_DEVBUF, M_WAITOK | M_ZERO);
-			g->sc = sc;
-			g->pa = rman_get_start(sc->doorbell) + q->doorbell_off;
-			mtx_lock(&sc->lock);
-			sc->iso.grants_live++;	/* the dtor undoes it */
-			sc->iso.grants++;
-			mtx_unlock(&sc->lock);
-			obj = cdev_pager_allocate(g, OBJT_MGTDEVICE,
-			    &amd_db_pg_ops, PAGE_SIZE, nprot, 0,
-			    curthread->td_ucred);
-			if (obj == NULL) {
-				/* The ctor never ran, so neither will the dtor. */
-				mtx_lock(&sc->lock);
-				sc->iso.grants_live--;
-				mtx_unlock(&sc->lock);
-				free(g, M_DEVBUF);
+			int err = amd_db_grant_create(sc,
+			    rman_get_start(sc->doorbell) + q->doorbell_off,
+			    nprot, &q->grant_obj);
+
+			if (err != 0) {
 				sx_xunlock(&q->lock);
-				return (ENOMEM);
+				return (err);
 			}
-			q->grant = g;
-			q->grant_obj = obj;
 		}
 		vm_object_reference(q->grant_obj);
 		*object = q->grant_obj;

@@ -72,6 +72,10 @@ upstream.
 8. **amd64 KASAN shadow offset**: 0004 set the offset for arm64 only, so on amd64 rustc used its
    user-space default and the first stack poison faulted (found 2026-11-11, the first amd64
    KASAN run of a Rust module). Now `0xdffff7c000000000`, the offset clang uses for the C kernel.
+9. **Managed device pagers** (`pager.rs`): `OBJT_MGTDEVICE` objects for `d_mmap_single` that the
+   driver can revoke. The handle (`Box<T>`) belongs to the object and is freed by the pager
+   destructor. `T` only picks the physical address for a fault, and the fault path refuses any
+   page that is not an unowned fictitious page. atrium-gpu-amd's doorbell grants use it.
 
 ## 4. Results (arm64 2026-11-07, amd64 2026-11-10; QEMU TCG on the cloud host)
 

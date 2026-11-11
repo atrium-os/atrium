@@ -1,0 +1,352 @@
+From 98fe4c7e89b5295a5f11fcc639daf7b6dbf51156 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Wed, 11 Nov 2026 09:56:17 +0000
+Subject: [PATCH] kpi: managed device pagers (pager.rs)
+
+OBJT_MGTDEVICE objects for d_mmap_single whose pages the driver can take
+back from every mapping. The handle is a Box<T> owned by the object and
+freed by the pager destructor; T only chooses the physical address for a
+fault, and the fault path refuses anything that is not an unowned
+fictitious page, so a wrong answer cannot map RAM or steal a page.
+VmObject<T> is one object reference (Clone takes another, Drop gives it
+back). bindings.h: the vm_object/vm_page/vm_pager headers, and the
+object lock and page xunbusy macros as functions.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ bindings.h       |  27 +++++
+ kern.rust.mk     |   1 +
+ kpi/src/lib.rs   |   3 +
+ kpi/src/pager.rs | 251 +++++++++++++++++++++++++++++++++++++++++++++++
+ 4 files changed, 282 insertions(+)
+ create mode 100644 kpi/src/pager.rs
+
+diff --git a/bindings.h b/bindings.h
+index e875e1e..b614cc0 100644
+--- a/bindings.h
++++ b/bindings.h
+@@ -66,7 +66,13 @@
+ #include <sys/user.h>
+ #include <sys/vmem.h>
+ 
++#include <sys/rwlock.h>
++
+ #include <vm/vm.h>
++#include <vm/vm_param.h>
++#include <vm/vm_object.h>
++#include <vm/vm_page.h>
++#include <vm/vm_pager.h>
+ 
+ #include <machine/_inttypes.h>
+ #include <machine/bus.h>
+@@ -283,3 +289,24 @@ rust_bindings_knote_locked(struct knlist *list, long hint) {
+     KNOTE_LOCKED(list, hint);
+ }
+ 
++/* Device pagers (kpi/src/pager.rs): the VM object lock and page busy macros. */
++void
++rust_bindings_vm_object_wlock(vm_object_t obj) {
++    VM_OBJECT_WLOCK(obj);
++}
++
++void
++rust_bindings_vm_object_wunlock(vm_object_t obj) {
++    VM_OBJECT_WUNLOCK(obj);
++}
++
++void
++rust_bindings_vm_object_assert_wlocked(vm_object_t obj) {
++    VM_OBJECT_ASSERT_WLOCKED(obj);
++}
++
++void
++rust_bindings_vm_page_xunbusy(vm_page_t m) {
++    vm_page_xunbusy(m);
++}
++
+diff --git a/kern.rust.mk b/kern.rust.mk
+index 1fe4d9b..4ede8b6 100644
+--- a/kern.rust.mk
++++ b/kern.rust.mk
+@@ -223,6 +223,7 @@ RUST_KPI_SOURCES= \
+ 	${SRCTOP}/sys/rust/kpi/src/file.rs \
+ 	${SRCTOP}/sys/rust/kpi/src/event.rs \
+ 	${SRCTOP}/sys/rust/kpi/src/vmem.rs \
++	${SRCTOP}/sys/rust/kpi/src/pager.rs \
+ 
+ BINDINGS_RS= bindings.rs
+ 
+diff --git a/kpi/src/lib.rs b/kpi/src/lib.rs
+index bcae6e3..0820ffb 100644
+--- a/kpi/src/lib.rs
++++ b/kpi/src/lib.rs
+@@ -110,6 +110,9 @@ pub mod vec;
+ pub mod usercopy;
+ /// vmem(9) resource arenas
+ pub mod vmem;
++/// managed device pagers (d_mmap_single objects the driver can revoke)
++#[macro_use]
++pub mod pager;
+ 
+ const _VERSION_CHECK: () = {
+     if bindings::__FreeBSD_version / 100000 != 16 {
+diff --git a/kpi/src/pager.rs b/kpi/src/pager.rs
+new file mode 100644
+index 0000000..6b181fd
+--- /dev/null
++++ b/kpi/src/pager.rs
+@@ -0,0 +1,251 @@
++/*-
++ * SPDX-License-Identifier: BSD-2-Clause
++ *
++ * Copyright (c) 2026 The Atrium Authors
++ *
++ * Redistribution and use in source and binary forms, with or without
++ * modification, are permitted provided that the following conditions
++ * are met:
++ * 1. Redistributions of source code must retain the above copyright
++ *    notice, this list of conditions and the following disclaimer.
++ * 2. Redistributions in binary form must reproduce the above copyright
++ *    notice, this list of conditions and the following disclaimer in the
++ *    documentation and/or other materials provided with the distribution.
++ *
++ * THIS SOFTWARE IS PROVIDED BY THE AUTHOR AND CONTRIBUTORS ``AS IS'' AND
++ * ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
++ * IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
++ * ARE DISCLAIMED.  IN NO EVENT SHALL THE AUTHOR OR CONTRIBUTORS BE LIABLE
++ * FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL
++ * DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS
++ * OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION)
++ * HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT
++ * LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY
++ * OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF
++ * SUCH DAMAGE.
++ */
++
++//! Managed device pagers (`OBJT_MGTDEVICE`): VM objects whose pages are a device's
++//! fictitious pages, handed to `d_mmap_single`, and taken back out of every mapping when the
++//! driver says so (`cdev_mgtdev_pager_free_pages`).
++//!
++//! A pager's handle is a `Box<T>` owned by the object: it is freed by the pager's destructor
++//! when the last reference to the object goes. The handle only chooses *which* physical
++//! address backs a fault; the fault path here refuses anything that is not a registered
++//! fictitious page (device memory) or that is already in another object, so a wrong answer
++//! from a handle cannot map ordinary RAM or steal a page from another mapping.
++
++use crate::bindings::{self, ucred, vm_object, vm_object_t, vm_ooffset_t, vm_page_t};
++use crate::boxed::Box;
++use crate::prelude::*;
++use core::ffi::{c_int, c_void};
++use core::marker::PhantomData;
++use core::mem::MaybeUninit;
++use core::ptr::NonNull;
++
++/// What a managed device pager's handle decides.
++pub trait MgtDevHandle: Send + Sync + Sized + 'static {
++    /// The physical address of the fictitious page to map at `offset` (page aligned within
++    /// the object), or `None` to fail the fault, which the faulting thread sees as SIGBUS.
++    /// Called with the object write-locked, so state that [`VmObject::lock`] guards is stable.
++    fn fault(&self, offset: u64, prot: c_int) -> Option<u64>;
++}
++
++/// A pager ops table. Made by [`mgtdev_pager!`] only.
++pub struct PagerOps(pub bindings::cdev_pager_ops);
++
++// SAFETY: function pointers only.
++unsafe impl Sync for PagerOps {}
++
++/// A [`MgtDevHandle`] with its ops table.
++///
++/// # Safety
++///
++/// `ops()` returns the table [`mgtdev_pager!`] made for this type, whose destructor frees a
++/// `Box<Self>` and whose fault handler reads the handle as `Self`.
++pub unsafe trait MgtDevPager: MgtDevHandle {
++    fn ops() -> &'static PagerOps;
++}
++
++/// Define the pager ops table of a [`MgtDevHandle`] type.
++#[macro_export]
++macro_rules! mgtdev_pager {
++    ($ty:ty) => {
++        const _: () = {
++            static OPS: $crate::pager::PagerOps = $crate::pager::PagerOps($crate::pager::mgtdev_ops::<$ty>());
++            // SAFETY: OPS is this type's own table.
++            unsafe impl $crate::pager::MgtDevPager for $ty {
++                fn ops() -> &'static $crate::pager::PagerOps {
++                    &OPS
++                }
++            }
++        };
++    };
++}
++
++/// The ops [`mgtdev_pager!`] installs for `T`.
++pub const fn mgtdev_ops<T: MgtDevHandle>() -> bindings::cdev_pager_ops {
++    // SAFETY: function pointers (None) and nothing else; all-zero is valid.
++    let mut ops: bindings::cdev_pager_ops = unsafe { MaybeUninit::zeroed().assume_init() };
++    ops.cdev_pg_ctor = Some(ctor_trampoline);
++    ops.cdev_pg_dtor = Some(dtor_trampoline::<T>);
++    ops.cdev_pg_fault = Some(fault_trampoline::<T>);
++    ops
++}
++
++unsafe extern "C" fn ctor_trampoline(
++    _handle: *mut c_void,
++    _size: vm_ooffset_t,
++    _prot: bindings::vm_prot_t,
++    _foff: vm_ooffset_t,
++    _cred: *mut ucred,
++    color: *mut u16,
++) -> c_int {
++    // SAFETY: the pager passes a colour to fill.
++    unsafe { *color = 0 };
++    0
++}
++
++unsafe extern "C" fn dtor_trampoline<T: MgtDevHandle>(handle: *mut c_void) {
++    // SAFETY: the handle is the Box<T> `VmObject::mgtdev` gave the object, and the destructor
++    // runs once, when the object's last reference is gone.
++    drop(unsafe { Box::<T>::from_raw(handle.cast::<T>()) });
++}
++
++unsafe extern "C" fn fault_trampoline<T: MgtDevHandle>(
++    obj: vm_object_t,
++    offset: vm_ooffset_t,
++    prot: c_int,
++    mres: *mut vm_page_t,
++) -> c_int {
++    // VM_PAGER_ERROR, never VM_PAGER_FAIL: FAIL means "no page here" and vm_fault would
++    // quietly zero-fill an anonymous page in the device page's place.
++    const ERR: c_int = bindings::VM_PAGER_ERROR as c_int;
++    // SAFETY: the VM calls this with the object write-locked, and the object's handle is the
++    // live Box<T> (it is freed only by the destructor, after the last reference).
++    unsafe {
++        bindings::rust_bindings_vm_object_assert_wlocked(obj);
++        let h = &*(*obj).handle.cast::<T>();
++        let Some(pa) = h.fault(offset as u64, prot) else {
++            return ERR;
++        };
++        let page = bindings::PHYS_TO_VM_PAGE(pa as _);
++        // Device memory only, and only a page no other object holds: refuse rather than steal.
++        if page.is_null()
++            || ((*page).flags as c_int & bindings::PG_FICTITIOUS as c_int) == 0
++            || !(*page).object.is_null()
++        {
++            return ERR;
++        }
++        let pidx = (offset as u64) >> bindings::PAGE_SHIFT;
++        bindings::vm_page_busy_acquire(page, 0);
++        bindings::vm_page_valid(page);
++        if !(*mres).is_null() {
++            bindings::vm_page_replace(page, obj, pidx as _, *mres);
++        } else if bindings::vm_page_insert(page, obj, pidx as _) != 0 {
++            bindings::rust_bindings_vm_page_xunbusy(page);
++            return ERR;
++        }
++        *mres = page;
++    }
++    bindings::VM_PAGER_OK as c_int
++}
++
++/// One reference to a VM object. Cloning takes another; dropping gives it back.
++pub struct VmObject<T> {
++    obj: NonNull<vm_object>,
++    _t: PhantomData<T>,
++}
++
++// SAFETY: VM objects are reference-counted and locked by the VM system; T is Send + Sync.
++unsafe impl<T: MgtDevPager> Send for VmObject<T> {}
++unsafe impl<T: MgtDevPager> Sync for VmObject<T> {}
++
++impl<T: MgtDevPager> VmObject<T> {
++    /// A new managed device pager object of `size` bytes whose faults `handle` answers.
++    pub fn mgtdev(handle: Box<T>, size: u64, prot: c_int, cred: *mut ucred) -> Result<Self> {
++        let raw = Box::into_raw(handle);
++        // SAFETY: a unique handle (a fresh allocation), so the pager makes a new object; the
++        // ops table frees the handle when that object dies.
++        let obj = unsafe {
++            bindings::cdev_pager_allocate(
++                raw.cast(),
++                bindings::OBJT_MGTDEVICE as _,
++                &T::ops().0,
++                size as _,
++                prot as _,
++                0,
++                cred,
++            )
++        };
++        match NonNull::new(obj) {
++            Some(obj) => Ok(VmObject { obj, _t: PhantomData }),
++            None => {
++                // The constructor never ran, so neither will the destructor: free it here.
++                // SAFETY: `raw` came from Box::into_raw above and nothing else holds it.
++                drop(unsafe { Box::<T>::from_raw(raw) });
++                Err(ENOMEM)
++            }
++        }
++    }
++
++    /// The handle.
++    pub fn handle(&self) -> &T {
++        // SAFETY: a mgtdev object of this type; the handle lives as long as the object, and
++        // we hold a reference to the object.
++        unsafe { &*self.obj.as_ref().handle.cast::<T>() }
++    }
++
++    /// Write-lock the object: faults on it wait until the guard drops.
++    pub fn lock(&self) -> ObjectGuard<'_, T> {
++        unsafe { bindings::rust_bindings_vm_object_wlock(self.obj.as_ptr()) };
++        ObjectGuard(self)
++    }
++
++    /// Remove every page of the object from every mapping and from the object, so the next
++    /// access faults again. Must not be called with the object locked.
++    pub fn free_pages(&self) {
++        unsafe { bindings::cdev_mgtdev_pager_free_pages(self.obj.as_ptr()) };
++    }
++
++    /// Give up this reference to a caller that will `vm_object_deallocate` it (for example the
++    /// object out-parameter of `d_mmap_single`).
++    pub fn into_raw(self) -> vm_object_t {
++        let p = self.obj.as_ptr();
++        core::mem::forget(self);
++        p
++    }
++
++    /// Take back a reference made by [`into_raw`](Self::into_raw).
++    ///
++    /// # Safety
++    ///
++    /// `obj` is a reference to a [`VmObject::mgtdev`] object of type `T`, given up by
++    /// `into_raw` and not used since.
++    pub unsafe fn from_raw(obj: vm_object_t) -> Self {
++        VmObject { obj: unsafe { NonNull::new_unchecked(obj) }, _t: PhantomData }
++    }
++}
++
++impl<T> Clone for VmObject<T> {
++    fn clone(&self) -> Self {
++        unsafe { bindings::vm_object_reference(self.obj.as_ptr()) };
++        VmObject { obj: self.obj, _t: PhantomData }
++    }
++}
++
++impl<T> Drop for VmObject<T> {
++    fn drop(&mut self) {
++        // The pager destructor (and so the handle's drop) runs if this was the last reference.
++        unsafe { bindings::vm_object_deallocate(self.obj.as_ptr()) };
++    }
++}
++
++/// The object's write lock, held.
++pub struct ObjectGuard<'a, T>(&'a VmObject<T>);
++
++impl<T> Drop for ObjectGuard<'_, T> {
++    fn drop(&mut self) {
++        unsafe { bindings::rust_bindings_vm_object_wunlock(self.0.obj.as_ptr()) };
++    }
++}
+-- 
+2.43.0
+

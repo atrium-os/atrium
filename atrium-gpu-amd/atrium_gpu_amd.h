@@ -698,13 +698,6 @@ struct atrium_amd_reset_hooks {
 
 struct atrium_amd_client;	/* one open of the client node (rs/ioctl.rs) */
 
-/* One doorbell mapping grant: the pager handle of one owner's mapping. */
-struct atrium_amd_db_grant {
-	struct atrium_amd_softc *sc;
-	vm_paddr_t	 pa;		/* the doorbell page */
-	int		 revoked;	/* set under the pager object's lock */
-};
-
 struct atrium_amd_hwq {
 	struct sx	 lock;		/* program + doorbell + ownership */
 	uint32_t	 qid;
@@ -715,8 +708,8 @@ struct atrium_amd_hwq {
 	uint64_t	 gen;		/* bumped by every program and dequeue */
 	struct atrium_amd_client *owner; /* user-mode owner, NULL = kernel */
 	struct atrium_amd_vm *owner_vm;
-	struct atrium_amd_db_grant *grant;
-	vm_object_t	 grant_obj;	/* our reference on the grant's object */
+	vm_object_t	 grant_obj;	/* our reference on the doorbell grant
+					 * (rs/doorbell.rs), NULL = none */
 };
 
 /*
