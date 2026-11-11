@@ -711,6 +711,11 @@ pub mod daemon {
         /// (OP_WM_SPAN_GROUP), or end the span (no members); the reply is
         /// the rect the window must cover. EV_DISPLAY_CHANGED follows.
         fn span_group(&mut self, p: fresco_protocol::WmSpanGroupPayload) -> io::Result<WmRect>;
+        /// Every gamepad and the window holding each (OP_WM_PADS).
+        fn pads(&mut self) -> io::Result<Vec<fresco_protocol::WmPad>>;
+        /// Take a pad back from its holder, 0 every held one
+        /// (OP_WM_PAD_RELEASE, fresco-capabilities.md §4).
+        fn pad_release(&mut self, device_id: u32) -> io::Result<()>;
     }
 
     /// A window spanning a group of monitors, as frescod granted it.
@@ -1731,6 +1736,27 @@ pub mod control {
                 Ok(None) => Reply::Err { message: "nothing to move, or only one monitor".into() },
                 Err(e) => Reply::Err { message: e.to_string() },
             },
+            // The controller menu (fresco-capabilities.md §4): which app
+            // holds each pad, by its window's owner.
+            Intent::ListPads => match (conn.pads(), conn.enumerate()) {
+                (Ok(pads), Ok(surfaces)) => Reply::Pads {
+                    pads: pads
+                        .into_iter()
+                        .map(|pad| {
+                            let held_by_app = match pad.held_by {
+                                0 => String::new(),
+                                w => surfaces.iter().find(|s| s.surface_id == w).map_or_else(|| format!("window {w}"), |s| s.owner_app.clone()),
+                            };
+                            forum_ctl::PadInfo { pad, held_by_app }
+                        })
+                        .collect(),
+                },
+                (Err(e), _) | (_, Err(e)) => Reply::Err { message: e.to_string() },
+            },
+            Intent::TakeBackPad { device_id } => match conn.pad_release(device_id) {
+                Ok(()) => Reply::Ack,
+                Err(e) => Reply::Err { message: e.to_string() },
+            },
             // frescod validates the mode against the monitor's list; the WM
             // re-lays out when frescod's EV_DISPLAY_CHANGED arrives, not here,
             // so a refused or failed switch leaves the layout alone.
@@ -1940,8 +1966,22 @@ mod tests {
         mirrored: Vec<(u64, u64)>,
         appearance: Option<fresco_protocol::AppearancePayload>,
         spans: Vec<fresco_protocol::WmSpanGroupPayload>,
+        pads: Vec<fresco_protocol::WmPad>,
+        released: Vec<u32>,
     }
     impl FrescoConn for MockConn {
+        fn pads(&mut self) -> io::Result<Vec<fresco_protocol::WmPad>> {
+            Ok(self.pads.clone())
+        }
+        fn pad_release(&mut self, device_id: u32) -> io::Result<()> {
+            self.released.push(device_id);
+            for p in &mut self.pads {
+                if device_id == 0 || p.device_id == device_id {
+                    p.held_by = 0;
+                }
+            }
+            Ok(())
+        }
         fn span_group(&mut self, p: fresco_protocol::WmSpanGroupPayload) -> io::Result<fresco_protocol::WmRect> {
             let rects: Vec<fresco_protocol::WmRect> =
                 p.members.iter().filter_map(|id| self.outputs.iter().find(|o| o.identity == *id)).map(|o| o.rect).collect();
@@ -2564,6 +2604,24 @@ mod tests {
         wm.set_outputs(&mut conn, vec![mon(1, 20, 0, 2560, 1440), mon(0, 10, 2560, 1920, 1080)]).unwrap();
         let r = slot(&wm.reconcile(&mut conn).unwrap(), 1).unwrap();
         assert!(r.x >= 2560, "window 1 stayed on monitor 10: {r:?}");
+    }
+
+    #[test]
+    fn the_controller_menu_lists_pads_and_takes_one_back() {
+        let mut wm = Wm::new(screen());
+        let mut conn = MockConn::default();
+        let mut game = surf(5, WmRole::Document);
+        game.owner_app = "org.test.game".into();
+        conn.surfaces = vec![game, surf(6, WmRole::Document)];
+        let pad = |id, held_by| fresco_protocol::WmPad { device_id: id, name: "Pad".into(), vendor: 1, product: 2, window_id: held_by, held_by };
+        conn.pads = vec![pad(1, 5), pad(2, 0), pad(3, 9)];
+        let Reply::Pads { pads } = handle_intent(&mut wm, &mut conn, Intent::ListPads) else { panic!() };
+        let apps: Vec<&str> = pads.iter().map(|p| p.held_by_app.as_str()).collect();
+        assert_eq!(apps, ["org.test.game", "", "window 9"]);
+        assert_eq!(handle_intent(&mut wm, &mut conn, Intent::TakeBackPad { device_id: 1 }), Reply::Ack);
+        assert_eq!(conn.released, [1]);
+        let Reply::Pads { pads } = handle_intent(&mut wm, &mut conn, Intent::ListPads) else { panic!() };
+        assert_eq!(pads[0].held_by_app, "");
     }
 
     #[test]

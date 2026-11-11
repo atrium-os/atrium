@@ -12,7 +12,7 @@
 
 use serde::{Deserialize, Serialize};
 
-pub use fresco_protocol::{WmDisplayMode, WmOutput, WmSurfaceInfo};
+pub use fresco_protocol::{WmDisplayMode, WmOutput, WmPad, WmSurfaceInfo};
 
 /// Where one monitor goes relative to another ([`Intent::PlaceOutput`]).
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -108,6 +108,22 @@ pub enum Intent {
     /// "Move the picture-in-picture window to this corner" (a drag on it
     /// ends as this; atrium-player-pip-keys.md §3.2). Remembered.
     PipCorner { corner: Corner },
+    /// "Which gamepads are there, and which app holds each?" — the
+    /// controller menu (fresco-capabilities.md §4). Read-only.
+    ListPads,
+    /// "Take pad `device_id` back from the app holding it" (0: every held
+    /// pad): the user's override of an exclusive claim. The pad follows
+    /// focus again; the app is told it lost the claim.
+    TakeBackPad { device_id: u32 },
+}
+
+/// A gamepad as the controller menu shows it.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PadInfo {
+    pub pad: WmPad,
+    /// The app holding it exclusively (its registry id, or its window's
+    /// owner as frescod reports it); empty when nobody holds it.
+    pub held_by_app: String,
 }
 
 /// A corner of the work area, for picture-in-picture.
@@ -149,6 +165,8 @@ pub enum Reply {
     /// This set's span groups, the window spanning one now (0: none), and
     /// the apps that don't span — answer to `ListSpanGroups`.
     SpanGroups { groups: Vec<SpanGroupInfo>, spanning: u32, no_span: Vec<String> },
+    /// Every gamepad — answer to `ListPads`.
+    Pads { pads: Vec<PadInfo> },
 }
 
 /// Encode a message for the wire.

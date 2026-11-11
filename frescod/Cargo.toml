@@ -60,6 +60,8 @@ atrium-gpu-rs       = { path = "../atrium-gpu-rs" }
 atrium-devevents    = { path = "../atrium-devevents" }
 # Input from tactusd (docs/spec/atrium-input.md): the wire types.
 tactus              = { path = "../tactus" }
+# The Guide button by the standard mapping, for the claim override.
+pergola-gamepad     = { path = "../pergola-gamepad" }
 fresco-scene-server = { path = "../fresco-scene-server" }
 fresco-vulkan       = { path = "../fresco-vulkan" }
 fresco-compute      = { path = "../fresco-compute" }

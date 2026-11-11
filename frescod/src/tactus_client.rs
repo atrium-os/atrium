@@ -105,6 +105,62 @@ struct Pads {
     claims: std::collections::BTreeMap<u32, u32>,
     /// The pad that sent input last; a claim of device 0 takes it.
     recent: Option<u32>,
+    /// Claimed pads whose Guide button is down, with the press's number:
+    /// held [`GUIDE_HOLD`], it takes the pad back (§4).
+    guide_down: std::collections::BTreeMap<u32, u64>,
+    presses: u64,
+}
+
+/// How long the Guide button is held to take a claimed pad back
+/// (`FRESCOD_GUIDE_HOLD_MS`, default 1000).
+fn guide_hold() -> Duration {
+    let ms = std::env::var("FRESCOD_GUIDE_HOLD_MS").ok().and_then(|s| s.parse().ok()).unwrap_or(1000u64);
+    Duration::from_millis(ms.clamp(200, 10_000))
+}
+
+/// The usages that are a pad's Guide (Xbox, PS, Home) button: the one its
+/// standard mapping names (pergola-gamepad, as apps see it), and the HID
+/// System Main Menu and AC Home usages some pads send for it.
+fn guide_usages(vendor: u16, product: u16) -> Vec<u32> {
+    let mut v = pergola_gamepad::Mapping::for_device(vendor, product).usages_of(pergola_gamepad::Button::Guide);
+    v.extend([0x0001_0085, 0x000c_0223]);
+    v
+}
+
+/// Every pad and who holds it, for the WM (`OP_WM_PADS`).
+pub fn wm_pads() -> Vec<fresco_protocol::WmPad> {
+    let active = ACTIVE.lock().unwrap().clone();
+    let Some((pads, _, _)) = active else { return Vec::new() };
+    let pads = pads.lock().unwrap();
+    pads.map
+        .iter()
+        .map(|(&id, p)| fresco_protocol::WmPad {
+            device_id: id,
+            name: p.name.clone(),
+            vendor: p.vendor,
+            product: p.product,
+            window_id: p.owner.unwrap_or(0),
+            held_by: pads.claims.get(&id).copied().unwrap_or(0),
+        })
+        .collect()
+}
+
+/// The user takes pad `device` (0: every claimed pad) back from the window
+/// holding it (`OP_WM_PAD_RELEASE`, from Forum's controller menu).
+pub fn take_back(device: u32) {
+    let active = ACTIVE.lock().unwrap().clone();
+    if let Some((pads, sink, comp)) = active {
+        pads.lock().unwrap().take_back(&sink, &comp, device, "the controller menu");
+    }
+}
+
+/// Guide press number `press` on pad `device` began [`guide_hold`] ago: if
+/// it is still down, the pad goes back to following focus.
+fn guide_held(device: u32, press: u64) {
+    let active = ACTIVE.lock().unwrap().clone();
+    if let Some((pads, sink, comp)) = active {
+        pads.lock().unwrap().guide_expired(&sink, &comp, device, press);
+    }
 }
 
 /// The connected seat's pads and where its events go, for claims.
@@ -151,6 +207,35 @@ fn pad_target(claims: &std::collections::BTreeMap<u32, u32>, id: u32, comp: &Mut
 }
 
 impl Pads {
+    /// See [`take_back`]: the holder gets releases and `DISCONNECT` (if
+    /// focus is elsewhere), then `EV_GAMEPAD_CLAIM` 0.
+    fn take_back(&mut self, sink: &Sender<DisplayEvent>, comp: &Mutex<Compositor>, device: u32, how: &str) {
+        let ended: Vec<(u32, u32)> = self.claims.iter().filter(|&(&d, _)| device == 0 || d == device).map(|(&d, &w)| (d, w)).collect();
+        for &(dev, window) in &ended {
+            self.claims.remove(&dev);
+            eprintln!("frescod: pad {dev} taken back from window {window} by {how}");
+        }
+        for &(dev, _) in &ended {
+            let target = pad_target(&self.claims, dev, comp);
+            if let Some(p) = self.map.get_mut(&dev) {
+                if p.owner.is_some() {
+                    pad_follow(sink, dev, p, target);
+                }
+            }
+        }
+        for (dev, window) in ended {
+            let _ = sink.send(DisplayEvent::Gamepad { window_id: window, kind: control::EV_GAMEPAD_CLAIM, device_id: dev, usage: 0, value: 0 });
+        }
+    }
+
+    /// See [`guide_held`].
+    fn guide_expired(&mut self, sink: &Sender<DisplayEvent>, comp: &Mutex<Compositor>, device: u32, press: u64) {
+        if self.guide_down.get(&device) == Some(&press) {
+            self.guide_down.remove(&device);
+            self.take_back(sink, comp, device, "a long press on Guide");
+        }
+    }
+
     /// See [`caps_changed`].
     fn regrant(&mut self, sink: &Sender<DisplayEvent>, comp: &Mutex<Compositor>, client: u8, caps: crate::caps::Caps) {
         let mut ended = Vec::new();
@@ -240,6 +325,8 @@ struct Pad {
     held: Vec<u32>,
     /// Every axis's last value.
     state: Vec<(u32, i16)>,
+    /// Its Guide button's usages ([`guide_usages`]).
+    guide: Vec<u32>,
 }
 
 fn wire_phase(p: Phase) -> u8 {
@@ -294,7 +381,8 @@ impl Seat {
             Message::Device { id, bus, classes, name, vendor, product } => {
                 eprintln!("frescod: input device {id} {name:?} ({bus:?}, {classes:?})");
                 if classes.iter().any(|c| matches!(c, tactus::wire::Class::Gamepad | tactus::wire::Class::Joystick)) {
-                    self.pads.lock().unwrap().map.insert(id, Pad { name, vendor, product, ..Pad::default() });
+                    let guide = guide_usages(vendor, product);
+                    self.pads.lock().unwrap().map.insert(id, Pad { name, vendor, product, guide, ..Pad::default() });
                 }
             }
             Message::PadLayout { id, buttons, axes } => {
@@ -311,6 +399,21 @@ impl Seat {
                 let mut pads = self.pads.lock().unwrap();
                 let target = pad_target(&pads.claims, id, comp);
                 pads.recent = Some(id);
+                // The user's override: Guide held on a claimed pad (§4).
+                if pads.map.get(&id).is_some_and(|p| p.guide.contains(&usage)) {
+                    if down && pads.claims.contains_key(&id) {
+                        pads.presses += 1;
+                        let press = pads.presses;
+                        pads.guide_down.insert(id, press);
+                        let hold = guide_hold();
+                        let _ = std::thread::Builder::new().name("frescod-guide".into()).spawn(move || {
+                            std::thread::sleep(hold);
+                            guide_held(id, press);
+                        });
+                    } else if !down {
+                        pads.guide_down.remove(&id);
+                    }
+                }
                 let Some(p) = pads.map.get_mut(&id) else { return };
                 pad_follow(sink, id, p, target);
                 let Some(window_id) = p.owner else { return };
@@ -467,6 +570,7 @@ impl Seat {
                 eprintln!("frescod: input device {id} gone");
                 let mut pads = self.pads.lock().unwrap();
                 pads.claims.remove(&id);
+                pads.guide_down.remove(&id);
                 if pads.recent == Some(id) {
                     pads.recent = None;
                 }
@@ -785,6 +889,103 @@ mod tests {
         seat.handle(Message::Gone { id: 7 }, &tx, &comp);
         assert_eq!(ev(&rx), vec![(a, control::EV_GAMEPAD_DISCONNECT, 0)]);
         assert!(seat.pads.lock().unwrap().claims.is_empty());
+    }
+
+    /// fresco-capabilities.md §4: only the user takes a claimed pad back,
+    /// from Forum's controller menu (`OP_WM_PAD_RELEASE`) or by holding
+    /// Guide; either way the holder is told and the pad follows focus.
+    #[test]
+    fn the_user_takes_a_claimed_pad_back() {
+        use crate::caps::{self, Caps};
+        let comp = Arc::new(Mutex::new(Compositor::new()));
+        let (a, b) = {
+            let mut g = comp.lock().unwrap();
+            let a = g.create(13, (100, 100));
+            let b = g.create(14, (100, 100));
+            g.set_focus_no_raise(Some(a));
+            (u32::from(a), u32::from(b))
+        };
+        caps::set(13, Caps::GAMEPAD.union(Caps::GAMEPAD_EXCLUSIVE));
+        caps::set(14, Caps::GAMEPAD);
+        let (tx, rx) = channel();
+        let mut seat = Seat::default();
+        let ev = |rx: &std::sync::mpsc::Receiver<DisplayEvent>| -> Vec<(u32, u16, i32)> {
+            rx.try_iter()
+                .map(|e| match e {
+                    DisplayEvent::GamepadConnect { window_id, .. } => (window_id, control::EV_GAMEPAD_CONNECT, 0),
+                    DisplayEvent::Gamepad { window_id, kind, value, .. } => (window_id, kind, value),
+                    e => panic!("{e:?}"),
+                })
+                .collect()
+        };
+        let focus = |w: u32| comp.lock().unwrap().set_focus_no_raise(Some(w as u16));
+        // A generic pad: Guide is button 17.
+        const GUIDE: u32 = 0x0009_0011;
+        let dev = Message::Device { id: 9, bus: tactus::wire::Bus::Usb, classes: vec![tactus::wire::Class::Gamepad], vendor: 1, product: 2, name: "pad".into() };
+        seat.handle(dev, &tx, &comp);
+        seat.handle(Message::PadLayout { id: 9, buttons: vec![0x0009_0001, GUIDE], axes: vec![] }, &tx, &comp);
+        let pads = seat.pads.clone();
+        let claim = || pads.lock().unwrap().claim(&tx, &comp, 13, caps::of(13), a, 9, true);
+        claim();
+        assert_eq!(ev(&rx), vec![(a, control::EV_GAMEPAD_CONNECT, 0), (a, control::EV_GAMEPAD_CLAIM, 1)]);
+        focus(b);
+        seat.pads_follow(&tx, &comp);
+        // Nothing claimed elsewhere: taking back pad 3 does nothing.
+        pads.lock().unwrap().take_back(&tx, &comp, 3, "test");
+        assert!(ev(&rx).is_empty());
+        // The menu takes it back (0: every claimed pad) while a holds button 1.
+        seat.handle(Message::PadButton { id: 9, ts_ns: 0, usage: 0x0009_0001, down: true }, &tx, &comp);
+        assert_eq!(ev(&rx), vec![(a, control::EV_GAMEPAD_BUTTON, 1)]);
+        pads.lock().unwrap().take_back(&tx, &comp, 0, "test");
+        assert_eq!(
+            ev(&rx),
+            vec![
+                (a, control::EV_GAMEPAD_BUTTON, 0),
+                (a, control::EV_GAMEPAD_DISCONNECT, 0),
+                (b, control::EV_GAMEPAD_CONNECT, 0),
+                (a, control::EV_GAMEPAD_CLAIM, 0),
+            ]
+        );
+        seat.handle(Message::PadButton { id: 9, ts_ns: 0, usage: 0x0009_0001, down: false }, &tx, &comp);
+        assert!(ev(&rx).is_empty(), "b never saw the press, so gets no release");
+        // Claimed again, and listed for the WM as held by a.
+        focus(a);
+        seat.pads_follow(&tx, &comp);
+        claim();
+        let _ = ev(&rx);
+        focus(b);
+        seat.pads_follow(&tx, &comp);
+        assert_eq!(pads.lock().unwrap().claims.get(&9), Some(&a));
+        // A short Guide press does not take it back; the holder gets it.
+        let mut press = |down| seat.handle(Message::PadButton { id: 9, ts_ns: 0, usage: GUIDE, down }, &tx, &comp);
+        press(true);
+        let first = *pads.lock().unwrap().guide_down.get(&9).expect("guide timed");
+        press(false);
+        pads.lock().unwrap().guide_expired(&tx, &comp, 9, first);
+        assert_eq!(ev(&rx), vec![(a, control::EV_GAMEPAD_BUTTON, 1), (a, control::EV_GAMEPAD_BUTTON, 0)]);
+        // Held past the time: taken back.
+        press(true);
+        let second = *pads.lock().unwrap().guide_down.get(&9).expect("guide timed");
+        assert_ne!(first, second);
+        pads.lock().unwrap().guide_expired(&tx, &comp, 9, first);
+        assert_eq!(ev(&rx), vec![(a, control::EV_GAMEPAD_BUTTON, 1)], "a stale timer does nothing");
+        pads.lock().unwrap().guide_expired(&tx, &comp, 9, second);
+        assert_eq!(
+            ev(&rx),
+            vec![
+                (a, control::EV_GAMEPAD_BUTTON, 0),
+                (a, control::EV_GAMEPAD_DISCONNECT, 0),
+                (b, control::EV_GAMEPAD_CONNECT, 0),
+                (a, control::EV_GAMEPAD_CLAIM, 0),
+            ]
+        );
+        press(false);
+        assert!(ev(&rx).is_empty());
+        assert!(pads.lock().unwrap().claims.is_empty());
+        // Guide on a pad nobody holds is just a button.
+        press(true);
+        assert!(pads.lock().unwrap().guide_down.is_empty());
+        assert_eq!(ev(&rx), vec![(b, control::EV_GAMEPAD_BUTTON, 1)]);
     }
 
     #[test]

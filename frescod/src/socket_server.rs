@@ -232,6 +232,13 @@ pub static DRAG_BEGIN: std::sync::OnceLock<DragBeginFn> = std::sync::OnceLock::n
 pub type PadClaimFn = Box<dyn Fn(u8, &fresco_protocol::PadClaim) + Send + Sync>;
 pub static PAD_CLAIM: std::sync::OnceLock<PadClaimFn> = std::sync::OnceLock::new();
 
+/// The WM's override of exclusive claims (fresco-capabilities.md §4), set
+/// by frescod where the pads are: list them (`OP_WM_PADS`), and take one
+/// back (`OP_WM_PAD_RELEASE`). Unset (a renderer, which has no WM socket):
+/// no pads.
+pub static WM_PADS: std::sync::OnceLock<fn() -> Vec<fresco_protocol::WmPad>> = std::sync::OnceLock::new();
+pub static WM_PAD_RELEASE: std::sync::OnceLock<fn(u32)> = std::sync::OnceLock::new();
+
 /// Who an event goes to (threat model §2.5.2 "input splits the same way").
 /// Every event names a window. It reaches that window's owner and the WM
 /// (TCB) only: a client never sees another client's keystrokes, pointer
@@ -658,6 +665,28 @@ pub fn reader_loop(
             if let (Ok(c), Some(f)) = (fresco_protocol::decode::<fresco_protocol::PadClaim>(&msg.payload), PAD_CLAIM.get()) {
                 f(client_id, &c);
             }
+            continue;
+        }
+
+        /* The user's override of exclusive pad claims, from the WM only
+         * (reaching the WM socket is the grant, as for every OP_WM_*). */
+        if wm_grant && msg.op == fresco_protocol::control::OP_WM_PADS {
+            let pads = WM_PADS.get().map(|f| f()).unwrap_or_default();
+            let payload = fresco_protocol::encode(&fresco_protocol::WmPadsReply { pads }).unwrap_or_default();
+            let _ = out.send(Outbound { op: msg.op, flags: flag::IS_RESPONSE, payload, fds: Vec::new() });
+            continue;
+        }
+        if wm_grant && msg.op == fresco_protocol::control::OP_WM_PAD_RELEASE {
+            let reply = match fresco_protocol::decode::<fresco_protocol::WmPadRelease>(&msg.payload) {
+                Ok(r) => {
+                    if let Some(f) = WM_PAD_RELEASE.get() {
+                        f(r.device_id);
+                    }
+                    Outbound { op: msg.op, flags: flag::IS_RESPONSE, payload: Vec::new(), fds: Vec::new() }
+                }
+                Err(_) => error_reply(msg.op, &DispatchError::BadPayload),
+            };
+            let _ = out.send(reply);
             continue;
         }
 

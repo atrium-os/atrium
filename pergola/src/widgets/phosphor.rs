@@ -44,3 +44,4 @@ pub const IMAGE: char = '\u{e2ca}';
 pub const FILE_PDF: char = '\u{e702}';
 pub const CLOCK: char = '\u{e19a}';
 pub const SLIDERS: char = '\u{e432}';
+pub const GAME_CONTROLLER: char = '\u{e26e}';

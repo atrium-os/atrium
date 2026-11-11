@@ -232,6 +232,13 @@ impl Mapping {
         self.buttons.insert(usage::DPAD_LEFT, Button::DpadLeft);
     }
 
+    /// The HID usages mapped to `button` (in usage order).
+    pub fn usages_of(&self, button: Button) -> Vec<u32> {
+        let mut v: Vec<u32> = self.buttons.iter().filter(|&(_, &b)| b == button).map(|(&u, _)| u).collect();
+        v.sort_unstable();
+        v
+    }
+
     /// Map HID usage `usage` to `button` (replacing what it was).
     pub fn set_button(&mut self, usage: u32, button: Button) -> &mut Self {
         self.buttons.insert(usage, button);

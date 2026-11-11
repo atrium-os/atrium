@@ -752,6 +752,22 @@ impl Connection {
         self.wm_response(control::OP_WM_SET_APPEARANCE).map(|_| ())
     }
 
+    /// Every gamepad and who holds each exclusively (WM only; `OP_WM_PADS`,
+    /// fresco-capabilities.md §4).
+    pub fn wm_pads(&mut self) -> io::Result<Vec<fresco_protocol::WmPad>> {
+        self.send_window_managed(control::OP_WM_PADS, &())?;
+        let m = self.wm_response(control::OP_WM_PADS)?;
+        let r: fresco_protocol::WmPadsReply = decode(&m.payload).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
+        Ok(r.pads)
+    }
+
+    /// Take pad `device_id` (0: every claimed pad) back from the window
+    /// holding it; it follows focus again (WM only; `OP_WM_PAD_RELEASE`).
+    pub fn wm_pad_release(&mut self, device_id: u32) -> io::Result<()> {
+        self.send_window_managed(control::OP_WM_PAD_RELEASE, &fresco_protocol::WmPadRelease { device_id })?;
+        self.wm_response(control::OP_WM_PAD_RELEASE).map(|_| ())
+    }
+
     /// Set a monitor's scale in thousandths (0 = automatic), by identity
     /// (WM only; `OP_WM_SET_OUTPUT_SCALE`).
     pub fn wm_set_output_scale(&mut self, identity: u64, scale_milli: u32) -> io::Result<()> {

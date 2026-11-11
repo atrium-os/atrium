@@ -101,6 +101,12 @@ impl FrescoConn for ClientConn {
     fn span_group(&mut self, p: fresco_protocol::WmSpanGroupPayload) -> io::Result<fresco_protocol::WmRect> {
         self.conn.wm_span_group(p.window_id, p.members, p.gaps_x, p.gaps_y)
     }
+    fn pads(&mut self) -> io::Result<Vec<fresco_protocol::WmPad>> {
+        self.conn.wm_pads()
+    }
+    fn pad_release(&mut self, device_id: u32) -> io::Result<()> {
+        self.conn.wm_pad_release(device_id)
+    }
 }
 
 

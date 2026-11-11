@@ -2,13 +2,16 @@
 //! gamepad and plays a fixed script on it, for the gamepad check
 //! (`GAMEPAD=1 scripts/vm-tactus-check.sh`, atrium-input.md §8 T5).
 //!
-//! Usage: fake-pad HID_SOCKET [PAUSE_SECONDS]
+//! Usage: fake-pad HID_SOCKET [PAUSE_SECONDS [guide]]
 //!
 //! Binds HID_SOCKET (tactusd's `TACTUS_BLUETOOTH_SOCKET`), waits for
 //! tactusd, attaches the pad, then: centred sticks; left stick right and
 //! button 1; release; hat right. Then it waits PAUSE_SECONDS (default 10;
 //! the check moves focus meanwhile), presses and releases button 2, and
-//! detaches the pad. Each step is printed.
+//! detaches the pad. Each step is printed. With `guide`, halfway through the
+//! pause it holds button 17 (the generic mapping's Guide) for 2.5 s: the
+//! user's long press that takes a claimed pad back
+//! (fresco-capabilities.md §4).
 
 use std::io::Write;
 use std::os::fd::AsRawFd;
@@ -18,8 +21,9 @@ use std::time::Duration;
 use vinculum_hid_wire as bt;
 
 /// Report id 1: four 16-bit sticks (X, Y, Rx, Ry), a 10-bit Z trigger,
-/// a 10-bit Simulation Brake, a 1..=8 hat, 15 buttons (tactus's
-/// `GAMEPAD_16BIT` test descriptor).
+/// a 10-bit Simulation Brake, a 1..=8 hat, 17 buttons (tactus's
+/// `GAMEPAD_16BIT` test descriptor, with buttons 16 and 17 added so that
+/// 17 is Guide as pergola-gamepad's generic mapping has it).
 const PAD: &[u8] = &[
     0x05, 0x01, 0x09, 0x05, 0xa1, 0x01, 0x85, 0x01, //
     0x09, 0x01, 0xa1, 0x00, 0x09, 0x30, 0x09, 0x31, 0x15, 0x00, 0x27, 0xff, 0xff, 0x00, 0x00, 0x75, 0x10, 0x95, 0x02,
@@ -33,18 +37,18 @@ const PAD: &[u8] = &[
     0x05, 0x01, 0x09, 0x39, 0x15, 0x01, 0x25, 0x08, 0x35, 0x00, 0x46, 0x3b, 0x01, 0x66, 0x14, 0x00, 0x75, 0x04, 0x95,
     0x01, 0x81, 0x42, //
     0x75, 0x04, 0x95, 0x01, 0x15, 0x00, 0x25, 0x00, 0x35, 0x00, 0x45, 0x00, 0x65, 0x00, 0x81, 0x03, //
-    0x05, 0x09, 0x19, 0x01, 0x29, 0x0f, 0x15, 0x00, 0x25, 0x01, 0x75, 0x01, 0x95, 0x0f, 0x81, 0x02, 0x75, 0x01, 0x95,
-    0x01, 0x81, 0x03, //
+    0x05, 0x09, 0x19, 0x01, 0x29, 0x11, 0x15, 0x00, 0x25, 0x01, 0x75, 0x01, 0x95, 0x11, 0x81, 0x02, 0x75, 0x01, 0x95,
+    0x07, 0x81, 0x03, //
     0xc0,
 ];
 
-fn report(lx: u16, hat: u8, buttons: u16) -> Vec<u8> {
+fn report(lx: u16, hat: u8, buttons: u32) -> Vec<u8> {
     let mut r = Vec::new();
     for v in [lx, 0x8000, 0x8000, 0x8000] {
         r.extend(v.to_le_bytes());
     }
     r.extend([0, 0, 0, 0, hat]);
-    r.extend(buttons.to_le_bytes());
+    r.extend(&buttons.to_le_bytes()[..3]);
     bt::packet(bt::ReportHeader { kind: bt::Kind::Input, report_id: 1, ts_ns: 0 }, &r)
 }
 
@@ -75,7 +79,17 @@ fn main() -> std::io::Result<()> {
     step(&mut pad, "release", report(0x8000, 0, 0))?;
     step(&mut pad, "hat right", report(0x8000, 3, 0))?;
     println!("fake-pad: pausing {pause} s");
-    std::thread::sleep(Duration::from_secs(pause));
+    if std::env::args().nth(3).as_deref() == Some("guide") {
+        std::thread::sleep(Duration::from_secs(pause / 2));
+        println!("fake-pad: guide held");
+        pad.write_all(&report(0x8000, 3, 1 << 16))?;
+        std::thread::sleep(Duration::from_millis(2500));
+        println!("fake-pad: guide released");
+        pad.write_all(&report(0x8000, 3, 0))?;
+        std::thread::sleep(Duration::from_secs(pause - pause / 2));
+    } else {
+        std::thread::sleep(Duration::from_secs(pause));
+    }
     step(&mut pad, "button 2", report(0x8000, 3, 2))?;
     step(&mut pad, "release", report(0x8000, 3, 0))?;
     std::thread::sleep(Duration::from_millis(1000));

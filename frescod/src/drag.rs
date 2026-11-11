@@ -138,6 +138,8 @@ pub fn observe(ev: &E, comp: &Arc<Mutex<Compositor>>, uid: impl Fn(u32) -> Optio
 pub fn install(comp: Arc<Mutex<Compositor>>) {
     // Gamepad claims are decided where the pads are (tactus_client).
     let _ = ss::PAD_CLAIM.set(Box::new(|client, c| crate::tactus_client::claim(client, c.window_id, c.device_id, c.claim)));
+    let _ = ss::WM_PADS.set(crate::tactus_client::wm_pads);
+    let _ = ss::WM_PAD_RELEASE.set(crate::tactus_client::take_back);
     use crate::socket_server as ss;
     let _ = ss::OBSERVE.set(|ev, comp| observe(ev, comp, |w| ss::window_owner_uid(w, comp)));
     let _ = ss::DRAG_BEGIN.set(Box::new(move |client, b| match begin(&comp, client, b) {

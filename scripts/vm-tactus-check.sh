@@ -50,6 +50,14 @@ CLAIM=${CLAIM:-0}
 # while window 1 holds the pad; the claim ends and the pad follows focus to
 # window 2 (§6).
 REVOKE=${REVOKE:-0}
+# TAKEBACK=1 (with CLAIM=1): the user takes the pad back from window 1 with
+# Forum's controller menu (forum-wm with forum-ctl take-back, the intent the
+# bar's "Take back" sends); the pad follows focus to window 2 (§4). Needs
+# FORUM_WM and FORUM_CTL (x86_64-unknown-freebsd builds) in the env.
+TAKEBACK=${TAKEBACK:-0}
+# GUIDE=1 (with CLAIM=1): the same by holding the pad's Guide button
+# (fake-pad holds button 17, the generic mapping's Guide, for 2.5 s).
+GUIDE=${GUIDE:-0}
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
 VMDIR=${VMDIR:-$HOME/atrium-vm-amd64}
 K="-i $HOME/.ssh/fresco_bsd_ed25519 -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR"
@@ -81,6 +89,10 @@ if [ "$GAMEPAD" = 1 ]; then
   scp -q $K -P 2222 "$FAKE_PAD" root@localhost:/root/t/fake-pad
   scp -q $K -P 2222 "$RENDERER" root@localhost:/root/t/fresco-renderer
 fi
+if [ "$TAKEBACK" = 1 ]; then
+  scp -q $K -P 2222 "$FORUM_WM" root@localhost:/root/t/forum-wm
+  scp -q $K -P 2222 "$FORUM_CTL" root@localhost:/root/t/forum-ctl
+fi
 
 echo "== commission tactusd (jailed, devfs ruleset 26)"
 V "CON=${CON:+/root/t/tactus-console} sh -s" <<'EOF'
@@ -111,7 +123,7 @@ ls -l /atrium/sockets/tactus/
 EOF
 
 echo "== frescod (headless) and the probe window"
-V "GAMEPAD=$GAMEPAD CLAIM=$CLAIM sh -s" <<'EOF'
+V "GAMEPAD=$GAMEPAD CLAIM=$CLAIM TAKEBACK=$TAKEBACK sh -s" <<'EOF'
 cd /root/t
 rm -rf /tmp/hl /tmp/frescod-t.log; mkdir -p /tmp/hl /atrium/sockets/fresco
 SPLIT="FRESCOD_SPLIT=0"
@@ -130,6 +142,11 @@ if [ "$CLAIM" = 1 ]; then
 fi
 daemon -f -o /tmp/frescod-t.log env FRESCOD_HEADLESS_PNG=/tmp/hl/f $SPLIT $CAPS FRESCOD_SOCK=/tmp/fresco-t.sock FRESCOD_WM_SOCK=/tmp/fresco-wm-t.sock ./frescod
 sleep 8
+if [ "$TAKEBACK" = 1 ]; then
+  pkill -x forum-wm; rm -f /tmp/forum-wm.log
+  daemon -f -o /tmp/forum-wm.log env FRESCO_WM_SOCKET=/tmp/fresco-wm-t.sock FORUM_CTL_SOCKET=/tmp/forum-ctl-t.sock ./forum-wm
+  sleep 4; head -3 /tmp/forum-wm.log
+fi
 grep -E "tactus|input" /tmp/frescod-t.log | head -5
 S=$(grep -o "/[^ ]*fresco[^ ]*\.sock" /tmp/frescod-t.log | head -1); [ -S /tmp/fresco-t.sock ] && S=/tmp/fresco-t.sock
 echo "  frescod socket $S"
@@ -139,12 +156,13 @@ EOF
 
 if [ "$GAMEPAD" = 1 ]; then
   echo "== gamepad: fake Bluetooth pad -> jailed tactusd -> split frescod -> windows"
-  V "REVOKE=$REVOKE sh -s" <<'EOF'
+  V "REVOKE=$REVOKE TAKEBACK=$TAKEBACK GUIDE=$GUIDE sh -s" <<'EOF'
 cd /root/t
 S=/tmp/fresco-t.sock
 mkdir -p /atrium/sockets/bluetooth-hid; chmod 0755 /atrium/sockets/bluetooth-hid
 rm -f /tmp/pad.log
-(umask 0; daemon -f -o /tmp/pad.log ./fake-pad /atrium/sockets/bluetooth-hid/hid.sock 25)
+MODE=""; [ "$GUIDE" = 1 ] && MODE=guide
+(umask 0; daemon -f -o /tmp/pad.log ./fake-pad /atrium/sockets/bluetooth-hid/hid.sock 25 $MODE)
 # tactusd retries the socket every 2 s; then four steps 1.5 s apart.
 i=0; until grep -q "pausing" /tmp/pad.log || [ $i -ge 60 ]; do sleep 1; i=$((i+1)); done
 sleep 3
@@ -153,6 +171,14 @@ if [ "$REVOKE" = 1 ]; then
   sleep 4
   grep -v gamepad_exclusive /tmp/cappol/root/policy.toml > /tmp/cappol/p.new && mv /tmp/cappol/p.new /tmp/cappol/root/policy.toml
   echo "revoked input.gamepad_exclusive"
+fi
+if [ "$TAKEBACK" = 1 ]; then
+  sleep 4
+  export FORUM_CTL_SOCKET=/tmp/forum-ctl-t.sock
+  ./forum-ctl pads > /tmp/pads-before.log 2>&1
+  ./forum-ctl take-back > /tmp/takeback.log 2>&1
+  ./forum-ctl pads > /tmp/pads-after.log 2>&1
+  echo "-- pads before"; cat /tmp/pads-before.log; echo "-- take-back"; cat /tmp/takeback.log; echo "-- pads after"; cat /tmp/pads-after.log
 fi
 i=0; until grep -q "detached" /tmp/pad.log || [ $i -ge 90 ]; do sleep 1; i=$((i+1)); done
 sleep 3
@@ -164,11 +190,24 @@ EOF
   V 'grep "^pad-std " /tmp/probe2.log' > /tmp/tactus-std2.log
   echo "-- window 1"; cat /tmp/tactus-pad1.log; echo "-- window 2"; cat /tmp/tactus-pad2.log
   P1=/tmp/tactus-pad1.log P2=/tmp/tactus-pad2.log
-  if [ "$CLAIM" = 1 ] && [ "$REVOKE" = 1 ]; then
+  if [ "$CLAIM" = 1 ] && [ "$TAKEBACK" = 1 ]; then
+    # The holder is named as frescod's surface list has it (here the
+    # unjailed probe's "client:N": it has no launch-registry entry).
+    V 'cat /tmp/pads-before.log' | grep -q '^pad [0-9]* "Fake Pad" .*, held by .* (window [0-9]*)$' && ok "forum-ctl pads: held, with the holder" || bad "pads before: $(V 'cat /tmp/pads-before.log')"
+    V 'cat /tmp/takeback.log' | grep -q "^ok" && ok "forum-ctl take-back: ok" || bad "take-back: $(V 'cat /tmp/takeback.log')"
+    V 'cat /tmp/pads-after.log' | grep '^pad [0-9]* "Fake Pad"' | grep -qv "held by" && ok "forum-ctl pads: no longer held" || bad "pads after: $(V 'cat /tmp/pads-after.log')"
+    V 'grep -q "taken back from window [0-9]* by the controller menu" /tmp/frescod-t.log' && ok "frescod: taken back by the controller menu" || bad "frescod log has no take-back"
+  fi
+  if [ "$CLAIM" = 1 ] && [ "$GUIDE" = 1 ]; then
+    grep -q "pad-button .*usage=0x00090011 pressed=1" $P1 && ok "window 1: Guide press (it held the pad)" || bad "window 1 saw no Guide press"
+    V 'grep -q "taken back from window [0-9]* by a long press on Guide" /tmp/frescod-t.log' && ok "frescod: taken back by holding Guide" || bad "frescod log has no Guide take-back"
+    grep -q "usage=0x00090011" $P2 && bad "window 2 got the Guide button" || ok "window 2: no stray Guide release"
+  fi
+  if [ "$CLAIM" = 1 ] && { [ "$REVOKE" = 1 ] || [ "$TAKEBACK" = 1 ] || [ "$GUIDE" = 1 ]; }; then
     grep -q "pad-claim .*held=1" $P1 && ok "window 1: claim granted" || bad "window 1 claim not granted"
-    tail -1 $P1 | grep -q "pad-claim .*held=0" && ok "window 1: claim ended by the revocation, last" || bad "window 1 claim not ended"
+    tail -1 $P1 | grep -q "pad-claim .*held=0" && ok "window 1: claim ended, last" || bad "window 1 claim not ended"
     grep -q "pad-disconnect" $P1 && ok "window 1: disconnected" || bad "window 1 not disconnected"
-    grep -q "usage=0x00090002" $P1 && bad "window 1 got button 2 after the revocation" || ok "window 1: nothing after the revocation"
+    grep -q "usage=0x00090002" $P1 && bad "window 1 got button 2 after the claim ended" || ok "window 1: nothing after the claim ended"
     head -1 $P2 | grep -q "pad-connect" && ok "window 2: connect (follows focus)" || bad "window 2 connect"
     grep -q "pad-button .*usage=0x00090002 pressed=1" $P2 && ok "window 2: button 2" || bad "window 2 button 2"
     tail -1 $P2 | grep -q "pad-disconnect" && ok "window 2: disconnect on detach" || bad "window 2 detach"
@@ -185,7 +224,7 @@ EOF
     echo "tactus: $fails failed"
     exit $fails
   fi
-  grep -q 'pad-connect .*id=1234:5678 buttons=15 axes=7 name="Fake Pad"' $P1 && ok "window 1: connect with counts and name" || bad "window 1 connect"
+  grep -q 'pad-connect .*id=1234:5678 buttons=17 axes=7 name="Fake Pad"' $P1 && ok "window 1: connect with counts and name" || bad "window 1 connect"
   grep -q "pad-axis .*usage=0x00010030 value=32767" $P1 && ok "window 1: stick right" || bad "window 1 stick"
   grep -q "pad-button .*usage=0x00090001 pressed=1" $P1 && grep -q "pad-button .*usage=0x00090001 pressed=0" $P1 && ok "window 1: button 1 press and release" || bad "window 1 button 1"
   grep -q "pad-axis .*usage=0x00010039 value=2" $P1 && ok "window 1: hat right" || bad "window 1 hat"

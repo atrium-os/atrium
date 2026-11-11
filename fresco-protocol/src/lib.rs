@@ -163,6 +163,12 @@ pub mod control {
     // The system appearance (visual language §15): the session sets it,
     // every client gets EV_APPEARANCE_CHANGED. AppearancePayload.
     pub const OP_WM_SET_APPEARANCE:     u16 = 0x052b;
+    // The user's override of exclusive gamepad claims
+    // (fresco-capabilities.md §4): the session lists the pads and who holds
+    // each (→ WmPadsReply), and takes a pad back from its holder, after
+    // which it follows focus again (WmPadRelease, no payload in the reply).
+    pub const OP_WM_PADS:               u16 = 0x052c;
+    pub const OP_WM_PAD_RELEASE:        u16 = 0x052d;
 
     // Async events (server → client). Sent with envelope flag
     // ASYNC_EVENT (aqueduct::envelope::flags::ASYNC_EVENT).
@@ -521,6 +527,36 @@ pub struct AppearancePayload {
     pub high_contrast: bool,
     /// Reserved for the accent colour's index: 0 for now.
     pub accent: u32,
+}
+
+/// One gamepad or joystick, as `OP_WM_PADS` lists it.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct WmPad {
+    /// Tactus's device id.
+    pub device_id: u32,
+    /// As the device names itself.
+    pub name: String,
+    pub vendor: u16,
+    pub product: u16,
+    /// The window its events go to now (0: none, e.g. the focused app
+    /// has no `input.gamepad`).
+    pub window_id: u32,
+    /// The window holding it exclusively, 0 if none.
+    pub held_by: u32,
+}
+
+/// Reply to `OP_WM_PADS`: every connected pad.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub struct WmPadsReply {
+    pub pads: Vec<WmPad>,
+}
+
+/// `OP_WM_PAD_RELEASE`: end the exclusive claim on pad `device_id` (0:
+/// every claimed pad). The holder gets the held buttons' releases,
+/// `EV_GAMEPAD_DISCONNECT` and `EV_GAMEPAD_CLAIM` 0; the pad follows focus.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub struct WmPadRelease {
+    pub device_id: u32,
 }
 
 pub const APPEARANCE_LIGHT: u32 = 0;
@@ -2372,6 +2408,8 @@ mod tests {
             control::EV_GAMEPAD_AXIS,
             control::EV_GAMEPAD_CLAIM,
             control::OP_PAD_CLAIM,
+            control::OP_WM_PADS,
+            control::OP_WM_PAD_RELEASE,
             control::OP_DRAG_BEGIN,
             control::OP_WM_CREDENTIAL_SLOT,
             control::EV_DRAG_ENTER,

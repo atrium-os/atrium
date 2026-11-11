@@ -10,7 +10,10 @@
 
 use std::time::Duration;
 
-use forum_ctl::{Intent, Reply};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
+
+use forum_ctl::{Intent, PadInfo, Reply};
 use lyra_protocol::wire::{action, FromMedia, MediaAction, NowPlaying, SessionState, ToMedia};
 use fresco_protocol::{WindowHints, WmRole};
 use pergola::geom::{Axis, Rect};
@@ -69,6 +72,32 @@ struct BarView {
     now: Mutable<Option<NowShown>>,
     /// Set by the now-playing button; the main loop sends it to choragusd.
     want_media: Mutable<Option<MediaAction>>,
+    /// The gamepads and who holds each (forum-ctl `ListPads`), for the
+    /// controller menu.
+    pads: Mutable<Vec<PadInfo>>,
+    /// Whether the controller menu is open.
+    pads_open: Mutable<bool>,
+    /// Set by a "Take back" click: the main loop asks for the pads again.
+    pads_stale: Arc<AtomicBool>,
+}
+
+/// The controller menu's line for one pad: its name, and the app holding
+/// it or that it follows focus.
+fn pad_line(p: &PadInfo) -> String {
+    let mut name = p.pad.name.clone();
+    if name.is_empty() {
+        name = format!("Controller {}", p.pad.device_id);
+    }
+    if name.chars().count() > 24 {
+        name = name.chars().take(23).collect::<String>() + "…";
+    }
+    if p.pad.held_by == 0 {
+        format!("{name} · follows focus")
+    } else {
+        // The app's short name: the registry id's last part.
+        let app = p.held_by_app.rsplit('.').next().unwrap_or(&p.held_by_app);
+        format!("{name} · held by {app}")
+    }
 }
 
 /// The bar's view of choragusd's `NowPlaying`.
@@ -228,9 +257,57 @@ impl View for BarView {
             ctx.pop();
         }
 
+        // The controller menu (fresco-capabilities.md §4), open: each pad,
+        // who holds it, and the user's override. In the bar itself, since
+        // a drop-down would be clipped by the bar's window until frescod
+        // has pop-up windows.
+        let pads = self.pads.get_cloned();
+        if self.pads_open.get() && !pads.is_empty() {
+            let menu = ctx.push(Node::hstack(Rect::ZERO_SIZED, 10.0));
+            ctx.set_flex(menu, FlexStyle { align: pergola::Align::Center, ..FlexStyle::default() });
+            for p in &pads {
+                Label::new(pad_line(p)).size(type_size::XS).color(t.text_secondary()).emit(ctx);
+                if p.pad.held_by != 0 {
+                    let device_id = p.pad.device_id;
+                    let stale = self.pads_stale.clone();
+                    Chip::new(
+                        shell::SURFACE_CHIP_H,
+                        Draw(move |ctx: &mut Ctx| {
+                            let t = ctx.theme;
+                            Label::new("Take back").size(type_size::XS).color(t.accent_fg()).emit(ctx);
+                        }),
+                    )
+                    .pad(8.0)
+                    .on_click(move || {
+                        let sock = forum_ctl::default_socket_path();
+                        match forum_ctl::request(&sock, &Intent::TakeBackPad { device_id }) {
+                            Ok(Reply::Ack) => {}
+                            Ok(r) => eprintln!("forum-bar: take back pad {device_id}: {r:?}"),
+                            Err(e) => eprintln!("forum-bar: take back pad {device_id}: {e}"),
+                        }
+                        stale.store(true, Ordering::Relaxed);
+                    })
+                    .render(ctx);
+                }
+            }
+            ctx.pop();
+        }
+
         // Right icon row.
         let row = ctx.push(Node::hstack(Rect::ZERO_SIZED, 14.0));
         ctx.set_flex(row, FlexStyle { align: pergola::Align::Center, ..FlexStyle::default() });
+        // The controller menu's button, while there are pads: accent while
+        // an app holds one.
+        if !pads.is_empty() {
+            let open = self.pads_open.clone();
+            let now_open = open.get();
+            let held = pads.iter().any(|p| p.pad.held_by != 0);
+            let id = Glyph::new(phosphor::GAME_CONTROLLER)
+                .size(15.0)
+                .color(if held || now_open { t.accent_fg() } else { t.text_secondary() })
+                .emit(ctx);
+            ctx.on_click(id, move || open.set(!now_open));
+        }
         icon_glyph(ctx, phosphor::BROADCAST, None);
         icon_glyph(ctx, phosphor::SPEAKER_SIMPLE_HIGH, None);
         icon_glyph(ctx, phosphor::BATTERY_CHARGING, None);
@@ -321,6 +398,14 @@ fn poll_status() -> (Vec<ChipData>, (String, String)) {
     (chips, ("atelier".into(), "a3f8".into()))
 }
 
+/// The gamepads from the WM core; none when it isn't reachable.
+fn poll_pads() -> Vec<PadInfo> {
+    match forum_ctl::request(forum_ctl::default_socket_path(), &Intent::ListPads) {
+        Ok(Reply::Pads { pads }) => pads,
+        _ => Vec::new(),
+    }
+}
+
 /// hh:mm + "Fri 7 Aug" from the epoch (civil-from-days, UTC — the VM
 /// runs UTC).
 fn clock_now() -> (String, String) {
@@ -400,6 +485,9 @@ fn main() -> std::io::Result<()> {
     let want_dark = Mutable::with_dirty(None, dirty.clone());
     let now = Mutable::with_dirty(None, dirty.clone());
     let want_media = Mutable::with_dirty(None, dirty.clone());
+    let pads = Mutable::with_dirty(poll_pads(), dirty.clone());
+    let pads_open = Mutable::with_dirty(false, dirty.clone());
+    let pads_stale = Arc::new(AtomicBool::new(false));
     let playing = follow_now_playing();
     let mut control: Option<lyra_protocol::client::Media> = None;
 
@@ -412,6 +500,9 @@ fn main() -> std::io::Result<()> {
         time: time.clone(),
         date: date.clone(),
         want_dark: want_dark.clone(),
+        pads: pads.clone(),
+        pads_open: pads_open.clone(),
+        pads_stale: pads_stale.clone(),
     };
     let mut app = App::new_with_flag(view, dirty).with_theme(mode);
 
@@ -436,6 +527,17 @@ fn main() -> std::io::Result<()> {
                 if w_now != workspace.get_cloned() {
                     workspace.set(w_now);
                 }
+                pads_stale.store(true, Ordering::Relaxed);
+            }
+        }
+        // The pads: every second, and at once after a "Take back".
+        if pads_stale.swap(false, Ordering::Relaxed) {
+            let p_now = poll_pads();
+            if p_now.is_empty() && pads_open.get() {
+                pads_open.set(false);
+            }
+            if p_now != pads.get_cloned() {
+                pads.set(p_now);
             }
         }
         // What is playing changed (choragusd pushes it).
@@ -486,7 +588,39 @@ mod tests {
             want_dark: Mutable::new(None),
             now: Mutable::new(None),
             want_media: Mutable::new(None),
+            pads: Mutable::new(Vec::new()),
+            pads_open: Mutable::new(false),
+            pads_stale: Arc::new(AtomicBool::new(false)),
         }
+    }
+
+    #[test]
+    fn controller_menu_shows_each_pad_and_a_take_back_for_held_ones() {
+        let pad = |id, name: &str, held_by, app: &str| PadInfo {
+            pad: forum_ctl::WmPad { device_id: id, name: name.into(), vendor: 1, product: 2, window_id: held_by, held_by },
+            held_by_app: app.into(),
+        };
+        let held = pad(1, "Fake Pad", 5, "org.test.game");
+        let free = pad(2, "", 0, "");
+        assert_eq!(pad_line(&held), "Fake Pad · held by game");
+        assert_eq!(pad_line(&free), "Controller 2 · follows focus");
+
+        pergola::text::clear_measurer();
+        let view = sample_view();
+        let has_text = |tree: &pergola::NodeTree, s: &str| tree.iter().any(|(_, x)| matches!(x, Node::Text { content, .. } if content == s));
+        let controller = phosphor::GAME_CONTROLLER.to_string();
+        // No pads: no controller button.
+        let (tree, _) = render(&view, Semantic::LIGHT);
+        assert!(!has_text(&tree, &controller));
+        // Pads: the button; open, a line per pad and one "Take back".
+        view.pads.set(vec![held, free]);
+        let (tree, _) = render(&view, Semantic::LIGHT);
+        assert!(has_text(&tree, &controller) && !has_text(&tree, "Take back"));
+        view.pads_open.set(true);
+        let (tree, _) = render(&view, Semantic::LIGHT);
+        assert!(has_text(&tree, "Fake Pad · held by game") && has_text(&tree, "Controller 2 · follows focus"));
+        let n = tree.iter().filter(|(_, x)| matches!(x, Node::Text { content, .. } if content == "Take back")).count();
+        assert_eq!(n, 1);
     }
 
     #[test]

@@ -82,6 +82,13 @@ pub fn translate(ev: &fresco_client::Event) -> Option<Event> {
         // Video layers: Pergola makes none yet.
         | fresco_client::Event::VideoPresented { .. }
         | fresco_client::Event::VideoReleased { .. }
+        // Gamepads: the app reads them with pergola-gamepad, at the loop
+        // level, as it does focus.
+        | fresco_client::Event::GamepadConnect { .. }
+        | fresco_client::Event::GamepadDisconnect { .. }
+        | fresco_client::Event::GamepadButton { .. }
+        | fresco_client::Event::GamepadAxis { .. }
+        | fresco_client::Event::GamepadClaim { .. }
         | fresco_client::Event::Unknown { .. } => None,
     }
 }

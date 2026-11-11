@@ -5,12 +5,12 @@ use pergola_gamepad::{usage, Axis, Button, Change, Mapping, Pads};
 const B: fn(u16) -> u32 = usage::button;
 
 /// The VM check's stand-in pad (tactus/examples/fake-pad.rs): X, Y, Rx, Ry
-/// sticks, a Z trigger, Brake, a hat, 15 buttons; the events frescod sent
+/// sticks, a Z trigger, Brake, a hat, 17 buttons; the events frescod sent
 /// the window, in order.
 #[test]
 fn a_generic_pad_waits_for_its_axes_then_maps_them() {
     let mut p = Pads::new();
-    assert_eq!(p.connect(3, 0x1234, 0x5678, 15, 7, "Fake Pad"), vec![Change::Connected { device: 3 }]);
+    assert_eq!(p.connect(3, 0x1234, 0x5678, 17, 7, "Fake Pad"), vec![Change::Connected { device: 3 }]);
     let mut out = Vec::new();
     for (u, v) in [(usage::X, 0), (usage::Y, 0), (usage::RX, 0), (usage::RY, 0), (usage::Z, -32768), (usage::BRAKE, -32768)] {
         out.extend(p.axis(3, u, v));
@@ -128,4 +128,11 @@ fn an_app_can_remap() {
     pad.mapping.set_button(B(4), Button::West).set_button(B(5), Button::North).unset(B(3));
     assert_eq!(p.button(1, B(4), true)[0], Change::Button { device: 1, button: Button::West, pressed: true });
     assert!(p.button(1, B(3), true).is_empty());
+}
+
+#[test]
+fn guide_usage_by_mapping() {
+    assert_eq!(Mapping::generic().usages_of(Button::Guide), vec![usage::button(17)]);
+    assert_eq!(Mapping::sony().usages_of(Button::Guide), vec![usage::button(13)]);
+    assert_eq!(Mapping::generic().usages_of(Button::DpadUp), vec![usage::DPAD_UP, usage::button(13)]);
 }

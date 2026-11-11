@@ -169,9 +169,39 @@ VM; `GAMEPAD=1 CLAIM=1 REVOKE=1` 7/0 (the exclusive grant is taken out of
 the policy while window 1 holds the pad: window 1 gets `DISCONNECT` and
 `EV_GAMEPAD_CLAIM` 0, and the pad follows focus to window 2).
 
-The Forum controller menu and Guide long-press (§4) belong to the Forum
-thread. Until they exist, ending the holder's app is the user's only
-override.
+*Built (2026-11-11):* the user's override (§4), C5.
+
+- **frescod.** Two WM-only ops on the window-management socket:
+  `OP_WM_PADS` 0x052c lists every pad (`WmPad`: device, name, ids, the
+  window it goes to, the window holding it) and `OP_WM_PAD_RELEASE`
+  0x052d (`WmPadRelease`, device 0 for every held pad) ends a claim. The
+  holder gets the held buttons' releases and `DISCONNECT` (when focus is
+  elsewhere), then `EV_GAMEPAD_CLAIM` 0, as for any release; the pad
+  follows focus. frescod logs `pad N taken back from window W by ...`.
+- **Guide long press.** frescod itself watches a claimed pad's Guide
+  button: the usage pergola-gamepad's mapping for that pad names Guide
+  (button 17 generic, 13 on Sony pads), or HID System Main Menu
+  (0x0001_0085) or AC Home (0x000C_0223). Held for
+  `FRESCOD_GUIDE_HOLD_MS` (default 1000) it takes the pad back. The press
+  still reaches the holder, which gets its release with the
+  `DISCONNECT`. On a pad nobody holds, Guide is an ordinary button.
+- **Forum.** forum-ctl intents `ListPads` (each pad with the holding
+  app's id, from the WM's surface list) and `TakeBackPad`; forum-wm
+  carries them out. The bar shows a controller button while there are
+  pads (accent while one is held); a click opens the controller menu in
+  the bar: each pad, who holds it or "follows focus", and a "Take back"
+  chip for a held one. It sits in the bar rather than a drop-down because
+  a drop-down would be clipped by the bar's window until frescod has
+  pop-up windows. `forum-ctl pads` and `forum-ctl take-back [ID]` do the
+  same from a shell.
+- **Checked:** frescod unit tests 55/55 in the amd64 VM (new:
+  `the_user_takes_a_claimed_pad_back`), forum-wm and forum-bar unit tests,
+  and in the VM `GAMEPAD=1 CLAIM=1 TAKEBACK=1` 11/0 (forum-wm, then
+  `forum-ctl pads` / `take-back` / `pads`: held, ok, follows focus) and
+  `GAMEPAD=1 CLAIM=1 GUIDE=1` 10/0 (fake-pad holds button 17 for 2.5 s).
+  fake-pad now has 17 buttons so that it has a Guide; the plain
+  `GAMEPAD=1` and `CLAIM=1 REVOKE=1` runs still pass (0 failed). Not run:
+  forum-bar on a real display (its menu is unit-tested only).
 
 ## 10. Decisions for review
 
