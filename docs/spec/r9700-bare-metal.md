@@ -301,3 +301,11 @@ land with it.
 
   The reset ended with "PSP bootloader ready, card cold" (sOS 0, GB_ADDR_CONFIG 0). The PCH
   stayed at 28–29 °C for 5 minutes.
+- **2026-11-12 18:57, stage 4a passed (0e8eb372).** Layout: VRAM 32640 MiB at MC
+  0x8000000000–0x87f7ffffff (FB offset 0); GART 512 MiB at MC 0; table at MC 0x8005800000.
+  Both hubs (MMHUB 4.1, GFXHUB GC 12.0) went from CONTEXT0_CNTL 0x3fffc00 to 0x3fffc01, with
+  PT base 0x5800001 (FB + 88 MiB, valid), L1_TLB 0x501 → 0x1859 and L2_CNTL 0x80602 → 0x80e01.
+  Fault status was 0 before and after, and the TLB flush on engine 17 was acked on both hubs.
+  After teardown the card was back at 7 W, 0 % busy, by sample 2. The gate passed, but the
+  verdict was not logged; the check now logs it ("card proven idle after stage 4"). The reset ended with
+  the card cold, and the PCH stayed at 28–30 °C for 5 minutes.

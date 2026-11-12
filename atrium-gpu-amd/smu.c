@@ -554,9 +554,12 @@ amd_smu_init(struct atrium_amd_softc *sc)
 			(void)amd_ih7_test(sc, &gt);
 		amd_gmc12_gart_disable(&gt);
 		(void)SEND(SMU_ALLOW_GFXOFF, 0, NULL);
-		if (!smu_sample(&link, vram, ifver, 5, "idle after 4a")) {
+		if (smu_sample(&link, vram, ifver, 5, "idle after stage 4"))
+			device_printf(sc->dev, "smu: card proven idle after "
+			    "stage 4\n");
+		else {
 			device_printf(sc->dev, "smu: not idle after stage "
-			    "4a; refusing\n");
+			    "4; refusing\n");
 			err = EIO;
 		}
 	}
