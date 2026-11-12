@@ -524,17 +524,20 @@ amd_gmc12_gart_disable(struct amd_gart *gt)
  * fragment size 9. A new PTB is filled with the invalid-PTE pattern
  * (EXECUTABLE | IS_PTE, amdgpu_vm_pte_update_flags), and so is an
  * unmapped page. A mapped system page is VALID | SYSTEM | SNOOPED plus
- * R/W/X and MTYPE NC (gmc_v12_0_get_vm_pte, AMDGPU_VM_MTYPE_DEFAULT).
+ * R/W/X, MTYPE NC (gmc_v12_0_get_vm_pte, AMDGPU_VM_MTYPE_DEFAULT) and
+ * IS_PTE (bit 63).
  *
- * Silicon runs 20261112T215929Z and T220611Z: with that layout the CP's
- * IB fetch through VMID 1 faulted (WALKER_ERROR 5, MAPPING_ERROR), with
- * and without BFS. To find which part the walker refuses, the 5b test
- * also builds three diagnostic variants:
- *  AMD_VM12_FLAT     depth 0, one PTB over a 2 MiB window, GART-style PTEs
- *                    (the VMID 0 path, known good, on VMID 1);
+ * IS_PTE on a valid leaf is from silicon, not from my reading of amdgpu:
+ * runs 20261112T215929Z and T220611Z faulted the first fetch through VMID
+ * 1 (WALKER_ERROR 5, MAPPING_ERROR) with leaves lacking bit 63; run
+ * T221309Z built four layouts side by side and only the leaves carrying
+ * bit 63 translated (the flat depth-0 table and the four-level VRAM table
+ * with IS_PTE both ran write_42; the same tables without it faulted, in
+ * VRAM and in system memory). The two diagnostic layouts stay for later
+ * bring-ups:
+ *  AMD_VM12_FLAT     depth 0, one PTB over a 2 MiB window, GART-style PTEs;
  *  AMD_VM12_4L_SYS   the four-level table with every table in system
- *                    memory (PDEs VALID | SYSTEM | SNOOPED);
- *  AMD_VM12_4L_LEAF  the four-level VRAM table with IS_PTE on leaf PTEs.
+ *                    memory (PDEs VALID | SYSTEM | SNOOPED).
  *
  * Tables are a bump allocator (a 5b test VM, not yet the allocator a
  * client VM will use; that comes with 5c, on vram-allocator).
@@ -716,10 +719,9 @@ amd_gmc12_vm_map(struct amd_vm12 *vm, uint64_t va, vm_paddr_t pa,
 	if (prot & AMD_VM_EXEC)
 		pte |= PTE_EXECUTABLE;
 	if (vm->mode == AMD_VM12_FLAT)		/* as amd_gmc12_gart_map */
-		pte |= PTE_MTYPE_UC | PTE_IS_PTE;
-	else if (vm->mode == AMD_VM12_4L_LEAF)
-		pte |= PTE_IS_PTE;
-	tbl_wr(vm, t, i, pte);			/* 4L: MTYPE NC (0) */
+		pte |= PTE_MTYPE_UC;
+	pte |= PTE_IS_PTE;			/* see above; 4L: MTYPE NC (0) */
+	tbl_wr(vm, t, i, pte);
 	return (0);
 }
 

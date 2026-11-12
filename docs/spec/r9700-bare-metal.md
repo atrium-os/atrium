@@ -552,3 +552,16 @@ through fd passing, close and jail death.
   amdgpu 4-level table in VRAM, a flat depth-0 table (the VMID 0 GART path, on VMID 1),
   the 4-level table in system memory, and the 4-level table with IS_PTE on the leaves.
   5b passes only on the amdgpu layout; the others show where the walker disagrees.
+- 2026-11-12 22:15, 5b diagnostic run cb679b38 (log /root/runs/20261112T221309Z.log) found
+  it. Same CONTEXT1 setup (read back: CNTL 0x3aaa807, depth 3, no retry, range 0..2^36-1),
+  same PDEs; only bit 63 on the leaf PTE differs. Without IS_PTE on the leaf the walk
+  faults (WALKER_ERROR 5 with tables in VRAM, 4 in system memory); with it, write_42 ran
+  through VMID 1's own four-level table (64 x 42, fence in 20 µs, no fault), and the flat
+  depth-0 table (GART-style PTEs, which carry IS_PTE) also passed. Valid leaves now always
+  carry IS_PTE. Isolation held: the write to the VA only VMID 0 maps latched a VMID 1 TCP
+  write fault at the victim page (status 0x141152) and the victim stayed poisoned. But
+  the faulting wave then stays stuck (rptr = wptr, no fence, GRBM busy) instead of
+  finishing on the dummy page. Next kmod: B and C pass on "fault latched for VMID 1 at
+  the page, target untouched, queue recovers", where recovery kills VMID 1's waves with
+  SQ_CMD (gfx_v11 soft recovery; gfx12 amdgpu has none) and waits for the fence. Only the
+  four-level VRAM layout runs.

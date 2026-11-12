@@ -264,3 +264,28 @@ amd_gc_idle_enter(struct atrium_amd_softc *sc)
 	    sc->ip.gc.major, sc->ip.gc.minor, sc->ip.gc.rev);
 	return (ENOTSUP);
 }
+
+/*
+ * Kill every wave of `vmid` (gfx_v11_0_ring_soft_recovery: SQ_CMD
+ * CMD 3 kill, MODE 1 broadcast, CHECK_VMID), inside RLC safe mode. Used
+ * after a no-retry VM fault leaves a wave stuck; amdgpu's gfx12 has no
+ * soft recovery hook, the SQ_CMD fields are the same as GC 11's.
+ */
+#define GC12_SQ_CMD		0x111b		/* segment 0 */
+#define GC12_GRBM_GFX_INDEX	0x2200		/* segment 1 */
+#define GRBM_GFX_INDEX_BCAST	0xe0000000u	/* SE, SA, instance broadcast */
+
+int
+amd_gfx12_sq_kill_vmid(struct atrium_amd_softc *sc, u_int vmid)
+{
+	int err;
+
+	if (!gfx12_regs_ok(sc) || vmid == 0 || vmid > 15)
+		return (ENXIO);
+	if ((err = safe_mode_enter(sc)) != 0)
+		return (err);
+	wr(sc, 1, GC12_GRBM_GFX_INDEX, GRBM_GFX_INDEX_BCAST);
+	wr(sc, 0, GC12_SQ_CMD, 0x3u | (0x1u << 4) | (1u << 7) | vmid << 28);
+	safe_mode_exit(sc);
+	return (0);
+}

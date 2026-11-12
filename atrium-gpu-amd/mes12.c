@@ -1158,7 +1158,7 @@ out_unmap:
 
 static int
 vmt_submit(struct mes *m, struct disp *d, u_int *n, uint64_t ib, u_int vmid,
-    uint32_t seq, const char *what)
+    uint32_t seq, const char *what, int timeout_us)
 {
 	volatile uint32_t *ring = (volatile uint32_t *)(d->blk + DISP_RING);
 	uint64_t fence = d->va + DISP_WB + 0x10;
@@ -1182,14 +1182,14 @@ vmt_submit(struct mes *m, struct disp *d, u_int *n, uint64_t ib, u_int vmid,
 	*(volatile uint64_t *)(d->blk + DISP_WB + 8) = k;
 	wmb();
 	bus_write_8(m->dbbar, (bus_size_t)KCQ_DOORBELL * 4, k);
-	for (us = 0; us < DISP_TIMEOUT_US; us += 10) {
+	for (us = 0; us < timeout_us; us += 10) {
 		if (*(volatile uint32_t *)(d->blk + DISP_WB + 0x10) == seq)
 			break;
 		DELAY(10);
 	}
-	if (us >= DISP_TIMEOUT_US) {
+	if (us >= timeout_us) {
 		device_printf(m->sc->dev, "vm: %s: no fence in %d ms\n", what,
-		    DISP_TIMEOUT_US / 1000);
+		    timeout_us / 1000);
 		kcq_report(m, d, "vm fence timeout");
 		amd_gmc12_fault_report(m->gt, "vm fence timeout");
 		return (ETIMEDOUT);
@@ -1253,11 +1253,69 @@ vmt_qclose(struct mes *m, struct disp *d)
 	return (hqd_dequeue_me(m, 1, 0));
 }
 
+/*
+ * A write VMID 1 must not be able to make (B, C). The wave faults (no
+ * retry) and on gfx12 then stays stuck rather than finishing on the
+ * dummy page (run T221309Z), so the dispatch does not fence by itself.
+ * Pass: the fault is latched for VMID 1 at `va`'s page, `buf` stayed
+ * poisoned, and the queue recovers: it fences on its own or after the
+ * stuck waves of VMID 1 are killed (SQ_CMD). *errp is set only when the
+ * queue did not recover (the caller must then remove it).
+ */
+#define VMT_FAULT_WAIT_US	200000
+
+static bool
+vmt_fault_case(struct mes *m, struct disp *d, u_int *n, uint64_t ib,
+    uint32_t seq, const char *what, uint64_t va, volatile uint32_t *buf,
+    int *errp)
+{
+	struct atrium_amd_softc *sc = m->sc;
+	bool fenced, faulted, untouched, recovered = false;
+	u_int bad;
+	int us, kerr = 0;
+
+	*errp = 0;
+	fenced = vmt_submit(m, d, n, ib, VMT_VMID, seq, what,
+	    VMT_FAULT_WAIT_US) == 0;
+	faulted = vmt_fault_is(m, what, va);
+	bad = vmt_count_not(buf, W42_OUT_DW, DISP_POISON);
+	untouched = (bad == 0);
+	if (!fenced) {
+		kerr = amd_gfx12_sq_kill_vmid(sc, VMT_VMID);
+		for (us = 0; us < DISP_TIMEOUT_US; us += 10) {
+			if (*(volatile uint32_t *)(d->blk + DISP_WB + 0x10) ==
+			    seq)
+				break;
+			DELAY(10);
+		}
+		recovered = (kerr == 0 && us < DISP_TIMEOUT_US);
+		device_printf(sc->dev, "vm: %s: killed VMID %u's waves (%d): "
+		    "%s\n", what, VMT_VMID, kerr, recovered ?
+		    "fence arrived, queue recovered" : "still no fence");
+		kcq_report(m, d, recovered ? "after wave kill" :
+		    "wave kill did not recover");
+		if (!recovered)
+			*errp = ETIMEDOUT;
+		if (vmt_fault_is(m, "after the kill", 0) == false)
+			device_printf(sc->dev, "vm: %s: (fault above came after "
+			    "the first one)\n", what);
+	}
+	if (faulted && untouched && (fenced || recovered))
+		device_printf(sc->dev, "vm: %s: PASS, target page untouched, "
+		    "VMID %u faulted at %#jx, queue %s\n", what, VMT_VMID,
+		    (uintmax_t)va, fenced ? "fenced" : "recovered");
+	else
+		device_printf(sc->dev, "vm: %s: FAILED (fault %s, %u target "
+		    "words changed, %s)\n", what, faulted ? "right" :
+		    "missing or wrong", bad, fenced ? "fenced" : recovered ?
+		    "recovered" : "queue stuck");
+	return (faulted && untouched && (fenced || recovered));
+}
+
 static const char *const vmt_names[] = {
 	[AMD_VM12_4L_VRAM] = "4-level, tables in VRAM (amdgpu layout)",
 	[AMD_VM12_FLAT] = "flat, depth 0, GART-style PTEs",
 	[AMD_VM12_4L_SYS] = "4-level, tables in system memory",
-	[AMD_VM12_4L_LEAF] = "4-level VRAM, IS_PTE on leaf PTEs",
 };
 
 /*
@@ -1320,7 +1378,7 @@ vmt_variant(struct mes *m, struct disp *d, uint8_t *pg, vm_paddr_t pg_pa,
 
 	/* A: VMID 1 writes its own page. */
 	if ((err = vmt_submit(m, d, &n, ib_vm, VMT_VMID, (*seq)++,
-	    "A (own page)")) != 0) {
+	    "A (own page)", DISP_TIMEOUT_US)) != 0) {
 		if (amd_gmc12_fault_take(gt, &st, &a)) {
 			amd_gmc12_fault_decode(gt, st, "A");
 			device_printf(sc->dev, "vm: A: fault page %#jx\n",
@@ -1344,19 +1402,12 @@ vmt_variant(struct mes *m, struct disp *d, uint8_t *pg, vm_paddr_t pg_pa,
 	}
 
 	/* B: VMID 1 aims at a VA only VMID 0 maps. */
-	if ((err = vmt_submit(m, d, &n, ib_vmx, VMT_VMID, (*seq)++,
-	    "B (VA mapped only in VMID 0)")) != 0) {
+	if (!vmt_fault_case(m, d, &n, ib_vmx, (*seq)++,
+	    "B (VA mapped only in VMID 0)", W42_VMX_DATA_VA, victim, &err))
+		fails++;
+	if (err != 0) {
 		*gone = vmt_qclose(m, d);
 		goto out;
-	}
-	bad = vmt_count_not(victim, W42_OUT_DW, DISP_POISON);
-	if (bad == 0 && vmt_fault_is(m, "B", W42_VMX_DATA_VA))
-		device_printf(sc->dev, "vm: B: PASS, victim untouched, VMID %u "
-		    "faulted at %#jx\n", VMT_VMID, (uintmax_t)W42_VMX_DATA_VA);
-	else {
-		device_printf(sc->dev, "vm: B: FAILED, %u victim words "
-		    "changed (victim[0] %#x)\n", bad, victim[0]);
-		fails++;
 	}
 
 	/* C: revoke the out page, run A's IB again. */
@@ -1368,20 +1419,12 @@ vmt_variant(struct mes *m, struct disp *d, uint8_t *pg, vm_paddr_t pg_pa,
 		*gone = vmt_qclose(m, d);
 		goto out;
 	}
-	if ((err = vmt_submit(m, d, &n, ib_vm, VMT_VMID, (*seq)++,
-	    "C (page revoked)")) != 0) {
+	if (!vmt_fault_case(m, d, &n, ib_vm, (*seq)++, "C (page revoked)",
+	    W42_VM_DATA_VA, out, &err))
+		fails++;
+	if (err != 0) {
 		*gone = vmt_qclose(m, d);
 		goto out;
-	}
-	bad = vmt_count_not(out, W42_OUT_DW, DISP_POISON);
-	if (bad == 0 && vmt_fault_is(m, "C", W42_VM_DATA_VA))
-		device_printf(sc->dev, "vm: C: PASS, revoked page untouched, "
-		    "VMID %u faulted at %#jx\n", VMT_VMID,
-		    (uintmax_t)W42_VM_DATA_VA);
-	else {
-		device_printf(sc->dev, "vm: C: FAILED, %u revoked-page words "
-		    "changed (out[0] %#x)\n", bad, out[0]);
-		fails++;
 	}
 	if (gt->dummy != NULL) {
 		device_printf(sc->dev, "vm: dummy page word 0 now %#x "
@@ -1401,15 +1444,13 @@ out:
 }
 
 /*
- * The 5b test: the amdgpu layout first, then the diagnostic layouts, each
- * with a fresh queue. Stage 5b passes only if the amdgpu layout passes;
- * the others say where the walker disagrees when it does not.
+ * The 5b test on the four-level VRAM layout. (Run T221309Z also ran the
+ * flat and system-memory layouts; add them to modes[] to compare again.)
  */
 static int
 vm_test_run(struct mes *m)
 {
-	static const int modes[] = { AMD_VM12_4L_VRAM, AMD_VM12_FLAT,
-	    AMD_VM12_4L_SYS, AMD_VM12_4L_LEAF };
+	static const int modes[] = { AMD_VM12_4L_VRAM };
 	struct atrium_amd_softc *sc = m->sc;
 	const struct mes_gen *g = m->g;
 	struct amd_gart *gt = m->gt;

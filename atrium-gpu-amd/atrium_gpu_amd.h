@@ -816,6 +816,7 @@ int	amd_psp_wait_bootloader(struct atrium_amd_softc *sc, uint32_t *sos);
 int	amd_smu_mode1_reset(struct atrium_amd_softc *sc);	/* smu.c */
 int	amd_gfx12_srm_enable(struct atrium_amd_softc *sc);	/* gfx12_pm.c */
 int	amd_gfx12_clock_gating(struct atrium_amd_softc *sc, bool enable);
+int	amd_gfx12_sq_kill_vmid(struct atrium_amd_softc *sc, u_int vmid);
 void	amd_gfx12_pm_report(struct atrium_amd_softc *sc, const char *when);
 int	amd_gc_idle_enter(struct atrium_amd_softc *sc);	/* gfx12_pm.c */
 void	amd_hdp_flush(struct atrium_amd_softc *sc);		/* psp.c */
@@ -853,7 +854,6 @@ struct amd_vm12 {
 #define AMD_VM12_4L_VRAM	0	/* amdgpu's layout */
 #define AMD_VM12_FLAT		1	/* diagnostic: depth 0, 2 MiB */
 #define AMD_VM12_4L_SYS		2	/* diagnostic: tables in system RAM */
-#define AMD_VM12_4L_LEAF	3	/* diagnostic: IS_PTE on leaf PTEs */
 #define AMD_VM_READ	0x1u
 #define AMD_VM_WRITE	0x2u
 #define AMD_VM_EXEC	0x4u
