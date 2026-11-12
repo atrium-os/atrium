@@ -1,5 +1,6 @@
 //! The demuxers against ffmpeg-made clips (scripts/media-test-clips.sh).
-use atrium_media_demux::{open, probe, Codec, Demuxer, Event, Kind, Limits, Sample, TrackInfo};
+mod common;
+use atrium_media_demux::{open, probe, Codec, Demuxer, Event, InitDataKind, Kind, Limits, Sample, Scheme, TrackInfo};
 use std::path::PathBuf;
 
 fn clip(name: &str) -> Vec<u8> {
@@ -33,6 +34,7 @@ struct Out {
     samples: Vec<Sample>,
     /// Offsets the parser asked for.
     jumps: Vec<u64>,
+    init_data: Vec<(InitDataKind, Vec<u8>)>,
 }
 
 /// Play a whole file through a parser, in chunks of `chunk` bytes, serving
@@ -46,6 +48,7 @@ fn run(file: &[u8], chunk: usize, d: &mut dyn Demuxer) -> Out {
                 Some(Event::Tracks(t)) => out.tracks = t,
                 Some(Event::Duration(x)) => out.duration = Some(x),
                 Some(Event::Sample(s)) => out.samples.push(s),
+                Some(Event::InitData { kind, data }) => out.init_data.push((kind, data)),
                 None => break,
             }
         }
@@ -328,4 +331,78 @@ fn colour_descriptions_are_read() {
     let o = play("color-full.mp4", 1 << 16);
     let c = o.tracks[0].color.expect("a colr box");
     assert_eq!((c.primaries, c.transfer, c.matrix, c.range), (1, 1, 1, 2), "BT.709, full range");
+}
+
+const KID: [u8; 16] = [0x00, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88, 0x99, 0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff];
+const KEY: [u8; 16] = [0x3a, 0x2b, 0x1c, 0x0d, 0x4e, 0x5f, 0x60, 0x71, 0x82, 0x93, 0xa4, 0xb5, 0xc6, 0xd7, 0xe8, 0xf9];
+
+/// An encrypted clip (scripts/media-encrypted-clips.sh), decrypted with the sample info the
+/// demuxer gives, has exactly its clear source's samples.
+fn clear_key(name: &str, source: &str, scheme: Scheme, init: InitDataKind, chunk: usize) -> Out {
+    let e = play(&format!("clearkey/{name}"), chunk);
+    let c = play(source, 1 << 20);
+    for t in &e.tracks {
+        let p = t.protection.as_ref().unwrap_or_else(|| panic!("{name}: track {} unprotected", t.index));
+        assert_eq!(p.scheme, scheme, "{name}");
+        assert_eq!(p.key_id, KID, "{name}");
+    }
+    assert!(!e.init_data.is_empty(), "{name}: no init data");
+    for (k, d) in &e.init_data {
+        assert_eq!(*k, init, "{name}");
+        match init {
+            InitDataKind::WebM => assert_eq!(d[..], KID),
+            // A pssh box naming the key.
+            InitDataKind::Cenc => {
+                assert_eq!(&d[4..8], b"pssh");
+                assert!(d.windows(16).any(|w| w == KID));
+            }
+        }
+    }
+    let aes = common::aes::Aes::new(&KEY);
+    assert_eq!(e.samples.len(), c.samples.len(), "{name}: sample count");
+    // Packagers may interleave the tracks differently: compare track by track.
+    fn order(o: &Out) -> Vec<&Sample> {
+        let mut v: Vec<&Sample> = o.samples.iter().collect();
+        v.sort_by_key(|s| s.track);
+        v
+    }
+    let mut encrypted = 0;
+    for (i, (s, r)) in order(&e).into_iter().zip(order(&c)).enumerate() {
+        assert_eq!((s.track, s.pts_ns, s.key), (r.track, r.pts_ns, r.key), "{name}: sample {i}");
+        let mut d = s.data.clone();
+        if let Some(x) = &s.crypto {
+            encrypted += 1;
+            assert_eq!(x.key_id, KID);
+            let total: u64 = x.subsamples.iter().map(|&(a, b)| a as u64 + b as u64).sum();
+            assert!(x.subsamples.is_empty() || total == d.len() as u64, "{name}: sample {i} subsamples cover {total} of {}", d.len());
+            common::aes::decrypt_sample(&aes, x.scheme == Scheme::Cbcs, &x.iv, &x.subsamples, (x.crypt_byte_block as u32, x.skip_byte_block as u32), &mut d);
+        }
+        assert!(d == r.data, "{name}: sample {i} (track {}) differs after decryption", s.track);
+    }
+    assert!(encrypted > e.samples.len() / 2, "{name}: only {encrypted} encrypted samples");
+    e
+}
+
+#[test]
+fn clear_key_cenc_fragmented_mp4() {
+    clear_key("vp9-opus-cenc.mp4", "vp9-opus-frag.mp4", Scheme::Cenc, InitDataKind::Cenc, 1 << 20);
+    clear_key("vp9-opus-cenc.mp4", "vp9-opus-frag.mp4", Scheme::Cenc, InitDataKind::Cenc, 7);
+}
+
+#[test]
+fn clear_key_cbcs_plain_mp4() {
+    let e = clear_key("av1-opus-cbcs.mp4", "av1-opus.mp4", Scheme::Cbcs, InitDataKind::Cenc, 1 << 20);
+    let v = e.samples.iter().find_map(|s| s.crypto.as_ref().filter(|_| s.track == 0)).unwrap();
+    assert_eq!((v.crypt_byte_block, v.skip_byte_block), (1, 9));
+    clear_key("av1-opus-cbcs.mp4", "av1-opus.mp4", Scheme::Cbcs, InitDataKind::Cenc, 4096);
+}
+
+#[test]
+fn clear_key_webm() {
+    let e = clear_key("vp9-opus-enc.webm", "vp9-opus.webm", Scheme::Cenc, InitDataKind::WebM, 1 << 20);
+    // The generator writes partitioned, whole-frame and clear frames.
+    assert!(e.samples.iter().any(|s| s.crypto.as_ref().is_some_and(|c| c.subsamples.len() > 1)));
+    assert!(e.samples.iter().any(|s| s.crypto.as_ref().is_some_and(|c| c.subsamples.len() <= 1)));
+    assert!(e.samples.iter().any(|s| s.crypto.is_none()));
+    clear_key("vp9-opus-enc.webm", "vp9-opus.webm", Scheme::Cenc, InitDataKind::WebM, 7);
 }

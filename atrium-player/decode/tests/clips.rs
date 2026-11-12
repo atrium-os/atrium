@@ -18,7 +18,7 @@ fn demux(name: &str) -> (Vec<TrackInfo>, Vec<Sample>) {
             match ev {
                 Event::Tracks(t) => tracks = t,
                 Event::Sample(s) => samples.push(s),
-                Event::Duration(_) => {}
+                Event::Duration(_) | Event::InitData { .. } => {}
             }
         }
         if let Some(off) = d.wants_offset() {

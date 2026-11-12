@@ -176,7 +176,7 @@ mod tests {
     use super::*;
 
     fn s(pts_ms: i64, key: bool) -> Sample {
-        Sample { track: 0, pts_ns: pts_ms * 1_000_000, dts_ns: pts_ms * 1_000_000, duration_ns: Some(40_000_000), key, data: vec![0; 10] }
+        Sample { track: 0, pts_ns: pts_ms * 1_000_000, dts_ns: pts_ms * 1_000_000, duration_ns: Some(40_000_000), key, data: vec![0; 10], crypto: None }
     }
 
     #[test]

@@ -167,8 +167,58 @@ pub struct TrackInfo {
     /// Encrypted (`ContentEncryption`, `encv`/`enca`): the player can't
     /// decode it without a CDM.
     pub encrypted: bool,
+    /// How it is encrypted, when the container says so in a form the player
+    /// can pass to a CDM (hospes.md §8.3). `None` for clear tracks, and for
+    /// encrypted ones in a scheme we don't support (`cens`, `cbc1`).
+    pub protection: Option<Protection>,
     /// Video: the container's colour description, if it has one.
     pub color: Option<Color>,
+}
+
+/// Common Encryption schemes the player passes to a CDM.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Scheme {
+    /// AES-CTR (`cenc`; WebM Encryption is the same cipher).
+    Cenc,
+    /// AES-CBC with a pattern and the IV restarting at every subsample (`cbcs`).
+    Cbcs,
+}
+
+/// A track's encryption defaults (`tenc`, or WebM's `ContentEncryption`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Protection {
+    pub scheme: Scheme,
+    pub key_id: [u8; 16],
+    /// Per-sample IV size (0, 8 or 16); 0 means every sample uses `constant_iv`.
+    pub iv_size: u8,
+    pub constant_iv: Vec<u8>,
+    /// `cbcs` pattern: encrypted then skipped 16-byte blocks (0:0 means all).
+    pub crypt_byte_block: u8,
+    pub skip_byte_block: u8,
+}
+
+/// One encrypted sample's parameters (CENC auxiliary information, or WebM's
+/// signal byte, IV and partitions). A sample without it is clear.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Crypto {
+    pub scheme: Scheme,
+    pub key_id: [u8; 16],
+    /// 8 or 16 bytes.
+    pub iv: Vec<u8>,
+    /// `(clear, encrypted)` byte runs covering the whole sample; empty means
+    /// all of it is encrypted.
+    pub subsamples: Vec<(u32, u32)>,
+    pub crypt_byte_block: u8,
+    pub skip_byte_block: u8,
+}
+
+/// What the page's EME `encrypted` event carries (W3C init data types).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InitDataKind {
+    /// Concatenated `pssh` boxes.
+    Cenc,
+    /// A WebM `ContentEncKeyID`.
+    WebM,
 }
 
 #[derive(Clone, PartialEq)]
@@ -179,6 +229,9 @@ pub struct Sample {
     pub duration_ns: Option<u64>,
     pub key: bool,
     pub data: Vec<u8>,
+    /// Set when this sample is encrypted; the bytes in `data` are then as
+    /// stored (encrypted), with WebM's encryption header already removed.
+    pub crypto: Option<Box<Crypto>>,
 }
 
 impl fmt::Debug for Sample {
@@ -190,6 +243,7 @@ impl fmt::Debug for Sample {
             .field("duration_ns", &self.duration_ns)
             .field("key", &self.key)
             .field("len", &self.data.len())
+            .field("crypto", &self.crypto)
             .finish()
     }
 }
@@ -202,6 +256,9 @@ pub enum Event {
     /// The duration the container declares, in seconds.
     Duration(f64),
     Sample(Sample),
+    /// Key-system initialisation data found in the container (after the
+    /// `Tracks` it belongs to). The player hands it to the key system.
+    InitData { kind: InitDataKind, data: Vec<u8> },
 }
 
 /// Which parser to use, from the first bytes.

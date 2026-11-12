@@ -410,6 +410,8 @@ impl Worker {
                 Event::Duration(secs) => {
                     let _ = self.send(Record::Duration { secs });
                 }
+                // Encrypted media is not played yet (no CDM attached).
+                Event::InitData { .. } => {}
                 Event::Sample(mut s) => {
                     let feed = &self.feeds[fi].1;
                     s.pts_ns = s.pts_ns.saturating_add(feed.offset_ns);

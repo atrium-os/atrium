@@ -5,7 +5,7 @@
 use std::collections::{HashMap, VecDeque};
 
 use crate::rd::Rd;
-use crate::{to_ns, Codec, Demuxer, Error, Event, Input, Kind, Limits, Result, Sample, TrackInfo};
+use crate::{to_ns, Codec, Crypto, Demuxer, Error, Event, InitDataKind, Input, Kind, Limits, Protection, Result, Sample, Scheme, TrackInfo};
 
 #[derive(Debug, Clone, Copy)]
 struct Pending {
@@ -62,6 +62,10 @@ pub struct Parser {
     want: Option<u64>,
     out: VecDeque<Event>,
     failed: Option<Error>,
+    /// CENC parameters of encrypted samples, by sample offset.
+    crypto: HashMap<u64, Box<Crypto>>,
+    /// `pssh` sets already announced.
+    init_data: Vec<Vec<u8>>,
 }
 
 type FourCc = [u8; 4];
@@ -83,6 +87,8 @@ impl Parser {
             want: None,
             out: VecDeque::new(),
             failed: None,
+            crypto: HashMap::new(),
+            init_data: Vec::new(),
         }
     }
 
@@ -133,6 +139,8 @@ impl Parser {
             let data = a[..s.size as usize].to_vec();
             self.inp.consume(s.size as usize);
             self.pending.pop_front();
+            // A plain file keeps its table (and the CENC data) for seeking.
+            let crypto = if self.index.is_empty() { self.crypto.remove(&s.offset) } else { self.crypto.get(&s.offset).cloned() };
             self.out.push_back(Event::Sample(Sample {
                 track: s.track,
                 pts_ns: s.pts,
@@ -140,6 +148,7 @@ impl Parser {
                 duration_ns: s.dur,
                 key: s.key,
                 data,
+                crypto,
             }));
             return Ok(true);
         }
@@ -181,10 +190,10 @@ impl Parser {
                     // after reading its mdat); a segment feed may send a new
                     // init segment at any time.
                     if self.index.is_empty() {
-                        self.moov(&body)?;
+                        self.moov(&body, body_start)?;
                     }
                 } else {
-                    self.moof(&body, pos)?;
+                    self.moof(&body, pos, body_start)?;
                 }
                 Ok(true)
             }
@@ -196,17 +205,20 @@ impl Parser {
         }
     }
 
-    fn moov(&mut self, b: &[u8]) -> Result<()> {
+    fn moov(&mut self, b: &[u8], b_abs: u64) -> Result<()> {
         let mut tracks = Vec::new();
         let mut trks = Vec::new();
         let mut by_id = HashMap::new();
         let mut index = Vec::new();
         let mut trex: HashMap<u32, Trex> = HashMap::new();
         let mut duration = None;
+        let mut pssh = Vec::new();
+        let mut crypto = HashMap::new();
         for bx in boxes(b) {
             let (ty, v) = bx?;
             match &ty {
                 b"mvhd" => duration = mvhd(v)?,
+                b"pssh" => push_pssh(&mut pssh, v),
                 b"mvex" => {
                     for bx in boxes(v) {
                         let (ty, v) = bx?;
@@ -223,7 +235,7 @@ impl Parser {
                         return Err(Error::TooBig("tracks"));
                     }
                     let idx = tracks.len() as u8;
-                    let (info, ts, shift, samples) = self.trak(v, idx, self.lim.max_index.saturating_sub(index.len()))?;
+                    let (info, ts, shift, samples) = self.trak(v, idx, self.lim.max_index.saturating_sub(index.len()), (b, b_abs), &mut crypto)?;
                     if by_id.insert(info.id as u32, idx).is_some() {
                         return Err(Error::Malformed("duplicate track id"));
                     }
@@ -244,7 +256,9 @@ impl Parser {
         self.trks = trks;
         self.by_id = by_id;
         self.moov_seen = true;
+        self.crypto = crypto;
         self.out.push_back(Event::Tracks(tracks));
+        self.announce(pssh);
         if let Some(d) = duration {
             self.out.push_back(Event::Duration(d));
         }
@@ -261,8 +275,9 @@ impl Parser {
     }
 
     /// (track, timescale, edit shift, plain sample table).
-    fn trak(&self, b: &[u8], idx: u8, room: usize) -> Result<(TrackInfo, u64, i64, Vec<Pending>)> {
+    fn trak(&self, b: &[u8], idx: u8, room: usize, outer: (&[u8], u64), crypto: &mut HashMap<u64, Box<Crypto>>) -> Result<(TrackInfo, u64, i64, Vec<Pending>)> {
         let mut id = 0u32;
+        let mut senc = None;
         let mut shift = 0i64;
         let mut ts = 0u64;
         let mut handler = [0u8; 4];
@@ -277,6 +292,8 @@ impl Parser {
                     r.skip(if ver == 1 { 16 } else { 8 })?;
                     id = r.u32()?;
                 }
+                // Where GPAC puts a plain file's sample encryption.
+                b"senc" => senc = Some(v),
                 // The first edit that shows media says where it starts.
                 b"edts" => {
                     for bx in boxes(v) {
@@ -339,8 +356,29 @@ impl Parser {
             return Err(Error::Malformed("trak without id or timescale"));
         }
         let stbl = stbl.ok_or(Error::Malformed("trak without stbl"))?;
-        let mut info = TrackInfo { index: idx, id: id as u64, codec: Codec::Unknown, kind: Kind::Other, config: Vec::new(), default_duration_ns: None, encrypted: false, color: None };
+        let mut info = TrackInfo { index: idx, id: id as u64, codec: Codec::Unknown, kind: Kind::Other, config: Vec::new(), default_duration_ns: None, encrypted: false, protection: None, color: None };
         let samples = self.stbl(stbl, &mut info, &handler, ts, shift, room)?;
+        // A fragmented file's moov has no samples; its fragments carry the aux information.
+        if let Some(p) = info.protection.as_ref().filter(|_| !samples.is_empty()) {
+            let (mut saiz, mut saio) = (None, None);
+            for bx in boxes(stbl) {
+                let (ty, v) = bx?;
+                match &ty {
+                    b"senc" => senc = Some(v),
+                    b"saiz" => saiz = Some(v),
+                    b"saio" => saio = Some(v),
+                    b"sbgp" | b"sgpd" if v.len() >= 8 && &v[4..8] == b"seig" => return Err(Error::Unsupported("CENC key rotation (seig)")),
+                    _ => {}
+                }
+            }
+            // A plain file's saio offsets are file offsets.
+            let aux = aux_info(Aux { senc, saiz, saio, outer, saio_base: 0 }, p, &samples)?;
+            for (s, c) in samples.iter().zip(aux) {
+                if let Some(c) = c {
+                    crypto.insert(s.offset, c);
+                }
+            }
+        }
         Ok((info, ts, shift, samples))
     }
 
@@ -572,10 +610,29 @@ impl Parser {
                 b"dOps" => opus_head = Some(dops_to_opushead(cv)?),
                 b"sinf" => {
                     info.encrypted = true;
+                    let mut scheme = None;
                     for bx in boxes(cv) {
                         let (sty, sv) = bx?;
-                        if &sty == b"frma" && sv.len() >= 4 {
-                            ty.copy_from_slice(&sv[..4]);
+                        match &sty {
+                            b"frma" if sv.len() >= 4 => ty.copy_from_slice(&sv[..4]),
+                            b"schm" if sv.len() >= 8 => {
+                                scheme = match &sv[4..8] {
+                                    b"cenc" => Some(Scheme::Cenc),
+                                    b"cbcs" => Some(Scheme::Cbcs),
+                                    _ => None,
+                                }
+                            }
+                            b"schi" => {
+                                for bx in boxes(sv) {
+                                    let (t, tv) = bx?;
+                                    if &t == b"tenc" {
+                                        if let Some(sc) = scheme {
+                                            info.protection = Some(tenc(tv, sc)?);
+                                        }
+                                    }
+                                }
+                            }
+                            _ => {}
                         }
                     }
                 }
@@ -606,16 +663,22 @@ impl Parser {
         Ok(())
     }
 
-    fn moof(&mut self, b: &[u8], moof_start: u64) -> Result<()> {
+    fn moof(&mut self, b: &[u8], moof_start: u64, b_abs: u64) -> Result<()> {
         if !self.moov_seen {
             return Err(Error::Malformed("moof before moov"));
         }
         let mut new = Vec::new();
+        let mut pssh = Vec::new();
         for bx in boxes(b) {
             let (ty, v) = bx?;
+            if &ty == b"pssh" {
+                push_pssh(&mut pssh, v);
+            }
             if &ty != b"traf" {
                 continue;
             }
+            let first = new.len();
+            let (mut senc, mut saiz, mut saio) = (None, None, None);
             let mut tf: Option<(u8, Trex, u64)> = None; // track, defaults, base offset
             let mut base_time = None;
             let mut data_ptr: Option<u64> = None;
@@ -711,14 +774,184 @@ impl Parser {
                         }
                         data_ptr = Some(ptr);
                     }
+                    b"senc" => senc = Some(v),
+                    b"saiz" => saiz = Some(v),
+                    b"saio" => saio = Some(v),
+                    b"sbgp" | b"sgpd" if v.len() >= 8 && &v[4..8] == b"seig" => return Err(Error::Unsupported("CENC key rotation (seig)")),
                     _ => {}
+                }
+            }
+            if let Some((ti, _, base)) = tf {
+                if let Some(p) = self.tracks[ti as usize].protection.clone() {
+                    // In a fragment, saio offsets count from the track fragment's base.
+                    let aux = aux_info(Aux { senc, saiz, saio, outer: (b, b_abs), saio_base: base }, &p, &new[first..])?;
+                    for (s, c) in new[first..].iter().zip(aux) {
+                        if let Some(c) = c {
+                            self.crypto.insert(s.offset, c);
+                        }
+                    }
                 }
             }
         }
         new.sort_by_key(|s| s.offset);
         self.pending.extend(new);
+        self.announce(pssh);
         Ok(())
     }
+}
+
+impl Parser {
+    /// Announce a new set of `pssh` boxes as init data (once each).
+    fn announce(&mut self, pssh: Vec<u8>) {
+        if !pssh.is_empty() && !self.init_data.contains(&pssh) {
+            self.init_data.push(pssh.clone());
+            self.out.push_back(Event::InitData { kind: InitDataKind::Cenc, data: pssh });
+        }
+    }
+}
+
+/// Re-frame a `pssh` box body as the whole box (EME's `cenc` init data is whole boxes).
+fn push_pssh(out: &mut Vec<u8>, body: &[u8]) {
+    out.extend_from_slice(&((body.len() + 8) as u32).to_be_bytes());
+    out.extend_from_slice(b"pssh");
+    out.extend_from_slice(body);
+}
+
+/// `tenc`: the track's key id and IV defaults.
+fn tenc(b: &[u8], scheme: Scheme) -> Result<Protection> {
+    let mut r = Rd::new(b);
+    let ver = r.u8()?;
+    r.skip(3)?;
+    r.skip(1)?;
+    let pattern = r.u8()?;
+    let (crypt, skip) = if ver >= 1 { (pattern >> 4, pattern & 0xf) } else { (0, 0) };
+    let protected = r.u8()?;
+    let iv_size = r.u8()?;
+    let mut key_id = [0u8; 16];
+    key_id.copy_from_slice(r.bytes(16)?);
+    let mut constant_iv = Vec::new();
+    if protected == 1 && iv_size == 0 {
+        let n = r.u8()? as usize;
+        if n != 8 && n != 16 {
+            return Err(Error::Malformed("tenc constant IV size"));
+        }
+        constant_iv = r.bytes(n)?.to_vec();
+    }
+    if !matches!(iv_size, 0 | 8 | 16) {
+        return Err(Error::Malformed("tenc IV size"));
+    }
+    if protected != 1 {
+        return Err(Error::Unsupported("tenc: track marked unprotected"));
+    }
+    Ok(Protection { scheme, key_id, iv_size, constant_iv, crypt_byte_block: crypt, skip_byte_block: skip })
+}
+
+/// Where a track's (or track fragment's) sample auxiliary information is.
+struct Aux<'a> {
+    senc: Option<&'a [u8]>,
+    saiz: Option<&'a [u8]>,
+    saio: Option<&'a [u8]>,
+    /// The box we hold in memory (moov or moof body) and its file offset: saio must point
+    /// inside it.
+    outer: (&'a [u8], u64),
+    /// What saio offsets are relative to.
+    saio_base: u64,
+}
+
+/// One `Crypto` per sample, in sample order: from `senc`, or from `saiz`/`saio`, or (no
+/// per-sample data) the constant IV with the whole sample encrypted.
+fn aux_info(a: Aux<'_>, p: &Protection, samples: &[Pending]) -> Result<Vec<Option<Box<Crypto>>>> {
+    let n = samples.len();
+    let make = |iv: Vec<u8>, subsamples: Vec<(u32, u32)>, size: u32| -> Result<Option<Box<Crypto>>> {
+        if !subsamples.is_empty() {
+            let total = subsamples.iter().map(|&(c, e)| c as u64 + e as u64).sum::<u64>();
+            if total != size as u64 {
+                return Err(Error::Malformed("CENC subsamples do not cover the sample"));
+            }
+        }
+        Ok(Some(Box::new(Crypto {
+            scheme: p.scheme,
+            key_id: p.key_id,
+            iv,
+            subsamples,
+            crypt_byte_block: p.crypt_byte_block,
+            skip_byte_block: p.skip_byte_block,
+        })))
+    };
+    let iv_of = |r: &mut Rd<'_>| -> Result<Vec<u8>> {
+        Ok(if p.iv_size == 0 { p.constant_iv.clone() } else { r.bytes(p.iv_size as usize)?.to_vec() })
+    };
+    let subs_of = |r: &mut Rd<'_>| -> Result<Vec<(u32, u32)>> {
+        let k = r.u16()? as usize;
+        if k * 6 > r.left() {
+            return Err(Error::Malformed("CENC subsample count"));
+        }
+        let mut v = Vec::with_capacity(k);
+        for _ in 0..k {
+            v.push((r.u16()? as u32, r.u32()?));
+        }
+        Ok(v)
+    };
+    let mut out = Vec::with_capacity(n);
+    if let Some(senc) = a.senc {
+        let mut r = Rd::new(senc);
+        let flags = r.u32()? & 0xFF_FFFF;
+        let count = r.u32()? as usize;
+        if count != n {
+            return Err(Error::Malformed("senc sample count"));
+        }
+        for s in samples {
+            let iv = iv_of(&mut r)?;
+            let subs = if flags & 0x2 != 0 { subs_of(&mut r)? } else { Vec::new() };
+            out.push(make(iv, subs, s.size)?);
+        }
+        return Ok(out);
+    }
+    if let (Some(saiz), Some(saio)) = (a.saiz, a.saio) {
+        let mut r = Rd::new(saiz);
+        let flags = r.u32()? & 0xFF_FFFF;
+        if flags & 1 != 0 {
+            r.skip(8)?; // aux_info_type and parameter
+        }
+        let default = r.u8()? as usize;
+        let count = r.u32()? as usize;
+        if count != n {
+            return Err(Error::Malformed("saiz sample count"));
+        }
+        let sizes: Vec<usize> = if default != 0 { vec![default; n] } else { r.bytes(n)?.iter().map(|&x| x as usize).collect() };
+        let mut r = Rd::new(saio);
+        let vf = r.u32()?;
+        if vf & 1 != 0 {
+            r.skip(8)?;
+        }
+        if r.u32()? != 1 {
+            return Err(Error::Unsupported("saio with more than one offset"));
+        }
+        let off = if vf >> 24 == 1 { r.u64()? } else { r.u32()? as u64 };
+        let abs = a.saio_base.checked_add(off).ok_or(Error::Malformed("saio offset"))?;
+        let (outer, outer_abs) = a.outer;
+        let start = abs.checked_sub(outer_abs).filter(|&o| o <= outer.len() as u64).ok_or(Error::Unsupported("CENC aux information outside moov/moof"))? as usize;
+        let total: usize = sizes.iter().sum();
+        let mut r = Rd::new(outer.get(start..start + total).ok_or(Error::Unsupported("CENC aux information outside moov/moof"))?);
+        for (s, &z) in samples.iter().zip(&sizes) {
+            let rec = r.bytes(z)?;
+            let mut q = Rd::new(rec);
+            let iv = iv_of(&mut q)?;
+            let subs = if q.left() > 0 { subs_of(&mut q)? } else { Vec::new() };
+            if q.left() != 0 {
+                return Err(Error::Malformed("CENC aux record size"));
+            }
+            out.push(make(iv, subs, s.size)?);
+        }
+        return Ok(out);
+    }
+    if p.iv_size == 0 && !p.constant_iv.is_empty() {
+        for s in samples {
+            out.push(make(p.constant_iv.clone(), Vec::new(), s.size)?);
+        }
+        return Ok(out);
+    }
+    Err(Error::Malformed("encrypted track without CENC aux information"))
 }
 
 impl Demuxer for Parser {

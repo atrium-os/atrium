@@ -5,7 +5,7 @@
 use std::collections::{HashMap, VecDeque};
 
 use crate::rd::{be_float, be_uint, Rd};
-use crate::{to_ns, Codec, Demuxer, Error, Event, Input, Kind, Limits, Result, Sample, TrackInfo};
+use crate::{to_ns, Codec, Crypto, Demuxer, Error, Event, InitDataKind, Input, Kind, Limits, Protection, Result, Sample, Scheme, TrackInfo};
 
 const EBML: u32 = 0x1A45_DFA3;
 const SEGMENT: u32 = 0x1853_8067;
@@ -295,7 +295,12 @@ impl Parser {
         self.tracks = tracks.clone();
         self.by_number = by_number;
         self.delay = delay;
+        let mut kids: Vec<[u8; 16]> = tracks.iter().filter_map(|t| t.protection.as_ref().map(|p| p.key_id)).collect();
+        kids.dedup();
         self.out.push_back(Event::Tracks(tracks));
+        for k in kids {
+            self.out.push_back(Event::InitData { kind: InitDataKind::WebM, data: k.to_vec() });
+        }
         Ok(())
     }
 
@@ -305,6 +310,7 @@ impl Parser {
         let (mut w, mut h, mut rate, mut channels) = (0u64, 0u64, 0f64, 1u64);
         let (mut default_duration, mut encrypted, mut codec_delay) = (None, false, 0u64);
         let mut color = None;
+        let mut protection = None;
         for el in children(b) {
             let (id, v) = el?;
             match id {
@@ -354,9 +360,12 @@ impl Parser {
                     for enc in children(v) {
                         let (_, enc) = enc?;
                         for el in children(enc) {
-                            let (id, _) = el?;
+                            let (id, v) = el?;
                             match id {
-                                0x5035 => encrypted = true,
+                                0x5035 => {
+                                    encrypted = true;
+                                    protection = content_encryption(v)?;
+                                }
                                 0x5034 => return Err(Error::Unsupported("compressed track")),
                                 _ => {}
                             }
@@ -400,7 +409,7 @@ impl Parser {
             Codec::Vorbis => vorbis_headers(&private)?,
             _ => private,
         };
-        Ok((TrackInfo { index, id: number, codec, kind, config, default_duration_ns: default_duration, encrypted, color }, codec_delay as i64))
+        Ok((TrackInfo { index, id: number, codec, kind, config, default_duration_ns: default_duration, encrypted, protection, color }, codec_delay as i64))
     }
 
     /// The SeekHead's entry for the Cues, if it has one.
@@ -500,15 +509,27 @@ impl Parser {
         let per = info.default_duration_ns.or_else(|| {
             dur.map(|d| to_ns(d as i128 * ts, 1_000_000_000).max(0) as u64 / frames.len().max(1) as u64)
         });
+        let prot = info.protection.clone();
+        if info.encrypted && prot.is_none() {
+            return Err(Error::Unsupported("encryption other than AES-CTR with a 16-byte key id"));
+        }
+        if prot.is_some() && frames.len() > 1 {
+            return Err(Error::Malformed("laced encrypted block"));
+        }
         for (i, f) in frames.into_iter().enumerate() {
             let t = t0.saturating_add(per.unwrap_or(0).saturating_mul(i as u64) as i64);
+            let (data, crypto) = match &prot {
+                Some(p) => encrypted_frame(f, p)?,
+                None => (f.to_vec(), None),
+            };
             self.out.push_back(Event::Sample(Sample {
                 track,
                 pts_ns: t,
                 dts_ns: t,
                 duration_ns: per,
                 key: key && i == 0,
-                data: f.to_vec(),
+                data,
+                crypto,
             }));
         }
         Ok(())
@@ -858,4 +879,71 @@ mod tests {
         // Frame over the cap
         assert_eq!(lace(&[0u8; 10], 0, 4), Err(Error::TooBig("frame")));
     }
+}
+
+/// `ContentEncryption`: AES (ContentEncAlgo 5) in CTR mode with a 16-byte key id is what a
+/// CDM can take; anything else leaves the track encrypted but unplayable (`None`).
+fn content_encryption(b: &[u8]) -> Result<Option<Protection>> {
+    let (mut algo, mut kid, mut mode) = (0u64, None, 1u64);
+    for el in children(b) {
+        let (id, v) = el?;
+        match id {
+            0x47E1 => algo = be_uint(v)?,
+            0x47E2 => kid = Some(v),
+            0x47E7 => {
+                for el in children(v) {
+                    let (id, v) = el?;
+                    if id == 0x47E8 {
+                        mode = be_uint(v)?;
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    let Some(kid) = kid.and_then(|k| <[u8; 16]>::try_from(k).ok()) else { return Ok(None) };
+    if algo != 5 || mode != 1 {
+        return Ok(None);
+    }
+    Ok(Some(Protection { scheme: Scheme::Cenc, key_id: kid, iv_size: 8, constant_iv: Vec::new(), crypt_byte_block: 0, skip_byte_block: 0 }))
+}
+
+/// One frame of an encrypted track (WebM Encryption): a signal byte, then for an encrypted
+/// frame an 8-byte IV and, if partitioned, the partition offsets. Partitions alternate clear
+/// and encrypted, starting clear. Returns the stored bytes and how to decrypt them.
+fn encrypted_frame(f: &[u8], p: &Protection) -> Result<(Vec<u8>, Option<Box<Crypto>>)> {
+    let (&signal, rest) = f.split_first().ok_or(Error::Malformed("empty encrypted frame"))?;
+    if signal & 0x01 == 0 {
+        return Ok((rest.to_vec(), None));
+    }
+    if rest.len() < 8 {
+        return Err(Error::Malformed("encrypted frame IV"));
+    }
+    let (iv, mut rest) = rest.split_at(8);
+    let mut subsamples = Vec::new();
+    if signal & 0x02 != 0 {
+        let (&n, r) = rest.split_first().ok_or(Error::Malformed("partition count"))?;
+        let n = n as usize;
+        if r.len() < 4 * n {
+            return Err(Error::Malformed("partition offsets"));
+        }
+        let (offs, data) = r.split_at(4 * n);
+        rest = data;
+        let mut points = Vec::with_capacity(n + 2);
+        points.push(0u32);
+        for c in offs.chunks_exact(4) {
+            let o = u32::from_be_bytes(c.try_into().unwrap());
+            if o < *points.last().unwrap() || o as usize > data.len() {
+                return Err(Error::Malformed("partition offset"));
+            }
+            points.push(o);
+        }
+        points.push(data.len() as u32);
+        let runs: Vec<u32> = points.windows(2).map(|w| w[1] - w[0]).collect();
+        for pair in runs.chunks(2) {
+            subsamples.push((pair[0], pair.get(1).copied().unwrap_or(0)));
+        }
+    }
+    let crypto = Crypto { scheme: Scheme::Cenc, key_id: p.key_id, iv: iv.to_vec(), subsamples, crypt_byte_block: 0, skip_byte_block: 0 };
+    Ok((rest.to_vec(), Some(Box::new(crypto))))
 }
