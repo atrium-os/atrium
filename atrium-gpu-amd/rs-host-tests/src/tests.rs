@@ -276,3 +276,88 @@ fn psp_plan_orders_and_checks() {
         let _ = find(&f[..n], ty::TOC);
     }
 }
+
+/// An RLC v2.2 file: RLC_G in the main array, then SRM list, IRAM, DRAM.
+fn rlc_v22() -> Vec<u8> {
+    // v2.0 fields (18) + v2.1 (13) + v2.2 (4) = 35 dwords after the common header.
+    let mut extra = [0u32; 35];
+    let h = 32 + 35 * 4; // 172, as gc_12_0_1_rlc.bin
+    let (g, srm, iram, dram) = (h as u32, h as u32 + 16, h as u32 + 24, h as u32 + 40);
+    // v2.1 at dword 18: direct_len, cntl{ver,feat,size,off}, gpm{..}, srm{ver,feat,size,off}
+    extra[18 + 11] = 8; // srm size
+    extra[18 + 12] = srm;
+    extra[31] = 16; // iram size
+    extra[32] = iram;
+    extra[33] = 8; // dram size
+    extra[34] = dram;
+    let mut f = fw_file(2, 2, &extra, 48);
+    put32(&mut f, 20, 16); // RLC_G size
+    let _ = g;
+    f
+}
+
+#[test]
+fn rlc_v22_regions() {
+    let f = rlc_v22();
+    let r = RlcFw::parse(&f).unwrap();
+    assert_eq!(r.rlc_g, Region { offset: 172, size: 16 });
+    assert_eq!(r.srl_srm, Region { offset: 188, size: 8 });
+    assert_eq!(r.srl_gpm.size, 0);
+    assert_eq!(r.iram, Region { offset: 196, size: 16 });
+    assert_eq!(r.dram, Region { offset: 212, size: 8 });
+    // Unknown minor versions and out-of-file regions are refused.
+    let mut bad = f.clone();
+    put16(&mut bad, 10, 6);
+    assert!(matches!(RlcFw::parse(&bad), Err(FwError::UnknownVersion { .. })));
+    let mut bad = f.clone();
+    put32(&mut bad, 32 + 33 * 4, 0x10000);
+    assert_eq!(RlcFw::parse(&bad), Err(FwError::RegionOutOfBounds));
+    for n in 0..f.len() {
+        let _ = RlcFw::parse(&f[..n]);
+    }
+}
+
+#[test]
+fn ip_fw_plan_order() {
+    use crate::ip_fw::*;
+    let smu = fw_file(2, 0, &[0x20000, 0, 0], 32);
+    let sdma = fw_file(3, 0, &[1, 44, 4], 8);
+    let rs64 = |p| fw_file(2, 0, &[1, 8, 60, 8, 68, 0, 0], p);
+    let (pfp, me, mec) = (rs64(16), rs64(16), rs64(16));
+    let mes = fw_file(1, 0, &[3, 8, 72, 4, 8, 80, 0, 0, 0, 0], 16);
+    let imu = fw_file(1, 0, &[8, 0, 8, 0], 16);
+    let rlc = rlc_v22();
+    let files: [&[u8]; file::COUNT] = [&smu, &sdma, &pfp, &me, &mec, &mes, &imu, &rlc];
+    let mut it = [Item::default(); MAX_ITEMS];
+    let n = plan(&files, &mut it).unwrap();
+    let types: Vec<u32> = it[..n].iter().map(|x| x.fw_type).collect();
+    assert_eq!(types, [ty::SMU, ty::SDMA_UCODE_TH0, ty::RS64_PFP, ty::RS64_ME, ty::RS64_MEC,
+        ty::RS64_PFP_P0_STACK, ty::RS64_ME_P0_STACK, ty::RS64_MEC_P0_STACK, ty::RS64_MEC_P1_STACK,
+        ty::CP_MES, ty::MES_STACK, ty::CP_MES_KIQ, ty::MES_KIQ_STACK, ty::IMU_I, ty::IMU_D,
+        ty::RLC_RESTORE_LIST_SRM_MEM, ty::RLC_IRAM, ty::RLC_DRAM_BOOT, ty::RLC_G]);
+    assert_eq!(it[n - 1], Item { file: file::RLC, fw_type: ty::RLC_G, offset: 172, size: 16 });
+    assert_eq!((it[5].file, it[5].offset, it[5].size), (file::PFP, 68, 8));
+    // A refused file is named.
+    let files: [&[u8]; file::COUNT] = [&smu, &sdma, &pfp, &me, &mec, &mes, &imu, &rlc[..100]];
+    assert!(matches!(plan(&files, &mut it), Err(PlanError::Fw(file::RLC, _))));
+}
+
+/// With AMDGPU_FW_DIR pointing at linux-firmware's amdgpu/ (or a copy of the
+/// R9700's files), plan the real gc_12_0_1 / sdma_7_0_1 / smu_14_0_3 set.
+#[test]
+fn ip_fw_plan_real_files() {
+    use crate::ip_fw::*;
+    let Ok(dir) = std::env::var("AMDGPU_FW_DIR") else { return };
+    let names = ["smu_14_0_3.bin", "sdma_7_0_1.bin", "gc_12_0_1_pfp.bin", "gc_12_0_1_me.bin",
+        "gc_12_0_1_mec.bin", "gc_12_0_1_uni_mes.bin", "gc_12_0_1_imu.bin", "gc_12_0_1_rlc.bin"];
+    let data: Vec<Vec<u8>> = names.iter().map(|n| std::fs::read(std::format!("{dir}/{n}")).unwrap()).collect();
+    let files: [&[u8]; file::COUNT] = core::array::from_fn(|i| data[i].as_slice());
+    let mut it = [Item::default(); MAX_ITEMS];
+    let n = plan(&files, &mut it).unwrap();
+    for x in &it[..n] {
+        std::println!("{:>2} type {:>3} off {:>6} size {:>6}", x.file, x.fw_type, x.offset, x.size);
+    }
+    assert_eq!(n, 20);
+    assert_eq!(it[0], Item { file: file::SMU, fw_type: ty::SMU, offset: 256, size: 327168 });
+    assert_eq!(it[n - 1], Item { file: file::RLC, fw_type: ty::RLC_G, offset: 256, size: 25088 });
+}

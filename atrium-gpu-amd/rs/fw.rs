@@ -241,6 +241,101 @@ impl SdmaFw {
     }
 }
 
+/// RLC firmware, `rlc_firmware_header_v2_0` to `_v2_5`. Each minor version
+/// appends regions; a region of size 0 is absent. The main array (the common
+/// header's) is RLC_G.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct RlcFw {
+    pub minor: u16,
+    pub rlc_g: Region,
+    /// v2.1: save/restore lists.
+    pub srl_cntl: Region,
+    pub srl_gpm: Region,
+    pub srl_srm: Region,
+    /// v2.2+: RLC IRAM / DRAM boot images.
+    pub iram: Region,
+    pub dram: Region,
+    /// v2.3/v2.4: RLC-P and RLC-V.
+    pub rlcp: Region,
+    pub rlcv: Region,
+    /// v2.4: tap delays (global, SE0..SE3).
+    pub tap: [Region; 5],
+    /// v2.5: second RLC core's IRAM / DRAM.
+    pub iram_1: Region,
+    pub dram_1: Region,
+}
+
+impl Default for Region {
+    fn default() -> Region {
+        Region { offset: 0, size: 0 }
+    }
+}
+
+impl RlcFw {
+    pub fn parse(file: &[u8]) -> Result<RlcFw, FwError> {
+        let common = CommonHeader::parse(file)?;
+        let (major, minor) = common.version();
+        if major != 2 || minor > 5 {
+            return Err(FwError::UnknownVersion { major, minor });
+        }
+        // Fixed part sizes: v2.0 = 32 + 18 dwords; v2.1 adds 13; v2.2 adds
+        // 4; v2.3 adds 8 to v2.2; v2.4 adds 10 to v2.3; v2.5 adds 4 to v2.2.
+        const V20: usize = COMMON_HEADER_LEN + 18 * 4;
+        const V21: usize = V20 + 13 * 4;
+        const V22: usize = V21 + 4 * 4;
+        const V23: usize = V22 + 8 * 4;
+        let need = match minor {
+            0 => V20,
+            1 => V21,
+            2 => V22,
+            3 => V23,
+            4 => V23 + 10 * 4,
+            _ => V22 + 4 * 4,
+        };
+        need_header(&common, need)?;
+        // (size, offset) pair at `at`, offsets from the start of the file.
+        let reg = |at: usize| -> Result<Region, FwError> {
+            Region::checked(file.len(), le32(file, at + 4)?, le32(file, at)?)
+        };
+        let mut r = RlcFw { minor, rlc_g: common.ucode(file)?, ..RlcFw::default() };
+        if minor >= 1 {
+            r.srl_cntl = reg(V20 + 12)?;
+            r.srl_gpm = reg(V20 + 28)?;
+            r.srl_srm = reg(V20 + 44)?;
+        }
+        if minor >= 2 {
+            r.iram = reg(V21)?;
+            r.dram = reg(V21 + 8)?;
+        }
+        if minor == 3 || minor == 4 {
+            r.rlcp = reg(V22 + 8)?;
+            r.rlcv = reg(V22 + 24)?;
+        }
+        if minor == 4 {
+            for (i, t) in r.tap.iter_mut().enumerate() {
+                *t = reg(V23 + 8 * i)?;
+            }
+        }
+        if minor == 5 {
+            r.iram_1 = reg(V22)?;
+            r.dram_1 = reg(V22 + 8)?;
+        }
+        Ok(r)
+    }
+}
+
+/// SMU firmware (`smc_firmware_header_v1_0` / `_v2_x`): the main array is
+/// the PMFW image the PSP loads; anything after it (soft pptables) is not
+/// sent on SMU 14 (the PMFW carries its own table).
+pub fn smu_image(file: &[u8]) -> Result<Region, FwError> {
+    let common = CommonHeader::parse(file)?;
+    let (major, minor) = common.version();
+    if major != 1 && major != 2 {
+        return Err(FwError::UnknownVersion { major, minor });
+    }
+    common.ucode(file)
+}
+
 /// One sub-binary of a PSP v2 file (SOS, sys driver, KDB, SPL, ...).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PspBin {

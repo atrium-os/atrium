@@ -98,6 +98,32 @@ firmware is loaded as opaque blobs; only container headers are parsed (`rs/fw.rs
 The step runs as a separate, explicitly loaded test module first (`atrium_gpu_psp_test`),
 not in the normal attach, so a hang cannot happen at boot.
 
+## 4.2 Stage 3c plan: IP microcode through the PSP
+
+Same sources as §4.1, plus `amdgpu_ucode.c` (which region of each file is an image) and
+`gfx_v12_0.c` (what the driver waits for). Selected by discovered versions: GC 12.x,
+SDMA 7.x, SMU (MP1) 14.x, PSP 14.x. Opt-in: `kenv hw.atrium_gpu.psp_ipfw=1` together
+with `psp_bootload=1`.
+
+1. **After the ring:** FB_FW_RESERV_ADDR / _EXT_ADDR (0x50 / 0x51), read only: where the
+   PSP keeps its firmware at the top of VRAM, logged for the VRAM allocator. Then
+   LOAD_TOC as before. No SETUP_TMR: PSP 14.0.x sets up its TMR at boot (amdgpu's
+   `boot_time_tmr`); the TOC reply's TMR size 0 confirms it.
+2. **Files** from `/boot/firmware/amdgpu/`, names from the versions:
+   `smu_14_0_3.bin`, `sdma_7_0_1.bin`, `gc_12_0_1_{pfp,me,mec,uni_mes,imu,rlc}.bin`.
+   amdgpu picks `*_kicker.bin` variants for a few boards by PCI id and revision; ours
+   (rev c0) takes the plain files. Choosing kicker images without a device id is open.
+3. **Plan** (`rs/ip_fw.rs`, host-tested on the real files): 20 images, in amdgpu's order.
+   SMU first, then SDMA (TH0), RS64 PFP/ME/MEC, their stacks (MEC P0 and P1), unified MES
+   code and data for both pipes, IMU I/D, RLC restore lists (GPM, SRM), RLC IRAM/DRAM,
+   RLC_G last. About 3.7 MiB, staged 4 KiB aligned at VRAM + 68 MiB, one HDP flush.
+4. **Load:** one LOAD_IP_FW (0x06) per image; any non-zero status stops. Then
+   AUTOLOAD_RLC (0x21), and wait up to 2 s for `RLC_RLCS_BOOTLOAD_STATUS` bit 31 and
+   `CP_STAT` = 0 (GC segments 1 and 0 from discovery).
+5. **Once per cold boot.** If the RLC already reports bootload complete, nothing is sent.
+   Reloading needs a mode-1 reset first (amdgpu resets on init when it finds the sOS
+   running); that is stage 4 work. A failure part-way leaves the card for a power cycle.
+
 ## 5. Log
 
 - **2026-11-12, stage 1 done.** First bare-metal boot: bundle `03715a5` booted via
@@ -133,3 +159,9 @@ not in the normal attach, so a hang cannot happen at boot.
   hang; device handed back to vgapci, module unloaded. The sOS keeps running until a cold
   boot, so later loads take the "already running" path. Next: KM ring, TMR, then IP
   microcode through the PSP.
+- **2026-11-12, stage 3 step 2: PSP command ring.** `46affd4f` / `c9611fb9`: the KM ring
+  is created (C2PMSG_64 0x80c20000) and destroyed cleanly, also a ring left by an earlier
+  load. LOAD_TOC (2304 bytes) completes through the fence with status 0 and TMR size 0.
+  With the response pre-filled with 0xdeadbeef, the PSP wrote status, session id and TMR
+  size (all 0) and left the rest, so 0 is the PSP's answer: the TMR was set up at boot
+  (`boot_time_tmr`), and no SETUP_TMR is sent. The sOS keeps running across loads.

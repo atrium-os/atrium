@@ -19,6 +19,8 @@ pub mod ipinfo;
 pub mod fw;
 #[path = "../rs/psp_plan.rs"]
 pub mod psp_plan;
+#[path = "../rs/ip_fw.rs"]
+pub mod ip_fw;
 
 /// # Safety
 /// `bin` points to `len` readable bytes and `out` to a writable
@@ -90,5 +92,43 @@ pub unsafe extern "C" fn atrium_amd_psp_find(
         }
         Ok(None) => 0,
         Err(_) => -2,
+    }
+}
+
+/// Plan the LOAD_IP_FW sequence from the eight firmware files (order of
+/// `ip_fw::file`): fill `out[..max]`, return the count, or a negative code
+/// -(100 * (file + 1) + 1) if file `file` is refused, -2 for an oversized
+/// image, -3 for a required empty one.
+///
+/// # Safety
+/// `bins[i]` points to `lens[i]` readable bytes for i < 8; `out` to `max`
+/// writable items.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn atrium_amd_ip_fw_plan(
+    bins: *const *const u8,
+    lens: *const usize,
+    out: *mut ip_fw::Item,
+    max: usize,
+) -> i32 {
+    if bins.is_null() || lens.is_null() || out.is_null() || max < ip_fw::MAX_ITEMS {
+        return -1;
+    }
+    let mut files: [&[u8]; ip_fw::file::COUNT] = [&[]; ip_fw::file::COUNT];
+    for (i, f) in files.iter_mut().enumerate() {
+        // SAFETY: per the contract above.
+        let (p, n) = unsafe { (*bins.add(i), *lens.add(i)) };
+        if p.is_null() {
+            return -1;
+        }
+        // SAFETY: per the contract above.
+        *f = unsafe { core::slice::from_raw_parts(p, n) };
+    }
+    // SAFETY: per the contract above.
+    let o = unsafe { &mut *(out as *mut [ip_fw::Item; ip_fw::MAX_ITEMS]) };
+    match ip_fw::plan(&files, o) {
+        Ok(n) => n as i32,
+        Err(ip_fw::PlanError::Fw(i, _)) => -(100 * (i as i32 + 1) + 1),
+        Err(ip_fw::PlanError::TooBig(_)) => -2,
+        Err(ip_fw::PlanError::Empty(_)) => -3,
     }
 }

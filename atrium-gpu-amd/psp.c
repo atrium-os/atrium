@@ -17,6 +17,12 @@
  * ring and send one command, LOAD_TOC, whose response carries the TMR size
  * the PSP wants: a harmless check that the ring protocol works end to end.
  *
+ * Second opt-in, hw.atrium_gpu.psp_ipfw=1: after LOAD_TOC, query the PSP's
+ * firmware reservation, then hand it every GC/SDMA/SMU microcode image with
+ * LOAD_IP_FW (order and types from the Rust planner, rs/ip_fw.rs), send
+ * AUTOLOAD_RLC and wait for the RLC to report bootload complete. Once per
+ * cold boot: if the RLC already reports it, nothing is sent.
+ *
  * The staging buffer lives in VRAM (amdgpu's debug_use_vram_fw_buf path),
  * written through BAR0; its GPU address is MMHUB's FB_LOCATION_BASE << 24
  * plus the offset, as the VBIOS programmed it. No bus mastering is needed.
@@ -58,11 +64,20 @@
 #define PSP_CMD_SIZE		0x1000u
 #define PSP_FENCE_VRAM_OFF	(PSP_CMD_VRAM_OFF + PSP_CMD_SIZE)
 #define PSP_VRAM_END		(PSP_FENCE_VRAM_OFF + 0x1000u)
+/* IP microcode images, each 4 KiB aligned (LOAD_IP_FW wants that). */
+#define PSP_FW_VRAM_OFF		(68u << 20)
+#define PSP_FW_AREA		(16u << 20)
+#define PSP_FW_VRAM_END		(PSP_FW_VRAM_OFF + PSP_FW_AREA)
 #define PSP_CMD_WAIT_US		5000000
 
 /* GFX command buffer (psp_gfx_if.h, 1024 bytes) and ring frame (64). */
 #define GFX_CMD_BUF_VERSION	1
+#define GFX_CMD_ID_LOAD_IP_FW	0x06
 #define GFX_CMD_ID_LOAD_TOC	0x20
+#define GFX_CMD_ID_AUTOLOAD_RLC	0x21
+#define GFX_CMD_ID_FB_FW_RESERV_ADDR	0x50
+#define GFX_CMD_ID_FB_FW_RESERV_EXT_ADDR 0x51
+#define PSP_ERR_UNKNOWN_COMMAND	0x100
 #define GFX_CMD_BUF_LEN		1024
 #define GFX_CMD_OFF_SIZE	0
 #define GFX_CMD_OFF_VERSION	4
@@ -70,7 +85,10 @@
 #define GFX_CMD_OFF_CMD		28	/* union psp_gfx_commands */
 #define GFX_CMD_OFF_RESP	864	/* struct psp_gfx_resp */
 #define GFX_RESP_OFF_STATUS	0
+#define GFX_RESP_OFF_FW_ADDR_LO	8
+#define GFX_RESP_OFF_FW_ADDR_HI	12
 #define GFX_RESP_OFF_TMR_SIZE	16
+#define GFX_RESP_OFF_URESP	64	/* union psp_gfx_uresp */
 #define RB_FRAME_LEN		64
 #define RB_OFF_CMD_LO		0
 #define RB_OFF_CMD_HI		4
@@ -91,6 +109,20 @@ int	atrium_amd_psp_plan(const uint8_t *bin, size_t len,
 int	atrium_amd_psp_find(const uint8_t *bin, size_t len, uint32_t type,
 	    uint32_t *off, uint32_t *size);		/* Rust */
 #define PSP_MAX_STEPS		10
+
+/* GC 12.x (gc_12_0_0_offset.h): dword offsets in GC segments 0 and 1. */
+#define GC12_CP_STAT			0x0f40	/* seg 0 */
+#define GC12_RLC_RLCS_BOOTLOAD_STATUS	0x4e7c	/* seg 1 */
+#define GC12_BOOTLOAD_COMPLETE		0x80000000u
+#define PSP_AUTOLOAD_WAIT_US		2000000
+
+struct amd_ip_fw_item {
+	uint32_t file, fw_type, offset, size;
+};
+int	atrium_amd_ip_fw_plan(const uint8_t *const *bins, const size_t *lens,
+	    struct amd_ip_fw_item *out, size_t max);	/* Rust, rs/ip_fw.rs */
+#define IP_FW_FILES		8
+#define IP_FW_MAX_ITEMS		32
 
 static bus_size_t
 psp_reg(struct atrium_amd_softc *sc, uint32_t dw)
@@ -214,12 +246,46 @@ psp_cmd_submit(struct atrium_amd_softc *sc, struct resource *vram,
 	return (0);
 }
 
+/*
+ * Build a GFX command (`cmd_id`, `nargs` dwords of its union) at
+ * PSP_CMD_VRAM_OFF, submit it with fence value `fence`, and return the
+ * response's status in *status. The response is pre-filled with a pattern so
+ * fields the PSP leaves alone stand out.
+ */
+static int
+psp_cmd(struct atrium_amd_softc *sc, struct resource *vram, uint64_t fb_base,
+    uint32_t cmd_id, const uint32_t *args, int nargs, uint32_t fence,
+    uint32_t *status)
+{
+	int k;
+
+	bus_set_region_4(vram, PSP_CMD_VRAM_OFF, 0, PSP_CMD_SIZE / 4);
+	bus_write_4(vram, PSP_CMD_VRAM_OFF + GFX_CMD_OFF_SIZE, GFX_CMD_BUF_LEN);
+	bus_write_4(vram, PSP_CMD_VRAM_OFF + GFX_CMD_OFF_VERSION,
+	    GFX_CMD_BUF_VERSION);
+	bus_write_4(vram, PSP_CMD_VRAM_OFF + GFX_CMD_OFF_ID, cmd_id);
+	for (k = 0; k < nargs; k++)
+		bus_write_4(vram, PSP_CMD_VRAM_OFF + GFX_CMD_OFF_CMD + 4 * k,
+		    args[k]);
+	bus_set_region_4(vram, PSP_CMD_VRAM_OFF + GFX_CMD_OFF_RESP, 0xdeadbeef,
+	    (GFX_CMD_BUF_LEN - GFX_CMD_OFF_RESP) / 4);
+	bus_write_4(vram, PSP_FENCE_VRAM_OFF, 0);
+	psp_hdp_flush(sc);
+	return (psp_cmd_submit(sc, vram, fb_base, fence, status));
+}
+
+static uint32_t
+psp_resp(struct resource *vram, uint32_t off)
+{
+	return (bus_read_4(vram, PSP_CMD_VRAM_OFF + GFX_CMD_OFF_RESP + off));
+}
+
 /* LOAD_TOC: the PSP reads the table of contents and answers the TMR size. */
 static int
 psp_load_toc(struct atrium_amd_softc *sc, struct resource *vram,
-    uint64_t fb_base, const struct firmware *fw)
+    uint64_t fb_base, const struct firmware *fw, uint32_t fence)
 {
-	uint32_t off, size, status, tmr;
+	uint32_t off, size, status, tmr, args[3];
 	uint64_t mc = fb_base + PSP_BUF_VRAM_OFF;
 	int r, err;
 
@@ -234,22 +300,12 @@ psp_load_toc(struct atrium_amd_softc *sc, struct resource *vram,
 	bus_write_region_1(vram, PSP_BUF_VRAM_OFF,
 	    (const uint8_t *)fw->data + off, size);
 
-	bus_set_region_4(vram, PSP_CMD_VRAM_OFF, 0, PSP_CMD_SIZE / 4);
-	bus_write_4(vram, PSP_CMD_VRAM_OFF + GFX_CMD_OFF_SIZE, GFX_CMD_BUF_LEN);
-	bus_write_4(vram, PSP_CMD_VRAM_OFF + GFX_CMD_OFF_VERSION,
-	    GFX_CMD_BUF_VERSION);
-	bus_write_4(vram, PSP_CMD_VRAM_OFF + GFX_CMD_OFF_ID, GFX_CMD_ID_LOAD_TOC);
-	bus_write_4(vram, PSP_CMD_VRAM_OFF + GFX_CMD_OFF_CMD + 0, (uint32_t)mc);
-	bus_write_4(vram, PSP_CMD_VRAM_OFF + GFX_CMD_OFF_CMD + 4,
-	    (uint32_t)(mc >> 32));
-	bus_write_4(vram, PSP_CMD_VRAM_OFF + GFX_CMD_OFF_CMD + 8, size);
-	/* A pattern in the response: what the PSP writes stands out. */
-	bus_set_region_4(vram, PSP_CMD_VRAM_OFF + GFX_CMD_OFF_RESP, 0xdeadbeef,
-	    (GFX_CMD_BUF_LEN - GFX_CMD_OFF_RESP) / 4);
-	bus_write_4(vram, PSP_FENCE_VRAM_OFF, 0);
 	psp_hdp_flush(sc);
-
-	err = psp_cmd_submit(sc, vram, fb_base, 1, &status);
+	args[0] = (uint32_t)mc;
+	args[1] = (uint32_t)(mc >> 32);
+	args[2] = size;
+	err = psp_cmd(sc, vram, fb_base, GFX_CMD_ID_LOAD_TOC, args, 3, fence,
+	    &status);
 	tmr = bus_read_4(vram, PSP_CMD_VRAM_OFF + GFX_CMD_OFF_RESP +
 	    GFX_RESP_OFF_TMR_SIZE);
 	{
@@ -268,6 +324,194 @@ psp_load_toc(struct atrium_amd_softc *sc, struct resource *vram,
 	    "TMR size %#x (%u MiB)\n", size, err == 0 ? "done" : "failed",
 	    status, tmr, tmr >> 20);
 	return (err != 0 ? err : (status != 0 ? EIO : 0));
+}
+
+/*
+ * FB_FW_RESERV_ADDR / _EXT_ADDR: where the PSP keeps its own firmware in
+ * VRAM (amdgpu's psp_update_fw_reservation, PSP 14). Read only: logged so the
+ * VRAM allocator can keep out of it; an sOS that does not know the command
+ * answers PSP_ERR_UNKNOWN_COMMAND.
+ */
+static void
+psp_fw_reservation(struct atrium_amd_softc *sc, struct resource *vram,
+    uint64_t fb_base, uint32_t *fence)
+{
+	static const struct { uint32_t id; const char *name; } q[] = {
+		{ GFX_CMD_ID_FB_FW_RESERV_ADDR, "fw reservation" },
+		{ GFX_CMD_ID_FB_FW_RESERV_EXT_ADDR, "fw reservation (ext)" },
+	};
+	uint64_t memsize, addr;
+	uint32_t status, size;
+	u_int i;
+
+	memsize = (uint64_t)amd_mmio_read32(sc,
+	    ((bus_size_t)sc->ip.nbif.base[2] + NBIF6_RCC_CONFIG_MEMSIZE) * 4) << 20;
+	for (i = 0; i < nitems(q); i++) {
+		if (psp_cmd(sc, vram, fb_base, q[i].id, NULL, 0, ++*fence,
+		    &status) != 0)
+			return;
+		if (status == PSP_ERR_UNKNOWN_COMMAND) {
+			device_printf(sc->dev, "psp: %s: not supported\n",
+			    q[i].name);
+			continue;
+		}
+		addr = (uint64_t)psp_resp(vram, GFX_RESP_OFF_URESP) << 32 |
+		    psp_resp(vram, GFX_RESP_OFF_URESP + 4);
+		size = psp_resp(vram, GFX_RESP_OFF_URESP + 8);
+		device_printf(sc->dev, "psp: %s: status %#x, VRAM %#jx + %#x "
+		    "(%u MiB)%s\n", q[i].name, status, (uintmax_t)addr, size,
+		    size >> 20, size != 0 && addr + size != memsize ?
+		    " NOT at the top of VRAM" : "");
+	}
+}
+
+static bool
+gc_reg_ok(struct atrium_amd_softc *sc, u_int seg, uint32_t dw)
+{
+	return (sc->ip.gc.nbase > seg &&
+	    ((bus_size_t)sc->ip.gc.base[seg] + dw) * 4 + 4 <=
+	    rman_get_size(sc->regs));
+}
+
+static uint32_t
+gc_read(struct atrium_amd_softc *sc, u_int seg, uint32_t dw)
+{
+	return (amd_mmio_read32(sc, ((bus_size_t)sc->ip.gc.base[seg] + dw) * 4));
+}
+
+/*
+ * LOAD_IP_FW for every GC/SDMA/SMU image, then AUTOLOAD_RLC. Files are
+ * picked by discovered version; the planner says what goes where.
+ */
+static int
+psp_load_ip_fw(struct atrium_amd_softc *sc, struct resource *vram,
+    uint64_t fb_base, uint32_t *fence)
+{
+	static const char *const suffix[IP_FW_FILES] = {
+		NULL, NULL, "pfp", "me", "mec", "uni_mes", "imu", "rlc",
+	};
+	const struct firmware *fw[IP_FW_FILES] = { 0 };
+	const uint8_t *bins[IP_FW_FILES];
+	size_t lens[IP_FW_FILES];
+	struct amd_ip_fw_item it[IP_FW_MAX_ITEMS];
+	uint32_t at[IP_FW_MAX_ITEMS], args[4], status, cp, bl, end;
+	const struct amd_ip_ver *gc = &sc->ip.gc, *sd = &sc->ip.sdma0,
+	    *mp1 = &sc->ip.mp1;
+	char name[64];
+	int i, n, us, err = 0;
+
+	if (!gc->present || gc->major != 12 || !sd->present || sd->major != 7 ||
+	    !mp1->present || mp1->major != 14) {
+		device_printf(sc->dev, "psp: GC %u.x / SDMA %u.x / SMU %u.x: no "
+		    "IP firmware plan here\n", gc->major, sd->major, mp1->major);
+		return (ENOTSUP);
+	}
+	if (!gc_reg_ok(sc, 0, GC12_CP_STAT) ||
+	    !gc_reg_ok(sc, 1, GC12_RLC_RLCS_BOOTLOAD_STATUS))
+		return (ENXIO);
+	bl = gc_read(sc, 1, GC12_RLC_RLCS_BOOTLOAD_STATUS);
+	cp = gc_read(sc, 0, GC12_CP_STAT);
+	device_printf(sc->dev, "psp: before: RLC bootload status %#x, CP_STAT "
+	    "%#x\n", bl, cp);
+	if (bl & GC12_BOOTLOAD_COMPLETE) {
+		device_printf(sc->dev, "psp: GC firmware already loaded this "
+		    "boot; not loading again (needs a reset first)\n");
+		return (0);
+	}
+
+	for (i = 0; i < IP_FW_FILES; i++) {
+		if (i == 0)
+			snprintf(name, sizeof(name), "amdgpu/smu_%u_%u_%u.bin",
+			    mp1->major, mp1->minor, mp1->rev);
+		else if (i == 1)
+			snprintf(name, sizeof(name), "amdgpu/sdma_%u_%u_%u.bin",
+			    sd->major, sd->minor, sd->rev);
+		else
+			snprintf(name, sizeof(name), "amdgpu/gc_%u_%u_%u_%s.bin",
+			    gc->major, gc->minor, gc->rev, suffix[i]);
+		fw[i] = firmware_get_flags(name, FIRMWARE_GET_NOWARN);
+		if (fw[i] == NULL) {
+			device_printf(sc->dev, "psp: no /boot/firmware/%s\n",
+			    name);
+			err = ENOENT;
+			goto out;
+		}
+		bins[i] = fw[i]->data;
+		lens[i] = fw[i]->datasize;
+	}
+	n = atrium_amd_ip_fw_plan(bins, lens, it, IP_FW_MAX_ITEMS);
+	if (n <= 0) {
+		device_printf(sc->dev, "psp: IP firmware refused by the planner "
+		    "(%d)\n", n);
+		err = EINVAL;
+		goto out;
+	}
+
+	/* Stage every image, 4 KiB aligned, then flush once. */
+	end = PSP_FW_VRAM_OFF;
+	for (i = 0; i < n; i++) {
+		at[i] = end;
+		end = roundup2(end + it[i].size, 0x1000);
+		if (end > PSP_FW_VRAM_END) {
+			device_printf(sc->dev, "psp: IP firmware does not fit "
+			    "%u MiB\n", PSP_FW_AREA >> 20);
+			err = EFBIG;
+			goto out;
+		}
+		if (it[i].file >= IP_FW_FILES) {
+			err = EINVAL;
+			goto out;
+		}
+		bus_write_region_1(vram, at[i],
+		    bins[it[i].file] + it[i].offset, it[i].size);
+	}
+	psp_hdp_flush(sc);
+	device_printf(sc->dev, "psp: %d IP firmware images, %u KiB staged at "
+	    "VRAM+%#x\n", n, (end - PSP_FW_VRAM_OFF) >> 10, PSP_FW_VRAM_OFF);
+
+	for (i = 0; i < n; i++) {
+		uint64_t mc = fb_base + at[i];
+
+		args[0] = (uint32_t)mc;
+		args[1] = (uint32_t)(mc >> 32);
+		args[2] = it[i].size;
+		args[3] = it[i].fw_type;
+		err = psp_cmd(sc, vram, fb_base, GFX_CMD_ID_LOAD_IP_FW, args, 4,
+		    ++*fence, &status);
+		device_printf(sc->dev, "psp: LOAD_IP_FW type %u, %u bytes: "
+		    "status %#x%s\n", it[i].fw_type, it[i].size, status,
+		    err != 0 ? " (timed out)" : "");
+		if (err == 0 && status != 0)
+			err = EIO;
+		if (err != 0)
+			goto out;
+	}
+
+	err = psp_cmd(sc, vram, fb_base, GFX_CMD_ID_AUTOLOAD_RLC, NULL, 0,
+	    ++*fence, &status);
+	device_printf(sc->dev, "psp: AUTOLOAD_RLC: status %#x%s\n", status,
+	    err != 0 ? " (timed out)" : "");
+	if (err == 0 && status != 0)
+		err = EIO;
+	if (err != 0)
+		goto out;
+	for (us = 0; us < PSP_AUTOLOAD_WAIT_US; us += 100) {
+		bl = gc_read(sc, 1, GC12_RLC_RLCS_BOOTLOAD_STATUS);
+		cp = gc_read(sc, 0, GC12_CP_STAT);
+		if (cp == 0 && (bl & GC12_BOOTLOAD_COMPLETE))
+			break;
+		DELAY(100);
+	}
+	device_printf(sc->dev, "psp: RLC autoload %s after %d us: bootload "
+	    "status %#x, CP_STAT %#x\n", us < PSP_AUTOLOAD_WAIT_US ?
+	    "complete" : "NOT complete", us, bl, cp);
+	if (us >= PSP_AUTOLOAD_WAIT_US)
+		err = ETIMEDOUT;
+out:
+	for (i = 0; i < IP_FW_FILES; i++)
+		if (fw[i] != NULL)
+			firmware_put(fw[i], FIRMWARE_UNLOAD);
+	return (err);
 }
 
 int
@@ -325,7 +569,7 @@ amd_psp_bootload(struct atrium_amd_softc *sc)
 	rid = PCIR_BAR(0);
 	vram = bus_alloc_resource_any(sc->dev, SYS_RES_MEMORY, &rid, RF_ACTIVE);
 	if (vram == NULL ||
-	    rman_get_size(vram) < PSP_VRAM_END) {
+	    rman_get_size(vram) < PSP_FW_VRAM_END) {
 		device_printf(sc->dev, "psp: BAR0 (VRAM window) unusable\n");
 		err = ENXIO;
 		goto out;
@@ -381,7 +625,15 @@ amd_psp_bootload(struct atrium_amd_softc *sc)
 		psp_hdp_flush(sc);
 		err = psp_ring_create(sc, fb_base + PSP_RING_VRAM_OFF);
 		if (err == 0) {
-			err = psp_load_toc(sc, vram, fb_base, fw);
+			uint32_t fence = 0;
+			int ipfw = 0;
+
+			psp_fw_reservation(sc, vram, fb_base, &fence);
+			err = psp_load_toc(sc, vram, fb_base, fw, ++fence);
+			/* Stage 3c test hook: kenv hw.atrium_gpu.psp_ipfw=1. */
+			TUNABLE_INT_FETCH("hw.atrium_gpu.psp_ipfw", &ipfw);
+			if (err == 0 && ipfw)
+				err = psp_load_ip_fw(sc, vram, fb_base, &fence);
 			/* We do not stay attached: leave no ring behind. */
 			(void)psp_ring_destroy(sc);
 		}
