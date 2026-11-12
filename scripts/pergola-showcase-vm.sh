@@ -37,15 +37,27 @@ done
 
 echo "=== run"
 g "cd /tmp/ps && env FRESCOD_SPLIT=0 FRESCOD_HEADLESS_PNG=/tmp/ps/screen FRESCOD_SOCK=/tmp/ps/fresco.sock \
-    FRESCOD_WM_SOCK=/tmp/ps/wm.sock daemon -f -o /tmp/ps/frescod.log $D/frescod </dev/null"
+    FRESCOD_WM_SOCK=/tmp/ps/wm.sock FRESCOD_INPUT_SOCK=/tmp/ps/inject.sock daemon -f -o /tmp/ps/frescod.log $D/frescod </dev/null"
 i=0; while [ $i -lt 60 ] && ! g "test -S /tmp/ps/fresco.sock"; do sleep 2; i=$((i+1)); done
 arg="$(echo "$MODE" | tr - " ")"
 S=${SECS:-90}
 g "cd /tmp/ps && env FRESCO_SOCKET=/tmp/ps/fresco.sock SHOWCASE_SECS=$S daemon -f -o /tmp/ps/showcase.log $D/showcase $arg </dev/null"
+# CLICKS="x,y x,y": presses through frescod's input injector once the
+# window is up (a menu opens only from a press: frescod's pop-up rule).
+if [ -n "${CLICKS:-}" ]; then
+    sleep ${CLICK_AFTER:-40}
+    for c in $CLICKS; do
+        x=${c%,*}; y=${c#*,}
+        g "printf 'MOVE $x $y\\nBTN 1 1\\n' | nc -N -U /tmp/ps/inject.sock; sleep 1; printf 'BTN 1 0\\n' | nc -N -U /tmp/ps/inject.sock"
+        sleep 8
+    done
+    sleep 15
+    S=0
+fi
 # The frame while the window is still up (frescod rewrites the PNG on damage).
-sleep $((S - 15))
+[ "$S" -gt 15 ] && sleep $((S - 15))
 g "cp /tmp/ps/screen.png /tmp/ps/shot.png; ls -la /tmp/ps/; tail -5 /tmp/ps/frescod.log"
 mkdir -p "$(dirname "$OUT")"
 get /tmp/ps/shot.png "$OUT" && echo "=== $OUT"
-sleep 20
+sleep 5
 g "cat /tmp/ps/showcase.log"

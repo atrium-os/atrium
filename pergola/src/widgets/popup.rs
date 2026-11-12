@@ -324,20 +324,22 @@ impl View for Dropdown {
                     f(i);
                 }
             });
-            open_under(ctx, m, r, self.attached);
+            open_under(ctx, m, r, self.attached, crate::popup::Align::Start);
         }
     }
 }
 
 /// The menu under a trigger at `r`: a pop-up hanging from it when the
 /// window allows, at least as wide. Attached: no gap, joined to it.
-fn open_under(ctx: &mut Ctx, m: Menu, r: Rect, attached: bool) {
+fn open_under(ctx: &mut Ctx, m: Menu, r: Rect, attached: bool, align: crate::popup::Align) {
     let gap = if attached { 0.0 } else { MENU_GAP };
+    let w = r.w().max(160.0);
+    let x = if align == crate::popup::Align::End { r.x() + r.w() - w } else { r.x() };
     let mut m = m
-        .at(r.x(), r.y() + r.h() + gap)
-        .width(r.w().max(160.0))
+        .at(x, r.y() + r.h() + gap)
+        .width(w)
         // The gap is part of the anchor, so a flipped list keeps it.
-        .anchored(Rect::new(r.x(), r.y() - gap, r.w(), r.h() + 2.0 * gap), crate::popup::Side::Below, crate::popup::Align::Start);
+        .anchored(Rect::new(r.x(), r.y() - gap, r.w(), r.h() + 2.0 * gap), crate::popup::Side::Below, align);
     m.attached = attached;
     ctx.overlay(move |ctx| m.render(ctx));
 }
@@ -351,9 +353,25 @@ fn open_under(ctx: &mut Ctx, m: Menu, r: Rect, attached: bool) {
 /// menu hangs from it with no gap inside an accent edge. An app cannot
 /// draw in the bar, so a fake menu under it has no lit button above it.
 fn trigger(ctx: &mut Ctx, r: Rect, label: &str, menu: &Mutable<MenuState>, cur: Option<usize>, attached: bool) -> NodeId {
+    trigger_with(ctx, r, label, None, menu, cur, attached)
+}
+
+/// An icon trigger's glyph: Phosphor char, size, colour (default
+/// `text-secondary`).
+#[derive(Clone, Copy)]
+pub struct TriggerIcon {
+    pub glyph: char,
+    pub size: f32,
+    pub color: Option<Color>,
+}
+
+fn trigger_with(ctx: &mut Ctx, r: Rect, label: &str, icon: Option<TriggerIcon>, menu: &Mutable<MenuState>, cur: Option<usize>, attached: bool) -> NodeId {
     let t = ctx.theme;
     let open = menu.get().open;
     let lit = attached && open;
+    if let Some(ic) = icon {
+        return icon_trigger(ctx, r, ic, menu, lit);
+    }
     let halo = ctx.add(Node::Rect { rect: inflate(r, 3.0), fill: Color::TRANSPARENT, radius: radius::SM + 3.0 });
     let ring = ctx.add(Node::Rect { rect: inflate(r, 1.0), fill: Color::TRANSPARENT, radius: radius::SM + 1.0 });
     let edge = ctx.add(Node::Rect { rect: r, fill: if lit { t.accent_fill() } else { t.border_strong() }, radius: radius::SM });
@@ -406,6 +424,57 @@ fn trigger(ctx: &mut Ctx, r: Rect, label: &str, menu: &Mutable<MenuState>, cur: 
     edge
 }
 
+/// An icon trigger (a ghost button: no edge, a hover fill; the bar's
+/// icons): lit, it is filled with the accent and the glyph is
+/// `text-on-accent`.
+fn icon_trigger(ctx: &mut Ctx, r: Rect, ic: TriggerIcon, menu: &Mutable<MenuState>, lit: bool) -> NodeId {
+    let t = ctx.theme;
+    let halo = ctx.add(Node::Rect { rect: inflate(r, 3.0), fill: Color::TRANSPARENT, radius: radius::SM + 3.0 });
+    let ring = ctx.add(Node::Rect { rect: inflate(r, 1.0), fill: Color::TRANSPARENT, radius: radius::SM + 1.0 });
+    let edge = ctx.add(Node::Rect { rect: r, fill: Color::TRANSPARENT, radius: radius::SM });
+    let fill = if lit {
+        if ctx.is_hovered(edge) || ctx.is_pressed(edge) { t.accent_fill_hover() } else { t.accent_fill() }
+    } else if ctx.is_pressed(edge) || menu.get().open {
+        t.state_pressed()
+    } else if ctx.is_hovered(edge) {
+        t.state_hover()
+    } else {
+        Color::TRANSPARENT
+    };
+    if let Some(Node::Rect { fill: f, .. }) = ctx.tree.get_mut(edge) {
+        *f = fill;
+    }
+    let color = if lit { t.text_on_accent() } else { ic.color.unwrap_or_else(|| t.text_secondary()) };
+    let gs = Node::measure_text(&ic.glyph.to_string(), &text(color, ic.size, font::ICONS, Weight::Regular));
+    ctx.tree.insert(Some(edge), Node::Text {
+        rect: Rect::new(r.x() + (r.w() - gs.w) / 2.0, r.y() + (r.h() - gs.h) / 2.0, gs.w, gs.h),
+        content: ic.glyph.to_string(),
+        style: text(color, ic.size, font::ICONS, Weight::Regular),
+    });
+    if ctx.is_focus_visible(edge) {
+        for (id, col) in [(halo, t.accent_bg()), (ring, t.focus_ring())] {
+            if let Some(Node::Rect { fill, .. }) = ctx.tree.get_mut(id) {
+                *fill = col;
+            }
+        }
+    }
+    let m = menu.clone();
+    ctx.on_click(edge, move || {
+        let open = m.get().open;
+        m.set(if open { MenuState::default() } else { MenuState::opened(None) });
+    });
+    let m = menu.clone();
+    ctx.on_key(edge, move |ev| {
+        if let Event::Key { kind: KeyEventKind::Down, key, chars, .. } = ev {
+            if matches!(key, Key::Down | Key::Up | Key::Enter) || (*key == Key::Char && chars == " ") {
+                m.set(MenuState::opened(Some(0)));
+            }
+        }
+    });
+    ctx.focusable(edge);
+    edge
+}
+
 // ── MenuButton ──────────────────────────────────────────────────────────
 
 /// A button that opens a menu of actions (the Forum bar's controller
@@ -417,6 +486,9 @@ pub struct MenuButton {
     pub menu: Mutable<MenuState>,
     pub rect: Rect,
     pub attached: bool,
+    /// An icon instead of the label and caret (the label stays its
+    /// accessible name).
+    pub icon: Option<TriggerIcon>,
     on_pick: Rc<dyn Fn(usize)>,
 }
 
@@ -428,6 +500,7 @@ impl MenuButton {
             menu,
             rect: Rect::new(0.0, 0.0, 160.0, size::BUTTON_HEIGHT_DEFAULT),
             attached: false,
+            icon: None,
             on_pick: Rc::new(on_pick),
         }
     }
@@ -449,16 +522,28 @@ impl MenuButton {
         self.attached = true;
         self
     }
+    /// Show a Phosphor glyph (`size` px, `color` or `text-secondary`)
+    /// instead of the label: a square ghost button `size` + 12 wide, as
+    /// tall as its rect. In a row it takes its natural size.
+    pub fn icon(mut self, glyph: char, size: f32, color: Option<Color>) -> Self {
+        self.icon = Some(TriggerIcon { glyph, size, color });
+        self.rect.size.w = (size + 12.0).round();
+        self.rect.size.h = self.rect.size.h.min(size + 12.0).max(size + 8.0);
+        self
+    }
 }
 
 impl View for MenuButton {
     fn render(&self, ctx: &mut Ctx) {
         let r = self.rect;
-        trigger(ctx, r, &self.label, &self.menu, None, self.attached);
+        trigger_with(ctx, r, &self.label, self.icon, &self.menu, None, self.attached);
         if self.menu.get().open {
             let pick = self.on_pick.clone();
             let m = Menu::new(self.menu.clone(), self.items.clone(), move |i| pick(i));
-            open_under(ctx, m, r, self.attached);
+            // An icon button is small and sits at the end of a row (the
+            // bar's right side): its menu lines up with its right edge.
+            let align = if self.icon.is_some() { crate::popup::Align::End } else { crate::popup::Align::Start };
+            open_under(ctx, m, r, self.attached, align);
         }
     }
 }
@@ -699,6 +784,38 @@ mod tests {
         click(&mut app, 30.0, h + MENU_INSET + size::MENU_ITEM * 1.5);
         assert_eq!(picked.get(), Some(1));
         assert!(!lit(&app), "closed again");
+    }
+
+    struct IconBar {
+        menu: Mutable<MenuState>,
+    }
+    impl View for IconBar {
+        fn render(&self, ctx: &mut Ctx) {
+            let row = ctx.push(Node::stack(crate::geom::Axis::Horizontal, Rect::new(0.0, 0.0, 400.0, 32.0), 8.0));
+            ctx.set_flex(row, FlexStyle { justify: Justify::End, align: Align::Center, ..FlexStyle::default() });
+            let b = MenuButton::new("Controllers", self.menu.clone(), vec![MenuItem::new("Fake Pad")], |_| {})
+                .icon(crate::widgets::phosphor::GAME_CONTROLLER, 15.0, None)
+                .attached();
+            ctx.place(b);
+            ctx.pop();
+        }
+    }
+
+    #[test]
+    fn an_icon_menu_button_in_a_laid_out_row_hangs_its_menu_from_where_layout_put_it() {
+        let d = Arc::new(AtomicBool::new(true));
+        let menu = Mutable::with_dirty(MenuState::default(), d.clone());
+        let mut app = App::new_with_flag(IconBar { menu: menu.clone() }, d);
+        app.set_popups(true);
+        app.tick();
+        // 27 square, at the row's end, centred in its 32.
+        click(&mut app, 386.0, 16.0);
+        assert!(menu.get().open);
+        let (root, spec) = app.tree().popups().next().map(|(id, s)| (id, *s)).unwrap();
+        assert_eq!(spec.anchor, Rect::new(373.0, 3.0, 27.0, 27.0));
+        assert_eq!(spec.align, crate::popup::Align::End);
+        let r = app.tree().get(root).unwrap().rect();
+        assert_eq!((r.x() + r.w(), r.y()), (400.0, 30.0), "right edges line up, no gap");
     }
 
     #[test]
