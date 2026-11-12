@@ -17,6 +17,7 @@ pub const PULSE: char = '\u{e000}';
 pub const SUN: char = '\u{e472}';
 pub const MOON: char = '\u{e330}';
 pub const SPEAKER_SIMPLE_HIGH: char = '\u{e450}';
+pub const SPEAKER_SIMPLE_X: char = '\u{e458}';
 pub const BROADCAST: char = '\u{e0f2}';
 pub const BATTERY_CHARGING: char = '\u{e0ba}';
 pub const ARROWS_OUT_SIMPLE: char = '\u{e0a6}';

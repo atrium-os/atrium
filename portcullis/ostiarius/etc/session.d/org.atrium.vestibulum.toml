@@ -14,6 +14,7 @@
 
 enabled       = true
 name          = "app-org-atrium-vestibulum"
+app_id        = "org.atrium.vestibulum"
 path          = "/var/lib/atrium/jails/org.atrium.vestibulum"
 children_max  = 0
 devfs_ruleset = 4

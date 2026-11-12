@@ -22,9 +22,9 @@ pub fn may(uid: u32) -> bool {
     uids().contains(&uid)
 }
 
-/// The session components that draw shell chrome: the Forum bar and dock,
-/// as portcullisd records them (their session.d jail names).
-const CHROME_COMPONENTS: [&str; 2] = ["app-org-atrium-forum-bar", "app-org-atrium-forum-dock"];
+/// The session components that draw shell chrome: the Forum bar and dock
+/// (their session.d `app_id`).
+const CHROME_COMPONENTS: [&str; 2] = ["org.atrium.forum-bar", "org.atrium.forum-dock"];
 
 /// The shell-chrome role (the Forum bar, which stacks above apps and their
 /// pop-ups: fresco-popups.md §2) goes to no app. Granted to:

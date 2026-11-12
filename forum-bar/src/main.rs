@@ -14,13 +14,14 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use forum_ctl::{Intent, PadInfo, Reply};
-use lyra_protocol::wire::{action, FromMedia, MediaAction, NowPlaying, SessionState, ToMedia};
+use lyra_protocol::wire::{action, FromControl, FromMedia, MediaAction, NowPlaying, SessionState, ToControl, ToMedia};
 use fresco_protocol::{WindowHints, WmRole};
 use pergola::geom::{Axis, Rect};
 use pergola::reactive::Mutable;
 use pergola::theme::{shell, type_size, Mode, Semantic, Weight};
 use pergola::widgets::phosphor;
-use pergola::widgets::popup::{MenuButton, MenuItem, MenuState};
+use pergola::widgets::popup::{MenuButton, MenuItem, MenuState, PanelButton, PANEL_PADDING};
+use pergola::widgets::{RadioGroup, Slider, Toggle};
 use pergola::{
     App, Chip, Color, Ctx, Divider, Dot, Draw, FlexStyle, Glyph, Label, Node, SizeSpec, StepResult,
     View, Window, WindowDesc,
@@ -80,6 +81,15 @@ struct BarView {
     pads_open: Mutable<MenuState>,
     /// Set by a "Take back" click: the main loop asks for the pads again.
     pads_stale: Arc<AtomicBool>,
+    /// The system volume, and what the volume drop-down asks for.
+    audio: Mutable<AudioShown>,
+    want_audio: Mutable<Option<AudioAction>>,
+    /// The volume drop-down: open, and its controls' values (kept in step
+    /// with `audio` by the main loop, so a drag is not undone mid-way).
+    audio_open: Mutable<MenuState>,
+    vol_level: Mutable<f64>,
+    vol_muted: Mutable<bool>,
+    vol_output: Mutable<usize>,
 }
 
 /// The controller menu's line for one pad: its name, and the app holding
@@ -292,7 +302,54 @@ impl View for BarView {
             ctx.place(button);
         }
         icon_glyph(ctx, phosphor::BROADCAST, None);
-        icon_glyph(ctx, phosphor::SPEAKER_SIMPLE_HIGH, None);
+        // The system volume (lyra-v1.md §7): an attached drop-down from the
+        // speaker, drawn by the bar (fresco-popups.md §2): mute, the master
+        // level, and the output in use. Dimmed while choragusd is away.
+        {
+            let a = self.audio.get_cloned();
+            let glyph = if !a.available || a.muted || a.master <= 0.0 {
+                phosphor::SPEAKER_SIMPLE_X
+            } else {
+                phosphor::SPEAKER_SIMPLE_HIGH
+            };
+            let names: Vec<String> = a.outputs.iter().map(|(_, n)| n.clone()).collect();
+            let rows = names.len() as f32;
+            let size = pergola::geom::Size::new(260.0, 2.0 * PANEL_PADDING + 28.0 + 36.0 + if rows > 0.0 { 24.0 + rows * 28.0 } else { 0.0 });
+            let (level, muted, output) = (self.vol_level.clone(), self.vol_muted.clone(), self.vol_output.clone());
+            let want = self.want_audio.clone();
+            let ids: Vec<u32> = a.outputs.iter().map(|(id, _)| *id).collect();
+            let enabled = a.available;
+            let panel = PanelButton::new("Volume", self.audio_open.clone(), size, move |ctx: &mut Ctx, inner: Rect| {
+                let t = ctx.theme;
+                let (w1, w2, w3) = (want.clone(), want.clone(), want.clone());
+                Toggle::new(muted.clone(), "Mute")
+                    .at(inner.x(), inner.y())
+                    .on_change(move |m| w1.set(Some(AudioAction::Mute(m))))
+                    .render(ctx);
+                Slider::new(level.clone(), 0.0, 1.0)
+                    .at(inner.x(), inner.y() + 36.0)
+                    .width(inner.w())
+                    .enabled(enabled)
+                    .on_change(move |v| w2.set(Some(AudioAction::Master(v as f32))))
+                    .render(ctx);
+                if !names.is_empty() {
+                    let y = inner.y() + 36.0 + 36.0;
+                    Label::new("Output").size(type_size::XS).color(t.text_tertiary()).at(inner.x(), y).emit(ctx);
+                    let ids = ids.clone();
+                    RadioGroup::new(output.clone(), names.clone())
+                        .at(inner.x(), y + 24.0)
+                        .on_change(move |i| {
+                            if let Some(&id) = ids.get(i) {
+                                w3.set(Some(AudioAction::Output(id)));
+                            }
+                        })
+                        .render(ctx);
+                }
+            })
+            .icon(glyph, 15.0, Some(if enabled { t.text_secondary() } else { t.text_tertiary() }))
+            .attached();
+            ctx.place(panel);
+        }
         icon_glyph(ctx, phosphor::BATTERY_CHARGING, None);
         icon_glyph(ctx, phosphor::PULSE, None);
         let theme_glyph = if t.mode == Mode::Dark { phosphor::SUN } else { phosphor::MOON };
@@ -443,6 +500,82 @@ fn follow_now_playing() -> std::sync::mpsc::Receiver<Option<NowPlaying>> {
     rx
 }
 
+/// choragusd's volume-control socket, in the bar's jail (`audio-control`).
+const AUDIO_CONTROL_SOCKET: &str = "/atrium/sockets/audio-control/audio-control.sock";
+
+/// The system volume as the bar shows it (lyra-v1.md §7).
+#[derive(Clone, PartialEq, Debug, Default)]
+struct AudioShown {
+    /// choragusd answers (the user's session is the active one).
+    available: bool,
+    master: f32,
+    muted: bool,
+    /// The outputs (id, name) and the one in use.
+    outputs: Vec<(u32, String)>,
+    current: u32,
+}
+
+impl AudioShown {
+    /// Take in an answer or change event from choragusd.
+    fn apply(&mut self, m: FromControl) {
+        match m {
+            FromControl::Apps { master, master_muted, .. } => {
+                self.available = true;
+                self.master = master.clamp(0.0, 1.0);
+                self.muted = master_muted;
+            }
+            FromControl::Outputs { current, outputs } => {
+                self.outputs = outputs.into_iter().map(|o| (o.id, o.name)).collect();
+                self.current = current;
+            }
+            FromControl::Welcome | FromControl::Denied { .. } => {}
+        }
+    }
+}
+
+/// What the volume drop-down asks choragusd for.
+#[derive(Clone, Copy, PartialEq, Debug)]
+enum AudioAction {
+    Master(f32),
+    Mute(bool),
+    Output(u32),
+}
+
+impl AudioAction {
+    fn wire(self) -> ToControl {
+        match self {
+            AudioAction::Master(v) => ToControl::SetMaster { volume: v.clamp(0.0, 1.0) },
+            AudioAction::Mute(m) => ToControl::SetMasterMute { muted: m },
+            AudioAction::Output(o) => ToControl::SetOutput { output: o },
+        }
+    }
+}
+
+/// Follow choragusd's volume state on a thread of its own, reconnecting
+/// when it restarts (`None`: it went away). The connection's other handle
+/// goes into `send` for the bar's own requests, whose answers come back here.
+fn follow_audio(send: Arc<std::sync::Mutex<Option<lyra_protocol::client::Control>>>) -> std::sync::mpsc::Receiver<Option<FromControl>> {
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || loop {
+        if let Ok(mut c) = lyra_protocol::client::Control::connect(AUDIO_CONTROL_SOCKET) {
+            *send.lock().unwrap() = c.try_clone().ok();
+            if c.send(&ToControl::List).is_ok() && c.send(&ToControl::ListOutputs).is_ok() {
+                while let Ok(m) = c.recv() {
+                    if tx.send(Some(m)).is_err() {
+                        return;
+                    }
+                }
+            }
+            *send.lock().unwrap() = None;
+            if tx.send(None).is_err() {
+                return;
+            }
+        }
+        std::thread::sleep(Duration::from_secs(5));
+    });
+    rx
+}
+
 fn main() -> std::io::Result<()> {
     // The system appearance decides (the Window follows it); `dark` only
     // seeds the first frame when frescod has none to give.
@@ -472,6 +605,14 @@ fn main() -> std::io::Result<()> {
     let pads_open = Mutable::with_dirty(MenuState::default(), dirty.clone());
     let pads_stale = Arc::new(AtomicBool::new(false));
     let playing = follow_now_playing();
+    let audio = Mutable::with_dirty(AudioShown::default(), dirty.clone());
+    let want_audio = Mutable::with_dirty(None, dirty.clone());
+    let audio_send = Arc::new(std::sync::Mutex::new(None));
+    let audio_events = follow_audio(audio_send.clone());
+    let audio_open = Mutable::with_dirty(MenuState::default(), dirty.clone());
+    let vol_level = Mutable::with_dirty(0.0f64, dirty.clone());
+    let vol_muted = Mutable::with_dirty(false, dirty.clone());
+    let vol_output = Mutable::with_dirty(0usize, dirty.clone());
     let mut control: Option<lyra_protocol::client::Media> = None;
 
     let view = BarView {
@@ -486,6 +627,12 @@ fn main() -> std::io::Result<()> {
         pads: pads.clone(),
         pads_open: pads_open.clone(),
         pads_stale: pads_stale.clone(),
+        audio: audio.clone(),
+        want_audio: want_audio.clone(),
+        audio_open: audio_open.clone(),
+        vol_level: vol_level.clone(),
+        vol_muted: vol_muted.clone(),
+        vol_output: vol_output.clone(),
     };
     let mut app = App::new_with_flag(view, dirty).with_theme(mode);
 
@@ -528,6 +675,40 @@ fn main() -> std::io::Result<()> {
             let shown = np.as_ref().and_then(now_shown);
             if shown != now.get_cloned() {
                 now.set(shown);
+            }
+        }
+        // The system volume (choragusd pushes changes).
+        while let Ok(m) = audio_events.try_recv() {
+            let mut a = audio.get_cloned();
+            match m {
+                Some(m) => a.apply(m),
+                None => a = AudioShown::default(),
+            }
+            if a != audio.get_cloned() {
+                // The controls follow choragusd (a drag's own changes come
+                // back as the same values).
+                if (vol_level.get() - a.master as f64).abs() > 1e-3 {
+                    vol_level.set(a.master as f64);
+                }
+                if vol_muted.get() != a.muted {
+                    vol_muted.set(a.muted);
+                }
+                let i = a.outputs.iter().position(|(id, _)| *id == a.current).unwrap_or(0);
+                if vol_output.get() != i {
+                    vol_output.set(i);
+                }
+                if !a.available && audio_open.get().open {
+                    audio_open.set(MenuState::default());
+                }
+                audio.set(a);
+            }
+        }
+        // The volume drop-down: a slider drag, mute, an output.
+        if let Some(a) = want_audio.get() {
+            want_audio.set(None);
+            let sent = audio_send.lock().unwrap().as_mut().map(|c| c.send(&a.wire()));
+            if !matches!(sent, Some(Ok(()))) {
+                eprintln!("forum-bar: choragusd audio-control is not reachable");
             }
         }
         // The play/pause click.
@@ -574,7 +755,47 @@ mod tests {
             pads: Mutable::new(Vec::new()),
             pads_open: Mutable::new(MenuState::default()),
             pads_stale: Arc::new(AtomicBool::new(false)),
+            audio: Mutable::new(AudioShown::default()),
+            want_audio: Mutable::new(None),
+            audio_open: Mutable::new(MenuState::default()),
+            vol_level: Mutable::new(0.0),
+            vol_muted: Mutable::new(false),
+            vol_output: Mutable::new(0),
         }
+    }
+
+    #[test]
+    fn the_speaker_opens_the_volume_drop_down() {
+        pergola::text::clear_measurer();
+        let view = sample_view();
+        let has_text = |tree: &pergola::NodeTree, s: &str| tree.iter().any(|(_, x)| matches!(x, Node::Text { content, .. } if content == s));
+        view.audio.set(AudioShown {
+            available: true, master: 0.5, muted: false, current: 2,
+            outputs: vec![(1, "Speakers".into()), (2, "Headphones".into())],
+        });
+        let (tree, _) = render(&view, Semantic::LIGHT);
+        assert!(has_text(&tree, &phosphor::SPEAKER_SIMPLE_HIGH.to_string()) && !has_text(&tree, "Headphones"));
+        view.audio_open.set(MenuState::opened(None));
+        let (tree, _) = render(&view, Semantic::LIGHT);
+        assert!(has_text(&tree, "Mute") && has_text(&tree, "Output") && has_text(&tree, "Speakers") && has_text(&tree, "Headphones"));
+    }
+
+    #[test]
+    fn the_volume_follows_choragusd() {
+        let mut a = AudioShown::default();
+        a.apply(FromControl::Apps { master: 1.4, master_muted: true, apps: Vec::new() });
+        assert!(a.available && a.master == 1.0 && a.muted);
+        a.apply(FromControl::Outputs {
+            current: 2,
+            outputs: vec![
+                lyra_protocol::wire::Output { id: 1, name: "Speakers".into(), balance: 0.0, channels: 2, spatial: false },
+                lyra_protocol::wire::Output { id: 2, name: "Headphones".into(), balance: 0.0, channels: 2, spatial: true },
+            ],
+        });
+        assert_eq!(a.outputs, vec![(1, "Speakers".into()), (2, "Headphones".into())]);
+        assert_eq!(a.current, 2);
+        assert_eq!(AudioAction::Master(-0.5).wire(), ToControl::SetMaster { volume: 0.0 });
+        assert_eq!(AudioAction::Output(1).wire(), ToControl::SetOutput { output: 1 });
     }
 
     #[test]

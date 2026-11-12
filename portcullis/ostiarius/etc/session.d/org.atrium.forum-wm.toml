@@ -14,6 +14,7 @@
 
 enabled       = true
 name          = "app-org-atrium-forum-wm"
+app_id        = "org.atrium.forum-wm"
 path          = "/var/lib/atrium/jails/org.atrium.forum-wm"
 children_max  = 0
 devfs_ruleset = 4

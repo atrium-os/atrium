@@ -65,6 +65,13 @@ pub struct ServiceManifest {
     pub name: String,
     pub path: String,
 
+    /// A session component's app id (`org.atrium.forum-bar`): what the
+    /// launch registry records for it, so services that grant by app id
+    /// (choragusd's audio-control, frescod's bar layer) know it. `None`: the
+    /// jail name stands in.
+    #[serde(default)]
+    pub app_id: Option<String>,
+
     #[serde(default)]
     pub children_max: u32,
 
@@ -631,6 +638,7 @@ mod tests {
     #[test]
     fn to_create_request_round_trip() {
         let m = ServiceManifest {
+            app_id: None,
             enabled: true,
             name: "atrium-x".into(),
             path: "/".into(),

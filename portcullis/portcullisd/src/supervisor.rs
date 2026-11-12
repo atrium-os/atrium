@@ -666,6 +666,7 @@ mod tests {
 
     fn never_restart_manifest() -> ServiceManifest {
         ServiceManifest {
+            app_id: None,
             enabled:       true,
             name:          "atrium-test".into(),
             path:          "/".into(),
