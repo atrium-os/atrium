@@ -79,8 +79,8 @@ Per-IP code is chosen by discovery version, not by device id (never hardcode RDN
   (vgapci does not own the registers) read RCC_CONFIG_MEMSIZE 0x7f70 (32624 MiB) and the
   discovery table: v1.3, IP table v3, one die, 46 IPs, checksums good. GC 12.0.1, PSP/SMU
   14.0.3, SDMA 7.0.1 (two instances, GC's bases), MMHUB/ATHUB 4.1.0, OSSSYS 7.0.0, HDP
-  7.0.0, NBIF 6.3.1, VCN 5.0.0, DMU 4.1.0 (the firmware files say dcn_4_0_1: compare with
-  amdgpu's view on Ubuntu), 8 UMCs. It found two parser bugs that synthetic fixtures hid
+  7.0.0, NBIF 6.3.1, VCN 5.0.0, DMU 4.1.0 (correct: the hardware reports 4.1.0 and amdgpu renames
+  it to 4.0.1 for its DC code, hence the dcn_4_0_1 firmware name), 8 UMCs. It found two parser bugs that synthetic fixtures hid
   (table signature is "IPDS", VCN hw id is 12); the real table is now a golden test
   (`rs-host-tests/data/r9700-discovery.bin`).
 - **2026-11-12, PSP/SMU state at power-on.** `atrium-gpu-probe pci 3:0:0 --status` (reads
@@ -88,3 +88,9 @@ Per-IP code is chosen by discovery version, not by device id (never hardcode RDN
   C2PMSG_81 = 0 (no sOS), C2PMSG_64 = 0; SMU C2PMSG_90 = 1 (last message OK, from the
   VBIOS). So the driver must run the whole PSP bootloader sequence (KDB, SPL, SYS_DRV, SOS
   from `psp_14_0_3_sos.bin`) before anything else; nothing is loaded behind it.
+- **2026-11-12, driver identifies silicon in-kernel.** `atrium_gpu_amd_pci.ko` (`639ddca`)
+  loaded on the box and handed the R9700 with `devctl set driver -f vgapci0
+  atrium_gpu_amd_pci`: it read the discovery table, printed GC 12.0.1, PSP/SMU 14.0.3, SDMA
+  7.0.1, MMHUB 4.1.0, OSSSYS 7.0.0, HDP 7.0.0, NBIF 6.3.1, DCN 4.1.0, VCN 5.0.0, ISA gfx1201,
+  and refused to attach (ENXIO, "silicon bring-up not implemented yet"). `devctl set driver
+  -f pci0:3:0:0 vgapci` gave the device back; `kldunload` clean; no panic.

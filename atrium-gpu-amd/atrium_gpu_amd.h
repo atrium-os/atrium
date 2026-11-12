@@ -215,7 +215,8 @@
  * fields are from AMD's MIT-licensed dcn_4_1_0_offset.h / _sh_mask.h. A
  * register's MMIO byte address is (segment base + offset) * 4. gpusim places
  * segment 2 at byte 0x60000 of its register BAR, as it places GC and OSS; on
- * the R9700 IP discovery gives DMU 4.0.1 segment bases 0x12, 0xc0, 0x34c0,
+ * the R9700 IP discovery gives DMU 4.1.0 (the block Linux's DC calls DCN 4.0.1 and its
+ * firmware dcn_4_0_1; amdgpu renames 4.1.0 to 4.0.1 after discovery) segment bases 0x12, 0xc0, 0x34c0,
  * 0x9000, 0x2403c00 (dwords), so on silicon (D5) DCN_SEG2_BYTES comes from IP
  * discovery: 0x34c0 * 4 (identify.c sets sc->dcn_seg2_bytes). What is left on the SIM registers above: the mode
  * set (OTG timing, OPP, DIG and PHY are not modelled), EDID/DDC, link
