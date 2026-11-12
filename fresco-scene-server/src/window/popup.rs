@@ -3,6 +3,10 @@
 
 use super::{Compositor, DisplayEvent, Popup, PopupGrant, PopupRefused, WindowId};
 
+/// The gap frescod leaves between the bar and a panel an app hangs from
+/// it by a grant, where frescod's label naming the app goes.
+pub const HOSTED_LABEL_GAP: f32 = 24.0;
+
 /// The most grants waiting at once (one a bar window; a few bars).
 const GRANTS_MAX: usize = 8;
 use fresco_protocol::{popup_align, popup_dismiss, popup_side, POPUP_MAX_DEPTH};
@@ -361,7 +365,13 @@ impl Compositor {
                 continue;
             };
             let ppos = parent.pos;
-            let a = [ppos.0 + p.anchor[0], ppos.1 + p.anchor[1], p.anchor[2], p.anchor[3]];
+            let mut a = [ppos.0 + p.anchor[0], ppos.1 + p.anchor[1], p.anchor[2], p.anchor[3]];
+            if p.hosted.is_some() {
+                // Room between the bar and the app's panel for frescod's
+                // label naming the app (forum-status-items.md §4).
+                a[1] -= HOSTED_LABEL_GAP;
+                a[3] += 2.0 * HOSTED_LABEL_GAP;
+            }
             let ([x, y, w, h], side) = place(a, p.side, p.align, p.want, self.bounds_at(a[0] + a[2] / 2.0, a[1] + a[3] / 2.0, self.popup_trusted(id)));
             let size = (w as u32, h as u32);
             if self.windows[&id].size != (w, h) {
@@ -657,7 +667,7 @@ mod tests {
         assert_eq!(c.claim_popup(5, [1; 16], (300, 400)), Err(PopupRefused::UnknownWindow), "used up");
         assert_eq!(c.windows[&p].owner, 5);
         assert_eq!(c.windows[&p].size, (300.0, 380.0));
-        assert_eq!(c.windows[&p].pos, (630.0, 62.0), "under the icon, end-aligned");
+        assert_eq!(c.windows[&p].pos, (630.0, 62.0 + HOSTED_LABEL_GAP), "under the icon, end-aligned, room for the label");
         let ev: Vec<DisplayEvent> = rx.try_iter().filter(|e| matches!(e, DisplayEvent::PopupHosted { .. })).collect();
         assert!(matches!(ev[..], [DisplayEvent::PopupHosted { window_id, token: [1, ..], open: true }] if window_id == bar as u32), "{ev:?}");
         // Above the app, below the bar; it takes the keys; not the shell's.

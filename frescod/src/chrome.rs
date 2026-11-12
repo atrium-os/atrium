@@ -24,9 +24,9 @@
 //!
 //! Clicks on chrome pixels go to the WM, never to a window under them.
 //!
-//! Text is drawn with a built-in 5x9 font of exactly the characters an
-//! origin may hold (`fresco_split::chrome::origin_char`): frescod parses no
-//! font file, and a look-alike letter has no glyph to be drawn with.
+//! Text is IBM Plex Mono, rasterized at build time (build.rs) for exactly
+//! the characters an origin may hold (`fresco_split::chrome::origin_char`):
+//! frescod parses no font file, and a look-alike letter has no glyph.
 
 use fresco_scene_server::window::CHROME_LAYER;
 use fresco_vulkan::SceneNode;
@@ -36,66 +36,20 @@ use crate::pack::WindowFrame;
 /// The chrome layer's id: reserved, never a window's.
 pub const CHROME_ID: u32 = CHROME_LAYER as u32;
 
-/// Font cells per glyph and pixels per cell.
-const GW: i32 = 5;
-const GH: i32 = 9;
-const SCALE: i32 = 2;
-const ADVANCE: i32 = (GW + 1) * SCALE;
 const PAD: i32 = 4;
 const RING: i32 = 2;
 
 const RING_COLOR: [f32; 4] = [0.15, 0.55, 1.0, 1.0];
 const TEXT_COLOR: [f32; 4] = [0.95, 0.95, 0.95, 1.0];
 
-/// Rows of each glyph, bit 4 the leftmost column.
-const FONT: &[(u8, [u8; 9])] = &[
-    (b'-', [0b00000, 0b00000, 0b00000, 0b11111, 0b00000, 0b00000, 0b00000, 0b00000, 0b00000]),
-    (b'.', [0b00000, 0b00000, 0b00000, 0b00000, 0b00000, 0b01100, 0b01100, 0b00000, 0b00000]),
-    (b'/', [0b00000, 0b00001, 0b00010, 0b00100, 0b01000, 0b10000, 0b00000, 0b00000, 0b00000]),
-    (b'0', [0b01110, 0b10001, 0b10011, 0b10101, 0b11001, 0b10001, 0b01110, 0b00000, 0b00000]),
-    (b'1', [0b00100, 0b01100, 0b00100, 0b00100, 0b00100, 0b00100, 0b01110, 0b00000, 0b00000]),
-    (b'2', [0b01110, 0b10001, 0b00001, 0b00010, 0b00100, 0b01000, 0b11111, 0b00000, 0b00000]),
-    (b'3', [0b11111, 0b00010, 0b00100, 0b00010, 0b00001, 0b10001, 0b01110, 0b00000, 0b00000]),
-    (b'4', [0b00010, 0b00110, 0b01010, 0b10010, 0b11111, 0b00010, 0b00010, 0b00000, 0b00000]),
-    (b'5', [0b11111, 0b10000, 0b11110, 0b00001, 0b00001, 0b10001, 0b01110, 0b00000, 0b00000]),
-    (b'6', [0b00110, 0b01000, 0b10000, 0b11110, 0b10001, 0b10001, 0b01110, 0b00000, 0b00000]),
-    (b'7', [0b11111, 0b00001, 0b00010, 0b00100, 0b01000, 0b01000, 0b01000, 0b00000, 0b00000]),
-    (b'8', [0b01110, 0b10001, 0b10001, 0b01110, 0b10001, 0b10001, 0b01110, 0b00000, 0b00000]),
-    (b'9', [0b01110, 0b10001, 0b10001, 0b01111, 0b00001, 0b00010, 0b01100, 0b00000, 0b00000]),
-    (b':', [0b00000, 0b01100, 0b01100, 0b00000, 0b01100, 0b01100, 0b00000, 0b00000, 0b00000]),
-    (b'[', [0b01110, 0b01000, 0b01000, 0b01000, 0b01000, 0b01000, 0b01110, 0b00000, 0b00000]),
-    (b']', [0b01110, 0b00010, 0b00010, 0b00010, 0b00010, 0b00010, 0b01110, 0b00000, 0b00000]),
-    (b'_', [0b00000, 0b00000, 0b00000, 0b00000, 0b00000, 0b00000, 0b11111, 0b00000, 0b00000]),
-    (b'a', [0b00000, 0b00000, 0b01110, 0b00001, 0b01111, 0b10001, 0b01111, 0b00000, 0b00000]),
-    (b'b', [0b10000, 0b10000, 0b11110, 0b10001, 0b10001, 0b10001, 0b11110, 0b00000, 0b00000]),
-    (b'c', [0b00000, 0b00000, 0b01110, 0b10000, 0b10000, 0b10000, 0b01110, 0b00000, 0b00000]),
-    (b'd', [0b00001, 0b00001, 0b01111, 0b10001, 0b10001, 0b10001, 0b01111, 0b00000, 0b00000]),
-    (b'e', [0b00000, 0b00000, 0b01110, 0b10001, 0b11111, 0b10000, 0b01110, 0b00000, 0b00000]),
-    (b'f', [0b00110, 0b01000, 0b11110, 0b01000, 0b01000, 0b01000, 0b01000, 0b00000, 0b00000]),
-    (b'g', [0b00000, 0b00000, 0b01111, 0b10001, 0b10001, 0b10001, 0b01111, 0b00001, 0b01110]),
-    (b'h', [0b10000, 0b10000, 0b11110, 0b10001, 0b10001, 0b10001, 0b10001, 0b00000, 0b00000]),
-    (b'i', [0b00100, 0b00000, 0b01100, 0b00100, 0b00100, 0b00100, 0b01110, 0b00000, 0b00000]),
-    (b'j', [0b00010, 0b00000, 0b00110, 0b00010, 0b00010, 0b00010, 0b00010, 0b10010, 0b01100]),
-    (b'k', [0b10000, 0b10000, 0b10010, 0b10100, 0b11000, 0b10100, 0b10010, 0b00000, 0b00000]),
-    (b'l', [0b01100, 0b00100, 0b00100, 0b00100, 0b00100, 0b00100, 0b01110, 0b00000, 0b00000]),
-    (b'm', [0b00000, 0b00000, 0b11010, 0b10101, 0b10101, 0b10101, 0b10101, 0b00000, 0b00000]),
-    (b'n', [0b00000, 0b00000, 0b11110, 0b10001, 0b10001, 0b10001, 0b10001, 0b00000, 0b00000]),
-    (b'o', [0b00000, 0b00000, 0b01110, 0b10001, 0b10001, 0b10001, 0b01110, 0b00000, 0b00000]),
-    (b'p', [0b00000, 0b00000, 0b11110, 0b10001, 0b10001, 0b10001, 0b11110, 0b10000, 0b10000]),
-    (b'q', [0b00000, 0b00000, 0b01111, 0b10001, 0b10001, 0b10001, 0b01111, 0b00001, 0b00001]),
-    (b'r', [0b00000, 0b00000, 0b10110, 0b11001, 0b10000, 0b10000, 0b10000, 0b00000, 0b00000]),
-    (b's', [0b00000, 0b00000, 0b01111, 0b10000, 0b01110, 0b00001, 0b11110, 0b00000, 0b00000]),
-    (b't', [0b01000, 0b01000, 0b11110, 0b01000, 0b01000, 0b01001, 0b00110, 0b00000, 0b00000]),
-    (b'u', [0b00000, 0b00000, 0b10001, 0b10001, 0b10001, 0b10011, 0b01101, 0b00000, 0b00000]),
-    (b'v', [0b00000, 0b00000, 0b10001, 0b10001, 0b10001, 0b01010, 0b00100, 0b00000, 0b00000]),
-    (b'w', [0b00000, 0b00000, 0b10001, 0b10001, 0b10101, 0b10101, 0b01010, 0b00000, 0b00000]),
-    (b'x', [0b00000, 0b00000, 0b10001, 0b01010, 0b00100, 0b01010, 0b10001, 0b00000, 0b00000]),
-    (b'y', [0b00000, 0b00000, 0b10001, 0b10001, 0b10001, 0b10001, 0b01111, 0b00001, 0b01110]),
-    (b'z', [0b00000, 0b00000, 0b11111, 0b00010, 0b00100, 0b01000, 0b11111, 0b00000, 0b00000]),
-];
+/// The chrome's glyphs: IBM Plex Mono, rasterized by build.rs.
+mod glyphs {
+    include!(concat!(env!("OUT_DIR"), "/chrome_glyphs.rs"));
+}
 
-fn glyph(c: u8) -> Option<&'static [u8; 9]> {
-    FONT.iter().find(|(g, _)| *g == c).map(|(_, rows)| rows)
+/// A character's glyph: left bearing, top above the baseline, size, coverage.
+fn glyph(c: u8) -> Option<(i32, i32, u32, u32, &'static [u8])> {
+    glyphs::GLYPHS.iter().find(|g| g.0 == c).map(|g| (g.1, g.2, g.3, g.4, g.5))
 }
 
 fn rect(x: i32, y: i32, w: i32, h: i32, color: [f32; 4]) -> SceneNode {
@@ -127,35 +81,46 @@ fn slot_frame(out: &mut Vec<SceneNode>, [x0, y0, x1, y1]: [i32; 4]) -> i32 {
     y1 + RING
 }
 
-/// `text` at (`x`, `y`), one rect per run of lit cells in a row, at most
-/// `max_w` pixels wide. Characters without a glyph are not drawn (origins
-/// are checked before they get here, so there are none).
+/// `text` with its line's top at (`x`, `y`), at most `max_w` pixels wide:
+/// each glyph's coverage as runs of rects of one (quantized) alpha.
+/// Characters without a glyph are not drawn (origins are checked before
+/// they get here, so there are none).
 fn text(out: &mut Vec<SceneNode>, s: &str, x: i32, y: i32, max_w: i32) {
+    let base = y + glyphs::ASCENT;
     for (i, c) in s.bytes().enumerate() {
-        let gx = x + i as i32 * ADVANCE;
-        if gx + GW * SCALE > x + max_w {
+        let pen = x + i as i32 * glyphs::ADVANCE;
+        if pen + glyphs::ADVANCE > x + max_w {
             break;
         }
-        let Some(rows) = glyph(c) else { continue };
-        for (r, bits) in rows.iter().enumerate() {
+        let Some((left, top, w, h, cov)) = glyph(c) else { continue };
+        let level = |a: u8| (a as u32 + 8) / 17; // 0..=15
+        for r in 0..h as usize {
+            let row = &cov[r * w as usize..(r + 1) * w as usize];
             let mut col = 0;
-            while col < GW {
-                if bits & (1 << (GW - 1 - col)) == 0 {
+            while col < row.len() {
+                let l = level(row[col]);
+                let start = col;
+                while col < row.len() && level(row[col]) == l {
                     col += 1;
+                }
+                if l == 0 {
                     continue;
                 }
-                let start = col;
-                while col < GW && bits & (1 << (GW - 1 - col)) != 0 {
-                    col += 1;
-                }
-                out.push(rect(gx + start * SCALE, y + r as i32 * SCALE, (col - start) * SCALE, SCALE, TEXT_COLOR));
+                let mut c = TEXT_COLOR;
+                c[3] = l as f32 / 15.0;
+                out.push(rect(pen + left + start as i32, base - top + r as i32, (col - start) as i32, 1, c));
             }
         }
     }
 }
 
+/// Width of `s` in the chrome's font.
+fn text_width(s: &str) -> i32 {
+    s.len() as i32 * glyphs::ADVANCE
+}
+
 /// Height of the strip at the top of the screen that only frescod draws.
-pub const STRIP_H: i32 = GH * SCALE + 2 * 3;
+pub const STRIP_H: i32 = 24;
 
 const STRIP_COLOR: [f32; 4] = [0.08, 0.08, 0.1, 1.0];
 
@@ -168,15 +133,16 @@ const STRIP_COLOR: [f32; 4] = [0.08, 0.08, 0.1, 1.0];
 /// which stack above every app; the ring is left out where they are, so
 /// it does not cut across an open bar menu. No app window is a cover.
 ///
-/// `hosted`: the panels apps hang from the bar (screen rects) and the
-/// app each is; a tab under each names it.
+/// `hosted`: the panels apps hang from the bar (screen rects), the app
+/// each is, and whether it opened below its icon; a label in the gap
+/// frescod leaves between the icon and the panel names it.
 #[allow(clippy::too_many_arguments)]
-pub fn build(screen_w: u32, focus: Option<u16>, origin: impl Fn(u16) -> Option<String>, shown: &[(u32, [i32; 4])], slots: &[[i32; 4]], covers: &[[i32; 4]], hosted: &[([i32; 4], String)]) -> WindowFrame {
+pub fn build(screen_w: u32, focus: Option<u16>, origin: impl Fn(u16) -> Option<String>, shown: &[(u32, [i32; 4])], slots: &[[i32; 4]], covers: &[[i32; 4]], hosted: &[([i32; 4], String, bool)]) -> WindowFrame {
     let sw = screen_w as i32;
     let mut rects = vec![rect(0, 0, sw, STRIP_H, STRIP_COLOR)];
     let mut bottom = STRIP_H;
-    for ([x0, _, x1, y1], name) in hosted {
-        bottom = bottom.max(hosted_tab(&mut rects, *x0, *x1, *y1, name));
+    for (r, name, below) in hosted {
+        bottom = bottom.max(hosted_label(&mut rects, *r, name, *below));
     }
     for &s in slots {
         bottom = bottom.max(slot_frame(&mut rects, s));
@@ -203,7 +169,7 @@ pub fn build(screen_w: u32, focus: Option<u16>, origin: impl Fn(u16) -> Option<S
         }
         if let Some(o) = origin(f).filter(|o| !o.is_empty()) {
             rects.push(rect(PAD, 3, RING, STRIP_H - 6, RING_COLOR)); // ties the text to the ring
-            text(&mut rects, &o, 3 * PAD, 3, sw - 4 * PAD);
+            text(&mut rects, &o, 3 * PAD, (STRIP_H - glyphs::LINE) / 2, sw - 4 * PAD);
         }
     }
     WindowFrame {
@@ -215,18 +181,31 @@ pub fn build(screen_w: u32, focus: Option<u16>, origin: impl Fn(u16) -> Option<S
     }
 }
 
-/// The tab under a panel an app hangs from the bar (`x0..x1`, its bottom
-/// at `y1`): the strip's colours, the ring's mark, the app's name. Returns
-/// its bottom edge.
-fn hosted_tab(out: &mut Vec<SceneNode>, x0: i32, x1: i32, y1: i32, name: &str) -> i32 {
-    let w = (x1 - x0).max(0);
-    out.push(rect(x0, y1, w, STRIP_H, STRIP_COLOR));
-    out.push(rect(x0 + PAD, y1 + 3, RING, STRIP_H - 6, RING_COLOR));
-    text(out, name, x0 + 3 * PAD, y1 + 3, w - 4 * PAD);
-    y1 + STRIP_H
+/// The label naming the app whose panel `[x0, y0, x1, y1]` hangs from
+/// the bar: a pill in the strip's colours, with the ring's dot, in the gap
+/// above the panel (`below`: it opened below its icon) or under it. It
+/// covers none of the app's pixels. Returns its bottom edge.
+fn hosted_label(out: &mut Vec<SceneNode>, [x0, y0, x1, y1]: [i32; 4], name: &str, below: bool) -> i32 {
+    let h = LABEL_H;
+    let gap = fresco_scene_server::window::HOSTED_LABEL_GAP as i32;
+    let y = if below { y0 - gap + (gap - h) / 2 } else { y1 + (gap - h) / 2 };
+    // The dot, a space, the name, the pill's round end.
+    let tx = x0 + PAD + 1 + 6 + 6;
+    let w = (tx - x0 + text_width(name) + 2 * PAD).min((x1 - x0).max(h));
+    let mut pill = rect(x0, y, w, h, STRIP_COLOR);
+    pill.radius = h as f32 / 2.0;
+    out.push(pill);
+    let mut dot = rect(x0 + PAD + 1, y + h / 2 - 3, 6, 6, RING_COLOR);
+    dot.radius = 3.0;
+    out.push(dot);
+    text(out, name, tx, y + (h - glyphs::LINE) / 2, x0 + w - PAD - tx);
+    y + h
 }
 
-/// What the tab under a granted panel names its app by: the launch
+/// The label's height.
+const LABEL_H: i32 = 20;
+
+/// What the label over a granted panel names its app by: the launch
 /// registry's id for `uid` (`uid-N` when it has none), in the characters
 /// the chrome font draws. The registry is read again every few seconds.
 pub fn app_label(uid: u32) -> String {
@@ -310,12 +289,17 @@ mod tests {
     }
 
     #[test]
-    fn a_granted_panel_gets_a_tab_naming_its_app() {
-        let f = build(1280, None, |_| None, &[], &[], &[], &[([900, 62, 1200, 362], "org.example.clip".into())]);
-        assert!(f.size.1 as i32 >= 362 + STRIP_H, "the layer reaches the tab");
-        let tab = f.rects.iter().find(|n| n.color == STRIP_COLOR && n.position == [900.0, 362.0]).expect("a tab under the panel");
-        assert_eq!(tab.size, [300.0, STRIP_H as f32]);
-        assert!(f.rects.iter().filter(|n| n.color == TEXT_COLOR && n.position[1] >= 362.0).count() > 10, "the name is drawn");
+    fn a_granted_panel_gets_a_label_naming_its_app() {
+        let gap = fresco_scene_server::window::HOSTED_LABEL_GAP as i32;
+        let f = build(1280, None, |_| None, &[], &[], &[], &[([900, 62 + gap, 1200, 362], "org.example.clip".into(), true)]);
+        let pill = f.rects.iter().find(|n| n.color == STRIP_COLOR && n.position[0] == 900.0 && n.radius > 0.0).expect("a label");
+        let (top, bottom) = (pill.position[1] as i32, (pill.position[1] + pill.size[1]) as i32);
+        assert!(top >= 62 && bottom <= 62 + gap, "in the gap above the panel: {top}..{bottom}");
+        assert!(pill.size[0] < 300.0, "a pill, not the panel's width");
+        let text: Vec<_> = f.rects.iter().filter(|n| n.color[..3] == TEXT_COLOR[..3]).collect();
+        assert!(text.len() > 20, "the name is drawn");
+        assert!(text.iter().all(|n| n.position[1] >= top as f32 && n.position[1] < bottom as f32), "inside the label");
+        assert!(text.iter().any(|n| n.color[3] < 1.0), "anti-aliased");
         assert_eq!(app_label(4_000_000_000), "uid-4000000000");
     }
 
@@ -331,6 +315,11 @@ mod tests {
     fn every_origin_character_has_a_glyph() {
         for c in 0u8..=127 {
             assert_eq!(super::glyph(c).is_some(), fresco_split::chrome::origin_char(c), "{:?}", c as char);
+        }
+        // Every glyph fits the strip's line.
+        for g in glyphs::GLYPHS {
+            assert_eq!(g.5.len(), (g.3 * g.4) as usize);
+            assert!(glyphs::ASCENT - g.2 >= -1 && glyphs::ASCENT - g.2 + g.4 as i32 <= STRIP_H, "{:?}", g.0 as char);
         }
     }
 }

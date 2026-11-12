@@ -56,7 +56,7 @@ A pop-up could be used to draw over another app. So:
   bar, role `Chrome`) and their pop-ups stack above every app's pop-up:
   app windows, app pop-ups, panels apps hang from the bar by its grant
   (forum-status-items.md §4: `OP_POPUP_GRANT` / `OP_POPUP_CLAIM`, kept
-  below the strip, named by a tab frescod draws), chrome, chrome pop-ups,
+  below the strip, named by a label frescod draws above it), chrome, chrome pop-ups,
   notifications. While
   a grabbing pop-up is open, only its chain may open more, so an app that
   stays focused under the bar's menu cannot cover it. No app gets the `Chrome`

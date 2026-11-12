@@ -74,9 +74,9 @@ g "grep -q 'OpenPanel' $S/app.log" && ok "forum-wm passed the token" || bad "no 
 g "grep -E 'grant refused|claim refused' $S/frescod.log" && bad "frescod refused" || ok "frescod took the grant and claim"
 
 echo "== a press inside the panel picks a clip"
-# The panel hangs end-aligned under the icon: the first clip row is
-# about 50 px below its top.
-press $((x - 120)) $((y + 30 + 50))
+# The panel hangs end-aligned under the icon, below the 24 px gap for
+# frescod's label: the first clip row is about 50 px below its top.
+press $((x - 120)) $((y + 19 + 24 + 50))
 sleep 4
 g "grep -q 'picked clip 0' $S/app.log" && ok "a click reached the app's panel" || bad "click did not reach the panel"
 

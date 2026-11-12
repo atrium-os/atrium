@@ -21,6 +21,7 @@ use std::sync::{Arc, Mutex, mpsc};
 
 mod popup;
 pub use popup::place as place_popup;
+pub use popup::HOSTED_LABEL_GAP;
 
 /// Server-driven async events emitted by the compositor when its
 /// state changes (resize, focus, close-request, DPI). Per

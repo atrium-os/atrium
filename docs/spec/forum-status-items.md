@@ -135,10 +135,13 @@ The panel is the app's, not the shell's:
 - It stacks above every app window and app pop-up but below the bar and
   the bar's own menus, and it is kept below frescod's strip.
 - Pop-ups it opens (a submenu) are the app's too.
-- In split mode frescod's trusted layer draws a tab under it naming the
-  app from the launch registry (`uid-N` when unregistered), in the
-  strip's colours and font. The app draws the panel but cannot draw who
-  it is. Direct mode (development only) has no tab.
+- frescod leaves a 24 px gap between the bar and the panel
+  (`HOSTED_LABEL_GAP`), and in split mode its trusted layer draws a pill
+  there naming the app from the launch registry (`uid-N` when
+  unregistered), in the strip's colours and font. The label sits on top,
+  between the icon and what the app drew, so it reads first, and it
+  covers none of the app's pixels. The app draws the panel but cannot
+  draw who it is. Direct mode (development only) has no label.
 
 In split mode the bar's and the app's renderers each record their half
 (`PopupGrant`, `PopupClaim` records) and frescod's broker checks both;

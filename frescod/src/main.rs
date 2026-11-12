@@ -1421,12 +1421,14 @@ fn render_one_frame(
          * window locks, which a renderer's thread takes before comp. */
         let (focus, covers, hosted) = {
             let c = comp.lock().unwrap();
-            /* Panels apps hang from the bar by its grant: a tab under
+            /* Panels apps hang from the bar by its grant: a label over
              * each names the app (forum-status-items.md §4). */
-            let hosted: Vec<([i32; 4], String)> = rects.iter()
+            let hosted: Vec<([i32; 4], String, bool)> = rects.iter()
                 .filter_map(|&(id, r)| {
                     let w = c.windows.get(&u16::try_from(id).ok()?)?;
-                    w.popup.filter(|p| p.hosted.is_some()).map(|_| (r, chrome::app_label(w.owner_uid)))
+                    let p = w.popup.filter(|p| p.hosted.is_some())?;
+                    let below = p.told.map_or(p.side, |t| t.4) != fresco_protocol::popup_side::ABOVE;
+                    Some((r, chrome::app_label(w.owner_uid), below))
                 })
                 .collect();
             /* The shell's own windows (the bar, its menus, notifications)

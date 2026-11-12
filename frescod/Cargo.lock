@@ -927,6 +927,7 @@ dependencies = [
  "portcullis-peer",
  "portcullis-policy",
  "serde",
+ "swash",
  "tactus",
 ]
 
