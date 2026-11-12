@@ -507,3 +507,8 @@ through fd passing, close and jail death.
   every start (mainline mes_v12_0_enable clears it because stale contents made the
   firmware fault at activation; kenv mes_mscratch=0 turns it off), GART page 0 is left
   unmapped (the IH ring moved to 0x1000), and the log says which start attempt worked.
+- **2026-11-12 21:38, 44649060: stage 5a refused a healthy card.** SMU up, GC idle proven
+  (7 W), then "attach failed (5)" before the GART: the new end-of-start check read
+  GB_ADDR_CONFIG, which reads 0 once GfxOff has powered GC down. Reset left the card cold.
+  Fix: that check removed (only a failed SMU link fails the start); every attach failure
+  now names its step. Log /root/runs/20261112T213813Z.log.

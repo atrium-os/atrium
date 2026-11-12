@@ -475,7 +475,7 @@ smu_start(struct smu_link *lp, struct resource *vram, uint64_t mc,
 		device_printf(sc->dev, "smu: features not running; enabling "
 		    "them powers GC up and the driver cannot idle it yet "
 		    "(power P2). Not enabling (hw.atrium_gpu.gc_up_ok=0)\n");
-		return (err);
+		return (ECANCELED);	/* GC not up: nothing to attach to */
 	}
 	if (feat == 0) {
 		/* First start this boot: amdgpu's smc_hw_setup order. */
@@ -562,7 +562,11 @@ smu_start(struct smu_link *lp, struct resource *vram, uint64_t mc,
 	}
 
 	*ifverp = ifver;
-	if (err == 0 && (lp->failed || gc_rd(sc, 0, GC12_GB_ADDR_CONFIG) == 0))
+	/*
+	 * Not GB_ADDR_CONFIG here: with GfxOff allowed GC is off and reads 0
+	 * (box run 44649060 refused a healthy card that way).
+	 */
+	if (err == 0 && lp->failed)
 		err = EIO;
 	return (err);
 #undef SEND
@@ -823,6 +827,7 @@ int
 amd_si_attach(struct atrium_amd_softc *sc)
 {
 	struct amd_si *si;
+	const char *step = "SMU link";
 	int err, us;
 
 	si = malloc(sizeof(*si), M_DEVBUF, M_WAITOK | M_ZERO);
@@ -834,6 +839,7 @@ amd_si_attach(struct atrium_amd_softc *sc)
 	    &si->table_mc);
 	if (err != 0)
 		goto fail;
+	step = "SMU start and idle proof";
 	err = smu_start(&si->link, si->vram, si->table_mc, &si->ifver);
 	if (err != 0)
 		goto fail;
@@ -843,21 +849,27 @@ amd_si_attach(struct atrium_amd_softc *sc)
 	for (us = 0; us < GC_WAIT_US && gc_rd(sc, 0, GC12_GB_ADDR_CONFIG) == 0;
 	    us += 100)
 		DELAY(100);
+	step = "GART (4a)";
 	if ((err = amd_gmc12_gart_enable(sc, si->vram, &si->gt)) != 0)
 		goto down;
 	si->gart_up = true;
+	step = "GFX setup (4c)";
 	if ((err = amd_gfx12_setup(sc)) != 0)
 		goto down;
+	step = "IH (4b)";
 	if ((err = amd_ih7_up(sc, &si->gt, &si->ih)) != 0)
 		goto down;
+	step = "MES (4d)";
 	if ((err = amd_mes12_up(sc, &si->gt, true, &si->mes)) != 0)
 		goto down;
+	step = "dispatch (4e)";
 	err = amd_mes12_selftest(si->mes);
 	device_printf(sc->dev, "si: dispatch at attach: %s; %d CP EOP IV(s)\n",
 	    err == 0 ? "PASS" : "FAILED", amd_ih7_drain_eop(si->ih, 8));
 	if (err != 0)
 		goto down;
 	(void)smu_send(&si->link, SMU_ALLOW_GFXOFF, 0, NULL, false);
+	step = "idle proof while attached";
 	if (!smu_sample(&si->link, si->vram, si->ifver, 5,
 	    "attached, MES up, no work")) {
 		device_printf(sc->dev, "si: could not prove the card idle "
@@ -865,6 +877,7 @@ amd_si_attach(struct atrium_amd_softc *sc)
 		err = EIO;
 		goto down;
 	}
+	step = "SMU link";
 	if (si->link.failed) {
 		err = EIO;
 		goto down;
@@ -880,7 +893,8 @@ amd_si_attach(struct atrium_amd_softc *sc)
 down:
 	si_down(si, false);
 fail:
-	device_printf(sc->dev, "si: stage 5a: attach failed (%d)\n", err);
+	device_printf(sc->dev, "si: stage 5a: attach failed at %s (%d)\n",
+	    step, err);
 	if (si->vram != NULL)
 		bus_release_resource(sc->dev, SYS_RES_MEMORY, si->vram_rid,
 		    si->vram);
