@@ -63,6 +63,10 @@ A pop-up could be used to draw over another app. So:
   <user> org.atrium.forum-bar session`), which an app installed under the same id never is, and an app
   launch never reuses a session uid. `FRESCOD_CHROME_UIDS` adds uids for
   tests. Everyone else gets `Document`.
+  frescod's focus ring (split mode's trusted chrome) goes under these
+  shell windows: it is left out where the bar, its menus or a
+  notification cover the focused window's edge, so an open bar menu is
+  not crossed by it. App windows and app pop-ups never hide it.
 - An app can still draw a fake drop-down in its own window under the bar.
   The tell is the bar: while its menu is open the button is drawn pressed
   and the menu attached to it (atrium-visual-language.md §14.2, Pergola

@@ -159,7 +159,11 @@ const STRIP_COLOR: [f32; 4] = [0.08, 0.08, 0.1, 1.0];
 /// focused window and where each window is (`shown`: id and screen rect,
 /// as composed). It is in screen coordinates (a layer at (0, 0)), down to
 /// the bottom of the focused window's ring.
-pub fn build(screen_w: u32, focus: Option<u16>, origin: impl Fn(u16) -> Option<String>, shown: &[(u32, [i32; 4])], slots: &[[i32; 4]]) -> WindowFrame {
+///
+/// `covers`: the shell's own windows (the bar, its menus, notifications),
+/// which stack above every app; the ring is left out where they are, so
+/// it does not cut across an open bar menu. No app window is a cover.
+pub fn build(screen_w: u32, focus: Option<u16>, origin: impl Fn(u16) -> Option<String>, shown: &[(u32, [i32; 4])], slots: &[[i32; 4]], covers: &[[i32; 4]]) -> WindowFrame {
     let sw = screen_w as i32;
     let mut rects = vec![rect(0, 0, sw, STRIP_H, STRIP_COLOR)];
     let mut bottom = STRIP_H;
@@ -173,10 +177,17 @@ pub fn build(screen_w: u32, focus: Option<u16>, origin: impl Fn(u16) -> Option<S
         let y0 = y0.max(STRIP_H);
         let (w, h) = (x1 - x0, y1 - y0);
         if w > 2 * RING && h > 2 * RING {
-            rects.push(rect(x0, y0, w, RING, RING_COLOR));
-            rects.push(rect(x0, y1 - RING, w, RING, RING_COLOR));
-            rects.push(rect(x0, y0 + RING, RING, h - 2 * RING, RING_COLOR));
-            rects.push(rect(x1 - RING, y0 + RING, RING, h - 2 * RING, RING_COLOR));
+            let sides = [
+                [x0, y0, x1, y0 + RING],
+                [x0, y1 - RING, x1, y1],
+                [x0, y0 + RING, x0 + RING, y1 - RING],
+                [x1 - RING, y0 + RING, x1, y1 - RING],
+            ];
+            for side in sides {
+                for [a, b, c, d] in uncovered(side, covers) {
+                    rects.push(rect(a, b, c - a, d - b, RING_COLOR));
+                }
+            }
             bottom = bottom.max(y1);
         }
         if let Some(o) = origin(f).filter(|o| !o.is_empty()) {
@@ -191,6 +202,28 @@ pub fn build(screen_w: u32, focus: Option<u16>, origin: impl Fn(u16) -> Option<S
         rects,
         ..Default::default()
     }
+}
+
+/// The parts of `r` (`[x0, y0, x1, y1]`) outside every rect of `covers`.
+fn uncovered(r: [i32; 4], covers: &[[i32; 4]]) -> Vec<[i32; 4]> {
+    let mut parts = vec![r];
+    for &[cx0, cy0, cx1, cy1] in covers {
+        let mut next = Vec::new();
+        for [x0, y0, x1, y1] in parts {
+            if cx1 <= x0 || cx0 >= x1 || cy1 <= y0 || cy0 >= y1 {
+                next.push([x0, y0, x1, y1]);
+                continue;
+            }
+            // Above, below, then left and right of the cover, within r.
+            if cy0 > y0 { next.push([x0, y0, x1, cy0]); }
+            if cy1 < y1 { next.push([x0, cy1, x1, y1]); }
+            let (my0, my1) = (y0.max(cy0), y1.min(cy1));
+            if cx0 > x0 { next.push([x0, my0, cx0, my1]); }
+            if cx1 < x1 { next.push([cx1, my0, x1, my1]); }
+        }
+        parts = next;
+    }
+    parts
 }
 
 /// Direct mode has no strip, so only the slots' frames go on top: a layer
@@ -216,6 +249,25 @@ pub fn slot_frames(slots: &[[i32; 4]]) -> Option<WindowFrame> {
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+
+    #[test]
+    fn the_ring_goes_under_the_shells_own_windows() {
+        let shown = [(5u32, [0, 62, 1280, 670])];
+        let lit = |f: &WindowFrame, x: i32, y: i32| {
+            f.rects.iter().any(|n| n.color == RING_COLOR && (n.position[0] as i32..(n.position[0] + n.size[0]) as i32).contains(&x)
+                && (n.position[1] as i32..(n.position[1] + n.size[1]) as i32).contains(&y))
+        };
+        let open = build(1280, Some(5), |_| None, &shown, &[], &[]);
+        assert!(lit(&open, 800, 62) && lit(&open, 600, 62));
+        // A bar menu over the window's top edge hides the ring under it only.
+        let menu = [679, 56, 975, 92];
+        let under = build(1280, Some(5), |_| None, &shown, &[], &[menu]);
+        assert!(!lit(&under, 800, 62) && !lit(&under, 679, 63) && !lit(&under, 974, 62));
+        assert!(lit(&under, 678, 62) && lit(&under, 975, 62) && lit(&under, 0, 300) && lit(&under, 640, 669));
+        assert_eq!(uncovered([0, 0, 10, 10], &[[2, 2, 4, 4]]).iter().map(|[a, b, c, d]| (c - a) * (d - b)).sum::<i32>(), 96);
+    }
+
     #[test]
     fn slot_frames_cover_each_slot_and_its_tab() {
         assert!(super::slot_frames(&[]).is_none());

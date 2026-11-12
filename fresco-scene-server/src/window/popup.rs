@@ -184,6 +184,15 @@ impl Compositor {
         }
     }
 
+    /// Whether window `id` is the shell's own layer: the bar or dock
+    /// (Chrome), a pop-up hanging from one, or a notification. These stack
+    /// above every app (fresco-popups.md §2), so frescod's focus ring does
+    /// not cross them: an open bar menu hides the ring under it.
+    pub fn shell_layer(&self, id: WindowId) -> bool {
+        self.windows.get(&id).is_some_and(|w| matches!(w.role, WmRole::Chrome | WmRole::Notification))
+            || (self.windows.get(&id).is_some_and(|w| w.popup.is_some()) && self.popup_trusted(id))
+    }
+
     /// Whether pop-up `id`'s chain hangs from the shell's chrome (the
     /// Forum bar): it stacks above every app's pop-up and may reach the
     /// top of the screen.
