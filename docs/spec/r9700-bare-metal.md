@@ -309,3 +309,13 @@ land with it.
   After teardown the card was back at 7 W, 0 % busy, by sample 2. The gate passed, but the
   verdict was not logged; the check now logs it ("card proven idle after stage 4"). The reset ended with
   the card cold, and the PCH stayed at 28–30 °C for 5 minutes.
+- **2026-11-12 19:11, stage 4a again plus 4b, IH self-test inconclusive (47128722).**
+  4a repeated exactly. IH ring 0 was programmed (RB_CNTL 0x40610000 → 0x4013011d: enabled,
+  64 KiB, wptr writeback, GPU VA space) and turned off cleanly. Writing the MP1 software
+  interrupt produced no IV: WPTR and the writeback stayed 0, and IH_STATUS stayed 0xc0847
+  (all idle bits, input included), so nothing reached the IH. Whether the host can raise that
+  interrupt at all is unknown, and the GART write path is still unproven. **The card has no
+  MSI-X capability, only MSI with 1 message** (pciconf). The driver now falls back to MSI, then
+  to polling, and every IH client shares one vector (8f0c26c7). The IH is proven by the first
+  CP EOP interrupt instead (4d/4e). Idle after stage 4 was accepted at 16 W, 15 % busy (below
+  the 20 % and 25 %-of-limit thresholds). The reset left the card cold; PCH 28–30 °C.
