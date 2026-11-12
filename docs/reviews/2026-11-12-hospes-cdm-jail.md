@@ -74,11 +74,9 @@ The first run found two setup gaps, both fixed:
 
 ## Not covered
 
-- **Widevine itself was not run on this path.** The VM check drives the Clear Key test CDM
-  through a probe app. The player cannot yet run as a jailed app, because no player bundle
-  ships its decoder libraries, so the H4 Widevine check still starts `hospes-cdm` directly.
-  When the player is bundled, `ATRIUM_PLAYER_CDM=system:com.widevine.alpha` is the switch,
-  and `hospes-install … /var/db/atrium/cdm/com.widevine.alpha` is where Widevine goes.
+- **Widevine on this path: done 2026-11-12.** The player now runs as a jailed test app, and
+  real Widevine plays through `OpenCdm` and `OpenFetcher` (`2026-11-12-hospes-jailed-widevine.md`,
+  `JAILED=1 scripts/hospes-h4-vm.sh`).
 - **The bhyve wrapper** (optional) is not built.
 - **Wiping and listing stores** in settings ("protected content licences for <origin>",
   §8.4) has no UI yet. The directory layout makes both one directory per origin.

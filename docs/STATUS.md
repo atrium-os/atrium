@@ -206,7 +206,7 @@ wrapper not built. Build order H0-H5 complete; open items in the H4/H5 write-ups
 (`docs/reviews/2026-11-12-hospes-cdm-jail.md`): portcullisd `OpenCdm` + manifest capability
 `protected-media`; hospes-cdm runs as `_hospes-cdm` (65027) in a one-shot jail with a
 per-app, per-origin store, library and store rights-limited; arm64 VM check passes. Widevine WebM (VP9) plays through the manifest's PSSH
-(`docs/reviews/2026-11-12-hospes-webm-pssh.md`, `ATRIUM_PLAYER_CDM_MPD`/`_PSSH`), arm64 VM. Run: `scripts/hospes-build.sh`, `scripts/hospes-h3-vm.sh`,
+(`docs/reviews/2026-11-12-hospes-webm-pssh.md`, `ATRIUM_PLAYER_CDM_MPD`/`_PSSH`), arm64 VM. Real Widevine plays through the jailed system path (player as an app, CDM via `OpenCdm`, licence via `OpenFetcher`; `docs/reviews/2026-11-12-hospes-jailed-widevine.md`, `JAILED=1 scripts/hospes-h4-vm.sh`), arm64 VM. That run needed the fork rebased onto upstream main (`atrium-os/freebsd-src` branch `atrium-os-rebase`, Laminar on upstream's new scheduler interface). Replacing branch `atrium-os` with it waits for Shankar. Run: `scripts/hospes-build.sh`, `scripts/hospes-h3-vm.sh`,
 `scripts/hospes-kmod.sh`, `scripts/hospes-k1-vm.sh`, `scripts/hospes-h4-vm.sh`,
 `scripts/hospes-version-watch.sh`, `scripts/hospes-cdm-jail-vm.sh`.
 
