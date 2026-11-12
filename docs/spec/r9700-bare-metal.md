@@ -435,3 +435,12 @@ land with it.
   CP_STAT 0) and halting it again afterwards both worked. With MES failed, the card was
   proven idle at 16 W. Next: retry the start up to 3 times (halt + pipe reset + icache
   invalidate between attempts), each attempt logged.
+- **2026-11-12 21:11, 4286a4fc: stage 4d PASSED, and the card idles.** Both MES pipes were
+  up on attempt 1, so the retry was not exercised. All APIs returned status 1, there were
+  14 CP EOP IVs (IH write path PASS) and no GFXHUB faults. GRBM_STATUS stayed 0x382c and
+  CP_CPF_STATUS 0 through MES running, queue removal and the halt. The card was proven
+  idle after stage 4 on the first sample: 14 W, 241 MHz, 10 % busy. The reset left it
+  cold. So the hot idle came from starting MES with MEC and PFP/ME halted; the fix is
+  amdgpu's cp_resume order. Stages 4a–4d are box-verified. Still open: the intermittent
+  MES pipe start (root cause unknown; the retry hides it), seen in 5 of 9 runs between
+  20:36 and 21:05.
