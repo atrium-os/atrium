@@ -55,6 +55,14 @@ REVOKE=${REVOKE:-0}
 # bar's "Take back" sends); the pad follows focus to window 2 (§4). Needs
 # FORUM_WM and FORUM_CTL (x86_64-unknown-freebsd builds) in the env.
 TAKEBACK=${TAKEBACK:-0}
+# BAR=1 (with TAKEBACK=1): the take-back goes through the real bar instead
+# of forum-ctl: forum-bar (FORUM_BAR, given the Chrome role) runs on the
+# same frescod, and the injector presses its controller icon (PAD_ICON=x,y)
+# and the menu's "Take back" line (PAD_ITEM=x,y). Frames before, with the
+# menu open and after are saved as /tmp/tactus-bar-{0,1,2}.png here.
+BAR=${BAR:-0}
+PAD_ICON=${PAD_ICON:-961,19}
+PAD_ITEM=${PAD_ITEM:-880,56}
 # GUIDE=1 (with CLAIM=1): the same by holding the pad's Guide button
 # (fake-pad holds button 17, the generic mapping's Guide, for 2.5 s).
 GUIDE=${GUIDE:-0}
@@ -93,6 +101,13 @@ if [ "$TAKEBACK" = 1 ]; then
   scp -q $K -P 2222 "$FORUM_WM" root@localhost:/root/t/forum-wm
   scp -q $K -P 2222 "$FORUM_CTL" root@localhost:/root/t/forum-ctl
 fi
+if [ "$BAR" = 1 ]; then
+  scp -q $K -P 2222 "$FORUM_BAR" root@localhost:/root/t/forum-bar
+  V 'mkdir -p /usr/local/share/fonts/ibm-plex'
+  for f in "$ROOT"/fonts/ibm-plex/*.ttf "$ROOT"/fonts/phosphor/*.ttf; do
+    V "test -f /usr/local/share/fonts/ibm-plex/$(basename "$f")" || scp -q $K -P 2222 "$f" root@localhost:/usr/local/share/fonts/ibm-plex/
+  done
+fi
 
 echo "== commission tactusd (jailed, devfs ruleset 26)"
 V "CON=${CON:+/root/t/tactus-console} sh -s" <<'EOF'
@@ -123,7 +138,7 @@ ls -l /atrium/sockets/tactus/
 EOF
 
 echo "== frescod (headless) and the probe window"
-V "GAMEPAD=$GAMEPAD CLAIM=$CLAIM TAKEBACK=$TAKEBACK sh -s" <<'EOF'
+V "GAMEPAD=$GAMEPAD CLAIM=$CLAIM TAKEBACK=$TAKEBACK BAR=$BAR sh -s" <<'EOF'
 cd /root/t
 rm -rf /tmp/hl /tmp/frescod-t.log; mkdir -p /tmp/hl /atrium/sockets/fresco
 SPLIT="FRESCOD_SPLIT=0"
@@ -140,12 +155,19 @@ if [ "$CLAIM" = 1 ]; then
   CAPS="FRESCOD_APP_REGISTRY=/tmp/capreg/registry ATRIUM_POLICY_BASE=/tmp/cappol"
   CLAIMENV="PROBE_PAD_CLAIM=1"
 fi
-daemon -f -o /tmp/frescod-t.log env FRESCOD_HEADLESS_PNG=/tmp/hl/f $SPLIT $CAPS FRESCOD_SOCK=/tmp/fresco-t.sock FRESCOD_WM_SOCK=/tmp/fresco-wm-t.sock ./frescod
+BARENV=""
+[ "$BAR" = 1 ] && BARENV="FRESCOD_CHROME_UIDS=0 FRESCOD_INPUT_SOCK=/tmp/inject-t.sock"
+daemon -f -o /tmp/frescod-t.log env FRESCOD_HEADLESS_PNG=/tmp/hl/f $SPLIT $CAPS $BARENV FRESCOD_SOCK=/tmp/fresco-t.sock FRESCOD_WM_SOCK=/tmp/fresco-wm-t.sock ./frescod
 sleep 8
 if [ "$TAKEBACK" = 1 ]; then
   pkill -x forum-wm; rm -f /tmp/forum-wm.log
   daemon -f -o /tmp/forum-wm.log env FRESCO_WM_SOCKET=/tmp/fresco-wm-t.sock FORUM_CTL_SOCKET=/tmp/forum-ctl-t.sock ./forum-wm
   sleep 4; head -3 /tmp/forum-wm.log
+fi
+if [ "$BAR" = 1 ]; then
+  pkill -x forum-bar; rm -f /tmp/forum-bar.log
+  daemon -f -o /tmp/forum-bar.log env FRESCO_SOCKET=/tmp/fresco-t.sock FORUM_CTL_SOCKET=/tmp/forum-ctl-t.sock ./forum-bar
+  sleep 8
 fi
 grep -E "tactus|input" /tmp/frescod-t.log | head -5
 S=$(grep -o "/[^ ]*fresco[^ ]*\.sock" /tmp/frescod-t.log | head -1); [ -S /tmp/fresco-t.sock ] && S=/tmp/fresco-t.sock
@@ -156,13 +178,14 @@ EOF
 
 if [ "$GAMEPAD" = 1 ]; then
   echo "== gamepad: fake Bluetooth pad -> jailed tactusd -> split frescod -> windows"
-  V "REVOKE=$REVOKE TAKEBACK=$TAKEBACK GUIDE=$GUIDE sh -s" <<'EOF'
+  V "REVOKE=$REVOKE TAKEBACK=$TAKEBACK GUIDE=$GUIDE BAR=$BAR PAD_ICON=$PAD_ICON PAD_ITEM=$PAD_ITEM sh -s" <<'EOF'
 cd /root/t
 S=/tmp/fresco-t.sock
 mkdir -p /atrium/sockets/bluetooth-hid; chmod 0755 /atrium/sockets/bluetooth-hid
 rm -f /tmp/pad.log
 MODE=""; [ "$GUIDE" = 1 ] && MODE=guide
-(umask 0; daemon -f -o /tmp/pad.log ./fake-pad /atrium/sockets/bluetooth-hid/hid.sock 25 $MODE)
+PAUSE=25; [ "$BAR" = 1 ] && PAUSE=90
+(umask 0; daemon -f -o /tmp/pad.log ./fake-pad /atrium/sockets/bluetooth-hid/hid.sock $PAUSE $MODE)
 # tactusd retries the socket every 2 s; then four steps 1.5 s apart.
 i=0; until grep -q "pausing" /tmp/pad.log || [ $i -ge 60 ]; do sleep 1; i=$((i+1)); done
 sleep 3
@@ -176,7 +199,17 @@ if [ "$TAKEBACK" = 1 ]; then
   sleep 4
   export FORUM_CTL_SOCKET=/tmp/forum-ctl-t.sock
   ./forum-ctl pads > /tmp/pads-before.log 2>&1
-  ./forum-ctl take-back > /tmp/takeback.log 2>&1
+  if [ "$BAR" = 1 ]; then
+    # The user's way: the bar's controller icon, then "Take back".
+    press() { printf 'MOVE %s %s\n' "${1%,*}" "${1#*,}" | nc -N -U /tmp/inject-t.sock; sleep 2
+              printf 'BTN 1 1\n' | nc -N -U /tmp/inject-t.sock; sleep 1; printf 'BTN 1 0\n' | nc -N -U /tmp/inject-t.sock; }
+    sleep 6; cp /tmp/hl/f.png /tmp/bar-0.png
+    press "$PAD_ICON"; sleep 15; cp /tmp/hl/f.png /tmp/bar-1.png
+    press "$PAD_ITEM"; sleep 15; cp /tmp/hl/f.png /tmp/bar-2.png
+    echo ok > /tmp/takeback.log
+  else
+    ./forum-ctl take-back > /tmp/takeback.log 2>&1
+  fi
   ./forum-ctl pads > /tmp/pads-after.log 2>&1
   echo "-- pads before"; cat /tmp/pads-before.log; echo "-- take-back"; cat /tmp/takeback.log; echo "-- pads after"; cat /tmp/pads-after.log
 fi
@@ -184,6 +217,10 @@ i=0; until grep -q "detached" /tmp/pad.log || [ $i -ge 90 ]; do sleep 1; i=$((i+
 sleep 3
 cat /tmp/pad.log
 EOF
+  if [ "$BAR" = 1 ]; then
+    for i in 0 1 2; do scp -q $K -P 2222 root@localhost:/tmp/bar-$i.png /tmp/tactus-bar-$i.png; done
+    V 'tail -5 /tmp/forum-bar.log'
+  fi
   V 'grep -E "^pad-(connect|disconnect|button|axis|claim) " /tmp/probe.log' > /tmp/tactus-pad1.log
   V 'grep -E "^pad-(connect|disconnect|button|axis|claim) " /tmp/probe2.log' > /tmp/tactus-pad2.log
   V 'grep "^pad-std " /tmp/probe.log' > /tmp/tactus-std1.log

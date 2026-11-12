@@ -33,6 +33,8 @@ pub const MENU_INSET: f32 = 4.0;
 pub const MENU_GAP: f32 = 4.0;
 /// The gutter before labels when a menu has check or radio marks.
 pub const MARK_GUTTER: f32 = 16.0;
+/// The widest a menu grows to fit its items.
+pub const MENU_MAX_W: f32 = 420.0;
 /// The accent edge of a menu hanging from a lit (attached) menu button.
 pub const ATTACHED_EDGE: f32 = 2.0;
 /// A press-catcher bigger than any window: frescod clips it.
@@ -164,6 +166,25 @@ impl Menu {
     pub fn anchored(mut self, rect: Rect, side: crate::popup::Side, align: crate::popup::Align) -> Self {
         self.anchor = Some((rect, side, align));
         self
+    }
+
+    /// As wide as its widest item needs (label, mark gutter, shortcut),
+    /// at most `MENU_MAX_W`: an icon button's menu is not cut to the
+    /// button (the bar's controller menu: "Pad · held by app — Take back").
+    pub fn natural_width(&self) -> f32 {
+        let gutter = if self.items.iter().any(|i| i.mark != Mark::None) { MARK_GUTTER } else { 0.0 };
+        let widest = self
+            .items
+            .iter()
+            .map(|i| {
+                let l = Node::measure_text(&i.label, &text(Color::TRANSPARENT, type_size::MD, font::SANS, Weight::Regular)).w;
+                let k = i.shortcut.as_ref().map_or(0.0, |k| {
+                    space::LG + Node::measure_text(k, &text(Color::TRANSPARENT, type_size::SM, font::MONO, Weight::Regular)).w
+                });
+                l + k
+            })
+            .fold(0.0, f32::max);
+        (2.0 * MENU_INSET + 2.0 * space::SM + gutter + widest).ceil().min(MENU_MAX_W)
     }
 
     /// The menu's height for its items.
@@ -410,7 +431,7 @@ impl View for Dropdown {
 /// window allows, at least as wide. Attached: no gap, joined to it.
 fn open_under(ctx: &mut Ctx, m: Menu, r: Rect, attached: bool, align: crate::popup::Align) {
     let gap = if attached { 0.0 } else { MENU_GAP };
-    let w = r.w().max(160.0);
+    let w = r.w().max(160.0).max(m.natural_width());
     let x = if align == crate::popup::Align::End { r.x() + r.w() - w } else { r.x() };
     let mut m = m
         .at(x, r.y() + r.h() + gap)
@@ -838,6 +859,15 @@ impl View for Dialog {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_menu_is_as_wide_as_its_widest_item() {
+        crate::text::clear_measurer();
+        let short = Menu::new(Mutable::new(MenuState::default()), vec![MenuItem::new("Copy")], |_| {});
+        let long = Menu::new(Mutable::new(MenuState::default()), vec![MenuItem::new("Fake Pad · held by game — Take back")], |_| {});
+        assert!(short.natural_width() < 160.0);
+        assert!(long.natural_width() > 160.0 && long.natural_width() <= MENU_MAX_W);
+    }
     use crate::app::App;
     use crate::event::Modifiers;
     use crate::geom::Point;
