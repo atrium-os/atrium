@@ -582,7 +582,7 @@ screen has it.
 | **Segmented control** | `bg-surface` track with a 1px `border-default` edge (so it shows on `bg-surface` too), radius-sm, 2px inset; segments equal width | the selected segment is a `bg-elevated` pill with `border-default` |
 | **Tabs** (in a panel) | labels `text-secondary` 16 apart, a 2px `accent-mark` bar under the selected one, a 1px `border-default` line under the row | label `text-primary` |
 | **List row** | 32 (dense 24), padding 12, glyph `icon-md` | `selection-bg` when the list has focus, `selection-idle` when not |
-| **Menu** | floating surface, 4px inset; items 28 high, padding 12, shortcut right in `text-tertiary`; separator a `Divider` with 4px above and below; submenu `caret-right` | the hovered or arrowed item takes `selection-bg` |
+| **Menu** | floating surface, 4px inset; items 28 high, padding 12, shortcut right in `text-tertiary`; separator a `Divider` with 4px above and below; submenu `caret-right`; check and radio items put a 1.5px check or a 6px dot in a 16 gutter before every label; a slider item is its label then a slider filling the row (Left and Right move it a twentieth, Enter picks nothing) | the hovered or arrowed item takes `selection-bg` |
 | **Tooltip** | `bg-inverse`, text `text-inverse` `sm`, radius-xs, padding 4×8, 8 from the target; shows after 500 ms of hover, at once while another is showing, never on touch | — |
 | **Popover** | floating surface, padding 16, radius-md | — |
 | **Group box** | `bg-elevated`, 1px `border-default`, radius-md, padding 16; title `sm` semibold `text-secondary`; contents 12 apart | — |

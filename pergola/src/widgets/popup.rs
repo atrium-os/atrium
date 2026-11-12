@@ -31,6 +31,8 @@ use crate::Color;
 pub const MENU_INSET: f32 = 4.0;
 /// Gap between a dropdown and the menu it opens.
 pub const MENU_GAP: f32 = 4.0;
+/// The gutter before labels when a menu has check or radio marks.
+pub const MARK_GUTTER: f32 = 16.0;
 /// The accent edge of a menu hanging from a lit (attached) menu button.
 pub const ATTACHED_EDGE: f32 = 2.0;
 /// A press-catcher bigger than any window: frescod clips it.
@@ -53,18 +55,47 @@ fn surface(ctx: &mut Ctx, r: Rect, rad: f32) -> NodeId {
 
 // ── Menu ────────────────────────────────────────────────────────────────
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// A mark before an item's label.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Mark {
+    #[default]
+    None,
+    /// A check box item: a check when on.
+    Check(bool),
+    /// One of a group: a dot on the chosen one.
+    Radio(bool),
+}
+
+#[derive(Debug, Clone, PartialEq)]
 pub struct MenuItem {
     pub label: String,
     pub shortcut: Option<String>,
     pub enabled: bool,
     /// A separator above this item.
     pub separated: bool,
+    pub mark: Mark,
+    /// A slider row at this value (0 to 1): the label, then a slider.
+    /// It reports through [`Menu::on_slide`] and does not close the menu.
+    pub slider: Option<f64>,
 }
 
 impl MenuItem {
     pub fn new(label: impl Into<String>) -> Self {
-        Self { label: label.into(), shortcut: None, enabled: true, separated: false }
+        Self { label: label.into(), shortcut: None, enabled: true, separated: false, mark: Mark::None, slider: None }
+    }
+    /// A slider row (a status item's volume, a brightness).
+    pub fn slider(label: impl Into<String>, value: f64) -> Self {
+        Self { slider: Some(value.clamp(0.0, 1.0)), ..Self::new(label) }
+    }
+    /// A check box item.
+    pub fn checked(mut self, on: bool) -> Self {
+        self.mark = Mark::Check(on);
+        self
+    }
+    /// One of a radio group.
+    pub fn radio(mut self, on: bool) -> Self {
+        self.mark = Mark::Radio(on);
+        self
     }
     pub fn shortcut(mut self, s: impl Into<String>) -> Self {
         self.shortcut = Some(s.into());
@@ -107,11 +138,12 @@ pub struct Menu {
     /// Hangs from a lit menu button: an accent edge (see [`trigger`]).
     pub attached: bool,
     on_pick: Rc<dyn Fn(usize)>,
+    on_slide: Option<Rc<dyn Fn(usize, f64)>>,
 }
 
 impl Menu {
     pub fn new(state: Mutable<MenuState>, items: Vec<MenuItem>, on_pick: impl Fn(usize) + 'static) -> Self {
-        Self { state, items, x: 0.0, y: 0.0, width: 220.0, anchor: None, attached: false, on_pick: Rc::new(on_pick) }
+        Self { state, items, x: 0.0, y: 0.0, width: 220.0, anchor: None, attached: false, on_pick: Rc::new(on_pick), on_slide: None }
     }
     pub fn at(mut self, x: f32, y: f32) -> Self {
         self.x = x;
@@ -120,6 +152,11 @@ impl Menu {
     }
     pub fn width(mut self, w: f32) -> Self {
         self.width = w;
+        self
+    }
+    /// A slider item moved: its index and value (0 to 1).
+    pub fn on_slide(mut self, f: impl Fn(usize, f64) + 'static) -> Self {
+        self.on_slide = Some(Rc::new(f));
         self
     }
     /// Open as a pop-up window hanging from `rect` when the app's window
@@ -186,6 +223,8 @@ impl Menu {
             surface(ctx, r, radius::MD)
         };
         ctx.autofocus(body);
+        // Marks get a gutter; then every label starts after it.
+        let gutter = if self.items.iter().any(|i| i.mark != Mark::None) { MARK_GUTTER } else { 0.0 };
         let mut y = r.y() + MENU_INSET;
         for (i, item) in self.items.iter().enumerate() {
             if item.separated {
@@ -203,11 +242,41 @@ impl Menu {
             }
             let color = if item.enabled { t.text_primary() } else { t.text_disabled() };
             let ls = Node::measure_text(&item.label, &text(color, type_size::MD, font::SANS, Weight::Regular));
+            let lx = row.x() + space::SM + gutter;
             ctx.tree.insert(Some(hit), Node::Text {
-                rect: Rect::new(row.x() + space::SM, row.y() + (row.h() - ls.h) / 2.0, ls.w, ls.h),
+                rect: Rect::new(lx, row.y() + (row.h() - ls.h) / 2.0, ls.w, ls.h),
                 content: item.label.clone(),
                 style: text(color, type_size::MD, font::SANS, Weight::Regular),
             });
+            let (mx, my) = (row.x() + space::SM + 6.0, row.y() + row.h() / 2.0);
+            match item.mark {
+                Mark::Check(true) => {
+                    ctx.tree.insert(Some(hit), Node::Path { p0: (mx - 4.0, my), p1: (mx - 1.0, my + 3.0), width: 1.5, color });
+                    ctx.tree.insert(Some(hit), Node::Path { p0: (mx - 1.0, my + 3.0), p1: (mx + 5.0, my - 4.0), width: 1.5, color });
+                }
+                Mark::Radio(true) => {
+                    ctx.tree.insert(Some(hit), Node::Rect { rect: Rect::new(mx - 3.0, my - 3.0, 6.0, 6.0), fill: color, radius: 3.0 });
+                }
+                _ => {}
+            }
+            if let Some(v) = item.slider {
+                // The rest of the row, after the label.
+                let sx = lx + ls.w + space::SM;
+                let sw = (row.x() + row.w() - space::SM - sx).max(40.0);
+                let val = Mutable::new(v);
+                let mut sl = crate::widgets::Slider::new(val, 0.0, 1.0).width(sw);
+                let sh = sl.rect.h();
+                sl = sl.at(sx, row.y() + (row.h() - sh) / 2.0);
+                if let Some(f) = self.on_slide.clone() {
+                    sl = sl.on_change(move |v| f(i, v));
+                }
+                if !item.enabled {
+                    sl = sl.enabled(false);
+                }
+                sl.render(ctx);
+                y += size::MENU_ITEM;
+                continue;
+            }
             if let Some(k) = &item.shortcut {
                 let kc = if item.enabled { t.text_tertiary() } else { t.text_disabled() };
                 let ks = Node::measure_text(k, &text(kc, type_size::SM, font::MONO, Weight::Regular));
@@ -228,7 +297,7 @@ impl Menu {
         }
         // Presses on the body between items close nothing.
         ctx.on_click(body, || {});
-        let (s, pick, items) = (self.state.clone(), self.on_pick.clone(), self.items.clone());
+        let (s, pick, items, slide) = (self.state.clone(), self.on_pick.clone(), self.items.clone(), self.on_slide.clone());
         ctx.on_key(body, move |ev| {
             let Event::Key { kind, key, chars, .. } = ev else { return };
             if !kind.pressed() {
@@ -239,19 +308,27 @@ impl Menu {
                 return;
             }
             let mut st = s.get();
+            // Left and Right move a highlighted slider a twentieth.
+            if let (Key::Left | Key::Right, Some(i)) = (key, st.highlight) {
+                if let (Some(v), Some(f)) = (items[i].slider.filter(|_| items[i].enabled), &slide) {
+                    let d = if *key == Key::Left { -0.05 } else { 0.05 };
+                    f(i, (v + d).clamp(0.0, 1.0));
+                }
+                return;
+            }
             match key {
                 Key::Down => st.highlight = Menu::step(&items, st.highlight, 1),
                 Key::Up => st.highlight = Menu::step(&items, st.highlight, -1),
                 Key::Escape => st = MenuState::default(),
                 Key::Enter => {
-                    if let Some(i) = st.highlight.filter(|&i| items[i].enabled) {
+                    if let Some(i) = st.highlight.filter(|&i| items[i].enabled && items[i].slider.is_none()) {
                         s.set(MenuState::default());
                         pick(i);
                     }
                     return;
                 }
                 Key::Char if chars == " " => {
-                    if let Some(i) = st.highlight.filter(|&i| items[i].enabled) {
+                    if let Some(i) = st.highlight.filter(|&i| items[i].enabled && items[i].slider.is_none()) {
                         s.set(MenuState::default());
                         pick(i);
                     }
@@ -490,6 +567,7 @@ pub struct MenuButton {
     /// accessible name).
     pub icon: Option<TriggerIcon>,
     on_pick: Rc<dyn Fn(usize)>,
+    on_slide: Option<Rc<dyn Fn(usize, f64)>>,
 }
 
 impl MenuButton {
@@ -502,6 +580,7 @@ impl MenuButton {
             attached: false,
             icon: None,
             on_pick: Rc::new(on_pick),
+            on_slide: None,
         }
     }
     pub fn at(mut self, x: f32, y: f32) -> Self {
@@ -522,6 +601,11 @@ impl MenuButton {
         self.attached = true;
         self
     }
+    /// A slider item moved ([`MenuItem::slider`]).
+    pub fn on_slide(mut self, f: impl Fn(usize, f64) + 'static) -> Self {
+        self.on_slide = Some(Rc::new(f));
+        self
+    }
     /// Show a Phosphor glyph (`size` px, `color` or `text-secondary`)
     /// instead of the label: a square ghost button `size` + 12 wide, as
     /// tall as its rect. In a row it takes its natural size.
@@ -539,7 +623,8 @@ impl View for MenuButton {
         trigger_with(ctx, r, &self.label, self.icon, &self.menu, None, self.attached);
         if self.menu.get().open {
             let pick = self.on_pick.clone();
-            let m = Menu::new(self.menu.clone(), self.items.clone(), move |i| pick(i));
+            let mut m = Menu::new(self.menu.clone(), self.items.clone(), move |i| pick(i));
+            m.on_slide = self.on_slide.clone();
             // An icon button is small and sits at the end of a row (the
             // bar's right side): its menu lines up with its right edge.
             let align = if self.icon.is_some() { crate::popup::Align::End } else { crate::popup::Align::Start };
@@ -966,6 +1051,60 @@ mod tests {
         app.handle_event(Event::Key { kind: KeyEventKind::Down, key: Key::Escape, modifiers: Default::default(), chars: String::new() });
         app.tick();
         assert!(!open.get().open);
+    }
+
+    struct Status {
+        menu: Mutable<MenuState>,
+        level: Mutable<f64>,
+        log: Rc<std::cell::RefCell<Vec<String>>>,
+    }
+    impl View for Status {
+        fn render(&self, ctx: &mut Ctx) {
+            let items = vec![
+                MenuItem::slider("Level", self.level.get()),
+                MenuItem::new("Mute").checked(true),
+                MenuItem::new("Speakers").radio(true).separated(),
+                MenuItem::new("Headphones").radio(false),
+            ];
+            let (log, level) = (self.log.clone(), self.level.clone());
+            let l2 = self.log.clone();
+            MenuButton::new("Sound", self.menu.clone(), items, move |i| l2.borrow_mut().push(format!("pick {i}")))
+                .on_slide(move |i, v| {
+                    log.borrow_mut().push(format!("slide {i} {v:.2}"));
+                    level.set(v);
+                })
+                .render(ctx);
+        }
+    }
+
+    #[test]
+    fn menu_items_can_be_checks_radios_and_sliders() {
+        let d = Arc::new(AtomicBool::new(true));
+        let menu = Mutable::with_dirty(MenuState::default(), d.clone());
+        let level = Mutable::with_dirty(0.5f64, d.clone());
+        let log = Rc::new(std::cell::RefCell::new(Vec::new()));
+        let mut app = App::new_with_flag(Status { menu: menu.clone(), level: level.clone(), log: log.clone() }, d);
+        app.tick();
+        click(&mut app, 20.0, 10.0);
+        assert!(menu.get().open);
+        let tree = app.tree();
+        // Labels after the mark gutter; a dot on the chosen radio.
+        let dots = tree.iter().filter(|(_, n)| matches!(n, Node::Rect { rect, radius, .. } if *radius == 3.0 && rect.w() == 6.0)).count();
+        assert_eq!(dots, 1);
+        // Arrow onto the slider: Right moves it, Enter does not close.
+        key(&mut app, Key::Down);
+        key(&mut app, Key::Right);
+        key(&mut app, Key::Enter);
+        assert!(menu.get().open, "Enter on a slider picks nothing");
+        assert_eq!(*log.borrow(), ["slide 0 0.55"]);
+        assert_eq!(level.get(), 0.55);
+        // A radio item picks and closes.
+        key(&mut app, Key::Down);
+        key(&mut app, Key::Down);
+        key(&mut app, Key::Down);
+        key(&mut app, Key::Enter);
+        assert!(!menu.get().open);
+        assert_eq!(log.borrow().last().unwrap(), "pick 3");
     }
 
     #[test]
