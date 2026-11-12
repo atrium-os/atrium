@@ -255,3 +255,20 @@ reads non-zero, all-zero GC registers mean "off", not "idle".
   - **Open:** the first telemetry sample after the features are enabled read mem 3 °C and
     VR 6 °C, probably before the sensors settle.
   - **Next:** P2 step 2, the gfx init that lets GC idle while attached (CG/PG, CP).
+- **2026-11-12 18:28, power P2 step 2 box test (efa15aa7): clock gating fixes the hot idle.**
+  Stage 3 from cold, then gfx_v12_0's idle setup one step at a time:
+  - **RLC up, no gfx init:** 246 W, gfx 3095 MHz, 100 % busy.
+  - **SRM enabled:** 281–282 W, so SRM alone changes nothing.
+  - **Clock gating on** (MGCG_OVERRIDE 0x7ff → 0x40, CGCG_CGLS 0x363f, CP idle interrupts on):
+    283 W, then 1 s later **9 W, gfx 43 MHz, 3 % busy**, hotspot 73 → 37 °C.
+  - **AllowGfxOff:** 7 W, gfx 0 MHz, 0 % busy. The gfx registers read 0 afterwards, so gfx
+    was off.
+
+  The mode 1 reset then returned the card to post-POST, and the PCH stayed at 29–30 °C for
+  5 minutes. Clock gating plus GfxOff is now the default once GC is up (`gfx_cg=0` skips it).
+
+  **Open:**
+  - The first sample after the features are enabled reads mem 1 °C; the sensor isn't valid
+    yet.
+  - Throttler id 1 (hotspot) shows a small non-zero percentage at idle.
+  - MetricsCounter jumps around (#1, #951, #905), so it is not a sequence number.

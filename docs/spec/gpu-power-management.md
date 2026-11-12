@@ -239,7 +239,9 @@ Throttler classes:
   skips it, `hw.atrium_gpu.mode1_reset=1` runs it alone. It also means a bring-up run no longer
   needs a power cycle before the next one. Box test 1: reset alone on a cold card. Box test 2:
   stage 3 with `gc_up_ok=1`, then the reset; GC off afterwards, and the board stays at its
-  idle temperature for 5 minutes. Then, for staying attached:
+  idle temperature for 5 minutes. Step 2 (box-verified 2026-11-12, efa15aa7): once GC is
+  up, gfx_v12_0's SRM + clock gating, then AllowGfxOff (`gfx12_pm.c`): ~280 W to 9 W, then 7 W
+  at gfx 0 MHz. Then, for staying attached:
   - gfx init enough for GC to idle (clock and power gating, as gfx_v12_0);
   - GfxOff allowed after bring-up, with the scoped guard;
   - detach / unload / reset sequence (A3.6) with PrepareMp1ForUnload;

@@ -501,10 +501,16 @@ amd_smu_init(struct atrium_amd_softc *sc)
 	smu_sample(&link, vram, ifver, 1, "RLC up, no gfx init");
 
 	/*
-	 * Power P2 step 2 experiment (kenv hw.atrium_gpu.gfx_cg=1): the GC
+	 * Power P2 step 2: the GC
 	 * idle setup amdgpu does after RLC boot, a step at a time with
 	 * telemetry after each: SRM, clock gating, then GfxOff allowed.
 	 */
+	/*
+	 * Box-verified 2026-11-12: clock gating takes GC from ~280 W to 9 W,
+	 * GfxOff to 7 W. Always done once GC is up; hw.atrium_gpu.gfx_cg=0
+	 * skips it (diagnosis only).
+	 */
+	gfx_cg = 1;
 	TUNABLE_INT_FETCH("hw.atrium_gpu.gfx_cg", &gfx_cg);
 	if (gfx_cg && !link.failed) {
 		amd_gfx12_pm_report(sc, "before");
