@@ -512,3 +512,13 @@ through fd passing, close and jail death.
   GB_ADDR_CONFIG, which reads 0 once GfxOff has powered GC down. Reset left the card cold.
   Fix: that check removed (only a failed SMU link fails the start); every attach failure
   now names its step. Log /root/runs/20261112T213813Z.log.
+- **2026-11-12 21:44, 24879d6c: stage 5a PASSED: the driver stayed attached on silicon.**
+  attach rc 0; MES started on attempt 1 (MSCRATCH zeroed and programmed; the "before
+  start" dump reads 0 because it precedes mes_enable); write_42 PASS at attach; the first
+  idle sample after MES was 52 W / 83 % busy, the second 13 W / 0 %, so the gate waited.
+  Attached 60 s: every 5 s sample 13 W, gfx 0 MHz, mem 193 MHz, busy 0 %, hotspot 35 to
+  32 °C. Detach: write_42 PASS again after 55 s attached (MES survived GfxOff), queues
+  removed, MES and CP halted, idle proven (13 W), mode 1 reset left it cold; give-back and
+  kldunload rc 0, no hub faults, stray 0. Open: ~6 W more than unattached (7 W) because
+  memory clock stays at 193 MHz while MES is resident (look at later). Log
+  /root/runs/20261112T214441Z.log. Next: 5b.
