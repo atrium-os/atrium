@@ -513,126 +513,185 @@ amd_gmc12_gart_disable(struct amd_gart *gt)
 }
 
 /*
- * Stage 5b: per-client page tables. One VM is a four-level table in the
- * VRAM pool (PDB2 root, PDB1, PDB0, PTB; 512 entries each), written
- * through BAR0 like the GART table. PDEs point at VRAM by physical FB
- * address and are just VALID (amdgpu_gmc_get_pde_for_bo for a VRAM BO);
- * only with translate_further (GC 12.1, not 12.0) do entries in a PDB1
- * also carry block fragment size 9 (gmc_v12_0_get_vm_pde). Silicon run
- * 20261112T215929Z set BFS 9 on GC 12.0.1 and the walker refused the
- * table (WALKER_ERROR 5). A new PTB is filled with the invalid-PTE pattern
- * (EXECUTABLE | IS_PTE, amdgpu_vm_pte_update_flags), and so is an unmapped
- * page. A mapped system page is VALID | SYSTEM | SNOOPED plus R/W/X and
- * MTYPE NC (gmc_v12_0_get_vm_pte, AMDGPU_VM_MTYPE_DEFAULT).
+ * Stage 5b: per-client page tables, in the gfx12 format of gmc_v12_0.c and
+ * amdgpu_vm_pt.c.
  *
- * The pool is a bump allocator: a 5b test VM, not yet the allocator a
- * client VM will use (that comes with 5c, on vram-allocator).
+ * The amdgpu layout (AMD_VM12_4L_VRAM) is a four-level table (PDB2 root,
+ * PDB1, PDB0, PTB; 512 entries each) in a VRAM pool, written through BAR0
+ * like the GART table. PDEs point at VRAM by physical FB address and are
+ * just VALID (amdgpu_gmc_get_pde_for_bo for a VRAM BO); only with
+ * translate_further (GC 12.1, not 12.0) do PDB1 entries also carry block
+ * fragment size 9. A new PTB is filled with the invalid-PTE pattern
+ * (EXECUTABLE | IS_PTE, amdgpu_vm_pte_update_flags), and so is an
+ * unmapped page. A mapped system page is VALID | SYSTEM | SNOOPED plus
+ * R/W/X and MTYPE NC (gmc_v12_0_get_vm_pte, AMDGPU_VM_MTYPE_DEFAULT).
+ *
+ * Silicon runs 20261112T215929Z and T220611Z: with that layout the CP's
+ * IB fetch through VMID 1 faulted (WALKER_ERROR 5, MAPPING_ERROR), with
+ * and without BFS. To find which part the walker refuses, the 5b test
+ * also builds three diagnostic variants:
+ *  AMD_VM12_FLAT     depth 0, one PTB over a 2 MiB window, GART-style PTEs
+ *                    (the VMID 0 path, known good, on VMID 1);
+ *  AMD_VM12_4L_SYS   the four-level table with every table in system
+ *                    memory (PDEs VALID | SYSTEM | SNOOPED);
+ *  AMD_VM12_4L_LEAF  the four-level VRAM table with IS_PTE on leaf PTEs.
+ *
+ * Tables are a bump allocator (a 5b test VM, not yet the allocator a
+ * client VM will use; that comes with 5c, on vram-allocator).
  */
-static uint64_t
-pool_rd(struct amd_vm12 *vm, bus_size_t off)
+static bool
+vm_sys(const struct amd_vm12 *vm)
 {
+	return (vm->mode == AMD_VM12_4L_SYS);
+}
+
+static uint64_t
+tbl_rd(struct amd_vm12 *vm, u_int t, u_int i)
+{
+	bus_size_t off;
+
+	if (vm_sys(vm))
+		return (((volatile uint64_t *)vm->sys[t])[i]);
+	off = VM_POOL_VRAM_OFF + (bus_size_t)t * PAGE_SIZE + i * 8;
 	return ((uint64_t)bus_read_4(vm->gt->vram, off) |
 	    (uint64_t)bus_read_4(vm->gt->vram, off + 4) << 32);
 }
 
 static void
-pool_wr(struct amd_vm12 *vm, bus_size_t off, uint64_t v)
+tbl_wr(struct amd_vm12 *vm, u_int t, u_int i, uint64_t v)
 {
+	bus_size_t off;
+
+	if (vm_sys(vm)) {
+		((volatile uint64_t *)vm->sys[t])[i] = v;
+		return;
+	}
+	off = VM_POOL_VRAM_OFF + (bus_size_t)t * PAGE_SIZE + i * 8;
 	bus_write_4(vm->gt->vram, off, (uint32_t)v);
 	bus_write_4(vm->gt->vram, off + 4, (uint32_t)(v >> 32));
 }
 
-/* FB physical address of a pool offset, as a PDE or the context base wants. */
+/* What a PDE (or the context base) pointing at table `t` holds. */
 static uint64_t
-pool_phys(struct amd_vm12 *vm, bus_size_t off)
+tbl_pde(struct amd_vm12 *vm, u_int t)
 {
-	return ((uint64_t)off + vm->gt->vram_base_offset);
+	if (vm_sys(vm))
+		return ((uint64_t)vm->sys_pa[t] | PTE_VALID | PTE_SYSTEM |
+		    PTE_SNOOPED);
+	return (((uint64_t)VM_POOL_VRAM_OFF + (uint64_t)t * PAGE_SIZE +
+	    vm->gt->vram_base_offset) | PTE_VALID);
 }
 
+/* The table a PDE points at, by looking it up among ours. */
 static bool
-pool_off_of(struct amd_vm12 *vm, uint64_t pde, bus_size_t *off)
+tbl_of(struct amd_vm12 *vm, uint64_t pde, u_int *t)
 {
-	uint64_t a = pde & PDE_ADDR_MASK;
+	u_int i;
 
-	if (a < vm->gt->vram_base_offset + VM_POOL_VRAM_OFF ||
-	    a >= vm->gt->vram_base_offset + VM_POOL_VRAM_OFF +
-	    (uint64_t)VM_POOL_PAGES * PAGE_SIZE)
-		return (false);
-	*off = (bus_size_t)(a - vm->gt->vram_base_offset);
-	return (true);
+	for (i = 0; i < vm->used; i++)
+		if ((tbl_pde(vm, i) & PDE_ADDR_MASK) == (pde & PDE_ADDR_MASK)) {
+			*t = i;
+			return (true);
+		}
+	return (false);
 }
 
 static int
-pool_alloc(struct amd_vm12 *vm, bool ptb, bus_size_t *off)
+tbl_alloc(struct amd_vm12 *vm, bool ptb, u_int *t)
 {
-	uint64_t fill = PTE_EXECUTABLE | PTE_IS_PTE;
 	u_int i;
 
 	if (vm->used >= VM_POOL_PAGES)
 		return (ENOMEM);
-	*off = VM_POOL_VRAM_OFF + (bus_size_t)vm->used++ * PAGE_SIZE;
-	if (!ptb) {
-		bus_set_region_4(vm->gt->vram, *off, 0, PAGE_SIZE / 4);
-		return (0);
+	*t = vm->used;
+	if (vm_sys(vm)) {
+		vm->sys[*t] = contigmalloc(PAGE_SIZE, M_DEVBUF, M_WAITOK |
+		    M_ZERO, 0, ~(vm_paddr_t)0, PAGE_SIZE, 0);
+		vm->sys_pa[*t] = vtophys(vm->sys[*t]);
 	}
+	vm->used++;
 	for (i = 0; i < PAGE_SIZE / 8; i++)
-		pool_wr(vm, *off + i * 8, fill);
+		tbl_wr(vm, *t, i, ptb ? PTE_EXECUTABLE | PTE_IS_PTE : 0);
 	return (0);
 }
 
 int
-amd_gmc12_vm_init(struct amd_gart *gt, struct amd_vm12 *vm)
+amd_gmc12_vm_init(struct amd_gart *gt, struct amd_vm12 *vm, int mode,
+    uint64_t flat_va)
 {
 	const struct hub_gen *g = hub_find(gt->sc, true);
+	u_int root;
 
 	memset(vm, 0, sizeof(*vm));
 	vm->gt = gt;
+	vm->mode = mode;
+	vm->flat_va = flat_va;
 	if (g == NULL)
 		return (ENOTSUP);
 	vm->translate_further = g->translate_further;
 	if (!gt->enabled || rman_get_size(gt->vram) < VM_POOL_VRAM_OFF +
 	    (bus_size_t)VM_POOL_PAGES * PAGE_SIZE)
 		return (ENXIO);
-	return (pool_alloc(vm, false, &vm->root_off));
+	if (mode == AMD_VM12_FLAT && (flat_va & ((2ull << 20) - 1)) != 0)
+		return (EINVAL);
+	return (tbl_alloc(vm, mode == AMD_VM12_FLAT, &root));	/* table 0 */
 }
 
-/* Context base for this VM: the root's FB physical address, valid. */
+void
+amd_gmc12_vm_fini(struct amd_vm12 *vm)
+{
+	u_int i;
+
+	if (vm_sys(vm))
+		for (i = 0; i < vm->used; i++)
+			contigfree(vm->sys[i], PAGE_SIZE, M_DEVBUF);
+	vm->used = 0;
+}
+
+/* Context base for this VM: table 0's address and flags. */
 uint64_t
 amd_gmc12_vm_pd_addr(struct amd_vm12 *vm)
 {
-	return (pool_phys(vm, vm->root_off) | PTE_VALID);
+	return (tbl_pde(vm, 0));
 }
 
 /* Walk to the PTE slot of `va`, allocating tables when `alloc`. */
 static int
-vm_walk(struct amd_vm12 *vm, uint64_t va, bool alloc, bus_size_t *pte_off)
+vm_walk(struct amd_vm12 *vm, uint64_t va, bool alloc, u_int *pt, u_int *pi)
 {
-	bus_size_t off = vm->root_off, child;
 	uint64_t pde;
-	u_int lvl, shift, idx;
+	u_int lvl, shift, idx, t = 0, child;
 	int err;
 
 	if ((va & PAGE_MASK) != 0 || va >= (1ull << VM_VA_BITS))
 		return (EINVAL);
+	if (vm->mode == AMD_VM12_FLAT) {
+		if (va < vm->flat_va || va - vm->flat_va >= (2ull << 20))
+			return (EINVAL);
+		*pt = 0;
+		*pi = (u_int)((va - vm->flat_va) >> PAGE_SHIFT);
+		return (0);
+	}
 	for (lvl = 0; lvl < VM_LEVELS - 1; lvl++) {
 		shift = PAGE_SHIFT + 9 * (VM_LEVELS - 1 - lvl);
 		idx = (va >> shift) & 511;
-		pde = pool_rd(vm, off + idx * 8);
+		pde = tbl_rd(vm, t, idx);
 		if ((pde & PTE_VALID) == 0) {
 			if (!alloc)
 				return (ENOENT);
-			err = pool_alloc(vm, lvl == VM_LEVELS - 2, &child);
+			err = tbl_alloc(vm, lvl == VM_LEVELS - 2, &child);
 			if (err != 0)
 				return (err);
-			pde = pool_phys(vm, child) | PTE_VALID;
+			pde = tbl_pde(vm, child);
 			if (lvl == 1 && vm->translate_further)
 				pde |= PDE_BFS(9);	/* an entry in a PDB1 */
-			pool_wr(vm, off + idx * 8, pde);
+			tbl_wr(vm, t, idx, pde);
 		}
-		if (!pool_off_of(vm, pde, &off))
+		if (!tbl_of(vm, pde, &t))
 			return (EFAULT);
 	}
-	*pte_off = off + ((va >> PAGE_SHIFT) & 511) * 8;
+	*pt = t;
+	*pi = (va >> PAGE_SHIFT) & 511;
 	return (0);
 }
 
@@ -641,13 +700,13 @@ int
 amd_gmc12_vm_map(struct amd_vm12 *vm, uint64_t va, vm_paddr_t pa,
     u_int prot)
 {
-	bus_size_t pte_off;
 	uint64_t pte;
+	u_int t, i;
 	int err;
 
 	if ((pa & PAGE_MASK) != 0 || (pa & ~PTE_ADDR_MASK) != 0)
 		return (EINVAL);
-	if ((err = vm_walk(vm, va, true, &pte_off)) != 0)
+	if ((err = vm_walk(vm, va, true, &t, &i)) != 0)
 		return (err);
 	pte = (uint64_t)pa | PTE_VALID | PTE_SYSTEM | PTE_SNOOPED;
 	if (prot & AMD_VM_READ)
@@ -656,7 +715,11 @@ amd_gmc12_vm_map(struct amd_vm12 *vm, uint64_t va, vm_paddr_t pa,
 		pte |= PTE_WRITEABLE;
 	if (prot & AMD_VM_EXEC)
 		pte |= PTE_EXECUTABLE;
-	pool_wr(vm, pte_off, pte);		/* MTYPE NC (0) */
+	if (vm->mode == AMD_VM12_FLAT)		/* as amd_gmc12_gart_map */
+		pte |= PTE_MTYPE_UC | PTE_IS_PTE;
+	else if (vm->mode == AMD_VM12_4L_LEAF)
+		pte |= PTE_IS_PTE;
+	tbl_wr(vm, t, i, pte);			/* 4L: MTYPE NC (0) */
 	return (0);
 }
 
@@ -664,13 +727,43 @@ amd_gmc12_vm_map(struct amd_vm12 *vm, uint64_t va, vm_paddr_t pa,
 int
 amd_gmc12_vm_unmap(struct amd_vm12 *vm, uint64_t va)
 {
-	bus_size_t pte_off;
+	u_int t, i;
 	int err;
 
-	if ((err = vm_walk(vm, va, false, &pte_off)) != 0)
+	if ((err = vm_walk(vm, va, false, &t, &i)) != 0)
 		return (err);
-	pool_wr(vm, pte_off, PTE_EXECUTABLE | PTE_IS_PTE);
+	tbl_wr(vm, t, i, vm->mode == AMD_VM12_FLAT ? 0 :
+	    PTE_EXECUTABLE | PTE_IS_PTE);
 	return (0);
+}
+
+/* Log the walk for `va`: each level's raw entry, read back. */
+void
+amd_gmc12_vm_dump(struct amd_vm12 *vm, uint64_t va)
+{
+	uint64_t e;
+	u_int lvl, shift, idx, t = 0;
+	static const char *names[] = { "PDB2", "PDB1", "PDB0", "PTB" };
+
+	if (vm->mode == AMD_VM12_FLAT) {
+		idx = (u_int)((va - vm->flat_va) >> PAGE_SHIFT) & 511;
+		device_printf(vm->gt->sc->dev, "vm: walk %#jx: flat PTB[%u] = "
+		    "%#018jx\n", (uintmax_t)va, idx,
+		    (uintmax_t)tbl_rd(vm, 0, idx));
+		return;
+	}
+	for (lvl = 0; lvl < VM_LEVELS; lvl++) {
+		shift = PAGE_SHIFT + 9 * (VM_LEVELS - 1 - lvl);
+		idx = (va >> shift) & 511;
+		e = tbl_rd(vm, t, idx);
+		device_printf(vm->gt->sc->dev, "vm: walk %#jx: %s (table %u at "
+		    "%#jx)[%u] = %#018jx\n", (uintmax_t)va, names[lvl], t,
+		    (uintmax_t)(tbl_pde(vm, t) & PDE_ADDR_MASK), idx,
+		    (uintmax_t)e);
+		if (lvl == VM_LEVELS - 1 || (e & PTE_VALID) == 0 ||
+		    !tbl_of(vm, e, &t))
+			break;
+	}
 }
 
 /* HDP flush, then invalidate `vmid` on both hubs and wait for the acks. */
@@ -691,26 +784,65 @@ amd_gmc12_vm_flush(struct amd_gart *gt, u_int vmid)
 }
 
 /*
- * Point context `vmid` (1-7: the kernel's own; 8-15 belong to MES) at a
- * page-table base on both hubs and flush it. pd_addr 0 unbinds: the
- * context then faults every access.
+ * Point context `vmid` (1-7: the kernel's own; 8-15 belong to MES) at
+ * `vm` on both hubs (depth, range and base) and flush it. vm NULL unbinds:
+ * back to the setup_vmid_config state with base 0, so every access faults.
  */
 int
-amd_gmc12_vm_bind(struct amd_gart *gt, u_int vmid, uint64_t pd_addr)
+amd_gmc12_vm_bind(struct amd_gart *gt, u_int vmid, struct amd_vm12 *vm)
 {
 	struct hub h;
+	uint64_t base = 0, start = 0, end = VM_MAX_PFN - 1;
+	u_int depth = VM_DEPTH;
 	int i;
 
 	if (vmid == 0 || vmid >= 8)
 		return (EINVAL);
+	if (vm != NULL) {
+		base = amd_gmc12_vm_pd_addr(vm);
+		if (vm->mode == AMD_VM12_FLAT) {
+			depth = 0;
+			start = vm->flat_va >> PAGE_SHIFT;
+			end = start + 511;
+		}
+	}
 	for (i = 0; i < 2; i++) {
 		if (!hub_open(gt->sc, i == 1, &h))
 			return (ENOTSUP);
-		hw(&h, h.g->ctx0_pt_base_lo + 2 * vmid, (uint32_t)pd_addr);
-		hw(&h, h.g->ctx0_pt_base_hi + 2 * vmid,
-		    (uint32_t)(pd_addr >> 32));
+		hrmw(&h, h.g->ctx0_cntl + vmid, CTX_DEPTH, depth << 1);
+		hw(&h, h.g->ctx0_pt_start_lo + 2 * vmid, (uint32_t)start);
+		hw(&h, h.g->ctx0_pt_start_hi + 2 * vmid,
+		    (uint32_t)(start >> 32));
+		hw(&h, h.g->ctx0_pt_end_lo + 2 * vmid, (uint32_t)end);
+		hw(&h, h.g->ctx0_pt_end_hi + 2 * vmid, (uint32_t)(end >> 32));
+		hw(&h, h.g->ctx0_pt_base_lo + 2 * vmid, (uint32_t)base);
+		hw(&h, h.g->ctx0_pt_base_hi + 2 * vmid, (uint32_t)(base >> 32));
 	}
 	return (amd_gmc12_vm_flush(gt, vmid));
+}
+
+/* GFXHUB's context `vmid` registers and the L2 setup, read back. */
+void
+amd_gmc12_ctx_report(struct amd_gart *gt, u_int vmid, const char *when)
+{
+	struct hub h;
+	const struct hub_gen *g;
+
+	if (vmid >= NUM_CTX || !hub_open(gt->sc, true, &h))
+		return;
+	g = h.g;
+	device_printf(gt->sc->dev, "gmc: %s %s: CONTEXT%u_CNTL %#x, base "
+	    "%#x%08x, start %#x%08x, end %#x%08x; L2_CNTL %#x, L2_CNTL3 %#x, "
+	    "L2_CNTL4 %#x, L2_CNTL5 %#x, FAULT_CNTL %#x, FAULT_CNTL2 %#x\n",
+	    g->name, when, vmid, hr(&h, g->ctx0_cntl + vmid),
+	    hr(&h, g->ctx0_pt_base_hi + 2 * vmid),
+	    hr(&h, g->ctx0_pt_base_lo + 2 * vmid),
+	    hr(&h, g->ctx0_pt_start_hi + 2 * vmid),
+	    hr(&h, g->ctx0_pt_start_lo + 2 * vmid),
+	    hr(&h, g->ctx0_pt_end_hi + 2 * vmid),
+	    hr(&h, g->ctx0_pt_end_lo + 2 * vmid), hr(&h, g->l2_cntl),
+	    hr(&h, g->l2_cntl3), hr(&h, g->l2_cntl4), hr(&h, g->l2_cntl5),
+	    hr(&h, g->fault_cntl), hr(&h, g->fault_cntl2));
 }
 
 /*
@@ -731,6 +863,25 @@ amd_gmc12_fault_take(struct amd_gart *gt, uint32_t *status, uint64_t *addr)
 	hrmw(&h, h.g->fault_cntl, 0, FAULT_CNTL_CLEAR);
 	hrmw(&h, h.g->fault_cntl, FAULT_CNTL_CLEAR, 0);
 	return (*status != 0);
+}
+
+/* gfxhub_v12_0_print_l2_protection_fault_status, one line. */
+void
+amd_gmc12_fault_decode(struct amd_gart *gt, uint32_t st, const char *when)
+{
+	static const char *cids[] = { "CB", "DB", "GE1", "GE2", "CPF", "CPC",
+	    "CPG", "RLC", "TCP", "SQC (inst)", "SQC (data)", "SQG/PC/SC",
+	    "Reserved", "SDMA0", "SDMA1", "GCR", "Reserved", "Reserved",
+	    "WGS", "DSM", "PA" };
+	u_int cid = FAULT_STATUS_CID(st);
+
+	device_printf(gt->sc->dev, "gmc: %s: fault status %#x: client %s "
+	    "(%#x), VMID %u, MORE_FAULTS %u, WALKER_ERROR %#x, "
+	    "PERMISSION_FAULTS %#x, MAPPING_ERROR %u, RW %u, ATOMIC %u, "
+	    "PRT %u, UCE %u\n", when, st, cid < nitems(cids) ? cids[cid] :
+	    "unknown", cid, FAULT_STATUS_VMID(st), st & 1, (st >> 1) & 7,
+	    (st >> 4) & 0xf, (st >> 8) & 1, (st >> 18) & 1, (st >> 19) & 1,
+	    (st >> 30) & 1, st >> 31);
 }
 
 u_int

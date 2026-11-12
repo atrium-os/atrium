@@ -843,22 +843,37 @@ void	amd_gmc12_fault_report(struct amd_gart *gt, const char *when);
 /* Stage 5b: per-client page tables (gmc12.c). */
 struct amd_vm12 {
 	struct amd_gart *gt;
-	bus_size_t root_off;		/* PDB2, in BAR0 */
-	u_int	used;			/* pool pages handed out */
+	int	mode;			/* AMD_VM12_* */
+	uint64_t flat_va;		/* AMD_VM12_FLAT: window base */
+	u_int	used;			/* tables handed out; 0 is the root */
 	bool	translate_further;	/* GC's PDE format variant */
+	void	*sys[64];		/* AMD_VM12_4L_SYS tables */
+	vm_paddr_t sys_pa[64];
 };
+#define AMD_VM12_4L_VRAM	0	/* amdgpu's layout */
+#define AMD_VM12_FLAT		1	/* diagnostic: depth 0, 2 MiB */
+#define AMD_VM12_4L_SYS		2	/* diagnostic: tables in system RAM */
+#define AMD_VM12_4L_LEAF	3	/* diagnostic: IS_PTE on leaf PTEs */
 #define AMD_VM_READ	0x1u
 #define AMD_VM_WRITE	0x2u
 #define AMD_VM_EXEC	0x4u
-int	amd_gmc12_vm_init(struct amd_gart *gt, struct amd_vm12 *vm);
+int	amd_gmc12_vm_init(struct amd_gart *gt, struct amd_vm12 *vm, int mode,
+	    uint64_t flat_va);
+void	amd_gmc12_vm_fini(struct amd_vm12 *vm);
 uint64_t amd_gmc12_vm_pd_addr(struct amd_vm12 *vm);
 int	amd_gmc12_vm_map(struct amd_vm12 *vm, uint64_t va, vm_paddr_t pa,
 	    u_int prot);
 int	amd_gmc12_vm_unmap(struct amd_vm12 *vm, uint64_t va);
+void	amd_gmc12_vm_dump(struct amd_vm12 *vm, uint64_t va);
 int	amd_gmc12_vm_flush(struct amd_gart *gt, u_int vmid);
-int	amd_gmc12_vm_bind(struct amd_gart *gt, u_int vmid, uint64_t pd_addr);
+int	amd_gmc12_vm_bind(struct amd_gart *gt, u_int vmid,
+	    struct amd_vm12 *vm);
+void	amd_gmc12_ctx_report(struct amd_gart *gt, u_int vmid,
+	    const char *when);
 bool	amd_gmc12_fault_take(struct amd_gart *gt, uint32_t *status,
 	    uint64_t *addr);
+void	amd_gmc12_fault_decode(struct amd_gart *gt, uint32_t st,
+	    const char *when);
 u_int	amd_gmc12_fault_vmid(uint32_t status);
 int	amd_ih7_test(struct atrium_amd_softc *sc, struct amd_gart *gt,
 	    int (*during)(struct atrium_amd_softc *, struct amd_gart *));

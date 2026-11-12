@@ -544,3 +544,11 @@ through fd passing, close and jail death.
   in PDB1 entries, L2 bank select 9 / BigK fragment 6. The walker rejected the BFS 9
   PDE. Fix: translate_further is now a per-GC-version row field (false for 12.0), used
   for both the L2_CNTL3 values and the PDE format.
+- 2026-11-12 22:10, 5b run a937a7a2 FAILED the same way (log /root/runs/20261112T220611Z.log):
+  the same status 0x1009ba at the IB page, so translate_further was not the cause (the
+  change stays: it is what amdgpu does on GC 12.0). Next kmod is diagnostic. It reads back
+  the CONTEXT1 registers and L2_CNTL*, logs every level of the walk, decodes the fault by
+  gc_12 field names, and tries four layouts in one run, each with a fresh queue: the
+  amdgpu 4-level table in VRAM, a flat depth-0 table (the VMID 0 GART path, on VMID 1),
+  the 4-level table in system memory, and the 4-level table with IS_PTE on the leaves.
+  5b passes only on the amdgpu layout; the others show where the walker disagrees.

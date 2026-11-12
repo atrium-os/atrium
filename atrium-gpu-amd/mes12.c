@@ -1230,102 +1230,108 @@ vmt_fault_is(struct mes *m, const char *what, uint64_t va)
 	    a == (va & ~(uint64_t)PAGE_MASK));
 }
 
+/* Fresh ring and fence, MQD, ADD_QUEUE. */
 static int
-vm_test_run(struct mes *m)
+vmt_qopen(struct mes *m, struct disp *d)
+{
+	int err;
+
+	memset(d->blk, 0, DISP_CODE);		/* ring, MQD, EOP, WB */
+	kcq_mqd_init(d);
+	wmb();
+	if ((err = kcq_map(m, d)) != 0)
+		kcq_report(m, d, "vm ADD_QUEUE failed");
+	return (err);
+}
+
+/* REMOVE_QUEUE and HQD dequeue; true once the queue is known gone. */
+static bool
+vmt_qclose(struct mes *m, struct disp *d)
+{
+	if (kcq_unmap(m) != 0)
+		kcq_report(m, d, "vm REMOVE_QUEUE failed");
+	return (hqd_dequeue_me(m, 1, 0));
+}
+
+static const char *const vmt_names[] = {
+	[AMD_VM12_4L_VRAM] = "4-level, tables in VRAM (amdgpu layout)",
+	[AMD_VM12_FLAT] = "flat, depth 0, GART-style PTEs",
+	[AMD_VM12_4L_SYS] = "4-level, tables in system memory",
+	[AMD_VM12_4L_LEAF] = "4-level VRAM, IS_PTE on leaf PTEs",
+};
+
+/*
+ * One layout: build VMID 1's table, bind it, open the queue, run A and,
+ * if A passes, B and C. Returns 0 when all three pass. *gone is false
+ * when the queue could not be removed (the caller must then stop and
+ * leak everything the GPU can still reach).
+ */
+static int
+vmt_variant(struct mes *m, struct disp *d, uint8_t *pg, vm_paddr_t pg_pa,
+    int mode, uint32_t *seq, bool *gone)
 {
 	struct atrium_amd_softc *sc = m->sc;
-	const struct mes_gen *g = m->g;
 	struct amd_gart *gt = m->gt;
 	struct amd_vm12 vm;
-	struct disp d;
-	uint8_t *pg = NULL;
-	vm_paddr_t pg_pa = 0;
-	volatile uint32_t *out, *victim;
-	uint32_t st, dummy0;
-	uint64_t a, ib_vm, ib_vmx;
-	u_int i, n = 0, bad;
-	int err, fails = 0;
-	bool mapped = false, gone = true, bound = false;
+	volatile uint32_t *out = (volatile uint32_t *)(pg + 2 * PAGE_SIZE);
+	volatile uint32_t *victim = (volatile uint32_t *)(d->blk + VMT_VICTIM);
+	uint64_t ib_vm = W42_VM_CODE_VA + W42_IB_OFFSET;
+	uint64_t ib_vmx = ib_vm + VMT_IB_VMX_OFF, a;
+	const u_int rwx = AMD_VM_READ | AMD_VM_WRITE | AMD_VM_EXEC;
+	const char *nm = vmt_names[mode];
+	uint32_t st;
+	u_int i, n = 0, bad, fails = 0;
+	int err;
 
-	memset(&d, 0, sizeof(d));
-	d.va = gt->gart_start + VMT_GART_VA;
-	if (d.va + VMT_VICTIM != W42_VMX_DATA_VA ||
-	    d.va + VMT_SIZE > gt->gart_end + 1 || W42_IB_OFFSET != PAGE_SIZE) {
-		device_printf(sc->dev, "vm: write42_ib.h built for victim "
-		    "%#jx, block at %#jx; regenerate it\n",
-		    (uintmax_t)W42_VMX_DATA_VA, (uintmax_t)d.va);
-		return (EINVAL);
-	}
-
-	/* VMID 1's table: shader, IB page, out. Nothing else. */
-	if ((err = amd_gmc12_vm_init(gt, &vm)) != 0) {
-		device_printf(sc->dev, "vm: no page-table pool (%d)\n", err);
+	*gone = true;
+	device_printf(sc->dev, "vm: --- layout %d: %s ---\n", mode, nm);
+	if ((err = amd_gmc12_vm_init(gt, &vm, mode, W42_VM_CODE_VA)) != 0 ||
+	    (err = amd_gmc12_vm_map(&vm, W42_VM_CODE_VA, pg_pa, rwx)) != 0 ||
+	    (err = amd_gmc12_vm_map(&vm, W42_VM_CODE_VA + PAGE_SIZE,
+	    pg_pa + PAGE_SIZE, rwx)) != 0 ||
+	    (err = amd_gmc12_vm_map(&vm, W42_VM_DATA_VA, pg_pa + 2 * PAGE_SIZE,
+	    rwx)) != 0) {
+		device_printf(sc->dev, "vm: %s: table build failed (%d)\n", nm,
+		    err);
+		amd_gmc12_vm_fini(&vm);
 		return (err);
 	}
-	pg = contigmalloc(VMT_PAGES * PAGE_SIZE, M_DEVBUF, M_WAITOK | M_ZERO,
-	    0, ~(vm_paddr_t)0, PAGE_SIZE, 0);
-	pg_pa = vtophys(pg);
-	memcpy(pg, w42_shader, sizeof(w42_shader));
-	memcpy(pg + PAGE_SIZE, w42_ib_vm, sizeof(w42_ib_vm));
-	memcpy(pg + PAGE_SIZE + VMT_IB_VMX_OFF, w42_ib_vmx, sizeof(w42_ib_vmx));
-	out = (volatile uint32_t *)(pg + 2 * PAGE_SIZE);
-	for (i = 0; i < W42_OUT_DW; i++)
-		out[i] = DISP_POISON;
-	ib_vm = W42_VM_CODE_VA + W42_IB_OFFSET;
-	ib_vmx = ib_vm + VMT_IB_VMX_OFF;
-	if ((err = amd_gmc12_vm_map(&vm, W42_VM_CODE_VA, pg_pa,
-	    AMD_VM_READ | AMD_VM_WRITE | AMD_VM_EXEC)) != 0 ||
-	    (err = amd_gmc12_vm_map(&vm, W42_VM_CODE_VA + PAGE_SIZE,
-	    pg_pa + PAGE_SIZE, AMD_VM_READ | AMD_VM_WRITE | AMD_VM_EXEC)) != 0 ||
-	    (err = amd_gmc12_vm_map(&vm, W42_VM_DATA_VA, pg_pa + 2 * PAGE_SIZE,
-	    AMD_VM_READ | AMD_VM_WRITE | AMD_VM_EXEC)) != 0) {
-		device_printf(sc->dev, "vm: map failed (%d)\n", err);
-		goto out_free;
-	}
-	device_printf(sc->dev, "vm: VMID %u table root at FB %#jx, %u table "
-	    "pages; shader %#jx, IBs %#jx/%#jx, out %#jx (pa %#jx)\n",
-	    VMT_VMID, (uintmax_t)amd_gmc12_vm_pd_addr(&vm), vm.used,
-	    (uintmax_t)W42_VM_CODE_VA, (uintmax_t)ib_vm, (uintmax_t)ib_vmx,
-	    (uintmax_t)W42_VM_DATA_VA, (uintmax_t)pg_pa);
 	if (amd_gmc12_fault_take(gt, &st, &a))
-		device_printf(sc->dev, "vm: stale fault before the test: "
-		    "status %#x at %#jx (cleared)\n", st, (uintmax_t)a);
-	if ((err = amd_gmc12_vm_bind(gt, VMT_VMID,
-	    amd_gmc12_vm_pd_addr(&vm))) != 0) {
+		device_printf(sc->dev, "vm: stale fault %#x at %#jx "
+		    "(cleared)\n", st, (uintmax_t)a);
+	if ((err = amd_gmc12_vm_bind(gt, VMT_VMID, &vm)) != 0) {
 		device_printf(sc->dev, "vm: bind/flush VMID %u: %d\n",
 		    VMT_VMID, err);
-		goto out_free;
+		goto out;
 	}
-	bound = true;
-
-	/* The kernel queue's block in the GART, with the victim page. */
-	d.blk = contigmalloc(VMT_SIZE, M_DEVBUF, M_WAITOK | M_ZERO, 0,
-	    ~(vm_paddr_t)0, PAGE_SIZE, 0);
-	d.pa = vtophys(d.blk);
-	for (i = 0; i < VMT_SIZE / PAGE_SIZE; i++)
-		(void)amd_gmc12_gart_map(gt, d.va + i * PAGE_SIZE,
-		    d.pa + i * PAGE_SIZE);
-	victim = (volatile uint32_t *)(d.blk + VMT_VICTIM);
-	for (i = 0; i < W42_OUT_DW; i++)
+	device_printf(sc->dev, "vm: VMID %u base %#jx, %u table page(s)\n",
+	    VMT_VMID, (uintmax_t)amd_gmc12_vm_pd_addr(&vm), vm.used);
+	amd_gmc12_ctx_report(gt, VMT_VMID, "bound");
+	amd_gmc12_vm_dump(&vm, ib_vm);
+	amd_gmc12_vm_dump(&vm, W42_VM_DATA_VA);
+	for (i = 0; i < W42_OUT_DW; i++) {
+		out[i] = DISP_POISON;
 		victim[i] = DISP_POISON;
-	if ((err = amd_gmc12_flush(gt)) != 0)
-		goto out_unmap;
-	kcq_mqd_init(&d);
-	grbm_select(m, 1, 0);
-	d.int_cntl = rd(m, g->cpc_int_cntl);
-	wr(m, g->cpc_int_cntl, d.int_cntl | TIME_STAMP_INT_ENABLE);
-	grbm_select(m, 0, 0);
-	if ((err = kcq_map(m, &d)) != 0) {
-		kcq_report(m, &d, "vm ADD_QUEUE failed");
-		goto out_queue;
 	}
-	mapped = true;
-	dummy0 = gt->dummy != NULL ? *(volatile uint32_t *)gt->dummy : 0;
+	if ((err = vmt_qopen(m, d)) != 0) {
+		*gone = vmt_qclose(m, d);
+		goto out;
+	}
 
 	/* A: VMID 1 writes its own page. */
-	if ((err = vmt_submit(m, &d, &n, ib_vm, VMT_VMID, VMT_SEQ,
-	    "A (own page)")) != 0)
-		goto out_queue;
+	if ((err = vmt_submit(m, d, &n, ib_vm, VMT_VMID, (*seq)++,
+	    "A (own page)")) != 0) {
+		if (amd_gmc12_fault_take(gt, &st, &a)) {
+			amd_gmc12_fault_decode(gt, st, "A");
+			device_printf(sc->dev, "vm: A: fault page %#jx\n",
+			    (uintmax_t)a);
+		}
+		amd_gmc12_ctx_report(gt, VMT_VMID, "A timeout");
+		device_printf(sc->dev, "vm: layout %d (%s): A FAILED (no "
+		    "fence)\n", mode, nm);
+		*gone = vmt_qclose(m, d);
+		goto out;
+	}
 	bad = vmt_count_not(out, W42_OUT_DW, W42_OUT_VALUE);
 	if (bad == 0 && vmt_fault_is(m, "A", 0))
 		device_printf(sc->dev, "vm: A: PASS, all %u words %#x through "
@@ -1338,9 +1344,11 @@ vm_test_run(struct mes *m)
 	}
 
 	/* B: VMID 1 aims at a VA only VMID 0 maps. */
-	if ((err = vmt_submit(m, &d, &n, ib_vmx, VMT_VMID, VMT_SEQ + 1,
-	    "B (VA mapped only in VMID 0)")) != 0)
-		goto out_queue;
+	if ((err = vmt_submit(m, d, &n, ib_vmx, VMT_VMID, (*seq)++,
+	    "B (VA mapped only in VMID 0)")) != 0) {
+		*gone = vmt_qclose(m, d);
+		goto out;
+	}
 	bad = vmt_count_not(victim, W42_OUT_DW, DISP_POISON);
 	if (bad == 0 && vmt_fault_is(m, "B", W42_VMX_DATA_VA))
 		device_printf(sc->dev, "vm: B: PASS, victim untouched, VMID %u "
@@ -1357,11 +1365,14 @@ vm_test_run(struct mes *m)
 	if ((err = amd_gmc12_vm_unmap(&vm, W42_VM_DATA_VA)) != 0 ||
 	    (err = amd_gmc12_vm_flush(gt, VMT_VMID)) != 0) {
 		device_printf(sc->dev, "vm: C: unmap/flush failed (%d)\n", err);
-		goto out_queue;
+		*gone = vmt_qclose(m, d);
+		goto out;
 	}
-	if ((err = vmt_submit(m, &d, &n, ib_vm, VMT_VMID, VMT_SEQ + 2,
-	    "C (page revoked)")) != 0)
-		goto out_queue;
+	if ((err = vmt_submit(m, d, &n, ib_vm, VMT_VMID, (*seq)++,
+	    "C (page revoked)")) != 0) {
+		*gone = vmt_qclose(m, d);
+		goto out;
+	}
 	bad = vmt_count_not(out, W42_OUT_DW, DISP_POISON);
 	if (bad == 0 && vmt_fault_is(m, "C", W42_VM_DATA_VA))
 		device_printf(sc->dev, "vm: C: PASS, revoked page untouched, "
@@ -1373,18 +1384,92 @@ vm_test_run(struct mes *m)
 		fails++;
 	}
 	if (gt->dummy != NULL) {
-		device_printf(sc->dev, "vm: dummy page word 0 %#x before, %#x "
-		    "after (faulting writes land there)\n", dummy0,
+		device_printf(sc->dev, "vm: dummy page word 0 now %#x "
+		    "(faulting writes land there); zeroed\n",
 		    *(volatile uint32_t *)gt->dummy);
 		memset(gt->dummy, 0, PAGE_SIZE);
 	}
-	if (fails != 0)
-		err = EIO;
+	*gone = vmt_qclose(m, d);
+	err = fails != 0 ? EIO : 0;
+	device_printf(sc->dev, "vm: layout %d (%s): %s\n", mode, nm,
+	    err == 0 ? "A, B, C PASS" : "FAILED");
+out:
+	(void)amd_gmc12_vm_bind(gt, VMT_VMID, NULL);
+	if (*gone)
+		amd_gmc12_vm_fini(&vm);	/* else system tables leak */
+	return (err);
+}
 
-out_queue:
-	if (mapped && kcq_unmap(m) != 0)
-		kcq_report(m, &d, "vm REMOVE_QUEUE failed");
-	gone = hqd_dequeue_me(m, 1, 0);
+/*
+ * The 5b test: the amdgpu layout first, then the diagnostic layouts, each
+ * with a fresh queue. Stage 5b passes only if the amdgpu layout passes;
+ * the others say where the walker disagrees when it does not.
+ */
+static int
+vm_test_run(struct mes *m)
+{
+	static const int modes[] = { AMD_VM12_4L_VRAM, AMD_VM12_FLAT,
+	    AMD_VM12_4L_SYS, AMD_VM12_4L_LEAF };
+	struct atrium_amd_softc *sc = m->sc;
+	const struct mes_gen *g = m->g;
+	struct amd_gart *gt = m->gt;
+	struct disp d;
+	uint8_t *pg;
+	vm_paddr_t pg_pa;
+	uint32_t seq = VMT_SEQ;
+	u_int i, k;
+	int err, res[nitems(modes)];
+	bool gone = true;
+
+	memset(&d, 0, sizeof(d));
+	d.va = gt->gart_start + VMT_GART_VA;
+	if (d.va + VMT_VICTIM != W42_VMX_DATA_VA ||
+	    d.va + VMT_SIZE > gt->gart_end + 1 || W42_IB_OFFSET != PAGE_SIZE ||
+	    W42_VM_DATA_VA - W42_VM_CODE_VA >= (2u << 20)) {
+		device_printf(sc->dev, "vm: write42_ib.h built for victim "
+		    "%#jx, block at %#jx; regenerate it\n",
+		    (uintmax_t)W42_VMX_DATA_VA, (uintmax_t)d.va);
+		return (EINVAL);
+	}
+	/* VMID 1's pages: shader, IBs, out. */
+	pg = contigmalloc(VMT_PAGES * PAGE_SIZE, M_DEVBUF, M_WAITOK | M_ZERO,
+	    0, ~(vm_paddr_t)0, PAGE_SIZE, 0);
+	pg_pa = vtophys(pg);
+	memcpy(pg, w42_shader, sizeof(w42_shader));
+	memcpy(pg + PAGE_SIZE, w42_ib_vm, sizeof(w42_ib_vm));
+	memcpy(pg + PAGE_SIZE + VMT_IB_VMX_OFF, w42_ib_vmx, sizeof(w42_ib_vmx));
+
+	/* The kernel queue's block in the GART, with the victim page. */
+	d.blk = contigmalloc(VMT_SIZE, M_DEVBUF, M_WAITOK | M_ZERO, 0,
+	    ~(vm_paddr_t)0, PAGE_SIZE, 0);
+	d.pa = vtophys(d.blk);
+	for (i = 0; i < VMT_SIZE / PAGE_SIZE; i++)
+		(void)amd_gmc12_gart_map(gt, d.va + i * PAGE_SIZE,
+		    d.pa + i * PAGE_SIZE);
+	device_printf(sc->dev, "vm: pages pa %#jx (shader %#jx, IBs "
+	    "%#jx/%#jx, out %#jx); queue block GART %#jx, victim %#jx\n",
+	    (uintmax_t)pg_pa, (uintmax_t)W42_VM_CODE_VA,
+	    (uintmax_t)(W42_VM_CODE_VA + W42_IB_OFFSET),
+	    (uintmax_t)(W42_VM_CODE_VA + W42_IB_OFFSET + VMT_IB_VMX_OFF),
+	    (uintmax_t)W42_VM_DATA_VA, (uintmax_t)d.va,
+	    (uintmax_t)W42_VMX_DATA_VA);
+	if ((err = amd_gmc12_flush(gt)) != 0)
+		goto out_unmap;
+	grbm_select(m, 1, 0);
+	d.int_cntl = rd(m, g->cpc_int_cntl);
+	wr(m, g->cpc_int_cntl, d.int_cntl | TIME_STAMP_INT_ENABLE);
+	grbm_select(m, 0, 0);
+
+	for (k = 0; k < nitems(modes); k++)
+		res[k] = ENXIO;
+	for (k = 0; k < nitems(modes) && gone; k++)
+		res[k] = vmt_variant(m, &d, pg, pg_pa, modes[k], &seq, &gone);
+	for (k = 0; k < nitems(modes); k++)
+		device_printf(sc->dev, "vm: summary: layout %d (%s): %s\n",
+		    modes[k], vmt_names[modes[k]], res[k] == 0 ? "PASS" :
+		    res[k] == ENXIO ? "not run" : "FAILED");
+	err = res[0];
+
 	grbm_select(m, 1, 0);
 	wr(m, g->cpc_int_cntl, d.int_cntl);
 	grbm_select(m, 0, 0);
@@ -1396,12 +1481,8 @@ out_unmap:
 		bus_write_4(gt->vram, gt->table_off + idx * 8 + 4, 0);
 	}
 	(void)amd_gmc12_flush(gt);
-out_free:
-	if (bound)
-		(void)amd_gmc12_vm_bind(gt, VMT_VMID, 0);
 	if (gone) {
-		if (d.blk != NULL)
-			contigfree(d.blk, VMT_SIZE, M_DEVBUF);
+		contigfree(d.blk, VMT_SIZE, M_DEVBUF);
 		contigfree(pg, VMT_PAGES * PAGE_SIZE, M_DEVBUF);
 	} else
 		device_printf(sc->dev, "vm: queue still active; its blocks "
