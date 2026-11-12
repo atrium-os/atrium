@@ -210,3 +210,29 @@ fn r9700_golden_discovery() {
     d.for_each_ip(|ip| if ip.hw_id == hwid::UMC { umc += 1 }).unwrap();
     assert_eq!(umc, 8);
 }
+
+/// The driver's view of the real R9700 table (what identify.c gets).
+#[test]
+fn r9700_ipinfo() {
+    use crate::ipinfo::*;
+    let b = include_bytes!("../data/r9700-discovery.bin");
+    let mut i = IpInfo::default();
+    assert_eq!(fill(b, &mut i), 0);
+    assert_eq!(i.nips, 46);
+    assert_eq!((i.gc.present, i.gc.major, i.gc.minor, i.gc.rev), (1, 12, 0, 1));
+    assert_eq!(&i.gc.base[..i.gc.nbase as usize], &[0x1260, 0xa000, 0x1c000, 0x2402c00]);
+    assert_eq!((i.mp0.major, i.mp0.minor, i.mp0.rev), (14, 0, 3));
+    assert_eq!(i.mp0.base[0], 0x16000);
+    assert_eq!(i.mp1.base[1], 0x16200);
+    assert_eq!((i.dmu.major, i.dmu.minor, i.dmu.rev), (4, 1, 0));
+    assert_eq!(i.dmu.base[2] * 4, 0x34c0 * 4);
+    assert_eq!((i.vcn.major, i.osssys.major, i.nbif.minor), (5, 7, 3));
+    // Corruption is an error code with a zeroed result, never a panic.
+    let mut c = b.to_vec();
+    c[0x40] ^= 0xff;
+    assert!(fill(&c, &mut i) < 0);
+    assert_eq!(i, IpInfo::default());
+    for n in 0..b.len() {
+        let _ = fill(&b[..n], &mut i);
+    }
+}

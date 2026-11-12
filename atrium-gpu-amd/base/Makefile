@@ -2,10 +2,13 @@
 # real `pci` bus), BAR mapping, MSI-X allocation, the shared softc, and the two
 # child devices the gpu + display modules attach to. Loaded first.
 KMOD=	atrium_gpu_amd_pci
-SRCS=	pci.c ih.c reset.c vram.c
+SRCS=	pci.c identify.c ih.c reset.c vram.c
 SRCS+=	device_if.h bus_if.h pci_if.h
 
 .PATH:	${.CURDIR}/..
 CFLAGS+= -I${.CURDIR}/..
+
+# Rust: the IP discovery parser behind identify.c (base_rs.rs, ../rs/).
+RUST_SRCS=	base_rs.rs
 
 .include <bsd.kmod.mk>

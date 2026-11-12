@@ -166,10 +166,11 @@ display_out(struct atrium_amd_softc *sc, uint32_t n)
 }
 
 /* An output's instance of a pipe-0 register. */
-#define HUBP(o, r)	DCN_PIPE_REG(r, DCN_STRIDE_HUBP, (o)->n)
-#define OTG(o, r)	DCN_PIPE_REG(r, DCN_STRIDE_OTG, (o)->n)
-#define HPD(o, r)	DCN_PIPE_REG(r, DCN_STRIDE_HPD, (o)->n)
-#define DIG(o, r)	DCN_PIPE_REG(r, DCN_STRIDE_DIG, (o)->n)
+#define DCN2(o, r)	((o)->sc->dcn_seg2_bytes + (r))
+#define HUBP(o, r)	DCN2(o, DCN_PIPE_REG(r, DCN_STRIDE_HUBP, (o)->n))
+#define OTG(o, r)	DCN2(o, DCN_PIPE_REG(r, DCN_STRIDE_OTG, (o)->n))
+#define HPD(o, r)	DCN2(o, DCN_PIPE_REG(r, DCN_STRIDE_HPD, (o)->n))
+#define DIG(o, r)	DCN2(o, DCN_PIPE_REG(r, DCN_STRIDE_DIG, (o)->n))
 #define SIMR(o, r)	regDISP_PIPE(r, (o)->n)
 
 static inline uint32_t

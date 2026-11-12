@@ -83,3 +83,8 @@ Per-IP code is chosen by discovery version, not by device id (never hardcode RDN
   amdgpu's view on Ubuntu), 8 UMCs. It found two parser bugs that synthetic fixtures hid
   (table signature is "IPDS", VCN hw id is 12); the real table is now a golden test
   (`rs-host-tests/data/r9700-discovery.bin`).
+- **2026-11-12, PSP/SMU state at power-on.** `atrium-gpu-probe pci 3:0:0 --status` (reads
+  only, MP0/MP1 bases from discovery): PSP C2PMSG_35 = 0x80000000 (bootloader ready),
+  C2PMSG_81 = 0 (no sOS), C2PMSG_64 = 0; SMU C2PMSG_90 = 1 (last message OK, from the
+  VBIOS). So the driver must run the whole PSP bootloader sequence (KDB, SPL, SYS_DRV, SOS
+  from `psp_14_0_3_sos.bin`) before anything else; nothing is loaded behind it.

@@ -7,6 +7,8 @@
 pub mod fw;
 #[path = "../../rs/discovery.rs"]
 pub mod discovery;
+#[path = "../../rs/ipinfo.rs"]
+pub mod ipinfo;
 
 #[cfg(test)]
 extern crate std;

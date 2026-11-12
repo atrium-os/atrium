@@ -1,8 +1,10 @@
 /*
  * pci.c — atrium_gpu_amd_pci.ko, the §4.1 base module.
  *
- * Owns the newbus PCI attach to the real `pci` bus (vendor 0x1002 / device
- * 0x7550 = the gpusim functional model): enables bus-mastering, maps the
+ * Owns the newbus PCI attach to the real `pci` bus (any AMD display-class
+ * function; identify.c decides at attach whether it is one we drive, from
+ * gpusim's identity register or the silicon's IP discovery table, never from
+ * the PCI device id): enables bus-mastering, maps the
  * register (BAR5) and doorbell (BAR2) BARs into the SHARED softc, then creates
  * two child devices — "atrium_gpu_amd" and "atrium_gpu_amd_display" — that the
  * GPU and display modules attach to. Both children reach the shared softc (and thus the
@@ -24,8 +26,8 @@ static int
 atrium_amd_pci_probe(device_t dev)
 {
 	if (pci_get_vendor(dev) == ATRIUM_AMD_VENDOR &&
-	    pci_get_device(dev) == ATRIUM_AMD_DEVICE) {
-		device_set_desc(dev, "Atrium AMD RDNA4 GPU (gpusim) — PCI base");
+	    pci_get_class(dev) == PCIC_DISPLAY) {
+		device_set_desc(dev, "Atrium AMD GPU — PCI base");
 		return (BUS_PROBE_DEFAULT);
 	}
 	return (ENXIO);
@@ -88,8 +90,6 @@ atrium_amd_pci_attach(device_t dev)
 	 * before Bus-Master-Enable and BAR access before Memory-Space-Enable.
 	 * pci_enable_busmaster sets BME; RF_ACTIVE BAR alloc enables MSE.
 	 */
-	pci_enable_busmaster(dev);
-
 	sc->regs_rid = ATRIUM_AMD_REGS_BAR;
 	sc->regs = bus_alloc_resource_any(dev, SYS_RES_MEMORY, &sc->regs_rid,
 	    RF_ACTIVE);
@@ -98,6 +98,24 @@ atrium_amd_pci_attach(device_t dev)
 		atrium_amd_pci_teardown(sc);
 		return (ENXIO);
 	}
+
+	/*
+	 * What is this? Decided before bus mastering or any write but the
+	 * discovery window's index registers (identify.c). Silicon gets no
+	 * further until its bring-up exists (docs/spec/r9700-bare-metal.md
+	 * stage 3): the sequences below are gpusim's.
+	 */
+	if (amd_identify(sc) != 0) {
+		atrium_amd_pci_teardown(sc);
+		return (ENXIO);
+	}
+	if (sc->hw_kind != AMD_HW_GPUSIM) {
+		device_printf(dev, "silicon bring-up not implemented yet; "
+		    "not attaching (vgapci keeps the device)\n");
+		atrium_amd_pci_teardown(sc);
+		return (ENXIO);
+	}
+	pci_enable_busmaster(dev);
 	sc->doorbell_rid = ATRIUM_AMD_DOORBELL_BAR;
 	sc->doorbell = bus_alloc_resource_any(dev, SYS_RES_MEMORY,
 	    &sc->doorbell_rid, RF_ACTIVE);
@@ -258,9 +276,10 @@ MODULE_VERSION(atrium_gpu_amd_pci, 1);
  * the bind policy is separate. The kld build's kldxref folds this into
  * /boot/.../linker.hints so devmatch can read it without loading the module.
  */
-struct atrium_amd_pci_id { uint16_t vendor; uint16_t device; };
+/* Vendor only: there is no device-id list, the attach identifies the part. */
+struct atrium_amd_pci_id { uint16_t vendor; };
 static const struct atrium_amd_pci_id atrium_amd_pci_ids[] = {
-	{ ATRIUM_AMD_VENDOR, ATRIUM_AMD_DEVICE },
+	{ ATRIUM_AMD_VENDOR },
 };
-MODULE_PNP_INFO("U16:vendor;U16:device", pci, atrium_gpu_amd_pci,
+MODULE_PNP_INFO("U16:vendor", pci, atrium_gpu_amd_pci,
     atrium_amd_pci_ids, nitems(atrium_amd_pci_ids));

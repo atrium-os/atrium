@@ -53,7 +53,13 @@
 #include <dev/pci/pcireg.h>
 
 #define ATRIUM_AMD_VENDOR	0x1002
-#define ATRIUM_AMD_DEVICE	0x7550	/* RDNA4-class (gpusim target) */
+/*
+ * No device ids: the base probes any AMD display-class function and decides
+ * at attach, from what answers behind BAR5, whether it can drive it
+ * (identify.c): gpusim answers regSIM_ID; silicon is described by its IP
+ * discovery table, and per-IP code is chosen by (hw id, version), never by
+ * PCI device id (Shankar 2026-11-05).
+ */
 
 /* BAR5 = 256 KiB MMIO register file; BAR2 = the doorbell page (dev-ref §2,§5). */
 #define ATRIUM_AMD_REGS_BAR	PCIR_BAR(5)
@@ -211,12 +217,13 @@
  * segment 2 at byte 0x60000 of its register BAR, as it places GC and OSS; on
  * the R9700 IP discovery gives DMU 4.0.1 segment bases 0x12, 0xc0, 0x34c0,
  * 0x9000, 0x2403c00 (dwords), so on silicon (D5) DCN_SEG2_BYTES comes from IP
- * discovery: 0x34c0 * 4. What is left on the SIM registers above: the mode
+ * discovery: 0x34c0 * 4 (identify.c sets sc->dcn_seg2_bytes). What is left on the SIM registers above: the mode
  * set (OTG timing, OPP, DIG and PHY are not modelled), EDID/DDC, link
  * training, MST and power, the referee's fault code, and the test hooks.
  */
-#define DCN_SEG2_BYTES		0x60000u	/* gpusim; silicon: IP discovery */
-#define regDCN2(d)		(DCN_SEG2_BYTES + (d) * 4u)
+#define DCN_SEG2_BYTES_GPUSIM	0x60000u	/* silicon: sc->dcn_seg2_bytes from IP discovery */
+/* Byte offset inside DCN segment 2; the display macros add sc->dcn_seg2_bytes. */
+#define regDCN2(d)		((d) * 4u)
 #define regHUBP0_DCSURF_SURFACE_CONFIG		regDCN2(0x05e5)
 #define regHUBP0_DCSURF_TILING_CONFIG		regDCN2(0x05e7)
 #define regHUBPREQ0_DCSURF_SURFACE_PITCH	regDCN2(0x0607)
@@ -781,8 +788,37 @@ struct amd_clear_engine {
 	uint64_t	 seq;		/* last fence value */
 };
 
+/*
+ * What identify.c found behind BAR5. ip_* hold the discovered (or, for gpusim,
+ * the modelled) version and register segment bases of the blocks the driver
+ * uses; present = 0 when the table lists no such block.
+ */
+#define AMD_HW_GPUSIM		1
+#define AMD_HW_SILICON		2
+#define AMD_IP_NBASE		8
+struct amd_ip_ver {
+	uint8_t		present;
+	uint8_t		major, minor, rev;
+	uint8_t		nbase;
+	uint32_t	base[AMD_IP_NBASE];	/* dword segment bases */
+};
+/* Order matters: rs (base/base_rs.rs) fills the same layout. */
+struct amd_ip_info {
+	struct amd_ip_ver gc, mp0, mp1, sdma0, mmhub, osssys, hdp, nbif, dmu, vcn;
+	uint32_t	nips;			/* IP instances in the table */
+};
+int	atrium_amd_discovery_parse(const uint8_t *bin, size_t len,
+	    struct amd_ip_info *out);		/* Rust, base/base_rs.rs */
+int	amd_identify(struct atrium_amd_softc *sc);	/* identify.c */
+
 struct atrium_amd_softc {
 	device_t	 dev;
+	int		 hw_kind;	/* AMD_HW_* (identify.c, before any write) */
+	struct amd_ip_info ip;
+	uint32_t	 isa_family;	/* CAP_ISA, from GC's version */
+	uint32_t	 isa_revision;
+	char		 isa_name[16];
+	uint32_t	 dcn_seg2_bytes; /* DMU segment 2 byte offset in BAR5 */
 	const struct atrium_gpu_backend_ops *backend; /* hardware seam (gpu module) */
 	struct resource	*regs;		/* BAR5 MMIO register file */
 	int		 regs_rid;

@@ -75,7 +75,7 @@
 static void
 amd_get_caps(struct atrium_amd_softc *sc, struct atrium_gpu_backend_caps *c)
 {
-	c->vendor = "Atrium AMD RDNA4 (gpusim)";
+	c->vendor = sc->hw_kind == AMD_HW_GPUSIM ? "Atrium AMD (gpusim)" : "Atrium AMD";
 	c->features = ATRIUM_GPU_FEAT_GRAPHICS | ATRIUM_GPU_FEAT_COMPUTE |
 	    ATRIUM_GPU_FEAT_USER_QUEUES | ATRIUM_GPU_FEAT_SYNCOBJ |
 	    ATRIUM_GPU_FEAT_VM_BIND;
@@ -84,10 +84,10 @@ amd_get_caps(struct atrium_amd_softc *sc, struct atrium_gpu_backend_caps *c)
 	c->va_align = PAGE_SIZE;
 	c->vram_bytes = sc->vram.total;
 	c->bind_features = ATRIUM_GPU_BIND_FEAT_READ_ONLY;
-	/* gpusim models the R9700 (Navi 48, gfx1201). */
-	c->isa_family = ATRIUM_GPU_ISA_AMD_RDNA4;
-	c->isa_revision = 0x1201;
-	c->isa_name = "gfx1201";
+	/* From GC's discovered (gpusim: modelled) version, identify.c. */
+	c->isa_family = sc->isa_family;
+	c->isa_revision = sc->isa_revision;
+	c->isa_name = sc->isa_name;
 }
 
 /*
