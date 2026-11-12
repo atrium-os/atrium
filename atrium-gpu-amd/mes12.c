@@ -1129,6 +1129,289 @@ out_unmap:
 	return (err);
 }
 
+/*
+ * Stage 5b: a per-client page table on silicon. VMID 1 (a kernel VMID:
+ * MES owns 8-15) gets its own four-level table (gmc12.c) holding only the
+ * write_42 shader, its IBs and an output page, all system pages. The same
+ * kernel compute queue as 4e runs the IBs with VMID 1 in the
+ * INDIRECT_BUFFER packet (gfx_v12_0_ring_emit_ib_compute); the ring, MQD
+ * and fence stay in VMID 0. Three checks:
+ *
+ *  A. write_42 at VM_DATA_VA through VMID 1's table: 64 x 42.
+ *  B. the same shader told to write at VMX_DATA_VA, which VMID 0 (the
+ *     GART) maps to a poisoned victim page and VMID 1 does not map: the
+ *     victim must stay poisoned, and GFXHUB must latch a VMID 1 fault at
+ *     that address.
+ *  C. revoke: VM_DATA_VA unmapped and VMID 1 flushed, then A's IB again:
+ *     the output page must stay poisoned, with a VMID 1 fault there.
+ *
+ * Faults go to the default (dummy) page with no retry, so B and C still
+ * reach their fence.
+ */
+#define VMT_GART_VA		0x00050000ull	/* after the 4e block */
+#define VMT_VICTIM		0x3000u
+#define VMT_SIZE		0x4000u
+#define VMT_VMID		1u
+#define VMT_PAGES		3u		/* shader, IBs, out */
+#define VMT_IB_VMX_OFF		0x400u		/* in the IB page */
+#define VMT_SEQ			0x5b000001u
+
+static int
+vmt_submit(struct mes *m, struct disp *d, u_int *n, uint64_t ib, u_int vmid,
+    uint32_t seq, const char *what)
+{
+	volatile uint32_t *ring = (volatile uint32_t *)(d->blk + DISP_RING);
+	uint64_t fence = d->va + DISP_WB + 0x10;
+	u_int k = *n;
+	int us;
+
+	ring[k++] = PKT3(IT_INDIRECT_BUFFER, 2);
+	ring[k++] = (uint32_t)ib;
+	ring[k++] = (uint32_t)(ib >> 32);
+	ring[k++] = IB_VALID | W42_IB_DW | (vmid & 0xf) << 24;
+	ring[k++] = PKT3(IT_RELEASE_MEM, 6);
+	ring[k++] = RM_GCR_SEQ | RM_GCR_GL2_WB | RM_CACHE_POLICY(3) |
+	    RM_EVENT_TYPE(CACHE_FLUSH_AND_INV_TS_EVENT) | RM_EVENT_INDEX(5);
+	ring[k++] = RM_DATA_SEL(1) | RM_INT_SEL(2);
+	ring[k++] = (uint32_t)fence;
+	ring[k++] = (uint32_t)(fence >> 32);
+	ring[k++] = seq;
+	ring[k++] = 0;
+	ring[k++] = 0;
+	*n = k;
+	*(volatile uint64_t *)(d->blk + DISP_WB + 8) = k;
+	wmb();
+	bus_write_8(m->dbbar, (bus_size_t)KCQ_DOORBELL * 4, k);
+	for (us = 0; us < DISP_TIMEOUT_US; us += 10) {
+		if (*(volatile uint32_t *)(d->blk + DISP_WB + 0x10) == seq)
+			break;
+		DELAY(10);
+	}
+	if (us >= DISP_TIMEOUT_US) {
+		device_printf(m->sc->dev, "vm: %s: no fence in %d ms\n", what,
+		    DISP_TIMEOUT_US / 1000);
+		kcq_report(m, d, "vm fence timeout");
+		amd_gmc12_fault_report(m->gt, "vm fence timeout");
+		return (ETIMEDOUT);
+	}
+	device_printf(m->sc->dev, "vm: %s: fence %#x after %d us\n", what,
+	    seq, us);
+	return (0);
+}
+
+/* Count words of `p` that are not `want`. */
+static u_int
+vmt_count_not(volatile uint32_t *p, u_int dw, uint32_t want)
+{
+	u_int i, bad = 0;
+
+	for (i = 0; i < dw; i++)
+		if (p[i] != want)
+			bad++;
+	return (bad);
+}
+
+/* The fault a check expects: VMID 1, at `va`'s page. Logs what it saw. */
+static bool
+vmt_fault_is(struct mes *m, const char *what, uint64_t va)
+{
+	uint32_t st;
+	uint64_t a;
+
+	if (!amd_gmc12_fault_take(m->gt, &st, &a)) {
+		device_printf(m->sc->dev, "vm: %s: no fault latched\n", what);
+		return (va == 0);
+	}
+	device_printf(m->sc->dev, "vm: %s: GFXHUB fault status %#x (VMID %u, "
+	    "client %#x, %s) at %#jx\n", what, st, amd_gmc12_fault_vmid(st),
+	    (st >> 9) & 0x1ff, (st & (1u << 18)) ? "write" : "read",
+	    (uintmax_t)a);
+	return (va != 0 && amd_gmc12_fault_vmid(st) == VMT_VMID &&
+	    a == (va & ~(uint64_t)PAGE_MASK));
+}
+
+static int
+vm_test_run(struct mes *m)
+{
+	struct atrium_amd_softc *sc = m->sc;
+	const struct mes_gen *g = m->g;
+	struct amd_gart *gt = m->gt;
+	struct amd_vm12 vm;
+	struct disp d;
+	uint8_t *pg = NULL;
+	vm_paddr_t pg_pa = 0;
+	volatile uint32_t *out, *victim;
+	uint32_t st, dummy0;
+	uint64_t a, ib_vm, ib_vmx;
+	u_int i, n = 0, bad;
+	int err, fails = 0;
+	bool mapped = false, gone = true, bound = false;
+
+	memset(&d, 0, sizeof(d));
+	d.va = gt->gart_start + VMT_GART_VA;
+	if (d.va + VMT_VICTIM != W42_VMX_DATA_VA ||
+	    d.va + VMT_SIZE > gt->gart_end + 1 || W42_IB_OFFSET != PAGE_SIZE) {
+		device_printf(sc->dev, "vm: write42_ib.h built for victim "
+		    "%#jx, block at %#jx; regenerate it\n",
+		    (uintmax_t)W42_VMX_DATA_VA, (uintmax_t)d.va);
+		return (EINVAL);
+	}
+
+	/* VMID 1's table: shader, IB page, out. Nothing else. */
+	if ((err = amd_gmc12_vm_init(gt, &vm)) != 0) {
+		device_printf(sc->dev, "vm: no page-table pool (%d)\n", err);
+		return (err);
+	}
+	pg = contigmalloc(VMT_PAGES * PAGE_SIZE, M_DEVBUF, M_WAITOK | M_ZERO,
+	    0, ~(vm_paddr_t)0, PAGE_SIZE, 0);
+	pg_pa = vtophys(pg);
+	memcpy(pg, w42_shader, sizeof(w42_shader));
+	memcpy(pg + PAGE_SIZE, w42_ib_vm, sizeof(w42_ib_vm));
+	memcpy(pg + PAGE_SIZE + VMT_IB_VMX_OFF, w42_ib_vmx, sizeof(w42_ib_vmx));
+	out = (volatile uint32_t *)(pg + 2 * PAGE_SIZE);
+	for (i = 0; i < W42_OUT_DW; i++)
+		out[i] = DISP_POISON;
+	ib_vm = W42_VM_CODE_VA + W42_IB_OFFSET;
+	ib_vmx = ib_vm + VMT_IB_VMX_OFF;
+	if ((err = amd_gmc12_vm_map(&vm, W42_VM_CODE_VA, pg_pa,
+	    AMD_VM_READ | AMD_VM_WRITE | AMD_VM_EXEC)) != 0 ||
+	    (err = amd_gmc12_vm_map(&vm, W42_VM_CODE_VA + PAGE_SIZE,
+	    pg_pa + PAGE_SIZE, AMD_VM_READ | AMD_VM_WRITE | AMD_VM_EXEC)) != 0 ||
+	    (err = amd_gmc12_vm_map(&vm, W42_VM_DATA_VA, pg_pa + 2 * PAGE_SIZE,
+	    AMD_VM_READ | AMD_VM_WRITE | AMD_VM_EXEC)) != 0) {
+		device_printf(sc->dev, "vm: map failed (%d)\n", err);
+		goto out_free;
+	}
+	device_printf(sc->dev, "vm: VMID %u table root at FB %#jx, %u table "
+	    "pages; shader %#jx, IBs %#jx/%#jx, out %#jx (pa %#jx)\n",
+	    VMT_VMID, (uintmax_t)amd_gmc12_vm_pd_addr(&vm), vm.used,
+	    (uintmax_t)W42_VM_CODE_VA, (uintmax_t)ib_vm, (uintmax_t)ib_vmx,
+	    (uintmax_t)W42_VM_DATA_VA, (uintmax_t)pg_pa);
+	if (amd_gmc12_fault_take(gt, &st, &a))
+		device_printf(sc->dev, "vm: stale fault before the test: "
+		    "status %#x at %#jx (cleared)\n", st, (uintmax_t)a);
+	if ((err = amd_gmc12_vm_bind(gt, VMT_VMID,
+	    amd_gmc12_vm_pd_addr(&vm))) != 0) {
+		device_printf(sc->dev, "vm: bind/flush VMID %u: %d\n",
+		    VMT_VMID, err);
+		goto out_free;
+	}
+	bound = true;
+
+	/* The kernel queue's block in the GART, with the victim page. */
+	d.blk = contigmalloc(VMT_SIZE, M_DEVBUF, M_WAITOK | M_ZERO, 0,
+	    ~(vm_paddr_t)0, PAGE_SIZE, 0);
+	d.pa = vtophys(d.blk);
+	for (i = 0; i < VMT_SIZE / PAGE_SIZE; i++)
+		(void)amd_gmc12_gart_map(gt, d.va + i * PAGE_SIZE,
+		    d.pa + i * PAGE_SIZE);
+	victim = (volatile uint32_t *)(d.blk + VMT_VICTIM);
+	for (i = 0; i < W42_OUT_DW; i++)
+		victim[i] = DISP_POISON;
+	if ((err = amd_gmc12_flush(gt)) != 0)
+		goto out_unmap;
+	kcq_mqd_init(&d);
+	grbm_select(m, 1, 0);
+	d.int_cntl = rd(m, g->cpc_int_cntl);
+	wr(m, g->cpc_int_cntl, d.int_cntl | TIME_STAMP_INT_ENABLE);
+	grbm_select(m, 0, 0);
+	if ((err = kcq_map(m, &d)) != 0) {
+		kcq_report(m, &d, "vm ADD_QUEUE failed");
+		goto out_queue;
+	}
+	mapped = true;
+	dummy0 = gt->dummy != NULL ? *(volatile uint32_t *)gt->dummy : 0;
+
+	/* A: VMID 1 writes its own page. */
+	if ((err = vmt_submit(m, &d, &n, ib_vm, VMT_VMID, VMT_SEQ,
+	    "A (own page)")) != 0)
+		goto out_queue;
+	bad = vmt_count_not(out, W42_OUT_DW, W42_OUT_VALUE);
+	if (bad == 0 && vmt_fault_is(m, "A", 0))
+		device_printf(sc->dev, "vm: A: PASS, all %u words %#x through "
+		    "VMID %u's own table\n", W42_OUT_DW, W42_OUT_VALUE,
+		    VMT_VMID);
+	else {
+		device_printf(sc->dev, "vm: A: FAILED, %u of %u words wrong "
+		    "(out[0] %#x)\n", bad, W42_OUT_DW, out[0]);
+		fails++;
+	}
+
+	/* B: VMID 1 aims at a VA only VMID 0 maps. */
+	if ((err = vmt_submit(m, &d, &n, ib_vmx, VMT_VMID, VMT_SEQ + 1,
+	    "B (VA mapped only in VMID 0)")) != 0)
+		goto out_queue;
+	bad = vmt_count_not(victim, W42_OUT_DW, DISP_POISON);
+	if (bad == 0 && vmt_fault_is(m, "B", W42_VMX_DATA_VA))
+		device_printf(sc->dev, "vm: B: PASS, victim untouched, VMID %u "
+		    "faulted at %#jx\n", VMT_VMID, (uintmax_t)W42_VMX_DATA_VA);
+	else {
+		device_printf(sc->dev, "vm: B: FAILED, %u victim words "
+		    "changed (victim[0] %#x)\n", bad, victim[0]);
+		fails++;
+	}
+
+	/* C: revoke the out page, run A's IB again. */
+	for (i = 0; i < W42_OUT_DW; i++)
+		out[i] = DISP_POISON;
+	if ((err = amd_gmc12_vm_unmap(&vm, W42_VM_DATA_VA)) != 0 ||
+	    (err = amd_gmc12_vm_flush(gt, VMT_VMID)) != 0) {
+		device_printf(sc->dev, "vm: C: unmap/flush failed (%d)\n", err);
+		goto out_queue;
+	}
+	if ((err = vmt_submit(m, &d, &n, ib_vm, VMT_VMID, VMT_SEQ + 2,
+	    "C (page revoked)")) != 0)
+		goto out_queue;
+	bad = vmt_count_not(out, W42_OUT_DW, DISP_POISON);
+	if (bad == 0 && vmt_fault_is(m, "C", W42_VM_DATA_VA))
+		device_printf(sc->dev, "vm: C: PASS, revoked page untouched, "
+		    "VMID %u faulted at %#jx\n", VMT_VMID,
+		    (uintmax_t)W42_VM_DATA_VA);
+	else {
+		device_printf(sc->dev, "vm: C: FAILED, %u revoked-page words "
+		    "changed (out[0] %#x)\n", bad, out[0]);
+		fails++;
+	}
+	if (gt->dummy != NULL) {
+		device_printf(sc->dev, "vm: dummy page word 0 %#x before, %#x "
+		    "after (faulting writes land there)\n", dummy0,
+		    *(volatile uint32_t *)gt->dummy);
+		memset(gt->dummy, 0, PAGE_SIZE);
+	}
+	if (fails != 0)
+		err = EIO;
+
+out_queue:
+	if (mapped && kcq_unmap(m) != 0)
+		kcq_report(m, &d, "vm REMOVE_QUEUE failed");
+	gone = hqd_dequeue_me(m, 1, 0);
+	grbm_select(m, 1, 0);
+	wr(m, g->cpc_int_cntl, d.int_cntl);
+	grbm_select(m, 0, 0);
+out_unmap:
+	for (i = 0; i < VMT_SIZE / PAGE_SIZE; i++) {
+		uint64_t idx = (d.va - gt->gart_start) / PAGE_SIZE + i;
+
+		bus_write_4(gt->vram, gt->table_off + idx * 8, 0);
+		bus_write_4(gt->vram, gt->table_off + idx * 8 + 4, 0);
+	}
+	(void)amd_gmc12_flush(gt);
+out_free:
+	if (bound)
+		(void)amd_gmc12_vm_bind(gt, VMT_VMID, 0);
+	if (gone) {
+		if (d.blk != NULL)
+			contigfree(d.blk, VMT_SIZE, M_DEVBUF);
+		contigfree(pg, VMT_PAGES * PAGE_SIZE, M_DEVBUF);
+	} else
+		device_printf(sc->dev, "vm: queue still active; its blocks "
+		    "are leaked, not freed\n");
+	device_printf(sc->dev, "vm: stage 5b: %s\n", err == 0 ?
+	    "PASS (own table, cross-VMID write blocked, revoke works)" :
+	    "FAILED");
+	return (err);
+}
+
 static void mes_free(struct mes *m);
 
 static int
@@ -1385,6 +1668,15 @@ amd_mes12_selftest(struct mes *m)
 	if (!m->dispatch)
 		return (ENOTSUP);
 	return (dispatch_run(m));
+}
+
+/* Stage 5b: VMID 1 through its own page table (vm_test_run), MES up. */
+int
+amd_mes12_vmtest(struct mes *m)
+{
+	if (!m->dispatch)
+		return (ENOTSUP);
+	return (vm_test_run(m));
 }
 
 /* Unmap the block and free it, release the doorbell BAR. */

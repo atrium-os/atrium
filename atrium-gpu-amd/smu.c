@@ -828,7 +828,7 @@ amd_si_attach(struct atrium_amd_softc *sc)
 {
 	struct amd_si *si;
 	const char *step = "SMU link";
-	int err, us;
+	int err, us, vm_test = 0;
 
 	si = malloc(sizeof(*si), M_DEVBUF, M_WAITOK | M_ZERO);
 	si->sc = sc;
@@ -868,6 +868,16 @@ amd_si_attach(struct atrium_amd_softc *sc)
 	    err == 0 ? "PASS" : "FAILED", amd_ih7_drain_eop(si->ih, 8));
 	if (err != 0)
 		goto down;
+	TUNABLE_INT_FETCH("hw.atrium_gpu.vm_test", &vm_test);
+	if (vm_test) {
+		step = "per-client page table (5b)";
+		err = amd_mes12_vmtest(si->mes);
+		device_printf(sc->dev, "si: VM test at attach: %s; %d CP EOP "
+		    "IV(s)\n", err == 0 ? "PASS" : "FAILED",
+		    amd_ih7_drain_eop(si->ih, 8));
+		if (err != 0)
+			goto down;
+	}
 	(void)smu_send(&si->link, SMU_ALLOW_GFXOFF, 0, NULL, false);
 	step = "idle proof while attached";
 	if (!smu_sample(&si->link, si->vram, si->ifver, 5,

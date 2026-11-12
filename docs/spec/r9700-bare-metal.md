@@ -522,3 +522,16 @@ through fd passing, close and jail death.
   kldunload rc 0, no hub faults, stray 0. Open: ~6 W more than unattached (7 W) because
   memory clock stays at 193 MHz while MES is resident (look at later). Log
   /root/runs/20261112T214441Z.log. Next: 5b.
+- 2026-11-12 22:00, 5b built. gmc12.c now sets up contexts 1–15 on both hubs as
+  gfxhub_v12_0_setup_vmid_config does (48-bit VA, depth 3, block size 0, faults to the
+  default page, no retry, no base until bound) and builds per-client page tables in the
+  gfx12 format: PDB2/PDB1/PDB0/PTB in a 256 KiB VRAM pool at 92 MiB, PDEs VALID with BFS 9
+  in PDB1 entries, system-page PTEs VALID|SYSTEM|SNOOPED|R|W|X, MTYPE NC, invalid PTEs
+  EXEC|IS_PTE; per-VMID bind and flush with ack; GFXHUB fault latch read and clear.
+  Self-test at attach (kenv vm_test, runner stage 5b): VMID 1 with its own table runs the
+  oracle's write_42 through the kernel compute queue (IB packet VMID 1), then (B) the same
+  shader aimed at a VA only VMID 0 maps (a poisoned victim page; must stay poisoned and
+  latch a VMID 1 fault there), then (C) the output page unmapped and flushed, same IB
+  again (page must stay poisoned, fault latched). Interrupts for VM faults stay off for
+  now (5c wires fault IVs to the owning queue). Faulting writes land in the shared dummy
+  page; the test reports and re-zeroes it (5c: a per-client dummy or discard).

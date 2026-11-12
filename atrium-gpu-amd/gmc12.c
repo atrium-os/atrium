@@ -17,8 +17,13 @@
  * address 0, one level (depth 0), its table in VRAM inside the driver's own
  * area. Unmapped GART pages read as invalid and fault to the default page.
  *
- * Contexts 1-15 (user VMs) are not set up here; that comes with the first
- * user queue (4e).
+ * Contexts 1-15 (stage 5b) are set up as gfxhub_v12_0_setup_vmid_config
+ * does: 48-bit VA, four levels (PDB2, PDB1, PDB0, PTB, 9 bits each), no
+ * retry, faults to the default page. A context gets a page-table base only
+ * when a VM is bound to it (amd_gmc12_vm_bind, or MES for VMIDs 8-15). The
+ * per-client page tables are built here too (amd_gmc12_vm_*), in a VRAM
+ * pool written through BAR0, in the gfx12 format of gmc_v12_0.c and
+ * amdgpu_vm_pt.c.
  */
 #include "atrium_gpu_amd.h"
 
@@ -31,6 +36,9 @@
 #define GART_PAGES		(GART_SIZE >> PAGE_SHIFT)
 #define GART_TABLE_SIZE		(GART_PAGES * 8)		/* 1 MiB */
 #define SCRATCH_VRAM_OFF	(GART_TABLE_VRAM_OFF + GART_TABLE_SIZE)
+/* Page-table pool for per-client VMs (stage 5b): 256 KiB at 92 MiB. */
+#define VM_POOL_VRAM_OFF	(92u << 20)
+#define VM_POOL_PAGES		64u
 
 /* PTE bits (amdgpu_vm.h), GFX12 layout. */
 #define PTE_VALID		(1ull << 0)
@@ -40,7 +48,17 @@
 #define PTE_READABLE		(1ull << 5)
 #define PTE_WRITEABLE		(1ull << 6)
 #define PTE_MTYPE_UC		(3ull << 54)
+#define PTE_MTYPE_MASK		(3ull << 54)	/* NC is 0 */
 #define PTE_IS_PTE		(1ull << 63)
+#define PDE_BFS(x)		((uint64_t)((x) & 0x1f) << 58)
+#define PDE_ADDR_MASK		0x0000ffffffffffc0ull
+#define PTE_ADDR_MASK		0x0000fffffffff000ull
+/* VM geometry (amdgpu_vm_adjust_size(256 TiB, 9, 3, 48)). */
+#define VM_LEVELS		4		/* PDB2, PDB1, PDB0, PTB */
+#define VM_DEPTH		3		/* PAGE_TABLE_DEPTH */
+#define VM_VA_BITS		48
+#define VM_MAX_PFN		(1ull << (VM_VA_BITS - PAGE_SHIFT))
+#define NUM_CTX			16
 
 /* Fields (identical in GCVM_* and MMVM_*). */
 #define L1_TLB_ENABLE		0x00000001
@@ -69,6 +87,12 @@
 #define CTX_ENABLE		0x00000001
 #define CTX_DEPTH		0x00000006
 #define CTX_RETRY		0x00000100
+#define CTX_BLOCK_SIZE		0x000000f0
+#define CTX_FAULT_DEFAULTS	0x00aaa800	/* *_FAULT_ENABLE_DEFAULT */
+#define CTX_FAULT_INTERRUPTS	0x00555400	/* *_FAULT_ENABLE_INTERRUPT */
+#define FAULT_CNTL_CLEAR	0x00000001
+#define FAULT_STATUS_VMID(s)	(((s) >> 20) & 0xf)
+#define FAULT_STATUS_CID(s)	(((s) >> 9) & 0x1ff)
 #define INV_L2_PTES		0x00080000
 #define INV_L2_PDE0		0x00100000
 #define INV_L2_PDE1		0x00200000
@@ -179,9 +203,10 @@ hub_open(struct atrium_amd_softc *sc, bool gc, struct hub *h)
 	if (h->g == NULL)
 		return (false);
 	h->base = (bus_size_t)ip->base[0] * 4;
-	/* The highest register in the row is ctx0_pt_end_hi or inv_*. */
-	return (h->base + (bus_size_t)MAX(h->g->ctx0_pt_end_hi,
-	    h->g->inv_range_lo + h->g->eng_addr_distance * 17 + 1) * 4 + 4 <=
+	/* The highest register is context 15's end_hi or engine 17's inv_*. */
+	return (h->base + (bus_size_t)MAX(h->g->ctx0_pt_end_hi + 2 *
+	    (NUM_CTX - 1), h->g->inv_range_lo + h->g->eng_addr_distance * 17 +
+	    1) * 4 + 4 <=
 	    rman_get_size(sc->regs));
 }
 
@@ -251,6 +276,22 @@ hub_gart_enable(struct hub *h, const struct amd_gart *gt)
 
 	/* System domain: context 0 on, depth 0, no retry. */
 	hrmw(h, g->ctx0_cntl, CTX_DEPTH | CTX_RETRY, CTX_ENABLE);
+
+	/*
+	 * Contexts 1-15 (setup_vmid_config): on, depth 3, block size 9 - 9,
+	 * every fault to the default page, no retry (noretry), the whole
+	 * 48-bit range. No base yet: a context is used only once bound.
+	 */
+	for (i = 1; i < NUM_CTX; i++) {
+		hrmw(h, g->ctx0_cntl + i, CTX_DEPTH | CTX_BLOCK_SIZE |
+		    CTX_RETRY | CTX_FAULT_INTERRUPTS, CTX_ENABLE |
+		    (VM_DEPTH << 1) | CTX_FAULT_DEFAULTS);
+		hw(h, g->ctx0_pt_start_lo + 2 * i, 0);
+		hw(h, g->ctx0_pt_start_hi + 2 * i, 0);
+		hw(h, g->ctx0_pt_end_lo + 2 * i, (uint32_t)(VM_MAX_PFN - 1));
+		hw(h, g->ctx0_pt_end_hi + 2 * i,
+		    (uint32_t)((VM_MAX_PFN - 1) >> 32));
+	}
 
 	/* Identity aperture off. */
 	hw(h, g->id_low_lo, 0xffffffff);
@@ -452,7 +493,8 @@ amd_gmc12_gart_disable(struct amd_gart *gt)
 	for (i = 0; i < 2 && gt->sc != NULL; i++) {
 		if (!hub_open(gt->sc, i == 1, &h))
 			continue;
-		hrmw(&h, h.g->ctx0_cntl, CTX_ENABLE, 0);
+		for (int c = 0; c < NUM_CTX; c++)
+			hrmw(&h, h.g->ctx0_cntl + c, CTX_ENABLE, 0);
 		hrmw(&h, h.g->l1_tlb, L1_TLB_ENABLE | L1_TLB_ADVANCED_MODEL, 0);
 		hrmw(&h, h.g->l2_cntl, L2_ENABLE, 0);
 		hw(&h, h.g->l2_cntl3, 0);
@@ -461,4 +503,224 @@ amd_gmc12_gart_disable(struct amd_gart *gt)
 		contigfree(gt->dummy, PAGE_SIZE, M_DEVBUF);
 	gt->dummy = NULL;
 	gt->enabled = false;
+}
+
+/*
+ * Stage 5b: per-client page tables. One VM is a four-level table in the
+ * VRAM pool (PDB2 root, PDB1, PDB0, PTB; 512 entries each), written
+ * through BAR0 like the GART table. PDEs point at VRAM by physical FB
+ * address and are just VALID (amdgpu_gmc_get_pde_for_bo for a VRAM BO);
+ * entries in a PDB1 also carry block fragment size 9 (translate_further,
+ * gmc_v12_0_get_vm_pde). A new PTB is filled with the invalid-PTE pattern
+ * (EXECUTABLE | IS_PTE, amdgpu_vm_pte_update_flags), and so is an unmapped
+ * page. A mapped system page is VALID | SYSTEM | SNOOPED plus R/W/X and
+ * MTYPE NC (gmc_v12_0_get_vm_pte, AMDGPU_VM_MTYPE_DEFAULT).
+ *
+ * The pool is a bump allocator: a 5b test VM, not yet the allocator a
+ * client VM will use (that comes with 5c, on vram-allocator).
+ */
+static uint64_t
+pool_rd(struct amd_vm12 *vm, bus_size_t off)
+{
+	return ((uint64_t)bus_read_4(vm->gt->vram, off) |
+	    (uint64_t)bus_read_4(vm->gt->vram, off + 4) << 32);
+}
+
+static void
+pool_wr(struct amd_vm12 *vm, bus_size_t off, uint64_t v)
+{
+	bus_write_4(vm->gt->vram, off, (uint32_t)v);
+	bus_write_4(vm->gt->vram, off + 4, (uint32_t)(v >> 32));
+}
+
+/* FB physical address of a pool offset, as a PDE or the context base wants. */
+static uint64_t
+pool_phys(struct amd_vm12 *vm, bus_size_t off)
+{
+	return ((uint64_t)off + vm->gt->vram_base_offset);
+}
+
+static bool
+pool_off_of(struct amd_vm12 *vm, uint64_t pde, bus_size_t *off)
+{
+	uint64_t a = pde & PDE_ADDR_MASK;
+
+	if (a < vm->gt->vram_base_offset + VM_POOL_VRAM_OFF ||
+	    a >= vm->gt->vram_base_offset + VM_POOL_VRAM_OFF +
+	    (uint64_t)VM_POOL_PAGES * PAGE_SIZE)
+		return (false);
+	*off = (bus_size_t)(a - vm->gt->vram_base_offset);
+	return (true);
+}
+
+static int
+pool_alloc(struct amd_vm12 *vm, bool ptb, bus_size_t *off)
+{
+	uint64_t fill = PTE_EXECUTABLE | PTE_IS_PTE;
+	u_int i;
+
+	if (vm->used >= VM_POOL_PAGES)
+		return (ENOMEM);
+	*off = VM_POOL_VRAM_OFF + (bus_size_t)vm->used++ * PAGE_SIZE;
+	if (!ptb) {
+		bus_set_region_4(vm->gt->vram, *off, 0, PAGE_SIZE / 4);
+		return (0);
+	}
+	for (i = 0; i < PAGE_SIZE / 8; i++)
+		pool_wr(vm, *off + i * 8, fill);
+	return (0);
+}
+
+int
+amd_gmc12_vm_init(struct amd_gart *gt, struct amd_vm12 *vm)
+{
+	memset(vm, 0, sizeof(*vm));
+	vm->gt = gt;
+	if (!gt->enabled || rman_get_size(gt->vram) < VM_POOL_VRAM_OFF +
+	    (bus_size_t)VM_POOL_PAGES * PAGE_SIZE)
+		return (ENXIO);
+	return (pool_alloc(vm, false, &vm->root_off));
+}
+
+/* Context base for this VM: the root's FB physical address, valid. */
+uint64_t
+amd_gmc12_vm_pd_addr(struct amd_vm12 *vm)
+{
+	return (pool_phys(vm, vm->root_off) | PTE_VALID);
+}
+
+/* Walk to the PTE slot of `va`, allocating tables when `alloc`. */
+static int
+vm_walk(struct amd_vm12 *vm, uint64_t va, bool alloc, bus_size_t *pte_off)
+{
+	bus_size_t off = vm->root_off, child;
+	uint64_t pde;
+	u_int lvl, shift, idx;
+	int err;
+
+	if ((va & PAGE_MASK) != 0 || va >= (1ull << VM_VA_BITS))
+		return (EINVAL);
+	for (lvl = 0; lvl < VM_LEVELS - 1; lvl++) {
+		shift = PAGE_SHIFT + 9 * (VM_LEVELS - 1 - lvl);
+		idx = (va >> shift) & 511;
+		pde = pool_rd(vm, off + idx * 8);
+		if ((pde & PTE_VALID) == 0) {
+			if (!alloc)
+				return (ENOENT);
+			err = pool_alloc(vm, lvl == VM_LEVELS - 2, &child);
+			if (err != 0)
+				return (err);
+			pde = pool_phys(vm, child) | PTE_VALID;
+			if (lvl == 1)		/* an entry in a PDB1 */
+				pde |= PDE_BFS(9);
+			pool_wr(vm, off + idx * 8, pde);
+		}
+		if (!pool_off_of(vm, pde, &off))
+			return (EFAULT);
+	}
+	*pte_off = off + ((va >> PAGE_SHIFT) & 511) * 8;
+	return (0);
+}
+
+/* Map one system page. Caller flushes (amd_gmc12_vm_flush) afterwards. */
+int
+amd_gmc12_vm_map(struct amd_vm12 *vm, uint64_t va, vm_paddr_t pa,
+    u_int prot)
+{
+	bus_size_t pte_off;
+	uint64_t pte;
+	int err;
+
+	if ((pa & PAGE_MASK) != 0 || (pa & ~PTE_ADDR_MASK) != 0)
+		return (EINVAL);
+	if ((err = vm_walk(vm, va, true, &pte_off)) != 0)
+		return (err);
+	pte = (uint64_t)pa | PTE_VALID | PTE_SYSTEM | PTE_SNOOPED;
+	if (prot & AMD_VM_READ)
+		pte |= PTE_READABLE;
+	if (prot & AMD_VM_WRITE)
+		pte |= PTE_WRITEABLE;
+	if (prot & AMD_VM_EXEC)
+		pte |= PTE_EXECUTABLE;
+	pool_wr(vm, pte_off, pte);		/* MTYPE NC (0) */
+	return (0);
+}
+
+/* Unmap one page: the invalid-PTE pattern. Caller flushes afterwards. */
+int
+amd_gmc12_vm_unmap(struct amd_vm12 *vm, uint64_t va)
+{
+	bus_size_t pte_off;
+	int err;
+
+	if ((err = vm_walk(vm, va, false, &pte_off)) != 0)
+		return (err);
+	pool_wr(vm, pte_off, PTE_EXECUTABLE | PTE_IS_PTE);
+	return (0);
+}
+
+/* HDP flush, then invalidate `vmid` on both hubs and wait for the acks. */
+int
+amd_gmc12_vm_flush(struct amd_gart *gt, u_int vmid)
+{
+	struct hub mm, gfx;
+	int err = 0;
+
+	if (vmid >= NUM_CTX)
+		return (EINVAL);
+	amd_hdp_flush(gt->sc);
+	if (hub_open(gt->sc, false, &mm) && hub_flush(&mm, vmid) != 0)
+		err = ETIMEDOUT;
+	if (hub_open(gt->sc, true, &gfx) && hub_flush(&gfx, vmid) != 0)
+		err = ETIMEDOUT;
+	return (err);
+}
+
+/*
+ * Point context `vmid` (1-7: the kernel's own; 8-15 belong to MES) at a
+ * page-table base on both hubs and flush it. pd_addr 0 unbinds: the
+ * context then faults every access.
+ */
+int
+amd_gmc12_vm_bind(struct amd_gart *gt, u_int vmid, uint64_t pd_addr)
+{
+	struct hub h;
+	int i;
+
+	if (vmid == 0 || vmid >= 8)
+		return (EINVAL);
+	for (i = 0; i < 2; i++) {
+		if (!hub_open(gt->sc, i == 1, &h))
+			return (ENOTSUP);
+		hw(&h, h.g->ctx0_pt_base_lo + 2 * vmid, (uint32_t)pd_addr);
+		hw(&h, h.g->ctx0_pt_base_hi + 2 * vmid,
+		    (uint32_t)(pd_addr >> 32));
+	}
+	return (amd_gmc12_vm_flush(gt, vmid));
+}
+
+/*
+ * GFXHUB's latched protection fault (status, page address), then clear
+ * it for the next one (gmc_v12_0_process_interrupt). Returns false when
+ * nothing is latched.
+ */
+bool
+amd_gmc12_fault_take(struct amd_gart *gt, uint32_t *status, uint64_t *addr)
+{
+	struct hub h;
+
+	if (!hub_open(gt->sc, true, &h))
+		return (false);
+	*status = hr(&h, h.g->fault_status);
+	*addr = ((uint64_t)(hr(&h, h.g->fault_addr_hi) & 0xf) << 32 |
+	    hr(&h, h.g->fault_addr_lo)) << PAGE_SHIFT;
+	hrmw(&h, h.g->fault_cntl, 0, FAULT_CNTL_CLEAR);
+	hrmw(&h, h.g->fault_cntl, FAULT_CNTL_CLEAR, 0);
+	return (*status != 0);
+}
+
+u_int
+amd_gmc12_fault_vmid(uint32_t status)
+{
+	return (FAULT_STATUS_VMID(status));
 }

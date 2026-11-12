@@ -840,6 +840,25 @@ int	amd_gmc12_gart_map(struct amd_gart *gt, uint64_t gart_addr,
 	    vm_paddr_t pa);
 int	amd_gmc12_flush(struct amd_gart *gt);
 void	amd_gmc12_fault_report(struct amd_gart *gt, const char *when);
+/* Stage 5b: per-client page tables (gmc12.c). */
+struct amd_vm12 {
+	struct amd_gart *gt;
+	bus_size_t root_off;		/* PDB2, in BAR0 */
+	u_int	used;			/* pool pages handed out */
+};
+#define AMD_VM_READ	0x1u
+#define AMD_VM_WRITE	0x2u
+#define AMD_VM_EXEC	0x4u
+int	amd_gmc12_vm_init(struct amd_gart *gt, struct amd_vm12 *vm);
+uint64_t amd_gmc12_vm_pd_addr(struct amd_vm12 *vm);
+int	amd_gmc12_vm_map(struct amd_vm12 *vm, uint64_t va, vm_paddr_t pa,
+	    u_int prot);
+int	amd_gmc12_vm_unmap(struct amd_vm12 *vm, uint64_t va);
+int	amd_gmc12_vm_flush(struct amd_gart *gt, u_int vmid);
+int	amd_gmc12_vm_bind(struct amd_gart *gt, u_int vmid, uint64_t pd_addr);
+bool	amd_gmc12_fault_take(struct amd_gart *gt, uint32_t *status,
+	    uint64_t *addr);
+u_int	amd_gmc12_fault_vmid(uint32_t status);
 int	amd_ih7_test(struct atrium_amd_softc *sc, struct amd_gart *gt,
 	    int (*during)(struct atrium_amd_softc *, struct amd_gart *));
 struct amd_ih7;
@@ -856,6 +875,7 @@ struct mes;
 int	amd_mes12_up(struct atrium_amd_softc *sc, struct amd_gart *gt,
 	    bool kq, struct mes **out);
 int	amd_mes12_selftest(struct mes *m);
+int	amd_mes12_vmtest(struct mes *m);	/* 5b */
 void	amd_mes12_down(struct mes *m);
 int	amd_smu_init(struct atrium_amd_softc *sc);	/* smu.c, silicon test */
 int	amd_si_attach(struct atrium_amd_softc *sc);	/* smu.c, stage 5a */
