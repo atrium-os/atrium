@@ -166,7 +166,7 @@ fn pci(dev: &str, vram_top: bool, save: Option<&str>) {
     }
     let top = (memsize as u64) << 20;
     let base = top - discovery::DISCOVERY_TMR_OFFSET_FROM_TOP;
-    let bin = m.read_vram(base, discovery::DISCOVERY_TMR_SIZE);
+    let bin = m.read_vram(base, discovery::DISCOVERY_TMR_SIZE).unwrap_or_else(|e| die(&e));
     if let Some(p) = save {
         std::fs::write(p, &bin).unwrap_or_else(|e| die(&format!("{p}: {e}")));
         println!("saved {} bytes to {p}", bin.len());

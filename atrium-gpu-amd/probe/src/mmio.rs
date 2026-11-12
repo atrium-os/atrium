@@ -34,7 +34,8 @@ impl Device {
         }
         #[cfg(target_os = "freebsd")]
         {
-            // `dev` is pciconf's selector, e.g. pci0:3:0:0.
+            // pciconf only resolves its own selector form, pci<dom>:<bus>:<slot>:<func>.
+            let dev = &freebsd_selector(dev);
             let out = std::process::Command::new("pciconf").args(["-lbv", dev]).output()
                 .map_err(|e| format!("pciconf: {e}"))?;
             let text = String::from_utf8_lossy(&out.stdout).into_owned();
@@ -51,13 +52,20 @@ impl Device {
                 }
             }
             let (b, s) = base.zip(size).ok_or("no BAR5 ([24]) in pciconf -lbv output")?;
-            let bound = !text.lines().next().unwrap_or("").starts_with("none");
-            Self::map_file("/dev/mem", b, Some(s), text, !bound)
+            // vgapci is FreeBSD's generic PCI display driver: it never touches
+            // an AMD part's registers. The device counts as owned only when a
+            // real GPU driver (drm-kmod amdgpu or ours) is loaded.
+            let first = text.lines().next().unwrap_or("");
+            let gpu_kmod = ["amdgpu", "atrium_gpu_amd"].iter().any(|m| {
+                std::process::Command::new("kldstat").args(["-q", "-n", m]).status().map(|s| s.success()).unwrap_or(false)
+            });
+            let unbound = first.starts_with("none") || (first.starts_with("vgapci") && !gpu_kmod);
+            Self::map_file("/dev/mem", b, Some(s), text, unbound)
         }
     }
 
     fn map_file(path: &str, off: u64, len: Option<usize>, desc: String, unbound: bool) -> Result<Device, String> {
-        // Writable only when no driver owns the device; even then the probe
+        // Writable only when no GPU driver owns the device; even then the probe
         // writes nothing but the MM_INDEX window, and only with --vram-top.
         let f = OpenOptions::new().read(true).write(unbound).open(path).map_err(|e| format!("{path}: {e}"))?;
         let len = match len { Some(l) => l, None => f.metadata().map_err(|e| e.to_string())?.len() as usize };
@@ -72,7 +80,7 @@ impl Device {
     }
 
     pub fn describe(&self) -> String {
-        format!("{}\nBAR5 mapped {} bytes{}", self.desc, self.len, if self.writable { "" } else { " (read-only: a driver owns the device)" })
+        format!("{}\nBAR5 mapped {} bytes{}", self.desc, self.len, if self.writable { "" } else { " (read-only: a GPU driver owns the device)" })
     }
 
     pub fn read32(&self, off: usize) -> u32 {
@@ -88,7 +96,12 @@ impl Device {
     }
 
     /// Read VRAM through the MM_INDEX/MM_DATA window (dword at a time).
-    pub fn read_vram(&mut self, addr: u64, n: usize) -> Vec<u8> {
+    /// Refused, before any write, when a GPU driver owns the device.
+    pub fn read_vram(&mut self, addr: u64, n: usize) -> Result<Vec<u8>, String> {
+        if !self.writable {
+            return Err("a GPU driver owns the device and the MM_INDEX window is shared with it; \
+                        unload it (Linux: unbind amdgpu) and run again".into());
+        }
         let mut out = Vec::with_capacity(n);
         let mut a = addr & !3;
         while out.len() < n {
@@ -98,7 +111,39 @@ impl Device {
             a += 4;
         }
         out.truncate(n);
-        out
+        Ok(out)
+    }
+}
+
+/// Normalise a PCI address to pciconf's selector: "3:0:0", "0:3:0:0",
+/// "03:00.0", "0000:03:00.0" and "pci0:3:0:0" all give "pci0:3:0:0".
+/// Anything else (e.g. a device name like vgapci0) passes through.
+#[cfg_attr(not(target_os = "freebsd"), allow(dead_code))]
+pub fn freebsd_selector(dev: &str) -> String {
+    let t = dev.trim_start_matches("pci");
+    let parts: Vec<&str> = t.split([':', '.']).collect();
+    let nums: Option<Vec<u32>> = parts.iter().map(|p| {
+        if p.is_empty() || p.len() > 4 { None }
+        else if dev.contains('.') { u32::from_str_radix(p, 16).ok() } // Linux form is hex
+        else { p.parse().ok() }
+    }).collect();
+    match nums.as_deref() {
+        Some([b, s, f]) => format!("pci0:{b}:{s}:{f}"),
+        Some([d, b, s, f]) => format!("pci{d}:{b}:{s}:{f}"),
+        _ => dev.to_string(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::freebsd_selector as sel;
+    #[test]
+    fn selectors() {
+        for s in ["3:0:0", "0:3:0:0", "pci0:3:0:0", "03:00.0", "0000:03:00.0"] {
+            assert_eq!(sel(s), "pci0:3:0:0", "{s}");
+        }
+        assert_eq!(sel("0000:1a:00.1"), "pci0:26:0:1");
+        assert_eq!(sel("vgapci0"), "vgapci0");
     }
 }
 
