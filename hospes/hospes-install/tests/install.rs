@@ -123,3 +123,24 @@ fn manifest_versions() {
     assert_eq!(manifest_version(br#"{"version":"../x"}"#), None);
     assert!(version_cmp("4.10.3112.0", "4.10.999.9").is_gt());
 }
+
+/// H5 fuzzer: a GNU name-table index in an `ar` header made the `ar` crate panic. Our own
+/// member parser refuses it (and other shapes dpkg never writes) with an error.
+#[test]
+fn hostile_ar_headers_are_refused() {
+    let crash = include_bytes!("data/fuzz-ar-gnu-index.bin");
+    assert!(hospes_install::extract_cdm(&crash[1..]).is_err());
+    let member = |name: &str, size: &str, body: &[u8]| {
+        let mut h = format!("{name:<16}{:<12}{:<6}{:<6}{:<8}{size:<10}`\n", 0, 0, 0, 100644).into_bytes();
+        h.extend_from_slice(body);
+        h
+    };
+    let deb = |m: Vec<u8>| [b"!<arch>\n".to_vec(), m].concat();
+    let ok = deb([member("debian-binary", "4", b"2.0\n"), member("data.tar.xz/", "3", b"abc\0")].concat());
+    let m = hospes_install::ar_members(&ok).unwrap();
+    assert_eq!(m, vec![("debian-binary", &b"2.0\n"[..]), ("data.tar.xz", &b"abc"[..])]);
+    for bad in [member("/1519378596833500", "4", b"2.0\n"), member("#1/20", "4", b"2.0\n"), member("x", "99", b"2.0\n"), member("x", "-1", b"2.0\n")] {
+        assert!(hospes_install::ar_members(&deb(bad)).is_err());
+    }
+    assert!(hospes_install::ar_members(b"!<arch>\nshort").is_err());
+}

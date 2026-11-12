@@ -10,6 +10,9 @@ hospes-elf = { path = "../hospes-elf" }
 hospes-glibc = { path = "../hospes-glibc" }
 pgp = "0.21"
 sha2 = "0.10"
-ar = "0.9"
 tar = { version = "0.4", default-features = false }
 lzma-rs = "0.3"
+
+[dev-dependencies]
+# Writes the test packages (the installer reads .deb files with its own parser).
+ar = "0.9"

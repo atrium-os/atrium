@@ -130,22 +130,63 @@ pub struct Extracted {
 /// Largest member we take out of the package (the CDM is about 20 MiB).
 const MEMBER_MAX: u64 = 64 << 20;
 
-pub fn extract_cdm(deb: &[u8]) -> Result<Extracted, Error> {
-    let mut ar = ar::Archive::new(deb);
-    let mut data = None;
-    while let Some(e) = ar.next_entry() {
-        let mut e = e.map_err(|e| Error::Package(format!("not a .deb: {e}")))?;
-        let id = String::from_utf8_lossy(e.header().identifier()).to_string();
-        if id == "data.tar.xz" {
-            let mut v = Vec::new();
-            e.read_to_end(&mut v).map_err(|e| Error::Package(e.to_string()))?;
-            data = Some(v);
-            break;
+/// Largest `data.tar` we unpack in memory (Chrome's is about 400 MiB).
+const DATA_TAR_MAX: usize = 1 << 30;
+
+/// A `Write` into memory that refuses to grow past its limit (a hostile `.xz` cannot make
+/// the installer allocate without bound).
+struct Capped(Vec<u8>, usize);
+
+impl std::io::Write for Capped {
+    fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
+        if self.0.len() + b.len() > self.1 {
+            return Err(std::io::Error::other("data.tar larger than the limit"));
         }
+        self.0.extend_from_slice(b);
+        Ok(b.len())
     }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+/// The members of a `.deb` (a common `ar` archive): (name, contents). Only what dpkg
+/// writes: short names, optionally ending in `/`; anything else is refused. Our own parser,
+/// since the `ar` crate panics on a hostile GNU name-table index (found by the H5 fuzzer).
+pub fn ar_members(deb: &[u8]) -> Result<Vec<(&str, &[u8])>, Error> {
+    let bad = |m: &str| Error::Package(format!("not a .deb: {m}"));
+    let mut rest = deb.strip_prefix(b"!<arch>\n").ok_or_else(|| bad("no ar magic"))?;
+    let mut out = Vec::new();
+    while !rest.is_empty() {
+        if rest.len() < 60 {
+            return Err(bad("short member header"));
+        }
+        let (h, body) = rest.split_at(60);
+        if &h[58..60] != b"`\n" {
+            return Err(bad("bad member header"));
+        }
+        let name = std::str::from_utf8(&h[..16]).map_err(|_| bad("member name not text"))?.trim_end_matches(' ');
+        let name = name.strip_suffix('/').unwrap_or(name);
+        if name.is_empty() || name.contains('/') || name.starts_with('#') {
+            return Err(bad("member name"));
+        }
+        let size: usize = std::str::from_utf8(&h[48..58]).ok().and_then(|t| t.trim_end_matches(' ').parse().ok()).ok_or_else(|| bad("member size"))?;
+        if size > body.len() {
+            return Err(bad("member runs past the end"));
+        }
+        out.push((name, &body[..size]));
+        // Members start on even offsets.
+        rest = &body[(size + (size & 1)).min(body.len())..];
+    }
+    Ok(out)
+}
+
+pub fn extract_cdm(deb: &[u8]) -> Result<Extracted, Error> {
+    let data = ar_members(deb)?.into_iter().find(|(n, _)| *n == "data.tar.xz").map(|(_, d)| d);
     let data = data.ok_or_else(|| Error::Package("no data.tar.xz".into()))?;
-    let mut tar_bytes = Vec::new();
+    let mut tar_bytes = Capped(Vec::new(), DATA_TAR_MAX);
     lzma_rs::xz_decompress(&mut &data[..], &mut tar_bytes).map_err(|e| Error::Package(format!("data.tar.xz: {e:?}")))?;
+    let tar_bytes = tar_bytes.0;
     let (_, plat) = platform();
     let want_lib = format!("opt/google/chrome/WidevineCdm/_platform_specific/{plat}/libwidevinecdm.so");
     let want_manifest = "opt/google/chrome/WidevineCdm/manifest.json";
