@@ -18,7 +18,8 @@
  * Sequence (smu_hw_init / smu_smc_hw_setup for 14.0.2/3, no SCPM writes):
  * TestMessage, GetSmuVersion, GetDriverIfVersion, SetDriverDramAddr (a VRAM
  * buffer for later table transfers), RunDcBtc, SetAllowedFeaturesMask (all,
- * as smu_v14_0_2_init_allowed_features), EnableAllSmuFeatures; then, for
+ * as smu_v14_0_2_init_allowed_features; refused under SCPM, then skipped as
+ * amdgpu does), EnableAllSmuFeatures; then, for
  * bring-up, DisallowGfxOff so GC registers stay readable, and report the RLC.
  */
 #include "atrium_gpu_amd.h"
@@ -31,6 +32,7 @@
 #define SMU14_C2PMSG_82		0x92	/* argument / output */
 #define SMU14_C2PMSG_90		0x9a	/* response */
 #define SMU_RESP_OK		0x01
+#define SMU_RESP_BAD_PREREQ	0xfd
 #define SMU_WAIT_US		2000000
 
 /* smu_v14_0_2_ppsmc.h */
@@ -187,10 +189,31 @@ amd_smu_init(struct atrium_amd_softc *sc)
 	if (MSG(SetDriverDramAddrHigh, (uint32_t)(mc >> 32), NULL) !=
 	    SMU_RESP_OK ||
 	    MSG(SetDriverDramAddrLow, (uint32_t)mc, NULL) != SMU_RESP_OK ||
-	    MSG(RunDcBtc, 0, NULL) != SMU_RESP_OK ||
-	    MSG(SetAllowedFeaturesMaskHigh, 0xffffffff, NULL) != SMU_RESP_OK ||
-	    MSG(SetAllowedFeaturesMaskLow, 0xffffffff, NULL) != SMU_RESP_OK ||
-	    MSG(EnableAllSmuFeatures, 0, NULL) != SMU_RESP_OK) {
+	    MSG(RunDcBtc, 0, NULL) != SMU_RESP_OK) {
+		err = EIO;
+		goto out;
+	}
+	lo = hi = 0;
+	(void)MSG(GetRunningSmuFeaturesLow, 0, &lo);
+	(void)MSG(GetRunningSmuFeaturesHigh, 0, &hi);
+	device_printf(sc->dev, "smu: features before enable %#010x%08x\n", hi,
+	    lo);
+	/*
+	 * With SCPM the PSP owns the feature mask and the PMFW refuses the
+	 * driver's (0xFD, bad prerequisite); amdgpu skips it then
+	 * (adev->scpm_enabled). Carry on to EnableAllSmuFeatures either way.
+	 */
+	v = MSG(SetAllowedFeaturesMaskHigh, 0xffffffff, NULL);
+	if (v == SMU_RESP_OK)
+		v = MSG(SetAllowedFeaturesMaskLow, 0xffffffff, NULL);
+	if (v == SMU_RESP_BAD_PREREQ)
+		device_printf(sc->dev, "smu: allowed mask refused: SCPM, the "
+		    "PSP owns it\n");
+	else if (v != SMU_RESP_OK) {
+		err = EIO;
+		goto out;
+	}
+	if (MSG(EnableAllSmuFeatures, 0, NULL) != SMU_RESP_OK) {
 		err = EIO;
 		goto out;
 	}

@@ -195,3 +195,8 @@ reads non-zero, all-zero GC registers mean "off", not "idle".
   never reported bootload complete. The PSP firmware reservation is 50 MiB at VRAM
   0x7f3e00000 (top), plus 4 MiB at 0x7d6c00000; the VRAM allocator must keep clear of both.
   A read-only status probe then showed GC unpowered (§4.3).
+- **2026-11-12, stage 3d first run.** `1e6fd692`: the SMU answers. TestMessage, GetSmuVersion
+  (0x685000), GetDriverIfVersion (0x33), SetDriverDramAddr and RunDcBtc all returned OK.
+  SetAllowedFeaturesMaskHigh returned 0xFD (bad prerequisite). Read that as SCPM: the PSP owns
+  the feature mask, and amdgpu skips it when `scpm_enabled`. The next build carries on to
+  EnableAllSmuFeatures. GC is still unpowered.
