@@ -1,0 +1,12 @@
+[package]
+name = "atrium-gpu-amd-rs-host-tests"
+version = "0.1.0"
+edition = "2021"
+license = "BSD-2-Clause"
+publish = false
+description = "Host tests for the pure (no kernel KPI) modules of atrium-gpu-amd's Rust part"
+
+[lib]
+path = "src/lib.rs"
+
+[workspace]
