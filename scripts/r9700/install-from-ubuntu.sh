@@ -18,7 +18,10 @@ die() { echo "FAILED: $*" >&2; exit 1; }
 [ "$(id -u)" = 0 ] || die "run as root"
 
 rootsrc=$(findmnt -no SOURCE /)
-DISK=/dev/$(lsblk -no PKNAME "$rootsrc")
+# Root may be on LVM (Hostkey's installer uses it): walk the stack down to
+# the disk instead of asking for the parent kernel name.
+DISK=$(lsblk -lnspo NAME,TYPE "$rootsrc" | awk '$2=="disk" {print $1; exit}')
+[ -b "$DISK" ] || die "cannot find the disk under $rootsrc"
 ESP_MNT=/boot/efi
 ESP_SRC=$(findmnt -no SOURCE "$ESP_MNT") || die "no ESP mounted at $ESP_MNT"
 ESP_PART=$(cat /sys/class/block/$(basename "$ESP_SRC")/partition)
