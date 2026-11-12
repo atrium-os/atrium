@@ -36,6 +36,17 @@ pub struct CdmOptions {
     pub store: Option<PathBuf>,
     pub licences: Licences,
     pub mem_mib: u64,
+    /// The EME key system the CDM is created for (`org.w3.clearkey`, `com.widevine.alpha`).
+    pub key_system: String,
+}
+
+/// The key system a CDM library is for, by its file name: Widevine's is `libwidevinecdm.so`.
+pub fn key_system_for(library: &std::path::Path) -> &'static str {
+    if library.file_name().is_some_and(|n| n.to_string_lossy().contains("widevine")) {
+        "com.widevine.alpha"
+    } else {
+        "org.w3.clearkey"
+    }
 }
 
 /// How licence requests are answered.
@@ -108,7 +119,8 @@ impl CdmOptions {
     /// `ATRIUM_PLAYER_HOSPES_CDM` (default: `hospes-cdm` next to this executable),
     /// `ATRIUM_PLAYER_CLEARKEY` (`KID:KEY[,KID:KEY...]` in hex) or `ATRIUM_PLAYER_LICENCE_URL`
     /// (a licence server, which wins), and optionally
-    /// `ATRIUM_PLAYER_CDM_STORE` (a directory).
+    /// `ATRIUM_PLAYER_CDM_STORE` (a directory) and `ATRIUM_PLAYER_KEY_SYSTEM` (default: by the
+    /// library's name, [`key_system_for`]).
     pub fn from_env() -> Option<CdmOptions> {
         let library: PathBuf = std::env::var_os("ATRIUM_PLAYER_CDM")?.into();
         if !library.is_file() {
@@ -122,7 +134,8 @@ impl CdmOptions {
             .map(PathBuf::from)
             .unwrap_or_else(|| std::env::current_exe().unwrap_or_default().with_file_name("hospes-cdm"));
         let store = std::env::var_os("ATRIUM_PLAYER_CDM_STORE").map(PathBuf::from);
-        Some(CdmOptions { host, library, store, licences, mem_mib: 512 })
+        let key_system = std::env::var("ATRIUM_PLAYER_KEY_SYSTEM").unwrap_or_else(|_| key_system_for(&library).into());
+        Some(CdmOptions { host, library, store, licences, mem_mib: 512, key_system })
     }
 }
 
@@ -228,6 +241,12 @@ pub struct CdmProc {
     initialized: bool,
     /// Init data waiting for `Initialized`.
     queued: Vec<(u8, Vec<u8>)>,
+    /// Key-id init data (WebM, `keyids`) held while another session's licence is under
+    /// way: that licence often carries this key too (Shaka's angel-one: one Widevine PSSH for
+    /// every track, and the proxy refuses a request made from a bare key id).
+    deferred: Vec<(u8, Vec<u8>)>,
+    /// Key ids the CDM has said are usable.
+    usable: Vec<Vec<u8>>,
     promise: u32,
     sessions: usize,
     /// Promises we are waiting on (create, update).
@@ -252,6 +271,7 @@ impl CdmProc {
             sys::pass_fd(&mut c, fd);
         }
         c.arg("--mem").arg(o.mem_mib.to_string());
+        c.arg("--key-system").arg(&o.key_system);
         c.stdin(std::process::Stdio::null());
         let child = c.spawn()?;
         drop((ctrl_c, data_c, lib, store));
@@ -271,7 +291,7 @@ impl CdmProc {
                 }
             }
         })?;
-        let mut p = CdmProc { child, ctrl, rx, licences: o.licences.clone(), answers: mpsc::channel(), initialized: false, queued: Vec::new(), promise: 0, sessions: 0, outstanding: 0, failed: false };
+        let mut p = CdmProc { child, ctrl, rx, licences: o.licences.clone(), answers: mpsc::channel(), initialized: false, queued: Vec::new(), deferred: Vec::new(), usable: Vec::new(), promise: 0, sessions: 0, outstanding: 0, failed: false };
         p.send(Msg::Init { allow_persistent: false, link_mask: 0 });
         Ok((p, data_w))
     }
@@ -294,6 +314,13 @@ impl CdmProc {
             return;
         }
         if self.sessions >= SESSIONS_MAX {
+            return;
+        }
+        // cdm::InitDataType: kCenc 0, kKeyIds 1, kWebM 2.
+        if kind != 0 && self.sessions > 0 {
+            if !self.deferred.iter().any(|d| d.1 == data) {
+                self.deferred.push((kind, data));
+            }
             return;
         }
         self.sessions += 1;
@@ -362,7 +389,12 @@ impl CdmProc {
                     out.push(CdmEvent::Failed("the CDM asked for individualisation, which is not supported yet".into()));
                 }
                 Msg::SessionMessage { .. } => {}
-                Msg::KeysChange { has_new_usable, .. } => {
+                Msg::KeysChange { has_new_usable, keys, .. } => {
+                    for k in keys.iter().filter(|k| k.status == 0 /* kUsable */) {
+                        if !self.usable.contains(&k.key_id) {
+                            self.usable.push(k.key_id.clone());
+                        }
+                    }
                     if has_new_usable {
                         out.push(CdmEvent::KeysUsable);
                     }
@@ -384,6 +416,21 @@ impl CdmProc {
                     self.send(Msg::UpdateSession { promise, id, response });
                 }
                 Err(why) => out.push(CdmEvent::Failed(why)),
+            }
+        }
+        // Held key-id init data: dropped once its key is usable, sent once nothing is under way.
+        if !self.deferred.is_empty() {
+            let usable = &self.usable;
+            self.deferred.retain(|(k, d)| !(*k == 2 && usable.contains(d)));
+            if self.outstanding == 0 {
+                for (k, d) in std::mem::take(&mut self.deferred) {
+                    if self.sessions < SESSIONS_MAX {
+                        self.sessions += 1;
+                        self.outstanding += 1;
+                        let promise = self.next_promise();
+                        self.send(Msg::CreateSession { promise, session_type: 0, init_type: k as u32, init: d });
+                    }
+                }
             }
         }
         if self.failed && !out.contains(&CdmEvent::Lost) {

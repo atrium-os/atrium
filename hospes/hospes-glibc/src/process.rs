@@ -343,21 +343,100 @@ pub unsafe extern "C" fn pthread_sigmask(_how: i32, _set: *const u8, old: *mut u
 
 #[cfg(target_arch = "x86_64")]
 mod nr {
+    pub const FUTEX: i64 = 202;
     pub const GETTID: i64 = 186;
     pub const GETRANDOM: i64 = 318;
 }
 #[cfg(target_arch = "aarch64")]
 mod nr {
+    pub const FUTEX: i64 = 98;
     pub const GETTID: i64 = 178;
     pub const GETRANDOM: i64 = 278;
 }
 
 static SYSCALL_LOGGED: AtomicU64 = AtomicU64::new(0);
 
-/// `syscall(2)` through glibc (H0: `gettid` ×15, `getrandom` ×10). Others are `ENOSYS`,
-/// logged once per number.
+/// Linux `futex(2)` for the operations Widevine's locks use (H4: PartitionAlloc's lock
+/// waits and wakes through `syscall`): `FUTEX_WAIT` with an optional relative timeout,
+/// `FUTEX_WAKE`, and their `_BITSET` forms with a full mask. The private flag only narrows
+/// the key, so it is ignored. Wakes report 0 woken; callers only use the count as a hint.
+unsafe fn futex(addr: *const u32, op: i32, val: u32, timeout: *const [i64; 2], mask: u32) -> i64 {
+    const WAIT: i32 = 0;
+    const WAKE: i32 = 1;
+    const WAIT_BITSET: i32 = 9;
+    const WAKE_BITSET: i32 = 10;
+    const CLOCK_REALTIME: i32 = 256;
+    let cmd = op & 127;
+    if addr.is_null() || addr as usize % 4 != 0 {
+        set_errno(abi::EFAULT);
+        return -1;
+    }
+    let full = mask == u32::MAX;
+    match cmd {
+        WAKE => {
+            sys::futex_wake(addr, val);
+            0
+        }
+        WAKE_BITSET if full => {
+            sys::futex_wake(addr, val);
+            0
+        }
+        WAIT | WAIT_BITSET if cmd == WAIT || full => {
+            if core::ptr::read_volatile(addr) != val {
+                set_errno(abi::EAGAIN);
+                return -1;
+            }
+            if timeout.is_null() {
+                sys::futex_wait(addr, val);
+                return 0;
+            }
+            let (ts_s, ts_n) = ((*timeout)[0], (*timeout)[1]);
+            // To an absolute CLOCK_REALTIME deadline, which is what the runtime waits on.
+            let (rs, rn) = sys::realtime();
+            let (ds, dn) = if cmd == WAIT {
+                (ts_s, ts_n)
+            } else if op & CLOCK_REALTIME != 0 {
+                (ts_s - rs, ts_n - rn)
+            } else {
+                let now = sys::monotonic_ns() as i64;
+                let until = ts_s.saturating_mul(1_000_000_000).saturating_add(ts_n);
+                let d = until.saturating_sub(now).max(0);
+                (d / 1_000_000_000, d % 1_000_000_000)
+            };
+            let mut ns = rn + dn;
+            let mut s = rs + ds + ns.div_euclid(1_000_000_000);
+            ns = ns.rem_euclid(1_000_000_000);
+            if s < rs {
+                s = rs;
+                ns = rn;
+            }
+            if sys::futex_wait_until_realtime(addr, val, s, ns) {
+                set_errno(abi::ETIMEDOUT);
+                return -1;
+            }
+            0
+        }
+        _ => {
+            hospes_rt::hlog!("hospes: futex op {} through glibc: not supported (ENOSYS)", op);
+            set_errno(abi::ENOSYS);
+            -1
+        }
+    }
+}
+
+/// `syscall(2)` through glibc (H0: `gettid` ×15, `getrandom` ×10; H4: `futex`). Others are
+/// `ENOSYS`, logged once per number.
 pub unsafe extern "C" fn syscall(n: i64, mut args: ...) -> i64 {
     match n {
+        nr::FUTEX => {
+            let addr = args.next_arg::<usize>() as *const u32;
+            let op = args.next_arg::<i64>() as i32;
+            let val = args.next_arg::<i64>() as u32;
+            let timeout = args.next_arg::<usize>() as *const [i64; 2];
+            let _uaddr2 = args.next_arg::<usize>();
+            let mask = args.next_arg::<i64>() as u32;
+            futex(addr, op, val, timeout, mask)
+        }
         nr::GETTID => sys::gettid() as i32 as i64,
         nr::GETRANDOM => {
             let p: *mut u8 = args.next_arg::<usize>() as *mut u8;

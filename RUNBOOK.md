@@ -5205,6 +5205,13 @@ make.py ... installkernel DESTDIR=$HOME/stage -DNO_ROOT KODIR=/boot/kernel.atriu
   fork kernel as `kernel.atrium` (one-shot nextboot) and runs the trap tests. Build the amd64
   kernel itself with LLVM 19 too: `installkernel` ships its modules in `kernel.atrium`, and with
   clang 18 `xdr.ko` fails to load, so `zfs.ko` does and the guest panics at mountroot.
+- Hospes H4: `ARCH=amd64 sh scripts/hospes-h4-vm.sh` downloads Shaka's angel-one media and
+  Google's Chrome apt files into `$VMDIR` (never the tree), starts a host-side licence relay
+  for `cwip-shaka-proxy.appspot.com` at the fixture address 1.2.3.100 (the guest has no route
+  out), (re)boots the VM with that network and the fork kernel, installs the CDM with
+  `hospes-install` and plays the stream as `nobody`. `INSTALL_ONLY=1` stops before the CDM
+  runs; `CHROME_DEB=` reuses a matching .deb. The arm64 libc++abi for the glibc.so fixture
+  comes from Ubuntu ports' `libc++abi-18-dev`, unpacked into `~/.cache/hospes-cxxabi-arm64`.
 - Build the Tessera EFI loader on the host via buildenv (~2 min), not in the TCG guest (30+ min).
 - Fork userland for amd64: `scripts/cross-build-world.sh` (~62 min). Stop the VM during it (the guest got OOM-killed).
 - Never run two make.py builds on one objdir.

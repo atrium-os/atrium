@@ -35,6 +35,28 @@ struct Trk {
     trex: Trex,
     /// Next decode time for fragments without `tfdt`, in timescale units.
     next_dts: u64,
+    /// Sample descriptions (bit `i` for index `i + 1`) that are not encrypted: a fragment
+    /// that uses one is clear (a "clear lead", as Shaka Packager writes it).
+    clear_sdi: u64,
+}
+
+/// [`Trk::clear_sdi`] from a `trak` body: the `stsd` entries that are not `encv`/`enca`, if
+/// any entry is.
+fn clear_entries(trak: &[u8]) -> u64 {
+    fn child<'a>(b: &'a [u8], want: &FourCc) -> Option<&'a [u8]> {
+        boxes(b).flatten().find(|(t, _)| t == want).map(|(_, v)| v)
+    }
+    let Some(stsd) = child(trak, b"mdia").and_then(|b| child(b, b"minf")).and_then(|b| child(b, b"stbl")).and_then(|b| child(b, b"stsd")) else { return 0 };
+    let Some(entries) = stsd.get(8..) else { return 0 };
+    let (mut clear, mut any_enc) = (0u64, false);
+    for (i, (t, _)) in boxes(entries).flatten().enumerate().take(64) {
+        if matches!(&t, b"encv" | b"enca") {
+            any_enc = true;
+        } else {
+            clear |= 1 << i;
+        }
+    }
+    if any_enc { clear } else { 0 }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -240,7 +262,7 @@ impl Parser {
                         return Err(Error::Malformed("duplicate track id"));
                     }
                     tracks.push(info);
-                    trks.push(Trk { timescale: ts, shift, trex: Trex::default(), next_dts: 0 });
+                    trks.push(Trk { timescale: ts, shift, trex: Trex::default(), next_dts: 0, clear_sdi: clear_entries(v) });
                     index.extend(samples);
                 }
                 _ => {}
@@ -781,8 +803,9 @@ impl Parser {
                     _ => {}
                 }
             }
-            if let Some((ti, _, base)) = tf {
-                if let Some(p) = self.tracks[ti as usize].protection.clone() {
+            if let Some((ti, d, base)) = tf {
+                let clear = d.sdi >= 1 && d.sdi <= 64 && self.trks[ti as usize].clear_sdi & (1 << (d.sdi - 1)) != 0;
+                if let (Some(p), false) = (self.tracks[ti as usize].protection.clone(), clear) {
                     // In a fragment, saio offsets count from the track fragment's base.
                     let aux = aux_info(Aux { senc, saiz, saio, outer: (b, b_abs), saio_base: base }, &p, &new[first..])?;
                     for (s, c) in new[first..].iter().zip(aux) {
@@ -1226,5 +1249,27 @@ mod tests {
         assert_eq!(h[9], 2);
         assert_eq!(u16::from_le_bytes([h[10], h[11]]), 312);
         assert_eq!(u32::from_le_bytes([h[12], h[13], h[14], h[15]]), 48000);
+    }
+
+    fn bx(t: &[u8; 4], body: &[u8]) -> Vec<u8> {
+        let mut v = ((body.len() + 8) as u32).to_be_bytes().to_vec();
+        v.extend_from_slice(t);
+        v.extend_from_slice(body);
+        v
+    }
+
+    /// A clear lead: `stsd` holds `encv` (1) then `avc1` (2); fragments using 2 are clear.
+    #[test]
+    fn clear_sample_entries() {
+        let mut stsd = vec![0, 0, 0, 0, 0, 0, 0, 2];
+        stsd.extend(bx(b"encv", &[0; 8]));
+        stsd.extend(bx(b"avc1", &[0; 8]));
+        let trak = bx(b"mdia", &bx(b"minf", &bx(b"stbl", &bx(b"stsd", &stsd))));
+        assert_eq!(clear_entries(&trak), 0b10);
+        // No encrypted entry: nothing to tell apart.
+        let mut plain = vec![0, 0, 0, 0, 0, 0, 0, 1];
+        plain.extend(bx(b"avc1", &[0; 8]));
+        let trak = bx(b"mdia", &bx(b"minf", &bx(b"stbl", &bx(b"stsd", &plain))));
+        assert_eq!(clear_entries(&trak), 0);
     }
 }

@@ -500,7 +500,7 @@ fn cdm_opts(keys: &str) -> Option<Options> {
     let arch = if cfg!(target_arch = "aarch64") { "aarch64" } else { "x86_64" };
     let library = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(format!("../../hospes/test-cdm/bin/{arch}-clearkey.so"));
     let licences = atrium_player::cdm::Licences::ClearKey(atrium_player::cdm::parse_keys(keys).unwrap());
-    Some(Options { cdm: Some(atrium_player::cdm::CdmOptions { host, library, store: None, licences, mem_mib: 256 }), ..opts() })
+    Some(Options { cdm: Some(atrium_player::cdm::CdmOptions { host, library, store: None, licences, mem_mib: 256, key_system: "org.w3.clearkey".into() }), ..opts() })
 }
 
 /// (encrypted clip, its clear source).
