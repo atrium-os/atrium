@@ -123,6 +123,10 @@ pub enum Intent {
     StatusSlide { app_id: String, index: u32, value: f32 },
     /// The user worked control `id` of app `app_id`'s status panel.
     StatusInput { app_id: String, id: u32, value: StatusValue },
+    /// The user opened app `app_id`'s own panel (`StatusContent::Drawn`):
+    /// the bar got `token` from frescod (`OP_POPUP_GRANT`), and the app
+    /// claims the pop-up with it (forum-status-items.md §4).
+    StatusOpenPanel { app_id: String, token: [u8; 16] },
 }
 
 // ── status items (docs/spec/forum-status-items.md) ──────────────────────────
@@ -195,13 +199,18 @@ pub const STATUS_PANEL_MIN_W: u16 = 200;
 pub const STATUS_PANEL_MAX_W: u16 = 400;
 /// The tallest panel, px; nodes past it are not drawn.
 pub const STATUS_PANEL_MAX_H: u16 = 560;
+/// The shortest panel an app draws itself, px.
+pub const STATUS_DRAWN_MIN_H: u16 = 40;
 
-/// What hangs from a status item's icon: a menu, or a panel the app
-/// describes and the bar lays out and draws (forum-status-items.md §2-3).
+/// What hangs from a status item's icon: a menu, a panel the app
+/// describes and the bar lays out and draws (forum-status-items.md §2-3),
+/// or a panel of `width` x `height` the app draws itself in a pop-up the
+/// bar grants it (§4; frescod labels it with the app's name).
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub enum StatusContent {
     Menu(Vec<StatusEntry>),
     Panel(StatusPanel),
+    Drawn { width: u16, height: u16 },
 }
 
 /// A described panel: its width (px, `STATUS_PANEL_MIN_W..=MAX_W`) and its
@@ -362,6 +371,10 @@ impl StatusContent {
         match self {
             StatusContent::Menu(m) => StatusContent::Menu(m.into_iter().take(STATUS_MAX_ENTRIES).map(StatusEntry::bounded).collect()),
             StatusContent::Panel(p) => StatusContent::Panel(p.bounded()),
+            StatusContent::Drawn { width, height } => StatusContent::Drawn {
+                width: width.clamp(STATUS_PANEL_MIN_W, STATUS_PANEL_MAX_W),
+                height: height.clamp(STATUS_DRAWN_MIN_H, STATUS_PANEL_MAX_H),
+            },
         }
     }
 }
@@ -387,6 +400,10 @@ pub enum FromStatus {
     Slid { index: u32, value: f32 },
     /// Panel control `id` was worked.
     Changed { id: u32, value: StatusValue },
+    /// The user opened the app's own panel: claim the pop-up with `token`
+    /// (`OP_POPUP_CLAIM`, at most `width` x `height`) within
+    /// `fresco_protocol::POPUP_GRANT_TTL_MS`, and draw in it.
+    OpenPanel { token: [u8; 16], width: u16, height: u16 },
     /// Refused (no `status-item`, or unregistered); the socket closes.
     Denied { message: String },
 }

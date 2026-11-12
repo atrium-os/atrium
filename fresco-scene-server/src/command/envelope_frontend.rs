@@ -701,6 +701,8 @@ impl EnvelopeFrontend {
             control::OP_WINDOW_PRESENT_DAMAGE => self.handle_window_present_damage(msg),
             control::OP_POPUP_CREATE         => self.handle_popup_create(msg),
             control::OP_POPUP_PLACE          => self.handle_popup_place(msg),
+            control::OP_POPUP_GRANT          => self.handle_popup_grant(msg),
+            control::OP_POPUP_CLAIM          => self.handle_popup_claim(msg),
 
             // ── Video layers (fresco-video.md) ──
             control::OP_VIDEO_LAYER_CREATE   => self.handle_video_layer_create(msg),
@@ -1439,6 +1441,40 @@ impl EnvelopeFrontend {
             .map_err(popup_refused)?;
         self.update_window_scales();
         Ok(vec![Outbound { op: control::OP_POPUP_PLACE, flags: aqueduct::envelope::flag::IS_RESPONSE, payload: Vec::new(), fds: Vec::new() }])
+    }
+
+    /// `OP_POPUP_GRANT` (forum-status-items.md §4): the bar lets another
+    /// client hang one pop-up from it; answered with the grant's token.
+    fn handle_popup_grant(&mut self, msg: &Message) -> Result<Vec<Outbound>, DispatchError> {
+        let p: fresco_protocol::PopupGrantPayload = decode(&msg.payload).map_err(|_| DispatchError::BadPayload)?;
+        if self.embed_only.contains(&self.current_client) {
+            return Err(DispatchError::Forbidden);
+        }
+        let parent = u16::try_from(p.parent).map_err(|_| DispatchError::UnknownWindow)?;
+        let token = crate::window::random_token();
+        self.compositor.lock().unwrap()
+            .grant_popup(self.current_client as u32, parent, p.anchor, p.side, p.align, (p.width, p.height), token)
+            .map_err(popup_refused)?;
+        let payload = encode(&token).map_err(|_| DispatchError::BadPayload)?;
+        Ok(vec![Outbound { op: control::OP_POPUP_GRANT, flags: aqueduct::envelope::flag::IS_RESPONSE, payload, fds: Vec::new() }])
+    }
+
+    /// `OP_POPUP_CLAIM`: open the pop-up a grant's token names. Answered
+    /// like `OP_POPUP_CREATE`.
+    fn handle_popup_claim(&mut self, msg: &Message) -> Result<Vec<Outbound>, DispatchError> {
+        let p: fresco_protocol::PopupClaimPayload = decode(&msg.payload).map_err(|_| DispatchError::BadPayload)?;
+        if self.embed_only.contains(&self.current_client) {
+            return Err(DispatchError::Forbidden);
+        }
+        let mut comp = self.compositor.lock().unwrap();
+        let id = comp.claim_popup(self.current_client as u32, p.token, (p.width, p.height)).map_err(popup_refused)?;
+        if let Some(w) = comp.windows.get_mut(&id) {
+            w.owner_uid = self.client_uids.get(&self.current_client).copied().unwrap_or(0);
+        }
+        drop(comp);
+        self.update_window_scales();
+        let payload = encode(&(id as u32)).map_err(|_| DispatchError::BadPayload)?;
+        Ok(vec![Outbound { op: control::OP_POPUP_CLAIM, flags: aqueduct::envelope::flag::IS_RESPONSE, payload, fds: Vec::new() }])
     }
 
     fn handle_window_create(&mut self, msg: &Message)

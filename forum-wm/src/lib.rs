@@ -1773,6 +1773,10 @@ pub mod control {
                 Ok(()) => Reply::Ack,
                 Err(message) => Reply::Err { message },
             },
+            Intent::StatusOpenPanel { app_id, token } => match crate::status::open_panel(&app_id, token) {
+                Ok(()) => Reply::Ack,
+                Err(message) => Reply::Err { message },
+            },
             // frescod validates the mode against the monitor's list; the WM
             // re-lays out when frescod's EV_DISPLAY_CHANGED arrives, not here,
             // so a refused or failed switch leaves the layout alone.

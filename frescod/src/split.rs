@@ -655,6 +655,37 @@ impl Broker {
                     }
                 }
             }
+            Msg::PopupGrant { token, anchor, side, align, width, height, .. } => {
+                // The bar lets another client hang a pop-up from it
+                // (forum-status-items.md §4); a refused grant is never
+                // claimed, so the claim is refused in turn.
+                let global = r.wins.lock().unwrap().get(&local).map(|w| w.global).ok_or("grant from unknown window")?;
+                let res = if socket_server::is_embed_only(r.client_id) {
+                    Err(fresco_scene_server::window::PopupRefused::UnknownWindow)
+                } else {
+                    self.comp.lock().unwrap().grant_popup(r.client_id as u32, global, anchor, side, align, (width, height), token)
+                };
+                match res {
+                    Ok(()) => log::info!("frescod: client {} window {local}: pop-up granted", r.client_id),
+                    Err(e) => log::info!("frescod: client {} window {local}: pop-up grant refused: {e:?}", r.client_id),
+                }
+            }
+            Msg::PopupClaim { token, width, height, .. } => {
+                let global = r.wins.lock().unwrap().get(&local).map(|w| w.global).ok_or("pop-up claim for unknown window")?;
+                log::info!("frescod: client {} window {local}: pop-up claim", r.client_id);
+                let res = if socket_server::is_embed_only(r.client_id) {
+                    Err(fresco_scene_server::window::PopupRefused::UnknownWindow)
+                } else {
+                    self.comp.lock().unwrap().attach_hosted(r.client_id as u32, global, token, (width, height))
+                };
+                match res {
+                    Ok(()) => self.redraw.wake(),
+                    Err(e) => {
+                        log::info!("frescod: client {} window {local}: pop-up claim refused: {e:?}", r.client_id);
+                        r.tell(&Msg::PopupDismissed { window: local, reason: fresco_protocol::popup_dismiss::PARENT }, &[])?;
+                    }
+                }
+            }
             Msg::PadClaim { device, claim, .. } => {
                 let global = r.wins.lock().unwrap().get(&local).map(|w| w.global as u32).ok_or("pad claim for unknown window")?;
                 crate::tactus_client::claim(r.client_id, global, device, claim);
@@ -1003,6 +1034,7 @@ fn event_record(r: &Renderer, ev: &DisplayEvent) -> Option<Msg> {
             return Some(Msg::PopupPlaced { window: r.local_of(window_id)?, x, y, width, height, side });
         }
         E::PopupDismissed { window_id, reason } => return Some(Msg::PopupDismissed { window: r.local_of(window_id)?, reason }),
+        E::PopupHosted { window_id, token, open } => return Some(Msg::PopupHosted { window: r.local_of(window_id)?, token, open }),
         E::VideoPresented { window_id, layer, seq, vblank_ns, dropped } => {
             return Some(Msg::VideoPresented { window: r.local_of(window_id)?, layer, seq, vblank_ns, dropped });
         }

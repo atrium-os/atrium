@@ -267,6 +267,11 @@ pub static DRAG_BEGIN: std::sync::OnceLock<DragBeginFn> = std::sync::OnceLock::n
 pub type PadClaimFn = Box<dyn Fn(u8, &fresco_protocol::PadClaim) + Send + Sync>;
 pub static PAD_CLAIM: std::sync::OnceLock<PadClaimFn> = std::sync::OnceLock::new();
 
+/// Run after `OP_POPUP_GRANT` is dispatched and before its answer goes
+/// out: a renderer sends the grant on to frescod now, so it is there
+/// before the token can reach the app that claims with it.
+pub static POPUP_GRANTED: std::sync::OnceLock<Box<dyn Fn() + Send + Sync>> = std::sync::OnceLock::new();
+
 /// The WM's override of exclusive claims (fresco-capabilities.md §4), set
 /// by frescod where the pads are: list them (`OP_WM_PADS`), and take one
 /// back (`OP_WM_PAD_RELEASE`). Unset (a renderer, which has no WM socket):
@@ -337,6 +342,7 @@ fn route(ev: &DisplayEvent, comp: &Arc<Mutex<Compositor>>) -> Route {
         | E::WindowSpan { window_id, .. }
         | E::PopupPlaced { window_id, .. }
         | E::PopupDismissed { window_id, .. }
+        | E::PopupHosted { window_id, .. }
         // A gamepad is the focused window's alone (not the WM's too).
         | E::GamepadConnect { window_id, .. }
         | E::Gamepad { window_id, .. } => return Route::Owner(owner_of(window_id)),
@@ -785,6 +791,11 @@ pub fn reader_loop(
          * harmless; under-signalling is a stuck frame). */
         if op_can_mutate(msg.op) {
             redraw.wake();
+        }
+        if msg.op == fresco_protocol::control::OP_POPUP_GRANT {
+            if let Some(f) = POPUP_GRANTED.get() {
+                f();
+            }
         }
         for o in outs {
             if out.send(o).is_err() {

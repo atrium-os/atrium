@@ -154,6 +154,7 @@ fn main() {
                             println!("  {i}: {e:?}");
                         }
                     }
+                    forum_ctl::StatusContent::Drawn { width, height } => println!("  its own panel, {width}x{height}"),
                     forum_ctl::StatusContent::Panel(p) => {
                         println!("  panel {} px wide", p.width);
                         for n in &p.nodes {

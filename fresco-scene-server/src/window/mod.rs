@@ -121,6 +121,9 @@ pub enum DisplayEvent {
     PopupPlaced { window_id: u32, x: f32, y: f32, width: u32, height: u32, side: u8 },
     /// To the owner: its pop-up went off screen (`popup_dismiss`).
     PopupDismissed { window_id: u32, reason: u8 },
+    /// To the owner of `window_id` (the granting chrome): the pop-up its
+    /// grant `token` let another client open is open, or went.
+    PopupHosted { window_id: u32, token: [u8; 16], open: bool },
     /// To the owner: a video layer's buffer may be filled again.
     VideoReleased { window_id: u32, layer: u32, buffer: u32 },
     /// To the owner: a video frame first showed at `vblank_ns`.
@@ -155,6 +158,24 @@ pub struct Popup {
     /// Times it was shown (opened, or placed again after a dismissal): a
     /// split renderer sends its place again when this changes.
     pub shown: u32,
+    /// Opened with this grant's token from another client's window (the
+    /// bar's; forum-status-items.md §4): it and its chain are the app's,
+    /// not the shell's, and it is never placed again.
+    pub hosted: Option<[u8; 16]>,
+}
+
+/// A pop-up grant (`OP_POPUP_GRANT`): `owner`'s chrome window `parent`
+/// lets the holder of `token` open one pop-up of at most `max` there.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct PopupGrant {
+    pub token: [u8; 16],
+    pub owner: u32,
+    pub parent: WindowId,
+    pub anchor: [f32; 4],
+    pub side: u8,
+    pub align: u8,
+    pub max: (u32, u32),
+    pub at: std::time::Instant,
 }
 
 /// Why a pop-up request was refused.
@@ -339,6 +360,10 @@ pub fn encode_event(ev: &DisplayEvent)
         DisplayEvent::PopupDismissed { window_id, reason } => {
             let p = PopupDismissedEvent { window_id: *window_id, reason: *reason };
             Ok((control::EV_POPUP_DISMISSED, encode(&p)?))
+        }
+        DisplayEvent::PopupHosted { window_id, token, open } => {
+            let p = fresco_protocol::PopupHostedEvent { window_id: *window_id, token: *token, open: *open };
+            Ok((control::EV_POPUP_HOSTED, encode(&p)?))
         }
     }
 }
@@ -558,6 +583,9 @@ pub struct Compositor {
     /// The rows at the top of the screen only frescod draws (the trusted
     /// strip, F4d): an app's pop-up is kept below them.
     pub popup_top: f32,
+    /// Pop-up grants waiting for their claim; in a split renderer, those
+    /// to send to frescod.
+    pub popup_grants: Vec<PopupGrant>,
 }
 
 /// Server-side WM theme — controls how the compositor draws window
@@ -690,6 +718,7 @@ impl Compositor {
             last_press: None,
             popups_upstream: false,
             popup_top: 0.0,
+            popup_grants: Vec::new(),
         }
     }
 

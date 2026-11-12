@@ -1419,17 +1419,25 @@ fn render_one_frame(
     if let Some(b) = split {
         /* The focus read and released first: origin() takes the broker's
          * window locks, which a renderer's thread takes before comp. */
-        let (focus, covers) = {
+        let (focus, covers, hosted) = {
             let c = comp.lock().unwrap();
+            /* Panels apps hang from the bar by its grant: a tab under
+             * each names the app (forum-status-items.md §4). */
+            let hosted: Vec<([i32; 4], String)> = rects.iter()
+                .filter_map(|&(id, r)| {
+                    let w = c.windows.get(&u16::try_from(id).ok()?)?;
+                    w.popup.filter(|p| p.hosted.is_some()).map(|_| (r, chrome::app_label(w.owner_uid)))
+                })
+                .collect();
             /* The shell's own windows (the bar, its menus, notifications)
              * stack above every app: the focus ring goes under them. */
             let covers: Vec<[i32; 4]> = rects.iter()
                 .filter(|(id, _)| Some(*id as u16) != c.focus.map(|f| f as u16) && u16::try_from(*id).is_ok_and(|w| c.shell_layer(w)))
                 .map(|&(_, r)| r)
                 .collect();
-            (c.focus, covers)
+            (c.focus, covers, hosted)
         };
-        let mut c = chrome::build(screen_w, focus, |id| b.origin(id), &rects, &slots, &covers);
+        let mut c = chrome::build(screen_w, focus, |id| b.origin(id), &rects, &slots, &covers, &hosted);
         c.size.1 = c.size.1.min(screen_h);
         rects.push((c.id, [0, 0, c.size.0 as i32, c.size.1 as i32]));
         windows.push(c);

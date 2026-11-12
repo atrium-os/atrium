@@ -1,7 +1,10 @@
 //! Pop-up windows (docs/spec/fresco-popups.md): placed, stacked and
 //! dismissed by frescod, not the WM.
 
-use super::{Compositor, DisplayEvent, Popup, PopupRefused, WindowId};
+use super::{Compositor, DisplayEvent, Popup, PopupGrant, PopupRefused, WindowId};
+
+/// The most grants waiting at once (one a bar window; a few bars).
+const GRANTS_MAX: usize = 8;
 use fresco_protocol::{popup_align, popup_dismiss, popup_side, POPUP_MAX_DEPTH};
 
 /// Top-left of a `w` x `h` pop-up on `side` of anchor `a`, lined up by
@@ -127,7 +130,7 @@ impl Compositor {
         let id = self.create(owner, size);
         let w = self.windows.get_mut(&id).expect("just made");
         w.title = String::new();
-        w.popup = Some(Popup { parent, anchor, side, align, want: size, grab, told: None, shown: 1 });
+        w.popup = Some(Popup { parent, anchor, side, align, want: size, grab, told: None, shown: 1, hosted: None });
         self.place_slots();
         Ok(id)
     }
@@ -139,7 +142,7 @@ impl Compositor {
     pub fn attach_popup(&mut self, owner: u32, id: WindowId, parent: WindowId, anchor: [f32; 4], side: u8, align: u8, size: (u32, u32), grab: bool) -> Result<(), PopupRefused> {
         let w = self.windows.get(&id).filter(|w| w.owner == owner && id != parent).ok_or(PopupRefused::UnknownWindow)?;
         if let Some(p) = w.popup {
-            if p.parent != parent || p.grab != grab {
+            if p.parent != parent || p.grab != grab || p.hosted.is_some() {
                 return Err(PopupRefused::Invalid);
             }
             return self.replace_popup(owner, id, anchor, side, align, size);
@@ -149,7 +152,7 @@ impl Compositor {
         }
         self.popup_ok(owner, parent, anchor, side, align, size, 1)?;
         let w = self.windows.get_mut(&id).expect("checked");
-        w.popup = Some(Popup { parent, anchor, side, align, want: size, grab, told: None, shown: 1 });
+        w.popup = Some(Popup { parent, anchor, side, align, want: size, grab, told: None, shown: 1, hosted: None });
         w.hidden = false;
         w.embed_pending = false;
         if !self.z_order.contains(&id) {
@@ -163,6 +166,9 @@ impl Compositor {
     /// dismissed.
     pub fn replace_popup(&mut self, owner: u32, id: WindowId, anchor: [f32; 4], side: u8, align: u8, size: (u32, u32)) -> Result<(), PopupRefused> {
         let p = self.windows.get(&id).filter(|w| w.owner == owner).and_then(|w| w.popup).ok_or(PopupRefused::UnknownWindow)?;
+        if p.hosted.is_some() {
+            return Err(PopupRefused::Invalid);
+        }
         self.popup_ok(owner, p.parent, anchor, side, align, size, 0)?;
         let w = self.windows.get_mut(&id).expect("checked");
         w.popup = Some(Popup { anchor, side, align, want: size, shown: p.shown.wrapping_add(w.hidden as u32), ..p });
@@ -173,6 +179,112 @@ impl Compositor {
         }
         self.place_slots();
         Ok(())
+    }
+
+    /// `OP_POPUP_GRANT` from client `owner`: its chrome window `parent`
+    /// lets the holder of `token` open one pop-up of at most `max` from
+    /// `anchor`, checked now as `OP_POPUP_CREATE` is (the bar was just
+    /// pressed). One grant a parent; it lasts `POPUP_GRANT_TTL_MS`. In a
+    /// split renderer it is only recorded, for frescod.
+    #[allow(clippy::too_many_arguments)]
+    pub fn grant_popup(&mut self, owner: u32, parent: WindowId, anchor: [f32; 4], side: u8, align: u8, max: (u32, u32), token: [u8; 16]) -> Result<(), PopupRefused> {
+        let p = self.windows.get(&parent).filter(|w| parent != 0 && w.owner == owner).ok_or(PopupRefused::UnknownWindow)?;
+        // A split renderer does not know the roles frescod gave.
+        if p.popup.is_some() || (!self.popups_upstream && p.role != WmRole::Chrome) {
+            return Err(PopupRefused::Invalid);
+        }
+        self.popup_ok(owner, parent, anchor, side, align, max, 1)?;
+        let now = std::time::Instant::now();
+        let ttl = std::time::Duration::from_millis(fresco_protocol::POPUP_GRANT_TTL_MS);
+        self.popup_grants.retain(|g| g.parent != parent && now.duration_since(g.at) < ttl);
+        if self.popup_grants.len() >= GRANTS_MAX {
+            self.popup_grants.remove(0);
+        }
+        self.popup_grants.push(PopupGrant { token, owner, parent, anchor, side, align, max, at: now });
+        Ok(())
+    }
+
+    /// A split renderer: the grants to send to frescod.
+    pub fn take_popup_grants(&mut self) -> Vec<PopupGrant> {
+        std::mem::take(&mut self.popup_grants)
+    }
+
+    /// The live grant `token` names, used up.
+    fn take_grant(&mut self, token: &[u8; 16]) -> Result<PopupGrant, PopupRefused> {
+        let now = std::time::Instant::now();
+        let ttl = std::time::Duration::from_millis(fresco_protocol::POPUP_GRANT_TTL_MS);
+        self.popup_grants.retain(|g| now.duration_since(g.at) < ttl);
+        let i = self.popup_grants.iter().position(|g| g.token == *token).ok_or(PopupRefused::UnknownWindow)?;
+        Ok(self.popup_grants.remove(i))
+    }
+
+    /// `OP_POPUP_CLAIM` from client `owner`: a new window, the grabbing
+    /// pop-up `token` grants, `size` cut to the grant's. The grant is
+    /// checked again (its parent still on screen, still pressed or with
+    /// its chain open). In a split renderer it is only recorded: frescod
+    /// checks the token.
+    pub fn claim_popup(&mut self, owner: u32, token: [u8; 16], size: (u32, u32)) -> Result<WindowId, PopupRefused> {
+        if !(1..=fresco_protocol::SPAN_MAX_DIM).contains(&size.0) || !(1..=fresco_protocol::SPAN_MAX_DIM).contains(&size.1) {
+            return Err(PopupRefused::Invalid);
+        }
+        if self.popups_upstream {
+            let id = self.create(owner, size);
+            let w = self.windows.get_mut(&id).expect("just made");
+            w.title = String::new();
+            w.popup = Some(Popup { parent: 0, anchor: [0.0; 4], side: 0, align: 0, want: size, grab: true, told: None, shown: 1, hosted: Some(token) });
+            return Ok(id);
+        }
+        let g = self.take_grant(&token)?;
+        let size = (size.0.min(g.max.0), size.1.min(g.max.1));
+        self.popup_ok(g.owner, g.parent, g.anchor, g.side, g.align, size, 1)?;
+        let id = self.create(owner, size);
+        let w = self.windows.get_mut(&id).expect("just made");
+        w.title = String::new();
+        w.popup = Some(Popup { parent: g.parent, anchor: g.anchor, side: g.side, align: g.align, want: size, grab: true, told: None, shown: 1, hosted: Some(token) });
+        self.place_slots();
+        self.emit(DisplayEvent::PopupHosted { window_id: g.parent as u32, token, open: true });
+        Ok(id)
+    }
+
+    /// frescod, for a split renderer: its window `id` (made hidden, as a
+    /// pop-up to be) is the pop-up `token` grants: checked as
+    /// `OP_POPUP_CLAIM` is, then shown and placed.
+    pub fn attach_hosted(&mut self, owner: u32, id: WindowId, token: [u8; 16], size: (u32, u32)) -> Result<(), PopupRefused> {
+        if !self.windows.get(&id).is_some_and(|w| w.owner == owner && w.popup.is_none() && w.slot.is_none()) {
+            return Err(PopupRefused::UnknownWindow);
+        }
+        if self.windows.values().any(|x| x.popup.is_some_and(|p| p.parent == id) || x.slot.is_some_and(|s| s.parent == id)) {
+            return Err(PopupRefused::Invalid);
+        }
+        let g = self.take_grant(&token)?;
+        let size = (size.0.min(g.max.0), size.1.min(g.max.1));
+        self.popup_ok(g.owner, g.parent, g.anchor, g.side, g.align, size, 1)?;
+        if self.windows[&id].size != (size.0 as f32, size.1 as f32) {
+            self.resize_window(id, size.0, size.1);
+        }
+        let w = self.windows.get_mut(&id).expect("checked");
+        w.popup = Some(Popup { parent: g.parent, anchor: g.anchor, side: g.side, align: g.align, want: size, grab: true, told: None, shown: 1, hosted: Some(token) });
+        w.hidden = false;
+        w.embed_pending = false;
+        if !self.z_order.contains(&id) {
+            self.z_order.push(id);
+        }
+        self.place_slots();
+        self.emit(DisplayEvent::PopupHosted { window_id: g.parent as u32, token, open: true });
+        Ok(())
+    }
+
+    /// The client whose grant opened pop-up `id`'s chain, and the window
+    /// it hangs from, if a grant did (frescod labels it with the client).
+    pub fn hosted_by(&self, mut id: WindowId) -> Option<WindowId> {
+        for _ in 0..=POPUP_MAX_DEPTH {
+            let p = self.windows.get(&id).and_then(|w| w.popup)?;
+            if p.hosted.is_some() {
+                return Some(id);
+            }
+            id = p.parent;
+        }
+        None
     }
 
     /// A split renderer: frescod dismissed pop-up `id`. It stays off
@@ -190,14 +302,16 @@ impl Compositor {
     /// not cross them: an open bar menu hides the ring under it.
     pub fn shell_layer(&self, id: WindowId) -> bool {
         self.windows.get(&id).is_some_and(|w| matches!(w.role, WmRole::Chrome | WmRole::Notification))
-            || (self.windows.get(&id).is_some_and(|w| w.popup.is_some()) && self.popup_trusted(id))
+            || (self.windows.get(&id).is_some_and(|w| w.popup.is_some())
+                && self.windows.get(&self.popup_root(id)).is_some_and(|w| w.role == WmRole::Chrome))
     }
 
     /// Whether pop-up `id`'s chain hangs from the shell's chrome (the
     /// Forum bar): it stacks above every app's pop-up and may reach the
-    /// top of the screen.
+    /// top of the screen. A chain an app opened with the bar's grant is
+    /// not: it stays below the strip and the bar's own menus.
     fn popup_trusted(&self, id: WindowId) -> bool {
-        self.windows.get(&self.popup_root(id)).is_some_and(|w| w.role == WmRole::Chrome)
+        self.hosted_by(id).is_none() && self.windows.get(&self.popup_root(id)).is_some_and(|w| w.role == WmRole::Chrome)
     }
 
     /// The monitor a screen point is on, from [`Compositor::popup_bounds`]
@@ -266,13 +380,16 @@ impl Compositor {
             self.z_order.retain(|&z| z != id);
             stacked.push(id);
         }
-        // Apps' windows, their pop-ups, the shell's chrome (the bar) and
-        // its pop-ups, then notifications: no app pixel covers the bar or
+        // Apps' windows, their pop-ups, those apps hang from the bar by
+        // its grant, the shell's chrome (the bar) and its pop-ups, then
+        // notifications: no app pixel covers the bar or
         // its menus (fresco-popups.md §2).
         let chrome = |c: &Self, id: WindowId| c.windows.get(&id).is_some_and(|w| w.role == WmRole::Chrome);
         let (bars, mut z): (Vec<WindowId>, Vec<WindowId>) = self.z_order.iter().partition(|&&id| chrome(self, id));
         let (trusted, apps): (Vec<WindowId>, Vec<WindowId>) = stacked.into_iter().partition(|&id| self.popup_trusted(id));
+        let (hosted, apps): (Vec<WindowId>, Vec<WindowId>) = apps.into_iter().partition(|&id| self.hosted_by(id).is_some());
         z.extend(apps);
+        z.extend(hosted);
         z.extend(bars);
         z.extend(trusted);
         self.z_order = z;
@@ -313,10 +430,12 @@ impl Compositor {
         gone.sort_by(|a, b| b.cmp(a));
         for (_, id) in gone {
             // Off screen, as `hide` does (not through it: it dismisses).
+            let mut hosted = None;
             if let Some(w) = self.windows.get_mut(&id) {
                 w.hidden = true;
                 if let Some(p) = w.popup.as_mut() {
                     p.told = None;
+                    hosted = p.hosted.map(|t| (p.parent, t));
                 }
             }
             self.z_order.retain(|&z| z != id);
@@ -324,6 +443,9 @@ impl Compositor {
                 self.set_focus_no_raise(None);
             }
             self.emit(DisplayEvent::PopupDismissed { window_id: id as u32, reason });
+            if let Some((parent, token)) = hosted {
+                self.emit(DisplayEvent::PopupHosted { window_id: parent as u32, token, open: false });
+            }
         }
     }
 
@@ -510,5 +632,54 @@ mod tests {
         assert_eq!(*c.z_order.last().unwrap(), bm, "the bar's menu is on top");
         assert_eq!(c.keyboard_window(), bm as u32, "and takes the keys");
         let _ = popup_events(&rx);
+    }
+
+    #[test]
+    fn an_app_hangs_its_panel_from_the_bars_grant_once() {
+        let (mut c, rx) = comp();
+        c.popup_top = 24.0;
+        let app = c.create(3, (1000, 700));
+        c.windows.get_mut(&app).unwrap().pos = (0.0, 62.0);
+        let bar = c.create(9, (1000, 38));
+        c.windows.get_mut(&bar).unwrap().pos = (0.0, 24.0);
+        c.set_focus_no_raise(Some(app));
+        let anchor = [900.0, 0.0, 30.0, 38.0];
+        // Only the shell's chrome grants, and only when just pressed.
+        assert_eq!(c.grant_popup(9, bar, anchor, popup_side::BELOW, popup_align::END, (300, 400), [1; 16]), Err(PopupRefused::Invalid));
+        c.windows.get_mut(&bar).unwrap().role = WmRole::Chrome;
+        assert_eq!(c.grant_popup(9, bar, anchor, popup_side::BELOW, popup_align::END, (300, 400), [1; 16]), Err(PopupRefused::NotActive));
+        assert_eq!(c.grant_popup(3, bar, anchor, popup_side::BELOW, 0, (300, 400), [1; 16]), Err(PopupRefused::UnknownWindow));
+        c.last_press = Some(bar);
+        c.grant_popup(9, bar, anchor, popup_side::BELOW, popup_align::END, (300, 400), [1; 16]).unwrap();
+        // A wrong token opens nothing; the right one, once, cut to the grant.
+        assert_eq!(c.claim_popup(5, [2; 16], (300, 400)), Err(PopupRefused::UnknownWindow));
+        let p = c.claim_popup(5, [1; 16], (500, 380)).unwrap();
+        assert_eq!(c.claim_popup(5, [1; 16], (300, 400)), Err(PopupRefused::UnknownWindow), "used up");
+        assert_eq!(c.windows[&p].owner, 5);
+        assert_eq!(c.windows[&p].size, (300.0, 380.0));
+        assert_eq!(c.windows[&p].pos, (630.0, 62.0), "under the icon, end-aligned");
+        let ev: Vec<DisplayEvent> = rx.try_iter().filter(|e| matches!(e, DisplayEvent::PopupHosted { .. })).collect();
+        assert!(matches!(ev[..], [DisplayEvent::PopupHosted { window_id, token: [1, ..], open: true }] if window_id == bar as u32), "{ev:?}");
+        // Above the app, below the bar; it takes the keys; not the shell's.
+        let zpos = |c: &Compositor, id| c.z_order.iter().position(|&z| z == id).unwrap();
+        assert!(zpos(&c, app) < zpos(&c, p) && zpos(&c, p) < zpos(&c, bar));
+        assert_eq!(c.keyboard_window(), p as u32);
+        assert!(!c.popup_trusted(p));
+        assert_eq!(c.hosted_by(p), Some(p));
+        // Its own submenu is the app's too.
+        let sub = c.open_popup(5, p, [0.0, 10.0, 300.0, 20.0], popup_side::LEFT, 0, (100, 100), true).unwrap();
+        assert_eq!(c.hosted_by(sub), Some(p));
+        assert!(!c.popup_trusted(sub));
+        // Never placed again.
+        assert_eq!(c.replace_popup(5, p, anchor, popup_side::BELOW, 0, (300, 300)), Err(PopupRefused::Invalid));
+        // A press outside closes it; the bar hears.
+        let _ = rx.try_iter().count();
+        assert!(c.press_dismisses_popups(app));
+        let ev: Vec<DisplayEvent> = rx.try_iter().filter(|e| matches!(e, DisplayEvent::PopupHosted { .. })).collect();
+        assert!(matches!(ev[..], [DisplayEvent::PopupHosted { token: [1, ..], open: false, .. }]), "{ev:?}");
+        // A stale grant is refused.
+        c.grant_popup(9, bar, anchor, popup_side::BELOW, 0, (300, 400), [3; 16]).unwrap();
+        c.popup_grants[0].at -= std::time::Duration::from_millis(fresco_protocol::POPUP_GRANT_TTL_MS + 1);
+        assert_eq!(c.claim_popup(5, [3; 16], (300, 400)), Err(PopupRefused::UnknownWindow));
     }
 }
