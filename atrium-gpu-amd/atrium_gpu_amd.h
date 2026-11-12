@@ -817,6 +817,7 @@ int	amd_smu_mode1_reset(struct atrium_amd_softc *sc);	/* smu.c */
 int	amd_gfx12_srm_enable(struct atrium_amd_softc *sc);	/* gfx12_pm.c */
 int	amd_gfx12_clock_gating(struct atrium_amd_softc *sc, bool enable);
 void	amd_gfx12_pm_report(struct atrium_amd_softc *sc, const char *when);
+int	amd_gc_idle_enter(struct atrium_amd_softc *sc);	/* gfx12_pm.c */
 int	amd_smu_init(struct atrium_amd_softc *sc);	/* smu.c, silicon test */
 
 /*

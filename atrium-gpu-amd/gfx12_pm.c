@@ -215,3 +215,51 @@ amd_gfx12_clock_gating(struct atrium_amd_softc *sc, bool enable)
 	safe_mode_exit(sc);
 	return (0);
 }
+
+/* GC 12.0.x idle sequence (box-verified on 12.0.1, 2026-11-12). */
+static int
+gc12_idle(struct atrium_amd_softc *sc)
+{
+	int err;
+
+	amd_gfx12_pm_report(sc, "before idle setup");
+	err = amd_gfx12_srm_enable(sc);
+	if (err == 0)
+		err = amd_gfx12_clock_gating(sc, true);
+	amd_gfx12_pm_report(sc, "after idle setup");
+	return (err);
+}
+
+/*
+ * What takes GC from powered to idle, per family (spec A3.9). The caller
+ * then allows GfxOff and must see the card idle in telemetry. Another
+ * family gets its own row (it may need power gating, a running CP or a
+ * different handshake); one without a row gets ENOTSUP and is refused.
+ */
+static const struct {
+	uint8_t	major, minor, rev_min, rev_max;
+	const char *name;
+	int	(*enter)(struct atrium_amd_softc *);
+} gc_idle_gens[] = {
+	{ 12, 0, 0, 1, "GC 12.0.0/1: SRM, clock gating", gc12_idle },
+};
+
+int
+amd_gc_idle_enter(struct atrium_amd_softc *sc)
+{
+	size_t i;
+
+	for (i = 0; i < nitems(gc_idle_gens); i++) {
+		if (sc->ip.gc.present && sc->ip.gc.major == gc_idle_gens[i].major &&
+		    sc->ip.gc.minor == gc_idle_gens[i].minor &&
+		    sc->ip.gc.rev >= gc_idle_gens[i].rev_min &&
+		    sc->ip.gc.rev <= gc_idle_gens[i].rev_max) {
+			device_printf(sc->dev, "gfx: idle sequence %s\n",
+			    gc_idle_gens[i].name);
+			return (gc_idle_gens[i].enter(sc));
+		}
+	}
+	device_printf(sc->dev, "gfx: no idle sequence for GC %u.%u.%u\n",
+	    sc->ip.gc.major, sc->ip.gc.minor, sc->ip.gc.rev);
+	return (ENOTSUP);
+}

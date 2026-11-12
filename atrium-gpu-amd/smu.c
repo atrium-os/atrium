@@ -341,8 +341,11 @@ smu_metrics(struct smu_link *l, struct resource *vram, uint32_t ifver,
 	return (true);
 }
 
-/* `n` telemetry samples 1 s apart, labelled; warn on a busy idle card. */
-static void
+/*
+ * Up to `n` telemetry samples 1 s apart, labelled. Returns true as soon as
+ * one shows the card idle (spec A3.9: idle is proven, not assumed).
+ */
+static bool
 smu_sample(struct smu_link *l, struct resource *vram, uint32_t ifver, int n,
     const char *label)
 {
@@ -354,11 +357,14 @@ smu_sample(struct smu_link *l, struct resource *vram, uint32_t ifver, int n,
 			pause("smumet", hz);
 		device_printf(l->sc->dev, "smu: sample [%s] %d/%d\n", label,
 		    i + 1, n);
-		if (smu_metrics(l, vram, ifver, false, &t) &&
-		    atrium_gpu_power_idle_suspicious(&t))
-			device_printf(l->sc->dev, "smu: WARNING: busy or at "
-			    "the power limit with no work queued\n");
+		if (!smu_metrics(l, vram, ifver, false, &t))
+			continue;
+		if (!atrium_gpu_power_idle_suspicious(&t))
+			return (true);
+		device_printf(l->sc->dev, "smu: busy or at the power limit "
+		    "with no work queued\n");
 	}
+	return (false);
 }
 
 int
@@ -498,37 +504,38 @@ amd_smu_init(struct atrium_amd_softc *sc)
 	 */
 	(void)smu_metrics(&link, vram, ifver, true, &t);
 	pause("smumet", hz);
-	smu_sample(&link, vram, ifver, 1, "RLC up, no gfx init");
+	(void)smu_sample(&link, vram, ifver, 1, "GC up, no idle setup");
 
 	/*
-	 * Power P2 step 2: the GC
-	 * idle setup amdgpu does after RLC boot, a step at a time with
-	 * telemetry after each: SRM, clock gating, then GfxOff allowed.
-	 */
-	/*
-	 * Box-verified 2026-11-12: clock gating takes GC from ~280 W to 9 W,
-	 * GfxOff to 7 W. Always done once GC is up; hw.atrium_gpu.gfx_cg=0
-	 * skips it (diagnosis only).
+	 * Spec A3.9: GC was powered up, so the family's idle sequence runs
+	 * (gc_idle_gens[] in gfx12_pm.c, by GC version), GfxOff is allowed,
+	 * and telemetry must show the card idle within 5 s. A family with
+	 * no sequence, or a card that does not go idle, is refused; detach
+	 * then resets it to post-POST. hw.atrium_gpu.gfx_cg=0 skips the
+	 * sequence (diagnosis only; the check still runs and refuses).
 	 */
 	gfx_cg = 1;
 	TUNABLE_INT_FETCH("hw.atrium_gpu.gfx_cg", &gfx_cg);
-	if (gfx_cg && !link.failed) {
-		amd_gfx12_pm_report(sc, "before");
-		device_printf(sc->dev, "gfx: SRM enable: %d\n",
-		    amd_gfx12_srm_enable(sc));
-		smu_sample(&link, vram, ifver, 2, "SRM on");
-		device_printf(sc->dev, "gfx: clock gating on: %d\n",
-		    amd_gfx12_clock_gating(sc, true));
-		amd_gfx12_pm_report(sc, "after CG");
-		smu_sample(&link, vram, ifver, 3, "clock gating on");
+	if (!link.failed) {
+		int r = gfx_cg ? amd_gc_idle_enter(sc) : ECANCELED;
+
+		if (r != 0)
+			device_printf(sc->dev, "gfx: no idle sequence run "
+			    "(%d)\n", r);
 		(void)SEND(SMU_ALLOW_GFXOFF, 0, NULL);
-		smu_sample(&link, vram, ifver, 3, "GfxOff allowed");
+		if (smu_sample(&link, vram, ifver, 5, "idle check"))
+			device_printf(sc->dev, "smu: card proven idle\n");
+		else {
+			device_printf(sc->dev, "smu: could not prove the card "
+			    "idle within 5 s (spec A3.9); refusing it\n");
+			err = EIO;
+		}
 		amd_gfx12_pm_report(sc, "end");
 	}
 
 	/* Hand back the PMFW's own idle policy (rule 6). */
 	(void)SEND(SMU_ALLOW_GFXOFF, 0, NULL);
-	if (link.failed)
+	if (link.failed && err == 0)
 		err = EIO;
 #undef SEND
 out:
@@ -590,10 +597,14 @@ amd_smu_mode1_reset(struct atrium_amd_softc *sc)
 	}
 	if (err == 0 && v == 0xffffffff)
 		err = ETIMEDOUT;
+	/* Cold is proven too (spec A3.9): no sOS, GC off. */
+	if (err == 0 && (sos != 0 || (gc_ok(sc, 0, GC12_GB_ADDR_CONFIG) &&
+	    gc_rd(sc, 0, GC12_GB_ADDR_CONFIG) != 0)))
+		err = EIO;
 	device_printf(sc->dev, "smu: after reset: %s; sOS %#x, memsize %u "
 	    "MiB, SMU response %#x, GB_ADDR_CONFIG %#x\n",
-	    err == 0 ? "PSP bootloader ready" : "card did NOT come back "
-	    "(needs a power cycle)", sos, v,
+	    err == 0 ? "PSP bootloader ready, card cold" : "card NOT back "
+	    "to cold (needs a power cycle)", sos, v,
 	    amd_mmio_read32(sc, smu_reg(sc, g->reg_resp)),
 	    gc_ok(sc, 0, GC12_GB_ADDR_CONFIG) ?
 	    gc_rd(sc, 0, GC12_GB_ADDR_CONFIG) : 0);
