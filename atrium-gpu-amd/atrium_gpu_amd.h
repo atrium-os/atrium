@@ -814,6 +814,30 @@ int	amd_identify(struct atrium_amd_softc *sc);	/* identify.c */
 int	amd_psp_bootload(struct atrium_amd_softc *sc);	/* psp.c, silicon test */
 int	amd_smu_init(struct atrium_amd_softc *sc);	/* smu.c, silicon test */
 
+/*
+ * One vendor-neutral GPU power telemetry sample (rs/power.rs Telemetry;
+ * docs/spec/gpu-power-management.md §4). Every backend fills this; nothing
+ * above the backend sees a vendor table. 0xffff = no such sensor.
+ */
+#define	GPU_POWER_UNKNOWN	0xffff
+#define	GPU_THROTTLE_THERMAL	0x1
+#define	GPU_THROTTLE_POWER	0x2
+#define	GPU_THROTTLE_CURRENT	0x4
+#define	GPU_THROTTLE_OTHER	0x8
+struct atrium_gpu_power_telemetry {
+	uint16_t edge_c, hotspot_c, mem_c, vr_c;
+	uint16_t power_w, board_power_w, power_limit_w;
+	uint16_t fan_rpm;
+	uint8_t	 fan_pct, gfx_busy_pct;
+	uint16_t _pad0;
+	uint16_t gfx_mhz, mem_mhz;
+	uint32_t throttle;		/* GPU_THROTTLE_* */
+	uint32_t vendor_throttle;	/* backend's own ids, bit n = id n */
+	uint32_t sample;		/* controller counter, informational */
+};
+int	atrium_gpu_power_idle_suspicious(
+	    const struct atrium_gpu_power_telemetry *t);	/* Rust */
+
 struct atrium_amd_softc {
 	device_t	 dev;
 	int		 hw_kind;	/* AMD_HW_* (identify.c, before any write) */

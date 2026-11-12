@@ -1,169 +1,259 @@
-# GPU power management on silicon (atrium-gpu-amd, SMU 14 / RDNA4)
+# GPU power management on silicon
 
 > **Status:** draft 2026-11-12, for Shankar's review. Written after stage 3 of the R9700
 > bring-up ([r9700-bare-metal.md](r9700-bare-metal.md) §4.3, §5), where the driver first talked
-> to the SMU. Gates stage 4: no GPU workload runs on silicon until §6 P1 (telemetry) is in.
+> to the SMU. Rev. 2 (same day): split into a vendor-neutral contract (Part A) and per-vendor
+> backends (Part B, AMD first), after the 2026-11-12 incident (§A6). Gates stage 4: no GPU
+> workload runs on silicon until P1 (telemetry) and P2 (lifecycle) are in.
 
-## 1. Who controls what
+---
 
-The work splits three ways. The dangerous parts are not in the driver.
+## Part A: the vendor-neutral contract
+
+### A1. Who controls what
+
+Every modern discrete GPU has a power-management controller running its own signed firmware:
+AMD's SMU (PMFW), Intel's GuC SLPC plus pcode, NVIDIA's GSP, Apple's own. The driver only
+sends it requests. The levers are similar everywhere; the messages, tables and signing rules
+are not.
 
 | Layer | Owns | Can the driver change it? |
 |---|---|---|
-| **Hardware** | Thermal trip / critical temperature shutdown (THM), voltage regulator protections | No |
-| **SMU firmware (PMFW)**, AMD-signed, loaded through the PSP | V/F curves, voltage, current and power limits (PPT/TDC), thermal throttling, fan curve, clock DPM, gating | Only through mailbox *requests*, which it clamps |
-| **PSP, with SCPM** (secure power management) | The power-play table, the feature mask, the limits' min/max envelope | No. The R9700 runs SCPM: on 2026-11-12 the SMU refused SetAllowedFeaturesMask with 0xFD |
-| **Driver (us)** | Enabling features at start, teardown, GfxOff policy, requests inside the envelope (power cap, clock floors/ceilings, workload profile), telemetry, reacting to thermal events | Yes. That is this spec |
+| **Hardware** | Thermal trip / critical shutdown, voltage-regulator protections | No |
+| **PM firmware** | V/F curves, voltage, current and power limits, throttling, fan curve, clock DPM, gating | Only through *requests*, which it clamps |
+| **Platform security** (AMD: PSP with SCPM) | The signed limits table and which features exist | No |
+| **Driver backend** | Starting the controller, teardown, idle policy, requests inside the envelope, telemetry, reacting to thermal events | Yes. Part B |
+| **Driver power layer** (vendor-neutral, `rs/power.rs`) | The rules below, the telemetry record, posture/cap → lever mapping, the idle check | Yes. Part A |
 
-So nothing the driver sends can raise a limit past the board's signed table, and the
-hardware trips regardless. What the driver can still get wrong:
-- leave the card in a wasteful state, e.g. GfxOff disallowed at idle (we do today after a
-  bring-up run);
-- skip the orderly teardown the PMFW expects;
+What a driver can still get wrong, on any vendor:
+- leave the card in a wasteful or hot state (§A6 is the real example);
+- skip the orderly teardown the firmware expects;
 - fly blind: not see temperature, power or throttling;
-- disable a protection feature or take manual fan control. Under SCPM some of this may still
-  be accepted, so it is a hard rule below.
+- disable a protection or take manual fan or voltage control.
 
-Interface sources: Linux's MIT-licensed `smu_cmn.c`, `smu_v14_0.c`, `smu_v14_0_2_ppt.c`,
-`smu_v14_0_2_ppsmc.h`, `smu14_driver_if_v14_0.h`. Chosen by MP1's discovered version (14.x),
-never by device id.
+### A2. Levers (what a backend offers)
 
-## 2. Hard rules (enforced in code)
+Four, all requests to the firmware, all optional per backend:
 
-1. **Message allowlist.** The driver sends only the messages in §3, through one function
-   that takes an enum of allowed messages. No raw message ids exist outside that table, so
-   anything else cannot be expressed. Adding a message is a reviewed spec change.
-2. **Never sent:**
-   - DisableAllSmuFeatures, DisableSmuFeatures*, EnableSmuFeatures* (piecemeal);
-   - any OverDrive table write, TransferTableDram2Smu of PPTABLE / OVERDRIVE /
-     CUSTOM_SKUTABLE;
-   - manual fan (PWM/RPM) set;
-   - voltage offsets;
-   - SetHardMinByFreq above the default.
+| Lever | Neutral form | Range |
+|---|---|---|
+| Power cap | watts | [firmware min, firmware default] |
+| Idle policy | `Allowed` / `HeldWhileQueued` | default `Allowed` |
+| Gfx clock ceiling | MHz (soft max) | ≤ firmware default max |
+| Workload profile | `PowerSaving` / `Default` | |
 
-   Throttlers, FW_CTF, FAN_CONTROL, VR0HOT and THROTTLERS stay as the PMFW enabled them. After
-   enable, the driver checks those feature bits (§4) and refuses to bring the GPU up if one is
-   off.
-3. **Requests only downward at first.** Power cap: only ≤ the default, ≥ the SMU-reported
-   minimum. Clock limits: soft max only, never above default; no hard minimum. Later raises,
-   for posture "performance", stay within the SMU-reported max and need a spec change.
-4. **Every response is checked.**
-   - Pre-poll and post-poll have a timeout (2 s).
-   - 0x01 is OK.
-   - 0xFD (bad prerequisite) is handled per message where expected: SetAllowedFeaturesMask
-     under SCPM. Anywhere else it is an error.
-   - 0xFE, 0xFF or a timeout put the SMU link in **failed** state. No further messages are
-     sent, the PMFW is left in its own automatic control, the event is logged, and the GPU is
-     marked device-lost (the reset path decides recovery).
-   - The driver never retries in a loop.
-5. **One sender.** All SMU traffic goes through one serialised path (a mutex, sleepable
-   context), never from an interrupt handler.
-6. **Leave a state the PMFW would choose itself.** On detach, unload, reset prepare or
-   shutdown:
-   1. undo every request we made (cap and clocks back to default, GfxOff allowed);
-   2. send PrepareMp1ForUnload.
-7. **Read-only towards the rest of Atrium.** Posture and energy cap come in through the
-   federation interface ([atrium-power-posture.md](atrium-power-posture.md),
-   [energy-policy.md](energy-policy.md)). The driver maps them to the requests in §5.
-   Telemetry goes out read-only. Nothing in the scheduler talks to the SMU, and SMU state is
-   never fed back into the scheduler's control loop.
+`power::plan(posture, grant, limits)` maps posture and the energy grant to levers, clamped so
+it can only lower a limit (tested for every posture and grant). Raising anything past the
+firmware default (posture "performance" headroom) needs a spec change.
 
-## 3. Messages (SMU 14.0.2/3 ids)
+### A3. Hard rules (every backend proves these)
+
+1. **Message allowlist.** A backend sends only the requests its Part B table lists, through one
+   function that takes an enum. No raw ids exist outside the table. Adding one is a reviewed
+   spec change.
+2. **Protections stay as the firmware set them.** Never disable a thermal, current, VR or fan
+   protection; never manual fan, voltage offsets, overdrive, or a limits-table write. After
+   start the backend checks that its required protections are running and refuses the GPU if
+   one is not.
+3. **Requests only downward** (A2).
+4. **Every response checked.** Timeouts on every wait. An unexpected answer or a timeout puts
+   the link in **failed** state: nothing more is sent, the firmware stays in its own control,
+   the GPU is marked device-lost. No retry loops.
+5. **One sender**, serialised, sleepable context, never from an interrupt handler.
+6. **Leave the card as the firmware would have it.** On detach, unload, reset prepare or
+   shutdown: restore the defaults (`power::defaults`), let the card idle, then the firmware's
+   own unload handshake.
+7. **The card must be able to idle.** The driver never powers up a block it cannot bring back
+   to idle itself. A bring-up hook that would is behind a separate opt-in
+   (`hw.atrium_gpu.gc_up_ok`), and every box run checks idle telemetry afterwards (§A6).
+8. **Read-only towards the rest of Atrium.** Posture and cap come in through the federation
+   ([atrium-power-posture.md](atrium-power-posture.md), [energy-policy.md](energy-policy.md));
+   telemetry goes out read-only. Firmware state is never fed back into the scheduler's control
+   loop.
+9. **Unknown means read-only.** A controller generation without a Part B row gets no messages.
+   A telemetry layout the backend doesn't know is not decoded (no "probably" readings).
+
+### A4. Telemetry record
+
+One C/Rust record, `struct atrium_gpu_power_telemetry` = `power::Telemetry`:
+
+- temperatures: edge, hotspot, memory, VR (°C)
+- package power, board power, the enforced power limit (W)
+- fan rpm and %
+- gfx busy %, gfx and memory clocks (MHz)
+- throttle classes: THERMAL / POWER / CURRENT / OTHER, plus the backend's raw throttler ids
+  for logs
+- the controller's sample counter (informational)
+
+Missing sensors read `0xffff`. Every sample passes `power::check` before anyone sees it:
+- edge temperature is required (1–150 °C);
+- hotspot ≥ edge;
+- power ≤ 1500 W;
+- fan ≤ 10 000 rpm;
+- percentages ≤ 100;
+- clocks ≤ 10 GHz.
+
+A failing sample is dropped and reported as "telemetry unavailable".
+
+Exposed as sysctls `dev.atrium_gpu.N.power.*`. The federation member `gpuN` publishes power and
+residency read-only. Polled every 1 s while busy and every 5 s idle, from a taskqueue.
+
+### A5. Policy
+
+| Posture | Idle | Profile | Cap | Gfx soft max |
+|---|---|---|---|---|
+| 0–2 powersave | allowed | power saving | min(default, grant) | 70 % of default |
+| 3–7 balanced (5 default) | allowed | default | min(default, grant) | default |
+| 8–10 performance | held only while work is queued | default | min(default, grant) | default |
+
+- **Cap changes** happen at most once a second, with 5 W hysteresis. A restore to the default
+  is never delayed.
+- **Idle check.** `power::idle_suspicious`: busy above 20 %, power above 25 % of the limit, or
+  power/current throttling, while nothing is queued. The driver logs it and raises a kqueue
+  note on the ctl node. It never fights the firmware.
+- **Thermal events.** Once interrupts are up, the backend hooks the thermal and firmware
+  interrupt sources. On a high-temperature or throttle event it logs, raises a note, and drops
+  its own requests to the defaults.
+
+### A6. Incident 2026-11-12: a card left at its limit
+
+After the stage 3c run (IP firmware loaded, RLC booted, SMU features enabled, which powered GC
+up), the R9700 sat with no work for about 15 minutes at:
+- 299 W of its 300 W limit;
+- hotspot 98 °C, edge 56 °C;
+- fan 73 %;
+- gfx 3.19 GHz at "100 % busy", PPT0 and hotspot throttlers active.
+
+Signs on the host: the PCH rose from 28 to 42 °C with the CPU idle. CP_STAT was 0 and the CP
+engines were halted. AllowGfxOff was accepted, but the card stayed in that state. The
+firmware's protections held it inside its limits, so there was no damage. It was powered off
+from FreeBSD (`shutdown -p`) at 17:02.
+
+Likely cause (unconfirmed): GC was up with the RLC running but none of the driver's gfx init
+done. amdgpu at this point runs gfx_v12_0 hw_init: CP resume, clock gating (RLC_CGCG_CGLS_CTRL
+CGCG/CGLS), power gating. Without those, the firmware sees gfx as busy and DPM holds it at the
+top clock.
+
+What changed:
+- rule 7, with `hw.atrium_gpu.gc_up_ok`;
+- the idle check;
+- P2's box test is now exactly this case.
+
+---
+
+## Part B: backends
+
+A backend is chosen by the discovered controller IP version, never by device id. It supplies:
+
+| Op | Meaning |
+|---|---|
+| `start` | Bring the controller to running, check the required protections (A3.2), read `Limits` |
+| `telemetry` | One `Telemetry` sample, already checked |
+| `set_levers` | Carry out `Levers` (only the levers it has) |
+| `idle_guard` / `idle_release` | Hold the block powered for a register sequence; always released |
+| `stop` | A3.6: defaults, idle, unload handshake |
+
+These join the driver's existing `atrium_gpu_backend_ops` seam in P2, where the lifecycle wiring
+lands. Until then the AMD backend is `smu.c` + `rs/smu_metrics.rs` behind the test hook.
+
+### B1. AMD: SMU generations
+
+Everything that differs between SMU generations is data:
+- **`smu_gens[]` in `smu.c`**, matched on MP1 major.minor and a revision range: mailbox
+  registers, message ids for the allowlist enum, the required-feature mask, table ids. An id of
+  0 means the generation lacks that message; the sender refuses it.
+- **`LAYOUTS` in `rs/smu_metrics.rs`**, matched on the PMFW's driver interface version: offsets
+  of the `SmuMetrics_t` fields read, and the throttler-id → class map. Each row records its
+  evidence.
+
+Adding a GPU family is adding rows, with the evidence. Interface sources are Linux's
+MIT-licensed `smu_cmn.c`, `smu_v1x_0*.c`, `*_ppsmc.h`, `smu1x_driver_if_*.h`.
+
+**SMU 14.0.2 / 14.0.3 (RDNA4).** The R9700 runs SCPM: on 2026-11-12 the SMU refused
+SetAllowedFeaturesMask with 0xFD.
 
 | Phase | Message (id) | Notes |
 |---|---|---|
-| Start | TestMessage (0x01), GetSmuVersion (0x02), GetDriverIfVersion (0x03) | log versions; driver-if is used for the metrics layout (§4) |
+| Start | TestMessage (0x01), GetSmuVersion (0x02), GetDriverIfVersion (0x03) | driver-if picks the metrics layout |
 | Start | SetDriverDramAddrHigh/Low (0x0E/0x0F) | 1 MiB driver table in VRAM, inside the driver's reserved area |
 | Start | RunDcBtc (0x36) | as amdgpu |
-| Start | SetAllowedFeaturesMaskHigh/Low (0x05/0x04), all ones | 0xFD under SCPM is expected and skipped |
-| Start | EnableAllSmuFeatures (0x06) | |
-| Start | GetRunningSmuFeaturesLow/High (0x0C/0x0D) | checked against the required set (§4) |
-| Run | TransferTableSmu2Dram (0x12), arg TABLE_SMU_METRICS (5) | telemetry, §4 |
-| Run | AllowGfxOff (0x28) / DisallowGfxOff (0x29) | §5 |
-| Run | SetPptLimit (0x32) / GetPptLimit (0x33) | cap, only downward (rule 3) |
-| Run | SetSoftMaxByFreq (0x1A), GetMinDpmFreq / GetMaxDpmFreq (0x1D/0x1E) | posture powersave only |
-| Run | SetWorkloadMask (0x24) | profile per posture; default "3D fullscreen" / "compute" as amdgpu |
-| Stop | PrepareMp1ForUnload (0x2E) | last message before detach / reset / shutdown |
+| Start | SetAllowedFeaturesMaskHigh/Low (0x05/0x04), all ones | 0xFD under SCPM is expected and skipped; anywhere else 0xFD is an error |
+| Start | EnableAllSmuFeatures (0x06) | powers GC up: rule 7 |
+| Start | GetRunningSmuFeaturesLow/High (0x0C/0x0D) | checked against the required set |
+| Run | TransferTableSmu2Dram (0x12), arg TABLE_SMU_METRICS (5) | telemetry |
+| Run | AllowGfxOff (0x28) / DisallowGfxOff (0x29) | idle policy, scoped guard |
+| Run | SetPptLimit (0x32) / GetPptLimit (0x33) | cap (P4; not in the table yet) |
+| Run | SetSoftMaxByFreq (0x1A), GetMin/MaxDpmFreq (0x1D/0x1E) | soft max (P4; not in the table yet) |
+| Run | SetWorkloadMask (0x24) | profile (P4; not in the table yet) |
+| Stop | PrepareMp1ForUnload (0x2E) | last message (P2; not in the table yet) |
 
-## 4. Telemetry (P1, before any workload)
+Never sent: DisableAllSmuFeatures, Disable/EnableSmuFeatures*, OverDrive or
+PPTABLE/CUSTOM_SKUTABLE writes (TransferTableDram2Smu), manual fan, voltage offsets,
+SetHardMinByFreq above default.
 
-- **Required features after enable.** The running-features mask must have these bits:
-  - THROTTLERS (23)
-  - FW_CTF (28)
-  - FAN_CONTROL (29)
-  - VR0HOT (27)
-  - FW_DSTATE (17)
-  - MEM_TEMP_READ (46)
+Required features:
+- FW_DSTATE 17
+- THROTTLERS 23
+- VR0HOT 27
+- FW_CTF 28
+- FAN_CONTROL 29
+- MEM_TEMP_READ 46
 
-  If any is missing, the driver logs it and refuses to attach. The R9700 on 2026-11-12
-  reported 0x0488f19e38fffcfb, and all six are set.
-- **Metrics.** TransferTableSmu2Dram(TABLE_SMU_METRICS) into the driver table, then a read
-  through BAR0. Fields:
-  - AvgTemperature[] (edge, hotspot, memory, VRs)
-  - AverageSocketPower, AverageTotalBoardPower
-  - AvgFanRpm / AvgFanPwm
-  - CurrClock[] and the average gfx/mem clocks
-  - ThrottlingPercentage[]
-  - MetricsCounter
+The R9700 reported 0x0488f19e38fffcfb, which has all six.
 
-  **Layout risk:** the PMFW reports driver interface 0x33, but the newest Linux header we
-  have (`smu14_driver_if_v14_0.h`) is 0x2E. The table is parsed by a Rust module with the
-  offsets for each interface version it knows. Values are checked for plausibility:
-  - temperatures 0–125 °C
-  - MetricsCounter advancing between reads
-  - fan RPM ≤ 10 000
+Metrics layouts:
+- **0x2E**: from the header.
+- **0x33**: the R9700's PMFW 0x685000. The same offsets were confirmed against a raw table
+  read on the box (fixture `rs-host-tests/data/smu14_if33_r9700_hot.bin`):
+  - dGPU_W_MAX 300 W;
+  - socket and board power 299 W under PPT0;
+  - moving-average power 303 W;
+  - nine temperatures 40–98 °C;
+  - fan 3470 rpm / 73 %.
 
-  An unknown version or an implausible value reports "telemetry unavailable" and is never
-  guessed. Until the 0x33 layout is confirmed, the driver also reads the edge temperature
-  from the THM block's current-temperature register as a cross-check.
-- **Exposed** as sysctls `dev.atrium_gpu.0.power.*`: temperatures, power, fan, clocks,
-  throttle reasons, features, versions. The federation member `gpu0` publishes power and
-  residency read-only (energy-policy §Shared).
-- **Polling.** Every 1 s while busy, 5 s idle, from a taskqueue, never from the ISR.
+  MetricsCounter does not advance per read on this PMFW, so it is not a plausibility check.
 
-## 5. Policy
+Throttler classes:
+- ids 0–11: thermal
+- ids 12–13 (TDC): current
+- ids 14–17 (PPT): power
+- ids 18–20: other
 
-| Posture (power-posture spec) | GfxOff | Workload mask | Cap | Soft max gfxclk |
-|---|---|---|---|---|
-| 0 powersave | allowed | power saving | min(default, budget grant) | 70 % of default max |
-| 5 balanced (default) | allowed | 3D / compute | min(default, budget grant) | default |
-| 10 performance | allowed (held off only while work is queued) | 3D / compute | min(default, grant) | default |
+---
 
-- **Federation.** `actuate(grant, P)` maps as the table; `demand(P)` comes from the metrics
-  table's power reading and the roofline profile. On gpusim the same levers are driver-owned
-  gating (`powergate.rs`). The posture spec's deadline-aware pre-wake stays on at every
-  posture: with GfxOff allowed it is what hides the power-up latency.
-- **GfxOff is allowed by default.** The driver disallows it only around register sequences
-  that need GC powered (bring-up, reset, MES queue map), as a scoped guard that always
-  re-allows. The bring-up test hook leaving it disallowed is a known gap, closed in P2.
-- **Energy cap.** The budget grant from `water_fill` becomes SetPptLimit. It is clamped to
-  [SMU min, default] and changed at most once a second, with hysteresis.
-- **Thermal events.** Once the IH ring is up (stage 4), the driver hooks THM DIG_THERM L2H/H2L
-  and the SMU's interrupt source. On L2H or a throttle event it logs, raises a kqueue note on
-  the ctl node, and drops its own requests to default. It never fights the PMFW's throttling.
+## Phases
 
-## 6. Phases
+- **P1 telemetry.** Done 2026-11-12 (55cb52b2, then this revision):
+  - the allowlisted sender with failed-link state;
+  - the required-features check;
+  - the metrics read with the neutral record, plausibility checks and idle check.
 
-- **P1 telemetry (gates stage 4).**
-  - The allowlisted sender: `smu.c` reworked, message enum, failed-link state.
-  - Required-features check.
-  - Metrics read (Rust parser, plausibility checks, THM cross-check).
-  - Sysctls.
-  - Box test: idle baseline, then the same values under the first dispatches in stage 4.
-- **P2 lifecycle.**
-  - GfxOff allowed after bring-up, plus the scoped guard.
-  - Detach / unload / reset sequence (rule 6).
-  - Box test: load, unload, load again, with the features mask and metrics unchanged.
+  Still to do:
+  - the THM cross-check;
+  - sysctls.
+- **P2 lifecycle (gates stage 4).**
+  - gfx init enough for GC to idle (clock and power gating, as gfx_v12_0);
+  - GfxOff allowed after bring-up, with the scoped guard;
+  - detach / unload / reset sequence (A3.6) with PrepareMp1ForUnload;
+  - the backend ops on `atrium_gpu_backend_ops`.
+
+  **Box test:**
+  1. Cold boot.
+  2. Load with `gc_up_ok=1`.
+  3. Unload.
+  4. Within 10 s the telemetry shows idle (busy ≤ 20 %, power well under the limit, no
+     PPT throttling) and stays there for 5 minutes.
+  5. Load again: the features mask and metrics are unchanged.
 - **P3 thermal interrupts** (after IH in stage 4).
-- **P4 posture and cap** (federation member `gpu0` on silicon). Box test: a cap step-down
-  shows in AverageSocketPower within 2 s.
+- **P4 posture and cap** (federation member `gpu0` on silicon). Adds SetPptLimit, soft max and
+  SetWorkloadMask to the table. **Box test:** a cap step-down shows in package power within
+  2 s.
 
-Every box run reads the metrics before and after, and its log goes in
+Every box run reads the telemetry before and after, and its log goes in
 [r9700-bare-metal.md](r9700-bare-metal.md) §5.
 
-## 7. Non-goals
+## Non-goals
 
-- Overclocking, undervolting, overdrive and fan curves (rule 2).
-- Driving power for VCN/JPEG/DCN beyond what EnableAllSmuFeatures does: those features
-  power on demand under the PMFW.
-- BACO / runtime D3: later, a separate spec section once suspend exists.
+- Overclocking, undervolting, overdrive and fan curves (A3.2).
+- Driving power for video/display engines beyond what the firmware does on its own.
+- BACO / runtime D3: later, a separate section once suspend exists.

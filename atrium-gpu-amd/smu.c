@@ -20,6 +20,14 @@
  * answer or timeout stops all SMU traffic; the PMFW's own idle policy
  * (GfxOff allowed) is handed back at the end.
  *
+ * Vendor-neutral split (spec §2, §8): everything SMU-generation-specific
+ * (mailbox registers, message ids, required feature bits, table ids) is a
+ * row of smu_gens[], picked by MP1's discovered version; the metrics
+ * layout is picked by the PMFW's driver interface version in Rust
+ * (rs/smu_metrics.rs) and comes out as the neutral telemetry record
+ * (rs/power.rs). An MP1 version with no row gets no messages at all; a
+ * driver interface with no layout gets no decoded telemetry.
+ *
  * Sequence (smu_hw_init / smu_smc_hw_setup for 14.0.2/3, no SCPM writes):
  * TestMessage, GetSmuVersion, GetDriverIfVersion, SetDriverDramAddr (a VRAM
  * buffer for later table transfers), RunDcBtc, SetAllowedFeaturesMask (all,
@@ -33,19 +41,15 @@
 #include <dev/pci/pcireg.h>
 #include <dev/pci/pcivar.h>
 
-/* MP1 14.x mailbox, dword offsets in MP1 segment 1. */
-#define SMU14_C2PMSG_66		0x82	/* message */
-#define SMU14_C2PMSG_82		0x92	/* argument / output */
-#define SMU14_C2PMSG_90		0x9a	/* response */
 #define SMU_RESP_OK		0x01
 #define SMU_RESP_BAD_PREREQ	0xfd
 #define SMU_WAIT_US		2000000
 
 /*
  * The allowlist (docs/spec/gpu-power-management.md §2 rule 1, §3): the only
- * messages this driver can express. smu_send() takes an index into this
- * table, never a raw id; adding a row is a spec change. Ids from
- * smu_v14_0_2_ppsmc.h.
+ * messages this driver can express. smu_send() takes one of these, never a
+ * raw id, and looks its id up in the SMU generation's row; adding a message
+ * is a spec change.
  */
 enum amd_smu_msg {
 	SMU_TEST,
@@ -64,51 +68,100 @@ enum amd_smu_msg {
 	SMU_DISALLOW_GFXOFF,
 	SMU_NMSG
 };
-static const struct {
-	uint16_t id;
-	const char *name;
-} smu_msgs[SMU_NMSG] = {
-	[SMU_TEST] =		{ 0x01, "TestMessage" },
-	[SMU_GET_VERSION] =	{ 0x02, "GetSmuVersion" },
-	[SMU_GET_DRIVER_IF] =	{ 0x03, "GetDriverIfVersion" },
-	[SMU_SET_DRIVER_ADDR_HI] = { 0x0e, "SetDriverDramAddrHigh" },
-	[SMU_SET_DRIVER_ADDR_LO] = { 0x0f, "SetDriverDramAddrLow" },
-	[SMU_RUN_DC_BTC] =	{ 0x36, "RunDcBtc" },
-	[SMU_SET_ALLOWED_HI] =	{ 0x05, "SetAllowedFeaturesMaskHigh" },
-	[SMU_SET_ALLOWED_LO] =	{ 0x04, "SetAllowedFeaturesMaskLow" },
-	[SMU_ENABLE_ALL] =	{ 0x06, "EnableAllSmuFeatures" },
-	[SMU_GET_RUNNING_LO] =	{ 0x0c, "GetRunningSmuFeaturesLow" },
-	[SMU_GET_RUNNING_HI] =	{ 0x0d, "GetRunningSmuFeaturesHigh" },
-	[SMU_TABLE_SMU2DRAM] =	{ 0x12, "TransferTableSmu2Dram" },
-	[SMU_ALLOW_GFXOFF] =	{ 0x28, "AllowGfxOff" },
-	[SMU_DISALLOW_GFXOFF] =	{ 0x29, "DisallowGfxOff" },
+static const char *const smu_msg_names[SMU_NMSG] = {
+	[SMU_TEST] = "TestMessage",
+	[SMU_GET_VERSION] = "GetSmuVersion",
+	[SMU_GET_DRIVER_IF] = "GetDriverIfVersion",
+	[SMU_SET_DRIVER_ADDR_HI] = "SetDriverDramAddrHigh",
+	[SMU_SET_DRIVER_ADDR_LO] = "SetDriverDramAddrLow",
+	[SMU_RUN_DC_BTC] = "RunDcBtc",
+	[SMU_SET_ALLOWED_HI] = "SetAllowedFeaturesMaskHigh",
+	[SMU_SET_ALLOWED_LO] = "SetAllowedFeaturesMaskLow",
+	[SMU_ENABLE_ALL] = "EnableAllSmuFeatures",
+	[SMU_GET_RUNNING_LO] = "GetRunningSmuFeaturesLow",
+	[SMU_GET_RUNNING_HI] = "GetRunningSmuFeaturesHigh",
+	[SMU_TABLE_SMU2DRAM] = "TransferTableSmu2Dram",
+	[SMU_ALLOW_GFXOFF] = "AllowGfxOff",
+	[SMU_DISALLOW_GFXOFF] = "DisallowGfxOff",
 };
-#define SMU_TABLE_SMU_METRICS	5
 
 /*
- * Features the PMFW must be running before the GPU is used (spec §4):
- * VR0HOT 27, FW_CTF 28, FAN_CONTROL 29, THROTTLERS 23, FW_DSTATE 17,
- * MEM_TEMP_READ 46 (smu14_driver_if_v14_0.h).
+ * One SMU generation: what differs between MP1 versions. A message id of 0
+ * means the generation has no such message, and smu_send() refuses it.
  */
-#define SMU_REQUIRED_FEATURES	((1ull << 17) | (1ull << 23) | (1ull << 27) | \
-	(1ull << 28) | (1ull << 29) | (1ull << 46))
-
-struct amd_smu_metrics {	/* rs/smu_metrics.rs Metrics */
-	uint32_t verified, counter;
-	uint16_t temp_c[12];
-	uint16_t socket_power_w, board_power_w, fan_rpm;
-	uint8_t fan_pwm, gfx_activity;
-	uint16_t gfxclk_mhz, memclk_mhz;
-	uint32_t clk_mhz[11];
-	uint8_t throttling[21], pad[3];
+struct smu_gen {
+	uint8_t		mp1_major, mp1_minor, mp1_rev_min, mp1_rev_max;
+	const char	*name;
+	/* Mailbox, dword offsets in MP1 segment 1. */
+	uint32_t	reg_msg, reg_arg, reg_resp;
+	uint16_t	msg[SMU_NMSG];
+	/* Features that must be running before the GPU is used (spec §4). */
+	uint64_t	required;
+	uint32_t	table_metrics;
 };
+
+static const struct smu_gen smu_gens[] = {
+	{
+		/*
+		 * SMU 14.0.2 / 14.0.3 (RDNA4): smu_v14_0_2_ppsmc.h ids,
+		 * mp_14_0_2_offset.h C2PMSG_66/82/90, required features from
+		 * smu14_driver_if_v14_0.h: FW_DSTATE 17, THROTTLERS 23,
+		 * VR0HOT 27, FW_CTF 28, FAN_CONTROL 29, MEM_TEMP_READ 46.
+		 */
+		.mp1_major = 14, .mp1_minor = 0, .mp1_rev_min = 2,
+		.mp1_rev_max = 3, .name = "SMU 14.0.2/3",
+		.reg_msg = 0x82, .reg_arg = 0x92, .reg_resp = 0x9a,
+		.msg = {
+			[SMU_TEST] = 0x01,
+			[SMU_GET_VERSION] = 0x02,
+			[SMU_GET_DRIVER_IF] = 0x03,
+			[SMU_SET_DRIVER_ADDR_HI] = 0x0e,
+			[SMU_SET_DRIVER_ADDR_LO] = 0x0f,
+			[SMU_RUN_DC_BTC] = 0x36,
+			[SMU_SET_ALLOWED_HI] = 0x05,
+			[SMU_SET_ALLOWED_LO] = 0x04,
+			[SMU_ENABLE_ALL] = 0x06,
+			[SMU_GET_RUNNING_LO] = 0x0c,
+			[SMU_GET_RUNNING_HI] = 0x0d,
+			[SMU_TABLE_SMU2DRAM] = 0x12,
+			[SMU_ALLOW_GFXOFF] = 0x28,
+			[SMU_DISALLOW_GFXOFF] = 0x29,
+		},
+		.required = (1ull << 17) | (1ull << 23) | (1ull << 27) |
+		    (1ull << 28) | (1ull << 29) | (1ull << 46),
+		.table_metrics = 5,
+	},
+};
+
+static const struct smu_gen *
+smu_gen_find(const struct atrium_amd_softc *sc)
+{
+	size_t i;
+
+	if (!sc->ip.mp1.present)
+		return (NULL);
+	for (i = 0; i < nitems(smu_gens); i++) {
+		const struct smu_gen *g = &smu_gens[i];
+
+		if (sc->ip.mp1.major == g->mp1_major &&
+		    sc->ip.mp1.minor == g->mp1_minor &&
+		    sc->ip.mp1.rev >= g->mp1_rev_min &&
+		    sc->ip.mp1.rev <= g->mp1_rev_max)
+			return (g);
+	}
+	return (NULL);
+}
+
+CTASSERT(sizeof(struct atrium_gpu_power_telemetry) == 36);
+size_t	atrium_amd_smu_metrics_len(uint32_t ifver);		/* Rust */
 int	atrium_amd_smu_metrics(const uint8_t *b, size_t len, uint32_t ifver,
-	    struct amd_smu_metrics *out);	/* Rust */
-#define SMU_METRICS_LEN		260
+	    struct atrium_gpu_power_telemetry *out);		/* Rust */
+#define SMU_METRICS_MAX		512
 
 /* One sender, one state: after a bad answer nothing more is sent (rule 4). */
 struct smu_link {
 	struct atrium_amd_softc *sc;
+	const struct smu_gen *gen;
 	bool failed;
 };
 
@@ -132,13 +185,14 @@ smu_reg(struct atrium_amd_softc *sc, uint32_t dw)
 }
 
 static uint32_t
-smu_poll(struct atrium_amd_softc *sc)
+smu_poll(struct smu_link *l)
 {
+	struct atrium_amd_softc *sc = l->sc;
 	uint32_t v = 0;
 	int us;
 
 	for (us = 0; us < SMU_WAIT_US; us += 10) {
-		v = amd_mmio_read32(sc, smu_reg(sc, SMU14_C2PMSG_90));
+		v = amd_mmio_read32(sc, smu_reg(sc, l->gen->reg_resp));
 		if (v != 0)
 			break;
 		DELAY(10);
@@ -162,21 +216,26 @@ smu_send(struct smu_link *l, enum amd_smu_msg m, uint32_t arg, uint32_t *out,
 
 	if (l->failed || m >= SMU_NMSG)
 		return (0);
-	resp = smu_poll(sc);
+	if (l->gen->msg[m] == 0) {
+		device_printf(sc->dev, "smu: %s has no %s; not sent\n",
+		    l->gen->name, smu_msg_names[m]);
+		return (0);
+	}
+	resp = smu_poll(l);
 	if (resp == 0) {
 		device_printf(sc->dev, "smu: %s: previous message never "
-		    "answered; link failed, PMFW left alone\n", smu_msgs[m].name);
+		    "answered; link failed, PMFW left alone\n", smu_msg_names[m]);
 		l->failed = true;
 		return (0);
 	}
-	amd_mmio_write32(sc, smu_reg(sc, SMU14_C2PMSG_90), 0);
-	amd_mmio_write32(sc, smu_reg(sc, SMU14_C2PMSG_82), arg);
-	amd_mmio_write32(sc, smu_reg(sc, SMU14_C2PMSG_66), smu_msgs[m].id);
-	resp = smu_poll(sc);
+	amd_mmio_write32(sc, smu_reg(sc, l->gen->reg_resp), 0);
+	amd_mmio_write32(sc, smu_reg(sc, l->gen->reg_arg), arg);
+	amd_mmio_write32(sc, smu_reg(sc, l->gen->reg_msg), l->gen->msg[m]);
+	resp = smu_poll(l);
 	if (resp == SMU_RESP_OK && out != NULL)
-		*out = amd_mmio_read32(sc, smu_reg(sc, SMU14_C2PMSG_82));
+		*out = amd_mmio_read32(sc, smu_reg(sc, l->gen->reg_arg));
 	device_printf(sc->dev, "smu: %-26s arg %#010x: resp %#x%s",
-	    smu_msgs[m].name, arg, resp, resp == 0 ? " (timeout)" : "");
+	    smu_msg_names[m], arg, resp, resp == 0 ? " (timeout)" : "");
 	if (resp == SMU_RESP_OK && out != NULL)
 		printf(", out %#x", *out);
 	printf("\n");
@@ -226,45 +285,50 @@ smu_features(struct smu_link *l)
 
 /*
  * TransferTableSmu2Dram(SMU_METRICS) into the driver table, read it through
- * BAR0, hand it to the Rust parser (range-checked; untrusted bytes).
+ * BAR0, hand it to the Rust decoder (layout by driver interface version,
+ * range-checked; untrusted bytes), which returns the neutral telemetry
+ * record. Returns true if `t` holds a sample.
  */
-static void
+static bool
 smu_metrics(struct smu_link *l, struct resource *vram, uint32_t ifver,
-    bool dump)
+    bool dump, struct atrium_gpu_power_telemetry *t)
 {
 	struct atrium_amd_softc *sc = l->sc;
-	struct amd_smu_metrics m;
-	uint8_t b[SMU_METRICS_LEN];
+	uint8_t b[SMU_METRICS_MAX];
+	size_t len = atrium_amd_smu_metrics_len(ifver);
 	int r, i;
 
-	if (smu_send(l, SMU_TABLE_SMU2DRAM, SMU_TABLE_SMU_METRICS, NULL,
-	    false) != SMU_RESP_OK)
-		return;
-	bus_read_region_1(vram, SMU_TABLE_VRAM_OFF, b, sizeof(b));
-	if (dump) {
-		/* Raw once, to check the layout by eye (interface version). */
-		for (i = 0; i < SMU_METRICS_LEN; i += 32)
-			device_printf(sc->dev, "smu: metrics +%3d: %32D\n", i,
-			    b + i, " ");
+	if (len == 0 || len > sizeof(b)) {
+		device_printf(sc->dev, "smu: telemetry unavailable: no metrics "
+		    "layout for driver interface %#x\n", ifver);
+		return (false);
 	}
-	r = atrium_amd_smu_metrics(b, sizeof(b), ifver, &m);
+	if (smu_send(l, SMU_TABLE_SMU2DRAM, l->gen->table_metrics, NULL,
+	    false) != SMU_RESP_OK)
+		return (false);
+	bus_read_region_1(vram, SMU_TABLE_VRAM_OFF, b, len);
+	if (dump) {
+		/* Raw once, to check the layout by eye. */
+		for (i = 0; i < (int)len; i += 32)
+			device_printf(sc->dev, "smu: metrics +%3d: %*D\n", i,
+			    (int)MIN(32, len - i), b + i, " ");
+	}
+	r = atrium_amd_smu_metrics(b, len, ifver, t);
 	if (r < 0) {
 		device_printf(sc->dev, "smu: telemetry unavailable (%s %d; "
-		    "driver interface %#x)\n", r == -10000 ? "short read" :
-		    "implausible field at byte", r == -10000 ? 0 : -r - 1, ifver);
-		return;
+		    "driver interface %#x)\n", r <= -10 ?
+		    "implausible field" : "decode error", r <= -10 ? -r - 10 :
+		    -r, ifver);
+		return (false);
 	}
-	device_printf(sc->dev, "smu: metrics #%u%s: edge %u C, hotspot %u C, "
-	    "mem %u C, VR gfx %u C; socket %u W, board %u W; fan %u rpm "
-	    "(%u%%); gfx %u MHz, mem %u MHz, gfx busy %u%%\n", m.counter,
-	    m.verified ? "" : " (layout unverified for this interface)",
-	    m.temp_c[0], m.temp_c[1], m.temp_c[4], m.temp_c[5],
-	    m.socket_power_w, m.board_power_w, m.fan_rpm, m.fan_pwm,
-	    m.gfxclk_mhz, m.memclk_mhz, m.gfx_activity);
-	for (i = 0; i < 21; i++)
-		if (m.throttling[i] != 0)
-			device_printf(sc->dev, "smu: throttler %d active %u%%\n",
-			    i, m.throttling[i]);
+	device_printf(sc->dev, "smu: telemetry #%u: edge %u C, hotspot %u C, "
+	    "mem %u C, VR %u C; power %u W of %u W limit, board %u W; fan "
+	    "%u rpm (%u%%); gfx %u MHz, mem %u MHz, gfx busy %u%%; throttle "
+	    "%#x (ids %#x)\n", t->sample, t->edge_c, t->hotspot_c, t->mem_c,
+	    t->vr_c, t->power_w, t->power_limit_w, t->board_power_w,
+	    t->fan_rpm, t->fan_pct, t->gfx_mhz, t->mem_mhz, t->gfx_busy_pct,
+	    t->throttle, t->vendor_throttle);
+	return (true);
 }
 
 int
@@ -273,17 +337,20 @@ amd_smu_init(struct atrium_amd_softc *sc)
 	struct resource *vram = NULL;
 	uint64_t fb_base, mc;
 	struct smu_link link = { .sc = sc, .failed = false };
+	struct atrium_gpu_power_telemetry t;
 	uint64_t feat;
 	uint32_t v, ifver = 0;
 	bus_size_t lim = rman_get_size(sc->regs);
-	int rid, us, err = 0;
+	int rid, us, err = 0, gc_up_ok = 0;
 
 #define	SEND(m, a, o)	smu_send(&link, (m), (a), (o), false)
-	if (!sc->ip.mp1.present || sc->ip.mp1.major != 14 ||
-	    sc->ip.mp1.nbase < 2 ||
-	    smu_reg(sc, SMU14_C2PMSG_90) + 4 > lim) {
-		device_printf(sc->dev, "smu: SMU %u.%u.%u: no mailbox known "
-		    "here; not touching it\n", sc->ip.mp1.major,
+	link.gen = smu_gen_find(sc);
+	if (link.gen == NULL || sc->ip.mp1.nbase < 2 ||
+	    smu_reg(sc, link.gen->reg_msg) + 4 > lim ||
+	    smu_reg(sc, link.gen->reg_arg) + 4 > lim ||
+	    smu_reg(sc, link.gen->reg_resp) + 4 > lim) {
+		device_printf(sc->dev, "smu: SMU %u.%u.%u: no generation "
+		    "table for it; not touching it\n", sc->ip.mp1.major,
 		    sc->ip.mp1.minor, sc->ip.mp1.rev);
 		return (ENOTSUP);
 	}
@@ -311,7 +378,7 @@ amd_smu_init(struct atrium_amd_softc *sc)
 
 	device_printf(sc->dev, "smu: SMU %u.%u.%u, response register %#x\n",
 	    sc->ip.mp1.major, sc->ip.mp1.minor, sc->ip.mp1.rev,
-	    amd_mmio_read32(sc, smu_reg(sc, SMU14_C2PMSG_90)));
+	    amd_mmio_read32(sc, smu_reg(sc, link.gen->reg_resp)));
 	gc_report(sc, "before");
 
 	if (SEND(SMU_TEST, 0, &v) != SMU_RESP_OK ||
@@ -330,6 +397,20 @@ amd_smu_init(struct atrium_amd_softc *sc)
 	feat = smu_features(&link);
 	if (link.failed) {
 		err = EIO;
+		goto out;
+	}
+	/*
+	 * Enabling the features powers GC up. Until the driver can bring GC
+	 * back to idle itself (power P2), that leaves the card at full clock
+	 * and its power limit with nothing running: the R9700 on 2026-11-12
+	 * sat at 299 W, hotspot 98 C, until it was powered off. So it takes
+	 * a second, explicit opt-in.
+	 */
+	TUNABLE_INT_FETCH("hw.atrium_gpu.gc_up_ok", &gc_up_ok);
+	if (feat == 0 && !gc_up_ok) {
+		device_printf(sc->dev, "smu: features not running; enabling "
+		    "them powers GC up and the driver cannot idle it yet "
+		    "(power P2). Not enabling (hw.atrium_gpu.gc_up_ok=0)\n");
 		goto out;
 	}
 	if (feat == 0) {
@@ -358,11 +439,11 @@ amd_smu_init(struct atrium_amd_softc *sc)
 	} else
 		device_printf(sc->dev, "smu: features already running this "
 		    "boot; not enabling again\n");
-	if ((feat & SMU_REQUIRED_FEATURES) != SMU_REQUIRED_FEATURES) {
+	if ((feat & link.gen->required) != link.gen->required) {
 		device_printf(sc->dev, "smu: required protection features "
 		    "missing (%#jx of %#jx); refusing the GPU\n",
-		    (uintmax_t)(feat & SMU_REQUIRED_FEATURES),
-		    (uintmax_t)SMU_REQUIRED_FEATURES);
+		    (uintmax_t)(feat & link.gen->required),
+		    (uintmax_t)link.gen->required);
 		err = EIO;
 		goto out;
 	}
@@ -381,10 +462,18 @@ amd_smu_init(struct atrium_amd_softc *sc)
 	    us < GC_WAIT_US ? "complete" : "NOT complete", us);
 	gc_report(sc, "after");
 
-	/* Telemetry, read only (spec §4): two reads 1 s apart. */
-	smu_metrics(&link, vram, ifver, true);
+	/*
+	 * Telemetry, read only (spec §4): two reads 1 s apart. Nothing is
+	 * queued here, so a busy or limit-bound card is reported (§5 idle
+	 * check).
+	 */
+	if (smu_metrics(&link, vram, ifver, true, &t) &&
+	    atrium_gpu_power_idle_suspicious(&t))
+		device_printf(sc->dev, "smu: WARNING: card is busy or at its "
+		    "power limit with no work queued; it will stay so until "
+		    "power-cycled\n");
 	pause("smumet", hz);
-	smu_metrics(&link, vram, ifver, false);
+	(void)smu_metrics(&link, vram, ifver, false, &t);
 
 	/* Hand back the PMFW's own idle policy (rule 6). */
 	(void)SEND(SMU_ALLOW_GFXOFF, 0, NULL);

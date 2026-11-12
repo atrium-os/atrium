@@ -632,6 +632,23 @@ amd_psp_bootload(struct atrium_amd_softc *sc)
 			err = psp_load_toc(sc, vram, fb_base, fw, ++fence);
 			/* Stage 3c test hook: kenv hw.atrium_gpu.psp_ipfw=1. */
 			TUNABLE_INT_FETCH("hw.atrium_gpu.psp_ipfw", &ipfw);
+			/*
+			 * Loading the IP firmware boots the RLC with GC up,
+			 * which the driver cannot idle yet (power P2): needs
+			 * hw.atrium_gpu.gc_up_ok=1 too (smu.c).
+			 */
+			if (ipfw) {
+				int gc_up_ok = 0;
+
+				TUNABLE_INT_FETCH("hw.atrium_gpu.gc_up_ok",
+				    &gc_up_ok);
+				if (!gc_up_ok) {
+					device_printf(sc->dev, "psp: IP firmware "
+					    "load needs hw.atrium_gpu.gc_up_ok=1 "
+					    "(GC cannot be idled yet); skipped\n");
+					ipfw = 0;
+				}
+			}
 			if (err == 0 && ipfw)
 				err = psp_load_ip_fw(sc, vram, fb_base, &fence);
 			/* We do not stay attached: leave no ring behind. */

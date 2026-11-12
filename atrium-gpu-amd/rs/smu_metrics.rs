@@ -1,68 +1,106 @@
 /*-
  * SPDX-License-Identifier: BSD-2-Clause
  *
- * smu_metrics.rs — read the SMU 14 metrics table (TABLE_SMU_METRICS) the
- * PMFW writes into the driver table: temperatures, power, fan, clocks,
- * throttling. docs/spec/gpu-power-management.md §4.
+ * smu_metrics.rs — AMD backend: decode the SMU metrics table
+ * (TABLE_SMU_METRICS) the PMFW writes into the driver table, into the
+ * vendor-neutral `power::Telemetry` (docs/spec/gpu-power-management.md §4,
+ * §8). The bytes come from device VRAM, written by firmware: untrusted.
  *
- * The bytes come from device VRAM, written by firmware, so they are
- * untrusted: every value is range-checked and the whole read is refused if
- * one is implausible. The layout is `SmuMetrics_t` from Linux's MIT-licensed
- * smu14_driver_if_v14_0.h at driver interface 0x2E. A PMFW reporting another
- * interface version is parsed with the same layout but marked unverified;
- * the plausibility checks then carry the weight, and the caller says so.
+ * The layout is chosen by the driver interface version the PMFW reports
+ * (GetDriverIfVersion), from a table of layouts this file knows. An
+ * interface version that is not in the table is refused (Unsupported):
+ * nothing is decoded or shown, since a guessed layout reads garbage as
+ * fact. Adding a row needs evidence, recorded next to it.
  */
 
-/// Driver interface version whose layout this file encodes.
-pub const IF_VERSION_KNOWN: u32 = 0x2e;
-/// sizeof(SmuMetrics_t) at 0x2E.
-pub const METRICS_LEN: usize = 260;
+use crate::power::{self, Telemetry};
 
-pub const TEMP_COUNT: usize = 12;
-pub const THROTTLER_COUNT: usize = 21;
-pub const PPCLK_COUNT: usize = 11;
+/// AMD throttler ids (THROTTLER_*_BIT, smu14_driver_if_v14_0.h) → class.
+const THROTTLER_COUNT: usize = 21;
 
-/// TEMP_e order.
-pub mod temp {
-    pub const EDGE: usize = 0;
-    pub const HOTSPOT: usize = 1;
-    pub const HOTSPOT_GFX: usize = 2;
-    pub const HOTSPOT_SOC: usize = 3;
-    pub const MEM: usize = 4;
-    pub const VR_GFX: usize = 5;
-    pub const VR_SOC: usize = 6;
-    pub const VR_MEM0: usize = 7;
-    pub const VR_MEM1: usize = 8;
+/// One `SmuMetrics_t` layout: byte offsets of the fields we read.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Layout {
+    pub len: usize,
+    gfxclk_postds: usize,
+    memclk_postds: usize,
+    power_limit: usize,
+    counter: usize,
+    gfx_activity: usize,
+    socket_power: usize,
+    board_power: usize,
+    temp: usize,
+    fan_pwm: usize,
+    fan_rpm: usize,
+    throttling: usize,
+    /// THROTTLER bit → power::throttle class.
+    classes: [u32; THROTTLER_COUNT],
 }
 
-/// What the driver exposes, C layout (atrium_gpu_amd.h struct amd_smu_metrics).
-#[repr(C)]
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub struct Metrics {
-    /// 1 if the PMFW's interface version is the one this layout is from.
-    pub verified: u32,
-    pub counter: u32,
-    /// °C, TEMP_e order.
-    pub temp_c: [u16; TEMP_COUNT],
-    pub socket_power_w: u16,
-    pub board_power_w: u16,
-    pub fan_rpm: u16,
-    pub fan_pwm: u8,
-    pub gfx_activity: u8,
-    pub gfxclk_mhz: u16,
-    pub memclk_mhz: u16,
-    /// MHz, PPCLK_e order.
-    pub clk_mhz: [u32; PPCLK_COUNT],
-    /// Percent of time throttled, per throttler.
-    pub throttling: [u8; THROTTLER_COUNT],
-    pub _pad: [u8; 3],
+/// TEMP_e order within AvgTemperature[].
+const T_EDGE: usize = 0;
+const T_HOTSPOT: usize = 1;
+const T_MEM: usize = 4;
+const T_VR_GFX: usize = 5;
+
+const TH: u32 = power::throttle::THERMAL;
+const PW: u32 = power::throttle::POWER;
+const CU: u32 = power::throttle::CURRENT;
+const OT: u32 = power::throttle::OTHER;
+
+/// SMU 14.0.2/3 `SmuMetrics_t` (smu14_driver_if_v14_0.h; offsets checked
+/// with offsetof against the header). Throttlers 0–11 temperatures, 12–13
+/// TDC, 14–17 PPT, 18 FIT, 19–20 GFX APCC+/DVO.
+const SMU14_0_2: Layout = Layout {
+    len: 260,
+    gfxclk_postds: 48,
+    memclk_postds: 56,
+    power_limit: 68, // dGPU_W_MAX
+    counter: 104,
+    gfx_activity: 124,
+    socket_power: 136,
+    board_power: 138,
+    temp: 140,
+    fan_pwm: 168,
+    fan_rpm: 170,
+    throttling: 172,
+    classes: [
+        TH, TH, TH, TH, TH, TH, TH, TH, TH, TH, TH, TH, // temperatures
+        CU, CU, // TDC gfx, soc
+        PW, PW, PW, PW, // PPT0..3
+        OT, OT, OT, // FIT, APCC+, DVO
+    ],
+};
+
+/// Driver interface versions with a known layout, and the evidence.
+pub const LAYOUTS: &[(u32, Layout)] = &[
+    // The Linux header's own version.
+    (0x2e, SMU14_0_2),
+    // R9700 (SMU 14.0.3, PMFW 0x685000), 2026-11-12: raw table read on the
+    // box decodes self-consistently with the 0x2E offsets: dGPU_W_MAX 300 W
+    // (the board's TBP), socket = board power 299 W under PPT0 throttling,
+    // moving-average power 303 W, nine sensed temperatures 40–98 °C,
+    // hotspot ≥ edge, fan 3470 rpm at 73 %, gfxclk target/pre/post 3207/
+    // 3191/3191 MHz, MetricsCounter not advancing per read
+    // (docs/spec/r9700-bare-metal.md §5).
+    (0x33, SMU14_0_2),
+];
+
+pub fn layout(if_version: u32) -> Option<&'static Layout> {
+    LAYOUTS.iter().find(|(v, _)| *v == if_version).map(|(_, l)| l)
+}
+
+/// Bytes the caller must read for this interface version.
+pub fn len(if_version: u32) -> Option<usize> {
+    layout(if_version).map(|l| l.len)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MetricsError {
+    /// No layout for this driver interface version.
+    Unsupported,
     Short,
-    /// Field (byte offset) out of its plausible range.
-    Implausible(usize),
+    Implausible(power::Field),
 }
 
 fn le16(b: &[u8], o: usize) -> u16 {
@@ -72,77 +110,45 @@ fn le32(b: &[u8], o: usize) -> u32 {
     u32::from_le_bytes([b[o], b[o + 1], b[o + 2], b[o + 3]])
 }
 
-// SmuMetrics_t offsets at 0x2E (checked with offsetof against the header).
-const OFF_CURR_CLOCK: usize = 0;
-const OFF_GFXCLK_POSTDS: usize = 48;
-const OFF_MEMCLK_POSTDS: usize = 56;
-const OFF_COUNTER: usize = 104;
-const OFF_GFX_ACTIVITY: usize = 124;
-const OFF_SOCKET_POWER: usize = 136;
-const OFF_BOARD_POWER: usize = 138;
-const OFF_TEMP: usize = 140;
-const OFF_FAN_PWM: usize = 168;
-const OFF_FAN_RPM: usize = 170;
-const OFF_THROTTLING: usize = 172;
-
-/// Plausible ranges: a reading outside them means a wrong layout or garbage.
-const TEMP_MAX_C: u16 = 150;
-const POWER_MAX_W: u16 = 1500;
-const FAN_MAX_RPM: u16 = 10_000;
-const CLK_MAX_MHZ: u32 = 10_000;
-
-pub fn parse(b: &[u8], if_version: u32) -> Result<Metrics, MetricsError> {
-    if b.len() < METRICS_LEN {
+/// Decode and check one metrics table.
+pub fn parse(b: &[u8], if_version: u32) -> Result<Telemetry, MetricsError> {
+    let l = layout(if_version).ok_or(MetricsError::Unsupported)?;
+    if b.len() < l.len {
         return Err(MetricsError::Short);
     }
-    let mut m = Metrics {
-        verified: (if_version == IF_VERSION_KNOWN) as u32,
-        counter: le32(b, OFF_COUNTER),
-        socket_power_w: le16(b, OFF_SOCKET_POWER),
-        board_power_w: le16(b, OFF_BOARD_POWER),
-        fan_pwm: b[OFF_FAN_PWM],
-        fan_rpm: le16(b, OFF_FAN_RPM),
-        gfxclk_mhz: le16(b, OFF_GFXCLK_POSTDS),
-        memclk_mhz: le16(b, OFF_MEMCLK_POSTDS),
-        ..Metrics::default()
+    let temp = |i: usize| match le16(b, l.temp + 2 * i) {
+        0 if i == T_VR_GFX => power::UNKNOWN,
+        v => v,
     };
-    let act = le16(b, OFF_GFX_ACTIVITY);
-    if act > 100 {
-        return Err(MetricsError::Implausible(OFF_GFX_ACTIVITY));
-    }
-    m.gfx_activity = act as u8;
-    for (i, t) in m.temp_c.iter_mut().enumerate() {
-        *t = le16(b, OFF_TEMP + 2 * i);
-    }
-    for (i, c) in m.clk_mhz.iter_mut().enumerate() {
-        *c = le32(b, OFF_CURR_CLOCK + 4 * i);
-        if *c > CLK_MAX_MHZ {
-            return Err(MetricsError::Implausible(OFF_CURR_CLOCK + 4 * i));
+    let pct = |v: u16| if v > 100 { 0xfe } else { v as u8 }; // 0xfe fails check()
+    let mut t = Telemetry {
+        edge_c: temp(T_EDGE),
+        hotspot_c: temp(T_HOTSPOT),
+        mem_c: temp(T_MEM),
+        vr_c: temp(T_VR_GFX),
+        power_w: le16(b, l.socket_power),
+        board_power_w: le16(b, l.board_power),
+        power_limit_w: match le16(b, l.power_limit) {
+            0 => power::UNKNOWN,
+            v => v,
+        },
+        fan_rpm: le16(b, l.fan_rpm),
+        fan_pct: b[l.fan_pwm],
+        gfx_busy_pct: pct(le16(b, l.gfx_activity)),
+        gfx_mhz: le16(b, l.gfxclk_postds),
+        mem_mhz: le16(b, l.memclk_postds),
+        sample: le32(b, l.counter),
+        ..Telemetry::default()
+    };
+    for (i, &p) in b[l.throttling..l.throttling + THROTTLER_COUNT].iter().enumerate() {
+        if p > 100 {
+            return Err(MetricsError::Implausible(power::Field::Busy));
+        }
+        if p != 0 {
+            t.vendor_throttle |= 1 << i;
+            t.throttle |= l.classes[i];
         }
     }
-    m.throttling.copy_from_slice(&b[OFF_THROTTLING..OFF_THROTTLING + THROTTLER_COUNT]);
-    // Edge, hotspot and memory are always sensed on a dGPU; a 0 or a
-    // too-hot value means we are not reading what we think.
-    for i in [temp::EDGE, temp::HOTSPOT, temp::MEM] {
-        let t = m.temp_c[i];
-        if t == 0 || t > TEMP_MAX_C {
-            return Err(MetricsError::Implausible(OFF_TEMP + 2 * i));
-        }
-    }
-    if m.temp_c.iter().any(|&t| t > TEMP_MAX_C) {
-        return Err(MetricsError::Implausible(OFF_TEMP));
-    }
-    if m.temp_c[temp::HOTSPOT] < m.temp_c[temp::EDGE] {
-        return Err(MetricsError::Implausible(OFF_TEMP + 2 * temp::HOTSPOT));
-    }
-    if m.socket_power_w > POWER_MAX_W || m.board_power_w > POWER_MAX_W {
-        return Err(MetricsError::Implausible(OFF_SOCKET_POWER));
-    }
-    if m.fan_rpm > FAN_MAX_RPM || m.fan_pwm > 100 {
-        return Err(MetricsError::Implausible(OFF_FAN_RPM));
-    }
-    if m.throttling.iter().any(|&p| p > 100) {
-        return Err(MetricsError::Implausible(OFF_THROTTLING));
-    }
-    Ok(m)
+    power::check(&t).map_err(MetricsError::Implausible)?;
+    Ok(t)
 }

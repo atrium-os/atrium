@@ -222,3 +222,22 @@ reads non-zero, all-zero GC registers mean "off", not "idle".
 
   Next is stage 4 (GMC, IH, MES, first dispatch). GFX stays powered, with GfxOff disallowed,
   until a power cycle.
+- **2026-11-12, power P1 metrics read (55cb52b2): the card was at its limit while idle.** The
+  first SMU metrics read decoded (0x2E offsets, which the 0x33 table matches; see
+  [gpu-power-management.md](gpu-power-management.md) §B1) to:
+  - 299 W socket and board power, against a 300 W limit;
+  - hotspot 98 °C, edge 56 °C, memory 59 °C, VR 71 °C;
+  - fan 3470–3649 rpm (73–76 %);
+  - gfx 3191 MHz at 100 % busy;
+  - throttlers active: 1 (hotspot) and 14 (PPT0).
+
+  The CP was halted and CP_STAT was 0. The host PCH went from 28 to 42 °C with the CPU idle.
+  AllowGfxOff was accepted, but nothing changed. The likely cause is that GC had been up
+  since the 16:48 run with no gfx clock or power gating set up. The firmware's protections
+  held it inside its limits. The box was powered off from FreeBSD at 17:02:52 to let it cool.
+
+  The hex dump also printed 28 bytes past its buffer (fixed). Changes after this:
+  - [gpu-power-management.md](gpu-power-management.md) rev. 2: a vendor-neutral contract with
+    per-generation backends, rule A3.7 "the card must be able to idle", and the idle check;
+  - `hw.atrium_gpu.gc_up_ok=1` is now required for any hook that powers GC up;
+  - stage 4 also waits for power P2.

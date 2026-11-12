@@ -21,6 +21,9 @@ pub mod fw;
 pub mod psp_plan;
 #[path = "../rs/ip_fw.rs"]
 pub mod ip_fw;
+#[allow(dead_code)]
+#[path = "../rs/power.rs"]
+pub mod power;
 #[path = "../rs/smu_metrics.rs"]
 pub mod smu_metrics;
 
@@ -135,31 +138,52 @@ pub unsafe extern "C" fn atrium_amd_ip_fw_plan(
     }
 }
 
-/// Parse the SMU metrics table: 0 verified, 1 parsed with a layout from
-/// another interface version, -(offset + 1) for an implausible field,
-/// -10000 if too short.
+/// Bytes of the SMU metrics table for this driver interface version, 0 if
+/// no layout is known (then nothing is read or decoded).
+#[unsafe(no_mangle)]
+pub extern "C" fn atrium_amd_smu_metrics_len(if_version: u32) -> usize {
+    smu_metrics::len(if_version).unwrap_or(0)
+}
+
+/// Decode the SMU metrics table into the vendor-neutral telemetry record:
+/// 0 ok, -1 no layout for this interface version, -2 too short,
+/// -(10 + power::Field) for an implausible field.
 ///
 /// # Safety
 /// `b` points to `len` readable bytes and `out` to a writable
-/// `struct amd_smu_metrics` (same layout as `smu_metrics::Metrics`).
+/// `struct atrium_gpu_power_telemetry` (same layout as `power::Telemetry`).
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn atrium_amd_smu_metrics(
     b: *const u8,
     len: usize,
     if_version: u32,
-    out: *mut smu_metrics::Metrics,
+    out: *mut power::Telemetry,
 ) -> i32 {
     if b.is_null() || out.is_null() {
-        return -10000;
+        return -2;
     }
     // SAFETY: per the contract above.
     let (bytes, o) = unsafe { (core::slice::from_raw_parts(b, len), &mut *out) };
     match smu_metrics::parse(bytes, if_version) {
-        Ok(m) => {
-            *o = m;
-            if m.verified != 0 { 0 } else { 1 }
+        Ok(t) => {
+            *o = t;
+            0
         }
-        Err(smu_metrics::MetricsError::Short) => -10000,
-        Err(smu_metrics::MetricsError::Implausible(off)) => -(off as i32 + 1),
+        Err(smu_metrics::MetricsError::Unsupported) => -1,
+        Err(smu_metrics::MetricsError::Short) => -2,
+        Err(smu_metrics::MetricsError::Implausible(f)) => -(10 + f as i32),
     }
+}
+
+/// Is the card busy or near its power limit with no work queued?
+///
+/// # Safety
+/// `t` points to a readable `struct atrium_gpu_power_telemetry`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn atrium_gpu_power_idle_suspicious(t: *const power::Telemetry) -> i32 {
+    if t.is_null() {
+        return 0;
+    }
+    // SAFETY: per the contract above.
+    power::idle_suspicious(unsafe { &*t }) as i32
 }
