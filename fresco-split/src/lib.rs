@@ -178,6 +178,16 @@ pub enum Msg {
     /// From the broker: the pop-up went off screen
     /// (`fresco_protocol::popup_dismiss`).
     PopupDismissed { window: u32, reason: u8 },
+    /// From the renderer: the client (the bar) lets the holder of `token`
+    /// hang one pop-up of at most `width` x `height` from `anchor` in its
+    /// `window` (forum-status-items.md §4).
+    PopupGrant { window: u32, token: [u8; 16], anchor: [f32; 4], side: u8, align: u8, width: u32, height: u32 },
+    /// From the renderer: `window` (created with [`Role::Popup`]) is the
+    /// pop-up `token` grants.
+    PopupClaim { window: u32, token: [u8; 16], width: u32, height: u32 },
+    /// From the broker, to the granting client: the pop-up `token` granted
+    /// from `window` opened, or (`open` false) went.
+    PopupHosted { window: u32, token: [u8; 16], open: bool },
     /// Two video slots of `bytes` each for the layer follow as fds.
     VideoSlots { window: u32, layer: u32, bytes: u32 },
     /// The broker has copied video slot `slot` out; it may be filled again.
@@ -248,6 +258,9 @@ mod kind {
     pub const POPUP_PLACE: u32 = 13;
     pub const POPUP_PLACED: u32 = 0x150;
     pub const POPUP_DISMISSED: u32 = 0x151;
+    pub const POPUP_GRANT: u32 = 14;
+    pub const POPUP_CLAIM: u32 = 15;
+    pub const POPUP_HOSTED: u32 = 0x152;
     pub const VIDEO_RING: u32 = 7;
     pub const VIDEO_FRAME: u32 = 8;
     pub const VIDEO_PLACE: u32 = 9;
@@ -328,6 +341,9 @@ impl Msg {
             | Msg::PopupPlace { window, .. }
             | Msg::PopupPlaced { window, .. }
             | Msg::PopupDismissed { window, .. }
+            | Msg::PopupGrant { window, .. }
+            | Msg::PopupClaim { window, .. }
+            | Msg::PopupHosted { window, .. }
             | Msg::VideoRing { window, .. }
             | Msg::VideoFrame { window, .. }
             | Msg::VideoPlace { window, .. }
@@ -531,6 +547,30 @@ impl Msg {
                 r.put(2, *reason as u32);
                 r
             }
+            Msg::PopupGrant { window, token, anchor, side, align, width, height } => {
+                let mut r = Rec::new(POPUP_GRANT, *window);
+                r.put(2, *width);
+                r.put(3, *height);
+                r.put(4, *side as u32 | (*align as u32) << 8);
+                r.0[32..48].copy_from_slice(token);
+                for (i, v) in anchor.iter().enumerate() {
+                    r.put(12 + i, v.to_bits());
+                }
+                r
+            }
+            Msg::PopupClaim { window, token, width, height } => {
+                let mut r = Rec::new(POPUP_CLAIM, *window);
+                r.put(2, *width);
+                r.put(3, *height);
+                r.0[32..48].copy_from_slice(token);
+                r
+            }
+            Msg::PopupHosted { window, token, open } => {
+                let mut r = Rec::new(POPUP_HOSTED, *window);
+                r.put(2, *open as u32);
+                r.0[32..48].copy_from_slice(token);
+                r
+            }
             Msg::PadClaim { window, device, claim } => {
                 let mut r = Rec::new(PAD_CLAIM, *window);
                 r.put(2, *device);
@@ -662,6 +702,9 @@ impl Msg {
             POPUP_PLACE => (4, false),
             POPUP_PLACED => (5, false),
             POPUP_DISMISSED => (1, false),
+            POPUP_GRANT => (3, false),
+            POPUP_CLAIM => (2, false),
+            POPUP_HOSTED => (1, false),
             VIDEO_RING => (3, false),
             VIDEO_FRAME | VIDEO_PRESENTED => (5, false),
             VIDEO_PLACE => (6, false),
@@ -691,7 +734,15 @@ impl Msg {
         } else {
             // Key and button records carry the activation token in 32..48.
             // POPUP_PLACE its anchor.
-            let tail = if matches!(k, KEY | BUTTON | DRAG_BEGIN | DROP | EMBED_TOKEN | POPUP_PLACE) { 48 } else { 32 };
+            // POPUP_GRANT its token and anchor; the other pop-up records
+            // their token.
+            let tail = if k == POPUP_GRANT {
+                64
+            } else if matches!(k, KEY | BUTTON | DRAG_BEGIN | DROP | EMBED_TOKEN | POPUP_PLACE | POPUP_CLAIM | POPUP_HOSTED) {
+                48
+            } else {
+                32
+            };
             if r.0[tail..].iter().any(|&c| c != 0) {
                 return Err(Refused("unused field not zero"));
             }
@@ -877,6 +928,20 @@ impl Msg {
                 }
                 Msg::PopupDismissed { window, reason: r.get(2) as u8 }
             }
+            POPUP_GRANT => {
+                let anchor = [finite(r.get(12))?, finite(r.get(13))?, finite(r.get(14))?, finite(r.get(15))?];
+                let packed = r.get(4);
+                if packed >> 16 != 0 || packed & 0xff > 3 || (packed >> 8) & 0xff > 2 {
+                    return Err(Refused("pop-up side or align"));
+                }
+                Msg::PopupGrant {
+                    window, anchor, token: r.0[32..48].try_into().unwrap(),
+                    side: packed as u8, align: (packed >> 8) as u8,
+                    width: dim(r.get(2))?, height: dim(r.get(3))?,
+                }
+            }
+            POPUP_CLAIM => Msg::PopupClaim { window, token: r.0[32..48].try_into().unwrap(), width: dim(r.get(2))?, height: dim(r.get(3))? },
+            POPUP_HOSTED => Msg::PopupHosted { window, token: r.0[32..48].try_into().unwrap(), open: flag(r.get(2))? },
             PAD_BUTTON | PAD_AXIS | PAD_CLAIMED => {
                 let value = r.get(4) as i32;
                 let ok = if k == PAD_AXIS { (-32768..=32767).contains(&value) } else { (0..=1).contains(&value) };
@@ -907,6 +972,8 @@ impl Msg {
                 | Msg::VideoRate { .. }
                 | Msg::PadClaim { .. }
                 | Msg::PopupPlace { .. }
+                | Msg::PopupGrant { .. }
+                | Msg::PopupClaim { .. }
         )
     }
 }

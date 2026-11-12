@@ -54,6 +54,10 @@ fn samples() -> Vec<Msg> {
         Msg::PopupPlace { window: 6, parent: 5, anchor: [0.0, 10.5, 200.0, 24.0], side: 2, align: 0, width: 160, height: 90, grab: false },
         Msg::PopupPlaced { window: 5, x: -12.5, y: 22.0, width: 200, height: 150, side: 1 },
         Msg::PopupDismissed { window: 5, reason: 0 },
+        Msg::PopupGrant { window: 2, token: [7; 16], anchor: [900.0, 0.0, 30.0, 38.0], side: 0, align: 2, width: 320, height: 400 },
+        Msg::PopupClaim { window: 4, token: [0xa5; 16], width: 300, height: 380 },
+        Msg::PopupHosted { window: 2, token: [7; 16], open: true },
+        Msg::PopupHosted { window: 2, token: [9; 16], open: false },
     ]
 }
 

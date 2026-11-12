@@ -127,6 +127,14 @@ pub mod control {
     /// Move, resize or show again an open pop-up: `PopupPlacePayload`,
     /// no payload in the reply.
     pub const OP_POPUP_PLACE:           u16 = 0x0508;
+    /// The shell's chrome (the bar) lets another client hang one pop-up
+    /// from a spot in it (forum-status-items.md §4): `PopupGrantPayload`
+    /// → a `[u8; 16]` token, good once for a few seconds.
+    pub const OP_POPUP_GRANT:           u16 = 0x0509;
+    /// Open the pop-up a token grants: `PopupClaimPayload` → the new
+    /// window id, as `OP_POPUP_CREATE` answers. It grabs, and cannot be
+    /// placed again: a closed one is destroyed and claimed anew.
+    pub const OP_POPUP_CLAIM:           u16 = 0x050a;
 
     /// Deadline-lane sponsorship request (scheduler federation §1.1,
     /// Laminar phase J): the client asks frescod — the vblank deadline
@@ -208,6 +216,9 @@ pub mod control {
     /// `PopupDismissedEvent`, to the pop-up's owner: frescod took it off
     /// screen (a press outside its chain, focus moved, its parent went).
     pub const EV_POPUP_DISMISSED:        u16 = 0x058c;
+    /// `PopupHostedEvent`, to the granting client: the pop-up its grant
+    /// let another client open is open, or went.
+    pub const EV_POPUP_HOSTED:           u16 = 0x058d;
     /// The display's mode changed (a mode switch, or a monitor plugged in
     /// or swapped): payload `DisplayInfoResponse`. Every client gets it;
     /// anything laid out for the screen lays itself out again.
@@ -875,6 +886,40 @@ pub struct PopupDismissedEvent {
     pub window_id: u32,
     pub reason: u8,
 }
+
+/// `OP_POPUP_GRANT`: let the holder of the answered token hang one
+/// grabbing pop-up of at most `width` x `height` from `anchor` in
+/// `parent` (a chrome window of the caller's), as `OP_POPUP_CREATE` would.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct PopupGrantPayload {
+    pub parent: u32,
+    pub anchor: [f32; 4],
+    pub side: u8,
+    pub align: u8,
+    pub width: u32,
+    pub height: u32,
+}
+
+/// `OP_POPUP_CLAIM`: open the pop-up `token` grants, `width` x `height`
+/// (cut to the grant's).
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct PopupClaimPayload {
+    pub token: [u8; 16],
+    pub width: u32,
+    pub height: u32,
+}
+
+/// `EV_POPUP_HOSTED`: the pop-up granted from `window_id` with `token`
+/// opened (`open`) or went.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct PopupHostedEvent {
+    pub window_id: u32,
+    pub token: [u8; 16],
+    pub open: bool,
+}
+
+/// How long a pop-up grant may wait for its claim.
+pub const POPUP_GRANT_TTL_MS: u64 = 10_000;
 
 /// `OP_WINDOW_DESTROY` — close + release a window. After the server
 /// processes this, the window_id is invalid; subsequent ops referring
@@ -2476,8 +2521,11 @@ mod tests {
             control::OP_WINDOW_PRESENT_DAMAGE,
             control::OP_POPUP_CREATE,
             control::OP_POPUP_PLACE,
+            control::OP_POPUP_GRANT,
+            control::OP_POPUP_CLAIM,
             control::EV_POPUP_PLACED,
             control::EV_POPUP_DISMISSED,
+            control::EV_POPUP_HOSTED,
             control::EV_APPEARANCE_CHANGED,
             control::EV_WINDOW_RESIZED,
             control::EV_WINDOW_FOCUS_CHANGED,

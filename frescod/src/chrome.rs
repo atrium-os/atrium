@@ -14,6 +14,10 @@
 //! - **a focus ring** just inside the focused window's edge, so the strip's
 //!   claim is tied to a window on screen.
 //!
+//! Under each panel an app hangs from the bar by the bar's grant
+//! (forum-status-items.md §4) it draws a tab naming the app, from the
+//! launch registry: the app draws the panel, but not who it says it is.
+//!
 //! It also frames each credential slot that is fit to fill right now
 //! (arca-autofill.md §5): a ring and a key tab no app or Arca draws, so a
 //! look-alike field drawn by an app has none.
@@ -163,10 +167,17 @@ const STRIP_COLOR: [f32; 4] = [0.08, 0.08, 0.1, 1.0];
 /// `covers`: the shell's own windows (the bar, its menus, notifications),
 /// which stack above every app; the ring is left out where they are, so
 /// it does not cut across an open bar menu. No app window is a cover.
-pub fn build(screen_w: u32, focus: Option<u16>, origin: impl Fn(u16) -> Option<String>, shown: &[(u32, [i32; 4])], slots: &[[i32; 4]], covers: &[[i32; 4]]) -> WindowFrame {
+///
+/// `hosted`: the panels apps hang from the bar (screen rects) and the
+/// app each is; a tab under each names it.
+#[allow(clippy::too_many_arguments)]
+pub fn build(screen_w: u32, focus: Option<u16>, origin: impl Fn(u16) -> Option<String>, shown: &[(u32, [i32; 4])], slots: &[[i32; 4]], covers: &[[i32; 4]], hosted: &[([i32; 4], String)]) -> WindowFrame {
     let sw = screen_w as i32;
     let mut rects = vec![rect(0, 0, sw, STRIP_H, STRIP_COLOR)];
     let mut bottom = STRIP_H;
+    for ([x0, _, x1, y1], name) in hosted {
+        bottom = bottom.max(hosted_tab(&mut rects, *x0, *x1, *y1, name));
+    }
     for &s in slots {
         bottom = bottom.max(slot_frame(&mut rects, s));
     }
@@ -201,6 +212,36 @@ pub fn build(screen_w: u32, focus: Option<u16>, origin: impl Fn(u16) -> Option<S
         size: (screen_w, bottom.clamp(STRIP_H, i32::MAX) as u32),
         rects,
         ..Default::default()
+    }
+}
+
+/// The tab under a panel an app hangs from the bar (`x0..x1`, its bottom
+/// at `y1`): the strip's colours, the ring's mark, the app's name. Returns
+/// its bottom edge.
+fn hosted_tab(out: &mut Vec<SceneNode>, x0: i32, x1: i32, y1: i32, name: &str) -> i32 {
+    let w = (x1 - x0).max(0);
+    out.push(rect(x0, y1, w, STRIP_H, STRIP_COLOR));
+    out.push(rect(x0 + PAD, y1 + 3, RING, STRIP_H - 6, RING_COLOR));
+    text(out, name, x0 + 3 * PAD, y1 + 3, w - 4 * PAD);
+    y1 + STRIP_H
+}
+
+/// What the tab under a granted panel names its app by: the launch
+/// registry's id for `uid` (`uid-N` when it has none), in the characters
+/// the chrome font draws. The registry is read again every few seconds.
+pub fn app_label(uid: u32) -> String {
+    use std::sync::Mutex;
+    use std::time::{Duration, Instant};
+    static REG: Mutex<Option<(Instant, portcullis_peer::AppRegistry)>> = Mutex::new(None);
+    let mut g = REG.lock().unwrap();
+    if g.as_ref().is_none_or(|(at, _)| at.elapsed() > Duration::from_secs(5)) {
+        let path = std::env::var("FRESCOD_APP_REGISTRY").unwrap_or_else(|_| portcullis_peer::DEFAULT_REGISTRY.into());
+        *g = Some((Instant::now(), portcullis_peer::AppRegistry::load(&path).unwrap_or_default()));
+    }
+    let id = g.as_ref().and_then(|(_, r)| r.resolve(uid)).map(|(_, app)| app.to_ascii_lowercase());
+    match id {
+        Some(a) => a.bytes().filter(|&c| fresco_split::chrome::origin_char(c)).map(char::from).collect(),
+        None => format!("uid-{uid}"),
     }
 }
 
@@ -258,14 +299,24 @@ mod tests {
             f.rects.iter().any(|n| n.color == RING_COLOR && (n.position[0] as i32..(n.position[0] + n.size[0]) as i32).contains(&x)
                 && (n.position[1] as i32..(n.position[1] + n.size[1]) as i32).contains(&y))
         };
-        let open = build(1280, Some(5), |_| None, &shown, &[], &[]);
+        let open = build(1280, Some(5), |_| None, &shown, &[], &[], &[]);
         assert!(lit(&open, 800, 62) && lit(&open, 600, 62));
         // A bar menu over the window's top edge hides the ring under it only.
         let menu = [679, 56, 975, 92];
-        let under = build(1280, Some(5), |_| None, &shown, &[], &[menu]);
+        let under = build(1280, Some(5), |_| None, &shown, &[], &[menu], &[]);
         assert!(!lit(&under, 800, 62) && !lit(&under, 679, 63) && !lit(&under, 974, 62));
         assert!(lit(&under, 678, 62) && lit(&under, 975, 62) && lit(&under, 0, 300) && lit(&under, 640, 669));
         assert_eq!(uncovered([0, 0, 10, 10], &[[2, 2, 4, 4]]).iter().map(|[a, b, c, d]| (c - a) * (d - b)).sum::<i32>(), 96);
+    }
+
+    #[test]
+    fn a_granted_panel_gets_a_tab_naming_its_app() {
+        let f = build(1280, None, |_| None, &[], &[], &[], &[([900, 62, 1200, 362], "org.example.clip".into())]);
+        assert!(f.size.1 as i32 >= 362 + STRIP_H, "the layer reaches the tab");
+        let tab = f.rects.iter().find(|n| n.color == STRIP_COLOR && n.position == [900.0, 362.0]).expect("a tab under the panel");
+        assert_eq!(tab.size, [300.0, STRIP_H as f32]);
+        assert!(f.rects.iter().filter(|n| n.color == TEXT_COLOR && n.position[1] >= 362.0).count() > 10, "the name is drawn");
+        assert_eq!(app_label(4_000_000_000), "uid-4000000000");
     }
 
     #[test]

@@ -103,6 +103,9 @@ pub enum Event {
     /// Pop-up `window_id` is off screen (`fresco_protocol::popup_dismiss`):
     /// close the menu, then destroy the window or place it again.
     PopupDismissed { window_id: u32, reason: u8 },
+    /// To the bar: the pop-up its grant `token` let another client open
+    /// from `window_id` is open, or (`open` false) went.
+    PopupHosted { window_id: u32, token: [u8; 16], open: bool },
     /// Keyboard press/release. `window_id == 0` indicates broadcast
     /// (no focused window).
     Key {
@@ -547,6 +550,29 @@ impl Connection {
         let p = fresco_protocol::PopupPlacePayload { window_id, anchor, side, align, width, height };
         self.send_window_managed(control::OP_POPUP_PLACE, &p)?;
         self.wm_response(control::OP_POPUP_PLACE).map(|_| ())
+    }
+
+    /// The shell's bar only: let the holder of the answered token hang one
+    /// grabbing pop-up of at most `width` x `height` from `anchor` in
+    /// `parent`, as `popup_create` would (forum-status-items.md §4). Good
+    /// once, for `fresco_protocol::POPUP_GRANT_TTL_MS`.
+    pub fn popup_grant(&mut self, parent: u32, anchor: [f32; 4], side: u8, align: u8, width: u32, height: u32) -> io::Result<[u8; 16]> {
+        let p = fresco_protocol::PopupGrantPayload { parent, anchor, side, align, width, height };
+        self.send_window_managed(control::OP_POPUP_GRANT, &p)?;
+        let m = self.wm_response(control::OP_POPUP_GRANT)?;
+        decode::<[u8; 16]>(&m.payload)
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, format!("decode POPUP_GRANT reply: {e}")))
+    }
+
+    /// Open the pop-up a grant's `token` names, `width` x `height` (cut to
+    /// the grant's): a new window, as `popup_create` answers. It grabs and
+    /// cannot be placed again; once dismissed, destroy it.
+    pub fn popup_claim(&mut self, token: [u8; 16], width: u32, height: u32) -> io::Result<u32> {
+        let p = fresco_protocol::PopupClaimPayload { token, width, height };
+        self.send_window_managed(control::OP_POPUP_CLAIM, &p)?;
+        let m = self.wm_response(control::OP_POPUP_CLAIM)?;
+        decode::<u32>(&m.payload)
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, format!("decode POPUP_CLAIM reply: {e}")))
     }
 
     // ── Video layers (docs/spec/fresco-video.md) ───────────────────
@@ -1236,6 +1262,10 @@ fn decode_event(op: u16, payload: &[u8]) -> Event {
         },
         control::EV_POPUP_DISMISSED => match decode::<fresco_protocol::PopupDismissedEvent>(payload) {
             Ok(p) => Event::PopupDismissed { window_id: p.window_id, reason: p.reason },
+            Err(_) => Event::Unknown { op, payload: payload.to_vec() },
+        },
+        control::EV_POPUP_HOSTED => match decode::<fresco_protocol::PopupHostedEvent>(payload) {
+            Ok(p) => Event::PopupHosted { window_id: p.window_id, token: p.token, open: p.open },
             Err(_) => Event::Unknown { op, payload: payload.to_vec() },
         },
         control::EV_WINDOW_SPAN => match decode::<fresco_protocol::WindowSpanEvent>(payload) {

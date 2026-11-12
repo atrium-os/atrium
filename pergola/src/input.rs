@@ -63,6 +63,8 @@ pub fn translate(ev: &fresco_client::Event) -> Option<Event> {
         // Pop-ups are the window's own business (Menu, Dropdown), not views'.
         | fresco_client::Event::PopupPlaced { .. }
         | fresco_client::Event::PopupDismissed { .. }
+        // The bar's alone: a pop-up it granted opened or went.
+        | fresco_client::Event::PopupHosted { .. }
         // Pergola draws no filled paths yet, so it has none to fall back for.
         | fresco_client::Event::FillsDropped { .. }
         // The window's embed token goes to limend, not to views.

@@ -33,6 +33,7 @@ serde           = { version = "1", features = ["derive"] }
 postcard        = { version = "1", features = ["use-std"] }
 
 [dev-dependencies]
+forum-ctl = { path = "../forum-ctl" }
 env_logger = "0.11"
 tempfile = "3"
 libc = "0.2"
@@ -40,3 +41,7 @@ libc = "0.2"
 [[example]]
 name = "hello"
 path = "examples/hello.rs"
+
+[[example]]
+name = "status_drawn"
+path = "examples/status_drawn.rs"

@@ -98,6 +98,19 @@ struct BarView {
     status: Mutable<Vec<StatusShown>>,
     /// Set by a pick or a slide: the main loop asks for the items again.
     status_stale: Arc<AtomicBool>,
+    /// A press on the icon of an app that draws its own panel: the main
+    /// loop asks frescod for a grant and passes its token to the app.
+    want_drawn: Mutable<Option<DrawnAsk>>,
+}
+
+/// An app's own panel to open (forum-status-items.md §4): under the icon
+/// at `rect` (layout px), `width` x `height` (layout px).
+#[derive(Clone, Debug, PartialEq)]
+struct DrawnAsk {
+    app_id: String,
+    rect: Rect,
+    width: u16,
+    height: u16,
 }
 
 /// One app's status item as the bar shows it, with its menu's state
@@ -377,6 +390,20 @@ impl View for BarView {
             ctx.set_flex(group, FlexStyle { align: pergola::Align::Center, ..FlexStyle::default() });
             for s in &status {
                 let label = if s.item.tooltip.is_empty() { short_app_name(&s.item.app_id).to_string() } else { s.item.tooltip.clone() };
+                // A panel the app draws itself (§4): the press asks for a
+                // grant; the icon is lit while frescod says it is open.
+                if let StatusContent::Drawn { width, height } = s.item.content {
+                    let (want, app_id) = (self.want_drawn.clone(), s.item.app_id.clone());
+                    let button = PanelButton::hosted(label, s.open.clone(), move |rect| {
+                        want.set(Some(DrawnAsk { app_id: app_id.clone(), rect, width, height }));
+                    });
+                    let button = match &s.vector {
+                        Some(v) => button.vector_icon(v.clone(), s.item.glyph, 15.0, Some(t.text_secondary())),
+                        None => button.icon(s.item.glyph, 15.0, Some(t.text_secondary())),
+                    };
+                    ctx.place(button);
+                    continue;
+                }
                 // A panel the app described: laid out and drawn by the bar,
                 // under the app's name.
                 if let StatusContent::Panel(p) = &s.item.content {
@@ -784,6 +811,9 @@ fn main() -> std::io::Result<()> {
         dirty.clone(),
     );
     let status_stale = Arc::new(AtomicBool::new(false));
+    let want_drawn = Mutable::with_dirty(None, dirty.clone());
+    // The grants handed to apps for their own panels: token, app.
+    let mut drawn: Vec<([u8; 16], String)> = Vec::new();
     let dirty_flag = dirty.clone();
 
     let view = BarView {
@@ -806,6 +836,7 @@ fn main() -> std::io::Result<()> {
         vol_output: vol_output.clone(),
         status: status.clone(),
         status_stale: status_stale.clone(),
+        want_drawn: want_drawn.clone(),
     };
     let mut app = App::new_with_flag(view, dirty).with_theme(mode);
 
@@ -814,6 +845,18 @@ fn main() -> std::io::Result<()> {
     loop {
         match window.step(&mut app, Some(Duration::from_secs(1)))? {
             StepResult::Closed => return Ok(()),
+            // An app's own panel opened or went (frescod's word): its icon
+            // is lit while it is open.
+            StepResult::Event(fresco_client::Event::PopupHosted { token, open, .. }) => {
+                if let Some(i) = drawn.iter().position(|(t, _)| *t == token) {
+                    if let Some(s) = status.get_cloned().iter().find(|s| s.item.app_id == drawn[i].1) {
+                        s.open.set(if open { MenuState::opened(None) } else { MenuState::default() });
+                    }
+                    if !open {
+                        drawn.remove(i);
+                    }
+                }
+            }
             StepResult::Event(_) => {}
             StepResult::Timeout => {
                 let (t_now, d_now) = clock_now();
@@ -890,6 +933,28 @@ fn main() -> std::io::Result<()> {
                 audio.set(a);
             }
         }
+        // A press on the icon of an app that draws its own panel: a grant
+        // from frescod (it checks the bar was just pressed), its token to
+        // the app through forum-wm; the app claims the pop-up with it.
+        if let Some(ask) = want_drawn.get_cloned() {
+            want_drawn.set(None);
+            let s = window.scale();
+            let anchor = [ask.rect.x() * s, 0.0, ask.rect.w() * s, shell::BAR_H * s];
+            let (w, h) = ((ask.width as f32 * s).round() as u32, (ask.height as f32 * s).round() as u32);
+            let id = window.id();
+            match window.connection().popup_grant(id, anchor, fresco_protocol::popup_side::BELOW, fresco_protocol::popup_align::END, w, h) {
+                Ok(token) => {
+                    drawn.retain(|(_, a)| *a != ask.app_id);
+                    let r = forum_ctl::request(forum_ctl::default_socket_path(), &Intent::StatusOpenPanel { app_id: ask.app_id.clone(), token });
+                    if matches!(r, Ok(Reply::Ack)) {
+                        drawn.push((token, ask.app_id));
+                    } else {
+                        eprintln!("forum-bar: open {}'s panel: {r:?}", ask.app_id);
+                    }
+                }
+                Err(e) => eprintln!("forum-bar: grant for {}'s panel: {e}", ask.app_id),
+            }
+        }
         // The volume drop-down: a slider drag, mute, an output.
         if let Some(a) = want_audio.get() {
             want_audio.set(None);
@@ -950,6 +1015,7 @@ mod tests {
             vol_output: Mutable::new(0),
             status: Mutable::new(Vec::new()),
             status_stale: Arc::new(AtomicBool::new(false)),
+            want_drawn: Mutable::new(None),
         }
     }
 

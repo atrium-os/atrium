@@ -64,7 +64,7 @@ pub fn list() -> Vec<StatusItem> {
 fn menu(item: &StatusItem) -> &[StatusEntry] {
     match &item.content {
         StatusContent::Menu(m) => m,
-        StatusContent::Panel(_) => &[],
+        StatusContent::Panel(_) | StatusContent::Drawn { .. } => &[],
     }
 }
 
@@ -101,6 +101,15 @@ pub fn input(app_id: &str, id: u32, value: StatusValue) -> Result<(), String> {
     let StatusContent::Panel(p) = &s.item.content else { return Err("not a panel".into()) };
     let value = p.accepts(id, value).ok_or("not a control that takes this")?;
     s.tx.send(FromStatus::Changed { id, value }).map_err(|_| "the app is gone".into())
+}
+
+/// The user opened `app_id`'s own panel: the app claims the pop-up the
+/// bar's `token` grants.
+pub fn open_panel(app_id: &str, token: [u8; 16]) -> Result<(), String> {
+    let b = BOARD.lock().unwrap();
+    let s = b.slots.iter().find(|s| s.item.app_id == app_id).ok_or("no such status item")?;
+    let StatusContent::Drawn { width, height } = s.item.content else { return Err("not a drawn panel".into()) };
+    s.tx.send(FromStatus::OpenPanel { token, width, height }).map_err(|_| "the app is gone".into())
 }
 
 #[cfg(test)]
@@ -208,5 +217,20 @@ mod tests {
         assert!(input("org.test.clip", 1, StatusValue::Text("x".into())).is_err(), "a toggle takes no text");
         assert!(pick("org.test.clip", 0).is_err(), "a panel has no menu");
         closed(7);
+    }
+
+    #[test]
+    fn a_drawn_panel_is_opened_with_the_bars_token() {
+        let _g = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+        reset();
+        let (tx, rx) = channel();
+        apply("org.test.draw", 7, &tx, ToStatus::Set { glyph: 'x', svg: None, tooltip: "t".into(), content: StatusContent::Drawn { width: 900, height: 2 } });
+        assert_eq!(list()[0].content, StatusContent::Drawn { width: forum_ctl::STATUS_PANEL_MAX_W, height: forum_ctl::STATUS_DRAWN_MIN_H }, "bounded");
+        open_panel("org.test.draw", [4; 16]).unwrap();
+        assert_eq!(rx.try_recv(), Ok(FromStatus::OpenPanel { token: [4; 16], width: 400, height: 40 }));
+        assert!(open_panel("org.none", [4; 16]).is_err());
+        assert!(pick("org.test.draw", 0).is_err(), "no menu");
+        apply("org.test.menu", 8, &tx, ToStatus::Set { glyph: 'x', svg: None, tooltip: "t".into(), content: StatusContent::Menu(Vec::new()) });
+        assert!(open_panel("org.test.menu", [4; 16]).is_err(), "not drawn");
     }
 }

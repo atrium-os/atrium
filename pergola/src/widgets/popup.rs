@@ -693,6 +693,8 @@ pub struct PanelButton {
     pub icon: Option<TriggerIcon>,
     pub size: crate::geom::Size,
     content: PanelContent,
+    /// Its panel is another client's (see [`PanelButton::hosted`]).
+    hosted: Option<Rc<dyn Fn(Rect)>>,
 }
 
 /// A panel's padding.
@@ -708,7 +710,21 @@ impl PanelButton {
             icon: None,
             size,
             content: Rc::new(content),
+            hosted: None,
         }
+    }
+
+    /// A button whose panel another client draws (a status item's own
+    /// panel, which frescod lets it hang from the bar by a grant;
+    /// forum-status-items.md §4): a press calls `on_press` with the
+    /// button's rect (window pixels) instead of opening one here, and it
+    /// is lit while `open` says the panel is open (the caller sets it
+    /// from frescod's word).
+    pub fn hosted(label: impl Into<String>, open: Mutable<MenuState>, on_press: impl Fn(Rect) + 'static) -> Self {
+        let mut b = Self::new(label, open, crate::geom::Size::new(0.0, 0.0), |_: &mut Ctx, _| {});
+        b.hosted = Some(Rc::new(on_press));
+        b.attached = true;
+        b
     }
     pub fn at(mut self, x: f32, y: f32) -> Self {
         self.rect.origin.x = x;
@@ -743,7 +759,20 @@ impl PanelButton {
 impl View for PanelButton {
     fn render(&self, ctx: &mut Ctx) {
         let r = self.rect;
-        trigger_with(ctx, r, &self.label, self.icon.clone(), &self.open, None, self.attached);
+        let edge = trigger_with(ctx, r, &self.label, self.icon.clone(), &self.open, None, self.attached);
+        if let Some(f) = &self.hosted {
+            let f1 = f.clone();
+            ctx.on_click(edge, move || f1(r));
+            let f2 = f.clone();
+            ctx.on_key(edge, move |ev| {
+                if let Event::Key { kind: KeyEventKind::Down, key, chars, .. } = ev {
+                    if matches!(key, Key::Down | Key::Enter) || (*key == Key::Char && chars == " ") {
+                        f2(r);
+                    }
+                }
+            });
+            return;
+        }
         if !self.open.get().open {
             return;
         }

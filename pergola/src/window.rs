@@ -36,11 +36,23 @@ pub struct WindowDesc {
     pub title: String,
     pub size: SizeSpec,
     pub hints: WindowHints,
+    /// Open as the pop-up a grant's token names (a status item's panel,
+    /// hanging from its icon in the bar; forum-status-items.md §4)
+    /// rather than as a window of its own. It closes for good when
+    /// frescod dismisses it: [`Window::run`] returns, [`Window::step`]
+    /// says [`StepResult::Closed`].
+    pub hosted: Option<[u8; 16]>,
 }
 
 impl WindowDesc {
     pub fn new(title: impl Into<String>, size: SizeSpec) -> Self {
-        Self { title: title.into(), size, hints: WindowHints::default() }
+        Self { title: title.into(), size, hints: WindowHints::default(), hosted: None }
+    }
+
+    /// The panel a grant's `token` lets the app hang from the bar,
+    /// `width` x `height` (frescod may cut it to the grant's).
+    pub fn hosted(token: [u8; 16], width: u32, height: u32) -> Self {
+        Self { hosted: Some(token), ..Self::new("", SizeSpec::Fixed(width, height)) }
     }
 }
 
@@ -76,6 +88,8 @@ pub struct Window {
     main: u32,
     /// Menus' pop-up windows ([`crate::popup`]).
     popups: crate::popup::Popups,
+    /// The main window is a granted pop-up ([`WindowDesc::hosted`]).
+    hosted: bool,
 }
 
 /// Opens pop-ups for [`crate::popup::Popups`] on the window's connection.
@@ -153,7 +167,15 @@ impl Window {
             }
         };
 
-        let win = conn.window_create(w, h, &desc.title, desc.hints.clone())?;
+        let win = match desc.hosted {
+            Some(token) => {
+                // Drawn into from now on, as `window_create` does.
+                let id = conn.popup_claim(token, w, h)?;
+                conn.set_default_window(id as u16);
+                id
+            }
+            None => conn.window_create(w, h, &desc.title, desc.hints.clone())?,
+        };
         let appearance = match conn.appearance() {
             Ok(a) => Some(theme_for(&a)),
             Err(e) => {
@@ -178,6 +200,7 @@ impl Window {
             follow_appearance: true,
             main: win,
             popups: Default::default(),
+            hosted: desc.hosted.is_some(),
         })
     }
 
@@ -251,6 +274,13 @@ impl Window {
     /// has sent it, shortly after the window opens.
     pub fn embed_token(&self) -> Option<[u8; 16]> { self.embed_token }
 
+    /// The window's id on the connection (for ops the loop does not
+    /// cover, such as `popup_grant`).
+    pub fn id(&self) -> u32 { self.main }
+
+    /// Window pixels per layout pixel.
+    pub fn scale(&self) -> f32 { self.surface.scale }
+
     /// Install the binder that embeds other processes' surfaces in this
     /// window's slots ([`crate::slot`]).
     pub fn set_slot_binder(&mut self, b: Box<dyn crate::slot::SlotBinder>) {
@@ -286,6 +316,14 @@ impl Window {
                     _ => {}
                 }
             }
+            // A granted pop-up may land smaller than asked.
+            fresco_client::Event::PopupPlaced { window_id, width, height, .. }
+                if window_id == main && (width as f32, height as f32) != (self.width, self.height) =>
+            {
+                self.width = width as f32;
+                self.height = height as f32;
+                app.invalidate();
+            }
             fresco_client::Event::Resized { window_id, width, height } if window_id == main => {
                 self.width = width as f32;
                 self.height = height as f32;
@@ -318,6 +356,16 @@ impl Window {
             _ => {}
         }
         ev
+    }
+
+    /// Whether `ev` ends the window: frescod asks it to close or, for a
+    /// granted pop-up, took it down (it is never shown again).
+    fn closes(&self, ev: &fresco_client::Event) -> bool {
+        match *ev {
+            fresco_client::Event::CloseRequested { window_id } => window_id == self.main,
+            fresco_client::Event::PopupDismissed { window_id, .. } => self.hosted && window_id == self.main,
+            _ => false,
+        }
     }
 
     /// Milliseconds on the app clock.
@@ -362,7 +410,7 @@ impl Window {
         let result = match ev {
             Some(ev) => {
                 let ev = self.to_tree(ev);
-                if matches!(ev, fresco_client::Event::CloseRequested { window_id } if window_id == self.main) {
+                if self.closes(&ev) {
                     return Ok(StepResult::Closed);
                 }
                 self.window_event(&ev, app);
@@ -409,7 +457,7 @@ impl Window {
             }
 
             if !flow.consumed {
-                if matches!(ev, fresco_client::Event::CloseRequested { window_id } if window_id == self.main) {
+                if self.closes(&ev) {
                     return Ok(());
                 }
                 self.window_event(&ev, app);

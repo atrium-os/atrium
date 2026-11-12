@@ -54,7 +54,10 @@ A pop-up could be used to draw over another app. So:
   drop-downs reach into app area). An app's pop-up is kept below the
   trusted strip (`reserved_top`). The shell's chrome windows (the Forum
   bar, role `Chrome`) and their pop-ups stack above every app's pop-up:
-  app windows, app pop-ups, chrome, chrome pop-ups, notifications. While
+  app windows, app pop-ups, panels apps hang from the bar by its grant
+  (forum-status-items.md §4: `OP_POPUP_GRANT` / `OP_POPUP_CLAIM`, kept
+  below the strip, named by a tab frescod draws), chrome, chrome pop-ups,
+  notifications. While
   a grabbing pop-up is open, only its chain may open more, so an app that
   stays focused under the bar's menu cannot cover it. No app gets the `Chrome`
   role (Shankar, 2026-11-12). It goes to the Forum bar and dock started as

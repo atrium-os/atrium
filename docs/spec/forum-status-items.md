@@ -101,9 +101,48 @@ choice does not move. The bar's window had been 24 px tall while the bar
 draws 38, so frescod refused every bar drop-down (anchor outside the
 window); forum-wm now gives it 38.
 
-## 4. Later
+## 4. Panels the app draws
 
-App-drawn panels (Shankar's second step): the bar asks frescod to open a
-pop-up for the app hanging from its icon; the app draws in it; frescod
-labels it with the app's name, the icon's button lights in the app's
-colour, and it stacks below the bar's own menus.
+An item whose content is `StatusContent::Drawn { width, height }` (width
+200–400, height 40–560) draws its own panel, as a pop-up of its own that
+hangs from its icon in the bar. The bar never draws it, and the app never
+gets a window of the bar's.
+
+1. The user presses the icon. The bar asks frescod for a grant,
+   `OP_POPUP_GRANT { parent: bar window, anchor: the icon's column, the
+   bar's full height, side below, align end, width, height }`. frescod
+   checks it as it checks `OP_POPUP_CREATE` (the bar's own window, Chrome,
+   just pressed) and answers a random 16-byte token.
+2. The bar sends `Intent::StatusOpenPanel { app_id, token }` to forum-wm,
+   which passes `FromStatus::OpenPanel { token, width, height }` to that
+   app's status connection (only an item set as `Drawn` takes one).
+3. The app claims the pop-up, `OP_POPUP_CLAIM { token, width, height }`
+   (Pergola: `Window::open(&WindowDesc::hosted(token, w, h))`), and draws
+   in it. frescod checks the grant again (one use, at most
+   `POPUP_GRANT_TTL_MS` = 10 s old, the bar still pressed or its chain
+   open) and cuts the size to the grant's.
+4. frescod tells the bar `EV_POPUP_HOSTED { token, open }` when it opens
+   and when it goes; the bar lights the icon while it is open.
+
+The panel is the app's, not the shell's:
+
+- It grabs (keys go to it; a press outside, or focus moving, dismisses
+  it, and the press that dismisses it is swallowed, so pressing the icon
+  again closes it).
+- It is never placed again. Once dismissed the app destroys it, and the
+  next press makes a new grant. Escape is the app's to handle (Pergola's
+  example closes on it).
+- It stacks above every app window and app pop-up but below the bar and
+  the bar's own menus, and it is kept below frescod's strip.
+- Pop-ups it opens (a submenu) are the app's too.
+- In split mode frescod's trusted layer draws a tab under it naming the
+  app from the launch registry (`uid-N` when unregistered), in the
+  strip's colours and font. The app draws the panel but cannot draw who
+  it is. Direct mode (development only) has no tab.
+
+In split mode the bar's and the app's renderers each record their half
+(`PopupGrant`, `PopupClaim` records) and frescod's broker checks both;
+`PopupHosted` goes back to the bar's renderer.
+
+Example: `pergola/examples/status_drawn.rs` (recent clips, a bar chart of
+copies by hour, Clear). Live check: `scripts/vm-status-drawn-check.sh`.

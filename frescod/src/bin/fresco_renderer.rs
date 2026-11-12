@@ -401,6 +401,11 @@ fn main() {
             }
         }));
     }
+    // A pop-up grant goes to frescod before its token is answered.
+    {
+        let (broker, state, comp) = (broker.clone(), state.clone(), comp.clone());
+        let _ = socket_server::POPUP_GRANTED.set(Box::new(move || send_grants(&broker, &state, &comp)));
+    }
     let wstream = client.try_clone().expect("clone the client socket");
     std::thread::spawn(move || socket_server::writer_loop(wstream, rx, CLIENT, None));
     {
@@ -471,15 +476,19 @@ fn declare(broker: &Chan, state: &Mutex<State>, comp: &Mutex<Compositor>, screen
                 };
                 // An open pop-up's spec, sent again when it changes or
                 // when the client shows it again after a dismissal.
-                let place = w.popup.filter(|_| !w.hidden).map(|p| (Msg::PopupPlace {
-                    window: w.id as u32,
-                    parent: p.parent as u32,
-                    anchor: p.anchor,
-                    side: p.side,
-                    align: p.align,
-                    width: p.want.0,
-                    height: p.want.1,
-                    grab: p.grab,
+                let place = w.popup.filter(|_| !w.hidden).map(|p| (match p.hosted {
+                    // Opened with the bar's grant (forum-status-items.md §4).
+                    Some(token) => Msg::PopupClaim { window: w.id as u32, token, width: p.want.0, height: p.want.1 },
+                    None => Msg::PopupPlace {
+                        window: w.id as u32,
+                        parent: p.parent as u32,
+                        anchor: p.anchor,
+                        side: p.side,
+                        align: p.align,
+                        width: p.want.0,
+                        height: p.want.1,
+                        grab: p.grab,
+                    },
                 }, p.shown));
                 (w.id as u32, m, place)
             })
@@ -518,6 +527,28 @@ fn declare(broker: &Chan, state: &Mutex<State>, comp: &Mutex<Compositor>, screen
         if place.is_some() && place != w.popup {
             send(broker, &place.as_ref().expect("some").0);
             w.popup = place;
+        }
+    }
+    drop(s);
+    send_grants(broker, state, comp);
+}
+
+/// The client's pop-up grants (forum-status-items.md §4), to frescod, for
+/// windows it knows. Sent as soon as each is made (`POPUP_GRANTED`).
+fn send_grants(broker: &Chan, state: &Mutex<State>, comp: &Mutex<Compositor>) {
+    let grants = comp.lock().unwrap().take_popup_grants();
+    let s = state.lock().unwrap();
+    for g in grants {
+        if s.wins.contains_key(&(g.parent as u32)) {
+            send(broker, &Msg::PopupGrant {
+                window: g.parent as u32,
+                token: g.token,
+                anchor: g.anchor,
+                side: g.side,
+                align: g.align,
+                width: g.max.0,
+                height: g.max.1,
+            });
         }
     }
 }
@@ -658,6 +689,9 @@ fn from_broker(
             Msg::PopupDismissed { reason, .. } => {
                 comp.lock().unwrap().popup_dismissed_upstream(local as u16);
                 let _ = events.send(DisplayEvent::PopupDismissed { window_id: local, reason });
+            }
+            Msg::PopupHosted { token, open, .. } => {
+                let _ = events.send(DisplayEvent::PopupHosted { window_id: local, token, open });
             }
             Msg::Focus { gained, cause, .. } => {
                 let _ = events.send(DisplayEvent::WindowFocusChanged { window_id: local, gained, cause });
