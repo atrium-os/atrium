@@ -1,7 +1,8 @@
 //! `hospes-install`: put Widevine where Hospes loads it from (docs/spec/hospes.md §12).
 //!
-//!   hospes-install widevine-index INRELEASE PACKAGES
+//!   hospes-install widevine-index INRELEASE PACKAGES [amd64|arm64]
 //!       verify Google's signed index; print the package to fetch: path, size, sha256, version
+//!       (another machine's index if named: the installing machine verifies again)
 //!   hospes-install widevine-deb INRELEASE PACKAGES DEB DEST
 //!       verify the chain to DEB, take out the CDM and its manifest, install into DEST
 //!   hospes-install widevine-file LIB [MANIFEST] DEST
@@ -31,6 +32,11 @@ fn run(args: &[String]) -> Result<(), Error> {
     match args.iter().map(String::as_str).collect::<Vec<_>>()[..] {
         ["widevine-index", inrelease, packages] => {
             let p = apt::verify_apt(&text(inrelease)?, &read(packages)?, PACKAGE)?;
+            println!("{} {} {} {}", p.filename, p.size, p.sha256, p.version);
+            Ok(())
+        }
+        ["widevine-index", inrelease, packages, arch] => {
+            let p = apt::verify_apt_for(&text(inrelease)?, &read(packages)?, PACKAGE, arch)?;
             println!("{} {} {} {}", p.filename, p.size, p.sha256, p.version);
             Ok(())
         }
@@ -67,7 +73,7 @@ fn run(args: &[String]) -> Result<(), Error> {
             Ok(())
         }
         _ => {
-            eprintln!("usage: hospes-install widevine-index INRELEASE PACKAGES | widevine-deb INRELEASE PACKAGES DEB DEST | widevine-file LIB [MANIFEST] DEST | widevine-check INRELEASE PACKAGES DEB | check-imports LIB");
+            eprintln!("usage: hospes-install widevine-index INRELEASE PACKAGES [ARCH] | widevine-deb INRELEASE PACKAGES DEB DEST | widevine-file LIB [MANIFEST] DEST | widevine-check INRELEASE PACKAGES DEB | check-imports LIB");
             Err(Error::Io("usage".into()))
         }
     }

@@ -196,7 +196,7 @@ table); `SIGSYS` handler in `hospes-rt`, Linux-call emulation and the first virt
 `hospes-glibc`; H0's raw call set trapped on FreeBSD arm64/amd64, probe and H3 still green.
 `hospes-cdm` on FreeBSD now needs `hospes_trap.ko` loaded. H4 (Widevine) done 2026-11-12
 (`docs/reviews/2026-11-12-hospes-h4.md`): Shaka's angel-one Widevine stream plays to the end
-in the FreeBSD amd64 VM under Hospes (H.264 through the CDM's decrypt-and-decode, Opus
+in the FreeBSD amd64 and arm64 VMs under Hospes (H.264 through the CDM's decrypt-and-decode, Opus
 decrypt-only, licence POSTed through Nuntius, CDM installed by `hospes-install` from Google's
 signed package). H5 (hardening) done 2026-11-12 (`docs/reviews/2026-11-12-hospes-h5.md`):
 five fuzz targets (ELF, both channel decoders, VFS paths, install parsers) clean for 1 h each

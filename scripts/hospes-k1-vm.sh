@@ -30,7 +30,8 @@ kernel() {
     env CC=/usr/bin/clang-$LLVM CXX=/usr/bin/clang++-$LLVM CPP=/usr/bin/clang-cpp-$LLVM MAKEOBJDIRPREFIX="$OBJ" \
         "$SRC/tools/build/make.py" --cross-bindir=/usr/lib/llvm-$LLVM/bin TARGET=$TGT TARGET_ARCH=$TA \
         installkernel KERNCONF="$KERNCONF" DESTDIR="$stage" -DNO_ROOT KODIR=/boot/kernel.atrium >&2
-    sum=$(tar czf - -C "$stage" boot/kernel.atrium | tee "$stage.tgz" | sha256sum | cut -d' ' -f1)
+    tar czf "$stage.tgz" -C "$stage" boot/kernel.atrium || { echo "kernel tarball (disk full?)" >&2; exit 1; }
+    sum=$(sha256sum "$stage.tgz" | cut -d' ' -f1)
     "$V" 'rm -rf /boot/kernel.atrium /tmp/k.tgz; cat > /tmp/k.tgz' < "$stage.tgz"
     got=$("$V" 'sha256 -q /tmp/k.tgz')
     [ "$got" = "$sum" ] || { echo "kernel copy corrupt ($got != $sum)" >&2; exit 1; }

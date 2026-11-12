@@ -47,7 +47,8 @@ curl -sSf -o "$VMDIR/chrome/InRelease" "$APT/dists/stable/InRelease" || die "fet
 curl -sSf -o "$VMDIR/chrome/Packages" "$APT/dists/stable/main/binary-$DEBARCH/Packages" || die "fetch Packages"
 # Which .deb the signed index names (verified on the host too: a bad index stops here).
 (cd "$ROOT/hospes" && cargo build -q --release -p hospes-install) || die "hospes-install (host)"
-set -- $("$ROOT/hospes/target/release/hospes-install" widevine-index "$VMDIR/chrome/InRelease" "$VMDIR/chrome/Packages") || die "index"
+IDX=$("$ROOT/hospes/target/release/hospes-install" widevine-index "$VMDIR/chrome/InRelease" "$VMDIR/chrome/Packages" "$DEBARCH") || die "index"
+set -- $IDX
 DEBPATH=$1 DEBSIZE=$2 DEBSHA=$3 DEBVER=$4
 if [ -n "${CHROME_DEB:-}" ] && [ "$(sha256sum "$CHROME_DEB" | cut -d' ' -f1)" = "$DEBSHA" ]; then
     cp "$CHROME_DEB" "$VMDIR/chrome/chrome.deb"

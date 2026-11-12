@@ -81,9 +81,17 @@ pub fn find_package(packages: &str, name: &str) -> Option<Package> {
 /// package entry for `name`. The caller fetches `entry.filename` and checks it with
 /// [`check_deb`].
 pub fn verify_apt(inrelease: &str, packages: &[u8], name: &str) -> Result<Package, Error> {
+    verify_apt_for(inrelease, packages, name, crate::platform().0)
+}
+
+/// [`verify_apt`] for another machine's index (`amd64` or `arm64`): only to find which
+/// package to fetch for it. The machine that installs verifies again with its own.
+pub fn verify_apt_for(inrelease: &str, packages: &[u8], name: &str, arch: &str) -> Result<Package, Error> {
+    if arch != "amd64" && arch != "arm64" {
+        return Err(Error::Verify(format!("no index for {arch}")));
+    }
     let key = google_key()?;
     let release = verify_inrelease(&key, inrelease)?;
-    let (arch, _) = crate::platform();
     let path = format!("main/binary-{arch}/Packages");
     let (want, len) = release_sha256(&release, &path).ok_or_else(|| Error::Verify(format!("the release lists no {path}")))?;
     if packages.len() as u64 != len || sha256_hex(packages) != want {
