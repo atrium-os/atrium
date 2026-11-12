@@ -19,7 +19,7 @@ SRC="${SRC:-$HOME/freebsd-src}"
 OBJ="${OBJ:-$HOME/obj-amd64}"
 KERNCONF="${KERNCONF:-ATRIUM-NODEBUG}"
 OUT="${OUT:-$HOME/r9700-out}"
-SIZE_MB="${SIZE_MB:-4096}"
+SIZE_MB="${SIZE_MB:-6144}"   # > the VM image's 5 GB rootfs
 VMDIR="${VMDIR:-$HOME/atrium-vm-amd64}"
 VMIMG="https://download.freebsd.org/snapshots/VM-IMAGES/16.0-CURRENT/amd64"
 SNAPDATE="${SNAPDATE:-20261109}"   # the cloud VM's image date (cloud-vm.sh setup)
@@ -35,7 +35,7 @@ say "userland: pristine UFS VM image $SNAPDATE"
 # ★ Not snapshots/.../base.txz: on 2026-11-12 that was still the Oct 27 build
 # (n290352), whose sshd segfaults at startup even on the stock kernel. The
 # dated VM images are newer and are what the cloud VM runs.
-if [ ! -f "$W/rootfs-$SNAPDATE.ufs" ]; then
+if [ ! -f "$W/rootfs-$SNAPDATE.ufs.zst" ]; then
     D="$VMIMG/$SNAPDATE"
     IDX=$(curl -fsS "$D/") || die "list $D"
     IMG=$(echo "$IDX" | grep -oE 'FreeBSD-16\.0-CURRENT-amd64-ufs-[^"]*\.raw\.xz' | head -1)
@@ -51,7 +51,7 @@ if [ ! -f "$W/rootfs-$SNAPDATE.ufs" ]; then
     [ -n "$n" ] && [ -n "$e" ] || die "partitions not found in $IMG"
     first=$(sgdisk -i "$n" "$W/vmimage.raw" | awk '/First sector/ {print $3}')
     last=$(sgdisk -i "$n" "$W/vmimage.raw" | awk '/Last sector/ {print $3}')
-    dd if="$W/vmimage.raw" of="$W/rootfs-$SNAPDATE.ufs" bs=512 skip="$first" count=$((last - first + 1)) conv=sparse status=none
+    dd if="$W/vmimage.raw" bs=512 skip="$first" count=$((last - first + 1)) status=none | zstd -q -T0 -o "$W/rootfs-$SNAPDATE.ufs.zst"
     efirst=$(sgdisk -i "$e" "$W/vmimage.raw" | awk '/First sector/ {print $3}')
     mcopy -n -i "$W/vmimage.raw@@$((efirst * 512))" ::/EFI/BOOT/BOOTX64.EFI "$W/loader-$SNAPDATE.efi" || die "loader.efi from ESP"
     echo "$IMG" > "$W/REVISION"
@@ -62,7 +62,7 @@ say "kernel $KERNCONF -> stage"
 rm -rf "$W/stage" && mkdir -p "$W/stage"
 env CC=/usr/bin/clang-19 CXX=/usr/bin/clang++-19 CPP=/usr/bin/clang-cpp-19 MAKEOBJDIRPREFIX="$OBJ" \
     "$SRC/tools/build/make.py" --cross-bindir=$L TARGET=amd64 TARGET_ARCH=amd64 \
-    installkernel KERNCONF="$KERNCONF" DESTDIR="$W/stage" -DNO_ROOT >"$W/installkernel.log" 2>&1 \
+    installkernel KERNCONF="$KERNCONF" DESTDIR="$W/stage" -DNO_ROOT WITHOUT_KERNEL_SYMBOLS=yes >"$W/installkernel.log" 2>&1 \
     || die "installkernel (see $W/installkernel.log)"
 # The GPU modules go OUTSIDE the module path, so neither devmatch nor a
 # stray kldload can attach the gpusim-shaped driver to silicon before stage 3.
@@ -78,40 +78,44 @@ install -D -m 755 "$ROOT/atrium-gpu-amd/probe/target/x86_64-unknown-freebsd/rele
 echo "atrium $(git -C "$ROOT" rev-parse --short HEAD) kernel $KERNCONF fork $(git -C "$SRC" rev-parse --short HEAD) base $(cat "$W/REVISION" 2>/dev/null) built $(date -u +%FT%TZ)" > "$W/stage/etc/atrium-image"
 tar -C "$W/stage" -cf "$W/overlay.tar" .
 
-say "filesystem (in the VM)"
-vssh 'rm -f /var/tmp/root.ufs /var/tmp/root.ufs.zst /var/tmp/overlay.tar; mkdir -p /mnt/ar'
-zstd -q -f -T0 "$W/rootfs-$SNAPDATE.ufs" -o "$W/rootfs.ufs.zst"
+say "filesystem (VM, image attached as a second disk)"
+# ★ The image is a raw file on the host attached to the VM, not copied into
+# the guest: guest ZFS writes grow vm.qcow2 for good, and the cloud session's
+# disk allowance ran out that way (2026-11-12).
+rm -f "$W/root.ufs"
+zstd -q -dc "$W/rootfs-$SNAPDATE.ufs.zst" | dd of="$W/root.ufs" bs=1M conv=sparse status=none
+truncate -s "${SIZE_MB}M" "$W/root.ufs"
+sh "$ROOT/scripts/cloud-vm.sh" down >/dev/null 2>&1 || true
+QEMU_EXTRA="-drive file=$W/root.ufs,format=raw,if=none,id=img,cache=unsafe -device virtio-blk-pci,drive=img,serial=atriumimg" \
+    sh "$ROOT/scripts/cloud-vm.sh" up >/dev/null || die "VM up"
+vssh 'rm -f /var/tmp/overlay.tar; mkdir -p /mnt/ar'
 scp -q -i "$HOME/.ssh/fresco_bsd_ed25519" -P 2222 -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
-    "$W/rootfs.ufs.zst" "$W/overlay.tar" root@127.0.0.1:/var/tmp/ || die "scp to VM"
+    "$W/overlay.tar" root@127.0.0.1:/var/tmp/ || die "scp to VM"
 # Under TCG a large scp occasionally lands with a run of zeros: hash-check.
-for f in rootfs.ufs.zst overlay.tar; do
-    [ "$(vssh "sha256 -q /var/tmp/$f")" = "$(sha256sum "$W/$f" | cut -d' ' -f1)" ] || die "$f corrupted in transfer; rerun"
-done
+[ "$(vssh "sha256 -q /var/tmp/overlay.tar")" = "$(sha256sum "$W/overlay.tar" | cut -d' ' -f1)" ] || die "overlay.tar corrupted in transfer; rerun"
 vssh "set -e
-    zstd -q -d -f /var/tmp/rootfs.ufs.zst -o /var/tmp/root.ufs && rm -f /var/tmp/rootfs.ufs.zst
-    truncate -s ${SIZE_MB}m /var/tmp/root.ufs
-    md=\$(mdconfig -a -t vnode -f /var/tmp/root.ufs)
-    growfs -y /dev/\$md >/dev/null
-    tunefs -L atriumroot /dev/\$md >/dev/null
-    mount /dev/\$md /mnt/ar
+    d=''
+    for x in \$(sysctl -n kern.disks); do
+        [ \"\$(diskinfo -s \$x 2>/dev/null)\" = atriumimg ] && d=\$x
+    done
+    [ -n \"\$d\" ] || { echo 'image disk not found'; exit 1; }
+    fsck_ufs -fy /dev/\$d >/dev/null
+    growfs -y /dev/\$d >/dev/null
+    tunefs -L atriumroot /dev/\$d >/dev/null
+    mount /dev/\$d /mnt/ar
     rm -rf /mnt/ar/boot/kernel /mnt/ar/etc/ssh/ssh_host_*
-    rm -f /mnt/ar/var/db/firstboot-done 2>/dev/null || true
     tar -xpf /var/tmp/overlay.tar -C /mnt/ar
     grep -q '^PermitRootLogin' /mnt/ar/etc/ssh/sshd_config || echo 'PermitRootLogin prohibit-password' >> /mnt/ar/etc/ssh/sshd_config
     kldxref /mnt/ar/boot/kernel
     ls /mnt/ar/boot/kernel/kernel >/dev/null
     umount /mnt/ar
-    mdconfig -d -u \$md
     rm -f /var/tmp/overlay.tar" || die "build filesystem in VM"
+sh "$ROOT/scripts/cloud-vm.sh" down >/dev/null 2>&1 || true
 
 say "bundle"
 B="$OUT/atrium-r9700-$(date -u +%Y%m%d-%H%M)"
 rm -rf "$B" && mkdir -p "$B"
-want=$(vssh 'zstd -q -f -T0 -10 /var/tmp/root.ufs -o /var/tmp/root.ufs.zst && rm -f /var/tmp/root.ufs && sha256 -q /var/tmp/root.ufs.zst') || die "compress image"
-scp -q -i "$HOME/.ssh/fresco_bsd_ed25519" -P 2222 -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
-    root@127.0.0.1:/var/tmp/root.ufs.zst "$B/root.ufs.zst" || die "fetch image"
-[ "$want" = "$(sha256sum "$B/root.ufs.zst" | cut -d' ' -f1)" ] || die "root.ufs.zst corrupted in transfer; rerun"
-vssh 'rm -f /var/tmp/root.ufs.zst'
+zstd -q -T0 -10 "$W/root.ufs" -o "$B/root.ufs.zst" && rm -f "$W/root.ufs" "$W/overlay.tar" || die "compress image"
 cp "$W/loader-$SNAPDATE.efi" "$B/loader.efi"
 (cd "$B" && sha256sum root.ufs.zst loader.efi > SHA256)
 tar -C "$B" -cf "$B.tar" root.ufs.zst loader.efi SHA256
