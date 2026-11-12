@@ -415,3 +415,12 @@ land with it.
   data before running. Power was 66 W, refused, reset cold. Next (diagnostic, with the
   start gate): log each pipe's PSP-programmed IC_BASE, MDBASE, bounds and MSCRATCH, and
   both hubs' fault status, before the start and on failure.
+- **2026-11-12 20:59, 45267702: both MES pipes started (same boot where 6c90468a failed),
+  so the start is intermittent, not stuck card state.** The PSP placed MES sanely: IC_BASE
+  0x7f461d000/0x7f469d000 and MDBASE 0x7f5500000/0x7f5580000, inside its 50 MiB
+  reservation, with 512 KiB bounds and no hub faults before MES. There were no client-0xa
+  IVs this time. With gfx_hqd_mask 0 the CPF still stuck busy (0x84000001, 60 W), so the
+  mask was not the cause. Linux's gfx_v12_0_cp_resume (async gfx ring, the default) sets
+  the doorbell ranges and un-halts MEC and PFP/ME, idle with no rings, before
+  mes kiq_hw_init starts MES; we started MES with them halted. Next (b7…): do the same
+  before MES, halt them again after, and set gfx_hqd_mask back to 0xfe.

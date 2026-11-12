@@ -59,6 +59,10 @@ struct mes_gen {
 	uint32_t ic_base_lo, ic_base_hi, ic_base_cntl, md_base_lo, md_base_hi,
 	    mi_bound_lo, mi_bound_hi, md_bound_lo, md_bound_hi, mscratch_lo,
 	    mscratch_hi, local_base0_lo;
+	/* CP engines and doorbell ranges (gfx_v12_0_cp_resume). */
+	uint32_t cp_me_cntl, cp_mec_rs64_cntl, rb_db_lo, rb_db_hi, mec_db_lo,
+	    mec_db_hi;
+	uint32_t db_gfx_lo, db_gfx_hi, db_mec_lo, db_mec_hi;	/* values */
 	/* NBIF segment 2 */
 	uint32_t nbif_db_aper_en, nbif_db_entry0, nbif_db_entry3;
 	/* Doorbell dword indices (amdgpu_doorbell.h NAVI10 MES_RING0/1 << 1). */
@@ -80,6 +84,10 @@ static const struct mes_gen mes_gens[] = {
 	  S1(0x5850), S1(0x5851), S1(0x5852), S1(0x5854), S1(0x5855),
 	  S1(0x585b), S1(0x585c), S1(0x585d), S1(0x585e), S1(0x2815),
 	  S1(0x2814), S1(0x2883),
+	  S1(0x0803), S1(0x2904), S0(0x1dfa), S0(0x1dfb), S0(0x1dfc),
+	  S0(0x1dfd),
+	  /* NAVI10 doorbell layout (soc24.c): gfx 0x8b..0xff, kiq 0..0x8a. */
+	  (0x8b * 2) << 2, (0xff * 2) << 2, 0, (0x8a * 2) << 2,
 	  0x00c0, 0x01cb, 0x01ce,
 	  0x0b << 1, 0x0c << 1, 0x400 },
 };
@@ -374,6 +382,70 @@ mes_placement(struct mes *m, const char *when)
 	grbm_select(m, 0, 0);
 }
 
+#define ME_HALTS		0x14000000u	/* PFP_HALT | ME_HALT */
+#define MEC_HALT		0x40000000u
+#define MEC_ACTIVE		0x3c000000u	/* PIPE0..3_ACTIVE */
+#define MEC_RESETS		0x000f0000u	/* PIPE0..3_RESET */
+#define MEC_INV_ICACHE		0x00000010u
+
+/*
+ * gfx_v12_0_cp_resume, amdgpu_async_gfx_ring path (the default): doorbell
+ * ranges, then MEC and PFP/ME un-halted, idle with no rings, BEFORE MES is
+ * started. Box runs 6073c0fa..45267702 started MES with them halted (4c's
+ * resting state): MES posts to the GFX pipe and the CPF stayed busy
+ * forever (CP_CPF_STATUS 0x84000001), and the MES pipe start was flaky.
+ * The RS64 start addresses were programmed in 4c.
+ */
+static int
+cp_resume(struct mes *m)
+{
+	const struct mes_gen *g = m->g;
+	uint32_t d;
+	int us;
+
+	wr(m, g->rb_db_lo, g->db_gfx_lo);
+	wr(m, g->rb_db_hi, g->db_gfx_hi);
+	wr(m, g->mec_db_lo, g->db_mec_lo);
+	wr(m, g->mec_db_hi, g->db_mec_hi);
+	/* gfx_v12_0_cp_compute_enable(true) */
+	d = rd(m, g->cp_mec_rs64_cntl);
+	d &= ~(MEC_INV_ICACHE | MEC_RESETS | MEC_HALT);
+	d |= MEC_ACTIVE;
+	wr(m, g->cp_mec_rs64_cntl, d);
+	DELAY(50);
+	/* gfx_v12_0_cp_gfx_enable(true): un-halt, wait for CP_STAT 0. */
+	wr(m, g->cp_me_cntl, rd(m, g->cp_me_cntl) & ~ME_HALTS);
+	for (us = 0; us < 100000 && rd(m, g->cp_stat) != 0; us++)
+		DELAY(1);
+	device_printf(m->sc->dev, "mes: CP running before MES (as amdgpu): "
+	    "CP_ME_CNTL %#x, CP_MEC_RS64_CNTL %#x, CP_STAT %#x after %d us, "
+	    "CP_CPF_STATUS %#x\n", rd(m, g->cp_me_cntl),
+	    rd(m, g->cp_mec_rs64_cntl), rd(m, g->cp_stat), us,
+	    rd(m, g->cp_cpf_status));
+	return (us >= 100000 ? ETIMEDOUT : 0);
+}
+
+/* Back to 4c's resting state after MES: PFP/ME and MEC halted. */
+static void
+cp_halt(struct mes *m)
+{
+	const struct mes_gen *g = m->g;
+	uint32_t d;
+	int us;
+
+	wr(m, g->cp_me_cntl, rd(m, g->cp_me_cntl) | ME_HALTS);
+	for (us = 0; us < 100000 && rd(m, g->cp_stat) != 0; us++)
+		DELAY(1);
+	d = rd(m, g->cp_mec_rs64_cntl);
+	d &= ~MEC_ACTIVE;
+	d |= MEC_INV_ICACHE | MEC_RESETS | MEC_HALT;
+	wr(m, g->cp_mec_rs64_cntl, d);
+	DELAY(50);
+	device_printf(m->sc->dev, "mes: CP halted again: CP_ME_CNTL %#x, "
+	    "CP_MEC_RS64_CNTL %#x, CP_STAT %#x\n", rd(m, g->cp_me_cntl),
+	    rd(m, g->cp_mec_rs64_cntl), rd(m, g->cp_stat));
+}
+
 /* mes_v12_0_mqd_init */
 static void
 mqd_init(struct mes *m, int pipe)
@@ -590,14 +662,11 @@ set_hw_resources(struct mes *m, int pipe)
 		put32(b, HW_COMPUTE_HQD + 0, 0xf);
 		put32(b, HW_COMPUTE_HQD + 4, 0xf);
 		/*
-		 * No GFX queues for MES (gfx_hqd_mask 0). Box run 6c90468a: given
-		 * 0xfe as amdgpu does, MES posted a GFX wptr the moment it took
-		 * its resources; with PFP/ME halted (4c's resting state) the CPF
-		 * stayed busy (CP_CPF_STATUS 0x84000001: CPF_BUSY, CPF_GFX_BUSY,
-		 * POST_WPTR_GFX_BUSY), GRBM never idled and the PMFW held gfx at
-		 * 3.4 GHz / 60 W. GFX queues come with the GFX ring stage.
+		 * gfx pipe 0, queue 0 kept, as amdgpu. (Box run 45267702: with
+		 * 0 the CPF stuck busy just the same, so the mask was not the
+		 * cause; PFP/ME being halted under MES was. See cp_resume().)
 		 */
-		put32(b, HW_GFX_HQD, 0);
+		put32(b, HW_GFX_HQD, 0xfe);
 		put32(b, HW_SDMA_HQD + 0, 0xfc);
 		put32(b, HW_SDMA_HQD + 4, 0xfc);
 		for (i = 0; i < 5; i++)
@@ -732,6 +801,8 @@ mes_teardown(struct mes *m)
 	(void)grbm_watch(m, "queues gone, MES still running", 500);
 	mes_enable(m, false);
 	DELAY(100);
+	(void)grbm_watch(m, "MES halted, CP still running", 500);
+	cp_halt(m);
 }
 
 static int
@@ -789,6 +860,8 @@ mes_run(struct mes *m)
 	mes_placement(m, "before start");
 	amd_gmc12_fault_report(m->gt, "before MES");
 	amd_gfx12_pm_report(sc, "before MES");
+	if ((err = cp_resume(m)) != 0)
+		return (err);
 	mes_enable(m, true);
 	/*
 	 * Both pipes must be running the firmware before any queue is made
