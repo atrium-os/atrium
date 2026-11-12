@@ -311,9 +311,9 @@ pub struct EnvelopeFrontend {
     /// frontend, which only forwards). Default: no one.
     notification_uids: Option<Vec<u32>>,
     /// Who may open shell chrome (the Forum bar, `WmRole::Chrome`), which
-    /// stacks above apps and their pop-ups; `None`: anyone (a renderer, or
-    /// frescod with no list set). Default: anyone.
-    chrome_uids: Option<Vec<u32>>,
+    /// stacks above apps and their pop-ups, by peer uid; `None`: anyone (a
+    /// renderer's frontend, which only forwards). Default: no one.
+    chrome_may: Option<Box<dyn Fn(u32) -> bool + Send>>,
 
     /// What `OP_WM_DISPLAY_MODES` reports (frescod sets it from the
     /// connector), and a switch `OP_WM_SET_DISPLAY_MODE` asked for, which
@@ -368,7 +368,7 @@ impl EnvelopeFrontend {
             display_mode: (0, 0, 0),
             reserved_top: 0,
             notification_uids: Some(Vec::new()),
-            chrome_uids: None,
+            chrome_may: Some(Box::new(|_| false)),
             display_modes: fresco_protocol::WmDisplayModesReply { modes: Vec::new(), current: u32::MAX },
             mode_request: None,
             outputs: fresco_protocol::WmOutputsReply { outputs: Vec::new() },
@@ -390,9 +390,10 @@ impl EnvelopeFrontend {
         self.notification_uids = uids;
     }
 
-    /// Who may open `Chrome` windows (`None`: anyone).
-    pub fn set_chrome_uids(&mut self, uids: Option<Vec<u32>>) {
-        self.chrome_uids = uids;
+    /// Who may open `Chrome` windows, by peer uid (`None`: anyone, for a
+    /// renderer, where frescod decides).
+    pub fn set_chrome_may(&mut self, may: Option<Box<dyn Fn(u32) -> bool + Send>>) {
+        self.chrome_may = may;
     }
 
     pub fn reserved_top(&self) -> u32 {
@@ -1478,9 +1479,9 @@ impl EnvelopeFrontend {
                 None => true,
                 Some(u) => uid.is_some_and(|uid| u.contains(&uid)),
             };
-            let may_chrome = match &self.chrome_uids {
+            let may_chrome = match &self.chrome_may {
                 None => true,
-                Some(u) => uid.is_some_and(|uid| u.contains(&uid)),
+                Some(f) => uid.is_some_and(|uid| f(uid)),
             };
             win.role = match p.hints.role {
                 Some(fresco_protocol::WmRole::Hud | fresco_protocol::WmRole::Pip) | None => fresco_protocol::WmRole::Document,

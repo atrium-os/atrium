@@ -56,9 +56,12 @@ A pop-up could be used to draw over another app. So:
   bar, role `Chrome`) and their pop-ups stack above every app's pop-up:
   app windows, app pop-ups, chrome, chrome pop-ups, notifications. While
   a grabbing pop-up is open, only its chain may open more, so an app that
-  stays focused under the bar's menu cannot cover it. The `Chrome` role is
-  granted only to the uids in `FRESCOD_CHROME_UIDS` (unset: anyone, with a
-  warning, for development); others get `Document`.
+  stays focused under the bar's menu cannot cover it. No app gets the `Chrome`
+  role unless frescod grants it (Shankar, 2026-11-12: closed by default;
+  our own setups pass the grant): a uid in `FRESCOD_CHROME_UIDS`, or a
+  launched `org.atrium.forum-bar` / `org.atrium.forum-dock` whose registry
+  binding is signed by a publisher in `FRESCOD_CHROME_PUBLISHERS` (hex
+  publisher ids). Everyone else gets `Document`.
 - An app can still draw a fake drop-down in its own window under the bar.
   The tell is the bar: while its menu is open the button is drawn pressed
   and the menu attached to it (atrium-visual-language.md §14.2, Pergola

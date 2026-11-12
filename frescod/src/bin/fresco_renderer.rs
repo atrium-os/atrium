@@ -359,6 +359,7 @@ fn main() {
     frontend.lock().unwrap().set_display_mode(sw, sh, refresh);
     // Roles are frescod's to grant: pass a notification ask on.
     frontend.lock().unwrap().set_notification_uids(None);
+    frontend.lock().unwrap().set_chrome_may(None);
     let redraw = redraw::RedrawSignal::new();
     let state = Arc::new(Mutex::new(State::default()));
     // Video layers: only in pixel mode, where frescod composes pixels.

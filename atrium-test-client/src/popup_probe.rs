@@ -238,6 +238,16 @@ fn main() -> std::io::Result<()> {
         on = drain(&mut bar, 500)?.iter().any(|e| matches!(e, Event::PointerMotion { window_id, .. } if *window_id == bw));
     }
     p.check(on, "the bar is on screen");
+    // Its role, as the WM sees it: Chrome only where frescod grants it
+    // (FRESCOD_CHROME_UIDS); PROBE_CHROME=0 expects it refused.
+    if let Some(wm_sock) = std::env::var_os("PROBE_WM_SOCK") {
+        let want_chrome = std::env::var("PROBE_CHROME").map_or(true, |v| v != "0");
+        let mut wm = Connection::connect(&wm_sock)?;
+        // By its place (ids are the renderer's own in split mode).
+        let role = wm.wm_enumerate()?.into_iter().find(|s| s.rect.y == 100 && s.rect.h == 40).map(|s| s.role);
+        let want = if want_chrome { fresco_protocol::WmRole::Chrome } else { fresco_protocol::WmRole::Document };
+        p.check(role == Some(want), &format!("the bar's role is {want:?}"));
+    }
     p.send("BTN 1 1")?;
     p.send("BTN 1 0")?;
     drain(&mut bar, 1000)?;
