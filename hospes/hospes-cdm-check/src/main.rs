@@ -12,7 +12,8 @@
 //! - `HOSPES_CDM_CHECK_BROKER=1`: by portcullisd itself (`OpenCdm`, from inside an app
 //!   jail holding `protected-media`): HOSPES_CDM, LIB and STORE_DIR are then unused (`-`),
 //!   since portcullisd picks the host, the library and the store. The origin is
-//!   `HOSPES_CDM_CHECK_ORIGIN` (default `https://check.example`).
+//!   `HOSPES_CDM_CHECK_ORIGIN` (default `https://check.example`). With no arguments at all
+//!   (an app bundle's entry), this mode, with the vectors in `../vectors` beside the binary.
 //!
 //! It plays the supervisor (control channel) and the decode worker (data channel), so the
 //! comparison covers hospes-proto as well as the host. The store directory defaults to a
@@ -279,12 +280,18 @@ fn open_cdm(ctrl: &UnixStream, data: &UnixStream) -> io::Result<UnixStream> {
 }
 
 fn main() {
-    let a: Vec<String> = std::env::args().collect();
+    let mut a: Vec<String> = std::env::args().collect();
+    let broker = std::env::var_os("HOSPES_CDM_CHECK_BROKER").is_some() || a.len() == 1;
+    if a.len() == 1 {
+        let exe = std::env::current_exe().unwrap_or_default();
+        let vectors = exe.parent().and_then(|d| d.parent()).map(|d| d.join("vectors")).unwrap_or_default();
+        a.extend(["-".into(), "-".into(), vectors.to_string_lossy().into_owned()]);
+    }
     if a.len() < 4 {
         eprintln!("usage: hospes-cdm-check HOSPES_CDM LIB VECTORS_DIR [STORE_DIR]");
         std::process::exit(2);
     }
-    std::process::exit(match run(&a[1], &a[2], &a[3], a.get(4).map(String::as_str)) {
+    std::process::exit(match run(&a[1], &a[2], &a[3], a.get(4).map(String::as_str), broker) {
         Ok(()) => 0,
         Err(e) => {
             eprintln!("hospes-cdm-check: {e}");
@@ -293,9 +300,11 @@ fn main() {
     });
 }
 
-fn run(host: &str, lib: &str, vecdir: &str, store: Option<&str>) -> io::Result<()> {
+fn run(host: &str, lib: &str, vecdir: &str, store: Option<&str>, broker: bool) -> io::Result<()> {
     let (vecs, licence, licence1) = load_vectors(vecdir)?;
+    // portcullisd keeps the store when it starts the host.
     let store_dir = match store {
+        _ if broker => String::new(),
         Some(d) => d.to_string(),
         None => {
             let d = std::env::temp_dir().join(format!("hospes-cdm-check.{}", std::process::id()));
@@ -306,7 +315,7 @@ fn run(host: &str, lib: &str, vecdir: &str, store: Option<&str>) -> io::Result<(
     };
     let (ctrl, ctrl_c) = UnixStream::pair()?;
     let (data, data_c) = UnixStream::pair()?;
-    let mut host = if std::env::var_os("HOSPES_CDM_CHECK_BROKER").is_some() {
+    let mut host = if broker {
         Host::Broker(open_cdm(&ctrl_c, &data_c)?)
     } else {
         let libf = File::open(lib)?;
@@ -334,6 +343,13 @@ fn run(host: &str, lib: &str, vecdir: &str, store: Option<&str>) -> io::Result<(
         Some(Msg::Ready { cdm_version }) => println!("version {}", s(&cdm_version)),
         other => {
             println!("no Ready: {other:?}");
+            // portcullisd says why its host did not run (a refused jail, a missing user).
+            if let Host::Broker(b) = &mut host {
+                let _ = b.set_read_timeout(Some(Duration::from_secs(5)));
+                if let Ok(r) = portcullis_ipc::read_response(b) {
+                    eprintln!("hospes-cdm-check: portcullisd: {r:?}");
+                }
+            }
             host.kill();
             return Err(io::Error::other("hospes-cdm did not start"));
         }
@@ -386,7 +402,7 @@ fn run(host: &str, lib: &str, vecdir: &str, store: Option<&str>) -> io::Result<(
     if let Some(st) = st {
         return Err(io::Error::other(format!("hospes-cdm exited with {st}")));
     }
-    if store.is_none() {
+    if store.is_none() && !broker {
         let _ = std::fs::remove_dir_all(&store_dir);
     }
     Ok(())

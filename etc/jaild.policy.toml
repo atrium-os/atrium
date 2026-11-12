@@ -288,6 +288,8 @@ allowed_system_uids = [
     # 65024 = _vinculum        (reserved: Bluetooth host, docs/spec/bluetooth.md §4)
     # 65025 = _vinculum-hci    (reserved: Bluetooth transport, one per controller)
     # 65026 = _vinculum-audio  (reserved: Bluetooth audio profiles)
+    65027,   # _hospes-cdm: content decryption module hosts, started per app by
+             # portcullisd (OpenCdm) under the system worker rule (hospes-cdm-bundle.sh)
 ]
 
 [gid]
@@ -303,6 +305,7 @@ allowed_system_gids = [
     65020,   # _arca
     65022,   # _limen
     65023,   # _nuntius
+    65027,   # _hospes-cdm
 ]
 
 

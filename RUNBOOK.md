@@ -5217,6 +5217,11 @@ make.py ... installkernel DESTDIR=$HOME/stage -DNO_ROOT KODIR=/boot/kernel.atriu
   `sh scripts/hospes-version-watch.sh x86_64|aarch64` (needs dl.google.com and
   ciscobinary.openh264.org; `OPENH264_BZ2_DIR=` takes Cisco's .bz2 files from disk where that
   host is blocked, as in the cloud container). CI runs it daily; the weekly job fuzzes 5 min each.
+- Hospes CDM jail: `ARCH=aarch64 sh scripts/hospes-k1-vm.sh kernel` (once per VM boot:
+  nextboot is one-shot), then `sh scripts/hospes-cdm-jail-vm.sh` (portcullis stack, the
+  org.atrium.hospes-cdm bundle via hospes-cdm-bundle.sh, three probe apps). Needs
+  kern.racct.enable=1. jaild refuses a worker uid not in etc/jaild.policy.toml's allowlist
+  (the host is 65027).
 - Build the Tessera EFI loader on the host via buildenv (~2 min), not in the TCG guest (30+ min).
 - Fork userland for amd64: `scripts/cross-build-world.sh` (~62 min). Stop the VM during it (the guest got OOM-killed).
 - Never run two make.py builds on one objdir.

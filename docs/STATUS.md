@@ -202,9 +202,12 @@ signed package). H5 (hardening) done 2026-11-12 (`docs/reviews/2026-11-12-hospes
 five fuzz targets (ELF, both channel decoders, VFS paths, install parsers) clean for 1 h each
 after one fix (own `.deb` reader); version-watch CI `.github/workflows/hospes-version-watch.yml`
 checks today's Chrome CDM and OpenH264 daily on both machines (CDM never run in CI). bhyve
-wrapper not built. Build order H0-H5 complete; open items in the H4/H5 write-ups. Run: `scripts/hospes-build.sh`, `scripts/hospes-h3-vm.sh`,
+wrapper not built. Build order H0-H5 complete; open items in the H4/H5 write-ups. The CDM's own jail and user done 2026-11-12
+(`docs/reviews/2026-11-12-hospes-cdm-jail.md`): portcullisd `OpenCdm` + manifest capability
+`protected-media`; hospes-cdm runs as `_hospes-cdm` (65027) in a one-shot jail with a
+per-app, per-origin store, library and store rights-limited; arm64 VM check passes. Run: `scripts/hospes-build.sh`, `scripts/hospes-h3-vm.sh`,
 `scripts/hospes-kmod.sh`, `scripts/hospes-k1-vm.sh`, `scripts/hospes-h4-vm.sh`,
-`scripts/hospes-version-watch.sh`.
+`scripts/hospes-version-watch.sh`, `scripts/hospes-cdm-jail-vm.sh`.
 
 ## 6. Navigator exploration coverage
 

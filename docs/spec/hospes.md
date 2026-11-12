@@ -76,6 +76,10 @@ of Atrium over a typed channel.
   settled: it is the one component we can neither read nor build, and it holds per-origin
   state that nothing else should see. One instance per media island; it dies with the island.
   The jail adds rctl limits and kill-on-teardown on top of capability mode.
+  *Built 2026-11-12* (`docs/reviews/2026-11-12-hospes-cdm-jail.md`): the app asks portcullisd
+  with `OpenCdm { key_system, origin }`, which needs `protected-media` in its installed
+  manifest; the host is `org.atrium.hospes-cdm`, run as `_hospes-cdm` (65027) by a system
+  worker rule, and receives its channels, library and store on stdin (`SCM_RIGHTS`).
 - **Two channels to the CDM.** The *control* channel goes to the supervisor: sessions,
   licence messages, key status. The supervisor relays licence messages to and from the engine
   over Limen and never looks inside them. The *data* channel goes to the decode worker:
@@ -305,6 +309,11 @@ ordinary video (legacy-web §8.1).
 - At jail creation the supervisor's broker opens (or creates) the origin's CDM store, a
   directory on a Tessera volume keyed by the top-level origin and the key system, and passes
   it as a directory fd limited with `cap_rights_limit` to create, read, write, unlink.
+  *Built:* the broker is portcullisd. The store is
+  `/var/db/atrium/cdm-store/<app>/<key system>/<origin, percent-encoded>/` (0700, the host's
+  user), the library `/var/db/atrium/cdm/<key system>/current/`; both are rights-limited by
+  portcullisd and again by hospes-cdm before it loads anything. The app names only the origin
+  and never reaches another app's stores.
 - `FileIO` maps record names to files under that fd with `openat` beneath it; names are
   checked (`[A-Za-z0-9._-]{1,64}`), total size is capped (1 MiB default), record count capped.
 - The store is wiped with the site's data, and listed in settings as "protected content
