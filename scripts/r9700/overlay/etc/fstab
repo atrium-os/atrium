@@ -1,0 +1,2 @@
+/dev/ufs/atriumroot	/	ufs	rw	1	1
+tmpfs			/tmp	tmpfs	rw,mode=1777	0	0

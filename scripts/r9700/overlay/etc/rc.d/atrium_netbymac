@@ -1,0 +1,50 @@
+#!/bin/sh
+#
+# PROVIDE: atrium_netbymac
+# REQUIRE: FILESYSTEMS
+# BEFORE: netif
+# KEYWORD: nojail
+#
+# R9700 box (docs/spec/r9700-bare-metal.md): the network settings come from
+# the ESP, written there by install-from-ubuntu.sh from Ubuntu's live
+# config. Find the NIC by MAC, name it wan0 and configure it statically.
+# Also installs root's authorized_keys from the ESP on every boot.
+
+. /etc/rc.subr
+
+name="atrium_netbymac"
+rcvar="atrium_netbymac_enable"
+start_cmd="${name}_start"
+stop_cmd=":"
+
+atrium_netbymac_start()
+{
+	local esp m mac cidr gw dns ifn
+	esp=$(gpart show -p 2>/dev/null | awk '$4 == "efi" {print $3; exit}')
+	[ -n "$esp" ] || { echo "atrium_netbymac: no ESP"; return 0; }
+	m=$(mktemp -d /tmp/esp.XXXX)
+	mount -t msdosfs -o ro "/dev/$esp" "$m" || return 0
+	if [ -f "$m/EFI/atrium/net.conf" ]; then
+		. "$m/EFI/atrium/net.conf"
+		mac=$(echo "$mac" | tr 'A-F' 'a-f')
+		for ifn in $(ifconfig -l ether); do
+			if ifconfig "$ifn" ether | grep -qi "ether $mac"; then
+				[ "$ifn" = wan0 ] || ifconfig "$ifn" name wan0 >/dev/null
+				sysrc -q ifconfig_wan0="inet $cidr" >/dev/null
+				sysrc -q defaultrouter="$gw" >/dev/null
+				: > /etc/resolv.conf
+				for d in $dns; do echo "nameserver $d" >> /etc/resolv.conf; done
+				echo "atrium_netbymac: $ifn ($mac) -> wan0 $cidr via $gw"
+			fi
+		done
+	fi
+	if [ -f "$m/EFI/atrium/authorized_keys" ]; then
+		install -d -m 700 /root/.ssh
+		install -m 600 "$m/EFI/atrium/authorized_keys" /root/.ssh/authorized_keys
+	fi
+	umount "$m"; rmdir "$m"
+}
+
+load_rc_config $name
+: ${atrium_netbymac_enable:="YES"}
+run_rc_command "$1"
