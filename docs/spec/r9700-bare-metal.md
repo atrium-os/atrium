@@ -294,3 +294,10 @@ land with it.
     yet.
   - Throttler id 1 (hotspot) shows a small non-zero percentage at idle.
   - MetricsCounter jumps around (#1, #951, #905), so it is not a sequence number.
+- **2026-11-12 18:44, idle proven by telemetry (0efb297d).** The family row "GC 12.0.0/1:
+  SRM, clock gating" was picked. Idle check:
+  - sample 1: 187 W, 87 % busy (gating hysteresis), not accepted;
+  - sample 2: 7 W, 0 % busy, accepted ("card proven idle").
+
+  The reset ended with "PSP bootloader ready, card cold" (sOS 0, GB_ADDR_CONFIG 0). The PCH
+  stayed at 28–29 °C for 5 minutes.
