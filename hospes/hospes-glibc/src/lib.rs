@@ -31,6 +31,7 @@ mod stdio;
 mod string;
 pub mod syscall;
 mod time;
+mod unwind;
 pub mod vfs;
 
 use hospes_rt::load::Resolver;
@@ -144,6 +145,7 @@ static TABLE: &[Entry] = table! {
     // memory (one heap: hospes-rt's)
     "malloc" B => fnaddr!(mem::malloc);
     "calloc" B => fnaddr!(mem::calloc);
+    "aligned_alloc" (pick!("GLIBC_2.16", "GLIBC_2.17")) => fnaddr!(mem::aligned_alloc);
     "free" B => fnaddr!(mem::free);
     "realloc" B => fnaddr!(mem::realloc);
     "mmap64" B => fnaddr!(process::mmap64);
@@ -216,6 +218,7 @@ static TABLE: &[Entry] = table! {
     "sched_setscheduler" B => fnaddr!(process::sched_setscheduler);
     "sched_yield" B => fnaddr!(process::sched_yield);
     "getauxval" (pick!("GLIBC_2.16", "GLIBC_2.17")) => fnaddr!(process::getauxval);
+    "__getauxval" (pick!("GLIBC_2.16", "GLIBC_2.17")) => fnaddr!(process::getauxval);
     "__libc_stack_end" B => dataaddr!(process::__libc_stack_end);
     "__register_atfork" (pick!("GLIBC_2.3.2", "GLIBC_2.17")) => fnaddr!(process::__register_atfork);
     "__cxa_atexit" B => fnaddr!(process::__cxa_atexit);
@@ -249,6 +252,7 @@ static TABLE: &[Entry] = table! {
     "stdin" B => dataaddr!(stdio::stdin);
     "fprintf" B => fnaddr!(stdio::fprintf);
     "vfprintf" B => fnaddr!(stdio::vfprintf);
+    "__vfprintf_chk" (pick!("GLIBC_2.3.4", "GLIBC_2.17")) => fnaddr!(stdio::__vfprintf_chk);
     "__fprintf_chk" (pick!("GLIBC_2.3.4", "GLIBC_2.17")) => fnaddr!(stdio::__fprintf_chk);
     "snprintf" B => fnaddr!(stdio::snprintf);
     "vsnprintf" B => fnaddr!(stdio::vsnprintf);
@@ -292,9 +296,13 @@ static TABLE: &[Entry] = table! {
     "pthread_getname_np" (pick!("GLIBC_2.12", "GLIBC_2.17")) => fnaddr!(pthread::pthread_getname_np);
     "pthread_setname_np" (pick!("GLIBC_2.12", "GLIBC_2.17")) => fnaddr!(pthread::pthread_setname_np);
     "pthread_getschedparam" B => fnaddr!(pthread::pthread_getschedparam);
+    "pthread_key_create" "GLIBC_2.34" => fnaddr!(pthread::pthread_key_create);
     "pthread_key_create" B => fnaddr!(pthread::pthread_key_create);
+    "pthread_getspecific" "GLIBC_2.34" => fnaddr!(pthread::pthread_getspecific);
     "pthread_getspecific" B => fnaddr!(pthread::pthread_getspecific);
+    "pthread_setspecific" "GLIBC_2.34" => fnaddr!(pthread::pthread_setspecific);
     "pthread_setspecific" B => fnaddr!(pthread::pthread_setspecific);
+    "pthread_once" "GLIBC_2.34" => fnaddr!(pthread::pthread_once);
     "pthread_once" B => fnaddr!(pthread::pthread_once);
     "pthread_mutex_init" B => fnaddr!(pthread::pthread_mutex_init);
     "pthread_mutex_destroy" B => fnaddr!(pthread::pthread_mutex_destroy);
@@ -356,7 +364,15 @@ static TABLE: &[Entry] = table! {
     "__cxa_pure_virtual" "CXXABI_1.3" => fnaddr!(cxx::__cxa_pure_virtual);
     "__cxa_throw_bad_array_new_length" "CXXABI_1.3.8" => fnaddr!(cxx::__cxa_throw_bad_array_new_length);
     "__gxx_personality_v0" "CXXABI_1.3" => fnaddr!(cxx::__gxx_personality_v0);
-    "_Unwind_Resume" "GCC_3.0" => fnaddr!(cxx::_Unwind_Resume);
+    // The unwinder (libgcc_s's ABI; unwind.rs): Widevine's libc++abi throws through it
+    "_Unwind_RaiseException" "GCC_3.0" => fnaddr!(unwinding::abi::_Unwind_RaiseException);
+    "_Unwind_Resume" "GCC_3.0" => fnaddr!(unwinding::abi::_Unwind_Resume);
+    "_Unwind_DeleteException" "GCC_3.0" => fnaddr!(unwinding::abi::_Unwind_DeleteException);
+    "_Unwind_GetIP" "GCC_3.0" => fnaddr!(unwinding::abi::_Unwind_GetIP);
+    "_Unwind_GetLanguageSpecificData" "GCC_3.0" => fnaddr!(unwinding::abi::_Unwind_GetLanguageSpecificData);
+    "_Unwind_GetRegionStart" "GCC_3.0" => fnaddr!(unwinding::abi::_Unwind_GetRegionStart);
+    "_Unwind_SetGR" "GCC_3.0" => fnaddr!(unwinding::abi::_Unwind_SetGR);
+    "_Unwind_SetIP" "GCC_3.0" => fnaddr!(unwinding::abi::_Unwind_SetIP);
     "_ZTVN10__cxxabiv117__class_type_infoE" "CXXABI_1.3" => dataaddr!(cxx::CLASS_TYPE_INFO_VTABLE);
     "_ZTVN10__cxxabiv120__si_class_type_infoE" "CXXABI_1.3" => dataaddr!(cxx::SI_CLASS_TYPE_INFO_VTABLE);
     "_ZTVN10__cxxabiv121__vmi_class_type_infoE" "CXXABI_1.3" => dataaddr!(cxx::VMI_CLASS_TYPE_INFO_VTABLE);
@@ -379,23 +395,33 @@ pub fn provided() -> impl Iterator<Item = (&'static str, Option<&'static str>)> 
 }
 
 /// Call once, before loading the library: draws the process canary and publishes it where
-/// aarch64 code reads it (`__stack_chk_guard`). `hwcap` is the host's `(AT_HWCAP,
-/// AT_HWCAP2)` for `getauxval`, `stack_end` the main stack's top for `__libc_stack_end`.
-pub fn init_with(hwcap: (usize, usize), stack_end: usize) {
+/// aarch64 code reads it (`__stack_chk_guard`); gives `getauxval` the host's `(AT_HWCAP,
+/// AT_HWCAP2)` and `__libc_stack_end` the main stack's top; describes our own frames to the
+/// unwinder.
+pub fn init_from(info: &hospes_rt::start::StartInfo) {
     hospes_rt::tls::init_process_secrets();
     misc::publish_canary();
     cxx::init_vtables();
     locale::init();
-    process::init(hwcap, stack_end);
+    // glibc's __libc_stack_end: the stack as the program saw it at entry (argc's slot).
+    process::init(hospes_rt::sys::linux_hwcap(info.auxv), info.argv as usize - 8);
+    unwind::register_self(info.auxv);
 }
 
-/// [`init_with`] without hardware capabilities or a stack top (codecs need neither).
-pub fn init() {
-    init_with((0, 0), 0)
-}
-
-/// Mark `[start, end)` as the library's own code: the only memory `mprotect` may make
-/// executable again (call for each executable segment after loading).
-pub fn set_text(start: usize, end: usize) {
-    process::set_text(start, end);
+/// Call after loading `lib`, before running any of its code: its executable segments become
+/// the only memory `mprotect` may make executable again, its `.eh_frame_hdr` describes its
+/// frames to the unwinder, and the VFS learns its path and mappings.
+pub fn library_loaded(lib: &hospes_rt::load::Library) {
+    let (mut lo, mut hi) = (usize::MAX, 0);
+    for (start, end) in lib.text() {
+        process::set_text(start, end);
+        lo = lo.min(start);
+        hi = hi.max(end);
+    }
+    if let Some((hdr, _)) = lib.img.eh_frame_hdr {
+        if lo < hi {
+            unwind::register(lo, hi, lib.base, lib.base + hdr as usize);
+        }
+    }
+    vfs::set_library(lib);
 }

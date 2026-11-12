@@ -5,15 +5,8 @@
 use std::collections::HashSet;
 
 /// Imports still to come, by step. Each must really be missing (so the list only shrinks).
-const PENDING: &[(&str, &str)] = &[
-    ("_Unwind_DeleteException", "H4b"),
-    ("_Unwind_GetIP", "H4b"),
-    ("_Unwind_GetLanguageSpecificData", "H4b"),
-    ("_Unwind_GetRegionStart", "H4b"),
-    ("_Unwind_RaiseException", "H4b"),
-    ("_Unwind_SetGR", "H4b"),
-    ("_Unwind_SetIP", "H4b"),
-];
+/// Imports still to come, by step. Each must really be missing (so the list only shrinks).
+const PENDING: &[(&str, &str)] = &[];
 
 fn lists() -> &'static [&'static str] {
     if cfg!(target_arch = "x86_64") {

@@ -86,6 +86,9 @@ pub unsafe extern "C" fn vfprintf(f: *mut File, fmt: *const u8, mut ap: VaList) 
     let v = format_vec(fmt, &mut ap);
     if put_bytes(f, &v) { v.len() as i32 } else { -1 }
 }
+pub unsafe extern "C" fn __vfprintf_chk(f: *mut File, _flag: i32, fmt: *const u8, ap: VaList) -> i32 {
+    vfprintf(f, fmt, ap)
+}
 pub unsafe extern "C" fn fprintf(f: *mut File, fmt: *const u8, mut args: ...) -> i32 {
     let Some(f) = file(f) else { return -1 };
     let v = format_vec(fmt, &mut args);

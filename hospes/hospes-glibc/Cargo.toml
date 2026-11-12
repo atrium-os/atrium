@@ -8,3 +8,11 @@ description = "The glibc-ABI shim Hospes binds foreign libraries' imports to (do
 [dependencies]
 hospes-rt = { path = "../hospes-rt", default-features = false }
 libm = "0.2"
+# The libgcc_s unwinder ABI (`_Unwind_*`) for C++ exceptions inside the library, finding
+# frames only through the library's own PT_GNU_EH_FRAME (unwind.rs).
+unwinding = { version = "0.2.11", default-features = false, features = ["unwinder", "fde-custom", "dwarf-expr", "hide-trace"] }
+
+[dev-dependencies]
+# Unit tests run on std, whose panics go through the same _Unwind_* symbols: let the
+# unwinder also find the test binary's own frames.
+unwinding = { version = "0.2.11", default-features = false, features = ["unwinder", "fde-custom", "fde-phdr-dl", "dwarf-expr", "hide-trace"] }

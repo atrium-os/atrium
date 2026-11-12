@@ -11,3 +11,8 @@ license = "MIT OR Apache-2.0"
 [profile.release]
 debug = 1
 opt-level = 2
+
+# unwinding 0.2.11 with one fix (vendor/unwinding/ATRIUM.md): strip AArch64 pointer
+# authentication codes from return addresses while unwinding.
+[patch.crates-io]
+unwinding = { path = "vendor/unwinding" }

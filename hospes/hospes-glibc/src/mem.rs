@@ -11,6 +11,20 @@ pub unsafe extern "C" fn malloc(n: usize) -> *mut c_void {
     p as *mut c_void
 }
 
+/// C11 `aligned_alloc`: any power-of-two alignment (glibc accepts sizes that are not a
+/// multiple of it).
+pub unsafe extern "C" fn aligned_alloc(align: usize, n: usize) -> *mut c_void {
+    if !align.is_power_of_two() {
+        set_errno(abi::EINVAL);
+        return core::ptr::null_mut();
+    }
+    let p = heap::alloc(n, align.max(16));
+    if p.is_null() {
+        set_errno(abi::ENOMEM);
+    }
+    p as *mut c_void
+}
+
 pub unsafe extern "C" fn calloc(n: usize, size: usize) -> *mut c_void {
     let Some(total) = n.checked_mul(size) else {
         set_errno(abi::ENOMEM);

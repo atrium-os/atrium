@@ -1,9 +1,10 @@
 //! The pieces of the C++ runtime the libraries import.
 //!
-//! No unwinder: OpenH264 imports neither `__cxa_throw` nor `__cxa_allocate_exception`, so the
-//! only way an exception could start is our `operator new` failing, and ours ends the
-//! process instead of throwing `std::bad_alloc`. The personality routine and
-//! `_Unwind_Resume` are therefore never reached; they end the process if they are.
+//! OpenH264 binds libstdc++'s personality routine but imports neither `__cxa_throw` nor
+//! `__cxa_allocate_exception`, so the only way an exception could start in it is our
+//! `operator new` failing, and ours ends the process instead of throwing `std::bad_alloc`;
+//! the personality here is never reached and ends the process if it is. Widevine carries its
+//! own C++ runtime (libc++abi) and needs only the unwinder (`unwind.rs`).
 use crate::die;
 use core::sync::atomic::{AtomicU32, AtomicU8, Ordering};
 use hospes_rt::{heap, sys};
@@ -67,9 +68,6 @@ pub extern "C" fn __cxa_throw_bad_array_new_length() -> ! {
 }
 pub extern "C" fn __gxx_personality_v0() -> ! {
     die("C++ exception unwinding reached (not supported)")
-}
-pub extern "C" fn _Unwind_Resume() -> ! {
-    die("_Unwind_Resume reached (not supported)")
 }
 
 extern "C" fn type_info_method() -> ! {

@@ -3,6 +3,12 @@
 version = 4
 
 [[package]]
+name = "gimli"
+version = "0.34.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1033caf0b349c518623b5396bfb2cf0bddf44f0306d543a250e5743297aafd10"
+
+[[package]]
 name = "hospes-cdm"
 version = "0.1.0"
 dependencies = [
@@ -50,6 +56,7 @@ version = "0.1.0"
 dependencies = [
  "hospes-rt",
  "libm",
+ "unwinding",
 ]
 
 [[package]]
@@ -74,3 +81,11 @@ name = "libm"
 version = "0.2.16"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b6d2cec3eae94f9f509c767b45932f1ada8350c4bdb85af2fcab4a3c14807981"
+
+[[package]]
+name = "unwinding"
+version = "0.2.11"
+dependencies = [
+ "gimli",
+ "libc",
+]

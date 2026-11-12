@@ -9,6 +9,8 @@
 //!   or SIGBUS);
 //! - `text-write`: write to the library's code, which must fault likewise;
 //! - `probe`: the isolation probe; `fixture_main` returns how many escapes succeeded;
+//! - `glibc`: load a glibc-built library against the real shim (`hospes_glibc::Glibc`) and
+//!   call `fixture_glibc_main(1)`, expect 0 (H4: exceptions, threads, text, process);
 //! - `load-only`: map and relocate a real library (CDM, OpenH264) with unknown imports bound
 //!   to an abort stub, run nothing from it, and report what was bound. Development only.
 //!
@@ -114,7 +116,7 @@ fn fail(name: &str, why: core::fmt::Arguments) -> i32 {
 #[no_mangle]
 pub fn hospes_main(info: &'static StartInfo) -> i32 {
     let (Some(mode), Some(path)) = (info.arg(1), info.arg_z(2)) else {
-        hlog!("usage: hospes-fixture-runner run|refuse|relro-write|text-write|probe|trap|trap-hold|raw FIXTURE.so");
+        hlog!("usage: hospes-fixture-runner run|refuse|relro-write|text-write|probe|trap|trap-hold|raw|glibc FIXTURE.so");
         return 2;
     };
     let mode = core::str::from_utf8(mode).unwrap_or("");
@@ -147,7 +149,11 @@ pub fn hospes_main(info: &'static StartInfo) -> i32 {
     }
 
     let opts = load::Options { hwcap: sys::linux_hwcap(info.auxv), allow_unknown: mode == "load-only", trap: mode == "trap" };
-    let lib = match load::load(fd, &opts, &Host) {
+    if mode == "glibc" {
+        hospes_glibc::init_from(info);
+    }
+    let res: &dyn Resolver = if mode == "glibc" { &hospes_glibc::Glibc } else { &Host };
+    let lib = match load::load(fd, &opts, res) {
         Ok(l) => l,
         Err(e) => {
             if mode == "refuse" {
@@ -177,8 +183,22 @@ pub fn hospes_main(info: &'static StartInfo) -> i32 {
         );
         return 0;
     }
+    if mode == "glibc" {
+        hospes_glibc::library_loaded(&lib);
+    }
     unsafe { lib.run_init(info.argc, info.argv, info.envp) };
     match mode {
+        "glibc" => {
+            let Some(m) = lib.sym("fixture_glibc_main") else { return fail(name, format_args!("no fixture_glibc_main")) };
+            let m: extern "C" fn(i32) -> i32 = unsafe { core::mem::transmute(m) };
+            match m(1) {
+                0 => {
+                    hlog!("PASS {} (glibc shim: exceptions, threads, text, process)", name);
+                    0
+                }
+                r => fail(name, format_args!("check {} failed", r)),
+            }
+        }
         "run" | "probe" => run(&lib, name, mode == "probe"),
         "trap" | "raw" => {
             let r = trap(&lib, name, mode == "trap");

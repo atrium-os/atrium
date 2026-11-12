@@ -51,8 +51,30 @@ build_fixtures() {
         $cc $lk -o "$out/probe.so" "$src/probe.c"
         $cc $lk -o "$out/trap.so" "$src/trap.c"
         rm -f "$out/libhost.so"
+        # H4: a glibc-built C++ library shaped like Widevine: LLVM libc++abi linked in
+        # statically, the unwinder imported from libgcc_s, old glibc symbol versions.
+        clang++ --target=$arch-linux-gnu -fuse-ld=lld -O2 -fPIC -shared -nostdlib++ -std=c++17 \
+            -fvisibility=hidden -Wall -Wl,--as-needed -Wl,-z,now -Wl,-z,relro -Wl,--build-id=none \
+            -o "$out/glibc.so" "$src/glibc.cc" "$(cxxabi $arch)"
         echo "fixtures: $out"
     done
+}
+
+# cxxabi ARCH: a static LLVM libc++abi for ARCH. x86_64: the host's libc++abi-18-dev
+# (apt). aarch64: the same package's arm64 build, unpacked once into ~/.cache (Ubuntu
+# ports; only the archive is used, nothing from it runs on the host).
+cxxabi() {
+    case "$1" in
+        x86_64) a=/usr/lib/llvm-18/lib/libc++abi.a
+            [ -f "$a" ] || { echo "need libc++abi-18-dev (apt install libc++abi-18-dev)" >&2; exit 1; } ;;
+        aarch64) c="$HOME/.cache/hospes-cxxabi-arm64"; a="$c/usr/lib/llvm-18/lib/libc++abi.a"
+            if [ ! -f "$a" ]; then
+                mkdir -p "$c"
+                curl -sSfL -o "$c/d.deb" "http://ports.ubuntu.com/ubuntu-ports/pool/universe/l/llvm-toolchain-18/libc++abi-18-dev_18.1.3-1ubuntu1_arm64.deb"
+                dpkg-deb -x "$c/d.deb" "$c"
+            fi ;;
+    esac
+    echo "$a"
 }
 
 # The H3 test CDM (C++, test-only) and the Linux reference host. The .so files, vectors and
@@ -96,7 +118,7 @@ cdm_check() {
 build_bin() {
     triple="$1"; pkg="$2"
     cd "$H"
-    RUSTFLAGS="-C relocation-model=static -C target-feature=+crt-static -C linker=rust-lld -C linker-flavor=ld.lld -C link-arg=-static -C link-arg=--no-dynamic-linker -C link-arg=-z -C link-arg=noexecstack" \
+    RUSTFLAGS="-C relocation-model=static -C force-unwind-tables=yes -C target-feature=+crt-static -C linker=rust-lld -C linker-flavor=ld.lld -C link-arg=-static -C link-arg=--no-dynamic-linker -C link-arg=-z -C link-arg=noexecstack" \
         cargo build --release -p "$pkg" --target "$triple" \
         -Z build-std=core,alloc -Z build-std-features=compiler-builtins-mem \
         --config 'profile.release.panic="abort"' >&2
@@ -122,6 +144,8 @@ run_all() {
     if [ "$(uname -s)" = Linux ]; then
         $w "$r" raw "$d/trap.so" || fails=$((fails + 1))
     fi
+    # H4: a glibc-built C++ library against the real shim (exceptions through the unwinder).
+    $w "$r" glibc "$d/glibc.so" || fails=$((fails + 1))
     for m in relro-write text-write; do
         set +e
         $w "$r" "$m" "$d/reloc.so" 2>/dev/null
@@ -188,6 +212,13 @@ case "${1:-}" in
         run_all "$x" "$H/fixtures/bin/x86_64" || rc=1
         echo "== aarch64 (qemu-aarch64-static)" >&2
         run_all "$a" "$H/fixtures/bin/aarch64" qemu-aarch64-static || rc=1
+        # The H4 fixture's reference run: the same .so under real glibc.
+        tmp=$(mktemp -d)
+        cc -O1 -o "$tmp/host" "$H/fixtures/src/glibc-host.c" -ldl
+        aarch64-linux-gnu-gcc -O1 -o "$tmp/host-arm64" "$H/fixtures/src/glibc-host.c" -ldl
+        "$tmp/host" "$H/fixtures/bin/x86_64/glibc.so" >&2 || rc=1
+        qemu-aarch64-static -L /usr/aarch64-linux-gnu "$tmp/host-arm64" "$H/fixtures/bin/aarch64/glibc.so" >&2 || rc=1
+        rm -rf "$tmp"
         exit $rc ;;
     *) sed -n '2,8p' "$0"; exit 2 ;;
 esac

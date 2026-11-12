@@ -105,10 +105,8 @@ pub fn hospes_main(info: &'static StartInfo) -> i32 {
         return fail(args.ctrl, 3, if e.0 == sys::ENOSYS { "no capability mode" } else { "cap_enter failed" });
     }
     heap::set_limit(args.mem_mib << 20);
-    let hwcap = sys::linux_hwcap(info.auxv);
-    // glibc's __libc_stack_end: the main stack's top as the program saw it (argc's slot).
-    hospes_glibc::init_with(hwcap, info.argv as usize - 8);
-    let opts = load::Options { hwcap, allow_unknown: false, trap };
+    hospes_glibc::init_from(info);
+    let opts = load::Options { hwcap: sys::linux_hwcap(info.auxv), allow_unknown: false, trap };
     let lib = match load::load(args.lib, &opts, &hospes_glibc::Glibc) {
         Ok(l) => l,
         Err(e) => {
@@ -117,10 +115,7 @@ pub fn hospes_main(info: &'static StartInfo) -> i32 {
         }
     };
     let _ = sys::close(args.lib);
-    for (start, end) in lib.text() {
-        hospes_glibc::set_text(start, end);
-    }
-    hospes_glibc::vfs::set_library(&lib);
+    hospes_glibc::library_loaded(&lib);
     run_init(&lib);
 
     host::install(State {
