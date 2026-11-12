@@ -814,6 +814,9 @@ int	amd_identify(struct atrium_amd_softc *sc);	/* identify.c */
 int	amd_psp_bootload(struct atrium_amd_softc *sc);	/* psp.c, silicon test */
 int	amd_psp_wait_bootloader(struct atrium_amd_softc *sc, uint32_t *sos);
 int	amd_smu_mode1_reset(struct atrium_amd_softc *sc);	/* smu.c */
+int	amd_gfx12_srm_enable(struct atrium_amd_softc *sc);	/* gfx12_pm.c */
+int	amd_gfx12_clock_gating(struct atrium_amd_softc *sc, bool enable);
+void	amd_gfx12_pm_report(struct atrium_amd_softc *sc, const char *when);
 int	amd_smu_init(struct atrium_amd_softc *sc);	/* smu.c, silicon test */
 
 /*

@@ -341,6 +341,26 @@ smu_metrics(struct smu_link *l, struct resource *vram, uint32_t ifver,
 	return (true);
 }
 
+/* `n` telemetry samples 1 s apart, labelled; warn on a busy idle card. */
+static void
+smu_sample(struct smu_link *l, struct resource *vram, uint32_t ifver, int n,
+    const char *label)
+{
+	struct atrium_gpu_power_telemetry t;
+	int i;
+
+	for (i = 0; i < n && !l->failed; i++) {
+		if (i > 0)
+			pause("smumet", hz);
+		device_printf(l->sc->dev, "smu: sample [%s] %d/%d\n", label,
+		    i + 1, n);
+		if (smu_metrics(l, vram, ifver, false, &t) &&
+		    atrium_gpu_power_idle_suspicious(&t))
+			device_printf(l->sc->dev, "smu: WARNING: busy or at "
+			    "the power limit with no work queued\n");
+	}
+}
+
 int
 amd_smu_init(struct atrium_amd_softc *sc)
 {
@@ -351,7 +371,7 @@ amd_smu_init(struct atrium_amd_softc *sc)
 	uint64_t feat;
 	uint32_t v, ifver = 0;
 	bus_size_t lim = rman_get_size(sc->regs);
-	int rid, us, err = 0, gc_up_ok = 0;
+	int rid, us, err = 0, gc_up_ok = 0, gfx_cg = 0;
 
 #define	SEND(m, a, o)	smu_send(&link, (m), (a), (o), false)
 	link.gen = smu_gen_find(sc);
@@ -473,17 +493,32 @@ amd_smu_init(struct atrium_amd_softc *sc)
 	gc_report(sc, "after");
 
 	/*
-	 * Telemetry, read only (spec §4): two reads 1 s apart. Nothing is
-	 * queued here, so a busy or limit-bound card is reported (§5 idle
-	 * check).
+	 * Telemetry, read only (spec §4). Nothing is queued here, so a busy
+	 * or limit-bound card is reported (§A5 idle check).
 	 */
-	if (smu_metrics(&link, vram, ifver, true, &t) &&
-	    atrium_gpu_power_idle_suspicious(&t))
-		device_printf(sc->dev, "smu: WARNING: card is busy or at its "
-		    "power limit with no work queued; it will stay so until "
-		    "power-cycled\n");
+	(void)smu_metrics(&link, vram, ifver, true, &t);
 	pause("smumet", hz);
-	(void)smu_metrics(&link, vram, ifver, false, &t);
+	smu_sample(&link, vram, ifver, 1, "RLC up, no gfx init");
+
+	/*
+	 * Power P2 step 2 experiment (kenv hw.atrium_gpu.gfx_cg=1): the GC
+	 * idle setup amdgpu does after RLC boot, a step at a time with
+	 * telemetry after each: SRM, clock gating, then GfxOff allowed.
+	 */
+	TUNABLE_INT_FETCH("hw.atrium_gpu.gfx_cg", &gfx_cg);
+	if (gfx_cg && !link.failed) {
+		amd_gfx12_pm_report(sc, "before");
+		device_printf(sc->dev, "gfx: SRM enable: %d\n",
+		    amd_gfx12_srm_enable(sc));
+		smu_sample(&link, vram, ifver, 2, "SRM on");
+		device_printf(sc->dev, "gfx: clock gating on: %d\n",
+		    amd_gfx12_clock_gating(sc, true));
+		amd_gfx12_pm_report(sc, "after CG");
+		smu_sample(&link, vram, ifver, 3, "clock gating on");
+		(void)SEND(SMU_ALLOW_GFXOFF, 0, NULL);
+		smu_sample(&link, vram, ifver, 3, "GfxOff allowed");
+		amd_gfx12_pm_report(sc, "end");
+	}
 
 	/* Hand back the PMFW's own idle policy (rule 6). */
 	(void)SEND(SMU_ALLOW_GFXOFF, 0, NULL);
