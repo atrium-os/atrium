@@ -18,4 +18,4 @@ could be unwound:
    strip the authentication code from the unwound return address with `xpaclri` (a no-op
    on CPUs without pointer authentication).
 
-To be offered upstream.
+To be offered upstream: two patches against 0.2.11 and a draft PR are kept in the project files (linux-compat/unwinding-upstream/); not yet sent.

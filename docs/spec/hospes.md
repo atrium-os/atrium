@@ -152,9 +152,9 @@ bounds-checked reads and a fuzz target. It accepts only:
 - **Init and fini.** `DT_INIT`, `DT_INIT_ARRAY` run on the host thread after binding;
   `DT_FINI_ARRAY` and `__cxa_atexit` handlers at orderly shutdown only.
 - **W^X.** Segments are mapped with their declared permissions, never write and execute at
-  once. If the library later asks `mprotect` for write+execute, the shim refuses; a
-  write-then-execute transition is allowed but logged. (§13 R3 covers obfuscated code that
-  needs more.)
+  once. Executable memory exists only in the library's own text: `mmap` with `PROT_EXEC` and
+  `mprotect` to executable outside that text are refused and logged, so no code is made at
+  run time. (§13 R3: revised 2026-11-12 from "write-then-execute allowed with logging".)
 
 ### 5.3 Thread-local storage
 
@@ -426,8 +426,11 @@ to four days. It needs the user's consent to download the two libraries (§14 de
   presence, timing. Hospes answers consistently and has no debugger attached. If a check
   still fails it shows in H0 as a difference between Linux and Hospes, and we do not work
   around it by patching the library.
-- **R3. Self-modifying code.** If the obfuscated CDM writes code at run time, it needs
-  write-then-execute. We allow the transition with logging, never simultaneous write+execute.
+- **R3. Self-modifying code — resolved: refused.** If the obfuscated CDM wrote code at run
+  time it would need write-then-execute. Widevine 4.10.3112.0 never asked: H.264 (amd64 and arm64) and VP9 (arm64)
+  played to the end with no executable `mmap` or `mprotect` request
+  (2026-11-12). The shim refuses any such request and logs it; we revisit only if a CDM
+  update needs it, and then as a decision, not by default.
 - **R4. Unwinder.** Confirmed: both libraries import libgcc_s's unwinder, and OpenH264
   libstdc++'s personality routine. Hospes carries freestanding LLVM libunwind and libc++abi
   pieces.
