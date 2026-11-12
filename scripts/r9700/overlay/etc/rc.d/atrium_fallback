@@ -1,0 +1,30 @@
+#!/bin/sh
+#
+# PROVIDE: atrium_fallback
+# REQUIRE: LOGIN
+# KEYWORD: nojail
+#
+# R9700 box safety net (docs/spec/r9700-bare-metal.md): Atrium is booted
+# once via UEFI BootNext, so a reboot returns the box to Ubuntu. If nobody
+# has run `atrium-stay` within atrium_fallback_minutes (default 20) of boot,
+# for example because the network never came up, reboot back to Ubuntu.
+
+. /etc/rc.subr
+
+name="atrium_fallback"
+rcvar="atrium_fallback_enable"
+start_cmd="${name}_start"
+stop_cmd=":"
+
+atrium_fallback_start()
+{
+	rm -f /var/run/atrium-stay
+	echo "atrium_fallback: rebooting to Ubuntu in ${atrium_fallback_minutes} min unless atrium-stay runs"
+	daemon -f sh -c "sleep $((atrium_fallback_minutes * 60)); \
+	    [ -e /var/run/atrium-stay ] || { logger -t atrium_fallback 'no atrium-stay: rebooting to Ubuntu'; shutdown -r now; }"
+}
+
+load_rc_config $name
+: ${atrium_fallback_enable:="YES"}
+: ${atrium_fallback_minutes:="20"}
+run_rc_command "$1"

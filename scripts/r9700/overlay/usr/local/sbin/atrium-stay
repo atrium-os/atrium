@@ -1,0 +1,3 @@
+#!/bin/sh
+# Cancel this boot's fallback reboot to Ubuntu (rc.d/atrium_fallback).
+touch /var/run/atrium-stay && echo "staying in Atrium until the next reboot"
