@@ -267,8 +267,12 @@ fn psp_plan_orders_and_checks() {
     assert_eq!(plan(&psp_file(&[ty::SOS, ty::KDB]), &mut s), Err(PlanError::Missing(ty::SYS_DRV)));
     assert_eq!(plan(&psp_file(&[ty::SYS_DRV]), &mut s), Err(PlanError::Missing(ty::SOS)));
     assert_eq!(plan(&psp_file(&[ty::SOS, ty::SYS_DRV, ty::SOS]), &mut s), Err(PlanError::Duplicate(ty::SOS)));
+    // TOC is not a bootloader step but can be looked up.
+    assert_eq!(find(&f, ty::TOC).unwrap(), Some((base as u32 + 24, 8)));
+    assert_eq!(find(&f, ty::RL).unwrap(), None);
     // Every truncation is an error, never a panic.
     for n in 0..f.len() {
         let _ = plan(&f[..n], &mut s);
+        let _ = find(&f[..n], ty::TOC);
     }
 }

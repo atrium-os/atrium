@@ -63,3 +63,32 @@ pub unsafe extern "C" fn atrium_amd_psp_plan(
         Err(psp_plan::PlanError::Empty(_)) => -6,
     }
 }
+
+/// Find the sub-binary of type `t`: 1 and (offset, size) if present, 0 if
+/// absent, negative if the file is refused.
+///
+/// # Safety
+/// `bin` points to `len` readable bytes; `off` and `size` are writable.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn atrium_amd_psp_find(
+    bin: *const u8,
+    len: usize,
+    t: u32,
+    off: *mut u32,
+    size: *mut u32,
+) -> i32 {
+    if bin.is_null() || off.is_null() || size.is_null() {
+        return -1;
+    }
+    // SAFETY: per the contract above.
+    let b = unsafe { core::slice::from_raw_parts(bin, len) };
+    match psp_plan::find(b, t) {
+        Ok(Some((o, s))) => {
+            // SAFETY: per the contract above.
+            unsafe { (*off, *size) = (o, s) };
+            1
+        }
+        Ok(None) => 0,
+        Err(_) => -2,
+    }
+}

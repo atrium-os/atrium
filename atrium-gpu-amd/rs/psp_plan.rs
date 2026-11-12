@@ -111,3 +111,24 @@ pub fn plan(file: &[u8], out: &mut [Step; MAX_STEPS]) -> Result<usize, PlanError
     }
     Ok(n)
 }
+
+/// The single sub-binary of type `t` (e.g. `ty::TOC`), as (offset, size).
+pub fn find(file: &[u8], t: u32) -> Result<Option<(u32, u32)>, PlanError> {
+    let psp = PspFw::parse(file).map_err(PlanError::Fw)?;
+    let mut found = None;
+    for b in psp.bins() {
+        if b.fw_type == t {
+            if found.is_some() {
+                return Err(PlanError::Duplicate(t));
+            }
+            if b.region.size == 0 {
+                return Err(PlanError::Empty(t));
+            }
+            if b.region.size > MAX_PIECE {
+                return Err(PlanError::TooBig(t));
+            }
+            found = Some((b.region.offset, b.region.size));
+        }
+    }
+    Ok(found)
+}
