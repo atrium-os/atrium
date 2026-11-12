@@ -121,6 +121,8 @@ pub enum Intent {
     StatusPick { app_id: String, index: u32 },
     /// The user moved slider entry `index` of app `app_id`'s status menu.
     StatusSlide { app_id: String, index: u32, value: f32 },
+    /// The user worked control `id` of app `app_id`'s status panel.
+    StatusInput { app_id: String, id: u32, value: StatusValue },
 }
 
 // ── status items (docs/spec/forum-status-items.md) ──────────────────────────
@@ -159,7 +161,7 @@ pub enum StatusEntry {
 impl StatusEntry {
     /// Within the limits: labels cut, a slider's value in 0..=1 (NaN: 0).
     pub fn bounded(self) -> StatusEntry {
-        let cut = |s: String| s.chars().take(STATUS_MAX_LABEL).collect::<String>();
+        let cut = |s: String| cut(s, STATUS_MAX_LABEL);
         match self {
             StatusEntry::Action { label, enabled } => StatusEntry::Action { label: cut(label), enabled },
             StatusEntry::Check { label, on, enabled } => StatusEntry::Check { label: cut(label), on, enabled },
@@ -172,19 +174,197 @@ impl StatusEntry {
     }
 }
 
+/// Most nodes in a status panel, counting those inside groups and rows.
+pub const STATUS_MAX_NODES: usize = 64;
+/// Deepest nesting of groups, rows and columns.
+pub const STATUS_MAX_DEPTH: usize = 4;
+/// Longest text (a paragraph), in characters.
+pub const STATUS_MAX_TEXT: usize = 512;
+/// Most options in a choice.
+pub const STATUS_MAX_OPTIONS: usize = 8;
+/// A panel's width range, px (the bar keeps it on screen).
+pub const STATUS_PANEL_MIN_W: u16 = 200;
+pub const STATUS_PANEL_MAX_W: u16 = 400;
+/// The tallest panel, px; nodes past it are not drawn.
+pub const STATUS_PANEL_MAX_H: u16 = 560;
+
+/// What hangs from a status item's icon: a menu, or a panel the app
+/// describes and the bar lays out and draws (forum-status-items.md §2-3).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub enum StatusContent {
+    Menu(Vec<StatusEntry>),
+    Panel(StatusPanel),
+}
+
+/// A described panel: its width (px, `STATUS_PANEL_MIN_W..=MAX_W`) and its
+/// nodes top to bottom. The height follows the content.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct StatusPanel {
+    pub width: u16,
+    pub nodes: Vec<StatusNode>,
+}
+
+/// How a run of text is set.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub enum StatusText {
+    #[default]
+    Body,
+    /// Quieter, for detail under a line.
+    Secondary,
+    /// Small and quiet: a footnote, a timestamp.
+    Caption,
+    /// Monospaced: an address, a key.
+    Mono,
+}
+
+/// One node of a status panel. Controls carry an `id` the app chooses;
+/// what the user does to one comes back as `FromStatus::Changed { id, .. }`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub enum StatusNode {
+    /// A title line.
+    Heading { text: String },
+    /// Text, wrapped to the width (`\n` breaks a line).
+    Text { text: String, style: StatusText },
+    /// A framed section, titled unless `title` is empty.
+    Group { title: String, children: Vec<StatusNode> },
+    /// Side by side, sharing the width equally.
+    Row { children: Vec<StatusNode> },
+    /// One under another (a cell of a row).
+    Column { children: Vec<StatusNode> },
+    Separator,
+    /// A switch with its label → `On(bool)`.
+    Toggle { id: u32, label: String, on: bool, enabled: bool },
+    /// A check box with its label → `On(bool)`.
+    Check { id: u32, label: String, on: bool, enabled: bool },
+    /// A label over a slider, 0 to 1 → `Level(f32)`, while dragging.
+    Slider { id: u32, label: String, value: f32, enabled: bool },
+    /// One of `options`: a list of radio buttons, or a segmented control
+    /// → `Chosen(index)`.
+    Choice { id: u32, options: Vec<String>, selected: u32, segmented: bool, enabled: bool },
+    /// → `Pressed`.
+    Button { id: u32, label: String, primary: bool, enabled: bool },
+    /// A label over a progress bar, 0 to 1.
+    Progress { label: String, value: f32 },
+}
+
+/// What the user did to a panel control.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq)]
+pub enum StatusValue {
+    Pressed,
+    On(bool),
+    Level(f32),
+    Chosen(u32),
+}
+
+fn unit(v: f32) -> f32 {
+    if v.is_nan() { 0.0 } else { v.clamp(0.0, 1.0) }
+}
+
+fn cut(s: String, n: usize) -> String {
+    if s.chars().count() <= n { s } else { s.chars().take(n).collect() }
+}
+
+impl StatusPanel {
+    /// Within the limits: the width in range, at most `STATUS_MAX_NODES`
+    /// nodes and `STATUS_MAX_DEPTH` levels (the rest dropped), texts and
+    /// labels cut, values in range.
+    pub fn bounded(self) -> StatusPanel {
+        let mut budget = STATUS_MAX_NODES;
+        StatusPanel {
+            width: self.width.clamp(STATUS_PANEL_MIN_W, STATUS_PANEL_MAX_W),
+            nodes: bound_nodes(self.nodes, 1, &mut budget),
+        }
+    }
+
+    /// The control `id`, depth first.
+    pub fn control(&self, id: u32) -> Option<&StatusNode> {
+        fn find(nodes: &[StatusNode], id: u32) -> Option<&StatusNode> {
+            nodes.iter().find_map(|n| match n {
+                StatusNode::Group { children, .. } | StatusNode::Row { children } | StatusNode::Column { children } => find(children, id),
+                StatusNode::Toggle { id: i, .. }
+                | StatusNode::Check { id: i, .. }
+                | StatusNode::Slider { id: i, .. }
+                | StatusNode::Choice { id: i, .. }
+                | StatusNode::Button { id: i, .. } if *i == id => Some(n),
+                _ => None,
+            })
+        }
+        find(&self.nodes, id)
+    }
+
+    /// `value` for control `id`, if that control takes it and is enabled
+    /// (a level clamped to 0..=1).
+    pub fn accepts(&self, id: u32, value: StatusValue) -> Option<StatusValue> {
+        match (self.control(id)?, value) {
+            (StatusNode::Toggle { enabled: true, .. } | StatusNode::Check { enabled: true, .. }, StatusValue::On(b)) => Some(StatusValue::On(b)),
+            (StatusNode::Slider { enabled: true, .. }, StatusValue::Level(v)) if v.is_finite() => Some(StatusValue::Level(unit(v))),
+            (StatusNode::Choice { enabled: true, options, .. }, StatusValue::Chosen(i)) if (i as usize) < options.len() => Some(StatusValue::Chosen(i)),
+            (StatusNode::Button { enabled: true, .. }, StatusValue::Pressed) => Some(StatusValue::Pressed),
+            _ => None,
+        }
+    }
+}
+
+fn bound_nodes(nodes: Vec<StatusNode>, depth: usize, budget: &mut usize) -> Vec<StatusNode> {
+    let mut out = Vec::new();
+    for n in nodes {
+        if *budget == 0 {
+            break;
+        }
+        *budget -= 1;
+        let label = |s: String| cut(s, STATUS_MAX_LABEL);
+        let n = match n {
+            StatusNode::Group { .. } | StatusNode::Row { .. } | StatusNode::Column { .. } if depth >= STATUS_MAX_DEPTH => continue,
+            StatusNode::Group { title, children } => StatusNode::Group { title: label(title), children: bound_nodes(children, depth + 1, budget) },
+            StatusNode::Row { children } => StatusNode::Row { children: bound_nodes(children, depth + 1, budget) },
+            StatusNode::Column { children } => StatusNode::Column { children: bound_nodes(children, depth + 1, budget) },
+            StatusNode::Heading { text } => StatusNode::Heading { text: label(text) },
+            StatusNode::Text { text, style } => StatusNode::Text { text: cut(text, STATUS_MAX_TEXT), style },
+            StatusNode::Separator => StatusNode::Separator,
+            StatusNode::Toggle { id, label: l, on, enabled } => StatusNode::Toggle { id, label: label(l), on, enabled },
+            StatusNode::Check { id, label: l, on, enabled } => StatusNode::Check { id, label: label(l), on, enabled },
+            StatusNode::Slider { id, label: l, value, enabled } => StatusNode::Slider { id, label: label(l), value: unit(value), enabled },
+            StatusNode::Choice { id, options, selected, segmented, enabled } => {
+                let options: Vec<String> = options.into_iter().take(STATUS_MAX_OPTIONS).map(label).collect();
+                let selected = selected.min(options.len().saturating_sub(1) as u32);
+                StatusNode::Choice { id, options, selected, segmented, enabled }
+            }
+            StatusNode::Button { id, label: l, primary, enabled } => StatusNode::Button { id, label: label(l), primary, enabled },
+            StatusNode::Progress { label: l, value } => StatusNode::Progress { label: label(l), value: unit(value) },
+        };
+        out.push(n);
+    }
+    out
+}
+
+impl StatusContent {
+    /// Within the limits (see [`StatusEntry::bounded`], [`StatusPanel::bounded`]).
+    pub fn bounded(self) -> StatusContent {
+        match self {
+            StatusContent::Menu(m) => StatusContent::Menu(m.into_iter().take(STATUS_MAX_ENTRIES).map(StatusEntry::bounded).collect()),
+            StatusContent::Panel(p) => StatusContent::Panel(p.bounded()),
+        }
+    }
+}
+
 /// App → forum-wm on the status socket.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub enum ToStatus {
-    /// Put (or replace) this app's item: a Phosphor glyph, a tooltip, the menu.
-    Set { glyph: char, tooltip: String, menu: Vec<StatusEntry> },
+    /// Put (or replace) this app's item: a Phosphor glyph, a tooltip, and
+    /// the menu or panel that hangs from it.
+    Set { glyph: char, tooltip: String, content: StatusContent },
     Remove,
 }
 
 /// forum-wm → app on the status socket: what the user did.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub enum FromStatus {
+    /// Menu entry `index` was picked.
     Picked { index: u32 },
+    /// Menu slider `index` moved.
     Slid { index: u32, value: f32 },
+    /// Panel control `id` was worked.
+    Changed { id: u32, value: StatusValue },
     /// Refused (no `status-item`, or unregistered); the socket closes.
     Denied { message: String },
 }
@@ -196,7 +376,7 @@ pub struct StatusItem {
     pub app_id: String,
     pub glyph: char,
     pub tooltip: String,
-    pub menu: Vec<StatusEntry>,
+    pub content: StatusContent,
     /// Bumped on each change, so the bar redraws only then.
     pub generation: u64,
 }

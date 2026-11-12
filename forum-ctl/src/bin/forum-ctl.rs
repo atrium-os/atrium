@@ -20,6 +20,7 @@
 //!   forum-ctl take-back [ID]      take pad ID (default: every held pad) back from its app
 //!   forum-ctl status              the apps' bar items and their menus
 //!   forum-ctl status-pick APP I   pick entry I of APP's bar menu
+//!   forum-ctl status-press APP ID press button ID of APP's bar panel
 
 use forum_ctl::{default_socket_path, request, Intent, Reply};
 
@@ -27,7 +28,7 @@ fn usage() -> ! {
     eprintln!("usage: forum-ctl surfaces | focus ID | modes | mode WxH[@Hz] | outputs \
                | arrange A right-of|left-of|above|below B | move-monitor | scale N F|auto | mirror A B|off \
                | zoom | span A [B..] [gap PX | bezel MM] | spans | span-app APP on|off \
-               | pads | take-back [ID] | status | status-pick APP I");
+               | pads | take-back [ID] | status | status-pick APP I | status-press APP ID");
     std::process::exit(2)
 }
 
@@ -88,6 +89,11 @@ fn main() {
         ["pads"] => Intent::ListPads,
         ["status"] => Intent::ListStatusItems,
         ["status-pick", app, i] => Intent::StatusPick { app_id: app.to_string(), index: i.parse().unwrap_or_else(|_| usage()) },
+        ["status-press", app, id] => Intent::StatusInput {
+            app_id: app.to_string(),
+            id: id.parse().unwrap_or_else(|_| usage()),
+            value: forum_ctl::StatusValue::Pressed,
+        },
         ["take-back"] => Intent::TakeBackPad { device_id: 0 },
         ["take-back", id] => Intent::TakeBackPad { device_id: id.parse().ok().filter(|&d| d != 0).unwrap_or_else(|| usage()) },
         _ => usage(),
@@ -142,8 +148,18 @@ fn main() {
             if items.is_empty() { println!("no status items"); }
             for it in items {
                 println!("{} {:?} {:?}", it.app_id, it.glyph, it.tooltip);
-                for (i, e) in it.menu.iter().enumerate() {
-                    println!("  {i}: {e:?}");
+                match it.content {
+                    forum_ctl::StatusContent::Menu(menu) => {
+                        for (i, e) in menu.iter().enumerate() {
+                            println!("  {i}: {e:?}");
+                        }
+                    }
+                    forum_ctl::StatusContent::Panel(p) => {
+                        println!("  panel {} px wide", p.width);
+                        for n in &p.nodes {
+                            println!("  {n:?}");
+                        }
+                    }
                 }
             }
         }

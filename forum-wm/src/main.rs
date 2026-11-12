@@ -146,10 +146,16 @@ fn screen_geometry(d: &fresco_protocol::DisplayInfoResponse) -> Option<(i32, i32
     Some((d.width as i32, d.height as i32, top))
 }
 
+/// The bar's height (Pergola `theme::shell::BAR_H`).
+const BAR_H: i32 = 38;
+
 fn screen_from(w: i32, h: i32, top: i32) -> Screen {
     /* frescod's trusted strip (F4d) covers the top `top` rows: the session's
      * screen, bar included, starts below it. */
-    Screen { rect: WmRect { x: 0, y: top, w, h: h - top }, bar_h: 24, dock_h: 48 }
+    /* The bar's window is as tall as the bar draws (Pergola shell::BAR_H,
+     * 38): at 24 its lower part was cut off, and a drop-down's anchor (a
+     * bar button) fell outside the window, so frescod refused it. */
+    Screen { rect: WmRect { x: 0, y: top, w, h: h - top }, bar_h: BAR_H, dock_h: 48 }
 }
 
 /// Tell the user (Praeco, as a system poster: praecod's

@@ -14,7 +14,9 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::rc::Rc;
 use std::sync::Arc;
 
-use forum_ctl::{Intent, PadInfo, Reply, StatusEntry, StatusItem};
+mod status_panel;
+
+use forum_ctl::{Intent, PadInfo, Reply, StatusContent, StatusEntry, StatusItem};
 use lyra_protocol::wire::{action, FromControl, FromMedia, MediaAction, NowPlaying, SessionState, ToControl, ToMedia};
 use fresco_protocol::{WindowHints, WmRole};
 use pergola::geom::{Axis, Rect};
@@ -104,7 +106,12 @@ struct BarView {
 struct StatusShown {
     item: StatusItem,
     open: Mutable<MenuState>,
+    /// A panel's controls' values (status_panel.rs).
+    controls: status_panel::Controls,
 }
+
+/// The heading over a status panel: the app's name, drawn by the bar.
+const STATUS_PANEL_HEAD: f32 = 24.0;
 
 /// An app's short name for the menu's heading: the registry id's last
 /// part (the id comes from the launch registry, never from the app).
@@ -119,7 +126,8 @@ fn status_menu(item: &StatusItem) -> (Vec<MenuItem>, Vec<Option<u32>>) {
     let mut items = vec![MenuItem::new(short_app_name(&item.app_id)).enabled(false)];
     let mut wire = vec![None];
     let mut separate = true;
-    for (i, e) in item.menu.iter().enumerate() {
+    let StatusContent::Menu(menu) = &item.content else { return (items, wire) };
+    for (i, e) in menu.iter().enumerate() {
         let m = match e {
             StatusEntry::Separator => {
                 separate = true;
@@ -146,14 +154,20 @@ fn merge_status(old: &[StatusShown], new: Vec<StatusItem>, dirty: Option<&Arc<At
         return None;
     }
     Some(new.into_iter().map(|item| {
-        let open = match old.iter().find(|o| o.item.app_id == item.app_id) {
-            Some(o) => o.open.clone(),
-            None => match dirty {
-                Some(d) => Mutable::with_dirty(MenuState::default(), d.clone()),
-                None => Mutable::new(MenuState::default()),
-            },
+        let (open, controls) = match old.iter().find(|o| o.item.app_id == item.app_id) {
+            Some(o) => (o.open.clone(), o.controls.clone()),
+            None => (
+                match dirty {
+                    Some(d) => Mutable::with_dirty(MenuState::default(), d.clone()),
+                    None => Mutable::new(MenuState::default()),
+                },
+                status_panel::Controls::new(dirty.cloned()),
+            ),
         };
-        StatusShown { item, open }
+        if let StatusContent::Panel(p) = &item.content {
+            controls.sync(p);
+        }
+        StatusShown { item, open, controls }
     }).collect())
 }
 
@@ -352,12 +366,32 @@ impl View for BarView {
             let group = ctx.push(Node::hstack(Rect::ZERO_SIZED, 10.0));
             ctx.set_flex(group, FlexStyle { align: pergola::Align::Center, ..FlexStyle::default() });
             for s in &status {
+                let label = if s.item.tooltip.is_empty() { short_app_name(&s.item.app_id).to_string() } else { s.item.tooltip.clone() };
+                // A panel the app described: laid out and drawn by the bar,
+                // under the app's name.
+                if let StatusContent::Panel(p) = &s.item.content {
+                    let w = p.width as f32;
+                    let (_, h) = status_panel::laid_out(p, 0.0, 0.0, w - 2.0 * PANEL_PADDING);
+                    let size = pergola::geom::Size::new(w, 2.0 * PANEL_PADDING + STATUS_PANEL_HEAD + h);
+                    let (panel, controls) = (p.clone(), s.controls.clone());
+                    let sink = status_panel::Sink { app_id: s.item.app_id.clone(), stale: self.status_stale.clone() };
+                    let name = short_app_name(&s.item.app_id).to_string();
+                    let button = PanelButton::new(label, s.open.clone(), size, move |ctx: &mut Ctx, inner: Rect| {
+                        let t = ctx.theme;
+                        status_panel::text_at(ctx, &name, inner.x(), inner.y(), inner.w(), type_size::XS, Weight::Semibold, false, t.text_tertiary());
+                        let (pieces, _) = status_panel::laid_out(&panel, inner.x(), inner.y() + STATUS_PANEL_HEAD, inner.w());
+                        status_panel::draw(ctx, &pieces, &controls, &sink);
+                    })
+                    .icon(s.item.glyph, 15.0, Some(t.text_secondary()))
+                    .attached();
+                    ctx.place(button);
+                    continue;
+                }
                 let (items, wire) = status_menu(&s.item);
                 let wire = Rc::new(wire);
                 let (w1, w2) = (wire.clone(), wire);
                 let (a1, a2) = (s.item.app_id.clone(), s.item.app_id.clone());
                 let (st1, st2) = (self.status_stale.clone(), self.status_stale.clone());
-                let label = if s.item.tooltip.is_empty() { short_app_name(&s.item.app_id).to_string() } else { s.item.tooltip.clone() };
                 let button = MenuButton::new(label, s.open.clone(), items, move |i| {
                     let Some(&Some(index)) = w1.get(i) else { return };
                     let r = forum_ctl::request(forum_ctl::default_socket_path(), &Intent::StatusPick { app_id: a1.clone(), index });
@@ -908,14 +942,14 @@ mod tests {
             app_id: "org.test.vpn".into(),
             glyph: phosphor::LOCK_SIMPLE,
             tooltip: "VPN".into(),
-            menu: vec![
+            content: StatusContent::Menu(vec![
                 StatusEntry::Check { label: "Connected".into(), on: true, enabled: true },
                 StatusEntry::Separator,
                 StatusEntry::Radio { label: "Home".into(), on: true, enabled: true },
                 StatusEntry::Radio { label: "Office".into(), on: false, enabled: false },
                 StatusEntry::Slider { label: "Level".into(), value: 0.25 },
                 StatusEntry::Action { label: "Quit".into(), enabled: true },
-            ],
+            ]),
             generation,
         }
     }
@@ -957,6 +991,37 @@ mod tests {
         view.status.get_cloned()[0].open.set(MenuState::opened(None));
         let (tree, _) = render(&view, Semantic::LIGHT);
         assert!(has_text(&tree, "vpn") && has_text(&tree, "Connected") && has_text(&tree, "Quit"));
+    }
+
+    #[test]
+    fn a_status_panel_opens_under_the_apps_name_with_its_content() {
+        use forum_ctl::{StatusNode, StatusPanel, StatusText};
+        pergola::text::clear_measurer();
+        let view = sample_view();
+        let has_text = |tree: &pergola::NodeTree, s: &str| tree.iter().any(|(_, x)| matches!(x, Node::Text { content, .. } if content == s));
+        let item = StatusItem {
+            app_id: "org.test.clip".into(),
+            glyph: phosphor::CLIPBOARD,
+            tooltip: "Clipboard".into(),
+            content: StatusContent::Panel(StatusPanel {
+                width: 280,
+                nodes: vec![
+                    StatusNode::Heading { text: "History".into() },
+                    StatusNode::Text { text: "Twelve items kept".into(), style: StatusText::Secondary },
+                    StatusNode::Group { title: "Keep".into(), children: vec![StatusNode::Toggle { id: 1, label: "Paused".into(), on: true, enabled: true }] },
+                    StatusNode::Row { children: vec![StatusNode::Button { id: 2, label: "Clear".into(), primary: false, enabled: true }] },
+                ],
+            }),
+            generation: 1,
+        };
+        view.status.set(merge_status(&[], vec![item], None).unwrap());
+        let (tree, _) = render(&view, Semantic::LIGHT);
+        assert!(has_text(&tree, &phosphor::CLIPBOARD.to_string()) && !has_text(&tree, "History"));
+        view.status.get_cloned()[0].open.set(MenuState::opened(None));
+        let (tree, _) = render(&view, Semantic::LIGHT);
+        for s in ["clip", "History", "Twelve items kept", "Keep", "Paused", "Clear"] {
+            assert!(has_text(&tree, s), "{s}");
+        }
     }
 
     #[test]
