@@ -372,6 +372,8 @@ pub struct NodeTree {
     styles: Vec<Option<crate::layout::FlexStyle>>,
     /// Stacks laid out as grids instead ([`crate::layout::Grid`]).
     grids: HashMap<NodeId, crate::layout::Grid>,
+    /// Top-level stacks drawn in pop-up windows ([`crate::popup`]).
+    popups: HashMap<NodeId, crate::popup::Spec>,
     keys: KeyAlloc,
     /// Set by `Ctx::key`: the key of the next node inserted.
     next_key: Option<u64>,
@@ -450,6 +452,24 @@ impl NodeTree {
 
     pub fn grid(&self, id: NodeId) -> Option<&crate::layout::Grid> {
         self.grids.get(&id)
+    }
+
+    /// Draw the top-level stack `id` in a pop-up window ([`crate::popup`]).
+    pub fn set_popup(&mut self, id: NodeId, spec: crate::popup::Spec) {
+        self.popups.insert(id, spec);
+    }
+
+    /// The pop-up roots and what they ask for.
+    pub fn popups(&self) -> impl Iterator<Item = (NodeId, &crate::popup::Spec)> {
+        self.popups.iter().map(|(id, s)| (*id, s))
+    }
+
+    /// The top-level node `id` sits under (itself if it is one).
+    pub fn root_of(&self, mut id: NodeId) -> NodeId {
+        while let Some(p) = self.parent_of(id) {
+            id = p;
+        }
+        id
     }
 
     pub fn style(&self, id: NodeId) -> Option<&crate::layout::FlexStyle> {

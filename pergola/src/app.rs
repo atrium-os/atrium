@@ -80,6 +80,8 @@ pub struct App<V: View> {
     /// asked ([`crate::slot`]).
     slots: std::collections::HashMap<crate::slot::SlotKey, crate::geom::Rect>,
     slot_changes: Vec<(crate::slot::SlotKey, Option<crate::geom::Rect>)>,
+    /// Menus open as pop-up windows (set by `Window`).
+    popups: bool,
 }
 
 impl<V: View> App<V> {
@@ -124,6 +126,7 @@ impl<V: View> App<V> {
             theme: Semantic::LIGHT,
             slots: Default::default(),
             slot_changes: Vec::new(),
+            popups: false,
         }
     }
 
@@ -278,6 +281,7 @@ impl<V: View> App<V> {
             focused: self.focused,
             focus_visible: self.focus_visible,
             tip: self.tip,
+            popups: self.popups,
         };
         let (next, interactions) = render_continuing(&self.view, self.theme, state, &mut self.prev_tree);
         // The render pass laid it out (`Ctx::flush_overlays`).
@@ -321,11 +325,24 @@ impl<V: View> App<V> {
     }
 
     /// The root `id` sits under.
-    fn root_of(&self, mut id: NodeId) -> NodeId {
-        while let Some(p) = self.prev_tree.parent_of(id) {
-            id = p;
+    fn root_of(&self, id: NodeId) -> NodeId {
+        self.prev_tree.root_of(id)
+    }
+
+    /// Let menus open as pop-up windows (`Window` does; tests and the log
+    /// surface keep overlays).
+    pub fn set_popups(&mut self, on: bool) {
+        if self.popups != on {
+            self.popups = on;
+            self.touch();
         }
-        id
+    }
+
+    /// frescod took pop-up `root` down: run its `on_dismiss`.
+    pub fn popup_dismissed(&mut self, root: NodeId) {
+        if let Some(cb) = self.interactions.get(root).and_then(|h| h.on_dismiss.as_ref()) {
+            cb();
+        }
     }
 
     /// Whether `id` belongs to the modal layer: everything emitted from

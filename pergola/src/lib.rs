@@ -33,6 +33,7 @@ pub mod input;
 pub mod interaction;
 pub mod layout;
 pub mod node;
+pub mod popup;
 pub mod reactive;
 pub mod scroll;
 pub mod slot;

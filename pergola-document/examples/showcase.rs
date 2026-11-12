@@ -2,7 +2,7 @@
 //! window, for checking them on a live frescod (headless: its PNG is the
 //! screenshot). Runs `SHOWCASE_SECS` (default 40) then exits.
 //!
-//!   FRESCO_SOCKET=… showcase [dark] [dialog]
+//!   FRESCO_SOCKET=… showcase [dark] [dialog] [menu] [barmenu]
 
 use std::cell::RefCell;
 use std::rc::Rc;
@@ -17,7 +17,7 @@ use pergola::theme::{font, space, type_size, Semantic, Weight};
 use pergola::view::{Ctx, View};
 use pergola::wrap::Wrap;
 use pergola::widgets::canvas::{Canvas, Item};
-use pergola::widgets::{Check, Checkbox, Dialog, DialogButton, Dropdown, GroupBox, MenuState, ScrollState, Section, Segmented, Slider, Tabs, Toggle};
+use pergola::widgets::{Check, Checkbox, Dialog, DialogButton, Dropdown, GroupBox, MenuButton, MenuItem, MenuState, ScrollState, Section, Segmented, Slider, Tabs, Toggle};
 use pergola::{App, Button, Color, Mutable, SizeSpec, TextField, TextStyle, Window, WindowDesc};
 use pergola_document::{Doc, DocumentView};
 
@@ -28,6 +28,7 @@ struct Show {
     text_demo: bool,
     plan: Mutable<usize>,
     plan_menu: Mutable<MenuState>,
+    bar_menu: Mutable<MenuState>,
     toggle: Mutable<bool>,
     seg: Mutable<usize>,
     tab: Mutable<usize>,
@@ -93,6 +94,10 @@ impl View for Show {
             ctx.place(TextField::new(self.name.clone()).placeholder("Your name"));
             text(ctx, "Plan");
             ctx.place(Dropdown::new(self.plan.clone(), self.plan_menu.clone(), ["Personal", "Family", "Team"]));
+            // The trusted (bar) look: lit while open, its menu joined to it.
+            text(ctx, "Controller");
+            let items = vec![MenuItem::new("Pair a controller"), MenuItem::new("Forget this one"), MenuItem::new("Settings…").separated()];
+            ctx.place(MenuButton::new("Gamepad", self.bar_menu.clone(), items, |_| {}).attached());
             ctx.pop();
             row(ctx, space::LG, |ctx| {
                 ctx.place(Checkbox::new(self.check.clone(), "Remember me"));
@@ -204,7 +209,8 @@ fn main() -> std::io::Result<()> {
         text_demo: std::env::args().any(|a| a == "text"),
         dialog: Mutable::with_dirty(std::env::args().any(|a| a == "dialog"), dirty.clone()),
         plan: Mutable::with_dirty(1usize, dirty.clone()),
-        plan_menu: Mutable::with_dirty(MenuState::default(), dirty.clone()),
+        plan_menu: Mutable::with_dirty(if std::env::args().any(|a| a == "menu") { MenuState::opened(Some(0)) } else { MenuState::default() }, dirty.clone()),
+        bar_menu: Mutable::with_dirty(if std::env::args().any(|a| a == "barmenu") { MenuState::opened(None) } else { MenuState::default() }, dirty.clone()),
         toggle: Mutable::with_dirty(true, dirty.clone()),
         seg: Mutable::with_dirty(1usize, dirty.clone()),
         tab: Mutable::with_dirty(0usize, dirty.clone()),

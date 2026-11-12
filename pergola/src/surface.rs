@@ -168,8 +168,22 @@ pub struct FrescoSurface {
     scrolls: std::collections::HashMap<u32, (fresco_protocol::GroupParams, Option<[f32; 9]>)>,
     /// App-shaped text's glyphs; uploaded on first use.
     atlas: crate::glyphs::Atlas,
-    atlas_bound: bool,
+    /// The atlas's version: one more each time rows are added.
+    atlas_gen: u64,
+    /// The version the current window's atlas slot holds.
+    atlas_seen: Option<u64>,
     /// Images bound to texture slots, by image id.
+    images: std::collections::HashSet<u32>,
+    /// The other windows' slot and scroll state (pop-ups,
+    /// [`FrescoSurface::select`]): slots are per window.
+    others: std::collections::HashMap<u32, WindowState>,
+}
+
+/// What a window's scene holds that the surface must remember.
+#[derive(Default)]
+struct WindowState {
+    scrolls: std::collections::HashMap<u32, (fresco_protocol::GroupParams, Option<[f32; 9]>)>,
+    atlas_seen: Option<u64>,
     images: std::collections::HashSet<u32>,
 }
 
@@ -186,7 +200,35 @@ fn background_id(id: NodeId) -> u32 {
 
 impl FrescoSurface {
     pub fn new(conn: fresco_client::Connection, window_id: u32) -> Self {
-        Self { conn, window_id, fonts: std::collections::HashMap::new(), scale: 1.0, scrolls: Default::default(), atlas: crate::glyphs::Atlas::new(), atlas_bound: false, images: Default::default() }
+        Self {
+            conn, window_id, fonts: std::collections::HashMap::new(), scale: 1.0, scrolls: Default::default(),
+            atlas: crate::glyphs::Atlas::new(), atlas_gen: 0, atlas_seen: None, images: Default::default(),
+            others: Default::default(),
+        }
+    }
+
+    /// Draw into `window` from now on (a pop-up of the same connection).
+    pub fn select(&mut self, window: u32) {
+        if window == self.window_id {
+            return;
+        }
+        let mine = WindowState {
+            scrolls: std::mem::take(&mut self.scrolls),
+            atlas_seen: self.atlas_seen,
+            images: std::mem::take(&mut self.images),
+        };
+        self.others.insert(self.window_id, mine);
+        let w = self.others.remove(&window).unwrap_or_default();
+        self.scrolls = w.scrolls;
+        self.atlas_seen = w.atlas_seen;
+        self.images = w.images;
+        self.window_id = window;
+        self.conn.set_default_window(window as u16);
+    }
+
+    /// `window` was destroyed: forget what its scene held.
+    pub fn forget(&mut self, window: u32) {
+        self.others.remove(&window);
     }
 
     pub fn window_id(&self) -> u32 { self.window_id }
@@ -225,15 +267,20 @@ impl FrescoSurface {
                 });
             }
         }
-        if !self.atlas_bound {
-            let _ = self.atlas.take_dirty();
+        // Each window has its own atlas slot: one that missed rows another
+        // window added gets the whole atlas, the rest only new rows.
+        if self.atlas_seen != Some(self.atlas_gen) {
+            if self.atlas.take_dirty().is_some() {
+                self.atlas_gen += 1;
+            }
             let hash = self.conn.upload_blob(self.atlas.pixels())?;
             self.conn.slot_set_texture(ATLAS_SLOT, hash, ATLAS_W, ATLAS_H, fresco_protocol::TextureFormat::R8Unorm)?;
-            self.atlas_bound = true;
         } else if let Some((y, rows, px)) = self.atlas.take_dirty() {
             let px = px.to_vec();
             self.conn.slot_update_region(ATLAS_SLOT, 0, y, ATLAS_W, rows, px)?;
+            self.atlas_gen += 1;
         }
+        self.atlas_seen = Some(self.atlas_gen);
         Ok(fresco_protocol::GlyphRunParams {
             x: (origin.x * k).round(), y: (origin.y * k).round(),
             atlas_slot_id: ATLAS_SLOT, atlas_width: ATLAS_W, atlas_height: ATLAS_H,

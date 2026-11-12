@@ -83,6 +83,25 @@ the real window table, checks, places and dismisses, and answers with
 
 ## 4. Pergola (the Pergola thread's part)
 
+Built 2026-11-12 (`pergola::popup`). A view asks with `Ctx::popup(rect,
+spec, on_dismiss, draw)` from an overlay: a free top-level stack laid out
+where the overlay would draw, with an anchor, side, align and grab. The
+tree stays one tree, so hit-testing, focus and keys work as for an
+overlay. `Window` keeps a window per pop-up root (`popup::Popups`): it
+opens, re-places (a new anchor or size, or showing it again after a
+dismissal) and destroys them to match the tree, sends the root's subtree
+to the pop-up (the root at its origin) and the rest to the main window,
+moves a pop-up's pointer input back into tree coordinates, and on
+`EV_POPUP_DISMISSED` runs the root's `on_dismiss`. `FrescoSurface::select`
+switches the scene target and keeps slots per window (the glyph atlas is
+re-sent to a window that missed rows). A `Menu` with an anchor
+(`Menu::anchored`; a `Dropdown`'s list) opens this way; without a `Window`
+(tests) it draws as an overlay. The anchor includes the 4 px gap, trimmed
+to the window when the control sits at its edge.
+
+Not yet: a list frescod shrank does not scroll (`EV_POPUP_PLACED` is
+not used yet), and tooltips and submenus as pop-ups.
+
 `Menu` and `Dropdown` open as pop-ups when the app's window allows
 (`Window` holds the connection); the overlay path stays for tests and for
 content that fits. `EV_POPUP_DISMISSED` closes the menu as Escape does.

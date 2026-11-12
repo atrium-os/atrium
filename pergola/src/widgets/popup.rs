@@ -7,9 +7,12 @@
 //! gives it back when it closes; Escape closes the topmost one, and a
 //! press outside a menu or on a dialog's scrim closes it too.
 //!
-//! These live inside the window, so a menu near the window's edge is
-//! clipped by it. Menus that reach past the window need a pop-up window
-//! kind from frescod; until then, callers place them inside.
+//! A menu given an anchor ([`Menu::anchored`]; a `Dropdown`'s list always
+//! is) opens as a pop-up window when the app runs in a `Window`
+//! ([`crate::popup`]): frescod places it, so it reaches past the window's
+//! edge, flips above when there is no room below, and takes it down on a
+//! press outside (which goes no further) or a change of focus. Without a
+//! `Window` (tests) it draws in the overlay layer, clipped by the window.
 
 use std::rc::Rc;
 use std::sync::Arc;
@@ -28,6 +31,8 @@ use crate::Color;
 pub const MENU_INSET: f32 = 4.0;
 /// Gap between a dropdown and the menu it opens.
 pub const MENU_GAP: f32 = 4.0;
+/// The accent edge of a menu hanging from a lit (attached) menu button.
+pub const ATTACHED_EDGE: f32 = 2.0;
 /// A press-catcher bigger than any window: frescod clips it.
 const EVERYWHERE: Rect = Rect::new(-100_000.0, -100_000.0, 200_000.0, 200_000.0);
 
@@ -96,12 +101,17 @@ pub struct Menu {
     pub x: f32,
     pub y: f32,
     pub width: f32,
+    /// What it hangs from, for a pop-up window: the rect (window px), the
+    /// side it opens on and how it lines up.
+    pub anchor: Option<(Rect, crate::popup::Side, crate::popup::Align)>,
+    /// Hangs from a lit menu button: an accent edge (see [`trigger`]).
+    pub attached: bool,
     on_pick: Rc<dyn Fn(usize)>,
 }
 
 impl Menu {
     pub fn new(state: Mutable<MenuState>, items: Vec<MenuItem>, on_pick: impl Fn(usize) + 'static) -> Self {
-        Self { state, items, x: 0.0, y: 0.0, width: 220.0, on_pick: Rc::new(on_pick) }
+        Self { state, items, x: 0.0, y: 0.0, width: 220.0, anchor: None, attached: false, on_pick: Rc::new(on_pick) }
     }
     pub fn at(mut self, x: f32, y: f32) -> Self {
         self.x = x;
@@ -110,6 +120,12 @@ impl Menu {
     }
     pub fn width(mut self, w: f32) -> Self {
         self.width = w;
+        self
+    }
+    /// Open as a pop-up window hanging from `rect` when the app's window
+    /// allows (else it draws at `at` inside the window, as before).
+    pub fn anchored(mut self, rect: Rect, side: crate::popup::Side, align: crate::popup::Align) -> Self {
+        self.anchor = Some((rect, side, align));
         self
     }
 
@@ -141,14 +157,34 @@ impl View for Menu {
         if !st.open {
             return;
         }
-        let t = ctx.theme;
+        let r = Rect::new(self.x, self.y, self.width, self.height());
+        if let Some((anchor, side, align)) = self.anchor.filter(|_| ctx.popups_enabled()) {
+            // Its own window: frescod places it and takes it down on a
+            // press outside (which goes no further) or a change of focus.
+            let spec = crate::popup::Spec { anchor, side, align, grab: true };
+            let s = self.state.clone();
+            ctx.popup(r, spec, move || s.set(MenuState::default()), |ctx| self.body(ctx, st, r));
+            return;
+        }
         // A press anywhere outside closes it, and goes no further.
         let catcher = ctx.add(Node::Rect { rect: EVERYWHERE, fill: Color::TRANSPARENT, radius: 0.0 });
         let s = self.state.clone();
         ctx.on_click(catcher, move || s.set(MenuState::default()));
+        self.body(ctx, st, r);
+    }
+}
 
-        let r = Rect::new(self.x, self.y, self.width, self.height());
-        let body = surface(ctx, r, radius::MD);
+impl Menu {
+    /// The menu's surface and items in `r`.
+    fn body(&self, ctx: &mut Ctx, st: MenuState, r: Rect) {
+        let t = ctx.theme;
+        let body = if self.attached {
+            // Joined to the lit button: its accent as a 2px edge.
+            let e = ctx.add(Node::Rect { rect: r, fill: t.accent_fill(), radius: radius::MD });
+            ctx.tree.insert(Some(e), Node::Rect { rect: inflate(r, -ATTACHED_EDGE), fill: t.bg_elevated(), radius: radius::MD - ATTACHED_EDGE })
+        } else {
+            surface(ctx, r, radius::MD)
+        };
         ctx.autofocus(body);
         let mut y = r.y() + MENU_INSET;
         for (i, item) in self.items.iter().enumerate() {
@@ -237,6 +273,8 @@ pub struct Dropdown {
     pub options: Vec<String>,
     pub menu: Mutable<MenuState>,
     pub rect: Rect,
+    /// The trusted-surface look (see [`trigger`]).
+    pub attached: bool,
     on_change: Option<Rc<dyn Fn(usize)>>,
 }
 
@@ -247,6 +285,7 @@ impl Dropdown {
             options: options.into_iter().map(Into::into).collect(),
             menu,
             rect: Rect::new(0.0, 0.0, 180.0, size::BUTTON_HEIGHT_DEFAULT),
+            attached: false,
             on_change: None,
         }
     }
@@ -259,6 +298,11 @@ impl Dropdown {
         self.rect.size.w = w;
         self
     }
+    /// The trusted-surface look: lit while open, the list joined to it.
+    pub fn attached(mut self) -> Self {
+        self.attached = true;
+        self
+    }
     pub fn on_change(mut self, f: impl Fn(usize) + 'static) -> Self {
         self.on_change = Some(Rc::new(f));
         self
@@ -267,54 +311,10 @@ impl Dropdown {
 
 impl View for Dropdown {
     fn render(&self, ctx: &mut Ctx) {
-        let t = ctx.theme;
         let r = self.rect;
         let cur = self.value.get().min(self.options.len().saturating_sub(1));
-        let halo = ctx.add(Node::Rect { rect: inflate(r, 3.0), fill: Color::TRANSPARENT, radius: radius::SM + 3.0 });
-        let ring = ctx.add(Node::Rect { rect: inflate(r, 1.0), fill: Color::TRANSPARENT, radius: radius::SM + 1.0 });
-        let edge = ctx.add(Node::Rect { rect: r, fill: t.border_strong(), radius: radius::SM });
-        let base = t.bg_elevated();
-        let body = if ctx.is_pressed(edge) {
-            t.state_pressed().over(base)
-        } else if ctx.is_hovered(edge) {
-            t.state_hover().over(base)
-        } else {
-            base
-        };
-        ctx.tree.insert(Some(edge), Node::Rect { rect: inflate(r, -stroke::DEFAULT), fill: body, radius: radius::SM - stroke::DEFAULT });
         let label = self.options.get(cur).cloned().unwrap_or_default();
-        let ls = Node::measure_text(&label, &text(t.text_primary(), type_size::MD, font::SANS, Weight::Medium));
-        ctx.tree.insert(Some(edge), Node::Text {
-            rect: Rect::new(r.x() + space::SM, r.y() + (r.h() - ls.h) / 2.0, ls.w, ls.h),
-            content: label,
-            style: text(t.text_primary(), type_size::MD, font::SANS, Weight::Medium),
-        });
-        // The caret: a chevron of two strokes, icon-sm wide.
-        let (cx, cy) = (r.x() + r.w() - space::SM - 8.0, r.y() + r.h() / 2.0);
-        let c = t.text_secondary();
-        ctx.tree.insert(Some(edge), Node::Path { p0: (cx - 4.0, cy - 2.0), p1: (cx, cy + 2.0), width: 1.5, color: c });
-        ctx.tree.insert(Some(edge), Node::Path { p0: (cx, cy + 2.0), p1: (cx + 4.0, cy - 2.0), width: 1.5, color: c });
-        if ctx.is_focus_visible(edge) {
-            for (id, col) in [(halo, t.accent_bg()), (ring, t.focus_ring())] {
-                if let Some(Node::Rect { fill, .. }) = ctx.tree.get_mut(id) {
-                    *fill = col;
-                }
-            }
-        }
-        let menu = self.menu.clone();
-        ctx.on_click(edge, move || {
-            let open = menu.get().open;
-            menu.set(if open { MenuState::default() } else { MenuState::opened(None) });
-        });
-        let menu = self.menu.clone();
-        ctx.on_key(edge, move |ev| {
-            if let Event::Key { kind: KeyEventKind::Down, key, chars, .. } = ev {
-                if matches!(key, Key::Down | Key::Up | Key::Enter) || (*key == Key::Char && chars == " ") {
-                    menu.set(MenuState::opened(Some(cur)));
-                }
-            }
-        });
-        ctx.focusable(edge);
+        trigger(ctx, r, &label, &self.menu, Some(cur), self.attached);
         if self.menu.get().open {
             let items: Vec<MenuItem> = self.options.iter().map(MenuItem::new).collect();
             let (value, cb) = (self.value.clone(), self.on_change.clone());
@@ -323,10 +323,142 @@ impl View for Dropdown {
                 if let Some(f) = &cb {
                     f(i);
                 }
-            })
-            .at(r.x(), r.y() + r.h() + MENU_GAP)
-            .width(r.w().max(160.0));
-            ctx.overlay(move |ctx| m.render(ctx));
+            });
+            open_under(ctx, m, r, self.attached);
+        }
+    }
+}
+
+/// The menu under a trigger at `r`: a pop-up hanging from it when the
+/// window allows, at least as wide. Attached: no gap, joined to it.
+fn open_under(ctx: &mut Ctx, m: Menu, r: Rect, attached: bool) {
+    let gap = if attached { 0.0 } else { MENU_GAP };
+    let mut m = m
+        .at(r.x(), r.y() + r.h() + gap)
+        .width(r.w().max(160.0))
+        // The gap is part of the anchor, so a flipped list keeps it.
+        .anchored(Rect::new(r.x(), r.y() - gap, r.w(), r.h() + 2.0 * gap), crate::popup::Side::Below, crate::popup::Align::Start);
+    m.attached = attached;
+    ctx.overlay(move |ctx| m.render(ctx));
+}
+
+/// A button that opens a menu: a secondary button's body with `label` and
+/// a caret. `cur`: the item the keyboard opens on (a select's value).
+///
+/// `attached` is the trusted-surface look (the Forum bar, visual language
+/// §14.2 "Menu button, attached"): while open the button is filled with
+/// the accent, its label and caret on it, the caret turned up, and the
+/// menu hangs from it with no gap inside an accent edge. An app cannot
+/// draw in the bar, so a fake menu under it has no lit button above it.
+fn trigger(ctx: &mut Ctx, r: Rect, label: &str, menu: &Mutable<MenuState>, cur: Option<usize>, attached: bool) -> NodeId {
+    let t = ctx.theme;
+    let open = menu.get().open;
+    let lit = attached && open;
+    let halo = ctx.add(Node::Rect { rect: inflate(r, 3.0), fill: Color::TRANSPARENT, radius: radius::SM + 3.0 });
+    let ring = ctx.add(Node::Rect { rect: inflate(r, 1.0), fill: Color::TRANSPARENT, radius: radius::SM + 1.0 });
+    let edge = ctx.add(Node::Rect { rect: r, fill: if lit { t.accent_fill() } else { t.border_strong() }, radius: radius::SM });
+    let body = if lit {
+        if ctx.is_hovered(edge) || ctx.is_pressed(edge) { t.accent_fill_hover() } else { t.accent_fill() }
+    } else {
+        let base = t.bg_elevated();
+        if ctx.is_pressed(edge) || open {
+            t.state_pressed().over(base)
+        } else if ctx.is_hovered(edge) {
+            t.state_hover().over(base)
+        } else {
+            base
+        }
+    };
+    ctx.tree.insert(Some(edge), Node::Rect { rect: inflate(r, -stroke::DEFAULT), fill: body, radius: radius::SM - stroke::DEFAULT });
+    let fg = if lit { t.text_on_accent() } else { t.text_primary() };
+    let ls = Node::measure_text(label, &text(fg, type_size::MD, font::SANS, Weight::Medium));
+    ctx.tree.insert(Some(edge), Node::Text {
+        rect: Rect::new(r.x() + space::SM, r.y() + (r.h() - ls.h) / 2.0, ls.w, ls.h),
+        content: label.to_string(),
+        style: text(fg, type_size::MD, font::SANS, Weight::Medium),
+    });
+    // The caret: a chevron of two strokes, icon-sm wide; up while lit.
+    let (cx, cy) = (r.x() + r.w() - space::SM - 8.0, r.y() + r.h() / 2.0);
+    let (c, d) = if lit { (t.text_on_accent(), -2.0) } else { (t.text_secondary(), 2.0) };
+    ctx.tree.insert(Some(edge), Node::Path { p0: (cx - 4.0, cy - d), p1: (cx, cy + d), width: 1.5, color: c });
+    ctx.tree.insert(Some(edge), Node::Path { p0: (cx, cy + d), p1: (cx + 4.0, cy - d), width: 1.5, color: c });
+    if ctx.is_focus_visible(edge) {
+        for (id, col) in [(halo, t.accent_bg()), (ring, t.focus_ring())] {
+            if let Some(Node::Rect { fill, .. }) = ctx.tree.get_mut(id) {
+                *fill = col;
+            }
+        }
+    }
+    let m = menu.clone();
+    ctx.on_click(edge, move || {
+        let open = m.get().open;
+        m.set(if open { MenuState::default() } else { MenuState::opened(None) });
+    });
+    let m = menu.clone();
+    ctx.on_key(edge, move |ev| {
+        if let Event::Key { kind: KeyEventKind::Down, key, chars, .. } = ev {
+            if matches!(key, Key::Down | Key::Up | Key::Enter) || (*key == Key::Char && chars == " ") {
+                m.set(MenuState::opened(Some(cur.unwrap_or(0))));
+            }
+        }
+    });
+    ctx.focusable(edge);
+    edge
+}
+
+// ── MenuButton ──────────────────────────────────────────────────────────
+
+/// A button that opens a menu of actions (the Forum bar's controller
+/// menu): the label stays, an item runs `on_pick`. `attached()` gives the
+/// trusted-surface look (see [`trigger`]).
+pub struct MenuButton {
+    pub label: String,
+    pub items: Vec<MenuItem>,
+    pub menu: Mutable<MenuState>,
+    pub rect: Rect,
+    pub attached: bool,
+    on_pick: Rc<dyn Fn(usize)>,
+}
+
+impl MenuButton {
+    pub fn new(label: impl Into<String>, menu: Mutable<MenuState>, items: Vec<MenuItem>, on_pick: impl Fn(usize) + 'static) -> Self {
+        Self {
+            label: label.into(),
+            items,
+            menu,
+            rect: Rect::new(0.0, 0.0, 160.0, size::BUTTON_HEIGHT_DEFAULT),
+            attached: false,
+            on_pick: Rc::new(on_pick),
+        }
+    }
+    pub fn at(mut self, x: f32, y: f32) -> Self {
+        self.rect.origin.x = x;
+        self.rect.origin.y = y;
+        self
+    }
+    pub fn width(mut self, w: f32) -> Self {
+        self.rect.size.w = w;
+        self
+    }
+    pub fn height(mut self, h: f32) -> Self {
+        self.rect.size.h = h;
+        self
+    }
+    /// The trusted-surface look: lit while open, the menu joined to it.
+    pub fn attached(mut self) -> Self {
+        self.attached = true;
+        self
+    }
+}
+
+impl View for MenuButton {
+    fn render(&self, ctx: &mut Ctx) {
+        let r = self.rect;
+        trigger(ctx, r, &self.label, &self.menu, None, self.attached);
+        if self.menu.get().open {
+            let pick = self.on_pick.clone();
+            let m = Menu::new(self.menu.clone(), self.items.clone(), move |i| pick(i));
+            open_under(ctx, m, r, self.attached);
         }
     }
 }
@@ -498,6 +630,75 @@ mod tests {
         click(&mut app, 600.0, 400.0);
         assert!(!menu.get().open, "outside closes");
         assert_eq!(value.get(), 1, "and picks nothing");
+    }
+
+    #[test]
+    fn in_a_window_the_list_is_a_pop_up_that_frescod_takes_down() {
+        let (mut app, value, menu) = form();
+        app.set_popups(true);
+        app.tick();
+        click(&mut app, 20.0, 20.0);
+        assert!(menu.get().open);
+        let pops: Vec<_> = app.tree().popups().map(|(id, s)| (id, *s)).collect();
+        assert_eq!(pops.len(), 1);
+        let (root, spec) = pops[0];
+        // Hanging from the button, the gap inside the anchor.
+        let h = size::BUTTON_HEIGHT_DEFAULT;
+        assert_eq!(spec.anchor, Rect::new(10.0, 10.0 - MENU_GAP, 180.0, h + 2.0 * MENU_GAP));
+        assert_eq!((spec.side, spec.align, spec.grab), (crate::popup::Side::Below, crate::popup::Align::Start, true));
+        let r = app.tree().get(root).unwrap().rect();
+        assert_eq!((r.x(), r.y()), (10.0, 10.0 + h + MENU_GAP));
+        // No press-catcher: frescod keeps the outside press.
+        assert_eq!(app.tree().roots().count(), 4, "the dropdown's halo, ring and edge, and the pop-up");
+        // Items work as before (input arrives in tree coordinates).
+        let y = r.y() + MENU_INSET + size::MENU_ITEM * 1.5;
+        click(&mut app, 30.0, y);
+        assert_eq!(value.get(), 1);
+        assert_eq!(app.tree().popups().count(), 0);
+        // Dismissed by frescod: closed, nothing picked.
+        click(&mut app, 20.0, 20.0);
+        let root = app.tree().popups().next().unwrap().0;
+        app.popup_dismissed(root);
+        app.tick();
+        assert!(!menu.get().open);
+        assert_eq!(value.get(), 1);
+    }
+
+    struct Bar {
+        menu: Mutable<MenuState>,
+        picked: Rc<std::cell::Cell<Option<usize>>>,
+    }
+    impl View for Bar {
+        fn render(&self, ctx: &mut Ctx) {
+            let p = self.picked.clone();
+            MenuButton::new("Controller", self.menu.clone(), vec![MenuItem::new("Pair"), MenuItem::new("Forget")], move |i| p.set(Some(i)))
+                .at(10.0, 0.0)
+                .attached()
+                .render(ctx);
+        }
+    }
+
+    #[test]
+    fn an_attached_menu_button_lights_up_and_its_menu_joins_it() {
+        let d = Arc::new(AtomicBool::new(true));
+        let menu = Mutable::with_dirty(MenuState::default(), d.clone());
+        let picked = Rc::new(std::cell::Cell::new(None));
+        let mut app = App::new_with_flag(Bar { menu: menu.clone(), picked: picked.clone() }, d);
+        app.set_popups(true);
+        app.tick();
+        let t = app.theme;
+        let lit = |app: &App<Bar>| app.tree().iter().any(|(_, n)| matches!(n, Node::Rect { fill, .. } if *fill == t.accent_fill()));
+        assert!(!lit(&app), "closed: an ordinary button");
+        click(&mut app, 20.0, 10.0);
+        assert!(menu.get().open);
+        assert!(lit(&app), "open: filled with the accent");
+        let (root, spec) = app.tree().popups().next().map(|(id, s)| (id, *s)).unwrap();
+        let h = size::BUTTON_HEIGHT_DEFAULT;
+        assert_eq!(spec.anchor, Rect::new(10.0, 0.0, 160.0, h), "no gap");
+        assert_eq!(app.tree().get(root).unwrap().rect().y(), h, "it hangs from the button");
+        click(&mut app, 30.0, h + MENU_INSET + size::MENU_ITEM * 1.5);
+        assert_eq!(picked.get(), Some(1));
+        assert!(!lit(&app), "closed again");
     }
 
     #[test]

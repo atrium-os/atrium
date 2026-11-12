@@ -72,6 +72,53 @@ pub struct Window {
     appearance: Option<crate::theme::Semantic>,
     /// Whether the app takes the system appearance (default on).
     follow_appearance: bool,
+    /// The app's main window (the surface draws into pop-ups too).
+    main: u32,
+    /// Menus' pop-up windows ([`crate::popup`]).
+    popups: crate::popup::Popups,
+}
+
+/// Opens pop-ups for [`crate::popup::Popups`] on the window's connection.
+struct PopupHost<'a> {
+    conn: &'a mut Connection,
+    main: u32,
+    scale: f32,
+    /// The main window's size (logical px): an anchor must lie inside it.
+    bounds: (f32, f32),
+    destroyed: Vec<u32>,
+}
+
+impl PopupHost<'_> {
+    /// The anchor and size on the wire: device px, the anchor inside the
+    /// parent (a gap around a control at the edge is trimmed).
+    fn wire(&self, spec: &crate::popup::Spec, rect: crate::geom::Rect) -> ([f32; 4], u32, u32) {
+        let a = spec.anchor;
+        let (bw, bh) = self.bounds;
+        let x0 = a.x().clamp(0.0, bw);
+        let y0 = a.y().clamp(0.0, bh);
+        let x1 = (a.x() + a.w()).clamp(x0, bw);
+        let y1 = (a.y() + a.h()).clamp(y0, bh);
+        let k = self.scale;
+        let size = |v: f32| ((v * k).ceil() as u32).max(1);
+        ([x0 * k, y0 * k, (x1 - x0) * k, (y1 - y0) * k], size(rect.w()), size(rect.h()))
+    }
+}
+
+impl crate::popup::Host for PopupHost<'_> {
+    fn create(&mut self, spec: &crate::popup::Spec, rect: crate::geom::Rect) -> io::Result<u32> {
+        let (anchor, w, h) = self.wire(spec, rect);
+        self.conn.popup_create(self.main, anchor, spec.side.wire(), spec.align.wire(), w, h, spec.grab)
+    }
+    fn place(&mut self, window: u32, spec: &crate::popup::Spec, rect: crate::geom::Rect) -> io::Result<()> {
+        let (anchor, w, h) = self.wire(spec, rect);
+        self.conn.popup_place(window, anchor, spec.side.wire(), spec.align.wire(), w, h)
+    }
+    fn destroy(&mut self, window: u32) {
+        if let Err(e) = self.conn.window_destroy(window) {
+            log::warn!("popup: destroy {window}: {e}");
+        }
+        self.destroyed.push(window);
+    }
 }
 
 /// The theme for a system appearance.
@@ -129,6 +176,8 @@ impl Window {
             embed_token: None,
             appearance,
             follow_appearance: true,
+            main: win,
+            popups: Default::default(),
         })
     }
 
@@ -151,17 +200,38 @@ impl Window {
         if let Some(t) = self.appearance.take().filter(|_| self.follow_appearance) {
             app.set_theme(t);
         }
+        app.set_popups(true);
         app.frame();
         let deltas = app.tick();
         if !deltas.is_empty() {
-            commit(&mut self.surface, &deltas)?;
-            self.surface.present()?;
+            // Pop-ups open (or move, or close) before what they show is sent.
+            let scale = self.surface.scale;
+            let mut host = PopupHost {
+                conn: self.surface.connection(),
+                main: self.main,
+                scale,
+                bounds: (self.width, self.height),
+                destroyed: Vec::new(),
+            };
+            self.popups.sync(app.tree(), &mut host);
+            for w in std::mem::take(&mut host.destroyed) {
+                self.surface.forget(w);
+            }
+            for (win, batch) in self.popups.route(deltas, app.tree(), self.main) {
+                if batch.is_empty() {
+                    continue;
+                }
+                self.surface.select(win);
+                commit(&mut self.surface, &batch)?;
+                self.surface.present()?;
+            }
+            self.surface.select(self.main);
         }
         // After the present, so a slot never sits over a frame that does
         // not yet show the space for it.
         let changes = app.take_slot_changes();
         if let Some(b) = self.binder.as_mut() {
-            let (win, s) = (self.surface.window_id(), self.surface.scale);
+            let (win, s) = (self.main, self.surface.scale);
             for (key, rect) in changes {
                 let r = rect.map(|r| [r.x() * s, r.y() * s, r.w() * s, r.h() * s]);
                 b.place(win, key, r);
@@ -186,14 +256,23 @@ impl Window {
     /// out; a DPI change rescales every node on the wire (layout stays
     /// in logical pixels, the surface multiplies at emission).
     fn window_event<V: View>(&mut self, ev: &fresco_client::Event, app: &mut App<V>) {
+        let main = self.main;
         match *ev {
-            fresco_client::Event::EmbedToken { window_id, token } if window_id == self.surface.window_id() => {
+            // frescod took a menu down (a press outside, which it kept, or
+            // focus elsewhere): close it as Escape would.
+            fresco_client::Event::PopupDismissed { window_id, reason } => {
+                if let Some(root) = self.popups.dismissed(window_id) {
+                    log::debug!("popup {window_id} dismissed ({reason})");
+                    app.popup_dismissed(root);
+                }
+            }
+            fresco_client::Event::EmbedToken { window_id, token } if window_id == main => {
                 self.embed_token = Some(token);
             }
             fresco_client::Event::Appearance(ref a) => {
                 self.appearance = Some(theme_for(a));
             }
-            fresco_client::Event::FocusChanged { window_id, gained: true, cause } if window_id == self.surface.window_id() => {
+            fresco_client::Event::FocusChanged { window_id, gained: true, cause } if window_id == main => {
                 // The focus ring shows only for keyboard focus (§14.1), and
                 // arriving by Alt-Tab is keyboard focus.
                 match cause {
@@ -202,7 +281,7 @@ impl Window {
                     _ => {}
                 }
             }
-            fresco_client::Event::Resized { width, height, .. } => {
+            fresco_client::Event::Resized { window_id, width, height } if window_id == main => {
                 self.width = width as f32;
                 self.height = height as f32;
                 app.invalidate();
@@ -216,6 +295,24 @@ impl Window {
             }
             _ => {}
         }
+    }
+
+    /// A pop-up's pointer input, moved into the tree's (main window)
+    /// coordinates, where its nodes are laid out.
+    fn to_tree(&self, mut ev: fresco_client::Event) -> fresco_client::Event {
+        use fresco_client::Event as E;
+        match &mut ev {
+            E::PointerMotion { window_id, x, y }
+            | E::PointerButton { window_id, x, y, .. }
+            | E::PointerMagnify { window_id, x, y, .. }
+            | E::Drop { window_id, x, y, .. } => {
+                if let Some((tx, ty)) = self.popups.to_tree(*window_id, *x, *y) {
+                    (*x, *y) = (tx, ty);
+                }
+            }
+            _ => {}
+        }
+        ev
     }
 
     /// Milliseconds on the app clock.
@@ -259,7 +356,8 @@ impl Window {
         app.set_time(self.now_ms());
         let result = match ev {
             Some(ev) => {
-                if matches!(ev, fresco_client::Event::CloseRequested { .. }) {
+                let ev = self.to_tree(ev);
+                if matches!(ev, fresco_client::Event::CloseRequested { window_id } if window_id == self.main) {
                     return Ok(StepResult::Closed);
                 }
                 self.window_event(&ev, app);
@@ -297,6 +395,7 @@ impl Window {
                 }
             };
             app.set_time(self.now_ms());
+            let ev = self.to_tree(ev);
 
             let mut flow = Flow { exit: false, consumed: false };
             hook(&ev, app, &mut flow);
@@ -305,7 +404,7 @@ impl Window {
             }
 
             if !flow.consumed {
-                if matches!(ev, fresco_client::Event::CloseRequested { .. }) {
+                if matches!(ev, fresco_client::Event::CloseRequested { window_id } if window_id == self.main) {
                     return Ok(());
                 }
                 self.window_event(&ev, app);

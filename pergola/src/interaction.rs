@@ -56,6 +56,9 @@ pub type DragHandler = Box<dyn Fn(DragPhase, Point) + 'static>;
 #[derive(Default)]
 pub struct Handlers {
     pub on_click: Option<ClickHandler>,
+    /// A pop-up root ([`crate::view::Ctx::popup`]): frescod dismissed its
+    /// window (a press outside, focus elsewhere).
+    pub on_dismiss: Option<ClickHandler>,
     pub on_key: Option<KeyHandler>,
     /// When `true`, this node can take keyboard focus. Pointer-down
     /// on a focusable node sets focus; Tab navigates among focusables.

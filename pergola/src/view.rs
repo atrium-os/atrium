@@ -33,6 +33,8 @@ pub struct InteractionState {
     pub focus_visible: bool,
     /// The node whose tooltip is showing.
     pub tip: Option<NodeId>,
+    /// Menus may open as pop-up windows (a `Window` hosts the app).
+    pub popups: bool,
 }
 
 /// Per-render context handed to `View::render`. Owns the in-construction
@@ -171,6 +173,26 @@ impl<'a> Ctx<'a> {
     /// `on_scroll` handler.
     pub fn on_frame<F: Fn(f64, &Node) -> bool + 'static>(&mut self, id: NodeId, handler: F) {
         self.interactions.entry(id).on_frame = Some(Box::new(handler));
+    }
+
+    /// Whether [`Ctx::popup`] opens a window (the app runs in a `Window`);
+    /// otherwise a menu draws as an overlay.
+    pub fn popups_enabled(&self) -> bool { self.state.popups }
+
+    /// A pop-up window (docs/spec/fresco-popups.md): call from an overlay.
+    /// `rect` is where it would draw in this window (its size is the
+    /// pop-up's; frescod decides where it goes, from `spec`). `f` draws its
+    /// content in window coordinates inside `rect`; `on_dismiss` runs when
+    /// frescod takes it down (close the menu there).
+    pub fn popup(&mut self, rect: crate::geom::Rect, spec: crate::popup::Spec, on_dismiss: impl Fn() + 'static, f: impl FnOnce(&mut Ctx)) -> NodeId {
+        let saved = std::mem::take(&mut self.parent_stack);
+        let id = self.push(Node::stack(crate::geom::Axis::Vertical, rect, 0.0));
+        self.set_flex(id, crate::layout::FlexStyle { free: true, ..Default::default() });
+        self.tree.set_popup(id, spec);
+        self.interactions.entry(id).on_dismiss = Some(Box::new(on_dismiss));
+        f(self);
+        self.parent_stack = saved;
+        id
     }
 
     /// Draw `f` above everything the view draws, at the window's top

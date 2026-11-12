@@ -36,7 +36,7 @@ pub use choice::{Check, Checkbox, RadioGroup, Segmented, Tabs, Toggle};
 pub use credential_field::{CredentialField, CredentialState};
 pub use group::{GroupBox, Section};
 pub use label::{Glyph, Label};
-pub use popup::{Dialog, DialogButton, Dropdown, Menu, MenuItem, MenuState};
+pub use popup::{Dialog, DialogButton, Dropdown, Menu, MenuButton, MenuItem, MenuState};
 pub use scroll_view::{ScrollState, ScrollView};
 pub use slider::Slider;
 pub use text_field::TextField;

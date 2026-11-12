@@ -577,6 +577,8 @@ screen has it.
 | **Toggle** | 32×18 pill track, 1px `border-control`, 14 thumb `border-control` | track `accent-fill`, thumb `text-on-accent`, slides with `spring-snappy` |
 | **Slider** | 4 high pill track `border-strong`, filled part `accent-mark`, 16 thumb `bg-elevated` with 1px `border-control` | — |
 | **Dropdown** (select) | the secondary button's body, label left, `caret-down` glyph right; opens a menu aligned to its left edge, the current item under the pointer | — |
+| **Menu button** | the secondary button's body, label left, `caret-down` right; opens a menu of actions 4 below its left edge (a pop-up window) | held in the pressed state while its menu is open |
+| Menu button, **attached** (trusted surfaces: the Forum bar) | as the menu button | while open the whole button is `accent-fill` (hover `accent-fill-hover`), label and caret `text-on-accent`, the caret turned up; the menu hangs from it with no gap, inside a 2px `accent-fill` edge instead of `border-default`, at least as wide as the button. High contrast: the same, with `accent-fill` replaced by the high-contrast accent and a 2px `text-primary` outline around the button |
 | **Segmented control** | `bg-surface` track with a 1px `border-default` edge (so it shows on `bg-surface` too), radius-sm, 2px inset; segments equal width | the selected segment is a `bg-elevated` pill with `border-default` |
 | **Tabs** (in a panel) | labels `text-secondary` 16 apart, a 2px `accent-mark` bar under the selected one, a 1px `border-default` line under the row | label `text-primary` |
 | **List row** | 32 (dense 24), padding 12, glyph `icon-md` | `selection-bg` when the list has focus, `selection-idle` when not |
@@ -589,6 +591,14 @@ screen has it.
 | **Dialog / sheet** | floating surface, radius-lg, padding 24, `scrim` behind; buttons bottom right, primary last; Esc and the scrim cancel | — |
 | **Scrollbar** | overlay, no track: a 6 wide pill, `neutral-500` at 50%, 2 from the edge; shows while scrolling and 800 ms after, widens to 10 on hover | — |
 | **Progress** | the existing `ProgressBar`: 4 high pill, `accent-mark` on `bg-surface`; indeterminate is a moving third | — |
+
+**Why the attached look** (fresco-popups.md): a menu is a pop-up window frescod places, and an
+app can draw a fake menu in its own window just under the bar. Apps cannot draw in the bar, so the
+tell is the bar: a real bar menu always hangs from a lit bar button, joined to it in its colour,
+and only the bar's own menus are drawn that way. frescod also stacks app pop-ups below the bar
+and its pop-ups, and while a menu is open only its owner can open more. Apps' menu buttons and
+drop-downs never use the attached look (Pergola offers it only to trusted surfaces by
+convention; a fake one in an app's window still sits under an unlit bar).
 
 A **floating surface** (menu, popover, dialog, tooltip excepted) is `bg-elevated`, 1px
 `border-default`, and the one §5 shadow once Fresco draws it. Floating surfaces open with
