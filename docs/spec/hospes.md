@@ -399,7 +399,8 @@ to four days. It needs the user's consent to download the two libraries (§14 de
   `read`, `close` and `rt_sigaction` (queries for `SIGILL`, `SIGTRAP`, `SIGABRT`, `SIGSYS`).
   Unhandled, they hit FreeBSD's table with Linux numbers (Linux `read` is 0, FreeBSD's
   indirect `syscall`); in capability mode that is an error or a crash, not an escape, but the
-  CDM fails. Remedy, **now required for Widevine (step K1)**: a small kernel hook, a `procctl` that makes any
+  CDM fails. Remedy, **now required for Widevine (step K1, built 2026-11-12 with a module system call
+  in place of the `procctl`: `docs/reviews/2026-11-12-hospes-k1.md`)**: a small kernel hook, a `procctl` that makes any
   syscall instruction executed from registered address ranges deliver `SIGSYS` with the
   registers; the shim's handler emulates it from its Linux-number table. A few hundred lines,
   written in Rust per the 2026-11-10 kernel decision, upstreamable as FreeBSD's equivalent of
@@ -457,7 +458,7 @@ to four days. It needs the user's consent to download the two libraries (§14 de
 | H2 ✔ | `hospes-glibc` for OpenH264's import set; `hospes-codec`; player integration behind the H.264 build feature | conformance MD5s match Linux (§11.5); player plays an H.264 MP4 in the VM | done 2026-11-11: `docs/reviews/2026-11-11-hospes-h2.md` (12/12 conformance streams bit-identical on Linux and FreeBSD amd64/arm64; no unwinder needed for OpenH264, it moves to H4 with the glibc-built fixtures) |
 | H3 ✔ | `hospes-proto`, `hospes-cdm` with the test CDM; CENC/CBCS info from the demuxers; control and data channels; per-origin store | Clear Key content plays through Hospes; outputs equal the Linux reference host | done 2026-11-12: `docs/reviews/2026-11-12-hospes-h3.md` (transcript identical to the reference host on Linux and FreeBSD amd64/arm64; three Clear Key clips play with frames equal to their clear sources; the player uses decrypt-only until H4, and the CDM's jail, own user and rights-limited store move to H4) |
 | H4 | Widevine: shim extended to its imports, provisioning flow, install route, public test content | Shaka's Widevine test stream plays in the amd64 VM | 3–4 weeks |
-| K1 | The `SIGSYS` trap hook (`procctl`, Rust, §13 R1) and the shim's Linux-syscall handler for `openat`/`read`/`close`/`rt_sigaction` | the H0 CDM run's raw syscalls all handled under Hospes; isolation probe still green | 1–2 weeks, before H4 |
+| K1 ✔ | The `SIGSYS` trap hook (`procctl`, Rust, §13 R1) and the shim's Linux-syscall handler for `openat`/`read`/`close`/`rt_sigaction` | the H0 CDM run's raw syscalls all handled under Hospes; isolation probe still green | done 2026-11-12: `docs/reviews/2026-11-12-hospes-k1.md` (core hook in the fork, policy in `hospes_trap.ko` (C glue + Rust table); a module system call instead of `procctl`; H0's raw call set trapped and answered on FreeBSD arm64/amd64 via a test library, the real CDM's run is H4's first check) |
 | H5 | Hardening: fuzz targets, version-watch CI, optional bhyve wrapper | fuzzers run clean 1 h each; CI job live | 1–2 weeks |
 
 About three months in all plus K1, with OpenH264 usable after H2 (about six weeks in). EME in the

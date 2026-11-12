@@ -298,3 +298,19 @@ pub fn poll(fds: &mut [super::PollFd], timeout_ms: i32) -> R<usize> {
     let tp = if timeout_ms < 0 { 0 } else { ts.as_ptr() as usize };
     call(SYS_PPOLL, [fds.as_mut_ptr() as usize, fds.len(), tp, 0, 8, 0])
 }
+
+/// The current disposition of `sig`: `(handler, flags, mask)`, Linux `struct
+/// kernel_sigaction` terms (the mask's low 64 bits in the first two words).
+pub fn sigaction_query(sig: i32) -> R<(usize, u32, [u32; 4])> {
+    #[repr(C)]
+    struct KSigAction {
+        handler: usize,
+        flags: usize,
+        restorer: usize,
+        mask: u64,
+    }
+    let n = if cfg!(target_arch = "x86_64") { 13 } else { 134 };
+    let mut o = KSigAction { handler: 0, flags: 0, restorer: 0, mask: 0 };
+    call(n, [sig as usize, 0, &mut o as *mut KSigAction as usize, 8, 0, 0])?;
+    Ok((o.handler, o.flags as u32, [o.mask as u32, (o.mask >> 32) as u32, 0, 0]))
+}

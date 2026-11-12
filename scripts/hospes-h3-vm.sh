@@ -6,6 +6,9 @@
 #
 #   ARCH=aarch64 sh scripts/hospes-h3-vm.sh     # or ARCH=amd64; the VM must be up
 #
+# Since K1 the guest must run the fork kernel (scripts/hospes-k1-vm.sh kernel) and
+# hospes_trap.ko must be built (scripts/hospes-kmod.sh): hospes-cdm refuses to run without it.
+#
 # The guest needs dav1d, libvpx, opus, libvorbis and libogg (pkg), and the sysroot their
 # /usr/local copy, for the player's cross-build. In the cloud the guest's pkg needs this
 # environment's proxy CA: SSL_CA_CERT_FILE=<the container's CA bundle, copied in> pkg install ...
@@ -35,6 +38,8 @@ cp "$ROOT"/hospes/test-cdm/vectors/* "$B/vectors/"
 cp "$ROOT"/test-assets/media/clearkey/* "$B/media/"
 for c in vp9-opus-frag.mp4 av1-opus.mp4 vp9-opus.webm; do cp "$ROOT/test-assets/media/$c.layer.framemd5" "$B/media/"; done
 cp "$ROOT/hospes/test-cdm/vm/run.sh" "$B/"
+case "$A" in aarch64) KT=arm64 ;; *) KT=amd64 ;; esac
+cp "$ROOT/hospes/kmod/out/$KT-${KERNCONF:-ATRIUM-NODEBUG}/hospes_trap.ko" "$B/"
 tar czf - -C "$(dirname "$B")" h3vm | "$ROOT/scripts/vssh" 'rm -rf /tmp/h3vm && tar xzf - -C /tmp'
 rm -rf "$(dirname "$B")"
 "$ROOT/scripts/vssh" "cd /tmp/h3vm && ARCH=$A sh run.sh"

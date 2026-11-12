@@ -20,6 +20,7 @@ pub mod start;
 pub mod sys;
 pub mod thread;
 pub mod tls;
+pub mod trap;
 
 #[cfg(feature = "global")]
 #[global_allocator]

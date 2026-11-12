@@ -114,7 +114,7 @@ fn fail(name: &str, why: core::fmt::Arguments) -> i32 {
 #[no_mangle]
 pub fn hospes_main(info: &'static StartInfo) -> i32 {
     let (Some(mode), Some(path)) = (info.arg(1), info.arg_z(2)) else {
-        hlog!("usage: hospes-fixture-runner run|refuse|relro-write|text-write|probe FIXTURE.so");
+        hlog!("usage: hospes-fixture-runner run|refuse|relro-write|text-write|probe|trap|trap-hold|raw FIXTURE.so");
         return 2;
     };
     let mode = core::str::from_utf8(mode).unwrap_or("");
@@ -126,6 +126,14 @@ pub fn hospes_main(info: &'static StartInfo) -> i32 {
         Ok(fd) => fd,
         Err(e) => return fail(name, format_args!("open: {:?}", e)),
     };
+    // K1: the trap facility is found by name, before capability mode.
+    let held = mode == "trap-hold";
+    let mode = if held { "trap" } else { mode };
+    if mode == "trap" {
+        if let Err(e) = hospes_rt::trap::init(hospes_glibc::syscall::handle) {
+            return fail(name, format_args!("no system call trap: {:?}", e));
+        }
+    }
     // Capability mode before we parse anything (spec §2). No-op on the Linux dev backend.
     if let Err(e) = sys::cap_enter() {
         return fail(name, format_args!("cap_enter: {:?}", e));
@@ -138,7 +146,7 @@ pub fn hospes_main(info: &'static StartInfo) -> i32 {
         return fail(name, format_args!("open by path still works after cap_enter"));
     }
 
-    let opts = load::Options { hwcap: sys::linux_hwcap(info.auxv), allow_unknown: mode == "load-only" };
+    let opts = load::Options { hwcap: sys::linux_hwcap(info.auxv), allow_unknown: mode == "load-only", trap: mode == "trap" };
     let lib = match load::load(fd, &opts, &Host) {
         Ok(l) => l,
         Err(e) => {
@@ -172,6 +180,15 @@ pub fn hospes_main(info: &'static StartInfo) -> i32 {
     unsafe { lib.run_init(info.argc, info.argv, info.envp) };
     match mode {
         "run" | "probe" => run(&lib, name, mode == "probe"),
+        "trap" | "raw" => {
+            let r = trap(&lib, name, mode == "trap");
+            // trap-hold: keep the process (and its kernel range table) alive a while, so
+            // the VM test can check the module refuses to unload under it.
+            if held {
+                sys::nanosleep(6, 0);
+            }
+            r
+        }
         "relro-write" => {
             let Some(t) = lib.sym("fixture_relro_target") else { return fail(name, format_args!("no fixture_relro_target")) };
             let t: extern "C" fn() -> *mut usize = unsafe { core::mem::transmute(t) };
@@ -187,6 +204,29 @@ pub fn hospes_main(info: &'static StartInfo) -> i32 {
             fail(name, format_args!("text write did not fault"))
         }
         _ => fail(name, format_args!("unknown mode {}", mode)),
+    }
+}
+
+/// K1: raw Linux system calls from the library. `trap`: under the trap (the shim answers);
+/// otherwise the reference run, where the real Linux kernel answers.
+fn trap(lib: &Library, name: &str, trapped: bool) -> i32 {
+    if trapped {
+        if !hospes_rt::trap::enabled() {
+            hlog!("SKIP {} (no system call trap on this host)", name);
+            return 0;
+        }
+        hospes_glibc::vfs::set_library(lib);
+    } else if sys::OS != "linux" {
+        return fail(name, format_args!("raw mode is the Linux reference run only"));
+    }
+    let Some(m) = lib.sym("fixture_trap_main") else { return fail(name, format_args!("no fixture_trap_main")) };
+    let m: extern "C" fn(i32) -> i32 = unsafe { core::mem::transmute(m) };
+    match m(trapped as i32) {
+        0 => {
+            hlog!("PASS {} ({})", name, if trapped { "trapped: the shim answered every raw call" } else { "raw: the Linux kernel answered" });
+            0
+        }
+        r => fail(name, format_args!("check {} failed", r)),
     }
 }
 

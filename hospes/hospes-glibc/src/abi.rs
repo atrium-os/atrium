@@ -42,12 +42,16 @@ pub const OFFSETOF_MUTEX_LOCK: usize = 0;
 pub const EPERM: i32 = 1;
 pub const ENOENT: i32 = 2;
 pub const EINTR: i32 = 4;
+pub const EIO: i32 = 5;
 pub const EBADF: i32 = 9;
 pub const EAGAIN: i32 = 11;
 pub const ENOMEM: i32 = 12;
 pub const EACCES: i32 = 13;
+pub const EFAULT: i32 = 14;
 pub const EBUSY: i32 = 16;
 pub const EINVAL: i32 = 22;
+pub const EMFILE: i32 = 24;
+pub const ENAMETOOLONG: i32 = 36;
 pub const ENOSYS: i32 = 38;
 pub const ETIMEDOUT: i32 = 110;
 

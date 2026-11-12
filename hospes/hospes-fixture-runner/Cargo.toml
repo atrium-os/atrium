@@ -12,3 +12,4 @@ test = false
 
 [dependencies]
 hospes-rt = { path = "../hospes-rt" }
+hospes-glibc = { path = "../hospes-glibc" }

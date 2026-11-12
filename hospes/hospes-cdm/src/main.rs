@@ -25,7 +25,7 @@ use core::ffi::c_void;
 use hospes_proto::{status, Msg, Sample};
 use hospes_rt::load::{self, Library};
 use hospes_rt::start::StartInfo;
-use hospes_rt::{heap, hlog, sys};
+use hospes_rt::{heap, hlog, sys, trap};
 
 use abi::{AudioDecoderConfig2, Cdm, InputBuffer2, Obj, Policy, SubsampleEntry, VideoDecoderConfig2};
 use host::{st, State};
@@ -90,12 +90,23 @@ pub fn hospes_main(info: &'static StartInfo) -> i32 {
         hlog!("usage: hospes-cdm --ctrl FD --data FD --lib FD [--store FD] [--key-system NAME] [--mem MiB]");
         return 2;
     };
+    // The trap facility is found by name, which capability mode does not allow: first.
+    let trap = match trap::init(hospes_glibc::syscall::handle) {
+        Ok(()) => true,
+        Err(_) if cfg!(target_os = "freebsd") => {
+            return fail(args.ctrl, 3, "no system call trap (is hospes_trap.ko loaded?)");
+        }
+        Err(e) => {
+            hlog!("hospes-cdm: no system call trap ({:?})", e);
+            false
+        }
+    };
     if let Err(e) = sys::cap_enter() {
         return fail(args.ctrl, 3, if e.0 == sys::ENOSYS { "no capability mode" } else { "cap_enter failed" });
     }
     heap::set_limit(args.mem_mib << 20);
     hospes_glibc::init();
-    let opts = load::Options { hwcap: sys::linux_hwcap(info.auxv), allow_unknown: false };
+    let opts = load::Options { hwcap: sys::linux_hwcap(info.auxv), allow_unknown: false, trap };
     let lib = match load::load(args.lib, &opts, &hospes_glibc::Glibc) {
         Ok(l) => l,
         Err(e) => {
@@ -104,6 +115,7 @@ pub fn hospes_main(info: &'static StartInfo) -> i32 {
         }
     };
     let _ = sys::close(args.lib);
+    hospes_glibc::vfs::set_library(&lib);
     run_init(&lib);
 
     host::install(State {

@@ -6,6 +6,10 @@ D=$(cd "$(dirname "$0")" && pwd)
 LIB="$D/${ARCH:-aarch64}-clearkey.so"
 rc=0
 mkdir -p "$D/store"; chmod 777 "$D/store"
+# Since K1 hospes-cdm traps the CDM's raw system calls and refuses to run without the module.
+if ! kldstat -q -n hospes_trap; then
+    kldload "$D/hospes_trap.ko" || { echo "hospes_trap.ko did not load (the fork kernel, kernel.atrium, must be booted)"; exit 1; }
+fi
 if "$D/bin/hospes-cdm-check" "$D/bin/hospes-cdm" "$LIB" "$D/vectors" "$D/store" > "$D/transcript.txt" 2> "$D/check.err" && diff "$D/vectors/transcript.txt" "$D/transcript.txt"; then
     echo "cdm-check: transcript equals the reference host's ($(wc -l < "$D/transcript.txt") lines)"
 else

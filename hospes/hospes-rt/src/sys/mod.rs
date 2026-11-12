@@ -19,6 +19,10 @@ mod os;
 
 pub use os::*;
 
+/// The raw trap instruction: `(value, error flag)`; the flag is FreeBSD's carry (on Linux
+/// the error is a negative value instead).
+pub use arch::sc as arch_sc;
+
 /// A kernel error number, in the host OS's numbering.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Errno(pub i32);

@@ -19,7 +19,9 @@ mod misc;
 mod printf;
 mod pthread;
 mod stdio;
+pub mod syscall;
 mod time;
+pub mod vfs;
 
 use hospes_rt::load::Resolver;
 

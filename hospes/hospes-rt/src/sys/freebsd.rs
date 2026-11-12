@@ -276,3 +276,19 @@ pub fn unlink_beneath(dirfd: i32, name: &[u8]) -> R<()> {
 pub fn poll(fds: &mut [super::PollFd], timeout_ms: i32) -> R<usize> {
     call(SYS_POLL, [fds.as_mut_ptr() as usize, fds.len(), timeout_ms as isize as usize, 0, 0, 0])
 }
+
+const SYS_SIGACTION: usize = 416;
+
+/// The current disposition of `sig` (FreeBSD numbering): `(handler, flags, mask)`, in
+/// FreeBSD's `struct sigaction` terms.
+pub fn sigaction_query(sig: i32) -> R<(usize, u32, [u32; 4])> {
+    #[repr(C)]
+    struct SigAction {
+        handler: usize,
+        flags: u32,
+        mask: [u32; 4],
+    }
+    let mut o = SigAction { handler: 0, flags: 0, mask: [0; 4] };
+    call(SYS_SIGACTION, [sig as usize, 0, &mut o as *mut SigAction as usize, 0, 0, 0])?;
+    Ok((o.handler, o.flags, o.mask))
+}

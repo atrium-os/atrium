@@ -49,6 +49,7 @@ build_fixtures() {
         $cc $lk -o "$out/unknown.so" "$src/unknown.c"
         $cc $lk -o "$out/badversion.so" "$src/badversion.c"
         $cc $lk -o "$out/probe.so" "$src/probe.c"
+        $cc $lk -o "$out/trap.so" "$src/trap.c"
         rm -f "$out/libhost.so"
         echo "fixtures: $out"
     done
@@ -115,6 +116,12 @@ run_all() {
         $w "$r" refuse "$d/$f.so" || fails=$((fails + 1))
     done
     $w "$r" probe "$d/probe.so" || fails=$((fails + 1))
+    # K1: raw Linux calls from the library, under the trap; on Linux also the reference run
+    # where the kernel answers them.
+    $w "$r" trap "$d/trap.so" || fails=$((fails + 1))
+    if [ "$(uname -s)" = Linux ]; then
+        $w "$r" raw "$d/trap.so" || fails=$((fails + 1))
+    fi
     for m in relro-write text-write; do
         set +e
         $w "$r" "$m" "$d/reloc.so" 2>/dev/null

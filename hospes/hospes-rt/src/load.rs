@@ -34,6 +34,11 @@ pub struct Options {
     /// Development only: bind unknown strong imports to a stub that aborts when called,
     /// instead of refusing the load (spec §6.4).
     pub allow_unknown: bool,
+    /// Trap system calls made from the library's code (K1, [`crate::trap`]): register its
+    /// executable segments and lock the table before any of its code runs. Needs
+    /// [`crate::trap::init`] first. On the Linux development backend a missing facility
+    /// (qemu-user has no syscall user dispatch) is a warning, on FreeBSD an error.
+    pub trap: bool,
 }
 
 pub struct Library {
@@ -148,6 +153,17 @@ fn map_and_relocate(fd: i32, lib: &mut Library, opts: &Options, res: &dyn Resolv
         }
     }
 
+    // Trap the library's own system calls before anything of it runs: relocation runs
+    // IRELATIVE resolvers, which are library code.
+    if opts.trap {
+        if let Err(e) = trap_segments(lib) {
+            if cfg!(target_os = "freebsd") {
+                return Err(LoadError::Io("trap", e));
+            }
+            crate::hlog!("hospes: no system call trap on this host ({:?}); the library's raw calls reach the kernel", e);
+        }
+    }
+
     // TLS: one module, static block in every thread.
     if let Some(t) = &lib.img.tls {
         tls::set_template(tls::Template {
@@ -170,6 +186,15 @@ fn map_and_relocate(fd: i32, lib: &mut Library, opts: &Options, res: &dyn Resolv
         }
     }
     Ok(())
+}
+
+fn trap_segments(lib: &Library) -> sys::R<()> {
+    for s in lib.img.segments.iter().filter(|s| s.flags.x) {
+        let va = lib.base + s.vaddr as usize;
+        let start = page_down(va);
+        crate::trap::add(start, page_up(va + s.memsz as usize) - start)?;
+    }
+    crate::trap::lock()
 }
 
 /// What a symbol index resolves to.

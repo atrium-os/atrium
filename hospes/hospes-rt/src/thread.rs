@@ -18,6 +18,7 @@ unsafe impl Send for Thread {}
 
 extern "C" fn trampoline(p: usize) {
     let st = p as *mut ThreadState;
+    crate::trap::thread_start();
     unsafe {
         let f: Entry = core::mem::transmute((*st).start);
         (*st).result = f((*st).arg);

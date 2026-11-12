@@ -5200,6 +5200,11 @@ make.py ... installkernel DESTDIR=$HOME/stage -DNO_ROOT KODIR=/boot/kernel.atriu
 
 - Kmods: `make.py ... buildenv BUILDENV_SHELL="sh -c 'cd DIR && make SYSDIR=...'"`.
 - **amd64 kmods need LLVM 19**: clang 18 emits GOTPCRELX (reloc 42), which kldload rejects.
+- Hospes K1: `SRC=... TARGET=arm64|amd64 sh scripts/hospes-kmod.sh` builds `hospes_trap.ko`
+  (objdir `$HOME/obj-<target>`); `ARCH=... sh scripts/hospes-k1-vm.sh kernel|test` installs the
+  fork kernel as `kernel.atrium` (one-shot nextboot) and runs the trap tests. Build the amd64
+  kernel itself with LLVM 19 too: `installkernel` ships its modules in `kernel.atrium`, and with
+  clang 18 `xdr.ko` fails to load, so `zfs.ko` does and the guest panics at mountroot.
 - Build the Tessera EFI loader on the host via buildenv (~2 min), not in the TCG guest (30+ min).
 - Fork userland for amd64: `scripts/cross-build-world.sh` (~62 min). Stop the VM during it (the guest got OOM-killed).
 - Never run two make.py builds on one objdir.

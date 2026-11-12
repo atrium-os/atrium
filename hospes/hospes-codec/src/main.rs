@@ -111,7 +111,7 @@ pub fn hospes_main(info: &'static StartInfo) -> i32 {
     }
     heap::set_limit(args.mem_mib << 20);
     hospes_glibc::init();
-    let opts = load::Options { hwcap: sys::linux_hwcap(info.auxv), allow_unknown: false };
+    let opts = load::Options { hwcap: sys::linux_hwcap(info.auxv), allow_unknown: false, trap: false };
     let lib = match load::load(lib_fd, &opts, &hospes_glibc::Glibc) {
         Ok(l) => l,
         Err(e) => {

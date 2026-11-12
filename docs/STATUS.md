@@ -189,8 +189,14 @@ H.264 in the FreeBSD arm64 VM. H3 done 2026-11-12 (`docs/reviews/2026-11-12-hosp
 Key test CDM with a glibc reference host (transcripts identical on Linux and FreeBSD
 amd64/arm64), CENC/CBCS sample info in the MP4 and WebM demuxers, and the player decrypting
 through `hospes-cdm` (cenc MP4, cbcs MP4 and encrypted WebM play with frames equal to the clear
-sources on Linux and both FreeBSD VMs). Next: K1 then H4 (Widevine). Run:
-`scripts/hospes-build.sh`, `scripts/hospes-h3-vm.sh`.
+sources on Linux and both FreeBSD VMs). K1 done 2026-11-12
+(`docs/reviews/2026-11-12-hospes-k1.md`): system call trap for the library's own raw Linux
+calls, a core hook in the fork's `syscallenter()` plus `hospes_trap.ko` (C glue, Rust range
+table); `SIGSYS` handler in `hospes-rt`, Linux-call emulation and the first virtual files in
+`hospes-glibc`; H0's raw call set trapped on FreeBSD arm64/amd64, probe and H3 still green.
+`hospes-cdm` on FreeBSD now needs `hospes_trap.ko` loaded. Next: H4 (Widevine). Run:
+`scripts/hospes-build.sh`, `scripts/hospes-h3-vm.sh`, `scripts/hospes-kmod.sh`,
+`scripts/hospes-k1-vm.sh`.
 
 ## 6. Navigator exploration coverage
 
