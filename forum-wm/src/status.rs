@@ -31,12 +31,13 @@ pub fn apply(app_id: &str, conn: u64, tx: &Sender<FromStatus>, m: ToStatus) {
     b.generation += 1;
     let generation = b.generation;
     match m {
-        ToStatus::Set { glyph, svg, tooltip, content } => {
+        ToStatus::Set { glyph, svg, tint, tooltip, content } => {
             let item = StatusItem {
                 app_id: app_id.to_string(),
                 glyph,
                 svg: forum_ctl::status_svg(svg),
                 tooltip: tooltip.chars().take(STATUS_MAX_LABEL).collect(),
+                tint,
                 content: content.bounded(),
                 generation,
             };
@@ -137,7 +138,7 @@ mod tests {
             StatusEntry::Slider { label: "Level".into(), value: 7.0 },
             StatusEntry::Separator,
         ];
-        apply("org.test.vpn", 1, &tx, ToStatus::Set { svg: Some("<path d=\"M4 4L20 20\"/>".into()), glyph: '\u{e000}', tooltip: "VPN".into(), content: StatusContent::Menu(menu) });
+        apply("org.test.vpn", 1, &tx, ToStatus::Set { tint: None, svg: Some("<path d=\"M4 4L20 20\"/>".into()), glyph: '\u{e000}', tooltip: "VPN".into(), content: StatusContent::Menu(menu) });
         let items = list();
         assert_eq!(items.len(), 1);
         let m = super::menu(&items[0]);
@@ -155,7 +156,7 @@ mod tests {
         // A newer connection of the same app replaces it; the old one closing
         // leaves it.
         let (tx2, _rx2) = channel();
-        apply("org.test.vpn", 2, &tx2, ToStatus::Set { svg: None, glyph: 'x', tooltip: String::new(), content: StatusContent::Menu(Vec::new()) });
+        apply("org.test.vpn", 2, &tx2, ToStatus::Set { tint: None, svg: None, glyph: 'x', tooltip: String::new(), content: StatusContent::Menu(Vec::new()) });
         closed(1);
         assert_eq!(list().len(), 1);
         closed(2);
@@ -183,7 +184,7 @@ mod tests {
             StatusNode::TextField { id: 5, label: "Server".into(), placeholder: "host".into(), value: String::new(), enabled: true },
         ];
         nodes.extend((0..100).map(|_| StatusNode::Separator));
-        apply("org.test.clip", 7, &tx, ToStatus::Set { svg: Some("<path d=\"M1 1\"/> é".into()), glyph: 'c', tooltip: String::new(), content: StatusContent::Panel(StatusPanel { width: 9999, nodes }) });
+        apply("org.test.clip", 7, &tx, ToStatus::Set { tint: None, svg: Some("<path d=\"M1 1\"/> é".into()), glyph: 'c', tooltip: String::new(), content: StatusContent::Panel(StatusPanel { width: 9999, nodes }) });
         let StatusContent::Panel(p) = list().into_iter().find(|i| i.app_id == "org.test.clip").unwrap().content else { panic!() };
         assert_eq!(p.width, STATUS_PANEL_MAX_W);
         assert_eq!(list().into_iter().find(|i| i.app_id == "org.test.clip").unwrap().svg, None, "not ASCII");
@@ -224,13 +225,13 @@ mod tests {
         let _g = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
         reset();
         let (tx, rx) = channel();
-        apply("org.test.draw", 7, &tx, ToStatus::Set { glyph: 'x', svg: None, tooltip: "t".into(), content: StatusContent::Drawn { width: 900, height: 2 } });
+        apply("org.test.draw", 7, &tx, ToStatus::Set { glyph: 'x', svg: None, tint: None, tooltip: "t".into(), content: StatusContent::Drawn { width: 900, height: 2 } });
         assert_eq!(list()[0].content, StatusContent::Drawn { width: forum_ctl::STATUS_PANEL_MAX_W, height: forum_ctl::STATUS_DRAWN_MIN_H }, "bounded");
         open_panel("org.test.draw", [4; 16]).unwrap();
         assert_eq!(rx.try_recv(), Ok(FromStatus::OpenPanel { token: [4; 16], width: 400, height: 40 }));
         assert!(open_panel("org.none", [4; 16]).is_err());
         assert!(pick("org.test.draw", 0).is_err(), "no menu");
-        apply("org.test.menu", 8, &tx, ToStatus::Set { glyph: 'x', svg: None, tooltip: "t".into(), content: StatusContent::Menu(Vec::new()) });
+        apply("org.test.menu", 8, &tx, ToStatus::Set { glyph: 'x', svg: None, tint: None, tooltip: "t".into(), content: StatusContent::Menu(Vec::new()) });
         assert!(open_panel("org.test.menu", [4; 16]).is_err(), "not drawn");
     }
 }

@@ -77,6 +77,31 @@ impl Color {
     ///
     /// `bg.a` is treated as opaque for the contrast calculation;
     /// callers wanting an alpha-blended check should pre-composite.
+    /// An 8-bit sRGB colour, opaque.
+    pub fn from_srgb8(r: u8, g: u8, b: u8) -> Self {
+        Self { r: srgb_to_linear(r), g: srgb_to_linear(g), b: srgb_to_linear(b), a: 1.0 }
+    }
+
+    /// WCAG contrast ratio between two opaque colours (1..=21).
+    pub fn contrast(self, other: Color) -> f32 {
+        let (a, b) = (self.relative_luminance(), other.relative_luminance());
+        (a.max(b) + 0.05) / (a.min(b) + 0.05)
+    }
+
+    /// `self`, darkened just enough (towards black) that `fg` on it has at
+    /// least `ratio` contrast: an app's colour as a fill under a white
+    /// icon. Black when no shade of it does.
+    pub fn fill_under(self, fg: Color, ratio: f32) -> Color {
+        let mut c = Color { a: 1.0, ..self };
+        for _ in 0..40 {
+            if fg.contrast(c) >= ratio {
+                return c;
+            }
+            c = Color::rgba(c.r * 0.9, c.g * 0.9, c.b * 0.9, 1.0);
+        }
+        Color::rgba(0.0, 0.0, 0.0, 1.0)
+    }
+
     pub fn auto_on(bg: Color) -> Color {
         let l_bg    = bg.relative_luminance();
         let l_white = 1.0;
@@ -104,6 +129,17 @@ fn srgb_to_linear(byte: u8) -> f32 {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn an_app_colour_is_darkened_until_white_reads_on_it() {
+        let white = Color::rgba(1.0, 1.0, 1.0, 1.0);
+        let yellow = Color::from_srgb8(0xff, 0xe0, 0x40);
+        assert!(white.contrast(yellow) < 3.0);
+        let f = yellow.fill_under(white, 3.0);
+        assert!(white.contrast(f) >= 3.0 && f.r > 0.05, "a darker yellow, not black: {f:?}");
+        let navy = Color::from_srgb8(0x10, 0x20, 0x60);
+        assert_eq!(navy.fill_under(white, 3.0), navy, "already readable: kept");
+    }
+
     use super::*;
 
     #[test]

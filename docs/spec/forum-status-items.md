@@ -74,6 +74,16 @@ The app chooses one of two, and can switch with its next `Set`:
   4 levels of nesting; text 512 characters, labels 64; 8 options a choice;
   560 px tall (nodes past it are not drawn).
 
+### The app's colour
+
+`ToStatus::Set` carries `tint: Option<[u8; 3]>` (sRGB). While the item's
+menu or panel is open its icon is lit in that colour instead of the
+accent, and the edge joining a bar-drawn menu or panel to it takes the
+same colour. The bar darkens it just enough that the icon on it
+(`text_on_accent`) keeps 3:1 contrast (`Color::fill_under`). It is a
+look, not a trust signal: the trusted mark is frescod's label (§4), which
+no app colours.
+
 ## 3. Wire
 
 forum-wm serves `/atrium/sockets/forum-status/forum-status.sock` (postcard,

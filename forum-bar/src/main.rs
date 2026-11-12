@@ -132,6 +132,13 @@ fn status_vector(svg: Option<&str>) -> Option<Arc<pergola::icon::IconGeometry>> 
     (!g.is_empty() && g.sane()).then(|| Arc::new(g))
 }
 
+/// An app's colour as its lit icon's fill: darkened as far as the icon
+/// (`text_on_accent`) needs for 3:1 contrast (visual language, controls).
+fn status_tint(t: &Semantic, tint: Option<[u8; 3]>) -> Option<pergola::Color> {
+    let [r, g, b] = tint?;
+    Some(pergola::Color::from_srgb8(r, g, b).fill_under(t.text_on_accent(), 3.0))
+}
+
 /// The heading over a status panel: the app's name, drawn by the bar.
 const STATUS_PANEL_HEAD: f32 = 24.0;
 
@@ -401,6 +408,10 @@ impl View for BarView {
                         Some(v) => button.vector_icon(v.clone(), s.item.glyph, 15.0, Some(t.text_secondary())),
                         None => button.icon(s.item.glyph, 15.0, Some(t.text_secondary())),
                     };
+                    let button = match status_tint(&t, s.item.tint) {
+                        Some(c) => button.tint(c),
+                        None => button,
+                    };
                     ctx.place(button);
                     continue;
                 }
@@ -423,6 +434,10 @@ impl View for BarView {
                     let button = match &s.vector {
                         Some(v) => button.vector_icon(v.clone(), s.item.glyph, 15.0, Some(t.text_secondary())),
                         None => button.icon(s.item.glyph, 15.0, Some(t.text_secondary())),
+                    };
+                    let button = match status_tint(&t, s.item.tint) {
+                        Some(c) => button.tint(c),
+                        None => button,
                     };
                     ctx.place(button);
                     continue;
@@ -452,6 +467,10 @@ impl View for BarView {
                 let button = match &s.vector {
                     Some(v) => button.vector_icon(v.clone(), s.item.glyph, 15.0, Some(t.text_secondary())),
                     None => button.icon(s.item.glyph, 15.0, Some(t.text_secondary())),
+                };
+                let button = match status_tint(&t, s.item.tint) {
+                    Some(c) => button.tint(c),
+                    None => button,
                 };
                 ctx.place(button);
             }
@@ -1024,6 +1043,7 @@ mod tests {
             app_id: "org.test.vpn".into(),
             glyph: phosphor::LOCK_SIMPLE,
             svg: None,
+            tint: None,
             tooltip: "VPN".into(),
             content: StatusContent::Menu(vec![
                 StatusEntry::Check { label: "Connected".into(), on: true, enabled: true },
@@ -1069,6 +1089,23 @@ mod tests {
     }
 
     #[test]
+    fn an_open_status_item_is_lit_in_its_apps_colour() {
+        pergola::text::clear_measurer();
+        let view = sample_view();
+        let mut item = sample_item(1);
+        item.tint = Some([0xff, 0xe0, 0x40]); // too light under a white icon
+        let shown = merge_status(&[], vec![item], None).unwrap();
+        shown[0].open.set(MenuState::opened(None));
+        view.status.set(shown);
+        let t = Semantic::LIGHT;
+        let lit = status_tint(&t, Some([0xff, 0xe0, 0x40])).unwrap();
+        assert!(t.text_on_accent().contrast(lit) >= 3.0, "darkened to read");
+        let (tree, _) = render(&view, t);
+        assert!(tree.iter().any(|(_, x)| matches!(x, Node::Rect { fill, .. } if *fill == lit)), "the icon's fill");
+        assert!(status_tint(&t, None).is_none());
+    }
+
+    #[test]
     fn status_items_keep_their_menu_state_and_redraw_only_on_change() {
         let first = merge_status(&[], vec![sample_item(1)], None).unwrap();
         first[0].open.set(MenuState::opened(None));
@@ -1103,6 +1140,7 @@ mod tests {
             app_id: "org.test.clip".into(),
             glyph: phosphor::CLIPBOARD,
             svg: None,
+            tint: None,
             tooltip: "Clipboard".into(),
             content: StatusContent::Panel(StatusPanel {
                 width: 280,

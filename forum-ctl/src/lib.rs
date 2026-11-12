@@ -387,7 +387,10 @@ pub enum ToStatus {
     /// `svg`: a vector icon from the app's bundle (stroke paths and
     /// circles in a 0..24 viewBox, as the dock's icons), drawn by the bar
     /// in place of `glyph`; ASCII, at most `STATUS_MAX_SVG` bytes.
-    Set { glyph: char, svg: Option<String>, tooltip: String, content: StatusContent },
+    /// `tint`: the app's colour (sRGB), which its icon lights in while
+    /// its menu or panel is open; the bar darkens it as far as the icon
+    /// needs to stay readable.
+    Set { glyph: char, svg: Option<String>, tint: Option<[u8; 3]>, tooltip: String, content: StatusContent },
     Remove,
 }
 
@@ -418,6 +421,8 @@ pub struct StatusItem {
     /// is within the limits.
     pub svg: Option<String>,
     pub tooltip: String,
+    /// The app's colour (see `ToStatus::Set`).
+    pub tint: Option<[u8; 3]>,
     pub content: StatusContent,
     /// Bumped on each change, so the bar redraws only then.
     pub generation: u64,

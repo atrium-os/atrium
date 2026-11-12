@@ -139,13 +139,15 @@ pub struct Menu {
     pub anchor: Option<(Rect, crate::popup::Side, crate::popup::Align)>,
     /// Hangs from a lit menu button: an accent edge (see [`trigger`]).
     pub attached: bool,
+    /// That edge's colour, when the button is lit in another (its tint).
+    pub tint: Option<Color>,
     on_pick: Rc<dyn Fn(usize)>,
     on_slide: Option<Rc<dyn Fn(usize, f64)>>,
 }
 
 impl Menu {
     pub fn new(state: Mutable<MenuState>, items: Vec<MenuItem>, on_pick: impl Fn(usize) + 'static) -> Self {
-        Self { state, items, x: 0.0, y: 0.0, width: 220.0, anchor: None, attached: false, on_pick: Rc::new(on_pick), on_slide: None }
+        Self { state, items, x: 0.0, y: 0.0, width: 220.0, anchor: None, attached: false, tint: None, on_pick: Rc::new(on_pick), on_slide: None }
     }
     pub fn at(mut self, x: f32, y: f32) -> Self {
         self.x = x;
@@ -238,7 +240,7 @@ impl Menu {
         let t = ctx.theme;
         let body = if self.attached {
             // Joined to the lit button: its accent as a 2px edge.
-            let e = ctx.add(Node::Rect { rect: r, fill: t.accent_fill(), radius: radius::MD });
+            let e = ctx.add(Node::Rect { rect: r, fill: self.tint.unwrap_or_else(|| t.accent_fill()), radius: radius::MD });
             ctx.tree.insert(Some(e), Node::Rect { rect: inflate(r, -ATTACHED_EDGE), fill: t.bg_elevated(), radius: radius::MD - ATTACHED_EDGE })
         } else {
             surface(ctx, r, radius::MD)
@@ -422,14 +424,14 @@ impl View for Dropdown {
                     f(i);
                 }
             });
-            open_under(ctx, m, r, self.attached, crate::popup::Align::Start);
+            open_under(ctx, m, r, self.attached, crate::popup::Align::Start, None);
         }
     }
 }
 
 /// The menu under a trigger at `r`: a pop-up hanging from it when the
 /// window allows, at least as wide. Attached: no gap, joined to it.
-fn open_under(ctx: &mut Ctx, m: Menu, r: Rect, attached: bool, align: crate::popup::Align) {
+fn open_under(ctx: &mut Ctx, m: Menu, r: Rect, attached: bool, align: crate::popup::Align, tint: Option<Color>) {
     let gap = if attached { 0.0 } else { MENU_GAP };
     let w = r.w().max(160.0).max(m.natural_width());
     let x = if align == crate::popup::Align::End { r.x() + r.w() - w } else { r.x() };
@@ -439,6 +441,7 @@ fn open_under(ctx: &mut Ctx, m: Menu, r: Rect, attached: bool, align: crate::pop
         // The gap is part of the anchor, so a flipped list keeps it.
         .anchored(Rect::new(r.x(), r.y() - gap, r.w(), r.h() + 2.0 * gap), crate::popup::Side::Below, align);
     m.attached = attached;
+    m.tint = tint;
     ctx.overlay(move |ctx| m.render(ctx));
 }
 
@@ -464,6 +467,9 @@ pub struct TriggerIcon {
     /// A vector icon (Lucide-style strokes, viewBox 0..24) drawn instead
     /// of the glyph: a status item's icon from the app's bundle.
     pub vector: Option<std::sync::Arc<crate::icon::IconGeometry>>,
+    /// The lit (open) fill in place of the accent: a status item lit in
+    /// its app's colour. Its caller makes sure `text_on_accent` reads on it.
+    pub tint: Option<Color>,
 }
 
 fn trigger_with(ctx: &mut Ctx, r: Rect, label: &str, icon: Option<TriggerIcon>, menu: &Mutable<MenuState>, cur: Option<usize>, attached: bool) -> NodeId {
@@ -534,7 +540,13 @@ fn icon_trigger(ctx: &mut Ctx, r: Rect, ic: TriggerIcon, menu: &Mutable<MenuStat
     let ring = ctx.add(Node::Rect { rect: inflate(r, 1.0), fill: Color::TRANSPARENT, radius: radius::SM + 1.0 });
     let edge = ctx.add(Node::Rect { rect: r, fill: Color::TRANSPARENT, radius: radius::SM });
     let fill = if lit {
-        if ctx.is_hovered(edge) || ctx.is_pressed(edge) { t.accent_fill_hover() } else { t.accent_fill() }
+        let hot = ctx.is_hovered(edge) || ctx.is_pressed(edge);
+        match ic.tint {
+            Some(c) if hot => Color::rgba(c.r * 0.85, c.g * 0.85, c.b * 0.85, 1.0),
+            Some(c) => c,
+            None if hot => t.accent_fill_hover(),
+            None => t.accent_fill(),
+        }
     } else if ctx.is_pressed(edge) || menu.get().open {
         t.state_pressed()
     } else if ctx.is_hovered(edge) {
@@ -640,7 +652,7 @@ impl MenuButton {
     /// instead of the label: a square ghost button `size` + 12 wide, as
     /// tall as its rect. In a row it takes its natural size.
     pub fn icon(mut self, glyph: char, size: f32, color: Option<Color>) -> Self {
-        self.icon = Some(TriggerIcon { glyph, size, color, vector: None });
+        self.icon = Some(TriggerIcon { glyph, size, color, vector: None, tint: None });
         self.rect.size.w = (size + 12.0).round();
         self.rect.size.h = self.rect.size.h.min(size + 12.0).max(size + 8.0);
         self
@@ -656,6 +668,15 @@ impl MenuButton {
         }
         b
     }
+    /// Lit in `color` while open instead of the accent (a status item in
+    /// its app's colour); set after the icon. The caller keeps the icon
+    /// readable on it (`Color::fill_under`).
+    pub fn tint(mut self, color: Color) -> Self {
+        if let Some(ic) = &mut self.icon {
+            ic.tint = Some(color);
+        }
+        self
+    }
 }
 
 impl View for MenuButton {
@@ -669,7 +690,7 @@ impl View for MenuButton {
             // An icon button is small and sits at the end of a row (the
             // bar's right side): its menu lines up with its right edge.
             let align = if self.icon.is_some() { crate::popup::Align::End } else { crate::popup::Align::Start };
-            open_under(ctx, m, r, self.attached, align);
+            open_under(ctx, m, r, self.attached, align, self.icon.as_ref().and_then(|i| i.tint));
         }
     }
 }
@@ -738,7 +759,7 @@ impl PanelButton {
     }
     /// A Phosphor glyph instead of the label (see [`MenuButton::icon`]).
     pub fn icon(mut self, glyph: char, size: f32, color: Option<Color>) -> Self {
-        self.icon = Some(TriggerIcon { glyph, size, color, vector: None });
+        self.icon = Some(TriggerIcon { glyph, size, color, vector: None, tint: None });
         self.rect.size.w = (size + 12.0).round();
         self.rect.size.h = self.rect.size.h.min(size + 12.0).max(size + 8.0);
         self
@@ -753,6 +774,15 @@ impl PanelButton {
             }
         }
         b
+    }
+    /// Lit in `color` while open instead of the accent (a status item in
+    /// its app's colour); set after the icon. The caller keeps the icon
+    /// readable on it (`Color::fill_under`).
+    pub fn tint(mut self, color: Color) -> Self {
+        if let Some(ic) = &mut self.icon {
+            ic.tint = Some(color);
+        }
+        self
     }
 }
 
@@ -783,15 +813,16 @@ impl View for PanelButton {
         let pr = Rect::new(x, r.y() + r.h() + gap, w, h);
         let anchor = Rect::new(r.x(), r.y() - gap, r.w(), r.h() + 2.0 * gap);
         let (open, content, attached) = (self.open.clone(), self.content.clone(), self.attached);
+        let tint = self.icon.as_ref().and_then(|i| i.tint);
         ctx.overlay(move |ctx| {
             let close = { let o = open.clone(); move || o.set(MenuState::default()) };
             if ctx.popups_enabled() {
                 let spec = crate::popup::Spec { anchor, side: crate::popup::Side::Below, align, grab: true };
-                ctx.popup(pr, spec, close, |ctx| panel_body(ctx, pr, attached, &open, &content));
+                ctx.popup(pr, spec, close, |ctx| panel_body(ctx, pr, attached, tint, &open, &content));
             } else {
                 let catcher = ctx.add(Node::Rect { rect: EVERYWHERE, fill: Color::TRANSPARENT, radius: 0.0 });
                 ctx.on_click(catcher, close);
-                panel_body(ctx, pr, attached, &open, &content);
+                panel_body(ctx, pr, attached, tint, &open, &content);
             }
         });
     }
@@ -799,10 +830,10 @@ impl View for PanelButton {
 
 /// A panel's surface (the attached edge when it hangs from a lit button),
 /// then its content.
-fn panel_body(ctx: &mut Ctx, r: Rect, attached: bool, open: &Mutable<MenuState>, content: &PanelContent) {
+fn panel_body(ctx: &mut Ctx, r: Rect, attached: bool, tint: Option<Color>, open: &Mutable<MenuState>, content: &PanelContent) {
     let t = ctx.theme;
     let body = if attached {
-        let e = ctx.add(Node::Rect { rect: r, fill: t.accent_fill(), radius: radius::MD });
+        let e = ctx.add(Node::Rect { rect: r, fill: tint.unwrap_or_else(|| t.accent_fill()), radius: radius::MD });
         ctx.tree.insert(Some(e), Node::Rect { rect: inflate(r, -ATTACHED_EDGE), fill: t.bg_elevated(), radius: radius::MD - ATTACHED_EDGE })
     } else {
         surface(ctx, r, radius::MD)

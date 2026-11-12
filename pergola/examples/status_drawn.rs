@@ -19,6 +19,8 @@ use pergola::window::{Window, WindowDesc};
 use pergola::{App, Button, Mutable};
 
 const GLYPH: char = '\u{e196}';
+/// The app's colour: its icon lights in it while its panel is open.
+const TINT: [u8; 3] = [0x7a, 0x4c, 0xd9];
 const ICON: &str = include_str!("../../forum-ctl/examples/status-item-icons/clipboard.svg");
 const W: u16 = 300;
 const H: u16 = 300;
@@ -83,7 +85,7 @@ impl View for Panel {
         let bw = w / 12.0;
         for (i, n) in c.per_hour.iter().enumerate() {
             let bh = 60.0 * *n as f32 / top;
-            ctx.add(Node::Rect { rect: Rect::new(x + i as f32 * bw + 2.0, y + 60.0 - bh, bw - 4.0, bh.max(2.0)), fill: t.accent_fill(), radius: 2.0 });
+            ctx.add(Node::Rect { rect: Rect::new(x + i as f32 * bw + 2.0, y + 60.0 - bh, bw - 4.0, bh.max(2.0)), fill: pergola::Color::from_srgb8(TINT[0], TINT[1], TINT[2]), radius: 2.0 });
         }
         y += 74.0;
         let clips = self.clips.clone();
@@ -101,7 +103,7 @@ impl View for Panel {
 }
 
 fn set(sock: &mut UnixStream) -> std::io::Result<()> {
-    let m = ToStatus::Set { glyph: GLYPH, svg: Some(ICON.into()), tooltip: "Clipboard history".into(), content: StatusContent::Drawn { width: W, height: H } };
+    let m = ToStatus::Set { glyph: GLYPH, tint: Some(TINT), svg: Some(ICON.into()), tooltip: "Clipboard history".into(), content: StatusContent::Drawn { width: W, height: H } };
     write_frame(sock, &encode(&m).map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?)
 }
 
