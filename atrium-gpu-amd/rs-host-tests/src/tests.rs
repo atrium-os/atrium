@@ -454,3 +454,15 @@ fn power_plan_only_lowers() {
     assert!(cap_change(250, 200, 1000, &l));
     assert!(cap_change(200, 300, 0, &l));
 }
+
+/// The RS64 start addresses stage 4c programs, from the real R9700 files.
+#[test]
+fn rs64_start_real_files() {
+    let Ok(dir) = std::env::var("AMDGPU_FW_DIR") else { return };
+    for n in ["gc_12_0_1_pfp.bin", "gc_12_0_1_me.bin", "gc_12_0_1_mec.bin"] {
+        let b = std::fs::read(std::path::Path::new(&dir).join(n)).unwrap();
+        let f = Rs64Fw::parse(&b).unwrap();
+        std::println!("{n}: ucode_start_addr {:#x}", f.ucode_start_addr);
+        assert_eq!(f.ucode_start_addr & 3, 0, "{n}: start not dword aligned");
+    }
+}

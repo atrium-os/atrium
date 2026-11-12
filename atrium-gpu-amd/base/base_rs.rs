@@ -187,3 +187,25 @@ pub unsafe extern "C" fn atrium_gpu_power_idle_suspicious(t: *const power::Telem
     // SAFETY: per the contract above.
     power::idle_suspicious(unsafe { &*t }) as i32
 }
+
+/// The RS64 program start address (`ucode_start_addr`, 64-bit) of a PFP, ME
+/// or MEC image (`gfx_firmware_header_v2_0`). 0 ok, -1 refused.
+///
+/// # Safety
+/// `bin` points to `len` readable bytes and `out` to a writable u64.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn atrium_amd_rs64_start(bin: *const u8, len: usize, out: *mut u64) -> i32 {
+    if bin.is_null() || out.is_null() {
+        return -1;
+    }
+    // SAFETY: per the contract above.
+    let b = unsafe { core::slice::from_raw_parts(bin, len) };
+    match fw::Rs64Fw::parse(b) {
+        Ok(f) => {
+            // SAFETY: per the contract above.
+            unsafe { *out = f.ucode_start_addr };
+            0
+        }
+        Err(_) => -1,
+    }
+}

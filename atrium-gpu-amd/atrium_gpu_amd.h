@@ -840,6 +840,8 @@ int	amd_gmc12_gart_map(struct amd_gart *gt, uint64_t gart_addr,
 	    vm_paddr_t pa);
 int	amd_gmc12_flush(struct amd_gart *gt);
 int	amd_ih7_test(struct atrium_amd_softc *sc, struct amd_gart *gt);
+int	amd_gfx12_setup(struct atrium_amd_softc *sc);	/* gfx12.c, 4c */
+int	atrium_amd_rs64_start(const uint8_t *bin, size_t len, uint64_t *out);
 int	amd_smu_init(struct atrium_amd_softc *sc);	/* smu.c, silicon test */
 
 /*
