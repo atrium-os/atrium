@@ -64,7 +64,7 @@ based on upstream from about 2026-09-21. Its `pf` predates those commands, so th
 userland and rebase". The userland was already the newest snapshot, so only the kernel moved.
 
 - **The branch.** The fork's 150 commits were rebased onto upstream main `83c8ec72a`
-  (2026-11-12). The result is `atrium-os/freebsd-src` branch `atrium-os-rebase`.
+  (2026-11-12). The result is now `atrium-os/freebsd-src` branch `atrium-os` (`afdfa5eb9`).
 - **Conflicts.** Three needed resolving:
   - `sys/conf/files` and `options`: upstream moved the scheduler entries.
   - Two in `vt_core.c`, from the boot splash. Upstream now checks `VDF_SPLASH` under the
@@ -82,9 +82,9 @@ userland and rebase". The userland was already the newest snapshot, so only the 
   rebuilt against it. Under it, `pfctl -f /usr/local/etc/atrium/pf.conf` loads the rules.
 
 **Fork commit ids changed.** The rebase gives every fork commit a new id. Older notes cite
-the ids on branch `atrium-os`, which is unchanged on GitHub. The two Hospes commits are:
+the old ids, which are kept on branch `atrium-os-pre-rebase-2026-11-12`. The two Hospes commits are:
 
-| Commit | On `atrium-os` | On `atrium-os-rebase` |
+| Commit | Before the rebase | After |
 |---|---|---|
 | The systrap hook | `c12a0dadc` | `abbb1e10f` |
 | `p_systrap` move | `501a0bb0a` | `27b310d5f` |
@@ -92,8 +92,8 @@ the ids on branch `atrium-os`, which is unchanged on GitHub. The two Hospes comm
 **Pushing.** This checkout is shallow, so it could not push to GitHub. The branch was pushed from
 a second clone that holds upstream main deep enough to reach the fork's old base.
 
-**Not done:** `atrium-os` itself still points at the old base. Replacing it with
-`atrium-os-rebase` is a force-push, and it waits for Shankar.
+**Branch swap.** On Shankar's go-ahead, `atrium-os` was force-pushed to the rebased commit, and the old
+head `501a0bb0a` was kept as `atrium-os-pre-rebase-2026-11-12`.
 
 ## The check
 
