@@ -422,5 +422,5 @@ land with it.
   IVs this time. With gfx_hqd_mask 0 the CPF still stuck busy (0x84000001, 60 W), so the
   mask was not the cause. Linux's gfx_v12_0_cp_resume (async gfx ring, the default) sets
   the doorbell ranges and un-halts MEC and PFP/ME, idle with no rings, before
-  mes kiq_hw_init starts MES; we started MES with them halted. Next (b7…): do the same
+  mes kiq_hw_init starts MES; we started MES with them halted. Next (a07d1fdd): do the same
   before MES, halt them again after, and set gfx_hqd_mask back to 0xfe.
