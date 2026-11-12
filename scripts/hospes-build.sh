@@ -149,13 +149,13 @@ run_all() {
     for m in relro-write text-write; do
         set +e
         $w "$r" "$m" "$d/reloc.so" 2>/dev/null
-        rc=$?
+        st=$?
         set -e
-        # SIGSEGV (139) or SIGBUS (138) through the shell.
-        if [ "$rc" -eq 139 ] || [ "$rc" -eq 138 ]; then
-            echo "PASS $m (faulted, status $rc)" >&2
+        # (st, not rc: callers keep their own rc.) SIGSEGV (139) or SIGBUS (138) through the shell.
+        if [ "$st" -eq 139 ] || [ "$st" -eq 138 ]; then
+            echo "PASS $m (faulted, status $st)" >&2
         else
-            echo "FAIL $m: status $rc, expected a fault" >&2
+            echo "FAIL $m: status $st, expected a fault" >&2
             fails=$((fails + 1))
         fi
     done
