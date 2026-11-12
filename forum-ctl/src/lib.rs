@@ -174,6 +174,14 @@ impl StatusEntry {
     }
 }
 
+/// The largest vector icon, bytes.
+pub const STATUS_MAX_SVG: usize = 8192;
+
+/// `svg` if it is within the limits (ASCII, `STATUS_MAX_SVG` bytes).
+pub fn status_svg(svg: Option<String>) -> Option<String> {
+    svg.filter(|s| s.len() <= STATUS_MAX_SVG && s.is_ascii())
+}
+
 /// Most nodes in a status panel, counting those inside groups and rows.
 pub const STATUS_MAX_NODES: usize = 64;
 /// Deepest nesting of groups, rows and columns.
@@ -363,7 +371,10 @@ impl StatusContent {
 pub enum ToStatus {
     /// Put (or replace) this app's item: a Phosphor glyph, a tooltip, and
     /// the menu or panel that hangs from it.
-    Set { glyph: char, tooltip: String, content: StatusContent },
+    /// `svg`: a vector icon from the app's bundle (stroke paths and
+    /// circles in a 0..24 viewBox, as the dock's icons), drawn by the bar
+    /// in place of `glyph`; ASCII, at most `STATUS_MAX_SVG` bytes.
+    Set { glyph: char, svg: Option<String>, tooltip: String, content: StatusContent },
     Remove,
 }
 
@@ -386,6 +397,9 @@ pub struct StatusItem {
     /// The app's id, from the launch registry (never one the app gave).
     pub app_id: String,
     pub glyph: char,
+    /// The app's vector icon (see `ToStatus::Set`), when it sent one that
+    /// is within the limits.
+    pub svg: Option<String>,
     pub tooltip: String,
     pub content: StatusContent,
     /// Bumped on each change, so the bar redraws only then.

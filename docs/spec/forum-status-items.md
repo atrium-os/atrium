@@ -17,9 +17,16 @@ cannot pass for the system's own controls and cannot cover them
   of the system icons and set apart from them, in the order the apps
   added them. The system icons (controller, volume, appearance, lock) are
   the bar's own and never come from an app.
-- **The icon** is a Phosphor glyph the app names. It is drawn in the
-  status-item group only, so a glyph that looks like a system icon still
-  sits among apps. (A bitmap icon from the app's bundle is a later step.)
+- **The icon** is a vector icon from the app's bundle (Shankar,
+  2026-11-12: vector, not bitmap): stroke paths and circles in a 0..24
+  viewBox, the dock's icon style, sent with each `Set` so it can follow
+  the app's state (a VPN connected or not). At most 8 KiB of ASCII
+  (forum-wm drops anything else); the bar parses it and draws it as
+  strokes in its own colour, and refuses one that is too complex (64
+  paths, 512 segments) or reaches far outside its box. Otherwise, and
+  when there is none, the app's Phosphor glyph. Either way it is drawn in
+  the status-item group only, so an icon that looks like a system icon
+  still sits among apps.
 - **The menu** is drawn as the bar's other menus are (Pergola
   `MenuButton::attached`), headed by the app's name from the launch
   registry, never a name the app supplies.
@@ -74,7 +81,7 @@ forum-wm serves `/atrium/sockets/forum-status/forum-status.sock` (postcard,
 `status-item`; forum-wm also resolves the peer through the launch registry
 and refuses an unregistered one (development: `FORUM_STATUS_ANY=1`).
 
-- App → WM: `Set { glyph: char, tooltip: String, content: Menu(..) |
+- App → WM: `Set { glyph: char, svg: Option<String>, tooltip: String, content: Menu(..) |
   Panel { width, nodes } }`, `Remove`.
 - WM → App: `Picked { index }`, `Slid { index, value }`, `Changed { id,
   value }`, `Denied { message }`.

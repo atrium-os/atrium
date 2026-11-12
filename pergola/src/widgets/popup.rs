@@ -456,11 +456,14 @@ fn trigger(ctx: &mut Ctx, r: Rect, label: &str, menu: &Mutable<MenuState>, cur: 
 
 /// An icon trigger's glyph: Phosphor char, size, colour (default
 /// `text-secondary`).
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 pub struct TriggerIcon {
     pub glyph: char,
     pub size: f32,
     pub color: Option<Color>,
+    /// A vector icon (Lucide-style strokes, viewBox 0..24) drawn instead
+    /// of the glyph: a status item's icon from the app's bundle.
+    pub vector: Option<std::sync::Arc<crate::icon::IconGeometry>>,
 }
 
 fn trigger_with(ctx: &mut Ctx, r: Rect, label: &str, icon: Option<TriggerIcon>, menu: &Mutable<MenuState>, cur: Option<usize>, attached: bool) -> NodeId {
@@ -543,12 +546,18 @@ fn icon_trigger(ctx: &mut Ctx, r: Rect, ic: TriggerIcon, menu: &Mutable<MenuStat
         *f = fill;
     }
     let color = if lit { t.text_on_accent() } else { ic.color.unwrap_or_else(|| t.text_secondary()) };
-    let gs = Node::measure_text(&ic.glyph.to_string(), &text(color, ic.size, font::ICONS, Weight::Regular));
-    ctx.tree.insert(Some(edge), Node::Text {
-        rect: Rect::new(r.x() + (r.w() - gs.w) / 2.0, r.y() + (r.h() - gs.h) / 2.0, gs.w, gs.h),
-        content: ic.glyph.to_string(),
-        style: text(color, ic.size, font::ICONS, Weight::Regular),
-    });
+    if let Some(v) = &ic.vector {
+        // Strokes as Lucide draws them (2 in 24), centred in the button.
+        let (x, y) = (r.x() + (r.w() - ic.size) / 2.0, r.y() + (r.h() - ic.size) / 2.0);
+        crate::icon::draw_icon(ctx, v, x, y, ic.size, (ic.size / 12.0).max(1.0), color);
+    } else {
+        let gs = Node::measure_text(&ic.glyph.to_string(), &text(color, ic.size, font::ICONS, Weight::Regular));
+        ctx.tree.insert(Some(edge), Node::Text {
+            rect: Rect::new(r.x() + (r.w() - gs.w) / 2.0, r.y() + (r.h() - gs.h) / 2.0, gs.w, gs.h),
+            content: ic.glyph.to_string(),
+            style: text(color, ic.size, font::ICONS, Weight::Regular),
+        });
+    }
     if ctx.is_focus_visible(edge) {
         for (id, col) in [(halo, t.accent_bg()), (ring, t.focus_ring())] {
             if let Some(Node::Rect { fill, .. }) = ctx.tree.get_mut(id) {
@@ -631,17 +640,28 @@ impl MenuButton {
     /// instead of the label: a square ghost button `size` + 12 wide, as
     /// tall as its rect. In a row it takes its natural size.
     pub fn icon(mut self, glyph: char, size: f32, color: Option<Color>) -> Self {
-        self.icon = Some(TriggerIcon { glyph, size, color });
+        self.icon = Some(TriggerIcon { glyph, size, color, vector: None });
         self.rect.size.w = (size + 12.0).round();
         self.rect.size.h = self.rect.size.h.min(size + 12.0).max(size + 8.0);
         self
+    }
+    /// A vector icon (`pergola::icon`, viewBox 0..24) instead of a glyph,
+    /// `size` px; `glyph` is drawn if the geometry is empty.
+    pub fn vector_icon(self, geometry: std::sync::Arc<crate::icon::IconGeometry>, glyph: char, size: f32, color: Option<Color>) -> Self {
+        let mut b = self.icon(glyph, size, color);
+        if !geometry.is_empty() {
+            if let Some(ic) = &mut b.icon {
+                ic.vector = Some(geometry);
+            }
+        }
+        b
     }
 }
 
 impl View for MenuButton {
     fn render(&self, ctx: &mut Ctx) {
         let r = self.rect;
-        trigger_with(ctx, r, &self.label, self.icon, &self.menu, None, self.attached);
+        trigger_with(ctx, r, &self.label, self.icon.clone(), &self.menu, None, self.attached);
         if self.menu.get().open {
             let pick = self.on_pick.clone();
             let mut m = Menu::new(self.menu.clone(), self.items.clone(), move |i| pick(i));
@@ -702,17 +722,28 @@ impl PanelButton {
     }
     /// A Phosphor glyph instead of the label (see [`MenuButton::icon`]).
     pub fn icon(mut self, glyph: char, size: f32, color: Option<Color>) -> Self {
-        self.icon = Some(TriggerIcon { glyph, size, color });
+        self.icon = Some(TriggerIcon { glyph, size, color, vector: None });
         self.rect.size.w = (size + 12.0).round();
         self.rect.size.h = self.rect.size.h.min(size + 12.0).max(size + 8.0);
         self
+    }
+    /// A vector icon (`pergola::icon`, viewBox 0..24) instead of a glyph,
+    /// `size` px; `glyph` is drawn if the geometry is empty.
+    pub fn vector_icon(self, geometry: std::sync::Arc<crate::icon::IconGeometry>, glyph: char, size: f32, color: Option<Color>) -> Self {
+        let mut b = self.icon(glyph, size, color);
+        if !geometry.is_empty() {
+            if let Some(ic) = &mut b.icon {
+                ic.vector = Some(geometry);
+            }
+        }
+        b
     }
 }
 
 impl View for PanelButton {
     fn render(&self, ctx: &mut Ctx) {
         let r = self.rect;
-        trigger_with(ctx, r, &self.label, self.icon, &self.open, None, self.attached);
+        trigger_with(ctx, r, &self.label, self.icon.clone(), &self.open, None, self.attached);
         if !self.open.get().open {
             return;
         }

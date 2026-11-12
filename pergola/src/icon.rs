@@ -31,6 +31,26 @@ impl IconGeometry {
     pub fn is_empty(&self) -> bool { self.subpaths.is_empty() }
     /// Total segment count (for tests / sizing heuristics).
     pub fn seg_count(&self) -> usize { self.subpaths.iter().map(|s| s.segs.len()).sum() }
+
+    /// Fit to draw from an untrusted source (an app's status icon): at
+    /// most 64 sub-paths and 512 segments, every point finite and near the
+    /// 0..24 viewBox, radii at most 24. Drawing cost is then bounded
+    /// (each segment flattens to at most 64 steps).
+    pub fn sane(&self) -> bool {
+        let near = |p: &Point| p.0.is_finite() && p.1.is_finite() && (-8.0..=32.0).contains(&p.0) && (-8.0..=32.0).contains(&p.1);
+        self.subpaths.len() <= 64
+            && self.seg_count() <= 512
+            && self.subpaths.iter().all(|sp| {
+                near(&sp.start)
+                    && sp.segs.iter().all(|s| match s {
+                        Seg::Line(p) => near(p),
+                        Seg::Cubic(a, b, c) => near(a) && near(b) && near(c),
+                        Seg::Arc { c, rx, ry, phi, t1, dt, end } => {
+                            near(c) && near(end) && [*rx, *ry, *phi, *t1, *dt].iter().all(|v| v.is_finite()) && *rx <= 24.0 && *ry <= 24.0
+                        }
+                    })
+            })
+    }
 }
 
 // ── parsing ──────────────────────────────────────────────────────────────────
@@ -302,6 +322,19 @@ fn disc(ctx: &mut crate::view::Ctx, p: Point, stroke: f32, color: crate::color::
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn hostile_icons_are_not_sane_and_do_not_panic() {
+        assert!(parse_icon(r#"<svg><path d="M4 4L20 20"/><circle cx="12" cy="12" r="3"/></svg>"#).sane());
+        assert!(!parse_icon(r#"<path d="M4 4L2000 20"/>"#).sane());
+        assert!(!parse_icon(r#"<circle cx="12" cy="12" r="300"/>"#).sane());
+        let many = format!(r#"<path d="M1 1{}"/>"#, "L2 2".repeat(600));
+        assert!(!parse_icon(&many).sane());
+        // Garbage parses to something or nothing, never a panic.
+        for junk in ["<path d=\"", "<path d=\"M\"", "<path d=\"A1 1 0 1 1\"/>", "<circle", "<path d=\"M1e40 1L1 1\"/>"] {
+            let _ = parse_icon(junk).sane();
+        }
+    }
 
     #[test]
     fn terminal_parses_to_two_subpaths_of_lines() {

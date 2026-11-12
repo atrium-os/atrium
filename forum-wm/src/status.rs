@@ -31,10 +31,11 @@ pub fn apply(app_id: &str, conn: u64, tx: &Sender<FromStatus>, m: ToStatus) {
     b.generation += 1;
     let generation = b.generation;
     match m {
-        ToStatus::Set { glyph, tooltip, content } => {
+        ToStatus::Set { glyph, svg, tooltip, content } => {
             let item = StatusItem {
                 app_id: app_id.to_string(),
                 glyph,
+                svg: forum_ctl::status_svg(svg),
                 tooltip: tooltip.chars().take(STATUS_MAX_LABEL).collect(),
                 content: content.bounded(),
                 generation,
@@ -127,10 +128,11 @@ mod tests {
             StatusEntry::Slider { label: "Level".into(), value: 7.0 },
             StatusEntry::Separator,
         ];
-        apply("org.test.vpn", 1, &tx, ToStatus::Set { glyph: '\u{e000}', tooltip: "VPN".into(), content: StatusContent::Menu(menu) });
+        apply("org.test.vpn", 1, &tx, ToStatus::Set { svg: Some("<path d=\"M4 4L20 20\"/>".into()), glyph: '\u{e000}', tooltip: "VPN".into(), content: StatusContent::Menu(menu) });
         let items = list();
         assert_eq!(items.len(), 1);
         let m = super::menu(&items[0]);
+        assert_eq!(items[0].svg.as_deref(), Some("<path d=\"M4 4L20 20\"/>"));
         assert!(matches!(&m[1], StatusEntry::Check { label, .. } if label.chars().count() == STATUS_MAX_LABEL));
         assert!(matches!(m[2], StatusEntry::Slider { value, .. } if value == 1.0));
         pick("org.test.vpn", 0).unwrap();
@@ -144,7 +146,7 @@ mod tests {
         // A newer connection of the same app replaces it; the old one closing
         // leaves it.
         let (tx2, _rx2) = channel();
-        apply("org.test.vpn", 2, &tx2, ToStatus::Set { glyph: 'x', tooltip: String::new(), content: StatusContent::Menu(Vec::new()) });
+        apply("org.test.vpn", 2, &tx2, ToStatus::Set { svg: None, glyph: 'x', tooltip: String::new(), content: StatusContent::Menu(Vec::new()) });
         closed(1);
         assert_eq!(list().len(), 1);
         closed(2);
@@ -172,9 +174,10 @@ mod tests {
             StatusNode::TextField { id: 5, label: "Server".into(), placeholder: "host".into(), value: String::new(), enabled: true },
         ];
         nodes.extend((0..100).map(|_| StatusNode::Separator));
-        apply("org.test.clip", 7, &tx, ToStatus::Set { glyph: 'c', tooltip: String::new(), content: StatusContent::Panel(StatusPanel { width: 9999, nodes }) });
+        apply("org.test.clip", 7, &tx, ToStatus::Set { svg: Some("<path d=\"M1 1\"/> é".into()), glyph: 'c', tooltip: String::new(), content: StatusContent::Panel(StatusPanel { width: 9999, nodes }) });
         let StatusContent::Panel(p) = list().into_iter().find(|i| i.app_id == "org.test.clip").unwrap().content else { panic!() };
         assert_eq!(p.width, STATUS_PANEL_MAX_W);
+        assert_eq!(list().into_iter().find(|i| i.app_id == "org.test.clip").unwrap().svg, None, "not ASCII");
         assert!(matches!(&p.nodes[1], StatusNode::Text { text, .. } if text.chars().count() == forum_ctl::STATUS_MAX_TEXT));
         assert!(matches!(p.nodes[3], StatusNode::Slider { value, .. } if value == 0.0));
         assert!(matches!(p.nodes[4], StatusNode::Choice { selected: 1, .. }));

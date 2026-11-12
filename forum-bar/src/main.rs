@@ -108,6 +108,15 @@ struct StatusShown {
     open: Mutable<MenuState>,
     /// A panel's controls' values (status_panel.rs).
     controls: status_panel::Controls,
+    /// The app's vector icon, parsed, if it sent one fit to draw.
+    vector: Option<Arc<pergola::icon::IconGeometry>>,
+}
+
+/// An app's vector icon, if it parses to something small and inside its
+/// box (`IconGeometry::sane`); else the bar draws the app's glyph.
+fn status_vector(svg: Option<&str>) -> Option<Arc<pergola::icon::IconGeometry>> {
+    let g = pergola::icon::parse_icon(svg?);
+    (!g.is_empty() && g.sane()).then(|| Arc::new(g))
 }
 
 /// The heading over a status panel: the app's name, drawn by the bar.
@@ -167,7 +176,8 @@ fn merge_status(old: &[StatusShown], new: Vec<StatusItem>, dirty: Option<&Arc<At
         if let StatusContent::Panel(p) = &item.content {
             controls.sync(p);
         }
-        StatusShown { item, open, controls }
+        let vector = status_vector(item.svg.as_deref());
+        StatusShown { item, open, controls, vector }
     }).collect())
 }
 
@@ -382,8 +392,11 @@ impl View for BarView {
                         let (pieces, _) = status_panel::laid_out(&panel, inner.x(), inner.y() + STATUS_PANEL_HEAD, inner.w());
                         status_panel::draw(ctx, &pieces, &controls, &sink);
                     })
-                    .icon(s.item.glyph, 15.0, Some(t.text_secondary()))
                     .attached();
+                    let button = match &s.vector {
+                        Some(v) => button.vector_icon(v.clone(), s.item.glyph, 15.0, Some(t.text_secondary())),
+                        None => button.icon(s.item.glyph, 15.0, Some(t.text_secondary())),
+                    };
                     ctx.place(button);
                     continue;
                 }
@@ -408,8 +421,11 @@ impl View for BarView {
                     }
                     st2.store(true, Ordering::Relaxed);
                 })
-                .icon(s.item.glyph, 15.0, Some(t.text_secondary()))
                 .attached();
+                let button = match &s.vector {
+                    Some(v) => button.vector_icon(v.clone(), s.item.glyph, 15.0, Some(t.text_secondary())),
+                    None => button.icon(s.item.glyph, 15.0, Some(t.text_secondary())),
+                };
                 ctx.place(button);
             }
             ctx.pop();
@@ -941,6 +957,7 @@ mod tests {
         StatusItem {
             app_id: "org.test.vpn".into(),
             glyph: phosphor::LOCK_SIMPLE,
+            svg: None,
             tooltip: "VPN".into(),
             content: StatusContent::Menu(vec![
                 StatusEntry::Check { label: "Connected".into(), on: true, enabled: true },
@@ -966,6 +983,23 @@ mod tests {
         assert_eq!(items[2].mark, pergola::widgets::popup::Mark::Radio(true));
         assert!(!items[3].enabled);
         assert_eq!(items[4].slider, Some(0.25));
+    }
+
+    #[test]
+    fn a_status_item_draws_its_vector_icon_or_falls_back_to_its_glyph() {
+        let ok = status_vector(Some(r#"<svg viewBox="0 0 24 24"><path d="M5 12h14M12 5v14"/></svg>"#));
+        assert!(ok.is_some());
+        assert!(status_vector(Some(r#"<path d="M5 12L500 12"/>"#)).is_none(), "outside its box");
+        assert!(status_vector(Some("not an icon")).is_none());
+        assert!(status_vector(None).is_none());
+        // Drawn as strokes (Path nodes), not the glyph.
+        pergola::text::clear_measurer();
+        let view = sample_view();
+        let mut item = sample_item(1);
+        item.svg = Some(r#"<path d="M5 12h14M12 5v14"/>"#.into());
+        view.status.set(merge_status(&[], vec![item], None).unwrap());
+        let (tree, _) = render(&view, Semantic::LIGHT);
+        assert!(tree.iter().any(|(_, x)| matches!(x, Node::Path { .. })));
     }
 
     #[test]
@@ -1002,6 +1036,7 @@ mod tests {
         let item = StatusItem {
             app_id: "org.test.clip".into(),
             glyph: phosphor::CLIPBOARD,
+            svg: None,
             tooltip: "Clipboard".into(),
             content: StatusContent::Panel(StatusPanel {
                 width: 280,

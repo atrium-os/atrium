@@ -13,8 +13,11 @@ use forum_ctl::{
     StatusPanel, StatusText, StatusValue, ToStatus,
 };
 
-/// Phosphor "clipboard".
+/// Phosphor "clipboard": shown if the vector icon is refused.
 const GLYPH: char = '\u{e196}';
+/// The app's own vector icons, from its bundle: one per state.
+const ICON: &str = include_str!("status-item-icons/clipboard.svg");
+const ICON_PAUSED: &str = include_str!("status-item-icons/clipboard-paused.svg");
 const MODES: [&str; 2] = ["Text only", "Everything"];
 
 struct State {
@@ -81,7 +84,8 @@ fn menu(s: &State) -> StatusContent {
 
 fn send(sock: &mut UnixStream, s: &State, as_menu: bool) -> std::io::Result<()> {
     let content = if as_menu { menu(s) } else { panel(s) };
-    let m = ToStatus::Set { glyph: GLYPH, tooltip: "Clipboard history".into(), content };
+    let svg = Some(if s.paused { ICON_PAUSED } else { ICON }.to_string());
+    let m = ToStatus::Set { glyph: GLYPH, svg, tooltip: "Clipboard history".into(), content };
     let b = encode(&m).map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
     write_frame(sock, &b)
 }
