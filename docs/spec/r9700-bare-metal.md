@@ -149,6 +149,28 @@ After that, the step waits for RLC bootload complete and logs `GB_ADDR_CONFIG`. 
 reload of the IP firmware, which the PSP already holds this boot. Until `GB_ADDR_CONFIG`
 reads non-zero, all-zero GC registers mean "off", not "idle".
 
+## 4.4 Stage 4 plan: GMC, IH, CP/MES, first dispatch
+
+Gated on power P1 + P2 (done 2026-11-12: telemetry, GC idle sequence proven by telemetry,
+mode 1 reset on detach). Every step below is another opt-in hook, runs after stage 3 +
+the idle sequence, re-checks idle in telemetry, and ends in the mode 1 reset, so a box run
+never leaves the card powered or hot. Each step logs its registers and is checked before
+the next. Interfaces are Linux's MIT-licensed files, selected by discovered IP version:
+
+| Step | What | Linux source | IP |
+|---|---|---|---|
+| 4a | **Hubs and GART.** FB location, AGP/system apertures, VMID0 GART page table in VRAM (inside the driver's area, clear of the PSP reservations at 0x7f3e00000 / 0x7d6c00000), L2 + TLB setup, context 0 enable, TLB invalidate on engine 17 with ack | gmc_v12_0.c, gfxhub_v12_0.c, mmhub_v4_1_0.c | GC 12, MMHUB 4.1 |
+| 4b | **IH ring.** Ring in system memory through the GART, rptr/wptr, MSI-X; a self-test interrupt | ih_v7_0.c, amdgpu_ih.c | OSSSYS 7.0 |
+| 4c | **GFX remainder.** Golden registers, constants (SH_MEM per VMID, compute VMIDs), RS64 config, gfxhub enable; CP stays halted | gfx_v12_0.c | GC 12 |
+| 4d | **MES.** MES and KIQ pipes unhalted, MES ring, SET_HW_RESOURCES, the MES API for ADD/REMOVE_QUEUE; the HQD dequeue handshake and TLB-invalidate ack (`cp.c` / `rs/queue.rs` TODOs) | mes_v12_0.c, amdgpu_mes.c | GC 12 (MES 12) |
+| 4e | **First dispatch.** One compute queue through MES, doorbell, EOP fence to the IH; result compared against the oracle corpus | gfx_v12_0.c compute path | GC 12 |
+
+The gpusim-only registers in `atrium_gpu_amd.h` (0x2xxxx/0x3xxxx) stay gpusim's; silicon
+gets its own per-IP files (`gmc12.c`, `ih7.c`, `mes12.c`), picked by discovery version.
+After 4e, the driver stays attached on silicon for the first time, so P2's remaining parts
+(the scoped GfxOff guard, the attached teardown: CP/MES quiesce, defaults, then the reset)
+land with it.
+
 ## 5. Log
 
 - **2026-11-12, stage 1 done.** First bare-metal boot: bundle `03715a5` booted via
