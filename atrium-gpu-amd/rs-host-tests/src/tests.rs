@@ -236,3 +236,39 @@ fn r9700_ipinfo() {
         let _ = fill(&b[..n], &mut i);
     }
 }
+
+/// A PSP v2.0 file whose sub-binaries are `types`, each 8 bytes, in that order.
+fn psp_file(types: &[u32]) -> Vec<u8> {
+    let mut extra = std::vec![types.len() as u32];
+    for (i, t) in types.iter().enumerate() {
+        extra.extend_from_slice(&[*t, 0x100 + i as u32, (i * 8) as u32, 8]);
+    }
+    let mut f = fw_file(2, 0, &extra, types.len() * 8);
+    put32(&mut f, 4, 36); // real layout: header covers common + count only
+    f
+}
+
+#[test]
+fn psp_plan_orders_and_checks() {
+    use crate::psp_plan::*;
+    let mut s = [Step::default(); MAX_STEPS];
+    // File order (SOS first, as in psp_14_0_3_sos.bin) is not load order.
+    let f = psp_file(&[ty::SOS, ty::SYS_DRV, ty::KDB, ty::TOC, ty::SPL, ty::SOC_DRV, ty::INTF_DRV,
+        ty::DBG_DRV, ty::RAS_DRV, ty::IPKEYMGR_DRV]);
+    let n = plan(&f, &mut s).unwrap();
+    let cmds: Vec<u32> = s[..n].iter().map(|x| x.cmd).collect();
+    assert_eq!(cmds, [bl::LOAD_KEY_DATABASE, bl::LOAD_TOS_SPL_TABLE, bl::LOAD_SYSDRV, bl::LOAD_SOCDRV,
+        bl::LOAD_INTFDRV, bl::LOAD_DBGDRV, bl::LOAD_RASDRV, bl::LOAD_IPKEYMGRDRV, bl::LOAD_SOSDRV]);
+    // Regions point at each piece's own bytes.
+    let base = 32 + 4 + 16 * 10; // ucode array follows the table
+    assert_eq!((s[0].fw_type, s[0].offset, s[0].size), (ty::KDB, base as u32 + 16, 8));
+    assert_eq!((s[8].fw_type, s[8].offset), (ty::SOS, base as u32));
+    // SYS_DRV and SOS are required; duplicates are refused.
+    assert_eq!(plan(&psp_file(&[ty::SOS, ty::KDB]), &mut s), Err(PlanError::Missing(ty::SYS_DRV)));
+    assert_eq!(plan(&psp_file(&[ty::SYS_DRV]), &mut s), Err(PlanError::Missing(ty::SOS)));
+    assert_eq!(plan(&psp_file(&[ty::SOS, ty::SYS_DRV, ty::SOS]), &mut s), Err(PlanError::Duplicate(ty::SOS)));
+    // Every truncation is an error, never a panic.
+    for n in 0..f.len() {
+        let _ = plan(&f[..n], &mut s);
+    }
+}

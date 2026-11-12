@@ -9,6 +9,8 @@ pub mod fw;
 pub mod discovery;
 #[path = "../../rs/ipinfo.rs"]
 pub mod ipinfo;
+#[path = "../../rs/psp_plan.rs"]
+pub mod psp_plan;
 
 #[cfg(test)]
 extern crate std;

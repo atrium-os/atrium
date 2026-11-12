@@ -25,13 +25,16 @@ mod fw;
 #[allow(dead_code)]
 #[path = "../../rs/discovery.rs"]
 mod discovery;
+#[allow(dead_code)]
+#[path = "../../rs/psp_plan.rs"]
+mod psp_plan;
 mod mmio;
 
 use std::path::Path;
 use std::process::exit;
 
 fn usage() -> ! {
-    eprintln!("usage: atrium-gpu-probe fw <dir> | discovery <file> | pci <bdf|sysfs-dir> [--vram-top] [--save <file>] [--status [--discovery <file>]]");
+    eprintln!("usage: atrium-gpu-probe fw <dir> | psp-plan <psp_*_sos.bin> | discovery <file> | pci <bdf|sysfs-dir> [--vram-top] [--save <file>] [--status [--discovery <file>]]");
     exit(2)
 }
 
@@ -39,6 +42,15 @@ fn main() {
     let a: Vec<String> = std::env::args().skip(1).collect();
     match a.first().map(String::as_str) {
         Some("fw") if a.len() == 2 => fw_dir(Path::new(&a[1])),
+        Some("psp-plan") if a.len() == 2 => {
+            let b = std::fs::read(&a[1]).unwrap_or_else(|e| die(&format!("{}: {e}", a[1])));
+            let mut st = [psp_plan::Step::default(); psp_plan::MAX_STEPS];
+            let n = psp_plan::plan(&b, &mut st).unwrap_or_else(|e| die(&format!("psp plan: {e:?}")));
+            for (i, s) in st[..n].iter().enumerate() {
+                println!("[{i}] type {:>2} version {:#010x} offset {:#08x} size {:>7} cmd {:#x}",
+                    s.fw_type, s.fw_version, s.offset, s.size, s.cmd);
+            }
+        }
         Some("discovery") if a.len() == 2 => {
             let b = std::fs::read(&a[1]).unwrap_or_else(|e| die(&format!("{}: {e}", a[1])));
             print_discovery(&b);
