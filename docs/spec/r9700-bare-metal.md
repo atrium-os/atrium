@@ -125,3 +125,11 @@ not in the normal attach, so a hang cannot happen at boot.
   7.0.1, MMHUB 4.1.0, OSSSYS 7.0.0, HDP 7.0.0, NBIF 6.3.1, DCN 4.1.0, VCN 5.0.0, ISA gfx1201,
   and refused to attach (ENXIO, "silicon bring-up not implemented yet"). `devctl set driver
   -f pci0:3:0:0 vgapci` gave the device back; `kldunload` clean; no panic.
+- **2026-11-12, stage 3 step 1: sOS up.** With `kenv hw.atrium_gpu.psp_bootload=1`, the base
+  module (`fff21d6f`) loaded `psp_14_0_3_sos.bin` (linux-firmware, 435632 bytes, sha256
+  28469a08…) into the PSP bootloader in 9 steps (KDB, SPL, SYS, SOC, INTF, HAD, RAS,
+  IPKEYMGR, SOS), staging through VRAM+64 MiB = MC 0x8004000000. Afterwards C2PMSG_81 counts
+  (sOS alive), C2PMSG_64 = 0x80c00000 (ring mailbox ready), C2PMSG_63 0xffffffff -> 2. No
+  hang; device handed back to vgapci, module unloaded. The sOS keeps running until a cold
+  boot, so later loads take the "already running" path. Next: KM ring, TMR, then IP
+  microcode through the PSP.

@@ -106,7 +106,8 @@ amd_psp_bootload(struct atrium_amd_softc *sc)
 
 	snprintf(name, sizeof(name), "amdgpu/psp_%u_%u_%u_sos.bin",
 	    sc->ip.mp0.major, sc->ip.mp0.minor, sc->ip.mp0.rev);
-	fw = firmware_get(name);
+	/* NOWARN: firmware(9) first tries a .ko by that name and logs the miss. */
+	fw = firmware_get_flags(name, FIRMWARE_GET_NOWARN);
 	if (fw == NULL) {
 		device_printf(sc->dev, "psp: no /boot/firmware/%s\n", name);
 		return (ENOENT);
