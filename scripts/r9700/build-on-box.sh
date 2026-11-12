@@ -7,6 +7,9 @@
 #   sh scripts/r9700/build-on-box.sh build    # kernel, kmods, helper VM, bundle
 #   sh scripts/r9700/build-on-box.sh testboot # boot the bundle under KVM, check ssh
 #
+# Run `build` from a shell or `systemd-run --unit=atrium-build`, never under
+# nohup: bmake's bootstrap self-tests send SIGINT, which nohup jobs ignore.
+#
 # Expects the atrium checkout at ~/atrium and atrium-os/freebsd-src (branch
 # atrium-os) at ~/freebsd-src. Everything else lives under ~ and /root/obj-amd64.
 set -eu
@@ -24,7 +27,7 @@ deps)
     DEBIAN_FRONTEND=noninteractive apt-get install -y -q \
         clang-19 lld-19 llvm-19 llvm-19-dev libclang-19-dev flex bison libarchive-dev time \
         qemu-system-x86 qemu-utils ovmf gdisk mtools dosfstools zstd xz-utils curl git \
-        build-essential pkg-config openssh-client python3
+        build-essential pkg-config openssh-client python3 bc
     say "rust"
     command -v rustup >/dev/null || curl -fsS https://sh.rustup.rs | sh -s -- -y --profile minimal
     . "$HOME/.cargo/env"
