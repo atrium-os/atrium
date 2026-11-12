@@ -30,6 +30,11 @@ atrium_netbymac_start()
 		for ifn in $(ifconfig -l ether); do
 			if ifconfig "$ifn" ether | grep -qi "ether $mac"; then
 				[ "$ifn" = wan0 ] || ifconfig "$ifn" name wan0 >/dev/null
+				# rc.conf was already read by /etc/rc, so netif and
+				# routing would not see new values until the next
+				# boot: configure now, and record them for later boots.
+				ifconfig wan0 inet "$cidr" up
+				route -q add default "$gw" >/dev/null 2>&1 || route -q change default "$gw" >/dev/null
 				sysrc -q ifconfig_wan0="inet $cidr" >/dev/null
 				sysrc -q defaultrouter="$gw" >/dev/null
 				: > /etc/resolv.conf
