@@ -119,6 +119,12 @@ struct hub_gen {
 	uint32_t eng_distance, eng_addr_distance;
 	uint32_t l2_cntl3_default;
 	bool	retry_int, use_sem;
+	/*
+	 * amdgpu's gmc.translate_further for this GC: set only for GC 12.1
+	 * (5-level); GC 12.0.x leaves it off. It picks the L2 bank select /
+	 * BigK fragment (12/9 vs 9/6) and whether PDB1 entries carry BFS 9.
+	 */
+	bool	translate_further;
 };
 
 static const struct hub_gen hub_gens[] = {
@@ -144,7 +150,7 @@ static const struct hub_gen hub_gens[] = {
 		.inv_range_lo = 0x166b, .inv_range_hi = 0x166c,
 		.eng_distance = 1, .eng_addr_distance = 2,
 		.l2_cntl3_default = 0x80120007, .retry_int = true,
-		.use_sem = false,
+		.use_sem = false, .translate_further = false,
 	},
 	{
 		.name = "MMHUB 4.1", .gc = false, .major = 4, .minor = 1,
@@ -168,7 +174,7 @@ static const struct hub_gen hub_gens[] = {
 		.inv_range_lo = 0x05ab, .inv_range_hi = 0x05ac,
 		.eng_distance = 1, .eng_addr_distance = 2,
 		.l2_cntl3_default = 0x80100007, .retry_int = false,
-		.use_sem = true,
+		.use_sem = true, .translate_further = false,
 	},
 };
 
@@ -263,13 +269,14 @@ hub_gart_enable(struct hub *h, const struct amd_gart *gt)
 	    L1_TLB_ECO_BITS | L1_TLB_MTYPE, L1_TLB_ENABLE |
 	    L1_TLB_SYSTEM_ACCESS | L1_TLB_ADVANCED_MODEL | (3u << 11));
 
-	/* L2 cache (translate_further: bank select 12, BigK fragment 9). */
+	/* L2 cache (init_cache_regs; bank select / BigK per translate_further). */
 	hrmw(h, g->l2_cntl, L2_FRAGMENT | L2_PDE0_TAG_MODE |
 	    L2_PDE_FAULT_CLASS | L2_CTX1_IDENTITY_MODE | L2_IDENTITY_FRAG,
 	    L2_ENABLE | L2_DEFAULT_PAGE_OUT | (1u << 19));
 	hrmw(h, g->l2_cntl2, 0, L2_CNTL2_INV_L1_TLBS | L2_CNTL2_INV_L2_CACHE);
 	hw(h, g->l2_cntl3, (g->l2_cntl3_default &
-	    ~(L2_CNTL3_BANK_SELECT | L2_CNTL3_BIGK_FRAG)) | 12u | (9u << 15));
+	    ~(L2_CNTL3_BANK_SELECT | L2_CNTL3_BIGK_FRAG)) |
+	    (g->translate_further ? 12u | (9u << 15) : 9u | (6u << 15)));
 	hw(h, g->l2_cntl4, 0x000000c1 & ~(L2_CNTL4_PDE_PHYS |
 	    L2_CNTL4_PTE_PHYS));
 	hw(h, g->l2_cntl5, 0x00003fe0 & ~L2_CNTL5_SMALLK_FRAG);
@@ -510,8 +517,10 @@ amd_gmc12_gart_disable(struct amd_gart *gt)
  * VRAM pool (PDB2 root, PDB1, PDB0, PTB; 512 entries each), written
  * through BAR0 like the GART table. PDEs point at VRAM by physical FB
  * address and are just VALID (amdgpu_gmc_get_pde_for_bo for a VRAM BO);
- * entries in a PDB1 also carry block fragment size 9 (translate_further,
- * gmc_v12_0_get_vm_pde). A new PTB is filled with the invalid-PTE pattern
+ * only with translate_further (GC 12.1, not 12.0) do entries in a PDB1
+ * also carry block fragment size 9 (gmc_v12_0_get_vm_pde). Silicon run
+ * 20261112T215929Z set BFS 9 on GC 12.0.1 and the walker refused the
+ * table (WALKER_ERROR 5). A new PTB is filled with the invalid-PTE pattern
  * (EXECUTABLE | IS_PTE, amdgpu_vm_pte_update_flags), and so is an unmapped
  * page. A mapped system page is VALID | SYSTEM | SNOOPED plus R/W/X and
  * MTYPE NC (gmc_v12_0_get_vm_pte, AMDGPU_VM_MTYPE_DEFAULT).
@@ -574,8 +583,13 @@ pool_alloc(struct amd_vm12 *vm, bool ptb, bus_size_t *off)
 int
 amd_gmc12_vm_init(struct amd_gart *gt, struct amd_vm12 *vm)
 {
+	const struct hub_gen *g = hub_find(gt->sc, true);
+
 	memset(vm, 0, sizeof(*vm));
 	vm->gt = gt;
+	if (g == NULL)
+		return (ENOTSUP);
+	vm->translate_further = g->translate_further;
 	if (!gt->enabled || rman_get_size(gt->vram) < VM_POOL_VRAM_OFF +
 	    (bus_size_t)VM_POOL_PAGES * PAGE_SIZE)
 		return (ENXIO);
@@ -611,8 +625,8 @@ vm_walk(struct amd_vm12 *vm, uint64_t va, bool alloc, bus_size_t *pte_off)
 			if (err != 0)
 				return (err);
 			pde = pool_phys(vm, child) | PTE_VALID;
-			if (lvl == 1)		/* an entry in a PDB1 */
-				pde |= PDE_BFS(9);
+			if (lvl == 1 && vm->translate_further)
+				pde |= PDE_BFS(9);	/* an entry in a PDB1 */
 			pool_wr(vm, off + idx * 8, pde);
 		}
 		if (!pool_off_of(vm, pde, &off))

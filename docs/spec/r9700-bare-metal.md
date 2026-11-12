@@ -535,3 +535,12 @@ through fd passing, close and jail death.
   again (page must stay poisoned, fault latched). Interrupts for VM faults stay off for
   now (5c wires fault IVs to the owning queue). Faulting writes land in the shared dummy
   page; the test reports and re-zeroes it (5c: a per-client dummy or discard).
+- 2026-11-12 22:00, 5b run c7dac886 FAILED (one run, card reset cold, no panic, stray 0;
+  log /root/runs/20261112T215929Z.log). Everything through the VMID 0 dispatch passed; then
+  the VMID 1 IB fetch at 0x1_0000_1000 hung with no fence in 1 s and GFXHUB latched a
+  VMID 1 read fault there (status 0x1009ba: WALKER_ERROR 5, MAPPING_ERROR, CID 4; IV
+  client 0xa vmid 1). Cause: I applied amdgpu's translate_further settings, but
+  gmc_v12_0 sets translate_further only for GC 12.1. GC 12.0.x runs without it: no BFS
+  in PDB1 entries, L2 bank select 9 / BigK fragment 6. The walker rejected the BFS 9
+  PDE. Fix: translate_further is now a per-GC-version row field (false for 12.0), used
+  for both the L2_CNTL3 values and the PDE format.

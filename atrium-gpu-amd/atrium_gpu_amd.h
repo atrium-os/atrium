@@ -845,6 +845,7 @@ struct amd_vm12 {
 	struct amd_gart *gt;
 	bus_size_t root_off;		/* PDB2, in BAR0 */
 	u_int	used;			/* pool pages handed out */
+	bool	translate_further;	/* GC's PDE format variant */
 };
 #define AMD_VM_READ	0x1u
 #define AMD_VM_WRITE	0x2u
