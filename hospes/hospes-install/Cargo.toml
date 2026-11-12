@@ -1,0 +1,15 @@
+[package]
+name = "hospes-install"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+description = "Install a foreign library for Hospes: Widevine from a user's file or Google's signed Chrome package (docs/spec/hospes.md §12)"
+
+[dependencies]
+hospes-elf = { path = "../hospes-elf" }
+hospes-glibc = { path = "../hospes-glibc" }
+pgp = "0.21"
+sha2 = "0.10"
+ar = "0.9"
+tar = { version = "0.4", default-features = false }
+lzma-rs = "0.3"
