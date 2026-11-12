@@ -835,7 +835,7 @@ mes_run(struct mes *m)
 	const struct mes_gen *g = m->g;
 	struct atrium_amd_softc *sc = m->sc;
 	uint32_t d;
-	int err, p, i;
+	int err, p, i, attempt;
 
 	/* NBIF: doorbell aperture on, GC doorbell routing (gc_doorbell_init). */
 	d = amd_mmio_read32(sc, nbreg(sc, g->nbif_db_aper_en));
@@ -862,35 +862,58 @@ mes_run(struct mes *m)
 	amd_gfx12_pm_report(sc, "before MES");
 	if ((err = cp_resume(m)) != 0)
 		return (err);
-	mes_enable(m, true);
 	/*
 	 * Both pipes must be running the firmware before any queue is made
 	 * active on them. Box run f4265f28: pipe 1 was still at instr 0x1,
 	 * GP3 0 500 us after the start; its HQD was activated anyway, the
 	 * wptr post wedged CPF and CPC, and the dequeue timed out. Wait for
 	 * each pipe's firmware version (GP3) to appear, up to 100 ms.
+	 *
+	 * Box runs 20:36-21:04: the start is intermittent; a pipe that does
+	 * not start faults in the GFX hub at 0x3f01NN000, i.e. its own data
+	 * addresses (0xfffffffff01NN000) truncated to 34 bits, as if its
+	 * local data aperture were not in effect. Try the start up to three
+	 * times, halting (pipe reset, icache invalidate) between attempts,
+	 * and log each attempt; still refuse if none takes.
 	 */
-	for (p = 0; p < 2; p++) {
-		uint32_t gp3 = 0;
-		int us;
+	for (attempt = 1; attempt <= 3; attempt++) {
+		bool up = true;
 
-		grbm_select(m, 3, p);
-		for (us = 0; us < 100000; us += 100) {
-			if ((gp3 = rd(m, g->mes_gp3_lo)) != 0)
-				break;
-			DELAY(100);
+		for (p = 0; p < 2; p++) {
+			grbm_select(m, 3, p);
+			wr(m, g->mes_gp3_lo, 0);
 		}
 		grbm_select(m, 0, 0);
-		if (gp3 == 0) {
-			mes_report(m, "pipe not started");
-			mes_placement(m, "pipe not started");
-			amd_gmc12_fault_report(m->gt, "pipe not started");
-			device_printf(sc->dev, "mes: pipe %d firmware not running "
-			    "100 ms after the start; no queues made active\n", p);
-			return (ENXIO);
+		mes_enable(m, true);
+		for (p = 0; p < 2; p++) {
+			uint32_t gp3 = 0;
+			int us;
+
+			grbm_select(m, 3, p);
+			for (us = 0; us < 100000; us += 100) {
+				if ((gp3 = rd(m, g->mes_gp3_lo)) != 0)
+					break;
+				DELAY(100);
+			}
+			grbm_select(m, 0, 0);
+			device_printf(sc->dev, "mes: attempt %d: pipe %d %s "
+			    "(GP3 %#x) after %d us\n", attempt, p, gp3 != 0 ?
+			    "firmware up" : "NOT started", gp3, us);
+			if (gp3 == 0)
+				up = false;
 		}
-		device_printf(sc->dev, "mes: pipe %d firmware up (version %#x) "
-		    "%d us after the start wait began\n", p, gp3, us);
+		if (up)
+			break;
+		mes_report(m, "pipe not started");
+		mes_placement(m, "pipe not started");
+		amd_gmc12_fault_report(m->gt, "pipe not started");
+		mes_enable(m, false);
+		DELAY(1000);
+	}
+	if (attempt > 3) {
+		device_printf(sc->dev, "mes: MES did not start in 3 attempts; "
+		    "no queues made active\n");
+		return (ENXIO);
 	}
 	mes_report(m, "started");
 

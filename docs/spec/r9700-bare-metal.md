@@ -424,3 +424,14 @@ land with it.
   the doorbell ranges and un-halts MEC and PFP/ME, idle with no rings, before
   mes kiq_hw_init starts MES; we started MES with them halted. Next (a07d1fdd): do the same
   before MES, halt them again after, and set gfx_hqd_mask back to 0xfe.
+- **2026-11-12 21:05, a07d1fdd: pipe 1 failed to start again; the fault is pinned down.**
+  When it failed, the GFXHUB held a VMID 0 fault: status 0x40b53, addr page 0x3f017f.
+  That ties the client-0xa src-0 IVs (pages 0x3f0110..0x3f017f) to UTCL2 faults from the
+  non-starting pipe. 0x3f01NN000 is 0xfffffffff01NN000 truncated to 34 bits, i.e. the
+  pipe's own data-segment addresses (MDBASE window 0xfffffffff0100000, bound 512 KiB) going
+  through GPUVM, as if its local data aperture were not in effect yet. Before the start,
+  IC/MD bases are sane and no hub faults are latched. After a start, LOCAL_BASE0 reads
+  0xf0100000 on both pipes. CP running before MES (CP_ME_CNTL 0xa000, MEC 0x3c000000,
+  CP_STAT 0) and halting it again afterwards both worked. With MES failed, the card was
+  proven idle at 16 W. Next: retry the start up to 3 times (halt + pipe reset + icache
+  invalidate between attempts), each attempt logged.
