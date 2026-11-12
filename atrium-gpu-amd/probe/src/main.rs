@@ -234,13 +234,31 @@ fn status_regs(hw: u16, major: u8) -> Option<&'static [(usize, usize, &'static s
             (0x559, 0, "MMMC_VM_SYSTEM_APERTURE_LOW"),
             (0x55a, 0, "MMMC_VM_SYSTEM_APERTURE_HIGH"),
         ]),
+        // GC 12.x (gc_12_0_0_offset.h): is graphics powered, and how far did
+        // the RLC/IMU boot get? GB_ADDR_CONFIG is never 0 on a powered GC.
+        (GC, 12) => Some(&[
+            (0x13de, 0, "GB_ADDR_CONFIG"),
+            (0x0da4, 0, "GRBM_STATUS"),
+            (0x0da2, 0, "GRBM_STATUS2"),
+            (0x0f40, 0, "CP_STAT"),
+            (0x4c00, 1, "RLC_CNTL"),
+            (0x4c04, 1, "RLC_STAT"),
+            (0x4c43, 1, "RLC_PG_CNTL"),
+            (0x4e6c, 1, "RLC_GPM_STAT"),
+            (0x4e7c, 1, "RLC_RLCS_BOOTLOAD_STATUS"),
+            (0x40b6, 1, "GFX_IMU_CORE_CTRL"),
+            (0x40bc, 1, "GFX_IMU_GFX_RESET_CTRL"),
+            (0x0803, 1, "CP_ME_CNTL"),
+            (0x2904, 1, "CP_MEC_RS64_CNTL"),
+            (0x2807, 1, "CP_MES_CNTL"),
+        ]),
         _ => None,
     }
 }
 
 fn print_status(m: &mmio::Device, bin: &[u8]) {
     let d = discovery::Discovery::parse(bin).unwrap_or_else(|e| die(&format!("discovery: {e:?}")));
-    for hw in [discovery::hwid::MP0, discovery::hwid::MP1, discovery::hwid::MMHUB] {
+    for hw in [discovery::hwid::MP0, discovery::hwid::MP1, discovery::hwid::MMHUB, discovery::hwid::GC] {
         let ip = match d.find(hw, 0) {
             Ok(Some(ip)) => ip,
             _ => { println!("{}: not in the discovery table", hw_name(hw)); continue; }
