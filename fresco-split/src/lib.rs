@@ -46,6 +46,9 @@ pub enum Role {
     Chrome = 4,
     /// Toasts: frescod grants it only to the uids it is configured with.
     Notification = 5,
+    /// A pop-up to be (docs/spec/fresco-popups.md): the broker keeps it
+    /// off screen until its [`Msg::PopupPlace`] makes it one.
+    Popup = 6,
 }
 
 impl Role {
@@ -57,6 +60,7 @@ impl Role {
             3 => Role::Background,
             4 => Role::Chrome,
             5 => Role::Notification,
+            6 => Role::Popup,
             _ => return None,
         })
     }
@@ -164,6 +168,16 @@ pub enum Msg {
     /// the one used last) for `window` whatever has focus, or (`claim`
     /// false) gives it back.
     PadClaim { window: u32, device: u32, claim: bool },
+    /// From the renderer: `window` (created with [`Role::Popup`]) is a
+    /// pop-up of `parent` hanging from `anchor` (fresco-popups.md §3), or
+    /// is placed again. `side`/`align`: `fresco_protocol::popup_side` /
+    /// `popup_align`.
+    PopupPlace { window: u32, parent: u32, anchor: [f32; 4], side: u8, align: u8, width: u32, height: u32, grab: bool },
+    /// From the broker: where the pop-up landed, in its parent.
+    PopupPlaced { window: u32, x: f32, y: f32, width: u32, height: u32, side: u8 },
+    /// From the broker: the pop-up went off screen
+    /// (`fresco_protocol::popup_dismiss`).
+    PopupDismissed { window: u32, reason: u8 },
     /// Two video slots of `bytes` each for the layer follow as fds.
     VideoSlots { window: u32, layer: u32, bytes: u32 },
     /// The broker has copied video slot `slot` out; it may be filled again.
@@ -231,6 +245,9 @@ mod kind {
     pub const PAD_AXIS: u32 = 0x118;
     pub const PAD_CLAIMED: u32 = 0x119;
     pub const PAD_CLAIM: u32 = 12;
+    pub const POPUP_PLACE: u32 = 13;
+    pub const POPUP_PLACED: u32 = 0x150;
+    pub const POPUP_DISMISSED: u32 = 0x151;
     pub const VIDEO_RING: u32 = 7;
     pub const VIDEO_FRAME: u32 = 8;
     pub const VIDEO_PLACE: u32 = 9;
@@ -308,6 +325,9 @@ impl Msg {
             | Msg::PadConnect { window, .. }
             | Msg::Pad { window, .. }
             | Msg::PadClaim { window, .. }
+            | Msg::PopupPlace { window, .. }
+            | Msg::PopupPlaced { window, .. }
+            | Msg::PopupDismissed { window, .. }
             | Msg::VideoRing { window, .. }
             | Msg::VideoFrame { window, .. }
             | Msg::VideoPlace { window, .. }
@@ -486,6 +506,31 @@ impl Msg {
                 r.put(4, *value as u32);
                 r
             }
+            Msg::PopupPlace { window, parent, anchor, side, align, width, height, grab } => {
+                let mut r = Rec::new(POPUP_PLACE, *window);
+                r.put(2, *parent);
+                r.put(3, *width);
+                r.put(4, *height);
+                r.put(5, *side as u32 | (*align as u32) << 8 | (*grab as u32) << 16);
+                for (i, v) in anchor.iter().enumerate() {
+                    r.put(8 + i, v.to_bits());
+                }
+                r
+            }
+            Msg::PopupPlaced { window, x, y, width, height, side } => {
+                let mut r = Rec::new(POPUP_PLACED, *window);
+                r.put(2, x.to_bits());
+                r.put(3, y.to_bits());
+                r.put(4, *width);
+                r.put(5, *height);
+                r.put(6, *side as u32);
+                r
+            }
+            Msg::PopupDismissed { window, reason } => {
+                let mut r = Rec::new(POPUP_DISMISSED, *window);
+                r.put(2, *reason as u32);
+                r
+            }
             Msg::PadClaim { window, device, claim } => {
                 let mut r = Rec::new(PAD_CLAIM, *window);
                 r.put(2, *device);
@@ -614,6 +659,9 @@ impl Msg {
             PAD_DISCONNECT => (1, false),
             PAD_BUTTON | PAD_AXIS | PAD_CLAIMED => (3, false),
             PAD_CLAIM => (2, false),
+            POPUP_PLACE => (4, false),
+            POPUP_PLACED => (5, false),
+            POPUP_DISMISSED => (1, false),
             VIDEO_RING => (3, false),
             VIDEO_FRAME | VIDEO_PRESENTED => (5, false),
             VIDEO_PLACE => (6, false),
@@ -642,7 +690,8 @@ impl Msg {
             s.to_string()
         } else {
             // Key and button records carry the activation token in 32..48.
-            let tail = if matches!(k, KEY | BUTTON | DRAG_BEGIN | DROP | EMBED_TOKEN) { 48 } else { 32 };
+            // POPUP_PLACE its anchor.
+            let tail = if matches!(k, KEY | BUTTON | DRAG_BEGIN | DROP | EMBED_TOKEN | POPUP_PLACE) { 48 } else { 32 };
             if r.0[tail..].iter().any(|&c| c != 0) {
                 return Err(Refused("unused field not zero"));
             }
@@ -800,6 +849,34 @@ impl Msg {
             },
             PAD_DISCONNECT => Msg::Pad { window, kind: k, device: r.get(2), usage: 0, value: 0 },
             PAD_CLAIM => Msg::PadClaim { window, device: r.get(2), claim: flag(r.get(3))? },
+            POPUP_PLACE => {
+                let anchor = [finite(r.get(8))?, finite(r.get(9))?, finite(r.get(10))?, finite(r.get(11))?];
+                let packed = r.get(5);
+                if packed >> 17 != 0 || packed & 0xff > 3 || (packed >> 8) & 0xff > 2 {
+                    return Err(Refused("pop-up side, align or grab"));
+                }
+                let parent = r.get(2);
+                if parent == 0 || parent > u16::MAX as u32 || parent == window {
+                    return Err(Refused("pop-up parent"));
+                }
+                Msg::PopupPlace {
+                    window, parent, anchor,
+                    side: packed as u8, align: (packed >> 8) as u8, grab: packed >> 16 != 0,
+                    width: dim(r.get(3))?, height: dim(r.get(4))?,
+                }
+            }
+            POPUP_PLACED => {
+                if r.get(6) > 3 {
+                    return Err(Refused("pop-up side"));
+                }
+                Msg::PopupPlaced { window, x: finite(r.get(2))?, y: finite(r.get(3))?, width: dim(r.get(4))?, height: dim(r.get(5))?, side: r.get(6) as u8 }
+            }
+            POPUP_DISMISSED => {
+                if r.get(2) > 2 {
+                    return Err(Refused("pop-up dismissal reason"));
+                }
+                Msg::PopupDismissed { window, reason: r.get(2) as u8 }
+            }
             PAD_BUTTON | PAD_AXIS | PAD_CLAIMED => {
                 let value = r.get(4) as i32;
                 let ok = if k == PAD_AXIS { (-32768..=32767).contains(&value) } else { (0..=1).contains(&value) };
@@ -829,6 +906,7 @@ impl Msg {
                 | Msg::VideoDestroy { .. }
                 | Msg::VideoRate { .. }
                 | Msg::PadClaim { .. }
+                | Msg::PopupPlace { .. }
         )
     }
 }

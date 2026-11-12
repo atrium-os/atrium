@@ -395,6 +395,21 @@ impl EnvelopeFrontend {
 
     pub fn set_display_mode(&mut self, width: u32, height: u32, refresh_mhz: u32) {
         self.display_mode = (width, height, refresh_mhz);
+        self.update_popup_bounds();
+    }
+
+    /// Keep pop-ups on the monitors (fresco-popups.md): each shown
+    /// output's rect, else the display mode's.
+    fn update_popup_bounds(&mut self) {
+        let mut b: Vec<[f32; 4]> = self.outputs.outputs.iter()
+            .filter(|o| o.present && o.mirror_of == 0 && o.rect.w > 0 && o.rect.h > 0)
+            .map(|o| [o.rect.x as f32, o.rect.y as f32, o.rect.w as f32, o.rect.h as f32])
+            .collect();
+        let (w, h, _) = self.display_mode;
+        if b.is_empty() && w > 0 && h > 0 {
+            b.push([0.0, 0.0, w as f32, h as f32]);
+        }
+        self.compositor.lock().unwrap().popup_bounds = b;
     }
 
     /// The scanout mode and the reserved top rows (`OP_DISPLAY_INFO`).
@@ -413,6 +428,7 @@ impl EnvelopeFrontend {
     pub fn set_outputs(&mut self, outputs: Vec<fresco_protocol::WmOutput>) {
         self.outputs = fresco_protocol::WmOutputsReply { outputs };
         self.update_window_scales();
+        self.update_popup_bounds();
     }
 
     /// The monitors a span moved apart for its bezels, at the places they
@@ -671,6 +687,8 @@ impl EnvelopeFrontend {
             control::OP_WINDOW_REQUEST_CLOSE => self.handle_window_request_close(msg),
             control::OP_WINDOW_PRESENT       => self.handle_window_present(msg),
             control::OP_WINDOW_PRESENT_DAMAGE => self.handle_window_present_damage(msg),
+            control::OP_POPUP_CREATE         => self.handle_popup_create(msg),
+            control::OP_POPUP_PLACE          => self.handle_popup_place(msg),
 
             // ── Video layers (fresco-video.md) ──
             control::OP_VIDEO_LAYER_CREATE   => self.handle_video_layer_create(msg),
@@ -1379,6 +1397,38 @@ impl EnvelopeFrontend {
 
     // ── Window-management handlers ───────────────────────────────────
 
+    /// `OP_POPUP_CREATE` (docs/spec/fresco-popups.md): a pop-up window of
+    /// the client's, placed by frescod. Answered like `OP_WINDOW_CREATE`.
+    fn handle_popup_create(&mut self, msg: &Message) -> Result<Vec<Outbound>, DispatchError> {
+        let p: fresco_protocol::PopupCreatePayload = decode(&msg.payload).map_err(|_| DispatchError::BadPayload)?;
+        if self.embed_only.contains(&self.current_client) {
+            return Err(DispatchError::Forbidden);
+        }
+        let parent = u16::try_from(p.parent).map_err(|_| DispatchError::UnknownWindow)?;
+        let mut comp = self.compositor.lock().unwrap();
+        let id = comp
+            .open_popup(self.current_client as u32, parent, p.anchor, p.side, p.align, (p.width, p.height), p.grab)
+            .map_err(popup_refused)?;
+        if let Some(w) = comp.windows.get_mut(&id) {
+            w.owner_uid = self.client_uids.get(&self.current_client).copied().unwrap_or(0);
+        }
+        drop(comp);
+        self.update_window_scales();
+        let payload = encode(&(id as u32)).map_err(|_| DispatchError::BadPayload)?;
+        Ok(vec![Outbound { op: control::OP_POPUP_CREATE, flags: aqueduct::envelope::flag::IS_RESPONSE, payload, fds: Vec::new() }])
+    }
+
+    /// `OP_POPUP_PLACE`: place a pop-up again, or show a dismissed one.
+    fn handle_popup_place(&mut self, msg: &Message) -> Result<Vec<Outbound>, DispatchError> {
+        let p: fresco_protocol::PopupPlacePayload = decode(&msg.payload).map_err(|_| DispatchError::BadPayload)?;
+        let id = u16::try_from(p.window_id).map_err(|_| DispatchError::UnknownWindow)?;
+        self.compositor.lock().unwrap()
+            .replace_popup(self.current_client as u32, id, p.anchor, p.side, p.align, (p.width, p.height))
+            .map_err(popup_refused)?;
+        self.update_window_scales();
+        Ok(vec![Outbound { op: control::OP_POPUP_PLACE, flags: aqueduct::envelope::flag::IS_RESPONSE, payload: Vec::new(), fds: Vec::new() }])
+    }
+
     fn handle_window_create(&mut self, msg: &Message)
         -> Result<Vec<Outbound>, DispatchError>
     {
@@ -1478,7 +1528,7 @@ impl EnvelopeFrontend {
         let mut surfaces: Vec<WmSurfaceInfo> = comp.windows.values()
             // Window 0 is the implicit screen, not an app surface; slots
             // and hidden embeds are frescod's to place, not the WM's.
-            .filter(|w| w.id != 0 && !w.hidden && w.slot.is_none())
+            .filter(|w| w.id != 0 && !w.hidden && w.slot.is_none() && w.popup.is_none())
             .map(|w| WmSurfaceInfo {
                 surface_id: w.id as u32,
                 owner_app:  format!("client:{}", w.owner),
@@ -1547,7 +1597,7 @@ impl EnvelopeFrontend {
 
         // 1. geometry — apply each declared rect to the surface it names.
         for slot in &layout.slots {
-            if let Some(w) = comp.windows.get_mut(&(slot.surface_id as u16)).filter(|w| !w.hidden && w.slot.is_none()) {
+            if let Some(w) = comp.windows.get_mut(&(slot.surface_id as u16)).filter(|w| !w.hidden && w.slot.is_none() && w.popup.is_none()) {
                 w.pos  = (slot.rect.x as f32, slot.rect.y as f32);
                 w.size = (slot.rect.w as f32, slot.rect.h as f32);
             }
@@ -2246,6 +2296,14 @@ mod tests {
             let out = self.dispatch(control::OP_WM_SPAN_GROUP, encode(&p).unwrap())?;
             Ok(decode::<fresco_protocol::WmSpanGroupReply>(&out[0].payload).unwrap().rect)
         }
+        // Pads are frescod's (its socket layer answers these), not the
+        // frontend's.
+        fn pads(&mut self) -> std::io::Result<Vec<fresco_protocol::WmPad>> {
+            Ok(Vec::new())
+        }
+        fn pad_release(&mut self, _: u32) -> std::io::Result<()> {
+            Ok(())
+        }
     }
 
     #[test]
@@ -2353,5 +2411,15 @@ mod tests {
             Err(DispatchError::NotOwner) => {}
             other => panic!("expected NotOwner, got {other:?}"),
         }
+    }
+}
+
+/// A refused pop-up request as a dispatch error.
+fn popup_refused(e: crate::window::PopupRefused) -> DispatchError {
+    use crate::window::PopupRefused as R;
+    match e {
+        R::UnknownWindow => DispatchError::UnknownWindow,
+        R::NotActive => DispatchError::Forbidden,
+        R::Invalid => DispatchError::BadPayload,
     }
 }

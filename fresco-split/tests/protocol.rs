@@ -49,6 +49,11 @@ fn samples() -> Vec<Msg> {
         Msg::VideoSlots { window: 3, layer: 2, bytes: 8294400 },
         Msg::VideoDone { window: 3, layer: 2, slot: 0 },
         Msg::VideoPresented { window: 3, layer: 2, seq: 99, vblank_ns: u64::MAX - 5, dropped: 2 },
+        Msg::WindowCreate { window: 5, width: 200, height: 150, role: Role::Popup, pos: None, title: String::new(), embed_pending: false },
+        Msg::PopupPlace { window: 5, parent: 3, anchor: [1.0, 2.0, 30.0, 20.0], side: 0, align: 1, width: 200, height: 150, grab: true },
+        Msg::PopupPlace { window: 6, parent: 5, anchor: [0.0, 10.5, 200.0, 24.0], side: 2, align: 0, width: 160, height: 90, grab: false },
+        Msg::PopupPlaced { window: 5, x: -12.5, y: 22.0, width: 200, height: 150, side: 1 },
+        Msg::PopupDismissed { window: 5, reason: 0 },
     ]
 }
 

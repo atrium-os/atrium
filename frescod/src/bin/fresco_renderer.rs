@@ -93,6 +93,9 @@ struct Win {
     /// The scroll viewports of the drawing in `px`, each with its key
     /// (content hash and the uploads of the slots it samples).
     scrolls: Vec<(pack::Scroll, u64)>,
+    /// A pop-up: the `PopupPlace` last sent, and the time it was shown
+    /// (`Popup::shown`) that it was sent for.
+    popup: Option<(Msg, u32)>,
 }
 
 impl Win {
@@ -348,6 +351,8 @@ fn main() {
     let scene = Arc::new(Mutex::new(SceneGraph::new()));
     let slots = Arc::new(Mutex::new(SlotTable::new()));
     let comp = Arc::new(Mutex::new(Compositor::new_with_window0(scene, slots)));
+    // Pop-ups are frescod's to check, place and dismiss (fresco-popups.md §3).
+    comp.lock().unwrap().popups_upstream = true;
     let (ev_tx, ev_rx) = mpsc::channel();
     comp.lock().unwrap().set_event_sink(ev_tx.clone());
     let frontend = Arc::new(Mutex::new(EnvelopeFrontend::new(cas, comp.clone())));
@@ -446,7 +451,7 @@ fn role(r: WmRole) -> Role {
 /// Tell the broker about windows the client created, retitled or
 /// destroyed since the last pass.
 fn declare(broker: &Chan, state: &Mutex<State>, comp: &Mutex<Compositor>, screen: (u32, u32)) {
-    let live: Vec<(u32, Msg)> = {
+    let mut live: Vec<(u32, Msg, Option<(Msg, u32)>)> = {
         let c = comp.lock().unwrap();
         c.windows
             .values()
@@ -458,22 +463,36 @@ fn declare(broker: &Chan, state: &Mutex<State>, comp: &Mutex<Compositor>, screen
                     window: w.id as u32,
                     width: dim(w.size.0, screen.0),
                     height: dim(w.size.1, screen.1),
-                    role: role(w.role),
+                    role: if w.popup.is_some() { Role::Popup } else { role(w.role) },
                     pos,
                     title: w.title.clone(),
                     embed_pending: w.embed_pending,
                 };
-                (w.id as u32, m)
+                // An open pop-up's spec, sent again when it changes or
+                // when the client shows it again after a dismissal.
+                let place = w.popup.filter(|_| !w.hidden).map(|p| (Msg::PopupPlace {
+                    window: w.id as u32,
+                    parent: p.parent as u32,
+                    anchor: p.anchor,
+                    side: p.side,
+                    align: p.align,
+                    width: p.want.0,
+                    height: p.want.1,
+                    grab: p.grab,
+                }, p.shown));
+                (w.id as u32, m, place)
             })
             .collect()
     };
+    // Parents before the pop-ups that hang from them.
+    live.sort_by_key(|l| l.0);
     let mut s = state.lock().unwrap();
-    let gone: Vec<u32> = s.wins.keys().copied().filter(|id| !live.iter().any(|(l, _)| l == id)).collect();
+    let gone: Vec<u32> = s.wins.keys().copied().filter(|id| !live.iter().any(|(l, ..)| l == id)).collect();
     for id in gone {
         s.wins.remove(&id);
         send(broker, &Msg::WindowDestroy { window: id });
     }
-    for (id, m) in live {
+    for (id, m, place) in live {
         let Msg::WindowCreate { title, .. } = &m else { unreachable!() };
         let room = s.wins.len() < MAX_WINDOWS as usize;
         match s.wins.get_mut(&id) {
@@ -487,7 +506,17 @@ fn declare(broker: &Chan, state: &Mutex<State>, comp: &Mutex<Compositor>, screen
                 s.wins.insert(id, Win { title: title.clone(), ..Default::default() });
                 send(broker, &m);
             }
-            None => log::warn!("fresco-renderer: window {id}: past {MAX_WINDOWS} windows; not shown"),
+            None => {
+                log::warn!("fresco-renderer: window {id}: past {MAX_WINDOWS} windows; not shown");
+                continue;
+            }
+        }
+        let w = s.wins.get_mut(&id).expect("declared");
+        // Not again after frescod dismissed it (the client's window stays
+        // hidden here) until the client shows it again (`shown` moves).
+        if place.is_some() && place != w.popup {
+            send(broker, &place.as_ref().expect("some").0);
+            w.popup = place;
         }
     }
 }
@@ -621,6 +650,13 @@ fn from_broker(
                 }
                 // Tells the client, which lays out again.
                 comp.lock().unwrap().resize_window(local as u16, width, height);
+            }
+            Msg::PopupPlaced { x, y, width, height, side, .. } => {
+                let _ = events.send(DisplayEvent::PopupPlaced { window_id: local, x, y, width, height, side });
+            }
+            Msg::PopupDismissed { reason, .. } => {
+                comp.lock().unwrap().popup_dismissed_upstream(local as u16);
+                let _ = events.send(DisplayEvent::PopupDismissed { window_id: local, reason });
             }
             Msg::Focus { gained, cause, .. } => {
                 let _ = events.send(DisplayEvent::WindowFocusChanged { window_id: local, gained, cause });

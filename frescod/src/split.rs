@@ -555,8 +555,10 @@ impl Broker {
                         }
                         w.embed_pending = embed_pending;
                     }
-                    if embed_pending {
-                        c.hide(g); // limen.md §4: off screen until bound
+                    if embed_pending || role == Role::Popup {
+                        // limen.md §4: off screen until bound; a pop-up
+                        // until its POPUP_PLACE passes (fresco-popups.md §3).
+                        c.hide(g);
                     }
                     g
                 };
@@ -617,6 +619,37 @@ impl Broker {
                     return Err("too many drag formats".into());
                 }
                 f.push(format);
+            }
+            Msg::PopupPlace { parent, anchor, side, align, width, height, grab, .. } => {
+                let (global, parent_global) = {
+                    let wins = r.wins.lock().unwrap();
+                    (wins.get(&local).map(|w| w.global), wins.get(&parent).map(|w| w.global))
+                };
+                let global = global.ok_or("pop-up place for unknown window")?;
+                let refused = {
+                    let mut c = self.comp.lock().unwrap();
+                    let res = match parent_global {
+                        Some(p) if !socket_server::is_embed_only(r.client_id) => {
+                            c.attach_popup(r.client_id as u32, global, p, anchor, side, align, (width, height), grab)
+                        }
+                        _ => Err(fresco_scene_server::window::PopupRefused::UnknownWindow),
+                    };
+                    // An open pop-up refused is dismissed, which tells
+                    // the renderer; otherwise it is told here.
+                    let open = c.windows.get(&global).is_some_and(|w| w.popup.is_some() && !w.hidden);
+                    if res.is_err() {
+                        c.hide(global);
+                    }
+                    res.err().map(|e| (e, open))
+                };
+                match refused {
+                    None => self.redraw.wake(),
+                    Some((e, true)) => log::info!("frescod: client {} window {local}: pop-up refused: {e:?}", r.client_id),
+                    Some((e, false)) => {
+                        log::info!("frescod: client {} window {local}: pop-up refused: {e:?}", r.client_id);
+                        r.tell(&Msg::PopupDismissed { window: local, reason: fresco_protocol::popup_dismiss::PARENT }, &[])?;
+                    }
+                }
             }
             Msg::PadClaim { device, claim, .. } => {
                 let global = r.wins.lock().unwrap().get(&local).map(|w| w.global as u32).ok_or("pad claim for unknown window")?;
@@ -962,6 +995,10 @@ fn event_record(r: &Renderer, ev: &DisplayEvent) -> Option<Msg> {
     let (global, input) = match *ev {
         E::WindowFocusChanged { window_id, gained, cause } => return Some(Msg::Focus { window: r.local_of(window_id)?, gained, cause }),
         E::WindowCloseRequested { window_id } => return Some(Msg::CloseRequested { window: r.local_of(window_id)? }),
+        E::PopupPlaced { window_id, x, y, width, height, side } => {
+            return Some(Msg::PopupPlaced { window: r.local_of(window_id)?, x, y, width, height, side });
+        }
+        E::PopupDismissed { window_id, reason } => return Some(Msg::PopupDismissed { window: r.local_of(window_id)?, reason }),
         E::VideoPresented { window_id, layer, seq, vblank_ns, dropped } => {
             return Some(Msg::VideoPresented { window: r.local_of(window_id)?, layer, seq, vblank_ns, dropped });
         }
@@ -1015,6 +1052,7 @@ fn wm_role(r: Role) -> WmRole {
         Role::Background => WmRole::Background,
         Role::Chrome => WmRole::Chrome,
         Role::Notification => WmRole::Notification,
+        Role::Popup => WmRole::Document,
     }
 }
 

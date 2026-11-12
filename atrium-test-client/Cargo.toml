@@ -105,6 +105,11 @@ path = "src/video_probe.rs"
 name = "atrium-input-probe"
 path = "src/input_probe.rs"
 
+# The pop-up window check (fresco-popups.md §5), driving FRESCOD_INPUT_SOCK.
+[[bin]]
+name = "atrium-popup-probe"
+path = "src/popup_probe.rs"
+
 [dependencies]
 aqueduct        = { path = "../aqueduct" }
 fresco-client   = { path = "../fresco-client" }

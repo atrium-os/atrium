@@ -95,6 +95,14 @@ pub enum Event {
     /// This window spans several monitors (fresco-span.md): each monitor's
     /// tile of it and the hidden bezel strips; no tiles = the span ended.
     Span(fresco_protocol::WindowSpanEvent),
+    /// Pop-up `window_id` landed at `x`, `y` (in its parent's pixels) at
+    /// `width` x `height`, opening to `side` after any flip
+    /// (docs/spec/fresco-popups.md). Sent on open, on each re-place, and
+    /// when the parent moves.
+    PopupPlaced { window_id: u32, x: f32, y: f32, width: u32, height: u32, side: u8 },
+    /// Pop-up `window_id` is off screen (`fresco_protocol::popup_dismiss`):
+    /// close the menu, then destroy the window or place it again.
+    PopupDismissed { window_id: u32, reason: u8 },
     /// Keyboard press/release. `window_id == 0` indicates broadcast
     /// (no focused window).
     Key {
@@ -509,6 +517,36 @@ impl Connection {
             }
             log::debug!("window_create: skipping unrelated message op={:#x}", m.op);
         }
+    }
+
+    // ── Pop-ups (docs/spec/fresco-popups.md) ───────────────────────
+
+    /// Open a pop-up (a menu, a drop-down list, a tooltip) of `parent`,
+    /// hanging from `anchor` (`[x, y, w, h]` in `parent`'s pixels) on
+    /// `side` (`fresco_protocol::popup_side`), lined up by `align`
+    /// (`popup_align`), `width` x `height` wanted. frescod places it (it
+    /// may flip, slide or shrink it) and says where with
+    /// `Event::PopupPlaced`. `grab`: it takes the keys and goes on a press
+    /// outside (a menu); not for a tooltip. Refused unless `parent` is
+    /// focused or was just pressed. The default window is left as it was:
+    /// draw into the pop-up with `set_default_window`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn popup_create(
+        &mut self, parent: u32, anchor: [f32; 4], side: u8, align: u8, width: u32, height: u32, grab: bool,
+    ) -> io::Result<u32> {
+        let p = fresco_protocol::PopupCreatePayload { parent, anchor, side, align, width, height, grab };
+        self.send_window_managed(control::OP_POPUP_CREATE, &p)?;
+        let m = self.wm_response(control::OP_POPUP_CREATE)?;
+        decode::<u32>(&m.payload)
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, format!("decode POPUP_CREATE reply: {e}")))
+    }
+
+    /// Move or resize open pop-up `window_id`, or show it again after a
+    /// dismissal (the same rules as `popup_create`).
+    pub fn popup_place(&mut self, window_id: u32, anchor: [f32; 4], side: u8, align: u8, width: u32, height: u32) -> io::Result<()> {
+        let p = fresco_protocol::PopupPlacePayload { window_id, anchor, side, align, width, height };
+        self.send_window_managed(control::OP_POPUP_PLACE, &p)?;
+        self.wm_response(control::OP_POPUP_PLACE).map(|_| ())
     }
 
     // ── Video layers (docs/spec/fresco-video.md) ───────────────────
@@ -1190,6 +1228,14 @@ fn decode_event(op: u16, payload: &[u8]) -> Event {
         },
         control::EV_APPEARANCE_CHANGED => match decode::<fresco_protocol::AppearancePayload>(payload) {
             Ok(p) => Event::Appearance(p),
+            Err(_) => Event::Unknown { op, payload: payload.to_vec() },
+        },
+        control::EV_POPUP_PLACED => match decode::<fresco_protocol::PopupPlacedEvent>(payload) {
+            Ok(p) => Event::PopupPlaced { window_id: p.window_id, x: p.x, y: p.y, width: p.width, height: p.height, side: p.side },
+            Err(_) => Event::Unknown { op, payload: payload.to_vec() },
+        },
+        control::EV_POPUP_DISMISSED => match decode::<fresco_protocol::PopupDismissedEvent>(payload) {
+            Ok(p) => Event::PopupDismissed { window_id: p.window_id, reason: p.reason },
             Err(_) => Event::Unknown { op, payload: payload.to_vec() },
         },
         control::EV_WINDOW_SPAN => match decode::<fresco_protocol::WindowSpanEvent>(payload) {

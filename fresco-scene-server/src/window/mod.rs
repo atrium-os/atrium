@@ -19,6 +19,9 @@ use crate::scene::slots::SlotTable;
 use fresco_protocol::WmRole;
 use std::sync::{Arc, Mutex, mpsc};
 
+mod popup;
+pub use popup::place as place_popup;
+
 /// Server-driven async events emitted by the compositor when its
 /// state changes (resize, focus, close-request, DPI). Per
 /// `docs/spec/fresco-rendering-stack.md` §3.8.1, these correspond
@@ -113,6 +116,11 @@ pub enum DisplayEvent {
     DragEnd { window_id: u32, drag_id: u64, dropped: bool },
     /// To the window's owner alone: its embed token (limen.md §5).
     EmbedToken { window_id: u32, token: [u8; 16] },
+    /// To the owner: where its pop-up landed, in the parent's coordinates
+    /// (docs/spec/fresco-popups.md).
+    PopupPlaced { window_id: u32, x: f32, y: f32, width: u32, height: u32, side: u8 },
+    /// To the owner: its pop-up went off screen (`popup_dismiss`).
+    PopupDismissed { window_id: u32, reason: u8 },
     /// To the owner: a video layer's buffer may be filled again.
     VideoReleased { window_id: u32, layer: u32, buffer: u32 },
     /// To the owner: a video frame first showed at `vblank_ns`.
@@ -128,6 +136,36 @@ pub struct Slot {
     pub kind: u8,
     /// Stacking among the parent's slots (`SlotBind::z`).
     pub z: u8,
+}
+
+/// A pop-up window (docs/spec/fresco-popups.md): hung from `anchor`
+/// (`[x, y, w, h]` in `parent`) on `side`, `want` the size asked for.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Popup {
+    pub parent: WindowId,
+    pub anchor: [f32; 4],
+    pub side: u8,
+    /// `fresco_protocol::popup_align`.
+    pub align: u8,
+    pub want: (u32, u32),
+    pub grab: bool,
+    /// What the owner was last told (`EV_POPUP_PLACED`): position in the
+    /// parent, size, side. `None` until placed, and after a dismissal.
+    pub told: Option<(f32, f32, u32, u32, u8)>,
+    /// Times it was shown (opened, or placed again after a dismissal): a
+    /// split renderer sends its place again when this changes.
+    pub shown: u32,
+}
+
+/// Why a pop-up request was refused.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PopupRefused {
+    /// No such window, or not the client's.
+    UnknownWindow,
+    /// The parent is not on screen, or neither focused nor just pressed.
+    NotActive,
+    /// A bad anchor, side or size, too deep, or the parent cannot have one.
+    Invalid,
 }
 
 /// A 16-byte token from the kernel's CSPRNG.
@@ -294,6 +332,14 @@ pub fn encode_event(ev: &DisplayEvent)
             let p = fresco_protocol::EmbedTokenEvent { window_id: *window_id, token: *token };
             Ok((control::EV_WINDOW_EMBED_TOKEN, encode(&p)?))
         }
+        DisplayEvent::PopupPlaced { window_id, x, y, width, height, side } => {
+            let p = PopupPlacedEvent { window_id: *window_id, x: *x, y: *y, width: *width, height: *height, side: *side };
+            Ok((control::EV_POPUP_PLACED, encode(&p)?))
+        }
+        DisplayEvent::PopupDismissed { window_id, reason } => {
+            let p = PopupDismissedEvent { window_id: *window_id, reason: *reason };
+            Ok((control::EV_POPUP_DISMISSED, encode(&p)?))
+        }
     }
 }
 
@@ -369,6 +415,8 @@ pub struct Window {
     /// `EV_WINDOW_DPI_CHANGED`: 1000 until the window lands on a monitor
     /// with another one.
     pub scale_milli: u32,
+    /// A pop-up: frescod places, stacks and dismisses it.
+    pub popup: Option<Popup>,
 }
 
 impl Window {
@@ -393,6 +441,7 @@ impl Window {
             role:  WmRole::Document,
             owner_uid: 0,
             scale_milli: 1000,
+            popup: None,
         }
     }
 
@@ -414,6 +463,7 @@ impl Window {
             role:  WmRole::Document,
             owner_uid: 0,
             scale_milli: 1000,
+            popup: None,
         }
     }
 }
@@ -495,6 +545,16 @@ pub struct Compositor {
     event_sink: Option<mpsc::Sender<DisplayEvent>>,
     /// The fills last reported dropped, per window (see `set_fill_drops`).
     fill_drops: std::collections::HashMap<WindowId, Vec<(u32, u8)>>,
+    /// The monitors' desktop rects (`[x, y, w, h]`), which pop-ups are
+    /// kept inside (docs/spec/fresco-popups.md). Empty: no limit.
+    pub popup_bounds: Vec<[f32; 4]>,
+    /// The window the last pointer press went to: it may open a pop-up
+    /// even when it does not take focus (the Forum bar).
+    pub last_press: Option<WindowId>,
+    /// A split renderer's own table: pop-ups are checked, placed and
+    /// dismissed by frescod, which tells this side; here they are only
+    /// recorded.
+    pub popups_upstream: bool,
 }
 
 /// Server-side WM theme — controls how the compositor draws window
@@ -623,6 +683,9 @@ impl Compositor {
             font: None,
             event_sink: None,
             fill_drops: std::collections::HashMap::new(),
+            popup_bounds: Vec::new(),
+            last_press: None,
+            popups_upstream: false,
         }
     }
 
@@ -917,6 +980,7 @@ impl Compositor {
     {
         let allowed = self.windows.get(&id).map(|w| w.owner == by).unwrap_or(false);
         if !allowed { return (false, None); }
+        self.dismiss_popups(|_, at| at == id, fresco_protocol::popup_dismiss::PARENT);
         self.windows.remove(&id);
         self.fill_drops.remove(&id);
         self.z_order.retain(|&w| w != id);
@@ -940,6 +1004,7 @@ impl Compositor {
     pub fn destroy(&mut self, id: WindowId, by: ClientId) -> bool {
         let allowed = self.windows.get(&id).map(|w| w.owner == by).unwrap_or(false);
         if !allowed { return false; }
+        self.dismiss_popups(|_, at| at == id, fresco_protocol::popup_dismiss::PARENT);
         self.windows.remove(&id);
         self.z_order.retain(|&w| w != id);
         self.release_slots_in(id);
@@ -1165,6 +1230,7 @@ impl Compositor {
     pub fn set_focus_no_raise_by(&mut self, id: Option<WindowId>, cause: u8) {
         let id = id.filter(|i| !self.windows.get(i).is_some_and(|w| w.hidden));
         if self.focus == id { return; }
+        self.focus_dismisses_popups(id);
         let prev = self.focus;
         if let Some(p) = prev { if let Some(w) = self.windows.get_mut(&p) { w.focus = false; } }
         if let Some(n) = id  { if let Some(w) = self.windows.get_mut(&n) { w.focus = true; } }
@@ -1221,8 +1287,15 @@ impl Compositor {
     /// The window keys go to: the focused one, else the topmost that is
     /// not a notification (0: none).
     pub fn keyboard_window(&self) -> u32 {
+        // An open menu takes the keys (fresco-popups.md §1).
+        if let Some(p) = self.key_popup() {
+            return p as u32;
+        }
         match self.focus.unwrap_or(0) {
-            0 => self.z_order.iter().rev().find(|&&id| id != 0 && !self.is_notification(id)).copied().unwrap_or(0) as u32,
+            // Not a pop-up: one that grabs was taken above, a tooltip takes no keys.
+            0 => self.z_order.iter().rev()
+                .find(|&&id| id != 0 && !self.is_notification(id) && self.windows.get(&id).is_some_and(|w| w.popup.is_none()))
+                .copied().unwrap_or(0) as u32,
             f => f as u32,
         }
     }
@@ -1319,6 +1392,9 @@ impl Compositor {
 
     /// Take `id` off screen: out of `z_order`, and out of focus.
     pub fn hide(&mut self, id: WindowId) {
+        if !self.windows.contains_key(&id) { return; }
+        // Its pop-ups go with it.
+        self.dismiss_popups(|_, at| at == id && at != 0, fresco_protocol::popup_dismiss::PARENT);
         let Some(w) = self.windows.get_mut(&id) else { return };
         w.hidden = true;
         self.z_order.retain(|&z| z != id);
@@ -1363,6 +1439,7 @@ impl Compositor {
                 w.z = i as u32;
             }
         }
+        self.place_popups();
     }
 
     pub fn raise(&mut self, id: WindowId) -> Option<FocusChange> {
@@ -1372,6 +1449,9 @@ impl Compositor {
         self.z_order.retain(|&w| w != id);
         self.z_order.push(id);
         self.layer_notifications();
+        if self.focus != Some(id) {
+            self.focus_dismisses_popups(Some(id));
+        }
         self.place_slots(); // its slots come up with it
         let prev = self.focus;
         self.focus = Some(id);

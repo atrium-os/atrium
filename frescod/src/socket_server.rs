@@ -154,6 +154,9 @@ pub fn spawn_event_fanout(
                  * here — wake the display loop so cursor/focus/window
                  * changes recompose. */
                 redraw.wake();
+                if popup_gate(&ev, &comp) {
+                    continue;
+                }
                 /* A real press gets its activation token (tabula.md §2),
                  * bound to the window's app; only that app sees it, the
                  * WM gets the event without it. */
@@ -171,6 +174,38 @@ pub fn spawn_event_fanout(
             }
         })
         .expect("spawn event fan-out");
+}
+
+/// Buttons whose press dismissed pop-ups: their releases are not
+/// delivered either.
+static SWALLOWED: Mutex<Vec<u8>> = Mutex::new(Vec::new());
+
+/// Pop-ups and presses (fresco-popups.md §1): a press outside an open
+/// grabbing pop-up's chain dismisses the chain and is not delivered, nor
+/// its release. Every press is noted, so the pressed window may open a
+/// pop-up even when it does not take focus (the bar). `true`: drop `ev`.
+fn popup_gate(ev: &DisplayEvent, comp: &Arc<Mutex<Compositor>>) -> bool {
+    let DisplayEvent::InputPointerButton { window_id, button, pressed, .. } = *ev else { return false };
+    let mut swallowed = SWALLOWED.lock().unwrap();
+    if !pressed {
+        return match swallowed.iter().position(|&b| b == button) {
+            Some(i) => {
+                swallowed.remove(i);
+                true
+            }
+            None => false,
+        };
+    }
+    let Ok(target) = u16::try_from(window_id) else { return false };
+    let mut c = comp.lock().unwrap();
+    c.last_press = Some(c.popup_root(target));
+    if c.press_dismisses_popups(target) {
+        if !swallowed.contains(&button) {
+            swallowed.push(button);
+        }
+        return true;
+    }
+    false
 }
 
 /// Send `ev` to every subscriber its route reaches; `bare` (the event
@@ -300,6 +335,8 @@ fn route(ev: &DisplayEvent, comp: &Arc<Mutex<Compositor>>) -> Route {
         | E::VideoReleased { window_id, .. }
         | E::VideoPresented { window_id, .. }
         | E::WindowSpan { window_id, .. }
+        | E::PopupPlaced { window_id, .. }
+        | E::PopupDismissed { window_id, .. }
         // A gamepad is the focused window's alone (not the WM's too).
         | E::GamepadConnect { window_id, .. }
         | E::Gamepad { window_id, .. } => return Route::Owner(owner_of(window_id)),

@@ -60,6 +60,9 @@ pub fn translate(ev: &fresco_client::Event) -> Option<Event> {
         | fresco_client::Event::Appearance(_)
         // Pergola apps do not span monitors; games do.
         | fresco_client::Event::Span(_)
+        // Pop-ups are the window's own business (Menu, Dropdown), not views'.
+        | fresco_client::Event::PopupPlaced { .. }
+        | fresco_client::Event::PopupDismissed { .. }
         // Pergola draws no filled paths yet, so it has none to fall back for.
         | fresco_client::Event::FillsDropped { .. }
         // The window's embed token goes to limend, not to views.

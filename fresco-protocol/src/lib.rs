@@ -120,6 +120,13 @@ pub mod control {
     /// the postcard wire is positional — appending a field would break
     /// existing whole-surface present clients.
     pub const OP_WINDOW_PRESENT_DAMAGE: u16 = 0x0506;
+    /// Open a pop-up window (docs/spec/fresco-popups.md) hanging from a
+    /// spot in one of the client's windows: `PopupCreatePayload` → the new
+    /// window id, as `OP_WINDOW_CREATE` answers. frescod places it.
+    pub const OP_POPUP_CREATE:          u16 = 0x0507;
+    /// Move, resize or show again an open pop-up: `PopupPlacePayload`,
+    /// no payload in the reply.
+    pub const OP_POPUP_PLACE:           u16 = 0x0508;
 
     /// Deadline-lane sponsorship request (scheduler federation §1.1,
     /// Laminar phase J): the client asks frescod — the vblank deadline
@@ -196,6 +203,11 @@ pub mod control {
     /// `AppearancePayload`, to every client: the system appearance
     /// changed (light/dark). Redraw in it.
     pub const EV_APPEARANCE_CHANGED:     u16 = 0x058a;
+    /// `PopupPlacedEvent`, to the pop-up's owner: where frescod put it.
+    pub const EV_POPUP_PLACED:           u16 = 0x058b;
+    /// `PopupDismissedEvent`, to the pop-up's owner: frescod took it off
+    /// screen (a press outside its chain, focus moved, its parent went).
+    pub const EV_POPUP_DISMISSED:        u16 = 0x058c;
     /// The display's mode changed (a mode switch, or a monitor plugged in
     /// or swapped): payload `DisplayInfoResponse`. Every client gets it;
     /// anything laid out for the screen lays itself out again.
@@ -781,6 +793,87 @@ pub struct WindowCreatePayload {
     pub hints:  WindowHints,
     /// Parent window for modal/dialog relationships. `0` = top-level.
     pub parent_window_id: u32,
+}
+
+/// Which side of its anchor a pop-up opens to ([`PopupCreatePayload`]).
+pub mod popup_side {
+    pub const BELOW: u8 = 0;
+    pub const ABOVE: u8 = 1;
+    pub const RIGHT: u8 = 2;
+    pub const LEFT: u8 = 3;
+}
+
+/// Where along its anchor a pop-up lines up ([`PopupCreatePayload`]):
+/// for `BELOW`/`ABOVE` its left edge with the anchor's left (`START`),
+/// centres, or right edges (`END`); for `RIGHT`/`LEFT` its top, centre or
+/// bottom.
+pub mod popup_align {
+    pub const START: u8 = 0;
+    pub const CENTER: u8 = 1;
+    pub const END: u8 = 2;
+}
+
+/// Why a pop-up went ([`PopupDismissedEvent`]).
+pub mod popup_dismiss {
+    /// A press outside the pop-up's chain (not delivered).
+    pub const PRESS_OUTSIDE: u8 = 0;
+    /// Focus moved to another window.
+    pub const FOCUS: u8 = 1;
+    /// Its parent was hidden or destroyed.
+    pub const PARENT: u8 = 2;
+}
+
+/// The deepest chain of pop-ups (a menu, its submenu, ...).
+pub const POPUP_MAX_DEPTH: usize = 8;
+
+/// `OP_POPUP_CREATE` (docs/spec/fresco-popups.md): a pop-up of
+/// `width` x `height` hanging from `anchor` (`[x, y, w, h]` in `parent`'s
+/// coordinates, inside it; zero-sized for a context menu at the pointer),
+/// opening to `side` (`popup_side`), lined up by `align` (`popup_align`).
+/// `grab`: it takes the keys and a press outside dismisses it (menus);
+/// without, it is display-only (tooltips: no keys, presses pass).
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct PopupCreatePayload {
+    pub parent: u32,
+    pub anchor: [f32; 4],
+    pub side: u8,
+    pub align: u8,
+    pub width: u32,
+    pub height: u32,
+    pub grab: bool,
+}
+
+/// `OP_POPUP_PLACE`: place pop-up `window_id` again (and show it, if it
+/// was dismissed).
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct PopupPlacePayload {
+    pub window_id: u32,
+    pub anchor: [f32; 4],
+    pub side: u8,
+    pub align: u8,
+    pub width: u32,
+    pub height: u32,
+}
+
+/// `EV_POPUP_PLACED`: where pop-up `window_id` is, in its parent's
+/// coordinates, its size (it may be smaller than asked, to fit the
+/// monitor), and the side it opened to after any flip.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct PopupPlacedEvent {
+    pub window_id: u32,
+    pub x: f32,
+    pub y: f32,
+    pub width: u32,
+    pub height: u32,
+    pub side: u8,
+}
+
+/// `EV_POPUP_DISMISSED`: pop-up `window_id` is off screen (`reason`:
+/// `popup_dismiss`).
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct PopupDismissedEvent {
+    pub window_id: u32,
+    pub reason: u8,
 }
 
 /// `OP_WINDOW_DESTROY` — close + release a window. After the server
@@ -2381,6 +2474,11 @@ mod tests {
             control::OP_WINDOW_REQUEST_CLOSE,
             control::OP_WINDOW_PRESENT,
             control::OP_WINDOW_PRESENT_DAMAGE,
+            control::OP_POPUP_CREATE,
+            control::OP_POPUP_PLACE,
+            control::EV_POPUP_PLACED,
+            control::EV_POPUP_DISMISSED,
+            control::EV_APPEARANCE_CHANGED,
             control::EV_WINDOW_RESIZED,
             control::EV_WINDOW_FOCUS_CHANGED,
             control::EV_WINDOW_CLOSE_REQUESTED,
