@@ -41,6 +41,7 @@
 #define PSP_TOS_RESP		0x80000000u
 #define PSP_TOS_MASK		0x8000ffffu	/* response flag + status */
 #define PSP_RING_TYPE_KM	2
+#define PSP_CTRL_DESTROY_RINGS	0x30000u
 /* NBIF 6.x segment 2 (nbif_6_3_1_offset.h): HDP write flush, then a read. */
 #define NBIF6_HDP_MEM_COHERENCY_FLUSH_CNTL 0xf7
 #define NBIF6_RCC_CONFIG_MEMSIZE	0xc3
@@ -127,6 +128,21 @@ psp_hdp_flush(struct atrium_amd_softc *sc)
 
 	amd_mmio_write32(sc, (b + NBIF6_HDP_MEM_COHERENCY_FLUSH_CNTL) * 4, 0);
 	(void)amd_mmio_read32(sc, (b + NBIF6_RCC_CONFIG_MEMSIZE) * 4);
+}
+
+/* GFX_CTRL_CMD_ID_DESTROY_RINGS: the sOS forgets any ring (ours or stale). */
+static int
+psp_ring_destroy(struct atrium_amd_softc *sc)
+{
+	int err;
+
+	amd_mmio_write32(sc, psp_reg(sc, PSP14_C2PMSG_64), PSP_CTRL_DESTROY_RINGS);
+	DELAY(20000);
+	err = psp_wait(sc, PSP14_C2PMSG_64, PSP_TOS_MASK, PSP_TOS_RESP, 0, 0);
+	device_printf(sc->dev, "psp: rings destroyed%s (C2PMSG_64 %#x)\n",
+	    err == 0 ? "" : " (no response)",
+	    amd_mmio_read32(sc, psp_reg(sc, PSP14_C2PMSG_64)));
+	return (err);
 }
 
 static int
@@ -227,12 +243,27 @@ psp_load_toc(struct atrium_amd_softc *sc, struct resource *vram,
 	bus_write_4(vram, PSP_CMD_VRAM_OFF + GFX_CMD_OFF_CMD + 4,
 	    (uint32_t)(mc >> 32));
 	bus_write_4(vram, PSP_CMD_VRAM_OFF + GFX_CMD_OFF_CMD + 8, size);
+	/* A pattern in the response: what the PSP writes stands out. */
+	bus_set_region_4(vram, PSP_CMD_VRAM_OFF + GFX_CMD_OFF_RESP, 0xdeadbeef,
+	    (GFX_CMD_BUF_LEN - GFX_CMD_OFF_RESP) / 4);
 	bus_write_4(vram, PSP_FENCE_VRAM_OFF, 0);
 	psp_hdp_flush(sc);
 
 	err = psp_cmd_submit(sc, vram, fb_base, 1, &status);
 	tmr = bus_read_4(vram, PSP_CMD_VRAM_OFF + GFX_CMD_OFF_RESP +
 	    GFX_RESP_OFF_TMR_SIZE);
+	{
+		uint32_t w[8];
+		int k;
+
+		for (k = 0; k < 8; k++)
+			w[k] = bus_read_4(vram, PSP_CMD_VRAM_OFF +
+			    GFX_CMD_OFF_RESP + 4 * k);
+		device_printf(sc->dev, "psp: fence %#x; resp %08x %08x %08x "
+		    "%08x %08x %08x %08x %08x\n",
+		    bus_read_4(vram, PSP_FENCE_VRAM_OFF), w[0], w[1], w[2],
+		    w[3], w[4], w[5], w[6], w[7]);
+	}
 	device_printf(sc->dev, "psp: LOAD_TOC (%u bytes): %s, status %#x, "
 	    "TMR size %#x (%u MiB)\n", size, err == 0 ? "done" : "failed",
 	    status, tmr, tmr >> 20);
@@ -342,12 +373,19 @@ amd_psp_bootload(struct atrium_amd_softc *sc)
 	    amd_mmio_read32(sc, psp_reg(sc, PSP14_C2PMSG_35)),
 	    amd_mmio_read32(sc, psp_reg(sc, PSP14_C2PMSG_81)));
 	if (err == 0) {
+		/* A ring left by an earlier load points at memory we may not
+		 * own any more; drop it first (amdgpu does on teardown). */
+		if (alive)
+			(void)psp_ring_destroy(sc);
 		bus_set_region_4(vram, PSP_RING_VRAM_OFF, 0, PSP_RING_SIZE / 4);
 		psp_hdp_flush(sc);
 		err = psp_ring_create(sc, fb_base + PSP_RING_VRAM_OFF);
+		if (err == 0) {
+			err = psp_load_toc(sc, vram, fb_base, fw);
+			/* We do not stay attached: leave no ring behind. */
+			(void)psp_ring_destroy(sc);
+		}
 	}
-	if (err == 0)
-		err = psp_load_toc(sc, vram, fb_base, fw);
 out:
 	if (vram != NULL)
 		bus_release_resource(sc->dev, SYS_RES_MEMORY, rid, vram);
