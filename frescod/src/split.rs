@@ -547,6 +547,7 @@ impl Broker {
                         w.title = title;
                         w.role = match wm_role(role) {
                             WmRole::Notification if !crate::notify::may(uid) => WmRole::Document,
+                            WmRole::Chrome if !crate::notify::chrome_may(uid) => WmRole::Document,
                             r => r,
                         };
                         w.owner_uid = uid;

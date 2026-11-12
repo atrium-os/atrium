@@ -10,7 +10,10 @@
 //! 6. a press outside the chain dismisses both, submenu first, and neither
 //!    that press nor its release reaches the window; the next press does;
 //! 7. an anchor outside the parent is refused;
-//! 8. a tooltip (no grab) takes no keys and outlives an outside press.
+//! 8. a tooltip (no grab) takes no keys and outlives an outside press;
+//! 9. the bar (a second client, role Chrome, never focused) opens a menu
+//!    when pressed; it is above the app's window, takes the keys, and the
+//!    app cannot open a pop-up while it is open.
 //!
 //! Prints `ok …` / `FAIL …` lines and ends `popup: N failed`.
 //!
@@ -205,6 +208,62 @@ fn main() -> std::io::Result<()> {
     p.check(keys(&ev, tip) == 0, "the tooltip takes no keys");
     let ev = p.click(600.0, 600.0)?;
     p.check(dismissed(&ev).is_empty() && buttons(&ev, win) == [true, false], "a press elsewhere leaves the tooltip and reaches the window");
+
+    // 9. The bar's menu.
+    let mut bar = Connection::connect(&sock)?;
+    let hints = WindowHints { role: Some(fresco_protocol::WmRole::Chrome), initial_position: Some((0, 100)), ..Default::default() };
+    let bw = bar.window_create(sw, 40, "bar", hints)?;
+    bar.set_default_window(bw as u16);
+    bar.scene_frame_begin()?;
+    bar.scene_node_rect(1, RectParams { x: 0.0, y: 0.0, w: sw as f32, h: 40.0, r: 0.2, g: 0.2, b: 0.2, a: 1.0, radius: 0.0 })?;
+    bar.scene_frame_end()?;
+    let mut drain = |c: &mut Connection, ms: u64| -> std::io::Result<Vec<Event>> {
+        let end = Instant::now() + Duration::from_millis(ms);
+        let mut out = Vec::new();
+        while let Some(left) = end.checked_duration_since(Instant::now()) {
+            match c.wait_event(Some(left.max(Duration::from_millis(1))))? {
+                Some(e) => { println!("  bar event {e:?}"); out.push(e) }
+                None => break,
+            }
+        }
+        Ok(out)
+    };
+    // On screen: a motion over it reaches the bar.
+    let end = Instant::now() + Duration::from_secs(90);
+    let mut on = false;
+    let mut nudge = 0.0;
+    while !on && Instant::now() < end {
+        p.send(&format!("MOVE {} 120", 700.0 + nudge))?;
+        nudge = 1.0 - nudge;
+        on = drain(&mut bar, 500)?.iter().any(|e| matches!(e, Event::PointerMotion { window_id, .. } if *window_id == bw));
+    }
+    p.check(on, "the bar is on screen");
+    p.send("BTN 1 1")?;
+    p.send("BTN 1 0")?;
+    drain(&mut bar, 1000)?;
+    let bm = bar.popup_create(bw, [600.0, 0.0, 80.0, 40.0], popup_side::BELOW, popup_align::START, 240, 200, true);
+    p.check(bm.is_ok(), "the pressed bar opens a menu");
+    let bm = bm?;
+    bar.set_default_window(bm as u16);
+    bar.scene_frame_begin()?;
+    bar.scene_node_rect(1, RectParams { x: 0.0, y: 0.0, w: 240.0, h: 200.0, r: 0.95, g: 0.95, b: 0.95, a: 1.0, radius: 0.0 })?;
+    bar.scene_frame_end()?;
+    let ev = drain(&mut bar, 1000)?;
+    p.check(placed(&ev, bm) == Some((600.0, 40.0, 240, 200, popup_side::BELOW)), "the bar's menu hangs below its button");
+    // Refused: an error, or in split mode (where frescod decides after
+    // the renderer answered) an immediate dismissal.
+    let r = p.conn.popup_create(win, [10.0, 400.0, 50.0, 20.0], popup_side::BELOW, popup_align::START, 100, 100, true);
+    let ev = p.events(1000)?;
+    let refused = match r {
+        Err(_) => true,
+        Ok(id) => placed(&ev, id).is_none() && dismissed(&ev).iter().any(|&(w, _)| w == id),
+    };
+    p.check(refused, "the app cannot open a pop-up while the bar's menu is open");
+    p.send("KEY 0x51 1")?;
+    p.send("KEY 0x51 0")?;
+    let ev = drain(&mut bar, 1000)?;
+    let app_ev = p.events(300)?;
+    p.check(keys(&ev, bm) == 2 && keys(&app_ev, win) == 0, "the bar's menu takes the keys, the app sees none");
 
     println!("popup: {} failed", p.fails);
     std::process::exit(if p.fails == 0 { 0 } else { 1 });

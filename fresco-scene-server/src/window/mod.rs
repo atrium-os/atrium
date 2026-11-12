@@ -555,6 +555,9 @@ pub struct Compositor {
     /// dismissed by frescod, which tells this side; here they are only
     /// recorded.
     pub popups_upstream: bool,
+    /// The rows at the top of the screen only frescod draws (the trusted
+    /// strip, F4d): an app's pop-up is kept below them.
+    pub popup_top: f32,
 }
 
 /// Server-side WM theme — controls how the compositor draws window
@@ -686,6 +689,7 @@ impl Compositor {
             popup_bounds: Vec::new(),
             last_press: None,
             popups_upstream: false,
+            popup_top: 0.0,
         }
     }
 

@@ -99,6 +99,13 @@ impl Compositor {
         if !self.popups_upstream && p.popup.is_some() && !self.popup_open(parent) {
             return Err(PopupRefused::NotActive);
         }
+        // While a menu is open, only its chain opens more (§2): an app
+        // under the bar's menu, still focused, cannot cover it.
+        if !self.popups_upstream && self.windows.values().any(|w| {
+            w.popup.is_some_and(|q| q.grab) && !w.hidden && self.popup_root(w.id) != root
+        }) {
+            return Err(PopupRefused::NotActive);
+        }
         let [x, y, w, h] = anchor;
         let inside = anchor.iter().all(|v| v.is_finite())
             && w >= 0.0 && h >= 0.0 && x >= 0.0 && y >= 0.0
@@ -177,14 +184,27 @@ impl Compositor {
         }
     }
 
+    /// Whether pop-up `id`'s chain hangs from the shell's chrome (the
+    /// Forum bar): it stacks above every app's pop-up and may reach the
+    /// top of the screen.
+    fn popup_trusted(&self, id: WindowId) -> bool {
+        self.windows.get(&self.popup_root(id)).is_some_and(|w| w.role == WmRole::Chrome)
+    }
+
     /// The monitor a screen point is on, from [`Compositor::popup_bounds`]
-    /// (the first one if it is on none; `None` if none are known).
-    fn bounds_at(&self, x: f32, y: f32) -> Option<[f32; 4]> {
-        self.popup_bounds
+    /// (the first one if it is on none; `None` if none are known). An
+    /// app's pop-up (`trusted` false) is kept below the trusted strip.
+    fn bounds_at(&self, x: f32, y: f32, trusted: bool) -> Option<[f32; 4]> {
+        let b = self.popup_bounds
             .iter()
             .find(|b| x >= b[0] && x < b[0] + b[2] && y >= b[1] && y < b[1] + b[3])
             .or(self.popup_bounds.first())
-            .copied()
+            .copied()?;
+        if trusted || b[1] >= self.popup_top || b[3] <= self.popup_top - b[1] {
+            return Some(b);
+        }
+        let cut = self.popup_top - b[1];
+        Some([b[0], b[1] + cut, b[2], b[3] - cut])
     }
 
     /// Put every open pop-up where it hangs, above everything but the
@@ -219,7 +239,7 @@ impl Compositor {
             };
             let ppos = parent.pos;
             let a = [ppos.0 + p.anchor[0], ppos.1 + p.anchor[1], p.anchor[2], p.anchor[3]];
-            let ([x, y, w, h], side) = place(a, p.side, p.align, p.want, self.bounds_at(a[0] + a[2] / 2.0, a[1] + a[3] / 2.0));
+            let ([x, y, w, h], side) = place(a, p.side, p.align, p.want, self.bounds_at(a[0] + a[2] / 2.0, a[1] + a[3] / 2.0, self.popup_trusted(id)));
             let size = (w as u32, h as u32);
             if self.windows[&id].size != (w, h) {
                 self.resize_window(id, size.0, size.1);
@@ -237,7 +257,16 @@ impl Compositor {
             self.z_order.retain(|&z| z != id);
             stacked.push(id);
         }
-        self.z_order.extend(stacked);
+        // Apps' windows, their pop-ups, the shell's chrome (the bar) and
+        // its pop-ups, then notifications: no app pixel covers the bar or
+        // its menus (fresco-popups.md §2).
+        let chrome = |c: &Self, id: WindowId| c.windows.get(&id).is_some_and(|w| w.role == WmRole::Chrome);
+        let (bars, mut z): (Vec<WindowId>, Vec<WindowId>) = self.z_order.iter().partition(|&&id| chrome(self, id));
+        let (trusted, apps): (Vec<WindowId>, Vec<WindowId>) = stacked.into_iter().partition(|&id| self.popup_trusted(id));
+        z.extend(apps);
+        z.extend(bars);
+        z.extend(trusted);
+        self.z_order = z;
         self.layer_notifications();
         for (i, &id) in self.z_order.iter().enumerate() {
             if let Some(w) = self.windows.get_mut(&id) {
@@ -442,5 +471,35 @@ mod tests {
         c.place_slots();
         assert!(matches!(popup_events(&rx)[..], [DisplayEvent::PopupDismissed { reason: popup_dismiss::PARENT, .. }]));
         assert!(c.windows[&menu].hidden);
+    }
+
+    #[test]
+    fn the_bars_menu_stays_above_apps_and_apps_stay_below_the_strip() {
+        let (mut c, rx) = comp();
+        c.popup_top = 24.0;
+        let app = c.create(3, (1000, 776));
+        c.windows.get_mut(&app).unwrap().pos = (0.0, 24.0);
+        let bar = c.create(9, (1000, 30));
+        c.windows.get_mut(&bar).unwrap().role = WmRole::Chrome;
+        c.windows.get_mut(&bar).unwrap().pos = (0.0, 24.0);
+        c.set_focus_no_raise(Some(app));
+        // An app's menu that would open above its anchor near the top
+        // flips below, never into the strip.
+        let m = c.open_popup(3, app, [10.0, 0.0, 50.0, 20.0], popup_side::ABOVE, 0, (100, 100), true).unwrap();
+        let y = c.windows[&m].pos.1;
+        assert!(y >= 24.0, "app pop-up at {y}, inside the strip");
+        // Its menu stacks below the bar.
+        let zpos = |c: &Compositor, id| c.z_order.iter().position(|&z| z == id).unwrap();
+        assert!(zpos(&c, m) < zpos(&c, bar));
+        assert!(c.press_dismisses_popups(0));
+        // The bar (pressed, never focused) opens its menu; the app, still
+        // focused, cannot open one over it.
+        c.last_press = Some(bar);
+        let bm = c.open_popup(9, bar, [900.0, 0.0, 40.0, 30.0], popup_side::BELOW, 2, (200, 150), true).unwrap();
+        assert_eq!(c.focus, Some(app));
+        assert_eq!(c.open_popup(3, app, [10.0, 100.0, 50.0, 20.0], popup_side::BELOW, 0, (100, 100), true), Err(PopupRefused::NotActive));
+        assert_eq!(*c.z_order.last().unwrap(), bm, "the bar's menu is on top");
+        assert_eq!(c.keyboard_window(), bm as u32, "and takes the keys");
+        let _ = popup_events(&rx);
     }
 }

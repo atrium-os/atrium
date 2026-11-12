@@ -310,6 +310,10 @@ pub struct EnvelopeFrontend {
     /// Who may open notification surfaces; `None`: anyone (a renderer's
     /// frontend, which only forwards). Default: no one.
     notification_uids: Option<Vec<u32>>,
+    /// Who may open shell chrome (the Forum bar, `WmRole::Chrome`), which
+    /// stacks above apps and their pop-ups; `None`: anyone (a renderer, or
+    /// frescod with no list set). Default: anyone.
+    chrome_uids: Option<Vec<u32>>,
 
     /// What `OP_WM_DISPLAY_MODES` reports (frescod sets it from the
     /// connector), and a switch `OP_WM_SET_DISPLAY_MODE` asked for, which
@@ -364,6 +368,7 @@ impl EnvelopeFrontend {
             display_mode: (0, 0, 0),
             reserved_top: 0,
             notification_uids: Some(Vec::new()),
+            chrome_uids: None,
             display_modes: fresco_protocol::WmDisplayModesReply { modes: Vec::new(), current: u32::MAX },
             mode_request: None,
             outputs: fresco_protocol::WmOutputsReply { outputs: Vec::new() },
@@ -385,12 +390,18 @@ impl EnvelopeFrontend {
         self.notification_uids = uids;
     }
 
+    /// Who may open `Chrome` windows (`None`: anyone).
+    pub fn set_chrome_uids(&mut self, uids: Option<Vec<u32>>) {
+        self.chrome_uids = uids;
+    }
+
     pub fn reserved_top(&self) -> u32 {
         self.reserved_top
     }
 
     pub fn set_reserved_top(&mut self, rows: u32) {
         self.reserved_top = rows;
+        self.compositor.lock().unwrap().popup_top = rows as f32;
     }
 
     pub fn set_display_mode(&mut self, width: u32, height: u32, refresh_mhz: u32) {
@@ -1457,9 +1468,8 @@ impl EnvelopeFrontend {
             /* Record the declared role so WM_ENUMERATE reports it and the
              * WM can place/layer by role (forum.md §2.2). `hud` is a
              * Forum-reserved layer no app may claim (overlay-safety): clamp
-             * it to Document. Capability-gating the other privileged roles
-             * (e.g. chrome only for shell apps) is future work — today the
-             * hint is trusted for everything except hud. */
+             * it to Document. Notification and chrome are granted per uid
+             * below; the other roles are trusted as declared. */
             let uid = self.client_uids.get(&self.current_client).copied();
             /* The notification layer (tabula.md §5) only for the uids
              * frescod grants it (None: a renderer, which passes the ask
@@ -1468,9 +1478,15 @@ impl EnvelopeFrontend {
                 None => true,
                 Some(u) => uid.is_some_and(|uid| u.contains(&uid)),
             };
+            let may_chrome = match &self.chrome_uids {
+                None => true,
+                Some(u) => uid.is_some_and(|uid| u.contains(&uid)),
+            };
             win.role = match p.hints.role {
                 Some(fresco_protocol::WmRole::Hud | fresco_protocol::WmRole::Pip) | None => fresco_protocol::WmRole::Document,
                 Some(fresco_protocol::WmRole::Notification) if !may_notify => fresco_protocol::WmRole::Document,
+                // The bar's layer is above every app's pop-up (fresco-popups.md §2).
+                Some(fresco_protocol::WmRole::Chrome) if !may_chrome => fresco_protocol::WmRole::Document,
                 Some(r) => r,
             };
             // Stamp the owning uid (resolved at connect) so WM_ENUMERATE carries

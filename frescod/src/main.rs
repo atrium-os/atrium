@@ -196,6 +196,7 @@ fn main() -> std::io::Result<()> {
 
     let frontend = Arc::new(Mutex::new(EnvelopeFrontend::new(cas, comp.clone())));
     frontend.lock().unwrap().set_notification_uids(Some(notify::uids().to_vec()));
+    frontend.lock().unwrap().set_chrome_uids(notify::chrome_uids().map(<[u32]>::to_vec));
     /* Publish the desktop's size, so clients can ASK (OP_DISPLAY_INFO)
      * rather than each assuming a screen size, and output 0's modes. */
     frontend.lock().unwrap().set_display_mode(dw, dh, refresh);
@@ -1224,6 +1225,7 @@ fn run_headless(png: &str) -> std::io::Result<()> {
     tactus_client::spawn(ev_tx.clone(), comp.clone(), tactus_client::socket(), (W, H));
     let frontend = Arc::new(Mutex::new(EnvelopeFrontend::new(cas, comp.clone())));
     frontend.lock().unwrap().set_notification_uids(Some(notify::uids().to_vec()));
+    frontend.lock().unwrap().set_chrome_uids(notify::chrome_uids().map(<[u32]>::to_vec));
     /* Headless has no connector, but clients still need an answer — the surface
      * it renders into IS the screen here. Refresh 0 says "no real mode". */
     frontend.lock().unwrap().set_display_mode(W, H, 0);

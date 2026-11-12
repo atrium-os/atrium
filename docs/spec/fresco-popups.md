@@ -50,6 +50,20 @@ A pop-up could be used to draw over another app. So:
   monitor the anchor is on.
 - A pop-up cannot be a notification, a slot, or an embed, and cannot have
   slots.
+- **The bar stays trusted** (asked by Shankar 2026-11-12: the bar's
+  drop-downs reach into app area). An app's pop-up is kept below the
+  trusted strip (`reserved_top`). The shell's chrome windows (the Forum
+  bar, role `Chrome`) and their pop-ups stack above every app's pop-up:
+  app windows, app pop-ups, chrome, chrome pop-ups, notifications. While
+  a grabbing pop-up is open, only its chain may open more, so an app that
+  stays focused under the bar's menu cannot cover it. The `Chrome` role is
+  granted only to the uids in `FRESCOD_CHROME_UIDS` (unset: anyone, with a
+  warning, for development); others get `Document`.
+- An app can still draw a fake drop-down in its own window under the bar.
+  The tell is the bar: while its menu is open the button is drawn pressed
+  and the menu attached to it (atrium-visual-language.md §14.2, Pergola
+  `MenuButton::attached`), which no app can draw. Bar menus never ask for
+  secrets; those go through Arca's credential slots.
 
 ## 3. Wire
 
