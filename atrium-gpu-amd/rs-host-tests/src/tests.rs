@@ -361,3 +361,33 @@ fn ip_fw_plan_real_files() {
     assert_eq!(it[0], Item { file: file::SMU, fw_type: ty::SMU, offset: 256, size: 327168 });
     assert_eq!(it[n - 1], Item { file: file::RLC, fw_type: ty::RLC_G, offset: 256, size: 25088 });
 }
+
+#[test]
+fn smu_metrics_parse_and_reject() {
+    use crate::smu_metrics::*;
+    let mut b = std::vec![0u8; METRICS_LEN];
+    let p16 = |b: &mut Vec<u8>, o: usize, v: u16| b[o..o + 2].copy_from_slice(&v.to_le_bytes());
+    put32(&mut b, 0, 2400); // gfxclk
+    put32(&mut b, 104, 77); // counter
+    p16(&mut b, 140, 31); // edge
+    p16(&mut b, 142, 35); // hotspot
+    p16(&mut b, 148, 40); // mem
+    p16(&mut b, 136, 30); // socket W
+    p16(&mut b, 170, 900); // fan rpm
+    b[168] = 25;
+    let m = parse(&b, IF_VERSION_KNOWN).unwrap();
+    assert_eq!((m.verified, m.counter, m.temp_c[0], m.temp_c[1], m.temp_c[4]), (1, 77, 31, 35, 40));
+    assert_eq!((m.fan_rpm, m.fan_pwm, m.clk_mhz[0]), (900, 25, 2400));
+    assert_eq!(parse(&b, 0x33).unwrap().verified, 0);
+    // Implausible values are refused, never reported.
+    let mut z = b.clone();
+    p16(&mut z, 140, 0);
+    assert_eq!(parse(&z, 0x2e), Err(MetricsError::Implausible(140)));
+    let mut z = b.clone();
+    p16(&mut z, 142, 20); // hotspot below edge
+    assert!(parse(&z, 0x2e).is_err());
+    let mut z = b.clone();
+    z[172] = 101;
+    assert!(parse(&z, 0x2e).is_err());
+    assert_eq!(parse(&b[..100], 0x2e), Err(MetricsError::Short));
+}

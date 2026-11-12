@@ -129,6 +129,10 @@ never by device id.
 | 5 balanced (default) | allowed | 3D / compute | min(default, budget grant) | default |
 | 10 performance | allowed (held off only while work is queued) | 3D / compute | min(default, grant) | default |
 
+- **Federation.** `actuate(grant, P)` maps as the table; `demand(P)` comes from the metrics
+  table's power reading and the roofline profile. On gpusim the same levers are driver-owned
+  gating (`powergate.rs`). The posture spec's deadline-aware pre-wake stays on at every
+  posture: with GfxOff allowed it is what hides the power-up latency.
 - **GfxOff is allowed by default.** The driver disallows it only around register sequences
   that need GC powered (bring-up, reset, MES queue map), as a scoped guard that always
   re-allows. The bring-up test hook leaving it disallowed is a known gap, closed in P2.

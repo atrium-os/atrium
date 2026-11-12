@@ -15,12 +15,18 @@
  * poll C2PMSG_90: 1 = OK, 0xFE unknown, 0xFD bad prerequisite, 0xFF failed.
  * Output arguments come back in C2PMSG_82.
  *
+ * Rules from docs/spec/gpu-power-management.md: only the allowlisted
+ * messages below can be sent; protection features must be running; a bad
+ * answer or timeout stops all SMU traffic; the PMFW's own idle policy
+ * (GfxOff allowed) is handed back at the end.
+ *
  * Sequence (smu_hw_init / smu_smc_hw_setup for 14.0.2/3, no SCPM writes):
  * TestMessage, GetSmuVersion, GetDriverIfVersion, SetDriverDramAddr (a VRAM
  * buffer for later table transfers), RunDcBtc, SetAllowedFeaturesMask (all,
  * as smu_v14_0_2_init_allowed_features; refused under SCPM, then skipped as
  * amdgpu does), EnableAllSmuFeatures; then, for
- * bring-up, DisallowGfxOff so GC registers stay readable, and report the RLC.
+ * bring-up, DisallowGfxOff so GC registers stay readable, report the RLC,
+ * read the metrics table twice, and AllowGfxOff again.
  */
 #include "atrium_gpu_amd.h"
 
@@ -35,19 +41,76 @@
 #define SMU_RESP_BAD_PREREQ	0xfd
 #define SMU_WAIT_US		2000000
 
-/* smu_v14_0_2_ppsmc.h */
-#define PPSMC_MSG_TestMessage			0x01
-#define PPSMC_MSG_GetSmuVersion			0x02
-#define PPSMC_MSG_GetDriverIfVersion		0x03
-#define PPSMC_MSG_SetAllowedFeaturesMaskLow	0x04
-#define PPSMC_MSG_SetAllowedFeaturesMaskHigh	0x05
-#define PPSMC_MSG_EnableAllSmuFeatures		0x06
-#define PPSMC_MSG_GetRunningSmuFeaturesLow	0x0c
-#define PPSMC_MSG_GetRunningSmuFeaturesHigh	0x0d
-#define PPSMC_MSG_SetDriverDramAddrHigh		0x0e
-#define PPSMC_MSG_SetDriverDramAddrLow		0x0f
-#define PPSMC_MSG_DisallowGfxOff		0x29
-#define PPSMC_MSG_RunDcBtc			0x36
+/*
+ * The allowlist (docs/spec/gpu-power-management.md §2 rule 1, §3): the only
+ * messages this driver can express. smu_send() takes an index into this
+ * table, never a raw id; adding a row is a spec change. Ids from
+ * smu_v14_0_2_ppsmc.h.
+ */
+enum amd_smu_msg {
+	SMU_TEST,
+	SMU_GET_VERSION,
+	SMU_GET_DRIVER_IF,
+	SMU_SET_DRIVER_ADDR_HI,
+	SMU_SET_DRIVER_ADDR_LO,
+	SMU_RUN_DC_BTC,
+	SMU_SET_ALLOWED_HI,
+	SMU_SET_ALLOWED_LO,
+	SMU_ENABLE_ALL,
+	SMU_GET_RUNNING_LO,
+	SMU_GET_RUNNING_HI,
+	SMU_TABLE_SMU2DRAM,
+	SMU_ALLOW_GFXOFF,
+	SMU_DISALLOW_GFXOFF,
+	SMU_NMSG
+};
+static const struct {
+	uint16_t id;
+	const char *name;
+} smu_msgs[SMU_NMSG] = {
+	[SMU_TEST] =		{ 0x01, "TestMessage" },
+	[SMU_GET_VERSION] =	{ 0x02, "GetSmuVersion" },
+	[SMU_GET_DRIVER_IF] =	{ 0x03, "GetDriverIfVersion" },
+	[SMU_SET_DRIVER_ADDR_HI] = { 0x0e, "SetDriverDramAddrHigh" },
+	[SMU_SET_DRIVER_ADDR_LO] = { 0x0f, "SetDriverDramAddrLow" },
+	[SMU_RUN_DC_BTC] =	{ 0x36, "RunDcBtc" },
+	[SMU_SET_ALLOWED_HI] =	{ 0x05, "SetAllowedFeaturesMaskHigh" },
+	[SMU_SET_ALLOWED_LO] =	{ 0x04, "SetAllowedFeaturesMaskLow" },
+	[SMU_ENABLE_ALL] =	{ 0x06, "EnableAllSmuFeatures" },
+	[SMU_GET_RUNNING_LO] =	{ 0x0c, "GetRunningSmuFeaturesLow" },
+	[SMU_GET_RUNNING_HI] =	{ 0x0d, "GetRunningSmuFeaturesHigh" },
+	[SMU_TABLE_SMU2DRAM] =	{ 0x12, "TransferTableSmu2Dram" },
+	[SMU_ALLOW_GFXOFF] =	{ 0x28, "AllowGfxOff" },
+	[SMU_DISALLOW_GFXOFF] =	{ 0x29, "DisallowGfxOff" },
+};
+#define SMU_TABLE_SMU_METRICS	5
+
+/*
+ * Features the PMFW must be running before the GPU is used (spec §4):
+ * VR0HOT 27, FW_CTF 28, FAN_CONTROL 29, THROTTLERS 23, FW_DSTATE 17,
+ * MEM_TEMP_READ 46 (smu14_driver_if_v14_0.h).
+ */
+#define SMU_REQUIRED_FEATURES	((1ull << 17) | (1ull << 23) | (1ull << 27) | \
+	(1ull << 28) | (1ull << 29) | (1ull << 46))
+
+struct amd_smu_metrics {	/* rs/smu_metrics.rs Metrics */
+	uint32_t verified, counter;
+	uint16_t temp_c[12];
+	uint16_t socket_power_w, board_power_w, fan_rpm;
+	uint8_t fan_pwm, gfx_activity;
+	uint16_t gfxclk_mhz, memclk_mhz;
+	uint32_t clk_mhz[11];
+	uint8_t throttling[21], pad[3];
+};
+int	atrium_amd_smu_metrics(const uint8_t *b, size_t len, uint32_t ifver,
+	    struct amd_smu_metrics *out);	/* Rust */
+#define SMU_METRICS_LEN		260
+
+/* One sender, one state: after a bad answer nothing more is sent (rule 4). */
+struct smu_link {
+	struct atrium_amd_softc *sc;
+	bool failed;
+};
 
 /* MMHUB 4.x FB location (as psp.c), and the SMU driver table in VRAM. */
 #define MMHUB4_FB_LOCATION_BASE	0x554
@@ -83,30 +146,46 @@ smu_poll(struct atrium_amd_softc *sc)
 	return (v);
 }
 
-/* One message; *out gets C2PMSG_82 after an OK. Returns the response. */
+/*
+ * Send allowlisted message `m`. Returns the raw response; *out gets
+ * C2PMSG_82 after an OK. `bad_prereq_ok`: 0xFD is an expected answer here
+ * (SetAllowedFeaturesMask under SCPM) and does not fail the link. Any other
+ * non-OK answer or a timeout marks the link failed: later calls send nothing
+ * and return 0, and the PMFW is left in its own control.
+ */
 static uint32_t
-smu_msg(struct atrium_amd_softc *sc, const char *name, uint32_t msg,
-    uint32_t arg, uint32_t *out)
+smu_send(struct smu_link *l, enum amd_smu_msg m, uint32_t arg, uint32_t *out,
+    bool bad_prereq_ok)
 {
+	struct atrium_amd_softc *sc = l->sc;
 	uint32_t resp;
 
+	if (l->failed || m >= SMU_NMSG)
+		return (0);
 	resp = smu_poll(sc);
 	if (resp == 0) {
 		device_printf(sc->dev, "smu: %s: previous message never "
-		    "answered\n", name);
+		    "answered; link failed, PMFW left alone\n", smu_msgs[m].name);
+		l->failed = true;
 		return (0);
 	}
 	amd_mmio_write32(sc, smu_reg(sc, SMU14_C2PMSG_90), 0);
 	amd_mmio_write32(sc, smu_reg(sc, SMU14_C2PMSG_82), arg);
-	amd_mmio_write32(sc, smu_reg(sc, SMU14_C2PMSG_66), msg);
+	amd_mmio_write32(sc, smu_reg(sc, SMU14_C2PMSG_66), smu_msgs[m].id);
 	resp = smu_poll(sc);
 	if (resp == SMU_RESP_OK && out != NULL)
 		*out = amd_mmio_read32(sc, smu_reg(sc, SMU14_C2PMSG_82));
-	device_printf(sc->dev, "smu: %-24s arg %#010x: resp %#x%s", name, arg,
-	    resp, resp == 0 ? " (timeout)" : "");
+	device_printf(sc->dev, "smu: %-26s arg %#010x: resp %#x%s",
+	    smu_msgs[m].name, arg, resp, resp == 0 ? " (timeout)" : "");
 	if (resp == SMU_RESP_OK && out != NULL)
 		printf(", out %#x", *out);
 	printf("\n");
+	if (resp != SMU_RESP_OK &&
+	    !(resp == SMU_RESP_BAD_PREREQ && bad_prereq_ok)) {
+		device_printf(sc->dev, "smu: link failed; no further messages, "
+		    "PMFW left in its own control\n");
+		l->failed = true;
+	}
 	return (resp);
 }
 
@@ -134,16 +213,72 @@ gc_report(struct atrium_amd_softc *sc, const char *when)
 	    gc_rd(sc, 0, GC12_CP_STAT));
 }
 
+static uint64_t
+smu_features(struct smu_link *l)
+{
+	uint32_t lo = 0, hi = 0;
+
+	(void)smu_send(l, SMU_GET_RUNNING_LO, 0, &lo, false);
+	(void)smu_send(l, SMU_GET_RUNNING_HI, 0, &hi, false);
+	device_printf(l->sc->dev, "smu: running features %#010x%08x\n", hi, lo);
+	return ((uint64_t)hi << 32 | lo);
+}
+
+/*
+ * TransferTableSmu2Dram(SMU_METRICS) into the driver table, read it through
+ * BAR0, hand it to the Rust parser (range-checked; untrusted bytes).
+ */
+static void
+smu_metrics(struct smu_link *l, struct resource *vram, uint32_t ifver,
+    bool dump)
+{
+	struct atrium_amd_softc *sc = l->sc;
+	struct amd_smu_metrics m;
+	uint8_t b[SMU_METRICS_LEN];
+	int r, i;
+
+	if (smu_send(l, SMU_TABLE_SMU2DRAM, SMU_TABLE_SMU_METRICS, NULL,
+	    false) != SMU_RESP_OK)
+		return;
+	bus_read_region_1(vram, SMU_TABLE_VRAM_OFF, b, sizeof(b));
+	if (dump) {
+		/* Raw once, to check the layout by eye (interface version). */
+		for (i = 0; i < SMU_METRICS_LEN; i += 32)
+			device_printf(sc->dev, "smu: metrics +%3d: %32D\n", i,
+			    b + i, " ");
+	}
+	r = atrium_amd_smu_metrics(b, sizeof(b), ifver, &m);
+	if (r < 0) {
+		device_printf(sc->dev, "smu: telemetry unavailable (%s %d; "
+		    "driver interface %#x)\n", r == -10000 ? "short read" :
+		    "implausible field at byte", r == -10000 ? 0 : -r - 1, ifver);
+		return;
+	}
+	device_printf(sc->dev, "smu: metrics #%u%s: edge %u C, hotspot %u C, "
+	    "mem %u C, VR gfx %u C; socket %u W, board %u W; fan %u rpm "
+	    "(%u%%); gfx %u MHz, mem %u MHz, gfx busy %u%%\n", m.counter,
+	    m.verified ? "" : " (layout unverified for this interface)",
+	    m.temp_c[0], m.temp_c[1], m.temp_c[4], m.temp_c[5],
+	    m.socket_power_w, m.board_power_w, m.fan_rpm, m.fan_pwm,
+	    m.gfxclk_mhz, m.memclk_mhz, m.gfx_activity);
+	for (i = 0; i < 21; i++)
+		if (m.throttling[i] != 0)
+			device_printf(sc->dev, "smu: throttler %d active %u%%\n",
+			    i, m.throttling[i]);
+}
+
 int
 amd_smu_init(struct atrium_amd_softc *sc)
 {
 	struct resource *vram = NULL;
 	uint64_t fb_base, mc;
-	uint32_t v, lo, hi;
+	struct smu_link link = { .sc = sc, .failed = false };
+	uint64_t feat;
+	uint32_t v, ifver = 0;
 	bus_size_t lim = rman_get_size(sc->regs);
 	int rid, us, err = 0;
 
-#define	MSG(n, a, o)	smu_msg(sc, #n, PPSMC_MSG_##n, (a), (o))
+#define	SEND(m, a, o)	smu_send(&link, (m), (a), (o), false)
 	if (!sc->ip.mp1.present || sc->ip.mp1.major != 14 ||
 	    sc->ip.mp1.nbase < 2 ||
 	    smu_reg(sc, SMU14_C2PMSG_90) + 4 > lim) {
@@ -179,50 +314,63 @@ amd_smu_init(struct atrium_amd_softc *sc)
 	    amd_mmio_read32(sc, smu_reg(sc, SMU14_C2PMSG_90)));
 	gc_report(sc, "before");
 
-	if (MSG(TestMessage, 0, &v) != SMU_RESP_OK ||
-	    MSG(GetSmuVersion, 0, &v) != SMU_RESP_OK ||
-	    MSG(GetDriverIfVersion, 0, &v) != SMU_RESP_OK) {
+	if (SEND(SMU_TEST, 0, &v) != SMU_RESP_OK ||
+	    SEND(SMU_GET_VERSION, 0, &v) != SMU_RESP_OK ||
+	    SEND(SMU_GET_DRIVER_IF, 0, &ifver) != SMU_RESP_OK) {
 		err = EIO;
 		goto out;
 	}
 	bus_set_region_4(vram, SMU_TABLE_VRAM_OFF, 0, SMU_TABLE_SIZE / 4);
-	if (MSG(SetDriverDramAddrHigh, (uint32_t)(mc >> 32), NULL) !=
+	if (SEND(SMU_SET_DRIVER_ADDR_HI, (uint32_t)(mc >> 32), NULL) !=
 	    SMU_RESP_OK ||
-	    MSG(SetDriverDramAddrLow, (uint32_t)mc, NULL) != SMU_RESP_OK ||
-	    MSG(RunDcBtc, 0, NULL) != SMU_RESP_OK) {
+	    SEND(SMU_SET_DRIVER_ADDR_LO, (uint32_t)mc, NULL) != SMU_RESP_OK) {
 		err = EIO;
 		goto out;
 	}
-	lo = hi = 0;
-	(void)MSG(GetRunningSmuFeaturesLow, 0, &lo);
-	(void)MSG(GetRunningSmuFeaturesHigh, 0, &hi);
-	device_printf(sc->dev, "smu: features before enable %#010x%08x\n", hi,
-	    lo);
-	/*
-	 * With SCPM the PSP owns the feature mask and the PMFW refuses the
-	 * driver's (0xFD, bad prerequisite); amdgpu skips it then
-	 * (adev->scpm_enabled). Carry on to EnableAllSmuFeatures either way.
-	 */
-	v = MSG(SetAllowedFeaturesMaskHigh, 0xffffffff, NULL);
-	if (v == SMU_RESP_OK)
-		v = MSG(SetAllowedFeaturesMaskLow, 0xffffffff, NULL);
-	if (v == SMU_RESP_BAD_PREREQ)
-		device_printf(sc->dev, "smu: allowed mask refused: SCPM, the "
-		    "PSP owns it\n");
-	else if (v != SMU_RESP_OK) {
+	feat = smu_features(&link);
+	if (link.failed) {
 		err = EIO;
 		goto out;
 	}
-	if (MSG(EnableAllSmuFeatures, 0, NULL) != SMU_RESP_OK) {
+	if (feat == 0) {
+		/* First start this boot: amdgpu's smc_hw_setup order. */
+		if (SEND(SMU_RUN_DC_BTC, 0, NULL) != SMU_RESP_OK) {
+			err = EIO;
+			goto out;
+		}
+		/*
+		 * Under SCPM the PSP owns the feature mask and the PMFW
+		 * refuses the driver's with 0xFD; amdgpu skips it then.
+		 */
+		v = smu_send(&link, SMU_SET_ALLOWED_HI, 0xffffffff, NULL, true);
+		if (v == SMU_RESP_OK)
+			v = smu_send(&link, SMU_SET_ALLOWED_LO, 0xffffffff,
+			    NULL, true);
+		if (v == SMU_RESP_BAD_PREREQ)
+			device_printf(sc->dev, "smu: allowed mask refused: "
+			    "SCPM, the PSP owns it\n");
+		if (link.failed ||
+		    SEND(SMU_ENABLE_ALL, 0, NULL) != SMU_RESP_OK) {
+			err = EIO;
+			goto out;
+		}
+		feat = smu_features(&link);
+	} else
+		device_printf(sc->dev, "smu: features already running this "
+		    "boot; not enabling again\n");
+	if ((feat & SMU_REQUIRED_FEATURES) != SMU_REQUIRED_FEATURES) {
+		device_printf(sc->dev, "smu: required protection features "
+		    "missing (%#jx of %#jx); refusing the GPU\n",
+		    (uintmax_t)(feat & SMU_REQUIRED_FEATURES),
+		    (uintmax_t)SMU_REQUIRED_FEATURES);
 		err = EIO;
 		goto out;
 	}
-	lo = hi = 0;
-	(void)MSG(GetRunningSmuFeaturesLow, 0, &lo);
-	(void)MSG(GetRunningSmuFeaturesHigh, 0, &hi);
-	device_printf(sc->dev, "smu: running features %#010x%08x\n", hi, lo);
-	(void)MSG(DisallowGfxOff, 0, NULL);
+	device_printf(sc->dev, "smu: protection features running (thermal "
+	    "trip, throttlers, fan, VR hot, memory temperature)\n");
 
+	/* Bring-up only: keep GC readable while we look at it. */
+	(void)SEND(SMU_DISALLOW_GFXOFF, 0, NULL);
 	for (us = 0; us < GC_WAIT_US; us += 100) {
 		if ((gc_rd(sc, 1, GC12_RLC_RLCS_BOOTLOAD_STATUS) &
 		    GC12_BOOTLOAD_COMPLETE) && gc_rd(sc, 0, GC12_CP_STAT) == 0)
@@ -232,7 +380,17 @@ amd_smu_init(struct atrium_amd_softc *sc)
 	device_printf(sc->dev, "smu: RLC autoload %s after %d us\n",
 	    us < GC_WAIT_US ? "complete" : "NOT complete", us);
 	gc_report(sc, "after");
-#undef MSG
+
+	/* Telemetry, read only (spec §4): two reads 1 s apart. */
+	smu_metrics(&link, vram, ifver, true);
+	pause("smumet", hz);
+	smu_metrics(&link, vram, ifver, false);
+
+	/* Hand back the PMFW's own idle policy (rule 6). */
+	(void)SEND(SMU_ALLOW_GFXOFF, 0, NULL);
+	if (link.failed)
+		err = EIO;
+#undef SEND
 out:
 	if (vram != NULL)
 		bus_release_resource(sc->dev, SYS_RES_MEMORY, rid, vram);
