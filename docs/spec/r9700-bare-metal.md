@@ -171,6 +171,30 @@ After 4e, the driver stays attached on silicon for the first time, so P2's remai
 (the scoped GfxOff guard, the attached teardown: CP/MES quiesce, defaults, then the reset)
 land with it.
 
+## 4.5 Stage 5 plan: the driver attached on silicon, then acceptance
+
+Through 4e every hook brings the card up, tests and resets it inside one attach that ends
+in ENXIO. Stage 5 needs the driver to stay attached and serve clients, so the gpusim-shaped
+half of the gpu module (`queue.c`/`rs/queue.rs` per-queue SIM block, SIM VMID select,
+`regMES_INIT`, SIM firmware load, clear engine) gets silicon implementations behind the
+same `atrium_gpu_backend_ops`, picked by discovered IP version. The front-end, the
+isolation rules and the tests' ABI stay as they are. Display stays gpusim-only for now
+(the box's console is the BMC VGA).
+
+| Step | What |
+|---|---|
+| 5a | **Attached lifecycle.** Attach runs stages 3–4 (PSP, SMU, GC idle, GART, IH, GFX, MES) and stays up: GfxOff disallowed only while work is queued, telemetry watch, A3 rules. Detach: queues removed, MES and CP halted, PrepareMp1ForUnload, mode 1 reset. Box test: load, idle 60 s proven by telemetry, unload cold. |
+| 5b | **Per-client VMs on silicon.** VMIDs 1–7 owned by the kernel (MES keeps 8–15); real GCVM_CONTEXTn page-table bases and the gmc_v12 PDE/PTE format; TLB invalidate with ack per VMID; UTCL2 faults from the IH into the existing VM-fault path. |
+| 5c | **Queues.** The compute and gfx queues become kernel queues mapped by MES (map_legacy_kq) whose MQD carries the client VM's VMID, so the ring is read in the client's address space exactly as on gpusim. Owner changes are REMOVE_QUEUE then ADD_QUEUE; rptr from the HQD / rptr report; EOP interrupts into the existing completion path; the hang watchdog uses REMOVE_QUEUE and the dequeue handshake. Doorbell pages stay per queue. |
+| 5d | **VRAM.** The allocator's range clear of the PSP reservations; scrub-on-free through DMA_DATA on a kernel queue (the 4e path). |
+| 5e | **Tests on silicon.** Dispatches that use gpusim's SIM_COMPUTE_KERNEL get a real-shader variant (oracle-built, like write_42); WAIT_REG_MEM parking works unchanged. |
+| 5f | **Acceptance.** `atrium_gpu_test` and `test_gpu_isolation` (82 checks) on the box. |
+
+Alternative to 5c: full MES user queues (ADD_QUEUE with process and gang contexts, MES
+assigns VMIDs). It is closer to amdgpu's user-queue path and to where the hardware is
+going, but changes how the driver owns VMIDs and queues, so the isolation proofs would
+have to be redone. 5c keeps today's model and proofs.
+
 ## 5. Log
 
 - **2026-11-12, stage 1 done.** First bare-metal boot: bundle `03715a5` booted via
