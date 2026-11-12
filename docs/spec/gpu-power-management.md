@@ -70,7 +70,19 @@ firmware default (posture "performance" headroom) needs a spec change.
    ([atrium-power-posture.md](atrium-power-posture.md), [energy-policy.md](energy-policy.md));
    telemetry goes out read-only. Firmware state is never fed back into the scheduler's control
    loop.
-9. **Unknown means read-only.** A controller generation without a Part B row gets no messages.
+9. **The idle sequence is per family, and proven by telemetry, not assumed.** What takes a
+   block from powered to idle differs by vendor and family. On GC 12.0.x it is clock gating
+   then GfxOff; another family may need power gating first, a CP running, or a different
+   firmware handshake. So:
+   - each backend keeps its idle sequence in a table keyed by the block's discovered IP
+     version, the same way as the SMU generations;
+   - after every power-up of a block, the driver reads telemetry and must see the card idle
+     (`power::idle_suspicious` false) within a few seconds;
+   - if it doesn't, or there is no sequence for the version, the driver logs it, resets the
+     card to its post-POST state and refuses to attach.
+
+   A card the driver cannot prove idle is never left powered.
+10. **Unknown means read-only.** A controller generation without a Part B row gets no messages.
    A telemetry layout the backend doesn't know is not decoded (no "probably" readings).
 
 ### A4. Telemetry record
