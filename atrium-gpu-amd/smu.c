@@ -377,7 +377,8 @@ amd_smu_init(struct atrium_amd_softc *sc)
 	uint64_t feat;
 	uint32_t v, ifver = 0;
 	bus_size_t lim = rman_get_size(sc->regs);
-	int rid, us, r, err = 0, gc_up_ok = 0, gfx_cg = 0, gmc = 0, ih = 0, gfx = 0;
+	int rid, us, r, err = 0, gc_up_ok = 0, gfx_cg = 0, gmc = 0, ih = 0, gfx = 0,
+	    gfx_r = -1, mes = 0;
 
 #define	SEND(m, a, o)	smu_send(&link, (m), (a), (o), false)
 	link.gen = smu_gen_find(sc);
@@ -548,15 +549,29 @@ amd_smu_init(struct atrium_amd_softc *sc)
 			DELAY(100);
 		r = amd_gmc12_gart_enable(sc, vram, &gt);
 		device_printf(sc->dev, "gmc: stage 4a: %d\n", r);
-		/* Stage 4b (kenv hw.atrium_gpu.ih=1): IH ring 0 + MSI-X. */
-		TUNABLE_INT_FETCH("hw.atrium_gpu.ih", &ih);
-		if (ih && r == 0)
-			(void)amd_ih7_test(sc, &gt);
 		/* Stage 4c (kenv hw.atrium_gpu.gfx=1): GFX setup, CP halted. */
 		TUNABLE_INT_FETCH("hw.atrium_gpu.gfx", &gfx);
-		if (gfx && r == 0)
-			device_printf(sc->dev, "gfx12: stage 4c: %d\n",
-			    amd_gfx12_setup(sc));
+		if (gfx && r == 0) {
+			gfx_r = amd_gfx12_setup(sc);
+			device_printf(sc->dev, "gfx12: stage 4c: %d\n", gfx_r);
+		}
+		/*
+		 * Stage 4d (kenv hw.atrium_gpu.mes=1, needs 4c): MES up and
+		 * answering, run inside the IH test (4b) when that is on so
+		 * MES's fence interrupts prove the IH write path.
+		 */
+		TUNABLE_INT_FETCH("hw.atrium_gpu.mes", &mes);
+		if (mes && !(gfx && gfx_r == 0)) {
+			device_printf(sc->dev, "mes: stage 4d needs stage 4c "
+			    "(hw.atrium_gpu.gfx=1) to pass; skipped\n");
+			mes = 0;
+		}
+		/* Stage 4b (kenv hw.atrium_gpu.ih=1): IH ring 0 + MSI. */
+		TUNABLE_INT_FETCH("hw.atrium_gpu.ih", &ih);
+		if (ih && r == 0)
+			(void)amd_ih7_test(sc, &gt, mes ? amd_mes12_test : NULL);
+		else if (mes && r == 0)
+			(void)amd_mes12_test(sc, &gt);
 		amd_gmc12_gart_disable(&gt);
 		(void)SEND(SMU_ALLOW_GFXOFF, 0, NULL);
 		if (smu_sample(&link, vram, ifver, 5, "idle after stage 4"))

@@ -209,3 +209,26 @@ pub unsafe extern "C" fn atrium_amd_rs64_start(bin: *const u8, len: usize, out: 
         Err(_) => -1,
     }
 }
+
+/// The MES program start address (`mes_uc_start_addr`, 64-bit) of a MES
+/// image (`mes_firmware_header_v1_0`), for the CP_MES_PRGRM_CNTR_START
+/// registers (mes12.c, stage 4d). 0 on success, -1 if the header is refused.
+///
+/// # Safety
+/// `bin` points to `len` readable bytes and `out` to a writable u64.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn atrium_amd_mes_start(bin: *const u8, len: usize, out: *mut u64) -> i32 {
+    if bin.is_null() || out.is_null() {
+        return -1;
+    }
+    // SAFETY: per the contract above.
+    let b = unsafe { core::slice::from_raw_parts(bin, len) };
+    match fw::MesFw::parse(b) {
+        Ok(f) => {
+            // SAFETY: per the contract above.
+            unsafe { *out = f.ucode_start_addr };
+            0
+        }
+        Err(_) => -1,
+    }
+}

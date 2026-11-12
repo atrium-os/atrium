@@ -73,6 +73,8 @@
 #define SWINT_CTRL_ACK		(1u << 8)
 #define SWINT_ID		0xfeu
 #define IH_CLIENT_MP1		0x1fu
+#define IH_CLIENT_GRBM_CP	0x14u
+#define IH_SRC_CP_EOP		0xb5u	/* 181: EOP, incl. MES API fences */
 
 struct ih_gen {
 	uint8_t major, minor;
@@ -388,11 +390,13 @@ ih7_selftest(struct amd_ih7 *ih)
 
 /*
  * Stage 4b test: ring 0 through the GART, MSI-X, self-test, then all of it
- * undone. The GART (4a) must be enabled; the caller tears the GART down
+ * undone. `during`, if not NULL, runs while the ring is live (stage 4d: MES,
+ * whose API fences raise CP EOP interrupts, the IH's first real source). The GART (4a) must be enabled; the caller tears the GART down
  * after this returns.
  */
 int
-amd_ih7_test(struct atrium_amd_softc *sc, struct amd_gart *gt)
+amd_ih7_test(struct atrium_amd_softc *sc, struct amd_gart *gt,
+    int (*during)(struct atrium_amd_softc *, struct amd_gart *))
 {
 	struct amd_ih7 ih;
 	const struct ih_gen *g;
@@ -479,6 +483,20 @@ amd_ih7_test(struct atrium_amd_softc *sc, struct amd_gart *gt)
 	DELAY(10000);
 	(void)ih7_drain(&ih, 0x100, 0x100, 16);
 	ih7_selftest(&ih);
+	if (during != NULL) {
+		uint32_t before = ih.nintr;
+		int derr, seen;
+
+		derr = during(sc, gt);
+		DELAY(10000);
+		seen = ih7_drain(&ih, IH_CLIENT_GRBM_CP, IH_SRC_CP_EOP, 32);
+		ih7_report(&ih, "after stage 4d");
+		device_printf(dev, "ih: stage 4d: %d CP EOP IV(s) (client %#x "
+		    "src %u), %u %s interrupt(s): %s\n", seen,
+		    IH_CLIENT_GRBM_CP, IH_SRC_CP_EOP, ih.nintr - before, ih.kind,
+		    seen > 0 ? "IH write path PASS" : derr != 0 ?
+		    "MES failed, no verdict" : "none (MES fence IRQs off?)");
+	}
 
 	/* Undo: ring off, wait, vector off (ih_v7_0_irq_disable). */
 	ih7_ring_off(&ih);

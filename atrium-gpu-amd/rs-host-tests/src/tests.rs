@@ -466,3 +466,13 @@ fn rs64_start_real_files() {
         assert_eq!(f.ucode_start_addr & 3, 0, "{n}: start not dword aligned");
     }
 }
+
+#[test]
+fn mes_start_real_file() {
+    let Ok(dir) = std::env::var("AMDGPU_FW_DIR") else { return };
+    let b = std::fs::read(std::path::Path::new(&dir).join("gc_12_0_1_uni_mes.bin")).unwrap();
+    let f = MesFw::parse(&b).unwrap();
+    std::println!("uni_mes: ucode_start_addr {:#x}, data_start_addr {:#x}", f.ucode_start_addr, f.data_start_addr);
+    assert_eq!(f.ucode_start_addr & 3, 0, "start not dword aligned");
+    assert!(f.ucode.size > 0);
+}

@@ -337,3 +337,12 @@ land with it.
   still halted, and "stage 4c done; CP halted". 4a and 4b unchanged. Idle after stage 4:
   15 W, accepted. Reset left the card cold; PCH 28–29 °C. Stages 4a–4c are box-verified; the
   IH write path still waits for the first CP interrupt (4d/4e).
+- **2026-11-12 20:05, stage 4d code ready (mes12.c), not yet run on the box.** Kenv
+  `hw.atrium_gpu.mes=1`; needs 4c to pass. Order is now 4a, 4c, then 4b with 4d run inside it
+  while the IH ring is live. Unified MES as amdgpu does it: KIQ = me 3 pipe 1; both pipes
+  started at the uni_mes start address; pipe 1 HQD by register, SET_HW_RESOURCES(_1);
+  pipe 0 mapped by ADD_QUEUE (map_legacy_kq) sent to pipe 1, then SET_HW_RESOURCES(_1),
+  aggregated doorbells and QUERY_SCHEDULER_STATUS. Completion is polled in memory (fence +
+  status), so 4d does not depend on interrupts. MES fence interrupts plus TIME_STAMP_INT on
+  the MES pipes should give CP EOP IVs (client 0x14, source 181), which would be the IH write
+  path's first proof. MES is halted again at the end; mode 1 reset as always.
