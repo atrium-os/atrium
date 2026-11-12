@@ -185,15 +185,17 @@ isolation rules and the tests' ABI stay as they are. Display stays gpusim-only f
 |---|---|
 | 5a | **Attached lifecycle.** Attach runs stages 3–4 (PSP, SMU, GC idle, GART, IH, GFX, MES) and stays up: GfxOff disallowed only while work is queued, telemetry watch, A3 rules. Detach: queues removed, MES and CP halted, PrepareMp1ForUnload, mode 1 reset. Box test: load, idle 60 s proven by telemetry, unload cold. |
 | 5b | **Per-client VMs on silicon.** VMIDs 1–7 owned by the kernel (MES keeps 8–15); real GCVM_CONTEXTn page-table bases and the gmc_v12 PDE/PTE format; TLB invalidate with ack per VMID; UTCL2 faults from the IH into the existing VM-fault path. |
-| 5c | **Queues.** The compute and gfx queues become kernel queues mapped by MES (map_legacy_kq) whose MQD carries the client VM's VMID, so the ring is read in the client's address space exactly as on gpusim. Owner changes are REMOVE_QUEUE then ADD_QUEUE; rptr from the HQD / rptr report; EOP interrupts into the existing completion path; the hang watchdog uses REMOVE_QUEUE and the dequeue handshake. Doorbell pages stay per queue. |
+| 5c | **Queues: MES user queues with an Atrium interface** (decided 2026-11-12). MES schedules (priorities, time slicing, preemption, per-queue reset) and assigns VMIDs per process; the driver supplies each client context's page-table base. Interface: a queue is a file descriptor (submit right; SCM_RIGHTS / Capsicum; close = REMOVE_QUEUE); completion is a kqueue filter woken by the IH EOP; explicit timeline syncobjs only; the doorbell page is a revocable managed-pager mapping; per-uid/jail quotas on queues and VRAM; priorities from the power/posture federation; only the queue's fd reports device-lost on a hang. The kernel is the only MES client; map_legacy_kq stays for the kernel's own queues (scrub, self-test). |
 | 5d | **VRAM.** The allocator's range clear of the PSP reservations; scrub-on-free through DMA_DATA on a kernel queue (the 4e path). |
 | 5e | **Tests on silicon.** Dispatches that use gpusim's SIM_COMPUTE_KERNEL get a real-shader variant (oracle-built, like write_42); WAIT_REG_MEM parking works unchanged. |
 | 5f | **Acceptance.** `atrium_gpu_test` and `test_gpu_isolation` (82 checks) on the box. |
 
-Alternative to 5c: full MES user queues (ADD_QUEUE with process and gang contexts, MES
-assigns VMIDs). It is closer to amdgpu's user-queue path and to where the hardware is
-going, but changes how the driver owns VMIDs and queues, so the isolation proofs would
-have to be redone. 5c keeps today's model and proofs.
+Decided 2026-11-12 (Shankar): MES user queues, not kernel queues carrying the client's
+VMID, because the hardware's scheduler is MES and fixed HQDs cap clients at a handful.
+Not amdgpu's interface: the fd/kqueue/capability surface above. 5b changes with it: MES
+owns VMID slots (8–15); the driver owns page tables per context. The isolation tests move
+from "a queue shared between VMs" to "a queue fd can only reach its own context", tested
+through fd passing, close and jail death.
 
 ## 5. Log
 
