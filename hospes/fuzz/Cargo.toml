@@ -11,6 +11,10 @@ cargo-fuzz = true
 [dependencies]
 libfuzzer-sys = "0.4"
 hospes-elf = { path = "../hospes-elf" }
+hospes-proto = { path = "../hospes-proto", features = ["std"] }
+hospes-codec-wire = { path = "../hospes-codec-wire" }
+hospes-glibc = { path = "../hospes-glibc" }
+hospes-install = { path = "../hospes-install" }
 
 # Not part of the hospes workspace: cargo-fuzz builds it on its own.
 [workspace]
@@ -18,6 +22,34 @@ hospes-elf = { path = "../hospes-elf" }
 [[bin]]
 name = "elf"
 path = "fuzz_targets/elf.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "proto"
+path = "fuzz_targets/proto.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "codec_wire"
+path = "fuzz_targets/codec_wire.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "vfs"
+path = "fuzz_targets/vfs.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "install"
+path = "fuzz_targets/install.rs"
 test = false
 doc = false
 bench = false

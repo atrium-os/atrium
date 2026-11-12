@@ -1,0 +1,102 @@
+# Hospes version watch (docs/spec/hospes.md §11.4, step H5).
+#
+# Every day, take the libraries Hospes hosts from their publishers and check that Hospes still
+# hosts them, on both machines (aarch64 under qemu-user on an x86_64 runner):
+#
+#   - Widevine: Google's signed apt index -> google-chrome-stable .deb -> the CDM, checked by
+#     `hospes-install widevine-check` (pinned key, hashes, ELF, entry points, every strong
+#     import provided by the shim). The CDM is never run in CI.
+#   - OpenH264: Cisco's binary, its imports checked, and a clip decoded under Hospes and under
+#     real glibc, which must agree byte for byte.
+#   - The fixture workload: scripts/hospes-build.sh test-linux (loader, shim, unwinder,
+#     syscall trap; x86_64 native and aarch64 under qemu-user).
+#
+# A new Chrome or OpenH264 build that imports something the shim lacks, or decodes
+# differently, turns this red. Nothing fetched is kept or uploaded.
+#
+# Weekly (and on demand) it also runs each Hospes fuzz target for 5 minutes, so the targets
+# keep building and a cheap regression shows up; the 1-hour runs are in the H5 write-up.
+
+name: hospes-version-watch
+
+on:
+  schedule:
+    - cron: '17 6 * * *'
+    - cron: '43 3 * * 0'
+  workflow_dispatch:
+    inputs:
+      fuzz:
+        description: 'Also run the fuzz targets (5 min each)'
+        type: boolean
+        default: false
+  push:
+    branches: [main]
+    paths:
+      - 'hospes/**'
+      - 'scripts/hospes-build.sh'
+      - 'scripts/hospes-version-watch.sh'
+      - '.github/workflows/hospes-version-watch.yml'
+
+concurrency:
+  group: hospes-version-watch-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  watch:
+    name: version watch (${{ matrix.arch }})
+    if: github.event.schedule != '43 3 * * 0'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        arch: [x86_64, aarch64]
+    steps:
+      - uses: actions/checkout@v4
+      - name: Packages
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y -q qemu-user-static gcc-aarch64-linux-gnu libc6-dev-arm64-cross ffmpeg bzip2
+      - name: Rust (nightly + rust-src, from rust-toolchain.toml)
+        run: rustup show active-toolchain || rustup toolchain install
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            hospes/target
+          key: hospes-${{ matrix.arch }}-${{ hashFiles('hospes/Cargo.lock', 'rust-toolchain.toml') }}
+          restore-keys: hospes-${{ matrix.arch }}-
+      - name: The shim against the recorded import lists
+        if: matrix.arch == 'x86_64'
+        run: cd hospes && cargo test -q --release -p hospes-glibc --test imports
+      - name: Today's Widevine and OpenH264
+        run: sh scripts/hospes-version-watch.sh ${{ matrix.arch }}
+      - name: Fixture workload
+        if: matrix.arch == 'x86_64'
+        run: sh scripts/hospes-build.sh test-linux
+
+  fuzz:
+    name: fuzz (5 min per target)
+    if: (github.event_name == 'workflow_dispatch' && inputs.fuzz) || github.event.schedule == '43 3 * * 0'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - name: Rust and cargo-fuzz
+        run: |
+          rustup show active-toolchain || rustup toolchain install
+          cargo install -q cargo-fuzz --version 0.13.2 --locked
+      - name: Fuzz
+        run: |
+          cd hospes/fuzz
+          for t in elf proto codec_wire vfs install; do
+            echo "== $t"
+            cargo fuzz run "$t" -O -- -max_total_time=300 -rss_limit_mb=2048 -max_len=65536
+          done
+      - name: Keep any crash
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: hospes-fuzz-artifacts
+          path: hospes/fuzz/artifacts

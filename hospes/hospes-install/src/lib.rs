@@ -80,13 +80,27 @@ pub struct LibraryInfo {
 /// The machine's ELF shared object, the CDM entry points exported, and every strong import
 /// provided by the glibc shim by (name, version).
 pub fn check_library(bytes: &[u8]) -> Result<LibraryInfo, Error> {
-    let machine = if cfg!(target_arch = "aarch64") { hospes_elf::Machine::Aarch64 } else { hospes_elf::Machine::X86_64 };
-    let img = hospes_elf::parse(bytes, Some(machine)).map_err(|e| Error::Library(format!("not this machine's ELF library: {e:?}")))?;
+    let img = parse_library(bytes)?;
     for ep in ENTRY_POINTS {
         if img.export(ep, None).is_none() {
             return Err(Error::Library(format!("no {ep}: not a CDM")));
         }
     }
+    imports_provided(&img, bytes)
+}
+
+/// Any library Hospes hosts (the CDM or OpenH264): the machine's ELF shared object, and every
+/// strong import provided by the glibc shim. The version watch (spec §11.4) runs this.
+pub fn check_imports(bytes: &[u8]) -> Result<LibraryInfo, Error> {
+    imports_provided(&parse_library(bytes)?, bytes)
+}
+
+fn parse_library(bytes: &[u8]) -> Result<hospes_elf::Image, Error> {
+    let machine = if cfg!(target_arch = "aarch64") { hospes_elf::Machine::Aarch64 } else { hospes_elf::Machine::X86_64 };
+    hospes_elf::parse(bytes, Some(machine)).map_err(|e| Error::Library(format!("not this machine's ELF library: {e:?}")))
+}
+
+fn imports_provided(img: &hospes_elf::Image, bytes: &[u8]) -> Result<LibraryInfo, Error> {
     let have: std::collections::HashSet<(&str, Option<&str>)> = hospes_glibc::provided().collect();
     let mut missing = Vec::new();
     let mut n = 0;

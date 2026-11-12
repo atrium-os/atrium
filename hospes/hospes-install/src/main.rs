@@ -6,6 +6,13 @@
 //!       verify the chain to DEB, take out the CDM and its manifest, install into DEST
 //!   hospes-install widevine-file LIB [MANIFEST] DEST
 //!       the user's own libwidevinecdm.so (and manifest.json), checked and installed
+//!   hospes-install widevine-check INRELEASE PACKAGES DEB
+//!       as widevine-deb, but install nothing: print the CDM's version and import count
+//!   hospes-install check-imports LIB
+//!       any library Hospes hosts (OpenH264 too): every strong import provided by the shim
+//!
+//! The last two are the version watch (docs/spec/hospes.md §11.4, .github/workflows/
+//! hospes-version-watch.yml).
 //!
 //! The files come from the caller (the system fetches them through Nuntius). Nothing from
 //! the package or the library is run.
@@ -36,6 +43,21 @@ fn run(args: &[String]) -> Result<(), Error> {
             println!("installed Widevine from {} {} into {}", p.name, p.version, dir.display());
             Ok(())
         }
+        ["widevine-check", inrelease, packages, deb] => {
+            let p = apt::verify_apt(&text(inrelease)?, &read(packages)?, PACKAGE)?;
+            let deb = read(deb)?;
+            apt::check_deb(&p, &deb)?;
+            let x = extract_cdm(&deb)?;
+            let info = check_library(&x.library)?;
+            let v = hospes_install::manifest_version(&x.manifest).unwrap_or_else(|| "unknown".into());
+            println!("{} {}: CDM {v}, {} imports, all provided, sha256 {}", p.name, p.version, info.imports, info.sha256);
+            Ok(())
+        }
+        ["check-imports", lib] => {
+            let info = hospes_install::check_imports(&read(lib)?)?;
+            println!("{lib}: {} imports, all provided, sha256 {}", info.imports, info.sha256);
+            Ok(())
+        }
         ["widevine-file", lib, dest] | ["widevine-file", lib, _, dest] => {
             let manifest = if args.len() == 4 { Some(read(&args[2])?) } else { None };
             let lib = read(lib)?;
@@ -45,7 +67,7 @@ fn run(args: &[String]) -> Result<(), Error> {
             Ok(())
         }
         _ => {
-            eprintln!("usage: hospes-install widevine-index INRELEASE PACKAGES | widevine-deb INRELEASE PACKAGES DEB DEST | widevine-file LIB [MANIFEST] DEST");
+            eprintln!("usage: hospes-install widevine-index INRELEASE PACKAGES | widevine-deb INRELEASE PACKAGES DEB DEST | widevine-file LIB [MANIFEST] DEST | widevine-check INRELEASE PACKAGES DEB | check-imports LIB");
             Err(Error::Io("usage".into()))
         }
     }
