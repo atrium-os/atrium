@@ -127,9 +127,12 @@ fn fw_dir(dir: &Path) {
 fn hw_name(id: u16) -> &'static str {
     use discovery::hwid::*;
     match id {
-        MP1 => "MP1(SMU)", THM => "THM", SMUIO => "SMUIO", GC => "GC", MMHUB => "MMHUB",
-        ATHUB => "ATHUB", OSSSYS => "OSSSYS(IH)", HDP => "HDP", SDMA0 => "SDMA", VCN => "VCN",
-        DF => "DF", NBIF => "NBIF", UMC => "UMC", MP0 => "MP0(PSP)", DMU => "DMU(DCN)",
+        MP1 => "MP1(SMU)", THM => "THM", SMUIO => "SMUIO", FUSE => "FUSE", CLKA => "CLKA",
+        PWR => "PWR", GC => "GC", VCN => "VCN", MMHUB => "MMHUB", ATHUB => "ATHUB",
+        DBGU_NBIO => "DBGU_NBIO", DFX => "DFX", OSSSYS => "OSSSYS(IH)", HDP => "HDP",
+        SDMA0 => "SDMA0", SDMA1 => "SDMA1", ISP => "ISP", DF => "DF", DFX_DAT => "DFX_DAT",
+        PCIE => "PCIE", LSDMA => "LSDMA", NBIF => "NBIF", SYSTEMHUB => "SYSTEMHUB", UMC => "UMC",
+        MP0 => "MP0(PSP)", DMU => "DMU(DCN)", DIO => "DIO", DAZ => "DAZ",
         _ => "?",
     }
 }

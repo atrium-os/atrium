@@ -176,3 +176,37 @@ fn no_panic_on_any_single_byte_corruption() {
         }
     }
 }
+
+/// Golden: the R9700's (Navi48) discovery table, read from the top of VRAM by
+/// atrium-gpu-probe under Atrium on bare metal, 2026-11-12. Real bytes, so it
+/// catches constants that a synthetic fixture would share with the parser
+/// (the "IPIP"/"IPDS" signature bug).
+#[test]
+fn r9700_golden_discovery() {
+    let b = include_bytes!("../data/r9700-discovery.bin");
+    let d = Discovery::parse(b).unwrap();
+    assert_eq!((d.version_major, d.version_minor, d.ip_version, d.num_dies), (1, 3, 3, 1));
+    let v = |id, inst| {
+        let ip = d.find(id, inst).unwrap().unwrap_or_else(|| panic!("hw {id} inst {inst} missing"));
+        (ip.major, ip.minor, ip.revision)
+    };
+    assert_eq!(v(hwid::GC, 0), (12, 0, 1));
+    assert_eq!(v(hwid::MP0, 0), (14, 0, 3));
+    assert_eq!(v(hwid::MP1, 0), (14, 0, 3));
+    assert_eq!(v(hwid::SDMA0, 0), (7, 0, 1));
+    assert_eq!(v(hwid::SDMA1, 0), (7, 0, 1));
+    assert_eq!(v(hwid::MMHUB, 0), (4, 1, 0));
+    assert_eq!(v(hwid::OSSSYS, 0), (7, 0, 0));
+    assert_eq!(v(hwid::HDP, 0), (7, 0, 0));
+    assert_eq!(v(hwid::NBIF, 0), (6, 3, 1));
+    assert_eq!(v(hwid::VCN, 0), (5, 0, 0));
+    assert_eq!(v(hwid::DMU, 0), (4, 1, 0));
+    assert_eq!(d.find(hwid::GC, 0).unwrap().unwrap().bases(), &[0x1260, 0xa000, 0x1c000, 0x2402c00]);
+    assert_eq!(d.find(hwid::MP0, 0).unwrap().unwrap().bases()[0], 0x16000);
+    let mut n = 0;
+    d.for_each_ip(|_| n += 1).unwrap();
+    assert_eq!(n, 46);
+    let mut umc = 0;
+    d.for_each_ip(|ip| if ip.hw_id == hwid::UMC { umc += 1 }).unwrap();
+    assert_eq!(umc, 8);
+}

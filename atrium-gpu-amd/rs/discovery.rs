@@ -42,18 +42,31 @@ pub mod hwid {
     pub const MP1: u16 = 1; /* SMU */
     pub const THM: u16 = 3;
     pub const SMUIO: u16 = 4;
+    pub const FUSE: u16 = 5;
+    pub const CLKA: u16 = 6;
+    pub const PWR: u16 = 10;
     pub const GC: u16 = 11;
+    pub const VCN: u16 = 12; /* also UVD */
     pub const MMHUB: u16 = 34;
     pub const ATHUB: u16 = 35;
     pub const OSSSYS: u16 = 40; /* IH */
     pub const HDP: u16 = 41;
+    pub const DBGU_NBIO: u16 = 36;
+    pub const DFX: u16 = 37;
     pub const SDMA0: u16 = 42;
-    pub const VCN: u16 = 44;
+    pub const SDMA1: u16 = 43;
+    pub const ISP: u16 = 44;
     pub const DF: u16 = 46;
+    pub const DFX_DAT: u16 = 49;
+    pub const PCIE: u16 = 70;
+    pub const LSDMA: u16 = 91;
     pub const NBIF: u16 = 108;
+    pub const SYSTEMHUB: u16 = 128;
     pub const UMC: u16 = 150;
     pub const MP0: u16 = 255; /* PSP */
     pub const DMU: u16 = 271; /* display (DCN) */
+    pub const DIO: u16 = 272;
+    pub const DAZ: u16 = 274;
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
