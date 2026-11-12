@@ -241,3 +241,17 @@ reads non-zero, all-zero GC registers mean "off", not "idle".
     per-generation backends, rule A3.7 "the card must be able to idle", and the idle check;
   - `hw.atrium_gpu.gc_up_ok=1` is now required for any hook that powers GC up;
   - stage 4 also waits for power P2.
+- **2026-11-12 17:25, power P2 step 1 box test (17d71224): mode 1 reset works.**
+  - **Reset alone on a cold card:** PSP bootloader ready, no sOS, memsize 32624 MiB, GC off.
+  - **Stage 3 from cold, then the reset** (`gc_up_ok=1`): all 20 IP images and the RLC
+    autoload went as before. The features were 0x0488f19e38fffcfb after EnableAll. The
+    telemetry showed:
+    - right after the RLC booted: 13 W, gfx 0 MHz, edge 30 °C;
+    - 1 s later: **262 W, gfx 3149 MHz, 100 % busy**, hotspot 59 °C, with the CP halted.
+
+    GC powered up with no gfx init goes to full clock at once. The mode 1 reset then put the
+    card back to post-POST: bootloader ready, sOS 0, GB_ADDR_CONFIG 0, RLC_CNTL 0. The PCH
+    stayed at 28–30 °C for 5 minutes afterwards. Bring-up runs no longer need a power cycle.
+  - **Open:** the first telemetry sample after the features are enabled read mem 3 °C and
+    VR 6 °C, probably before the sensors settle.
+  - **Next:** P2 step 2, the gfx init that lets GC idle while attached (CG/PG, CP).
