@@ -707,6 +707,7 @@ mes_run(struct mes *m)
 	grbm_select(m, 0, 0);
 
 	mes_report(m, "before");
+	amd_gfx12_pm_report(sc, "before MES");
 	mes_enable(m, true);
 	mes_report(m, "started");
 
@@ -808,8 +809,20 @@ amd_mes12_test(struct atrium_amd_softc *sc, struct amd_gart *gt)
 	pci_enable_busmaster(sc->dev);
 	err = mes_run(&m);
 	mes_report(&m, err == 0 ? "answered" : "failed");
+	amd_gfx12_pm_report(sc, "MES running");
 	mes_teardown(&m);
 	mes_report(&m, "torn down");
+	amd_gfx12_pm_report(sc, "MES torn down");
+	/*
+	 * Box run 84bd8b3f: once MES had run, RLC_STAT fell from 0x35 to 0 and
+	 * GRBM_STATUS kept GUI_ACTIVE|CP_BUSY|ANY_ACTIVE after the halt; the
+	 * card stayed at 60 W. Redo the GC idle sequence (SRM + clock gating)
+	 * so the idle check after stage 4 sees whether that brings it back.
+	 */
+	device_printf(sc->dev, "mes: GC idle sequence again after MES: %d\n",
+	    amd_gc_idle_enter(sc));
+	DELAY(100000);
+	amd_gfx12_pm_report(sc, "100 ms after the idle sequence");
 	if ((pci_cmd & PCIM_CMD_BUSMASTEREN) == 0)
 		pci_disable_busmaster(sc->dev);
 	device_printf(sc->dev, "mes: stage 4d: %s\n", err == 0 ?

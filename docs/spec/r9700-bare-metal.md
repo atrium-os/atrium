@@ -358,3 +358,11 @@ land with it.
   the scheduler queue, dequeuing both MES HQDs by register, unmapped doorbells off and
   CPC_INT_CNTL restored, then halting. GRBM_STATUS, CP_STAT and RLC_STAT are logged at
   each step.
+- **2026-11-12 20:23, stage 4d with teardown (84bd8b3f): teardown clean, still not idle.**
+  REMOVE_QUEUE (scheduler) ok in 110 µs, both MES HQDs dequeued to inactive, MES halted.
+  There were 14 CP EOP IVs. Power was still 13 → 52 → 60 W with gfx 3.4 GHz and 100 %
+  busy, so the active HQDs were not the cause. RLC_STAT went 0x35 → 0x25 → 0 once MES
+  started and answered, and stayed 0. GRBM_STATUS was 0xa800382c (GUI_ACTIVE, CP_BUSY,
+  ANY_ACTIVE) after MES answered and after the halt. The driver refused and the reset
+  left the card cold. Next run: RLC and clock-gating registers logged around MES, and the
+  GC idle sequence (SRM + clock gating) re-run after the teardown.

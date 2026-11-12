@@ -123,13 +123,14 @@ amd_gfx12_pm_report(struct atrium_amd_softc *sc, const char *when)
 {
 	if (!gfx12_regs_ok(sc))
 		return;
-	device_printf(sc->dev, "gfx: %s: GRBM_STATUS %#x, RLC_STAT %#x, "
-	    "MGCG_OVERRIDE %#x, CGCG_CGLS %#x, CGCG_CGLS_3D %#x, SRM %#x, "
-	    "CP_INT_CNTL_RING0 %#x\n", when, rd(sc, 0, GC12_GRBM_STATUS),
+	device_printf(sc->dev, "gfx: %s: GRBM_STATUS %#x, RLC_CNTL %#x, "
+	    "RLC_STAT %#x, MGCG_OVERRIDE %#x, CGCG_CGLS %#x, CGCG_CGLS_3D %#x, "
+	    "SRM %#x, CP_INT_CNTL %#x, CP_INT_CNTL_RING0 %#x\n", when,
+	    rd(sc, 0, GC12_GRBM_STATUS), rd(sc, 1, GC12_RLC_CNTL),
 	    rd(sc, 1, GC12_RLC_STAT), rd(sc, 1, GC12_RLC_CGTT_MGCG_OVERRIDE),
 	    rd(sc, 1, GC12_RLC_CGCG_CGLS_CTRL),
 	    rd(sc, 1, GC12_RLC_CGCG_CGLS_CTRL_3D), rd(sc, 1, GC12_RLC_SRM_CNTL),
-	    rd(sc, 0, GC12_CP_INT_CNTL_RING0));
+	    rd(sc, 0, GC12_CP_INT_CNTL), rd(sc, 0, GC12_CP_INT_CNTL_RING0));
 }
 
 /* gfx_v12_0_rlc_resume, PSP-loaded branch. */
