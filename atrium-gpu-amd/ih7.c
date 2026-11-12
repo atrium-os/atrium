@@ -3,7 +3,7 @@
  *
  * ih7.c — stage 4b of the silicon bring-up (docs/spec/r9700-bare-metal.md
  * §4.4): the interrupt handler (IH, in OSSSYS) ring 0 on real silicon, its
- * MSI-X vector, and a self-test interrupt. ih.c is gpusim's model of the
+ * MSI-X or MSI vector, and a self-test interrupt. ih.c is gpusim's model of the
  * same thing and stays as it is until the silicon path replaces it.
  *
  * Interface: Linux's MIT-licensed ih_v7_0.c, amdgpu_ih.c and nbif_v6_3_1.c
@@ -12,7 +12,7 @@
  * ring through GPU virtual memory (MC_SPACE 4, VMID 0), so the ring and the
  * write-pointer writeback page are system pages mapped into the GART that
  * stage 4a set up. Read pointer by register (no doorbell); RPTR_REARM so
- * one MSI-X message is sent per read-pointer write.
+ * one message is sent per read-pointer write.
  *
  * Each IV is 8 dwords (amdgpu_ih_decode_iv_helper): client 7:0, source
  * 15:8, ring 23:16, vmid 27:24 in dword 0; timestamp; pasid; four data.
@@ -22,6 +22,8 @@
  * expects one IV from client MP1, source 0xFE, then acks it. Whether the
  * host may raise it is not documented; no cookie means "inconclusive", not
  * a failure, and the real proof becomes the first EOP in 4e.
+ * Box run 2026-11-12 19:11: ring programmed, IH_STATUS idle throughout,
+ * no IV: the IH input never saw the trigger, so the GART path is untested.
  *
  * Everything is per version: ih_gens[] by OSSSYS version, swint_gens[] by
  * MP1 version. An unknown version is not touched (power spec A3.10).
@@ -110,7 +112,8 @@ struct amd_ih7 {
 	struct resource *irq, *msix_table;
 	int irq_rid, msix_table_rid;
 	void *intr_cookie;
-	bool msix;
+	bool msi;
+	const char *kind;		/* MSI-X, MSI or polling */
 	volatile u_int nintr;
 	uint16_t pci_cmd;
 };
@@ -154,20 +157,36 @@ ih7_filter(void *arg)
 	return (FILTER_HANDLED);
 }
 
-/* One MSI-X vector for ring 0 (the base owns MSI-X on the gpusim path). */
+/*
+ * One message-signalled vector for ring 0: MSI-X if the function has it,
+ * else plain MSI (the R9700 exposes only MSI, 1 message, 2026-11-12), else
+ * none and the ring is polled. Every IH client shares the one vector.
+ */
 static void
-ih7_msix_setup(struct amd_ih7 *ih)
+ih7_msi_setup(struct amd_ih7 *ih)
 {
 	device_t dev = ih->sc->dev;
 	int count = 1;
 
-	ih->msix_table_rid = pci_msix_table_bar(dev);
-	ih->msix_table = bus_alloc_resource_any(dev, SYS_RES_MEMORY,
-	    &ih->msix_table_rid, RF_ACTIVE);
-	if (ih->msix_table == NULL)
+	if (pci_msix_count(dev) > 0) {
+		ih->msix_table_rid = pci_msix_table_bar(dev);
+		ih->msix_table = bus_alloc_resource_any(dev, SYS_RES_MEMORY,
+		    &ih->msix_table_rid, RF_ACTIVE);
+		if (ih->msix_table != NULL &&
+		    pci_alloc_msix(dev, &count) == 0 && count >= 1)
+			ih->kind = "MSI-X";
+		else if (ih->msix_table != NULL) {
+			bus_release_resource(dev, SYS_RES_MEMORY,
+			    ih->msix_table_rid, ih->msix_table);
+			ih->msix_table = NULL;
+		}
+	}
+	count = 1;
+	if (ih->kind == NULL && pci_msi_count(dev) > 0 &&
+	    pci_alloc_msi(dev, &count) == 0 && count >= 1)
+		ih->kind = "MSI";
+	if (ih->kind == NULL)
 		goto fail;
-	if (pci_alloc_msix(dev, &count) != 0 || count < 1)
-		goto fail_table;
 	ih->irq_rid = 1;
 	ih->irq = bus_alloc_resource_any(dev, SYS_RES_IRQ, &ih->irq_rid,
 	    RF_ACTIVE);
@@ -176,23 +195,27 @@ ih7_msix_setup(struct amd_ih7 *ih)
 	if (bus_setup_intr(dev, ih->irq, INTR_TYPE_MISC | INTR_MPSAFE,
 	    ih7_filter, NULL, ih, &ih->intr_cookie) != 0)
 		goto fail_irq;
-	ih->msix = true;
+	ih->msi = true;
+	device_printf(dev, "ih: %s, 1 vector, for every IH client\n",
+	    ih->kind);
 	return;
 fail_irq:
 	bus_release_resource(dev, SYS_RES_IRQ, ih->irq_rid, ih->irq);
 	ih->irq = NULL;
 fail_msi:
 	pci_release_msi(dev);
-fail_table:
-	bus_release_resource(dev, SYS_RES_MEMORY, ih->msix_table_rid,
-	    ih->msix_table);
+	if (ih->msix_table != NULL)
+		bus_release_resource(dev, SYS_RES_MEMORY, ih->msix_table_rid,
+		    ih->msix_table);
 	ih->msix_table = NULL;
 fail:
-	device_printf(dev, "ih: MSI-X unavailable; polling the ring\n");
+	device_printf(dev, "ih: no MSI-X or MSI vector (MSI-X %d, MSI %d); "
+	    "polling the ring\n", pci_msix_count(dev), pci_msi_count(dev));
+	ih->kind = "polling";
 }
 
 static void
-ih7_msix_teardown(struct amd_ih7 *ih)
+ih7_msi_teardown(struct amd_ih7 *ih)
 {
 	device_t dev = ih->sc->dev;
 
@@ -208,17 +231,18 @@ ih7_msix_teardown(struct amd_ih7 *ih)
 		bus_release_resource(dev, SYS_RES_MEMORY, ih->msix_table_rid,
 		    ih->msix_table);
 	ih->msix_table = NULL;
-	ih->msix = false;
+	ih->msi = false;
 }
 
 static void
 ih7_report(struct amd_ih7 *ih, const char *when)
 {
 	device_printf(ih->sc->dev, "ih: %s: RB_CNTL %#x, RPTR %#x, WPTR %#x "
-	    "(writeback %#x), STATUS %#x, MSI-X interrupts %u\n", when,
+	    "(writeback %#x), STATUS %#x, %s interrupts %u\n", when,
 	    ihr(ih, ih->g->rb_cntl), ihr(ih, ih->g->rb_rptr),
 	    ihr(ih, ih->g->rb_wptr), ih->wb != NULL ? ih->wb[0] : 0,
-	    ihr(ih, ih->g->status), ih->nintr);
+	    ihr(ih, ih->g->status), ih->kind != NULL ? ih->kind : "no",
+	    ih->nintr);
 }
 
 /* Ring off, pointers to 0 (ih_v7_0_toggle_ring_interrupts(false)). */
@@ -337,6 +361,9 @@ ih7_selftest(struct amd_ih7 *ih)
 	amd_mmio_write32(sc, mp1(sc, s->sw_int_ctrl), ctrl & ~SWINT_CTRL_MASK);
 	amd_mmio_write32(sc, mp1(sc, s->sw_int),
 	    (old & ~SWINT_ID_MASK) | SWINT_ID | SWINT_VALID);
+	device_printf(sc->dev, "ih: MP1 SW_INT %#x, SW_INT_CTRL %#x after "
+	    "the trigger\n", amd_mmio_read32(sc, mp1(sc, s->sw_int)),
+	    amd_mmio_read32(sc, mp1(sc, s->sw_int_ctrl)));
 	err = ih7_wait(ih, ih->wb[0], 100);
 	DELAY(1000);
 	seen = ih7_drain(ih, IH_CLIENT_MP1, SWINT_ID, 16);
@@ -350,13 +377,13 @@ ih7_selftest(struct amd_ih7 *ih)
 	ih7_report(ih, "after self-test");
 	if (seen > 0)
 		device_printf(sc->dev, "ih: self-test: %d IV(s) from MP1 "
-		    "source %#x, %u MSI-X interrupt(s): PASS\n", seen,
-		    SWINT_ID, ih->nintr - before);
+		    "source %#x, %u %s interrupt(s): PASS\n", seen,
+		    SWINT_ID, ih->nintr - before, ih->kind);
 	else
 		device_printf(sc->dev, "ih: self-test: no IV from MP1 (%s), "
-		    "%u MSI-X interrupt(s): inconclusive\n",
+		    "%u %s interrupt(s): inconclusive\n",
 		    err == 0 ? "other IVs only" : "wptr never moved",
-		    ih->nintr - before);
+		    ih->nintr - before, ih->kind);
 }
 
 /*
@@ -421,7 +448,7 @@ amd_ih7_test(struct atrium_amd_softc *sc, struct amd_gart *gt)
 	amd_mmio_write32(sc, nbif(&ih, g->bif_int_cntl),
 	    c & ~(IH_DUMMY_RD_OVERRIDE | IH_REQ_NONSNOOP_EN));
 
-	ih7_msix_setup(&ih);
+	ih7_msi_setup(&ih);
 
 	ihw(&ih, g->rb_base, (uint32_t)(ring_va >> 8));
 	ihw(&ih, g->rb_base_hi, (uint32_t)(ring_va >> 40) & 0xff);
@@ -431,7 +458,7 @@ amd_ih7_test(struct atrium_amd_softc *sc, struct amd_gart *gt)
 	c |= WPTR_OVERFLOW_CLEAR | WPTR_OVERFLOW_ENABLE |
 	    ((uint32_t)(ffs(IH_RING_SIZE / 4) - 1) << RB_SIZE_SHIFT) |
 	    WPTR_WRITEBACK_ENABLE | MC_SNOOP |
-	    (MC_SPACE_GPUVA << MC_SPACE_SHIFT) | (ih.msix ? RPTR_REARM : 0);
+	    (MC_SPACE_GPUVA << MC_SPACE_SHIFT) | (ih.msi ? RPTR_REARM : 0);
 	ihw(&ih, g->rb_cntl, c);
 	ihw(&ih, g->wptr_addr_lo, (uint32_t)wb_va);
 	ihw(&ih, g->wptr_addr_hi, (uint32_t)(wb_va >> 32) & 0xffff);
@@ -457,7 +484,7 @@ amd_ih7_test(struct atrium_amd_softc *sc, struct amd_gart *gt)
 	ih7_ring_off(&ih);
 	DELAY(1000);
 	ih7_report(&ih, "disabled");
-	ih7_msix_teardown(&ih);
+	ih7_msi_teardown(&ih);
 	if ((ih.pci_cmd & PCIM_CMD_BUSMASTEREN) == 0)
 		pci_disable_busmaster(dev);
 	err = 0;
