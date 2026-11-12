@@ -149,6 +149,23 @@ psp_wait(struct atrium_amd_softc *sc, uint32_t dw, uint32_t mask,
 }
 
 /*
+ * After an ASIC reset: wait for the PSP bootloader to be ready again and
+ * report whether a sOS is running (it should not be). 0 or ETIMEDOUT.
+ */
+int
+amd_psp_wait_bootloader(struct atrium_amd_softc *sc, uint32_t *sos)
+{
+	int err;
+
+	if (!sc->ip.mp0.present || sc->ip.mp0.major != 14)
+		return (ENOTSUP);
+	err = psp_wait(sc, PSP14_C2PMSG_35, PSP_BL_READY, PSP_BL_READY, 0, 0);
+	if (sos != NULL)
+		*sos = amd_mmio_read32(sc, psp_reg(sc, PSP14_C2PMSG_81));
+	return (err);
+}
+
+/*
  * Make CPU writes through the BAR visible to the GPU's own agents (the PSP
  * reads VRAM directly, behind HDP): HDP_MEM_COHERENCY_FLUSH_CNTL, then a read
  * as amdgpu does. NBIF segment 2 from discovery.

@@ -95,6 +95,13 @@ struct smu_gen {
 	/* Mailbox, dword offsets in MP1 segment 1. */
 	uint32_t	reg_msg, reg_arg, reg_resp;
 	uint16_t	msg[SMU_NMSG];
+	/*
+	 * Debug mailbox (no response handshake), used for one thing: the
+	 * ASIC reset that puts the card back in its post-POST state on
+	 * detach (spec A3.6). 0 = the generation has none.
+	 */
+	uint32_t	reg_dbg_param, reg_dbg_msg, reg_dbg_resp;
+	uint16_t	dbg_mode1_reset;
 	/* Features that must be running before the GPU is used (spec §4). */
 	uint64_t	required;
 	uint32_t	table_metrics;
@@ -111,6 +118,9 @@ static const struct smu_gen smu_gens[] = {
 		.mp1_major = 14, .mp1_minor = 0, .mp1_rev_min = 2,
 		.mp1_rev_max = 3, .name = "SMU 14.0.2/3",
 		.reg_msg = 0x82, .reg_arg = 0x92, .reg_resp = 0x9a,
+		/* C2PMSG_53/75/54; DEBUGSMC_MSG_Mode1Reset (smu_v14_0_2_ppt.c). */
+		.reg_dbg_param = 0x75, .reg_dbg_msg = 0x8b, .reg_dbg_resp = 0x76,
+		.dbg_mode1_reset = 2,
 		.msg = {
 			[SMU_TEST] = 0x01,
 			[SMU_GET_VERSION] = 0x02,
@@ -483,5 +493,68 @@ amd_smu_init(struct atrium_amd_softc *sc)
 out:
 	if (vram != NULL)
 		bus_release_resource(sc->dev, SYS_RES_MEMORY, rid, vram);
+	return (err);
+}
+
+/*
+ * Mode 1 reset (spec A3.6, B1): the whole ASIC but the PCIe link goes back
+ * to its post-POST state: PSP bootloader waiting, no sOS, no IP firmware,
+ * GC off, PMFW from the board's own ROM. That is the state the card idled
+ * in before the driver touched it, so it is how the driver leaves the card
+ * on detach whenever it went past read-only (amdgpu's reset method for MP1
+ * 14.0.2/3, amdgpu_device_mode1_reset + smu_v14_0_2_mode1_reset):
+ * save config space, bus master off, debug message Mode1Reset, 1 s with no
+ * MMIO, restore config space, wait for the PSP bootloader and for the
+ * memory size register to read back.
+ */
+int
+amd_smu_mode1_reset(struct atrium_amd_softc *sc)
+{
+	const struct smu_gen *g = smu_gen_find(sc);
+	bus_size_t lim = rman_get_size(sc->regs), memsize;
+	uint32_t sos = 0, v = 0;
+	int us, err;
+
+	if (g == NULL || g->dbg_mode1_reset == 0 || sc->ip.mp1.nbase < 2 ||
+	    smu_reg(sc, g->reg_dbg_msg) + 4 > lim ||
+	    smu_reg(sc, g->reg_dbg_param) + 4 > lim ||
+	    smu_reg(sc, g->reg_dbg_resp) + 4 > lim ||
+	    !sc->ip.nbif.present || sc->ip.nbif.nbase < 3) {
+		device_printf(sc->dev, "smu: no mode 1 reset known for SMU "
+		    "%u.%u.%u\n", sc->ip.mp1.major, sc->ip.mp1.minor,
+		    sc->ip.mp1.rev);
+		return (ENOTSUP);
+	}
+	memsize = ((bus_size_t)sc->ip.nbif.base[2] + 0xc3) * 4; /* RCC_CONFIG_MEMSIZE */
+	if (memsize + 4 > lim)
+		return (ENOTSUP);
+
+	device_printf(sc->dev, "smu: mode 1 reset (card back to its "
+	    "post-POST state)\n");
+	pci_save_state(sc->dev);
+	pci_disable_busmaster(sc->dev);
+	amd_mmio_write32(sc, smu_reg(sc, g->reg_dbg_param), 0);
+	amd_mmio_write32(sc, smu_reg(sc, g->reg_dbg_msg), g->dbg_mode1_reset);
+	amd_mmio_write32(sc, smu_reg(sc, g->reg_dbg_resp), 0);
+	/* No MMIO while the ASIC resets. */
+	pause("smurst", hz);
+	pci_restore_state(sc->dev);
+
+	err = amd_psp_wait_bootloader(sc, &sos);
+	for (us = 0; err == 0 && us < 2000000; us += 100) {
+		v = amd_mmio_read32(sc, memsize);
+		if (v != 0xffffffff)
+			break;
+		DELAY(100);
+	}
+	if (err == 0 && v == 0xffffffff)
+		err = ETIMEDOUT;
+	device_printf(sc->dev, "smu: after reset: %s; sOS %#x, memsize %u "
+	    "MiB, SMU response %#x, GB_ADDR_CONFIG %#x\n",
+	    err == 0 ? "PSP bootloader ready" : "card did NOT come back "
+	    "(needs a power cycle)", sos, v,
+	    amd_mmio_read32(sc, smu_reg(sc, g->reg_resp)),
+	    gc_ok(sc, 0, GC12_GB_ADDR_CONFIG) ?
+	    gc_rd(sc, 0, GC12_GB_ADDR_CONFIG) : 0);
 	return (err);
 }

@@ -152,6 +152,7 @@ A backend is chosen by the discovered controller IP version, never by device id.
 | `set_levers` | Carry out `Levers` (only the levers it has) |
 | `idle_guard` / `idle_release` | Hold the block powered for a register sequence; always released |
 | `stop` | A3.6: defaults, idle, unload handshake |
+| `reset` | Put the card back in its post-POST state (AMD: mode 1 reset); used on detach whenever the driver went past read-only |
 
 These join the driver's existing `atrium_gpu_backend_ops` seam in P2, where the lifecycle wiring
 lands. Until then the AMD backend is `smu.c` + `rs/smu_metrics.rs` behind the test hook.
@@ -185,7 +186,8 @@ SetAllowedFeaturesMask with 0xFD.
 | Run | SetPptLimit (0x32) / GetPptLimit (0x33) | cap (P4; not in the table yet) |
 | Run | SetSoftMaxByFreq (0x1A), GetMin/MaxDpmFreq (0x1D/0x1E) | soft max (P4; not in the table yet) |
 | Run | SetWorkloadMask (0x24) | profile (P4; not in the table yet) |
-| Stop | PrepareMp1ForUnload (0x2E) | last message (P2; not in the table yet) |
+| Stop | PrepareMp1ForUnload (0x2E) | last message when staying loaded is over (P2; not in the table yet) |
+| Detach | debug mailbox Mode1Reset (2), C2PMSG_53/75/54 | amdgpu's reset method for MP1 14.0.2/3; no response handshake, 1 s without MMIO, then PSP bootloader ready and CONFIG_MEMSIZE readable |
 
 Never sent: DisableAllSmuFeatures, Disable/EnableSmuFeatures*, OverDrive or
 PPTABLE/CUSTOM_SKUTABLE writes (TransferTableDram2Smu), manual fan, voltage offsets,
@@ -231,7 +233,13 @@ Throttler classes:
   Still to do:
   - the THM cross-check;
   - sysctls.
-- **P2 lifecycle (gates stage 4).**
+- **P2 lifecycle (gates stage 4).** Step 1 (built): on detach after any hook that went past
+  read-only, a mode 1 reset puts the card back to its post-POST state (PSP bootloader, no
+  sOS, GC off), which is where it idled before the driver touched it. `hw.atrium_gpu.keep_state=1`
+  skips it, `hw.atrium_gpu.mode1_reset=1` runs it alone. It also means a bring-up run no longer
+  needs a power cycle before the next one. Box test 1: reset alone on a cold card. Box test 2:
+  stage 3 with `gc_up_ok=1`, then the reset; GC off afterwards, and the board stays at its
+  idle temperature for 5 minutes. Then, for staying attached:
   - gfx init enough for GC to idle (clock and power gating, as gfx_v12_0);
   - GfxOff allowed after bring-up, with the scoped guard;
   - detach / unload / reset sequence (A3.6) with PrepareMp1ForUnload;

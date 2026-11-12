@@ -110,7 +110,7 @@ atrium_amd_pci_attach(device_t dev)
 		return (ENXIO);
 	}
 	if (sc->hw_kind != AMD_HW_GPUSIM) {
-		int psp_bootload = 0, smu_init = 0;
+		int psp_bootload = 0, smu_init = 0, keep = 0, reset = 0;
 
 		/* Stage 3 test hook: kenv hw.atrium_gpu.psp_bootload=1. */
 		TUNABLE_INT_FETCH("hw.atrium_gpu.psp_bootload", &psp_bootload);
@@ -120,6 +120,18 @@ atrium_amd_pci_attach(device_t dev)
 		TUNABLE_INT_FETCH("hw.atrium_gpu.smu_init", &smu_init);
 		if (smu_init)
 			(void)amd_smu_init(sc);
+		/*
+		 * Leave the card as POST left it (power spec A3.6): any hook
+		 * above may have loaded firmware or powered GC up, which
+		 * nothing will manage once we give the device back. A mode 1
+		 * reset undoes all of it. hw.atrium_gpu.keep_state=1 skips
+		 * it (bring-up only); hw.atrium_gpu.mode1_reset=1 runs just
+		 * the reset.
+		 */
+		TUNABLE_INT_FETCH("hw.atrium_gpu.keep_state", &keep);
+		TUNABLE_INT_FETCH("hw.atrium_gpu.mode1_reset", &reset);
+		if ((psp_bootload || smu_init || reset) && !keep)
+			(void)amd_smu_mode1_reset(sc);
 		device_printf(dev, "silicon bring-up not implemented yet; "
 		    "not attaching (vgapci keeps the device)\n");
 		atrium_amd_pci_teardown(sc);
