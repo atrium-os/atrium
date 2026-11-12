@@ -9,6 +9,8 @@
 //!   atrium-gpu-probe fw <dir>               parse every firmware header in <dir>
 //!   atrium-gpu-probe discovery <file>       parse a saved discovery binary
 //!   atrium-gpu-probe pci <bdf> [--vram-top] identity, BARs, MMIO reads
+//!   atrium-gpu-probe pci <bdf> --status [--discovery <file>]
+//!                                           PSP/SMU mailbox status (reads only)
 //!
 //! `pci` maps BAR5 (registers) read-only, except with --vram-top, which
 //! writes the MM_INDEX/MM_INDEX_HI window registers to read the discovery
@@ -29,7 +31,7 @@ use std::path::Path;
 use std::process::exit;
 
 fn usage() -> ! {
-    eprintln!("usage: atrium-gpu-probe fw <dir> | discovery <file> | pci <bdf|sysfs-dir> [--vram-top] [--save <file>]");
+    eprintln!("usage: atrium-gpu-probe fw <dir> | discovery <file> | pci <bdf|sysfs-dir> [--vram-top] [--save <file>] [--status [--discovery <file>]]");
     exit(2)
 }
 
@@ -43,8 +45,9 @@ fn main() {
         }
         Some("pci") if a.len() >= 2 => {
             let vram_top = a.iter().any(|x| x == "--vram-top");
-            let save = a.iter().position(|x| x == "--save").and_then(|i| a.get(i + 1)).cloned();
-            pci(&a[1], vram_top, save.as_deref());
+            let arg = |k: &str| a.iter().position(|x| x == k).and_then(|i| a.get(i + 1)).cloned();
+            let status = a.iter().any(|x| x == "--status");
+            pci(&a[1], vram_top, arg("--save").as_deref(), status, arg("--discovery").as_deref());
         }
         _ => usage(),
     }
@@ -154,12 +157,17 @@ fn print_discovery(b: &[u8]) {
     .unwrap_or_else(|e| die(&format!("discovery walk: {e:?}")));
 }
 
-fn pci(dev: &str, vram_top: bool, save: Option<&str>) {
+fn pci(dev: &str, vram_top: bool, save: Option<&str>, status: bool, disc_file: Option<&str>) {
     let mut m = mmio::Device::open(dev).unwrap_or_else(|e| die(&e));
     println!("{}", m.describe());
     // Fixed-offset registers that need no discovery (NBIO/BIF early window).
     let memsize = m.read32(mmio::RCC_CONFIG_MEMSIZE);
     println!("RCC_CONFIG_MEMSIZE = {memsize:#x} ({} MiB VRAM)", memsize);
+    if let Some(f) = disc_file {
+        let bin = std::fs::read(f).unwrap_or_else(|e| die(&format!("{f}: {e}")));
+        if status { print_status(&m, &bin); } else { print_discovery(&bin); }
+        return;
+    }
     if !vram_top {
         println!("(pass --vram-top, with no driver bound, to read the discovery table)");
         return;
@@ -174,5 +182,56 @@ fn pci(dev: &str, vram_top: bool, save: Option<&str>) {
         std::fs::write(p, &bin).unwrap_or_else(|e| die(&format!("{p}: {e}")));
         println!("saved {} bytes to {p}", bin.len());
     }
-    print_discovery(&bin);
+    if status { print_status(&m, &bin); } else { print_discovery(&bin); }
+}
+
+/// Mailbox registers by IP version: (block, offset within base segment,
+/// base index, name). Offsets from the MIT-licensed mp_*_offset.h; only
+/// versions checked against those headers are listed, anything else is
+/// reported as unsupported rather than guessed.
+fn status_regs(hw: u16, major: u8) -> Option<&'static [(usize, usize, &'static str)]> {
+    use discovery::hwid::*;
+    match (hw, major) {
+        // MP0 (PSP) 13.x/14.x: C2PMSG_35 bootloader mailbox (bit 31 = ready),
+        // C2PMSG_64 ring/GPCOM mailbox (bit 31 = response), C2PMSG_81 sOS
+        // sign of life (non-zero = sOS running), 58-63/79-80 scratch.
+        (MP0, 13) | (MP0, 14) => Some(&[
+            (0x63, 0, "C2PMSG_35 (bootloader mbox)"),
+            (0x80, 0, "C2PMSG_64 (ring mbox)"),
+            (0x91, 0, "C2PMSG_81 (sOS sign of life)"),
+            (0x7c, 0, "C2PMSG_60"), (0x7d, 0, "C2PMSG_61"),
+            (0x7e, 0, "C2PMSG_62"), (0x7f, 0, "C2PMSG_63"),
+        ]),
+        // MP1 (SMU) 13.x/14.x: message / argument / response mailboxes.
+        (MP1, 13) | (MP1, 14) => Some(&[
+            (0x82, 1, "C2PMSG_66 (msg)"),
+            (0x92, 1, "C2PMSG_82 (arg)"),
+            (0x9a, 1, "C2PMSG_90 (resp)"),
+        ]),
+        _ => None,
+    }
+}
+
+fn print_status(m: &mmio::Device, bin: &[u8]) {
+    let d = discovery::Discovery::parse(bin).unwrap_or_else(|e| die(&format!("discovery: {e:?}")));
+    for hw in [discovery::hwid::MP0, discovery::hwid::MP1] {
+        let ip = match d.find(hw, 0) {
+            Ok(Some(ip)) => ip,
+            _ => { println!("{}: not in the discovery table", hw_name(hw)); continue; }
+        };
+        println!("{} v{}.{}.{}", hw_name(hw), ip.major, ip.minor, ip.revision);
+        let Some(regs) = status_regs(hw, ip.major) else {
+            println!("  unsupported version: no register map, nothing read");
+            continue;
+        };
+        for &(off, idx, name) in regs {
+            let Some(&base) = ip.bases().get(idx) else { println!("  {name}: no base {idx}"); continue };
+            let byte = ((base as usize) + off) * 4;
+            if byte + 4 > m.len() {
+                println!("  {name}: offset {byte:#x} outside BAR5");
+                continue;
+            }
+            println!("  {name:<28} @ {byte:#08x} = {:#010x}", m.read32(byte));
+        }
+    }
 }

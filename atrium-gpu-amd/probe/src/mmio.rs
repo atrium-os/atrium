@@ -83,6 +83,8 @@ impl Device {
         format!("{}\nBAR5 mapped {} bytes{}", self.desc, self.len, if self.writable { "" } else { " (read-only: a GPU driver owns the device)" })
     }
 
+    pub fn len(&self) -> usize { self.len }
+
     pub fn read32(&self, off: usize) -> u32 {
         assert!(off % 4 == 0 && off + 4 <= self.len);
         // SAFETY: in bounds and aligned (asserted).
