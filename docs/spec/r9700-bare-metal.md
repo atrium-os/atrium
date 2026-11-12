@@ -400,3 +400,10 @@ land with it.
   0x3f0126..0x3f017f. The source change since the last good run (6c90468a) cannot touch
   the pipe start. Next: re-run 6c90468a unchanged as a control; if pipe 1 fails there too,
   try a cold power cycle.
+- **2026-11-12 20:44, control: known-good 6c90468a now fails the same way.** MES pipe 1 does
+  not start (instr 0x1, GP3 0), with the same client-0xa IV burst; the HQD wedges CPF/CPC;
+  62 W, refused, reset cold. Nothing changed on the box (uptime since the 17:14 boot, no
+  kenvs, firmware shas unchanged). Something that survives the mode 1 reset changed between
+  20:31 and 20:36, after about 15 resets. Note: at "started", GRBM_STATUS2 reads 0x100000
+  in the failing runs against 0x4100000 in the good one. Next: cold power cycle, then
+  6c90468a as the first run.
