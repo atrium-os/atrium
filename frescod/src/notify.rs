@@ -22,44 +22,31 @@ pub fn may(uid: u32) -> bool {
     uids().contains(&uid)
 }
 
-/// The shell's chrome apps: the only app ids the chrome role can go to by
-/// registry identity (the Forum bar and dock).
-const CHROME_APPS: [&str; 2] = ["org.atrium.forum-bar", "org.atrium.forum-dock"];
+/// The session components that draw shell chrome: the Forum bar and dock,
+/// as portcullisd records them (their session.d jail names).
+const CHROME_COMPONENTS: [&str; 2] = ["app-org-atrium-forum-bar", "app-org-atrium-forum-dock"];
 
 /// The shell-chrome role (the Forum bar, which stacks above apps and their
-/// pop-ups: fresco-popups.md §2) goes to no app by default. Granted to:
-/// - the uids in FRESCOD_CHROME_UIDS (comma separated; a session that runs
-///   the bar under a fixed uid, and tests), or
-/// - a launched app whose registry binding (FRESCOD_APP_REGISTRY) is one of
-///   [`CHROME_APPS`] signed by a publisher in FRESCOD_CHROME_PUBLISHERS
-///   (comma-separated publisher ids, hex: Atrium's own key). An unsigned
-///   install named like the bar gets nothing.
+/// pop-ups: fresco-popups.md §2) goes to no app. Granted to:
+/// - the bar or dock started as a declared session component: portcullisd
+///   records those in the launch registry (FRESCOD_APP_REGISTRY) marked
+///   `session`, which an app installed under the same id never is;
+/// - the uids in FRESCOD_CHROME_UIDS (comma separated; tests).
 struct Chrome {
     uids: Vec<u32>,
-    publishers: Vec<[u8; 32]>,
     registry: String,
 }
 
 fn chrome() -> &'static Chrome {
     static C: OnceLock<Chrome> = OnceLock::new();
     C.get_or_init(|| {
-        let list = |k: &str| std::env::var(k).unwrap_or_default();
-        let uids: Vec<u32> = list("FRESCOD_CHROME_UIDS").split(',').filter_map(|u| u.trim().parse().ok()).collect();
-        let publishers: Vec<[u8; 32]> = list("FRESCOD_CHROME_PUBLISHERS")
-            .split(',')
-            .filter_map(|h| {
-                let h = h.trim();
-                (h.len() == 64).then_some(())?;
-                let mut out = [0u8; 32];
-                for (i, b) in out.iter_mut().enumerate() {
-                    *b = u8::from_str_radix(h.get(2 * i..2 * i + 2)?, 16).ok()?;
-                }
-                Some(out)
-            })
-            .collect();
+        let uids: Vec<u32> = std::env::var("FRESCOD_CHROME_UIDS").unwrap_or_default()
+            .split(',').filter_map(|u| u.trim().parse().ok()).collect();
         let registry = std::env::var("FRESCOD_APP_REGISTRY").unwrap_or_else(|_| portcullis_peer::DEFAULT_REGISTRY.into());
-        eprintln!("frescod: chrome (bar) role for uids {uids:?} and {} publisher(s)", publishers.len());
-        Chrome { uids, publishers, registry }
+        if !uids.is_empty() {
+            eprintln!("frescod: chrome (bar) role also for uids {uids:?}");
+        }
+        Chrome { uids, registry }
     })
 }
 
@@ -69,11 +56,6 @@ pub fn chrome_may(uid: u32) -> bool {
     if c.uids.contains(&uid) {
         return true;
     }
-    if c.publishers.is_empty() {
-        return false;
-    }
     let reg = portcullis_peer::AppRegistry::load(&c.registry).unwrap_or_default();
-    let app = reg.resolve(uid).map(|(_, app)| app);
-    let signed = reg.publisher(uid).flatten();
-    matches!((app, signed), (Some(a), Some(p)) if CHROME_APPS.contains(&a) && c.publishers.contains(&p))
+    reg.is_session(uid) && reg.resolve(uid).is_some_and(|(_, id)| CHROME_COMPONENTS.contains(&id))
 }

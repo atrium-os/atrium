@@ -112,6 +112,11 @@ struct Entry {
     /// DER, `portcullis_sig::publisher_id`), or `None` for an app launched
     /// unsigned (trust unconfigured) or a system session component.
     publisher: Option<[u8; 32]>,
+    /// Written by portcullisd for a declared session component (the
+    /// root-owned session.d set: the Forum bar, dock, WM). Services that
+    /// grant shell roles (frescod's bar layer) trust only these; an app
+    /// installed under the same id is never one.
+    session: bool,
 }
 
 #[derive(Default)]
@@ -136,10 +141,11 @@ fn publisher_hex(p: &[u8; 32]) -> String {
 
 impl AppRegistry {
     /// Parse the registry text. One app per line:
-    /// `<uid> <user> <app-id> [publisher-id hex]`; `#` comments and blanks
-    /// ignored; a later line for the same uid replaces an earlier one. A
-    /// fourth field that isn't 64 hex digits makes the line void: a binding
-    /// with a garbled publisher must not read as "unsigned".
+    /// `<uid> <user> <app-id> [publisher-id hex | session]`; `#` comments
+    /// and blanks ignored; a later line for the same uid replaces an earlier
+    /// one. A fourth field that is neither 64 hex digits nor `session` makes
+    /// the line void: a binding with a garbled publisher must not read as
+    /// "unsigned".
     pub fn parse(text: &str) -> AppRegistry {
         let mut map = HashMap::new();
         for line in text.lines() {
@@ -149,10 +155,11 @@ impl AppRegistry {
             }
             let mut it = line.split_whitespace();
             if let (Some(uid), Some(user), Some(app)) = (it.next(), it.next(), it.next()) {
-                let publisher = match it.next() {
-                    None => None,
+                let (publisher, session) = match it.next() {
+                    None => (None, false),
+                    Some("session") => (None, true),
                     Some(h) => match parse_publisher(h) {
-                        Some(p) => Some(p),
+                        Some(p) => (Some(p), false),
                         None => continue,
                     },
                 };
@@ -160,7 +167,7 @@ impl AppRegistry {
                     continue;
                 }
                 if let Ok(uid) = uid.parse::<u32>() {
-                    map.insert(uid, Entry { user: user.to_string(), app_id: app.to_string(), publisher });
+                    map.insert(uid, Entry { user: user.to_string(), app_id: app.to_string(), publisher, session });
                 }
             }
         }
@@ -184,12 +191,26 @@ impl AppRegistry {
         self.map.get(&uid).map(|e| e.publisher)
     }
 
-    /// The uid already bound to `(user, app_id)`, if any. Lets a re-launch REUSE
+    /// Whether `uid` is a declared session component portcullisd launched
+    /// (see [`register_session`]).
+    pub fn is_session(&self, uid: u32) -> bool {
+        self.map.get(&uid).is_some_and(|e| e.session)
+    }
+
+    /// The session-component uid bound to `(user, component_id)`, if any.
+    pub fn uid_for_session(&self, user: &str, component_id: &str) -> Option<u32> {
+        self.map.iter()
+            .find(|(_, e)| e.session && e.user == user && e.app_id == component_id)
+            .map(|(uid, _)| *uid)
+    }
+
+    /// The app uid already bound to `(user, app_id)`, if any (never a
+    /// session component's: an app named like one must not inherit it). Lets a re-launch REUSE
     /// the app's existing dedicated uid (stable identity for services that
     /// peer-cred it) instead of leaking a fresh uid + passwd entry every time.
     pub fn uid_for(&self, user: &str, app_id: &str) -> Option<u32> {
         self.map.iter()
-            .find(|(_, e)| e.user == user && e.app_id == app_id)
+            .find(|(_, e)| !e.session && e.user == user && e.app_id == app_id)
             .map(|(uid, _)| *uid)
     }
 
@@ -198,7 +219,7 @@ impl AppRegistry {
     /// key gets a NEW uid, so it inherits nothing keyed by the old one.
     pub fn uid_for_publisher(&self, user: &str, app_id: &str, publisher: Option<&[u8; 32]>) -> Option<u32> {
         self.map.iter()
-            .find(|(_, e)| e.user == user && e.app_id == app_id && e.publisher.as_ref() == publisher)
+            .find(|(_, e)| !e.session && e.user == user && e.app_id == app_id && e.publisher.as_ref() == publisher)
             .map(|(uid, _)| *uid)
     }
 }
@@ -236,6 +257,20 @@ pub fn register_with_publisher(
         None => writeln!(f, "{uid} {user} {app_id}"),
         Some(p) => writeln!(f, "{uid} {user} {app_id} {}", publisher_hex(p)),
     }
+}
+
+/// Append a declared session component's binding (portcullisd only, for
+/// the root-owned session.d set): marked `session`, so shell roles can be
+/// granted to it and never to an app installed under the same id.
+pub fn register_session(path: &str, uid: u32, user: &str, component_id: &str) -> io::Result<()> {
+    use std::io::Write;
+    let mut f = std::fs::OpenOptions::new().create(true).append(true).open(path)?;
+    writeln!(f, "{uid} {user} {component_id} session")
+}
+
+/// As [`AppRegistry::uid_for_session`], reading the registry file.
+pub fn uid_for_session(path: &str, user: &str, component_id: &str) -> Option<u32> {
+    AppRegistry::load(path).ok().and_then(|r| r.uid_for_session(user, component_id))
 }
 
 /// As [`AppRegistry::uid_for_publisher`], reading the registry file.
@@ -350,6 +385,20 @@ mod tests {
         assert_eq!(r.uid_for_publisher("alice", "org.x.mail", Some(&[0xcd; 32])), None);
         assert_eq!(r.uid_for_publisher("alice", "org.x.mail", None), None);
         let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn session_components_are_marked_and_never_reused_by_apps() {
+        let r = AppRegistry::parse("50000 alice org.atrium.forum-bar session\n50001 alice org.atrium.forum-bar\n");
+        assert!(r.is_session(50000) && !r.is_session(50001) && !r.is_session(7));
+        assert_eq!(r.resolve(50000), Some(("alice", "org.atrium.forum-bar")));
+        assert_eq!(r.uid_for_session("alice", "org.atrium.forum-bar"), Some(50000));
+        // An app launched under the bar's id gets its own uid, not the session's.
+        assert_eq!(r.uid_for("alice", "org.atrium.forum-bar"), Some(50001));
+        assert_eq!(r.uid_for_publisher("alice", "org.atrium.forum-bar", None), Some(50001));
+        let only = AppRegistry::parse("50000 alice org.atrium.forum-bar session\n");
+        assert_eq!(only.uid_for("alice", "org.atrium.forum-bar"), None);
+        assert_eq!(only.uid_for_publisher("alice", "org.atrium.forum-bar", None), None);
     }
 
     #[test]

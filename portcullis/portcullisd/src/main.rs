@@ -1100,10 +1100,13 @@ fn launch_session_component(component_id: &str, owner_name: &str,
     // _ostiarius, which only supplied owner_name. Reuse the existing binding for
     // this (owner, component) if any, else allocate a fresh 50000+ uid.
     let reg = portcullis_peer::DEFAULT_REGISTRY;
-    let owner_uid = portcullis_peer::uid_for_app(reg, owner_name, component_id)
+    // Marked `session` (frescod grants the bar's layer only to these, so an
+    // app installed under the bar's id never gets it). A binding from before
+    // the mark is not reused: the component gets a fresh, marked uid.
+    let owner_uid = portcullis_peer::uid_for_session(reg, owner_name, component_id)
         .unwrap_or_else(|| {
             let u = portcullis_peer::allocate(reg);
-            let _ = portcullis_peer::register(reg, u, owner_name, component_id);
+            let _ = portcullis_peer::register_session(reg, u, owner_name, component_id);
             u
         });
     if let Some(exec) = create.exec.as_mut() {
