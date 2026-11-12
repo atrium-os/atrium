@@ -200,3 +200,25 @@ reads non-zero, all-zero GC registers mean "off", not "idle".
   SetAllowedFeaturesMaskHigh returned 0xFD (bad prerequisite). Read that as SCPM: the PSP owns
   the feature mask, and amdgpu skips it when `scpm_enabled`. The next build carries on to
   EnableAllSmuFeatures. GC is still unpowered.
+- **2026-11-12, stage 3 DONE: GC powered and booted.** With `3333d96c` the SMU listed no
+  features running before the enable. It refused the allowed mask again (SCPM), and
+  EnableAllSmuFeatures returned OK. Running features after the enable: 0x0488f19e38fffcfb.
+  After DisallowGfxOff, the RLC reported bootload complete at once (0x8000003f), from the
+  microcode the PSP had loaded earlier in the boot. Readings afterwards:
+  - GB_ADDR_CONFIG is 0x08200545.
+  - GRBM_STATUS is 0x382c.
+  - RLC_CNTL is 1.
+  - GFX_IMU_GFX_RESET_CTRL is 0x7f, so the resets are released.
+  - CP ME, MEC and MES are halted, waiting for a driver.
+
+  The working order on PSP 14.0.3 / SMU 14.0.3 / GC 12.0.1:
+  1. sOS
+  2. KM ring
+  3. LOAD_TOC
+  4. LOAD_IP_FW x20
+  5. AUTOLOAD_RLC
+  6. SMU features enable
+  7. RLC boots
+
+  Next is stage 4 (GMC, IH, MES, first dispatch). GFX stays powered, with GfxOff disallowed,
+  until a power cycle.
