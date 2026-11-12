@@ -391,3 +391,12 @@ land with it.
   mask, which is used after the start, so the start is intermittent. Fix (next run): wait
   up to 100 ms for each pipe's firmware version, and refuse before any queue is made
   active.
+- **2026-11-12 20:41, 0e5974ad: the start gate worked; MES pipe 1 failed to start again.**
+  Pipe 0 was up at once, but pipe 1 had no firmware version after 100 ms (instr 0x1 → 0).
+  The driver refused before any queue was made active, nothing wedged, GRBM stayed idle,
+  and the card was proven idle at 14 W on the first sample. So MES running with no active
+  queues lets the card idle; the 60 W came from queue state. Both failing runs, and none
+  of the good ones, logged 32 IVs from client 0xa (SOC21 GFX) src 0 ring 169, data
+  0x3f0126..0x3f017f. The source change since the last good run (6c90468a) cannot touch
+  the pipe start. Next: re-run 6c90468a unchanged as a control; if pipe 1 fails there too,
+  try a cold power cycle.
