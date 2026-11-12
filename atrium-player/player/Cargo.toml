@@ -55,3 +55,8 @@ path = "examples/audio_play.rs"
 [[example]]
 name = "atrium-media-probe"
 path = "examples/media_probe.rs"
+
+# A test bundle's entry (scripts/hospes-player-jail-vm.sh).
+[[example]]
+name = "atrium-player-bundle-launch"
+path = "examples/bundle_launch.rs"

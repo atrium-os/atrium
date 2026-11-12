@@ -481,8 +481,15 @@ impl CdmProc {
                         let (url, fetcher, tx) = (url.clone(), fetcher.clone(), self.answers.0.clone());
                         let _ = std::thread::Builder::new().name("player-licence".into()).spawn(move || {
                             let r = (fetcher.0)().map_err(|e| format!("no fetcher: {e}")).and_then(|f| {
-                                let (client, _guard) = f.into_parts();
-                                post_licence(client, &url, message)
+                                let (client, guard) = f.into_parts();
+                                post_licence(client, &url, message).map_err(|e| {
+                                    // portcullisd says why a fetcher never ran.
+                                    std::thread::sleep(Duration::from_millis(200));
+                                    match guard.failure() {
+                                        Some(why) => format!("{e} (the system fetcher: {why})"),
+                                        None => e,
+                                    }
+                                })
                             });
                             let _ = tx.send((id, r));
                         });
