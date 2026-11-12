@@ -247,6 +247,9 @@ pub struct CdmProc {
     deferred: Vec<(u8, Vec<u8>)>,
     /// Key ids the CDM has said are usable.
     usable: Vec<Vec<u8>>,
+    /// Sessions made from key-id init data, by promise until `NewSession` names them.
+    keyid_promises: Vec<u32>,
+    keyid_sessions: Vec<Vec<u8>>,
     promise: u32,
     sessions: usize,
     /// Promises we are waiting on (create, update).
@@ -291,7 +294,7 @@ impl CdmProc {
                 }
             }
         })?;
-        let mut p = CdmProc { child, ctrl, rx, licences: o.licences.clone(), answers: mpsc::channel(), initialized: false, queued: Vec::new(), deferred: Vec::new(), usable: Vec::new(), promise: 0, sessions: 0, outstanding: 0, failed: false };
+        let mut p = CdmProc { child, ctrl, rx, licences: o.licences.clone(), answers: mpsc::channel(), initialized: false, queued: Vec::new(), deferred: Vec::new(), usable: Vec::new(), keyid_promises: Vec::new(), keyid_sessions: Vec::new(), promise: 0, sessions: 0, outstanding: 0, failed: false };
         p.send(Msg::Init { allow_persistent: false, link_mask: 0 });
         Ok((p, data_w))
     }
@@ -326,6 +329,9 @@ impl CdmProc {
         self.sessions += 1;
         self.outstanding += 1;
         let promise = self.next_promise();
+        if kind != 0 {
+            self.keyid_promises.push(promise);
+        }
         self.send(Msg::CreateSession { promise, session_type: 0, init_type: kind as u32, init: data });
     }
 
@@ -344,7 +350,13 @@ impl CdmProc {
                 break;
             };
             match m {
-                Msg::NewSession { .. } => self.outstanding = self.outstanding.saturating_sub(1),
+                Msg::NewSession { promise, id } => {
+                    self.outstanding = self.outstanding.saturating_sub(1);
+                    if let Some(i) = self.keyid_promises.iter().position(|&p| p == promise) {
+                        self.keyid_promises.swap_remove(i);
+                        self.keyid_sessions.push(id);
+                    }
+                }
                 Msg::Ready { .. } | Msg::Expiration { .. } | Msg::Closed { .. } | Msg::KeyStatus { .. } => {}
                 Msg::Initialized { ok: true } => {
                     self.initialized = true;
@@ -415,6 +427,12 @@ impl CdmProc {
                     self.outstanding += 1;
                     self.send(Msg::UpdateSession { promise, id, response });
                 }
+                // A session made from a bare key id, beside others: a server may refuse it
+                // (Shaka's proxy does) and the other sessions' licences carry its key.
+                // If none does, the samples wait for it as for a slow licence.
+                Err(why) if self.sessions > 1 && self.keyid_sessions.contains(&id) => {
+                    eprintln!("atrium-player: encrypted media: licence for a key-id session refused ({why}); relying on the others");
+                }
                 Err(why) => out.push(CdmEvent::Failed(why)),
             }
         }
@@ -428,6 +446,9 @@ impl CdmProc {
                         self.sessions += 1;
                         self.outstanding += 1;
                         let promise = self.next_promise();
+                        if k != 0 {
+                            self.keyid_promises.push(promise);
+                        }
                         self.send(Msg::CreateSession { promise, session_type: 0, init_type: k as u32, init: d });
                     }
                 }

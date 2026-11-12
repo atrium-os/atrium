@@ -44,7 +44,9 @@ mkdir -p "$D/store"; chown nobody "$D/store"
 chmod -R a+rX "$D"
 export ATRIUM_PLAYER_DECODE="$D/bin/atrium-player-decode" ATRIUM_PLAYER_HOSPES_CDM="$D/bin/hospes-cdm" ATRIUM_PLAYER_CDM="$LIB"
 export ATRIUM_PLAYER_LICENCE_URL="https://$PROXY/no_auth" ATRIUM_PLAYER_CDM_STORE="$D/store"
-for v in ${VIDEOS:-v-0144p-0100k-libx264.mp4 v-0144p-0100k-vp9.webm}; do
+# The VP9 WebM carries only key ids (no PSSH): Shaka's proxy refuses a request made from one,
+# and its player takes the PSSH from the manifest, which this check does not read.
+for v in ${VIDEOS:-v-0144p-0100k-libx264.mp4}; do
     t0=$(date +%s)
     out=$(su -m nobody -c "$D/bin/atrium-player --headless --feed $D/media/$v $D/media/a-eng-0096k-libopus-2c.webm" 2>"$D/player-$v.err")
     t1=$(date +%s)
