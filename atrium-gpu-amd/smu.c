@@ -377,7 +377,7 @@ amd_smu_init(struct atrium_amd_softc *sc)
 	uint64_t feat;
 	uint32_t v, ifver = 0;
 	bus_size_t lim = rman_get_size(sc->regs);
-	int rid, us, err = 0, gc_up_ok = 0, gfx_cg = 0;
+	int rid, us, r, err = 0, gc_up_ok = 0, gfx_cg = 0, gmc = 0;
 
 #define	SEND(m, a, o)	smu_send(&link, (m), (a), (o), false)
 	link.gen = smu_gen_find(sc);
@@ -517,7 +517,7 @@ amd_smu_init(struct atrium_amd_softc *sc)
 	gfx_cg = 1;
 	TUNABLE_INT_FETCH("hw.atrium_gpu.gfx_cg", &gfx_cg);
 	if (!link.failed) {
-		int r = gfx_cg ? amd_gc_idle_enter(sc) : ECANCELED;
+		r = gfx_cg ? amd_gc_idle_enter(sc) : ECANCELED;
 
 		if (r != 0)
 			device_printf(sc->dev, "gfx: no idle sequence run "
@@ -531,6 +531,30 @@ amd_smu_init(struct atrium_amd_softc *sc)
 			err = EIO;
 		}
 		amd_gfx12_pm_report(sc, "end");
+	}
+
+	/*
+	 * Stage 4a (kenv hw.atrium_gpu.gmc=1): hubs + GART, with GC held
+	 * powered for the GFXHUB writes (scoped: always re-allowed), then
+	 * the idle check again. Undone before the detach reset.
+	 */
+	TUNABLE_INT_FETCH("hw.atrium_gpu.gmc", &gmc);
+	if (gmc && err == 0 && !link.failed) {
+		struct amd_gart gt;
+
+		(void)SEND(SMU_DISALLOW_GFXOFF, 0, NULL);
+		for (us = 0; us < GC_WAIT_US && gc_rd(sc, 0,
+		    GC12_GB_ADDR_CONFIG) == 0; us += 100)
+			DELAY(100);
+		r = amd_gmc12_gart_enable(sc, vram, &gt);
+		device_printf(sc->dev, "gmc: stage 4a: %d\n", r);
+		amd_gmc12_gart_disable(&gt);
+		(void)SEND(SMU_ALLOW_GFXOFF, 0, NULL);
+		if (!smu_sample(&link, vram, ifver, 5, "idle after 4a")) {
+			device_printf(sc->dev, "smu: not idle after stage "
+			    "4a; refusing\n");
+			err = EIO;
+		}
 	}
 
 	/* Hand back the PMFW's own idle policy (rule 6). */

@@ -170,6 +170,14 @@ amd_psp_wait_bootloader(struct atrium_amd_softc *sc, uint32_t *sos)
  * reads VRAM directly, behind HDP): HDP_MEM_COHERENCY_FLUSH_CNTL, then a read
  * as amdgpu does. NBIF segment 2 from discovery.
  */
+static void psp_hdp_flush(struct atrium_amd_softc *sc);
+
+void
+amd_hdp_flush(struct atrium_amd_softc *sc)
+{
+	psp_hdp_flush(sc);
+}
+
 static void
 psp_hdp_flush(struct atrium_amd_softc *sc)
 {

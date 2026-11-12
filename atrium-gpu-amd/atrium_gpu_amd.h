@@ -818,6 +818,27 @@ int	amd_gfx12_srm_enable(struct atrium_amd_softc *sc);	/* gfx12_pm.c */
 int	amd_gfx12_clock_gating(struct atrium_amd_softc *sc, bool enable);
 void	amd_gfx12_pm_report(struct atrium_amd_softc *sc, const char *when);
 int	amd_gc_idle_enter(struct atrium_amd_softc *sc);	/* gfx12_pm.c */
+void	amd_hdp_flush(struct atrium_amd_softc *sc);		/* psp.c */
+
+/* gmc12.c: GPUVM hubs + GART on silicon (stage 4a). */
+struct amd_gart {
+	struct atrium_amd_softc *sc;
+	struct resource *vram;		/* BAR0 */
+	uint64_t fb_start, fb_end;	/* VRAM in MC address space */
+	uint64_t vram_base_offset;	/* MC FB offset (physical) */
+	uint64_t gart_start, gart_end;
+	uint64_t table_mc, scratch_mc, pd_addr;
+	bus_size_t table_off;		/* in BAR0 */
+	void	*dummy;
+	vm_paddr_t dummy_phys;
+	bool	enabled;
+};
+int	amd_gmc12_gart_enable(struct atrium_amd_softc *sc,
+	    struct resource *vram, struct amd_gart *gt);
+void	amd_gmc12_gart_disable(struct amd_gart *gt);
+int	amd_gmc12_gart_map(struct amd_gart *gt, uint64_t gart_addr,
+	    vm_paddr_t pa);
+int	amd_gmc12_flush(struct amd_gart *gt);
 int	amd_smu_init(struct atrium_amd_softc *sc);	/* smu.c, silicon test */
 
 /*
