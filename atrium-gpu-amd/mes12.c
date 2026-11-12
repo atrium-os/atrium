@@ -334,9 +334,9 @@ grbm_watch(struct mes *m, const char *when, int ms)
 		DELAY(1000);
 	}
 	device_printf(m->sc->dev, "mes: %s: GRBM_STATUS %#x -> %#x, %s after "
-	    "%d ms; CP_CPC_STATUS %#x\n", when, first, v,
+	    "%d ms; CP_CPC_STATUS %#x, CP_CPF_STATUS %#x\n", when, first, v,
 	    (v & GRBM_BUSY_BITS) == 0 ? "idle" : "still busy", us / 1000,
-	    rd(m, m->g->cp_cpc_status));
+	    rd(m, m->g->cp_cpc_status), rd(m, m->g->cp_cpf_status));
 	return ((v & GRBM_BUSY_BITS) == 0);
 }
 
@@ -555,8 +555,15 @@ set_hw_resources(struct mes *m, int pipe)
 		/* MEC1 pipes 0-1, 4 queues each, none kept for the kernel. */
 		put32(b, HW_COMPUTE_HQD + 0, 0xf);
 		put32(b, HW_COMPUTE_HQD + 4, 0xf);
-		/* gfx pipe 0, queue 0 kept as amdgpu keeps it. */
-		put32(b, HW_GFX_HQD, 0xfe);
+		/*
+		 * No GFX queues for MES (gfx_hqd_mask 0). Box run 6c90468a: given
+		 * 0xfe as amdgpu does, MES posted a GFX wptr the moment it took
+		 * its resources; with PFP/ME halted (4c's resting state) the CPF
+		 * stayed busy (CP_CPF_STATUS 0x84000001: CPF_BUSY, CPF_GFX_BUSY,
+		 * POST_WPTR_GFX_BUSY), GRBM never idled and the PMFW held gfx at
+		 * 3.4 GHz / 60 W. GFX queues come with the GFX ring stage.
+		 */
+		put32(b, HW_GFX_HQD, 0);
 		put32(b, HW_SDMA_HQD + 0, 0xfc);
 		put32(b, HW_SDMA_HQD + 4, 0xfc);
 		for (i = 0; i < 5; i++)

@@ -375,3 +375,10 @@ land with it.
   refused and the reset left the card cold. Next: name the busy CP block (CP_CPC_STATUS,
   CPC/CPF busy, GRBM_STATUS2/3, RLC_GPM_STAT) and watch GRBM_STATUS for 500 ms with MES
   running, after the queues are gone, and after the halt.
+- **2026-11-12 20:32, 6c90468a: the stuck block is the GFX command fetcher.** When MES
+  answers, CP_CPF_STATUS goes 0 -> 0x84000001 (CPF_BUSY, CPF_GFX_BUSY,
+  POST_WPTR_GFX_BUSY) and GRBM_STATUS2 shows CPF_BUSY. CPC stays 0. GRBM stays busy for
+  500 ms at each point: MES running, queues removed, MES halted. Power 56 -> 60 W;
+  refused; reset cold. Reading: given gfx_hqd_mask 0xfe (as amdgpu does), MES posts a GFX
+  wptr, but PFP/ME are halted (4c), so it is never consumed. Next: gfx_hqd_mask 0 until
+  the GFX ring stage; the CP stays halted.
