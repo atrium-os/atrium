@@ -292,3 +292,25 @@ pub fn sigaction_query(sig: i32) -> R<(usize, u32, [u32; 4])> {
     call(SYS_SIGACTION, [sig as usize, 0, &mut o as *mut SigAction as usize, 0, 0, 0])?;
     Ok((o.handler, o.flags, o.mask))
 }
+
+const SYS_GETEUID: usize = 25;
+
+/// `clock_gettime` for a Linux clock id: (seconds, nanoseconds). REALTIME and its coarse
+/// form, MONOTONIC/RAW/COARSE/BOOTTIME (FreeBSD's MONOTONIC, which counts suspend like
+/// Linux's BOOTTIME), the process and thread CPU clocks.
+pub fn clock_gettime_linux(id: i32) -> R<(i64, i64)> {
+    let fid = match id {
+        0 | 5 => 0,          // REALTIME, REALTIME_COARSE
+        1 | 4 | 6 | 7 => 4,  // MONOTONIC, MONOTONIC_RAW, MONOTONIC_COARSE, BOOTTIME
+        2 => 15,             // PROCESS_CPUTIME_ID
+        3 => 14,             // THREAD_CPUTIME_ID
+        _ => return Err(Errno(22)),
+    };
+    let mut ts = [0i64; 2];
+    call(SYS_CLOCK_GETTIME, [fid, ts.as_mut_ptr() as usize, 0, 0, 0, 0])?;
+    Ok((ts[0], ts[1]))
+}
+
+pub fn geteuid() -> u32 {
+    call(SYS_GETEUID, [0; 6]).unwrap_or(0) as u32
+}

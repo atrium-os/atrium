@@ -24,6 +24,8 @@ int main(void) {
     P("SIZEOF_PTHREAD_MUTEXATTR_T", sizeof(pthread_mutexattr_t));
     P("SIZEOF_PTHREAD_CONDATTR_T", sizeof(pthread_condattr_t));
     P("SIZEOF_SEM_T", sizeof(sem_t));
+    P("SIZEOF_PTHREAD_RWLOCK_T", sizeof(pthread_rwlock_t));
+    P("SIZEOF_PTHREAD_ONCE_T", sizeof(pthread_once_t));
     P("SIZEOF_PTHREAD_T", sizeof(pthread_t));
     P("SIZEOF_CPU_SET_T", sizeof(cpu_set_t));
     P("SIZEOF_TIMESPEC", sizeof(struct timespec));
@@ -55,6 +57,8 @@ fn ours_native() -> Vec<(&'static str, i64)> {
         ("SIZEOF_PTHREAD_MUTEXATTR_T", abi::SIZEOF_PTHREAD_MUTEXATTR_T as i64),
         ("SIZEOF_PTHREAD_CONDATTR_T", abi::SIZEOF_PTHREAD_CONDATTR_T as i64),
         ("SIZEOF_SEM_T", abi::SIZEOF_SEM_T as i64),
+        ("SIZEOF_PTHREAD_RWLOCK_T", abi::SIZEOF_PTHREAD_RWLOCK_T as i64),
+        ("SIZEOF_PTHREAD_ONCE_T", abi::SIZEOF_PTHREAD_ONCE_T as i64),
         ("SIZEOF_PTHREAD_T", abi::SIZEOF_PTHREAD_T as i64),
         ("SIZEOF_CPU_SET_T", abi::SIZEOF_CPU_SET_T as i64),
         ("SIZEOF_TIMESPEC", abi::SIZEOF_TIMESPEC as i64),

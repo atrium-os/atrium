@@ -86,6 +86,55 @@ fn maps_for(path: &str, lib: &Library) -> String {
     out
 }
 
+/// What a path or descriptor is, for `stat`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Kind {
+    /// A generated file (Linux reports size 0 for `/proc` files).
+    Proc,
+    /// `/dev/urandom` and `/dev/random`: character device 1,9 / 1,8.
+    Random { minor: u32 },
+}
+
+/// The kind of `path`, or `ENOENT`.
+pub fn stat(path: &[u8]) -> Result<Kind, i32> {
+    match path {
+        b"/dev/urandom" => Ok(Kind::Random { minor: 9 }),
+        b"/dev/random" => Ok(Kind::Random { minor: 8 }),
+        _ => {
+            let fd = open(path, false)?;
+            let _ = close(fd);
+            Ok(Kind::Proc)
+        }
+    }
+}
+
+/// The kind of an open virtual descriptor.
+pub fn fstat(fd: i32) -> Result<Kind, i32> {
+    let s = slot(fd).ok_or(abi::EBADF)?;
+    match VFS.lock().open[s].as_ref().ok_or(abi::EBADF)? {
+        Content::Bytes { .. } => Ok(Kind::Proc),
+        Content::Random => Ok(Kind::Random { minor: 9 }),
+    }
+}
+
+/// Read at `off` without moving the position.
+pub fn pread(fd: i32, out: &mut [u8], off: u64) -> Result<usize, i32> {
+    let s = slot(fd).ok_or(abi::EBADF)?;
+    let mut g = VFS.lock();
+    match g.open[s].as_mut().ok_or(abi::EBADF)? {
+        Content::Bytes { data, .. } => {
+            let off = (off as usize).min(data.len());
+            let n = out.len().min(data.len() - off);
+            out[..n].copy_from_slice(&data[off..off + n]);
+            Ok(n)
+        }
+        Content::Random => {
+            drop(g);
+            read(fd, out)
+        }
+    }
+}
+
 /// Open `path` read-only; a virtual descriptor or a Linux errno.
 pub fn open(path: &[u8], write: bool) -> Result<i32, i32> {
     let mut g = VFS.lock();

@@ -23,6 +23,8 @@ pub use x86_64::*;
 pub use aarch64::*;
 
 pub const SIZEOF_SEM_T: usize = 32;
+pub const SIZEOF_PTHREAD_RWLOCK_T: usize = 56;
+pub const SIZEOF_PTHREAD_ONCE_T: usize = 4;
 pub const SIZEOF_PTHREAD_T: usize = 8;
 pub const SIZEOF_CPU_SET_T: usize = 128;
 pub const SIZEOF_TIMESPEC: usize = 16;
@@ -49,10 +51,16 @@ pub const ENOMEM: i32 = 12;
 pub const EACCES: i32 = 13;
 pub const EFAULT: i32 = 14;
 pub const EBUSY: i32 = 16;
+pub const EEXIST: i32 = 17;
+pub const ENOTDIR: i32 = 20;
+pub const EISDIR: i32 = 21;
+pub const ESPIPE: i32 = 29;
 pub const EINVAL: i32 = 22;
 pub const EMFILE: i32 = 24;
 pub const ENAMETOOLONG: i32 = 36;
+pub const ERANGE: i32 = 34;
 pub const ENOSYS: i32 = 38;
+pub const EILSEQ: i32 = 84;
 pub const ETIMEDOUT: i32 = 110;
 
 pub const CLOCK_REALTIME: i32 = 0;

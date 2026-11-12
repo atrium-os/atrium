@@ -314,3 +314,15 @@ pub fn sigaction_query(sig: i32) -> R<(usize, u32, [u32; 4])> {
     call(n, [sig as usize, 0, &mut o as *mut KSigAction as usize, 8, 0, 0])?;
     Ok((o.handler, o.flags as u32, [o.mask as u32, (o.mask >> 32) as u32, 0, 0]))
 }
+
+/// `clock_gettime` for a Linux clock id (the host's own numbering here).
+pub fn clock_gettime_linux(id: i32) -> R<(i64, i64)> {
+    let mut ts = [0i64; 2];
+    call(nr::CLOCK_GETTIME, [id as usize, ts.as_mut_ptr() as usize, 0, 0, 0, 0])?;
+    Ok((ts[0], ts[1]))
+}
+
+pub fn geteuid() -> u32 {
+    let n = if cfg!(target_arch = "x86_64") { 107 } else { 175 };
+    call(n, [0; 6]).unwrap_or(0) as u32
+}

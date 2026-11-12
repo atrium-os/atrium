@@ -189,10 +189,8 @@ fn map_and_relocate(fd: i32, lib: &mut Library, opts: &Options, res: &dyn Resolv
 }
 
 fn trap_segments(lib: &Library) -> sys::R<()> {
-    for s in lib.img.segments.iter().filter(|s| s.flags.x) {
-        let va = lib.base + s.vaddr as usize;
-        let start = page_down(va);
-        crate::trap::add(start, page_up(va + s.memsz as usize) - start)?;
+    for (start, end) in lib.text() {
+        crate::trap::add(start, end - start)?;
     }
     crate::trap::lock()
 }
@@ -376,6 +374,14 @@ fn relocate(lib: &mut Library, opts: &Options, res: &dyn Resolver) -> Result<(),
 }
 
 impl Library {
+    /// The library's executable segments as page-aligned `[start, end)` ranges.
+    pub fn text(&self) -> impl Iterator<Item = (usize, usize)> + '_ {
+        self.img.segments.iter().filter(|s| s.flags.x).map(|s| {
+            let va = self.base + s.vaddr as usize;
+            (page_down(va), page_up(va + s.memsz as usize))
+        })
+    }
+
     /// Address of an exported symbol (ifuncs resolved).
     pub fn sym(&self, name: &str) -> Option<usize> {
         let s = self.img.export(name, None)?;
