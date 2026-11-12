@@ -52,6 +52,7 @@ struct mes_gen {
 	    hqd_rptr_report_hi, hqd_pq_control, hqd_wptr_poll, hqd_wptr_poll_hi,
 	    hqd_persistent, hqd_active, hqd_pq_rptr, hqd_pq_wptr_lo;
 	uint32_t unmapped_doorbell, mes_db_cntl1, hqd_gfx_control, cpc_int_cntl;
+	uint32_t hqd_dequeue_req, hqd_pq_wptr_hi, grbm_status, cp_stat, rlc_stat;
 	/* NBIF segment 2 */
 	uint32_t nbif_db_aper_en, nbif_db_entry0, nbif_db_entry3;
 	/* Doorbell dword indices (amdgpu_doorbell.h NAVI10 MES_RING0/1 << 1). */
@@ -67,6 +68,7 @@ static const struct mes_gen mes_gens[] = {
 	  S0(0x1fb6), S0(0x1fb7), S0(0x1fad), S0(0x1fab), S0(0x1fb3),
 	  S0(0x1fdf),
 	  S1(0x0880), S1(0x283c), S0(0x1e9f), S0(0x1e54),
+	  S0(0x1fc1), S0(0x1fe0), S0(0x0da4), S0(0x0f40), S1(0x4c04),
 	  0x00c0, 0x01cb, 0x01ce,
 	  0x0b << 1, 0x0c << 1, 0x400 },
 };
@@ -145,6 +147,7 @@ static const struct mes_gen mes_gens[] = {
 #define HDR_SET_HW_RSRC_1	0x00040131u
 #define HDR_QUERY_STATUS	0x000400b1u
 #define HDR_ADD_QUEUE		0x00040021u
+#define HDR_REMOVE_QUEUE	0x00040031u
 #define HW_VMID_MMHUB		4
 #define HW_VMID_GFXHUB		8
 #define HW_COMPUTE_HQD		20	/* [8] */
@@ -180,6 +183,13 @@ static const struct mes_gen mes_gens[] = {
 #define AQ_PIPE_ID		200
 #define AQ_QUEUE_ID		204
 #define QUEUE_TYPE_SCHQ		3
+#define RQ_DOORBELL		4
+#define RQ_FLAGS		16	/* dw 4 */
+#define RQ_UNMAP_LEGACY		0x00000008u
+#define RQ_API_STATUS		24
+#define RQ_PIPE_ID		40
+#define RQ_QUEUE_ID		44
+#define RQ_QUEUE_TYPE		60
 
 struct mes_ring {
 	int pipe;
@@ -199,6 +209,8 @@ struct mes {
 	uint64_t va;		/* GART address of the block */
 	uint64_t uc_start;
 	uint32_t version[2];
+	uint32_t cpc_int_cntl[2];	/* as found, restored on teardown */
+	bool sched_mapped;		/* pipe 0's queue mapped by MES */
 	struct mes_ring r[2];	/* index = pipe */
 };
 
@@ -286,7 +298,9 @@ mes_report(struct mes *m, const char *when)
 		    rd(m, m->g->hqd_pq_rptr), rd(m, m->g->hqd_pq_wptr_lo));
 	}
 	grbm_select(m, 0, 0);
-	printf("\n");
+	printf("; GRBM_STATUS %#x, CP_STAT %#x, RLC_STAT %#x\n",
+	    rd(m, m->g->grbm_status), rd(m, m->g->cp_stat),
+	    rd(m, m->g->rlc_stat));
 }
 
 /* mes_v12_0_mqd_init */
@@ -567,6 +581,80 @@ map_sched_queue(struct mes *m)
 	return (mes_api(m, 1, pkt, AQ_API_STATUS, "ADD_QUEUE (scheduler)"));
 }
 
+/* mes_v12_0_unmap_legacy_queue for the scheduler ring (uni: to pipe 1). */
+static int
+unmap_sched_queue(struct mes *m)
+{
+	uint32_t pkt[API_DW];
+	uint8_t *b = (uint8_t *)pkt;
+
+	memset(pkt, 0, sizeof(pkt));
+	pkt[0] = HDR_REMOVE_QUEUE;
+	put32(b, RQ_DOORBELL, m->r[0].db);
+	put32(b, RQ_FLAGS, RQ_UNMAP_LEGACY);
+	put32(b, RQ_PIPE_ID, 0);
+	put32(b, RQ_QUEUE_ID, 0);
+	put32(b, RQ_QUEUE_TYPE, QUEUE_TYPE_SCHQ);
+	return (mes_api(m, 1, pkt, RQ_API_STATUS, "REMOVE_QUEUE (scheduler)"));
+}
+
+/*
+ * mes_v12_0_kiq_dequeue_sched, for any MES pipe whose HQD is still active:
+ * dequeue request, wait for inactive, doorbell off, pointers zeroed.
+ */
+static void
+hqd_dequeue(struct mes *m, int pipe)
+{
+	const struct mes_gen *g = m->g;
+	uint32_t d;
+	int us = 0;
+
+	grbm_select(m, 3, pipe);
+	if (rd(m, g->hqd_active) & 1) {
+		wr(m, g->hqd_dequeue_req, 1);
+		for (; us < 100000 && (rd(m, g->hqd_active) & 1); us += 10)
+			DELAY(10);
+		wr(m, g->hqd_dequeue_req, 0);
+	}
+	d = rd(m, g->hqd_doorbell);
+	d &= ~(1u << 30);		/* DOORBELL_EN */
+	d |= 1u << 31;			/* DOORBELL_HIT: clear */
+	wr(m, g->hqd_doorbell, d);
+	wr(m, g->hqd_doorbell, 0);
+	wr(m, g->hqd_pq_wptr_lo, 0);
+	wr(m, g->hqd_pq_wptr_hi, 0);
+	wr(m, g->hqd_pq_rptr, 0);
+	d = rd(m, g->hqd_active);
+	grbm_select(m, 0, 0);
+	device_printf(m->sc->dev, "mes: pipe %d HQD dequeued: active %u%s\n",
+	    pipe, d & 1, us >= 100000 ? " (dequeue timed out)" : "");
+}
+
+/*
+ * Undo 4d so the card can idle (kiq_hw_fini + mes_enable(false)): the
+ * scheduler queue unmapped by MES, both MES HQDs dequeued, unmapped
+ * doorbell handling off, interrupt enables restored, then MES halted.
+ */
+static void
+mes_teardown(struct mes *m)
+{
+	const struct mes_gen *g = m->g;
+	int p;
+
+	if (m->sched_mapped)
+		(void)unmap_sched_queue(m);
+	hqd_dequeue(m, 0);
+	hqd_dequeue(m, 1);
+	wr(m, g->unmapped_doorbell, rd(m, g->unmapped_doorbell) & ~1u);
+	for (p = 0; p < 2; p++) {
+		grbm_select(m, 3, p);
+		wr(m, g->cpc_int_cntl, m->cpc_int_cntl[p]);
+	}
+	grbm_select(m, 0, 0);
+	mes_enable(m, false);
+	DELAY(100);
+}
+
 static int
 mes_fw_start(struct mes *m)
 {
@@ -612,7 +700,8 @@ mes_run(struct mes *m)
 	/* MES pipes: EOP interrupt on API completion (TIME_STAMP_INT). */
 	for (p = 0; p < 2; p++) {
 		grbm_select(m, 3, p);
-		wr(m, g->cpc_int_cntl, rd(m, g->cpc_int_cntl) |
+		m->cpc_int_cntl[p] = rd(m, g->cpc_int_cntl);
+		wr(m, g->cpc_int_cntl, m->cpc_int_cntl[p] |
 		    TIME_STAMP_INT_ENABLE);
 	}
 	grbm_select(m, 0, 0);
@@ -638,6 +727,7 @@ mes_run(struct mes *m)
 	mqd_init(m, 0);
 	if ((err = map_sched_queue(m)) != 0)
 		return (err);
+	m->sched_mapped = true;
 	grbm_select(m, 3, 0);
 	m->version[0] = rd(m, g->mes_gp3_lo);
 	grbm_select(m, 0, 0);
@@ -718,9 +808,8 @@ amd_mes12_test(struct atrium_amd_softc *sc, struct amd_gart *gt)
 	pci_enable_busmaster(sc->dev);
 	err = mes_run(&m);
 	mes_report(&m, err == 0 ? "answered" : "failed");
-	mes_enable(&m, false);
-	DELAY(100);
-	mes_report(&m, "halted");
+	mes_teardown(&m);
+	mes_report(&m, "torn down");
 	if ((pci_cmd & PCIM_CMD_BUSMASTEREN) == 0)
 		pci_disable_busmaster(sc->dev);
 	device_printf(sc->dev, "mes: stage 4d: %s\n", err == 0 ?

@@ -346,3 +346,15 @@ land with it.
   status), so 4d does not depend on interrupts. MES fence interrupts plus TIME_STAMP_INT on
   the MES pipes should give CP EOP IVs (client 0x14, source 181), which would be the IH write
   path's first proof. MES is halted again at the end; mode 1 reset as always.
+- **2026-11-12 20:10, stage 4d on the box (6073c0fa): MES up, IH write path proven, idle refused.**
+  Both MES pipes run firmware 0x1029097. SET_HW_RESOURCES, SET_HW_RESOURCES_1, ADD_QUEUE
+  (scheduler, via pipe 1) and QUERY_SCHEDULER_STATUS all returned status 1 within 30–50 µs.
+  12 CP EOP IVs arrived (client 0x14, src 181, rings 12/13, ctx 0xb1), the IH wptr went to
+  0x180 with the writeback in step, and 1 MSI fired, so the IH write path is PASS. The MP1
+  SW_INT miss is on the MP1 side. After stage 4 the card would not idle: 53–60 W, gfx
+  3.4 GHz, busy 100 %. MES was halted but both MES HQDs were still active. The driver
+  refused, the mode 1 reset left it cold, PCH 28–30 °C, no strays. Fix (next run): proper
+  teardown as amdgpu's kiq_hw_fini does. That means REMOVE_QUEUE (unmap_legacy_queue) for
+  the scheduler queue, dequeuing both MES HQDs by register, unmapped doorbells off and
+  CPC_INT_CNTL restored, then halting. GRBM_STATUS, CP_STAT and RLC_STAT are logged at
+  each step.
