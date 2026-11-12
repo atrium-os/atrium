@@ -188,11 +188,11 @@ the policy while window 1 holds the pad: window 1 gets `DISCONNECT` and
 - **Forum.** forum-ctl intents `ListPads` (each pad with the holding
   app's id, from the WM's surface list) and `TakeBackPad`; forum-wm
   carries them out. The bar shows a controller button while there are
-  pads (accent while one is held); a click opens the controller menu in
-  the bar: each pad, who holds it or "follows focus", and a "Take back"
-  chip for a held one. It sits in the bar rather than a drop-down because
-  a drop-down would be clipped by the bar's window until frescod has
-  pop-up windows. `forum-ctl pads` and `forum-ctl take-back [ID]` do the
+  pads (accent while one is held); a click opens the controller menu as an
+  attached drop-down (a pop-up window, fresco-popups.md; Pergola
+  `MenuButton::icon(..).attached()`): each pad, who holds it or "follows
+  focus"; picking a held one ("— Take back") takes it back. While open the
+  button is lit, which no app can draw in the bar. `forum-ctl pads` and `forum-ctl take-back [ID]` do the
   same from a shell.
 - **Checked:** frescod unit tests 55/55 in the amd64 VM (new:
   `the_user_takes_a_claimed_pad_back`), forum-wm and forum-bar unit tests,
