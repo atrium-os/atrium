@@ -382,3 +382,12 @@ land with it.
   refused; reset cold. Reading: given gfx_hqd_mask 0xfe (as amdgpu does), MES posts a GFX
   wptr, but PFP/ME are halted (4c), so it is never consumed. Next: gfx_hqd_mask 0 until
   the GFX ring stage; the CP stays halted.
+- **2026-11-12 20:37, f4265f28 (gfx_hqd_mask 0): MES pipe 1 never started, so the
+  question went untested.** 500 µs after the start, pipe 1 sat at instr 0x1 with GP3 0,
+  while pipe 0 was normal. Its HQD was still activated, and the wptr post wedged CPF
+  (0xad000001) and CPC (0xa0010000). SET_HW_RESOURCES got no answer, the dequeue timed
+  out, and 32 IVs arrived from client 0xa (SOC21 GFX) src 0. Power was 62 W; the driver
+  refused and the reset left the card cold. The mes12.c change between runs was only the
+  mask, which is used after the start, so the start is intermittent. Fix (next run): wait
+  up to 100 ms for each pipe's firmware version, and refuse before any queue is made
+  active.

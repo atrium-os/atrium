@@ -754,6 +754,33 @@ mes_run(struct mes *m)
 	mes_report(m, "before");
 	amd_gfx12_pm_report(sc, "before MES");
 	mes_enable(m, true);
+	/*
+	 * Both pipes must be running the firmware before any queue is made
+	 * active on them. Box run f4265f28: pipe 1 was still at instr 0x1,
+	 * GP3 0 500 us after the start; its HQD was activated anyway, the
+	 * wptr post wedged CPF and CPC, and the dequeue timed out. Wait for
+	 * each pipe's firmware version (GP3) to appear, up to 100 ms.
+	 */
+	for (p = 0; p < 2; p++) {
+		uint32_t gp3 = 0;
+		int us;
+
+		grbm_select(m, 3, p);
+		for (us = 0; us < 100000; us += 100) {
+			if ((gp3 = rd(m, g->mes_gp3_lo)) != 0)
+				break;
+			DELAY(100);
+		}
+		grbm_select(m, 0, 0);
+		if (gp3 == 0) {
+			mes_report(m, "pipe not started");
+			device_printf(sc->dev, "mes: pipe %d firmware not running "
+			    "100 ms after the start; no queues made active\n", p);
+			return (ENXIO);
+		}
+		device_printf(sc->dev, "mes: pipe %d firmware up (version %#x) "
+		    "%d us after the start wait began\n", p, gp3, us);
+	}
 	mes_report(m, "started");
 
 	/* Pipe 1 (KIQ): MQD and HQD by register. */
