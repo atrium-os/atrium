@@ -276,7 +276,12 @@ impl PspFw {
         if count > PSP_MAX_BINS {
             return Err(FwError::TooManyBins);
         }
-        need_header(&common, table + count * 16)?;
+        // The descriptor table is a flexible array: header_size_bytes covers
+        // only the fixed part (36 bytes for v2.0 on psp_14_0_3_sos.bin), so
+        // the table is checked against the file, not the header size.
+        if table + count * 16 > file.len() {
+            return Err(FwError::Truncated);
+        }
         let empty = PspBin { fw_type: 0, fw_version: 0, region: Region { offset: 0, size: 0 } };
         let mut bins = [empty; PSP_MAX_BINS];
         for (i, slot) in bins.iter_mut().enumerate().take(count) {

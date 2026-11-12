@@ -1,0 +1,12 @@
+[package]
+name = "atrium-gpu-probe"
+version = "0.1.0"
+edition = "2021"
+license = "BSD-2-Clause"
+publish = false
+description = "Read-only first look at an AMD GPU on real silicon: PCI identity, BARs, a few MMIO registers, the IP discovery table, firmware headers"
+
+[dependencies]
+libc = "0.2"
+
+[workspace]

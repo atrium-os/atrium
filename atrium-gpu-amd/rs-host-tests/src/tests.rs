@@ -86,6 +86,11 @@ fn psp_v2_tables() {
     assert_eq!(PspFw::parse(&f), Err(FwError::TooManyBins));
     let f = fw_file(2, 0, &[3, 1, 0, 0, 4], 4);
     assert_eq!(PspFw::parse(&f), Err(FwError::Truncated));
+    // Real files: header_size covers only common + count; the table follows.
+    let mut f = fw_file(2, 0, &[1, 7, 9, 0, 4], 4);
+    put32(&mut f, 4, 36);
+    let p = PspFw::parse(&f).unwrap();
+    assert_eq!(p.bins()[0].fw_type, 7);
 }
 
 /// A discovery binary with one die and the given IPs (hw_id, inst, ver, bases).
