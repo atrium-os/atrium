@@ -54,6 +54,28 @@ pub fn proto_sample(s: &demux::Sample, data: Vec<u8>) -> hospes_proto::Sample {
     out
 }
 
+/// The VP9 profile from the track's configuration: MP4's `vpcC` (version, three flag bytes
+/// that are zero, then the profile) or WebM's `CodecPrivate` (a list of ID, length, value
+/// features; ID 1 is the profile). Nothing there: profile 0, as the format assumes.
+fn vp9_profile(c: &[u8]) -> Option<u8> {
+    if c.is_empty() {
+        return Some(0);
+    }
+    if c.len() >= 5 && c[1..4] == [0, 0, 0] {
+        return Some(c[4]);
+    }
+    let mut at = 0;
+    while at + 2 <= c.len() {
+        let (id, len) = (c[at], c[at + 1] as usize);
+        let v = c.get(at + 2..at + 2 + len)?;
+        if id == 1 {
+            return (len == 1).then(|| v[0]);
+        }
+        at += 2 + len;
+    }
+    (at == c.len()).then_some(0)
+}
+
 /// `avcC` → (profile, SPS+PPS as Annex-B), for 4-byte length fields only.
 fn h264_config(c: &[u8]) -> Option<(u32, Vec<u8>)> {
     if c.len() < 7 || c[0] != 1 || c[4] & 3 != 3 {
@@ -123,8 +145,7 @@ impl CdmVideo {
                 let (profile, params) = h264_config(&t.config).ok_or(Error::Unsupported)?;
                 (cdm::CODEC_H264, profile, Some(params))
             }
-            // vpcC: version, flags, then profile.
-            Codec::Vp9 if t.config.len() < 5 || t.config[4] == 0 => (cdm::CODEC_VP9, cdm::VP9_PROFILE0, None),
+            Codec::Vp9 if vp9_profile(&t.config) == Some(0) => (cdm::CODEC_VP9, cdm::VP9_PROFILE0, None),
             _ => return Err(Error::Unsupported),
         };
         let init = Msg::InitVideo {
@@ -265,6 +286,18 @@ impl Drop for CdmVideo {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn vp9_profile_from_vpcc_and_webm() {
+        // Shaka's angel-one VP9 WebM: profile 0, level 1.0, 8 bits, 4:2:0.
+        assert_eq!(vp9_profile(&[1, 1, 0, 2, 1, 10, 3, 1, 8, 4, 1, 0]), Some(0));
+        assert_eq!(vp9_profile(&[1, 1, 2, 2, 1, 10]), Some(2));
+        assert_eq!(vp9_profile(&[1, 0, 0, 0, 0, 10, 0x82, 2, 2, 2, 0, 0]), Some(0));
+        assert_eq!(vp9_profile(&[1, 0, 0, 0, 1, 10, 0x82, 2, 2, 2, 0, 0]), Some(1));
+        assert_eq!(vp9_profile(&[]), Some(0));
+        assert_eq!(vp9_profile(&[2, 1, 10]), Some(0));
+        assert_eq!(vp9_profile(&[1, 5, 0]), None);
+    }
 
     #[test]
     fn avcc_lengths_become_start_codes() {

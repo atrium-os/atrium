@@ -205,7 +205,8 @@ checks today's Chrome CDM and OpenH264 daily on both machines (CDM never run in 
 wrapper not built. Build order H0-H5 complete; open items in the H4/H5 write-ups. The CDM's own jail and user done 2026-11-12
 (`docs/reviews/2026-11-12-hospes-cdm-jail.md`): portcullisd `OpenCdm` + manifest capability
 `protected-media`; hospes-cdm runs as `_hospes-cdm` (65027) in a one-shot jail with a
-per-app, per-origin store, library and store rights-limited; arm64 VM check passes. Run: `scripts/hospes-build.sh`, `scripts/hospes-h3-vm.sh`,
+per-app, per-origin store, library and store rights-limited; arm64 VM check passes. Widevine WebM (VP9) plays through the manifest's PSSH
+(`docs/reviews/2026-11-12-hospes-webm-pssh.md`, `ATRIUM_PLAYER_CDM_MPD`/`_PSSH`), arm64 VM. Run: `scripts/hospes-build.sh`, `scripts/hospes-h3-vm.sh`,
 `scripts/hospes-kmod.sh`, `scripts/hospes-k1-vm.sh`, `scripts/hospes-h4-vm.sh`,
 `scripts/hospes-version-watch.sh`, `scripts/hospes-cdm-jail-vm.sh`.
 

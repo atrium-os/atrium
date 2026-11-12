@@ -25,6 +25,16 @@ OBJ="${OBJ:-$HOME/obj-$TGT}"
 V="$ROOT/scripts/vssh"
 
 kernel() {
+    # The guest keeps kernel.atrium between boots: when it is this build's, only nextboot
+    # again (an install stages ~500 MB on the host, which the cloud disk may not have).
+    kbin="$OBJ$SRC/$TGT.$TA/sys/$KERNCONF/kernel"
+    stamp=$(sha256sum "$kbin" 2>/dev/null | cut -d' ' -f1)
+    if [ -n "$stamp" ] && [ "$("$V" 'cat /boot/kernel.atrium/.atrium-stamp 2>/dev/null' | tr -d '\r')" = "$stamp" ]; then
+        echo "kernel.atrium in the guest is this build: nextboot only" >&2
+        "$V" 'nextboot -k kernel.atrium && (shutdown -r now >/dev/null 2>&1 &)'
+        reboot_wait
+        return
+    fi
     stage="$HOME/stage-$TGT"
     rm -rf "$stage"
     env CC=/usr/bin/clang-$LLVM CXX=/usr/bin/clang++-$LLVM CPP=/usr/bin/clang-cpp-$LLVM MAKEOBJDIRPREFIX="$OBJ" \
@@ -35,8 +45,12 @@ kernel() {
     "$V" 'rm -rf /boot/kernel.atrium /tmp/k.tgz; cat > /tmp/k.tgz' < "$stage.tgz"
     got=$("$V" 'sha256 -q /tmp/k.tgz')
     [ "$got" = "$sum" ] || { echo "kernel copy corrupt ($got != $sum)" >&2; exit 1; }
-    "$V" 'tar xzf /tmp/k.tgz -C / && rm /tmp/k.tgz && nextboot -k kernel.atrium && (shutdown -r now >/dev/null 2>&1 &)'
+    "$V" "tar xzf /tmp/k.tgz -C / && rm /tmp/k.tgz && echo $stamp > /boot/kernel.atrium/.atrium-stamp && nextboot -k kernel.atrium && (shutdown -r now >/dev/null 2>&1 &)"
     rm -rf "$stage" "$stage.tgz"
+    reboot_wait
+}
+
+reboot_wait() {
     sleep 20
     i=0
     until VSSH_CONNECT_TIMEOUT=5 "$V" true 2>/dev/null; do

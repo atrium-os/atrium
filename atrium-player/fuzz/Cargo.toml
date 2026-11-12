@@ -28,3 +28,10 @@ path = "fuzz_targets/mp4.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "dash"
+path = "fuzz_targets/dash.rs"
+test = false
+doc = false
+bench = false

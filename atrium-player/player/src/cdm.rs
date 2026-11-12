@@ -11,7 +11,7 @@
 //! request is POSTed to through the system fetcher (Nuntius, hospes.md §8.5): neither the
 //! CDM nor the supervisor ever holds a socket to the network.
 use std::fs::File;
-use std::io;
+use std::io::{self, Read};
 use std::os::fd::AsRawFd;
 use std::os::unix::net::UnixStream;
 use std::path::PathBuf;
@@ -43,6 +43,10 @@ pub struct CdmOptions {
     /// the app's manifest must hold `protected-media`). `host`, `library` and `store` are
     /// then unused. `None`: we start `hospes-cdm` ourselves (development, the VM checks).
     pub system_origin: Option<String>,
+    /// Init data from outside the media: `pssh` boxes the caller took from the manifest
+    /// (a DASH `<cenc:pssh>`), as a page passes EME's `initData`. Sent first, as `cenc`.
+    /// WebM names only a key id, and some licence services refuse a request made from one.
+    pub init_data: Vec<Vec<u8>>,
 }
 
 /// The key system a CDM library is for, by its file name: Widevine's is `libwidevinecdm.so`.
@@ -129,6 +133,11 @@ impl CdmOptions {
     ///
     /// `ATRIUM_PLAYER_CDM=system:KEY_SYSTEM` asks portcullisd for the system's CDM instead,
     /// with `ATRIUM_PLAYER_CDM_ORIGIN` (default `local`) naming the store.
+    ///
+    /// Init data from the manifest ([`CdmOptions::init_data`]): `ATRIUM_PLAYER_CDM_PSSH`
+    /// (base64 `pssh` boxes, comma-separated) and `ATRIUM_PLAYER_CDM_MPD` (a DASH manifest
+    /// whose `<cenc:pssh>` for the key system are taken). Boxes for another DRM system, or
+    /// malformed, are dropped.
     pub fn from_env() -> Option<CdmOptions> {
         let library: PathBuf = std::env::var_os("ATRIUM_PLAYER_CDM")?.into();
         let system = library.to_str().and_then(|l| l.strip_prefix("system:")).map(str::to_string);
@@ -145,8 +154,58 @@ impl CdmOptions {
         let store = std::env::var_os("ATRIUM_PLAYER_CDM_STORE").map(PathBuf::from);
         let key_system = system.clone().unwrap_or_else(|| std::env::var("ATRIUM_PLAYER_KEY_SYSTEM").unwrap_or_else(|_| key_system_for(&library).into()));
         let system_origin = system.map(|_| std::env::var("ATRIUM_PLAYER_CDM_ORIGIN").unwrap_or_else(|_| "local".into()));
-        Some(CdmOptions { host, library, store, licences, mem_mib: 512, key_system, system_origin })
+        let init_data = manifest_init_data(&key_system, std::env::var("ATRIUM_PLAYER_CDM_PSSH").ok().as_deref(), std::env::var_os("ATRIUM_PLAYER_CDM_MPD").map(PathBuf::from).as_deref());
+        Some(CdmOptions { host, library, store, licences, mem_mib: 512, key_system, system_origin, init_data })
     }
+}
+
+/// The `pssh` boxes for `key_system` from base64 text and from a manifest file.
+pub fn manifest_init_data(key_system: &str, pssh: Option<&str>, mpd: Option<&std::path::Path>) -> Vec<Vec<u8>> {
+    use atrium_media_demux::dash;
+    let Some(system) = dash::system_id(key_system) else { return Vec::new() };
+    let mut out: Vec<Vec<u8>> = Vec::new();
+    let mut add = |b: Vec<u8>| {
+        if !out.contains(&b) && out.len() < dash::BOXES_MAX {
+            out.push(b);
+        }
+    };
+    for p in pssh.unwrap_or("").split(',').filter(|p| !p.trim().is_empty()) {
+        match dash::pssh_from_base64(p.trim(), system) {
+            Some(b) => add(b),
+            None => eprintln!("atrium-player: ATRIUM_PLAYER_CDM_PSSH: not a {key_system} pssh box; skipped"),
+        }
+    }
+    if let Some(path) = mpd {
+        let mut text = Vec::new();
+        let read = File::open(path).and_then(|f| f.take(dash::MANIFEST_MAX as u64 + 1).read_to_end(&mut text));
+        match read {
+            Ok(_) if text.len() <= dash::MANIFEST_MAX => {
+                let boxes = dash::pssh_boxes(&text, system);
+                if boxes.is_empty() {
+                    eprintln!("atrium-player: {}: no {key_system} pssh in the manifest", path.display());
+                }
+                boxes.into_iter().for_each(&mut add);
+            }
+            Ok(_) => eprintln!("atrium-player: {}: manifest too big", path.display()),
+            Err(e) => eprintln!("atrium-player: {}: {e}", path.display()),
+        }
+    }
+    out
+}
+
+/// How long held key-id init data waits for a key change after the CDM took a licence.
+const HOLD_AFTER_LICENCE: Duration = Duration::from_secs(2);
+
+/// `ATRIUM_PLAYER_TRACE_CDM=1`: sessions and key changes, to stderr.
+fn trace(what: std::fmt::Arguments) {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if *ON.get_or_init(|| std::env::var_os("ATRIUM_PLAYER_TRACE_CDM").is_some()) {
+        eprintln!("atrium-player: cdm: {what}");
+    }
+}
+
+fn hex(b: &[u8]) -> String {
+    b.iter().map(|x| format!("{x:02x}")).collect()
 }
 
 /// `KID:KEY,KID:KEY`, 32 hex digits each.
@@ -249,8 +308,19 @@ pub struct CdmProc {
     /// Answers from licence servers: (session, answer or why not).
     answers: (mpsc::Sender<(Vec<u8>, Result<Vec<u8>, String>)>, mpsc::Receiver<(Vec<u8>, Result<Vec<u8>, String>)>),
     initialized: bool,
-    /// Init data waiting for `Initialized`.
+    /// Init data waiting for `Initialized` (the manifest's first).
     queued: Vec<(u8, Vec<u8>)>,
+    /// `cenc` init data already made into a session (the manifest's box is often the
+    /// media's too).
+    sent: Vec<Vec<u8>>,
+    /// When a licence answer went to the CDM, and whether keys have changed since: held
+    /// key-id init data waits for both (the CDM resolves the update before it reports the
+    /// keys), or [`HOLD_AFTER_LICENCE`] if no key change comes.
+    licensed: Option<std::time::Instant>,
+    keys_seen: bool,
+    /// The last promise the CDM resolved: the wait for a key change counts from there (a
+    /// slow CDM, under emulation, takes seconds over an update).
+    resolved_at: Option<std::time::Instant>,
     /// Key-id init data (WebM, `keyids`) held while another session's licence is under
     /// way: that licence often carries this key too (Shaka's angel-one: one Widevine PSSH for
     /// every track, and the proxy refuses a request made from a bare key id).
@@ -309,7 +379,7 @@ impl CdmProc {
                 }
             }
         })?;
-        let mut p = CdmProc { child, ctrl, rx, licences: o.licences.clone(), answers: mpsc::channel(), initialized: false, queued: Vec::new(), deferred: Vec::new(), usable: Vec::new(), keyid_promises: Vec::new(), keyid_sessions: Vec::new(), promise: 0, sessions: 0, outstanding: 0, failed: false };
+        let mut p = CdmProc { child, ctrl, rx, licences: o.licences.clone(), answers: mpsc::channel(), initialized: false, queued: o.init_data.iter().map(|d| (0, d.clone())).collect(), sent: Vec::new(), licensed: None, keys_seen: false, resolved_at: None, deferred: Vec::new(), usable: Vec::new(), keyid_promises: Vec::new(), keyid_sessions: Vec::new(), promise: 0, sessions: 0, outstanding: 0, failed: false };
         p.send(Msg::Init { allow_persistent: false, link_mask: 0 });
         Ok((p, data_w))
     }
@@ -331,8 +401,11 @@ impl CdmProc {
             self.queued.push((kind, data));
             return;
         }
-        if self.sessions >= SESSIONS_MAX {
+        if self.sessions >= SESSIONS_MAX || (kind == 0 && self.sent.contains(&data)) {
             return;
+        }
+        if kind == 0 {
+            self.sent.push(data.clone());
         }
         // cdm::InitDataType: kCenc 0, kKeyIds 1, kWebM 2.
         if kind != 0 && self.sessions > 0 {
@@ -347,6 +420,7 @@ impl CdmProc {
         if kind != 0 {
             self.keyid_promises.push(promise);
         }
+        trace(format_args!("session {promise} from init data type {kind}, {} bytes", data.len()));
         self.send(Msg::CreateSession { promise, session_type: 0, init_type: kind as u32, init: data });
     }
 
@@ -380,7 +454,10 @@ impl CdmProc {
                     }
                 }
                 Msg::Initialized { ok: false } => out.push(CdmEvent::Failed("CDM initialisation failed".into())),
-                Msg::Resolved { .. } => self.outstanding = self.outstanding.saturating_sub(1),
+                Msg::Resolved { .. } => {
+                    self.outstanding = self.outstanding.saturating_sub(1);
+                    self.resolved_at = Some(std::time::Instant::now());
+                }
                 Msg::Rejected { message, .. } => {
                     self.outstanding = self.outstanding.saturating_sub(1);
                     out.push(CdmEvent::Failed(format!("CDM refused: {}", String::from_utf8_lossy(&message))));
@@ -392,6 +469,7 @@ impl CdmProc {
                         Some(response) => {
                             let promise = self.next_promise();
                             self.outstanding += 1;
+                            self.licensed.get_or_insert_with(std::time::Instant::now);
                             self.send(Msg::UpdateSession { promise, id, response });
                         }
                         None => out.push(CdmEvent::Failed("no key for this media".into())),
@@ -417,6 +495,8 @@ impl CdmProc {
                 }
                 Msg::SessionMessage { .. } => {}
                 Msg::KeysChange { has_new_usable, keys, .. } => {
+                    self.keys_seen |= self.licensed.is_some();
+                    trace(format_args!("keys change (new usable: {has_new_usable}): {}", keys.iter().map(|k| format!("{}={}", hex(&k.key_id), k.status)).collect::<Vec<_>>().join(" ")));
                     for k in keys.iter().filter(|k| k.status == 0 /* kUsable */) {
                         if !self.usable.contains(&k.key_id) {
                             self.usable.push(k.key_id.clone());
@@ -436,8 +516,10 @@ impl CdmProc {
         }
         while let Ok((id, r)) = self.answers.1.try_recv() {
             self.outstanding = self.outstanding.saturating_sub(1);
+            trace(format_args!("licence for session {}: {}", String::from_utf8_lossy(&id), match &r { Ok(b) => format!("{} bytes", b.len()), Err(e) => e.clone() }));
             match r {
                 Ok(response) => {
+                    self.licensed.get_or_insert_with(std::time::Instant::now);
                     let promise = self.next_promise();
                     self.outstanding += 1;
                     self.send(Msg::UpdateSession { promise, id, response });
@@ -455,8 +537,12 @@ impl CdmProc {
         if !self.deferred.is_empty() {
             let usable = &self.usable;
             self.deferred.retain(|(k, d)| !(*k == 2 && usable.contains(d)));
-            if self.outstanding == 0 {
+            // Not before a licence has come back: between a session's creation and its
+            // licence request nothing is outstanding, and the licence usually holds the key.
+            let licence_done = self.licensed.is_some() && (self.keys_seen || self.resolved_at.is_some_and(|t| t.elapsed() > HOLD_AFTER_LICENCE));
+            if self.outstanding == 0 && (licence_done || self.sent.is_empty()) {
                 for (k, d) in std::mem::take(&mut self.deferred) {
+                    trace(format_args!("session from held init data type {k}, {} bytes", d.len()));
                     if self.sessions < SESSIONS_MAX {
                         self.sessions += 1;
                         self.outstanding += 1;
@@ -570,6 +656,21 @@ mod tests {
     use super::*;
 
     const KID: [u8; 16] = [0x00, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88, 0x99, 0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff];
+
+    #[test]
+    fn manifest_init_data_takes_the_key_systems_boxes_once() {
+        const BOX: &str = "AAAAPnBzc2gAAAAA7e+LqXnWSs6jyCfc1R0h7QAAAB4iFnNoYWthX2NlYzJmNjRhYTc4OTBhMTFI49yVmwY=";
+        let dir = std::env::temp_dir().join(format!("player-mpd-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mpd = dir.join("dash.mpd");
+        std::fs::write(&mpd, format!(r#"<MPD><ContentProtection schemeIdUri="urn:uuid:edef8ba9-79d6-4ace-a3c8-27dcd51d21ed"><cenc:pssh>{BOX}</cenc:pssh></ContentProtection></MPD>"#)).unwrap();
+        let w = manifest_init_data("com.widevine.alpha", Some(&format!("{BOX}, junk")), Some(&mpd));
+        assert_eq!(w.len(), 1);
+        assert_eq!(&w[0][4..8], b"pssh");
+        assert!(manifest_init_data("org.w3.clearkey", Some(BOX), Some(&mpd)).is_empty());
+        assert!(manifest_init_data("com.example.unknown", Some(BOX), None).is_empty());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
 
     #[test]
     fn keys_from_env_syntax() {

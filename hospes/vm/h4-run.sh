@@ -1,7 +1,7 @@
 #!/bin/sh
 # H4 on FreeBSD (copied in by scripts/hospes-h4-vm.sh, run as root from its directory):
 # install Widevine from Google's signed Chrome package with hospes-install, then play Shaka's
-# Widevine test stream (angel-one: H.264 MP4 video, Opus WebM audio) through the player as
+# Widevine test stream (angel-one: H.264 MP4 or VP9 WebM video, Opus WebM audio) through the player as
 # `nobody`, the licence going by POST through Nuntius to Shaka's licence proxy.
 #
 # The guest has no route out: the proxy's name resolves to the fixture address, where the
@@ -44,11 +44,15 @@ mkdir -p "$D/store"; chown nobody "$D/store"
 chmod -R a+rX "$D"
 export ATRIUM_PLAYER_DECODE="$D/bin/atrium-player-decode" ATRIUM_PLAYER_HOSPES_CDM="$D/bin/hospes-cdm" ATRIUM_PLAYER_CDM="$LIB"
 export ATRIUM_PLAYER_LICENCE_URL="https://$PROXY/no_auth" ATRIUM_PLAYER_CDM_STORE="$D/store"
-# The VP9 WebM carries only key ids (no PSSH): Shaka's proxy refuses a request made from one,
-# and its player takes the PSSH from the manifest, which this check does not read.
-for v in ${VIDEOS:-v-0144p-0100k-libx264.mp4}; do
+# The VP9 WebM carries only key ids (no PSSH), and Shaka's proxy refuses a request made from
+# one: as Shaka's player does, the PSSH comes from the manifest (ATRIUM_PLAYER_CDM_MPD). The
+# MP4 carries its own PSSH, so it plays without the manifest.
+for v in ${VIDEOS:-v-0144p-0100k-libx264.mp4 v-0144p-0100k-vp9.webm}; do
+    case "$v" in *.webm) mpd="ATRIUM_PLAYER_CDM_MPD=$D/media/dash.mpd" ;; *) mpd= ;; esac
     t0=$(date +%s)
-    out=$(su -m nobody -c "$D/bin/atrium-player --headless --feed $D/media/$v $D/media/a-eng-0096k-libopus-2c.webm" 2>"$D/player-$v.err")
+    # TRACE=1: the player's CDM trace on stderr. A stall ends after PLAY_TIMEOUT seconds.
+    [ "${TRACE:-0}" = 1 ] && mpd="$mpd ATRIUM_PLAYER_TRACE_CDM=1"
+    out=$(su -m nobody -c "env $mpd timeout ${PLAY_TIMEOUT:-900} $D/bin/atrium-player --headless --feed $D/media/$v $D/media/a-eng-0096k-libopus-2c.webm" 2>"$D/player-$v.err")
     t1=$(date +%s)
     echo "$out" | grep -v '^video ' > "$D/player-$v.out"
     frames=$(echo "$out" | grep -c '^video ')
@@ -60,7 +64,7 @@ for v in ${VIDEOS:-v-0144p-0100k-libx264.mp4}; do
     if echo "$out" | grep -q '^ended' && [ "$frames" -ge 1490 ] && [ "$last" -ge 59000000000 ] && [ "${pcm:-0}" -ge 2800000 ] && [ "$sb" -ge 1 ]; then
         echo "player $v: $frames frames ($distinct distinct, last at $((last / 1000000)) ms), $pcm audio frames, sandboxed, $((t1 - t0)) s"
     else
-        echo "player $v: FAILED ($frames frames, last at $last ns, audio ${pcm:-none})"; cat "$D/player-$v.out" | head -20; tail -20 "$D/player-$v.err"; rc=1
+        echo "player $v: FAILED ($frames frames, last at $last ns, audio ${pcm:-none})"; cat "$D/player-$v.out" | head -20; tail -40 "$D/player-$v.err"; rc=1
     fi
 done
 echo "licence POSTs relayed: see the host's relay log"

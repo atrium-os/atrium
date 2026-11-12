@@ -94,9 +94,15 @@ jobs:
             echo "== $t"
             cargo fuzz run "$t" -O -- -max_total_time=300 -rss_limit_mb=2048 -max_len=65536
           done
+          # The player's DASH manifest scan: the PSSH handed to the CDM for WebM.
+          echo "== atrium-player dash"
+          cd ../../atrium-player/fuzz
+          cargo fuzz run dash -O -- -max_total_time=300 -rss_limit_mb=2048 -max_len=65536
       - name: Keep any crash
         if: failure()
         uses: actions/upload-artifact@v4
         with:
           name: hospes-fuzz-artifacts
-          path: hospes/fuzz/artifacts
+          path: |
+            hospes/fuzz/artifacts
+            atrium-player/fuzz/artifacts

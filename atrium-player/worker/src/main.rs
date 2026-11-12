@@ -60,8 +60,12 @@ fn codec_id(c: Codec) -> u32 {
 fn video_decoder(t: &TrackInfo, cfg: &decode::Config, h264: &mut Option<UnixStream>, cdm: &Option<UnixStream>) -> decode::Result<(Box<dyn decode::VideoDecoder>, bool)> {
     if let (Some(sock), Some(_)) = (cdm.as_ref(), t.protection.as_ref()) {
         if let Ok(sock) = sock.try_clone() {
-            if let Ok(d) = cdmvideo::CdmVideo::new(t, (cfg.max_width, cfg.max_height), sock) {
-                return Ok((Box::new(d), true));
+            match cdmvideo::CdmVideo::new(t, (cfg.max_width, cfg.max_height), sock) {
+                Ok(d) => {
+                    trace(format_args!("video {:?}: the CDM decodes", t.codec));
+                    return Ok((Box::new(d), true));
+                }
+                Err(e) => trace(format_args!("video {:?}: the CDM will not decode ({e:?}); decrypt-only", t.codec)),
             }
         }
     }
@@ -107,10 +111,25 @@ fn feed_video(v: &mut Video, cdm: &mut Option<UnixStream>) -> Fed {
             Fed::Sent
         }
         Ok(false) => Fed::Sent,
-        Err(decode::Error::NoKey) => Fed::Wait,
+        Err(decode::Error::NoKey) => {
+            trace(format_args!("video sample at {} ms: no key {}", s.pts_ns / 1_000_000, s.crypto.as_ref().map(|c| hex(&c.key_id)).unwrap_or_default()));
+            Fed::Wait
+        }
         Err(decode::Error::TooBig) => Fed::Fail(err::TOO_BIG),
         Err(_) => Fed::Fail(err::DECODE),
     }
+}
+
+/// `ATRIUM_PLAYER_TRACE_CDM=1`: what the encrypted-media path is waiting on, to stderr.
+fn trace(what: std::fmt::Arguments) {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if *ON.get_or_init(|| std::env::var_os("ATRIUM_PLAYER_TRACE_CDM").is_some()) {
+        eprintln!("atrium-player-decode: cdm: {what}");
+    }
+}
+
+fn hex(b: &[u8]) -> String {
+    b.iter().map(|x| format!("{x:02x}")).collect()
 }
 
 /// Why the next sample can't be decoded yet.
@@ -140,6 +159,7 @@ fn next_clear<'a>(store: &'a mut Store, cdm: &mut Option<UnixStream>) -> Result<
                 s.crypto = None;
             }
             Ok(Some(hospes_proto::Msg::Decrypted { status, .. })) if status == hospes_proto::status::NO_KEY => {
+                trace(format_args!("sample at {} ms (track {}): no key {}", s.pts_ns / 1_000_000, s.track, hex(&sample.key_id)));
                 s.data = sample.data;
                 return Err(Locked::Wait);
             }
@@ -217,7 +237,13 @@ struct Worker {
     cdm: Option<UnixStream>,
     /// Init data already sent up (the supervisor opens one session for each).
     init_sent: Vec<Vec<u8>>,
+    /// Video waiting for a key: since when, and whether keys have changed since. A key
+    /// that the CDM still lacks [`KEY_WAIT`] after keys changed will not come (Widevine
+    /// refuses decrypt-only video with "no key"): fail rather than hang.
+    key_wait: Option<(std::time::Instant, bool)>,
 }
+
+const KEY_WAIT: std::time::Duration = std::time::Duration::from_secs(30);
 
 fn main() {
     let mut args = std::env::args().skip(1);
@@ -289,6 +315,7 @@ fn main() {
         h264,
         cdm,
         init_sent: Vec::new(),
+        key_wait: None,
     };
     if w.send(Record::Ready { sandboxed }).is_err() {
         return;
@@ -469,7 +496,12 @@ impl Worker {
                 let _ = self.send(Record::Probe { refused });
             }
             // Waiting samples are tried again on the next round of work.
-            ToWorker::KeysChanged => {}
+            ToWorker::KeysChanged => {
+                trace(format_args!("keys changed"));
+                if let Some(w) = self.key_wait.as_mut() {
+                    *w = (std::time::Instant::now(), true);
+                }
+            }
             ToWorker::Shutdown => return false,
         }
         true
@@ -814,8 +846,17 @@ impl Worker {
                         break;
                     }
                     if matches!(fed, Fed::Wait) {
+                        match self.key_wait {
+                            None => self.key_wait = Some((std::time::Instant::now(), false)),
+                            Some((since, true)) if since.elapsed() > KEY_WAIT => {
+                                eprintln!("atrium-player-decode: encrypted video: the CDM still has no key {} s after the keys changed", KEY_WAIT.as_secs());
+                                fail = Some(err::UNSUPPORTED);
+                            }
+                            Some(_) => {}
+                        }
                         break;
                     }
+                    self.key_wait = None;
                     if matches!(fed, Fed::Sent) {
                         did = true;
                     } else {

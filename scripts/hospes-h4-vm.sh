@@ -32,7 +32,7 @@ PUB=1.2.3.100
 PROXY=cwip-shaka-proxy.appspot.com
 SHAKA=https://storage.googleapis.com/shaka-demo-assets/angel-one-widevine
 APT=https://dl.google.com/linux/chrome/deb
-MEDIA="v-0144p-0100k-libx264.mp4 v-0144p-0100k-vp9.webm a-eng-0096k-libopus-2c.webm"
+MEDIA="v-0144p-0100k-libx264.mp4 v-0144p-0100k-vp9.webm a-eng-0096k-libopus-2c.webm dash.mpd"
 FIX="$VMDIR/h4fix"
 say() { printf '\n=== %s\n' "$*" >&2; }
 die() { printf '\nFAILED: %s\n' "$*" >&2; exit 1; }
@@ -147,8 +147,10 @@ for f in $MEDIA; do cp "$VMDIR/shaka/$f" "$B/media/"; done
 cp "$VMDIR/chrome/InRelease" "$VMDIR/chrome/Packages" "$VMDIR/chrome/chrome.deb" "$B/chrome/"
 cp "$FIX/ca.pem" "$ROOT/hospes/vm/h4-run.sh" "$ROOT/hospes/kmod/out/$KT-${KERNCONF:-ATRIUM-NODEBUG}/hospes_trap.ko" "$B/"
 tar czf - -C "$(dirname "$B")" h4vm | "$V" 'rm -rf /tmp/h4vm && tar xzf - -C /tmp'
+# A full host disk has cut a copy short without an error: check the largest file arrived whole.
+[ "$("$V" 'sha256 -q /tmp/h4vm/chrome/chrome.deb' | tr -d '\r')" = "$DEBSHA" ] || die "the Chrome package did not reach the guest whole (host disk full?)"
 rm -rf "$(dirname "$B")"
 rc=0
-"$V" "cd /tmp/h4vm && PUB=$PUB INSTALL_ONLY=${INSTALL_ONLY:-0} ${VIDEOS:+VIDEOS='$VIDEOS'} sh h4-run.sh" || rc=$?
+"$V" "cd /tmp/h4vm && PUB=$PUB INSTALL_ONLY=${INSTALL_ONLY:-0} ${VIDEOS:+VIDEOS='$VIDEOS'} TRACE=${TRACE:-0} PLAY_TIMEOUT=${PLAY_TIMEOUT:-900} sh h4-run.sh" || rc=$?
 echo "relay: $(grep -c '^POST' "$FIX/relay.log") licence POSTs"; grep '^POST' "$FIX/relay.log" | head -5
 exit $rc

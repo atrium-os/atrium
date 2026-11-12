@@ -300,6 +300,13 @@ and VP9, bit-identical to ffmpeg where comparable. Hospes must hand it H.264 in 
 with SPS/PPS before each IDR (as Chrome's MP4 parser does), adjusting the first subsample's
 clear bytes. Decrypt-only remains the path for audio. Decision 7 is revised accordingly.
 
+**Init data from the manifest (built 2026-11-12, `docs/reviews/2026-11-12-hospes-webm-pssh.md`).**
+WebM names only key ids, and licence services may refuse a request made from one. The caller
+passes the manifest's `pssh` boxes (as a page passes EME `initData`); the player sends them
+first, and holds key-id init data until the licence's keys have arrived. A video sample that
+still has no key 30 s after the keys changed fails the stream rather than waiting forever
+(decrypt-only video answers "no key" for good).
+
 Either way the worker checks every returned size against the slot and the declared frame
 size before copying anything. At Widevine L3 nothing here is a protected path; the frames are
 ordinary video (legacy-web §8.1).

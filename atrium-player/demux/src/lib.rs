@@ -15,6 +15,7 @@
 #![forbid(unsafe_code)]
 
 mod rd;
+pub mod dash;
 pub mod mp4;
 pub mod webm;
 
