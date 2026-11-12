@@ -444,3 +444,18 @@ land with it.
   amdgpu's cp_resume order. Stages 4a–4d are box-verified. Still open: the intermittent
   MES pipe start (root cause unknown; the retry hides it), seen in 5 of 9 runs between
   20:36 and 21:05.
+- **2026-11-12 21:15–21:17, 4286a4fc, three repeat runs: all PASSED 4d, card idle and cold
+  after.** At 21:15:06 pipe 1 did not start on attempt 1 (instr 0x1, GP3 0, GFXHUB fault
+  0x40b53 at page 0x3f017f, 32 client-0xa faults); attempt 2 brought both pipes up, so the
+  retry path is now proven on silicon. 21:15:51 and 21:16:36 started first time. Tally for
+  4286a4fc: 4 runs, 1 first-attempt failure, all recovered. Logs on the box in
+  /root/runs/20261112T2115{06,51}Z.log and 20261112T211636Z.log.
+- **Stage 4e built (kenv hw.atrium_gpu.dispatch, runner stage `4e`, needs 4d).** While MES
+  is up: one kernel compute queue (MEC1 pipe 0 queue 0, VMID 0, doorbell 0x6) built as
+  gfx_v12_0_compute_mqd_init and mapped by MES ADD_QUEUE (map_legacy_kq, compute, sent to
+  pipe 0; pipe 0's MES compute mask becomes 0xe so MES leaves that queue alone). The ring
+  holds INDIRECT_BUFFER to the oracle's write_42 IB (generated at GART 0x43000 / out
+  0x45000 by atrium-rdna4-oracle/examples/kmod_write42.rs into write42_ib.h), then
+  RELEASE_MEM with an interrupt. Pass = fence seen and all 64 words 42 (the golden),
+  then REMOVE_QUEUE and a register dequeue; the block is leaked, not freed, if the queue
+  will not go inactive.

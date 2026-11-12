@@ -2,7 +2,7 @@
 # gpu-stage-run.sh: one silicon bring-up run of atrium_gpu_amd_pci on the
 # R9700 box, done in a single ssh call (docs/spec/r9700-bare-metal.md).
 #
-#   gpu-stage-run.sh <sha256> <stage>...     stages: 3 4a 4b 4c 4d
+#   gpu-stage-run.sh <sha256> <stage>...     stages: 3 4a 4b 4c 4d 4e
 #
 # The kmod must already be at /root/kmod/atrium_gpu_amd_pci.ko. The script
 # checks its sha256, probes before, clears the kernel message buffer, sets
@@ -20,7 +20,7 @@ KO=/root/kmod/atrium_gpu_amd_pci.ko
 PROBE=/root/atrium-gpu-probe
 GPU_SEL=pci0:3:0:0
 GPU_DEV=vgapci0
-KNOBS="psp_bootload psp_ipfw smu_init gc_up_ok gmc ih gfx mes"
+KNOBS="psp_bootload psp_ipfw smu_init gc_up_ok gmc ih gfx mes dispatch"
 
 [ $# -ge 2 ] || { echo "usage: $0 <sha256> <stage>..." >&2; exit 2; }
 want=$1; shift
@@ -33,6 +33,7 @@ for s in "$@"; do
 	4b) kenvs="$kenvs ih" ;;
 	4c) kenvs="$kenvs gfx" ;;
 	4d) kenvs="$kenvs mes" ;;
+	4e) kenvs="$kenvs dispatch" ;;	# needs 4d
 	*)  echo "unknown stage $s" >&2; exit 2 ;;
 	esac
 done

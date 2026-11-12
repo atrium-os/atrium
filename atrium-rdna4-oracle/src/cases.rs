@@ -25,6 +25,13 @@ fn words_to_bytes(w: &[u32]) -> Vec<u8> {
 /// `write_42`: one workgroup of 64 threads (two wave32 waves); thread `i`
 /// stores 42 at `out[i]`. The output address arrives in user SGPRs s[0:1].
 pub fn write_42() -> Case {
+    write_42_at(CODE_VA, DATA_VA)
+}
+
+/// [`write_42`] with the code buffer at `code_va` (shader at 0, IB at
+/// [`IB_OFFSET`]) and the output at `data_va`. The kernel driver's stage 4e
+/// first dispatch runs this at its own GART addresses (examples/kmod_write42.rs).
+pub fn write_42_at(code_va: u64, data_va: u64) -> Case {
     let mut sh: Vec<u32> = Vec::new();
     // v1 = v0 << 2            (byte offset of this thread's element)
     sh.extend(encode("V_LSHLREV_B32", "ENC_VOP2", "default", &[("VDST", 1), ("SRC0", inline_int(2)), ("VSRC1", 0)]).unwrap());
@@ -37,9 +44,9 @@ pub fn write_42() -> Case {
     let mut ib = Blob::compute();
     ib.acquire_all();
     emit_dispatch(&mut ib, &Dispatch {
-        shader_va: CODE_VA,
+        shader_va: code_va,
         vgprs: 3,
-        user_sgprs: vec![DATA_VA as u32, (DATA_VA >> 32) as u32],
+        user_sgprs: vec![data_va as u32, (data_va >> 32) as u32],
         threads: [64, 1, 1],
         groups: [1, 1, 1],
         wave32: true,
@@ -57,8 +64,8 @@ pub fn write_42() -> Case {
         name: "write_42".into(),
         ip: "compute",
         buffers: vec![
-            Buffer { name: "code".into(), va: CODE_VA, size: 0x2000, init: code, expect: None, unordered: None },
-            Buffer { name: "out".into(), va: DATA_VA, size: 64 * 4, init: vec![], expect: Some(words_to_bytes(&[42; 64])), unordered: None },
+            Buffer { name: "code".into(), va: code_va, size: 0x2000, init: code, expect: None, unordered: None },
+            Buffer { name: "out".into(), va: data_va, size: 64 * 4, init: vec![], expect: Some(words_to_bytes(&[42; 64])), unordered: None },
         ],
         ib: ("code".into(), IB_OFFSET, ib_dw),
     }

@@ -25,6 +25,11 @@
  * v12_structs.h (computed on the host, listed by name below). Rings, MQDs,
  * EOP buffers and writeback live in system pages mapped into the GART.
  *
+ * Stage 4e (kenv hw.atrium_gpu.dispatch=1) runs while MES is up: one
+ * kernel compute queue (MEC1 pipe 0 queue 0) mapped by MES, the oracle's
+ * write_42 dispatched through it by an indirect buffer, an end-of-pipe fence
+ * with interrupt, and the output compared with the oracle's golden.
+ *
  * Per version: mes_gens[] by GC version. Unknown: not touched (A3.10).
  */
 #include "atrium_gpu_amd.h"
@@ -37,6 +42,8 @@
 #include <dev/pci/pcivar.h>
 #include <vm/vm.h>
 #include <vm/pmap.h>
+
+#include "write42_ib.h"	/* stage 4e: the oracle's write_42, generated */
 
 #define S0(x)	(0u << 24 | (x))
 #define S1(x)	(1u << 24 | (x))
@@ -230,6 +237,7 @@ struct mes {
 	uint32_t version[2];
 	uint32_t cpc_int_cntl[2];	/* as found, restored on teardown */
 	bool sched_mapped;		/* pipe 0's queue mapped by MES */
+	bool dispatch;			/* stage 4e: keep MEC1 queue 0 */
 	struct mes_ring r[2];	/* index = pipe */
 };
 
@@ -658,8 +666,11 @@ set_hw_resources(struct mes *m, int pipe)
 		/* VMIDs 8-15 for user queues, as amdgpu's uq masks. */
 		put32(b, HW_VMID_MMHUB, 0xff00);
 		put32(b, HW_VMID_GFXHUB, 0xff00);
-		/* MEC1 pipes 0-1, 4 queues each, none kept for the kernel. */
-		put32(b, HW_COMPUTE_HQD + 0, 0xf);
+		/*
+		 * MEC1 pipes 0-1, 4 queues each. Stage 4e keeps pipe 0 queue
+		 * 0 for the kernel compute queue, as amdgpu keeps its KCQs.
+		 */
+		put32(b, HW_COMPUTE_HQD + 0, m->dispatch ? 0xe : 0xf);
 		put32(b, HW_COMPUTE_HQD + 4, 0xf);
 		/*
 		 * gfx pipe 0, queue 0 kept, as amdgpu. (Box run 45267702: with
@@ -749,14 +760,14 @@ unmap_sched_queue(struct mes *m)
  * mes_v12_0_kiq_dequeue_sched, for any MES pipe whose HQD is still active:
  * dequeue request, wait for inactive, doorbell off, pointers zeroed.
  */
-static void
-hqd_dequeue(struct mes *m, int pipe)
+static bool
+hqd_dequeue_me(struct mes *m, u_int me, int pipe)
 {
 	const struct mes_gen *g = m->g;
 	uint32_t d;
 	int us = 0;
 
-	grbm_select(m, 3, pipe);
+	grbm_select(m, me, pipe);
 	if (rd(m, g->hqd_active) & 1) {
 		wr(m, g->hqd_dequeue_req, 1);
 		for (; us < 100000 && (rd(m, g->hqd_active) & 1); us += 10)
@@ -773,8 +784,16 @@ hqd_dequeue(struct mes *m, int pipe)
 	wr(m, g->hqd_pq_rptr, 0);
 	d = rd(m, g->hqd_active);
 	grbm_select(m, 0, 0);
-	device_printf(m->sc->dev, "mes: pipe %d HQD dequeued: active %u%s\n",
-	    pipe, d & 1, us >= 100000 ? " (dequeue timed out)" : "");
+	device_printf(m->sc->dev, "mes: me %u pipe %d HQD dequeued: active "
+	    "%u%s\n", me, pipe, d & 1, us >= 100000 ? " (dequeue timed out)" :
+	    "");
+	return ((d & 1) == 0);
+}
+
+static void
+hqd_dequeue(struct mes *m, int pipe)
+{
+	(void)hqd_dequeue_me(m, 3, pipe);
 }
 
 /*
@@ -803,6 +822,290 @@ mes_teardown(struct mes *m)
 	DELAY(100);
 	(void)grbm_watch(m, "MES halted, CP still running", 500);
 	cp_halt(m);
+}
+
+/*
+ * Stage 4e: the first dispatch. One kernel compute queue, MEC1 (me 1) pipe
+ * 0 queue 0, VMID 0, built as gfx_v12_0_compute_mqd_init does and mapped by
+ * MES (mes_v12_0_map_legacy_queue: ADD_QUEUE with map_legacy_kq, sent to
+ * the scheduler pipe 0 in unified mode). Its ring carries one
+ * INDIRECT_BUFFER (gfx_v12_0_ring_emit_ib_compute) pointing at the oracle's
+ * write_42 IB, then RELEASE_MEM with an interrupt (gfx_v12_0_ring_emit_fence).
+ * Everything lives in one block of system pages in the GART.
+ */
+#define DISP_GART_VA		0x00040000ull	/* after MES's block */
+#define DISP_RING		0x0000u
+#define DISP_MQD		0x1000u
+#define DISP_EOP		0x1800u		/* GFX12_MEC_HPD_SIZE */
+#define DISP_WB			0x2000u		/* rptr 0, wptr 8, fence 0x10 */
+#define DISP_CODE		0x3000u		/* shader; IB at +W42_IB_OFFSET */
+#define DISP_OUT		0x5000u
+#define DISP_SIZE		0x6000u
+#define DISP_EOP_SIZE		2048u
+#define KCQ_DOORBELL		(0x03u << 1)	/* NAVI10 MEC_RING0 << 1 */
+#define QUEUE_TYPE_COMPUTE	1
+#define DISP_SEQ		0x4e000001u
+#define DISP_POISON		0xdeadbeefu
+#define DISP_TIMEOUT_US		1000000
+
+#define PKT3(op, n)		(3u << 30 | ((n) & 0x3fffu) << 16 | (op) << 8)
+#define IT_INDIRECT_BUFFER	0x3fu
+#define IB_VALID		(1u << 23)
+#define RM_EVENT_TYPE(x)	(x)
+#define RM_EVENT_INDEX(x)	((x) << 8)
+#define RM_GCR_GL2_WB		(1u << 21)
+#define RM_GCR_SEQ		(1u << 22)
+#define RM_CACHE_POLICY(x)	((x) << 25)
+#define RM_DATA_SEL(x)		((x) << 29)
+#define RM_INT_SEL(x)		((x) << 24)
+#define CACHE_FLUSH_AND_INV_TS_EVENT 0x14u
+
+struct disp {
+	uint8_t *blk;
+	vm_paddr_t pa;
+	uint64_t va;
+	uint32_t int_cntl;	/* me 1 pipe 0 CPC_INT_CNTL as found */
+};
+
+/* gfx_v12_0_compute_mqd_init for a kernel queue, not active (MES maps it). */
+static void
+kcq_mqd_init(struct disp *d)
+{
+	uint8_t *q = d->blk + DISP_MQD;
+	uint64_t mqd = d->va + DISP_MQD, ring = d->va + DISP_RING;
+	uint64_t eop = d->va + DISP_EOP, wb = d->va + DISP_WB;
+	uint32_t t;
+
+	memset(q, 0, MQD_SIZE);
+	put32(q, MQD_HEADER, 0xC0310800u);
+	put32(q, MQD_PIPELINESTAT, 1);
+	put32(q, MQD_STM_SE0, ~0u);
+	put32(q, MQD_STM_SE1, ~0u);
+	put32(q, MQD_STM_SE2, ~0u);
+	put32(q, MQD_STM_SE3, ~0u);
+	put32(q, MQD_MISC_RESERVED, 7);
+	put32(q, MQD_EOP_BASE_LO, (uint32_t)(eop >> 8));
+	put32(q, MQD_EOP_BASE_HI, (uint32_t)(eop >> 40));
+	/* EOP_SIZE: 2^(n+1) dwords; 2048 bytes = 512 dwords -> 8. */
+	put32(q, MQD_EOP_CONTROL, (EOP_CONTROL_DEFAULT & ~0x3fu) | 8);
+	put32(q, MQD_MQD_BASE_LO, (uint32_t)mqd & 0xfffffffcu);
+	put32(q, MQD_MQD_BASE_HI, (uint32_t)(mqd >> 32));
+	put32(q, MQD_MQD_CONTROL, MQD_CONTROL_DEFAULT);	/* VMID 0 */
+	put32(q, MQD_PQ_BASE_LO, (uint32_t)(ring >> 8));
+	put32(q, MQD_PQ_BASE_HI, (uint32_t)(ring >> 40));
+	/*
+	 * QUEUE_SIZE 2^(9+1) dwords, RPTR_BLOCK_SIZE log2(4096 / 4) - 1,
+	 * UNORD_DISPATCH, PRIV_STATE, KMD_QUEUE.
+	 */
+	t = PQ_CONTROL_DEFAULT & ~(0x3fu | 0x3f00u);
+	t |= (uint32_t)(ffs(RING_DW) - 2) | (9u << 8);
+	t |= (1u << 28) | (1u << 30) | (1u << 31);
+	put32(q, MQD_PQ_CONTROL, t);
+	put32(q, MQD_RPTR_REPORT_LO, (uint32_t)wb & 0xfffffffcu);
+	put32(q, MQD_RPTR_REPORT_HI, (uint32_t)(wb >> 32) & 0xffff);
+	put32(q, MQD_WPTR_POLL_LO, (uint32_t)(wb + 8) & 0xfffffffcu);
+	put32(q, MQD_WPTR_POLL_HI, (uint32_t)((wb + 8) >> 32) & 0xffff);
+	put32(q, MQD_DOORBELL, (KCQ_DOORBELL << 2) | (1u << 30));
+	put32(q, MQD_PQ_RPTR, 0);
+	put32(q, MQD_HQD_VMID, 0);
+	put32(q, MQD_PERSISTENT, (PERSISTENT_DEFAULT & ~0x3ff00u) |
+	    (0x55u << 8));
+	put32(q, MQD_IB_CONTROL, IB_CONTROL_DEFAULT);	/* MIN_IB_AVAIL 3 */
+	put32(q, MQD_QUANTUM, 0x111u);	/* EN, SCALE 1, DURATION 1 */
+	put32(q, MQD_HQD_ACTIVE, 0);
+}
+
+static int
+kcq_map(struct mes *m, struct disp *d)
+{
+	uint32_t pkt[API_DW];
+	uint8_t *b = (uint8_t *)pkt;
+
+	memset(pkt, 0, sizeof(pkt));
+	pkt[0] = HDR_ADD_QUEUE;
+	put32(b, AQ_PIPE_ID, 0);
+	put32(b, AQ_QUEUE_ID, 0);
+	put32(b, AQ_DOORBELL, KCQ_DOORBELL);
+	put64(b, AQ_MQD_ADDR, d->va + DISP_MQD);
+	put64(b, AQ_WPTR_ADDR, d->va + DISP_WB + 8);
+	put32(b, AQ_QUEUE_TYPE, QUEUE_TYPE_COMPUTE);
+	put32(b, AQ_FLAGS, AQ_MAP_LEGACY_KQ);
+	return (mes_api(m, 0, pkt, AQ_API_STATUS, "ADD_QUEUE (compute)"));
+}
+
+static int
+kcq_unmap(struct mes *m)
+{
+	uint32_t pkt[API_DW];
+	uint8_t *b = (uint8_t *)pkt;
+
+	memset(pkt, 0, sizeof(pkt));
+	pkt[0] = HDR_REMOVE_QUEUE;
+	put32(b, RQ_DOORBELL, KCQ_DOORBELL);
+	put32(b, RQ_FLAGS, RQ_UNMAP_LEGACY);
+	put32(b, RQ_PIPE_ID, 0);
+	put32(b, RQ_QUEUE_ID, 0);
+	put32(b, RQ_QUEUE_TYPE, QUEUE_TYPE_COMPUTE);
+	return (mes_api(m, 0, pkt, RQ_API_STATUS, "REMOVE_QUEUE (compute)"));
+}
+
+static void
+kcq_report(struct mes *m, struct disp *d, const char *when)
+{
+	const struct mes_gen *g = m->g;
+	uint32_t act, rptr, wlo, db;
+
+	grbm_select(m, 1, 0);
+	act = rd(m, g->hqd_active);
+	rptr = rd(m, g->hqd_pq_rptr);
+	wlo = rd(m, g->hqd_pq_wptr_lo);
+	db = rd(m, g->hqd_doorbell);
+	grbm_select(m, 0, 0);
+	device_printf(m->sc->dev, "dispatch: %s: HQD active %u, rptr %#x, "
+	    "wptr %#x, doorbell %#x; rptr report %#x, fence %#x; CP_STAT %#x, "
+	    "CPC_STATUS %#x, GRBM_STATUS %#x\n", when, act & 1, rptr, wlo, db,
+	    *(volatile uint32_t *)(d->blk + DISP_WB),
+	    *(volatile uint32_t *)(d->blk + DISP_WB + 0x10), rd(m, g->cp_stat),
+	    rd(m, g->cp_cpc_status), rd(m, g->grbm_status));
+}
+
+/*
+ * Map the queue, ring the doorbell, wait for the fence, compare the output,
+ * unmap. Returns 0 only when all 64 words are the golden 42. The block is
+ * freed only once the queue is known to be gone; otherwise it is leaked so
+ * the GPU can never write freed memory.
+ */
+static int
+dispatch_run(struct mes *m)
+{
+	struct atrium_amd_softc *sc = m->sc;
+	const struct mes_gen *g = m->g;
+	struct amd_gart *gt = m->gt;
+	struct disp d;
+	volatile uint32_t *out, *ring;
+	uint64_t ib, fence;
+	uint32_t i, bad = 0, first_bad = 0, n = 0;
+	int err, us;
+	bool mapped = false, gone = true;
+
+	memset(&d, 0, sizeof(d));
+	d.va = gt->gart_start + DISP_GART_VA;
+	if (d.va + DISP_CODE != W42_CODE_VA || d.va + DISP_OUT != W42_DATA_VA ||
+	    d.va + DISP_SIZE > gt->gart_end + 1) {
+		device_printf(sc->dev, "dispatch: write_42 built for code %#jx "
+		    "out %#jx, block at %#jx; regenerate write42_ib.h\n",
+		    (uintmax_t)W42_CODE_VA, (uintmax_t)W42_DATA_VA,
+		    (uintmax_t)d.va);
+		return (EINVAL);
+	}
+	d.blk = contigmalloc(DISP_SIZE, M_DEVBUF, M_WAITOK | M_ZERO, 0,
+	    ~(vm_paddr_t)0, PAGE_SIZE, 0);
+	d.pa = vtophys(d.blk);
+	for (i = 0; i < DISP_SIZE / PAGE_SIZE; i++)
+		(void)amd_gmc12_gart_map(gt, d.va + i * PAGE_SIZE,
+		    d.pa + i * PAGE_SIZE);
+	if ((err = amd_gmc12_flush(gt)) != 0)
+		goto out_unmap;
+
+	memcpy(d.blk + DISP_CODE, w42_shader, sizeof(w42_shader));
+	memcpy(d.blk + DISP_CODE + W42_IB_OFFSET, w42_ib, sizeof(w42_ib));
+	out = (volatile uint32_t *)(d.blk + DISP_OUT);
+	for (i = 0; i < W42_OUT_DW; i++)
+		out[i] = DISP_POISON;
+	kcq_mqd_init(&d);
+
+	/* gfx_v12_0_set_compute_eop_interrupt_state(me 1, pipe 0, on) */
+	grbm_select(m, 1, 0);
+	d.int_cntl = rd(m, g->cpc_int_cntl);
+	wr(m, g->cpc_int_cntl, d.int_cntl | TIME_STAMP_INT_ENABLE);
+	grbm_select(m, 0, 0);
+
+	device_printf(sc->dev, "dispatch: block at GART %#jx (pa %#jx), "
+	    "shader %#jx, IB %#jx (%u dw), out %#jx, doorbell %#x\n",
+	    (uintmax_t)d.va, (uintmax_t)d.pa, (uintmax_t)W42_CODE_VA,
+	    (uintmax_t)(W42_CODE_VA + W42_IB_OFFSET), W42_IB_DW,
+	    (uintmax_t)W42_DATA_VA, KCQ_DOORBELL);
+	if ((err = kcq_map(m, &d)) != 0) {
+		kcq_report(m, &d, "ADD_QUEUE failed");
+		goto out_queue;
+	}
+	mapped = true;
+	kcq_report(m, &d, "mapped");
+
+	ring = (volatile uint32_t *)(d.blk + DISP_RING);
+	ib = d.va + DISP_CODE + W42_IB_OFFSET;
+	fence = d.va + DISP_WB + 0x10;
+	ring[n++] = PKT3(IT_INDIRECT_BUFFER, 2);
+	ring[n++] = (uint32_t)ib;
+	ring[n++] = (uint32_t)(ib >> 32);
+	ring[n++] = IB_VALID | W42_IB_DW;		/* VMID 0 */
+	ring[n++] = PKT3(IT_RELEASE_MEM, 6);
+	ring[n++] = RM_GCR_SEQ | RM_GCR_GL2_WB | RM_CACHE_POLICY(3) |
+	    RM_EVENT_TYPE(CACHE_FLUSH_AND_INV_TS_EVENT) | RM_EVENT_INDEX(5);
+	ring[n++] = RM_DATA_SEL(1) | RM_INT_SEL(2);	/* 32 bit, interrupt */
+	ring[n++] = (uint32_t)fence;
+	ring[n++] = (uint32_t)(fence >> 32);
+	ring[n++] = DISP_SEQ;
+	ring[n++] = 0;
+	ring[n++] = 0;
+	*(volatile uint64_t *)(d.blk + DISP_WB + 8) = n;
+	wmb();
+	bus_write_8(m->dbbar, (bus_size_t)KCQ_DOORBELL * 4, n);
+
+	for (us = 0; us < DISP_TIMEOUT_US; us += 10) {
+		if (*(volatile uint32_t *)(d.blk + DISP_WB + 0x10) == DISP_SEQ)
+			break;
+		DELAY(10);
+	}
+	if (us >= DISP_TIMEOUT_US) {
+		device_printf(sc->dev, "dispatch: no fence in %d ms\n",
+		    DISP_TIMEOUT_US / 1000);
+		kcq_report(m, &d, "fence timeout");
+		mes_report(m, "fence timeout");
+		amd_gmc12_fault_report(gt, "fence timeout");
+		err = ETIMEDOUT;
+	} else {
+		device_printf(sc->dev, "dispatch: fence %#x after %d us\n",
+		    DISP_SEQ, us);
+		kcq_report(m, &d, "fence");
+	}
+	for (i = 0; i < W42_OUT_DW; i++)
+		if (out[i] != W42_OUT_VALUE && bad++ == 0)
+			first_bad = i;
+	if (bad != 0)
+		device_printf(sc->dev, "dispatch: out: %u of %u words wrong, "
+		    "first out[%u] = %#x (want %#x)\n", bad, W42_OUT_DW,
+		    first_bad, out[first_bad], W42_OUT_VALUE);
+	else
+		device_printf(sc->dev, "dispatch: out: all %u words %#x, "
+		    "matches the oracle golden\n", W42_OUT_DW, W42_OUT_VALUE);
+	if (err == 0 && bad != 0)
+		err = EIO;
+	amd_gmc12_fault_report(gt, "after dispatch");
+
+out_queue:
+	if (mapped && kcq_unmap(m) != 0)
+		kcq_report(m, &d, "REMOVE_QUEUE failed");
+	gone = hqd_dequeue_me(m, 1, 0);
+	grbm_select(m, 1, 0);
+	wr(m, g->cpc_int_cntl, d.int_cntl);
+	grbm_select(m, 0, 0);
+out_unmap:
+	for (i = 0; i < DISP_SIZE / PAGE_SIZE; i++) {
+		uint64_t idx = (d.va - gt->gart_start) / PAGE_SIZE + i;
+
+		bus_write_4(gt->vram, gt->table_off + idx * 8, 0);
+		bus_write_4(gt->vram, gt->table_off + idx * 8 + 4, 0);
+	}
+	(void)amd_gmc12_flush(gt);
+	if (gone)
+		contigfree(d.blk, DISP_SIZE, M_DEVBUF);
+	else
+		device_printf(sc->dev, "dispatch: queue still active; its "
+		    "%u KiB block is leaked, not freed\n", DISP_SIZE >> 10);
+	device_printf(sc->dev, "dispatch: stage 4e: %s\n", err == 0 ?
+	    "write_42 PASS (matches the oracle)" : "FAILED");
+	return (err);
 }
 
 static int
@@ -966,11 +1269,13 @@ amd_mes12_test(struct atrium_amd_softc *sc, struct amd_gart *gt)
 	struct mes m;
 	uint32_t i;
 	uint16_t pci_cmd;
-	int err;
+	int err, disp = 0;
 
 	memset(&m, 0, sizeof(m));
 	m.sc = sc;
 	m.gt = gt;
+	TUNABLE_INT_FETCH("hw.atrium_gpu.dispatch", &disp);
+	m.dispatch = disp != 0;
 	m.g = mes_gen_find(sc);
 	if (m.g == NULL) {
 		device_printf(sc->dev, "mes: no table for GC %u.%u.%u; not "
@@ -1015,6 +1320,12 @@ amd_mes12_test(struct atrium_amd_softc *sc, struct amd_gart *gt)
 	pci_enable_busmaster(sc->dev);
 	err = mes_run(&m);
 	mes_report(&m, err == 0 ? "answered" : "failed");
+	/* Stage 4e (kenv hw.atrium_gpu.dispatch=1): the first dispatch. */
+	if (m.dispatch && err == 0)
+		(void)dispatch_run(&m);
+	else if (m.dispatch)
+		device_printf(sc->dev, "dispatch: stage 4e needs MES up; "
+		    "skipped\n");
 	(void)grbm_watch(&m, "MES running, no work", 500);
 	amd_gfx12_pm_report(sc, "MES running");
 	mes_teardown(&m);
