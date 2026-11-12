@@ -10,9 +10,10 @@ use std::path::PathBuf;
 use std::process::{Child, Command};
 use std::time::Duration;
 
+use crate::cdm::{CdmEvent, CdmOptions, CdmProc};
 use crate::ring::PcmRing;
 use crate::sys;
-use crate::wire::{encode_frame, err, Format, Limits, Mode, Record, ToWorker, BUFFERS_MAX, RECORD_LEN};
+use crate::wire::{encode_frame, err, Format, Limits, Mode, Record, ToWorker, BUFFERS_MAX, INIT_DATA_MAX, RECORD_LEN};
 
 /// How long the worker may go silent while it owes us something.
 pub const WATCHDOG: Duration = Duration::from_secs(5);
@@ -84,6 +85,8 @@ pub struct Options {
     pub worker_mem_mib: u64,
     /// H.264 through Hospes: start this codec host beside every worker (hospes.md §9).
     pub h264: Option<H264>,
+    /// Encrypted media through Hospes: start `hospes-cdm` beside every worker (hospes.md §8).
+    pub cdm: Option<CdmOptions>,
 }
 
 /// Where `hospes-codec` and the user-installed OpenH264 binary are (hospes.md §12).
@@ -127,7 +130,7 @@ impl Options {
 
 impl Default for Options {
     fn default() -> Self {
-        Options { worker: Self::default_worker(), limits: Limits::default(), buffers: 4, worker_mem_mib: 768, h264: H264::from_env() }
+        Options { worker: Self::default_worker(), limits: Limits::default(), buffers: 4, worker_mem_mib: 768, h264: H264::from_env(), cdm: CdmOptions::from_env() }
     }
 }
 
@@ -135,6 +138,8 @@ struct Proc {
     child: Child,
     /// hospes-codec, started with the worker and killed with it.
     codec: Option<Child>,
+    /// hospes-cdm, likewise; its sessions live and die with this worker.
+    cdm: Option<CdmProc>,
     sock: UnixStream,
     /// Bytes of a record read so far.
     partial: Vec<u8>,
@@ -165,6 +170,16 @@ impl Proc {
             sys::pass_fd(&mut cmd, w_end.as_raw_fd());
             worker_end = Some(w_end);
         }
+        // The CDM host: its control channel is ours, its data channel the worker's.
+        let mut cdm = None;
+        let mut cdm_end = None;
+        if let Some(o) = &o.cdm {
+            let (p, w_end) = CdmProc::spawn(o)?;
+            cmd.arg("--cdm-fd").arg(w_end.as_raw_fd().to_string());
+            sys::pass_fd(&mut cmd, w_end.as_raw_fd());
+            cdm = Some(p);
+            cdm_end = Some(w_end);
+        }
         // ETXTBSY: a worker binary just written can be briefly busy while
         // another thread's fork still holds it open for writing.
         let mut tries = 0;
@@ -179,7 +194,8 @@ impl Proc {
         };
         drop(theirs);
         drop(worker_end);
-        Ok(Proc { child, codec, sock: mine, partial: Vec::new() })
+        drop(cdm_end);
+        Ok(Proc { child, codec, cdm, sock: mine, partial: Vec::new() })
     }
 
     fn send(&self, m: &ToWorker, fds: &[&OwnedFd]) -> io::Result<()> {
@@ -211,6 +227,9 @@ impl Proc {
         if let Some(c) = &mut self.codec {
             let _ = c.kill();
             let _ = c.wait();
+        }
+        if let Some(c) = &mut self.cdm {
+            c.kill();
         }
     }
 }
@@ -264,6 +283,8 @@ pub struct Player<S: Sink> {
     text_files: Vec<(u8, File)>,
     subtitles: Subtitles,
     cue_partial: Option<(i64, i64, usize, Option<u8>, Vec<u8>)>,
+    /// Init data arriving from the worker: kind, length, bytes so far.
+    init_partial: Option<(u8, usize, Vec<u8>)>,
     /// Media time of the last frame handed to the sink.
     last_pts: Option<i64>,
     /// Frames before this media time are dropped (after a seek).
@@ -316,6 +337,7 @@ impl<S: Sink> Player<S> {
             text_files: Vec::new(),
             subtitles: Subtitles::InBand,
             cue_partial: None,
+            init_partial: None,
             last_pts: None,
             show_from: None,
             events: VecDeque::new(),
@@ -352,6 +374,7 @@ impl<S: Sink> Player<S> {
         }
         self.w = Some(w);
         self.cue_partial = None;
+        self.init_partial = None;
         // A restarted worker reads the page's subtitles again (each cue is
         // kept once).
         let ids: Vec<u8> = self.text_files.iter().map(|(i, _)| *i).collect();
@@ -657,6 +680,11 @@ impl<S: Sink> Player<S> {
         }
     }
 
+    /// The CDM host's pid (tests: to kill it alone).
+    pub fn cdm_pid(&self) -> Option<u32> {
+        self.w.as_ref().and_then(|w| w.cdm.as_ref()).map(|c| c.pid())
+    }
+
     pub fn worker_pid(&self) -> Option<u32> {
         self.w.as_ref().map(|w| w.child.id())
     }
@@ -671,6 +699,33 @@ impl<S: Sink> Player<S> {
             }
             if self.dead {
                 return None;
+            }
+            // The CDM's news first; while a licence exchange runs, look again soon.
+            let mut timeout = timeout;
+            if let Some(c) = self.w.as_mut().and_then(|w| w.cdm.as_mut()) {
+                let events = c.poll();
+                if c.busy() {
+                    timeout = timeout.min(Duration::from_millis(5));
+                }
+                let mut lost = false;
+                for e in events {
+                    match e {
+                        CdmEvent::KeysUsable => self.send(ToWorker::KeysChanged),
+                        CdmEvent::Failed(why) => {
+                            eprintln!("atrium-player: encrypted media: {why}");
+                            self.dead = true;
+                            self.events.push_back(PlayerEvent::Error(err::UNSUPPORTED));
+                        }
+                        CdmEvent::Lost => lost = true,
+                    }
+                }
+                // The host and the worker go together (and come back together).
+                if lost && !self.dead {
+                    self.worker_lost();
+                }
+                if self.dead || !self.events.is_empty() || lost {
+                    continue;
+                }
             }
             let Some(w) = self.w.as_mut() else { return None };
             match w.recv(timeout) {
@@ -859,6 +914,27 @@ impl<S: Sink> Player<S> {
                     return self.worker_lost();
                 }
                 self.add_cue(Cue { start_ns: start, end_ns: end, text, source });
+            }
+            Record::InitData { kind, len } => {
+                if self.init_partial.is_some() || len > INIT_DATA_MAX {
+                    return self.worker_lost();
+                }
+                self.init_partial = Some((kind, len as usize, Vec::with_capacity(len as usize)));
+            }
+            Record::InitDataBytes { i, bytes } => {
+                let Some((kind, len, mut data)) = self.init_partial.take() else { return self.worker_lost() };
+                if i as usize != data.len() / 24 {
+                    return self.worker_lost();
+                }
+                data.extend_from_slice(&bytes[..(len - data.len()).min(24)]);
+                if data.len() < len {
+                    self.init_partial = Some((kind, len, data));
+                    return;
+                }
+                // Without a CDM the worker sends none; one that does anyway is ignored.
+                if let Some(c) = self.w.as_mut().and_then(|w| w.cdm.as_mut()) {
+                    c.init_data(kind, data);
+                }
             }
             Record::Color { primaries, transfer, matrix, range } => {
                 if self.video.is_none() {

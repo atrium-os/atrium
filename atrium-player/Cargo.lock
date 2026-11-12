@@ -60,6 +60,7 @@ dependencies = [
  "atrium-media-demux",
  "fresco-client",
  "fresco-protocol",
+ "hospes-proto",
  "libc",
  "limen",
  "lyra-protocol",
@@ -80,6 +81,7 @@ dependencies = [
  "atrium-media-decode",
  "atrium-media-demux",
  "atrium-player",
+ "hospes-proto",
  "libc",
  "lyra-protocol",
  "md-5",
@@ -458,6 +460,10 @@ checksum = "7f24254aa9a54b5c858eaee2f5bccdb46aaf0e486a595ed5fd8f86ba55232a70"
 
 [[package]]
 name = "hospes-codec-wire"
+version = "0.1.0"
+
+[[package]]
+name = "hospes-proto"
 version = "0.1.0"
 
 [[package]]

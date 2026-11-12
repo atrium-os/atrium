@@ -489,3 +489,104 @@ fn h264_through_hospes_matches_ffmpeg() {
     assert!(r.events.contains(&PlayerEvent::Restarted), "{:?}", r.events);
     assert!(matches!(r.events.last(), Some(PlayerEvent::Ended)), "{:?}", r.events.last());
 }
+
+/// Clear Key media through hospes-cdm and the test CDM (hospes.md §11.3): decrypt-only, our own
+/// decoders after. Needs `ATRIUM_PLAYER_HOSPES_CDM` (`scripts/hospes-build.sh cdm TRIPLE`);
+/// the test CDM is the one in the repository for this machine. Skipped without the host.
+const CLEARKEY: &str = "00112233445566778899aabbccddeeff:3a2b1c0d4e5f60718293a4b5c6d7e8f9";
+
+fn cdm_opts(keys: &str) -> Option<Options> {
+    let host: PathBuf = std::env::var_os("ATRIUM_PLAYER_HOSPES_CDM")?.into();
+    let arch = if cfg!(target_arch = "aarch64") { "aarch64" } else { "x86_64" };
+    let library = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(format!("../../hospes/test-cdm/bin/{arch}-clearkey.so"));
+    let licences = atrium_player::cdm::Licences::ClearKey(atrium_player::cdm::parse_keys(keys).unwrap());
+    Some(Options { cdm: Some(atrium_player::cdm::CdmOptions { host, library, store: None, licences, mem_mib: 256 }), ..opts() })
+}
+
+/// (encrypted clip, its clear source).
+const ENCRYPTED: [(&str, &str); 3] =
+    [("clearkey/vp9-opus-cenc.mp4", "vp9-opus-frag.mp4"), ("clearkey/av1-opus-cbcs.mp4", "av1-opus.mp4"), ("clearkey/vp9-opus-enc.webm", "vp9-opus.webm")];
+
+#[test]
+fn clear_key_through_hospes_matches_the_clear_source() {
+    let Some(o) = cdm_opts(CLEARKEY) else {
+        eprintln!("skipped: set ATRIUM_PLAYER_HOSPES_CDM");
+        return;
+    };
+    for (enc, clear) in ENCRYPTED {
+        let r = play(load(enc), o.clone(), 0, &[], |_, _, _| {});
+        assert!(matches!(r.events.last(), Some(PlayerEvent::Ended)), "{enc}: {:?}", r.events.last());
+        let hashes: Vec<_> = r.frames.iter().map(|f| f.1.clone()).collect();
+        assert_eq!(hashes, layer_refs(clear), "{enc}: layer contents");
+        assert!((95_000..=98_000).contains(&r.pcm), "{enc}: {} PCM frames", r.pcm);
+        eprintln!("{enc}: {} frames equal {clear}'s, {} PCM frames", hashes.len(), r.pcm);
+    }
+}
+
+#[test]
+fn clear_key_feed_in_small_appends() {
+    let Some(o) = cdm_opts(CLEARKEY) else { return };
+    for (enc, clear) in [ENCRYPTED[0], ENCRYPTED[2]] {
+        let mime = if enc.ends_with("mp4") { "video/mp4" } else { "video/webm" };
+        let r = play(Source::Feed(vec![(0, mime.into())]), o.clone(), 7000, &[enc], |_, _, _| {});
+        assert!(matches!(r.events.last(), Some(PlayerEvent::Ended)), "{enc}: {:?}", r.events.last());
+        let hashes: Vec<_> = r.frames.iter().map(|f| f.1.clone()).collect();
+        assert_eq!(hashes, layer_refs(clear), "{enc}");
+    }
+}
+
+/// A killed worker takes its CDM with it; the new pair licenses again and playback goes on.
+#[test]
+fn clear_key_survives_a_worker_restart() {
+    let Some(o) = cdm_opts(CLEARKEY) else { return };
+    let (enc, clear) = ENCRYPTED[2];
+    let r = play(load(enc), o, 0, &[], |p, ev, n| {
+        if matches!(ev, PlayerEvent::Frame { .. }) && n == 10 {
+            p.kill_worker();
+        }
+    });
+    assert!(r.events.contains(&PlayerEvent::Restarted));
+    assert!(matches!(r.events.last(), Some(PlayerEvent::Ended)), "{:?}", r.events.last());
+    let hashes: Vec<_> = r.frames.iter().map(|f| f.1.clone()).collect();
+    assert_eq!(hashes, layer_refs(clear), "no frame lost or repeated");
+}
+
+/// A CDM host that dies alone takes its worker with it, and the pair is replaced.
+#[test]
+fn clear_key_survives_a_cdm_crash() {
+    let Some(o) = cdm_opts(CLEARKEY) else { return };
+    let (enc, clear) = ENCRYPTED[0];
+    let r = play(load(enc), o, 0, &[], |p, ev, n| {
+        if matches!(ev, PlayerEvent::Frame { .. }) && n == 10 {
+            let pid = p.cdm_pid().unwrap();
+            unsafe { libc::kill(pid as i32, libc::SIGKILL) };
+        }
+    });
+    assert!(r.events.contains(&PlayerEvent::Restarted), "{:?}", r.events);
+    assert!(matches!(r.events.last(), Some(PlayerEvent::Ended)), "{:?}", r.events.last());
+    let hashes: Vec<_> = r.frames.iter().map(|f| f.1.clone()).collect();
+    assert_eq!(hashes, layer_refs(clear), "no frame lost or repeated");
+}
+
+/// No key for the media's key id: an error at once, not a hang until the watchdog.
+#[test]
+fn clear_key_without_the_key_is_an_error() {
+    let Some(o) = cdm_opts("a0a1a2a3a4a5a6a7a8a9aaabacadaeaf:0f1e2d3c4b5a69788796a5b4c3d2e1f0") else { return };
+    for (enc, _) in ENCRYPTED {
+        let t = Instant::now();
+        let r = play(load(enc), o.clone(), 0, &[], |_, _, _| {});
+        assert_eq!(r.events.last(), Some(&PlayerEvent::Error(err::UNSUPPORTED)), "{enc}");
+        assert!(r.frames.is_empty(), "{enc}");
+        assert!(t.elapsed() < Duration::from_secs(3), "{enc}: took {:?}", t.elapsed());
+    }
+}
+
+/// Without a CDM, encrypted media is refused (the decoders never see ciphertext).
+#[test]
+fn encrypted_media_without_a_cdm_is_refused() {
+    for (enc, _) in ENCRYPTED {
+        let r = play(load(enc), Options { cdm: None, ..opts() }, 0, &[], |_, _, _| {});
+        assert_eq!(r.events.last(), Some(&PlayerEvent::Error(err::UNSUPPORTED)), "{enc}: {:?}", r.events);
+        assert!(r.frames.is_empty(), "{enc}");
+    }
+}

@@ -34,6 +34,7 @@ postcard = { version = "1", features = ["use-std"] }
 nuntius  = { path = "../../nuntius" }
 # --headless prints frame hashes comparable with ffmpeg's framemd5.
 md-5     = "0.10"
+hospes-proto = { path = "../../hospes/hospes-proto", features = ["std"] }
 
 [features]
 # Start hospes-codec beside the worker when OpenH264 is installed (hospes.md §9).

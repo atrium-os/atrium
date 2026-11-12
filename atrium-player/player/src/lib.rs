@@ -12,6 +12,7 @@
 
 pub mod app;
 pub mod audio_out;
+pub mod cdm;
 pub mod controls;
 pub mod fetch;
 pub mod fresco_sink;

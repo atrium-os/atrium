@@ -14,6 +14,7 @@ path = "src/main.rs"
 atrium-player       = { path = "../player" }
 atrium-media-demux  = { path = "../demux" }
 atrium-media-decode = { path = "../decode" }
+hospes-proto        = { path = "../../hospes/hospes-proto", features = ["std"] }
 libc = "0.2"
 
 [features]

@@ -53,6 +53,13 @@ impl Store {
     }
 
 
+    pub fn next_mut(&mut self) -> Option<&mut Sample> {
+        if self.pending.is_some() {
+            return None;
+        }
+        self.s.get_mut(self.cursor)
+    }
+
     pub fn advance(&mut self) {
         self.cursor = (self.cursor + 1).min(self.s.len());
     }

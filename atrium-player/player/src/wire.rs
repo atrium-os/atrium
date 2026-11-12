@@ -93,6 +93,8 @@ pub enum ToWorker {
     Seek { t_ns: i64, epoch: u32 },
     /// Test builds only: try to escape and report what the kernel said.
     ProbeSandbox,
+    /// The CDM has new usable keys: try the samples that were waiting for one again.
+    KeysChanged,
     Shutdown,
 }
 
@@ -115,6 +117,8 @@ pub mod tag {
     pub const CUE: u32 = 15;
     pub const CUE_TEXT: u32 = 16;
     pub const STARVED: u32 = 17;
+    pub const INIT_DATA: u32 = 18;
+    pub const INIT_DATA_BYTES: u32 = 19;
 }
 
 /// Error codes (map to limen `media_player::code`).
@@ -167,7 +171,15 @@ pub enum Record {
     /// A growing file has no more bytes yet; sent about once a second
     /// while the worker waits, so the watchdog knows it is alive.
     Starved,
+    /// Encrypted media's init data (a run of `pssh` boxes, or a WebM key id), `len` bytes in
+    /// `InitDataBytes` records. `kind`: 0 `cenc`, 2 `webm` (the CDM's `InitDataType`).
+    InitData { kind: u8, len: u32 },
+    /// Piece `i` of the init data, 24 bytes (the last one zero-padded).
+    InitDataBytes { i: u32, bytes: [u8; 24] },
 }
+
+/// The most init data a worker may announce at once.
+pub const INIT_DATA_MAX: u32 = 8192;
 
 fn put(b: &mut [u8; RECORD_LEN], tag: u32, a: u32, x: u64, y: u64, z: u64) {
     b[0..4].copy_from_slice(&tag.to_le_bytes());
@@ -207,6 +219,11 @@ impl Record {
             Record::CueText { i, bytes } => {
                 let w = |k: usize| u64::from_le_bytes(bytes[k * 8..k * 8 + 8].try_into().unwrap());
                 put(&mut b, tag::CUE_TEXT, i, w(0), w(1), w(2))
+            }
+            Record::InitData { kind, len } => put(&mut b, tag::INIT_DATA, len, kind as u64, 0, 0),
+            Record::InitDataBytes { i, bytes } => {
+                let w = |k: usize| u64::from_le_bytes(bytes[k * 8..k * 8 + 8].try_into().unwrap());
+                put(&mut b, tag::INIT_DATA_BYTES, i, w(0), w(1), w(2))
             }
             Record::Hdr { primaries_x: px, primaries_y: py, white, luminance, light } => {
                 let w = |a: [u16; 4]| a.iter().enumerate().fold(0u64, |acc, (i, &v)| acc | (v as u64) << (16 * i));
@@ -279,6 +296,14 @@ impl Record {
                 bytes[16..].copy_from_slice(&z.to_le_bytes());
                 Record::CueText { i: a, bytes }
             }
+            tag::INIT_DATA if (1..=INIT_DATA_MAX).contains(&a) && (x == 0 || x == 2) => Record::InitData { kind: x as u8, len: a },
+            tag::INIT_DATA_BYTES if a < INIT_DATA_MAX.div_ceil(24) => {
+                let mut bytes = [0u8; 24];
+                bytes[..8].copy_from_slice(&x.to_le_bytes());
+                bytes[8..16].copy_from_slice(&y.to_le_bytes());
+                bytes[16..].copy_from_slice(&z.to_le_bytes());
+                Record::InitDataBytes { i: a, bytes }
+            }
             tag::HDR => {
                 let h = |v: u64, i: usize| (v >> (16 * i)) as u16;
                 Record::Hdr {
@@ -330,6 +355,8 @@ mod tests {
             Record::Error { code: err::DECODE, track: None },
             Record::Error { code: err::TOO_BIG, track: Some(2) },
             Record::Probe { refused: 7 },
+            Record::InitData { kind: 2, len: 16 },
+            Record::InitDataBytes { i: 3, bytes: *b"0123456789abcdefghijklmn" },
         ];
         for r in rs {
             assert_eq!(Record::decode(&r.encode()), Some(r));
@@ -348,6 +375,10 @@ mod tests {
             Record::Buffered { track: 0, i: 0, n: 1, start_ns: 5, end_ns: 1 }.encode(),
             Record::Duration { secs: f64::NAN }.encode(),
             Record::Error { code: 99, track: None }.encode(),
+            Record::InitData { kind: 1, len: 16 }.encode(),
+            Record::InitData { kind: 0, len: INIT_DATA_MAX + 1 }.encode(),
+            Record::InitData { kind: 0, len: 0 }.encode(),
+            Record::InitDataBytes { i: INIT_DATA_MAX, bytes: [0; 24] }.encode(),
             [0xFF; RECORD_LEN],
         ];
         for b in bad {

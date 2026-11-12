@@ -63,6 +63,56 @@ fn video_decoder(t: &TrackInfo, cfg: &decode::Config, h264: &mut Option<UnixStre
     decode::video(t, cfg)
 }
 
+/// Why the next sample can't be decoded yet.
+enum Locked {
+    /// Its key isn't there yet: wait for `KeysChanged`.
+    Wait,
+    /// The CDM refused it or is gone.
+    Fail,
+}
+
+/// The store's next sample, decrypted in place first if it is encrypted (decrypt-only,
+/// hospes.md §8.3: the clear bytes go to our own decoders).
+fn next_clear<'a>(store: &'a mut Store, cdm: &mut Option<UnixStream>) -> Result<Option<&'a demux::Sample>, Locked> {
+    let Some(s) = store.next_mut() else { return Ok(None) };
+    if let Some(c) = s.crypto.as_ref() {
+        let Some(sock) = cdm.as_mut() else { return Err(Locked::Fail) };
+        // Chromium hands CDMs 16-byte IVs: an 8-byte one is the counter's high half.
+        let mut iv = c.iv.clone();
+        iv.resize(16, 0);
+        let sample = hospes_proto::Sample {
+            scheme: match c.scheme {
+                demux::Scheme::Cenc => hospes_proto::scheme::CENC,
+                demux::Scheme::Cbcs => hospes_proto::scheme::CBCS,
+            },
+            key_id: c.key_id.to_vec(),
+            iv,
+            subsamples: c.subsamples.clone(),
+            crypt_byte_block: c.crypt_byte_block as u32,
+            skip_byte_block: c.skip_byte_block as u32,
+            timestamp: s.pts_ns / 1000,
+            data: std::mem::take(&mut s.data),
+        };
+        let len = sample.data.len();
+        if hospes_proto::io::send(sock, &hospes_proto::Msg::Decrypt { sample: sample.clone() }).is_err() {
+            return Err(Locked::Fail);
+        }
+        match hospes_proto::io::recv(sock) {
+            // Decrypt-only keeps the size: anything else is a broken CDM.
+            Ok(Some(hospes_proto::Msg::Decrypted { status, data, .. })) if status == hospes_proto::status::SUCCESS && data.len() == len => {
+                s.data = data;
+                s.crypto = None;
+            }
+            Ok(Some(hospes_proto::Msg::Decrypted { status, .. })) if status == hospes_proto::status::NO_KEY => {
+                s.data = sample.data;
+                return Err(Locked::Wait);
+            }
+            _ => return Err(Locked::Fail),
+        }
+    }
+    Ok(store.next())
+}
+
 /// One byte stream: the whole file, or one MSE track's appends.
 struct Feed {
     parser: Option<Box<dyn Demuxer + Send>>,
@@ -125,17 +175,23 @@ struct Worker {
     starved: Option<std::time::Instant>,
     /// The socket to hospes-codec (OpenH264 under Hospes), if the supervisor started one.
     h264: Option<UnixStream>,
+    /// The data channel to hospes-cdm, if the supervisor started one for encrypted media.
+    cdm: Option<UnixStream>,
+    /// Init data already sent up (the supervisor opens one session for each).
+    init_sent: Vec<Vec<u8>>,
 }
 
 fn main() {
     let mut args = std::env::args().skip(1);
     let mut fd = None;
     let mut h264_fd = None;
+    let mut cdm_fd = None;
     let mut mem: u64 = 768 << 20;
     while let Some(a) = args.next() {
         match a.as_str() {
             "--fd" => fd = args.next().and_then(|v| v.parse::<i32>().ok()),
             "--h264-fd" => h264_fd = args.next().and_then(|v| v.parse::<i32>().ok()),
+            "--cdm-fd" => cdm_fd = args.next().and_then(|v| v.parse::<i32>().ok()),
             "--mem-mib" => mem = args.next().and_then(|v| v.parse::<u64>().ok()).unwrap_or(768) << 20,
             _ => {}
         }
@@ -155,7 +211,10 @@ fn main() {
     #[allow(unsafe_code)]
     // SAFETY: as for --fd.
     let h264 = h264_fd.map(|f| UnixStream::from(unsafe { sys::adopt(f) }));
-    if let Some(h) = &h264 {
+    #[allow(unsafe_code)]
+    // SAFETY: as for --fd.
+    let cdm = cdm_fd.map(|f| UnixStream::from(unsafe { sys::adopt(f) }));
+    for h in h264.iter().chain(cdm.iter()) {
         if let Err(e) = sys::limit(&std::os::fd::OwnedFd::from(h.try_clone().unwrap()), sys::Rights::Socket) {
             eprintln!("atrium-player-decode: cap_rights_limit: {e}");
             std::process::exit(1);
@@ -190,6 +249,8 @@ fn main() {
         growing: false,
         starved: None,
         h264,
+        cdm,
+        init_sent: Vec::new(),
     };
     if w.send(Record::Ready { sandboxed }).is_err() {
         return;
@@ -212,6 +273,24 @@ impl Worker {
             self.send(Record::CueText { i: i as u32, bytes: piece })?;
         }
         Ok(())
+    }
+
+    /// Init data for the supervisor's licence session, once per distinct value.
+    fn send_init_data(&mut self, kind: demux::InitDataKind, data: Vec<u8>) {
+        if self.cdm.is_none() || data.is_empty() || data.len() > atrium_player::wire::INIT_DATA_MAX as usize || self.init_sent.contains(&data) || self.init_sent.len() >= 16 {
+            return;
+        }
+        let kind = match kind {
+            demux::InitDataKind::Cenc => 0,
+            demux::InitDataKind::WebM => 2,
+        };
+        let _ = self.send(Record::InitData { kind, len: data.len() as u32 });
+        for (i, c) in data.chunks(24).enumerate() {
+            let mut piece = [0u8; 24];
+            piece[..c.len()].copy_from_slice(c);
+            let _ = self.send(Record::InitDataBytes { i: i as u32, bytes: piece });
+        }
+        self.init_sent.push(data);
     }
 
     fn fail(&mut self, code: u32) {
@@ -351,6 +430,8 @@ impl Worker {
                 let refused = sys::probe_sandbox();
                 let _ = self.send(Record::Probe { refused });
             }
+            // Waiting samples are tried again on the next round of work.
+            ToWorker::KeysChanged => {}
             ToWorker::Shutdown => return false,
         }
         true
@@ -410,8 +491,7 @@ impl Worker {
                 Event::Duration(secs) => {
                     let _ = self.send(Record::Duration { secs });
                 }
-                // Encrypted media is not played yet (no CDM attached).
-                Event::InitData { .. } => {}
+                Event::InitData { kind, data } => self.send_init_data(kind, data),
                 Event::Sample(mut s) => {
                     let feed = &self.feeds[fi].1;
                     s.pts_ns = s.pts_ns.saturating_add(feed.offset_ns);
@@ -449,7 +529,13 @@ impl Worker {
         }
     }
 
-    fn tracks(&mut self, fi: usize, tracks: Vec<TrackInfo>) {
+    fn tracks(&mut self, fi: usize, mut tracks: Vec<TrackInfo>) {
+        // With a CDM, a track in a scheme we know is clear by the time it reaches a decoder.
+        if self.cdm.is_some() {
+            for t in tracks.iter_mut().filter(|t| t.protection.is_some()) {
+                t.encrypted = false;
+            }
+        }
         let feed = &mut self.feeds[fi].1;
         feed.tracks = tracks.clone();
         if self.video.is_none() {
@@ -684,7 +770,15 @@ impl Worker {
                     did = true;
                 }
                 Ok(None) => {
-                    if let Some(s) = v.store.next() {
+                    let next = match next_clear(&mut v.store, &mut self.cdm) {
+                        Ok(n) => n,
+                        Err(Locked::Wait) => break,
+                        Err(Locked::Fail) => {
+                            fail = Some(err::DECODE);
+                            break;
+                        }
+                    };
+                    if let Some(s) = next {
                         match v.dec.send(&s.data, s.pts_ns) {
                             Ok(true) => v.store.advance(),
                             Ok(false) => {}
@@ -756,7 +850,14 @@ impl Worker {
                     break;
                 }
             }
-            let Some(s) = v.store.next() else { break };
+            let s = match next_clear(&mut v.store, &mut self.cdm) {
+                Ok(Some(s)) => s,
+                Ok(None) | Err(Locked::Wait) => break,
+                Err(Locked::Fail) => {
+                    fail = Some(err::DECODE);
+                    break;
+                }
+            };
             match v.dec.send(&s.data, s.pts_ns) {
                 Ok(true) => v.store.advance(),
                 Ok(false) => {}
@@ -819,6 +920,7 @@ impl Worker {
         let Some(a) = self.audio.as_mut() else { return false };
         let Some(ring) = a.ring.as_mut() else { return false };
         let mut did = false;
+        let mut fail = false;
         let mut out = Vec::new();
         loop {
             if !a.pcm.is_empty() {
@@ -837,7 +939,14 @@ impl Worker {
             if ring.free() < PCM_PACKET_MAX {
                 break;
             }
-            let Some(s) = a.store.next() else { break };
+            let s = match next_clear(&mut a.store, &mut self.cdm) {
+                Ok(Some(s)) => s,
+                Ok(None) | Err(Locked::Wait) => break,
+                Err(Locked::Fail) => {
+                    fail = true;
+                    break;
+                }
+            };
             let (pts, data) = (s.pts_ns, s.data.clone());
             a.store.advance();
             if a.dec.decode(&data, &mut a.pcm).is_err() {
@@ -867,6 +976,9 @@ impl Worker {
         }
         for r in out {
             let _ = self.send(r);
+        }
+        if fail {
+            self.fail(err::DECODE);
         }
         did
     }
