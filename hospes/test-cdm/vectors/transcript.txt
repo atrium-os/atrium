@@ -1,0 +1,47 @@
+version hospes-test-cdm 1
+initialized 1
+key-status p=1 s=0
+key-status p=2 s=3
+reject p=3 e=1 code=0 msg=server certificates are not used by Clear Key
+new-session p=4 id=1
+message id=1 type=0 {"kids":["ABEiM0RVZneImaq7zN3u_w","oKGio6SlpqeoqaqrrK2urw"],"type":"temporary","hospes":{"storage_id_len":32,"link_mask":0,"protection":0}}
+keys id=1 new=1 00112233445566778899aabbccddeeff=0/0 a0a1a2a3a4a5a6a7a8a9aaabacadaeaf=0/0
+resolve p=5
+decrypt i=0 status=0 ts=0 len=100 ok=1
+decrypt i=1 status=0 ts=41667 len=1000 ok=1
+decrypt i=2 status=0 ts=83334 len=216 ok=1
+decrypt i=3 status=0 ts=125001 len=64 ok=1
+decrypt i=4 status=0 ts=166668 len=316 ok=1
+decrypt i=5 status=0 ts=208335 len=840 ok=1
+decrypt i=6 status=0 ts=250002 len=999 ok=1
+decrypt i=7 status=0 ts=291669 len=1075 ok=1
+decrypt i=8 status=2 ts=0 len=0 ok=1
+decrypt i=9 status=4 ts=0 len=0 ok=1
+audio-init status=3
+video-init status=3
+video-init status=0
+frame i=10 status=0 fmt=2 size=64x48 off=0,3072,3840 stride=64,32,32 ts=416670 fnv=72e5a7b164b97300
+frame i=11 status=0 fmt=2 size=64x48 off=0,3072,3840 stride=64,32,32 ts=458337 fnv=e6c2da1c28d338fd
+frame i=12 status=0 fmt=2 size=64x48 off=0,3072,3840 stride=64,32,32 ts=500004 fnv=3f1a48bce4c8a458
+frame i=13 status=0 fmt=2 size=64x48 off=0,3072,3840 stride=64,32,32 ts=541671 fnv=7ce80c406ac3cf0f
+frame i=14 status=1
+new-session p=6 id=2
+message id=2 type=0 {"kids":["ABEiM0RVZneImaq7zN3u_w"],"type":"persistent-license","hospes":{"storage_id_len":32,"link_mask":0,"protection":0}}
+keys id=2 new=1 00112233445566778899aabbccddeeff=0/0
+resolve p=7
+closed id=2
+resolve p=8
+closed id=1
+resolve p=9
+decrypt i=1 status=2 ts=0 len=0 ok=0
+new-session p=10 id=2
+keys id=2 new=1 00112233445566778899aabbccddeeff=0/0
+decrypt i=1 status=0 ts=41667 len=1000 ok=1
+new-session p=11 id=
+keys id=2 new=0 00112233445566778899aabbccddeeff=6/0
+resolve p=12
+closed id=2
+resolve p=13
+new-session p=14 id=
+reject p=15 e=2 code=0 msg=unknown session
+end

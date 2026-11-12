@@ -74,3 +74,30 @@ pub fn mmap_aligned(len: usize, align: usize, prot: usize) -> R<usize> {
     }
     Ok(start)
 }
+
+/// `struct pollfd` (the same on FreeBSD and Linux).
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Default)]
+pub struct PollFd {
+    pub fd: i32,
+    pub events: i16,
+    pub revents: i16,
+}
+pub const POLLIN: i16 = 0x1;
+pub const POLLERR: i16 = 0x8;
+pub const POLLHUP: i16 = 0x10;
+
+/// Read exactly `b.len()` bytes; `Ok(false)` if the peer closed before the first byte.
+pub fn read_exact(fd: i32, b: &mut [u8]) -> R<bool> {
+    let mut o = 0;
+    while o < b.len() {
+        match read(fd, &mut b[o..]) {
+            Ok(0) => return if o == 0 { Ok(false) } else { Err(Errno(EIO)) },
+            Ok(n) => o += n,
+            Err(Errno(e)) if e == EINTR => {}
+            Err(e) => return Err(e),
+        }
+    }
+    Ok(true)
+}
+const EIO: i32 = 5;

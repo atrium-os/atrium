@@ -3,6 +3,23 @@
 version = 4
 
 [[package]]
+name = "hospes-cdm"
+version = "0.1.0"
+dependencies = [
+ "hospes-glibc",
+ "hospes-proto",
+ "hospes-rt",
+]
+
+[[package]]
+name = "hospes-cdm-check"
+version = "0.1.0"
+dependencies = [
+ "hospes-proto",
+ "libc",
+]
+
+[[package]]
 name = "hospes-codec"
 version = "0.1.0"
 dependencies = [
@@ -35,11 +52,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "hospes-proto"
+version = "0.1.0"
+
+[[package]]
 name = "hospes-rt"
 version = "0.1.0"
 dependencies = [
  "hospes-elf",
 ]
+
+[[package]]
+name = "libc"
+version = "0.2.191"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "65cd87c9a6d60536580b316ad985726104730a5151c99845f2490428ef91240a"
 
 [[package]]
 name = "libm"

@@ -1,0 +1,10 @@
+[package]
+name = "hospes-cdm-check"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+description = "Runs the test CDM's scenario through hospes-cdm and prints the reference host's transcript (test tool)"
+
+[dependencies]
+hospes-proto = { path = "../hospes-proto", features = ["std"] }
+libc = "0.2"

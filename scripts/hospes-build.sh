@@ -7,6 +7,13 @@
 #   sh scripts/hospes-build.sh test-linux          # x86_64 native + aarch64 under qemu-user
 #   sh scripts/hospes-build.sh test RUNNER FIXDIR  # run every fixture with RUNNER (any OS)
 #   sh scripts/hospes-build.sh conform CODEC LIB STREAMDIR REF.sha  # H2 conformance (any OS)
+#   sh scripts/hospes-build.sh cdm TRIPLE          # hospes-cdm (CDM host) for TRIPLE
+#   sh scripts/hospes-build.sh test-cdm            # H3: rebuild the test CDM, its vectors and
+#                                                  #   the reference transcript (Linux)
+#   sh scripts/hospes-build.sh cdm-check-linux     # H3: hospes-cdm vs the reference host,
+#                                                  #   x86_64 native + aarch64 under qemu-user
+#   sh scripts/hospes-build.sh cdm-check CHECK CDM ARCH  # H3 on any OS: run hospes-cdm-check
+#                                                  #   and diff with the committed transcript
 #
 # conform: decode every stream in STREAMDIR with hospes-codec --file and compare the I420
 # output's SHA-256 with REF.sha ("<sha256> <stream name>" lines), made by the H0 reference
@@ -45,6 +52,43 @@ build_fixtures() {
         rm -f "$out/libhost.so"
         echo "fixtures: $out"
     done
+}
+
+# The H3 test CDM (C++, test-only) and the Linux reference host. The .so files, vectors and
+# the reference transcript are committed, so the FreeBSD VMs check against what Linux ran.
+T="$H/test-cdm"
+build_test_cdm() {
+    f="-O2 -fPIC -shared -fno-exceptions -fno-rtti -fvisibility=hidden -fstack-protector-strong -std=c++17 -Wall -Wextra"
+    f="$f -I$H/probe/third_party -nostdlib++ -Wl,--version-script=$T/exports.map -Wl,--build-id=none"
+    mkdir -p "$T/bin" "$T/vectors"
+    clang++ --target=x86_64-linux-gnu -fuse-ld=lld $f -o "$T/bin/x86_64-clearkey.so" "$T/clearkey.cc" "$T/aes.cc"
+    clang++ --target=aarch64-linux-gnu -fuse-ld=lld $f -o "$T/bin/aarch64-clearkey.so" "$T/clearkey.cc" "$T/aes.cc"
+    python3 "$T/make-vectors.py" "$T/vectors"
+    tmp=$(mktemp -d)
+    g++ -O1 -std=c++17 -Wall -I"$H/probe/third_party" -o "$tmp/refhost" "$T/refhost.cc" -ldl
+    aarch64-linux-gnu-g++ -O1 -std=c++17 -I"$H/probe/third_party" -o "$tmp/refhost-arm64" "$T/refhost.cc" -ldl
+    "$tmp/refhost" "$T/bin/x86_64-clearkey.so" "$T/vectors" > "$T/vectors/transcript.txt"
+    qemu-aarch64-static -L /usr/aarch64-linux-gnu "$tmp/refhost-arm64" "$T/bin/aarch64-clearkey.so" "$T/vectors" > "$tmp/arm.txt"
+    diff "$T/vectors/transcript.txt" "$tmp/arm.txt" >&2 || { echo "reference transcripts differ between machines" >&2; exit 1; }
+    rm -rf "$tmp"
+    echo "test CDM, vectors and transcript: $T" >&2
+}
+
+# cdm_check CHECK CDM ARCH [WRAPPER]: run the scenario, diff with the reference transcript.
+cdm_check() {
+    check="$1"; cdm="$2"; arch="$3"; wrap="${4:-}"
+    out="${TMPDIR:-/tmp}/hospes-cdm-check.$$"
+    mkdir -p "$out"
+    if [ -n "$wrap" ]; then
+        printf '#!/bin/sh\nexec %s %s "$@"\n' "$wrap" "$cdm" > "$out/cdm.sh"; chmod +x "$out/cdm.sh"; cdm="$out/cdm.sh"
+    fi
+    if "$check" "$cdm" "$T/bin/$arch-clearkey.so" "$T/vectors" > "$out/transcript.txt" 2> "$out/err.txt" &&
+        diff "$T/vectors/transcript.txt" "$out/transcript.txt" >&2; then
+        echo "hospes-cdm ($arch): transcript equals the reference host's ($(wc -l < "$out/transcript.txt") lines)" >&2
+        rm -rf "$out"
+    else
+        echo "hospes-cdm ($arch): MISMATCH; see $out" >&2; cat "$out/err.txt" >&2; return 1
+    fi
 }
 
 # build_bin TRIPLE PACKAGE: a static no_std Hospes binary.
@@ -116,6 +160,17 @@ case "${1:-}" in
     fixtures) build_fixtures ;;
     runner) build_runner "$2" ;;
     codec) build_bin "$2" hospes-codec ;;
+    cdm) build_bin "$2" hospes-cdm ;;
+    test-cdm) build_test_cdm ;;
+    cdm-check) cdm_check "$2" "$3" "$4" ;;
+    cdm-check-linux)
+        x=$(build_bin x86_64-unknown-linux-gnu hospes-cdm)
+        a=$(build_bin aarch64-unknown-linux-gnu hospes-cdm)
+        (cd "$H" && cargo build --release -p hospes-cdm-check >&2)
+        rc=0
+        cdm_check "$H/target/release/hospes-cdm-check" "$x" x86_64 || rc=1
+        cdm_check "$H/target/release/hospes-cdm-check" "$a" aarch64 qemu-aarch64-static || rc=1
+        exit $rc ;;
     test) run_all "$2" "$3" ;;
     conform) conform "$2" "$3" "$4" "$5" ;;
     test-linux)

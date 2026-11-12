@@ -55,3 +55,8 @@ pub extern "C" fn logf(x: f32) -> f32 {
 pub extern "C" fn sqrtf(x: f32) -> f32 {
     libm::sqrtf(x)
 }
+
+/// `abort(3)`: the library gave up. End the process; the peer sees the channel close.
+pub extern "C" fn abort() -> ! {
+    crate::die("abort() called by the library")
+}

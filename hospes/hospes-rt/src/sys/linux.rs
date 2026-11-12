@@ -264,3 +264,37 @@ pub fn create(path: &[u8]) -> R<i32> {
     // O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC
     call(nr::OPENAT, [AT_FDCWD as usize, path.as_ptr() as usize, 0x1 | 0x40 | 0x200 | O_CLOEXEC, 0o644, 0, 0]).map(|v| v as i32)
 }
+
+const SYS_PPOLL: usize = if cfg!(target_arch = "x86_64") { 271 } else { 73 };
+const SYS_RENAMEAT: usize = if cfg!(target_arch = "x86_64") { 264 } else { 38 };
+const SYS_UNLINKAT: usize = if cfg!(target_arch = "x86_64") { 263 } else { 35 };
+const O_WRONLY: usize = 0x1;
+const O_CREAT: usize = 0x40;
+const O_TRUNC: usize = 0x200;
+const O_NOFOLLOW: usize = if cfg!(target_arch = "x86_64") { 0x20000 } else { 0x8000 };
+pub const ENOENT: i32 = 2;
+
+/// Open `name` (NUL-terminated, one path component) beneath `dirfd`: for reading, or
+/// created/truncated for writing (mode 0600). Never follows a symbolic link.
+pub fn open_beneath(dirfd: i32, name: &[u8], write: bool) -> R<i32> {
+    debug_assert!(name.last() == Some(&0));
+    let f = if write { O_WRONLY | O_CREAT | O_TRUNC } else { O_RDONLY };
+    call(nr::OPENAT, [dirfd as usize, name.as_ptr() as usize, f | O_NOFOLLOW | O_CLOEXEC, 0o600, 0, 0]).map(|v| v as i32)
+}
+
+/// `renameat(dirfd, from, dirfd, to)`; both NUL-terminated.
+pub fn rename_beneath(dirfd: i32, from: &[u8], to: &[u8]) -> R<()> {
+    call(SYS_RENAMEAT, [dirfd as usize, from.as_ptr() as usize, dirfd as usize, to.as_ptr() as usize, 0, 0]).map(|_| ())
+}
+
+/// `unlinkat(dirfd, name, 0)`; NUL-terminated.
+pub fn unlink_beneath(dirfd: i32, name: &[u8]) -> R<()> {
+    call(SYS_UNLINKAT, [dirfd as usize, name.as_ptr() as usize, 0, 0, 0, 0]).map(|_| ())
+}
+
+/// `poll(2)` through `ppoll`; `timeout_ms < 0` waits forever.
+pub fn poll(fds: &mut [super::PollFd], timeout_ms: i32) -> R<usize> {
+    let ts = [(timeout_ms / 1000) as i64, ((timeout_ms % 1000) as i64) * 1_000_000];
+    let tp = if timeout_ms < 0 { 0 } else { ts.as_ptr() as usize };
+    call(SYS_PPOLL, [fds.as_mut_ptr() as usize, fds.len(), tp, 0, 8, 0])
+}

@@ -5,7 +5,8 @@
 //! `(name, version) → address`, matched exactly, per architecture. A name or version that is
 //! not in the table refuses the load (§6.4).
 //!
-//! H2 covers OpenH264 2.6.0's 71 imports (both machines). The CDM's set comes with H4.
+//! H2 covers OpenH264 2.6.0's 71 imports (both machines), H3 the test CDM's few extra
+//! (`abort`, `bcmp`). Widevine's set comes with H4.
 #![no_std]
 #![allow(clippy::missing_safety_doc, non_upper_case_globals, non_snake_case)]
 
@@ -93,11 +94,13 @@ static TABLE: &[Entry] = table! {
     "memmove" B => fnaddr!(mem::memmove);
     "memset" B => fnaddr!(mem::memset);
     "memcmp" B => fnaddr!(mem::memcmp);
+    "bcmp" B => fnaddr!(mem::memcmp);
     "strlen" B => fnaddr!(mem::strlen);
     "strncpy" B => fnaddr!(mem::strncpy);
     // errors, process
     "__errno_location" B => fnaddr!(misc::__errno_location);
     "getpid" B => fnaddr!(misc::getpid);
+    "abort" B => fnaddr!(misc::abort);
     "sched_getaffinity" (pick!("GLIBC_2.3.4", "GLIBC_2.17")) => fnaddr!(misc::sched_getaffinity);
     "__sched_cpucount" (pick!("GLIBC_2.6", "GLIBC_2.17")) => fnaddr!(misc::__sched_cpucount);
     "__stack_chk_fail" (pick!("GLIBC_2.4", "GLIBC_2.17")) => fnaddr!(misc::__stack_chk_fail);
