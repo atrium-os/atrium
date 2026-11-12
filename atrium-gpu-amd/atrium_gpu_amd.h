@@ -839,6 +839,7 @@ void	amd_gmc12_gart_disable(struct amd_gart *gt);
 int	amd_gmc12_gart_map(struct amd_gart *gt, uint64_t gart_addr,
 	    vm_paddr_t pa);
 int	amd_gmc12_flush(struct amd_gart *gt);
+void	amd_gmc12_fault_report(struct amd_gart *gt, const char *when);
 int	amd_ih7_test(struct atrium_amd_softc *sc, struct amd_gart *gt,
 	    int (*during)(struct atrium_amd_softc *, struct amd_gart *));
 int	amd_gfx12_setup(struct atrium_amd_softc *sc);	/* gfx12.c, 4c */

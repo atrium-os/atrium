@@ -407,3 +407,11 @@ land with it.
   20:31 and 20:36, after about 15 resets. Note: at "started", GRBM_STATUS2 reads 0x100000
   in the failing runs against 0x4100000 in the good one. Next: cold power cycle, then
   6c90468a as the first run.
+- **2026-11-12 20:53, 6c90468a, first run after a panel reboot: neither MES pipe started**
+  (instr 0, GP3 0). 112 client-0xa src-0 IVs arrived in pairs. Read as GFX UTCL2 faults
+  (gmc_v12 SRCID 0; addr = data0 << 12 | (data1 & 0xf) << 44), they are at 0x3f01NN000 and
+  0xfffff01NN000 for NN 0x10..0x7f. The second range sign-extends into the uni_mes data
+  segment (data_start 0xfffffffff0100000). So the MES firmware seems to fault on its own
+  data before running. Power was 66 W, refused, reset cold. Next (diagnostic, with the
+  start gate): log each pipe's PSP-programmed IC_BASE, MDBASE, bounds and MSCRATCH, and
+  both hubs' fault status, before the start and on failure.

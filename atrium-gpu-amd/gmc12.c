@@ -340,6 +340,18 @@ amd_gmc12_gart_map(struct amd_gart *gt, uint64_t gart_addr, vm_paddr_t pa)
 	return (0);
 }
 
+/* Both hubs' VMID 0 fault status and address, for callers' diagnostics. */
+void
+amd_gmc12_fault_report(struct amd_gart *gt, const char *when)
+{
+	struct hub mm, gfx;
+
+	if (hub_open(gt->sc, false, &mm))
+		hub_report(&mm, when);
+	if (hub_open(gt->sc, true, &gfx))
+		hub_report(&gfx, when);
+}
+
 int
 amd_gmc12_flush(struct amd_gart *gt)
 {

@@ -55,6 +55,10 @@ struct mes_gen {
 	uint32_t hqd_dequeue_req, hqd_pq_wptr_hi, grbm_status, cp_stat, rlc_stat;
 	uint32_t grbm_status2, grbm_status3, cp_cpc_status, cp_cpc_busy,
 	    cp_cpc_busy2, cp_cpf_status, cp_busy_stat, rlc_gpm_stat;
+	/* Firmware placement, per pipe (programmed by the PSP): read only. */
+	uint32_t ic_base_lo, ic_base_hi, ic_base_cntl, md_base_lo, md_base_hi,
+	    mi_bound_lo, mi_bound_hi, md_bound_lo, md_bound_hi, mscratch_lo,
+	    mscratch_hi, local_base0_lo;
 	/* NBIF segment 2 */
 	uint32_t nbif_db_aper_en, nbif_db_entry0, nbif_db_entry3;
 	/* Doorbell dword indices (amdgpu_doorbell.h NAVI10 MES_RING0/1 << 1). */
@@ -73,6 +77,9 @@ static const struct mes_gen mes_gens[] = {
 	  S0(0x1fc1), S0(0x1fe0), S0(0x0da4), S0(0x0f40), S1(0x4c04),
 	  S0(0x0da2), S0(0x0da7), S0(0x0e24), S0(0x0e25), S0(0x0e2a),
 	  S0(0x0e27), S0(0x0f3f), S1(0x4e6c),
+	  S1(0x5850), S1(0x5851), S1(0x5852), S1(0x5854), S1(0x5855),
+	  S1(0x585b), S1(0x585c), S1(0x585d), S1(0x585e), S1(0x2815),
+	  S1(0x2814), S1(0x2883),
 	  0x00c0, 0x01cb, 0x01ce,
 	  0x0b << 1, 0x0c << 1, 0x400 },
 };
@@ -338,6 +345,33 @@ grbm_watch(struct mes *m, const char *when, int ms)
 	    (v & GRBM_BUSY_BITS) == 0 ? "idle" : "still busy", us / 1000,
 	    rd(m, m->g->cp_cpc_status), rd(m, m->g->cp_cpf_status));
 	return ((v & GRBM_BUSY_BITS) == 0);
+}
+
+/*
+ * Box runs from 20:36: MES pipes stopped starting (instr 0/1, GP3 0) and
+ * the GFX hub reported UTCL2 faults (client 0xa src 0) at 0x3f01NN000 and
+ * 0xfffff01NN000, the latter inside the MES data segment's address range.
+ * Log where the PSP placed each pipe's code and data, read only.
+ */
+static void
+mes_placement(struct mes *m, const char *when)
+{
+	const struct mes_gen *g = m->g;
+	int p;
+
+	for (p = 0; p < 2; p++) {
+		grbm_select(m, 3, p);
+		device_printf(m->sc->dev, "mes: %s: pipe %d IC_BASE %#x%08x "
+		    "(cntl %#x), MIBOUND %#x%08x, MDBASE %#x%08x, MDBOUND "
+		    "%#x%08x, MSCRATCH %#x%08x, LOCAL_BASE0 %#x\n", when, p,
+		    rd(m, g->ic_base_hi), rd(m, g->ic_base_lo),
+		    rd(m, g->ic_base_cntl), rd(m, g->mi_bound_hi),
+		    rd(m, g->mi_bound_lo), rd(m, g->md_base_hi),
+		    rd(m, g->md_base_lo), rd(m, g->md_bound_hi),
+		    rd(m, g->md_bound_lo), rd(m, g->mscratch_hi),
+		    rd(m, g->mscratch_lo), rd(m, g->local_base0_lo));
+	}
+	grbm_select(m, 0, 0);
 }
 
 /* mes_v12_0_mqd_init */
@@ -752,6 +786,8 @@ mes_run(struct mes *m)
 	grbm_select(m, 0, 0);
 
 	mes_report(m, "before");
+	mes_placement(m, "before start");
+	amd_gmc12_fault_report(m->gt, "before MES");
 	amd_gfx12_pm_report(sc, "before MES");
 	mes_enable(m, true);
 	/*
@@ -774,6 +810,8 @@ mes_run(struct mes *m)
 		grbm_select(m, 0, 0);
 		if (gp3 == 0) {
 			mes_report(m, "pipe not started");
+			mes_placement(m, "pipe not started");
+			amd_gmc12_fault_report(m->gt, "pipe not started");
 			device_printf(sc->dev, "mes: pipe %d firmware not running "
 			    "100 ms after the start; no queues made active\n", p);
 			return (ENXIO);
