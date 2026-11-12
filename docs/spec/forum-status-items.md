@@ -51,6 +51,11 @@ The app chooses one of two, and can switch with its next `Set`:
     selected, segmented, enabled }` (radio list or segmented) →
     `Chosen(i)`; `Button { id, label, primary, enabled }` → `Pressed`.
   - `Progress { label, value }`.
+  - `TextField { id, label, placeholder, value, enabled }` → `Text(..)`
+    when the user presses Enter. Never obscured: the bar's surfaces do
+    not ask for passwords (fresco-popups.md §2), so there is no secret
+    field. The field takes the app's `value` only when it changes, so an
+    unrelated update does not wipe what the user is typing.
 
   What the user does comes back as `Changed { id, value }`; the app sends
   the new state in its next `Set` (a control moves at once in the bar, so
@@ -60,8 +65,7 @@ The app chooses one of two, and can switch with its next `Set`:
 
   Limits (forum-wm cuts to them): width 200 to 400 px; 64 nodes in all;
   4 levels of nesting; text 512 characters, labels 64; 8 options a choice;
-  560 px tall (nodes past it are not drawn). Text fields come later (a
-  grabbing pop-up already takes keys).
+  560 px tall (nodes past it are not drawn).
 
 ## 3. Wire
 

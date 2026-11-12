@@ -22,6 +22,7 @@ struct State {
     level: f32,
     mode: u32,
     kept: u32,
+    search: String,
 }
 
 fn panel(s: &State) -> StatusContent {
@@ -46,6 +47,13 @@ fn panel(s: &State) -> StatusContent {
                     },
                     StatusNode::Slider { id: 3, label: format!("History: {} items", (s.level * 100.0).round()), value: s.level, enabled: true },
                 ],
+            },
+            StatusNode::TextField {
+                id: 6,
+                label: "Search history".into(),
+                placeholder: "Type and press Enter".into(),
+                value: s.search.clone(),
+                enabled: true,
             },
             StatusNode::Progress { label: "Storage used".into(), value: s.kept as f32 / 100.0 },
             StatusNode::Separator,
@@ -82,7 +90,7 @@ fn main() -> std::io::Result<()> {
     let as_menu = std::env::args().any(|a| a == "--menu");
     let path = status_socket_path();
     let mut sock = UnixStream::connect(&path)?;
-    let mut st = State { paused: false, level: 0.5, mode: 0, kept: 12 };
+    let mut st = State { paused: false, level: 0.5, mode: 0, kept: 12, search: String::new() };
     send(&mut sock, &st, as_menu)?;
     println!("status item up on {}", path.display());
     loop {
@@ -101,6 +109,7 @@ fn main() -> std::io::Result<()> {
             FromStatus::Changed { id: 3, value: StatusValue::Level(v) } => st.level = v,
             FromStatus::Changed { id: 4, value: StatusValue::Pressed } => st.kept = 0,
             FromStatus::Changed { id: 5, value: StatusValue::Pressed } => println!("open the history window"),
+            FromStatus::Changed { id: 6, value: StatusValue::Text(t) } => st.search = t,
             FromStatus::Denied { message } => {
                 eprintln!("refused: {message}");
                 return Ok(());

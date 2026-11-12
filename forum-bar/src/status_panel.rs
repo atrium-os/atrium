@@ -14,7 +14,8 @@ use forum_ctl::{Intent, Reply, StatusNode, StatusPanel, StatusText, StatusValue,
 use pergola::geom::Rect;
 use pergola::reactive::Mutable;
 use pergola::theme::{font, radius, size, type_size, Weight};
-use pergola::widgets::{Button, Check, Checkbox, Divider, ProgressBar, RadioGroup, Segmented, Slider, Toggle};
+use pergola::text_edit::TextEdit;
+use pergola::widgets::{Button, Check, Checkbox, Divider, ProgressBar, RadioGroup, Segmented, Slider, TextField, Toggle};
 use pergola::{Ctx, Node, TextStyle, View};
 
 /// Between nodes one under another, and cells of a row.
@@ -121,6 +122,9 @@ fn layout_one(n: &StatusNode, x: f32, y: f32, w: f32, out: &mut Vec<(Rect, Piece
         }
         StatusNode::Button { .. } => control(n, x, y, w, size::BUTTON_HEIGHT_DEFAULT, out),
         StatusNode::Progress { label, .. } => control(n, x, y, w, if label.is_empty() { 4.0 } else { LABEL_H + 8.0 }, out),
+        StatusNode::TextField { label, .. } => {
+            control(n, x, y, w, if label.is_empty() { 0.0 } else { LABEL_H } + size::INPUT_HEIGHT_DEFAULT, out)
+        }
     }
 }
 
@@ -154,6 +158,10 @@ enum Ctl {
     Check(Mutable<Check>),
     Level(Mutable<f64>),
     Index(Mutable<usize>),
+    /// The field's edit state, and the value the app last sent (the
+    /// field takes a new one only when the app's changes, so what the
+    /// user is typing is not overwritten by an unrelated update).
+    Text(Mutable<TextEdit>, Rc<RefCell<String>>),
 }
 
 impl Controls {
@@ -174,6 +182,7 @@ impl Controls {
             StatusNode::Check { id, on, .. } => (*id, Ctl::Check(self.cell(if *on { Check::On } else { Check::Off }))),
             StatusNode::Slider { id, value, .. } => (*id, Ctl::Level(self.cell(*value as f64))),
             StatusNode::Choice { id, selected, .. } => (*id, Ctl::Index(self.cell(*selected as usize))),
+            StatusNode::TextField { id, value, .. } => (*id, Ctl::Text(self.cell(TextEdit::new(value)), Rc::new(RefCell::new(value.clone())))),
             _ => return None,
         };
         let mut map = self.map.borrow_mut();
@@ -197,6 +206,10 @@ impl Controls {
                         }
                         (Some(Ctl::Level(m)), StatusNode::Slider { value, .. }) if (m.get() - *value as f64).abs() > 1e-4 => m.set(*value as f64),
                         (Some(Ctl::Index(m)), StatusNode::Choice { selected, .. }) if m.get() != *selected as usize => m.set(*selected as usize),
+                        (Some(Ctl::Text(m, last)), StatusNode::TextField { value, .. }) if *last.borrow() != *value => {
+                            *last.borrow_mut() = value.clone();
+                            m.set(TextEdit::new(value));
+                        }
                         _ => {}
                     },
                 }
@@ -327,6 +340,28 @@ fn draw_control(ctx: &mut Ctx, r: Rect, n: &StatusNode, controls: &Controls, sin
             };
             b.render(ctx);
         }
+        (StatusNode::TextField { id, label, placeholder, value, enabled }, Some(Ctl::Text(m, _))) => {
+            let dy = label_above(ctx, label);
+            let field = Rect::new(r.x(), r.y() + dy, r.w(), size::INPUT_HEIGHT_DEFAULT);
+            if *enabled {
+                let (id, s) = (*id, sink.clone());
+                TextField::new(m)
+                    .placeholder(placeholder.clone())
+                    .at(field.x(), field.y())
+                    .width(field.w())
+                    .on_submit(move |text| s.send(id, StatusValue::Text(text.to_string())))
+                    .render(ctx);
+            } else {
+                // Read-only: the value in a quiet box, no caret.
+                ctx.add(Node::Rect { rect: field, fill: t.border_default(), radius: radius::SM });
+                let inner = Rect::new(field.x() + 1.0, field.y() + 1.0, field.w() - 2.0, field.h() - 2.0);
+                ctx.add(Node::Rect { rect: inner, fill: t.bg_surface(), radius: radius::SM - 1.0 });
+                let shown = if value.is_empty() { placeholder } else { value };
+                let style = TextStyle { family: font::SANS.into(), size: type_size::SM, weight: Weight::Regular, color: t.text_tertiary() };
+                let h = pergola::text::measure(shown, &style).h;
+                ctx.add(Node::Text { rect: Rect::new(field.x() + 8.0, field.y() + (field.h() - h) / 2.0, field.w() - 16.0, h), content: shown.clone(), style });
+            }
+        }
         (StatusNode::Progress { label, value }, _) => {
             let dy = label_above(ctx, label);
             ProgressBar::new(*value, r.w()).at(r.x(), r.y() + dy + 2.0).emit(ctx);
@@ -406,6 +441,23 @@ mod tests {
         c.sync(&p);
         let Some(Ctl::On(b)) = c.get(&p.nodes[3].clone().children()[0]) else { panic!() };
         assert!(a.get() && b.get(), "the same cell, now on");
+    }
+
+    #[test]
+    fn a_text_field_takes_the_apps_value_only_when_it_changes() {
+        let c = Controls::new(None);
+        let field = |v: &str| StatusPanel { width: 280, nodes: vec![StatusNode::TextField { id: 7, label: "Server".into(), placeholder: "host".into(), value: v.into(), enabled: true }] };
+        let p = field("a.example");
+        c.sync(&p);
+        let Some(Ctl::Text(m, _)) = c.get(&p.nodes[0]) else { panic!() };
+        assert_eq!(m.get_cloned().text(), "a.example");
+        // The user types; the app re-sends the same value: kept.
+        m.set(TextEdit::new("typed"));
+        c.sync(&field("a.example"));
+        assert_eq!(m.get_cloned().text(), "typed");
+        // The app sends a new value: shown.
+        c.sync(&field("b.example"));
+        assert_eq!(m.get_cloned().text(), "b.example");
     }
 
     trait Children {

@@ -169,6 +169,7 @@ mod tests {
             StatusNode::Choice { id: 3, options: vec!["a".into(), "b".into()], selected: 9, segmented: true, enabled: true },
             StatusNode::Button { id: 4, label: "Clear".into(), primary: false, enabled: false },
             deep,
+            StatusNode::TextField { id: 5, label: "Server".into(), placeholder: "host".into(), value: String::new(), enabled: true },
         ];
         nodes.extend((0..100).map(|_| StatusNode::Separator));
         apply("org.test.clip", 7, &tx, ToStatus::Set { glyph: 'c', tooltip: String::new(), content: StatusContent::Panel(StatusPanel { width: 9999, nodes }) });
@@ -198,6 +199,10 @@ mod tests {
         assert!(input("org.test.clip", 4, StatusValue::Pressed).is_err(), "disabled");
         assert!(input("org.test.clip", 1, StatusValue::Pressed).is_err(), "a toggle is not pressed");
         assert!(input("org.test.clip", 99, StatusValue::Pressed).is_err());
+        while rx.try_recv().is_ok() {}
+        input("org.test.clip", 5, StatusValue::Text("y".repeat(900))).unwrap();
+        assert!(matches!(rx.try_recv(), Ok(FromStatus::Changed { id: 5, value: StatusValue::Text(t) }) if t.chars().count() == forum_ctl::STATUS_MAX_TEXT));
+        assert!(input("org.test.clip", 1, StatusValue::Text("x".into())).is_err(), "a toggle takes no text");
         assert!(pick("org.test.clip", 0).is_err(), "a panel has no menu");
         closed(7);
     }

@@ -245,15 +245,21 @@ pub enum StatusNode {
     Button { id: u32, label: String, primary: bool, enabled: bool },
     /// A label over a progress bar, 0 to 1.
     Progress { label: String, value: f32 },
+    /// A label over a one-line text field showing `value` → `Text(..)` on
+    /// Enter. Never a secret: no field in the bar is obscured, and the
+    /// bar's surfaces never ask for passwords (fresco-popups.md §2).
+    TextField { id: u32, label: String, placeholder: String, value: String, enabled: bool },
 }
 
 /// What the user did to a panel control.
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub enum StatusValue {
     Pressed,
     On(bool),
     Level(f32),
     Chosen(u32),
+    /// A text field's text, on Enter (at most `STATUS_MAX_TEXT` characters).
+    Text(String),
 }
 
 fn unit(v: f32) -> f32 {
@@ -285,7 +291,8 @@ impl StatusPanel {
                 | StatusNode::Check { id: i, .. }
                 | StatusNode::Slider { id: i, .. }
                 | StatusNode::Choice { id: i, .. }
-                | StatusNode::Button { id: i, .. } if *i == id => Some(n),
+                | StatusNode::Button { id: i, .. }
+                | StatusNode::TextField { id: i, .. } if *i == id => Some(n),
                 _ => None,
             })
         }
@@ -300,6 +307,7 @@ impl StatusPanel {
             (StatusNode::Slider { enabled: true, .. }, StatusValue::Level(v)) if v.is_finite() => Some(StatusValue::Level(unit(v))),
             (StatusNode::Choice { enabled: true, options, .. }, StatusValue::Chosen(i)) if (i as usize) < options.len() => Some(StatusValue::Chosen(i)),
             (StatusNode::Button { enabled: true, .. }, StatusValue::Pressed) => Some(StatusValue::Pressed),
+            (StatusNode::TextField { enabled: true, .. }, StatusValue::Text(t)) => Some(StatusValue::Text(cut(t, STATUS_MAX_TEXT))),
             _ => None,
         }
     }
@@ -331,6 +339,9 @@ fn bound_nodes(nodes: Vec<StatusNode>, depth: usize, budget: &mut usize) -> Vec<
             }
             StatusNode::Button { id, label: l, primary, enabled } => StatusNode::Button { id, label: label(l), primary, enabled },
             StatusNode::Progress { label: l, value } => StatusNode::Progress { label: label(l), value: unit(value) },
+            StatusNode::TextField { id, label: l, placeholder, value, enabled } => {
+                StatusNode::TextField { id, label: label(l), placeholder: label(placeholder), value: cut(value, STATUS_MAX_TEXT), enabled }
+            }
         };
         out.push(n);
     }
