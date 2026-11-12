@@ -38,6 +38,8 @@
  */
 #include "atrium_gpu_amd.h"
 
+#include <sys/sx.h>
+#include <sys/taskqueue.h>
 #include <dev/pci/pcireg.h>
 #include <dev/pci/pcivar.h>
 
@@ -367,25 +369,28 @@ smu_sample(struct smu_link *l, struct resource *vram, uint32_t ifver, int n,
 	return (false);
 }
 
-int
-amd_smu_init(struct atrium_amd_softc *sc)
+/*
+ * The checks every SMU user makes (generation table, register windows, an
+ * MMHUB 4 and GC 12 to talk about), then BAR0 for the driver table. On 0,
+ * *vramp is the BAR (release with rid *ridp) and *mcp the table's MC address.
+ */
+static int
+smu_open(struct atrium_amd_softc *sc, struct smu_link *l,
+    struct resource **vramp, int *ridp, uint64_t *mcp)
 {
-	struct resource *vram = NULL;
-	uint64_t fb_base, mc;
-	struct smu_link link = { .sc = sc, .failed = false };
-	struct atrium_gpu_power_telemetry t;
-	uint64_t feat;
-	uint32_t v, ifver = 0;
 	bus_size_t lim = rman_get_size(sc->regs);
-	int rid, us, r, err = 0, gc_up_ok = 0, gfx_cg = 0, gmc = 0, ih = 0, gfx = 0,
-	    gfx_r = -1, mes = 0;
+	struct resource *vram;
+	uint64_t fb_base;
+	int rid;
 
-#define	SEND(m, a, o)	smu_send(&link, (m), (a), (o), false)
-	link.gen = smu_gen_find(sc);
-	if (link.gen == NULL || sc->ip.mp1.nbase < 2 ||
-	    smu_reg(sc, link.gen->reg_msg) + 4 > lim ||
-	    smu_reg(sc, link.gen->reg_arg) + 4 > lim ||
-	    smu_reg(sc, link.gen->reg_resp) + 4 > lim) {
+	*vramp = NULL;
+	l->sc = sc;
+	l->failed = false;
+	l->gen = smu_gen_find(sc);
+	if (l->gen == NULL || sc->ip.mp1.nbase < 2 ||
+	    smu_reg(sc, l->gen->reg_msg) + 4 > lim ||
+	    smu_reg(sc, l->gen->reg_arg) + 4 > lim ||
+	    smu_reg(sc, l->gen->reg_resp) + 4 > lim) {
 		device_printf(sc->dev, "smu: SMU %u.%u.%u: no generation "
 		    "table for it; not touching it\n", sc->ip.mp1.major,
 		    sc->ip.mp1.minor, sc->ip.mp1.rev);
@@ -399,42 +404,64 @@ amd_smu_init(struct atrium_amd_softc *sc)
 	    !gc_ok(sc, 0, GC12_GB_ADDR_CONFIG) ||
 	    !gc_ok(sc, 1, GC12_RLC_RLCS_BOOTLOAD_STATUS))
 		return (ENOTSUP);
-
 	rid = PCIR_BAR(0);
 	vram = bus_alloc_resource_any(sc->dev, SYS_RES_MEMORY, &rid, RF_ACTIVE);
 	if (vram == NULL ||
 	    rman_get_size(vram) < SMU_TABLE_VRAM_OFF + SMU_TABLE_SIZE) {
 		device_printf(sc->dev, "smu: BAR0 (VRAM window) unusable\n");
-		err = ENXIO;
-		goto out;
+		if (vram != NULL)
+			bus_release_resource(sc->dev, SYS_RES_MEMORY, rid, vram);
+		return (ENXIO);
 	}
 	fb_base = (uint64_t)(amd_mmio_read32(sc,
 	    ((bus_size_t)sc->ip.mmhub.base[0] + MMHUB4_FB_LOCATION_BASE) * 4) &
 	    MMHUB4_FB_BASE_MASK) << 24;
-	mc = fb_base + SMU_TABLE_VRAM_OFF;
+	*mcp = fb_base + SMU_TABLE_VRAM_OFF;
+	*vramp = vram;
+	*ridp = rid;
+	return (0);
+}
 
+/*
+ * Start the SMU (spec §4.3) and prove the card idle (A3.9): test messages,
+ * the driver table, the features (GC powers up; needs gc_up_ok), the
+ * required protections, then the GC idle sequence, AllowGfxOff and an idle
+ * telemetry sample within 5 s. Leaves GfxOff allowed. *ifverp gets the
+ * driver interface version for metrics. 0 only if the card was proven idle.
+ */
+static int
+smu_start(struct smu_link *lp, struct resource *vram, uint64_t mc,
+    uint32_t *ifverp)
+{
+	struct atrium_amd_softc *sc = lp->sc;
+	struct atrium_gpu_power_telemetry t;
+	uint64_t feat;
+	uint32_t v, ifver = 0;
+	int us, r, err = 0, gc_up_ok = 0, gfx_cg;
+
+#define	SEND(m, a, o)	smu_send(lp, (m), (a), (o), false)
 	device_printf(sc->dev, "smu: SMU %u.%u.%u, response register %#x\n",
 	    sc->ip.mp1.major, sc->ip.mp1.minor, sc->ip.mp1.rev,
-	    amd_mmio_read32(sc, smu_reg(sc, link.gen->reg_resp)));
+	    amd_mmio_read32(sc, smu_reg(sc, lp->gen->reg_resp)));
 	gc_report(sc, "before");
 
 	if (SEND(SMU_TEST, 0, &v) != SMU_RESP_OK ||
 	    SEND(SMU_GET_VERSION, 0, &v) != SMU_RESP_OK ||
 	    SEND(SMU_GET_DRIVER_IF, 0, &ifver) != SMU_RESP_OK) {
 		err = EIO;
-		goto out;
+		return (err);
 	}
 	bus_set_region_4(vram, SMU_TABLE_VRAM_OFF, 0, SMU_TABLE_SIZE / 4);
 	if (SEND(SMU_SET_DRIVER_ADDR_HI, (uint32_t)(mc >> 32), NULL) !=
 	    SMU_RESP_OK ||
 	    SEND(SMU_SET_DRIVER_ADDR_LO, (uint32_t)mc, NULL) != SMU_RESP_OK) {
 		err = EIO;
-		goto out;
+		return (err);
 	}
-	feat = smu_features(&link);
-	if (link.failed) {
+	feat = smu_features(lp);
+	if (lp->failed) {
 		err = EIO;
-		goto out;
+		return (err);
 	}
 	/*
 	 * Enabling the features powers GC up. Until the driver can bring GC
@@ -448,41 +475,41 @@ amd_smu_init(struct atrium_amd_softc *sc)
 		device_printf(sc->dev, "smu: features not running; enabling "
 		    "them powers GC up and the driver cannot idle it yet "
 		    "(power P2). Not enabling (hw.atrium_gpu.gc_up_ok=0)\n");
-		goto out;
+		return (err);
 	}
 	if (feat == 0) {
 		/* First start this boot: amdgpu's smc_hw_setup order. */
 		if (SEND(SMU_RUN_DC_BTC, 0, NULL) != SMU_RESP_OK) {
 			err = EIO;
-			goto out;
+			return (err);
 		}
 		/*
 		 * Under SCPM the PSP owns the feature mask and the PMFW
 		 * refuses the driver's with 0xFD; amdgpu skips it then.
 		 */
-		v = smu_send(&link, SMU_SET_ALLOWED_HI, 0xffffffff, NULL, true);
+		v = smu_send(lp, SMU_SET_ALLOWED_HI, 0xffffffff, NULL, true);
 		if (v == SMU_RESP_OK)
-			v = smu_send(&link, SMU_SET_ALLOWED_LO, 0xffffffff,
+			v = smu_send(lp, SMU_SET_ALLOWED_LO, 0xffffffff,
 			    NULL, true);
 		if (v == SMU_RESP_BAD_PREREQ)
 			device_printf(sc->dev, "smu: allowed mask refused: "
 			    "SCPM, the PSP owns it\n");
-		if (link.failed ||
+		if (lp->failed ||
 		    SEND(SMU_ENABLE_ALL, 0, NULL) != SMU_RESP_OK) {
 			err = EIO;
-			goto out;
+			return (err);
 		}
-		feat = smu_features(&link);
+		feat = smu_features(lp);
 	} else
 		device_printf(sc->dev, "smu: features already running this "
 		    "boot; not enabling again\n");
-	if ((feat & link.gen->required) != link.gen->required) {
+	if ((feat & lp->gen->required) != lp->gen->required) {
 		device_printf(sc->dev, "smu: required protection features "
 		    "missing (%#jx of %#jx); refusing the GPU\n",
-		    (uintmax_t)(feat & link.gen->required),
-		    (uintmax_t)link.gen->required);
+		    (uintmax_t)(feat & lp->gen->required),
+		    (uintmax_t)lp->gen->required);
 		err = EIO;
-		goto out;
+		return (err);
 	}
 	device_printf(sc->dev, "smu: protection features running (thermal "
 	    "trip, throttlers, fan, VR hot, memory temperature)\n");
@@ -503,9 +530,9 @@ amd_smu_init(struct atrium_amd_softc *sc)
 	 * Telemetry, read only (spec §4). Nothing is queued here, so a busy
 	 * or limit-bound card is reported (§A5 idle check).
 	 */
-	(void)smu_metrics(&link, vram, ifver, true, &t);
+	(void)smu_metrics(lp, vram, ifver, true, &t);
 	pause("smumet", hz);
-	(void)smu_sample(&link, vram, ifver, 1, "GC up, no idle setup");
+	(void)smu_sample(lp, vram, ifver, 1, "GC up, no idle setup");
 
 	/*
 	 * Spec A3.9: GC was powered up, so the family's idle sequence runs
@@ -517,14 +544,14 @@ amd_smu_init(struct atrium_amd_softc *sc)
 	 */
 	gfx_cg = 1;
 	TUNABLE_INT_FETCH("hw.atrium_gpu.gfx_cg", &gfx_cg);
-	if (!link.failed) {
+	if (!lp->failed) {
 		r = gfx_cg ? amd_gc_idle_enter(sc) : ECANCELED;
 
 		if (r != 0)
 			device_printf(sc->dev, "gfx: no idle sequence run "
 			    "(%d)\n", r);
 		(void)SEND(SMU_ALLOW_GFXOFF, 0, NULL);
-		if (smu_sample(&link, vram, ifver, 5, "idle check"))
+		if (smu_sample(lp, vram, ifver, 5, "idle check"))
 			device_printf(sc->dev, "smu: card proven idle\n");
 		else {
 			device_printf(sc->dev, "smu: could not prove the card "
@@ -533,6 +560,30 @@ amd_smu_init(struct atrium_amd_softc *sc)
 		}
 		amd_gfx12_pm_report(sc, "end");
 	}
+
+	*ifverp = ifver;
+	if (err == 0 && (lp->failed || gc_rd(sc, 0, GC12_GB_ADDR_CONFIG) == 0))
+		err = EIO;
+	return (err);
+#undef SEND
+}
+
+int
+amd_smu_init(struct atrium_amd_softc *sc)
+{
+	struct resource *vram = NULL;
+	uint64_t mc;
+	struct smu_link link;
+	uint32_t ifver = 0;
+	int rid, us, r, err = 0, gmc = 0, ih = 0, gfx = 0, gfx_r = -1, mes = 0;
+
+#define	SEND(m, a, o)	smu_send(&link, (m), (a), (o), false)
+	err = smu_open(sc, &link, &vram, &rid, &mc);
+	if (err != 0)
+		return (err);
+	err = smu_start(&link, vram, mc, &ifver);
+	if (err != 0)
+		goto out;
 
 	/*
 	 * Stage 4a (kenv hw.atrium_gpu.gmc=1): hubs + GART, with GC held
@@ -660,4 +711,213 @@ amd_smu_mode1_reset(struct atrium_amd_softc *sc)
 	    gc_ok(sc, 0, GC12_GB_ADDR_CONFIG) ?
 	    gc_rd(sc, 0, GC12_GB_ADDR_CONFIG) : 0);
 	return (err);
+}
+
+/* ---------------------------------------------------------------------------
+ * Stage 5a: the driver attached on silicon (docs/spec/r9700-bare-metal.md
+ * §4.5). Attach brings the card up (stages 3-4) and leaves it running: SMU,
+ * GART, GFX, IH, MES with a kernel compute queue. GfxOff is allowed while
+ * nothing is queued (nothing is, yet). A watcher samples telemetry every
+ * 5 s and, if the card is not idle three times running or the hotspot
+ * reaches SI_HOT_C, brings everything down and resets the card (A3.7). Detach
+ * proves MES survived the time attached (the 4e dispatch again), takes
+ * everything down, proves idle, then the mode 1 reset (A3.6).
+ */
+#define SI_WATCH_SECS		5
+#define SI_LOG_EVERY		6	/* log every 6th sample: 30 s */
+#define SI_HOT_C		95
+#define SI_BUSY_STRIKES		3
+
+struct amd_si {
+	struct atrium_amd_softc *sc;
+	struct smu_link link;
+	struct resource *vram;
+	int vram_rid;
+	uint64_t table_mc;
+	uint32_t ifver;
+	struct amd_gart gt;
+	bool gart_up;
+	struct amd_ih7 *ih;
+	struct mes *mes;
+	struct sx lock;			/* one SMU sender (A3.5) */
+	struct timeout_task watch;
+	bool stopping, lost;
+	u_int nsample, strikes;
+};
+
+/* Everything down to the GART, GfxOff disallowed meanwhile; then allowed. */
+static void
+si_down(struct amd_si *si, bool selftest)
+{
+	struct atrium_amd_softc *sc = si->sc;
+	int us;
+
+	(void)smu_send(&si->link, SMU_DISALLOW_GFXOFF, 0, NULL, false);
+	for (us = 0; us < GC_WAIT_US && gc_rd(sc, 0, GC12_GB_ADDR_CONFIG) == 0;
+	    us += 100)
+		DELAY(100);
+	if (si->mes != NULL) {
+		if (selftest)
+			device_printf(sc->dev, "si: dispatch after %u s "
+			    "attached: %s\n", si->nsample * SI_WATCH_SECS,
+			    amd_mes12_selftest(si->mes) == 0 ? "PASS" :
+			    "FAILED");
+		if (si->ih != NULL)
+			device_printf(sc->dev, "si: %d CP EOP IV(s) since "
+			    "attach, %u interrupt(s)\n",
+			    amd_ih7_drain_eop(si->ih, 8),
+			    amd_ih7_nintr(si->ih));
+		amd_mes12_down(si->mes);
+		si->mes = NULL;
+	}
+	amd_ih7_down(si->ih);
+	si->ih = NULL;
+	if (si->gart_up) {
+		amd_gmc12_gart_disable(&si->gt);
+		si->gart_up = false;
+	}
+	(void)smu_send(&si->link, SMU_ALLOW_GFXOFF, 0, NULL, false);
+}
+
+static void
+si_watch(void *arg, int pending __unused)
+{
+	struct amd_si *si = arg;
+	struct atrium_amd_softc *sc = si->sc;
+	struct atrium_gpu_power_telemetry t;
+	bool ok, hot = false, busy = false, log;
+
+	sx_xlock(&si->lock);
+	if (si->stopping || si->lost) {
+		sx_xunlock(&si->lock);
+		return;
+	}
+	si->nsample++;
+	log = si->nsample % SI_LOG_EVERY == 0;
+	ok = smu_metrics(&si->link, si->vram, si->ifver, false, &t);
+	if (ok) {
+		hot = t.hotspot_c != 0xffff && t.hotspot_c >= SI_HOT_C;
+		busy = atrium_gpu_power_idle_suspicious(&t);
+		si->strikes = busy ? si->strikes + 1 : 0;
+	}
+	if (log || !ok || hot || busy)
+		device_printf(sc->dev, "si: watch #%u: %s%s%s\n", si->nsample,
+		    ok ? "telemetry ok" : "no telemetry", hot ? ", HOT" : "",
+		    busy ? ", busy with no work queued" : "");
+	if (si->link.failed || hot || si->strikes >= SI_BUSY_STRIKES) {
+		device_printf(sc->dev, "si: %s; taking the GPU down and "
+		    "resetting it (A3.7)\n", si->link.failed ? "SMU link "
+		    "failed" : hot ? "hotspot at the limit" : "not idle "
+		    "with no work queued");
+		if (!si->link.failed)
+			si_down(si, false);
+		(void)amd_smu_mode1_reset(sc);
+		si->lost = true;
+	} else
+		taskqueue_enqueue_timeout(taskqueue_thread, &si->watch,
+		    SI_WATCH_SECS * hz);
+	sx_xunlock(&si->lock);
+}
+
+int
+amd_si_attach(struct atrium_amd_softc *sc)
+{
+	struct amd_si *si;
+	int err, us;
+
+	si = malloc(sizeof(*si), M_DEVBUF, M_WAITOK | M_ZERO);
+	si->sc = sc;
+	sx_init(&si->lock, "atrium-gpu-si");
+	TIMEOUT_TASK_INIT(taskqueue_thread, &si->watch, 0, si_watch, si);
+
+	err = smu_open(sc, &si->link, &si->vram, &si->vram_rid,
+	    &si->table_mc);
+	if (err != 0)
+		goto fail;
+	err = smu_start(&si->link, si->vram, si->table_mc, &si->ifver);
+	if (err != 0)
+		goto fail;
+
+	/* Stages 4a-4e, GfxOff held off while we set GC up. */
+	(void)smu_send(&si->link, SMU_DISALLOW_GFXOFF, 0, NULL, false);
+	for (us = 0; us < GC_WAIT_US && gc_rd(sc, 0, GC12_GB_ADDR_CONFIG) == 0;
+	    us += 100)
+		DELAY(100);
+	if ((err = amd_gmc12_gart_enable(sc, si->vram, &si->gt)) != 0)
+		goto down;
+	si->gart_up = true;
+	if ((err = amd_gfx12_setup(sc)) != 0)
+		goto down;
+	if ((err = amd_ih7_up(sc, &si->gt, &si->ih)) != 0)
+		goto down;
+	if ((err = amd_mes12_up(sc, &si->gt, true, &si->mes)) != 0)
+		goto down;
+	err = amd_mes12_selftest(si->mes);
+	device_printf(sc->dev, "si: dispatch at attach: %s; %d CP EOP IV(s)\n",
+	    err == 0 ? "PASS" : "FAILED", amd_ih7_drain_eop(si->ih, 8));
+	if (err != 0)
+		goto down;
+	(void)smu_send(&si->link, SMU_ALLOW_GFXOFF, 0, NULL, false);
+	if (!smu_sample(&si->link, si->vram, si->ifver, 5,
+	    "attached, MES up, no work")) {
+		device_printf(sc->dev, "si: could not prove the card idle "
+		    "while attached (A3.9)\n");
+		err = EIO;
+		goto down;
+	}
+	if (si->link.failed) {
+		err = EIO;
+		goto down;
+	}
+	sc->si = si;
+	taskqueue_enqueue_timeout(taskqueue_thread, &si->watch,
+	    SI_WATCH_SECS * hz);
+	device_printf(sc->dev, "si: stage 5a: attached and idle (MES up, "
+	    "kernel compute queue ready); watching telemetry every %d s\n",
+	    SI_WATCH_SECS);
+	return (0);
+
+down:
+	si_down(si, false);
+fail:
+	device_printf(sc->dev, "si: stage 5a: attach failed (%d)\n", err);
+	if (si->vram != NULL)
+		bus_release_resource(sc->dev, SYS_RES_MEMORY, si->vram_rid,
+		    si->vram);
+	sx_destroy(&si->lock);
+	free(si, M_DEVBUF);
+	return (err);
+}
+
+/* Detach: everything down, idle proven, the caller resets the card. */
+void
+amd_si_detach(struct atrium_amd_softc *sc)
+{
+	struct amd_si *si = sc->si;
+
+	if (si == NULL)
+		return;
+	sx_xlock(&si->lock);
+	si->stopping = true;
+	sx_xunlock(&si->lock);
+	while (taskqueue_cancel_timeout(taskqueue_thread, &si->watch,
+	    NULL) != 0)
+		taskqueue_drain_timeout(taskqueue_thread, &si->watch);
+	if (!si->lost && !si->link.failed) {
+		si_down(si, true);
+		if (smu_sample(&si->link, si->vram, si->ifver, 5,
+		    "detached"))
+			device_printf(sc->dev, "si: card proven idle at "
+			    "detach\n");
+		else
+			device_printf(sc->dev, "si: card NOT idle at detach\n");
+	} else
+		device_printf(sc->dev, "si: detach after the GPU was taken "
+		    "down (%s)\n", si->lost ? "watcher reset it" :
+		    "SMU link failed");
+	bus_release_resource(sc->dev, SYS_RES_MEMORY, si->vram_rid, si->vram);
+	sc->si = NULL;
+	sx_destroy(&si->lock);
+	free(si, M_DEVBUF);
+	device_printf(sc->dev, "si: stage 5a: detached\n");
 }

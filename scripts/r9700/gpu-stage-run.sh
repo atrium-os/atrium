@@ -2,12 +2,13 @@
 # gpu-stage-run.sh: one silicon bring-up run of atrium_gpu_amd_pci on the
 # R9700 box, done in a single ssh call (docs/spec/r9700-bare-metal.md).
 #
-#   gpu-stage-run.sh <sha256> <stage>...     stages: 3 4a 4b 4c 4d 4e
+#   gpu-stage-run.sh <sha256> <stage>...     stages: 3 4a 4b 4c 4d 4e 5a
 #
 # The kmod must already be at /root/kmod/atrium_gpu_amd_pci.ko. The script
 # checks its sha256, probes before, clears the kernel message buffer, sets
 # the kenvs for the stages, loads the module and hands it the GPU (attach
-# ends in ENXIO after the mode 1 reset, as designed), saves the kernel log,
+# ends in ENXIO after the mode 1 reset, as designed; with stage 5a it stays
+# attached for 60 s with telemetry watched, then detaches), saves the kernel log,
 # gives the GPU back to vgapci, unsets the kenvs, unloads, probes after, and
 # takes one temperature reading 30 s later. The whole report is printed and
 # kept in /root/runs/. It never sets keep_state, gfx_cg or mode1_reset.
@@ -20,12 +21,13 @@ KO=/root/kmod/atrium_gpu_amd_pci.ko
 PROBE=/root/atrium-gpu-probe
 GPU_SEL=pci0:3:0:0
 GPU_DEV=vgapci0
-KNOBS="psp_bootload psp_ipfw smu_init gc_up_ok gmc ih gfx mes dispatch"
+KNOBS="psp_bootload psp_ipfw smu_init gc_up_ok gmc ih gfx mes dispatch attach mes_mscratch"
 
 [ $# -ge 2 ] || { echo "usage: $0 <sha256> <stage>..." >&2; exit 2; }
 want=$1; shift
 
 kenvs=""
+hold=0
 for s in "$@"; do
 	case $s in
 	3)  kenvs="$kenvs psp_bootload psp_ipfw smu_init gc_up_ok" ;;
@@ -34,6 +36,7 @@ for s in "$@"; do
 	4c) kenvs="$kenvs gfx" ;;
 	4d) kenvs="$kenvs mes" ;;
 	4e) kenvs="$kenvs dispatch" ;;	# needs 4d
+	5a) kenvs="$kenvs psp_bootload psp_ipfw gc_up_ok attach"; hold=60 ;;
 	*)  echo "unknown stage $s" >&2; exit 2 ;;
 	esac
 done
@@ -66,7 +69,15 @@ sysctl kern.msgbuf_clear=1 >/dev/null
 for k in $kenvs; do kenv -q hw.atrium_gpu.$k=1 >/dev/null; done
 echo "== kldload"
 kldload "$KO"; echo "kldload rc=$?"
-devctl set driver -f "$GPU_DEV" atrium_gpu_amd_pci; echo "attach rc=$? (ENXIO expected)"
+if [ "$hold" -gt 0 ]; then
+	devctl set driver -f "$GPU_DEV" atrium_gpu_amd_pci; echo "attach rc=$? (0 expected: stays attached)"
+	echo "== attached, holding ${hold} s"; temps
+	sleep "$hold"
+	echo "== after ${hold} s attached"; temps
+	devctl set driver -f "$GPU_SEL" vgapci; echo "detach + give-back rc=$?"
+else
+	devctl set driver -f "$GPU_DEV" atrium_gpu_amd_pci; echo "attach rc=$? (ENXIO expected)"
+fi
 echo "== kernel log"
 dmesg | sed -n '/atrium_gpu_amd/,$p'
 echo "stray lines: $(dmesg | grep -ci stray)"

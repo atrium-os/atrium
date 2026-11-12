@@ -122,6 +122,15 @@ static const struct mes_gen mes_gens[] = {
 #define WB_QUERY_FENCE		0x28
 #define BLK_RES1(p)		(0x5000u + (p) * 0x1000u)
 #define BLK_SIZE		0x7000u
+/*
+ * Per-pipe MSCRATCH (amdgpu's event-log layout without the log part):
+ * zeroed and programmed into CP_MES_MSCRATCH before every unhalt, as
+ * mainline mes_v12_0_enable does, so the firmware never walks stale
+ * pointers or address 0 at activation (lead for the intermittent pipe
+ * start, 2026-11-12). kenv hw.atrium_gpu.mes_mscratch=0 leaves it 0.
+ */
+#define MES_SCRATCH_VA		0x00100000ull
+#define MES_SCRATCH_SIZE	0x40000u	/* AMDGPU_MES_MSCRATCH_SIZE */
 #define RING_BYTES		4096u
 #define RING_DW			(RING_BYTES / 4)
 #define MES_EOP_SIZE		2048u
@@ -238,6 +247,10 @@ struct mes {
 	uint32_t cpc_int_cntl[2];	/* as found, restored on teardown */
 	bool sched_mapped;		/* pipe 0's queue mapped by MES */
 	bool dispatch;			/* stage 4e: keep MEC1 queue 0 */
+	uint16_t pci_cmd;		/* as found, restored on down */
+	uint8_t *scratch;		/* 2 x MES_SCRATCH_SIZE, or NULL */
+	vm_paddr_t scratch_pa;
+	uint64_t scratch_va;
 	struct mes_ring r[2];	/* index = pipe */
 };
 
@@ -562,8 +575,16 @@ mes_enable(struct mes *m, bool on)
 		wr(m, g->cp_mes_cntl, d);
 		return;
 	}
+	if (m->scratch != NULL)
+		memset(m->scratch, 0, 2 * MES_SCRATCH_SIZE);
 	for (p = 0; p < 2; p++) {
 		grbm_select(m, 3, p);
+		if (m->scratch != NULL) {
+			uint64_t va = m->scratch_va + p * MES_SCRATCH_SIZE;
+
+			wr(m, g->mscratch_lo, (uint32_t)va);
+			wr(m, g->mscratch_hi, (uint32_t)(va >> 32));
+		}
 		d = rd(m, g->cp_mes_cntl);
 		wr(m, g->cp_mes_cntl, d | (p == 0 ? MES_PIPE0_RESET :
 		    MES_PIPE1_RESET));
@@ -1108,6 +1129,8 @@ out_unmap:
 	return (err);
 }
 
+static void mes_free(struct mes *m);
+
 static int
 mes_fw_start(struct mes *m)
 {
@@ -1218,6 +1241,8 @@ mes_run(struct mes *m)
 		    "no queues made active\n");
 		return (ENXIO);
 	}
+	device_printf(sc->dev, "mes: started on attempt %d of 3%s\n", attempt,
+	    attempt > 1 ? " (retry used)" : "");
 	mes_report(m, "started");
 
 	/* Pipe 1 (KIQ): MQD and HQD by register. */
@@ -1258,106 +1283,191 @@ mes_run(struct mes *m)
 }
 
 /*
- * Stage 4d test: MES up and answering, then halted. GC powered, hubs and
- * GART up (4a), GFX set up with the CP halted (4c). Run inside the IH test
- * (4b) to catch MES's completion interrupts. Undone by the halt here and
- * the mode 1 reset after.
+ * MES up and answering (stage 4d's bring-up), left running: the block in
+ * the GART, the doorbell BAR, both pipes, the scheduler queue. `kq`: keep
+ * MEC1 pipe 0 queue 0 for a kernel compute queue (4e, the attached driver).
+ * GC powered, hubs and GART up (4a), GFX set up with the CP halted (4c).
+ * On error everything this did is undone and *out is NULL.
  */
 int
-amd_mes12_test(struct atrium_amd_softc *sc, struct amd_gart *gt)
+amd_mes12_up(struct atrium_amd_softc *sc, struct amd_gart *gt, bool kq,
+    struct mes **out)
 {
-	struct mes m;
+	struct mes *m;
 	uint32_t i;
-	uint16_t pci_cmd;
-	int err, disp = 0;
+	int err, scratch;
 
-	memset(&m, 0, sizeof(m));
-	m.sc = sc;
-	m.gt = gt;
-	TUNABLE_INT_FETCH("hw.atrium_gpu.dispatch", &disp);
-	m.dispatch = disp != 0;
-	m.g = mes_gen_find(sc);
-	if (m.g == NULL) {
+	*out = NULL;
+	m = malloc(sizeof(*m), M_DEVBUF, M_WAITOK | M_ZERO);
+	m->sc = sc;
+	m->gt = gt;
+	m->dispatch = kq;
+	m->g = mes_gen_find(sc);
+	if (m->g == NULL) {
 		device_printf(sc->dev, "mes: no table for GC %u.%u.%u; not "
 		    "touching it\n", sc->ip.gc.major, sc->ip.gc.minor,
 		    sc->ip.gc.rev);
+		free(m, M_DEVBUF);
 		return (ENOTSUP);
 	}
-	if (!gt->enabled)
+	if (!gt->enabled) {
+		free(m, M_DEVBUF);
 		return (ENXIO);
-	if ((err = mes_fw_start(&m)) != 0)
-		return (err);
-	m.r[0].pipe = 0;
-	m.r[0].db = m.g->db_pipe0;
-	m.r[1].pipe = 1;
-	m.r[1].db = m.g->db_pipe1;
-
-	m.dbrid = PCIR_BAR(2);
-	m.dbbar = bus_alloc_resource_any(sc->dev, SYS_RES_MEMORY, &m.dbrid,
-	    RF_ACTIVE);
-	if (m.dbbar == NULL || rman_get_size(m.dbbar) <
-	    (bus_size_t)(m.g->db_aggregated + 16) * 4) {
-		device_printf(sc->dev, "mes: doorbell BAR unusable\n");
-		err = ENXIO;
-		goto out_bar;
 	}
-	m.blk = contigmalloc(BLK_SIZE, M_DEVBUF, M_WAITOK | M_ZERO, 0,
+	if ((err = mes_fw_start(m)) != 0) {
+		free(m, M_DEVBUF);
+		return (err);
+	}
+	m->r[0].pipe = 0;
+	m->r[0].db = m->g->db_pipe0;
+	m->r[1].pipe = 1;
+	m->r[1].db = m->g->db_pipe1;
+
+	m->dbrid = PCIR_BAR(2);
+	m->dbbar = bus_alloc_resource_any(sc->dev, SYS_RES_MEMORY, &m->dbrid,
+	    RF_ACTIVE);
+	if (m->dbbar == NULL || rman_get_size(m->dbbar) <
+	    (bus_size_t)(m->g->db_aggregated + 16) * 4) {
+		device_printf(sc->dev, "mes: doorbell BAR unusable\n");
+		if (m->dbbar != NULL)
+			bus_release_resource(sc->dev, SYS_RES_MEMORY, m->dbrid,
+			    m->dbbar);
+		free(m, M_DEVBUF);
+		return (ENXIO);
+	}
+	m->blk = contigmalloc(BLK_SIZE, M_DEVBUF, M_WAITOK | M_ZERO, 0,
 	    ~(vm_paddr_t)0, PAGE_SIZE, 0);
-	m.blk_pa = vtophys(m.blk);
-	m.va = gt->gart_start + MES_GART_VA;
+	m->blk_pa = vtophys(m->blk);
+	m->va = gt->gart_start + MES_GART_VA;
 	for (i = 0; i < BLK_SIZE / PAGE_SIZE; i++)
-		(void)amd_gmc12_gart_map(gt, m.va + i * PAGE_SIZE,
-		    m.blk_pa + i * PAGE_SIZE);
-	if ((err = amd_gmc12_flush(gt)) != 0)
-		goto out_unmap;
+		(void)amd_gmc12_gart_map(gt, m->va + i * PAGE_SIZE,
+		    m->blk_pa + i * PAGE_SIZE);
+	scratch = 1;
+	TUNABLE_INT_FETCH("hw.atrium_gpu.mes_mscratch", &scratch);
+	if (scratch) {
+		m->scratch = contigmalloc(2 * MES_SCRATCH_SIZE, M_DEVBUF,
+		    M_WAITOK | M_ZERO, 0, ~(vm_paddr_t)0, PAGE_SIZE, 0);
+		m->scratch_pa = vtophys(m->scratch);
+		m->scratch_va = gt->gart_start + MES_SCRATCH_VA;
+		for (i = 0; i < 2 * MES_SCRATCH_SIZE / PAGE_SIZE; i++)
+			(void)amd_gmc12_gart_map(gt, m->scratch_va +
+			    i * PAGE_SIZE, m->scratch_pa + i * PAGE_SIZE);
+		device_printf(sc->dev, "mes: MSCRATCH 2 x %u KiB at GART "
+		    "%#jx, zeroed before every start\n", MES_SCRATCH_SIZE >> 10,
+		    (uintmax_t)m->scratch_va);
+	}
+	if ((err = amd_gmc12_flush(gt)) != 0) {
+		mes_free(m);
+		return (err);
+	}
 	device_printf(sc->dev, "mes: %s, start %#jx, block at GART %#jx (pa "
-	    "%#jx), doorbell BAR %ju KiB\n", m.g->name, (uintmax_t)m.uc_start,
-	    (uintmax_t)m.va, (uintmax_t)m.blk_pa,
-	    (uintmax_t)(rman_get_size(m.dbbar) >> 10));
+	    "%#jx), doorbell BAR %ju KiB\n", m->g->name, (uintmax_t)m->uc_start,
+	    (uintmax_t)m->va, (uintmax_t)m->blk_pa,
+	    (uintmax_t)(rman_get_size(m->dbbar) >> 10));
 
 	/* MES reads its rings and writes fences in system memory. */
-	pci_cmd = pci_read_config(sc->dev, PCIR_COMMAND, 2);
+	m->pci_cmd = pci_read_config(sc->dev, PCIR_COMMAND, 2);
 	pci_enable_busmaster(sc->dev);
-	err = mes_run(&m);
-	mes_report(&m, err == 0 ? "answered" : "failed");
-	/* Stage 4e (kenv hw.atrium_gpu.dispatch=1): the first dispatch. */
-	if (m.dispatch && err == 0)
-		(void)dispatch_run(&m);
-	else if (m.dispatch)
-		device_printf(sc->dev, "dispatch: stage 4e needs MES up; "
-		    "skipped\n");
-	(void)grbm_watch(&m, "MES running, no work", 500);
-	amd_gfx12_pm_report(sc, "MES running");
-	mes_teardown(&m);
-	mes_report(&m, "torn down");
-	amd_gfx12_pm_report(sc, "MES torn down");
-	(void)grbm_watch(&m, "MES halted", 500);
-	/*
-	 * Box run 84bd8b3f: once MES had run, RLC_STAT fell from 0x35 to 0 and
-	 * GRBM_STATUS kept GUI_ACTIVE|CP_BUSY|ANY_ACTIVE after the halt; the
-	 * card stayed at 60 W. Redo the GC idle sequence (SRM + clock gating)
-	 * so the idle check after stage 4 sees whether that brings it back.
-	 */
-	device_printf(sc->dev, "mes: GC idle sequence again after MES: %d\n",
-	    amd_gc_idle_enter(sc));
-	DELAY(100000);
-	amd_gfx12_pm_report(sc, "100 ms after the idle sequence");
-	if ((pci_cmd & PCIM_CMD_BUSMASTEREN) == 0)
-		pci_disable_busmaster(sc->dev);
-	device_printf(sc->dev, "mes: stage 4d: %s\n", err == 0 ?
-	    "MES up, both pipes answered" : "FAILED");
-out_unmap:
+	err = mes_run(m);
+	mes_report(m, err == 0 ? "answered" : "failed");
+	if (err != 0) {
+		amd_mes12_down(m);
+		return (err);
+	}
+	*out = m;
+	return (0);
+}
+
+/* The 4e dispatch (write_42 through a kernel compute queue), MES up. */
+int
+amd_mes12_selftest(struct mes *m)
+{
+	if (!m->dispatch)
+		return (ENOTSUP);
+	return (dispatch_run(m));
+}
+
+/* Unmap the block and free it, release the doorbell BAR. */
+static void
+mes_free(struct mes *m)
+{
+	struct amd_gart *gt = m->gt;
+	uint32_t i;
+
 	for (i = 0; i < BLK_SIZE / PAGE_SIZE; i++) {
-		uint64_t idx = (m.va - gt->gart_start) / PAGE_SIZE + i;
+		uint64_t idx = (m->va - gt->gart_start) / PAGE_SIZE + i;
 
 		bus_write_4(gt->vram, gt->table_off + idx * 8, 0);
 		bus_write_4(gt->vram, gt->table_off + idx * 8 + 4, 0);
 	}
+	if (m->scratch != NULL) {
+		for (i = 0; i < 2 * MES_SCRATCH_SIZE / PAGE_SIZE; i++) {
+			uint64_t idx = (m->scratch_va - gt->gart_start) /
+			    PAGE_SIZE + i;
+
+			bus_write_4(gt->vram, gt->table_off + idx * 8, 0);
+			bus_write_4(gt->vram, gt->table_off + idx * 8 + 4, 0);
+		}
+	}
 	(void)amd_gmc12_flush(gt);
-	contigfree(m.blk, BLK_SIZE, M_DEVBUF);
-out_bar:
-	if (m.dbbar != NULL)
-		bus_release_resource(sc->dev, SYS_RES_MEMORY, m.dbrid,
-		    m.dbbar);
+	contigfree(m->blk, BLK_SIZE, M_DEVBUF);
+	if (m->scratch != NULL)
+		contigfree(m->scratch, 2 * MES_SCRATCH_SIZE, M_DEVBUF);
+	bus_release_resource(m->sc->dev, SYS_RES_MEMORY, m->dbrid, m->dbbar);
+	free(m, M_DEVBUF);
+}
+
+/*
+ * Undo amd_mes12_up: queues removed, MES and CP halted, the GC idle
+ * sequence again (box run 84bd8b3f: after MES the RLC needs it to idle),
+ * then the block freed.
+ */
+void
+amd_mes12_down(struct mes *m)
+{
+	struct atrium_amd_softc *sc;
+
+	if (m == NULL)
+		return;
+	sc = m->sc;
+	(void)grbm_watch(m, "MES running, no work", 500);
+	amd_gfx12_pm_report(sc, "MES running");
+	mes_teardown(m);
+	mes_report(m, "torn down");
+	amd_gfx12_pm_report(sc, "MES torn down");
+	(void)grbm_watch(m, "MES halted", 500);
+	device_printf(sc->dev, "mes: GC idle sequence again after MES: %d\n",
+	    amd_gc_idle_enter(sc));
+	DELAY(100000);
+	amd_gfx12_pm_report(sc, "100 ms after the idle sequence");
+	if ((m->pci_cmd & PCIM_CMD_BUSMASTEREN) == 0)
+		pci_disable_busmaster(sc->dev);
+	mes_free(m);
+}
+
+/*
+ * Stage 4d test: MES up and answering, then halted; 4e's dispatch in
+ * between when kenv hw.atrium_gpu.dispatch=1. Run inside the IH test (4b)
+ * to catch MES's completion interrupts. Undone by the halt here and the
+ * mode 1 reset after.
+ */
+int
+amd_mes12_test(struct atrium_amd_softc *sc, struct amd_gart *gt)
+{
+	struct mes *m;
+	int err, disp = 0;
+
+	TUNABLE_INT_FETCH("hw.atrium_gpu.dispatch", &disp);
+	err = amd_mes12_up(sc, gt, disp != 0, &m);
+	/* Stage 4e (kenv hw.atrium_gpu.dispatch=1): the first dispatch. */
+	if (disp && err == 0)
+		(void)amd_mes12_selftest(m);
+	else if (disp)
+		device_printf(sc->dev, "dispatch: stage 4e needs MES up; "
+		    "skipped\n");
+	if (m != NULL)
+		amd_mes12_down(m);
+	device_printf(sc->dev, "mes: stage 4d: %s\n", err == 0 ?
+	    "MES up, both pipes answered" : "FAILED");
 	return (err);
 }

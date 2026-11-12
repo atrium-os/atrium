@@ -40,7 +40,12 @@
 
 #define IH_RING_SIZE		(64u << 10)	/* 2048 IVs */
 #define IH_IV_SIZE		32u
-#define IH_GART_RING		0x00000000ull	/* GART addresses we use */
+/*
+ * GART addresses we use. Page 0 stays unmapped (reads go to the dummy page),
+ * so firmware that dereferences address 0 never sees live IVs (the MES
+ * MSCRATCH lead, 2026-11-12).
+ */
+#define IH_GART_RING		0x00001000ull
 #define IH_GART_WB		(IH_GART_RING + IH_RING_SIZE)
 
 /* IH_RB_CNTL fields (osssys_7_0_0_sh_mask.h). */
@@ -388,27 +393,26 @@ ih7_selftest(struct amd_ih7 *ih)
 		    ih->nintr - before, ih->kind);
 }
 
+static void ih7_unmap_free(struct amd_ih7 *ih);
+
 /*
- * Stage 4b test: ring 0 through the GART, MSI-X, self-test, then all of it
- * undone. `during`, if not NULL, runs while the ring is live (stage 4d: MES,
- * whose API fences raise CP EOP interrupts, the IH's first real source). The GART (4a) must be enabled; the caller tears the GART down
- * after this returns.
+ * Ring 0 through the GART and MSI-X, enabled (ih_v7_0_irq_init). The GART
+ * (4a) must be up. On success *out holds the live ring; amd_ih7_down undoes
+ * it. Used by the stage 4b test and by the attached driver (stage 5a).
  */
 int
-amd_ih7_test(struct atrium_amd_softc *sc, struct amd_gart *gt,
-    int (*during)(struct atrium_amd_softc *, struct amd_gart *))
+amd_ih7_up(struct atrium_amd_softc *sc, struct amd_gart *gt,
+    struct amd_ih7 **out)
 {
-	struct amd_ih7 ih;
+	struct amd_ih7 *ihp;
 	const struct ih_gen *g;
 	device_t dev = sc->dev;
 	uint64_t ring_va, wb_va;
 	uint32_t c, i;
 	int err;
 
-	memset(&ih, 0, sizeof(ih));
-	ih.sc = sc;
-	ih.gt = gt;
-	g = ih.g = ih_gen_find(sc);
+	*out = NULL;
+	g = ih_gen_find(sc);
 	if (g == NULL) {
 		device_printf(dev, "ih: no table for OSSSYS %u.%u; not "
 		    "touching it\n", sc->ip.osssys.major, sc->ip.osssys.minor);
@@ -416,6 +420,11 @@ amd_ih7_test(struct atrium_amd_softc *sc, struct amd_gart *gt,
 	}
 	if (!gt->enabled)
 		return (ENXIO);
+	ihp = malloc(sizeof(*ihp), M_DEVBUF, M_WAITOK | M_ZERO);
+#define ih (*ihp)
+	ih.sc = sc;
+	ih.gt = gt;
+	ih.g = g;
 
 	ih.ring = (volatile uint32_t *)contigmalloc(IH_RING_SIZE, M_DEVBUF, M_WAITOK | M_ZERO, 0,
 	    ~(vm_paddr_t)0, PAGE_SIZE, 0);
@@ -430,10 +439,12 @@ amd_ih7_test(struct atrium_amd_softc *sc, struct amd_gart *gt,
 		    ih.ring_pa + i * PAGE_SIZE);
 	(void)amd_gmc12_gart_map(gt, wb_va, ih.wb_pa);
 	err = amd_gmc12_flush(gt);
-	if (err != 0)
-		goto out_unmap;
+	if (err != 0) {
+		ih7_unmap_free(ihp);
+		return (err);
+	}
 
-	/* The IH writes system memory: bus mastering on for the test. */
+	/* The IH writes system memory: bus mastering on while it runs. */
 	ih.pci_cmd = pci_read_config(dev, PCIR_COMMAND, 2);
 	pci_enable_busmaster(dev);
 
@@ -478,36 +489,19 @@ amd_ih7_test(struct atrium_amd_softc *sc, struct amd_gart *gt,
 	c = ihr(&ih, g->rb_cntl) & ~WPTR_OVERFLOW_CLEAR;
 	ihw(&ih, g->rb_cntl, c | RB_ENABLE | ENABLE_INTR);
 	ih7_report(&ih, "enabled");
+#undef ih
+	*out = ihp;
+	return (0);
+}
 
-	/* Anything already queued by other clients: log it, then self-test. */
-	DELAY(10000);
-	(void)ih7_drain(&ih, 0x100, 0x100, 16);
-	ih7_selftest(&ih);
-	if (during != NULL) {
-		uint32_t before = ih.nintr;
-		int derr, seen;
+/* Unmap (zero PTEs fault to the dummy page) and free the ring pages. */
+static void
+ih7_unmap_free(struct amd_ih7 *ih)
+{
+	struct amd_gart *gt = ih->gt;
+	uint64_t ring_va = gt->gart_start + IH_GART_RING;
+	uint32_t i;
 
-		derr = during(sc, gt);
-		DELAY(10000);
-		seen = ih7_drain(&ih, IH_CLIENT_GRBM_CP, IH_SRC_CP_EOP, 32);
-		ih7_report(&ih, "after stage 4d");
-		device_printf(dev, "ih: stage 4d: %d CP EOP IV(s) (client %#x "
-		    "src %u), %u %s interrupt(s): %s\n", seen,
-		    IH_CLIENT_GRBM_CP, IH_SRC_CP_EOP, ih.nintr - before, ih.kind,
-		    seen > 0 ? "IH write path PASS" : derr != 0 ?
-		    "MES failed, no verdict" : "none (MES fence IRQs off?)");
-	}
-
-	/* Undo: ring off, wait, vector off (ih_v7_0_irq_disable). */
-	ih7_ring_off(&ih);
-	DELAY(1000);
-	ih7_report(&ih, "disabled");
-	ih7_msi_teardown(&ih);
-	if ((ih.pci_cmd & PCIM_CMD_BUSMASTEREN) == 0)
-		pci_disable_busmaster(dev);
-	err = 0;
-out_unmap:
-	/* Unmap: zero PTEs read as invalid and fault to the dummy page. */
 	for (i = 0; i <= IH_RING_SIZE / PAGE_SIZE; i++) {
 		bus_write_4(gt->vram, gt->table_off +
 		    ((ring_va - gt->gart_start) >> PAGE_SHIFT) * 8 + i * 8, 0);
@@ -516,8 +510,81 @@ out_unmap:
 		    0);
 	}
 	(void)amd_gmc12_flush(gt);
-	contigfree(__DEVOLATILE(void *, ih.ring), IH_RING_SIZE, M_DEVBUF);
-	contigfree(__DEVOLATILE(void *, ih.wb), PAGE_SIZE, M_DEVBUF);
-	device_printf(dev, "ih: stage 4b: %d\n", err);
-	return (err);
+	contigfree(__DEVOLATILE(void *, ih->ring), IH_RING_SIZE, M_DEVBUF);
+	contigfree(__DEVOLATILE(void *, ih->wb), PAGE_SIZE, M_DEVBUF);
+	free(ih, M_DEVBUF);
+}
+
+/* Ring off, wait, vector off (ih_v7_0_irq_disable), then unmap and free. */
+void
+amd_ih7_down(struct amd_ih7 *ih)
+{
+	device_t dev;
+
+	if (ih == NULL)
+		return;
+	dev = ih->sc->dev;
+	ih7_ring_off(ih);
+	DELAY(1000);
+	ih7_report(ih, "disabled");
+	ih7_msi_teardown(ih);
+	if ((ih->pci_cmd & PCIM_CMD_BUSMASTEREN) == 0)
+		pci_disable_busmaster(dev);
+	ih7_unmap_free(ih);
+}
+
+/* Drain the ring, counting CP end-of-pipe IVs (logs up to max_log). */
+int
+amd_ih7_drain_eop(struct amd_ih7 *ih, int max_log)
+{
+	return (ih7_drain(ih, IH_CLIENT_GRBM_CP, IH_SRC_CP_EOP, max_log));
+}
+
+u_int
+amd_ih7_nintr(struct amd_ih7 *ih)
+{
+	return (ih->nintr);
+}
+
+/*
+ * Stage 4b test: ring 0 through the GART, MSI-X, self-test, then all of it
+ * undone. `during`, if not NULL, runs while the ring is live (stage 4d: MES,
+ * whose API fences raise CP EOP interrupts, the IH's first real source). The
+ * GART (4a) must be enabled; the caller tears the GART down after this
+ * returns.
+ */
+int
+amd_ih7_test(struct atrium_amd_softc *sc, struct amd_gart *gt,
+    int (*during)(struct atrium_amd_softc *, struct amd_gart *))
+{
+	struct amd_ih7 *ih;
+	device_t dev = sc->dev;
+	int err;
+
+	err = amd_ih7_up(sc, gt, &ih);
+	if (err != 0) {
+		device_printf(dev, "ih: stage 4b: %d\n", err);
+		return (err);
+	}
+	/* Anything already queued by other clients: log it, then self-test. */
+	DELAY(10000);
+	(void)ih7_drain(ih, 0x100, 0x100, 16);
+	ih7_selftest(ih);
+	if (during != NULL) {
+		uint32_t before = ih->nintr;
+		int derr, seen;
+
+		derr = during(sc, gt);
+		DELAY(10000);
+		seen = ih7_drain(ih, IH_CLIENT_GRBM_CP, IH_SRC_CP_EOP, 32);
+		ih7_report(ih, "after stage 4d");
+		device_printf(dev, "ih: stage 4d: %d CP EOP IV(s) (client %#x "
+		    "src %u), %u %s interrupt(s): %s\n", seen,
+		    IH_CLIENT_GRBM_CP, IH_SRC_CP_EOP, ih->nintr - before,
+		    ih->kind, seen > 0 ? "IH write path PASS" : derr != 0 ?
+		    "MES failed, no verdict" : "none (MES fence IRQs off?)");
+	}
+	amd_ih7_down(ih);
+	device_printf(dev, "ih: stage 4b: 0\n");
+	return (0);
 }

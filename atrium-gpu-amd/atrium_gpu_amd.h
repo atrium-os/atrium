@@ -842,11 +842,24 @@ int	amd_gmc12_flush(struct amd_gart *gt);
 void	amd_gmc12_fault_report(struct amd_gart *gt, const char *when);
 int	amd_ih7_test(struct atrium_amd_softc *sc, struct amd_gart *gt,
 	    int (*during)(struct atrium_amd_softc *, struct amd_gart *));
+struct amd_ih7;
+int	amd_ih7_up(struct atrium_amd_softc *sc, struct amd_gart *gt,
+	    struct amd_ih7 **out);
+void	amd_ih7_down(struct amd_ih7 *ih);
+int	amd_ih7_drain_eop(struct amd_ih7 *ih, int max_log);
+u_int	amd_ih7_nintr(struct amd_ih7 *ih);
 int	amd_gfx12_setup(struct atrium_amd_softc *sc);	/* gfx12.c, 4c */
 int	atrium_amd_rs64_start(const uint8_t *bin, size_t len, uint64_t *out);
 int	atrium_amd_mes_start(const uint8_t *bin, size_t len, uint64_t *out);
 int	amd_mes12_test(struct atrium_amd_softc *sc, struct amd_gart *gt);	/* mes12.c, 4d */
+struct mes;
+int	amd_mes12_up(struct atrium_amd_softc *sc, struct amd_gart *gt,
+	    bool kq, struct mes **out);
+int	amd_mes12_selftest(struct mes *m);
+void	amd_mes12_down(struct mes *m);
 int	amd_smu_init(struct atrium_amd_softc *sc);	/* smu.c, silicon test */
+int	amd_si_attach(struct atrium_amd_softc *sc);	/* smu.c, stage 5a */
+void	amd_si_detach(struct atrium_amd_softc *sc);
 
 /*
  * One vendor-neutral GPU power telemetry sample (rs/power.rs Telemetry;
@@ -881,6 +894,7 @@ struct atrium_amd_softc {
 	char		 isa_name[16];
 	uint32_t	 dcn_seg2_bytes; /* DMU segment 2 byte offset in BAR5 */
 	const struct atrium_gpu_backend_ops *backend; /* hardware seam (gpu module) */
+	struct amd_si *si;		/* silicon, attached (smu.c, stage 5a) */
 	struct resource	*regs;		/* BAR5 MMIO register file */
 	int		 regs_rid;
 	struct resource	*doorbell;	/* BAR2 doorbell page */

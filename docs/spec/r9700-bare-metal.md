@@ -492,3 +492,16 @@ have to be redone. 5c keeps today's model and proofs.
   140 us, HQD inactive. The card was then proven idle (13 W) and the reset left it cold.
   Log /root/runs/20261112T212618Z.log. Stages 3 and 4a–4e are box-verified; next is stage
   5 (atrium_gpu_test, test_gpu_isolation).
+- **Stage 5a built (kenv hw.atrium_gpu.attach=1 with psp_bootload; runner stage `5a`).**
+  Attach runs stages 3–4e as one bring-up (smu.c `amd_si_attach`, using the new up/down
+  halves `amd_ih7_up/down` and `amd_mes12_up/selftest/down`), proves idle with MES up and
+  GfxOff allowed, and stays attached (no gpu/display children yet). A telemetry watcher
+  every 5 s takes the GPU down and resets it if the hotspot reaches 95 °C or the card is
+  busy with nothing queued three samples running. Detach (and shutdown): GfxOff
+  disallowed, the write_42 dispatch again (proves MES survived GfxOff cycles), MES/IH/GART
+  down, idle proven, mode 1 reset. PrepareMp1ForUnload is not sent: the mode 1 reset after
+  it returns the card to post-POST, which is stronger. Also in this build, from the
+  public MES sources: each MES pipe gets a zeroed 256 KiB MSCRATCH area programmed before
+  every start (mainline mes_v12_0_enable clears it because stale contents made the
+  firmware fault at activation; kenv mes_mscratch=0 turns it off), GART page 0 is left
+  unmapped (the IH ring moved to 0x1000), and the log says which start attempt worked.

@@ -110,12 +110,30 @@ atrium_amd_pci_attach(device_t dev)
 		return (ENXIO);
 	}
 	if (sc->hw_kind != AMD_HW_GPUSIM) {
-		int psp_bootload = 0, smu_init = 0, keep = 0, reset = 0;
+		int psp_bootload = 0, smu_init = 0, keep = 0, reset = 0,
+		    attach = 0;
 
 		/* Stage 3 test hook: kenv hw.atrium_gpu.psp_bootload=1. */
 		TUNABLE_INT_FETCH("hw.atrium_gpu.psp_bootload", &psp_bootload);
 		if (psp_bootload)
 			(void)amd_psp_bootload(sc);
+		/*
+		 * Stage 5a (kenv hw.atrium_gpu.attach=1, after psp_bootload):
+		 * bring the card up and stay attached. Detach takes it down
+		 * and resets it. No children yet: the gpu module's hardware
+		 * half is still gpusim's (stage 5b/5c).
+		 */
+		TUNABLE_INT_FETCH("hw.atrium_gpu.attach", &attach);
+		if (attach && psp_bootload) {
+			if (amd_si_attach(sc) == 0) {
+				device_printf(dev, "silicon attached (stage "
+				    "5a); no gpu/display children yet\n");
+				return (0);
+			}
+			(void)amd_smu_mode1_reset(sc);
+			atrium_amd_pci_teardown(sc);
+			return (ENXIO);
+		}
 		/* Stage 3d test hook: kenv hw.atrium_gpu.smu_init=1. */
 		TUNABLE_INT_FETCH("hw.atrium_gpu.smu_init", &smu_init);
 		if (smu_init)
@@ -241,6 +259,11 @@ atrium_amd_pci_detach(device_t dev)
 	if (err != 0)
 		return (err);
 	device_delete_children(dev);
+	/* Silicon (stage 5a): down, idle proven, then back to post-POST. */
+	if (sc->si != NULL) {
+		amd_si_detach(sc);
+		(void)amd_smu_mode1_reset(sc);
+	}
 	atrium_amd_pci_teardown(sc);
 	return (0);
 }
@@ -255,6 +278,13 @@ atrium_amd_pci_detach(device_t dev)
 static int
 atrium_amd_pci_shutdown(device_t dev)
 {
+	struct atrium_amd_softc *sc = device_get_softc(dev);
+
+	/* Silicon: leave the card as POST left it for the next boot. */
+	if (sc->si != NULL) {
+		amd_si_detach(sc);
+		(void)amd_smu_mode1_reset(sc);
+	}
 	pci_disable_busmaster(dev);
 	return (0);
 }
