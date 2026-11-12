@@ -24,3 +24,6 @@ h264 = ["atrium-media-decode/h264", "atrium-player/h264"]
 md-5 = "0.10"
 # tests/audio.rs: a stand-in choragusd.
 lyra-protocol = { path = "../../lyra-protocol" }
+# tests/play.rs: a stand-in portcullisd and Nuntius as a licence server's route.
+nuntius = { path = "../../nuntius" }
+portcullis-ipc = { path = "../../portcullis/portcullis-ipc" }

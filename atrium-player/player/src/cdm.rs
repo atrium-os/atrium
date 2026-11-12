@@ -6,15 +6,18 @@
 //! CDM's licence request, and tell the worker when new keys are usable.
 //!
 //! In a browser the page's EME code fetches the licence. The standalone player has no page:
-//! [`Licences`] stands in for it. Today that is Clear Key with keys the user supplied
-//! (`ATRIUM_PLAYER_CLEARKEY`); a licence server reached through Nuntius comes with H4.
+//! [`Licences`] stands in for it: Clear Key with keys the user supplied
+//! (`ATRIUM_PLAYER_CLEARKEY`), or a licence server (`ATRIUM_PLAYER_LICENCE_URL`) that each
+//! request is POSTed to through the system fetcher (Nuntius, hospes.md §8.5): neither the
+//! CDM nor the supervisor ever holds a socket to the network.
 use std::fs::File;
 use std::io;
 use std::os::fd::AsRawFd;
 use std::os::unix::net::UnixStream;
 use std::path::PathBuf;
 use std::process::{Child, Command};
-use std::sync::mpsc;
+use std::sync::{mpsc, Arc};
+use std::time::Duration;
 
 use hospes_proto::io::{recv, send};
 use hospes_proto::Msg;
@@ -40,24 +43,86 @@ pub struct CdmOptions {
 pub enum Licences {
     /// Clear Key: these (key id, key) pairs.
     ClearKey(Vec<([u8; 16], [u8; 16])>),
+    /// POST each licence (and renewal) request, as is, to `url`; the answer goes back to the
+    /// CDM as is. For Widevine that is the service's licence proxy.
+    Server { url: String, fetcher: FetcherSource },
+}
+
+/// Where a licence request's fetcher comes from: the system's (portcullisd `OpenFetcher`),
+/// or a stand-in in tests.
+#[derive(Clone)]
+pub struct FetcherSource(Arc<dyn Fn() -> io::Result<nuntius::launch::Fetcher> + Send + Sync>);
+
+impl FetcherSource {
+    pub fn system() -> FetcherSource {
+        FetcherSource(Arc::new(nuntius::launch::open))
+    }
+    pub fn new(f: impl Fn() -> io::Result<nuntius::launch::Fetcher> + Send + Sync + 'static) -> FetcherSource {
+        FetcherSource(Arc::new(f))
+    }
+}
+
+impl std::fmt::Debug for FetcherSource {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("FetcherSource")
+    }
+}
+
+/// Largest licence answer taken from a server.
+pub const LICENCE_MAX: u64 = 1 << 20;
+
+/// ★ POST `request` to `url` over `client` and return the answer's body: a 2xx with at most
+/// [`LICENCE_MAX`] bytes, within 30 s, or why not.
+pub fn post_licence(mut client: nuntius::Client, url: &str, request: Vec<u8>) -> Result<Vec<u8>, String> {
+    use nuntius::{Event, Limits, Open};
+    let mut o = Open::post(1, url, "application/octet-stream", request);
+    o.limits = Limits { max_bytes: LICENCE_MAX, connect_ms: 10_000, idle_ms: 20_000, total_ms: 30_000 };
+    client.open(o).map_err(|_| "the fetcher's channel".to_string())?;
+    client.budget(LICENCE_MAX).map_err(|_| "the fetcher's channel".to_string())?;
+    let mut body = Vec::new();
+    let deadline = std::time::Instant::now() + Duration::from_secs(40);
+    loop {
+        let left = deadline.saturating_duration_since(std::time::Instant::now());
+        let ev = match client.recv_timeout(left) {
+            Ok(Some(ev)) => ev,
+            Ok(None) => return Err("the licence server did not answer in time".into()),
+            Err(_) => return Err("the fetcher stopped".into()),
+        };
+        match ev {
+            Event::Head { status, .. } if !(200..300).contains(&status) => return Err(format!("licence server: HTTP {status}")),
+            Event::Data { bytes, .. } => {
+                if body.len() as u64 + bytes.len() as u64 > LICENCE_MAX {
+                    return Err("licence answer too big".into());
+                }
+                body.extend_from_slice(&bytes);
+            }
+            Event::Done { .. } => return Ok(body),
+            Event::Error { code, .. } => return Err(format!("licence request: {code:?}")),
+            Event::Head { .. } | Event::Fd { .. } | Event::Progress { .. } | Event::Retrying { .. } => {}
+        }
+    }
 }
 
 impl CdmOptions {
     /// From `ATRIUM_PLAYER_CDM` (the library: the test CDM until Widevine),
     /// `ATRIUM_PLAYER_HOSPES_CDM` (default: `hospes-cdm` next to this executable),
-    /// `ATRIUM_PLAYER_CLEARKEY` (`KID:KEY[,KID:KEY...]` in hex) and optionally
+    /// `ATRIUM_PLAYER_CLEARKEY` (`KID:KEY[,KID:KEY...]` in hex) or `ATRIUM_PLAYER_LICENCE_URL`
+    /// (a licence server, which wins), and optionally
     /// `ATRIUM_PLAYER_CDM_STORE` (a directory).
     pub fn from_env() -> Option<CdmOptions> {
         let library: PathBuf = std::env::var_os("ATRIUM_PLAYER_CDM")?.into();
         if !library.is_file() {
             return None;
         }
-        let keys = parse_keys(&std::env::var("ATRIUM_PLAYER_CLEARKEY").unwrap_or_default())?;
+        let licences = match std::env::var("ATRIUM_PLAYER_LICENCE_URL") {
+            Ok(url) if url.starts_with("https://") || url.starts_with("http://") => Licences::Server { url, fetcher: FetcherSource::system() },
+            _ => Licences::ClearKey(parse_keys(&std::env::var("ATRIUM_PLAYER_CLEARKEY").unwrap_or_default())?),
+        };
         let host = std::env::var_os("ATRIUM_PLAYER_HOSPES_CDM")
             .map(PathBuf::from)
             .unwrap_or_else(|| std::env::current_exe().unwrap_or_default().with_file_name("hospes-cdm"));
         let store = std::env::var_os("ATRIUM_PLAYER_CDM_STORE").map(PathBuf::from);
-        Some(CdmOptions { host, library, store, licences: Licences::ClearKey(keys), mem_mib: 512 })
+        Some(CdmOptions { host, library, store, licences, mem_mib: 512 })
     }
 }
 
@@ -158,6 +223,8 @@ pub struct CdmProc {
     ctrl: UnixStream,
     rx: mpsc::Receiver<Option<Msg>>,
     licences: Licences,
+    /// Answers from licence servers: (session, answer or why not).
+    answers: (mpsc::Sender<(Vec<u8>, Result<Vec<u8>, String>)>, mpsc::Receiver<(Vec<u8>, Result<Vec<u8>, String>)>),
     initialized: bool,
     /// Init data waiting for `Initialized`.
     queued: Vec<(u8, Vec<u8>)>,
@@ -204,7 +271,7 @@ impl CdmProc {
                 }
             }
         })?;
-        let mut p = CdmProc { child, ctrl, rx, licences: o.licences.clone(), initialized: false, queued: Vec::new(), promise: 0, sessions: 0, outstanding: 0, failed: false };
+        let mut p = CdmProc { child, ctrl, rx, licences: o.licences.clone(), answers: mpsc::channel(), initialized: false, queued: Vec::new(), promise: 0, sessions: 0, outstanding: 0, failed: false };
         p.send(Msg::Init { allow_persistent: false, link_mask: 0 });
         Ok((p, data_w))
     }
@@ -264,18 +331,35 @@ impl CdmProc {
                     self.outstanding = self.outstanding.saturating_sub(1);
                     out.push(CdmEvent::Failed(format!("CDM refused: {}", String::from_utf8_lossy(&message))));
                 }
-                // A licence request (type 0). Renewals and releases don't happen with
-                // temporary Clear Key sessions.
-                Msg::SessionMessage { id, message_type: 0, message } => {
-                    let Licences::ClearKey(keys) = &self.licences;
-                    match request_kids(&message).and_then(|kids| clear_key_licence(keys, &kids)) {
+                // A licence request (type 0) or renewal (1). Clear Key's temporary sessions
+                // never renew; a server gets both.
+                Msg::SessionMessage { id, message_type: t @ (0 | 1), message } => match &self.licences {
+                    Licences::ClearKey(keys) if t == 0 => match request_kids(&message).and_then(|kids| clear_key_licence(keys, &kids)) {
                         Some(response) => {
                             let promise = self.next_promise();
                             self.outstanding += 1;
                             self.send(Msg::UpdateSession { promise, id, response });
                         }
                         None => out.push(CdmEvent::Failed("no key for this media".into())),
+                    },
+                    Licences::ClearKey(_) => {}
+                    Licences::Server { url, fetcher } => {
+                        // Off this thread: a slow server never stalls frames.
+                        self.outstanding += 1;
+                        let (url, fetcher, tx) = (url.clone(), fetcher.clone(), self.answers.0.clone());
+                        let _ = std::thread::Builder::new().name("player-licence".into()).spawn(move || {
+                            let r = (fetcher.0)().map_err(|e| format!("no fetcher: {e}")).and_then(|f| {
+                                let (client, _guard) = f.into_parts();
+                                post_licence(client, &url, message)
+                            });
+                            let _ = tx.send((id, r));
+                        });
                     }
+                },
+                // Individualisation (3): the provisioning flow (hospes.md §8.5) is not wired
+                // yet; say so rather than stall.
+                Msg::SessionMessage { message_type: 3, .. } => {
+                    out.push(CdmEvent::Failed("the CDM asked for individualisation, which is not supported yet".into()));
                 }
                 Msg::SessionMessage { .. } => {}
                 Msg::KeysChange { has_new_usable, .. } => {
@@ -289,6 +373,17 @@ impl CdmProc {
                 }
                 // Data-channel messages never come this way.
                 _ => out.push(CdmEvent::Lost),
+            }
+        }
+        while let Ok((id, r)) = self.answers.1.try_recv() {
+            self.outstanding = self.outstanding.saturating_sub(1);
+            match r {
+                Ok(response) => {
+                    let promise = self.next_promise();
+                    self.outstanding += 1;
+                    self.send(Msg::UpdateSession { promise, id, response });
+                }
+                Err(why) => out.push(CdmEvent::Failed(why)),
             }
         }
         if self.failed && !out.contains(&CdmEvent::Lost) {

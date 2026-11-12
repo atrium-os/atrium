@@ -402,3 +402,81 @@ fn a_ranged_resume_with_exactly_its_credit_completes_without_waiting() {
     assert!(t.elapsed() < Duration::from_secs(3), "done when the length is in hand: {:?}", t.elapsed());
     assert_eq!(n.budget(), 0, "the credit was spent exactly");
 }
+
+/// A server for POSTs: records each request's method, content type and body, and answers
+/// `status` with the body reversed (or a redirect for 302).
+fn post_server(status: u16) -> (SocketAddr, Arc<Mutex<Vec<(String, String, Vec<u8>)>>>) {
+    let l = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = l.local_addr().unwrap();
+    let seen = Arc::new(Mutex::new(vec![]));
+    let s2 = seen.clone();
+    std::thread::spawn(move || for s in l.incoming() {
+        let Ok(mut s) = s else { return };
+        let seen = s2.clone();
+        std::thread::spawn(move || {
+            let mut buf = Vec::new();
+            let mut b = [0u8; 4096];
+            let end = loop {
+                if let Some(p) = buf.windows(4).position(|w| w == b"\r\n\r\n") { break p + 4 }
+                match s.read(&mut b) { Ok(0) | Err(_) => return, Ok(n) => buf.extend_from_slice(&b[..n]) }
+            };
+            let text = String::from_utf8_lossy(&buf[..end]).to_string();
+            let hdr = |n: &str| text.lines().find_map(|l| l.split_once(':').filter(|(k, _)| k.eq_ignore_ascii_case(n)).map(|(_, v)| v.trim().to_string()));
+            let len: usize = hdr("content-length").and_then(|v| v.parse().ok()).unwrap_or(0);
+            while buf.len() < end + len {
+                match s.read(&mut b) { Ok(0) | Err(_) => return, Ok(n) => buf.extend_from_slice(&b[..n]) }
+            }
+            let body = buf[end..end + len].to_vec();
+            let method = text.split(' ').next().unwrap_or("").to_string();
+            seen.lock().unwrap().push((method, hdr("content-type").unwrap_or_default(), body.clone()));
+            let r = match status {
+                302 => "HTTP/1.1 302 Found\r\nLocation: http://media.test/elsewhere\r\nContent-Length: 0\r\n\r\n".to_string().into_bytes(),
+                200 => {
+                    let mut out = format!("HTTP/1.1 200 OK\r\nContent-Type: application/octet-stream\r\nContent-Length: {}\r\n\r\n", body.len()).into_bytes();
+                    out.extend(body.iter().rev());
+                    out
+                }
+                st => format!("HTTP/1.1 {st} Nope\r\nContent-Length: 0\r\n\r\n").into_bytes(),
+            };
+            let _ = s.write_all(&r);
+            let _ = s.read(&mut b);
+        });
+    });
+    (addr, seen)
+}
+
+fn post_instance(addr: SocketAddr) -> (Nuntius, Receiver<Event>) {
+    let net: &'static ToServer = Box::leak(Box::new(ToServer(addr)));
+    let (tx, rx) = channel();
+    (Nuntius::new(Conversation::new(net, tls(), GRANT), tx, u64::MAX), rx)
+}
+
+#[test]
+fn a_post_sends_its_body_once_and_streams_the_answer() {
+    let (addr, seen) = post_server(200);
+    let (n, rx) = post_instance(addr);
+    let body: Vec<u8> = (0..5000u32).map(|i| (i * 7) as u8).collect();
+    n.request(Request::Open(Open::post(1, "http://licence.test/wv", "application/octet-stream", body.clone())));
+    let (k, got, err) = collect(&rx, 1);
+    assert_eq!(err, None);
+    assert_eq!(k, vec!["head 200", "done"]);
+    assert_eq!(got, body.iter().rev().copied().collect::<Vec<_>>());
+    let seen = seen.lock().unwrap();
+    assert_eq!(seen.len(), 1);
+    assert_eq!(seen[0], ("POST".to_string(), "application/octet-stream".to_string(), body));
+}
+
+#[test]
+fn a_post_is_neither_retried_nor_redirected() {
+    for (status, code) in [(500, ErrorCode::Http(500)), (302, ErrorCode::Policy)] {
+        let (addr, seen) = post_server(status);
+        let (n, rx) = post_instance(addr);
+        let mut o = Open::post(1, "http://licence.test/wv", "application/octet-stream", vec![1, 2, 3]);
+        o.retry = Retry { max_attempts: 4, backoff_ms: 10 };
+        n.request(Request::Open(o));
+        let (_, _, err) = collect(&rx, 1);
+        assert_eq!(err, Some(code), "status {status}");
+        std::thread::sleep(Duration::from_millis(100));
+        assert_eq!(seen.lock().unwrap().len(), 1, "status {status}: one request only");
+    }
+}

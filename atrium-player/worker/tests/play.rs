@@ -590,3 +590,54 @@ fn encrypted_media_without_a_cdm_is_refused() {
         assert!(r.frames.is_empty(), "{enc}");
     }
 }
+
+/// portcullisd, then a Nuntius that answers one licence POST as a Clear Key licence server
+/// with `keys` would (H4: the licence route through the system fetcher, hospes.md §8.5).
+fn licence_fetcher(keys: &'static str, posts: std::sync::Arc<std::sync::atomic::AtomicUsize>) -> std::io::Result<nuntius::launch::Fetcher> {
+    use nuntius::{server, Event, Method, Request};
+    use portcullis_ipc::{read_request, recv_fds, write_response, Response};
+    use std::os::unix::net::UnixStream;
+    let (app, d) = UnixStream::pair()?;
+    std::thread::spawn(move || {
+        let mut r = std::io::BufReader::new(d.try_clone().unwrap());
+        let mut w = d;
+        read_request(&mut r).unwrap();
+        write_response(&mut w, &Response::Hello { version: portcullis_ipc::PROTO_VERSION }).unwrap();
+        read_request(&mut r).unwrap();
+        write_response(&mut w, &Response::ReadyForFds).unwrap();
+        let fds = recv_fds(&w, 3).unwrap();
+        let (mut reqs, mut out) = server::channel(UnixStream::from(fds.into_iter().next().unwrap())).unwrap();
+        let Some(Request::Open(o)) = reqs.recv().unwrap() else { panic!("an Open first") };
+        assert_eq!(o.method, Method::Post);
+        assert_eq!(o.url, "https://licence.test/clearkey");
+        let body = o.body.expect("a body").bytes;
+        posts.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let keys = atrium_player::cdm::parse_keys(keys).unwrap();
+        let lic = atrium_player::cdm::request_kids(&body).and_then(|k| atrium_player::cdm::clear_key_licence(&keys, &k)).unwrap();
+        let id = o.id;
+        out.send(Event::Head { id, status: 200, final_url: o.url.clone(), redirects: 0, content_type: Some("application/json".into()),
+                               length: Some(lic.len() as u64), accept_ranges: false, validator: None }).unwrap();
+        out.send(Event::Data { id, offset: 0, bytes: lic.clone() }).unwrap();
+        out.send(Event::Done { id, bytes: lic.len() as u64 }).unwrap();
+        while let Ok(Some(_)) = reqs.recv() {}
+        let _ = w;
+    });
+    nuntius::launch::open_at(app)
+}
+
+#[test]
+fn clear_key_from_a_licence_server_through_the_system_fetcher() {
+    let Some(mut o) = cdm_opts(CLEARKEY) else { return };
+    let posts = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let p2 = posts.clone();
+    o.cdm.as_mut().unwrap().licences = atrium_player::cdm::Licences::Server {
+        url: "https://licence.test/clearkey".into(),
+        fetcher: atrium_player::cdm::FetcherSource::new(move || licence_fetcher(CLEARKEY, p2.clone())),
+    };
+    let (enc, clear) = ENCRYPTED[0];
+    let r = play(load(enc), o, 0, &[], |_, _, _| {});
+    assert!(matches!(r.events.last(), Some(PlayerEvent::Ended)), "{:?}", r.events.last());
+    let hashes: Vec<_> = r.frames.iter().map(|f| f.1.clone()).collect();
+    assert_eq!(hashes, layer_refs(clear));
+    assert!(posts.load(std::sync::atomic::Ordering::SeqCst) >= 1, "the licence came by POST");
+}

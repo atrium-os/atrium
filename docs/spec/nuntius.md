@@ -71,7 +71,8 @@ channel, many concurrent requests, each with an id chosen by the client.
 Open {
   id: u32,
   url: String,                       // http or https only; https by default for apps
-  method: Get | Head,                // v1: no bodies upstream, so no POST
+  method: Get | Head | Post,         // Post since 2026-11-12 (Hospes H4, licence requests)
+  body: Option<{ content_type, bytes }>,  // Post only, at most 32 KiB (BODY_MAX)
   range: Option<(u64, Option<u64>)>, // start, length; None = whole resource
   if_range: Option<Validator>,       // ETag or Last-Modified from an earlier Head
   deliver: Stream | Fd,              // see 3.3
@@ -83,6 +84,14 @@ Open {
 Cancel { id }
 Budget { bytes }                     // the instance's remaining byte budget
 ```
+
+`Post` (added 2026-11-12 for EME licence and provisioning requests, hospes.md §8.5): the body
+is at most `BODY_MAX` (32 KiB) with its content type; a `Post` has no range or `If-Range`; it
+is sent once (the retry policy is forced to one attempt, as a POST is not idempotent) and a
+redirect answer ends it with `Policy` rather than being followed, so the body only ever goes
+to the URL the client named. No cookies or credentials are added, as for every request. The
+response is delivered like any other (`Stream` or `Fd`). Every other rule (address policy,
+site list, caps) is unchanged.
 
 ### 3.2 Events
 

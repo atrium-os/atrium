@@ -253,8 +253,9 @@ fn read_chunked(rest: &mut Vec<u8>, r: &mut impl Read, cap: usize) -> Result<(Ve
 /// length)` or from the first byte to the end, `If-Range` with a validator,
 /// an `Accept`. Still nothing that identifies the reader.
 pub fn write_request_full(w: &mut impl Write, host_header: &str, path_and_query: &str, head_only: bool,
-                          range: Option<(u64, Option<u64>)>, if_range: Option<&str>, accept: Option<&str>) -> io::Result<()> {
-    let method = if head_only { "HEAD" } else { "GET" };
+                          range: Option<(u64, Option<u64>)>, if_range: Option<&str>, accept: Option<&str>,
+                          post: Option<(&str, &[u8])>) -> io::Result<()> {
+    let method = if post.is_some() { "POST" } else if head_only { "HEAD" } else { "GET" };
     let clean = |v: &str| v.chars().filter(|c| !c.is_control()).collect::<String>();
     let range = match range {
         Some((s, Some(n))) if n > 0 => format!("Range: bytes={s}-{}\r\n", s + n - 1),
@@ -263,9 +264,16 @@ pub fn write_request_full(w: &mut impl Write, host_header: &str, path_and_query:
     };
     let if_range = match if_range { Some(v) if !range.is_empty() => format!("If-Range: {}\r\n", clean(v)), _ => String::new() };
     let accept = clean(accept.unwrap_or("*/*"));
+    let body = match post {
+        Some((ct, b)) => format!("Content-Type: {}\r\nContent-Length: {}\r\n", clean(ct), b.len()),
+        None => String::new(),
+    };
     write!(w, "{method} {path_and_query} HTTP/1.1\r\nHost: {host_header}\r\n\
                User-Agent: atrium-navigator-fetch/0.1\r\nAccept: {accept}\r\n\
-               Accept-Encoding: identity\r\n{range}{if_range}Connection: close\r\n\r\n")?;
+               Accept-Encoding: identity\r\n{range}{if_range}{body}Connection: close\r\n\r\n")?;
+    if let Some((_, b)) = post {
+        w.write_all(b)?;
+    }
     w.flush()
 }
 
@@ -418,11 +426,11 @@ mod tests {
     #[test]
     fn a_full_request_asks_for_the_range_with_its_validator() {
         let mut out = vec![];
-        write_request_full(&mut out, "a.test", "/v.webm", false, Some((1000, None)), Some("\"abc\""), Some("video/*")).unwrap();
+        write_request_full(&mut out, "a.test", "/v.webm", false, Some((1000, None)), Some("\"abc\""), Some("video/*"), None).unwrap();
         let s = String::from_utf8(out).unwrap();
         assert!(s.contains("Range: bytes=1000-\r\nIf-Range: \"abc\"\r\n") && s.contains("Accept: video/*"), "{s}");
         let mut out = vec![];
-        write_request_full(&mut out, "a.test", "/v", true, None, Some("x"), None).unwrap();
+        write_request_full(&mut out, "a.test", "/v", true, None, Some("x"), None, None).unwrap();
         let s = String::from_utf8(out).unwrap();
         assert!(s.starts_with("HEAD /v HTTP/1.1") && !s.contains("If-Range"), "no If-Range without a Range");
     }

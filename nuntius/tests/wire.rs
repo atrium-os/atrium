@@ -78,3 +78,23 @@ fn an_fd_event_carries_its_descriptor_and_a_lying_peer_is_caught() {
     raw.send_message(CLASS, OP_EVENT, 0, &WireEvent::Done { id: 1, bytes: 0 }.encode()).unwrap();
     assert_eq!(c.recv().unwrap_err().kind(), std::io::ErrorKind::InvalidData, "not flagged an event");
 }
+
+#[test]
+fn a_post_carries_a_bounded_body_and_nothing_else_does() {
+    use nuntius::*;
+    let ok = Open::post(1, "https://licence.example/wv", "application/octet-stream", vec![7; BODY_MAX]);
+    assert_eq!(Request::decode(&Request::Open(ok.clone()).encode()), Some(Request::Open(ok.clone())));
+    let mut big = ok.clone();
+    big.body.as_mut().unwrap().bytes.push(0);
+    let mut ranged = ok.clone();
+    ranged.range = Some((0, None));
+    let mut no_body = ok.clone();
+    no_body.body = None;
+    let mut get_with_body = Open::get(1, "https://a.example/");
+    get_with_body.body = ok.body.clone();
+    let mut bad_type = ok.clone();
+    bad_type.body.as_mut().unwrap().content_type = "a\nb".into();
+    for (why, o) in [("too big", big), ("ranged", ranged), ("no body", no_body), ("GET with body", get_with_body), ("bad type", bad_type)] {
+        assert_eq!(Request::decode(&Request::Open(o).encode()), None, "{why}");
+    }
+}

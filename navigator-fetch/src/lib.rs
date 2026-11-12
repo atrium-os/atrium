@@ -396,7 +396,7 @@ impl<'a> Conversation<'a> {
     /// the response's head (connect, TLS and the server's first answer);
     /// the connection is never reused.
     pub fn open_stream(&mut self, url: &str, head_only: bool, range: Option<(u64, Option<u64>)>, if_range: Option<&str>,
-                       accept: Option<&str>, head_wait: Duration) -> Result<Stream, FetchError> {
+                       accept: Option<&str>, post: Option<(&str, &[u8])>, head_wait: Duration) -> Result<Stream, FetchError> {
         let mut current = url::Url::parse(url).map_err(|e| FetchError::BadUrl(e.to_string()))?;
         for redirects in 0..=MAX_REDIRECTS {
             let https = match current.scheme() { "https" => true, "http" => false, s => return Err(FetchError::Refused(format!("scheme {s}"))) };
@@ -421,12 +421,15 @@ impl<'a> Conversation<'a> {
             let sock = c.tcp().try_clone().map_err(|e| FetchError::Connect(e.to_string()))?;
             sock.set_read_timeout(Some(head_wait.max(Duration::from_millis(1)))).ok();
             let w = match &mut c {
-                Conn::Plain(s) => http::write_request_full(s, &host_header, &path, head_only, range, if_range, accept).map_err(|e| FetchError::Connect(e.to_string())),
-                Conn::Tls(s) => http::write_request_full(s, &host_header, &path, head_only, range, if_range, accept).map_err(|e| FetchError::Tls(e.to_string())),
+                Conn::Plain(s) => http::write_request_full(s, &host_header, &path, head_only, range, if_range, accept, post).map_err(|e| FetchError::Connect(e.to_string())),
+                Conn::Tls(s) => http::write_request_full(s, &host_header, &path, head_only, range, if_range, accept, post).map_err(|e| FetchError::Tls(e.to_string())),
             };
             w?;
             let (head, rest) = http::read_head(&mut c, head_only).map_err(FetchError::Http)?;
             if matches!(head.status, 301 | 302 | 303 | 307 | 308) {
+                // A POST is never followed: its body would go to a place the client did
+                // not name (or, rewritten to GET, the answer would not be to the request).
+                if post.is_some() { return Err(FetchError::Refused(format!("redirect ({}) of a POST", head.status))) }
                 let loc = head.header("location").ok_or(FetchError::Http(http::HttpError::Malformed("redirect without Location")))?;
                 let next = current.join(loc).map_err(|e| FetchError::BadUrl(e.to_string()))?;
                 if current.scheme() == "https" && next.scheme() != "https" { return Err(FetchError::Refused(format!("redirect downgrades to {next}"))) }
@@ -741,7 +744,7 @@ mod policy_tests {
         let net = Scripted::new(vec![], vec![]);
         let mut c = Conversation::new(&net, tls(), addr::Policy::default()).with_sites(sites());
         assert!(matches!(c.fetch("http://elsewhere.example/"), Err(FetchError::Refused(_))));
-        assert!(matches!(c.open_stream("http://elsewhere.example/", false, None, None, None, Duration::from_secs(5)), Err(FetchError::Refused(_))));
+        assert!(matches!(c.open_stream("http://elsewhere.example/", false, None, None, None, None, Duration::from_secs(5)), Err(FetchError::Refused(_))));
         assert!(net.resolved.lock().unwrap().is_empty() && net.connected.lock().unwrap().is_empty());
         // A listed host redirecting off the list: refused at the hop, in both
         // the whole-body path and the stream path.
@@ -749,7 +752,7 @@ mod policy_tests {
         let net = Scripted::new(vec![vec![PUBLIC]], vec![redirect, redirect]);
         let mut c = Conversation::new(&net, tls(), addr::Policy::default()).with_sites(sites());
         assert!(matches!(c.fetch("http://example.com/"), Err(FetchError::Refused(m)) if m.contains("tracker.example")));
-        assert!(matches!(c.open_stream("http://example.com/", false, None, None, None, Duration::from_secs(5)), Err(FetchError::Refused(_))));
+        assert!(matches!(c.open_stream("http://example.com/", false, None, None, None, None, Duration::from_secs(5)), Err(FetchError::Refused(_))));
         assert_eq!(net.resolved.lock().unwrap().len(), 1, "only the listed name was looked up");
         // A listed redirect target is followed; a sibling keeps the list.
         let net = Scripted::new(vec![vec![PUBLIC], vec![PUBLIC]],

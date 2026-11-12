@@ -85,6 +85,8 @@ dependencies = [
  "libc",
  "lyra-protocol",
  "md-5",
+ "nuntius",
+ "portcullis-ipc",
 ]
 
 [[package]]

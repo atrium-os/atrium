@@ -43,7 +43,14 @@ impl Request {
     pub fn valid(&self) -> bool {
         match self {
             Request::Open(o) => text_ok(&o.url, URL_MAX) && o.accept.as_deref().is_none_or(|a| text_ok(a, TEXT_MAX))
-                && validator_ok(&o.if_range) && o.range.is_none_or(|(_, n)| n != Some(0)),
+                && validator_ok(&o.if_range) && o.range.is_none_or(|(_, n)| n != Some(0))
+                && match (&o.method, &o.body) {
+                    // A body only with POST, and a POST is a whole request: no range.
+                    (Method::Post, Some(b)) => text_ok(&b.content_type, TEXT_MAX) && !b.content_type.is_empty()
+                        && b.bytes.len() <= BODY_MAX && o.range.is_none() && o.if_range.is_none(),
+                    (Method::Get | Method::Head, None) => true,
+                    _ => false,
+                },
             Request::Cancel { .. } | Request::Budget { .. } => true,
         }
     }

@@ -43,9 +43,23 @@ pub const BACKOFF_MS_MAX: u64 = 30_000;
 /// Longest URL, `Accept` value, header-derived string and reason on the wire.
 pub const URL_MAX: usize = 8192;
 pub const TEXT_MAX: usize = 512;
+/// Largest request body (`Post`): licence and provisioning requests are a few KiB.
+pub const BODY_MAX: usize = 32 * 1024;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub enum Method { Get, Head }
+pub enum Method {
+    Get,
+    Head,
+    /// With [`Open::body`]; never retried, never redirected (spec §3.1).
+    Post,
+}
+
+/// What a `Post` sends.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Body {
+    pub content_type: String,
+    pub bytes: Vec<u8>,
+}
 
 /// A resource's validator, from `Head`: an `ETag` (preferred) or a
 /// `Last-Modified`.
@@ -82,12 +96,21 @@ pub struct Open {
     /// 0 is highest: a media playhead before a prefetch.
     pub priority: u8,
     pub accept: Option<String>,
+    /// `Post` only: what to send.
+    pub body: Option<Body>,
 }
 
 impl Open {
     pub fn get(id: u32, url: &str) -> Open {
         Open { id, url: url.to_string(), method: Method::Get, range: None, if_range: None, deliver: Deliver::Stream,
-               limits: Limits::default(), retry: Retry::default(), priority: 1, accept: None }
+               limits: Limits::default(), retry: Retry::default(), priority: 1, accept: None, body: None }
+    }
+
+    /// A `POST` of `bytes` (at most [`BODY_MAX`]), the response streamed back. No retries:
+    /// a POST is not idempotent.
+    pub fn post(id: u32, url: &str, content_type: &str, bytes: Vec<u8>) -> Open {
+        Open { method: Method::Post, retry: Retry { max_attempts: 0, backoff_ms: 0 },
+               body: Some(Body { content_type: content_type.to_string(), bytes }), ..Open::get(id, url) }
     }
 }
 

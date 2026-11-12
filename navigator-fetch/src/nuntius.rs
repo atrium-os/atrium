@@ -145,6 +145,8 @@ fn clamp(mut o: Open) -> Open {
     o.limits.total_ms = o.limits.total_ms.clamp(1, STREAM_TOTAL_MS_MAX);
     if o.deliver == Deliver::Fd { o.limits.max_bytes = o.limits.max_bytes.min(FD_MAX_BYTES) }
     o.retry.max_attempts = o.retry.max_attempts.min(ATTEMPTS_MAX);
+    // A POST is not idempotent: one attempt, whatever was asked.
+    if o.method == Method::Post { o.retry.max_attempts = 0 }
     o.retry.backoff_ms = o.retry.backoff_ms.min(BACKOFF_MS_MAX);
     o
 }
@@ -209,7 +211,8 @@ fn run(mut conv: Conversation<'static>, o: Open, ctl: &Ctl, inner: &Inner, ev: &
         let if_range = if ranged { validator.as_ref().map(|v| v.value().to_string()) } else { None };
         let head_wait = Duration::from_millis(o.limits.connect_ms).min(deadline.saturating_duration_since(Instant::now()));
         let failure: Fail = 'attempt: {
-            let mut s = match conv.open_stream(&o.url, o.method == Method::Head, range, if_range.as_deref(), o.accept.as_deref(), head_wait) {
+            let post = o.body.as_ref().map(|b| (b.content_type.as_str(), b.bytes.as_slice()));
+            let mut s = match conv.open_stream(&o.url, o.method == Method::Head, range, if_range.as_deref(), o.accept.as_deref(), post, head_wait) {
                 Ok(s) => s,
                 Err(e) => break 'attempt classify(&e),
             };
