@@ -331,3 +331,9 @@ land with it.
   an address-swizzle field, not the topology; the SA disable 0xff00 leaves 8 SAs (4 SE × 2);
   no RBs disabled; SH_MEM 0xc00c, bases 0x20001000 (VMID 1–7) and 0x10002 (VMID 8–15). Idle
   after stage 4: 15 W, accepted; reset left the card cold; PCH 28–30 °C.
+- **2026-11-12 19:46, stage 4c with halt-first passed (8ab60114).** Before: CP_ME_CNTL 0xa000,
+  CP_MEC_RS64_CNTL 0x3c000000. After the halt: 0x1400a000 / 0x40030000, the same as after the
+  RLC autoload. After the RS64 start programming and pipe resets: 0x1400a000 / 0x40000000,
+  still halted, and "stage 4c done; CP halted". 4a and 4b unchanged. Idle after stage 4:
+  15 W, accepted. Reset left the card cold; PCH 28–29 °C. Stages 4a–4c are box-verified; the
+  IH write path still waits for the first CP interrupt (4d/4e).
