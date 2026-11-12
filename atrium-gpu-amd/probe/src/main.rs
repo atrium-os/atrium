@@ -208,13 +208,27 @@ fn status_regs(hw: u16, major: u8) -> Option<&'static [(usize, usize, &'static s
             (0x92, 1, "C2PMSG_82 (arg)"),
             (0x9a, 1, "C2PMSG_90 (resp)"),
         ]),
+        // MMHUB 4.x (mmhub_4_1_0_offset.h, segment 0): where VRAM sits in
+        // the GPU's address space, as the VBIOS left it. FB_LOCATION_* are in
+        // 16 MiB units (<< 24); stage 3 puts the PSP buffers in VRAM at
+        // MC = (FB_LOCATION_BASE << 24) + offset.
+        (MMHUB, 4) => Some(&[
+            (0x554, 0, "MMMC_VM_FB_LOCATION_BASE"),
+            (0x555, 0, "MMMC_VM_FB_LOCATION_TOP"),
+            (0x4c7, 0, "MMMC_VM_FB_OFFSET"),
+            (0x556, 0, "MMMC_VM_AGP_TOP"),
+            (0x557, 0, "MMMC_VM_AGP_BOT"),
+            (0x558, 0, "MMMC_VM_AGP_BASE"),
+            (0x559, 0, "MMMC_VM_SYSTEM_APERTURE_LOW"),
+            (0x55a, 0, "MMMC_VM_SYSTEM_APERTURE_HIGH"),
+        ]),
         _ => None,
     }
 }
 
 fn print_status(m: &mmio::Device, bin: &[u8]) {
     let d = discovery::Discovery::parse(bin).unwrap_or_else(|e| die(&format!("discovery: {e:?}")));
-    for hw in [discovery::hwid::MP0, discovery::hwid::MP1] {
+    for hw in [discovery::hwid::MP0, discovery::hwid::MP1, discovery::hwid::MMHUB] {
         let ip = match d.find(hw, 0) {
             Ok(Some(ip)) => ip,
             _ => { println!("{}: not in the discovery table", hw_name(hw)); continue; }
