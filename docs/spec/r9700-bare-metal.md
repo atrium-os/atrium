@@ -124,6 +124,31 @@ with `psp_bootload=1`.
    Reloading needs a mode-1 reset first (amdgpu resets on init when it finds the sOS
    running); that is stage 4 work. A failure part-way leaves the card for a power cycle.
 
+## 4.3 Stage 3d plan: SMU bring-up
+
+The stage 3c run left GC unpowered: `atrium-gpu-probe --status` (33b3972e) read every GC
+register as 0, `GB_ADDR_CONFIG` included (never 0 on a powered GC). Only the always-on IMU
+answers: `GFX_IMU_CORE_CTRL` 0x8 (core out of reset), `GFX_IMU_GFX_RESET_CTRL` 0x30
+(`HARD_RESETB` still 0, so GFX is held in reset). amdgpu's PSP-load path never touches the IMU
+on dGPU. Between the PSP step and GFX's wait for autoload it runs the SMU's `smu_hw_init`,
+which is where GFX gets powered.
+
+`smu.c`, opt-in `kenv hw.atrium_gpu.smu_init=1`, needs MP1 14.x. The mailbox is MP1 segment 1:
+C2PMSG_66 message, 82 argument, 90 response; 1 means OK. The messages are those of
+`smu_hw_init` / `smu_smc_hw_setup` on 14.0.2/3. No pptable write (14.0.2 has none), and no
+SCPM-gated messages. In order:
+- TestMessage, GetSmuVersion, GetDriverIfVersion
+- SetDriverDramAddr High/Low (1 MiB at VRAM + 84 MiB)
+- RunDcBtc
+- SetAllowedFeaturesMask High/Low (all, as `smu_v14_0_2_init_allowed_features`)
+- EnableAllSmuFeatures
+- GetRunningSmuFeatures
+- DisallowGfxOff, for bring-up, so GC stays readable
+
+After that, the step waits for RLC bootload complete and logs `GB_ADDR_CONFIG`. It needs no
+reload of the IP firmware, which the PSP already holds this boot. Until `GB_ADDR_CONFIG`
+reads non-zero, all-zero GC registers mean "off", not "idle".
+
 ## 5. Log
 
 - **2026-11-12, stage 1 done.** First bare-metal boot: bundle `03715a5` booted via
@@ -165,3 +190,8 @@ with `psp_bootload=1`.
   With the response pre-filled with 0xdeadbeef, the PSP wrote status, session id and TMR
   size (all 0) and left the rest, so 0 is the PSP's answer: the TMR was set up at boot
   (`boot_time_tmr`), and no SETUP_TMR is sent. The sOS keeps running across loads.
+- **2026-11-12, stage 3c run: PSP accepts all microcode, GC stays off.** `69d11bc0` with the
+  box's linux-firmware files: all 20 LOAD_IP_FW and AUTOLOAD_RLC returned status 0. The RLC
+  never reported bootload complete. The PSP firmware reservation is 50 MiB at VRAM
+  0x7f3e00000 (top), plus 4 MiB at 0x7d6c00000; the VRAM allocator must keep clear of both.
+  A read-only status probe then showed GC unpowered (§4.3).

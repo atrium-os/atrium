@@ -812,6 +812,7 @@ int	atrium_amd_discovery_parse(const uint8_t *bin, size_t len,
 	    struct amd_ip_info *out);		/* Rust, base/base_rs.rs */
 int	amd_identify(struct atrium_amd_softc *sc);	/* identify.c */
 int	amd_psp_bootload(struct atrium_amd_softc *sc);	/* psp.c, silicon test */
+int	amd_smu_init(struct atrium_amd_softc *sc);	/* smu.c, silicon test */
 
 struct atrium_amd_softc {
 	device_t	 dev;

@@ -110,12 +110,16 @@ atrium_amd_pci_attach(device_t dev)
 		return (ENXIO);
 	}
 	if (sc->hw_kind != AMD_HW_GPUSIM) {
-		int psp_bootload = 0;
+		int psp_bootload = 0, smu_init = 0;
 
 		/* Stage 3 test hook: kenv hw.atrium_gpu.psp_bootload=1. */
 		TUNABLE_INT_FETCH("hw.atrium_gpu.psp_bootload", &psp_bootload);
 		if (psp_bootload)
 			(void)amd_psp_bootload(sc);
+		/* Stage 3d test hook: kenv hw.atrium_gpu.smu_init=1. */
+		TUNABLE_INT_FETCH("hw.atrium_gpu.smu_init", &smu_init);
+		if (smu_init)
+			(void)amd_smu_init(sc);
 		device_printf(dev, "silicon bring-up not implemented yet; "
 		    "not attaching (vgapci keeps the device)\n");
 		atrium_amd_pci_teardown(sc);
