@@ -18,6 +18,8 @@
 //!   forum-ctl span-app APP on|off let an app's zoom span a group, or not
 //!   forum-ctl pads                list the gamepads and which app holds each
 //!   forum-ctl take-back [ID]      take pad ID (default: every held pad) back from its app
+//!   forum-ctl status              the apps' bar items and their menus
+//!   forum-ctl status-pick APP I   pick entry I of APP's bar menu
 
 use forum_ctl::{default_socket_path, request, Intent, Reply};
 
@@ -25,7 +27,7 @@ fn usage() -> ! {
     eprintln!("usage: forum-ctl surfaces | focus ID | modes | mode WxH[@Hz] | outputs \
                | arrange A right-of|left-of|above|below B | move-monitor | scale N F|auto | mirror A B|off \
                | zoom | span A [B..] [gap PX | bezel MM] | spans | span-app APP on|off \
-               | pads | take-back [ID]");
+               | pads | take-back [ID] | status | status-pick APP I");
     std::process::exit(2)
 }
 
@@ -84,6 +86,8 @@ fn main() {
             Intent::SetSpanGroup { outputs: outs.iter().map(|n| n.parse().unwrap_or_else(|_| usage())).collect(), gap, gap_mm }
         }
         ["pads"] => Intent::ListPads,
+        ["status"] => Intent::ListStatusItems,
+        ["status-pick", app, i] => Intent::StatusPick { app_id: app.to_string(), index: i.parse().unwrap_or_else(|_| usage()) },
         ["take-back"] => Intent::TakeBackPad { device_id: 0 },
         ["take-back", id] => Intent::TakeBackPad { device_id: id.parse().ok().filter(|&d| d != 0).unwrap_or_else(|| usage()) },
         _ => usage(),
@@ -133,6 +137,15 @@ fn main() {
             }
             if spanning != 0 { println!("window {spanning} spans"); }
             for a in no_span { println!("app {a} does not span"); }
+        }
+        Ok(Reply::StatusItems { items }) => {
+            if items.is_empty() { println!("no status items"); }
+            for it in items {
+                println!("{} {:?} {:?}", it.app_id, it.glyph, it.tooltip);
+                for (i, e) in it.menu.iter().enumerate() {
+                    println!("  {i}: {e:?}");
+                }
+            }
         }
         Ok(Reply::Pads { pads }) => {
             if pads.is_empty() { println!("no gamepads"); }

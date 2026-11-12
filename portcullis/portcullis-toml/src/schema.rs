@@ -137,6 +137,11 @@ pub struct Capabilities {
     /// what others play or steer them (atrium-player-pip-keys.md §4).
     #[serde(rename = "media-control")]
     pub media_control: Option<bool>,
+    /// A status item in Forum's bar (forum-status-items.md): an icon and a
+    /// menu the bar draws for this app, over forum-wm's `forum-status/`
+    /// socket. The app never draws in the bar.
+    #[serde(rename = "status-item")]
+    pub status_item: Option<bool>,
     /// An output device driver (vinculum-audio): add an output to choragusd
     /// and read that output's mix over `audio-device/`. It hears no app's
     /// own samples and sets no app's level (lyra-external-device.md).
@@ -341,6 +346,7 @@ pub fn merge_capabilities(base: &Capabilities, ovr: &Capabilities) -> Capabiliti
         app_launch:       ovr.app_launch.or(base.app_launch),
         audio_control:    ovr.audio_control.or(base.audio_control),
         media_control:    ovr.media_control.or(base.media_control),
+        status_item:      ovr.status_item.or(base.status_item),
         audio_device:     ovr.audio_device.or(base.audio_device),
         net_fetch:        ovr.net_fetch.or(base.net_fetch),
         net_fetch_sites:  ovr.net_fetch_sites.clone().or_else(|| base.net_fetch_sites.clone()),

@@ -11,9 +11,10 @@
 use std::time::Duration;
 
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::rc::Rc;
 use std::sync::Arc;
 
-use forum_ctl::{Intent, PadInfo, Reply};
+use forum_ctl::{Intent, PadInfo, Reply, StatusEntry, StatusItem};
 use lyra_protocol::wire::{action, FromControl, FromMedia, MediaAction, NowPlaying, SessionState, ToControl, ToMedia};
 use fresco_protocol::{WindowHints, WmRole};
 use pergola::geom::{Axis, Rect};
@@ -90,6 +91,78 @@ struct BarView {
     vol_level: Mutable<f64>,
     vol_muted: Mutable<bool>,
     vol_output: Mutable<usize>,
+    /// Apps' status items (forum-status-items.md): the bar draws each
+    /// one's icon and menu; picks go back through forum-wm.
+    status: Mutable<Vec<StatusShown>>,
+    /// Set by a pick or a slide: the main loop asks for the items again.
+    status_stale: Arc<AtomicBool>,
+}
+
+/// One app's status item as the bar shows it, with its menu's state
+/// (kept across polls, by app id).
+#[derive(Clone)]
+struct StatusShown {
+    item: StatusItem,
+    open: Mutable<MenuState>,
+}
+
+/// An app's short name for the menu's heading: the registry id's last
+/// part (the id comes from the launch registry, never from the app).
+fn short_app_name(app_id: &str) -> &str {
+    app_id.rsplit('.').next().unwrap_or(app_id)
+}
+
+/// A status item's menu as Pergola items: a heading (the app's name,
+/// not pickable), then the app's entries, a separator marking the next
+/// one. Also each Pergola item's index on the wire (None: the heading).
+fn status_menu(item: &StatusItem) -> (Vec<MenuItem>, Vec<Option<u32>>) {
+    let mut items = vec![MenuItem::new(short_app_name(&item.app_id)).enabled(false)];
+    let mut wire = vec![None];
+    let mut separate = true;
+    for (i, e) in item.menu.iter().enumerate() {
+        let m = match e {
+            StatusEntry::Separator => {
+                separate = true;
+                continue;
+            }
+            StatusEntry::Action { label, enabled } => MenuItem::new(label.clone()).enabled(*enabled),
+            StatusEntry::Check { label, on, enabled } => MenuItem::new(label.clone()).checked(*on).enabled(*enabled),
+            StatusEntry::Radio { label, on, enabled } => MenuItem::new(label.clone()).radio(*on).enabled(*enabled),
+            StatusEntry::Slider { label, value } => MenuItem::slider(label.clone(), *value as f64),
+        };
+        items.push(if separate { m.separated() } else { m });
+        wire.push(Some(i as u32));
+        separate = false;
+    }
+    (items, wire)
+}
+
+/// The items from the WM, keeping each app's menu state. None when
+/// nothing changed (same apps, same generations).
+fn merge_status(old: &[StatusShown], new: Vec<StatusItem>, dirty: Option<&Arc<AtomicBool>>) -> Option<Vec<StatusShown>> {
+    let same = old.len() == new.len()
+        && old.iter().zip(&new).all(|(o, n)| o.item.app_id == n.app_id && o.item.generation == n.generation);
+    if same {
+        return None;
+    }
+    Some(new.into_iter().map(|item| {
+        let open = match old.iter().find(|o| o.item.app_id == item.app_id) {
+            Some(o) => o.open.clone(),
+            None => match dirty {
+                Some(d) => Mutable::with_dirty(MenuState::default(), d.clone()),
+                None => Mutable::new(MenuState::default()),
+            },
+        };
+        StatusShown { item, open }
+    }).collect())
+}
+
+/// Apps' status items from the WM; none when it isn't reachable.
+fn poll_status_items() -> Vec<StatusItem> {
+    match forum_ctl::request(forum_ctl::default_socket_path(), &Intent::ListStatusItems) {
+        Ok(Reply::StatusItems { items }) => items,
+        _ => Vec::new(),
+    }
 }
 
 /// The controller menu's line for one pad: its name, and the app holding
@@ -269,6 +342,48 @@ impl View for BarView {
         }
 
         let pads = self.pads.get_cloned();
+
+        // Apps' status items (forum-status-items.md §1): their own group,
+        // left of the system icons and set apart from them by a rule, so
+        // a glyph that looks like a system icon still sits among apps.
+        // The bar draws the icon and the menu, headed by the app's name.
+        let status = self.status.get_cloned();
+        if !status.is_empty() {
+            let group = ctx.push(Node::hstack(Rect::ZERO_SIZED, 10.0));
+            ctx.set_flex(group, FlexStyle { align: pergola::Align::Center, ..FlexStyle::default() });
+            for s in &status {
+                let (items, wire) = status_menu(&s.item);
+                let wire = Rc::new(wire);
+                let (w1, w2) = (wire.clone(), wire);
+                let (a1, a2) = (s.item.app_id.clone(), s.item.app_id.clone());
+                let (st1, st2) = (self.status_stale.clone(), self.status_stale.clone());
+                let label = if s.item.tooltip.is_empty() { short_app_name(&s.item.app_id).to_string() } else { s.item.tooltip.clone() };
+                let button = MenuButton::new(label, s.open.clone(), items, move |i| {
+                    let Some(&Some(index)) = w1.get(i) else { return };
+                    let r = forum_ctl::request(forum_ctl::default_socket_path(), &Intent::StatusPick { app_id: a1.clone(), index });
+                    if !matches!(r, Ok(Reply::Ack)) {
+                        eprintln!("forum-bar: status pick {a1} {index}: {r:?}");
+                    }
+                    st1.store(true, Ordering::Relaxed);
+                })
+                .on_slide(move |i, value| {
+                    let Some(&Some(index)) = w2.get(i) else { return };
+                    let r = forum_ctl::request(forum_ctl::default_socket_path(), &Intent::StatusSlide { app_id: a2.clone(), index, value: value as f32 });
+                    if !matches!(r, Ok(Reply::Ack)) {
+                        eprintln!("forum-bar: status slide {a2} {index}: {r:?}");
+                    }
+                    st2.store(true, Ordering::Relaxed);
+                })
+                .icon(s.item.glyph, 15.0, Some(t.text_secondary()))
+                .attached();
+                ctx.place(button);
+            }
+            ctx.pop();
+            let gap = ctx.push(Node::hstack(Rect::ZERO_SIZED, 0.0));
+            ctx.set_flex(gap, FlexStyle { align: pergola::Align::Center, ..FlexStyle::default() });
+            Divider::vertical(16.0).emit(ctx);
+            ctx.pop();
+        }
 
         // Right icon row.
         let row = ctx.push(Node::hstack(Rect::ZERO_SIZED, 14.0));
@@ -614,6 +729,12 @@ fn main() -> std::io::Result<()> {
     let vol_muted = Mutable::with_dirty(false, dirty.clone());
     let vol_output = Mutable::with_dirty(0usize, dirty.clone());
     let mut control: Option<lyra_protocol::client::Media> = None;
+    let status = Mutable::with_dirty(
+        merge_status(&[], poll_status_items(), Some(&dirty)).unwrap_or_default(),
+        dirty.clone(),
+    );
+    let status_stale = Arc::new(AtomicBool::new(false));
+    let dirty_flag = dirty.clone();
 
     let view = BarView {
         now: now.clone(),
@@ -633,6 +754,8 @@ fn main() -> std::io::Result<()> {
         vol_level: vol_level.clone(),
         vol_muted: vol_muted.clone(),
         vol_output: vol_output.clone(),
+        status: status.clone(),
+        status_stale: status_stale.clone(),
     };
     let mut app = App::new_with_flag(view, dirty).with_theme(mode);
 
@@ -658,6 +781,20 @@ fn main() -> std::io::Result<()> {
                     workspace.set(w_now);
                 }
                 pads_stale.store(true, Ordering::Relaxed);
+                status_stale.store(true, Ordering::Relaxed);
+            }
+        }
+        // Apps' status items: every second, and at once after a pick (the
+        // app answers with its next `Set`). A menu whose app went closes.
+        if status_stale.swap(false, Ordering::Relaxed) {
+            let old = status.get_cloned();
+            if let Some(new) = merge_status(&old, poll_status_items(), Some(&dirty_flag)) {
+                for o in &old {
+                    if o.open.get().open && !new.iter().any(|n| n.item.app_id == o.item.app_id) {
+                        o.open.set(MenuState::default());
+                    }
+                }
+                status.set(new);
             }
         }
         // The pads: every second, and at once after a "Take back".
@@ -761,7 +898,65 @@ mod tests {
             vol_level: Mutable::new(0.0),
             vol_muted: Mutable::new(false),
             vol_output: Mutable::new(0),
+            status: Mutable::new(Vec::new()),
+            status_stale: Arc::new(AtomicBool::new(false)),
         }
+    }
+
+    fn sample_item(generation: u64) -> StatusItem {
+        StatusItem {
+            app_id: "org.test.vpn".into(),
+            glyph: phosphor::LOCK_SIMPLE,
+            tooltip: "VPN".into(),
+            menu: vec![
+                StatusEntry::Check { label: "Connected".into(), on: true, enabled: true },
+                StatusEntry::Separator,
+                StatusEntry::Radio { label: "Home".into(), on: true, enabled: true },
+                StatusEntry::Radio { label: "Office".into(), on: false, enabled: false },
+                StatusEntry::Slider { label: "Level".into(), value: 0.25 },
+                StatusEntry::Action { label: "Quit".into(), enabled: true },
+            ],
+            generation,
+        }
+    }
+
+    #[test]
+    fn a_status_menu_is_headed_by_the_app_and_maps_back_to_its_entries() {
+        let (items, wire) = status_menu(&sample_item(1));
+        let labels: Vec<_> = items.iter().map(|m| m.label.as_str()).collect();
+        assert_eq!(labels, ["vpn", "Connected", "Home", "Office", "Level", "Quit"]);
+        assert!(!items[0].enabled, "the heading is not pickable");
+        assert_eq!(wire, [None, Some(0), Some(2), Some(3), Some(4), Some(5)]);
+        assert!(items[1].separated && items[2].separated && !items[3].separated);
+        assert_eq!(items[1].mark, pergola::widgets::popup::Mark::Check(true));
+        assert_eq!(items[2].mark, pergola::widgets::popup::Mark::Radio(true));
+        assert!(!items[3].enabled);
+        assert_eq!(items[4].slider, Some(0.25));
+    }
+
+    #[test]
+    fn status_items_keep_their_menu_state_and_redraw_only_on_change() {
+        let first = merge_status(&[], vec![sample_item(1)], None).unwrap();
+        first[0].open.set(MenuState::opened(None));
+        assert!(merge_status(&first, vec![sample_item(1)], None).is_none());
+        let second = merge_status(&first, vec![sample_item(2)], None).unwrap();
+        assert!(second[0].open.get().open, "an open menu stays open across a change");
+        assert!(merge_status(&second, Vec::new(), None).unwrap().is_empty());
+    }
+
+    #[test]
+    fn status_items_sit_in_the_bar_and_open_their_menu() {
+        pergola::text::clear_measurer();
+        let view = sample_view();
+        let has_text = |tree: &pergola::NodeTree, s: &str| tree.iter().any(|(_, x)| matches!(x, Node::Text { content, .. } if content == s));
+        let (tree, _) = render(&view, Semantic::LIGHT);
+        assert!(!has_text(&tree, "Connected"));
+        view.status.set(merge_status(&[], vec![sample_item(1)], None).unwrap());
+        let (tree, _) = render(&view, Semantic::LIGHT);
+        assert!(!has_text(&tree, "Connected"));
+        view.status.get_cloned()[0].open.set(MenuState::opened(None));
+        let (tree, _) = render(&view, Semantic::LIGHT);
+        assert!(has_text(&tree, "vpn") && has_text(&tree, "Connected") && has_text(&tree, "Quit"));
     }
 
     #[test]

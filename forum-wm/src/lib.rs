@@ -380,6 +380,7 @@ fn subtract(r: &WmRect, cut: &WmRect) -> Vec<WmRect> {
 /// set <identity>@<x>,<y>:<w>x<h> ... [mirror <identity>=<source> ...]
 /// ```
 pub mod media;
+pub mod status;
 
 pub mod displays {
     use fresco_protocol::{WmOutput, WmOutputPlacement};
@@ -1756,6 +1757,17 @@ pub mod control {
             Intent::TakeBackPad { device_id } => match conn.pad_release(device_id) {
                 Ok(()) => Reply::Ack,
                 Err(e) => Reply::Err { message: e.to_string() },
+            },
+            // Status items (forum-status-items.md): the bar lists them and
+            // reports the user's picks, which go to the app.
+            Intent::ListStatusItems => Reply::StatusItems { items: crate::status::list() },
+            Intent::StatusPick { app_id, index } => match crate::status::pick(&app_id, index) {
+                Ok(()) => Reply::Ack,
+                Err(message) => Reply::Err { message },
+            },
+            Intent::StatusSlide { app_id, index, value } => match crate::status::slide(&app_id, index, value) {
+                Ok(()) => Reply::Ack,
+                Err(message) => Reply::Err { message },
             },
             // frescod validates the mode against the monitor's list; the WM
             // re-lays out when frescod's EV_DISPLAY_CHANGED arrives, not here,

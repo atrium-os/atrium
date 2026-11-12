@@ -45,6 +45,9 @@ pub fn apply_all(
     if caps.audio_control == Some(true) {
         apply_audio_control(jc, opts);
     }
+    if caps.status_item == Some(true) {
+        apply_socket("forum-status.sock", jc, opts);
+    }
     if caps.media_control == Some(true) {
         apply_media_control(jc, opts);
     }
@@ -129,6 +132,9 @@ pub fn apply_window_management(jc: &mut JailConfig, opts: &BuildOpts) {
     // so it can bind there. (The chrome side, apply_forum_control, mounts the same
     // dir — reaching it IS the forum-control capability; the WM reads no policy.)
     apply_socket("forum-ctl.sock", jc, opts);
+    // And the status-item socket apps with `status-item` reach it through
+    // (forum-status-items.md).
+    apply_socket("forum-status.sock", jc, opts);
 }
 
 /// `forum-control` — a Forum chrome app (bar/dock/overview). It *connects* to the
@@ -356,12 +362,14 @@ mod tests {
     fn window_management_mounts_forum_ctl_socket() {
         let mut j = jc();
         apply_window_management(&mut j, &opts());
-        // Two per-service dir mounts: the dedicated wm socket (reachability = the
-        // window-management grant) + forum-ctl (which the WM serves to chrome).
-        assert_eq!(j.mounts.len(), 2);
+        // Three per-service dir mounts: the dedicated wm socket (reachability =
+        // the window-management grant), forum-ctl (which the WM serves to
+        // chrome) and forum-status (which the WM serves, so it must reach it).
+        assert_eq!(j.mounts.len(), 3);
         let srcs: Vec<_> = j.mounts.iter().map(|m| m.src.clone()).collect();
         assert!(srcs.contains(&PathBuf::from("/atrium/sockets/fresco-wm")));
         assert!(srcs.contains(&PathBuf::from("/atrium/sockets/forum-ctl")));
+        assert!(srcs.contains(&PathBuf::from("/atrium/sockets/forum-status")));
     }
 
     #[test]

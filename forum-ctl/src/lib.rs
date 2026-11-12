@@ -115,6 +115,90 @@ pub enum Intent {
     /// pad): the user's override of an exclusive claim. The pad follows
     /// focus again; the app is told it lost the claim.
     TakeBackPad { device_id: u32 },
+    /// "Which apps have an item in the bar?" (forum-status-items.md).
+    ListStatusItems,
+    /// The user picked entry `index` of app `app_id`'s status menu.
+    StatusPick { app_id: String, index: u32 },
+    /// The user moved slider entry `index` of app `app_id`'s status menu.
+    StatusSlide { app_id: String, index: u32, value: f32 },
+}
+
+// ── status items (docs/spec/forum-status-items.md) ──────────────────────────
+
+/// The status-item socket inside a jail (`status-item`; forum-wm serves it).
+pub const JAILED_STATUS_SOCKET: &str = "/atrium/sockets/forum-status/forum-status.sock";
+/// Dev fallback when running bare.
+pub const DEV_STATUS_SOCKET: &str = "/tmp/forum-status.sock";
+/// Most entries in a status menu.
+pub const STATUS_MAX_ENTRIES: usize = 32;
+/// Longest label or tooltip, in characters (longer ones are cut).
+pub const STATUS_MAX_LABEL: usize = 64;
+
+/// `$FORUM_STATUS_SOCKET` → the in-jail path (if mounted) → the dev fallback.
+pub fn status_socket_path() -> std::path::PathBuf {
+    if let Ok(s) = std::env::var("FORUM_STATUS_SOCKET") {
+        return std::path::PathBuf::from(s);
+    }
+    if std::path::Path::new("/atrium/sockets/forum-status").is_dir() {
+        return std::path::PathBuf::from(JAILED_STATUS_SOCKET);
+    }
+    std::path::PathBuf::from(DEV_STATUS_SOCKET)
+}
+
+/// One entry of a status menu, as the app describes it and the bar draws it.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub enum StatusEntry {
+    Action { label: String, enabled: bool },
+    Check { label: String, on: bool, enabled: bool },
+    Radio { label: String, on: bool, enabled: bool },
+    /// 0 to 1.
+    Slider { label: String, value: f32 },
+    Separator,
+}
+
+impl StatusEntry {
+    /// Within the limits: labels cut, a slider's value in 0..=1 (NaN: 0).
+    pub fn bounded(self) -> StatusEntry {
+        let cut = |s: String| s.chars().take(STATUS_MAX_LABEL).collect::<String>();
+        match self {
+            StatusEntry::Action { label, enabled } => StatusEntry::Action { label: cut(label), enabled },
+            StatusEntry::Check { label, on, enabled } => StatusEntry::Check { label: cut(label), on, enabled },
+            StatusEntry::Radio { label, on, enabled } => StatusEntry::Radio { label: cut(label), on, enabled },
+            StatusEntry::Slider { label, value } => {
+                StatusEntry::Slider { label: cut(label), value: if value.is_nan() { 0.0 } else { value.clamp(0.0, 1.0) } }
+            }
+            StatusEntry::Separator => StatusEntry::Separator,
+        }
+    }
+}
+
+/// App → forum-wm on the status socket.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub enum ToStatus {
+    /// Put (or replace) this app's item: a Phosphor glyph, a tooltip, the menu.
+    Set { glyph: char, tooltip: String, menu: Vec<StatusEntry> },
+    Remove,
+}
+
+/// forum-wm → app on the status socket: what the user did.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub enum FromStatus {
+    Picked { index: u32 },
+    Slid { index: u32, value: f32 },
+    /// Refused (no `status-item`, or unregistered); the socket closes.
+    Denied { message: String },
+}
+
+/// A status item as the bar draws it.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct StatusItem {
+    /// The app's id, from the launch registry (never one the app gave).
+    pub app_id: String,
+    pub glyph: char,
+    pub tooltip: String,
+    pub menu: Vec<StatusEntry>,
+    /// Bumped on each change, so the bar redraws only then.
+    pub generation: u64,
 }
 
 /// A gamepad as the controller menu shows it.
@@ -167,6 +251,9 @@ pub enum Reply {
     SpanGroups { groups: Vec<SpanGroupInfo>, spanning: u32, no_span: Vec<String> },
     /// Every gamepad — answer to `ListPads`.
     Pads { pads: Vec<PadInfo> },
+    /// The apps' bar items, in the order they were added — answer to
+    /// `ListStatusItems`.
+    StatusItems { items: Vec<StatusItem> },
 }
 
 /// Encode a message for the wire.

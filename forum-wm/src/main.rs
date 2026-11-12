@@ -243,6 +243,8 @@ fn main() -> io::Result<()> {
 
     spawn_input_poller(Arc::clone(&core));
 
+    spawn_status_server();
+
     let ctl = forum_ctl::default_socket_path();
     let ctl = ctl.to_string_lossy();
     eprintln!("forum-wm: serving forum-ctl at {ctl}");
@@ -694,6 +696,72 @@ fn serve_forum_ctl(path: &str, core: &Core) -> io::Result<()> {
         }
     }
     Ok(())
+}
+
+/// Serve the status-item socket (forum-status-items.md) on a thread of its
+/// own. Reaching it is the `status-item` capability (Portcullis mounts
+/// `/atrium/sockets/forum-status/` only into jails holding it); the app is
+/// named by the launch registry, so it cannot put an item up as another app.
+/// An unregistered peer is refused, unless `FORUM_STATUS_ANY=1` (development:
+/// it is named `uid:N`).
+fn spawn_status_server() {
+    use std::os::unix::net::UnixListener;
+    let path = forum_ctl::status_socket_path();
+    let _ = std::fs::remove_file(&path);
+    let listener = match UnixListener::bind(&path) {
+        Ok(l) => l,
+        Err(e) => return eprintln!("forum-wm: status items: cannot bind {}: {e}", path.display()),
+    };
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o666));
+    }
+    eprintln!("forum-wm: serving status items on {}", path.display());
+    let any = std::env::var("FORUM_STATUS_ANY").as_deref() == Ok("1");
+    std::thread::spawn(move || {
+        let mut next = 0u64;
+        for stream in listener.incoming() {
+            let Ok(s) = stream else { continue };
+            next += 1;
+            let conn = next;
+            std::thread::spawn(move || serve_status(s, conn, any));
+        }
+    });
+}
+
+fn serve_status(mut s: std::os::unix::net::UnixStream, conn: u64, any: bool) {
+    use forum_ctl::{FromStatus, ToStatus};
+    let send = |s: &mut std::os::unix::net::UnixStream, m: &FromStatus| {
+        forum_ctl::encode(m).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e)).and_then(|b| forum_ctl::write_frame(s, &b))
+    };
+    let uid = peer_uid(&s);
+    let registry = portcullis_peer::AppRegistry::load(portcullis_peer::DEFAULT_REGISTRY).unwrap_or_default();
+    let app_id = match uid.and_then(|u| registry.resolve(u).map(|(_, a)| a.to_string())) {
+        Some(a) => a,
+        None if any => format!("uid:{}", uid.unwrap_or(0)),
+        None => {
+            let _ = send(&mut s, &FromStatus::Denied { message: "not a launched app".into() });
+            return;
+        }
+    };
+    eprintln!("forum-wm: status item from {app_id}");
+    let (tx, rx) = std::sync::mpsc::channel::<FromStatus>();
+    if let Ok(mut w) = s.try_clone() {
+        std::thread::spawn(move || {
+            for m in rx {
+                if send(&mut w, &m).is_err() {
+                    return;
+                }
+            }
+        });
+    }
+    while let Ok(frame) = forum_ctl::read_frame(&mut s) {
+        match forum_ctl::decode::<ToStatus>(&frame) {
+            Ok(m) => forum_wm::status::apply(&app_id, conn, &tx, m),
+            Err(_) => break,
+        }
+    }
+    forum_wm::status::closed(conn);
 }
 
 /// The connecting peer's uid (getpeereid over the UDS) — for the log line only;
