@@ -839,6 +839,7 @@ void	amd_gmc12_gart_disable(struct amd_gart *gt);
 int	amd_gmc12_gart_map(struct amd_gart *gt, uint64_t gart_addr,
 	    vm_paddr_t pa);
 int	amd_gmc12_flush(struct amd_gart *gt);
+int	amd_ih7_test(struct atrium_amd_softc *sc, struct amd_gart *gt);
 int	amd_smu_init(struct atrium_amd_softc *sc);	/* smu.c, silicon test */
 
 /*

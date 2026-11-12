@@ -377,7 +377,7 @@ amd_smu_init(struct atrium_amd_softc *sc)
 	uint64_t feat;
 	uint32_t v, ifver = 0;
 	bus_size_t lim = rman_get_size(sc->regs);
-	int rid, us, r, err = 0, gc_up_ok = 0, gfx_cg = 0, gmc = 0;
+	int rid, us, r, err = 0, gc_up_ok = 0, gfx_cg = 0, gmc = 0, ih = 0;
 
 #define	SEND(m, a, o)	smu_send(&link, (m), (a), (o), false)
 	link.gen = smu_gen_find(sc);
@@ -548,6 +548,10 @@ amd_smu_init(struct atrium_amd_softc *sc)
 			DELAY(100);
 		r = amd_gmc12_gart_enable(sc, vram, &gt);
 		device_printf(sc->dev, "gmc: stage 4a: %d\n", r);
+		/* Stage 4b (kenv hw.atrium_gpu.ih=1): IH ring 0 + MSI-X. */
+		TUNABLE_INT_FETCH("hw.atrium_gpu.ih", &ih);
+		if (ih && r == 0)
+			(void)amd_ih7_test(sc, &gt);
 		amd_gmc12_gart_disable(&gt);
 		(void)SEND(SMU_ALLOW_GFXOFF, 0, NULL);
 		if (!smu_sample(&link, vram, ifver, 5, "idle after 4a")) {
