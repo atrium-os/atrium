@@ -66,3 +66,20 @@ bases, HQD select and modeset/EDID use registers only gpusim has (`0x2xxxx`/`0x3
    gates jaild's attestation of the driver.
 
 Per-IP code is chosen by discovery version, not by device id (never hardcode RDNA4).
+
+## 5. Log
+
+- **2026-11-12, stage 1 done.** First bare-metal boot: bundle `03715a5` booted via
+  `boot-once` in about 80 s; `wan0` = igb1 with Ubuntu's address; root grew to 554 GB.
+  The R9700 is `vgapci0` at pci0:3:0:0 (PCIe Gen5 x16, BAR5 512 KiB at 0x98100000,
+  256 MiB BAR0, plain MSI only); the boot console is the BMC's ASPEED (efifb 800x600),
+  not the R9700. The BMC (ASUS, fw 1.13) sits on Hostkey's management network and is not
+  reachable from the box.
+- **2026-11-12, stage 2 discovery.** `atrium-gpu-probe pci 3:0:0 --vram-top` under Atrium
+  (vgapci does not own the registers) read RCC_CONFIG_MEMSIZE 0x7f70 (32624 MiB) and the
+  discovery table: v1.3, IP table v3, one die, 46 IPs, checksums good. GC 12.0.1, PSP/SMU
+  14.0.3, SDMA 7.0.1 (two instances, GC's bases), MMHUB/ATHUB 4.1.0, OSSSYS 7.0.0, HDP
+  7.0.0, NBIF 6.3.1, VCN 5.0.0, DMU 4.1.0 (the firmware files say dcn_4_0_1: compare with
+  amdgpu's view on Ubuntu), 8 UMCs. It found two parser bugs that synthetic fixtures hid
+  (table signature is "IPDS", VCN hw id is 12); the real table is now a golden test
+  (`rs-host-tests/data/r9700-discovery.bin`).
