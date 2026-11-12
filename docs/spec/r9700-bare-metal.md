@@ -459,3 +459,12 @@ land with it.
   RELEASE_MEM with an interrupt. Pass = fence seen and all 64 words 42 (the golden),
   then REMOVE_QUEUE and a register dequeue; the block is leaked, not freed, if the queue
   will not go inactive.
+- **2026-11-12 21:26, 2ce97c75: stage 4e PASSED, the first compute dispatch on silicon.**
+  MES started both pipes on attempt 1. ADD_QUEUE (compute) on pipe 0 ok in 50 us; the
+  queue went active with doorbell 0x60000018; the fence 0x4e000001 came back 30 us after
+  the doorbell (rptr = wptr = 0xc); all 64 output words were 0x2a, matching the oracle
+  golden write_42.r9700.txt. No hub faults. The IH saw 19 EOP IVs, one on ring 4 (me 1
+  pipe 0 queue 0, the dispatch's RELEASE_MEM interrupt). REMOVE_QUEUE (compute) ok in
+  140 us, HQD inactive. The card was then proven idle (13 W) and the reset left it cold.
+  Log /root/runs/20261112T212618Z.log. Stages 3 and 4a–4e are box-verified; next is stage
+  5 (atrium_gpu_test, test_gpu_isolation).
