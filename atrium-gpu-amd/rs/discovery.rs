@@ -11,7 +11,7 @@
  * pick its per-IP code by version (Shankar 2026-11-05: never hardcode RDNA4).
  *
  * Layout: a binary header (signature 0x28211407, checksum over the binary,
- * a table list), then the IP discovery table (signature "IPIP") with one
+ * a table list), then the IP discovery table (signature "IPDS", 0x53445049) with one
  * die header per die and a variable-length entry per IP instance. These are
  * the documented on-device structs (Linux's MIT-licensed discovery.h has the
  * same ones); all little-endian.
@@ -23,7 +23,7 @@
  */
 
 pub const BINARY_SIGNATURE: u32 = 0x2821_1407;
-pub const IP_DISCOVERY_SIGNATURE: u32 = 0x5049_5049; /* "IPIP" */
+pub const IP_DISCOVERY_SIGNATURE: u32 = 0x5344_5049; /* "IPDS" (bytes 49 50 44 53); confirmed on the R9700 2026-11-12 */
 /// Where the table sits, counted back from the end of VRAM.
 pub const DISCOVERY_TMR_OFFSET_FROM_TOP: u64 = 64 << 10;
 pub const DISCOVERY_TMR_SIZE: usize = 10 << 10;
