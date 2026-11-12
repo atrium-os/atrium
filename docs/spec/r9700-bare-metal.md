@@ -67,6 +67,37 @@ bases, HQD select and modeset/EDID use registers only gpusim has (`0x2xxxx`/`0x3
 
 Per-IP code is chosen by discovery version, not by device id (never hardcode RDNA4).
 
+## 4.1 Stage 3 plan: PSP bootloader load
+
+Sources: the hardware interface as Linux's MIT-licensed `psp_v14_0.c`, `amdgpu_psp.c`
+and `mp_14_0_2_offset.h` describe it (register offsets, command codes, order). The
+firmware is loaded as opaque blobs; only container headers are parsed (`rs/fw.rs`).
+
+1. **Gate.** Only for MP0 14.x from discovery; anything else is refused by name and
+   version. Skip if C2PMSG_81 != 0 (sOS already running). Never on gpusim.
+2. **Buffers in VRAM.** The PSP needs a 1 MiB, 1 MiB-aligned staging buffer (later also
+   the ring and fence buffers). We use VRAM through BAR0, amdgpu's
+   `debug_use_vram_fw_buf` path, so no GART or system-memory DMA is needed yet. Its GPU
+   address is `(MMMC_VM_FB_LOCATION_BASE << 24) + offset`, as the VBIOS programmed it
+   (read by `atrium-gpu-probe --status`).
+3. **Components, in order**, each from `psp_14_0_3_sos.bin`'s descriptor table, each only
+   if present: KDB (0x80000), SPL (0x10000000), SYS_DRV (0x10000), SOC_DRV (0xB0000),
+   INTF_DRV (0xD0000), HAD_DRV (0xC0000), RAS_DRV (0xE0000), IPKEYMGR_DRV (0xF0000),
+   SPDM_DRV (0x20000000), then SOS (0x20000). For each: wait for C2PMSG_35 bit 31
+   (bootloader ready), copy the blob to the buffer, write `mc >> 20` to C2PMSG_36 and the
+   command to C2PMSG_35, wait for bit 31 again. After SOS: wait 20 ms, then for C2PMSG_81
+   to change (sOS sign of life).
+4. **Then** the KM ring (C2PMSG_69/70/71, command in C2PMSG_64, response bit 31) and the
+   GFX command interface (TMR setup, then each IP's microcode through the PSP).
+5. **Memory training** (PSP_BL__DRAM_*_TRAIN) is skipped: the VBIOS trained GDDR6 at
+   POST (the discovery table was read from VRAM fine). Revisit if VRAM misbehaves.
+6. **Failure = stop.** Timeouts leave the device unattached and vgapci-free; recovery is a
+   reboot (the PSP's state is not resettable from the host without a full reset, which is
+   stage 4 work).
+
+The step runs as a separate, explicitly loaded test module first (`atrium_gpu_psp_test`),
+not in the normal attach, so a hang cannot happen at boot.
+
 ## 5. Log
 
 - **2026-11-12, stage 1 done.** First bare-metal boot: bundle `03715a5` booted via
