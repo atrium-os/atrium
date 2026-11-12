@@ -23,6 +23,8 @@ pub enum Error {
     NoMemory,
     /// A codec, profile or configuration the build doesn't decode.
     Unsupported,
+    /// An encrypted sample whose key the CDM doesn't have yet: send it again once it has.
+    NoKey,
 }
 
 impl std::fmt::Display for Error {
@@ -32,6 +34,7 @@ impl std::fmt::Display for Error {
             Error::TooBig => "frame too big",
             Error::NoMemory => "out of memory",
             Error::Unsupported => "unsupported",
+            Error::NoKey => "no key",
         })
     }
 }
@@ -80,6 +83,11 @@ pub trait VideoDecoder: Send {
     /// Give the decoder one coded frame. `Ok(false)`: it's busy, so
     /// [`Self::receive`] pictures first and send the same frame again.
     fn send(&mut self, data: &[u8], pts_ns: i64) -> Result<bool>;
+    /// [`Self::send`] for a demuxed sample. Only a decoder that decrypts (the CDM's
+    /// decrypt-and-decode path) looks at `crypto`; the rest are given clear samples.
+    fn send_sample(&mut self, s: &atrium_media_demux::Sample) -> Result<bool> {
+        self.send(&s.data, s.pts_ns)
+    }
     /// The next decoded picture, if one is ready. Call until `None` after
     /// each send; after the last send, until `None` to drain.
     fn receive(&mut self) -> Result<Option<Picture<'_>>>;

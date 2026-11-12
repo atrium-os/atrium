@@ -8,6 +8,7 @@
 //! parses or decodes is hostile.
 #![deny(unsafe_code)]
 
+mod cdmvideo;
 mod cue;
 mod store;
 
@@ -51,16 +52,65 @@ fn codec_id(c: Codec) -> u32 {
     }
 }
 
-/// The decoder for a video track. H.264 goes to hospes-codec, if the supervisor started one;
-/// there is one codec process per worker, so a second H.264 track finds none left.
-fn video_decoder(t: &TrackInfo, cfg: &decode::Config, h264: &mut Option<UnixStream>) -> decode::Result<Box<dyn decode::VideoDecoder>> {
+/// The decoder for a video track, and whether it is the CDM's (decrypt-and-decode, given
+/// samples as they are stored). An encrypted track goes to the CDM if it will take it;
+/// otherwise, and for clear tracks, it is decrypted first (if need be) and decoded here.
+/// H.264 goes to hospes-codec, if the supervisor started one; there is one codec process
+/// per worker, so a second H.264 track finds none left.
+fn video_decoder(t: &TrackInfo, cfg: &decode::Config, h264: &mut Option<UnixStream>, cdm: &Option<UnixStream>) -> decode::Result<(Box<dyn decode::VideoDecoder>, bool)> {
+    if let (Some(sock), Some(_)) = (cdm.as_ref(), t.protection.as_ref()) {
+        if let Ok(sock) = sock.try_clone() {
+            if let Ok(d) = cdmvideo::CdmVideo::new(t, (cfg.max_width, cfg.max_height), sock) {
+                return Ok((Box::new(d), true));
+            }
+        }
+    }
     #[cfg(feature = "h264")]
     if t.codec == Codec::H264 && !t.encrypted {
         let sock = h264.take().ok_or(decode::Error::Unsupported)?;
-        return Ok(Box::new(decode::hospes::Openh264::new(t, cfg.max_width, cfg.max_height, sock)?));
+        return Ok((Box::new(decode::hospes::Openh264::new(t, cfg.max_width, cfg.max_height, sock)?), false));
     }
     let _ = h264;
-    decode::video(t, cfg)
+    Ok((decode::video(t, cfg)?, false))
+}
+
+/// What feeding the video decoder one sample came to.
+enum Fed {
+    /// Sent (and the store moved on), or the decoder was busy: either way, receive next.
+    Sent,
+    /// No sample buffered.
+    Empty,
+    /// Waiting for a key.
+    Wait,
+    Fail(u32),
+}
+
+/// Give the video decoder its next sample: as stored if the CDM decodes, decrypted
+/// first otherwise.
+fn feed_video(v: &mut Video, cdm: &mut Option<UnixStream>) -> Fed {
+    let s = if v.cdm_decodes {
+        match v.store.next() {
+            Some(s) => s,
+            None => return Fed::Empty,
+        }
+    } else {
+        match next_clear(&mut v.store, cdm) {
+            Ok(Some(s)) => s,
+            Ok(None) => return Fed::Empty,
+            Err(Locked::Wait) => return Fed::Wait,
+            Err(Locked::Fail) => return Fed::Fail(err::DECODE),
+        }
+    };
+    match v.dec.send_sample(s) {
+        Ok(true) => {
+            v.store.advance();
+            Fed::Sent
+        }
+        Ok(false) => Fed::Sent,
+        Err(decode::Error::NoKey) => Fed::Wait,
+        Err(decode::Error::TooBig) => Fed::Fail(err::TOO_BIG),
+        Err(_) => Fed::Fail(err::DECODE),
+    }
 }
 
 /// Why the next sample can't be decoded yet.
@@ -75,24 +125,10 @@ enum Locked {
 /// hospes.md §8.3: the clear bytes go to our own decoders).
 fn next_clear<'a>(store: &'a mut Store, cdm: &mut Option<UnixStream>) -> Result<Option<&'a demux::Sample>, Locked> {
     let Some(s) = store.next_mut() else { return Ok(None) };
-    if let Some(c) = s.crypto.as_ref() {
+    if s.crypto.is_some() {
         let Some(sock) = cdm.as_mut() else { return Err(Locked::Fail) };
-        // Chromium hands CDMs 16-byte IVs: an 8-byte one is the counter's high half.
-        let mut iv = c.iv.clone();
-        iv.resize(16, 0);
-        let sample = hospes_proto::Sample {
-            scheme: match c.scheme {
-                demux::Scheme::Cenc => hospes_proto::scheme::CENC,
-                demux::Scheme::Cbcs => hospes_proto::scheme::CBCS,
-            },
-            key_id: c.key_id.to_vec(),
-            iv,
-            subsamples: c.subsamples.clone(),
-            crypt_byte_block: c.crypt_byte_block as u32,
-            skip_byte_block: c.skip_byte_block as u32,
-            timestamp: s.pts_ns / 1000,
-            data: std::mem::take(&mut s.data),
-        };
+        let data = std::mem::take(&mut s.data);
+        let sample = cdmvideo::proto_sample(s, data);
         let len = sample.data.len();
         if hospes_proto::io::send(sock, &hospes_proto::Msg::Decrypt { sample: sample.clone() }).is_err() {
             return Err(Locked::Fail);
@@ -129,6 +165,8 @@ struct Feed {
 struct Video {
     track: TrackInfo,
     dec: Box<dyn decode::VideoDecoder>,
+    /// `dec` is the CDM's: it takes samples still encrypted.
+    cdm_decodes: bool,
     store: Store,
     feed: usize,
     buffers: Vec<Map>,
@@ -541,13 +579,13 @@ impl Worker {
         if self.video.is_none() {
             if let Some(t) = tracks.iter().find(|t| t.codec.is_video()) {
                 let cfg = decode::Config { threads: self.limits.threads, max_width: self.limits.max_width, max_height: self.limits.max_height };
-                match video_decoder(t, &cfg, &mut self.h264) {
-                    Ok(dec) => {
+                match video_decoder(t, &cfg, &mut self.h264, &self.cdm) {
+                    Ok((dec, cdm_decodes)) => {
                         let Kind::Video { width, height } = t.kind else { return };
                         feed.video = Some(t.index);
                         // The track is announced once its first picture says
                         // its bit depth (see `probe_video`).
-                        self.video = Some(Video { track: t.clone(), dec, store: Store::default(), feed: fi, buffers: Vec::new(), free: VecDeque::new(), format: Format::Nv12, dims: (width, height), drained: false, probed: false, drain_tries: 0 });
+                        self.video = Some(Video { track: t.clone(), dec, cdm_decodes, store: Store::default(), feed: fi, buffers: Vec::new(), free: VecDeque::new(), format: Format::Nv12, dims: (width, height), drained: false, probed: false, drain_tries: 0 });
                     }
                     Err(decode::Error::TooBig) => return self.fail(err::TOO_BIG),
                     Err(_) => return self.fail(err::UNSUPPORTED),
@@ -770,27 +808,15 @@ impl Worker {
                     did = true;
                 }
                 Ok(None) => {
-                    let next = match next_clear(&mut v.store, &mut self.cdm) {
-                        Ok(n) => n,
-                        Err(Locked::Wait) => break,
-                        Err(Locked::Fail) => {
-                            fail = Some(err::DECODE);
-                            break;
-                        }
-                    };
-                    if let Some(s) = next {
-                        match v.dec.send(&s.data, s.pts_ns) {
-                            Ok(true) => v.store.advance(),
-                            Ok(false) => {}
-                            Err(decode::Error::TooBig) => {
-                                fail = Some(err::TOO_BIG);
-                                break;
-                            }
-                            Err(_) => {
-                                fail = Some(err::DECODE);
-                                break;
-                            }
-                        }
+                    let fed = feed_video(v, &mut self.cdm);
+                    if let Fed::Fail(code) = fed {
+                        fail = Some(code);
+                        break;
+                    }
+                    if matches!(fed, Fed::Wait) {
+                        break;
+                    }
+                    if matches!(fed, Fed::Sent) {
                         did = true;
                     } else {
                         // dav1d hands out its last pictures only to a get
@@ -850,23 +876,11 @@ impl Worker {
                     break;
                 }
             }
-            let s = match next_clear(&mut v.store, &mut self.cdm) {
-                Ok(Some(s)) => s,
-                Ok(None) | Err(Locked::Wait) => break,
-                Err(Locked::Fail) => {
-                    fail = Some(err::DECODE);
-                    break;
-                }
-            };
-            match v.dec.send(&s.data, s.pts_ns) {
-                Ok(true) => v.store.advance(),
-                Ok(false) => {}
-                Err(decode::Error::TooBig) => {
-                    fail = Some(err::TOO_BIG);
-                    break;
-                }
-                Err(_) => {
-                    fail = Some(err::DECODE);
+            match feed_video(v, &mut self.cdm) {
+                Fed::Sent => {}
+                Fed::Empty | Fed::Wait => break,
+                Fed::Fail(c) => {
+                    fail = Some(c);
                     break;
                 }
             }

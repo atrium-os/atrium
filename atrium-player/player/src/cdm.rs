@@ -392,6 +392,21 @@ impl CdmProc {
         out
     }
 
+    /// Whether the host has exited, waiting up to `grace` for it: a worker that lost its
+    /// data channel reports an error, and that can arrive before the host is reaped.
+    pub fn exited(&mut self, grace: std::time::Duration) -> bool {
+        let until = std::time::Instant::now() + grace;
+        loop {
+            if matches!(self.child.try_wait(), Ok(Some(_))) {
+                return true;
+            }
+            if std::time::Instant::now() >= until {
+                return false;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+    }
+
     pub fn pid(&self) -> u32 {
         self.child.id()
     }

@@ -887,6 +887,11 @@ impl<S: Sink> Player<S> {
                 self.events.push_back(PlayerEvent::AppendRefused { track, code });
             }
             Record::Error { code, track: None } => {
+                // The worker's CDM died under it: the pair is replaced, as when the host's
+                // death is noticed first.
+                if self.w.as_mut().and_then(|w| w.cdm.as_mut()).is_some_and(|c| c.exited(Duration::from_millis(200))) {
+                    return self.worker_lost();
+                }
                 self.waiting = false;
                 self.events.push_back(PlayerEvent::Error(code));
             }
