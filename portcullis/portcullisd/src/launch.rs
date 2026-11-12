@@ -683,6 +683,15 @@ pub fn app_may_fetch(app_id: &str) -> bool {
     m.capabilities.net_fetch == Some(true)
 }
 
+/// Does this app's INSTALLED manifest hold `protected-media`
+/// (docs/spec/hospes.md §3)? Read from the app tree, never from the caller.
+pub fn app_may_play_protected(app_id: &str) -> bool {
+    let path = PathBuf::from(APPS_DIR).join(app_id).join("atrium.toml");
+    let Ok(text) = fs::read_to_string(path) else { return false };
+    let Ok(m) = Manifest::from_str(&text) else { return false };
+    m.capabilities.protected_media == Some(true)
+}
+
 /// The site list this app's INSTALLED manifest narrows its fetcher to
 /// (`net-fetch-sites`, nuntius.md §4), in the fetcher's environment form;
 /// `Ok(None)` is unrestricted. A list that does not parse is an error, so

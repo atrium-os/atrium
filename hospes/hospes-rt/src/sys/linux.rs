@@ -326,3 +326,68 @@ pub fn geteuid() -> u32 {
     let n = if cfg!(target_arch = "x86_64") { 107 } else { 175 };
     call(n, [0; 6]).unwrap_or(0) as u32
 }
+
+// ---- descriptors: receiving and narrowing ---------------------------------------------
+
+const SYS_RECVMSG: usize = if cfg!(target_arch = "x86_64") { 47 } else { 212 };
+
+#[repr(C)]
+struct IoVec {
+    base: usize,
+    len: usize,
+}
+
+#[repr(C)]
+struct MsgHdr {
+    name: usize,
+    namelen: u32,
+    iov: *mut IoVec,
+    iovlen: usize,
+    control: *mut u8,
+    controllen: usize,
+    flags: i32,
+}
+
+/// Receive up to `out.len()` descriptors sent with `SCM_RIGHTS` on `sock` (as FreeBSD's).
+pub fn recv_fds(sock: i32, buf: &mut [u8], out: &mut [i32]) -> R<(usize, usize)> {
+    // struct cmsghdr { usize len; i32 level; i32 type; }: data at 16.
+    const HDR: usize = 16;
+    let mut ctl = [0u64; 8];
+    let room = (HDR + 4 * out.len()).min(core::mem::size_of_val(&ctl));
+    let mut iov = IoVec { base: buf.as_mut_ptr() as usize, len: buf.len() };
+    let mut m = MsgHdr { name: 0, namelen: 0, iov: &mut iov, iovlen: 1, control: ctl.as_mut_ptr().cast(), controllen: room, flags: 0 };
+    let n = call(SYS_RECVMSG, [sock as usize, &mut m as *mut MsgHdr as usize, 0x4000_0000 /* MSG_CMSG_CLOEXEC */, 0, 0, 0])?;
+    let mut k = 0;
+    let c = ctl.as_ptr() as *const u8;
+    if m.controllen >= HDR {
+        // Safety: the kernel filled `controllen` bytes of `ctl` with one cmsghdr.
+        let (len, level, ty) = unsafe { (*(c as *const usize), *(c.add(8) as *const i32), *(c.add(12) as *const i32)) };
+        if level == 1 && ty == 1 && len >= HDR {
+            let count = ((len - HDR) / 4).min(out.len());
+            for (i, o) in out.iter_mut().enumerate().take(count) {
+                *o = unsafe { *(c.add(HDR + 4 * i) as *const i32) };
+            }
+            k = count;
+        }
+    }
+    Ok((n, k))
+}
+
+/// No Capsicum on Linux (development backend): the rights are FreeBSD's numbers, unused.
+pub mod rights {
+    pub const READ: u64 = 0;
+    pub const WRITE: u64 = 0;
+    pub const SEEK: u64 = 0;
+    pub const MMAP_RX: u64 = 0;
+    pub const CREATE: u64 = 0;
+    pub const FSYNC: u64 = 0;
+    pub const FTRUNCATE: u64 = 0;
+    pub const LOOKUP: u64 = 0;
+    pub const FSTAT: u64 = 0;
+    pub const RENAMEAT_SOURCE: u64 = 0;
+    pub const RENAMEAT_TARGET: u64 = 0;
+    pub const UNLINKAT: u64 = 0;
+}
+pub fn cap_rights_limit(_fd: i32, _r: u64) -> R<()> {
+    Ok(())
+}

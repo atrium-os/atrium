@@ -682,7 +682,7 @@ impl<S: Sink> Player<S> {
 
     /// The CDM host's pid (tests: to kill it alone).
     pub fn cdm_pid(&self) -> Option<u32> {
-        self.w.as_ref().and_then(|w| w.cdm.as_ref()).map(|c| c.pid())
+        self.w.as_ref().and_then(|w| w.cdm.as_ref()).and_then(|c| c.pid())
     }
 
     pub fn worker_pid(&self) -> Option<u32> {

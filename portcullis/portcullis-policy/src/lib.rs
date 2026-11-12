@@ -194,6 +194,7 @@ pub struct CapabilityDelta {
     pub status_item:     bool,
     pub audio_device:    bool,
     pub net_fetch:       bool,
+    pub protected_media: bool,
     pub tessera_cas_read: bool,
     /// The manifest asks for the `terminal` system call class, which is
     /// wider than an app's (jail-sysfil.md §5.2).
@@ -234,6 +235,7 @@ impl CapabilityDelta {
             && !self.status_item
             && !self.audio_device
             && !self.net_fetch
+            && !self.protected_media
             && !self.tessera_cas_read
             && !self.syscalls_terminal
             && !self.input_gamepad_exclusive
@@ -270,6 +272,7 @@ impl CapabilityDelta {
         if self.status_item     { out.push("Put an icon with a menu in the bar".into()); }
         if self.audio_device    { out.push("Add a sound output and play the system's sound through it".into()); }
         if self.net_fetch       { out.push("Fetch from the internet through the system's fetcher (no direct network access)".into()); }
+        if self.protected_media { out.push("Play protected (DRM) media through a separately jailed decryption module".into()); }
         if self.tessera_cas_read{ out.push("Read the global Tessera CAS (privileged)".into()); }
         if self.input_gamepad_exclusive { out.push("Keep a game controller when you switch to another window".into()); }
         if self.input_pointer_lock { out.push("Hide and capture the pointer while its window has focus (Escape releases it)".into()); }
@@ -357,6 +360,7 @@ pub fn compute_delta(
     bool_cap!(status_item);
     bool_cap!(audio_device);
     bool_cap!(net_fetch);
+    bool_cap!(protected_media);
     bool_cap!(tessera_cas_read);
 
     macro_rules! input_cap {
@@ -550,6 +554,7 @@ mod tests {
             audio_device: None,
             net_fetch: None,
             net_fetch_sites: None,
+            protected_media: None,
             syscalls: None,
             input: None,
             extra:      Default::default(),

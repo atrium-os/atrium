@@ -20,7 +20,7 @@ use serde::{Deserialize, Serialize};
 use portcullis_toml::Capabilities;
 
 pub mod fdpass;
-pub use fdpass::{recv_fds, send_fds};
+pub use fdpass::{recv_fds, send_fds, send_fds_with};
 
 /// Default socket path. Created by portcullisd at startup mode 0666
 /// (world-connectable); per-user authorization happens inside the
@@ -64,6 +64,9 @@ pub const PROTO_VERSION: u32 = 1;
 
 /// The fetcher `OpenFetcher` starts (docs/spec/nuntius.md).
 pub const NUNTIUS_APP: &str = "org.atrium.nuntius";
+
+/// The content decryption module host `OpenCdm` starts (docs/spec/hospes.md).
+pub const HOSPES_CDM_APP: &str = "org.atrium.hospes-cdm";
 
 /// The bounded reclaim signal a memory governor may request — mirrors jaild's
 /// `ReapSignal` but keeps this app-protocol crate free of a jaild dependency
@@ -165,6 +168,21 @@ pub enum Request {
     /// The fetcher is always the system's installed one (`NUNTIUS_APP`), run
     /// as its own uid under the system worker rule, never as the caller.
     OpenFetcher,
+
+    /// ★ A content decryption module of the caller's own (docs/spec/hospes.md
+    /// §3, §8.4): `hospes-cdm` (`HOSPES_CDM_APP`) in a one-shot jail of its
+    /// own, as its own uid, never as the caller. Requires the caller's
+    /// INSTALLED manifest to hold `protected-media`. portcullisd picks the
+    /// library for `key_system` from the system's CDM install, and opens the
+    /// store for (caller app, key system, `origin`); the caller names only
+    /// the origin, and can reach no other app's stores. The handoff is
+    /// `ExecInstance`'s: `ReadyForFds`, then three descriptors: the control
+    /// channel's socket, the data channel's socket, and stderr. The CDM runs
+    /// until the caller hangs up on this connection.
+    OpenCdm {
+        key_system: String,
+        origin:     String,
+    },
 
     /// "What may I launch?" — the installed-app catalog, for the launcher UI
     /// (Forum's dock). Requires the caller's manifest to hold `app-launch`.

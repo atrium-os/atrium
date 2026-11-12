@@ -28,10 +28,19 @@ use std::os::unix::io::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 /// of normal data to carry the cmsg; we send a literal 'F' byte
 /// that the receiver consumes and discards.
 pub fn send_fds<S: AsRawFd>(stream: &S, fds: &[RawFd]) -> io::Result<()> {
-    let payload: u8 = b'F';
+    send_fds_with(stream, fds, b"F")
+}
+
+/// [`send_fds`] with `data` (at least one byte) as the normal data: for a
+/// receiver that reads a short message beside the descriptors (hospes-cdm
+/// reads its key system and memory limit that way).
+pub fn send_fds_with<S: AsRawFd>(stream: &S, fds: &[RawFd], data: &[u8]) -> io::Result<()> {
+    if data.is_empty() {
+        return Err(io::Error::other("send_fds_with: no data byte to carry the descriptors"));
+    }
     let mut iov = libc::iovec {
-        iov_base: &payload as *const u8 as *mut _,
-        iov_len:  1,
+        iov_base: data.as_ptr() as *mut _,
+        iov_len:  data.len(),
     };
 
     /* Allocate the cmsg buffer. CMSG_SPACE includes the cmsghdr +
@@ -61,9 +70,9 @@ pub fn send_fds<S: AsRawFd>(stream: &S, fds: &[RawFd]) -> io::Result<()> {
         if sent < 0 {
             return Err(io::Error::last_os_error());
         }
-        if sent != 1 {
+        if sent as usize != data.len() {
             return Err(io::Error::other(
-                format!("partial sendmsg: wrote {sent} of 1 byte")));
+                format!("partial sendmsg: wrote {sent} of {} bytes", data.len())));
         }
     }
     Ok(())

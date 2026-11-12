@@ -5,12 +5,21 @@
 //! hospes-cdm-check HOSPES_CDM LIB VECTORS_DIR [STORE_DIR]
 //! ```
 //!
+//! How the host is started:
+//! - by default, with `--ctrl/--data/--lib/--store` descriptors;
+//! - `HOSPES_CDM_CHECK_FDS_FROM=1`: with no arguments, the four descriptors and the key
+//!   system on its stdin, as portcullisd's `OpenCdm` hands them over;
+//! - `HOSPES_CDM_CHECK_BROKER=1`: by portcullisd itself (`OpenCdm`, from inside an app
+//!   jail holding `protected-media`): HOSPES_CDM, LIB and STORE_DIR are then unused (`-`),
+//!   since portcullisd picks the host, the library and the store. The origin is
+//!   `HOSPES_CDM_CHECK_ORIGIN` (default `https://check.example`).
+//!
 //! It plays the supervisor (control channel) and the decode worker (data channel), so the
 //! comparison covers hospes-proto as well as the host. The store directory defaults to a
 //! fresh one under the temp directory.
 use std::fs::File;
 use std::io;
-use std::os::fd::AsRawFd;
+use std::os::fd::{AsRawFd, OwnedFd};
 use std::os::unix::net::UnixStream;
 use std::os::unix::process::CommandExt;
 use std::process::{Command, Stdio};
@@ -218,6 +227,57 @@ fn pass_fd(cmd: &mut Command, fd: i32) {
     }
 }
 
+/// The host: our child, or portcullisd's (the connection that keeps it alive).
+enum Host {
+    Child(std::process::Child),
+    Broker(UnixStream),
+}
+
+impl Host {
+    fn kill(&mut self) {
+        match self {
+            Host::Child(c) => {
+                let _ = c.kill();
+            }
+            Host::Broker(s) => {
+                let _ = s.shutdown(std::net::Shutdown::Both);
+            }
+        }
+    }
+    /// `None` if it exited 0, otherwise how it ended.
+    fn wait(&mut self) -> io::Result<Option<String>> {
+        match self {
+            Host::Child(c) => {
+                let st = c.wait()?;
+                Ok((!st.success()).then(|| st.to_string()))
+            }
+            Host::Broker(s) => match portcullis_ipc::read_response(s)? {
+                portcullis_ipc::Response::LaunchExit { code: Some(0) } => Ok(None),
+                r => Ok(Some(format!("{r:?}"))),
+            },
+        }
+    }
+}
+
+/// Ask portcullisd for a CDM of our own (`OpenCdm`), on these two channels.
+fn open_cdm(ctrl: &UnixStream, data: &UnixStream) -> io::Result<UnixStream> {
+    use portcullis_ipc::{read_response, round_trip, send_fds, write_request, Request, Response};
+    let path = portcullis_ipc::resolve_socket_path().ok_or_else(|| io::Error::other("portcullisd's socket is not reachable (protected-media?)"))?;
+    let mut s = UnixStream::connect(path)?;
+    match round_trip(&mut s, &Request::Hello { version: portcullis_ipc::PROTO_VERSION })? {
+        Response::Hello { .. } => {}
+        r => return Err(io::Error::other(format!("portcullisd hello: {r:?}"))),
+    }
+    let origin = std::env::var("HOSPES_CDM_CHECK_ORIGIN").unwrap_or_else(|_| "https://check.example".into());
+    write_request(&mut s, &Request::OpenCdm { key_system: "org.w3.clearkey".into(), origin })?;
+    match read_response(&mut s)? {
+        Response::ReadyForFds => {}
+        r => return Err(io::Error::other(format!("refused: {r:?}"))),
+    }
+    send_fds(&s, &[ctrl.as_raw_fd(), data.as_raw_fd(), 2])?;
+    Ok(s)
+}
+
 fn main() {
     let a: Vec<String> = std::env::args().collect();
     if a.len() < 4 {
@@ -246,16 +306,26 @@ fn run(host: &str, lib: &str, vecdir: &str, store: Option<&str>) -> io::Result<(
     };
     let (ctrl, ctrl_c) = UnixStream::pair()?;
     let (data, data_c) = UnixStream::pair()?;
-    let libf = File::open(lib)?;
-    let storef = File::open(&store_dir)?;
-    let mut cmd = Command::new(host);
-    for (flag, fd) in [("--ctrl", ctrl_c.as_raw_fd()), ("--data", data_c.as_raw_fd()), ("--lib", libf.as_raw_fd()), ("--store", storef.as_raw_fd())] {
-        cmd.arg(flag).arg(fd.to_string());
-        pass_fd(&mut cmd, fd);
-    }
-    cmd.stdin(Stdio::null());
-    let mut child = cmd.spawn()?;
-    drop((ctrl_c, data_c, libf, storef));
+    let mut host = if std::env::var_os("HOSPES_CDM_CHECK_BROKER").is_some() {
+        Host::Broker(open_cdm(&ctrl_c, &data_c)?)
+    } else {
+        let libf = File::open(lib)?;
+        let storef = File::open(&store_dir)?;
+        let mut cmd = Command::new(host);
+        if std::env::var_os("HOSPES_CDM_CHECK_FDS_FROM").is_some() {
+            let (ours, theirs) = UnixStream::pair()?;
+            portcullis_ipc::send_fds_with(&ours, &[ctrl_c.as_raw_fd(), data_c.as_raw_fd(), libf.as_raw_fd(), storef.as_raw_fd()], b"org.w3.clearkey 512\n")?;
+            cmd.stdin(Stdio::from(OwnedFd::from(theirs)));
+        } else {
+            for (flag, fd) in [("--ctrl", ctrl_c.as_raw_fd()), ("--data", data_c.as_raw_fd()), ("--lib", libf.as_raw_fd()), ("--store", storef.as_raw_fd())] {
+                cmd.arg(flag).arg(fd.to_string());
+                pass_fd(&mut cmd, fd);
+            }
+            cmd.stdin(Stdio::null());
+        }
+        Host::Child(cmd.spawn()?)
+    };
+    drop((ctrl_c, data_c));
     let mut c = Check { ctrl, data };
 
     // The reference host prints the version from GetCdmVersion; we get it in Ready.
@@ -264,7 +334,7 @@ fn run(host: &str, lib: &str, vecdir: &str, store: Option<&str>) -> io::Result<(
         Some(Msg::Ready { cdm_version }) => println!("version {}", s(&cdm_version)),
         other => {
             println!("no Ready: {other:?}");
-            let _ = child.kill();
+            host.kill();
             return Err(io::Error::other("hospes-cdm did not start"));
         }
     }
@@ -311,9 +381,9 @@ fn run(host: &str, lib: &str, vecdir: &str, store: Option<&str>) -> io::Result<(
 
     // Close the control channel: the host destroys the CDM and exits 0.
     drop(c);
-    let st = child.wait()?;
+    let st = host.wait()?;
     println!("end");
-    if !st.success() {
+    if let Some(st) = st {
         return Err(io::Error::other(format!("hospes-cdm exited with {st}")));
     }
     if store.is_none() {

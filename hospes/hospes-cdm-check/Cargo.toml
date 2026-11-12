@@ -8,3 +8,4 @@ description = "Runs the test CDM's scenario through hospes-cdm and prints the re
 [dependencies]
 hospes-proto = { path = "../hospes-proto", features = ["std"] }
 libc = "0.2"
+portcullis-ipc = { path = "../../portcullis/portcullis-ipc" }

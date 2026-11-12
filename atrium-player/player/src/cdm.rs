@@ -38,6 +38,11 @@ pub struct CdmOptions {
     pub mem_mib: u64,
     /// The EME key system the CDM is created for (`org.w3.clearkey`, `com.widevine.alpha`).
     pub key_system: String,
+    /// The system's CDM (docs/spec/hospes.md §3): portcullisd starts `hospes-cdm` in a jail
+    /// of its own, with the system's library and the store for this origin (`OpenCdm`;
+    /// the app's manifest must hold `protected-media`). `host`, `library` and `store` are
+    /// then unused. `None`: we start `hospes-cdm` ourselves (development, the VM checks).
+    pub system_origin: Option<String>,
 }
 
 /// The key system a CDM library is for, by its file name: Widevine's is `libwidevinecdm.so`.
@@ -121,9 +126,13 @@ impl CdmOptions {
     /// (a licence server, which wins), and optionally
     /// `ATRIUM_PLAYER_CDM_STORE` (a directory) and `ATRIUM_PLAYER_KEY_SYSTEM` (default: by the
     /// library's name, [`key_system_for`]).
+    ///
+    /// `ATRIUM_PLAYER_CDM=system:KEY_SYSTEM` asks portcullisd for the system's CDM instead,
+    /// with `ATRIUM_PLAYER_CDM_ORIGIN` (default `local`) naming the store.
     pub fn from_env() -> Option<CdmOptions> {
         let library: PathBuf = std::env::var_os("ATRIUM_PLAYER_CDM")?.into();
-        if !library.is_file() {
+        let system = library.to_str().and_then(|l| l.strip_prefix("system:")).map(str::to_string);
+        if system.is_none() && !library.is_file() {
             return None;
         }
         let licences = match std::env::var("ATRIUM_PLAYER_LICENCE_URL") {
@@ -134,8 +143,9 @@ impl CdmOptions {
             .map(PathBuf::from)
             .unwrap_or_else(|| std::env::current_exe().unwrap_or_default().with_file_name("hospes-cdm"));
         let store = std::env::var_os("ATRIUM_PLAYER_CDM_STORE").map(PathBuf::from);
-        let key_system = std::env::var("ATRIUM_PLAYER_KEY_SYSTEM").unwrap_or_else(|_| key_system_for(&library).into());
-        Some(CdmOptions { host, library, store, licences, mem_mib: 512, key_system })
+        let key_system = system.clone().unwrap_or_else(|| std::env::var("ATRIUM_PLAYER_KEY_SYSTEM").unwrap_or_else(|_| key_system_for(&library).into()));
+        let system_origin = system.map(|_| std::env::var("ATRIUM_PLAYER_CDM_ORIGIN").unwrap_or_else(|_| "local".into()));
+        Some(CdmOptions { host, library, store, licences, mem_mib: 512, key_system, system_origin })
     }
 }
 
@@ -232,7 +242,7 @@ pub enum CdmEvent {
 
 /// One `hospes-cdm` and its sessions.
 pub struct CdmProc {
-    child: Child,
+    child: HostProc,
     ctrl: UnixStream,
     rx: mpsc::Receiver<Option<Msg>>,
     licences: Licences,
@@ -262,22 +272,27 @@ impl CdmProc {
     pub fn spawn(o: &CdmOptions) -> io::Result<(CdmProc, UnixStream)> {
         let (ctrl, ctrl_c) = UnixStream::pair()?;
         let (data_w, data_c) = UnixStream::pair()?;
-        let lib = File::open(&o.library)?;
-        let store = o.store.as_ref().map(File::open).transpose()?;
-        let mut c = Command::new(&o.host);
-        let mut fds = vec![("--ctrl", ctrl_c.as_raw_fd()), ("--data", data_c.as_raw_fd()), ("--lib", lib.as_raw_fd())];
-        if let Some(s) = &store {
-            fds.push(("--store", s.as_raw_fd()));
-        }
-        for (flag, fd) in fds {
-            c.arg(flag).arg(fd.to_string());
-            sys::pass_fd(&mut c, fd);
-        }
-        c.arg("--mem").arg(o.mem_mib.to_string());
-        c.arg("--key-system").arg(&o.key_system);
-        c.stdin(std::process::Stdio::null());
-        let child = c.spawn()?;
-        drop((ctrl_c, data_c, lib, store));
+        let child = match &o.system_origin {
+            Some(origin) => open_system_cdm(&o.key_system, origin, &ctrl_c, &data_c)?,
+            None => {
+                let lib = File::open(&o.library)?;
+                let store = o.store.as_ref().map(File::open).transpose()?;
+                let mut c = Command::new(&o.host);
+                let mut fds = vec![("--ctrl", ctrl_c.as_raw_fd()), ("--data", data_c.as_raw_fd()), ("--lib", lib.as_raw_fd())];
+                if let Some(s) = &store {
+                    fds.push(("--store", s.as_raw_fd()));
+                }
+                for (flag, fd) in fds {
+                    c.arg(flag).arg(fd.to_string());
+                    sys::pass_fd(&mut c, fd);
+                }
+                c.arg("--mem").arg(o.mem_mib.to_string());
+                c.arg("--key-system").arg(&o.key_system);
+                c.stdin(std::process::Stdio::null());
+                HostProc::Child(c.spawn()?)
+            }
+        };
+        drop((ctrl_c, data_c));
         let mut r = ctrl.try_clone()?;
         let (tx, rx) = mpsc::channel();
         // The control channel is read on its own thread so a slow CDM never stalls frames.
@@ -465,7 +480,7 @@ impl CdmProc {
     pub fn exited(&mut self, grace: std::time::Duration) -> bool {
         let until = std::time::Instant::now() + grace;
         loop {
-            if matches!(self.child.try_wait(), Ok(Some(_))) {
+            if self.child.exited() {
                 return true;
             }
             if std::time::Instant::now() >= until {
@@ -475,14 +490,73 @@ impl CdmProc {
         }
     }
 
-    pub fn pid(&self) -> u32 {
-        self.child.id()
+    /// Our child's pid; `None` for the system's CDM (portcullisd's child, in its jail).
+    pub fn pid(&self) -> Option<u32> {
+        match &self.child {
+            HostProc::Child(c) => Some(c.id()),
+            HostProc::System { .. } => None,
+        }
     }
 
     pub fn kill(&mut self) {
-        let _ = self.child.kill();
-        let _ = self.child.wait();
+        match &mut self.child {
+            HostProc::Child(c) => {
+                let _ = c.kill();
+                let _ = c.wait();
+            }
+            // Hanging up ends it: portcullisd removes the jail.
+            HostProc::System { conn, .. } => {
+                let _ = conn.shutdown(std::net::Shutdown::Both);
+            }
+        }
     }
+}
+
+/// `hospes-cdm`: our child, or the system's (the connection to portcullisd keeps it alive).
+enum HostProc {
+    Child(Child),
+    System { conn: UnixStream, done: std::sync::Arc<std::sync::atomic::AtomicBool> },
+}
+
+impl HostProc {
+    fn exited(&mut self) -> bool {
+        match self {
+            HostProc::Child(c) => matches!(c.try_wait(), Ok(Some(_))),
+            HostProc::System { done, .. } => done.load(std::sync::atomic::Ordering::Acquire),
+        }
+    }
+}
+
+/// Ask portcullisd for the system's CDM for `key_system`, with the store for `origin`
+/// (`OpenCdm`, docs/spec/hospes.md §3), on these two channels.
+fn open_system_cdm(key_system: &str, origin: &str, ctrl: &UnixStream, data: &UnixStream) -> io::Result<HostProc> {
+    use portcullis_ipc::{read_response, round_trip, send_fds, write_request, Request, Response};
+    let path = portcullis_ipc::resolve_socket_path()
+        .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "portcullisd's socket is not reachable (does the manifest hold protected-media?)"))?;
+    let mut s = UnixStream::connect(path)?;
+    s.set_read_timeout(Some(Duration::from_secs(10)))?;
+    match round_trip(&mut s, &Request::Hello { version: portcullis_ipc::PROTO_VERSION })? {
+        Response::Hello { .. } => {}
+        r => return Err(io::Error::other(format!("portcullisd hello: {r:?}"))),
+    }
+    write_request(&mut s, &Request::OpenCdm { key_system: key_system.into(), origin: origin.into() })?;
+    match read_response(&mut s)? {
+        Response::ReadyForFds => {}
+        Response::LaunchFailed { stage, message } => return Err(io::Error::new(io::ErrorKind::PermissionDenied, format!("CDM: {stage}: {message}"))),
+        r => return Err(io::Error::other(format!("portcullisd: {r:?}"))),
+    }
+    // The host's stderr goes to ours.
+    send_fds(&s, &[ctrl.as_raw_fd(), data.as_raw_fd(), 2])?;
+    s.set_read_timeout(None)?;
+    let done = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let (mut r, d) = (s.try_clone()?, done.clone());
+    std::thread::Builder::new().name("hospes-cdm-system".into()).spawn(move || {
+        if let Ok(Response::LaunchFailed { stage, message }) = read_response(&mut r) {
+            eprintln!("atrium-player: the system CDM did not run: {stage}: {message}");
+        }
+        d.store(true, std::sync::atomic::Ordering::Release);
+    })?;
+    Ok(HostProc::System { conn: s, done })
 }
 
 impl Drop for CdmProc {

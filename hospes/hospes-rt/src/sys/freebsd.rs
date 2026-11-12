@@ -314,3 +314,78 @@ pub fn clock_gettime_linux(id: i32) -> R<(i64, i64)> {
 pub fn geteuid() -> u32 {
     call(SYS_GETEUID, [0; 6]).unwrap_or(0) as u32
 }
+
+// ---- descriptors: receiving and narrowing ---------------------------------------------
+
+const SYS_RECVMSG: usize = 27;
+const SYS_CAP_RIGHTS_LIMIT: usize = 533;
+const SOL_SOCKET: i32 = 0xffff;
+const SCM_RIGHTS: i32 = 1;
+
+#[repr(C)]
+struct IoVec {
+    base: usize,
+    len: usize,
+}
+
+#[repr(C)]
+struct MsgHdr {
+    name: usize,
+    namelen: u32,
+    iov: *mut IoVec,
+    iovlen: i32,
+    control: *mut u8,
+    controllen: u32,
+    flags: i32,
+}
+
+/// Receive up to `out.len()` descriptors sent with `SCM_RIGHTS` on `sock`, with at most
+/// `buf.len()` bytes of data. Returns (data bytes, descriptors). Allowed in capability mode.
+pub fn recv_fds(sock: i32, buf: &mut [u8], out: &mut [i32]) -> R<(usize, usize)> {
+    // struct cmsghdr { u32 len; i32 level; i32 type; } with its data at 16 (_ALIGN on LP64).
+    const HDR: usize = 16;
+    let mut ctl = [0u64; 8];
+    let room = (HDR + 4 * out.len()).min(core::mem::size_of_val(&ctl));
+    let mut iov = IoVec { base: buf.as_mut_ptr() as usize, len: buf.len() };
+    let mut m = MsgHdr { name: 0, namelen: 0, iov: &mut iov, iovlen: 1, control: ctl.as_mut_ptr().cast(), controllen: room as u32, flags: 0 };
+    let n = call(SYS_RECVMSG, [sock as usize, &mut m as *mut MsgHdr as usize, 0x0004_0000 /* MSG_CMSG_CLOEXEC */, 0, 0, 0])?;
+    let mut k = 0;
+    let c = ctl.as_ptr() as *const u8;
+    if m.controllen as usize >= HDR {
+        // Safety: the kernel filled `controllen` bytes of `ctl` with one cmsghdr.
+        let (len, level, ty) = unsafe { (*(c as *const u32), *(c.add(4) as *const i32), *(c.add(8) as *const i32)) };
+        if level == SOL_SOCKET && ty == SCM_RIGHTS && len as usize >= HDR {
+            let count = ((len as usize - HDR) / 4).min(out.len());
+            for (i, o) in out.iter_mut().enumerate().take(count) {
+                *o = unsafe { *(c.add(HDR + 4 * i) as *const i32) };
+            }
+            k = count;
+        }
+    }
+    Ok((n, k))
+}
+
+/// Capsicum rights (sys/capsicum.h), index 0. Each carries its index marker (bit 57).
+pub mod rights {
+    const I0: u64 = 1 << 57;
+    pub const READ: u64 = I0 | 0x1;
+    pub const WRITE: u64 = I0 | 0x2;
+    pub const SEEK: u64 = I0 | 0x4 | 0x8;
+    pub const MMAP_RX: u64 = I0 | 0x10 | SEEK | READ | 0x20;
+    pub const CREATE: u64 = I0 | 0x40;
+    pub const FSYNC: u64 = I0 | 0x100;
+    pub const FTRUNCATE: u64 = I0 | 0x200;
+    pub const LOOKUP: u64 = I0 | 0x400;
+    pub const FSTAT: u64 = I0 | 0x80000;
+    pub const RENAMEAT_SOURCE: u64 = LOOKUP | 0x0400_0000;
+    pub const RENAMEAT_TARGET: u64 = LOOKUP | 0x0400_0000_0000;
+    pub const UNLINKAT: u64 = LOOKUP | 0x1000_0000;
+}
+
+/// `cap_rights_limit(fd, rights)`: `fd` keeps only these index-0 rights, and so does every
+/// descriptor later opened beneath it. Rights only ever shrink.
+pub fn cap_rights_limit(fd: i32, r: u64) -> R<()> {
+    // cap_rights_t, version 0: two words, each with its index marker.
+    let set: [u64; 2] = [r | (1 << 57), 1 << 58];
+    call(SYS_CAP_RIGHTS_LIMIT, [fd as usize, set.as_ptr() as usize, 0, 0, 0, 0]).map(|_| ())
+}

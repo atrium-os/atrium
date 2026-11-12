@@ -2,10 +2,14 @@
 //!
 //! ```text
 //! hospes-cdm --ctrl FD --data FD --lib FD [--store FD] [--key-system NAME] [--mem MiB]
+//! hospes-cdm [--fds-from FD]
 //! ```
 //!
 //! The supervisor passes every fd: the control socket (its own end), the data socket (the
-//! decode worker's), the library (read-only) and the origin's store directory. We enter
+//! decode worker's), the library (read-only) and the origin's store directory. Started by
+//! portcullisd in a jail of its own (`OpenCdm`), it has no arguments: the four descriptors
+//! arrive on stdin with `SCM_RIGHTS`, beside a line `KEY_SYSTEM MEM_MIB`. Either way the
+//! library and the store are narrowed with `cap_rights_limit` before anything else runs. We enter
 //! capability mode before parsing the library, load it against the glibc shim, create one
 //! CDM instance and then serve both channels from one loop until the control channel
 //! closes. The CDM never sees a path, a socket of its own or the network.
@@ -50,6 +54,7 @@ struct Args {
 fn parse_args(info: &'static StartInfo) -> Option<Args> {
     let (mut ctrl, mut data, mut lib) = (None, None, None);
     let mut a = Args { ctrl: -1, data: -1, lib: -1, store: None, key_system: b"org.w3.clearkey", mem_mib: 512 };
+    let mut from = if info.arg(1).is_none() { Some(0) } else { None };
     let mut i = 1;
     while let Some(x) = info.arg(i) {
         let v = info.arg(i + 1)?;
@@ -60,14 +65,43 @@ fn parse_args(info: &'static StartInfo) -> Option<Args> {
             b"--store" => a.store = Some(num(v)? as i32),
             b"--key-system" => a.key_system = v,
             b"--mem" => a.mem_mib = num(v)?,
+            b"--fds-from" => from = Some(num(v)? as i32),
             _ => return None,
         }
         i += 2;
+    }
+    if let Some(sock) = from {
+        // ctrl, data, lib and (optionally) the store; then "KEY_SYSTEM MEM_MIB\n".
+        let mut buf = [0u8; 256];
+        let mut fds = [-1i32; 4];
+        let (n, k) = sys::recv_fds(sock, &mut buf, &mut fds).ok()?;
+        let _ = sys::close(sock);
+        if k < 3 {
+            return None;
+        }
+        let line = buf[..n].split(|&c| c == b'\n').next()?;
+        let mut it = line.split(|&c| c == b' ');
+        let ks = it.next().filter(|k| !k.is_empty() && k.len() <= 64)?;
+        a.key_system = alloc::boxed::Box::leak(ks.to_vec().into_boxed_slice());
+        a.mem_mib = num(it.next()?)?;
+        (ctrl, data, lib) = (Some(fds[0]), Some(fds[1]), Some(fds[2]));
+        a.store = (k == 4).then_some(fds[3]);
     }
     a.ctrl = ctrl?;
     a.data = data?;
     a.lib = lib?;
     Some(a)
+}
+
+/// The library may only be read and mapped; the store only used for its records. Rights
+/// travel with the descriptor, and those opened beneath the store inherit its limit.
+fn narrow(a: &Args) -> Result<(), sys::Errno> {
+    use sys::rights::*;
+    sys::cap_rights_limit(a.lib, READ | SEEK | FSTAT | MMAP_RX)?;
+    if let Some(s) = a.store {
+        sys::cap_rights_limit(s, LOOKUP | CREATE | READ | WRITE | SEEK | FSTAT | FTRUNCATE | FSYNC | RENAMEAT_SOURCE | RENAMEAT_TARGET | UNLINKAT)?;
+    }
+    Ok(())
 }
 
 /// Report and exit. The supervisor sees `Fail`, then the channel close.
@@ -87,9 +121,12 @@ fn fail(ctrl: i32, code: u32, what: &str) -> i32 {
 #[no_mangle]
 pub fn hospes_main(info: &'static StartInfo) -> i32 {
     let Some(args) = parse_args(info) else {
-        hlog!("usage: hospes-cdm --ctrl FD --data FD --lib FD [--store FD] [--key-system NAME] [--mem MiB]");
+        hlog!("usage: hospes-cdm --ctrl FD --data FD --lib FD [--store FD] [--key-system NAME] [--mem MiB] | [--fds-from FD]");
         return 2;
     };
+    if narrow(&args).is_err() {
+        return fail(args.ctrl, 3, "cap_rights_limit on the library or the store failed");
+    }
     // The trap facility is found by name, which capability mode does not allow: first.
     let trap = match trap::init(hospes_glibc::syscall::handle) {
         Ok(()) => true,

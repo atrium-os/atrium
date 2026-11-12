@@ -201,6 +201,8 @@ case "${1:-}" in
         rc=0
         cdm_check "$H/target/release/hospes-cdm-check" "$x" x86_64 || rc=1
         cdm_check "$H/target/release/hospes-cdm-check" "$a" aarch64 qemu-aarch64-static || rc=1
+        # As portcullisd's OpenCdm starts it: no arguments, the descriptors on stdin.
+        HOSPES_CDM_CHECK_FDS_FROM=1 cdm_check "$H/target/release/hospes-cdm-check" "$x" x86_64 || rc=1
         exit $rc ;;
     test) run_all "$2" "$3" ;;
     conform) conform "$2" "$3" "$4" "$5" ;;

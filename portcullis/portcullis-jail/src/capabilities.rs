@@ -89,7 +89,8 @@ pub fn apply_all(
     // it reaches portcullisd's socket, as the launcher does. portcullisd
     // gates every verb on the caller's own installed manifest, so the mount
     // grants nothing else.
-    if caps.net_fetch == Some(true) && caps.app_launch != Some(true) {
+    // `protected-media` (OpenCdm) reaches it the same way.
+    if (caps.net_fetch == Some(true) || caps.protected_media == Some(true)) && caps.app_launch != Some(true) {
         apply_app_launch(jc, opts);
     }
     Ok(())

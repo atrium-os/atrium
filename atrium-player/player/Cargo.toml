@@ -35,6 +35,9 @@ nuntius  = { path = "../../nuntius" }
 # --headless prints frame hashes comparable with ffmpeg's framemd5.
 md-5     = "0.10"
 hospes-proto = { path = "../../hospes/hospes-proto", features = ["std"] }
+# OpenCdm (hospes.md §3): the system's CDM, asked of portcullisd; also the
+# stand-in portcullisd in tests/system_fetcher.rs.
+portcullis-ipc = { path = "../../portcullis/portcullis-ipc" }
 
 [features]
 # Start hospes-codec beside the worker when OpenH264 is installed (hospes.md §9).
@@ -44,8 +47,6 @@ h264 = []
 # examples/media_probe.rs: limend in process, and the capture.
 aqueduct = { path = "../../aqueduct" }
 png      = "0.17"
-# tests/system_fetcher.rs: a stand-in portcullisd.
-portcullis-ipc = { path = "../../portcullis/portcullis-ipc" }
 
 [[example]]
 name = "atrium-audio-play"

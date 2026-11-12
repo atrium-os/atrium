@@ -31,7 +31,7 @@ use std::collections::HashMap;
 use std::ffi::CStr;
 use std::io::BufReader;
 use std::os::unix::fs::PermissionsExt;
-use std::os::unix::io::AsRawFd;
+use std::os::unix::io::{AsRawFd, OwnedFd};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
@@ -319,11 +319,18 @@ fn serve(stream: UnixStream, shared: Arc<Mutex<Tenants>>) -> std::io::Result<()>
                     message: format!("{app_id} is started only by OpenFetcher, for an app holding net-fetch") })?;
                 continue;
             }
+            // Likewise the CDM host: started here it would get no library and
+            // no store of the caller's, and run as the CDM's uid for anyone.
+            if app_id == portcullis_ipc::HOSPES_CDM_APP {
+                write_response(&mut writer, &Response::LaunchFailed { stage: "policy".into(),
+                    message: format!("{app_id} is started only by OpenCdm, for an app holding protected-media") })?;
+                continue;
+            }
             let limits = (memory_mb, cpu_pct, require_memory_limit);
             let rule = Policy::load_system(std::path::Path::new(SYSTEM_PATH)).ok()
                 .and_then(|p| p.worker_rule(&app_id, &owner).cloned());
             handle_exec_instance(app_id, instance, tmpfs_mb, limits, rule, Vec::new(), &owner, &shared,
-                                 &LIMITER, &mut writer, &reader)?;
+                                 &LIMITER, &mut writer, &reader, None)?;
             continue;
         }
         /* ★ OpenFetcher (docs/spec/nuntius.md §2): a Nuntius of the caller's
@@ -367,7 +374,55 @@ fn serve(stream: UnixStream, shared: Arc<Mutex<Tenants>>) -> std::io::Result<()>
             eprintln!("portcullisd: fetcher {instance} for {app} (uid {uid})");
             // A fetcher needs no scratch space beyond its own small tmpfs.
             handle_exec_instance(portcullis_ipc::NUNTIUS_APP.to_string(), Some(instance), 16, (None, None, true), Some(rule), extra_env,
-                                 &owner, &shared, &LIMITER, &mut writer, &reader)?;
+                                 &owner, &shared, &LIMITER, &mut writer, &reader, None)?;
+            continue;
+        }
+        /* ★ OpenCdm (docs/spec/hospes.md §3, §8.4): a content decryption
+         * module of the caller's own. Gated like OpenFetcher, on the PEER UID:
+         * the caller's INSTALLED manifest must hold `protected-media`. The
+         * host always runs as the system worker rule's uid for HOSPES_CDM_APP.
+         * WE choose the library (from the system's CDM install, by key
+         * system) and the store (per caller app, key system and origin);
+         * the caller names only the key system and the origin. */
+        if let Request::OpenCdm { key_system, origin } = &req {
+            let app = portcullis_peer::AppRegistry::load(portcullis_peer::DEFAULT_REGISTRY)
+                .unwrap_or_default().resolve(uid).map(|(_, app)| app.to_string());
+            let refuse = |why: String| Response::LaunchFailed { stage: "protected-media".into(), message: why };
+            let Some(app) = app else {
+                eprintln!("portcullisd: CDM DENIED to uid {uid}: not a launched app");
+                write_response(&mut writer, &refuse("cap.protected_media.denied: caller is not a launched app".into()))?;
+                continue;
+            };
+            if !launch::app_may_play_protected(&app) {
+                eprintln!("portcullisd: CDM DENIED to {app} (uid {uid}): no protected-media capability");
+                write_response(&mut writer, &refuse("cap.protected_media.denied: this app's manifest does not hold protected-media".into()))?;
+                continue;
+            }
+            let Some(rule) = Policy::load_system(std::path::Path::new(SYSTEM_PATH)).ok()
+                .and_then(|p| p.workers.get(portcullis_ipc::HOSPES_CDM_APP).cloned()) else {
+                eprintln!("portcullisd: CDM for {app} REFUSED: no system worker rule for {}", portcullis_ipc::HOSPES_CDM_APP);
+                write_response(&mut writer, &refuse(format!("no system worker rule for {}: the CDM never runs as its caller", portcullis_ipc::HOSPES_CDM_APP)))?;
+                continue;
+            };
+            let (lib, store) = match portcullisd::cdm::open(&app, key_system, origin, &rule.run_as) {
+                Ok(v) => v,
+                Err(why) => {
+                    eprintln!("portcullisd: CDM for {app} REFUSED: {why}");
+                    write_response(&mut writer, &refuse(why))?;
+                    continue;
+                }
+            };
+            let line = format!("{key_system} {}\n", portcullisd::cdm::MEM_MIB);
+            let prepare = move |[ctrl, data, err]: [OwnedFd; 3]| -> std::io::Result<[OwnedFd; 3]> {
+                let (ours, theirs) = UnixStream::pair()?;
+                portcullis_ipc::send_fds_with(&ours, &[ctrl.as_raw_fd(), data.as_raw_fd(), lib.as_raw_fd(), store.as_raw_fd()], line.as_bytes())?;
+                let out = theirs.try_clone()?;
+                Ok([OwnedFd::from(theirs), OwnedFd::from(out), err])
+            };
+            let instance = fetcher_instance(uid);
+            eprintln!("portcullisd: CDM {instance} ({key_system}) for {app} (uid {uid})");
+            handle_exec_instance(portcullis_ipc::HOSPES_CDM_APP.to_string(), Some(instance), 16, (None, None, true), Some(rule), Vec::new(),
+                                 &owner, &shared, &LIMITER, &mut writer, &reader, Some(&prepare))?;
             continue;
         }
         if let Request::Launch { app_id, bypass_policy } = req {
@@ -517,6 +572,10 @@ fn handle_exec_instance(
     limiter:  &Arc<Mutex<portcullisd::ratelimit::Limiter>>,
     writer:   &mut UnixStream,
     reader:   &BufReader<UnixStream>,
+    /* What the entry gets in place of the caller's three descriptors
+     * (OpenCdm: its channels go to the CDM host over a socket of its own,
+     * beside the library and the store). None: the caller's, as sent. */
+    prepare:  Option<&dyn Fn([OwnedFd; 3]) -> std::io::Result<[OwnedFd; 3]>>,
 ) -> std::io::Result<()> {
     /* ★ LIMITED BEFORE THE FD HANDSHAKE, not after. Answering ReadyForFds
      * first would have the client send three descriptors the daemon is about
@@ -615,6 +674,15 @@ fn handle_exec_instance(
     }
     let mut it = fds.into_iter();
     let stdio = [it.next().unwrap(), it.next().unwrap(), it.next().unwrap()];
+    let stdio = match prepare {
+        None => stdio,
+        Some(f) => match f(stdio) {
+            Ok(s) => s,
+            Err(e) => return write_response(writer, &Response::LaunchFailed {
+                stage: "fdpass".into(), message: format!("prepare: {e}"),
+            }),
+        },
+    };
 
     let spec = portcullis_oneshot::Spec {
         target: app_id.clone(),
@@ -1255,6 +1323,9 @@ fn handle(req: Request, user: &str, shared: &Mutex<Tenants>) -> Response {
          * receive the caller's descriptors. */
         Request::ExecInstance { .. } => Response::Error {
             message: "ExecInstance must be routed through the fd-passing path".into(),
+        },
+        Request::OpenCdm { .. } => Response::Error {
+            message: "OpenCdm must be routed through the peer-uid, fd-passing path".into(),
         },
         Request::OpenFetcher => Response::Error {
             message: "OpenFetcher must be routed through the peer-uid, fd-passing path".into(),

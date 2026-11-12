@@ -161,6 +161,13 @@ pub struct Capabilities {
     /// that does not parse refuses the fetcher rather than run it unlimited.
     #[serde(rename = "net-fetch-sites")]
     pub net_fetch_sites: Option<Vec<String>>,
+    /// Play protected (DRM) media: portcullisd starts a content decryption
+    /// module of the app's own (`OpenCdm`, docs/spec/hospes.md §3) in a jail
+    /// of its own, as its own uid, with a store per site the app plays from.
+    /// The app never gets the module, its library or its store. Asks consent:
+    /// the module is a binary nobody here can read.
+    #[serde(rename = "protected-media")]
+    pub protected_media: Option<bool>,
     /// ★ The system call filter class the app's jail gets
     /// (docs/spec/jail-sysfil.md §5): a profile name from the `[sysfil]`
     /// section of jaild's policy, e.g. `renderer`. Absent: `networked` if the
@@ -350,6 +357,7 @@ pub fn merge_capabilities(base: &Capabilities, ovr: &Capabilities) -> Capabiliti
         audio_device:     ovr.audio_device.or(base.audio_device),
         net_fetch:        ovr.net_fetch.or(base.net_fetch),
         net_fetch_sites:  ovr.net_fetch_sites.clone().or_else(|| base.net_fetch_sites.clone()),
+        protected_media:  ovr.protected_media.or(base.protected_media),
         syscalls:         ovr.syscalls.clone().or_else(|| base.syscalls.clone()),
         input:            InputCaps::merge(base.input, ovr.input),
         extra:            {
