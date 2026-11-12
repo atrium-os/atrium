@@ -319,3 +319,15 @@ land with it.
   to polling, and every IH client shares one vector (8f0c26c7). The IH is proven by the first
   CP EOP interrupt instead (4d/4e). Idle after stage 4 was accepted at 16 W, 15 % busy (below
   the 20 % and 25 %-of-limit thresholds). The reset left the card cold; PCH 28–30 °C.
+- **2026-11-12 19:26, stages 4a–4c (362f9eef).** 4a and 4b as before. With MSI the vector
+  was allocated (the card's one MSI message) but never fired, and the MP1 SW_INT register read
+  0 after the host's write: the host cannot raise it, so that self-test is dropped as evidence.
+  4c ran to "stage 4c: 0", but **the CP was not halted**. It came back from the GfxOff cycle
+  with CP_ME_CNTL 0xa000 (no PFP/ME halt) and CP_MEC_RS64_CNTL 0x3c000000 (pipes active, no
+  halt), whereas after the RLC autoload it was 0x1514a000 / 0x40030000. Nothing ran (CP_STAT 0,
+  15 W), but 4c now halts the CP first, as amdgpu's cp_*_enable(false), verifies it and
+  refuses otherwise. Other readings: RS64 start 0x7000000003000 in all three headers (checked
+  per file); GB_ADDR_CONFIG 0x08200545, whose NUM_SHADER_ENGINES field decodes to 16, so it is
+  an address-swizzle field, not the topology; the SA disable 0xff00 leaves 8 SAs (4 SE × 2);
+  no RBs disabled; SH_MEM 0xc00c, bases 0x20001000 (VMID 1–7) and 0x10002 (VMID 8–15). Idle
+  after stage 4: 15 W, accepted; reset left the card cold; PCH 28–30 °C.

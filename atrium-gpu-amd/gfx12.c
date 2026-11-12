@@ -58,6 +58,8 @@ static const struct gfx_gen gfx_gens[] = {
 #define CP_ME_HALTS			0x14000000u	/* PFP, ME */
 #define CP_MEC_PIPE_RESET		0x000f0000u	/* PIPE0..3 */
 #define CP_MEC_HALT			0x40000000u
+#define CP_MEC_PIPE_ACTIVE		0x3c000000u	/* PIPE0..3 */
+#define CP_MEC_INVALIDATE_ICACHE	0x00000010u
 #define DB_MEM_CONFIG_GOLDEN		0x00008000u	/* golden_settings_gc_12_0 */
 #define TRAP_EN				0x00000008u
 /* DEFAULT_SH_MEM_CONFIG: 64-bit, unaligned, INITIAL_INST_PREFETCH 3. */
@@ -230,6 +232,13 @@ sh_mem_init(struct atrium_amd_softc *sc, const struct gfx_gen *g)
 	grbm_select(sc, g, 0, 0, 0, 0);
 }
 
+static bool
+cp_halted(struct atrium_amd_softc *sc, const struct gfx_gen *g)
+{
+	return ((rd(sc, g->cp_me_cntl) & CP_ME_HALTS) == CP_ME_HALTS &&
+	    (rd(sc, g->cp_mec_rs64_cntl) & CP_MEC_HALT) != 0);
+}
+
 /*
  * Stage 4c. GC must be powered (the caller holds GfxOff off) and the hubs
  * set up (4a). Everything written here is undone by the mode 1 reset; the
@@ -256,9 +265,25 @@ amd_gfx12_setup(struct atrium_amd_softc *sc)
 		return (ENXIO);
 	}
 	gfx_report(sc, g, "before");
-	if ((rd(sc, g->cp_me_cntl) & CP_ME_HALTS) != CP_ME_HALTS ||
-	    (rd(sc, g->cp_mec_rs64_cntl) & CP_MEC_HALT) == 0)
-		device_printf(sc->dev, "gfx12: note: CP not fully halted\n");
+	/*
+	 * Halt the CP ourselves before touching its start addresses
+	 * (cp_gfx_enable(false), cp_compute_enable(false)). After the RLC
+	 * autoload the halts are set, but a GfxOff cycle brings the block
+	 * back with them clear (box, 2026-11-12 19:26: CP_ME_CNTL 0xa000,
+	 * CP_MEC_RS64_CNTL 0x3c000000). If they do not stick: refuse.
+	 */
+	wr(sc, g->cp_me_cntl, rd(sc, g->cp_me_cntl) | CP_ME_HALTS);
+	wr(sc, g->cp_mec_rs64_cntl, (rd(sc, g->cp_mec_rs64_cntl) &
+	    ~CP_MEC_PIPE_ACTIVE) | CP_MEC_HALT | CP_MEC_PIPE_RESET |
+	    CP_MEC_INVALIDATE_ICACHE);
+	DELAY(50);
+	if (!cp_halted(sc, g)) {
+		gfx_report(sc, g, "halt refused");
+		device_printf(sc->dev, "gfx12: CP would not halt; not "
+		    "programming it\n");
+		return (EIO);
+	}
+	gfx_report(sc, g, "halted");
 
 	/* Golden registers. The rev-0 list only applies to PCI revision 0. */
 	wr(sc, g->db_mem_config, rd(sc, g->db_mem_config) |
@@ -268,10 +293,20 @@ amd_gfx12_setup(struct atrium_amd_softc *sc)
 		    "settings not in the table yet\n");
 
 	gb = rd(sc, g->gb_addr_config);
-	device_printf(sc->dev, "gfx12: GB_ADDR_CONFIG %#x: %u pipes, %u SEs, "
-	    "%u RB/SE, %u packers, interleave %u B\n", gb, 1u << (gb & 7),
-	    1u << ((gb >> 19) & 0xf), 1u << ((gb >> 26) & 3),
+	/*
+	 * Raw address-config fields, decoded as amdgpu's get_gb_addr_config
+	 * (1 << field). They describe the address swizzle, not the shader
+	 * topology: on the R9700 NUM_SHADER_ENGINES decodes to 16 while the
+	 * part has 4 SEs x 2 SAs (the SA disable mask below leaves 8 SAs).
+	 * The topology comes from the SA/RB masks (and discovery's gc_info).
+	 */
+	device_printf(sc->dev, "gfx12: GB_ADDR_CONFIG %#x (address fields: "
+	    "pipes %u, se %u, rb/se %u, pkrs %u, interleave %u B)\n", gb,
+	    1u << (gb & 7), 1u << ((gb >> 19) & 0xf), 1u << ((gb >> 26) & 3),
 	    1u << ((gb >> 8) & 7), 1u << (8 + ((gb >> 3) & 7)));
+	v = (rd(sc, g->cc_sa_disable) | rd(sc, g->user_sa_disable)) >> 8;
+	device_printf(sc->dev, "gfx12: active SAs %d of 16 (mask %#x)\n",
+	    16 - __builtin_popcount(v & 0xffff), ~v & 0xffff);
 	device_printf(sc->dev, "gfx12: RB disable %#x/%#x, SA disable "
 	    "%#x/%#x, DB_RING_CONTROL %#x\n", rd(sc, g->cc_rb_disable),
 	    rd(sc, g->user_rb_disable), rd(sc, g->cc_sa_disable),
@@ -292,9 +327,11 @@ amd_gfx12_setup(struct atrium_amd_softc *sc)
 	sh_mem_init(sc, g);
 
 	gfx_report(sc, g, "after");
-	device_printf(sc->dev, "gfx12: stage 4c done; CP %s\n",
-	    (rd(sc, g->cp_me_cntl) & CP_ME_HALTS) == CP_ME_HALTS &&
-	    (rd(sc, g->cp_mec_rs64_cntl) & CP_MEC_HALT) != 0 ?
-	    "halted" : "NOT halted");
+	if (!cp_halted(sc, g)) {
+		device_printf(sc->dev, "gfx12: stage 4c: CP NOT halted at "
+		    "the end\n");
+		return (EIO);
+	}
+	device_printf(sc->dev, "gfx12: stage 4c done; CP halted\n");
 	return (0);
 }
