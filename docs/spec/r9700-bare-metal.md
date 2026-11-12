@@ -366,3 +366,12 @@ land with it.
   ANY_ACTIVE) after MES answered and after the halt. The driver refused and the reset
   left the card cold. Next run: RLC and clock-gating registers logged around MES, and the
   GC idle sequence (SRM + clock gating) re-run after the teardown.
+- **2026-11-12 20:28, 7c536595: re-running the idle sequence after MES changed nothing.**
+  Clock-gating state (MGCG_OVERRIDE 0x40, CGCG_CGLS(_3D) 0x363f, SRM 0x3, CP_INT_CNTL
+  0x3c0000) was identical before MES, while it ran, after the teardown and after the
+  re-run. RLC_STAT only bounces (live status). The sticky change is GRBM_STATUS 0x382c ->
+  0xa800382c (GUI_ACTIVE, CP_BUSY, ANY_ACTIVE) as soon as MES answers, with CP_STAT 0, and
+  it lasts past the halt. Power was 28 -> 60 W, gfx 3.4 GHz, busy 100 %; the driver
+  refused and the reset left the card cold. Next: name the busy CP block (CP_CPC_STATUS,
+  CPC/CPF busy, GRBM_STATUS2/3, RLC_GPM_STAT) and watch GRBM_STATUS for 500 ms with MES
+  running, after the queues are gone, and after the halt.

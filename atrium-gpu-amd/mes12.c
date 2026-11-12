@@ -53,6 +53,8 @@ struct mes_gen {
 	    hqd_persistent, hqd_active, hqd_pq_rptr, hqd_pq_wptr_lo;
 	uint32_t unmapped_doorbell, mes_db_cntl1, hqd_gfx_control, cpc_int_cntl;
 	uint32_t hqd_dequeue_req, hqd_pq_wptr_hi, grbm_status, cp_stat, rlc_stat;
+	uint32_t grbm_status2, grbm_status3, cp_cpc_status, cp_cpc_busy,
+	    cp_cpc_busy2, cp_cpf_status, cp_busy_stat, rlc_gpm_stat;
 	/* NBIF segment 2 */
 	uint32_t nbif_db_aper_en, nbif_db_entry0, nbif_db_entry3;
 	/* Doorbell dword indices (amdgpu_doorbell.h NAVI10 MES_RING0/1 << 1). */
@@ -69,6 +71,8 @@ static const struct mes_gen mes_gens[] = {
 	  S0(0x1fdf),
 	  S1(0x0880), S1(0x283c), S0(0x1e9f), S0(0x1e54),
 	  S0(0x1fc1), S0(0x1fe0), S0(0x0da4), S0(0x0f40), S1(0x4c04),
+	  S0(0x0da2), S0(0x0da7), S0(0x0e24), S0(0x0e25), S0(0x0e2a),
+	  S0(0x0e27), S0(0x0f3f), S1(0x4e6c),
 	  0x00c0, 0x01cb, 0x01ce,
 	  0x0b << 1, 0x0c << 1, 0x400 },
 };
@@ -301,6 +305,39 @@ mes_report(struct mes *m, const char *when)
 	printf("; GRBM_STATUS %#x, CP_STAT %#x, RLC_STAT %#x\n",
 	    rd(m, m->g->grbm_status), rd(m, m->g->cp_stat),
 	    rd(m, m->g->rlc_stat));
+	device_printf(m->sc->dev, "mes: %s: GRBM_STATUS2 %#x, GRBM_STATUS3 "
+	    "%#x, CP_CPC_STATUS %#x, CP_CPC_BUSY_STAT %#x/%#x, CP_CPF_STATUS "
+	    "%#x, CP_BUSY_STAT %#x, RLC_GPM_STAT %#x\n", when,
+	    rd(m, m->g->grbm_status2), rd(m, m->g->grbm_status3),
+	    rd(m, m->g->cp_cpc_status), rd(m, m->g->cp_cpc_busy),
+	    rd(m, m->g->cp_cpc_busy2), rd(m, m->g->cp_cpf_status),
+	    rd(m, m->g->cp_busy_stat), rd(m, m->g->rlc_gpm_stat));
+}
+
+#define GRBM_BUSY_BITS	0xa8000000u	/* GUI_ACTIVE | CP_BUSY | ANY_ACTIVE */
+
+/*
+ * Box runs 84bd8b3f/7c536595: GRBM_STATUS took GUI_ACTIVE|CP_BUSY|
+ * ANY_ACTIVE when MES answered and kept them after the halt, with CP_STAT
+ * 0, and the card never idled. Watch whether they clear on their own.
+ */
+static bool
+grbm_watch(struct mes *m, const char *when, int ms)
+{
+	uint32_t first = rd(m, m->g->grbm_status), v = first;
+	int us;
+
+	for (us = 0; us < ms * 1000; us += 1000) {
+		v = rd(m, m->g->grbm_status);
+		if ((v & GRBM_BUSY_BITS) == 0)
+			break;
+		DELAY(1000);
+	}
+	device_printf(m->sc->dev, "mes: %s: GRBM_STATUS %#x -> %#x, %s after "
+	    "%d ms; CP_CPC_STATUS %#x\n", when, first, v,
+	    (v & GRBM_BUSY_BITS) == 0 ? "idle" : "still busy", us / 1000,
+	    rd(m, m->g->cp_cpc_status));
+	return ((v & GRBM_BUSY_BITS) == 0);
 }
 
 /* mes_v12_0_mqd_init */
@@ -651,6 +688,7 @@ mes_teardown(struct mes *m)
 		wr(m, g->cpc_int_cntl, m->cpc_int_cntl[p]);
 	}
 	grbm_select(m, 0, 0);
+	(void)grbm_watch(m, "queues gone, MES still running", 500);
 	mes_enable(m, false);
 	DELAY(100);
 }
@@ -809,10 +847,12 @@ amd_mes12_test(struct atrium_amd_softc *sc, struct amd_gart *gt)
 	pci_enable_busmaster(sc->dev);
 	err = mes_run(&m);
 	mes_report(&m, err == 0 ? "answered" : "failed");
+	(void)grbm_watch(&m, "MES running, no work", 500);
 	amd_gfx12_pm_report(sc, "MES running");
 	mes_teardown(&m);
 	mes_report(&m, "torn down");
 	amd_gfx12_pm_report(sc, "MES torn down");
+	(void)grbm_watch(&m, "MES halted", 500);
 	/*
 	 * Box run 84bd8b3f: once MES had run, RLC_STAT fell from 0x35 to 0 and
 	 * GRBM_STATUS kept GUI_ACTIVE|CP_BUSY|ANY_ACTIVE after the halt; the
