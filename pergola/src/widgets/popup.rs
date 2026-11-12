@@ -548,6 +548,110 @@ impl View for MenuButton {
     }
 }
 
+// ── PanelButton ─────────────────────────────────────────────────────────
+
+/// What a panel draws: its content in `inner` (the panel less its
+/// padding), window px.
+pub type PanelContent = Rc<dyn Fn(&mut Ctx, Rect)>;
+
+/// A button that opens a panel of any content (the bar's volume:
+/// a slider and a list of outputs). The same trigger as [`MenuButton`]
+/// (label or icon, the attached look); the panel is a floating surface of
+/// `size`, padding 12, that hangs from it as a pop-up window. Escape, a
+/// press outside or a change of focus closes it.
+pub struct PanelButton {
+    pub label: String,
+    pub open: Mutable<MenuState>,
+    pub rect: Rect,
+    pub attached: bool,
+    pub icon: Option<TriggerIcon>,
+    pub size: crate::geom::Size,
+    content: PanelContent,
+}
+
+/// A panel's padding.
+pub const PANEL_PADDING: f32 = 12.0;
+
+impl PanelButton {
+    pub fn new(label: impl Into<String>, open: Mutable<MenuState>, size: crate::geom::Size, content: impl Fn(&mut Ctx, Rect) + 'static) -> Self {
+        Self {
+            label: label.into(),
+            open,
+            rect: Rect::new(0.0, 0.0, 160.0, size::BUTTON_HEIGHT_DEFAULT),
+            attached: false,
+            icon: None,
+            size,
+            content: Rc::new(content),
+        }
+    }
+    pub fn at(mut self, x: f32, y: f32) -> Self {
+        self.rect.origin.x = x;
+        self.rect.origin.y = y;
+        self
+    }
+    /// The trusted-surface look: lit while open, the panel joined to it.
+    pub fn attached(mut self) -> Self {
+        self.attached = true;
+        self
+    }
+    /// A Phosphor glyph instead of the label (see [`MenuButton::icon`]).
+    pub fn icon(mut self, glyph: char, size: f32, color: Option<Color>) -> Self {
+        self.icon = Some(TriggerIcon { glyph, size, color });
+        self.rect.size.w = (size + 12.0).round();
+        self.rect.size.h = self.rect.size.h.min(size + 12.0).max(size + 8.0);
+        self
+    }
+}
+
+impl View for PanelButton {
+    fn render(&self, ctx: &mut Ctx) {
+        let r = self.rect;
+        trigger_with(ctx, r, &self.label, self.icon, &self.open, None, self.attached);
+        if !self.open.get().open {
+            return;
+        }
+        let gap = if self.attached { 0.0 } else { MENU_GAP };
+        let (w, h) = (self.size.w.max(r.w()), self.size.h);
+        let align = if self.icon.is_some() { crate::popup::Align::End } else { crate::popup::Align::Start };
+        let x = if align == crate::popup::Align::End { r.x() + r.w() - w } else { r.x() };
+        let pr = Rect::new(x, r.y() + r.h() + gap, w, h);
+        let anchor = Rect::new(r.x(), r.y() - gap, r.w(), r.h() + 2.0 * gap);
+        let (open, content, attached) = (self.open.clone(), self.content.clone(), self.attached);
+        ctx.overlay(move |ctx| {
+            let close = { let o = open.clone(); move || o.set(MenuState::default()) };
+            if ctx.popups_enabled() {
+                let spec = crate::popup::Spec { anchor, side: crate::popup::Side::Below, align, grab: true };
+                ctx.popup(pr, spec, close, |ctx| panel_body(ctx, pr, attached, &open, &content));
+            } else {
+                let catcher = ctx.add(Node::Rect { rect: EVERYWHERE, fill: Color::TRANSPARENT, radius: 0.0 });
+                ctx.on_click(catcher, close);
+                panel_body(ctx, pr, attached, &open, &content);
+            }
+        });
+    }
+}
+
+/// A panel's surface (the attached edge when it hangs from a lit button),
+/// then its content.
+fn panel_body(ctx: &mut Ctx, r: Rect, attached: bool, open: &Mutable<MenuState>, content: &PanelContent) {
+    let t = ctx.theme;
+    let body = if attached {
+        let e = ctx.add(Node::Rect { rect: r, fill: t.accent_fill(), radius: radius::MD });
+        ctx.tree.insert(Some(e), Node::Rect { rect: inflate(r, -ATTACHED_EDGE), fill: t.bg_elevated(), radius: radius::MD - ATTACHED_EDGE })
+    } else {
+        surface(ctx, r, radius::MD)
+    };
+    ctx.autofocus(body);
+    ctx.on_click(body, || {});
+    let o = open.clone();
+    ctx.on_key(body, move |ev| {
+        if matches!(ev, Event::Key { kind: KeyEventKind::Down, key: Key::Escape, .. }) {
+            o.set(MenuState::default());
+        }
+    });
+    content(ctx, inflate(r, -PANEL_PADDING));
+}
+
 // ── Dialog ──────────────────────────────────────────────────────────────
 
 /// One of a dialog's buttons; the last is the primary one (§14.2).
@@ -816,6 +920,52 @@ mod tests {
         assert_eq!(spec.align, crate::popup::Align::End);
         let r = app.tree().get(root).unwrap().rect();
         assert_eq!((r.x() + r.w(), r.y()), (400.0, 30.0), "right edges line up, no gap");
+    }
+
+    struct Volume {
+        open: Mutable<MenuState>,
+        level: Mutable<f64>,
+        out: Mutable<usize>,
+    }
+    impl View for Volume {
+        fn render(&self, ctx: &mut Ctx) {
+            let (level, out) = (self.level.clone(), self.out.clone());
+            PanelButton::new("Volume", self.open.clone(), crate::geom::Size::new(240.0, 120.0), move |ctx, r| {
+                crate::widgets::Slider::new(level.clone(), 0.0, 1.0).at(r.x(), r.y()).width(r.w()).render(ctx);
+                crate::widgets::RadioGroup::new(out.clone(), ["Speakers", "Headphones"]).at(r.x(), r.y() + 32.0).render(ctx);
+            })
+            .icon(crate::widgets::phosphor::SPEAKER_SIMPLE_HIGH, 15.0, None)
+            .at(300.0, 0.0)
+            .attached()
+            .render(ctx);
+        }
+    }
+
+    #[test]
+    fn a_panel_button_hangs_any_content_from_its_lit_button() {
+        let d = Arc::new(AtomicBool::new(true));
+        let open = Mutable::with_dirty(MenuState::default(), d.clone());
+        let level = Mutable::with_dirty(0.5f64, d.clone());
+        let out = Mutable::with_dirty(0usize, d.clone());
+        let mut app = App::new_with_flag(Volume { open: open.clone(), level: level.clone(), out: out.clone() }, d);
+        app.set_popups(true);
+        app.tick();
+        click(&mut app, 310.0, 10.0);
+        assert!(open.get().open);
+        let (root, spec) = app.tree().popups().next().map(|(id, s)| (id, *s)).unwrap();
+        assert_eq!((spec.side, spec.align), (crate::popup::Side::Below, crate::popup::Align::End));
+        let r = app.tree().get(root).unwrap().rect();
+        assert_eq!((r.x() + r.w(), r.y(), r.w(), r.h()), (327.0, 27.0, 240.0, 120.0));
+        // The content works inside: the slider's track, near its right end.
+        let (x0, y0) = (r.x() + PANEL_PADDING, r.y() + PANEL_PADDING);
+        click(&mut app, x0 + 0.9 * (r.w() - 2.0 * PANEL_PADDING), y0 + 8.0);
+        assert!(level.get() > 0.8, "{}", level.get());
+        assert!(open.get().open, "a press inside keeps it open");
+        // Escape closes it.
+        key(&mut app, Key::Tab);
+        app.handle_event(Event::Key { kind: KeyEventKind::Down, key: Key::Escape, modifiers: Default::default(), chars: String::new() });
+        app.tick();
+        assert!(!open.get().open);
     }
 
     #[test]

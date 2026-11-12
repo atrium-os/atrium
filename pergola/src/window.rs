@@ -213,9 +213,14 @@ impl Window {
                 bounds: (self.width, self.height),
                 destroyed: Vec::new(),
             };
-            self.popups.sync(app.tree(), &mut host);
+            let refused = self.popups.sync(app.tree(), &mut host);
             for w in std::mem::take(&mut host.destroyed) {
                 self.surface.forget(w);
+            }
+            // Not allowed now (the window is not the active one): closed,
+            // so the next press opens it rather than closing an unseen one.
+            for root in refused {
+                app.popup_dismissed(root);
             }
             for (win, batch) in self.popups.route(deltas, app.tree(), self.main) {
                 if batch.is_empty() {

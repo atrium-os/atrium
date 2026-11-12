@@ -588,8 +588,9 @@ impl<V: View> App<V> {
                     }
                 }
                 // A key no one in the layer took goes to the layer itself: a
-                // dialog hears Escape from the button that has focus.
-                if !taken {
+                // dialog hears Escape from the button that has focus. Escape
+                // always reaches it (a slider in a panel does nothing with it).
+                if !taken || (*key == Key::Escape && *kind == KeyEventKind::Down) {
                     if let Some(cb) = self.modal.filter(|m| Some(*m) != self.focused).and_then(|m| self.interactions.get(m)).and_then(|h| h.on_key.as_ref()) {
                         cb(&event);
                         taken = true;

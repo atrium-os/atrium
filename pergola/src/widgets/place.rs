@@ -176,6 +176,19 @@ impl Widget for Dropdown {
     }
 }
 
+impl Widget for crate::widgets::PanelButton {
+    fn natural_size(&self) -> Size {
+        self.rect.size
+    }
+    fn framed(mut self, r: Rect) -> Self {
+        frame(&mut self.rect, r);
+        self
+    }
+    fn baseline(&self, s: Size) -> Option<f32> {
+        Some(centred(s.h, type_size::MD))
+    }
+}
+
 impl Widget for crate::widgets::MenuButton {
     fn natural_size(&self) -> Size {
         self.rect.size

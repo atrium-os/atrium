@@ -104,7 +104,10 @@ pub struct Popups {
 
 impl Popups {
     /// Open, move or close windows to match the tree's pop-up roots.
-    pub fn sync(&mut self, tree: &NodeTree, host: &mut dyn Host) {
+    /// Returns the roots frescod refused (not the active window, an
+    /// anchor outside it): close them, as a dismissal would.
+    pub fn sync(&mut self, tree: &NodeTree, host: &mut dyn Host) -> Vec<NodeId> {
+        let mut refused = Vec::new();
         let want: HashMap<NodeId, (Spec, Rect)> = tree
             .popups()
             .filter_map(|(id, spec)| Some((id, (*spec, tree.get(id)?.rect()))))
@@ -124,19 +127,25 @@ impl Popups {
                 Some(o) => {
                     match host.place(o.window, &spec, rect) {
                         Ok(()) => *o = Open { spec, rect, dismissed: false, ..*o },
-                        Err(e) => log::warn!("popup: place failed ({e})"),
+                        Err(e) => {
+                            log::warn!("popup: place refused ({e})");
+                            o.dismissed = true;
+                            refused.push(id);
+                        }
                     }
                 }
                 None => match host.create(&spec, rect) {
                     Ok(window) => {
                         self.open.insert(id, Open { window, spec, rect, dismissed: false });
                     }
-                    // Refused (the window is not active): the menu stays
-                    // closed-looking but open; the next press closes it.
-                    Err(e) => log::warn!("popup: create refused ({e})"),
+                    Err(e) => {
+                        log::warn!("popup: create refused ({e})");
+                        refused.push(id);
+                    }
                 },
             }
         }
+        refused
     }
 
     /// Split a frame's deltas by window: `main`'s, then each pop-up's
@@ -155,7 +164,12 @@ impl Popups {
             match d {
                 NodeDelta::Added { id, node, group, order } | NodeDelta::Changed { id, node, group, order } => {
                     let root = tree.root_of(id);
-                    let w = self.open.get(&root).map_or(main, |o| o.window);
+                    let w = match self.open.get(&root) {
+                        Some(o) => o.window,
+                        // A pop-up frescod refused: drawn nowhere (it closes).
+                        None if tree.popups().any(|(p, _)| p == root) => continue,
+                        None => main,
+                    };
                     let prev = self.owner.insert(id, w);
                     if let Some(prev) = prev.filter(|&p| p != w && (p == main || alive.contains_key(&p))) {
                         push(prev, NodeDelta::Removed { id }, &mut out);
