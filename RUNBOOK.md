@@ -5212,6 +5212,11 @@ make.py ... installkernel DESTDIR=$HOME/stage -DNO_ROOT KODIR=/boot/kernel.atriu
   `hospes-install` and plays the stream as `nobody`. `INSTALL_ONLY=1` stops before the CDM
   runs; `CHROME_DEB=` reuses a matching .deb. The arm64 libc++abi for the glibc.so fixture
   comes from Ubuntu ports' `libc++abi-18-dev`, unpacked into `~/.cache/hospes-cxxabi-arm64`.
+- Hospes H5: fuzz with `cd hospes/fuzz && cargo +nightly fuzz run <elf|proto|codec_wire|vfs|install> -O`
+  (the fuzz build is large; clear other `target/` dirs first in the cloud). Version watch:
+  `sh scripts/hospes-version-watch.sh x86_64|aarch64` (needs dl.google.com and
+  ciscobinary.openh264.org; `OPENH264_BZ2_DIR=` takes Cisco's .bz2 files from disk where that
+  host is blocked, as in the cloud container). CI runs it daily; the weekly job fuzzes 5 min each.
 - Build the Tessera EFI loader on the host via buildenv (~2 min), not in the TCG guest (30+ min).
 - Fork userland for amd64: `scripts/cross-build-world.sh` (~62 min). Stop the VM during it (the guest got OOM-killed).
 - Never run two make.py builds on one objdir.

@@ -198,8 +198,13 @@ table); `SIGSYS` handler in `hospes-rt`, Linux-call emulation and the first virt
 (`docs/reviews/2026-11-12-hospes-h4.md`): Shaka's angel-one Widevine stream plays to the end
 in the FreeBSD amd64 VM under Hospes (H.264 through the CDM's decrypt-and-decode, Opus
 decrypt-only, licence POSTed through Nuntius, CDM installed by `hospes-install` from Google's
-signed package). Next: H5. Run: `scripts/hospes-build.sh`, `scripts/hospes-h3-vm.sh`,
-`scripts/hospes-kmod.sh`, `scripts/hospes-k1-vm.sh`, `scripts/hospes-h4-vm.sh`.
+signed package). H5 (hardening) done 2026-11-12 (`docs/reviews/2026-11-12-hospes-h5.md`):
+five fuzz targets (ELF, both channel decoders, VFS paths, install parsers) clean for 1 h each
+after one fix (own `.deb` reader); version-watch CI `.github/workflows/hospes-version-watch.yml`
+checks today's Chrome CDM and OpenH264 daily on both machines (CDM never run in CI). bhyve
+wrapper not built. Build order H0-H5 complete; open items in the H4/H5 write-ups. Run: `scripts/hospes-build.sh`, `scripts/hospes-h3-vm.sh`,
+`scripts/hospes-kmod.sh`, `scripts/hospes-k1-vm.sh`, `scripts/hospes-h4-vm.sh`,
+`scripts/hospes-version-watch.sh`.
 
 ## 6. Navigator exploration coverage
 
