@@ -183,7 +183,13 @@ on FreeBSD amd64 and arm64 incl. the capability-mode isolation probe; real CDM a
 map and relocate. H2 done 2026-11-11 (`docs/reviews/2026-11-11-hospes-h2.md`): `hospes-glibc`
 shim for OpenH264's 71 imports, `hospes-codec` (capability mode), player `h264` feature; 12/12
 conformance streams bit-identical to glibc on Linux and FreeBSD amd64/arm64, player plays
-H.264 in the FreeBSD arm64 VM. Next: H3 (`hospes-cdm` with the test CDM). Run: `scripts/hospes-build.sh`.
+H.264 in the FreeBSD arm64 VM. H3 done 2026-11-12 (`docs/reviews/2026-11-12-hospes-h3.md`):
+`hospes-cdm` (CDM interface 10, capability mode, per-origin store), `hospes-proto`, a C++ Clear
+Key test CDM with a glibc reference host (transcripts identical on Linux and FreeBSD
+amd64/arm64), CENC/CBCS sample info in the MP4 and WebM demuxers, and the player decrypting
+through `hospes-cdm` (cenc MP4, cbcs MP4 and encrypted WebM play with frames equal to the clear
+sources on Linux and both FreeBSD VMs). Next: K1 then H4 (Widevine). Run:
+`scripts/hospes-build.sh`, `scripts/hospes-h3-vm.sh`.
 
 ## 6. Navigator exploration coverage
 
