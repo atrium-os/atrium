@@ -244,6 +244,11 @@ pub fn create_fd(dev: Dev, size: u64, flags: u32) -> Result<c_int> {
     }
     let vram = flags & sys::ATRIUM_GPU_BO_VRAM as u32 != 0;
     let bytes = (size + PAGE_SIZE - 1) & !(PAGE_SIZE - 1);
+    // A device with no VRAM heap (silicon before stage 5d) has nothing to place it in: not
+    // supported, rather than a quota of 0 % of nothing (EDQUOT).
+    if vram && dev.caps().vram_bytes == 0 {
+        return Err(EOPNOTSUPP);
+    }
     let charge = dev.state().quotas.charge(dev, vram, bytes)?;
     let mut bo: Box<Bo> =
         Box::new(Bo { hw, binds: SxLock::new([const { None }; MAX_BIND]), charge: None }, M_WAITOK);

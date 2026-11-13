@@ -363,7 +363,14 @@ main(void)
 			    "is untouched", "%d/64 poison, out[0] %#x", n,
 			    first);
 		}
-		/* 4: D recovers with a page of its own again. */
+		/*
+		 * 4: D recovers with a page of its own again. Its syncobj
+		 * keeps the EIO (the ABI's sticky error state), so the next
+		 * job signals a fresh one.
+		 */
+		close(d.so);
+		d.so = syncobj();
+		d.value = 0;
 		d.out = bo_alloc(4096, 0);
 		if (d.out < 0 || bind(d.vm, d.out, 0, &d.out_va) != 0)
 			check(0, "4 recovery", "rebind: %s", strerror(errno));

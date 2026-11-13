@@ -615,3 +615,15 @@ through fd passing, close and jail death.
   page alone, recovery, refusals. Runner stage 5c2. **5c-2b** then moves SUBMIT onto MES user
   queues per the 2026-11-12 decision (queue fd = MES user queue, doorbell mapping, device-lost
   on the queue's fd), after which client work no longer runs on the kernel queue.
+- 2026-11-13 02:00, 5c-2a run 4f9c4f21 (log /root/runs/20261113T020027Z.log): the client node
+  came up on silicon (/dev/atrium-gpu0, amd-silicon backend, kernel queue at GART 0x70000).
+  si-client-test 9 of 11: dispatch with kqueue completion in 0 ms; two VMs at the same VAs each
+  64 x 42 on their own page; the cross-VM write faulted (TCP, VMID 4, write, VA 0x10002000),
+  the fault IV failed the submit with EIO, the watchdog stopped the queue (wave kill, fence
+  after 100 us) and the other VM's page kept its poison; the other VMs then ran clean.
+  Failures were the test and an errno, not the hardware path: (1) the faulted VM's next job
+  reused the syncobj that had failed, whose EIO is sticky by design (ABI §5.6), so its wait
+  returned at once; the test now gives it a fresh syncobj. (2) a VRAM BO was refused with
+  EDQUOT (0 % of no VRAM) instead of EOPNOTSUPP; the front-end now refuses VRAM BOs with
+  EOPNOTSUPP when the device has no VRAM heap. Idle with the client node attached: 7 W
+  (GfxOff allowed while no VM exists). Detach clean, mode 1 reset cold, stray 0.
