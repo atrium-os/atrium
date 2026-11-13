@@ -321,7 +321,9 @@ later addition; the split in §3.1 allows it (hostapd's role would move into
 9. **Regulatory from wireless-regdb**, firmware LAR, user country; AP may
    only tighten. *Recommend yes* (§3.6).
 10. **Simulation-first testing** (`aura_sim` + Linux hwsim/hostapd) before
-    silicon. *Recommend yes* (§6).
+    silicon. *Recommend yes* (§6). **Accepted 2026-11-13** (Shankar), with no
+    emulated chip model: QEMU has no Wi-Fi device, so the driver is tested on
+    the real MT7921AU via USB passthrough and the MT7925 bare metal.
 11. **Station only in v1**; AP/hotspot later. *Recommend yes* (§9).
 12. **Usable on stock FreeBSD as a port** (kmods + `aurad` with seams for
     Arca and launch), as Vinculum is. *Recommend yes*, it costs little: the
