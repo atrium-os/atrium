@@ -1793,7 +1793,12 @@ impl<'a> Cx<'a> {
         // which the UI binds to a Limen media player.
         if self.dom.tag(h) == Some("video") && !hidden {
             let content = (bx + bl + pl, by + bt + pt, (w - frame).max(0), (hgt - pt - pb - bt - bb).max(0));
-            if content.2 > 0 && content.3 > 0 {
+            let source = video_source(self.dom, h);
+            // ★ An island box smaller than content gets no slot and paints
+            // nothing (navigator-ui D14): the size gate, not a host list.
+            let island = matches!(source, crate::EmbedSource::Island { .. });
+            let big = !island || (content.2 >= navigator_dom::media::ISLAND_MIN_W * 64 && content.3 >= navigator_dom::media::ISLAND_MIN_H * 64);
+            if content.2 > 0 && content.3 > 0 && big {
                 let has_poster = self.dom.attr(h, "poster").is_some_and(|p| self.subs.get(p).is_some());
                 if !has_poster {
                     self.scene.insert_rect(slot, Rect { x: content.0, y: content.1, w: content.2, h: content.3, rgba: 0x000000ff, radii: [0; 4], ring: 0 });
@@ -1802,10 +1807,9 @@ impl<'a> Cx<'a> {
                 let flag = |a: &str| self.dom.attr(h, a).is_some();
                 let flags = (flag("autoplay") as u8) * crate::embed_flags::AUTOPLAY | (flag("loop") as u8) * crate::embed_flags::LOOP
                     | (flag("muted") as u8) * crate::embed_flags::MUTED | (flag("controls") as u8) * crate::embed_flags::CONTROLS;
-                let source = video_source(self.dom, h);
-                // ★ A recognised embed is a live part: Limen's `island`
+                // ★ An embedded frame is a live part: Limen's `island`
                 // slot kind (navigator-ui §6.3), never the media player.
-                let role = if matches!(source, crate::EmbedSource::Island { .. }) { "island" } else { "media-player" };
+                let role = if island { "island" } else { "media-player" };
                 self.scene.insert_embed(slot, crate::Embed { x: content.0, y: content.1, w: content.2, h: content.3, role, key: h, source, flags,
                                                                  tracks: navigator_dom::media::text_tracks(self.dom, h) });
                 slot += 1;

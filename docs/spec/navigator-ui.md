@@ -793,7 +793,7 @@ images; open).
 **Embeds** (legacy-web §8.1): no corpus page produced an island. All 4 real video embeds arrive
 lazily: LinkedIn and wikiHow put the player URL in a data attribute a script copies to `src`, and
 Samsung inserts its iframe from script. The normalizer now reads the common lazy attributes too.
-How embeds should be recognised beyond the short list is §13 D14.
+D14 then made embeds list-free: see legacy-web §8.1.
 
 ## 7. Reading controls
 
@@ -1015,7 +1015,7 @@ argued further on paper.
 | **D6** | Favicons | show site favicons (decoded in the page's jail, validated) · **monograms only** (§1) | **Monograms.** No site pixels in the chrome; lookalikes can't copy a monogram any better than the name |
 | **D7** | UI processes | **one per user session** · one per window (§2.3) | **One per session.** It holds nothing worth isolating per window, and the switch is cheap later |
 | **D9** | Malicious-site list for red (§6.5) | **off by default; local signals only** (cert failure, lookalike of an Arca login, jail monitor reports) · a downloaded hashed-prefix list on by default · per-visit online lookups | **Off by default, offered in settings.** The local signals catch what matters most with no data leaving; a list adds a dependency on its publisher |
-| **D14** open | Which iframes become live parts (§6.6, legacy-web §8.1) | **short list of video players** (YouTube, Vimeo; plus lazy attributes) · no list: any iframe of real size becomes a click-to-start box naming its origin, the list only adds a poster | Short list chosen 2026-11-13; the corpus then showed the list catches 2 of 4 real embeds even with lazy attributes, so it is put to Shankar again |
+| **D14** ✓ accepted | Which iframes become live parts (§6.6, legacy-web §8.1) | short list of video players · **no list: any iframe with a web address and a box of at least 200 × 150 becomes a press-to-start island box naming its origin; a known player only gets a canonical URL** | **List-free** (Shankar, 2026-11-13). The short list, picked first, caught 2 of the corpus's 4 real embeds even with lazy attributes; a miss now degrades to a plainer box, not a lost embed |
 | **D13** ✓ accepted | Ad residue (§6.6) | **optional "Tidy page", off by default, per site** · on by default · nothing | **Optional, off by default.** Conversion already removes every third-party ad; tidying first-party boxes is a heuristic, so the reader turns it on |
 | **D12** | Always private? (§2.4) | **Personal by default, with "start new trails Unrecorded" and a history retention setting** · Unrecorded always | **Personal by default.** Sites already see an anonymous reader; forgetting everything locally costs restore, history and the certificate-change signal |
 | **D11** | Status bar (§5.7) | **optional, off by default** · always on · none | **Optional, off by default.** The click check runs either way; the bar is for people who look before they click |

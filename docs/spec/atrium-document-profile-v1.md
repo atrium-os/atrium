@@ -128,7 +128,8 @@ position, never a silent recovery.
 (a scripting surface), event-handler attributes, `<style>` `@import` chains beyond a
 bounded depth, `<base>` (ambient rewriting of every link).
 The normalizer (§6) drops them, except that an `<object>` leaves its fallback content and
-an iframe that is a recognised video embed becomes an island box (legacy-web §8.1).
+an iframe with a web address and a content-sized box becomes a press-to-start island box
+(legacy-web §8.1).
 
 **Structural and semantic elements** are the core of the subset, and they are what feeds
 G5: sectioning (`article`, `section`, `nav`, `aside`, `header`, `footer`, `main`),
