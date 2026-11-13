@@ -983,3 +983,14 @@ work (self-test, scrub).
   most 3 re-inits in 10 minutes; after that the GPU stays lost until the driver is
   reloaded. A failed re-init also leaves it lost, as before. gpusim does not run this
   path (both suites ALL OK there as a regression check).
+- **2026-11-13 06:31, stage 5f on the box (ce098609): the box hung about 3 minutes into
+  the run**, near isolation's step-7 CPG fault, where the first GPU re-init would run.
+  ssh stopped answering and the box did not reboot. Before the run:
+  - the 06:04 reboot into Ubuntu was Atrium's own fallback (/etc/rc.d/atrium_fallback),
+    which re-arms on every boot; atrium-stay was run again at 06:31;
+  - the box was booted once into Atrium (BootNext 0005) at 06:30.
+  Suspect, found in review: `si_recover` took the kernel queue (set c->kq to NULL)
+  before stopping the VRAM scrub engine, and `si_vram_clear` re-read c->kq at every
+  step. A scrub running during the re-init could therefore use a NULL queue and panic,
+  and this kernel stops in the debugger on a panic. Fixed in 54939f76. The console (a
+  panic or a hard hang) and the run log on Atrium's disk will confirm or rule this out.
