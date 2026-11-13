@@ -1238,7 +1238,12 @@ part_f(void)
 	bo_read(fda, stage, buf, F_BYTES);
 	CHECK(err == 0 && buf[0] == SENTINEL && buf[F_BYTES / 4 - 1] == SENTINEL,
 	    "A's VRAM BO holds the sentinel (round trip through the GPU)");
-	CHECK(vram("used") == used0 + F_BYTES, "VRAM in use grew by A's BO");
+	/* On silicon a VM's page tables come from VRAM too (gmc12.c
+	 * AMD_VM12_4L_HEAP), so A's bindings add a few table pages. */
+	CHECK(vram("used") >= used0 + F_BYTES &&
+	    vram("used") <= used0 + F_BYTES + (1ULL << 20),
+	    "VRAM in use grew by A's BO (and at most 1 MiB of its page tables: "
+	    "+%llu KiB)", (unsigned long long)((vram("used") - used0) >> 10));
 
 	/* A frees it: it is dirty, then scrubbed by the GPU. */
 	close(v);
@@ -1290,11 +1295,13 @@ part_f(void)
 	    "device) in %.1f s with no ENOMEM",
 	    (unsigned long long)(i * 64), (double)(i * (64ULL << 20)) / total,
 	    now_s() - t0);
-	CHECK(vram("used") == used0 && vram("enomem") == enomem0 &&
-	    vram("scrub_failed") == 0,
-	    "VRAM in use is back where it started; no scrub failed");
+	/* B's VM goes too (its page tables are VRAM on silicon). */
 	close(vmb);
 	close(fdb);
+	ok = vram_settle(5000);
+	CHECK(ok && vram("used") == used0 && vram("enomem") == enomem0 &&
+	    vram("scrub_failed") == 0,
+	    "VRAM in use is back where it started; no scrub failed");
 }
 
 /* ---------------------------------------------------------------------------

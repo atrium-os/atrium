@@ -1003,3 +1003,17 @@ work (self-test, scrub).
   - next commit: the re-init treats the PSP load's result as attach does, and lets the
     SMU start and si_up decide.
   No crash dump: dumpdev="AUTO" has no swap partition to write to.
+- **2026-11-13 07:19, stage 5f on the box (26fffb0b): the GPU re-init works on silicon.**
+  si-client-test 64/64; suite ALL OK; isolation 2 FAILs, both in the test's accounting.
+  - Step 7's CPG fault left a stuck HQD. The driver did a mode 1 reset and brought the
+    whole card back in about 4 s: PSP, SMU (which completes the RLC autoload), GART,
+    GFX, IH (MSI again), MES, dispatch PASS and the idle proof. Then "GPU re-init 1 of
+    3: PASS" and a new kernel queue. Every later test ran on the new card; Break 1 and
+    Part G pass.
+  - Scrubs never failed. The card returned to idle (GRBM 0x382c) and was proven idle
+    at detach (7 W). The vector was released.
+  - Only 0x18000000 is still unrouted (one per IH instance).
+  The 2 FAILs: Part F expected "VRAM in use" to grow by exactly the 64 KiB BO. On
+  silicon a VM's page tables come from VRAM too, so A's grew by 88 KiB. Its last check
+  also ran while B's VM was still open. The test now allows up to 1 MiB of page tables
+  and closes B's VM before the final check (gpusim ALL OK).
