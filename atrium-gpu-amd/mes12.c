@@ -1428,7 +1428,7 @@ vmt_variant(struct mes *m, struct disp *d, uint8_t *pg, vm_paddr_t pg_pa,
 	}
 	if (gt->dummy != NULL) {
 		device_printf(sc->dev, "vm: dummy page word 0 now %#x "
-		    "(faulting writes land there); zeroed\n",
+		    "(no-retry faulting writes were not seen there); zeroed\n",
 		    *(volatile uint32_t *)gt->dummy);
 		memset(gt->dummy, 0, PAGE_SIZE);
 	}

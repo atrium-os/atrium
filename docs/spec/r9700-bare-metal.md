@@ -565,3 +565,15 @@ through fd passing, close and jail death.
   the page, target untouched, queue recovers", where recovery kills VMID 1's waves with
   SQ_CMD (gfx_v11 soft recovery; gfx12 amdgpu has none) and waits for the fence. Only the
   four-level VRAM layout runs.
+- 2026-11-13 01:20, **stage 5b PASSED** (e0bed369; log /root/runs/20261113T011936Z.log). VMID 1
+  with its own four-level VRAM table (IS_PTE leaves): (A) write_42 64 x 42, fence 20 µs, no
+  fault; (B) a write to a VA only VMID 0 maps latched a VMID 1 TCP write fault at the victim
+  page (0x141156), the victim stayed poisoned, the stuck wave was killed with SQ_CMD and
+  the queue fenced and went idle; (C) after unmap + VMID 1 flush, the revoked page latched
+  a fault (0x141050) and stayed poisoned, recovered the same way. Then attached 30 s at
+  13 W (gfx 0 MHz, mem 193 MHz, 0 % busy), VMID 0 dispatch PASS at detach, idle proven,
+  mode 1 reset cold; give-back and kldunload rc 0, stray 0. Notes for 5c: no-retry faulting
+  writes did not appear in the dummy page (dropped, so no cross-client channel there); two
+  IVs from client 0xa with src 0xef (data 0x580000, 0x80 / 0x82) came with the B fault and
+  are not yet decoded; the fault IV (client 0xa src 0, data = page, vmid) is the hook for
+  "only the faulting queue's fd sees device-lost". Next: 5c.
