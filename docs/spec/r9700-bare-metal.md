@@ -1413,3 +1413,15 @@ work (self-test, scrub).
   last TLB invalidation (and for which context) started and ended, to see
   whether an invalidation overlaps the fault. Logs: claude/project-thread-33aauq
   b5d8c2d4.
+- **2026-11-13 14:36, full suite with 880c3ce7 (L2 state at the fault): WEDGED,
+  and the L2 is idle when the fault is taken.** 70 passed, 2 failed, 189
+  timeouts. At test 15's fault GCVM_L2_STATUS was 0 (and stayed 0 for the check),
+  and the last invalidation (context 5) had ended 476 us earlier, so no
+  invalidation overlapped the fault. By the "before the wave kill" snapshot, a
+  few steps later, L2_STATUS was 0x1 and CPF bit 28 set, for good. Tests 7 and
+  13 also read 0 at the fault and recovered. Between the two: the IH marks the
+  queue lost (scanning HQDs through GRBM selects), the eviction task reports
+  the queue and looks up its HQD (more selects), while the bystander's EOP IV
+  arrives. That is the window of audit F1.
+  Next (kmods fc80fbea): F1/F2 in, plus the L2/CPF state and time since the
+  fault at each of those steps. Logs: claude/project-thread-33aauq 8cd0e5be.
