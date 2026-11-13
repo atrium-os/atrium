@@ -5,8 +5,15 @@
 //! only device-derived data `sigillumd` reads, so every field has a cap that
 //! [`driver::FromDriver::check_caps`] enforces after decoding.
 #![forbid(unsafe_code)]
+#![no_std]
+extern crate alloc;
+#[cfg(feature = "std")]
+extern crate std;
 
+#[cfg(feature = "std")]
 use std::io::{self, Read, Write};
+#[cfg(feature = "std")]
+use std::{string::ToString, vec};
 
 use serde::{de::DeserializeOwned, Serialize};
 
@@ -15,7 +22,25 @@ pub mod driver;
 pub mod ui;
 pub mod rp;
 
+/// One message as it goes on the wire: `u32 LE length | postcard`.
+pub fn encode<T: Serialize>(msg: &T, max: usize) -> Option<alloc::vec::Vec<u8>> {
+    let body = postcard::to_allocvec(msg).ok()?;
+    if body.len() > max {
+        return None;
+    }
+    let mut out = alloc::vec::Vec::with_capacity(4 + body.len());
+    out.extend_from_slice(&(body.len() as u32).to_le_bytes());
+    out.extend_from_slice(&body);
+    Some(out)
+}
+
+/// Decode one message body (the bytes after the length word).
+pub fn decode<T: DeserializeOwned>(body: &[u8]) -> Option<T> {
+    postcard::from_bytes(body).ok()
+}
+
 /// Write one message.
+#[cfg(feature = "std")]
 pub fn write_msg<T: Serialize>(w: &mut impl Write, msg: &T, max: usize) -> io::Result<()> {
     let body = postcard::to_stdvec(msg).map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e.to_string()))?;
     if body.len() > max {
@@ -27,6 +52,7 @@ pub fn write_msg<T: Serialize>(w: &mut impl Write, msg: &T, max: usize) -> io::R
 }
 
 /// Read one message; `Ok(None)` at a clean end of stream.
+#[cfg(feature = "std")]
 pub fn read_msg<T: DeserializeOwned>(r: &mut impl Read, max: usize) -> io::Result<Option<T>> {
     let mut len = [0u8; 4];
     match r.read_exact(&mut len) {

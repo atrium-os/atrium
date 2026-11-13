@@ -177,6 +177,10 @@ impl<D: HidDevice> Driver<D> {
                 let _ = self.client.cancel();
                 None
             }
+            // A token driver's requests (S5): a FIDO key has no certificates.
+            ToDriver::ListCertificates { ceremony } | ToDriver::SignDigest { ceremony, .. } => {
+                Some(FromDriver::Error { ceremony, error: DriverError::Unsupported })
+            }
         }
     }
 
@@ -335,6 +339,9 @@ impl<D: HidDevice> Driver<D> {
                 Some(self.u2f_assert(ceremony, &rp_id, &client_data_hash, &allow, uv_required))
             }
             ToDriver::Cancel { .. } => None,
+            ToDriver::ListCertificates { ceremony } | ToDriver::SignDigest { ceremony, .. } => {
+                Some(FromDriver::Error { ceremony, error: DriverError::Unsupported })
+            }
         }
     }
 

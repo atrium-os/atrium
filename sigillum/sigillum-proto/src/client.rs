@@ -2,6 +2,8 @@
 //! `/atrium/sockets/sigillum/sigillumd.sock`. Who the client is comes from
 //! the peer uid, never from a message.
 
+#[allow(unused_imports)]
+use alloc::{boxed::Box, string::String, vec::Vec};
 use serde::{Deserialize, Serialize};
 
 pub const MAX_MESSAGE: usize = 16 * 1024;

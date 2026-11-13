@@ -3,12 +3,15 @@
 //! device-derived field is capped; `sigillumd` decodes, then calls
 //! [`FromDriver::check_caps`] before looking at anything.
 
+#[allow(unused_imports)]
+use alloc::{boxed::Box, string::String, vec::Vec};
 use serde::{Deserialize, Serialize};
 use zeroize::Zeroizing;
 
 use crate::client::CeremonyId;
 
-pub const MAX_MESSAGE: usize = 8 * 1024;
+/// 64 KiB: a token's certificates (S5) come in one record.
+pub const MAX_MESSAGE: usize = 64 * 1024;
 /// Where drivers connect to `sigillumd`; only `_sigillum-dev` is served.
 pub const SOCKET: &str = "/atrium/sockets/sigillum-dev/drivers.sock";
 
@@ -21,6 +24,13 @@ pub mod cap {
     pub const SIGNATURE: usize = 512;
     pub const USER_HANDLE: usize = 64;
     pub const LIST: usize = 64;
+    /// A token certificate (DER), its key id and label, and how many one record carries.
+    pub const CERT: usize = 4096;
+    pub const KEY_ID: usize = 64;
+    pub const LABEL: usize = 64;
+    pub const CERTS: usize = 8;
+    /// A digest to sign: SHA-512 at most.
+    pub const DIGEST: usize = 64;
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -44,10 +54,58 @@ pub struct FidoCaps {
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Pin(pub Zeroizing<Vec<u8>>);
 
-impl std::fmt::Debug for Pin {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl core::fmt::Debug for Pin {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         f.write_str("Pin(..)")
     }
+}
+
+/// The digest's algorithm, for an RSA signature's `DigestInfo` or PSS parameters.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum HashAlg {
+    Sha256,
+    Sha384,
+    Sha512,
+}
+
+impl HashAlg {
+    pub fn len(self) -> usize {
+        match self {
+            HashAlg::Sha256 => 32,
+            HashAlg::Sha384 => 48,
+            HashAlg::Sha512 => 64,
+        }
+    }
+}
+
+/// How a token signs a digest Sigillum computed (sigillum.md §16.5): the only mechanisms
+/// a token driver may use.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum SignScheme {
+    /// RSASSA-PKCS1-v1_5 (`CKM_RSA_PKCS` over the `DigestInfo`).
+    RsaPkcs1(HashAlg),
+    /// RSASSA-PSS, salt as long as the digest (`CKM_RSA_PKCS_PSS`).
+    RsaPss(HashAlg),
+    /// ECDSA over the digest (`CKM_ECDSA`); the signature is `r || s`.
+    Ecdsa(HashAlg),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum KeyKind {
+    Rsa { bits: u16 },
+    Ec { bits: u16 },
+    Other,
+}
+
+/// One certificate on a token, with the private key that goes with it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TokenCert {
+    /// `CKA_ID`, shared by the certificate and its key.
+    pub key_id: Vec<u8>,
+    pub label: String,
+    /// The certificate, DER. sigillumd parses it, never the driver's word about it.
+    pub cert: Vec<u8>,
+    pub key: KeyKind,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -76,6 +134,32 @@ pub enum ToDriver {
     Cancel {
         ceremony: CeremonyId,
     },
+    /// Token drivers (S5): the certificates and the keys that sign with them. No PIN: the
+    /// public objects are read without logging in.
+    ListCertificates {
+        ceremony: CeremonyId,
+    },
+    /// Token drivers (S5): sign `digest` with the key `key_id` names. `pin` is required by
+    /// most tokens; without it the driver answers `NeedPin`.
+    SignDigest {
+        ceremony: CeremonyId,
+        key_id: Vec<u8>,
+        scheme: SignScheme,
+        digest: Vec<u8>,
+        pin: Option<Pin>,
+    },
+}
+
+impl ToDriver {
+    pub fn ceremony(&self) -> CeremonyId {
+        match self {
+            ToDriver::Register { ceremony, .. }
+            | ToDriver::Assert { ceremony, .. }
+            | ToDriver::Cancel { ceremony }
+            | ToDriver::ListCertificates { ceremony }
+            | ToDriver::SignDigest { ceremony, .. } => *ceremony,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -91,7 +175,14 @@ pub enum DriverError {
     /// The device broke protocol or answered something we refused.
     Device,
     Gone,
+    /// The request is not one this driver serves (a FIDO key asked for certificates).
+    Unsupported,
+    /// The token has no key with that id, or it can't use the scheme asked for.
+    NoKey,
 }
+
+/// `PinInvalid::retries` when the token doesn't say how many tries are left.
+pub const RETRIES_UNKNOWN: u8 = u8::MAX;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum FromDriver {
@@ -137,6 +228,17 @@ pub enum FromDriver {
         ceremony: CeremonyId,
         error: DriverError,
     },
+    /// Token drivers (S5): the answer to `ListCertificates`.
+    Certificates {
+        ceremony: CeremonyId,
+        token_label: String,
+        certs: Vec<TokenCert>,
+    },
+    /// Token drivers (S5): the answer to `SignDigest`.
+    Signed {
+        ceremony: CeremonyId,
+        signature: Vec<u8>,
+    },
 }
 
 impl FromDriver {
@@ -163,6 +265,27 @@ impl FromDriver {
                 within(signature, cap::SIGNATURE, "signature")?;
                 within(user_handle.as_deref().unwrap_or(&[]), cap::USER_HANDLE, "user handle")
             }
+            FromDriver::Certificates { token_label, certs, .. } => {
+                within(token_label.as_bytes(), cap::LABEL, "token label")?;
+                if certs.len() > cap::CERTS {
+                    return Err("too many certificates");
+                }
+                for c in certs {
+                    if c.key_id.is_empty() || c.cert.is_empty() {
+                        return Err("empty key id or certificate");
+                    }
+                    within(&c.key_id, cap::KEY_ID, "key id")?;
+                    within(c.label.as_bytes(), cap::LABEL, "label")?;
+                    within(&c.cert, cap::CERT, "certificate")?;
+                }
+                Ok(())
+            }
+            FromDriver::Signed { signature, .. } => {
+                if signature.is_empty() {
+                    return Err("empty signature");
+                }
+                within(signature, cap::SIGNATURE, "signature")
+            }
             _ => Ok(()),
         }
     }
@@ -174,7 +297,9 @@ impl FromDriver {
             | FromDriver::Asserted { ceremony, .. }
             | FromDriver::NeedPin { ceremony, .. }
             | FromDriver::NeedTouch { ceremony }
-            | FromDriver::Error { ceremony, .. } => Some(*ceremony),
+            | FromDriver::Error { ceremony, .. }
+            | FromDriver::Certificates { ceremony, .. }
+            | FromDriver::Signed { ceremony, .. } => Some(*ceremony),
         }
     }
 }

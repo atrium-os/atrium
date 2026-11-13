@@ -4,6 +4,8 @@
 //! frescod (purpose `IDENTITY`) itself and reports whether frescod accepted
 //! it, as arca-ui does for its fill chip.
 
+#[allow(unused_imports)]
+use alloc::{boxed::Box, string::String, vec::Vec};
 use serde::{Deserialize, Serialize};
 
 use crate::client::Purpose;

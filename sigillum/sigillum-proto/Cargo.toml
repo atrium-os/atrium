@@ -5,7 +5,13 @@ description = "Sigillum's two wires (sigillum.md §14): clients <-> sigillumd an
 edition.workspace = true
 license.workspace = true
 
+[features]
+default = ["std"]
+# The read_msg/write_msg helpers over std::io. Without it the records and the codec are
+# no_std + alloc, for the sigillum-p11 Hospes host (sigillum.md §16.5).
+std = ["postcard/use-std", "serde/std", "zeroize/std"]
+
 [dependencies]
-serde = { workspace = true }
-postcard = { workspace = true }
-zeroize = { workspace = true, features = ["serde"] }
+serde = { version = "1", default-features = false, features = ["derive", "alloc"] }
+postcard = { version = "1", default-features = false, features = ["alloc"] }
+zeroize = { version = "1", default-features = false, features = ["serde", "alloc"] }

@@ -34,4 +34,3 @@ cbc      = "0.1"
 getrandom = { version = "0.2", features = ["std"] }
 zeroize  = "1"
 serde    = { version = "1", features = ["derive"] }
-postcard = { version = "1", features = ["use-std"] }

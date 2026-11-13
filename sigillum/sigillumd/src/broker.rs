@@ -591,6 +591,12 @@ impl Broker {
                     a
                 }
             },
+            // Token records (S5) belong to token ceremonies, which this broker doesn't run yet.
+            FromDriver::Certificates { .. } | FromDriver::Signed { .. } => {
+                let mut a = self.end(key, Reply::Refused { ceremony: id, reason: Refusal::NotAllowed }, "token record in a FIDO ceremony");
+                a.push(Action::Audit(format!("device {device} sent a token record in a FIDO ceremony")));
+                a
+            }
             FromDriver::Hello { .. } => unreachable!(),
         }
     }

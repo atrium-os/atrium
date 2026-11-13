@@ -1,6 +1,7 @@
 //! RP ID syntax, shared by sigillumd and the WebAuthn client. The *origin*
 //! check (is this RP ID allowed for the page's origin) is the web broker's
 //! (`sigillum-webauthn`, sigillum.md §9.1). Here: is it a well-formed domain.
+use alloc::vec::Vec;
 
 /// A lowercase DNS name: 1–253 bytes, labels of 1–63 `[a-z0-9-]` not
 /// starting or ending with `-`, and not an IP address (WebAuthn RP IDs are

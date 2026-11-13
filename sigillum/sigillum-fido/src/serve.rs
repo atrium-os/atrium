@@ -52,9 +52,7 @@ pub fn serve<D: HidDevice>(mut driver: Driver<D>, hello: FromDriver, sock: UnixS
     });
 
     for req in rx {
-        let ceremony = match &req {
-            ToDriver::Register { ceremony, .. } | ToDriver::Assert { ceremony, .. } | ToDriver::Cancel { ceremony } => *ceremony,
-        };
+        let ceremony = req.ceremony();
         current.set(ceremony);
         let Some(rec) = driver.handle(req) else { continue };
         let gone = matches!(rec, FromDriver::Error { error: DriverError::Gone, .. });
