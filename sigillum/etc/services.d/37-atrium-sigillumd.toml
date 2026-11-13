@@ -23,7 +23,9 @@
 #   1. The _sigillum (65028), _sigillum-dev (65029), _sigillum-ui (65030)
 #      system users, in jaild.policy's allowed_system_uids.
 #   2. The socket directories above, owned _sigillum.
-#   3. The rootfs mountpoint dirs: <path>/{dev,libexec,lib,usr/lib,usr/local/bin,atrium/sockets,var/run/atrium}.
+#   3. The rootfs mountpoint dirs: <path>/{dev,libexec,lib,usr/lib,usr/local/bin,atrium/sockets,var/run/atrium,var/db/sigillum}.
+#   4. /var/db/sigillum/keys, owned _sigillum 0700: users' enrolled login
+#      keys (public keys and sign counts, sigillum.md §16.6).
 
 enabled       = true
 name          = "atrium-sigillumd"
@@ -56,6 +58,11 @@ source = "/var/run/atrium/app-registry"           # ro: who each app uid is (one
 dest   = "var/run/atrium/app-registry"
 kind   = "ro_nullfs"
 
+[[mounts]]
+source = "/var/db/sigillum"                       # rw: users' enrolled login keys
+dest   = "var/db/sigillum"
+kind   = "rw_nullfs"
+
 [exec]
 path = "/usr/local/bin/atrium-sigillumd"
 argv = ["atrium-sigillumd"]
@@ -65,3 +72,11 @@ gid  = 65028
 [[exec.env]]
 key   = "SIGILLUM_ARCA_UID"
 value = "65020"                                   # _arca: may ask VerifyUser
+
+[[exec.env]]
+key   = "SIGILLUM_OSTIARIUS_UID"
+value = "50093"                                   # _ostiarius: VerifyUser (unlock) and EnrolKey
+
+[[exec.env]]
+key   = "SIGILLUM_KEY_DIR"
+value = "/var/db/sigillum/keys"

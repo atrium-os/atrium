@@ -114,6 +114,10 @@ rw_paths = [
     # choragusd's users' volumes (<user>.toml; _choragus 0700).
     "/var/db/choragus",
 
+    # sigillumd's users' enrolled login keys (<user>.json; _sigillum 0700,
+    # public keys and sign counts only: sigillum.md §16.6).
+    "/var/db/sigillum",
+
     # Atrium shared state — session records, jaild persistent
     # state, etc.
     "/var/run/atrium",
@@ -324,6 +328,8 @@ allowed_keys = [
     "SIGILLUM_ARCA_UID",
     "SIGILLUM_OSTIARIUS_UID",
     "SIGILLUM_WEB_BROKER",
+    # sigillumd: where users' enrolled login keys are kept (§16.6).
+    "SIGILLUM_KEY_DIR",
     # arcad: the system services the machine store serves, `name=uid,...`
     # (arca.md §6.4; vinculumd's Bluetooth bonds).
     "ARCA_SERVICES",

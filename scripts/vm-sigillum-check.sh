@@ -101,6 +101,8 @@ scp -q $K -P 2222 "$ROOT/tactus/etc/devices.d/30-tactus.toml" root@localhost:/ro
 scp -q $K -P 2222 "$ROOT/dispensator/target/$TRIPLE/release/atrium-dispensatord" root@localhost:/root/s/atrium-dispensatord
 scp -q $K -P 2222 "$ROOT/dispensator/etc/atrium-dispensatord" root@localhost:/root/s/atrium-dispensatord.rc
 [ -n "$TD" ] && scp -q $K -P 2222 "$TD" root@localhost:/root/s/tactusd
+# A real key's runs, typed at the VM's terminal (PIN): register/assert, enrol/unlock.
+[ -n "$REAL" ] && scp -q $K -P 2222 "$ROOT/scripts/sigillum-real-key-ceremony.sh" "$ROOT/scripts/sigillum-real-key-unlock.sh" root@localhost:/root/s/
 # S4: arcad, its probe, ostiarius, their manifests, the PAM service.
 V 'mkdir -p /root/s/arca /root/s/ostiarius'
 scp -q $K -P 2222 "$AB/arcad" "$AB/arca-probe" "$ROOT/arca/arcad/etc/services.d/42-atrium-arcad.toml" root@localhost:/root/s/arca/

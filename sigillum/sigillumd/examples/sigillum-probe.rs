@@ -9,7 +9,14 @@
 //! sigillum-probe assert RP FILE [SOCKET]     # sign in with FILE's credential; verifies the signature
 //! sigillum-probe webauthn ORIGIN RP [SOCKET] # navigator.credentials.create() then .get() through
 //!                                            # sigillum-webauthn, checked as a relying party would
+//! sigillum-probe enrol USER NAME [SOCKET]    # as ostiarius: enrol a login key for USER (§16.6)
+//! sigillum-probe verify USER [MIN] [SOCKET]  # as ostiarius: VERIFY_USER to unlock; MIN is
+//!                                            # key-uv (default) or passcode
 //! ```
+//!
+//! `ui-tty` answers a passcode sheet with the next of SPROBE_PASSCODES
+//! (a test account's password, comma separated), else from the terminal
+//! with echo off.
 //!
 //! `ui` must run as `_sigillum-ui`; the client as a uid the launch
 //! registry names as the web broker app. Prints one line per result.
@@ -21,7 +28,7 @@ use std::time::Duration;
 use p256::ecdsa::{signature::Verifier, DerSignature, VerifyingKey};
 use sha2::{Digest, Sha256};
 use sigillum_ctap::authdata::AuthData;
-use sigillum_proto::client::{self, Assert, Attestation, Register, Reply, Request, Uv};
+use sigillum_proto::client::{self, Assert, Attestation, EnrolKey, Purpose, Register, Reply, Request, Strength, Uv, VerifyUser};
 use sigillum_proto::driver::Pin;
 use sigillum_proto::ui::{self, Choice, FromUi, ToUi};
 use sigillum_proto::{read_msg, write_msg};
@@ -133,6 +140,8 @@ fn read_pin_tty(prompt: &str) -> Option<Pin> {
 /// tries are left. It never asks when 3 or fewer are left. Exits after
 /// `ceremonies` sheets close.
 fn ui_tty(sock: &str, ceremonies: usize) -> ExitCode {
+    let mut passcodes: std::collections::VecDeque<String> =
+        std::env::var("SPROBE_PASSCODES").unwrap_or_default().split(',').filter(|p| !p.is_empty()).map(String::from).collect();
     let mut s = UnixStream::connect(sock).expect("ui socket");
     let mut w = s.try_clone().unwrap();
     let mut closed = 0;
@@ -168,6 +177,23 @@ fn ui_tty(sock: &str, ceremonies: usize) -> ExitCode {
                     }
                 }
             }
+            ToUi::AskPasscode { key, wrong } => {
+                if *wrong {
+                    eprintln!("ui-tty: wrong passcode");
+                }
+                let p = match passcodes.pop_front() {
+                    Some(p) => {
+                        eprintln!("ui-tty: passcode asked; typing the test account's");
+                        Some(Pin(p.into_bytes().into()))
+                    }
+                    None => read_pin_tty("Login passcode (empty line cancels): "),
+                };
+                let msg = match p {
+                    Some(passcode) => FromUi::Passcode { key: *key, passcode },
+                    None => FromUi::Press { key: *key, choice: Choice::Cancel, activation_ok: true },
+                };
+                let _ = write_msg(&mut w, &msg, ui::MAX_MESSAGE);
+            }
             ToUi::Touch { .. } => eprintln!("ui-tty: >>> TOUCH THE KEY NOW (it is blinking) <<<"),
             ToUi::Close { .. } => {
                 closed += 1;
@@ -176,7 +202,6 @@ fn ui_tty(sock: &str, ceremonies: usize) -> ExitCode {
                     return ExitCode::SUCCESS;
                 }
             }
-            _ => {}
         }
     }
     eprintln!("ui-tty: closed by sigillumd");
@@ -328,6 +353,31 @@ fn main() -> ExitCode {
             }
         }
         Some("webauthn") if a.len() >= 3 => webauthn(&a[1], &a[2], &sock(3, client::SOCKET)),
+        Some("enrol") if a.len() >= 3 => {
+            let r = ask(&sock(3, client::SOCKET), &Request::EnrolKey(EnrolKey { ceremony: 3, user: a[1].clone(), name: a[2].clone() }));
+            println!("enrol: {r:?}");
+            if matches!(r, Reply::KeyEnrolled { .. }) {
+                ExitCode::SUCCESS
+            } else {
+                ExitCode::FAILURE
+            }
+        }
+        Some("verify") if a.len() >= 2 => {
+            let min_strength = match a.get(2).map(String::as_str) {
+                Some("passcode") => Strength::Passcode,
+                _ => Strength::KeyUv,
+            };
+            let r = ask(
+                &sock(3, client::SOCKET),
+                &Request::VerifyUser(VerifyUser { ceremony: 4, user: a[1].clone(), purpose: Purpose::Unlock, min_strength }),
+            );
+            println!("verify: {r:?}");
+            if matches!(r, Reply::Verified { .. }) {
+                ExitCode::SUCCESS
+            } else {
+                ExitCode::FAILURE
+            }
+        }
         _ => {
             eprintln!("usage: sigillum-probe ui [SOCKET] | register RP FILE [SOCKET] | assert RP FILE [SOCKET]");
             ExitCode::from(2)

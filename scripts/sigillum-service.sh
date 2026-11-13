@@ -45,6 +45,8 @@ install -o root -g wheel -m 0644 "$HERE/sigillum/etc/devices.d/40-sigillum.toml"
 
 R=/var/lib/atrium/jails/sigillumd
 # (Skips dirs that exist: a running jail has its mounts over them.)
-for d in dev libexec lib usr/lib usr/local/bin atrium/sockets var/run/atrium; do [ -d "$R/$d" ] || install -d "$R/$d"; done
+# Users' enrolled login keys (sigillum.md §16.6): only _sigillum reads or writes them.
+install -d -o _sigillum -g _sigillum -m 0700 /var/db/sigillum /var/db/sigillum/keys
+for d in dev libexec lib usr/lib usr/local/bin atrium/sockets var/run/atrium var/db/sigillum; do [ -d "$R/$d" ] || install -d "$R/$d"; done
 [ -e "$R/var/run/atrium/app-registry" ] || touch "$R/var/run/atrium/app-registry"
 echo "sigillum-service: commissioned. Restart atrium-portcullisd-bootstrap (or run it) to start atrium-sigillumd."
