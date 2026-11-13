@@ -1,0 +1,205 @@
+From 5021d556dd0bcfce4a660755a149b8515cfb9983 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Fri, 13 Nov 2026 02:58:51 +0000
+Subject: [PATCH] kpi: RamPages, RAM pages a managed device pager may map
+
+A pager handle now answers with a Backing: a fictitious device page by
+address, as before, or a page of a RamPages allocation it holds. RamPages
+are wired, zeroed, contiguous pages from vm_page_alloc_noobj_contig made
+managed, so the pmap tracks their mappings and free_pages takes them back.
+They free only once in no object and unmapped; else they leak.
+---
+ bindings.h       |  42 ++++++++++++++++++
+ kpi/src/pager.rs | 109 ++++++++++++++++++++++++++++++++++++++++-------
+ 2 files changed, 135 insertions(+), 16 deletions(-)
+
+diff --git a/bindings.h b/bindings.h
+index eea50ad..166de37 100644
+--- a/bindings.h
++++ b/bindings.h
+@@ -311,3 +311,45 @@ rust_bindings_vm_page_xunbusy(vm_page_t m) {
+     vm_page_xunbusy(m);
+ }
+ 
++/*
++ * RAM pages for managed device pagers (kpi/src/pager.rs RamPages): wired, zeroed, physically
++ * contiguous pages that no object owns, made managed so the pmap tracks every mapping of them
++ * and cdev_mgtdev_pager_free_pages can take each one back (pmap_remove_all). The kernel reaches
++ * them through the direct map.
++ */
++vm_page_t
++rust_bindings_ram_pages_alloc(u_long npages) {
++    vm_page_t m;
++    u_long i;
++
++    m = vm_page_alloc_noobj_contig(VM_ALLOC_WIRED | VM_ALLOC_ZERO | VM_ALLOC_WAITOK,
++        npages, 0, ~(vm_paddr_t)0, PAGE_SIZE, 0, VM_MEMATTR_DEFAULT);
++    if (m == NULL)
++        return (NULL);
++    for (i = 0; i < npages; i++)
++        m[i].oflags &= ~VPO_UNMANAGED;
++    return (m);
++}
++
++/* Free them, unless one is still in an object or mapped (then they leak: false). */
++bool
++rust_bindings_ram_pages_free(vm_page_t m, u_long npages) {
++    u_long i;
++
++    for (i = 0; i < npages; i++)
++        if (m[i].object != NULL || pmap_page_is_mapped(&m[i]))
++            return (false);
++    for (i = 0; i < npages; i++) {
++        m[i].oflags = VPO_UNMANAGED;
++        /* A wiring someone else left (mlock of a mapping) keeps the page: leaked, not freed. */
++        if (vm_page_unwire_noq(&m[i]))
++            vm_page_free(&m[i]);
++    }
++    return (true);
++}
++
++void *
++rust_bindings_phys_to_dmap(vm_paddr_t pa) {
++    return ((void *)PHYS_TO_DMAP(pa));
++}
++
+diff --git a/kpi/src/pager.rs b/kpi/src/pager.rs
+index 6b181fd..3da171d 100644
+--- a/kpi/src/pager.rs
++++ b/kpi/src/pager.rs
+@@ -30,10 +30,11 @@
+ //! driver says so (`cdev_mgtdev_pager_free_pages`).
+ //!
+ //! A pager's handle is a `Box<T>` owned by the object: it is freed by the pager's destructor
+-//! when the last reference to the object goes. The handle only chooses *which* physical
+-//! address backs a fault; the fault path here refuses anything that is not a registered
+-//! fictitious page (device memory) or that is already in another object, so a wrong answer
+-//! from a handle cannot map ordinary RAM or steal a page from another mapping.
++//! when the last reference to the object goes. The handle only chooses *which* page backs a
++//! fault: a registered fictitious page (device memory, by physical address), or a page of a
++//! [`RamPages`] allocation the handle holds. The fault path refuses anything else, and any page
++//! that is already in another object, so a wrong answer from a handle cannot map ordinary RAM
++//! or steal a page from another mapping.
+ 
+ use crate::bindings::{self, ucred, vm_object, vm_object_t, vm_ooffset_t, vm_page_t};
+ use crate::boxed::Box;
+@@ -43,12 +44,80 @@ use core::marker::PhantomData;
+ use core::mem::MaybeUninit;
+ use core::ptr::NonNull;
+ 
++/// The page a fault maps.
++pub enum Backing<'a> {
++    /// The fictitious (device) page at this physical address.
++    Device(u64),
++    /// Page `n` of a RAM allocation (the handle's own, so it lives as long as the object).
++    Ram(&'a RamPages, usize),
++}
++
+ /// What a managed device pager's handle decides.
+ pub trait MgtDevHandle: Send + Sync + Sized + 'static {
+-    /// The physical address of the fictitious page to map at `offset` (page aligned within
+-    /// the object), or `None` to fail the fault, which the faulting thread sees as SIGBUS.
+-    /// Called with the object write-locked, so state that [`VmObject::lock`] guards is stable.
+-    fn fault(&self, offset: u64, prot: c_int) -> Option<u64>;
++    /// The page to map at `offset` (page aligned within the object), or `None` to fail the
++    /// fault, which the faulting thread sees as SIGBUS. Called with the object write-locked,
++    /// so state that [`VmObject::lock`] guards is stable.
++    fn fault(&self, offset: u64, prot: c_int) -> Option<Backing<'_>>;
++}
++
++/// Wired, zeroed, physically contiguous RAM pages that a managed device pager may map (a
++/// queue's ring, say): the kernel reaches them through the direct map, user space through
++/// the object, and [`VmObject::free_pages`] takes them back out of every mapping. They are
++/// managed pages that no object owns, so the pmap tracks each mapping of them.
++///
++/// Dropping frees them only once they are in no object and no mapping (a pager's
++/// `free_pages` has run, or they were never mapped); otherwise they leak, never freed under
++/// a mapping.
++pub struct RamPages {
++    first: NonNull<bindings::vm_page>,
++    n: usize,
++}
++
++// SAFETY: the pages are wired and owned by this value; the VM locks what it shares of them.
++unsafe impl Send for RamPages {}
++unsafe impl Sync for RamPages {}
++
++impl RamPages {
++    /// `n` pages (sleeps for memory).
++    pub fn alloc(n: usize) -> Result<Self> {
++        if n == 0 {
++            return Err(EINVAL);
++        }
++        // SAFETY: a fresh allocation, ours alone.
++        let m = unsafe { bindings::rust_bindings_ram_pages_alloc(n as _) };
++        NonNull::new(m).map(|first| RamPages { first, n }).ok_or(ENOMEM)
++    }
++
++    pub fn len(&self) -> usize {
++        self.n
++    }
++
++    /// The physical address of the first page (the rest follow it).
++    pub fn pa(&self) -> u64 {
++        // SAFETY: our page; phys_addr never changes.
++        unsafe { self.first.as_ref().phys_addr as u64 }
++    }
++
++    /// The kernel address of the first page (direct map; the rest follow it).
++    pub fn kva(&self) -> *mut u8 {
++        // SAFETY: RAM, so in the direct map.
++        unsafe { bindings::rust_bindings_phys_to_dmap(self.pa() as _).cast() }
++    }
++
++    fn page(&self, i: usize) -> Option<vm_page_t> {
++        // SAFETY: within the contiguous run of vm_page structures the allocation returned.
++        (i < self.n).then(|| unsafe { self.first.as_ptr().add(i) })
++    }
++}
++
++impl Drop for RamPages {
++    fn drop(&mut self) {
++        // SAFETY: our pages; the helper refuses (and we leak) while any is in an object or
++        // mapped.
++        if !unsafe { bindings::rust_bindings_ram_pages_free(self.first.as_ptr(), self.n as _) } {
++            crate::println!("kpi: RamPages still mapped at drop; {} page(s) leaked", self.n);
++        }
++    }
+ }
+ 
+ /// A pager ops table. Made by [`mgtdev_pager!`] only.
+@@ -126,15 +195,23 @@ unsafe extern "C" fn fault_trampoline<T: MgtDevHandle>(
+     unsafe {
+         bindings::rust_bindings_vm_object_assert_wlocked(obj);
+         let h = &*(*obj).handle.cast::<T>();
+-        let Some(pa) = h.fault(offset as u64, prot) else {
+-            return ERR;
++        let page = match h.fault(offset as u64, prot) {
++            None => return ERR,
++            Some(Backing::Device(pa)) => {
++                let page = bindings::PHYS_TO_VM_PAGE(pa as _);
++                // Device memory only: refuse rather than map RAM by address.
++                if page.is_null() || ((*page).flags as c_int & bindings::PG_FICTITIOUS as c_int) == 0 {
++                    return ERR;
++                }
++                page
++            }
++            Some(Backing::Ram(ram, i)) => match ram.page(i) {
++                Some(page) => page,
++                None => return ERR,
++            },
+         };
+-        let page = bindings::PHYS_TO_VM_PAGE(pa as _);
+-        // Device memory only, and only a page no other object holds: refuse rather than steal.
+-        if page.is_null()
+-            || ((*page).flags as c_int & bindings::PG_FICTITIOUS as c_int) == 0
+-            || !(*page).object.is_null()
+-        {
++        // Only a page no other object holds: refuse rather than steal.
++        if !(*page).object.is_null() {
+             return ERR;
+         }
+         let pidx = (offset as u64) >> bindings::PAGE_SHIFT;
+-- 
+2.43.0
+

@@ -85,9 +85,11 @@ pub fn open_at(mut s: UnixStream) -> io::Result<Fetcher> {
     }
     let (mine, theirs) = UnixStream::pair()?;
     // The channel is the fetcher's stdin and stdout; its stderr goes nowhere
-    // the app reads.
+    // the app reads, unless the app is being debugged (NUNTIUS_FETCHER_STDERR=inherit:
+    // the fetcher's diagnostics on the app's own stderr).
     let null = std::fs::OpenOptions::new().write(true).open("/dev/null")?;
-    send_fds(&s, &[theirs.as_raw_fd(), theirs.as_raw_fd(), null.as_raw_fd()])?;
+    let err = if std::env::var_os("NUNTIUS_FETCHER_STDERR").is_some_and(|v| v == "inherit") { 2 } else { null.as_raw_fd() };
+    send_fds(&s, &[theirs.as_raw_fd(), theirs.as_raw_fd(), err])?;
     drop(theirs);
     s.set_read_timeout(None)?;
     let exited = Arc::new(End::default());

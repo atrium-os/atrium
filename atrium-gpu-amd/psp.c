@@ -149,10 +149,35 @@ psp_wait(struct atrium_amd_softc *sc, uint32_t dw, uint32_t mask,
 }
 
 /*
+ * After an ASIC reset: wait for the PSP bootloader to be ready again and
+ * report whether a sOS is running (it should not be). 0 or ETIMEDOUT.
+ */
+int
+amd_psp_wait_bootloader(struct atrium_amd_softc *sc, uint32_t *sos)
+{
+	int err;
+
+	if (!sc->ip.mp0.present || sc->ip.mp0.major != 14)
+		return (ENOTSUP);
+	err = psp_wait(sc, PSP14_C2PMSG_35, PSP_BL_READY, PSP_BL_READY, 0, 0);
+	if (sos != NULL)
+		*sos = amd_mmio_read32(sc, psp_reg(sc, PSP14_C2PMSG_81));
+	return (err);
+}
+
+/*
  * Make CPU writes through the BAR visible to the GPU's own agents (the PSP
  * reads VRAM directly, behind HDP): HDP_MEM_COHERENCY_FLUSH_CNTL, then a read
  * as amdgpu does. NBIF segment 2 from discovery.
  */
+static void psp_hdp_flush(struct atrium_amd_softc *sc);
+
+void
+amd_hdp_flush(struct atrium_amd_softc *sc)
+{
+	psp_hdp_flush(sc);
+}
+
 static void
 psp_hdp_flush(struct atrium_amd_softc *sc)
 {
@@ -346,6 +371,11 @@ psp_fw_reservation(struct atrium_amd_softc *sc, struct resource *vram,
 
 	memsize = (uint64_t)amd_mmio_read32(sc,
 	    ((bus_size_t)sc->ip.nbif.base[2] + NBIF6_RCC_CONFIG_MEMSIZE) * 4) << 20;
+	CTASSERT(nitems(q) <= nitems(sc->psp_resv_off));
+	for (i = 0; i < nitems(q); i++) {
+		sc->psp_resv_off[i] = 0;
+		sc->psp_resv_size[i] = 0;
+	}
 	for (i = 0; i < nitems(q); i++) {
 		if (psp_cmd(sc, vram, fb_base, q[i].id, NULL, 0, ++*fence,
 		    &status) != 0)
@@ -358,6 +388,10 @@ psp_fw_reservation(struct atrium_amd_softc *sc, struct resource *vram,
 		addr = (uint64_t)psp_resp(vram, GFX_RESP_OFF_URESP) << 32 |
 		    psp_resp(vram, GFX_RESP_OFF_URESP + 4);
 		size = psp_resp(vram, GFX_RESP_OFF_URESP + 8);
+		if (status == 0 && size != 0) {
+			sc->psp_resv_off[i] = addr;
+			sc->psp_resv_size[i] = size;
+		}
 		device_printf(sc->dev, "psp: %s: status %#x, VRAM %#jx + %#x "
 		    "(%u MiB)%s\n", q[i].name, status, (uintmax_t)addr, size,
 		    size >> 20, size != 0 && addr + size != memsize ?
@@ -632,6 +666,23 @@ amd_psp_bootload(struct atrium_amd_softc *sc)
 			err = psp_load_toc(sc, vram, fb_base, fw, ++fence);
 			/* Stage 3c test hook: kenv hw.atrium_gpu.psp_ipfw=1. */
 			TUNABLE_INT_FETCH("hw.atrium_gpu.psp_ipfw", &ipfw);
+			/*
+			 * Loading the IP firmware boots the RLC with GC up,
+			 * which the driver cannot idle yet (power P2): needs
+			 * hw.atrium_gpu.gc_up_ok=1 too (smu.c).
+			 */
+			if (ipfw) {
+				int gc_up_ok = 0;
+
+				TUNABLE_INT_FETCH("hw.atrium_gpu.gc_up_ok",
+				    &gc_up_ok);
+				if (!gc_up_ok) {
+					device_printf(sc->dev, "psp: IP firmware "
+					    "load needs hw.atrium_gpu.gc_up_ok=1 "
+					    "(GC cannot be idled yet); skipped\n");
+					ipfw = 0;
+				}
+			}
 			if (err == 0 && ipfw)
 				err = psp_load_ip_fw(sc, vram, fb_base, &fence);
 			/* We do not stay attached: leave no ring behind. */

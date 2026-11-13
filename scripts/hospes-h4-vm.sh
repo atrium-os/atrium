@@ -4,6 +4,8 @@
 # Google's signed Chrome package and the licence POSTed through Nuntius to Shaka's proxy.
 #
 #   ARCH=amd64 sh scripts/hospes-h4-vm.sh        # (ARCH=aarch64 works the same way)
+#   JAILED=1 ARCH=aarch64 sh scripts/hospes-h4-vm.sh   # as the system runs it: the player
+#       as a jailed app, the CDM from OpenCdm, the licence through OpenFetcher (h4-jail-run.sh)
 #
 # The container has no direct route out, so the guest's network gets a fixture address,
 # 1.2.3.100, as scripts/nuntius-vm-check.sh does: its port 443 is a host-side relay holding a
@@ -124,14 +126,21 @@ fi
 # ---- cross-build ------------------------------------------------------------------
 say "cross-build ($T)"
 X="-C link-arg=--sysroot=$S -C link-arg=-L$S/lib -C link-arg=-L$S/usr/lib -C link-arg=--dynamic-linker=/libexec/ld-elf.so.1 -C link-arg=$S/usr/lib/Scrt1.o -C link-arg=$S/usr/lib/crti.o -C link-arg=$S/usr/lib/crtbeginS.o -C link-arg=-lc -C link-arg=$S/usr/lib/crtendS.o -C link-arg=$S/usr/lib/crtn.o"
-sh "$ROOT/scripts/hospes-build.sh" cdm "$T" >/dev/null
-(cd "$ROOT/hospes" && RUSTFLAGS="$X" cargo build --release -p hospes-install --target "$T" >&2)
+sh "$ROOT/scripts/hospes-build.sh" cdm "$T" >/dev/null || die "hospes-cdm cross-build"
+(cd "$ROOT/hospes" && RUSTFLAGS="$X" cargo build --release -p hospes-install --target "$T" >&2) || die "hospes-install cross-build"
 (cd "$ROOT/atrium-player" && env PKG_CONFIG_ALLOW_CROSS=1 PKG_CONFIG_SYSROOT_DIR="$S" PKG_CONFIG_LIBDIR="$S/usr/local/libdata/pkgconfig" \
     "CC_$TU=clang --target=$T --sysroot=$S" "CFLAGS_$TU=-I$S/usr/local/include" RUSTFLAGS="$X -C link-arg=-L$S/usr/local/lib" \
-    cargo build --release --target "$T" -p atrium-player -p atrium-player-decode >&2)
+    cargo build --release --target "$T" -p atrium-player -p atrium-player-decode --bins --example atrium-player-bundle-launch >&2) || die "player cross-build (disk full?)"
 export "CC_$TU=clang" "AR_$TU=llvm-ar" "CFLAGS_$TU=--target=$T --sysroot=$S"
-(cd "$ROOT/navigator-fetch" && RUSTFLAGS="$X" cargo +nightly build --quiet --release --target "$T" -Z build-std=std,panic_abort --bin nuntiusd >&2)
-(cd "$ROOT/nuntius" && RUSTFLAGS="$X" cargo +nightly build --quiet --release --target "$T" -Z build-std=std,panic_abort --example fetcher-standin >&2)
+(cd "$ROOT/navigator-fetch" && RUSTFLAGS="$X" cargo +nightly build --quiet --release --target "$T" -Z build-std=std,panic_abort --bin nuntiusd >&2) || die "nuntiusd cross-build"
+(cd "$ROOT/nuntius" && RUSTFLAGS="$X" cargo +nightly build --quiet --release --target "$T" -Z build-std=std,panic_abort --example fetcher-standin >&2) || die "fetcher-standin cross-build"
+
+if [ "${JAILED:-0}" = 1 ]; then
+    # The Portcullis stack (portcullisd, jaild, opifex) as the system runs it.
+    (cd "$ROOT/portcullis" && TESSERA_CORE_LIB="$ROOT/atrium-tessera/core" RUSTFLAGS="$X" \
+        cargo build --quiet --release --target "$T") >&2 || die "portcullis cross-build"
+    TARGET=$T sh "$ROOT/scripts/deploy-portcullis.sh" 2>&1 | grep -v -e '^warning' -e '^ *|' -e '^ \+= ' | tail -2 >&2
+fi
 
 # ---- copy and run -------------------------------------------------------------------
 say "run in the guest"
@@ -145,12 +154,14 @@ done
 for f in "$B"/bin/*; do llvm-strip "$f" 2>/dev/null || true; done
 for f in $MEDIA; do cp "$VMDIR/shaka/$f" "$B/media/"; done
 cp "$VMDIR/chrome/InRelease" "$VMDIR/chrome/Packages" "$VMDIR/chrome/chrome.deb" "$B/chrome/"
+cp "$ROOT/atrium-player/target/$T/release/examples/atrium-player-bundle-launch" "$B/bin/"
+cp "$ROOT/hospes/vm/h4-jail-run.sh" "$ROOT/scripts/hospes-cdm-bundle.sh" "$ROOT/scripts/nuntius-bundle.sh" "$B/"
 cp "$FIX/ca.pem" "$ROOT/hospes/vm/h4-run.sh" "$ROOT/hospes/kmod/out/$KT-${KERNCONF:-ATRIUM-NODEBUG}/hospes_trap.ko" "$B/"
 tar czf - -C "$(dirname "$B")" h4vm | "$V" 'rm -rf /tmp/h4vm && tar xzf - -C /tmp'
 # A full host disk has cut a copy short without an error: check the largest file arrived whole.
 [ "$("$V" 'sha256 -q /tmp/h4vm/chrome/chrome.deb' | tr -d '\r')" = "$DEBSHA" ] || die "the Chrome package did not reach the guest whole (host disk full?)"
 rm -rf "$(dirname "$B")"
 rc=0
-"$V" "cd /tmp/h4vm && PUB=$PUB INSTALL_ONLY=${INSTALL_ONLY:-0} ${VIDEOS:+VIDEOS='$VIDEOS'} TRACE=${TRACE:-0} PLAY_TIMEOUT=${PLAY_TIMEOUT:-900} sh h4-run.sh" || rc=$?
+"$V" "cd /tmp/h4vm && PUB=$PUB INSTALL_ONLY=${INSTALL_ONLY:-0} ${VIDEOS:+VIDEOS='$VIDEOS'} TRACE=${TRACE:-0} PLAY_TIMEOUT=${PLAY_TIMEOUT:-900} sh $([ "${JAILED:-0}" = 1 ] && echo h4-jail-run.sh || echo h4-run.sh)" || rc=$?
 echo "relay: $(grep -c '^POST' "$FIX/relay.log") licence POSTs"; grep '^POST' "$FIX/relay.log" | head -5
 exit $rc

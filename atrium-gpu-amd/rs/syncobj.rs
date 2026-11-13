@@ -86,6 +86,12 @@ impl Drop for SyncObj {
 }
 
 impl SyncObj {
+    /// The device it belongs to (only its own device may owe it a completion: the close
+    /// scrubs that device's lists).
+    pub fn dev(&self) -> Dev {
+        self.dev
+    }
+
     /// The pointer C code knows this syncobj by.
     pub fn as_c(&self) -> *mut sys::atrium_amd_syncobj {
         core::ptr::from_ref(self).cast_mut().cast()

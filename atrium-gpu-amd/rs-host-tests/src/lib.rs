@@ -13,6 +13,10 @@ pub mod ipinfo;
 pub mod psp_plan;
 #[path = "../../rs/ip_fw.rs"]
 pub mod ip_fw;
+#[path = "../../rs/power.rs"]
+pub mod power;
+#[path = "../../rs/smu_metrics.rs"]
+pub mod smu_metrics;
 
 #[cfg(test)]
 extern crate std;

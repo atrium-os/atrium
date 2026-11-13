@@ -198,7 +198,7 @@ impl Queues {
 
     /// Which queues are busy under any of `vmids` (all VMs if None), and their generations.
     pub fn snapshot(&self, dev: Dev, vmids: Option<&[u16]>) -> BusyAt {
-        let mut at = BusyAt { mask: 0, gens: [0; NHWQ] };
+        let mut at = BusyAt { mask: 0, gens: [0; NHWQ], uq: 0 };
         for (i, q) in self.0.iter().enumerate() {
             let st = sx_slock(&q.st);
             at.gens[i] = st.generation;
@@ -286,7 +286,7 @@ pub unsafe extern "C" fn amd_hwq_submit(
     st.wptr = n_dwords;
     st.generation += 1;
     dev.q_started(q.qid, so, signal_value);
-    dev.q_doorbell(off, n_dwords);
+    dev.q_doorbell(off, n_dwords, !so.is_null());
     drop(st);
     dev.watchdog_arm();
     0

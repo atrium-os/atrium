@@ -532,6 +532,7 @@ struct atrium_gpu_queue_map {
     uint64_t out_doorbell_offset; /* mmap(queue_fd) offset: this queue's doorbell page */
     uint64_t out_doorbell_size;
     uint64_t out_wptr_offset;     /* write-pointer location (ring-relative) */
+    uint64_t out_fence_gpu_va;    /* 2.2: GPU VA of the queue's fence slot */
 };
 ```
 
@@ -542,6 +543,11 @@ struct atrium_gpu_queue_map {
 - **Revocable.** On `QUEUE_RESET`, device reset or `close(queue_fd)` the kernel removes the queue from the firmware, then invalidates the pager's pages (`cdev_pager_free_page`/`pmap_remove`). A later access faults, and the fault handler returns `SIGBUS`; a queue re-created after reset is mapped afresh.
 - **Hang detection without seeing submissions.** The kernel cannot count user-mode submissions, so the watchdog (§10) watches the queue's fence slot against its write pointer: a queue whose write pointer is ahead of its fence for longer than the watchdog period is hung. Its signal points are errored like a kernel-submitted queue's.
 - **Frees never trust userspace fences.** A user-mode queue's fence slot is writable by work the user built, so it cannot gate memory reuse. Freeing VA or backing storage reachable from a user-mode queue's VM waits for the firmware to preempt or remove the queue (§5.11).
+
+*2.2 changes:*
+
+- **Fence slot address.** `out_fence_gpu_va` (appended; a 2.1-sized struct still works and gets no address) is the GPU VA, in the queue's own VM, of the queue's fence slot: the address the client's end-of-work packets (AMD: `RELEASE_MEM`) write their fence value to. The slot sits in a kernel-allocated writeback page the client also maps: rptr report, write pointer, fence, and an *emitted* word in which the client publishes the last fence value it put on the ring. Without the address a client would have to hard-code the layout.
+- **Advisory and client-written.** The slot and the emitted word are for the client's own waits and for the kernel's hang watchdog (fence short of emitted, or the hardware read pointer short of the write pointer, neither moving for the watchdog period; the read pointer alone is not enough because it is a fetch pointer and runs ahead of execution). The kernel never frees, reuses or signals anything on them: the free rule stays firmware preemption or removal (§5.11), and kqueue completion for a user-mode queue comes from the queue's own end-of-pipe interrupt, never from reading the slot. A client can fake progress to dodge the watchdog; that only keeps its own queue alive, which the firmware still time-slices against everyone else.
 
 What stays in the kernel (principle 11): VM_BIND and memory validation, queue/MQD setup and its hand-off to the scheduler firmware, preemption, and hang/reset (§10). Userspace owns only its own ring contents and write pointer. Completion is unchanged: signal points on syncobjs, observed via kqueue on the syncobj fd (§5.6).
 

@@ -216,6 +216,89 @@ struct atrium_gpu_vm_bind2 {
 };
 #define ATRIUM_GPU_BIND_READONLY	0x1
 
+/*
+ * Queue fds (GPU ABI v2 §5.5, §5.7; stage 5c-2b). Layouts and numbers are
+ * v2's (include/atrium/gpu_abi_v2.h: atrium_gpu_queue_create, and
+ * atrium_gpu_submit, here named atrium_gpu_queue_submit because the v1
+ * SUBMIT above holds the name).
+ *
+ * QUEUE_CREATE is an ioctl on a VM fd: a queue that runs in that VM, as a
+ * new fd holding a reference on the VM. family_id 0 is compute (the only
+ * family on silicon so far); priority 0 only; flags 0 or USER_MODE (below).
+ * The fd is the right to submit: it passes over SCM_RIGHTS, and its
+ * last close takes the queue off the GPU, cancelling (ECANCELED) what has
+ * not completed.
+ *
+ * QUEUE_SUBMIT is an ioctl on the queue fd: run blob_size bytes of PM4 at
+ * blob_va (in the queue's VM) as one indirect buffer; on completion signal
+ * the out dependency (at most one in 5c-2b; in_dep_count must be 0).
+ * out_seqno is the submit's number on this queue, from 1.
+ *
+ * USER_MODE (5c-2b step 3; interim: PRIV_DRIVER only): the client writes
+ * the ring itself. QUEUE_MAP2 on the queue fd gives the mmap(queue_fd)
+ * layout: the ring (PM4, ring_size bytes; the CP fetches it read-only),
+ * the writeback page and the queue's own doorbell page. Map MAP_SHARED,
+ * read-write; never executable. The writeback page, from wptr_offset - 8:
+ *   +0x00  rptr report: the CP's fetch position, dwords into the ring
+ *   +0x08  wptr (client): 64 bits, dwords written since creation
+ *   +0x10  fence: what the client's RELEASE_MEMs write, at fence_gpu_va
+ *   +0x18  emitted (client): the last fence value it put on the ring
+ * To submit: write packets, then emitted, then wptr, then the wptr (64
+ * bits) at doorbell_offset. A job is done when the fence reaches its
+ * value. QUEUE_SUBMIT is refused (EOPNOTSUPP). A lost queue (fault, or
+ * hang: the fence short of emitted or the rptr short of the wptr, neither
+ * moving for hang_ms) is taken off the GPU: QUEUE_MAP2 then fails with EIO and a page not yet touched
+ * faults (SIGBUS). The last close takes every mapping back, so the next
+ * touch is SIGBUS.
+ */
+#define ATRIUM_GPU_QUEUE_FAMILY_COMPUTE	0u
+#define ATRIUM_GPU_QUEUE_FLAG_USER_MODE	0x1u
+
+struct atrium_gpu_queue_create {	/* on vm_fd */
+	uint32_t	struct_size;
+	uint32_t	family_id;
+	uint32_t	priority;
+	uint32_t	flags;
+	int32_t		out_queue_fd;
+	uint32_t	_pad;
+};
+
+/* GPU ABI v2's atrium_gpu_queue_map (named apart from v1's 'A',14 one). */
+struct atrium_gpu_queue_map2 {		/* on queue_fd */
+	uint32_t	struct_size;
+	uint32_t	_reserved;
+	uint64_t	out_ring_offset;	/* mmap(queue_fd) offsets */
+	uint64_t	out_ring_size;
+	uint64_t	out_doorbell_offset;
+	uint64_t	out_doorbell_size;
+	uint64_t	out_wptr_offset;
+	uint64_t	out_fence_gpu_va;	/* v2 2.2 (§5.9): advisory */
+};
+
+struct atrium_gpu_syncobj_point {
+	int32_t		syncobj_fd;
+	uint32_t	_pad;
+	uint64_t	value;
+};
+
+struct atrium_gpu_queue_submit {	/* on queue_fd */
+	uint32_t	struct_size;
+	uint32_t	flags;		/* must be 0 */
+	uint64_t	blob_va;
+	uint64_t	blob_size;	/* bytes, a multiple of 4 */
+	uint64_t	in_dep_ptr;	/* atrium_gpu_syncobj_point[] */
+	uint32_t	in_dep_count;
+	uint32_t	deadline_ns;
+	uint64_t	out_dep_ptr;	/* atrium_gpu_syncobj_point[] */
+	uint32_t	out_dep_count;
+	uint32_t	_pad2;
+	uint64_t	out_seqno;
+};
+
+#define ATRIUM_GPU_IOC_QUEUE_CREATE	_IOWR('A', 79, struct atrium_gpu_queue_create)
+#define ATRIUM_GPU_IOC_QUEUE_MAP2	_IOWR('A', 82, struct atrium_gpu_queue_map2)
+#define ATRIUM_GPU_IOC_QUEUE_SUBMIT	_IOWR('A', 83, struct atrium_gpu_queue_submit)
+
 #define ATRIUM_GPU_IOC_BO_ALLOC		_IOWR('A', 0, struct atrium_gpu_bo_alloc)
 #define ATRIUM_GPU_IOC_BO_WRITE		_IOW('A', 1, struct atrium_gpu_bo_xfer)
 #define ATRIUM_GPU_IOC_BO_READ		_IOW('A', 2, struct atrium_gpu_bo_xfer)

@@ -205,14 +205,20 @@ impl Drop for BoFile {
         // Work already queued under one of those VMs may still be using the pages (isolation
         // break 2): note which queues are busy now, before dropping the VM references (the
         // last one tears the VM down, which stops its queues).
-        let at = dev.busy_snapshot(&vmids[..n]);
+        let mut at = dev.busy_snapshot(&vmids[..n]);
+        // The free rule (spec §4.5.1 step 4): the PTEs are cleared and flushed; one MES
+        // preemption of each user queue of those VMs then proves nothing still uses the old
+        // translations. VMs whose queues could not be preempted keep the BO waiting.
+        if at.uq != 0 {
+            at.uq = dev.uq_preempt(at.uq);
+        }
         for b in binds.iter_mut() {
             *b = None; // drops the VM reference
         }
         // SAFETY: created by create_fd with Box; this was the last user and nothing else
         // refers to it (no bindings left).
         let mut bo = unsafe { Box::<Bo>::from_raw(self.0.as_ptr()) };
-        if at.mask != 0 {
+        if at.mask != 0 || at.uq != 0 {
             // Freed by the reaper once those queues have moved on (defer.rs).
             defer::defer(dev, bo, at);
             return;
@@ -244,6 +250,11 @@ pub fn create_fd(dev: Dev, size: u64, flags: u32) -> Result<c_int> {
     }
     let vram = flags & sys::ATRIUM_GPU_BO_VRAM as u32 != 0;
     let bytes = (size + PAGE_SIZE - 1) & !(PAGE_SIZE - 1);
+    // A device with no VRAM heap (silicon before stage 5d) has nothing to place it in: not
+    // supported, rather than a quota of 0 % of nothing (EDQUOT).
+    if vram && dev.caps().vram_bytes == 0 {
+        return Err(EOPNOTSUPP);
+    }
     let charge = dev.state().quotas.charge(dev, vram, bytes)?;
     let mut bo: Box<Bo> =
         Box::new(Bo { hw, binds: SxLock::new([const { None }; MAX_BIND]), charge: None }, M_WAITOK);

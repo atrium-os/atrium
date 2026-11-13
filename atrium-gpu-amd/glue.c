@@ -9,8 +9,14 @@
  */
 #include "atrium_gpu_amd.h"
 
+#include <sys/priv.h>
 #include <sys/proc.h>
 #include <sys/ucred.h>
+#include <sys/mman.h>
+
+#include <vm/vm.h>
+#include <vm/vm_extern.h>
+#include <vm/vm_object.h>
 
 #include "rs/glue.h"
 
@@ -113,3 +119,36 @@ struct cdevsw atrium_amd_ctl_cdevsw = {
 	.d_name =	"atrium-gpuctl",
 	.d_ioctl =	amd_rs_ctl_ioctl,
 };
+
+/*
+ * The calling thread may drive the hardware directly (interim gate for
+ * user-mode queues, rs/uqueue.rs, until the GPU ABI's capability for it).
+ */
+int
+amd_rs_priv_driver(void)
+{
+	return (priv_check(curthread, PRIV_DRIVER));
+}
+
+/*
+ * A queue fd's fo_mmap (rs/uqueue.rs): map `obj` (a reference the caller
+ * gives up, consumed either way) shared, read-write, never executable.
+ */
+int
+amd_rs_mmap_object(vm_map_t map, vm_offset_t *addr, vm_size_t size,
+    vm_prot_t prot, vm_prot_t cap_maxprot, int flags, vm_object_t obj,
+    vm_ooffset_t foff, struct thread *td)
+{
+	vm_prot_t maxprot;
+	int error;
+
+	maxprot = (VM_PROT_READ | VM_PROT_WRITE) & cap_maxprot;
+	if ((flags & MAP_SHARED) == 0 || (prot & ~maxprot) != 0)
+		error = EACCES;
+	else
+		error = vm_mmap_object(map, addr, size, prot, maxprot, flags,
+		    obj, foff, FALSE, td);
+	if (error != 0)
+		vm_object_deallocate(obj);
+	return (error);
+}

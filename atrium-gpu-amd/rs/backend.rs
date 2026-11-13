@@ -92,12 +92,17 @@ impl Dev {
     /// Which hardware queues may still be running work under any of `vmids`, and each queue's
     /// generation now (queue.rs). Busy queues hold up a BO's free.
     pub fn busy_snapshot(self, vmids: &[u16]) -> BusyAt {
-        self.state().queues.snapshot(self, Some(vmids))
+        let mut at = self.state().queues.snapshot(self, Some(vmids));
+        let mine = vmids.iter().fold(0u32, |m, &v| if v < 32 { m | 1 << v } else { m });
+        at.uq = self.uq_vmids() & mine;
+        at
     }
 
     /// Which queues are busy now (under any VM), and each queue's generation.
     pub fn queues_now(self) -> BusyAt {
-        self.state().queues.snapshot(self, None)
+        let mut at = self.state().queues.snapshot(self, None);
+        at.uq = self.uq_vmids();
+        at
     }
 
     /// The front-end's per-device state.
@@ -260,8 +265,10 @@ impl Dev {
         unsafe { sys::amd_rs_q_deadline(self.0, ns) }
     }
 
-    pub fn q_doorbell(self, off: u32, wptr: u32) {
-        unsafe { sys::amd_rs_q_doorbell(self.0, off, wptr) }
+    /// Ring the doorbell. `signalled`: the submit put a completion on the queue's list, so
+    /// silicon counts its fence against that list (gpusim ignores it).
+    pub fn q_doorbell(self, off: u32, wptr: u32, signalled: bool) {
+        unsafe { sys::amd_rs_q_doorbell(self.0, off, wptr, signalled as c_int) }
     }
 
     /// The doorbell BAR's base physical address, 0 if it cannot be mapped.
@@ -284,7 +291,61 @@ impl Dev {
     /// Forget every completion the ISR still owes `so` (it is about to be freed). Takes
     /// sc->lock, so the ISR is not using `so` once this returns.
     pub fn pending_scrub(self, so: *mut sys::atrium_amd_syncobj) {
-        crate::pending::scrub(self, so)
+        crate::pending::scrub(self, so);
+        // ...and what the user queues owe it (si_client.c; a no-op elsewhere).
+        unsafe { sys::amd_si_uq_scrub(self.0, so) }
+    }
+
+    // --- queue fds on MES user queues (uqueue.rs; si_client.c, 5c-2b) ---
+
+    /// Add a user queue running in `vm`. Returns its slot. EOPNOTSUPP on a backend without.
+    /// `user`: a user-mode queue on these pages (ring, writeback, EOP: kernel address and
+    /// physical address of three contiguous pages that outlive the queue).
+    pub fn uq_create(self, vm: *mut sys::atrium_amd_vm, prio: u32, user: Option<(*mut u8, u64)>) -> Result<c_int> {
+        let mut slot: c_int = -1;
+        let (pg, pa) = user.unwrap_or((core::ptr::null_mut(), 0));
+        check(unsafe { sys::amd_si_uq_create(self.0, vm, prio, pg, pa, &mut slot) })?;
+        Ok(slot)
+    }
+
+    /// A user-mode queue's doorbell page (0 if none).
+    pub fn uq_doorbell_pa(self, slot: c_int) -> u64 {
+        unsafe { sys::amd_si_uq_doorbell_pa(self.0, slot) }
+    }
+
+    /// The GPU VA of a queue's fence (in its VM).
+    pub fn uq_fence_va(self, slot: c_int) -> u64 {
+        unsafe { sys::amd_si_uq_fence_va(self.0, slot) }
+    }
+
+    /// The queue runs (not lost, the card usable). Takes sc->lock.
+    pub fn uq_alive(self, slot: c_int) -> bool {
+        unsafe { sys::amd_si_uq_alive(self.0, slot) != 0 }
+    }
+
+    /// Take the queue off the GPU. Err: the hardware kept it, so its VM must never be freed.
+    pub fn uq_destroy(self, slot: c_int) -> Result<()> {
+        check(unsafe { sys::amd_si_uq_destroy(self.0, slot) })
+    }
+
+    /// Run `ib_dw` dwords at `ib` on the queue; on completion signal `so` (if non-NULL) to
+    /// `value`. Returns the submit's number on the queue.
+    pub fn uq_submit(self, slot: c_int, ib: u64, ib_dw: u32, so: *mut sys::atrium_amd_syncobj, value: u64) -> Result<u64> {
+        let mut seqno = 0u64;
+        check(unsafe { sys::amd_si_uq_submit(self.0, slot, ib, ib_dw, so, value, &mut seqno) })?;
+        Ok(seqno)
+    }
+
+    /// The free rule: preempt every user queue of the VMs in `mask` (kernel VMIDs) once.
+    /// Returns the VMIDs whose queues could not be (a BO of theirs waits for them to go).
+    /// Sleeps (MES round trips).
+    pub fn uq_preempt(self, mask: u32) -> u32 {
+        unsafe { sys::amd_si_uq_preempt(self.0, mask) }
+    }
+
+    /// The kernel VMIDs (bit n = VMID n) whose VM has a user queue that may run.
+    pub fn uq_vmids(self) -> u32 {
+        unsafe { sys::amd_si_uq_vmids(self.0) }
     }
 
     pub fn syncobj_count(self, delta: c_int) {

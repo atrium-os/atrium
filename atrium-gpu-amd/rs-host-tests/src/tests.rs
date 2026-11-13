@@ -361,3 +361,118 @@ fn ip_fw_plan_real_files() {
     assert_eq!(it[0], Item { file: file::SMU, fw_type: ty::SMU, offset: 256, size: 327168 });
     assert_eq!(it[n - 1], Item { file: file::RLC, fw_type: ty::RLC_G, offset: 256, size: 25088 });
 }
+
+#[test]
+fn smu_metrics_parse_and_reject() {
+    use crate::power::{self, throttle, Field};
+    use crate::smu_metrics::*;
+    let mut b = std::vec![0u8; 260];
+    let p16 = |b: &mut Vec<u8>, o: usize, v: u16| b[o..o + 2].copy_from_slice(&v.to_le_bytes());
+    p16(&mut b, 48, 2400); // gfxclk
+    put32(&mut b, 104, 77); // counter
+    p16(&mut b, 140, 31); // edge
+    p16(&mut b, 142, 35); // hotspot
+    p16(&mut b, 148, 40); // mem
+    p16(&mut b, 136, 30); // socket W
+    p16(&mut b, 68, 300); // limit W
+    p16(&mut b, 170, 900); // fan rpm
+    b[168] = 25;
+    let t = parse(&b, 0x2e).unwrap();
+    assert_eq!((t.sample, t.edge_c, t.hotspot_c, t.mem_c, t.vr_c), (77, 31, 35, 40, power::UNKNOWN));
+    assert_eq!((t.fan_rpm, t.fan_pct, t.gfx_mhz, t.power_limit_w), (900, 25, 2400, 300));
+    assert!(!power::idle_suspicious(&t));
+    // An interface version without a known layout is refused outright.
+    assert_eq!(parse(&b, 0x34), Err(MetricsError::Unsupported));
+    assert_eq!(len(0x34), None);
+    // Implausible values are refused, never reported.
+    let mut z = b.clone();
+    p16(&mut z, 140, 0);
+    assert_eq!(parse(&z, 0x2e), Err(MetricsError::Implausible(Field::Edge)));
+    let mut z = b.clone();
+    p16(&mut z, 142, 20); // hotspot below edge
+    assert_eq!(parse(&z, 0x2e), Err(MetricsError::Implausible(Field::Hotspot)));
+    let mut z = b.clone();
+    z[172] = 101;
+    assert!(parse(&z, 0x2e).is_err());
+    let mut z = b.clone();
+    p16(&mut z, 124, 101);
+    assert_eq!(parse(&z, 0x2e), Err(MetricsError::Implausible(Field::Busy)));
+    assert_eq!(parse(&b[..100], 0x2e), Err(MetricsError::Short));
+    // Throttler ids map to neutral classes.
+    let mut z = b.clone();
+    z[172 + 1] = 50; // hotspot
+    z[172 + 14] = 90; // PPT0
+    let t = parse(&z, 0x2e).unwrap();
+    assert_eq!(t.throttle, throttle::THERMAL | throttle::POWER);
+    assert_eq!(t.vendor_throttle, (1 << 1) | (1 << 14));
+}
+
+/// The R9700's own table (SMU 14.0.3, driver interface 0x33), read
+/// 2026-11-12 while it sat at its power limit with no work queued; serial
+/// number bytes zeroed.
+#[test]
+fn smu_metrics_r9700_if33_hot_idle() {
+    use crate::power::{self, throttle};
+    use crate::smu_metrics::*;
+    let b = include_bytes!("../data/smu14_if33_r9700_hot.bin");
+    let t = parse(b, 0x33).unwrap();
+    assert_eq!((t.edge_c, t.hotspot_c, t.mem_c, t.vr_c), (56, 98, 59, 71));
+    assert_eq!((t.power_w, t.board_power_w, t.power_limit_w), (299, 299, 300));
+    assert_eq!((t.fan_rpm, t.fan_pct, t.gfx_busy_pct), (3470, 73, 100));
+    assert_eq!((t.gfx_mhz, t.mem_mhz), (3191, 192));
+    assert_eq!(t.throttle, throttle::THERMAL | throttle::POWER);
+    // Exactly the state the idle check exists for.
+    assert!(power::idle_suspicious(&t));
+}
+
+#[test]
+fn power_plan_only_lowers() {
+    use crate::power::*;
+    let l = Limits { cap_min_w: 150, cap_default_w: 300, gfx_max_mhz: 3200 };
+    // No grant: defaults. A grant above default is clamped down, below the
+    // minimum clamped up.
+    assert_eq!(plan(5, 0, &l), defaults(&l));
+    assert_eq!(plan(5, 450, &l).cap_w, 300);
+    assert_eq!(plan(5, 40, &l).cap_w, 150);
+    assert_eq!(plan(5, 220, &l).cap_w, 220);
+    let p = plan(0, 0, &l);
+    assert_eq!((p.gfx_soft_max_mhz, p.profile), (2240, Profile::PowerSaving));
+    assert_eq!(plan(10, 0, &l).idle, Idle::HeldWhileQueued);
+    for posture in 0..=10 {
+        for grant in [0, 1, 150, 299, 300, 301, 5000] {
+            let v = plan(posture, grant, &l);
+            assert!(v.cap_w <= l.cap_default_w && v.cap_w >= l.cap_min_w);
+            assert!(v.gfx_soft_max_mhz <= l.gfx_max_mhz);
+        }
+    }
+    // A bogus envelope (min above default) never yields a raise.
+    let bad = Limits { cap_min_w: 400, cap_default_w: 300, gfx_max_mhz: 3200 };
+    assert_eq!(plan(5, 0, &bad).cap_w, 300);
+    // Rate limit and hysteresis; restoring the default is never delayed.
+    assert!(!cap_change(250, 252, 5000, &l));
+    assert!(!cap_change(250, 200, 10, &l));
+    assert!(cap_change(250, 200, 1000, &l));
+    assert!(cap_change(200, 300, 0, &l));
+}
+
+/// The RS64 start addresses stage 4c programs, from the real R9700 files.
+#[test]
+fn rs64_start_real_files() {
+    let Ok(dir) = std::env::var("AMDGPU_FW_DIR") else { return };
+    for n in ["gc_12_0_1_pfp.bin", "gc_12_0_1_me.bin", "gc_12_0_1_mec.bin"] {
+        let b = std::fs::read(std::path::Path::new(&dir).join(n)).unwrap();
+        let f = Rs64Fw::parse(&b).unwrap();
+        std::println!("{n}: ucode_start_addr {:#x}", f.ucode_start_addr);
+        assert_eq!(f.ucode_start_addr & 3, 0, "{n}: start not dword aligned");
+    }
+}
+
+#[test]
+fn mes_start_real_file() {
+    let Ok(dir) = std::env::var("AMDGPU_FW_DIR") else { return };
+    let b = std::fs::read(std::path::Path::new(&dir).join("gc_12_0_1_uni_mes.bin")).unwrap();
+    let f = MesFw::parse(&b).unwrap();
+    std::println!("uni_mes: ucode_start_addr {:#x}, data_start_addr {:#x}", f.ucode_start_addr, f.data_start_addr);
+    assert_eq!(f.ucode_start_addr & 3, 0, "start not dword aligned");
+    assert!(f.ucode.size > 0);
+}

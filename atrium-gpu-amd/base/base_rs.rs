@@ -21,6 +21,11 @@ pub mod fw;
 pub mod psp_plan;
 #[path = "../rs/ip_fw.rs"]
 pub mod ip_fw;
+#[allow(dead_code)]
+#[path = "../rs/power.rs"]
+pub mod power;
+#[path = "../rs/smu_metrics.rs"]
+pub mod smu_metrics;
 
 /// # Safety
 /// `bin` points to `len` readable bytes and `out` to a writable
@@ -130,5 +135,100 @@ pub unsafe extern "C" fn atrium_amd_ip_fw_plan(
         Err(ip_fw::PlanError::Fw(i, _)) => -(100 * (i as i32 + 1) + 1),
         Err(ip_fw::PlanError::TooBig(_)) => -2,
         Err(ip_fw::PlanError::Empty(_)) => -3,
+    }
+}
+
+/// Bytes of the SMU metrics table for this driver interface version, 0 if
+/// no layout is known (then nothing is read or decoded).
+#[unsafe(no_mangle)]
+pub extern "C" fn atrium_amd_smu_metrics_len(if_version: u32) -> usize {
+    smu_metrics::len(if_version).unwrap_or(0)
+}
+
+/// Decode the SMU metrics table into the vendor-neutral telemetry record:
+/// 0 ok, -1 no layout for this interface version, -2 too short,
+/// -(10 + power::Field) for an implausible field.
+///
+/// # Safety
+/// `b` points to `len` readable bytes and `out` to a writable
+/// `struct atrium_gpu_power_telemetry` (same layout as `power::Telemetry`).
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn atrium_amd_smu_metrics(
+    b: *const u8,
+    len: usize,
+    if_version: u32,
+    out: *mut power::Telemetry,
+) -> i32 {
+    if b.is_null() || out.is_null() {
+        return -2;
+    }
+    // SAFETY: per the contract above.
+    let (bytes, o) = unsafe { (core::slice::from_raw_parts(b, len), &mut *out) };
+    match smu_metrics::parse(bytes, if_version) {
+        Ok(t) => {
+            *o = t;
+            0
+        }
+        Err(smu_metrics::MetricsError::Unsupported) => -1,
+        Err(smu_metrics::MetricsError::Short) => -2,
+        Err(smu_metrics::MetricsError::Implausible(f)) => -(10 + f as i32),
+    }
+}
+
+/// Is the card busy or near its power limit with no work queued?
+///
+/// # Safety
+/// `t` points to a readable `struct atrium_gpu_power_telemetry`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn atrium_gpu_power_idle_suspicious(t: *const power::Telemetry) -> i32 {
+    if t.is_null() {
+        return 0;
+    }
+    // SAFETY: per the contract above.
+    power::idle_suspicious(unsafe { &*t }) as i32
+}
+
+/// The RS64 program start address (`ucode_start_addr`, 64-bit) of a PFP, ME
+/// or MEC image (`gfx_firmware_header_v2_0`). 0 ok, -1 refused.
+///
+/// # Safety
+/// `bin` points to `len` readable bytes and `out` to a writable u64.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn atrium_amd_rs64_start(bin: *const u8, len: usize, out: *mut u64) -> i32 {
+    if bin.is_null() || out.is_null() {
+        return -1;
+    }
+    // SAFETY: per the contract above.
+    let b = unsafe { core::slice::from_raw_parts(bin, len) };
+    match fw::Rs64Fw::parse(b) {
+        Ok(f) => {
+            // SAFETY: per the contract above.
+            unsafe { *out = f.ucode_start_addr };
+            0
+        }
+        Err(_) => -1,
+    }
+}
+
+/// The MES program start address (`mes_uc_start_addr`, 64-bit) of a MES
+/// image (`mes_firmware_header_v1_0`), for the CP_MES_PRGRM_CNTR_START
+/// registers (mes12.c, stage 4d). 0 on success, -1 if the header is refused.
+///
+/// # Safety
+/// `bin` points to `len` readable bytes and `out` to a writable u64.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn atrium_amd_mes_start(bin: *const u8, len: usize, out: *mut u64) -> i32 {
+    if bin.is_null() || out.is_null() {
+        return -1;
+    }
+    // SAFETY: per the contract above.
+    let b = unsafe { core::slice::from_raw_parts(bin, len) };
+    match fw::MesFw::parse(b) {
+        Ok(f) => {
+            // SAFETY: per the contract above.
+            unsafe { *out = f.ucode_start_addr };
+            0
+        }
+        Err(_) => -1,
     }
 }

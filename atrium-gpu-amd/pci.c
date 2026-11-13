@@ -110,16 +110,72 @@ atrium_amd_pci_attach(device_t dev)
 		return (ENXIO);
 	}
 	if (sc->hw_kind != AMD_HW_GPUSIM) {
-		int psp_bootload = 0, smu_init = 0;
+		int psp_bootload = 0, smu_init = 0, keep = 0, reset = 0,
+		    attach = 0;
 
 		/* Stage 3 test hook: kenv hw.atrium_gpu.psp_bootload=1. */
 		TUNABLE_INT_FETCH("hw.atrium_gpu.psp_bootload", &psp_bootload);
 		if (psp_bootload)
 			(void)amd_psp_bootload(sc);
+		/*
+		 * Stage 5a (kenv hw.atrium_gpu.attach=1, after psp_bootload):
+		 * bring the card up and stay attached. Detach takes it down
+		 * and resets it. No children yet: the gpu module's hardware
+		 * half is still gpusim's (stage 5b/5c).
+		 */
+		TUNABLE_INT_FETCH("hw.atrium_gpu.attach", &attach);
+		if (attach && psp_bootload) {
+			if (amd_si_attach(sc) == 0) {
+				int client = 0, err;
+
+				/* 5d: the VRAM allocator over silicon VRAM. The
+				 * gpu child's clear engine scrubs it. Without
+				 * it, VRAM BOs are refused (no heap). */
+				if ((err = amd_si_vram_init(sc)) != 0)
+					device_printf(dev, "VRAM allocator not "
+					    "up (%d): no VRAM BOs\n", err);
+
+				/*
+				 * Stage 5c-2a (kenv hw.atrium_gpu.client=1):
+				 * the gpu child, so atrium_gpu_amd.ko publishes
+				 * the client node over the silicon backend. No
+				 * display child yet.
+				 */
+				TUNABLE_INT_FETCH("hw.atrium_gpu.client",
+				    &client);
+				if (client) {
+					child = device_add_child(dev,
+					    "atrium_gpu_amd", DEVICE_UNIT_ANY);
+					if (child == NULL)
+						device_printf(dev, "could not "
+						    "add the gpu child\n");
+					bus_attach_children(dev);
+				}
+				device_printf(dev, "silicon attached (stage "
+				    "5a)%s\n", client ? "; gpu child added "
+				    "(5c-2a)" : "; no gpu/display children");
+				return (0);
+			}
+			(void)amd_smu_mode1_reset(sc);
+			atrium_amd_pci_teardown(sc);
+			return (ENXIO);
+		}
 		/* Stage 3d test hook: kenv hw.atrium_gpu.smu_init=1. */
 		TUNABLE_INT_FETCH("hw.atrium_gpu.smu_init", &smu_init);
 		if (smu_init)
 			(void)amd_smu_init(sc);
+		/*
+		 * Leave the card as POST left it (power spec A3.6): any hook
+		 * above may have loaded firmware or powered GC up, which
+		 * nothing will manage once we give the device back. A mode 1
+		 * reset undoes all of it. hw.atrium_gpu.keep_state=1 skips
+		 * it (bring-up only); hw.atrium_gpu.mode1_reset=1 runs just
+		 * the reset.
+		 */
+		TUNABLE_INT_FETCH("hw.atrium_gpu.keep_state", &keep);
+		TUNABLE_INT_FETCH("hw.atrium_gpu.mode1_reset", &reset);
+		if ((psp_bootload || smu_init || reset) && !keep)
+			(void)amd_smu_mode1_reset(sc);
 		device_printf(dev, "silicon bring-up not implemented yet; "
 		    "not attaching (vgapci keeps the device)\n");
 		atrium_amd_pci_teardown(sc);
@@ -229,6 +285,11 @@ atrium_amd_pci_detach(device_t dev)
 	if (err != 0)
 		return (err);
 	device_delete_children(dev);
+	/* Silicon (stage 5a): down, idle proven, then back to post-POST. */
+	if (sc->si != NULL) {
+		amd_si_detach(sc);
+		(void)amd_smu_mode1_reset(sc);
+	}
 	atrium_amd_pci_teardown(sc);
 	return (0);
 }
@@ -243,6 +304,13 @@ atrium_amd_pci_detach(device_t dev)
 static int
 atrium_amd_pci_shutdown(device_t dev)
 {
+	struct atrium_amd_softc *sc = device_get_softc(dev);
+
+	/* Silicon: leave the card as POST left it for the next boot. */
+	if (sc->si != NULL) {
+		amd_si_detach(sc);
+		(void)amd_smu_mode1_reset(sc);
+	}
 	pci_disable_busmaster(dev);
 	return (0);
 }

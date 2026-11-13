@@ -372,6 +372,8 @@
 /* DMA_DATA fields (public layout, Mesa sid.h R_411/R_415; GFX9+). */
 #define DMA_DATA_SRC_SEL_DATA	(2u << 29)	/* DW1: source is the DW2 value */
 #define DMA_DATA_CP_SYNC	(1u << 31)	/* DW1: finish before the next packet */
+#define DMA_DATA_DST_SEL_L2	(3u << 20)	/* DW1: memory through the L2 (GFX9+) */
+#define DMA_DATA_SRC_SEL_L2	(3u << 29)	/* DW1: source is memory via the L2 */
 #define DMA_DATA_MAX_BYTES	((1u << 26) - 1)	/* DW6 BYTE_COUNT width */
 #define IT_DISPATCH_DIRECT	0x15u
 #define IT_DRAW_INDEX_AUTO	0x2du
@@ -553,6 +555,7 @@ struct atrium_amd_vm {
 	uint16_t	 vmid;		/* 1..15 */
 	struct atrium_amd_dma_page pdb;	/* page-directory page */
 	struct atrium_amd_dma_page pt[ATRIUM_AMD_VM_NUM_PT]; /* page-table pages */
+	void		*hw12;		/* silicon: its struct amd_vm12 (si_client.c) */
 };
 /*
  * Front-end/back-end split (rs/README.md). The struct above is the backend's
@@ -753,8 +756,10 @@ struct atrium_amd_vram {
 	struct mtx	 lock;		/* everything below */
 	int		 inited;
 	vmem_t		*arena;		/* clean free VRAM (offsets + ARENA_BASE) */
-	uint64_t	 total;		/* device VRAM bytes */
-	uint64_t	 visible;	/* of which the CPU can reach via BAR0 */
+	uint64_t	 total;		/* VRAM the allocator hands out, bytes */
+	uint64_t	 lo;		/* ... starting at this device offset */
+	uint64_t	 device;	/* device VRAM bytes */
+	uint64_t	 visible;	/* CPU-reachable via BAR0: offsets below */
 	uint64_t	 used;		/* allocated now */
 	uint64_t	 dirty_bytes;	/* freed, not yet scrubbed (incl. in flight) */
 	TAILQ_HEAD(, amd_vram_dirty) dirty;
@@ -812,7 +817,184 @@ int	atrium_amd_discovery_parse(const uint8_t *bin, size_t len,
 	    struct amd_ip_info *out);		/* Rust, base/base_rs.rs */
 int	amd_identify(struct atrium_amd_softc *sc);	/* identify.c */
 int	amd_psp_bootload(struct atrium_amd_softc *sc);	/* psp.c, silicon test */
+int	amd_psp_wait_bootloader(struct atrium_amd_softc *sc, uint32_t *sos);
+int	amd_smu_mode1_reset(struct atrium_amd_softc *sc);	/* smu.c */
+int	amd_gfx12_srm_enable(struct atrium_amd_softc *sc);	/* gfx12_pm.c */
+int	amd_gfx12_clock_gating(struct atrium_amd_softc *sc, bool enable);
+int	amd_gfx12_sq_kill_vmid(struct atrium_amd_softc *sc, u_int vmid);
+void	amd_gfx12_pm_report(struct atrium_amd_softc *sc, const char *when);
+int	amd_gc_idle_enter(struct atrium_amd_softc *sc);	/* gfx12_pm.c */
+void	amd_hdp_flush(struct atrium_amd_softc *sc);		/* psp.c */
+
+/* gmc12.c: GPUVM hubs + GART on silicon (stage 4a). */
+struct amd_gart {
+	struct atrium_amd_softc *sc;
+	struct resource *vram;		/* BAR0 */
+	uint64_t fb_start, fb_end;	/* VRAM in MC address space */
+	uint64_t vram_base_offset;	/* MC FB offset (physical) */
+	uint64_t gart_start, gart_end;
+	uint64_t table_mc, scratch_mc, pd_addr;
+	bus_size_t table_off;		/* in BAR0 */
+	void	*dummy;
+	vm_paddr_t dummy_phys;
+	bool	enabled;
+	u_int	vm_slices;		/* VRAM page-table pool slices in use */
+};
+int	amd_gmc12_gart_enable(struct atrium_amd_softc *sc,
+	    struct resource *vram, struct amd_gart *gt);
+void	amd_gmc12_gart_disable(struct amd_gart *gt);
+int	amd_gmc12_gart_map(struct amd_gart *gt, uint64_t gart_addr,
+	    vm_paddr_t pa);
+int	amd_gmc12_flush(struct amd_gart *gt);
+void	amd_gmc12_fault_report(struct amd_gart *gt, const char *when);
+/* Stage 5b: per-client page tables (gmc12.c). */
+struct amd_vm12 {
+	struct amd_gart *gt;
+	int	mode;			/* AMD_VM12_* */
+	uint64_t flat_va;		/* AMD_VM12_FLAT: window base */
+	u_int	used;			/* tables handed out; 0 is the root */
+	u_int	slice, first;		/* VRAM pool slice, its first table */
+	bool	live;
+	bool	translate_further;	/* GC's PDE format variant */
+	void	*sys[64];		/* AMD_VM12_4L_SYS tables */
+	vm_paddr_t sys_pa[64];
+};
+#define AMD_VM12_4L_VRAM	0	/* amdgpu's layout */
+#define AMD_VM12_FLAT		1	/* diagnostic: depth 0, 2 MiB */
+#define AMD_VM12_4L_SYS		2	/* diagnostic: tables in system RAM */
+#define AMD_VM_READ	0x1u
+#define AMD_VM_WRITE	0x2u
+#define AMD_VM_EXEC	0x4u
+#define AMD_VM_VRAM	0x8u	/* pa is a physical FB address (local VRAM) */
+int	amd_gmc12_vm_init(struct amd_gart *gt, struct amd_vm12 *vm, int mode,
+	    uint64_t flat_va);
+void	amd_gmc12_vm_fini(struct amd_vm12 *vm);
+uint64_t amd_gmc12_vm_pd_addr(struct amd_vm12 *vm);
+int	amd_gmc12_vm_map(struct amd_vm12 *vm, uint64_t va, vm_paddr_t pa,
+	    u_int prot);
+int	amd_gmc12_vm_unmap(struct amd_vm12 *vm, uint64_t va);
+void	amd_gmc12_vm_dump(struct amd_vm12 *vm, uint64_t va);
+int	amd_gmc12_vm_flush(struct amd_gart *gt, u_int vmid);
+int	amd_gmc12_vm_bind(struct amd_gart *gt, u_int vmid,
+	    struct amd_vm12 *vm);
+void	amd_gmc12_ctx_report(struct amd_gart *gt, u_int vmid,
+	    const char *when);
+bool	amd_gmc12_fault_take(struct amd_gart *gt, uint32_t *status,
+	    uint64_t *addr);
+void	amd_gmc12_fault_decode(struct amd_gart *gt, uint32_t st,
+	    const char *when);
+u_int	amd_gmc12_fault_vmid(uint32_t status);
+uint32_t amd_gmc12_ctx_cntl(struct amd_gart *gt, u_int vmid);
+int	amd_ih7_test(struct atrium_amd_softc *sc, struct amd_gart *gt,
+	    int (*during)(struct atrium_amd_softc *, struct amd_gart *));
+struct amd_ih7;
+int	amd_ih7_up(struct atrium_amd_softc *sc, struct amd_gart *gt,
+	    struct amd_ih7 **out);
+void	amd_ih7_down(struct amd_ih7 *ih);
+int	amd_ih7_drain_eop(struct amd_ih7 *ih, int max_log);
+u_int	amd_ih7_nintr(struct amd_ih7 *ih);
+/* One IV (8 dwords), or NULL at the end of a batch (5c-2). */
+typedef void amd_ih7_consumer_fn(void *arg, const uint32_t *iv);
+void	amd_ih7_set_consumer(struct amd_ih7 *ih, amd_ih7_consumer_fn *fn,
+	    void *arg);
+int	amd_gfx12_setup(struct atrium_amd_softc *sc);	/* gfx12.c, 4c */
+int	atrium_amd_rs64_start(const uint8_t *bin, size_t len, uint64_t *out);
+int	atrium_amd_mes_start(const uint8_t *bin, size_t len, uint64_t *out);
+int	amd_mes12_test(struct atrium_amd_softc *sc, struct amd_gart *gt);	/* mes12.c, 4d */
+struct mes;
+int	amd_mes12_up(struct atrium_amd_softc *sc, struct amd_gart *gt,
+	    bool kq, struct mes **out);
+int	amd_mes12_selftest(struct mes *m);
+int	amd_mes12_vmtest(struct mes *m);	/* 5b */
+int	amd_mes12_uqtest(struct mes *m);	/* 5c-1 */
+void	amd_mes12_down(struct mes *m);
+/* 5c-2: the kernel compute queue client SUBMITs run on (mes12.c). */
+struct amd_kq;
+int	amd_mes12_kq_open(struct mes *m, struct amd_kq **out);
+void	amd_mes12_kq_close(struct amd_kq *kq);
+int	amd_mes12_kq_reset(struct amd_kq *kq);
+int	amd_mes12_kq_submit(struct amd_kq *kq, uint64_t ib, uint32_t ib_dw,
+	    u_int vmid, uint32_t *seq);
+/* 5d: zero-fill [mc, mc+bytes) (VMID 0 MC addresses, i.e. VRAM through the
+ * system aperture) on the kernel queue; EBUSY unless the queue is idle.
+ * The fill is done when the fence passes *seq and the generation is still
+ * *gen (a reset starts the sequence over). */
+#define AMD_KQ_FILL_MAX		(256ull << 20)
+int	amd_mes12_kq_fill(struct amd_kq *kq, uint64_t mc, uint64_t bytes,
+	    uint32_t *seq, uint32_t *gen);
+uint32_t amd_mes12_kq_gen(struct amd_kq *kq);
+uint32_t amd_mes12_kq_fence(struct amd_kq *kq);
+void	amd_mes12_kq_report(struct amd_kq *kq, const char *when);
+#define AMD_UQ_SLOTS	8	/* MES user queues for client queue fds */
+#define AMD_UQ_DOORBELL(slot)	((0x10u + (slot)) << 1)	/* userqueue range */
+/* A user-mode queue's doorbell: the first dword of its own doorbell BAR
+ * page (2 + slot; page 0 is the kernel's, page 1 MES's aggregated ones). */
+#define AMD_UQ_DOORBELL_USER(slot)	((2u + (slot)) << 10)
+/* RELEASE_MEM INT_CTXID, which an EOP IV carries in src_data[0]. */
+#define AMD_UQ_CTXID_FLAG	0x01000000u
+#define AMD_UQ_CTXID(db)	(AMD_UQ_CTXID_FLAG | ((db) & 0x00ffffffu))
+#define AMD_KQ_CTXID		0x02000006u
+#define AMD_MES_CTXID_FLAG	0x20000000u	/* MES's own EOPs (silicon) */
+struct amd_uq;
+int	amd_mes12_uq_create(struct mes *m, struct amd_vm12 *vm, u_int kvmid,
+	    u_int slot, uint64_t va, uint32_t prio, uint8_t *upg,
+	    vm_paddr_t upa, struct amd_uq **out);
+vm_paddr_t amd_mes12_uq_doorbell_pa(struct amd_uq *q);
+bool	amd_mes12_uq_user_busy(struct amd_uq *q, uint32_t *rptr,
+	    uint32_t *fence);
+uint64_t amd_mes12_uq_fence_va(struct amd_uq *q);
+int	amd_mes12_uq_preempt(struct amd_uq *q);
+int	amd_mes12_uq_destroy(struct amd_uq *q, u_int kvmid);
+int	amd_mes12_uq_evict(struct amd_uq *q);
+int	amd_mes12_uq_submit(struct amd_uq *q, uint64_t ib, uint32_t ib_dw,
+	    uint32_t *seq);
+uint32_t amd_mes12_uq_fence(struct amd_uq *q);
+uint32_t amd_mes12_uq_doorbell(struct amd_uq *q);
+uint32_t amd_mes12_uq_seq(struct amd_uq *q);
+u_int	amd_mes12_uq_hqd_vmid(struct amd_uq *q);
+void	amd_mes12_uq_free_lost(struct amd_uq *q);
+void	amd_si_lose(struct atrium_amd_softc *sc, const char *why);
+void	amd_mes12_uq_report(struct amd_uq *q, const char *when);
+void	amd_mes12_uq_ints(struct mes *m, bool on, uint32_t *saved);
 int	amd_smu_init(struct atrium_amd_softc *sc);	/* smu.c, silicon test */
+int	amd_si_attach(struct atrium_amd_softc *sc);	/* smu.c, stage 5a */
+void	amd_si_detach(struct atrium_amd_softc *sc);
+/* 5c-2: what the client node (si_client.c, gpu module) needs of smu.c. */
+struct amd_gart *amd_si_gart(struct atrium_amd_softc *sc);
+struct mes *amd_si_mes(struct atrium_amd_softc *sc);
+struct amd_ih7 *amd_si_ih(struct atrium_amd_softc *sc);
+/* 5d: the VRAM allocator's range on silicon (smu.c), called by the base
+ * after amd_si_attach: above the driver's own area, below the PSP's. */
+#define AMD_SI_VRAM_DRIVER_END	(128ull << 20)
+int	amd_si_vram_init(struct atrium_amd_softc *sc);
+bool	amd_si_usable(struct atrium_amd_softc *sc);
+void	amd_si_client_attached(struct atrium_amd_softc *sc, bool on);
+int	amd_si_gfx_hold(struct atrium_amd_softc *sc);
+void	amd_si_gfx_release(struct atrium_amd_softc *sc);
+
+/*
+ * One vendor-neutral GPU power telemetry sample (rs/power.rs Telemetry;
+ * docs/spec/gpu-power-management.md §4). Every backend fills this; nothing
+ * above the backend sees a vendor table. 0xffff = no such sensor.
+ */
+#define	GPU_POWER_UNKNOWN	0xffff
+#define	GPU_THROTTLE_THERMAL	0x1
+#define	GPU_THROTTLE_POWER	0x2
+#define	GPU_THROTTLE_CURRENT	0x4
+#define	GPU_THROTTLE_OTHER	0x8
+struct atrium_gpu_power_telemetry {
+	uint16_t edge_c, hotspot_c, mem_c, vr_c;
+	uint16_t power_w, board_power_w, power_limit_w;
+	uint16_t fan_rpm;
+	uint8_t	 fan_pct, gfx_busy_pct;
+	uint16_t _pad0;
+	uint16_t gfx_mhz, mem_mhz;
+	uint32_t throttle;		/* GPU_THROTTLE_* */
+	uint32_t vendor_throttle;	/* backend's own ids, bit n = id n */
+	uint32_t sample;		/* controller counter, informational */
+};
+int	atrium_gpu_power_idle_suspicious(
+	    const struct atrium_gpu_power_telemetry *t);	/* Rust */
 
 struct atrium_amd_softc {
 	device_t	 dev;
@@ -823,6 +1005,10 @@ struct atrium_amd_softc {
 	char		 isa_name[16];
 	uint32_t	 dcn_seg2_bytes; /* DMU segment 2 byte offset in BAR5 */
 	const struct atrium_gpu_backend_ops *backend; /* hardware seam (gpu module) */
+	struct amd_si *si;		/* silicon, attached (smu.c, stage 5a) */
+	/* The PSP's own VRAM (FB_FW_RESERV_ADDR[_EXT], psp.c): offsets and
+	 * sizes in bytes; size 0 = not reported. The allocator keeps out. */
+	uint64_t	 psp_resv_off[2], psp_resv_size[2];
 	struct resource	*regs;		/* BAR5 MMIO register file */
 	int		 regs_rid;
 	struct resource	*doorbell;	/* BAR2 doorbell page */
@@ -907,6 +1093,7 @@ struct atrium_amd_softc {
 	struct atrium_amd_dma_page null_pd; /* all-invalid page directory */
 	int		 db_fict_registered;
 	void		*rs_state;	/* the Rust front-end's (rs/defer.rs) */
+	struct amd_si_client *si_client; /* silicon client node (si_client.c) */
 	struct timeout_task defer_task;
 	struct atrium_amd_isolation_stats iso;
 	struct timeout_task watchdog_task;
@@ -1026,6 +1213,11 @@ int	 amd_device_reset(struct atrium_amd_softc *sc);
  *          which waits out a running scrub).
  */
 int	 amd_vram_init(struct atrium_amd_softc *sc);
+/* Silicon: hand out [lo, hi) of `device` bytes. `dirty` = its contents are
+ * unknown (silicon need not wipe VRAM), so all of it is scrubbed before it
+ * is first allocated. */
+int	 amd_vram_init_range(struct atrium_amd_softc *sc, uint64_t device,
+	    uint64_t lo, uint64_t hi, bool dirty);
 void	 amd_vram_fini(struct atrium_amd_softc *sc);
 int	 amd_vram_alloc(struct atrium_amd_softc *sc, uint64_t size, int flags,
 	    uint64_t *out_off);
@@ -1141,5 +1333,27 @@ void	 amd_hwq_kick_watchdog(struct atrium_amd_softc *sc);
 /* glue.c — the client and control cdevsws (entry points in rs/ioctl.rs) */
 extern struct cdevsw atrium_amd_cdevsw;
 extern struct cdevsw atrium_amd_ctl_cdevsw;
+
+/*
+ * si_client.c (gpu module, stage 5c-2): the client node on silicon. The
+ * backend vtable, and the queue hardware the Rust front-end drives through
+ * cp.c and queue.c, which branch here on silicon.
+ */
+static inline bool
+amd_is_si(const struct atrium_amd_softc *sc)
+{
+	return (sc->hw_kind != AMD_HW_GPUSIM);
+}
+struct amd_si_client;
+extern const struct atrium_gpu_backend_ops amd_si_backend;
+int	amd_si_client_up(struct atrium_amd_softc *sc);
+void	amd_si_client_down(struct atrium_amd_softc *sc);
+int	amd_si_q_program(struct atrium_amd_softc *sc, uint64_t ring_va,
+	    uint32_t engine, uint16_t vmid, uint32_t *doorbell_off);
+void	amd_si_q_stop(struct atrium_amd_softc *sc, uint32_t qid);
+uint32_t amd_si_q_rptr(struct atrium_amd_softc *sc, uint32_t qid);
+void	amd_si_q_kick(struct atrium_amd_softc *sc, uint32_t n_dwords,
+	    bool signalled);
+void	amd_si_vm_unbind(struct atrium_amd_softc *sc, uint16_t vmid);
 
 #endif /* _ATRIUM_GPU_AMD_H_ */
