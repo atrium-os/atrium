@@ -83,6 +83,21 @@ Fix: a mutex in `mes_api` (amdgpu's `mes.ring_lock`), or at least
 kernel-queue stop/reset in si_client.c:885-910, and the legacy SUBMIT path (off)
 all write the same ring and wptr. Check that one lock covers every submitter.
 
+**F7. The driver GRBM-selects MES-owned queues and pipes while MES runs
+(found on the box, fixed for the fault path).** GRBM_GFX_CNTL selects for
+HQD scans, MES-pipe reads and the MEC interrupt enables, made while MES/CP
+was busy right after a fault, left CPF's GRBM path and the GFXHUB L2 stuck
+(CPF bit 28, GCVM_L2_STATUS 0x1, no invalidation acked): the G5 wedge
+(r9700-bare-metal.md §5, runs 8f3d4517 to f4af2b81). F1's lock does not
+help: it orders the driver's threads, not the driver against MES firmware.
+Fixed: the fault and eviction path find a queue's VMID by the hub's context
+page-table base and never select (f4af2b81, 2 of 2 clean full suites); the
+MEC1 interrupt enables are set once at MES start (d9391a26). Still selecting
+at run time: CP-error IVs (si_uq_cperr maps pipe/queue to a queue by a scan)
+and the HQD reset of a queue that will not stop (followed by a mode 1 reset
+if it fails). Rule: no GRBM select of a MES-owned queue or pipe while MES
+runs, except on a path that ends in a reset.
+
 ## Deadlocks and sleeping with locks held
 
 - The new invalidation mutex is MTX_DEF and is never taken under a spin lock.

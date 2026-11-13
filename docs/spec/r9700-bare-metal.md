@@ -1479,3 +1479,9 @@ work (self-test, scrub).
   Still selecting at run time: CPC interrupt enables at the first queue create
   and the last destroy (amd_mes12_uq_ints), CP-error IVs (si_uq_cperr), the HQD
   reset of a queue that will not stop. Logs: claude/project-thread-33aauq 438a2af9.
+- **2026-11-13 15:23, confirming rerun of f4af2b81: CLEAN again, 92 passed, 0
+  failed (2 of 2).** 0 flush timeouts, CPF bit 28 clear within 1 ms after all 12
+  kills, L2 idle at every end of watch, test 14's two re-inits pass, card proven
+  idle at detach. G5 wedge fixed. Follow-up d9391a26: the MEC1 interrupt enables
+  are set once at MES start instead of by GRBM selects at the first queue
+  create and last destroy. Logs: claude/project-thread-33aauq a5a8b3f9.
