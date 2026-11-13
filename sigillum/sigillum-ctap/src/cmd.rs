@@ -409,6 +409,8 @@ pub mod pin_sub {
     pub const GET_PIN_RETRIES: u8 = 0x01;
     pub const GET_KEY_AGREEMENT: u8 = 0x02;
     pub const SET_PIN: u8 = 0x03;
+    /// `getPinToken`: CTAP 2.0's, without permissions (protocol 1 keys).
+    pub const GET_PIN_TOKEN: u8 = 0x05;
     pub const GET_PIN_UV_AUTH_TOKEN_USING_PIN_WITH_PERMISSIONS: u8 = 0x09;
 }
 

@@ -717,6 +717,18 @@ otherwise passes the blobs on without reading them.
     (`scripts/qemu-patches/u2f-emulated-lost-wakeup.patch`, applied by build-qemu.sh).
   Only an emulated U2F key so far: CTAP2 (PIN, UV, resident keys) on real hardware waits
   for a YubiKey on the Mac VM.
+- **S2e on a real key (2026-11-13, in progress).** A YubiKey 5 (1050:0406, firmware 5.4.3)
+  passed through by QEMU `usb-host` to the Mac's arm64 HVF guest
+  (`scripts/sigillum-fido-vm.sh`, as root;
+  `ARCH=aarch64 SIGILLUM_REAL_KEY=1 sh scripts/vm-sigillum-check.sh`). The driver-jail
+  checks pass on it: `atrium-sigillum-fido-0`, `/dev/u2f/0` only, `_sigillum-dev` 0600,
+  `ip4=disable`. The scripted UI never sends a PIN; `sigillum-probe ui-tty`
+  (`scripts/sigillum-real-key-ceremony.sh`) takes one typed at the terminal, one try per
+  ceremony. Found: the key has a PIN, and it lists only PIN/UV protocol 1, so it answered
+  protocol 2's `getPinUvAuthTokenUsingPinWithPermissions` with `INVALID_COMMAND`.
+  `sigillum-ctap` now speaks protocol 1 (`SHA-256(Z)` secret, zero-IV AES-CBC, 16-byte
+  HMAC) and CTAP 2.0's `getPinToken` with such keys. The soft key emulates such a key
+  (`pin_protocols = [1]`, `ceremonies.rs`). Register and assert on the real key are not yet run.
 - **Not yet:** Capsicum in `sigillumd` itself (it reads the launch registry per connection; a
   pre-opened directory fd comes later), `allow.mlock` for `sigillumd`.
 

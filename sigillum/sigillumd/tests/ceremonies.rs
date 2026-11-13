@@ -244,6 +244,46 @@ fn navigator_registers_and_signs_in_with_a_pin_protected_key() {
     assert_eq!(f & (flags::UP | flags::UV), flags::UP | flags::UV);
 }
 
+/// A CTAP 2.0 key (PIN/UV protocol 1 only, `getPinToken`, as a YubiKey 5
+/// on firmware 5.4.3): the S2 gate's real key answered protocol 2's token
+/// subcommand with INVALID_COMMAND.
+#[test]
+fn pin_protocol_one_key_registers_and_signs_in() {
+    let mut soft = SoftKey::new(Some(PIN));
+    soft.pin_protocols = vec![sigillum_ctap::pin::PROTOCOL_ONE];
+    let mut r = Rig::new(soft);
+    r.request(&web_broker(), register("example.com", Uv::Discouraged));
+    r.press_last(Choice::Device(DEV));
+    assert_eq!(r.pin_asks, 1);
+    let (cred, vk) = rp_check_registration(&r.reply(), "example.com");
+    assert!(r.key.borrow().commands.iter().all(|c| *c != sigillum_ctap::cmd::RESET));
+
+    r.request(&web_broker(), assert_req("example.com", vec![cred], Uv::Discouraged));
+    r.press_last(Choice::Device(DEV));
+    let f = rp_check_assertion(&r.reply(), "example.com", &vk);
+    assert_eq!(f & (flags::UP | flags::UV), flags::UP | flags::UV);
+    assert_eq!(r.key.borrow().pin_retries, 8);
+}
+
+#[test]
+fn pin_protocol_one_wrong_pin_costs_one_try() {
+    let mut soft = SoftKey::new(Some(PIN));
+    soft.pin_protocols = vec![sigillum_ctap::pin::PROTOCOL_ONE];
+    let mut r = Rig::new(soft);
+    r.request(&web_broker(), register("example.com", Uv::Discouraged));
+    let key = r.sheets[0].0;
+    let a = r.broker.press(key, Choice::Device(DEV), true);
+    r.pin = None;
+    r.run(a);
+    let a = r.broker.pin(key, Pin(Zeroizing::new(b"0000".to_vec())));
+    r.run(a);
+    assert_eq!(r.pin_asks, 2, "PinInvalid asks again");
+    assert_eq!(r.key.borrow().pin_retries, 7);
+    let a = r.broker.pin(key, Pin(Zeroizing::new(PIN.to_vec())));
+    r.run(a);
+    rp_check_registration(&r.reply(), "example.com");
+}
+
 #[test]
 fn key_without_pin_works_without_uv_and_refuses_required_uv() {
     let mut r = Rig::new(SoftKey::new(None));

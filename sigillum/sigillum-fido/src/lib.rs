@@ -121,6 +121,15 @@ impl<D: HidDevice> Driver<D> {
             return Ok((Driver { client, info: None, u2f_poll: std::time::Duration::from_millis(200), u2f_polls: U2F_POLLS, touch }, hello));
         }
         let info = client.get_info()?;
+        // Speak protocol 2 when the key lists it, else 1 (CTAP 2.0 keys,
+        // and those that leave pinUvAuthProtocols out, which 2.0 allows;
+        // e.g. a YubiKey 5 on firmware 5.4, list [1] and answer protocol 2's
+        // token subcommand with INVALID_COMMAND).
+        client.pin_protocol = if info.pin_protocols.contains(&sigillum_ctap::pin::PROTOCOL) {
+            sigillum_ctap::pin::PROTOCOL
+        } else {
+            sigillum_ctap::pin::PROTOCOL_ONE
+        };
         let opt = |k| info.option(k).unwrap_or(false);
         let ext = |k: &str| info.extensions.iter().any(|e| e == k);
         let hello = FromDriver::Hello {

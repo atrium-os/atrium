@@ -31,6 +31,9 @@ pub struct Client<D: HidDevice> {
     /// Set by the driver's socket reader when the broker cancels: the
     /// pending command gets `CTAPHID_CANCEL` and ends.
     pub cancel: Arc<AtomicBool>,
+    /// The PIN/UV auth protocol to speak: 2 by default; the driver sets 1
+    /// for a key whose `GetInfo` lists only 1 (CTAP 2.0 keys).
+    pub pin_protocol: u8,
 }
 
 impl<D: HidDevice> Client<D> {
@@ -64,7 +67,7 @@ impl<D: HidDevice> Client<D> {
                     r = Reassembler::new(hid::BROADCAST);
                     continue;
                 }
-                return Ok(Client { dev, cid: init.cid, init, on_keepalive: None, cancel: Arc::new(AtomicBool::new(false)) });
+                return Ok(Client { dev, cid: init.cid, init, on_keepalive: None, cancel: Arc::new(AtomicBool::new(false)), pin_protocol: pin::PROTOCOL });
             }
         }
         Err(Error::Timeout)
@@ -171,50 +174,54 @@ impl<D: HidDevice> Client<D> {
     }
 
     pub fn pin_retries(&mut self) -> Result<u64, Error> {
-        let req = ClientPin { protocol: pin::PROTOCOL, sub: cmd::pin_sub::GET_PIN_RETRIES, ..ClientPin::default() };
+        let req = ClientPin { protocol: self.pin_protocol, sub: cmd::pin_sub::GET_PIN_RETRIES, ..ClientPin::default() };
         ClientPinResponse::parse(&self.cbor(cmd::CLIENT_PIN, &req.encode())?)?.retries.ok_or(Error::Protocol("no pinRetries"))
     }
 
     fn shared(&mut self) -> Result<(Shared, crate::cose::CoseKey), Error> {
-        let req = ClientPin { protocol: pin::PROTOCOL, sub: cmd::pin_sub::GET_KEY_AGREEMENT, ..ClientPin::default() };
+        let req = ClientPin { protocol: self.pin_protocol, sub: cmd::pin_sub::GET_KEY_AGREEMENT, ..ClientPin::default() };
         let resp = ClientPinResponse::parse(&self.cbor(cmd::CLIENT_PIN, &req.encode())?)?;
         let peer = resp.key_agreement.ok_or(Error::Protocol("no keyAgreement"))?;
         let (sk, ours) = pin::platform_key();
-        Ok((Shared::agree(&sk, &peer)?, ours))
+        Ok((Shared::agree_with(self.pin_protocol, &sk, &peer)?, ours))
     }
 
     /// `getPinUvAuthTokenUsingPinWithPermissions` (protocol 2). The token is
     /// good for `permissions` on `rp_id` until the authenticator expires it.
+    /// With protocol 1, CTAP 2.0's `getPinToken`: no permissions, no RP.
     pub fn pin_token(&mut self, pin_utf8: &[u8], permissions: u8, rp_id: &str) -> Result<PinToken, Error> {
         if pin_utf8.len() < 4 || pin_utf8.len() > 63 {
             return Err(Error::Request("PIN length"));
         }
         let (shared, ours) = self.shared()?;
         let hash = pin::pin_hash(pin_utf8);
+        let one = self.pin_protocol == pin::PROTOCOL_ONE;
         let req = ClientPin {
-            protocol: pin::PROTOCOL,
-            sub: cmd::pin_sub::GET_PIN_UV_AUTH_TOKEN_USING_PIN_WITH_PERMISSIONS,
+            protocol: self.pin_protocol,
+            sub: if one { cmd::pin_sub::GET_PIN_TOKEN } else { cmd::pin_sub::GET_PIN_UV_AUTH_TOKEN_USING_PIN_WITH_PERMISSIONS },
             key_agreement: Some(ours),
             pin_hash_enc: Some(shared.encrypt(&*hash)?),
-            permissions: Some(permissions),
-            rp_id: Some(rp_id.to_owned()),
+            permissions: if one { None } else { Some(permissions) },
+            rp_id: if one { None } else { Some(rp_id.to_owned()) },
             ..ClientPin::default()
         };
         let resp = ClientPinResponse::parse(&self.cbor(cmd::CLIENT_PIN, &req.encode())?)?;
         let token = shared.decrypt(&resp.token_enc.ok_or(Error::Protocol("no pinUvAuthToken"))?)?;
-        if token.len() != 32 {
+        // Protocol 2's token is 32 bytes; protocol 1 allows any multiple of
+        // 16 (16 or 32 in practice).
+        if (one && (token.len() != 16 && token.len() != 32)) || (!one && token.len() != 32) {
             return Err(Error::Protocol("pinUvAuthToken length"));
         }
-        Ok(PinToken(token))
+        Ok(PinToken(token, self.pin_protocol))
     }
 }
 
 /// A pinUvAuthToken, zeroized on drop.
-pub struct PinToken(Zeroizing<Vec<u8>>);
+pub struct PinToken(Zeroizing<Vec<u8>>, u8);
 
 impl PinToken {
     /// `pinUvAuthParam` over a clientDataHash.
     pub fn auth(&self, client_data_hash: &[u8; 32]) -> PinAuth {
-        PinAuth { param: pin::authenticate(&self.0, client_data_hash).to_vec(), protocol: pin::PROTOCOL }
+        PinAuth { param: pin::authenticate_with(self.1, &self.0, client_data_hash), protocol: self.1 }
     }
 }
