@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["capsa-fat"]
+members = ["capsa-fat", "capsa-fuse"]
 
 [workspace.package]
 edition = "2021"

@@ -531,8 +531,43 @@ and 32 volumes made by `mkfs.fat`, then `fsck.fat -n` must find nothing
 and `mtype` must read every file back by its long name; a volume filled to
 `NoSpace` (data and the fixed root) stays sound.
 
-Next: exFAT, a fuzz target, then the FUSE server and jaild's outside
-mount.
+exFAT, read side (`capsa_fat::exfat`): the boot region's checksum and
+layout checked (heap after the FAT, heap inside the volume, at most 2^28
+clusters so the FAT32 table code is exact), entry sets used only when the
+set checksum, stream entry and name entries agree, `NoFatChain` runs
+checked against the heap, bytes past `ValidDataLength` read as zeros, free
+space from the allocation bitmap. Tested on volumes made by `mkfs.exfat`
+and filled through `exfat-fuse` on a loop device (long and Unicode names,
+two files grown in turns so they fragment onto FAT chains, a 300-entry
+directory), plus 200 damaged copies. exFAT writes come later.
+
+Fuzzing: `capsa-fat/fuzz` target `volume` takes any bytes as the start of
+a 64 MiB device and opens, walks, reads, then creates, writes, renames,
+removes and syncs.
+
+**The FUSE server** (`capsa/capsa-fuse`, binary `atrium-capsa-fuse`)
+speaks the FUSE kernel protocol (7.x, answering min(kernel, 7.31)) itself,
+no libfuse: it is handed an open partition and an open, already-mounted
+`/dev/fuse` and nothing else. Lookups, attributes (owner = the session
+user from `--uid/--gid`; mode 0644/0755, read-only bit and `--ro` give
+0444/0555), readdir, read, write, create, mkdir, unlink, rmdir, rename and
+rename2 (`NOREPLACE`), truncate and mtime, statfs, fsync/flush (the FAT is
+synced on close and after every directory change). Node ids follow
+renames; a removed or replaced entry's id answers `ESTALE` instead of
+reaching whatever reuses its slot. Request framing is checked before any
+field is read. FAT is served read-write, exFAT read-only. Disk devices go
+through `Aligned` with `DIOCGSECTORSIZE`/`DIOCGMEDIASIZE`. Tested under a
+real kernel FUSE mount in the cloud container (Linux's fuse speaks the same
+protocol): a FAT32 volume written through `std::fs` (3 MB file, nested
+directories, Unicode name, append, overwrite, truncate, rename across
+directories and replacing, rmdir refusal, bad name refused, case-insensitive
+lookups, statvfs), then `fsck.fat -n` clean and `mtype` agreeing; and
+`--ro` giving `EROFS`.
+
+Next: jaild opening `/dev/fuse` and the partition and mounting fusefs from
+outside (no `allow.mount.fusefs` in any jail), the server's sysfil
+profile, a FreeBSD VM gate on fusefs, dispensatord's rule for `daNpM`
+partitions to the storage service, then exFAT writes.
 
 ## 7. Not in scope
 

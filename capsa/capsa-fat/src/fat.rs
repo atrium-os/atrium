@@ -70,6 +70,26 @@ impl Table {
     /// The raw entry for cluster `n` (any n the FAT has room for).
     pub fn raw<D: BlockDev>(&mut self, dev: &mut D, g: &Geometry, n: u32) -> Result<u32> {
         let n64 = u64::from(n);
+        // FAT16 and FAT32 entries never straddle a sector: one lookup.
+        let w: u64 = match g.fat_type {
+            FatType::Fat16 => 2,
+            FatType::Fat32 => 4,
+            FatType::Fat12 => 0,
+        };
+        if w != 0 {
+            let off = n64 * w;
+            if off + w > g.fat_bytes {
+                return Err(Error::Corrupt("FAT entry beyond the FAT"));
+            }
+            let bps = u64::from(g.bytes_per_sector);
+            let i = (off % bps) as usize;
+            let b = &self.sector(dev, g, off / bps)?.0;
+            return Ok(if w == 2 {
+                u32::from(u16::from_le_bytes([b[i], b[i + 1]]))
+            } else {
+                u32::from_le_bytes([b[i], b[i + 1], b[i + 2], b[i + 3]]) & 0x0FFF_FFFF
+            });
+        }
         Ok(match g.fat_type {
             FatType::Fat12 => {
                 let o = n64 + n64 / 2;

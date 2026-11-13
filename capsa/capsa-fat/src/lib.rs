@@ -17,6 +17,7 @@
 
 mod bpb;
 mod dir;
+pub mod exfat;
 mod fat;
 mod time;
 mod volume;
