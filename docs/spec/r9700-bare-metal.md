@@ -821,3 +821,12 @@ work (self-test, scrub).
   suite runs part A, breaks 1 (B is never blocked by A's parked work) and 5, F (VRAM
   scrub) and G (quotas). Also written into the ABI header: USER_MODE queues are only for a
   trusted renderer's own path, never an app or a per-client renderer (Shankar agreed).
+- **2026-11-13, stage 5f on gpusim: suite ALL OK (28), isolation 82/82** (cloud amd64
+  VM, TCG, queue-fd kmods). First run failed 9 + 11 checks: the suites' synchronous
+  helper waited on a syncobj, but on gpusim the blob is the ring and a syncobj signals
+  only from an interrupting EOP the ring itself carries, so plain rings never signalled
+  (`EAGAIN` from SYNCOBJ_WAIT after the work had run). The helpers now submit without a
+  syncobj on gpusim, as the old SUBMIT did; on silicon the kernel ends every blob with
+  its own EOP, so they wait on one there. Runner: `gpu-stage-run.sh
+  <pci>,<gpu>,<si test>,<suite>,<iso> 5f` runs si-client-test, then
+  `/root/atrium-gpu-test` and `/root/test-gpu-isolation`.

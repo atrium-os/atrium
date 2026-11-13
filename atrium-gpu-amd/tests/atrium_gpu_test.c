@@ -298,6 +298,19 @@ submit_va(int fd, int vm, uint64_t va, uint32_t n, uint32_t engine)
 	struct atrium_gpu_syncobj_wait wt;
 	int q, so, r = 0;
 
+	/* gpusim: the blob is the ring, and a syncobj signals only from an
+	 * interrupting EOP the ring carries; submit without one, as the old
+	 * SUBMIT did (silicon ends every blob with the kernel's own EOP). */
+	if (!g_si) {
+		if ((q = queue_new(vm, engine)) < 0)
+			return (-1);
+		r = queue_submit(q, va, n, -1, 0);
+		if (r != 0)
+			r = errno;
+		close(q);
+		errno = r;
+		return (r == 0 ? 0 : -1);
+	}
 	if ((so = syncobj_new(fd)) < 0)
 		return (-1);
 	if ((q = queue_new(vm, engine)) < 0 || queue_submit(q, va, n, so, 1) != 0)

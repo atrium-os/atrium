@@ -250,14 +250,27 @@ submit_so(int fd __unused, int vm, uint64_t va, uint32_t n, uint32_t engine,
 	return (0);
 }
 
-/* Submit on a queue of its own and wait (up to 5 s) for the work to finish:
- * the old SUBMIT's synchronous use. 0 or the errno. */
+/*
+ * Submit on a queue of its own and let the work finish: the old SUBMIT's
+ * synchronous use. 0 or the errno. On silicon the kernel ends every blob
+ * with its own end-of-pipe, so we wait (up to 5 s) on a syncobj. On gpusim
+ * the blob is the ring and a syncobj signals only from an interrupting EOP
+ * the ring itself carries, so, as with the old SUBMIT, we submit without
+ * one: the engine queue runs it before the next submit or BO access.
+ */
 static int
 submit(int fd, int vm, uint64_t va, uint32_t n, uint32_t engine)
 {
 	struct atrium_gpu_syncobj_wait w;
 	int q, so, err;
 
+	if (!g_si) {
+		if ((q = queue_new(vm, engine)) < 0)
+			return (errno);
+		err = queue_submit(q, va, n, -1, 0);
+		close(q);
+		return (err);
+	}
 	so = syncobj_new(fd);
 	if ((q = queue_new(vm, engine)) < 0)
 		err = errno;
