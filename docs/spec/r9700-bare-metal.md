@@ -1371,3 +1371,17 @@ work (self-test, scrub).
   Fix (kmods de56be23): one mutex across the HDP flush and both hubs' engine-17
   invalidation. c8561e42's eviction unmap stays. Logs: claude/project-thread-33aauq
   aea5d54a.
+- **2026-11-13 14:00, full suite with de56be23 (serialised invalidation): still
+  WEDGED, same picture.** 70 passed, 2 failed, 173 timeouts, none with a mismatched
+  mask any more. The first timeout is still the first flush after REMOVE_QUEUE.
+  **Correction to the QFIRST reading.** Going back over all 13 runs of the day, one
+  register predicts the wedge every time: CP_CPF_STATUS in the snapshot right
+  after the wave kill. Bit 28 was set (0xb0000001, once 0xb8008001) before every
+  wedge, and clear (0xa8008001, 0xa0000001, 0) after every recovery, QFIRST's
+  included. QFIRST and SKIP 9-12 differ only after the fault and got 0xa8008001
+  and 0xb8008001. So the teardown order did not matter: whether the CP front end
+  is left in that state at the kill decides it, and the next invalidation then
+  never acks. c8561e42 is reverted (041ce9b9); the mutex stays.
+  Next: a diagnostic kmod that, after the wave kill, decodes CPF_STATUS and the
+  CPF/CPC stall registers and polls whether bit 28 clears by itself, to find
+  what the CP front end is waiting on. Logs: claude/project-thread-33aauq 0a5dd03c.
