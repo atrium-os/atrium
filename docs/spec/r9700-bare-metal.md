@@ -1030,7 +1030,7 @@ work (self-test, scrub).
   Logs: branch claude/project-thread-33aauq, commit 16d37a66.
   Open: the unrouted 0x18000000 EOP (one per IH instance); hostile-PM4 policy;
   reset-path leaks; crash dumps need a dump device on Atrium's disk.
-- **2026-11-13 08:00, security gate step 1: the hostile-PM4 test is ready (98ba0daa).**
+- **2026-11-13 08:00, security gate step 1: the hostile-PM4 test is ready (4efb65df).**
   si-client-test 14 (silicon only) aims client packets at registers only the kernel
   may touch. It takes them from `dev.atrium_gpu_amd_pci.0.si_protected_regs`, which
   the kernel builds from its per-IP tables:
@@ -1047,3 +1047,6 @@ work (self-test, scrub).
   `isolation.cp_errors`. Risk on the box: if a refused packet leaves a stuck HQD, each
   refusal costs a whole-GPU re-init. The test stops after 2 (the cap is 3 per 10 min),
   and its last check reports whether any were needed.
+  On gpusim with these kmods, atrium_gpu_test and test_gpu_isolation are ALL OK, and
+  test 14 skips (no silicon). Box artifacts: atrium_gpu_amd.ko 43c9d76a…,
+  atrium_gpu_amd_pci.ko 5849b6c7…, si-client-test 7e0c21dc….
