@@ -1162,3 +1162,25 @@ work (self-test, scrub).
   The rest fail there, as tests 1-8 do, because si-client-test is silicon only.
   test_gpu_isolation already passed on silicon in stage 5f (07:30). Box artifacts:
   si-client-test e7073da3…, kmods 4e443a80 unchanged, xfer 1b71cafd.
+- **2026-11-13 10:35, hostile ISA on the box (si-client-test e7073da3, kmods
+  4e443a80): the hostile shaders are contained, but afterwards the GPU stays busy.**
+  74 passed, 3 failed.
+  - The endless shader was lost with EIO at 5049 ms (hang_ms). Its waves were killed
+    and its fence landed. The bystander's page was untouched and it ran clean. No
+    re-init was needed.
+  - The store to VA 0 was lost at once with a TCP fault: WALKER_ERROR 0x6,
+    MAPPING_ERROR 1. Earlier faults at mapped-range VAs show WALKER_ERROR 0. The
+    bystander was untouched and clean.
+  - From then on the SMU reported gfx busy at 100% with no work queued. Every
+    context flush (VMID unbind) timed out (60), and new VMs could not be set up, so
+    the last two test 15 cases and test 14 failed at setup. The card was NOT idle at
+    detach, and the mode 1 reset at detach cleaned it.
+  - Left running, the busy watchdog would have reset the card and marked it lost: a
+    client could take the GPU down.
+  Diagnostics a8840b9a:
+  - Test 15 now runs one case at a time (high VA, past its buffer, endless, VA 0
+    last), each followed by a fresh VM. It stops at the first case that breaks.
+  - A flush timeout logs the hub's INV_REQ/ACK, semaphore and fault state.
+  - The CP/GRBM state is logged right after every wave kill.
+  gpusim suites ALL OK. Box artifacts: pci f8adbc34…, gpu c167c776…, display
+  3d9cea12…, si-client-test d59eb2d8…. Logs: claude/project-thread-33aauq 2a4171dd.
