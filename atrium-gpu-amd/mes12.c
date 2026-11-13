@@ -418,7 +418,7 @@ mes_report(struct mes *m, const char *when)
 
 /* MES pipe 0's program counter (GRBM-selected). */
 static uint32_t
-mes_pc0(struct mes *m)
+mes_pc0(struct mes *m) __unused
 {
 	uint32_t v;
 
@@ -438,9 +438,10 @@ cp_snap(struct mes *m, const char *when)
 {
 	const struct mes_gen *g = m->g;
 
-	device_printf(m->sc->dev, "mes: %s: MES pipe 0 PC %#x, CP_CPF_STATUS "
+	/* No MES PC: reading it needs a GRBM select (run 3b6c6dfc). */
+	device_printf(m->sc->dev, "mes: %s: CP_CPF_STATUS "
 	    "%#x, CP_CPC_STATUS %#x, CP_CPC_BUSY_STAT %#x/%#x, GRBM_STATUS2 "
-	    "%#x, RLC_GPM_STAT %#x, GCVM_L2_STATUS %#x\n", when, mes_pc0(m),
+	    "%#x, RLC_GPM_STAT %#x, GCVM_L2_STATUS %#x\n", when,
 	    rd(m, g->cp_cpf_status), rd(m, g->cp_cpc_status),
 	    rd(m, g->cp_cpc_busy), rd(m, g->cp_cpc_busy2),
 	    rd(m, g->grbm_status2), rd(m, g->rlc_gpm_stat),
@@ -3174,9 +3175,9 @@ amd_mes12_uq_evict(struct amd_uq *q)
 			    "killed (%d); fence %s after %u us\n", q->slot,
 			    vmid, err, uq2_done(q) ? "landed" : "still behind",
 			    us);
-			/* Box run 1b71cafd: the GPU stayed busy after a
-			 * hostile shader's kill; where it is busy. */
-			mes_report(m, "after the wave kill");
+			/* Box run 1b71cafd added mes_report here; it GRBM-
+			 * selects the MES pipes, which run 3b6c6dfc suspects
+			 * of the wedge: not while MES runs. */
 			cp_stall_watch(m, "after the wave kill", 500);
 		}
 	}
