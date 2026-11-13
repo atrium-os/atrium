@@ -1,0 +1,10 @@
+[package]
+name = "aura-ipc"
+version = "0.1.0"
+description = "The line protocol between aura-mlme, aura-keys and atrium-net/aura-ctl (docs/spec/wifi.md §3.4): one bounded line per message, `verb key=value ...`, binary values in hex."
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+zeroize = "1"
+libc = "0.2"

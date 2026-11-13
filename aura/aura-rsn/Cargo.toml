@@ -1,0 +1,17 @@
+[package]
+name = "aura-rsn"
+version = "0.1.0"
+description = "Aura's RSN pieces (docs/spec/wifi.md §3.4): PSK/PTK derivation, RSNE, EAPOL-Key frames, and the supplicant side of the 4-way and group key handshakes. No I/O."
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+aes = "0.8"
+aes-kw = "0.2"
+cmac = "0.7"
+hmac = "0.12"
+sha1 = "0.10"
+sha2 = "0.10"
+pbkdf2 = { version = "0.12", default-features = false, features = ["hmac"] }
+subtle = "2"
+zeroize = { version = "1", features = ["zeroize_derive"] }

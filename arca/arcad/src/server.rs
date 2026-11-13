@@ -295,9 +295,10 @@ impl State {
                 let value = field!(r.bytes(caps::VALUE));
                 field!(r.end());
                 let Ok(kind) = Kind::from_u16(kind) else { return malformed() };
-                if kind.shape() != Shape::Bearer || kind == Kind::BluetoothKey {
+                if kind.shape() != Shape::Bearer || matches!(kind, Kind::BluetoothKey | Kind::WifiCredential) {
                     // Keys are minted inside Arca, never imported by an app;
-                    // bond keys are the machine store's (§6.4).
+                    // bond keys and Wi-Fi credentials are the machine
+                    // store's (§6.4).
                     return reply(status::UNSUPPORTED);
                 }
                 let m = tri!(store.add(NewItem {

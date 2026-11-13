@@ -1,0 +1,14 @@
+[package]
+name = "aura-keys"
+version = "0.1.0"
+description = "Aura's key daemon (docs/spec/wifi.md §8.3): runs the 4-way and group handshakes on /dev/aura/keyN, installs keys, opens the controlled port. The only Aura piece that sees a password; credentials come from Arca's machine store."
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+aura-proto = { path = "../aura-proto" }
+aura-rsn = { path = "../aura-rsn" }
+aura-ipc = { path = "../aura-ipc" }
+libc = "0.2"
+getrandom = "0.2"
+zeroize = "1"

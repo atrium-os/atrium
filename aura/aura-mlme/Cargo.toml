@@ -1,0 +1,13 @@
+[package]
+name = "aura-mlme"
+version = "0.1.0"
+description = "Aura's MLME daemon (docs/spec/wifi.md §3.4, §8.3): scans, parses beacons and every IE, authenticates and associates, enforces PMF on management frames. Holds no secrets; jailed."
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+aura-proto = { path = "../aura-proto" }
+aura-rsn = { path = "../aura-rsn" }
+aura-ipc = { path = "../aura-ipc" }
+libc = "0.2"
+getrandom = "0.2"

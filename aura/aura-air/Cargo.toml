@@ -1,0 +1,13 @@
+[package]
+name = "aura-air"
+version = "0.1.0"
+description = "Test only: the FreeBSD half of Aura's simulated air. Plays radio firmware for aura_sim.ko (scan, channel, CCMP, BIP) and exchanges 802.11 frames over UDP with air-hwsim.py beside hostapd (docs/spec/wifi.md §6.2)."
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+aura-proto = { path = "../aura-proto" }
+aes = "0.8"
+ccm = "0.5"
+cmac = "0.7"
+libc = "0.2"

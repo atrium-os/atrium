@@ -8,6 +8,12 @@ members = [
     "aura-proto",
     "aura-wlan-core",
     "aura-sim-check",
+    "aura-rsn",
+    "aura-air",
+    "aura-ipc",
+    "aura-mlme",
+    "aura-keys",
+    "aura-ctl",
 ]
 
 [workspace.package]

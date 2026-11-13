@@ -1,0 +1,10 @@
+[package]
+name = "aura-ctl"
+version = "0.1.0"
+description = "Command-line stand-in for atrium-net's Wi-Fi side (docs/spec/wifi.md §3.5): remember/forget networks, scan, join, leave, status; runs DHCP once the port is authorized."
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+aura-ipc = { path = "../aura-ipc" }
+zeroize = "1"
