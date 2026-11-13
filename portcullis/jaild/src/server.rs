@@ -671,6 +671,7 @@ fn handle_remove(
 
     /* Capture alias + path info before we drop the record. */
     let alias_addr = record_idx.and_then(|i| state.jails[i].lo0_alias.clone());
+    let fuse_mount = record_idx.and_then(|i| state.jails[i].fuse_mount.clone());
     let jail_path = record_idx.map(|i| state.jails[i].path.clone());
 
     /* Resolve the jid for the actual jail_remove syscall. If we
@@ -711,6 +712,13 @@ fn handle_remove(
                 }
             }
         }
+    }
+
+    /* A FUSE mount jaild made for the jail: forced, since its server is gone
+     * (or going) and a reader may still hold a file open on it. */
+    if let Some(m) = fuse_mount.as_deref() {
+        ffi::unmount_force_quiet(m);
+        let _ = std::fs::remove_dir(m);
     }
 
     /* ★ A Routed jail's network: destroy its epair and free the /30. The jail
@@ -1230,6 +1238,39 @@ fn create_routed(
     Ok(jid)
 }
 
+/// Open the partition and `/dev/fuse` for a FUSE-serving jail and mount
+/// fusefs on its mountpoint, before anything runs (device-assignment.md
+/// §6.4). The validator has checked device and mountpoint against the pin.
+/// Returns the two descriptors for the child's fd 3 and fd 4.
+fn fuse_prepare(f: &crate::protocol::FuseServe) -> Result<(OwnedFd, OwnedFd), JaildError> {
+    let sys = |name: &'static str, e: std::io::Error| JaildError::Syscall {
+        name, errno: e.raw_os_error().unwrap_or(-1), msg: format!("{e}"),
+    };
+    if let Err(e) = ffi::kld_ensure("fusefs") {
+        warn!("jaild: kldload fusefs: {e} (the mount will say whether it matters)");
+    }
+    let dev = std::fs::OpenOptions::new()
+        .read(true)
+        .write(!f.read_only)
+        .open(format!("/dev/{}", f.device))
+        .map_err(|e| sys("open device", e))?;
+    let fusefd = std::fs::OpenOptions::new().read(true).write(true).open("/dev/fuse")
+        .map_err(|e| sys("open /dev/fuse", e))?;
+    match std::fs::create_dir(&f.mountpoint) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+            // A mount left by a server that died without a RemoveJail.
+            ffi::unmount_force_quiet(&f.mountpoint);
+        }
+        Err(e) => return Err(sys("mkdir mountpoint", e)),
+    }
+    use std::os::unix::io::AsRawFd;
+    ffi::fusefs_mount(&f.mountpoint, fusefd.as_raw_fd(), f.read_only, &format!("capsa:{}", f.device))
+        .map_err(|e| sys("nmount fusefs", e))?;
+    info!("jaild: fusefs on {} for /dev/{}{}", f.mountpoint, f.device, if f.read_only { " (ro)" } else { "" });
+    Ok((OwnedFd::from(dev), OwnedFd::from(fusefd)))
+}
+
 fn handle_create_with_exec(
     req:         &CreateJailRequest,
     exec:        &ExecSpec,
@@ -1267,11 +1308,26 @@ fn handle_create_with_exec(
         })
         .collect();
 
-    let pdf = ffi::pdfork().map_err(|e| JaildError::Syscall {
-        name:  "pdfork",
-        errno: e.raw_os_error().unwrap_or(-1),
-        msg:   format!("{e}"),
-    })?;
+    /* ★ FUSE serving (device-assignment.md §6.4): jaild, not the jail, opens
+     * the partition and /dev/fuse and mounts fusefs on the host. The jailed
+     * server only ever holds the two descriptors (fd 3 and fd 4): no device
+     * node in its devfs, no allow.mount, and the mountpoint is the pin's. */
+    let fuse = match &req.fuse {
+        Some(f) => Some(fuse_prepare(f)?),
+        None => None,
+    };
+
+    let pdf = match ffi::pdfork() {
+        Ok(p) => p,
+        Err(e) => {
+            if let Some(f) = &req.fuse { ffi::unmount_force_quiet(&f.mountpoint); }
+            return Err(JaildError::Syscall {
+                name:  "pdfork",
+                errno: e.raw_os_error().unwrap_or(-1),
+                msg:   format!("{e}"),
+            });
+        }
+    };
 
     if pdf.pid == 0 {
         /* ====== child ====== */
@@ -1292,6 +1348,14 @@ fn handle_create_with_exec(
                 [fds[0].as_raw_fd(), fds[1].as_raw_fd(), fds[2].as_raw_fd()])
             {
                 eprintln!("jaild-child[{}]: install caller stdio: {e}", req.name);
+                ffi::child_exit(105);
+            }
+        }
+
+        if let Some((dev, fusefd)) = &fuse {
+            use std::os::unix::io::AsRawFd;
+            if let Err(e) = ffi::install_child_fds(&[dev.as_raw_fd(), fusefd.as_raw_fd()]) {
+                eprintln!("jaild-child[{}]: install fuse fds: {e}", req.name);
                 ffi::child_exit(105);
             }
         }
@@ -1374,6 +1438,8 @@ fn handle_create_with_exec(
     /* The child holds the caller's stdio now; jaild's copies must go, or the
      * broker's end would never see EOF when the worker exits. */
     drop(stdio);
+    /* Likewise the partition and /dev/fuse: the server holds them now. */
+    drop(fuse);
     /* ★ A pre-created (Routed) jail was made persistent so it could be
      * networked before anything ran in it. Clear that now, so it dies with its
      * processes exactly like a create-and-attach jail. If the child has
@@ -1391,6 +1457,9 @@ fn handle_create_with_exec(
      * cleanup at RemoveJail. Exec'd jails use jid sentinel 0;
      * handle_remove special-cases this. */
     state.add_exec(&req.name, pre_created.unwrap_or(0), lo0_alias, &req.path, exec.uid, exec.gid);
+    if let (Some(f), Some(r)) = (&req.fuse, state.jails.last_mut()) {
+        r.fuse_mount = Some(f.mountpoint.clone());
+    }
     if let Err(e) = state.save(state_path) {
         warn!("jaild: state save after exec'd-jail create: {e}");
     }

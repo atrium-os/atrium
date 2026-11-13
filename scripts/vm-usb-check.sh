@@ -86,6 +86,7 @@ devfs rule -s 29 add include 1 && devfs rule -s 29 add include 2
 cp $P.usbtest-bak $P
 sed -i '' 's/^allowed_ids = \[\(.*\)\]/allowed_ids = [\1, 29]/' $P
 sed -i '' 's/^allowed_system_uids = \[/allowed_system_uids = [ 65060,/' $P
+sed -i '' 's/^allowed_system_gids = \[/allowed_system_gids = [ 65060,/' $P
 cat >> $P <<'EOP'
 
 # vm-usb-check.sh only (removed at the end).
@@ -99,6 +100,7 @@ grant_nodes = ["ugen#.#", "usb/#.#.0"]
 EOP
 grep -q '^allowed_ids = .*29\]' $P && echo "  ok policy allows ruleset 29" || echo "  FAIL could not add 29 to allowed_ids"
 grep -q '^allowed_system_uids = \[ 65060,' $P && echo "  ok policy allows uid 65060" || echo "  FAIL could not add 65060 to allowed_system_uids"
+grep -q '^allowed_system_gids = \[ 65060,' $P && echo "  ok policy allows gid 65060" || echo "  FAIL could not add 65060 to allowed_system_gids"
 cat > /usr/local/etc/atrium/devices.d/90-usbtest.toml <<'EOR'
 [[rule]]
 name          = "usbtest-audio"

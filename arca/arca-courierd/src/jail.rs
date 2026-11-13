@@ -138,6 +138,7 @@ fn start(cfg: &Config, uid: u32, root: &Path, port: u16, addrs: &[Ipv4Addr]) -> 
         syscall_profile: None,
         devfs_grant: None,
         devfs_grants: vec![],
+        fuse: None,
     });
 
     let (app, courier) = std::os::unix::net::UnixStream::pair().map_err(|e| format!("socketpair: {e}"))?;

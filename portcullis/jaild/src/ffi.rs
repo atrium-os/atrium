@@ -795,6 +795,112 @@ pub fn grant_name_ok(node: &str) -> bool {
         })
 }
 
+/// Mount fusefs at `target`, served over `fuse_fd` — an open `/dev/fuse`
+/// in THIS process (the kernel looks the descriptor up in the caller's fd
+/// table). The way mount_fusefs(8) does it, minus the fork: the mount returns
+/// before the daemon answers FUSE_INIT, and file access waits for it.
+/// `allow_other` because the mount is jaild's (root) and the readers are the
+/// user's apps; `default_permissions` so the kernel checks the modes the
+/// server reports (device-assignment.md §6.4).
+#[cfg(target_os = "freebsd")]
+pub fn fusefs_mount(target: &str, fuse_fd: i32, read_only: bool, fsname: &str) -> io::Result<()> {
+    let opts: [(&str, Option<String>); 7] = [
+        ("fstype", Some("fusefs".into())),
+        ("fspath", Some(target.into())),
+        ("from", Some("/dev/fuse".into())),
+        ("fd", Some(fuse_fd.to_string())),
+        ("fsname", Some(fsname.into())),
+        ("allow_other", None),
+        ("default_permissions", None),
+    ];
+    let mut strs: Vec<CString> = Vec::new();
+    for (k, v) in &opts {
+        strs.push(c_string(k)?);
+        if let Some(v) = v { strs.push(c_string(v)?); }
+    }
+    let mut iov: Vec<libc::iovec> = Vec::new();
+    let mut it = strs.iter();
+    for (_, v) in &opts {
+        let k = it.next().expect("key");
+        iov.push(libc::iovec { iov_base: k.as_ptr() as *mut _, iov_len: k.as_bytes_with_nul().len() });
+        match v {
+            Some(_) => {
+                let c = it.next().expect("value");
+                iov.push(libc::iovec { iov_base: c.as_ptr() as *mut _, iov_len: c.as_bytes_with_nul().len() });
+            }
+            // A flag option: present, no value (build_iovec(.., NULL, 0)).
+            None => iov.push(libc::iovec { iov_base: std::ptr::null_mut(), iov_len: 0 }),
+        }
+    }
+    let flags = if read_only { libc::MNT_RDONLY } else { 0 } | libc::MNT_NOSUID;
+    // SAFETY: each non-null iov_base points into a CString in `strs`, which
+    // outlives nmount.
+    #[allow(unsafe_code)]
+    let rc = unsafe { libc::nmount(iov.as_mut_ptr(), iov.len() as u32, flags as i32) };
+    if rc < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
+}
+#[cfg(not(target_os = "freebsd"))]
+pub fn fusefs_mount(_t: &str, _fd: i32, _ro: bool, _fsname: &str) -> io::Result<()> {
+    Err(io::Error::new(io::ErrorKind::Unsupported, "nmount: FreeBSD only"))
+}
+
+/// Load a kernel module unless it is loaded already (`kldload -n`).
+#[cfg(target_os = "freebsd")]
+pub fn kld_ensure(name: &str) -> io::Result<()> {
+    extern "C" {
+        fn kldfind(file: *const libc::c_char) -> libc::c_int;
+        fn kldload(file: *const libc::c_char) -> libc::c_int;
+    }
+    let c = c_string(name)?;
+    // SAFETY: c is a valid NUL-terminated string.
+    #[allow(unsafe_code)]
+    unsafe {
+        if kldfind(c.as_ptr()) >= 0 || kldload(c.as_ptr()) >= 0 {
+            return Ok(());
+        }
+    }
+    let e = io::Error::last_os_error();
+    if e.raw_os_error() == Some(libc::EEXIST) { Ok(()) } else { Err(e) }
+}
+#[cfg(not(target_os = "freebsd"))]
+pub fn kld_ensure(_name: &str) -> io::Result<()> {
+    Err(io::Error::new(io::ErrorKind::Unsupported, "kldload: FreeBSD only"))
+}
+
+/// Forced unmount, ignoring errors: a FUSE mount whose server is gone would
+/// otherwise refuse a plain unmount while anything holds it open.
+pub fn unmount_force_quiet(path: &str) {
+    if let Ok(c) = CString::new(path) {
+        // SAFETY: c is a valid NUL-terminated path.
+        #[allow(unsafe_code)]
+        let _ = unsafe { libc::unmount(c.as_ptr(), libc::MNT_FORCE) };
+    }
+}
+
+/// Put `fds` at 3, 4, … in the calling (child) process, without CLOEXEC, so
+/// an exec'd program finds them there. Each is first copied to 64 and up, so
+/// a source already sitting on one of the targets is never clobbered.
+pub fn install_child_fds(fds: &[i32]) -> io::Result<()> {
+    let mut high = Vec::with_capacity(fds.len());
+    for &fd in fds {
+        // SAFETY: fcntl on an fd this process owns.
+        #[allow(unsafe_code)]
+        let h = unsafe { libc::fcntl(fd, libc::F_DUPFD_CLOEXEC, 64) };
+        if h < 0 { return Err(io::Error::last_os_error()); }
+        high.push(h);
+    }
+    for (i, &h) in high.iter().enumerate() {
+        // SAFETY: dup2 onto a fixed low slot; dup2 clears FD_CLOEXEC there.
+        #[allow(unsafe_code)]
+        let r = unsafe { libc::dup2(h, 3 + i as i32) };
+        if r < 0 { return Err(io::Error::last_os_error()); }
+    }
+    Ok(())
+}
+
 /// Unmount, ignoring errors (cleanup after a failed create).
 pub fn unmount_quiet(path: &str) {
     if let Ok(c) = CString::new(path) {

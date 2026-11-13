@@ -263,7 +263,7 @@ pub struct DevfsRulesets {
     pub pinned: Vec<PinnedRuleset>,
 }
 
-#[derive(Debug, Deserialize, Serialize, Clone)]
+#[derive(Debug, Deserialize, Serialize, Clone, Default)]
 pub struct PinnedRuleset {
     pub id:        u32,
     pub jail_name: String,
@@ -283,6 +283,15 @@ pub struct PinnedRuleset {
     /// `ugen#.#`, `usb/#.#.0`). Empty: no grants on this ruleset.
     #[serde(default)]
     pub grant_nodes: Vec<String>,
+    /// Block devices (relative to `/dev`, `#` patterns as in `grant_nodes`:
+    /// `da#p#`, `da#s#`) a request on this ruleset may have jaild open and
+    /// serve over FUSE (device-assignment.md §6.4). Empty: no FUSE serving.
+    #[serde(default)]
+    pub fuse_devices: Vec<String>,
+    /// Directory every FUSE mountpoint of this pin lives directly under,
+    /// e.g. `/media`. Required with `fuse_devices`.
+    #[serde(default)]
+    pub fuse_mount_prefix: Option<String>,
 }
 
 impl PinnedRuleset {
@@ -298,6 +307,16 @@ impl PinnedRuleset {
     /// May a request on this ruleset show `node` (`hidraw3`, `usb/0.2.0`)?
     pub fn allows_grant(&self, node: &str) -> bool {
         self.grant_nodes.iter().any(|pat| grant_matches(pat, node))
+    }
+
+    /// May a request on this ruleset serve `device` over FUSE at `mnt`? The
+    /// mountpoint must be one plain component directly under the prefix.
+    pub fn allows_fuse(&self, device: &str, mnt: &str) -> bool {
+        let Some(prefix) = self.fuse_mount_prefix.as_deref() else { return false };
+        let leaf = mnt.strip_prefix(prefix.trim_end_matches('/')).and_then(|r| r.strip_prefix('/'));
+        let leaf_ok = leaf.is_some_and(|l| !l.is_empty() && l.len() <= 64 && !l.starts_with('.')
+            && l.bytes().all(|b| b.is_ascii_alphanumeric() || b"-_.".contains(&b)));
+        leaf_ok && prefix.starts_with('/') && self.fuse_devices.iter().any(|pat| grant_matches(pat, device))
     }
 }
 

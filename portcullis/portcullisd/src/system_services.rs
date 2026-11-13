@@ -482,6 +482,7 @@ impl ServiceManifest {
             syscall_profile: None,
             devfs_grant: None,
             devfs_grants: vec![],
+            fuse: None,
         }
     }
 }

@@ -71,6 +71,7 @@ fn main() -> ExitCode {
                 syscall_profile: None,
                 devfs_grant: None,
                 devfs_grants: vec![],
+                fuse: None,
             })
         }
         "remove" => {
@@ -114,6 +115,7 @@ fn main() -> ExitCode {
                 syscall_profile: None,
                 devfs_grant: None,
                 devfs_grants: vec![],
+                fuse: None,
             })
         }
         "attach" => {

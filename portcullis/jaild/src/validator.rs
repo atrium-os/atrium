@@ -287,6 +287,12 @@ fn validate_devfs_pin(req: &CreateJailRequest, policy: &Policy) -> Result<(), Ja
         });
     }
     let Some(pin) = policy.devfs_rulesets.pin(req.devfs_ruleset) else {
+        if req.fuse.is_some() {
+            return Err(JaildError::PolicyViolation {
+                rule:   "fuse.unpinned",
+                detail: format!("fuse needs a pinned ruleset; {} is not", req.devfs_ruleset),
+            });
+        }
         if let Some(node) = &req.devfs_grant {
             return Err(JaildError::PolicyViolation {
                 rule:   "devfs_grant.unpinned",
@@ -306,6 +312,12 @@ fn validate_devfs_pin(req: &CreateJailRequest, policy: &Policy) -> Result<(), Ja
     for node in req.devfs_grant.iter().chain(&req.devfs_grants) {
         if !pin.allows_grant(node) {
             return deny(format!("devfs_grant {node:?} is not one of {:?}", pin.grant_nodes));
+        }
+    }
+    if let Some(f) = &req.fuse {
+        if !pin.allows_fuse(&f.device, &f.mountpoint) {
+            return deny(format!("fuse {:?} on {:?} is not one of {:?} under {:?}",
+                f.device, f.mountpoint, pin.fuse_devices, pin.fuse_mount_prefix));
         }
     }
     if req.children_max != 0 {
@@ -765,6 +777,7 @@ mod tests {
             syscall_profile: None,
             devfs_grant: None,
             devfs_grants: vec![],
+            fuse: None,
         };
         validate_create(&req, &p).unwrap();
     }
@@ -793,6 +806,7 @@ mod tests {
             syscall_profile: None,
             devfs_grant: None,
             devfs_grants: vec![],
+            fuse: None,
         }
     }
 
@@ -987,6 +1001,7 @@ mod tests {
             syscall_profile: None,
             devfs_grant: None,
             devfs_grants: vec![],
+            fuse: None,
         };
         let err = validate_create(&req, &p).unwrap_err();
         match err {
@@ -1012,6 +1027,7 @@ mod tests {
             syscall_profile: None,
             devfs_grant: None,
             devfs_grants: vec![],
+            fuse: None,
         }
     }
 
@@ -1357,6 +1373,7 @@ mod tests {
             leases: vec!["dev.atrium_gpu_amd_display.0.lease".into()],
             name_prefix: false,
             grant_nodes: vec![],
+            ..Default::default()
         }];
         p
     }
@@ -1406,6 +1423,7 @@ mod tests {
             leases: vec![],
             name_prefix: true,
             grant_nodes: vec!["hidraw#".into(), "u2f/#".into()],
+            ..Default::default()
         });
         let bin = "/usr/local/bin/atrium-sigillum-fido";
         let req = |name: &str, node: Option<&str>| {
@@ -1446,6 +1464,7 @@ mod tests {
             leases: vec![],
             name_prefix: true,
             grant_nodes: vec!["ugen#.#".into(), "usb/#.#.0".into()],
+            ..Default::default()
         });
         let req = |first: Option<&str>, more: &[&str]| {
             let mut r = frescod_req("atrium-x-usb-0-2-0", "/usr/local/bin/atrium-x-usb", 65040);
@@ -1463,6 +1482,44 @@ mod tests {
         let mut r = req(Some("ugen0.2"), &["usb/0.2.0"]);
         r.devfs_ruleset = 21;
         assert!(refused(r), "unpinned");
+    }
+
+    /// FUSE serving (device-assignment.md §6.4): only a pin naming the
+    /// device pattern, only directly under its prefix, never unpinned.
+    #[test]
+    fn fuse_serving_is_pinned() {
+        let mut p = pinned_policy();
+        p.devfs_rulesets.allowed_ids.push(28);
+        p.devfs_rulesets.pinned.push(jaild_policy::PinnedRuleset {
+            id: 28,
+            jail_name: "atrium-capsa-".into(),
+            exec_path: "/usr/local/bin/atrium-capsa-fuse".into(),
+            uid: 65070,
+            name_prefix: true,
+            fuse_devices: vec!["da#p#".into(), "da#s#".into(), "da#".into()],
+            fuse_mount_prefix: Some("/media".into()),
+            ..Default::default()
+        });
+        let req = |dev: &str, mnt: &str| {
+            let mut r = frescod_req("atrium-capsa-da0p1", "/usr/local/bin/atrium-capsa-fuse", 65070);
+            r.devfs_ruleset = 28;
+            r.fuse = Some(crate::protocol::FuseServe { device: dev.into(), mountpoint: mnt.into(), read_only: false });
+            r
+        };
+        validate_devfs_pin(&req("da0p1", "/media/usb-da0p1"), &p).unwrap();
+        validate_devfs_pin(&req("da12", "/media/STICK"), &p).unwrap();
+        let refused = |r: CreateJailRequest| validate_devfs_pin(&r, &p).is_err();
+        assert!(refused(req("ada0p1", "/media/x")), "an internal disk");
+        assert!(refused(req("da0p1/../ada0", "/media/x")), "a path");
+        assert!(refused(req("da0p1", "/mnt/x")), "outside the prefix");
+        assert!(refused(req("da0p1", "/media")), "the prefix itself");
+        assert!(refused(req("da0p1", "/media/a/b")), "nested");
+        assert!(refused(req("da0p1", "/media/..")), "dot-dot");
+        assert!(refused(req("da0p1", "/media/.hidden")), "leading dot");
+        assert!(refused(req("da0p1", "/mediax/y")), "a sibling of the prefix");
+        let mut r = req("da0p1", "/media/x");
+        r.devfs_ruleset = 21;
+        assert!(matches!(validate_devfs_pin(&r, &p), Err(JaildError::PolicyViolation { rule: "fuse.unpinned", .. })));
     }
 
     #[test]

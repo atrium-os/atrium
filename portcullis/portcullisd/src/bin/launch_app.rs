@@ -93,6 +93,7 @@ fn main() {
         syscall_profile: None,
         devfs_grant: None,
         devfs_grants: vec![],
+        fuse: None,
     });
     let mut c = match Client::connect(JAILD_SOCK) {
         Ok(c) => c,

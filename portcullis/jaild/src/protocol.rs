@@ -331,6 +331,28 @@ pub struct CreateJailRequest {
     /// pin's `grant_nodes`, and needs `devfs_grant` set; at most 7.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub devfs_grants: Vec<String>,
+
+    /// Serve a FUSE filesystem from this jail (device-assignment.md §6.4).
+    /// jaild opens the partition and `/dev/fuse` itself, mounts fusefs on
+    /// `mountpoint` on the host with the fuse fd, and hands the jailed exec
+    /// the two descriptors as fd 3 (the partition) and fd 4 (`/dev/fuse`).
+    /// The jail never sees either node and needs no `allow.mount`. Only on a
+    /// pinned ruleset whose `fuse_devices` allow `device` and under its
+    /// `fuse_mount_prefix`; the mount goes when the jail is removed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fuse: Option<FuseServe>,
+}
+
+/// See [`CreateJailRequest::fuse`].
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+pub struct FuseServe {
+    /// The block device relative to `/dev`: `da0p1`, `da1s1`.
+    pub device:     String,
+    /// Absolute host path the filesystem appears on: `/media/usb-da0p1`.
+    pub mountpoint: String,
+    /// Open the device read-only and mount with `ro`.
+    #[serde(default)]
+    pub read_only:  bool,
 }
 
 /// One mount applied inside a jail. `source` is a path on the host
@@ -669,6 +691,7 @@ mod tests {
             syscall_profile: None,
             devfs_grant: None,
             devfs_grants: vec![],
+            fuse: None,
         });
         let bytes = serde_json::to_vec(&req).unwrap();
         let back: Request = serde_json::from_slice(&bytes).unwrap();

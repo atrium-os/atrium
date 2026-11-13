@@ -422,6 +422,7 @@ pub fn run_with_stdio(spec: &Spec, stdio: Option<[std::os::fd::OwnedFd; 3]>) -> 
         syscall_profile: Some(portcullis_jail::sysfil_class(&manifest.capabilities)),
         devfs_grant: None,
         devfs_grants: vec![],
+        fuse: None,
     });
     let outcome = run_via_jaild(&req, stdio);
 

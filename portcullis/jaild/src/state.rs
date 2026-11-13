@@ -104,6 +104,10 @@ pub struct JailRecord {
     /// tighten a capped jail and never loosen it.
     #[serde(default)]
     pub memory_ceiling_mb: Option<u64>,
+    /// A fusefs mount jaild made for this jail (`CreateJailRequest::fuse`):
+    /// force-unmounted at RemoveJail.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fuse_mount: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -209,6 +213,7 @@ impl PersistentState {
             uid,
             gid,
             memory_ceiling_mb: None,
+            fuse_mount: None,
         });
         self.written_at_unix = now_unix();
     }

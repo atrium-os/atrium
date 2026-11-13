@@ -108,6 +108,7 @@ pub fn run_init(
         syscall_profile: None,
         devfs_grant: None,
         devfs_grants: vec![],
+        fuse: None,
     });
 
     info!("{}: running init for volume {} (jail={})",
