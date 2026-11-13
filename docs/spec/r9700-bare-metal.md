@@ -989,9 +989,17 @@ work (self-test, scrub).
   - the 06:04 reboot into Ubuntu was Atrium's own fallback (/etc/rc.d/atrium_fallback),
     which re-arms on every boot; atrium-stay was run again at 06:31;
   - the box was booted once into Atrium (BootNext 0005) at 06:30.
-  Suspect, found in review: `si_recover` took the kernel queue (set c->kq to NULL)
-  before stopping the VRAM scrub engine, and `si_vram_clear` re-read c->kq at every
-  step. A scrub running during the re-init could therefore use a NULL queue and panic,
-  and if this kernel stops in the debugger on a panic, the box would sit there with
-  no ssh. Fixed in 54939f76. The console (a
-  panic or a hard hang) and the run log on Atrium's disk will confirm or rule this out.
+  The log on Atrium's disk (read from Ubuntu, read-only) shows what happened. The re-init
+  ran: mode 1 reset, sOS, TOC, 19 IP firmware loads and AUTOLOAD_RLC all went fine.
+  It then gave up on "RLC autoload NOT complete" (ETIMEDOUT). That message also
+  appears at every healthy attach, where it is ignored: the autoload completes once
+  the SMU enables its features. So the re-init failed on a healthy card, did a second
+  mode 1 reset and left the GPU lost. The last line on disk is 06:32:28; ssh died about
+  06:34. Most likely cause of the hang: the detach after the suites. Client detach
+  called `amd_ih7_set_consumer` on the IH pointer that the failed re-init had set to
+  NULL, which panics, and with no dump device the box just stops. Fixes:
+  - 54939f76: the NULL IH at client detach, and the scrub engine stopped before the
+    kernel queue is taken;
+  - next commit: the re-init treats the PSP load's result as attach does, and lets the
+    SMU start and si_up decide.
+  No crash dump: dumpdev="AUTO" has no swap partition to write to.

@@ -379,9 +379,8 @@ si_recover(struct amd_si_client *c, const char *why)
 	amd_si_lose(sc, why);		/* the reset, bus mastering off */
 	/*
 	 * The scrub engine off first: it waits out a range in progress (which
-	 * fails at once now) that still uses the kernel queue. ce098609 took
-	 * the queue first, so a running scrub could use a NULL queue (the
-	 * suspect for that box run's hang).
+	 * fails at once now) that still uses the kernel queue (ce098609 took
+	 * the queue first, so a running scrub could use a NULL queue).
 	 */
 	amd_vram_set_clear(sc, NULL);
 	mtx_lock(&sc->lock);
@@ -1578,7 +1577,9 @@ amd_si_client_down(struct atrium_amd_softc *sc)
 	device_printf(sc->dev, "si: VRAM scrub: %ju fills, %ju waits for an "
 	    "idle queue\n", (uintmax_t)c->scrub_fills,
 	    (uintmax_t)c->scrub_busy_waits);
-	if (c->ih != NULL)	/* NULL: a GPU re-init failed */
+	/* NULL after a failed GPU re-init: most likely where box run ce098609
+	 * hung (its runner detaches after the suites). */
+	if (c->ih != NULL)
 		amd_ih7_set_consumer(c->ih, NULL, NULL);
 	callout_drain(&c->uq_poll);
 	taskqueue_drain(taskqueue_thread, &c->uq_task);

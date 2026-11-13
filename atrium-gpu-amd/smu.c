@@ -1168,11 +1168,20 @@ amd_si_reinit(struct atrium_amd_softc *sc)
 	pci_enable_busmaster(sc->dev);
 	si->dma_off = false;
 	si->link.failed = false;
+	/*
+	 * As at attach (pci.c), the PSP load's result is not the verdict: its
+	 * RLC autoload completes only once the SMU has enabled its features
+	 * (smu_start), so the load reports "NOT complete" (ETIMEDOUT) on every
+	 * healthy bring-up. Box run ce098609 gave up here on a healthy card.
+	 * si_up's dispatch self-test and idle proof decide.
+	 */
 	err = amd_psp_bootload_on(sc, si->vram);
-	if (err == 0) {
-		step = "SMU start and idle proof";
-		err = smu_start(&si->link, si->vram, si->table_mc, &si->ifver);
-	}
+	if (err != 0)
+		device_printf(sc->dev, "si: re-init: PSP load returned %d "
+		    "(as at attach; the SMU start completes the RLC "
+		    "autoload)\n", err);
+	step = "SMU start and idle proof";
+	err = smu_start(&si->link, si->vram, si->table_mc, &si->ifver);
 	if (err == 0)
 		err = si_up(si, false, &step);
 	if (err != 0) {
