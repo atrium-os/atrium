@@ -142,7 +142,7 @@ done
 allow_rctl = true
 ' \$P
     else printf '\n[resource_control]\nallow_rctl = true\n' >> \$P; fi
-    service atrium_jaild restart >/dev/null 2>&1; sleep 2
+    service atrium-jaild restart >/dev/null 2>&1; sleep 2
     # The app launcher on the socket a net-fetch app's jail sees
     # (/atrium/sockets/portcullis/, mounted by the capability).
     pkill -x portcullisd; sleep 1; mkdir -p /atrium/sockets/portcullis; rm -f $PSOCK

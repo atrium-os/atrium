@@ -75,7 +75,7 @@ $SCP "$ROOT"/hospes/test-cdm/vectors/* root@localhost:$W/vectors/ >/dev/null || 
 allow_rctl = true
 ' \$P
     else printf '\n[resource_control]\nallow_rctl = true\n' >> \$P; fi
-    service atrium_jaild restart >/dev/null 2>&1; sleep 2
+    service atrium-jaild restart >/dev/null 2>&1; sleep 2
     kldstat | grep -q hospes_trap || kldload $W/hospes_trap.ko
     pkill -x portcullisd; sleep 1; mkdir -p /atrium/sockets/portcullis; rm -f $PSOCK
     daemon -f -o $PLOG /usr/local/bin/portcullisd --socket $PSOCK; sleep 3

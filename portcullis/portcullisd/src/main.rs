@@ -714,10 +714,16 @@ fn handle_exec_instance(
         // The worker's own status (jaild reaps it); None = killed by a signal.
         portcullis_oneshot::OneShot::Exit { code, .. } =>
             Response::LaunchExit { code },
-        portcullis_oneshot::OneShot::Refused(why) =>
-            Response::LaunchFailed { stage: "refused".into(), message: why },
-        portcullis_oneshot::OneShot::Failed(why) =>
-            Response::LaunchFailed { stage: "oneshot".into(), message: why },
+        // Logged here too: a caller that gives up when its channels close (a
+        // player whose CDM never came) exits before it reads this response.
+        portcullis_oneshot::OneShot::Refused(why) => {
+            eprintln!("portcullisd: {} refused: {why}", spec.target);
+            Response::LaunchFailed { stage: "refused".into(), message: why }
+        }
+        portcullis_oneshot::OneShot::Failed(why) => {
+            eprintln!("portcullisd: {} failed: {why}", spec.target);
+            Response::LaunchFailed { stage: "oneshot".into(), message: why }
+        }
     };
     // The slot is held for the jail's whole life — `run_with_stdio` blocks
     // until the entry exits — and released here, or by the guard's Drop on

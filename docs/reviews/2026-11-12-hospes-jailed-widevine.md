@@ -109,6 +109,31 @@ to 8, or panicked with "fault on nofault entry" inside `memset_mops`.
 - **The fix.** `sh scripts/build-qemu.sh` builds the fork. `cloud-vm.sh` uses that build when it
   is present. Otherwise it falls back to `-cpu neoverse-n2`, which has no MOPS.
 
+## Follow-up: the rest of the checks on the rebased kernel (2026-11-13)
+
+| Check | Result |
+|---|---|
+| sysfil ATF (`jail_sysfil`, arm64) | 14/14 pass |
+| Stock jail tests (`jail_lookup_root`, `jail_thread`, `jaildesc`, `jailmeta`, `sysctl_security_jail_children`) | 24/24 pass |
+| `ATRIUM-SYZKALLER` (arm64) | Builds. Boots with KASAN on and `/dev/kcov` present. No KASAN reports. |
+| `ATRIUM-NODEBUG` (amd64) | Builds, with `hospes_trap.ko` |
+| Widevine, not jailed (amd64) | MP4: 1,500 frames, 1 licence |
+| Widevine, jailed (amd64) | Both clips: 1,500 frames, 2,880,648 audio frames. 1 licence each. Nothing left over. |
+
+**amd64 needs clang 20.** Upstream's amd64 kernel now uses the FRED instruction `erets`
+(`dtrace_asm.S`), and clang 18 cannot assemble it. Use a cross bindir whose `clang`, `clang++`
+and `clang-cpp` are LLVM 20 and whose other tools are LLVM 18.
+
+**Why the first jailed amd64 run failed.** Three VM scripts restarted jaild as `atrium_jaild`.
+The rc script is `atrium-jaild`, so the restart did nothing, silently. jaild kept a policy
+loaded before the harness set `allow_rctl = true`, and refused the CDM's jail because its
+manifest asks for a memory limit. The player then saw its CDM channel close and stopped with a
+decode error. portcullisd's only log line was "caller hung up".
+
+- The scripts now restart jaild under its real name.
+- `h4-jail-run.sh` fails if the restart fails.
+- portcullisd now logs a refused or failed worker launch.
+
 ## The check
 
 ```
@@ -119,7 +144,4 @@ The fork kernel must be the rebased one. `hospes-k1-vm.sh kernel` installs it.
 
 ## Not covered
 
-- **The amd64 VM.** It was not rerun. Its kernel would need the same rebase build (`ARCH=amd64`).
-- **Other ATRIUM kernel configs.** Only `ATRIUM-NODEBUG` (arm64) was built after the rebase.
-  The KASAN and SYZKALLER configs, and the sysfil ATF tests, were not rerun on the rebased kernel.
 - **The real CDM is not in CI.** This is unchanged: it stays manual until the licence.

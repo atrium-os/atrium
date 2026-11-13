@@ -42,7 +42,7 @@ elif grep -q '^\[resource_control\]' $P; then sed -i '' '/^\[resource_control\]/
 allow_rctl = true
 ' $P
 else printf '\n[resource_control]\nallow_rctl = true\n' >> $P; fi
-service atrium_jaild restart >/dev/null 2>&1; sleep 2
+service atrium-jaild restart >/dev/null 2>&1 || fail "jaild restart"; sleep 2
 pkill -x portcullisd; pkill -f fetcher-standin; sleep 1
 mkdir -p /atrium/sockets/portcullis; rm -f $PSOCK
 daemon -f -o $PLOG /usr/local/bin/portcullisd --socket $PSOCK; sleep 3
