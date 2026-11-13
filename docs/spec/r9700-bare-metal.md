@@ -707,3 +707,14 @@ work (self-test, scrub).
   ("routed 0"), and completions were retired by the check-all fallback (IV-driven, poll 0).
   Next: decode what a MES user-queue EOP carries (ring_id / me-pipe-queue) and key on it,
   then step 2.
+- **2026-11-13, stage 5c-2b step 2 PASSED (29/29).** `22191091`, log `20261113T024533Z`.
+  EOP routing by INT_CTXID works: each user queue's EOP carries src_data[0] =
+  0x1000000 | doorbell (0x1000020..0x1000026) and retires only that queue. A faulting queue's
+  work fails with EIO at once, the queue refuses more, is evicted (wave kill, fence, REMOVE
+  ok) and other VMs run on; the VM runs clean on a new queue. A queue hung in WAIT_REG_MEM
+  (65 W, 100 % busy while hung) fails with EIO after 5049 ms (hang_ms 5000); its HQD reset
+  (DEQUEUE_REQUEST 2) went inactive in 10 us and REMOVE_QUEUE was ok; then 7 W idle. No
+  REMOVE refused, no last-rung reset; vm_faults 1, hangs 1, 16 deferred / 16 reaped; detach
+  clean, card cold. The remaining unrouted EOPs (src_data 0x20000002/3/b) are MES's own
+  pipes; they should not count as misses. Next: step 3 (user mode: mmap of ring, wptr and
+  doorbell from the queue fd, revocation), then step 4 (the free rule).
