@@ -3086,25 +3086,6 @@ amd_mes12_uq_evict(struct amd_uq *q)
 	return (0);
 }
 
-/*
- * After a lost queue's eviction (it is off MES): take its pages out of the
- * VM and flush the kernel VMID and 8-15, as its close would. From here no
- * MES VMID can run this VM for it, so the VM's later PTE changes need only
- * the kernel VMID's flush.
- *
- * Box runs 6849e284..1d72542a: after a client store fault, freeing a BO of
- * the VM while its lost queue was still open (flush of the kernel VMID and
- * then 8-15) left GFXHUB's invalidation engine never acking again, every
- * VMID, until a mode 1 reset. Closing the lost queue first (this unmap and
- * flush, then BO frees flushing only the kernel VMID) stayed clean.
- */
-void
-amd_mes12_uq_unmap(struct amd_uq *q, u_int kvmid)
-{
-	if (!q->added)
-		uq2_unmap_vm(q, kvmid);
-}
-
 int
 amd_mes12_uq_destroy(struct amd_uq *q, u_int kvmid)
 {
