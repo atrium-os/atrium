@@ -148,8 +148,14 @@ page in it uses that persona's partition.
 | persona | cookies and logins | trails and history | shared store |
 |---|---|---|---|
 | **Personal** (the default) | kept in Arca, while unlocked | kept | anonymous conversions shared per user (threat model §2.6) |
-| **Unrecorded** | in memory, gone when its last trail closes | never written; parked pages stay in memory | none: conversions are private and never stored |
+| **Unrecorded** | **one throwaway jar per trail** (Shankar, 2026-11-13), in memory, gone when that trail closes; two Unrecorded trails share nothing | never written; parked pages stay in memory | none: conversions are private and never stored |
 | **named** ("Work", "Shopping", added later) | their own Arca partition | kept, filtered by persona | as Personal |
+
+Each Unrecorded trail is its own throwaway persona: its own in-memory Arca partition, so
+signing in in one Unrecorded trail signs in nowhere else, and closing the trail destroys the
+partition's key. Browsers share one jar across all private windows; here a jar is only an Arca key,
+so per-trail costs nothing. A branch moved out into its own trail (§4.2) keeps the jar it was
+opened with until it closes.
 
 Unrecorded is what browsers call private browsing, with one difference that matters: since a
 page is anonymous until you let a site remember you (§6.2), Personal trails are already private
