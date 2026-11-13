@@ -1560,8 +1560,9 @@ out_unmap:
  * the GART, and the wptr page is aliased there for MES (wptr_mc_addr).
  *
  * Both processes map write_42 at the SAME VAs (UQ_VA + ...) onto their
- * own pages. Pass: both fences, each process's out page all 42, the two
- * queues on different VMIDs (read from the HQDs while mapped), and after
+ * own pages (each poisoned differently). Pass: both fences, each
+ * process's out page all 42, the two queues on different VMIDs (read from
+ * the HQDs after both ran: MES maps a queue when it has work), and after
  * REMOVE_QUEUE no HQD left active.
  */
 #define UQ_N			2
@@ -1842,6 +1843,15 @@ uq_test_run(struct mes *m)
 		    "fenced" : "NO FENCE", W42_OUT_DW - bad[p], W42_OUT_DW,
 		    out[0], *(volatile uint32_t *)(u[p].pg + UQ_WB));
 	}
+	/*
+	 * MES maps a user queue onto an HQD when it has work (run
+	 * T013353Z: right after ADD_QUEUE only process 0 was resident, yet
+	 * both ran). The queues stay mapped until REMOVE_QUEUE, so read the
+	 * VMIDs again now that both have run.
+	 */
+	active = uq_hqd_scan(m, "after both ran", vmids);
+	device_printf(sc->dev, "uq: %u HQD(s) active; process VMIDs %u and "
+	    "%u\n", active, vmids[0], vmids[1]);
 	if (amd_gmc12_fault_take(gt, &st, &a)) {
 		amd_gmc12_fault_decode(gt, st, "uq");
 		device_printf(sc->dev, "uq: fault page %#jx\n", (uintmax_t)a);

@@ -587,3 +587,9 @@ through fd passing, close and jail death.
   range). Both map write_42 at the same VAs onto their own pages. Pass: both fence, each
   out page all 42, different MES VMIDs (8-15, read from the HQDs), no HQD active after
   REMOVE_QUEUE. Runner stage 5c1 (5b's test runs first).
+- 2026-11-13 01:35, 5c-1 run bdddc2dc (log /root/runs/20261113T013353Z.log): 5b PASS again;
+  both MES user queues added, both fenced, both out pages all 42 from the same VAs onto
+  their own (differently poisoned) pages, no faults, both removed cleanly. Failed only
+  the VMID check: right after ADD_QUEUE only process 0 was resident (me1 pipe 1 queue 0,
+  VMID 8); MES maps a user queue onto an HQD when its doorbell brings work. Fix: read the
+  VMIDs again after both ran (queues stay mapped until REMOVE_QUEUE).
