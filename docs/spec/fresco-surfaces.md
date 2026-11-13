@@ -134,8 +134,10 @@ enum SurfacePacing {
 2. **External timeline-semaphore fd** for completion signaling —
    imported via `VK_KHR_external_semaphore_fd`. Single timeline
    semaphore per surface; client increments on each submit, sends
-   the new value with `SURFACE_FRAME_READY`; server waits for that
-   value before sampling.
+   the new value with `SURFACE_FRAME_READY`; server samples that
+   frame only once the semaphore has reached that value, and never
+   waits for it: at composite time an unsignalled frame is skipped
+   and the previous one is used (§3.1; gpu-arbitration.md §3 rule 1).
 
 On `SURFACE_RECONFIG` the server may allocate a *new* VkImage; if
 so, the next `SURFACE_CREATED`-shaped reply carries the new fds

@@ -61,7 +61,10 @@ Five rules keep the hog's cost on its own window.
    compositor takes each window's newest buffer whose completion fence has
    already signalled. If the hog has not finished its frame, the compositor
    reuses the hog's previous buffer and composites on time. Explicit sync
-   (ABI §5.6) is what allows checking a fence without blocking on it. The
+   (ABI §5.6) is what allows checking a fence without blocking on it.
+   ([`fresco-surfaces.md`](fresco-surfaces.md) §2.3 said the server "waits
+   for" the client's semaphore value; reworded 2026-11-13 to match §3.1 and
+   this rule.) The
    hog's window drops frames; the cursor, the other windows and the desktop
    don't.
 2. **Separate contexts, separate priorities: no priority inversion.** Any GPU
