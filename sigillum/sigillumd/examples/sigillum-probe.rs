@@ -3,6 +3,8 @@
 //!
 //! ```text
 //! sigillum-probe ui [SOCKET]                 # a scripted trusted UI: presses the first device
+//! sigillum-probe ui-tty [N] [SOCKET]         # a real key's UI: the PIN typed at this terminal
+//!                                            # (echo off, one try per ceremony); exits after N sheets
 //! sigillum-probe register RP FILE [SOCKET]   # register; saves cred id + public key to FILE
 //! sigillum-probe assert RP FILE [SOCKET]     # sign in with FILE's credential; verifies the signature
 //! sigillum-probe webauthn ORIGIN RP [SOCKET] # navigator.credentials.create() then .get() through
@@ -74,6 +76,111 @@ fn ui_loop(sock: &str) -> ExitCode {
     }
     println!("ui: closed");
     ExitCode::SUCCESS
+}
+
+/// Reads a PIN from fd 0, which must be a terminal, with echo off. One byte
+/// per read(2) into a zeroized buffer: no stdio buffer keeps a copy. None on
+/// an empty line, EOF, or a fd 0 that is not a terminal.
+fn read_pin_tty(prompt: &str) -> Option<Pin> {
+    use std::io::Write;
+    if unsafe { libc::isatty(0) } != 1 {
+        eprintln!("ui-tty: stdin is not a terminal; no PIN read");
+        return None;
+    }
+    let mut old: libc::termios = unsafe { std::mem::zeroed() };
+    if unsafe { libc::tcgetattr(0, &mut old) } != 0 {
+        return None;
+    }
+    let mut quiet = old;
+    quiet.c_lflag &= !(libc::ECHO | libc::ECHONL);
+    eprint!("{prompt}");
+    let _ = std::io::stderr().flush();
+    if unsafe { libc::tcsetattr(0, libc::TCSAFLUSH, &quiet) } != 0 {
+        return None;
+    }
+    let mut buf = zeroize::Zeroizing::new(Vec::<u8>::with_capacity(64));
+    let mut b = zeroize::Zeroizing::new([0u8; 1]);
+    let mut ok = false;
+    loop {
+        let n = unsafe { libc::read(0, b.as_mut_ptr().cast(), 1) };
+        if n != 1 {
+            break;
+        }
+        if b[0] == b'\n' || b[0] == b'\r' {
+            ok = true;
+            break;
+        }
+        // CTAP2 PINs are at most 63 bytes; refuse anything longer.
+        if buf.len() == 63 {
+            buf.clear();
+            ok = false;
+            while unsafe { libc::read(0, b.as_mut_ptr().cast(), 1) } == 1 && b[0] != b'\n' {}
+            break;
+        }
+        buf.push(b[0]);
+    }
+    unsafe { libc::tcsetattr(0, libc::TCSAFLUSH, &old) };
+    eprintln!();
+    if !ok || buf.len() < 4 {
+        return None;
+    }
+    Some(Pin(buf))
+}
+
+/// The trusted UI for a real key, typed by the person at the terminal:
+/// presses the first device, asks for the key's PIN on this terminal (echo
+/// off) once per ceremony, and stops at the first wrong PIN, saying how many
+/// tries are left. It never asks when 3 or fewer are left. Exits after
+/// `ceremonies` sheets close.
+fn ui_tty(sock: &str, ceremonies: usize) -> ExitCode {
+    let mut s = UnixStream::connect(sock).expect("ui socket");
+    let mut w = s.try_clone().unwrap();
+    let mut closed = 0;
+    eprintln!("ui-tty: connected; waiting for a ceremony");
+    while let Ok(Some(m)) = read_msg::<ToUi>(&mut s, ui::MAX_MESSAGE) {
+        match &m {
+            ToUi::Show { key, sheet, devices } => {
+                eprintln!("ui-tty: sheet {sheet:?}");
+                if let Some(d) = devices.first() {
+                    eprintln!("ui-tty: using {}", d.name);
+                    let _ = write_msg(&mut w, &FromUi::Press { key: *key, choice: Choice::Device(d.id), activation_ok: true }, ui::MAX_MESSAGE);
+                }
+            }
+            ToUi::AskPin { key, retries, wrong, .. } => {
+                let cancel = FromUi::Press { key: *key, choice: Choice::Cancel, activation_ok: true };
+                if *wrong {
+                    eprintln!("ui-tty: WRONG PIN; {retries} tries left on the key. Stopping (no second try).");
+                    let _ = write_msg(&mut w, &cancel, ui::MAX_MESSAGE);
+                    return ExitCode::FAILURE;
+                }
+                if *retries <= 3 {
+                    eprintln!("ui-tty: only {retries} PIN tries left on the key; not asking. Stopping.");
+                    let _ = write_msg(&mut w, &cancel, ui::MAX_MESSAGE);
+                    return ExitCode::FAILURE;
+                }
+                match read_pin_tty(&format!("Security key PIN ({retries} tries left; empty line cancels): ")) {
+                    Some(pin) => {
+                        let _ = write_msg(&mut w, &FromUi::Pin { key: *key, pin }, ui::MAX_MESSAGE);
+                    }
+                    None => {
+                        eprintln!("ui-tty: no PIN given; cancelled");
+                        let _ = write_msg(&mut w, &cancel, ui::MAX_MESSAGE);
+                    }
+                }
+            }
+            ToUi::Touch { .. } => eprintln!("ui-tty: >>> TOUCH THE KEY NOW (it is blinking) <<<"),
+            ToUi::Close { .. } => {
+                closed += 1;
+                eprintln!("ui-tty: sheet closed ({closed}/{ceremonies})");
+                if closed >= ceremonies {
+                    return ExitCode::SUCCESS;
+                }
+            }
+            _ => {}
+        }
+    }
+    eprintln!("ui-tty: closed by sigillumd");
+    ExitCode::FAILURE
 }
 
 fn ask(sock: &str, req: &Request) -> Reply {
@@ -158,6 +265,7 @@ fn main() -> ExitCode {
     let sock = |i: usize, d: &str| a.get(i).cloned().unwrap_or_else(|| d.to_string());
     match a.first().map(String::as_str) {
         Some("ui") => ui_loop(&sock(1, ui::SOCKET)),
+        Some("ui-tty") => ui_tty(&sock(2, ui::SOCKET), a.get(1).and_then(|n| n.parse().ok()).unwrap_or(2)),
         Some("register") if a.len() >= 3 => {
             let rp = &a[1];
             let r = ask(
