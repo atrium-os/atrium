@@ -479,15 +479,19 @@ CCID driver, S3) do not exist yet. What they need from this layer does:
   `usb/0.5.0`, and the jail was refused for the gate's own test uid (fixed);
   QEMU's `usb-serial`, the first choice for the kernel-claimed case, never
   enumerated in the guest behind QEMU's added hub, so the gate uses
-  `usb-audio`.
+  `usb-audio`. The third run assigned both correctly and was refused on
+  the test gid (fixed). **Passed** 2026-11-13 (9e12750): uaudio detached
+  and the probe's jail up with exactly `ugenB.A` + `usb/B.A.0` (uid 65060,
+  0600), the CCID reader by nomatch and again after a daemon restart (found
+  through usbconfig), both gone on unplug.
 - **Not shipped yet**: rule files and jaild pins for `vinculum-hci`
   (ruleset 25) and `sigillum-ccid`; each is one `devices.d` file plus one
   `[[devfs_rulesets.pinned]]` entry with `grant_nodes = ["ugen#.#",
   "usb/#.#.0"]` when its driver lands. Host tests: dispensator 13 (USB
   attach, repeat, unplug and replug at the same address, priority by id,
   kernel detach and re-detach, malformed fields, devinfo at start),
-  jaild-policy grant patterns; jaild's validator and grant-name tests run on
-  FreeBSD (type-checked here).
+  jaild-policy grant patterns; jaild's validator and grant-name tests pass
+  on FreeBSD.
 
 ### 6.4 As built: D5b, FAT library (2026-11-13, in progress)
 
@@ -598,9 +602,14 @@ exists the mechanism runs only under the gate. `scripts/vm-fuse-check.sh`
 node in the jail, fsck_msdosfs clean, msdosfs reads it back), read-only
 gives EROFS, refusals for the VM's own disk and a mountpoint outside
 /media, then dispensatord serving a GPT partition on a fresh md at
-`/media/md98p1` and removing it when the md goes. Runs pending.
+`/media/md98p1` and removing it when the md goes. **Passed** 2026-11-13 on
+the amd64 VM (9e12750; output in project files `vm-runs/`). It found one
+real case: FreeBSD's `newfs_msdos` can size the FAT two entries short of
+the data area's clusters, which capsa-fat refused; it now limits the
+volume to what the FAT addresses, as Linux and FreeBSD do. jaild's unit
+tests (87) and jaild-policy's (9) pass on FreeBSD.
 
-Next: the VM gate's run, exFAT writes, a whole-disk (superfloppy) case,
+Next: exFAT writes, a whole-disk (superfloppy) case,
 and the removable-media service (session owner, lock, eject).
 
 ## 7. Not in scope
