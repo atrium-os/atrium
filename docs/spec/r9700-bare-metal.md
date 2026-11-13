@@ -1352,7 +1352,7 @@ work (self-test, scrub).
   flush of the MES VMIDs (8-15), while the lost queue is still open, leaves
   GFXHUB's invalidation engine never acking again. Test 7 never hit it only
   because job_renew closes its lost queue first.
-  Fix (kmods dbfec631): si_uq_evict_task, once a lost queue is off MES, unmaps its
+  Fix (kmods c8561e42): si_uq_evict_task, once a lost queue is off MES, unmaps its
   pages and flushes as its close would (amd_mes12_uq_unmap), and marks the slot
   off MES, so the VM drops out of the MES-VMID flush and free-rule masks. Logs:
   claude/project-thread-33aauq 1d72542a.
