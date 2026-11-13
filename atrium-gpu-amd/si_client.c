@@ -69,6 +69,7 @@ struct si_uq {
 	uint16_t kvmid;			/* the VM's kernel VMID */
 	bool	 busy;			/* slot taken (hw may still be NULL) */
 	bool	 seen_eop;		/* first routed EOP IV logged */
+	bool	 dead;			/* faulted: its work fails, EIO */
 	struct si_uq_owed owed[ATRIUM_AMD_MAX_PENDING];
 	u_int	 head, n;
 	uint64_t submits;
@@ -108,6 +109,7 @@ struct amd_si_client {
 	/* The IV consumer's batch (interrupt thread only). */
 	u_int	 b_eop, b_fault, b_sq, b_other;
 	uint32_t b_uq;			/* user queues named by an EOP */
+	uint32_t b_fault_vmids;		/* every VMID that faulted */
 	bool	 b_uq_scan;		/* an EOP named no queue: check all */
 	uint32_t b_unrouted_db;		/* ... and the doorbell it gave */
 	uint16_t b_fault_vmid;
@@ -165,6 +167,42 @@ si_uq_owes(struct amd_si_client *c)
 }
 
 /*
+ * A UTCL2 fault on a MES VMID (8-15): the user queue MES runs under it now
+ * is lost. What it owes fails (EIO) and its later submits are refused; its
+ * close takes it off the GPU (resetting the HQD if it is wedged). Its
+ * client's other queues and everyone else's run on. sc->lock held.
+ */
+static void
+si_uq_faulted(struct amd_si_client *c, uint32_t vmids, bool log)
+{
+	struct si_uq *u;
+	u_int i, vmid;
+
+	mtx_assert(&c->sc->lock, MA_OWNED);
+	for (i = 0; i < AMD_UQ_SLOTS; i++) {
+		u = &c->uq[i];
+		if (u->hw == NULL || u->dead)
+			continue;
+		vmid = amd_mes12_uq_hqd_vmid(u->hw);
+		if (vmid < 8 || (vmids & (1u << vmid)) == 0)
+			continue;
+		(void)si_uq_retire(c, i);	/* what fenced before it */
+		while (u->n > 0) {
+			if (u->owed[u->head].so != NULL)
+				amd_syncobj_fail(u->owed[u->head].so, EIO);
+			u->owed[u->head].so = NULL;
+			u->head = (u->head + 1) % ATRIUM_AMD_MAX_PENDING;
+			u->n--;
+		}
+		u->dead = true;
+		if (log)
+			device_printf(c->sc->dev, "si: uq%u faulted (VMID %u, "
+			    "%#jx): its work fails, the queue is lost\n", i,
+			    vmid, (uintmax_t)c->b_fault_addr);
+	}
+}
+
+/*
  * The fallback: while a user queue owes completions, look at the fences
  * every 50 ms, so a missing EOP interrupt costs latency, not a hang. The
  * counts tell the box log which path retired them.
@@ -213,6 +251,8 @@ si_iv_batch_end(struct amd_si_client *c)
 			sc->ih_fault_vmid[q] = c->b_fault_vmid;
 			sc->ih_fault_page[q] = (uint32_t)(c->b_fault_addr >> 12);
 			fault = true;
+		} else if ((c->b_fault_vmids & 0xff00u) != 0) {
+			si_uq_faulted(c, c->b_fault_vmids & 0xff00u, log);
 		} else if (log)
 			device_printf(sc->dev, "si: VM fault on VMID %u at "
 			    "%#jx, not the running submit's VMID %u\n",
@@ -255,6 +295,7 @@ si_iv_batch_end(struct amd_si_client *c)
 	c->b_fault_vmid = 0;
 	c->b_uq = 0;
 	c->b_uq_scan = false;
+	c->b_fault_vmids = 0;
 }
 
 /*
@@ -304,6 +345,7 @@ si_iv(void *arg, const uint32_t *iv)
 	else if (client == IH_CLIENT_GFX && src == IH_SRC_UTCL2_FAULT) {
 		/* gmc_v12_0_process_interrupt: VMID in dword 0, the page in
 		 * data 0 and bits 47:44 in data 1. */
+		c->b_fault_vmids |= 1u << ((iv[0] >> 24) & 0xf);
 		if (c->b_fault++ == 0) {
 			c->b_fault_vmid = (iv[0] >> 24) & 0xf;
 			c->b_fault_addr = (uint64_t)iv[4] << 12 |
@@ -653,6 +695,8 @@ amd_si_uq_submit(struct atrium_amd_softc *sc, int slot, uint64_t ib,
 	mtx_lock(&sc->lock);
 	if (u->hw == NULL)
 		err = ENXIO;
+	else if (u->dead)
+		err = EIO;
 	else if (so != NULL && u->n >= ATRIUM_AMD_MAX_PENDING &&
 	    si_uq_retire(c, slot) == 0)
 		err = EBUSY;

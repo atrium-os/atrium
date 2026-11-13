@@ -682,3 +682,15 @@ work (self-test, scrub).
   graphics, VRAM BOs and user-mode queues EOPNOTSUPP. vm_faults counts fault IVs (2 for the one
   event). Idle with the client node attached 7 W; detach clean, dispatch PASS at detach, mode 1
   reset cold, stray 0. Next: 5c-2b, client work on MES user queues behind queue fds.
+- **2026-11-13, 5c-2b step 1 first run: FAIL (13/21), box left busy.** `6e5aafbf`, log
+  `20261113T022617Z`. Every user queue faulted as the CPF fetched its ring (client CPF,
+  PERMISSION_FAULTS 0x8, RW 0): the ring PTE was read-only without EXECUTABLE, which a CP
+  fetch needs (5c-1 mapped every page RWX). No user-queue job ran, so EOP routing by doorbell
+  is untested (the EOPs seen, doorbells 0x2/0x3/0xb, were other queues'). The fault was
+  misattributed (kernel-queue VMID logic), so jobs timed out. At close, wave kill did not
+  help a CPF fault; MES refused REMOVE_QUEUE (status 0x8100030100000000) for the three
+  mapped queues, the driver leaked them as designed, detach/unload got EBUSY and the card
+  sat at 62 W, 3.4 GHz busy until a reboot. Fixes: ring/queue pages executable; a fault on
+  a MES VMID fails that queue (EIO, later submits refused); close resets a wedged HQD
+  (CP_HQD_DEQUEUE_REQUEST 2) before REMOVE_QUEUE and retries once after a refusal. Open:
+  detach with a queue MES will not drop must end in a reset, never EBUSY with the card hot.

@@ -2171,8 +2171,8 @@ out:
  *   memory   ring, writeback (rptr 0, wptr 8, fence 0x10) and EOP buffer:
  *            three kernel-allocated pages mapped into the client's VM at
  *            `va` (a kernel-reserved range above the BO window, never handed
- *            to a BO). The ring is mapped read-only: the CP reads it, and a
- *            client shader cannot rewrite it under the kernel.
+ *            to a BO). The ring is mapped read-only (and executable: the
+ *            CPF fetch needs it), so a client shader cannot rewrite it.
  *   process  one MES process (and gang) per queue, so two queues of one VM
  *            are two MES processes on the same page tables. MES picks the
  *            HQD and the VMID (8-15) when the queue has work.
@@ -2213,24 +2213,71 @@ uq2_seq_passed(uint32_t fence, uint32_t seq)
 
 /* The active MEC1 HQD (any pipe and queue) whose doorbell is `db`. */
 static bool
-uq2_hqd_find(struct mes *m, uint32_t db, u_int *vmid)
+uq2_hqd_at(struct mes *m, uint32_t db, u_int *vmid, u_int *pipep, u_int *qp)
 {
 	const struct mes_gen *g = m->g;
 	u_int pipe, q;
-	bool found = false;
 
-	for (pipe = 0; pipe < 4 && !found; pipe++)
-		for (q = 0; q < 8 && !found; q++) {
+	for (pipe = 0; pipe < 4; pipe++)
+		for (q = 0; q < 8; q++) {
 			grbm_select_q(m, 1, pipe, q);
 			if ((rd(m, g->hqd_active) & 1) == 0)
 				continue;
 			if (((rd(m, g->hqd_doorbell) >> 2) & 0x03ffffff) != db)
 				continue;
 			*vmid = rd(m, g->hqd_vmid) & 0xf;
-			found = true;
+			if (pipep != NULL)
+				*pipep = pipe;
+			if (qp != NULL)
+				*qp = q;
+			grbm_select_q(m, 0, 0, 0);
+			return (true);
 		}
 	grbm_select_q(m, 0, 0, 0);
-	return (found);
+	return (false);
+}
+
+static bool
+uq2_hqd_find(struct mes *m, uint32_t db, u_int *vmid)
+{
+	return (uq2_hqd_at(m, db, vmid, NULL, NULL));
+}
+
+/* The VMID MES runs the queue under now; 0 if it is not on an HQD. */
+u_int
+amd_mes12_uq_hqd_vmid(struct amd_uq *q)
+{
+	u_int vmid = 0;
+
+	return (uq2_hqd_find(q->m, q->db, &vmid) ? vmid : 0);
+}
+
+/*
+ * A wedged queue (a CPF fault, waves that do not die) MES cannot preempt:
+ * reset its HQD directly, as amdgpu's legacy queue reset does
+ * (CP_HQD_DEQUEUE_REQUEST = 2, reset), and wait for it to go inactive.
+ */
+static bool
+uq2_hqd_reset(struct amd_uq *q)
+{
+	struct mes *m = q->m;
+	const struct mes_gen *g = m->g;
+	u_int vmid, pipe, qi, us = 0;
+	bool idle;
+
+	if (!uq2_hqd_at(m, q->db, &vmid, &pipe, &qi))
+		return (true);
+	grbm_select_q(m, 1, pipe, qi);
+	wr(m, g->hqd_dequeue_req, 2);
+	for (; us < 100000 && (rd(m, g->hqd_active) & 1); us += 10)
+		DELAY(10);
+	wr(m, g->hqd_dequeue_req, 0);
+	idle = (rd(m, g->hqd_active) & 1) == 0;
+	grbm_select_q(m, 0, 0, 0);
+	device_printf(m->sc->dev, "uq%u: HQD me1 pipe %u queue %u (VMID %u) "
+	    "reset: %s after %u us\n", q->slot, pipe, qi, vmid,
+	    idle ? "inactive" : "STILL ACTIVE", us);
+	return (idle);
 }
 
 /* EOP interrupts from every MEC1 pipe MES may place a user queue on. */
@@ -2316,12 +2363,17 @@ amd_mes12_uq_create(struct mes *m, struct amd_vm12 *vm, u_int kvmid,
 	if ((err = amd_gmc12_flush(gt)) != 0)
 		goto fail;
 
-	/* The client's VM: ring read-only, writeback and EOP read-write. */
+	/*
+	 * The client's VM: ring read-only, writeback and EOP read-write, all
+	 * executable: the CPF fetches the ring as an execute access (box run
+	 * 2026-11-13: a ring PTE without it faulted, PERMISSION_FAULTS 0x8).
+	 */
 	q->mapped_vm = true;
 	for (i = 0; i < UQ2_PAGES; i++)
 		if ((err = amd_gmc12_vm_map(vm, va + i * PAGE_SIZE,
 		    q->pg_pa + i * PAGE_SIZE, i * PAGE_SIZE == UQ2_RING ?
-		    AMD_VM_READ : AMD_VM_READ | AMD_VM_WRITE)) != 0)
+		    AMD_VM_READ | AMD_VM_EXEC :
+		    AMD_VM_READ | AMD_VM_WRITE | AMD_VM_EXEC)) != 0)
 			goto fail;
 	if ((err = amd_gmc12_vm_flush(gt, kvmid)) != 0)
 		goto fail;
@@ -2456,9 +2508,16 @@ amd_mes12_uq_destroy(struct amd_uq *q, u_int kvmid)
 			    q->seq) ? "landed" : "still behind", us);
 		}
 	}
+	if (q->added && !uq2_seq_passed(amd_mes12_uq_fence(q), q->seq))
+		(void)uq2_hqd_reset(q);
 	if (q->added) {
-		if ((err = uq_remove_raw(m, q->gva, q->db)) != 0 ||
-		    uq2_hqd_find(m, q->db, &vmid)) {
+		err = uq_remove_raw(m, q->gva, q->db);
+		if (err != 0 && uq2_hqd_reset(q)) {
+			device_printf(m->sc->dev, "uq%u: REMOVE_QUEUE refused "
+			    "(%d); HQD reset, trying once more\n", q->slot, err);
+			err = uq_remove_raw(m, q->gva, q->db);
+		}
+		if (err != 0 || uq2_hqd_find(m, q->db, &vmid)) {
 			amd_mes12_uq_report(q, "REMOVE_QUEUE failed");
 			device_printf(m->sc->dev, "uq%u: still mapped after "
 			    "REMOVE_QUEUE (%d); its memory and VM are "
