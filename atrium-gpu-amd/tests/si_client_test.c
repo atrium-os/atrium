@@ -49,6 +49,7 @@
 
 #include <sys/types.h>
 #include <sys/mman.h>
+#include <sys/resource.h>
 #include <sys/socket.h>
 #include <sys/uio.h>
 #include <sys/wait.h>
@@ -605,6 +606,9 @@ touch_sigbus(volatile uint8_t *p, int write, int *how)
 	if (pid < 0)
 		return (0);
 	if (pid == 0) {
+		struct rlimit nocore = { 0, 0 };
+
+		(void)setrlimit(RLIMIT_CORE, &nocore);	/* the SIGBUS is wanted */
 		if (write)
 			*(volatile uint64_t *)p = 1;
 		else

@@ -733,3 +733,13 @@ work (self-test, scrub).
   apart, not as unrouted; `vm_faults` counted once per fault (it was counted in both
   si_client.c and amd_fault_handler); the dummy-page line says whether a write landed.
   Test 9 in si-client-test (the step-1 user-mode refusal is gone).
+- **2026-11-13, stage 5c-2b step 3 PASSED (42/42).** `bd51958f`, log `20261113T031144Z`.
+  write_42 rung from user space twice on one ring (fence 1 then 2 in 1 ms, rptr/wptr 12 then
+  24), so a doorbell on its own BAR page outside CP_MEC_DOORBELL_RANGE works under MES.
+  All seven refusals held; after close the ring and the doorbell SIGBUS (pager read error).
+  A user ring stuck in WAIT_REG_MEM (66 W, gfx busy 100 %) was lost after 5251 ms: waves
+  killed, HQD reset inactive in 90 us, REMOVE ok; other VMs ran on and the VM ran clean on
+  a kernel-mode queue. Steps 1/2 checks passed again (hang EIO after 5039 ms). vm_faults 1
+  (counted once), hangs 2, grants 2 / live 0; unrouted EOPs 1 (src_data 0x18000000 once at
+  attach, before any queue), MES own 54. Idle 7 W, detach clean, card cold. Next: step 4,
+  the free rule (MES suspend/resume before freeing a BO of a VM with user queues).
