@@ -959,6 +959,7 @@ uint64_t amd_mes12_uq_fence_va(struct amd_uq *q);
 int	amd_mes12_uq_preempt(struct amd_uq *q);
 int	amd_mes12_uq_destroy(struct amd_uq *q, u_int kvmid);
 int	amd_mes12_uq_evict(struct amd_uq *q);
+void	amd_mes12_uq_unmap(struct amd_uq *q, u_int kvmid);
 int	amd_mes12_uq_submit(struct amd_uq *q, uint64_t ib, uint32_t ib_dw,
 	    uint32_t *seq);
 uint32_t amd_mes12_uq_fence(struct amd_uq *q);

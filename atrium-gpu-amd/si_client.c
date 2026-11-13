@@ -85,6 +85,7 @@ struct si_uq {
 	bool	 seen_eop;		/* first routed EOP IV logged */
 	bool	 dead;			/* lost (fault, hang): work fails, EIO */
 	bool	 evict;			/* lost, still on MES: the task removes it */
+	bool	 offmes;		/* evicted and unmapped: no MES VMID flush */
 	bool	 user;			/* user mode: the client's ring (step 3) */
 	bool	 stale;			/* of a generation a GPU re-init ended */
 	uid_t	 ruid;			/* its creator's real uid (reset blame) */
@@ -510,7 +511,7 @@ si_uq_evict_task(void *arg, int pending __unused)
 	struct atrium_amd_softc *sc = c->sc;
 	struct amd_uq *hw;
 	uid_t uid;
-	u_int i;
+	u_int i, kvmid;
 	int err;
 
 	sx_xlock(&c->uq_sx);
@@ -518,6 +519,7 @@ si_uq_evict_task(void *arg, int pending __unused)
 		mtx_lock(&sc->lock);
 		hw = c->uq[i].evict ? c->uq[i].hw : NULL;
 		uid = c->uq[i].ruid;
+		kvmid = c->uq[i].kvmid;
 		c->uq[i].evict = false;
 		mtx_unlock(&sc->lock);
 		if (hw == NULL || !amd_si_usable(sc))
@@ -528,7 +530,14 @@ si_uq_evict_task(void *arg, int pending __unused)
 			    uid);
 			break;
 		}
-		device_printf(sc->dev, "si: uq%u evicted (lost)\n", i);
+		/* Off MES: its pages out of the VM now, not at its close
+		 * (amd_mes12_uq_unmap has the box runs). */
+		amd_mes12_uq_unmap(hw, kvmid);
+		mtx_lock(&sc->lock);
+		c->uq[i].offmes = true;
+		mtx_unlock(&sc->lock);
+		device_printf(sc->dev, "si: uq%u evicted (lost) and unmapped\n",
+		    i);
 	}
 	sx_xunlock(&c->uq_sx);
 }
@@ -926,7 +935,8 @@ si_uq_vmids_locked(struct amd_si_client *c)
 	u_int i;
 
 	for (i = 0; i < AMD_UQ_SLOTS; i++)
-		if (c->uq[i].busy && c->uq[i].kvmid != 0)
+		if (c->uq[i].busy && c->uq[i].kvmid != 0 &&
+		    !c->uq[i].offmes)
 			mask |= 1u << c->uq[i].kvmid;
 	return (mask);
 }
