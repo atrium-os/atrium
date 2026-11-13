@@ -41,12 +41,28 @@
 #   - a key hot-plugged through the QEMU monitor gets a jail from the devd
 #     path, and unplugging it removes that jail (and only that one).
 #
+# ARCH=aarch64 runs it against the arm64 VM instead (VMDIR ~/atrium-vm, the
+# Mac's HVF guest; its cross sysroot is $VMDIR/sysroot).
+#
+# SIGILLUM_REAL_KEY=1: a real key passed through by QEMU usb-host (on the Mac,
+# qemu as root: scripts/sigillum-fido-vm.sh). The ceremonies then run one by
+# one, each waiting until the file $GO_DIR/<step> exists (register, assert;
+# webauthn too with SIGILLUM_WEBAUTHN=1), so whoever touches the key is told
+# first; the hot-plug section, which adds emulated keys, is skipped. The
+# registration is non-resident with UV discouraged: nothing is stored on the
+# key. The scripted UI never types a PIN: on a key with a PIN set it cancels
+# the ceremony ("ui: PIN requested ... no PIN sent") and the gate says so.
+#
 # Ends "sigillum: N failed".
 set -u
 TD=${1:-}
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
-VMDIR=${VMDIR:-$HOME/atrium-vm-amd64}
-TRIPLE=x86_64-unknown-freebsd
+case "${ARCH:-amd64}" in
+  aarch64|arm64) ARCH=aarch64; VMDIR=${VMDIR:-$HOME/atrium-vm}; TRIPLE=aarch64-unknown-freebsd ;;
+  *) ARCH=amd64; VMDIR=${VMDIR:-$HOME/atrium-vm-amd64}; TRIPLE=x86_64-unknown-freebsd ;;
+esac
+REAL=${SIGILLUM_REAL_KEY:-}
+GO_DIR=${GO_DIR:-/tmp/sigillum-go}
 K="-i $HOME/.ssh/fresco_bsd_ed25519 -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR"
 V() { "$ROOT/scripts/vssh" "$@"; }
 mon() { python3 -I -c '
@@ -63,7 +79,7 @@ V true >/dev/null 2>&1 || { echo "the VM does not answer over ssh (scripts/cloud
 
 echo "== cross-build"
 # (cloud-vm.sh reads its verb from $1, so source it with "env" as $1.)
-CROSS_RUSTFLAGS=$(cd "$ROOT" && ARCH=amd64 sh -c '. ./scripts/cloud-vm.sh >/dev/null; printf %s "$CROSS_RUSTFLAGS"' sh env)
+CROSS_RUSTFLAGS=$(cd "$ROOT" && ARCH=$ARCH VMDIR=$VMDIR sh -c '. ./scripts/cloud-vm.sh >/dev/null; printf %s "$CROSS_RUSTFLAGS"' sh env)
 ( cd "$ROOT/sigillum" && RUSTFLAGS="$CROSS_RUSTFLAGS" cargo build -q --release --target $TRIPLE \
     -p sigillumd -p sigillum-fido --bins --example sigillum-probe ) || { echo "build failed"; exit 1; }
 B=$ROOT/sigillum/target/$TRIPLE/release
@@ -224,6 +240,42 @@ if [ -n "$TD" ]; then
 fi
 
 echo "== ceremonies"
+if [ -n "$REAL" ]; then
+# One ceremony per ssh, each after its go file: a person touches the key.
+go() {
+  mkdir -p "$GO_DIR"; rm -f "$GO_DIR/$1"
+  echo "  WAITING for $GO_DIR/$1 (then touch the key when it blinks: $2)"
+  until [ -e "$GO_DIR/$1" ]; do sleep 1; done
+  echo "  go $1"
+}
+V 'sh -s' > /tmp/sigillum-cer.log 2>&1 <<'EOF'
+cd /root/s
+install -m 0755 sigillum-probe /usr/local/bin/sigillum-probe-test
+pkill -f "sigillum-probe-test ui"; sleep 1
+rm -f /tmp/sprobe-ui.log /tmp/sprobe.cred
+timeout 5 /usr/local/bin/sigillum-probe-test ui > /tmp/sprobe-wrongui.log 2>&1
+echo "wrong-ui $(tail -1 /tmp/sprobe-wrongui.log)"
+daemon -f -o /tmp/sprobe-ui.log -u _sigillum-ui /usr/local/bin/sigillum-probe-test ui
+sleep 2
+touch /tmp/sprobe.cred; chown _sprobe /tmp/sprobe.cred
+EOF
+go register "one touch, registering for example.com"
+V 'su -m _sprobe -c "timeout 120 /usr/local/bin/sigillum-probe-test register example.com /tmp/sprobe.cred"; echo "register-rc $?"' >> /tmp/sigillum-cer.log 2>&1
+tail -2 /tmp/sigillum-cer.log | sed 's/^/  /'
+if grep -q "^register-rc 0" /tmp/sigillum-cer.log; then
+  go assert "one touch, signing in to example.com"
+  V 'su -m _sprobe -c "timeout 120 /usr/local/bin/sigillum-probe-test assert example.com /tmp/sprobe.cred"; echo "assert-rc $?"' >> /tmp/sigillum-cer.log 2>&1
+  tail -2 /tmp/sigillum-cer.log | sed 's/^/  /'
+fi
+if [ -n "${SIGILLUM_WEBAUTHN:-}" ] && grep -q "^assert-rc 0" /tmp/sigillum-cer.log; then
+  go webauthn "two touches: create, then get"
+  V 'su -m _sprobe -c "timeout 240 /usr/local/bin/sigillum-probe-test webauthn https://login.example.com example.com"; echo "webauthn-rc $?"' >> /tmp/sigillum-cer.log 2>&1
+fi
+V 'su -m nobody -c "timeout 30 /usr/local/bin/sigillum-probe-test register example.com /tmp/sprobe-x.cred"; echo "unknown-rc $?"
+echo "-- ui"; cat /tmp/sprobe-ui.log
+echo "-- sigillumd"; tail -12 /var/log/atrium/atrium-sigillumd.log 2>/dev/null
+echo "-- driver"; tail -8 /var/log/atrium/*sigillum-fido*.log 2>/dev/null' >> /tmp/sigillum-cer.log 2>&1
+else
 V 'sh -s' > /tmp/sigillum-cer.log 2>&1 <<'EOF'
 cd /root/s
 install -m 0755 sigillum-probe /usr/local/bin/sigillum-probe-test
@@ -244,13 +296,17 @@ su -m nobody -c "timeout 30 /usr/local/bin/sigillum-probe-test register example.
 echo "-- ui"; cat /tmp/sprobe-ui.log
 echo "-- sigillumd"; tail -12 /var/log/atrium/atrium-sigillumd.log 2>/dev/null
 EOF
+fi
 cat /tmp/sigillum-cer.log | sed 's/^/  /'
 C=/tmp/sigillum-cer.log
+grep -q "^ui: PIN requested" $C && bad "the key asked for its PIN: the scripted UI cancelled and sent none (a person must type it)"
 grep -q "^wrong-ui ui: closed" $C && ok "a UI under another uid is closed at once" || bad "wrong-uid UI: $(sed -n 's/^wrong-ui //p' $C)"
 grep -q "^register: ok .*rp_hash_ok=true" $C && grep -q "^register-rc 0" $C && ok "register: credential for example.com" || bad "register"
 grep -q "^assert: cred_match=true signature_ok=true" $C && grep -q "^assert-rc 0" $C && ok "assert: signature verifies" || bad "assert"
+if [ -n "$REAL" ] && [ -z "${SIGILLUM_WEBAUTHN:-}" ]; then echo "  skip webauthn (SIGILLUM_WEBAUTHN=1 for two more touches)"; else
 grep -q "^webauthn create: ok=true" $C && grep -q "^webauthn get: ok=true" $C && grep -q "^webauthn-rc 0" $C && ok "webauthn: create + get through sigillum-webauthn verify as an RP" || bad "webauthn"
 grep -q "^webauthn foreign rp: security_error=true" $C && ok "webauthn: a foreign RP ID is SecurityError" || bad "webauthn foreign RP"
+fi
 grep -q "^unknown-rc 0" $C && bad "an unknown uid registered" || ok "an unknown uid is refused"
 grep -q "Show" $C && ok "the UI was shown the sheets" || bad "the UI saw no sheet"
 
@@ -299,6 +355,7 @@ grep -q "^wrong status=3 " $C && ok "three wrong passcodes (PAM said no): NEEDS_
 grep -q "^right status=0 " $C && ok "the right passcode (PAM said yes): signed" || bad "right passcode: $(sed -n 's/^right //p' $C)"
 grep -q "^next-use status=3 " $C && ok "the next use asks again (no passcode left: cancelled)" || bad "next use: $(sed -n 's/^next-use //p' $C)"
 
+if [ -n "$REAL" ]; then echo "== hot-plug skipped (real key)"; echo "sigillum: $fails failed"; exit $fails; fi
 echo "== hot-plug and unplug a second key (devd path)"
 before=$(V 'jls -n name | grep -c "^name=atrium-sigillum-fido-"')
 mon "device_add u2f-emulated,id=fido9"; sleep 10

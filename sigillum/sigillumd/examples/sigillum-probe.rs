@@ -54,6 +54,13 @@ fn ui_loop(sock: &str) -> ExitCode {
                     let _ = write_msg(&mut w, &FromUi::Press { key: *key, choice: Choice::Device(d.id), activation_ok: true }, ui::MAX_MESSAGE);
                 }
             }
+            // A key's PIN is never scripted: on a real key a wrong PIN burns
+            // one of its retries. Cancel the ceremony and say so; the gate
+            // stops there and a person types the PIN in a real sheet.
+            ToUi::AskPin { key, retries, wrong, .. } => {
+                println!("ui: PIN requested (retries={retries} wrong={wrong}): cancelled, no PIN sent");
+                let _ = write_msg(&mut w, &FromUi::Press { key: *key, choice: Choice::Cancel, activation_ok: true }, ui::MAX_MESSAGE);
+            }
             // Type the next scripted passcode; none left: cancel.
             ToUi::AskPasscode { key, .. } => {
                 let msg = match passcodes.pop_front() {
