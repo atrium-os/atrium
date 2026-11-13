@@ -60,6 +60,15 @@ fn only_the_bar_holds_removable_media() {
 }
 
 #[test]
+fn only_the_bar_may_lock_the_screen() {
+    // The bar's Lock button (lock-screen.md §2).
+    assert_eq!(load("forum-bar/atrium.toml").capabilities.session_lock, Some(true));
+    for rel in ["forum-wm/atrium.toml", "forum-dock/atrium.toml", "forum-overview/atrium.toml"] {
+        assert_eq!(load(rel).capabilities.session_lock, None, "{rel}");
+    }
+}
+
+#[test]
 fn the_bar_and_the_wm_hold_media_control() {
     // The bar shows now-playing; forum-wm sends the media keys and focus.
     for rel in ["forum-bar/atrium.toml", "forum-wm/atrium.toml"] {

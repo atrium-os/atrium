@@ -188,6 +188,11 @@ fn validate_capabilities(c: &Capabilities, ctx: &str, r: &mut Report) {
             "{ctx}.removable-media = true: restricted to Forum's bar (USB sticks and eject); \
              requires explicit policy approval"));
     }
+    if c.session_lock == Some(true) {
+        r.warnings.push(format!(
+            "{ctx}.session-lock = true: restricted to Forum's bar (the Lock button); \
+             requires explicit policy approval"));
+    }
     if c.media_control == Some(true) {
         r.warnings.push(format!(
             "{ctx}.media-control = true: restricted to now-playing and the media keys \

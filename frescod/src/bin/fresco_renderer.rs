@@ -58,6 +58,9 @@ mod credential;
 #[path = "../activation.rs"]
 #[allow(dead_code)]
 mod activation;
+#[path = "../lock.rs"]
+#[allow(dead_code)]
+mod lock;
 #[path = "../socket_server.rs"]
 mod socket_server;
 /// Renderers hold no capabilities (fresco-capabilities.md §2): the front

@@ -347,6 +347,14 @@ fn route(ev: &DisplayEvent, comp: &Arc<Mutex<Compositor>>) -> Route {
         | E::GamepadConnect { window_id, .. }
         | E::Gamepad { window_id, .. } => return Route::Owner(owner_of(window_id)),
     };
+    /* While locked (lock-screen.md §3) input goes to the window's owner
+     * alone (the lock screen, a sheet), never to the WM, whose session is
+     * the one locked; input over the background goes nowhere. */
+    let input = matches!(ev, E::InputKey { .. } | E::InputPointerMotion { .. } | E::InputPointerButton { .. }
+        | E::InputPointerScroll { .. } | E::InputPointerMagnify { .. } | E::InputSwipe { .. });
+    if input && crate::lock::locked() {
+        return if window_id == 0 { Route::Owner(None) } else { Route::Owner(owner_of(window_id)) };
+    }
     if window_id == 0 {
         return Route::WmOnly;
     }

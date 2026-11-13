@@ -143,6 +143,12 @@ pub struct Capabilities {
     /// the mount, which the session's user owns. Restricted.
     #[serde(rename = "removable-media")]
     pub removable_media: Option<bool>,
+    /// Lock the screen (Forum's bar, docs/spec/lock-screen.md): ask
+    /// ostiarius, over its `ostiarius-lock/` socket, to lock the session.
+    /// That socket takes `lock` and nothing else; unlocking is the lock
+    /// screen's alone. Restricted.
+    #[serde(rename = "session-lock")]
+    pub session_lock: Option<bool>,
     /// A status item in Forum's bar (forum-status-items.md): an icon and a
     /// menu the bar draws for this app, over forum-wm's `forum-status/`
     /// socket. The app never draws in the bar.
@@ -360,6 +366,7 @@ pub fn merge_capabilities(base: &Capabilities, ovr: &Capabilities) -> Capabiliti
         audio_control:    ovr.audio_control.or(base.audio_control),
         media_control:    ovr.media_control.or(base.media_control),
         removable_media:  ovr.removable_media.or(base.removable_media),
+        session_lock:     ovr.session_lock.or(base.session_lock),
         status_item:      ovr.status_item.or(base.status_item),
         audio_device:     ovr.audio_device.or(base.audio_device),
         net_fetch:        ovr.net_fetch.or(base.net_fetch),

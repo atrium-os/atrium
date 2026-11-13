@@ -13,7 +13,13 @@
 //! Usage (in-VM):
 //!   FRESCO_SOCK=/tmp/frescod.sock vestibulum
 //!
-//! Quit: Esc or close button.
+//! Quit: Esc or close button (not in lock mode).
+//!
+//! Lock mode (`vestibulum --lock USER`, launched by ostiarius when the
+//! session locks; docs/spec/lock-screen.md): "Locked", the user's name, the
+//! password field, Unlock, and "Use a security key", which asks ostiarius
+//! for `unlock_with_key` (Sigillum's sheet then asks for the key or the
+//! passcode). It exits once ostiarius answers ok.
 
 use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
@@ -48,6 +54,11 @@ const FORM_Y: f32 = (WIN_H as f32 - FORM_H) / 2.0;
 
 #[derive(Clone)]
 struct LoginView {
+    /// Lock mode: the locked session's user.
+    lock: Option<String>,
+    /// Lock mode: "Use a security key" was pressed; the main loop asks
+    /// ostiarius once the status line is painted.
+    key_requested: Mutable<bool>,
     username: Mutable<TextEdit>,
     password: Mutable<TextEdit>,
     status: Mutable<String>,
@@ -75,7 +86,10 @@ impl View for LoginView {
         // Heading.
         ctx.tree.insert(None, Node::Text {
             rect: Rect::new(FORM_X, FORM_Y, 0.0, 0.0),
-            content: "Sign in to Atrium".into(),
+            content: match &self.lock {
+                Some(u) => format!("Locked: {u}"),
+                None => "Sign in to Atrium".into(),
+            },
             style: TextStyle {
                 family: font::SANS.into(),
                 size: type_size::XL,
@@ -100,12 +114,14 @@ impl View for LoginView {
             },
         });
 
-        // Username field.
-        TextField::new(self.username.clone())
-            .placeholder("username")
-            .at(FORM_X, FORM_Y + 60.0)
-            .width(FORM_W)
-            .render(ctx);
+        // Username field (the lock screen knows its user).
+        if self.lock.is_none() {
+            TextField::new(self.username.clone())
+                .placeholder("username")
+                .at(FORM_X, FORM_Y + 60.0)
+                .width(FORM_W)
+                .render(ctx);
+        }
 
         // Password field — masked.
         TextField::new(self.password.clone())
@@ -113,6 +129,38 @@ impl View for LoginView {
             .at(FORM_X, FORM_Y + 60.0 + 48.0)
             .width(FORM_W)
             .render(ctx);
+
+        if self.lock.is_some() {
+            let password = self.password.clone();
+            let status = self.status.clone();
+            let done = self.done.clone();
+            Button::primary("Unlock")
+                .at(FORM_X, FORM_Y + 60.0 + 48.0 * 2.0 + space::MD)
+                .width(FORM_W)
+                .on_click(move || {
+                    let p = password.get_cloned().text().to_string();
+                    if p.is_empty() {
+                        status.set("enter your password".into());
+                        return;
+                    }
+                    match ostiarius(serde_json::json!({ "op": "unlock", "password": p })) {
+                        Ok(_) => done.set(true),
+                        Err(e) => status.set(e),
+                    }
+                })
+                .render(ctx);
+            let key = self.key_requested.clone();
+            let status = self.status.clone();
+            Button::secondary("Use a security key")
+                .at(FORM_X, FORM_Y + 60.0 + 48.0 * 3.0 + space::MD * 2.0)
+                .width(FORM_W)
+                .on_click(move || {
+                    status.set("Follow the prompt for your security key.".into());
+                    key.set(true);
+                })
+                .render(ctx);
+            return;
+        }
 
         // Sign-in button.
         let username = self.username.clone();
@@ -154,6 +202,15 @@ impl View for LoginView {
 /// not path=/) reaches it via the same ro service-socket mount as frescod —
 /// jaild scrubs env, so the in-jail process relies on this default.
 fn session_handoff(user: &str, password: &str) -> Result<String, String> {
+    let r = ostiarius(serde_json::json!({
+        "op": "login", "user": user, "password": password, "frontend": "gui",
+    }))?;
+    Ok(r.unwrap_or_else(|| user.to_string()))
+}
+
+/// One request to ostiarius's control socket, one reply: the active user
+/// on ok, or the error the form shows.
+fn ostiarius(req: serde_json::Value) -> Result<Option<String>, String> {
     use std::io::{BufRead, BufReader, Write};
     use std::os::unix::net::UnixStream;
 
@@ -163,9 +220,6 @@ fn session_handoff(user: &str, password: &str) -> Result<String, String> {
         .map_err(|e| format!("session manager unavailable: {e}"))?;
     let mut writer = stream.try_clone().map_err(|e| e.to_string())?;
 
-    let req = serde_json::json!({
-        "op": "login", "user": user, "password": password, "frontend": "gui",
-    });
     let mut line = req.to_string();
     line.push('\n');
     writer.write_all(line.as_bytes()).map_err(|e| e.to_string())?;
@@ -175,11 +229,7 @@ fn session_handoff(user: &str, password: &str) -> Result<String, String> {
     let v: serde_json::Value =
         serde_json::from_str(resp.trim()).map_err(|e| format!("bad reply: {e}"))?;
     match v.get("status").and_then(|s| s.as_str()) {
-        Some("ok") => Ok(v
-            .get("active")
-            .and_then(|a| a.as_str())
-            .unwrap_or(user)
-            .to_string()),
+        Some("ok") => Ok(v.get("active").and_then(|a| a.as_str()).map(str::to_string)),
         _ => Err(v
             .get("message")
             .and_then(|m| m.as_str())
@@ -190,6 +240,11 @@ fn session_handoff(user: &str, password: &str) -> Result<String, String> {
 
 fn main() -> std::io::Result<()> {
     env_logger::init();
+    let mut args = std::env::args().skip(1);
+    let lock = match args.next().as_deref() {
+        Some("--lock") => Some(args.next().unwrap_or_default()),
+        _ => None,
+    };
 
     // $FRESCO_SOCK overrides (dev/harness); otherwise resolve like every other
     // client — connect_default() finds the canonical in-jail socket
@@ -233,13 +288,18 @@ fn main() -> std::io::Result<()> {
     let dirty = Arc::new(AtomicBool::new(true));
     let username = Mutable::with_dirty(TextEdit::default(), Arc::clone(&dirty));
     let password = Mutable::with_dirty(TextEdit::default().secret(true), Arc::clone(&dirty));
-    let status   = Mutable::with_dirty("Use your local account password.".to_string(), Arc::clone(&dirty));
+    let hint = if lock.is_some() { "Enter your password, or use a security key." } else { "Use your local account password." };
+    let status   = Mutable::with_dirty(hint.to_string(), Arc::clone(&dirty));
+    let key_requested = Mutable::with_dirty(false, Arc::clone(&dirty));
     let done     = Mutable::with_dirty(false, Arc::clone(&dirty));
 
+    let locked = lock.is_some();
     let view = LoginView {
+        lock,
+        key_requested: key_requested.clone(),
         username: username.clone(),
         password: password.clone(),
-        status,
+        status: status.clone(),
         done: done.clone(),
     };
 
@@ -260,6 +320,8 @@ fn main() -> std::io::Result<()> {
 
         // Handle window-lifecycle events at the loop level.
         match &ev {
+            // The lock screen does not close: only an unlock ends it.
+            fresco_client::Event::CloseRequested { .. } | fresco_client::Event::Key { hid_usage: 0x29, pressed: true, .. } if locked => {}
             fresco_client::Event::CloseRequested { .. } => {
                 log::info!("vestibulum: close requested, exiting");
                 break;
@@ -289,6 +351,21 @@ fn main() -> std::io::Result<()> {
         if !deltas.is_empty() {
             commit(&mut surface, &deltas)?;
             surface.present()?;
+        }
+
+        // "Use a security key", once its status line is on screen: this
+        // waits while Sigillum's sheet runs the ceremony.
+        if key_requested.get() {
+            key_requested.set(false);
+            match ostiarius(serde_json::json!({ "op": "unlock_with_key" })) {
+                Ok(_) => done.set(true),
+                Err(e) => status.set(e),
+            }
+            let deltas = app.tick();
+            if !deltas.is_empty() {
+                commit(&mut surface, &deltas)?;
+                surface.present()?;
+            }
         }
     }
 

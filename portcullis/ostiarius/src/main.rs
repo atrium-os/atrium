@@ -129,7 +129,7 @@ fn main() {
         let mut o = Ostiarius::new(AllocLauncher).with_seat_path(seat);
         eprintln!("ostiarius(demo): serving {sock} (allocates per-app uids, no jaild)");
         let r = if std::env::var("OSTIARIUS_OPEN").is_ok() {
-            ostiarius::control::serve(&mut o, &sock, |_| true)
+            ostiarius::control::serve(&mut o, &sock, |_| Some(ostiarius::control::Access::Full))
         } else {
             ostiarius::control::serve(&mut o, &sock, ostiarius::control::vestibulum_gate)
         };
@@ -156,6 +156,7 @@ fn main() {
         // De-rooted: ostiarius launches via the portcullisd broker, not jaild.
         if let Ok(b) = std::env::var("BROKER_SOCK") { launcher.broker_sock = b; }
         spawn_verify(launcher.broker_sock.clone());
+        spawn_lock(&sock);
         let arca = std::env::var("ARCA_SOCKET")
             .unwrap_or_else(|_| "/atrium/sockets/arca/arcad.sock".into());
         let mut o = with_sigillum(Ostiarius::new(launcher).with_seat_path(seat).with_arca(arca)); // stub auth (no with_pam)
@@ -183,7 +184,7 @@ fn main() {
         }
         eprintln!("ostiarius(prod-test): serving {sock} with JaildLauncher (real jails)");
         let r = if std::env::var("OSTIARIUS_OPEN").is_ok() {
-            ostiarius::control::serve(&mut o, &sock, |_| true)
+            ostiarius::control::serve(&mut o, &sock, |_| Some(ostiarius::control::Access::Full))
         } else {
             ostiarius::control::serve(&mut o, &sock, ostiarius::control::vestibulum_gate)
         };
@@ -202,6 +203,7 @@ fn main() {
     let mut launcher = JaildLauncher::default();
     if let Ok(b) = std::env::var("BROKER_SOCK") { launcher.broker_sock = b; }
     spawn_verify(launcher.broker_sock.clone());
+    spawn_lock(SOCK);
     let mut o = with_sigillum(Ostiarius::new(launcher));
     if let Err(e) = o.boot() {
         eprintln!("ostiarius: boot (launch vestibulum): {e}");
@@ -221,5 +223,14 @@ fn with_sigillum<L: ostiarius::Launcher>(o: Ostiarius<L>) -> Ostiarius<L> {
         v => o.with_sigillum(Box::new(ostiarius::sigillum::SigillumLink::new(
             v.unwrap_or_else(|_| sigillum_proto::client::SOCKET.into()),
         ))),
+    }
+}
+
+/// The lock-only socket Forum's bar reaches (lock-screen.md §2):
+/// `$OSTIARIUS_LOCK_SOCK`, default `control::LOCK_SOCK`; `none` turns it off.
+fn spawn_lock(control_sock: &str) {
+    match std::env::var("OSTIARIUS_LOCK_SOCK") {
+        Ok(v) if v == "none" => {}
+        v => ostiarius::control::spawn_lock_socket(v.unwrap_or_else(|_| ostiarius::control::LOCK_SOCK.into()), control_sock.into()),
     }
 }

@@ -92,6 +92,9 @@ mod activation;
 #[path = "../caps.rs"]
 #[allow(dead_code)]
 mod caps;
+#[path = "../lock.rs"]
+#[allow(dead_code)]
+mod lock;
 #[path = "../socket_server.rs"]
 mod socket_server;
 

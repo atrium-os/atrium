@@ -107,6 +107,8 @@ struct BarView {
     sticks_open: Mutable<MenuState>,
     stick_note: Mutable<Option<String>>,
     want_eject: Mutable<Option<String>>,
+    /// The Lock button was pressed: the main loop asks ostiarius.
+    want_lock: Mutable<bool>,
 }
 
 /// An app's own panel to open (forum-status-items.md §4): under the icon
@@ -599,7 +601,10 @@ impl View for BarView {
             ..FlexStyle::default()
         });
         ctx.pop();
-        icon_glyph(ctx, phosphor::LOCK_SIMPLE, None);
+        // Lock the screen (lock-screen.md §2): ostiarius locks, frescod
+        // hides the session, the lock screen comes up.
+        let lock = self.want_lock.clone();
+        icon_glyph(ctx, phosphor::LOCK_SIMPLE, Some(Box::new(move || lock.set(true))));
         ctx.pop();
 
         // Clock block, right-aligned text.
@@ -890,6 +895,24 @@ fn stick_menu(sticks: &[atrium_media::Volume], note: Option<&str>) -> (Vec<MenuI
     (items, parts)
 }
 
+/// Ask ostiarius to lock the screen, over the socket `session-lock` mounts
+/// (docs/spec/lock-screen.md §2). It answers once the lock screen is up.
+fn lock_screen() {
+    use std::io::{BufRead, BufReader, Write};
+    let path = std::env::var("FORUM_BAR_LOCK_SOCK").unwrap_or_else(|_| "/atrium/sockets/ostiarius-lock/lock.sock".into());
+    let r = std::os::unix::net::UnixStream::connect(&path).and_then(|s| {
+        (&s).write_all(b"{\"op\":\"lock\"}\n")?;
+        let mut line = String::new();
+        BufReader::new(&s).read_line(&mut line)?;
+        Ok(line)
+    });
+    match r {
+        Ok(l) if l.contains("\"ok\"") => {}
+        Ok(l) => eprintln!("forum-bar: lock refused: {}", l.trim()),
+        Err(e) => eprintln!("forum-bar: lock: {path}: {e}"),
+    }
+}
+
 fn main() -> std::io::Result<()> {
     // The system appearance decides (the Window follows it); `dark` only
     // seeds the first frame when frescod has none to give.
@@ -938,6 +961,7 @@ fn main() -> std::io::Result<()> {
     let sticks_open = Mutable::with_dirty(MenuState::default(), dirty.clone());
     let stick_note = Mutable::with_dirty(None, dirty.clone());
     let want_eject = Mutable::with_dirty(None, dirty.clone());
+    let want_lock = Mutable::with_dirty(false, dirty.clone());
     let (stick_events, stick_tx) = follow_sticks();
     // The grants handed to apps for their own panels: token, app.
     let mut drawn: Vec<([u8; 16], String)> = Vec::new();
@@ -968,6 +992,7 @@ fn main() -> std::io::Result<()> {
         sticks_open: sticks_open.clone(),
         stick_note: stick_note.clone(),
         want_eject: want_eject.clone(),
+        want_lock: want_lock.clone(),
     };
     let mut app = App::new_with_flag(view, dirty).with_theme(mode);
 
@@ -1107,6 +1132,11 @@ fn main() -> std::io::Result<()> {
                 sticks.set(l);
             }
         }
+        // The Lock button: ostiarius's lock-only socket, on a thread.
+        if want_lock.get() {
+            want_lock.set(false);
+            std::thread::spawn(lock_screen);
+        }
         // An Eject pick: on a thread, as an unmount can take a while.
         if let Some(part) = want_eject.get_cloned() {
             want_eject.set(None);
@@ -1181,6 +1211,7 @@ mod tests {
             sticks_open: Mutable::new(MenuState::default()),
             stick_note: Mutable::new(None),
             want_eject: Mutable::new(None),
+            want_lock: Mutable::new(false),
         }
     }
 

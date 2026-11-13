@@ -110,7 +110,7 @@ fn session_layer(human: &str, frontend: Frontend) -> Vec<LaunchSpec> {
         // stream on the active session itself.
         Frontend::Gui => vec![
             spec("org.atrium.forum-wm", human, "forum-wm", &[], vec!["graphics", "window-management", "notify", "media-control", "audio-control"]),
-            spec("org.atrium.forum-bar", human, "forum-bar", &[], vec!["graphics", "forum-control", "audio-control", "media-control", "removable-media"]),
+            spec("org.atrium.forum-bar", human, "forum-bar", &[], vec!["graphics", "forum-control", "audio-control", "media-control", "removable-media", "session-lock"]),
             spec("org.atrium.forum-dock", human, "forum-dock", &[], vec!["graphics", "forum-control"]),
         ],
         // Display-down fallback: a login zsh in the human's session jail (the
@@ -297,6 +297,28 @@ impl<L: Launcher> Ostiarius<L> {
         seat::set_locked_at(&seat::locked_path(&self.seat_path), who.as_deref()).map_err(|e| format!("session lock: {e}"))
     }
 
+    /// The lock screen (docs/spec/lock-screen.md): lock the active session
+    /// and show vestibulum in lock mode over it. frescod hides the session
+    /// as soon as the lock file names its user, before the lock screen is
+    /// up. If the lock screen cannot be launched the lock is lifted again
+    /// and the error returned: a lock with nothing to unlock it would shut
+    /// the user out. Locking a locked session does nothing.
+    pub fn lock_screen(&mut self) -> Result<(), String> {
+        if seat::is_locked_at(&self.seat_path) {
+            return Ok(());
+        }
+        let user = self.active_human().ok_or("no active session to lock")?;
+        self.set_locked(true)?;
+        // The login screen's jail from boot, or the last lock's, goes first.
+        let _ = self.launcher.teardown("org.atrium.vestibulum");
+        let v = spec("org.atrium.vestibulum", "_login", "vestibulum", &["--lock", &user], vec!["graphics"]);
+        if let Err(e) = self.launcher.launch(&v) {
+            let _ = self.set_locked(false);
+            return Err(format!("lock screen: {e}"));
+        }
+        Ok(())
+    }
+
     /// The humans with a live session right now (active + any detached).
     pub fn live_sessions(&self) -> Vec<&str> {
         self.sessions.keys().map(|s| s.as_str()).collect()
@@ -345,6 +367,24 @@ pub mod control {
         Err { message: String },
     }
 
+    /// What a peer of the control socket may ask.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub enum Access {
+        /// The trusted login UI (vestibulum): everything.
+        Full,
+        /// An app of the active session (Forum's Lock button): only `lock`,
+        /// whose worst case is a locked screen.
+        LockOnly,
+    }
+
+    /// [`handle`] for a peer with `access`.
+    pub fn handle_as<L: Launcher>(ost: &mut Ostiarius<L>, access: Access, req: Request) -> Response {
+        if access == Access::LockOnly && !matches!(req, Request::Lock) {
+            return Response::Err { message: "only lock is allowed here".into() };
+        }
+        handle(ost, req)
+    }
+
     /// Handle one request against the orchestrator. Pure of the socket — the unit
     /// of behavior the daemon loop wraps. Login authenticates then establishes the
     /// session; logout tears it down.
@@ -357,7 +397,7 @@ pub mod control {
                     ost.login(&human, frontend)
                 }),
             Request::Logout => ost.logout(),
-            Request::Lock => ost.set_locked(true),
+            Request::Lock => ost.lock_screen(),
             Request::Unlock { password } => match ost.active_human() {
                 None => Err("no active session".into()),
                 Some(active) => ost.authenticate(&active, &password).and_then(|human| {
@@ -373,16 +413,71 @@ pub mod control {
         }
     }
 
-    /// The connecting peer's app-id, via `getpeereid` → the launch registry. The
-    /// daemon admits only the trusted login UI (`org.atrium.vestibulum`).
-    fn peer_is_vestibulum(stream: &UnixStream) -> bool {
+    /// The connecting peer, via `getpeereid` → the launch registry: the
+    /// trusted login UI (`org.atrium.vestibulum`, owned by `_login`) gets
+    /// everything; ostiarius's own uid (its lock socket, below, passing on a
+    /// `lock`) only `lock`; anyone else nothing.
+    fn peer_access(stream: &UnixStream) -> Option<Access> {
         use std::os::fd::AsRawFd;
         let reg = portcullis_peer::AppRegistry::load(portcullis_peer::DEFAULT_REGISTRY)
             .unwrap_or_default();
-        match portcullis_peer::resolve(stream.as_raw_fd(), &reg) {
-            Ok(p) => p.app_id.as_deref() == Some("org.atrium.vestibulum"),
-            Err(_) => false,
+        let p = portcullis_peer::resolve(stream.as_raw_fd(), &reg).ok()?;
+        // SAFETY: geteuid has no preconditions.
+        if p.uid == unsafe { libc::geteuid() } {
+            return Some(Access::LockOnly);
         }
+        (p.app_id.as_deref() == Some("org.atrium.vestibulum") && p.user == "_login").then_some(Access::Full)
+    }
+
+    /// ostiarius's lock socket (docs/spec/lock-screen.md §2): what an app
+    /// holding `session-lock` (Forum's bar) reaches, in its own directory
+    /// so nothing else of ostiarius's is mounted with it.
+    pub const LOCK_SOCK: &str = "/atrium/sockets/ostiarius-lock/lock.sock";
+
+    /// Serve [`LOCK_SOCK`] (or `lock_sock`) on a thread: one JSON line,
+    /// `{"op":"lock"}`, passed on to the control socket at `control_sock`
+    /// as ostiarius's own uid (which the control socket lets do `lock` and
+    /// nothing else), and its answer passed back. Anything else is refused
+    /// here. Anyone may connect: the worst they can do is lock the screen.
+    pub fn spawn_lock_socket(lock_sock: String, control_sock: String) {
+        let _ = std::thread::Builder::new().name("ostiarius-lock".into()).spawn(move || {
+            let _ = std::fs::remove_file(&lock_sock);
+            let listener = match UnixListener::bind(&lock_sock) {
+                Ok(l) => l,
+                Err(e) => {
+                    eprintln!("ostiarius: lock socket {lock_sock}: {e}");
+                    return;
+                }
+            };
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let _ = std::fs::set_permissions(&lock_sock, std::fs::Permissions::from_mode(0o666));
+            }
+            for conn in listener.incoming().flatten() {
+                let _ = conn.set_read_timeout(Some(std::time::Duration::from_secs(5)));
+                let mut line = String::new();
+                let mut r = BufReader::new(std::io::Read::take(&conn, 256));
+                let _ = r.read_line(&mut line);
+                let answer = match serde_json::from_str::<Request>(line.trim()) {
+                    Ok(Request::Lock) => forward_lock(&control_sock),
+                    _ => Response::Err { message: "only lock is served here".into() },
+                };
+                let mut body = serde_json::to_vec(&answer).unwrap_or_default();
+                body.push(b'\n');
+                let _ = (&conn).write_all(&body);
+            }
+        });
+    }
+
+    fn forward_lock(control_sock: &str) -> Response {
+        let go = || -> std::io::Result<Response> {
+            let s = UnixStream::connect(control_sock)?;
+            (&s).write_all(b"{\"op\":\"lock\"}\n")?;
+            let mut line = String::new();
+            BufReader::new(&s).read_line(&mut line)?;
+            serde_json::from_str(line.trim()).map_err(std::io::Error::other)
+        };
+        go().unwrap_or_else(|e| Response::Err { message: format!("lock: {e}") })
     }
 
     /// The daemon service loop: listen on `sock_path`, and for each connection from
@@ -392,7 +487,7 @@ pub mod control {
     pub fn serve<L: Launcher>(
         ost: &mut Ostiarius<L>,
         sock_path: &str,
-        gate: impl Fn(&UnixStream) -> bool,
+        gate: impl Fn(&UnixStream) -> Option<Access>,
     ) -> std::io::Result<()> {
         let _ = std::fs::remove_file(sock_path);
         let listener = UnixListener::bind(sock_path)?;
@@ -409,10 +504,10 @@ pub mod control {
                 Ok(s) => s,
                 Err(_) => continue,
             };
-            if !gate(&stream) {
-                eprintln!("ostiarius: refused a non-vestibulum peer");
+            let Some(access) = gate(&stream) else {
+                eprintln!("ostiarius: refused a peer that is neither vestibulum nor the session's");
                 continue;
-            }
+            };
             let mut writer = stream.try_clone()?;
             let reader = BufReader::new(stream);
             for line in reader.lines() {
@@ -421,7 +516,7 @@ pub mod control {
                     _ => continue,
                 };
                 let resp = match serde_json::from_str::<Request>(&line) {
-                    Ok(req) => handle(ost, req),
+                    Ok(req) => handle_as(ost, access, req),
                     Err(e) => Response::Err { message: format!("bad request: {e}") },
                 };
                 let mut body = serde_json::to_vec(&resp).unwrap_or_default();
@@ -435,8 +530,8 @@ pub mod control {
     }
 
     /// The production peer gate (re-exported for the daemon binary).
-    pub fn vestibulum_gate(stream: &UnixStream) -> bool {
-        peer_is_vestibulum(stream)
+    pub fn vestibulum_gate(stream: &UnixStream) -> Option<Access> {
+        peer_access(stream)
     }
 }
 
@@ -690,6 +785,90 @@ mod tests {
         handle(&mut o, Request::Lock);
         handle(&mut o, Request::Logout);
         assert!(!seat::is_locked_at(&path), "logout clears the lock");
+    }
+
+    #[test]
+    fn lock_shows_the_lock_screen_and_only_lock_is_open_to_the_session() {
+        use crate::control::{handle_as, Access, Request, Response};
+        let path = seat_file("lockui");
+        let mut o = Ostiarius::new(MockLauncher::default()).with_seat_path(path.clone());
+        handle_as(&mut o, Access::Full, Request::Login { user: "alice".into(), password: "pw".into(), frontend: Frontend::Gui });
+        assert_eq!(handle_as(&mut o, Access::LockOnly, Request::Lock), Response::Ok { active: Some("alice".into()) });
+        assert!(seat::is_locked_at(&path));
+        let v = o.launcher.launched.last().unwrap();
+        assert_eq!((v.app_id.as_str(), v.owner.as_str()), ("org.atrium.vestibulum", "_login"));
+        assert_eq!(v.argv, vec!["--lock", "alice"]);
+        assert!(o.launcher.torn_down.contains(&"org.atrium.vestibulum".to_string()), "the old login screen goes first");
+        // Locking again launches nothing more.
+        let n = o.launcher.launched.len();
+        handle_as(&mut o, Access::LockOnly, Request::Lock);
+        assert_eq!(o.launcher.launched.len(), n);
+        // The session may lock, never unlock or log out.
+        for r in [Request::Unlock { password: "pw".into() }, Request::UnlockWithKey, Request::Logout, Request::EnrolKey { name: "k".into() }] {
+            assert!(matches!(handle_as(&mut o, Access::LockOnly, r), Response::Err { .. }));
+        }
+        assert!(seat::is_locked_at(&path) && o.active_human().as_deref() == Some("alice"));
+    }
+
+    #[test]
+    fn the_lock_socket_passes_on_lock_and_nothing_else() {
+        use std::io::{BufRead, BufReader, Write};
+        use std::os::unix::net::{UnixListener, UnixStream};
+        let d = std::env::temp_dir().join(format!("ost-locksock-{}", std::process::id()));
+        std::fs::create_dir_all(&d).unwrap();
+        let control = d.join("control.sock");
+        let lock = d.join("lock.sock");
+        let l = UnixListener::bind(&control).unwrap();
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let seen2 = seen.clone();
+        std::thread::spawn(move || {
+            for c in l.incoming().flatten() {
+                let mut line = String::new();
+                BufReader::new(&c).read_line(&mut line).unwrap();
+                seen2.lock().unwrap().push(line.trim().to_string());
+                (&c).write_all(b"{\"status\":\"ok\",\"active\":\"alice\"}\n").unwrap();
+            }
+        });
+        crate::control::spawn_lock_socket(lock.to_str().unwrap().into(), control.to_str().unwrap().into());
+        let ask = |req: &str| {
+            for _ in 0..50 {
+                if let Ok(s) = UnixStream::connect(&lock) {
+                    (&s).write_all(req.as_bytes()).unwrap();
+                    let mut line = String::new();
+                    BufReader::new(&s).read_line(&mut line).unwrap();
+                    return line;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+            panic!("no lock socket");
+        };
+        assert!(ask("{\"op\":\"lock\"}\n").contains("\"ok\""));
+        assert!(ask("{\"op\":\"unlock_with_key\"}\n").contains("err"));
+        assert!(ask("{\"op\":\"unlock\",\"password\":\"x\"}\n").contains("err"));
+        assert_eq!(*seen.lock().unwrap(), vec!["{\"op\":\"lock\"}"], "only the lock reached the control socket");
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// A launcher whose launches fail.
+    #[derive(Default)]
+    struct FailLauncher;
+    impl Launcher for FailLauncher {
+        fn launch(&mut self, _: &LaunchSpec) -> Result<i32, String> {
+            Err("no jail".into())
+        }
+        fn teardown(&mut self, _: &str) -> Result<(), String> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn no_lock_without_a_lock_screen() {
+        let path = seat_file("lockfail");
+        let o = Ostiarius::new(FailLauncher).with_seat_path(path.clone());
+        seat::set_active_at(&path, "alice").unwrap();
+        let mut o = o;
+        assert!(o.lock_screen().is_err());
+        assert!(!seat::is_locked_at(&path), "lifted again: nothing could unlock it");
     }
 
     /// Sigillum stand-in: answers verified when `ok`, and records the asks.

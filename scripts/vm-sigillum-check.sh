@@ -158,7 +158,7 @@ install -m 0644 ostiarius/atrium-login /etc/pam.d/atrium-login
 install -m 0644 ostiarius/45-atrium-ostiarius.toml /etc/atrium/services.d/
 install -d -o _arca -g _arca -m 0700 /var/db/arca
 install -d -o _arca -g _arca -m 0755 /atrium/sockets/arca
-install -d -o _ostiarius -g _ostiarius -m 0755 /atrium/sockets/ostiarius
+install -d -o _ostiarius -g _ostiarius -m 0755 /atrium/sockets/ostiarius /atrium/sockets/ostiarius-lock
 touch /var/run/atrium/courier-registry
 for d in dev libexec lib usr/lib usr/local/lib usr/local/bin atrium/sockets/arca atrium/sockets/sigillum var/db/arca var/run/atrium; do
   [ -d /var/lib/atrium/jails/arcad/$d ] || install -d /var/lib/atrium/jails/arcad/$d; done

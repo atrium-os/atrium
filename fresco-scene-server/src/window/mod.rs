@@ -20,6 +20,7 @@ use fresco_protocol::WmRole;
 use std::sync::{Arc, Mutex, mpsc};
 
 mod popup;
+mod lock;
 pub use popup::place as place_popup;
 pub use popup::HOSTED_LABEL_GAP;
 
@@ -587,6 +588,11 @@ pub struct Compositor {
     /// Pop-up grants waiting for their claim; in a split renderer, those
     /// to send to frescod.
     pub popup_grants: Vec<PopupGrant>,
+    /// The lock screen (docs/spec/lock-screen.md §3): while `Some`, only
+    /// windows of these owner uids are on screen. See `lock.rs`.
+    lock: Option<Vec<u32>>,
+    /// Windows the lock took off screen, bottom to top.
+    lock_hidden: Vec<WindowId>,
 }
 
 /// Server-side WM theme — controls how the compositor draws window
@@ -720,6 +726,8 @@ impl Compositor {
             popups_upstream: false,
             popup_top: 0.0,
             popup_grants: Vec::new(),
+            lock: None,
+            lock_hidden: Vec::new(),
         }
     }
 
@@ -955,6 +963,7 @@ impl Compositor {
         }
         self.windows.insert(id, w);
         self.z_order.push(id);
+        self.apply_lock();
         /* Tell the session a surface appeared. The WM reconciles on this
          * to place the newcomer; everyone else ignores it. (next_id starts
          * at 1, so this is never the implicit screen window 0.) */
@@ -1321,6 +1330,9 @@ impl Compositor {
     /// The window keys go to: the focused one, else the topmost that is
     /// not a notification (0: none).
     pub fn keyboard_window(&self) -> u32 {
+        if self.lock.is_some() {
+            return self.lock_keyboard_window();
+        }
         // An open menu takes the keys (fresco-popups.md §1).
         if let Some(p) = self.key_popup() {
             return p as u32;
@@ -1400,6 +1412,7 @@ impl Compositor {
                 if !self.z_order.contains(&child) {
                     self.z_order.push(child);
                 }
+                self.apply_lock();
             }
             None => {
                 let w = self.windows.get_mut(&child).unwrap();
@@ -1474,6 +1487,7 @@ impl Compositor {
             }
         }
         self.place_popups();
+        self.apply_lock();
     }
 
     pub fn raise(&mut self, id: WindowId) -> Option<FocusChange> {

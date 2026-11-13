@@ -17,7 +17,8 @@
 #      -s /usr/sbin/nologin`); 50093 is in jaild.policy's user-uid range.
 #   2. The control-socket subdir owned by _ostiarius so it can bind:
 #      `mkdir -p /atrium/sockets/ostiarius && chown _ostiarius:_ostiarius
-#       /atrium/sockets/ostiarius`.
+#       /atrium/sockets/ostiarius`, and the same for /atrium/sockets/ostiarius-lock
+#      (the lock-only socket Forum's bar reaches, docs/spec/lock-screen.md §2).
 #   3. The rootfs mountpoint dirs under <path>.
 #   4. Disable the old root rc.d: `sysrc atrium_ostiarius_enable=NO`.
 #   5. ostiarius installed as /usr/local/bin/atrium-ostiarius (the atrium- prefix

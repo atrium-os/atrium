@@ -194,8 +194,9 @@ pub fn caps_changed(client: u8) {
 fn pad_target(claims: &std::collections::BTreeMap<u32, u32>, id: u32, comp: &Mutex<Compositor>) -> u32 {
     let g = comp.lock().unwrap();
     if let Some(&w) = claims.get(&id) {
-        if u16::try_from(w).is_ok_and(|w| g.windows.contains_key(&w)) {
-            return w;
+        // A window off screen (the lock hid it) keeps its claim but gets nothing.
+        if let Some(win) = u16::try_from(w).ok().and_then(|w| g.windows.get(&w)) {
+            return if win.hidden { 0 } else { w };
         }
     }
     let w = g.keyboard_window();

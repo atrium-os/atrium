@@ -55,6 +55,10 @@ pub fn apply_all(
         // dispensatord's media socket (device-assignment.md §6.6).
         apply_socket("removable-media.sock", jc, opts);
     }
+    if caps.session_lock == Some(true) {
+        // ostiarius's lock-only socket (docs/spec/lock-screen.md §2).
+        apply_socket("ostiarius-lock.sock", jc, opts);
+    }
     if caps.audio_device == Some(true) {
         apply_audio_device(jc, opts);
     }

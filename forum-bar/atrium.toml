@@ -15,6 +15,7 @@ forum-control = true
 audio-control = true   # the volume control: levels and mutes, never samples
 media-control = true   # now-playing: the active player's app, state and controls
 removable-media = true # USB sticks served for the session, and eject
+session-lock  = true   # the Lock button: ostiarius locks; only the lock screen unlocks
 network       = "none"
 
 [supervision]

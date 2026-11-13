@@ -52,6 +52,7 @@ mod heads;
 mod outputs;
 mod video;
 mod span;
+mod lock;
 
 use atrium_gpu::amd::{Display, EventWatch, Gpu, ModeV2, OutputCommit, MODE_PREFERRED, NOTE_HOTPLUG, NOTE_RESET};
 
@@ -1354,11 +1355,18 @@ fn render_one_frame(
      * implicit screen window (id 0) is the whole screen; a content
      * window with no size yet gets the screen's, as before surfaces. */
     let full = (screen_w as f32, screen_h as f32);
+    /* The lock screen (lock-screen.md §3): while the seat is locked only
+     * its windows and Sigillum's sheets are in the z-order. */
+    let lock = lock::current();
     let layers: Vec<(u32, (f32, f32), (f32, f32))> = {
-        let g = comp.lock().unwrap();
+        let mut g = comp.lock().unwrap();
+        g.set_lock(lock);
         let mut out = Vec::with_capacity(g.windows.len());
-        /* Always include window 0 first (background scene). */
-        out.push((0u32, (0.0, 0.0), full));
+        /* Window 0 first (the WM's background scene), except while
+         * locked: the screen behind the lock is blank. */
+        if !g.locked() {
+            out.push((0u32, (0.0, 0.0), full));
+        }
         for &id in &g.z_order {
             if id == 0 { continue; }
             if let Some(w) = g.windows.get(&id) {
