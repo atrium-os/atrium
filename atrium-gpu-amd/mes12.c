@@ -2427,6 +2427,7 @@ struct amd_uq {
 	bool	 user;		/* user mode: the client writes ring and wptr
 				 * and rings its own doorbell page; pg is the
 				 * caller's (rs/uqueue.rs RamPages) */
+	u_int	 fault_vmid;	/* VMID the IH found it on at its fault */
 };
 
 static bool
@@ -2533,6 +2534,13 @@ amd_mes12_uq_hqd_vmid(struct amd_uq *q)
 	u_int vmid = 0;
 
 	return (uq2_hqd_find(q->m, q->db, &vmid) ? vmid : 0);
+}
+
+/* The IH found this queue on `vmid` at its fault (si_uq_faulted). */
+void
+amd_mes12_uq_note_fault(struct amd_uq *q, u_int vmid)
+{
+	q->fault_vmid = vmid;
 }
 
 /*
@@ -3098,8 +3106,23 @@ amd_mes12_uq_evict(struct amd_uq *q)
 	if (q->added && !uq2_done(q)) {
 		amd_mes12_uq_report(q, "destroy: work in flight");
 		amd_gmc12_l2_note(m->gt, "evict: after the queue report");
-		if (uq2_hqd_find(m, q->db, &vmid) && vmid >= 8) {
-			amd_gmc12_l2_note(m->gt, "evict: after the HQD lookup");
+		/*
+		 * Run fc80fbea: test 15's GFXHUB L2 went busy for good (and
+		 * CPF bit 28 set) during this lookup, a 32-HQD scan through
+		 * GRBM selects, while MES pipe 0 was busy scheduling (the
+		 * bystander's EOP had just come in); tests 7 and 13 scanned
+		 * with MES idle and recovered. Probe: reuse the VMID the IH
+		 * found at the fault and do not scan HQDs here.
+		 */
+		vmid = q->fault_vmid;
+		q->fault_vmid = 0;
+		if (vmid >= 8)
+			device_printf(m->sc->dev, "uq%u: VMID %u from the "
+			    "fault, no HQD scan\n", q->slot, vmid);
+		else if (!uq2_hqd_find(m, q->db, &vmid))
+			vmid = 0;
+		amd_gmc12_l2_note(m->gt, "evict: after the HQD lookup");
+		if (vmid >= 8) {
 			cp_snap(m, "before the wave kill");
 			err = amd_gfx12_sq_kill_vmid(m->sc, vmid);
 			cp_snap(m, "right after the wave kill");

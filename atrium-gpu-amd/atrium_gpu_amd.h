@@ -967,6 +967,7 @@ int	amd_mes12_uq_submit(struct amd_uq *q, uint64_t ib, uint32_t ib_dw,
 uint32_t amd_mes12_uq_fence(struct amd_uq *q);
 uint32_t amd_mes12_uq_doorbell(struct amd_uq *q);
 uint32_t amd_mes12_uq_seq(struct amd_uq *q);
+void	amd_mes12_uq_note_fault(struct amd_uq *q, u_int vmid);
 u_int	amd_mes12_uq_hqd_vmid(struct amd_uq *q);
 bool	amd_mes12_uq_hqd_where(struct amd_uq *q, u_int *pipe, u_int *queue);
 void	amd_mes12_uq_free_lost(struct amd_uq *q, device_t dev);

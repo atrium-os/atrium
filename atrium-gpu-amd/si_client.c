@@ -235,6 +235,7 @@ si_uq_faulted(struct amd_si_client *c, uint32_t vmids, bool log)
 		vmid = amd_mes12_uq_hqd_vmid(u->hw);
 		if (vmid < 8 || (vmids & (1u << vmid)) == 0)
 			continue;
+		amd_mes12_uq_note_fault(u->hw, vmid);
 		(void)si_uq_retire(c, i);	/* what fenced before it */
 		while (u->n > 0) {
 			if (u->owed[u->head].so != NULL)
