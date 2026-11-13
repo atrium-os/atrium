@@ -2037,8 +2037,14 @@ main(void)
 	/* 12: real-shader variants of gpusim's compute ops (5e). */
 	real_ops(&a);
 
-	/* 13: GPU W^X. */
-	wx();
+	/* 13: GPU W^X. SI_SKIP13=1 leaves it out (box bisection: every run
+	 * that wedged the GFXHUB at a 15 store fault had 13's SQC
+	 * instruction fault just before it; test 7's store fault, before
+	 * 13, never wedged). */
+	if (getenv("SI_SKIP13") == NULL || *getenv("SI_SKIP13") != '1')
+		wx();
+	else
+		printf("SKIP: 13 GPU W^X (SI_SKIP13)\n");
 
 	/* 15: hostile ISA (F6 G5). Before 14, whose refusals use up re-inits. */
 	hostile_isa();
