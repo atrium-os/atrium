@@ -780,3 +780,14 @@ work (self-test, scrub).
   DMA copy, CPU read refused, freed BO scrubbed, the next BO reads zero); test 6's "VRAM
   refused" check is gone. Also: the first four distinct unrouted EOP `src_data[0]` values
   are counted and logged at queue close, to identify the SUSPEND/RESUME EOPs.
+- **2026-11-13, stage 5d PASSED (53/53).** `a22a43de`, log `20261113T033700Z`. PSP
+  reservations 50 MiB at 0x7f3e00000 and 4 MiB at 0x7d6c00000 (ext); gmc VRAM 32640 MiB at
+  MC 0x8000000000, FB offset 0. Allocator range 0x8000000-0x7d6c00000 (31980 MiB); the
+  ~400 MiB between the two reservations stays unused. Self-test at 0x8000000 (MC
+  0x8008000000) PASS; the initial scrub of 31980 MiB took 410 ms (~78 GB/s, 128 fills, no
+  idle waits, 0 failed). Test 11: a new VRAM BO reads zero, a fill reads back, CPU read
+  refused, the freed BO scrubbed in 20 ms, the next BO reads zero. Steps 1-4 passed again.
+  Unrouted EOPs identified: apart from 0x18000000 once at attach, they carry a bare user
+  queue doorbell (0x20/0x22/0x26, no 0x1000000 tag) and track the free-rule preemptions:
+  MES's SUSPEND/RESUME EOPs, to be counted as preemption EOPs. Idle 7 W, detach clean, card
+  cold. Next: 5e (real-shader test variants).
