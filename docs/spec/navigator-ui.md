@@ -717,6 +717,56 @@ a password going to the wrong place.
 
 ---
 
+### 6.6 Ads and ad walls (measured 2026-11-13)
+
+*Asked by Shankar, 2026-11-13: pages "full of ads … the entire page starts crawling", and "can
+pages refuse to show if ads are not shown?". Measured on the corpus (119 pages) the same day;
+the per-page table is on the Mac in `~/src/navigator-corpus/ad-residue-2026-11-13/`, never
+committed. Host classification used EasyList and EasyPrivacy for measurement only.*
+
+**Crawling can't happen in the document lane**: no site script runs while you read, so nothing
+rotates, refreshes or reflows. On Live code pages it can, bounded by the page's jail limits and
+the GPU's per-window scheduling, and parking stops it when the page goes off screen.
+
+**What conversion already removes, with no blocklist:**
+
+| | pages | units |
+|---|---|---|
+| likely ad slots in the raw HTML | 62 of 119 | 507 (49 iframes, 48 ad or tracker scripts, 6 images, 404 marked elements) |
+| page requests refused during conversion | 34 | 1,055, of which 1,015 to ad or tracker hosts (989 one analytics host retrying) |
+| third-party ad creative in the converted page | **0** | 0 |
+| any ad residue after conversion | **11 (9%)** | 83 |
+
+The residue is first-party markup: empty ad boxes with an "Advertisement" label (4 pages, the only
+ones that take real space: up to 27.5% of the page), first-party sponsored blocks (6 pages, each
+under 2%), one tracker pixel fetched at conversion, and a label with no box.
+
+**Ad walls.** 8 of the 119 pages carry ad-block detection; **none ends up worse**: no converted
+page shows a wall or a "disable your ad blocker" message, and none lost text against tier 1
+(legacy-web §5.4.2's fallback). A wall the *server* enforces (content sent only after an ad, or
+only to signed-in readers) is not bypassed: the Navigator identifies itself honestly and never
+fakes an impression (legacy-web §5.4.1b). The reader sees what the server sent, and the page's
+menu offers *Open with the site's code*: the page as Live code, ads included, in its jail, under
+the amber light (§6.5). That choice is remembered per site.
+
+**An optional "Tidy page" setting** (Aa, §7; §13 D13). A host blocklist would remove nothing
+more, since ad hosts are already gone. What a reader would still notice is the empty labelled ad
+boxes, plus consent and newsletter boxes (3 and 6 pages). "Tidy page" collapses those, using
+element-hiding rules (EasyList's cosmetic list, optionally) applied in the document worker after
+conversion; off by default, per site, and the hidden count is shown in the Aa pop-up so nothing is
+removed silently.
+
+**Two backend findings from the measurement**, for the Navigator backend owners (not UI work):
+- **Iframes survive normalization.** 68 `<iframe>` elements remain in converted output (36
+  visible, on 18 pages). They load nothing, but 7 pages keep an empty box for one. The document
+  profile excludes `<iframe>` (profile §3), so the normalizer should drop them, or map the ones
+  that are recognised embeds to Limen slots.
+- **The converter downloads third-party scripts, ad scripts included.** The external-script
+  prefetch in `navigator-prerender` has no origin rule, so 48 ad or tracker scripts on 29 pages
+  are fetched as code at conversion; the same-origin rule refuses only what they then request.
+  That tells those hosts a conversion happened (once per conversion, shared by every reader). A
+  typed rule like legacy-web §5.4.1d's, or tier-3 substitution before fetching, would close it.
+
 ## 7. Reading controls
 
 **Aa** opens a pop-up with the controls the backend already supports, so none needs new
@@ -937,6 +987,7 @@ argued further on paper.
 | **D6** | Favicons | show site favicons (decoded in the page's jail, validated) · **monograms only** (§1) | **Monograms.** No site pixels in the chrome; lookalikes can't copy a monogram any better than the name |
 | **D7** | UI processes | **one per user session** · one per window (§2.3) | **One per session.** It holds nothing worth isolating per window, and the switch is cheap later |
 | **D9** | Malicious-site list for red (§6.5) | **off by default; local signals only** (cert failure, lookalike of an Arca login, jail monitor reports) · a downloaded hashed-prefix list on by default · per-visit online lookups | **Off by default, offered in settings.** The local signals catch what matters most with no data leaving; a list adds a dependency on its publisher |
+| **D13** | Ad residue (§6.6) | **optional "Tidy page", off by default, per site** · on by default · nothing | **Optional, off by default.** Conversion already removes every third-party ad; tidying first-party boxes is a heuristic, so the reader turns it on |
 | **D12** | Always private? (§2.4) | **Personal by default, with "start new trails Unrecorded" and a history retention setting** · Unrecorded always | **Personal by default.** Sites already see an anonymous reader; forgetting everything locally costs restore, history and the certificate-change signal |
 | **D11** | Status bar (§5.7) | **optional, off by default** · always on · none | **Optional, off by default.** The click check runs either way; the bar is for people who look before they click |
 | **D10** | Certificate errors (§6.5) | **no click-through on public sites; private addresses after typing the name** · click-through like other browsers | **No click-through.** A person who sees a red stop page and proceeds is the attack's success case |
