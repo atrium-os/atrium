@@ -2,6 +2,8 @@
 # Hospes H1: build the loader fixtures and the fixture runner, and run the fixtures.
 #
 #   sh scripts/hospes-build.sh fixtures            # rebuild hospes/fixtures/bin/{x86_64,aarch64}
+#   sh scripts/hospes-build.sh focal               # fetch focal's libstdc++ (S5) into ~/.cache
+#   sh scripts/hospes-build.sh cxxset              # rebuild the S5 C++ fixture against it
 #   sh scripts/hospes-build.sh runner TRIPLE       # static no_std runner for TRIPLE
 #   sh scripts/hospes-build.sh codec TRIPLE        # hospes-codec (OpenH264 host) for TRIPLE
 #   sh scripts/hospes-build.sh test-linux          # x86_64 native + aarch64 under qemu-user
@@ -62,6 +64,34 @@ build_fixtures() {
             -o "$out/glibc.so" "$src/glibc.cc" "$(cxxabi $arch)"
         echo "fixtures: $out"
     done
+}
+
+# focal_libstdcxx: Ubuntu focal's libstdc++ 6.0.28 (the InnaIT PKCS#11 module's) and gcc 9's
+# headers, unpacked once into ~/.cache, each deb pinned by SHA-256. Never committed.
+FOCAL="$HOME/.cache/hospes-focal-libstdcxx"
+focal_libstdcxx() {
+    [ -f "$FOCAL/root/usr/lib/x86_64-linux-gnu/libstdc++.so.6.0.28" ] && return 0
+    mkdir -p "$FOCAL"
+    for e in \
+        "7f9222342d3551d063bf651319ec397c39278eeeb9ab5950ae0e8c28ef0af431 pool/main/g/gcc-10/libstdc++6_10.5.0-1ubuntu1~20.04_amd64.deb" \
+        "e8c637e8f5a87f05b3f1dad0e020cc3763c384f5bb0fc159f69277645a2444df pool/main/g/gcc-9/libstdc++-9-dev_9.4.0-1ubuntu1~20.04.2_amd64.deb"; do
+        sha="${e%% *}"; url="${e#* }"
+        f="$FOCAL/$(basename "$url")"
+        [ -f "$f" ] || curl -sSfL -o "$f" "http://archive.ubuntu.com/ubuntu/$url"
+        echo "$sha  $f" | sha256sum -c --quiet || { rm -f "$f"; echo "focal deb checksum mismatch: $url" >&2; exit 1; }
+        dpkg-deb -x "$f" "$FOCAL/root"
+    done
+}
+
+# S5: the C++ fixture against focal's libstdc++ (x86_64 only, like the vendor module).
+build_cxxset() {
+    focal_libstdcxx
+    r="$FOCAL/root/usr"
+    clang++ --target=x86_64-linux-gnu -fuse-ld=lld -O2 -fPIC -shared -std=c++17 -nostdinc++ -nostdlib \
+        -isystem "$r/include/c++/9" -isystem "$r/include/x86_64-linux-gnu/c++/9" \
+        -Wall -Wl,-z,now -Wl,-z,relro -Wl,--build-id=none \
+        -o "$H/fixtures/bin/x86_64/cxxset.so" "$H/fixtures/src/cxxset.cc" "$r/lib/x86_64-linux-gnu/libstdc++.so.6"
+    echo "$H/fixtures/bin/x86_64/cxxset.so"
 }
 
 # cxxabi ARCH: a static LLVM libc++abi for ARCH. x86_64: the host's libc++abi-18-dev
@@ -152,6 +182,12 @@ run_all() {
     fi
     # H4: a glibc-built C++ library against the real shim (exceptions through the unwinder).
     $w "$r" glibc "$d/glibc.so" || fails=$((fails + 1))
+    # S5: a C++ library with the real focal libstdc++, loaded as a set (when it is fetched:
+    # sh scripts/hospes-build.sh focal).
+    lsc="$HOME/.cache/hospes-focal-libstdcxx/root/usr/lib/x86_64-linux-gnu/libstdc++.so.6.0.28"
+    if [ -f "$d/cxxset.so" ] && [ -f "$lsc" ]; then
+        $w "$r" cxx-set "$d/cxxset.so" "$lsc" || fails=$((fails + 1))
+    fi
     for m in relro-write text-write; do
         set +e
         $w "$r" "$m" "$d/reloc.so" 2>/dev/null
@@ -195,6 +231,8 @@ conform() {
 
 case "${1:-}" in
     fixtures) build_fixtures ;;
+    focal) focal_libstdcxx; echo "$FOCAL" ;;
+    cxxset) build_cxxset ;;
     runner) build_runner "$2" ;;
     codec) build_bin "$2" hospes-codec ;;
     cdm) build_bin "$2" hospes-cdm ;;

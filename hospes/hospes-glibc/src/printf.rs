@@ -238,16 +238,11 @@ pub unsafe fn format(out: &mut Buf, fmt: *const u8, ap: &mut VaList) {
             }
             b'f' | b'F' | b'e' | b'E' | b'g' | b'G' => {
                 let v = ap.next_arg::<f64>();
-                let prec = sp.prec.unwrap_or(6);
-                let mut tmp = [0u8; 64];
-                let mut t = Buf::new(tmp.as_mut_ptr(), tmp.len());
-                let _ = match conv {
-                    b'e' | b'E' => write!(t, "{:.*e}", prec, v.abs()),
-                    b'g' | b'G' => write!(t, "{}", v.abs()),
-                    _ => write!(t, "{:.*}", prec, v.abs()),
-                };
-                let n = t.len().min(63);
-                emit_num(out, &sp, v.is_sign_negative() && v != 0.0, &tmp[..n], b"");
+                let mut tmp = [0u8; 400];
+                let n = float_text(&mut tmp, v.abs(), conv, sp.prec.unwrap_or(6), sp.alt);
+                // The precision is spent: it is not a minimum digit count here.
+                let fsp = Spec { prec: None, zero: sp.zero && v.is_finite(), ..sp };
+                emit_num(out, &fsp, v.is_sign_negative() && !v.is_nan(), &tmp[..n], b"");
             }
             b'%' => out.byte(b'%'),
             b'n' => {
@@ -259,5 +254,107 @@ pub unsafe fn format(out: &mut Buf, fmt: *const u8, ap: &mut VaList) {
                 out.byte(other);
             }
         }
+    }
+}
+
+/// C's `%f`, `%e`, `%g` (and upper case) of a non-negative `v`, without the sign, into `out`;
+/// the length. Rust's formatting rounds correctly; this only reshapes it the C way.
+fn float_text(out: &mut [u8; 400], v: f64, conv: u8, prec: usize, alt: bool) -> usize {
+    let upper = conv.is_ascii_uppercase();
+    let mut b = Buf::new(out.as_mut_ptr(), out.len());
+    if !v.is_finite() {
+        let s: &[u8] = match (v.is_nan(), upper) {
+            (true, false) => b"nan",
+            (true, true) => b"NAN",
+            (false, false) => b"inf",
+            (false, true) => b"INF",
+        };
+        s.iter().for_each(|&c| b.byte(c));
+        return b.len();
+    }
+    let prec = prec.min(340);
+    // Mantissa digits and decimal exponent of `v` at `p` digits after the point.
+    let sci = |p: usize| -> (alloc::string::String, i32) {
+        let s = alloc::format!("{:.*e}", p, v);
+        let (m, e) = s.split_once('e').unwrap_or((&s, "0"));
+        (alloc::string::String::from(m), e.parse().unwrap_or(0))
+    };
+    let mut text: alloc::string::String;
+    match conv.to_ascii_lowercase() {
+        b'f' => {
+            text = alloc::format!("{:.*}", prec, v);
+            if alt && prec == 0 {
+                text.push('.');
+            }
+        }
+        b'e' => {
+            let (m, e) = sci(prec);
+            text = m;
+            if alt && prec == 0 {
+                text.push('.');
+            }
+            text.push_str(&alloc::format!("e{}{:02}", if e < 0 { '-' } else { '+' }, e.unsigned_abs()));
+        }
+        _ => {
+            let p = if prec == 0 { 1 } else { prec };
+            let (_, x) = sci(p - 1);
+            if (x as i64) < p as i64 && x >= -4 {
+                text = alloc::format!("{:.*}", (p as i64 - 1 - x as i64) as usize, v);
+            } else {
+                let (m, e) = sci(p - 1);
+                text = m;
+                text.push_str(&alloc::format!("e{}{:02}", if e < 0 { '-' } else { '+' }, e.unsigned_abs()));
+            }
+            if !alt {
+                // Drop trailing zeros of the fraction, then a bare point.
+                let (num, exp) = match text.find('e') {
+                    Some(i) => (alloc::string::String::from(&text[..i]), alloc::string::String::from(&text[i..])),
+                    None => (text.clone(), alloc::string::String::new()),
+                };
+                let mut num = num;
+                if num.contains('.') {
+                    while num.ends_with('0') {
+                        num.pop();
+                    }
+                    if num.ends_with('.') {
+                        num.pop();
+                    }
+                }
+                text = num + &exp;
+            }
+        }
+    }
+    for c in text.bytes() {
+        b.byte(if upper { c.to_ascii_uppercase() } else { c });
+    }
+    b.len().min(out.len() - 1)
+}
+
+#[cfg(test)]
+mod float_tests {
+    use super::*;
+
+    fn f(v: f64, conv: u8, prec: usize, alt: bool) -> std::string::String {
+        let mut o = [0u8; 400];
+        let n = float_text(&mut o, v, conv, prec, alt);
+        std::string::String::from_utf8(o[..n].to_vec()).unwrap()
+    }
+
+    #[test]
+    fn like_glibc() {
+        assert_eq!(f(2.5, b'g', 6, false), "2.5");
+        assert_eq!(f(2.5, b'f', 6, false), "2.500000");
+        assert_eq!(f(2.5, b'e', 6, false), "2.500000e+00");
+        assert_eq!(f(1e-5, b'g', 6, false), "1e-05");
+        assert_eq!(f(123456789.0, b'g', 6, false), "1.23457e+08");
+        assert_eq!(f(100000.0, b'g', 6, false), "100000");
+        assert_eq!(f(1000000.0, b'g', 6, false), "1e+06");
+        assert_eq!(f(0.0001, b'g', 6, false), "0.0001");
+        assert_eq!(f(0.0, b'g', 6, false), "0");
+        assert_eq!(f(0.5, b'g', 0, false), "0.5");
+        assert_eq!(f(3.0, b'g', 6, true), "3.00000");
+        assert_eq!(f(1.5e300, b'E', 2, false), "1.50E+300");
+        assert_eq!(f(f64::INFINITY, b'f', 6, false), "inf");
+        assert_eq!(f(9.9999999, b'g', 6, false), "10");
     }
 }

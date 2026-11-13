@@ -54,7 +54,7 @@ fn every_strong_import_resolves() {
 /// PKCS#11 module and the real libstdc++ 6.0.28 (Ubuntu focal), loaded as one set. The
 /// module's C++ imports (`GLIBCXX_*`, `CXXABI_*`) bind to libstdc++; libgcc_s is not loaded
 /// (the shim's unwinder stands in), so every other import of either resolves in the shim.
-/// An unversioned import binds to the baseline row, as the resolver does. The PC/SC, udev
+/// An unversioned import binds to any row of its name, as the resolver does. The PC/SC, udev
 /// and curl imports come from the sigillum-p11 host (P2), not from the shim.
 #[cfg(target_arch = "x86_64")]
 #[test]
@@ -77,7 +77,7 @@ fn the_innait_set_resolves() {
             if ["SCard", "udev_", "curl_"].iter().any(|p| name.starts_with(p)) {
                 continue;
             }
-            let found = have.contains(&(name, ver)) || (ver.is_none() && have.iter().any(|h| h.0 == name && h.1.is_some_and(|v| v == "GLIBC_2.2.5")));
+            let found = have.contains(&(name, ver)) || (ver.is_none() && have.iter().any(|h| h.0 == name));
             if !found && bind != "WEAK" {
                 missing.push(format!("{list}: {sym}"));
             }

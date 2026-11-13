@@ -897,6 +897,15 @@ administrative calls (`C_InnaIT*`: zeroize, initialise, applet install and delet
    functions, and libstdc++'s "C"-locale entry points (`__newlocale`, `__uselocale`,
    `__strcoll_l`…). Hospes's own `_Unwind_*` replaces libgcc_s. The Hospes loader also has
    to load more than one library and bind the module's C++ imports to libstdc++.
+   **Done 2026-11-13.** The loader takes a set of libraries (`load_set`, dependencies
+   first), with one static TLS module per library and TLS imported across them. Every
+   import of the module and of libstdc++ resolves (`the_innait_set_resolves`), except
+   PC/SC, udev and curl, which are P2's. The shim refuses the network, other processes and
+   code, shared memory, signal handlers and filesystem changes (`hospes-glibc/src/deny.rs`),
+   and computes the rest. A C++ test library linked against the real focal libstdc++ runs
+   as a set over the shim (`hospes/fixtures/src/cxxset.cc`): exceptions, iostreams with the
+   C locale, threads, `call_once` reading libstdc++'s TLS. The module itself has not run
+   yet: it runs first in P4.
 2. **P2.** `SCard*` over `sigillum-ccid`. The CCID transport is built: descriptor, bulk
    messages, ATR, APDUs, chaining, with 15 host tests on this token's real descriptor and
    ATR.

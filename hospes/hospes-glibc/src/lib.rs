@@ -576,14 +576,14 @@ pub struct Glibc;
 
 impl Resolver for Glibc {
     fn resolve(&self, name: &str, version: Option<&str>) -> Option<usize> {
-        // An unversioned reference binds to the baseline definition, as ld.so binds it to
-        // the oldest (the module was linked against a glibc without version info for it,
-        // e.g. libpthread's names in the InnaIT module).
-        TABLE
-            .iter()
-            .find(|e| e.name == name && e.version == version)
-            .or_else(|| version.is_none().then(|| TABLE.iter().find(|e| e.name == name && e.version == Some(BASE))).flatten())
-            .map(|e| (e.addr)())
+        // An unversioned reference (the library was linked without version info for the
+        // name, e.g. libpthread's names in the InnaIT module) binds to the baseline row,
+        // else to the name's only or first row, as ld.so binds it to a definition.
+        let exact = TABLE.iter().find(|e| e.name == name && e.version == version);
+        let loose = || {
+            TABLE.iter().find(|e| e.name == name && e.version == Some(BASE)).or_else(|| TABLE.iter().find(|e| e.name == name))
+        };
+        exact.or_else(|| if version.is_none() { loose() } else { None }).map(|e| (e.addr)())
     }
 }
 

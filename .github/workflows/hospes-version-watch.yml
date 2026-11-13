@@ -74,7 +74,7 @@ jobs:
         run: sh scripts/hospes-version-watch.sh ${{ matrix.arch }}
       - name: Fixture workload
         if: matrix.arch == 'x86_64'
-        run: sh scripts/hospes-build.sh test-linux
+        run: sh scripts/hospes-build.sh focal && sh scripts/hospes-build.sh test-linux
 
   fuzz:
     name: fuzz (5 min per target)
