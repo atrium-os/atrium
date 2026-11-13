@@ -5561,6 +5561,22 @@ then `vinculum-ctl -s ctl.sock pair NAME` (asks on the terminal; `--yes` for scr
 Classic devices pair with `vinculum-ctl pair ADDR --classic`. `peer_hid_keyboard.py` is the Bumble keyboard,
 `peer_hogp_mouse.py` the LE mouse. With `--hid`, vinculumd also scans in the background while a bonded LE device is away.
 
+### 13.6c Navigator UI shell on frescod (`scripts/navigator-ui-vm.sh`)
+
+`navigator-ui` (docs/spec/navigator-ui.md §14 step 1) is the Navigator's window over a stand-in trail
+store, with the page as a placeholder slot. With the VM up:
+
+    sh scripts/navigator-ui-vm.sh [out-dir]              # six scenes + a driven run, ~25 min under TCG
+    SCENES="main start" DRIVE=0 sh scripts/navigator-ui-vm.sh
+
+It cross-builds frescod, fresco-renderer, forum-wm and navigator-ui, runs frescod in split mode with the
+compute renderer (SPLIT=0 for the in-process path) and forum-wm so the window sits under the strip, and
+saves one frame per scene (`--scene main|prompt|start|live|stop`, `-dark` suffix for dark) to
+`scratch/navigator-ui/`. The driven run presses a link, Back, Ctrl-T, types a search, Enter, Ctrl-W and
+Ctrl-B through frescod's injector and checks the `NAVIGATOR_UI_TRACE` lines. Coordinates assume
+forum-wm's placement (window top at y 62 with no bar running). By hand:
+`FRESCO_SOCKET=… navigator-ui --scene start --dark`; `NAVIGATOR_UI_SECS`, `NAVIGATOR_UI_SIZE=WxH`.
+
 ### 13.7 Navigator corpus (on the Mac, no VM)
 
 - Corpus: `~/src/navigator-corpus` (batch 1 + `batch2/`). Run recipe in its README.

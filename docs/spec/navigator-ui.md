@@ -1006,6 +1006,11 @@ Each step runs in the VM on headless frescod before the next.
 
 1. **Static shell.** `navigator-ui` crate: window, rail, toolbar, prompt row, Start, drawn from
    a fake trail store, with the page as a placeholder slot. The mockup example is its seed.
+   *Built 2026-11-13:* `navigator-ui/` (trail model, Where field parsing and local suggestions,
+   keyboard map, stand-in store in `fake.rs`, drawing in `ui.rs`; page slot key `PAGE_SLOT`
+   logged until Limen binds it). Also drawn: the tier chip's popover, the status bar, the stop
+   page for red, the media glyph's mute. In-window stand-ins for what become Fresco pop-ups: the
+   suggestion list and the popover. Run with `scripts/navigator-ui-vm.sh` (RUNBOOK §13.6c).
 2. **One live page.** Connect to `navigatord`: open a session, bind the page through Limen L6,
    Back/Forward along a one-page trail, link activation, the origin strip following the slot.
 3. **Trails.** The tree, open beside, put away and Earlier, the trail store on disk.

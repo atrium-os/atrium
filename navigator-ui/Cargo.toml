@@ -1,0 +1,19 @@
+[package]
+name = "navigator-ui"
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+publish = false
+description = "navigator-ui — the Navigator's window (docs/spec/navigator-ui.md): the trail rail, the toolbar with the tier chip and its light, the prompt row, the status bar and Start, drawn by Pergola. Build step 1 (§14): a static shell over a stand-in trail store, with the page as a placeholder slot where Limen binds the jailed page in step 2."
+
+[lib]
+name = "navigator_ui"
+path = "src/lib.rs"
+
+[[bin]]
+name = "navigator-ui"
+path = "src/main.rs"
+
+[dependencies]
+pergola = { path = "../pergola" }
+fresco-client = { path = "../fresco-client" }
