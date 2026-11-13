@@ -266,6 +266,23 @@ job_init(struct job *j)
 	j->vm = j->q = j->shader = j->ib = j->out = j->so = -1;
 }
 
+/*
+ * SI_SKIPHANG=1 (wedge bisection, run 6eed21f1): leaves out the three
+ * hung-queue tests (8, 9's stuck user ring, 10's stuck queue). Test 7's
+ * store fault comes before them and recovers; test 15's comes after them
+ * and wedges the GFXHUB, with the same VMID, slot and fault status.
+ */
+static int
+skiphang(const char *what)
+{
+	const char *e = getenv("SI_SKIPHANG");
+
+	if (e == NULL || *e != '1')
+		return (0);
+	printf("SKIP: %s (SI_SKIPHANG)\n", what);
+	return (1);
+}
+
 static int
 job_open(struct job *j, const char *name)
 {
@@ -771,7 +788,9 @@ user_mode(struct job *other)
 	uq_close(&u);
 
 	/* A stuck user ring is lost after hang_ms; others run on. */
-	if (uq_open(g.vm, &h) != 0) {
+	if (skiphang("9 hang")) {
+		;
+	} else if (uq_open(g.vm, &h) != 0) {
 		check(0, "9 hang: user queue", "%s", strerror(errno));
 	} else {
 		(void)poison(g.out, POISON_A);
@@ -886,6 +905,8 @@ free_rule(struct job *a)
 	run_clean(a, "10 free rule: the queue runs on after the preemption");
 
 	/* The same while one of the VM's queues is stuck. */
+	if (skiphang("10 free rule (stuck)"))
+		return;
 	if (job_open(&h, "10") != 0) {
 		check(0, "10 free rule (stuck)", "setup failed");
 		job_close(&h);
@@ -2011,7 +2032,7 @@ main(void)
 	}
 
 	/* 8: a job that never ends loses its queue after hang_ms. */
-	if (f.vm >= 0 && f.q >= 0 && f.out >= 0) {
+	if (f.vm >= 0 && f.q >= 0 && f.out >= 0 && !skiphang("8 hang")) {
 		uint32_t w[7];
 
 		(void)poison(f.out, POISON_A);

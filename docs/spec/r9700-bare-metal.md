@@ -1245,3 +1245,16 @@ work (self-test, scrub).
   Next: SI15_BYLATE=1 opens the hostile queue before the bystander, so the
   hostile faults on VMID 11 in test 15 itself. Logs:
   claude/project-thread-33aauq 07740286.
+- **2026-11-13 12:17, BYLATE probe (si-client-test 19deaa3c, kmods fc54eb53,
+  SI_SKIP13=1 SI15_BYLATE=1 SI15_VA=0x10003000): still WEDGED, so the VMID is not
+  it.** 66 passed, 2 failed. The hostile queue was uq3 on VMID 11, the same slot,
+  VMID, doorbell and fault status (0xb41050) as test 7's clean fault. Yet the
+  after-kill state is again the wedge one (CPC 0x80110400, CPC_BUSY 0/0x4480, CPF
+  0xb0000001), followed by 185 flush timeouts, a busy GPU at 100% and no idle at
+  detach. No reboot was needed.
+  What does differ: test 7 faults before any hung queue. Test 15 faults after
+  three hung-queue recoveries (8, 9's user ring, 10's stuck queue), each ending
+  "waves killed; fence still behind" and an MMIO HQD reset of me1 pipe 0 queue 2.
+  The last of them was 1 s before test 15.
+  Next: SI_SKIPHANG=1 (19deaa3c+1) leaves those three out. Logs:
+  claude/project-thread-33aauq 6eed21f1.
