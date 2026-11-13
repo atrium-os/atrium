@@ -193,6 +193,7 @@ static const struct mes_gen mes_gens[] = {
 #define HDR_SUSPEND		0x00040061u	/* opcode 6 */
 #define HDR_RESUME		0x00040071u	/* opcode 7 */
 #define HDR_RESET		0x00040081u	/* opcode 8 (MESAPI__RESET) */
+#define MEC_RS64_PIPE0_RESET	0x00010000u	/* CP_MEC_RS64_CNTL, << pipe */
 #define RST_FLAGS		4	/* bit 0 reset_queue_only */
 #define RST_GANG_CTX		8
 #define RST_DOORBELL		16
@@ -2449,6 +2450,48 @@ uq2_hqd_reset(struct amd_uq *q)
 	return (idle);
 }
 
+/* MEC pipe resets so far: si_client.c loses the other queues on a move. */
+volatile u_int amd_mes12_pipe_resets;
+
+/*
+ * The last rung before a GPU reset, as amdgpu's mes_v12_0_reset_compute_
+ * pipe_mmio: hold the queue's MEC pipe in reset, force every HQD on it
+ * inactive, release the pipe (its firmware restarts at its start PC).
+ * Box runs a0597b2d..a4073d89: a CP-side fault (client CPG) left an HQD
+ * that neither a dequeue reset, REMOVE_QUEUE nor MES's RESET would stop.
+ * Every queue on that pipe is lost; true if the stuck HQD is now inactive.
+ */
+static bool
+uq2_pipe_reset(struct amd_uq *q)
+{
+	struct mes *m = q->m;
+	const struct mes_gen *g = m->g;
+	uint32_t d;
+	u_int vmid, pipe, qi, i;
+	bool idle;
+
+	if (!uq2_hqd_at(m, q->db, &vmid, &pipe, &qi))
+		return (true);
+	grbm_select_q(m, 1, pipe, qi);
+	d = rd(m, g->cp_mec_rs64_cntl);
+	wr(m, g->cp_mec_rs64_cntl, d | (MEC_RS64_PIPE0_RESET << pipe));
+	for (i = 0; i < 8; i++) {
+		grbm_select_q(m, 1, pipe, i);
+		wr(m, g->hqd_active, 0);
+		wr(m, g->hqd_dequeue_req, 0);
+	}
+	grbm_select_q(m, 1, pipe, qi);
+	wr(m, g->cp_mec_rs64_cntl, d & ~(MEC_RS64_PIPE0_RESET << pipe));
+	DELAY(100);
+	idle = (rd(m, g->hqd_active) & 1) == 0;
+	grbm_select_q(m, 0, 0, 0);
+	atomic_add_int(&amd_mes12_pipe_resets, 1);
+	device_printf(m->sc->dev, "uq%u: MEC me1 pipe %u reset (VMID %u, queue "
+	    "%u): HQD %s; every queue on the pipe is lost\n", q->slot, pipe,
+	    vmid, qi, idle ? "inactive" : "STILL ACTIVE");
+	return (idle);
+}
+
 /* EOP interrupts from every MEC1 pipe MES may place a user queue on. */
 void
 amd_mes12_uq_ints(struct mes *m, bool on, uint32_t *saved)
@@ -2802,6 +2845,14 @@ amd_mes12_uq_evict(struct amd_uq *q)
 			device_printf(m->sc->dev, "uq%u: after MES RESET (%d): "
 			    "REMOVE_QUEUE %s\n", q->slot, rerr, err == 0 ?
 			    "ok" : "still refused");
+		}
+		if (err != 0 && uq2_pipe_reset(q)) {
+			/* The pipe's other queues went with it: the caller
+			 * loses them (amd_mes12_pipe_resets moved). */
+			err = uq_remove_raw(m, q->gva, q->db);
+			device_printf(m->sc->dev, "uq%u: after MEC pipe reset: "
+			    "REMOVE_QUEUE %s\n", q->slot, err == 0 ? "ok" :
+			    "still refused");
 		}
 		if (err != 0 || uq2_hqd_find(m, q->db, &vmid)) {
 			amd_mes12_uq_report(q, "REMOVE_QUEUE failed");

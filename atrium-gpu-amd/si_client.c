@@ -315,7 +315,7 @@ si_uq_evict_task(void *arg, int pending __unused)
 	struct amd_si_client *c = arg;
 	struct atrium_amd_softc *sc = c->sc;
 	struct amd_uq *hw;
-	u_int i;
+	u_int i, resets;
 	int err;
 
 	sx_xlock(&c->uq_sx);
@@ -326,7 +326,16 @@ si_uq_evict_task(void *arg, int pending __unused)
 		mtx_unlock(&sc->lock);
 		if (hw == NULL || !amd_si_usable(sc))
 			continue;
-		if ((err = amd_mes12_uq_evict(hw)) != 0) {
+		resets = amd_mes12_pipe_resets;
+		err = amd_mes12_uq_evict(hw);
+		if (err == 0 && amd_mes12_pipe_resets != resets) {
+			/* A MEC pipe reset took the queue off: the pipe's
+			 * other queues are gone too. */
+			mtx_lock(&sc->lock);
+			si_uq_lost_all(c);
+			mtx_unlock(&sc->lock);
+		}
+		if (err != 0) {
 			amd_si_lose(sc, "a lost user queue MES will not remove");
 			mtx_lock(&sc->lock);
 			si_uq_lost_all(c);
@@ -821,7 +830,7 @@ amd_si_uq_destroy(struct atrium_amd_softc *sc, int slot)
 	struct amd_uq *hw;
 	uint64_t submits;
 	uint16_t kvmid;
-	u_int done;
+	u_int done, resets = 0;
 	int err;
 
 	if (c == NULL || slot < 0 || slot >= AMD_UQ_SLOTS)
@@ -852,7 +861,8 @@ amd_si_uq_destroy(struct atrium_amd_softc *sc, int slot)
 		amd_si_lose(sc, "card not usable at a queue's close");
 		amd_mes12_uq_free_lost(hw);
 		err = 0;
-	} else if ((err = amd_mes12_uq_destroy(hw, kvmid)) != 0) {
+	} else if ((resets = amd_mes12_pipe_resets,
+	    err = amd_mes12_uq_destroy(hw, kvmid)) != 0) {
 		/*
 		 * MES kept the queue even after an HQD reset: the last rung.
 		 * Reset the card, fail what every queue owes, and free.
@@ -863,6 +873,12 @@ amd_si_uq_destroy(struct atrium_amd_softc *sc, int slot)
 		mtx_unlock(&sc->lock);
 		amd_mes12_uq_free_lost(hw);
 		err = 0;
+	} else if (amd_mes12_pipe_resets != resets) {
+		/* Removed after a MEC pipe reset: the pipe's other queues
+		 * went with it. */
+		mtx_lock(&sc->lock);
+		si_uq_lost_all(c);
+		mtx_unlock(&sc->lock);
 	}
 	device_printf(sc->dev, "si: uq%d closed: %ju submits; EOP IVs "
 	    "routed %ju, unrouted %ju, MES own %ju, MES preemption %ju; "

@@ -1222,6 +1222,7 @@ int	 amd_device_reset(struct atrium_amd_softc *sc);
  *   set_clear: the gpu module registers its clear engine (NULL on detach,
  *          which waits out a running scrub).
  */
+extern volatile u_int amd_mes12_pipe_resets;	/* mes12.c */
 int	 amd_vram_init(struct atrium_amd_softc *sc);
 /* Silicon: hand out [lo, hi) of `device` bytes. `dirty` = its contents are
  * unknown (silicon need not wipe VRAM), so all of it is scrubbed before it

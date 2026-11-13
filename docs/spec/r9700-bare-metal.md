@@ -891,3 +891,21 @@ work (self-test, scrub).
     sends MES's own queue reset (MES_SCH_API_RESET, reset_queue_only, by doorbell) and
     tries REMOVE once more; only then does it reset the GPU. Isolation steps 4/5 are the
     reproducer.
+- **2026-11-13 05:18, stage 5f on the box (a4073d89): si-client-test 64/64; suite ALL OK
+  (va_reuse fixed); isolation again stopped after Part A step 6.** The new fault decode
+  shows the difference:
+  - test 7's store is client TCP and test 13's jump is client SQC (inst); both recover
+    with a wave kill and REMOVE_QUEUE.
+  - Isolation steps 4/5 (B's DMA_DATA from a VA its VM does not map) fault in client
+    **CPG** (RW 0, PERMISSION_FAULTS 0x3) on VMID 8. That HQD stays active through
+    the dequeue reset (now with SPI_COMPUTE_QUEUE_RESET), REMOVE_QUEUE (status
+    0x8100030100000000) and MES's RESET (0x8100080000000000), so the driver reset the
+    GPU.
+
+  All four 5f wedges were CP-side faults from client packets, not a pipe problem.
+  CP_DEBUG.CPG_UTCL1_ERROR_HALT_DISABLE was already set at gfx init. After the
+  reset, 2 scrubs failed (40 KiB dirty). The allocator's visible part was 256 MiB.
+  Fix for the next run: one more rung before the GPU reset, amdgpu's
+  `mes_v12_0_reset_compute_pipe_mmio`. It holds the queue's MEC pipe in reset, forces
+  every HQD on it inactive, releases the pipe, then retries REMOVE_QUEUE. Every queue on
+  that pipe is lost (EIO), not the whole card.
