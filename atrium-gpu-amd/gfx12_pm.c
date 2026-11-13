@@ -143,26 +143,48 @@ amd_gfx12_srm_enable(struct atrium_amd_softc *sc)
 	return (0);
 }
 
-/* gfx_v12_0_set_safe_mode / unset_safe_mode. */
+/*
+ * gfx_v12_0_set_safe_mode / unset_safe_mode, nested as amdgpu's
+ * amdgpu_gfx_rlc_enter/exit_safe_mode: the handshake runs on the first
+ * enter and the exit on the last, so a client's queue stop and the
+ * eviction task's wave kill cannot drop safe mode under each other
+ * (concurrency audit F2). The lock covers only the count and the
+ * handshake, never the work done in safe mode.
+ */
+static struct mtx gfx12_safe_mtx;
+MTX_SYSINIT(gfx12_safe, &gfx12_safe_mtx, "gfx12 safe mode", MTX_DEF);
+static u_int gfx12_safe_depth;
+
 static int
 safe_mode_enter(struct atrium_amd_softc *sc)
 {
-	int us;
+	int us, err = 0;
 
+	mtx_lock(&gfx12_safe_mtx);
+	if (gfx12_safe_depth++ > 0)
+		goto out;
 	wr(sc, 1, GC12_RLC_SAFE_MODE, SAFE_MODE_CMD | SAFE_MODE_MSG_ENTER);
 	for (us = 0; us < 100000; us++) {
 		if ((rd(sc, 1, GC12_RLC_SAFE_MODE) & SAFE_MODE_CMD) == 0)
-			return (0);
+			goto out;
 		DELAY(1);
 	}
 	device_printf(sc->dev, "gfx: RLC did not acknowledge safe mode\n");
-	return (ETIMEDOUT);
+	gfx12_safe_depth--;
+	err = ETIMEDOUT;
+out:
+	mtx_unlock(&gfx12_safe_mtx);
+	return (err);
 }
 
 static void
 safe_mode_exit(struct atrium_amd_softc *sc)
 {
-	wr(sc, 1, GC12_RLC_SAFE_MODE, SAFE_MODE_CMD);
+	mtx_lock(&gfx12_safe_mtx);
+	KASSERT(gfx12_safe_depth > 0, ("gfx12: safe mode exit unbalanced"));
+	if (gfx12_safe_depth > 0 && --gfx12_safe_depth == 0)
+		wr(sc, 1, GC12_RLC_SAFE_MODE, SAFE_MODE_CMD);
+	mtx_unlock(&gfx12_safe_mtx);
 }
 
 /* For mes12.c's MEC pipe reset (amdgpu holds RLC safe mode around it). */

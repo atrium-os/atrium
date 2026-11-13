@@ -89,13 +89,35 @@ wr(struct atrium_amd_softc *sc, uint32_t r, uint32_t v)
 	amd_mmio_write32(sc, gfx_reg(sc, r), v);
 }
 
+/*
+ * GRBM_GFX_CNTL picks which me/pipe/queue/VMID the indexed registers that
+ * follow reach, so a select and the accesses after it are one window
+ * (amdgpu's srbm_mutex; concurrency audit F1). A select of anything but
+ * 0 opens the window (taking the lock unless this thread holds it), the
+ * select back to 0 closes it. Lock order: sc->lock, uq_sx -> grbm ->
+ * gfx12 safe mode. Nothing sleeps inside a window.
+ */
+static struct mtx amd_grbm_mtx;
+MTX_SYSINIT(amd_grbm, &amd_grbm_mtx, "amd grbm select", MTX_DEF);
+
+void
+amd_grbm_select_write(struct atrium_amd_softc *sc, bus_size_t off,
+    uint32_t v)
+{
+	if (!mtx_owned(&amd_grbm_mtx))
+		mtx_lock(&amd_grbm_mtx);
+	amd_mmio_write32(sc, off, v);
+	if (v == 0)
+		mtx_unlock(&amd_grbm_mtx);
+}
+
 /* soc24_grbm_select: me 0 = gfx, 1 = MEC. */
 static void
 grbm_select(struct atrium_amd_softc *sc, const struct gfx_gen *g, u_int me,
     u_int pipe, u_int queue, u_int vmid)
 {
-	wr(sc, g->grbm_gfx_cntl, (pipe & 3) | (me & 3) << 2 |
-	    (vmid & 0xf) << 4 | (queue & 7) << 8);
+	amd_grbm_select_write(sc, gfx_reg(sc, g->grbm_gfx_cntl), (pipe & 3) |
+	    (me & 3) << 2 | (vmid & 0xf) << 4 | (queue & 7) << 8);
 }
 
 static const struct gfx_gen *

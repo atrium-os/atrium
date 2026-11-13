@@ -1,6 +1,7 @@
 # atrium-gpu-amd concurrency audit (2026-11-13)
 
-Status: findings, not yet fixed (except F0). Asked for by Shankar after the
+Status: F0 fixed (de56be23); F1 and F2 fixed on main, not yet run on the
+box; F3-F6 open. Asked for by Shankar after the
 G5 wedge turned out to be two threads driving one TLB invalidation engine
 (r9700-bare-metal.md §5, 13:53 run). Read from the code at main f16ba0b0; no
 lock-order checker (WITNESS) has run on this driver, since the box kernel is
@@ -28,7 +29,9 @@ semaphore; the eviction flush and a BO-free flush interleaved and the engine
 never acked again. Now one mutex across `amd_gmc12_flush` and
 `amd_gmc12_vm_flush`, as amdgpu's `gmc.invalidate_lock`. Awaiting the box run.
 
-**F1. GRBM_GFX_CNTL select-then-access is unserialised.** `grbm_select`
+**F1. GRBM_GFX_CNTL select-then-access is unserialised (fixed on main:
+`amd_grbm_select_write` in gfx12.c, one mutex from a non-zero select to the
+select back to 0).** `grbm_select`
 (gfx12.c:94), `grbm_select`/`grbm_select_q` (mes12.c:322, 1933) write the
 me/pipe/queue/VMID index, and the following reads and writes of the CP_HQD_*,
 SH_MEM_* and MEC registers go to whatever that index says *now*. Callers run in:
@@ -44,7 +47,8 @@ inside `sc->lock` where that is held (order: `sc->lock` → grbm). Better still,
 remove HQD scans from the interrupt path: look a queue's HQD up once in the task,
 not per IV.
 
-**F2. RLC safe mode is not reentrant.** `safe_mode_enter`/`exit`
+**F2. RLC safe mode is not reentrant (fixed on main: depth count under a
+mutex in gfx12_pm.c).** `safe_mode_enter`/`exit`
 (gfx12_pm.c:148) are a raw handshake. Users: `amd_gfx12_sq_kill_vmid` (the
 eviction task, and `amd_si_q_stop`, si_client.c:891, from a client close),
 the MEC pipe reset, clock gating. If two overlap, the first `exit` drops safe

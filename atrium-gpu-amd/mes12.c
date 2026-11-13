@@ -324,7 +324,8 @@ nbreg(struct atrium_amd_softc *sc, uint32_t dw)
 static void
 grbm_select(struct mes *m, u_int me, u_int pipe)
 {
-	wr(m, m->g->grbm_gfx_cntl, (pipe & 3) | (me & 3) << 2);
+	amd_grbm_select_write(m->sc, gcreg(m->sc, m->g->grbm_gfx_cntl),
+	    (pipe & 3) | (me & 3) << 2);
 }
 
 static volatile uint32_t *
@@ -2009,8 +2010,8 @@ struct uqp {
 static void
 grbm_select_q(struct mes *m, u_int me, u_int pipe, u_int queue)
 {
-	wr(m, m->g->grbm_gfx_cntl, (pipe & 3) | (me & 3) << 2 |
-	    (queue & 7) << 8);
+	amd_grbm_select_write(m->sc, gcreg(m->sc, m->g->grbm_gfx_cntl),
+	    (pipe & 3) | (me & 3) << 2 | (queue & 7) << 8);
 }
 
 /*
