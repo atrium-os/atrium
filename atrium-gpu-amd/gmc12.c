@@ -30,6 +30,17 @@
 #include <vm/vm.h>
 #include <vm/pmap.h>
 
+/*
+ * One TLB invalidation at a time on the hubs' engine 17 (amdgpu's
+ * gmc.invalidate_lock around gmc_v12_0_flush_vm_hub). GFXHUB has no
+ * semaphore; two threads writing INV_REQ while the other waits for its ack
+ * left the engine never acking again (box run aea5d54a: a lost queue's
+ * eviction flush and its VM's BO-free flush, interleaved, the log naming
+ * one context with the next one's request).
+ */
+static struct mtx gmc12_inv_mtx;
+MTX_SYSINIT(gmc12_inv, &gmc12_inv_mtx, "gmc12 inv", MTX_DEF);
+
 /* Layout inside the driver's VRAM area (psp.c stages at 68 MiB, smu.c's table at 84). */
 #define GART_TABLE_VRAM_OFF	(88u << 20)
 #define GART_SIZE		(512ull << 20)
@@ -441,11 +452,13 @@ amd_gmc12_flush(struct amd_gart *gt)
 	struct hub mm, gfx;
 	int err = 0;
 
+	mtx_lock(&gmc12_inv_mtx);
 	amd_hdp_flush(gt->sc);
 	if (hub_open(gt->sc, false, &mm) && hub_flush(&mm, 0) != 0)
 		err = ETIMEDOUT;
 	if (hub_open(gt->sc, true, &gfx) && hub_flush(&gfx, 0) != 0)
 		err = ETIMEDOUT;
+	mtx_unlock(&gmc12_inv_mtx);
 	return (err);
 }
 
@@ -951,6 +964,7 @@ amd_gmc12_vm_flush(struct amd_gart *gt, u_int vmid)
 
 	if (vmid >= NUM_CTX)
 		return (EINVAL);
+	mtx_lock(&gmc12_inv_mtx);
 	amd_hdp_flush(gt->sc);
 	if (hub_open(gt->sc, false, &mm) && hub_flush(&mm, vmid) != 0) {
 		err = ETIMEDOUT;
@@ -960,6 +974,7 @@ amd_gmc12_vm_flush(struct amd_gart *gt, u_int vmid)
 		err = ETIMEDOUT;
 		hub_flush_report(&gfx, vmid);
 	}
+	mtx_unlock(&gmc12_inv_mtx);
 	return (err);
 }
 
