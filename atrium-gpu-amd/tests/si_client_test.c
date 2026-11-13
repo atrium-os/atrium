@@ -1512,11 +1512,15 @@ hostile_isa(void)
 		int spin;
 		uint64_t va;		/* 0: from the job (past its buffer) */
 	} c[] = {
-		{ "a shader that never ends", 1, 0 },
-		{ "stores at VA 0", 0, 1 },
+		/* Box run 1b71cafd: after the first two the GPU stayed busy
+		 * and no new VM could be set up. One at a time, VA 0 last,
+		 * each followed by a fresh VM: which one breaks it. */
 		{ "stores at a high VA", 0, 0x7ffffff00000ull },
 		{ "stores past its own buffer", 0, 0 },
+		{ "a shader that never ends", 1, 0 },
+		{ "stores at VA 0", 0, 1 },
 	};
+	struct job hc;
 	uint32_t first;
 	u_int i;
 	int r, n, ms, ri0 = -1, ri = -1;
@@ -1573,6 +1577,19 @@ hostile_isa(void)
 		    "another VM runs clean", c[i].name);
 		run_clean(&by, what);
 		job_close(&h);
+		/* A fresh VM: setting one up flushes its context. */
+		sleep(2);
+		r = job_open(&hc, "15 health") == 0 ? 0 : errno;
+		snprintf(what, sizeof(what), "15 hostile ISA: after %s, a new "
+		    "VM can be set up and runs clean", c[i].name);
+		if (r != 0) {
+			check(0, what, "setup: %s; the rest is not run",
+			    strerror(r));
+			job_close(&hc);
+			break;
+		}
+		run_clean(&hc, what);
+		job_close(&hc);
 	}
 	job_close(&by);
 	if (preg_read(NULL, &ri) >= 0)

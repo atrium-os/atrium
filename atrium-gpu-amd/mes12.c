@@ -3028,6 +3028,9 @@ amd_mes12_uq_evict(struct amd_uq *q)
 			    "killed (%d); fence %s after %u us\n", q->slot,
 			    vmid, err, uq2_done(q) ? "landed" : "still behind",
 			    us);
+			/* Box run 1b71cafd: the GPU stayed busy after a
+			 * hostile shader's kill; where it is busy. */
+			mes_report(m, "after the wave kill");
 		}
 	}
 	/*

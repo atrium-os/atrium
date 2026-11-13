@@ -384,6 +384,22 @@ hub_report(struct hub *h, const char *when)
 	    hr(h, g->fault_addr_hi), hr(h, g->fault_addr_lo));
 }
 
+/* A context flush that never got its ack: what the hub looks like (box
+ * run 1b71cafd: after a hostile shader every flush timed out). */
+static void
+hub_flush_report(struct hub *h, u_int vmid)
+{
+	const struct hub_gen *g = h->g;
+	uint32_t e = INV_ENG_GART * g->eng_distance;
+
+	device_printf(h->sc->dev, "gmc: %s flush of context %u timed out: "
+	    "INV_REQ %#x, INV_ACK %#x%s\n", g->name, vmid,
+	    hr(h, g->inv_req + e), hr(h, g->inv_ack + e), g->use_sem ?
+	    (hr(h, g->inv_sem + e) & 1 ? ", semaphore held" :
+	    ", semaphore free") : "");
+	hub_report(h, "after the timeout");
+}
+
 /*
  * Map one system page into the GART (amdgpu_gart_bind for a system page:
  * valid, system, snooped, readable, writeable, plus the GART's UC,
@@ -876,10 +892,14 @@ amd_gmc12_vm_flush(struct amd_gart *gt, u_int vmid)
 	if (vmid >= NUM_CTX)
 		return (EINVAL);
 	amd_hdp_flush(gt->sc);
-	if (hub_open(gt->sc, false, &mm) && hub_flush(&mm, vmid) != 0)
+	if (hub_open(gt->sc, false, &mm) && hub_flush(&mm, vmid) != 0) {
 		err = ETIMEDOUT;
-	if (hub_open(gt->sc, true, &gfx) && hub_flush(&gfx, vmid) != 0)
+		hub_flush_report(&mm, vmid);
+	}
+	if (hub_open(gt->sc, true, &gfx) && hub_flush(&gfx, vmid) != 0) {
 		err = ETIMEDOUT;
+		hub_flush_report(&gfx, vmid);
+	}
 	return (err);
 }
 
