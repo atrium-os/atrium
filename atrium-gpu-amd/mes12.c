@@ -290,6 +290,8 @@ struct mes {
 	uint32_t cpc_int_cntl[2];	/* as found, restored on teardown */
 	bool sched_mapped;		/* pipe 0's queue mapped by MES */
 	bool dispatch;			/* stage 4e: keep MEC1 queue 0 */
+	bool uq_ints_on;		/* MEC1 EOP/CP-error ints set at start */
+	uint32_t mec_int_cntl[4];	/* MEC1 pipes' INT_CNTL as found */
 	uint16_t pci_cmd;		/* as found, restored on down */
 	uint8_t *scratch;		/* 2 x MES_SCRATCH_SIZE, or NULL */
 	vm_paddr_t scratch_pa;
@@ -951,6 +953,8 @@ hqd_dequeue(struct mes *m, int pipe)
  * scheduler queue unmapped by MES, both MES HQDs dequeued, unmapped
  * doorbell handling off, interrupt enables restored, then MES halted.
  */
+static void mec_ints(struct mes *m, bool on, uint32_t *saved);
+
 static void
 mes_teardown(struct mes *m)
 {
@@ -970,6 +974,10 @@ mes_teardown(struct mes *m)
 	(void)grbm_watch(m, "queues gone, MES still running", 500);
 	mes_enable(m, false);
 	DELAY(100);
+	if (m->uq_ints_on) {		/* MES halted: selects are safe */
+		mec_ints(m, false, m->mec_int_cntl);
+		m->uq_ints_on = false;
+	}
 	(void)grbm_watch(m, "MES halted, CP still running", 500);
 	cp_halt(m);
 }
@@ -2608,8 +2616,8 @@ uq2_hqd_reset(struct amd_uq *q)
 }
 
 /* EOP interrupts from every MEC1 pipe MES may place a user queue on. */
-void
-amd_mes12_uq_ints(struct mes *m, bool on, uint32_t *saved)
+static void
+mec_ints(struct mes *m, bool on, uint32_t *saved)
 {
 	u_int pipe;
 
@@ -2623,6 +2631,20 @@ amd_mes12_uq_ints(struct mes *m, bool on, uint32_t *saved)
 			wr(m, m->g->cpc_int_cntl, saved[pipe]);
 	}
 	grbm_select(m, 0, 0);
+}
+
+/*
+ * Box runs to f4af2b81: GRBM selects while MES is busy wedged the GFXHUB.
+ * The MEC1 pipes' interrupt enables are now set once, at MES start
+ * (mes_run, MES idle), and left on; the client's first-create and
+ * last-destroy calls do nothing while they are.
+ */
+void
+amd_mes12_uq_ints(struct mes *m, bool on, uint32_t *saved)
+{
+	if (m->uq_ints_on)
+		return;
+	mec_ints(m, on, saved);
 }
 
 static void
@@ -3395,6 +3417,10 @@ mes_run(struct mes *m)
 		wr(m, g->mes_db_cntl1 + i, d);
 	}
 	wr(m, g->hqd_gfx_control, 1u << 15);	/* DB_UPDATED_MSG_EN */
+	/* MEC1 EOP and CP-error interrupts for user queues, set now while
+	 * MES has nothing to schedule (amd_mes12_uq_ints). */
+	mec_ints(m, true, m->mec_int_cntl);
+	m->uq_ints_on = true;
 	return (query_status(m, 0));
 }
 
