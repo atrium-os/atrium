@@ -1,0 +1,141 @@
+== fuzzdiag2 excerpt (si-fuzz ff5cb48e, kmods 7a1464ba, fz:3600:0x24f00d)
+== si-fuzz all 3600 0x24f00d
+si-fuzz: all for 3600 s, seed 0x24f00d, 6 ioctl threads, hang_ms 5000 (job wait 20000 ms), re-inits 2, pace 210 s, generations 60 s
+canary: VM fd 3, queue fd 8: shader 0x10000000, IB 0x10001000, out 0x10002000
+si-fuzz: ioctl generation 1: uid 61001, seed 0x24f00e
+si-fuzz: blob generation 2: uid 62002, seed 0x24f00f
+si-fuzz:    0 s: 0 calls, blob 0 jobs (0 ok, 0 failed, 0 clean after), canary 1, re-inits 2, cp_errors 2, vm_faults 7, hangs 6, findings 0
+blob: VM fd 3, queue fd 8: shader 0x10000000, IB 0x10001000, out 0x10002000
+FINDING: the driver reports the GPU lost (re-init cap)
+  last op, slot 0 (42452 ops): create queue on fd 86 [in the kernel]
+  last op, slot 1 (37897 ops): close 22 [in the kernel]
+  last op, slot 2 (38444 ops): create queue on fd 109 [in the kernel]
+  last op, slot 3 (35357 ops): create queue on fd 98 [in the kernel]
+  last op, slot 4 (66918 ops): close 128 [in the kernel]
+  last op, slot 5 (35640 ops): dup2 53 over 84
+  last op, slot 16 (3 ops): blob w42 mutated: 56 dw, va 0x10001000 (IB 0x10001000) 224 bytes, w0 000002af
+blob: VM fd 3, queue fd 8: shader 0x10000000, IB 0x10001000, out 0x10002000
+si-fuzz:   16 s: 256713 calls, blob 4 jobs (1 ok, 2 failed, 1 clean after), canary 2, re-inits 2, cp_errors 2, vm_faults 8, hangs 8, findings 1
+si-fuzz: re-inits at the end 3
+canary: VM fd 3, queue fd 8: shader 0x10000000, IB 0x10001000, out 0x10002000
+FINDING: health: a new VM does not run clean: completion Input/output error after 5039 ms, 0/64 words 42
+si-fuzz: errno per ioctl (calls by the ioctl workers)
+                          ok     EINVAL      EBADF     EFAULT     ENOTTY      EPERM     ENOMEM     ENOSPC        EIO      EBUSY EOPNOTSUPP      other
+  BO_ALLOC              4106       1300        349          0       1870          0          0          0          0          0        154          0
+  BO_WRITE               251       4316        884        306       1835          0          0          0          0          0        135          0
+  BO_READ                219       4409        859        342       1835          0          0          0          0          0        124          0
+  GET_IRQS              5437          0        344          0       1855          0          0          0          0          0        143          0
+  SYNCOBJ_CREATE        5513          0        397          0       1825          0          0          0          0          0        116          0
+  SYNCOBJ_SIGNAL        2315       2686        922          0       1842          0          0          0          0          0        117          0
+  SYNCOBJ_QUERY         2345       2635        935          0       1861          0          0          0          0          0        136          0
+  SYNCOBJ_WAIT           262       2714        876          0       1840          0          0          0          0          0        134       2030
+  VM_CREATE              623          0        329          0       1940          0          0       4821          0          0        114          0
+  VM_BIND                 85       4489       1181          0       1883          0          0          0          0          9        119         43
+  QUEUE_MAP                0       4691       1194          0       1858          0          0          0          0          0        129          0
+  QUERY_CAPS            1766          0        356       3222       1851          0        696          0          0          0        144          0
+  VM_BIND2                38       4751       1033          0       1877          0          0          0          0          1        127         17
+  QUEUE_CREATE            10        396       1176          0       5771          1          0          0          0          0        448          0
+  QUEUE_MAP2               0        195       1292          0       5825          0          0          0          0          0        464          0
+  QUEUE_SUBMIT             0        148       1235          0       5889          0          0          0          0          0        454          0
+  GPU_RESET                0          0        344          0       1885       5462          0          0          0          0        115          0
+  SCHED                    0          0        333          0       1862       5577          0          0          0          0        132          0
+  POWERGATE                0          0        342          0       1850       5417          0          0          0          0        131          0
+  old SUBMIT               0          0        348          0       7220          0          0          0          0          0        137          0
+si-fuzz: mmaps that succeeded 0, forks 252, blob VM reopens 2, queue renews 2
+FINDING 1: the driver reports the GPU lost (re-init cap)
+FINDING 2: health: a new VM does not run clean: completion Input/output error after 5039 ms, 0/64 words 42
+RESULT: FAIL (2 findings, seed 0x24f00d)
+si-fuzz rc=1
+reinits 3
+
+    6514
+== grbm while MES runs: 8
+Nov 13 17:23:45 grbm: select 0x4 while MES runs (1 from here), from 0xffffffff820195d7 (amd_grbm_select_write at 0xffffffff8200a0b0)
+Nov 13 17:23:45 grbm: select 0x4 while MES runs (1 from here), from 0xffffffff82011b4a (amd_grbm_select_write at 0xffffffff8200a0b0)
+Nov 13 17:23:45 grbm: select 0x4 while MES runs (1 from here), from 0xffffffff82019a6c (amd_grbm_select_write at 0xffffffff8200a0b0)
+Nov 13 17:24:16 si: CP error on me1 HQDs 0x400: no HQD scan while MES runs; the hang check takes the queue
+Nov 13 17:24:31 grbm: select 0x4 while MES runs (2 from here), from 0xffffffff820195d7 (amd_grbm_select_write at 0xffffffff8200a0b0)
+Nov 13 17:24:31 grbm: select 0x4 while MES runs (2 from here), from 0xffffffff82011b4a (amd_grbm_select_write at 0xffffffff8200a0b0)
+Nov 13 17:24:31 grbm: select 0x4 while MES runs (2 from here), from 0xffffffff82019a6c (amd_grbm_select_write at 0xffffffff8200a0b0)
+Nov 13 17:24:32 si: CP error on me1 HQDs 0x2: no HQD scan while MES runs; the hang check takes the queue
+== HQD scan skipped: 4
+Nov 13 17:23:47 mes: HQD scan for doorbell 0x26 skipped: MES runs (1 so far)
+Nov 13 17:23:47 mes: HQD scan for doorbell 0x22 skipped: MES runs (2 so far)
+Nov 13 17:23:47 mes: HQD scan for doorbell 0x26 skipped: MES runs (3 so far)
+Nov 13 17:23:47 mes: HQD scan for doorbell 0x20 skipped: MES runs (4 so far)
+== CP error on me1 HQDs
+Nov 13 17:24:16 si: CP error on me1 HQDs 0x400: no HQD scan while MES runs; the hang check takes the queue
+Nov 13 17:24:32 si: CP error on me1 HQDs 0x2: no HQD scan while MES runs; the hang check takes the queue
+== flush timeouts: 0
+== refused/MES RESET/must be reset/will not stop/re-init/lost
+Nov 13 17:23:47 si: VM fault: 1 IV(s), VMIDs 0x800, first VMID 11 at 0x10002000
+Nov 13 17:23:52 si: uq3 hung: fence 1, no progress for 5000 ms; its work fails, the queue is lost
+Nov 13 17:24:02 si: uq3 hung: fence 0, no progress for 5000 ms; its work fails, the queue is lost
+Nov 13 17:24:03 si: VM fault: 1 IV(s), VMIDs 0x800, first VMID 11 at 0x10003000
+Nov 13 17:24:03 si: VM fault: 1 IV(s), VMIDs 0x1000, first VMID 12 at 0x7ffffff00000
+Nov 13 17:24:05 si: VM fault: 1 IV(s), VMIDs 0x1000, first VMID 12 at 0x10003000
+Nov 13 17:24:12 si: uq4 hung: fence 0, no progress for 5000 ms; its work fails, the queue is lost
+Nov 13 17:24:14 si: VM fault: 1 IV(s), VMIDs 0x1000, first VMID 12 at 0
+Nov 13 17:24:16 si: 1 CP error IV(s) (privileged register, ring 0x25): me1 HQDs 0x400
+Nov 13 17:24:16 si: CP error on me1 HQDs 0x400: no HQD scan while MES runs; the hang check takes the queue
+Nov 13 17:24:21 si: uq4 hung: fence 0, no progress for 5000 ms; its work fails, the queue is lost
+Nov 13 17:24:23 mes: pipe 0 REMOVE_QUEUE (user compute): refused (fence 0x80 of 0x80, status 0x8100030100000000, rptr 0)
+Nov 13 17:24:23 uq4: REMOVE_QUEUE refused (5); HQD reset, trying once more
+Nov 13 17:24:23 si: VM fault: 1 IV(s), VMIDs 0x1, first VMID 0 at 0
+Nov 13 17:24:23 gmc: at the fault: GCVM_L2_STATUS 0, after 0 us 0; last invalidation (context 15) started 2201045 us ago, atrium_gpu_amd_pci0: mes: pipe 0 REMOVE_QUEUE (user compute): refused (fence 0x81 of 0x81, status 0x81000303
+Nov 13 17:24:23 si: VM fault on VMID 0 at 0, not the running submit's VMID 0
+Nov 13 17:24:25 mes: pipe 0 RESET (user compute queue): refused (fence 0x82 of 0x82, status 0x8100080000000000, rptr 0)
+Nov 13 17:24:25 mes: pipe 0 REMOVE_QUEUE (user compute): refused (fence 0x83 of 0x83, status 0x8100030300000000, rptr 0)
+Nov 13 17:24:25 uq4: after MES RESET (5): REMOVE_QUEUE still refused
+Nov 13 17:24:25 si: a lost user queue that will not stop; resetting the GPU, every client queue is lost
+Nov 13 17:24:28 si: re-init: PSP load returned 60 (as at attach; the SMU start completes the RLC autoload)
+Nov 13 17:24:32 si: GPU re-init 1 of 3 in this window: PASS (MES up, kernel compute queue ready)
+Nov 13 17:24:32 si: GPU re-initialised (1 so far): old VMs (0x3e) and queues are lost (EIO) until closed; new ones run
+Nov 13 17:24:32 si: 1 CP error IV(s) (privileged register, ring 0x14): me1 HQDs 0x2
+Nov 13 17:24:32 si: CP error on me1 HQDs 0x2: no HQD scan while MES runs; the hang check takes the queue
+Nov 13 17:24:37 si: uq4 hung: fence 0, no progress for 5000 ms; its work fails, the queue is lost
+Nov 13 17:24:40 mes: pipe 0 REMOVE_QUEUE (user compute): refused (fence 0x9 of 0x9, status 0x8100030100000000, rptr 0)
+Nov 13 17:24:40 uq4: REMOVE_QUEUE refused (5); HQD reset, trying once more
+Nov 13 17:24:40 si: VM fault: 1 IV(s), VMIDs 0x1, first VMID 0 at 0
+Nov 13 17:24:40 gmc: at the fault: GCVM_L2_STATUS 0, after 0 us 0; last invalidation (context 15) started 2201049 us ago, atrium_gpu_amd_pci0: mes: pipe 0 REMOVE_QUEUE (user compute): refused (fence 0xa of 0xa, status 0x8100030300
+Nov 13 17:24:40 si: VM fault on VMID 0 at 0, not the running submit's VMID 0
+Nov 13 17:24:41 mes: pipe 0 RESET (user compute queue): refused (fence 0xb of 0xb, status 0x8100080000000000, rptr 0)
+Nov 13 17:24:41 mes: pipe 0 REMOVE_QUEUE (user compute): refused (fence 0xc of 0xc, status 0x8100030300000000, rptr 0)
+Nov 13 17:24:41 uq4: after MES RESET (5): REMOVE_QUEUE still refused
+Nov 13 17:24:41 si: a lost user queue that will not stop; resetting the GPU, every client queue is lost
+Nov 13 17:24:46 si: re-init: PSP load returned 60 (as at attach; the SMU start completes the RLC autoload)
+Nov 13 17:24:49 si: GPU re-init 2 of 3 in this window: PASS (MES up, kernel compute queue ready)
+Nov 13 17:24:49 si: GPU re-initialised (2 so far): old VMs (0x3e) and queues are lost (EIO) until closed; new ones run
+Nov 13 17:24:55 si: uq2 hung: fence 0, no progress for 5000 ms; its work fails, the queue is lost
+Nov 13 17:24:57 mes: pipe 0 REMOVE_QUEUE (user compute): refused (fence 0x2e9 of 0x2e9, status 0x8100030100000000, rptr 0)
+Nov 13 17:24:57 uq3: REMOVE_QUEUE refused (5); HQD reset, trying once more
+Nov 13 17:24:57 si: VM fault: 1 IV(s), VMIDs 0x1, first VMID 0 at 0
+Nov 13 17:24:57 mes: pipe 0 REMOVE_QUEUE (user compute): refused (fence 0x2ea of 0x2ea, status 0x8100030300000000, rptr 0)atrium_gpu_amd_pci0: gmc: client fault: fault status 0xb3a: client CPC (0x5), VMID 0, MORE_FAULTS 0, WALKER_
+Nov 13 17:24:57 si: VM fault on VMID 0 at 0, not the running submit's VMID 0
+Nov 13 17:24:59 mes: pipe 0 RESET (user compute queue): refused (fence 0x2eb of 0x2eb, status 0x8100080000000000, rptr 0)
+Nov 13 17:24:59 mes: pipe 0 REMOVE_QUEUE (user compute): refused (fence 0x2ec of 0x2ec, status 0x8100030300000000, rptr 0)
+Nov 13 17:24:59 uq3: after MES RESET (5): REMOVE_QUEUE still refused
+Nov 13 17:24:59 si: a user queue that will not stop; resetting the GPU, every client queue is lost
+Nov 13 17:25:00 si: uq1 hung: fence 1, no progress for 5000 ms; its work fails, the queue is lost
+Nov 13 17:25:02 si: re-init: PSP load returned 60 (as at attach; the SMU start completes the RLC autoload)
+Nov 13 17:25:05 si: GPU re-init 3 of 3 in this window: PASS (MES up, kernel compute queue ready)
+Nov 13 17:25:05 si: GPU re-initialised (3 so far): old VMs (0xfe) and queues are lost (EIO) until closed; new ones run
+Nov 13 17:25:09 si: VM fault: 1 IV(s), VMIDs 0x1, first VMID 0 at 0
+Nov 13 17:25:09 si: VM fault on VMID 0 at 0, not the running submit's VMID 0
+Nov 13 17:25:14 si: uq0 hung: fence 0, no progress for 5000 ms; its work fails, the queue is lost
+Nov 13 17:25:14 si: VM fault: 1 IV(s), VMIDs 0x1, first VMID 0 at 0
+Nov 13 17:25:14 si: VM fault on VMID 0 at 0, not the running submit's VMID 0
+Nov 13 17:25:19 si: uq0 hung: fence 0, no progress for 5000 ms; its work fails, the queue is lost
+Nov 13 17:25:19 si: VM fault: 1 IV(s), VMIDs 0x1, first VMID 0 at 0
+Nov 13 17:25:19 si: VM fault on VMID 0 at 0, not the running submit's VMID 0
+Nov 13 17:25:21 mes: pipe 0 REMOVE_QUEUE (user compute): refused (fence 0x14 of 0x14, status 0x8100030100000000, rptr 0)
+Nov 13 17:25:21 uq0: REMOVE_QUEUE refused (5); HQD reset, trying once more
+Nov 13 17:25:21 si: VM fault: 1 IV(s), VMIDs 0x1, first VMID 0 at 0
+Nov 13 17:25:21 gmc: at the fault: GCVM_L2_STATUS 0, after 0 us 0; last invalidation (context 3) started 2986994 us ago, eatrium_gpu_amd_pci0: mes: pipe 0 REMOVE_QUEUE (user compute): refused (fence 0x15 of 0x15, status 0x81000303
+Nov 13 17:25:21 si: VM fault on VMID 0 at 0, not the running submit's VMID 0
+Nov 13 17:25:23 mes: pipe 0 RESET (user compute queue): refused (fence 0x16 of 0x16, status 0x8100080000000000, rptr 0)
+Nov 13 17:25:23 mes: pipe 0 REMOVE_QUEUE (user compute): refused (fence 0x17 of 0x17, status 0x8100030300000000, rptr 0)
+Nov 13 17:25:23 uq0: after MES RESET (5): REMOVE_QUEUE still refused
+Nov 13 17:25:23 si: a lost user queue that will not stop; resetting the GPU, every client queue is lost
+Nov 13 17:25:24 si: uq2 hung: fence 0, no progress for 5000 ms; its work fails, the queue is lost
+Nov 13 17:25:24 si: 3 GPU re-inits in 600 s; the GPU stays lost until the driver is reloaded
