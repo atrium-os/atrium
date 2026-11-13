@@ -2049,7 +2049,14 @@ main(void)
 
 	/* 7: a fault loses only its own queue (needs a free VM: drop 4's). */
 	job_close(&e);
-	if (job_open(&f, "7") == 0) {
+	/*
+	 * SI_SKIP7=1 (wedge bisection, run 772891ad: test 15 doing test 7's
+	 * exact fault still wedged, one second after test 7 recovered): so
+	 * test 15's fault is the run's first VM fault.
+	 */
+	if (getenv("SI_SKIP7") != NULL && *getenv("SI_SKIP7") == '1') {
+		printf("SKIP: 7 fault (SI_SKIP7)\n");
+	} else if (job_open(&f, "7") == 0) {
 		uint64_t target = f.out_va;
 
 		close(f.out);		/* unbound: the VA faults in F */

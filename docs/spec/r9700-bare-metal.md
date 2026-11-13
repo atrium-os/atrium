@@ -1300,3 +1300,20 @@ work (self-test, scrub).
   store hit a page that was never mapped (the page tables hold the same invalid
   pattern either way). Next: SI15_CLOSEOUT=1 (14a57259+1) does exactly test 7's
   fault inside test 15. Logs: claude/project-thread-33aauq d8436096.
+- **2026-11-13 12:54, CLOSEOUT probe (si-client-test 78e2a466, kmods fc54eb53,
+  SI_SKIP13=1 SI_SKIPHANG=1 SI15_NOBY=1 SI15_CLOSEOUT=1): WEDGED, doing exactly
+  test 7's fault.** 55 passed, 2 failed. Test 15 repeated test 7's sequence step
+  for step (uq3 / VMID 11, preempt for a free, store to the closed out BO at
+  0x10002000). Test 7 recovered at 12:54:04 (after-kill snapshot fully idle);
+  test 15 wedged at 12:54:05 (CPC 0x80110400 / BUSY 0/0x4480 / CPF 0xb0000001,
+  first flush after REMOVE timed out, 142 in all).
+  So nothing about test 15 itself matters: the same fault recovers the first time
+  and wedges the second. Every run fits "the first data (TCP) fault of a load
+  recovers, the next one wedges"; test 13's SQC (instruction) fault in between
+  was clean. Odd extra: test 7's latched status this time decoded as CPC / VMID 0,
+  0x40b53 (MORE_FAULTS, WALKER_ERROR 1, MAPPING_ERROR), though its IV said VMID 11.
+  Suspect: what the first fault leaves behind. amd_gmc12_fault_take sets and then
+  clears FAULT_CNTL bit 0 (CLEAR_PROTECTION_FAULT_STATUS_ADDR); amdgpu sets it and
+  leaves it set.
+  Next: SI_SKIP7=1 (78e2a466+1) leaves test 7 out, so test 15's fault is the
+  first. Logs: claude/project-thread-33aauq 772891ad.
