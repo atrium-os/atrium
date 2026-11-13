@@ -2481,6 +2481,20 @@ amd_mes12_uq_report(struct amd_uq *q, const char *when)
 }
 
 /*
+ * The card was reset and bus mastering is off (amd_si_lose): nothing can
+ * reach the queue's memory, so free it without touching the hardware.
+ */
+void
+amd_mes12_uq_free_lost(struct amd_uq *q)
+{
+	device_printf(q->m->sc->dev, "uq%u: freed after the GPU reset\n",
+	    q->slot);
+	contigfree(q->pg, UQ2_PAGES * PAGE_SIZE, M_DEVBUF);
+	contigfree(q->g, UQ_G_SIZE, M_DEVBUF);
+	free(q, M_DEVBUF);
+}
+
+/*
  * Take the queue off MES and free it. If its last job has not fenced,
  * first kill the waves of the VMID MES runs it under and give the fence a
  * moment. 0: removed, nothing of it is mapped, its memory is freed.

@@ -692,5 +692,7 @@ work (self-test, scrub).
   mapped queues, the driver leaked them as designed, detach/unload got EBUSY and the card
   sat at 62 W, 3.4 GHz busy until a reboot. Fixes: ring/queue pages executable; a fault on
   a MES VMID fails that queue (EIO, later submits refused); close resets a wedged HQD
-  (CP_HQD_DEQUEUE_REQUEST 2) before REMOVE_QUEUE and retries once after a refusal. Open:
-  detach with a queue MES will not drop must end in a reset, never EBUSY with the card hot.
+  (CP_HQD_DEQUEUE_REQUEST 2) before REMOVE_QUEUE and retries once after a refusal. Last rung
+  (Shankar, 2026-11-13: reset first): if MES still keeps a queue, the card gets a mode 1
+  reset and bus mastering goes off for good (`amd_si_lose`), every client queue fails with
+  EIO, and the queue's memory is freed, so detach proceeds and the card never sits hot.

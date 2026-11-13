@@ -924,6 +924,8 @@ uint32_t amd_mes12_uq_fence(struct amd_uq *q);
 uint32_t amd_mes12_uq_doorbell(struct amd_uq *q);
 uint32_t amd_mes12_uq_seq(struct amd_uq *q);
 u_int	amd_mes12_uq_hqd_vmid(struct amd_uq *q);
+void	amd_mes12_uq_free_lost(struct amd_uq *q);
+void	amd_si_lose(struct atrium_amd_softc *sc, const char *why);
 void	amd_mes12_uq_report(struct amd_uq *q, const char *when);
 void	amd_mes12_uq_ints(struct mes *m, bool on, uint32_t *saved);
 int	amd_smu_init(struct atrium_amd_softc *sc);	/* smu.c, silicon test */

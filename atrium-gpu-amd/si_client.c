@@ -202,6 +202,27 @@ si_uq_faulted(struct amd_si_client *c, uint32_t vmids, bool log)
 	}
 }
 
+/* The card was reset: every user queue is lost (EIO). sc->lock held. */
+static void
+si_uq_lost_all(struct amd_si_client *c)
+{
+	struct si_uq *u;
+	u_int i;
+
+	mtx_assert(&c->sc->lock, MA_OWNED);
+	for (i = 0; i < AMD_UQ_SLOTS; i++) {
+		u = &c->uq[i];
+		while (u->n > 0) {
+			if (u->owed[u->head].so != NULL)
+				amd_syncobj_fail(u->owed[u->head].so, EIO);
+			u->owed[u->head].so = NULL;
+			u->head = (u->head + 1) % ATRIUM_AMD_MAX_PENDING;
+			u->n--;
+		}
+		u->dead = true;
+	}
+}
+
 /*
  * The fallback: while a user queue owes completions, look at the fences
  * every 50 ms, so a missing EOP interrupt costs latency, not a hang. The
@@ -655,11 +676,22 @@ amd_si_uq_destroy(struct atrium_amd_softc *sc, int slot)
 		return (EINVAL);
 	}
 	if (!amd_si_usable(sc)) {
-		device_printf(sc->dev, "si: uq%d: card not usable at close; "
-		    "queue leaked\n", slot);
-		err = EBUSY;
-	} else
-		err = amd_mes12_uq_destroy(hw, kvmid);
+		/* Lost or failing: make sure it is reset with DMA off. */
+		amd_si_lose(sc, "card not usable at a queue's close");
+		amd_mes12_uq_free_lost(hw);
+		err = 0;
+	} else if ((err = amd_mes12_uq_destroy(hw, kvmid)) != 0) {
+		/*
+		 * MES kept the queue even after an HQD reset: the last rung.
+		 * Reset the card, fail what every queue owes, and free.
+		 */
+		amd_si_lose(sc, "a user queue MES will not remove");
+		mtx_lock(&sc->lock);
+		si_uq_lost_all(c);
+		mtx_unlock(&sc->lock);
+		amd_mes12_uq_free_lost(hw);
+		err = 0;
+	}
 	device_printf(sc->dev, "si: uq%d closed: %ju submits; EOP IVs "
 	    "routed %ju, unrouted %ju; retired by IV %ju, by poll %ju\n",
 	    slot, (uintmax_t)submits, (uintmax_t)c->uq_eop_routed,
@@ -671,7 +703,7 @@ amd_si_uq_destroy(struct atrium_amd_softc *sc, int slot)
 		u->kvmid = 0;
 		c->uq_live--;
 		mtx_unlock(&sc->lock);
-		if (c->uq_live == 0)
+		if (c->uq_live == 0 && amd_si_usable(sc))
 			amd_mes12_uq_ints(amd_si_mes(sc), false,
 			    c->uq_int_saved);
 	}
@@ -695,7 +727,7 @@ amd_si_uq_submit(struct atrium_amd_softc *sc, int slot, uint64_t ib,
 	mtx_lock(&sc->lock);
 	if (u->hw == NULL)
 		err = ENXIO;
-	else if (u->dead)
+	else if (u->dead || !amd_si_usable(sc))
 		err = EIO;
 	else if (so != NULL && u->n >= ATRIUM_AMD_MAX_PENDING &&
 	    si_uq_retire(c, slot) == 0)

@@ -746,6 +746,7 @@ struct amd_si {
 	struct sx lock;			/* one SMU sender (A3.5) */
 	struct timeout_task watch;
 	bool stopping, lost;
+	bool dma_off;		/* lost: bus mastering off for good */
 	u_int nsample, strikes;
 	u_int gfx_holds;		/* GfxOff disallowed while > 0 (5c-2) */
 	bool client;			/* the client node is attached (5c-2) */
@@ -827,6 +828,9 @@ si_watch(void *arg, int pending __unused)
 			si_down(si, false);
 		(void)amd_smu_mode1_reset(sc);
 		si->lost = true;
+		/* Nothing of the card's old state may DMA again. */
+		pci_disable_busmaster(sc->dev);
+		si->dma_off = true;
 	} else
 		taskqueue_enqueue_timeout(taskqueue_thread, &si->watch,
 		    SI_WATCH_SECS * hz);
@@ -968,6 +972,36 @@ amd_si_client_attached(struct atrium_amd_softc *sc, bool on)
 		return;
 	sx_xlock(&si->lock);
 	si->client = on;
+	sx_xunlock(&si->lock);
+}
+
+/*
+ * The last rung (5c-2b): the client side found the card in a state it
+ * cannot undo (a user queue MES will not remove). Reset the card (mode 1),
+ * mark it lost, and turn bus mastering off, so nothing the old state
+ * pointed at can be read or written by the GPU again: everything the
+ * driver kept for it may then be freed. Idempotent. Every client queue is
+ * lost; detach proceeds normally.
+ */
+void
+amd_si_lose(struct atrium_amd_softc *sc, const char *why)
+{
+	struct amd_si *si = sc->si;
+
+	if (si == NULL)
+		return;
+	sx_xlock(&si->lock);
+	if (!si->lost) {
+		device_printf(sc->dev, "si: %s; resetting the GPU, every "
+		    "client queue is lost\n", why);
+		if (!si->link.failed)
+			(void)amd_smu_mode1_reset(sc);
+		si->lost = true;
+	}
+	if (!si->dma_off) {
+		pci_disable_busmaster(sc->dev);
+		si->dma_off = true;
+	}
 	sx_xunlock(&si->lock);
 }
 
