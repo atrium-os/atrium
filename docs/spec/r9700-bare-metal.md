@@ -1317,3 +1317,13 @@ work (self-test, scrub).
   leaves it set.
   Next: SI_SKIP7=1 (78e2a466+1) leaves test 7 out, so test 15's fault is the
   first. Logs: claude/project-thread-33aauq 772891ad.
+- **2026-11-13 13:10, SKIP7 probe (si-client-test 1ff063ff, kmods fc54eb53,
+  SI_SKIP7=1 SI_SKIP13=1 SI_SKIPHANG=1 SI15_NOBY=1 SI15_VA=0x10003000): WEDGED with
+  test 15's fault the first and only VM fault of the load.** 51 passed, 2 failed
+  (test 8 also fell out: it needs test 7's VM). Same signature, 151 flush
+  timeouts. So "the second fault wedges" is wrong too: the same fault recovers in
+  test 7's place and wedges in test 15's place. Between them run tests 9 (user-mode
+  queue, minus its hang), 10 (free rule), 11 (VRAM BOs) and 12 (real-shader ops,
+  some with VRAM sources).
+  Next: SI_SKIP=9,10,11,12 (1ff063ff+1) leaves all four out. If clean, bisect
+  them. Logs: claude/project-thread-33aauq 0f855443.

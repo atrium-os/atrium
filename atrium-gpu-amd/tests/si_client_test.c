@@ -283,6 +283,28 @@ skiphang(const char *what)
 	return (1);
 }
 
+/*
+ * SI_SKIP=<n>[,<n>...] (wedge bisection, run 0f855443: test 15's store
+ * fault wedged as the first fault of the load, while test 7's identical
+ * fault recovers): leaves out whole tests 9-12, which run between them.
+ */
+static int
+skipped(int n, const char *what)
+{
+	const char *e = getenv("SI_SKIP"), *p;
+	char *end;
+
+	for (p = e; p != NULL && *p != '\0'; p = *end == ',' ? end + 1 : end) {
+		if (strtol(p, &end, 10) == n) {
+			printf("SKIP: %d %s (SI_SKIP)\n", n, what);
+			return (1);
+		}
+		if (end == p)
+			break;
+	}
+	return (0);
+}
+
 static int
 job_open(struct job *j, const char *name)
 {
@@ -2117,16 +2139,20 @@ main(void)
 
 	/* 9: user-mode queues (needs a free VM: drop 8's). */
 	job_close(&f);
-	user_mode(&a);
+	if (!skipped(9, "user mode"))
+		user_mode(&a);
 
 	/* 10: the free rule. */
-	free_rule(&a);
+	if (!skipped(10, "free rule"))
+		free_rule(&a);
 
 	/* 11: VRAM BOs (5d). */
-	vram(&a);
+	if (!skipped(11, "VRAM"))
+		vram(&a);
 
 	/* 12: real-shader variants of gpusim's compute ops (5e). */
-	real_ops(&a);
+	if (!skipped(12, "real ops"))
+		real_ops(&a);
 
 	/* 13: GPU W^X. SI_SKIP13=1 leaves it out (box bisection: every run
 	 * that wedged the GFXHUB at a 15 store fault had 13's SQC
