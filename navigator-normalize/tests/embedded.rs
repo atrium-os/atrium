@@ -65,3 +65,13 @@ fn a_hidden_embed_has_no_slot() {
     let fonts = FontSet::load().unwrap();
     assert!(render_html(&out, &fonts, &Env::default()).scene.embeds.is_empty(), "{out}");
 }
+
+/// A lazy embed (its URL in a data attribute a script would copy to `src`)
+/// is recognised too.
+#[test]
+fn a_lazy_embed_is_recognised() {
+    let html = r#"<html><body><iframe src="about:blank" data-delayed-url="https://www.youtube.com/embed/dQw4w9WgXcQ?rel=0"></iframe><iframe data-src="//player.vimeo.com/video/76979871"></iframe></body></html>"#;
+    let (out, _) = normalize(html, &Inputs::default());
+    assert!(out.contains(r#"atrium-island="https://www.youtube-nocookie.com/embed/dQw4w9WgXcQ""#), "{out}");
+    assert!(out.contains(r#"atrium-island="https://player.vimeo.com/video/76979871""#), "{out}");
+}

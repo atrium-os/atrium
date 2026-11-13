@@ -74,6 +74,11 @@ impl<'a> SameOriginScripts<'a> {
     }
 
     fn refuse(&mut self, url: &str) -> String {
+        // A `data:` or `blob:` script is not a request to anyone: no
+        // network refusal is counted for it (it was never run before either).
+        if url.starts_with("data:") || url.starts_with("blob:") {
+            return format!("not run: {} script", &url[..url.find(':').unwrap_or(0)]);
+        }
         let host = url::Url::parse(url).ok().and_then(|u| u.host_str().map(str::to_string))
             .unwrap_or_else(|| "?".into());
         let key = format!("cross-origin script {host}");

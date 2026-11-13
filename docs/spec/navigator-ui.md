@@ -767,6 +767,34 @@ removed silently.
   That tells those hosts a conversion happened (once per conversion, shared by every reader). A
   typed rule like legacy-web §5.4.1d's, or tier-3 substitution before fetching, would close it.
 
+**Both fixed and re-measured, 2026-11-13** (e6dc0b1e, same corpus and tooling; per-page data on
+the Mac in `~/src/navigator-corpus/ad-residue-2026-11-13-fixed/`, never committed):
+
+| | before | after |
+|---|---|---|
+| visible iframes in converted output | 36 on 18 pages | **0** (15 remain inside `<noscript>`, raw text that never loads) |
+| pages keeping an empty iframe box | 7 | **0** |
+| ad or tracker scripts fetched as code | 45 requests on 29 pages | **0** |
+| script requests to any other origin | 720 on 66 pages | **0**; every same-origin script is still fetched |
+| page requests refused during conversion | 1,058 | 15 (the scripts that made them no longer run) |
+| pages with any ad residue | 11 (83 units) | 10 (82): the tracker pixel went |
+| documents published at tier 1 | 10 | 17 |
+
+The cost: cross-origin script refusals are 690 on 67 pages, 46 of them ad or tracker scripts and
+most of the rest the sites' own CDNs. Seven pages move to tier 1 with no text lost (GitHub,
+Spotify, Instagram, WhatsApp, two Discourse forums, two danluu pages), and Trello moves up to
+tier 2, because its cross-origin scripts used to blank it. Two lose more than 5% of their text:
+nhs.uk (−6.4%, its cookie banner and an account label, so a gain) and ynet (−9.3%, video,
+weather and login widgets from its own CDN; the article is kept). Third-party ad creative stays
+at 0, and the 8 pages that detect ad blocking are still none worse. One request still reaches an
+ad host, and it is not a script: old.reddit's `<img>` pixel (legacy-web §5.4.1d does not cover
+images; open).
+
+**Embeds** (legacy-web §8.1): no corpus page produced an island. All 4 real video embeds arrive
+lazily: LinkedIn and wikiHow put the player URL in a data attribute a script copies to `src`, and
+Samsung inserts its iframe from script. The normalizer now reads the common lazy attributes too.
+How embeds should be recognised beyond the short list is §13 D14.
+
 ## 7. Reading controls
 
 **Aa** opens a pop-up with the controls the backend already supports, so none needs new
@@ -987,6 +1015,7 @@ argued further on paper.
 | **D6** | Favicons | show site favicons (decoded in the page's jail, validated) · **monograms only** (§1) | **Monograms.** No site pixels in the chrome; lookalikes can't copy a monogram any better than the name |
 | **D7** | UI processes | **one per user session** · one per window (§2.3) | **One per session.** It holds nothing worth isolating per window, and the switch is cheap later |
 | **D9** | Malicious-site list for red (§6.5) | **off by default; local signals only** (cert failure, lookalike of an Arca login, jail monitor reports) · a downloaded hashed-prefix list on by default · per-visit online lookups | **Off by default, offered in settings.** The local signals catch what matters most with no data leaving; a list adds a dependency on its publisher |
+| **D14** open | Which iframes become live parts (§6.6, legacy-web §8.1) | **short list of video players** (YouTube, Vimeo; plus lazy attributes) · no list: any iframe of real size becomes a click-to-start box naming its origin, the list only adds a poster | Short list chosen 2026-11-13; the corpus then showed the list catches 2 of 4 real embeds even with lazy attributes, so it is put to Shankar again |
 | **D13** ✓ accepted | Ad residue (§6.6) | **optional "Tidy page", off by default, per site** · on by default · nothing | **Optional, off by default.** Conversion already removes every third-party ad; tidying first-party boxes is a heuristic, so the reader turns it on |
 | **D12** | Always private? (§2.4) | **Personal by default, with "start new trails Unrecorded" and a history retention setting** · Unrecorded always | **Personal by default.** Sites already see an anonymous reader; forgetting everything locally costs restore, history and the certificate-change signal |
 | **D11** | Status bar (§5.7) | **optional, off by default** · always on · none | **Optional, off by default.** The click check runs either way; the bar is for people who look before they click |

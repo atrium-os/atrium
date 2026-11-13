@@ -92,3 +92,14 @@ fn no_base_no_script() {
     assert!(f.asked.is_empty() && f.hinted.is_empty(), "{:?} {:?}", f.asked, f.hinted);
     assert_eq!(c.external_refused, 1);
 }
+
+/// A `data:` script is not a network request: not fetched, not counted as
+/// a refusal by host.
+#[test]
+fn a_data_script_is_not_a_network_refusal() {
+    let mut f = Recording::default();
+    let html = r#"<html><body><script src="data:text/javascript,1"></script></body></html>"#;
+    let c = convert_with(html, Some("https://news.example/p.html"), &mut BoaEngine::default(), &mut f);
+    assert!(f.asked.is_empty());
+    assert!(c.blocked_hosts.is_empty(), "{:?}", c.blocked_hosts);
+}

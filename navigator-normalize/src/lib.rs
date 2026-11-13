@@ -945,7 +945,13 @@ pub fn normalize(html: &str, inputs: &Inputs) -> (String, Report) {
     // `<iframe>` and whether it is a recognised embed (see `embedded`).
     let frames: Vec<(Handle, Option<String>, Option<u32>, Option<u32>)> = dom.by_tag_anywhere("iframe").into_iter().map(|h| {
         let dim = |a: &str| dom.attr(h, a).and_then(|v| v.trim().trim_end_matches("px").parse::<u32>().ok()).filter(|v| (1..=8192).contains(v));
-        (h, dom.attr(h, "src").and_then(navigator_dom::media::recognised_embed), dim("width"), dim("height"))
+        // ★ Real embeds mostly arrive LAZY: the URL sits in a data attribute
+        // a script copies to `src` (LinkedIn's `data-delayed-url`, wikiHow's
+        // `data-src`), and that script is another origin's, so it no longer
+        // runs at conversion (legacy-web §5.4.1f). Read those too.
+        let island = ["src", "data-src", "data-lazy-src", "data-delayed-url"].iter()
+            .find_map(|a| dom.attr(h, a).and_then(navigator_dom::media::recognised_embed));
+        (h, island, dim("width"), dim("height"))
     }).collect();
     // 6. Rewrite the document: generated classes on, `style=` off, `<link>`
     //    and the old `<style>` blocks gone, one new sheet in the head.
