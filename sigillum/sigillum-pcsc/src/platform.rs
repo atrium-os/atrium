@@ -20,7 +20,7 @@ pub fn set_log(f: fn(core::fmt::Arguments)) {
     LOG.store(f as usize, Ordering::Release);
 }
 
-fn log(a: core::fmt::Arguments) {
+pub(crate) fn log(a: core::fmt::Arguments) {
     let f = LOG.load(Ordering::Acquire);
     if f != 0 {
         // Safety: only `set_log` stores here, with a `fn(Arguments)`.
@@ -193,16 +193,23 @@ mod tests {
         let mut n = 0;
         for l in list.lines() {
             let sym = l.split_whitespace().next().unwrap_or("");
-            let name = sym.split('@').next().unwrap();
+            // With its version, as the host's resolver sees it: libudev's are `@LIBUDEV_183`.
+            let (name, ver) = match sym.split_once('@') {
+                Some((n, v)) => (n, Some(v)),
+                None => (sym, None),
+            };
             if name.starts_with("udev_") || name.starts_with("curl_") {
-                assert!(super::resolve(name).is_some(), "{name}");
+                assert!(crate::resolve_import(name, ver).is_some(), "{sym}");
                 n += 1;
             }
             if name.starts_with("SCard") {
-                assert!(crate::resolve(name).is_some(), "{name}");
+                assert!(crate::resolve_import(name, ver).is_some(), "{sym}");
             }
         }
         assert_eq!(n, 27);
+        // A version the module does not use binds nothing of ours.
+        assert!(crate::resolve_import("udev_new", Some("LIBUDEV_999")).is_none());
+        assert!(crate::resolve_import("SCardConnect", Some("LIBUDEV_183")).is_none());
         assert!(super::curl_easy_init().is_null());
         assert!(!super::udev_new().is_null());
         assert!(super::udev_enumerate_get_list_entry(super::enumerate()).is_null());

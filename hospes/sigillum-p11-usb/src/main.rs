@@ -30,9 +30,10 @@ use sigillum_proto::{read_msg, write_msg};
 use sigillumd::cert;
 use zeroize::Zeroizing;
 
-const USBDEVFS_BULK: libc::c_ulong = 0xC018_5502;
-const USBDEVFS_CLAIMINTERFACE: libc::c_ulong = 0x8004_550F;
-const USBDEVFS_IOCTL: libc::c_ulong = 0xC010_5512;
+// libc::Ioctl: c_ulong on glibc, c_int on musl (a static build for any guest).
+const USBDEVFS_BULK: libc::Ioctl = 0xC018_5502_u32 as libc::Ioctl;
+const USBDEVFS_CLAIMINTERFACE: libc::Ioctl = 0x8004_550F_u32 as libc::Ioctl;
+const USBDEVFS_IOCTL: libc::Ioctl = 0xC010_5512_u32 as libc::Ioctl;
 const USBDEVFS_DISCONNECT: libc::c_int = 0x5516;
 
 #[repr(C)]
@@ -65,6 +66,25 @@ fn sysfs(dir: &std::path::Path, f: &str) -> Option<String> {
     fs::read_to_string(dir.join(f)).ok().map(|s| s.trim().to_string())
 }
 
+/// The reader name pcscd gives a CCID reader its libccid does not list (338c:0032 is not):
+/// "manufacturer product [interface] (serial) 00 00", from the USB strings. Vendor modules
+/// pick their reader by it: InnaIT's looks for "InnaitKey", which only the manufacturer
+/// string holds ("No InnaITKey reader found" otherwise).
+fn reader_name(dir: &std::path::Path, ifno: u8, vendor: u16, product: u16) -> String {
+    let mut n = [sysfs(dir, "manufacturer"), sysfs(dir, "product")].into_iter().flatten().collect::<Vec<_>>().join(" ");
+    if n.is_empty() {
+        n = format!("{vendor:04x}:{product:04x}");
+    }
+    let base = dir.file_name().and_then(|f| f.to_str()).unwrap_or("");
+    if let Some(i) = sysfs(&dir.join(format!("{base}:1.{ifno}")), "interface") {
+        n = format!("{n} [{i}]");
+    }
+    if let Some(s) = sysfs(dir, "serial") {
+        n = format!("{n} ({s})");
+    }
+    format!("{n} 00 00")
+}
+
 /// The token's usbfs node, CCID interface and bulk endpoints.
 fn find(vendor: u16, product: u16) -> io::Result<Token> {
     for e in fs::read_dir("/sys/bus/usb/devices")? {
@@ -75,7 +95,6 @@ fn find(vendor: u16, product: u16) -> io::Result<Token> {
         }
         let bus: u32 = sysfs(&dir, "busnum").and_then(|s| s.parse().ok()).ok_or_else(|| io::Error::other("busnum"))?;
         let devnum: u32 = sysfs(&dir, "devnum").and_then(|s| s.parse().ok()).ok_or_else(|| io::Error::other("devnum"))?;
-        let name = sysfs(&dir, "product").unwrap_or_else(|| format!("{vendor:04x}:{product:04x}"));
         let mut dev = OpenOptions::new().read(true).write(true).open(format!("/dev/bus/usb/{bus:03}/{devnum:03}"))?;
         // Reading the node gives the device descriptor and every configuration's.
         let mut d = Vec::new();
@@ -110,6 +129,7 @@ fn find(vendor: u16, product: u16) -> io::Result<Token> {
         let (Some(ifno), Some(desc), Some(ep_in), Some(ep_out)) = (ifno, desc, ep_in, ep_out) else {
             return Err(io::Error::other("no CCID interface with bulk endpoints"));
         };
+        let name = reader_name(&dir, ifno, vendor, product);
         return Ok(Token { dev, ifno, ep_in, ep_out, desc, name, vendor, product });
     }
     Err(io::Error::other(format!("no USB device {vendor:04x}:{product:04x} (is it passed through?)")))
@@ -217,6 +237,18 @@ fn unhex(s: &str) -> Option<Vec<u8>> {
     (s.len() % 2 == 0).then(|| (0..s.len()).step_by(2).map(|i| u8::from_str_radix(&s[i..i + 2], 16).ok()).collect::<Option<Vec<u8>>>()).flatten()
 }
 
+/// The host, killed if the bridge gives up first (a host stuck inside the module would
+/// otherwise outlive it, holding the token).
+struct Host(Option<std::process::Child>);
+impl Drop for Host {
+    fn drop(&mut self) {
+        if let Some(c) = self.0.as_mut() {
+            let _ = c.kill();
+            let _ = c.wait();
+        }
+    }
+}
+
 fn ask(s: &mut UnixStream, m: &ToDriver) -> io::Result<FromDriver> {
     write_msg(s, m, MAX_MESSAGE)?;
     read_msg(s, MAX_MESSAGE)?.ok_or_else(|| io::Error::other("the host closed the socket (see its log above)"))
@@ -260,12 +292,12 @@ fn run(a: &[String]) -> io::Result<bool> {
             Ok(())
         });
     }
-    let mut child = cmd.spawn()?;
+    let mut child = Host(Some(cmd.spawn()?));
     drop((sock_c, ccid_c, module, libstdcxx));
     std::thread::spawn(move || relay(t, ccid));
 
     let mut s = UnixStream::from(sock);
-    s.set_read_timeout(Some(Duration::from_secs(120)))?;
+    s.set_read_timeout(Some(Duration::from_secs(900)))?;
     let hello: Option<FromDriver> = read_msg(&mut s, MAX_MESSAGE)?;
     println!("hello: {hello:?}");
     let FromDriver::Certificates { token_label, certs, .. } = ask(&mut s, &ToDriver::ListCertificates { ceremony: 1 })? else {
@@ -327,7 +359,7 @@ fn run(a: &[String]) -> io::Result<bool> {
         }
     }
     drop(s);
-    let st = child.wait()?;
+    let st = child.0.take().expect("host").wait()?;
     println!("host exited: {st}");
     Ok(ok && st.success())
 }

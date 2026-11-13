@@ -257,28 +257,43 @@ fn dispose(st: &mut State, how: Dword) -> Result<(), Long> {
     }
 }
 
+/// Each call's name and result to the host's log (never a buffer, a length or an APDU).
+fn trace(call: &str, rv: Long) {
+    platform::log(format_args!("pcsc: {call} -> {rv:#x}"));
+}
+
 // ---- the API ----------------------------------------------------------------------
 
 pub unsafe extern "C" fn SCardEstablishContext(_scope: Dword, _r1: *const c_void, _r2: *const c_void, ctx: *mut Context) -> Long {
-    if ctx.is_null() {
-        return SCARD_E_INVALID_PARAMETER;
-    }
-    with(|s| {
-        let Some(st) = s else { return SCARD_E_NO_READERS_AVAILABLE };
-        st.next += 1;
-        st.contexts.push(st.next);
-        *ctx = st.next;
-        SCARD_S_SUCCESS
-    })
+    #[allow(clippy::redundant_closure_call)]
+    let r = (|| {
+        if ctx.is_null() {
+            return SCARD_E_INVALID_PARAMETER;
+        }
+        with(|s| {
+            let Some(st) = s else { return SCARD_E_NO_READERS_AVAILABLE };
+            st.next += 1;
+            st.contexts.push(st.next);
+            *ctx = st.next;
+            SCARD_S_SUCCESS
+        })
+    })();
+    trace("SCardEstablishContext", r);
+    r
 }
 
 pub unsafe extern "C" fn SCardReleaseContext(ctx: Context) -> Long {
-    with(|s| {
-        let Some(st) = s else { return SCARD_E_INVALID_HANDLE };
-        let n = st.contexts.len();
-        st.contexts.retain(|c| *c != ctx);
-        if st.contexts.len() == n { SCARD_E_INVALID_HANDLE } else { SCARD_S_SUCCESS }
-    })
+    #[allow(clippy::redundant_closure_call)]
+    let r = (|| {
+        with(|s| {
+            let Some(st) = s else { return SCARD_E_INVALID_HANDLE };
+            let n = st.contexts.len();
+            st.contexts.retain(|c| *c != ctx);
+            if st.contexts.len() == n { SCARD_E_INVALID_HANDLE } else { SCARD_S_SUCCESS }
+        })
+    })();
+    trace("SCardReleaseContext", r);
+    r
 }
 
 pub unsafe extern "C" fn SCardFreeMemory(_ctx: Context, mem: *const c_void) -> Long {
@@ -292,15 +307,20 @@ pub unsafe extern "C" fn SCardFreeMemory(_ctx: Context, mem: *const c_void) -> L
 
 /// The one reader, as a multi-string (`name\0\0`).
 pub unsafe extern "C" fn SCardListReaders(ctx: Context, _groups: *const c_char, out: *mut c_char, len: *mut Dword) -> Long {
-    with(|s| {
-        let Some(st) = s else { return SCARD_E_NO_READERS_AVAILABLE };
-        if !context_ok(st, ctx) {
-            return SCARD_E_INVALID_HANDLE;
-        }
-        let mut m = Vec::from(st.setup.name.as_bytes());
-        m.extend_from_slice(&[0, 0]);
-        copy_out(&m, out as *mut u8, len)
-    })
+    #[allow(clippy::redundant_closure_call)]
+    let r = (|| {
+        with(|s| {
+            let Some(st) = s else { return SCARD_E_NO_READERS_AVAILABLE };
+            if !context_ok(st, ctx) {
+                return SCARD_E_INVALID_HANDLE;
+            }
+            let mut m = Vec::from(st.setup.name.as_bytes());
+            m.extend_from_slice(&[0, 0]);
+            copy_out(&m, out as *mut u8, len)
+        })
+    })();
+    trace("SCardListReaders", r);
+    r
 }
 
 pub unsafe extern "C" fn SCardConnect(
@@ -311,35 +331,41 @@ pub unsafe extern "C" fn SCardConnect(
     card: *mut Handle,
     active: *mut Dword,
 ) -> Long {
-    if reader.is_null() || card.is_null() || active.is_null() {
-        return SCARD_E_INVALID_PARAMETER;
-    }
-    with(|s| {
-        let Some(st) = s else { return SCARD_E_NO_READERS_AVAILABLE };
-        if !context_ok(st, ctx) {
-            return SCARD_E_INVALID_HANDLE;
+    platform::log(format_args!("pcsc: SCardConnect share {share} protocols {protocols:#x}"));
+    #[allow(clippy::redundant_closure_call)]
+    let r = (|| {
+        if reader.is_null() || card.is_null() || active.is_null() {
+            return SCARD_E_INVALID_PARAMETER;
         }
-        if cstr(reader) != st.setup.name.as_bytes() {
-            return SCARD_E_UNKNOWN_READER;
-        }
-        if share == SCARD_SHARE_DIRECT && protocols == 0 {
+        with(|s| {
+            let Some(st) = s else { return SCARD_E_NO_READERS_AVAILABLE };
+            if !context_ok(st, ctx) {
+                return SCARD_E_INVALID_HANDLE;
+            }
+            if cstr(reader) != st.setup.name.as_bytes() {
+                return SCARD_E_UNKNOWN_READER;
+            }
+            if share == SCARD_SHARE_DIRECT && protocols == 0 {
+                st.next += 1;
+                st.card = Some((st.next, 0));
+                *card = st.next;
+                *active = 0;
+                return SCARD_S_SUCCESS;
+            }
+            let atr = match power(st) {
+                Ok(a) => a,
+                Err(e) => return e,
+            };
+            let Some(p) = pick(&atr, protocols) else { return SCARD_E_PROTO_MISMATCH };
             st.next += 1;
-            st.card = Some((st.next, 0));
+            st.card = Some((st.next, p));
             *card = st.next;
-            *active = 0;
-            return SCARD_S_SUCCESS;
-        }
-        let atr = match power(st) {
-            Ok(a) => a,
-            Err(e) => return e,
-        };
-        let Some(p) = pick(&atr, protocols) else { return SCARD_E_PROTO_MISMATCH };
-        st.next += 1;
-        st.card = Some((st.next, p));
-        *card = st.next;
-        *active = p;
-        SCARD_S_SUCCESS
-    })
+            *active = p;
+            SCARD_S_SUCCESS
+        })
+    })();
+    trace("SCardConnect", r);
+    r
 }
 
 fn connected(st: &State, h: Handle) -> Option<Dword> {
@@ -347,60 +373,80 @@ fn connected(st: &State, h: Handle) -> Option<Dword> {
 }
 
 pub unsafe extern "C" fn SCardReconnect(card: Handle, _share: Dword, protocols: Dword, init: Dword, active: *mut Dword) -> Long {
-    with(|s| {
-        let Some(st) = s else { return SCARD_E_INVALID_HANDLE };
-        if connected(st, card).is_none() {
-            return SCARD_E_INVALID_HANDLE;
-        }
-        if let Err(e) = dispose(st, init) {
-            return e;
-        }
-        let atr = match power(st) {
-            Ok(a) => a,
-            Err(e) => return e,
-        };
-        let Some(p) = pick(&atr, protocols) else { return SCARD_E_PROTO_MISMATCH };
-        st.card = Some((card, p));
-        if !active.is_null() {
-            *active = p;
-        }
-        SCARD_S_SUCCESS
-    })
+    #[allow(clippy::redundant_closure_call)]
+    let r = (|| {
+        with(|s| {
+            let Some(st) = s else { return SCARD_E_INVALID_HANDLE };
+            if connected(st, card).is_none() {
+                return SCARD_E_INVALID_HANDLE;
+            }
+            if let Err(e) = dispose(st, init) {
+                return e;
+            }
+            let atr = match power(st) {
+                Ok(a) => a,
+                Err(e) => return e,
+            };
+            let Some(p) = pick(&atr, protocols) else { return SCARD_E_PROTO_MISMATCH };
+            st.card = Some((card, p));
+            if !active.is_null() {
+                *active = p;
+            }
+            SCARD_S_SUCCESS
+        })
+    })();
+    trace("SCardReconnect", r);
+    r
 }
 
 pub unsafe extern "C" fn SCardDisconnect(card: Handle, how: Dword) -> Long {
-    with(|s| {
-        let Some(st) = s else { return SCARD_E_INVALID_HANDLE };
-        if connected(st, card).is_none() {
-            return SCARD_E_INVALID_HANDLE;
-        }
-        st.card = None;
-        match dispose(st, how) {
-            Ok(()) => SCARD_S_SUCCESS,
-            Err(e) => e,
-        }
-    })
+    #[allow(clippy::redundant_closure_call)]
+    let r = (|| {
+        with(|s| {
+            let Some(st) = s else { return SCARD_E_INVALID_HANDLE };
+            if connected(st, card).is_none() {
+                return SCARD_E_INVALID_HANDLE;
+            }
+            st.card = None;
+            match dispose(st, how) {
+                Ok(()) => SCARD_S_SUCCESS,
+                Err(e) => e,
+            }
+        })
+    })();
+    trace("SCardDisconnect", r);
+    r
 }
 
 /// One process holds the token: a transaction only needs a live handle.
 pub unsafe extern "C" fn SCardBeginTransaction(card: Handle) -> Long {
-    with(|s| match s {
-        Some(st) if connected(st, card).is_some() => SCARD_S_SUCCESS,
-        _ => SCARD_E_INVALID_HANDLE,
-    })
+    #[allow(clippy::redundant_closure_call)]
+    let r = (|| {
+        with(|s| match s {
+            Some(st) if connected(st, card).is_some() => SCARD_S_SUCCESS,
+            _ => SCARD_E_INVALID_HANDLE,
+        })
+    })();
+    trace("SCardBeginTransaction", r);
+    r
 }
 
 pub unsafe extern "C" fn SCardEndTransaction(card: Handle, how: Dword) -> Long {
-    with(|s| {
-        let Some(st) = s else { return SCARD_E_INVALID_HANDLE };
-        if connected(st, card).is_none() {
-            return SCARD_E_INVALID_HANDLE;
-        }
-        match dispose(st, how) {
-            Ok(()) => SCARD_S_SUCCESS,
-            Err(_) => SCARD_E_NOT_TRANSACTED,
-        }
-    })
+    #[allow(clippy::redundant_closure_call)]
+    let r = (|| {
+        with(|s| {
+            let Some(st) = s else { return SCARD_E_INVALID_HANDLE };
+            if connected(st, card).is_none() {
+                return SCARD_E_INVALID_HANDLE;
+            }
+            match dispose(st, how) {
+                Ok(()) => SCARD_S_SUCCESS,
+                Err(_) => SCARD_E_NOT_TRANSACTED,
+            }
+        })
+    })();
+    trace("SCardEndTransaction", r);
+    r
 }
 
 pub unsafe extern "C" fn SCardStatus(
@@ -412,29 +458,34 @@ pub unsafe extern "C" fn SCardStatus(
     atr: *mut u8,
     atr_len: *mut Dword,
 ) -> Long {
-    with(|s| {
-        let Some(st) = s else { return SCARD_E_INVALID_HANDLE };
-        let Some(p) = connected(st, card) else { return SCARD_E_INVALID_HANDLE };
-        let a = st.atr.clone().unwrap_or_default();
-        if !state.is_null() {
-            *state = if a.is_empty() { SCARD_PRESENT } else { SCARD_SPECIFIC | SCARD_POWERED | SCARD_PRESENT };
-        }
-        if !protocol.is_null() {
-            *protocol = p;
-        }
-        if !name_len.is_null() {
-            let mut m = Vec::from(st.setup.name.as_bytes());
-            m.extend_from_slice(&[0, 0]);
-            let r = copy_out(&m, name as *mut u8, name_len);
-            if r != SCARD_S_SUCCESS {
-                return r;
+    #[allow(clippy::redundant_closure_call)]
+    let r = (|| {
+        with(|s| {
+            let Some(st) = s else { return SCARD_E_INVALID_HANDLE };
+            let Some(p) = connected(st, card) else { return SCARD_E_INVALID_HANDLE };
+            let a = st.atr.clone().unwrap_or_default();
+            if !state.is_null() {
+                *state = if a.is_empty() { SCARD_PRESENT } else { SCARD_SPECIFIC | SCARD_POWERED | SCARD_PRESENT };
             }
-        }
-        if !atr_len.is_null() {
-            return copy_out(&a, atr, atr_len);
-        }
-        SCARD_S_SUCCESS
-    })
+            if !protocol.is_null() {
+                *protocol = p;
+            }
+            if !name_len.is_null() {
+                let mut m = Vec::from(st.setup.name.as_bytes());
+                m.extend_from_slice(&[0, 0]);
+                let r = copy_out(&m, name as *mut u8, name_len);
+                if r != SCARD_S_SUCCESS {
+                    return r;
+                }
+            }
+            if !atr_len.is_null() {
+                return copy_out(&a, atr, atr_len);
+            }
+            SCARD_S_SUCCESS
+        })
+    })();
+    trace("SCardStatus", r);
+    r
 }
 
 /// The reader's state as `SCardGetStatusChange` reports it, and the ATR.
@@ -456,60 +507,65 @@ fn reader_state(st: &mut State) -> (Dword, Vec<u8>) {
 }
 
 pub unsafe extern "C" fn SCardGetStatusChange(ctx: Context, timeout: Dword, states: *mut ReaderState, n: Dword) -> Long {
-    if n > 0 && states.is_null() {
-        return SCARD_E_INVALID_PARAMETER;
-    }
-    let rs = core::slice::from_raw_parts_mut(states, n as usize);
-    let mut waited: u64 = 0;
-    loop {
-        let (r, sleep) = with(|s| {
-            let Some(st) = s else { return (SCARD_E_NO_READERS_AVAILABLE, None) };
-            if !context_ok(st, ctx) {
-                return (SCARD_E_INVALID_HANDLE, None);
-            }
-            let (now, atr) = reader_state(st);
-            let now = now | ((st.events as Dword & 0xFFFF) << 16);
-            let mut changed = false;
-            for r in rs.iter_mut() {
-                if r.reader.is_null() {
-                    return (SCARD_E_INVALID_VALUE, None);
-                }
-                let name = cstr(r.reader);
-                if name == PNP {
-                    // No reader comes or goes: the token is the reader.
-                    r.event = r.current & !SCARD_STATE_CHANGED;
-                    continue;
-                }
-                if r.current & SCARD_STATE_IGNORE != 0 {
-                    r.event = SCARD_STATE_IGNORE;
-                    continue;
-                }
-                if name != st.setup.name.as_bytes() {
-                    r.event = SCARD_STATE_UNKNOWN | SCARD_STATE_CHANGED | SCARD_STATE_IGNORE;
-                    changed = true;
-                    continue;
-                }
-                let differs = (r.current & 0xFFFF & !SCARD_STATE_CHANGED) != (now & 0xFFFF)
-                    || (r.current >> 16 != 0 && r.current >> 16 != now >> 16);
-                r.event = if differs { now | SCARD_STATE_CHANGED } else { now };
-                r.atr_len = atr.len().min(MAX_ATR_SIZE) as Dword;
-                r.atr[..atr.len().min(MAX_ATR_SIZE)].copy_from_slice(&atr[..atr.len().min(MAX_ATR_SIZE)]);
-                changed |= differs;
-            }
-            if changed || rs.is_empty() {
-                (SCARD_S_SUCCESS, None)
-            } else {
-                (SCARD_E_TIMEOUT, Some(st.setup.sleep_ms))
-            }
-        });
-        let Some(sleep) = sleep else { return r };
-        if timeout != INFINITE && waited >= timeout as u64 {
-            return SCARD_E_TIMEOUT;
+    #[allow(clippy::redundant_closure_call)]
+    let r = (|| {
+        if n > 0 && states.is_null() {
+            return SCARD_E_INVALID_PARAMETER;
         }
-        let step = if timeout == INFINITE { 250 } else { (timeout as u64 - waited).min(250) };
-        sleep(step as u32);
-        waited += step;
-    }
+        let rs = core::slice::from_raw_parts_mut(states, n as usize);
+        let mut waited: u64 = 0;
+        loop {
+            let (r, sleep) = with(|s| {
+                let Some(st) = s else { return (SCARD_E_NO_READERS_AVAILABLE, None) };
+                if !context_ok(st, ctx) {
+                    return (SCARD_E_INVALID_HANDLE, None);
+                }
+                let (now, atr) = reader_state(st);
+                let now = now | ((st.events as Dword & 0xFFFF) << 16);
+                let mut changed = false;
+                for r in rs.iter_mut() {
+                    if r.reader.is_null() {
+                        return (SCARD_E_INVALID_VALUE, None);
+                    }
+                    let name = cstr(r.reader);
+                    if name == PNP {
+                        // No reader comes or goes: the token is the reader.
+                        r.event = r.current & !SCARD_STATE_CHANGED;
+                        continue;
+                    }
+                    if r.current & SCARD_STATE_IGNORE != 0 {
+                        r.event = SCARD_STATE_IGNORE;
+                        continue;
+                    }
+                    if name != st.setup.name.as_bytes() {
+                        r.event = SCARD_STATE_UNKNOWN | SCARD_STATE_CHANGED | SCARD_STATE_IGNORE;
+                        changed = true;
+                        continue;
+                    }
+                    let differs = (r.current & 0xFFFF & !SCARD_STATE_CHANGED) != (now & 0xFFFF)
+                        || (r.current >> 16 != 0 && r.current >> 16 != now >> 16);
+                    r.event = if differs { now | SCARD_STATE_CHANGED } else { now };
+                    r.atr_len = atr.len().min(MAX_ATR_SIZE) as Dword;
+                    r.atr[..atr.len().min(MAX_ATR_SIZE)].copy_from_slice(&atr[..atr.len().min(MAX_ATR_SIZE)]);
+                    changed |= differs;
+                }
+                if changed || rs.is_empty() {
+                    (SCARD_S_SUCCESS, None)
+                } else {
+                    (SCARD_E_TIMEOUT, Some(st.setup.sleep_ms))
+                }
+            });
+            let Some(sleep) = sleep else { return r };
+            if timeout != INFINITE && waited >= timeout as u64 {
+                return SCARD_E_TIMEOUT;
+            }
+            let step = if timeout == INFINITE { 250 } else { (timeout as u64 - waited).min(250) };
+            sleep(step as u32);
+            waited += step;
+        }
+    })();
+    trace("SCardGetStatusChange", r);
+    r
 }
 
 pub unsafe extern "C" fn SCardTransmit(
@@ -521,37 +577,43 @@ pub unsafe extern "C" fn SCardTransmit(
     recv: *mut u8,
     recv_len: *mut Dword,
 ) -> Long {
-    if send.is_null() || recv.is_null() || recv_len.is_null() || send_len == 0 {
-        return SCARD_E_INVALID_PARAMETER;
-    }
-    with(|s| {
-        let Some(st) = s else { return SCARD_E_INVALID_HANDLE };
-        let Some(p) = connected(st, card) else { return SCARD_E_INVALID_HANDLE };
-        if !send_pci.is_null() && (*send_pci).protocol != p && (*send_pci).protocol != SCARD_PROTOCOL_RAW {
-            return SCARD_E_PROTO_MISMATCH;
+    #[allow(clippy::redundant_closure_call)]
+    let r = (|| {
+        if send.is_null() || recv.is_null() || recv_len.is_null() || send_len == 0 {
+            return SCARD_E_INVALID_PARAMETER;
         }
-        if st.atr.is_none() {
-            return SCARD_W_REMOVED_CARD;
-        }
-        let apdu = core::slice::from_raw_parts(send, send_len as usize);
-        match st.setup.card.transmit(apdu) {
-            Ok(r) => {
-                if (*recv_len as usize) < r.len() {
+        with(|s| {
+            let Some(st) = s else { return SCARD_E_INVALID_HANDLE };
+            let Some(p) = connected(st, card) else { return SCARD_E_INVALID_HANDLE };
+            if !send_pci.is_null() && (*send_pci).protocol != p && (*send_pci).protocol != SCARD_PROTOCOL_RAW {
+                return SCARD_E_PROTO_MISMATCH;
+            }
+            if st.atr.is_none() {
+                return SCARD_W_REMOVED_CARD;
+            }
+            let apdu = core::slice::from_raw_parts(send, send_len as usize);
+            match st.setup.card.transmit(apdu) {
+                Ok(r) => {
+                    if (*recv_len as usize) < r.len() {
+                        *recv_len = r.len() as Dword;
+                        return SCARD_E_INSUFFICIENT_BUFFER;
+                    }
+                    core::ptr::copy_nonoverlapping(r.as_ptr(), recv, r.len());
                     *recv_len = r.len() as Dword;
-                    return SCARD_E_INSUFFICIENT_BUFFER;
+                    SCARD_S_SUCCESS
                 }
-                core::ptr::copy_nonoverlapping(r.as_ptr(), recv, r.len());
-                *recv_len = r.len() as Dword;
-                SCARD_S_SUCCESS
+                Err(Error::NoCard) => {
+                    st.atr = None;
+                    st.events = st.events.wrapping_add(1);
+                    SCARD_W_REMOVED_CARD
+                }
+                Err(e) => map(e),
             }
-            Err(Error::NoCard) => {
-                st.atr = None;
-                st.events = st.events.wrapping_add(1);
-                SCARD_W_REMOVED_CARD
-            }
-            Err(e) => map(e),
-        }
-    })
+        })
+    })();
+    // The result code only: the bytes may hold a PIN.
+    trace("SCardTransmit", r);
+    r
 }
 
 /// Every `SCard*` the module may import, by name, for the host's resolver.
@@ -571,6 +633,17 @@ pub fn resolve(name: &str) -> Option<usize> {
         "SCardTransmit" => SCardTransmit as *const () as usize,
         _ => return None,
     })
+}
+
+/// What the host's resolver asks first, with the import's symbol version: `SCard*` and
+/// `curl_*` are imported unversioned (pcsc-lite and the module's libcurl have none),
+/// libudev's as `@LIBUDEV_183`. `None` sends the import on to the shim.
+pub fn resolve_import(name: &str, version: Option<&str>) -> Option<usize> {
+    match version {
+        None => resolve(name).or_else(|| platform::resolve(name)),
+        Some("LIBUDEV_183") if name.starts_with("udev_") => platform::resolve(name),
+        Some(_) => None,
+    }
 }
 
 pub mod platform;

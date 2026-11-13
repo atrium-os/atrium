@@ -39,6 +39,15 @@ pub const OFFSETOF_TM_ZONE: usize = 48;
 /// Our use of glibc's opaque words: the lock word of a mutex is glibc's `__lock` (offset 0),
 /// so `PTHREAD_MUTEX_INITIALIZER` (all zero) is an unlocked mutex for us too.
 pub const OFFSETOF_MUTEX_LOCK: usize = 0;
+/// glibc's own fields after it (same on x86_64 and aarch64): the recursion depth, the
+/// owner's tid, and the kind, which `PTHREAD_RECURSIVE_MUTEX_INITIALIZER_NP` and
+/// `PTHREAD_ERRORCHECK_MUTEX_INITIALIZER_NP` set statically (libstdc++'s
+/// `std::recursive_mutex` is one, with no `pthread_mutexattr_settype` call).
+pub const OFFSETOF_MUTEX_COUNT: usize = 4;
+pub const OFFSETOF_MUTEX_OWNER: usize = 8;
+pub const OFFSETOF_MUTEX_KIND: usize = 16;
+pub const PTHREAD_MUTEX_RECURSIVE: i32 = 1;
+pub const PTHREAD_MUTEX_ERRORCHECK: i32 = 2;
 
 // Linux errno values (asm-generic, same on x86_64 and aarch64).
 pub const EPERM: i32 = 1;
@@ -59,6 +68,7 @@ pub const EINVAL: i32 = 22;
 pub const EMFILE: i32 = 24;
 pub const ENAMETOOLONG: i32 = 36;
 pub const ERANGE: i32 = 34;
+pub const EDEADLK: i32 = 35;
 pub const ENOSYS: i32 = 38;
 pub const EILSEQ: i32 = 84;
 pub const ETIMEDOUT: i32 = 110;

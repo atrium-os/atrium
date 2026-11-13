@@ -128,12 +128,7 @@ impl Bulk for FdBulk {
 struct Res;
 impl Resolver for Res {
     fn resolve(&self, name: &str, version: Option<&str>) -> Option<usize> {
-        if version.is_none() {
-            if let Some(a) = sigillum_pcsc::resolve(name).or_else(|| sigillum_pcsc::platform::resolve(name)) {
-                return Some(a);
-            }
-        }
-        hospes_glibc::Glibc.resolve(name, version)
+        sigillum_pcsc::resolve_import(name, version).or_else(|| hospes_glibc::Glibc.resolve(name, version))
     }
 }
 

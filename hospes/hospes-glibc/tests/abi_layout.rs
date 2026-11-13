@@ -35,6 +35,17 @@ int main(void) {
     P("OFFSETOF_TM_GMTOFF", offsetof(struct tm, tm_gmtoff));
     P("OFFSETOF_TM_ZONE", offsetof(struct tm, tm_zone));
     P("OFFSETOF_MUTEX_LOCK", offsetof(pthread_mutex_t, __data.__lock));
+    P("OFFSETOF_MUTEX_COUNT", offsetof(pthread_mutex_t, __data.__count));
+    P("OFFSETOF_MUTEX_OWNER", offsetof(pthread_mutex_t, __data.__owner));
+    P("OFFSETOF_MUTEX_KIND", offsetof(pthread_mutex_t, __data.__kind));
+    P("PTHREAD_MUTEX_RECURSIVE", PTHREAD_MUTEX_RECURSIVE);
+    P("PTHREAD_MUTEX_ERRORCHECK", PTHREAD_MUTEX_ERRORCHECK);
+    P("EDEADLK", EDEADLK);
+    /* The static initialisers carry the kind where we read it. */
+    { pthread_mutex_t m = PTHREAD_RECURSIVE_MUTEX_INITIALIZER_NP;
+      P("RECURSIVE_INITIALIZER_KIND", *(int *)((char *)&m + offsetof(pthread_mutex_t, __data.__kind))); }
+    { pthread_mutex_t m = PTHREAD_ERRORCHECK_MUTEX_INITIALIZER_NP;
+      P("ERRORCHECK_INITIALIZER_KIND", *(int *)((char *)&m + offsetof(pthread_mutex_t, __data.__kind))); }
     P("EPERM", EPERM); P("ENOENT", ENOENT); P("EINTR", EINTR); P("EBADF", EBADF);
     P("EAGAIN", EAGAIN); P("ENOMEM", ENOMEM); P("EACCES", EACCES); P("EBUSY", EBUSY);
     P("EINVAL", EINVAL); P("ENOSYS", ENOSYS); P("ETIMEDOUT", ETIMEDOUT);
@@ -68,6 +79,14 @@ fn ours_native() -> Vec<(&'static str, i64)> {
         ("OFFSETOF_TM_GMTOFF", abi::OFFSETOF_TM_GMTOFF as i64),
         ("OFFSETOF_TM_ZONE", abi::OFFSETOF_TM_ZONE as i64),
         ("OFFSETOF_MUTEX_LOCK", abi::OFFSETOF_MUTEX_LOCK as i64),
+        ("OFFSETOF_MUTEX_COUNT", abi::OFFSETOF_MUTEX_COUNT as i64),
+        ("OFFSETOF_MUTEX_OWNER", abi::OFFSETOF_MUTEX_OWNER as i64),
+        ("OFFSETOF_MUTEX_KIND", abi::OFFSETOF_MUTEX_KIND as i64),
+        ("PTHREAD_MUTEX_RECURSIVE", abi::PTHREAD_MUTEX_RECURSIVE as i64),
+        ("PTHREAD_MUTEX_ERRORCHECK", abi::PTHREAD_MUTEX_ERRORCHECK as i64),
+        ("EDEADLK", abi::EDEADLK as i64),
+        ("RECURSIVE_INITIALIZER_KIND", abi::PTHREAD_MUTEX_RECURSIVE as i64),
+        ("ERRORCHECK_INITIALIZER_KIND", abi::PTHREAD_MUTEX_ERRORCHECK as i64),
         ("EPERM", abi::EPERM as i64),
         ("ENOENT", abi::ENOENT as i64),
         ("EINTR", abi::EINTR as i64),

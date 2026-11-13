@@ -151,6 +151,22 @@ pub extern "C" fn pthread_attr_setschedpolicy(_a: *mut u8, _p: i32) -> i32 {
 }
 
 // ---- mutex: 0 free, 1 held, 2 held with waiters ------------------------------------------
+//
+// The kind is glibc's `__kind` word, set by the static initialisers (a recursive mutex from
+// `PTHREAD_RECURSIVE_MUTEX_INITIALIZER_NP` is locked twice by one thread, and must not wait
+// on itself). For recursive and error-checking mutexes the owner's tid is kept in `__owner`
+// and the depth in `__count`, as glibc keeps them. A plain mutex keeps neither.
+
+unsafe fn field<'a>(m: *mut u8, off: usize) -> &'a AtomicU32 {
+    &*(m.add(off) as *const AtomicU32)
+}
+unsafe fn kind(m: *mut u8) -> i32 {
+    // glibc's low bits; the rest are flags (robust, priority) we never set.
+    (field(m, abi::OFFSETOF_MUTEX_KIND).load(Ordering::Relaxed) & 3) as i32
+}
+fn me() -> u32 {
+    sys::gettid() as u32
+}
 
 pub unsafe extern "C" fn pthread_mutex_init(m: *mut u8, _attr: *const c_void) -> i32 {
     core::ptr::write_bytes(m, 0, abi::SIZEOF_PTHREAD_MUTEX_T);
@@ -160,11 +176,28 @@ pub unsafe extern "C" fn pthread_mutex_destroy(_m: *mut u8) -> i32 {
     0
 }
 pub unsafe extern "C" fn pthread_mutex_lock(m: *mut u8) -> i32 {
-    let w = word(m);
+    let k = kind(m);
+    if k == abi::PTHREAD_MUTEX_RECURSIVE || k == abi::PTHREAD_MUTEX_ERRORCHECK {
+        let (owner, count, t) = (field(m, abi::OFFSETOF_MUTEX_OWNER), field(m, abi::OFFSETOF_MUTEX_COUNT), me());
+        if owner.load(Ordering::Relaxed) == t {
+            if k == abi::PTHREAD_MUTEX_ERRORCHECK {
+                return abi::EDEADLK;
+            }
+            count.fetch_add(1, Ordering::Relaxed);
+            return 0;
+        }
+        lock_word(word(m));
+        owner.store(t, Ordering::Relaxed);
+        count.store(1, Ordering::Relaxed);
+        return 0;
+    }
+    lock_word(word(m));
+    0
+}
+fn lock_word(w: &AtomicU32) {
     if w.compare_exchange(0, 1, Ordering::Acquire, Ordering::Relaxed).is_err() {
         lock_slow(w);
     }
-    0
 }
 #[cold]
 fn lock_slow(w: &AtomicU32) {
@@ -179,8 +212,26 @@ fn lock_slow(w: &AtomicU32) {
     }
 }
 pub unsafe extern "C" fn pthread_mutex_trylock(m: *mut u8) -> i32 {
+    let k = kind(m);
+    let owned = k == abi::PTHREAD_MUTEX_RECURSIVE || k == abi::PTHREAD_MUTEX_ERRORCHECK;
+    if owned {
+        let t = me();
+        if field(m, abi::OFFSETOF_MUTEX_OWNER).load(Ordering::Relaxed) == t {
+            if k == abi::PTHREAD_MUTEX_ERRORCHECK {
+                return abi::EBUSY;
+            }
+            field(m, abi::OFFSETOF_MUTEX_COUNT).fetch_add(1, Ordering::Relaxed);
+            return 0;
+        }
+    }
     match word(m).compare_exchange(0, 1, Ordering::Acquire, Ordering::Relaxed) {
-        Ok(_) => 0,
+        Ok(_) => {
+            if owned {
+                field(m, abi::OFFSETOF_MUTEX_OWNER).store(me(), Ordering::Relaxed);
+                field(m, abi::OFFSETOF_MUTEX_COUNT).store(1, Ordering::Relaxed);
+            }
+            0
+        }
         Err(_) => abi::EBUSY,
     }
 }
@@ -192,11 +243,24 @@ pub extern "C" fn pthread_mutexattr_destroy(_a: *mut u8) -> i32 {
     0
 }
 pub unsafe extern "C" fn pthread_mutex_unlock(m: *mut u8) -> i32 {
-    let w = word(m);
-    if w.swap(0, Ordering::Release) == 2 {
-        sys::futex_wake(w.as_ptr(), 1);
+    let k = kind(m);
+    if k == abi::PTHREAD_MUTEX_RECURSIVE || k == abi::PTHREAD_MUTEX_ERRORCHECK {
+        let (owner, count) = (field(m, abi::OFFSETOF_MUTEX_OWNER), field(m, abi::OFFSETOF_MUTEX_COUNT));
+        if owner.load(Ordering::Relaxed) != me() {
+            return abi::EPERM;
+        }
+        if count.fetch_sub(1, Ordering::Relaxed) > 1 {
+            return 0;
+        }
+        owner.store(0, Ordering::Relaxed);
     }
+    unlock_word(word(m));
     0
+}
+fn unlock_word(w: &AtomicU32) {
+    if w.swap(0, Ordering::Release) == 2 {
+        unsafe { sys::futex_wake(w.as_ptr(), 1) };
+    }
 }
 
 // ---- condition variables: a sequence counter ---------------------------------------------
@@ -232,7 +296,19 @@ pub unsafe extern "C" fn pthread_cond_destroy(_c: *mut u8) -> i32 {
 unsafe fn cond_wait(c: *mut u8, m: *mut u8, deadline: Option<&Timespec>) -> i32 {
     let seq = word(c);
     let v = seq.load(Ordering::Acquire);
-    pthread_mutex_unlock(m);
+    // A recursive or error-checking mutex is released whole and given back at its depth.
+    let k = kind(m);
+    let owned = k == abi::PTHREAD_MUTEX_RECURSIVE || k == abi::PTHREAD_MUTEX_ERRORCHECK;
+    let depth = if owned {
+        if field(m, abi::OFFSETOF_MUTEX_OWNER).load(Ordering::Relaxed) != me() {
+            return abi::EPERM;
+        }
+        field(m, abi::OFFSETOF_MUTEX_OWNER).store(0, Ordering::Relaxed);
+        field(m, abi::OFFSETOF_MUTEX_COUNT).swap(0, Ordering::Relaxed)
+    } else {
+        0
+    };
+    unlock_word(word(m));
     let timed_out = match deadline {
         None => {
             sys::futex_wait(seq.as_ptr(), v);
@@ -244,6 +320,10 @@ unsafe fn cond_wait(c: *mut u8, m: *mut u8, deadline: Option<&Timespec>) -> i32 
     let w = word(m);
     while w.swap(2, Ordering::Acquire) != 0 {
         sys::futex_wait(w.as_ptr(), 2);
+    }
+    if owned {
+        field(m, abi::OFFSETOF_MUTEX_OWNER).store(me(), Ordering::Relaxed);
+        field(m, abi::OFFSETOF_MUTEX_COUNT).store(depth, Ordering::Relaxed);
     }
     if timed_out && seq.load(Ordering::Acquire) == v {
         abi::ETIMEDOUT
@@ -502,4 +582,112 @@ pub unsafe extern "C" fn pthread_getschedparam(_t: usize, policy: *mut i32, para
         *param = 0;
     }
     0
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    extern crate std;
+
+    /// A mutex as glibc's static initialisers leave it: all zero but `__kind`.
+    #[repr(C, align(8))]
+    struct M([u8; abi::SIZEOF_PTHREAD_MUTEX_T]);
+    fn with_kind(k: i32) -> Box<M> {
+        let mut m = Box::new(M([0; abi::SIZEOF_PTHREAD_MUTEX_T]));
+        m.0[abi::OFFSETOF_MUTEX_KIND..abi::OFFSETOF_MUTEX_KIND + 4].copy_from_slice(&k.to_ne_bytes());
+        m
+    }
+    struct P(*mut u8);
+    unsafe impl Send for P {}
+    unsafe impl Sync for P {}
+    /// trylock from another thread (and release it if it got it).
+    fn other_trylock(m: *mut u8) -> i32 {
+        let p = P(m);
+        std::thread::spawn(move || unsafe {
+            let p = p;
+            let r = pthread_mutex_trylock(p.0);
+            if r == 0 {
+                pthread_mutex_unlock(p.0);
+            }
+            r
+        })
+        .join()
+        .unwrap()
+    }
+    use alloc::boxed::Box;
+
+    #[test]
+    fn plain_mutex_excludes_others() {
+        let mut m = with_kind(0);
+        let p = m.0.as_mut_ptr();
+        unsafe {
+            assert_eq!(pthread_mutex_lock(p), 0);
+            assert_eq!(pthread_mutex_trylock(p), abi::EBUSY);
+            assert_eq!(other_trylock(p), abi::EBUSY);
+            assert_eq!(pthread_mutex_unlock(p), 0);
+            assert_eq!(other_trylock(p), 0);
+        }
+    }
+
+    /// libstdc++'s std::recursive_mutex: the same thread locks it again without waiting on
+    /// itself (the InnaIT module hung here, P4), and others wait until the last unlock.
+    #[test]
+    fn recursive_mutex_relocks_and_counts() {
+        let mut m = with_kind(abi::PTHREAD_MUTEX_RECURSIVE);
+        let p = m.0.as_mut_ptr();
+        unsafe {
+            assert_eq!(pthread_mutex_lock(p), 0);
+            assert_eq!(pthread_mutex_lock(p), 0);
+            assert_eq!(pthread_mutex_trylock(p), 0);
+            assert_eq!(other_trylock(p), abi::EBUSY);
+            assert_eq!(pthread_mutex_unlock(p), 0);
+            assert_eq!(pthread_mutex_unlock(p), 0);
+            assert_eq!(other_trylock(p), abi::EBUSY);
+            assert_eq!(pthread_mutex_unlock(p), 0);
+            assert_eq!(pthread_mutex_unlock(p), abi::EPERM);
+            assert_eq!(other_trylock(p), 0);
+        }
+    }
+
+    #[test]
+    fn errorcheck_mutex_reports_misuse() {
+        let mut m = with_kind(abi::PTHREAD_MUTEX_ERRORCHECK);
+        let p = m.0.as_mut_ptr();
+        unsafe {
+            assert_eq!(pthread_mutex_unlock(p), abi::EPERM);
+            assert_eq!(pthread_mutex_lock(p), 0);
+            assert_eq!(pthread_mutex_lock(p), abi::EDEADLK);
+            assert_eq!(other_trylock(p), abi::EBUSY);
+            assert_eq!(pthread_mutex_unlock(p), 0);
+            assert_eq!(other_trylock(p), 0);
+        }
+    }
+
+    /// A wait releases a recursive mutex whole and gives it back at its depth.
+    #[test]
+    fn cond_wait_keeps_recursive_depth() {
+        let mut mx = with_kind(abi::PTHREAD_MUTEX_RECURSIVE);
+        let mut cv = Box::new(M([0; abi::SIZEOF_PTHREAD_MUTEX_T]));
+        let (p, c) = (mx.0.as_mut_ptr(), cv.0.as_mut_ptr());
+        unsafe {
+            assert_eq!(pthread_mutex_lock(p), 0);
+            assert_eq!(pthread_mutex_lock(p), 0);
+            let (pp, cc) = (P(p), P(c));
+            let t = std::thread::spawn(move || {
+                let (pp, cc) = (pp, cc);
+                // Gets the mutex only once the waiter has released it whole.
+                assert_eq!(pthread_mutex_lock(pp.0), 0);
+                pthread_cond_signal(cc.0);
+                assert_eq!(pthread_mutex_unlock(pp.0), 0);
+            });
+            let mut deadline = Timespec { sec: 0, nsec: 0 };
+            let (s, _) = sys::realtime();
+            deadline.sec = s + 10;
+            assert_eq!(pthread_cond_timedwait(c, p, &deadline), 0);
+            t.join().unwrap();
+            assert_eq!(pthread_mutex_unlock(p), 0);
+            assert_eq!(pthread_mutex_unlock(p), 0);
+            assert_eq!(pthread_mutex_unlock(p), abi::EPERM);
+        }
+    }
 }

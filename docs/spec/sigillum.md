@@ -949,6 +949,16 @@ administrative calls (`C_InnaIT*`: zeroize, initialise, applet install and delet
    QEMU `usb-host` or by APDU forwarding (`ccid-card-passthru`). It signs a digest, and
    the signature verifies against the token's certificate. Generic PIV over the same
    transport follows for YubiKey-class tokens.
+   **`list` passed on the real token 2026-11-13** (Ubuntu 24.04 amd64 guest under TCG on
+   the Mac; qemu `usb-host` needs root there, or macOS keeps the interfaces and the guest's
+   SET_CONFIGURATION stalls): hello, label "InnaITKey", 0 certificates, host exit 0, no PIN
+   sent. Three gaps the p11test fixture could not show, now fixed: the module imports
+   libudev versioned (`@LIBUDEV_183`); it picks its reader by name (it needs "InnaitKey",
+   the USB manufacturer string, so the bridge names the reader as pcscd does for a CCID
+   reader libccid does not list); and it locks libstdc++'s `std::recursive_mutex`, whose
+   kind comes from glibc's static initialiser, so the shim honours `__kind`. sigillum-pcsc
+   logs each `SCard*` call's name and result (never a buffer or length). `sign` waits for a
+   certificate on the token.
 
 ## 17. Decisions, with recommendations
 
