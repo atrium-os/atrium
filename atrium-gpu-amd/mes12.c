@@ -2924,6 +2924,85 @@ uq2_recover(struct amd_uq *q)
 }
 
 /*
+ * amdgpu's MMIO MEC pipe reset (mes_v12_0_reset_compute_pipe_mmio, gfx12
+ * sets mec.use_mmio_for_reset), step for step: RLC safe mode, pipe reset
+ * held while every HQD on the pipe is cleared, then released. Unlike our
+ * old version (fdadff06) it does not touch the pipe's PRGRM_START. Then
+ * MES forgets the queue (REMOVE_QUEUE, plainly or after reset).
+ *
+ * Only when the guilty queue is alone on its pipe and that is not pipe 0
+ * (the kernel queue's): a pipe reset loses every queue on the pipe, and
+ * MES would not know. Otherwise false, and the caller resets the GPU.
+ */
+static bool
+uq2_pipe_reset(struct amd_uq *q)
+{
+	struct mes *m = q->m;
+	const struct mes_gen *g = m->g;
+	uint32_t d, bit, pc0, pc1, pc2, start, busy0, busy1;
+	u_int vmid, pipe, qi, i, others = 0;
+	int err, aerr = -1;
+	bool safe, gone;
+
+	if (!uq2_hqd_at(m, q->db, &vmid, &pipe, &qi))
+		return (false);
+	for (i = 0; i < 8; i++) {
+		if (i == qi)
+			continue;
+		grbm_select_q(m, 1, pipe, i);
+		if (rd(m, g->hqd_active) & 1)
+			others++;
+	}
+	grbm_select_q(m, 0, 0, 0);
+	if (pipe == 0 || others != 0) {
+		device_printf(m->sc->dev, "uq%u: no pipe reset: me1 pipe %u "
+		    "%s\n", q->slot, pipe, pipe == 0 ? "holds the kernel queue"
+		    : "has other active queues");
+		return (false);
+	}
+	bit = MEC_RS64_PIPE0_RESET << pipe;
+	safe = amd_gfx12_safe_mode(m->sc, true) == 0;
+	grbm_select_q(m, 1, pipe, qi);
+	pc0 = rd(m, g->mec_instr_pntr);
+	start = rd(m, g->mec_prgrm_start);
+	busy0 = rd(m, g->cp_cpc_busy);
+	d = rd(m, g->cp_mec_rs64_cntl);
+	wr(m, g->cp_mec_rs64_cntl, d | bit);
+	for (i = 0; i < 8; i++) {
+		grbm_select_q(m, 1, pipe, i);
+		wr(m, g->hqd_active, 0);
+		wr(m, g->hqd_dequeue_req, 0);
+	}
+	grbm_select_q(m, 1, pipe, qi);
+	wr(m, g->cp_mec_rs64_cntl, d & ~bit);
+	pc1 = rd(m, g->mec_instr_pntr);
+	DELAY(1000);
+	pc2 = rd(m, g->mec_instr_pntr);
+	busy1 = rd(m, g->cp_cpc_busy);
+	device_printf(m->sc->dev, "uq%u: MEC me1 pipe %u reset as amdgpu "
+	    "(queue %u, VMID %u%s): PC %#x -> %#x -> %#x (start %#x, amdgpu "
+	    "checks (PC << 2) - start = %#x), CP_CPC_BUSY_STAT %#x -> %#x, "
+	    "CP_CPC_STATUS %#x, CP_CPF_STATUS %#x, HQD %s\n", q->slot, pipe,
+	    qi, vmid, safe ? "" : ", no RLC safe mode", pc0, pc1, pc2, start,
+	    (pc2 << 2) - start, busy0, busy1, rd(m, g->cp_cpc_status),
+	    rd(m, g->cp_cpf_status),
+	    (rd(m, g->hqd_active) & 1) ? "STILL ACTIVE" : "inactive");
+	grbm_select_q(m, 0, 0, 0);
+	if (safe)
+		(void)amd_gfx12_safe_mode(m->sc, false);
+	err = uq_remove_raw(m, q->gva, q->db);
+	if (err != 0)
+		aerr = err = uq_remove_after_reset(m, q->gva, q->db);
+	gone = !uq2_hqd_find(m, q->db, &vmid);
+	mes_report(m, "after pipe reset");
+	device_printf(m->sc->dev, "uq%u: after pipe reset: REMOVE_QUEUE %d%s, "
+	    "HQD %s: %s\n", q->slot, err, aerr == -1 ? "" : " (after reset)",
+	    gone ? "gone" : "STILL ACTIVE",
+	    gone && err == 0 ? "RECOVERED" : "failed");
+	return (gone && err == 0);
+}
+
+/*
  * Evict: take the queue off MES, keeping its memory (a lost queue: its
  * close frees it later). Destroy: evict and free. If its last job has not fenced,
  * first kill the waves of the VMID MES runs it under and give the fence a
@@ -2956,12 +3035,15 @@ amd_mes12_uq_evict(struct amd_uq *q)
 	 * client CPG) is beyond MES: box runs a0597b2d..a652163f, MES refused
 	 * REMOVE_QUEUE and its own RESET for it; runs 647da1b1/fdadff06, a MEC
 	 * pipe reset cleared the HQD but left the MEC busy and wedged the
-	 * pipe's other queues, the kernel queue among them. Do not ask MES:
-	 * the caller resets and re-initialises the GPU (smu.c amd_si_reinit).
+	 * pipe's other queues, the kernel queue among them; run e88fd84e,
+	 * MES-level recovery (suspend, hang detect, reset, remove) was all
+	 * refused. Try amdgpu's exact MMIO pipe reset when the queue is alone
+	 * on a pipe other than 0; failing that, the caller resets and
+	 * re-initialises the GPU (smu.c amd_si_reinit).
 	 */
 	if (q->added && !uq2_done(q) && !uq2_hqd_reset(q)) {
 		amd_mes12_uq_report(q, "HQD stuck after its reset");
-		if (uq2_recover(q)) {
+		if (uq2_pipe_reset(q) || uq2_recover(q)) {
 			q->added = false;
 			return (0);
 		}
