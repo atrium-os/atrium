@@ -1522,3 +1522,18 @@ work (self-test, scrub).
   mes_report and kcq_report skip their selects; kq_int is a no-op once MES
   set the interrupt enables. The select log now counts per calling site.
   Logs: claude/project-thread-33aauq 8cddd2ca.
+- **2026-11-13 17:23, 1 h fuzz check with 7a1464ba: the flush wedge is gone (0
+  timeouts; si-client-test 92/0 first, tests 8, 10, 14 included), but the run
+  ended after 16 s.** Two si-fuzz faults and one driver one. si-fuzz read the
+  "lost" state every re-init passes through as the cap and stopped; and it
+  started with only one re-init of the window left (test 14 spends 2). Then
+  re-init 3, taken while six ioctl threads were creating VMs and queues, left
+  a card on which every new queue's CPC faulted on VMID 0 at address 0 and
+  hung, even the root canary's; REMOVE_QUEUE and MES RESET were refused, and
+  the 4th reset hit the cap. Fixes (next commit): si-fuzz waits out the
+  re-init window before it starts and after each re-init (SI_FUZZ_PACE 610),
+  treats "lost" as final only after 90 s; si_vm_setup takes uq_sx shared, so
+  a VM is never bound across si_recover (one bound on the old card after its
+  VMIDs were marked lost came out on the new card neither lost nor bound).
+  Whether that race explains the VMID 0 faults is not proven. Logs:
+  claude/project-thread-33aauq 929ba7c6.

@@ -1336,14 +1336,27 @@ si_vm_setup(struct atrium_amd_softc *sc, struct atrium_amd_vm *vm)
 	uint16_t vmid;
 	int err;
 
-	if (c == NULL || !amd_si_usable(sc))
+	if (c == NULL)
 		return (ENXIO);
+	/*
+	 * Not across a re-init (si_recover holds uq_sx exclusive): a VM bound
+	 * on the old card after si_recover marked the VMIDs lost would come
+	 * out on the new one neither lost nor bound (run 7a1464ba: re-init 3
+	 * came with six threads in VM and queue creates, and every queue
+	 * after it faulted).
+	 */
+	sx_slock(&c->uq_sx);
+	if (!amd_si_usable(sc)) {
+		sx_sunlock(&c->uq_sx);
+		return (ENXIO);
+	}
 	mtx_lock(&sc->lock);
 	for (vmid = SI_KVMID_FIRST; vmid <= SI_KVMID_LAST; vmid++)
 		if ((c->vmids & (1u << vmid)) == 0)
 			break;
 	if (vmid > SI_KVMID_LAST) {
 		mtx_unlock(&sc->lock);
+		sx_sunlock(&c->uq_sx);
 		return (ENOSPC);
 	}
 	c->vmids |= 1u << vmid;
@@ -1366,6 +1379,7 @@ si_vm_setup(struct atrium_amd_softc *sc, struct atrium_amd_vm *vm)
 	}
 	vm->vmid = vmid;
 	vm->hw12 = v;
+	sx_sunlock(&c->uq_sx);
 	return (0);
 fail:
 	if (v->live)
@@ -1375,6 +1389,7 @@ fail:
 	c->vmids &= ~(1u << vmid);
 	sc->vm_count--;
 	mtx_unlock(&sc->lock);
+	sx_sunlock(&c->uq_sx);
 	return (err);
 }
 

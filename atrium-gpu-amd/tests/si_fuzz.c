@@ -37,7 +37,7 @@
  * Workers restart every generation with a new uid, so the reset-blame
  * lockout of one does not stop the next. After a re-init (silicon:
  * si_protected_regs' "reinits" line) every worker is stopped for
- * SI_FUZZ_PACE seconds (default 210), so the driver's cap (3 per 10 min)
+ * SI_FUZZ_PACE seconds (default 610, the driver's whole window), so its cap (3 per 10 min)
  * is never reached by the fuzzer; "lost" ends the run.
  *
  * Findings: a canary that fails twice with no re-init, a job whose
@@ -1412,7 +1412,8 @@ main(int argc, char **argv)
 	uint64_t seed, gen = 0, canary_runs = 0;
 	int64_t t0, end, pause_until = 0, next_canary = 0, next_status = 0;
 	int want_ioctl, want_blob, nthreads = 6, ri, ri_last, hang_ms,
-	    hang_wait, pace = 210, gen_s = 60, d, st, i, j;
+	    hang_wait, pace = 610, gen_s = 60, d, st, i, j;
+	int64_t lost_since = 0;
 	int64_t base_deferred, base_grants, base_vram;
 	pid_t pid;
 
@@ -1498,6 +1499,17 @@ main(int argc, char **argv)
 		return (1);
 	}
 
+	/* The driver allows 3 re-inits per 600 s from the first: one left
+	 * over from before (si-client-test 14 spends 2) would leave the fuzz
+	 * a single one (run 7a1464ba: the cap after 16 s). Start once the
+	 * window is over. */
+	if (ri_last > 0 && pace > 0) {
+		printf("si-fuzz: %d re-init(s) before the start: waiting %d s "
+		    "for the driver's window to close\n", ri_last, pace);
+		for (i = 0; i < pace && !stop_now; i++)
+			sleep(1);
+	}
+
 	t0 = now_ms();
 	end = t0 + 1000LL * strtoll(argv[2], NULL, 10);
 	while (now_ms() < end && !stop_now) {
@@ -1522,12 +1534,22 @@ main(int argc, char **argv)
 		}
 
 		/* A whole-GPU re-init: stop everything, pace, start over. */
+		/* "lost" is also the state during every re-init (run
+		 * 7a1464ba misread it as the cap): only lost for 90 s is. */
 		ri = reinits();
-		if (ri == -2 && ri_last != -2) {
-			finding("the driver reports the GPU lost (re-init cap)");
-			dump_last();
-			break;
+		if (ri == -2) {
+			if (lost_since == 0)
+				lost_since = now;
+			if (now - lost_since > 90000) {
+				finding("the driver reports the GPU lost for "
+				    "90 s (re-init cap or a failed re-init)");
+				dump_last();
+				break;
+			}
+			usleep(200000);
+			continue;
 		}
+		lost_since = 0;
 		if (ri > ri_last && ri_last >= 0) {
 			printf("si-fuzz: re-init %d -> %d; workers stopped for "
 			    "%d s\n", ri_last, ri, pace);
@@ -1644,7 +1666,8 @@ main(int argc, char **argv)
 	sleep(3);
 	for (i = 0; i < 100 && iso("deferred_now") > base_deferred; i++)
 		usleep(200000);
-	ri = reinits();
+	for (i = 0; i < 450 && (ri = reinits()) == -2; i++)
+		usleep(200000);	/* a re-init in progress: up to 90 s */
 	printf("si-fuzz: re-inits at the end %d\n", ri);
 	if (ri == -2)
 		finding("the GPU is lost at the end");
