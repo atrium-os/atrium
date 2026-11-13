@@ -17,6 +17,7 @@ pub mod cookie;
 pub mod courier;
 pub mod handles;
 pub mod label;
+pub mod passkey;
 pub mod proto;
 pub mod server;
 pub mod tickets;

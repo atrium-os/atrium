@@ -132,6 +132,12 @@ impl State {
             Label::Vestibulum => self.vestibulum_op(op, body),
             Label::TrustedUi => self.ui_op(op, body, &mut item),
             Label::Courier(c) => self.courier_op(c, op, body, &mut item),
+            Label::Service(name) if name == crate::passkey::SIGILLUM && (0x90..=0x92).contains(&op) => {
+                match crate::passkey::handle(&mut self.stores, PERSONA, op, body, &mut item) {
+                    Ok(b) => ok(b),
+                    Err(e) => map_err(e),
+                }
+            }
             Label::Service(name) => self.service_op(name, op, body, &mut item),
             Label::Unknown => reply(status::UNKNOWN_PEER),
         };

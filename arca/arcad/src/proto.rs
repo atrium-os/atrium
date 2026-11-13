@@ -94,6 +94,30 @@ pub mod broker_op {
     pub const W_TICKET: u16 = 0x70;
 }
 
+/// Sigillum's ops (0x90..): only `sigillumd` (the `ARCA_SERVICES` entry
+/// named [`crate::passkey::SIGILLUM`]). Arca is the platform authenticator
+/// (arca.md §8.4, sigillum.md §9.2): a passkey is a P-256 key item whose
+/// recipient is the RP ID, in the user's main persona, class
+/// while-unlocked. Its credential id is its item id. Arca builds the
+/// authenticator data itself (RP ID hash from the item's recipient, flags,
+/// counter 0, AAGUID zero), so `sigillumd` can't have it sign for another
+/// RP. `sigillumd` runs the sheet and the press first; `u8 uv` is 1 only
+/// after its `VERIFY_USER` succeeded.
+pub mod sigillum_op {
+    /// `str user | str rp_id | bytes user_handle (1..=64) | str name | str
+    /// display_name | u8 uv` → `id[16] | bytes auth_data` (with the
+    /// attested credential data). A passkey for the same RP and user
+    /// handle is replaced, as platform authenticators do.
+    pub const P_CREATE: u16 = 0x90;
+    /// `str user | str rp_id | id[16] | u8 uv | client_data_hash[32]` →
+    /// `bytes auth_data | bytes signature (DER) | bytes user_handle`.
+    pub const P_ASSERT: u16 = 0x91;
+    /// `str user | str rp_id` → `u32 n | n × (id[16] | bytes user_handle |
+    /// str name | str display_name)`, for the sheet and for
+    /// `excludeCredentials`.
+    pub const P_LIST: u16 = 0x92;
+}
+
 /// Courier ops (0x80..): only a courier's uid, for its own endpoint.
 pub mod courier_op {
     /// After TLS is up: `u8 n | n × (u8 source | ref[16])` → `n × bytes

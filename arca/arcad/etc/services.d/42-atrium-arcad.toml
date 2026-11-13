@@ -81,5 +81,6 @@ gid  = 65020
 # courier gets a cookie. Set once the Navigator ships signed.
 # ARCA_SERVICES names the system services the machine store serves
 # (arca.md §6.4): vinculumd (_vinculum, 65024) for Bluetooth bonds, usable
-# at the login screen.
-env  = [{ key = "ARCA_VESTIBULUM_UID", value = "50093" }, { key = "ARCA_UI_UID", value = "65021" }, { key = "ARCA_SERVICES", value = "vinculumd=65024" }]
+# at the login screen; sigillumd (_sigillum, 65028) for the passkey ops
+# P_CREATE/P_ASSERT/P_LIST only (sigillum.md §9.2), not the machine store.
+env  = [{ key = "ARCA_VESTIBULUM_UID", value = "50093" }, { key = "ARCA_UI_UID", value = "65021" }, { key = "ARCA_SERVICES", value = "vinculumd=65024,sigillumd=65028" }]

@@ -18,12 +18,14 @@ path = "src/bin/arcad.rs"
 arca-store      = { path = "../arca-store" }
 portcullis-peer = { path = "../../portcullis/portcullis-peer" }
 ed25519-dalek   = { version = "2", default-features = false, features = ["zeroize"] }
+p256            = { version = "0.13", features = ["ecdsa"] }
 libc            = "0.2"
 getrandom       = { version = "0.2", features = ["std"] }
 sha2            = "0.10"
 psl = "2"
 
 [dev-dependencies]
+sha2 = "0.10"
 tempfile = "3"
 libc = "0.2"
 

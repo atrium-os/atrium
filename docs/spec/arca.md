@@ -487,6 +487,15 @@ same-site context or a gesture, because it never holds a ticket.
   the courier actually connected to, and builds `clientDataJSON` from trusted values.
 - **User verification** is Vestibulum's prompt. Arca signs. Pages can request a credential,
   never read one.
+- **The wire** (built 2026-11-13, sigillum.md §9.2 and §16.3): `P_CREATE 0x90`,
+  `P_ASSERT 0x91`, `P_LIST 0x92`, served only to the `ARCA_SERVICES` entry `sigillumd`,
+  which runs the sheet and the press first. A passkey is a `Kind::P256` item, recipient
+  `RpId`, main persona, class while-unlocked, account = user name, scope = user handle and
+  display name; its credential id is its item id. Arca builds the authenticator data from
+  the item's own recipient (so `sigillumd` can't have it sign for another RP): UP always,
+  UV only when `sigillumd` says its `VERIFY_USER` passed, BE set, BS clear until sync
+  exists, counter 0, AAGUID zero. A new passkey for the same RP and user handle replaces
+  the old one. `arcad/src/passkey.rs`, `arcad/tests/passkey.rs`.
 - Passkeys sync through Vestibulum's end-to-end sync. Hardware security keys over CTAP2
   come later, through a USB HID helper jail.
 
