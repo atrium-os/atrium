@@ -11,11 +11,13 @@ use crate::hid::{self, Event, HidDevice, InitResponse, Reassembler};
 use crate::pin::{self, Shared};
 use crate::{status, Error};
 
-/// How long a transaction may go without hearing from the device. A
+/// How long a transaction may go without hearing from the device. A CTAP2
 /// user-presence wait sends keepalives every 100 ms or so, which restart
-/// the clock; the ceremony's own 120 s limit is the broker's (sigillum.md
+/// the clock, but a U2F-only key sends none and may take a while over a
+/// slow bus (QEMU's emulated key answers a registration after more than a
+/// second); the ceremony's own 120 s limit is the broker's (sigillum.md
 /// §7.2).
-pub const READ_TIMEOUT_MS: u32 = 1000;
+pub const READ_TIMEOUT_MS: u32 = 5000;
 /// One read's wait, so a cancel is noticed promptly.
 pub const POLL_MS: u32 = 100;
 
@@ -34,6 +36,15 @@ pub struct Client<D: HidDevice> {
 impl<D: HidDevice> Client<D> {
     /// `INIT` on the broadcast channel; the answer must echo our nonce.
     pub fn open(mut dev: D) -> Result<Client<D>, Error> {
+        // Drop what an earlier client left unread (an answer that came after
+        // it gave up): reports queue in the node across opens.
+        for _ in 0..256 {
+            match dev.read_report(0) {
+                Ok(_) => {}
+                Err(Error::Timeout) => break,
+                Err(e) => return Err(e),
+            }
+        }
         let mut nonce = [0u8; 8];
         getrandom::getrandom(&mut nonce).map_err(|e| Error::Io(e.to_string()))?;
         for p in hid::frame(hid::BROADCAST, hid::cmd::INIT, &nonce)? {

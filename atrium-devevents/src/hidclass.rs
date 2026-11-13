@@ -16,6 +16,13 @@
 //! `sys/dev/hid/hidbus.c`, read 2026-11-13). The classifier still fails
 //! closed: a `hidraw` whose bus reported no collection is `Unknown`, and
 //! an `Unknown` node stays hidden from everyone.
+//!
+//! On FreeBSD 15 and later, `u2f(4)` attaches to a FIDO collection (it
+//! names itself `uhid` for old software, `/dev/u2f/N` with a `uhidN`
+//! alias) and turns off the bus's read-ahead, after which the `hidraw`
+//! node of that bus sees only the first report of each answer. A FIDO
+//! key with a `u2f` driver is driven through `/dev/u2f/N`; one without
+//! (the module not loaded) through its `hidraw` node.
 
 use std::collections::HashMap;
 
@@ -25,8 +32,9 @@ pub const PAGE_FIDO: u16 = 0xF1D0;
 /// One devd line about a HID device, reduced to what classification needs.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Notice {
-    /// A top-level collection of `hidbus` (attached or not).
-    Collection { hidbus: u32, page: u16, usage: u16, vendor: u16, product: u16 },
+    /// A top-level collection of `hidbus` (attached or not). `u2f`: the
+    /// unit of the `u2f(4)` driver attached to it, if that is its driver.
+    Collection { hidbus: u32, page: u16, usage: u16, vendor: u16, product: u16, u2f: Option<u32> },
     /// `hidrawN` attached on `hidbusM`.
     HidrawAttached { hidraw: u32, hidbus: u32 },
     HidrawDetached { hidraw: u32 },
@@ -83,7 +91,10 @@ pub fn parse(line: &str) -> Option<Notice> {
             _ => {}
         }
     }
-    Some(Notice::Collection { hidbus, page: page?, usage: usage?, vendor, product })
+    let page = page?;
+    // u2f(4)'s driver name is `uhid` (or `uf2`, built without the alias).
+    let u2f = (kind == '+' && page == PAGE_FIDO).then(|| unit(what, "uhid").or_else(|| unit(what, "uf2")).or_else(|| unit(what, "u2f"))).flatten();
+    Some(Notice::Collection { hidbus, page, usage: usage?, vendor, product, u2f })
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -101,7 +112,7 @@ pub enum HidKind {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Decision {
     /// Unhide `hidrawN` for the owner of this kind.
-    Attach { hidraw: u32, hidbus: u32, kind: HidKind, vendor: u16, product: u16, mixed: bool },
+    Attach { hidraw: u32, hidbus: u32, kind: HidKind, vendor: u16, product: u16, mixed: bool, u2f: Option<u32> },
     /// `hidrawN` is gone: drop its per-node rule and its driver.
     Detach { hidraw: u32 },
 }
@@ -109,7 +120,7 @@ pub enum Decision {
 /// Collects collection notices per bus and decides at the `hidraw` attach.
 #[derive(Debug, Default)]
 pub struct Classifier {
-    buses: HashMap<u32, Vec<(u16, u16, u16, u16)>>,
+    buses: HashMap<u32, Vec<(u16, u16, u16, u16, Option<u32>)>>,
 }
 
 /// Collections remembered per bus, at most (a descriptor with more is odd;
@@ -122,13 +133,13 @@ pub const MAX_BUSES: usize = 256;
 impl Classifier {
     pub fn feed(&mut self, n: Notice) -> Option<Decision> {
         match n {
-            Notice::Collection { hidbus, page, usage, vendor, product } => {
+            Notice::Collection { hidbus, page, usage, vendor, product, u2f } => {
                 if self.buses.len() >= MAX_BUSES && !self.buses.contains_key(&hidbus) {
                     return None;
                 }
                 let v = self.buses.entry(hidbus).or_default();
                 if v.len() <= MAX_COLLECTIONS {
-                    v.push((page, usage, vendor, product));
+                    v.push((page, usage, vendor, product, u2f));
                 }
                 None
             }
@@ -144,7 +155,8 @@ impl Classifier {
                 } else {
                     HidKind::Input
                 };
-                Some(Decision::Attach { hidraw, hidbus, kind, vendor, product, mixed: fido && other })
+                let u2f = tlcs.iter().find_map(|t| t.4);
+                Some(Decision::Attach { hidraw, hidbus, kind, vendor, product, mixed: fido && other, u2f })
             }
             Notice::HidrawDetached { hidraw } => Some(Decision::Detach { hidraw }),
             Notice::HidbusDetached { hidbus } => {
@@ -168,11 +180,11 @@ mod tests {
     fn parses_kernel_lines() {
         assert_eq!(
             parse("? at index=1 page=0xf1d0 usage=0x0001 bus=0x03 vendor=0x1050 product=0x0407 version=0x0526 on hidbus2\n"),
-            Some(Notice::Collection { hidbus: 2, page: 0xf1d0, usage: 1, vendor: 0x1050, product: 0x0407 })
+            Some(Notice::Collection { hidbus: 2, page: 0xf1d0, usage: 1, vendor: 0x1050, product: 0x0407, u2f: None })
         );
         assert_eq!(
             parse("+hkbd0 at index=0 page=0x0001 usage=0x0006 bus=0x03 vendor=0x0627 product=0x0001 version=0x0000 on hidbus0"),
-            Some(Notice::Collection { hidbus: 0, page: 1, usage: 6, vendor: 0x0627, product: 1 })
+            Some(Notice::Collection { hidbus: 0, page: 1, usage: 6, vendor: 0x0627, product: 1, u2f: None })
         );
         assert_eq!(
             parse("+hidraw2 at index=255 page=0x0000 usage=0x0000 bus=0x03 vendor=0x1050 product=0x0407 version=0x0526 on hidbus2"),
@@ -183,8 +195,14 @@ mod tests {
         assert_eq!(parse("+ugen0.4 at port=4 on usbus0"), None);
         assert_eq!(parse("!system=DEVFS subsystem=CDEV type=CREATE cdev=hidraw0"), None);
         // A name that only looks like ours.
-        assert_eq!(parse("+hidrawx at page=0x0001 usage=0x0002 on hidbus0"), Some(Notice::Collection { hidbus: 0, page: 1, usage: 2, vendor: 0, product: 0 }));
+        assert_eq!(parse("+hidrawx at page=0x0001 usage=0x0002 on hidbus0"), Some(Notice::Collection { hidbus: 0, page: 1, usage: 2, vendor: 0, product: 0, u2f: None }));
         assert_eq!(parse("? at page=0xf1d0 usage=0x0001 on hidbusX"), None);
+        // u2f(4) attached to a FIDO collection: its unit; not for others.
+        assert_eq!(
+            parse("+uhid0 at index=0 page=0xf1d0 usage=0x0001 bus=0x03 vendor=0x46f4 product=0x0005 on hidbus1"),
+            Some(Notice::Collection { hidbus: 1, page: 0xf1d0, usage: 1, vendor: 0x46f4, product: 5, u2f: Some(0) })
+        );
+        assert!(matches!(parse("+uhid3 at index=0 page=0x0001 usage=0x0006 on hidbus1"), Some(Notice::Collection { u2f: None, .. })));
     }
 
     #[test]
@@ -199,8 +217,8 @@ mod tests {
         assert_eq!(
             d,
             vec![
-                Decision::Attach { hidraw: 3, hidbus: 3, kind: HidKind::Input, vendor: 0x1050, product: 0x0407, mixed: false },
-                Decision::Attach { hidraw: 4, hidbus: 4, kind: HidKind::Identity, vendor: 0x1050, product: 0x0407, mixed: false },
+                Decision::Attach { hidraw: 3, hidbus: 3, kind: HidKind::Input, vendor: 0x1050, product: 0x0407, mixed: false, u2f: None },
+                Decision::Attach { hidraw: 4, hidbus: 4, kind: HidKind::Identity, vendor: 0x1050, product: 0x0407, mixed: false, u2f: None },
             ]
         );
     }

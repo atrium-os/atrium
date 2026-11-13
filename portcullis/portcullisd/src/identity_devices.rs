@@ -34,8 +34,12 @@ pub const IDENTITY_RULESET: u32 = 27;
 const JAIL_PREFIX: &str = "atrium-sigillum-fido-";
 const JAIL_ROOTS: &str = "/var/lib/atrium/jails";
 
-/// The jaild request for `hidrawN`'s driver jail.
-pub fn driver_request(hidraw: u32) -> jaild::protocol::CreateJailRequest {
+/// The jaild request for `hidrawN`'s driver jail. The jail is named for the
+/// `hidraw` unit (that is what devd's detach names); the node it is shown
+/// is `u2f/<u2f>` when `u2f(4)` drives the key, since that driver turns
+/// off the bus's read-ahead and the `hidraw` node would miss most of every
+/// answer (atrium_devevents::hidclass).
+pub fn driver_request(hidraw: u32, u2f: Option<u32>) -> jaild::protocol::CreateJailRequest {
     use jaild::protocol::{CreateJailRequest, ExecSpec, MountKind, MountSpec, NetworkConfig};
     let ro = |p: &str| MountSpec {
         source: p.to_string(),
@@ -44,7 +48,7 @@ pub fn driver_request(hidraw: u32) -> jaild::protocol::CreateJailRequest {
         size_mb: None,
         owner: None,
     };
-    let node = format!("hidraw{hidraw}");
+    let node = u2f.map_or_else(|| format!("hidraw{hidraw}"), |n| format!("u2f/{n}"));
     CreateJailRequest {
         rctl: None,
         name: format!("{JAIL_PREFIX}{hidraw}"),
@@ -168,9 +172,9 @@ mod run {
             for op in ops {
                 match op {
                     Op::ShowInput { hidraw } => self.show_input(hidraw),
-                    Op::StartIdentity { hidraw, vendor, product, .. } => {
+                    Op::StartIdentity { hidraw, u2f, vendor, product, .. } => {
                         self.stop(hidraw);
-                        self.start(hidraw, vendor, product);
+                        self.start(hidraw, u2f, vendor, product);
                     }
                     Op::StopIdentity { hidraw } => self.stop(hidraw),
                     Op::Log(m) => eprintln!("portcullisd: identity agent: {m}"),
@@ -207,13 +211,19 @@ mod run {
             }
         }
 
-        fn start(&mut self, hidraw: u32, vendor: u16, product: u16) {
-            let req = driver_request(hidraw);
+        fn start(&mut self, hidraw: u32, u2f: Option<u32>, vendor: u16, product: u16) {
+            let req = driver_request(hidraw, u2f);
             let name = req.name.clone();
+            // A driver jail left by an earlier agent (portcullisd restarted:
+            // closing its procdesc ended the driver) leaves its mounts.
+            for m in &req.mounts {
+                let _ = crate::host_mount::unmount_jail_dest(&req.path, &m.dest);
+            }
             let sent = Client::connect(self.jaild).and_then(|mut c| c.send(&jaild::protocol::Request::CreateJail(req)));
             match sent {
                 Ok((jaild::protocol::Response::JailCreated(r), fd)) => {
-                    eprintln!("portcullisd: identity agent: hidraw{hidraw} ({vendor:04x}:{product:04x}) -> {name} (jid {}, pid {})", r.jid, r.pid);
+                    let via = u2f.map_or_else(|| format!("hidraw{hidraw}"), |n| format!("u2f/{n}"));
+                    eprintln!("portcullisd: identity agent: hidraw{hidraw} ({vendor:04x}:{product:04x}) -> {name} via {via} (jid {}, pid {})", r.jid, r.pid);
                     if let Some(raw) = fd {
                         // SAFETY: jaild just passed us this procdesc and we own it;
                         // holding it keeps the driver's persist=0 jail alive.
@@ -226,7 +236,7 @@ mod run {
         }
 
         fn stop(&mut self, hidraw: u32) {
-            let req = driver_request(hidraw);
+            let req = driver_request(hidraw, None); // the name and mounts do not depend on the node
             let had = self.drivers.remove(&hidraw).is_some();
             let rm = jaild::protocol::Request::RemoveJail { jid: None, name: Some(req.name.clone()) };
             let _ = Client::connect(self.jaild).and_then(|mut c| c.send(&rm));
@@ -247,7 +257,7 @@ mod tests {
 
     #[test]
     fn driver_jail_is_narrow() {
-        let r = driver_request(7);
+        let r = driver_request(7, None);
         assert_eq!(r.name, "atrium-sigillum-fido-7");
         assert_eq!(r.devfs_ruleset, 27);
         assert_eq!(r.devfs_grant.as_deref(), Some("hidraw7"));
@@ -258,5 +268,9 @@ mod tests {
         assert!(e.argv.windows(2).any(|w| w[0] == "--dev" && w[1] == "/dev/hidraw7"));
         assert!(r.mounts.iter().all(|m| matches!(m.kind, jaild::protocol::MountKind::RoNullfs)));
         assert!(!r.mounts.iter().any(|m| m.source == "/atrium/sockets"), "only the driver socket's own directory");
+        // Driven by u2f(4): that node instead, same jail.
+        let u = driver_request(7, Some(2));
+        assert_eq!((u.name.as_str(), u.devfs_grant.as_deref()), ("atrium-sigillum-fido-7", Some("u2f/2")));
+        assert!(u.exec.unwrap().argv.windows(2).any(|w| w[0] == "--dev" && w[1] == "/dev/u2f/2"));
     }
 }

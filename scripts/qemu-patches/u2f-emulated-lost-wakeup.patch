@@ -1,0 +1,47 @@
+diff --git a/hw/usb/u2f-emulated.c b/hw/usb/u2f-emulated.c
+index b82a315..4d464fe 100644
+--- a/hw/usb/u2f-emulated.c
++++ b/hw/usb/u2f-emulated.c
+@@ -161,25 +161,32 @@ static void *u2f_emulated_thread(void* arg)
+ 
+ 
+     while (true) {
+-        /* Wait signal */
+-        qemu_mutex_lock(&key->key_mutex);
+-        qemu_cond_wait(&key->key_cond, &key->key_mutex);
+-        qemu_mutex_unlock(&key->key_mutex);
++        /*
++         * Wait for a packet. A signal sent while this thread was busy with
++         * the previous packet is lost, so only sleep when nothing is queued
++         * (otherwise the second packet of a message waits for the guest's
++         * next write: a multi-packet U2F request never gets its answer).
++         */
++        qemu_mutex_lock(&key->pending_out_mutex);
++        packet_out = u2f_pending_out_get(key);
++        if (packet_out != NULL) {
++            memcpy(packet, packet_out, U2FHID_PACKET_SIZE);
++        }
++        qemu_mutex_unlock(&key->pending_out_mutex);
++        if (packet_out == NULL) {
++            qemu_mutex_lock(&key->key_mutex);
++            qemu_cond_timedwait(&key->key_cond, &key->key_mutex, 10);
++            qemu_mutex_unlock(&key->key_mutex);
++        }
+ 
+         /* Exit thread check */
+         if (key->stop_thread) {
+             key->stop_thread = false;
+             break;
+         }
+-
+-        qemu_mutex_lock(&key->pending_out_mutex);
+-        packet_out = u2f_pending_out_get(key);
+         if (packet_out == NULL) {
+-            qemu_mutex_unlock(&key->pending_out_mutex);
+             continue;
+         }
+-        memcpy(packet, packet_out, U2FHID_PACKET_SIZE);
+-        qemu_mutex_unlock(&key->pending_out_mutex);
+ 
+         qemu_mutex_lock(&key->vdev_mutex);
+         u2f_emu_vdev_send(key->vdev, U2F_EMU_USB, packet,

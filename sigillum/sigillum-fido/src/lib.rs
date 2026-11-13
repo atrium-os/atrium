@@ -73,7 +73,12 @@ fn map_err(e: Error) -> DriverError {
         Error::Status(status::PIN_BLOCKED) | Error::Status(status::PIN_AUTH_BLOCKED) => DriverError::PinBlocked,
         Error::Io(_) => DriverError::Gone,
         Error::Cancelled => DriverError::Denied,
-        _ => DriverError::Device,
+        e => {
+            // The broker gets only the class; the detail stays in this
+            // jail's log (jaild's per-jail log under /var/log/atrium).
+            eprintln!("sigillum-fido: authenticator error: {e:?}");
+            DriverError::Device
+        }
     }
 }
 
@@ -231,19 +236,25 @@ impl<D: HidDevice> Driver<D> {
             hmac_secret: false,
             pin_auth,
         };
-        let fault = |_| FromDriver::Error { ceremony, error: DriverError::Device };
+        let fault = |why: &str| {
+            eprintln!("sigillum-fido: refusing the authenticator's credential: {why}");
+            FromDriver::Error { ceremony, error: DriverError::Device }
+        };
         let att = match self.client.make_credential(&req) {
             Ok(a) => a,
             Err(e) => return FromDriver::Error { ceremony, error: map_err(e) },
         };
         let ad = &att.auth_data;
         let expected: [u8; 32] = Sha256::digest(rp_id.as_bytes()).into();
-        if ad.rp_id_hash != expected || ad.flags & flags::UP == 0 || (uv && ad.flags & flags::UV == 0) {
-            return fault(());
+        if ad.rp_id_hash != expected {
+            return fault("RP ID hash");
         }
-        let Some(cred) = ad.attested.as_ref() else { return fault(()) };
-        let CoseKey::P256 { alg: alg::ES256, .. } = cred.public_key else { return fault(()) };
-        let Some(pk) = cred.public_key.p256() else { return fault(()) };
+        if ad.flags & flags::UP == 0 || (uv && ad.flags & flags::UV == 0) {
+            return fault("UP/UV flags");
+        }
+        let Some(cred) = ad.attested.as_ref() else { return fault("no attested credential") };
+        let CoseKey::P256 { alg: alg::ES256, .. } = cred.public_key else { return fault("not an ES256 key") };
+        let Some(pk) = cred.public_key.p256() else { return fault("bad P-256 point") };
         use sigillum_ctap_sec1::ToSec1;
         let public_key = pk.to_sec1_vec();
         let (auth_data, att_obj) = att.none_object();
@@ -316,7 +327,10 @@ impl<D: HidDevice> Driver<D> {
                     std::thread::sleep(self.u2f_poll)
                 }
                 Ok((_, u2f::sw::WRONG_DATA)) => return Err(DriverError::NoCredentials),
-                Ok(_) => return Err(DriverError::Device),
+                Ok((_, sw)) => {
+                    eprintln!("sigillum-fido: U2F status {sw:#06x}");
+                    return Err(DriverError::Device);
+                }
                 Err(e) => return Err(map_err(e)),
             }
         }
@@ -359,8 +373,17 @@ impl<D: HidDevice> Driver<D> {
             Ok(b) => b,
             Err(e) => return err(e),
         };
-        let Ok(reg) = u2f::parse_registration(&body) else { return err(DriverError::Device) };
-        let Ok(pk) = p256::PublicKey::from_sec1_bytes(&reg.public_key) else { return err(DriverError::Device) };
+        let reg = match u2f::parse_registration(&body) {
+            Ok(r) => r,
+            Err(e) => {
+                eprintln!("sigillum-fido: U2F registration ({} bytes) does not parse: {e:?}", body.len());
+                return err(DriverError::Device);
+            }
+        };
+        let Ok(pk) = p256::PublicKey::from_sec1_bytes(&reg.public_key) else {
+            eprintln!("sigillum-fido: U2F registration has a bad public key");
+            return err(DriverError::Device);
+        };
         let cose = CoseKey::from_p256(alg::ES256, &pk);
         let ad = sigillum_ctap::authdata::AuthData {
             rp_id_hash: app,
@@ -404,7 +427,13 @@ impl<D: HidDevice> Driver<D> {
             Ok(b) => b,
             Err(e) => return err(e),
         };
-        let Ok(a) = u2f::parse_authentication(&body) else { return err(DriverError::Device) };
+        let a = match u2f::parse_authentication(&body) {
+            Ok(a) => a,
+            Err(e) => {
+                eprintln!("sigillum-fido: U2F authentication ({} bytes) does not parse: {e:?}", body.len());
+                return err(DriverError::Device);
+            }
+        };
         if a.up & flags::UP == 0 {
             return err(DriverError::Device);
         }

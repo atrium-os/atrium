@@ -19,8 +19,9 @@ use crate::hidclass::{parse, Classifier, Decision, HidKind};
 pub enum Op {
     /// Show `hidrawN` to tactusd.
     ShowInput { hidraw: u32 },
-    /// Start a driver jail for `hidrawN`.
-    StartIdentity { hidraw: u32, vendor: u16, product: u16, mixed: bool },
+    /// Start a driver jail for `hidrawN`'s key: through `/dev/u2f/<u2f>`
+    /// when `u2f(4)` drives it, else through `hidrawN` (hidclass docs).
+    StartIdentity { hidraw: u32, u2f: Option<u32>, vendor: u16, product: u16, mixed: bool },
     /// `hidrawN` is gone (or became something else): stop its driver jail.
     StopIdentity { hidraw: u32 },
     /// Nothing to do but say why.
@@ -43,7 +44,7 @@ impl Owners {
                 Some(HidKind::Identity) => vec![Op::StopIdentity { hidraw }],
                 _ => Vec::new(),
             },
-            Some(Decision::Attach { hidraw, kind, vendor, product, mixed, .. }) => {
+            Some(Decision::Attach { hidraw, kind, vendor, product, mixed, u2f, .. }) => {
                 let mut out = Vec::new();
                 match self.owned.get(&hidraw) {
                     Some(k) if *k == kind => {
@@ -65,7 +66,7 @@ impl Owners {
                                 "hidraw{hidraw} ({vendor:04x}:{product:04x}) has FIDO and input collections: Sigillum's; its input part will not work"
                             )));
                         }
-                        out.push(Op::StartIdentity { hidraw, vendor, product, mixed });
+                        out.push(Op::StartIdentity { hidraw, u2f, vendor, product, mixed });
                     }
                     HidKind::Unknown => out.push(Op::Log(format!("hidraw{hidraw}: no collections reported; shown to nobody"))),
                 }
@@ -96,8 +97,8 @@ pub fn devinfo_lines(text: &str) -> Vec<String> {
     struct Dev<'a> {
         indent: usize,
         name: &'a str,
-        pnp: &'a str,
-        loc: &'a str,
+        pnp: String,
+        loc: String,
     }
     let devs: Vec<Dev> = text
         .lines()
@@ -107,15 +108,20 @@ pub fn devinfo_lines(text: &str) -> Vec<String> {
                 return None;
             }
             let indent = l.len() - t.len();
-            let (head, loc) = match t.find(" at ") {
-                Some(i) => (&t[..i], t[i + 4..].trim()),
-                None => (t, ""),
+            // `name [<description>] [pnpinfo ...] [at ...]`. The description
+            // is the driver's free text (FreeBSD 16 prints it), so it is
+            // skipped before looking for the keywords.
+            let (name, mut rest) = t.split_once(' ').unwrap_or((t, ""));
+            if rest.starts_with('<') {
+                rest = rest.find('>').map_or("", |e| &rest[e + 1..]);
+            }
+            let rest = format!(" {}", rest.trim());
+            let (head, loc) = match rest.find(" at ") {
+                Some(i) => (&rest[..i], rest[i + 4..].trim()),
+                None => (&rest[..], ""),
             };
-            let (name, pnp) = match head.find(" pnpinfo ") {
-                Some(i) => (&head[..i], head[i + 9..].trim()),
-                None => (head.trim(), ""),
-            };
-            Some(Dev { indent, name, pnp, loc })
+            let pnp = head.find(" pnpinfo ").map_or("", |i| head[i + 9..].trim());
+            Some(Dev { indent, name, pnp: pnp.to_string(), loc: loc.to_string() })
         })
         .collect();
     let mut out = Vec::new();
@@ -181,7 +187,7 @@ nexus0
             ops,
             vec![
                 Op::ShowInput { hidraw: 0 },
-                Op::StartIdentity { hidraw: 1, vendor: 0x1050, product: 0x0407, mixed: false },
+                Op::StartIdentity { hidraw: 1, u2f: None, vendor: 0x1050, product: 0x0407, mixed: false },
                 Op::Log("hidraw2: no collections reported; shown to nobody".into()),
             ]
         );
@@ -195,6 +201,31 @@ nexus0
         o.line("+hkbd1 at index=0 page=0x0001 usage=0x0006 on hidbus1");
         assert_eq!(o.line("+hidraw1 at index=255 on hidbus1"), vec![Op::ShowInput { hidraw: 1 }]);
         assert_eq!(o.input_nodes().collect::<Vec<_>>(), vec![0, 1]);
+    }
+
+    /// What FreeBSD 16 prints, from the amd64 VM with QEMU's keyboard and
+    /// u2f-emulated key: descriptions in angle brackets, and the FIDO
+    /// collection claimed by uhid.
+    #[test]
+    fn devinfo_with_descriptions() {
+        let text = "\
+              usbhid0 <QEMU QEMU USB Keyboard, class 0/0, rev 2.00/0.00, addr 1>
+                hidbus0 <HID bus>
+                  hkbd0 <QEMU QEMU USB Keyboard> pnpinfo page=0x0001 usage=0x0006 bus=0x03 vendor=0x0627 product=0x0001 version=0x0000 at index=0
+                  hidraw0 <QEMU QEMU USB Keyboard Raw HID Device> pnpinfo page=0x0000 usage=0x0000 bus=0x03 vendor=0x0627 product=0x0001 version=0x0000 at index=255
+              usbhid1 <QEMU U2F USB key, class 0/0, rev 2.00/0.00, addr 2>
+                hidbus1 <HID bus>
+                  uhid0 <QEMU U2F USB key Authenticator> pnpinfo page=0xf1d0 usage=0x0001 bus=0x03 vendor=0x46f4 product=0x0005 version=0x0000 at index=0
+                  hidraw1 <QEMU U2F USB key Raw HID Device> pnpinfo page=0x0000 usage=0x0000 bus=0x03 vendor=0x46f4 product=0x0005 version=0x0000 at index=255
+";
+        let l = devinfo_lines(text);
+        assert_eq!(l[0], "+hkbd0 at index=0 page=0x0001 usage=0x0006 bus=0x03 vendor=0x0627 product=0x0001 version=0x0000 on hidbus0");
+        assert!(l[2].starts_with("+uhid0 at index=0 page=0xf1d0"), "{l:?}");
+        let mut o = Owners::default();
+        assert_eq!(
+            o.devinfo(text),
+            vec![Op::ShowInput { hidraw: 0 }, Op::StartIdentity { hidraw: 1, u2f: Some(0), vendor: 0x46f4, product: 0x0005, mixed: false }]
+        );
     }
 
     #[test]

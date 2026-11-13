@@ -1392,7 +1392,7 @@ mod tests {
             uid: 65029,
             leases: vec![],
             name_prefix: true,
-            grant_nodes: vec!["hidraw#".into()],
+            grant_nodes: vec!["hidraw#".into(), "u2f/#".into()],
         });
         let bin = "/usr/local/bin/atrium-sigillum-fido";
         let req = |name: &str, node: Option<&str>| {
@@ -1403,10 +1403,11 @@ mod tests {
         };
         validate_devfs_pin(&req("atrium-sigillum-fido-3", Some("hidraw3")), &p).unwrap();
         validate_devfs_pin(&req("atrium-sigillum-fido-3", None), &p).unwrap();
+        validate_devfs_pin(&req("atrium-sigillum-fido-3", Some("u2f/0")), &p).unwrap();
         let refused = |r: CreateJailRequest| validate_devfs_pin(&r, &p).is_err();
         assert!(refused(req("atrium-sigillum-fido-", Some("hidraw3"))), "bare prefix");
         assert!(refused(req("atrium-sigillum-x", Some("hidraw3"))), "other name");
-        for bad in ["hidraw", "hidraw3a", "ugen0.2", "hidraw/../mem", "hidraw*", "hidraw99999", "kmem"] {
+        for bad in ["hidraw", "hidraw3a", "ugen0.2", "hidraw/../mem", "hidraw*", "hidraw99999", "kmem", "u2f", "u2f/", "u2f/x", "u2f/0/1", "u2f0"] {
             assert!(refused(req("atrium-sigillum-fido-3", Some(bad))), "{bad}");
         }
         // A grant on an unpinned ruleset, or on a pin with no grant_nodes.
@@ -1426,7 +1427,7 @@ mod tests {
         assert_eq!(pin.jail_name, "atrium-sigillum-fido-");
         assert_eq!(pin.exec_path, "/usr/local/bin/atrium-sigillum-fido");
         assert_eq!(pin.uid, 65029);
-        assert!(pin.allows_grant("hidraw0") && !pin.allows_grant("ugen0.1"));
+        assert!(pin.allows_grant("hidraw0") && pin.allows_grant("u2f/0") && !pin.allows_grant("ugen0.1"));
         assert!(p.devfs_rulesets.allowed_ids.contains(&27));
     }
 

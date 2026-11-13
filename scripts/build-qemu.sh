@@ -10,6 +10,14 @@
 #
 #   sh scripts/build-qemu.sh                      # aarch64 only (~10 min, ~600 MB)
 #   TARGETS=aarch64-softmmu,x86_64-softmmu sh scripts/build-qemu.sh
+#
+# The emulated security key (-device u2f-emulated, for the Sigillum gate,
+# scripts/vm-sigillum-check.sh) needs libu2f-emu at configure time; build it
+# into a prefix and point pkg-config there:
+#   PKG_CONFIG_PATH=$HOME/u2f-prefix/lib/pkgconfig \
+#   LDFLAGS="-Wl,-rpath,$HOME/u2f-prefix/lib" TARGETS=x86_64-softmmu sh scripts/build-qemu.sh
+# (libu2f-emu: cmake with -DCMAKE_C_FLAGS=-Wno-error=deprecated-declarations
+# for OpenSSL 3.)
 set -eu
 SRC="${QEMU_SRC:-$HOME/qemu-atrium}"
 TARGETS="${TARGETS:-aarch64-softmmu}"
@@ -22,6 +30,14 @@ done
 [ -z "$pkgs" ] || apt-get install -y $pkgs
 
 [ -d "$SRC/.git" ] || git clone --depth 1 https://github.com/atrium-os/qemu "$SRC"
+# Fixes carried here until they are in the fork (scripts/qemu-patches/):
+# each is applied once; one already in the tree is skipped.
+for p in "$(cd "$(dirname "$0")" && pwd)"/qemu-patches/*.patch; do
+    [ -e "$p" ] || continue
+    if git -C "$SRC" apply --check "$p" 2>/dev/null; then
+        git -C "$SRC" apply "$p" && echo "applied $(basename "$p")"
+    fi
+done
 mkdir -p "$SRC/build"
 cd "$SRC/build"
 # user networking (slirp) is required: cloud-vm.sh uses -netdev user.

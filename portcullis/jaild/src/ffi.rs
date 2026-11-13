@@ -756,12 +756,18 @@ pub fn devfs_ruleset_has_rules(id: u32) -> io::Result<bool> {
 /// to any ruleset. `node` was validated against a pin's `grant_nodes`
 /// (letters then digits), so it is never a pattern.
 pub fn devfs_grant(mount: &str, node: &str, uid: u32) -> io::Result<()> {
-    if node.is_empty() || !node.bytes().all(|b| b.is_ascii_alphanumeric()) {
+    // `name` or `dir/name` (u2f(4) keys are /dev/u2f/N), plain names only.
+    let parts: Vec<&str> = node.split('/').collect();
+    if parts.len() > 2 || parts.iter().any(|p| p.is_empty() || !p.bytes().all(|b| b.is_ascii_alphanumeric())) {
         return Err(io::Error::from(io::ErrorKind::InvalidInput));
     }
     let uid = uid.to_string();
-    for action in [&["unhide"][..], &["user", uid.as_str()][..], &["mode", "0600"][..]] {
-        let mut args: Vec<&str> = vec!["-m", mount, "rule", "apply", "path", node];
+    // A node in a directory needs the directory itself shown (not what
+    // else is in it: the rule names the directory entry only).
+    let dir: Vec<(&str, &[&str])> = if parts.len() == 2 { vec![(parts[0], &["unhide"][..])] } else { vec![] };
+    let node_actions: [(&str, &[&str]); 3] = [(node, &["unhide"][..]), (node, &["user", uid.as_str()][..]), (node, &["mode", "0600"][..])];
+    for (path, action) in dir.into_iter().chain(node_actions) {
+        let mut args: Vec<&str> = vec!["-m", mount, "rule", "apply", "path", path];
         args.extend_from_slice(action);
         let out = std::process::Command::new("devfs").args(&args).output()?;
         if !out.status.success() {

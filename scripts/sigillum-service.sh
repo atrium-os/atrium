@@ -21,7 +21,12 @@ user _sigillum     65028 "Sigillum broker"
 user _sigillum-dev 65029 "Sigillum device drivers"
 user _sigillum-ui  65030 "Sigillum trusted UI"
 kldload -n hidraw
-sysrc -n kld_list 2>/dev/null | grep -qw hidraw || sysrc kld_list+=hidraw >/dev/null
+# Load nullfs at boot, not on first mount: portcullisd's agent starts the
+# driver jails at boot while the bootstrap starts services, and two first
+# nullfs mounts at once paniced 16-CURRENT (getnewvnode: not registered
+# vector op, in null_nodeget) in the amd64 VM gate.
+kldload -n nullfs
+for m in hidraw nullfs; do sysrc -n kld_list 2>/dev/null | grep -qw $m || sysrc kld_list+=$m >/dev/null; done
 
 install -d -m 0755 /atrium/sockets
 # Clients: anyone may reach it; sigillumd labels each by peer uid.

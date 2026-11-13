@@ -147,10 +147,6 @@ fn main() -> ExitCode {
 
     let shared = Arc::new(Mutex::new(Tenants { cache: HashMap::new(), session_procdescs: HashMap::new() }));
 
-    /* Who gets each hidraw node: tactusd (input) or a Sigillum driver jail
-     * of its own (security keys); nobody, if unclassified (sigillum.md §5.1). */
-    portcullisd::identity_devices::spawn(JAILD_SOCK);
-
     for conn in listener.incoming() {
         match conn {
             Ok(stream) => {

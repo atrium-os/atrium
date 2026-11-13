@@ -203,14 +203,15 @@ uid       = 65018
 
 # Security keys belong to Sigillum's FIDO driver (sigillum.md §4, §5.1): one
 # jail per key, named atrium-sigillum-fido-<hidraw unit>, each running the
-# driver as _sigillum-dev and shown exactly one hidraw node (devfs_grant).
+# driver as _sigillum-dev and shown exactly one node (devfs_grant): the key's
+# /dev/u2f/N when u2f(4) drives it (FreeBSD 15+), else its hidraw node.
 [[devfs_rulesets.pinned]]
 id          = 27
 jail_name   = "atrium-sigillum-fido-"
 name_prefix = true
 exec_path   = "/usr/local/bin/atrium-sigillum-fido"
 uid         = 65029
-grant_nodes = ["hidraw#"]
+grant_nodes = ["hidraw#", "u2f/#"]   # u2f/N: keys u2f(4) drives (FreeBSD 15+)
 
 
 # ---------------------------------------------------------------
@@ -271,6 +272,13 @@ allowed_keys = [
     # arcad and arca-courierd: the web broker's app id and publisher, the
     # one app that issues web tickets (arca.md §8.2).
     "ARCA_WEB_BROKER",
+    # sigillumd: the system uids that may ask VerifyUser (Arca, ostiarius)
+    # and the web broker's app id and publisher, the one app that may run
+    # WebAuthn for any RP ID (sigillum.md §7.1). Socket paths and the
+    # driver/UI uids are compiled in and deliberately not settable here.
+    "SIGILLUM_ARCA_UID",
+    "SIGILLUM_OSTIARIUS_UID",
+    "SIGILLUM_WEB_BROKER",
     # arcad: the system services the machine store serves, `name=uid,...`
     # (arca.md §6.4; vinculumd's Bluetooth bonds).
     "ARCA_SERVICES",
@@ -601,6 +609,7 @@ include = ["base"]
 ioctls = [
     "0x40085520",   # HIDIOCGRAWINFO
     "0x40805521",   # HIDIOCGRAWNAME(128)
+    "0x41705570",   # USB_GET_DEVICEINFO (u2f(4): vendor, product, name)
 ]
 
 # Ordinary apps.

@@ -58,6 +58,7 @@ Read 2026-11-13 in `freebsd-src` main and in this repo.
 | `hidraw_open` | **exclusive**: a second open gets `EBUSY` | whoever opens a key first owns it. Today that is tactusd (next row) |
 | devfs ruleset 26 `atrium_input` | unhides `hidraw*` for tactusd, all of them | **today tactusd can open every FIDO key.** tactusd parses untrusted HID; if it is compromised it can send CTAP commands, including `authenticatorReset` within 10 s of a replug. §5.1 fixes this |
 | `hidbus_child_pnpinfo` | each top-level collection's devd event carries `page=0x.... usage=0x.... vendor product` | the kernel already parsed the report descriptor; userspace can classify a device as FIDO (usage page `0xF1D0`) **without parsing any device bytes as root**. A FIDO collection has no kernel driver, so devd reports it as `nomatch` on `hidbusN` |
+| `u2f(4)` (FreeBSD 15+, loaded by default in 16-CURRENT) | attaches to a FIDO collection as `/dev/u2f/N` (named `uhidN` in devd and devinfo, for old software), and sets the bus's `HQ_NO_READAHEAD`: the interrupt pipe is restarted only by a read or poll of `/dev/u2f/N` (`sys/dev/hid/u2f.c`, `usbhid.c`, read 2026-11-13) | the same key's `hidrawN` then sees one report per request and misses the rest of every multi-report answer (found in the S2e VM gate). A key `u2f(4)` drives is driven through `/dev/u2f/N`, as libfido2 does; `hidrawN` only when no `u2f` driver attached |
 | CCID | no kernel driver; `ugen(4)` per USB device. Ports have `pcsc-lite` + `ccid` (C, one daemon for every reader) | we write our own CCID transport in Rust, one jail per reader (§6.2) |
 | fingerprint | FreeBSD has nothing (no `libfprint` port that works with current sensors, no kernel driver) | §6.3; needs hardware before it is real |
 | `libfido2` | in base as a private library for OpenSSH `sk-*` keys (`lib/libfido2`) | not used: C, and it parses device responses in the calling process. Its tests and known quirks are a reference |
@@ -147,8 +148,9 @@ a list of devices or a raw APDU channel.
 - **Who starts what.** `sigillumd` and `sigillum-ui` are services.d manifests started before
   the login screen (the lock screen and Vestibulum need them). Drivers are started per
   device by portcullisd's identity-device agent on the kernel's classification (§5.1),
-  through jaild: jail `atrium-sigillum-fido-N` on ruleset 27, shown only `hidrawN`
-  (jaild's `devfs_grant`, owned `_sigillum-dev`, 0600), with `/atrium/sockets/sigillum-dev`
+  through jaild: jail `atrium-sigillum-fido-N` on ruleset 27, shown only that key's node,
+  `u2f/M` when `u2f(4)` drives it and `hidrawN` otherwise (§2; jaild's `devfs_grant`,
+  owned `_sigillum-dev`, 0600), with `/atrium/sockets/sigillum-dev`
   read-only as its one socket path. The driver connects to `sigillumd`'s driver socket
   (peer uid `_sigillum-dev` checked), then enters Capsicum. (Amended in S2: the first
   draft had portcullisd pass a socketpair, which jaild's exec path cannot carry.) A driver
@@ -598,7 +600,7 @@ otherwise passes the blobs on without reading them.
   keys, real-key traces. Everything so far has been tested only against our own soft key,
   so a spec misreading shared by both sides would not show; a real key in S2 is the check.
 
-### 16.2 As built: S2, so far (2026-11-13)
+### 16.2 As built: S2 (2026-11-13)
 
 - **S2a, HID classification** (`atrium-devevents/src/hidclass.rs`, commit `5fc598e`):
   parses devd's hidbus and hidraw lines and decides, per hidbus, whether its hidraw node is
@@ -662,8 +664,45 @@ otherwise passes the blobs on without reading them.
     tests (a per-device pin grants one matching node; the shipped policy pins 27) and the
     portcullisd test type-check for FreeBSD but run only there (`sockmux` needs kqueue), so
     they run in the VM gate.
-- **Not yet:** S2e (the VM gate), S2f (`sigillum-ui` and frescod's `IDENTITY` purpose),
-  Capsicum in `sigillumd` itself (it reads the launch registry per connection; a
+- **S2f, the trusted sheets** (`daab114`): frescod's activation purpose `IDENTITY` (8):
+  a button press or Enter in a sheet window that was whole, uncovered and still for 500 ms,
+  the same check as `FILL`; sheet windows are top-level windows of `FRESCOD_SHEET_UIDS`
+  (default `_sigillum-ui`). `sigillum-ui` (own crate): one dialog window per sheet; a choice
+  is spent with frescod before `sigillumd` hears of it; PIN and passcode bytes go into
+  locked memory and are drawn as rects, never glyphs; Cancel and Escape need no token.
+- **S2e, the VM gate** (`scripts/vm-sigillum-check.sh`, 2026-11-13: **0 failed**). amd64
+  16-CURRENT VM, QEMU's `u2f-emulated` key (the atrium-os/qemu fork built against
+  libu2f-emu; `scripts/build-qemu.sh`) and a USB keyboard; sigillumd and tactusd started
+  jailed by portcullisd-bootstrap, the driver jail by portcullisd's agent. Checked: the key
+  gets `atrium-sigillum-fido-1`, driven through `/dev/u2f/0`, whose `/dev` holds that node
+  only (plus null, zero, random, urandom), owned `_sigillum-dev` 0600, driver running as
+  `_sigillum-dev`, `ip4=disable`; tactusd's `/dev` has the keyboard's `hidraw0` and not the
+  key; a client the launch registry names as the web broker registers for `example.com`
+  (RP ID hash checked) and signs in (ES256 signature over authData and the client data
+  hash verified), with the sheets shown to a scripted UI running as `_sigillum-ui`; a UI
+  under another uid and an unregistered uid are refused; a second key hot-plugged through
+  the QEMU monitor gets its own jail from the devd path and unplugging removes only that
+  one. jaild (84), portcullisd (39) and frescod activation/credential (9) unit tests pass
+  in the VM. What the gate found and fixed:
+  - the agent ran in the multi-tenant `portcullisd`, which rc.d does not start; it now
+    runs in `atrium-portcullisd-daemon`, the root service that is jaild's one client;
+  - FreeBSD 16's `devinfo -v` prints `name <description> pnpinfo ...`: the parser skipped
+    nothing and found no device at start;
+  - `u2f(4)` (§2): drivers use `/dev/u2f/N` (bare 64-byte reports, name from
+    `USB_GET_DEVICEINFO`, added to the `device` sysfil profile; `devfs_grant` takes
+    `dir/name` and shows the directory entry too; the pin allows `u2f/#`);
+  - the client's idle limit is 5 s, not 1 s (a U2F-only key sends no keepalives), and it
+    drains reports left in the node before `INIT`;
+  - jaild's env allow-list lacked `SIGILLUM_ARCA_UID`, `SIGILLUM_OSTIARIUS_UID`,
+    `SIGILLUM_WEB_BROKER`;
+  - a restarted agent first unmounts what a dead driver jail left;
+  - two first nullfs mounts at once paniced the 16-CURRENT kernel (`getnewvnode: not
+    registered vector op` in `null_nodeget`); `sigillum-service.sh` loads nullfs at boot;
+  - QEMU's `u2f-emulated` lost wakeups and so the second packet of a request
+    (`scripts/qemu-patches/u2f-emulated-lost-wakeup.patch`, applied by build-qemu.sh).
+  Only an emulated U2F key so far: CTAP2 (PIN, UV, resident keys) on real hardware waits
+  for a YubiKey on the Mac VM.
+- **Not yet:** Capsicum in `sigillumd` itself (it reads the launch registry per connection; a
   pre-opened directory fd comes later), `allow.mlock` for `sigillumd`.
 
 ## 17. Decisions, with recommendations
