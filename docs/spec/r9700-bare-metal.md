@@ -1030,3 +1030,20 @@ work (self-test, scrub).
   Logs: branch claude/project-thread-33aauq, commit 16d37a66.
   Open: the unrouted 0x18000000 EOP (one per IH instance); hostile-PM4 policy;
   reset-path leaks; crash dumps need a dump device on Atrium's disk.
+- **2026-11-13 08:00, security gate step 1: the hostile-PM4 test is ready (98ba0daa).**
+  si-client-test 14 (silicon only) aims client packets at registers only the kernel
+  may touch. It takes them from `dev.atrium_gpu_amd_pci.0.si_protected_regs`, which
+  the kernel builds from its per-IP tables:
+  - VM context 0's page-table base on the GC hub and on the MMHUB;
+  - IH ring 0's base;
+  - CP_MES_CNTL;
+  - the SMU argument mailbox, read only (a write could race a live SMU message).
+  Writes (WRITE_DATA and COPY_DATA immediate) use the value already in the register,
+  so a write that lands changes nothing. Contexts 8-15 are left out because MES can
+  point one at a new VM between the read and the write. Each packet runs on a fresh VM
+  and passes only if it is refused: its work fails, the marker after it never lands
+  and the register is unchanged. A read passes if it is refused or does not return
+  the real value. A bystander VM must run clean after each. New counter:
+  `isolation.cp_errors`. Risk on the box: if a refused packet leaves a stuck HQD, each
+  refusal costs a whole-GPU re-init. The test stops after 2 (the cap is 3 per 10 min),
+  and its last check reports whether any were needed.
