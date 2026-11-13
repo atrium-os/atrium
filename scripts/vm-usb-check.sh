@@ -83,6 +83,7 @@ devfs rule -s 29 add include 1 && devfs rule -s 29 add include 2
 [ -f $P.usbtest-bak ] || cp $P $P.usbtest-bak
 cp $P.usbtest-bak $P
 sed -i '' 's/^allowed_ids = \[\(.*\)\]/allowed_ids = [\1, 29]/' $P
+sed -i '' 's/^allowed_system_uids = \[/allowed_system_uids = [ 65060,/' $P
 cat >> $P <<'EOP'
 
 # vm-usb-check.sh only (removed at the end).
@@ -95,6 +96,7 @@ uid         = 65060
 grant_nodes = ["ugen#.#", "usb/#.#.0"]
 EOP
 grep -q '^allowed_ids = .*29\]' $P && echo "  ok policy allows ruleset 29" || echo "  FAIL could not add 29 to allowed_ids"
+grep -q '^allowed_system_uids = \[ 65060,' $P && echo "  ok policy allows uid 65060" || echo "  FAIL could not add 65060 to allowed_system_uids"
 cat > /usr/local/etc/atrium/devices.d/90-usbtest.toml <<'EOR'
 [[rule]]
 name          = "usbtest-serial"
@@ -149,7 +151,7 @@ EOF
 check() {
   rule=$1 pfx=$2
   line=$(V "grep 'rule=$rule ' /var/run/atrium/dispensator.state")
-  [ -n "$line" ] || { bad "$rule: no device assigned (state: $(V 'cat /var/run/atrium/dispensator.state | tr "\n" ";"'); log: $(V 'tail -5 /var/log/atrium/dispensatord.log | tr "\n" ";"'))"; return 1; }
+  [ -n "$line" ] || { V 'echo "  usbconfig:"; usbconfig list | sed "s/^/    /"; echo "  devinfo:"; devinfo -v | grep -E "ugen=" | sed "s/^/    /"; echo "  devd (last USB lines in messages):"; grep -E "USB|uftdi|ugen" /var/log/messages | tail -6 | sed "s/^/    /"; echo "  the planner on devinfo -v now:"; devinfo -v > /tmp/usbgate.di; : > /tmp/usbgate.empty; /usr/local/bin/atrium-dispensatord --plan /tmp/usbgate.empty --devinfo /tmp/usbgate.di | grep -iE "ugen|usbtest|detach" | sed "s/^/    /"'; bad "$rule: no device assigned (state: $(V 'cat /var/run/atrium/dispensator.state | tr "\n" ";"'); log: $(V 'tail -5 /var/log/atrium/dispensatord.log | tr "\n" ";"'))"; return 1; }
   key=${line%% *}; ugen=${key%:*}; i=${key#*:}; ba=${ugen#ugen}; b=${ba%.*}; a=${ba#*.}
   inst="$b-$a-$i"; J=atrium-usbprobe-$pfx-$inst; R=/var/lib/atrium/jails/usbprobe-$pfx-$inst/dev
   ok "$rule: $key assigned ($line)"
@@ -173,7 +175,7 @@ gone() {
 }
 
 echo "== usb-serial (uftdi claims it; detach_kernel)"
-mon "chardev-add null,id=usbgate-nul" "device_add usb-serial,chardev=usbgate-nul,id=usbgate-ser" | grep -iE "error|not" | sed 's/^/  qemu: /'
+mon "chardev-add null,id=usbgate-nul" "device_add usb-serial,chardev=usbgate-nul,id=usbgate-ser" | tr -d '\r' | grep -vE '^\(qemu\)|^QEMU|^$|chardev-add|device_add' | sed 's/^/  qemu: /'
 sleep 6
 if check usbtest-serial s; then
   V "grep -q 'kernel driver detached' /var/log/atrium/dispensatord.log" && ok "uftdi was detached first" || echo "  (no kernel driver had it: the nomatch path ran instead; is uftdi.ko there?)"
