@@ -36,10 +36,11 @@ use sha2::{Digest, Sha256};
 use sigillum_proto::client::{
     AuthenticatorClass, CeremonyId, Method, Purpose, Refusal, Reply, Request, Strength, Uv, VerifyUser,
 };
-use sigillum_proto::client::{Assert, CertPurpose, ChooseCertificate, Register, SignWithCertificate, MAX_SCHEMES};
+use sigillum_proto::client::{Assert, CertPurpose, ChooseCertificate, EnrolKey, Register, SignWithCertificate, MAX_LOGIN_KEYS, MAX_SCHEMES, VERIFY_RP};
 use sigillum_proto::driver::{cap, DeviceClass, DriverError, FidoCaps, FromDriver, Pin, SignScheme, ToDriver, TokenCert};
 
 use crate::cert;
+use crate::keys::{valid_user, LoginKey};
 
 use crate::label::Label;
 use crate::rp::valid_domain;
@@ -104,6 +105,13 @@ pub enum Action {
     PlatformCreate { key: Key, user: String, rp_id: String, user_handle: Vec<u8>, name: String, display_name: String, uv: bool },
     /// `P_ASSERT`; answer with [`Broker::platform_result`].
     PlatformAssert { key: Key, user: String, rp_id: String, id: [u8; 16], uv: bool, client_data_hash: [u8; 32] },
+    /// The user's enrolled security keys (§12); answer with
+    /// [`Broker::login_keys`].
+    ListLoginKeys { key: Key, user: String },
+    /// Store a newly enrolled key; answer with [`Broker::saved`].
+    SaveLoginKey { key: Key, user: String, login: LoginKey },
+    /// A verification used this key: its sign count is now `count`.
+    SetSignCount { user: String, cred_id: Vec<u8>, count: u32 },
     /// One audit line (arca.md §10 style): no values, ever.
     Audit(String),
 }
@@ -115,6 +123,7 @@ enum Kind {
     Verify(VerifyUser),
     Choose(ChooseCertificate),
     Sign(SignWithCertificate),
+    Enrol(EnrolKey),
 }
 
 impl Kind {
@@ -198,6 +207,21 @@ struct Ceremony {
     listing: Vec<DeviceId>,
     certs: Vec<Found>,
     chosen: Option<usize>,
+    /// Verify and enrol (§12): the user's enrolled keys once listed, and the
+    /// fresh challenge the key signs.
+    login_keys: Option<Vec<LoginKey>>,
+    challenge: [u8; 32],
+}
+
+fn fresh_challenge() -> [u8; 32] {
+    let mut b = [0u8; 32];
+    getrandom::getrandom(&mut b).expect("the system's random source");
+    b
+}
+
+/// The user handle an enrolled key gets: the same for every key of a user.
+fn login_user_handle(user: &str) -> Vec<u8> {
+    Sha256::digest(format!("atrium-login:{user}").as_bytes()).to_vec()
 }
 
 #[derive(Debug, Clone)]
@@ -268,7 +292,7 @@ impl Broker {
         let uv_preferred = match &kind {
             Kind::Register(r) => r.uv == Uv::Preferred,
             Kind::Assert(a) => a.uv == Uv::Preferred,
-            Kind::Verify(_) | Kind::Choose(_) | Kind::Sign(_) => false,
+            Kind::Verify(_) | Kind::Choose(_) | Kind::Sign(_) | Kind::Enrol(_) => false,
         };
         let c = Ceremony {
             conn,
@@ -288,10 +312,21 @@ impl Broker {
             listing: Vec::new(),
             certs: Vec::new(),
             chosen: None,
+            login_keys: None,
+            challenge: fresh_challenge(),
         };
         let sheet = sheet_for(&c);
         self.ceremonies.insert(key, c);
         let audit = Action::Audit(format!("start key={key} conn={conn} {:?}", sheet));
+        let local = match &self.ceremonies[&key].kind {
+            Kind::Verify(v) => Some(v.user.clone()),
+            Kind::Enrol(e) => Some(e.user.clone()),
+            _ => None,
+        };
+        if let Some(user) = local {
+            self.ceremonies.get_mut(&key).unwrap().state = State::Listing;
+            return vec![audit, Action::ListLoginKeys { key, user }];
+        }
         if self.ceremonies[&key].kind.token() {
             let tokens: Vec<DeviceId> = self.devices.iter().filter(|(_, d)| d.class == DeviceClass::Ccid).map(|(id, _)| *id).collect();
             let c = self.ceremonies.get_mut(&key).unwrap();
@@ -458,7 +493,17 @@ impl Broker {
                     return vec![refused(conn, id, Refusal::Malformed)];
                 }
                 let limit = self.cfg.ceremony_ms;
-                self.start(conn, id, Kind::Verify(v), "", false, now, limit, who, None)
+                self.start(conn, id, Kind::Verify(v), VERIFY_RP, true, now, limit, who, None)
+            }
+            Request::EnrolKey(e) => {
+                if *label != Label::Ostiarius {
+                    return vec![refused(conn, id, Refusal::Denied)];
+                }
+                if !valid_user(&e.user) || e.name.is_empty() || e.name.len() > 64 {
+                    return vec![refused(conn, id, Refusal::Malformed)];
+                }
+                let limit = self.cfg.ceremony_ms;
+                self.start(conn, id, Kind::Enrol(e), VERIFY_RP, true, now, limit, who, None)
             }
             Request::ChooseCertificate(r) => {
                 if let Err(e) = may_use_token(label, &self.cfg, &r.purpose) {
@@ -484,6 +529,82 @@ impl Broker {
                 self.start(conn, id, Kind::Sign(r), "", false, now, limit, who, None)
             }
             Request::Cancel { .. } => unreachable!(),
+        }
+    }
+
+    /// The daemon's answer to `ListLoginKeys`.
+    pub fn login_keys(&mut self, key: Key, mut list: Vec<LoginKey>) -> Vec<Action> {
+        let Some(c) = self.ceremonies.get_mut(&key) else { return Vec::new() };
+        if c.state != State::Listing || !matches!(c.kind, Kind::Verify(_) | Kind::Enrol(_)) {
+            return Vec::new();
+        }
+        list.truncate(MAX_LOGIN_KEYS);
+        if matches!(c.kind, Kind::Enrol(_)) && list.len() >= MAX_LOGIN_KEYS {
+            let id = c.id;
+            return self.end(key, Reply::Refused { ceremony: id, reason: Refusal::NotAllowed }, "enrol: the user has the most keys");
+        }
+        c.login_keys = Some(list);
+        c.state = State::AwaitingPress;
+        vec![Action::Sheet { key, sheet: sheet_for(c) }]
+    }
+
+    /// The daemon stored (or failed to store) an enrolled key.
+    pub fn saved(&mut self, key: Key, ok: bool) -> Vec<Action> {
+        let Some(c) = self.ceremonies.get(&key) else { return Vec::new() };
+        if c.state != State::Platform || !matches!(c.kind, Kind::Enrol(_)) {
+            return Vec::new();
+        }
+        let id = c.id;
+        if ok {
+            self.end(key, Reply::KeyEnrolled { ceremony: id }, "key enrolled")
+        } else {
+            self.end(key, Reply::Refused { ceremony: id, reason: Refusal::NotAllowed }, "enrol: could not store the key")
+        }
+    }
+
+    /// A key's answer in a verify or enrol ceremony, after [`check`].
+    fn local_result(&mut self, key: Key, device: DeviceId, rec: FromDriver) -> Vec<Action> {
+        let c = self.ceremonies.get(&key).expect("live");
+        let id = c.id;
+        let refuse = |b: &mut Broker, why: &str| {
+            let mut a = b.end(key, Reply::Refused { ceremony: id, reason: Refusal::NotAllowed }, &format!("record refused: {why}"));
+            a.push(Action::Audit(format!("device {device} sent a record that failed checks: {why}")));
+            a
+        };
+        if let Err(why) = check(c, &rec) {
+            return refuse(self, why);
+        }
+        match (rec, &c.kind) {
+            (FromDriver::Registered { cred_id, public_key, sign_count, .. }, Kind::Enrol(e)) => {
+                let login = LoginKey { cred_id, public_key, sign_count, name: e.name.clone() };
+                let user = e.user.clone();
+                self.ceremonies.get_mut(&key).unwrap().state = State::Platform;
+                vec![Action::SaveLoginKey { key, user, login }]
+            }
+            (FromDriver::Asserted { cred_id, auth_data, signature, sign_count, .. }, Kind::Verify(v)) => {
+                let Some(k) = c.login_keys.iter().flatten().find(|k| k.cred_id == cred_id) else { return refuse(self, "not an enrolled key") };
+                let mut msg = auth_data.clone();
+                msg.extend_from_slice(&c.challenge);
+                let good = p256::ecdsa::VerifyingKey::from_sec1_bytes(&k.public_key)
+                    .ok()
+                    .zip(p256::ecdsa::DerSignature::from_bytes(&signature).ok())
+                    .is_some_and(|(vk, s)| p256::ecdsa::signature::Verifier::verify(&vk, &msg, &s).is_ok());
+                if !good {
+                    return refuse(self, "signature does not verify against the enrolled key");
+                }
+                // A counter that doesn't move forward means a cloned key or a replay.
+                if (k.sign_count != 0 || sign_count != 0) && sign_count <= k.sign_count {
+                    return refuse(self, "sign count did not increase");
+                }
+                if v.min_strength > Strength::KeyUv {
+                    return refuse(self, "a security key is not strong enough here");
+                }
+                let set = Action::SetSignCount { user: v.user.clone(), cred_id, count: sign_count };
+                let mut a = self.end(key, Reply::Verified { ceremony: id, method: Method::SecurityKey, strength: Strength::KeyUv }, "verified by security key");
+                a.insert(0, set);
+                a
+            }
+            _ => refuse(self, "record does not match the ceremony"),
         }
     }
 
@@ -573,7 +694,28 @@ impl Broker {
                 let f = &c.certs[c.chosen?];
                 ToDriver::SignDigest { ceremony: key, key_id: f.key_id.clone(), scheme: r.scheme, digest: r.digest.clone(), pin }
             }
-            Kind::Verify(_) | Kind::Choose(_) => return None,
+            Kind::Verify(_) => ToDriver::Assert {
+                ceremony: key,
+                rp_id: VERIFY_RP.into(),
+                client_data_hash: c.challenge,
+                allow: c.login_keys.iter().flatten().map(|k| k.cred_id.clone()).collect(),
+                uv_required: true,
+                pin,
+            },
+            Kind::Enrol(e) => ToDriver::Register {
+                ceremony: key,
+                rp_id: VERIFY_RP.into(),
+                rp_name: "Atrium".into(),
+                client_data_hash: c.challenge,
+                user_id: login_user_handle(&e.user),
+                user_name: e.user.clone(),
+                user_display_name: e.user.clone(),
+                exclude: c.login_keys.iter().flatten().map(|k| k.cred_id.clone()).collect(),
+                resident_key: false,
+                uv_required: true,
+                pin,
+            },
+            Kind::Choose(_) => return None,
         })
     }
 
@@ -615,6 +757,21 @@ impl Broker {
             }
             (Choice::Passkey(p), Kind::Assert(_)) if c.passkeys.iter().flatten().any(|k| k.id == p) => self.pick(key, Pick::Assert(p)),
             (Choice::Certificate(i), Kind::Choose(_) | Kind::Sign(_)) => self.press_certificate(key, i),
+            (Choice::Device(d), Kind::Verify(_)) if key_offered(c) && self.devices.get(&d).is_some_and(|dev| dev.class == DeviceClass::Fido) => {
+                let msg = self.driver_msg(key, c, None).expect("verify");
+                let c = self.ceremonies.get_mut(&key).unwrap();
+                c.state = State::Driving;
+                c.device = Some(d);
+                vec![Action::ToDriver { device: d, msg }]
+            }
+            // Enrolling: the passcode first, then the key.
+            (Choice::Device(d), Kind::Enrol(e)) if self.devices.get(&d).is_some_and(|dev| dev.class == DeviceClass::Fido) => {
+                let user = e.user.clone();
+                let c = self.ceremonies.get_mut(&key).unwrap();
+                c.device = Some(d);
+                c.state = State::AwaitingPasscode;
+                vec![Action::CheckPasscode { key, user, retry: false }]
+            }
             (Choice::Passcode, Kind::Verify(v)) => {
                 let user = v.user.clone();
                 self.ceremonies.get_mut(&key).unwrap().state = State::AwaitingPasscode;
@@ -652,12 +809,19 @@ impl Broker {
             }
             let user = match &c.kind {
                 Kind::Verify(v) => v.user.clone(),
+                Kind::Enrol(e) => e.user.clone(),
                 _ => c.user.clone().unwrap_or_default(),
             };
             return vec![Action::Audit(format!("passcode wrong key={key}")), Action::CheckPasscode { key, user, retry: true }];
         }
         if c.pick.is_some() {
             return self.platform_action(key, true);
+        }
+        if let (Kind::Enrol(_), Some(device)) = (&c.kind, c.device) {
+            c.state = State::Driving;
+            let c = &self.ceremonies[&key];
+            let msg = self.driver_msg(key, c, None).expect("enrol");
+            return vec![Action::ToDriver { device, msg }];
         }
         let id = c.id;
         let Kind::Verify(v) = &c.kind else { return Vec::new() };
@@ -721,6 +885,9 @@ impl Broker {
             }
             FromDriver::Error { error, .. } => {
                 self.end(key, Reply::Refused { ceremony: id, reason: Refusal::NotAllowed }, &format!("driver: {error:?}"))
+            }
+            FromDriver::Registered { .. } | FromDriver::Asserted { .. } if matches!(c.kind, Kind::Verify(_) | Kind::Enrol(_)) => {
+                self.local_result(key, device, rec)
             }
             FromDriver::Registered { .. } | FromDriver::Asserted { .. } => match check(c, &rec) {
                 Ok(()) => {
@@ -878,7 +1045,7 @@ fn check(c: &Ceremony, rec: &FromDriver) -> Result<(), &'static str> {
         return Err("no user verification");
     }
     match (rec, &c.kind) {
-        (FromDriver::Registered { cred_id, cose_alg, public_key, att_obj, .. }, Kind::Register(_)) => {
+        (FromDriver::Registered { cred_id, cose_alg, public_key, att_obj, .. }, Kind::Register(_) | Kind::Enrol(_)) => {
             if flags & AT == 0 || auth_data.len() < 55 + cred_id.len() {
                 return Err("no attested credential data");
             }
@@ -905,8 +1072,26 @@ fn check(c: &Ceremony, rec: &FromDriver) -> Result<(), &'static str> {
             }
             Ok(())
         }
+        (FromDriver::Asserted { cred_id, signature, .. }, Kind::Verify(_)) => {
+            if flags & AT != 0 {
+                return Err("assertion carries attested credential data");
+            }
+            if !c.login_keys.iter().flatten().any(|k| k.cred_id == *cred_id) {
+                return Err("credential not enrolled for the user");
+            }
+            if signature.is_empty() {
+                return Err("empty signature");
+            }
+            Ok(())
+        }
         _ => Err("record does not match the ceremony"),
     }
+}
+
+/// A verify sheet offers the user's security key: one is enrolled and a key
+/// is strong enough for what is asked.
+fn key_offered(c: &Ceremony) -> bool {
+    matches!(&c.kind, Kind::Verify(v) if v.min_strength <= Strength::KeyUv) && c.login_keys.as_ref().is_some_and(|l| !l.is_empty())
 }
 
 /// The sheet for a ceremony as it stands.
@@ -918,7 +1103,8 @@ fn sheet_for(c: &Ceremony) -> Sheet {
             rp_id: a.rp_id.clone(),
             passkeys: c.passkeys.iter().flatten().map(|p| PasskeyView { id: p.id, name: p.name.clone(), display_name: p.display_name.clone() }).collect(),
         },
-        Kind::Verify(v) => Sheet::Verify { requester: c.requester.clone(), user: v.user.clone(), purpose: v.purpose.clone() },
+        Kind::Verify(v) => Sheet::Verify { requester: c.requester.clone(), user: v.user.clone(), purpose: v.purpose.clone(), key: key_offered(c) },
+        Kind::Enrol(e) => Sheet::EnrolKey { requester: c.requester.clone(), user: e.user.clone(), name: e.name.clone() },
         Kind::Choose(ChooseCertificate { purpose, .. }) | Kind::Sign(SignWithCertificate { purpose, .. }) => Sheet::Certificates {
             requester: c.requester.clone(),
             purpose: purpose.clone(),

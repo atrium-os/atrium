@@ -12,6 +12,7 @@ pub mod bio;
 pub mod broker;
 pub mod cert;
 pub mod daemon;
+pub mod keys;
 pub mod label;
 pub mod platform;
 pub mod resolve;

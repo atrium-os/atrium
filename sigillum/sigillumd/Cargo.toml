@@ -11,6 +11,7 @@ sigillum-proto = { path = "../sigillum-proto" }
 sha2 = { workspace = true }
 p256 = { workspace = true }
 p384 = { workspace = true }
+getrandom = { workspace = true }
 rsa = { workspace = true }
 portcullis-peer = { path = "../../portcullis/portcullis-peer" }
 libc = "0.2"

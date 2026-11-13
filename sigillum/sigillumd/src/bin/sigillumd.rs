@@ -97,6 +97,11 @@ fn main() -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
+    // Users' enrolled security keys (§12): SIGILLUM_KEY_DIR, a directory only _sigillum writes.
+    let daemon = match std::env::var("SIGILLUM_KEY_DIR") {
+        Ok(d) => daemon.with_keys(Box::new(sigillumd::keys::FileKeys(d.into()))),
+        Err(_) => daemon,
+    };
     eprintln!(
         "sigillumd: clients {}, drivers {} (uid {}), ui {} (uid {})",
         settings.client_socket.display(),

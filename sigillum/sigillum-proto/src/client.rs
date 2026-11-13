@@ -128,6 +128,24 @@ pub struct SignWithCertificate {
     pub digest: Vec<u8>,
 }
 
+/// ostiarius: add a security key the user can verify with (sigillum.md §12):
+/// the passcode first, then the key registers with UV (its PIN) for
+/// [`VERIFY_RP`]. The key is then offered on that user's verify sheets.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EnrolKey {
+    pub ceremony: CeremonyId,
+    pub user: String,
+    /// The user's name for the key ("Blue YubiKey"), shown when it's listed.
+    pub name: String,
+}
+
+/// The RP ID local verification uses: not a domain, so no website's RP ID
+/// (`valid_domain`) or app's private one (`app:...`) can equal it.
+pub const VERIFY_RP: &str = "atrium:sigillum/verify";
+
+/// Most security keys one user enrols.
+pub const MAX_LOGIN_KEYS: usize = 8;
+
 /// Most schemes a [`ChooseCertificate`] names.
 pub const MAX_SCHEMES: usize = 8;
 
@@ -138,6 +156,7 @@ pub enum Request {
     VerifyUser(VerifyUser),
     ChooseCertificate(ChooseCertificate),
     SignWithCertificate(SignWithCertificate),
+    EnrolKey(EnrolKey),
     Cancel { ceremony: CeremonyId },
 }
 
@@ -149,6 +168,7 @@ impl Request {
             Request::VerifyUser(v) => v.ceremony,
             Request::ChooseCertificate(c) => c.ceremony,
             Request::SignWithCertificate(s) => s.ceremony,
+            Request::EnrolKey(e) => e.ceremony,
             Request::Cancel { ceremony } => *ceremony,
         }
     }
@@ -214,6 +234,10 @@ pub enum Reply {
     CertificateSigned {
         ceremony: CeremonyId,
         signature: Vec<u8>,
+    },
+    /// The key is enrolled for the user.
+    KeyEnrolled {
+        ceremony: CeremonyId,
     },
     Refused {
         ceremony: CeremonyId,

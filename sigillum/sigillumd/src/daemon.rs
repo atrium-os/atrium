@@ -151,6 +151,7 @@ pub struct Daemon {
     started: Instant,
     passcode: Arc<dyn Passcode>,
     platform: Box<dyn crate::platform::Platform>,
+    keys: Box<dyn crate::keys::KeyStore>,
     /// The verify ceremony waiting for a passcode, and its user.
     asked_passcode: Option<(Key, String)>,
     pub settings: Settings,
@@ -229,6 +230,7 @@ impl Daemon {
             started: Instant::now(),
             passcode: Arc::from(passcode),
             platform: Box::new(crate::platform::NoPlatform),
+            keys: Box::new(crate::keys::NoKeys),
             asked_passcode: None,
             settings,
         })
@@ -237,6 +239,12 @@ impl Daemon {
     /// Serve Arca as the platform authenticator (§9.2).
     pub fn with_platform(mut self, p: Box<dyn crate::platform::Platform>) -> Daemon {
         self.platform = p;
+        self
+    }
+
+    /// Keep users' enrolled security keys here (§12).
+    pub fn with_keys(mut self, k: Box<dyn crate::keys::KeyStore>) -> Daemon {
+        self.keys = k;
         self
     }
 
@@ -401,7 +409,11 @@ impl Daemon {
         if matches!(sheet, Sheet::Certificates { .. }) {
             return Vec::new();
         }
-        let fido = matches!(sheet, Sheet::Register { .. } | Sheet::Assert { .. });
+        // A verify sheet lists keys only when the user has one enrolled.
+        if matches!(sheet, Sheet::Verify { key: false, .. }) {
+            return Vec::new();
+        }
+        let fido = matches!(sheet, Sheet::Register { .. } | Sheet::Assert { .. } | Sheet::Verify { .. } | Sheet::EnrolKey { .. });
         self.broker
             .devices()
             .filter(|(_, d)| !fido || d.class == DeviceClass::Fido)
@@ -463,6 +475,20 @@ impl Daemon {
                 Action::PlatformAssert { key, user, rp_id, id, uv, client_data_hash } => {
                     let r = self.platform.assert(&user, &rp_id, &id, uv, &client_data_hash);
                     self.broker.platform_result(key, r)
+                }
+                Action::ListLoginKeys { key, user } => {
+                    let list = self.keys.list(&user);
+                    self.broker.login_keys(key, list)
+                }
+                Action::SaveLoginKey { key, user, login } => {
+                    let ok = self.keys.add(&user, login);
+                    self.broker.saved(key, ok)
+                }
+                Action::SetSignCount { user, cred_id, count } => {
+                    if !self.keys.set_count(&user, &cred_id, count) {
+                        Self::audit("could not record a key's sign count");
+                    }
+                    Vec::new()
                 }
                 Action::ToDriver { device, msg } => {
                     let failed = match self.drivers.get_mut(&device) {

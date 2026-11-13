@@ -846,8 +846,7 @@ otherwise passes the blobs on without reading them.
 - Couriers' `FILL` of a verify-each-use item (arca.md §6.2 as built): the same sheet,
   naming the endpoint, once per fill; `arcad/tests/courier.rs` and
   `arcad/tests/verify_each_use.rs` (through `serve_conn_with`).
-- **Not yet:** a fingerprint or key-UV method on
-  the verify sheet (S5, S6); ostiarius telling "PAM said no" from "the broker is
+- **Not yet:** a fingerprint method on the verify sheet (S6; key-UV is §16.6); ostiarius telling "PAM said no" from "the broker is
   unreachable" (both count as a failure toward the lockout today).
 
 ### 16.5 S5 design: tokens with a closed card OS, through their vendor module (2026-11-13)
@@ -980,6 +979,44 @@ administrative calls (`C_InnaIT*`: zeroize, initialise, applet install and delet
    kind comes from glibc's static initialiser, so the shim honours `__kind`. sigillum-pcsc
    logs each `SCard*` call's name and result (never a buffer or length). `sign` waits for a
    certificate on the token.
+
+### 16.6 As built: unlocking with a security key (2026-11-13)
+
+§12's "unlock the lock screen with a security key", the key-UV method of `VERIFY_USER`.
+
+- **Enrolment** (`EnrolKey { ceremony, user, name }`, replied `KeyEnrolled`): only from
+  ostiarius (`SIGILLUM_OSTIARIUS_UID`), for a valid user name, with a name of 1 to 64
+  bytes. The sheet ("Add a security key") asks the passcode first, through ostiarius's
+  check as in §16.4; only after it is right does the plugged-in key get a `Register` for
+  the local RP ID `atrium:sigillum/verify` (not a domain, so no website can ask a key for
+  it), non-resident, UV required, the user's enrolled keys excluded, the user handle
+  `sha256("atrium-login:" + user)`. A wrong passcode enrols nothing. At most 8 keys a user
+  (`MAX_LOGIN_KEYS`). Only ES256 (P-256) keys enrol.
+- **Store** (`sigillumd/src/keys.rs`, `SIGILLUM_KEY_DIR`): one JSON file per user,
+  `<dir>/<user>.json`, mode 0600, replaced by atomic rename; a directory only `_sigillum`
+  writes. Per key: credential id, SEC1 public key, sign count, name. No secret is stored:
+  the key's private half never leaves it. Unset, no user has a key and the verify sheet
+  offers the passcode only.
+- **Verify:** a `VERIFY_USER` first lists the user's keys. With none, or a minimum strength
+  above `key-uv` (§12's admin step-up asking `passcode`), the sheet offers the passcode
+  only and no device is asked. Otherwise it offers both ("Plug in your security key, or use
+  your passcode"); a key gets an `Assert` for the local RP ID naming the enrolled
+  credentials, UV required, over a fresh 32-byte challenge from `getrandom`. `sigillumd`
+  then checks, itself: the driver record's byte checks (RP ID hash, UP and UV set), that the
+  credential is enrolled for that user, the ES256 signature over `authData || challenge`
+  against the stored key, and that the sign count went up (a key that reports 0 every time
+  is allowed, as WebAuthn allows it). Then it stores the new count and answers `Verified {
+  SecurityKey, KeyUv }`. Anything else is `NotAllowed` and an audit line.
+- **Gates (host):** `sigillumd/tests/ceremonies.rs`: a key enrols after the passcode and then
+  unlocks; it is not offered where the passcode is required; no enrolled key means no key
+  on the sheet, and only ostiarius enrols; a wrong passcode enrols nothing; a forged
+  signature, a replayed answer (same sign count) and an unenrolled credential are refused.
+  `keys.rs` unit test (store round trip, mode, bad user names); `sigillum-ui` sheet tests.
+- **Not yet:** the run on Shankar's YubiKey (enrol, then unlock, through the jailed
+  driver); ostiarius's lock screen asking `sigillumd` (`VERIFY_USER` with `key-uv`) instead of
+  checking the passcode itself, and an "Add a security key" entry in its settings that
+  sends `EnrolKey`; removing a key (a user deletes its file entry
+  through ostiarius, to be added with the settings page).
 
 ## 17. Decisions, with recommendations
 

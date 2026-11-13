@@ -76,7 +76,13 @@ impl State {
                 rows.extend(passkeys.iter().map(|p| Row { choice: Choice::Passkey(p.id), label: format!("Passkey \u{201c}{}\u{201d}", if p.name.is_empty() { &p.display_name } else { &p.name }) }));
                 rows.extend(devices.iter().map(|d| Row { choice: Choice::Device(d.id), label: format!("Use {}", d.name) }));
             }
-            Sheet::Verify { .. } => rows.push(Row { choice: Choice::Passcode, label: "Use your passcode".into() }),
+            Sheet::Verify { key, .. } => {
+                rows.push(Row { choice: Choice::Passcode, label: "Use your passcode".into() });
+                if *key {
+                    rows.extend(devices.iter().map(|d| Row { choice: Choice::Device(d.id), label: format!("Use {}", d.name) }));
+                }
+            }
+            Sheet::EnrolKey { .. } => rows.extend(devices.iter().map(|d| Row { choice: Choice::Device(d.id), label: format!("Add {}", d.name) })),
             // Read from each certificate by sigillumd; quoted, as a name is.
             Sheet::Certificates { sign, certs, .. } => rows.extend(certs.iter().map(|c| Row {
                 choice: Choice::Certificate(c.id),
@@ -89,7 +95,8 @@ impl State {
                 ),
             })),
         }
-        let notice = rows.is_empty().then_some(match &sheet {
+        let notice = (rows.is_empty() || matches!(sheet, Sheet::Verify { key: true, .. }) && devices.is_empty()).then_some(match &sheet {
+            Sheet::Verify { .. } => "Plug in your security key, or use your passcode",
             Sheet::Certificates { .. } => "Plug in your token",
             _ => "Plug in your security key",
         });
@@ -106,7 +113,7 @@ impl State {
                 vec![format!("{requester} wants to create a passkey for {rp_id}"), format!("Account: \u{201c}{user_name}\u{201d}")],
             ),
             Sheet::Assert { requester, rp_id, .. } => ("Sign in with a passkey".into(), vec![format!("{requester} wants to sign you in to {rp_id}")]),
-            Sheet::Verify { requester, user, purpose } => {
+            Sheet::Verify { requester, user, purpose, .. } => {
                 let why = match purpose {
                     Purpose::ArcaItem { description } => format!("to use \u{201c}{description}\u{201d}"),
                     Purpose::Unlock => "to unlock".into(),
@@ -114,6 +121,10 @@ impl State {
                 };
                 ("Confirm it\u{2019}s you".into(), vec![format!("{requester} asks {why}"), format!("User: {user}")])
             }
+            Sheet::EnrolKey { requester, user, name } => (
+                "Add a security key".into(),
+                vec![format!("{requester} asks to add a security key for {user}"), format!("Name: \u{201c}{name}\u{201d}"), "Your passcode first, then the key\u{2019}s PIN and a touch.".into()],
+            ),
             Sheet::Certificates { requester, purpose, sign, certs } => {
                 let CertPurpose::TlsClient { host, port } = purpose;
                 let at = if *port == 443 { host.clone() } else { format!("{host}:{port}") };
@@ -331,7 +342,7 @@ mod tests {
     fn verify_offers_the_passcode_and_quotes_the_item() {
         let mut s = State::new(
             2,
-            Sheet::Verify { requester: "Arca".into(), user: "alice".into(), purpose: Purpose::ArcaItem { description: "Bank".into() } },
+            Sheet::Verify { requester: "Arca".into(), user: "alice".into(), purpose: Purpose::ArcaItem { description: "Bank".into() }, key: false },
             vec![DeviceView { id: 9, name: "Key".into() }],
         );
         assert_eq!(s.rows[0].choice, Choice::Passcode);
@@ -364,6 +375,27 @@ mod tests {
         let s = State::new(4, Sheet::Certificates { requester: "Navigator".into(), purpose, sign: false, certs: vec![] }, vec![]);
         assert_eq!(s.notice, Some("Plug in your token"));
         assert_eq!(s.text().1, ["portal.example.in asks Navigator for a certificate"]);
+    }
+
+    #[test]
+    fn an_enrolled_key_is_offered_beside_the_passcode_and_enrolling_lists_keys() {
+        let key = DeviceView { id: 9, name: "YubiKey FIDO+CCID".into() };
+        let v = |k| Sheet::Verify { requester: "Lock screen".into(), user: "alice".into(), purpose: Purpose::Unlock, key: k };
+        let s = State::new(1, v(true), vec![key.clone()]);
+        assert_eq!(s.rows.iter().map(|r| r.choice).collect::<Vec<_>>(), [Choice::Passcode, Choice::Device(9), Choice::Cancel]);
+        assert!(s.notice.is_none());
+        let s = State::new(1, v(true), vec![]);
+        assert_eq!(s.notice, Some("Plug in your security key, or use your passcode"));
+        let s = State::new(1, v(false), vec![key.clone()]);
+        assert_eq!(s.rows.len(), 2, "no key enrolled: passcode and cancel only");
+
+        let mut s = State::new(2, Sheet::EnrolKey { requester: "Lock screen".into(), user: "alice".into(), name: "Blue key".into() }, vec![key]);
+        assert_eq!(s.text().0, "Add a security key");
+        assert_eq!(s.rows[0].label, "Add YubiKey FIDO+CCID");
+        assert_eq!(s.click(0, T), vec![Do::Spend { choice: Choice::Device(9), token: T }]);
+        s.spent(Choice::Device(9), true);
+        s.from_broker(&ToUi::AskPasscode { key: 2, wrong: false });
+        assert!(s.takes_secret(), "the passcode comes first");
     }
 
     #[test]

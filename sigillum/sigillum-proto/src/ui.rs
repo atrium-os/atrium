@@ -29,7 +29,11 @@ pub enum Sheet {
     /// `passkeys`: the user's Arca passkeys for this RP that the request
     /// allows, offered before security keys.
     Assert { requester: String, rp_id: String, passkeys: Vec<PasskeyView> },
-    Verify { requester: String, user: String, purpose: Purpose },
+    /// `key`: the user has an enrolled security key, offered beside the
+    /// passcode (the devices list holds the attached keys).
+    Verify { requester: String, user: String, purpose: Purpose, key: bool },
+    /// "Add a security key" for `user`: the passcode, then the key (§12).
+    EnrolKey { requester: String, user: String, name: String },
     /// Certificates on the attached tokens (§10.1). `sign`: this is the
     /// signature itself (one certificate, a PIN follows); otherwise the user
     /// picks which certificate the server gets.

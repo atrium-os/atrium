@@ -69,6 +69,8 @@ struct Rig {
     passcode_answers: std::collections::VecDeque<bool>,
     /// Substitute for Arca's next answer (a lying arcad).
     arca_tamper: Option<Box<dyn FnMut(PlatformResult) -> PlatformResult>>,
+    /// The daemon's enrolled-key store (§12), for user "shankar".
+    logins: Vec<sigillumd::keys::LoginKey>,
 }
 
 /// arcad's handler behind the `Wire` sigillumd speaks, as `sigillumd`'s
@@ -101,7 +103,7 @@ impl Rig {
         let mut broker = Broker::new(Config { web_broker: Some(broker_app()), ceremony_ms: 120_000 });
         let a = broker.driver(DEV, hello);
         assert!(matches!(a[0], Action::Audit(_)));
-        Rig { broker, driver, key, pin: Some(PIN), pin_asks: 0, replies: vec![], sheets: vec![], audit: vec![], tamper: None, arca: None, passcode_ok: true, passcode_asks: 0, passcode_answers: Default::default(), arca_tamper: None }
+        Rig { broker, driver, key, pin: Some(PIN), pin_asks: 0, replies: vec![], sheets: vec![], audit: vec![], tamper: None, arca: None, passcode_ok: true, passcode_asks: 0, passcode_answers: Default::default(), arca_tamper: None, logins: vec![] }
     }
 
     fn run(&mut self, actions: Vec<Action>) {
@@ -150,6 +152,18 @@ impl Rig {
                         res = t(res);
                     }
                     queue.extend(self.broker.platform_result(key, res));
+                }
+                Action::ListLoginKeys { key, user } => {
+                    let l = if user == "shankar" { self.logins.clone() } else { vec![] };
+                    queue.extend(self.broker.login_keys(key, l));
+                }
+                Action::SaveLoginKey { key, user, login } => {
+                    assert_eq!(user, "shankar");
+                    self.logins.push(login);
+                    queue.extend(self.broker.saved(key, true));
+                }
+                Action::SetSignCount { cred_id, count, .. } => {
+                    self.logins.iter_mut().find(|k| k.cred_id == cred_id).expect("enrolled").sign_count = count;
                 }
                 Action::CloseSheet { .. } | Action::Touch { .. } => {}
             }
@@ -755,4 +769,107 @@ fn no_arca_for_apps_private_rp_ids_or_without_arca() {
     let (key, sheet) = r.sheets.last().unwrap().clone();
     assert!(matches!(sheet, Sheet::Register { platform: false, .. }));
     assert!(r.broker.press(key, Choice::Platform, true).is_empty());
+}
+
+// §12: a security key enrolled with the passcode, then used to verify (lock screen unlock).
+
+fn enrol() -> Request {
+    Request::EnrolKey(sigillum_proto::client::EnrolKey { ceremony: 5, user: "shankar".into(), name: "Blue key".into() })
+}
+
+fn unlock(min: Strength) -> Request {
+    Request::VerifyUser(VerifyUser { ceremony: 6, user: "shankar".into(), purpose: Purpose::Unlock, min_strength: min })
+}
+
+#[test]
+fn a_key_is_enrolled_after_the_passcode_and_then_unlocks() {
+    let mut r = Rig::new(SoftKey::new(Some(PIN)));
+    r.request(&Label::Ostiarius, enrol());
+    assert!(matches!(&r.sheets.last().unwrap().1, Sheet::EnrolKey { user, .. } if user == "shankar"));
+    r.press_last(Choice::Device(DEV));
+    assert_eq!(r.passcode_asks, 1, "the passcode comes before the key");
+    assert!(matches!(r.reply(), Reply::KeyEnrolled { ceremony: 5 }));
+    assert_eq!(r.logins.len(), 1);
+    assert!(r.pin_asks >= 1, "enrolment needs the key's UV (its PIN)");
+
+    // Unlock: the sheet offers the key; PIN + touch verify; the counter moves.
+    r.sheets.clear();
+    r.passcode_asks = 0;
+    r.request(&Label::Ostiarius, unlock(Strength::BiometricSecure));
+    assert!(matches!(&r.sheets.last().unwrap().1, Sheet::Verify { key: true, .. }));
+    r.press_last(Choice::Device(DEV));
+    assert!(matches!(r.reply(), Reply::Verified { ceremony: 6, method: sigillum_proto::client::Method::SecurityKey, strength: Strength::KeyUv }));
+    assert_eq!(r.passcode_asks, 0);
+    let first = r.logins[0].sign_count;
+    r.request(&Label::Ostiarius, unlock(Strength::BiometricSecure));
+    r.press_last(Choice::Device(DEV));
+    assert!(matches!(r.reply(), Reply::Verified { .. }));
+    assert!(r.logins[0].sign_count > first);
+}
+
+#[test]
+fn a_key_is_not_offered_where_the_passcode_is_required() {
+    let mut r = Rig::new(SoftKey::new(Some(PIN)));
+    r.request(&Label::Ostiarius, enrol());
+    r.press_last(Choice::Device(DEV));
+    r.reply();
+    r.request(&Label::Ostiarius, unlock(Strength::Passcode));
+    assert!(matches!(&r.sheets.last().unwrap().1, Sheet::Verify { key: false, .. }));
+    r.press_last(Choice::Device(DEV));
+    assert!(r.replies.is_empty(), "a key press does nothing on a passcode-only sheet");
+}
+
+#[test]
+fn no_enrolled_key_no_key_on_the_sheet_and_only_ostiarius_enrols() {
+    let mut r = Rig::new(SoftKey::new(Some(PIN)));
+    r.request(&Label::Ostiarius, unlock(Strength::BiometricSecure));
+    assert!(matches!(&r.sheets.last().unwrap().1, Sheet::Verify { key: false, .. }));
+    r.press_last(Choice::Cancel);
+    r.reply();
+    for l in [Label::Arca, web_broker(), some_app()] {
+        r.request(&l, enrol());
+        assert!(matches!(r.reply(), Reply::Refused { reason: Refusal::Denied, .. }));
+    }
+    let bad = Request::EnrolKey(sigillum_proto::client::EnrolKey { ceremony: 5, user: "../root".into(), name: "x".into() });
+    r.request(&Label::Ostiarius, bad);
+    assert!(matches!(r.reply(), Reply::Refused { reason: Refusal::Malformed, .. }));
+}
+
+#[test]
+fn a_wrong_passcode_enrols_nothing() {
+    let mut r = Rig::new(SoftKey::new(Some(PIN)));
+    r.passcode_ok = false;
+    r.request(&Label::Ostiarius, enrol());
+    r.press_last(Choice::Device(DEV));
+    assert!(matches!(r.reply(), Reply::Refused { reason: Refusal::NotAllowed, .. }));
+    assert!(r.logins.is_empty());
+    assert_eq!(r.pin_asks, 0, "the key is never asked");
+}
+
+#[test]
+fn a_forged_or_replayed_key_answer_is_refused() {
+    let mut r = Rig::new(SoftKey::new(Some(PIN)));
+    r.request(&Label::Ostiarius, enrol());
+    r.press_last(Choice::Device(DEV));
+    r.reply();
+    // A driver that changes the signature.
+    r.tamper = Some(Box::new(|rec| match rec {
+        FromDriver::Asserted { ceremony, cred_id, rp_id_hash, flags, sign_count, auth_data, mut signature, user_handle } => {
+            let n = signature.len();
+            signature[n - 1] ^= 1;
+            FromDriver::Asserted { ceremony, cred_id, rp_id_hash, flags, sign_count, auth_data, signature, user_handle }
+        }
+        other => other,
+    }));
+    r.request(&Label::Ostiarius, unlock(Strength::BiometricSecure));
+    r.press_last(Choice::Device(DEV));
+    assert!(matches!(r.reply(), Reply::Refused { reason: Refusal::NotAllowed, .. }));
+    assert!(r.audit.iter().any(|a| a.contains("does not verify") || a.contains("failed checks")));
+    // A stored counter ahead of the key's: a clone or a replay.
+    r.tamper = None;
+    r.logins[0].sign_count = u32::MAX - 1;
+    r.request(&Label::Ostiarius, unlock(Strength::BiometricSecure));
+    r.press_last(Choice::Device(DEV));
+    assert!(matches!(r.reply(), Reply::Refused { .. }));
+    assert!(r.audit.iter().any(|a| a.contains("sign count")));
 }

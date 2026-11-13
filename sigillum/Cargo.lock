@@ -931,6 +931,7 @@ name = "sigillumd"
 version = "0.1.0"
 dependencies = [
  "arcad",
+ "getrandom 0.2.17",
  "libc",
  "p256",
  "p384",
