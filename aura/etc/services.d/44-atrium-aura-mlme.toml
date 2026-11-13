@@ -1,0 +1,53 @@
+# /etc/atrium/services.d/44-atrium-aura-mlme.toml
+#
+# Aura's MLME daemon (docs/spec/wifi.md §8.3): scans, parses every beacon,
+# probe response and management frame, joins and leaves. The largest hostile
+# parser in the Wi-Fi stack, so it holds no secrets: the kernel never shows
+# it EAPOL or keys, and passwords stay in aura-keys. Numbered after
+# aura-keys (43), which it connects to before entering capability mode.
+#
+# Runs as _aura (65033) with no network, in Capsicum capability mode once
+# its descriptors are open (--capsicum). Its devfs (ruleset 28,
+# atrium_wifi_mlme, pinned to this jail) shows only /dev/aura/ctl*.
+#
+# REQUIRES (commission once):
+#   pw useradd _aura -u 65033 -d /nonexistent -s /usr/sbin/nologin
+#   mkdir -p /atrium/sockets/aura && chown _aura /atrium/sockets/aura
+#   install the binary as /usr/local/bin/atrium-aura-mlme
+
+enabled       = true
+name          = "atrium-aura-mlme"
+path          = "/var/lib/atrium/jails/aura-mlme"
+children_max  = 0
+devfs_ruleset = 28                               # atrium_wifi_mlme: basics + aura/ctl*
+
+[[mounts]]
+source = "/libexec"
+dest   = "libexec"
+kind   = "ro_nullfs"
+[[mounts]]
+source = "/lib"
+dest   = "lib"
+kind   = "ro_nullfs"
+[[mounts]]
+source = "/usr/lib"
+dest   = "usr/lib"
+kind   = "ro_nullfs"
+[[mounts]]
+source = "/usr/local/bin"
+dest   = "usr/local/bin"
+kind   = "ro_nullfs"
+[[mounts]]
+source = "/atrium/sockets/aura"                  # rw: binds mlme.sock (atrium-net connects)
+dest   = "atrium/sockets/aura"
+kind   = "rw_nullfs"
+[[mounts]]
+source = "/atrium/sockets/aura-keys"             # ro: connect to aura-keys
+dest   = "atrium/sockets/aura-keys"
+kind   = "ro_nullfs"
+
+[exec]
+path = "/usr/local/bin/atrium-aura-mlme"
+argv = ["atrium-aura-mlme", "--capsicum"]
+uid  = 65033   # _aura
+gid  = 65033

@@ -5513,7 +5513,7 @@ timing, so run it on the Mac's HVF VM; check 3 (no device in app jails) is
 portcullis-jail's devfs test plus portcullisd's shipped_manifests test (VM only:
 portcullisd doesn't build on Linux).
 
-### 13.6c Aura Wi-Fi core in the cloud VM (`scripts/aura-vm-check.sh`)
+### 13.6c Aura Wi-Fi in the cloud VM (`scripts/aura-vm-check.sh`, `scripts/aura-w1-check.sh`)
 
 ```sh
 OBJ=$HOME/obj ARCH=aarch64 sh scripts/aura-vm-check.sh kernel   # fork kernel as kernel.atrium (one-shot nextboot)
@@ -5527,6 +5527,30 @@ OBJ=$HOME/obj ARCH=aarch64 sh scripts/aura-vm-check.sh test     # build aura_wla
 - `aura_sim` is test only: it never goes in devices.d. `/dev/aura/sim0` is a pipe to user
   space (`aura/kmod/sim/aura_sim.h`); the gate plays the AP through it.
 - Host tests: `cd aura && cargo test` (proto + core, incl. mutation fuzzing).
+
+W1 gate: the FreeBSD VM joins a real hostapd (WPA2-PSK + PSK-SHA256, PMF required) running
+on mac80211_hwsim in a second, Ubuntu arm64 VM. `aura/sim-ap/air-hwsim.py` registers as
+hwsim's wireless medium and carries every frame over UDP to `aura-air` in the FreeBSD VM
+(the test stand-in for radio firmware: channel hopping, CCMP, BIP), which plays it through
+`/dev/aura/sim0`.
+
+```sh
+sh scripts/aura-w1-check.sh vms     # both VMs up (FreeBSD with udp 7701 forwarded, Ubuntu AP VM on ssh 2223)
+sh scripts/aura-w1-check.sh test    # build, start hostapd + udhcpd, arcad, jailed aura-keys + aura-mlme, check
+sh scripts/aura-ap-vm.sh log        # hostapd and the medium's logs; `ssh CMD` runs a command as root there
+```
+
+- `AURA_JAIL=0` runs the daemons unjailed under `daemon(8)`; `AURA_ARCA=0` uses
+  aura-keys' `--memory-store` instead of arcad.
+- Checks: scan, remember (Arca machine store, kind 8), join + DHCP, PMF, 4-way on both
+  sides, pings both ways, a GTK rekey (`wpa_group_rekey=60`), a forged unprotected deauth
+  ignored after SA Query, leave, no secret in the logs, each jail sees only its own
+  `/dev/aura` node and has no addresses.
+- `MAKEOBJDIRPREFIX` is `~/obj-arm64`: a symlink to `~/obj` in a fresh container.
+- The AP VM needs `linux-modules-extra` for mac80211_hwsim; it is installed with
+  `--force-depends` and `depmod -a` (the image's meta packages pin another kernel).
+- "netlink error -22" from the medium is hwsim refusing frames injected on a channel the AP
+  is not on (our probes while scanning); harmless.
 
 ### 13.6b Bluetooth (Vinculum) harness: Rootcanal + Bumble, no radio
 

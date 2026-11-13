@@ -60,15 +60,16 @@ impl Conn {
     }
 }
 
-/// Binds a listening socket, replacing a stale one, mode 0660.
-pub fn listen(path: &Path) -> io::Result<UnixListener> {
+/// Binds a listening socket, replacing a stale one. Peers are checked by
+/// uid on accept; `mode` is the outer fence.
+pub fn listen(path: &Path, mode: u32) -> io::Result<UnixListener> {
     let _ = std::fs::remove_file(path);
     if let Some(d) = path.parent() {
         std::fs::create_dir_all(d)?;
     }
     let l = UnixListener::bind(path)?;
     use std::os::unix::fs::PermissionsExt;
-    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o660))?;
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode))?;
     l.set_nonblocking(true)?;
     Ok(l)
 }

@@ -78,6 +78,10 @@ ro_paths = [
     # Users' approved grants (<user>/policy.toml, 0644), read by choragusd to
     # check audio capabilities. The host identity key here is root 0600.
     "/var/db/atrium",
+    # Aura (wifi.md §8.3): aura-mlme connects to aura-keys' socket dir;
+    # aura-keys connects to arcad's for Wi-Fi credentials.
+    "/atrium/sockets/aura-keys",
+    "/atrium/sockets/arca",
 ]
 rw_paths = [
     # Aqueduct service-socket directory (all jails that talk to
@@ -101,6 +105,11 @@ rw_paths = [
     # socket tree.
     "/var/db/arca",
     "/atrium/sockets/arca",
+
+    # Aura's two daemons (wifi.md §8.3), each binding in its own dir:
+    # aura-mlme's mlme.sock, aura-keys' keys.sock.
+    "/atrium/sockets/aura",
+    "/atrium/sockets/aura-keys",
 
     # choragusd's users' volumes (<user>.toml; _choragus 0700).
     "/var/db/choragus",
@@ -145,6 +154,8 @@ allowed = [
     "atrium-input",      # baseline + atkbd*, bpsm* (+ input hidraw per node); pinned to tactusd
     "atrium-identity",   # baseline (+ one hidraw per jail); pinned to sigillum-fido
     "atrium-tty",        # baseline + a specific allocated tty
+    "atrium-wifi-mlme",  # baseline + aura/ctl*; pinned to aura-mlme
+    "atrium-wifi-keys",  # baseline + aura/key*; pinned to aura-keys
 ]
 # Numeric ruleset ids jaild may mount a jail's devfs with. The rulesets
 # themselves live in etc/atrium.devfs.rules (installed and loaded at boot by
@@ -173,7 +184,9 @@ allowed = [
 #      kernel classified as input, in that jail's mount (sigillum.md §5.1).
 # 27 = atrium_identity — basics only: one jail per security key, each shown
 #      its own hidraw node through the request's devfs_grant (pinned below).
-allowed_ids = [4, 20, 22, 23, 24, 26, 27, 31]
+# 28 = atrium_wifi_mlme — basics + aura/ctl*: aura-mlme's alone (pinned below).
+# 29 = atrium_wifi_keys — basics + aura/key*: aura-keys' alone (pinned below).
+allowed_ids = [4, 20, 22, 23, 24, 26, 27, 28, 29, 31]
 
 # The display belongs to frescod. Only the frescod service may mount the
 # ruleset that shows /dev/atrium-display0, and before it starts jaild writes
@@ -228,6 +241,22 @@ exec_path         = "/usr/local/bin/atrium-capsa-fuse"
 uid               = 65031
 fuse_devices      = ["da#p#", "da#s#"]
 fuse_mount_prefix = "/media"
+
+# Wi-Fi radios (wifi.md §8.3): the control nodes belong to aura-mlme, the key
+# nodes to aura-keys. Neither may mount the other's ruleset, so a parser bug
+# in aura-mlme cannot reach keys or EAPOL, and aura-keys cannot scan or send
+# management frames.
+[[devfs_rulesets.pinned]]
+id        = 28
+jail_name = "atrium-aura-mlme"
+exec_path = "/usr/local/bin/atrium-aura-mlme"
+uid       = 65033
+
+[[devfs_rulesets.pinned]]
+id        = 29
+jail_name = "atrium-aura-keys"
+exec_path = "/usr/local/bin/atrium-aura-keys"
+uid       = 65032
 
 
 # ---------------------------------------------------------------
@@ -341,6 +370,8 @@ allowed_system_uids = [
     65030,   # _sigillum-ui: Sigillum's trusted sheets
     65031,   # _capsa: removable-storage FUSE servers, one jail per partition,
              # started by dispensatord (capsa-service.sh creates it)
+    65032,   # _aura-keys: Aura's key daemon, aura-keys (wifi.md §8.3)
+    65033,   # _aura: Aura's MLME daemon, aura-mlme (docs/spec/wifi.md §8.3)
 ]
 
 [gid]
@@ -361,6 +392,8 @@ allowed_system_gids = [
     65029,   # _sigillum-dev
     65030,   # _sigillum-ui
     65031,   # _capsa
+    65032,   # _aura-keys
+    65033,   # _aura
 ]
 
 

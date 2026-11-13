@@ -1,0 +1,52 @@
+# /etc/atrium/services.d/43-atrium-aura-keys.toml
+#
+# Aura's key daemon (docs/spec/wifi.md §8.3, decision 14): the 4-way and
+# group handshakes, keys, the controlled port. The only Aura piece that sees
+# a Wi-Fi password; it gets each one from Arca's machine store for one join
+# (arcad's ARCA_SERVICES names aura-keys=65032). Numbered after arcad (42).
+#
+# Runs as _aura-keys (65032) with no network. Its devfs (ruleset 29,
+# atrium_wifi_keys, pinned to this jail in jaild.policy.toml) shows only
+# /dev/aura/key*: never ctl*, so it cannot scan or send management frames.
+#
+# REQUIRES (commission once):
+#   pw useradd _aura-keys -u 65032 -d /nonexistent -s /usr/sbin/nologin
+#   mkdir -p /atrium/sockets/aura-keys && chown _aura-keys /atrium/sockets/aura-keys
+#   install the binary as /usr/local/bin/atrium-aura-keys
+
+enabled       = true
+name          = "atrium-aura-keys"
+path          = "/var/lib/atrium/jails/aura-keys"
+children_max  = 0
+devfs_ruleset = 29                               # atrium_wifi_keys: basics + aura/key*
+
+[[mounts]]
+source = "/libexec"
+dest   = "libexec"
+kind   = "ro_nullfs"
+[[mounts]]
+source = "/lib"
+dest   = "lib"
+kind   = "ro_nullfs"
+[[mounts]]
+source = "/usr/lib"
+dest   = "usr/lib"
+kind   = "ro_nullfs"
+[[mounts]]
+source = "/usr/local/bin"
+dest   = "usr/local/bin"
+kind   = "ro_nullfs"
+[[mounts]]
+source = "/atrium/sockets/aura-keys"             # rw: binds keys.sock (aura-mlme and atrium-net connect)
+dest   = "atrium/sockets/aura-keys"
+kind   = "rw_nullfs"
+[[mounts]]
+source = "/atrium/sockets/arca"                  # ro: connect to arcad for the machine store
+dest   = "atrium/sockets/arca"
+kind   = "ro_nullfs"
+
+[exec]
+path = "/usr/local/bin/atrium-aura-keys"
+argv = ["atrium-aura-keys"]
+uid  = 65032   # _aura-keys
+gid  = 65032

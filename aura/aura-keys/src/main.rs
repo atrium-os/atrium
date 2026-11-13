@@ -42,8 +42,8 @@ fn opts() -> Opts {
     let mut o = Opts {
         verbose: false,
         dev: "/dev/aura/key0".into(),
-        sock: "/var/run/aura/keys.sock".into(),
-        mlme_uid: 65031,
+        sock: "/atrium/sockets/aura-keys/keys.sock".into(),
+        mlme_uid: 65033,
         ctl_uid: 0,
         arca: Some("/atrium/sockets/arca/arcad.sock".into()),
     };
@@ -219,13 +219,13 @@ impl Keys {
                 }
                 match self.store.remember(&ssid, &secret) {
                     Ok(()) => Line::new("ok"),
-                    Err(e) => err(&format!("store:{}", e.kind())),
+                    Err(e) => err(&store_err(&e)),
                 }
             }
             "forget" => match self.store.forget(&ssid) {
                 Ok(true) => Line::new("ok"),
                 Ok(false) => err("unknown"),
-                Err(e) => err(&format!("store:{}", e.kind())),
+                Err(e) => err(&store_err(&e)),
             },
             "prepare" => match self.store.release(&ssid) {
                 Ok(Some(s)) => {
@@ -233,11 +233,17 @@ impl Keys {
                     Line::new("ok")
                 }
                 Ok(None) => err("no-credential"),
-                Err(e) => err(&format!("store:{}", e.kind())),
+                Err(e) => err(&store_err(&e)),
             },
             _ => err("unknown-command"),
         }
     }
+}
+
+/// An error for the reply line: no spaces, no secrets (store errors carry
+/// none).
+fn store_err(e: &std::io::Error) -> String {
+    format!("store:{e}").chars().map(|c| if c.is_ascii_graphic() && c != '=' { c } else { '-' }).take(80).collect()
 }
 
 fn main() {
@@ -256,7 +262,7 @@ fn main() {
         }
     };
     let mut k = Keys { f, seq: 0, verbose: o.verbose, store, prepared: None, join: None, pending: Vec::new() };
-    let listener = sock::listen(&o.sock).unwrap_or_else(|e| die(&format!("{}: {e}", o.sock.display())));
+    let listener = sock::listen(&o.sock, 0o666).unwrap_or_else(|e| die(&format!("{}: {e}", o.sock.display())));
     let mut conns: Vec<Option<Conn>> = Vec::new();
     let mut buf = vec![0u8; HEADER_LEN + MAX_BODY];
     eprintln!("aura-keys: up");

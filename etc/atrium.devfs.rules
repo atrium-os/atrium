@@ -113,3 +113,22 @@ add include $devfsrules_unhide_basic
 [atrium_capsa=31]
 add include $devfsrules_hide_all
 add include $devfsrules_unhide_basic
+
+# Aura, the Wi-Fi stack (wifi.md §8.3): each daemon sees only its own node
+# of each radio. aura-mlme gets the control nodes (scans, management
+# frames), never key*; aura-keys gets the key nodes (EAPOL, keys, the
+# controlled port), never ctl*. Each ruleset is pinned to its jail and uid in
+# jaild.policy.toml (28 atrium-aura-mlme/_aura, 29 atrium-aura-keys/_aura-keys).
+[atrium_wifi_mlme=28]
+add include $devfsrules_hide_all
+add include $devfsrules_unhide_basic
+add path 'aura' unhide
+add path 'aura/ctl*' unhide
+add path 'aura/ctl*' mode 0600 user _aura
+
+[atrium_wifi_keys=29]
+add include $devfsrules_hide_all
+add include $devfsrules_unhide_basic
+add path 'aura' unhide
+add path 'aura/key*' unhide
+add path 'aura/key*' mode 0600 user _aura-keys

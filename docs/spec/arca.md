@@ -396,8 +396,10 @@ root key.
   service's items: there is no grant, and no op that names another recipient.
 - **When.** One class, *after boot*: the store opens when arcad starts and stays open until
   shutdown. No user's unlock or lock touches it.
-- **What.** Bearer items only: `Kind::BluetoothKey` (7) for link keys, LTKs and IRKs, or
-  another bearer kind. Cookies and keys are refused; apps are refused kind 7 everywhere.
+- **What.** Bearer items only: `Kind::BluetoothKey` (7) for link keys, LTKs and IRKs,
+  `Kind::WifiCredential` (8) for Wi-Fi passphrases and PSKs (aura-keys, account
+  `wifi <ssid hex>`), or another bearer kind. Cookies and keys are refused; apps are refused
+  kinds 7 and 8 everywhere.
 - **The wire** is the app ops' (§4.2), on arcad's socket:
   - `STORE 0x04`: `u16 kind | u8 class (1) | str account | bytes value` → `id[16]`.
   - `RELEASE 0x05`: `id[16]` → `u32 len | value`. The value goes to the service, which hands

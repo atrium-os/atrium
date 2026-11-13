@@ -34,8 +34,8 @@ fn opts() -> Opts {
     let mut o = Opts {
         verbose: false,
         dev: "/dev/aura/ctl0".into(),
-        sock: "/var/run/aura/mlme.sock".into(),
-        keys: "/var/run/aura/keys.sock".into(),
+        sock: "/atrium/sockets/aura/mlme.sock".into(),
+        keys: "/atrium/sockets/aura-keys/keys.sock".into(),
         ctl_uid: 0,
         capsicum: false,
     };
@@ -143,7 +143,7 @@ fn main() {
     };
     k.pending.clear();
 
-    let listener = sock::listen(&o.sock).unwrap_or_else(|e| die(&format!("{}: {e}", o.sock.display())));
+    let listener = sock::listen(&o.sock, 0o600).unwrap_or_else(|e| die(&format!("{}: {e}", o.sock.display())));
     let mut keys: Option<Conn> = None;
     let mut keys_retry = Instant::now();
     let mut clients: Vec<Conn> = Vec::new();

@@ -270,7 +270,7 @@ in FreeBSD and that hardware is going away.
 | Step | What | Done when |
 |---|---|---|
 | W0 | `aura-proto`, `aura_wlan` skeleton, kpi bindings (bus_dma, MSI-X, firmware, mbuf, ifnet), `aura_sim` + hwsim bridge | `wlan0` appears in the VM and passes Ethernet frames to the sim. **Done 2026-11-13** (§7.1) |
-| W1 | `aurad`: scan, open + WPA2-PSK + PMF, Arca credentials, jail, atrium-net glue, DHCP | VM joins hwsim `hostapd` WPA2 and gets an address |
+| W1 | `aurad`: scan, open + WPA2-PSK + PMF, Arca credentials, jail, atrium-net glue, DHCP | VM joins hwsim `hostapd` WPA2 and gets an address. **Done 2026-11-13** (§7.2) |
 | W2 | `aurad`: WPA3-SAE (H2E + hunting-and-pecking), transition mode, roaming, MAC randomization, regdb | sim gate (§6.2) green |
 | W3 | `aura_mt79` USB transport: MCU messages, patch + RAM firmware load, hardware scan | MT7921AU in the Mac VM scans and reports BSSs to `aurad` |
 | W4 | `aura_mt79` station: BSS/STA records, TX/RX, HW crypto, firmware rate control, BA sessions, PS, country/regulatory; then the PCIe (WFDMA) bus layer and MT7925 on the AI X1 Pro | real AP joined at HE/EHT rates, iperf target met on the AI X1 Pro |
@@ -303,6 +303,41 @@ W0–W2 need no Wi-Fi hardware at all.
   in the arm64 cloud VM on the fork's ATRIUM-NODEBUG kernel, modules unload
   cleanly. The hwsim/hostapd bridge moves to W1, where the first handshake
   needs it.
+
+### 7.2 W1 as built (2026-11-13)
+
+`aurad` is two daemons, as §8.3 split it:
+
+- `aura/aura-mlme` (uid `_aura` 65033, jail `atrium-aura-mlme`, devfs ruleset 28: only
+  `/dev/aura/ctl0`, no network, Capsicum after start-up): scan results and IE parsing
+  (WEP, TKIP and WPA1 refused; a remembered SSID offering weaker security than remembered
+  is refused as an evil twin), open authentication and association (WMM IE for QoS),
+  `SetBss`, PMF (an unprotected deauth or disassoc starts an SA Query instead of leaving;
+  the AP's SA Query is answered), timeouts and retries. It never sees a key.
+- `aura/aura-keys` (uid `_aura-keys` 65032, jail `atrium-aura-keys`, ruleset 29: only
+  `/dev/aura/key0`): credentials in Arca's machine store (`Kind::WifiCredential`, arca.md
+  §6.4), PSK derivation, the 4-way and group handshakes (`aura/aura-rsn`), key install
+  through `key0`, the controlled port. Its rules (MIC before key data, replay counter only
+  forward, no reinstall, msg 3 RSNE equal to the beacon's byte for byte, IGTK required with
+  PMF) have host tests including the Annex J vectors and mutation fuzzing.
+- `aura/aura-ipc`: the line protocol between them and the control client; peer roles by
+  uid (`getpeereid`), lines capped at 4 KiB, values hex. Sockets
+  `/atrium/sockets/aura/mlme.sock` (0600) and `/atrium/sockets/aura-keys/keys.sock`.
+- `aura/aura-ctl`: the atrium-net stand-in (`remember`, `forget`, `scan`, `join [--open]
+  [--wait] [--dhcp IF]`, `leave`, `status`); DHCP is `dhclient` until atrium-net exists.
+- `aura/aura-air`: test only, the firmware stand-in on the far side of `/dev/aura/sim0`:
+  channel hopping (150 ms dwell, probes only on 2412–2452), CCMP-128 for data and
+  unicast robust management frames, BIP-CMAC-128 checks and the management replay check.
+  Data frame PNs go up to the kernel core, which checks them. The management replay check
+  belongs in `aura-wlan-core` once real drivers deliver protected management frames
+  (W3/W4); it lives in aura-air now only because the sim has no such path.
+- Manifests: `aura/etc/services.d/43-atrium-aura-keys.toml`, `44-atrium-aura-mlme.toml`;
+  rulesets in `etc/atrium.devfs.rules`, pins in `etc/jaild.policy.toml`.
+- Gate: `scripts/aura-w1-check.sh vms|test` (RUNBOOK §13.6c). A second VM (Ubuntu arm64)
+  runs unmodified hostapd 2.10 on mac80211_hwsim with WPA2-PSK + PSK-SHA256, PMF
+  required, GTK rekey every 60 s; `aura/sim-ap/air-hwsim.py` is the hwsim medium, carrying
+  frames over UDP to aura-air. The FreeBSD VM joins in about 3 s, gets an address from
+  udhcpd, pings both ways, survives a rekey and a forged deauth, and leaves.
 
 
 ## 8. Threat model and what runs where

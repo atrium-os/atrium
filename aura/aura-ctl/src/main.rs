@@ -8,8 +8,8 @@
 //!   aura-ctl join SSID [--open] [--wait SECS] [--dhcp IFACE]
 //!   aura-ctl leave | status
 //!
-//! Global: --mlme PATH (/var/run/aura/mlme.sock), --keys PATH
-//! (/var/run/aura/keys.sock). Exit status 0 on success.
+//! Global: --mlme PATH (/atrium/sockets/aura/mlme.sock), --keys PATH
+//! (/atrium/sockets/aura-keys/keys.sock). Exit status 0 on success.
 
 use aura_ipc::{Got, Line, Reader};
 use std::io::{BufRead, Write};
@@ -79,8 +79,8 @@ fn show(l: &Line) -> String {
 }
 
 fn main() {
-    let mut mlme = "/var/run/aura/mlme.sock".to_string();
-    let mut keys = "/var/run/aura/keys.sock".to_string();
+    let mut mlme = "/atrium/sockets/aura/mlme.sock".to_string();
+    let mut keys = "/atrium/sockets/aura-keys/keys.sock".to_string();
     let mut args: Vec<String> = Vec::new();
     let mut it = std::env::args().skip(1);
     while let Some(a) = it.next() {
