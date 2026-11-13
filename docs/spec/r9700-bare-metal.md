@@ -1065,3 +1065,13 @@ work (self-test, scrub).
     denial-of-service hole.
   - The card was proven idle at detach (9 W) and the vector was released.
   Logs: branch claude/project-thread-33aauq, commit 03bb7450.
+- **2026-11-13 08:45, reset blame (9e337339), chosen by Shankar on the card.** The GPU
+  reset is blamed on the uid that created the queue which forced it. That uid's
+  QUEUE_CREATE returns EPERM for `isolation.reset_lockout_s` (600 s). Root is exempt,
+  and 0 turns the rule off. New counters: `resets_blamed` and `lockout_refused`. The
+  global cap of 3 re-inits per 10 min stays. si-client-test 14 now runs each hostile
+  job in a child under its own uid and checks that uid's next queue. The targets the
+  last run missed go first. On gpusim, atrium_gpu_test and test_gpu_isolation are ALL
+  OK. Box artifacts: pci 80cd52f5…, gpu f6aae609…, si-client-test 5801b269…, staged
+  in xfer b40b243d. Still owed: recovering a halted CP queue on its own, without a
+  full reset.
