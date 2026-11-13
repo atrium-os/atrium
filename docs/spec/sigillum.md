@@ -829,6 +829,77 @@ otherwise passes the blobs on without reading them.
   the verify sheet (S5, S6); ostiarius telling "PAM said no" from "the broker is
   unreachable" (both count as a failure toward the lockout today).
 
+### 16.5 S5 design: tokens with a closed card OS, through their vendor module (2026-11-13)
+
+**The token.** Shankar's InnaIT DSC token (Precision Biometric, USB 338c:0032, "InnaitKey
+DSC DSC_tocken") is a CCID reader (APDU level, short and extended, T=0/T=1, no PIN pad)
+plus a virtual CD. Its card (an NXP P71 secure element, ATR historical bytes
+`PK\x03XXX_DSC_KEY`) runs Precision's own card OS: SELECT of PIV and of PKCS#15 answer
+`6A82`, the MF selects, there is no CPLC. Its driver runs secure messaging (PACE) with the
+card. Without Precision's APDU specification only their PKCS#11 module can sign with it.
+Most Indian DSC tokens are like this.
+
+**Decision (Shankar, 2026-11-13):** run the vendor's PKCS#11 module in a jail, rather than
+waiting for a specification or supporting only PIV.
+
+**The module** (`innait-dsc-driver` 4.0.7.1, driver-only package from
+technical.innait.com, inspected statically, never run on a host): one amd64 ELF,
+`libInnaITPKCS11Driver.so` (no arm64 Linux build). `DT_NEEDED`: libpcsclite, libudev,
+libstdc++, libm, libgcc_s, libc (glibc 2.28). It imports 407 symbols: 12 `SCard*`, 16
+`udev_*` (hidapi's HID path, unused for this token), 11 `curl_*` (with no libcurl in
+`DT_NEEDED`), 142 libstdc++ symbols (strings, iostreams, locale, regex errors), and 226
+from libc. Of those 226, Hospes already provides about 95, and many of the rest are trivial
+string or stdio functions. It statically links and exports OpenSSL 1.1.1f. Its network
+code (AIA certificate fetches, firmware download, a fingerprint service on 127.0.0.1),
+`fork`/`execle` (mongoose CGI) and `popen` are never needed to sign. It also exports
+administrative calls (`C_InnaIT*`: zeroize, initialise, applet install and delete).
+
+**Design.**
+
+- `sigillum-p11`, a Hospes host (amd64), one per token. It runs in that token's driver jail
+  as `_sigillum-dev`. Its devfs holds only the token's two USB nodes (device-assignment
+  §6.3, a `usb` rule on interface class 0x0B). It has no network, and enters capability
+  mode after load.
+- Inside the process, Hospes loads three libraries: the vendor module, plus the real
+  libstdc++ and libgcc_s from a signed Ubuntu package (the GCC runtime library exception
+  allows it). Hospes's shim grows to cover what those three import.
+- Hospes itself provides `libpcsclite.so.1`: `SCard*` in Rust over `sigillum-ccid`, with
+  one reader and one card, and no pcscd. It also provides an empty `libudev.so.1` and
+  `curl_*` stubs that fail with "couldn't connect".
+- Calls that would reach outside the jail fail cleanly: sockets, `fork`/`exec`/`popen`,
+  `dlopen`, `shm*`. File paths (`INNAIT_HOME`, `/tmp/Precision_Biometric`) resolve to a
+  per-run scratch directory.
+- **Allow-listed PKCS#11.** The host calls only `C_Initialize`, `C_GetSlotList`,
+  `C_GetTokenInfo`, `C_OpenSession`, `C_Login(CKU_USER)`, `C_FindObjects*`,
+  `C_GetAttributeValue` (certificate value, label, id, key type), `C_SignInit`/`C_Sign`
+  (`CKM_RSA_PKCS`, `CKM_RSA_PKCS_PSS`, `CKM_ECDSA` on a digest Sigillum computed),
+  `C_Logout`, `C_CloseSession` and `C_Finalize`. Never `C_InitToken`, `C_InitPIN`,
+  `C_SetPIN`, object creation or deletion, key generation, or any `C_InnaIT*`. The token
+  locks after 8 wrong PINs, so the sheet shows the remaining tries the module reports.
+- **The PIN** goes from sigillum-ui's secure input to sigillumd, then to the host. The module
+  caches the PIN in its own memory, so the host lives for one ceremony, or for the opt-in
+  5-minute window (§17, decision 7). Then it logs out and exits.
+- **Interface.** The driver socket and records are the same as sigillum-fido's, with token
+  records added: list certificates, sign a digest. The broker, the sheet and the
+  courier's `CertificateVerify` (§9.3) don't care whether a card is PIV or driven by its
+  vendor module.
+- **Rules,** as for Widevine: the vendor package is never committed or run in CI. The user
+  installs it through an install route that checks a known sha256. We don't patch the
+  module, and we don't disassemble it any further than the call map we already have.
+
+**Plan.**
+
+1. **P1.** Grow the Hospes shim to the module's libc imports. Add the libstdc++ route:
+   load real libstdc++ and libgcc_s, and cover their imports.
+2. **P2.** `SCard*` over `sigillum-ccid`. The CCID transport is built: descriptor, bulk
+   messages, ATR, APDUs, chaining, with 15 host tests on this token's real descriptor and
+   ATR.
+3. **P3.** The `sigillum-p11` host, the allow-list and the token records in sigillumd.
+4. **P4.** A gate on an amd64 guest with the real token passed through from the Mac, by
+   QEMU `usb-host` or by APDU forwarding (`ccid-card-passthru`). It signs a digest, and
+   the signature verifies against the token's certificate. Generic PIV over the same
+   transport follows for YubiKey-class tokens.
+
 ## 17. Decisions, with recommendations
 
 **Accepted by Shankar, 2026-11-13: all eleven, as recommended.**
