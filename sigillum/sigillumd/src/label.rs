@@ -20,7 +20,8 @@ impl AppId {
 pub enum Label {
     /// A launched app, with the RP IDs its manifest's `identity.webauthn`
     /// declared and Opifex verified at install.
-    App { app: AppId, rp_ids: Vec<String> },
+    /// `user` is the owning user the launch registry names.
+    App { user: String, app: AppId, rp_ids: Vec<String> },
     /// arcad, by its fixed uid.
     Arca,
     /// ostiarius, by its fixed uid.

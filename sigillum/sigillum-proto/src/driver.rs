@@ -9,6 +9,8 @@ use zeroize::Zeroizing;
 use crate::client::CeremonyId;
 
 pub const MAX_MESSAGE: usize = 8 * 1024;
+/// Where drivers connect to `sigillumd`; only `_sigillum-dev` is served.
+pub const SOCKET: &str = "/atrium/sockets/sigillum-dev/drivers.sock";
 
 pub mod cap {
     pub const NAME: usize = 64;

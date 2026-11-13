@@ -12,6 +12,12 @@
 //! valid P-256 point. Attestation leaves as `none` with a zero AAGUID.
 #![forbid(unsafe_code)]
 
+pub mod serve;
+pub use serve::serve;
+
+use std::cell::RefCell;
+use std::rc::Rc;
+
 use sha2::{Digest, Sha256};
 use sigillum_ctap::authdata::flags;
 use sigillum_ctap::client::Client;
@@ -32,7 +38,30 @@ pub struct Driver<D: HidDevice> {
     /// How many polls before giving up on a touch (the broker's ceremony
     /// limit usually ends it first, with a cancel).
     pub u2f_polls: u32,
+    touch: Rc<RefCell<Touch>>,
 }
+
+/// "Touch your key" once per request: on CTAP2's `UPNEEDED` keepalive or
+/// U2F's first "conditions not satisfied".
+#[derive(Default)]
+struct Touch {
+    hook: Option<Box<dyn FnMut()>>,
+    said: bool,
+}
+
+impl Touch {
+    fn needed(&mut self) {
+        if !self.said {
+            self.said = true;
+            if let Some(f) = self.hook.as_mut() {
+                f();
+            }
+        }
+    }
+}
+
+/// CTAPHID keepalive status: waiting for the user's touch.
+const KEEPALIVE_UPNEEDED: u8 = 2;
 
 fn map_err(e: Error) -> DriverError {
     match e {
@@ -52,6 +81,13 @@ impl<D: HidDevice> Driver<D> {
     /// `INIT` and `GetInfo`; the `Hello` record for `sigillumd`.
     pub fn open(dev: D, vendor: u16, product: u16, name: &str) -> Result<(Driver<D>, FromDriver), Error> {
         let mut client = Client::open(dev)?;
+        let touch = Rc::new(RefCell::new(Touch::default()));
+        let t = touch.clone();
+        client.on_keepalive = Some(Box::new(move |s| {
+            if s == KEEPALIVE_UPNEEDED {
+                t.borrow_mut().needed();
+            }
+        }));
         if !client.ctap2() {
             let hello = FromDriver::Hello {
                 class: DeviceClass::Fido,
@@ -67,7 +103,7 @@ impl<D: HidDevice> Driver<D> {
                     hmac_secret: false,
                 }),
             };
-            return Ok((Driver { client, info: None, u2f_poll: std::time::Duration::from_millis(200), u2f_polls: 150 }, hello));
+            return Ok((Driver { client, info: None, u2f_poll: std::time::Duration::from_millis(200), u2f_polls: 150, touch }, hello));
         }
         let info = client.get_info()?;
         let opt = |k| info.option(k).unwrap_or(false);
@@ -86,7 +122,7 @@ impl<D: HidDevice> Driver<D> {
                 hmac_secret: ext("hmac-secret"),
             }),
         };
-        Ok((Driver { client, info: Some(info), u2f_poll: std::time::Duration::from_millis(200), u2f_polls: 150 }, hello))
+        Ok((Driver { client, info: Some(info), u2f_poll: std::time::Duration::from_millis(200), u2f_polls: 150, touch }, hello))
     }
 
     /// Run one request to its record. Nothing here blocks on the user
@@ -96,7 +132,14 @@ impl<D: HidDevice> Driver<D> {
         self.client.cancel.clone()
     }
 
+    /// Called (at most once per request) when the authenticator waits for
+    /// a touch; the daemon turns it into a `NeedTouch` record.
+    pub fn on_touch(&mut self, f: impl FnMut() + 'static) {
+        self.touch.borrow_mut().hook = Some(Box::new(f));
+    }
+
     pub fn handle(&mut self, req: ToDriver) -> Option<FromDriver> {
+        self.touch.borrow_mut().said = false;
         let out = self.handle_inner(req);
         // A cancel that arrived for this request is spent now.
         self.client.cancel.store(false, std::sync::atomic::Ordering::SeqCst);
@@ -268,7 +311,10 @@ impl<D: HidDevice> Driver<D> {
             }
             match self.client.msg(apdu) {
                 Ok((b, u2f::sw::OK)) => return Ok(b),
-                Ok((_, u2f::sw::CONDITIONS_NOT_SATISFIED)) => std::thread::sleep(self.u2f_poll),
+                Ok((_, u2f::sw::CONDITIONS_NOT_SATISFIED)) => {
+                    self.touch.borrow_mut().needed();
+                    std::thread::sleep(self.u2f_poll)
+                }
                 Ok((_, u2f::sw::WRONG_DATA)) => return Err(DriverError::NoCredentials),
                 Ok(_) => return Err(DriverError::Device),
                 Err(e) => return Err(map_err(e)),

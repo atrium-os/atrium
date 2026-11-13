@@ -124,7 +124,7 @@ a list of devices or a raw APDU channel.
 
 | process | user (proposed uid) | jail | holds | parses device data |
 |---|---|---|---|---|
-| `sigillumd` | `_sigillum` (65028) | own; no devices, no network; `allow.mlock`; Capsicum after start | client socket, one socketpair per driver, its links to arcad, ostiarius, `sigillum-ui`, the launch registry read-only | only the fixed records of §14.2 |
+| `sigillumd` | `_sigillum` (65028) | own; no devices, no network; `allow.mlock`; Capsicum after start | client socket, the driver socket (one connection per driver), the UI socket, its links to arcad, ostiarius, `sigillum-ui`, the launch registry read-only | only the fixed records of §14.2 |
 | `sigillum-fido` | `_sigillum-dev` (65029) | one jail per device, devfs ruleset 27 `atrium_identity` showing **only that device's node**; no network | one `hidraw` fd (or a BLE channel fd from vinculumd) | yes: CTAPHID, CBOR, COSE keys, authenticator data |
 | `sigillum-ccid` | `_sigillum-dev` (65029) | as above, the reader's `ugen` nodes only | one reader | yes: CCID, ATR, APDUs, PIV/OpenPGP objects, X.509 certificates on the card |
 | `sigillum-bio` | `_sigillum-dev` (65029) | as above | one sensor; for host-matching sensors, the templates Arca releases to it (§11.3) | yes: the sensor protocol, images on host-matching sensors |
@@ -142,13 +142,17 @@ a list of devices or a raw APDU channel.
 - **sysfil** (jail-sysfil.md): a new profile `device` = `base` plus `ioctl` limited to the
   node's own ioctls (`HIDIOCGRDESC`, `HIDIOCGRDESCSIZE`, `HIDIOCGRAWINFO`, `HIDIOCGRAWNAME`
   for hidraw; the `USB_*` transfer and interface ioctls for ugen), no `socket` except the
-  inherited socketpair, no `open` after start (Capsicum). `sigillumd` and `sigillum-ui` take
+  inherited driver connection, no `open` after start (Capsicum). `sigillumd` and `sigillum-ui` take
   the `base` profile.
 - **Who starts what.** `sigillumd` and `sigillum-ui` are services.d manifests started before
   the login screen (the lock screen and Vestibulum need them). Drivers are started per
-  device by portcullisd on a devevents classification (§5), each with one end of a
-  socketpair whose other end goes to `sigillumd` (peer uid `_sigillum-dev` checked), as
-  portcullisd does for `vinculum-hci`. A driver that exits loses its device's state; its
+  device by portcullisd on a devevents classification (§5). portcullisd connects to
+  `sigillumd`'s driver socket itself (peer uid root, the launcher) and hands the connected
+  socket to the driver as fd 3, so the jail holds a socket but no socket path and no
+  `connect` (amended in S2c; the first draft had portcullisd pass `sigillumd` one end of a
+  socketpair, which needs an fd-passing link to `sigillumd` for no gain). A driver started
+  by hand for development connects with `--connect` and is served by its peer uid
+  `_sigillum-dev`. A driver that exits loses its device's state; its
   ceremonies fail with `DEVICE_GONE` and the supervisor does not restart it until the device
   is replugged or re-enumerated.
 
@@ -263,7 +267,7 @@ connection and resolves it:
 | arcad | fixed uid `_arca` (65020) | `VERIFY_USER`; it is the platform authenticator for §9.2 |
 | ostiarius | fixed uid (`_ostiarius`) | unlock and enrolment ops (§12) |
 | `sigillum-ui` | fixed uid `_sigillum-ui` | answers to prompts it was shown |
-| drivers | `_sigillum-dev`, only on the socketpair portcullisd made | §14.2 records |
+| drivers | on the driver socket only: peer uid root (portcullisd connected for the jailed driver) or `_sigillum-dev`; first record `Hello`, exactly once | §14.2 records |
 
 A uid with no label gets `UNKNOWN_PEER` and the connection is closed.
 
@@ -503,7 +507,7 @@ Every refusal is one of `Denied`, `NotAllowed` (user or timeout), `UnknownPeer`,
 
 ### 14.2 Drivers ↔ `sigillumd`
 
-Over the socketpair, `u32 LE length | postcard`, at most 8 KiB. The driver's records are
+Over the driver connection, `u32 LE length | postcard`, at most 8 KiB. The driver's records are
 the only device-derived data `sigillumd` reads, and every field is capped:
 
 - `Hello { class, vendor, product, name (≤ 64 bytes), caps }` — caps for FIDO from
@@ -589,6 +593,50 @@ otherwise passes the blobs on without reading them.
   `sigillum-ui`, frescod's `IDENTITY` purpose, the hidraw binary and its jail, U2F-only
   keys, real-key traces. Everything so far has been tested only against our own soft key,
   so a spec misreading shared by both sides would not show; a real key in S2 is the check.
+
+### 16.2 As built: S2, so far (2026-11-13)
+
+- **S2a, HID classification** (`atrium-devevents/src/hidclass.rs`, commit `5fc598e`):
+  parses devd's hidbus and hidraw lines and decides, per hidbus, whether its hidraw node is
+  input, identity (any top-level collection on usage page `0xF1D0`) or unknown. `tactusd`
+  now skips identity devices itself. Hiding hidraw by default in devfs is S2d.
+- **S2b, the `sigillum-fido` binary** (`4601448`): opens one `/dev/hidrawN`, reads vendor,
+  product and name with the hidraw ioctls, enters Capsicum, says `Hello`, serves. U2F-only
+  keys work (register and sign through `CTAPHID_MSG`, mapped to WebAuthn shapes), which is
+  what QEMU's `u2f-emulated` offers the VM gate. A broker `Cancel` reaches the key as
+  `CTAPHID_CANCEL` within 100 ms.
+- **S2c, the daemon** (`sigillumd/src/daemon.rs`, `resolve.rs`, `bin/sigillumd.rs`):
+  - Three sockets: clients (0666; label from the peer uid at accept, through the launch
+    registry, read fresh per connection), drivers (peer uid root or `_sigillum-dev`;
+    `Hello` first and once, or dropped; at most 8), the trusted UI (peer uid
+    `_sigillum-ui`, one at a time). Reader thread per connection, one thread owns the
+    broker and every write; writes time out at 2 s and drop the peer; a malformed or
+    oversized message drops the peer.
+  - With no UI connected a ceremony ends at once with `NotAllowed`; when the UI leaves,
+    every ceremony ends. The sheet lists only FIDO devices for WebAuthn sheets.
+  - The UI wire (`sigillum-proto/src/ui.rs`): `Show`, `AskPin`, `Touch`, `AskPasscode`,
+    `Close` to the UI; `Press` (with frescod's verdict on the press token), `Pin`,
+    `Passcode` back.
+  - The driver turns the key's `UPNEEDED` keepalive (or U2F's first "conditions not
+    satisfied") into one `NeedTouch` per request, which becomes the sheet's "touch your
+    key".
+  - Resolver choices, all fail-closed: unsigned apps are unknown (a private RP ID is keyed
+    by publisher, so all-zero would merge every unsigned app); a system uid also in the
+    launch registry is unknown; session components are unknown; apps get **no web RP IDs
+    yet**, only their private one, because Opifex does not verify `identity.webauthn`
+    (§13) yet.
+  - Passcode checks go through a `Passcode` trait; until S4 wires ostiarius every passcode
+    is refused, so `VerifyUser` cannot succeed yet.
+  - Hardening: no core dumps, not traceable (`PROC_TRACE_CTL`), before anything else.
+  - Gate (`sigillumd/tests/daemon.rs`): the real daemon on real sockets, the driver's real
+    serve loop over the soft key, a scripted UI and a client, in one process: register with
+    PIN, then assert with UV; the UI sees the sheets, the PIN ask, the touch prompt and the
+    closes. Refusals: no UI, UI leaving mid-ceremony, wrong uids on the driver and UI
+    sockets, a driver that skips or repeats `Hello`, an oversized client message. 43 host
+    tests in the workspace; the FreeBSD target type-checks.
+- **Not yet:** S2d (devfs, jails, uids, manifests), S2e (the VM gate), S2f (`sigillum-ui`
+  and frescod's `IDENTITY` purpose), Capsicum in `sigillumd` itself (it reads the launch
+  registry per connection; a pre-opened directory fd comes with S2d).
 
 ## 17. Decisions, with recommendations
 

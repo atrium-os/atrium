@@ -8,6 +8,9 @@ license.workspace = true
 [dependencies]
 sigillum-proto = { path = "../sigillum-proto" }
 sha2 = { workspace = true }
+portcullis-peer = { path = "../../portcullis/portcullis-peer" }
+libc = "0.2"
+serde = { workspace = true }
 
 [dev-dependencies]
 sigillum-fido = { path = "../sigillum-fido" }

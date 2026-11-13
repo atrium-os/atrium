@@ -5,8 +5,12 @@
 //! with no network. It inherits one end of a socketpair to `sigillumd`.
 //!
 //! ```text
-//! sigillum-fido --dev /dev/hidrawN [--socket-fd 3]
+//! sigillum-fido --dev /dev/hidrawN [--socket-fd 3 | --connect PATH]
 //! ```
+//!
+//! `--connect` dials `sigillumd`'s driver socket
+//! (`/atrium/sockets/sigillum-dev/drivers.sock`), where the broker checks
+//! the peer uid is `_sigillum-dev`; `--socket-fd` takes an inherited end.
 //!
 //! It opens the node, reads the vendor and product, enters Capsicum
 //! capability mode (no new files or sockets from then on), says `Hello`,
@@ -19,14 +23,10 @@ use std::io::{Read, Write};
 use std::os::fd::{AsRawFd, FromRawFd};
 use std::os::unix::net::UnixStream;
 use std::process::ExitCode;
-use std::sync::atomic::Ordering;
-use std::sync::mpsc;
 
 use sigillum_ctap::hid::{HidDevice, REPORT};
 use sigillum_ctap::Error;
 use sigillum_fido::Driver;
-use sigillum_proto::driver::{FromDriver, ToDriver, MAX_MESSAGE};
-use sigillum_proto::{read_msg, write_msg};
 
 #[repr(C)]
 #[derive(Default)]
@@ -120,13 +120,15 @@ fn capsicum() -> std::io::Result<()> {
 fn main() -> ExitCode {
     let mut dev = None;
     let mut sock_fd: i32 = 3;
+    let mut connect: Option<String> = None;
     let mut args = std::env::args().skip(1);
     while let Some(a) = args.next() {
         match a.as_str() {
             "--dev" => dev = args.next(),
+            "--connect" => connect = args.next(),
             "--socket-fd" => sock_fd = args.next().and_then(|s| s.parse().ok()).unwrap_or(-1),
             _ => {
-                eprintln!("usage: sigillum-fido --dev /dev/hidrawN [--socket-fd N]");
+                eprintln!("usage: sigillum-fido --dev /dev/hidrawN [--socket-fd N | --connect PATH]");
                 return ExitCode::from(2);
             }
         }
@@ -147,52 +149,34 @@ fn main() -> ExitCode {
         }
     };
     let (vendor, product, name) = info(&file);
-    // SAFETY: the launcher hands us this fd and nothing else owns it.
-    let sock = unsafe { UnixStream::from_raw_fd(sock_fd) };
+    let sock = match connect {
+        // Before Capsicum: connecting is a namespace operation.
+        Some(path) => match UnixStream::connect(&path) {
+            Ok(s) => s,
+            Err(e) => {
+                eprintln!("sigillum-fido: connect {path}: {e}");
+                return ExitCode::from(1);
+            }
+        },
+        // SAFETY: the launcher hands us this fd and nothing else owns it.
+        None => unsafe { UnixStream::from_raw_fd(sock_fd) },
+    };
     if let Err(e) = capsicum() {
         eprintln!("sigillum-fido: cap_enter: {e}");
         return ExitCode::from(1);
     }
-    let (mut driver, hello) = match Driver::open(Hidraw(file), vendor, product, &name) {
+    let (driver, hello) = match Driver::open(Hidraw(file), vendor, product, &name) {
         Ok(x) => x,
         Err(e) => {
             eprintln!("sigillum-fido: {dev}: {e}");
             return ExitCode::from(1);
         }
     };
-    let mut out = match sock.try_clone() {
-        Ok(s) => s,
+    match sigillum_fido::serve(driver, hello, sock) {
+        Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
-            eprintln!("sigillum-fido: {e}");
-            return ExitCode::from(1);
-        }
-    };
-    if write_msg(&mut out, &hello, MAX_MESSAGE).is_err() {
-        return ExitCode::from(1);
-    }
-
-    // The reader thread: cancels take effect at once, work goes to main.
-    let cancel = driver.cancel_flag();
-    let (tx, rx) = mpsc::channel::<ToDriver>();
-    let mut input = sock;
-    std::thread::spawn(move || loop {
-        match read_msg::<ToDriver>(&mut input, MAX_MESSAGE) {
-            Ok(Some(ToDriver::Cancel { .. })) => cancel.store(true, Ordering::SeqCst),
-            Ok(Some(m)) => {
-                if tx.send(m).is_err() {
-                    return;
-                }
-            }
-            _ => return, // EOF or a malformed message: the broker is gone
-        }
-    });
-
-    for req in rx {
-        let Some(rec) = driver.handle(req) else { continue };
-        let gone = matches!(rec, FromDriver::Error { error: sigillum_proto::driver::DriverError::Gone, .. });
-        if write_msg(&mut out, &rec, MAX_MESSAGE).is_err() || gone {
-            break;
+            eprintln!("sigillum-fido: {dev}: socket: {e}");
+            ExitCode::from(1)
         }
     }
-    ExitCode::SUCCESS
 }

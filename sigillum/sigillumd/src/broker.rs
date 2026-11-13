@@ -43,27 +43,13 @@ const AT: u8 = 0x40;
 
 #[derive(Debug, Clone)]
 pub struct Config {
-    /// `SIGILLUM_WEB_BROKER`: the one app that may name any RP ID.
-    pub web_broker: crate::label::AppId,
+    /// `SIGILLUM_WEB_BROKER`: the one app that may name any RP ID; `None`,
+    /// no app may.
+    pub web_broker: Option<crate::label::AppId>,
     pub ceremony_ms: u64,
 }
 
-/// What `sigillum-ui` shows. `requester` comes from the label; `rp_id` is
-/// what the ceremony will be bound to.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum Sheet {
-    Register { requester: String, rp_id: String, user_name: String },
-    Assert { requester: String, rp_id: String },
-    Verify { requester: String, user: String, purpose: Purpose },
-}
-
-/// What the user chose on the sheet.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Choice {
-    Device(DeviceId),
-    Passcode,
-    Cancel,
-}
+pub use sigillum_proto::ui::{Choice, Sheet};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Action {
@@ -128,7 +114,7 @@ fn refused(conn: ConnId, ceremony: CeremonyId, reason: Refusal) -> Action {
 
 fn requester(label: &Label, cfg: &Config) -> String {
     match label {
-        Label::App { app, .. } if *app == cfg.web_broker => "Navigator".into(),
+        Label::App { app, .. } if Some(app) == cfg.web_broker.as_ref() => "Navigator".into(),
         Label::App { app, .. } => app.app_id.clone(),
         Label::Arca => "Arca".into(),
         Label::Ostiarius => "Lock screen".into(),
@@ -148,14 +134,14 @@ impl Broker {
     /// May this label run a WebAuthn ceremony for this RP ID?
     fn may_use_rp(&self, label: &Label, rp_id: &str) -> Result<(), Refusal> {
         match label {
-            Label::App { app, .. } if *app == self.cfg.web_broker => {
+            Label::App { app, .. } if Some(app) == self.cfg.web_broker.as_ref() => {
                 if valid_domain(rp_id) {
                     Ok(())
                 } else {
                     Err(Refusal::Malformed)
                 }
             }
-            Label::App { app, rp_ids } => {
+            Label::App { app, rp_ids, .. } => {
                 if rp_id == app.private_rp() || (valid_domain(rp_id) && rp_ids.iter().any(|r| r == rp_id)) {
                     Ok(())
                 } else {
@@ -439,6 +425,20 @@ impl Broker {
             out.retain(|a| !matches!(a, Action::Reply { .. }));
         }
         out
+    }
+
+    /// End one ceremony from outside: no trusted UI to show its sheet, or
+    /// the UI went away.
+    pub fn abort(&mut self, key: Key, why: &str) -> Vec<Action> {
+        let Some(c) = self.ceremonies.get(&key) else { return Vec::new() };
+        let id = c.id;
+        self.end(key, Reply::Refused { ceremony: id, reason: Refusal::NotAllowed }, why)
+    }
+
+    /// End every ceremony (the trusted UI disconnected).
+    pub fn abort_all(&mut self, why: &str) -> Vec<Action> {
+        let keys: Vec<Key> = self.ceremonies.keys().copied().collect();
+        keys.into_iter().flat_map(|k| self.abort(k, why)).collect()
     }
 
     pub fn tick(&mut self, now: u64) -> Vec<Action> {
