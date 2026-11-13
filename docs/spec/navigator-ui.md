@@ -46,9 +46,11 @@ it already exist or are specified:
 - **Identity is the system's job, not the toolbar's.** frescod's origin strip names the page's
   origin above every window, where no app pixel can reach. The toolbar's address is a
   convenience, not the proof.
-- **The lane is visible where it applies.** The document lane, which is nearly everything, has
-  no badge: calm is the default. A region that runs site code (an island) gets a frame
-  frescod draws; a page that runs entirely in an engine says so in the toolbar and the strip.
+- **Every page says what runs for it** (asked by Shankar, 2026-11-13). A tier indicator at the
+  start of the Where field and in the origin strip reads **Static** (tier 1), **Replayed**
+  (tiers 2 and 3: the site's scripts ran once, sealed, at conversion; nothing of theirs runs
+  now) or **Live code** (tier 4: the site's JavaScript is running, in a jail). A page with an
+  island reads "Replayed · 1 live part", and the island itself gets a frame frescod draws.
 - **Apps are not pages.** An `atrium-app://` link opens a native app in its own window, after
   a consent moment, and the trail records that you went there.
 
@@ -392,21 +394,25 @@ one, and it costs no network to read later.
 
 ### 5.7 The mockups
 
-Three frames, each 1280×720, drawn by Pergola and composited by frescod:
+Four frames, each 1280×720, drawn by Pergola and composited by frescod:
 
 1. **`navigator-ui-main-light.png`**: the recommended layout. The rail with the current trail
    expanded into its path (a search, two pages, then the current page with two branches, one
    unseen), four other trails (one playing audio) and three put away; the toolbar with the
    Where field at rest (title, then the address with the registrable domain emphasised),
    presence showing *Anonymous*, Aa, Keep and More; the page at a comfortable reading width.
+   The tier chip reads **Static**, and so does the strip.
 2. **`navigator-ui-dark-prompt-island.png`**: the same page in dark, after the reader let
    atlas.example remember them (presence filled, the person glyph on the trail's row), with a
-   download asked in the prompt row and a video island framed and tagged "site code ·
-   media.example".
+   download asked in the prompt row and a video island framed and tagged "live code ·
+   media.example". The tier chip reads **Replayed · 1 live part**.
 3. **`navigator-ui-start-where.png`**: a new trail on Start with the rail collapsed to
    monograms, the Where field focused on "impl" and its suggestions open: an open trail's page
    first ("Switch to"), then kept and history pages, then the search, marked as sent only on
    Enter.
+4. **`navigator-ui-live-code.png`**: a web app running whole in the engine (a stand-in mail
+   inbox at mail.example), rail collapsed: the tier chip and the strip read **Live code** in
+   amber, and presence shows the site knows the reader.
 
 What is a stand-in: the 24 px strip is drawn by the mockup to show where frescod's own strip
 goes (headless direct mode has none); the page is a DocumentView in the mockup's own process,
@@ -431,8 +437,9 @@ every app. For the Navigator two changes are needed:
   window. frescod knows which slot child is the page (navigatord opened its connection through
   the chrome channel and set its origin), so the rule is: the focused window's origin, or if it
   has none, the origin of its single `page` slot. Proposed as a frescod change (§12).
-- **The strip carries the lane.** A page that runs whole in an engine (tier 4) shows a second
-  label, "runs site code", after the origin.
+- **The strip carries the tier** (§6.3): `static`, `replayed`, `replayed + 1 live part` or
+  `live code` after the origin, set by navigatord over the chrome channel with the origin,
+  never by the renderer.
 
 Fullscreen keeps the strip (threat model §2.11). The toolbar's address is a convenience; the
 strip is the proof, and the two always agree because both come from the broker.
@@ -457,24 +464,67 @@ This is the first-principles inversion of a browser's padlock and permission pro
 question people actually have is "does this site know it's me?", and here it has a direct,
 always-visible answer.
 
-### 6.3 Which lane: islands and engine pages
+### 6.3 What runs for this page: the tier indicator
 
-The document lane, which is the default and nearly everything, has **no badge**. Marking the
-safe state teaches people to ignore marks.
+*Asked by Shankar, 2026-11-13: "some kind of indication of the tier of the page: static, dynamic
+content recorded and replayed (both secure), vs javascript running in a sandbox (eg. gmail), to
+indicate to the user the level of security". This replaces the first draft, which marked only
+islands and engine pages and left documents unmarked.*
 
-- **An island** (legacy-web §8.1: a video player, a map, a payment field) is a separate slot
-  above the page. It gets a 1 px frame and a small tag at its top-left, **"site code"**, drawn
-  by frescod as part of a new slot kind (`island`, like `credential` draws its ring;
-  limen.md §5.1). The page can't draw over it and can't remove it. Hovering the tag says what it
-  is: "This part runs youtube.com's code in its own jail. It can't see the rest of the page."
-- **A page that runs whole in an engine** (a fat client, legacy-web §11.8.3) shows **Compatibility**
-  in the toolbar, before the Where field, and in the strip (§6.1). Its menu explains the
-  difference in one sentence and offers the document lane version if the converter produced one.
+The four tiers of legacy-web §5.3 are three different answers to the one question a person can
+act on, **"is this site's code running on my machine right now?"**:
 
-The island frame is the region-level marker the legacy-web spec asks for (§8.1: "an island
-carries the compatibility lane's indicator, not the whole page"). It also gives the unobscured
-input rule (threat model §2.9) something visible: while the page's content overlaps the frame,
-the island takes no input, and the frame is drawn dashed.
+| indicator | tiers | what it means, in the words the popover uses | colour |
+|---|---|---|---|
+| **Static** (document glyph) | 1 | "This page is text and pictures. No code from atlas.example ran to make it, and none runs now." | neutral |
+| **Replayed** (film-strip glyph) | 2, 3 | "atlas.example's scripts ran once, sealed off, to record what this page can do. What you click now replays those recordings. None of the site's code runs now." | neutral |
+| **Live code** (lightning glyph) | 4, whole page | "atlas.example's JavaScript is running now, in a jail of its own. It can't see your other pages, your files or other sites' logins. It can see what you type into this page and send it to its own site." | `warning-fg` |
+| **Replayed · 1 live part** | 1–3 with islands | the page as Replayed (or Static), plus "1 part of this page runs live code: the video player from media.example" | the live part in `warning-fg` |
+
+Tier 3 (a known script swapped for a native behaviour by its hash) is shown as Replayed: to the
+reader it is the same promise, no site code at view time, and the difference is how the
+converter got there.
+
+**Why three, and why these words.** The security difference that matters to a reader is between
+the first two and the third: in Static and Replayed no site code runs at view time, so the
+document lane's guarantees hold (no scripted timers, no scripted fetch, nothing typed leaves
+except by a form the broker builds; legacy-web §7.4). In Live code they do not. So the two safe
+tiers share the calm neutral look and differ only in their word, and Live code alone gets
+colour. People who don't care learn "amber means the site's own code is running", which is the
+one fact worth learning; people who do care get the finer word.
+
+**Where it is drawn.**
+- **In the Where field**, at its left end where browsers put the padlock: a 22 px chip with the
+  glyph and the word, drawn by the UI from the broker's report. Clicking it opens the popover
+  with the sentence above, the origins involved and, for Live code, the document lane version
+  if the converter produced one ("Read as a document instead").
+- **In the origin strip** (§6.1), after the origin, in frescod's own font: `static`,
+  `replayed`, `replayed + 1 live part`, `live code`. This is the copy no app can fake. navigatord
+  sets it with the origin over the chrome channel; the renderer never names its own tier.
+- **On each island**: a 1 px frame and a tag, "live code · media.example", drawn by frescod as
+  part of a new slot kind (`island`, as `credential` draws its ring; limen.md §5.1). The page
+  can't draw over it or remove it. While the page's content overlaps the frame the island takes
+  no input (threat model §2.9), and the frame is drawn dashed.
+- **In the rail**, a trail whose current page is Live code shows the lightning glyph after its
+  title, so a running web app is findable without opening it.
+
+**Who decides the tier.** The broker, from what it holds: a session opened from a recording
+with no transitions is Static; one with a transitions table attached (or tier-3 substitutions
+in its recording) is Replayed; a page served by an engine jail is Live code; each live island
+the broker bound adds a live part. The worker and the page never report their own tier, so a
+compromised worker can't claim Static.
+
+**It changes in front of the reader, and says so.** Progressive display (backend §4.6) shows a
+tier-1 document first and swaps in the replayed one at an idle moment, so a page can go from
+Static to Replayed while it is read; that is a step to a richer page with the same promise, and
+the chip changes without comment. A step towards Live code (an island starting, or a whole page
+handed to the engine) never happens without a press, and the chip's change is announced to
+accessibility tools.
+
+**Not a rating of the site.** The indicator says what runs, not whether the site is honest. A
+Static phishing page is still phishing; that is what the origin strip, the registrable-domain
+emphasis and Arca's exact-recipient rule are for (threat model §2.11). The popover says so in its
+last line, so "Static" is never read as "safe to give your password to".
 
 ### 6.4 What the system is asking: the prompt row (the UI)
 
@@ -597,10 +647,10 @@ and does it work?"
 | closes a tab by mistake | Ctrl-Shift-T, or it is in Earlier, exactly as it was |
 | types a search in the address bar | works; suggestions come from their own history only, and the search is sent on Enter |
 | expects to stay signed in | the first visit to a site is anonymous; signing in or pressing the site's own consent button makes the site remember them, and the toolbar shows it. This is the one habit that changes, and it is the point |
-| watches video | the video plays in a frame marked "site code"; PiP and media keys work |
-| looks for the padlock | there is none: the strip names the site, "Not private" marks `http:`, and presence says whether the site knows them |
+| watches video | the video plays in a frame marked "live code", and the page says "Replayed · 1 live part"; PiP and media keys work |
+| looks for the padlock | in its place is the tier chip (Static, Replayed, Live code); the strip names the site, "Not private" marks `http:`, and presence says whether the site knows them |
 
-The new ideas are three: the path in the rail, presence, and the island frame. Each is visible
+The new ideas are four: the path in the rail, presence, the tier chip and the island frame. Each is visible
 rather than hidden in a menu, and each answers a question people already ask ("how did I get
 here?", "am I signed in here?", "is this part different?").
 
@@ -619,8 +669,9 @@ argued further on paper.
 | navigatord | a persona in `OpenSession` and in Arca tickets | §2.4 |
 | navigatord | `Save` from the jailed host into the store on a Tessera volume (M4's open item) | §4.4 |
 | Limen (L6) | `doc-viewer` with the Navigator's worker as the child, opened by navigatord and bound into the UI's window; `LinkHover { url }` from child to parent (advisory, for showing a link's destination) | §2.1 |
-| Limen + frescod | slot kind `island`: frescod draws a 1 px frame and the "site code" tag, dashed while obscured | §6.3 |
-| frescod | origin strip follows a window's `page` slot when the window has no origin of its own; a lane label after the origin | §6.1 |
+| Limen + frescod | slot kind `island`: frescod draws a 1 px frame and the "live code" tag, dashed while obscured | §6.3 |
+| frescod | origin strip follows a window's `page` slot when the window has no origin of its own; a tier label after the origin, set with `SET_ORIGIN` | §6.1, §6.3 |
+| navigatord | a tier in each session's report (static, replayed, live code, plus live islands), derived by the broker | §6.3 |
 | Arca | partition key (persona, site); an in-memory partition for Unrecorded | §2.4 |
 | Forum | the group/split intent of forum.md §2.3 in `forum-ctl` (it has `Focus` and display intents today), used for "open beside" | §8 |
 | Pergola | a tree list widget (VirtualList rows with indentation and disclosure); a toolbar strip; the find bar (already planned) | §5.2 |
@@ -638,7 +689,7 @@ argued further on paper.
 | **D5** | Personas | one jar per site · **Personal + Unrecorded now, named personas later** · named personas now (§2.4) | **Personal + Unrecorded now.** Named ones cost only an Arca key, so they can follow when wanted |
 | **D6** | Favicons | show site favicons (decoded in the page's jail, validated) · **monograms only** (§1) | **Monograms.** No site pixels in the chrome; lookalikes can't copy a monogram any better than the name |
 | **D7** | UI processes | **one per user session** · one per window (§2.3) | **One per session.** It holds nothing worth isolating per window, and the switch is cheap later |
-| **D8** | Lane markers | **none for documents; frescod-drawn frame on islands; toolbar + strip for engine pages** · a badge on every page (§6.3) | **As described.** Marking the default state teaches people to ignore marks |
+| **D8** | Tier indicator (revised 2026-11-13 at Shankar's ask) | **three words on every page: Static, Replayed, Live code**, plus live parts and island frames · four tiers shown as numbers · two states only, safe and live (§6.3) | **Three words.** Static and Replayed share the calm look because neither runs site code now; Live code alone gets colour |
 
 Settled by earlier decisions and only applied here: the chrome is a Pergola app in the trusted
 UI process (pergola.md §10.4); pages are jailed document surfaces in Limen slots; the origin

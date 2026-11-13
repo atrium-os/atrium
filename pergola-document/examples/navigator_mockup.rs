@@ -51,6 +51,9 @@ mod ph {
     pub const PUSH_PIN: char = '\u{e3e2}';
     pub const BOOKMARK: char = '\u{e0ea}';
     pub const EYE_SLASH: char = '\u{e224}';
+    pub const FILE_TEXT: char = '\u{e23a}';
+    pub const FILM_STRIP: char = '\u{e792}';
+    pub const LIGHTNING: char = '\u{e2de}';
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -58,6 +61,7 @@ enum Mode {
     Main,
     Dark,
     Start,
+    Live,
 }
 
 struct Mock {
@@ -120,7 +124,10 @@ fn strip(ctx: &mut Ctx, origin: &str, lane: Option<&str>) {
     rect(ctx, 0.0, 0.0, W, STRIP, Color::from_hex("#4E4F58"), 0.0);
     rect(ctx, 4.0, 4.0, 2.0, 16.0, Color::from_hex("#6CC4F5"), 0.0);
     let st = TextStyle { family: font::MONO.into(), size: 13.0, weight: Weight::Regular, color: Color::from_hex("#F2F4F6") };
-    let lane_st = TextStyle { color: Color::from_hex("#E2B45C"), ..st.clone() };
+    // Live code in the warning colour; the two kinds where no site code
+    // runs on this machine (static, replayed) in a quiet neutral.
+    let live = lane.map_or(false, |l| l.contains("live"));
+    let lane_st = TextStyle { color: Color::from_hex(if live { "#E2B45C" } else { "#A8B0B8" }), ..st.clone() };
     let mut runs = vec![(origin, st)];
     if let Some(l) = lane {
         runs.push((l, lane_st));
@@ -265,25 +272,31 @@ fn toolbar(ctx: &mut Ctx, x0: f32, mode: Mode) {
         rect(ctx, fx + 57.0, top + 11.0, 1.0, 18.0, t.text_primary(), 0.0);
     } else {
         boxed(ctx, fx, top + 6.0, fw, 28.0, t.border_default(), t.bg_canvas(), 6.0);
+        let tx = fx + 4.0 + tier_chip(ctx, fx + 4.0, top + 9.0, mode) + 10.0;
+        let (title, domain, path) = match mode {
+            Mode::Live => ("Inbox (3)", "mail.example", "/inbox"),
+            _ => ("Atrium (architecture)", "atlas.example", "/wiki/Atrium_(architecture)"),
+        };
         let y = top + 20.0 - type_size::SM * 0.5;
-        let r = ctx.push(Node::stack(Axis::Horizontal, Rect::new(fx + 12.0, y, 0.0, 0.0), 8.0));
+        let r = ctx.push(Node::stack(Axis::Horizontal, Rect::new(tx, y, 0.0, 0.0), 8.0));
         ctx.set_flex(r, FlexStyle { align: Align::Baseline, ..FlexStyle::default() });
-        ctx.add(Node::Text { rect: Rect::ZERO_SIZED, content: "Atrium (architecture)".into(), style: body(t.text_primary(), Weight::Medium) });
+        ctx.add(Node::Text { rect: Rect::ZERO_SIZED, content: title.into(), style: body(t.text_primary(), Weight::Medium) });
         ctx.add(Node::Text { rect: Rect::ZERO_SIZED, content: "·".into(), style: body(t.text_tertiary(), Weight::Regular) });
         let a = ctx.push(Node::stack(Axis::Horizontal, Rect::ZERO_SIZED, 0.0));
         ctx.set_flex(a, FlexStyle { align: Align::Baseline, ..FlexStyle::default() });
-        ctx.add(Node::Text { rect: Rect::ZERO_SIZED, content: "atlas.example".into(), style: body(t.text_primary(), Weight::Semibold) });
-        ctx.add(Node::Text { rect: Rect::ZERO_SIZED, content: "/wiki/Atrium_(architecture)".into(), style: body(t.text_tertiary(), Weight::Regular) });
+        ctx.add(Node::Text { rect: Rect::ZERO_SIZED, content: domain.into(), style: body(t.text_primary(), Weight::Semibold) });
+        ctx.add(Node::Text { rect: Rect::ZERO_SIZED, content: path.into(), style: body(t.text_tertiary(), Weight::Regular) });
         ctx.pop();
         ctx.pop();
     }
 
     // Presence, then Aa, Keep, More.
     let px = fx + fw + 12.0;
-    if mode == Mode::Dark {
+    if mode == Mode::Dark || mode == Mode::Live {
         boxed(ctx, px, top + 6.0, 112.0, 28.0, t.accent_mark(), t.accent_bg(), 14.0);
         icon(ctx, px + 9.0, top + 12.0, ph::USER, 16.0, t.accent_strong());
-        text(ctx, px + 29.0, top + 20.0, "atlas.example", type_size::XS, Weight::Semibold, t.accent_strong());
+        let who = if mode == Mode::Live { "mail.example" } else { "atlas.example" };
+        text(ctx, px + 29.0, top + 20.0, who, type_size::XS, Weight::Semibold, t.accent_strong());
     } else if !start {
         boxed(ctx, px, top + 6.0, 112.0, 28.0, t.border_default(), t.bg_surface(), 14.0);
         icon(ctx, px + 9.0, top + 12.0, ph::EYE_SLASH, 16.0, t.text_secondary());
@@ -292,6 +305,58 @@ fn toolbar(ctx: &mut Ctx, x0: f32, mode: Mode) {
     icon(ctx, W - 72.0 - 28.0, top + 10.0, ph::TEXT_AA, 20.0, if start { dim } else { t.text_secondary() });
     icon(ctx, W - 72.0, top + 10.0, ph::STAR, 20.0, if start { dim } else { t.text_secondary() });
     icon(ctx, W - 40.0, top + 10.0, ph::DOTS_THREE, 20.0, t.text_secondary());
+}
+
+/// The tier indicator (navigator-ui.md §6.3), inside the Where field's left
+/// end: what runs for this page. Returns its width.
+fn tier_chip(ctx: &mut Ctx, x: f32, y: f32, mode: Mode) -> f32 {
+    let t = ctx.theme;
+    let seg = |ctx: &mut Ctx, x: f32, w: f32, g: char, label: &str, live: bool| {
+        let t = ctx.theme;
+        let (edge, fill, fg) = if live {
+            (t.warning_fg(), t.bg_canvas(), t.warning_fg())
+        } else {
+            (t.border_strong(), t.bg_surface(), t.text_secondary())
+        };
+        boxed(ctx, x, y, w, 22.0, edge, fill, 11.0);
+        icon(ctx, x + 8.0, y + 4.0, g, 14.0, fg);
+        text(ctx, x + 26.0, y + 11.0, label, type_size::XS, Weight::Semibold, fg);
+    };
+    let _ = t;
+    match mode {
+        Mode::Main => { seg(ctx, x, 70.0, ph::FILE_TEXT, "Static", false); 70.0 }
+        Mode::Dark => {
+            seg(ctx, x, 88.0, ph::FILM_STRIP, "Replayed", false);
+            seg(ctx, x + 92.0, 92.0, ph::LIGHTNING, "1 live part", true);
+            184.0
+        }
+        Mode::Live => { seg(ctx, x, 90.0, ph::LIGHTNING, "Live code", true); 90.0 }
+        Mode::Start => 0.0,
+    }
+}
+
+/// A web app running whole in the engine (tier 4): a stand-in mail inbox.
+fn mail_page() -> String {
+    let mut b = String::from(r#"<html><head><style>
+        body { margin: 20px 28px; font-size: 14px; background-color: #fafbfc; color: #22282e }
+        h1 { font-size: 20px; font-weight: 600; margin: 0px 0px 16px }
+        p { margin: 0px 0px 18px }
+        .unread { font-weight: 600 }
+        .from { color: #22282e } .snip { color: #7c858e }
+        </style></head><body><h1>Inbox</h1>"#);
+    for (u, f, s, n) in [
+        (true, "Lena Ortiz", "Survey drawings for the north wing", "The measured plans are attached; the impluvium is 40 cm deeper than the old drawing shows."),
+        (true, "Builders' guild", "Lime delivery moved to Tuesday", "The kiln was late. Same quantity, same price, two days later."),
+        (true, "Marco", "Dinner on Saturday?", "We could try the place by the river if it's warm enough to sit outside."),
+        (false, "Library", "Your hold is ready", "Vitruvius, Ten Books on Architecture, at the front desk until the 20th."),
+        (false, "Tessa Lindqvist", "Re: roof tiles", "Two pallets left over. Happy to swap them for the oak beam."),
+        (false, "Utility notice", "Water works on your street", "Supply will be off between 09:00 and 13:00 on Thursday."),
+    ] {
+        let cls = if u { "unread" } else { "" };
+        b.push_str(&format!(r#"<p class="{cls}"><span class="from">{f}</span> — {s} <span class="snip">· {n}</span></p>"#));
+    }
+    b.push_str("</body></html>");
+    b
 }
 
 /// The prompt row: asked by the Navigator, between the toolbar and the page.
@@ -341,7 +406,7 @@ fn island(ctx: &mut Ctx, x: f32, y: f32, w: f32, h: f32) {
     rect(ctx, x + 16.0, y + h - 18.0, (w - 32.0) * 0.12, 3.0, Color::from_hex("#F2F4F6"), 1.5);
     // The tag.
     rect(ctx, x - 1.0, y - 21.0, 168.0, 20.0, frame, 0.0);
-    text(ctx, x + 6.0, y - 11.0, "site code · media.example", type_size::XS, Weight::Semibold, Color::from_hex("#22282E"));
+    text(ctx, x + 6.0, y - 11.0, "live code · media.example", type_size::XS, Weight::Semibold, Color::from_hex("#22282E"));
     let _ = t;
 }
 
@@ -429,6 +494,14 @@ impl View for Mock {
                 start_page(ctx, RAIL_NARROW);
                 strip(ctx, "new trail · nothing loaded", None);
             }
+            Mode::Live => {
+                if let Some(doc) = &self.doc {
+                    doc.render(ctx);
+                }
+                rail_narrow(ctx);
+                toolbar(ctx, RAIL_NARROW, self.mode);
+                strip(ctx, "https://mail.example", Some("live code"));
+            }
             Mode::Main | Mode::Dark => {
                 if let Some(doc) = &self.doc {
                     doc.render(ctx);
@@ -439,7 +512,7 @@ impl View for Mock {
                     prompt(ctx, RAIL);
                     island(ctx, RAIL + 1.0 + 140.0, 374.0, 520.0, 272.0);
                 }
-                strip(ctx, "https://atlas.example", None);
+                strip(ctx, "https://atlas.example", Some(if self.mode == Mode::Dark { "replayed + 1 live part" } else { "static" }));
             }
         }
     }
@@ -477,6 +550,7 @@ fn main() -> std::io::Result<()> {
     let mode = match std::env::args().nth(1).as_deref() {
         Some("dark") => Mode::Dark,
         Some("start") => Mode::Start,
+        Some("live") => Mode::Live,
         _ => Mode::Main,
     };
     let dark = mode == Mode::Dark;
@@ -488,9 +562,11 @@ fn main() -> std::io::Result<()> {
         None
     } else {
         let top = STRIP + BAR + 1.0 + if dark { PROMPT } else { 0.0 };
-        let (w, h) = (W - RAIL - 1.0, H - top);
-        let d = Rc::new(RefCell::new(Doc::html(page(dark), Default::default(), w, h, dark, |_| None).map_err(std::io::Error::other)?));
-        Some(DocumentView::new(Mutable::with_dirty(ScrollState::default(), dirty.clone()), Rect::new(RAIL + 1.0, top, w, h), d, Mutable::with_dirty(0u64, dirty.clone())))
+        let left = if mode == Mode::Live { RAIL_NARROW } else { RAIL };
+        let (w, h) = (W - left - 1.0, H - top);
+        let html = if mode == Mode::Live { mail_page() } else { page(dark) };
+        let d = Rc::new(RefCell::new(Doc::html(html, Default::default(), w, h, dark, |_| None).map_err(std::io::Error::other)?));
+        Some(DocumentView::new(Mutable::with_dirty(ScrollState::default(), dirty.clone()), Rect::new(left + 1.0, top, w, h), d, Mutable::with_dirty(0u64, dirty.clone())))
     };
     let view = Mock { mode, doc };
     let mut app = App::new_with_flag(view, dirty).with_theme(if dark { Semantic::DARK } else { Semantic::LIGHT });
