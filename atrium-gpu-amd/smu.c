@@ -828,7 +828,7 @@ amd_si_attach(struct atrium_amd_softc *sc)
 {
 	struct amd_si *si;
 	const char *step = "SMU link";
-	int err, us, vm_test = 0;
+	int err, us, vm_test = 0, uq_test = 0;
 
 	si = malloc(sizeof(*si), M_DEVBUF, M_WAITOK | M_ZERO);
 	si->sc = sc;
@@ -874,6 +874,16 @@ amd_si_attach(struct atrium_amd_softc *sc)
 		err = amd_mes12_vmtest(si->mes);
 		device_printf(sc->dev, "si: VM test at attach: %s; %d CP EOP "
 		    "IV(s)\n", err == 0 ? "PASS" : "FAILED",
+		    amd_ih7_drain_eop(si->ih, 8));
+		if (err != 0)
+			goto down;
+	}
+	TUNABLE_INT_FETCH("hw.atrium_gpu.uq_test", &uq_test);
+	if (uq_test) {
+		step = "MES user queues (5c-1)";
+		err = amd_mes12_uqtest(si->mes);
+		device_printf(sc->dev, "si: user-queue test at attach: %s; %d "
+		    "CP EOP IV(s)\n", err == 0 ? "PASS" : "FAILED",
 		    amd_ih7_drain_eop(si->ih, 8));
 		if (err != 0)
 			goto down;

@@ -833,6 +833,7 @@ struct amd_gart {
 	void	*dummy;
 	vm_paddr_t dummy_phys;
 	bool	enabled;
+	u_int	vm_slices;		/* VRAM page-table pool slices in use */
 };
 int	amd_gmc12_gart_enable(struct atrium_amd_softc *sc,
 	    struct resource *vram, struct amd_gart *gt);
@@ -847,6 +848,8 @@ struct amd_vm12 {
 	int	mode;			/* AMD_VM12_* */
 	uint64_t flat_va;		/* AMD_VM12_FLAT: window base */
 	u_int	used;			/* tables handed out; 0 is the root */
+	u_int	slice, first;		/* VRAM pool slice, its first table */
+	bool	live;
 	bool	translate_further;	/* GC's PDE format variant */
 	void	*sys[64];		/* AMD_VM12_4L_SYS tables */
 	vm_paddr_t sys_pa[64];
@@ -875,6 +878,7 @@ bool	amd_gmc12_fault_take(struct amd_gart *gt, uint32_t *status,
 void	amd_gmc12_fault_decode(struct amd_gart *gt, uint32_t st,
 	    const char *when);
 u_int	amd_gmc12_fault_vmid(uint32_t status);
+uint32_t amd_gmc12_ctx_cntl(struct amd_gart *gt, u_int vmid);
 int	amd_ih7_test(struct atrium_amd_softc *sc, struct amd_gart *gt,
 	    int (*during)(struct atrium_amd_softc *, struct amd_gart *));
 struct amd_ih7;
@@ -892,6 +896,7 @@ int	amd_mes12_up(struct atrium_amd_softc *sc, struct amd_gart *gt,
 	    bool kq, struct mes **out);
 int	amd_mes12_selftest(struct mes *m);
 int	amd_mes12_vmtest(struct mes *m);	/* 5b */
+int	amd_mes12_uqtest(struct mes *m);	/* 5c-1 */
 void	amd_mes12_down(struct mes *m);
 int	amd_smu_init(struct atrium_amd_softc *sc);	/* smu.c, silicon test */
 int	amd_si_attach(struct atrium_amd_softc *sc);	/* smu.c, stage 5a */

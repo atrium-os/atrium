@@ -208,10 +208,22 @@ static const struct mes_gen mes_gens[] = {
 #define HW1_KIQ_UNMAP_TIMEOUT	52
 #define HW1_CLEANER_FENCE	64
 #define QUERY_API_STATUS	8
+#define AQ_PROCESS_ID		4
+#define AQ_PTB			8
+#define AQ_VA_START		16
+#define AQ_VA_END		24
+#define AQ_PROC_QUANTUM		32
+#define AQ_PROC_CTX		40
+#define AQ_GANG_QUANTUM		48
+#define AQ_GANG_CTX		56
+#define AQ_INPROC_PRIO		64
+#define AQ_GANG_PRIO		68
 #define AQ_DOORBELL		72
 #define AQ_MQD_ADDR		80
 #define AQ_WPTR_ADDR		88
 #define AQ_QUEUE_TYPE		112
+#define AQ_GDS_SIZE		120	/* queue size in dwords (amdgpu) */
+#define AQ_VM_CNTX_CNTL		144
 #define AQ_FLAGS		148	/* dw 37 */
 #define AQ_MAP_LEGACY_KQ	0x00002000u
 #define AQ_API_STATUS		152
@@ -219,6 +231,7 @@ static const struct mes_gen mes_gens[] = {
 #define AQ_QUEUE_ID		204
 #define QUEUE_TYPE_SCHQ		3
 #define RQ_DOORBELL		4
+#define RQ_GANG_CTX		8
 #define RQ_FLAGS		16	/* dw 4 */
 #define RQ_UNMAP_LEGACY		0x00000008u
 #define RQ_API_STATUS		24
@@ -1534,6 +1547,368 @@ out_unmap:
 	return (err);
 }
 
+/*
+ * Stage 5c, step 1: MES user queues on silicon, driven from the kernel
+ * (the fd/kqueue interface comes on top in step 2). Two "processes", each
+ * with its own four-level VM (5b) and one compute user queue added with a
+ * plain ADD_QUEUE (mes_userq_map: process and gang context pages, quanta
+ * 10 ms / 1 ms, NORMAL priority, the VM's page-table base, VA range
+ * 0..max_pfn-1, vm_context_cntl = the CONTEXT1-15 setting). MES picks the
+ * HQD and the VMID (8-15). The MQD is gfx_v12_0_compute_mqd_init for a
+ * user queue: no PRIV_STATE/KMD_QUEUE, and the ring, EOP and rptr/wptr
+ * are VAs in the process's own VM; the MQD and the context pages are in
+ * the GART, and the wptr page is aliased there for MES (wptr_mc_addr).
+ *
+ * Both processes map write_42 at the SAME VAs (UQ_VA + ...) onto their
+ * own pages. Pass: both fences, each process's out page all 42, the two
+ * queues on different VMIDs (read from the HQDs while mapped), and after
+ * REMOVE_QUEUE no HQD left active.
+ */
+#define UQ_N			2
+#define UQ_VA			0x200000000ull	/* in each process's VM */
+#define UQ_RING			0x0000u
+#define UQ_WB			0x1000u		/* rptr 0, wptr 8, fence 0x10 */
+#define UQ_EOP			0x2000u
+#define UQ_CODE			0x3000u		/* shader; IB page next */
+#define UQ_IB			0x4000u
+#define UQ_OUT			0x5000u
+#define UQ_PAGES		6u
+#define UQ_GART_VA		0x00060000ull	/* per process: 0x4000 apart */
+#define UQ_G_MQD		0x0000u
+#define UQ_G_PROC		0x1000u
+#define UQ_G_GANG		0x2000u
+#define UQ_G_WB			0x3000u		/* alias of the WB page */
+#define UQ_G_SIZE		0x4000u
+#define UQ_DOORBELL(p)		((0x10u + (p)) << 1)	/* userqueue range */
+#define UQ_SEQ			0x5c000001u
+
+struct uqp {
+	struct amd_vm12 vm;
+	uint8_t	*pg;			/* UQ_PAGES: the process's pages */
+	vm_paddr_t pg_pa;
+	uint8_t	*g;			/* MQD, process ctx, gang ctx */
+	vm_paddr_t g_pa;
+	uint64_t gva;			/* GART VA of g */
+	bool	vm_up, added;
+};
+
+static void
+grbm_select_q(struct mes *m, u_int me, u_int pipe, u_int queue)
+{
+	wr(m, m->g->grbm_gfx_cntl, (pipe & 3) | (me & 3) << 2 |
+	    (queue & 7) << 8);
+}
+
+/* gfx_v12_0_compute_mqd_init for a user queue (prop->kernel_queue false). */
+static void
+uq_mqd_init(struct uqp *u, u_int p)
+{
+	uint8_t *q = u->g + UQ_G_MQD;
+	uint64_t mqd = u->gva + UQ_G_MQD, ring = UQ_VA + UQ_RING;
+	uint64_t eop = UQ_VA + UQ_EOP, wb = UQ_VA + UQ_WB;
+	uint32_t t;
+
+	memset(q, 0, MQD_SIZE);
+	put32(q, MQD_HEADER, 0xC0310800u);
+	put32(q, MQD_PIPELINESTAT, 1);
+	put32(q, MQD_STM_SE0, ~0u);
+	put32(q, MQD_STM_SE1, ~0u);
+	put32(q, MQD_STM_SE2, ~0u);
+	put32(q, MQD_STM_SE3, ~0u);
+	put32(q, MQD_MISC_RESERVED, 7);
+	put32(q, MQD_EOP_BASE_LO, (uint32_t)(eop >> 8));
+	put32(q, MQD_EOP_BASE_HI, (uint32_t)(eop >> 40));
+	put32(q, MQD_EOP_CONTROL, (EOP_CONTROL_DEFAULT & ~0x3fu) | 8);
+	put32(q, MQD_MQD_BASE_LO, (uint32_t)mqd & 0xfffffffcu);
+	put32(q, MQD_MQD_BASE_HI, (uint32_t)(mqd >> 32));
+	put32(q, MQD_MQD_CONTROL, MQD_CONTROL_DEFAULT);	/* MQD in VMID 0 */
+	put32(q, MQD_PQ_BASE_LO, (uint32_t)(ring >> 8));
+	put32(q, MQD_PQ_BASE_HI, (uint32_t)(ring >> 40));
+	/* QUEUE_SIZE, RPTR_BLOCK_SIZE, UNORD_DISPATCH; no PRIV_STATE/KMD. */
+	t = PQ_CONTROL_DEFAULT & ~(0x3fu | 0x3f00u);
+	t |= (uint32_t)(ffs(RING_DW) - 2) | (9u << 8);
+	t |= 1u << 28;
+	put32(q, MQD_PQ_CONTROL, t);
+	put32(q, MQD_RPTR_REPORT_LO, (uint32_t)wb & 0xfffffffcu);
+	put32(q, MQD_RPTR_REPORT_HI, (uint32_t)(wb >> 32) & 0xffff);
+	put32(q, MQD_WPTR_POLL_LO, (uint32_t)(wb + 8) & 0xfffffffcu);
+	put32(q, MQD_WPTR_POLL_HI, (uint32_t)((wb + 8) >> 32) & 0xffff);
+	put32(q, MQD_DOORBELL, (UQ_DOORBELL(p) << 2) | (1u << 30));
+	put32(q, MQD_PQ_RPTR, 0);
+	put32(q, MQD_HQD_VMID, 0);			/* MES sets it */
+	put32(q, MQD_PERSISTENT, (PERSISTENT_DEFAULT & ~0x3ff00u) |
+	    (0x55u << 8));
+	put32(q, MQD_IB_CONTROL, IB_CONTROL_DEFAULT);
+	put32(q, MQD_QUANTUM, 0x111u);
+	put32(q, MQD_HQD_ACTIVE, 0);
+}
+
+static int
+uq_add(struct mes *m, struct uqp *u, u_int p)
+{
+	uint32_t pkt[API_DW];
+	uint8_t *b = (uint8_t *)pkt;
+
+	memset(pkt, 0, sizeof(pkt));
+	pkt[0] = HDR_ADD_QUEUE;
+	put32(b, AQ_PROCESS_ID, 0x100 + p);		/* a pasid-like id */
+	put64(b, AQ_PTB, amd_gmc12_vm_pd_addr(&u->vm));
+	put64(b, AQ_VA_START, 0);
+	put64(b, AQ_VA_END, (1ull << 36) - 1);		/* max_pfn - 1 */
+	put64(b, AQ_PROC_QUANTUM, 100000);		/* 10 ms */
+	put64(b, AQ_PROC_CTX, u->gva + UQ_G_PROC);
+	put64(b, AQ_GANG_QUANTUM, 10000);		/* 1 ms */
+	put64(b, AQ_GANG_CTX, u->gva + UQ_G_GANG);
+	put32(b, AQ_INPROC_PRIO, 1);			/* NORMAL */
+	put32(b, AQ_GANG_PRIO, 1);
+	put32(b, AQ_DOORBELL, UQ_DOORBELL(p));
+	put64(b, AQ_MQD_ADDR, u->gva + UQ_G_MQD);
+	put64(b, AQ_WPTR_ADDR, u->gva + UQ_G_WB + 8);
+	put32(b, AQ_QUEUE_TYPE, QUEUE_TYPE_COMPUTE);
+	put32(b, AQ_GDS_SIZE, RING_DW);
+	put32(b, AQ_VM_CNTX_CNTL, amd_gmc12_ctx_cntl(m->gt, 8));
+	return (mes_api(m, 0, pkt, AQ_API_STATUS, "ADD_QUEUE (user compute)"));
+}
+
+static int
+uq_remove(struct mes *m, struct uqp *u, u_int p)
+{
+	uint32_t pkt[API_DW];
+	uint8_t *b = (uint8_t *)pkt;
+
+	memset(pkt, 0, sizeof(pkt));
+	pkt[0] = HDR_REMOVE_QUEUE;
+	put32(b, RQ_DOORBELL, UQ_DOORBELL(p));
+	put64(b, RQ_GANG_CTX, u->gva + UQ_G_GANG);
+	put32(b, RQ_QUEUE_TYPE, QUEUE_TYPE_COMPUTE);
+	return (mes_api(m, 0, pkt, RQ_API_STATUS,
+	    "REMOVE_QUEUE (user compute)"));
+}
+
+/*
+ * Every MEC1 compute HQD (pipes 0-1, queues 0-3): active ones with their
+ * VMID and doorbell. Returns how many are active; vmids[] gets the VMID
+ * of the HQD whose doorbell is UQ_DOORBELL(p).
+ */
+static u_int
+uq_hqd_scan(struct mes *m, const char *when, u_int *vmids)
+{
+	const struct mes_gen *g = m->g;
+	uint32_t act, vmid, db;
+	u_int pipe, q, p, n = 0;
+
+	for (pipe = 0; pipe < 2; pipe++)
+		for (q = 0; q < 4; q++) {
+			grbm_select_q(m, 1, pipe, q);
+			act = rd(m, g->hqd_active) & 1;
+			vmid = rd(m, g->hqd_vmid) & 0xf;
+			db = rd(m, g->hqd_doorbell);
+			if (!act)
+				continue;
+			n++;
+			device_printf(m->sc->dev, "uq: %s: HQD me1 pipe %u queue "
+			    "%u active, VMID %u, doorbell %#x\n", when, pipe, q,
+			    vmid, db);
+			for (p = 0; p < UQ_N && vmids != NULL; p++)
+				if (((db >> 2) & 0x03ffffff) == UQ_DOORBELL(p))
+					vmids[p] = vmid;
+		}
+	grbm_select_q(m, 0, 0, 0);
+	return (n);
+}
+
+static int
+uq_setup(struct mes *m, struct uqp *u, u_int p)
+{
+	struct amd_gart *gt = m->gt;
+	const u_int rwx = AMD_VM_READ | AMD_VM_WRITE | AMD_VM_EXEC;
+	u_int i;
+	int err;
+
+	u->pg = contigmalloc(UQ_PAGES * PAGE_SIZE, M_DEVBUF, M_WAITOK | M_ZERO,
+	    0, ~(vm_paddr_t)0, PAGE_SIZE, 0);
+	u->pg_pa = vtophys(u->pg);
+	u->g = contigmalloc(UQ_G_SIZE, M_DEVBUF, M_WAITOK | M_ZERO, 0,
+	    ~(vm_paddr_t)0, PAGE_SIZE, 0);
+	u->g_pa = vtophys(u->g);
+	u->gva = gt->gart_start + UQ_GART_VA + (uint64_t)p * UQ_G_SIZE;
+	memcpy(u->pg + UQ_CODE, w42_shader, sizeof(w42_shader));
+	memcpy(u->pg + UQ_IB, w42_ib_uq, sizeof(w42_ib_uq));
+	for (i = 0; i < W42_OUT_DW; i++)
+		((volatile uint32_t *)(u->pg + UQ_OUT))[i] = DISP_POISON + p;
+
+	/* GART: MQD, process ctx, gang ctx, and the WB page's alias. */
+	for (i = 0; i < 3; i++)
+		(void)amd_gmc12_gart_map(gt, u->gva + i * PAGE_SIZE,
+		    u->g_pa + i * PAGE_SIZE);
+	(void)amd_gmc12_gart_map(gt, u->gva + UQ_G_WB, u->pg_pa + UQ_WB);
+
+	/* The process's own VM: all six pages at UQ_VA. */
+	if ((err = amd_gmc12_vm_init(gt, &u->vm, AMD_VM12_4L_VRAM, 0)) != 0)
+		return (err);
+	u->vm_up = true;
+	for (i = 0; i < UQ_PAGES; i++)
+		if ((err = amd_gmc12_vm_map(&u->vm, UQ_VA + i * PAGE_SIZE,
+		    u->pg_pa + i * PAGE_SIZE, rwx)) != 0)
+			return (err);
+	uq_mqd_init(u, p);
+	device_printf(m->sc->dev, "uq: process %u: VM base %#jx (%u tables), "
+	    "pages pa %#jx, MQD GART %#jx, doorbell %#x\n", p,
+	    (uintmax_t)amd_gmc12_vm_pd_addr(&u->vm), u->vm.used,
+	    (uintmax_t)u->pg_pa, (uintmax_t)(u->gva + UQ_G_MQD),
+	    UQ_DOORBELL(p));
+	return (0);
+}
+
+/* One IB + RELEASE_MEM (no interrupt) into the user ring, then doorbell. */
+static void
+uq_kick(struct mes *m, struct uqp *u, u_int p)
+{
+	volatile uint32_t *ring = (volatile uint32_t *)(u->pg + UQ_RING);
+	uint64_t ib = UQ_VA + UQ_IB, fence = UQ_VA + UQ_WB + 0x10;
+	u_int n = 0;
+
+	ring[n++] = PKT3(IT_INDIRECT_BUFFER, 2);
+	ring[n++] = (uint32_t)ib;
+	ring[n++] = (uint32_t)(ib >> 32);
+	ring[n++] = IB_VALID | W42_IB_DW;		/* VMID from the HQD */
+	ring[n++] = PKT3(IT_RELEASE_MEM, 6);
+	ring[n++] = RM_GCR_SEQ | RM_GCR_GL2_WB | RM_CACHE_POLICY(3) |
+	    RM_EVENT_TYPE(CACHE_FLUSH_AND_INV_TS_EVENT) | RM_EVENT_INDEX(5);
+	ring[n++] = RM_DATA_SEL(1) | RM_INT_SEL(0);
+	ring[n++] = (uint32_t)fence;
+	ring[n++] = (uint32_t)(fence >> 32);
+	ring[n++] = UQ_SEQ + p;
+	ring[n++] = 0;
+	ring[n++] = 0;
+	*(volatile uint64_t *)(u->pg + UQ_WB + 8) = n;
+	wmb();
+	bus_write_8(m->dbbar, (bus_size_t)UQ_DOORBELL(p) * 4, n);
+}
+
+static int
+uq_test_run(struct mes *m)
+{
+	struct atrium_amd_softc *sc = m->sc;
+	struct amd_gart *gt = m->gt;
+	struct uqp u[UQ_N];
+	u_int p, i, us, bad[UQ_N], vmids[UQ_N], active;
+	bool fenced[UQ_N], gone = true;
+	uint32_t st;
+	uint64_t a;
+	int err = 0, e;
+
+	memset(u, 0, sizeof(u));
+	for (p = 0; p < UQ_N; p++) {
+		vmids[p] = 0xff;
+		fenced[p] = false;
+		bad[p] = W42_OUT_DW;
+	}
+	if (amd_gmc12_fault_take(gt, &st, &a))
+		device_printf(sc->dev, "uq: stale fault %#x at %#jx (cleared)\n",
+		    st, (uintmax_t)a);
+	for (p = 0; p < UQ_N && err == 0; p++)
+		if ((err = uq_setup(m, &u[p], p)) != 0)
+			device_printf(sc->dev, "uq: process %u setup failed "
+			    "(%d)\n", p, err);
+	if (err == 0 && (err = amd_gmc12_flush(gt)) != 0)
+		device_printf(sc->dev, "uq: GART flush failed\n");
+	for (p = 0; p < UQ_N && err == 0; p++) {
+		if ((err = uq_add(m, &u[p], p)) == 0)
+			u[p].added = true;
+	}
+	if (err != 0)
+		goto out;
+	active = uq_hqd_scan(m, "both added", vmids);
+	device_printf(sc->dev, "uq: %u HQD(s) active; process VMIDs %u and "
+	    "%u\n", active, vmids[0], vmids[1]);
+
+	for (p = 0; p < UQ_N; p++)
+		uq_kick(m, &u[p], p);
+	for (us = 0; us < DISP_TIMEOUT_US; us += 10) {
+		for (p = 0; p < UQ_N; p++)
+			fenced[p] = *(volatile uint32_t *)(u[p].pg + UQ_WB +
+			    0x10) == UQ_SEQ + p;
+		if (fenced[0] && fenced[1])
+			break;
+		DELAY(10);
+	}
+	for (p = 0; p < UQ_N; p++) {
+		volatile uint32_t *out = (volatile uint32_t *)(u[p].pg + UQ_OUT);
+
+		bad[p] = vmt_count_not(out, W42_OUT_DW, W42_OUT_VALUE);
+		device_printf(sc->dev, "uq: process %u: %s, out %u of %u words "
+		    "42 (out[0] %#x), rptr report %#x\n", p, fenced[p] ?
+		    "fenced" : "NO FENCE", W42_OUT_DW - bad[p], W42_OUT_DW,
+		    out[0], *(volatile uint32_t *)(u[p].pg + UQ_WB));
+	}
+	if (amd_gmc12_fault_take(gt, &st, &a)) {
+		amd_gmc12_fault_decode(gt, st, "uq");
+		device_printf(sc->dev, "uq: fault page %#jx\n", (uintmax_t)a);
+		err = EIO;
+	}
+	if (!fenced[0] || !fenced[1]) {
+		mes_report(m, "uq fence timeout");
+		(void)uq_hqd_scan(m, "fence timeout", NULL);
+		for (p = 0; p < UQ_N; p++)
+			if (!fenced[p])
+				(void)amd_gfx12_sq_kill_vmid(sc, vmids[p] & 0xf);
+		err = ETIMEDOUT;
+	} else if (bad[0] != 0 || bad[1] != 0)
+		err = EIO;
+	else if (vmids[0] == vmids[1] || vmids[0] < 8 || vmids[0] > 15 ||
+	    vmids[1] < 8 || vmids[1] > 15) {
+		device_printf(sc->dev, "uq: VMIDs %u/%u: want two different "
+		    "MES VMIDs (8-15)\n", vmids[0], vmids[1]);
+		err = EIO;
+	}
+
+out:
+	for (p = 0; p < UQ_N; p++)
+		if (u[p].added && (e = uq_remove(m, &u[p], p)) != 0) {
+			gone = false;
+			if (err == 0)
+				err = e;
+		}
+	active = uq_hqd_scan(m, "after REMOVE_QUEUE", NULL);
+	if (active > 0) {
+		device_printf(sc->dev, "uq: %u HQD(s) still active after "
+		    "REMOVE_QUEUE\n", active);
+		gone = false;
+		if (err == 0)
+			err = EIO;
+	}
+	for (p = 0; p < UQ_N; p++) {
+		if (u[p].g == NULL)
+			continue;
+		for (i = 0; i < UQ_G_SIZE / PAGE_SIZE; i++) {
+			uint64_t idx = (u[p].gva - gt->gart_start) / PAGE_SIZE +
+			    i;
+
+			bus_write_4(gt->vram, gt->table_off + idx * 8, 0);
+			bus_write_4(gt->vram, gt->table_off + idx * 8 + 4, 0);
+		}
+	}
+	(void)amd_gmc12_flush(gt);
+	for (p = 0; p < UQ_N; p++) {
+		if (!gone)
+			break;
+		if (u[p].vm_up)
+			amd_gmc12_vm_fini(&u[p].vm);
+		if (u[p].pg != NULL)
+			contigfree(u[p].pg, UQ_PAGES * PAGE_SIZE, M_DEVBUF);
+		if (u[p].g != NULL)
+			contigfree(u[p].g, UQ_G_SIZE, M_DEVBUF);
+	}
+	if (!gone)
+		device_printf(sc->dev, "uq: queues not known gone; their pages "
+		    "are leaked, not freed\n");
+	device_printf(sc->dev, "uq: stage 5c-1: %s\n", err == 0 ?
+	    "PASS (two MES user queues, own VMs and VMIDs, same VAs, own "
+	    "pages)" : "FAILED");
+	return (err);
+}
+
 static void mes_free(struct mes *m);
 
 static int
@@ -1799,6 +2174,15 @@ amd_mes12_vmtest(struct mes *m)
 	if (!m->dispatch)
 		return (ENOTSUP);
 	return (vm_test_run(m));
+}
+
+/* Stage 5c-1: two MES user queues in their own VMs (uq_test_run). */
+int
+amd_mes12_uqtest(struct mes *m)
+{
+	if (!m->dispatch)
+		return (ENOTSUP);
+	return (uq_test_run(m));
 }
 
 /* Unmap the block and free it, release the doorbell BAR. */

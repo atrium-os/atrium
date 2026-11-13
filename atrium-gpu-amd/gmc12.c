@@ -39,6 +39,8 @@
 /* Page-table pool for per-client VMs (stage 5b): 256 KiB at 92 MiB. */
 #define VM_POOL_VRAM_OFF	(92u << 20)
 #define VM_POOL_PAGES		64u
+#define VM_SLICE_PAGES		16u		/* tables per VM (test VMs) */
+#define VM_SLICES		(VM_POOL_PAGES / VM_SLICE_PAGES)
 
 /* PTE bits (amdgpu_vm.h), GFX12 layout. */
 #define PTE_VALID		(1ull << 0)
@@ -555,7 +557,8 @@ tbl_rd(struct amd_vm12 *vm, u_int t, u_int i)
 
 	if (vm_sys(vm))
 		return (((volatile uint64_t *)vm->sys[t])[i]);
-	off = VM_POOL_VRAM_OFF + (bus_size_t)t * PAGE_SIZE + i * 8;
+	off = VM_POOL_VRAM_OFF + (bus_size_t)(vm->first + t) * PAGE_SIZE +
+	    i * 8;
 	return ((uint64_t)bus_read_4(vm->gt->vram, off) |
 	    (uint64_t)bus_read_4(vm->gt->vram, off + 4) << 32);
 }
@@ -569,7 +572,8 @@ tbl_wr(struct amd_vm12 *vm, u_int t, u_int i, uint64_t v)
 		((volatile uint64_t *)vm->sys[t])[i] = v;
 		return;
 	}
-	off = VM_POOL_VRAM_OFF + (bus_size_t)t * PAGE_SIZE + i * 8;
+	off = VM_POOL_VRAM_OFF + (bus_size_t)(vm->first + t) * PAGE_SIZE +
+	    i * 8;
 	bus_write_4(vm->gt->vram, off, (uint32_t)v);
 	bus_write_4(vm->gt->vram, off + 4, (uint32_t)(v >> 32));
 }
@@ -581,7 +585,8 @@ tbl_pde(struct amd_vm12 *vm, u_int t)
 	if (vm_sys(vm))
 		return ((uint64_t)vm->sys_pa[t] | PTE_VALID | PTE_SYSTEM |
 		    PTE_SNOOPED);
-	return (((uint64_t)VM_POOL_VRAM_OFF + (uint64_t)t * PAGE_SIZE +
+	return (((uint64_t)VM_POOL_VRAM_OFF + (uint64_t)(vm->first + t) *
+	    PAGE_SIZE +
 	    vm->gt->vram_base_offset) | PTE_VALID);
 }
 
@@ -604,7 +609,7 @@ tbl_alloc(struct amd_vm12 *vm, bool ptb, u_int *t)
 {
 	u_int i;
 
-	if (vm->used >= VM_POOL_PAGES)
+	if (vm->used >= VM_SLICE_PAGES)
 		return (ENOMEM);
 	*t = vm->used;
 	if (vm_sys(vm)) {
@@ -635,6 +640,15 @@ amd_gmc12_vm_init(struct amd_gart *gt, struct amd_vm12 *vm, int mode,
 	if (!gt->enabled || rman_get_size(gt->vram) < VM_POOL_VRAM_OFF +
 	    (bus_size_t)VM_POOL_PAGES * PAGE_SIZE)
 		return (ENXIO);
+	/* A slice of the pool per live VM. */
+	for (vm->slice = 0; vm->slice < VM_SLICES; vm->slice++)
+		if ((gt->vm_slices & (1u << vm->slice)) == 0)
+			break;
+	if (vm->slice == VM_SLICES)
+		return (ENOMEM);
+	gt->vm_slices |= 1u << vm->slice;
+	vm->first = vm->slice * VM_SLICE_PAGES;
+	vm->live = true;
 	if (mode == AMD_VM12_FLAT && (flat_va & ((2ull << 20) - 1)) != 0)
 		return (EINVAL);
 	return (tbl_alloc(vm, mode == AMD_VM12_FLAT, &root));	/* table 0 */
@@ -649,6 +663,9 @@ amd_gmc12_vm_fini(struct amd_vm12 *vm)
 		for (i = 0; i < vm->used; i++)
 			contigfree(vm->sys[i], PAGE_SIZE, M_DEVBUF);
 	vm->used = 0;
+	if (vm->live)
+		vm->gt->vm_slices &= ~(1u << vm->slice);
+	vm->live = false;
 }
 
 /* Context base for this VM: table 0's address and flags. */
@@ -890,4 +907,15 @@ u_int
 amd_gmc12_fault_vmid(uint32_t status)
 {
 	return (FAULT_STATUS_VMID(status));
+}
+
+/* GFXHUB CONTEXTn_CNTL as programmed (MES ADD_QUEUE's vm_context_cntl). */
+uint32_t
+amd_gmc12_ctx_cntl(struct amd_gart *gt, u_int vmid)
+{
+	struct hub h;
+
+	if (vmid >= NUM_CTX || !hub_open(gt->sc, true, &h))
+		return (0);
+	return (hr(&h, h.g->ctx0_cntl + vmid));
 }

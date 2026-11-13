@@ -577,3 +577,13 @@ through fd passing, close and jail death.
   IVs from client 0xa with src 0xef (data 0x580000, 0x80 / 0x82) came with the B fault and
   are not yet decoded; the fault IV (client 0xa src 0, data = page, vmid) is the hook for
   "only the faulting queue's fd sees device-lost". Next: 5c.
+- 2026-11-13 01:40, 5c split. Step 1 (5c-1) proves MES user queues on silicon from the
+  kernel before the fd/kqueue interface (step 2) goes on top. Built: two processes, each
+  with its own four-level VM and one compute user queue added with a plain ADD_QUEUE
+  (mes_userq_map: process and gang context pages in the GART, quanta 10 ms / 1 ms, NORMAL,
+  page-table base, VA 0..2^36-1 pages, vm_context_cntl from CONTEXT8_CNTL); the MQD is the
+  user-queue form of compute_mqd_init (no PRIV/KMD, ring/EOP/rptr/wptr at VAs in the
+  process's VM), wptr page aliased in the GART for MES; doorbells 0x20/0x22 (userqueue
+  range). Both map write_42 at the same VAs onto their own pages. Pass: both fence, each
+  out page all 42, different MES VMIDs (8-15, read from the HQDs), no HQD active after
+  REMOVE_QUEUE. Runner stage 5c1 (5b's test runs first).
