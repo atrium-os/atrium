@@ -1210,3 +1210,14 @@ work (self-test, scrub).
   entry points down to a 4 KiB-level fault. gpusim suites ALL OK. Box artifacts: pci
   2877ac32…, gpu 60da822b…, display 1a282bc0…, si-client-test unchanged (d59eb2d8…).
   Logs: claude/project-thread-33aauq 96f0b6aa.
+- **2026-11-13 11:47, the empty-table chain on the box (fc54eb53): no change.** 70
+  passed, 2 failed, the same as at 11:12. The fault status is identical to test 7's
+  store past an unbound page (0xc41050 vs 0xb41050; only the VMID differs). Yet test 7
+  leaves the GPU clean, and 0x7ffffff00000 wedges the GFXHUB (189 flush timeouts, gfx
+  busy 100%).
+  After the kill, only the wedge shows GRBM_STATUS2 bit 15 (0x34118000 vs 0x34110000
+  after a hang kill) and RLC_GPM_STAT 0x160037. So the page-table level is not the
+  cause. Both fixes stay: they match amdgpu and are harmless.
+  Next: bisect by VA with si-client-test 48dad7ab. SI15_VA=<hex> runs one store, and
+  SI15_SPIN=1 runs the endless shader alone. Logs: claude/project-thread-33aauq
+  34b15e3b.
