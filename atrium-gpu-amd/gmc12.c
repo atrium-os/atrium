@@ -41,6 +41,27 @@
 static struct mtx gmc12_inv_mtx;
 MTX_SYSINIT(gmc12_inv, &gmc12_inv_mtx, "gmc12 inv", MTX_DEF);
 
+/*
+ * Wedge diagnosis (runs 8f3d4517, 8e13d8ce): GCVM_L2_STATUS L2_BUSY was
+ * already set, for good, when test 15's fault was taken. Note when the
+ * last invalidation ran (for which context) so the fault report can say
+ * whether one overlapped the fault.
+ */
+static volatile sbintime_t gmc12_flush_t0, gmc12_flush_t1;
+static volatile u_int gmc12_flush_vmid;
+#define GC12_GCVM_L2_STATUS	0x15c7
+
+static void
+flush_mark(u_int vmid, bool start)
+{
+	if (start) {
+		gmc12_flush_vmid = vmid;
+		gmc12_flush_t0 = sbinuptime();
+		gmc12_flush_t1 = 0;
+	} else
+		gmc12_flush_t1 = sbinuptime();
+}
+
 /* Layout inside the driver's VRAM area (psp.c stages at 68 MiB, smu.c's table at 84). */
 #define GART_TABLE_VRAM_OFF	(88u << 20)
 #define GART_SIZE		(512ull << 20)
@@ -453,11 +474,13 @@ amd_gmc12_flush(struct amd_gart *gt)
 	int err = 0;
 
 	mtx_lock(&gmc12_inv_mtx);
+	flush_mark(0, true);
 	amd_hdp_flush(gt->sc);
 	if (hub_open(gt->sc, false, &mm) && hub_flush(&mm, 0) != 0)
 		err = ETIMEDOUT;
 	if (hub_open(gt->sc, true, &gfx) && hub_flush(&gfx, 0) != 0)
 		err = ETIMEDOUT;
+	flush_mark(0, false);
 	mtx_unlock(&gmc12_inv_mtx);
 	return (err);
 }
@@ -965,6 +988,7 @@ amd_gmc12_vm_flush(struct amd_gart *gt, u_int vmid)
 	if (vmid >= NUM_CTX)
 		return (EINVAL);
 	mtx_lock(&gmc12_inv_mtx);
+	flush_mark(vmid, true);
 	amd_hdp_flush(gt->sc);
 	if (hub_open(gt->sc, false, &mm) && hub_flush(&mm, vmid) != 0) {
 		err = ETIMEDOUT;
@@ -974,6 +998,7 @@ amd_gmc12_vm_flush(struct amd_gart *gt, u_int vmid)
 		err = ETIMEDOUT;
 		hub_flush_report(&gfx, vmid);
 	}
+	flush_mark(vmid, false);
 	mtx_unlock(&gmc12_inv_mtx);
 	return (err);
 }
@@ -1055,6 +1080,23 @@ amd_gmc12_fault_take(struct amd_gart *gt, uint32_t *status, uint64_t *addr)
 	*status = hr(&h, h.g->fault_status);
 	*addr = ((uint64_t)(hr(&h, h.g->fault_addr_hi) & 0xf) << 32 |
 	    hr(&h, h.g->fault_addr_lo)) << PAGE_SHIFT;
+	if (*status != 0 && h.g->gc) {
+		sbintime_t now = sbinuptime(), t0 = gmc12_flush_t0,
+		    t1 = gmc12_flush_t1;
+		uint32_t l2 = hr(&h, GC12_GCVM_L2_STATUS), l2b = l2;
+		int us;
+
+		for (us = 0; us < 1000 && (l2b & 1); us += 10) {
+			DELAY(10);
+			l2b = hr(&h, GC12_GCVM_L2_STATUS);
+		}
+		device_printf(gt->sc->dev, "gmc: at the fault: GCVM_L2_STATUS "
+		    "%#x, after %d us %#x; last invalidation (context %u) "
+		    "started %jd us ago, %s %jd us ago\n", l2, us, l2b,
+		    gmc12_flush_vmid, (intmax_t)sbttous(now - t0),
+		    t1 == 0 ? "still running, i.e. in flight" : "ended",
+		    (intmax_t)(t1 == 0 ? 0 : sbttous(now - t1)));
+	}
 	hrmw(&h, h.g->fault_cntl, 0, FAULT_CNTL_CLEAR);
 	hrmw(&h, h.g->fault_cntl, FAULT_CNTL_CLEAR, 0);
 	return (*status != 0);
