@@ -3,6 +3,7 @@
 //! XfrBlock, and their replies.
 
 use crate::Error;
+use alloc::vec::Vec;
 
 pub const HEADER: usize = 10;
 

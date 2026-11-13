@@ -17,6 +17,7 @@ members = [
     "sigillumd",
     "sigillum-webauthn",
     "sigillum-ccid",
+    "sigillum-pcsc",
 ]
 
 [workspace.package]

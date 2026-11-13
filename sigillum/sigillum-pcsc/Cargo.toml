@@ -1,0 +1,12 @@
+[package]
+name = "sigillum-pcsc"
+version = "0.1.0"
+description = "The pcsc-lite client API (SCard*) over one sigillum-ccid reader, for a vendor PKCS#11 module hosted by sigillum-p11 (sigillum.md §16.5). no_std"
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+sigillum-ccid = { path = "../sigillum-ccid" }
+
+[dev-dependencies]
+sigillum-ccid = { path = "../sigillum-ccid", features = ["fake"] }

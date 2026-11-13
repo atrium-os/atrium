@@ -800,6 +800,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "sigillum-pcsc"
+version = "0.1.0"
+dependencies = [
+ "sigillum-ccid",
+]
+
+[[package]]
 name = "sigillum-proto"
 version = "0.1.0"
 dependencies = [

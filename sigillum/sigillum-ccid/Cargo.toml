@@ -5,4 +5,8 @@ description = "Sigillum's CCID transport (sigillum.md §6.2): the class descript
 edition.workspace = true
 license.workspace = true
 
+[features]
+# An in-memory reader and card for other crates' tests.
+fake = []
+
 [dependencies]

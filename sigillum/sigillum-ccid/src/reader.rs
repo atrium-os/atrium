@@ -9,6 +9,7 @@ use crate::atr::Atr;
 use crate::desc::{Ccid, Level};
 use crate::msg::{self, chain, Reply};
 use crate::Error;
+use alloc::vec::Vec;
 
 pub const MAX_RESPONSE: usize = 65_538;
 pub const MAX_TIME_EXTENSIONS: u32 = 120;
@@ -125,7 +126,7 @@ impl<B: Bulk> Reader<B> {
         }
         let mut reply = r.ok_or(Error::Protocol("empty APDU"))?;
         // Response: 0 whole, 1 begins, 3 continues, 2 ends.
-        let mut out = std::mem::take(&mut reply.data);
+        let mut out = core::mem::take(&mut reply.data);
         let mut chained = reply.param;
         while matches!(chained, 1 | 3) {
             let seq = self.next_seq();
@@ -151,7 +152,7 @@ impl<B: Bulk> Reader<B> {
             let again = Command { le: Some(if r.sw2() == 0 { 256 } else { r.sw2() as u32 }), ..c.clone() };
             r = Response::parse(&self.transmit_raw(&again.encode(extended)?)?)?;
         }
-        let mut data = std::mem::take(&mut r.data);
+        let mut data = core::mem::take(&mut r.data);
         let mut rounds = 0;
         while r.sw1() == 0x61 {
             rounds += 1;
@@ -173,101 +174,8 @@ impl<B: Bulk> Reader<B> {
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
-    use std::collections::VecDeque;
-
-    /// A reader with one card: answers XfrBlocks with `card(apdu)`, sends
-    /// responses in parts of `chunk` bytes (CCID chaining), and optionally
-    /// asks for time extensions first.
-    pub struct Fake<F: FnMut(&[u8]) -> Vec<u8>> {
-        pub card: F,
-        pub chunk: usize,
-        pub extensions: u32,
-        pub present: bool,
-        pending: VecDeque<Vec<u8>>,
-        cmd: Vec<u8>,
-        out: Vec<u8>,
-        pub sent: Vec<Vec<u8>>,
-    }
-
-    impl<F: FnMut(&[u8]) -> Vec<u8>> Fake<F> {
-        pub fn new(card: F) -> Self {
-            Fake { card, chunk: 4086, extensions: 0, present: true, pending: VecDeque::new(), cmd: vec![], out: vec![], sent: vec![] }
-        }
-    }
-
-    fn reply(kind: u8, seq: u8, status: u8, param: u8, data: &[u8]) -> Vec<u8> {
-        let mut m = vec![kind];
-        m.extend_from_slice(&(data.len() as u32).to_le_bytes());
-        m.extend_from_slice(&[0, seq, status, 0, param]);
-        m.extend_from_slice(data);
-        m
-    }
-
-    impl<F: FnMut(&[u8]) -> Vec<u8>> Bulk for Fake<F> {
-        fn send(&mut self, m: &[u8]) -> Result<(), Error> {
-            self.sent.push(m.to_vec());
-            let (kind, seq, level) = (m[0], m[6], u16::from_le_bytes([m[8], m[9]]));
-            for _ in 0..self.extensions {
-                self.pending.push_back(reply(msg::RDR_TO_PC_DATA_BLOCK, seq, msg::CMD_TIME_EXTENSION << 6, 1, &[]));
-            }
-            if !self.present {
-                self.pending.push_back(reply(msg::RDR_TO_PC_SLOT_STATUS, seq, (msg::CMD_FAILED << 6) | msg::ICC_ABSENT, 0, &[]));
-                return Ok(());
-            }
-            let atr = [0x3B, 0x8E, 0x80, 0x01, 0x50, 0x4B, 0x03, 0x58, 0x58, 0x58, 0x5F, 0x44, 0x53, 0x43, 0x5F, 0x4B, 0x45, 0x59, 0x4C];
-            let r = match kind {
-                msg::PC_TO_RDR_ICC_POWER_ON => reply(msg::RDR_TO_PC_DATA_BLOCK, seq, 0, 0, &atr),
-                msg::PC_TO_RDR_ICC_POWER_OFF | msg::PC_TO_RDR_GET_SLOT_STATUS => reply(msg::RDR_TO_PC_SLOT_STATUS, seq, 0, 0, &[]),
-                msg::PC_TO_RDR_XFR_BLOCK => {
-                    match level {
-                        chain::WHOLE | chain::ENDS => {
-                            self.cmd.extend_from_slice(&m[10..]);
-                            let apdu = std::mem::take(&mut self.cmd);
-                            self.out = (self.card)(&apdu);
-                        }
-                        chain::BEGINS | chain::CONTINUES => {
-                            self.cmd.extend_from_slice(&m[10..]);
-                            self.pending.push_back(reply(msg::RDR_TO_PC_DATA_BLOCK, seq, 0, 0x10, &[]));
-                            return Ok(());
-                        }
-                        chain::NEXT => {}
-                        _ => panic!("level {level}"),
-                    }
-                    let first = level != chain::NEXT;
-                    let n = self.out.len().min(self.chunk);
-                    let part: Vec<u8> = self.out.drain(..n).collect();
-                    let param = match (first, self.out.is_empty()) {
-                        (true, true) => 0,
-                        (true, false) => 1,
-                        (false, true) => 2,
-                        (false, false) => 3,
-                    };
-                    reply(msg::RDR_TO_PC_DATA_BLOCK, seq, 0, param, &part)
-                }
-                _ => panic!("message {kind:#x}"),
-            };
-            self.pending.push_back(r);
-            Ok(())
-        }
-
-        fn recv(&mut self, _cap: usize) -> Result<Vec<u8>, Error> {
-            self.pending.pop_front().ok_or(Error::Io)
-        }
-    }
-
-    fn desc(features: u32, max: u32) -> Ccid {
-        let mut d = [0u8; 54];
-        d[0] = 0x36;
-        d[1] = 0x21;
-        d[6] = 3;
-        d[40..44].copy_from_slice(&features.to_le_bytes());
-        d[44..48].copy_from_slice(&max.to_le_bytes());
-        Ccid::parse(&d).unwrap()
-    }
-
-    pub fn innait_desc() -> Ccid {
-        desc(0x0004_04be, 4096)
-    }
+    use crate::fake::{desc, innait_desc, Fake};
+    use alloc::vec;
 
     #[test]
     fn power_on_and_select() {

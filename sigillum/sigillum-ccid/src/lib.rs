@@ -12,12 +12,21 @@
 //!
 //! The USB side (ugen bulk endpoints) is the driver binary's; tests run
 //! over an in-memory card.
+//!
+//! `no_std` with `alloc`: it also runs inside the `sigillum-p11` Hospes host
+//! (sigillum.md §16.5), which has no `std`.
+#![no_std]
+extern crate alloc;
+#[cfg(test)]
+extern crate std;
 
 pub mod apdu;
 pub mod atr;
 pub mod desc;
 pub mod msg;
 pub mod reader;
+#[cfg(any(test, feature = "fake"))]
+pub mod fake;
 
 /// Why a reader session failed. Card status words are not errors here:
 /// they come back in [`apdu::Response`].

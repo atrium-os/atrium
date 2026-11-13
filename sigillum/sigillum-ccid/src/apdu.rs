@@ -2,6 +2,8 @@
 //! and response parsing.
 
 use crate::Error;
+use alloc::vec;
+use alloc::vec::Vec;
 
 /// Longest command data (extended Lc).
 pub const MAX_DATA: usize = 65_535;

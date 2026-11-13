@@ -3,6 +3,7 @@
 //! automatic parameters) negotiates the rest.
 
 use crate::Error;
+use alloc::vec::Vec;
 
 pub const MAX: usize = 33;
 
@@ -70,6 +71,7 @@ impl Atr {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use alloc::vec;
 
     #[test]
     fn innait() {
