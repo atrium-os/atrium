@@ -1,19 +1,28 @@
-//! Thread control blocks and the library's static TLS (docs/spec/hospes.md §5.3).
+//! Thread control blocks and the libraries' static TLS (docs/spec/hospes.md §5.3).
 //!
-//! Hospes hosts exactly one foreign module, so TLS is one static block per thread at a fixed
-//! offset from the thread pointer, laid out the way glibc lays it out:
+//! Hospes hosts a few foreign modules (one library, or a library with the libraries it
+//! needs, all loaded before any thread exists), so TLS is one static block per thread at
+//! a fixed offset from the thread pointer, holding every module's block, laid out the way
+//! glibc lays out static TLS:
 //!
 //! - **x86_64, variant II.** `%fs` points at a `tcbhead_t`: self-pointer at 0, `dtv` at 8,
-//!   self again at 16, stack-protector canary at 0x28, pointer guard at 0x30. The module's
+//!   self again at 16, stack-protector canary at 0x28, pointer guard at 0x30. The combined
 //!   block ends at the thread pointer. Our [`ThreadState`] sits at `tp + 0x100`, past
 //!   everything glibc-compiled code reads.
-//! - **aarch64, variant I.** `TPIDR_EL0` points at `{ dtv, private }`; the block starts at
-//!   `tp + align_up(16, align)`. `private` holds a pointer to our [`ThreadState`], which sits
-//!   below the thread pointer, where glibc keeps its `struct pthread`.
+//! - **aarch64, variant I.** `TPIDR_EL0` points at `{ dtv, private }`; the combined block
+//!   starts at `tp + align_up(16, align)`. `private` holds a pointer to our
+//!   [`ThreadState`], which sits below the thread pointer, where glibc keeps its
+//!   `struct pthread`.
+//!
+//! Module `m` (0-based, in load order) sits at its own aligned offset in the combined
+//! block; its `DTPMOD` is `m + 1`.
 use crate::sys;
 use core::sync::atomic::{AtomicUsize, Ordering};
 
-/// The module's TLS template, set once by the loader before any thread exists.
+/// Most modules with TLS one process hosts.
+pub const MAX_MODULES: usize = 4;
+
+/// A module's TLS template, registered by the loader before any thread exists.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct Template {
     /// Address of the initialised bytes in the loaded image.
@@ -23,50 +32,77 @@ pub struct Template {
     pub align: usize,
 }
 
-static T_IMAGE: AtomicUsize = AtomicUsize::new(0);
-static T_FILESZ: AtomicUsize = AtomicUsize::new(0);
-static T_MEMSZ: AtomicUsize = AtomicUsize::new(0);
-static T_ALIGN: AtomicUsize = AtomicUsize::new(1);
+#[allow(clippy::declare_interior_mutable_const)]
+const Z: AtomicUsize = AtomicUsize::new(0);
+static M_IMAGE: [AtomicUsize; MAX_MODULES] = [Z; MAX_MODULES];
+static M_FILESZ: [AtomicUsize; MAX_MODULES] = [Z; MAX_MODULES];
+static M_MEMSZ: [AtomicUsize; MAX_MODULES] = [Z; MAX_MODULES];
+static M_OFF: [AtomicUsize; MAX_MODULES] = [Z; MAX_MODULES];
+static COUNT: AtomicUsize = AtomicUsize::new(0);
+/// Set once the first control block exists: no module can join after.
+static FROZEN: AtomicUsize = AtomicUsize::new(0);
+/// The combined block's size (unaligned) and alignment.
+static TOTAL: AtomicUsize = AtomicUsize::new(0);
+static ALIGN: AtomicUsize = AtomicUsize::new(1);
 static CANARY: AtomicUsize = AtomicUsize::new(0);
 static PTR_GUARD: AtomicUsize = AtomicUsize::new(0);
 
-pub fn set_template(t: Template) {
-    T_IMAGE.store(t.image, Ordering::Relaxed);
-    T_FILESZ.store(t.filesz, Ordering::Relaxed);
-    T_MEMSZ.store(t.memsz, Ordering::Relaxed);
-    T_ALIGN.store(t.align.max(1), Ordering::Release);
+/// Register a module's TLS; its index (0-based), or `None` when [`MAX_MODULES`] are taken.
+/// Only before the first thread control block exists.
+pub fn add_module(t: Template) -> Option<usize> {
+    let m = COUNT.load(Ordering::Acquire);
+    if m >= MAX_MODULES || FROZEN.load(Ordering::Acquire) != 0 {
+        return None;
+    }
+    let a = t.align.max(1);
+    let off = align_up(TOTAL.load(Ordering::Relaxed), a);
+    M_IMAGE[m].store(t.image, Ordering::Relaxed);
+    M_FILESZ[m].store(t.filesz, Ordering::Relaxed);
+    M_MEMSZ[m].store(t.memsz, Ordering::Relaxed);
+    M_OFF[m].store(off, Ordering::Relaxed);
+    TOTAL.store(off + t.memsz, Ordering::Relaxed);
+    ALIGN.store(ALIGN.load(Ordering::Relaxed).max(a), Ordering::Relaxed);
+    COUNT.store(m + 1, Ordering::Release);
+    Some(m)
 }
 
-pub fn template() -> Template {
-    Template {
-        align: T_ALIGN.load(Ordering::Acquire),
-        image: T_IMAGE.load(Ordering::Relaxed),
-        filesz: T_FILESZ.load(Ordering::Relaxed),
-        memsz: T_MEMSZ.load(Ordering::Relaxed),
-    }
+/// Modules registered so far.
+pub fn modules() -> usize {
+    COUNT.load(Ordering::Acquire)
 }
 
 fn align_up(x: usize, a: usize) -> usize {
     (x + a - 1) & !(a - 1)
 }
 
-/// The value glibc-compiled code adds to the thread pointer to reach offset `v` of the
-/// module's block (`R_*_TPOFF*`, static TLSDESC).
-pub fn tpoff(v: u64) -> u64 {
-    let t = template();
+/// Offset of the combined block from the thread pointer's side it grows from: x86_64,
+/// the size it takes below `tp`; aarch64, where it starts above `tp`.
+fn block_span() -> usize {
+    let a = ALIGN.load(Ordering::Relaxed);
     if cfg!(target_arch = "x86_64") {
-        v.wrapping_sub(align_up(t.memsz, t.align) as u64)
+        align_up(TOTAL.load(Ordering::Relaxed), a)
     } else {
-        v.wrapping_add(align_up(16, t.align) as u64)
+        align_up(16, a)
+    }
+}
+
+/// The value glibc-compiled code adds to the thread pointer to reach offset `v` of module
+/// `m`'s block (`R_*_TPOFF*`, static TLSDESC). Valid once every module is registered.
+pub fn tpoff_in(m: usize, v: u64) -> u64 {
+    let off = M_OFF[m].load(Ordering::Relaxed) as u64;
+    if cfg!(target_arch = "x86_64") {
+        (off + v).wrapping_sub(block_span() as u64)
+    } else {
+        (off + v).wrapping_add(block_span() as u64)
     }
 }
 
 /// Per-thread state of ours, at a fixed place relative to the thread pointer.
 #[repr(C)]
 pub struct ThreadState {
-    /// `dtv[0]` generation, `dtv[1]` the module's block. glibc code never reads the dtv
+    /// `dtv[0]` generation, `dtv[1 + m]` module `m`'s block. glibc code never reads the dtv
     /// directly; our `__tls_get_addr` and TLSDESC resolvers do.
-    pub dtv: [usize; 2],
+    pub dtv: [usize; 1 + MAX_MODULES],
     pub errno: i32,
     /// Join word: see `sys::thread_done`. 64 bits because FreeBSD's `thr_exit` stores a long.
     pub done: u64,
@@ -115,37 +151,48 @@ pub fn canary() -> usize {
     CANARY.load(Ordering::Relaxed)
 }
 
-/// Allocate and fill a control block with a fresh copy of the TLS template.
+/// Allocate and fill a control block with a fresh copy of every module's TLS template.
 pub fn new_tcb() -> sys::R<Tcb> {
-    let t = template();
-    let a = t.align.max(64);
+    FROZEN.store(1, Ordering::Release);
+    let n = modules();
+    let align = ALIGN.load(Ordering::Relaxed);
+    let total = TOTAL.load(Ordering::Relaxed);
+    let a = align.max(64);
     let st_size = core::mem::size_of::<ThreadState>();
     #[cfg(target_arch = "x86_64")]
     let (len, tp_off, block_off) = {
-        let off = align_up(t.memsz, t.align.max(1));
-        let tp_off = align_up(off, a);
-        (tp_off + TCB_SIZE, tp_off, tp_off - off)
+        let span = block_span();
+        let tp_off = align_up(span, a);
+        (tp_off + TCB_SIZE, tp_off, tp_off - span)
     };
     #[cfg(target_arch = "aarch64")]
     let (len, tp_off, block_off) = {
         let tp_off = align_up(st_size, a);
-        let b = tp_off + align_up(16, t.align.max(1));
-        (b + t.memsz, tp_off, b)
+        let b = tp_off + block_span();
+        (b + total, tp_off, b)
     };
+    let _ = total;
     let len = sys::page_up(len.max(1));
     let region = sys::mmap_anon(len, sys::PROT_READ | sys::PROT_WRITE)?;
     let tp = region + tp_off;
     let block = region + block_off;
     unsafe {
-        if t.filesz > 0 {
-            core::ptr::copy_nonoverlapping(t.image as *const u8, block as *mut u8, t.filesz);
-        }
         #[cfg(target_arch = "x86_64")]
         let state = (tp + STATE_OFF) as *mut ThreadState;
         #[cfg(target_arch = "aarch64")]
         let state = (tp - align_up(st_size, 16)) as *mut ThreadState;
         let _ = st_size;
-        (*state).dtv = [1, block];
+        (*state).dtv = [0; 1 + MAX_MODULES];
+        (*state).dtv[0] = 1;
+        for m in 0..n {
+            let mb = block + M_OFF[m].load(Ordering::Relaxed);
+            let fsz = M_FILESZ[m].load(Ordering::Relaxed);
+            if fsz > 0 {
+                core::ptr::copy_nonoverlapping(M_IMAGE[m].load(Ordering::Relaxed) as *const u8, mb as *mut u8, fsz);
+            }
+            (*state).dtv[1 + m] = mb;
+        }
+        let _ = &M_MEMSZ;
         (*state).tp = tp;
         (*state).region = region;
         (*state).region_len = len;
@@ -196,11 +243,13 @@ pub fn install_main() -> sys::R<()> {
     unsafe { sys::set_tp(tcb.tp) }
 }
 
-/// `__tls_get_addr(tls_index *)`: general-dynamic access to our one module.
+/// `__tls_get_addr(tls_index *)`: general-dynamic access; `ti[0]` is the module's
+/// `DTPMOD` (1-based), `ti[1]` the offset in its block.
 #[no_mangle]
 pub unsafe extern "C" fn hospes_tls_get_addr(ti: *const [usize; 2]) -> *mut u8 {
     let st = current();
-    ((*st).dtv[1] + (*ti)[1]) as *mut u8
+    let m = (*ti)[0].clamp(1, MAX_MODULES);
+    ((*st).dtv[m] + (*ti)[1]) as *mut u8
 }
 
 extern "C" {

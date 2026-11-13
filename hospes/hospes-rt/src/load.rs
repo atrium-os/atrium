@@ -1,4 +1,5 @@
-//! Map, relocate and initialise one foreign shared object (docs/spec/hospes.md §5.2).
+//! Map, relocate and initialise foreign shared objects (docs/spec/hospes.md §5.2): one
+//! library, or a library with the libraries it needs ([`load_set`]).
 //!
 //! Order: parse (in `hospes-elf`) → reserve the image span → map each `PT_LOAD` with its own
 //! permissions (never write+execute) → register the TLS template and give the main thread
@@ -48,6 +49,8 @@ pub struct Library {
     pub hwcap: (usize, usize),
     /// Unknown imports bound to the abort stub (only with `allow_unknown`).
     pub stubbed: Vec<String>,
+    /// The library's TLS module (0-based), if it has `PT_TLS`.
+    pub tls_module: Option<usize>,
 }
 
 #[cfg(target_arch = "x86_64")]
@@ -96,6 +99,41 @@ fn prot(f: hospes_elf::Flags) -> usize {
 
 /// Load the shared object open at `fd` (read-only is enough).
 pub fn load(fd: i32, opts: &Options, res: &dyn Resolver) -> Result<Library, LoadError> {
+    let mut v = load_set(&[fd], opts, res)?;
+    Ok(v.pop().expect("one library"))
+}
+
+/// Load several shared objects into one scope, dependencies first (`[libstdc++, module]`).
+/// Every object is mapped and its TLS registered before the main thread gets its control
+/// block; then each is relocated in order, its imports bound to its own exports, then to
+/// the exports of the objects before it, then to `res`. Only once per process: TLS
+/// modules can't be added after the first thread control block exists.
+pub fn load_set(fds: &[i32], opts: &Options, res: &dyn Resolver) -> Result<Vec<Library>, LoadError> {
+    let mut libs: Vec<Library> = Vec::with_capacity(fds.len());
+    let mut r = Ok(());
+    for &fd in fds {
+        match map_one(fd, opts) {
+            Ok(l) => libs.push(l),
+            Err(e) => {
+                r = Err(e);
+                break;
+            }
+        }
+    }
+    if r.is_ok() {
+        r = link_set(&mut libs, opts, res);
+    }
+    if let Err(e) = r {
+        for l in &libs {
+            let _ = sys::munmap(l.base + l.img.span.0 as usize, l.map_len);
+        }
+        return Err(e);
+    }
+    Ok(libs)
+}
+
+/// Parse, reserve and map one object, and register its TLS.
+fn map_one(fd: i32, opts: &Options) -> Result<Library, LoadError> {
     let size = file_size(fd)?;
     if size == 0 {
         return Err(LoadError::Elf(hospes_elf::Error::Truncated("empty file")));
@@ -111,15 +149,15 @@ pub fn load(fd: i32, opts: &Options, res: &dyn Resolver) -> Result<Library, Load
     let len = hi - lo;
     let resv = sys::mmap_aligned(len, 64 * 1024, sys::PROT_NONE).map_err(|e| LoadError::Io("reserve", e))?;
     let base = resv - lo;
-    let mut lib = Library { base, map_len: len, img, hwcap: opts.hwcap, stubbed: Vec::new() };
-    let r = map_and_relocate(fd, &mut lib, opts, res);
+    let mut lib = Library { base, map_len: len, img, hwcap: opts.hwcap, stubbed: Vec::new(), tls_module: None };
+    let r = map_segments(fd, &mut lib);
     if r.is_err() {
         let _ = sys::munmap(resv, len);
     }
     r.map(|_| lib)
 }
 
-fn map_and_relocate(fd: i32, lib: &mut Library, opts: &Options, res: &dyn Resolver) -> Result<(), LoadError> {
+fn map_segments(fd: i32, lib: &mut Library) -> Result<(), LoadError> {
     let base = lib.base;
     for s in &lib.img.segments {
         let va = base + s.vaddr as usize;
@@ -152,45 +190,54 @@ fn map_and_relocate(fd: i32, lib: &mut Library, opts: &Options, res: &dyn Resolv
             }
         }
     }
+    // TLS: each module's block sits in one static block per thread.
+    if let Some(t) = &lib.img.tls {
+        let m = tls::add_module(tls::Template {
+            image: base + t.vaddr as usize,
+            filesz: t.filesz as usize,
+            memsz: t.memsz as usize,
+            align: t.align as usize,
+        })
+        .ok_or(LoadError::Tls("too many TLS modules, or one after the first thread"))?;
+        lib.tls_module = Some(m);
+    }
+    Ok(())
+}
 
-    // Trap the library's own system calls before anything of it runs: relocation runs
+fn link_set(libs: &mut [Library], opts: &Options, res: &dyn Resolver) -> Result<(), LoadError> {
+    // Trap the libraries' own system calls before anything of them runs: relocation runs
     // IRELATIVE resolvers, which are library code.
     if opts.trap {
-        if let Err(e) = trap_segments(lib) {
+        if let Err(e) = trap_segments(libs) {
             if cfg!(target_os = "freebsd") {
                 return Err(LoadError::Io("trap", e));
             }
             crate::hlog!("hospes: no system call trap on this host ({:?}); the library's raw calls reach the kernel", e);
         }
     }
-
-    // TLS: one module, static block in every thread.
-    if let Some(t) = &lib.img.tls {
-        tls::set_template(tls::Template {
-            image: base + t.vaddr as usize,
-            filesz: t.filesz as usize,
-            memsz: t.memsz as usize,
-            align: t.align as usize,
-        });
-    }
     tls::init_process_secrets();
     tls::install_main().map_err(|e| LoadError::Io("main thread TCB", e))?;
 
-    relocate(lib, opts, res)?;
-
-    if let Some((a, l)) = lib.img.relro {
-        let start = page_down(base + a as usize);
-        let end = page_down(base + (a + l) as usize);
-        if end > start {
-            sys::mprotect(start, end - start, sys::PROT_READ).map_err(|e| LoadError::Io("relro", e))?;
+    for i in 0..libs.len() {
+        let (deps, rest) = libs.split_at_mut(i);
+        let lib = &mut rest[0];
+        relocate(lib, deps, opts, res)?;
+        if let Some((a, l)) = lib.img.relro {
+            let start = page_down(lib.base + a as usize);
+            let end = page_down(lib.base + (a + l) as usize);
+            if end > start {
+                sys::mprotect(start, end - start, sys::PROT_READ).map_err(|e| LoadError::Io("relro", e))?;
+            }
         }
     }
     Ok(())
 }
 
-fn trap_segments(lib: &Library) -> sys::R<()> {
-    for (start, end) in lib.text() {
-        crate::trap::add(start, end - start)?;
+fn trap_segments(libs: &[Library]) -> sys::R<()> {
+    for lib in libs {
+        for (start, end) in lib.text() {
+            crate::trap::add(start, end - start)?;
+        }
     }
     crate::trap::lock()
 }
@@ -200,11 +247,11 @@ enum Val {
     Addr(usize),
     /// Defined ifunc: call the resolver at this address (deferred to the last pass).
     Ifunc(usize),
-    /// Offset in our TLS module.
-    Tls(u64),
+    /// Offset in a TLS module (0-based module, offset).
+    Tls(usize, u64),
 }
 
-fn resolve_all(lib: &mut Library, opts: &Options, res: &dyn Resolver) -> Result<Vec<Option<Val>>, LoadError> {
+fn resolve_all(lib: &mut Library, deps: &[Library], opts: &Options, res: &dyn Resolver) -> Result<Vec<Option<Val>>, LoadError> {
     let base = lib.base;
     let img = &lib.img;
     let mut out = Vec::with_capacity(img.symbols.len());
@@ -222,21 +269,25 @@ fn resolve_all(lib: &mut Library, opts: &Options, res: &dyn Resolver) -> Result<
             out.push(None);
             continue;
         }
+        let own_tls = || lib.tls_module.ok_or(LoadError::Tls("TLS symbol without PT_TLS"));
         let v = if s.defined {
             match s.kind {
-                SymKind::Tls => Val::Tls(s.value),
+                SymKind::Tls => Val::Tls(own_tls()?, s.value),
                 SymKind::Ifunc => Val::Ifunc(base + s.value as usize),
                 _ => Val::Addr(base + s.value as usize),
             }
         } else if let Some(d) = img.export(&s.name, s.version.as_deref()) {
             // The library's own definition first (glibc's global scope order).
             match d.kind {
-                SymKind::Tls => Val::Tls(d.value),
+                SymKind::Tls => Val::Tls(own_tls()?, d.value),
                 SymKind::Ifunc => Val::Ifunc(base + d.value as usize),
                 _ => Val::Addr(base + d.value as usize),
             }
+        } else if let Some(v) = from_deps(deps, &s.name, s.version.as_deref())? {
+            // Then the libraries loaded before it, in order.
+            v
         } else if s.kind == SymKind::Tls {
-            return Err(LoadError::Tls("TLS import from outside the module"));
+            return Err(LoadError::Tls("TLS import with no defining module"));
         } else if let Some(a) = res.resolve(&s.name, s.version.as_deref()) {
             Val::Addr(a)
         } else if s.bind == Bind::Weak {
@@ -264,6 +315,20 @@ fn resolve_all(lib: &mut Library, opts: &Options, res: &dyn Resolver) -> Result<
     Ok(out)
 }
 
+/// An export of an already relocated library (its ifuncs can run).
+fn from_deps(deps: &[Library], name: &str, version: Option<&str>) -> Result<Option<Val>, LoadError> {
+    for d in deps {
+        let Some(e) = d.img.export(name, version) else { continue };
+        let a = d.base + e.value as usize;
+        return Ok(Some(match e.kind {
+            SymKind::Tls => Val::Tls(d.tls_module.ok_or(LoadError::Tls("TLS export without PT_TLS"))?, e.value),
+            SymKind::Ifunc => Val::Addr(unsafe { call_resolver(a, d.hwcap) }),
+            _ => Val::Addr(a),
+        }));
+    }
+    Ok(None)
+}
+
 fn writable(img: &Image, off: u64) -> bool {
     img.segments.iter().any(|s| s.flags.w && off >= s.vaddr && off + 8 <= s.vaddr + s.memsz)
 }
@@ -272,11 +337,12 @@ unsafe fn put(base: usize, off: u64, v: u64) {
     core::ptr::write_unaligned((base + off as usize) as *mut u64, v);
 }
 
-fn relocate(lib: &mut Library, opts: &Options, res: &dyn Resolver) -> Result<(), LoadError> {
-    let vals = resolve_all(lib, opts, res)?;
+fn relocate(lib: &mut Library, deps: &[Library], opts: &Options, res: &dyn Resolver) -> Result<(), LoadError> {
+    let vals = resolve_all(lib, deps, opts, res)?;
     let base = lib.base;
     let img = &lib.img;
     let hw = lib.hwcap;
+    let own = lib.tls_module;
     for &a in &img.relr {
         if !writable(img, a) {
             return Err(LoadError::Reloc("RELR target not writable", a));
@@ -299,17 +365,17 @@ fn relocate(lib: &mut Library, opts: &Options, res: &dyn Resolver) -> Result<(),
                 None => Err(LoadError::Reloc(what, r.offset)),
                 Some(Val::Addr(x)) => Ok(Some(*x as u64)),
                 Some(Val::Ifunc(_)) => Ok(None),
-                Some(Val::Tls(_)) => Err(LoadError::Reloc("TLS symbol in a non-TLS relocation", r.offset)),
+                Some(Val::Tls(..)) => Err(LoadError::Reloc("TLS symbol in a non-TLS relocation", r.offset)),
             }
         };
-        let s_tls = || -> Result<u64, LoadError> {
+        // (module, offset): symbol 0 means the library's own module (local-dynamic).
+        let s_tls = || -> Result<(usize, u64), LoadError> {
             match sym {
-                None if r.sym == 0 => Ok(0),
-                Some(Val::Tls(v)) => Ok(*v),
+                None if r.sym == 0 => Ok((own.ok_or(LoadError::Tls("TLS relocation without PT_TLS"))?, 0)),
+                Some(Val::Tls(m, v)) => Ok((*m, *v)),
                 _ => Err(LoadError::Reloc("non-TLS symbol in a TLS relocation", r.offset)),
             }
         };
-        let needs_tls = || if img.tls.is_none() { Err(LoadError::Tls("TLS relocation without PT_TLS")) } else { Ok(()) };
         unsafe {
             match r.kind {
                 RelocKind::None => {}
@@ -323,26 +389,19 @@ fn relocate(lib: &mut Library, opts: &Options, res: &dyn Resolver) -> Result<(),
                     Some(s) => put(base, r.offset, if MACHINE == Machine::Aarch64 { s.wrapping_add(a) } else { s }),
                     None => deferred.push(i),
                 },
-                RelocKind::DtpMod => {
-                    needs_tls()?;
-                    s_tls()?;
-                    put(base, r.offset, 1)
-                }
-                RelocKind::DtpOff => {
-                    needs_tls()?;
-                    put(base, r.offset, s_tls()?.wrapping_add(a))
-                }
+                RelocKind::DtpMod => put(base, r.offset, s_tls()?.0 as u64 + 1),
+                RelocKind::DtpOff => put(base, r.offset, s_tls()?.1.wrapping_add(a)),
                 RelocKind::TpOff => {
-                    needs_tls()?;
-                    put(base, r.offset, tls::tpoff(s_tls()?.wrapping_add(a)))
+                    let (m, v) = s_tls()?;
+                    put(base, r.offset, tls::tpoff_in(m, v.wrapping_add(a)))
                 }
                 RelocKind::TlsDesc => {
-                    needs_tls()?;
+                    let (m, v) = s_tls()?;
                     if !writable(img, r.offset + 8) {
                         return Err(LoadError::Reloc("TLSDESC second word not writable", r.offset));
                     }
                     put(base, r.offset, tls::hospes_tlsdesc_static as *const () as usize as u64);
-                    put(base, r.offset + 8, tls::tpoff(s_tls()?.wrapping_add(a)));
+                    put(base, r.offset + 8, tls::tpoff_in(m, v.wrapping_add(a)));
                 }
                 RelocKind::IRelative => deferred.push(i),
             }

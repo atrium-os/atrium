@@ -50,7 +50,11 @@ build_fixtures() {
         $cc $lk -o "$out/badversion.so" "$src/badversion.c"
         $cc $lk -o "$out/probe.so" "$src/probe.c"
         $cc $lk -o "$out/trap.so" "$src/trap.c"
-        rm -f "$out/libhost.so"
+        # Two libraries loaded as one set: user.so imports from dep.so.
+        $cc $lk -Wl,-soname,libdep.so -o "$out/dep.so" "$src/dep.c"
+        ln -sf dep.so "$out/libdep.so"
+        $cc $lk -ldep -o "$out/user.so" "$src/user.c"
+        rm -f "$out/libhost.so" "$out/libdep.so"
         # H4: a glibc-built C++ library shaped like Widevine: LLVM libc++abi linked in
         # statically, the unwinder imported from libgcc_s, old glibc symbol versions.
         clang++ --target=$arch-linux-gnu -fuse-ld=lld -O2 -fPIC -shared -nostdlib++ -std=c++17 \
@@ -138,6 +142,8 @@ run_all() {
         $w "$r" refuse "$d/$f.so" || fails=$((fails + 1))
     done
     $w "$r" probe "$d/probe.so" || fails=$((fails + 1))
+    # Two libraries as one set: functions, data and TLS across modules.
+    $w "$r" set "$d/user.so" "$d/dep.so" || fails=$((fails + 1))
     # K1: raw Linux calls from the library, under the trap; on Linux also the reference run
     # where the kernel answers them.
     $w "$r" trap "$d/trap.so" || fails=$((fails + 1))

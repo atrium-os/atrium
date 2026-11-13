@@ -11,6 +11,8 @@
 //! - `probe`: the isolation probe; `fixture_main` returns how many escapes succeeded;
 //! - `glibc`: load a glibc-built library against the real shim (`hospes_glibc::Glibc`) and
 //!   call `fixture_glibc_main(1)`, expect 0 (H4: exceptions, threads, text, process);
+//! - `set USER.so DEP.so`: load DEP then USER as one set (USER imports DEP's functions,
+//!   data and TLS), run both initialisers, call USER's `fixture_main`, expect 0;
 //! - `load-only`: map and relocate a real library (CDM, OpenH264) with unknown imports bound
 //!   to an abort stub, run nothing from it, and report what was bound. Development only.
 //!
@@ -116,7 +118,7 @@ fn fail(name: &str, why: core::fmt::Arguments) -> i32 {
 #[no_mangle]
 pub fn hospes_main(info: &'static StartInfo) -> i32 {
     let (Some(mode), Some(path)) = (info.arg(1), info.arg_z(2)) else {
-        hlog!("usage: hospes-fixture-runner run|refuse|relro-write|text-write|probe|trap|trap-hold|raw|glibc FIXTURE.so");
+        hlog!("usage: hospes-fixture-runner run|refuse|relro-write|text-write|probe|trap|trap-hold|raw|glibc FIXTURE.so | set USER.so DEP.so");
         return 2;
     };
     let mode = core::str::from_utf8(mode).unwrap_or("");
@@ -136,6 +138,14 @@ pub fn hospes_main(info: &'static StartInfo) -> i32 {
             return fail(name, format_args!("no system call trap: {:?}", e));
         }
     }
+    if mode == "set" {
+        if let Some(dep) = info.arg_z(3) {
+            match sys::openat(sys::AT_FDCWD, dep, sys::O_RDONLY | sys::O_CLOEXEC) {
+                Ok(fd) => DEP_FD.store(fd, core::sync::atomic::Ordering::Relaxed),
+                Err(e) => return fail(name, format_args!("open dep: {:?}", e)),
+            }
+        }
+    }
     // Capability mode before we parse anything (spec §2). No-op on the Linux dev backend.
     if let Err(e) = sys::cap_enter() {
         return fail(name, format_args!("cap_enter: {:?}", e));
@@ -153,6 +163,9 @@ pub fn hospes_main(info: &'static StartInfo) -> i32 {
         hospes_glibc::init_from(info);
     }
     let res: &dyn Resolver = if mode == "glibc" { &hospes_glibc::Glibc } else { &Host };
+    if mode == "set" {
+        return set(info, name, fd, &opts);
+    }
     let lib = match load::load(fd, &opts, res) {
         Ok(l) => l,
         Err(e) => {
@@ -226,6 +239,40 @@ pub fn hospes_main(info: &'static StartInfo) -> i32 {
         _ => fail(name, format_args!("unknown mode {}", mode)),
     }
 }
+
+/// Two libraries as one set: the dependency (argument 3) first.
+fn set(info: &'static StartInfo, name: &str, user_fd: i32, opts: &load::Options) -> i32 {
+    // FreeBSD: capability mode is already on, so the second file can't be opened by path;
+    // the runner opens it before (Linux opens it here, where cap_enter is a no-op).
+    let Some(dep) = info.arg_z(3) else { return fail(name, format_args!("set needs DEP.so")) };
+    let dep_fd = match DEP_FD.load(core::sync::atomic::Ordering::Relaxed) {
+        -1 => match sys::openat(sys::AT_FDCWD, dep, sys::O_RDONLY | sys::O_CLOEXEC) {
+            Ok(fd) => fd,
+            Err(e) => return fail(name, format_args!("open dep: {:?}", e)),
+        },
+        fd => fd,
+    };
+    let libs = match load::load_set(&[dep_fd, user_fd], opts, &Host) {
+        Ok(l) => l,
+        Err(e) => return fail(name, format_args!("load_set: {:?}", e)),
+    };
+    let _ = (sys::close(dep_fd), sys::close(user_fd));
+    unsafe { __stack_chk_guard_value = tls::canary() };
+    for l in &libs {
+        unsafe { l.run_init(info.argc, info.argv, info.envp) };
+    }
+    let Some(m) = libs[1].sym("fixture_main") else { return fail(name, format_args!("no fixture_main")) };
+    let m: extern "C" fn() -> i32 = unsafe { core::mem::transmute(m) };
+    match m() {
+        0 => {
+            hlog!("PASS {} (set of 2: calls, data and TLS across modules, {} TLS modules)", name, tls::modules());
+            0
+        }
+        r => fail(name, format_args!("check {} failed", r)),
+    }
+}
+
+static DEP_FD: core::sync::atomic::AtomicI32 = core::sync::atomic::AtomicI32::new(-1);
 
 /// K1: raw Linux system calls from the library. `trap`: under the trap (the shim answers);
 /// otherwise the reference run, where the real Linux kernel answers.

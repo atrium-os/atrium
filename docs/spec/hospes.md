@@ -158,10 +158,13 @@ bounds-checked reads and a fuzz target. It accepts only:
 
 ### 5.3 Thread-local storage
 
-- One static TLS block for the library, sized from `PT_TLS`, allocated in every thread's
-  control block at a fixed offset computed at load. The library's initial-exec and TLSDESC
-  accesses resolve to that offset; general-dynamic `__tls_get_addr` calls go to the shim,
-  which knows the one module.
+- One static TLS block per thread, holding the block of every hosted module with `PT_TLS`
+  (at most 4: a library and the libraries it needs, such as the real libstdc++ for a C++
+  PKCS#11 module, loaded together by `load_set` before any thread exists). Each module sits
+  at a fixed, aligned offset computed at load; its `DTPMOD` is its load index + 1. Initial-
+  exec and TLSDESC accesses resolve to that offset; general-dynamic `__tls_get_addr` calls
+  go to the shim, which reads the module's block from the dtv. A library can import TLS
+  from one loaded before it.
 - **arm64 (TLS variant I):** the thread pointer (`TPIDR_EL0`) points at a 16-byte header
   (`dtv`, reserved), followed by the library's block.
 - **x86_64 (TLS variant II):** `%fs` points at a glibc `tcbhead_t`: self-pointer at 0,
