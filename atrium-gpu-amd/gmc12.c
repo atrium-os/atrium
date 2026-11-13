@@ -677,8 +677,18 @@ tbl_alloc(struct amd_vm12 *vm, bool ptb, u_int *t)
 		vm->sys_pa[*t] = vtophys(vm->sys[*t]);
 	}
 	vm->used++;
+	/*
+	 * Unused entries: a PTB's are invalid PTEs (EXECUTABLE | IS_PTE, the
+	 * GMC9 fault-priority workaround); a directory's are invalid leaf
+	 * PDEs, 0 | IS_PTE, as amdgpu_vm_pt_clear writes them ("handle leaf
+	 * PDEs as PTEs", AMDGPU_PDE_PTE_GFX12). Box runs 1b71cafd/3959e48a:
+	 * with 0 there, a store through an empty directory entry (VA 0, a
+	 * high VA) faulted with WALKER_ERROR 6 and left the GFXHUB L2 unable
+	 * to ack any invalidation until a mode 1 reset.
+	 */
 	for (i = 0; i < PAGE_SIZE / 8; i++)
-		tbl_wr(vm, *t, i, ptb ? PTE_EXECUTABLE | PTE_IS_PTE : 0);
+		tbl_wr(vm, *t, i, ptb ? PTE_EXECUTABLE | PTE_IS_PTE :
+		    PTE_IS_PTE);
 	return (0);
 }
 
