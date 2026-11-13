@@ -8,6 +8,10 @@ Laminar CPU scheduler (kernel `SCHED_LAMINAR`); grounds against the gpusim
 model (separate repo). Energy stance:
 [`feedback_energy_policy_coordinated_not_coupled`].
 
+> **Silicon status (2026-11-13):** what of this applies on the R9700 today,
+> the compositor-vs-GPU-hog rules and the gap list are in
+> [`gpu-arbitration.md`](gpu-arbitration.md).
+
 ## 0. Thesis (lead with the payoff)
 
 > **⚠ Partially superseded (2026-06-11) by
