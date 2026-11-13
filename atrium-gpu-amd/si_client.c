@@ -275,6 +275,10 @@ si_uq_cperr(struct amd_si_client *c, uint32_t hqds, bool log)
 	u_int i, pipe, q;
 
 	mtx_assert(&c->sc->lock, MA_OWNED);
+	if (amd_mes_live && log && hqds != 0)
+		device_printf(c->sc->dev, "si: CP error on me1 HQDs %#x: no "
+		    "HQD scan while MES runs; the hang check takes the "
+		    "queue\n", hqds);
 	for (i = 0; i < AMD_UQ_SLOTS && hqds != 0; i++) {
 		u = &c->uq[i];
 		if (u->hw == NULL || u->dead ||

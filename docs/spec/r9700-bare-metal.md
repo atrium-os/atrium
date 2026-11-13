@@ -1508,3 +1508,17 @@ work (self-test, scrub).
   and CPF state and whether engine 16 still acks; si-fuzz ends the run after 10
   timed-out job setups and prints its end block on SIGTERM. Logs:
   claude/project-thread-33aauq 691516f0, 5ab6bf66.
+- **2026-11-13 17:07, 1 h fuzz diagnostic (ff5cb48e): FAIL, the wedge again,
+  one second after re-init 2.** si-fuzz ended itself after 10 timed-out job
+  setups (2 findings). At the first timeout: GCVM_L2_STATUS 0x1, CP_CPF_STATUS
+  bit 28 set, and engine 16 got no ack either: the hub is stuck, not engine
+  17. The select log (budget 32, spent by 17:07:11) named uq2_hqd_at 24 times:
+  the 32-HQD scan after every successful REMOVE_QUEUE (also mes_report,
+  kcq_report, kq_int, the self-test). So queue teardown GRBM-selected MES's
+  HQDs on every close, against the rule; the burst of closes right after a
+  re-init hit MES busy. Fix (next commit): uq2_hqd_at answers "not found"
+  while MES runs, so teardown relies on MES alone (REMOVE_QUEUE, MES RESET,
+  then the whole-GPU reset); a CP error's queue is taken by the hang check;
+  mes_report and kcq_report skip their selects; kq_int is a no-op once MES
+  set the interrupt enables. The select log now counts per calling site.
+  Logs: claude/project-thread-33aauq 8cddd2ca.

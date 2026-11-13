@@ -107,18 +107,28 @@ MTX_SYSINIT(amd_grbm, &amd_grbm_mtx, "amd grbm select", MTX_DEF);
  * came back after two re-inits, with no fault in sight).
  */
 volatile int amd_mes_live;
-static int amd_grbm_live_logged;
+static struct { void *from; u_int n; } amd_grbm_live[16];
 
 void
 amd_grbm_select_write(struct atrium_amd_softc *sc, bus_size_t off,
     uint32_t v)
 {
-	if (v != 0 && amd_mes_live && amd_grbm_live_logged < 32) {
-		amd_grbm_live_logged++;
-		device_printf(sc->dev, "grbm: select %#x while MES runs, from "
-		    "%p (amd_grbm_select_write at %p)\n", v,
-		    __builtin_return_address(0), (void *)amd_grbm_select_write);
-	}
+	void *from = __builtin_return_address(0);
+	u_int i, n = 0;
+
+	/* Each calling site: its first 2, then every 1000th (run ff5cb48e
+	 * spent a total budget of 32 at attach). */
+	for (i = 0; v != 0 && amd_mes_live && i < nitems(amd_grbm_live); i++)
+		if (amd_grbm_live[i].from == from ||
+		    amd_grbm_live[i].from == NULL) {
+			amd_grbm_live[i].from = from;
+			n = ++amd_grbm_live[i].n;
+			break;
+		}
+	if (n != 0 && (n <= 2 || n % 1000 == 0))
+		device_printf(sc->dev, "grbm: select %#x while MES runs (%u "
+		    "from here), from %p (amd_grbm_select_write at %p)\n", v,
+		    n, from, (void *)amd_grbm_select_write);
 	if (!mtx_owned(&amd_grbm_mtx))
 		mtx_lock(&amd_grbm_mtx);
 	amd_mmio_write32(sc, off, v);

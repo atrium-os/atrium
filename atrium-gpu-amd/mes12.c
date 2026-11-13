@@ -386,7 +386,7 @@ mes_report(struct mes *m, const char *when)
 
 	device_printf(m->sc->dev, "mes: %s: CP_MES_CNTL %#x", when,
 	    rd(m, m->g->cp_mes_cntl));
-	for (p = 0; p < 2; p++) {
+	for (p = 0; p < 2 && !amd_mes_live; p++) {	/* no selects: F7 */
 		grbm_select(m, 3, p);
 		printf("; pipe %d: instr %#x, GP3 %#x, HQD active %u, rptr "
 		    "%#x, wptr %#x", p, rd(m, m->g->mes_instr_pntr),
@@ -1112,14 +1112,16 @@ static void
 kcq_report(struct mes *m, struct disp *d, const char *when)
 {
 	const struct mes_gen *g = m->g;
-	uint32_t act, rptr, wlo, db;
+	uint32_t act = 0, rptr = 0, wlo = 0, db = 0;
 
-	grbm_select(m, 1, 0);
-	act = rd(m, g->hqd_active);
-	rptr = rd(m, g->hqd_pq_rptr);
-	wlo = rd(m, g->hqd_pq_wptr_lo);
-	db = rd(m, g->hqd_doorbell);
-	grbm_select(m, 0, 0);
+	if (!amd_mes_live) {	/* MES's HQDs: no selects while it runs */
+		grbm_select(m, 1, 0);
+		act = rd(m, g->hqd_active);
+		rptr = rd(m, g->hqd_pq_rptr);
+		wlo = rd(m, g->hqd_pq_wptr_lo);
+		db = rd(m, g->hqd_doorbell);
+		grbm_select(m, 0, 0);
+	}
 	device_printf(m->sc->dev, "dispatch: %s: HQD active %u, rptr %#x, "
 	    "wptr %#x, doorbell %#x; rptr report %#x, fence %#x; CP_STAT %#x, "
 	    "CPC_STATUS %#x, GRBM_STATUS %#x\n", when, act & 1, rptr, wlo, db,
@@ -1723,6 +1725,10 @@ kq_int(struct amd_kq *kq, bool on)
 {
 	struct mes *m = kq->m;
 
+	/* mec_ints set pipe 0's TIME_STAMP_INT_ENABLE at MES start and left
+	 * it on: nothing to do, and no select while MES runs. */
+	if (m->uq_ints_on)
+		return;
 	grbm_select(m, 1, 0);
 	if (on) {
 		kq->d.int_cntl = rd(m, m->g->cpc_int_cntl);
@@ -2496,13 +2502,32 @@ amd_mes12_uq_fence_va(struct amd_uq *q)
 	return (q->va + UQ2_WB + 0x10);
 }
 
-/* The active MEC1 HQD (any pipe and queue) whose doorbell is `db`. */
+/*
+ * The active MEC1 HQD (any pipe and queue) whose doorbell is `db`.
+ *
+ * Never while MES runs (spec §5 rule, audit F7): fuzz runs 78169ef0 and
+ * ff5cb48e wedged the GFXHUB (L2 busy, CPF bit 28, no engine acking) one
+ * second after a re-init, and the logged selects were this scan's, done
+ * after every successful REMOVE_QUEUE. With MES running this answers "not
+ * found", so the callers rely on MES alone: REMOVE_QUEUE, then MES's
+ * RESET, then the whole-GPU reset; a CP error's queue is taken by the hang
+ * check; a fault's VMID comes from the hub (amd_mes12_uq_vmid_by_base).
+ */
+static u_int uq2_scans_skipped;
+
 static bool
 uq2_hqd_at(struct mes *m, uint32_t db, u_int *vmid, u_int *pipep, u_int *qp)
 {
 	const struct mes_gen *g = m->g;
 	u_int pipe, q;
 
+	if (amd_mes_live) {
+		if (uq2_scans_skipped++ < 4)
+			device_printf(m->sc->dev, "mes: HQD scan for doorbell "
+			    "%#x skipped: MES runs (%u so far)\n", db,
+			    uq2_scans_skipped);
+		return (false);
+	}
 	for (pipe = 0; pipe < 4; pipe++)
 		for (q = 0; q < 8; q++) {
 			grbm_select_q(m, 1, pipe, q);
