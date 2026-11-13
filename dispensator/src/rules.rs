@@ -7,13 +7,22 @@
 //! (`[service.NAME]`). All files of the directory are merged; a name defined
 //! twice is an error, so one package cannot redefine another's driver.
 //!
-//! D2 knows one device class, `hid`: a HID device (one `hidbus`) with its
-//! top-level collections' usage pages, its `hidraw` unit and, when `u2f(4)`
-//! drives a FIDO collection, the `u2f` unit. More classes (USB interfaces,
+//! Two device classes so far:
+//!
+//! - `hid`: a HID device (one `hidbus`) with its top-level collections'
+//!   usage pages, its `hidraw` unit and, when `u2f(4)` drives a FIDO
+//!   collection, the `u2f` unit. Placeholders `{hidraw}`, `{hidbus}`, `{u2f}`.
+//! - `driver`: a device a kernel driver attached, by driver name (`pcm`,
+//!   `atkbd`, `psm`): `driver = "pcm"` matches `pcm0`, `pcm1`... Placeholder
+//!   `{unit}`. Used for kernel class drivers whose nodes a service consumes.
+//!
+//! More classes (USB interfaces,
 //! `pcm`, disks) come with D3 and D4.
 //!
-//! Templates use `{hidraw}`, `{hidbus}`, `{u2f}` and, in a driver's argv,
-//! `{node}` (the node the rule granted).
+//! Templates use the class's placeholders and, in a driver's argv, `{node}`
+//! (the node the rule granted). A driver's `jail` and `root` take only the
+//! class's instance placeholder (`{hidraw}` or `{unit}`), so one jail per
+//! device and a stop needs only what a detach names.
 
 use std::collections::BTreeMap;
 use std::fmt;
@@ -28,13 +37,18 @@ pub struct Rule {
     pub class: String,
     #[serde(default)]
     pub priority: i32,
-    /// Match if any top-level collection is on one of these usage pages.
-    /// Absent: any HID device with at least one collection.
+    /// `hid`: match if any top-level collection is on one of these usage
+    /// pages. Absent: any HID device with at least one collection.
     #[serde(default)]
     pub any_page: Vec<u16>,
+    /// `driver`: the kernel driver's name (devices `NAME0`, `NAME1`...).
+    #[serde(default)]
+    pub driver: String,
     /// Nodes to grant, in order; the first whose placeholders are all
-    /// known is used.
+    /// known is used, or every one with `all_nodes`.
     pub nodes: Vec<String>,
+    #[serde(default)]
+    pub all_nodes: bool,
     /// `driver:NAME` or `service:NAME`.
     pub owner: String,
 }
@@ -46,10 +60,10 @@ pub struct Driver {
     pub argv: Vec<String>,
     pub uid: u32,
     pub gid: u32,
-    /// Jail name; must contain `{hidraw}` (and no other placeholder), so
-    /// each device gets its own and a stop needs only the unit devd names.
+    /// Jail name; must contain the instance placeholder of every rule class
+    /// that uses this driver (`{hidraw}` or `{unit}`), and no other.
     pub jail: String,
-    /// Jail root; `{hidraw}` only, as for `jail`.
+    /// Jail root; as for `jail`.
     pub root: String,
     pub devfs_ruleset: u32,
     pub sysfil: String,
@@ -114,7 +128,27 @@ fn err<T>(m: impl Into<String>) -> Result<T, Error> {
 
 pub const MAX_FILE: u64 = 64 * 1024;
 pub const MAX_RULES: usize = 256;
-const PLACEHOLDERS: [&str; 3] = ["hidraw", "hidbus", "u2f"];
+/// The placeholders a class's devices have.
+pub fn class_vars(class: &str) -> &'static [&'static str] {
+    match class {
+        "hid" => &["hidraw", "hidbus", "u2f"],
+        "driver" => &["unit"],
+        _ => &[],
+    }
+}
+
+/// The placeholder naming one device of a class (jail names, stops).
+pub fn instance_var(class: &str) -> &'static str {
+    if class == "hid" {
+        "hidraw"
+    } else {
+        "unit"
+    }
+}
+
+fn driver_name_ok(s: &str) -> bool {
+    !s.is_empty() && s.len() <= 24 && s.bytes().all(|b| b.is_ascii_lowercase() || b == b'_')
+}
 
 fn ident_ok(s: &str) -> bool {
     !s.is_empty() && s.len() <= 40 && s.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
@@ -187,7 +221,7 @@ impl Rules {
                 return Err(w("argv must have 1 to 32 entries".into()));
             }
             for a in &d.argv {
-                check_template("argv", a, &["hidraw", "hidbus", "u2f", "node"]).map_err(|e| w(e.0))?;
+                check_template("argv", a, &["hidraw", "hidbus", "u2f", "unit", "node"]).map_err(|e| w(e.0))?;
             }
             if d.uid == 0 || d.gid == 0 {
                 return Err(w("a driver never runs as root".into()));
@@ -195,16 +229,13 @@ impl Rules {
             if d.devfs_ruleset == 0 {
                 return Err(w("devfs_ruleset 0 would show the host's /dev".into()));
             }
-            for (k, t) in [("jail", &d.jail), ("root", &d.root)] {
-                if !t.contains("{hidraw}") {
-                    return Err(w(format!("{k} must contain {{hidraw}}: one jail per device")));
-                }
-            }
-            check_template("jail", &d.jail, &["hidraw"]).map_err(|e| w(e.0))?;
+            // Which instance placeholder must appear is checked per rule
+            // in finish(), once the rules naming this driver are known.
+            check_template("jail", &d.jail, &["hidraw", "unit"]).map_err(|e| w(e.0))?;
             if !d.jail.bytes().all(|b| b.is_ascii_alphanumeric() || b"-_{}".contains(&b)) {
                 return Err(w("jail name: letters, digits, '-', '_' only".into()));
             }
-            check_abs("root", &d.root, &["hidraw"]).map_err(|e| w(e.0))?;
+            check_abs("root", &d.root, &["hidraw", "unit"]).map_err(|e| w(e.0))?;
             if !ident_ok(&d.sysfil) {
                 return Err(w("sysfil: a profile name".into()));
             }
@@ -238,14 +269,17 @@ impl Rules {
             if self.rules.len() == MAX_RULES {
                 return Err(w(format!("more than {MAX_RULES} rules")));
             }
-            if r.class != "hid" {
-                return Err(w(format!("class {:?}: only \"hid\" so far", r.class)));
+            match r.class.as_str() {
+                "hid" if r.driver.is_empty() => {}
+                "driver" if r.any_page.is_empty() && driver_name_ok(&r.driver) => {}
+                "hid" | "driver" => return Err(w("hid takes any_page, driver takes driver = \"NAME\"".into())),
+                c => return Err(w(format!("class {c:?}: \"hid\" or \"driver\""))),
             }
             if r.nodes.is_empty() || r.nodes.len() > 8 {
                 return Err(w("nodes: 1 to 8 entries".into()));
             }
             for n in &r.nodes {
-                check_template("node", n, &PLACEHOLDERS).map_err(|e| w(e.0))?;
+                check_template("node", n, class_vars(&r.class)).map_err(|e| w(e.0))?;
                 if n.starts_with('/') || !n.contains('{') || n.split('/').any(str::is_empty) {
                     return Err(w(format!("node {n:?}: a /dev-relative name with a unit placeholder")));
                 }
@@ -260,7 +294,8 @@ impl Rules {
         Ok(())
     }
 
-    /// After every file: each rule's owner exists.
+    /// After every file: each rule's owner exists, and a driver's jail and
+    /// root are per device of the rule's class.
     pub fn finish(self) -> Result<Self, Error> {
         for (r, o) in &self.rules {
             let ok = match o {
@@ -269,6 +304,18 @@ impl Rules {
             };
             if !ok {
                 return err(format!("rule {}: owner {} is not defined in any file", r.name, r.owner));
+            }
+            if let Owner::Driver(n) = o {
+                if r.all_nodes {
+                    return err(format!("rule {}: a driver jail is granted one node; all_nodes is for services", r.name));
+                }
+                let d = &self.drivers[n];
+                let v = instance_var(&r.class);
+                for (k, t) in [("jail", &d.jail), ("root", &d.root)] {
+                    if placeholders(t) != Some(vec![v]) {
+                        return err(format!("rule {}: driver {n}'s {k} must hold {{{v}}} and nothing else: one jail per device", r.name));
+                    }
+                }
             }
         }
         Ok(self)
@@ -308,10 +355,25 @@ impl Rules {
     /// The winning rule for a HID device with these collection pages:
     /// highest priority, then name, among rules whose page filter matches.
     pub fn match_hid(&self, pages: &[u16]) -> Option<&(Rule, Owner)> {
+        self.best(|r| r.class == "hid" && (r.any_page.is_empty() || pages.iter().any(|p| r.any_page.contains(p))))
+    }
+
+    /// The winning rule for a device a kernel driver attached as `name`
+    /// (`pcm1`): its driver part, and the unit.
+    pub fn match_driver(&self, name: &str) -> Option<(&(Rule, Owner), u32)> {
+        let split = name.find(|c: char| c.is_ascii_digit())?;
+        let (drv, unit) = name.split_at(split);
+        if unit.len() > 6 || !unit.bytes().all(|b| b.is_ascii_digit()) {
+            return None;
+        }
+        let unit = unit.parse().ok()?;
+        Some((self.best(|r| r.class == "driver" && r.driver == drv)?, unit))
+    }
+
+    fn best(&self, f: impl Fn(&Rule) -> bool) -> Option<&(Rule, Owner)> {
         self.rules
             .iter()
-            .filter(|(r, _)| r.class == "hid")
-            .filter(|(r, _)| r.any_page.is_empty() || pages.iter().any(|p| r.any_page.contains(p)))
+            .filter(|(r, _)| f(r))
             .max_by(|(a, _), (b, _)| a.priority.cmp(&b.priority).then_with(|| b.name.cmp(&a.name)))
     }
 }
@@ -333,7 +395,7 @@ mod tests {
     #[test]
     fn shipped_rules_load() {
         let r = shipped();
-        assert_eq!(r.rules.len(), 2);
+        assert_eq!(r.rules.len(), 4);
         assert_eq!(r.match_hid(&[0xF1D0]).unwrap().0.name, "sigillum-fido");
         assert_eq!(r.match_hid(&[0x0001, 0xF1D0]).unwrap().0.name, "sigillum-fido");
         assert_eq!(r.match_hid(&[0x0001]).unwrap().0.name, "tactus-input");
@@ -362,6 +424,7 @@ mod tests {
             ("\"hidraw{hidraw}\"]", "\"{disk}\"]"),
             ("owner    = \"driver:sigillum-fido\"", "owner    = \"root:x\""),
             ("class    = \"hid\"", "class    = \"usb\""),
+            ("class    = \"hid\"", "class    = \"driver\""),
             ("root          = \"/var/lib/atrium/jails/sigillum-fido-{hidraw}\"", "root          = \"/var/lib/atrium/jails/sigillum-fido-{u2f}-{hidraw}\""),
         ];
         for (from, to) in cases {
@@ -389,7 +452,7 @@ mod tests {
         std::fs::write(d.join("40-sigillum.toml"), SIGILLUM).unwrap();
         std::fs::write(d.join("README"), "ignored").unwrap();
         let r = Rules::load_dir(&d, false).unwrap();
-        assert_eq!(r.rules.len(), 2);
+        assert_eq!(r.rules.len(), 4);
         // Not root-owned (tests do not run as root, or the file is ours).
         let strict = Rules::load_dir(&d, true);
         let am_root = unsafe { libc::geteuid() } == 0;
@@ -397,5 +460,28 @@ mod tests {
             assert!(strict.is_err());
         }
         std::fs::remove_dir_all(&d).unwrap();
+    }
+
+    #[test]
+    fn driver_class_checks() {
+        let lyra = include_str!("../../lyra/etc/devices.d/35-lyra.toml");
+        let mut r = Rules::default();
+        r.add_toml("l", lyra).unwrap();
+        let r = r.finish().unwrap();
+        assert_eq!(r.match_driver("pcm3").map(|(x, u)| (x.0.name.as_str(), u)), Some(("lyra-pcm", 3)));
+        assert!(r.match_driver("pcm").is_none() && r.match_driver("hdaa0").is_none() && r.match_driver("pcm1x").is_none());
+        for (from, to) in [("driver    = \"pcm\"", "driver    = \"pcm0\""), ("\"dsp{unit}\"", "\"dsp{hidraw}\"")] {
+            assert!(lyra.contains(from));
+            assert!(Rules::default().add_toml("x", &lyra.replacen(from, to, 1)).is_err(), "accepted {to}");
+        }
+        // A driver owner for the driver class must be per {unit}, one node.
+        let sig = include_str!("../../sigillum/etc/devices.d/40-sigillum.toml");
+        let mut r = Rules::default();
+        r.add_toml("s", sig).unwrap();
+        r.add_toml("x", "[[rule]]\nname=\"p\"\nclass=\"driver\"\ndriver=\"pcm\"\nnodes=[\"dsp{unit}\"]\nowner=\"driver:sigillum-fido\"\n").unwrap();
+        assert!(r.finish().is_err(), "a {{hidraw}} jail used for a {{unit}} class");
+        let mut r = Rules::default();
+        r.add_toml("x", "[[rule]]\nname=\"p\"\nclass=\"driver\"\ndriver=\"pcm\"\nnodes=[\"dsp{unit}\"]\nall_nodes=true\nowner=\"driver:d\"\n[driver.d]\nexec=\"/x\"\nargv=[\"x\"]\nuid=5\ngid=5\njail=\"j-{unit}\"\nroot=\"/r/{unit}\"\ndevfs_ruleset=30\nsysfil=\"device\"\n").unwrap();
+        assert!(r.finish().is_err(), "all_nodes with a driver owner");
     }
 }

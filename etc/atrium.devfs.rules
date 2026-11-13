@@ -58,12 +58,12 @@ add path 'atrium-display0' mode 0666
 # lyrad's alone: jaild.policy.toml pins id 24 to the lyrad service (jail
 # atrium-lyrad, /usr/local/bin/atrium-lyrad, uid _lyra). No app jail ever shows
 # dsp* or mixer*: apps play through choragusd (portcullis apply_audio).
+# dsp*/mixer* are shown to lyrad per card by atrium-dispensatord
+# (lyra/etc/devices.d/35-lyra.toml); here only their mode.
 [atrium_audio=24]
 add include $devfsrules_hide_all
 add include $devfsrules_unhide_basic
-add path 'dsp*' unhide
 add path 'dsp*' mode 0666
-add path 'mixer*' unhide
 add path 'mixer*' mode 0666
 add path 'laminar' unhide
 add path 'laminar' mode 0666
@@ -90,13 +90,13 @@ add include $devfsrules_unhide_login
 # one node at a time, in tactusd's own mount (`devfs -m ... rule apply`); a
 # node nobody classified stays hidden. The mode rule still applies to hidden
 # nodes, so an unhidden one is openable by _tactus.
+# hidraw*, atkbd* and bpsm* are shown to tactusd per device by
+# atrium-dispensatord (tactus/etc/devices.d/30-tactus.toml); here only their mode.
 [atrium_input=26]
 add include $devfsrules_hide_all
 add include $devfsrules_unhide_basic
 add path 'hidraw*' mode 0666
-add path 'atkbd*' unhide
 add path 'atkbd*' mode 0666
-add path 'bpsm*' unhide
 add path 'bpsm*' mode 0666
 
 # Sigillum's per-device driver jails (sigillum.md §4): the basics and nothing

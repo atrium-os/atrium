@@ -39,6 +39,9 @@ install -m 0755 "$CHOR" /usr/local/bin/atrium-choragusd
 HERE=$(dirname "$0")/..
 install -d /etc/atrium/services.d
 install -m 0644 "$HERE/lyra/etc/services.d/35-atrium-lyrad.toml" /etc/atrium/services.d/
+# Which dsp/mixer nodes lyrad is shown: dispensatord's rule (device-assignment.md).
+install -d -m 0755 /usr/local/etc/atrium/devices.d
+install -o root -g wheel -m 0644 "$HERE/lyra/etc/devices.d/35-lyra.toml" /usr/local/etc/atrium/devices.d/
 install -m 0644 "$HERE/choragus/etc/services.d/36-atrium-choragusd.toml" /etc/atrium/services.d/
 
 R=/var/lib/atrium/jails/lyrad

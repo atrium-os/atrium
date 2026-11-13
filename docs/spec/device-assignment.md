@@ -389,6 +389,37 @@ the way Ubuntu points at NVIDIA's?).
   - Tests: 8 host tests; FreeBSD (x86_64) type-check of dispensatord and
     portcullisd clean. **Not yet run: the S2e VM gate against dispensatord.**
 
+### 6.2 As built: D3 (2026-11-13)
+
+- **S2e gate passed against dispensatord** (Sigillum thread, amd64 VM,
+  f444666, with tactusd): key jail `atrium-sigillum-fido-1` driven through
+  `/dev/u2f/0`, its `/dev` holding only that node, `_sigillum-dev` 0600, no
+  network; tactusd saw the keyboard and not the key; ceremonies OK; a
+  hot-plugged key got its own jail and lost it on unplug, the first untouched.
+- **A second rule class, `driver`**: a device a kernel driver attached, by
+  driver name (`driver = "pcm"` matches `pcm0`, `pcm1`...), placeholder
+  `{unit}`; `all_nodes = true` grants every node template (a sound card is
+  `dspN` and `mixerN`). A device the registry sees removed (directly, or as
+  part of a detached subtree such as `uaudio0`) is released. Driver owners
+  are refused `all_nodes` (a jail gets one node) and must name their jail
+  and root by the class's instance placeholder only.
+- **Rules**: `lyra/etc/devices.d/35-lyra.toml` (`pcm` → lyrad, `dsp{unit}` +
+  `mixer{unit}`); `tactus/etc/devices.d/30-tactus.toml` gains `atkbd` →
+  `atkbd{unit}` and `psm` → `bpsm{unit}`. `lyra-service.sh` installs Lyra's.
+- **Rulesets**: 24 no longer unhides `dsp*`/`mixer*`, 26 no longer unhides
+  `atkbd*`/`bpsm*` (modes kept). lyrad opens `/dev/dsp` and `/dev/mixer`:
+  `devfs_lookup` runs sound(4)'s `dsp_clone`/`mixer_clone`, which return the
+  default unit's cdev, and the lookup then uses *that* cdev's entry in the
+  same mount, so the default name works exactly when the default card has
+  been shown (read in `sys/fs/devfs/devfs_vnops.c` and
+  `sys/dev/sound/pcm/dsp.c`, main, 2026-11-13). tactusd already rescans every
+  2 s in its jail (no devd socket there), so per-node showing reaches it.
+- **Gate**: `scripts/vm-devices-check.sh` (rulesets, lyrad and tactusd
+  mounts, `/dev/dsp` through the clone, isolation between the two, USB sound
+  card hot-plug and unplug). 10 host tests. **Not yet run in the VM.**
+- `deploy-portcullis.sh` now passes the cross sysroot flags when it builds
+  dispensatord (the Sigillum gate found the plain build failing).
+
 ## 7. Not in scope
 
 - New kernel drivers or hardware coverage (Wi-Fi, laptop I²C/SPI sensors).

@@ -152,7 +152,7 @@ mod run {
 
     use atrium_devevents::DeviceWatcher;
     use dispensator::jail::{plan, stop_names, JailPlan};
-    use dispensator::plan::Op;
+    use dispensator::plan::{Op, Vars};
     use jaild::client::Client;
     use jaild::protocol::{CreateJailRequest, ExecSpec, MountKind, MountSpec, NetworkConfig, Request, Response};
 
@@ -162,8 +162,8 @@ mod run {
         jaild: String,
         state: PathBuf,
         planner: Planner,
-        /// (driver, hidraw) -> the procdesc that keeps its jail alive.
-        drivers: BTreeMap<(String, u32), OwnedFd>,
+        /// (driver, device) -> the procdesc that keeps its jail alive.
+        drivers: BTreeMap<(String, String), OwnedFd>,
         /// The last failure showing each (service, node), so a service that
         /// is down is logged once, not every reshow.
         show_errors: BTreeMap<(String, String), String>,
@@ -236,11 +236,12 @@ mod run {
             for op in ops {
                 match op {
                     Op::Show { service, node } => self.show(&service, &node),
-                    Op::StartDriver { driver, hidraw, hidbus, u2f, node, vendor, product } => {
-                        self.stop(&driver, hidraw);
-                        self.start(&driver, hidraw, hidbus, u2f, &node, vendor, product);
+                    Op::StartDriver { driver, device, vars, node, label } => {
+                        let inst: Vars = vars.iter().filter(|(k, _)| matches!(k.as_str(), "hidraw" | "unit")).map(|(k, v)| (k.clone(), v.clone())).collect();
+                        self.stop(&driver, &device, &inst);
+                        self.start(&driver, &device, &vars, &node, &label);
                     }
-                    Op::StopDriver { driver, hidraw } => self.stop(&driver, hidraw),
+                    Op::StopDriver { driver, device, vars } => self.stop(&driver, &device, &vars),
                     Op::Log(m) => eprintln!("atrium-dispensatord: {m}"),
                 }
             }
@@ -324,11 +325,10 @@ mod run {
             }
         }
 
-        #[allow(clippy::too_many_arguments)]
-        fn start(&mut self, driver: &str, hidraw: u32, hidbus: u32, u2f: Option<u32>, node: &str, vendor: u16, product: u16) {
+        fn start(&mut self, driver: &str, device: &str, vars: &Vars, node: &str, label: &str) {
             let Some(d) = self.planner.rules().drivers.get(driver) else { return };
-            let Some(p) = plan(d, hidraw, hidbus, u2f, node) else {
-                eprintln!("atrium-dispensatord: {driver}: hidraw{hidraw}: a template has no value");
+            let Some(p) = plan(d, vars, node) else {
+                eprintln!("atrium-dispensatord: {driver}: {device}: a template has no value");
                 return;
             };
             Self::unmount_all(&p.path, &p.mounts_ro);
@@ -336,13 +336,13 @@ mod run {
             match sent {
                 Ok((Response::JailCreated(r), fd)) => {
                     eprintln!(
-                        "atrium-dispensatord: hidraw{hidraw} ({vendor:04x}:{product:04x}) -> {} via {node} (jid {}, pid {})",
+                        "atrium-dispensatord: {device} ({label}) -> {} via {node} (jid {}, pid {})",
                         p.name, r.jid, r.pid
                     );
                     if let Some(raw) = fd {
                         // SAFETY: jaild just passed us this procdesc and we own
                         // it; holding it keeps the driver's persist=0 jail alive.
-                        self.drivers.insert((driver.to_string(), hidraw), unsafe { OwnedFd::from_raw_fd(raw) });
+                        self.drivers.insert((driver.to_string(), device.to_string()), unsafe { OwnedFd::from_raw_fd(raw) });
                     }
                 }
                 Ok((other, _)) => eprintln!("atrium-dispensatord: {}: jaild: {other:?}", p.name),
@@ -350,11 +350,11 @@ mod run {
             }
         }
 
-        fn stop(&mut self, driver: &str, hidraw: u32) {
+        fn stop(&mut self, driver: &str, device: &str, vars: &Vars) {
             let Some(d) = self.planner.rules().drivers.get(driver) else { return };
-            let Some((name, path)) = stop_names(d, hidraw) else { return };
+            let Some((name, path)) = stop_names(d, vars) else { return };
             let mounts = d.mounts_ro.clone();
-            let had = self.drivers.remove(&(driver.to_string(), hidraw)).is_some();
+            let had = self.drivers.remove(&(driver.to_string(), device.to_string())).is_some();
             let rm = Request::RemoveJail { jid: None, name: Some(name.clone()) };
             let _ = Client::connect(&self.jaild).and_then(|mut c| c.send(&rm));
             Self::unmount_all(&path, &mounts);

@@ -1,0 +1,23 @@
+# Lyra's devices for dispensatord (docs/spec/device-assignment.md §4.2).
+# Installed to /usr/local/etc/atrium/devices.d/ by scripts/lyra-service.sh.
+#
+# Every sound card the kernel's sound(4) drivers attach (snd_hda, snd_uaudio,
+# ...) appears as pcmN with /dev/dspN and /dev/mixerN. Both are shown to
+# lyrad in its own devfs mount (ruleset 24 no longer unhides dsp* or mixer*).
+# lyrad opens /dev/dsp and /dev/mixer: devfs resolves those through sound(4)'s
+# clone handler to the default unit's dspN/mixerN entry in the same mount, so
+# they work exactly when the default unit has been shown, and a hot-plugged
+# USB headset is shown as soon as it attaches.
+
+[[rule]]
+name      = "lyra-pcm"
+class     = "driver"
+driver    = "pcm"
+priority  = 50
+nodes     = ["dsp{unit}", "mixer{unit}"]
+all_nodes = true
+owner     = "service:lyrad"
+
+[service.lyrad]
+devfs       = "/var/lib/atrium/jails/lyrad/dev"
+reshow_secs = 2

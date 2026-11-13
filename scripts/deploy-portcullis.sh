@@ -35,7 +35,11 @@ g() { ssh $SSHOPT -p 2222 root@localhost "$@"; }
 # ── build anything missing ──────────────────────────────────────────
 if [ ! -x "$DT/atrium-dispensatord" ]; then
     echo "=== building atrium-dispensatord (cross) ==="
-    ( cd "$BSD/dispensator" && cargo build --release --target "$TARGET" ) || {
+    # The sysroot link flags cloud-vm.sh computes (a plain cargo build has no
+    # FreeBSD libc to link against); CROSS_RUSTFLAGS in the environment wins.
+    case "$TARGET" in x86_64-*) VMARCH=amd64 ;; *) VMARCH=aarch64 ;; esac
+    : "${CROSS_RUSTFLAGS:=$(cd "$BSD" && ARCH=$VMARCH sh -c '. ./scripts/cloud-vm.sh >/dev/null 2>&1; printf %s "$CROSS_RUSTFLAGS"' sh env)}"
+    ( cd "$BSD/dispensator" && RUSTFLAGS="$CROSS_RUSTFLAGS" cargo build --release --target "$TARGET" ) || {
         echo "ABORT: dispensatord cross-build failed"; exit 1; }
 fi
 # ★ Cross-build on the HOST, never in the VM (feedback_always_cross_build).

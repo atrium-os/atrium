@@ -19,3 +19,23 @@ owner    = "service:tactusd"
 [service.tactusd]
 devfs       = "/var/lib/atrium/jails/tactusd/dev"
 reshow_secs = 2
+
+# The PS/2 keyboard and pointer (laptops, the VM's i8042): their kernel
+# drivers' nodes, shown to tactusd per device (ruleset 26 no longer unhides
+# atkbd* or bpsm*). tactusd opens /dev/atkbd0 and the blocking /dev/bpsm0.
+
+[[rule]]
+name     = "tactus-ps2-keyboard"
+class    = "driver"
+driver   = "atkbd"
+priority = 50
+nodes    = ["atkbd{unit}"]
+owner    = "service:tactusd"
+
+[[rule]]
+name     = "tactus-ps2-pointer"
+class    = "driver"
+driver   = "psm"
+priority = 50
+nodes    = ["bpsm{unit}"]
+owner    = "service:tactusd"
