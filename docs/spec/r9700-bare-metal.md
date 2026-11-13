@@ -1221,3 +1221,15 @@ work (self-test, scrub).
   Next: bisect by VA with si-client-test 48dad7ab. SI15_VA=<hex> runs one store, and
   SI15_SPIN=1 runs the endless shader alone. Logs: claude/project-thread-33aauq
   34b15e3b.
+- **2026-11-13 11:54, VA bisection (si-client-test d19906bf, kmods fc54eb53): the
+  address does not matter.** Two runs, each 70 passed and 2 failed:
+  - SI15_VA=0x10200000: WEDGED.
+  - SI15_VA=0x10003000 (the control, just past the buffer): WEDGED.
+  The fault status (0xc41050), the after-kill state (GRBM_STATUS2 0x34118000, CPC
+  0x80110400, CPF 0xb0000001) and the 189 flush timeouts are identical to the
+  0x7ffffff00000 run.
+  Test 7's identical store fault (0xb41050), earlier in the run, leaves everything
+  clean. The difference is what came before: every wedging run had test 13's SQC
+  instruction fault (W^X) just before its store fault.
+  Next: 48dad7ab+1 adds SI_SKIP13=1. Logs: claude/project-thread-33aauq 4446d344,
+  412231c3.
