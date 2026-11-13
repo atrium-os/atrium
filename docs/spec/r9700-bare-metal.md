@@ -865,3 +865,29 @@ work (self-test, scrub).
   hostile-PM4 reset). Fix: `gpu_wx` is now bits: 1 = client BOs X only where bound EXEC;
   2 = no X on the queue's pages (diagnostic only). Test 13 uses bit 1 and no longer
   probes an IB without X.
+- **2026-11-13 05:08, stage 5f on the box (955528b9): si-client-test 64/64; suite: all
+  silicon tests pass but va_reuse; isolation stopped after Part A step 6 (GPU reset).**
+  Test 13 (W^X, `gpu_wx` = 1) passed: code and IB bound EXEC run with data pages
+  without X, and a jump into a read-write data BO faults (EIO). That queue came off
+  cleanly (wave kill, fence landed, REMOVE_QUEUE ok) and the VM ran on. `va_reuse` ran
+  out at bind 6656. Client VMs took their tables from the 5b test pool: 4 slices of 16
+  tables, so 13 leaf tables, 6656 pages (26 MiB) per VM and only 4 client VMs at once.
+  Isolation steps 4/5 have VM B DMA-copy from a VA it does not map. The CP-side fault
+  lost B's queue, and at its close the HQD stayed active through the wave kill and HQD
+  reset. MES refused REMOVE_QUEUE (status 0x8100030100000000) and the driver reset the
+  GPU. This is the third wedge with this signature. All three were faults raised by the
+  CP itself: a truncated packet, an EOP write without X, a DMA from an unmapped VA.
+  Shader-side faults (stores, instruction fetch) recover cleanly. The fault lines were
+  missing: the client-fault decode shared a 5/s log budget.
+- **2026-11-13, fixes for the next run.**
+  - Client VMs take each page table as a CPU-visible page from the VRAM allocator
+    (`AMD_VM12_4L_HEAP`, up to 192 tables: the whole 256 MiB BO window plus queue
+    pages, under a per-VM sx lock). The allocator's part inside BAR0 (128-256 MiB) is
+    now marked visible for them; ordinary allocations go above it first.
+  - Every VM fault batch logs a line (VMIDs, address) and the decoded fault status
+    (client CPF/CPC/SQC...), on its own 10/s budget.
+  - The HQD reset also writes SPI_COMPUTE_QUEUE_RESET, as amdgpu's
+    `mes_v12_0_reset_queue_mmio` does. If REMOVE_QUEUE is still refused, the driver
+    sends MES's own queue reset (MES_SCH_API_RESET, reset_queue_only, by doorbell) and
+    tries REMOVE once more; only then does it reset the GPU. Isolation steps 4/5 are the
+    reproducer.

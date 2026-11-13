@@ -859,10 +859,14 @@ struct amd_vm12 {
 	bool	translate_further;	/* GC's PDE format variant */
 	void	*sys[64];		/* AMD_VM12_4L_SYS tables */
 	vm_paddr_t sys_pa[64];
+	uint64_t *heap;			/* AMD_VM12_4L_HEAP: table FB offsets */
+	struct sx tlock;		/* AMD_VM12_4L_HEAP: table walks */
 };
 #define AMD_VM12_4L_VRAM	0	/* amdgpu's layout */
 #define AMD_VM12_FLAT		1	/* diagnostic: depth 0, 2 MiB */
 #define AMD_VM12_4L_SYS		2	/* diagnostic: tables in system RAM */
+#define AMD_VM12_4L_HEAP	3	/* client VMs: tables from the VRAM allocator */
+#define AMD_VM12_HEAP_TABLES	192	/* 4L_HEAP: tables per VM (window + queue pages) */
 #define AMD_VM_READ	0x1u
 #define AMD_VM_WRITE	0x2u
 #define AMD_VM_EXEC	0x4u

@@ -964,9 +964,10 @@ int
 amd_si_vram_init(struct atrium_amd_softc *sc)
 {
 	struct amd_gart *gt = amd_si_gart(sc);
-	uint64_t device, lo = AMD_SI_VRAM_DRIVER_END, hi;
+	uint64_t device, lo = AMD_SI_VRAM_DRIVER_END, hi, bar;
 	bool reported = false;
 	u_int i;
+	int err;
 
 	if (gt == NULL || gt->fb_end <= gt->fb_start)
 		return (ENXIO);
@@ -990,7 +991,17 @@ amd_si_vram_init(struct atrium_amd_softc *sc)
 	if (!reported)
 		device_printf(sc->dev, "VRAM: the PSP reported no "
 		    "reservation; keeping the top 1 GiB out\n");
-	return (amd_vram_init_range(sc, device, lo, hi, true));
+	if ((err = amd_vram_init_range(sc, device, lo, hi, true)) != 0)
+		return (err);
+	/*
+	 * The part of the range inside BAR0 is CPU-visible: client page
+	 * tables live there (gmc12.c AMD_VM12_4L_HEAP, written through
+	 * BAR0); ordinary allocations go above it first.
+	 */
+	bar = gt->vram != NULL ? rman_get_size(gt->vram) : 0;
+	if (bar > lo)
+		sc->vram.visible = MIN(bar, hi);
+	return (0);
 }
 
 struct mes *

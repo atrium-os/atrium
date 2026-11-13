@@ -139,6 +139,8 @@ struct amd_si_client {
 	uint64_t b_fault_addr;
 	struct timeval log_last;
 	int	 log_pps;
+	struct timeval flog_last;	/* VM fault lines: their own budget */
+	int	 flog_pps;
 };
 
 static bool
@@ -364,10 +366,15 @@ si_iv_batch_end(struct amd_si_client *c)
 	const u_int q = ATRIUM_AMD_COMPUTE_QID;
 	uint32_t fence, eop = 0, status;
 	uint64_t addr;
-	bool fault = false, log;
+	bool fault = false, log, flog = false;
 	int i;
 
 	log = ppsratecheck(&c->log_last, &c->log_pps, 5);
+	/* A fault always gets its line (address, VMID, decoded status) unless
+	 * faults themselves arrive faster than 10 a second: box runs
+	 * 05fdaebf and 955528b9 lost queues to faults with nothing logged. */
+	if (c->b_fault != 0)
+		flog = ppsratecheck(&c->flog_last, &c->flog_pps, 10);
 	mtx_lock(&sc->lock);
 	for (i = 0; i < ATRIUM_AMD_NHWQ; i++) {
 		sc->ih_eop_ring[i] = 0;
@@ -378,8 +385,13 @@ si_iv_batch_end(struct amd_si_client *c)
 		 * fault goes to it, else below. */
 		/* Re-arm the latch (GC registers: valid while VMs hold
 		 * GfxOff off, and only a VM's work can fault here). */
+		if (flog)
+			device_printf(sc->dev, "si: VM fault: %u IV(s), VMIDs "
+			    "%#x, first VMID %u at %#jx\n", c->b_fault,
+			    c->b_fault_vmids, c->b_fault_vmid,
+			    (uintmax_t)c->b_fault_addr);
 		if (c->vmids != 0 && amd_gmc12_fault_take(c->gt, &status,
-		    &addr) && log)
+		    &addr) && flog)
 			amd_gmc12_fault_decode(c->gt, status, "client fault");
 		if (c->b_fault_vmid != 0 && c->b_fault_vmid == c->last_vmid &&
 		    c->kq != NULL && !fence_passed(amd_mes12_kq_fence(c->kq),
@@ -389,8 +401,8 @@ si_iv_batch_end(struct amd_si_client *c)
 			sc->ih_fault_page[q] = (uint32_t)(c->b_fault_addr >> 12);
 			fault = true;
 		} else if ((c->b_fault_vmids & 0xff00u) != 0) {
-			si_uq_faulted(c, c->b_fault_vmids & 0xff00u, log);
-		} else if (log)
+			si_uq_faulted(c, c->b_fault_vmids & 0xff00u, flog);
+		} else if (flog)
 			device_printf(sc->dev, "si: VM fault on VMID %u at "
 			    "%#jx, not the running submit's VMID %u\n",
 			    c->b_fault_vmid, (uintmax_t)c->b_fault_addr,
@@ -1072,7 +1084,10 @@ si_vm_setup(struct atrium_amd_softc *sc, struct atrium_amd_vm *vm)
 	mtx_unlock(&sc->lock);
 
 	v = malloc(sizeof(*v), M_DEVBUF, M_WAITOK | M_ZERO);
-	err = amd_gmc12_vm_init(c->gt, v, AMD_VM12_4L_VRAM, 0);
+	/* Tables from the VRAM allocator (the whole BO window); the fixed
+	 * pool only if the allocator is not up. */
+	err = amd_gmc12_vm_init(c->gt, v, sc->vram.inited ? AMD_VM12_4L_HEAP :
+	    AMD_VM12_4L_VRAM, 0);
 	if (err != 0)
 		goto fail;
 	if ((err = amd_si_gfx_hold(sc)) != 0)

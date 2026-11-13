@@ -408,8 +408,10 @@ amd_vram_init(struct atrium_amd_softc *sc)
 }
 
 /*
- * Base attach (silicon, 5d): hand out [lo, hi) of `device` bytes, none of
- * it CPU-visible (the kernel and clients reach VRAM only through the GPU).
+ * Base attach (silicon, 5d): hand out [lo, hi) of `device` bytes. None of
+ * it is CPU-visible here; amd_si_vram_init then marks the part inside BAR0
+ * visible for the kernel's own page tables (clients never reach VRAM with
+ * the CPU).
  * With `dirty`, the range is taken as dirty pieces at once (allocated from
  * the arena, so the scrub's frees coalesce back into one free span) and the
  * first clear engine to register scrubs it.

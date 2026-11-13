@@ -543,13 +543,33 @@ amd_gmc12_gart_disable(struct amd_gart *gt)
  *  AMD_VM12_4L_SYS   the four-level table with every table in system
  *                    memory (PDEs VALID | SYSTEM | SNOOPED).
  *
- * Tables are a bump allocator (a 5b test VM, not yet the allocator a
- * client VM will use; that comes with 5c, on vram-allocator).
+ * Test VMs take tables from a bump allocator over a fixed pool (16 per
+ * VM, 4 VMs). Client VMs (AMD_VM12_4L_HEAP) take each table as a
+ * CPU-visible page from the VRAM allocator, up to AMD_VM12_HEAP_TABLES:
+ * the whole BO window (ATRIUM_AMD_VM_MAX_BO pages, 128 leaf tables) plus
+ * the directories and the queue pages. Box run 955528b9 hit the pool's
+ * 13 leaf tables (6656 pages, va_reuse) with client VMs on it. Tables are
+ * never freed before the VM goes; next-fit reuses them as the window wraps.
  */
 static bool
 vm_sys(const struct amd_vm12 *vm)
 {
 	return (vm->mode == AMD_VM12_4L_SYS);
+}
+
+static bool
+vm_heap(const struct amd_vm12 *vm)
+{
+	return (vm->mode == AMD_VM12_4L_HEAP);
+}
+
+/* Table `t`'s FB offset (VRAM-resident modes): also its BAR0 offset. */
+static bus_size_t
+tbl_off(const struct amd_vm12 *vm, u_int t)
+{
+	if (vm_heap(vm))
+		return ((bus_size_t)vm->heap[t]);
+	return (VM_POOL_VRAM_OFF + (bus_size_t)(vm->first + t) * PAGE_SIZE);
 }
 
 static uint64_t
@@ -559,8 +579,7 @@ tbl_rd(struct amd_vm12 *vm, u_int t, u_int i)
 
 	if (vm_sys(vm))
 		return (((volatile uint64_t *)vm->sys[t])[i]);
-	off = VM_POOL_VRAM_OFF + (bus_size_t)(vm->first + t) * PAGE_SIZE +
-	    i * 8;
+	off = tbl_off(vm, t) + i * 8;
 	return ((uint64_t)bus_read_4(vm->gt->vram, off) |
 	    (uint64_t)bus_read_4(vm->gt->vram, off + 4) << 32);
 }
@@ -574,8 +593,7 @@ tbl_wr(struct amd_vm12 *vm, u_int t, u_int i, uint64_t v)
 		((volatile uint64_t *)vm->sys[t])[i] = v;
 		return;
 	}
-	off = VM_POOL_VRAM_OFF + (bus_size_t)(vm->first + t) * PAGE_SIZE +
-	    i * 8;
+	off = tbl_off(vm, t) + i * 8;
 	bus_write_4(vm->gt->vram, off, (uint32_t)v);
 	bus_write_4(vm->gt->vram, off + 4, (uint32_t)(v >> 32));
 }
@@ -587,9 +605,8 @@ tbl_pde(struct amd_vm12 *vm, u_int t)
 	if (vm_sys(vm))
 		return ((uint64_t)vm->sys_pa[t] | PTE_VALID | PTE_SYSTEM |
 		    PTE_SNOOPED);
-	return (((uint64_t)VM_POOL_VRAM_OFF + (uint64_t)(vm->first + t) *
-	    PAGE_SIZE +
-	    vm->gt->vram_base_offset) | PTE_VALID);
+	return (((uint64_t)tbl_off(vm, t) + vm->gt->vram_base_offset) |
+	    PTE_VALID);
 }
 
 /* The table a PDE points at, by looking it up among ours. */
@@ -609,11 +626,20 @@ tbl_of(struct amd_vm12 *vm, uint64_t pde, u_int *t)
 static int
 tbl_alloc(struct amd_vm12 *vm, bool ptb, u_int *t)
 {
+	uint64_t off;
 	u_int i;
+	int err;
 
-	if (vm->used >= VM_SLICE_PAGES)
+	if (vm->used >= (vm_heap(vm) ? AMD_VM12_HEAP_TABLES : VM_SLICE_PAGES))
 		return (ENOMEM);
 	*t = vm->used;
+	if (vm_heap(vm)) {
+		err = amd_vram_alloc(vm->gt->sc, PAGE_SIZE,
+		    AMD_VRAM_CPU_VISIBLE, &off);
+		if (err != 0)
+			return (err);
+		vm->heap[*t] = off;
+	}
 	if (vm_sys(vm)) {
 		vm->sys[*t] = contigmalloc(PAGE_SIZE, M_DEVBUF, M_WAITOK |
 		    M_ZERO, 0, ~(vm_paddr_t)0, PAGE_SIZE, 0);
@@ -642,6 +668,15 @@ amd_gmc12_vm_init(struct amd_gart *gt, struct amd_vm12 *vm, int mode,
 	if (!gt->enabled || rman_get_size(gt->vram) < VM_POOL_VRAM_OFF +
 	    (bus_size_t)VM_POOL_PAGES * PAGE_SIZE)
 		return (ENXIO);
+	if (mode == AMD_VM12_4L_HEAP) {
+		if (!gt->sc->vram.inited)
+			return (ENXIO);
+		vm->heap = malloc(AMD_VM12_HEAP_TABLES * sizeof(uint64_t),
+		    M_DEVBUF, M_WAITOK | M_ZERO);
+		sx_init(&vm->tlock, "atrium_vm12");
+		vm->live = true;
+		return (tbl_alloc(vm, false, &root));	/* table 0 */
+	}
 	/* A slice of the pool per live VM. */
 	for (vm->slice = 0; vm->slice < VM_SLICES; vm->slice++)
 		if ((gt->vm_slices & (1u << vm->slice)) == 0)
@@ -664,6 +699,20 @@ amd_gmc12_vm_fini(struct amd_vm12 *vm)
 	if (vm_sys(vm))
 		for (i = 0; i < vm->used; i++)
 			contigfree(vm->sys[i], PAGE_SIZE, M_DEVBUF);
+	if (vm_heap(vm)) {
+		/* The VMID points at nothing and was flushed: nothing walks
+		 * these any more. The allocator scrubs them before reuse. */
+		for (i = 0; i < vm->used; i++)
+			amd_vram_free(vm->gt->sc, vm->heap[i], PAGE_SIZE);
+		vm->used = 0;
+		if (vm->live) {
+			free(vm->heap, M_DEVBUF);
+			vm->heap = NULL;
+			sx_destroy(&vm->tlock);
+		}
+		vm->live = false;
+		return;
+	}
 	vm->used = 0;
 	if (vm->live)
 		vm->gt->vm_slices &= ~(1u << vm->slice);
@@ -728,8 +777,13 @@ amd_gmc12_vm_map(struct amd_vm12 *vm, uint64_t va, vm_paddr_t pa,
 
 	if ((pa & PAGE_MASK) != 0 || (pa & ~PTE_ADDR_MASK) != 0)
 		return (EINVAL);
-	if ((err = vm_walk(vm, va, true, &t, &i)) != 0)
+	if (vm_heap(vm))
+		sx_xlock(&vm->tlock);
+	if ((err = vm_walk(vm, va, true, &t, &i)) != 0) {
+		if (vm_heap(vm))
+			sx_xunlock(&vm->tlock);
 		return (err);
+	}
 	/* Local VRAM: the physical FB address, neither SYSTEM nor SNOOPED
 	 * (amdgpu_vm_bo_update for a VRAM BO; 4L: MTYPE NC). */
 	pte = (uint64_t)pa | PTE_VALID;
@@ -745,6 +799,8 @@ amd_gmc12_vm_map(struct amd_vm12 *vm, uint64_t va, vm_paddr_t pa,
 		pte |= PTE_MTYPE_UC;
 	pte |= PTE_IS_PTE;			/* see above; 4L: MTYPE NC (0) */
 	tbl_wr(vm, t, i, pte);
+	if (vm_heap(vm))
+		sx_xunlock(&vm->tlock);
 	return (0);
 }
 
@@ -755,11 +811,15 @@ amd_gmc12_vm_unmap(struct amd_vm12 *vm, uint64_t va)
 	u_int t, i;
 	int err;
 
-	if ((err = vm_walk(vm, va, false, &t, &i)) != 0)
-		return (err);
-	tbl_wr(vm, t, i, vm->mode == AMD_VM12_FLAT ? 0 :
-	    PTE_EXECUTABLE | PTE_IS_PTE);
-	return (0);
+	if (vm_heap(vm))
+		sx_xlock(&vm->tlock);
+	err = vm_walk(vm, va, false, &t, &i);
+	if (err == 0)
+		tbl_wr(vm, t, i, vm->mode == AMD_VM12_FLAT ? 0 :
+		    PTE_EXECUTABLE | PTE_IS_PTE);
+	if (vm_heap(vm))
+		sx_xunlock(&vm->tlock);
+	return (err);
 }
 
 /* Log the walk for `va`: each level's raw entry, read back. */

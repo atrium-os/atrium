@@ -77,6 +77,8 @@ struct mes_gen {
 	uint32_t nbif_db_aper_en, nbif_db_entry0, nbif_db_entry3;
 	/* Doorbell dword indices (amdgpu_doorbell.h NAVI10 MES_RING0/1 << 1). */
 	uint32_t db_pipe0, db_pipe1, db_aggregated;
+	/* Compute queue reset (mes_v12_0_reset_queue_mmio). */
+	uint32_t spi_compute_queue_reset;
 };
 
 static const struct mes_gen mes_gens[] = {
@@ -99,7 +101,8 @@ static const struct mes_gen mes_gens[] = {
 	  /* NAVI10 doorbell layout (soc24.c): gfx 0x8b..0xff, kiq 0..0x8a. */
 	  (0x8b * 2) << 2, (0xff * 2) << 2, 0, (0x8a * 2) << 2,
 	  0x00c0, 0x01cb, 0x01ce,
-	  0x0b << 1, 0x0c << 1, 0x400 },
+	  0x0b << 1, 0x0c << 1, 0x400,
+	  S0(0x1f73) },
 };
 
 /* CP_MES_CNTL */
@@ -189,6 +192,12 @@ static const struct mes_gen mes_gens[] = {
 #define HDR_REMOVE_QUEUE	0x00040031u
 #define HDR_SUSPEND		0x00040061u	/* opcode 6 */
 #define HDR_RESUME		0x00040071u	/* opcode 7 */
+#define HDR_RESET		0x00040081u	/* opcode 8 (MESAPI__RESET) */
+#define RST_FLAGS		4	/* bit 0 reset_queue_only */
+#define RST_GANG_CTX		8
+#define RST_DOORBELL		16
+#define RST_QUEUE_TYPE		32
+#define RST_API_STATUS		112
 #define HW_VMID_MMHUB		4
 #define HW_VMID_GFXHUB		8
 #define HW_COMPUTE_HQD		20	/* [8] */
@@ -1998,6 +2007,27 @@ uq_remove_raw(struct mes *m, uint64_t gva, uint32_t db)
 	    "REMOVE_QUEUE (user compute)"));
 }
 
+/*
+ * MES's own reset of one queue (MES_SCH_API_RESET, reset_queue_only, by
+ * doorbell), as amdgpu's mes_v12_0_reset_hw_queue: for a queue whose HQD
+ * a direct reset did not stop and whose REMOVE_QUEUE MES refused.
+ */
+static int
+uq_reset_raw(struct mes *m, uint64_t gva, uint32_t db)
+{
+	uint32_t pkt[API_DW];
+	uint8_t *b = (uint8_t *)pkt;
+
+	memset(pkt, 0, sizeof(pkt));
+	pkt[0] = HDR_RESET;
+	put32(b, RST_FLAGS, 1);
+	put64(b, RST_GANG_CTX, gva + UQ_G_GANG);
+	put32(b, RST_DOORBELL, db);
+	put32(b, RST_QUEUE_TYPE, QUEUE_TYPE_COMPUTE);
+	return (mes_api(m, 0, pkt, RST_API_STATUS,
+	    "RESET (user compute queue)"));
+}
+
 static int
 uq_add(struct mes *m, struct uqp *u, u_int p)
 {
@@ -2405,6 +2435,9 @@ uq2_hqd_reset(struct amd_uq *q)
 		return (true);
 	grbm_select_q(m, 1, pipe, qi);
 	wr(m, g->hqd_dequeue_req, 2);
+	/* amdgpu also resets the queue's SPI state (box runs a0597b2d,
+	 * 05fdaebf, 955528b9: without it a CP-faulted HQD stayed active). */
+	wr(m, g->spi_compute_queue_reset, 1);
 	for (; us < 100000 && (rd(m, g->hqd_active) & 1); us += 10)
 		DELAY(10);
 	wr(m, g->hqd_dequeue_req, 0);
@@ -2757,6 +2790,18 @@ amd_mes12_uq_evict(struct amd_uq *q)
 			device_printf(m->sc->dev, "uq%u: REMOVE_QUEUE refused "
 			    "(%d); HQD reset, trying once more\n", q->slot, err);
 			err = uq_remove_raw(m, q->gva, q->db);
+		}
+		if (err != 0) {
+			/* Still refused: MES's own queue reset, then once
+			 * more. Only if that fails too does the caller reset
+			 * the GPU. */
+			int rerr = uq_reset_raw(m, q->gva, q->db);
+
+			(void)uq2_hqd_reset(q);
+			err = uq_remove_raw(m, q->gva, q->db);
+			device_printf(m->sc->dev, "uq%u: after MES RESET (%d): "
+			    "REMOVE_QUEUE %s\n", q->slot, rerr, err == 0 ?
+			    "ok" : "still refused");
 		}
 		if (err != 0 || uq2_hqd_find(m, q->db, &vmid)) {
 			amd_mes12_uq_report(q, "REMOVE_QUEUE failed");
