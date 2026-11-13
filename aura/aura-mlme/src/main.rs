@@ -94,6 +94,14 @@ impl Kernel {
                 let s = aura_proto::ScanReq { flags: aura_proto::scan_flags::RANDOM_MAC, mac: *mac, dwell_ms: 0, ssids, freqs };
                 self.send(&Msg::Scan(s), "scan");
             }
+            Req::SetMac(m) => self.send(&Msg::SetMac(*m), "set-mac"),
+            Req::SetRegulatory { alpha2, rules } => {
+                let mut raw = vec![0u8; rules.len() * 20];
+                match aura_proto::List::build(rules, &mut raw) {
+                    Ok(rules) => self.send(&Msg::SetRegulatory { alpha2: *alpha2, rules }, "set-regulatory"),
+                    Err(e) => eprintln!("aura-mlme: regulatory rules: {e:?}"),
+                }
+            }
             Req::TxMgmt { freq, frame } => self.send(&Msg::TxMgmt { freq: *freq, frame }, "tx-mgmt"),
             Req::SetBss(b) => self.send(&Msg::SetBss(*b), "set-bss"),
             Req::ClearBss => self.send(&Msg::ClearBss, "clear-bss"),
@@ -233,7 +241,7 @@ fn main() {
                             if o.verbose {
                                 eprintln!("aura-mlme: keys: {l:?}");
                             }
-                            outs.extend(sta.keys_msg(&l));
+                            outs.extend(sta.keys_msg(&l, now()));
                         }
                     }
                 }
@@ -243,7 +251,7 @@ fn main() {
                     if o.capsicum {
                         die("aura-keys went away");
                     }
-                    outs.extend(sta.keys_msg(&Line::new("failed").with("why", "keys-gone")));
+                    outs.extend(sta.keys_msg(&Line::new("failed").with("why", "keys-gone"), now()));
                 }
             }
         }
@@ -281,6 +289,8 @@ fn main() {
                     if o.verbose {
                         eprintln!("aura-mlme: -> kernel {}", match &r {
                             Req::Scan { .. } => "scan".to_string(),
+                            Req::SetMac(m) => format!("set-mac {}", aura_ipc::fmt_mac(m)),
+                            Req::SetRegulatory { alpha2, rules } => format!("set-regulatory {} ({} rules)", String::from_utf8_lossy(alpha2), rules.len()),
                             Req::TxMgmt { frame, .. } => format!("tx-mgmt subtype {}", frame[0] >> 4),
                             Req::SetBss(b) => format!("set-bss aid {}", b.aid),
                             Req::ClearBss => "clear-bss".into(),

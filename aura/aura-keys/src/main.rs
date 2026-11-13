@@ -4,8 +4,12 @@
 //! port. Nothing else in Aura sees a password, a PMK or a key. Listens on
 //! one socket for two peers, told apart by uid:
 //!
-//! - aura-mlme (`--mlme-uid`): `assoc ...` when associated (BSSID, both
-//!   RSNEs, AKM), `disassoc`; gets back `authorized` or `failed why=..`.
+//! - aura-mlme (`--mlme-uid`): `hello mac_key=..` when it connects (the
+//!   key for per-network addresses); SAE authentication as `sae-start`,
+//!   `sae-rx`, `sae-abort`, answered with `sae-commit`, `sae-confirm`,
+//!   `sae-done` or `sae-failed` (aura-mlme frames them, this side does the
+//!   crypto); `assoc ...` when associated (BSSID, RSNEs and RSNXEs, AKM),
+//!   `disassoc`; gets back `authorized [td=..]` or `failed why=..`.
 //! - atrium-net (`--ctl-uid`): `remember ssid=.. secret=..`, `forget
 //!   ssid=..`, `prepare ssid=..` (release the credential for the next join;
 //!   Arca hands out one per join, never the list); gets `ok` or `error`.
@@ -19,7 +23,8 @@ mod creds;
 use aura_ipc::sock::{self, Conn};
 use aura_ipc::{Got, Line};
 use aura_proto::{decode, encode, Cipher, Direction, Key, KeyKind, Msg, HEADER_LEN, MAX_BODY};
-use aura_rsn::crypto::{self, Akm};
+use aura_rsn::crypto::{self, Akm, Pmk};
+use aura_rsn::sae::{self, Sae, SaeError};
 use aura_rsn::supp::{Action, Config, Supplicant};
 use creds::{Secret, Store};
 use std::fs::{File, OpenOptions};
@@ -81,7 +86,19 @@ struct Join {
     mlme: usize,
 }
 
+/// An SAE exchange in progress, and its PMK once done (kept for the
+/// association that follows).
+struct SaeRun {
+    bssid: [u8; 6],
+    sae: Sae,
+    token: Option<Vec<u8>>,
+}
+
 struct Keys {
+    sae: Option<SaeRun>,
+    sae_pmk: Option<([u8; 6], Pmk)>,
+    /// Transition Disable bits from the last message 3.
+    td: u8,
     f: File,
     seq: u32,
     verbose: bool,
@@ -125,9 +142,14 @@ impl Keys {
                 Action::SetPtk(tk) => self.set_key(KeyKind::Pairwise, 0, Cipher::Ccmp128, bssid, [0; 6], tk),
                 Action::SetGtk { idx, key, rsc } => self.set_key(KeyKind::Group, *idx, Cipher::Ccmp128, BROADCAST, *rsc, key),
                 Action::SetIgtk { idx, key, ipn } => self.set_key(KeyKind::Igtk, *idx, Cipher::BipCmac128, BROADCAST, *ipn, key),
+                Action::TransitionDisable(b) => self.td = *b,
                 Action::Authorized => {
                     self.send(&Msg::PortAuthorized(true));
-                    reply = Some(Line::new("authorized"));
+                    let mut l = Line::new("authorized");
+                    if self.td != 0 {
+                        l = l.with("td", self.td);
+                    }
+                    reply = Some(l);
                 }
             }
         }
@@ -172,10 +194,8 @@ impl Keys {
             out.push(Line::new("authorized"));
             return out;
         }
-        let akm = match akm {
-            2 => Akm::Psk,
-            6 => Akm::PskSha256,
-            _ => return fail("akm"),
+        let Some(akm) = Akm::from_suite(0x000f_ac00 | akm) else {
+            return fail("akm");
         };
         let (Some(own_rsne), Some(ap_rsne)) = (l.hex("own_rsne"), l.hex("ap_rsne")) else {
             return fail("bad-assoc");
@@ -187,14 +207,24 @@ impl Keys {
         if *pssid != ssid {
             return fail("not-prepared");
         }
-        let Some(pmk) = crypto::psk(secret, &ssid) else {
-            return fail("bad-credential");
+        let pmk = if akm == Akm::Sae {
+            // The PMK from the SAE exchange with this very BSS.
+            match self.sae_pmk.take() {
+                Some((b, pmk)) if b == bssid => pmk,
+                _ => return fail("no-sae-pmk"),
+            }
+        } else {
+            match crypto::psk(secret, &ssid) {
+                Some(p) => p,
+                None => return fail("bad-credential"),
+            }
         };
         let mut snonce = [0u8; 32];
         if getrandom::getrandom(&mut snonce).is_err() {
             die("no randomness");
         }
-        let cfg = Config { akm, pmk, aa: bssid, spa: own, own_rsne, ap_rsne, pmf: pmf == 1 };
+        self.td = 0;
+        let cfg = Config { akm, pmk, aa: bssid, spa: own, own_rsne, ap_rsne, own_rsnxe: l.hex("own_rsnxe"), ap_rsnxe: l.hex("ap_rsnxe"), pmf: pmf == 1 };
         self.join = Some(Join { bssid, supp: Some(Supplicant::new(cfg, snonce)), mlme });
         for (src, body) in std::mem::take(&mut self.pending) {
             if let Some(r) = self.eapol(src, &body) {
@@ -202,6 +232,103 @@ impl Keys {
             }
         }
         out
+    }
+
+    /// SAE, the station side (sae.rs does the crypto).
+    fn sae_msg(&mut self, l: &Line) -> Line {
+        let failed = |e: &str| Line::new("sae-failed").with("why", e);
+        match l.verb.as_str() {
+            "sae-start" => {
+                self.sae = None;
+                self.sae_pmk = None;
+                let (Some(ssid), Some(bssid), Some(own), Some(h2e)) = (l.hex("ssid"), l.mac("bssid"), l.mac("own"), l.num::<u8>("h2e")) else {
+                    return failed("bad-start");
+                };
+                let Some((pssid, secret)) = &self.prepared else {
+                    return failed("no-credential");
+                };
+                if *pssid != ssid {
+                    return failed("not-prepared");
+                }
+                // SAE takes the passphrase itself; a raw 64-hex-digit PSK
+                // cannot be used with it.
+                if secret.len() == 64 && secret.iter().all(|b| b.is_ascii_hexdigit()) {
+                    return failed("psk-not-password");
+                }
+                let pwe = if h2e == 1 {
+                    sae::pwe_from_pt(&sae::pt_h2e(secret, &ssid), &own, &bssid)
+                } else {
+                    match sae::pwe_hnp(secret, &own, &bssid) {
+                        Some(p) => p,
+                        None => return failed("pwe"),
+                    }
+                };
+                let s = Sae::new(pwe, h2e == 1, &mut |b: &mut [u8]| {
+                    if getrandom::getrandom(b).is_err() {
+                        die("no randomness");
+                    }
+                });
+                eprintln!("aura-keys: SAE start with {} ({})", aura_ipc::fmt_mac(&bssid), if h2e == 1 { "hash-to-element" } else { "hunting-and-pecking" });
+                let reply = Line::new("sae-commit").with("status", s.commit_status()).with_hex("body", &s.commit_body(None));
+                self.sae = Some(SaeRun { bssid, sae: s, token: None });
+                reply
+            }
+            "sae-rx" => {
+                let (Some(tr), Some(status), Some(body)) = (l.num::<u16>("trans"), l.num::<u16>("status"), l.hex("body")) else {
+                    return failed("bad-rx");
+                };
+                let Some(run) = &mut self.sae else {
+                    return failed("not-started");
+                };
+                let r: Result<Line, SaeError> = (|| match (tr, status) {
+                    (1, sae::STATUS_ANTI_CLOGGING) => {
+                        let t = run.sae.token_request(&body)?;
+                        eprintln!("aura-keys: SAE anti-clogging token requested ({} bytes), commit again", t.len());
+                        let b = run.sae.commit_body(Some(&t));
+                        run.token = Some(t);
+                        Ok(Line::new("sae-commit").with("status", run.sae.commit_status()).with_hex("body", &b))
+                    }
+                    (1, st) if st == run.sae.commit_status() => {
+                        match run.sae.rx_commit(&body) {
+                            // A repeated commit after ours was answered:
+                            // the AP missed our confirm, send it again.
+                            Ok(()) | Err(SaeError::UnexpectedMessage) => {}
+                            Err(e) => return Err(e),
+                        }
+                        Ok(Line::new("sae-confirm").with("status", 0).with_hex("body", &run.sae.confirm_body()?))
+                    }
+                    (2, 0) => {
+                        run.sae.rx_confirm(&body)?;
+                        Ok(Line::new("sae-done"))
+                    }
+                    _ => Err(SaeError::UnexpectedMessage),
+                })();
+                match r {
+                    Ok(l) => {
+                        if l.verb == "sae-done" {
+                            if let Some(run) = self.sae.take() {
+                                if let Some((pmk, _)) = run.sae.pmk() {
+                                    eprintln!("aura-keys: SAE accepted by {}", aura_ipc::fmt_mac(&run.bssid));
+                                    self.sae_pmk = Some((run.bssid, Pmk(pmk)));
+                                }
+                            }
+                        }
+                        l
+                    }
+                    Err(e) => {
+                        eprintln!("aura-keys: SAE failed: {e:?}");
+                        self.sae = None;
+                        failed(&format!("{e:?}").to_ascii_lowercase())
+                    }
+                }
+            }
+            _ => {
+                // sae-abort
+                self.sae = None;
+                self.sae_pmk = None;
+                Line::new("ok")
+            }
+        }
     }
 
     fn ctl(&mut self, l: &Line) -> Line {
@@ -217,17 +344,17 @@ impl Keys {
                 if crypto::psk(&secret, &ssid).is_none() {
                     return err("bad-secret");
                 }
-                match self.store.remember(&ssid, &secret) {
+                match self.store.remember(&creds::account(&ssid), &secret) {
                     Ok(()) => Line::new("ok"),
                     Err(e) => err(&store_err(&e)),
                 }
             }
-            "forget" => match self.store.forget(&ssid) {
+            "forget" => match self.store.forget(&creds::account(&ssid)) {
                 Ok(true) => Line::new("ok"),
                 Ok(false) => err("unknown"),
                 Err(e) => err(&store_err(&e)),
             },
-            "prepare" => match self.store.release(&ssid) {
+            "prepare" => match self.store.release(&creds::account(&ssid)) {
                 Ok(Some(s)) => {
                     self.prepared = Some((ssid, s));
                     Line::new("ok")
@@ -238,6 +365,29 @@ impl Keys {
             _ => err("unknown-command"),
         }
     }
+}
+
+/// The key per-network MAC addresses are derived from: kept in the store
+/// so addresses survive reboots; made on first use. If the store cannot be
+/// reached, a random one for this run (addresses then change per boot,
+/// which only costs the network a new lease).
+fn mac_key(store: &mut dyn Store) -> zeroize::Zeroizing<[u8; 32]> {
+    let mut key = zeroize::Zeroizing::new([0u8; 32]);
+    match store.release(creds::MAC_KEY) {
+        Ok(Some(v)) if v.len() == 32 => {
+            key.copy_from_slice(&v);
+            return key;
+        }
+        Ok(_) => {}
+        Err(e) => eprintln!("aura-keys: mac key: {}", store_err(&e)),
+    }
+    if getrandom::getrandom(&mut key[..]).is_err() {
+        die("no randomness");
+    }
+    if let Err(e) = store.remember(creds::MAC_KEY, &key[..]) {
+        eprintln!("aura-keys: mac key not stored: {}", store_err(&e));
+    }
+    key
 }
 
 /// An error for the reply line: no spaces, no secrets (store errors carry
@@ -261,7 +411,7 @@ fn main() {
             Box::new(creds::Memory::default())
         }
     };
-    let mut k = Keys { f, seq: 0, verbose: o.verbose, store, prepared: None, join: None, pending: Vec::new() };
+    let mut k = Keys { sae: None, sae_pmk: None, td: 0, f, seq: 0, verbose: o.verbose, store, prepared: None, join: None, pending: Vec::new() };
     let listener = sock::listen(&o.sock, 0o666).unwrap_or_else(|e| die(&format!("{}: {e}", o.sock.display())));
     let mut conns: Vec<Option<Conn>> = Vec::new();
     let mut buf = vec![0u8; HEADER_LEN + MAX_BODY];
@@ -317,7 +467,12 @@ fn main() {
         if ready[1] {
             while let Ok((s, _)) = listener.accept() {
                 match Conn::new(s) {
-                    Ok(c) if c.uid == o.mlme_uid || c.uid == o.ctl_uid => conns.push(Some(c)),
+                    Ok(mut c) if c.uid == o.mlme_uid => {
+                        let key = mac_key(&mut *k.store);
+                        let _ = c.send(&Line::new("hello").with_hex("mac_key", &key[..]));
+                        conns.push(Some(c));
+                    }
+                    Ok(c) if c.uid == o.ctl_uid => conns.push(Some(c)),
                     Ok(c) => eprintln!("aura-keys: refused peer uid {}", c.uid),
                     Err(e) => eprintln!("aura-keys: accept: {e}"),
                 }
@@ -347,6 +502,12 @@ fn main() {
                 match l.verb.as_str() {
                     "assoc" if uid == o.mlme_uid => {
                         for r in k.assoc(&l, i) {
+                            to_mlme.push((i, r));
+                        }
+                    }
+                    "sae-start" | "sae-rx" | "sae-abort" if uid == o.mlme_uid => {
+                        let r = k.sae_msg(&l);
+                        if r.verb != "ok" {
                             to_mlme.push((i, r));
                         }
                     }

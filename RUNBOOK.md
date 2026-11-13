@@ -5513,7 +5513,7 @@ timing, so run it on the Mac's HVF VM; check 3 (no device in app jails) is
 portcullis-jail's devfs test plus portcullisd's shipped_manifests test (VM only:
 portcullisd doesn't build on Linux).
 
-### 13.6c Aura Wi-Fi in the cloud VM (`scripts/aura-vm-check.sh`, `scripts/aura-w1-check.sh`)
+### 13.6c Aura Wi-Fi in the cloud VM (`scripts/aura-vm-check.sh`, `scripts/aura-sim-gate.sh`)
 
 ```sh
 OBJ=$HOME/obj ARCH=aarch64 sh scripts/aura-vm-check.sh kernel   # fork kernel as kernel.atrium (one-shot nextboot)
@@ -5528,15 +5528,18 @@ OBJ=$HOME/obj ARCH=aarch64 sh scripts/aura-vm-check.sh test     # build aura_wla
   space (`aura/kmod/sim/aura_sim.h`); the gate plays the AP through it.
 - Host tests: `cd aura && cargo test` (proto + core, incl. mutation fuzzing).
 
-W1 gate: the FreeBSD VM joins a real hostapd (WPA2-PSK + PSK-SHA256, PMF required) running
-on mac80211_hwsim in a second, Ubuntu arm64 VM. `aura/sim-ap/air-hwsim.py` registers as
+Sim gates (W1, W2): the FreeBSD VM joins a real, unmodified hostapd running on
+mac80211_hwsim in a second, Ubuntu arm64 VM. `aura/sim-ap/air-hwsim.py` registers as
 hwsim's wireless medium and carries every frame over UDP to `aura-air` in the FreeBSD VM
 (the test stand-in for radio firmware: channel hopping, CCMP, BIP), which plays it through
 `/dev/aura/sim0`.
 
 ```sh
-sh scripts/aura-w1-check.sh vms     # both VMs up (FreeBSD with udp 7701 forwarded, Ubuntu AP VM on ssh 2223)
-sh scripts/aura-w1-check.sh test    # build, start hostapd + udhcpd, arcad, jailed aura-keys + aura-mlme, check
+sh scripts/aura-sim-gate.sh vms     # both VMs up (FreeBSD with udp 7701 forwarded, Ubuntu AP VM on ssh 2223)
+sh scripts/aura-sim-gate.sh w1      # WPA2-PSK + PMF: build, hostapd + udhcpd, arcad, jailed daemons, checks
+sh scripts/aura-sim-gate.sh w2      # WPA3-SAE (H2E, hunting-and-pecking, tokens), transition mode, roaming
+sh scripts/aura-ap-vm.sh ap CONF... # AP configs from aura/sim-ap (two at most: one radio each, bridged)
+sh scripts/aura-ap-vm.sh signal 2412 -85 2437 -40   # what the FreeBSD side hears per channel
 sh scripts/aura-ap-vm.sh log        # hostapd and the medium's logs; `ssh CMD` runs a command as root there
 ```
 
@@ -5545,12 +5548,20 @@ sh scripts/aura-ap-vm.sh log        # hostapd and the medium's logs; `ssh CMD` r
 - Checks: scan, remember (Arca machine store, kind 8), join + DHCP, PMF, 4-way on both
   sides, pings both ways, a GTK rekey (`wpa_group_rekey=60`), a forged unprotected deauth
   ignored after SA Query, leave, no secret in the logs, each jail sees only its own
-  `/dev/aura` node and has no addresses.
+  `/dev/aura` node and has no addresses, the per-network MAC on `wlan0`.
+- W2 checks: SAE with H2E and with hunting-and-pecking, each with an anti-clogging
+  token forced (`sae_anti_clogging_threshold=0`); transition mode picks SAE and the
+  Transition Disable KDE makes a later WPA2-only BSS of the network refused; roaming
+  from channel 1 to 6 when the medium fades the first BSS (`signal`), same address,
+  ping after; `aura-ctl country` sets the regulatory domain.
+- The AP VM keeps two hwsim radios loaded between runs: unloading the module or
+  `depmod` takes minutes under TCG when the FreeBSD VM is busy.
 - `MAKEOBJDIRPREFIX` is `~/obj-arm64`: a symlink to `~/obj` in a fresh container.
 - The AP VM needs `linux-modules-extra` for mac80211_hwsim; it is installed with
   `--force-depends` and `depmod -a` (the image's meta packages pin another kernel).
-- "netlink error -22" from the medium is hwsim refusing frames injected on a channel the AP
-  is not on (our probes while scanning); harmless.
+- The medium drops frames for channels no radio is on (our probes while scanning).
+- Host tests include IEEE 802.11-2020 Annex J.10's SAE vectors (from hostapd's module
+  tests) and the regulatory table built from `aura/aura-regdb/data/db.txt`.
 
 ### 13.6b Bluetooth (Vinculum) harness: Rootcanal + Bumble, no radio
 

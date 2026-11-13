@@ -298,6 +298,16 @@ pub unsafe extern "C" fn aura_rs_close(mem: *mut c_void, _chan: u32) {
     }
 }
 
+/// The address in use now (aura-mlme's last SetMac, or the radio's own).
+///
+/// # Safety
+/// `out` 6 writable bytes; lock held.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn aura_rs_mac(mem: *mut c_void, out: *mut u8) {
+    let m = (unsafe { st(mem) }).wlan.radio.mac;
+    unsafe { ptr::copy_nonoverlapping(m.as_ptr(), out, 6) };
+}
+
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn aura_rs_port_open(mem: *mut c_void) -> i32 {
     (unsafe { st(mem) }).wlan.port_open() as i32

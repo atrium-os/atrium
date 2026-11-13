@@ -1,0 +1,10 @@
+[package]
+name = "aura-regdb"
+version = "0.1.0"
+description = "Aura's regulatory database (docs/spec/wifi.md §3.6): wireless-regdb compiled into a table, country lookup, and the tighten-only intersection used for an AP's Country element."
+edition.workspace = true
+license.workspace = true
+build = "build.rs"
+
+[dependencies]
+aura-proto = { path = "../aura-proto" }

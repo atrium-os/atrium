@@ -83,13 +83,15 @@ pub fn kdf_sha256(key: &[u8], label: &[u8], context: &[u8], out: &mut [u8]) {
     }
 }
 
-/// The AKMs W1 supports (W2 adds SAE).
+/// The AKMs Aura supports.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Akm {
     /// 00-0f-ac:2, PSK with the SHA-1 PRF.
     Psk,
     /// 00-0f-ac:6, PSK with the SHA-256 KDF.
     PskSha256,
+    /// 00-0f-ac:8, SAE (WPA3-Personal), the SHA-256 KDF.
+    Sae,
 }
 
 impl Akm {
@@ -97,20 +99,24 @@ impl Akm {
         match self {
             Akm::Psk => 0x000f_ac02,
             Akm::PskSha256 => 0x000f_ac06,
+            Akm::Sae => 0x000f_ac08,
         }
     }
     pub fn from_suite(s: u32) -> Option<Akm> {
         match s {
             0x000f_ac02 => Some(Akm::Psk),
             0x000f_ac06 => Some(Akm::PskSha256),
+            0x000f_ac08 => Some(Akm::Sae),
             _ => None,
         }
     }
-    /// EAPOL-Key descriptor version for CCMP (§12.7.2).
+    /// EAPOL-Key descriptor version for CCMP (§12.7.2); 0 means "defined
+    /// by the AKM", which for SAE is AES-128-CMAC and AES key wrap.
     pub fn key_version(self) -> u16 {
         match self {
             Akm::Psk => 2,
             Akm::PskSha256 => 3,
+            Akm::Sae => 0,
         }
     }
 }
@@ -149,7 +155,7 @@ pub fn ptk(akm: Akm, pmk: &Pmk, aa: &[u8; 6], spa: &[u8; 6], anonce: &[u8; 32], 
     let mut out = [0u8; 48];
     match akm {
         Akm::Psk => prf_sha1(&pmk.0, b"Pairwise key expansion", &data, &mut out),
-        Akm::PskSha256 => kdf_sha256(&pmk.0, b"Pairwise key expansion", &data, &mut out),
+        Akm::PskSha256 | Akm::Sae => kdf_sha256(&pmk.0, b"Pairwise key expansion", &data, &mut out),
     }
     let mut p = Ptk { kck: [0; 16], kek: [0; 16], tk: [0; 16] };
     p.kck.copy_from_slice(&out[..16]);
@@ -160,6 +166,7 @@ pub fn ptk(akm: Akm, pmk: &Pmk, aa: &[u8; 6], spa: &[u8; 6], anonce: &[u8; 32], 
 }
 
 /// The EAPOL-Key MIC over a whole EAPOL frame whose MIC field is zero.
+/// `version` is the key descriptor version; 0 is only ever SAE's here.
 pub fn mic(version: u16, kck: &[u8; 16], frame: &[u8]) -> Option<[u8; 16]> {
     match version {
         2 => {
@@ -168,7 +175,7 @@ pub fn mic(version: u16, kck: &[u8; 16], frame: &[u8]) -> Option<[u8; 16]> {
             m.copy_from_slice(&h[..16]);
             Some(m)
         }
-        3 => {
+        0 | 3 => {
             let mut c = <Cmac<Aes128> as cmac::Mac>::new_from_slice(kck).ok()?;
             c.update(frame);
             Some(c.finalize().into_bytes().into())

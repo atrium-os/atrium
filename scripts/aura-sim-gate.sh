@@ -1,18 +1,24 @@
 #!/bin/sh
-# W1 gate for Aura (docs/spec/wifi.md §7): the FreeBSD VM joins a WPA2
-# network run by real hostapd and gets an address over DHCP.
+# Aura's simulation gates (docs/spec/wifi.md §6.2, §7): the FreeBSD VM
+# against real hostapd.
 #
-#   Linux VM (scripts/aura-ap-vm.sh): hostapd on mac80211_hwsim, PMF
-#     required, WPA-PSK + WPA-PSK-SHA256, group rekey every 60 s; the
-#     medium air-hwsim.py; udhcpd on 10.77.0.0/24.
+#   Linux VM (scripts/aura-ap-vm.sh): hostapd on mac80211_hwsim radios, the
+#     medium air-hwsim.py, udhcpd on br0 (10.77.0.0/24).
 #   FreeBSD VM: aura_wlan.ko + aura_sim.ko; aura-air (the radio's firmware,
-#     test only) on UDP 7701; aura-keys, aura-mlme; aura-ctl as atrium-net.
+#     test only) on UDP 7701; arcad; aura-keys and aura-mlme jailed;
+#     aura-ctl as atrium-net.
 #
-#   sh scripts/aura-w1-check.sh vms     boot both VMs (FreeBSD with the UDP
-#                                       forward; fork kernel via nextboot)
-#   sh scripts/aura-w1-check.sh test    build, install, run the gate
+#   sh scripts/aura-sim-gate.sh vms   boot both VMs (FreeBSD with the UDP
+#                                     forward; fork kernel via nextboot)
+#   sh scripts/aura-sim-gate.sh w1    WPA2-PSK + PMF: join, DHCP, pings,
+#                                     GTK rekey, forged deauth, jails
+#   sh scripts/aura-sim-gate.sh w2    WPA3-SAE (H2E and hunting-and-pecking,
+#                                     anti-clogging tokens), transition mode
+#                                     and Transition Disable, per-network
+#                                     MAC, roaming between two BSSs
 #
-# The FreeBSD VM must have been started with
+# AURA_JAIL=0 runs the daemons unjailed; AURA_ARCA=0 uses aura-keys'
+# memory store. The FreeBSD VM must have been started with
 #   NETDEV_EXTRA="hostfwd=udp:127.0.0.1:7701-:7701"
 # (the vms step does it): the medium in the Linux VM sends to the host's
 # 127.0.0.1:7701 through its own slirp, and that forward carries it on.
@@ -25,15 +31,27 @@ V="$ROOT/scripts/vssh"
 AP="$ROOT/scripts/aura-ap-vm.sh"
 ARCA="${AURA_ARCA:-1}"
 JAIL="${AURA_JAIL:-1}"
+PASS='correct horse battery staple'
 
-case "${1:-}" in
-vms)
-    sh "$AP" up
-    if ! VSSH_CONNECT_TIMEOUT=5 "$V" true 2>/dev/null; then
-        NETDEV_EXTRA="hostfwd=udp:127.0.0.1:7701-:7701" sh "$ROOT/scripts/cloud-vm.sh" up
-    fi
-    ARCH=aarch64 KERNCONF="$KERNCONF" sh "$ROOT/scripts/aura-vm-check.sh" kernel ;;
-test)
+# The address a join used (from its "authenticating ... mac=" line).
+mac_of() {
+    printf '%s\n' "$1" | sed -n 's/.*state=authenticating.* mac=\([0-9a-f:]*\).*/\1/p' | head -n 1
+}
+
+# join SSID ARGS...: prints the join's lines; fails the gate unless authorized.
+join() {
+    ssid=$1; shift
+    out=$("$V" "$CTL join $ssid --wait 240 $*" 2>&1) || fail "join $*: $out"
+    echo "$out" | sed 's/^/    /'
+    echo "$out" | grep -q 'state=authorized' || fail "join $*: not authorized"
+}
+
+leave() {
+    out=$("$V" "$CTL leave") || true
+    echo "$out" | grep -q 'state=disconnected' || fail "leave"
+}
+
+setup() {
     TARGET=arm64 KERNCONF="$KERNCONF" sh "$ROOT/scripts/aura-kmod.sh" >&2
     X="-C link-arg=--sysroot=$S -C link-arg=-L$S/lib -C link-arg=-L$S/usr/lib -C link-arg=--dynamic-linker=/libexec/ld-elf.so.1 -C link-arg=$S/usr/lib/Scrt1.o -C link-arg=$S/usr/lib/crti.o -C link-arg=$S/usr/lib/crtbeginS.o -C link-arg=-lc -C link-arg=$S/usr/lib/crtendS.o -C link-arg=$S/usr/lib/crtn.o"
     (cd "$ROOT/aura" && RUSTFLAGS="$X" cargo build --release -p aura-air -p aura-mlme -p aura-keys -p aura-ctl --target "$T" >&2)
@@ -48,7 +66,7 @@ test)
     tar czf - -C "$(dirname "$B")" aura | "$V" 'rm -rf /tmp/aura && tar xzf - -C /tmp'
     rm -rf "$(dirname "$B")"
 
-    sh "$AP" ap hostapd-wpa2.conf
+    sh "$AP" ap "$@"
 
     # The daemons run as their own uids (_aura 65033, _aura-keys 65032),
     # each seeing only its own node. AURA_JAIL=1 (default): jailed by
@@ -146,6 +164,9 @@ test)
         [ -z "$n" ] && ok "no network in either jail" || fail "jail network: $n"
     fi
 
+}
+
+w1() {
     out=$("$V" "$CTL scan" 2>&1) || fail "scan: $out"
     echo "$out" | sed 's/^/    /'
     echo "$out" | grep -q 'ssid="aura-test".*security=psk-sha256' && ok "scan finds aura-test (WPA2, PMF required, PSK-SHA256)" || fail "scan result"
@@ -155,6 +176,10 @@ test)
 
     out=$("$V" "$CTL join aura-test --wait 180 --dhcp wlan0" 2>&1) || fail "join: $out"
     echo "$out" | sed 's/^/    /'
+    MAC=$(mac_of "$out")
+    [ -n "$MAC" ] && [ "$MAC" != 02:a5:00:00:00:01 ] && ok "per-network address $MAC, not the radio's" || fail "per-network address: '$MAC'"
+    "$V" "ifconfig wlan0 ether | grep -q 'ether $MAC'" && ok "wlan0 took the address" || fail "wlan0 ether"
+    
     echo "$out" | grep -q 'state=associated.*pmf=1' && ok "associated with PMF" || fail "associated with PMF"
     echo "$out" | grep -q 'state=authorized' && ok "4-way handshake done, port authorized" || fail "authorized"
     echo "$out" | grep -q 'address inet 10\.77\.0\.1[0-2][0-9]' && ok "DHCP address from udhcpd" || fail "DHCP address"
@@ -162,8 +187,8 @@ test)
     if [ "$ARCA" = 1 ]; then
         "$V" "grep -q 'service:aura-keys op=0x0005 .* status=0' /tmp/aura/arca/audit.log" && ok "Arca released the credential to aura-keys (audit log)" || fail "Arca release"
     fi
-    sh "$AP" ssh "grep -q 'AP-STA-CONNECTED 02:a5:00:00:00:01' /tmp/hostapd.log" && ok "hostapd: AP-STA-CONNECTED" || fail "hostapd connected"
-    sh "$AP" ssh "grep -q 'EAPOL-4WAY-HS-COMPLETED 02:a5:00:00:00:01' /tmp/hostapd.log" && ok "hostapd: EAPOL-4WAY-HS-COMPLETED" || fail "hostapd 4-way"
+    sh "$AP" ssh "grep -q 'AP-STA-CONNECTED $MAC' /tmp/hostapd.log" && ok "hostapd: AP-STA-CONNECTED" || fail "hostapd connected"
+    sh "$AP" ssh "grep -q 'EAPOL-4WAY-HS-COMPLETED $MAC' /tmp/hostapd.log" && ok "hostapd: EAPOL-4WAY-HS-COMPLETED" || fail "hostapd 4-way"
 
     "$V" 'ping -c 3 -t 30 10.77.0.1' >/dev/null && ok "ping the AP over CCMP" || fail "ping"
     ADDR=$("$V" "ifconfig wlan0 inet | awk '/inet / {print \$2}'")
@@ -180,7 +205,7 @@ test)
     "$V" 'ping -c 3 -t 30 10.77.0.1' >/dev/null && ok "ping after rekey" || fail "ping after rekey"
 
     # PMF: a forged (unprotected) deauth from the AP's address is ignored.
-    sh "$AP" ssh "hostapd_cli -p /run/hostapd deauthenticate 02:a5:00:00:00:01 test=0 >/dev/null 2>&1; true"
+    sh "$AP" ssh "hostapd_cli -p /run/hostapd deauthenticate $MAC test=0 >/dev/null 2>&1; true"
     sleep 5
     st=$("$V" "$CTL status")
     echo "    $st"
@@ -194,8 +219,103 @@ test)
     echo "$out" | grep -q 'state=disconnected' && ok "leave" || fail "leave"
     "$V" "grep -q 'secret=\\|correct horse' $MLOG && exit 1; true" && ok "no secret in aura-mlme's log" || fail "secret leaked to mlme log"
 
+}
+
+w2() {
+    r=$("$V" "echo '$PASS' | $CTL remember aura-test") || fail "remember: $r"
+    ok "credential remembered"
+
+    # 1. WPA3 only, H2E only, anti-clogging token on every commit.
+    sh "$AP" ap hostapd-wpa3.conf
+    out=$("$V" "$CTL scan" 2>&1) || fail "scan: $out"
+    echo "$out" | grep 'aura-test' | sed 's/^/    /'
+    echo "$out" | grep -q 'ssid="aura-test".*security=sae$' && ok "scan: aura-test is WPA3-SAE" || fail "scan security"
+    join aura-test --dhcp wlan0
+    MAC=$(mac_of "$out")
+    st=$("$V" "$CTL status"); echo "    $st"
+    echo "$st" | grep -q 'using=sae-h2e' && ok "SAE with hash-to-element" || fail "using H2E"
+    "$V" "grep -q 'anti-clogging token requested' $KLOG" && ok "anti-clogging token: asked, commit sent again" || fail "token path"
+    sh "$AP" ssh "grep -q 'AP-STA-CONNECTED $MAC' /tmp/hostapd.log && grep -q 'EAPOL-4WAY-HS-COMPLETED $MAC' /tmp/hostapd.log" && ok "hostapd: SAE station connected, 4-way done" || fail "hostapd SAE connect"
+    echo "$out" | grep -q 'address inet 10\.77\.0\.1[0-2][0-9]' && ok "DHCP address" || fail "DHCP"
+    "$V" 'ping -c 3 -t 30 10.77.0.1' >/dev/null && ok "ping over WPA3" || fail "ping (wpa3)"
+    # Regulatory: our country DE; the AP's Country element (US) narrows it.
+    r=$("$V" "$CTL country DE") || fail "country: $r"
+    echo "    $r"
+    st=$("$V" "$CTL status"); echo "    $st"
+    echo "$st" | grep -q 'country=DE narrowed=1' && ok "country DE set; the AP's US Country element narrowed the rules" || fail "regulatory narrowing"
+    "$V" 'ping -c 2 -t 20 10.77.0.1' >/dev/null && ok "still connected on channel 6 under DE and US" || fail "ping after country"
+    leave
+
+    # 2. Hunting-and-pecking (no H2E offered).
+    sh "$AP" ap hostapd-wpa3-hnp.conf
+    "$V" "killall -q dhclient; true"
+    join aura-test --dhcp wlan0
+    st=$("$V" "$CTL status"); echo "    $st"
+    echo "$st" | grep -q 'using=sae ' && ok "SAE with hunting-and-pecking" || fail "using H&P"
+    "$V" "grep -q 'hunting-and-pecking' $KLOG" || fail "H&P in keys log"
+    "$V" 'ping -c 3 -t 30 10.77.0.1' >/dev/null && ok "ping (hunting-and-pecking)" || fail "ping (hnp)"
+    leave
+
+    # 3. Transition mode: SAE chosen over PSK; Transition Disable honoured.
+    sh "$AP" ap hostapd-transition.conf
+    out=$("$V" "$CTL scan" 2>&1) || fail "scan: $out"
+    echo "$out" | grep -q 'ssid="aura-test".*security=sae-transition' && ok "scan: transition mode seen" || fail "scan transition"
+    "$V" "killall -q dhclient; true"
+    join aura-test
+    echo "$out" | grep -q 'transition_disabled=1' && ok "WPA3 chosen; the AP disabled transition (KDE)" || fail "transition disable"
+    leave
+
+    # 4. The same network offered as WPA2 only afterwards: refused.
+    sh "$AP" ap hostapd-wpa2.conf
+    out=$("$V" "$CTL join aura-test --wait 120" 2>&1) && fail "joined WPA2 after transition disable: $out"
+    echo "$out" | tail -n 2 | sed 's/^/    /'
+    echo "$out" | grep -q 'why=security-mismatch' && ok "WPA2-only BSS refused after Transition Disable" || fail "downgrade refused"
+
+    # 5. Roaming between two BSSs of one WPA3 network (channels 1 and 6).
+    sh "$AP" ap hostapd-roam-a.conf hostapd-roam-b.conf
+    sh "$AP" signal 2412 -40 2437 -75
+    BA=$(sh "$AP" ssh "cat /sys/class/net/wlan0/address")
+    BB=$(sh "$AP" ssh "cat /sys/class/net/wlan1/address")
+    "$V" "killall -q dhclient; true"
+    join aura-test --dhcp wlan0
+    echo "$out" | grep -q "state=authorized bssid=$BA" && ok "joined the stronger BSS ($BA, channel 1)" || fail "first BSS"
+    "$V" "rm -f /tmp/aura/watch.log; daemon -f -o /tmp/aura/watch.log $CTL watch 150"
+    sleep 2
+    sh "$AP" signal 2412 -85 2437 -40
+    i=0
+    until "$V" "grep -q 'state=authorized bssid=$BB' /tmp/aura/watch.log"; do
+        i=$((i + 1)); [ $i -lt 30 ] || { "$V" "cat /tmp/aura/watch.log"; fail "roam within 150 s"; }
+        sleep 5
+    done
+    "$V" "cat /tmp/aura/watch.log" | sed 's/^/    /'
+    "$V" "grep -q 'what=roam ' /tmp/aura/watch.log" && ok "roamed to $BB (channel 6) when $BA faded" || fail "roam event"
+    sh "$AP" ssh "grep -q 'wlan1: AP-STA-CONNECTED $MAC' /tmp/hostapd.log" && ok "hostapd: same address on the second BSS" || fail "hostapd roam"
+    "$V" 'ping -c 3 -t 30 10.77.0.1' >/dev/null && ok "ping after the roam (same address, same LAN)" || fail "ping after roam"
+    leave
+    "$V" "grep -q 'secret=\\|correct horse' $MLOG && exit 1; true" && ok "no secret in aura-mlme's log" || fail "secret leaked to mlme log"
+}
+
+teardown() {
     "$V" 'sysctl net.aura.wlan0; service atrium-portcullisd-bootstrap onestop >/dev/null 2>&1; pkill -x atrium-aura-mlme atrium-aura-keys aura-mlme aura-keys aura-air arcad dhclient; sleep 3; kldunload aura_sim && kldunload aura_wlan && echo "modules unloaded cleanly"'
+}
+
+case "${1:-}" in
+vms)
+    sh "$AP" up
+    if ! VSSH_CONNECT_TIMEOUT=5 "$V" true 2>/dev/null; then
+        NETDEV_EXTRA="hostfwd=udp:127.0.0.1:7701-:7701" sh "$ROOT/scripts/cloud-vm.sh" up
+    fi
+    ARCH=aarch64 KERNCONF="$KERNCONF" sh "$ROOT/scripts/aura-vm-check.sh" kernel ;;
+w1 | test)
+    setup hostapd-wpa2.conf
+    w1
+    teardown
     echo "W1 gate: $pass checks passed" ;;
+w2)
+    setup hostapd-wpa3.conf
+    w2
+    teardown
+    echo "W2 gate: $pass checks passed" ;;
 *)
-    sed -n 2,20p "$0"; exit 2 ;;
+    sed -n 2,26p "$0"; exit 2 ;;
 esac

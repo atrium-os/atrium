@@ -3,12 +3,15 @@
 # an Ubuntu 24.04 arm64 VM running hostapd on a mac80211_hwsim radio, with
 # aura/sim-ap/air-hwsim.py as the wireless medium. Frames cross to aura-air
 # in the FreeBSD VM over UDP: guest -> 10.0.2.2:$AIR_PORT (the host) ->
-# the FreeBSD VM's hostfwd (scripts/aura-w1-check.sh starts that VM with it).
+# the FreeBSD VM's hostfwd (scripts/aura-sim-gate.sh starts that VM with it).
 #
 #   sh scripts/aura-ap-vm.sh up        download (once), boot, install, wait for ssh
-#   sh scripts/aura-ap-vm.sh ap [CONF] start hwsim + medium + hostapd + udhcpd
-#                                       (CONF: a file in aura/sim-ap, default
-#                                       hostapd-wpa2.conf)
+#   sh scripts/aura-ap-vm.sh ap [CONF...] start hwsim + medium + hostapd + udhcpd
+#                                       (CONF: files in aura/sim-ap, default
+#                                       hostapd-wpa2.conf; one radio and BSS
+#                                       each, all bridged on br0 = 10.77.0.1)
+#   sh scripts/aura-ap-vm.sh signal FREQ DBM [FREQ DBM...]
+#                                       what the FreeBSD side hears per channel
 #   sh scripts/aura-ap-vm.sh log       hostapd and medium logs
 #   sh scripts/aura-ap-vm.sh ssh CMD   run a command in the VM as root
 #   sh scripts/aura-ap-vm.sh down      power off
@@ -33,7 +36,7 @@ main/i/iw/iw_6.7-1build1_arm64.deb"
 # The command goes over stdin, so it may hold any quotes.
 gssh() {
     printf '%s\n' "$*" | ssh -i "$KEY" -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
-        -o LogLevel=ERROR -o ConnectTimeout=5 -p "$SSH_PORT" ubuntu@localhost "sudo sh -s"
+        -o LogLevel=ERROR -o ConnectTimeout=60 -o ServerAliveInterval=30 -p "$SSH_PORT" ubuntu@localhost "sudo sh -s"
 }
 
 fetch() {
@@ -61,7 +64,7 @@ ssh_authorized_keys:
 package_update: false
 package_upgrade: false
 runcmd:
-  - systemctl disable --now snapd.service snapd.socket unattended-upgrades.service apt-daily.timer apt-daily-upgrade.timer || true
+  - systemctl disable --now snapd.service snapd.socket unattended-upgrades.service apt-daily.timer apt-daily-upgrade.timer ModemManager.service udisks2.service || true
   - mkdir -p /root/debs
   - for f in $(for p in $DEBS; do printf '%s ' "$(basename "$p")"; done); do curl -fsS -o /root/debs/\$f http://10.0.2.2:$HTTP_PORT/\$f; done
   - dpkg -i --force-depends /root/debs/*.deb || true
@@ -100,24 +103,46 @@ up() {
 }
 
 ap() {
-    conf=${1:-hostapd-wpa2.conf}
-    for f in air-hwsim.py udhcpd.conf "$conf"; do
+    [ $# -gt 0 ] || set -- hostapd-wpa2.conf
+    for f in air-hwsim.py udhcpd.conf "$@"; do
         scp -q -i "$KEY" -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR \
             -P "$SSH_PORT" "$ROOT/aura/sim-ap/$f" ubuntu@localhost:/tmp/
     done
-    gssh "pkill -x hostapd; pkill -f [a]ir-hwsim; pkill -f [u]dhcpd; sleep 1; rmmod mac80211_hwsim 2>/dev/null; true"
-    gssh "depmod -a && modprobe mac80211_hwsim radios=1 && sleep 1 && \
+    # The radios stay loaded between runs (unloading hwsim takes minutes
+    # under TCG): two radios, wlan0 and wlan1; a config only uses its own.
+    gssh "systemctl disable --now ModemManager.service udisks2.service >/dev/null 2>&1; \
+        pkill -x hostapd; pkill -f [a]ir-hwsim; pkill -f [u]dhcpd; sleep 1; rm -f /tmp/air-signal /run/udhcpd.leases; true"
+    # One radio per config: config i runs on wlan<i>, every BSS on br0.
+    confs="" i=0
+    for f in "$@"; do
+        gssh "sed -e 's/^interface=.*/interface=wlan$i/' /tmp/$f > /tmp/ap$i.conf && echo bridge=br0 >> /tmp/ap$i.conf"
+        confs="$confs /tmp/ap$i.conf"
+        i=$((i + 1))
+    done
+    [ "$i" -le 2 ] || { echo "aura-ap-vm: at most 2 configs" >&2; exit 2; }
+    gssh "set -e; [ \$(ls /sys/class/ieee80211 2>/dev/null | wc -l) -ge 2 ] || { rmmod mac80211_hwsim 2>/dev/null || true; depmod -a; modprobe mac80211_hwsim radios=2; sleep 2; }; \
+        ip link show br0 >/dev/null 2>&1 || { ip link add br0 type bridge; ip link set br0 up; ip addr add 10.77.0.1/24 dev br0; }; \
         (nohup python3 /tmp/air-hwsim.py 10.0.2.2 $AIR_PORT >/tmp/air.log 2>&1 &) && sleep 1 && \
-        (nohup hostapd /tmp/$conf >/tmp/hostapd.log 2>&1 &) && sleep 3 && \
-        ip addr add 10.77.0.1/24 dev wlan0 && \
+        (nohup hostapd$confs >/tmp/hostapd.log 2>&1 &) && sleep 4 && \
         (nohup busybox udhcpd -f /tmp/udhcpd.conf >/tmp/udhcpd.log 2>&1 &) && true"
-    gssh "grep -q AP-ENABLED /tmp/hostapd.log" || { gssh "cat /tmp/hostapd.log /tmp/air.log"; exit 1; }
-    echo "aura-ap-vm: AP up ($conf)"
+    t=0
+    until [ "$(gssh "grep -c AP-ENABLED /tmp/hostapd.log" || echo 0)" -ge "$i" ]; do
+        t=$((t + 1)); [ $t -lt 30 ] || { gssh "cat /tmp/hostapd.log /tmp/air.log"; exit 1; }
+        sleep 3
+    done
+    echo "aura-ap-vm: AP up ($*)"
+}
+
+signal() {
+    l=""
+    while [ $# -ge 2 ]; do l="$l$1 $2\n"; shift 2; done
+    gssh "printf '$l' > /tmp/air-signal.new && mv /tmp/air-signal.new /tmp/air-signal"
 }
 
 case "${1:-}" in
 up) up ;;
 ap) shift; ap "$@" ;;
+signal) shift; signal "$@" ;;
 log) gssh "tail -n 60 /tmp/hostapd.log; echo ---; tail -n 20 /tmp/air.log; echo ---; tail -n 20 /tmp/udhcpd.log" ;;
 ssh) shift; gssh "$*" ;;
 down) gssh "poweroff" || true; sleep 5; [ -f "$D/qemu.pid" ] && kill "$(cat "$D/qemu.pid")" 2>/dev/null || true ;;

@@ -10,13 +10,19 @@ pub const SSID: u8 = 0;
 pub const RATES: u8 = 1;
 pub const DS_PARAMS: u8 = 3;
 pub const TIM: u8 = 5;
+pub const COUNTRY: u8 = 7;
 pub const HT_CAP: u8 = 45;
 pub const RSN: u8 = 48;
 pub const EXT_RATES: u8 = 50;
 pub const HT_OP: u8 = 61;
 pub const VHT_CAP: u8 = 191;
 pub const VENDOR: u8 = 221;
+pub const RSNX: u8 = 244;
 pub const EXT: u8 = 255;
+/// RSNXE capability bit: the AP does SAE hash-to-element.
+pub const RSNX_SAE_H2E: u8 = 1 << 5;
+/// BSS membership selector (in the rates elements): H2E only.
+pub const SELECTOR_H2E: u8 = 123;
 pub const EXT_HE_CAP: u8 = 35;
 pub const MMIE: u8 = 76;
 
@@ -73,9 +79,10 @@ pub enum Pmf {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Security {
     Open,
+    /// WPA2-Personal only.
     Psk { akm: Akm, pmf: Pmf },
-    /// WPA3-SAE only (W2).
-    Sae,
+    /// WPA3-Personal; `psk` is the WPA2 AKM also offered (transition mode).
+    Sae { pmf: Pmf, psk: Option<Akm> },
     /// Refused outright (WEP, TKIP, WPA1, unknown AKMs): wifi.md §3.4.
     Refused(&'static str),
 }
@@ -86,7 +93,9 @@ impl Security {
             Security::Open => "open",
             Security::Psk { akm: Akm::Psk, .. } => "psk",
             Security::Psk { akm: Akm::PskSha256, .. } => "psk-sha256",
-            Security::Sae => "sae",
+            Security::Psk { akm: Akm::Sae, .. } => "sae",
+            Security::Sae { psk: None, .. } => "sae",
+            Security::Sae { psk: Some(_), .. } => "sae-transition",
             Security::Refused(w) => w,
         }
     }
@@ -105,6 +114,13 @@ pub struct BssInfo {
     pub rates: Vec<u8>,
     /// The whole RSN element, for the handshake's downgrade check.
     pub rsne: Option<Vec<u8>>,
+    /// The whole RSNXE, if any (checked against message 3 too).
+    pub rsnxe: Option<Vec<u8>>,
+    /// SAE hash-to-element offered (RSNXE), or required (selector).
+    pub h2e: bool,
+    pub h2e_only: bool,
+    /// The Country element's code, if any (it may only narrow our rules).
+    pub country: Option<[u8; 2]>,
     pub security: Security,
     pub wmm: bool,
     pub ht: bool,
@@ -146,16 +162,22 @@ pub fn security(cap: u16, rsne_el: Option<&[u8]>, wpa1: bool) -> Security {
         return Security::Refused("group-mgmt-cipher");
     }
     let has = |s: u32| r.akms.contains(&s);
-    if pmf != Pmf::No && has(Akm::PskSha256.suite()) {
-        Security::Psk { akm: Akm::PskSha256, pmf }
+    let psk = if pmf != Pmf::No && has(Akm::PskSha256.suite()) {
+        Some(Akm::PskSha256)
     } else if has(Akm::Psk.suite()) {
-        Security::Psk { akm: Akm::Psk, pmf }
+        Some(Akm::Psk)
     } else if has(Akm::PskSha256.suite()) {
-        Security::Psk { akm: Akm::PskSha256, pmf }
-    } else if has(0x000f_ac08) {
-        Security::Sae
+        Some(Akm::PskSha256)
     } else {
-        Security::Refused("akm")
+        None
+    };
+    // SAE needs management frame protection (§12.4); an AP offering SAE
+    // without it gets its WPA2 AKM used, or nothing.
+    match (has(Akm::Sae.suite()) && pmf != Pmf::No, psk) {
+        (true, psk) => Security::Sae { pmf, psk },
+        (false, Some(akm)) => Security::Psk { akm, pmf },
+        (false, None) if has(Akm::Sae.suite()) => Security::Refused("sae-no-pmf"),
+        (false, None) => Security::Refused("akm"),
     }
 }
 
@@ -184,6 +206,10 @@ pub fn parse_bss(frame: &[u8], freq: u16, rssi: i8) -> Option<BssInfo> {
         dtim: 1,
         rates: Vec::new(),
         rsne: None,
+        rsnxe: None,
+        h2e: false,
+        h2e_only: false,
+        country: None,
         security: Security::Open,
         wmm: false,
         ht: false,
@@ -216,10 +242,22 @@ pub fn parse_bss(frame: &[u8], freq: u16, rssi: i8) -> Option<BssInfo> {
                 }
             }
             TIM if body.len() >= 2 && body[1] != 0 => b.dtim = body[1],
+            COUNTRY if body.len() >= 3 && b.country.is_none() => {
+                let cc = [body[0], body[1]];
+                if cc.iter().all(u8::is_ascii_uppercase) {
+                    b.country = Some(cc);
+                }
+            }
             RSN if b.rsne.is_none() => {
                 let mut el = vec![RSN, body.len() as u8];
                 el.extend_from_slice(body);
                 b.rsne = Some(el);
+            }
+            RSNX if b.rsnxe.is_none() => {
+                let mut el = vec![RSNX, body.len() as u8];
+                el.extend_from_slice(body);
+                b.h2e = body.first().is_some_and(|c| c & RSNX_SAE_H2E != 0);
+                b.rsnxe = Some(el);
             }
             HT_CAP => b.ht = true,
             VHT_CAP => b.vht = true,
@@ -232,6 +270,9 @@ pub fn parse_bss(frame: &[u8], freq: u16, rssi: i8) -> Option<BssInfo> {
     if !seen_ssid || ies.truncated() || b.rates.is_empty() {
         return None;
     }
+    b.h2e_only = b.rates.contains(&(0x80 | SELECTOR_H2E));
+    // Membership selectors are not rates: keep them out of the rate list.
+    b.rates.retain(|&r| r & 0x7f != SELECTOR_H2E && r != 0xff && r != 0xfe);
     b.security = security(cap, b.rsne.as_deref(), wpa1);
     Some(b)
 }

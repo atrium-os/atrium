@@ -56,12 +56,29 @@ pub fn auth_open(own: &Mac, bssid: &Mac, seq: u16) -> Vec<u8> {
     f
 }
 
+/// SAE authentication (algorithm 3): `trans` 1 = commit, 2 = confirm;
+/// `body` from aura-keys.
+pub fn auth_sae(own: &Mac, bssid: &Mac, seq: u16, trans: u16, status: u16, body: &[u8]) -> Vec<u8> {
+    let mut f = hdr(AUTH, bssid, own, bssid, seq, false);
+    f.extend_from_slice(&3u16.to_le_bytes());
+    f.extend_from_slice(&trans.to_le_bytes());
+    f.extend_from_slice(&status.to_le_bytes());
+    f.extend_from_slice(body);
+    f
+}
+
+/// An authentication frame's body after algorithm, transaction and status.
+pub fn auth_body(f: &[u8]) -> &[u8] {
+    f.get(30..).unwrap_or(&[])
+}
+
 pub struct AssocReq<'a> {
     pub cap: u16,
     pub listen_interval: u16,
     pub ssid: &'a [u8],
     pub rates: &'a [u8],
     pub rsne: Option<&'a [u8]>,
+    pub rsnxe: Option<&'a [u8]>,
     pub wmm: bool,
 }
 
@@ -82,6 +99,9 @@ pub fn assoc_req(own: &Mac, bssid: &Mac, seq: u16, r: &AssocReq<'_>) -> Vec<u8> 
         f.extend_from_slice(b);
     }
     if let Some(e) = r.rsne {
+        f.extend_from_slice(e);
+    }
+    if let Some(e) = r.rsnxe {
         f.extend_from_slice(e);
     }
     if r.wmm {

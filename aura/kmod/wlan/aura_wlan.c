@@ -82,6 +82,7 @@ int	aura_rs_write(void *mem, uint32_t chan, const uint8_t *buf, size_t len,
 	    uint8_t *out, size_t cap, size_t *out_len, struct aura_tx *tx);
 void	aura_rs_close(void *mem, uint32_t chan);
 int	aura_rs_port_open(void *mem);
+void	aura_rs_mac(void *mem, uint8_t *out);
 int	aura_rs_tx_hdr(void *mem, const uint8_t *dst, const uint8_t *src,
 	    uint16_t ethertype, uint8_t prio, struct aura_tx *tx);
 int	aura_rs_rx_data(void *mem, const uint8_t *frame, size_t len,
@@ -340,6 +341,7 @@ aura_write(struct cdev *dev, struct uio *uio, int ioflag)
 	struct aura_tx tx;
 	size_t len, rlen;
 	uint8_t *in, *body = NULL;
+	uint8_t mac[ETHER_ADDR_LEN];
 	int error;
 
 	len = uio->uio_resid;
@@ -367,9 +369,19 @@ aura_write(struct cdev *dev, struct uio *uio, int ioflag)
 		if (tx.send && tx.body_off + (size_t)tx.body_len <= len)
 			body = in + tx.body_off;
 	}
+	if (error == 0 && n->which == AURA_CHAN_CTL)
+		aura_rs_mac(w->rs, mac);
 	AURA_UNLOCK(w);
 	if (body != NULL)
 		aura_send_frame(w, &tx, body, tx.body_len);
+	/*
+	 * A SetMac went through: the interface takes the address too (ARP,
+	 * DHCP and every frame the stack builds use it). Outside the lock:
+	 * if_setlladdr takes the ifnet's own locks.
+	 */
+	if (error == 0 && n->which == AURA_CHAN_CTL &&
+	    memcmp(mac, if_getlladdr(w->ifp), ETHER_ADDR_LEN) != 0)
+		if_setlladdr(w->ifp, mac, ETHER_ADDR_LEN);
 	free(in, M_AURA);
 	return (error);
 }

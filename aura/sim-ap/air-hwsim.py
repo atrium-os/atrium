@@ -12,6 +12,12 @@ as acknowledged, as a clean channel would.
 Datagram: b"AAIR" | u16 freq | i8 signal | u8 0 | 802.11 frame (no FCS).
 Test only; the AP side runs hostapd unmodified.
 
+With several hwsim radios (one hostapd BSS each, on different channels),
+each radio's channel is learned from its own frames and a frame from the
+FreeBSD side goes to the radio on its channel. The signal the FreeBSD side
+sees per channel comes from SIGNAL_FILE ("FREQ DBM" lines, re-read when it
+changes; default -40), so a test can make one AP fade and another grow.
+
 usage: air-hwsim.py HOST PORT
 """
 
@@ -48,6 +54,29 @@ TX_CTL_NO_ACK = 2
 TX_STAT_ACK = 4
 
 MAGIC = b"AAIR"
+SIGNAL_FILE = "/tmp/air-signal"
+
+
+class Signals:
+    def __init__(self):
+        self.mtime = None
+        self.by_freq = {}
+
+    def get(self, freq):
+        try:
+            m = os.stat(SIGNAL_FILE).st_mtime
+        except OSError:
+            m = None
+        if m != self.mtime:
+            self.mtime = m
+            self.by_freq = {}
+            if m is not None:
+                with open(SIGNAL_FILE) as f:
+                    for line in f:
+                        p = line.split()
+                        if len(p) == 2:
+                            self.by_freq[int(p[0])] = max(-100, min(0, int(p[1])))
+        return self.by_freq.get(freq, -40)
 
 
 def attr(t, data):
@@ -113,8 +142,8 @@ def main():
     nl.send(fam, HWSIM_CMD_REGISTER, b"")
     udp = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     udp.connect((host, port))
-    radio = None  # hwsim address of the AP radio, learned from its first frame
-    radio_freq = 0
+    radios = {}  # freq -> hwsim address of the radio on it
+    sig = Signals()
     stats = {"up": 0, "down": 0, "down_err": 0}
     last = time.time()
     print(f"air: medium registered, family {fam}, peer {host}:{port}", flush=True)
@@ -128,10 +157,12 @@ def main():
                 frame = a.get(A_FRAME)
                 if tx is None or frame is None:
                     continue
-                radio = tx
                 flags = struct.unpack("<I", a[A_FLAGS][:4])[0] if A_FLAGS in a else 0
-                freq = struct.unpack("<I", a[A_FREQ][:4])[0] if A_FREQ in a else radio_freq
-                radio_freq = freq or radio_freq
+                freq = struct.unpack("<I", a[A_FREQ][:4])[0] if A_FREQ in a else 0
+                if not freq:
+                    freq = next((f for f, r in radios.items() if r == tx), 0)
+                if freq:
+                    radios[freq] = tx
                 # Report the frame delivered and acknowledged.
                 info = a.get(A_TX_INFO, b"")
                 rates = bytearray(info)
@@ -152,7 +183,7 @@ def main():
                     + attr(A_COOKIE, a.get(A_COOKIE, b"\0" * 8)),
                 )
                 try:
-                    udp.send(MAGIC + struct.pack("<HbB", freq, -40, 0) + frame)
+                    udp.send(MAGIC + struct.pack("<HbB", freq, sig.get(freq), 0) + frame)
                     stats["up"] += 1
                 except OSError:
                     pass  # the FreeBSD side is not up yet
@@ -161,15 +192,18 @@ def main():
                 d = udp.recv(16384)
             except OSError:
                 d = b""
+            freq = struct.unpack_from("<H", d, 4)[0] if len(d) >= 8 else 0
+            radio = radios.get(freq)
             if len(d) >= 8 + 10 and d[:4] == MAGIC and radio is not None:
-                freq, sig, _ = struct.unpack_from("<HbB", d, 4)
+                # The AP hears us as well as we hear it.
+                s_dbm = sig.get(freq)
                 nl.send(
                     fam,
                     HWSIM_CMD_FRAME,
                     attr(A_ADDR_RECEIVER, radio)
                     + attr(A_FRAME, d[8:])
                     + attr(A_RX_RATE, struct.pack("<I", 0))
-                    + attr(A_SIGNAL, struct.pack("<i", sig))
+                    + attr(A_SIGNAL, struct.pack("<i", s_dbm))
                     + attr(A_FREQ, struct.pack("<I", freq)),
                 )
                 stats["down"] += 1

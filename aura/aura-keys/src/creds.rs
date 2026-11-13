@@ -1,7 +1,9 @@
 //! Where Wi-Fi credentials live: Arca's machine store (arca.md §6.4,
 //! wifi.md decision 7), kind `WifiCredential` (8), class "after boot". The
 //! account string is `wifi <ssid hex>`; the value is the passphrase (or the
-//! 64-hex-digit PSK). aura-keys (uid `_aura-keys`, named in arcad's
+//! 64-hex-digit PSK). One more item, `aura mac-key`, holds the key that
+//! per-network MAC addresses are derived from, so they stay the same across
+//! reboots. aura-keys (uid `_aura-keys`, named in arcad's
 //! `ARCA_SERVICES` as `aura-keys`) is the only reader and writer.
 //!
 //! `Memory` keeps credentials in this process only: for the sim gate before
@@ -15,32 +17,35 @@ use zeroize::{Zeroize, Zeroizing};
 
 pub type Secret = Zeroizing<Vec<u8>>;
 
+/// Items by account string.
 pub trait Store {
-    fn remember(&mut self, ssid: &[u8], secret: &[u8]) -> io::Result<()>;
-    fn forget(&mut self, ssid: &[u8]) -> io::Result<bool>;
-    fn release(&mut self, ssid: &[u8]) -> io::Result<Option<Secret>>;
+    fn remember(&mut self, acc: &str, secret: &[u8]) -> io::Result<()>;
+    fn forget(&mut self, acc: &str) -> io::Result<bool>;
+    fn release(&mut self, acc: &str) -> io::Result<Option<Secret>>;
 }
 
-fn account(ssid: &[u8]) -> String {
+pub fn account(ssid: &[u8]) -> String {
     format!("wifi {}", aura_ipc::hex(ssid))
 }
 
+pub const MAC_KEY: &str = "aura mac-key";
+
 #[derive(Default)]
-pub struct Memory(Vec<(Vec<u8>, Secret)>);
+pub struct Memory(Vec<(String, Secret)>);
 
 impl Store for Memory {
-    fn remember(&mut self, ssid: &[u8], secret: &[u8]) -> io::Result<()> {
-        self.0.retain(|(s, _)| s != ssid);
-        self.0.push((ssid.to_vec(), Zeroizing::new(secret.to_vec())));
+    fn remember(&mut self, acc: &str, secret: &[u8]) -> io::Result<()> {
+        self.0.retain(|(s, _)| s != acc);
+        self.0.push((acc.to_string(), Zeroizing::new(secret.to_vec())));
         Ok(())
     }
-    fn forget(&mut self, ssid: &[u8]) -> io::Result<bool> {
+    fn forget(&mut self, acc: &str) -> io::Result<bool> {
         let n = self.0.len();
-        self.0.retain(|(s, _)| s != ssid);
+        self.0.retain(|(s, _)| s != acc);
         Ok(self.0.len() != n)
     }
-    fn release(&mut self, ssid: &[u8]) -> io::Result<Option<Secret>> {
-        Ok(self.0.iter().find(|(s, _)| s == ssid).map(|(_, v)| v.clone()))
+    fn release(&mut self, acc: &str) -> io::Result<Option<Secret>> {
+        Ok(self.0.iter().find(|(s, _)| s == acc).map(|(_, v)| v.clone()))
     }
 }
 
@@ -122,9 +127,8 @@ impl Arca {
 }
 
 impl Store for Arca {
-    fn remember(&mut self, ssid: &[u8], secret: &[u8]) -> io::Result<()> {
-        self.forget(ssid)?;
-        let acc = account(ssid);
+    fn remember(&mut self, acc: &str, secret: &[u8]) -> io::Result<()> {
+        self.forget(acc)?;
         let mut body = Zeroizing::new(Vec::new());
         body.extend_from_slice(&KIND_WIFI.to_le_bytes());
         body.push(CLASS_AFTER_BOOT);
@@ -135,11 +139,10 @@ impl Store for Arca {
         self.call(OP_STORE, &body).map(|_| ())
     }
 
-    fn forget(&mut self, ssid: &[u8]) -> io::Result<bool> {
-        let acc = account(ssid);
+    fn forget(&mut self, acc: &str) -> io::Result<bool> {
         let mut any = false;
         for (id, a) in self.list()? {
-            if a == acc {
+            if a == *acc {
                 self.call(OP_DELETE, &id)?;
                 any = true;
             }
@@ -147,8 +150,7 @@ impl Store for Arca {
         Ok(any)
     }
 
-    fn release(&mut self, ssid: &[u8]) -> io::Result<Option<Secret>> {
-        let acc = account(ssid);
+    fn release(&mut self, acc: &str) -> io::Result<Option<Secret>> {
         let Some((id, _)) = self.list()?.into_iter().find(|(_, a)| *a == acc) else {
             return Ok(None);
         };

@@ -12,6 +12,7 @@
 pub mod crypto;
 pub mod eapol;
 pub mod rsne;
+pub mod sae;
 pub mod supp;
 
 #[cfg(test)]

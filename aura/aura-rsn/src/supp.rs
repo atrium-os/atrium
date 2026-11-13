@@ -23,6 +23,10 @@ pub struct Config {
     pub own_rsne: Vec<u8>,
     /// The RSNE the AP advertised in its beacon or probe response.
     pub ap_rsne: Vec<u8>,
+    /// The RSNXE we sent (H2E), and the AP's advertised one: message 3
+    /// must carry exactly the AP's (downgrade protection for H2E).
+    pub own_rsnxe: Option<Vec<u8>>,
+    pub ap_rsnxe: Option<Vec<u8>>,
     /// PMF negotiated: an IGTK is required.
     pub pmf: bool,
 }
@@ -32,6 +36,9 @@ pub enum Action {
     SetPtk([u8; 16]),
     SetGtk { idx: u8, key: Vec<u8>, rsc: [u8; 6] },
     SetIgtk { idx: u8, key: Vec<u8>, ipn: [u8; 6] },
+    /// The AP asked us to stop using transition modes (bits of the
+    /// Transition Disable KDE; bit 0: WPA3-Personal only).
+    TransitionDisable(u8),
     /// The 4-way handshake is complete: open the controlled port.
     Authorized,
 }
@@ -53,6 +60,7 @@ impl core::fmt::Debug for Action {
             Action::SetPtk(_) => f.write_str("SetPtk"),
             Action::SetGtk { idx, rsc, .. } => write!(f, "SetGtk(idx {idx}, rsc {rsc:02x?})"),
             Action::SetIgtk { idx, ipn, .. } => write!(f, "SetIgtk(idx {idx}, ipn {ipn:02x?})"),
+            Action::TransitionDisable(b) => write!(f, "TransitionDisable({b:#x})"),
             Action::Authorized => f.write_str("Authorized"),
         }
     }
@@ -70,6 +78,7 @@ pub enum Ignored {
     AnonceChanged,
     KeyData,
     RsneMismatch,
+    RsnxeMismatch,
     NoGtk,
     NoIgtk,
 }
@@ -155,7 +164,11 @@ impl Supplicant {
         let ptk = crypto::ptk(self.cfg.akm, &self.cfg.pmk, &self.cfg.aa, &self.cfg.spa, &anonce, &self.snonce);
         let info = self.version() | info::PAIRWISE | info::MIC;
         let snonce = self.snonce;
-        let msg2 = self.signed(&ptk.kck, k.version, info, k.replay, &snonce, &self.cfg.own_rsne.clone());
+        let mut kd = self.cfg.own_rsne.clone();
+        if let Some(x) = &self.cfg.own_rsnxe {
+            kd.extend_from_slice(x);
+        }
+        let msg2 = self.signed(&ptk.kck, k.version, info, k.replay, &snonce, &kd);
         self.state = State::WaitMsg3 { anonce, ptk };
         Ok(vec![Action::Send(msg2)])
     }
@@ -186,6 +199,9 @@ impl Supplicant {
         if kd.rsne.as_deref() != Some(&self.cfg.ap_rsne[..]) || kd.rsne2 {
             return Err(Ignored::RsneMismatch);
         }
+        if kd.rsnxe != self.cfg.ap_rsnxe {
+            return Err(Ignored::RsnxeMismatch);
+        }
         let Some((gidx, gtk)) = &kd.gtk else {
             return Err(Ignored::NoGtk);
         };
@@ -214,6 +230,9 @@ impl Supplicant {
                 return Err(Ignored::KeyData);
             }
             out.push(Action::SetIgtk { idx: *idx, key: key.clone(), ipn: *ipn });
+        }
+        if let Some(b) = kd.transition_disable {
+            out.push(Action::TransitionDisable(b));
         }
         out.push(Action::Authorized);
         self.state = State::Done { anonce, ptk };

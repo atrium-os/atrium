@@ -175,8 +175,8 @@ runs DHCP on `wlanN` when `aurad` reports the port authorized. The
 
 ### 3.6 Regulatory
 
-- Database: wireless-regdb (`db.txt`, ISC licence) compiled into a signed
-  table shipped with `aurad`.
+- Database: wireless-regdb (`db.txt`, ISC licence) compiled into `aurad`
+  at build time (`aura/aura-regdb`, §7.3), so it is signed with the binary.
 - Country: user setting, else the firmware's location-aware result (Intel
   LAR/MCC updates), else world-safe ("00"). An AP's Country IE may only
   tighten rules, never loosen them.
@@ -271,7 +271,7 @@ in FreeBSD and that hardware is going away.
 |---|---|---|
 | W0 | `aura-proto`, `aura_wlan` skeleton, kpi bindings (bus_dma, MSI-X, firmware, mbuf, ifnet), `aura_sim` + hwsim bridge | `wlan0` appears in the VM and passes Ethernet frames to the sim. **Done 2026-11-13** (§7.1) |
 | W1 | `aurad`: scan, open + WPA2-PSK + PMF, Arca credentials, jail, atrium-net glue, DHCP | VM joins hwsim `hostapd` WPA2 and gets an address. **Done 2026-11-13** (§7.2) |
-| W2 | `aurad`: WPA3-SAE (H2E + hunting-and-pecking), transition mode, roaming, MAC randomization, regdb | sim gate (§6.2) green |
+| W2 | `aurad`: WPA3-SAE (H2E + hunting-and-pecking), transition mode, roaming, MAC randomization, regdb | sim gate (§6.2) green. **Done 2026-11-13** (§7.3) |
 | W3 | `aura_mt79` USB transport: MCU messages, patch + RAM firmware load, hardware scan | MT7921AU in the Mac VM scans and reports BSSs to `aurad` |
 | W4 | `aura_mt79` station: BSS/STA records, TX/RX, HW crypto, firmware rate control, BA sessions, PS, country/regulatory; then the PCIe (WFDMA) bus layer and MT7925 on the AI X1 Pro | real AP joined at HE/EHT rates, iperf target met on the AI X1 Pro |
 | W5 | suspend/resume, rfkill, firmware crash recovery (reload + rejoin), 24 h soak | soak green |
@@ -333,12 +333,45 @@ W0–W2 need no Wi-Fi hardware at all.
   (W3/W4); it lives in aura-air now only because the sim has no such path.
 - Manifests: `aura/etc/services.d/43-atrium-aura-keys.toml`, `44-atrium-aura-mlme.toml`;
   rulesets in `etc/atrium.devfs.rules`, pins in `etc/jaild.policy.toml`.
-- Gate: `scripts/aura-w1-check.sh vms|test` (RUNBOOK §13.6c). A second VM (Ubuntu arm64)
+- Gate: `scripts/aura-sim-gate.sh vms|w1` (was `aura-w1-check.sh`; RUNBOOK §13.6c). A second VM (Ubuntu arm64)
   runs unmodified hostapd 2.10 on mac80211_hwsim with WPA2-PSK + PSK-SHA256, PMF
   required, GTK rekey every 60 s; `aura/sim-ap/air-hwsim.py` is the hwsim medium, carrying
   frames over UDP to aura-air. The FreeBSD VM joins in about 3 s, gets an address from
   udhcpd, pings both ways, survives a rekey and a forged deauth, and leaves.
 
+
+### 7.3 W2 as built (2026-11-13)
+
+- SAE (`aura/aura-rsn/src/sae.rs`), group 19 only, on the `p256` crate: hunting-and-pecking
+  (always 40 rounds, constant-time selection) and hash-to-element (SSWU, PT cached per
+  SSID and password), anti-clogging tokens (in the H2E container when H2E is used),
+  reflection and invalid scalar/element checks. Host tests run IEEE 802.11 Annex J.10
+  vectors (the ones hostapd uses), both methods end to end, wrong password, and mutation
+  fuzzing of hostile commits. SAE runs in aura-keys; aura-mlme only carries the
+  authentication frames and never sees the password or PMK.
+- AKM 8 (SAE): key descriptor version 0 (AES-CMAC MIC, SHA-256 KDF), RSNXE in message 2
+  and checked in message 3 against the beacon, PMF required (no MFPC means no SAE).
+- Transition mode: an AP offering PSK and SAE is joined with SAE. A Transition Disable
+  KDE (it is a WFA vendor KDE, OUI 50-6f-9a type 0x20, not an 00-0f-ac one) puts the
+  SSID on a WPA3-only list, so a later WPA2 BSS of that name is refused. The list lives
+  in aura-mlme memory for now; atrium-net will persist it.
+- MAC addresses: per network by default (HMAC of the SSID under a device key that
+  aura-keys keeps in Arca as `aura mac-key`), or `random` per join, or `device`. The
+  kernel takes the address with `SetMac` and changes the ifnet's lladdr.
+- Roaming: beacon RSSI average; below -70 dBm a background scan runs at most every
+  10 s, and a BSS of the same network 8 dB better gets a fresh SAE join after a
+  protected deauth. No 802.11r (FT) or PMK caching yet.
+- Regulatory: `aura/aura-regdb` compiles wireless-regdb `db.txt` (2026.05.30, ISC,
+  in `aura-regdb/data/`) into the binary at build time; unknown flags fail the build.
+  The country is set with `aura-ctl country CC` (atrium-net later). An AP's Country
+  element narrows the rules while associated (intersection only) and they are restored
+  on leave.
+- Gate: `scripts/aura-sim-gate.sh vms|w1|w2` (RUNBOOK §13.6c). The AP VM runs hostapd
+  2.10 with up to two radios bridged to one DHCP network. W2 scenarios: WPA3-only H2E
+  with anti-clogging, DHCP, ping and a country change narrowed by the AP; WPA3
+  hunting-and-pecking; transition mode with Transition Disable; a WPA2-only AP under a
+  WPA3-only name refused; roaming from channel 1 to 6 as `aura/sim-ap/air-hwsim.py`
+  lowers the first AP's signal; no secret in the aura-mlme log.
 
 ## 8. Threat model and what runs where
 

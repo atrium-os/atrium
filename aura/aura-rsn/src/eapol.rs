@@ -116,6 +116,10 @@ pub struct KeyData {
     pub rsne2: bool,
     pub gtk: Option<(u8, Vec<u8>)>,
     pub igtk: Option<(u8, [u8; 6], Vec<u8>)>,
+    /// The RSNXE, whole (must equal the AP's advertised one).
+    pub rsnxe: Option<Vec<u8>>,
+    /// Transition Disable KDE bits (bit 0: WPA3-Personal only from now on).
+    pub transition_disable: Option<u8>,
 }
 
 impl Drop for KeyData {
@@ -157,6 +161,17 @@ pub fn parse_key_data(d: &[u8]) -> Result<KeyData, BadFrame> {
                 } else {
                     k.rsne = Some(d[i..i + 2 + n].to_vec());
                 }
+            }
+            244 => {
+                if k.rsnxe.is_some() {
+                    return Err(BadFrame::Length);
+                }
+                k.rsnxe = Some(d[i..i + 2 + n].to_vec());
+            }
+            // Transition Disable is a Wi-Fi Alliance KDE (WPA3 spec §8):
+            // OUI 50-6f-9a, type 0x20, one octet of bits.
+            0xdd if n >= 5 && body[..4] == [0x50, 0x6f, 0x9a, 0x20] => {
+                k.transition_disable = Some(body[4]);
             }
             0xdd if n >= 4 && body[..3] == OUI => {
                 let kd = &body[4..];

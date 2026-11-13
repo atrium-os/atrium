@@ -5,7 +5,10 @@
 //!   aura-ctl scan
 //!   aura-ctl remember SSID        (passphrase on stdin; stored in Arca)
 //!   aura-ctl forget SSID
-//!   aura-ctl join SSID [--open] [--wait SECS] [--dhcp IFACE]
+//!   aura-ctl join SSID [--open | --wpa3] [--mac network|random|device]
+//!                [--wait SECS] [--dhcp IFACE]
+//!   aura-ctl watch SECS     (print aura-mlme's events)
+//!   aura-ctl country CC     (regulatory domain, ISO 3166 alpha-2; 00 = world)
 //!   aura-ctl leave | status
 //!
 //! Global: --mlme PATH (/atrium/sockets/aura/mlme.sock), --keys PATH
@@ -122,15 +125,19 @@ fn main() {
         "join" => {
             let ssid = ssid_arg();
             let mut open = false;
+            let mut wpa3 = false;
+            let mut mac = "network".to_string();
             let mut wait = 60u64;
             let mut dhcp: Option<String> = None;
             let mut a = args[2..].iter();
             while let Some(x) = a.next() {
                 match x.as_str() {
                     "--open" => open = true,
+                    "--wpa3" => wpa3 = true,
+                    "--mac" => mac = a.next().cloned().unwrap_or_default(),
                     "--wait" => wait = a.next().and_then(|v| v.parse().ok()).unwrap_or(60),
                     "--dhcp" => dhcp = a.next().cloned(),
-                    _ => die("join SSID [--open] [--wait SECS] [--dhcp IFACE]"),
+                    _ => die("join SSID [--open | --wpa3] [--mac network|random|device] [--wait SECS] [--dhcp IFACE]"),
                 }
             }
             if !open {
@@ -140,7 +147,8 @@ fn main() {
                 }
             }
             let mut p = Peer::connect(&mlme);
-            p.send(&Line::new("join").with_hex("ssid", &ssid).with("security", if open { "open" } else { "psk" }));
+            let sec = if open { "open" } else if wpa3 { "sae" } else { "psk" };
+            p.send(&Line::new("join").with_hex("ssid", &ssid).with("security", sec).with("mac", &mac));
             let start = Instant::now();
             let end = start + Duration::from_secs(wait);
             loop {
@@ -166,6 +174,29 @@ fn main() {
                 }
             }
         }
+        "country" => {
+            let cc = args.get(1).cloned().unwrap_or_default().to_ascii_uppercase();
+            let mut p = Peer::connect(&mlme);
+            p.send(&Line::new("country").with("cc", &cc));
+            let end = Instant::now() + Duration::from_secs(5);
+            while let Some(l) = p.next(end) {
+                if l.verb == "ok" || l.verb == "error" {
+                    println!("{}", show(&l));
+                    exit((l.verb != "ok") as i32);
+                }
+            }
+            die("no answer");
+        }
+        "watch" => {
+            let secs = args.get(1).and_then(|v| v.parse().ok()).unwrap_or(10u64);
+            let mut p = Peer::connect(&mlme);
+            let start = Instant::now();
+            let end = start + Duration::from_secs(secs);
+            while let Some(l) = p.next(end) {
+                println!("{:>7.2}s {}", start.elapsed().as_secs_f64(), show(&l));
+                std::io::stdout().flush().ok();
+            }
+        }
         "leave" | "status" => {
             let mut p = Peer::connect(&mlme);
             p.send(&Line::new(cmd));
@@ -178,7 +209,7 @@ fn main() {
             }
         }
         _ => {
-            eprintln!("usage: aura-ctl [--mlme PATH] [--keys PATH] scan|remember SSID|forget SSID|join SSID [--open] [--wait S] [--dhcp IF]|leave|status");
+            eprintln!("usage: aura-ctl [--mlme PATH] [--keys PATH] scan|remember SSID|forget SSID|join SSID [--open|--wpa3] [--mac P] [--wait S] [--dhcp IF]|watch S|country CC|leave|status");
             exit(2);
         }
     }
