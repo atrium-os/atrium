@@ -1,0 +1,930 @@
+Nov 13 13:52:59 atrium-r9700 kernel: vgapci0: detached
+Nov 13 13:52:59 atrium-r9700 kernel: atrium_gpu_amd_pci0: <Atrium AMD GPU — PCI base> port 0x6000-0x60ff mem 0x80000000-0x8fffffff,0x90000000-0x901fffff,0x98100000-0x9817ffff at device 0.0 on pci3
+Nov 13 13:52:59 atrium-r9700 kernel: atrium_gpu_amd_pci0: silicon: 32624 MiB VRAM, 46 IP instances
+Nov 13 13:52:59 atrium-r9700 kernel: atrium_gpu_amd_pci0:   GC      12.0.1 (4 segments, base0 0x1260)
+Nov 13 13:52:59 atrium-r9700 kernel: atrium_gpu_amd_pci0:   PSP     14.0.3 (8 segments, base0 0x16000)
+Nov 13 13:52:59 atrium-r9700 kernel: atrium_gpu_amd_pci0:   SMU     14.0.3 (8 segments, base0 0x16000)
+Nov 13 13:52:59 atrium-r9700 kernel: atrium_gpu_amd_pci0:   SDMA    7.0.1 (4 segments, base0 0x1260)
+Nov 13 13:52:59 atrium-r9700 kernel: atrium_gpu_amd_pci0:   MMHUB   4.1.0 (2 segments, base0 0x1a000)
+Nov 13 13:52:59 atrium-r9700 kernel: atrium_gpu_amd_pci0:   OSSSYS  7.0.0 (2 segments, base0 0x10a0)
+Nov 13 13:52:59 atrium-r9700 kernel: atrium_gpu_amd_pci0:   HDP     7.0.0 (2 segments, base0 0xf20)
+Nov 13 13:52:59 atrium-r9700 kernel: atrium_gpu_amd_pci0:   NBIF    6.3.1 (6 segments, base0 0)
+Nov 13 13:52:59 atrium-r9700 kernel: atrium_gpu_amd_pci0:   DCN     4.1.0 (5 segments, base0 0x12)
+Nov 13 13:52:59 atrium-r9700 kernel: atrium_gpu_amd_pci0:   VCN     5.0.0 (2 segments, base0 0x7800)
+Nov 13 13:52:59 atrium-r9700 kernel: atrium_gpu_amd_pci0: silicon, ISA gfx1201
+Nov 13 13:52:59 atrium-r9700 kernel: atrium_gpu_amd_pci0: psp: amdgpu/psp_14_0_3_sos.bin, 9 pieces; buffer VRAM+0x4000000 = MC 0x8004000000
+Nov 13 13:52:59 atrium-r9700 kernel: atrium_gpu_amd_pci0: psp: [0] type 3 version 0x703b0001, 6816 bytes, cmd 0x80000
+Nov 13 13:52:59 atrium-r9700 kernel: atrium_gpu_amd_pci0: psp: [1] type 5 version 0x1003a00, 832 bytes, cmd 0x10000000
+Nov 13 13:52:59 atrium-r9700 kernel: atrium_gpu_amd_pci0: psp: [2] type 2 version 0x3a1214, 78272 bytes, cmd 0x10000
+Nov 13 13:52:59 atrium-r9700 kernel: atrium_gpu_amd_pci0: psp: [3] type 7 version 0x3a1214, 103792 bytes, cmd 0xb0000
+Nov 13 13:52:59 atrium-r9700 kernel: atrium_gpu_amd_pci0: psp: [4] type 8 version 0x3a1214, 37280 bytes, cmd 0xd0000
+Nov 13 13:52:59 atrium-r9700 kernel: atrium_gpu_amd_pci0: psp: [5] type 9 version 0x3a1214, 53344 bytes, cmd 0xc0000
+Nov 13 13:52:59 atrium-r9700 kernel: atrium_gpu_amd_pci0: psp: [6] type 10 version 0x3a1214, 12704 bytes, cmd 0xe0000
+Nov 13 13:52:59 atrium-r9700 kernel: atrium_gpu_amd_pci0: psp: [7] type 11 version 0x3a1214, 12848 bytes, cmd 0xf0000
+Nov 13 13:52:59 atrium-r9700 kernel: atrium_gpu_amd_pci0: psp: [8] type 1 version 0x3a1214, 125472 bytes, cmd 0x20000
+Nov 13 13:52:59 atrium-r9700 kernel: atrium_gpu_amd_pci0: psp: sOS up; C2PMSG_35 0, C2PMSG_81 0x22509bbf
+Nov 13 13:52:59 atrium-r9700 kernel: atrium_gpu_amd_pci0: psp: KM ring created (C2PMSG_64 0x80c20000)
+Nov 13 13:52:59 atrium-r9700 kernel: atrium_gpu_amd_pci0: psp: fw reservation: status 0, VRAM 0x7f3e00000 + 0x3200000 (50 MiB)
+Nov 13 13:52:59 atrium-r9700 kernel: atrium_gpu_amd_pci0: psp: fw reservation (ext): status 0, VRAM 0x7d6c00000 + 0x400000 (4 MiB) NOT at the top of VRAM
+Nov 13 13:52:59 atrium-r9700 kernel: atrium_gpu_amd_pci0: psp: fence 0x3; resp 00000000 00000000 deadbeef deadbeef 00000000 deadbeef deadbeef deadbeef
+Nov 13 13:52:59 atrium-r9700 kernel: atrium_gpu_amd_pci0: psp: LOAD_TOC (2304 bytes): done, status 0, TMR size 0 (0 MiB)
+Nov 13 13:52:59 atrium-r9700 kernel: atrium_gpu_amd_pci0: psp: before: RLC bootload status 0, CP_STAT 0
+Nov 13 13:53:00 atrium-r9700 kernel: atrium_gpu_amd_pci0: psp: 20 IP firmware images, 2020 KiB staged at VRAM+0x4400000
+Nov 13 13:53:00 atrium-r9700 kernel: atrium_gpu_amd_pci0: psp: LOAD_IP_FW type 18, 327168 bytes: status 0
+Nov 13 13:53:00 atrium-r9700 kernel: atrium_gpu_amd_pci0: psp: LOAD_IP_FW type 71, 46848 bytes: status 0
+Nov 13 13:53:00 atrium-r9700 kernel: atrium_gpu_amd_pci0: psp: LOAD_IP_FW type 87, 92992 bytes: status 0
+Nov 13 13:53:00 atrium-r9700 kernel: atrium_gpu_amd_pci0: psp: LOAD_IP_FW type 88, 201152 bytes: status 0
+Nov 13 13:53:00 atrium-r9700 kernel: atrium_gpu_amd_pci0: psp: LOAD_IP_FW type 89, 193248 bytes: status 0
+Nov 13 13:53:00 atrium-r9700 kernel: atrium_gpu_amd_pci0: psp: LOAD_IP_FW type 90, 66368 bytes: status 0
+Nov 13 13:53:00 atrium-r9700 kernel: atrium_gpu_amd_pci0: psp: LOAD_IP_FW type 92, 66192 bytes: status 0
+Nov 13 13:53:00 atrium-r9700 kernel: atrium_gpu_amd_pci0: psp: LOAD_IP_FW type 94, 66080 bytes: status 0
+Nov 13 13:53:00 atrium-r9700 kernel: atrium_gpu_amd_pci0: psp: LOAD_IP_FW type 95, 66080 bytes: status 0
+Nov 13 13:53:00 atrium-r9700 kernel: atrium_gpu_amd_pci0: psp: LOAD_IP_FW type 33, 217104 bytes: status 0
+Nov 13 13:53:00 atrium-r9700 kernel: atrium_gpu_amd_pci0: psp: LOAD_IP_FW type 34, 82048 bytes: status 0
+Nov 13 13:53:00 atrium-r9700 kernel: atrium_gpu_amd_pci0: psp: LOAD_IP_FW type 81, 217104 bytes: status 0
+Nov 13 13:53:00 atrium-r9700 kernel: atrium_gpu_amd_pci0: psp: LOAD_IP_FW type 82, 82048 bytes: status 0
+Nov 13 13:53:00 atrium-r9700 kernel: atrium_gpu_amd_pci0: psp: LOAD_IP_FW type 68, 66048 bytes: status 0
+Nov 13 13:53:00 atrium-r9700 kernel: atrium_gpu_amd_pci0: psp: LOAD_IP_FW type 69, 66048 bytes: status 0
+Nov 13 13:53:00 atrium-r9700 kernel: atrium_gpu_amd_pci0: psp: LOAD_IP_FW type 20, 2560 bytes: status 0
+Nov 13 13:53:00 atrium-r9700 kernel: atrium_gpu_amd_pci0: psp: LOAD_IP_FW type 21, 23616 bytes: status 0
+Nov 13 13:53:00 atrium-r9700 kernel: atrium_gpu_amd_pci0: psp: LOAD_IP_FW type 26, 66048 bytes: status 0
+Nov 13 13:53:00 atrium-r9700 kernel: atrium_gpu_amd_pci0: psp: LOAD_IP_FW type 48, 33280 bytes: status 0
+Nov 13 13:53:00 atrium-r9700 kernel: atrium_gpu_amd_pci0: psp: LOAD_IP_FW type 8, 25088 bytes: status 0
+Nov 13 13:53:00 atrium-r9700 kernel: atrium_gpu_amd_pci0: psp: AUTOLOAD_RLC: status 0
+Nov 13 13:53:02 atrium-r9700 kernel: atrium_gpu_amd_pci0: psp: RLC autoload NOT complete after 2000000 us: bootload status 0, CP_STAT 0
+Nov 13 13:53:02 atrium-r9700 kernel: atrium_gpu_amd_pci0: psp: rings destroyed (C2PMSG_64 0x80c30000)
+Nov 13 13:53:02 atrium-r9700 kernel: atrium_gpu_amd_pci0: smu: SMU 14.0.3, response register 0x1
+Nov 13 13:53:02 atrium-r9700 kernel: atrium_gpu_amd_pci0: smu: before: GB_ADDR_CONFIG 0, RLC bootload status 0, CP_STAT 0
+Nov 13 13:53:02 atrium-r9700 kernel: atrium_gpu_amd_pci0: smu: TestMessage                arg 0000000000: resp 0x1, out 0x1
+Nov 13 13:53:02 atrium-r9700 kernel: atrium_gpu_amd_pci0: smu: GetSmuVersion              arg 0000000000: resp 0x1, out 0x685000
+Nov 13 13:53:02 atrium-r9700 kernel: atrium_gpu_amd_pci0: smu: GetDriverIfVersion         arg 0000000000: resp 0x1, out 0x33
+Nov 13 13:53:02 atrium-r9700 kernel: atrium_gpu_amd_pci0: smu: SetDriverDramAddrHigh      arg 0x00000080: resp 0x1
+Nov 13 13:53:02 atrium-r9700 kernel: atrium_gpu_amd_pci0: smu: SetDriverDramAddrLow       arg 0x05400000: resp 0x1
+Nov 13 13:53:02 atrium-r9700 kernel: atrium_gpu_amd_pci0: smu: GetRunningSmuFeaturesLow   arg 0000000000: resp 0x1, out 0
+Nov 13 13:53:02 atrium-r9700 kernel: atrium_gpu_amd_pci0: smu: GetRunningSmuFeaturesHigh  arg 0000000000: resp 0x1, out 0
+Nov 13 13:53:02 atrium-r9700 kernel: atrium_gpu_amd_pci0: smu: running features 000000000000000000
+Nov 13 13:53:02 atrium-r9700 kernel: atrium_gpu_amd_pci0: smu: RunDcBtc                   arg 0000000000: resp 0x1
+Nov 13 13:53:02 atrium-r9700 kernel: atrium_gpu_amd_pci0: smu: SetAllowedFeaturesMaskHigh arg 0xffffffff: resp 0xfd
+Nov 13 13:53:02 atrium-r9700 kernel: atrium_gpu_amd_pci0: smu: allowed mask refused: SCPM, the PSP owns it
+Nov 13 13:53:02 atrium-r9700 kernel: atrium_gpu_amd_pci0: smu: EnableAllSmuFeatures       arg 0000000000: resp 0x1
+Nov 13 13:53:02 atrium-r9700 kernel: atrium_gpu_amd_pci0: smu: GetRunningSmuFeaturesLow   arg 0000000000: resp 0x1, out 0x38fffcfb
+Nov 13 13:53:02 atrium-r9700 kernel: atrium_gpu_amd_pci0: smu: GetRunningSmuFeaturesHigh  arg 0000000000: resp 0x1, out 0x488f19e
+Nov 13 13:53:02 atrium-r9700 kernel: atrium_gpu_amd_pci0: smu: running features 0x0488f19e38fffcfb
+Nov 13 13:53:02 atrium-r9700 kernel: atrium_gpu_amd_pci0: smu: protection features running (thermal trip, throttlers, fan, VR hot, memory temperature)
+Nov 13 13:53:02 atrium-r9700 kernel: atrium_gpu_amd_pci0: smu: DisallowGfxOff             arg 0000000000: resp 0x1
+Nov 13 13:53:02 atrium-r9700 kernel: atrium_gpu_amd_pci0: smu: RLC autoload complete after 0 us
+Nov 13 13:53:02 atrium-r9700 kernel: atrium_gpu_amd_pci0: smu: after: GB_ADDR_CONFIG 0x8200545, RLC bootload status 0x8000003f, CP_STAT 0
+Nov 13 13:53:02 atrium-r9700 kernel: atrium_gpu_amd_pci0: smu: TransferTableSmu2Dram      arg 0x00000005: resp 0x1
+Nov 13 13:53:02 atrium-r9700 kernel: atrium_gpu_amd_pci0: smu: metrics +  0: e8 03 00 00 24 02 00 00 60 00 00 00 54 04 00 00 19 00 00 00 19 00 00 00 58 02 00 00 58 02 00 00
+Nov 13 13:53:02 atrium-r9700 kernel: atrium_gpu_amd_pci0: smu: metrics + 32: cf 02 00 00 cf 02 00 00 cf 02 00 00 00 00 00 00 00 00 37 04 f6 03 76 01 80 01 18 00 18 00 00 00
+Nov 13 13:53:02 atrium-r9700 kernel: atrium_gpu_amd_pci0: smu: metrics + 64: 00 00 2b 00 2c 01 00 00 00 00 00 00 00 00 fb 03 e2 03 71 00 9d 00 17 00 17 00 57 00 00 00 00 00
+Nov 13 13:53:02 atrium-r9700 kernel: atrium_gpu_amd_pci0: smu: metrics + 96: 12 00 00 00 3b 00 00 00 04 00 00 00 23 02 4e 03 fa 01 a9 03 d1 b5 e3 0c 2b 00 c3 0b 4b 00 00 00
+Nov 13 13:53:02 atrium-r9700 kernel: atrium_gpu_amd_pci0: smu: metrics +128: 00 00 00 00 35 00 00 00 35 00 35 00 1f 00 25 00 25 00 23 00 01 00 17 00 17 00 15 00 19 00 00 00
+Nov 13 13:53:02 atrium-r9700 kernel: atrium_gpu_amd_pci0: smu: metrics +160: 00 00 00 00 00 00 03 08 01 03 7b 03 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+Nov 13 13:53:02 atrium-r9700 kernel: atrium_gpu_amd_pci0: smu: metrics +192: 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+Nov 13 13:53:02 atrium-r9700 kernel: atrium_gpu_amd_pci0: smu: metrics +224: 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 9f 6c ce 74
+Nov 13 13:53:02 atrium-r9700 kernel: atrium_gpu_amd_pci0: smu: metrics +256: e2 f1 df b8
+Nov 13 13:53:02 atrium-r9700 kernel: atrium_gpu_amd_pci0: smu: telemetry #4: edge 31 C, hotspot 37 C, mem 1 C, VR 23 C; power 53 W of 300 W limit, board 53 W; fan 891 rpm (1%); gfx 0 MHz, mem 384 MHz, gfx busy 75%; throttle 0 (ids 0)
+Nov 13 13:53:03 atrium-r9700 kernel: atrium_gpu_amd_pci0: smu: sample [GC up, no idle setup] 1/1
+Nov 13 13:53:03 atrium-r9700 kernel: atrium_gpu_amd_pci0: smu: TransferTableSmu2Dram      arg 0x00000005: resp 0x1
+Nov 13 13:53:03 atrium-r9700 kernel: atrium_gpu_amd_pci0: smu: telemetry #949: edge 31 C, hotspot 58 C, mem 32 C, VR 37 C; power 249 W of 300 W limit, board 249 W; fan 1017 rpm (20%); gfx 3109 MHz, mem 13 MHz, gfx busy 100%; throttle 0x1 (ids 0x2)
+Nov 13 13:53:03 atrium-r9700 kernel: atrium_gpu_amd_pci0: smu: busy or at the power limit with no work queued
+Nov 13 13:53:03 atrium-r9700 kernel: atrium_gpu_amd_pci0: gfx: idle sequence GC 12.0.0/1: SRM, clock gating
+Nov 13 13:53:03 atrium-r9700 kernel: atrium_gpu_amd_pci0: gfx: before idle setup: GRBM_STATUS 0x382c, RLC_CNTL 0x1, RLC_STAT 0, MGCG_OVERRIDE 0x7ff, CGCG_CGLS 0x1003c, CGCG_CGLS_3D 0x3c, SRM 0x2, CP_INT_CNTL 0, CP_INT_CNTL_RING0 0
+Nov 13 13:53:03 atrium-r9700 kernel: atrium_gpu_amd_pci0: gfx: after idle setup: GRBM_STATUS 0x800382c, RLC_CNTL 0x1, RLC_STAT 0x35, MGCG_OVERRIDE 0x40, CGCG_CGLS 0x363f, CGCG_CGLS_3D 0x363f, SRM 0x3, CP_INT_CNTL 0x3c0000, CP_INT_CNTL_RING0 0x3c0000
+Nov 13 13:53:03 atrium-r9700 kernel: atrium_gpu_amd_pci0: smu: AllowGfxOff                arg 0000000000: resp 0x1
+Nov 13 13:53:03 atrium-r9700 kernel: atrium_gpu_amd_pci0: smu: sample [idle check] 1/5
+Nov 13 13:53:03 atrium-r9700 kernel: atrium_gpu_amd_pci0: smu: TransferTableSmu2Dram      arg 0x00000005: resp 0x1
+Nov 13 13:53:03 atrium-r9700 kernel: atrium_gpu_amd_pci0: smu: telemetry #1: edge 33 C, hotspot 67 C, mem 32 C, VR 39 C; power 286 W of 300 W limit, board 286 W; fan 923 rpm (20%); gfx 3260 MHz, mem 133 MHz, gfx busy 100%; throttle 0x1 (ids 0x2)
+Nov 13 13:53:03 atrium-r9700 kernel: atrium_gpu_amd_pci0: smu: busy or at the power limit with no work queued
+Nov 13 13:53:04 atrium-r9700 kernel: atrium_gpu_amd_pci0: smu: sample [idle check] 2/5
+Nov 13 13:53:04 atrium-r9700 kernel: atrium_gpu_amd_pci0: smu: TransferTableSmu2Dram      arg 0x00000005: resp 0x1
+Nov 13 13:53:04 atrium-r9700 kernel: atrium_gpu_amd_pci0: smu: telemetry #999: edge 32 C, hotspot 38 C, mem 32 C, VR 33 C; power 7 W of 300 W limit, board 7 W; fan 860 rpm (20%); gfx 7 MHz, mem 2 MHz, gfx busy 0%; throttle 0x1 (ids 0x2)
+Nov 13 13:53:04 atrium-r9700 kernel: atrium_gpu_amd_pci0: smu: card proven idle
+Nov 13 13:53:04 atrium-r9700 kernel: atrium_gpu_amd_pci0: gfx: end: GRBM_STATUS 0, RLC_CNTL 0, RLC_STAT 0, MGCG_OVERRIDE 0, CGCG_CGLS 0, CGCG_CGLS_3D 0, SRM 0, CP_INT_CNTL 0, CP_INT_CNTL_RING0 0
+Nov 13 13:53:04 atrium-r9700 kernel: atrium_gpu_amd_pci0: smu: DisallowGfxOff             arg 0000000000: resp 0x1
+Nov 13 13:53:04 atrium-r9700 kernel: atrium_gpu_amd_pci0: gmc: VRAM 32640 MiB at MC 0x8000000000-0x87f7ffffff (FB offset 0); GART 512 MiB at 0, table at MC 0x8005800000
+Nov 13 13:53:04 atrium-r9700 kernel: atrium_gpu_amd_pci0: gmc: MMHUB 4.1 before: CONTEXT0_CNTL 0x3fffc00, PT base 000000000, L1_TLB 0x501, L2_CNTL 0x80602, fault status 0 (addr 000000000)
+Nov 13 13:53:04 atrium-r9700 kernel: atrium_gpu_amd_pci0: gmc: GFXHUB (GC 12.0) before: CONTEXT0_CNTL 0x3fffc00, PT base 000000000, L1_TLB 0x501, L2_CNTL 0x80602, fault status 0 (addr 000000000)
+Nov 13 13:53:04 atrium-r9700 kernel: atrium_gpu_amd_pci0: gmc: MMHUB 4.1 after: CONTEXT0_CNTL 0x3fffc01, PT base 005800001, L1_TLB 0x1859, L2_CNTL 0x80e01, fault status 0 (addr 000000000)
+Nov 13 13:53:04 atrium-r9700 kernel: atrium_gpu_amd_pci0: gmc: GFXHUB (GC 12.0) after: CONTEXT0_CNTL 0x3fffc01, PT base 005800001, L1_TLB 0x1859, L2_CNTL 0x80e01, fault status 0 (addr 000000000)
+Nov 13 13:53:04 atrium-r9700 kernel: atrium_gpu_amd_pci0: gmc: TLB flush on both hubs: acked
+Nov 13 13:53:04 atrium-r9700 kernel: atrium_gpu_amd_pci0: gfx12: before: GRBM_STATUS 0x382c, CP_STAT 0, CP_ME_CNTL 0xa000, CP_MEC_RS64_CNTL 0x3c000000, CP_DEBUG 0x20400000, GRBM_CNTL 0x300018
+Nov 13 13:53:04 atrium-r9700 kernel: atrium_gpu_amd_pci0: gfx12: halted: GRBM_STATUS 0x382c, CP_STAT 0, CP_ME_CNTL 0x1400a000, CP_MEC_RS64_CNTL 0x40030000, CP_DEBUG 0x20400000, GRBM_CNTL 0x300018
+Nov 13 13:53:04 atrium-r9700 kernel: atrium_gpu_amd_pci0: gfx12: GB_ADDR_CONFIG 0x8200545 (address fields: pipes 32, se 16, rb/se 4, pkrs 32, interleave 256 B)
+Nov 13 13:53:04 atrium-r9700 kernel: atrium_gpu_amd_pci0: gfx12: active SAs 8 of 16 (mask 0xff)
+Nov 13 13:53:04 atrium-r9700 kernel: atrium_gpu_amd_pci0: gfx12: RB disable 0/0, SA disable 0xff0000/0xff0000, DB_RING_CONTROL 0x1
+Nov 13 13:53:04 atrium-r9700 kernel: atrium_gpu_amd_pci0: gfx12: RS64 start: PFP 0x7000000003000, ME 0x7000000003000, MEC 0x7000000003000
+Nov 13 13:53:04 atrium-r9700 kernel: atrium_gpu_amd_pci0: gfx12: SH_MEM VMID 1: config 0xc00c, bases 0x20001000; VMID 8: config 0xc00c, bases 0x10002
+Nov 13 13:53:04 atrium-r9700 kernel: atrium_gpu_amd_pci0: gfx12: after: GRBM_STATUS 0x382c, CP_STAT 0, CP_ME_CNTL 0x1400a000, CP_MEC_RS64_CNTL 0x40000000, CP_DEBUG 0x20408000, GRBM_CNTL 0x3000ff
+Nov 13 13:53:04 atrium-r9700 kernel: atrium_gpu_amd_pci0: gfx12: stage 4c done; CP halted
+Nov 13 13:53:04 atrium-r9700 kernel: atrium_gpu_amd_pci0: ih: OSSSYS 7.0, ring 64 KiB at GART 0x1000 (pa 0x2f84b0000), wptr writeback at GART 0x11000
+Nov 13 13:53:04 atrium-r9700 kernel: atrium_gpu_amd_pci0: ih: before: RB_CNTL 0x40610000, RPTR 0, WPTR 0 (writeback 0), STATUS 0xc0847, no interrupts 0
+Nov 13 13:53:04 atrium-r9700 kernel: atrium_gpu_amd_pci0: ih: MSI, 1 vector, for every IH client
+Nov 13 13:53:04 atrium-r9700 kernel: atrium_gpu_amd_pci0: ih: enabled: RB_CNTL 0x4033011d, RPTR 0, WPTR 0 (writeback 0), STATUS 0xc0847, MSI interrupts 0
+Nov 13 13:53:04 atrium-r9700 kernel: atrium_gpu_amd_pci0: mes: MSCRATCH 2 x 256 KiB at GART 0x100000, zeroed before every start
+Nov 13 13:53:04 atrium-r9700 kernel: atrium_gpu_amd_pci0: mes: MES 12 (GC 12.0.0/1, unified), start 0xfffffffff0005000, block at GART 0x20000 (pa 0x34eaa8000), doorbell BAR 2048 KiB
+Nov 13 13:53:04 atrium-r9700 kernel: atrium_gpu_amd_pci0: mes: before: CP_MES_CNTL 0x40000000; pipe 0: instr 0x800, GP3 0, HQD active 0, rptr 0, wptr 0; pipe 1: instr 0x800, GP3 0, HQD active 0, rptr 0, wptr 0; GRBM_STATUS 0x382c, CP_STAT 0, RLC_STAT 0x25
+Nov 13 13:53:04 atrium-r9700 kernel: atrium_gpu_amd_pci0: mes: before: GRBM_STATUS2 0x100000, GRBM_STATUS3 0, CP_CPC_STATUS 0, CP_CPC_BUSY_STAT 0/0, CP_CPF_STATUS 0, CP_BUSY_STAT 0, RLC_GPM_STAT 0x140037
+Nov 13 13:53:04 atrium-r9700 kernel: atrium_gpu_amd_pci0: mes: before start: pipe 0 IC_BASE 0x7f461d000 (cntl 0), MIBOUND 00007ffff, MDBASE 0x7f5500000, MDBOUND 00007ffff, MSCRATCH 000000000, LOCAL_BASE0 0
+Nov 13 13:53:04 atrium-r9700 kernel: atrium_gpu_amd_pci0: mes: before start: pipe 1 IC_BASE 0x7f469d000 (cntl 0), MIBOUND 00007ffff, MDBASE 0x7f5580000, MDBOUND 00007ffff, MSCRATCH 000000000, LOCAL_BASE0 0
+Nov 13 13:53:04 atrium-r9700 kernel: atrium_gpu_amd_pci0: gmc: MMHUB 4.1 before MES: CONTEXT0_CNTL 0x3fffc01, PT base 005800001, L1_TLB 0x1859, L2_CNTL 0x80e01, fault status 0 (addr 000000000)
+Nov 13 13:53:04 atrium-r9700 kernel: atrium_gpu_amd_pci0: gmc: GFXHUB (GC 12.0) before MES: CONTEXT0_CNTL 0x3fffc01, PT base 005800001, L1_TLB 0x1859, L2_CNTL 0x80e01, fault status 0 (addr 000000000)
+Nov 13 13:53:04 atrium-r9700 kernel: atrium_gpu_amd_pci0: gfx: before MES: GRBM_STATUS 0x382c, RLC_CNTL 0x1, RLC_STAT 0x25, MGCG_OVERRIDE 0x40, CGCG_CGLS 0x363f, CGCG_CGLS_3D 0x363f, SRM 0x3, CP_INT_CNTL 0x3c0000, CP_INT_CNTL_RING0 0x3c0000
+Nov 13 13:53:04 atrium-r9700 kernel: atrium_gpu_amd_pci0: mes: CP running before MES (as amdgpu): CP_ME_CNTL 0xa000, CP_MEC_RS64_CNTL 0x3c000000, CP_STAT 0 after 12 us, CP_CPF_STATUS 0
+Nov 13 13:53:04 atrium-r9700 kernel: atrium_gpu_amd_pci0: mes: attempt 1: pipe 0 firmware up (GP3 0x1029097) after 0 us
+Nov 13 13:53:04 atrium-r9700 kernel: atrium_gpu_amd_pci0: mes: attempt 1: pipe 1 firmware up (GP3 0x1029097) after 0 us
+Nov 13 13:53:04 atrium-r9700 kernel: atrium_gpu_amd_pci0: mes: started on attempt 1 of 3
+Nov 13 13:53:04 atrium-r9700 kernel: atrium_gpu_amd_pci0: mes: started: CP_MES_CNTL 0xc000000; pipe 0: instr 0x7ec4, GP3 0x1029097, HQD active 0, rptr 0, wptr 0; pipe 1: instr 0x7ec4, GP3 0x1029097, HQD active 0, rptr 0, wptr 0; GRBM_STATUS 0x382c, CP_STAT 0, RLC_STAT 0x25
+Nov 13 13:53:04 atrium-r9700 kernel: atrium_gpu_amd_pci0: mes: started: GRBM_STATUS2 0x100000, GRBM_STATUS3 0, CP_CPC_STATUS 0, CP_CPC_BUSY_STAT 0/0, CP_CPF_STATUS 0, CP_BUSY_STAT 0, RLC_GPM_STAT 0x140037
+Nov 13 13:53:04 atrium-r9700 kernel: atrium_gpu_amd_pci0: mes: pipe 1 HQD by register: active 1, doorbell 0x18
+Nov 13 13:53:04 atrium-r9700 kernel: atrium_gpu_amd_pci0: mes: version (pipe 1) 0x1029097
+Nov 13 13:53:04 atrium-r9700 kernel: atrium_gpu_amd_pci0: mes: pipe 1 SET_HW_RESOURCES: ok in 230 us (status 0x1)
+Nov 13 13:53:04 atrium-r9700 kernel: atrium_gpu_amd_pci0: mes: pipe 1 SET_HW_RESOURCES_1: ok in 110 us (status 0x1)
+Nov 13 13:53:04 atrium-r9700 kernel: atrium_gpu_amd_pci0: mes: pipe 1 ADD_QUEUE (scheduler): ok in 120 us (status 0x1)
+Nov 13 13:53:04 atrium-r9700 kernel: atrium_gpu_amd_pci0: mes: version (pipe 0) 0x1029097
+Nov 13 13:53:04 atrium-r9700 kernel: atrium_gpu_amd_pci0: mes: pipe 0 SET_HW_RESOURCES: ok in 330 us (status 0x1)
+Nov 13 13:53:04 atrium-r9700 kernel: atrium_gpu_amd_pci0: mes: pipe 0 SET_HW_RESOURCES_1: ok in 100 us (status 0x1)
+Nov 13 13:53:04 atrium-r9700 kernel: atrium_gpu_amd_pci0: mes: pipe 0 QUERY_SCHEDULER_STATUS: ok in 80 us (status 0x1)
+Nov 13 13:53:04 atrium-r9700 kernel: atrium_gpu_amd_pci0: mes: answered: CP_MES_CNTL 0xc000000; pipe 0: instr 0xd1cb, GP3 0x1029097, HQD active 1, rptr 0x180, wptr 0x180; pipe 1: instr 0x7ec4, GP3 0x1029097, HQD active 1, rptr 0x180, wptr 0x180; GRBM_STATUS 0xa800382c, CP_STAT 0, RLC_STAT 0x25
+Nov 13 13:53:04 atrium-r9700 kernel: atrium_gpu_amd_pci0: mes: answered: GRBM_STATUS2 0x30110000, GRBM_STATUS3 0x4000, CP_CPC_STATUS 0x80110400, CP_CPC_BUSY_STAT 0/0x4480, CP_CPF_STATUS 0xa0000001, CP_BUSY_STAT 0, RLC_GPM_STAT 0x140097
+Nov 13 13:53:04 atrium-r9700 kernel: atrium_gpu_amd_pci0: dispatch: block at GART 0x40000 (pa 0x34e7b8000), shader 0x43000, IB 0x44000 (56 dw), out 0x45000, doorbell 0x6
+Nov 13 13:53:04 atrium-r9700 kernel: atrium_gpu_amd_pci0: mes: pipe 0 ADD_QUEUE (compute): ok in 90 us (status 0x1)
+Nov 13 13:53:04 atrium-r9700 kernel: atrium_gpu_amd_pci0: dispatch: mapped: HQD active 1, rptr 0, wptr 0, doorbell 0x60000018; rptr report 0, fence 0; CP_STAT 0, CPC_STATUS 0x80110400, GRBM_STATUS 0xa800382c
+Nov 13 13:53:04 atrium-r9700 kernel: atrium_gpu_amd_pci0: dispatch: fence 0x4e000001 after 30 us
+Nov 13 13:53:04 atrium-r9700 kernel: atrium_gpu_amd_pci0: dispatch: fence: HQD active 1, rptr 0xc, wptr 0xc, doorbell 0xe0000018; rptr report 0xc, fence 0x4e000001; CP_STAT 0, CPC_STATUS 0, GRBM_STATUS 0x382c
+Nov 13 13:53:04 atrium-r9700 kernel: atrium_gpu_amd_pci0: dispatch: out: all 64 words 0x2a, matches the oracle golden
+Nov 13 13:53:04 atrium-r9700 kernel: atrium_gpu_amd_pci0: gmc: MMHUB 4.1 after dispatch: CONTEXT0_CNTL 0x3fffc01, PT base 005800001, L1_TLB 0x1859, L2_CNTL 0x80e01, fault status 0 (addr 000000000)
+Nov 13 13:53:04 atrium-r9700 kernel: atrium_gpu_amd_pci0: gmc: GFXHUB (GC 12.0) after dispatch: CONTEXT0_CNTL 0x3fffc01, PT base 005800001, L1_TLB 0x1859, L2_CNTL 0x80e01, fault status 0 (addr 000000000)
+Nov 13 13:53:04 atrium-r9700 kernel: atrium_gpu_amd_pci0: mes: pipe 0 REMOVE_QUEUE (compute): ok in 170 us (status 0x1)
+Nov 13 13:53:04 atrium-r9700 kernel: atrium_gpu_amd_pci0: mes: me 1 pipe 0 HQD dequeued: active 0
+Nov 13 13:53:04 atrium-r9700 kernel: atrium_gpu_amd_pci0: dispatch: stage 4e: write_42 PASS (matches the oracle)
+Nov 13 13:53:04 atrium-r9700 kernel: atrium_gpu_amd_pci0: ih: IV client 0x14 src 0xb5 ring 13 vmid 0 pasid 0 data 0x20000000 0 0xb1 0
+Nov 13 13:53:04 atrium-r9700 kernel: atrium_gpu_amd_pci0: ih: IV client 0x14 src 0xb5 ring 13 vmid 0 pasid 0 data 0x2000000b 0 0xb1 0
+Nov 13 13:53:04 atrium-r9700 kernel: atrium_gpu_amd_pci0: ih: IV client 0x14 src 0xb5 ring 13 vmid 0 pasid 0 data 0x20000013 0 0xb1 0
+Nov 13 13:53:04 atrium-r9700 kernel: atrium_gpu_amd_pci0: ih: IV client 0x14 src 0xb5 ring 13 vmid 0 pasid 0 data 0x2000000b 0 0xb1 0
+Nov 13 13:53:04 atrium-r9700 kernel: atrium_gpu_amd_pci0: ih: IV client 0x14 src 0xb5 ring 13 vmid 0 pasid 0 data 0x20000002 0 0xb1 0
+Nov 13 13:53:04 atrium-r9700 kernel: atrium_gpu_amd_pci0: ih: IV client 0x14 src 0xb5 ring 13 vmid 0 pasid 0 data 0x2000000b 0 0xb1 0
+Nov 13 13:53:04 atrium-r9700 kernel: atrium_gpu_amd_pci0: ih: IV client 0x14 src 0xb5 ring 12 vmid 0 pasid 0 data 0x20000000 0 0xb1 0
+Nov 13 13:53:04 atrium-r9700 kernel: atrium_gpu_amd_pci0: ih: IV client 0x14 src 0xb5 ring 12 vmid 0 pasid 0 data 0x2000000b 0 0xb1 0
+Nov 13 13:53:04 atrium-r9700 kernel: atrium_gpu_amd_pci0: ih: ... 9 more IVs
+Nov 13 13:53:04 atrium-r9700 kernel: atrium_gpu_amd_pci0: si: dispatch at attach: PASS; 17 CP EOP IV(s)
+Nov 13 13:53:04 atrium-r9700 kernel: atrium_gpu_amd_pci0: smu: AllowGfxOff                arg 0000000000: resp 0x1
+Nov 13 13:53:04 atrium-r9700 kernel: atrium_gpu_amd_pci0: smu: sample [attached, MES up, no work] 1/5
+Nov 13 13:53:04 atrium-r9700 kernel: atrium_gpu_amd_pci0: smu: TransferTableSmu2Dram      arg 0x00000005: resp 0x1
+Nov 13 13:53:04 atrium-r9700 kernel: atrium_gpu_amd_pci0: smu: telemetry #23: edge 31 C, hotspot 36 C, mem 32 C, VR 31 C; power 22 W of 300 W limit, board 22 W; fan 968 rpm (20%); gfx 1483 MHz, mem 173 MHz, gfx busy 81%; throttle 0x1 (ids 0x2)
+Nov 13 13:53:04 atrium-r9700 kernel: atrium_gpu_amd_pci0: smu: busy or at the power limit with no work queued
+Nov 13 13:53:05 atrium-r9700 kernel: atrium_gpu_amd_pci0: smu: sample [attached, MES up, no work] 2/5
+Nov 13 13:53:05 atrium-r9700 kernel: atrium_gpu_amd_pci0: smu: TransferTableSmu2Dram      arg 0x00000005: resp 0x1
+Nov 13 13:53:05 atrium-r9700 kernel: atrium_gpu_amd_pci0: smu: telemetry #1053: edge 31 C, hotspot 36 C, mem 32 C, VR 31 C; power 13 W of 300 W limit, board 13 W; fan 882 rpm (20%); gfx 7 MHz, mem 190 MHz, gfx busy 0%; throttle 0x1 (ids 0x2)
+Nov 13 13:53:05 atrium-r9700 kernel: atrium_gpu_amd_pci0: si: stage 5a: attached and idle (MES up, kernel compute queue ready); watching telemetry every 5 s
+Nov 13 13:53:05 atrium-r9700 kernel: atrium_gpu_amd_pci0: VRAM 32640 MiB; allocator range 0x8000000-0x7d6c00000 (31980 MiB), all dirty until scrubbed
+Nov 13 13:53:05 atrium-r9700 kernel: atrium_gpu_amd0: <Atrium AMD RDNA4 GPU> on atrium_gpu_amd_pci0
+Nov 13 13:53:05 atrium-r9700 kernel: atrium_gpu_amd_pci0: smu: DisallowGfxOff             arg 0000000000: resp 0x1
+Nov 13 13:53:05 atrium-r9700 kernel: atrium_gpu_amd_pci0: mes: pipe 0 ADD_QUEUE (compute): ok in 240 us (status 0x1)
+Nov 13 13:53:05 atrium-r9700 kernel: atrium_gpu_amd_pci0: kq: client queue up: MEC1 pipe 0 queue 0, block at GART 0x70000, doorbell 0x6
+Nov 13 13:53:05 atrium-r9700 kernel: atrium_gpu_amd_pci0: smu: AllowGfxOff                arg 0000000000: resp 0x1
+Nov 13 13:53:05 atrium-r9700 kernel: atrium_gpu_amd_pci0: si: EOP IV with src_data[0] 0x18000000: no queue of ours; checked every user queue
+Nov 13 13:53:05 atrium-r9700 kernel: atrium_gpu_amd_pci0: smu: DisallowGfxOff             arg 0000000000: resp 0x1
+Nov 13 13:53:05 atrium-r9700 kernel: atrium_gpu_amd_pci0: smu: AllowGfxOff                arg 0000000000: resp 0x1
+Nov 13 13:53:05 atrium-r9700 kernel: atrium_gpu_amd_pci0: si: VRAM scrub self-test at 0x8000000 (MC 0x8008000000): 1024/1024 words zeroed, 1024/1024 of the next page kept: PASS
+Nov 13 13:53:05 atrium-r9700 kernel: atrium_gpu_amd0: ready: /dev/atrium-gpu0 (amd-silicon backend)
+Nov 13 13:53:05 atrium-r9700 kernel: atrium_gpu_amd_pci0: silicon attached (stage 5a); gpu child added (5c-2a)
+Nov 13 13:53:05 atrium-r9700 kernel: atrium_gpu_amd_pci0: smu: DisallowGfxOff             arg 0000000000: resp 0x1
+Nov 13 13:53:05 atrium-r9700 kernel: atrium_gpu_amd_pci0: smu: AllowGfxOff                arg 0000000000: resp 0x1
+Nov 13 13:53:05 atrium-r9700 kernel: atrium_gpu_amd_pci0: smu: DisallowGfxOff             arg 0000000000: resp 0x1
+Nov 13 13:53:05 atrium-r9700 kernel: atrium_gpu_amd_pci0: smu: AllowGfxOff                arg 0000000000: resp 0x1
+Nov 13 13:53:05 atrium-r9700 kernel: atrium_gpu_amd_pci0: smu: DisallowGfxOff             arg 0000000000: resp 0x1
+Nov 13 13:53:05 atrium-r9700 kernel: atrium_gpu_amd_pci0: smu: AllowGfxOff                arg 0000000000: resp 0x1
+Nov 13 13:53:05 atrium-r9700 kernel: atrium_gpu_amd_pci0: smu: DisallowGfxOff             arg 0000000000: resp 0x1
+Nov 13 13:53:05 atrium-r9700 kernel: atrium_gpu_amd_pci0: smu: AllowGfxOff                arg 0000000000: resp 0x1
+Nov 13 13:53:05 atrium-r9700 kernel: atrium_gpu_amd_pci0: smu: DisallowGfxOff             arg 0000000000: resp 0x1
+Nov 13 13:53:05 atrium-r9700 kernel: atrium_gpu_amd_pci0: smu: AllowGfxOff                arg 0000000000: resp 0x1
+Nov 13 13:53:05 atrium-r9700 kernel: atrium_gpu_amd_pci0: smu: DisallowGfxOff             arg 0000000000: resp 0x1
+Nov 13 13:53:05 atrium-r9700 kernel: atrium_gpu_amd_pci0: smu: AllowGfxOff                arg 0000000000: resp 0x1
+Nov 13 13:53:05 atrium-r9700 kernel: atrium_gpu_amd_pci0: smu: DisallowGfxOff             arg 0000000000: resp 0x1
+Nov 13 13:53:05 atrium-r9700 kernel: atrium_gpu_amd_pci0: smu: AllowGfxOff                arg 0000000000: resp 0x1
+Nov 13 13:53:05 atrium-r9700 kernel: atrium_gpu_amd_pci0: smu: DisallowGfxOff             arg 0000000000: resp 0x1
+Nov 13 13:53:05 atrium-r9700 kernel: atrium_gpu_amd_pci0: mes: pipe 0 ADD_QUEUE (user compute): ok in 140 us (status 0x1)
+Nov 13 13:53:05 atrium-r9700 kernel: atrium_gpu_amd_pci0: uq0: added: VM base 0x8000001, queue pages at VA 0x200000000 (pa 0x34ecbc000), MQD GART 0x80000, doorbell 0x20
+Nov 13 13:53:05 atrium-r9700 kernel: atrium_gpu_amd_pci0: si: uq0: first EOP IV, src_data[0] 0x1000020
+Nov 13 13:53:05 atrium-r9700 kernel: atrium_gpu_amd_pci0: mes: pipe 0 ADD_QUEUE (user compute): ok in 140 us (status 0x1)
+Nov 13 13:53:05 atrium-r9700 kernel: atrium_gpu_amd_pci0: uq1: added: VM base 0x8009001, queue pages at VA 0x200010000 (pa 0x34e9bc000), MQD GART 0x84000, doorbell 0x22
+Nov 13 13:53:05 atrium-r9700 kernel: atrium_gpu_amd_pci0: mes: pipe 0 ADD_QUEUE (user compute): ok in 140 us (status 0x1)
+Nov 13 13:53:05 atrium-r9700 kernel: atrium_gpu_amd_pci0: uq2: added: VM base 0x8012001, queue pages at VA 0x200020000 (pa 0x34e7bc000), MQD GART 0x88000, doorbell 0x24
+Nov 13 13:53:05 atrium-r9700 kernel: atrium_gpu_amd_pci0: si: uq1: first EOP IV, src_data[0] 0x1000022
+Nov 13 13:53:05 atrium-r9700 kernel: atrium_gpu_amd_pci0: si: uq2: first EOP IV, src_data[0] 0x1000024
+Nov 13 13:53:05 atrium-r9700 kernel: atrium_gpu_amd_pci0: mes: pipe 0 ADD_QUEUE (user compute): ok in 160 us (status 0x1)
+Nov 13 13:53:05 atrium-r9700 kernel: atrium_gpu_amd_pci0: uq3: added: VM base 0x8000001, queue pages at VA 0x200030000 (pa 0x34eab4000), MQD GART 0x8c000, doorbell 0x26
+Nov 13 13:53:05 atrium-r9700 kernel: atrium_gpu_amd_pci0: si: uq3: first EOP IV, src_data[0] 0x1000026
+Nov 13 13:53:05 atrium-r9700 kernel: atrium_gpu_amd_pci0: mes: pipe 0 REMOVE_QUEUE (user compute): ok in 200 us (status 0x1)
+Nov 13 13:53:05 atrium-r9700 kernel: atrium_gpu_amd_pci0: uq3: removed (seq 1, fence 1)
+Nov 13 13:53:05 atrium-r9700 kernel: atrium_gpu_amd_pci0: si: uq3 closed: 1 submits; EOP IVs routed 6, unrouted 1, MES own 12, MES preemption 0; retired by IV 6, by poll 0; queues lost to faults 0, hangs 0; preempted for frees 0 (failed 0)
+Nov 13 13:53:05 atrium-r9700 kernel: atrium_gpu_amd_pci0: si: unrouted EOP src_data[0]: 0x18000000 x1, 0 x0, 0 x0, 0 x0
+Nov 13 13:53:05 atrium-r9700 kernel: atrium_gpu_amd_pci0: mes: pipe 0 ADD_QUEUE (user compute): ok in 140 us (status 0x1)
+Nov 13 13:53:05 atrium-r9700 kernel: atrium_gpu_amd_pci0: uq3: added: VM base 0x801b001, queue pages at VA 0x200030000 (pa 0x34eab4000), MQD GART 0x8c000, doorbell 0x26
+Nov 13 13:53:05 atrium-r9700 kernel: atrium_gpu_amd_pci0: si: uq3: first EOP IV, src_data[0] 0x1000026
+Nov 13 13:53:05 atrium-r9700 kernel: atrium_gpu_amd_pci0: uq1: destroy: work in flight: seq 2, fence 1, wptr 24, rptr report 0xc; HQD active (VMID 9)
+Nov 13 13:53:05 atrium-r9700 kernel: atrium_gpu_amd_pci0: uq1: VMID 9's waves killed (0); fence landed after 0 us
+Nov 13 13:53:05 atrium-r9700 kernel: atrium_gpu_amd_pci0: mes: after the wave kill: CP_MES_CNTL 0xc000000; pipe 0: instr 0x1893, GP3 0x1029097, HQD active 1, rptr 0x200, wptr 0x600; pipe 1: instr 0x7ec4, GP3 0x1029097, HQD active 1, rptr 0x180, wptr 0x180; GRBM_STATUS 0xa800382c, CP_STAT 0x88404000, RLC_STAT 0x25
+Nov 13 13:53:05 atrium-r9700 kernel: atrium_gpu_amd_pci0: mes: after the wave kill: GRBM_STATUS2 0x70110000, GRBM_STATUS3 0x4000, CP_CPC_STATUS 0x80110401, CP_CPC_BUSY_STAT 0x500/0x4480, CP_CPF_STATUS 0xa8008001, CP_BUSY_STAT 0, RLC_GPM_STAT 0x1400b7
+Nov 13 13:53:05 atrium-r9700 kernel: atrium_gpu_amd_pci0: mes: pipe 0 REMOVE_QUEUE (user compute): ok in 280 us (status 0x1)
+Nov 13 13:53:05 atrium-r9700 kernel: atrium_gpu_amd_pci0: uq1: removed (seq 2, fence 2)
+Nov 13 13:53:05 atrium-r9700 kernel: atrium_gpu_amd_pci0: si: uq1 closed: 2 submits; EOP IVs routed 8, unrouted 1, MES own 16, MES preemption 0; retired by IV 7, by poll 0; queues lost to faults 0, hangs 0; preempted for frees 0 (failed 0)
+Nov 13 13:53:05 atrium-r9700 kernel: atrium_gpu_amd_pci0: si: unrouted EOP src_data[0]: 0x18000000 x1, 0 x0, 0 x0, 0 x0
+Nov 13 13:53:05 atrium-r9700 kernel: atrium_gpu_amd_pci0: mes: pipe 0 ADD_QUEUE (user compute): ok in 130 us (status 0x1)
+Nov 13 13:53:05 atrium-r9700 kernel: atrium_gpu_amd_pci0: uq1: added: VM base 0x8009001, queue pages at VA 0x200010000 (pa 0x34eabc000), MQD GART 0x84000, doorbell 0x22
+Nov 13 13:53:05 atrium-r9700 kernel: atrium_gpu_amd_pci0: si: uq1: first EOP IV, src_data[0] 0x1000022
+Nov 13 13:53:05 atrium-r9700 kernel: atrium_gpu_amd_pci0: mes: pipe 0 SUSPEND (user gang): ok in 180 us (status 0x1)
+Nov 13 13:53:05 atrium-r9700 kernel: atrium_gpu_amd_pci0: mes: pipe 0 RESUME (user gang): ok in 90 us (status 0x1)
+Nov 13 13:53:05 atrium-r9700 kernel: atrium_gpu_amd_pci0: uq3: preempted for a free: suspend fence landed after 0 us, resume ok
+Nov 13 13:53:05 atrium-r9700 kernel: atrium_gpu_amd_pci0: mes: pipe 0 SUSPEND (user gang): ok in 60 us (status 0x1)
+Nov 13 13:53:05 atrium-r9700 kernel: atrium_gpu_amd_pci0: mes: pipe 0 RESUME (user gang): ok in 80 us (status 0x1)
+Nov 13 13:53:05 atrium-r9700 kernel: atrium_gpu_amd_pci0: uq3: preempted for a free: suspend fence landed after 0 us, resume ok
+Nov 13 13:53:05 atrium-r9700 kernel: atrium_gpu_amd_pci0: mes: pipe 0 SUSPEND (user gang): ok in 60 us (status 0x1)
+Nov 13 13:53:05 atrium-r9700 kernel: atrium_gpu_amd_pci0: mes: pipe 0 RESUME (user gang): ok in 80 us (status 0x1)
+Nov 13 13:53:05 atrium-r9700 kernel: atrium_gpu_amd_pci0: uq3: preempted for a free: suspend fence landed after 0 us, resume ok
+Nov 13 13:53:05 atrium-r9700 kernel: atrium_gpu_amd_pci0: mes: pipe 0 REMOVE_QUEUE (user compute): ok in 160 us (status 0x1)
+Nov 13 13:53:05 atrium-r9700 kernel: atrium_gpu_amd_pci0: uq3: removed (seq 1, fence 1)
+Nov 13 13:53:05 atrium-r9700 kernel: atrium_gpu_amd_pci0: si: uq3 closed: 1 submits; EOP IVs routed 10, unrouted 1, MES own 32, MES preemption 3; retired by IV 9, by poll 0; queues lost to faults 0, hangs 0; preempted for frees 3 (failed 0)
+Nov 13 13:53:05 atrium-r9700 kernel: atrium_gpu_amd_pci0: si: unrouted EOP src_data[0]: 0x18000000 x1, 0 x0, 0 x0, 0 x0
+Nov 13 13:53:05 atrium-r9700 kernel: atrium_gpu_amd_pci0: mes: pipe 0 ADD_QUEUE (user compute): ok in 140 us (status 0x1)
+Nov 13 13:53:05 atrium-r9700 kernel: atrium_gpu_amd_pci0: uq3: added: VM base 0x8024001, queue pages at VA 0x200030000 (pa 0x34e7b8000), MQD GART 0x8c000, doorbell 0x26
+Nov 13 13:53:05 atrium-r9700 kernel: atrium_gpu_amd_pci0: mes: pipe 0 SUSPEND (user gang): ok in 230 us (status 0x1)
+Nov 13 13:53:05 atrium-r9700 kernel: atrium_gpu_amd_pci0: mes: pipe 0 RESUME (user gang): ok in 120 us (status 0x1)
+Nov 13 13:53:05 atrium-r9700 kernel: atrium_gpu_amd_pci0: uq3: preempted for a free: suspend fence landed after 0 us, resume ok
+Nov 13 13:53:05 atrium-r9700 kernel: atrium_gpu_amd_pci0: si: VM fault: 1 IV(s), VMIDs 0x800, first VMID 11 at 0x10002000
+Nov 13 13:53:05 atrium-r9700 kernel: atrium_gpu_amd_pci0: gmc: client fault: fault status 0xb41050: client TCP (0x8), VMID 11, MORE_FAULTS 0, WALKER_ERROR 0, PERMISSION_FAULTS 0x5, MAPPING_ERROR 0, RW 1, ATOMIC 0, PRT 0, UCE 0
+Nov 13 13:53:05 atrium-r9700 kernel: atrium_gpu_amd_pci0: si: uq3 faulted (VMID 11, 0x10002000): its work fails, the queue is lost
+Nov 13 13:53:05 atrium-r9700 kernel: atrium_gpu_amd_pci0: uq3: destroy: work in flight: seq 1, fence 0, wptr 12, rptr report 0xc; HQD active (VMID 11)
+Nov 13 13:53:05 atrium-r9700 kernel: atrium_gpu_amd_pci0: si: uq3: first EOP IV, src_data[0] 0x1000026
+Nov 13 13:53:05 atrium-r9700 kernel: atrium_gpu_amd_pci0: uq3: VMID 11's waves killed (0); fence landed after 100 us
+Nov 13 13:53:05 atrium-r9700 kernel: atrium_gpu_amd_pci0: mes: after the wave kill: CP_MES_CNTL 0xc000000; pipe 0: instr 0x1791, GP3 0x1029097, HQD active 1, rptr 0, wptr 0xc00; pipe 1: instr 0x7ec4, GP3 0x1029097, HQD active 1, rptr 0x180, wptr 0x180; GRBM_STATUS 0x382c, CP_STAT 0, RLC_STAT 0x25
+Nov 13 13:53:05 atrium-r9700 kernel: atrium_gpu_amd_pci0: mes: after the wave kill: GRBM_STATUS2 0x100000, GRBM_STATUS3 0, CP_CPC_STATUS 0, CP_CPC_BUSY_STAT 0/0, CP_CPF_STATUS 0, CP_BUSY_STAT 0, RLC_GPM_STAT 0x140037
+Nov 13 13:53:05 atrium-r9700 kernel: atrium_gpu_amd_pci0: mes: pipe 0 REMOVE_QUEUE (user compute): ok in 160 us (status 0x1)
+Nov 13 13:53:05 atrium-r9700 kernel: atrium_gpu_amd_pci0: uq3: removed (seq 1, fence 1)
+Nov 13 13:53:05 atrium-r9700 kernel: atrium_gpu_amd_pci0: si: uq3 evicted (lost) and unmapped
+Nov 13 13:53:05 atrium-r9700 kernel: atrium_gpu_amd_pci0: si: uq3 closed: 1 submits; EOP IVs routed 12, unrouted 1, MES own 40, MES preemption 4; retired by IV 10, by poll 0; queues lost to faults 1, hangs 0; preempted for frees 4 (failed 0)
+Nov 13 13:53:05 atrium-r9700 kernel: atrium_gpu_amd_pci0: si: unrouted EOP src_data[0]: 0x18000000 x1, 0 x0, 0 x0, 0 x0
+Nov 13 13:53:05 atrium-r9700 kernel: atrium_gpu_amd_pci0: mes: pipe 0 ADD_QUEUE (user compute): ok in 130 us (status 0x1)
+Nov 13 13:53:05 atrium-r9700 kernel: atrium_gpu_amd_pci0: uq3: added: VM base 0x8024001, queue pages at VA 0x200030000 (pa 0x34eab8000), MQD GART 0x8c000, doorbell 0x26
+Nov 13 13:53:05 atrium-r9700 kernel: atrium_gpu_amd_pci0: si: uq3: first EOP IV, src_data[0] 0x1000026
+Nov 13 13:53:06 atrium-r9700 kernel: atrium_gpu_amd_pci0: VRAM: scrubbed 31980 MiB in 417 ms (76690 MiB/s)
+Nov 13 13:53:10 atrium-r9700 kernel: atrium_gpu_amd_pci0: smu: TransferTableSmu2Dram      arg 0x00000005: resp 0x1
+Nov 13 13:53:10 atrium-r9700 kernel: atrium_gpu_amd_pci0: smu: telemetry #4963: edge 32 C, hotspot 40 C, mem 33 C, VR 32 C; power 68 W of 300 W limit, board 68 W; fan 895 rpm (20%); gfx 3375 MHz, mem 389 MHz, gfx busy 99%; throttle 0x1 (ids 0x2)
+Nov 13 13:53:10 atrium-r9700 kernel: atrium_gpu_amd_pci0: si: uq3 hung: fence 1, no progress for 5000 ms; its work fails, the queue is lost
+Nov 13 13:53:10 atrium-r9700 kernel: atrium_gpu_amd_pci0: uq3: destroy: work in flight: seq 2, fence 1, wptr 24, rptr report 0xc; HQD active (VMID 11)
+Nov 13 13:53:10 atrium-r9700 kernel: atrium_gpu_amd_pci0: uq3: VMID 11's waves killed (0); fence still behind after 200000 us
+Nov 13 13:53:10 atrium-r9700 kernel: atrium_gpu_amd_pci0: mes: after the wave kill: CP_MES_CNTL 0xc000000; pipe 0: instr 0x7ec4, GP3 0x1029097, HQD active 1, rptr 0x100, wptr 0xd00; pipe 1: instr 0x7ec4, GP3 0x1029097, HQD active 1, rptr 0x180, wptr 0x180; GRBM_STATUS 0xa800382c, CP_STAT 0, RLC_STAT 0x35
+Nov 13 13:53:10 atrium-r9700 kernel: atrium_gpu_amd_pci0: mes: after the wave kill: GRBM_STATUS2 0x34110000, GRBM_STATUS3 0x4000, CP_CPC_STATUS 0xa0200401, CP_CPC_BUSY_STAT 0x4a0/0x40000, CP_CPF_STATUS 0xa800c001, CP_BUSY_STAT 0, RLC_GPM_STAT 0x140097
+Nov 13 13:53:10 atrium-r9700 kernel: atrium_gpu_amd_pci0: uq3: HQD me1 pipe 0 queue 2 (VMID 11) reset: inactive after 10 us
+Nov 13 13:53:10 atrium-r9700 kernel: atrium_gpu_amd_pci0: mes: pipe 0 REMOVE_QUEUE (user compute): ok in 240 us (status 0x1)
+Nov 13 13:53:10 atrium-r9700 kernel: atrium_gpu_amd_pci0: uq3: removed (seq 2, fence 1)
+Nov 13 13:53:10 atrium-r9700 kernel: atrium_gpu_amd_pci0: si: uq3 evicted (lost) and unmapped
+Nov 13 13:53:10 atrium-r9700 kernel: atrium_gpu_amd_pci0: si: uq3 closed: 2 submits; EOP IVs routed 14, unrouted 1, MES own 44, MES preemption 4; retired by IV 12, by poll 0; queues lost to faults 1, hangs 1; preempted for frees 4 (failed 0)
+Nov 13 13:53:10 atrium-r9700 kernel: atrium_gpu_amd_pci0: si: unrouted EOP src_data[0]: 0x18000000 x1, 0 x0, 0 x0, 0 x0
+Nov 13 13:53:10 atrium-r9700 kernel: atrium_gpu_amd_pci0: mes: pipe 0 ADD_QUEUE (user compute): ok in 180 us (status 0x1)
+Nov 13 13:53:10 atrium-r9700 kernel: atrium_gpu_amd_pci0: uq3: added: VM base 0x8024001, queue pages at VA 0x200030000 (pa 0x34eab4000), MQD GART 0x8c000, doorbell 0x26
+Nov 13 13:53:10 atrium-r9700 kernel: atrium_gpu_amd_pci0: si: uq3: first EOP IV, src_data[0] 0x1000026
+Nov 13 13:53:10 atrium-r9700 kernel: atrium_gpu_amd_pci0: mes: pipe 0 SUSPEND (user gang): ok in 410 us (status 0x1)
+Nov 13 13:53:10 atrium-r9700 kernel: atrium_gpu_amd_pci0: mes: pipe 0 RESUME (user gang): ok in 100 us (status 0x1)
+Nov 13 13:53:10 atrium-r9700 kernel: atrium_gpu_amd_pci0: uq3: preempted for a free: suspend fence landed after 0 us, resume ok
+Nov 13 13:53:10 atrium-r9700 kernel: atrium_gpu_amd_pci0: mes: pipe 0 SUSPEND (user gang): ok in 80 us (status 0x1)
+Nov 13 13:53:10 atrium-r9700 kernel: atrium_gpu_amd_pci0: mes: pipe 0 RESUME (user gang): ok in 100 us (status 0x1)
+Nov 13 13:53:10 atrium-r9700 kernel: atrium_gpu_amd_pci0: uq3: preempted for a free: suspend fence landed after 0 us, resume ok
+Nov 13 13:53:10 atrium-r9700 kernel: atrium_gpu_amd_pci0: mes: pipe 0 SUSPEND (user gang): ok in 80 us (status 0x1)
+Nov 13 13:53:10 atrium-r9700 kernel: atrium_gpu_amd_pci0: mes: pipe 0 RESUME (user gang): ok in 100 us (status 0x1)
+Nov 13 13:53:10 atrium-r9700 kernel: atrium_gpu_amd_pci0: uq3: preempted for a free: suspend fence landed after 0 us, resume ok
+Nov 13 13:53:10 atrium-r9700 kernel: atrium_gpu_amd_pci0: mes: pipe 0 REMOVE_QUEUE (user compute): ok in 200 us (status 0x1)
+Nov 13 13:53:10 atrium-r9700 kernel: atrium_gpu_amd_pci0: uq3: removed (seq 1, fence 1)
+Nov 13 13:53:10 atrium-r9700 kernel: atrium_gpu_amd_pci0: si: uq3 closed: 1 submits; EOP IVs routed 15, unrouted 1, MES own 60, MES preemption 7; retired by IV 13, by poll 0; queues lost to faults 1, hangs 1; preempted for frees 7 (failed 0)
+Nov 13 13:53:10 atrium-r9700 kernel: atrium_gpu_amd_pci0: si: unrouted EOP src_data[0]: 0x18000000 x1, 0 x0, 0 x0, 0 x0
+Nov 13 13:53:10 atrium-r9700 kernel: atrium_gpu_amd_pci0: mes: pipe 0 ADD_QUEUE (user compute): ok in 160 us (status 0x1)
+Nov 13 13:53:10 atrium-r9700 kernel: atrium_gpu_amd_pci0: uq3: added: VM base 0x801b001, queue pages at VA 0x200030000 (pa 0x34e7b8000), MQD GART 0x8c000, doorbell 0x26
+Nov 13 13:53:10 atrium-r9700 kernel: atrium_gpu_amd_pci0: mes: pipe 0 REMOVE_QUEUE (user compute): ok in 430 us (status 0x1)
+Nov 13 13:53:10 atrium-r9700 kernel: atrium_gpu_amd_pci0: uq3: removed (seq 0, fence 0)
+Nov 13 13:53:10 atrium-r9700 kernel: atrium_gpu_amd_pci0: si: uq3 closed: 0 submits; EOP IVs routed 15, unrouted 1, MES own 64, MES preemption 7; retired by IV 13, by poll 0; queues lost to faults 1, hangs 1; preempted for frees 7 (failed 0)
+Nov 13 13:53:10 atrium-r9700 kernel: atrium_gpu_amd_pci0: si: unrouted EOP src_data[0]: 0x18000000 x1, 0 x0, 0 x0, 0 x0
+Nov 13 13:53:10 atrium-r9700 kernel: atrium_gpu_amd_pci0: mes: pipe 0 ADD_QUEUE (user compute): ok in 160 us (status 0x1)
+Nov 13 13:53:10 atrium-r9700 kernel: atrium_gpu_amd_pci0: uq3: added (user mode): VM base 0x801b001, queue pages at VA 0x200030000 (pa 0x34eab8000), MQD GART 0x8c000, doorbell 0x1400
+Nov 13 13:53:10 atrium-r9700 kernel: atrium_gpu_amd_pci0: mes: pipe 0 REMOVE_QUEUE (user compute): ok in 270 us (status 0x1)
+Nov 13 13:53:10 atrium-r9700 kernel: atrium_gpu_amd_pci0: uq3: removed (seq 0, fence 2)
+Nov 13 13:53:10 atrium-r9700 kernel: atrium_gpu_amd_pci0: si: uq3 closed: 0 submits; EOP IVs routed 15, unrouted 1, MES own 68, MES preemption 7; retired by IV 13, by poll 0; queues lost to faults 1, hangs 1; preempted for frees 7 (failed 0)
+Nov 13 13:53:10 atrium-r9700 kernel: atrium_gpu_amd_pci0: si: unrouted EOP src_data[0]: 0x18000000 x1, 0 x0, 0 x0, 0 x0
+Nov 13 13:53:10 atrium-r9700 kernel: vm_fault: pager read error, pid 7278 (si-client-test)
+Nov 13 13:53:10 atrium-r9700 kernel: pid 7278 (si-client-test), jid 0, uid 0: exited on signal 10 (no core dump - coredumpsize limit is 0)
+Nov 13 13:53:10 atrium-r9700 kernel: vm_fault: pager read error, pid 7279 (si-client-test)
+Nov 13 13:53:10 atrium-r9700 kernel: pid 7279 (si-client-test), jid 0, uid 0: exited on signal 10 (no core dump - coredumpsize limit is 0)
+Nov 13 13:53:10 atrium-r9700 kernel: atrium_gpu_amd_pci0: mes: pipe 0 ADD_QUEUE (user compute): ok in 160 us (status 0x1)
+Nov 13 13:53:10 atrium-r9700 kernel: atrium_gpu_amd_pci0: uq3: added (user mode): VM base 0x801b001, queue pages at VA 0x200030000 (pa 0x34eab4000), MQD GART 0x8c000, doorbell 0x1400
+Nov 13 13:53:15 atrium-r9700 kernel: atrium_gpu_amd_pci0: smu: TransferTableSmu2Dram      arg 0x00000005: resp 0x1
+Nov 13 13:53:15 atrium-r9700 kernel: atrium_gpu_amd_pci0: smu: telemetry #4984: edge 33 C, hotspot 41 C, mem 34 C, VR 33 C; power 66 W of 300 W limit, board 66 W; fan 894 rpm (20%); gfx 3415 MHz, mem 181 MHz, gfx busy 100%; throttle 0x1 (ids 0x2)
+Nov 13 13:53:15 atrium-r9700 kernel: atrium_gpu_amd_pci0: si: uq3 hung (user mode): fence 0, no progress for 5000 ms; its work fails, the queue is lost
+Nov 13 13:53:15 atrium-r9700 kernel: atrium_gpu_amd_pci0: uq3: destroy: work in flight: seq 0, fence 0, wptr 12 (client's), rptr report 0; HQD active (VMID 11)
+Nov 13 13:53:16 atrium-r9700 kernel: atrium_gpu_amd_pci0: uq3: VMID 11's waves killed (0); fence still behind after 200000 us
+Nov 13 13:53:16 atrium-r9700 kernel: atrium_gpu_amd_pci0: mes: after the wave kill: CP_MES_CNTL 0xc000000; pipe 0: instr 0x7ec4, GP3 0x1029097, HQD active 1, rptr 0, wptr 0x1400; pipe 1: instr 0x7ec4, GP3 0x1029097, HQD active 1, rptr 0x180, wptr 0x180; GRBM_STATUS 0xa800382c, CP_STAT 0, RLC_STAT 0x25
+Nov 13 13:53:16 atrium-r9700 kernel: atrium_gpu_amd_pci0: mes: after the wave kill: GRBM_STATUS2 0x10100000, GRBM_STATUS3 0, CP_CPC_STATUS 0, CP_CPC_BUSY_STAT 0/0x40000, CP_CPF_STATUS 0x88008001, CP_BUSY_STAT 0, RLC_GPM_STAT 0x140097
+Nov 13 13:53:16 atrium-r9700 kernel: atrium_gpu_amd_pci0: uq3: HQD me1 pipe 0 queue 2 (VMID 11) reset: inactive after 90 us
+Nov 13 13:53:16 atrium-r9700 kernel: atrium_gpu_amd_pci0: mes: pipe 0 REMOVE_QUEUE (user compute): ok in 180 us (status 0x1)
+Nov 13 13:53:16 atrium-r9700 kernel: atrium_gpu_amd_pci0: uq3: removed (seq 0, fence 0)
+Nov 13 13:53:16 atrium-r9700 kernel: atrium_gpu_amd_pci0: si: uq3 evicted (lost) and unmapped
+Nov 13 13:53:16 atrium-r9700 kernel: atrium_gpu_amd_pci0: si: uq3 closed: 0 submits; EOP IVs routed 16, unrouted 1, MES own 72, MES preemption 7; retired by IV 14, by poll 0; queues lost to faults 1, hangs 2; preempted for frees 7 (failed 0)
+Nov 13 13:53:16 atrium-r9700 kernel: atrium_gpu_amd_pci0: si: unrouted EOP src_data[0]: 0x18000000 x1, 0 x0, 0 x0, 0 x0
+Nov 13 13:53:16 atrium-r9700 kernel: atrium_gpu_amd_pci0: mes: pipe 0 ADD_QUEUE (user compute): ok in 220 us (status 0x1)
+Nov 13 13:53:16 atrium-r9700 kernel: atrium_gpu_amd_pci0: uq3: added: VM base 0x801b001, queue pages at VA 0x200030000 (pa 0x34e7b8000), MQD GART 0x8c000, doorbell 0x26
+Nov 13 13:53:16 atrium-r9700 kernel: atrium_gpu_amd_pci0: si: uq3: first EOP IV, src_data[0] 0x1000026
+Nov 13 13:53:16 atrium-r9700 kernel: atrium_gpu_amd_pci0: mes: pipe 0 SUSPEND (user gang): ok in 300 us (status 0x1)
+Nov 13 13:53:16 atrium-r9700 kernel: atrium_gpu_amd_pci0: mes: pipe 0 RESUME (user gang): ok in 100 us (status 0x1)
+Nov 13 13:53:16 atrium-r9700 kernel: atrium_gpu_amd_pci0: uq3: preempted for a free: suspend fence landed after 0 us, resume ok
+Nov 13 13:53:16 atrium-r9700 kernel: atrium_gpu_amd_pci0: mes: pipe 0 SUSPEND (user gang): ok in 80 us (status 0x1)
+Nov 13 13:53:16 atrium-r9700 kernel: atrium_gpu_amd_pci0: mes: pipe 0 RESUME (user gang): ok in 100 us (status 0x1)
+Nov 13 13:53:16 atrium-r9700 kernel: atrium_gpu_amd_pci0: uq3: preempted for a free: suspend fence landed after 0 us, resume ok
+Nov 13 13:53:16 atrium-r9700 kernel: atrium_gpu_amd_pci0: mes: pipe 0 SUSPEND (user gang): ok in 80 us (status 0x1)
+Nov 13 13:53:16 atrium-r9700 kernel: atrium_gpu_amd_pci0: mes: pipe 0 RESUME (user gang): ok in 100 us (status 0x1)
+Nov 13 13:53:16 atrium-r9700 kernel: atrium_gpu_amd_pci0: uq3: preempted for a free: suspend fence landed after 0 us, resume ok
+Nov 13 13:53:16 atrium-r9700 kernel: atrium_gpu_amd_pci0: mes: pipe 0 REMOVE_QUEUE (user compute): ok in 200 us (status 0x1)
+Nov 13 13:53:16 atrium-r9700 kernel: atrium_gpu_amd_pci0: uq3: removed (seq 1, fence 1)
+Nov 13 13:53:16 atrium-r9700 kernel: atrium_gpu_amd_pci0: si: uq3 closed: 1 submits; EOP IVs routed 17, unrouted 1, MES own 88, MES preemption 10; retired by IV 15, by poll 0; queues lost to faults 1, hangs 2; preempted for frees 10 (failed 0)
+Nov 13 13:53:16 atrium-r9700 kernel: atrium_gpu_amd_pci0: si: unrouted EOP src_data[0]: 0x18000000 x1, 0 x0, 0 x0, 0 x0
+Nov 13 13:53:16 atrium-r9700 kernel: atrium_gpu_amd_pci0: mes: pipe 0 SUSPEND (user gang): ok in 150 us (status 0x1)
+Nov 13 13:53:16 atrium-r9700 kernel: atrium_gpu_amd_pci0: mes: pipe 0 RESUME (user gang): ok in 100 us (status 0x1)
+Nov 13 13:53:16 atrium-r9700 kernel: atrium_gpu_amd_pci0: uq0: preempted for a free: suspend fence landed after 0 us, resume ok
+Nov 13 13:53:16 atrium-r9700 kernel: atrium_gpu_amd_pci0: mes: pipe 0 ADD_QUEUE (user compute): ok in 160 us (status 0x1)
+Nov 13 13:53:16 atrium-r9700 kernel: atrium_gpu_amd_pci0: uq3: added: VM base 0x8024001, queue pages at VA 0x200030000 (pa 0x34e7b8000), MQD GART 0x8c000, doorbell 0x26
+Nov 13 13:53:16 atrium-r9700 kernel: atrium_gpu_amd_pci0: mes: pipe 0 SUSPEND (user gang): ok in 200 us (status 0x1)
+Nov 13 13:53:16 atrium-r9700 kernel: atrium_gpu_amd_pci0: mes: pipe 0 RESUME (user gang): ok in 140 us (status 0x1)
+Nov 13 13:53:16 atrium-r9700 kernel: atrium_gpu_amd_pci0: uq3: preempted for a free: suspend fence landed after 0 us, resume ok
+Nov 13 13:53:20 atrium-r9700 kernel: atrium_gpu_amd_pci0: smu: TransferTableSmu2Dram      arg 0x00000005: resp 0x1
+Nov 13 13:53:20 atrium-r9700 kernel: atrium_gpu_amd_pci0: smu: telemetry #4972: edge 34 C, hotspot 42 C, mem 34 C, VR 34 C; power 67 W of 300 W limit, board 67 W; fan 893 rpm (20%); gfx 3414 MHz, mem 181 MHz, gfx busy 100%; throttle 0x1 (ids 0x2)
+Nov 13 13:53:21 atrium-r9700 kernel: atrium_gpu_amd_pci0: si: uq3 hung: fence 0, no progress for 5000 ms; its work fails, the queue is lost
+Nov 13 13:53:21 atrium-r9700 kernel: atrium_gpu_amd_pci0: uq3: destroy: work in flight: seq 1, fence 0, wptr 12, rptr report 0; HQD active (VMID 11)
+Nov 13 13:53:21 atrium-r9700 kernel: atrium_gpu_amd_pci0: uq3: VMID 11's waves killed (0); fence still behind after 200000 us
+Nov 13 13:53:21 atrium-r9700 kernel: atrium_gpu_amd_pci0: mes: after the wave kill: CP_MES_CNTL 0xc000000; pipe 0: instr 0x7ec4, GP3 0x1029097, HQD active 1, rptr 0x300, wptr 0x1b00; pipe 1: instr 0x7ec4, GP3 0x1029097, HQD active 1, rptr 0x180, wptr 0x180; GRBM_STATUS 0xa800382c, CP_STAT 0, RLC_STAT 0x35
+Nov 13 13:53:21 atrium-r9700 kernel: atrium_gpu_amd_pci0: mes: after the wave kill: GRBM_STATUS2 0x34110000, GRBM_STATUS3 0x4000, CP_CPC_STATUS 0xa0200401, CP_CPC_BUSY_STAT 0x4a0/0x40000, CP_CPF_STATUS 0xa800c001, CP_BUSY_STAT 0, RLC_GPM_STAT 0x140097
+Nov 13 13:53:21 atrium-r9700 kernel: atrium_gpu_amd_pci0: uq3: HQD me1 pipe 0 queue 2 (VMID 11) reset: inactive after 10 us
+Nov 13 13:53:21 atrium-r9700 kernel: atrium_gpu_amd_pci0: mes: pipe 0 REMOVE_QUEUE (user compute): ok in 180 us (status 0x1)
+Nov 13 13:53:21 atrium-r9700 kernel: atrium_gpu_amd_pci0: uq3: removed (seq 1, fence 0)
+Nov 13 13:53:21 atrium-r9700 kernel: atrium_gpu_amd_pci0: si: uq3 evicted (lost) and unmapped
+Nov 13 13:53:21 atrium-r9700 kernel: atrium_gpu_amd_pci0: si: uq3 closed: 1 submits; EOP IVs routed 18, unrouted 1, MES own 100, MES preemption 12; retired by IV 16, by poll 0; queues lost to faults 1, hangs 3; preempted for frees 12 (failed 0)
+Nov 13 13:53:21 atrium-r9700 kernel: atrium_gpu_amd_pci0: si: unrouted EOP src_data[0]: 0x18000000 x1, 0 x0, 0 x0, 0 x0
+Nov 13 13:53:21 atrium-r9700 kernel: atrium_gpu_amd_pci0: mes: pipe 0 SUSPEND (user gang): ok in 170 us (status 0x1)
+Nov 13 13:53:21 atrium-r9700 kernel: atrium_gpu_amd_pci0: mes: pipe 0 RESUME (user gang): ok in 110 us (status 0x1)
+Nov 13 13:53:21 atrium-r9700 kernel: atrium_gpu_amd_pci0: uq0: preempted for a free: suspend fence landed after 0 us, resume ok
+Nov 13 13:53:21 atrium-r9700 kernel: atrium_gpu_amd_pci0: mes: pipe 0 SUSPEND (user gang): ok in 160 us (status 0x1)
+Nov 13 13:53:21 atrium-r9700 kernel: atrium_gpu_amd_pci0: mes: pipe 0 RESUME (user gang): ok in 110 us (status 0x1)
+Nov 13 13:53:21 atrium-r9700 kernel: atrium_gpu_amd_pci0: uq0: preempted for a free: suspend fence landed after 0 us, resume ok
+Nov 13 13:53:21 atrium-r9700 kernel: atrium_gpu_amd_pci0: mes: pipe 0 SUSPEND (user gang): ok in 160 us (status 0x1)
+Nov 13 13:53:21 atrium-r9700 kernel: atrium_gpu_amd_pci0: mes: pipe 0 RESUME (user gang): ok in 110 us (status 0x1)
+Nov 13 13:53:21 atrium-r9700 kernel: atrium_gpu_amd_pci0: uq0: preempted for a free: suspend fence landed after 0 us, resume ok
+Nov 13 13:53:21 atrium-r9700 kernel: atrium_gpu_amd_pci0: mes: pipe 0 SUSPEND (user gang): ok in 90 us (status 0x1)
+Nov 13 13:53:21 atrium-r9700 kernel: atrium_gpu_amd_pci0: mes: pipe 0 RESUME (user gang): ok in 110 us (status 0x1)
+Nov 13 13:53:21 atrium-r9700 kernel: atrium_gpu_amd_pci0: uq0: preempted for a free: suspend fence landed after 0 us, resume ok
+Nov 13 13:53:21 atrium-r9700 kernel: atrium_gpu_amd_pci0: mes: pipe 0 SUSPEND (user gang): ok in 80 us (status 0x1)
+Nov 13 13:53:21 atrium-r9700 kernel: atrium_gpu_amd_pci0: mes: pipe 0 RESUME (user gang): ok in 110 us (status 0x1)
+Nov 13 13:53:21 atrium-r9700 kernel: atrium_gpu_amd_pci0: uq0: preempted for a free: suspend fence landed after 0 us, resume ok
+Nov 13 13:53:21 atrium-r9700 kernel: atrium_gpu_amd_pci0: mes: pipe 0 ADD_QUEUE (user compute): ok in 190 us (status 0x1)
+Nov 13 13:53:21 atrium-r9700 kernel: atrium_gpu_amd_pci0: uq3: added: VM base 0x801c001, queue pages at VA 0x200030000 (pa 0x34e7b8000), MQD GART 0x8c000, doorbell 0x26
+Nov 13 13:53:21 atrium-r9700 kernel: atrium_gpu_amd_pci0: si: uq3: first EOP IV, src_data[0] 0x1000026
+Nov 13 13:53:21 atrium-r9700 kernel: atrium_gpu_amd_pci0: si: VM fault: 1 IV(s), VMIDs 0x800, first VMID 11 at 0x10003000
+Nov 13 13:53:21 atrium-r9700 kernel: atrium_gpu_amd_pci0: gmc: client fault: fault status 0xb01280: client SQC (inst) (0x9), VMID 11, MORE_FAULTS 0, WALKER_ERROR 0, PERMISSION_FAULTS 0x8, MAPPING_ERROR 0, RW 0, ATOMIC 0, PRT 0, UCE 0
+Nov 13 13:53:21 atrium-r9700 kernel: atrium_gpu_amd_pci0: si: uq3 faulted (VMID 11, 0x10003000): its work fails, the queue is lost
+Nov 13 13:53:21 atrium-r9700 kernel: atrium_gpu_amd_pci0: uq3: destroy: work in flight: seq 2, fence 1, wptr 24, rptr report 0x18; HQD active (VMID 11)
+Nov 13 13:53:21 atrium-r9700 kernel: atrium_gpu_amd_pci0: uq3: VMID 11's waves killed (0); fence landed after 100 us
+Nov 13 13:53:21 atrium-r9700 kernel: atrium_gpu_amd_pci0: mes: after the wave kill: CP_MES_CNTL 0xc000000; pipe 0: instr 0x7ec4, GP3 0x1029097, HQD active 1, rptr 0x100, wptr 0x2100; pipe 1: instr 0x7ec4, GP3 0x1029097, HQD active 1, rptr 0x180, wptr 0x180; GRBM_STATUS 0x382c, CP_STAT 0, RLC_STAT 0x25
+Nov 13 13:53:21 atrium-r9700 kernel: atrium_gpu_amd_pci0: mes: after the wave kill: GRBM_STATUS2 0x100000, GRBM_STATUS3 0, CP_CPC_STATUS 0, CP_CPC_BUSY_STAT 0/0, CP_CPF_STATUS 0, CP_BUSY_STAT 0, RLC_GPM_STAT 0x140037
+Nov 13 13:53:21 atrium-r9700 kernel: atrium_gpu_amd_pci0: mes: pipe 0 REMOVE_QUEUE (user compute): ok in 210 us (status 0x1)
+Nov 13 13:53:21 atrium-r9700 kernel: atrium_gpu_amd_pci0: uq3: removed (seq 2, fence 2)
+Nov 13 13:53:21 atrium-r9700 kernel: atrium_gpu_amd_pci0: si: uq3 evicted (lost) and unmapped
+Nov 13 13:53:21 atrium-r9700 kernel: atrium_gpu_amd_pci0: si: uq3 closed: 2 submits; EOP IVs routed 34, unrouted 1, MES own 124, MES preemption 17; retired by IV 31, by poll 0; queues lost to faults 2, hangs 3; preempted for frees 17 (failed 0)
+Nov 13 13:53:21 atrium-r9700 kernel: atrium_gpu_amd_pci0: si: unrouted EOP src_data[0]: 0x18000000 x1, 0 x0, 0 x0, 0 x0
+Nov 13 13:53:21 atrium-r9700 kernel: atrium_gpu_amd_pci0: mes: pipe 0 ADD_QUEUE (user compute): ok in 250 us (status 0x1)
+Nov 13 13:53:21 atrium-r9700 kernel: atrium_gpu_amd_pci0: uq3: added: VM base 0x801c001, queue pages at VA 0x200030000 (pa 0x34e7b8000), MQD GART 0x8c000, doorbell 0x26
+Nov 13 13:53:21 atrium-r9700 kernel: atrium_gpu_amd_pci0: si: uq3: first EOP IV, src_data[0] 0x1000026
+Nov 13 13:53:21 atrium-r9700 kernel: atrium_gpu_amd_pci0: mes: pipe 0 SUSPEND (user gang): ok in 310 us (status 0x1)
+Nov 13 13:53:21 atrium-r9700 kernel: atrium_gpu_amd_pci0: mes: pipe 0 RESUME (user gang): ok in 120 us (status 0x1)
+Nov 13 13:53:21 atrium-r9700 kernel: atrium_gpu_amd_pci0: uq3: preempted for a free: suspend fence landed after 0 us, resume ok
+Nov 13 13:53:21 atrium-r9700 kernel: atrium_gpu_amd_pci0: mes: pipe 0 SUSPEND (user gang): ok in 90 us (status 0x1)
+Nov 13 13:53:21 atrium-r9700 kernel: atrium_gpu_amd_pci0: mes: pipe 0 RESUME (user gang): ok in 110 us (status 0x1)
+Nov 13 13:53:21 atrium-r9700 kernel: atrium_gpu_amd_pci0: uq3: preempted for a free: suspend fence landed after 0 us, resume ok
+Nov 13 13:53:21 atrium-r9700 kernel: atrium_gpu_amd_pci0: mes: pipe 0 SUSPEND (user gang): ok in 90 us (status 0x1)
+Nov 13 13:53:21 atrium-r9700 kernel: atrium_gpu_amd_pci0: mes: pipe 0 RESUME (user gang): ok in 100 us (status 0x1)
+Nov 13 13:53:21 atrium-r9700 kernel: atrium_gpu_amd_pci0: uq3: preempted for a free: suspend fence landed after 0 us, resume ok
+Nov 13 13:53:21 atrium-r9700 kernel: atrium_gpu_amd_pci0: mes: pipe 0 SUSPEND (user gang): ok in 90 us (status 0x1)
+Nov 13 13:53:21 atrium-r9700 kernel: atrium_gpu_amd_pci0: mes: pipe 0 RESUME (user gang): ok in 100 us (status 0x1)
+Nov 13 13:53:21 atrium-r9700 kernel: atrium_gpu_amd_pci0: uq3: preempted for a free: suspend fence landed after 0 us, resume ok
+Nov 13 13:53:21 atrium-r9700 kernel: atrium_gpu_amd_pci0: mes: pipe 0 REMOVE_QUEUE (user compute): ok in 230 us (status 0x1)
+Nov 13 13:53:21 atrium-r9700 kernel: atrium_gpu_amd_pci0: uq3: removed (seq 1, fence 1)
+Nov 13 13:53:21 atrium-r9700 kernel: atrium_gpu_amd_pci0: si: uq3 closed: 1 submits; EOP IVs routed 35, unrouted 1, MES own 144, MES preemption 21; retired by IV 32, by poll 0; queues lost to faults 2, hangs 3; preempted for frees 21 (failed 0)
+Nov 13 13:53:21 atrium-r9700 kernel: atrium_gpu_amd_pci0: si: unrouted EOP src_data[0]: 0x18000000 x1, 0 x0, 0 x0, 0 x0
+Nov 13 13:53:21 atrium-r9700 kernel: atrium_gpu_amd_pci0: mes: pipe 0 ADD_QUEUE (user compute): ok in 190 us (status 0x1)
+Nov 13 13:53:21 atrium-r9700 kernel: atrium_gpu_amd_pci0: uq3: added: VM base 0x8025001, queue pages at VA 0x200030000 (pa 0x34e7b8000), MQD GART 0x8c000, doorbell 0x26
+Nov 13 13:53:21 atrium-r9700 kernel: atrium_gpu_amd_pci0: mes: pipe 0 ADD_QUEUE (user compute): ok in 190 us (status 0x1)
+Nov 13 13:53:21 atrium-r9700 kernel: atrium_gpu_amd_pci0: uq4: added: VM base 0x802e001, queue pages at VA 0x200040000 (pa 0x34eab4000), MQD GART 0x90000, doorbell 0x28
+Nov 13 13:53:21 atrium-r9700 kernel: atrium_gpu_amd_pci0: si: VM fault: 1 IV(s), VMIDs 0x1000, first VMID 12 at 0x7ffffff00000
+Nov 13 13:53:21 atrium-r9700 kernel: atrium_gpu_amd_pci0: gmc: client fault: fault status 0xc41050: client TCP (0x8), VMID 12, MORE_FAULTS 0, WALKER_ERROR 0, PERMISSION_FAULTS 0x5, MAPPING_ERROR 0, RW 1, ATOMIC 0, PRT 0, UCE 0
+Nov 13 13:53:21 atrium-r9700 kernel: atrium_gpu_amd_pci0: si: uq4 faulted (VMID 12, 0x7ffffff00000): its work fails, the queue is lost
+Nov 13 13:53:21 atrium-r9700 kernel: atrium_gpu_amd_pci0: uq4: destroy: work in flight: seq 1, fence 0, wptr 12, rptr report 0xc; HQD active (VMID 12)
+Nov 13 13:53:21 atrium-r9700 kernel: atrium_gpu_amd_pci0: si: uq3: first EOP IV, src_data[0] 0x1000026
+Nov 13 13:53:21 atrium-r9700 kernel: atrium_gpu_amd_pci0: si: uq4: first EOP IV, src_data[0] 0x1000028
+Nov 13 13:53:21 atrium-r9700 kernel: atrium_gpu_amd_pci0: uq4: VMID 12's waves killed (0); fence landed after 100 us
+Nov 13 13:53:21 atrium-r9700 kernel: atrium_gpu_amd_pci0: mes: after the wave kill: CP_MES_CNTL 0xc000000; pipe 0: instr 0x21cc, GP3 0x1029097, HQD active 1, rptr 0x380, wptr 0x2780; pipe 1: instr 0x7ec4, GP3 0x1029097, HQD active 1, rptr 0x180, wptr 0x180; GRBM_STATUS 0xa800382c, CP_STAT 0, RLC_STAT 0x25
+Nov 13 13:53:21 atrium-r9700 kernel: atrium_gpu_amd_pci0: mes: after the wave kill: GRBM_STATUS2 0x34118000, GRBM_STATUS3 0x4000, CP_CPC_STATUS 0x80110400, CP_CPC_BUSY_STAT 0/0x4480, CP_CPF_STATUS 0xb0000001, CP_BUSY_STAT 0, RLC_GPM_STAT 0x160037
+Nov 13 13:53:21 atrium-r9700 kernel: atrium_gpu_amd_pci0: mes: pipe 0 REMOVE_QUEUE (user compute): ok in 200 us (status 0x1)
+Nov 13 13:53:21 atrium-r9700 kernel: atrium_gpu_amd_pci0: uq4: removed (seq 1, fence 1)
+Nov 13 13:53:21 atrium-r9700 kernel: atrium_gpu_amd_pci0: gmc: GFXHUB (GC 12.0) flush of context 5 timed out: INV_REQ 0xf80020, INV_ACK 0
+Nov 13 13:53:21 atrium-r9700 kernel: atrium_gpu_amd_pci0: gmc: GFXHUB (GC 12.0) after the timeout: CONTEXT0_CNTL 0x3fffc01, PT base 005800001, L1_TLB 0x1859, L2_CNTL 0x80e01, fault status 0 (addr 000000000)
+Nov 13 13:53:21 atrium-r9700 kernel: atrium_gpu_amd_pci0: gmc: GFXHUB (GC 12.0) flush of context 5 timed out: INV_REQ 0xf80100, INV_ACK 0
+Nov 13 13:53:21 atrium-r9700 kernel: atrium_gpu_amd_pci0: gmc: GFXHUB (GC 12.0) after the timeout: CONTEXT0_CNTL 0x3fffc01, PT base 005800001, L1_TLB 0x1859, L2_CNTL 0x80e01, fault status 0 (addr 000000000)
+Nov 13 13:53:21 atrium-r9700 kernel: atrium_gpu_amd_pci0: gmc: GFXHUB (GC 12.0) flush of context 8 timed out: INV_REQ 0xf80100, INV_ACK 0
+Nov 13 13:53:21 atrium-r9700 kernel: atrium_gpu_amd_pci0: gmc: GFXHUB (GC 12.0) after the timeout: CONTEXT0_CNTL 0x3fffc01, PT base 005800001, L1_TLB 0x1859, L2_CNTL 0x80e01, fault status 0 (addr 000000000)
+Nov 13 13:53:21 atrium-r9700 kernel: atrium_gpu_amd_pci0: gmc: GFXHUB (GC 12.0) flush of context 8 timed out: INV_REQ 0xf80200, INV_ACK 0
+Nov 13 13:53:21 atrium-r9700 kernel: atrium_gpu_amd_pci0: gmc: GFXHUB (GC 12.0) after the timeout: CONTEXT0_CNTL 0x3fffc01, PT base 005800001, L1_TLB 0x1859, L2_CNTL 0x80e01, fault status 0 (addr 000000000)
+Nov 13 13:53:22 atrium-r9700 kernel: atrium_gpu_amd_pci0: gmc: GFXHUB (GC 12.0) flush of context 9 timed out: INV_REQ 0xf80200, INV_ACK 0
+Nov 13 13:53:22 atrium-r9700 kernel: atrium_gpu_amd_pci0: gmc: GFXHUB (GC 12.0) after the timeout: CONTEXT0_CNTL 0x3fffc01, PT base 005800001, L1_TLB 0x1859, L2_CNTL 0x80e01, fault status 0 (addr 000000000)
+Nov 13 13:53:22 atrium-r9700 kernel: atrium_gpu_amd_pci0: gmc: GFXHUB (GC 12.0) flush of context 9 timed out: INV_REQ 0xf80400, INV_ACK 0
+Nov 13 13:53:22 atrium-r9700 kernel: atrium_gpu_amd_pci0: gmc: GFXHUB (GC 12.0) after the timeout: CONTEXT0_CNTL 0x3fffc01, PT base 005800001, L1_TLB 0x1859, L2_CNTL 0x80e01, fault status 0 (addr 000000000)
+Nov 13 13:53:22 atrium-r9700 kernel: atrium_gpu_amd_pci0: gmc: GFXHUB (GC 12.0) flush of context 10 timed out: INV_REQ 0xf80400, INV_ACK 0
+Nov 13 13:53:22 atrium-r9700 kernel: atrium_gpu_amd_pci0: gmc: GFXHUB (GC 12.0) after the timeout: CONTEXT0_CNTL 0x3fffc01, PT base 005800001, L1_TLB 0x1859, L2_CNTL 0x80e01, fault status 0 (addr 000000000)
+Nov 13 13:53:22 atrium-r9700 kernel: atrium_gpu_amd_pci0: gmc: GFXHUB (GC 12.0) flush of context 10 timed out: INV_REQ 0xf80800, INV_ACK 0
+Nov 13 13:53:22 atrium-r9700 kernel: atrium_gpu_amd_pci0: gmc: GFXHUB (GC 12.0) after the timeout: CONTEXT0_CNTL 0x3fffc01, PT base 005800001, L1_TLB 0x1859, L2_CNTL 0x80e01, fault status 0 (addr 000000000)
+Nov 13 13:53:22 atrium-r9700 kernel: atrium_gpu_amd_pci0: gmc: GFXHUB (GC 12.0) flush of context 11 timed out: INV_REQ 0xf80800, INV_ACK 0
+Nov 13 13:53:22 atrium-r9700 kernel: atrium_gpu_amd_pci0: gmc: GFXHUB (GC 12.0) after the timeout: CONTEXT0_CNTL 0x3fffc01, PT base 005800001, L1_TLB 0x1859, L2_CNTL 0x80e01, fault status 0 (addr 000000000)
+Nov 13 13:53:22 atrium-r9700 kernel: atrium_gpu_amd_pci0: gmc: GFXHUB (GC 12.0) flush of context 11 timed out: INV_REQ 0xf81000, INV_ACK 0
+Nov 13 13:53:22 atrium-r9700 kernel: atrium_gpu_amd_pci0: gmc: GFXHUB (GC 12.0) after the timeout: CONTEXT0_CNTL 0x3fffc01, PT base 005800001, L1_TLB 0x1859, L2_CNTL 0x80e01, fault status 0 (addr 000000000)
+Nov 13 13:53:22 atrium-r9700 kernel: atrium_gpu_amd_pci0: gmc: GFXHUB (GC 12.0) flush of context 12 timed out: INV_REQ 0xf81000, INV_ACK 0
+Nov 13 13:53:22 atrium-r9700 kernel: atrium_gpu_amd_pci0: gmc: GFXHUB (GC 12.0) after the timeout: CONTEXT0_CNTL 0x3fffc01, PT base 005800001, L1_TLB 0x1859, L2_CNTL 0x80e01, fault status 0 (addr 000000000)
+Nov 13 13:53:22 atrium-r9700 kernel: atrium_gpu_amd_pci0: gmc: GFXHUB (GC 12.0) flush of context 12 timed out: INV_REQ 0xf82000, INV_ACK 0
+Nov 13 13:53:22 atrium-r9700 kernel: atrium_gpu_amd_pci0: gmc: GFXHUB (GC 12.0) after the timeout: CONTEXT0_CNTL 0x3fffc01, PT base 005800001, L1_TLB 0x1859, L2_CNTL 0x80e01, fault status 0 (addr 000000000)
+Nov 13 13:53:22 atrium-r9700 kernel: atrium_gpu_amd_pci0: gmc: GFXHUB (GC 12.0) flush of context 13 timed out: INV_REQ 0xf82000, INV_ACK 0
+Nov 13 13:53:22 atrium-r9700 kernel: atrium_gpu_amd_pci0: gmc: GFXHUB (GC 12.0) after the timeout: CONTEXT0_CNTL 0x3fffc01, PT base 005800001, L1_TLB 0x1859, L2_CNTL 0x80e01, fault status 0 (addr 000000000)
+Nov 13 13:53:22 atrium-r9700 kernel: atrium_gpu_amd_pci0: gmc: GFXHUB (GC 12.0) flush of context 13 timed out: INV_REQ 0xf84000, INV_ACK 0
+Nov 13 13:53:22 atrium-r9700 kernel: atrium_gpu_amd_pci0: gmc: GFXHUB (GC 12.0) after the timeout: CONTEXT0_CNTL 0x3fffc01, PT base 005800001, L1_TLB 0x1859, L2_CNTL 0x80e01, fault status 0 (addr 000000000)
+Nov 13 13:53:22 atrium-r9700 kernel: atrium_gpu_amd_pci0: gmc: GFXHUB (GC 12.0) flush of context 14 timed out: INV_REQ 0xf84000, INV_ACK 0
+Nov 13 13:53:22 atrium-r9700 kernel: atrium_gpu_amd_pci0: gmc: GFXHUB (GC 12.0) after the timeout: CONTEXT0_CNTL 0x3fffc01, PT base 005800001, L1_TLB 0x1859, L2_CNTL 0x80e01, fault status 0 (addr 000000000)
+Nov 13 13:53:22 atrium-r9700 kernel: atrium_gpu_amd_pci0: gmc: GFXHUB (GC 12.0) flush of context 14 timed out: INV_REQ 0xf88000, INV_ACK 0
+Nov 13 13:53:22 atrium-r9700 kernel: atrium_gpu_amd_pci0: gmc: GFXHUB (GC 12.0) after the timeout: CONTEXT0_CNTL 0x3fffc01, PT base 005800001, L1_TLB 0x1859, L2_CNTL 0x80e01, fault status 0 (addr 000000000)
+Nov 13 13:53:23 atrium-r9700 kernel: atrium_gpu_amd_pci0: gmc: GFXHUB (GC 12.0) flush of context 15 timed out: INV_REQ 0xf88000, INV_ACK 0
+Nov 13 13:53:23 atrium-r9700 kernel: atrium_gpu_amd_pci0: gmc: GFXHUB (GC 12.0) after the timeout: CONTEXT0_CNTL 0x3fffc01, PT base 005800001, L1_TLB 0x1859, L2_CNTL 0x80e01, fault status 0 (addr 000000000)
+Nov 13 13:53:23 atrium-r9700 kernel: atrium_gpu_amd_pci0: gmc: GFXHUB (GC 12.0) flush of context 15 timed out: INV_REQ 0xf88000, INV_ACK 0
+Nov 13 13:53:23 atrium-r9700 kernel: atrium_gpu_amd_pci0: gmc: GFXHUB (GC 12.0) after the timeout: CONTEXT0_CNTL 0x3fffc01, PT base 005800001, L1_TLB 0x1859, L2_CNTL 0x80e01, fault status 0 (addr 000000000)
+Nov 13 13:53:23 atrium-r9700 kernel: atrium_gpu_amd_pci0: si: uq4 evicted (lost) and unmapped
+Nov 13 13:53:23 atrium-r9700 kernel: atrium_gpu_amd_pci0: gmc: GFXHUB (GC 12.0) flush of context 5 timed out: INV_REQ 0xf80020, INV_ACK 0
+Nov 13 13:53:23 atrium-r9700 kernel: atrium_gpu_amd_pci0: gmc: GFXHUB (GC 12.0) after the timeout: CONTEXT0_CNTL 0x3fffc01, PT base 005800001, L1_TLB 0x1859, L2_CNTL 0x80e01, fault status 0 (addr 000000000)
+Nov 13 13:53:23 atrium-r9700 kernel: atrium_gpu_amd_pci0: gmc: GFXHUB (GC 12.0) flush of context 5 timed out: INV_REQ 0xf80020, INV_ACK 0
+Nov 13 13:53:23 atrium-r9700 kernel: atrium_gpu_amd_pci0: gmc: GFXHUB (GC 12.0) after the timeout: CONTEXT0_CNTL 0x3fffc01, PT base 005800001, L1_TLB 0x1859, L2_CNTL 0x80e01, fault status 0 (addr 000000000)
+Nov 13 13:53:23 atrium-r9700 kernel: atrium_gpu_amd_pci0: si: uq4 closed: 1 submits; EOP IVs routed 37, unrouted 1, MES own 150, MES preemption 21; retired by IV 33, by poll 0; queues lost to faults 3, hangs 3; preempted for frees 21 (failed 0)
+Nov 13 13:53:23 atrium-r9700 kernel: atrium_gpu_amd_pci0: si: unrouted EOP src_data[0]: 0x18000000 x1, 0 x0, 0 x0, 0 x0
+Nov 13 13:53:23 atrium-r9700 kernel: atrium_gpu_amd_pci0: gmc: GFXHUB (GC 12.0) flush of context 5 timed out: INV_REQ 0xf80020, INV_ACK 0
+Nov 13 13:53:23 atrium-r9700 kernel: atrium_gpu_amd_pci0: gmc: GFXHUB (GC 12.0) after the timeout: CONTEXT0_CNTL 0x3fffc01, PT base 005800001, L1_TLB 0x1859, L2_CNTL 0x80e01, fault status 0 (addr 000000000)
+Nov 13 13:53:23 atrium-r9700 kernel: atrium_gpu_amd_pci0: si: VMID 5 unbind failed (60)
+Nov 13 13:53:25 atrium-r9700 kernel: atrium_gpu_amd_pci0: gmc: GFXHUB (GC 12.0) flush of context 5 timed out: INV_REQ 0xf80020, INV_ACK 0
+Nov 13 13:53:25 atrium-r9700 kernel: atrium_gpu_amd_pci0: gmc: GFXHUB (GC 12.0) after the timeout: CONTEXT0_CNTL 0x3fffc01, PT base 005800001, L1_TLB 0x1859, L2_CNTL 0x80e01, fault status 0 (addr 000000000)
+Nov 13 13:53:25 atrium-r9700 kernel: atrium_gpu_amd_pci0: smu: TransferTableSmu2Dram      arg 0x00000005: resp 0x1
+Nov 13 13:53:25 atrium-r9700 kernel: atrium_gpu_amd_pci0: smu: telemetry #4413: edge 34 C, hotspot 42 C, mem 34 C, VR 34 C; power 59 W of 300 W limit, board 59 W; fan 893 rpm (20%); gfx 3274 MHz, mem 45 MHz, gfx busy 97%; throttle 0x1 (ids 0x2)
+Nov 13 13:53:25 atrium-r9700 kernel: atrium_gpu_amd_pci0: gmc: GFXHUB (GC 12.0) flush of context 5 timed out: INV_REQ 0xf80020, INV_ACK 0
+Nov 13 13:53:25 atrium-r9700 kernel: atrium_gpu_amd_pci0: gmc: GFXHUB (GC 12.0) after the timeout: CONTEXT0_CNTL 0x3fffc01, PT base 005800001, L1_TLB 0x1859, L2_CNTL 0x80e01, fault status 0 (addr 000000000)
+Nov 13 13:53:25 atrium-r9700 kernel: atrium_gpu_amd_pci0: gmc: GFXHUB (GC 12.0) flush of context 4 timed out: INV_REQ 0xf80010, INV_ACK 0
+Nov 13 13:53:25 atrium-r9700 kernel: atrium_gpu_amd_pci0: gmc: GFXHUB (GC 12.0) after the timeout: CONTEXT0_CNTL 0x3fffc01, PT base 005800001, L1_TLB 0x1859, L2_CNTL 0x80e01, fault status 0 (addr 000000000)
+Nov 13 13:53:25 atrium-r9700 kernel: atrium_gpu_amd_pci0: gmc: GFXHUB (GC 12.0) flush of context 8 timed out: INV_REQ 0xf80100, INV_ACK 0
+Nov 13 13:53:25 atrium-r9700 kernel: atrium_gpu_amd_pci0: gmc: GFXHUB (GC 12.0) after the timeout: CONTEXT0_CNTL 0x3fffc01, PT base 005800001, L1_TLB 0x1859, L2_CNTL 0x80e01, fault status 0 (addr 000000000)
+Nov 13 13:53:25 atrium-r9700 kernel: atrium_gpu_amd_pci0: gmc: GFXHUB (GC 12.0) flush of context 9 timed out: INV_REQ 0xf80200, INV_ACK 0
+Nov 13 13:53:25 atrium-r9700 kernel: atrium_gpu_amd_pci0: gmc: GFXHUB (GC 12.0) after the timeout: CONTEXT0_CNTL 0x3fffc01, PT base 005800001, L1_TLB 0x1859, L2_CNTL 0x80e01, fault status 0 (addr 000000000)
+Nov 13 13:53:25 atrium-r9700 kernel: atrium_gpu_amd_pci0: gmc: GFXHUB (GC 12.0) flush of context 10 timed out: INV_REQ 0xf80400, INV_ACK 0
+Nov 13 13:53:25 atrium-r9700 kernel: atrium_gpu_amd_pci0: gmc: GFXHUB (GC 12.0) after the timeout: CONTEXT0_CNTL 0x3fffc01, PT base 005800001, L1_TLB 0x1859, L2_CNTL 0x80e01, fault status 0 (addr 000000000)
+Nov 13 13:53:26 atrium-r9700 kernel: atrium_gpu_amd_pci0: gmc: GFXHUB (GC 12.0) flush of context 11 timed out: INV_REQ 0xf80800, INV_ACK 0
+Nov 13 13:53:26 atrium-r9700 kernel: atrium_gpu_amd_pci0: gmc: GFXHUB (GC 12.0) after the timeout: CONTEXT0_CNTL 0x3fffc01, PT base 005800001, L1_TLB 0x1859, L2_CNTL 0x80e01, fault status 0 (addr 000000000)
+Nov 13 13:53:26 atrium-r9700 kernel: atrium_gpu_amd_pci0: gmc: GFXHUB (GC 12.0) flush of context 12 timed out: INV_REQ 0xf81000, INV_ACK 0
+Nov 13 13:53:26 atrium-r9700 kernel: atrium_gpu_amd_pci0: gmc: GFXHUB (GC 12.0) after the timeout: CONTEXT0_CNTL 0x3fffc01, PT base 005800001, L1_TLB 0x1859, L2_CNTL 0x80e01, fault status 0 (addr 000000000)
+Nov 13 13:53:26 atrium-r9700 kernel: atrium_gpu_amd_pci0: gmc: GFXHUB (GC 12.0) flush of context 13 timed out: INV_REQ 0xf82000, INV_ACK 0
+Nov 13 13:53:26 atrium-r9700 kernel: atrium_gpu_amd_pci0: gmc: GFXHUB (GC 12.0) after the timeout: CONTEXT0_CNTL 0x3fffc01, PT base 005800001, L1_TLB 0x1859, L2_CNTL 0x80e01, fault status 0 (addr 000000000)
+Nov 13 13:53:26 atrium-r9700 kernel: atrium_gpu_amd_pci0: gmc: GFXHUB (GC 12.0) flush of context 14 timed out: INV_REQ 0xf84000, INV_ACK 0
+Nov 13 13:53:26 atrium-r9700 kernel: atrium_gpu_amd_pci0: gmc: GFXHUB (GC 12.0) after the timeout: CONTEXT0_CNTL 0x3fffc01, PT base 005800001, L1_TLB 0x1859, L2_CNTL 0x80e01, fault status 0 (addr 000000000)
+Nov 13 13:53:26 atrium-r9700 kernel: atrium_gpu_amd_pci0: gmc: GFXHUB (GC 12.0) flush of context 15 timed out: INV_REQ 0xf88000, INV_ACK 0
+Nov 13 13:53:26 atrium-r9700 kernel: atrium_gpu_amd_pci0: gmc: GFXHUB (GC 12.0) after the timeout: CONTEXT0_CNTL 0x3fffc01, PT base 005800001, L1_TLB 0x1859, L2_CNTL 0x80e01, fault status 0 (addr 000000000)
+Nov 13 13:53:26 atrium-r9700 kernel: atrium_gpu_amd_pci0: mes: pipe 0 SUSPEND (user gang): ok in 240 us (status 0x1)
+Nov 13 13:53:26 atrium-r9700 kernel: atrium_gpu_amd_pci0: mes: pipe 0 RESUME (user gang): ok in 100 us (status 0x1)
+Nov 13 13:53:26 atrium-r9700 kernel: atrium_gpu_amd_pci0: uq3: preempted for a free: suspend fence landed after 0 us, resume ok
+Nov 13 13:53:26 atrium-r9700 kernel: atrium_gpu_amd_pci0: gmc: GFXHUB (GC 12.0) flush of context 4 timed out: INV_REQ 0xf80010, INV_ACK 0
+Nov 13 13:53:26 atrium-r9700 kernel: atrium_gpu_amd_pci0: gmc: GFXHUB (GC 12.0) after the timeout: CONTEXT0_CNTL 0x3fffc01, PT base 005800001, L1_TLB 0x1859, L2_CNTL 0x80e01, fault status 0 (addr 000000000)
+Nov 13 13:53:26 atrium-r9700 kernel: atrium_gpu_amd_pci0: gmc: GFXHUB (GC 12.0) flush of context 8 timed out: INV_REQ 0xf80100, INV_ACK 0
+Nov 13 13:53:26 atrium-r9700 kernel: atrium_gpu_amd_pci0: gmc: GFXHUB (GC 12.0) after the timeout: CONTEXT0_CNTL 0x3fffc01, PT base 005800001, L1_TLB 0x1859, L2_CNTL 0x80e01, fault status 0 (addr 000000000)
+Nov 13 13:53:26 atrium-r9700 kernel: atrium_gpu_amd_pci0: gmc: GFXHUB (GC 12.0) flush of context 9 timed out: INV_REQ 0xf80200, INV_ACK 0
+Nov 13 13:53:26 atrium-r9700 kernel: atrium_gpu_amd_pci0: gmc: GFXHUB (GC 12.0) after the timeout: CONTEXT0_CNTL 0x3fffc01, PT base 005800001, L1_TLB 0x1859, L2_CNTL 0x80e01, fault status 0 (addr 000000000)
+Nov 13 13:53:27 atrium-r9700 kernel: atrium_gpu_amd_pci0: gmc: GFXHUB (GC 12.0) flush of context 10 timed out: INV_REQ 0xf80400, INV_ACK 0
+Nov 13 13:53:27 atrium-r9700 kernel: atrium_gpu_amd_pci0: gmc: GFXHUB (GC 12.0) after the timeout: CONTEXT0_CNTL 0x3fffc01, PT base 005800001, L1_TLB 0x1859, L2_CNTL 0x80e01, fault status 0 (addr 000000000)
+Nov 13 13:53:27 atrium-r9700 kernel: atrium_gpu_amd_pci0: gmc: GFXHUB (GC 12.0) flush of context 11 timed out: INV_REQ 0xf80800, INV_ACK 0
+Nov 13 13:53:27 atrium-r9700 kernel: atrium_gpu_amd_pci0: gmc: GFXHUB (GC 12.0) after the timeout: CONTEXT0_CNTL 0x3fffc01, PT base 005800001, L1_TLB 0x1859, L2_CNTL 0x80e01, fault status 0 (addr 000000000)
+Nov 13 13:53:27 atrium-r9700 kernel: atrium_gpu_amd_pci0: gmc: GFXHUB (GC 12.0) flush of context 12 timed out: INV_REQ 0xf81000, INV_ACK 0
+Nov 13 13:53:27 atrium-r9700 kernel: atrium_gpu_amd_pci0: gmc: GFXHUB (GC 12.0) after the timeout: CONTEXT0_CNTL 0x3fffc01, PT base 005800001, L1_TLB 0x1859, L2_CNTL 0x80e01, fault status 0 (addr 000000000)
+Nov 13 13:53:27 atrium-r9700 kernel: atrium_gpu_amd_pci0: gmc: GFXHUB (GC 12.0) flush of context 13 timed out: INV_REQ 0xf82000, INV_ACK 0
+Nov 13 13:53:27 atrium-r9700 kernel: atrium_gpu_amd_pci0: gmc: GFXHUB (GC 12.0) after the timeout: CONTEXT0_CNTL 0x3fffc01, PT base 005800001, L1_TLB 0x1859, L2_CNTL 0x80e01, fault status 0 (addr 000000000)
+Nov 13 13:53:27 atrium-r9700 kernel: atrium_gpu_amd_pci0: gmc: GFXHUB (GC 12.0) flush of context 14 timed out: INV_REQ 0xf84000, INV_ACK 0
+Nov 13 13:53:27 atrium-r9700 kernel: atrium_gpu_amd_pci0: gmc: GFXHUB (GC 12.0) after the timeout: CONTEXT0_CNTL 0x3fffc01, PT base 005800001, L1_TLB 0x1859, L2_CNTL 0x80e01, fault status 0 (addr 000000000)
+Nov 13 13:53:27 atrium-r9700 kernel: atrium_gpu_amd_pci0: gmc: GFXHUB (GC 12.0) flush of context 15 timed out: INV_REQ 0xf88000, INV_ACK 0
+Nov 13 13:53:27 atrium-r9700 kernel: atrium_gpu_amd_pci0: gmc: GFXHUB (GC 12.0) after the timeout: CONTEXT0_CNTL 0x3fffc01, PT base 005800001, L1_TLB 0x1859, L2_CNTL 0x80e01, fault status 0 (addr 000000000)
+Nov 13 13:53:27 atrium-r9700 kernel: atrium_gpu_amd_pci0: mes: pipe 0 SUSPEND (user gang): ok in 170 us (status 0x1)
+Nov 13 13:53:27 atrium-r9700 kernel: atrium_gpu_amd_pci0: mes: pipe 0 RESUME (user gang): ok in 100 us (status 0x1)
+Nov 13 13:53:27 atrium-r9700 kernel: atrium_gpu_amd_pci0: uq3: preempted for a free: suspend fence landed after 0 us, resume ok
+Nov 13 13:53:27 atrium-r9700 kernel: atrium_gpu_amd_pci0: gmc: GFXHUB (GC 12.0) flush of context 4 timed out: INV_REQ 0xf80010, INV_ACK 0
+Nov 13 13:53:27 atrium-r9700 kernel: atrium_gpu_amd_pci0: gmc: GFXHUB (GC 12.0) after the timeout: CONTEXT0_CNTL 0x3fffc01, PT base 005800001, L1_TLB 0x1859, L2_CNTL 0x80e01, fault status 0 (addr 000000000)
+Nov 13 13:53:27 atrium-r9700 kernel: atrium_gpu_amd_pci0: gmc: GFXHUB (GC 12.0) flush of context 8 timed out: INV_REQ 0xf80100, INV_ACK 0
+Nov 13 13:53:27 atrium-r9700 kernel: atrium_gpu_amd_pci0: gmc: GFXHUB (GC 12.0) after the timeout: CONTEXT0_CNTL 0x3fffc01, PT base 005800001, L1_TLB 0x1859, L2_CNTL 0x80e01, fault status 0 (addr 000000000)
+Nov 13 13:53:27 atrium-r9700 kernel: atrium_gpu_amd_pci0: gmc: GFXHUB (GC 12.0) flush of context 9 timed out: INV_REQ 0xf80200, INV_ACK 0
+Nov 13 13:53:27 atrium-r9700 kernel: atrium_gpu_amd_pci0: gmc: GFXHUB (GC 12.0) after the timeout: CONTEXT0_CNTL 0x3fffc01, PT base 005800001, L1_TLB 0x1859, L2_CNTL 0x80e01, fault status 0 (addr 000000000)
+Nov 13 13:53:27 atrium-r9700 kernel: atrium_gpu_amd_pci0: gmc: GFXHUB (GC 12.0) flush of context 10 timed out: INV_REQ 0xf80400, INV_ACK 0
+Nov 13 13:53:27 atrium-r9700 kernel: atrium_gpu_amd_pci0: gmc: GFXHUB (GC 12.0) after the timeout: CONTEXT0_CNTL 0x3fffc01, PT base 005800001, L1_TLB 0x1859, L2_CNTL 0x80e01, fault status 0 (addr 000000000)
+Nov 13 13:53:28 atrium-r9700 kernel: atrium_gpu_amd_pci0: gmc: GFXHUB (GC 12.0) flush of context 11 timed out: INV_REQ 0xf80800, INV_ACK 0
+Nov 13 13:53:28 atrium-r9700 kernel: atrium_gpu_amd_pci0: gmc: GFXHUB (GC 12.0) after the timeout: CONTEXT0_CNTL 0x3fffc01, PT base 005800001, L1_TLB 0x1859, L2_CNTL 0x80e01, fault status 0 (addr 000000000)
+Nov 13 13:53:28 atrium-r9700 kernel: atrium_gpu_amd_pci0: gmc: GFXHUB (GC 12.0) flush of context 12 timed out: INV_REQ 0xf81000, INV_ACK 0
+Nov 13 13:53:28 atrium-r9700 kernel: atrium_gpu_amd_pci0: gmc: GFXHUB (GC 12.0) after the timeout: CONTEXT0_CNTL 0x3fffc01, PT base 005800001, L1_TLB 0x1859, L2_CNTL 0x80e01, fault status 0 (addr 000000000)
+Nov 13 13:53:28 atrium-r9700 kernel: atrium_gpu_amd_pci0: gmc: GFXHUB (GC 12.0) flush of context 13 timed out: INV_REQ 0xf82000, INV_ACK 0
+Nov 13 13:53:28 atrium-r9700 kernel: atrium_gpu_amd_pci0: gmc: GFXHUB (GC 12.0) after the timeout: CONTEXT0_CNTL 0x3fffc01, PT base 005800001, L1_TLB 0x1859, L2_CNTL 0x80e01, fault status 0 (addr 000000000)
+Nov 13 13:53:28 atrium-r9700 kernel: atrium_gpu_amd_pci0: gmc: GFXHUB (GC 12.0) flush of context 14 timed out: INV_REQ 0xf84000, INV_ACK 0
+Nov 13 13:53:28 atrium-r9700 kernel: atrium_gpu_amd_pci0: gmc: GFXHUB (GC 12.0) after the timeout: CONTEXT0_CNTL 0x3fffc01, PT base 005800001, L1_TLB 0x1859, L2_CNTL 0x80e01, fault status 0 (addr 000000000)
+Nov 13 13:53:28 atrium-r9700 kernel: atrium_gpu_amd_pci0: gmc: GFXHUB (GC 12.0) flush of context 15 timed out: INV_REQ 0xf88000, INV_ACK 0
+Nov 13 13:53:28 atrium-r9700 kernel: atrium_gpu_amd_pci0: gmc: GFXHUB (GC 12.0) after the timeout: CONTEXT0_CNTL 0x3fffc01, PT base 005800001, L1_TLB 0x1859, L2_CNTL 0x80e01, fault status 0 (addr 000000000)
+Nov 13 13:53:28 atrium-r9700 kernel: atrium_gpu_amd_pci0: mes: pipe 0 SUSPEND (user gang): ok in 170 us (status 0x1)
+Nov 13 13:53:28 atrium-r9700 kernel: atrium_gpu_amd_pci0: mes: pipe 0 RESUME (user gang): ok in 100 us (status 0x1)
+Nov 13 13:53:28 atrium-r9700 kernel: atrium_gpu_amd_pci0: uq3: preempted for a free: suspend fence landed after 0 us, resume ok
+Nov 13 13:53:28 atrium-r9700 kernel: atrium_gpu_amd_pci0: mes: pipe 0 REMOVE_QUEUE (user compute): ok in 210 us (status 0x1)
+Nov 13 13:53:28 atrium-r9700 kernel: atrium_gpu_amd_pci0: uq3: removed (seq 1, fence 1)
+Nov 13 13:53:28 atrium-r9700 kernel: atrium_gpu_amd_pci0: gmc: GFXHUB (GC 12.0) flush of context 4 timed out: INV_REQ 0xf80010, INV_ACK 0
+Nov 13 13:53:28 atrium-r9700 kernel: atrium_gpu_amd_pci0: gmc: GFXHUB (GC 12.0) after the timeout: CONTEXT0_CNTL 0x3fffc01, PT base 005800001, L1_TLB 0x1859, L2_CNTL 0x80e01, fault status 0 (addr 000000000)
+Nov 13 13:53:28 atrium-r9700 kernel: atrium_gpu_amd_pci0: gmc: GFXHUB (GC 12.0) flush of context 8 timed out: INV_REQ 0xf80100, INV_ACK 0
+Nov 13 13:53:28 atrium-r9700 kernel: atrium_gpu_amd_pci0: gmc: GFXHUB (GC 12.0) after the timeout: CONTEXT0_CNTL 0x3fffc01, PT base 005800001, L1_TLB 0x1859, L2_CNTL 0x80e01, fault status 0 (addr 000000000)
+Nov 13 13:53:28 atrium-r9700 kernel: atrium_gpu_amd_pci0: gmc: GFXHUB (GC 12.0) flush of context 9 timed out: INV_REQ 0xf80200, INV_ACK 0
+Nov 13 13:53:28 atrium-r9700 kernel: atrium_gpu_amd_pci0: gmc: GFXHUB (GC 12.0) after the timeout: CONTEXT0_CNTL 0x3fffc01, PT base 005800001, L1_TLB 0x1859, L2_CNTL 0x80e01, fault status 0 (addr 000000000)
+Nov 13 13:53:28 atrium-r9700 kernel: atrium_gpu_amd_pci0: gmc: GFXHUB (GC 12.0) flush of context 10 timed out: INV_REQ 0xf80400, INV_ACK 0
+Nov 13 13:53:28 atrium-r9700 kernel: atrium_gpu_amd_pci0: gmc: GFXHUB (GC 12.0) after the timeout: CONTEXT0_CNTL 0x3fffc01, PT base 005800001, L1_TLB 0x1859, L2_CNTL 0x80e01, fault status 0 (addr 000000000)
+Nov 13 13:53:28 atrium-r9700 kernel: atrium_gpu_amd_pci0: gmc: GFXHUB (GC 12.0) flush of context 11 timed out: INV_REQ 0xf80800, INV_ACK 0
+Nov 13 13:53:28 atrium-r9700 kernel: atrium_gpu_amd_pci0: gmc: GFXHUB (GC 12.0) after the timeout: CONTEXT0_CNTL 0x3fffc01, PT base 005800001, L1_TLB 0x1859, L2_CNTL 0x80e01, fault status 0 (addr 000000000)
+Nov 13 13:53:28 atrium-r9700 kernel: atrium_gpu_amd_pci0: gmc: GFXHUB (GC 12.0) flush of context 12 timed out: INV_REQ 0xf81000, INV_ACK 0
+Nov 13 13:53:28 atrium-r9700 kernel: atrium_gpu_amd_pci0: gmc: GFXHUB (GC 12.0) after the timeout: CONTEXT0_CNTL 0x3fffc01, PT base 005800001, L1_TLB 0x1859, L2_CNTL 0x80e01, fault status 0 (addr 000000000)
+Nov 13 13:53:29 atrium-r9700 kernel: atrium_gpu_amd_pci0: gmc: GFXHUB (GC 12.0) flush of context 13 timed out: INV_REQ 0xf82000, INV_ACK 0
+Nov 13 13:53:29 atrium-r9700 kernel: atrium_gpu_amd_pci0: gmc: GFXHUB (GC 12.0) after the timeout: CONTEXT0_CNTL 0x3fffc01, PT base 005800001, L1_TLB 0x1859, L2_CNTL 0x80e01, fault status 0 (addr 000000000)
+Nov 13 13:53:29 atrium-r9700 kernel: atrium_gpu_amd_pci0: gmc: GFXHUB (GC 12.0) flush of context 14 timed out: INV_REQ 0xf84000, INV_ACK 0
+Nov 13 13:53:29 atrium-r9700 kernel: atrium_gpu_amd_pci0: gmc: GFXHUB (GC 12.0) after the timeout: CONTEXT0_CNTL 0x3fffc01, PT base 005800001, L1_TLB 0x1859, L2_CNTL 0x80e01, fault status 0 (addr 000000000)
+Nov 13 13:53:29 atrium-r9700 kernel: atrium_gpu_amd_pci0: gmc: GFXHUB (GC 12.0) flush of context 15 timed out: INV_REQ 0xf88000, INV_ACK 0
+Nov 13 13:53:29 atrium-r9700 kernel: atrium_gpu_amd_pci0: gmc: GFXHUB (GC 12.0) after the timeout: CONTEXT0_CNTL 0x3fffc01, PT base 005800001, L1_TLB 0x1859, L2_CNTL 0x80e01, fault status 0 (addr 000000000)
+Nov 13 13:53:29 atrium-r9700 kernel: atrium_gpu_amd_pci0: si: uq3 closed: 1 submits; EOP IVs routed 37, unrouted 1, MES own 164, MES preemption 24; retired by IV 33, by poll 0; queues lost to faults 3, hangs 3; preempted for frees 24 (failed 0)
+Nov 13 13:53:29 atrium-r9700 kernel: atrium_gpu_amd_pci0: si: unrouted EOP src_data[0]: 0x18000000 x1, 0 x0, 0 x0, 0 x0
+Nov 13 13:53:29 atrium-r9700 kernel: atrium_gpu_amd_pci0: gmc: GFXHUB (GC 12.0) flush of context 4 timed out: INV_REQ 0xf80010, INV_ACK 0
+Nov 13 13:53:29 atrium-r9700 kernel: atrium_gpu_amd_pci0: gmc: GFXHUB (GC 12.0) after the timeout: CONTEXT0_CNTL 0x3fffc01, PT base 005800001, L1_TLB 0x1859, L2_CNTL 0x80e01, fault status 0 (addr 000000000)
+Nov 13 13:53:29 atrium-r9700 kernel: atrium_gpu_amd_pci0: si: VMID 4 unbind failed (60)
+Nov 13 13:53:29 atrium-r9700 kernel: atrium_gpu_amd_pci0: gmc: GFXHUB (GC 12.0) flush of context 4 timed out: INV_REQ 0xf80010, INV_ACK 0
+Nov 13 13:53:29 atrium-r9700 kernel: atrium_gpu_amd_pci0: gmc: GFXHUB (GC 12.0) after the timeout: CONTEXT0_CNTL 0x3fffc01, PT base 005800001, L1_TLB 0x1859, L2_CNTL 0x80e01, fault status 0 (addr 000000000)
+Nov 13 13:53:29 atrium-r9700 kernel: atrium_gpu_amd_pci0: gmc: GFXHUB (GC 12.0) flush of context 4 timed out: INV_REQ 0xf80010, INV_ACK 0
+Nov 13 13:53:29 atrium-r9700 kernel: atrium_gpu_amd_pci0: gmc: GFXHUB (GC 12.0) after the timeout: CONTEXT0_CNTL 0x3fffc01, PT base 005800001, L1_TLB 0x1859, L2_CNTL 0x80e01, fault status 0 (addr 000000000)
+Nov 13 13:53:29 atrium-r9700 kernel: atrium_gpu_amd_pci0: gmc: GFXHUB (GC 12.0) flush of context 1 timed out: INV_REQ 0xf80002, INV_ACK 0
+Nov 13 13:53:29 atrium-r9700 kernel: atrium_gpu_amd_pci0: gmc: GFXHUB (GC 12.0) after the timeout: CONTEXT0_CNTL 0x3fffc01, PT base 005800001, L1_TLB 0x1859, L2_CNTL 0x80e01, fault status 0 (addr 000000000)
+Nov 13 13:53:29 atrium-r9700 kernel: atrium_gpu_amd_pci0: gmc: GFXHUB (GC 12.0) flush of context 8 timed out: INV_REQ 0xf80100, INV_ACK 0
+Nov 13 13:53:29 atrium-r9700 kernel: atrium_gpu_amd_pci0: gmc: GFXHUB (GC 12.0) after the timeout: CONTEXT0_CNTL 0x3fffc01, PT base 005800001, L1_TLB 0x1859, L2_CNTL 0x80e01, fault status 0 (addr 000000000)
+Nov 13 13:53:29 atrium-r9700 kernel: atrium_gpu_amd_pci0: gmc: GFXHUB (GC 12.0) flush of context 9 timed out: INV_REQ 0xf80200, INV_ACK 0
+Nov 13 13:53:29 atrium-r9700 kernel: atrium_gpu_amd_pci0: gmc: GFXHUB (GC 12.0) after the timeout: CONTEXT0_CNTL 0x3fffc01, PT base 005800001, L1_TLB 0x1859, L2_CNTL 0x80e01, fault status 0 (addr 000000000)
+Nov 13 13:53:30 atrium-r9700 kernel: atrium_gpu_amd_pci0: gmc: GFXHUB (GC 12.0) flush of context 10 timed out: INV_REQ 0xf80400, INV_ACK 0
+Nov 13 13:53:30 atrium-r9700 kernel: atrium_gpu_amd_pci0: gmc: GFXHUB (GC 12.0) after the timeout: CONTEXT0_CNTL 0x3fffc01, PT base 005800001, L1_TLB 0x1859, L2_CNTL 0x80e01, fault status 0 (addr 000000000)
+Nov 13 13:53:30 atrium-r9700 kernel: atrium_gpu_amd_pci0: gmc: GFXHUB (GC 12.0) flush of context 11 timed out: INV_REQ 0xf80800, INV_ACK 0
+Nov 13 13:53:30 atrium-r9700 kernel: atrium_gpu_amd_pci0: gmc: GFXHUB (GC 12.0) after the timeout: CONTEXT0_CNTL 0x3fffc01, PT base 005800001, L1_TLB 0x1859, L2_CNTL 0x80e01, fault status 0 (addr 000000000)
+Nov 13 13:53:30 atrium-r9700 kernel: atrium_gpu_amd_pci0: gmc: GFXHUB (GC 12.0) flush of context 12 timed out: INV_REQ 0xf81000, INV_ACK 0
+Nov 13 13:53:30 atrium-r9700 kernel: atrium_gpu_amd_pci0: gmc: GFXHUB (GC 12.0) after the timeout: CONTEXT0_CNTL 0x3fffc01, PT base 005800001, L1_TLB 0x1859, L2_CNTL 0x80e01, fault status 0 (addr 000000000)
+Nov 13 13:53:30 atrium-r9700 kernel: atrium_gpu_amd_pci0: gmc: GFXHUB (GC 12.0) flush of context 13 timed out: INV_REQ 0xf82000, INV_ACK 0
+Nov 13 13:53:30 atrium-r9700 kernel: atrium_gpu_amd_pci0: gmc: GFXHUB (GC 12.0) after the timeout: CONTEXT0_CNTL 0x3fffc01, PT base 005800001, L1_TLB 0x1859, L2_CNTL 0x80e01, fault status 0 (addr 000000000)
+Nov 13 13:53:30 atrium-r9700 kernel: atrium_gpu_amd_pci0: gmc: GFXHUB (GC 12.0) flush of context 14 timed out: INV_REQ 0xf84000, INV_ACK 0
+Nov 13 13:53:30 atrium-r9700 kernel: atrium_gpu_amd_pci0: gmc: GFXHUB (GC 12.0) after the timeout: CONTEXT0_CNTL 0x3fffc01, PT base 005800001, L1_TLB 0x1859, L2_CNTL 0x80e01, fault status 0 (addr 000000000)
+Nov 13 13:53:30 atrium-r9700 kernel: atrium_gpu_amd_pci0: gmc: GFXHUB (GC 12.0) flush of context 15 timed out: INV_REQ 0xf88000, INV_ACK 0
+Nov 13 13:53:30 atrium-r9700 kernel: atrium_gpu_amd_pci0: gmc: GFXHUB (GC 12.0) after the timeout: CONTEXT0_CNTL 0x3fffc01, PT base 005800001, L1_TLB 0x1859, L2_CNTL 0x80e01, fault status 0 (addr 000000000)
+Nov 13 13:53:30 atrium-r9700 kernel: atrium_gpu_amd_pci0: mes: pipe 0 SUSPEND (user gang): ok in 240 us (status 0x1)
+Nov 13 13:53:30 atrium-r9700 kernel: atrium_gpu_amd_pci0: mes: pipe 0 RESUME (user gang): ok in 110 us (status 0x1)
+Nov 13 13:53:30 atrium-r9700 kernel: atrium_gpu_amd_pci0: uq0: preempted for a free: suspend fence landed after 0 us, resume ok
+Nov 13 13:53:30 atrium-r9700 kernel: atrium_gpu_amd_pci0: smu: TransferTableSmu2Dram      arg 0x00000005: resp 0x1
+Nov 13 13:53:30 atrium-r9700 kernel: atrium_gpu_amd_pci0: smu: telemetry #4554: edge 35 C, hotspot 43 C, mem 34 C, VR 35 C; power 61 W of 300 W limit, board 61 W; fan 893 rpm (20%); gfx 3417 MHz, mem 9 MHz, gfx busy 100%; throttle 0x1 (ids 0x2)
+Nov 13 13:53:30 atrium-r9700 kernel: atrium_gpu_amd_pci0: gmc: GFXHUB (GC 12.0) flush of context 1 timed out: INV_REQ 0xf80002, INV_ACK 0
+Nov 13 13:53:30 atrium-r9700 kernel: atrium_gpu_amd_pci0: gmc: GFXHUB (GC 12.0) after the timeout: CONTEXT0_CNTL 0x3fffc01, PT base 005800001, L1_TLB 0x1859, L2_CNTL 0x80e01, fault status 0 (addr 000000000)
+Nov 13 13:53:30 atrium-r9700 kernel: atrium_gpu_amd_pci0: gmc: GFXHUB (GC 12.0) flush of context 8 timed out: INV_REQ 0xf80100, INV_ACK 0
+Nov 13 13:53:30 atrium-r9700 kernel: atrium_gpu_amd_pci0: gmc: GFXHUB (GC 12.0) after the timeout: CONTEXT0_CNTL 0x3fffc01, PT base 005800001, L1_TLB 0x1859, L2_CNTL 0x80e01, fault status 0 (addr 000000000)
+Nov 13 13:53:31 atrium-r9700 kernel: atrium_gpu_amd_pci0: gmc: GFXHUB (GC 12.0) flush of context 9 timed out: INV_REQ 0xf80200, INV_ACK 0
+Nov 13 13:53:31 atrium-r9700 kernel: atrium_gpu_amd_pci0: gmc: GFXHUB (GC 12.0) after the timeout: CONTEXT0_CNTL 0x3fffc01, PT base 005800001, L1_TLB 0x1859, L2_CNTL 0x80e01, fault status 0 (addr 000000000)
+Nov 13 13:53:31 atrium-r9700 kernel: atrium_gpu_amd_pci0: gmc: GFXHUB (GC 12.0) flush of context 10 timed out: INV_REQ 0xf80400, INV_ACK 0
+Nov 13 13:53:31 atrium-r9700 kernel: atrium_gpu_amd_pci0: gmc: GFXHUB (GC 12.0) after the timeout: CONTEXT0_CNTL 0x3fffc01, PT base 005800001, L1_TLB 0x1859, L2_CNTL 0x80e01, fault status 0 (addr 000000000)
+Nov 13 13:53:31 atrium-r9700 kernel: atrium_gpu_amd_pci0: gmc: GFXHUB (GC 12.0) flush of context 11 timed out: INV_REQ 0xf80800, INV_ACK 0
+Nov 13 13:53:31 atrium-r9700 kernel: atrium_gpu_amd_pci0: gmc: GFXHUB (GC 12.0) after the timeout: CONTEXT0_CNTL 0x3fffc01, PT base 005800001, L1_TLB 0x1859, L2_CNTL 0x80e01, fault status 0 (addr 000000000)
+Nov 13 13:53:31 atrium-r9700 kernel: atrium_gpu_amd_pci0: gmc: GFXHUB (GC 12.0) flush of context 12 timed out: INV_REQ 0xf81000, INV_ACK 0
+Nov 13 13:53:31 atrium-r9700 kernel: atrium_gpu_amd_pci0: gmc: GFXHUB (GC 12.0) after the timeout: CONTEXT0_CNTL 0x3fffc01, PT base 005800001, L1_TLB 0x1859, L2_CNTL 0x80e01, fault status 0 (addr 000000000)
+Nov 13 13:53:31 atrium-r9700 kernel: atrium_gpu_amd_pci0: gmc: GFXHUB (GC 12.0) flush of context 13 timed out: INV_REQ 0xf82000, INV_ACK 0
+Nov 13 13:53:31 atrium-r9700 kernel: atrium_gpu_amd_pci0: gmc: GFXHUB (GC 12.0) after the timeout: CONTEXT0_CNTL 0x3fffc01, PT base 005800001, L1_TLB 0x1859, L2_CNTL 0x80e01, fault status 0 (addr 000000000)
+Nov 13 13:53:31 atrium-r9700 kernel: atrium_gpu_amd_pci0: gmc: GFXHUB (GC 12.0) flush of context 14 timed out: INV_REQ 0xf84000, INV_ACK 0
+Nov 13 13:53:31 atrium-r9700 kernel: atrium_gpu_amd_pci0: gmc: GFXHUB (GC 12.0) after the timeout: CONTEXT0_CNTL 0x3fffc01, PT base 005800001, L1_TLB 0x1859, L2_CNTL 0x80e01, fault status 0 (addr 000000000)
+Nov 13 13:53:31 atrium-r9700 kernel: atrium_gpu_amd_pci0: gmc: GFXHUB (GC 12.0) flush of context 15 timed out: INV_REQ 0xf88000, INV_ACK 0
+Nov 13 13:53:31 atrium-r9700 kernel: atrium_gpu_amd_pci0: gmc: GFXHUB (GC 12.0) after the timeout: CONTEXT0_CNTL 0x3fffc01, PT base 005800001, L1_TLB 0x1859, L2_CNTL 0x80e01, fault status 0 (addr 000000000)
+Nov 13 13:53:31 atrium-r9700 kernel: atrium_gpu_amd_pci0: mes: pipe 0 SUSPEND (user gang): ok in 170 us (status 0x1)
+Nov 13 13:53:31 atrium-r9700 kernel: atrium_gpu_amd_pci0: mes: pipe 0 RESUME (user gang): ok in 100 us (status 0x1)
+Nov 13 13:53:31 atrium-r9700 kernel: atrium_gpu_amd_pci0: uq0: preempted for a free: suspend fence landed after 0 us, resume ok
+Nov 13 13:53:31 atrium-r9700 kernel: atrium_gpu_amd_pci0: gmc: GFXHUB (GC 12.0) flush of context 1 timed out: INV_REQ 0xf80002, INV_ACK 0
+Nov 13 13:53:31 atrium-r9700 kernel: atrium_gpu_amd_pci0: gmc: GFXHUB (GC 12.0) after the timeout: CONTEXT0_CNTL 0x3fffc01, PT base 005800001, L1_TLB 0x1859, L2_CNTL 0x80e01, fault status 0 (addr 000000000)
+Nov 13 13:53:31 atrium-r9700 kernel: atrium_gpu_amd_pci0: gmc: GFXHUB (GC 12.0) flush of context 8 timed out: INV_REQ 0xf80100, INV_ACK 0
+Nov 13 13:53:31 atrium-r9700 kernel: atrium_gpu_amd_pci0: gmc: GFXHUB (GC 12.0) after the timeout: CONTEXT0_CNTL 0x3fffc01, PT base 005800001, L1_TLB 0x1859, L2_CNTL 0x80e01, fault status 0 (addr 000000000)
+Nov 13 13:53:31 atrium-r9700 kernel: atrium_gpu_amd_pci0: gmc: GFXHUB (GC 12.0) flush of context 9 timed out: INV_REQ 0xf80200, INV_ACK 0
+Nov 13 13:53:31 atrium-r9700 kernel: atrium_gpu_amd_pci0: gmc: GFXHUB (GC 12.0) after the timeout: CONTEXT0_CNTL 0x3fffc01, PT base 005800001, L1_TLB 0x1859, L2_CNTL 0x80e01, fault status 0 (addr 000000000)
+Nov 13 13:53:32 atrium-r9700 kernel: atrium_gpu_amd_pci0: gmc: GFXHUB (GC 12.0) flush of context 10 timed out: INV_REQ 0xf80400, INV_ACK 0
+Nov 13 13:53:32 atrium-r9700 kernel: atrium_gpu_amd_pci0: gmc: GFXHUB (GC 12.0) after the timeout: CONTEXT0_CNTL 0x3fffc01, PT base 005800001, L1_TLB 0x1859, L2_CNTL 0x80e01, fault status 0 (addr 000000000)
+Nov 13 13:53:32 atrium-r9700 kernel: atrium_gpu_amd_pci0: gmc: GFXHUB (GC 12.0) flush of context 11 timed out: INV_REQ 0xf80800, INV_ACK 0
+Nov 13 13:53:32 atrium-r9700 kernel: atrium_gpu_amd_pci0: gmc: GFXHUB (GC 12.0) after the timeout: CONTEXT0_CNTL 0x3fffc01, PT base 005800001, L1_TLB 0x1859, L2_CNTL 0x80e01, fault status 0 (addr 000000000)
+Nov 13 13:53:32 atrium-r9700 kernel: atrium_gpu_amd_pci0: gmc: GFXHUB (GC 12.0) flush of context 12 timed out: INV_REQ 0xf81000, INV_ACK 0
+Nov 13 13:53:32 atrium-r9700 kernel: atrium_gpu_amd_pci0: gmc: GFXHUB (GC 12.0) after the timeout: CONTEXT0_CNTL 0x3fffc01, PT base 005800001, L1_TLB 0x1859, L2_CNTL 0x80e01, fault status 0 (addr 000000000)
+Nov 13 13:53:32 atrium-r9700 kernel: atrium_gpu_amd_pci0: gmc: GFXHUB (GC 12.0) flush of context 13 timed out: INV_REQ 0xf82000, INV_ACK 0
+Nov 13 13:53:32 atrium-r9700 kernel: atrium_gpu_amd_pci0: gmc: GFXHUB (GC 12.0) after the timeout: CONTEXT0_CNTL 0x3fffc01, PT base 005800001, L1_TLB 0x1859, L2_CNTL 0x80e01, fault status 0 (addr 000000000)
+Nov 13 13:53:32 atrium-r9700 kernel: atrium_gpu_amd_pci0: gmc: GFXHUB (GC 12.0) flush of context 14 timed out: INV_REQ 0xf84000, INV_ACK 0
+Nov 13 13:53:32 atrium-r9700 kernel: atrium_gpu_amd_pci0: gmc: GFXHUB (GC 12.0) after the timeout: CONTEXT0_CNTL 0x3fffc01, PT base 005800001, L1_TLB 0x1859, L2_CNTL 0x80e01, fault status 0 (addr 000000000)
+Nov 13 13:53:32 atrium-r9700 kernel: atrium_gpu_amd_pci0: gmc: GFXHUB (GC 12.0) flush of context 15 timed out: INV_REQ 0xf88000, INV_ACK 0
+Nov 13 13:53:32 atrium-r9700 kernel: atrium_gpu_amd_pci0: gmc: GFXHUB (GC 12.0) after the timeout: CONTEXT0_CNTL 0x3fffc01, PT base 005800001, L1_TLB 0x1859, L2_CNTL 0x80e01, fault status 0 (addr 000000000)
+Nov 13 13:53:32 atrium-r9700 kernel: atrium_gpu_amd_pci0: mes: pipe 0 SUSPEND (user gang): ok in 160 us (status 0x1)
+Nov 13 13:53:32 atrium-r9700 kernel: atrium_gpu_amd_pci0: mes: pipe 0 RESUME (user gang): ok in 110 us (status 0x1)
+Nov 13 13:53:32 atrium-r9700 kernel: atrium_gpu_amd_pci0: uq0: preempted for a free: suspend fence landed after 0 us, resume ok
+Nov 13 13:53:32 atrium-r9700 kernel: atrium_gpu_amd_pci0: mes: pipe 0 REMOVE_QUEUE (user compute): ok in 200 us (status 0x1)
+Nov 13 13:53:32 atrium-r9700 kernel: atrium_gpu_amd_pci0: uq0: removed (seq 22, fence 22)
+Nov 13 13:53:32 atrium-r9700 kernel: atrium_gpu_amd_pci0: gmc: GFXHUB (GC 12.0) flush of context 1 timed out: INV_REQ 0xf80002, INV_ACK 0
+Nov 13 13:53:32 atrium-r9700 kernel: atrium_gpu_amd_pci0: gmc: GFXHUB (GC 12.0) after the timeout: CONTEXT0_CNTL 0x3fffc01, PT base 005800001, L1_TLB 0x1859, L2_CNTL 0x80e01, fault status 0 (addr 000000000)
+Nov 13 13:53:32 atrium-r9700 kernel: atrium_gpu_amd_pci0: gmc: GFXHUB (GC 12.0) flush of context 8 timed out: INV_REQ 0xf80100, INV_ACK 0
+Nov 13 13:53:32 atrium-r9700 kernel: atrium_gpu_amd_pci0: gmc: GFXHUB (GC 12.0) after the timeout: CONTEXT0_CNTL 0x3fffc01, PT base 005800001, L1_TLB 0x1859, L2_CNTL 0x80e01, fault status 0 (addr 000000000)
+Nov 13 13:53:32 atrium-r9700 kernel: atrium_gpu_amd_pci0: gmc: GFXHUB (GC 12.0) flush of context 9 timed out: INV_REQ 0xf80200, INV_ACK 0
+Nov 13 13:53:32 atrium-r9700 kernel: atrium_gpu_amd_pci0: gmc: GFXHUB (GC 12.0) after the timeout: CONTEXT0_CNTL 0x3fffc01, PT base 005800001, L1_TLB 0x1859, L2_CNTL 0x80e01, fault status 0 (addr 000000000)
+Nov 13 13:53:32 atrium-r9700 kernel: atrium_gpu_amd_pci0: gmc: GFXHUB (GC 12.0) flush of context 10 timed out: INV_REQ 0xf80400, INV_ACK 0
+Nov 13 13:53:32 atrium-r9700 kernel: atrium_gpu_amd_pci0: gmc: GFXHUB (GC 12.0) after the timeout: CONTEXT0_CNTL 0x3fffc01, PT base 005800001, L1_TLB 0x1859, L2_CNTL 0x80e01, fault status 0 (addr 000000000)
+Nov 13 13:53:32 atrium-r9700 kernel: atrium_gpu_amd_pci0: gmc: GFXHUB (GC 12.0) flush of context 11 timed out: INV_REQ 0xf80800, INV_ACK 0
+Nov 13 13:53:32 atrium-r9700 kernel: atrium_gpu_amd_pci0: gmc: GFXHUB (GC 12.0) after the timeout: CONTEXT0_CNTL 0x3fffc01, PT base 005800001, L1_TLB 0x1859, L2_CNTL 0x80e01, fault status 0 (addr 000000000)
+Nov 13 13:53:33 atrium-r9700 kernel: atrium_gpu_amd_pci0: gmc: GFXHUB (GC 12.0) flush of context 12 timed out: INV_REQ 0xf81000, INV_ACK 0
+Nov 13 13:53:33 atrium-r9700 kernel: atrium_gpu_amd_pci0: gmc: GFXHUB (GC 12.0) after the timeout: CONTEXT0_CNTL 0x3fffc01, PT base 005800001, L1_TLB 0x1859, L2_CNTL 0x80e01, fault status 0 (addr 000000000)
+Nov 13 13:53:33 atrium-r9700 kernel: atrium_gpu_amd_pci0: gmc: GFXHUB (GC 12.0) flush of context 13 timed out: INV_REQ 0xf82000, INV_ACK 0
+Nov 13 13:53:33 atrium-r9700 kernel: atrium_gpu_amd_pci0: gmc: GFXHUB (GC 12.0) after the timeout: CONTEXT0_CNTL 0x3fffc01, PT base 005800001, L1_TLB 0x1859, L2_CNTL 0x80e01, fault status 0 (addr 000000000)
+Nov 13 13:53:33 atrium-r9700 kernel: atrium_gpu_amd_pci0: gmc: GFXHUB (GC 12.0) flush of context 14 timed out: INV_REQ 0xf84000, INV_ACK 0
+Nov 13 13:53:33 atrium-r9700 kernel: atrium_gpu_amd_pci0: gmc: GFXHUB (GC 12.0) after the timeout: CONTEXT0_CNTL 0x3fffc01, PT base 005800001, L1_TLB 0x1859, L2_CNTL 0x80e01, fault status 0 (addr 000000000)
+Nov 13 13:53:33 atrium-r9700 kernel: atrium_gpu_amd_pci0: gmc: GFXHUB (GC 12.0) flush of context 15 timed out: INV_REQ 0xf88000, INV_ACK 0
+Nov 13 13:53:33 atrium-r9700 kernel: atrium_gpu_amd_pci0: gmc: GFXHUB (GC 12.0) after the timeout: CONTEXT0_CNTL 0x3fffc01, PT base 005800001, L1_TLB 0x1859, L2_CNTL 0x80e01, fault status 0 (addr 000000000)
+Nov 13 13:53:33 atrium-r9700 kernel: atrium_gpu_amd_pci0: si: uq0 closed: 22 submits; EOP IVs routed 37, unrouted 1, MES own 178, MES preemption 27; retired by IV 33, by poll 0; queues lost to faults 3, hangs 3; preempted for frees 27 (failed 0)
+Nov 13 13:53:33 atrium-r9700 kernel: atrium_gpu_amd_pci0: si: unrouted EOP src_data[0]: 0x18000000 x1, 0 x0, 0 x0, 0 x0
+Nov 13 13:53:33 atrium-r9700 kernel: atrium_gpu_amd_pci0: gmc: GFXHUB (GC 12.0) flush of context 1 timed out: INV_REQ 0xf80002, INV_ACK 0
+Nov 13 13:53:33 atrium-r9700 kernel: atrium_gpu_amd_pci0: gmc: GFXHUB (GC 12.0) after the timeout: CONTEXT0_CNTL 0x3fffc01, PT base 005800001, L1_TLB 0x1859, L2_CNTL 0x80e01, fault status 0 (addr 000000000)
+Nov 13 13:53:33 atrium-r9700 kernel: atrium_gpu_amd_pci0: si: VMID 1 unbind failed (60)
+Nov 13 13:53:33 atrium-r9700 kernel: atrium_gpu_amd_pci0: gmc: GFXHUB (GC 12.0) flush of context 2 timed out: INV_REQ 0xf80004, INV_ACK 0
+Nov 13 13:53:33 atrium-r9700 kernel: atrium_gpu_amd_pci0: gmc: GFXHUB (GC 12.0) after the timeout: CONTEXT0_CNTL 0x3fffc01, PT base 005800001, L1_TLB 0x1859, L2_CNTL 0x80e01, fault status 0 (addr 000000000)
+Nov 13 13:53:33 atrium-r9700 kernel: atrium_gpu_amd_pci0: gmc: GFXHUB (GC 12.0) flush of context 8 timed out: INV_REQ 0xf80100, INV_ACK 0
+Nov 13 13:53:33 atrium-r9700 kernel: atrium_gpu_amd_pci0: gmc: GFXHUB (GC 12.0) after the timeout: CONTEXT0_CNTL 0x3fffc01, PT base 005800001, L1_TLB 0x1859, L2_CNTL 0x80e01, fault status 0 (addr 000000000)
+Nov 13 13:53:33 atrium-r9700 kernel: atrium_gpu_amd_pci0: gmc: GFXHUB (GC 12.0) flush of context 9 timed out: INV_REQ 0xf80200, INV_ACK 0
+Nov 13 13:53:33 atrium-r9700 kernel: atrium_gpu_amd_pci0: gmc: GFXHUB (GC 12.0) after the timeout: CONTEXT0_CNTL 0x3fffc01, PT base 005800001, L1_TLB 0x1859, L2_CNTL 0x80e01, fault status 0 (addr 000000000)
+Nov 13 13:53:33 atrium-r9700 kernel: atrium_gpu_amd_pci0: gmc: GFXHUB (GC 12.0) flush of context 10 timed out: INV_REQ 0xf80400, INV_ACK 0
+Nov 13 13:53:33 atrium-r9700 kernel: atrium_gpu_amd_pci0: gmc: GFXHUB (GC 12.0) after the timeout: CONTEXT0_CNTL 0x3fffc01, PT base 005800001, L1_TLB 0x1859, L2_CNTL 0x80e01, fault status 0 (addr 000000000)
+Nov 13 13:53:34 atrium-r9700 kernel: atrium_gpu_amd_pci0: gmc: GFXHUB (GC 12.0) flush of context 11 timed out: INV_REQ 0xf80800, INV_ACK 0
+Nov 13 13:53:34 atrium-r9700 kernel: atrium_gpu_amd_pci0: gmc: GFXHUB (GC 12.0) after the timeout: CONTEXT0_CNTL 0x3fffc01, PT base 005800001, L1_TLB 0x1859, L2_CNTL 0x80e01, fault status 0 (addr 000000000)
+Nov 13 13:53:34 atrium-r9700 kernel: atrium_gpu_amd_pci0: gmc: GFXHUB (GC 12.0) flush of context 12 timed out: INV_REQ 0xf81000, INV_ACK 0
+Nov 13 13:53:34 atrium-r9700 kernel: atrium_gpu_amd_pci0: gmc: GFXHUB (GC 12.0) after the timeout: CONTEXT0_CNTL 0x3fffc01, PT base 005800001, L1_TLB 0x1859, L2_CNTL 0x80e01, fault status 0 (addr 000000000)
+Nov 13 13:53:34 atrium-r9700 kernel: atrium_gpu_amd_pci0: gmc: GFXHUB (GC 12.0) flush of context 13 timed out: INV_REQ 0xf82000, INV_ACK 0
+Nov 13 13:53:34 atrium-r9700 kernel: atrium_gpu_amd_pci0: gmc: GFXHUB (GC 12.0) after the timeout: CONTEXT0_CNTL 0x3fffc01, PT base 005800001, L1_TLB 0x1859, L2_CNTL 0x80e01, fault status 0 (addr 000000000)
+Nov 13 13:53:34 atrium-r9700 kernel: atrium_gpu_amd_pci0: gmc: GFXHUB (GC 12.0) flush of context 14 timed out: INV_REQ 0xf84000, INV_ACK 0
+Nov 13 13:53:34 atrium-r9700 kernel: atrium_gpu_amd_pci0: gmc: GFXHUB (GC 12.0) after the timeout: CONTEXT0_CNTL 0x3fffc01, PT base 005800001, L1_TLB 0x1859, L2_CNTL 0x80e01, fault status 0 (addr 000000000)
+Nov 13 13:53:34 atrium-r9700 kernel: atrium_gpu_amd_pci0: gmc: GFXHUB (GC 12.0) flush of context 15 timed out: INV_REQ 0xf88000, INV_ACK 0
+Nov 13 13:53:34 atrium-r9700 kernel: atrium_gpu_amd_pci0: gmc: GFXHUB (GC 12.0) after the timeout: CONTEXT0_CNTL 0x3fffc01, PT base 005800001, L1_TLB 0x1859, L2_CNTL 0x80e01, fault status 0 (addr 000000000)
+Nov 13 13:53:34 atrium-r9700 kernel: atrium_gpu_amd_pci0: mes: pipe 0 SUSPEND (user gang): ok in 250 us (status 0x1)
+Nov 13 13:53:34 atrium-r9700 kernel: atrium_gpu_amd_pci0: mes: pipe 0 RESUME (user gang): ok in 100 us (status 0x1)
+Nov 13 13:53:34 atrium-r9700 kernel: atrium_gpu_amd_pci0: uq1: preempted for a free: suspend fence landed after 0 us, resume ok
+Nov 13 13:53:34 atrium-r9700 kernel: atrium_gpu_amd_pci0: gmc: GFXHUB (GC 12.0) flush of context 2 timed out: INV_REQ 0xf80004, INV_ACK 0
+Nov 13 13:53:34 atrium-r9700 kernel: atrium_gpu_amd_pci0: gmc: GFXHUB (GC 12.0) after the timeout: CONTEXT0_CNTL 0x3fffc01, PT base 005800001, L1_TLB 0x1859, L2_CNTL 0x80e01, fault status 0 (addr 000000000)
+Nov 13 13:53:34 atrium-r9700 kernel: atrium_gpu_amd_pci0: gmc: GFXHUB (GC 12.0) flush of context 8 timed out: INV_REQ 0xf80100, INV_ACK 0
+Nov 13 13:53:34 atrium-r9700 kernel: atrium_gpu_amd_pci0: gmc: GFXHUB (GC 12.0) after the timeout: CONTEXT0_CNTL 0x3fffc01, PT base 005800001, L1_TLB 0x1859, L2_CNTL 0x80e01, fault status 0 (addr 000000000)
+Nov 13 13:53:34 atrium-r9700 kernel: atrium_gpu_amd_pci0: gmc: GFXHUB (GC 12.0) flush of context 9 timed out: INV_REQ 0xf80200, INV_ACK 0
+Nov 13 13:53:34 atrium-r9700 kernel: atrium_gpu_amd_pci0: gmc: GFXHUB (GC 12.0) after the timeout: CONTEXT0_CNTL 0x3fffc01, PT base 005800001, L1_TLB 0x1859, L2_CNTL 0x80e01, fault status 0 (addr 000000000)
+Nov 13 13:53:35 atrium-r9700 kernel: atrium_gpu_amd_pci0: gmc: GFXHUB (GC 12.0) flush of context 10 timed out: INV_REQ 0xf80400, INV_ACK 0
+Nov 13 13:53:35 atrium-r9700 kernel: atrium_gpu_amd_pci0: gmc: GFXHUB (GC 12.0) after the timeout: CONTEXT0_CNTL 0x3fffc01, PT base 005800001, L1_TLB 0x1859, L2_CNTL 0x80e01, fault status 0 (addr 000000000)
+Nov 13 13:53:35 atrium-r9700 kernel: atrium_gpu_amd_pci0: gmc: GFXHUB (GC 12.0) flush of context 11 timed out: INV_REQ 0xf80800, INV_ACK 0
+Nov 13 13:53:35 atrium-r9700 kernel: atrium_gpu_amd_pci0: gmc: GFXHUB (GC 12.0) after the timeout: CONTEXT0_CNTL 0x3fffc01, PT base 005800001, L1_TLB 0x1859, L2_CNTL 0x80e01, fault status 0 (addr 000000000)
+Nov 13 13:53:35 atrium-r9700 kernel: atrium_gpu_amd_pci0: gmc: GFXHUB (GC 12.0) flush of context 12 timed out: INV_REQ 0xf81000, INV_ACK 0
+Nov 13 13:53:35 atrium-r9700 kernel: atrium_gpu_amd_pci0: gmc: GFXHUB (GC 12.0) after the timeout: CONTEXT0_CNTL 0x3fffc01, PT base 005800001, L1_TLB 0x1859, L2_CNTL 0x80e01, fault status 0 (addr 000000000)
+Nov 13 13:53:35 atrium-r9700 kernel: atrium_gpu_amd_pci0: gmc: GFXHUB (GC 12.0) flush of context 13 timed out: INV_REQ 0xf82000, INV_ACK 0
+Nov 13 13:53:35 atrium-r9700 kernel: atrium_gpu_amd_pci0: gmc: GFXHUB (GC 12.0) after the timeout: CONTEXT0_CNTL 0x3fffc01, PT base 005800001, L1_TLB 0x1859, L2_CNTL 0x80e01, fault status 0 (addr 000000000)
+Nov 13 13:53:35 atrium-r9700 kernel: atrium_gpu_amd_pci0: gmc: GFXHUB (GC 12.0) flush of context 14 timed out: INV_REQ 0xf84000, INV_ACK 0
+Nov 13 13:53:35 atrium-r9700 kernel: atrium_gpu_amd_pci0: gmc: GFXHUB (GC 12.0) after the timeout: CONTEXT0_CNTL 0x3fffc01, PT base 005800001, L1_TLB 0x1859, L2_CNTL 0x80e01, fault status 0 (addr 000000000)
+Nov 13 13:53:35 atrium-r9700 kernel: atrium_gpu_amd_pci0: gmc: GFXHUB (GC 12.0) flush of context 15 timed out: INV_REQ 0xf88000, INV_ACK 0
+Nov 13 13:53:35 atrium-r9700 kernel: atrium_gpu_amd_pci0: gmc: GFXHUB (GC 12.0) after the timeout: CONTEXT0_CNTL 0x3fffc01, PT base 005800001, L1_TLB 0x1859, L2_CNTL 0x80e01, fault status 0 (addr 000000000)
+Nov 13 13:53:35 atrium-r9700 kernel: atrium_gpu_amd_pci0: mes: pipe 0 SUSPEND (user gang): ok in 170 us (status 0x1)
+Nov 13 13:53:35 atrium-r9700 kernel: atrium_gpu_amd_pci0: mes: pipe 0 RESUME (user gang): ok in 100 us (status 0x1)
+Nov 13 13:53:35 atrium-r9700 kernel: atrium_gpu_amd_pci0: uq1: preempted for a free: suspend fence landed after 0 us, resume ok
+Nov 13 13:53:35 atrium-r9700 kernel: atrium_gpu_amd_pci0: gmc: GFXHUB (GC 12.0) flush of context 2 timed out: INV_REQ 0xf80004, INV_ACK 0
+Nov 13 13:53:35 atrium-r9700 kernel: atrium_gpu_amd_pci0: gmc: GFXHUB (GC 12.0) after the timeout: CONTEXT0_CNTL 0x3fffc01, PT base 005800001, L1_TLB 0x1859, L2_CNTL 0x80e01, fault status 0 (addr 000000000)
+Nov 13 13:53:35 atrium-r9700 kernel: atrium_gpu_amd_pci0: gmc: GFXHUB (GC 12.0) flush of context 8 timed out: INV_REQ 0xf80100, INV_ACK 0
+Nov 13 13:53:35 atrium-r9700 kernel: atrium_gpu_amd_pci0: gmc: GFXHUB (GC 12.0) after the timeout: CONTEXT0_CNTL 0x3fffc01, PT base 005800001, L1_TLB 0x1859, L2_CNTL 0x80e01, fault status 0 (addr 000000000)
+Nov 13 13:53:35 atrium-r9700 kernel: atrium_gpu_amd_pci0: smu: TransferTableSmu2Dram      arg 0x00000005: resp 0x1
+Nov 13 13:53:35 atrium-r9700 kernel: atrium_gpu_amd_pci0: smu: telemetry #4372: edge 35 C, hotspot 44 C, mem 34 C, VR 35 C; power 61 W of 300 W limit, board 61 W; fan 893 rpm (20%); gfx 3416 MHz, mem 8 MHz, gfx busy 100%; throttle 0x1 (ids 0x2)
+Nov 13 13:53:35 atrium-r9700 kernel: atrium_gpu_amd_pci0: si: watch #6: telemetry ok
+Nov 13 13:53:35 atrium-r9700 kernel: atrium_gpu_amd_pci0: gmc: GFXHUB (GC 12.0) flush of context 9 timed out: INV_REQ 0xf80200, INV_ACK 0
+Nov 13 13:53:35 atrium-r9700 kernel: atrium_gpu_amd_pci0: gmc: GFXHUB (GC 12.0) after the timeout: CONTEXT0_CNTL 0x3fffc01, PT base 005800001, L1_TLB 0x1859, L2_CNTL 0x80e01, fault status 0 (addr 000000000)
+Nov 13 13:53:35 atrium-r9700 kernel: atrium_gpu_amd_pci0: gmc: GFXHUB (GC 12.0) flush of context 10 timed out: INV_REQ 0xf80400, INV_ACK 0
+Nov 13 13:53:35 atrium-r9700 kernel: atrium_gpu_amd_pci0: gmc: GFXHUB (GC 12.0) after the timeout: CONTEXT0_CNTL 0x3fffc01, PT base 005800001, L1_TLB 0x1859, L2_CNTL 0x80e01, fault status 0 (addr 000000000)
+Nov 13 13:53:36 atrium-r9700 kernel: atrium_gpu_amd_pci0: gmc: GFXHUB (GC 12.0) flush of context 11 timed out: INV_REQ 0xf80800, INV_ACK 0
+Nov 13 13:53:36 atrium-r9700 kernel: atrium_gpu_amd_pci0: gmc: GFXHUB (GC 12.0) after the timeout: CONTEXT0_CNTL 0x3fffc01, PT base 005800001, L1_TLB 0x1859, L2_CNTL 0x80e01, fault status 0 (addr 000000000)
+Nov 13 13:53:36 atrium-r9700 kernel: atrium_gpu_amd_pci0: gmc: GFXHUB (GC 12.0) flush of context 12 timed out: INV_REQ 0xf81000, INV_ACK 0
+Nov 13 13:53:36 atrium-r9700 kernel: atrium_gpu_amd_pci0: gmc: GFXHUB (GC 12.0) after the timeout: CONTEXT0_CNTL 0x3fffc01, PT base 005800001, L1_TLB 0x1859, L2_CNTL 0x80e01, fault status 0 (addr 000000000)
+Nov 13 13:53:36 atrium-r9700 kernel: atrium_gpu_amd_pci0: gmc: GFXHUB (GC 12.0) flush of context 13 timed out: INV_REQ 0xf82000, INV_ACK 0
+Nov 13 13:53:36 atrium-r9700 kernel: atrium_gpu_amd_pci0: gmc: GFXHUB (GC 12.0) after the timeout: CONTEXT0_CNTL 0x3fffc01, PT base 005800001, L1_TLB 0x1859, L2_CNTL 0x80e01, fault status 0 (addr 000000000)
+Nov 13 13:53:36 atrium-r9700 kernel: atrium_gpu_amd_pci0: gmc: GFXHUB (GC 12.0) flush of context 14 timed out: INV_REQ 0xf84000, INV_ACK 0
+Nov 13 13:53:36 atrium-r9700 kernel: atrium_gpu_amd_pci0: gmc: GFXHUB (GC 12.0) after the timeout: CONTEXT0_CNTL 0x3fffc01, PT base 005800001, L1_TLB 0x1859, L2_CNTL 0x80e01, fault status 0 (addr 000000000)
+Nov 13 13:53:36 atrium-r9700 kernel: atrium_gpu_amd_pci0: gmc: GFXHUB (GC 12.0) flush of context 15 timed out: INV_REQ 0xf88000, INV_ACK 0
+Nov 13 13:53:36 atrium-r9700 kernel: atrium_gpu_amd_pci0: gmc: GFXHUB (GC 12.0) after the timeout: CONTEXT0_CNTL 0x3fffc01, PT base 005800001, L1_TLB 0x1859, L2_CNTL 0x80e01, fault status 0 (addr 000000000)
+Nov 13 13:53:36 atrium-r9700 kernel: atrium_gpu_amd_pci0: mes: pipe 0 SUSPEND (user gang): ok in 170 us (status 0x1)
+Nov 13 13:53:36 atrium-r9700 kernel: atrium_gpu_amd_pci0: mes: pipe 0 RESUME (user gang): ok in 100 us (status 0x1)
+Nov 13 13:53:36 atrium-r9700 kernel: atrium_gpu_amd_pci0: uq1: preempted for a free: suspend fence landed after 0 us, resume ok
+Nov 13 13:53:36 atrium-r9700 kernel: atrium_gpu_amd_pci0: mes: pipe 0 REMOVE_QUEUE (user compute): ok in 190 us (status 0x1)
+Nov 13 13:53:36 atrium-r9700 kernel: atrium_gpu_amd_pci0: uq1: removed (seq 1, fence 1)
+Nov 13 13:53:36 atrium-r9700 kernel: atrium_gpu_amd_pci0: gmc: GFXHUB (GC 12.0) flush of context 2 timed out: INV_REQ 0xf80004, INV_ACK 0
+Nov 13 13:53:36 atrium-r9700 kernel: atrium_gpu_amd_pci0: gmc: GFXHUB (GC 12.0) after the timeout: CONTEXT0_CNTL 0x3fffc01, PT base 005800001, L1_TLB 0x1859, L2_CNTL 0x80e01, fault status 0 (addr 000000000)
+Nov 13 13:53:36 atrium-r9700 kernel: atrium_gpu_amd_pci0: gmc: GFXHUB (GC 12.0) flush of context 8 timed out: INV_REQ 0xf80100, INV_ACK 0
+Nov 13 13:53:36 atrium-r9700 kernel: atrium_gpu_amd_pci0: gmc: GFXHUB (GC 12.0) after the timeout: CONTEXT0_CNTL 0x3fffc01, PT base 005800001, L1_TLB 0x1859, L2_CNTL 0x80e01, fault status 0 (addr 000000000)
+Nov 13 13:53:36 atrium-r9700 kernel: atrium_gpu_amd_pci0: gmc: GFXHUB (GC 12.0) flush of context 9 timed out: INV_REQ 0xf80200, INV_ACK 0
+Nov 13 13:53:36 atrium-r9700 kernel: atrium_gpu_amd_pci0: gmc: GFXHUB (GC 12.0) after the timeout: CONTEXT0_CNTL 0x3fffc01, PT base 005800001, L1_TLB 0x1859, L2_CNTL 0x80e01, fault status 0 (addr 000000000)
+Nov 13 13:53:36 atrium-r9700 kernel: atrium_gpu_amd_pci0: gmc: GFXHUB (GC 12.0) flush of context 10 timed out: INV_REQ 0xf80400, INV_ACK 0
+Nov 13 13:53:36 atrium-r9700 kernel: atrium_gpu_amd_pci0: gmc: GFXHUB (GC 12.0) after the timeout: CONTEXT0_CNTL 0x3fffc01, PT base 005800001, L1_TLB 0x1859, L2_CNTL 0x80e01, fault status 0 (addr 000000000)
+Nov 13 13:53:36 atrium-r9700 kernel: atrium_gpu_amd_pci0: gmc: GFXHUB (GC 12.0) flush of context 11 timed out: INV_REQ 0xf80800, INV_ACK 0
+Nov 13 13:53:36 atrium-r9700 kernel: atrium_gpu_amd_pci0: gmc: GFXHUB (GC 12.0) after the timeout: CONTEXT0_CNTL 0x3fffc01, PT base 005800001, L1_TLB 0x1859, L2_CNTL 0x80e01, fault status 0 (addr 000000000)
+Nov 13 13:53:36 atrium-r9700 kernel: atrium_gpu_amd_pci0: gmc: GFXHUB (GC 12.0) flush of context 12 timed out: INV_REQ 0xf81000, INV_ACK 0
+Nov 13 13:53:36 atrium-r9700 kernel: atrium_gpu_amd_pci0: gmc: GFXHUB (GC 12.0) after the timeout: CONTEXT0_CNTL 0x3fffc01, PT base 005800001, L1_TLB 0x1859, L2_CNTL 0x80e01, fault status 0 (addr 000000000)
+Nov 13 13:53:37 atrium-r9700 kernel: atrium_gpu_amd_pci0: gmc: GFXHUB (GC 12.0) flush of context 13 timed out: INV_REQ 0xf82000, INV_ACK 0
+Nov 13 13:53:37 atrium-r9700 kernel: atrium_gpu_amd_pci0: gmc: GFXHUB (GC 12.0) after the timeout: CONTEXT0_CNTL 0x3fffc01, PT base 005800001, L1_TLB 0x1859, L2_CNTL 0x80e01, fault status 0 (addr 000000000)
+Nov 13 13:53:37 atrium-r9700 kernel: atrium_gpu_amd_pci0: gmc: GFXHUB (GC 12.0) flush of context 14 timed out: INV_REQ 0xf84000, INV_ACK 0
+Nov 13 13:53:37 atrium-r9700 kernel: atrium_gpu_amd_pci0: gmc: GFXHUB (GC 12.0) after the timeout: CONTEXT0_CNTL 0x3fffc01, PT base 005800001, L1_TLB 0x1859, L2_CNTL 0x80e01, fault status 0 (addr 000000000)
+Nov 13 13:53:37 atrium-r9700 kernel: atrium_gpu_amd_pci0: gmc: GFXHUB (GC 12.0) flush of context 15 timed out: INV_REQ 0xf88000, INV_ACK 0
+Nov 13 13:53:37 atrium-r9700 kernel: atrium_gpu_amd_pci0: gmc: GFXHUB (GC 12.0) after the timeout: CONTEXT0_CNTL 0x3fffc01, PT base 005800001, L1_TLB 0x1859, L2_CNTL 0x80e01, fault status 0 (addr 000000000)
+Nov 13 13:53:37 atrium-r9700 kernel: atrium_gpu_amd_pci0: si: uq1 closed: 1 submits; EOP IVs routed 37, unrouted 1, MES own 192, MES preemption 30; retired by IV 33, by poll 0; queues lost to faults 3, hangs 3; preempted for frees 30 (failed 0)
+Nov 13 13:53:37 atrium-r9700 kernel: atrium_gpu_amd_pci0: si: unrouted EOP src_data[0]: 0x18000000 x1, 0 x0, 0 x0, 0 x0
+Nov 13 13:53:37 atrium-r9700 kernel: atrium_gpu_amd_pci0: gmc: GFXHUB (GC 12.0) flush of context 2 timed out: INV_REQ 0xf80004, INV_ACK 0
+Nov 13 13:53:37 atrium-r9700 kernel: atrium_gpu_amd_pci0: gmc: GFXHUB (GC 12.0) after the timeout: CONTEXT0_CNTL 0x3fffc01, PT base 005800001, L1_TLB 0x1859, L2_CNTL 0x80e01, fault status 0 (addr 000000000)
+Nov 13 13:53:37 atrium-r9700 kernel: atrium_gpu_amd_pci0: si: VMID 2 unbind failed (60)
+Nov 13 13:53:37 atrium-r9700 kernel: atrium_gpu_amd_pci0: gmc: GFXHUB (GC 12.0) flush of context 3 timed out: INV_REQ 0xf80008, INV_ACK 0
+Nov 13 13:53:37 atrium-r9700 kernel: atrium_gpu_amd_pci0: gmc: GFXHUB (GC 12.0) after the timeout: CONTEXT0_CNTL 0x3fffc01, PT base 005800001, L1_TLB 0x1859, L2_CNTL 0x80e01, fault status 0 (addr 000000000)
+Nov 13 13:53:37 atrium-r9700 kernel: atrium_gpu_amd_pci0: gmc: GFXHUB (GC 12.0) flush of context 8 timed out: INV_REQ 0xf80100, INV_ACK 0
+Nov 13 13:53:37 atrium-r9700 kernel: atrium_gpu_amd_pci0: gmc: GFXHUB (GC 12.0) after the timeout: CONTEXT0_CNTL 0x3fffc01, PT base 005800001, L1_TLB 0x1859, L2_CNTL 0x80e01, fault status 0 (addr 000000000)
+Nov 13 13:53:37 atrium-r9700 kernel: atrium_gpu_amd_pci0: gmc: GFXHUB (GC 12.0) flush of context 9 timed out: INV_REQ 0xf80200, INV_ACK 0
+Nov 13 13:53:37 atrium-r9700 kernel: atrium_gpu_amd_pci0: gmc: GFXHUB (GC 12.0) after the timeout: CONTEXT0_CNTL 0x3fffc01, PT base 005800001, L1_TLB 0x1859, L2_CNTL 0x80e01, fault status 0 (addr 000000000)
+Nov 13 13:53:37 atrium-r9700 kernel: atrium_gpu_amd_pci0: gmc: GFXHUB (GC 12.0) flush of context 10 timed out: INV_REQ 0xf80400, INV_ACK 0
+Nov 13 13:53:37 atrium-r9700 kernel: atrium_gpu_amd_pci0: gmc: GFXHUB (GC 12.0) after the timeout: CONTEXT0_CNTL 0x3fffc01, PT base 005800001, L1_TLB 0x1859, L2_CNTL 0x80e01, fault status 0 (addr 000000000)
+Nov 13 13:53:37 atrium-r9700 kernel: atrium_gpu_amd_pci0: gmc: GFXHUB (GC 12.0) flush of context 11 timed out: INV_REQ 0xf80800, INV_ACK 0
+Nov 13 13:53:37 atrium-r9700 kernel: atrium_gpu_amd_pci0: gmc: GFXHUB (GC 12.0) after the timeout: CONTEXT0_CNTL 0x3fffc01, PT base 005800001, L1_TLB 0x1859, L2_CNTL 0x80e01, fault status 0 (addr 000000000)
+Nov 13 13:53:38 atrium-r9700 kernel: atrium_gpu_amd_pci0: gmc: GFXHUB (GC 12.0) flush of context 12 timed out: INV_REQ 0xf81000, INV_ACK 0
+Nov 13 13:53:38 atrium-r9700 kernel: atrium_gpu_amd_pci0: gmc: GFXHUB (GC 12.0) after the timeout: CONTEXT0_CNTL 0x3fffc01, PT base 005800001, L1_TLB 0x1859, L2_CNTL 0x80e01, fault status 0 (addr 000000000)
+Nov 13 13:53:38 atrium-r9700 kernel: atrium_gpu_amd_pci0: gmc: GFXHUB (GC 12.0) flush of context 13 timed out: INV_REQ 0xf82000, INV_ACK 0
+Nov 13 13:53:38 atrium-r9700 kernel: atrium_gpu_amd_pci0: gmc: GFXHUB (GC 12.0) after the timeout: CONTEXT0_CNTL 0x3fffc01, PT base 005800001, L1_TLB 0x1859, L2_CNTL 0x80e01, fault status 0 (addr 000000000)
+Nov 13 13:53:38 atrium-r9700 kernel: atrium_gpu_amd_pci0: gmc: GFXHUB (GC 12.0) flush of context 14 timed out: INV_REQ 0xf84000, INV_ACK 0
+Nov 13 13:53:38 atrium-r9700 kernel: atrium_gpu_amd_pci0: gmc: GFXHUB (GC 12.0) after the timeout: CONTEXT0_CNTL 0x3fffc01, PT base 005800001, L1_TLB 0x1859, L2_CNTL 0x80e01, fault status 0 (addr 000000000)
+Nov 13 13:53:38 atrium-r9700 kernel: atrium_gpu_amd_pci0: gmc: GFXHUB (GC 12.0) flush of context 15 timed out: INV_REQ 0xf88000, INV_ACK 0
+Nov 13 13:53:38 atrium-r9700 kernel: atrium_gpu_amd_pci0: gmc: GFXHUB (GC 12.0) after the timeout: CONTEXT0_CNTL 0x3fffc01, PT base 005800001, L1_TLB 0x1859, L2_CNTL 0x80e01, fault status 0 (addr 000000000)
+Nov 13 13:53:38 atrium-r9700 kernel: atrium_gpu_amd_pci0: mes: pipe 0 SUSPEND (user gang): ok in 240 us (status 0x1)
+Nov 13 13:53:38 atrium-r9700 kernel: atrium_gpu_amd_pci0: mes: pipe 0 RESUME (user gang): ok in 100 us (status 0x1)
+Nov 13 13:53:38 atrium-r9700 kernel: atrium_gpu_amd_pci0: uq2: preempted for a free: suspend fence landed after 0 us, resume ok
+Nov 13 13:53:38 atrium-r9700 kernel: atrium_gpu_amd_pci0: gmc: GFXHUB (GC 12.0) flush of context 3 timed out: INV_REQ 0xf80008, INV_ACK 0
+Nov 13 13:53:38 atrium-r9700 kernel: atrium_gpu_amd_pci0: gmc: GFXHUB (GC 12.0) after the timeout: CONTEXT0_CNTL 0x3fffc01, PT base 005800001, L1_TLB 0x1859, L2_CNTL 0x80e01, fault status 0 (addr 000000000)
+Nov 13 13:53:38 atrium-r9700 kernel: atrium_gpu_amd_pci0: gmc: GFXHUB (GC 12.0) flush of context 8 timed out: INV_REQ 0xf80100, INV_ACK 0
+Nov 13 13:53:38 atrium-r9700 kernel: atrium_gpu_amd_pci0: gmc: GFXHUB (GC 12.0) after the timeout: CONTEXT0_CNTL 0x3fffc01, PT base 005800001, L1_TLB 0x1859, L2_CNTL 0x80e01, fault status 0 (addr 000000000)
+Nov 13 13:53:38 atrium-r9700 kernel: atrium_gpu_amd_pci0: gmc: GFXHUB (GC 12.0) flush of context 9 timed out: INV_REQ 0xf80200, INV_ACK 0
+Nov 13 13:53:38 atrium-r9700 kernel: atrium_gpu_amd_pci0: gmc: GFXHUB (GC 12.0) after the timeout: CONTEXT0_CNTL 0x3fffc01, PT base 005800001, L1_TLB 0x1859, L2_CNTL 0x80e01, fault status 0 (addr 000000000)
+Nov 13 13:53:38 atrium-r9700 kernel: atrium_gpu_amd_pci0: gmc: GFXHUB (GC 12.0) flush of context 10 timed out: INV_REQ 0xf80400, INV_ACK 0
+Nov 13 13:53:38 atrium-r9700 kernel: atrium_gpu_amd_pci0: gmc: GFXHUB (GC 12.0) after the timeout: CONTEXT0_CNTL 0x3fffc01, PT base 005800001, L1_TLB 0x1859, L2_CNTL 0x80e01, fault status 0 (addr 000000000)
+Nov 13 13:53:38 atrium-r9700 kernel: atrium_gpu_amd_pci0: gmc: GFXHUB (GC 12.0) flush of context 11 timed out: INV_REQ 0xf80800, INV_ACK 0
+Nov 13 13:53:38 atrium-r9700 kernel: atrium_gpu_amd_pci0: gmc: GFXHUB (GC 12.0) after the timeout: CONTEXT0_CNTL 0x3fffc01, PT base 005800001, L1_TLB 0x1859, L2_CNTL 0x80e01, fault status 0 (addr 000000000)
+Nov 13 13:53:38 atrium-r9700 kernel: atrium_gpu_amd_pci0: gmc: GFXHUB (GC 12.0) flush of context 12 timed out: INV_REQ 0xf81000, INV_ACK 0
+Nov 13 13:53:38 atrium-r9700 kernel: atrium_gpu_amd_pci0: gmc: GFXHUB (GC 12.0) after the timeout: CONTEXT0_CNTL 0x3fffc01, PT base 005800001, L1_TLB 0x1859, L2_CNTL 0x80e01, fault status 0 (addr 000000000)
+Nov 13 13:53:39 atrium-r9700 kernel: atrium_gpu_amd_pci0: gmc: GFXHUB (GC 12.0) flush of context 13 timed out: INV_REQ 0xf82000, INV_ACK 0
+Nov 13 13:53:39 atrium-r9700 kernel: atrium_gpu_amd_pci0: gmc: GFXHUB (GC 12.0) after the timeout: CONTEXT0_CNTL 0x3fffc01, PT base 005800001, L1_TLB 0x1859, L2_CNTL 0x80e01, fault status 0 (addr 000000000)
+Nov 13 13:53:39 atrium-r9700 kernel: atrium_gpu_amd_pci0: gmc: GFXHUB (GC 12.0) flush of context 14 timed out: INV_REQ 0xf84000, INV_ACK 0
+Nov 13 13:53:39 atrium-r9700 kernel: atrium_gpu_amd_pci0: gmc: GFXHUB (GC 12.0) after the timeout: CONTEXT0_CNTL 0x3fffc01, PT base 005800001, L1_TLB 0x1859, L2_CNTL 0x80e01, fault status 0 (addr 000000000)
+Nov 13 13:53:39 atrium-r9700 kernel: atrium_gpu_amd_pci0: gmc: GFXHUB (GC 12.0) flush of context 15 timed out: INV_REQ 0xf88000, INV_ACK 0
+Nov 13 13:53:39 atrium-r9700 kernel: atrium_gpu_amd_pci0: gmc: GFXHUB (GC 12.0) after the timeout: CONTEXT0_CNTL 0x3fffc01, PT base 005800001, L1_TLB 0x1859, L2_CNTL 0x80e01, fault status 0 (addr 000000000)
+Nov 13 13:53:39 atrium-r9700 kernel: atrium_gpu_amd_pci0: mes: pipe 0 SUSPEND (user gang): ok in 170 us (status 0x1)
+Nov 13 13:53:39 atrium-r9700 kernel: atrium_gpu_amd_pci0: mes: pipe 0 RESUME (user gang): ok in 100 us (status 0x1)
+Nov 13 13:53:39 atrium-r9700 kernel: atrium_gpu_amd_pci0: uq2: preempted for a free: suspend fence landed after 0 us, resume ok
+Nov 13 13:53:39 atrium-r9700 kernel: atrium_gpu_amd_pci0: gmc: GFXHUB (GC 12.0) flush of context 3 timed out: INV_REQ 0xf80008, INV_ACK 0
+Nov 13 13:53:39 atrium-r9700 kernel: atrium_gpu_amd_pci0: gmc: GFXHUB (GC 12.0) after the timeout: CONTEXT0_CNTL 0x3fffc01, PT base 005800001, L1_TLB 0x1859, L2_CNTL 0x80e01, fault status 0 (addr 000000000)
+Nov 13 13:53:39 atrium-r9700 kernel: atrium_gpu_amd_pci0: gmc: GFXHUB (GC 12.0) flush of context 8 timed out: INV_REQ 0xf80100, INV_ACK 0
+Nov 13 13:53:39 atrium-r9700 kernel: atrium_gpu_amd_pci0: gmc: GFXHUB (GC 12.0) after the timeout: CONTEXT0_CNTL 0x3fffc01, PT base 005800001, L1_TLB 0x1859, L2_CNTL 0x80e01, fault status 0 (addr 000000000)
+Nov 13 13:53:39 atrium-r9700 kernel: atrium_gpu_amd_pci0: gmc: GFXHUB (GC 12.0) flush of context 9 timed out: INV_REQ 0xf80200, INV_ACK 0
+Nov 13 13:53:39 atrium-r9700 kernel: atrium_gpu_amd_pci0: gmc: GFXHUB (GC 12.0) after the timeout: CONTEXT0_CNTL 0x3fffc01, PT base 005800001, L1_TLB 0x1859, L2_CNTL 0x80e01, fault status 0 (addr 000000000)
+Nov 13 13:53:39 atrium-r9700 kernel: atrium_gpu_amd_pci0: gmc: GFXHUB (GC 12.0) flush of context 10 timed out: INV_REQ 0xf80400, INV_ACK 0
+Nov 13 13:53:39 atrium-r9700 kernel: atrium_gpu_amd_pci0: gmc: GFXHUB (GC 12.0) after the timeout: CONTEXT0_CNTL 0x3fffc01, PT base 005800001, L1_TLB 0x1859, L2_CNTL 0x80e01, fault status 0 (addr 000000000)
+Nov 13 13:53:39 atrium-r9700 kernel: atrium_gpu_amd_pci0: gmc: GFXHUB (GC 12.0) flush of context 11 timed out: INV_REQ 0xf80800, INV_ACK 0
+Nov 13 13:53:39 atrium-r9700 kernel: atrium_gpu_amd_pci0: gmc: GFXHUB (GC 12.0) after the timeout: CONTEXT0_CNTL 0x3fffc01, PT base 005800001, L1_TLB 0x1859, L2_CNTL 0x80e01, fault status 0 (addr 000000000)
+Nov 13 13:53:40 atrium-r9700 kernel: atrium_gpu_amd_pci0: gmc: GFXHUB (GC 12.0) flush of context 12 timed out: INV_REQ 0xf81000, INV_ACK 0
+Nov 13 13:53:40 atrium-r9700 kernel: atrium_gpu_amd_pci0: gmc: GFXHUB (GC 12.0) after the timeout: CONTEXT0_CNTL 0x3fffc01, PT base 005800001, L1_TLB 0x1859, L2_CNTL 0x80e01, fault status 0 (addr 000000000)
+Nov 13 13:53:40 atrium-r9700 kernel: atrium_gpu_amd_pci0: gmc: GFXHUB (GC 12.0) flush of context 13 timed out: INV_REQ 0xf82000, INV_ACK 0
+Nov 13 13:53:40 atrium-r9700 kernel: atrium_gpu_amd_pci0: gmc: GFXHUB (GC 12.0) after the timeout: CONTEXT0_CNTL 0x3fffc01, PT base 005800001, L1_TLB 0x1859, L2_CNTL 0x80e01, fault status 0 (addr 000000000)
+Nov 13 13:53:40 atrium-r9700 kernel: atrium_gpu_amd_pci0: gmc: GFXHUB (GC 12.0) flush of context 14 timed out: INV_REQ 0xf84000, INV_ACK 0
+Nov 13 13:53:40 atrium-r9700 kernel: atrium_gpu_amd_pci0: gmc: GFXHUB (GC 12.0) after the timeout: CONTEXT0_CNTL 0x3fffc01, PT base 005800001, L1_TLB 0x1859, L2_CNTL 0x80e01, fault status 0 (addr 000000000)
+Nov 13 13:53:40 atrium-r9700 kernel: atrium_gpu_amd_pci0: gmc: GFXHUB (GC 12.0) flush of context 15 timed out: INV_REQ 0xf88000, INV_ACK 0
+Nov 13 13:53:40 atrium-r9700 kernel: atrium_gpu_amd_pci0: gmc: GFXHUB (GC 12.0) after the timeout: CONTEXT0_CNTL 0x3fffc01, PT base 005800001, L1_TLB 0x1859, L2_CNTL 0x80e01, fault status 0 (addr 000000000)
+Nov 13 13:53:40 atrium-r9700 kernel: atrium_gpu_amd_pci0: mes: pipe 0 SUSPEND (user gang): ok in 170 us (status 0x1)
+Nov 13 13:53:40 atrium-r9700 kernel: atrium_gpu_amd_pci0: mes: pipe 0 RESUME (user gang): ok in 100 us (status 0x1)
+Nov 13 13:53:40 atrium-r9700 kernel: atrium_gpu_amd_pci0: uq2: preempted for a free: suspend fence landed after 0 us, resume ok
+Nov 13 13:53:40 atrium-r9700 kernel: atrium_gpu_amd_pci0: mes: pipe 0 REMOVE_QUEUE (user compute): ok in 180 us (status 0x1)
+Nov 13 13:53:40 atrium-r9700 kernel: atrium_gpu_amd_pci0: uq2: removed (seq 1, fence 1)
+Nov 13 13:53:40 atrium-r9700 kernel: atrium_gpu_amd_pci0: gmc: GFXHUB (GC 12.0) flush of context 3 timed out: INV_REQ 0xf80008, INV_ACK 0
+Nov 13 13:53:40 atrium-r9700 kernel: atrium_gpu_amd_pci0: gmc: GFXHUB (GC 12.0) after the timeout: CONTEXT0_CNTL 0x3fffc01, PT base 005800001, L1_TLB 0x1859, L2_CNTL 0x80e01, fault status 0 (addr 000000000)
+Nov 13 13:53:40 atrium-r9700 kernel: atrium_gpu_amd_pci0: gmc: GFXHUB (GC 12.0) flush of context 8 timed out: INV_REQ 0xf80100, INV_ACK 0
+Nov 13 13:53:40 atrium-r9700 kernel: atrium_gpu_amd_pci0: gmc: GFXHUB (GC 12.0) after the timeout: CONTEXT0_CNTL 0x3fffc01, PT base 005800001, L1_TLB 0x1859, L2_CNTL 0x80e01, fault status 0 (addr 000000000)
+Nov 13 13:53:40 atrium-r9700 kernel: atrium_gpu_amd_pci0: gmc: GFXHUB (GC 12.0) flush of context 9 timed out: INV_REQ 0xf80200, INV_ACK 0
+Nov 13 13:53:40 atrium-r9700 kernel: atrium_gpu_amd_pci0: gmc: GFXHUB (GC 12.0) after the timeout: CONTEXT0_CNTL 0x3fffc01, PT base 005800001, L1_TLB 0x1859, L2_CNTL 0x80e01, fault status 0 (addr 000000000)
+Nov 13 13:53:40 atrium-r9700 kernel: atrium_gpu_amd_pci0: gmc: GFXHUB (GC 12.0) flush of context 10 timed out: INV_REQ 0xf80400, INV_ACK 0
+Nov 13 13:53:40 atrium-r9700 kernel: atrium_gpu_amd_pci0: gmc: GFXHUB (GC 12.0) after the timeout: CONTEXT0_CNTL 0x3fffc01, PT base 005800001, L1_TLB 0x1859, L2_CNTL 0x80e01, fault status 0 (addr 000000000)
+Nov 13 13:53:40 atrium-r9700 kernel: atrium_gpu_amd_pci0: smu: TransferTableSmu2Dram      arg 0x00000005: resp 0x1
+Nov 13 13:53:40 atrium-r9700 kernel: atrium_gpu_amd_pci0: smu: telemetry #4497: edge 36 C, hotspot 44 C, mem 35 C, VR 36 C; power 61 W of 300 W limit, board 61 W; fan 893 rpm (20%); gfx 3413 MHz, mem 9 MHz, gfx busy 100%; throttle 0x1 (ids 0x2)
+Nov 13 13:53:40 atrium-r9700 kernel: atrium_gpu_amd_pci0: gmc: GFXHUB (GC 12.0) flush of context 11 timed out: INV_REQ 0xf80800, INV_ACK 0
+Nov 13 13:53:40 atrium-r9700 kernel: atrium_gpu_amd_pci0: gmc: GFXHUB (GC 12.0) after the timeout: CONTEXT0_CNTL 0x3fffc01, PT base 005800001, L1_TLB 0x1859, L2_CNTL 0x80e01, fault status 0 (addr 000000000)
+Nov 13 13:53:40 atrium-r9700 kernel: atrium_gpu_amd_pci0: gmc: GFXHUB (GC 12.0) flush of context 12 timed out: INV_REQ 0xf81000, INV_ACK 0
+Nov 13 13:53:40 atrium-r9700 kernel: atrium_gpu_amd_pci0: gmc: GFXHUB (GC 12.0) after the timeout: CONTEXT0_CNTL 0x3fffc01, PT base 005800001, L1_TLB 0x1859, L2_CNTL 0x80e01, fault status 0 (addr 000000000)
+Nov 13 13:53:40 atrium-r9700 kernel: atrium_gpu_amd_pci0: gmc: GFXHUB (GC 12.0) flush of context 13 timed out: INV_REQ 0xf82000, INV_ACK 0
+Nov 13 13:53:40 atrium-r9700 kernel: atrium_gpu_amd_pci0: gmc: GFXHUB (GC 12.0) after the timeout: CONTEXT0_CNTL 0x3fffc01, PT base 005800001, L1_TLB 0x1859, L2_CNTL 0x80e01, fault status 0 (addr 000000000)
+Nov 13 13:53:41 atrium-r9700 kernel: atrium_gpu_amd_pci0: gmc: GFXHUB (GC 12.0) flush of context 14 timed out: INV_REQ 0xf84000, INV_ACK 0
+Nov 13 13:53:41 atrium-r9700 kernel: atrium_gpu_amd_pci0: gmc: GFXHUB (GC 12.0) after the timeout: CONTEXT0_CNTL 0x3fffc01, PT base 005800001, L1_TLB 0x1859, L2_CNTL 0x80e01, fault status 0 (addr 000000000)
+Nov 13 13:53:41 atrium-r9700 kernel: atrium_gpu_amd_pci0: gmc: GFXHUB (GC 12.0) flush of context 15 timed out: INV_REQ 0xf88000, INV_ACK 0
+Nov 13 13:53:41 atrium-r9700 kernel: atrium_gpu_amd_pci0: gmc: GFXHUB (GC 12.0) after the timeout: CONTEXT0_CNTL 0x3fffc01, PT base 005800001, L1_TLB 0x1859, L2_CNTL 0x80e01, fault status 0 (addr 000000000)
+Nov 13 13:53:41 atrium-r9700 kernel: atrium_gpu_amd_pci0: si: uq2 closed: 1 submits; EOP IVs routed 37, unrouted 1, MES own 206, MES preemption 33; retired by IV 33, by poll 0; queues lost to faults 3, hangs 3; preempted for frees 33 (failed 0)
+Nov 13 13:53:41 atrium-r9700 kernel: atrium_gpu_amd_pci0: si: unrouted EOP src_data[0]: 0x18000000 x1, 0 x0, 0 x0, 0 x0
+Nov 13 13:53:41 atrium-r9700 kernel: atrium_gpu_amd_pci0: gmc: GFXHUB (GC 12.0) flush of context 3 timed out: INV_REQ 0xf80008, INV_ACK 0
+Nov 13 13:53:41 atrium-r9700 kernel: atrium_gpu_amd_pci0: gmc: GFXHUB (GC 12.0) after the timeout: CONTEXT0_CNTL 0x3fffc01, PT base 005800001, L1_TLB 0x1859, L2_CNTL 0x80e01, fault status 0 (addr 000000000)
+Nov 13 13:53:41 atrium-r9700 kernel: atrium_gpu_amd_pci0: si: VMID 3 unbind failed (60)
+Nov 13 13:53:41 atrium-r9700 kernel: atrium_gpu_amd_pci0: smu: AllowGfxOff                arg 0000000000: resp 0x1
+Nov 13 13:53:41 atrium-r9700 kernel: atrium_gpu_amd_pci0: smu: DisallowGfxOff             arg 0000000000: resp 0x1
+Nov 13 13:53:41 atrium-r9700 kernel: atrium_gpu_amd_pci0: smu: AllowGfxOff                arg 0000000000: resp 0x1
+Nov 13 13:53:41 atrium-r9700 kernel: atrium_gpu_amd_pci0: smu: DisallowGfxOff             arg 0000000000: resp 0x1
+Nov 13 13:53:41 atrium-r9700 kernel: atrium_gpu_amd_pci0: smu: AllowGfxOff                arg 0000000000: resp 0x1
+Nov 13 13:53:41 atrium-r9700 kernel: atrium_gpu_amd_pci0: smu: DisallowGfxOff             arg 0000000000: resp 0x1
+Nov 13 13:53:41 atrium-r9700 kernel: atrium_gpu_amd_pci0: smu: AllowGfxOff                arg 0000000000: resp 0x1
+Nov 13 13:53:41 atrium-r9700 kernel: atrium_gpu_amd_pci0: smu: DisallowGfxOff             arg 0000000000: resp 0x1
+Nov 13 13:53:41 atrium-r9700 kernel: atrium_gpu_amd_pci0: smu: AllowGfxOff                arg 0000000000: resp 0x1
+Nov 13 13:53:41 atrium-r9700 kernel: atrium_gpu_amd_pci0: smu: DisallowGfxOff             arg 0000000000: resp 0x1
+Nov 13 13:53:41 atrium-r9700 kernel: atrium_gpu_amd_pci0: smu: AllowGfxOff                arg 0000000000: resp 0x1
+Nov 13 13:53:41 atrium-r9700 kernel: atrium_gpu_amd_pci0: smu: DisallowGfxOff             arg 0000000000: resp 0x1
+Nov 13 13:53:41 atrium-r9700 kernel: atrium_gpu_amd_pci0: smu: AllowGfxOff                arg 0000000000: resp 0x1
+Nov 13 13:53:41 atrium-r9700 kernel: atrium_gpu_amd_pci0: smu: DisallowGfxOff             arg 0000000000: resp 0x1
+Nov 13 13:53:41 atrium-r9700 kernel: atrium_gpu_amd_pci0: smu: AllowGfxOff                arg 0000000000: resp 0x1
+Nov 13 13:53:41 atrium-r9700 kernel: atrium_gpu_amd_pci0: smu: DisallowGfxOff             arg 0000000000: resp 0x1
+Nov 13 13:53:41 atrium-r9700 kernel: atrium_gpu_amd_pci0: smu: AllowGfxOff                arg 0000000000: resp 0x1
+Nov 13 13:53:41 atrium-r9700 kernel: atrium_gpu_amd_pci0: smu: DisallowGfxOff             arg 0000000000: resp 0x1
+Nov 13 13:53:41 atrium-r9700 kernel: atrium_gpu_amd_pci0: smu: AllowGfxOff                arg 0000000000: resp 0x1
+Nov 13 13:53:45 atrium-r9700 kernel: atrium_gpu_amd_pci0: smu: TransferTableSmu2Dram      arg 0x00000005: resp 0x1
+Nov 13 13:53:45 atrium-r9700 kernel: atrium_gpu_amd_pci0: smu: telemetry #4389: edge 36 C, hotspot 45 C, mem 36 C, VR 36 C; power 61 W of 300 W limit, board 61 W; fan 893 rpm (20%); gfx 3413 MHz, mem 8 MHz, gfx busy 100%; throttle 0x1 (ids 0x2)
+Nov 13 13:53:45 atrium-r9700 kernel: atrium_gpu_amd_pci0: si: watch #8: telemetry ok, busy with no work queued
+Nov 13 13:53:50 atrium-r9700 kernel: atrium_gpu_amd_pci0: smu: TransferTableSmu2Dram      arg 0x00000005: resp 0x1
+Nov 13 13:53:50 atrium-r9700 kernel: atrium_gpu_amd_pci0: smu: telemetry #4380: edge 37 C, hotspot 45 C, mem 36 C, VR 37 C; power 61 W of 300 W limit, board 61 W; fan 893 rpm (20%); gfx 3413 MHz, mem 8 MHz, gfx busy 100%; throttle 0x1 (ids 0x2)
+Nov 13 13:53:50 atrium-r9700 kernel: atrium_gpu_amd_pci0: si: watch #9: telemetry ok, busy with no work queued
+Nov 13 13:53:51 atrium-r9700 kernel: atrium_gpu_amd_pci0: si: VRAM scrub: 228 fills, 0 waits for an idle queue
+Nov 13 13:53:51 atrium-r9700 kernel: atrium_gpu_amd_pci0: smu: DisallowGfxOff             arg 0000000000: resp 0x1
+Nov 13 13:53:51 atrium-r9700 kernel: atrium_gpu_amd_pci0: mes: pipe 0 REMOVE_QUEUE (compute): ok in 170 us (status 0x1)
+Nov 13 13:53:51 atrium-r9700 kernel: atrium_gpu_amd_pci0: mes: me 1 pipe 0 HQD dequeued: active 0
+Nov 13 13:53:51 atrium-r9700 kernel: atrium_gpu_amd_pci0: smu: AllowGfxOff                arg 0000000000: resp 0x1
+Nov 13 13:53:51 atrium-r9700 kernel: atrium_gpu_amd0: detached
+Nov 13 13:53:51 atrium-r9700 kernel: atrium_gpu_amd_pci0: smu: DisallowGfxOff             arg 0000000000: resp 0x1
+Nov 13 13:53:52 atrium-r9700 kernel: atrium_gpu_amd_pci0: dispatch: stage 4e: FAILED
+Nov 13 13:53:52 atrium-r9700 kernel: atrium_gpu_amd_pci0: si: dispatch after 45 s attached: FAILED
+Nov 13 13:53:52 atrium-r9700 kernel: atrium_gpu_amd_pci0: ih: IV client 0x14 src 0xb5 ring 12 vmid 0 pasid 0 data 0x20000003 0 0xb1 0
+Nov 13 13:53:52 atrium-r9700 kernel: atrium_gpu_amd_pci0: ih: IV client 0x14 src 0xb5 ring 12 vmid 0 pasid 0 data 0x2000000b 0 0xb1 0
+Nov 13 13:53:52 atrium-r9700 kernel: atrium_gpu_amd_pci0: si: 2 CP EOP IV(s) since attach, 247 interrupt(s)
+Nov 13 13:53:52 atrium-r9700 kernel: atrium_gpu_amd_pci0: mes: MES running, no work: GRBM_STATUS 0xa800382c -> 0xa800382c, still busy after 500 ms; CP_CPC_STATUS 0, CP_CPF_STATUS 0x90000001
+Nov 13 13:53:52 atrium-r9700 kernel: atrium_gpu_amd_pci0: gfx: MES running: GRBM_STATUS 0xa800382c, RLC_CNTL 0x1, RLC_STAT 0x25, MGCG_OVERRIDE 0x40, CGCG_CGLS 0x363f, CGCG_CGLS_3D 0x363f, SRM 0x3, CP_INT_CNTL 0x3c0000, CP_INT_CNTL_RING0 0x3c0000
+Nov 13 13:53:52 atrium-r9700 kernel: atrium_gpu_amd_pci0: mes: pipe 1 REMOVE_QUEUE (scheduler): ok in 230 us (status 0x1)
+Nov 13 13:53:52 atrium-r9700 kernel: atrium_gpu_amd_pci0: mes: me 3 pipe 0 HQD dequeued: active 0
+Nov 13 13:53:52 atrium-r9700 kernel: atrium_gpu_amd_pci0: mes: me 3 pipe 1 HQD dequeued: active 0
+Nov 13 13:53:53 atrium-r9700 kernel: atrium_gpu_amd_pci0: mes: queues gone, MES still running: GRBM_STATUS 0xa800382c -> 0xa800382c, still busy after 500 ms; CP_CPC_STATUS 0, CP_CPF_STATUS 0x90000001
+Nov 13 13:53:53 atrium-r9700 kernel: atrium_gpu_amd_pci0: mes: MES halted, CP still running: GRBM_STATUS 0xa800382c -> 0xa800382c, still busy after 500 ms; CP_CPC_STATUS 0, CP_CPF_STATUS 0x90000001
+Nov 13 13:53:53 atrium-r9700 kernel: atrium_gpu_amd_pci0: mes: CP halted again: CP_ME_CNTL 0x1400a000, CP_MEC_RS64_CNTL 0x40030000, CP_STAT 0
+Nov 13 13:53:53 atrium-r9700 kernel: atrium_gpu_amd_pci0: mes: torn down: CP_MES_CNTL 0x40030000; pipe 0: instr 0x1400, GP3 0x1029097, HQD active 0, rptr 0, wptr 0; pipe 1: instr 0x1400, GP3 0x1029097, HQD active 0, rptr 0, wptr 0; GRBM_STATUS 0xa800382c, CP_STAT 0, RLC_STAT 0x25
+Nov 13 13:53:53 atrium-r9700 kernel: atrium_gpu_amd_pci0: mes: torn down: GRBM_STATUS2 0x14008000, GRBM_STATUS3 0, CP_CPC_STATUS 0, CP_CPC_BUSY_STAT 0/0, CP_CPF_STATUS 0x90000001, CP_BUSY_STAT 0, RLC_GPM_STAT 0x160037
+Nov 13 13:53:53 atrium-r9700 kernel: atrium_gpu_amd_pci0: gfx: MES torn down: GRBM_STATUS 0xa800382c, RLC_CNTL 0x1, RLC_STAT 0x25, MGCG_OVERRIDE 0x40, CGCG_CGLS 0x363f, CGCG_CGLS_3D 0x363f, SRM 0x3, CP_INT_CNTL 0x3c0000, CP_INT_CNTL_RING0 0x3c0000
+Nov 13 13:53:53 atrium-r9700 kernel: atrium_gpu_amd_pci0: mes: MES halted: GRBM_STATUS 0xa800382c -> 0xa800382c, still busy after 500 ms; CP_CPC_STATUS 0, CP_CPF_STATUS 0x90000001
+Nov 13 13:53:53 atrium-r9700 kernel: atrium_gpu_amd_pci0: gfx: idle sequence GC 12.0.0/1: SRM, clock gating
+Nov 13 13:53:53 atrium-r9700 kernel: atrium_gpu_amd_pci0: gfx: before idle setup: GRBM_STATUS 0xa800382c, RLC_CNTL 0x1, RLC_STAT 0x25, MGCG_OVERRIDE 0x40, CGCG_CGLS 0x363f, CGCG_CGLS_3D 0x363f, SRM 0x3, CP_INT_CNTL 0x3c0000, CP_INT_CNTL_RING0 0x3c0000
+Nov 13 13:53:53 atrium-r9700 kernel: atrium_gpu_amd_pci0: gfx: after idle setup: GRBM_STATUS 0xa800382c, RLC_CNTL 0x1, RLC_STAT 0x35, MGCG_OVERRIDE 0x40, CGCG_CGLS 0x363f, CGCG_CGLS_3D 0x363f, SRM 0x3, CP_INT_CNTL 0x3c0000, CP_INT_CNTL_RING0 0x3c0000
+Nov 13 13:53:53 atrium-r9700 kernel: atrium_gpu_amd_pci0: mes: GC idle sequence again after MES: 0
+Nov 13 13:53:54 atrium-r9700 kernel: atrium_gpu_amd_pci0: gfx: 100 ms after the idle sequence: GRBM_STATUS 0xa800382c, RLC_CNTL 0x1, RLC_STAT 0x25, MGCG_OVERRIDE 0x40, CGCG_CGLS 0x363f, CGCG_CGLS_3D 0x363f, SRM 0x3, CP_INT_CNTL 0x3c0000, CP_INT_CNTL_RING0 0x3c0000
+Nov 13 13:53:54 atrium-r9700 kernel: atrium_gpu_amd_pci0: ih: disabled: RB_CNTL 0x4031011c, RPTR 0, WPTR 0 (writeback 0x2660), STATUS 0xc0847, MSI interrupts 248
+Nov 13 13:53:54 atrium-r9700 kernel: atrium_gpu_amd_pci0: smu: AllowGfxOff                arg 0000000000: resp 0x1
+Nov 13 13:53:54 atrium-r9700 kernel: atrium_gpu_amd_pci0: smu: sample [detached] 1/5
+Nov 13 13:53:54 atrium-r9700 kernel: atrium_gpu_amd_pci0: smu: TransferTableSmu2Dram      arg 0x00000005: resp 0x1
+Nov 13 13:53:54 atrium-r9700 kernel: atrium_gpu_amd_pci0: smu: telemetry #3242: edge 37 C, hotspot 46 C, mem 36 C, VR 37 C; power 65 W of 300 W limit, board 65 W; fan 893 rpm (20%); gfx 3413 MHz, mem 115 MHz, gfx busy 100%; throttle 0x1 (ids 0x2)
+Nov 13 13:53:54 atrium-r9700 kernel: atrium_gpu_amd_pci0: smu: busy or at the power limit with no work queued
+Nov 13 13:53:55 atrium-r9700 kernel: atrium_gpu_amd_pci0: smu: sample [detached] 2/5
+Nov 13 13:53:55 atrium-r9700 kernel: atrium_gpu_amd_pci0: smu: TransferTableSmu2Dram      arg 0x00000005: resp 0x1
+Nov 13 13:53:55 atrium-r9700 kernel: atrium_gpu_amd_pci0: smu: telemetry #941: edge 37 C, hotspot 46 C, mem 36 C, VR 38 C; power 62 W of 300 W limit, board 62 W; fan 893 rpm (20%); gfx 3413 MHz, mem 8 MHz, gfx busy 100%; throttle 0x1 (ids 0x2)
+Nov 13 13:53:55 atrium-r9700 kernel: atrium_gpu_amd_pci0: smu: busy or at the power limit with no work queued
+Nov 13 13:53:56 atrium-r9700 kernel: atrium_gpu_amd_pci0: smu: sample [detached] 3/5
+Nov 13 13:53:56 atrium-r9700 kernel: atrium_gpu_amd_pci0: smu: TransferTableSmu2Dram      arg 0x00000005: resp 0x1
+Nov 13 13:53:56 atrium-r9700 kernel: atrium_gpu_amd_pci0: smu: telemetry #857: edge 37 C, hotspot 46 C, mem 36 C, VR 38 C; power 62 W of 300 W limit, board 62 W; fan 893 rpm (20%); gfx 3413 MHz, mem 8 MHz, gfx busy 100%; throttle 0x1 (ids 0x2)
+Nov 13 13:53:56 atrium-r9700 kernel: atrium_gpu_amd_pci0: smu: busy or at the power limit with no work queued
+Nov 13 13:53:57 atrium-r9700 kernel: atrium_gpu_amd_pci0: smu: sample [detached] 4/5
+Nov 13 13:53:57 atrium-r9700 kernel: atrium_gpu_amd_pci0: smu: TransferTableSmu2Dram      arg 0x00000005: resp 0x1
+Nov 13 13:53:57 atrium-r9700 kernel: atrium_gpu_amd_pci0: smu: telemetry #921: edge 38 C, hotspot 46 C, mem 36 C, VR 38 C; power 62 W of 300 W limit, board 62 W; fan 893 rpm (20%); gfx 3413 MHz, mem 8 MHz, gfx busy 100%; throttle 0x1 (ids 0x2)
+Nov 13 13:53:57 atrium-r9700 kernel: atrium_gpu_amd_pci0: smu: busy or at the power limit with no work queued
+Nov 13 13:53:58 atrium-r9700 kernel: atrium_gpu_amd_pci0: smu: sample [detached] 5/5
+Nov 13 13:53:58 atrium-r9700 kernel: atrium_gpu_amd_pci0: smu: TransferTableSmu2Dram      arg 0x00000005: resp 0x1
+Nov 13 13:53:58 atrium-r9700 kernel: atrium_gpu_amd_pci0: smu: telemetry #957: edge 38 C, hotspot 46 C, mem 36 C, VR 38 C; power 62 W of 300 W limit, board 62 W; fan 893 rpm (20%); gfx 3413 MHz, mem 9 MHz, gfx busy 100%; throttle 0 (ids 0)
+Nov 13 13:53:58 atrium-r9700 kernel: atrium_gpu_amd_pci0: smu: busy or at the power limit with no work queued
+Nov 13 13:53:58 atrium-r9700 kernel: atrium_gpu_amd_pci0: si: card NOT idle at detach
+Nov 13 13:53:58 atrium-r9700 kernel: atrium_gpu_amd_pci0: si: stage 5a: detached
+Nov 13 13:53:58 atrium-r9700 kernel: atrium_gpu_amd_pci0: smu: mode 1 reset (card back to its post-POST state)
+Nov 13 13:53:59 atrium-r9700 kernel: atrium_gpu_amd_pci0: smu: after reset: PSP bootloader ready, card cold; sOS 0, memsize 32624 MiB, SMU response 0x1, GB_ADDR_CONFIG 0
+Nov 13 13:53:59 atrium-r9700 kernel: atrium_gpu_amd_pci0: detached
+Nov 13 13:53:59 atrium-r9700 kernel: vgapci0: <VGA-compatible display> port 0x6000-0x60ff mem 0x80000000-0x8fffffff,0x90000000-0x901fffff,0x98100000-0x9817ffff at device 0.0 on pci3
