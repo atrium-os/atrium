@@ -760,6 +760,40 @@ damaged volumes take writes without a panic or hang. capsa-fuse
 Unicode name on FreeBSD, ejects, and on the host fsck.exfat finds it clean
 and Linux reads both files byte for byte: **0 failed** 2026-11-14.
 
+### 6.9 As built: Tessera sticks, read-only (2026-11-14)
+
+A Tessera stick is untrusted like any other until at-rest encryption can
+tell this machine's own disks apart (§4.6), so it is never mounted by
+`tessera_fs`. atrium-capsa-fuse recognises it (`TESSERA1` in either
+superblock copy) and serves it read-only through the Tessera core's reader
+(`tessera/reader.h`, the code the loader boots from, whose on-disk
+decoders are the Rust `tessera-decode`), in the same jail and capability
+mode as the FAT server. The reader gained `tessera_reader_stat_ex` (mode,
+size, times, links) and `tessera_reader_foreach` (directory entries);
+`tessera-sys` binds them, and capsa-fuse's `tessera` feature (default on)
+links the core. The gate cross-builds the core for FreeBSD with clang and
+links it through `TESSERA_CORE_LIB`.
+
+- **Committed state only.** A journal a crash left behind is not
+  replayed: the stick shows what was last committed, and nothing is ever
+  written to it.
+- **Owners and modes** belong to another machine's users, so they are not
+  shown: everything is the session user's (0400 files, 0500 directories),
+  as on FAT.
+- **Symlinks and special files** are left out, and so are names that
+  cannot be file names here (empty, `/`, NUL, not UTF-8). A directory
+  lists at most 2^20 entries.
+
+Tests: `capsa-fuse/tests/tessera.rs` reads volumes made by mkfs-tessera
+(inline and chunked seed files) through the backend and under a real FUSE
+mount (reads match, writes refused, mode and owner as above), and reads 300
+damaged volumes without a panic or hang. Populated volumes with trees need
+the kernel module, so host tests use seed files only; the reader itself is
+the loader's, which atrium-tessera tests on its own. Gate
+`vm-automount-check.sh` adds a Tessera stick: served at `/media/da0`,
+alice reads its file, writes are refused, bob cannot list it, unmounted on
+unplug: **0 failed** 2026-11-14.
+
 ## 7. Not in scope
 
 - New kernel drivers or hardware coverage (Wi-Fi, laptop I²C/SPI sensors).

@@ -64,7 +64,15 @@ echo "== cross-build"
 CROSS_RUSTFLAGS=$(cd "$ROOT" && ARCH=amd64 sh -c '. ./scripts/cloud-vm.sh >/dev/null; printf %s "$CROSS_RUSTFLAGS"' sh env)
 ( cd "$ROOT/portcullis" && RUSTFLAGS="$CROSS_RUSTFLAGS" cargo build -q --release --target $TRIPLE -p jaild ) || { echo "jaild build failed"; exit 1; }
 ( cd "$ROOT/dispensator" && RUSTFLAGS="$CROSS_RUSTFLAGS" cargo build -q --release --target $TRIPLE --bins ) || { echo "dispensator build failed"; exit 1; }
-( cd "$ROOT/capsa" && RUSTFLAGS="$CROSS_RUSTFLAGS" cargo build -q --release --target $TRIPLE -p capsa-fuse ) || { echo "capsa build failed"; exit 1; }
+# The Tessera core (Tessera sticks, read-only) for the guest, from core/Makefile's SRCS.
+CORE="$ROOT/atrium-tessera/core"; COREOUT="$CORE/build-cross-$TRIPLE"; SYSROOT="$VMDIR/sysroot"
+rm -rf "$COREOUT"; mkdir -p "$COREOUT"
+for f in $(sed -n '/^SRCS=/,/[^\\]$/p' "$CORE/Makefile" | sed 's/^SRCS=//; s/\\$//' | tr -s ' \t' '\n' | grep '\.c$'); do
+  clang --target=${TRIPLE}16.0 --sysroot="$SYSROOT" -isystem "$SYSROOT/usr/include" -O2 -fPIC -fno-strict-aliasing \
+    -I"$CORE/include" -I"$CORE/src" -D__libtessera_core__ -DTESSERA_RUST_DECODE -c "$CORE/src/$f" -o "$COREOUT/${f%.c}.o" || { echo "core: $f failed"; exit 1; }
+done
+llvm-ar-18 rcs "$COREOUT/libtessera_core.a" "$COREOUT"/*.o 2>/dev/null || ar rcs "$COREOUT/libtessera_core.a" "$COREOUT"/*.o
+( cd "$ROOT/capsa" && TESSERA_CORE_LIB="$COREOUT" RUSTFLAGS="$CROSS_RUSTFLAGS" cargo build -q --release --target $TRIPLE -p capsa-fuse ) || { echo "capsa build failed"; exit 1; }
 
 echo "== the stick (MBR, one FAT32 partition from 1 MiB)"
 IMG=$VMDIR/stick.img
@@ -81,6 +89,11 @@ mkfs.fat -F 32 --offset 2048 -n STICK "$IMG" $(( (96*1024*1024 - 1048576) / 1024
 # An exFAT stick (no partition table, as many come).
 IMG3=$VMDIR/exfat.img
 rm -f "$IMG3"; truncate -s 128M "$IMG3"; mkfs.exfat -L XSTICK "$IMG3" >/dev/null && echo "  exFAT stick image ready" || { echo "  could not build the exFAT image"; exit 1; }
+# A Tessera stick (another Atrium machine's), seeded on this side.
+IMG4=$VMDIR/tessera.img; MKT="$ROOT/atrium-tessera/rs/target/debug/mkfs-tessera"
+[ -x "$MKT" ] || ( cd "$ROOT/atrium-tessera/rs" && cargo build -q -p tessera-tools ) || { echo "  could not build mkfs-tessera"; exit 1; }
+rm -f "$IMG4"; "$MKT" --create -s 64 --seed-file notes.txt --seed-content "from another atrium" "$IMG4" >/dev/null \
+  && echo "  Tessera stick image ready" || { echo "  could not build the Tessera image"; exit 1; }
 # And one with FAT straight on the disk ("superfloppy").
 IMG2=$VMDIR/bare.img
 rm -f "$IMG2"; mkfs.fat -C -F 32 -n BARE "$IMG2" $((80*1024)) >/dev/null \
@@ -251,6 +264,20 @@ else
   echo "  (no exfat-fuse here: cross-read skipped)"
 fi
 [ -n "$L" ] && losetup -d "$L"
+echo "== a Tessera stick, read-only"
+login alice
+plug 5$RUN "$IMG4"
+PART=$DA; M=/media/$DA
+if [ -n "$DA" ] && mounted; then
+  ok "Tessera served at $M"
+  [ "$(V "su -m alice -c 'cat $M/notes.txt'")" = "from another atrium" ] && ok "alice reads the file on it" || bad "notes.txt: '$(V "su -m alice -c 'cat $M/notes.txt'" 2>&1)'"
+  V "su -m alice -c 'echo x > $M/new.txt' 2>/dev/null" && bad "a write went through" || ok "writes refused"
+  V "su -m bob -c 'ls $M' >/dev/null 2>&1" && bad "bob can list it" || ok "bob cannot list it"
+else
+  bad "Tessera not served ($(V "tail -3 /var/log/atrium/dispensatord.log | tr '\n' ';'"))"
+fi
+unplug 5$RUN
+mounted && bad "still mounted after unplug" || ok "unplugged: unmounted"
 login ""
 V "grep -E 'capsa|session|eject' /var/log/atrium/dispensatord.log | tail -8" | sed 's/^/  log: /'
 

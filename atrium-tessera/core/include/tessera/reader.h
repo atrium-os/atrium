@@ -69,6 +69,20 @@ int tessera_reader_readdir(tessera_reader_t *, uint32_t dir_ino, uint32_t idx,
                            char *name_out, size_t name_cap,
                            uint64_t *out_child_ino, uint32_t *out_child_mode);
 
+/* As tessera_reader_stat_ino, plus mtime and ctime (ns since the epoch)
+ * and the link count. Any out may be NULL. */
+int tessera_reader_stat_ex(tessera_reader_t *, uint32_t ino, uint32_t *out_mode,
+                           uint64_t *out_size, uint64_t *out_mtime_ns,
+                           uint64_t *out_ctime_ns, uint32_t *out_nlink);
+
+/* Every entry of directory `dir_ino` in one walk ("." and ".." left out):
+ * `fn` gets the child inode and its name (not NUL-terminated); a non-zero
+ * return stops the walk. Returns 0, or TESSERA_ENOENT for no such inode. */
+typedef int (*tessera_reader_entry_fn)(void *ctx, uint64_t child,
+                                       const char *name, uint16_t nlen);
+int tessera_reader_foreach(tessera_reader_t *, uint32_t dir_ino,
+                           tessera_reader_entry_fn fn, void *ctx);
+
 #ifdef __cplusplus
 }
 #endif

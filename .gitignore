@@ -119,6 +119,7 @@ vm/atrium-apps.img
 # tessera-core host/fuzz build trees (see scripts/core-host-tests.sh)
 atrium-tessera/core/build-host/
 atrium-tessera/core/build-host-san/
+atrium-tessera/core/build-cross-*/
 atrium-tessera/core/build-fuzz/
 atrium-tessera/core/build-fuzz-rs/
 atrium-tessera/core/build-host-rs/

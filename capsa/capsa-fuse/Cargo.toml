@@ -9,6 +9,13 @@ description = "Capsa's FUSE server: serves a capsa-fat volume over a /dev/fuse f
 [dependencies]
 capsa-fat = { path = "../capsa-fat" }
 libc = "0.2"
+# Tessera sticks, read-only, through the Tessera core's reader (its decoders
+# are Rust). For FreeBSD, TESSERA_CORE_LIB names the cross-built core.
+tessera-sys = { path = "../../atrium-tessera/rs/tessera-sys", optional = true }
+
+[features]
+default = ["tessera"]
+tessera = ["dep:tessera-sys"]
 
 [[bin]]
 name = "atrium-capsa-fuse"

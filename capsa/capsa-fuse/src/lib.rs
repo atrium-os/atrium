@@ -12,6 +12,8 @@
 pub mod backend;
 pub mod proto;
 pub mod server;
+#[cfg(feature = "tessera")]
+pub mod tessera;
 
 pub use backend::{Attr, Backend};
 pub use server::{serve, Options};

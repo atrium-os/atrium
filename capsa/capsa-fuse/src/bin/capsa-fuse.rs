@@ -8,7 +8,8 @@
 //! In Atrium jaild opens the partition and `/dev/fuse`, mounts fusefs on
 //! the session's media directory from outside the jail, and starts this in
 //! a jail with only those two descriptors (docs/spec/device-assignment.md
-//! §4.6). FAT12/16/32 and exFAT are served read-write unless `--ro`.
+//! §4.6). FAT12/16/32 and exFAT are served read-write unless `--ro`;
+//! Tessera read-only.
 
 use std::fs::File;
 use std::os::fd::FromRawFd;
@@ -95,6 +96,21 @@ fn main() -> ExitCode {
     if let Err(e) = dev.read_at(0, &mut head) {
         eprintln!("atrium-capsa-fuse: {e}");
         return ExitCode::FAILURE;
+    }
+    #[cfg(feature = "tessera")]
+    if capsa_fuse::tessera::is_tessera(&mut dev) {
+        // Read-only until Tessera's encryption can vouch for a disk.
+        let r = match capsa_fuse::tessera::TesseraVolume::open(dev) {
+            Ok(v) => serve(v, fuse, Options { read_only: true, ..opts }),
+            Err(e) => return fail(e),
+        };
+        return match r {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(e) => {
+                eprintln!("atrium-capsa-fuse: /dev/fuse: {e}");
+                ExitCode::FAILURE
+            }
+        };
     }
     let r = if &head[3..11] == b"EXFAT   " {
         match ExVolume::open(dev) {

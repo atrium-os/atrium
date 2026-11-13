@@ -31,7 +31,10 @@
 
 /* inode record field offsets (packed tessera_inode_record_t) */
 #define INO_OFF_MODE     8u
+#define INO_OFF_MTIME    32u
+#define INO_OFF_CTIME    40u
 #define INO_OFF_SIZE     56u
+#define INO_OFF_NLINK    64u
 #define INO_OFF_MANIFEST 72u
 /* registry entry field offsets (packed tessera_registry_entry_t) */
 #define REG_OFF_START    16u
@@ -803,5 +806,50 @@ tessera_reader_readdir(tessera_reader_t *rd, uint32_t dir_ino, uint32_t idx,
 		(void)tessera_reader_stat_ino(rd, (uint32_t)c.child, &cm, NULL);
 		*out_child_mode = cm;
 	}
+	return TESSERA_OK;
+}
+
+/* ── for a FUSE server: times, and one walk per directory ─────────── */
+
+int
+tessera_reader_stat_ex(tessera_reader_t *rd, uint32_t ino, uint32_t *out_mode,
+                       uint64_t *out_size, uint64_t *out_mtime_ns,
+                       uint64_t *out_ctime_ns, uint32_t *out_nlink)
+{
+	tessera_btree_t *t = tessera_btree_open(&rd->io, rd->inode_root,
+	    TESSERA_BTREE_KIND_INODE, 4, INOREC);
+	if (t == NULL) return TESSERA_EIO;
+	uint8_t key[4], val[INOREC];
+	ino_key_be(ino, key);
+	int rc = tessera_btree_get(t, key, val);
+	tessera_btree_close(t);
+	if (rc != TESSERA_OK) return TESSERA_ENOENT;
+	if (out_mode) *out_mode = rd_u32(val, INO_OFF_MODE);
+	if (out_size) *out_size = rd_u64(val, INO_OFF_SIZE);
+	if (out_mtime_ns) *out_mtime_ns = rd_u64(val, INO_OFF_MTIME);
+	if (out_ctime_ns) *out_ctime_ns = rd_u64(val, INO_OFF_CTIME);
+	if (out_nlink) *out_nlink = rd_u32(val, INO_OFF_NLINK);
+	return TESSERA_OK;
+}
+
+struct each_ctx { tessera_reader_entry_fn fn; void *ctx; };
+static int
+each_cb(void *vctx, uint64_t child, const char *name, uint16_t nlen)
+{
+	struct each_ctx *c = vctx;
+	if (nlen == 1 && name[0] == '.') return 0;
+	if (nlen == 2 && name[0] == '.' && name[1] == '.') return 0;
+	return c->fn(c->ctx, child, name, nlen);
+}
+
+int
+tessera_reader_foreach(tessera_reader_t *rd, uint32_t dir_ino,
+                       tessera_reader_entry_fn fn, void *ctx)
+{
+	uint32_t mode; uint64_t size; uint8_t mhash[32];
+	if (inode_manifest(rd, dir_ino, mhash, &mode, &size) != TESSERA_OK)
+		return TESSERA_ENOENT;
+	struct each_ctx c = { fn, ctx };
+	walk_dir(rd, mhash, each_cb, &c, 0);
 	return TESSERA_OK;
 }

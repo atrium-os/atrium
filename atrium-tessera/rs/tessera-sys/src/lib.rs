@@ -534,3 +534,26 @@ pub mod btree_fail {
     pub const HEADER: i32 = 2;
     pub const KIND: i32 = 3;
 }
+
+/* ── read-only path/content reader (tessera/reader.h) ────────── */
+
+#[repr(C)]
+pub struct tessera_reader_t {
+    _opaque: [u8; 0],
+}
+
+pub type tessera_reader_entry_fn =
+    extern "C" fn(ctx: *mut c_void, child: u64, name: *const core::ffi::c_char, nlen: u16) -> c_int;
+
+extern "C" {
+    pub fn tessera_reader_open(io: *const tessera_block_io_t) -> *mut tessera_reader_t;
+    pub fn tessera_reader_close(rd: *mut tessera_reader_t);
+    pub fn tessera_reader_root_ino(rd: *const tessera_reader_t) -> u32;
+    pub fn tessera_reader_stat_ex(rd: *mut tessera_reader_t, ino: u32, out_mode: *mut u32,
+                                  out_size: *mut u64, out_mtime_ns: *mut u64,
+                                  out_ctime_ns: *mut u64, out_nlink: *mut u32) -> c_int;
+    pub fn tessera_reader_pread(rd: *mut tessera_reader_t, ino: u32, off: u64,
+                                buf: *mut c_void, len: usize, out_read: *mut usize) -> c_int;
+    pub fn tessera_reader_foreach(rd: *mut tessera_reader_t, dir_ino: u32,
+                                  f: tessera_reader_entry_fn, ctx: *mut c_void) -> c_int;
+}
