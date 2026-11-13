@@ -593,3 +593,9 @@ through fd passing, close and jail death.
   the VMID check: right after ADD_QUEUE only process 0 was resident (me1 pipe 1 queue 0,
   VMID 8); MES maps a user queue onto an HQD when its doorbell brings work. Fix: read the
   VMIDs again after both ran (queues stay mapped until REMOVE_QUEUE).
+- 2026-11-13 01:38, **stage 5c-1 PASSED** (be750894; log /root/runs/20261113T013722Z.log).
+  5b PASS again; two MES user queues in their own VMs at the same VAs both fenced with
+  64 x 42 on their own pages; after both ran MES had them on two HQDs (me1 pipe 1 queue 0
+  VMID 8, me1 pipe 0 queue 1 VMID 9); no faults in the user-queue phase; both removed,
+  no HQD left. Attached 30 s at 13 W, dispatch PASS at detach, mode 1 reset cold, stray 0.
+  Next: 5c-2, the queue fd / kqueue / doorbell-mapping interface on top.
