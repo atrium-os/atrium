@@ -128,6 +128,8 @@ static const struct mes_gen mes_gens[] = {
 #define WB_SCH_CTX		0x20
 #define WB_QUERY_FENCE		0x28
 #define WB_SUSPEND_FENCE	0x40	/* pipe 0: SUSPEND's fence (kernel's) */
+#define BLK_HANG		0x4400u	/* MESAPI__RESET's hung-queue list */
+#define BLK_HANG_SIZE		0x0c00u	/* db offsets, then HQD ids */
 #define BLK_RES1(p)		(0x5000u + (p) * 0x1000u)
 #define BLK_SIZE		0x7000u
 /*
@@ -201,6 +203,8 @@ static const struct mes_gen mes_gens[] = {
 #define RST_FLAGS		4	/* bit 0 reset_queue_only */
 #define RST_GANG_CTX		8
 #define RST_DOORBELL		16
+#define RST_DB_ADDR		24	/* doorbell_offset_addr (hang list) */
+#define RST_HANG_DETECT_RESET	0x00000002u
 #define RST_QUEUE_TYPE		32
 #define RST_API_STATUS		112
 #define HW_VMID_MMHUB		4
@@ -254,6 +258,7 @@ static const struct mes_gen mes_gens[] = {
 #define RQ_GANG_CTX		8
 #define RQ_FLAGS		16	/* dw 4 */
 #define RQ_UNMAP_LEGACY		0x00000008u
+#define RQ_AFTER_RESET		0x00000010u	/* remove_queue_after_reset */
 #define RQ_API_STATUS		24
 #define RQ_PIPE_ID		40
 #define RQ_QUEUE_ID		44
@@ -2796,6 +2801,129 @@ amd_mes12_uq_free_lost(struct amd_uq *q, device_t dev)
 }
 
 /*
+ * Per-queue recovery of a queue whose CP stopped on an error (a refused
+ * privileged register write, a CPG fault): amdgpu's order for a hung MES
+ * user queue (amdgpu_gfx_reset_mes_compute, mes_userq_reset; MES 0x5a+):
+ * SUSPEND all gangs; if that does not complete, MESAPI__RESET with
+ * hang_detect_then_reset (MES finds and resets the hung queues and lists
+ * them); MES's reset of this queue by doorbell; REMOVE_QUEUE (again with
+ * remove_queue_after_reset, so MES drops its state instead of asking the
+ * wedged CP to unmap it); RESUME all. Box runs a0597b2d..a652163f sent
+ * RESET and REMOVE without suspending first, and MES refused both.
+ * true: the queue's HQD is gone and MES took the rest back.
+ */
+#define SU_FLAGS		4
+#define SU_ALL			0x00000001u
+#define RS_FLAGS		4
+#define RS_ALL			0x00000001u
+
+static int
+uq_suspend_all(struct mes *m, bool *fenced)
+{
+	uint32_t pkt[API_DW], v;
+	uint8_t *b = (uint8_t *)pkt;
+	int err, us;
+
+	v = ++m->suspend_seq;
+	memset(pkt, 0, sizeof(pkt));
+	pkt[0] = HDR_SUSPEND;
+	put32(b, SU_FLAGS, SU_ALL);
+	put64(b, SU_FENCE_ADDR, m->va + BLK_WB(0) + WB_SUSPEND_FENCE);
+	put32(b, SU_FENCE_VALUE, v);
+	*fenced = false;
+	if ((err = mes_api(m, 0, pkt, SU_API_STATUS, "SUSPEND (all gangs)")) !=
+	    0)
+		return (err);
+	for (us = 0; us < UQ2_SUSPEND_WAIT_US &&
+	    (uint32_t)*p64(m, BLK_WB(0) + WB_SUSPEND_FENCE) != v; us += 10)
+		DELAY(10);
+	*fenced = (uint32_t)*p64(m, BLK_WB(0) + WB_SUSPEND_FENCE) == v;
+	return (0);
+}
+
+static int
+uq_resume_all(struct mes *m)
+{
+	uint32_t pkt[API_DW];
+	uint8_t *b = (uint8_t *)pkt;
+
+	memset(pkt, 0, sizeof(pkt));
+	pkt[0] = HDR_RESUME;
+	put32(b, RS_FLAGS, RS_ALL);
+	return (mes_api(m, 0, pkt, RS_API_STATUS, "RESUME (all gangs)"));
+}
+
+/* MESAPI__RESET hang_detect_then_reset; logs the hung queues MES lists. */
+static int
+uq_hang_reset(struct mes *m)
+{
+	uint32_t pkt[API_DW], *list = (uint32_t *)(m->blk + BLK_HANG);
+	uint8_t *b = (uint8_t *)pkt;
+	u_int i, n = BLK_HANG_SIZE / 8;
+	int err;
+
+	memset(list, 0xff, BLK_HANG_SIZE);
+	wmb();
+	memset(pkt, 0, sizeof(pkt));
+	pkt[0] = HDR_RESET;
+	put32(b, RST_FLAGS, RST_HANG_DETECT_RESET);
+	put64(b, RST_DB_ADDR, m->va + BLK_HANG);
+	put32(b, RST_QUEUE_TYPE, QUEUE_TYPE_COMPUTE);
+	err = mes_api(m, 0, pkt, RST_API_STATUS, "RESET (hang detect, reset)");
+	rmb();
+	for (i = 0; i < n; i++)
+		if (list[i] != 0xffffffffu && list[i] != 0)
+			device_printf(m->sc->dev, "mes: hung queue %u: doorbell "
+			    "%#x\n", i, list[i]);
+	return (err);
+}
+
+static int
+uq_remove_after_reset(struct mes *m, uint64_t gva, uint32_t db)
+{
+	uint32_t pkt[API_DW];
+	uint8_t *b = (uint8_t *)pkt;
+
+	memset(pkt, 0, sizeof(pkt));
+	pkt[0] = HDR_REMOVE_QUEUE;
+	put32(b, RQ_DOORBELL, db);
+	put64(b, RQ_GANG_CTX, gva + UQ_G_GANG);
+	put32(b, RQ_FLAGS, RQ_AFTER_RESET);
+	put32(b, RQ_QUEUE_TYPE, QUEUE_TYPE_COMPUTE);
+	return (mes_api(m, 0, pkt, RQ_API_STATUS,
+	    "REMOVE_QUEUE (user compute, after reset)"));
+}
+
+static bool
+uq2_recover(struct amd_uq *q)
+{
+	struct mes *m = q->m;
+	bool fenced = false, gone;
+	int serr, herr = 0, rerr, err, aerr;
+	u_int vmid;
+
+	device_printf(m->sc->dev, "uq%u: per-queue recovery: suspend all, "
+	    "hang detect, MES reset, remove, resume all\n", q->slot);
+	mes_report(m, "per-queue recovery: before");
+	serr = uq_suspend_all(m, &fenced);
+	if (serr != 0 || !fenced)
+		herr = uq_hang_reset(m);
+	rerr = uq_reset_raw(m, q->gva, q->db);
+	err = uq_remove_raw(m, q->gva, q->db);
+	if (err != 0)
+		err = uq_remove_after_reset(m, q->gva, q->db);
+	gone = !uq2_hqd_find(m, q->db, &vmid);
+	aerr = uq_resume_all(m);
+	mes_report(m, "per-queue recovery: after");
+	device_printf(m->sc->dev, "uq%u: per-queue recovery: suspend %d "
+	    "(fence %s), hang reset %d, MES reset %d, remove %d, HQD %s, "
+	    "resume %d: %s\n", q->slot, serr, fenced ? "landed" : "missing",
+	    herr, rerr, err, gone ? "gone" : "STILL ACTIVE", aerr,
+	    gone && err == 0 && aerr == 0 ? "RECOVERED" : "failed");
+	return (gone && err == 0 && aerr == 0);
+}
+
+/*
  * Evict: take the queue off MES, keeping its memory (a lost queue: its
  * close frees it later). Destroy: evict and free. If its last job has not fenced,
  * first kill the waves of the VMID MES runs it under and give the fence a
@@ -2833,6 +2961,10 @@ amd_mes12_uq_evict(struct amd_uq *q)
 	 */
 	if (q->added && !uq2_done(q) && !uq2_hqd_reset(q)) {
 		amd_mes12_uq_report(q, "HQD stuck after its reset");
+		if (uq2_recover(q)) {
+			q->added = false;
+			return (0);
+		}
 		device_printf(m->sc->dev, "uq%u: HQD will not stop; the GPU "
 		    "must be reset\n", q->slot);
 		return (EBUSY);
