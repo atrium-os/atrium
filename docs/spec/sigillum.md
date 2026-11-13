@@ -890,7 +890,13 @@ administrative calls (`C_InnaIT*`: zeroize, initialise, applet install and delet
 **Plan.**
 
 1. **P1.** Grow the Hospes shim to the module's libc imports. Add the libstdc++ route:
-   load real libstdc++ and libgcc_s, and cover their imports.
+   load real libstdc++, and cover its imports. Measured 2026-11-13 against Ubuntu 20.04's
+   libstdc++ 10.5 (`libstdc++.so.6.0.28`), with the import lists kept in
+   `hospes/probe/h0-data/`: 182 glibc symbols are still missing across the module and
+   libstdc++. Most are network or process calls that fail cleanly, string and stdio
+   functions, and libstdc++'s "C"-locale entry points (`__newlocale`, `__uselocale`,
+   `__strcoll_l`…). Hospes's own `_Unwind_*` replaces libgcc_s. The Hospes loader also has
+   to load more than one library and bind the module's C++ imports to libstdc++.
 2. **P2.** `SCard*` over `sigillum-ccid`. The CCID transport is built: descriptor, bulk
    messages, ATR, APDUs, chaining, with 15 host tests on this token's real descriptor and
    ATR.
