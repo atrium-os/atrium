@@ -9,6 +9,13 @@
 #   run-vm.sh --virtio-gpu --display --tablet # also absolute mouse (more battery cost)
 #   run-vm.sh --gpu --virtio-gpu              # both (transitional during D0)
 #
+# Which VM: ~/atrium-vm (VMDIR; its vm.qcow2 ZFS image, code.fd, vars.fd), the
+# Mac's dev VM since 2026-11-13, unless the Tessera devroot set
+# (vm/tessera-devroot.img, atrium-apps.img, atrium-scratch.img) is here or
+# VM=devroot asks for it. ~/atrium-vm's serial and monitor are unix sockets in
+# VMDIR (serial.sock, mon.sock), as scripts/sigillum-fido-vm.sh and the VM
+# gates expect. Both boot the atrium-os/qemu fork (scripts/build-qemu.sh).
+#
 # Tunables (env vars):
 #   SMP=N        vCPU count, default 4. Lower = less host wakeup overhead
 #                when the guest is idle. 2 is plenty for shell + cargo work.
@@ -436,6 +443,35 @@ if [ "$ALL_DISKS" = 1 ]; then
       -device virtio-blk-pci,drive=storagedrv,serial=atrium-storage,config-wce=on \
       -drive file=$BSD_DIR/vm/tessera-root.img,format=raw,cache=writeback,if=none,id=tessrootdrv \
       -device virtio-blk-pci,drive=tessrootdrv,serial=tessera-root,config-wce=on"
+fi
+
+VMDIR="${VMDIR:-$HOME/atrium-vm}"
+if [ "${VM:-}" != devroot ] && { [ "${VM:-}" = atrium-vm ] || [ ! -f "$BSD_DIR/vm/tessera-devroot.img" ]; }; then
+    [ -f "$VMDIR/vm.qcow2" ] || { echo "error: no $VMDIR/vm.qcow2 (and no vm/tessera-devroot.img)" >&2; exit 1; }
+    if pgrep -f "file=$VMDIR/vm.qcow2" >/dev/null; then echo "error: a qemu already holds $VMDIR/vm.qcow2" >&2; exit 1; fi
+    [ "$NOGRAPHIC" = "-display none -serial tcp:127.0.0.1:4444,server=on,wait=off -monitor unix:/tmp/qmp.sock,server=on,wait=off" ] &&
+        NOGRAPHIC="-display none -serial unix:$VMDIR/serial.sock,server=on,wait=off -monitor unix:$VMDIR/mon.sock,server=on,wait=off"
+    rm -f "$VMDIR/serial.sock" "$VMDIR/mon.sock"
+    exec "$QEMU" \
+        -L "$QEMU_DIR/pc-bios" \
+        -d guest_errors -D /tmp/qemu-guest-errors.log \
+        -accel hvf -cpu host -machine virt,gic-version=3 \
+        -smp "$SMP" -m "$MEM" \
+        -drive if=pflash,format=raw,unit=0,file="$VMDIR/code.fd",readonly=on \
+        -drive if=pflash,format=raw,unit=1,file="$VMDIR/vars.fd" \
+        -drive file="$VMDIR/vm.qcow2",format=qcow2,cache=writeback,if=none,id=zfsd \
+        -device virtio-blk-pci,drive=zfsd,bootindex=0 \
+        -device virtio-net-pci,netdev=net0 \
+        -netdev user,id=net0,hostfwd=tcp:127.0.0.1:2222-:22 \
+        -fsdev local,id=share,path="$SHARE_DIR",security_model=none \
+        -device virtio-9p-pci,fsdev=share,mount_tag=bsd_share \
+        $NOGRAPHIC \
+        $DISPLAY_FRONTEND \
+        $GPU_ARGS \
+        $VIRTIO_GPU_ARGS \
+        $GPUSIM_ARGS \
+        $AUDIO_ARGS \
+        $KGDB_ARGS
 fi
 
 exec "$QEMU" \

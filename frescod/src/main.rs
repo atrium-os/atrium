@@ -214,6 +214,7 @@ fn main() -> std::io::Result<()> {
      * input, compositor events) and consumed by the display loop so it
      * recomposes on change instead of spinning at TARGET_FPS. */
     let redraw = redraw::RedrawSignal::new();
+    lock::watch(comp.clone(), redraw.clone());
     /* Video layers (fresco-video.md): composed as pixels, so only by
      * the compute renderer; with another, creating one is refused. */
     if renderer.takes_pixels() {
@@ -1237,6 +1238,7 @@ fn run_headless(png: &str) -> std::io::Result<()> {
     let wm_sock = Some(std::env::var("FRESCOD_WM_SOCK").map(PathBuf::from)
         .unwrap_or_else(|_| PathBuf::from("/atrium/sockets/fresco-wm/fresco-wm.sock")));
     let redraw2 = redraw::RedrawSignal::new();
+    lock::watch(comp.clone(), redraw2.clone());
     /* Video layers (fresco-video.md): composed as pixels, so only by
      * the compute renderer; with another, creating one is refused. */
     if renderer.takes_pixels() {

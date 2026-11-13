@@ -29,6 +29,27 @@ fn seat_path() -> String {
     std::env::var("FRESCOD_SEAT").ok().filter(|s| !s.is_empty()).unwrap_or_else(|| portcullis_peer::seat::ACTIVE_SESSION.to_string())
 }
 
+/// Follow the lock files on a thread: on a change, apply it to the
+/// compositor and the input routing at once and redraw, so a lock takes
+/// effect within [`POLL`] even on a screen that is not otherwise redrawn.
+pub fn watch(comp: std::sync::Arc<Mutex<fresco_scene_server::window::Compositor>>, redraw: crate::redraw::Redraw) {
+    let _ = std::thread::Builder::new().name("frescod-lock".into()).spawn(move || {
+        let mut last: Option<Vec<u32>> = None;
+        loop {
+            let v = read(&seat_path(), crate::activation::sheet_uids());
+            if v != last {
+                // Routing first: from here no input reaches a session window or the WM.
+                LOCKED.store(v.is_some(), Ordering::Relaxed);
+                comp.lock().unwrap().set_lock(v.clone());
+                eprintln!("frescod: screen {}", if v.is_some() { "locked" } else { "unlocked" });
+                last = v;
+                redraw.wake();
+            }
+            std::thread::sleep(POLL);
+        }
+    });
+}
+
 /// The uids shown while locked, or `None` when the session is not locked.
 /// Read at most every [`POLL`].
 pub fn current() -> Option<Vec<u32>> {

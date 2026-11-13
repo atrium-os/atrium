@@ -8,6 +8,9 @@
 //! With `PROBE_PAD_CLAIM=1` it claims the first pad it is given
 //! (fresco-capabilities.md §4) and prints `pad-claim` lines.
 //!
+//! `PROBE_COLOR=r,g,b` (0..1 each) fills the window with that colour
+//! (the lock gate tells its windows apart in a screenshot).
+//!
 //! Usage: atrium-input-probe [fresco socket] [seconds]
 
 use std::time::{Duration, Instant};
@@ -23,7 +26,9 @@ fn main() -> std::io::Result<()> {
     let win = conn.window_create(w, h, "input-probe", WindowHints::default())?;
     conn.set_default_window(win as u16);
     conn.scene_frame_begin()?;
-    conn.scene_node_rect(1, RectParams { x: 0.0, y: 0.0, w: w as f32, h: h as f32, r: 0.1, g: 0.3, b: 0.2, a: 1.0, radius: 0.0 })?;
+    let c: Vec<f32> = std::env::var("PROBE_COLOR").ok().map(|v| v.split(',').filter_map(|x| x.trim().parse().ok()).collect()).unwrap_or_default();
+    let (r, g, b) = match c[..] { [r, g, b] => (r, g, b), _ => (0.1, 0.3, 0.2) };
+    conn.scene_node_rect(1, RectParams { x: 0.0, y: 0.0, w: w as f32, h: h as f32, r, g, b, a: 1.0, radius: 0.0 })?;
     conn.scene_frame_end()?;
     println!("input-probe: window {win}");
     let end = Instant::now() + Duration::from_secs(secs);
