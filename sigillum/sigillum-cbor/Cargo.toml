@@ -1,0 +1,8 @@
+[package]
+name = "sigillum-cbor"
+version = "0.1.0"
+description = "Bounded CBOR for CTAP2 (sigillum.md §6.1): canonical encoder, strict decoder with depth and size caps"
+edition.workspace = true
+license.workspace = true
+
+[dependencies]

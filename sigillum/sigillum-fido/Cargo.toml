@@ -1,0 +1,16 @@
+[package]
+name = "sigillum-fido"
+version = "0.1.0"
+description = "Sigillum's FIDO driver (sigillum.md §6.1): CTAP over one device, answering sigillumd with capped records. S1: the logic; the hidraw binary and jail arrive in S2"
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+sigillum-cbor = { path = "../sigillum-cbor" }
+sigillum-ctap = { path = "../sigillum-ctap" }
+sigillum-proto = { path = "../sigillum-proto" }
+sha2 = { workspace = true }
+p256 = { workspace = true }
+
+[dev-dependencies]
+sigillum-softkey = { path = "../sigillum-softkey" }

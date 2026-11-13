@@ -1,0 +1,14 @@
+[package]
+name = "sigillum-softkey"
+version = "0.1.0"
+description = "A CTAP 2.1 authenticator in memory, over CTAPHID: the device in Sigillum's host tests (sigillum.md §15)"
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+sigillum-cbor = { path = "../sigillum-cbor" }
+sigillum-ctap = { path = "../sigillum-ctap" }
+p256 = { workspace = true }
+sha2 = { workspace = true }
+getrandom = { workspace = true }
+zeroize = { workspace = true }

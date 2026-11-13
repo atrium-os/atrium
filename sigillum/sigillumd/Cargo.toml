@@ -1,0 +1,18 @@
+[package]
+name = "sigillumd"
+version = "0.1.0"
+description = "Sigillum's broker (sigillum.md §7): ceremonies, policy and client labels; no devices, no network, reads only capped driver records"
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+sigillum-proto = { path = "../sigillum-proto" }
+sha2 = { workspace = true }
+
+[dev-dependencies]
+sigillum-fido = { path = "../sigillum-fido" }
+sigillum-softkey = { path = "../sigillum-softkey" }
+sigillum-ctap = { path = "../sigillum-ctap" }
+sigillum-cbor = { path = "../sigillum-cbor" }
+p256 = { workspace = true }
+zeroize = { workspace = true }

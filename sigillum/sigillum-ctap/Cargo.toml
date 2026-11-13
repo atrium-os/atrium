@@ -1,0 +1,20 @@
+[package]
+name = "sigillum-ctap"
+version = "0.1.0"
+description = "CTAPHID framing, the CTAP 2.1 client side and its parsers (sigillum.md §6.1); sans-I/O"
+edition.workspace = true
+license.workspace = true
+
+[dev-dependencies]
+sigillum-softkey = { path = "../sigillum-softkey" }
+
+[dependencies]
+sigillum-cbor = { path = "../sigillum-cbor" }
+p256 = { workspace = true }
+sha2 = { workspace = true }
+hmac = { workspace = true }
+hkdf = { workspace = true }
+aes = { workspace = true }
+cbc = { workspace = true }
+getrandom = { workspace = true }
+zeroize = { workspace = true }

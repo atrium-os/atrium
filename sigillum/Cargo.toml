@@ -1,0 +1,35 @@
+# Sigillum, the identity verification service (docs/spec/sigillum.md).
+#
+# Its own workspace with no path dependency outside sigillum/, like Vinculum,
+# so the device drivers and the broker's policy build and test anywhere.
+# Atrium-only seams (the launch registry, frescod's press, jails) arrive in S2
+# behind an `atrium` feature.
+[workspace]
+resolver = "2"
+members = [
+    "sigillum-cbor",
+    "sigillum-ctap",
+    "sigillum-softkey",
+    "sigillum-proto",
+    "sigillum-fido",
+    "sigillumd",
+    
+    
+    
+]
+
+[workspace.package]
+edition = "2021"
+license = "BSD-2-Clause"
+
+[workspace.dependencies]
+p256     = { version = "0.13", features = ["ecdsa", "ecdh"] }
+sha2     = "0.10"
+hmac     = "0.12"
+hkdf     = "0.12"
+aes      = "0.8"
+cbc      = "0.1"
+getrandom = { version = "0.2", features = ["std"] }
+zeroize  = "1"
+serde    = { version = "1", features = ["derive"] }
+postcard = { version = "1", features = ["use-std"] }

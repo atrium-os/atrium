@@ -3,7 +3,7 @@
 **Status:** proposed 2026-11-13 at Shankar's request ("identity verification in Atrium.
 Fingerprint, FIDO2, USB stick certificate etc. The Navigator needs to be able to access these
 when needed. Apply the standard Atrium security, jails and protections"). §17 lists the
-decisions for Shankar, each with a recommendation. Nothing is built yet; S1 (§16) is next.
+decisions for Shankar, each with a recommendation. S1 (§16) is built and host-tested (`sigillum/`); the rest is not.
 **Owner:** the identity thread. The name is a proposal (Latin *sigillum*: a personal seal,
 the ring a Roman pressed into wax to prove a document was his).
 
@@ -438,8 +438,9 @@ A fingerprint works only when **all** hold (Apple's rules, which have held up):
 
 - the user's Arca store is unlocked or screen-locked (keys in memory), never at boot or
   after sign-out: the root key needs the passcode (arca.md §6.1);
-- less than 48 hours since the passcode was last entered, and less than 4 hours since it
-  was last entered if the user has not unlocked with a fingerprint for 6.5 days;
+- less than 48 hours since the last unlock of any kind;
+- not both "the passcode hasn't been entered for 6.5 days" and "no fingerprint unlock in the
+  last 4 hours";
 - fewer than 5 failed matches in a row;
 - the sensor is enrolled for that user, and the enrolment was made with the passcode.
 
@@ -545,7 +546,7 @@ otherwise passes the blobs on without reading them.
 | phase | work | gate |
 |---|---|---|
 | **S0** | this spec | Shankar's decisions (§17) |
-| **S1** | `sigillum/` workspace: `sigillum-cbor` (bounded CTAP2 canonical CBOR), `sigillum-ctap` (CTAPHID framing, CTAP2 GetInfo/MakeCredential/GetAssertion/ClientPIN v2 client, authenticator-data and COSE parsing), `sigillum-softkey`, `sigillum-proto` (§14 wires), `sigillumd` policy core (labels, ceremonies, press gate, driver record checks, fingerprint policy) | host tests: a broker registers and asserts against the soft key with PIN; an app is refused another RP; a lying driver record is refused; fingerprint policy limits |
+| **S1** *(built 2026-11-13, §16.1)* | `sigillum/` workspace: `sigillum-cbor` (bounded CTAP2 canonical CBOR), `sigillum-ctap` (CTAPHID framing, CTAP2 GetInfo/MakeCredential/GetAssertion/ClientPIN v2 client, authenticator-data and COSE parsing), `sigillum-softkey`, `sigillum-proto` (§14 wires), `sigillumd` policy core (labels, ceremonies, press gate, driver record checks, fingerprint policy) | host tests: a broker registers and asserts against the soft key with PIN; an app is refused another RP; a lying driver record is refused; fingerprint policy limits |
 | **S2** | `sigillum-fido` on hidraw; devevents classification; default-hidden hidraw (§5.1) with the input thread; ruleset 27; services.d manifests; `sigillum-ui` sheets on frescod with purpose `IDENTITY` | VM: a FIDO HID device reaches only its driver jail; tactusd gets `EACCES`/no node |
 | **S3** | the Navigator broker's WebAuthn client against Sigillum; Arca `P_CREATE`/`P_ASSERT`/`P_LIST` (with the Arca thread's A4) | e2e: webauthn.io-style local RP registers and logs in with the soft key and with an Arca passkey |
 | **S4** | `VERIFY_USER` with the passcode through ostiarius; Arca verify-each-use served | arca-vm-test: a verify-each-use item is usable after the sheet, not before |
@@ -554,6 +555,40 @@ otherwise passes the blobs on without reading them.
 | **S7** | FIDO over BLE through Vinculum | with Vinculum's B-phases and a BLE key |
 | **S8** | hybrid (phone as authenticator): QR, BLE advert via Vinculum, tunnel through a dedicated Nuntius-style jail allowed only the tunnel servers | needs a phone and decision 9 |
 | **S9** | NFC keys and cards through CCID contactless readers | needs a reader |
+
+### 16.1 As built: S1 (2026-11-13)
+
+- **Where:** `sigillum/`, its own workspace (README there). 32 host tests, `cd sigillum &&
+  cargo test`.
+- **`sigillum-cbor`:** strict decoder (one item, depth ≤ 8, ≤ 2048 items, ≤ 7609 bytes,
+  shortest integers, no tags, floats, indefinite lengths or duplicate keys; key order not
+  enforced on input) and a canonical encoder. RFC 8949 Appendix A vectors pass.
+- **`sigillum-ctap`:** CTAPHID framing and reassembly (sequence, channel, keepalive,
+  error, the 7609-byte cap); CTAP 2.1 requests and responses with caps; authenticator data
+  and COSE keys (P-256 points checked on the curve); PIN/UV auth protocol 2, with HKDF and
+  HMAC checked against values computed independently in Python. A random-bytes and
+  mutation run over every parser (`tests/hostile.rs`) stands in for fuzz targets until S2.
+- **`sigillum-softkey`:** an in-memory CTAP 2.1 authenticator over CTAPHID (P-256, packed
+  self-attestation, PIN protocol 2, resident keys, sign counter) with knobs for "user does
+  not touch" and three lies (wrong RP hash, no UP, a credential that wasn't allowed).
+- **`sigillum-fido`:** the driver logic of §6.1: `GetInfo` to `Hello`, PIN-or-not, the
+  checks of §9.1 on the driver side, attestation rewritten to `none` with a zero AAGUID.
+- **`sigillumd`:** the broker as a pure state machine (`broker.rs`): labels (§7.1), one
+  ceremony at a time, the press gate, PIN round trips, passcode verification through an
+  `CheckPasscode` action, the byte comparisons of §14.2, timeouts, cancel, unplug; the
+  fingerprint policy of §11.4 (`bio.rs`); RP ID syntax (`rp.rs`).
+- **The gate** (`sigillumd/tests/ceremonies.rs`): the Navigator's broker registers with a
+  PIN-protected soft key and signs in with UV, and a relying party verifies the attestation
+  object and the ES256 signature; a key without a PIN works without UV and refuses required
+  UV; a wrong PIN asks again and the key's retry counter recovers; nothing reaches the key
+  without a valid press; an app can use only its own and its private RP; a lying key is
+  caught by the driver and five kinds of lying driver record by the broker; busy, cancel
+  (only by the client that started the ceremony) and unplug end ceremonies cleanly; only
+  arcad and ostiarius may ask `VerifyUser`.
+- **Not yet, by design (S2):** the daemon loop and sockets, the launch registry lookup,
+  `sigillum-ui`, frescod's `IDENTITY` purpose, the hidraw binary and its jail, U2F-only
+  keys, real-key traces. Everything so far has been tested only against our own soft key,
+  so a spec misreading shared by both sides would not show; a real key in S2 is the check.
 
 ## 17. Decisions, with recommendations
 
