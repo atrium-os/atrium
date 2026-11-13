@@ -4,13 +4,17 @@
 #
 #   gpu-stage-run.sh <sha256> <stage>...     stages: 3 4a 4b 4c 4d 4e 5a 5b 5c1
 #   gpu-stage-run.sh <sha256>,<gpu sha256>,<test sha256> 5c2
+#   gpu-stage-run.sh <sha256>,<gpu sha256>,<test sha256>,<suite sha256>,<iso sha256> 5f
 #
 # The kmod must already be at /root/kmod/atrium_gpu_amd_pci.ko. Stage 5c2
 # (the client node on silicon) also needs the gpu module at
 # /root/kmod/atrium_gpu_amd.ko and the userspace test at /root/si-client-test
 # (tests/si_client_test.c), each checked against its sha256: it loads both
 # modules, attaches, runs the test once against /dev/atrium-gpu0, then
-# detaches and unloads both. The script
+# detaches and unloads both. Stage 5f is 5c2 plus the two acceptance suites
+# on queue fds, /root/atrium-gpu-test (tests/atrium_gpu_test.c) and
+# /root/test-gpu-isolation (tests/test_gpu_isolation.c), each run once after
+# si-client-test and checked against its sha256. The script
 # checks its sha256, probes before, clears the kernel message buffer, sets
 # the kenvs for the stages, loads the module and hands it the GPU (attach
 # ends in ENXIO after the mode 1 reset, as designed; with stage 5a it stays
@@ -26,6 +30,8 @@ set -u
 KO=/root/kmod/atrium_gpu_amd_pci.ko
 GPU_KO=/root/kmod/atrium_gpu_amd.ko
 TEST=/root/si-client-test
+SUITE=/root/atrium-gpu-test
+ISO=/root/test-gpu-isolation
 PROBE=/root/atrium-gpu-probe
 GPU_SEL=pci0:3:0:0
 GPU_DEV=vgapci0
@@ -34,14 +40,18 @@ KNOBS="psp_bootload psp_ipfw smu_init gc_up_ok gmc ih gfx mes dispatch attach me
 [ $# -ge 2 ] || { echo "usage: $0 <sha256> <stage>..." >&2; exit 2; }
 shas=$1; shift
 want=${shas%%,*}
-want_gpu=""; want_test=""
+want_gpu=""; want_test=""; want_suite=""; want_iso=""
 case $shas in
+*,*,*,*,*) rest=${shas#*,}; want_gpu=${rest%%,*}; rest=${rest#*,}
+	want_test=${rest%%,*}; rest=${rest#*,}; want_suite=${rest%%,*}
+	want_iso=${rest#*,} ;;
 *,*,*) rest=${shas#*,}; want_gpu=${rest%%,*}; want_test=${rest#*,} ;;
 esac
 
 kenvs=""
 hold=0
 client=0
+suites=0
 for s in "$@"; do
 	case $s in
 	3)  kenvs="$kenvs psp_bootload psp_ipfw smu_init gc_up_ok" ;;
@@ -54,6 +64,7 @@ for s in "$@"; do
 	5b) kenvs="$kenvs psp_bootload psp_ipfw gc_up_ok attach vm_test"; hold=30 ;;
 	5c1) kenvs="$kenvs psp_bootload psp_ipfw gc_up_ok attach vm_test uq_test"; hold=30 ;;
 	5c2) kenvs="$kenvs psp_bootload psp_ipfw gc_up_ok attach client"; hold=10; client=1 ;;
+	5f) kenvs="$kenvs psp_bootload psp_ipfw gc_up_ok attach client"; hold=10; client=1; suites=1 ;;
 	*)  echo "unknown stage $s" >&2; exit 2 ;;
 	esac
 done
@@ -83,6 +94,14 @@ if [ "$client" = 1 ]; then
 	fi
 	echo "sha256 ok: gpu module $g, test $t"
 fi
+if [ "$suites" = 1 ]; then
+	u=$(sha256 -q "$SUITE" 2>/dev/null); i=$(sha256 -q "$ISO" 2>/dev/null)
+	if [ -z "$want_iso" ] || [ "$u" != "$want_suite" ] || [ "$i" != "$want_iso" ]; then
+		echo "REFUSED: $SUITE sha256 $u (want $want_suite), $ISO sha256 $i (want $want_iso)"
+		exit 1
+	fi
+	echo "sha256 ok: suite $u, isolation $i"
+fi
 if kldstat -q -m atrium_gpu_amd_pci 2>/dev/null || kldstat | grep -q atrium_gpu_amd; then
 	echo "REFUSED: an atrium_gpu_amd module is already loaded"
 	exit 1
@@ -101,6 +120,13 @@ if [ "$hold" -gt 0 ]; then
 		ls -l /dev/atrium-gpu0 /dev/atrium-gpu0ctl
 		echo "== si-client-test"
 		timeout 120 "$TEST"; echo "si-client-test rc=$?"
+		if [ "$suites" = 1 ]; then
+			echo "== atrium-gpu-test"
+			timeout 300 "$SUITE"; echo "atrium-gpu-test rc=$?"
+			echo "== test-gpu-isolation"
+			timeout 600 "$ISO"; echo "test-gpu-isolation rc=$?"
+			sysctl dev.atrium_gpu_amd_pci.0.vram 2>/dev/null
+		fi
 		sysctl dev.atrium_gpu_amd.0.isolation 2>/dev/null
 	fi
 	echo "== attached, holding ${hold} s"; temps
