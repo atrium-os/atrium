@@ -95,16 +95,22 @@ impl Geometry {
         if clusters64 == 0 || clusters64 > 0x0FFF_FFF5 {
             return Err(Error::NotFat("cluster count"));
         }
-        let clusters = clusters64 as u32;
+        // A FAT with fewer entries than the data area has clusters limits the
+        // volume to what it can address, as Linux and FreeBSD do: FreeBSD's
+        // newfs_msdos sizes the FAT for the clusters without the two reserved
+        // entries, so its last two clusters are never used. The type still
+        // follows the computed count.
         let fat_bytes = fat_sectors * bps64;
-        let need = match fat_type {
-            FatType::Fat12 => (u64::from(clusters) + 2) * 3 / 2 + 1,
-            FatType::Fat16 => (u64::from(clusters) + 2) * 2,
-            FatType::Fat32 => (u64::from(clusters) + 2) * 4,
+        let entries = match fat_type {
+            FatType::Fat12 => fat_bytes * 2 / 3,
+            FatType::Fat16 => fat_bytes / 2,
+            FatType::Fat32 => fat_bytes / 4,
         };
-        if fat_bytes < need {
+        let addressable = entries.saturating_sub(2);
+        if addressable == 0 {
             return Err(Error::NotFat("FAT too small for the clusters"));
         }
+        let clusters = clusters64.min(addressable) as u32;
         let (root_cluster, active_fat, fsinfo_offset, label_at) = if fat_type == FatType::Fat32 {
             if root_entries != 0 || fs16 != 0 {
                 return Err(Error::NotFat("FAT32 with FAT16 fields"));

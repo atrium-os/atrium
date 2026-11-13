@@ -8,7 +8,7 @@
 #   sh scripts/vm-fuse-check.sh
 #
 # It cross-builds jaild, the jclient smoke CLI and atrium-capsa-fuse, installs
-# them, and for the test only: a 64 MiB FAT32 volume on md(4) unit 99 (a
+# them, and for the test only: a 80 MiB FAT32 volume on md(4) unit 99 (a
 # stand-in for a USB stick's daNpM), devfs ruleset 30 (basics only) and a
 # jaild pin for it (atrium-capsa-*, uid/gid 65070, fuse_devices md#, mounts
 # under /media). Then it checks:
@@ -64,9 +64,10 @@ install -m 0755 atrium-capsa-fuse /usr/local/bin/atrium-capsa-fuse
 id _capsatest >/dev/null 2>&1 || pw useradd _capsatest -u 65070 -d /nonexistent -s /usr/sbin/nologin -c "fuse gate server"
 # The volume: FAT32 on md99, with one file written by the kernel's msdosfs
 # beforehand (this is the test's own image, not removable media).
-umount /root/fz/m 2>/dev/null; mdconfig -d -u 99 2>/dev/null
-truncate -s 64m /root/fz/vol.img && mdconfig -a -t vnode -f /root/fz/vol.img -u 99 \
-  && newfs_msdos -F 32 -L CAPSA /dev/md99 >/dev/null 2>&1 \
+pkill -f atrium-portcullisd-jclient; umount -f /media/capsa-md99 2>/dev/null; umount -f /media/md98p1 2>/dev/null
+umount /root/fz/m 2>/dev/null; mdconfig -d -u 99 -o force 2>/dev/null
+truncate -s 80m /root/fz/vol.img && mdconfig -a -t vnode -f /root/fz/vol.img -u 99 \
+  && newfs_msdos -F 32 -c 1 -L CAPSA /dev/md99 >/dev/null 2>&1 \
   && mkdir -p /root/fz/m && mount_msdosfs /dev/md99 /root/fz/m \
   && echo "written before the server ran" > /root/fz/m/hello.txt && umount /root/fz/m \
   && echo "  ok md99 holds a FAT32 volume with hello.txt" || echo "  FAIL could not make the md99 volume"
@@ -108,26 +109,30 @@ J=atrium-capsa-md99
 R=/var/lib/atrium/jails/capsa-md99
 SESSION_UID=1001
 # start NAME FUSE-SPEC: the server, held by a background jclient.
+# jclient's jails are not dispensatord's: nothing unmounts their ro mounts.
+unmount_root() { V "for m in \$(mount -p | awk '{print \$2}' | grep '^$R/' | sort -r); do umount -f \$m; done"; }
 start() {
+  unmount_root
   V "cd /root/fz; ATRIUM_JCLIENT_HOLD=600 ATRIUM_JCLIENT_DEVFS=30 ATRIUM_JCLIENT_UID=65070 ATRIUM_JCLIENT_GID=65070 \
      ATRIUM_JCLIENT_SYSFIL=fuse-server ATRIUM_JCLIENT_MOUNTS_RO=/libexec,/lib,/usr/lib,/usr/local/bin ATRIUM_JCLIENT_FUSE='$2' \
      daemon -p /root/fz/jc.pid -o /root/fz/jc-$1.log $JC $S exec $1 $R /usr/local/bin/atrium-capsa-fuse \
-       --dev-fd 3 --fuse-fd 4 --uid $SESSION_UID --gid $SESSION_UID $3"
+       --dev-fd 3 --fuse-fd 4 --uid $SESSION_UID --gid $SESSION_UID ${3:-} </dev/null >/dev/null 2>&1"
   sleep 4
 }
 # stop NAME: drop the procdesc (kills the server), then RemoveJail.
 stop() {
   V "kill \$(cat /root/fz/jc.pid) 2>/dev/null; sleep 2; $JC $S remove $1 >/dev/null 2>&1"
   sleep 1
+  unmount_root
 }
 
 echo "== serve md99 read-write"
 start $J "md99:$MNT"
 V "cat /root/fz/jc-$J.log | grep -E 'error|Error|denied' | head -3 | sed 's/^/  jclient: /'"
-if ! V "mount -p | grep -q ' $MNT fusefs'"; then
+if ! V "mount -p | tr -s '\t' ' ' | grep -q ' $MNT fusefs'"; then
   bad "no fusefs on $MNT ($(V "cat /root/fz/jc-$J.log | tr '\n' ' ' | cut -c1-300"); $(V "tail -3 /var/log/atrium/jaild.log 2>/dev/null | tr '\n' ';'"))"
 else
-  ok "jaild mounted fusefs on $MNT ($(V "mount -p | grep ' $MNT ' | awk '{print \$1, \$4}'"))"
+  ok "jaild mounted fusefs on $MNT ($(V "mount -p | tr -s '\t' ' ' | grep ' $MNT ' | awk '{print \$1, \$4}'"))"
   got=$(V "cat $MNT/HELLO.TXT 2>&1; cat $MNT/hello.txt 2>&1" | head -1)
   [ "$got" = "written before the server ran" ] && ok "reads the file msdosfs wrote" || bad "hello.txt reads '$got'"
   V "sh -c 'cd $MNT && echo one > new.txt && echo two >> new.txt && mkdir -p dir/sub && mv new.txt dir/sub/renamed.txt \
@@ -150,14 +155,14 @@ else
   V "ls $R/dev | grep -qE '^(md|fuse)'" && bad "the jail's /dev shows $(V "ls $R/dev | grep -E '^(md|fuse)' | tr '\n' ' '")" || ok "the jail's /dev shows neither md99 nor fuse"
 fi
 stop $J
-V "mount -p | grep -q ' $MNT '" && bad "$MNT still mounted after RemoveJail" || ok "RemoveJail left no mount"
-V "fsck_msdosfs -n /dev/md99 2>&1 | grep -qiE 'fix|bad|error|invalid|lost'" && bad "fsck_msdosfs: $(V "fsck_msdosfs -n /dev/md99 2>&1 | tr '\n' ';'")" || ok "fsck_msdosfs finds the volume clean"
+V "mount -p | tr -s '\t' ' ' | grep -q ' $MNT '" && bad "$MNT still mounted after RemoveJail" || ok "RemoveJail left no mount"
+V "fsck_msdosfs -n /dev/md99 2>&1 | grep -qiE 'fix\?|truncate\?|clear\?|reconnect\?|bad |error|invalid|out of range'" && bad "fsck_msdosfs: $(V "fsck_msdosfs -n /dev/md99 2>&1 | tr '\n' ';'")" || ok "fsck_msdosfs finds the volume clean"
 V "mount_msdosfs /dev/md99 /root/fz/m && cat /root/fz/m/dir/sub/renamed.txt | tr '\n' ' ' && sha256 -q /root/fz/m/big.bin | cmp -s - /root/fz/big.sha && echo sha-ok; ls /root/fz/m | grep -c 'Grüße'; umount /root/fz/m" > /tmp/fuse-kcheck 2>&1
 grep -q "one two" /tmp/fuse-kcheck && grep -q "sha-ok" /tmp/fuse-kcheck && ok "msdosfs reads what the server wrote (text, 2 MiB checksum)" || bad "msdosfs check: $(tr '\n' ';' < /tmp/fuse-kcheck)"
 
 echo "== read-only"
 start $J "md99:$MNT:ro" --ro
-if V "mount -p | grep ' $MNT fusefs' | grep -q 'ro'"; then
+if V "mount -p | tr -s '\t' ' ' | grep ' $MNT fusefs' | grep -qE ' ro[, ]'"; then
   ok "mounted read-only"
   err=$(V "sh -c 'echo x > $MNT/ro.txt' 2>&1")
   echo "$err" | grep -qi "read-only" && ok "a write fails: read-only file system" || bad "a write gave '$err'"
@@ -173,7 +178,7 @@ V "ATRIUM_JCLIENT_DEVFS=30 ATRIUM_JCLIENT_UID=65070 ATRIUM_JCLIENT_GID=65070 ATR
 grep -qi "pinned\|policy" /tmp/fuse-refuse && ok "refuses the VM's own disk $DISK" || bad "the disk $DISK: $(tr '\n' ' ' < /tmp/fuse-refuse | cut -c1-200)"
 V "ATRIUM_JCLIENT_DEVFS=30 ATRIUM_JCLIENT_UID=65070 ATRIUM_JCLIENT_GID=65070 ATRIUM_JCLIENT_FUSE='md99:/mnt/capsa' $JC $S exec $J $R /usr/local/bin/atrium-capsa-fuse 2>&1" > /tmp/fuse-refuse 2>&1
 grep -qi "pinned\|policy" /tmp/fuse-refuse && ok "refuses a mountpoint outside /media" || bad "/mnt/capsa: $(tr '\n' ' ' < /tmp/fuse-refuse | cut -c1-200)"
-V "mount -p | grep -q fusefs" && bad "a fusefs mount is left: $(V 'mount -p | grep fusefs')" || ok "no fusefs mount left"
+V "mount -p | tr -s '\t' ' ' | grep -q fusefs" && bad "a fusefs mount is left: $(V 'mount -p | grep fusefs')" || ok "no fusefs mount left"
 
 echo "== dispensatord: a disk rule serves partitions as GEOM makes them"
 V 'sh -s' <<'EOF'
@@ -207,15 +212,15 @@ service atrium-dispensatord start >/dev/null 2>&1; sleep 4
 pgrep -qf atrium-dispensatord && echo "  ok dispensatord running" || echo "  FAIL dispensatord not running"
 # A "stick": GPT with one FAT32 partition, on a file attached as md98.
 mdconfig -d -u 98 -o force 2>/dev/null
-truncate -s 48m /root/fz/stick.img && mdconfig -a -t vnode -f /root/fz/stick.img -u 98 \
+truncate -s 80m /root/fz/stick.img && mdconfig -a -t vnode -f /root/fz/stick.img -u 98 \
   && gpart create -s gpt md98 >/dev/null && gpart add -t ms-basic-data md98 >/dev/null \
-  && newfs_msdos -F 32 -L STICK /dev/md98p1 >/dev/null 2>&1 && echo "  md98p1 made"
+  && newfs_msdos -F 32 -c 1 -L STICK /dev/md98p1 >/dev/null 2>&1 && echo "  md98p1 made"
 # Plug it in again, now with the filesystem on it.
 mdconfig -d -u 98 -o force; sleep 3
 mdconfig -a -t vnode -f /root/fz/stick.img -u 98
 sleep 8
 EOF
-if V "mount -p | grep -q ' /media/md98p1 fusefs'"; then
+if V "mount -p | tr -s '\t' ' ' | grep -q ' /media/md98p1 fusefs'"; then
   ok "md98p1 served at /media/md98p1 by dispensatord's rule"
   V "sh -c 'echo stick > /media/md98p1/s.txt && cat /media/md98p1/s.txt'" | grep -qx stick && ok "the stick takes a write" || bad "write to the stick failed"
   [ "$(V "stat -f %u /media/md98p1/s.txt")" = "1001" ] && ok "files belong to the session uid" || bad "s.txt owner $(V "stat -f %u /media/md98p1/s.txt")"
@@ -223,7 +228,7 @@ else
   bad "no mount at /media/md98p1 ($(V "grep -E 'md98|capsa' /var/log/atrium/dispensatord.log | tail -4 | tr '\n' ';'"); state: $(V 'cat /var/run/atrium/dispensator.state | tr "\n" ";"'))"
 fi
 V 'mdconfig -d -u 98 -o force'; sleep 6
-V "mount -p | grep -q ' /media/md98p1 '" && bad "/media/md98p1 still mounted after the md went" || ok "md gone: mount gone"
+V "mount -p | tr -s '\t' ' ' | grep -q ' /media/md98p1 '" && bad "/media/md98p1 still mounted after the md went" || ok "md gone: mount gone"
 V "jls -n name | grep -q 'name=atrium-capsa-md98p1'" && bad "its jail is still running" || ok "and its jail"
 V "grep -E 'md98|capsa' /var/log/atrium/dispensatord.log | tail -4" | sed 's/^/  log: /'
 

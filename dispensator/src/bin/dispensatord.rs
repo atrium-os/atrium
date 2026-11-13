@@ -376,6 +376,16 @@ mod run {
                 return;
             };
             Self::unmount_all(&p.path, &p.mounts_ro);
+            // GEOM's CREATE can come a moment before devfs has the node.
+            if let Some((dev, ..)) = &p.fuse {
+                let node = Path::new("/dev").join(dev);
+                for _ in 0..20 {
+                    if node.exists() {
+                        break;
+                    }
+                    std::thread::sleep(Duration::from_millis(100));
+                }
+            }
             let sent = Client::connect(&self.jaild).and_then(|mut c| c.send(&Request::CreateJail(Self::request(&p))));
             match sent {
                 Ok((Response::JailCreated(r), fd)) => {
