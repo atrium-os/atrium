@@ -1,0 +1,456 @@
+== fuzzdiag3 excerpt (si-fuzz 64f44616, kmods 64f44616, fz:3600:0x24f00d)
+== si-fuzz all 3600 0x24f00d
+si-fuzz: all for 3600 s, seed 0x24f00d, 6 ioctl threads, hang_ms 5000 (job wait 20000 ms), re-inits 2, pace 610 s, generations 60 s
+canary: VM fd 3, queue fd 8: shader 0x10000000, IB 0x10001000, out 0x10002000
+si-fuzz: 2 re-init(s) before the start: waiting 610 s for the driver's window to close
+si-fuzz: ioctl generation 1: uid 61001, seed 0x24f00e
+si-fuzz: blob generation 2: uid 62002, seed 0x24f00f
+si-fuzz:    0 s: 0 calls, blob 0 jobs (0 ok, 0 failed, 0 clean after), canary 1, re-inits 2, cp_errors 2, vm_faults 7, hangs 6, findings 0
+blob: VM fd 3, queue fd 8: shader 0x10000000, IB 0x10001000, out 0x10002000
+FINDING: blob: the VM did not run clean on a new queue after a contained failure (Input/output error; after: blob splice: 151 dw, va 0x10001000 (IB 0x10001000) 604 bytes, w0 c0065802)
+si-fuzz: re-init 2 -> 3; workers stopped for 610 s
+  last op, slot 0 (34299 ops): close 89 [in the kernel]
+  last op, slot 1 (33501 ops): create VM [in the kernel]
+  last op, slot 2 (27866 ops): create VM [in the kernel]
+  last op, slot 3 (34781 ops): ioctl VM_CREATE on fd 250 [00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 ...] [in the kernel]
+  last op, slot 4 (34302 ops): create VM [in the kernel]
+  last op, slot 5 (32701 ops): create VM [in the kernel]
+  last op, slot 16 (2 ops): blob splice: 151 dw, va 0x10001000 (IB 0x10001000) 604 bytes, w0 c0065802
+blob: VM fd 3, queue fd 8: shader 0x10000000, IB 0x10001000, out 0x10002000
+si-fuzz: re-init 3 -> 4; workers stopped for 610 s
+  last op, slot 0 (34299 ops): close 89 [in the kernel]
+  last op, slot 1 (33501 ops): create VM [in the kernel]
+  last op, slot 2 (27866 ops): create VM [in the kernel]
+  last op, slot 3 (34781 ops): ioctl VM_CREATE on fd 250 [00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 ...] [in the kernel]
+  last op, slot 4 (34302 ops): create VM [in the kernel]
+  last op, slot 5 (32701 ops): create VM [in the kernel]
+  last op, slot 16 (2 ops): blob w42 mutated: 56 dw, va 0x10001000 (IB 0x10001000) 224 bytes, w0 000002af [in the kernel]
+canary: VM fd 3, queue fd 8: shader 0x10000000, IB 0x10001000, out 0x10002000
+si-fuzz:   60 s: 197452 calls, blob 2 jobs (0 ok, 1 failed, 0 clean after), canary 8, re-inits 4, cp_errors 3, vm_faults 9, hangs 9, findings 1
+si-fuzz:  120 s: 197452 calls, blob 2 jobs (0 ok, 1 failed, 0 clean after), canary 20, re-inits 4, cp_errors 3, vm_faults 9, hangs 9, findings 1
+si-fuzz:  180 s: 197452 calls, blob 2 jobs (0 ok, 1 failed, 0 clean after), canary 32, re-inits 4, cp_errors 3, vm_faults 9, hangs 9, findings 1
+si-fuzz:  240 s: 197452 calls, blob 2 jobs (0 ok, 1 failed, 0 clean after), canary 44, re-inits 4, cp_errors 3, vm_faults 9, hangs 9, findings 1
+si-fuzz:  300 s: 197452 calls, blob 2 jobs (0 ok, 1 failed, 0 clean after), canary 56, re-inits 4, cp_errors 3, vm_faults 9, hangs 9, findings 1
+si-fuzz:  360 s: 197452 calls, blob 2 jobs (0 ok, 1 failed, 0 clean after), canary 68, re-inits 4, cp_errors 3, vm_faults 9, hangs 9, findings 1
+si-fuzz:  420 s: 197452 calls, blob 2 jobs (0 ok, 1 failed, 0 clean after), canary 80, re-inits 4, cp_errors 3, vm_faults 9, hangs 9, findings 1
+si-fuzz:  480 s: 197452 calls, blob 2 jobs (0 ok, 1 failed, 0 clean after), canary 92, re-inits 4, cp_errors 3, vm_faults 9, hangs 9, findings 1
+si-fuzz:  540 s: 197452 calls, blob 2 jobs (0 ok, 1 failed, 0 clean after), canary 104, re-inits 4, cp_errors 3, vm_faults 9, hangs 9, findings 1
+si-fuzz:  600 s: 197452 calls, blob 2 jobs (0 ok, 1 failed, 0 clean after), canary 116, re-inits 4, cp_errors 3, vm_faults 9, hangs 9, findings 1
+si-fuzz: ioctl generation 3: uid 61003, seed 0x24f010
+si-fuzz: blob generation 4: uid 62004, seed 0x24f011
+blob: VM fd 3, queue fd 8: shader 0x10000000, IB 0x10001000, out 0x10002000
+blob: VM fd 3, queue fd 8: shader 0x10000000, IB 0x10001000, out 0x10002000
+si-fuzz: re-init 4 -> 5; workers stopped for 610 s
+  last op, slot 0 (36019 ops): ioctl SYNCOBJ_WAIT on fd 250 [1f 00 00 00 00 00 00 00 4e 00 00 00 62 00 00 00 ...] [in the kernel]
+  last op, slot 1 (34692 ops): ioctl SYNCOBJ_WAIT on fd 250 [16 46 29 3e 63 93 44 b7 30 00 00 00 22 00 00 00 ...] [in the kernel]
+  last op, slot 2 (30156 ops): ioctl SYNCOBJ_WAIT on fd 250 [17 00 00 00 00 00 00 00 4b 00 00 00 44 00 00 00 ...] [in the kernel]
+  last op, slot 3 (37682 ops): ioctl SYNCOBJ_WAIT on fd 250 [28 00 00 00 00 00 00 00 46 00 00 00 5f 00 00 00 ...] [in the kernel]
+  last op, slot 4 (36093 ops): ioctl SYNCOBJ_WAIT on fd 250 [17 6f b5 e2 47 76 af 74 6b 00 00 00 27 00 00 00 ...] [in the kernel]
+  last op, slot 5 (33820 ops): ioctl SYNCOBJ_WAIT on fd 250 [2e 00 00 00 00 00 00 00 6c 00 00 00 55 00 00 00 ...] [in the kernel]
+  last op, slot 16 (3 ops): blob splice: 141 dw, va 0x10001000 (IB 0x10001000) 564 bytes, w0 c0065802 [in the kernel]
+canary: VM fd 3, queue fd 8: shader 0x10000000, IB 0x10001000, out 0x10002000
+si-fuzz: re-init 5 -> 6; workers stopped for 610 s
+  last op, slot 0 (36019 ops): ioctl SYNCOBJ_WAIT on fd 250 [1f 00 00 00 00 00 00 00 4e 00 00 00 62 00 00 00 ...] [in the kernel]
+  last op, slot 1 (34692 ops): ioctl SYNCOBJ_WAIT on fd 250 [16 46 29 3e 63 93 44 b7 30 00 00 00 22 00 00 00 ...] [in the kernel]
+  last op, slot 2 (30156 ops): ioctl SYNCOBJ_WAIT on fd 250 [17 00 00 00 00 00 00 00 4b 00 00 00 44 00 00 00 ...] [in the kernel]
+  last op, slot 3 (37682 ops): ioctl SYNCOBJ_WAIT on fd 250 [28 00 00 00 00 00 00 00 46 00 00 00 5f 00 00 00 ...] [in the kernel]
+  last op, slot 4 (36093 ops): ioctl SYNCOBJ_WAIT on fd 250 [17 6f b5 e2 47 76 af 74 6b 00 00 00 27 00 00 00 ...] [in the kernel]
+  last op, slot 5 (33820 ops): ioctl SYNCOBJ_WAIT on fd 250 [2e 00 00 00 00 00 00 00 6c 00 00 00 55 00 00 00 ...] [in the kernel]
+  last op, slot 16 (3 ops): blob splice: 141 dw, va 0x10001000 (IB 0x10001000) 564 bytes, w0 c0065802 [in the kernel]
+canary: VM fd 3, queue fd 8: shader 0x10000000, IB 0x10001000, out 0x10002000
+si-fuzz:  675 s: 208465 calls, blob 4 jobs (0 ok, 2 failed, 0 clean after), canary 128, re-inits 6, cp_errors 5, vm_faults 11, hangs 10, findings 1
+si-fuzz:  735 s: 208465 calls, blob 4 jobs (0 ok, 2 failed, 0 clean after), canary 140, re-inits 6, cp_errors 5, vm_faults 11, hangs 10, findings 1
+si-fuzz:  795 s: 208465 calls, blob 4 jobs (0 ok, 2 failed, 0 clean after), canary 152, re-inits 6, cp_errors 5, vm_faults 11, hangs 10, findings 1
+si-fuzz:  855 s: 208465 calls, blob 4 jobs (0 ok, 2 failed, 0 clean after), canary 164, re-inits 6, cp_errors 5, vm_faults 11, hangs 10, findings 1
+si-fuzz:  915 s: 208465 calls, blob 4 jobs (0 ok, 2 failed, 0 clean after), canary 176, re-inits 6, cp_errors 5, vm_faults 11, hangs 10, findings 1
+si-fuzz:  975 s: 208465 calls, blob 4 jobs (0 ok, 2 failed, 0 clean after), canary 188, re-inits 6, cp_errors 5, vm_faults 11, hangs 10, findings 1
+si-fuzz: 1035 s: 208465 calls, blob 4 jobs (0 ok, 2 failed, 0 clean after), canary 200, re-inits 6, cp_errors 5, vm_faults 11, hangs 10, findings 1
+si-fuzz: 1095 s: 208465 calls, blob 4 jobs (0 ok, 2 failed, 0 clean after), canary 212, re-inits 6, cp_errors 5, vm_faults 11, hangs 10, findings 1
+si-fuzz: 1155 s: 208465 calls, blob 4 jobs (0 ok, 2 failed, 0 clean after), canary 224, re-inits 6, cp_errors 5, vm_faults 11, hangs 10, findings 1
+si-fuzz: 1215 s: 208465 calls, blob 4 jobs (0 ok, 2 failed, 0 clean after), canary 236, re-inits 6, cp_errors 5, vm_faults 11, hangs 10, findings 1
+si-fuzz: 1275 s: 208465 calls, blob 4 jobs (0 ok, 2 failed, 0 clean after), canary 248, re-inits 6, cp_errors 5, vm_faults 11, hangs 10, findings 1
+si-fuzz: ioctl generation 5: uid 61005, seed 0x24f012
+si-fuzz: blob generation 6: uid 62006, seed 0x24f013
+blob: VM fd 3, queue fd 8: shader 0x10000000, IB 0x10001000, out 0x10002000
+blob: VM fd 3, queue fd 8: shader 0x10000000, IB 0x10001000, out 0x10002000
+si-fuzz: re-init 6 -> 7; workers stopped for 610 s
+  last op, slot 0 (37349 ops): kevent on fd 22 [in the kernel]
+  last op, slot 1 (35129 ops): ioctl SYNCOBJ_WAIT on fd 250 [3b 00 00 00 00 00 00 00 3c 00 00 00 28 00 00 00 ...] [in the kernel]
+  last op, slot 2 (31499 ops): ioctl SYNCOBJ_WAIT on fd 250 [3a 00 00 00 00 00 00 00 33 00 00 00 07 00 00 00 ...] [in the kernel]
+  last op, slot 3 (39843 ops): kevent on fd 10 [in the kernel]
+  last op, slot 4 (37723 ops): ioctl SYNCOBJ_WAIT on fd 250 [06 00 00 00 00 00 00 00 32 00 00 00 4f 00 00 00 ...] [in the kernel]
+  last op, slot 5 (36190 ops): ioctl VM_CREATE on fd 250 [00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 ...] [in the kernel]
+  last op, slot 16 (4 ops): blob splice: 55 dw, va 0x10001000 (IB 0x10001000) 220 bytes, w0 c0065802 [in the kernel]
+canary: VM fd 3, queue fd 8: shader 0x10000000, IB 0x10001000, out 0x10002000
+si-fuzz: re-init 7 -> 8; workers stopped for 610 s
+  last op, slot 0 (37349 ops): kevent on fd 22 [in the kernel]
+  last op, slot 1 (35129 ops): ioctl SYNCOBJ_WAIT on fd 250 [3b 00 00 00 00 00 00 00 3c 00 00 00 28 00 00 00 ...] [in the kernel]
+  last op, slot 2 (31499 ops): ioctl SYNCOBJ_WAIT on fd 250 [3a 00 00 00 00 00 00 00 33 00 00 00 07 00 00 00 ...] [in the kernel]
+  last op, slot 3 (39843 ops): kevent on fd 10 [in the kernel]
+  last op, slot 4 (37723 ops): ioctl SYNCOBJ_WAIT on fd 250 [06 00 00 00 00 00 00 00 32 00 00 00 4f 00 00 00 ...] [in the kernel]
+  last op, slot 5 (36197 ops): kqueue
+  last op, slot 16 (4 ops): blob splice: 55 dw, va 0x10001000 (IB 0x10001000) 220 bytes, w0 c0065802 [in the kernel]
+canary: VM fd 3, queue fd 8: shader 0x10000000, IB 0x10001000, out 0x10002000
+si-fuzz: 1336 s: 217744 calls, blob 6 jobs (0 ok, 3 failed, 0 clean after), canary 256, re-inits 8, cp_errors 7, vm_faults 13, hangs 12, findings 1
+si-fuzz: 1396 s: 217744 calls, blob 6 jobs (0 ok, 3 failed, 0 clean after), canary 268, re-inits 8, cp_errors 7, vm_faults 13, hangs 12, findings 1
+si-fuzz: 1456 s: 217744 calls, blob 6 jobs (0 ok, 3 failed, 0 clean after), canary 280, re-inits 8, cp_errors 7, vm_faults 13, hangs 12, findings 1
+si-fuzz: 1516 s: 217744 calls, blob 6 jobs (0 ok, 3 failed, 0 clean after), canary 292, re-inits 8, cp_errors 7, vm_faults 13, hangs 12, findings 1
+si-fuzz: 1576 s: 217744 calls, blob 6 jobs (0 ok, 3 failed, 0 clean after), canary 304, re-inits 8, cp_errors 7, vm_faults 13, hangs 12, findings 1
+si-fuzz: 1636 s: 217744 calls, blob 6 jobs (0 ok, 3 failed, 0 clean after), canary 316, re-inits 8, cp_errors 7, vm_faults 13, hangs 12, findings 1
+si-fuzz: 1696 s: 217744 calls, blob 6 jobs (0 ok, 3 failed, 0 clean after), canary 328, re-inits 8, cp_errors 7, vm_faults 13, hangs 12, findings 1
+si-fuzz: 1756 s: 217744 calls, blob 6 jobs (0 ok, 3 failed, 0 clean after), canary 340, re-inits 8, cp_errors 7, vm_faults 13, hangs 12, findings 1
+si-fuzz: 1816 s: 217744 calls, blob 6 jobs (0 ok, 3 failed, 0 clean after), canary 352, re-inits 8, cp_errors 7, vm_faults 13, hangs 12, findings 1
+si-fuzz: 1876 s: 217744 calls, blob 6 jobs (0 ok, 3 failed, 0 clean after), canary 364, re-inits 8, cp_errors 7, vm_faults 13, hangs 12, findings 1
+si-fuzz: ioctl generation 7: uid 61007, seed 0x24f014
+si-fuzz: blob generation 8: uid 62008, seed 0x24f015
+blob: VM fd 3, queue fd 8: shader 0x10000000, IB 0x10001000, out 0x10002000
+si-fuzz: re-init 8 -> 9; workers stopped for 610 s
+  last op, slot 0 (37355 ops): dup2 20 over 14
+  last op, slot 1 (35167 ops): create VM [in the kernel]
+  last op, slot 2 (31542 ops): ioctl VM_CREATE on fd 250 [00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 ...] [in the kernel]
+  last op, slot 3 (39881 ops): ioctl VM_CREATE on fd 250 [e7 b5 e9 78 00 00 00 00 00 00 00 00 00 00 00 00 ...] [in the kernel]
+  last op, slot 4 (37734 ops): ioctl VM_CREATE on fd 250 [00 00 00 00 16 c5 17 fd 00 00 00 00 00 00 00 00 ...] [in the kernel]
+  last op, slot 5 (36213 ops): ioctl VM_CREATE on fd 250 [00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 ...] [in the kernel]
+  last op, slot 16 (7 ops): blob packets: 1021 dw, va 0x10001000 (IB 0x10001000) 4084 bytes, w0 c0026801
+blob: VM fd 3, queue fd 8: shader 0x10000000, IB 0x10001000, out 0x10002000
+canary: VM fd 3, queue fd 8: shader 0x10000000, IB 0x10001000, out 0x10002000
+si-fuzz: canary slow once: completion Input/output error after 5046 ms, 0/64 words 42
+FINDING: canary: submit: Input/output error
+  last op, slot 0 (37355 ops): dup2 20 over 14
+  last op, slot 1 (35167 ops): create VM [in the kernel]
+  last op, slot 2 (31542 ops): ioctl VM_CREATE on fd 250 [00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 ...] [in the kernel]
+  last op, slot 3 (39881 ops): ioctl VM_CREATE on fd 250 [e7 b5 e9 78 00 00 00 00 00 00 00 00 00 00 00 00 ...] [in the kernel]
+  last op, slot 4 (37734 ops): ioctl VM_CREATE on fd 250 [00 00 00 00 16 c5 17 fd 00 00 00 00 00 00 00 00 ...] [in the kernel]
+  last op, slot 5 (36213 ops): ioctl VM_CREATE on fd 250 [00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 ...] [in the kernel]
+  last op, slot 16 (7 ops): blob packets: 1016 dw, va 0x10001000 (IB 0x10001000) 4064 bytes, w0 c0054900 [in the kernel]
+si-fuzz: 1940 s: 217899 calls, blob 9 jobs (0 ok, 5 failed, 1 clean after), canary 376, re-inits 9, cp_errors 8, vm_faults 16, hangs 14, findings 2
+canary: VM fd 3, queue fd 8: shader 0x10000000, IB 0x10001000, out 0x10002000
+si-fuzz: 2000 s: 217899 calls, blob 9 jobs (0 ok, 5 failed, 1 clean after), canary 388, re-inits 9, cp_errors 8, vm_faults 16, hangs 14, findings 2
+si-fuzz: 2061 s: 217899 calls, blob 9 jobs (0 ok, 5 failed, 1 clean after), canary 400, re-inits 9, cp_errors 8, vm_faults 16, hangs 14, findings 2
+si-fuzz: 2121 s: 217899 calls, blob 9 jobs (0 ok, 5 failed, 1 clean after), canary 412, re-inits 9, cp_errors 8, vm_faults 16, hangs 14, findings 2
+si-fuzz: 2181 s: 217899 calls, blob 9 jobs (0 ok, 5 failed, 1 clean after), canary 424, re-inits 9, cp_errors 8, vm_faults 16, hangs 14, findings 2
+si-fuzz: 2241 s: 217899 calls, blob 9 jobs (0 ok, 5 failed, 1 clean after), canary 436, re-inits 9, cp_errors 8, vm_faults 16, hangs 14, findings 2
+si-fuzz: 2301 s: 217899 calls, blob 9 jobs (0 ok, 5 failed, 1 clean after), canary 448, re-inits 9, cp_errors 8, vm_faults 16, hangs 14, findings 2
+si-fuzz: 2361 s: 217899 calls, blob 9 jobs (0 ok, 5 failed, 1 clean after), canary 460, re-inits 9, cp_errors 8, vm_faults 16, hangs 14, findings 2
+si-fuzz: 2421 s: 217899 calls, blob 9 jobs (0 ok, 5 failed, 1 clean after), canary 472, re-inits 9, cp_errors 8, vm_faults 16, hangs 14, findings 2
+si-fuzz: 2481 s: 217899 calls, blob 9 jobs (0 ok, 5 failed, 1 clean after), canary 484, re-inits 9, cp_errors 8, vm_faults 16, hangs 14, findings 2
+si-fuzz: ioctl generation 9: uid 61009, seed 0x24f016
+si-fuzz: blob generation 10: uid 62010, seed 0x24f017
+blob: VM fd 3, queue fd 8: shader 0x10000000, IB 0x10001000, out 0x10002000
+si-fuzz: 2552 s: 218558 calls, blob 10 jobs (0 ok, 6 failed, 1 clean after), canary 496, re-inits 9, cp_errors 9, vm_faults 17, hangs 16, findings 2
+blob: VM fd 3, queue fd 8: shader 0x10000000, IB 0x10001000, out 0x10002000
+si-fuzz: re-init 9 -> 10; workers stopped for 610 s
+  last op, slot 0 (39569 ops): ioctl SYNCOBJ_WAIT on fd 250 [38 00 00 00 00 00 00 00 2c 00 00 00 36 00 00 00 ...] [in the kernel]
+  last op, slot 1 (37036 ops): ioctl SYNCOBJ_WAIT on fd 250 [2e 00 00 00 00 00 00 00 18 00 00 00 41 00 00 00 ...] [in the kernel]
+  last op, slot 2 (32891 ops): ioctl SYNCOBJ_WAIT on fd 250 [40 bc 76 40 93 da af 57 76 00 00 00 50 00 00 00 ...] [in the kernel]
+  last op, slot 3 (40819 ops): ioctl SYNCOBJ_WAIT on fd 250 [32 00 00 00 00 00 00 00 2c 00 00 00 2b 00 00 00 ...] [in the kernel]
+  last op, slot 4 (39113 ops): ioctl SYNCOBJ_WAIT on fd 250 [3a 00 00 00 00 00 00 00 62 00 00 00 5c 00 00 00 ...] [in the kernel]
+  last op, slot 5 (38001 ops): ioctl SYNCOBJ_WAIT on fd 250 [2b 00 00 00 00 00 00 00 1e 00 00 00 38 00 00 00 ...] [in the kernel]
+  last op, slot 16 (8 ops): blob splice: 75 dw, va 0x10001000 (IB 0x10001000) 300 bytes, w0 c0065802 [in the kernel]
+canary: VM fd 3, queue fd 8: shader 0x10000000, IB 0x10001000, out 0x10002000
+si-fuzz: re-init 10 -> 11; workers stopped for 610 s
+  last op, slot 0 (39569 ops): ioctl SYNCOBJ_WAIT on fd 250 [38 00 00 00 00 00 00 00 2c 00 00 00 36 00 00 00 ...] [in the kernel]
+  last op, slot 1 (37036 ops): ioctl SYNCOBJ_WAIT on fd 250 [2e 00 00 00 00 00 00 00 18 00 00 00 41 00 00 00 ...] [in the kernel]
+  last op, slot 2 (32891 ops): ioctl SYNCOBJ_WAIT on fd 250 [40 bc 76 40 93 da af 57 76 00 00 00 50 00 00 00 ...] [in the kernel]
+  last op, slot 3 (40819 ops): ioctl SYNCOBJ_WAIT on fd 250 [32 00 00 00 00 00 00 00 2c 00 00 00 2b 00 00 00 ...] [in the kernel]
+  last op, slot 4 (39113 ops): ioctl SYNCOBJ_WAIT on fd 250 [3a 00 00 00 00 00 00 00 62 00 00 00 5c 00 00 00 ...] [in the kernel]
+  last op, slot 5 (38001 ops): ioctl SYNCOBJ_WAIT on fd 250 [2b 00 00 00 00 00 00 00 1e 00 00 00 38 00 00 00 ...] [in the kernel]
+  last op, slot 16 (8 ops): blob splice: 75 dw, va 0x10001000 (IB 0x10001000) 300 bytes, w0 c0065802 [in the kernel]
+canary: VM fd 3, queue fd 8: shader 0x10000000, IB 0x10001000, out 0x10002000
+si-fuzz: 2601 s: 227437 calls, blob 11 jobs (0 ok, 6 failed, 1 clean after), canary 504, re-inits 11, cp_errors 10, vm_faults 18, hangs 17, findings 2
+si-fuzz: 2661 s: 227437 calls, blob 11 jobs (0 ok, 6 failed, 1 clean after), canary 516, re-inits 11, cp_errors 10, vm_faults 18, hangs 17, findings 2
+si-fuzz: 2721 s: 227437 calls, blob 11 jobs (0 ok, 6 failed, 1 clean after), canary 528, re-inits 11, cp_errors 10, vm_faults 18, hangs 17, findings 2
+si-fuzz: 2781 s: 227437 calls, blob 11 jobs (0 ok, 6 failed, 1 clean after), canary 540, re-inits 11, cp_errors 10, vm_faults 18, hangs 17, findings 2
+si-fuzz: 2841 s: 227437 calls, blob 11 jobs (0 ok, 6 failed, 1 clean after), canary 552, re-inits 11, cp_errors 10, vm_faults 18, hangs 17, findings 2
+si-fuzz: 2901 s: 227437 calls, blob 11 jobs (0 ok, 6 failed, 1 clean after), canary 564, re-inits 11, cp_errors 10, vm_faults 18, hangs 17, findings 2
+si-fuzz: 2961 s: 227437 calls, blob 11 jobs (0 ok, 6 failed, 1 clean after), canary 576, re-inits 11, cp_errors 10, vm_faults 18, hangs 17, findings 2
+si-fuzz: 3021 s: 227437 calls, blob 11 jobs (0 ok, 6 failed, 1 clean after), canary 588, re-inits 11, cp_errors 10, vm_faults 18, hangs 17, findings 2
+si-fuzz: 3081 s: 227437 calls, blob 11 jobs (0 ok, 6 failed, 1 clean after), canary 600, re-inits 11, cp_errors 10, vm_faults 18, hangs 17, findings 2
+si-fuzz: 3141 s: 227437 calls, blob 11 jobs (0 ok, 6 failed, 1 clean after), canary 612, re-inits 11, cp_errors 10, vm_faults 18, hangs 17, findings 2
+si-fuzz: ioctl generation 11: uid 61011, seed 0x24f018
+si-fuzz: blob generation 12: uid 62012, seed 0x24f019
+blob: VM fd 3, queue fd 8: shader 0x10000000, IB 0x10001000, out 0x10002000
+si-fuzz: canary slow once: completion Input/output error after 5031 ms, 0/64 words 42
+FINDING: canary: submit: Input/output error
+  last op, slot 0 (39723 ops): ioctl VM_CREATE on fd 250 [00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 ...] [in the kernel]
+  last op, slot 1 (37357 ops): ioctl VM_CREATE on fd 250 [00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 ...] [in the kernel]
+  last op, slot 2 (33089 ops): create VM [in the kernel]
+  last op, slot 3 (40945 ops): create VM [in the kernel]
+  last op, slot 4 (39262 ops): ioctl VM_CREATE on fd 250 [00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 ...] [in the kernel]
+  last op, slot 5 (38256 ops): close 14 [in the kernel]
+  last op, slot 16 (9 ops): blob splice: 27 dw, va 0x10001000 (IB 0x10001000) 108 bytes, w0 c0065802
+blob: VM fd 3, queue fd 8: shader 0x10000000, IB 0x10001000, out 0x10002000
+si-fuzz: re-init 11 -> 12; workers stopped for 610 s
+  last op, slot 0 (41373 ops): ioctl SYNCOBJ_WAIT on fd 250 [05 00 00 00 00 00 00 00 0e 00 00 00 46 00 00 00 ...] [in the kernel]
+  last op, slot 1 (40920 ops): ioctl SYNCOBJ_WAIT on fd 250 [1d 00 00 00 00 00 00 00 56 00 00 00 2d 00 00 00 ...] [in the kernel]
+  last op, slot 2 (34091 ops): kevent on fd 35 [in the kernel]
+  last op, slot 3 (42778 ops): ioctl SYNCOBJ_WAIT on fd 250 [0e 00 00 00 00 00 00 00 70 00 00 00 57 00 00 00 ...] [in the kernel]
+  last op, slot 4 (41632 ops): ioctl SYNCOBJ_WAIT on fd 250 [37 00 00 00 00 00 00 00 03 00 00 00 33 00 00 00 ...] [in the kernel]
+  last op, slot 5 (39531 ops): ioctl SYNCOBJ_WAIT on fd 250 [39 00 00 00 00 00 00 00 31 00 00 00 4c 00 00 00 ...] [in the kernel]
+  last op, slot 16 (9 ops): blob splice: 114 dw, va 0x10001000 (IB 0x10001000) 456 bytes, w0 c0065802 [in the kernel]
+canary: VM fd 3, queue fd 8: shader 0x10000000, IB 0x10001000, out 0x10002000
+si-fuzz: re-init 12 -> 13; workers stopped for 610 s
+  last op, slot 0 (41373 ops): ioctl SYNCOBJ_WAIT on fd 250 [05 00 00 00 00 00 00 00 0e 00 00 00 46 00 00 00 ...] [in the kernel]
+  last op, slot 1 (40920 ops): ioctl SYNCOBJ_WAIT on fd 250 [1d 00 00 00 00 00 00 00 56 00 00 00 2d 00 00 00 ...] [in the kernel]
+  last op, slot 2 (34091 ops): kevent on fd 35 [in the kernel]
+  last op, slot 3 (42778 ops): ioctl SYNCOBJ_WAIT on fd 250 [0e 00 00 00 00 00 00 00 70 00 00 00 57 00 00 00 ...] [in the kernel]
+  last op, slot 4 (41632 ops): ioctl SYNCOBJ_WAIT on fd 250 [37 00 00 00 00 00 00 00 03 00 00 00 33 00 00 00 ...] [in the kernel]
+  last op, slot 5 (39531 ops): ioctl SYNCOBJ_WAIT on fd 250 [39 00 00 00 00 00 00 00 31 00 00 00 4c 00 00 00 ...] [in the kernel]
+  last op, slot 16 (9 ops): blob splice: 114 dw, va 0x10001000 (IB 0x10001000) 456 bytes, w0 c0065802 [in the kernel]
+canary: VM fd 3, queue fd 8: shader 0x10000000, IB 0x10001000, out 0x10002000
+si-fuzz: 3212 s: 240334 calls, blob 13 jobs (0 ok, 7 failed, 1 clean after), canary 623, re-inits 13, cp_errors 12, vm_faults 20, hangs 20, findings 3
+si-fuzz: 3272 s: 240334 calls, blob 13 jobs (0 ok, 7 failed, 1 clean after), canary 635, re-inits 13, cp_errors 12, vm_faults 20, hangs 20, findings 3
+si-fuzz: 3332 s: 240334 calls, blob 13 jobs (0 ok, 7 failed, 1 clean after), canary 647, re-inits 13, cp_errors 12, vm_faults 20, hangs 20, findings 3
+si-fuzz: 3392 s: 240334 calls, blob 13 jobs (0 ok, 7 failed, 1 clean after), canary 659, re-inits 13, cp_errors 12, vm_faults 20, hangs 20, findings 3
+si-fuzz: 3452 s: 240334 calls, blob 13 jobs (0 ok, 7 failed, 1 clean after), canary 671, re-inits 13, cp_errors 12, vm_faults 20, hangs 20, findings 3
+si-fuzz: 3512 s: 240334 calls, blob 13 jobs (0 ok, 7 failed, 1 clean after), canary 683, re-inits 13, cp_errors 12, vm_faults 20, hangs 20, findings 3
+si-fuzz: 3572 s: 240334 calls, blob 13 jobs (0 ok, 7 failed, 1 clean after), canary 695, re-inits 13, cp_errors 12, vm_faults 20, hangs 20, findings 3
+si-fuzz: 3600 s: 240334 calls, blob 13 jobs (0 ok, 7 failed, 1 clean after), canary 700, re-inits 13, cp_errors 12, vm_faults 20, hangs 20, findings 3
+si-fuzz: re-inits at the end 13
+canary: VM fd 3, queue fd 8: shader 0x10000000, IB 0x10001000, out 0x10002000
+si-fuzz: health: a new VM runs write_42 clean
+si-fuzz: errno per ioctl (calls by the ioctl workers)
+                          ok     EINVAL      EBADF     EFAULT     ENOTTY      EPERM     ENOMEM     ENOSPC        EIO      EBUSY EOPNOTSUPP      other
+  BO_ALLOC              4023       1196        352          0       1703          0          0          0          0          0        134          0
+  BO_WRITE               224       4070        827        300       1743          0          0          0          0          0        128          0
+  BO_READ                216       4081        855        351       1674          0          0          0          0          0        102          0
+  GET_IRQS              5105          0        329          0       1801          0          0          0          0          0        117          0
+  SYNCOBJ_CREATE        5064          0        342          0       1738          0          0          0          0          0        135          0
+  SYNCOBJ_SIGNAL        2096       2481        840          0       1764          0          0          0          0          0        121          0
+  SYNCOBJ_QUERY         2230       2460        863          0       1765          0          0          0          0          0        113          0
+  SYNCOBJ_WAIT           291       2504        850          0       1720          0          0          0          0          0        118       1869
+  VM_CREATE              663          0        312          0       1725          0          0       4428          0          0        129          0
+  VM_BIND                108       4298       1082          0       1756          0          0          0          2          7        108         64
+  QUEUE_MAP                0       4345       1137          0       1802          0          0          0          0          0        123          0
+  QUERY_CAPS            1624          0        336       2976       1774          0        702          0          0          0        114          0
+  VM_BIND2                41       4360        963          0       1760          0          0          0          0          3        124         22
+  QUEUE_CREATE             9        473       1038          0       5513          3          0          0          0          0        399          0
+  QUEUE_MAP2               0        166       1079          0       5812          0          0          0          0          0        418          0
+  QUEUE_SUBMIT             1        137       1016          0       5777          0          0          0          0          0        429          0
+  GPU_RESET                0          0        304          0       1725       5220          0          0          0          0        151          0
+  SCHED                    0          0        325          0       1763       5280          0          0          0          0        131          0
+  POWERGATE                0          0        316          0       1770       5194          0          0          0          0        121          0
+  old SUBMIT               0          0        307          0       6900          0          0          0          0          0        116          0
+si-fuzz: mmaps that succeeded 0, forks 231, blob VM reopens 12, queue renews 7
+FINDING 1: blob: the VM did not run clean on a new queue after a contained failure (Input/output error; after: blob splice: 151 dw, va 0x10001000 (IB 0x10001000) 604 bytes, w0 c0065802)
+FINDING 2: canary: submit: Input/output error
+FINDING 3: canary: submit: Input/output error
+RESULT: FAIL (3 findings, seed 0x24f00d)
+si-fuzz rc=1
+reinits 13
+== ENOSPC 0
+== post-fuzz test 14 block
+PASS: 15 hostile ISA: stores at VA 0: the bystander's memory is untouched (64/64 words intact, out[0] 0x5b5b5b5b)
+PASS: 15 hostile ISA: stores at VA 0: the lost queue refuses new work (Input/output error)
+PASS: 15 hostile ISA: after stores at VA 0, another VM runs clean (completion ok after 0 ms, 64/64 words 42, out[0] 0x2a)
+15 health: VM fd 28, queue fd 33: shader 0x10000000, IB 0x10001000, out 0x10002000
+PASS: 15 hostile ISA: after stores at VA 0, a new VM can be set up and runs clean (completion ok after 0 ms, 64/64 words 42, out[0] 0x2a)
+PASS: 15 hostile ISA: no GPU re-init was needed (re-inits 13 -> 13)
+PASS: 14 hostile PM4: the target list (5 registers, re-inits so far 13)
+14: target ih_rb_base at dword 0x1123 = 0x10 (write same value)
+14: target cp_mes_cntl at dword 0xc807 = 0xc000000 (write same value)
+14: target gc_vm_ctx0_pt_base_lo at dword 0x28ef = 0x5800001 (write same value)
+14: target mm_vm_ctx0_pt_base_lo at dword 0x1a5cf = 0x5800001 (write same value)
+14: target smu_msg_arg at dword 0x16292 = 0 (read only)
+14 bystander: VM fd 22, queue fd 27: shader 0x10000000, IB 0x10001000, out 0x10002000
+14: VM fd 28, queue fd 34: shader 0x10000000, IB 0x10001000, out 0x10002000
+14: WRITE_DATA ih_rb_base as uid 61131: Operation not permitted after 5038 ms, marker not written, CP errors +1, word 0x5b5b5b5b, register now 0x10, re-inits 14 (+1), the uid's next queue: Operation not permitted
+PASS: 14 after WRITE_DATA to ih_rb_base: the uid's next queue is refused (it forced a GPU reset) (Operation not permitted)
+PASS: 14 WRITE_DATA to ih_rb_base: refused (refused, CP errors +1, register 0x10 -> 0x10)
+14 bystander: VM fd 22, queue fd 27: shader 0x10000000, IB 0x10001000, out 0x10002000
+PASS: 14 after WRITE_DATA to ih_rb_base: another VM runs clean (completion ok after 0 ms, 64/64 words 42, out[0] 0x2a)
+14: VM fd 28, queue fd 34: shader 0x10000000, IB 0x10001000, out 0x10002000
+14: WRITE_DATA cp_mes_cntl as uid 61132: Device not configured after 5038 ms, marker not written, CP errors +1, word 0x5b5b5b5b, register now 0, re-inits -1 (+-1), the uid's next queue: Device not configured
+FAIL: 14 after WRITE_DATA to cp_mes_cntl: the uid's next queue is created (no GPU reset) (Device not configured)
+FAIL: 14 WRITE_DATA to cp_mes_cntl: refused (refused, CP errors +1, register 0xc000000 -> 0)
+14: -1 GPU re-init(s) since the start of 14 (cap 3 per 10 min): the rest is not run
+KNOWN: 14 hostile PM4: refused packets cost -1 whole-GPU re-init(s), stopped early; the uids that forced them were locked out (per-queue recovery still owed)
+14 after: setup failed: Device not configured
+si_client_test: 89 passed, 2 failed: FAIL
+si-client-test rc=1
+
+    8129
+== grbm while MES runs: 17
+   1 18:00:14 Nov 13 18:00:14 si: C
+   3 18:00:29 Nov 13 18:00:29 grbm:
+   1 18:00:30 Nov 13 18:00:30 si: C
+   1 18:11:02 Nov 13 18:11:02 si: C
+   1 18:21:45 Nov 13 18:21:45 si: C
+   1 18:21:56 Nov 13 18:21:56 si: C
+   1 18:32:24 Nov 13 18:32:24 si: C
+   1 18:32:34 Nov 13 18:32:34 si: C
+   1 18:43:02 Nov 13 18:43:02 si: C
+   1 18:53:18 Nov 13 18:53:18 si: C
+   1 from 0xffffffff82011b4a
+   1 from 0xffffffff820195d7
+   1 from 0xffffffff82019a6c
+== HQD scan skipped: 0
+== CP error on me1: 14
+Nov 13 18:00:14 si: CP error on me1 HQDs 0x400: no HQD scan while MES runs; the hang check takes the queue
+Nov 13 18:00:30 si: CP error on me1 HQDs 0x2: no HQD scan while MES runs; the hang check takes the queue
+Nov 13 18:11:02 si: CP error on me1 HQDs 0x2: no HQD scan while MES runs; the hang check takes the queue
+Nov 13 18:21:45 si: CP error on me1 HQDs 0x200: no HQD scan while MES runs; the hang check takes the queue
+Nov 13 18:21:56 si: CP error on me1 HQDs 0x100: no HQD scan while MES runs; the hang check takes the queue
+Nov 13 18:32:24 si: CP error on me1 HQDs 0x200: no HQD scan while MES runs; the hang check takes the queue
+Nov 13 18:32:34 si: CP error on me1 HQDs 0x100: no HQD scan while MES runs; the hang check takes the queue
+Nov 13 18:43:02 si: CP error on me1 HQDs 0x200: no HQD scan while MES runs; the hang check takes the queue
+Nov 13 18:53:18 si: CP error on me1 HQDs 0x200: no HQD scan while MES runs; the hang check takes the queue
+Nov 13 18:53:30 si: CP error on me1 HQDs 0x100: no HQD scan while MES runs; the hang check takes the queue
+Nov 13 19:03:58 si: CP error on me1 HQDs 0x200: no HQD scan while MES runs; the hang check takes the queue
+Nov 13 19:04:13 si: CP error on me1 HQDs 0x100: no HQD scan while MES runs; the hang check takes the queue
+Nov 13 19:11:30 si: CP error on me1 HQDs 0x400: no HQD scan while MES runs; the hang check takes the queue
+Nov 13 19:11:47 si: CP error on me1 HQDs 0x2: no HQD scan while MES runs; the hang check takes the queue
+== flush timeouts lines: 8; markers:
+timed out (7 so far)
+timed out (8 so far)
+Nov 13 18:11:12 gmc: GFXHUB (GC 12.0) flush of context 3 timed out (1 so far): INV_REQ 0, INV_ACK 0
+Nov 13 18:11:12 gmc: GFXHUB (GC 12.0) at the timeout: GCVM_L2_STATUS 0, CP_CPF_STATUS 0
+Nov 13 18:11:12 gmc: GFXHUB (GC 12.0) engine 16, same context: NO ack either
+Nov 13 18:11:12 gmc: GFXHUB (GC 12.0) after the timeout: CONTEXT0_CNTL 0, PT base 000000000, L1_TLB 0, L2_CNTL 0, fault status 0 (addr 000000000)
+Nov 13 18:11:12 gmc: GFXHUB (GC 12.0) flush of context 8 timed out (2 so far): INV_REQ 0, INV_ACK 0
+Nov 13 18:11:12 gmc: GFXHUB (GC 12.0) at the timeout: GCVM_L2_STATUS 0, CP_CPF_STATUS 0
+Nov 13 18:11:12 gmc: GFXHUB (GC 12.0) engine 16, same context: NO ack either
+Nov 13 18:11:12 gmc: GFXHUB (GC 12.0) after the timeout: CONTEXT0_CNTL 0, PT base 000000000, L1_TLB 0, L2_CNTL 0, fault status 0 (addr 000000000)
+Nov 13 18:11:12 gmc: GFXHUB (GC 12.0) flush of context 9 timed out (3 so far): INV_REQ 0, INV_ACK 0
+Nov 13 18:11:12 gmc: GFXHUB (GC 12.0) at the timeout: GCVM_L2_STATUS 0, CP_CPF_STATUS 0
+Nov 13 18:11:12 gmc: GFXHUB (GC 12.0) engine 16, same context: NO ack either
+Nov 13 18:11:12 gmc: GFXHUB (GC 12.0) after the timeout: CONTEXT0_CNTL 0, PT base 000000000, L1_TLB 0, L2_CNTL 0, fault status 0 (addr 000000000)
+Nov 13 18:11:12 gmc: GFXHUB (GC 12.0) flush of context 10 timed out (4 so far): INV_REQ 0, INV_ACK 0
+Nov 13 18:11:12 gmc: GFXHUB (GC 12.0) at the timeout: GCVM_L2_STATUS 0, CP_CPF_STATUS 0
+Nov 13 18:11:13 gmc: GFXHUB (GC 12.0) engine 16, same context: NO ack either
+Nov 13 18:11:13 gmc: GFXHUB (GC 12.0) after the timeout: CONTEXT0_CNTL 0, PT base 000000000, L1_TLB 0, L2_CNTL 0, fault status 0 (addr 000000000)
+Nov 13 18:11:13 gmc: GFXHUB (GC 12.0) flush of context 11 timed out (5 so far): INV_REQ 0, INV_ACK 0
+Nov 13 18:11:13 gmc: GFXHUB (GC 12.0) at the timeout: GCVM_L2_STATUS 0, CP_CPF_STATUS 0
+Nov 13 18:11:13 gmc: GFXHUB (GC 12.0) engine 16, same context: NO ack either
+Nov 13 18:11:13 gmc: GFXHUB (GC 12.0) after the timeout: CONTEXT0_CNTL 0, PT base 000000000, L1_TLB 0, L2_CNTL 0, fault status 0 (addr 000000000)
+Nov 13 18:11:13 gmc: GFXHUB (GC 12.0) flush of context 12 timed out (6 so far): INV_REQ 0, INV_ACK 0
+Nov 13 18:11:13 gmc: GFXHUB (GC 12.0) at the timeout: GCVM_L2_STATUS 0, CP_CPF_STATUS 0
+Nov 13 18:11:13 gmc: GFXHUB (GC 12.0) engine 16, same context: NO ack either
+Nov 13 18:11:13 gmc: GFXHUB (GC 12.0) after the timeout: CONTEXT0_CNTL 0, PT base 000000000, L1_TLB 0, L2_CNTL 0, fault status 0 (addr 000000000)
+Nov 13 18:11:13 gmc: GFXHUB (GC 12.0) flush of context 13 timed out (7 so far): INV_REQ 0, INV_ACK 0
+Nov 13 18:11:13 gmc: GFXHUB (GC 12.0) at the timeout: GCVM_L2_STATUS 0, CP_CPF_STATUS 0
+Nov 13 18:11:13 gmc: GFXHUB (GC 12.0) engine 16, same context: NO ack either
+Nov 13 18:11:13 gmc: GFXHUB (GC 12.0) after the timeout: CONTEXT0_CNTL 0, PT base 000000000, L1_TLB 0, L2_CNTL 0, fault status 0 (addr 000000000)
+Nov 13 18:11:13 gmc: GFXHUB (GC 12.0) flush of context 14 timed out (8 so far): INV_REQ 0, INV_ACK 0
+Nov 13 18:11:13 gmc: GFXHUB (GC 12.0) at the timeout: GCVM_L2_STATUS 0, CP_CPF_STATUS 0
+Nov 13 18:11:13 gmc: GFXHUB (GC 12.0) engine 16, same context: NO ack either
+Nov 13 18:11:13 gmc: GFXHUB (GC 12.0) after the timeout: CONTEXT0_CNTL 0, PT base 000000000, L1_TLB 0, L2_CNTL 0, fault status 0 (addr 000000000)
+== key lines
+Nov 13 18:00:21 uq4: REMOVE_QUEUE refused (5); HQD reset, trying once more
+Nov 13 18:00:21 si: VM fault on VMID 0 at 0, not the running submit's VMID 0
+Nov 13 18:00:23 si: a lost user queue that will not stop; resetting the GPU, every client queue is lost
+Nov 13 18:00:30 si: GPU re-init 1 of 3 in this window: PASS (MES up, kernel compute queue ready)
+Nov 13 18:00:30 si: GPU re-initialised (1 so far): old VMs (0x3e) and queues are lost (EIO) until closed; new ones run
+Nov 13 18:00:38 uq4: REMOVE_QUEUE refused (5); HQD reset, trying once more
+Nov 13 18:00:38 si: VM fault on VMID 0 at 0, not the running submit's VMID 0
+Nov 13 18:00:40 si: a lost user queue that will not stop; resetting the GPU, every client queue is lost
+Nov 13 18:00:47 si: GPU re-init 2 of 3 in this window: PASS (MES up, kernel compute queue ready)
+Nov 13 18:00:47 si: GPU re-initialised (2 so far): old VMs (0x3e) and queues are lost (EIO) until closed; new ones run
+Nov 13 18:11:09 uq1: REMOVE_QUEUE refused (5); HQD reset, trying once more
+Nov 13 18:11:09 si: VM fault on VMID 0 at 0, not the running submit's VMID 0
+Nov 13 18:11:11 si: a user queue that will not stop; resetting the GPU, every client queue is lost
+Nov 13 18:11:18 si: GPU re-init 1 of 3 in this window: PASS (MES up, kernel compute queue ready)
+Nov 13 18:11:18 si: GPU re-initialised (3 so far): old VMs (0xfe) and queues are lost (EIO) until closed; new ones run
+Nov 13 18:11:26 uq1: REMOVE_QUEUE refused (5); HQD reset, trying once more
+Nov 13 18:11:26 si: VM fault on VMID 0 at 0, not the running submit's VMID 0
+Nov 13 18:11:28 si: a user queue that will not stop; resetting the GPU, every client queue is lost
+Nov 13 18:11:35 si: GPU re-init 2 of 3 in this window: PASS (MES up, kernel compute queue ready)
+Nov 13 18:11:35 si: GPU re-initialised (4 so far): old VMs (0xa) and queues are lost (EIO) until closed; new ones run
+Nov 13 18:21:47 uq4: REMOVE_QUEUE refused (5); HQD reset, trying once more
+Nov 13 18:21:47 si: VM fault on VMID 0 at 0, not the running submit's VMID 0
+Nov 13 18:21:49 si: a user queue that will not stop; resetting the GPU, every client queue is lost
+Nov 13 18:21:56 si: GPU re-init 1 of 3 in this window: PASS (MES up, kernel compute queue ready)
+Nov 13 18:21:56 si: GPU re-initialised (5 so far): old VMs (0xfe) and queues are lost (EIO) until closed; new ones run
+Nov 13 18:22:04 uq0: REMOVE_QUEUE refused (5); HQD reset, trying once more
+Nov 13 18:22:04 si: VM fault on VMID 0 at 0, not the running submit's VMID 0
+Nov 13 18:22:06 si: a user queue that will not stop; resetting the GPU, every client queue is lost
+Nov 13 18:22:13 si: GPU re-init 2 of 3 in this window: PASS (MES up, kernel compute queue ready)
+Nov 13 18:22:13 si: GPU re-initialised (6 so far): old VMs (0x8) and queues are lost (EIO) until closed; new ones run
+Nov 13 18:32:26 uq4: REMOVE_QUEUE refused (5); HQD reset, trying once more
+Nov 13 18:32:26 si: VM fault on VMID 0 at 0, not the running submit's VMID 0
+Nov 13 18:32:28 si: a user queue that will not stop; resetting the GPU, every client queue is lost
+Nov 13 18:32:34 si: GPU re-init 1 of 3 in this window: PASS (MES up, kernel compute queue ready)
+Nov 13 18:32:34 si: GPU re-initialised (7 so far): old VMs (0xfe) and queues are lost (EIO) until closed; new ones run
+Nov 13 18:32:43 uq0: REMOVE_QUEUE refused (5); HQD reset, trying once more
+Nov 13 18:32:43 si: VM fault on VMID 0 at 0, not the running submit's VMID 0
+Nov 13 18:32:45 si: a user queue that will not stop; resetting the GPU, every client queue is lost
+Nov 13 18:32:52 si: GPU re-init 2 of 3 in this window: PASS (MES up, kernel compute queue ready)
+Nov 13 18:32:52 si: GPU re-initialised (8 so far): old VMs (0x8) and queues are lost (EIO) until closed; new ones run
+Nov 13 18:43:04 uq4: REMOVE_QUEUE refused (5); HQD reset, trying once more
+Nov 13 18:43:04 si: VM fault on VMID 0 at 0, not the running submit's VMID 0
+Nov 13 18:43:06 si: a user queue that will not stop; resetting the GPU, every client queue is lost
+Nov 13 18:43:13 si: GPU re-init 1 of 3 in this window: PASS (MES up, kernel compute queue ready)
+Nov 13 18:43:13 si: GPU re-initialised (9 so far): old VMs (0xfe) and queues are lost (EIO) until closed; new ones run
+Nov 13 18:43:14 si: VM fault on VMID 0 at 0, not the running submit's VMID 0
+Nov 13 18:53:22 uq6: REMOVE_QUEUE refused (5); HQD reset, trying once more
+Nov 13 18:53:22 si: VM fault on VMID 0 at 0, not the running submit's VMID 0
+Nov 13 18:53:24 si: a user queue that will not stop; resetting the GPU, every client queue is lost
+Nov 13 18:53:30 si: GPU re-init 1 of 3 in this window: PASS (MES up, kernel compute queue ready)
+Nov 13 18:53:30 si: GPU re-initialised (10 so far): old VMs (0xfe) and queues are lost (EIO) until closed; new ones run
+Nov 13 18:53:39 uq0: REMOVE_QUEUE refused (5); HQD reset, trying once more
+Nov 13 18:53:39 si: VM fault on VMID 0 at 0, not the running submit's VMID 0
+Nov 13 18:53:41 si: a user queue that will not stop; resetting the GPU, every client queue is lost
+Nov 13 18:53:48 si: GPU re-init 2 of 3 in this window: PASS (MES up, kernel compute queue ready)
+Nov 13 18:53:48 si: GPU re-initialised (11 so far): old VMs (0x8) and queues are lost (EIO) until closed; new ones run
+Nov 13 19:04:04 uq4: REMOVE_QUEUE refused (5); HQD reset, trying once more
+Nov 13 19:04:04 si: VM fault on VMID 0 at 0, not the running submit's VMID 0
+Nov 13 19:04:06 si: a user queue that will not stop; resetting the GPU, every client queue is lost
+Nov 13 19:04:13 si: GPU re-init 1 of 3 in this window: PASS (MES up, kernel compute queue ready)
+Nov 13 19:04:13 si: GPU re-initialised (12 so far): old VMs (0xfe) and queues are lost (EIO) until closed; new ones run
+Nov 13 19:04:21 uq0: REMOVE_QUEUE refused (5); HQD reset, trying once more
+Nov 13 19:04:21 si: VM fault on VMID 0 at 0, not the running submit's VMID 0
+Nov 13 19:04:24 si: a user queue that will not stop; resetting the GPU, every client queue is lost
+Nov 13 19:04:30 si: GPU re-init 2 of 3 in this window: PASS (MES up, kernel compute queue ready)
+Nov 13 19:04:30 si: GPU re-initialised (13 so far): old VMs (0x8) and queues are lost (EIO) until closed; new ones run
+Nov 13 19:11:37 uq4: REMOVE_QUEUE refused (5); HQD reset, trying once more
+Nov 13 19:11:37 si: VM fault on VMID 0 at 0, not the running submit's VMID 0
+Nov 13 19:11:39 si: a lost user queue that will not stop; resetting the GPU, every client queue is lost
+Nov 13 19:11:46 si: GPU re-init 3 of 3 in this window: PASS (MES up, kernel compute queue ready)
+Nov 13 19:11:46 si: GPU re-initialised (14 so far): old VMs (0x3e) and queues are lost (EIO) until closed; new ones run
+Nov 13 19:11:54 uq4: REMOVE_QUEUE refused (5); HQD reset, trying once more
+Nov 13 19:11:54 si: VM fault on VMID 0 at 0, not the running submit's VMID 0
+Nov 13 19:11:56 si: a lost user queue that will not stop; resetting the GPU, every client queue is lost
+Nov 13 19:11:58 si: 3 GPU re-inits in 600 s; the GPU stays lost until the driver is reloaded
+
+== 40 unfiltered lines before the first VMID 0 fault after a fuzz-time re-init (re-init at 18:11:18; fault line 3256)
+Nov 13 18:11:18 atrium-r9700 kernel: atrium_gpu_amd_pci0: smu: TransferTableSmu2Dram      arg 0x00000005: resp 0x1
+Nov 13 18:11:18 atrium-r9700 kernel: atrium_gpu_amd_pci0: uq2: freed after the GPU reset
+Nov 13 18:11:18 atrium-r9700 kernel: atrium_gpu_amd_pci0: si: uq2 closed: 1 submits; EOP IVs routed 53, unrouted 9, MES own 1750, MES preemption 108; retired by IV 46, by poll 0; queues lost to faults 5, hangs 8; preempted for frees 108 (failed 2)
+Nov 13 18:11:18 atrium-r9700 kernel: atrium_gpu_amd_pci0: si: unrouted EOP src_data[0]: 0x18000000 x4, 0x4000028 x2, 0x4000022 x2, 0x4000026 x1
+Nov 13 18:11:18 atrium-r9700 kernel: atrium_gpu_amd_pci0: smu: telemetry #2: edge 28 C, hotspot 33 C, mem 28 C, VR 27 C; power 14 W of 300 W limit, board 14 W; fan 845 rpm (20%); gfx 0 MHz, mem 193 MHz, gfx busy 0%; throttle 0x1 (ids 0x2)
+Nov 13 18:11:18 atrium-r9700 kernel: atrium_gpu_amd_pci0: si: watch #132: telemetry ok
+Nov 13 18:11:18 atrium-r9700 kernel: atrium_gpu_amd_pci0: uq3: freed after the GPU reset
+Nov 13 18:11:18 atrium-r9700 kernel: atrium_gpu_amd_pci0: si: uq3 closed: 0 submits; EOP IVs routed 53, unrouted 9, MES own 1750, MES preemption 108; retired by IV 46, by poll 0; queues lost to faults 5, hangs 8; preempted for frees 108 (failed 2)
+Nov 13 18:11:18 atrium-r9700 kernel: atrium_gpu_amd_pci0: si: unrouted EOP src_data[0]: 0x18000000 x4, 0x4000028 x2, 0x4000022 x2, 0x4000026 x1
+Nov 13 18:11:18 atrium-r9700 kernel: atrium_gpu_amd_pci0: mes: pipe 0 ADD_QUEUE (user compute): ok in 300 us (status 0x1)
+Nov 13 18:11:18 atrium-r9700 kernel: atrium_gpu_amd_pci0: uq1: added: VM base 0x8804001, queue pages at VA 0x200010000 (pa 0x303cb8000), MQD GART 0x84000, doorbell 0x22
+Nov 13 18:11:20 atrium-r9700 kernel: atrium_gpu_amd_pci0: si: EOP IV with src_data[0] 0x4000022: no queue of ours; checked every user queue
+Nov 13 18:11:20 atrium-r9700 kernel: atrium_gpu_amd_pci0: mes: pipe 0 SUSPEND (user gang): refused (fence 0x8 of 0x8, status 0x8100060200000000, rptr 0)
+Nov 13 18:11:20 atrium-r9700 kernel: atrium_gpu_amd_pci0: si: uq1 could not be preempted (5); the BO waits for its queues to close
+Nov 13 18:11:22 atrium-r9700 kernel: atrium_gpu_amd_pci0: si: EOP IV with src_data[0] 0x4000022: no queue of ours; checked every user queue
+Nov 13 18:11:22 atrium-r9700 kernel: atrium_gpu_amd_pci0: mes: pipe 0 SUSPEND (user gang): refused (fence 0x9 of 0x9, status 0x8100060200000000, rptr 0)
+Nov 13 18:11:22 atrium-r9700 kernel: atrium_gpu_amd_pci0: si: uq1 could not be preempted (5); the BO waits for its queues to close
+Nov 13 18:11:23 atrium-r9700 kernel: atrium_gpu_amd_pci0: smu: TransferTableSmu2Dram      arg 0x00000005: resp 0x1
+Nov 13 18:11:23 atrium-r9700 kernel: atrium_gpu_amd_pci0: smu: telemetry #4962: edge 29 C, hotspot 37 C, mem 28 C, VR 28 C; power 64 W of 300 W limit, board 64 W; fan 894 rpm (20%); gfx 3392 MHz, mem 183 MHz, gfx busy 100%; throttle 0x1 (ids 0x2)
+Nov 13 18:11:23 atrium-r9700 kernel: atrium_gpu_amd_pci0: si: uq1 hung: fence 0, no progress for 5000 ms; its work fails, the queue is lost
+Nov 13 18:11:24 atrium-r9700 kernel: atrium_gpu_amd_pci0: si: EOP IV with src_data[0] 0x4000022: no queue of ours; checked every user queue
+Nov 13 18:11:24 atrium-r9700 kernel: atrium_gpu_amd_pci0: mes: pipe 0 SUSPEND (user gang): refused (fence 0xa of 0xa, status 0x8100060200000000, rptr 0)
+Nov 13 18:11:24 atrium-r9700 kernel: atrium_gpu_amd_pci0: si: uq1 could not be preempted (5); the BO waits for its queues to close
+Nov 13 18:11:24 atrium-r9700 kernel: atrium_gpu_amd_pci0: uq1: destroy: work in flight: seq 1, fence 0, wptr 12, rptr report 0; HQD not looked up (MES owns it) (VMID 0)
+Nov 13 18:11:24 atrium-r9700 kernel: atrium_gpu_amd_pci0: gmc: evict: after the queue report: GCVM_L2_STATUS 0, CP_CPF_STATUS 0xa8008001, 14847392 us after the fault
+Nov 13 18:11:24 atrium-r9700 kernel: atrium_gpu_amd_pci0: uq1: VMID 8, no HQD scan
+Nov 13 18:11:24 atrium-r9700 kernel: atrium_gpu_amd_pci0: gmc: evict: after the HQD lookup: GCVM_L2_STATUS 0, CP_CPF_STATUS 0xa8008001, 14847410 us after the fault
+Nov 13 18:11:24 atrium-r9700 kernel: atrium_gpu_amd_pci0: mes: before the wave kill: CP_CPF_STATUS 0xa8008001, CP_CPC_STATUS 0xa0000041, CP_CPC_BUSY_STAT 0x848/0, GRBM_STATUS2 0x34110000, RLC_GPM_STAT 0xc0036, GCVM_L2_STATUS 0
+Nov 13 18:11:24 atrium-r9700 kernel: atrium_gpu_amd_pci0: mes: right after the wave kill: CP_CPF_STATUS 0xa8008001, CP_CPC_STATUS 0xa0000041, CP_CPC_BUSY_STAT 0x848/0, GRBM_STATUS2 0x34100000, RLC_GPM_STAT 0xc0036, GCVM_L2_STATUS 0
+Nov 13 18:11:24 atrium-r9700 kernel: atrium_gpu_amd_pci0: uq1: VMID 8's waves killed (0); fence still behind after 200000 us
+Nov 13 18:11:24 atrium-r9700 kernel: atrium_gpu_amd_pci0: mes: after the wave kill: CP_CPF_STATUS 0xa8008001, CP_CPF_BUSY_STAT 0xd84a0000/0, CP_CPF_STALLED_STAT1 0, CP_CPC_BUSY_STAT 0x848/0, CP_CPC_STALLED_STAT1 0x100, GRBM_STATUS2 0x34110000
+Nov 13 18:11:24 atrium-r9700 kernel: atrium_gpu_amd_pci0: mes: end of the CPF watch: CP_CPF_STATUS 0xa8008001, CP_CPC_STATUS 0xa0000041, CP_CPC_BUSY_STAT 0x848/0, GRBM_STATUS2 0x34110000, RLC_GPM_STAT 0xc0036, GCVM_L2_STATUS 0
+Nov 13 18:11:24 atrium-r9700 kernel: atrium_gpu_amd_pci0: mes: after the wave kill: CPF bit 28 clear after 0 ms (CP_CPF_STATUS 0xa8008001); CP_CPF_BUSY_STAT 0xd84a0000/0, CP_CPF_STALLED_STAT1 0, CP_CPC_BUSY_STAT 0x848/0, CP_CPC_STALLED_STAT1 0x100, CP_CPC_STATUS 0xa0000041, GRBM_STATUS2 0x34110000, RLC_GPM_STAT 0xc0036
+Nov 13 18:11:26 atrium-r9700 kernel: atrium_gpu_amd_pci0: si: EOP IV with src_data[0] 0x4000022: no queue of ours; checked every user queue
+Nov 13 18:11:26 atrium-r9700 kernel: atrium_gpu_amd_pci0: mes: pipe 0 REMOVE_QUEUE (user compute): refused (fence 0xb of 0xb, status 0x8100030100000000, rptr 0)
+Nov 13 18:11:26 atrium-r9700 kernel: atrium_gpu_amd_pci0: uq1: REMOVE_QUEUE refused (5); HQD reset, trying once more
+Nov 13 18:11:26 atrium-r9700 kernel: atrium_gpu_amd_pci0: si: VM fault: 1 IV(s), VMIDs 0x1, first VMID 0 at 0
+Nov 13 18:11:26 atrium-r9700 kernel: atrium_gpu_amd_pci0: gmc: at the fault: GCVM_L2_STATUS 0, after 0 us 0; last invalidation (context 15) started 4201309 us ago, atrium_gpu_amd_pci0: mes: pipe 0 REMOVE_QUEUE (user compute): refused (fence 0xc of 0xc, status 0x8100030300000000, rptr 0)
+Nov 13 18:11:26 atrium-r9700 kernel: ended 4201297 us ago
+Nov 13 18:11:26 atrium-r9700 kernel: atrium_gpu_amd_pci0: gmc: client fault: fault status 0xb3a: client CPC (0x5), VMID 0, MORE_FAULTS 0, WALKER_ERROR 0x5, PERMISSION_FAULTS 0x3, MAPPING_ERROR 1, RW 0, ATOMIC 0, PRT 0, UCE 0
+Nov 13 18:11:26 atrium-r9700 kernel: atrium_gpu_amd_pci0: si: VM fault on VMID 0 at 0, not the running submit's VMID 0
