@@ -135,6 +135,19 @@ impl State {
     /// `NEEDS_VERIFICATION`: the user, and the item's description for the
     /// sheet. Only an app's own verify-each-use item, by the ops that use one.
     pub fn verify_prompt(&self, who: &Label, op: u16, body: &[u8]) -> Option<(String, String)> {
+        if let Label::Courier(c) = who {
+            let Recipient::Endpoint { host, .. } = &c.endpoint else { return None };
+            let store = self.stores.get(&c.user)?;
+            let who = Access { persona: &c.persona, recipient: &c.endpoint };
+            let names: Vec<String> = self
+                .fill_items(c, op, body)?
+                .iter()
+                .filter_map(|id| store.meta(id, &who).ok())
+                .filter(|m| m.class == Class::VerifyEachUse)
+                .map(|m| format!("\u{201c}{}\u{201d}", m.account))
+                .collect();
+            return (!names.is_empty()).then(|| (c.user.clone(), format!("{} for {host}", names.join(", "))));
+        }
         let (Label::App { user, publisher, app_id } | Label::WebBroker { user, publisher, app_id }) = who else { return None };
         if !matches!(op, op::PUBKEY | op::SIGN | op::RELEASE) || body.len() < 16 {
             return None;
@@ -840,10 +853,35 @@ impl State {
 
     // ── couriers ─────────────────────────────────────────────────────────
 
+    /// The stored items a `FILL` names, directly or through a handle
+    /// (looked at, not redeemed). `None` if it isn't a well-formed `FILL`.
+    fn fill_items(&self, c: &CourierLabel, op: u16, body: &[u8]) -> Option<Vec<ItemId>> {
+        if op != courier_op::FILL {
+            return None;
+        }
+        let mut r = Reader::new(body);
+        let n = r.u8().ok()? as usize;
+        if n == 0 || n > courier_op::MAX_SLOTS {
+            return None;
+        }
+        let mut out = Vec::new();
+        for _ in 0..n {
+            let (src, x) = (r.u8().ok()?, r.array::<16>().ok()?);
+            match src {
+                courier_op::SOURCE_ITEM => out.push(ItemId(x)),
+                courier_op::SOURCE_HANDLE => out.extend(self.handles.item_of(&x, &c.user, &c.persona, &c.endpoint)),
+                _ => return None,
+            }
+        }
+        r.end().ok()?;
+        Some(out)
+    }
+
     /// A courier asks only after its TLS handshake with its endpoint, and
     /// only for its own label's (persona, endpoint): the store's access
     /// check and the handle's binding both use the registry's label.
     fn courier_op(&mut self, c: &CourierLabel, op: u16, body: &[u8], item: &mut Option<ItemId>) -> Reply {
+        let verified = std::mem::take(&mut self.verified);
         let mut r = Reader::new(body);
         let who = Access { persona: &c.persona, recipient: &c.endpoint };
         match op {
@@ -864,6 +902,18 @@ impl State {
                     return malformed();
                 }
                 let Some(store) = self.stores.get(&c.user) else { return reply(status::LOCKED) };
+                // Verify-each-use (arca.md §6.2): one check covers the whole
+                // fill. Looked at before any handle is redeemed, so a fill
+                // that waits for the sheet keeps its handles.
+                if !verified {
+                    for id in self.fill_items(c, op, body).unwrap_or_default() {
+                        if store.meta(&id, &who).is_ok_and(|m| m.class == Class::VerifyEachUse) {
+                            *item = Some(id);
+                            return reply(status::NEEDS_VERIFICATION);
+                        }
+                    }
+                }
+                let uv = || verified.then(arca_store::UserVerified::vouched_by_vestibulum);
                 let mut vals = Vec::with_capacity(n);
                 for (src, x) in refs {
                     let v = match src {
@@ -875,7 +925,7 @@ impl State {
                             if m.kind.shape() != Shape::Bearer || m.kind == Kind::Cookie {
                                 return reply(status::DENIED);
                             }
-                            tri!(store.release(&id, &who, None)).1
+                            tri!(store.release(&id, &who, uv())).1
                         }
                         courier_op::SOURCE_HANDLE => {
                             let Some(e) = self.handles.take(&x, &c.user, &c.persona, &c.endpoint) else {
@@ -885,7 +935,7 @@ impl State {
                                 crate::handles::Source::Pending(v) => v,
                                 crate::handles::Source::Item(id) => {
                                     *item = Some(id);
-                                    tri!(store.release(&id, &who, None)).1
+                                    tri!(store.release(&id, &who, uv())).1
                                 }
                             }
                         }

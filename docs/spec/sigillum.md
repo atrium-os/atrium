@@ -822,7 +822,10 @@ otherwise passes the blobs on without reading them.
   policy doesn't allow (now ro, and in `ro_paths`), and a gate whose broker socket is
   missing would see every passcode as wrong. The gate now checks that the broker is up and
   that PAM answered yes before it trusts a no.
-- **Not yet:** couriers' `FILL` of a verify-each-use item; a fingerprint or key-UV method on
+- Couriers' `FILL` of a verify-each-use item (arca.md §6.2 as built): the same sheet,
+  naming the endpoint, once per fill; `arcad/tests/courier.rs` and
+  `arcad/tests/verify_each_use.rs` (through `serve_conn_with`).
+- **Not yet:** a fingerprint or key-UV method on
   the verify sheet (S5, S6); ostiarius telling "PAM said no" from "the broker is
   unreachable" (both count as a failure toward the lockout today).
 

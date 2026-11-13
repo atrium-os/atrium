@@ -353,7 +353,18 @@ inside arcad; `serve_conn_with` then asks sigillumd (`ARCA_SIGILLUM_SOCKET`, wit
 item's account and app id as the sheet's description) with the state unlocked, and on
 `Verified` (at least biometric-secure) reruns the request with one `UserVerified`. No
 answer or a refusal leaves the item unused (`NEEDS_VERIFICATION` to the app). Apps may now
-`MINT` and `STORE` in this class. Not yet: couriers' `FILL` of such an item.
+`MINT` and `STORE` in this class (and `STORE_FOR`, for an endpoint).
+
+A courier's `FILL` of a verify-each-use item, named directly or through a credential
+handle, goes through the same check: arcad looks at every slot before it redeems any
+handle, answers `NEEDS_VERIFICATION` if one is verify-each-use, and the sheet names the
+items and the endpoint ("“transfer token” for api.bank.example"). One check covers the
+whole fill; the next fill asks again. A refused or unfinished check fails the request
+with the courier's `NotVerified` refusal, nothing sent. The courier waits up to 12 minutes
+for `FILL` (arcad's own wait on sigillumd is 11). Its TLS connection to the endpoint
+stays open meanwhile, so a server that drops idle connections faster fails the request
+with `Connect`/`Http`, and the app retries; the order (handshake first, then `FILL`) is
+kept, because a secret is never unwrapped for a host not yet proven.
 
 ### 6.3 Arca's own process
 

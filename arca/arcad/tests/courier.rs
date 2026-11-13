@@ -149,3 +149,51 @@ fn courier_uids_resolve_only_through_the_courier_registry() {
     let r = Resolver { courier_registry: None, ..r };
     assert_eq!(r.resolve(64001), Label::Unknown);
 }
+
+/// Verify-each-use (arca.md §6.2): a courier's fill of such an item waits
+/// for Sigillum's check, which names the item and the endpoint; one check
+/// covers the whole fill, and the next fill asks again.
+#[test]
+fn a_verify_each_use_token_is_filled_only_after_the_check() {
+    let (_d, mut s) = setup();
+    let bank = app(7, "org.example.bank");
+    let plain = store_for(&mut s, &bank, "api.bank.example", b"tok-plain");
+    let r = s.handle(&bank, op::STORE_FOR, &body(|w| {
+        w.u16(4);
+        w.u8(3);
+        w.str("transfer token");
+        write_endpoint(w, "api.bank.example", 443);
+        w.bytes(b"tok-veu");
+    }));
+    assert_eq!(r.status, status::OK);
+    let veu: [u8; 16] = r.body.bytes().try_into().unwrap();
+    let c = courier(7, "org.example.bank", "api.bank.example");
+    let refs = [(cop::SOURCE_ITEM, plain), (cop::SOURCE_ITEM, veu)];
+    let b = body(|w| {
+        w.u8(2);
+        for (src, x) in &refs {
+            w.u8(*src);
+            w.raw(x);
+        }
+    });
+
+    assert_eq!(fill(&mut s, &c, &refs), (status::NEEDS_VERIFICATION, vec![]));
+    assert_eq!(
+        s.verify_prompt(&c, cop::FILL, &b),
+        Some(("alice".to_string(), "\u{201c}transfer token\u{201d} for api.bank.example".to_string()))
+    );
+    let r = s.handle_verified(&c, cop::FILL, &b);
+    assert_eq!(r.status, status::OK);
+    let mut rd = Reader::new(r.body.bytes());
+    assert_eq!(rd.bytes(64).unwrap(), b"tok-plain");
+    assert_eq!(rd.bytes(64).unwrap(), b"tok-veu");
+    // Once: the next fill is asked about again.
+    assert_eq!(fill(&mut s, &c, &refs).0, status::NEEDS_VERIFICATION);
+    // A fill of only the while-unlocked token asks nothing.
+    assert!(s.verify_prompt(&c, cop::FILL, &body(|w| { w.u8(1); w.u8(cop::SOURCE_ITEM); w.raw(&plain); })).is_none());
+    assert_eq!(fill(&mut s, &c, &[(cop::SOURCE_ITEM, plain)]).0, status::OK);
+    // Another endpoint's courier gets no sheet, only DENIED.
+    let evil = courier(7, "org.example.bank", "evil.example");
+    assert!(s.verify_prompt(&evil, cop::FILL, &b).is_none());
+    assert_eq!(fill(&mut s, &evil, &refs).0, status::DENIED);
+}

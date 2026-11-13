@@ -335,6 +335,9 @@ pub enum Refusal {
     /// header value).
     Unsendable = 7,
     Internal = 8,
+    /// A verify-each-use slot whose check the user refused or didn't
+    /// finish (arca.md §6.2): nothing was sent.
+    NotVerified = 9,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -388,6 +391,7 @@ impl Response {
                 5 => Refusal::Locked,
                 6 => Refusal::Http,
                 7 => Refusal::Unsendable,
+                9 => Refusal::NotVerified,
                 _ => Refusal::Internal,
             }),
             _ => return None,

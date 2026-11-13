@@ -121,3 +121,48 @@ fn only_its_own_apps_items_are_asked_about() {
     assert_eq!(sign(&mut c, &plain), (status::OK, 64));
     assert!(sheet.asked.lock().unwrap().is_empty());
 }
+
+/// A courier's FILL of a verify-each-use token goes through the same sheet,
+/// once per fill, naming the endpoint (arca.md §6.2, §5).
+#[test]
+fn a_couriers_fill_is_verified_first() {
+    use arcad::courier::{app_persona, CourierLabel};
+    use arcad::proto::{courier_op, write_endpoint};
+    let d = tempfile::tempdir().unwrap();
+    let st = state(&d);
+    let mut w = Writer::new();
+    w.u16(4); // ApiKey
+    w.u8(VERIFY_EACH_USE);
+    w.str("transfer token");
+    write_endpoint(&mut w, "api.bank.example", 443);
+    w.bytes(b"tok-veu");
+    let r = st.lock().unwrap().handle(&app(), op::STORE_FOR, &w.buf);
+    assert_eq!(r.status, status::OK);
+    let id: [u8; 16] = r.body.bytes().try_into().unwrap();
+
+    let courier = Label::Courier(CourierLabel {
+        user: "alice".into(),
+        persona: app_persona(&[7; 32], "org.example.bank"),
+        endpoint: arca_store::Recipient::endpoint(arca_store::Scheme::Https, "api.bank.example", 443, None).unwrap(),
+    });
+    let fill = |yes: bool| {
+        let sheet = Arc::new(Sheet { yes, asked: Mutex::new(vec![]), state: st.clone() });
+        let (mut c, server) = UnixStream::pair().unwrap();
+        let (st2, l, v) = (st.clone(), courier.clone(), sheet.clone());
+        std::thread::spawn(move || arcad::serve_conn_with(server, &l, &st2, Some(&*v as &dyn Verify)));
+        let mut w = Writer::new();
+        w.u8(1);
+        w.u8(courier_op::SOURCE_ITEM);
+        w.raw(&id);
+        proto::write_request(&mut c, courier_op::FILL, &w.buf).unwrap();
+        let (s, body) = proto::read_reply(&mut c).unwrap();
+        let asked = sheet.asked.lock().unwrap().clone();
+        (s, body.as_ref().to_vec(), asked)
+    };
+    let (s, body, asked) = fill(true);
+    assert_eq!(s, status::OK);
+    assert_eq!(&body[4..], b"tok-veu");
+    assert_eq!(asked, vec![("alice".to_string(), "\u{201c}transfer token\u{201d} for api.bank.example".to_string())]);
+    let (s, body, asked) = fill(false);
+    assert_eq!((s, body.len(), asked.len()), (status::NEEDS_VERIFICATION, 0, 1));
+}

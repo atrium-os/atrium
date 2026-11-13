@@ -13,6 +13,9 @@ use arcad::proto::{self, courier_op, status};
 use crate::schema::Refusal;
 use crate::send::Vault;
 
+/// Longer than arcad's own wait on sigillumd (11 minutes).
+const VERIFY_WAIT: Duration = Duration::from_secs(12 * 60);
+
 pub struct Arcad {
     path: PathBuf,
 }
@@ -24,7 +27,10 @@ impl Arcad {
 
     fn call(&self, op: u16, body: &[u8]) -> Result<(u8, LockedBuf), Refusal> {
         let mut s = UnixStream::connect(&self.path).map_err(|_| Refusal::Internal)?;
-        s.set_read_timeout(Some(Duration::from_secs(5))).ok();
+        // A FILL of a verify-each-use item waits while the user answers
+        // Sigillum's sheet (arcad bounds that wait); everything else is quick.
+        let wait = if op == courier_op::FILL { VERIFY_WAIT } else { Duration::from_secs(5) };
+        s.set_read_timeout(Some(wait)).ok();
         proto::write_request(&mut s, op, body).map_err(|_| Refusal::Internal)?;
         proto::read_reply(&mut s).map_err(|_| Refusal::Internal)
     }
@@ -42,6 +48,7 @@ impl Vault for Arcad {
         match st {
             status::OK => {}
             status::LOCKED => return Err(Refusal::Locked),
+            status::NEEDS_VERIFICATION => return Err(Refusal::NotVerified),
             _ => return Err(Refusal::Denied),
         }
         let mut r = Reader::new(b.as_ref());

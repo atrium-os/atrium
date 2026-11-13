@@ -71,6 +71,20 @@ impl Handles {
         Some(e)
     }
 
+    /// The stored item a handle names, for exactly the party it was
+    /// issued to, without redeeming it (FILL looks before it takes, so a
+    /// fill that must wait for verification leaves its handles).
+    pub fn item_of(&self, h: &Handle, user: &str, persona: &str, recipient: &Recipient) -> Option<ItemId> {
+        let e = self.map.get(h)?;
+        if e.expires <= Instant::now() || e.user != user || e.persona != persona || &e.recipient != recipient {
+            return None;
+        }
+        match e.source {
+            Source::Item(id) => Some(id),
+            Source::Pending(_) => None,
+        }
+    }
+
     /// Lock: every pending value of `user` goes (handles to stored items
     /// would fail at redeem anyway, but drop them too).
     pub fn lock_user(&mut self, user: &str) {
