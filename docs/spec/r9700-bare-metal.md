@@ -1454,3 +1454,14 @@ work (self-test, scrub).
   on the VMID from the fault. Still scanning: the uq_poll hang check, CP-error
   IVs, the HQD reset of a queue that will not stop. Logs:
   claude/project-thread-33aauq 2bcbeacc.
+- **2026-11-13 15:08, full suite with 3b6c6dfc (no HQD scans on the fault
+  path): WEDGED, high-VA case again (70 passed, 2 failed, 183 timeouts).** So
+  b4d6e8f9's high-VA pass was timing. No HQD scan ran ("not looked up",
+  "VMID 12 from the fault"). Every checkpoint through 157 us was clean; the
+  L2 read 0x1 at the "before the wave kill" snapshot, whose first access is
+  MES pipe 0's PC through a GRBM select (me 3); CPF bit 28 set just after the
+  kill. Refined hypothesis: any GRBM_GFX_CNTL select made while MES/CP is busy
+  (the HQD scans before, now the diagnostics' own MES-pipe selects).
+  Next (kmods f4af2b81, includes b648c939): no GRBM select anywhere on the
+  fault and eviction path, diagnostics included. Logs: claude/project-thread-33aauq
+  0419a9f3.
