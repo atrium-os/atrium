@@ -895,10 +895,26 @@ The mount side of §4.8:
   ends when the jail goes (checked every reshow), on `REVOKE`, eject,
   unplug, lock and logout. CLI: `atrium-dispensatord --grant PART PATH
   --jail NAME --uid U [--gid G] [--ro]`, `--revoke JAIL`.
-- **Not yet:** the picker and the file manager, which are Scrinium's; the
-  `removable-files` capability is wired with them (portcullisd asks for the
-  whole stick when it launches the file manager); a single file handed as a
-  descriptor.
+- **The file manager** (`ATTACH_ALL`, op 4): the app asks from its own
+  jail. dispensatord checks the session is unlocked, the peer's uid is in
+  portcullisd's app registry as an app of the session's user, its
+  installed manifest (`/var/lib/atrium/apps/<id>/atrium.toml`) holds
+  `removable-files` (restricted: portcullisd installs it only with policy
+  approval), and the uid's processes run in exactly one jail (`ps -x -U`,
+  `jls`). It then keeps a standing grant: every served stick, whole and
+  read-write (read-only where the driver is), at `/media/<part>`, as each
+  comes, through the same grants as above. Locking ends the mounts and
+  unlocking brings them back to the same jail; the jail going, a logout or
+  another user's session ends the standing grant. CLI `--attach-all`.
+  Capability `removable-files` also gives the `removable-media/` socket.
+- **One file** (`OPEN`, op 5, root only, so the picker through
+  portcullisd): `{part, path, write}`; dispensatord opens the path on the
+  session's mount itself (no `..`, `O_NOFOLLOW`, a regular file only) and
+  the reply carries the open file as its one descriptor, which portcullisd
+  passes on to the app over Aqueduct. CLI `--open PART PATH [--write]`
+  prints the file as read through the descriptor.
+- **Not yet:** the picker and the file manager themselves, which are
+  Scrinium's.
 
 Tests: capsa-fuse `grants` (a real FUSE mount on Linux: refusals, only the
 folder, owner and mode, `..`, writes seen by the session, the session's
@@ -908,7 +924,12 @@ fsck.fat clean after); atrium-media `grants_are_roots_and_checked`. Gate
 `/Docs` into a jail (uid 50601, 0700, only `note.txt`); the app reads it
 and writes, alice sees the write and cannot read the grant; the whole stick
 read-only into a second jail, which cannot write; the first jail removed
-ends its grant; locking ends the other: **0 failed** 2026-11-14.
+ends its grant; locking ends the other. The file manager: alice (not an app)
+and an app without `removable-files` are refused; from its jail it gets the
+stick (uid 50603, 0700), reads and writes, alice sees its file; locking
+ends it, unlocking brings it back, its jail going leaves no grant. One
+file: root's descriptor reads and writes; alice, a folder and `..` are
+refused: **0 failed** 2026-11-14. atrium-media `open_hands_over_a_file`.
 
 ## 7. Not in scope
 

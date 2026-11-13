@@ -155,6 +155,13 @@ pub struct Capabilities {
     /// restricted.
     #[serde(rename = "device-list")]
     pub device_list: Option<bool>,
+    /// The file manager's standing grant (device-assignment.md §4.8): every
+    /// served stick, read-write, in its own jail at `/media/<part>`, for as
+    /// long as the jail runs. Implies the `removable-media/` socket (it asks
+    /// for the grant there). Restricted to the file manager; every other app
+    /// asks the system picker for one file or folder.
+    #[serde(rename = "removable-files")]
+    pub removable_files: Option<bool>,
     /// A status item in Forum's bar (forum-status-items.md): an icon and a
     /// menu the bar draws for this app, over forum-wm's `forum-status/`
     /// socket. The app never draws in the bar.
@@ -374,6 +381,7 @@ pub fn merge_capabilities(base: &Capabilities, ovr: &Capabilities) -> Capabiliti
         removable_media:  ovr.removable_media.or(base.removable_media),
         session_lock:     ovr.session_lock.or(base.session_lock),
         device_list:      ovr.device_list.or(base.device_list),
+        removable_files:  ovr.removable_files.or(base.removable_files),
         status_item:      ovr.status_item.or(base.status_item),
         audio_device:     ovr.audio_device.or(base.audio_device),
         net_fetch:        ovr.net_fetch.or(base.net_fetch),

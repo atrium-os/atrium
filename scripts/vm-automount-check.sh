@@ -138,7 +138,7 @@ fuse_devices      = ["da#p#", "da#s#", "da#"]
 fuse_mount_prefix = "/media"
 EOP
 grep -q 'sysfil.profiles.fuse-server' $P || printf '\n[sysfil.profiles.fuse-server]\ninclude = ["base"]\nioctls  = ["0x40046480", "0x40086481"]\n' >> $P
-for u in alice:1011 bob:1012 grantapp:50601 grantapp2:50602; do id ${u%:*} >/dev/null 2>&1 || pw useradd ${u%:*} -u ${u#*:} -m -s /bin/sh; done
+for u in alice:1011 bob:1012 grantapp:50601 grantapp2:50602 grantfm:50603; do id ${u%:*} >/dev/null 2>&1 || pw useradd ${u%:*} -u ${u#*:} -m -s /bin/sh; done
 install -d -m 0755 /atrium/sockets/ostiarius
 : > /atrium/sockets/ostiarius/active-session; : > /atrium/sockets/ostiarius/session-locked
 service atrium-jaild start >/dev/null 2>&1; sleep 2
@@ -212,6 +212,40 @@ V "su -m grantapp2 -c 'echo x > $RB/media/$PART/x.txt' 2>/dev/null" && bad "$JB 
 V "$JC $JS remove $JA >/dev/null"; sleep 5
 V "mount -p | grep -q '$RA/media'" && bad "$JA's grant outlived its jail" || ok "$JA gone: its grant ended"
 [ "$(V "ls /media/.grants | wc -l | tr -d ' '")" = "1" ] && ok "one grant left ($JB's)" || bad "grants left: '$(V "ls /media/.grants | tr '\n' ' '")'"
+
+echo "== the file manager: every stick, while it runs (§4.8)"
+JF=app-files-$RUN; RF=/var/lib/atrium/jails/$JF
+REG=/var/run/atrium/app-registry; APPS=/var/lib/atrium/apps
+V 'sh -s' <<EOS
+mkdir -p $RF/bin $RF/sock $APPS/org.test.files $APPS/org.test.viewer /var/run/atrium
+printf '50603 alice org.test.files\n50601 alice org.test.viewer\n' >> $REG
+printf '[app]\nid = "org.test.files"\n[capabilities]\nremovable-files = true\n' > $APPS/org.test.files/atrium.toml
+printf '[app]\nid = "org.test.viewer"\n[capabilities]\nremovable-media = true\n' > $APPS/org.test.viewer/atrium.toml
+$JC $JS create $JF $RF >/dev/null
+cp $DD $RF/bin/dd
+for l in \$(ldd -f '%p\n' $DD | grep '^/') /libexec/ld-elf.so.1; do mkdir -p $RF\$(dirname \$l); cp \$l $RF\$l; done
+mount_nullfs -o ro /atrium/sockets/removable-media $RF/sock
+EOS
+out=$(V "su -m alice -c '$DD --attach-all' 2>&1")
+echo "$out" | grep -q "not an app (status 2)" && ok "alice is not an app: refused ($out)" || bad "alice's attach-all: '$out'"
+out=$(V "su -m grantapp -c '$DD --attach-all' 2>&1")
+echo "$out" | grep -q "does not hold removable-files (status 2)" && ok "an app without removable-files: refused" || bad "viewer's attach-all: '$out'"
+out=$(V "jexec -u grantfm $JF /bin/dd --media-socket /sock/removable-media.sock --attach-all 2>&1")
+echo "$out" | grep -q "^ok 1 sticks in $JF" && ok "the file manager, from its jail, gets the stick ($out)" || bad "file manager's attach-all: '$out' ($(V "grep -E 'grant|attach' /var/log/atrium/dispensatord.log | tail -2 | tr '\n' ';'"))"
+F=$RF/media/$PART
+[ "$(V "stat -f '%u %Lp' $F")" = "50603 700" ] && ok "the whole stick, the file manager's own (50603, 0700)" || bad "file manager's root '$(V "stat -f '%u %Lp' $F")'"
+[ "$(V "su -m grantfm -c 'cat $F/hello.txt'")" = "on the stick" ] && V "su -m grantfm -c 'echo from the file manager > $F/fm.txt'" && [ "$(V "su -m alice -c 'cat $M/fm.txt'")" = "from the file manager" ] && ok "it reads and writes; alice sees its file" || bad "the file manager's read or write"
+
+echo "== one file, handed over open (§4.8)"
+[ "$(V "$DD --open $PART /Docs/note.txt")" = "for the app" ] && ok "root opens /Docs/note.txt; the descriptor reads" || bad "open: '$(V "$DD --open $PART /Docs/note.txt 2>&1")'"
+out=$(V "su -m alice -c '$DD --open $PART /Docs/note.txt' 2>&1")
+echo "$out" | grep -q "status 2" && ok "only root opens ($out)" || bad "alice opened: '$out'"
+out=$(V "$DD --open $PART /Docs 2>&1")
+echo "$out" | grep -q "not a file" && ok "a folder is not a file ($out)" || bad "open of a folder: '$out'"
+out=$(V "$DD --open $PART /Docs/../hello.txt 2>&1")
+echo "$out" | grep -q "status 1" && ok "no .. ($out)" || bad "open with ..: '$out'"
+V "$DD --open $PART /Docs/note.txt --write >/dev/null" && [ "$(V "su -m alice -c 'tail -1 $M/Docs/note.txt'")" = "written through the descriptor" ] && ok "opened for writing, the write lands on the stick" || bad "write through the descriptor"
+
 echo "== lock and unlock"
 lock alice
 mounted && bad "still mounted while locked" || ok "locked: unmounted"
@@ -221,6 +255,11 @@ V "$JC $JS remove $JB >/dev/null"
 V "tail -1 /tmp/mw.$RUN | grep -qx end" && ok "locking ends the subscription" || bad "subscriber while locked: '$(V "tr '\n' ';' < /tmp/mw.$RUN")'"
 lock ""
 mounted && [ "$(V "su -m alice -c 'cat $M/alice.txt'")" = "from alice" ] && ok "unlocked: back, with alice's file" || bad "not back after unlock"
+sleep 3
+[ "$(V "su -m grantfm -c 'cat $F/fm.txt'")" = "from the file manager" ] && ok "and the file manager has it again" || bad "file manager after unlock: '$(V "ls $F 2>&1 | tr '\n' ' '")'"
+V "umount $RF/sock; $JC $JS remove $JF >/dev/null"; sleep 5
+[ "$(V "ls /media/.grants 2>/dev/null | wc -l | tr -d ' '")" = "0" ] && ok "its jail gone: no grant left" || bad "grants after the file manager went: '$(V "ls /media/.grants | tr '\n' ' '")'"
+V "sed -i '' '/ org.test.files\$/d; / org.test.viewer\$/d' $REG; rm -rf $APPS/org.test.files $APPS/org.test.viewer"
 # Subscribe again, as the bar does.
 V "rm -f /tmp/mw.$RUN; daemon -f -o /tmp/mw.$RUN su -m alice -c '$DD --media-watch'"; sleep 2
 

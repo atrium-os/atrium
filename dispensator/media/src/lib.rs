@@ -10,6 +10,8 @@
 //! | `EJECT` 0x01 | postcard [`Eject`] | `u8 status`, then postcard `String` (a message to show) |
 //! | `GRANT` 0x02 | postcard [`Grant`] | `u8 status`, then postcard `String` (where it is in the jail, or why not) |
 //! | `REVOKE` 0x03 | postcard `String` (the jail) | `u8 status`, then postcard `String` |
+//! | `ATTACH_ALL` 0x04 | empty | `u8 status`, then postcard `String`: the file manager asks for every stick, now and as they come, in its own jail |
+//! | `OPEN` 0x05 | postcard [`Open`] | `u8 status`, then postcard `String`; with `OK`, the open file as the message's one descriptor |
 //! | `SUBSCRIBE` 0x10 | empty | `u8 status`; then `EV` 0x80 events (`ASYNC_EVENT`), postcard [`Event`]: an `Added` per volume served now, then changes |
 //!
 //! Only the session's own user and its desktop components (Forum) may ask;
@@ -29,6 +31,8 @@ pub mod op {
     pub const EJECT: u16 = 0x01;
     pub const GRANT: u16 = 0x02;
     pub const REVOKE: u16 = 0x03;
+    pub const ATTACH_ALL: u16 = 0x04;
+    pub const OPEN: u16 = 0x05;
     pub const SUBSCRIBE: u16 = 0x10;
     pub const EV: u16 = 0x80;
 }
@@ -73,6 +77,15 @@ pub struct Grant {
     pub read_only: bool,
 }
 
+/// Open one file of a served stick for the picker (root only): the
+/// descriptor goes to the app, never the path (§4.8).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Open {
+    pub part: String,
+    pub path: String,
+    pub write: bool,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Event {
     Added(Volume),
@@ -107,6 +120,12 @@ pub mod server {
         fn grant(&self, g: &Grant) -> (u8, String);
         /// End every grant into `jail`.
         fn revoke(&self, jail: &str) -> (u8, String);
+        /// `uid` (a jailed app) asks for every stick in its own jail; the
+        /// daemon checks it is the session's file manager.
+        fn attach_all(&self, uid: u32) -> (u8, String);
+        /// Open `o.path` of the volume mounted at `mountpoint` (the caller is
+        /// root and the path has no `..`: both checked here).
+        fn open(&self, mountpoint: &str, o: &Open) -> Result<std::fs::File, (u8, String)>;
     }
 
     pub struct Shared {
@@ -233,6 +252,33 @@ pub mod server {
                     };
                     conn.send_message(CLASS, op::REVOKE, flag::IS_RESPONSE, &enc(st, &msg))?;
                 }
+                op::ATTACH_ALL => {
+                    let (st, msg) = shared.host.attach_all(uid);
+                    conn.send_message(CLASS, op::ATTACH_ALL, flag::IS_RESPONSE, &enc(st, &msg))?;
+                }
+                op::OPEN => {
+                    let r = match postcard::from_bytes::<Open>(&m.payload) {
+                        Ok(_) if uid != 0 => Err((status::NOT_ALLOWED, "only root may open".into())),
+                        Ok(o) if o.part.is_empty() || o.part.len() > 32 || !o.path.starts_with('/') || o.path.len() > 1024 || o.path.split('/').any(|c| c == "..") || o.path.contains('\0') => {
+                            Err((status::MALFORMED, "malformed".into()))
+                        }
+                        Ok(o) => {
+                            let mnt = shared.state.lock().unwrap().volumes.iter().find(|v| v.part == o.part).map(|v| v.mountpoint.clone());
+                            match mnt {
+                                Some(mnt) => shared.host.open(&mnt, &o),
+                                None => Err((status::NOT_FOUND, format!("{} is not mounted", o.part))),
+                            }
+                        }
+                        Err(_) => Err((status::MALFORMED, "malformed".into())),
+                    };
+                    match r {
+                        Ok(f) => {
+                            use std::os::fd::AsRawFd;
+                            conn.send_message_with_fds(CLASS, op::OPEN, flag::IS_RESPONSE, &enc(status::OK, &String::new()), &[f.as_raw_fd()])?
+                        }
+                        Err((st, msg)) => conn.send_message(CLASS, op::OPEN, flag::IS_RESPONSE, &enc(st, &msg))?,
+                    }
+                }
                 op::SUBSCRIBE => {
                     let Some((now, rx)) = shared.subscribe(uid) else {
                         conn.send_message(CLASS, op::SUBSCRIBE, flag::IS_RESPONSE, &[status::NOT_ALLOWED])?;
@@ -330,6 +376,28 @@ pub mod client {
         status_call(sock, op::REVOKE, &jail.to_string())
     }
 
+    /// The file manager asks for every stick in its jail.
+    pub fn attach_all(sock: &Path) -> Result<String, (u8, String)> {
+        status_call(sock, op::ATTACH_ALL, &())
+    }
+
+    /// Open a file of a stick (root only): the open file.
+    pub fn open(sock: &Path, o: &Open) -> Result<std::fs::File, (u8, String)> {
+        let r = (|| {
+            let mut c = Connection::connect(sock)?;
+            let p = call(&mut c, op::OPEN, &postcard::to_stdvec(o).unwrap_or_default())?;
+            let (&st, rest) = p.split_first().ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "empty reply"))?;
+            let fd = c.take_fds(1).and_then(|v| v.into_iter().next());
+            Ok::<_, io::Error>((st, postcard::from_bytes::<String>(rest).unwrap_or_default(), fd))
+        })();
+        match r {
+            Ok((status::OK, _, Some(fd))) => Ok(std::fs::File::from(fd)),
+            Ok((status::OK, _, None)) => Err((status::FAILED, "no descriptor came".into())),
+            Ok((st, m, _)) => Err((st, m)),
+            Err(e) => Err((status::FAILED, e.to_string())),
+        }
+    }
+
     /// Subscribe: an `Added` per volume served now, then every change, until
     /// the daemon drops the stream (the session changed) or the socket closes.
     pub struct Events(Connection);
@@ -379,6 +447,12 @@ mod tests {
         }
         fn revoke(&self, j: &str) -> (u8, String) {
             (status::OK, j.into())
+        }
+        fn attach_all(&self, uid: u32) -> (u8, String) {
+            (status::NOT_ALLOWED, format!("{uid}"))
+        }
+        fn open(&self, mnt: &str, o: &Open) -> Result<std::fs::File, (u8, String)> {
+            std::fs::File::open(format!("{mnt}{}", o.path)).map_err(|e| (status::FAILED, e.to_string()))
         }
     }
 
@@ -462,5 +536,39 @@ mod tests {
             assert_eq!(server::grant_checked(&s, 0, &bad).0, status::MALFORMED, "{bad:?}");
         }
         assert_eq!(server::grant_checked(&s, 0, &Grant { part: "da9s1".into(), ..g.clone() }).0, status::NOT_FOUND);
+    }
+
+    /// OPEN hands over a descriptor, for root alone, never above the stick.
+    #[test]
+    fn open_hands_over_a_file() {
+        let dir = std::env::temp_dir().join(format!("atrium-media-open-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("stick/Docs")).unwrap();
+        std::fs::write(dir.join("stick/Docs/a.txt"), b"hello").unwrap();
+        let shared = server::Shared::new(Box::new(H(Arc::new(AtomicU32::new(0)))));
+        shared.update(vec![Volume { mountpoint: dir.join("stick").to_string_lossy().into_owned(), ..vol("da0s1") }], &[]);
+        let (sock, sock5) = (dir.join("root.sock"), dir.join("five.sock"));
+        for (path, uid) in [(sock.clone(), 0u32), (sock5.clone(), 5)] {
+            let l = std::os::unix::net::UnixListener::bind(&path).unwrap();
+            let sh = shared.clone();
+            std::thread::spawn(move || {
+                for s in l.incoming().flatten() {
+                    let sh = sh.clone();
+                    std::thread::spawn(move || {
+                        let _ = server::serve(aqueduct::Connection::wrap(s).unwrap(), uid, sh);
+                    });
+                }
+            });
+        }
+        let o = Open { part: "da0s1".into(), path: "/Docs/a.txt".into(), write: false };
+        let mut f = client::open(&sock, &o).unwrap();
+        let mut got = String::new();
+        std::io::Read::read_to_string(&mut f, &mut got).unwrap();
+        assert_eq!(got, "hello");
+        assert_eq!(client::open(&sock5, &o).unwrap_err().0, status::NOT_ALLOWED);
+        assert_eq!(client::open(&sock, &Open { path: "/Docs/../../x".into(), ..o.clone() }).unwrap_err().0, status::MALFORMED);
+        assert_eq!(client::open(&sock, &Open { part: "da9s1".into(), ..o.clone() }).unwrap_err().0, status::NOT_FOUND);
+        assert_eq!(client::attach_all(&sock5).unwrap_err(), (status::NOT_ALLOWED, "5".into()));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

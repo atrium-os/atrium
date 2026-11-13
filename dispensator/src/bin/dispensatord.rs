@@ -32,6 +32,8 @@
 //! atrium-dispensatord --devices [--devices-socket PATH]     the Devices list
 //! atrium-dispensatord --grant PART PATH --jail NAME --uid U [--gid G] [--ro]
 //! atrium-dispensatord --revoke JAIL      (root: a folder of a stick in an app's jail, §4.8)
+//! atrium-dispensatord --attach-all       (the file manager, from its jail: every stick)
+//! atrium-dispensatord --open PART PATH [--write]   (root: print the file, as handed over)
 //! ```
 //!
 //! The media socket speaks Aqueduct class `media` (atrium-media, §6.6):
@@ -71,6 +73,8 @@ struct Args {
     grant_uid: u32,
     grant_gid: Option<u32>,
     grant_ro: bool,
+    open: Option<atrium_media::Open>,
+    open_write: bool,
     /// Client: `list` or `eject PART`.
     media_cmd: Option<String>,
 }
@@ -93,6 +97,8 @@ fn args() -> Result<Args, String> {
         grant_uid: 0,
         grant_gid: None,
         grant_ro: false,
+        open: None,
+        open_write: false,
         media_cmd: None,
     };
     let mut it = std::env::args().skip(1);
@@ -122,6 +128,13 @@ fn args() -> Result<Args, String> {
             "--gid" => a.grant_gid = Some(val()?.parse().map_err(|_| "--gid: a number")?),
             "--ro" => a.grant_ro = true,
             "--revoke" => a.media_cmd = Some(format!("revoke {}", val()?)),
+            "--attach-all" => a.media_cmd = Some("attach-all".into()),
+            "--open" => {
+                let part = val()?;
+                let path = it.next().ok_or("--open needs PART PATH")?;
+                a.open = Some(atrium_media::Open { part, path, write: false });
+            }
+            "--write" => a.open_write = true,
             "-h" | "--help" => return Err(String::new()),
             _ => return Err(format!("unknown argument {x}")),
         }
@@ -149,6 +162,32 @@ fn main() -> ExitCode {
             Ok(m) => {
                 println!("ok {m}");
                 ExitCode::SUCCESS
+            }
+            Err((st, m)) => {
+                println!("error {m} (status {st})");
+                ExitCode::FAILURE
+            }
+        };
+    }
+    if let Some(o) = &a.open {
+        let o = atrium_media::Open { write: a.open_write, ..o.clone() };
+        return match atrium_media::client::open(&a.media_socket, &o) {
+            Ok(mut f) => {
+                use std::io::Write;
+                let mut out = std::io::stdout().lock();
+                if o.write {
+                    // Proves the descriptor writes: append a line, read it all.
+                    use std::io::Seek;
+                    let _ = f.seek(std::io::SeekFrom::End(0)).and_then(|_| f.write_all(b"written through the descriptor\n"));
+                    let _ = f.rewind();
+                }
+                match std::io::copy(&mut f, &mut out) {
+                    Ok(_) => ExitCode::SUCCESS,
+                    Err(e) => {
+                        eprintln!("error reading: {e}");
+                        ExitCode::FAILURE
+                    }
+                }
             }
             Err((st, m)) => {
                 println!("error {m} (status {st})");
@@ -244,6 +283,18 @@ fn print_devices(ds: &[atrium_devices::Device]) {
 /// One request to the daemon's media socket (Aqueduct `CLASS_MEDIA`);
 /// prints the answer.
 fn media_client(sock: &std::path::Path, cmd: &str) -> ExitCode {
+    if cmd == "attach-all" {
+        return match atrium_media::client::attach_all(sock) {
+            Ok(m) => {
+                println!("ok {m}");
+                ExitCode::SUCCESS
+            }
+            Err((st, m)) => {
+                println!("error {m} (status {st})");
+                ExitCode::FAILURE
+            }
+        };
+    }
     match cmd.split_once(' ') {
         Some(("revoke", jail)) => match atrium_media::client::revoke(sock, jail) {
             Ok(m) => {
@@ -361,6 +412,8 @@ mod run {
         /// Folders of served sticks in app jails.
         grants: Vec<GrantRec>,
         next_grant: u64,
+        /// File managers given every stick.
+        standing: Vec<Standing>,
     }
 
     /// A grant: a FUSE mount at `dir` (the stick's server, rooted at the
@@ -376,6 +429,56 @@ mod run {
         Eject(String),
         Grant(atrium_media::Grant),
         Revoke(String),
+        AttachAll(Standing),
+    }
+
+    /// The file manager's standing grant (§4.8): every served stick, whole,
+    /// in `jail`, as each comes, while the jail runs and `user`'s session
+    /// is the active one.
+    #[derive(Clone, PartialEq)]
+    struct Standing {
+        jail: String,
+        uid: u32,
+        gid: u32,
+        user: String,
+    }
+
+    /// The one jail `uid`'s processes run in (a per-app uid has one), by
+    /// name: none, several, or the host itself is no answer.
+    fn jail_of_uid(uid: u32) -> Option<String> {
+        let o = std::process::Command::new("ps").args(["-x", "-U", &uid.to_string(), "-o", "jid="]).output().ok()?;
+        let mut jids: Vec<u32> = String::from_utf8_lossy(&o.stdout).split_whitespace().filter_map(|j| j.parse().ok()).collect();
+        jids.sort_unstable();
+        jids.dedup();
+        let [jid] = jids[..] else { return None };
+        if jid == 0 {
+            return None;
+        }
+        let o = std::process::Command::new("jls").args(["-j", &jid.to_string(), "name"]).output().ok()?;
+        let name = String::from_utf8_lossy(&o.stdout).trim().to_string();
+        (!name.is_empty()).then_some(name)
+    }
+
+    fn primary_gid(uid: u32) -> Option<u32> {
+        // SAFETY: getpwuid's result is read at once, on this thread's own
+        // call (the daemon's connection threads are the only callers and
+        // only read pw_gid).
+        unsafe {
+            let p = libc::getpwuid(uid);
+            (!p.is_null()).then(|| (*p).pw_gid)
+        }
+    }
+
+    /// Does the installed manifest of `app_id` ask for `removable-files`?
+    /// (portcullisd granted it at install: a restricted capability is
+    /// installed only with policy approval.)
+    fn has_removable_files(apps_dir: &str, app_id: &str) -> bool {
+        if app_id.is_empty() || app_id.contains('/') || app_id.starts_with('.') {
+            return false;
+        }
+        let Ok(t) = std::fs::read_to_string(Path::new(apps_dir).join(app_id).join("atrium.toml")) else { return false };
+        let Ok(v) = t.parse::<toml::Table>() else { return false };
+        v.get("capabilities").and_then(|c| c.get("removable-files")).and_then(|b| b.as_bool()) == Some(true)
     }
 
     type EjectReq = (Req, mpsc::Sender<(u8, String)>);
@@ -420,6 +523,7 @@ mod run {
     struct MediaHost {
         session: Arc<Mutex<Session>>,
         registry: String,
+        apps_dir: String,
         tx: Mutex<mpsc::Sender<EjectReq>>,
         wake: Mutex<UnixStream>,
     }
@@ -461,6 +565,45 @@ mod run {
 
         fn revoke(&self, jail: &str) -> (u8, String) {
             self.ask(Req::Revoke(jail.to_string()))
+        }
+
+        /// The asker must be an app of the session's user whose manifest
+        /// holds `removable-files`, running in exactly one jail.
+        fn attach_all(&self, uid: u32) -> (u8, String) {
+            let Session::Active { user, .. } = self.session.lock().unwrap().clone() else { return (mstatus::NOT_ALLOWED, "no unlocked session".into()) };
+            let Ok(reg) = portcullis_peer::AppRegistry::load(&self.registry) else { return (mstatus::NOT_ALLOWED, "not an app".into()) };
+            let Some((owner, app)) = reg.resolve(uid) else { return (mstatus::NOT_ALLOWED, "not an app".into()) };
+            if owner != user {
+                return (mstatus::NOT_ALLOWED, "not the session's app".into());
+            }
+            if !has_removable_files(&self.apps_dir, app) {
+                return (mstatus::NOT_ALLOWED, format!("{app} does not hold removable-files"));
+            }
+            let Some(jail) = jail_of_uid(uid) else { return (mstatus::NOT_FOUND, format!("{app} runs in no one jail")) };
+            let gid = primary_gid(uid).unwrap_or(uid);
+            self.ask(Req::AttachAll(Standing { jail, uid, gid, user }))
+        }
+
+        /// Root's own open, on the session's mount: no link followed, no
+        /// directory, nothing above the stick (no `..`, checked before).
+        fn open(&self, mountpoint: &str, o: &atrium_media::Open) -> Result<std::fs::File, (u8, String)> {
+            use std::os::unix::fs::OpenOptionsExt;
+            let path = format!("{mountpoint}{}", o.path);
+            let f = std::fs::OpenOptions::new()
+                .read(true)
+                .write(o.write)
+                .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+                .open(&path)
+                .map_err(|e| (if e.kind() == std::io::ErrorKind::NotFound { mstatus::NOT_FOUND } else { mstatus::FAILED }, format!("{}: {e}", o.path)))?;
+            match f.metadata() {
+                Ok(m) if m.is_file() => {}
+                _ => return Err((mstatus::MALFORMED, format!("{} is not a file", o.path))),
+            }
+            // Blocking again for the app.
+            // SAFETY: fcntl on our own open descriptor.
+            unsafe { libc::fcntl(f.as_raw_fd(), libc::F_SETFL, 0) };
+            eprintln!("atrium-dispensatord: open {}{} handed over{}", o.part, o.path, if o.write { " (write)" } else { "" });
+            Ok(f)
         }
     }
 
@@ -505,6 +648,7 @@ mod run {
             controls: BTreeMap::new(),
             grants: Vec::new(),
             next_grant: 0,
+            standing: Vec::new(),
         };
         a.session = a.read_session();
         *a.session_shared.lock().unwrap() = a.session.clone();
@@ -641,6 +785,7 @@ mod run {
             let host = MediaHost {
                 session: self.session_shared.clone(),
                 registry: portcullis_peer::DEFAULT_REGISTRY.into(),
+                apps_dir: std::env::var("DISPENSATOR_APPS_DIR").unwrap_or_else(|_| "/var/lib/atrium/apps".into()),
                 tx: Mutex::new(tx),
                 wake: Mutex::new(wake_wr),
             };
@@ -722,9 +867,11 @@ mod run {
                     Req::Eject(part) => self.eject(&part),
                     Req::Grant(g) => self.grant(&g),
                     Req::Revoke(jail) => {
+                        self.standing.retain(|s| s.jail != jail);
                         let n = self.end_grants(|g| g.jail == jail);
                         (mstatus::OK, format!("{n} grants into {jail} ended"))
                     }
+                    Req::AttachAll(s) => self.attach_all(s),
                 };
                 let _ = reply.send(a);
             }
@@ -799,6 +946,53 @@ mod run {
             eprintln!("atrium-dispensatord: grant {}{} -> {} at {dest} (uid {}{})", g.part, g.path, g.jail, g.uid, if read_only { ", ro" } else { "" });
             self.grants.push(GrantRec { part: g.part.clone(), jail: g.jail.clone(), dir, dest: dest.clone() });
             (mstatus::OK, dest)
+        }
+
+        /// A file manager asks for every stick: now and each that comes.
+        fn attach_all(&mut self, s: Standing) -> (u8, String) {
+            if !jail_alive(&s.jail) {
+                return (mstatus::NOT_FOUND, format!("no jail {}", s.jail));
+            }
+            let jail = s.jail.clone();
+            if !self.standing.contains(&s) {
+                self.standing.push(s);
+            }
+            let n = self.sync_standing();
+            let have = self.grants.iter().filter(|g| g.jail == jail).count();
+            (mstatus::OK, format!("{have} sticks in {jail} ({n} new); more as they come"))
+        }
+
+        /// Give each standing file manager every served stick it lacks;
+        /// forget those whose jail went or whose user's session is not the
+        /// active one. Grants are made only while the session is unlocked
+        /// (`grant` checks), so a lock ends them and an unlock brings them
+        /// back to the same jail.
+        fn sync_standing(&mut self) -> usize {
+            let user = match &self.session {
+                Session::Active { user, .. } => Some(user.clone()),
+                _ => None,
+            };
+            let locked_same = |s: &Standing| matches!(&self.session, Session::Locked { user } if *user == s.user);
+            let keep: Vec<Standing> = self.standing.iter().filter(|s| jail_alive(&s.jail) && (user.as_deref() == Some(s.user.as_str()) || locked_same(s))).cloned().collect();
+            self.standing = keep;
+            if user.is_none() {
+                return 0;
+            }
+            let mut made = 0;
+            let parts: Vec<String> = self.controls.keys().cloned().collect();
+            for s in self.standing.clone() {
+                for part in &parts {
+                    let dest = format!("/media/{part}");
+                    if self.grants.iter().any(|g| g.jail == s.jail && g.dest == dest) {
+                        continue;
+                    }
+                    let g = atrium_media::Grant { part: part.clone(), path: "/".into(), jail: s.jail.clone(), uid: s.uid, gid: s.gid, read_only: false };
+                    if self.grant(&g).0 == mstatus::OK {
+                        made += 1;
+                    }
+                }
+            }
+            made
         }
 
         /// End the grants `f` picks: out of the jail, then the mount.
@@ -886,6 +1080,7 @@ mod run {
                     // A grant lasts as long as its app's jail (one shot).
                     self.end_grants(|g| !jail_alive(&g.jail));
                     self.follow_session();
+                    self.sync_standing();
                     self.publish();
                     self.publish_devices();
                     let mut ops = Vec::new();
