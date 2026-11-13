@@ -12,5 +12,6 @@ pub mod bio;
 pub mod broker;
 pub mod daemon;
 pub mod label;
+pub mod platform;
 pub mod resolve;
 pub mod rp;

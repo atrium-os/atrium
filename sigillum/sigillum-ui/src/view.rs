@@ -82,6 +82,7 @@ pub fn draw(conn: &mut Connection, font: u32, s: &State, w: f32, h: f32) -> io::
         let status = match &s.stage {
             Stage::Touch { .. } => Some("Touch your security key now."),
             Stage::Working { .. } => Some("Waiting for your security key\u{2026}"),
+            Stage::Arca => Some("Using the passkey on this device\u{2026}"),
             Stage::Pin { .. } => Some("Enter the PIN of your security key, then press Enter."),
             Stage::Passcode => Some("Enter your passcode, then press Enter."),
             Stage::Choose => None,

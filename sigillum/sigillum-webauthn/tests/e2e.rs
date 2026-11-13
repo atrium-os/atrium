@@ -14,7 +14,7 @@ use sha2::{Digest, Sha256};
 use sigillum_cbor::Value;
 use sigillum_proto::client::{CeremonyId, Reply, Request};
 use sigillum_proto::driver::Pin;
-use sigillum_proto::ui::{self, Choice, FromUi, ToUi};
+use sigillum_proto::ui::{self, Choice, FromUi, Sheet, ToUi};
 use sigillum_proto::{read_msg, write_msg};
 use sigillum_softkey::SoftKey;
 use sigillum_webauthn::{create, get, unb64url, CreationOptions, DomError, Origin, RequestOptions, Sigillumd, Transport};
@@ -49,9 +49,38 @@ impl Drop for Rig {
     }
 }
 
-/// The daemon, a soft key with PIN 4711, and (when `press`) a UI that
-/// presses the key on every sheet and types the PIN.
-fn rig(press: bool) -> Rig {
+/// What the scripted UI presses.
+#[derive(Clone, Copy, PartialEq)]
+enum Press {
+    Nothing,
+    Key,
+    /// Arca: "save on this device", or the first passkey listed.
+    Arca,
+}
+
+/// arcad on a real socket, serving sigillumd's uid (this test's) as the
+/// `sigillumd` service, with alice's store unlocked.
+fn arcad(dir: &std::path::Path) -> PathBuf {
+    let mut s = arcad::server::State::new(dir.join("arca")).unwrap();
+    let mut body = vec![5, 0, 0, 0];
+    body.extend_from_slice(b"alice");
+    body.extend_from_slice(&[1; 32]);
+    assert_eq!(s.handle(&arcad::label::Label::Vestibulum, arcad::proto::op::V_CREATE, &body).status, 0);
+    let state = Arc::new(std::sync::Mutex::new(s));
+    let path = dir.join("arcad.sock");
+    let l = std::os::unix::net::UnixListener::bind(&path).unwrap();
+    std::thread::spawn(move || {
+        for c in l.incoming().flatten() {
+            let st = state.clone();
+            std::thread::spawn(move || arcad::serve_conn(c, &arcad::label::Label::Service("sigillumd".into()), &st));
+        }
+    });
+    path
+}
+
+/// The daemon, a soft key with PIN 4711, Arca on its socket, and a UI that
+/// presses what `press` says on every sheet and types the PIN.
+fn rig(press: Press) -> Rig {
     static N: AtomicU64 = AtomicU64::new(0);
     let dir = std::env::temp_dir().join(format!("sigillum-webauthn-{}-{}", std::process::id(), N.fetch_add(1, Ordering::SeqCst)));
     std::fs::create_dir_all(&dir).unwrap();
@@ -63,7 +92,8 @@ fn rig(press: bool) -> Rig {
         ui_uid: me(),
         broker: Config { web_broker: Some(navigator()), ceremony_ms: 10_000 },
     };
-    let d = Daemon::bind(settings.clone(), Arc::new(AllNavigator), Box::new(NoPasscode)).unwrap();
+    let arca = sigillumd::platform::Arca(sigillumd::platform::Socket(arcad(&dir)));
+    let d = Daemon::bind(settings.clone(), Arc::new(AllNavigator), Box::new(NoPasscode)).unwrap().with_platform(Box::new(arca));
     std::thread::spawn(move || d.run());
 
     let mut s = UnixStream::connect(&settings.ui_socket).unwrap();
@@ -71,7 +101,9 @@ fn rig(press: bool) -> Rig {
     std::thread::spawn(move || {
         while let Ok(Some(m)) = read_msg::<ToUi>(&mut s, ui::MAX_MESSAGE) {
             let answer = match &m {
-                ToUi::Show { key, devices, .. } if press => devices.first().map(|d| FromUi::Press { key: *key, choice: Choice::Device(d.id), activation_ok: true }),
+                ToUi::Show { key, devices, .. } if press == Press::Key => devices.first().map(|d| FromUi::Press { key: *key, choice: Choice::Device(d.id), activation_ok: true }),
+                ToUi::Show { key, sheet: Sheet::Register { platform: true, .. }, .. } if press == Press::Arca => Some(FromUi::Press { key: *key, choice: Choice::Platform, activation_ok: true }),
+                ToUi::Show { key, sheet: Sheet::Assert { passkeys, .. }, .. } if press == Press::Arca => passkeys.first().map(|p| FromUi::Press { key: *key, choice: Choice::Passkey(p.id), activation_ok: true }),
                 ToUi::AskPin { key, .. } => Some(FromUi::Pin { key: *key, pin: Pin(Zeroizing::new(b"4711".to_vec())) }),
                 _ => None,
             };
@@ -127,20 +159,20 @@ impl Rp {
     }
 
     /// Verify a registration; returns the credential id and its key.
-    fn register(&self, json: &str, challenge: &[u8]) -> (Vec<u8>, VerifyingKey) {
+    fn register(&self, json: &str, challenge: &[u8], platform: bool) -> (Vec<u8>, VerifyingKey) {
         let v: serde_json::Value = serde_json::from_str(json).unwrap();
         assert_eq!(v["type"], "public-key");
         assert_eq!(v["id"], v["rawId"]);
-        assert_eq!(v["authenticatorAttachment"], "cross-platform");
+        assert_eq!(v["authenticatorAttachment"], if platform { "platform" } else { "cross-platform" });
         let r = &v["response"];
-        assert_eq!(r["transports"], serde_json::json!(["usb"]));
+        assert_eq!(r["transports"], serde_json::json!([if platform { "internal" } else { "usb" }]));
         assert_eq!(r["publicKeyAlgorithm"], -7);
         self.client_data(r, "webauthn.create", challenge);
         let obj = sigillum_cbor::decode(&b(r, "attestationObject")).unwrap();
         assert_eq!(obj.get_text("fmt").and_then(Value::as_text), Some("none"));
         let ad = obj.get_text("authData").and_then(Value::as_bytes).unwrap().to_vec();
         assert_eq!(ad, b(r, "authenticatorData"));
-        self.auth_data(&ad, true);
+        self.auth_data(&ad, !platform);
         assert!(ad[32] & 0x40 != 0, "AT");
         assert_eq!(ad[37..53], [0; 16], "AAGUID zeroed under none");
         let n = u16::from_be_bytes([ad[53], ad[54]]) as usize;
@@ -185,13 +217,13 @@ fn creation(extra: &str) -> CreationOptions {
 
 #[test]
 fn register_and_sign_in_verified_by_the_relying_party() {
-    let r = rig(true);
+    let r = rig(Press::Key);
     let mut t = broker(&r);
     let origin = Origin::parse(RP.origin).unwrap();
 
     let o = creation("");
     let reg = create(&mut t, &origin, None, &o).unwrap();
-    let (cred_id, key) = RP.register(&reg.to_json(), &o.challenge);
+    let (cred_id, key) = RP.register(&reg.to_json(), &o.challenge, false);
 
     // Sign in with the credential named...
     let o = RequestOptions::from_json(&format!(
@@ -275,7 +307,7 @@ fn replies_that_fail_the_checks_are_not_allowed() {
 #[test]
 fn the_page_aborting_cancels_the_ceremony() {
     // A UI that shows the sheet but never presses.
-    let r = rig(false);
+    let r = rig(Press::Nothing);
     let mut t = broker(&r);
     let mut c = t.canceller().unwrap();
     std::thread::spawn(move || {
@@ -285,4 +317,35 @@ fn the_page_aborting_cancels_the_ceremony() {
     let started = std::time::Instant::now();
     assert_eq!(create(&mut t, &Origin::parse(RP.origin).unwrap(), None, &creation("")).unwrap_err(), DomError::NotAllowed);
     assert!(started.elapsed() < Duration::from_secs(5), "ended by the cancel, not the timeout");
+}
+
+#[test]
+fn an_arca_passkey_through_both_daemons_verified_by_the_relying_party() {
+    let r = rig(Press::Arca);
+    let mut t = broker(&r);
+    let origin = Origin::parse(RP.origin).unwrap();
+
+    // No UV asked (S4 brings the passcode through ostiarius; until then
+    // NoPasscode refuses every passcode, so "required" can't be met).
+    let o = creation("").clone();
+    let o = CreationOptions { uv: sigillum_webauthn::options::Uv::Preferred, ..o };
+    let reg = create(&mut t, &origin, None, &o).unwrap();
+    let (cred_id, key) = RP.register(&reg.to_json(), &o.challenge, true);
+    assert_eq!(cred_id.len(), 16);
+
+    let o = RequestOptions::from_json(r#"{"challenge":"YXJjYS1zaWduLWlu","rpId":"example.com","userVerification":"preferred"}"#).unwrap();
+    let a = get(&mut t, &origin, None, &o).unwrap();
+    assert_eq!(RP.authenticate(&a.to_json(), &o.challenge, &cred_id, &key, false), Some(vec![1, 2, 3, 4]));
+    let v: serde_json::Value = serde_json::from_str(&a.to_json()).unwrap();
+    assert_eq!(v["authenticatorAttachment"], "platform");
+
+    // UV required with no passcode checker: NotAllowedError, nothing signed.
+    let o = RequestOptions::from_json(r#"{"challenge":"dXYtcmVxdWlyZWQ","rpId":"example.com","userVerification":"required"}"#).unwrap();
+    // The UI types no passcode; the ceremony ends at the page's abort.
+    let mut c = t.canceller().unwrap();
+    std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_millis(400));
+        c.cancel().unwrap();
+    });
+    assert_eq!(get(&mut t, &origin, None, &o).unwrap_err(), DomError::NotAllowed);
 }

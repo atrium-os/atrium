@@ -13,6 +13,8 @@ libc = "0.2"
 serde = { workspace = true }
 
 [dev-dependencies]
+arcad = { path = "../../arca/arcad" }
+tempfile = "3"
 sigillum-fido = { path = "../sigillum-fido" }
 sigillum-softkey = { path = "../sigillum-softkey" }
 sigillum-ctap = { path = "../sigillum-ctap" }

@@ -114,6 +114,7 @@ pub struct Daemon {
     next: u64,
     started: Instant,
     passcode: Box<dyn Passcode>,
+    platform: Box<dyn crate::platform::Platform>,
     /// The verify ceremony waiting for a passcode, and its user.
     asked_passcode: Option<(Key, String)>,
     pub settings: Settings,
@@ -191,9 +192,16 @@ impl Daemon {
             next: 1,
             started: Instant::now(),
             passcode,
+            platform: Box::new(crate::platform::NoPlatform),
             asked_passcode: None,
             settings,
         })
+    }
+
+    /// Serve Arca as the platform authenticator (§9.2).
+    pub fn with_platform(mut self, p: Box<dyn crate::platform::Platform>) -> Daemon {
+        self.platform = p;
+        self
     }
 
     fn now(&self) -> u64 {
@@ -397,6 +405,18 @@ impl Daemon {
                 Action::CheckPasscode { key, user } => {
                     self.asked_passcode = Some((key, user));
                     self.ui_or_drop(ToUi::AskPasscode { key })
+                }
+                Action::ListPasskeys { key, user, rp_id } => {
+                    let list = self.platform.list(&user, &rp_id);
+                    self.broker.passkeys(key, list)
+                }
+                Action::PlatformCreate { key, user, rp_id, user_handle, name, display_name, uv } => {
+                    let r = self.platform.create(&user, &rp_id, &user_handle, &name, &display_name, uv);
+                    self.broker.platform_result(key, r)
+                }
+                Action::PlatformAssert { key, user, rp_id, id, uv, client_data_hash } => {
+                    let r = self.platform.assert(&user, &rp_id, &id, uv, &client_data_hash);
+                    self.broker.platform_result(key, r)
                 }
                 Action::ToDriver { device, msg } => {
                     let failed = match self.drivers.get_mut(&device) {

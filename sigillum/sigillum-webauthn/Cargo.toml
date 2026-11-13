@@ -16,6 +16,7 @@ base64 = "0.22"
 psl = "2"
 
 [dev-dependencies]
+arcad = { path = "../../arca/arcad" }
 sigillumd = { path = "../sigillumd" }
 sigillum-fido = { path = "../sigillum-fido" }
 sigillum-softkey = { path = "../sigillum-softkey" }

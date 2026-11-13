@@ -12,6 +12,10 @@
 //!   the only uids served on the driver and UI sockets.
 //! - `SIGILLUM_SOCKET`, `SIGILLUM_DRIVER_SOCKET`, `SIGILLUM_UI_SOCKET`:
 //!   override the socket paths (tests).
+//! - `SIGILLUM_ARCA_SOCKET` (default `/atrium/sockets/arca/arcad.sock`):
+//!   arcad, for Arca's passkeys (§9.2); `none` turns Arca off. arcad
+//!   serves the passkey ops to sigillumd only when its `ARCA_SERVICES`
+//!   names `sigillumd` with this uid.
 //!
 //! It hardens itself before anything else (no core dumps, not traceable)
 //! and never opens a device or a network socket.
@@ -77,8 +81,10 @@ fn main() -> ExitCode {
             *slot = p.into();
         }
     }
+    let arca = std::env::var("SIGILLUM_ARCA_SOCKET").unwrap_or_else(|_| sigillumd::platform::DEFAULT_SOCKET.into());
     let daemon = match Daemon::bind(settings.clone(), Arc::new(resolver), Box::new(NoPasscode)) {
-        Ok(d) => d,
+        Ok(d) if arca == "none" => d,
+        Ok(d) => d.with_platform(Box::new(sigillumd::platform::Arca(sigillumd::platform::Socket(arca.into())))),
         Err(e) => {
             eprintln!("sigillumd: bind: {e}");
             return ExitCode::FAILURE;

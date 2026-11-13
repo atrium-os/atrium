@@ -365,6 +365,9 @@ Arca is the platform authenticator (arca.md §8.4). Sigillum adds the ceremony a
   credential id, authenticator-data flags, clientDataHash)` → (authenticator data,
   signature); `P_LIST (user, rp_id)` → credential ids and display names, for the sheet only.
   Arca checks `rp_id` against the item's recipient, as it does for every key item.
+  *As built (§16.3):* Arca builds the whole authenticator data, so `P_CREATE` returns it
+  (with the attested credential data) rather than a bare public key, and `P_ASSERT` takes
+  a UV bit, not flags; `cred_protect` waits for extensions.
 - UV for a platform passkey is `VERIFY_USER` (§8) done by `sigillumd` just before `P_ASSERT`,
   so Arca's verify-each-use class is satisfied by the same mechanism.
 - The sheet offers the user's Arca passkeys for this RP first, then "Use a security key",
@@ -716,7 +719,7 @@ otherwise passes the blobs on without reading them.
 - **Not yet:** Capsicum in `sigillumd` itself (it reads the launch registry per connection; a
   pre-opened directory fd comes later), `allow.mlock` for `sigillumd`.
 
-### 16.3 As built: S3 (in progress)
+### 16.3 As built: S3 (2026-11-13)
 
 - **S3a (2026-11-13): `sigillum-webauthn`**, the WebAuthn client the Navigator broker links.
   The Navigator broker and its JS runtime aren't built yet, so this is the library they
@@ -745,6 +748,35 @@ otherwise passes the blobs on without reading them.
     → `InvalidStateError`, a foreign RP ID → `SecurityError` without reaching `sigillumd`,
     five tampered replies → `NotAllowedError`, abort → `NotAllowedError` well before the
     timeout.
+- **S3b and S3c (2026-11-13): Arca as the platform authenticator.**
+  - arcad (`arcad/src/passkey.rs`, arca.md §8.4): `P_CREATE 0x90`, `P_ASSERT 0x91`,
+    `P_LIST 0x92`, served only to the `ARCA_SERVICES` entry `sigillumd` (the arcad manifest
+    now says `sigillumd=65028`). A passkey is a P-256 key item bound to its RP ID,
+    while-unlocked, in the main persona; its credential id is its 16-byte item id. Arca
+    builds the authenticator data from the item's own recipient (UP; UV only when told;
+    BE; counter 0; AAGUID zero) and signs ES256. A new passkey for the same RP and user
+    handle replaces the old one.
+  - sigillumd (`platform.rs`, `broker.rs`): for an app's user and a real domain (not an
+    app's private RP ID, which is no Arca recipient) a ceremony first asks `P_LIST`; the
+    sheet then offers "Save a passkey on this device" (register) or the user's passkeys
+    the request allows, at most 16 (assert), before security keys. Arca locked or
+    unreachable: security keys only. `excludeCredentials` naming an Arca passkey is
+    `InvalidStateError` after the press. Arca's answer gets the driver record's checks
+    (RP ID hash, UP, UV when required, the credential id) and sigillumd wraps a
+    registration in `fmt: "none"`. `authenticatorAttachment` is `platform`, transport
+    `internal`.
+  - **UV for a passkey is the passcode on the sheet**, asked only when the RP requires UV
+    (`preferred` gets UP only). Until S4 wires ostiarius, `NoPasscode` refuses every
+    passcode, so a site that requires UV must use a security key with a PIN.
+  - `sigillum-ui`: passkey rows ("Passkey “name”", the site's words, quoted) and "Save a
+    passkey on this device" come first.
+  - Gates (host): `arcad/tests/passkey.rs` (5: an RP verifies the registration and the
+    signature; RP binding; replacement; only sigillumd; bounds and lock);
+    `sigillumd/tests/ceremonies.rs` (5 more, against the real arcad handler: register and
+    discoverable sign-in with the passcode as UV, exclude and allow lists, a wrong passcode,
+    a tampered Arca answer, no Arca for private RP IDs or when it is unavailable);
+    `sigillum-webauthn/tests/e2e.rs` (a passkey through both daemons on real sockets,
+    verified by the relying party).
 
 ## 17. Decisions, with recommendations
 

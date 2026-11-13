@@ -14,6 +14,11 @@
 //!   ID this ceremony asked for, UP must be set and UV when it was required.
 //!   A registration's credential id must be the one inside its authenticator
 //!   data; an assertion's must be in the allow list.
+//! - **Arca is the platform authenticator** (§9.2) for an app's user and a
+//!   real domain: the sheet lists the user's passkeys for the RP (from
+//!   `P_LIST`) before security keys. Arca builds the authenticator data;
+//!   the same checks apply to it. UV for a passkey is the passcode, asked
+//!   on the sheet, only when the RP requires UV.
 //! - **One ceremony per seat**, 120 s each; ending one cancels its driver
 //!   work and closes its sheet.
 
@@ -65,6 +70,7 @@ pub struct Config {
 }
 
 pub use sigillum_proto::ui::{Choice, Sheet};
+use sigillum_proto::ui::{PasskeyView, MAX_PASSKEYS};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Action {
@@ -78,6 +84,13 @@ pub enum Action {
     ToDriver { device: DeviceId, msg: ToDriver },
     /// Ask ostiarius to check the passcode the user typed on the sheet.
     CheckPasscode { key: Key, user: String },
+    /// Ask Arca for the user's passkeys for this RP (`P_LIST`); answer
+    /// with [`Broker::passkeys`].
+    ListPasskeys { key: Key, user: String, rp_id: String },
+    /// `P_CREATE`; answer with [`Broker::platform_result`].
+    PlatformCreate { key: Key, user: String, rp_id: String, user_handle: Vec<u8>, name: String, display_name: String, uv: bool },
+    /// `P_ASSERT`; answer with [`Broker::platform_result`].
+    PlatformAssert { key: Key, user: String, rp_id: String, id: [u8; 16], uv: bool, client_data_hash: [u8; 32] },
     /// One audit line (arca.md §10 style): no values, ever.
     Audit(String),
 }
@@ -89,12 +102,40 @@ enum Kind {
     Verify(VerifyUser),
 }
 
+/// One of the user's Arca passkeys, as `P_LIST` returns it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Passkey {
+    pub id: [u8; 16],
+    pub user_handle: Vec<u8>,
+    pub name: String,
+    pub display_name: String,
+}
+
+/// What Arca answered to a `PlatformCreate` or `PlatformAssert`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PlatformResult {
+    Created { id: [u8; 16], auth_data: Vec<u8> },
+    Asserted { auth_data: Vec<u8>, signature: Vec<u8>, user_handle: Vec<u8> },
+    /// Arca refused or was unreachable.
+    Failed,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Pick {
+    Create,
+    Assert([u8; 16]),
+}
+
 #[derive(Debug, PartialEq, Eq)]
 enum State {
+    /// Waiting for Arca's passkey list before the sheet is shown.
+    Listing,
     AwaitingPress,
     Driving,
     AwaitingPin,
     AwaitingPasscode,
+    /// Waiting for Arca's `P_CREATE` or `P_ASSERT`.
+    Platform,
 }
 
 #[derive(Debug)]
@@ -108,6 +149,14 @@ struct Ceremony {
     /// When it ends with `NotAllowed` if still open (ms, the daemon's clock).
     deadline: u64,
     device: Option<DeviceId>,
+    requester: String,
+    /// The app's user, when Arca may serve this ceremony.
+    user: Option<String>,
+    /// `Some` once Arca answered `P_LIST` (for an assertion, only the
+    /// passkeys the request allows); `None`: Arca isn't offered.
+    passkeys: Option<Vec<Passkey>>,
+    /// The Arca choice made on the sheet.
+    pick: Option<Pick>,
 }
 
 #[derive(Debug, Clone)]
@@ -169,25 +218,117 @@ impl Broker {
         }
     }
 
+    /// Start a ceremony. With `user`, Arca is asked for passkeys first and
+    /// the sheet follows its answer.
     #[allow(clippy::too_many_arguments)]
-    fn start(&mut self, conn: ConnId, id: CeremonyId, kind: Kind, rp_id: &str, uv_required: bool, now: u64, limit_ms: u64, sheet: Sheet) -> Vec<Action> {
+    fn start(&mut self, conn: ConnId, id: CeremonyId, kind: Kind, rp_id: &str, uv_required: bool, now: u64, limit_ms: u64, requester: String, user: Option<String>) -> Vec<Action> {
         let key = self.next_key;
         self.next_key += 1;
+        let c = Ceremony {
+            conn,
+            id,
+            kind,
+            rp_hash: Sha256::digest(rp_id.as_bytes()).into(),
+            uv_required,
+            state: if user.is_some() { State::Listing } else { State::AwaitingPress },
+            deadline: now.saturating_add(limit_ms),
+            device: None,
+            requester,
+            user: user.clone(),
+            passkeys: None,
+            pick: None,
+        };
+        let sheet = sheet_for(&c);
+        self.ceremonies.insert(key, c);
         let audit = Action::Audit(format!("start key={key} conn={conn} {:?}", sheet));
-        self.ceremonies.insert(
-            key,
-            Ceremony {
-                conn,
-                id,
-                kind,
-                rp_hash: Sha256::digest(rp_id.as_bytes()).into(),
-                uv_required,
-                state: State::AwaitingPress,
-                deadline: now.saturating_add(limit_ms),
-                device: None,
+        match user {
+            Some(user) => vec![audit, Action::ListPasskeys { key, user, rp_id: rp_id.to_string() }],
+            None => vec![audit, Action::Sheet { key, sheet }],
+        }
+    }
+
+    /// Arca's answer to `ListPasskeys` (`None`: locked, unreachable or
+    /// refused; the sheet then offers security keys only).
+    pub fn passkeys(&mut self, key: Key, list: Option<Vec<Passkey>>) -> Vec<Action> {
+        let Some(c) = self.ceremonies.get_mut(&key) else { return Vec::new() };
+        if c.state != State::Listing {
+            return Vec::new();
+        }
+        c.passkeys = list.map(|l| match &c.kind {
+            Kind::Assert(a) => {
+                let mut l: Vec<Passkey> = l.into_iter().filter(|p| a.allow.is_empty() || a.allow.iter().any(|c| c[..] == p.id[..])).collect();
+                l.truncate(MAX_PASSKEYS);
+                l
+            }
+            _ => l,
+        });
+        c.state = State::AwaitingPress;
+        vec![Action::Sheet { key, sheet: sheet_for(c) }]
+    }
+
+    fn platform_action(&mut self, key: Key, uv: bool) -> Vec<Action> {
+        let c = self.ceremonies.get_mut(&key).expect("live");
+        c.state = State::Platform;
+        let (Some(user), Some(pick)) = (c.user.clone(), c.pick) else { return Vec::new() };
+        match (&c.kind, pick) {
+            (Kind::Register(r), Pick::Create) => vec![Action::PlatformCreate {
+                key,
+                user,
+                rp_id: r.rp_id.clone(),
+                user_handle: r.user_id.clone(),
+                name: r.user_name.clone(),
+                display_name: r.user_display_name.clone(),
+                uv,
+            }],
+            (Kind::Assert(a), Pick::Assert(id)) => vec![Action::PlatformAssert { key, user, rp_id: a.rp_id.clone(), id, uv, client_data_hash: a.client_data_hash }],
+            _ => Vec::new(),
+        }
+    }
+
+    /// The user chose Arca on the sheet: the passcode first if the RP
+    /// requires UV, then Arca.
+    fn pick(&mut self, key: Key, pick: Pick) -> Vec<Action> {
+        let c = self.ceremonies.get_mut(&key).expect("live");
+        c.pick = Some(pick);
+        if c.uv_required {
+            c.state = State::AwaitingPasscode;
+            let user = c.user.clone().expect("Arca is offered only with a user");
+            return vec![Action::CheckPasscode { key, user }];
+        }
+        self.platform_action(key, false)
+    }
+
+    /// Arca's answer to `PlatformCreate` or `PlatformAssert`, checked like
+    /// a driver's record.
+    pub fn platform_result(&mut self, key: Key, r: PlatformResult) -> Vec<Action> {
+        let Some(c) = self.ceremonies.get(&key) else { return Vec::new() };
+        if c.state != State::Platform {
+            return Vec::new();
+        }
+        let id = c.id;
+        let reply = match (check_platform(c, &r), r) {
+            (Ok(()), PlatformResult::Created { id: cred, auth_data }) => Reply::Registered {
+                ceremony: id,
+                cred_id: cred.to_vec(),
+                att_obj: none_attestation(&auth_data),
+                auth_data,
+                authenticator: AuthenticatorClass::Platform,
             },
-        );
-        vec![audit, Action::Sheet { key, sheet }]
+            (Ok(()), PlatformResult::Asserted { auth_data, signature, user_handle }) => Reply::Asserted {
+                ceremony: id,
+                cred_id: match c.pick {
+                    Some(Pick::Assert(cred)) => cred.to_vec(),
+                    _ => unreachable!("checked"),
+                },
+                auth_data,
+                signature,
+                user_handle: Some(user_handle),
+                authenticator: AuthenticatorClass::Platform,
+            },
+            (Err(why), _) => return self.end(key, Reply::Refused { ceremony: id, reason: Refusal::NotAllowed }, &format!("arca: {why}")),
+            (Ok(()), PlatformResult::Failed) => unreachable!("checked"),
+        };
+        self.end(key, reply, "done (arca)")
     }
 
     /// A client's request, with the label its peer uid resolved to.
@@ -222,11 +363,11 @@ impl Broker {
                 {
                     return vec![refused(conn, id, Refusal::Malformed)];
                 }
-                let sheet = Sheet::Register { requester: who, rp_id: r.rp_id.clone(), user_name: r.user_name.clone() };
                 let rp = r.rp_id.clone();
                 let uv = r.uv == Uv::Required;
                 let limit = ceremony_limit(r.timeout_ms, self.cfg.ceremony_ms);
-                self.start(conn, id, Kind::Register(r), &rp, uv, now, limit, sheet)
+                let user = arca_user(label, &rp);
+                self.start(conn, id, Kind::Register(r), &rp, uv, now, limit, who, user)
             }
             Request::Assert(a) => {
                 if let Err(e) = self.may_use_rp(label, &a.rp_id) {
@@ -235,11 +376,11 @@ impl Broker {
                 if a.allow.len() > cap::LIST || a.allow.iter().any(|c| c.is_empty() || c.len() > cap::CRED_ID) {
                     return vec![refused(conn, id, Refusal::Malformed)];
                 }
-                let sheet = Sheet::Assert { requester: who, rp_id: a.rp_id.clone() };
                 let rp = a.rp_id.clone();
                 let uv = a.uv == Uv::Required;
                 let limit = ceremony_limit(a.timeout_ms, self.cfg.ceremony_ms);
-                self.start(conn, id, Kind::Assert(a), &rp, uv, now, limit, sheet)
+                let user = arca_user(label, &rp);
+                self.start(conn, id, Kind::Assert(a), &rp, uv, now, limit, who, user)
             }
             Request::VerifyUser(v) => {
                 if !matches!(label, Label::Arca | Label::Ostiarius) {
@@ -251,9 +392,8 @@ impl Broker {
                 if v.user.is_empty() || v.user.len() > 64 {
                     return vec![refused(conn, id, Refusal::Malformed)];
                 }
-                let sheet = Sheet::Verify { requester: who, user: v.user.clone(), purpose: v.purpose.clone() };
                 let limit = self.cfg.ceremony_ms;
-                self.start(conn, id, Kind::Verify(v), "", false, now, limit, sheet)
+                self.start(conn, id, Kind::Verify(v), "", false, now, limit, who, None)
             }
             Request::Cancel { .. } => unreachable!(),
         }
@@ -314,6 +454,15 @@ impl Broker {
                 c.device = Some(d);
                 vec![Action::ToDriver { device: d, msg }]
             }
+            (Choice::Platform, Kind::Register(r)) if c.passkeys.is_some() => {
+                let excluded = c.passkeys.iter().flatten().any(|p| r.exclude.iter().any(|e| e[..] == p.id[..]));
+                if excluded {
+                    let id = c.id;
+                    return self.end(key, Reply::Refused { ceremony: id, reason: Refusal::Excluded }, "excluded (arca)");
+                }
+                self.pick(key, Pick::Create)
+            }
+            (Choice::Passkey(p), Kind::Assert(_)) if c.passkeys.iter().flatten().any(|k| k.id == p) => self.pick(key, Pick::Assert(p)),
             (Choice::Passcode, Kind::Verify(v)) => {
                 let user = v.user.clone();
                 self.ceremonies.get_mut(&key).unwrap().state = State::AwaitingPasscode;
@@ -345,6 +494,9 @@ impl Broker {
             // The sheet stays; portcullisd delays and rate-limits failures.
             c.state = State::AwaitingPress;
             return vec![Action::Audit(format!("passcode wrong key={key}"))];
+        }
+        if c.pick.is_some() {
+            return self.platform_action(key, true);
         }
         let id = c.id;
         let Kind::Verify(v) = &c.kind else { return Vec::new() };
@@ -539,4 +691,77 @@ fn check(c: &Ceremony, rec: &FromDriver) -> Result<(), &'static str> {
         }
         _ => Err("record does not match the ceremony"),
     }
+}
+
+/// The sheet for a ceremony as it stands.
+fn sheet_for(c: &Ceremony) -> Sheet {
+    match &c.kind {
+        Kind::Register(r) => Sheet::Register { requester: c.requester.clone(), rp_id: r.rp_id.clone(), user_name: r.user_name.clone(), platform: c.passkeys.is_some() },
+        Kind::Assert(a) => Sheet::Assert {
+            requester: c.requester.clone(),
+            rp_id: a.rp_id.clone(),
+            passkeys: c.passkeys.iter().flatten().map(|p| PasskeyView { id: p.id, name: p.name.clone(), display_name: p.display_name.clone() }).collect(),
+        },
+        Kind::Verify(v) => Sheet::Verify { requester: c.requester.clone(), user: v.user.clone(), purpose: v.purpose.clone() },
+    }
+}
+
+/// Arca serves an app's own user, for a real domain (an app's private RP
+/// ID is no Arca recipient).
+fn arca_user(label: &Label, rp_id: &str) -> Option<String> {
+    match label {
+        Label::App { user, .. } if valid_domain(rp_id) => Some(user.clone()),
+        _ => None,
+    }
+}
+
+/// Arca's answer, checked as a driver record is: the RP ID hash, UP, UV
+/// when required, and the credential.
+fn check_platform(c: &Ceremony, r: &PlatformResult) -> Result<(), &'static str> {
+    let ad = match r {
+        PlatformResult::Created { auth_data, .. } | PlatformResult::Asserted { auth_data, .. } => auth_data,
+        PlatformResult::Failed => return Err("refused or unreachable"),
+    };
+    if ad.len() < 37 || ad[..32] != c.rp_hash {
+        return Err("RP ID hash is not this ceremony's");
+    }
+    let flags = ad[32];
+    if flags & UP == 0 {
+        return Err("no user presence");
+    }
+    if c.uv_required && flags & UV == 0 {
+        return Err("no user verification");
+    }
+    match (r, &c.kind, c.pick) {
+        (PlatformResult::Created { id, auth_data }, Kind::Register(_), Some(Pick::Create)) => {
+            if flags & AT == 0 || auth_data.len() < 71 || auth_data[53..55] != [0, 16] || auth_data[55..71] != id[..] {
+                return Err("credential id is not the one in the authenticator data");
+            }
+            Ok(())
+        }
+        (PlatformResult::Asserted { auth_data, signature, user_handle }, Kind::Assert(_), Some(Pick::Assert(_))) => {
+            if auth_data.len() != 37 || signature.is_empty() || user_handle.is_empty() {
+                return Err("malformed assertion");
+            }
+            Ok(())
+        }
+        _ => Err("answer does not match the ceremony"),
+    }
+}
+
+/// The WebAuthn attestation object for `fmt: "none"` (§9.3): canonical
+/// CBOR `{"fmt": "none", "attStmt": {}, "authData": h'..'}`.
+pub fn none_attestation(auth_data: &[u8]) -> Vec<u8> {
+    let mut v = vec![0xa3, 0x63, b'f', b'm', b't', 0x64, b'n', b'o', b'n', b'e', 0x67];
+    v.extend_from_slice(b"attStmt");
+    v.push(0xa0);
+    v.push(0x68);
+    v.extend_from_slice(b"authData");
+    match auth_data.len() {
+        n if n < 24 => v.push(0x40 | n as u8),
+        n if n < 256 => v.extend_from_slice(&[0x58, n as u8]),
+        n => v.extend_from_slice(&[0x59, (n >> 8) as u8, n as u8]),
+    }
+    v.extend_from_slice(auth_data);
+    v
 }

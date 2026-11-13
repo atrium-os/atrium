@@ -27,6 +27,8 @@ pub enum Stage {
     Choose,
     /// Asked the device; waiting for it (or for the user to touch it).
     Working { device: u64 },
+    /// Asked Arca (a passkey on this device).
+    Arca,
     Touch { device: u64 },
     Pin { device: u64, retries: u8 },
     Passcode,
@@ -63,7 +65,15 @@ impl State {
     pub fn new(key: SheetKey, sheet: Sheet, devices: Vec<DeviceView>) -> State {
         let mut rows: Vec<Row> = Vec::new();
         match &sheet {
-            Sheet::Register { .. } | Sheet::Assert { .. } => {
+            Sheet::Register { platform, .. } => {
+                if *platform {
+                    rows.push(Row { choice: Choice::Platform, label: "Save a passkey on this device".into() });
+                }
+                rows.extend(devices.iter().map(|d| Row { choice: Choice::Device(d.id), label: format!("Use {}", d.name) }));
+            }
+            Sheet::Assert { passkeys, .. } => {
+                // The user's passkeys first; the names are the site's words.
+                rows.extend(passkeys.iter().map(|p| Row { choice: Choice::Passkey(p.id), label: format!("Passkey \u{201c}{}\u{201d}", if p.name.is_empty() { &p.display_name } else { &p.name }) }));
                 rows.extend(devices.iter().map(|d| Row { choice: Choice::Device(d.id), label: format!("Use {}", d.name) }));
             }
             Sheet::Verify { .. } => rows.push(Row { choice: Choice::Passcode, label: "Use your passcode".into() }),
@@ -77,11 +87,11 @@ impl State {
     /// an account or item name is quoted secondary text.
     pub fn text(&self) -> (String, Vec<String>) {
         match &self.sheet {
-            Sheet::Register { requester, rp_id, user_name } => (
+            Sheet::Register { requester, rp_id, user_name, .. } => (
                 "Create a passkey".into(),
                 vec![format!("{requester} wants to create a passkey for {rp_id}"), format!("Account: \u{201c}{user_name}\u{201d}")],
             ),
-            Sheet::Assert { requester, rp_id } => ("Sign in with a passkey".into(), vec![format!("{requester} wants to sign you in to {rp_id}")]),
+            Sheet::Assert { requester, rp_id, .. } => ("Sign in with a passkey".into(), vec![format!("{requester} wants to sign you in to {rp_id}")]),
             Sheet::Verify { requester, user, purpose } => {
                 let why = match purpose {
                     Purpose::ArcaItem { description } => format!("to use \u{201c}{description}\u{201d}"),
@@ -143,8 +153,10 @@ impl State {
             return vec![Do::Redraw];
         }
         self.notice = None;
-        if let Choice::Device(device) = choice {
-            self.stage = Stage::Working { device };
+        match choice {
+            Choice::Device(device) => self.stage = Stage::Working { device },
+            Choice::Platform | Choice::Passkey(_) => self.stage = Stage::Arca,
+            _ => {}
         }
         vec![Do::Send(FromUi::Press { key: self.key, choice, activation_ok: true }), Do::Redraw]
     }
@@ -204,7 +216,7 @@ mod tests {
     fn assert_sheet() -> State {
         State::new(
             4,
-            Sheet::Assert { requester: "Navigator".into(), rp_id: "example.com".into() },
+            Sheet::Assert { requester: "Navigator".into(), rp_id: "example.com".into(), passkeys: vec![] },
             vec![DeviceView { id: 9, name: "YubiKey 5".into() }],
         )
     }
@@ -257,8 +269,25 @@ mod tests {
     }
 
     #[test]
+    fn arca_passkeys_come_before_security_keys() {
+        use sigillum_proto::ui::PasskeyView;
+        let pk = PasskeyView { id: [7; 16], name: "alice@example.com".into(), display_name: "Alice".into() };
+        let mut s = State::new(5, Sheet::Assert { requester: "Navigator".into(), rp_id: "example.com".into(), passkeys: vec![pk] }, vec![DeviceView { id: 9, name: "Key".into() }]);
+        assert_eq!(s.rows.iter().map(|r| r.choice).collect::<Vec<_>>(), vec![Choice::Passkey([7; 16]), Choice::Device(9), Choice::Cancel]);
+        assert_eq!(s.rows[0].label, "Passkey \u{201c}alice@example.com\u{201d}");
+        assert!(s.notice.is_none());
+        assert_eq!(s.click(0, T), vec![Do::Spend { choice: Choice::Passkey([7; 16]), token: T }]);
+        s.spent(Choice::Passkey([7; 16]), true);
+        assert_eq!(s.stage, Stage::Arca);
+
+        let s = State::new(6, Sheet::Register { requester: "Navigator".into(), rp_id: "a.com".into(), user_name: "x".into(), platform: true }, vec![]);
+        assert_eq!(s.rows[0].choice, Choice::Platform);
+        assert!(s.notice.is_none(), "saving on this device needs no key");
+    }
+
+    #[test]
     fn no_device_says_plug_one_in() {
-        let s = State::new(1, Sheet::Register { requester: "Navigator".into(), rp_id: "a.com".into(), user_name: "x".into() }, vec![]);
+        let s = State::new(1, Sheet::Register { requester: "Navigator".into(), rp_id: "a.com".into(), user_name: "x".into(), platform: false }, vec![]);
         assert_eq!(s.rows.len(), 1);
         assert!(s.notice.is_some());
     }

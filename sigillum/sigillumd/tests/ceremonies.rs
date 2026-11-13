@@ -4,6 +4,7 @@
 
 use std::cell::RefCell;
 use std::rc::Rc;
+use std::sync::{Arc, Mutex};
 
 use p256::ecdsa::{signature::Verifier, DerSignature, VerifyingKey};
 use sha2::{Digest, Sha256};
@@ -16,6 +17,8 @@ use sigillum_proto::driver::{FromDriver, Pin};
 use sigillum_softkey::{Lie, SoftKey};
 use sigillumd::broker::{Action, Broker, Choice, Config, Key, Sheet};
 use sigillumd::label::{AppId, Label};
+use sigillumd::platform::{Arca, Platform, Wire};
+use sigillumd::broker::PlatformResult;
 use zeroize::Zeroizing;
 
 const DEV: u64 = 1;
@@ -57,6 +60,35 @@ struct Rig {
     audit: Vec<String>,
     /// A record to substitute for the driver's next one (a lying driver).
     tamper: Option<Box<dyn FnMut(FromDriver) -> FromDriver>>,
+    /// Arca, in process (the real arcad request handler), when offered.
+    arca: Option<Arca<InProc>>,
+    /// What ostiarius answers when the passcode is asked.
+    passcode_ok: bool,
+    passcode_asks: usize,
+    /// Substitute for Arca's next answer (a lying arcad).
+    arca_tamper: Option<Box<dyn FnMut(PlatformResult) -> PlatformResult>>,
+}
+
+/// arcad's handler behind the `Wire` sigillumd speaks, as `sigillumd`'s
+/// uid would reach it.
+struct InProc(Arc<Mutex<arcad::server::State>>, #[allow(dead_code)] tempfile::TempDir);
+
+impl Wire for InProc {
+    fn call(&mut self, op: u16, body: &[u8]) -> Option<(u8, Vec<u8>)> {
+        let r = self.0.lock().unwrap().handle(&arcad::label::Label::Service("sigillumd".into()), op, body);
+        Some((r.status, r.body.bytes().to_vec()))
+    }
+}
+
+/// A fresh arcad with alice's store unlocked.
+fn arca() -> Arca<InProc> {
+    let d = tempfile::tempdir().unwrap();
+    let mut s = arcad::server::State::new(d.path().into()).unwrap();
+    let mut body = vec![5, 0, 0, 0];
+    body.extend_from_slice(b"alice");
+    body.extend_from_slice(&[1; 32]);
+    assert_eq!(s.handle(&arcad::label::Label::Vestibulum, arcad::proto::op::V_CREATE, &body).status, 0);
+    Arca(InProc(Arc::new(Mutex::new(s)), d))
 }
 
 impl Rig {
@@ -67,7 +99,7 @@ impl Rig {
         let mut broker = Broker::new(Config { web_broker: Some(broker_app()), ceremony_ms: 120_000 });
         let a = broker.driver(DEV, hello);
         assert!(matches!(a[0], Action::Audit(_)));
-        Rig { broker, driver, key, pin: Some(PIN), pin_asks: 0, replies: vec![], sheets: vec![], audit: vec![], tamper: None }
+        Rig { broker, driver, key, pin: Some(PIN), pin_asks: 0, replies: vec![], sheets: vec![], audit: vec![], tamper: None, arca: None, passcode_ok: true, passcode_asks: 0, arca_tamper: None }
     }
 
     fn run(&mut self, actions: Vec<Action>) {
@@ -93,7 +125,30 @@ impl Rig {
                     }
                 }
                 Action::Audit(s) => self.audit.push(s),
-                Action::CloseSheet { .. } | Action::Touch { .. } | Action::CheckPasscode { .. } => {}
+                Action::CheckPasscode { key, .. } => {
+                    self.passcode_asks += 1;
+                    assert!(self.passcode_asks < 10, "passcode loop");
+                    queue.extend(self.broker.passcode_result(key, self.passcode_ok));
+                }
+                Action::ListPasskeys { key, user, rp_id } => {
+                    let l = self.arca.as_mut().and_then(|a| a.list(&user, &rp_id));
+                    queue.extend(self.broker.passkeys(key, l));
+                }
+                Action::PlatformCreate { key, user, rp_id, user_handle, name, display_name, uv } => {
+                    let mut res = self.arca.as_mut().expect("Arca offered").create(&user, &rp_id, &user_handle, &name, &display_name, uv);
+                    if let Some(t) = self.arca_tamper.as_mut() {
+                        res = t(res);
+                    }
+                    queue.extend(self.broker.platform_result(key, res));
+                }
+                Action::PlatformAssert { key, user, rp_id, id, uv, client_data_hash } => {
+                    let mut res = self.arca.as_mut().expect("Arca offered").assert(&user, &rp_id, &id, uv, &client_data_hash);
+                    if let Some(t) = self.arca_tamper.as_mut() {
+                        res = t(res);
+                    }
+                    queue.extend(self.broker.platform_result(key, res));
+                }
+                Action::CloseSheet { .. } | Action::Touch { .. } => {}
             }
         }
     }
@@ -517,4 +572,118 @@ fn u2f_only_key_refusals() {
     r.request(&web_broker(), assert_req("example.com", vec![], Uv::Discouraged));
     r.press_last(Choice::Device(DEV));
     assert_eq!(r.reply(), Reply::Refused { ceremony: 2, reason: Refusal::NotAllowed });
+}
+
+// ── Arca as the platform authenticator (§9.2) ───────────────────────────
+
+fn with_arca() -> Rig {
+    let mut r = Rig::new(SoftKey::new(Some(PIN)));
+    r.arca = Some(arca());
+    r
+}
+
+#[test]
+fn arca_passkey_registers_and_signs_in_verified_by_the_rp() {
+    let mut r = with_arca();
+    r.request(&web_broker(), register("example.com", Uv::Preferred));
+    assert!(matches!(&r.sheets[0].1, Sheet::Register { platform: true, .. }));
+    r.press_last(Choice::Platform);
+    let reply = r.reply();
+    assert!(matches!(reply, Reply::Registered { authenticator: sigillum_proto::client::AuthenticatorClass::Platform, .. }));
+    let (cred, vk) = rp_check_registration(&reply, "example.com");
+    assert_eq!(cred.len(), 16);
+    assert_eq!(r.passcode_asks, 0, "UV only when required");
+    assert!(r.key.borrow().commands.iter().all(|c| *c == sigillum_ctap::cmd::GET_INFO), "the security key was never asked");
+
+    // Discoverable sign-in: the sheet lists the passkey first.
+    r.request(&web_broker(), assert_req("example.com", vec![], Uv::Required));
+    let Sheet::Assert { passkeys, .. } = &r.sheets.last().unwrap().1 else { panic!() };
+    assert_eq!(passkeys.len(), 1);
+    assert_eq!((passkeys[0].id.to_vec(), passkeys[0].name.as_str()), (cred.clone(), "shankar@example.com"));
+    r.press_last(Choice::Passkey(cred[..].try_into().unwrap()));
+    assert_eq!(r.passcode_asks, 1, "UV required: the passcode first");
+    let reply = r.reply();
+    let f = rp_check_assertion(&reply, "example.com", &vk);
+    assert_eq!(f & (flags::UP | flags::UV), flags::UP | flags::UV);
+    let Reply::Asserted { cred_id, user_handle, .. } = reply else { panic!() };
+    assert_eq!((cred_id, user_handle), (cred, Some(vec![1, 2, 3, 4])));
+}
+
+#[test]
+fn arca_honours_exclude_and_allow_lists() {
+    let mut r = with_arca();
+    r.request(&web_broker(), register("example.com", Uv::Discouraged));
+    r.press_last(Choice::Platform);
+    let Reply::Registered { cred_id, .. } = r.reply() else { panic!() };
+
+    // excludeCredentials naming it: InvalidStateError after the press.
+    let Request::Register(mut reg) = register("example.com", Uv::Discouraged) else { unreachable!() };
+    reg.exclude = vec![cred_id.clone()];
+    r.request(&web_broker(), Request::Register(reg));
+    r.press_last(Choice::Platform);
+    assert_eq!(r.reply(), Reply::Refused { ceremony: 1, reason: Refusal::Excluded });
+
+    // An allow list without it: the sheet doesn't offer it, and a press
+    // naming it anyway does nothing.
+    r.request(&web_broker(), assert_req("example.com", vec![vec![9; 16]], Uv::Discouraged));
+    let (key, Sheet::Assert { passkeys, .. }) = r.sheets.last().unwrap().clone() else { panic!() };
+    assert!(passkeys.is_empty());
+    let a = r.broker.press(key, Choice::Passkey(cred_id[..].try_into().unwrap()), true);
+    assert!(a.is_empty());
+    let a = r.broker.press(key, Choice::Cancel, true);
+    r.run(a);
+    r.reply();
+
+    // Another RP's sheet doesn't list it.
+    r.request(&web_broker(), assert_req("other.example", vec![], Uv::Discouraged));
+    assert!(matches!(&r.sheets.last().unwrap().1, Sheet::Assert { passkeys, .. } if passkeys.is_empty()));
+}
+
+#[test]
+fn a_wrong_passcode_keeps_the_sheet_and_signs_nothing() {
+    let mut r = with_arca();
+    r.request(&web_broker(), register("example.com", Uv::Required));
+    r.passcode_ok = false;
+    r.press_last(Choice::Platform);
+    assert_eq!(r.passcode_asks, 1);
+    assert!(r.replies.is_empty(), "still open");
+    r.passcode_ok = true;
+    r.press_last(Choice::Platform);
+    let reply = r.reply();
+    let Reply::Registered { auth_data, .. } = &reply else { panic!("{reply:?}") };
+    assert!(auth_data[32] & flags::UV != 0);
+}
+
+#[test]
+fn arcas_answer_is_checked_like_a_drivers() {
+    let mut r = with_arca();
+    r.arca_tamper = Some(Box::new(|res| match res {
+        PlatformResult::Created { id, mut auth_data } => {
+            auth_data[..32].copy_from_slice(&cdh("evil.example"));
+            PlatformResult::Created { id, auth_data }
+        }
+        other => other,
+    }));
+    r.request(&web_broker(), register("example.com", Uv::Discouraged));
+    r.press_last(Choice::Platform);
+    assert_eq!(r.reply(), Reply::Refused { ceremony: 1, reason: Refusal::NotAllowed });
+    assert!(r.audit.iter().any(|l| l.contains("arca: RP ID hash")));
+}
+
+#[test]
+fn no_arca_for_apps_private_rp_ids_or_without_arca() {
+    // An app's private RP ID is no Arca recipient: no ListPasskeys.
+    let mut r = with_arca();
+    let app = some_app();
+    let Label::App { app: id, .. } = &app else { unreachable!() };
+    let a = r.broker.request(7, &app, register(&id.private_rp(), Uv::Discouraged), 0);
+    assert!(a.iter().any(|x| matches!(x, Action::Sheet { sheet: Sheet::Register { platform: false, .. }, .. })));
+    assert!(!a.iter().any(|x| matches!(x, Action::ListPasskeys { .. })));
+
+    // Arca unreachable or locked: security keys only, and Platform does nothing.
+    let mut r = Rig::new(SoftKey::new(Some(PIN)));
+    r.request(&web_broker(), register("example.com", Uv::Discouraged));
+    let (key, sheet) = r.sheets.last().unwrap().clone();
+    assert!(matches!(sheet, Sheet::Register { platform: false, .. }));
+    assert!(r.broker.press(key, Choice::Platform, true).is_empty());
 }
