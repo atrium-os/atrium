@@ -29,6 +29,7 @@ const RAIL: f32 = 248.0;
 const RAIL_NARROW: f32 = 56.0;
 const BAR: f32 = 40.0;
 const PROMPT: f32 = 44.0;
+const STATUS: f32 = 24.0;
 
 // Phosphor codepoints (fonts/phosphor/Phosphor.ttf, by ligature name).
 mod ph {
@@ -54,6 +55,9 @@ mod ph {
     pub const FILE_TEXT: char = '\u{e23a}';
     pub const FILM_STRIP: char = '\u{e792}';
     pub const LIGHTNING: char = '\u{e2de}';
+    pub const SHIELD_CHECK: char = '\u{e40c}';
+    pub const WARNING: char = '\u{e4e0}';
+    pub const PROHIBIT: char = '\u{e3de}';
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -122,7 +126,9 @@ fn monogram(ctx: &mut Ctx, x: f32, y: f32, letter: &str, strong: bool) {
 /// above every app, origin only. Stand-in for the mockup.
 fn strip(ctx: &mut Ctx, origin: &str, lane: Option<&str>) {
     rect(ctx, 0.0, 0.0, W, STRIP, Color::from_hex("#4E4F58"), 0.0);
-    rect(ctx, 4.0, 4.0, 2.0, 16.0, Color::from_hex("#6CC4F5"), 0.0);
+    // The marker in the light's colour (§6.5): green, or amber with live code.
+    let live_m = lane.map_or(false, |l| l.contains("live"));
+    rect(ctx, 4.0, 4.0, 3.0, 16.0, Color::from_hex(if live_m { "#E2B45C" } else { "#5DBE88" }), 0.0);
     let st = TextStyle { family: font::MONO.into(), size: 13.0, weight: Weight::Regular, color: Color::from_hex("#F2F4F6") };
     // Live code in the warning colour; the two kinds where no site code
     // runs on this machine (static, replayed) in a quiet neutral.
@@ -323,14 +329,21 @@ fn tier_chip(ctx: &mut Ctx, x: f32, y: f32, mode: Mode) -> f32 {
         text(ctx, x + 26.0, y + 11.0, label, type_size::XS, Weight::Semibold, fg);
     };
     let _ = t;
+    // The light (§6.5) first, then the tier word(s).
+    let (lg, lc) = match mode {
+        Mode::Main => (ph::SHIELD_CHECK, t.success_fg()),
+        _ => (ph::WARNING, t.warning_fg()),
+    };
+    icon(ctx, x + 4.0, y + 3.0, lg, 16.0, lc);
+    let x = x + 26.0;
     match mode {
-        Mode::Main => { seg(ctx, x, 70.0, ph::FILE_TEXT, "Static", false); 70.0 }
+        Mode::Main => { seg(ctx, x, 70.0, ph::FILE_TEXT, "Static", false); 96.0 }
         Mode::Dark => {
             seg(ctx, x, 88.0, ph::FILM_STRIP, "Replayed", false);
             seg(ctx, x + 92.0, 92.0, ph::LIGHTNING, "1 live part", true);
-            184.0
+            210.0
         }
-        Mode::Live => { seg(ctx, x, 90.0, ph::LIGHTNING, "Live code", true); 90.0 }
+        Mode::Live => { seg(ctx, x, 90.0, ph::LIGHTNING, "Live code", true); 116.0 }
         Mode::Start => 0.0,
     }
 }
@@ -357,6 +370,31 @@ fn mail_page() -> String {
     }
     b.push_str("</body></html>");
     b
+}
+
+/// The optional status bar (§5.7): where the hovered link really goes, as
+/// the broker decided it, with the light it predicts.
+fn status_bar(ctx: &mut Ctx, x0: f32, mode: Mode) {
+    let t = ctx.theme;
+    let y = H - STATUS;
+    rect(ctx, x0 + 1.0, y, W - x0 - 1.0, STATUS, t.bg_surface(), 0.0);
+    rect(ctx, x0 + 1.0, y, W - x0 - 1.0, 1.0, t.border_default(), 0.0);
+    let st = |c: Color, w: Weight| TextStyle { family: font::SANS.into(), size: type_size::XS, weight: w, color: c };
+    let (g, gc, scheme, domain, path, facts, fc) = match mode {
+        Mode::Live => (ph::PROHIBIT, t.danger_fg(), "https://", "n0rthbank.example", "/login",
+            "lookalike of northbank.example, where you have a login · a click stops at a warning", t.danger_fg()),
+        _ => (ph::SHIELD_CHECK, t.success_fg(), "https://", "atlas.example", "/wiki/Impluvium",
+            "same site · visited today 10:42 · Let's Encrypt → ISRG Root X1 (shipped with Atrium)", t.text_secondary()),
+    };
+    icon(ctx, x0 + 12.0, y + 5.0, g, 14.0, gc);
+    let cy = y + 12.5;
+    let r = ctx.push(Node::stack(Axis::Horizontal, Rect::new(x0 + 32.0, cy - type_size::XS * 0.5, 0.0, 0.0), 0.0));
+    ctx.set_flex(r, FlexStyle { align: Align::Baseline, ..FlexStyle::default() });
+    ctx.add(Node::Text { rect: Rect::ZERO_SIZED, content: scheme.into(), style: st(t.text_tertiary(), Weight::Regular) });
+    ctx.add(Node::Text { rect: Rect::ZERO_SIZED, content: domain.into(), style: st(t.text_primary(), Weight::Semibold) });
+    ctx.add(Node::Text { rect: Rect::ZERO_SIZED, content: path.into(), style: st(t.text_tertiary(), Weight::Regular) });
+    ctx.pop();
+    text(ctx, x0 + 330.0, cy, facts, type_size::XS, Weight::Medium, fc);
 }
 
 /// The prompt row: asked by the Navigator, between the toolbar and the page.
@@ -500,6 +538,7 @@ impl View for Mock {
                 }
                 rail_narrow(ctx);
                 toolbar(ctx, RAIL_NARROW, self.mode);
+                status_bar(ctx, RAIL_NARROW, self.mode);
                 strip(ctx, "https://mail.example", Some("live code"));
             }
             Mode::Main | Mode::Dark => {
@@ -508,6 +547,9 @@ impl View for Mock {
                 }
                 rail(ctx, self.mode);
                 toolbar(ctx, RAIL, self.mode);
+                if self.mode == Mode::Main {
+                    status_bar(ctx, RAIL, self.mode);
+                }
                 if self.mode == Mode::Dark {
                     prompt(ctx, RAIL);
                     island(ctx, RAIL + 1.0 + 140.0, 374.0, 520.0, 272.0);
@@ -563,7 +605,8 @@ fn main() -> std::io::Result<()> {
     } else {
         let top = STRIP + BAR + 1.0 + if dark { PROMPT } else { 0.0 };
         let left = if mode == Mode::Live { RAIL_NARROW } else { RAIL };
-        let (w, h) = (W - left - 1.0, H - top);
+        let bar = if dark { 0.0 } else { STATUS };
+        let (w, h) = (W - left - 1.0, H - top - bar);
         let html = if mode == Mode::Live { mail_page() } else { page(dark) };
         let d = Rc::new(RefCell::new(Doc::html(html, Default::default(), w, h, dark, |_| None).map_err(std::io::Error::other)?));
         Some(DocumentView::new(Mutable::with_dirty(ScrollState::default(), dirty.clone()), Rect::new(left + 1.0, top, w, h), d, Mutable::with_dirty(0u64, dirty.clone())))

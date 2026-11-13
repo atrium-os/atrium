@@ -7,7 +7,7 @@ browse"). Nothing here is built. §13 lists the decisions, each with a recommend
 **Mockups:** rendered by Pergola on a live headless frescod in the FreeBSD VM
 (`pergola-document/examples/navigator_mockup.rs`; run with
 `EXAMPLE=navigator_mockup sh scripts/pergola-showcase-vm.sh main|dark|start`). The PNGs are in
-project files under `navigator/ui/`; §5.7 says what each shows and what in them is a stand-in.
+project files under `navigator/ui/`; §5.8 says what each shows and what in them is a stand-in.
 
 This document designs what a person sees and does in the Navigator: how pages are organised,
 how a window is laid out, how they move around, and which process holds what. The pieces under
@@ -51,6 +51,9 @@ it already exist or are specified:
   (tiers 2 and 3: the site's scripts ran once, sealed, at conversion; nothing of theirs runs
   now) or **Live code** (tier 4: the site's JavaScript is running, in a jail). A page with an
   island reads "Replayed · 1 live part", and the island itself gets a frame frescod draws.
+- **One light sums it up** (also Shankar's ask): green, amber or red in that chip, from the
+  connection (https, the certificate's root), what runs, and local danger signals such as a
+  lookalike of a site you have a login for (§6.5). Red stops the page instead of tinting it.
 - **Apps are not pages.** An `atrium-app://` link opens a native app in its own window, after
   a consent moment, and the trail records that you went there.
 
@@ -148,6 +151,18 @@ page in it uses that persona's partition.
 Unrecorded is what browsers call private browsing, with one difference that matters: since a
 page is anonymous until you let a site remember you (§6.2), Personal trails are already private
 from sites. Unrecorded is privacy from *this machine*: nothing written, nothing remembered.
+
+**Should every trail be Unrecorded?** *(Asked by Shankar, 2026-11-13.)* Against sites, the
+default already behaves like private browsing: every page starts anonymous, there are no
+third-party cookies, and in the document lane no script runs to fingerprint or track (§6.2,
+legacy-web §7.4). What Unrecorded adds is forgetting on *this machine*, and always forgetting
+costs things that protect the person: trails and parked pages don't survive a restart or a
+crash, there is no history to search, and the status bar loses "visited before" and "issuer
+changed since your last visit" (§5.7), which are among the few signals that catch a swapped
+certificate. The user's home is encrypted and readable only while their session is unlocked, so
+what Personal writes is not open to other users of the machine. **Recommend: Personal stays the
+default, with two settings** (§13, D12): *Start new trails Unrecorded* for people who want it
+always, and *Keep history for* (30 days by default; 1 day, 7 days, or until the window closes).
 
 Named personas are the browser "container" idea (two accounts on one site, work kept apart from
 home). They cost nothing new in the jail design, only a key in Arca. **Recommend shipping
@@ -392,7 +407,63 @@ its stored version is pinned in the store, so it can be read offline indefinitel
 are listed in Start and in the Where field's suggestions. This is bookmarks and read-later in
 one, and it costs no network to read later.
 
-### 5.7 The mockups
+### 5.7 The status bar: where a link goes, checked before you click
+
+*Asked by Shankar, 2026-11-13: "optional status bar that shows the full link we are hovering
+over, to make sure it is valid and not taking us to somewhere shady … it can show the same
+traffic light information in more detail: http/https, CA provenance etc."*
+
+An optional 24 px bar along the bottom of the window, under the page, drawn by the UI (View →
+*Status bar*, or Ctrl-/; off by default, remembered per window). The page can't draw into it,
+because the page is clipped to its slot above it.
+
+**While the pointer is over a link** it shows where a click will really go:
+
+```
+● https://atlas.example/wiki/Impluvium     same site · visited today 10:42 · Let's Encrypt → ISRG Root X1 (shipped)
+▲ http://files.example/survey.pdf          other site · not private · never visited
+✕ https://n0rthbank.example/login          lookalike of northbank.example (you have a login there) · a click stops at a warning
+```
+
+- **The full address**, never shortened: scheme, then the registrable domain in `text-primary`
+  and the rest in `text-tertiary`, IDN as punycode when mixed or confusable, as in the Where
+  field (§5.3). A long address wraps to a second line rather than being cut.
+- **The predicted light** (§6.5), with what can be known *before* visiting:
+  - `https` or `http` (http is amber, "not private");
+  - same site, other site, or a handoff ("opens in Mail");
+  - a lookalike of a site this persona has a login for (red), and the red list if it is on;
+  - whether this persona has been there, and when;
+  - **the certificate seen last time**, from history: issuer, root and whether the root is shipped
+    or added. If the certificate's issuer has changed since the last visit, that is shown too
+    ("issuer changed since 3 Nov"), because that is the provenance change worth noticing.
+- **Nothing is fetched to fill it.** Hovering never touches the network: no DNS lookup, no TLS
+  probe, no preconnect. A link to a site never visited says "never visited" and shows no
+  certificate. The full certificate story for the page you are on is in the bar at rest and in
+  the chip's popover.
+
+**At rest** (no link under the pointer) it shows the current page's light in detail: `TLS 1.3 ·
+Let's Encrypt → ISRG Root X1 (shipped) · Static · anonymous`, the facts of §6.5's popover on one
+line.
+
+**The bar can't be lied to by the page.** The hovered link comes from the page's worker
+(limen.md `LinkHover`, §12), and a compromised worker could name a different link than the one
+under the pointer. So:
+- the UI never shows the worker's string. It asks the broker, which applies the same two checks as
+  a click (threat model §2.10: the href must be one the document carries, and resolves through
+  the WHATWG parser) and answers with the decision a click would get: `Navigate` (with
+  `insecure`), `InDocument`, `Handoff` or `Blocked`. The bar shows that answer;
+- **a click goes only where the bar said.** If the bar is showing a destination and the click's
+  `Activate` resolves somewhere else, the UI doesn't navigate: the prompt row asks "This link goes
+  to X, not Y. Go there?" A worker that shows one link and clicks another is caught at the moment
+  it matters. Keyboard activation (no hover) shows the destination in the prompt row only when
+  the light would be amber or red;
+- the broker answers at most 20 hover requests a second per page and caches by href, so a page
+  can't use hover to make the broker work.
+
+**Without the bar**, the same check still runs on every click, and a red destination still stops
+at a warning; the bar only lets a person see it first.
+
+### 5.8 The mockups
 
 Four frames, each 1280×720, drawn by Pergola and composited by frescod:
 
@@ -401,7 +472,8 @@ Four frames, each 1280×720, drawn by Pergola and composited by frescod:
    unseen), four other trails (one playing audio) and three put away; the toolbar with the
    Where field at rest (title, then the address with the registrable domain emphasised),
    presence showing *Anonymous*, Aa, Keep and More; the page at a comfortable reading width.
-   The tier chip reads **Static**, and so does the strip.
+   The chip shows a green light and **Static**, and so does the strip. The status bar (§5.7) is
+   on, showing a hovered same-site link with the certificate seen last time.
 2. **`navigator-ui-dark-prompt-island.png`**: the same page in dark, after the reader let
    atlas.example remember them (presence filled, the person glyph on the trail's row), with a
    download asked in the prompt row and a video island framed and tagged "live code ·
@@ -412,7 +484,8 @@ Four frames, each 1280×720, drawn by Pergola and composited by frescod:
    Enter.
 4. **`navigator-ui-live-code.png`**: a web app running whole in the engine (a stand-in mail
    inbox at mail.example), rail collapsed: the tier chip and the strip read **Live code** in
-   amber, and presence shows the site knows the reader.
+   amber with an amber light, and presence shows the site knows the reader. The status bar shows
+   a hovered link to a lookalike of a bank the reader has a login for, predicted red.
 
 What is a stand-in: the 24 px strip is drawn by the mockup to show where frescod's own strip
 goes (headless direct mode has none); the page is a DocumentView in the mockup's own process,
@@ -424,7 +497,7 @@ a Fresco pop-up; and the trails and sites are made up.
 
 ## 6. Trust on screen
 
-Four things on screen carry trust. Each is drawn by the process that knows the fact, never by
+Five things on screen carry trust, and §6.5 sums them into one light. Each is drawn by the process that knows the fact, never by
 the page, and each is placed where the page can't draw.
 
 ### 6.1 Who the page is: the origin strip (frescod)
@@ -551,6 +624,87 @@ Rules:
   second, and a dismissed prompt doesn't come back for that page until it is reloaded.
 - **Arca's save-password offer** and **Sigillum's sheet** are not in this row: they are Arca's
   and Sigillum's own surfaces (notification layer and system sheet).
+
+### 6.5 One light: green, amber, red
+
+*Asked by Shankar, 2026-11-13: "page security information (what other browsers show with a
+lock): https or http, CA provenance, something simple like traffic lights: green for secure,
+amber for uncertain, red for malicious page and so on".*
+
+The padlock failed because it answered a question people don't have ("is the transport
+encrypted?") and every phishing site has one. A light can do better if it sums the facts this
+system actually holds, and if each colour means one thing a person can act on:
+
+| light | means | the person should |
+|---|---|---|
+| **green** (shield with a check) | nothing to worry about that we can see | read on |
+| **amber** (triangle) | something is weaker than usual, and the popover says what | carry on, but think before typing anything private |
+| **red** (octagon with a cross) | we believe this page is unsafe | not use it; the page is stopped, not just tinted |
+
+The light sits **in the tier chip**, before the tier word (§6.3): `● Static`, `● Replayed`,
+`● Live code`. One chip, one place to look, and the word still says what runs. It is drawn by
+the UI from the broker's verdict, and frescod paints the strip's left marker in the same colour
+(today a fixed blue bar), set by navigatord with the origin and the tier, so an app imitating
+the Navigator can't show a green it hasn't earned. The colour is never the only signal: each
+light has its own glyph shape, for colour-blind readers and high-contrast themes
+(visual language §4 status colours, `success`, `warning`, `danger`).
+
+**Green** needs all of:
+- `https`, and the certificate chain verified by webpki against **Atrium's system root store**;
+- the page in the document lane (Static or Replayed), so none of the site's code runs now;
+- no amber or red signal below.
+
+**Amber** if any of:
+- the page is `http:` ("Not private": anyone on the network can read or change it);
+- **Live code**, the whole page or a live part (§6.3): the site's own script runs, so the
+  document lane's protections don't hold for it;
+- the chain ends at a root **the user or an administrator added**, not one Atrium ships. That is
+  how company proxies and some malware read encrypted traffic, so it is worth knowing;
+- (once TLS.md gap 1 is built) revocation could not be checked, or (once CT checking exists)
+  the certificate carries no public log proof. Until those checks exist they don't count against
+  a page: a light that is amber everywhere teaches nothing;
+- a password or payment field on an origin this persona has never visited before;
+- the domain is a lookalike of nothing the user knows, but mixes scripts (punycode shown,
+  threat model §2.11).
+
+**Red**, and the page is not shown; the UI draws a stop page in its place, with *Go back* first:
+- the certificate fails verification (expired, wrong name, untrusted, revoked when that is
+  checked). Today the fetcher refuses the connection; the stop page says why in plain words.
+  **No click-through** for these on public sites (§13, D10): the one case a person may proceed is
+  a private address they own (a router, a dev box), and only after typing the address's name;
+- **a lookalike of a site this persona has a login for**: the domain's confusable skeleton
+  (UTS #39) matches a recipient in Arca, but the domain differs (`paypa1.example` when Arca holds
+  `paypal.example`). This is the phishing signal no list can give, and it costs no lookup;
+- **the page's own jail tried something it never should**: the jail monitor (legacy-web §10)
+  reported the worker or an island trying to open a file, reach the network or call a refused
+  system call. The page is stopped and the popover says what was tried ("This site's renderer
+  tried to read your files") — the signal §10.8 asked to keep for exactly this;
+- **a malicious-site list**, if the user turns one on (§13, D9): a downloaded list of hashed
+  prefixes checked on this machine, so no visited address is ever sent anywhere.
+
+**What the popover shows** (click the chip), drawn by the UI, two short sections:
+
+- **Connection.** "Private connection to atlas.example (TLS 1.3)." The certificate's issuer
+  organisation and its root ("issued by Let's Encrypt, root ISRG Root X1, shipped with Atrium"
+  or "root added by you on 2 Nov"), its validity dates, and later its log proofs. For `http:`:
+  "Not private. Anyone on this network can read or change this page."
+- **What runs.** The tier sentence of §6.3, and live parts by origin.
+- Then the amber or red reasons, one line each, and the actions: *Forget this site*, *Site
+  settings*.
+
+**Where the facts come from.** The TLS facts are produced by the fetcher (Nuntius, or Arca's
+courier for a cookied view) that made the connection: protocol, the chain's subjects and
+issuers, which root it ended at and whether that root is shipped or added. It reports them to
+the broker as structured fields, never as certificate bytes, so the broker still parses nothing.
+A compromised fetcher could lie about the connection it made, but it could already serve any
+bytes it liked for that page, so the light is no weaker than the page itself. Lookalike checks
+run in the broker against a skeleton list Arca gives it (skeletons, not recipients). Jail
+reports come from the jail monitor. The red list, if on, is checked in the broker.
+
+**Not a rating of honesty.** Green says the connection is sound and no site code runs; it can't
+say the site is honest. The popover's last line says so ("Green doesn't mean this site is who
+you think: check the name in the strip"), and Arca's exact-recipient rule is what actually stops
+a password going to the wrong place.
 
 ---
 
@@ -690,6 +844,7 @@ System shortcuts go to Forum first (limen.md §6). Within the Navigator:
 | Ctrl-plus, Ctrl-minus, Ctrl-0 | zoom (ScrollView) |
 | Ctrl-Shift-N | new Unrecorded trail |
 | Ctrl-M | mute or unmute the current trail |
+| Ctrl-/ | show or hide the status bar |
 | F6 | move focus between rail, toolbar and page |
 | Ctrl-Enter on a link | open beside (§4.2) |
 
@@ -724,7 +879,7 @@ and does it work?"
 | types a search in the address bar | works; suggestions come from their own history only, and the search is sent on Enter |
 | expects to stay signed in | the first visit to a site is anonymous; signing in or pressing the site's own consent button makes the site remember them, and the toolbar shows it. This is the one habit that changes, and it is the point |
 | watches video | the video plays in a frame marked "live code", and the page says "Replayed · 1 live part"; PiP and media keys work |
-| looks for the padlock | in its place is the tier chip (Static, Replayed, Live code); the strip names the site, "Not private" marks `http:`, and presence says whether the site knows them |
+| looks for the padlock | in its place is the chip with a green, amber or red light and the tier word (Static, Replayed, Live code); the strip names the site, "Not private" marks `http:`, and presence says whether the site knows them |
 
 The new ideas are four: the path in the rail, presence, the tier chip and the island frame. Each is visible
 rather than hidden in a menu, and each answers a question people already ask ("how did I get
@@ -745,8 +900,13 @@ argued further on paper.
 | navigatord | a persona in `OpenSession` and in Arca tickets | §2.4 |
 | navigatord | `Save` from the jailed host into the store on a Tessera volume (M4's open item) | §4.4 |
 | Limen (L6) | `doc-viewer` with the Navigator's worker as the child, opened by navigatord and bound into the UI's window; `LinkHover { url }` from child to parent (advisory, for showing a link's destination) | §2.1 |
+| navigatord | `Hover { session, href }` answered with the link decision (`Navigate`/`InDocument`/`Handoff`/`Blocked`), the predicted light and the last-seen certificate; rate-limited and cached | §5.7 |
+| UI | the status bar; refuse an `Activate` that resolves somewhere other than the destination shown | §5.7 |
 | Limen + frescod | slot kind `island`: frescod draws a 1 px frame and the "live code" tag, dashed while obscured | §6.3 |
-| frescod | origin strip follows a window's `page` slot when the window has no origin of its own; a tier label after the origin, set with `SET_ORIGIN` | §6.1, §6.3 |
+| frescod | origin strip follows a window's `page` slot when the window has no origin of its own; a tier label after the origin and the marker in the light's colour, set with `SET_ORIGIN` | §6.1, §6.3, §6.5 |
+| Nuntius, Arca courier | report TLS facts per connection (protocol, chain subjects and issuers, root id, shipped or added) as structured fields | §6.5 |
+| navigatord | the light's verdict per page; lookalike check against Arca's skeleton list; jail monitor reports to red | §6.5 |
+| system | one root store with added-root records (TLS.md gap 4), then revocation (gap 1) and CT | §6.5 |
 | navigatord | a tier in each session's report (static, replayed, live code, plus live islands), derived by the broker | §6.3 |
 | Arca | partition key (persona, site); an in-memory partition for Unrecorded | §2.4 |
 | Forum | the group/split intent of forum.md §2.3 in `forum-ctl` (it has `Focus` and display intents today), used for "open beside" | §8 |
@@ -765,6 +925,10 @@ argued further on paper.
 | **D5** | Personas | one jar per site · **Personal + Unrecorded now, named personas later** · named personas now (§2.4) | **Personal + Unrecorded now.** Named ones cost only an Arca key, so they can follow when wanted |
 | **D6** | Favicons | show site favicons (decoded in the page's jail, validated) · **monograms only** (§1) | **Monograms.** No site pixels in the chrome; lookalikes can't copy a monogram any better than the name |
 | **D7** | UI processes | **one per user session** · one per window (§2.3) | **One per session.** It holds nothing worth isolating per window, and the switch is cheap later |
+| **D9** | Malicious-site list for red (§6.5) | **off by default; local signals only** (cert failure, lookalike of an Arca login, jail monitor reports) · a downloaded hashed-prefix list on by default · per-visit online lookups | **Off by default, offered in settings.** The local signals catch what matters most with no data leaving; a list adds a dependency on its publisher |
+| **D12** | Always private? (§2.4) | **Personal by default, with "start new trails Unrecorded" and a history retention setting** · Unrecorded always | **Personal by default.** Sites already see an anonymous reader; forgetting everything locally costs restore, history and the certificate-change signal |
+| **D11** | Status bar (§5.7) | **optional, off by default** · always on · none | **Optional, off by default.** The click check runs either way; the bar is for people who look before they click |
+| **D10** | Certificate errors (§6.5) | **no click-through on public sites; private addresses after typing the name** · click-through like other browsers | **No click-through.** A person who sees a red stop page and proceeds is the attack's success case |
 | **D8** | Tier indicator (revised 2026-11-13 at Shankar's ask) | **three words on every page: Static, Replayed, Live code**, plus live parts and island frames · four tiers shown as numbers · two states only, safe and live (§6.3) | **Three words.** Static and Replayed share the calm look because neither runs site code now; Live code alone gets colour |
 
 Settled by earlier decisions and only applied here: the chrome is a Pergola app in the trusted
