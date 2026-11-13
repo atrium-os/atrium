@@ -27,6 +27,10 @@
 #   - a client the launch registry names as the web broker app registers a
 #     credential and signs in with it (the probe checks the RP ID hash and
 #     the ES256 signature); the scripted trusted UI runs as _sigillum-ui;
+#   - the same client, as a page through sigillum-webauthn (S3), runs
+#     navigator.credentials.create() and .get() for example.com from
+#     https://login.example.com, verified as a relying party would, and a
+#     foreign RP ID is SecurityError without reaching sigillumd;
 #   - an unknown uid and a wrong-uid UI are refused;
 #   - a key hot-plugged through the QEMU monitor gets a jail from the devd
 #     path, and unplugging it removes that jail (and only that one).
@@ -170,6 +174,9 @@ sleep 2
 touch /tmp/sprobe.cred; chown _sprobe /tmp/sprobe.cred
 su -m _sprobe -c "timeout 120 /usr/local/bin/sigillum-probe-test register example.com /tmp/sprobe.cred"; echo "register-rc $?"
 su -m _sprobe -c "timeout 120 /usr/local/bin/sigillum-probe-test assert example.com /tmp/sprobe.cred"; echo "assert-rc $?"
+# S3: the page's side through sigillum-webauthn (create + get from
+# https://login.example.com for example.com), checked as an RP would.
+su -m _sprobe -c "timeout 240 /usr/local/bin/sigillum-probe-test webauthn https://login.example.com example.com"; echo "webauthn-rc $?"
 su -m nobody -c "timeout 30 /usr/local/bin/sigillum-probe-test register example.com /tmp/sprobe-x.cred"; echo "unknown-rc $?"
 echo "-- ui"; cat /tmp/sprobe-ui.log
 echo "-- sigillumd"; tail -12 /var/log/atrium/atrium-sigillumd.log 2>/dev/null
@@ -179,6 +186,8 @@ C=/tmp/sigillum-cer.log
 grep -q "^wrong-ui ui: closed" $C && ok "a UI under another uid is closed at once" || bad "wrong-uid UI: $(sed -n 's/^wrong-ui //p' $C)"
 grep -q "^register: ok .*rp_hash_ok=true" $C && grep -q "^register-rc 0" $C && ok "register: credential for example.com" || bad "register"
 grep -q "^assert: cred_match=true signature_ok=true" $C && grep -q "^assert-rc 0" $C && ok "assert: signature verifies" || bad "assert"
+grep -q "^webauthn create: ok=true" $C && grep -q "^webauthn get: ok=true" $C && grep -q "^webauthn-rc 0" $C && ok "webauthn: create + get through sigillum-webauthn verify as an RP" || bad "webauthn"
+grep -q "^webauthn foreign rp: security_error=true" $C && ok "webauthn: a foreign RP ID is SecurityError" || bad "webauthn foreign RP"
 grep -q "^unknown-rc 0" $C && bad "an unknown uid registered" || ok "an unknown uid is refused"
 grep -q "Show" $C && ok "the UI was shown the sheets" || bad "the UI saw no sheet"
 

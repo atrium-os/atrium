@@ -5,6 +5,8 @@
 //! sigillum-probe ui [SOCKET]                 # a scripted trusted UI: presses the first device
 //! sigillum-probe register RP FILE [SOCKET]   # register; saves cred id + public key to FILE
 //! sigillum-probe assert RP FILE [SOCKET]     # sign in with FILE's credential; verifies the signature
+//! sigillum-probe webauthn ORIGIN RP [SOCKET] # navigator.credentials.create() then .get() through
+//!                                            # sigillum-webauthn, checked as a relying party would
 //! ```
 //!
 //! `ui` must run as `_sigillum-ui`; the client as a uid the launch
@@ -50,6 +52,76 @@ fn ask(sock: &str, req: &Request) -> Reply {
     s.set_read_timeout(Some(Duration::from_secs(150))).unwrap();
     write_msg(&mut s, req, client::MAX_MESSAGE).unwrap();
     read_msg::<Reply>(&mut s, client::MAX_MESSAGE).unwrap().expect("a reply")
+}
+
+/// The page's side through `sigillum-webauthn`, and the relying party's
+/// checks on what comes back.
+fn webauthn(origin: &str, rp: &str, sock: &str) -> ExitCode {
+    use sigillum_webauthn::{create, get, unb64url, CreationOptions, DomError, Origin, RequestOptions, Sigillumd};
+    let connect = || {
+        let s = UnixStream::connect(sock).expect("client socket");
+        s.set_read_timeout(Some(Duration::from_secs(150))).unwrap();
+        Sigillumd::from_stream(s)
+    };
+    let origin = Origin::parse(origin).expect("origin");
+    let b = |v: &serde_json::Value, k: &str| unb64url(v[k].as_str().unwrap_or("")).unwrap_or_default();
+    let o = CreationOptions::from_json(&format!(
+        r#"{{"rp":{{"id":"{rp}","name":"Probe"}},"user":{{"id":"AQIDBA","name":"probe","displayName":"Probe"}},
+            "challenge":"dm0tZ2F0ZS1yZWdpc3Rlcg","pubKeyCredParams":[{{"type":"public-key","alg":-7}}],
+            "authenticatorSelection":{{"userVerification":"discouraged"}}}}"#
+    ))
+    .expect("options");
+    let reg = match create(&mut connect(), &origin, None, &o) {
+        Ok(r) => r,
+        Err(e) => {
+            println!("webauthn create: {}", e.name());
+            return ExitCode::FAILURE;
+        }
+    };
+    let v: serde_json::Value = serde_json::from_str(&reg.to_json()).unwrap();
+    let r = &v["response"];
+    let cd: serde_json::Value = serde_json::from_slice(&b(r, "clientDataJSON")).unwrap();
+    let ad = b(r, "authenticatorData");
+    let cred = b(&v, "rawId");
+    let spki = b(r, "publicKey");
+    let key = VerifyingKey::from_sec1_bytes(spki.get(26..).unwrap_or(&[])).expect("SPKI point");
+    let ok_create = cd["type"] == "webauthn.create"
+        && cd["origin"] == origin.serialize()
+        && ad.get(..32) == Some(&Sha256::digest(rp.as_bytes())[..])
+        && ad.get(32).is_some_and(|f| f & 0x41 == 0x41);
+    println!("webauthn create: ok={ok_create} attachment={} cred={}", v["authenticatorAttachment"], hex(&cred));
+
+    let o = RequestOptions::from_json(&format!(
+        r#"{{"challenge":"dm0tZ2F0ZS1zaWduLWlu","rpId":"{rp}","userVerification":"discouraged","allowCredentials":[{{"type":"public-key","id":"{}"}}]}}"#,
+        sigillum_webauthn::b64url(&cred)
+    ))
+    .expect("options");
+    let a = match get(&mut connect(), &origin, None, &o) {
+        Ok(a) => a,
+        Err(e) => {
+            println!("webauthn get: {}", e.name());
+            return ExitCode::FAILURE;
+        }
+    };
+    let v: serde_json::Value = serde_json::from_str(&a.to_json()).unwrap();
+    let r = &v["response"];
+    let cdj = b(r, "clientDataJSON");
+    let cd: serde_json::Value = serde_json::from_slice(&cdj).unwrap();
+    let mut signed = b(r, "authenticatorData");
+    signed.extend_from_slice(&Sha256::digest(&cdj));
+    let verified = DerSignature::try_from(&b(r, "signature")[..]).ok().is_some_and(|s| key.verify(&signed, &s).is_ok());
+    let ok_get = verified && cd["type"] == "webauthn.get" && b(&v, "rawId") == cred;
+    println!("webauthn get: ok={ok_get} signature_ok={verified}");
+
+    // A foreign RP ID never reaches sigillumd.
+    let evil = RequestOptions::from_json(r#"{"challenge":"AQID","rpId":"evil.example"}"#).unwrap();
+    let refused = get(&mut connect(), &origin, None, &evil).err() == Some(DomError::Security);
+    println!("webauthn foreign rp: security_error={refused}");
+    if ok_create && ok_get && refused {
+        ExitCode::SUCCESS
+    } else {
+        ExitCode::FAILURE
+    }
 }
 
 fn main() -> ExitCode {
@@ -118,6 +190,7 @@ fn main() -> ExitCode {
                 ExitCode::FAILURE
             }
         }
+        Some("webauthn") if a.len() >= 3 => webauthn(&a[1], &a[2], &sock(3, client::SOCKET)),
         _ => {
             eprintln!("usage: sigillum-probe ui [SOCKET] | register RP FILE [SOCKET] | assert RP FILE [SOCKET]");
             ExitCode::from(2)

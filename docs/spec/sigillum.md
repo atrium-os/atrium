@@ -778,6 +778,13 @@ otherwise passes the blobs on without reading them.
     a tampered Arca answer, no Arca for private RP IDs or when it is unavailable);
     `sigillum-webauthn/tests/e2e.rs` (a passkey through both daemons on real sockets,
     verified by the relying party).
+- **S3 VM gate (2026-11-13):** `scripts/vm-sigillum-check.sh` (now on dispensatord) gained a
+  step where the probe, as a page through `sigillum-webauthn`, runs create and get for
+  `example.com` from `https://login.example.com` against QEMU's emulated key through the
+  jailed driver and `sigillumd`, verified as an RP would, and a foreign RP ID is
+  `SecurityError`: 0 failed. Arca isn't commissioned in that VM, so the sheet offered the
+  key only (Arca unreachable is the security-keys-only path); the Arca path is covered by
+  the host gates above.
 
 ## 17. Decisions, with recommendations
 
