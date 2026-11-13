@@ -736,7 +736,8 @@ otherwise passes the blobs on without reading them.
   non-resident registration for example.com (flags 0x45: UP, UV, AT; RP ID hash checked)
   and a sign-in with it (flags 0x05: UP, UV; ES256 signature over authData and the client
   data hash verified against the registered key; sign count 5), one touch each, through
-  the jailed driver (`/dev/u2f/0`) and the jailed `sigillumd`.
+  the jailed driver (`/dev/u2f/0`) and the jailed `sigillumd`. The PIN-path fixes: `773890d6`
+  (protocol 1) and `ee04964f` (getPinToken without `pinUvAuthToken`, the one this key needed).
 - **Not yet:** Capsicum in `sigillumd` itself (it reads the launch registry per connection; a
   pre-opened directory fd comes later), `allow.mlock` for `sigillumd`.
 
