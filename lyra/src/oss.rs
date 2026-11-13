@@ -40,6 +40,15 @@ const SNDCTL_DSP_GETOPTR: u64 = ior(18, std::mem::size_of::<CountInfo>());
 const SNDCTL_DSP_GETODELAY: u64 = ior(23, 4);
 const SNDCTL_DSP_GETERROR: u64 = ior(25, std::mem::size_of::<AudioErrInfo>());
 const SNDCTL_DSP_SYNC: u64 = 0x2000_0000 | ((b'P' as u64) << 8) | 1; // _IO('P', 1)
+/// `SNDCTL_AUDIOINFO`: `_IOWR('X', 7, oss_audioinfo)`, 1180 bytes on FreeBSD
+/// (checked against sys/soundcard.h with the cross sysroot, 2026-11-13).
+const OSS_AUDIOINFO_LEN: usize = 1180;
+const SNDCTL_AUDIOINFO: u64 = (IOC_IN | IOC_OUT) | ((OSS_AUDIOINFO_LEN as u64) << 16) | ((b'X' as u64) << 8) | 7;
+/// Mixer ioctls ('M'): the device mask, and the master level (0).
+const SOUND_MIXER_READ_DEVMASK: u64 = IOC_OUT | (4 << 16) | ((b'M' as u64) << 8) | 0xfe;
+const SOUND_MIXER_VOLUME: u64 = 0;
+const SOUND_MIXER_WRITE_VOLUME: u64 = (IOC_IN | IOC_OUT) | (4 << 16) | ((b'M' as u64) << 8) | SOUND_MIXER_VOLUME;
+const SOUND_MASK_VOLUME: i32 = 1 << SOUND_MIXER_VOLUME;
 
 /// Mirror of `audio_errinfo` (sys/soundcard.h): 8 ints, 2 longs, filler[16].
 #[repr(C)]
@@ -248,6 +257,21 @@ impl OssSink {
         self.format
     }
 
+    /// The card's name as sound(4) gives it (e.g. "Auris EarMen Sparrow"),
+    /// for keeping per-output settings: the default unit can be any card.
+    pub fn card_name(&self) -> Option<String> {
+        let mut info = [0u8; OSS_AUDIOINFO_LEN];
+        info[..4].copy_from_slice(&(-1i32).to_ne_bytes()); // dev -1: this device
+        let rc = unsafe { libc::ioctl(self.fd.as_raw_fd(), SNDCTL_AUDIOINFO, info.as_mut_ptr()) };
+        if rc != 0 {
+            return None;
+        }
+        let name = &info[4..68];
+        let end = name.iter().position(|&b| b == 0).unwrap_or(name.len());
+        let s = String::from_utf8_lossy(&name[..end]).trim().to_string();
+        (!s.is_empty()).then_some(s)
+    }
+
     /// Write interleaved S16 frames (widened for an S24 or S32 device);
     /// blocks until the kernel buffer accepts them.
     pub fn write_i16(&self, samples: &[i16]) -> io::Result<()> {
@@ -339,6 +363,46 @@ impl OssSink {
     }
 }
 
+/// The device's own master level (`/dev/mixer`, the default unit's mixer,
+/// like `/dev/dsp`): a hardware control, such as a USB DAC's feature unit or
+/// a codec's output amplifier. sound(4) emulates only `pcm` in software
+/// (SOFTPCMVOL), never `vol`, so a `vol` control is the hardware's.
+pub struct HwVolume {
+    fd: OwnedFd,
+}
+
+impl HwVolume {
+    /// The mixer, if it has a master level.
+    pub fn open() -> Option<HwVolume> {
+        let fd = unsafe { libc::open(c"/dev/mixer".as_ptr(), libc::O_RDWR) };
+        if fd < 0 {
+            return None;
+        }
+        let fd = unsafe { OwnedFd::from_raw_fd(fd) };
+        let mut mask: i32 = 0;
+        let rc = unsafe { libc::ioctl(fd.as_raw_fd(), SOUND_MIXER_READ_DEVMASK, &mut mask) };
+        (rc == 0 && mask & SOUND_MASK_VOLUME != 0).then_some(HwVolume { fd })
+    }
+
+    /// Set the level, 0 to 1 (both channels).
+    pub fn set(&self, volume: f32) -> io::Result<()> {
+        let mut v = level(volume);
+        let rc = unsafe { libc::ioctl(self.fd.as_raw_fd(), SOUND_MIXER_WRITE_VOLUME, &mut v) };
+        if rc != 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(())
+    }
+}
+
+/// An OSS mixer level for `volume` 0 to 1: percent, left in the low byte and
+/// right in the next. Not a number is silence.
+pub fn level(volume: f32) -> i32 {
+    let v = if volume.is_finite() { volume.clamp(0.0, 1.0) } else { 0.0 };
+    let pct = (v * 100.0).round() as i32;
+    pct | (pct << 8)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -373,6 +437,19 @@ mod tests {
         assert!(w.iter().zip(src).all(|(w, s)| (w >> 8) as i16 == s));
         encode_s16(&src, Format::S16, &mut out);
         assert_eq!(out, src.iter().flat_map(|s| s.to_le_bytes()).collect::<Vec<u8>>());
+    }
+
+    #[test]
+    fn mixer_encodings_and_levels() {
+        // Checked against sys/soundcard.h with the cross sysroot.
+        assert_eq!(SNDCTL_AUDIOINFO, 3_298_580_487);
+        assert_eq!(SOUND_MIXER_READ_DEVMASK, 1_074_023_934);
+        assert_eq!(SOUND_MIXER_WRITE_VOLUME, 3_221_507_328);
+        assert_eq!(level(1.0), 100 | 100 << 8);
+        assert_eq!(level(0.5), 50 | 50 << 8);
+        assert_eq!(level(0.0), 0);
+        assert_eq!(level(f32::NAN), 0);
+        assert_eq!(level(7.0), 100 | 100 << 8);
     }
 
     #[test]

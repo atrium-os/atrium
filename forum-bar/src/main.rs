@@ -17,7 +17,7 @@ use std::sync::Arc;
 mod status_panel;
 
 use forum_ctl::{Intent, PadInfo, Reply, StatusContent, StatusEntry, StatusItem};
-use lyra_protocol::wire::{action, FromControl, FromMedia, MediaAction, NowPlaying, SessionState, ToControl, ToMedia};
+use lyra_protocol::wire::{action, FromControl, FromMedia, MediaAction, NowPlaying, SessionState, ToControl, ToMedia, VolumeMode};
 use fresco_protocol::{WindowHints, WmRole};
 use pergola::geom::{Axis, Rect};
 use pergola::reactive::Mutable;
@@ -93,6 +93,8 @@ struct BarView {
     vol_level: Mutable<f64>,
     vol_muted: Mutable<bool>,
     vol_output: Mutable<usize>,
+    /// The current output's "Fixed volume" switch.
+    vol_fixed: Mutable<bool>,
     /// Apps' status items (forum-status-items.md): the bar draws each
     /// one's icon and menu; picks go back through forum-wm.
     status: Mutable<Vec<StatusShown>>,
@@ -549,14 +551,18 @@ impl View for BarView {
             };
             let names: Vec<String> = a.outputs.iter().map(|(_, n)| n.clone()).collect();
             let rows = names.len() as f32;
-            let size = pergola::geom::Size::new(260.0, 2.0 * PANEL_PADDING + 28.0 + 36.0 + if rows > 0.0 { 24.0 + rows * 28.0 } else { 0.0 });
-            let (level, muted, output) = (self.vol_level.clone(), self.vol_muted.clone(), self.vol_output.clone());
+            // A Fixed output (line out to an amplifier) keeps the mix at 100%:
+            // the slider is off and says where the volume is.
+            let fixed_now = a.fixed();
+            let size = pergola::geom::Size::new(260.0, 2.0 * PANEL_PADDING + 28.0 + 36.0 + 36.0 + if fixed_now { 20.0 } else { 0.0 } + if rows > 0.0 { 24.0 + rows * 28.0 } else { 0.0 });
+            let (level, muted, output, fixed) = (self.vol_level.clone(), self.vol_muted.clone(), self.vol_output.clone(), self.vol_fixed.clone());
+            let current = a.current;
             let want = self.want_audio.clone();
             let ids: Vec<u32> = a.outputs.iter().map(|(id, _)| *id).collect();
             let enabled = a.available;
             let panel = PanelButton::new("Volume", self.audio_open.clone(), size, move |ctx: &mut Ctx, inner: Rect| {
                 let t = ctx.theme;
-                let (w1, w2, w3) = (want.clone(), want.clone(), want.clone());
+                let (w1, w2, w3, w4) = (want.clone(), want.clone(), want.clone(), want.clone());
                 Toggle::new(muted.clone(), "Mute")
                     .at(inner.x(), inner.y())
                     .on_change(move |m| w1.set(Some(AudioAction::Mute(m))))
@@ -564,11 +570,20 @@ impl View for BarView {
                 Slider::new(level.clone(), 0.0, 1.0)
                     .at(inner.x(), inner.y() + 36.0)
                     .width(inner.w())
-                    .enabled(enabled)
+                    .enabled(enabled && !fixed_now)
                     .on_change(move |v| w2.set(Some(AudioAction::Master(v as f32))))
                     .render(ctx);
+                let mut y = inner.y() + 36.0 + 36.0;
+                if fixed_now {
+                    Label::new("Fixed at 100%: use your amplifier").size(type_size::XS).color(t.text_tertiary()).at(inner.x(), y - 8.0).emit(ctx);
+                    y += 20.0;
+                }
+                Toggle::new(fixed.clone(), "Fixed volume (line out)")
+                    .at(inner.x(), y)
+                    .on_change(move |on| w4.set(Some(AudioAction::Fixed(current, on))))
+                    .render(ctx);
+                y += 36.0;
                 if !names.is_empty() {
-                    let y = inner.y() + 36.0 + 36.0;
                     Label::new("Output").size(type_size::XS).color(t.text_tertiary()).at(inner.x(), y).emit(ctx);
                     let ids = ids.clone();
                     RadioGroup::new(output.clone(), names.clone())
@@ -751,6 +766,15 @@ struct AudioShown {
     /// The outputs (id, name) and the one in use.
     outputs: Vec<(u32, String)>,
     current: u32,
+    /// Where the current output's volume is applied (lyra-hires.md §5).
+    volume_mode: Option<VolumeMode>,
+}
+
+impl AudioShown {
+    /// The current output's volume is fixed at 100% (line out to an amplifier).
+    fn fixed(&self) -> bool {
+        self.volume_mode == Some(VolumeMode::Fixed)
+    }
 }
 
 impl AudioShown {
@@ -763,6 +787,7 @@ impl AudioShown {
                 self.muted = master_muted;
             }
             FromControl::Outputs { current, outputs } => {
+                self.volume_mode = outputs.iter().find(|o| o.id == current).map(|o| o.volume);
                 self.outputs = outputs.into_iter().map(|o| (o.id, o.name)).collect();
                 self.current = current;
             }
@@ -777,6 +802,8 @@ enum AudioAction {
     Master(f32),
     Mute(bool),
     Output(u32),
+    /// The output's volume fixed at 100% (`true`), or automatic again.
+    Fixed(u32, bool),
 }
 
 impl AudioAction {
@@ -785,6 +812,7 @@ impl AudioAction {
             AudioAction::Master(v) => ToControl::SetMaster { volume: v.clamp(0.0, 1.0) },
             AudioAction::Mute(m) => ToControl::SetMasterMute { muted: m },
             AudioAction::Output(o) => ToControl::SetOutput { output: o },
+            AudioAction::Fixed(o, on) => ToControl::SetVolumeMode { output: o, mode: on.then_some(VolumeMode::Fixed) },
         }
     }
 }
@@ -950,6 +978,7 @@ fn main() -> std::io::Result<()> {
     let vol_level = Mutable::with_dirty(0.0f64, dirty.clone());
     let vol_muted = Mutable::with_dirty(false, dirty.clone());
     let vol_output = Mutable::with_dirty(0usize, dirty.clone());
+    let vol_fixed = Mutable::with_dirty(false, dirty.clone());
     let mut control: Option<lyra_protocol::client::Media> = None;
     let status = Mutable::with_dirty(
         merge_status(&[], poll_status_items(), Some(&dirty)).unwrap_or_default(),
@@ -985,6 +1014,7 @@ fn main() -> std::io::Result<()> {
         vol_level: vol_level.clone(),
         vol_muted: vol_muted.clone(),
         vol_output: vol_output.clone(),
+        vol_fixed: vol_fixed.clone(),
         status: status.clone(),
         status_stale: status_stale.clone(),
         want_drawn: want_drawn.clone(),
@@ -1078,6 +1108,9 @@ fn main() -> std::io::Result<()> {
                 }
                 if vol_muted.get() != a.muted {
                     vol_muted.set(a.muted);
+                }
+                if vol_fixed.get() != a.fixed() {
+                    vol_fixed.set(a.fixed());
                 }
                 let i = a.outputs.iter().position(|(id, _)| *id == a.current).unwrap_or(0);
                 if vol_output.get() != i {
@@ -1204,6 +1237,7 @@ mod tests {
             vol_level: Mutable::new(0.0),
             vol_muted: Mutable::new(false),
             vol_output: Mutable::new(0),
+            vol_fixed: Mutable::new(false),
             status: Mutable::new(Vec::new()),
             status_stale: Arc::new(AtomicBool::new(false)),
             want_drawn: Mutable::new(None),
@@ -1383,12 +1417,20 @@ mod tests {
         view.audio.set(AudioShown {
             available: true, master: 0.5, muted: false, current: 2,
             outputs: vec![(1, "Speakers".into()), (2, "Headphones".into())],
+            volume_mode: Some(VolumeMode::Digital),
         });
         let (tree, _) = render(&view, Semantic::LIGHT);
         assert!(has_text(&tree, &phosphor::SPEAKER_SIMPLE_HIGH.to_string()) && !has_text(&tree, "Headphones"));
         view.audio_open.set(MenuState::opened(None));
         let (tree, _) = render(&view, Semantic::LIGHT);
         assert!(has_text(&tree, "Mute") && has_text(&tree, "Output") && has_text(&tree, "Speakers") && has_text(&tree, "Headphones"));
+        assert!(has_text(&tree, "Fixed volume (line out)") && !has_text(&tree, "Fixed at 100%: use your amplifier"));
+        // A Fixed output says where its volume is.
+        let mut a = view.audio.get_cloned();
+        a.volume_mode = Some(VolumeMode::Fixed);
+        view.audio.set(a);
+        let (tree, _) = render(&view, Semantic::LIGHT);
+        assert!(has_text(&tree, "Fixed at 100%: use your amplifier"));
     }
 
     #[test]
@@ -1399,12 +1441,15 @@ mod tests {
         a.apply(FromControl::Outputs {
             current: 2,
             outputs: vec![
-                lyra_protocol::wire::Output { id: 1, name: "Speakers".into(), balance: 0.0, channels: 2, spatial: false },
-                lyra_protocol::wire::Output { id: 2, name: "Headphones".into(), balance: 0.0, channels: 2, spatial: true },
+                lyra_protocol::wire::Output { id: 1, name: "Speakers".into(), volume: VolumeMode::Digital, volume_setting: None, hw_volume: false, balance: 0.0, channels: 2, spatial: false },
+                lyra_protocol::wire::Output { id: 2, name: "Headphones".into(), volume: VolumeMode::Fixed, volume_setting: Some(VolumeMode::Fixed), hw_volume: false, balance: 0.0, channels: 2, spatial: true },
             ],
         });
         assert_eq!(a.outputs, vec![(1, "Speakers".into()), (2, "Headphones".into())]);
         assert_eq!(a.current, 2);
+        assert!(a.fixed(), "the current output's mode");
+        assert_eq!(AudioAction::Fixed(2, true).wire(), ToControl::SetVolumeMode { output: 2, mode: Some(VolumeMode::Fixed) });
+        assert_eq!(AudioAction::Fixed(2, false).wire(), ToControl::SetVolumeMode { output: 2, mode: None });
         assert_eq!(AudioAction::Master(-0.5).wire(), ToControl::SetMaster { volume: 0.0 });
         assert_eq!(AudioAction::Output(1).wire(), ToControl::SetOutput { output: 1 });
     }

@@ -16,6 +16,7 @@
 //! Only the control socket ([`crate::control`]) changes them; an app's own
 //! `SetVolume` multiplies under them and is not stored.
 
+use lyra_protocol::wire::VolumeMode;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap};
 use std::io;
@@ -170,6 +171,10 @@ pub struct OutputSettings {
     /// Headphone virtual surround by output name (default off).
     #[serde(default)]
     pub spatial: BTreeMap<String, bool>,
+    /// Where the volume is applied, by output name (or `card:<name>` for a
+    /// built-in card), when the user chose (default automatic).
+    #[serde(default)]
+    pub volume_mode: BTreeMap<String, VolumeMode>,
 }
 
 /// Speaker layouts an output may have: stereo, 5.1, 7.1.
@@ -213,6 +218,18 @@ impl OutputSettings {
 
     pub fn set_spatial(&mut self, dir: &Option<String>, output: &str, on: bool) -> io::Result<()> {
         self.spatial.insert(output.to_string(), on);
+        self.save(dir)
+    }
+
+    pub fn volume_mode(&self, output: &str) -> Option<VolumeMode> {
+        self.volume_mode.get(output).copied()
+    }
+
+    pub fn set_volume_mode(&mut self, dir: &Option<String>, output: &str, mode: Option<VolumeMode>) -> io::Result<()> {
+        match mode {
+            Some(m) => { self.volume_mode.insert(output.to_string(), m); }
+            None => { self.volume_mode.remove(output); }
+        }
         self.save(dir)
     }
 
@@ -269,6 +286,18 @@ mod tests {
         assert_eq!(s.user("bob").app("x").volume, 1.0);
         std::fs::write(format!("{d}/carol.toml"), "not toml [[[").unwrap();
         assert_eq!(s.user("carol"), &UserVolumes::default());
+    }
+
+    #[test]
+    fn an_outputs_volume_mode_is_kept_and_auto_forgets_it() {
+        let d = Some(dir("vmode"));
+        let mut o = OutputSettings::load(&d);
+        assert_eq!(o.volume_mode("card:Auris EarMen Sparrow"), None);
+        o.set_volume_mode(&d, "card:Auris EarMen Sparrow", Some(VolumeMode::Fixed)).unwrap();
+        assert_eq!(OutputSettings::load(&d).volume_mode("card:Auris EarMen Sparrow"), Some(VolumeMode::Fixed));
+        assert_eq!(OutputSettings::load(&d).volume_mode("Speakers"), None, "per card, not every output");
+        o.set_volume_mode(&d, "card:Auris EarMen Sparrow", None).unwrap();
+        assert_eq!(OutputSettings::load(&d).volume_mode("card:Auris EarMen Sparrow"), None);
     }
 
     #[test]

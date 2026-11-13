@@ -281,6 +281,13 @@ pub struct Engine {
     pub want_rate: Option<u32>,
     /// Rates the built-in device refused; never asked for again.
     pub refused_rates: Vec<u32>,
+    /// The built-in device's own master level, as choragusd last set it.
+    pub hw_volume: Option<f32>,
+    /// It changed since the run loop last applied it.
+    pub hw_volume_changed: bool,
+    /// The built-in device lyrad has open (its card name, and whether it has a
+    /// volume control), told again to each new session.
+    builtin: Option<(String, bool)>,
     /// The last period went to the device bit for bit as one stream sent it.
     bit_perfect: Option<u32>,
     /// Streams sounding in the last period.
@@ -326,6 +333,9 @@ impl Engine {
             want_output: None,
             want_rate: None,
             refused_rates: Vec::new(),
+            hw_volume: None,
+            hw_volume_changed: false,
+            builtin: None,
             bit_perfect: None,
             sounding: 0,
         }
@@ -352,6 +362,12 @@ impl Engine {
         // The measured HRTFs are 48 kHz; at other rates the model renders.
         self.virt = Virtualizer::for_period(rate as f32, self.period_frames);
         self.balance = [Gain::new(self.balance[0].target(), rate as f32, 20.0), Gain::new(self.balance[1].target(), rate as f32, 20.0)];
+    }
+
+    /// The built-in device was opened: tell choragusd now and each new session.
+    pub fn set_builtin(&mut self, name: String, hw_volume: bool) {
+        self.builtin = Some((name.clone(), hw_volume));
+        self.events.push(FromEngine::BuiltIn { name, hw_volume });
     }
 
     /// The stream the last period carried bit for bit, if it did.
@@ -447,6 +463,9 @@ impl Engine {
                 self.events.clear();
                 self.gen = g;
                 self.drop_devices();
+                if let Some((name, hw_volume)) = self.builtin.clone() {
+                    self.events.push(FromEngine::BuiltIn { name, hw_volume });
+                }
             }
             Cmd::End(g) if g == self.gen => {
                 if !self.slots.is_empty() {
@@ -508,6 +527,10 @@ impl Engine {
                 if self.output == device && device != 0 {
                     self.want_output = Some(0);
                 }
+            }
+            ToEngine::SetHwVolume { volume } => {
+                self.hw_volume = Some(if volume.is_finite() { volume.clamp(0.0, 1.0) } else { 0.0 });
+                self.hw_volume_changed = true;
             }
             ToEngine::UseOutput { device } => {
                 if device == 0 || self.device(device).is_some() {
@@ -1342,6 +1365,13 @@ pub fn run(cfg: Config) -> ! {
             }
         };
         eprintln!("lyrad: OSS device open ({} Hz, {} ch, {:?})", sink.rate_hz(), sink.channels(), sink.format());
+        // The card, and its own master level if it has one: choragusd decides
+        // where the volume goes (lyra-hires.md §5) and keeps it per card.
+        let hw = crate::oss::HwVolume::open();
+        let name = sink.card_name().unwrap_or_default();
+        eprintln!("lyrad: card \"{name}\", {}", if hw.is_some() { "with its own volume control" } else { "no volume control of its own" });
+        engine.set_builtin(name, hw.is_some());
+        engine.hw_volume_changed = true;
         engine.set_channels(channels as usize);
         mix.resize(period as usize * channels as usize, 0.0);
         out.resize(mix.len(), 0);
@@ -1356,6 +1386,14 @@ pub fn run(cfg: Config) -> ! {
                 break;
             }
             engine.want_output = engine.want_output.filter(|&o| o != 0);
+            if engine.hw_volume_changed {
+                engine.hw_volume_changed = false;
+                if let (Some(h), Some(v)) = (hw.as_ref(), engine.hw_volume) {
+                    if let Err(e) = h.set(v) {
+                        eprintln!("lyrad: setting the device's volume: {e}");
+                    }
+                }
+            }
             if engine.want_rate.is_some_and(|r| r != dev_rate) {
                 // Reopen at the rate of the stream that started alone. Nothing
                 // else is playing, so the gap is before its first frame.

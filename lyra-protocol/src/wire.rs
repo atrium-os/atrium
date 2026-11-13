@@ -344,6 +344,11 @@ pub enum ToControl {
     /// `Pro` streams never do). The user's setting, kept across restarts.
     /// Answered by `Apps`.
     SetAppSpatial { app_id: String, on: bool },
+    /// Where the output's volume is applied: `None` automatic, or the user's
+    /// choice (`Fixed` for line out to an amplifier; `Hardware` only on a
+    /// device that has a control). A system setting of the output, kept
+    /// across restarts; only the active session sets it. Answered by `Outputs`.
+    SetVolumeMode { output: u32, mode: Option<VolumeMode> },
 }
 
 /// One app with a stream open, as the volume UI shows it.
@@ -362,10 +367,28 @@ pub struct AppEntry {
     pub spatial: bool,
 }
 
+/// Where an output's volume is applied (lyra-hires.md §5).
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
+pub enum VolumeMode {
+    /// Scaled in the mix (bit-perfect only at 100%).
+    Digital,
+    /// The device's own control; the mix stays at 100%, bit-perfect.
+    Hardware,
+    /// Always 100%: line out to an amplifier, whose knob is the volume.
+    Fixed,
+}
+
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
 pub struct Output {
     pub id: u32,
     pub name: String,
+    /// Where its volume is applied now.
+    pub volume: VolumeMode,
+    /// What the user chose (`None`: automatic, `Hardware` when the device
+    /// has a control of its own, `Digital` otherwise).
+    pub volume_setting: Option<VolumeMode>,
+    /// The device has a volume control of its own.
+    pub hw_volume: bool,
     pub balance: f32,
     /// Its speaker layout (2, 6 or 8).
     pub channels: u8,
@@ -447,6 +470,9 @@ pub enum ToEngine {
     /// Mix for this output from the next period on: 0 is the built-in (OSS)
     /// device, anything else a device added with `AddDevice`.
     UseOutput { device: u32 },
+    /// The built-in device's own master level, 0 to 1 (only when `BuiltIn`
+    /// said it has one). Kept and set again each time lyrad opens the device.
+    SetHwVolume { volume: f32 },
 }
 
 /// Rates an external device may run at (HFP's 8 and 16 kHz, LC3's 16 to
@@ -474,6 +500,10 @@ pub enum FromEngine {
     /// lyrad now mixes for this output (after `UseOutput`, or 0 when the
     /// current external device went away).
     OutputInUse { device: u32 },
+    /// The built-in device lyrad opened (each time it opens one): the card's
+    /// name (sound(4)'s, e.g. "Auris EarMen Sparrow"; empty if it gave none)
+    /// and whether it has a master level of its own.
+    BuiltIn { name: String, hw_volume: bool },
 }
 
 // ── framing ─────────────────────────────────────────────────────────────────

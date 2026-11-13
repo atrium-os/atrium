@@ -67,9 +67,7 @@ lyrad logs every change: `lyrad: bit-perfect: stream 3 at 192000 Hz, S32` or
 
 ## 5. Open items
 
-- **Hardware volume.** Bit-perfect needs 0 dB digitally. A DAC with a hardware volume control
-  (a UAC feature unit, `mixerN`) should take the master volume there, as Bluetooth absolute
-  volume does (lyra-external-device.md §5).
+- **Hardware volume:** done, see §8.
 - **Show it.** A `FromEngine::BitPerfect { stream }` event for choragusd and a badge in the
   Forum bar's output menu.
 - **bitperfect on hot-plug.** `lyra-service.sh` sets `dev.pcm.N.bitperfect=1` for the cards
@@ -112,3 +110,44 @@ the engine and the S24 encoder, integer for integer), `a_second_stream_or_resamp
   - 192 kHz: `the device refused 192000 Hz (... got 96000)`, back to 48 kHz, resampled.
 - No real hi-res DAC has played through this yet. The Sparrow (S32, up to 384 kHz) is the
   first to try, on real hardware or on the Mac's EHCI passthrough.
+
+## 8. Where the volume goes (2026-11-13)
+
+Bit-perfect needs the mix at 0 dB, so the volume has to go somewhere else. Shankar: a DAC with
+no volume control of its own usually feeds an amplifier whose knob is the volume, so its volume
+is fixed at 100%. Each output therefore has a **volume mode** (`wire::VolumeMode`):
+
+| mode | master volume | when |
+|---|---|---|
+| `Hardware` | the device's own control (the card's `vol` mixer, or an external device's absolute volume); the mix stays at 100% | automatic when the device has a control |
+| `Fixed` | none: 100% always (mute still mutes) | the user's choice, for line out to an amplifier |
+| `Digital` | in the mix (bit-perfect only at 100%) | automatic when the device has no control, or the user's choice |
+
+- **Headphone DACs without a control stay `Digital` by default.** A dongle such as the Sparrow
+  or DragonFly drives headphones itself, so a fixed 100% would be far too loud. `Fixed` is the
+  user's choice ("Fixed volume (line out)" in the Forum bar's volume menu), never automatic.
+- **The choice is kept per card**: `card:<sound(4) name>` in choragusd's `.outputs.toml`, so
+  fixing a USB DAC never fixes the laptop speakers when it is unplugged.
+- **lyrad** opens `/dev/mixer` beside `/dev/dsp`. sound(4) emulates only `pcm` in software,
+  so a `vol` control is the hardware's. lyrad reports `FromEngine::BuiltIn { name, hw_volume }`
+  at each open, and again to each new session, and applies `ToEngine::SetHwVolume` (also at
+  each reopen).
+- **choragusd** applies the master in the mix only for `Digital`, sends it to the device for
+  `Hardware`, and sets a device control to 100% for `Fixed` and `Digital`, so a control left
+  low can't hold the level down. A Fixed output ignores the master but not mute.
+  `ToControl::SetVolumeMode { output, mode }` (`None`: automatic) refuses `Hardware` on a device
+  with no control.
+- **Forum bar**: the switch, a disabled slider and "Fixed at 100%: use your amplifier" while
+  fixed.
+
+Checked in the Mac VM on virtual HDA, which has a `vol` control, with the master at 0.5:
+- automatic → `Hardware`: mixer `vol` 0.50, and the tone `bit-perfect`;
+- `Digital`: mixer 1.00, and the tone mixed (scaled by 0.5);
+- `Fixed`: mixer 1.00, and the tone `bit-perfect`;
+- automatic again: mixer 0.50.
+
+Unit tests: `resolve_volume_mode`, `master_in_mix`, the per-card setting, the mixer ioctl
+numbers (checked against the sysroot's soundcard.h), and the bar's switch and label.
+
+Still open: reading the DAC's output terminal type (UAC headphones vs line connector) to
+suggest `Fixed` for a line-out DAC. That needs dispensatord, which sees the USB descriptors.

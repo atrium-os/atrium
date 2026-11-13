@@ -268,7 +268,7 @@ fn the_volume_ui_sets_the_users_levels_and_they_persist() {
     loop {
         match ui.recv().unwrap() {
             FromControl::Outputs { current, outputs } => {
-                assert_eq!((current, outputs), (0, vec![Output { id: 0, name: "Speakers".into(), balance: 0.0, channels: 2, spatial: false }]));
+                assert_eq!((current, outputs), (0, vec![Output { id: 0, name: "Speakers".into(), volume: wire::VolumeMode::Digital, volume_setting: None, hw_volume: false, balance: 0.0, channels: 2, spatial: false }]));
                 break;
             }
             _ => continue,

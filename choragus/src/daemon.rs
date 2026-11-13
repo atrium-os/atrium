@@ -24,7 +24,7 @@ use crate::volumes::{clamp, Level, OutputSettings, VolumeStore};
 use lyra_protocol::fdpass::{recv_fd, send_fd};
 use lyra_protocol::wire::{
     self, AppEntry, DenyCode, FromAttribution, FromControl, FromDevice, FromEngine, FromMedia, MediaAction, NowPlaying,
-    Output, OutputKind, Role as WireRole, SessionState, Ticket, ToApp, ToAttribution, ToChoragus, ToControl, ToDevice,
+    Output, OutputKind, Role as WireRole, VolumeMode, SessionState, Ticket, ToApp, ToAttribution, ToChoragus, ToControl, ToDevice,
     ToEngine, ToMedia,
 };
 use portcullis_peer::AppRegistry;
@@ -140,6 +140,31 @@ struct ExtOutput {
 /// A device announced again within this long keeps its output.
 const DEVICE_GRACE: Duration = Duration::from_secs(2);
 
+/// Where an output's volume goes: the user's `setting`, else the device's
+/// control when it has one (`hw`), else the mix. `Hardware` without a
+/// control is `Digital`. Headphone dongles with no control of their own stay
+/// `Digital` unless the user says `Fixed`: 100% into headphones is too loud.
+pub fn resolve_volume_mode(setting: Option<VolumeMode>, hw: bool) -> VolumeMode {
+    match setting {
+        Some(VolumeMode::Fixed) => VolumeMode::Fixed,
+        Some(VolumeMode::Digital) => VolumeMode::Digital,
+        Some(VolumeMode::Hardware) | None if hw => VolumeMode::Hardware,
+        _ => VolumeMode::Digital,
+    }
+}
+
+/// The master's share of a stream's gain in the mix: all of it on a Digital
+/// output, none on a Hardware one (the device applies it) or a Fixed one
+/// (the amplifier's knob is the volume), except that mute still silences a
+/// Fixed output.
+pub fn master_in_mix(mode: VolumeMode, master_gain: f32, muted: bool) -> f32 {
+    match mode {
+        VolumeMode::Digital => master_gain,
+        VolumeMode::Fixed if muted => 0.0,
+        VolumeMode::Fixed | VolumeMode::Hardware => 1.0,
+    }
+}
+
 struct State {
     sess: Session,
     ext: HashMap<u32, ExtOutput>,
@@ -159,6 +184,10 @@ struct State {
     state_dir: Option<String>,
     /// The device's channel count, as lyrad last reported it.
     device_channels: u8,
+    /// The built-in card lyrad has open: its name, and whether it has a
+    /// volume control of its own (`FromEngine::BuiltIn`).
+    builtin_card: String,
+    builtin_hw: bool,
     /// The seat file, when streams are gated on the active session.
     seat: Option<String>,
     controls: HashMap<u64, ControlConn>,
@@ -184,11 +213,12 @@ impl State {
         let keys: Vec<(u32, String, String)> =
             self.streams.iter().map(|(id, r)| (*id, r.user.clone(), r.app_id.clone())).collect();
         for (id, user, app) in keys {
-            // With a device that has its own volume, the master is applied
-            // there, not here (twice would be double attenuation).
-            let hw = self.hw_volume_active();
+            // The master is applied in the mix only for a Digital output: a
+            // Hardware one takes it on the device (twice would attenuate
+            // twice), a Fixed one stays at 100% (the amplifier's knob).
+            let mode = self.current_volume_mode();
             let v = self.volumes.user(&user);
-            let g = v.app(&app).gain() * if hw { 1.0 } else { v.master_gain() };
+            let g = v.app(&app).gain() * master_in_mix(mode, v.master_gain(), v.master_muted);
             self.streams.get_mut(&id).unwrap().user_gain = g;
         }
         for d in self.sess.resolve() {
@@ -250,6 +280,9 @@ impl State {
                 let key = self.output_key(d);
                 Output {
                     id: d.id,
+                    volume: self.volume_mode(d),
+                    volume_setting: self.outputs.volume_mode(&self.volume_key(d)),
+                    hw_volume: self.has_hw_volume(d),
                     balance: self.outputs.balance(&key),
                     channels: self.outputs.layout(&key),
                     spatial: self.outputs.spatial(&key),
@@ -391,9 +424,35 @@ impl State {
         self.ext.get(&id).map_or(0, |e| e.engine)
     }
 
-    /// The current output is a device that sets its own volume.
-    fn hw_volume_active(&self) -> bool {
-        self.ext.get(&self.sess.default_device).is_some_and(|e| e.hw_volume && e.writer.is_some())
+    /// The output's device has a volume control of its own: an external
+    /// device that said so, or the built-in card when lyrad found one.
+    fn has_hw_volume(&self, d: &Device) -> bool {
+        match self.ext.get(&d.id) {
+            Some(e) => e.hw_volume && e.writer.is_some(),
+            None => self.builtin_hw,
+        }
+    }
+
+    /// Where an output's volume mode is kept: by card for the built-in device
+    /// (the default unit can be any card, e.g. a USB DAC), else the output.
+    fn volume_key(&self, d: &Device) -> String {
+        if !self.ext.contains_key(&d.id) && !self.builtin_card.is_empty() {
+            return format!("card:{}", self.builtin_card);
+        }
+        self.output_key(d)
+    }
+
+    /// Where the output's volume is applied (lyra-hires.md §5): the user's
+    /// choice, else the device's control when it has one, else the mix.
+    /// `Hardware` needs a control; without one it is `Digital`.
+    fn volume_mode(&self, d: &Device) -> VolumeMode {
+        resolve_volume_mode(self.outputs.volume_mode(&self.volume_key(d)), self.has_hw_volume(d))
+    }
+
+    /// The current output's volume mode.
+    fn current_volume_mode(&self) -> VolumeMode {
+        let id = self.sess.default_device;
+        self.sess.devices.iter().find(|d| d.id == id).map_or(VolumeMode::Digital, |d| self.volume_mode(d))
     }
 
     /// Whose master volume a device's volume control moves: the seat's
@@ -405,17 +464,29 @@ impl State {
         }
     }
 
-    /// Tell the current output's device its volume, if it sets its own.
+    /// Tell the current output's device its volume, if it has a control:
+    /// the master for a Hardware output, 100% for a Fixed or Digital one (so
+    /// a control left low earlier doesn't hold the level down).
     fn send_device_volume(&mut self) {
-        if !self.hw_volume_active() {
+        let id = self.sess.default_device;
+        let Some(d) = self.sess.devices.iter().find(|d| d.id == id).copied() else { return };
+        if !self.has_hw_volume(&d) {
             return;
         }
-        let Some(user) = self.volume_user() else { return };
-        let v = self.volumes.user(&user);
-        let volume = if v.master_muted { 0.0 } else { v.master };
-        let id = self.sess.default_device;
-        if let Some(w) = self.ext.get_mut(&id).and_then(|e| e.writer.as_mut()) {
-            let _ = wire::send(w, &FromDevice::SetVolume { volume });
+        let volume = match self.volume_mode(&d) {
+            VolumeMode::Hardware => {
+                let Some(user) = self.volume_user() else { return };
+                let v = self.volumes.user(&user);
+                if v.master_muted { 0.0 } else { v.master }
+            }
+            VolumeMode::Fixed | VolumeMode::Digital => 1.0,
+        };
+        if let Some(e) = self.ext.get_mut(&id) {
+            if let Some(w) = e.writer.as_mut() {
+                let _ = wire::send(w, &FromDevice::SetVolume { volume });
+            }
+        } else {
+            let _ = wire::send(&mut self.lyrad, &ToEngine::SetHwVolume { volume });
         }
     }
 
@@ -745,7 +816,8 @@ fn serve_device(mut c: UnixStream, state: Shared, cfg: Arc<Config>, socket_caps:
             ToDevice::Volume { volume } => {
                 let mut st = state.lock().unwrap();
                 let Some(id) = mine else { continue };
-                if !st.ext.get(&id).is_some_and(|e| e.hw_volume) || st.sess.default_device != id {
+                let hardware = st.sess.devices.iter().find(|d| d.id == id).is_some_and(|d| st.volume_mode(d) == VolumeMode::Hardware);
+                if !hardware || st.sess.default_device != id {
                     continue;
                 }
                 let Some(user) = st.volume_user() else { continue };
@@ -873,6 +945,33 @@ fn serve_control(mut c: UnixStream, state: Shared, cfg: Arc<Config>, socket_caps
             ToControl::ListOutputs => {
                 let m = st.outputs_msg();
                 st.to_control(conn, &m);
+            }
+            ToControl::SetVolumeMode { output, mode } => {
+                // A system setting of the output, like its balance.
+                let Some(d) = st.sess.devices.iter().find(|d| d.id == output).copied() else {
+                    st.to_control(conn, &FromControl::Denied { code: DenyCode::NotGranted });
+                    continue;
+                };
+                if !st.active(user) {
+                    st.to_control(conn, &FromControl::Denied { code: DenyCode::NotGranted });
+                    continue;
+                }
+                if mode == Some(VolumeMode::Hardware) && !st.has_hw_volume(&d) {
+                    st.to_control(conn, &FromControl::Denied { code: DenyCode::BadFormat });
+                    continue;
+                }
+                let dir = st.state_dir.clone();
+                let key = st.volume_key(&d);
+                if let Err(e) = st.outputs.set_volume_mode(&dir, &key, mode) {
+                    eprintln!("choragusd: saving output settings: {e}");
+                }
+                eprintln!("choragusd: {key}: volume {:?} (chosen {:?})", st.volume_mode(&d), mode);
+                st.send_device_volume();
+                st.recompute();
+                let m = st.outputs_msg();
+                for c in st.controls.keys().copied().collect::<Vec<_>>() {
+                    st.to_control(c, &m);
+                }
             }
             ToControl::SetLayout { output, channels } => {
                 let Some(d) = st.sess.devices.iter().find(|d| d.id == output).copied() else {
@@ -1187,6 +1286,19 @@ fn serve_lyrad(mut rd: UnixStream, state: Shared) -> io::Error {
                 }
             }
             FromEngine::OutputInUse { device } => eprintln!("choragusd: lyrad mixes for output {device}"),
+            FromEngine::BuiltIn { name, hw_volume } => {
+                let mut st = state.lock().unwrap();
+                let name: String = name.chars().filter(|c| !c.is_control()).take(64).collect();
+                eprintln!("choragusd: built-in card \"{name}\"{}", if hw_volume { ", with its own volume" } else { "" });
+                st.builtin_card = name;
+                st.builtin_hw = hw_volume;
+                st.send_device_volume();
+                st.recompute();
+                let m = st.outputs_msg();
+                for c in st.controls.keys().copied().collect::<Vec<_>>() {
+                    st.to_control(c, &m);
+                }
+            }
             FromEngine::Layout { channels } => {
                 let mut st = state.lock().unwrap();
                 // The device refused a layout: keep what it has, and show it.
@@ -1275,6 +1387,8 @@ pub fn run(cfg: Config) -> io::Error {
         outputs: OutputSettings::load(&cfg.state_dir),
         state_dir: cfg.state_dir.clone(),
         device_channels: cfg.device_channels,
+        builtin_card: String::new(),
+        builtin_hw: false,
         seat: cfg.seat.then(|| cfg.seat_path.clone()),
         controls: HashMap::new(),
         tickets: HashMap::new(),
@@ -1335,4 +1449,34 @@ pub fn run(cfg: Config) -> io::Error {
         st.to_app(conn, &ToApp::StreamLost { stream });
     }
     e
+}
+
+#[cfg(test)]
+mod volume_mode_tests {
+    use super::*;
+
+    #[test]
+    fn automatic_uses_the_devices_control_when_it_has_one() {
+        assert_eq!(resolve_volume_mode(None, true), VolumeMode::Hardware);
+        assert_eq!(resolve_volume_mode(None, false), VolumeMode::Digital);
+    }
+
+    #[test]
+    fn the_users_choice_wins_but_hardware_needs_a_control() {
+        assert_eq!(resolve_volume_mode(Some(VolumeMode::Fixed), false), VolumeMode::Fixed);
+        assert_eq!(resolve_volume_mode(Some(VolumeMode::Fixed), true), VolumeMode::Fixed);
+        assert_eq!(resolve_volume_mode(Some(VolumeMode::Digital), true), VolumeMode::Digital);
+        assert_eq!(resolve_volume_mode(Some(VolumeMode::Hardware), true), VolumeMode::Hardware);
+        assert_eq!(resolve_volume_mode(Some(VolumeMode::Hardware), false), VolumeMode::Digital);
+    }
+
+    #[test]
+    fn only_a_digital_output_scales_the_mix_and_mute_always_silences() {
+        assert_eq!(master_in_mix(VolumeMode::Digital, 0.25, false), 0.25);
+        assert_eq!(master_in_mix(VolumeMode::Hardware, 0.25, false), 1.0);
+        assert_eq!(master_in_mix(VolumeMode::Fixed, 0.25, false), 1.0, "the amplifier is the volume");
+        assert_eq!(master_in_mix(VolumeMode::Fixed, 0.25, true), 0.0, "mute still mutes");
+        // A muted Digital master is already 0 in master_gain; Hardware mutes on the device.
+        assert_eq!(master_in_mix(VolumeMode::Hardware, 0.0, true), 1.0);
+    }
 }

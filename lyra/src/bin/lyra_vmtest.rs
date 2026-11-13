@@ -38,7 +38,7 @@
 //!       lyrad hangs up (only _choragus may talk to it), `ACCEPTED` otherwise.
 
 use lyra_protocol::client::{Client, Control};
-use lyra_protocol::wire::{self, FromControl, FromEngine, Role, StreamParams, ToControl, ToEngine};
+use lyra_protocol::wire::{self, FromControl, FromEngine, Role, StreamParams, ToControl, ToEngine, VolumeMode};
 use std::time::{Duration, Instant};
 
 fn die(m: String) -> ! {
@@ -85,6 +85,14 @@ fn ctl(sock: &str, args: &[String]) {
         "layout" => ToControl::SetLayout { output: 0, channels: a(1).parse().unwrap_or(2) },
         "spatial" => ToControl::SetSpatial { output: 0, on: a(1) == "1" },
         "app-spatial" => ToControl::SetAppSpatial { app_id: a(1), on: a(2) == "1" },
+        "outputs" => ToControl::ListOutputs,
+        "volume-mode" => ToControl::SetVolumeMode { output: 0, mode: match a(1).as_str() {
+            "auto" => None,
+            "digital" => Some(VolumeMode::Digital),
+            "hardware" => Some(VolumeMode::Hardware),
+            "fixed" => Some(VolumeMode::Fixed),
+            other => die(format!("volume-mode auto|digital|hardware|fixed, not {other}")),
+        } },
         other => die(format!("unknown ctl command {other}")),
     };
     u.send(&req).unwrap_or_else(|e| die(format!("send: {e}")));
@@ -98,7 +106,7 @@ fn ctl(sock: &str, args: &[String]) {
         }
         Ok(FromControl::Outputs { current, outputs }) => {
             for o in outputs {
-                println!("output {} \"{}\" balance {:+.2} {} ch{}{}", o.id, o.name, o.balance, o.channels, if o.spatial { " surround" } else { "" }, if o.id == current { " (current)" } else { "" });
+                println!("output {} \"{}\" balance {:+.2} {} ch{}{} volume {:?} (chosen {:?}, device control {})", o.id, o.name, o.balance, o.channels, if o.spatial { " surround" } else { "" }, if o.id == current { " (current)" } else { "" }, o.volume, o.volume_setting, o.hw_volume);
             }
         }
         Ok(m) => die(format!("unexpected {m:?}")),
