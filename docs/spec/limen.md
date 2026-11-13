@@ -117,6 +117,7 @@ doesn't know drops the message. An incompatible change is a new role name (`doc-
 | `share-target` | user | the app the user chose in the share sheet | `plain` | one share |
 | `media-player` | user | default media app | `plain` | as long as the parent wants |
 | `payment` | user | the user's payment app | `credential` | one payment |
+| `web-island` | system | the Navigator's engine host | `island` | as long as the page |
 | `map` | user | default map app | `plain` | as long as the parent wants |
 | `editor-extension` | user | the extension the user installed | `plain` | as long as the parent wants |
 
@@ -423,6 +424,9 @@ The slot op takes a **kind**:
 - `plain`: pinned, clipped to the parent, and nothing else.
 - `credential`: pinned, plus frescod's visibility record, `FILL` presses, and the frame that
   frescod draws (arca-autofill.md §4).
+- `island` (2026-11-14): pinned, plus frescod's frame and an origin tag (`live code:
+  <origin>`), and no pointer input while anything composed above overlaps it; the frame is
+  then dashed (navigator-ui.md §6.3, §14 step 6). Role `web-island`.
 
 Only limend may bind slots. The op has its own allowlist (`_limen`) instead of the whole
 window-management socket. `OP_WM_CREDENTIAL_SLOT` stays as the test stand-in until the general
@@ -445,7 +449,7 @@ renderer's, not frescod's, so windows are named by an **embed token** instead of
   `FRESCOD_SLOT_UIDS`, default `_limen`), `UNKNOWN_WINDOW` (2), or `INVALID` (3: the same window
   twice, a parent that is itself a slot, a child that hosts slots, a notification, a child
   already in another parent, a bad kind or rect).
-- `slot::kind::PLAIN` (0) and `CREDENTIAL` (1). Only `CREDENTIAL` gets the visibility record,
+- `slot::kind::PLAIN` (0), `CREDENTIAL` (1) and `ISLAND` (2). Only `CREDENTIAL` gets the visibility record,
   `FILL` and the frame.
 - `WindowHints.embed_pending` keeps a window off screen (not composed, hit or focused, and not
   listed to the WM) until it is bound. A child of either kind goes off screen again when it is

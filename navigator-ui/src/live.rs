@@ -96,6 +96,15 @@ fn send(w: &mut UnixStream, r: &Request) {
 
 fn ms(t: Instant) -> u128 { t.elapsed().as_millis() }
 
+/// A size as the prompt row says it.
+pub fn human(n: u64) -> String {
+    match n {
+        0..=999 => format!("{n} bytes"),
+        1000..=999_999 => format!("{:.0} KB", n as f64 / 1e3),
+        _ => format!("{:.1} MB", n as f64 / 1e6),
+    }
+}
+
 impl Live {
     /// Connect to navigatord at `path` and say hello. With `chrome`,
     /// navigatord opens the window's frescod connection over the chrome
@@ -312,9 +321,48 @@ impl Live {
                     match action {
                         LinkAction::Navigate { url, .. } => s.follow_link(&url, beside),
                         LinkAction::InDocument { fragment } => s.last_note = Some(format!("in-page link #{fragment} (scrolling to it comes later)")),
-                        LinkAction::Handoff { url, scheme } => s.last_note = Some(format!("{scheme} link {url}: hand-off comes in step 6")),
+                        LinkAction::Handoff { url, scheme } => s.handoff(&url, &scheme, crate::ui::now_ms()),
                         LinkAction::Blocked { why } => s.last_note = Some(format!("link refused: {why}")),
                     }
+                }
+                Event::File { id, url, name, size, origin, kind } => {
+                    // A link to a file (§6.4): the page it was going to be
+                    // is taken back, and the page it was on asks.
+                    let Some(i) = self.children.iter().position(|c| c.asked == Some(id)) else {
+                        send(&mut self.w, &Request::Discard { id });
+                        continue;
+                    };
+                    let key = self.children[i].key;
+                    eprintln!("navigator-ui: {url} is a file ({kind}, {size} bytes); asking");
+                    self.close(i);
+                    let prompt = crate::trail::Prompt::Download { id, file: name.clone(), size: human(size), origin, kind };
+                    let now = crate::ui::now_ms();
+                    let parent = s.store.trails.iter_mut().find(|t| t.id == key.0).and_then(|t| t.retract(key.1));
+                    let asked = match parent {
+                        Some(p) => s.ask_at((key.0, p), prompt, now),
+                        // Typed, with nowhere to go back to: the page says
+                        // what it is and asks.
+                        None => {
+                            if let Some(p) = s.store.page_by_key_mut(key.0, key.1) {
+                                p.title = name.clone();
+                            }
+                            if self.shown == Some(key) {
+                                s.live = Some(LivePage::File { url: url.clone(), name });
+                            }
+                            s.ask_at(key, prompt, now)
+                        }
+                    };
+                    if !asked {
+                        send(&mut self.w, &Request::Discard { id });
+                    }
+                    if self.shown == Some(key) && parent.is_some() {
+                        self.shown = None;
+                    }
+                }
+                Event::Saved { path, .. } => s.last_note = Some(format!("saved as {path}")),
+                Event::NotSaved { why, .. } => s.last_note = Some(format!("not saved: {why}")),
+                Event::Handed { url, ok, why } => {
+                    s.last_note = Some(if ok { format!("handed {url} on") } else { format!("{url} not handed on: {}", why.unwrap_or_default()) })
                 }
                 Event::Chrome { .. } => {}
             }
@@ -421,6 +469,9 @@ impl Live {
                     send(&mut self.w, &Request::Activate { id, page, href });
                 }
                 Out::Forget { jar, url } => send(&mut self.w, &Request::Forget { jar, url: Some(url) }),
+                Out::Save { id } => send(&mut self.w, &Request::Save { id }),
+                Out::Discard { id } => send(&mut self.w, &Request::Discard { id }),
+                Out::Hand { url, how } => send(&mut self.w, &Request::Hand { url, how }),
             }
         }
         // Unrecorded trails that closed: their jars are forgotten.

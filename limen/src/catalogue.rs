@@ -8,6 +8,9 @@ pub enum SlotKind {
     /// Pinned, plus the visibility record, `FILL` presses and the frame
     /// (arca-autofill.md §4).
     Credential,
+    /// Live code in a page (navigator-ui.md §6.3): frescod's frame and
+    /// origin tag, no input while anything overlaps it.
+    Island,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -30,6 +33,9 @@ pub struct Role {
 
 pub const ARCA: &str = "org.atrium.arca";
 pub const VESTIBULUM: &str = "org.atrium.vestibulum";
+/// The Navigator's engine jail host (legacy-web tier 4): a page's live
+/// islands.
+pub const NAVIGATOR_ENGINE: &str = "org.atrium.navigator.engine";
 
 pub const ROLES: &[Role] = &[
     Role { name: "credential", provider: Provider::System(ARCA), slot: SlotKind::Credential, takes_fd: false },
@@ -39,6 +45,7 @@ pub const ROLES: &[Role] = &[
     Role { name: "share-target", provider: Provider::User, slot: SlotKind::Plain, takes_fd: false },
     Role { name: "media-player", provider: Provider::User, slot: SlotKind::Plain, takes_fd: true },
     Role { name: "payment", provider: Provider::User, slot: SlotKind::Credential, takes_fd: false },
+    Role { name: "web-island", provider: Provider::System(NAVIGATOR_ENGINE), slot: SlotKind::Island, takes_fd: false },
     Role { name: "map", provider: Provider::User, slot: SlotKind::Plain, takes_fd: false },
     Role { name: "editor-extension", provider: Provider::User, slot: SlotKind::Plain, takes_fd: false },
 ];

@@ -1137,5 +1137,64 @@ Each step runs in the VM on headless frescod before the next.
      session cookies ending with the last view, and moving a branch into its own trail with its
      jar.
 6. **Islands and prompts.** The `island` slot kind, the prompt row with its press rule, downloads,
-   app hand-off.
+   app hand-off. *Built 2026-11-14*:
+   - **The prompt row's rules** (§6.4), in `navigator-ui/src/shell.rs`: a press counts only once
+     the row has been still and uncovered for 500 ms. The clock starts again whenever the row
+     moves (the rail folding, the window resizing) or the UI's own suggestion list or tier
+     popover covers it, and a press while it is covered never counts. One prompt shows at a
+     time per page, with at most three waiting behind it, each getting its own 500 ms. A page
+     can't ask more than once a second, the same question is never queued twice, and a prompt
+     answered *Cancel* or *Not now* doesn't come back for that page while it stays loaded.
+     Other programs' windows over the row are not yet checked: frescod's visibility record
+     covers credential slots and sheets, not the UI's own row.
+   - **Downloads.** navigatord decides from the fetched bytes, not from anything the site
+     claims, whether an `Open` is a document or a file (`navigatord/src/files.rs`). The
+     fetcher's reply carries no media type anyway. Markup and UTF-8 text are documents; a
+     known signature (PDF, archives, images, media, programs, fonts) or binary bytes make a
+     file, which is never converted.
+     - navigatord holds the file in memory (at most four per UI, ten minutes, 64 MB; the
+       fetcher's own body limit is 8 MB today) and answers `File` instead of `Opened`.
+     - The UI takes the would-be page back out of the trail and asks on the page the link
+       was on: *Cancel* · *Save*, with the name, size, kind and origin. A typed address with
+       nowhere to go back to stays as a page that says it is a file.
+     - *Save* has navigatord write it to `NAVIGATORD_DOWNLOADS` (default `~/Downloads`). The
+       name is made safe (no path, no leading dot, no control characters, bounded, the
+       extension kept or added), the file is created new (never over a file, `name (2).ext`,
+       no link followed) with mode 0644 so it is never executable, and the address it came
+       from is recorded on it as the user extended attribute `atrium.origin`. *Open in
+       viewer* waits for a jailed viewer.
+   - **Hand-offs** (threat model §2.10). `NAVIGATORD_SCHEMES` lists the schemes the person
+     allowed (e.g. `mailto`), and `atrium-app` is always allowed. A link to one of them is
+     `Handoff` and asks first: *Not now* · *Open in Mail* for `mailto:`, *Not now* · *Open*
+     · *Try it* for an app, named by its host part. The answer goes back as `Hand { url, how }`,
+     and navigatord hands on only a link it decided as a hand-off on that same connection,
+     once, to `NAVIGATORD_OPENER` (`<opener…> open|try <url>`, no shell). Without an opener
+     it says nothing here takes hand-offs. The app's publisher and the capabilities it will
+     ask for are not shown yet: that needs Nomenclator and Opifex.
+   - **Islands** (§6.3). frescod has a third slot kind, `slot::kind::ISLAND` (2), and Limen
+     has the role `web-island` (provider `org.atrium.navigator.engine`, slot `Island`). An
+     island is a sibling slot of the page in the UI's window, stacked above it by `z`, since a
+     slot can't host slots.
+     - frescod draws a 1 px amber frame just outside it, and a tag in a pill above its top
+       left corner (below it when there is no room under the strip). The tag reads `live code:
+       <origin>`, the origin being what the window's broker set over the chrome channel, or
+       just `live code`. The page can't draw over either, in split or direct mode.
+     - While anything composed above the island overlaps it (the page's own slots or
+       popups, another window; not frescod's chrome), its frame is dashed and
+       `Compositor::pointer_target` gives none of its clicks to it, wherever they land on
+       the island. The cover takes its own.
+     - Not yet: keyboard focus already on an island when it becomes covered keeps it, and
+       nothing produces islands until the engine jail (legacy-web tier 4) exists, so the
+       Navigator has no `web-island` provider and draws no live parts in the tier chip.
+     - Tests: `fresco-scene-server` (`a_covered_island_takes_no_pointer_input`), frescod's
+       `chrome` tests (frame, tag, dashes, placement; 61/61 run in the VM), and
+       `atrium-activation-probe` through `scripts/island-probe-vm.sh` in split mode, 24/24.
+       It checks that an island takes clicks, takes none while a slot covers its corner, and
+       takes them again once uncovered.
+   - Checked in `scripts/navigator-live-vm.sh` §"prompts". A PDF link asks and stays on its
+     page, and Save writes it 0644 with its origin. A `mailto:` link and an `atrium-app:` link
+     are each handed on once, through a stand-in opener. The whole script ran 38/39 on
+     2026-11-14. The one miss was the check itself, which read the first navigatord's log
+     after the parking section had restarted it. The line was in the second log, and the
+     check now reads both.
 7. **Reading controls, find, history view, keyboard map, accessibility tree.**

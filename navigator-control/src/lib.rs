@@ -64,7 +64,34 @@ pub enum Request {
     Activate { id: u32, page: String, href: String },
     /// The UI shows no page (Start, a stop page): no origin in the strip.
     Blank,
+    /// The person pressed Save on a file an `Open` turned out to be
+    /// (`File`, same `id`, navigator-ui.md §6.4). navigatord writes it to
+    /// the downloads directory with its source origin recorded, never
+    /// executable; answered by `Saved` or `NotSaved`.
+    Save { id: u32 },
+    /// The person cancelled that file: navigatord drops the bytes.
+    Discard { id: u32 },
+    /// The person pressed a hand-off prompt's answer for a link navigatord
+    /// decided as `Handoff` on this connection (threat model §2.10). Only
+    /// such a link is handed on; answered by `Handed`.
+    Hand { url: String, how: Hand },
 }
+
+/// How a hand-off is taken (navigator-ui.md §6.4).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Hand {
+    /// To the scheme's handler (`mailto:` to Mail; an app installed).
+    Open,
+    /// An `atrium-app:` link in an ephemeral jail that keeps nothing
+    /// (insula trial launch).
+    Try,
+}
+
+/// Files bigger than this are not kept for saving (navigatord holds them in
+/// memory until the person answers).
+pub const FILE_MAX: u64 = 64 << 20;
+/// The longest file name navigatord reports or writes.
+pub const NAME_MAX: usize = 128;
 
 /// What a link does (backend `links::LinkAction`, and refusals).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -88,6 +115,16 @@ pub enum Event {
     Opened { id: u32, url: String, title: String, insecure: bool, ticket: Ticket, ms: u32, saved: String, from: Source, knows: bool, note: Option<String> },
     Failed { id: u32, url: String, why: String },
     Link { id: u32, action: LinkAction },
+    /// The page an `Open` asked for is a file, not a document: navigatord
+    /// keeps it until `Save` or `Discard` (and drops it unanswered after
+    /// a while). `name` is a safe file name, `origin` the site it came
+    /// from, `kind` what its bytes look like ("PDF", "ZIP archive", …).
+    File { id: u32, url: String, name: String, size: u64, origin: String, kind: String },
+    /// Written: `path` is where.
+    Saved { id: u32, path: String },
+    NotSaved { id: u32, why: String },
+    /// A hand-off was passed to its handler, or why not.
+    Handed { url: String, ok: bool, why: Option<String> },
 }
 
 /// A persona's jar (navigator-ui.md §2.4): Personal, or one Unrecorded

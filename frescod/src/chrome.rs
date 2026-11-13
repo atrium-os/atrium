@@ -137,10 +137,14 @@ const STRIP_COLOR: [f32; 4] = [0.08, 0.08, 0.1, 1.0];
 /// each is, and whether it opened below its icon; a label in the gap
 /// frescod leaves between the icon and the panel names it.
 #[allow(clippy::too_many_arguments)]
-pub fn build(screen_w: u32, focus: Option<u16>, origin: impl Fn(u16) -> Option<String>, shown: &[(u32, [i32; 4])], slots: &[[i32; 4]], covers: &[[i32; 4]], hosted: &[([i32; 4], String, bool)]) -> WindowFrame {
+#[allow(clippy::too_many_arguments)]
+pub fn build(screen_w: u32, focus: Option<u16>, origin: impl Fn(u16) -> Option<String>, shown: &[(u32, [i32; 4])], slots: &[[i32; 4]], covers: &[[i32; 4]], hosted: &[([i32; 4], String, bool)], islands: &[Island]) -> WindowFrame {
     let sw = screen_w as i32;
     let mut rects = vec![rect(0, 0, sw, STRIP_H, STRIP_COLOR)];
     let mut bottom = STRIP_H;
+    for i in islands {
+        bottom = bottom.max(island_frame(&mut rects, i, STRIP_H));
+    }
     for (r, name, below) in hosted {
         bottom = bottom.max(hosted_label(&mut rects, *r, name, *below));
     }
@@ -205,6 +209,65 @@ fn hosted_label(out: &mut Vec<SceneNode>, [x0, y0, x1, y1]: [i32; 4], name: &str
 /// The label's height.
 const LABEL_H: i32 = 20;
 
+/// An island slot as composed (navigator-ui.md §6.3): its screen rect,
+/// whether anything above it overlaps it, and its origin if the window's
+/// broker named one over the chrome channel.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Island {
+    pub rect: [i32; 4],
+    pub covered: bool,
+    pub origin: Option<String>,
+}
+
+impl Island {
+    /// What its tag says, in the characters the chrome font draws.
+    pub fn tag(&self) -> String {
+        match self.origin.as_deref().filter(|o| !o.is_empty()) {
+            Some(o) => format!("live code: {o}"),
+            None => "live code".into(),
+        }
+    }
+}
+
+/// The island frame's colour: the tier indicator's amber (§6.3).
+const ISLAND_COLOR: [f32; 4] = [0.96, 0.62, 0.12, 1.0];
+/// A covered island's frame: dashes this long, gaps this long.
+const DASH: i32 = 6;
+const GAP: i32 = 4;
+
+/// A 1 px frame just outside the island, dashed while it is covered,
+/// and its tag in a pill above its top left corner (below it when there
+/// is no room above `top`). Returns the bottom edge drawn.
+fn island_frame(out: &mut Vec<SceneNode>, i: &Island, top: i32) -> i32 {
+    let [x0, y0, x1, y1] = i.rect;
+    let (fx0, fy0, fx1, fy1) = (x0 - 1, y0 - 1, x1 + 1, y1 + 1);
+    let mut line = |a: i32, b: i32, horizontal: bool, at: i32| {
+        if !i.covered {
+            out.push(if horizontal { rect(a, at, b - a, 1, ISLAND_COLOR) } else { rect(at, a, 1, b - a, ISLAND_COLOR) });
+            return;
+        }
+        let mut p = a;
+        while p < b {
+            let e = (p + DASH).min(b);
+            out.push(if horizontal { rect(p, at, e - p, 1, ISLAND_COLOR) } else { rect(at, p, 1, e - p, ISLAND_COLOR) });
+            p = e + GAP;
+        }
+    };
+    line(fx0, fx1, true, fy0);
+    line(fx0, fx1, true, fy1 - 1);
+    line(fy0 + 1, fy1 - 1, false, fx0);
+    line(fy0 + 1, fy1 - 1, false, fx1 - 1);
+    let tag = i.tag();
+    let w = text_width(&tag) + 2 * PAD + 6;
+    let above = fy0 - LABEL_H;
+    let y = if above >= top { above } else { fy1 };
+    let mut pill = rect(fx0, y, w, LABEL_H, ISLAND_COLOR);
+    pill.radius = 3.0;
+    out.push(pill);
+    text(out, &tag, fx0 + PAD + 3, y + (LABEL_H - glyphs::LINE) / 2, w - 2 * PAD);
+    fy1.max(y + LABEL_H)
+}
+
 /// What the label over a granted panel names its app by: the launch
 /// registry's id for `uid` (`uid-N` when it has none), in the characters
 /// the chrome font draws. The registry is read again every few seconds.
@@ -248,12 +311,16 @@ fn uncovered(r: [i32; 4], covers: &[[i32; 4]]) -> Vec<[i32; 4]> {
 
 /// Direct mode has no strip, so only the slots' frames go on top: a layer
 /// at (0, 0) as wide and tall as the lowest, rightmost frame needs.
-pub fn slot_frames(slots: &[[i32; 4]]) -> Option<WindowFrame> {
-    if slots.is_empty() {
+pub fn slot_frames(slots: &[[i32; 4]], islands: &[Island]) -> Option<WindowFrame> {
+    if slots.is_empty() && islands.is_empty() {
         return None;
     }
     let mut rects = Vec::new();
     let (mut right, mut bottom) = (0, 0);
+    for i in islands {
+        bottom = bottom.max(island_frame(&mut rects, i, 0));
+        right = right.max(i.rect[2] + 1).max(i.rect[0] + text_width(&i.tag()) + 4 * PAD);
+    }
     for &s in slots {
         bottom = bottom.max(slot_frame(&mut rects, s));
         right = right.max(s[2] + RING);
@@ -278,11 +345,11 @@ mod tests {
             f.rects.iter().any(|n| n.color == RING_COLOR && (n.position[0] as i32..(n.position[0] + n.size[0]) as i32).contains(&x)
                 && (n.position[1] as i32..(n.position[1] + n.size[1]) as i32).contains(&y))
         };
-        let open = build(1280, Some(5), |_| None, &shown, &[], &[], &[]);
+        let open = build(1280, Some(5), |_| None, &shown, &[], &[], &[], &[]);
         assert!(lit(&open, 800, 62) && lit(&open, 600, 62));
         // A bar menu over the window's top edge hides the ring under it only.
         let menu = [679, 56, 975, 92];
-        let under = build(1280, Some(5), |_| None, &shown, &[], &[menu], &[]);
+        let under = build(1280, Some(5), |_| None, &shown, &[], &[menu], &[], &[]);
         assert!(!lit(&under, 800, 62) && !lit(&under, 679, 63) && !lit(&under, 974, 62));
         assert!(lit(&under, 678, 62) && lit(&under, 975, 62) && lit(&under, 0, 300) && lit(&under, 640, 669));
         assert_eq!(uncovered([0, 0, 10, 10], &[[2, 2, 4, 4]]).iter().map(|[a, b, c, d]| (c - a) * (d - b)).sum::<i32>(), 96);
@@ -291,7 +358,7 @@ mod tests {
     #[test]
     fn a_granted_panel_gets_a_label_naming_its_app() {
         let gap = fresco_scene_server::window::HOSTED_LABEL_GAP as i32;
-        let f = build(1280, None, |_| None, &[], &[], &[], &[([900, 62 + gap, 1200, 362], "org.example.clip".into(), true)]);
+        let f = build(1280, None, |_| None, &[], &[], &[], &[([900, 62 + gap, 1200, 362], "org.example.clip".into(), true)], &[]);
         let pill = f.rects.iter().find(|n| n.color == STRIP_COLOR && n.position[0] == 900.0 && n.radius > 0.0).expect("a label");
         let (top, bottom) = (pill.position[1] as i32, (pill.position[1] + pill.size[1]) as i32);
         assert!(top >= 62 && bottom <= 62 + gap, "in the gap above the panel: {top}..{bottom}");
@@ -305,8 +372,8 @@ mod tests {
 
     #[test]
     fn slot_frames_cover_each_slot_and_its_tab() {
-        assert!(super::slot_frames(&[]).is_none());
-        let f = super::slot_frames(&[[120, 320, 320, 360]]).unwrap();
+        assert!(super::slot_frames(&[], &[]).is_none());
+        let f = super::slot_frames(&[[120, 320, 320, 360]], &[]).unwrap();
         assert!(f.size.0 >= 320 && f.size.1 >= 360);
         assert!(f.rects.iter().any(|r| r.position[0] < 120.0 - super::TAB as f32 + 1.0));
     }
@@ -321,5 +388,30 @@ mod tests {
             assert_eq!(g.5.len(), (g.3 * g.4) as usize);
             assert!(glyphs::ASCENT - g.2 >= -1 && glyphs::ASCENT - g.2 + g.4 as i32 <= STRIP_H, "{:?}", g.0 as char);
         }
+    }
+
+    #[test]
+    fn an_island_is_framed_and_tagged_and_dashed_while_covered() {
+        let at = [200, 300, 600, 500];
+        let clear = Island { rect: at, covered: false, origin: Some("media.example".into()) };
+        assert_eq!(clear.tag(), "live code: media.example");
+        assert_eq!(Island { origin: None, ..clear.clone() }.tag(), "live code");
+        let sides = |f: &WindowFrame| f.rects.iter().filter(|n| n.color == ISLAND_COLOR && n.radius == 0.0).count();
+        let f = build(1280, None, |_| None, &[], &[], &[], &[], &[clear.clone()]);
+        assert_eq!(sides(&f), 4, "four solid sides");
+        // The frame is just outside the island: none of its pixels.
+        assert!(f.rects.iter().filter(|n| n.color == ISLAND_COLOR && n.radius == 0.0).all(|n| {
+            let (x, y, w, h) = (n.position[0] as i32, n.position[1] as i32, n.size[0] as i32, n.size[1] as i32);
+            x + w <= at[0] || x >= at[2] || y + h <= at[1] || y >= at[3]
+        }));
+        let pill = f.rects.iter().find(|n| n.color == ISLAND_COLOR && n.radius > 0.0).expect("a tag");
+        assert_eq!(pill.position[1] as i32, at[1] - 1 - LABEL_H, "above the island");
+        let covered = build(1280, None, |_| None, &[], &[], &[], &[], &[Island { covered: true, ..clear.clone() }]);
+        assert!(sides(&covered) > 20, "dashed");
+        // No room above, under the strip: the tag goes below.
+        let high = build(1280, None, |_| None, &[], &[], &[], &[], &[Island { rect: [10, 30, 200, 100], ..clear.clone() }]);
+        let pill = high.rects.iter().find(|n| n.color == ISLAND_COLOR && n.radius > 0.0).unwrap();
+        assert_eq!(pill.position[1] as i32, 101);
+        assert!(super::slot_frames(&[], &[clear]).is_some(), "direct mode frames islands too");
     }
 }

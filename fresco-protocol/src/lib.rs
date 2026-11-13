@@ -2093,6 +2093,12 @@ pub mod slot {
         /// Also the visibility record, `FILL` and frescod's frame
         /// (arca-autofill.md §4).
         pub const CREDENTIAL: u8 = 1;
+        /// Live code inside a page (navigator-ui.md §6.3): frescod draws a
+        /// 1 px frame round it and a tag above it naming its origin
+        /// ("live code · media.example"), which the page under it can't
+        /// draw over. While anything composed above it overlaps it, the
+        /// island takes no pointer input and its frame is dashed.
+        pub const ISLAND: u8 = 2;
     }
 
     pub mod refusal {

@@ -50,6 +50,7 @@ impl Compositor for Frescod {
         let kind = match kind {
             SlotKind::Plain => slot::kind::PLAIN,
             SlotKind::Credential => slot::kind::CREDENTIAL,
+            SlotKind::Island => slot::kind::ISLAND,
         };
         match self.ask(&SlotBind { parent, child, kind, rect, z, keep_shown: false }) {
             Ok(SlotBindResult::Ok { parent_uid, child_uid }) => Ok((parent_uid, child_uid)),

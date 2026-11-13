@@ -1425,6 +1425,18 @@ fn render_one_frame(
     /* Credential slots (arca-autofill.md §4): what this frame shows of
      * each, before frescod's own chrome goes on top. */
     let slots = credential::observe_frame(comp, &rects, [0, top as i32, screen_w as i32, screen_h as i32], activation::now_ns());
+    /* Islands (navigator-ui.md §6.3): framed and tagged on top, dashed
+     * while anything composed above overlaps them (they then take no
+     * input: Compositor::pointer_target). */
+    let island_ids: Vec<u32> = {
+        let c = comp.lock().unwrap();
+        rects.iter().map(|&(id, _)| id).filter(|&id| u16::try_from(id).is_ok_and(|w| c.is_island(w))).collect()
+    };
+    let island_at = |id: u32, origin: Option<String>| -> Option<chrome::Island> {
+        let r = rects.iter().find(|(l, _)| *l == id)?.1;
+        let covered = fresco_scene_server::window::island_covered(rects.iter().map(|&(l, r)| (l as u16, r)), id as u16);
+        Some(chrome::Island { rect: r, covered, origin })
+    };
     /* Trusted chrome (F4d), split mode: frescod's own layer, on top. */
     if let Some(b) = split {
         /* The focus read and released first: origin() takes the broker's
@@ -1454,11 +1466,12 @@ fn render_one_frame(
             (c.focus, covers, hosted, focus_parent)
         };
         let origin = |id: u16| b.origin(id).or_else(|| focus_parent.filter(|_| focus.map(|f| f as u16) == Some(id)).and_then(|p| b.origin(p)));
-        let mut c = chrome::build(screen_w, focus, origin, &rects, &slots, &covers, &hosted);
+        let islands: Vec<chrome::Island> = island_ids.iter().filter_map(|&id| island_at(id, u16::try_from(id).ok().and_then(|w| b.origin(w)))).collect();
+        let mut c = chrome::build(screen_w, focus, origin, &rects, &slots, &covers, &hosted, &islands);
         c.size.1 = c.size.1.min(screen_h);
         rects.push((c.id, [0, 0, c.size.0 as i32, c.size.1 as i32]));
         windows.push(c);
-    } else if let Some(mut c) = chrome::slot_frames(&slots) {
+    } else if let Some(mut c) = chrome::slot_frames(&slots, &island_ids.iter().filter_map(|&id| island_at(id, None)).collect::<Vec<_>>()) {
         /* Direct mode: no strip, but slots still get their frame. */
         c.size = (c.size.0.min(screen_w), c.size.1.min(screen_h));
         rects.push((c.id, [0, 0, c.size.0 as i32, c.size.1 as i32]));

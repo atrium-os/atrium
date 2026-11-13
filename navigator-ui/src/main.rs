@@ -179,10 +179,18 @@ fn main() -> std::io::Result<()> {
             }
             StepResult::Timeout => {}
         }
-        if let Some(l) = &mut live {
+        {
+            // The prompt row's 500 ms (§6.4) starts again when it moves or
+            // something covers it.
             let mut s = state.get_cloned();
-            if l.tick(&mut s) {
-                navigator_ui::ui::trace(&mut s);
+            let mut changed = s.settle(now_ms());
+            if let Some(l) = &mut live {
+                if l.tick(&mut s) {
+                    navigator_ui::ui::trace(&mut s);
+                    changed = true;
+                }
+            }
+            if changed {
                 state.set(s);
             }
         }

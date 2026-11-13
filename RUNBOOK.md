@@ -5612,9 +5612,9 @@ Ctrl-B through frescod's injector and checks the `NAVIGATOR_UI_TRACE` lines. Coo
 forum-wm's placement (window top at y 62 with no bar running). By hand:
 `FRESCO_SOCKET=… navigator-ui --scene start --dark`; `NAVIGATOR_UI_SECS`, `NAVIGATOR_UI_SIZE=WxH`.
 
-### 13.6d Navigator: live pages, trails on disk, parking (`scripts/navigator-live-vm.sh`)
+### 13.6d Navigator: live pages, trails on disk, parking, prompts (`scripts/navigator-live-vm.sh`)
 
-Steps 2 to 4 of docs/spec/navigator-ui.md §14. With the VM up:
+Steps 2 to 6 of docs/spec/navigator-ui.md §14. With the VM up:
 
     sh scripts/navigator-live-vm.sh [out-dir]       # ~20 min under TCG, BUILD=0 skips the cross-build
 
@@ -5651,6 +5651,24 @@ whose site knows you carries its jar's cookie, an Unrecorded trail's jar is its 
 trail closes, Forget this site empties the Personal jar, and a restarted navigatord forgets every
 Unrecorded jar. A `hash mismatch` ABORT is TCG's scp landing zeros:
 run it again with `BUILD=0`.
+
+Step 6's prompts run after presence (ui8.log). navigatord gets `NAVIGATORD_DOWNLOADS=$S/downloads`,
+`NAVIGATORD_SCHEMES=mailto` and a stand-in `NAVIGATORD_OPENER` (`sh $S/opener.sh`, which appends its
+arguments to `$S/opener.log`). The script presses the fixture's PDF link, finds the download prompt with
+the trail still on its page, and presses Save. It checks `survey.pdf` is 0644 with its address in
+`getextattr user atrium.origin`. Then the `mailto:` and `atrium-app:` links each ask and are handed on
+once (`open mailto:…`, `try atrium-app://…`). The prompt row's primary answer is pressed at the window's
+right edge (the trace's `w=`), at least 500 ms after the row appeared. Islands are checked by
+`atrium-activation-probe`, which binds an `ISLAND` slot, covers its corner with a plain slot, and checks
+clicks. `scripts/island-probe-vm.sh` (logs in `$OUT`, default /tmp) deploys the probe and the current frescod and runs it in split mode with
+`PROBE_SLOTS_ONLY=1` (24/24 on 2026-11-14). The probe's other sections, clipboard, drag and toasts, need a
+full session with Forum, and fail without one. frescod's unit tests run only on FreeBSD: cross-build
+them with `cargo test --release --target aarch64-unknown-freebsd --no-run`, then copy and run the binary
+in the VM (61/61).
+
+Don't run host builds while a VM script runs: under TCG they starve the guest (ssh times out in banner
+exchange). A full host disk hangs the guest outright. Free `*/target/debug` first, and check the image
+with `qemu-img check ~/atrium-vm/vm.qcow2` after a hang.
 
 Cross-building prerender and navigatord compiles ring's C: the script sets `CC_aarch64_unknown_freebsd`
 to clang with `--sysroot`, which needs FreeBSD's headers in the sysroot. If `assert.h` is missing:

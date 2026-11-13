@@ -6,6 +6,9 @@
 <p class="nav"><a href="http://old-atlas.example/">The old atlas (http)</a></p>
 <p class="nav"><a href="javascript:alert(1)">A script link</a></p>
 <p class="nav"><a href="#plan">The plan, further down</a></p>
+<p class="nav"><a href="/files/survey.pdf">The survey (PDF)</a></p>
+<p class="nav"><a href="mailto:curator@atlas.example">Write to the curator</a></p>
+<p class="nav"><a href="atrium-app://atlas.example/viewer">Open in the atlas app</a></p>
 <p>An <b>atrium</b> is the open central court of an ancient Roman house, lit from above through the compluvium, an opening in the roof. Rain falling through it was gathered in the impluvium, a shallow pool set into the floor, and led to a cistern below.</p>
 <p>The rooms of the house opened onto the atrium: the tablinum, where the master of the house received clients, faced the entrance across it, and small rooms along its sides served for storage and sleeping.</p>
 <p id="plan">The plan of a typical house ran from the street door through the fauces into the atrium, then the tablinum, and beyond it the peristyle garden.</p>

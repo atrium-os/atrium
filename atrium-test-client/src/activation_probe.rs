@@ -142,6 +142,10 @@ fn main() {
     for c in [&mut p.app, &mut p.wm] {
         while let Ok(Some(_)) = c.wait_event(Some(Duration::from_millis(100))) {}
     }
+    // PROBE_SLOTS_ONLY: only the slot and island checks (the rest need
+    // a full session: Forum, a clipboard owner, a toast band).
+    let slots_only = std::env::var_os("PROBE_SLOTS_ONLY").is_some();
+    if !slots_only {
 
     let (t, w) = p.press(&format!("KEY {HID_V} 1 {CTRL}"));
     p.inject(&format!("KEY {HID_V} 0 {CTRL}"));
@@ -250,6 +254,7 @@ fn main() {
     let (t, _) = p.press(&format!("KEY {HID_A} 1 0"));
     p.inject(&format!("KEY {HID_A} 0 0"));
     p.check(t != [0; 16], "keys still go to the app under it");
+    }
 
     // Credential slots (arca-autofill.md §4): a FILL press counts only on
     // a slot frescod saw whole, uncovered, big enough and still for 500 ms.
@@ -298,6 +303,7 @@ fn main() {
         255
     };
     let still = || std::thread::sleep(Duration::from_millis(800));
+    if !slots_only {
     bind(&mut p, [20.0, 20.0, 200.0, 40.0]); // screen (120, 320) to (320, 360)
     let r = fill(&mut p, &mut arca, 220, 340);
     p.check(r == refusal::OBSCURED, &format!("a slot that just appeared does not fill ({r})"));
@@ -338,6 +344,7 @@ fn main() {
         // frescod captures at most every 200 ms; take it while we're up.
         std::thread::sleep(Duration::from_millis(1500));
         let _ = std::fs::copy(&png, format!("{png}.slot.png"));
+    }
     }
 
     // Limen slots (limen.md §5): an embed child stays off screen until
@@ -409,6 +416,46 @@ fn main() {
     p.check(h, "its parent went: off screen, not top-level");
     let r = slot_bind(&mut p, ht, et, sk::PLAIN, Some([0.0, 0.0, 50.0, 50.0]));
     p.check(r == SlotBindResult::Refused { reason: sno::UNKNOWN_WINDOW }, "a gone window's token is dead");
+
+    // Islands (navigator-ui.md §6.3): a slot of kind ISLAND takes clicks
+    // while nothing above it overlaps it, and none while something does.
+    let embed = |colour: [f32; 3], at: (i32, i32)| -> (Connection, [u8; 16]) {
+        let mut c = Connection::connect(sock).expect("app socket");
+        let hints = WindowHints { initial_position: Some(at), embed_pending: true, ..WindowHints::default() };
+        let id = c.window_create(10, 10, "embed", hints).expect("window");
+        c.set_default_window(id as u16);
+        c.scene_frame_begin().unwrap();
+        c.scene_node_rect(1, RectParams { x: 0.0, y: 0.0, w: 2000.0, h: 2000.0, r: colour[0], g: colour[1], b: colour[2], a: 1.0, radius: 0.0 }).unwrap();
+        c.scene_frame_end().unwrap();
+        let t = token_of(&mut c);
+        (c, t)
+    };
+    let bind_z = |p: &mut Probe, parent: [u8; 16], child: [u8; 16], kind: u8, rect: Option<[f32; 4]>, z: u8| -> SlotBindResult {
+        let b = fresco_protocol::encode(&SlotBind { parent, child, kind, rect, z, keep_shown: false }).unwrap();
+        fresco_protocol::decode(&p.ask(sop::BIND, b)).unwrap()
+    };
+    let (mut ihost, _) = window(sock, (500, 450), (400, 250), [0.85, 0.85, 0.8, 1.0]);
+    let iht = token_of(&mut ihost);
+    let (mut isl, ist) = embed([0.9, 0.6, 0.1], (520, 470));
+    let (mut over, ot) = embed([0.1, 0.4, 0.4], (680, 540));
+    let r = bind_z(&mut p, iht, ist, sk::ISLAND, Some([20.0, 20.0, 200.0, 100.0]), 1); // screen (520, 470) to (720, 570)
+    p.check(matches!(r, SlotBindResult::Ok { .. }), &format!("an island binds ({r:?})"));
+    still();
+    let h = hits(&mut p, &mut isl, 560, 500);
+    p.check(h, "a clear island takes the click");
+    let r = bind_z(&mut p, iht, ot, sk::PLAIN, Some([180.0, 90.0, 100.0, 60.0]), 2); // (680, 540) to (780, 600), over its corner
+    p.check(matches!(r, SlotBindResult::Ok { .. }), &format!("something of the page's over its corner ({r:?})"));
+    still();
+    let h = !hits(&mut p, &mut isl, 560, 500);
+    p.check(h, "a covered island takes no click, even away from the cover");
+    let h = hits(&mut p, &mut over, 760, 590);
+    p.check(h, "the cover takes its own");
+    let _ = bind_z(&mut p, iht, ot, sk::PLAIN, None, 2);
+    still();
+    let h = hits(&mut p, &mut isl, 560, 500);
+    p.check(h, "uncovered again: the island takes the click");
+    let _ = bind_z(&mut p, iht, ist, sk::PLAIN, None, 1);
+    drop((ihost, isl, over));
 
     // Embed-only connections (fresco-video.md §8, S1): limend turns a new
     // activation-socket stream into the child's frescod connection; every

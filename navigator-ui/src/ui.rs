@@ -75,13 +75,20 @@ pub fn trace(s: &mut Shell) {
     if std::env::var_os("NAVIGATOR_UI_TRACE").is_some() {
         let t = s.store.trail();
         eprintln!(
-            "navigator-ui: trace trail=\"{}\" pages={} trails={} earlier={} where={} prompt={} rail={} url={} live={} page={},{}",
+            "navigator-ui: trace trail=\"{}\" pages={} trails={} earlier={} where={} prompt={} rail={} url={} live={} page={},{} w={}",
             t.title(),
             t.pages.len(),
             s.store.trails.len(),
             s.store.earlier.len(),
             s.editing.as_ref().map_or("-".to_string(), |e| format!("\"{}\"", e.edit.text())),
-            t.page().is_some_and(|p| p.asked.is_some()),
+            t.page().and_then(|p| p.asked.as_ref()).map_or("-", |a| match a.prompt {
+                Prompt::Download { .. } => "download",
+                Prompt::NotPrivate { .. } => "not-private",
+                Prompt::FetchAgain => "fetch-again",
+                Prompt::Play { .. } => "play",
+                Prompt::Handoff { .. } => "handoff",
+                Prompt::OpenApp { .. } => "app",
+            }),
             s.rail_w(),
             t.page().map_or("-", |p| p.url.as_str()),
             match &s.live {
@@ -89,9 +96,11 @@ pub fn trace(s: &mut Shell) {
                 Some(crate::shell::LivePage::Loading(_)) => "loading".into(),
                 Some(crate::shell::LivePage::Shown(_)) => "shown".into(),
                 Some(crate::shell::LivePage::Failed { why, .. }) => format!("failed:{}", why.replace(' ', "_")),
+                Some(crate::shell::LivePage::File { name, .. }) => format!("file:{}", name.replace(' ', "_")),
             },
             s.geo().page.x(),
             s.geo().page.y(),
+            s.w,
         );
     }
 }
@@ -840,10 +849,19 @@ fn prompt_row(ctx: &mut Ctx, r: Rect, p: &Prompt, st: &Mutable<Shell>) {
     rect(ctx, r.x(), r.y() + r.h() - 1.0, r.w(), 1.0, t.border_default(), 0.0);
     let body = |c: Color, w: Weight| sans(type_size::SM, w, c);
     let (g, runs): (char, Vec<(String, TextStyle)>) = match p {
-        Prompt::Download { file, size, origin } => (ph::DOWNLOAD, vec![
+        Prompt::Download { file, size, origin, kind, .. } => (ph::DOWNLOAD, vec![
             (file.clone(), body(t.text_primary(), Weight::Semibold)),
-            (format!("{size} from"), body(t.text_secondary(), Weight::Regular)),
+            (format!("{size} {kind} from"), body(t.text_secondary(), Weight::Regular)),
             (origin.clone(), body(t.text_primary(), Weight::Semibold)),
+        ]),
+        Prompt::Handoff { url, scheme } => (ph::ARROW_RIGHT, vec![
+            (format!("This link is for another program ({scheme}):"), body(t.text_secondary(), Weight::Regular)),
+            (url.trim_start_matches(&format!("{scheme}:")).chars().take(80).collect(), body(t.text_primary(), Weight::Semibold)),
+        ]),
+        Prompt::OpenApp { name, .. } => (ph::ARROW_RIGHT, vec![
+            ("This link opens the app".into(), body(t.text_secondary(), Weight::Regular)),
+            (name.chars().take(80).collect(), body(t.text_primary(), Weight::Semibold)),
+            ("· Try it keeps nothing".into(), body(t.text_secondary(), Weight::Regular)),
         ]),
         Prompt::NotPrivate { origin } => (ph::WARNING, vec![
             ("This form is on".into(), body(t.text_secondary(), Weight::Regular)),
@@ -915,6 +933,10 @@ fn page_slot(ctx: &mut Ctx, g: &Geo, p: &trail::Page, st: &Mutable<Shell>) -> Op
             crate::shell::LivePage::Failed { url, why } => {
                 text(ctx, x, y, &fit(&format!("{} could not be opened", crate::trail::host(url)), &ns, col), type_size::LG, Weight::Semibold, t.text_primary());
                 text(ctx, x, y + 28.0, &fit(why, &ns, col), type_size::SM, Weight::Regular, t.text_secondary());
+            }
+            crate::shell::LivePage::File { url, name } => {
+                text(ctx, x, y, &fit(name, &ns, col), type_size::LG, Weight::Semibold, t.text_primary());
+                text(ctx, x, y + 28.0, &fit(&format!("A file from {}, not a page. Save it from the row above.", crate::trail::host(url)), &ns, col), type_size::SM, Weight::Regular, t.text_secondary());
             }
             crate::shell::LivePage::Shown(_) => {}
         }

@@ -1387,7 +1387,7 @@ impl Compositor {
             && c.slot.is_none_or(|s| s.parent == parent)
             && c.kept_by.is_none_or(|p| p == parent)
             && !self.windows.values().any(|w| w.slot.is_some_and(|s| s.parent == child))
-            && matches!(kind, k::PLAIN | k::CREDENTIAL)
+            && matches!(kind, k::PLAIN | k::CREDENTIAL | k::ISLAND)
             && rect.is_none_or(|r| r.iter().all(|v| v.is_finite()) && r[2] >= 1.0 && r[3] >= 1.0);
         if !ok {
             return Err(refusal::INVALID);
@@ -1547,9 +1547,18 @@ impl Compositor {
             if chrome {
                 return (0, (x, y)); // the WM's, like the background
             }
+            // A covered island takes no input (navigator-ui.md §6.3).
+            if self.is_island(l.id) && island_covered(shown.iter().map(|l| (l.id, l.rect)), l.id) {
+                return (0, (x, y));
+            }
             return (l.id, local);
         }
         (0, (x, y))
+    }
+
+    /// Whether `id` is bound as an island slot.
+    pub fn is_island(&self, id: WindowId) -> bool {
+        self.windows.get(&id).and_then(|w| w.slot).is_some_and(|s| s.kind == fresco_protocol::slot::kind::ISLAND)
     }
 
     /// Phase-B1c entry point: which window contains (x, y) at the top
@@ -1566,6 +1575,25 @@ impl Compositor {
         }
         None
     }
+}
+
+/// Whether anything composed above `island` overlaps it: `layers` bottom
+/// to top as composed, frescod's own chrome (which frames the island)
+/// left out.
+pub fn island_covered(layers: impl Iterator<Item = (WindowId, [i32; 4])>, island: WindowId) -> bool {
+    let mut at: Option<[i32; 4]> = None;
+    for (id, r) in layers {
+        match at {
+            None if id == island => at = Some(r),
+            None => {}
+            Some(a) => {
+                if id != CHROME_LAYER && a[0] < r[2] && r[0] < a[2] && a[1] < r[3] && r[1] < a[3] {
+                    return true;
+                }
+            }
+        }
+    }
+    false
 }
 
 /// Center pixel position of the close button on a window's
@@ -1903,6 +1931,34 @@ mod notification_tests {
         assert!(c.z_order.contains(&e));
         assert!(c.destroy(p, 1));
         assert!(c.windows[&e].slot.is_none() && !c.z_order.contains(&e), "its parent went: released and hidden");
+    }
+
+    #[test]
+    fn a_covered_island_takes_no_pointer_input() {
+        use fresco_protocol::slot::kind;
+        let mut c = Compositor::new();
+        let p = c.create(1, (800, 600));
+        let island = c.create(2, (10, 10));
+        let over = c.create(3, (10, 10));
+        c.hide(island);
+        c.hide(over);
+        assert_eq!(c.bind_slot(island, p, kind::ISLAND, Some([100.0, 100.0, 200.0, 100.0]), 2), Ok(()));
+        assert!(c.is_island(island) && !c.is_island(p));
+        let layer = |id, rect| ShownLayer { id, rect, alpha: None };
+        // Clear: the island's clicks are its own. The chrome over it (its
+        // frame and tag) doesn't cover it.
+        c.shown = Some(vec![layer(p, [0, 0, 800, 600]), layer(island, [100, 100, 300, 200]), layer(CHROME_LAYER, [0, 0, 10, 10])]);
+        assert_eq!(c.pointer_target(150.0, 150.0).0, island);
+        assert_eq!(c.pointer_target(5.0, 5.0).0, 0, "the chrome is the WM's");
+        // Something of the page's drawn over a corner of it: a click
+        // anywhere on the island goes nowhere.
+        c.shown = Some(vec![layer(p, [0, 0, 800, 600]), layer(island, [100, 100, 300, 200]), layer(over, [280, 180, 400, 260])]);
+        assert_eq!(c.pointer_target(150.0, 150.0).0, 0);
+        assert_eq!(c.pointer_target(290.0, 190.0).0, over, "what covers it takes its own clicks");
+        assert_eq!(c.pointer_target(50.0, 50.0).0, p);
+        // A plain slot in the same place is not held back.
+        assert_eq!(c.bind_slot(island, p, kind::PLAIN, Some([100.0, 100.0, 200.0, 100.0]), 2), Ok(()));
+        assert_eq!(c.pointer_target(150.0, 150.0).0, island);
     }
 
     #[test]

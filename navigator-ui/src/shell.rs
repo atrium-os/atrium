@@ -9,7 +9,7 @@ use pergola::{Key, Modifiers, Rect};
 
 use crate::fake::{self, Link};
 use crate::keys::Action;
-use crate::trail::{Asked, Facts, Light, Media, PageId, PageSpec, Prompt, TrailStore, PROMPT_STILL_MS};
+use crate::trail::{Asked, Facts, Light, Media, PageId, PageSpec, Prompt, TrailStore, PROMPTS_QUEUED, PROMPT_EVERY_MS, PROMPT_STILL_MS};
 use crate::where_field::{self, Entry, Source, Suggestion};
 
 /// Rail width, wide and collapsed (§5.2; collapsed = Forum's dock rail).
@@ -60,6 +60,9 @@ pub struct Shell {
     pub live: Option<LivePage>,
     /// What the UI asks navigatord next (drained by the main loop).
     pub outbox: Vec<Out>,
+    /// Where the prompt row was last drawn: a row that moves starts its
+    /// 500 ms again (§6.4).
+    pub prompt_at: Option<Rect>,
 }
 
 /// The live page's state, as navigatord and the page child reported it.
@@ -71,6 +74,8 @@ pub enum LivePage {
     Shown(String),
     /// navigatord could not open it.
     Failed { url: String, why: String },
+    /// Not a page but a file (§6.4): the prompt row asks what to do.
+    File { url: String, name: String },
 }
 
 /// A request for navigatord the shell can't send itself.
@@ -80,6 +85,11 @@ pub enum Out {
     Activate { page: String, href: String, beside: bool },
     /// The person told a site to forget them in a jar (§6.2).
     Forget { jar: navigator_control::Jar, url: String },
+    /// Save, or drop, the file navigatord holds under that `Open` (§6.4).
+    Save { id: u32 },
+    Discard { id: u32 },
+    /// Hand a link to its program (§6.4, threat model §2.10).
+    Hand { url: String, how: navigator_control::Hand },
 }
 
 /// A page about to be opened by navigatord: its title is its host until
@@ -113,7 +123,7 @@ pub struct Geo {
 
 impl Shell {
     pub fn new(store: TrailStore, w: f32, h: f32) -> Self {
-        Shell { store, w, h, rail_collapsed: false, status_bar: false, editing: None, popover: false, mods: Modifiers::default(), hover_hint: None, last_note: None, live: None, outbox: Vec::new() }
+        Shell { store, w, h, rail_collapsed: false, status_bar: false, editing: None, popover: false, mods: Modifiers::default(), hover_hint: None, last_note: None, live: None, outbox: Vec::new(), prompt_at: None }
     }
 
     /// A page for `url`: from navigatord when live, else the stand-in.
@@ -332,7 +342,7 @@ impl Shell {
     pub fn activate(&mut self, l: &Link, now: f64) {
         if let Some((file, size)) = &l.download {
             let origin = crate::trail::site(&l.url).to_string();
-            self.ask(Prompt::Download { file: file.clone(), size: size.clone(), origin }, now);
+            self.ask(Prompt::Download { id: 0, file: file.clone(), size: size.clone(), origin, kind: "PDF".into() }, now);
             return;
         }
         let spec = fake::spec(&l.url);
@@ -343,28 +353,109 @@ impl Shell {
         }
     }
 
-    pub fn ask(&mut self, p: Prompt, now: f64) {
-        if let Some(page) = self.store.trail_mut().page_mut() {
-            page.asked = Some(Asked { prompt: p, since_ms: now });
+    /// Ask on the page on screen.
+    pub fn ask(&mut self, p: Prompt, now: f64) -> bool {
+        let Some(key) = self.shown_key() else { return false };
+        self.ask_at(key, p, now)
+    }
+
+    /// Ask on the page `key` (§6.4): one prompt shown at a time, newer ones
+    /// waiting behind it (at most [`PROMPTS_QUEUED`]); a page can't ask
+    /// faster than once a second, and a prompt dismissed on a page doesn't
+    /// come back for it until it is loaded again. Returns whether it was
+    /// taken.
+    pub fn ask_at(&mut self, key: (u64, PageId), p: Prompt, now: f64) -> bool {
+        let Some(page) = self.store.page_by_key_mut(key.0, key.1) else { return false };
+        let k = p.key();
+        let q = &mut page.prompts;
+        if q.dismissed.contains(&k) || q.last_ms.is_some_and(|t| now - t < PROMPT_EVERY_MS) {
+            return false;
+        }
+        if page.asked.as_ref().is_some_and(|a| a.prompt.key() == k) || q.queued.iter().any(|x| x.key() == k) {
+            return false;
+        }
+        match page.asked {
+            None => page.asked = Some(Asked { prompt: p, since_ms: now }),
+            Some(_) if q.queued.len() < PROMPTS_QUEUED => q.queued.push(p),
+            Some(_) => return false,
+        }
+        q.last_ms = Some(now);
+        true
+    }
+
+    /// Whether something of the UI's own covers the prompt row (the
+    /// suggestion list, the tier popover).
+    pub fn prompt_obscured(&self) -> bool {
+        let g = self.geo();
+        let Some(r) = g.prompt else { return false };
+        let over = |o: Option<Rect>| o.is_some_and(|o| o.x() < r.x() + r.w() && r.x() < o.x() + o.w() && o.y() < r.y() + r.h() && r.y() < o.y() + o.h());
+        over(g.drop) || over(g.popover)
+    }
+
+    /// Called every frame: a prompt row that moved, or is covered, starts
+    /// its 500 ms again. Returns whether anything changed.
+    pub fn settle(&mut self, now: f64) -> bool {
+        let at = self.geo().prompt;
+        let covered = self.prompt_obscured();
+        let moved = at != self.prompt_at;
+        self.prompt_at = at;
+        if !(moved || covered) {
+            return false;
+        }
+        match self.store.trail_mut().page_mut().and_then(|p| p.asked.as_mut()) {
+            Some(a) if a.since_ms < now => {
+                a.since_ms = now;
+                true
+            }
+            _ => moved,
         }
     }
 
     /// A press on a prompt's answer. It counts only once the row has been
-    /// still for 500 ms (§6.4); returns whether it counted.
+    /// still and uncovered for 500 ms (§6.4); returns whether it counted.
     pub fn answer(&mut self, i: usize, now: f64) -> bool {
+        if self.prompt_obscured() {
+            return false;
+        }
         let Some(page) = self.store.trail_mut().page_mut() else { return false };
         let Some(a) = &page.asked else { return false };
         if now - a.since_ms < PROMPT_STILL_MS {
             return false;
         }
-        let what = a.prompt.answers().get(i).copied().unwrap_or("?");
-        let go_back = matches!(a.prompt, Prompt::NotPrivate { .. }) && what == "Go back";
-        self.last_note = Some(format!("prompt answered: {what} ({:?})", a.prompt));
-        page.asked = None;
-        if go_back {
-            self.store.trail_mut().back();
+        let Some(&what) = a.prompt.answers().get(i) else { return false };
+        let prompt = a.prompt.clone();
+        // The next one waiting gets its own 500 ms.
+        page.asked = (!page.prompts.queued.is_empty()).then(|| Asked { prompt: page.prompts.queued.remove(0), since_ms: now });
+        if matches!(what, "Cancel" | "Not now") {
+            page.prompts.dismissed.push(prompt.key());
+        }
+        self.last_note = Some(format!("prompt answered: {what} ({prompt:?})"));
+        let live = self.live.is_some();
+        match (&prompt, what) {
+            (Prompt::NotPrivate { .. }, "Go back") => {
+                self.store.trail_mut().back();
+            }
+            (Prompt::Download { id, .. }, "Save") if live => self.outbox.push(Out::Save { id: *id }),
+            (Prompt::Download { id, .. }, "Cancel") if live => self.outbox.push(Out::Discard { id: *id }),
+            (Prompt::Handoff { url, .. } | Prompt::OpenApp { url, .. }, "Open" | "Open in Mail") if live => {
+                self.outbox.push(Out::Hand { url: url.clone(), how: navigator_control::Hand::Open })
+            }
+            (Prompt::OpenApp { url, .. }, "Try it") if live => self.outbox.push(Out::Hand { url: url.clone(), how: navigator_control::Hand::Try }),
+            _ => {}
         }
         true
+    }
+
+    /// navigatord decided a link is for another program: ask first.
+    pub fn handoff(&mut self, url: &str, scheme: &str, now: f64) {
+        let p = if scheme == "atrium-app" {
+            let name = url.trim_start_matches("atrium-app:").trim_start_matches("//");
+            let name = name.split(['/', '?', '#']).next().unwrap_or("").to_string();
+            Prompt::OpenApp { url: url.into(), name }
+        } else {
+            Prompt::Handoff { url: url.into(), scheme: scheme.into() }
+        };
+        self.ask(p, now);
     }
 
     /// The stop page's Go back (§6.5: no click-through, D10).
@@ -619,6 +710,57 @@ mod tests {
         assert!(s.geo().prompt.is_none());
         s.activate(&links[0], 2000.0);
         assert_ne!(s.store.trail().current, cur);
+    }
+
+    #[test]
+    fn the_prompt_row_waits_takes_turns_and_remembers_no() {
+        let mut s = shell();
+        s.live = Some(LivePage::Shown(String::new()));
+        let dl = |id: u32, f: &str| Prompt::Download { id, file: f.into(), size: "1 KB".into(), origin: "atlas.example".into(), kind: "PDF".into() };
+        assert!(s.ask(dl(7, "a.pdf"), 0.0));
+        assert!(!s.ask(dl(8, "b.pdf"), 500.0), "one a second at most");
+        assert!(s.ask(dl(8, "b.pdf"), 1000.0), "queued behind the first");
+        assert!(!s.ask(dl(8, "b.pdf"), 2000.0), "the same one twice");
+        // Covered by the tier popover: a press doesn't count, and the row's
+        // 500 ms start again once it is uncovered.
+        s.settle(0.0);
+        s.popover = true;
+        assert!(s.prompt_obscured());
+        assert!(!s.answer(0, 2000.0));
+        s.settle(2000.0);
+        s.popover = false;
+        assert!(!s.answer(0, 2200.0), "500 ms from when it was last covered");
+        assert!(s.answer(0, 2600.0), "Cancel");
+        assert_eq!(s.outbox.pop(), Some(Out::Discard { id: 7 }));
+        // The next one takes its own 500 ms.
+        assert!(matches!(&s.store.trail().page().unwrap().asked, Some(a) if a.prompt.key().contains("b.pdf")));
+        assert!(!s.answer(1, 2700.0));
+        assert!(s.answer(1, 3200.0), "Save");
+        assert_eq!(s.outbox.pop(), Some(Out::Save { id: 8 }));
+        assert!(s.geo().prompt.is_none());
+        assert!(!s.ask(dl(9, "a.pdf"), 9000.0), "dismissed on this page: not asked again");
+        // A row that moves starts again too.
+        assert!(s.ask(dl(10, "c.pdf"), 9000.0));
+        s.settle(9000.0);
+        s.rail_collapsed = !s.rail_collapsed;
+        assert!(s.settle(9600.0), "moved");
+        assert!(!s.answer(1, 9700.0));
+        assert!(s.answer(1, 10100.0));
+    }
+
+    #[test]
+    fn hand_offs_ask_and_name_the_app() {
+        let mut s = shell();
+        s.live = Some(LivePage::Shown(String::new()));
+        s.handoff("atrium-app://example.com/photos?path=/x", "atrium-app", 0.0);
+        let a = s.store.trail().page().unwrap().asked.clone().unwrap();
+        assert_eq!(a.prompt, Prompt::OpenApp { url: "atrium-app://example.com/photos?path=/x".into(), name: "example.com".into() });
+        assert!(s.answer(2, 600.0), "Try it");
+        assert_eq!(s.outbox.pop(), Some(Out::Hand { url: "atrium-app://example.com/photos?path=/x".into(), how: navigator_control::Hand::Try }));
+        s.handoff("mailto:a@atlas.example", "mailto", 2000.0);
+        assert_eq!(s.store.trail().page().unwrap().asked.as_ref().unwrap().prompt.answers(), &["Not now", "Open in Mail"]);
+        assert!(s.answer(1, 2600.0));
+        assert_eq!(s.outbox.pop(), Some(Out::Hand { url: "mailto:a@atlas.example".into(), how: navigator_control::Hand::Open }));
     }
 
     #[test]

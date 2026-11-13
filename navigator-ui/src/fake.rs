@@ -222,7 +222,7 @@ pub fn scene(sc: Scene) -> (TrailStore, Option<Prompt>) {
         Scene::Main | Scene::Start => (s, None),
         Scene::Prompt => {
             s.set_knows("atlas.example", true);
-            (s, Some(Prompt::Download { file: "impluvium-survey.pdf".into(), size: "2.4 MB".into(), origin: "atlas.example".into() }))
+            (s, Some(Prompt::Download { id: 0, file: "impluvium-survey.pdf".into(), size: "2.4 MB".into(), origin: "atlas.example".into(), kind: "PDF".into() }))
         }
         Scene::Live => {
             let i = s.trails.iter().position(|t| t.title() == "Inbox (3)").unwrap();

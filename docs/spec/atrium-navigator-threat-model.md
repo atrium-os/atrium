@@ -1206,6 +1206,13 @@ pipe, and the typed island channel.
     untouched.
 - **Downloads.** Saved with the source origin recorded, never executable by default, and
   opened only by a jailed viewer.
+  - *Built 2026-11-14* (navigator-ui.md §14 step 6, `navigatord/src/files.rs`). A file is
+    told from a document by its bytes and never converted. It is saved only on a press in the
+    prompt row, created new under a safe name (no path, no leading dot, no link followed,
+    never over a file), mode 0644, with the source address in the user extended attribute
+    `atrium.origin`. Not yet: the jailed viewer, and a quarantine flag that other apps honour.
+  - Hand-offs (§2.10 "Schemes") now ask in the prompt row first, and navigatord passes on
+    only a link it decided as `Handoff` on that connection, once.
 
 ### 2.11 Deception — phishing without a bug (A2)
 

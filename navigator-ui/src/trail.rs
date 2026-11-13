@@ -86,23 +86,64 @@ pub enum RowMedia {
 /// A question in the prompt row (§6.4).
 #[derive(Clone, Debug, PartialEq)]
 pub enum Prompt {
-    Download { file: String, size: String, origin: String },
+    /// A link to a file (§6.4): `id` is the `Open` navigatord holds it
+    /// under (0 for the stand-in), `kind` what its bytes are.
+    Download { id: u32, file: String, size: String, origin: String, kind: String },
     NotPrivate { origin: String },
     FetchAgain,
     Play { origin: String },
+    /// A link for another program (`mailto:`, an allowlisted scheme;
+    /// threat model §2.10).
+    Handoff { url: String, scheme: String },
+    /// An `atrium-app:` link (navigator.md §2.2): try it in a jail that
+    /// keeps nothing, or open it.
+    OpenApp { url: String, name: String },
 }
 
 impl Prompt {
     /// The answers, left to right; the last is the primary one.
+    /// ("Open in viewer" for a download waits for a jailed viewer.)
     pub fn answers(&self) -> &'static [&'static str] {
         match self {
-            Prompt::Download { .. } => &["Cancel", "Save", "Open in viewer"],
+            Prompt::Download { .. } => &["Cancel", "Save"],
             Prompt::NotPrivate { .. } => &["Continue", "Go back"],
             Prompt::FetchAgain => &["Fetch now"],
             Prompt::Play { .. } => &["Not now", "Play"],
+            Prompt::Handoff { scheme, .. } if scheme == "mailto" => &["Not now", "Open in Mail"],
+            Prompt::Handoff { .. } => &["Not now", "Open"],
+            Prompt::OpenApp { .. } => &["Not now", "Open", "Try it"],
+        }
+    }
+
+    /// What a dismissal is remembered by (§6.4: a dismissed prompt does
+    /// not come back for its page until the page is reloaded).
+    pub fn key(&self) -> String {
+        match self {
+            Prompt::Download { file, origin, .. } => format!("download {origin} {file}"),
+            Prompt::NotPrivate { origin } => format!("not-private {origin}"),
+            Prompt::FetchAgain => "fetch-again".into(),
+            Prompt::Play { origin } => format!("play {origin}"),
+            Prompt::Handoff { url, .. } | Prompt::OpenApp { url, .. } => format!("hand {url}"),
         }
     }
 }
+
+/// The prompts a page has waiting behind the one shown, and what it was
+/// told no to (§6.4).
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct Prompts {
+    /// Oldest first; the row shows `Page.asked`, then these in turn.
+    pub queued: Vec<Prompt>,
+    /// Keys of prompts dismissed on this page since it was loaded.
+    pub dismissed: Vec<String>,
+    /// When the page last asked (ms, the app clock): one a second at most.
+    pub last_ms: Option<f64>,
+}
+
+/// §6.4: at most this many prompts wait behind the one shown.
+pub const PROMPTS_QUEUED: usize = 3;
+/// §6.4: a page can't ask faster than this.
+pub const PROMPT_EVERY_MS: f64 = 1000.0;
 
 /// A prompt on a page, with when it appeared: a press counts only once
 /// the row has been still for [`PROMPT_STILL_MS`] (§6.4).
@@ -131,6 +172,7 @@ pub struct Page {
     pub facts: Facts,
     pub media: Media,
     pub asked: Option<Asked>,
+    pub prompts: Prompts,
     /// navigatord's store address for the version shown (§4.4, §4.5): a
     /// parked page comes back as this version, not fetched again.
     pub saved: Option<String>,
@@ -218,6 +260,7 @@ impl Trail {
             facts: spec.facts,
             media: spec.media,
             asked: None,
+            prompts: Prompts::default(),
             saved: None,
             scroll: 0.0,
         });
@@ -277,6 +320,30 @@ impl Trail {
         self.current = Some(id);
         self.pages[id].seen = true;
         true
+    }
+
+    /// Take back a page that turned out not to be one (a link to a file,
+    /// §6.4): its parent becomes current again. The newest page, with no
+    /// children, leaves the trail; any other is only unhooked. Returns the
+    /// parent, if any.
+    pub fn retract(&mut self, id: PageId) -> Option<PageId> {
+        let parent = self.pages.get(id)?.parent;
+        if !self.pages[id].children.is_empty() {
+            return None;
+        }
+        if let Some(p) = parent {
+            self.pages[p].children.retain(|&c| c != id);
+        }
+        if self.current == Some(id) {
+            self.current = parent;
+        }
+        self.pages[id].seen = true;
+        if id + 1 == self.pages.len() && parent.is_some() {
+            self.pages.pop();
+        } else {
+            self.pages[id].parent = None;
+        }
+        parent
     }
 
     /// True while a branch opened beside has not been looked at.
@@ -613,6 +680,25 @@ mod tests {
 
     fn spec(url: &str) -> PageSpec {
         PageSpec { url: url.into(), title: url.into(), search: None, facts: Facts::green(""), media: Media::None }
+    }
+
+    #[test]
+    fn a_page_that_was_a_file_is_taken_back() {
+        let mut t = Trail::new(1, false);
+        let a = t.follow(spec("a"));
+        let f = t.follow(spec("a/file.pdf"));
+        assert_eq!(t.retract(f), Some(a));
+        assert_eq!(t.current, Some(a));
+        assert_eq!(t.pages.len(), 1, "the newest page leaves");
+        assert!(t.pages[a].children.is_empty());
+        // Not the newest: only unhooked.
+        let g = t.follow(spec("a/g.pdf"));
+        t.back();
+        let b = t.follow(spec("b"));
+        assert_eq!(t.retract(g), Some(a));
+        assert_eq!(t.pages[a].children, vec![b]);
+        assert_eq!(t.current, Some(b));
+        assert_eq!(t.retract(a), None, "a page with children stays");
     }
 
     #[test]

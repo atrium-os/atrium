@@ -155,6 +155,7 @@ fn trail_of(r: TrailRec, facts: &dyn Fn(&str) -> Facts) -> Result<Trail, String>
             seen: p.seen,
             media: Media::None,
             asked: None,
+            prompts: crate::trail::Prompts::default(),
             saved,
             scroll,
         });

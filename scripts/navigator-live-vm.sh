@@ -93,7 +93,10 @@ g "cd $S && env LIMEN_SOCKET=$S/limend.sock LIMEN_DEV_UID=50901 LIMEN_DEFAULTS=d
 # nd [log]: navigatord, its store of opened pages in $S/store.
 nd() { g "cd $S && env NAVIGATORD_SOCKET=$S/nav.sock NAVIGATORD_PAGE_SOCKET=$S/page.sock NAVIGATORD_FIXTURES=$D/fixtures \
     NAVIGATORD_STORE=$S/store NAVIGATORD_PRERENDER=$D/prerender FRESCOD_CHROME_SOCK=$S/chrome.sock \
+    NAVIGATORD_DOWNLOADS=$S/downloads NAVIGATORD_SCHEMES=mailto NAVIGATORD_OPENER='sh $S/opener.sh' \
     daemon -f -o $S/${1:-navigatord}.log $D/navigatord --unconfined-for-testing </dev/null"; }
+# The hand-off program: says what it was given.
+g "printf '%s\\n' 'echo \"\$@\" >> $S/opener.log' > $S/opener.sh; rm -rf $S/downloads $S/opener.log"
 nd
 sleep 10
 g "test -S $S/limend.sock && test -S $S/nav.sock" || { echo "ABORT: limend or navigatord did not start"; g "tail -5 $S/limend.log $S/navigatord.log"; exit 1; }
@@ -223,12 +226,47 @@ g "grep -q \"can't remember you: Arca isn't running\" $S/ui7.log" && ok "…and 
 sleep 3
 g "grep -A2 '\"knows\"' $S/trails.json | grep -q atlas.example" && bad "a site that could not remember you was saved as knowing you" || ok "…and the control and the trail store say it doesn't know you"
 shot live-7-presence
+g "pkill -x navigator-ui; sleep 2; true"
+
+echo "=== prompts (step 6)"
+last() { g "grep 'trace' $S/ui8.log | tail -1"; }
+ui https://atlas.example/wiki/Atrium ui8
+until_trace 'url=https://atlas.example/wiki/Atrium live=shown' || bad "prompts: first page: $(last)"
+P=$(last | sed -n 's/.* page=\([0-9.]*\),\([0-9.]*\).*/\1 \2/p'); PX=${P% *}; PY=${P#* }; PX=${PX%.*}; PY=${PY%.*}
+W=$(last | sed -n 's/.* w=\([0-9]*\).*/\1/p')
+# The prompt row's primary answer is its rightmost button (Save, Open in
+# Mail, Try it), in the row under the toolbar.
+answer() { press $((W - 40)) $((TOP + 41 + 22)); }
+press $((PX + 50)) $((TOP + PY + 64 + 20 + 4 * 40))    # The survey (PDF)
+until_trace 'prompt=download .*url=https://atlas.example/wiki/Atrium ' && ok "a link to a PDF asked in the prompt row, and the trail stayed on its page" || bad "download: $(last); $(g "tail -3 $S/navigatord2.log")"
+g "grep -q 'survey.pdf is a file (PDF' $S/navigatord*.log" && ok "…navigatord told it from a document by its bytes, and did not convert it" || bad "file: $(g "tail -3 $S/navigatord2.log")"
+last | grep -q 'pages=1 ' && ok "…and the file did not become a page of the trail" || bad "pages: $(last)"
+shot live-8-download
+answer
+sleep 3
+g "test -f $S/downloads/survey.pdf" && ok "Save wrote it to the downloads directory" || bad "not saved: $(g "grep -v trace $S/ui8.log | tail -3; ls -l $S/downloads")"
+g "stat -f %Lp $S/downloads/survey.pdf" | grep -qx 644 && ok "…not executable (0644)" || bad "mode $(g "stat -f %Lp $S/downloads/survey.pdf")"
+g "getextattr -q user atrium.origin $S/downloads/survey.pdf" | grep -q 'https://atlas.example/files/survey.pdf' && ok "…with where it came from recorded on the file" || bad "origin: $(g "getextattr user atrium.origin $S/downloads/survey.pdf 2>&1")"
+until_trace 'prompt=- ' || bad "the row stayed: $(last)"
+press $((PX + 50)) $((TOP + PY + 64 + 20 + 5 * 40))    # mailto:
+until_trace 'prompt=handoff' && ok "a mailto: link asked before going anywhere" || bad "mailto: $(last)"
+shot live-9-handoff
+answer
+sleep 3
+g "grep -qx 'open mailto:curator@atlas.example' $S/opener.log" && ok "…Open in Mail handed it on" || bad "opener: $(g "cat $S/opener.log; grep -v trace $S/ui8.log | tail -3")"
+until_trace 'prompt=- ' || bad "the row stayed: $(last)"
+press $((PX + 50)) $((TOP + PY + 64 + 20 + 6 * 40))    # atrium-app:
+until_trace 'prompt=app' && ok "an atrium-app: link asked to try or open the app" || bad "app: $(last)"
+answer
+sleep 3
+g "grep -qx 'try atrium-app://atlas.example/viewer' $S/opener.log" && ok "…Try it handed it on to be tried" || bad "opener: $(g "cat $S/opener.log; grep -v trace $S/ui8.log | tail -3")"
+g "grep -c . $S/opener.log" | grep -qx 2 && ok "nothing else was handed on" || bad "opener log: $(g "cat $S/opener.log")"
 echo "--- park and restore times (TCG)"
 g "grep -hE 'showed live page|parked .* in [0-9]+ ms|page .* in [0-9]+ ms' $S/ui5.log $S/ui6.log"
 g "pkill -x navigator-ui; sleep 2; true"
 
 echo "=== logs"
-for l in navigatord limend ui ui4 ui5 ui6 ui7 navigatord2; do echo "--- $l"; g "grep -v trace $S/$l.log | tail -12"; done
+for l in navigatord limend ui ui4 ui5 ui6 ui7 ui8 navigatord2; do echo "--- $l"; g "grep -v trace $S/$l.log | tail -12"; done
 g "grep -iE 'chrome|slot|origin|panic' $S/frescod.log | tail -8; true"
 echo "navigator-live: $fails failed"
 [ "$fails" = 0 ]

@@ -41,6 +41,9 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+mod files;
+
+use navigator_backend::links::SchemeAllowlist;
 use navigator_backend::store::{DirStore, MemoryStore, Store};
 use navigator_control::{self as ctl, Event, Jar, LinkAction, PageHeader, Request, Source, Ticket};
 use navigator_cookies::{Arca as _, ArcadSocket, Broker, Fetch, Launcher, Why};
@@ -78,6 +81,16 @@ struct Config {
     /// arcad's socket and Arca's courier launcher's: with both, a page
     /// whose site knows you is fetched through Arca's couriers.
     arca: Option<(PathBuf, String)>,
+    /// Where Save writes a file (`NAVIGATORD_DOWNLOADS`, default
+    /// `$HOME/Downloads`).
+    downloads: PathBuf,
+    /// The program a hand-off goes to (`NAVIGATORD_OPENER`), run as
+    /// `<opener…> open|try <url>` with no shell. Without one, nothing is
+    /// handed on and the UI is told so.
+    opener: Option<(String, Vec<String>)>,
+    /// Schemes handed on (`NAVIGATORD_SCHEMES`, comma-separated, e.g.
+    /// `mailto,tel`); `atrium-app` always is (navigator.md §2.2).
+    schemes: SchemeAllowlist,
 }
 
 impl Config {
@@ -93,6 +106,17 @@ impl Config {
             chrome: var("FRESCOD_CHROME_SOCK").map(PathBuf::from),
             store: var("NAVIGATORD_STORE").map(PathBuf::from),
             arca: var("NAVIGATORD_ARCA").zip(var("NAVIGATORD_COURIERD")).map(|(a, c)| (PathBuf::from(a), c)),
+            downloads: var("NAVIGATORD_DOWNLOADS").map(PathBuf::from)
+                .or_else(|| var("HOME").map(|h| Path::new(&h).join("Downloads")))
+                .unwrap_or_else(|| PathBuf::from("/nonexistent/Downloads")),
+            opener: var("NAVIGATORD_OPENER").and_then(|v| words(&v)),
+            schemes: {
+                let mut a = SchemeAllowlist::default();
+                for sch in std::iter::once("atrium-app".to_string()).chain(var("NAVIGATORD_SCHEMES").unwrap_or_default().split(',').map(str::trim).filter(|x| !x.is_empty()).map(String::from)) {
+                    a.allow(&sch).map_err(|e| format!("NAVIGATORD_SCHEMES: {e}"))?;
+                }
+                a
+            },
         };
         if !unconfined {
             if c.converter.is_none() {
@@ -375,7 +399,15 @@ fn upstream(cfg: &Config, inst: &str) -> Result<Upstream, String> {
 }
 
 /// Fetch and convert `url`; through Arca as the jar's, with `cookies`.
-fn convert(cfg: &Config, url: &str, ctx: Ctx, cookies: Option<(Cookies, u64)>) -> Result<Page, String> {
+/// What an address turned out to be.
+enum Got {
+    Page(Page),
+    /// Not a document (files.rs): kept for the person to save, never
+    /// converted.
+    File { url: String, what: &'static str, ext: &'static str, body: Vec<u8> },
+}
+
+fn convert(cfg: &Config, url: &str, ctx: Ctx, cookies: Option<(Cookies, u64)>) -> Result<Got, String> {
     let inst = instance();
     let mut up = upstream(cfg, &inst)?;
     if let Some((cookies, view)) = cookies {
@@ -391,6 +423,9 @@ fn convert(cfg: &Config, url: &str, ctx: Ctx, cookies: Option<(Cookies, u64)>) -
         Reply::Ok { status, .. } => return Err(format!("the site answered {status}")),
         Reply::Err(e) => return Err(e),
     };
+    if let Some((what, ext)) = files::kind(&doc) {
+        return Ok(Got::File { url: base, what, ext, body: doc });
+    }
     let job = Job {
         base: Some(base.clone()),
         net: true,
@@ -474,7 +509,7 @@ fn convert(cfg: &Config, url: &str, ctx: Ctx, cookies: Option<(Cookies, u64)>) -
         return Err("the recording is over its bound".into());
     }
     let insecure = base.starts_with("http:");
-    Ok(Page { title: title(&recording), url: base, recording, insecure, saved: String::new(), ctx })
+    Ok(Got::Page(Page { title: title(&recording), url: base, recording, insecure, saved: String::new(), ctx }))
 }
 
 /// The document's `<title>` from the recording's JSON text, bounded.
@@ -556,6 +591,10 @@ fn send(w: &Mutex<UnixStream>, e: &Event) {
 fn serve_ui(cfg: Arc<Config>, state: Arc<Mutex<State>>, cookies: Option<Cookies>, s: UnixStream) {
     let w = Arc::new(Mutex::new(s.try_clone().expect("clone")));
     let strip = Arc::new(Mutex::new(Strip::default()));
+    // Files waiting for Save, and links decided as hand-offs, on this
+    // connection only.
+    let waiting = Arc::new(Mutex::new(files::Waiting::default()));
+    let mut handed: Vec<String> = Vec::new();
     let mut r = s;
     loop {
         let req: Request = match ctl::read_frame(&mut r) {
@@ -629,7 +668,7 @@ fn serve_ui(cfg: Arc<Config>, state: Arc<Mutex<State>>, cookies: Option<Cookies>
                     continue;
                 }
                 strip.lock().unwrap().latest = id;
-                let (cfg, state, w, strip, cookies) = (cfg.clone(), state.clone(), w.clone(), strip.clone(), cookies.clone());
+                let (cfg, state, w, strip, cookies, waiting) = (cfg.clone(), state.clone(), w.clone(), strip.clone(), cookies.clone(), waiting.clone());
                 std::thread::spawn(move || {
                     let t = Instant::now();
                     // The site knowing you needs Arca; without it the page
@@ -670,12 +709,32 @@ fn serve_ui(cfg: Arc<Config>, state: Arc<Mutex<State>>, cookies: Option<Cookies>
                                     if let Some(Err(e)) = other {
                                         eprintln!("navigatord: {url}: not reopened from the store ({e}); fetching");
                                     }
-                                    convert(&cfg, &url, ctx, cookied).map(|p| {
-                                        let mut st = state.lock().unwrap();
-                                        let p = Arc::new(st.stored(p));
-                                        st.keep(p.clone(), &url);
-                                        (p, Source::Fetched)
-                                    })
+                                    match convert(&cfg, &url, ctx, cookied) {
+                                        Ok(Got::Page(p)) => {
+                                            let mut st = state.lock().unwrap();
+                                            let p = Arc::new(st.stored(p));
+                                            st.keep(p.clone(), &url);
+                                            Ok((p, Source::Fetched))
+                                        }
+                                        Ok(Got::File { url: at, what, ext, body }) => {
+                                            if let (Some(v), Some(c)) = (view, &cookies) {
+                                                c.lock().unwrap().close(v);
+                                            }
+                                            let name = files::name(&at, ext);
+                                            let size = body.len() as u64;
+                                            let origin = origin(&at).unwrap_or_default();
+                                            let held = files::Held { url: at.clone(), name: name.clone(), bytes: body, since: Instant::now() };
+                                            match waiting.lock().unwrap().hold(id, held) {
+                                                Ok(()) => {
+                                                    eprintln!("navigatord: {at} is a file ({what}, {size} bytes): asking");
+                                                    send(&w, &Event::File { id, url: at, name, size, origin, kind: what.to_string() });
+                                                }
+                                                Err(why) => send(&w, &Event::Failed { id, url: at, why }),
+                                            }
+                                            return;
+                                        }
+                                        Err(e) => Err(e),
+                                    }
                                 }
                             }
                         }
@@ -708,17 +767,66 @@ fn serve_ui(cfg: Arc<Config>, state: Arc<Mutex<State>>, cookies: Option<Cookies>
                 let p = state.lock().unwrap().page(&page);
                 let action = match p {
                     None => LinkAction::Blocked { why: "that page is not open".into() },
-                    Some(p) => activate(&p, &href),
+                    Some(p) => activate(&p, &href, &cfg.schemes),
                 };
+                if let LinkAction::Handoff { url, .. } = &action {
+                    if handed.len() >= 32 {
+                        handed.remove(0);
+                    }
+                    handed.push(url.clone());
+                }
                 send(&w, &Event::Link { id, action });
+            }
+            Request::Save { id } => {
+                let Some(h) = waiting.lock().unwrap().take(id) else {
+                    send(&w, &Event::NotSaved { id, why: "that file is no longer held".into() });
+                    continue;
+                };
+                match files::save(&cfg.downloads, &h) {
+                    Ok(path) => {
+                        eprintln!("navigatord: saved {} as {}", h.url, path.display());
+                        send(&w, &Event::Saved { id, path: path.display().to_string() });
+                    }
+                    Err(why) => send(&w, &Event::NotSaved { id, why }),
+                }
+            }
+            Request::Discard { id } => {
+                waiting.lock().unwrap().take(id);
+            }
+            Request::Hand { url, how } => {
+                let ev = hand(&cfg, &mut handed, &url, how);
+                send(&w, &ev);
             }
         }
     }
 }
 
+/// Hand `url` to the opener, once, if this connection was told it is a
+/// hand-off (threat model §2.10): the person pressed for it in the prompt
+/// row. `Try` is only for `atrium-app:` links.
+fn hand(cfg: &Config, handed: &mut Vec<String>, url: &str, how: ctl::Hand) -> Event {
+    let no = |why: &str| Event::Handed { url: url.to_string(), ok: false, why: Some(why.to_string()) };
+    let Some(i) = handed.iter().position(|u| u == url) else { return no("that link was not decided as a hand-off here") };
+    if how == ctl::Hand::Try && !url.starts_with("atrium-app:") {
+        return no("only an app can be tried");
+    }
+    handed.remove(i);
+    let Some((p, a)) = &cfg.opener else { return no("nothing here takes hand-offs yet") };
+    let verb = match how { ctl::Hand::Open => "open", ctl::Hand::Try => "try" };
+    use std::process::Stdio;
+    match std::process::Command::new(p).args(a).arg(verb).arg(url).stdin(Stdio::null()).stdout(Stdio::null()).spawn() {
+        Ok(mut ch) => {
+            std::thread::spawn(move || { let _ = ch.wait(); });
+            eprintln!("navigatord: handed {url} on ({verb})");
+            Event::Handed { url: url.to_string(), ok: true, why: None }
+        }
+        Err(e) => no(&format!("the opener: {e}")),
+    }
+}
+
 /// What activating `href` in `page` does: only a link the recording
 /// carries (threat model §2.10), decided by the backend's link rules.
-fn activate(page: &Page, href: &str) -> LinkAction {
+fn activate(page: &Page, href: &str, schemes: &SchemeAllowlist) -> LinkAction {
     use navigator_backend::links;
     if href.len() > links::MAX_HREF {
         return LinkAction::Blocked { why: "the link is too long".into() };
@@ -727,7 +835,7 @@ fn activate(page: &Page, href: &str) -> LinkAction {
     if !carried {
         return LinkAction::Blocked { why: "the page does not carry this link".into() };
     }
-    match links::decide(&page.url, href, &links::SchemeAllowlist::default()) {
+    match links::decide(&page.url, href, schemes) {
         Ok(links::LinkAction::Navigate { url, insecure }) => LinkAction::Navigate { url, insecure },
         Ok(links::LinkAction::InDocument { fragment }) => LinkAction::InDocument { fragment },
         Ok(links::LinkAction::Handoff { url, scheme }) => LinkAction::Handoff { url, scheme },
@@ -837,10 +945,10 @@ mod tests {
     #[test]
     fn only_links_the_page_carries_are_followed() {
         let p = page("https://atlas.example/wiki/Atrium", r##"<html><head><title>Atrium & court</title></head><body><a href=\"/wiki/Impluvium\">pool</a><a href=\"#plan\">plan</a><a href=\"javascript:x()\">x</a></body></html>"##);
-        assert_eq!(activate(&p, "/wiki/Impluvium"), LinkAction::Navigate { url: "https://atlas.example/wiki/Impluvium".into(), insecure: false });
-        assert_eq!(activate(&p, "#plan"), LinkAction::InDocument { fragment: "plan".into() });
-        assert!(matches!(activate(&p, "https://evil.example/"), LinkAction::Blocked { .. }), "not in the page");
-        assert!(matches!(activate(&p, "javascript:x()"), LinkAction::Blocked { .. }), "a scheme no one allowed");
+        assert_eq!(activate(&p, "/wiki/Impluvium", &SchemeAllowlist::default()), LinkAction::Navigate { url: "https://atlas.example/wiki/Impluvium".into(), insecure: false });
+        assert_eq!(activate(&p, "#plan", &SchemeAllowlist::default()), LinkAction::InDocument { fragment: "plan".into() });
+        assert!(matches!(activate(&p, "https://evil.example/", &SchemeAllowlist::default()), LinkAction::Blocked { .. }), "not in the page");
+        assert!(matches!(activate(&p, "javascript:x()", &SchemeAllowlist::default()), LinkAction::Blocked { .. }), "a scheme no one allowed");
     }
 
     #[test]
