@@ -1,0 +1,806 @@
+Nov 13 06:30:26 atrium-r9700 syslogd: kernel boot file is /boot/kernel/kernel
+Nov 13 06:30:26 atrium-r9700 kernel: ---<<BOOT>>---
+Nov 13 06:30:26 atrium-r9700 kernel: Copyright (c) 1992-2026 The FreeBSD Project.
+Nov 13 06:30:26 atrium-r9700 kernel: Copyright (c) 1979, 1980, 1983, 1986, 1988, 1989, 1991, 1992, 1993, 1994
+Nov 13 06:30:26 atrium-r9700 kernel: 	The Regents of the University of California. All rights reserved.
+Nov 13 06:30:26 atrium-r9700 kernel: FreeBSD is a registered trademark of The FreeBSD Foundation.
+Nov 13 06:30:26 atrium-r9700 kernel: FreeBSD 16.0-CURRENT #0 atrium-os-501a0bb0a4c6-dirty: Thu Nov 12 15:39:16 CET 2026
+Nov 13 06:30:26 atrium-r9700 kernel:     root@39084.example.com:/root/obj-amd64/root/freebsd-src/amd64.amd64/sys/ATRIUM-NODEBUG amd64
+Nov 13 06:30:26 atrium-r9700 kernel: Ubuntu clang version 19.1.7 (20ubuntu4)
+Nov 13 06:30:26 atrium-r9700 kernel: VT(efifb): resolution 800x600
+Nov 13 06:30:26 atrium-r9700 kernel: CPU: Intel(R) Xeon(R) E-2288G CPU @ 3.70GHz (3700.00-MHz K8-class CPU)
+Nov 13 06:30:26 atrium-r9700 kernel:   Origin="GenuineIntel"  Id=0x906ed  Family=0x6  Model=0x9e  Stepping=13
+Nov 13 06:30:26 atrium-r9700 kernel:   Features=0xbfebfbff<FPU,VME,DE,PSE,TSC,MSR,PAE,MCE,CX8,APIC,SEP,MTRR,PGE,MCA,CMOV,PAT,PSE36,CLFLUSH,DTS,ACPI,MMX,FXSR,SSE,SSE2,SS,HTT,TM,PBE>
+Nov 13 06:30:26 atrium-r9700 kernel:   Features2=0x7ffafbff<SSE3,PCLMULQDQ,DTES64,MON,DS_CPL,VMX,SMX,EST,TM2,SSSE3,SDBG,FMA,CX16,xTPR,PDCM,PCID,SSE4.1,SSE4.2,x2APIC,MOVBE,POPCNT,TSCDLT,AESNI,XSAVE,OSXSAVE,AVX,F16C,RDRAND>
+Nov 13 06:30:26 atrium-r9700 kernel:   AMD Features=0x2c100800<SYSCALL,NX,Page1GB,RDTSCP,LM>
+Nov 13 06:30:26 atrium-r9700 kernel:   AMD Features2=0x121<LAHF,ABM,Prefetch>
+Nov 13 06:30:26 atrium-r9700 kernel:   Structured Extended Features=0x29c6fbf<FSGSBASE,TSCADJ,SGX,BMI1,HLE,AVX2,SMEP,BMI2,ERMS,INVPCID,RTM,NFPUSG,MPX,RDSEED,ADX,SMAP,CLFLUSHOPT,PROCTRACE>
+Nov 13 06:30:26 atrium-r9700 kernel:   Structured Extended Features2=0x40000000<SGXLC>
+Nov 13 06:30:26 atrium-r9700 kernel:   Structured Extended Features3=0xbc000e00<MCUOPT,MD_CLEAR,IBPB,STIBP,L1DFL,ARCH_CAP,SSBD>
+Nov 13 06:30:26 atrium-r9700 kernel:   XSAVE Features=0xf<XSAVEOPT,XSAVEC,XINUSE,XSAVES>
+Nov 13 06:30:26 atrium-r9700 kernel:   IA32_ARCH_CAPS=0xa0a0cab<RDCL_NO,IBRS_ALL,SKIP_L1DFL_VME,MDS_NO,TSX_CTRL>
+Nov 13 06:30:26 atrium-r9700 kernel:   VT-x: PAT,HLT,MTF,PAUSE,EPT,UG,VPID
+Nov 13 06:30:26 atrium-r9700 kernel:   TSC: P-state invariant, performance statistics
+Nov 13 06:30:26 atrium-r9700 kernel: real memory  = 68717379584 (65534 MB)
+Nov 13 06:30:26 atrium-r9700 kernel: avail memory = 66981888000 (63878 MB)
+Nov 13 06:30:26 atrium-r9700 kernel: Event timer "LAPIC" quality 600
+Nov 13 06:30:26 atrium-r9700 kernel: ACPI APIC Table: <ALASKA A M I >
+Nov 13 06:30:26 atrium-r9700 kernel: FreeBSD/SMP: Multiprocessor System Detected: 16 CPUs
+Nov 13 06:30:26 atrium-r9700 kernel: FreeBSD/SMP: 1 package(s) x 8 core(s) x 2 hardware threads
+Nov 13 06:30:26 atrium-r9700 kernel: random: registering fast source Intel Secure Key Seed
+Nov 13 06:30:26 atrium-r9700 kernel: random: fast provider: "Intel Secure Key Seed"
+Nov 13 06:30:26 atrium-r9700 kernel: random: unblocking device.
+Nov 13 06:30:26 atrium-r9700 kernel: ioapic0 <Version 2.0> irqs 0-119
+Nov 13 06:30:26 atrium-r9700 kernel: Launching APs: 1 3 14 15 2 4 7 6 9 11 12 10 8 5 13
+Nov 13 06:30:26 atrium-r9700 kernel: random: entropy device external interface
+Nov 13 06:30:26 atrium-r9700 kernel: kbd0 at kbdmux0
+Nov 13 06:30:26 atrium-r9700 kernel: efirtc0: <EFI Realtime Clock>
+Nov 13 06:30:26 atrium-r9700 kernel: efirtc0: registered as a time-of-day clock, resolution 1.000000s
+Nov 13 06:30:26 atrium-r9700 kernel: smbios0: <System Management BIOS> at iomem 0x7ebd8000-0x7ebd8017
+Nov 13 06:30:26 atrium-r9700 kernel: smbios0: Entry point: v3 (64-bit), Version: 3.2
+Nov 13 06:30:26 atrium-r9700 kernel: aesni0: <AES-CBC,AES-CCM,AES-GCM,AES-ICM,AES-XTS>
+Nov 13 06:30:26 atrium-r9700 kernel: acpi0: <ALASKA A M I >
+Nov 13 06:30:26 atrium-r9700 kernel: acpi0: Power Button (fixed)
+Nov 13 06:30:26 atrium-r9700 kernel: cpu0: <ACPI CPU> on acpi0
+Nov 13 06:30:26 atrium-r9700 kernel: hpet0: <High Precision Event Timer> iomem 0xfed00000-0xfed003ff on acpi0
+Nov 13 06:30:26 atrium-r9700 kernel: Timecounter "HPET" frequency 24000000 Hz quality 950
+Nov 13 06:30:26 atrium-r9700 kernel: Event timer "HPET" frequency 24000000 Hz quality 350
+Nov 13 06:30:26 atrium-r9700 kernel: Event timer "HPET1" frequency 24000000 Hz quality 340
+Nov 13 06:30:26 atrium-r9700 kernel: Event timer "HPET2" frequency 24000000 Hz quality 340
+Nov 13 06:30:26 atrium-r9700 kernel: Event timer "HPET3" frequency 24000000 Hz quality 340
+Nov 13 06:30:26 atrium-r9700 kernel: Event timer "HPET4" frequency 24000000 Hz quality 340
+Nov 13 06:30:26 atrium-r9700 kernel: Event timer "HPET5" frequency 24000000 Hz quality 340
+Nov 13 06:30:26 atrium-r9700 kernel: Event timer "HPET6" frequency 24000000 Hz quality 340
+Nov 13 06:30:26 atrium-r9700 kernel: Event timer "HPET7" frequency 24000000 Hz quality 340
+Nov 13 06:30:26 atrium-r9700 kernel: atrtc0: <AT realtime clock> port 0x70-0x77 irq 8 on acpi0
+Nov 13 06:30:26 atrium-r9700 kernel: atrtc0: Warning: Couldn't map I/O.
+Nov 13 06:30:26 atrium-r9700 kernel: atrtc0: registered as a time-of-day clock, resolution 1.000000s
+Nov 13 06:30:26 atrium-r9700 kernel: Event timer "RTC" frequency 32768 Hz quality 0
+Nov 13 06:30:26 atrium-r9700 kernel: attimer0: <AT timer> port 0x40-0x43,0x50-0x53 irq 0 on acpi0
+Nov 13 06:30:26 atrium-r9700 kernel: Timecounter "i8254" frequency 1193182 Hz quality 0
+Nov 13 06:30:26 atrium-r9700 kernel: Event timer "i8254" frequency 1193182 Hz quality 100
+Nov 13 06:30:26 atrium-r9700 kernel: Timecounter "ACPI-fast" frequency 3579545 Hz quality 900
+Nov 13 06:30:26 atrium-r9700 kernel: acpi_timer0: <24-bit timer at 3.579545MHz> port 0x1808-0x180b on acpi0
+Nov 13 06:30:26 atrium-r9700 kernel: isab0: <ACPI Generic ISA bridge> on acpi0
+Nov 13 06:30:26 atrium-r9700 kernel: isa0: <ISA bus> on isab0
+Nov 13 06:30:26 atrium-r9700 kernel: pcib0: <ACPI Host-PCI bridge> port 0xcf8-0xcff on acpi0
+Nov 13 06:30:26 atrium-r9700 kernel: pci0: <ACPI PCI bus> on pcib0
+Nov 13 06:30:26 atrium-r9700 kernel: pcib1: <ACPI PCI-PCI bridge> at device 1.0 on pci0
+Nov 13 06:30:26 atrium-r9700 kernel: pci1: <ACPI PCI bus> on pcib1
+Nov 13 06:30:26 atrium-r9700 kernel: pcib2: <ACPI PCI-PCI bridge> mem 0x98200000-0x98203fff at device 0.0 on pci1
+Nov 13 06:30:26 atrium-r9700 kernel: pci2: <ACPI PCI bus> on pcib2
+Nov 13 06:30:26 atrium-r9700 kernel: pcib3: <PCI-PCI bridge> at device 0.0 on pci2
+Nov 13 06:30:26 atrium-r9700 kernel: pci3: <PCI bus> on pcib3
+Nov 13 06:30:26 atrium-r9700 kernel: vgapci0: <VGA-compatible display> port 0x6000-0x60ff mem 0x80000000-0x8fffffff,0x90000000-0x901fffff,0x98100000-0x9817ffff at device 0.0 on pci3
+Nov 13 06:30:26 atrium-r9700 kernel: hdac0: <ATI (0xab40) HDA Controller> mem 0x981a0000-0x981a3fff at device 0.1 on pci3
+Nov 13 06:30:26 atrium-r9700 kernel: pcib4: <ACPI PCI-PCI bridge> at device 1.2 on pci0
+Nov 13 06:30:26 atrium-r9700 kernel: pci4: <ACPI PCI bus> on pcib4
+Nov 13 06:30:26 atrium-r9700 kernel: xhci0: <Intel Cannon Lake USB 3.1 controller> mem 0x98600000-0x9860ffff at device 20.0 on pci0
+Nov 13 06:30:26 atrium-r9700 kernel: xhci0: 32 bytes context size, 64-bit DMA
+Nov 13 06:30:26 atrium-r9700 kernel: xhci0: xECP capabilities <PROTO,PROTO,VEND(c0),LEGACY,VEND(c6),VEND(c7),VEND(c2),DEBUG,VEND(c3),VEND(c4),VEND(c5),VEND(c8),VEND(c9),VEND(ca),VEND(cb)>
+Nov 13 06:30:26 atrium-r9700 kernel: usbus0 on xhci0
+Nov 13 06:30:26 atrium-r9700 kernel: usbus0: 5.0Gbps Super Speed USB v3.0
+Nov 13 06:30:26 atrium-r9700 kernel: pci0: <memory, RAM> at device 20.2 (no driver attached)
+Nov 13 06:30:26 atrium-r9700 kernel: pci0: <serial bus> at device 21.0 (no driver attached)
+Nov 13 06:30:26 atrium-r9700 kernel: pci0: <serial bus> at device 21.1 (no driver attached)
+Nov 13 06:30:26 atrium-r9700 kernel: pci0: <simple comms> at device 22.0 (no driver attached)
+Nov 13 06:30:26 atrium-r9700 kernel: pci0: <simple comms> at device 22.4 (no driver attached)
+Nov 13 06:30:26 atrium-r9700 kernel: ahci0: <Intel Cannon Lake AHCI SATA controller> port 0x7050-0x7057,0x7040-0x7043,0x7020-0x703f mem 0x98610000-0x98611fff,0x98617000-0x986170ff,0x98616000-0x986167ff at device 23.0 on pci0
+Nov 13 06:30:26 atrium-r9700 kernel: ahci0: AHCI v1.31 with 6 6Gbps ports, Port Multiplier not supported
+Nov 13 06:30:26 atrium-r9700 kernel: ahcich0: <AHCI channel> at channel 0 on ahci0
+Nov 13 06:30:26 atrium-r9700 kernel: ahcich1: <AHCI channel> at channel 1 on ahci0
+Nov 13 06:30:26 atrium-r9700 kernel: ahcich2: <AHCI channel> at channel 2 on ahci0
+Nov 13 06:30:26 atrium-r9700 kernel: ahcich3: <AHCI channel> at channel 3 on ahci0
+Nov 13 06:30:26 atrium-r9700 kernel: ahcich4: <AHCI channel> at channel 4 on ahci0
+Nov 13 06:30:26 atrium-r9700 kernel: ahcich5: <AHCI channel> at channel 5 on ahci0
+Nov 13 06:30:26 atrium-r9700 kernel: ahciem0: <AHCI enclosure management bridge> on ahci0
+Nov 13 06:30:26 atrium-r9700 kernel: pcib5: <ACPI PCI-PCI bridge> at device 28.0 on pci0
+Nov 13 06:30:26 atrium-r9700 kernel: pci5: <ACPI PCI bus> on pcib5
+Nov 13 06:30:26 atrium-r9700 kernel: igb0: <Intel(R) I210 (Copper)> port 0x5000-0x501f mem 0x98500000-0x9857ffff,0x98580000-0x98583fff at device 0.0 on pci5
+Nov 13 06:30:26 atrium-r9700 kernel: igb0: PHY reset is blocked due to SOL/IDER session.
+Nov 13 06:30:26 atrium-r9700 kernel: igb0: EEPROM V3.25-0 eTrack 0x800005cc
+Nov 13 06:30:26 atrium-r9700 kernel: igb0: Using 1024 TX descriptors and 1024 RX descriptors
+Nov 13 06:30:26 atrium-r9700 kernel: igb0: Using 4 RX queues 4 TX queues
+Nov 13 06:30:26 atrium-r9700 kernel: igb0: Using MSI-X interrupts with 5 vectors
+Nov 13 06:30:26 atrium-r9700 kernel: igb0: Ethernet address: d4:5d:64:40:e4:6c
+Nov 13 06:30:26 atrium-r9700 kernel: pcib6: <ACPI PCI-PCI bridge> at device 28.1 on pci0
+Nov 13 06:30:26 atrium-r9700 kernel: pci6: <ACPI PCI bus> on pcib6
+Nov 13 06:30:26 atrium-r9700 kernel: igb1: <Intel(R) I210 (Copper)> port 0x4000-0x401f mem 0x98400000-0x9847ffff,0x98480000-0x98483fff at device 0.0 on pci6
+Nov 13 06:30:26 atrium-r9700 kernel: igb1: PHY reset is blocked due to SOL/IDER session.
+Nov 13 06:30:26 atrium-r9700 kernel: igb1: EEPROM V3.25-0 eTrack 0x800005cc
+Nov 13 06:30:26 atrium-r9700 kernel: igb1: Using 1024 TX descriptors and 1024 RX descriptors
+Nov 13 06:30:26 atrium-r9700 kernel: igb1: Using 4 RX queues 4 TX queues
+Nov 13 06:30:26 atrium-r9700 kernel: igb1: Using MSI-X interrupts with 5 vectors
+Nov 13 06:30:26 atrium-r9700 kernel: igb1: Ethernet address: d4:5d:64:40:e4:6d
+Nov 13 06:30:26 atrium-r9700 kernel: igb1: link state changed to UP
+Nov 13 06:30:26 atrium-r9700 kernel: pcib7: <ACPI PCI-PCI bridge> at device 29.0 on pci0
+Nov 13 06:30:26 atrium-r9700 kernel: pci7: <ACPI PCI bus> on pcib7
+Nov 13 06:30:26 atrium-r9700 kernel: pcib8: <ACPI PCI-PCI bridge> at device 0.0 on pci7
+Nov 13 06:30:26 atrium-r9700 kernel: pci8: <ACPI PCI bus> on pcib8
+Nov 13 06:30:26 atrium-r9700 kernel: vgapci1: <VGA-compatible display> port 0x3000-0x307f mem 0x94000000-0x97ffffff,0x98000000-0x9801ffff at device 0.0 on pci8
+Nov 13 06:30:26 atrium-r9700 kernel: vgapci1: Boot video device
+Nov 13 06:30:26 atrium-r9700 kernel: pcib9: <ACPI PCI-PCI bridge> at device 29.2 on pci0
+Nov 13 06:30:26 atrium-r9700 kernel: pci9: <ACPI PCI bus> on pcib9
+Nov 13 06:30:26 atrium-r9700 kernel: nvme0: <Generic NVMe Device> mem 0x98300000-0x98303fff at device 0.0 on pci9
+Nov 13 06:30:26 atrium-r9700 kernel: pci0: <simple comms> at device 30.0 (no driver attached)
+Nov 13 06:30:26 atrium-r9700 kernel: isab1: <PCI-ISA bridge> at device 31.0 on pci0
+Nov 13 06:30:26 atrium-r9700 kernel: isa1: <ISA bus> on isab1
+Nov 13 06:30:26 atrium-r9700 kernel: pci0: <serial bus> at device 31.5 (no driver attached)
+Nov 13 06:30:26 atrium-r9700 kernel: acpi_button0: <Sleep Button> on acpi0
+Nov 13 06:30:26 atrium-r9700 kernel: acpi_spmc0: <System Power Management Controller> on acpi0
+Nov 13 06:30:26 atrium-r9700 kernel: acpi_spmc0: DSMs supported: <Intel>
+Nov 13 06:30:26 atrium-r9700 kernel: acpi_spmc0: DSM Intel, revision 0: Supported functions: 0x7e<DEVICE_CONSTRAINTS,CRASH_DUMP_DEVICE,DISPLAY_OFF,DISPLAY_ON,LPI_ENTRY,LPI_EXIT>
+Nov 13 06:30:26 atrium-r9700 kernel: apei0: <ACPI Platform Error Interface> on acpi0
+Nov 13 06:30:26 atrium-r9700 kernel: hest0: <APEI Hardware Errors> on apei0
+Nov 13 06:30:26 atrium-r9700 kernel: acpi_tz0: <Thermal Zone> on acpi0
+Nov 13 06:30:26 atrium-r9700 kernel: uart: ns8250: UART FCR is broken (0x1)
+Nov 13 06:30:26 atrium-r9700 kernel: uart0: <16550 or compatible> port 0x3f8-0x3ff irq 4 flags 0x10 on acpi0
+Nov 13 06:30:26 atrium-r9700 kernel: uart: ns8250: UART FCR is broken (0x1)
+Nov 13 06:30:26 atrium-r9700 kernel: uart1: <16550 or compatible> port 0x2f8-0x2ff irq 3 on acpi0
+Nov 13 06:30:26 atrium-r9700 kernel: acpi_syscontainer0: <System Container> on acpi0
+Nov 13 06:30:26 atrium-r9700 kernel: hwpstate_intel0: <Intel Speed Shift> on cpu0
+Nov 13 06:30:26 atrium-r9700 kernel: cpufreq0: <CPU frequency control> on cpu0
+Nov 13 06:30:26 atrium-r9700 kernel: hwpstate_intel1: <Intel Speed Shift> on cpu1
+Nov 13 06:30:26 atrium-r9700 kernel: cpufreq1: <CPU frequency control> on cpu1
+Nov 13 06:30:26 atrium-r9700 kernel: hwpstate_intel2: <Intel Speed Shift> on cpu2
+Nov 13 06:30:26 atrium-r9700 kernel: cpufreq2: <CPU frequency control> on cpu2
+Nov 13 06:30:26 atrium-r9700 kernel: hwpstate_intel3: <Intel Speed Shift> on cpu3
+Nov 13 06:30:26 atrium-r9700 kernel: cpufreq3: <CPU frequency control> on cpu3
+Nov 13 06:30:26 atrium-r9700 kernel: hwpstate_intel4: <Intel Speed Shift> on cpu4
+Nov 13 06:30:26 atrium-r9700 kernel: cpufreq4: <CPU frequency control> on cpu4
+Nov 13 06:30:26 atrium-r9700 kernel: hwpstate_intel5: <Intel Speed Shift> on cpu5
+Nov 13 06:30:26 atrium-r9700 kernel: cpufreq5: <CPU frequency control> on cpu5
+Nov 13 06:30:26 atrium-r9700 kernel: hwpstate_intel6: <Intel Speed Shift> on cpu6
+Nov 13 06:30:26 atrium-r9700 kernel: cpufreq6: <CPU frequency control> on cpu6
+Nov 13 06:30:26 atrium-r9700 kernel: hwpstate_intel7: <Intel Speed Shift> on cpu7
+Nov 13 06:30:26 atrium-r9700 kernel: cpufreq7: <CPU frequency control> on cpu7
+Nov 13 06:30:26 atrium-r9700 kernel: hwpstate_intel8: <Intel Speed Shift> on cpu8
+Nov 13 06:30:26 atrium-r9700 kernel: cpufreq8: <CPU frequency control> on cpu8
+Nov 13 06:30:26 atrium-r9700 kernel: hwpstate_intel9: <Intel Speed Shift> on cpu9
+Nov 13 06:30:26 atrium-r9700 kernel: cpufreq9: <CPU frequency control> on cpu9
+Nov 13 06:30:26 atrium-r9700 kernel: hwpstate_intel10: <Intel Speed Shift> on cpu10
+Nov 13 06:30:26 atrium-r9700 kernel: cpufreq10: <CPU frequency control> on cpu10
+Nov 13 06:30:26 atrium-r9700 kernel: hwpstate_intel11: <Intel Speed Shift> on cpu11
+Nov 13 06:30:26 atrium-r9700 kernel: cpufreq11: <CPU frequency control> on cpu11
+Nov 13 06:30:26 atrium-r9700 kernel: hwpstate_intel12: <Intel Speed Shift> on cpu12
+Nov 13 06:30:26 atrium-r9700 kernel: cpufreq12: <CPU frequency control> on cpu12
+Nov 13 06:30:26 atrium-r9700 kernel: hwpstate_intel13: <Intel Speed Shift> on cpu13
+Nov 13 06:30:26 atrium-r9700 kernel: cpufreq13: <CPU frequency control> on cpu13
+Nov 13 06:30:26 atrium-r9700 kernel: hwpstate_intel14: <Intel Speed Shift> on cpu14
+Nov 13 06:30:26 atrium-r9700 kernel: cpufreq14: <CPU frequency control> on cpu14
+Nov 13 06:30:26 atrium-r9700 kernel: hwpstate_intel15: <Intel Speed Shift> on cpu15
+Nov 13 06:30:26 atrium-r9700 kernel: cpufreq15: <CPU frequency control> on cpu15
+Nov 13 06:30:26 atrium-r9700 kernel: Timecounter "TSC-low" frequency 1847999473 Hz quality 1000
+Nov 13 06:30:26 atrium-r9700 kernel: Timecounters tick every 1.000 msec
+Nov 13 06:30:26 atrium-r9700 kernel: hdacc0: <ATI R6xx HDA CODEC> at cad 0 on hdac0
+Nov 13 06:30:26 atrium-r9700 kernel: hdaa0: <ATI R6xx Audio Function Group> at nid 1 on hdacc0
+Nov 13 06:30:26 atrium-r9700 kernel: pcm0: <ATI R6xx (HDMI)> at nid 3 on hdaa0
+Nov 13 06:30:26 atrium-r9700 kernel: pcm1: <ATI R6xx (HDMI)> at nid 5 on hdaa0
+Nov 13 06:30:26 atrium-r9700 kernel: pcm2: <ATI R6xx (HDMI)> at nid 7 on hdaa0
+Nov 13 06:30:26 atrium-r9700 kernel: pcm3: <ATI R6xx (HDMI)> at nid 9 on hdaa0
+Nov 13 06:30:26 atrium-r9700 kernel: ugen0.1: <Intel XHCI root HUB> at usbus0
+Nov 13 06:30:26 atrium-r9700 kernel: uhub0 on usbus0
+Nov 13 06:30:26 atrium-r9700 kernel: uhub0: <Intel XHCI root HUB, class 9/0, rev 3.00/1.00, addr 1> on usbus0
+Nov 13 06:30:26 atrium-r9700 kernel: nvme_sim0: <nvme cam> on nvme0
+Nov 13 06:30:26 atrium-r9700 kernel: Trying to mount root from ufs:/dev/ufs/atriumroot []...
+Nov 13 06:30:26 atrium-r9700 kernel: cam_periph_alloc: attempt to re-allocate valid device nda0 rejected flags 0 refcount 2
+Nov 13 06:30:26 atrium-r9700 kernel: ndaasync: Unable to attach to new device due to status 0x6
+Nov 13 06:30:26 atrium-r9700 kernel: nda0 at nvme0 bus 0 scbus7 target 0 lun 1
+Nov 13 06:30:26 atrium-r9700 kernel: nda0: <SAMSUNG MZVL21T0HCLR-00B00 GXA7801Q S676NL1W539747>
+Nov 13 06:30:26 atrium-r9700 kernel: nda0: Serial Number S676NL1W539747
+Nov 13 06:30:26 atrium-r9700 kernel: nda0: nvme version 1.3
+Nov 13 06:30:26 atrium-r9700 kernel: nda0: 976762MB (2000409264 512 byte sectors)
+Nov 13 06:30:26 atrium-r9700 kernel: ses0 at ahciem0 bus 0 scbus6 target 0 lun 0
+Nov 13 06:30:26 atrium-r9700 kernel: ses0: <AHCI SGPIO Enclosure 2.00 0001> SEMB S-E-S 2.00 device
+Nov 13 06:30:26 atrium-r9700 kernel: ses0: SEMB SES Device
+Nov 13 06:30:26 atrium-r9700 kernel: Root mount waiting for: usbus0
+Nov 13 06:30:26 atrium-r9700 kernel: uhub0: 22 ports with 22 removable, self powered
+Nov 13 06:30:26 atrium-r9700 kernel: acpi_wmi0: <ACPI-WMI mapping> on acpi0
+Nov 13 06:30:26 atrium-r9700 kernel: acpi_wmi0: cannot find EC device
+Nov 13 06:30:26 atrium-r9700 kernel: acpi_wmi0: Embedded MOF found
+Nov 13 06:30:26 atrium-r9700 kernel: acpi_wmi1: <ACPI-WMI mapping> on acpi0
+Nov 13 06:30:26 atrium-r9700 kernel: acpi_wmi1: cannot find EC device
+Nov 13 06:30:26 atrium-r9700 kernel: acpi_wmi1: Embedded MOF found
+Nov 13 06:30:26 atrium-r9700 kernel: pchtherm0: <CannonLake-H Thermal Subsystem> mem 0x9861d000-0x9861dfff at device 18.0 on pci0
+Nov 13 06:30:26 atrium-r9700 kernel: ig4iic0: <Intel Cannon Lake-H I2C Controller-0> at device 21.0 on pci0
+Nov 13 06:30:26 atrium-r9700 kernel: ig4iic0: Using MSI
+Nov 13 06:30:26 atrium-r9700 kernel: iicbus0: <Philips I2C bus (ACPI-hinted)> on ig4iic0
+Nov 13 06:30:26 atrium-r9700 kernel: ig4iic1: <Intel Cannon Lake-H I2C Controller-1> at device 21.1 on pci0
+Nov 13 06:30:26 atrium-r9700 kernel: ig4iic1: Using MSI
+Nov 13 06:30:26 atrium-r9700 kernel: iicbus1: <Philips I2C bus (ACPI-hinted)> on ig4iic1
+Nov 13 06:30:26 atrium-r9700 kernel: ichsmb0: <Intel Cannon Lake SMBus controller> port 0xefa0-0xefbf mem 0x98614000-0x986140ff at device 31.4 on pci0
+Nov 13 06:30:26 atrium-r9700 kernel: smbus0: <System Management Bus> on ichsmb0
+Nov 13 06:30:26 atrium-r9700 kernel: igb1: changing name to 'wan0'
+Nov 13 06:30:26 atrium-r9700 kernel: wan0: link state changed to DOWN
+Nov 13 06:30:26 atrium-r9700 kernel: lo0: link state changed to UP
+Nov 13 06:30:26 atrium-r9700 ntpd[2457]: ntpd 4.2.8p18-a (1): Starting
+Nov 13 06:30:26 atrium-r9700 ntpd[2457]: Command line: /usr/sbin/ntpd -p /var/db/ntp/ntpd.pid -c /etc/ntp.conf -f /var/db/ntp/ntpd.drift -g
+Nov 13 06:30:26 atrium-r9700 ntpd[2457]: ----------------------------------------------------
+Nov 13 06:30:26 atrium-r9700 ntpd[2457]: ntp-4 is maintained by Network Time Foundation,
+Nov 13 06:30:26 atrium-r9700 ntpd[2457]: Inc. (NTF), a non-profit 501(c)(3) public-benefit
+Nov 13 06:30:26 atrium-r9700 ntpd[2457]: corporation.  Support and training for ntp-4 are
+Nov 13 06:30:26 atrium-r9700 ntpd[2457]: available at https://www.nwtime.org/support
+Nov 13 06:30:26 atrium-r9700 ntpd[2457]: ----------------------------------------------------
+Nov 13 06:30:26 atrium-r9700 ntpd[2458]: leapsecond file ('/var/db/ntpd.leap-seconds.list'): good hash signature
+Nov 13 06:30:26 atrium-r9700 ntpd[2458]: leapsecond file ('/var/db/ntpd.leap-seconds.list'): loaded, expire=2027-06-28T00:00:00Z last=2017-01-01T00:00:00Z ofs=37
+Nov 13 06:30:27 atrium-r9700 kernel: Security policy loaded: MAC/ntpd (mac_ntpd)
+Nov 13 06:30:28 atrium-r9700 kernel: wan0: link state changed to UP
+Nov 13 06:32:01 atrium-r9700 kernel: vgapci0: detached
+Nov 13 06:32:01 atrium-r9700 kernel: atrium_gpu_amd_pci0: <Atrium AMD GPU — PCI base> port 0x6000-0x60ff mem 0x80000000-0x8fffffff,0x90000000-0x901fffff,0x98100000-0x9817ffff at device 0.0 on pci3
+Nov 13 06:32:01 atrium-r9700 kernel: atrium_gpu_amd_pci0: silicon: 32624 MiB VRAM, 46 IP instances
+Nov 13 06:32:01 atrium-r9700 kernel: atrium_gpu_amd_pci0:   GC      12.0.1 (4 segments, base0 0x1260)
+Nov 13 06:32:01 atrium-r9700 kernel: atrium_gpu_amd_pci0:   PSP     14.0.3 (8 segments, base0 0x16000)
+Nov 13 06:32:01 atrium-r9700 kernel: atrium_gpu_amd_pci0:   SMU     14.0.3 (8 segments, base0 0x16000)
+Nov 13 06:32:01 atrium-r9700 kernel: atrium_gpu_amd_pci0:   SDMA    7.0.1 (4 segments, base0 0x1260)
+Nov 13 06:32:01 atrium-r9700 kernel: atrium_gpu_amd_pci0:   MMHUB   4.1.0 (2 segments, base0 0x1a000)
+Nov 13 06:32:01 atrium-r9700 kernel: atrium_gpu_amd_pci0:   OSSSYS  7.0.0 (2 segments, base0 0x10a0)
+Nov 13 06:32:01 atrium-r9700 kernel: atrium_gpu_amd_pci0:   HDP     7.0.0 (2 segments, base0 0xf20)
+Nov 13 06:32:01 atrium-r9700 kernel: atrium_gpu_amd_pci0:   NBIF    6.3.1 (6 segments, base0 0)
+Nov 13 06:32:01 atrium-r9700 kernel: atrium_gpu_amd_pci0:   DCN     4.1.0 (5 segments, base0 0x12)
+Nov 13 06:32:01 atrium-r9700 kernel: atrium_gpu_amd_pci0:   VCN     5.0.0 (2 segments, base0 0x7800)
+Nov 13 06:32:01 atrium-r9700 kernel: atrium_gpu_amd_pci0: silicon, ISA gfx1201
+Nov 13 06:32:01 atrium-r9700 kernel: atrium_gpu_amd_pci0: psp: amdgpu/psp_14_0_3_sos.bin, 9 pieces; buffer VRAM+0x4000000 = MC 0x8004000000
+Nov 13 06:32:01 atrium-r9700 kernel: atrium_gpu_amd_pci0: psp: [0] type 3 version 0x703b0001, 6816 bytes, cmd 0x80000
+Nov 13 06:32:01 atrium-r9700 kernel: atrium_gpu_amd_pci0: psp: [1] type 5 version 0x1003a00, 832 bytes, cmd 0x10000000
+Nov 13 06:32:01 atrium-r9700 kernel: atrium_gpu_amd_pci0: psp: [2] type 2 version 0x3a1214, 78272 bytes, cmd 0x10000
+Nov 13 06:32:01 atrium-r9700 kernel: atrium_gpu_amd_pci0: psp: [3] type 7 version 0x3a1214, 103792 bytes, cmd 0xb0000
+Nov 13 06:32:01 atrium-r9700 kernel: atrium_gpu_amd_pci0: psp: [4] type 8 version 0x3a1214, 37280 bytes, cmd 0xd0000
+Nov 13 06:32:01 atrium-r9700 kernel: atrium_gpu_amd_pci0: psp: [5] type 9 version 0x3a1214, 53344 bytes, cmd 0xc0000
+Nov 13 06:32:01 atrium-r9700 kernel: atrium_gpu_amd_pci0: psp: [6] type 10 version 0x3a1214, 12704 bytes, cmd 0xe0000
+Nov 13 06:32:01 atrium-r9700 kernel: atrium_gpu_amd_pci0: psp: [7] type 11 version 0x3a1214, 12848 bytes, cmd 0xf0000
+Nov 13 06:32:01 atrium-r9700 kernel: atrium_gpu_amd_pci0: psp: [8] type 1 version 0x3a1214, 125472 bytes, cmd 0x20000
+Nov 13 06:32:01 atrium-r9700 kernel: atrium_gpu_amd_pci0: psp: sOS up; C2PMSG_35 0, C2PMSG_81 0x8cbaa8c
+Nov 13 06:32:01 atrium-r9700 kernel: atrium_gpu_amd_pci0: psp: KM ring created (C2PMSG_64 0x80c20000)
+Nov 13 06:32:01 atrium-r9700 kernel: atrium_gpu_amd_pci0: psp: fw reservation: status 0, VRAM 0x7f3e00000 + 0x3200000 (50 MiB)
+Nov 13 06:32:01 atrium-r9700 kernel: atrium_gpu_amd_pci0: psp: fw reservation (ext): status 0, VRAM 0x7d6c00000 + 0x400000 (4 MiB) NOT at the top of VRAM
+Nov 13 06:32:01 atrium-r9700 kernel: atrium_gpu_amd_pci0: psp: fence 0x3; resp 00000000 00000000 deadbeef deadbeef 00000000 deadbeef deadbeef deadbeef
+Nov 13 06:32:01 atrium-r9700 kernel: atrium_gpu_amd_pci0: psp: LOAD_TOC (2304 bytes): done, status 0, TMR size 0 (0 MiB)
+Nov 13 06:32:01 atrium-r9700 kernel: atrium_gpu_amd_pci0: psp: before: RLC bootload status 0, CP_STAT 0
+Nov 13 06:32:01 atrium-r9700 kernel: atrium_gpu_amd_pci0: psp: 20 IP firmware images, 2020 KiB staged at VRAM+0x4400000
+Nov 13 06:32:01 atrium-r9700 kernel: atrium_gpu_amd_pci0: psp: LOAD_IP_FW type 18, 327168 bytes: status 0
+Nov 13 06:32:01 atrium-r9700 kernel: atrium_gpu_amd_pci0: psp: LOAD_IP_FW type 71, 46848 bytes: status 0
+Nov 13 06:32:01 atrium-r9700 kernel: atrium_gpu_amd_pci0: psp: LOAD_IP_FW type 87, 92992 bytes: status 0
+Nov 13 06:32:01 atrium-r9700 kernel: atrium_gpu_amd_pci0: psp: LOAD_IP_FW type 88, 201152 bytes: status 0
+Nov 13 06:32:01 atrium-r9700 kernel: atrium_gpu_amd_pci0: psp: LOAD_IP_FW type 89, 193248 bytes: status 0
+Nov 13 06:32:01 atrium-r9700 kernel: atrium_gpu_amd_pci0: psp: LOAD_IP_FW type 90, 66368 bytes: status 0
+Nov 13 06:32:01 atrium-r9700 kernel: atrium_gpu_amd_pci0: psp: LOAD_IP_FW type 92, 66192 bytes: status 0
+Nov 13 06:32:01 atrium-r9700 kernel: atrium_gpu_amd_pci0: psp: LOAD_IP_FW type 94, 66080 bytes: status 0
+Nov 13 06:32:01 atrium-r9700 kernel: atrium_gpu_amd_pci0: psp: LOAD_IP_FW type 95, 66080 bytes: status 0
+Nov 13 06:32:01 atrium-r9700 kernel: atrium_gpu_amd_pci0: psp: LOAD_IP_FW type 33, 217104 bytes: status 0
+Nov 13 06:32:01 atrium-r9700 kernel: atrium_gpu_amd_pci0: psp: LOAD_IP_FW type 34, 82048 bytes: status 0
+Nov 13 06:32:01 atrium-r9700 kernel: atrium_gpu_amd_pci0: psp: LOAD_IP_FW type 81, 217104 bytes: status 0
+Nov 13 06:32:01 atrium-r9700 kernel: atrium_gpu_amd_pci0: psp: LOAD_IP_FW type 82, 82048 bytes: status 0
+Nov 13 06:32:01 atrium-r9700 kernel: atrium_gpu_amd_pci0: psp: LOAD_IP_FW type 68, 66048 bytes: status 0
+Nov 13 06:32:01 atrium-r9700 kernel: atrium_gpu_amd_pci0: psp: LOAD_IP_FW type 69, 66048 bytes: status 0
+Nov 13 06:32:01 atrium-r9700 kernel: atrium_gpu_amd_pci0: psp: LOAD_IP_FW type 20, 2560 bytes: status 0
+Nov 13 06:32:01 atrium-r9700 kernel: atrium_gpu_amd_pci0: psp: LOAD_IP_FW type 21, 23616 bytes: status 0
+Nov 13 06:32:01 atrium-r9700 kernel: atrium_gpu_amd_pci0: psp: LOAD_IP_FW type 26, 66048 bytes: status 0
+Nov 13 06:32:01 atrium-r9700 kernel: atrium_gpu_amd_pci0: psp: LOAD_IP_FW type 48, 33280 bytes: status 0
+Nov 13 06:32:01 atrium-r9700 kernel: atrium_gpu_amd_pci0: psp: LOAD_IP_FW type 8, 25088 bytes: status 0
+Nov 13 06:32:01 atrium-r9700 kernel: atrium_gpu_amd_pci0: psp: AUTOLOAD_RLC: status 0
+Nov 13 06:32:03 atrium-r9700 kernel: atrium_gpu_amd_pci0: psp: RLC autoload NOT complete after 2000000 us: bootload status 0, CP_STAT 0
+Nov 13 06:32:03 atrium-r9700 kernel: atrium_gpu_amd_pci0: psp: rings destroyed (C2PMSG_64 0x80c30000)
+Nov 13 06:32:03 atrium-r9700 kernel: atrium_gpu_amd_pci0: smu: SMU 14.0.3, response register 0x1
+Nov 13 06:32:03 atrium-r9700 kernel: atrium_gpu_amd_pci0: smu: before: GB_ADDR_CONFIG 0, RLC bootload status 0, CP_STAT 0
+Nov 13 06:32:03 atrium-r9700 kernel: atrium_gpu_amd_pci0: smu: TestMessage                arg 0000000000: resp 0x1, out 0x1
+Nov 13 06:32:03 atrium-r9700 kernel: atrium_gpu_amd_pci0: smu: GetSmuVersion              arg 0000000000: resp 0x1, out 0x685000
+Nov 13 06:32:03 atrium-r9700 kernel: atrium_gpu_amd_pci0: smu: GetDriverIfVersion         arg 0000000000: resp 0x1, out 0x33
+Nov 13 06:32:03 atrium-r9700 kernel: atrium_gpu_amd_pci0: smu: SetDriverDramAddrHigh      arg 0x00000080: resp 0x1
+Nov 13 06:32:03 atrium-r9700 kernel: atrium_gpu_amd_pci0: smu: SetDriverDramAddrLow       arg 0x05400000: resp 0x1
+Nov 13 06:32:03 atrium-r9700 kernel: atrium_gpu_amd_pci0: smu: GetRunningSmuFeaturesLow   arg 0000000000: resp 0x1, out 0
+Nov 13 06:32:03 atrium-r9700 kernel: atrium_gpu_amd_pci0: smu: GetRunningSmuFeaturesHigh  arg 0000000000: resp 0x1, out 0
+Nov 13 06:32:03 atrium-r9700 kernel: atrium_gpu_amd_pci0: smu: running features 000000000000000000
+Nov 13 06:32:03 atrium-r9700 kernel: atrium_gpu_amd_pci0: smu: RunDcBtc                   arg 0000000000: resp 0x1
+Nov 13 06:32:03 atrium-r9700 kernel: atrium_gpu_amd_pci0: smu: SetAllowedFeaturesMaskHigh arg 0xffffffff: resp 0xfd
+Nov 13 06:32:03 atrium-r9700 kernel: atrium_gpu_amd_pci0: smu: allowed mask refused: SCPM, the PSP owns it
+Nov 13 06:32:03 atrium-r9700 kernel: atrium_gpu_amd_pci0: smu: EnableAllSmuFeatures       arg 0000000000: resp 0x1
+Nov 13 06:32:03 atrium-r9700 kernel: atrium_gpu_amd_pci0: smu: GetRunningSmuFeaturesLow   arg 0000000000: resp 0x1, out 0x38fffcfb
+Nov 13 06:32:03 atrium-r9700 kernel: atrium_gpu_amd_pci0: smu: GetRunningSmuFeaturesHigh  arg 0000000000: resp 0x1, out 0x488f19e
+Nov 13 06:32:03 atrium-r9700 kernel: atrium_gpu_amd_pci0: smu: running features 0x0488f19e38fffcfb
+Nov 13 06:32:03 atrium-r9700 kernel: atrium_gpu_amd_pci0: smu: protection features running (thermal trip, throttlers, fan, VR hot, memory temperature)
+Nov 13 06:32:03 atrium-r9700 kernel: atrium_gpu_amd_pci0: smu: DisallowGfxOff             arg 0000000000: resp 0x1
+Nov 13 06:32:03 atrium-r9700 kernel: atrium_gpu_amd_pci0: smu: RLC autoload complete after 0 us
+Nov 13 06:32:03 atrium-r9700 kernel: atrium_gpu_amd_pci0: smu: after: GB_ADDR_CONFIG 0x8200545, RLC bootload status 0x8000003f, CP_STAT 0
+Nov 13 06:32:03 atrium-r9700 kernel: atrium_gpu_amd_pci0: smu: TransferTableSmu2Dram      arg 0x00000005: resp 0x1
+Nov 13 06:32:03 atrium-r9700 kernel: atrium_gpu_amd_pci0: smu: metrics +  0: e8 03 00 00 24 02 00 00 60 00 00 00 54 04 00 00 19 00 00 00 19 00 00 00 58 02 00 00 58 02 00 00
+Nov 13 06:32:03 atrium-r9700 kernel: atrium_gpu_amd_pci0: smu: metrics + 32: cf 02 00 00 cf 02 00 00 cf 02 00 00 48 01 38 01 38 01 00 04 f7 03 bc 02 e4 02 19 00 19 00 00 00
+Nov 13 06:32:03 atrium-r9700 kernel: atrium_gpu_amd_pci0: smu: metrics + 64: 00 00 49 00 2c 01 00 00 28 07 d6 06 d6 06 4d 04 3d 04 62 00 67 00 18 00 18 00 63 00 00 00 00 00
+Nov 13 06:32:03 atrium-r9700 kernel: atrium_gpu_amd_pci0: smu: metrics + 96: 09 00 00 00 46 00 00 00 08 00 00 00 d9 00 1b 01 c9 00 73 01 b9 47 ae 03 63 00 53 05 1e 00 00 00
+Nov 13 06:32:03 atrium-r9700 kernel: atrium_gpu_amd_pci0: smu: metrics +128: 00 00 00 00 32 00 00 00 15 00 15 00 1c 00 23 00 23 00 21 00 04 00 08 00 09 00 08 00 09 00 00 00
+Nov 13 06:32:03 atrium-r9700 kernel: atrium_gpu_amd_pci0: smu: metrics +160: 00 00 00 00 00 00 03 08 03 03 7e 03 00 43 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+Nov 13 06:32:03 atrium-r9700 kernel: atrium_gpu_amd_pci0: smu: metrics +192: 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+Nov 13 06:32:03 atrium-r9700 kernel: atrium_gpu_amd_pci0: smu: metrics +224: 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 9f 6c ce 74
+Nov 13 06:32:03 atrium-r9700 kernel: atrium_gpu_amd_pci0: smu: metrics +256: e2 f1 df b8
+Nov 13 06:32:03 atrium-r9700 kernel: atrium_gpu_amd_pci0: smu: telemetry #8: edge 28 C, hotspot 35 C, mem 4 C, VR 8 C; power 21 W of 300 W limit, board 21 W; fan 894 rpm (3%); gfx 312 MHz, mem 740 MHz, gfx busy 30%; throttle 0x1 (ids 0x2)
+Nov 13 06:32:04 atrium-r9700 kernel: atrium_gpu_amd_pci0: smu: sample [GC up, no idle setup] 1/1
+Nov 13 06:32:04 atrium-r9700 kernel: atrium_gpu_amd_pci0: smu: TransferTableSmu2Dram      arg 0x00000005: resp 0x1
+Nov 13 06:32:04 atrium-r9700 kernel: atrium_gpu_amd_pci0: smu: telemetry #1059: edge 29 C, hotspot 58 C, mem 30 C, VR 34 C; power 263 W of 300 W limit, board 263 W; fan 970 rpm (20%); gfx 3165 MHz, mem 193 MHz, gfx busy 100%; throttle 0x1 (ids 0x2)
+Nov 13 06:32:04 atrium-r9700 kernel: atrium_gpu_amd_pci0: smu: busy or at the power limit with no work queued
+Nov 13 06:32:04 atrium-r9700 kernel: atrium_gpu_amd_pci0: gfx: idle sequence GC 12.0.0/1: SRM, clock gating
+Nov 13 06:32:04 atrium-r9700 kernel: atrium_gpu_amd_pci0: gfx: before idle setup: GRBM_STATUS 0x382c, RLC_CNTL 0x1, RLC_STAT 0, MGCG_OVERRIDE 0x7ff, CGCG_CGLS 0x1003c, CGCG_CGLS_3D 0x3c, SRM 0x2, CP_INT_CNTL 0, CP_INT_CNTL_RING0 0
+Nov 13 06:32:04 atrium-r9700 kernel: atrium_gpu_amd_pci0: gfx: after idle setup: GRBM_STATUS 0x800382c, RLC_CNTL 0x1, RLC_STAT 0x35, MGCG_OVERRIDE 0x40, CGCG_CGLS 0x363f, CGCG_CGLS_3D 0x363f, SRM 0x3, CP_INT_CNTL 0x3c0000, CP_INT_CNTL_RING0 0x3c0000
+Nov 13 06:32:04 atrium-r9700 kernel: atrium_gpu_amd_pci0: smu: AllowGfxOff                arg 0000000000: resp 0x1
+Nov 13 06:32:04 atrium-r9700 kernel: atrium_gpu_amd_pci0: smu: sample [idle check] 1/5
+Nov 13 06:32:04 atrium-r9700 kernel: atrium_gpu_amd_pci0: smu: TransferTableSmu2Dram      arg 0x00000005: resp 0x1
+Nov 13 06:32:04 atrium-r9700 kernel: atrium_gpu_amd_pci0: smu: telemetry #1: edge 30 C, hotspot 66 C, mem 30 C, VR 36 C; power 287 W of 300 W limit, board 287 W; fan 852 rpm (20%); gfx 3269 MHz, mem 193 MHz, gfx busy 100%; throttle 0 (ids 0)
+Nov 13 06:32:04 atrium-r9700 kernel: atrium_gpu_amd_pci0: smu: busy or at the power limit with no work queued
+Nov 13 06:32:05 atrium-r9700 kernel: atrium_gpu_amd_pci0: smu: sample [idle check] 2/5
+Nov 13 06:32:05 atrium-r9700 kernel: atrium_gpu_amd_pci0: smu: TransferTableSmu2Dram      arg 0x00000005: resp 0x1
+Nov 13 06:32:05 atrium-r9700 kernel: atrium_gpu_amd_pci0: smu: telemetry #1055: edge 29 C, hotspot 36 C, mem 30 C, VR 30 C; power 13 W of 300 W limit, board 13 W; fan 874 rpm (20%); gfx 6 MHz, mem 193 MHz, gfx busy 0%; throttle 0x1 (ids 0x2)
+Nov 13 06:32:05 atrium-r9700 kernel: atrium_gpu_amd_pci0: smu: card proven idle
+Nov 13 06:32:05 atrium-r9700 kernel: atrium_gpu_amd_pci0: gfx: end: GRBM_STATUS 0, RLC_CNTL 0, RLC_STAT 0, MGCG_OVERRIDE 0, CGCG_CGLS 0, CGCG_CGLS_3D 0, SRM 0, CP_INT_CNTL 0, CP_INT_CNTL_RING0 0
+Nov 13 06:32:05 atrium-r9700 kernel: atrium_gpu_amd_pci0: smu: DisallowGfxOff             arg 0000000000: resp 0x1
+Nov 13 06:32:05 atrium-r9700 kernel: atrium_gpu_amd_pci0: gmc: VRAM 32640 MiB at MC 0x8000000000-0x87f7ffffff (FB offset 0); GART 512 MiB at 0, table at MC 0x8005800000
+Nov 13 06:32:05 atrium-r9700 kernel: atrium_gpu_amd_pci0: gmc: MMHUB 4.1 before: CONTEXT0_CNTL 0x3fffc00, PT base 000000000, L1_TLB 0x501, L2_CNTL 0x80602, fault status 0 (addr 000000000)
+Nov 13 06:32:05 atrium-r9700 kernel: atrium_gpu_amd_pci0: gmc: GFXHUB (GC 12.0) before: CONTEXT0_CNTL 0x3fffc00, PT base 000000000, L1_TLB 0x501, L2_CNTL 0x80602, fault status 0 (addr 000000000)
+Nov 13 06:32:05 atrium-r9700 kernel: atrium_gpu_amd_pci0: gmc: MMHUB 4.1 after: CONTEXT0_CNTL 0x3fffc01, PT base 005800001, L1_TLB 0x1859, L2_CNTL 0x80e01, fault status 0 (addr 000000000)
+Nov 13 06:32:05 atrium-r9700 kernel: atrium_gpu_amd_pci0: gmc: GFXHUB (GC 12.0) after: CONTEXT0_CNTL 0x3fffc01, PT base 005800001, L1_TLB 0x1859, L2_CNTL 0x80e01, fault status 0 (addr 000000000)
+Nov 13 06:32:05 atrium-r9700 kernel: atrium_gpu_amd_pci0: gmc: TLB flush on both hubs: acked
+Nov 13 06:32:05 atrium-r9700 kernel: atrium_gpu_amd_pci0: gfx12: before: GRBM_STATUS 0x800382c, CP_STAT 0, CP_ME_CNTL 0xa000, CP_MEC_RS64_CNTL 0x3c000000, CP_DEBUG 0x20400000, GRBM_CNTL 0x300018
+Nov 13 06:32:05 atrium-r9700 kernel: atrium_gpu_amd_pci0: gfx12: halted: GRBM_STATUS 0x382c, CP_STAT 0, CP_ME_CNTL 0x1400a000, CP_MEC_RS64_CNTL 0x40030000, CP_DEBUG 0x20400000, GRBM_CNTL 0x300018
+Nov 13 06:32:05 atrium-r9700 kernel: atrium_gpu_amd_pci0: gfx12: GB_ADDR_CONFIG 0x8200545 (address fields: pipes 32, se 16, rb/se 4, pkrs 32, interleave 256 B)
+Nov 13 06:32:05 atrium-r9700 kernel: atrium_gpu_amd_pci0: gfx12: active SAs 8 of 16 (mask 0xff)
+Nov 13 06:32:05 atrium-r9700 kernel: atrium_gpu_amd_pci0: gfx12: RB disable 0/0, SA disable 0xff0000/0xff0000, DB_RING_CONTROL 0x1
+Nov 13 06:32:05 atrium-r9700 kernel: atrium_gpu_amd_pci0: gfx12: RS64 start: PFP 0x7000000003000, ME 0x7000000003000, MEC 0x7000000003000
+Nov 13 06:32:05 atrium-r9700 kernel: atrium_gpu_amd_pci0: gfx12: SH_MEM VMID 1: config 0xc00c, bases 0x20001000; VMID 8: config 0xc00c, bases 0x10002
+Nov 13 06:32:05 atrium-r9700 kernel: atrium_gpu_amd_pci0: gfx12: after: GRBM_STATUS 0x382c, CP_STAT 0, CP_ME_CNTL 0x1400a000, CP_MEC_RS64_CNTL 0x40000000, CP_DEBUG 0x20408000, GRBM_CNTL 0x3000ff
+Nov 13 06:32:05 atrium-r9700 kernel: atrium_gpu_amd_pci0: gfx12: stage 4c done; CP halted
+Nov 13 06:32:05 atrium-r9700 kernel: atrium_gpu_amd_pci0: ih: OSSSYS 7.0, ring 64 KiB at GART 0x1000 (pa 0x449640000), wptr writeback at GART 0x11000
+Nov 13 06:32:05 atrium-r9700 kernel: atrium_gpu_amd_pci0: ih: before: RB_CNTL 0x40610000, RPTR 0, WPTR 0 (writeback 0), STATUS 0xc0847, no interrupts 0
+Nov 13 06:32:05 atrium-r9700 kernel: atrium_gpu_amd_pci0: ih: MSI, 1 vector, for every IH client
+Nov 13 06:32:05 atrium-r9700 kernel: atrium_gpu_amd_pci0: ih: enabled: RB_CNTL 0x4033011d, RPTR 0, WPTR 0 (writeback 0), STATUS 0xc0847, MSI interrupts 0
+Nov 13 06:32:05 atrium-r9700 kernel: atrium_gpu_amd_pci0: mes: MSCRATCH 2 x 256 KiB at GART 0x100000, zeroed before every start
+Nov 13 06:32:05 atrium-r9700 kernel: atrium_gpu_amd_pci0: mes: MES 12 (GC 12.0.0/1, unified), start 0xfffffffff0005000, block at GART 0x20000 (pa 0x449638000), doorbell BAR 2048 KiB
+Nov 13 06:32:05 atrium-r9700 kernel: atrium_gpu_amd_pci0: mes: before: CP_MES_CNTL 0x40000000; pipe 0: instr 0x800, GP3 0, HQD active 0, rptr 0, wptr 0; pipe 1: instr 0x800, GP3 0, HQD active 0, rptr 0, wptr 0; GRBM_STATUS 0x800382c, CP_STAT 0, RLC_STAT 0x35
+Nov 13 06:32:05 atrium-r9700 kernel: atrium_gpu_amd_pci0: mes: before: GRBM_STATUS2 0x4110000, GRBM_STATUS3 0x4000, CP_CPC_STATUS 0, CP_CPC_BUSY_STAT 0/0, CP_CPF_STATUS 0, CP_BUSY_STAT 0, RLC_GPM_STAT 0x140037
+Nov 13 06:32:05 atrium-r9700 kernel: atrium_gpu_amd_pci0: mes: before start: pipe 0 IC_BASE 0x7f461d000 (cntl 0), MIBOUND 00007ffff, MDBASE 0x7f5500000, MDBOUND 00007ffff, MSCRATCH 000000000, LOCAL_BASE0 0
+Nov 13 06:32:05 atrium-r9700 kernel: atrium_gpu_amd_pci0: mes: before start: pipe 1 IC_BASE 0x7f469d000 (cntl 0), MIBOUND 00007ffff, MDBASE 0x7f5580000, MDBOUND 00007ffff, MSCRATCH 000000000, LOCAL_BASE0 0
+Nov 13 06:32:05 atrium-r9700 kernel: atrium_gpu_amd_pci0: gmc: MMHUB 4.1 before MES: CONTEXT0_CNTL 0x3fffc01, PT base 005800001, L1_TLB 0x1859, L2_CNTL 0x80e01, fault status 0 (addr 000000000)
+Nov 13 06:32:05 atrium-r9700 kernel: atrium_gpu_amd_pci0: gmc: GFXHUB (GC 12.0) before MES: CONTEXT0_CNTL 0x3fffc01, PT base 005800001, L1_TLB 0x1859, L2_CNTL 0x80e01, fault status 0 (addr 000000000)
+Nov 13 06:32:05 atrium-r9700 kernel: atrium_gpu_amd_pci0: gfx: before MES: GRBM_STATUS 0x382c, RLC_CNTL 0x1, RLC_STAT 0, MGCG_OVERRIDE 0x40, CGCG_CGLS 0x363f, CGCG_CGLS_3D 0x363f, SRM 0x3, CP_INT_CNTL 0x3c0000, CP_INT_CNTL_RING0 0x3c0000
+Nov 13 06:32:05 atrium-r9700 kernel: atrium_gpu_amd_pci0: mes: CP running before MES (as amdgpu): CP_ME_CNTL 0xa000, CP_MEC_RS64_CNTL 0x3c000000, CP_STAT 0 after 4 us, CP_CPF_STATUS 0
+Nov 13 06:32:05 atrium-r9700 kernel: atrium_gpu_amd_pci0: mes: attempt 1: pipe 0 firmware up (GP3 0x1029097) after 0 us
+Nov 13 06:32:05 atrium-r9700 kernel: atrium_gpu_amd_pci0: mes: attempt 1: pipe 1 firmware up (GP3 0x1029097) after 0 us
+Nov 13 06:32:05 atrium-r9700 kernel: atrium_gpu_amd_pci0: mes: started on attempt 1 of 3
+Nov 13 06:32:05 atrium-r9700 kernel: atrium_gpu_amd_pci0: mes: started: CP_MES_CNTL 0xc000000; pipe 0: instr 0x7ec4, GP3 0x1029097, HQD active 0, rptr 0, wptr 0; pipe 1: instr 0x7ec4, GP3 0x1029097, HQD active 0, rptr 0, wptr 0; GRBM_STATUS 0x382c, CP_STAT 0, RLC_STAT 0x25
+Nov 13 06:32:05 atrium-r9700 kernel: atrium_gpu_amd_pci0: mes: started: GRBM_STATUS2 0x100000, GRBM_STATUS3 0, CP_CPC_STATUS 0, CP_CPC_BUSY_STAT 0/0, CP_CPF_STATUS 0, CP_BUSY_STAT 0, RLC_GPM_STAT 0x140037
+Nov 13 06:32:05 atrium-r9700 kernel: atrium_gpu_amd_pci0: mes: pipe 1 HQD by register: active 1, doorbell 0x18
+Nov 13 06:32:05 atrium-r9700 kernel: atrium_gpu_amd_pci0: mes: version (pipe 1) 0x1029097
+Nov 13 06:32:05 atrium-r9700 kernel: atrium_gpu_amd_pci0: mes: pipe 1 SET_HW_RESOURCES: ok in 240 us (status 0x1)
+Nov 13 06:32:05 atrium-r9700 kernel: atrium_gpu_amd_pci0: mes: pipe 1 SET_HW_RESOURCES_1: ok in 100 us (status 0x1)
+Nov 13 06:32:05 atrium-r9700 kernel: atrium_gpu_amd_pci0: mes: pipe 1 ADD_QUEUE (scheduler): ok in 120 us (status 0x1)
+Nov 13 06:32:05 atrium-r9700 kernel: atrium_gpu_amd_pci0: mes: version (pipe 0) 0x1029097
+Nov 13 06:32:05 atrium-r9700 kernel: atrium_gpu_amd_pci0: mes: pipe 0 SET_HW_RESOURCES: ok in 330 us (status 0x1)
+Nov 13 06:32:05 atrium-r9700 kernel: atrium_gpu_amd_pci0: mes: pipe 0 SET_HW_RESOURCES_1: ok in 110 us (status 0x1)
+Nov 13 06:32:05 atrium-r9700 kernel: atrium_gpu_amd_pci0: mes: pipe 0 QUERY_SCHEDULER_STATUS: ok in 90 us (status 0x1)
+Nov 13 06:32:05 atrium-r9700 kernel: atrium_gpu_amd_pci0: mes: answered: CP_MES_CNTL 0xc000000; pipe 0: instr 0x180e, GP3 0x1029097, HQD active 1, rptr 0x180, wptr 0x180; pipe 1: instr 0x7ec4, GP3 0x1029097, HQD active 1, rptr 0x180, wptr 0x180; GRBM_STATUS 0xa800382c, CP_STAT 0, RLC_STAT 0x25
+Nov 13 06:32:05 atrium-r9700 kernel: atrium_gpu_amd_pci0: mes: answered: GRBM_STATUS2 0x100000, GRBM_STATUS3 0, CP_CPC_STATUS 0, CP_CPC_BUSY_STAT 0/0, CP_CPF_STATUS 0, CP_BUSY_STAT 0, RLC_GPM_STAT 0x140037
+Nov 13 06:32:05 atrium-r9700 kernel: atrium_gpu_amd_pci0: dispatch: block at GART 0x40000 (pa 0x449650000), shader 0x43000, IB 0x44000 (56 dw), out 0x45000, doorbell 0x6
+Nov 13 06:32:05 atrium-r9700 kernel: atrium_gpu_amd_pci0: mes: pipe 0 ADD_QUEUE (compute): ok in 90 us (status 0x1)
+Nov 13 06:32:05 atrium-r9700 kernel: atrium_gpu_amd_pci0: dispatch: mapped: HQD active 1, rptr 0, wptr 0, doorbell 0x60000018; rptr report 0, fence 0; CP_STAT 0, CPC_STATUS 0x80110400, GRBM_STATUS 0xa800382c
+Nov 13 06:32:05 atrium-r9700 kernel: atrium_gpu_amd_pci0: dispatch: fence 0x4e000001 after 30 us
+Nov 13 06:32:05 atrium-r9700 kernel: atrium_gpu_amd_pci0: dispatch: fence: HQD active 1, rptr 0xc, wptr 0xc, doorbell 0xe0000018; rptr report 0xc, fence 0x4e000001; CP_STAT 0, CPC_STATUS 0, GRBM_STATUS 0x382c
+Nov 13 06:32:05 atrium-r9700 kernel: atrium_gpu_amd_pci0: dispatch: out: all 64 words 0x2a, matches the oracle golden
+Nov 13 06:32:05 atrium-r9700 kernel: atrium_gpu_amd_pci0: gmc: MMHUB 4.1 after dispatch: CONTEXT0_CNTL 0x3fffc01, PT base 005800001, L1_TLB 0x1859, L2_CNTL 0x80e01, fault status 0 (addr 000000000)
+Nov 13 06:32:05 atrium-r9700 kernel: atrium_gpu_amd_pci0: gmc: GFXHUB (GC 12.0) after dispatch: CONTEXT0_CNTL 0x3fffc01, PT base 005800001, L1_TLB 0x1859, L2_CNTL 0x80e01, fault status 0 (addr 000000000)
+Nov 13 06:32:05 atrium-r9700 kernel: atrium_gpu_amd_pci0: mes: pipe 0 REMOVE_QUEUE (compute): ok in 180 us (status 0x1)
+Nov 13 06:32:05 atrium-r9700 kernel: atrium_gpu_amd_pci0: mes: me 1 pipe 0 HQD dequeued: active 0
+Nov 13 06:32:05 atrium-r9700 kernel: atrium_gpu_amd_pci0: dispatch: stage 4e: write_42 PASS (matches the oracle)
+Nov 13 06:32:05 atrium-r9700 kernel: atrium_gpu_amd_pci0: ih: IV client 0x14 src 0xb5 ring 13 vmid 0 pasid 0 data 0x20000000 0 0xb1 0
+Nov 13 06:32:05 atrium-r9700 kernel: atrium_gpu_amd_pci0: ih: IV client 0x14 src 0xb5 ring 13 vmid 0 pasid 0 data 0x2000000b 0 0xb1 0
+Nov 13 06:32:05 atrium-r9700 kernel: atrium_gpu_amd_pci0: ih: IV client 0x14 src 0xb5 ring 13 vmid 0 pasid 0 data 0x20000013 0 0xb1 0
+Nov 13 06:32:05 atrium-r9700 kernel: atrium_gpu_amd_pci0: ih: IV client 0x14 src 0xb5 ring 13 vmid 0 pasid 0 data 0x2000000b 0 0xb1 0
+Nov 13 06:32:05 atrium-r9700 kernel: atrium_gpu_amd_pci0: ih: IV client 0x14 src 0xb5 ring 13 vmid 0 pasid 0 data 0x20000002 0 0xb1 0
+Nov 13 06:32:05 atrium-r9700 kernel: atrium_gpu_amd_pci0: ih: IV client 0x14 src 0xb5 ring 13 vmid 0 pasid 0 data 0x2000000b 0 0xb1 0
+Nov 13 06:32:05 atrium-r9700 kernel: atrium_gpu_amd_pci0: ih: IV client 0x14 src 0xb5 ring 12 vmid 0 pasid 0 data 0x20000000 0 0xb1 0
+Nov 13 06:32:05 atrium-r9700 kernel: atrium_gpu_amd_pci0: ih: IV client 0x14 src 0xb5 ring 12 vmid 0 pasid 0 data 0x2000000b 0 0xb1 0
+Nov 13 06:32:05 atrium-r9700 kernel: atrium_gpu_amd_pci0: ih: ... 9 more IVs
+Nov 13 06:32:05 atrium-r9700 kernel: atrium_gpu_amd_pci0: si: dispatch at attach: PASS; 17 CP EOP IV(s)
+Nov 13 06:32:05 atrium-r9700 kernel: atrium_gpu_amd_pci0: smu: AllowGfxOff                arg 0000000000: resp 0x1
+Nov 13 06:32:05 atrium-r9700 kernel: atrium_gpu_amd_pci0: smu: sample [attached, MES up, no work] 1/5
+Nov 13 06:32:05 atrium-r9700 kernel: atrium_gpu_amd_pci0: smu: TransferTableSmu2Dram      arg 0x00000005: resp 0x1
+Nov 13 06:32:05 atrium-r9700 kernel: atrium_gpu_amd_pci0: smu: telemetry #22: edge 29 C, hotspot 34 C, mem 30 C, VR 29 C; power 22 W of 300 W limit, board 22 W; fan 970 rpm (20%); gfx 1493 MHz, mem 193 MHz, gfx busy 84%; throttle 0x1 (ids 0x2)
+Nov 13 06:32:05 atrium-r9700 kernel: atrium_gpu_amd_pci0: smu: busy or at the power limit with no work queued
+Nov 13 06:32:06 atrium-r9700 kernel: atrium_gpu_amd_pci0: smu: sample [attached, MES up, no work] 2/5
+Nov 13 06:32:06 atrium-r9700 kernel: atrium_gpu_amd_pci0: smu: TransferTableSmu2Dram      arg 0x00000005: resp 0x1
+Nov 13 06:32:06 atrium-r9700 kernel: atrium_gpu_amd_pci0: smu: telemetry #1058: edge 29 C, hotspot 34 C, mem 30 C, VR 28 C; power 13 W of 300 W limit, board 13 W; fan 865 rpm (20%); gfx 5 MHz, mem 193 MHz, gfx busy 0%; throttle 0x1 (ids 0x2)
+Nov 13 06:32:06 atrium-r9700 kernel: atrium_gpu_amd_pci0: si: stage 5a: attached and idle (MES up, kernel compute queue ready); watching telemetry every 5 s
+Nov 13 06:32:06 atrium-r9700 kernel: atrium_gpu_amd_pci0: VRAM 32640 MiB; allocator range 0x8000000-0x7d6c00000 (31980 MiB), all dirty until scrubbed
+Nov 13 06:32:06 atrium-r9700 kernel: atrium_gpu_amd0: <Atrium AMD RDNA4 GPU> on atrium_gpu_amd_pci0
+Nov 13 06:32:06 atrium-r9700 kernel: atrium_gpu_amd_pci0: smu: DisallowGfxOff             arg 0000000000: resp 0x1
+Nov 13 06:32:06 atrium-r9700 kernel: atrium_gpu_amd_pci0: mes: pipe 0 ADD_QUEUE (compute): ok in 240 us (status 0x1)
+Nov 13 06:32:06 atrium-r9700 kernel: atrium_gpu_amd_pci0: kq: client queue up: MEC1 pipe 0 queue 0, block at GART 0x70000, doorbell 0x6
+Nov 13 06:32:06 atrium-r9700 kernel: atrium_gpu_amd_pci0: smu: AllowGfxOff                arg 0000000000: resp 0x1
+Nov 13 06:32:06 atrium-r9700 kernel: atrium_gpu_amd_pci0: si: EOP IV with src_data[0] 0x18000000: no queue of ours; checked every user queue
+Nov 13 06:32:06 atrium-r9700 kernel: atrium_gpu_amd_pci0: smu: DisallowGfxOff             arg 0000000000: resp 0x1
+Nov 13 06:32:06 atrium-r9700 kernel: atrium_gpu_amd_pci0: smu: AllowGfxOff                arg 0000000000: resp 0x1
+Nov 13 06:32:06 atrium-r9700 kernel: atrium_gpu_amd_pci0: si: VRAM scrub self-test at 0x8000000 (MC 0x8008000000): 1024/1024 words zeroed, 1024/1024 of the next page kept: PASS
+Nov 13 06:32:06 atrium-r9700 kernel: atrium_gpu_amd0: ready: /dev/atrium-gpu0 (amd-silicon backend)
+Nov 13 06:32:06 atrium-r9700 kernel: atrium_gpu_amd_pci0: silicon attached (stage 5a); gpu child added (5c-2a)
+Nov 13 06:32:06 atrium-r9700 kernel: atrium_gpu_amd_pci0: smu: DisallowGfxOff             arg 0000000000: resp 0x1
+Nov 13 06:32:06 atrium-r9700 kernel: atrium_gpu_amd_pci0: smu: AllowGfxOff                arg 0000000000: resp 0x1
+Nov 13 06:32:06 atrium-r9700 kernel: atrium_gpu_amd_pci0: smu: DisallowGfxOff             arg 0000000000: resp 0x1
+Nov 13 06:32:06 atrium-r9700 kernel: atrium_gpu_amd_pci0: smu: AllowGfxOff                arg 0000000000: resp 0x1
+Nov 13 06:32:06 atrium-r9700 kernel: atrium_gpu_amd_pci0: smu: DisallowGfxOff             arg 0000000000: resp 0x1
+Nov 13 06:32:06 atrium-r9700 kernel: atrium_gpu_amd_pci0: smu: AllowGfxOff                arg 0000000000: resp 0x1
+Nov 13 06:32:06 atrium-r9700 kernel: atrium_gpu_amd_pci0: smu: DisallowGfxOff             arg 0000000000: resp 0x1
+Nov 13 06:32:06 atrium-r9700 kernel: atrium_gpu_amd_pci0: smu: AllowGfxOff                arg 0000000000: resp 0x1
+Nov 13 06:32:06 atrium-r9700 kernel: atrium_gpu_amd_pci0: smu: DisallowGfxOff             arg 0000000000: resp 0x1
+Nov 13 06:32:06 atrium-r9700 kernel: atrium_gpu_amd_pci0: smu: AllowGfxOff                arg 0000000000: resp 0x1
+Nov 13 06:32:06 atrium-r9700 kernel: atrium_gpu_amd_pci0: smu: DisallowGfxOff             arg 0000000000: resp 0x1
+Nov 13 06:32:06 atrium-r9700 kernel: atrium_gpu_amd_pci0: smu: AllowGfxOff                arg 0000000000: resp 0x1
+Nov 13 06:32:06 atrium-r9700 kernel: atrium_gpu_amd_pci0: smu: DisallowGfxOff             arg 0000000000: resp 0x1
+Nov 13 06:32:06 atrium-r9700 kernel: atrium_gpu_amd_pci0: smu: AllowGfxOff                arg 0000000000: resp 0x1
+Nov 13 06:32:06 atrium-r9700 kernel: atrium_gpu_amd_pci0: smu: DisallowGfxOff             arg 0000000000: resp 0x1
+Nov 13 06:32:06 atrium-r9700 kernel: atrium_gpu_amd_pci0: mes: pipe 0 ADD_QUEUE (user compute): ok in 140 us (status 0x1)
+Nov 13 06:32:06 atrium-r9700 kernel: atrium_gpu_amd_pci0: uq0: added: VM base 0x8000001, queue pages at VA 0x200000000 (pa 0x449654000), MQD GART 0x80000, doorbell 0x20
+Nov 13 06:32:06 atrium-r9700 kernel: atrium_gpu_amd_pci0: si: uq0: first EOP IV, src_data[0] 0x1000020
+Nov 13 06:32:06 atrium-r9700 kernel: atrium_gpu_amd_pci0: mes: pipe 0 ADD_QUEUE (user compute): ok in 140 us (status 0x1)
+Nov 13 06:32:06 atrium-r9700 kernel: atrium_gpu_amd_pci0: uq1: added: VM base 0x8006001, queue pages at VA 0x200010000 (pa 0x44965c000), MQD GART 0x84000, doorbell 0x22
+Nov 13 06:32:06 atrium-r9700 kernel: atrium_gpu_amd_pci0: mes: pipe 0 ADD_QUEUE (user compute): ok in 140 us (status 0x1)
+Nov 13 06:32:06 atrium-r9700 kernel: atrium_gpu_amd_pci0: uq2: added: VM base 0x800c001, queue pages at VA 0x200020000 (pa 0x449664000), MQD GART 0x88000, doorbell 0x24
+Nov 13 06:32:06 atrium-r9700 kernel: atrium_gpu_amd_pci0: si: uq1: first EOP IV, src_data[0] 0x1000022
+Nov 13 06:32:06 atrium-r9700 kernel: atrium_gpu_amd_pci0: si: uq2: first EOP IV, src_data[0] 0x1000024
+Nov 13 06:32:06 atrium-r9700 kernel: atrium_gpu_amd_pci0: mes: pipe 0 ADD_QUEUE (user compute): ok in 200 us (status 0x1)
+Nov 13 06:32:06 atrium-r9700 kernel: atrium_gpu_amd_pci0: uq3: added: VM base 0x8000001, queue pages at VA 0x200030000 (pa 0x44966c000), MQD GART 0x8c000, doorbell 0x26
+Nov 13 06:32:06 atrium-r9700 kernel: atrium_gpu_amd_pci0: si: uq3: first EOP IV, src_data[0] 0x1000026
+Nov 13 06:32:06 atrium-r9700 kernel: atrium_gpu_amd_pci0: mes: pipe 0 REMOVE_QUEUE (user compute): ok in 290 us (status 0x1)
+Nov 13 06:32:06 atrium-r9700 kernel: atrium_gpu_amd_pci0: uq3: removed (seq 1, fence 1)
+Nov 13 06:32:06 atrium-r9700 kernel: atrium_gpu_amd_pci0: si: uq3 closed: 1 submits; EOP IVs routed 6, unrouted 1, MES own 12, MES preemption 0; retired by IV 6, by poll 0; queues lost to faults 0, hangs 0; preempted for frees 0 (failed 0)
+Nov 13 06:32:06 atrium-r9700 kernel: atrium_gpu_amd_pci0: si: unrouted EOP src_data[0]: 0x18000000 x1, 0 x0, 0 x0, 0 x0
+Nov 13 06:32:06 atrium-r9700 kernel: atrium_gpu_amd_pci0: mes: pipe 0 ADD_QUEUE (user compute): ok in 140 us (status 0x1)
+Nov 13 06:32:06 atrium-r9700 kernel: atrium_gpu_amd_pci0: uq3: added: VM base 0x8012001, queue pages at VA 0x200030000 (pa 0x44966c000), MQD GART 0x8c000, doorbell 0x26
+Nov 13 06:32:06 atrium-r9700 kernel: atrium_gpu_amd_pci0: si: uq3: first EOP IV, src_data[0] 0x1000026
+Nov 13 06:32:06 atrium-r9700 kernel: atrium_gpu_amd_pci0: uq1: destroy: work in flight: seq 2, fence 1, wptr 24, rptr report 0xc; HQD active (VMID 9)
+Nov 13 06:32:06 atrium-r9700 kernel: atrium_gpu_amd_pci0: uq1: VMID 9's waves killed (0); fence landed after 0 us
+Nov 13 06:32:06 atrium-r9700 kernel: atrium_gpu_amd_pci0: mes: pipe 0 REMOVE_QUEUE (user compute): ok in 280 us (status 0x1)
+Nov 13 06:32:06 atrium-r9700 kernel: atrium_gpu_amd_pci0: uq1: removed (seq 2, fence 2)
+Nov 13 06:32:06 atrium-r9700 kernel: atrium_gpu_amd_pci0: si: uq1 closed: 2 submits; EOP IVs routed 8, unrouted 1, MES own 16, MES preemption 0; retired by IV 7, by poll 0; queues lost to faults 0, hangs 0; preempted for frees 0 (failed 0)
+Nov 13 06:32:06 atrium-r9700 kernel: atrium_gpu_amd_pci0: si: unrouted EOP src_data[0]: 0x18000000 x1, 0 x0, 0 x0, 0 x0
+Nov 13 06:32:06 atrium-r9700 kernel: atrium_gpu_amd_pci0: mes: pipe 0 ADD_QUEUE (user compute): ok in 140 us (status 0x1)
+Nov 13 06:32:06 atrium-r9700 kernel: atrium_gpu_amd_pci0: uq1: added: VM base 0x8006001, queue pages at VA 0x200010000 (pa 0x449674000), MQD GART 0x84000, doorbell 0x22
+Nov 13 06:32:06 atrium-r9700 kernel: atrium_gpu_amd_pci0: si: uq1: first EOP IV, src_data[0] 0x1000022
+Nov 13 06:32:06 atrium-r9700 kernel: atrium_gpu_amd_pci0: mes: pipe 0 SUSPEND (user gang): ok in 150 us (status 0x1)
+Nov 13 06:32:06 atrium-r9700 kernel: atrium_gpu_amd_pci0: mes: pipe 0 RESUME (user gang): ok in 60 us (status 0x1)
+Nov 13 06:32:06 atrium-r9700 kernel: atrium_gpu_amd_pci0: uq3: preempted for a free: suspend fence landed after 0 us, resume ok
+Nov 13 06:32:06 atrium-r9700 kernel: atrium_gpu_amd_pci0: mes: pipe 0 SUSPEND (user gang): ok in 70 us (status 0x1)
+Nov 13 06:32:06 atrium-r9700 kernel: atrium_gpu_amd_pci0: mes: pipe 0 RESUME (user gang): ok in 70 us (status 0x1)
+Nov 13 06:32:06 atrium-r9700 kernel: atrium_gpu_amd_pci0: uq3: preempted for a free: suspend fence landed after 0 us, resume ok
+Nov 13 06:32:06 atrium-r9700 kernel: atrium_gpu_amd_pci0: mes: pipe 0 SUSPEND (user gang): ok in 70 us (status 0x1)
+Nov 13 06:32:06 atrium-r9700 kernel: atrium_gpu_amd_pci0: mes: pipe 0 RESUME (user gang): ok in 70 us (status 0x1)
+Nov 13 06:32:06 atrium-r9700 kernel: atrium_gpu_amd_pci0: uq3: preempted for a free: suspend fence landed after 0 us, resume ok
+Nov 13 06:32:06 atrium-r9700 kernel: atrium_gpu_amd_pci0: mes: pipe 0 REMOVE_QUEUE (user compute): ok in 130 us (status 0x1)
+Nov 13 06:32:06 atrium-r9700 kernel: atrium_gpu_amd_pci0: uq3: removed (seq 1, fence 1)
+Nov 13 06:32:06 atrium-r9700 kernel: atrium_gpu_amd_pci0: si: uq3 closed: 1 submits; EOP IVs routed 10, unrouted 1, MES own 32, MES preemption 3; retired by IV 9, by poll 0; queues lost to faults 0, hangs 0; preempted for frees 3 (failed 0)
+Nov 13 06:32:06 atrium-r9700 kernel: atrium_gpu_amd_pci0: si: unrouted EOP src_data[0]: 0x18000000 x1, 0 x0, 0 x0, 0 x0
+Nov 13 06:32:06 atrium-r9700 kernel: atrium_gpu_amd_pci0: mes: pipe 0 ADD_QUEUE (user compute): ok in 150 us (status 0x1)
+Nov 13 06:32:06 atrium-r9700 kernel: atrium_gpu_amd_pci0: uq3: added: VM base 0x8018001, queue pages at VA 0x200030000 (pa 0x449660000), MQD GART 0x8c000, doorbell 0x26
+Nov 13 06:32:06 atrium-r9700 kernel: atrium_gpu_amd_pci0: mes: pipe 0 SUSPEND (user gang): ok in 340 us (status 0x1)
+Nov 13 06:32:06 atrium-r9700 kernel: atrium_gpu_amd_pci0: mes: pipe 0 RESUME (user gang): ok in 110 us (status 0x1)
+Nov 13 06:32:06 atrium-r9700 kernel: atrium_gpu_amd_pci0: uq3: preempted for a free: suspend fence landed after 0 us, resume ok
+Nov 13 06:32:06 atrium-r9700 kernel: atrium_gpu_amd_pci0: si: VM fault: 1 IV(s), VMIDs 0x800, first VMID 11 at 0x10002000
+Nov 13 06:32:06 atrium-r9700 kernel: atrium_gpu_amd_pci0: gmc: client fault: fault status 0xb41050: client TCP (0x8), VMID 11, MORE_FAULTS 0, WALKER_ERROR 0, PERMISSION_FAULTS 0x5, MAPPING_ERROR 0, RW 1, ATOMIC 0, PRT 0, UCE 0
+Nov 13 06:32:06 atrium-r9700 kernel: atrium_gpu_amd_pci0: si: uq3 faulted (VMID 11, 0x10002000): its work fails, the queue is lost
+Nov 13 06:32:06 atrium-r9700 kernel: atrium_gpu_amd_pci0: uq3: destroy: work in flight: seq 1, fence 0, wptr 12, rptr report 0xc; HQD active (VMID 11)
+Nov 13 06:32:06 atrium-r9700 kernel: atrium_gpu_amd_pci0: si: uq3: first EOP IV, src_data[0] 0x1000026
+Nov 13 06:32:06 atrium-r9700 kernel: atrium_gpu_amd_pci0: uq3: VMID 11's waves killed (0); fence landed after 100 us
+Nov 13 06:32:06 atrium-r9700 kernel: atrium_gpu_amd_pci0: mes: pipe 0 REMOVE_QUEUE (user compute): ok in 170 us (status 0x1)
+Nov 13 06:32:06 atrium-r9700 kernel: atrium_gpu_amd_pci0: uq3: removed (seq 1, fence 1)
+Nov 13 06:32:06 atrium-r9700 kernel: atrium_gpu_amd_pci0: si: uq3 evicted (lost)
+Nov 13 06:32:06 atrium-r9700 kernel: atrium_gpu_amd_pci0: si: uq3 closed: 1 submits; EOP IVs routed 12, unrouted 1, MES own 40, MES preemption 4; retired by IV 10, by poll 0; queues lost to faults 1, hangs 0; preempted for frees 4 (failed 0)
+Nov 13 06:32:06 atrium-r9700 kernel: atrium_gpu_amd_pci0: si: unrouted EOP src_data[0]: 0x18000000 x1, 0 x0, 0 x0, 0 x0
+Nov 13 06:32:06 atrium-r9700 kernel: atrium_gpu_amd_pci0: mes: pipe 0 ADD_QUEUE (user compute): ok in 140 us (status 0x1)
+Nov 13 06:32:06 atrium-r9700 kernel: atrium_gpu_amd_pci0: uq3: added: VM base 0x8018001, queue pages at VA 0x200030000 (pa 0x449670000), MQD GART 0x8c000, doorbell 0x26
+Nov 13 06:32:06 atrium-r9700 kernel: atrium_gpu_amd_pci0: si: uq3: first EOP IV, src_data[0] 0x1000026
+Nov 13 06:32:07 atrium-r9700 kernel: atrium_gpu_amd_pci0: VRAM: scrubbed 31980 MiB in 418 ms (76507 MiB/s)
+Nov 13 06:32:11 atrium-r9700 kernel: atrium_gpu_amd_pci0: smu: TransferTableSmu2Dram      arg 0x00000005: resp 0x1
+Nov 13 06:32:11 atrium-r9700 kernel: atrium_gpu_amd_pci0: smu: telemetry #4974: edge 30 C, hotspot 38 C, mem 30 C, VR 30 C; power 66 W of 300 W limit, board 66 W; fan 897 rpm (20%); gfx 3382 MHz, mem 399 MHz, gfx busy 99%; throttle 0x1 (ids 0x2)
+Nov 13 06:32:11 atrium-r9700 kernel: atrium_gpu_amd_pci0: si: uq3 hung: fence 1, no progress for 5000 ms; its work fails, the queue is lost
+Nov 13 06:32:11 atrium-r9700 kernel: atrium_gpu_amd_pci0: uq3: destroy: work in flight: seq 2, fence 1, wptr 24, rptr report 0xc; HQD active (VMID 11)
+Nov 13 06:32:12 atrium-r9700 kernel: atrium_gpu_amd_pci0: uq3: VMID 11's waves killed (0); fence still behind after 200000 us
+Nov 13 06:32:12 atrium-r9700 kernel: atrium_gpu_amd_pci0: uq3: HQD me1 pipe 0 queue 2 (VMID 11) reset: inactive after 20 us
+Nov 13 06:32:12 atrium-r9700 kernel: atrium_gpu_amd_pci0: mes: pipe 0 REMOVE_QUEUE (user compute): ok in 230 us (status 0x1)
+Nov 13 06:32:12 atrium-r9700 kernel: atrium_gpu_amd_pci0: uq3: removed (seq 2, fence 1)
+Nov 13 06:32:12 atrium-r9700 kernel: atrium_gpu_amd_pci0: si: uq3 evicted (lost)
+Nov 13 06:32:12 atrium-r9700 kernel: atrium_gpu_amd_pci0: si: uq3 closed: 2 submits; EOP IVs routed 14, unrouted 1, MES own 44, MES preemption 4; retired by IV 12, by poll 0; queues lost to faults 1, hangs 1; preempted for frees 4 (failed 0)
+Nov 13 06:32:12 atrium-r9700 kernel: atrium_gpu_amd_pci0: si: unrouted EOP src_data[0]: 0x18000000 x1, 0 x0, 0 x0, 0 x0
+Nov 13 06:32:12 atrium-r9700 kernel: atrium_gpu_amd_pci0: mes: pipe 0 ADD_QUEUE (user compute): ok in 180 us (status 0x1)
+Nov 13 06:32:12 atrium-r9700 kernel: atrium_gpu_amd_pci0: uq3: added: VM base 0x8018001, queue pages at VA 0x200030000 (pa 0x44966c000), MQD GART 0x8c000, doorbell 0x26
+Nov 13 06:32:12 atrium-r9700 kernel: atrium_gpu_amd_pci0: si: uq3: first EOP IV, src_data[0] 0x1000026
+Nov 13 06:32:12 atrium-r9700 kernel: atrium_gpu_amd_pci0: mes: pipe 0 SUSPEND (user gang): ok in 330 us (status 0x1)
+Nov 13 06:32:12 atrium-r9700 kernel: atrium_gpu_amd_pci0: mes: pipe 0 RESUME (user gang): ok in 100 us (status 0x1)
+Nov 13 06:32:12 atrium-r9700 kernel: atrium_gpu_amd_pci0: uq3: preempted for a free: suspend fence landed after 0 us, resume ok
+Nov 13 06:32:12 atrium-r9700 kernel: atrium_gpu_amd_pci0: mes: pipe 0 SUSPEND (user gang): ok in 80 us (status 0x1)
+Nov 13 06:32:12 atrium-r9700 kernel: atrium_gpu_amd_pci0: mes: pipe 0 RESUME (user gang): ok in 100 us (status 0x1)
+Nov 13 06:32:12 atrium-r9700 kernel: atrium_gpu_amd_pci0: uq3: preempted for a free: suspend fence landed after 0 us, resume ok
+Nov 13 06:32:12 atrium-r9700 kernel: atrium_gpu_amd_pci0: mes: pipe 0 SUSPEND (user gang): ok in 80 us (status 0x1)
+Nov 13 06:32:12 atrium-r9700 kernel: atrium_gpu_amd_pci0: mes: pipe 0 RESUME (user gang): ok in 100 us (status 0x1)
+Nov 13 06:32:12 atrium-r9700 kernel: atrium_gpu_amd_pci0: uq3: preempted for a free: suspend fence landed after 0 us, resume ok
+Nov 13 06:32:12 atrium-r9700 kernel: atrium_gpu_amd_pci0: mes: pipe 0 REMOVE_QUEUE (user compute): ok in 200 us (status 0x1)
+Nov 13 06:32:12 atrium-r9700 kernel: atrium_gpu_amd_pci0: uq3: removed (seq 1, fence 1)
+Nov 13 06:32:12 atrium-r9700 kernel: atrium_gpu_amd_pci0: si: uq3 closed: 1 submits; EOP IVs routed 15, unrouted 1, MES own 60, MES preemption 7; retired by IV 13, by poll 0; queues lost to faults 1, hangs 1; preempted for frees 7 (failed 0)
+Nov 13 06:32:12 atrium-r9700 kernel: atrium_gpu_amd_pci0: si: unrouted EOP src_data[0]: 0x18000000 x1, 0 x0, 0 x0, 0 x0
+Nov 13 06:32:12 atrium-r9700 kernel: atrium_gpu_amd_pci0: mes: pipe 0 ADD_QUEUE (user compute): ok in 160 us (status 0x1)
+Nov 13 06:32:12 atrium-r9700 kernel: atrium_gpu_amd_pci0: uq3: added: VM base 0x8012001, queue pages at VA 0x200030000 (pa 0x449660000), MQD GART 0x8c000, doorbell 0x26
+Nov 13 06:32:12 atrium-r9700 kernel: atrium_gpu_amd_pci0: mes: pipe 0 REMOVE_QUEUE (user compute): ok in 430 us (status 0x1)
+Nov 13 06:32:12 atrium-r9700 kernel: atrium_gpu_amd_pci0: uq3: removed (seq 0, fence 0)
+Nov 13 06:32:12 atrium-r9700 kernel: atrium_gpu_amd_pci0: si: uq3 closed: 0 submits; EOP IVs routed 15, unrouted 1, MES own 64, MES preemption 7; retired by IV 13, by poll 0; queues lost to faults 1, hangs 1; preempted for frees 7 (failed 0)
+Nov 13 06:32:12 atrium-r9700 kernel: atrium_gpu_amd_pci0: si: unrouted EOP src_data[0]: 0x18000000 x1, 0 x0, 0 x0, 0 x0
+Nov 13 06:32:12 atrium-r9700 kernel: atrium_gpu_amd_pci0: mes: pipe 0 ADD_QUEUE (user compute): ok in 160 us (status 0x1)
+Nov 13 06:32:12 atrium-r9700 kernel: atrium_gpu_amd_pci0: uq3: added (user mode): VM base 0x8012001, queue pages at VA 0x200030000 (pa 0x449670000), MQD GART 0x8c000, doorbell 0x1400
+Nov 13 06:32:12 atrium-r9700 kernel: atrium_gpu_amd_pci0: mes: pipe 0 REMOVE_QUEUE (user compute): ok in 190 us (status 0x1)
+Nov 13 06:32:12 atrium-r9700 kernel: atrium_gpu_amd_pci0: uq3: removed (seq 0, fence 2)
+Nov 13 06:32:12 atrium-r9700 kernel: atrium_gpu_amd_pci0: si: uq3 closed: 0 submits; EOP IVs routed 15, unrouted 1, MES own 68, MES preemption 7; retired by IV 13, by poll 0; queues lost to faults 1, hangs 1; preempted for frees 7 (failed 0)
+Nov 13 06:32:12 atrium-r9700 kernel: atrium_gpu_amd_pci0: si: unrouted EOP src_data[0]: 0x18000000 x1, 0 x0, 0 x0, 0 x0
+Nov 13 06:32:12 atrium-r9700 kernel: vm_fault: pager read error, pid 2743 (si-client-test)
+Nov 13 06:32:12 atrium-r9700 kernel: pid 2743 (si-client-test), jid 0, uid 0: exited on signal 10 (no core dump - coredumpsize limit is 0)
+Nov 13 06:32:12 atrium-r9700 kernel: vm_fault: pager read error, pid 2744 (si-client-test)
+Nov 13 06:32:12 atrium-r9700 kernel: pid 2744 (si-client-test), jid 0, uid 0: exited on signal 10 (no core dump - coredumpsize limit is 0)
+Nov 13 06:32:12 atrium-r9700 kernel: atrium_gpu_amd_pci0: mes: pipe 0 ADD_QUEUE (user compute): ok in 160 us (status 0x1)
+Nov 13 06:32:12 atrium-r9700 kernel: atrium_gpu_amd_pci0: uq3: added (user mode): VM base 0x8012001, queue pages at VA 0x200030000 (pa 0x44966c000), MQD GART 0x8c000, doorbell 0x1400
+Nov 13 06:32:17 atrium-r9700 kernel: atrium_gpu_amd_pci0: smu: TransferTableSmu2Dram      arg 0x00000005: resp 0x1
+Nov 13 06:32:17 atrium-r9700 kernel: atrium_gpu_amd_pci0: smu: telemetry #5009: edge 30 C, hotspot 39 C, mem 30 C, VR 30 C; power 64 W of 300 W limit, board 64 W; fan 893 rpm (20%); gfx 3431 MHz, mem 193 MHz, gfx busy 100%; throttle 0x1 (ids 0x2)
+Nov 13 06:32:17 atrium-r9700 kernel: atrium_gpu_amd_pci0: si: uq3 hung (user mode): fence 0, no progress for 5000 ms; its work fails, the queue is lost
+Nov 13 06:32:17 atrium-r9700 kernel: atrium_gpu_amd_pci0: uq3: destroy: work in flight: seq 0, fence 0, wptr 12 (client's), rptr report 0; HQD active (VMID 11)
+Nov 13 06:32:17 atrium-r9700 kernel: atrium_gpu_amd_pci0: uq3: VMID 11's waves killed (0); fence still behind after 200000 us
+Nov 13 06:32:17 atrium-r9700 kernel: atrium_gpu_amd_pci0: uq3: HQD me1 pipe 0 queue 2 (VMID 11) reset: inactive after 10 us
+Nov 13 06:32:17 atrium-r9700 kernel: atrium_gpu_amd_pci0: mes: pipe 0 REMOVE_QUEUE (user compute): ok in 180 us (status 0x1)
+Nov 13 06:32:17 atrium-r9700 kernel: atrium_gpu_amd_pci0: uq3: removed (seq 0, fence 0)
+Nov 13 06:32:17 atrium-r9700 kernel: atrium_gpu_amd_pci0: si: uq3 evicted (lost)
+Nov 13 06:32:17 atrium-r9700 kernel: atrium_gpu_amd_pci0: si: uq3 closed: 0 submits; EOP IVs routed 16, unrouted 1, MES own 72, MES preemption 7; retired by IV 14, by poll 0; queues lost to faults 1, hangs 2; preempted for frees 7 (failed 0)
+Nov 13 06:32:17 atrium-r9700 kernel: atrium_gpu_amd_pci0: si: unrouted EOP src_data[0]: 0x18000000 x1, 0 x0, 0 x0, 0 x0
+Nov 13 06:32:17 atrium-r9700 kernel: atrium_gpu_amd_pci0: mes: pipe 0 ADD_QUEUE (user compute): ok in 230 us (status 0x1)
+Nov 13 06:32:17 atrium-r9700 kernel: atrium_gpu_amd_pci0: uq3: added: VM base 0x8012001, queue pages at VA 0x200030000 (pa 0x449660000), MQD GART 0x8c000, doorbell 0x26
+Nov 13 06:32:17 atrium-r9700 kernel: atrium_gpu_amd_pci0: si: uq3: first EOP IV, src_data[0] 0x1000026
+Nov 13 06:32:17 atrium-r9700 kernel: atrium_gpu_amd_pci0: mes: pipe 0 SUSPEND (user gang): ok in 280 us (status 0x1)
+Nov 13 06:32:17 atrium-r9700 kernel: atrium_gpu_amd_pci0: mes: pipe 0 RESUME (user gang): ok in 110 us (status 0x1)
+Nov 13 06:32:17 atrium-r9700 kernel: atrium_gpu_amd_pci0: uq3: preempted for a free: suspend fence landed after 0 us, resume ok
+Nov 13 06:32:17 atrium-r9700 kernel: atrium_gpu_amd_pci0: mes: pipe 0 SUSPEND (user gang): ok in 80 us (status 0x1)
+Nov 13 06:32:17 atrium-r9700 kernel: atrium_gpu_amd_pci0: mes: pipe 0 RESUME (user gang): ok in 100 us (status 0x1)
+Nov 13 06:32:17 atrium-r9700 kernel: atrium_gpu_amd_pci0: uq3: preempted for a free: suspend fence landed after 0 us, resume ok
+Nov 13 06:32:17 atrium-r9700 kernel: atrium_gpu_amd_pci0: mes: pipe 0 SUSPEND (user gang): ok in 80 us (status 0x1)
+Nov 13 06:32:17 atrium-r9700 kernel: atrium_gpu_amd_pci0: mes: pipe 0 RESUME (user gang): ok in 100 us (status 0x1)
+Nov 13 06:32:17 atrium-r9700 kernel: atrium_gpu_amd_pci0: uq3: preempted for a free: suspend fence landed after 0 us, resume ok
+Nov 13 06:32:17 atrium-r9700 kernel: atrium_gpu_amd_pci0: mes: pipe 0 REMOVE_QUEUE (user compute): ok in 210 us (status 0x1)
+Nov 13 06:32:17 atrium-r9700 kernel: atrium_gpu_amd_pci0: uq3: removed (seq 1, fence 1)
+Nov 13 06:32:17 atrium-r9700 kernel: atrium_gpu_amd_pci0: si: uq3 closed: 1 submits; EOP IVs routed 17, unrouted 1, MES own 88, MES preemption 10; retired by IV 15, by poll 0; queues lost to faults 1, hangs 2; preempted for frees 10 (failed 0)
+Nov 13 06:32:17 atrium-r9700 kernel: atrium_gpu_amd_pci0: si: unrouted EOP src_data[0]: 0x18000000 x1, 0 x0, 0 x0, 0 x0
+Nov 13 06:32:17 atrium-r9700 kernel: atrium_gpu_amd_pci0: mes: pipe 0 SUSPEND (user gang): ok in 160 us (status 0x1)
+Nov 13 06:32:17 atrium-r9700 kernel: atrium_gpu_amd_pci0: mes: pipe 0 RESUME (user gang): ok in 100 us (status 0x1)
+Nov 13 06:32:17 atrium-r9700 kernel: atrium_gpu_amd_pci0: uq0: preempted for a free: suspend fence landed after 0 us, resume ok
+Nov 13 06:32:17 atrium-r9700 kernel: atrium_gpu_amd_pci0: mes: pipe 0 ADD_QUEUE (user compute): ok in 250 us (status 0x1)
+Nov 13 06:32:17 atrium-r9700 kernel: atrium_gpu_amd_pci0: uq3: added: VM base 0x8018001, queue pages at VA 0x200030000 (pa 0x449660000), MQD GART 0x8c000, doorbell 0x26
+Nov 13 06:32:17 atrium-r9700 kernel: atrium_gpu_amd_pci0: mes: pipe 0 SUSPEND (user gang): ok in 150 us (status 0x1)
+Nov 13 06:32:17 atrium-r9700 kernel: atrium_gpu_amd_pci0: mes: pipe 0 RESUME (user gang): ok in 130 us (status 0x1)
+Nov 13 06:32:17 atrium-r9700 kernel: atrium_gpu_amd_pci0: uq3: preempted for a free: suspend fence landed after 0 us, resume ok
+Nov 13 06:32:22 atrium-r9700 kernel: atrium_gpu_amd_pci0: smu: TransferTableSmu2Dram      arg 0x00000005: resp 0x1
+Nov 13 06:32:22 atrium-r9700 kernel: atrium_gpu_amd_pci0: smu: telemetry #5009: edge 31 C, hotspot 39 C, mem 32 C, VR 31 C; power 64 W of 300 W limit, board 64 W; fan 893 rpm (20%); gfx 3415 MHz, mem 193 MHz, gfx busy 100%; throttle 0x1 (ids 0x2)
+Nov 13 06:32:22 atrium-r9700 kernel: atrium_gpu_amd_pci0: si: uq3 hung: fence 0, no progress for 5000 ms; its work fails, the queue is lost
+Nov 13 06:32:22 atrium-r9700 kernel: atrium_gpu_amd_pci0: uq3: destroy: work in flight: seq 1, fence 0, wptr 12, rptr report 0; HQD active (VMID 11)
+Nov 13 06:32:22 atrium-r9700 kernel: atrium_gpu_amd_pci0: uq3: VMID 11's waves killed (0); fence still behind after 200000 us
+Nov 13 06:32:22 atrium-r9700 kernel: atrium_gpu_amd_pci0: uq3: HQD me1 pipe 0 queue 2 (VMID 11) reset: inactive after 10 us
+Nov 13 06:32:22 atrium-r9700 kernel: atrium_gpu_amd_pci0: mes: pipe 0 REMOVE_QUEUE (user compute): ok in 180 us (status 0x1)
+Nov 13 06:32:22 atrium-r9700 kernel: atrium_gpu_amd_pci0: uq3: removed (seq 1, fence 0)
+Nov 13 06:32:22 atrium-r9700 kernel: atrium_gpu_amd_pci0: si: uq3 evicted (lost)
+Nov 13 06:32:22 atrium-r9700 kernel: atrium_gpu_amd_pci0: si: uq3 closed: 1 submits; EOP IVs routed 18, unrouted 1, MES own 100, MES preemption 12; retired by IV 16, by poll 0; queues lost to faults 1, hangs 3; preempted for frees 12 (failed 0)
+Nov 13 06:32:22 atrium-r9700 kernel: atrium_gpu_amd_pci0: si: unrouted EOP src_data[0]: 0x18000000 x1, 0 x0, 0 x0, 0 x0
+Nov 13 06:32:22 atrium-r9700 kernel: atrium_gpu_amd_pci0: mes: pipe 0 SUSPEND (user gang): ok in 210 us (status 0x1)
+Nov 13 06:32:22 atrium-r9700 kernel: atrium_gpu_amd_pci0: mes: pipe 0 RESUME (user gang): ok in 110 us (status 0x1)
+Nov 13 06:32:22 atrium-r9700 kernel: atrium_gpu_amd_pci0: uq0: preempted for a free: suspend fence landed after 0 us, resume ok
+Nov 13 06:32:22 atrium-r9700 kernel: atrium_gpu_amd_pci0: mes: pipe 0 SUSPEND (user gang): ok in 160 us (status 0x1)
+Nov 13 06:32:22 atrium-r9700 kernel: atrium_gpu_amd_pci0: mes: pipe 0 RESUME (user gang): ok in 110 us (status 0x1)
+Nov 13 06:32:22 atrium-r9700 kernel: atrium_gpu_amd_pci0: uq0: preempted for a free: suspend fence landed after 0 us, resume ok
+Nov 13 06:32:22 atrium-r9700 kernel: atrium_gpu_amd_pci0: mes: pipe 0 SUSPEND (user gang): ok in 160 us (status 0x1)
+Nov 13 06:32:22 atrium-r9700 kernel: atrium_gpu_amd_pci0: mes: pipe 0 RESUME (user gang): ok in 110 us (status 0x1)
+Nov 13 06:32:22 atrium-r9700 kernel: atrium_gpu_amd_pci0: uq0: preempted for a free: suspend fence landed after 0 us, resume ok
+Nov 13 06:32:22 atrium-r9700 kernel: atrium_gpu_amd_pci0: mes: pipe 0 SUSPEND (user gang): ok in 90 us (status 0x1)
+Nov 13 06:32:22 atrium-r9700 kernel: atrium_gpu_amd_pci0: mes: pipe 0 RESUME (user gang): ok in 100 us (status 0x1)
+Nov 13 06:32:22 atrium-r9700 kernel: atrium_gpu_amd_pci0: uq0: preempted for a free: suspend fence landed after 0 us, resume ok
+Nov 13 06:32:22 atrium-r9700 kernel: atrium_gpu_amd_pci0: mes: pipe 0 SUSPEND (user gang): ok in 80 us (status 0x1)
+Nov 13 06:32:22 atrium-r9700 kernel: atrium_gpu_amd_pci0: mes: pipe 0 RESUME (user gang): ok in 110 us (status 0x1)
+Nov 13 06:32:22 atrium-r9700 kernel: atrium_gpu_amd_pci0: uq0: preempted for a free: suspend fence landed after 0 us, resume ok
+Nov 13 06:32:22 atrium-r9700 kernel: atrium_gpu_amd_pci0: mes: pipe 0 ADD_QUEUE (user compute): ok in 190 us (status 0x1)
+Nov 13 06:32:22 atrium-r9700 kernel: atrium_gpu_amd_pci0: uq3: added: VM base 0x8013001, queue pages at VA 0x200030000 (pa 0x449660000), MQD GART 0x8c000, doorbell 0x26
+Nov 13 06:32:22 atrium-r9700 kernel: atrium_gpu_amd_pci0: si: uq3: first EOP IV, src_data[0] 0x1000026
+Nov 13 06:32:22 atrium-r9700 kernel: atrium_gpu_amd_pci0: si: VM fault: 1 IV(s), VMIDs 0x800, first VMID 11 at 0x10003000
+Nov 13 06:32:22 atrium-r9700 kernel: atrium_gpu_amd_pci0: gmc: client fault: fault status 0xb01280: client SQC (inst) (0x9), VMID 11, MORE_FAULTS 0, WALKER_ERROR 0, PERMISSION_FAULTS 0x8, MAPPING_ERROR 0, RW 0, ATOMIC 0, PRT 0, UCE 0
+Nov 13 06:32:22 atrium-r9700 kernel: atrium_gpu_amd_pci0: si: uq3 faulted (VMID 11, 0x10003000): its work fails, the queue is lost
+Nov 13 06:32:22 atrium-r9700 kernel: atrium_gpu_amd_pci0: uq3: destroy: work in flight: seq 2, fence 1, wptr 24, rptr report 0x18; HQD active (VMID 11)
+Nov 13 06:32:22 atrium-r9700 kernel: atrium_gpu_amd_pci0: uq3: VMID 11's waves killed (0); fence landed after 100 us
+Nov 13 06:32:22 atrium-r9700 kernel: atrium_gpu_amd_pci0: mes: pipe 0 REMOVE_QUEUE (user compute): ok in 200 us (status 0x1)
+Nov 13 06:32:22 atrium-r9700 kernel: atrium_gpu_amd_pci0: uq3: removed (seq 2, fence 2)
+Nov 13 06:32:22 atrium-r9700 kernel: atrium_gpu_amd_pci0: si: uq3 evicted (lost)
+Nov 13 06:32:22 atrium-r9700 kernel: atrium_gpu_amd_pci0: si: uq3 closed: 2 submits; EOP IVs routed 34, unrouted 1, MES own 124, MES preemption 17; retired by IV 31, by poll 0; queues lost to faults 2, hangs 3; preempted for frees 17 (failed 0)
+Nov 13 06:32:22 atrium-r9700 kernel: atrium_gpu_amd_pci0: si: unrouted EOP src_data[0]: 0x18000000 x1, 0 x0, 0 x0, 0 x0
+Nov 13 06:32:22 atrium-r9700 kernel: atrium_gpu_amd_pci0: mes: pipe 0 ADD_QUEUE (user compute): ok in 190 us (status 0x1)
+Nov 13 06:32:22 atrium-r9700 kernel: atrium_gpu_amd_pci0: uq3: added: VM base 0x8013001, queue pages at VA 0x200030000 (pa 0x449660000), MQD GART 0x8c000, doorbell 0x26
+Nov 13 06:32:22 atrium-r9700 kernel: atrium_gpu_amd_pci0: si: uq3: first EOP IV, src_data[0] 0x1000026
+Nov 13 06:32:22 atrium-r9700 kernel: atrium_gpu_amd_pci0: mes: pipe 0 SUSPEND (user gang): ok in 300 us (status 0x1)
+Nov 13 06:32:22 atrium-r9700 kernel: atrium_gpu_amd_pci0: mes: pipe 0 RESUME (user gang): ok in 110 us (status 0x1)
+Nov 13 06:32:22 atrium-r9700 kernel: atrium_gpu_amd_pci0: uq3: preempted for a free: suspend fence landed after 0 us, resume ok
+Nov 13 06:32:22 atrium-r9700 kernel: atrium_gpu_amd_pci0: mes: pipe 0 SUSPEND (user gang): ok in 90 us (status 0x1)
+Nov 13 06:32:22 atrium-r9700 kernel: atrium_gpu_amd_pci0: mes: pipe 0 RESUME (user gang): ok in 110 us (status 0x1)
+Nov 13 06:32:22 atrium-r9700 kernel: atrium_gpu_amd_pci0: uq3: preempted for a free: suspend fence landed after 0 us, resume ok
+Nov 13 06:32:22 atrium-r9700 kernel: atrium_gpu_amd_pci0: mes: pipe 0 SUSPEND (user gang): ok in 90 us (status 0x1)
+Nov 13 06:32:22 atrium-r9700 kernel: atrium_gpu_amd_pci0: mes: pipe 0 RESUME (user gang): ok in 100 us (status 0x1)
+Nov 13 06:32:22 atrium-r9700 kernel: atrium_gpu_amd_pci0: uq3: preempted for a free: suspend fence landed after 0 us, resume ok
+Nov 13 06:32:22 atrium-r9700 kernel: atrium_gpu_amd_pci0: mes: pipe 0 SUSPEND (user gang): ok in 90 us (status 0x1)
+Nov 13 06:32:22 atrium-r9700 kernel: atrium_gpu_amd_pci0: mes: pipe 0 RESUME (user gang): ok in 100 us (status 0x1)
+Nov 13 06:32:22 atrium-r9700 kernel: atrium_gpu_amd_pci0: uq3: preempted for a free: suspend fence landed after 0 us, resume ok
+Nov 13 06:32:22 atrium-r9700 kernel: atrium_gpu_amd_pci0: mes: pipe 0 REMOVE_QUEUE (user compute): ok in 220 us (status 0x1)
+Nov 13 06:32:22 atrium-r9700 kernel: atrium_gpu_amd_pci0: uq3: removed (seq 1, fence 1)
+Nov 13 06:32:22 atrium-r9700 kernel: atrium_gpu_amd_pci0: si: uq3 closed: 1 submits; EOP IVs routed 35, unrouted 1, MES own 144, MES preemption 21; retired by IV 32, by poll 0; queues lost to faults 2, hangs 3; preempted for frees 21 (failed 0)
+Nov 13 06:32:22 atrium-r9700 kernel: atrium_gpu_amd_pci0: si: unrouted EOP src_data[0]: 0x18000000 x1, 0 x0, 0 x0, 0 x0
+Nov 13 06:32:22 atrium-r9700 kernel: atrium_gpu_amd_pci0: mes: pipe 0 SUSPEND (user gang): ok in 170 us (status 0x1)
+Nov 13 06:32:22 atrium-r9700 kernel: atrium_gpu_amd_pci0: mes: pipe 0 RESUME (user gang): ok in 110 us (status 0x1)
+Nov 13 06:32:22 atrium-r9700 kernel: atrium_gpu_amd_pci0: uq0: preempted for a free: suspend fence landed after 0 us, resume ok
+Nov 13 06:32:22 atrium-r9700 kernel: atrium_gpu_amd_pci0: mes: pipe 0 SUSPEND (user gang): ok in 90 us (status 0x1)
+Nov 13 06:32:22 atrium-r9700 kernel: atrium_gpu_amd_pci0: mes: pipe 0 RESUME (user gang): ok in 100 us (status 0x1)
+Nov 13 06:32:22 atrium-r9700 kernel: atrium_gpu_amd_pci0: uq0: preempted for a free: suspend fence landed after 0 us, resume ok
+Nov 13 06:32:22 atrium-r9700 kernel: atrium_gpu_amd_pci0: mes: pipe 0 SUSPEND (user gang): ok in 80 us (status 0x1)
+Nov 13 06:32:22 atrium-r9700 kernel: atrium_gpu_amd_pci0: mes: pipe 0 RESUME (user gang): ok in 110 us (status 0x1)
+Nov 13 06:32:22 atrium-r9700 kernel: atrium_gpu_amd_pci0: uq0: preempted for a free: suspend fence landed after 0 us, resume ok
+Nov 13 06:32:22 atrium-r9700 kernel: atrium_gpu_amd_pci0: mes: pipe 0 REMOVE_QUEUE (user compute): ok in 210 us (status 0x1)
+Nov 13 06:32:22 atrium-r9700 kernel: atrium_gpu_amd_pci0: uq0: removed (seq 22, fence 22)
+Nov 13 06:32:22 atrium-r9700 kernel: atrium_gpu_amd_pci0: si: uq0 closed: 22 submits; EOP IVs routed 35, unrouted 1, MES own 158, MES preemption 24; retired by IV 32, by poll 0; queues lost to faults 2, hangs 3; preempted for frees 24 (failed 0)
+Nov 13 06:32:22 atrium-r9700 kernel: atrium_gpu_amd_pci0: si: unrouted EOP src_data[0]: 0x18000000 x1, 0 x0, 0 x0, 0 x0
+Nov 13 06:32:22 atrium-r9700 kernel: atrium_gpu_amd_pci0: mes: pipe 0 SUSPEND (user gang): ok in 170 us (status 0x1)
+Nov 13 06:32:22 atrium-r9700 kernel: atrium_gpu_amd_pci0: mes: pipe 0 RESUME (user gang): ok in 110 us (status 0x1)
+Nov 13 06:32:22 atrium-r9700 kernel: atrium_gpu_amd_pci0: uq1: preempted for a free: suspend fence landed after 0 us, resume ok
+Nov 13 06:32:22 atrium-r9700 kernel: atrium_gpu_amd_pci0: mes: pipe 0 SUSPEND (user gang): ok in 90 us (status 0x1)
+Nov 13 06:32:22 atrium-r9700 kernel: atrium_gpu_amd_pci0: mes: pipe 0 RESUME (user gang): ok in 110 us (status 0x1)
+Nov 13 06:32:22 atrium-r9700 kernel: atrium_gpu_amd_pci0: uq1: preempted for a free: suspend fence landed after 0 us, resume ok
+Nov 13 06:32:22 atrium-r9700 kernel: atrium_gpu_amd_pci0: mes: pipe 0 SUSPEND (user gang): ok in 90 us (status 0x1)
+Nov 13 06:32:22 atrium-r9700 kernel: atrium_gpu_amd_pci0: mes: pipe 0 RESUME (user gang): ok in 100 us (status 0x1)
+Nov 13 06:32:22 atrium-r9700 kernel: atrium_gpu_amd_pci0: uq1: preempted for a free: suspend fence landed after 0 us, resume ok
+Nov 13 06:32:22 atrium-r9700 kernel: atrium_gpu_amd_pci0: mes: pipe 0 REMOVE_QUEUE (user compute): ok in 210 us (status 0x1)
+Nov 13 06:32:22 atrium-r9700 kernel: atrium_gpu_amd_pci0: uq1: removed (seq 1, fence 1)
+Nov 13 06:32:22 atrium-r9700 kernel: atrium_gpu_amd_pci0: si: uq1 closed: 1 submits; EOP IVs routed 35, unrouted 1, MES own 172, MES preemption 27; retired by IV 32, by poll 0; queues lost to faults 2, hangs 3; preempted for frees 27 (failed 0)
+Nov 13 06:32:22 atrium-r9700 kernel: atrium_gpu_amd_pci0: si: unrouted EOP src_data[0]: 0x18000000 x1, 0 x0, 0 x0, 0 x0
+Nov 13 06:32:22 atrium-r9700 kernel: atrium_gpu_amd_pci0: mes: pipe 0 SUSPEND (user gang): ok in 170 us (status 0x1)
+Nov 13 06:32:22 atrium-r9700 kernel: atrium_gpu_amd_pci0: mes: pipe 0 RESUME (user gang): ok in 110 us (status 0x1)
+Nov 13 06:32:22 atrium-r9700 kernel: atrium_gpu_amd_pci0: uq2: preempted for a free: suspend fence landed after 0 us, resume ok
+Nov 13 06:32:22 atrium-r9700 kernel: atrium_gpu_amd_pci0: mes: pipe 0 SUSPEND (user gang): ok in 90 us (status 0x1)
+Nov 13 06:32:22 atrium-r9700 kernel: atrium_gpu_amd_pci0: mes: pipe 0 RESUME (user gang): ok in 100 us (status 0x1)
+Nov 13 06:32:22 atrium-r9700 kernel: atrium_gpu_amd_pci0: uq2: preempted for a free: suspend fence landed after 0 us, resume ok
+Nov 13 06:32:22 atrium-r9700 kernel: atrium_gpu_amd_pci0: mes: pipe 0 SUSPEND (user gang): ok in 80 us (status 0x1)
+Nov 13 06:32:22 atrium-r9700 kernel: atrium_gpu_amd_pci0: mes: pipe 0 RESUME (user gang): ok in 110 us (status 0x1)
+Nov 13 06:32:22 atrium-r9700 kernel: atrium_gpu_amd_pci0: uq2: preempted for a free: suspend fence landed after 0 us, resume ok
+Nov 13 06:32:22 atrium-r9700 kernel: atrium_gpu_amd_pci0: mes: pipe 0 REMOVE_QUEUE (user compute): ok in 190 us (status 0x1)
+Nov 13 06:32:22 atrium-r9700 kernel: atrium_gpu_amd_pci0: uq2: removed (seq 1, fence 1)
+Nov 13 06:32:22 atrium-r9700 kernel: atrium_gpu_amd_pci0: si: uq2 closed: 1 submits; EOP IVs routed 35, unrouted 1, MES own 186, MES preemption 30; retired by IV 32, by poll 0; queues lost to faults 2, hangs 3; preempted for frees 30 (failed 0)
+Nov 13 06:32:22 atrium-r9700 kernel: atrium_gpu_amd_pci0: si: unrouted EOP src_data[0]: 0x18000000 x1, 0 x0, 0 x0, 0 x0
+Nov 13 06:32:22 atrium-r9700 kernel: atrium_gpu_amd_pci0: smu: AllowGfxOff                arg 0000000000: resp 0x1
+Nov 13 06:32:22 atrium-r9700 kernel: atrium_gpu_amd_pci0: smu: DisallowGfxOff             arg 0000000000: resp 0x1
+Nov 13 06:32:22 atrium-r9700 kernel: atrium_gpu_amd_pci0: mes: pipe 0 ADD_QUEUE (user compute): ok in 180 us (status 0x1)
+Nov 13 06:32:22 atrium-r9700 kernel: atrium_gpu_amd_pci0: uq0: added: VM base 0x8013001, queue pages at VA 0x200000000 (pa 0x449654000), MQD GART 0x80000, doorbell 0x20
+Nov 13 06:32:22 atrium-r9700 kernel: atrium_gpu_amd_pci0: si: uq0: first EOP IV, src_data[0] 0x1000020
+Nov 13 06:32:22 atrium-r9700 kernel: atrium_gpu_amd_pci0: mes: pipe 0 REMOVE_QUEUE (user compute): ok in 230 us (status 0x1)
+Nov 13 06:32:22 atrium-r9700 kernel: atrium_gpu_amd_pci0: uq0: removed (seq 1, fence 1)
+Nov 13 06:32:22 atrium-r9700 kernel: atrium_gpu_amd_pci0: si: uq0 closed: 1 submits; EOP IVs routed 36, unrouted 1, MES own 190, MES preemption 30; retired by IV 33, by poll 0; queues lost to faults 2, hangs 3; preempted for frees 30 (failed 0)
+Nov 13 06:32:22 atrium-r9700 kernel: atrium_gpu_amd_pci0: si: unrouted EOP src_data[0]: 0x18000000 x1, 0 x0, 0 x0, 0 x0
+Nov 13 06:32:22 atrium-r9700 kernel: atrium_gpu_amd_pci0: mes: pipe 0 ADD_QUEUE (user compute): ok in 180 us (status 0x1)
+Nov 13 06:32:22 atrium-r9700 kernel: atrium_gpu_amd_pci0: uq0: added: VM base 0x8013001, queue pages at VA 0x200000000 (pa 0x449654000), MQD GART 0x80000, doorbell 0x20
+Nov 13 06:32:22 atrium-r9700 kernel: atrium_gpu_amd_pci0: si: uq0: first EOP IV, src_data[0] 0x1000020
+Nov 13 06:32:22 atrium-r9700 kernel: atrium_gpu_amd_pci0: mes: pipe 0 REMOVE_QUEUE (user compute): ok in 230 us (status 0x1)
+Nov 13 06:32:22 atrium-r9700 kernel: atrium_gpu_amd_pci0: uq0: removed (seq 1, fence 1)
+Nov 13 06:32:22 atrium-r9700 kernel: atrium_gpu_amd_pci0: si: uq0 closed: 1 submits; EOP IVs routed 37, unrouted 1, MES own 194, MES preemption 30; retired by IV 34, by poll 0; queues lost to faults 2, hangs 3; preempted for frees 30 (failed 0)
+Nov 13 06:32:22 atrium-r9700 kernel: atrium_gpu_amd_pci0: si: unrouted EOP src_data[0]: 0x18000000 x1, 0 x0, 0 x0, 0 x0
+Nov 13 06:32:22 atrium-r9700 kernel: atrium_gpu_amd_pci0: mes: pipe 0 ADD_QUEUE (user compute): ok in 180 us (status 0x1)
+Nov 13 06:32:22 atrium-r9700 kernel: atrium_gpu_amd_pci0: uq0: added: VM base 0x8013001, queue pages at VA 0x200000000 (pa 0x449654000), MQD GART 0x80000, doorbell 0x20
+Nov 13 06:32:22 atrium-r9700 kernel: atrium_gpu_amd_pci0: si: uq0: first EOP IV, src_data[0] 0x1000020
+Nov 13 06:32:22 atrium-r9700 kernel: atrium_gpu_amd_pci0: mes: pipe 0 REMOVE_QUEUE (user compute): ok in 230 us (status 0x1)
+Nov 13 06:32:22 atrium-r9700 kernel: atrium_gpu_amd_pci0: uq0: removed (seq 1, fence 1)
+Nov 13 06:32:22 atrium-r9700 kernel: atrium_gpu_amd_pci0: si: uq0 closed: 1 submits; EOP IVs routed 38, unrouted 1, MES own 198, MES preemption 30; retired by IV 35, by poll 0; queues lost to faults 2, hangs 3; preempted for frees 30 (failed 0)
+Nov 13 06:32:22 atrium-r9700 kernel: atrium_gpu_amd_pci0: si: unrouted EOP src_data[0]: 0x18000000 x1, 0 x0, 0 x0, 0 x0
+Nov 13 06:32:22 atrium-r9700 kernel: atrium_gpu_amd_pci0: mes: pipe 0 ADD_QUEUE (user compute): ok in 180 us (status 0x1)
+Nov 13 06:32:22 atrium-r9700 kernel: atrium_gpu_amd_pci0: uq0: added: VM base 0x8013001, queue pages at VA 0x200000000 (pa 0x449654000), MQD GART 0x80000, doorbell 0x20
+Nov 13 06:32:22 atrium-r9700 kernel: atrium_gpu_amd_pci0: si: uq0: first EOP IV, src_data[0] 0x1000020
+Nov 13 06:32:22 atrium-r9700 kernel: atrium_gpu_amd_pci0: mes: pipe 0 REMOVE_QUEUE (user compute): ok in 230 us (status 0x1)
+Nov 13 06:32:22 atrium-r9700 kernel: atrium_gpu_amd_pci0: uq0: removed (seq 1, fence 1)
+Nov 13 06:32:22 atrium-r9700 kernel: atrium_gpu_amd_pci0: si: uq0 closed: 1 submits; EOP IVs routed 39, unrouted 1, MES own 202, MES preemption 30; retired by IV 36, by poll 0; queues lost to faults 2, hangs 3; preempted for frees 30 (failed 0)
+Nov 13 06:32:22 atrium-r9700 kernel: atrium_gpu_amd_pci0: si: unrouted EOP src_data[0]: 0x18000000 x1, 0 x0, 0 x0, 0 x0
+Nov 13 06:32:23 atrium-r9700 kernel: atrium_gpu_amd_pci0: mes: pipe 0 ADD_QUEUE (user compute): ok in 180 us (status 0x1)
+Nov 13 06:32:23 atrium-r9700 kernel: atrium_gpu_amd_pci0: uq0: added: VM base 0x800e001, queue pages at VA 0x200000000 (pa 0x449654000), MQD GART 0x80000, doorbell 0x20
+Nov 13 06:32:23 atrium-r9700 kernel: atrium_gpu_amd_pci0: si: uq0: first EOP IV, src_data[0] 0x1000020
+Nov 13 06:32:23 atrium-r9700 kernel: atrium_gpu_amd_pci0: mes: pipe 0 REMOVE_QUEUE (user compute): ok in 230 us (status 0x1)
+Nov 13 06:32:23 atrium-r9700 kernel: atrium_gpu_amd_pci0: uq0: removed (seq 1, fence 1)
+Nov 13 06:32:23 atrium-r9700 kernel: atrium_gpu_amd_pci0: si: uq0 closed: 1 submits; EOP IVs routed 40, unrouted 1, MES own 206, MES preemption 30; retired by IV 37, by poll 0; queues lost to faults 2, hangs 3; preempted for frees 30 (failed 0)
+Nov 13 06:32:23 atrium-r9700 kernel: atrium_gpu_amd_pci0: si: unrouted EOP src_data[0]: 0x18000000 x1, 0 x0, 0 x0, 0 x0
+Nov 13 06:32:23 atrium-r9700 kernel: atrium_gpu_amd_pci0: mes: pipe 0 ADD_QUEUE (user compute): ok in 180 us (status 0x1)
+Nov 13 06:32:23 atrium-r9700 kernel: atrium_gpu_amd_pci0: uq0: added: VM base 0x800f001, queue pages at VA 0x200000000 (pa 0x449654000), MQD GART 0x80000, doorbell 0x20
+Nov 13 06:32:23 atrium-r9700 kernel: atrium_gpu_amd_pci0: si: uq0: first EOP IV, src_data[0] 0x1000020
+Nov 13 06:32:23 atrium-r9700 kernel: atrium_gpu_amd_pci0: mes: pipe 0 REMOVE_QUEUE (user compute): ok in 230 us (status 0x1)
+Nov 13 06:32:23 atrium-r9700 kernel: atrium_gpu_amd_pci0: uq0: removed (seq 1, fence 1)
+Nov 13 06:32:23 atrium-r9700 kernel: atrium_gpu_amd_pci0: si: uq0 closed: 1 submits; EOP IVs routed 41, unrouted 1, MES own 210, MES preemption 30; retired by IV 38, by poll 0; queues lost to faults 2, hangs 3; preempted for frees 30 (failed 0)
+Nov 13 06:32:23 atrium-r9700 kernel: atrium_gpu_amd_pci0: si: unrouted EOP src_data[0]: 0x18000000 x1, 0 x0, 0 x0, 0 x0
+Nov 13 06:32:23 atrium-r9700 kernel: atrium_gpu_amd_pci0: mes: pipe 0 ADD_QUEUE (user compute): ok in 180 us (status 0x1)
+Nov 13 06:32:23 atrium-r9700 kernel: atrium_gpu_amd_pci0: uq0: added: VM base 0x8013001, queue pages at VA 0x200000000 (pa 0x449654000), MQD GART 0x80000, doorbell 0x20
+Nov 13 06:32:23 atrium-r9700 kernel: atrium_gpu_amd_pci0: mes: pipe 0 ADD_QUEUE (user compute): ok in 340 us (status 0x1)
+Nov 13 06:32:23 atrium-r9700 kernel: atrium_gpu_amd_pci0: uq1: added: VM base 0x8013001, queue pages at VA 0x200010000 (pa 0x44965c000), MQD GART 0x84000, doorbell 0x22
+Nov 13 06:32:23 atrium-r9700 kernel: atrium_gpu_amd_pci0: si: uq1: first EOP IV, src_data[0] 0x1000022
+Nov 13 06:32:23 atrium-r9700 kernel: atrium_gpu_amd_pci0: si: uq0: first EOP IV, src_data[0] 0x1000020
+Nov 13 06:32:23 atrium-r9700 kernel: atrium_gpu_amd_pci0: mes: pipe 0 REMOVE_QUEUE (user compute): ok in 250 us (status 0x1)
+Nov 13 06:32:23 atrium-r9700 kernel: atrium_gpu_amd_pci0: uq1: removed (seq 1, fence 1)
+Nov 13 06:32:23 atrium-r9700 kernel: atrium_gpu_amd_pci0: si: uq1 closed: 1 submits; EOP IVs routed 43, unrouted 1, MES own 216, MES preemption 30; retired by IV 39, by poll 0; queues lost to faults 2, hangs 3; preempted for frees 30 (failed 0)
+Nov 13 06:32:23 atrium-r9700 kernel: atrium_gpu_amd_pci0: si: unrouted EOP src_data[0]: 0x18000000 x1, 0 x0, 0 x0, 0 x0
+Nov 13 06:32:23 atrium-r9700 kernel: atrium_gpu_amd_pci0: mes: pipe 0 REMOVE_QUEUE (user compute): ok in 210 us (status 0x1)
+Nov 13 06:32:23 atrium-r9700 kernel: atrium_gpu_amd_pci0: uq0: removed (seq 1, fence 1)
+Nov 13 06:32:23 atrium-r9700 kernel: atrium_gpu_amd_pci0: si: uq0 closed: 1 submits; EOP IVs routed 43, unrouted 1, MES own 218, MES preemption 30; retired by IV 39, by poll 0; queues lost to faults 2, hangs 3; preempted for frees 30 (failed 0)
+Nov 13 06:32:23 atrium-r9700 kernel: atrium_gpu_amd_pci0: si: unrouted EOP src_data[0]: 0x18000000 x1, 0 x0, 0 x0, 0 x0
+Nov 13 06:32:23 atrium-r9700 kernel: atrium_gpu_amd_pci0: mes: pipe 0 ADD_QUEUE (user compute): ok in 180 us (status 0x1)
+Nov 13 06:32:23 atrium-r9700 kernel: atrium_gpu_amd_pci0: uq0: added: VM base 0x8013001, queue pages at VA 0x200000000 (pa 0x449654000), MQD GART 0x80000, doorbell 0x20
+Nov 13 06:32:23 atrium-r9700 kernel: atrium_gpu_amd_pci0: si: uq0: first EOP IV, src_data[0] 0x1000020
+Nov 13 06:32:23 atrium-r9700 kernel: atrium_gpu_amd_pci0: mes: pipe 0 REMOVE_QUEUE (user compute): ok in 270 us (status 0x1)
+Nov 13 06:32:23 atrium-r9700 kernel: atrium_gpu_amd_pci0: uq0: removed (seq 1, fence 1)
+Nov 13 06:32:23 atrium-r9700 kernel: atrium_gpu_amd_pci0: si: uq0 closed: 1 submits; EOP IVs routed 44, unrouted 1, MES own 222, MES preemption 30; retired by IV 40, by poll 0; queues lost to faults 2, hangs 3; preempted for frees 30 (failed 0)
+Nov 13 06:32:23 atrium-r9700 kernel: atrium_gpu_amd_pci0: si: unrouted EOP src_data[0]: 0x18000000 x1, 0 x0, 0 x0, 0 x0
+Nov 13 06:32:23 atrium-r9700 kernel: atrium_gpu_amd_pci0: mes: pipe 0 ADD_QUEUE (user compute): ok in 180 us (status 0x1)
+Nov 13 06:32:23 atrium-r9700 kernel: atrium_gpu_amd_pci0: uq0: added: VM base 0x8013001, queue pages at VA 0x200000000 (pa 0x449654000), MQD GART 0x80000, doorbell 0x20
+Nov 13 06:32:23 atrium-r9700 kernel: atrium_gpu_amd_pci0: si: uq0: first EOP IV, src_data[0] 0x1000020
+Nov 13 06:32:23 atrium-r9700 kernel: atrium_gpu_amd_pci0: mes: pipe 0 REMOVE_QUEUE (user compute): ok in 260 us (status 0x1)
+Nov 13 06:32:23 atrium-r9700 kernel: atrium_gpu_amd_pci0: uq0: removed (seq 1, fence 1)
+Nov 13 06:32:23 atrium-r9700 kernel: atrium_gpu_amd_pci0: si: uq0 closed: 1 submits; EOP IVs routed 45, unrouted 1, MES own 226, MES preemption 30; retired by IV 41, by poll 0; queues lost to faults 2, hangs 3; preempted for frees 30 (failed 0)
+Nov 13 06:32:23 atrium-r9700 kernel: atrium_gpu_amd_pci0: si: unrouted EOP src_data[0]: 0x18000000 x1, 0 x0, 0 x0, 0 x0
+Nov 13 06:32:23 atrium-r9700 kernel: atrium_gpu_amd_pci0: mes: pipe 0 ADD_QUEUE (user compute): ok in 180 us (status 0x1)
+Nov 13 06:32:23 atrium-r9700 kernel: atrium_gpu_amd_pci0: uq0: added: VM base 0x8021001, queue pages at VA 0x200000000 (pa 0x449654000), MQD GART 0x80000, doorbell 0x20
+Nov 13 06:32:23 atrium-r9700 kernel: atrium_gpu_amd_pci0: si: VM fault: 1 IV(s), VMIDs 0x100, first VMID 8 at 0x10002000
+Nov 13 06:32:23 atrium-r9700 kernel: atrium_gpu_amd_pci0: gmc: client fault: fault status 0x800c30: client CPG (0x6), VMID 8, MORE_FAULTS 0, WALKER_ERROR 0, PERMISSION_FAULTS 0x3, MAPPING_ERROR 0, RW 0, ATOMIC 0, PRT 0, UCE 0
+Nov 13 06:32:23 atrium-r9700 kernel: atrium_gpu_amd_pci0: si: uq0 faulted (VMID 8, 0x10002000): its work fails, the queue is lost
+Nov 13 06:32:23 atrium-r9700 kernel: atrium_gpu_amd_pci0: uq0: destroy: work in flight: seq 1, fence 0, wptr 12, rptr report 0; HQD active (VMID 8)
+Nov 13 06:32:23 atrium-r9700 kernel: atrium_gpu_amd_pci0: uq0: VMID 8's waves killed (0); fence still behind after 200000 us
+Nov 13 06:32:23 atrium-r9700 kernel: atrium_gpu_amd_pci0: si: uq0: first EOP IV, src_data[0] 0x1000020
+Nov 13 06:32:23 atrium-r9700 kernel: atrium_gpu_amd_pci0: uq0: stuck HQD rptr 0xc wptr 0xc, CP_CPC_STATUS 0xa0000001, CP_CPC_BUSY_STAT 0x840/0, CP_CPF_STATUS 0xa8008001
+Nov 13 06:32:23 atrium-r9700 kernel: atrium_gpu_amd_pci0: uq0: HQD me1 pipe 1 queue 0 (VMID 8) reset: STILL ACTIVE after 100000 us
+Nov 13 06:32:23 atrium-r9700 kernel: atrium_gpu_amd_pci0: uq0: HQD stuck after its reset: seq 1, fence 1, wptr 12, rptr report 0xc; HQD active (VMID 8)
+Nov 13 06:32:23 atrium-r9700 kernel: atrium_gpu_amd_pci0: uq0: HQD will not stop; the GPU must be reset
+Nov 13 06:32:23 atrium-r9700 kernel: atrium_gpu_amd_pci0: si: a lost user queue that will not stop; resetting the GPU, every client queue is lost
+Nov 13 06:32:23 atrium-r9700 kernel: atrium_gpu_amd_pci0: smu: mode 1 reset (card back to its post-POST state)
+Nov 13 06:32:24 atrium-r9700 kernel: atrium_gpu_amd_pci0: smu: after reset: PSP bootloader ready, card cold; sOS 0, memsize 32624 MiB, SMU response 0x1, GB_ADDR_CONFIG 0
+Nov 13 06:32:24 atrium-r9700 kernel: atrium_gpu_amd_pci0: psp: amdgpu/psp_14_0_3_sos.bin, 9 pieces; buffer VRAM+0x4000000 = MC 0x8004000000
+Nov 13 06:32:24 atrium-r9700 kernel: atrium_gpu_amd_pci0: psp: [0] type 3 version 0x703b0001, 6816 bytes, cmd 0x80000
+Nov 13 06:32:24 atrium-r9700 kernel: atrium_gpu_amd_pci0: psp: [1] type 5 version 0x1003a00, 832 bytes, cmd 0x10000000
+Nov 13 06:32:24 atrium-r9700 kernel: atrium_gpu_amd_pci0: psp: [2] type 2 version 0x3a1214, 78272 bytes, cmd 0x10000
+Nov 13 06:32:24 atrium-r9700 kernel: atrium_gpu_amd_pci0: psp: [3] type 7 version 0x3a1214, 103792 bytes, cmd 0xb0000
+Nov 13 06:32:25 atrium-r9700 kernel: atrium_gpu_amd_pci0: psp: [4] type 8 version 0x3a1214, 37280 bytes, cmd 0xd0000
+Nov 13 06:32:25 atrium-r9700 kernel: atrium_gpu_amd_pci0: psp: [5] type 9 version 0x3a1214, 53344 bytes, cmd 0xc0000
+Nov 13 06:32:25 atrium-r9700 kernel: atrium_gpu_amd_pci0: psp: [6] type 10 version 0x3a1214, 12704 bytes, cmd 0xe0000
+Nov 13 06:32:25 atrium-r9700 kernel: atrium_gpu_amd_pci0: psp: [7] type 11 version 0x3a1214, 12848 bytes, cmd 0xf0000
+Nov 13 06:32:25 atrium-r9700 kernel: atrium_gpu_amd_pci0: psp: [8] type 1 version 0x3a1214, 125472 bytes, cmd 0x20000
+Nov 13 06:32:25 atrium-r9700 kernel: atrium_gpu_amd_pci0: psp: sOS up; C2PMSG_35 0, C2PMSG_81 0xa1b3f35
+Nov 13 06:32:25 atrium-r9700 kernel: atrium_gpu_amd_pci0: psp: KM ring created (C2PMSG_64 0x80c20000)
+Nov 13 06:32:25 atrium-r9700 kernel: atrium_gpu_amd_pci0: psp: fw reservation: status 0, VRAM 0x7f3e00000 + 0x3200000 (50 MiB)
+Nov 13 06:32:25 atrium-r9700 kernel: atrium_gpu_amd_pci0: psp: fw reservation (ext): status 0, VRAM 0x7d6c00000 + 0x400000 (4 MiB) NOT at the top of VRAM
+Nov 13 06:32:25 atrium-r9700 kernel: atrium_gpu_amd_pci0: psp: fence 0x3; resp 00000000 00000000 deadbeef deadbeef 00000000 deadbeef deadbeef deadbeef
+Nov 13 06:32:25 atrium-r9700 kernel: atrium_gpu_amd_pci0: psp: LOAD_TOC (2304 bytes): done, status 0, TMR size 0 (0 MiB)
+Nov 13 06:32:25 atrium-r9700 kernel: atrium_gpu_amd_pci0: psp: before: RLC bootload status 0, CP_STAT 0
+Nov 13 06:32:25 atrium-r9700 kernel: atrium_gpu_amd_pci0: psp: 20 IP firmware images, 2020 KiB staged at VRAM+0x4400000
+Nov 13 06:32:25 atrium-r9700 kernel: atrium_gpu_amd_pci0: psp: LOAD_IP_FW type 18, 327168 bytes: status 0
+Nov 13 06:32:25 atrium-r9700 kernel: atrium_gpu_amd_pci0: psp: LOAD_IP_FW type 71, 46848 bytes: status 0
+Nov 13 06:32:25 atrium-r9700 kernel: atrium_gpu_amd_pci0: psp: LOAD_IP_FW type 87, 92992 bytes: status 0
+Nov 13 06:32:25 atrium-r9700 kernel: atrium_gpu_amd_pci0: psp: LOAD_IP_FW type 88, 201152 bytes: status 0
+Nov 13 06:32:25 atrium-r9700 kernel: atrium_gpu_amd_pci0: psp: LOAD_IP_FW type 89, 193248 bytes: status 0
+Nov 13 06:32:25 atrium-r9700 kernel: atrium_gpu_amd_pci0: psp: LOAD_IP_FW type 90, 66368 bytes: status 0
+Nov 13 06:32:25 atrium-r9700 kernel: atrium_gpu_amd_pci0: psp: LOAD_IP_FW type 92, 66192 bytes: status 0
+Nov 13 06:32:25 atrium-r9700 kernel: atrium_gpu_amd_pci0: psp: LOAD_IP_FW type 94, 66080 bytes: status 0
+Nov 13 06:32:25 atrium-r9700 kernel: atrium_gpu_amd_pci0: psp: LOAD_IP_FW type 95, 66080 bytes: status 0
+Nov 13 06:32:25 atrium-r9700 kernel: atrium_gpu_amd_pci0: psp: LOAD_IP_FW type 33, 217104 bytes: status 0
+Nov 13 06:32:25 atrium-r9700 kernel: atrium_gpu_amd_pci0: psp: LOAD_IP_FW type 34, 82048 bytes: status 0
+Nov 13 06:32:25 atrium-r9700 kernel: atrium_gpu_amd_pci0: psp: LOAD_IP_FW type 81, 217104 bytes: status 0
+Nov 13 06:32:25 atrium-r9700 kernel: atrium_gpu_amd_pci0: psp: LOAD_IP_FW type 82, 82048 bytes: status 0
+Nov 13 06:32:25 atrium-r9700 kernel: atrium_gpu_amd_pci0: psp: LOAD_IP_FW type 68, 66048 bytes: status 0
+Nov 13 06:32:25 atrium-r9700 kernel: atrium_gpu_amd_pci0: psp: LOAD_IP_FW type 69, 66048 bytes: status 0
+Nov 13 06:32:25 atrium-r9700 kernel: atrium_gpu_amd_pci0: psp: LOAD_IP_FW type 20, 2560 bytes: status 0
+Nov 13 06:32:25 atrium-r9700 kernel: atrium_gpu_amd_pci0: psp: LOAD_IP_FW type 21, 23616 bytes: status 0
+Nov 13 06:32:25 atrium-r9700 kernel: atrium_gpu_amd_pci0: psp: LOAD_IP_FW type 26, 66048 bytes: status 0
+Nov 13 06:32:25 atrium-r9700 kernel: atrium_gpu_amd_pci0: psp: LOAD_IP_FW type 48, 33280 bytes: status 0
+Nov 13 06:32:25 atrium-r9700 kernel: atrium_gpu_amd_pci0: psp: LOAD_IP_FW type 8, 25088 bytes: status 0
+Nov 13 06:32:25 atrium-r9700 kernel: atrium_gpu_amd_pci0: psp: AUTOLOAD_RLC: status 0
+Nov 13 06:32:27 atrium-r9700 kernel: atrium_gpu_amd_pci0: psp: RLC autoload NOT complete after 2000000 us: bootload status 0, CP_STAT 0
+Nov 13 06:32:27 atrium-r9700 kernel: atrium_gpu_amd_pci0: psp: rings destroyed (C2PMSG_64 0x80c30000)
+Nov 13 06:32:27 atrium-r9700 kernel: atrium_gpu_amd_pci0: si: GPU re-init 1 failed at PSP firmware load (60); the GPU stays lost
+Nov 13 06:32:27 atrium-r9700 kernel: atrium_gpu_amd_pci0: smu: mode 1 reset (card back to its post-POST state)
+Nov 13 06:32:28 atrium-r9700 kernel: atrium_gpu_amd_pci0: smu: after reset: PSP bootloader ready, card cold; sOS 0, memsize 32624 MiB, SMU response 0x1, GB_ADDR_CONFIG 0
+Nov 13 06:32:28 atrium-r9700 kernel: atrium_gpu_amd_pci0: uq0: freed after the GPU reset
+Nov 13 06:32:28 atrium-r9700 kernel: atrium_gpu_amd_pci0: si: uq0 closed: 1 submits; EOP IVs routed 46, unrouted 1, MES own 228, MES preemption 30; retired by IV 41, by poll 0; queues lost to faults 3, hangs 3; preempted for frees 30 (failed 0)
+Nov 13 06:32:28 atrium-r9700 kernel: atrium_gpu_amd_pci0: si: unrouted EOP src_data[0]: 0x18000000 x1, 0 x0, 0 x0, 0 x0
