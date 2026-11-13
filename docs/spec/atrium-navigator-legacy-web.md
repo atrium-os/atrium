@@ -661,6 +661,11 @@ data settled for page requests, applied to code:
 3. **Script a page injects at run time** was already refused when it had a `src`
    (`run_injected_scripts`), so the converter now fetches no third-party code by any path.
 4. **No blocklist**, as in §5.4.1c and §5.4.1d: the rule is computed from two URLs.
+5. **A tracking pixel is never fetched either** (`subresource::invisible_img`): an `<img>`
+   that carries `hidden` itself or declares at most 1 × 1 shows a reader nothing, so it is
+   neither fetched nor hinted, whatever its host. It keeps its declared size with no bytes.
+   Subresources are collected after scripts run, so an image a script revealed has lost its
+   `hidden`; one hidden by CSS or a container is still fetched (a carousel's slides).
 
 **What it costs** is the same population §5.4.1c's measurement found: pages whose own code
 lives on a CDN of another origin (`githubassets`, `bbci`) now convert as their tier-1

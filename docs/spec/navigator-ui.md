@@ -787,8 +787,11 @@ tier 2, because its cross-origin scripts used to blank it. Two lose more than 5%
 nhs.uk (−6.4%, its cookie banner and an account label, so a gain) and ynet (−9.3%, video,
 weather and login widgets from its own CDN; the article is kept). Third-party ad creative stays
 at 0, and the 8 pages that detect ad blocking are still none worse. One request still reaches an
-ad host, and it is not a script: old.reddit's `<img>` pixel (legacy-web §5.4.1d does not cover
-images; open).
+ad host, and it is not a script: old.reddit's `<img src="https://id.rlcdn.com/…gif" hidden>`.
+**Closed the same day**: the converter never fetches or hints an `<img>` that is `hidden` itself
+or declares at most 1 × 1 (structural, no host list; an image hidden by CSS or a container is
+still fetched, for carousels). Re-measured: requests to ad or tracker hosts at conversion 1 → 0;
+the rule skips exactly that one image on the corpus; text, tiers and residue unchanged.
 
 **Embeds** (legacy-web §8.1): no corpus page produced an island. All 4 real video embeds arrive
 lazily: LinkedIn and wikiHow put the player URL in a data attribute a script copies to `src`, and
