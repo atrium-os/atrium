@@ -654,9 +654,24 @@ tbl_of(struct amd_vm12 *vm, uint64_t pde, u_int *t)
 	return (false);
 }
 
-static int
-tbl_alloc(struct amd_vm12 *vm, bool ptb, u_int *t)
+/* Table `t` is one of the VM's empty ("null") tables. */
+static bool
+tbl_null(const struct amd_vm12 *vm, u_int t)
 {
+	u_int l;
+
+	for (l = 1; l < VM_LEVELS; l++)
+		if (vm->nullt[l] != 0 && vm->nullt[l] == t)
+			return (true);
+	return (false);
+}
+
+/* A new table at level `lvl` (0 the root .. VM_LEVELS - 1 a PTB). */
+static int
+tbl_alloc(struct amd_vm12 *vm, u_int lvl, u_int *t)
+{
+	bool ptb = lvl == VM_LEVELS - 1;
+	uint64_t fill;
 	uint64_t off;
 	u_int i;
 	int err;
@@ -686,9 +701,42 @@ tbl_alloc(struct amd_vm12 *vm, bool ptb, u_int *t)
 	 * high VA) faulted with WALKER_ERROR 6 and left the GFXHUB L2 unable
 	 * to ack any invalidation until a mode 1 reset.
 	 */
+	/*
+	 * Box run 6eca95c0: with that, a store through an empty PDB2 entry
+	 * (0x7ffffff00000) faulted cleanly (WALKER_ERROR 0) and still wedged
+	 * the GFXHUB (UTCL2 and EA busy, no invalidation acked). A store past
+	 * a buffer, which faults at a 4 KiB PTE, never did. So client VMs
+	 * point every empty entry at a chain of empty tables down to an empty
+	 * PTB (vm->nullt): every fault, anywhere in the 48-bit range, is a
+	 * 4 KiB PTE fault.
+	 */
+	fill = ptb ? PTE_EXECUTABLE | PTE_IS_PTE : vm->nullt[lvl + 1] != 0 ?
+	    tbl_pde(vm, vm->nullt[lvl + 1]) : PTE_IS_PTE;
 	for (i = 0; i < PAGE_SIZE / 8; i++)
-		tbl_wr(vm, *t, i, ptb ? PTE_EXECUTABLE | PTE_IS_PTE :
-		    PTE_IS_PTE);
+		tbl_wr(vm, *t, i, fill);
+	return (0);
+}
+
+/*
+ * A client VM: the root (table 0), then its empty tables bottom up (an
+ * empty PTB, a PDB0 all pointing at it, a PDB1 all pointing at that), and
+ * the root's entries pointed at the empty PDB1. See tbl_alloc.
+ */
+static int
+vm_init_null(struct amd_vm12 *vm)
+{
+	u_int root, t, l, i;
+	int err;
+
+	if ((err = tbl_alloc(vm, 0, &root)) != 0)
+		return (err);
+	for (l = VM_LEVELS - 1; l >= 1; l--) {
+		if ((err = tbl_alloc(vm, l, &t)) != 0)
+			return (err);
+		vm->nullt[l] = t;
+	}
+	for (i = 0; i < PAGE_SIZE / 8; i++)
+		tbl_wr(vm, root, i, tbl_pde(vm, vm->nullt[1]));
 	return (0);
 }
 
@@ -716,7 +764,7 @@ amd_gmc12_vm_init(struct amd_gart *gt, struct amd_vm12 *vm, int mode,
 		    M_DEVBUF, M_WAITOK | M_ZERO);
 		sx_init(&vm->tlock, "atrium_vm12");
 		vm->live = true;
-		return (tbl_alloc(vm, false, &root));	/* table 0 */
+		return (vm_init_null(vm));
 	}
 	/* A slice of the pool per live VM. */
 	for (vm->slice = 0; vm->slice < VM_SLICES; vm->slice++)
@@ -729,7 +777,8 @@ amd_gmc12_vm_init(struct amd_gart *gt, struct amd_vm12 *vm, int mode,
 	vm->live = true;
 	if (mode == AMD_VM12_FLAT && (flat_va & ((2ull << 20) - 1)) != 0)
 		return (EINVAL);
-	return (tbl_alloc(vm, mode == AMD_VM12_FLAT, &root));	/* table 0 */
+	return (tbl_alloc(vm, mode == AMD_VM12_FLAT ? VM_LEVELS - 1 : 0,
+	    &root));	/* table 0 */
 }
 
 void
@@ -788,10 +837,11 @@ vm_walk(struct amd_vm12 *vm, uint64_t va, bool alloc, u_int *pt, u_int *pi)
 		shift = PAGE_SHIFT + 9 * (VM_LEVELS - 1 - lvl);
 		idx = (va >> shift) & 511;
 		pde = tbl_rd(vm, t, idx);
-		if ((pde & PTE_VALID) == 0) {
+		if ((pde & PTE_VALID) == 0 || (tbl_of(vm, pde, &child) &&
+		    tbl_null(vm, child))) {
 			if (!alloc)
 				return (ENOENT);
-			err = tbl_alloc(vm, lvl == VM_LEVELS - 2, &child);
+			err = tbl_alloc(vm, lvl + 1, &child);
 			if (err != 0)
 				return (err);
 			pde = tbl_pde(vm, child);
