@@ -1089,3 +1089,18 @@ work (self-test, scrub).
     08:22 got EIO. Every other sign shows the refusal.
   Logs: claude/project-thread-33aauq 6658138c. Still owed: per-queue recovery of a CP
   queue halted on an error, and the SMU-mailbox read probe.
+- **2026-11-13 09:40, per-queue recovery attempt staged (e88fd84e).** When a user
+  queue's HQD will not stop after the dequeue reset, the driver now tries amdgpu's
+  recovery order for a hung MES user queue (amdgpu_gfx_reset_mes_compute,
+  mes_userq_reset) before falling back to mode 1:
+  1. SUSPEND all gangs.
+  2. If that does not complete, MESAPI__RESET with hang_detect_then_reset; the
+     hung-queue list goes to MES block 0x4400.
+  3. MES's reset of the queue, by doorbell.
+  4. REMOVE_QUEUE. If that is refused, again with remove_queue_after_reset (box MES
+     0x97 is at least 0x5a).
+  5. RESUME all.
+  Earlier runs sent RESET and REMOVE without suspending first. CP and MES state is
+  dumped before and after. If any step fails, the existing mode 1 reset, re-init and
+  reset blame run as before. On gpusim both suites are ALL OK. Box artifacts: pci
+  c7db56c6…, gpu 67a565a0…, si-client-test unchanged (5801b269…), xfer 74f342a3.
