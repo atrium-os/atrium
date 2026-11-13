@@ -22,6 +22,7 @@
 #   - Aqueduct media service (§6.6): alice lists and subscribes, bob is
 #     refused; the subscriber hears added and ejected; lock and logout
 #     end it.
+#   - a stick with FAT straight on the disk is served whole (/media/daN).
 #   - eject: refused for bob, refused while alice has a file open ("busy"),
 #     then done for alice; stays down across a relogin, back after replug;
 #   - switch to bob: served as bob; logout: unmounted;
@@ -76,6 +77,11 @@ PY
 mkfs.fat -F 32 --offset 2048 -n STICK "$IMG" $(( (96*1024*1024 - 1048576) / 1024 )) >/dev/null \
   && printf 'on the stick\n' > /tmp/automount-hello.txt && MTOOLS_SKIP_CHECK=1 mcopy -i "$IMG@@1M" /tmp/automount-hello.txt ::hello.txt \
   && echo "  stick image ready" || { echo "  could not build the stick image"; exit 1; }
+# And one with FAT straight on the disk ("superfloppy").
+IMG2=$VMDIR/bare.img
+rm -f "$IMG2"; mkfs.fat -C -F 32 -n BARE "$IMG2" $((80*1024)) >/dev/null \
+  && printf 'no table\n' > /tmp/automount-bare.txt && MTOOLS_SKIP_CHECK=1 mcopy -i "$IMG2" /tmp/automount-bare.txt ::bare.txt \
+  && echo "  bare stick image ready" || { echo "  could not build the bare image"; exit 1; }
 
 echo "== copy and install"
 V 'rm -rf /root/am && mkdir -p /root/am/scripts /root/am/capsa/etc/devices.d'
@@ -109,7 +115,7 @@ jail_name         = "atrium-capsa-"
 name_prefix       = true
 exec_path         = "/usr/local/bin/atrium-capsa-fuse"
 uid               = 65031
-fuse_devices      = ["da#p#", "da#s#"]
+fuse_devices      = ["da#p#", "da#s#", "da#"]
 fuse_mount_prefix = "/media"
 EOP
 grep -q 'sysfil.profiles.fuse-server' $P || printf '\n[sysfil.profiles.fuse-server]\ninclude = ["base"]\nioctls  = ["0x40046480", "0x40086481"]\n' >> $P
@@ -132,7 +138,7 @@ lock() { V "printf '%s\n' '$1' > $LOCK"; sleep 6; }
 mounted() { V "mount -p | tr -s '\t' ' ' | grep -q ' $M fusefs'"; }
 plug() {
   before=$(V "sysctl -n kern.disks")
-  mon "drive_add 0 if=none,id=stick$1,file=$IMG,format=raw" "device_add usb-storage,id=st$1,drive=stick$1" | tr -d '\r' | grep -iE "error|fail" | sed 's/^/  qemu: /'
+  mon "drive_add 0 if=none,id=stick$1,file=${2:-$IMG},format=raw" "device_add usb-storage,id=st$1,drive=stick$1" | tr -d '\r' | grep -iE "error|fail" | sed 's/^/  qemu: /'
   sleep 10
   DA=$(V "sysctl -n kern.disks" | tr ' ' '\n' | grep '^da' | while read d; do echo " $before " | grep -q " $d " || echo $d; done | head -1)
   PART=${DA}s1; M=/media/$PART
@@ -203,6 +209,21 @@ login ""
 mounted && bad "still mounted after logout" || ok "logged out: unmounted"
 V "$DD --media" | sed 's/^/  media: /'
 unplug 2$RUN
+
+echo "== a stick with no partition table"
+login alice
+plug 3$RUN "$IMG2"
+PART=$DA; M=/media/$DA
+if [ -n "$DA" ] && mounted; then
+  ok "served whole at $M"
+  [ "$(V "su -m alice -c 'cat $M/bare.txt'")" = "no table" ] && ok "alice reads it" || bad "alice cannot read bare.txt"
+  V "ls /dev | grep -q '^${DA}[ps]'" && bad "GEOM made partitions on it" || ok "no partition nodes"
+else
+  bad "not served whole ($(V "tail -3 /var/log/atrium/dispensatord.log | tr '\n' ';'"))"
+fi
+unplug 3$RUN
+mounted && bad "still mounted after unplug" || ok "unplugged: unmounted"
+login ""
 V "grep -E 'capsa|session|eject' /var/log/atrium/dispensatord.log | tail -8" | sed 's/^/  log: /'
 
 echo "== the stick, checked here"

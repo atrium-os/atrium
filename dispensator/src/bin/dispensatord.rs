@@ -265,6 +265,8 @@ mod run {
         session_shared: Arc<Mutex<Session>>,
         ejects: Option<(mpsc::Receiver<EjectReq>, UnixStream)>,
         ejected_now: Vec<String>,
+        /// Whole disks waiting for GEOM to make their partitions, if any.
+        settling: Vec<(Instant, String)>,
     }
 
     type EjectReq = (String, mpsc::Sender<(u8, String)>);
@@ -323,6 +325,7 @@ mod run {
             session_shared: Arc::new(Mutex::new(Session::None)),
             ejects: None,
             ejected_now: Vec::new(),
+            settling: Vec::new(),
         };
         a.session = a.read_session();
         *a.session_shared.lock().unwrap() = a.session.clone();
@@ -550,12 +553,20 @@ mod run {
                     libc::pollfd { fd: self.ejects.as_ref().map_or(-1, |(_, w)| w.as_raw_fd()), events: libc::POLLIN, revents: 0 },
                 ];
                 // SAFETY: two valid pollfds (a negative fd is ignored).
-                let r = unsafe { libc::poll(p.as_mut_ptr(), 2, reshow.as_millis() as libc::c_int) };
+                let wait = if self.settling.is_empty() { reshow } else { Duration::from_millis(500).min(reshow) };
+                let r = unsafe { libc::poll(p.as_mut_ptr(), 2, wait.as_millis() as libc::c_int) };
                 if r < 0 && std::io::Error::last_os_error().kind() != std::io::ErrorKind::Interrupted {
                     return;
                 }
                 if r > 0 && p[1].revents != 0 {
                     self.take_ejects();
+                }
+                let now = Instant::now();
+                let due: Vec<String> = self.settling.iter().filter(|(t, _)| *t <= now).map(|(_, d)| d.clone()).collect();
+                self.settling.retain(|(t, _)| *t > now);
+                for d in due {
+                    let ops = self.planner.settle(&d);
+                    self.run(ops);
                 }
                 if r > 0 && p[0].revents != 0 {
                     match w.recv_line() {
@@ -600,6 +611,7 @@ mod run {
                     Op::DetachKernel { ugen, interface } => Self::detach_kernel(&ugen, interface),
                     Op::StopDriver { driver, device, vars } => self.stop(&driver, &device, &vars),
                     Op::Log(m) => eprintln!("atrium-dispensatord: {m}"),
+                    Op::Settle { disk } => self.settling.push((Instant::now() + Duration::from_millis(1500), disk)),
                 }
             }
             if changed {

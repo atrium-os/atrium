@@ -243,7 +243,7 @@ jail_name         = "atrium-capsa-"
 name_prefix       = true
 exec_path         = "/usr/local/bin/atrium-capsa-fuse"
 uid               = 65031
-fuse_devices      = ["da#p#", "da#s#"]
+fuse_devices      = ["da#p#", "da#s#", "da#"]  # da#: a stick with no partition table
 fuse_mount_prefix = "/media"
 
 # Wi-Fi radios (wifi.md §8.3): the control nodes belong to aura-mlme, the key

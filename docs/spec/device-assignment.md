@@ -658,7 +658,7 @@ shipped rule); ostiarius 17 and portcullis-peer 9 on FreeBSD.
 
 Not yet: the session's apps see `/media` through their jails only where a
 manifest grants it (storage.md `removable_media`, not wired); a whole-disk
-(superfloppy) stick; exFAT writes; the lock screen as the caller of
+(superfloppy) stick (done, §6.7); exFAT writes; the lock screen as the caller of
 ostiarius `Lock`/`Unlock`. The Forum eject button came next (§6.6).
 
 ### 6.6 As built: sticks in Forum, over Aqueduct (2026-11-13)
@@ -705,6 +705,19 @@ eject is refused, an open file answers BUSY (status 4), with everything
 from §6.5 still passing. Host tests: atrium-media 2, forum-bar 18
 (the icon only with a stick, the menu, events), portcullis-jail devfs and
 the Forum manifest tests (only the bar holds `removable-media`).
+
+### 6.7 As built: sticks with no partition table (2026-11-13)
+
+Some sticks carry FAT straight on the disk ("superfloppy"). GEOM's CREATE
+for a whole disk a `disk` rule matches (`da0`) now yields `Op::Settle`;
+the daemon calls `Planner::settle` 1.5 s later and, if no partition of that
+disk has appeared, serves the disk itself as `{part}` = `da0`, mounted at
+`/media/da0`. A partition appearing later (repartitioned while plugged in)
+stops the whole-disk server and takes over. At start, bare disks in `/dev`
+settle at once. jaild pin 31 adds `da#` to `fuse_devices`. Host test
+`superfloppy`; gate `vm-automount-check.sh` adds a bare FAT32 stick
+(`mkfs.fat -C`, no MBR): served whole at `/media/da0`, alice reads it, no
+partition nodes, unmounted on unplug; **0 failed** 2026-11-13.
 
 ## 7. Not in scope
 

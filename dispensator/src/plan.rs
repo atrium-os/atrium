@@ -36,6 +36,9 @@ pub enum Op {
     DetachKernel { ugen: String, interface: u8 },
     /// Stop `driver`'s jail for `device`; `vars` holds its instance placeholder.
     StopDriver { driver: String, device: String, vars: Vars },
+    /// Whole disk `disk` appeared: call [`Planner::settle`] once GEOM has
+    /// had time to make its partitions (a second or two).
+    Settle { disk: String },
     Log(String),
 }
 
@@ -55,6 +58,10 @@ pub struct Planner {
     /// (`pcm1`) for the `driver` class, `ugenB.A:I` for a USB interface.
     owned: BTreeMap<String, Assignment>,
     pub registry: Registry,
+    /// Whole disks a `disk` rule matches, and the partitions present: a
+    /// disk with none is served whole once it settles.
+    whole: std::collections::BTreeSet<String>,
+    parts: std::collections::BTreeSet<String>,
 }
 
 /// A USB interface's attach or nomatch: `(ugen, bus, addr, interface, ids
@@ -132,7 +139,7 @@ fn vars(pairs: &[(&str, Option<String>)]) -> Vars {
 
 impl Planner {
     pub fn new(rules: Rules) -> Self {
-        Self { rules, hid: Classifier::default(), owned: BTreeMap::new(), registry: Registry::default() }
+        Self { rules, hid: Classifier::default(), owned: BTreeMap::new(), registry: Registry::default(), whole: Default::default(), parts: Default::default() }
     }
 
     pub fn rules(&self) -> &Rules {
@@ -159,8 +166,12 @@ impl Planner {
             if (system.as_str(), subsystem.as_str()) == ("GEOM", "DEV") {
                 if let Some(cdev) = fields.get("cdev") {
                     match kind.as_str() {
-                        "CREATE" => out.extend(self.disk_attach(cdev)),
-                        "DESTROY" => out.extend(self.release(cdev)),
+                        "CREATE" => out.extend(self.disk_create(cdev)),
+                        "DESTROY" => {
+                            self.whole.remove(cdev);
+                            self.parts.remove(cdev);
+                            out.extend(self.release(cdev));
+                        }
                         _ => {}
                     }
                 }
@@ -230,24 +241,66 @@ impl Planner {
         Some(out)
     }
 
+    /// A disk or partition GEOM made. A partition goes to its `disk` rule,
+    /// and takes over from its disk if that was served whole; a whole disk
+    /// waits to settle.
+    fn disk_create(&mut self, name: &str) -> Vec<Op> {
+        if self.rules.match_whole_disk(name).is_some() {
+            self.whole.insert(name.to_string());
+            return vec![Op::Settle { disk: name.to_string() }];
+        }
+        let Some((_, disk)) = crate::rules::parse_partition(name) else { return Vec::new() };
+        let disk = disk.to_string();
+        self.parts.insert(name.to_string());
+        let mut out = self.release(&disk);
+        out.extend(self.disk_attach(name));
+        out
+    }
+
+    /// GEOM had its time: serve `disk` whole if it still has no partition
+    /// (FAT straight on the disk, no table).
+    pub fn settle(&mut self, disk: &str) -> Vec<Op> {
+        let has_parts = self.parts.iter().any(|p| crate::rules::parse_partition(p).is_some_and(|(_, d)| d == disk));
+        if !self.whole.contains(disk) || has_parts || self.owned.contains_key(disk) {
+            return Vec::new();
+        }
+        let Some((rule, owner)) = self.rules.match_whole_disk(disk) else { return Vec::new() };
+        let pairs = [("part", Some(disk.to_string())), ("disk", Some(disk.to_string()))];
+        self.assign_disk(disk, rule.clone(), owner.clone(), &pairs)
+    }
+
     /// A partition GEOM made (`da0p1`): the `disk` rule for its driver.
     fn disk_attach(&mut self, part: &str) -> Vec<Op> {
         let Some(((rule, owner), disk)) = self.rules.match_partition(part) else { return Vec::new() };
         let pairs = [("part", Some(part.to_string())), ("disk", Some(disk.to_string()))];
-        let filled: Vec<String> = rule.nodes.iter().filter_map(|t| fill(t, &pairs)).collect();
+        let (rule, owner) = (rule.clone(), owner.clone());
+        self.assign_disk(part, rule, owner, &pairs)
+    }
+
+    fn assign_disk(&mut self, part: &str, rule: crate::rules::Rule, owner: Owner, pairs: &[(&str, Option<String>)]) -> Vec<Op> {
+        let filled: Vec<String> = rule.nodes.iter().filter_map(|t| fill(t, pairs)).collect();
         let nodes = if rule.all_nodes { filled } else { filled.into_iter().take(1).collect() };
-        let a = Assignment { rule: rule.name.clone(), owner: owner.clone(), nodes, vars: vars(&pairs) };
+        let a = Assignment { rule: rule.name, owner, nodes, vars: vars(pairs) };
         self.assign(part, a, String::new(), Vec::new())
     }
 
-    /// Partitions present at start (the names in `/dev`): GEOM sent their
-    /// CREATE before this daemon listened.
+    /// Disks and partitions present at start (the names in `/dev`): GEOM
+    /// sent their CREATE before this daemon listened. Whole disks settle at
+    /// once, as GEOM is long done with them.
     pub fn disks_present<'a>(&mut self, names: impl IntoIterator<Item = &'a str>) -> Vec<Op> {
+        let names: Vec<&str> = names.into_iter().collect();
         let mut out = Vec::new();
-        for n in names {
-            if crate::rules::parse_partition(n).is_some() {
-                out.extend(self.line(&format!("!system=GEOM subsystem=DEV type=CREATE cdev={n}")));
+        let mut settle = Vec::new();
+        for n in names.iter().filter(|n| crate::rules::parse_whole_disk(n).is_some()).chain(names.iter().filter(|n| crate::rules::parse_partition(n).is_some())) {
+            for op in self.line(&format!("!system=GEOM subsystem=DEV type=CREATE cdev={n}")) {
+                match op {
+                    Op::Settle { disk } => settle.push(disk),
+                    op => out.push(op),
+                }
             }
+        }
+        for d in settle {
+            out.extend(self.settle(&d));
         }
         out
     }
@@ -624,14 +677,43 @@ fuse_mount     = "/media/{part}"
         assert!(j.devfs_grants.is_empty(), "the jail never sees the partition");
         assert_eq!(j.fuse, Some(("da0p1".into(), "/media/da0p1".into(), false)));
         assert!(matches!(p.line(&ev("CREATE", "da1s2")).as_slice(), [Op::StartDriver { .. }]));
-        for n in ["da0", "ada0p1", "da0p1.eli", "gpt/stick", "da0px", "nvd0p1", "da0p"] {
+        for n in ["ada0p1", "da0p1.eli", "gpt/stick", "da0px", "nvd0p1", "da0p", "ada0"] {
             assert!(p.line(&ev("CREATE", n)).is_empty(), "{n}");
         }
+        // A whole disk waits to settle; with a partition it stays down.
+        assert_eq!(p.line(&ev("CREATE", "da0")), [Op::Settle { disk: "da0".into() }]);
+        assert!(p.settle("da0").is_empty(), "da0p1 is its partition");
         let ops = p.line(&ev("DESTROY", "da0p1"));
         assert!(matches!(ops.as_slice(), [Op::StopDriver { device, vars, .. }] if device == "da0p1" && vars.keys().collect::<Vec<_>>() == ["part"]), "{ops:?}");
         assert!(p.line(&ev("DESTROY", "da0p1")).is_empty());
         let ops = p.disks_present(["null", "md99", "md99p1", "ada0p2", "da1s2"]);
         assert_eq!(ops.len(), 1, "md99p1 is new, da1s2 already running: {ops:?}");
+    }
+
+    /// A stick with FAT straight on the disk (no partition table): served
+    /// whole once GEOM settles; a partition appearing takes over from it;
+    /// unplugged, stopped.
+    #[test]
+    fn superfloppy() {
+        let mut r = Rules::default();
+        r.add_toml("t", DISK_RULES).unwrap();
+        let mut p = Planner::new(r.finish().unwrap());
+        let ev = |k: &str, n: &str| format!("!system=GEOM subsystem=DEV type={k} cdev={n}");
+        assert_eq!(p.line(&ev("CREATE", "da2")), [Op::Settle { disk: "da2".into() }]);
+        let ops = p.settle("da2");
+        let [Op::StartDriver { device, vars, nodes, .. }] = ops.as_slice() else { panic!("{ops:?}") };
+        assert_eq!((device.as_str(), vars["part"].as_str(), vars["disk"].as_str(), nodes.as_slice()), ("da2", "da2", "da2", &["da2".to_string()][..]));
+        assert!(p.settle("da2").is_empty(), "once");
+        assert!(p.settle("da9").is_empty(), "never created");
+        // Repartitioned while plugged in: the partition takes over.
+        let ops = p.line(&ev("CREATE", "da2s1"));
+        assert!(matches!(ops.as_slice(), [Op::StopDriver { device: a, .. }, Op::StartDriver { device: b, .. }] if a == "da2" && b == "da2s1"), "{ops:?}");
+        assert!(matches!(p.line(&ev("DESTROY", "da2s1")).as_slice(), [Op::StopDriver { .. }]));
+        assert!(p.line(&ev("DESTROY", "da2")).is_empty());
+        // At start: a bare disk is served, one with partitions is not.
+        let ops = p.disks_present(["da3", "da4", "da4p1"]);
+        let devices: Vec<&str> = ops.iter().filter_map(|o| match o { Op::StartDriver { device, .. } => Some(device.as_str()), _ => None }).collect();
+        assert_eq!(devices, ["da4p1", "da3"]);
     }
 
     /// The shipped rule: USB disk partitions only, never an md or ada.
@@ -649,9 +731,10 @@ fuse_mount     = "/media/{part}"
         assert_eq!((j.name.as_str(), j.devfs_ruleset, j.uid), ("atrium-capsa-da0s1", 31, 65031));
         assert_eq!(j.fuse, Some(("da0s1".into(), "/media/da0s1".into(), false)));
         assert!(j.argv.windows(2).any(|w| w == ["--umask", "077"]) && j.argv.windows(2).any(|w| w == ["--uid", "1001"]));
-        for n in ["md0p1", "ada0p1", "nda0p1", "da0"] {
+        for n in ["md0p1", "ada0p1", "nda0p1", "ada0", "nda0"] {
             assert!(p.line(&ev(n)).is_empty(), "{n}");
         }
+        assert_eq!(p.line(&ev("da0")), [Op::Settle { disk: "da0".into() }]);
     }
 
     #[test]

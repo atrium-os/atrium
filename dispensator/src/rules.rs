@@ -216,6 +216,14 @@ pub fn parse_partition(name: &str) -> Option<(&str, &str)> {
     (driver_name_ok(drv) && digits(unit) && digits(num)).then(|| (drv, &name[..d + unit.len()]))
 }
 
+/// A whole disk's name, `da0`: its driver. `None` for a partition or
+/// anything else.
+pub fn parse_whole_disk(name: &str) -> Option<&str> {
+    let d = name.find(|c: char| c.is_ascii_digit())?;
+    let (drv, unit) = name.split_at(d);
+    (driver_name_ok(drv) && unit.len() <= 4 && unit.bytes().all(|b| b.is_ascii_digit())).then_some(drv)
+}
+
 /// One USB interface as devd reports it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct UsbInterface {
@@ -470,6 +478,13 @@ impl Rules {
     pub fn match_partition<'a>(&self, name: &'a str) -> Option<(&(Rule, Owner), &'a str)> {
         let (drv, disk) = parse_partition(name)?;
         Some((self.best(|r| r.class == "disk" && r.disk.iter().any(|d| d == drv))?, disk))
+    }
+
+    /// The winning rule for whole disk `name` (`da0`), served as one volume
+    /// when it has no partition table (a "superfloppy" stick).
+    pub fn match_whole_disk(&self, name: &str) -> Option<&(Rule, Owner)> {
+        let drv = parse_whole_disk(name)?;
+        self.best(|r| r.class == "disk" && r.disk.iter().any(|d| d == drv))
     }
 
     /// The winning rule for a device a kernel driver attached as `name`
