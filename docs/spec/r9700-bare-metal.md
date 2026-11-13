@@ -1237,10 +1237,11 @@ work (self-test, scrub).
   SI_SKIP13=1 SI15_VA=0x10003000): still WEDGED, so test 13 is not the trigger.**
   The new pattern: every wedging store fault so far was on VMID 12 (uq slot 4, its
   first use in the run, with the bystander on uq slot 3 / VMID 11). Every clean
-  fault (test 7's store, test 13's SQC) was on VMID 11, with no second VM live.
-  The per-VMID setup is identical for 8-15 (SH_MEM, SPI_GDBG trap, CONTEXTn_CNTL,
-  MES vm_cntx_cntl), so the open question is VMID 12 versus a second live VM.
+  fault (test 7's store, test 13's SQC) was on VMID 11. Test 7 also had a second
+  VM live (queue a), so two live VMs alone do not wedge it. The per-VMID setup is
+  identical for 8-15 (SH_MEM, SPI_GDBG trap, CONTEXTn_CNTL, MES vm_cntx_cntl), so
+  the open question is VMID 12 (uq slot 4) versus something else in test 15.
   Shankar (12:11) chose to keep root-causing over shipping reset + lockout.
   Next: SI15_BYLATE=1 opens the hostile queue before the bystander, so the
-  hostile faults on VMID 11 while a second VM is live. Logs:
+  hostile faults on VMID 11 in test 15 itself. Logs:
   claude/project-thread-33aauq 07740286.
