@@ -145,9 +145,17 @@ if [ "$hold" -gt 0 ]; then
 		fi
 		if [ -n "$fuzz" ]; then
 			fsecs=${fuzz%%:*}; fseed=${fuzz#*:}
+			r0=$(sysctl -n dev.atrium_gpu_amd_pci.0.si_protected_regs 2>/dev/null | awk '/^reinits/ {print $2}')
 			echo "== si-fuzz all $fsecs $fseed"
 			timeout $((fsecs + 1800)) "$FUZZ" all "$fsecs" "$fseed"; echo "si-fuzz rc=$?"
 			sysctl dev.atrium_gpu_amd_pci.0.si_protected_regs 2>/dev/null | grep reinits
+			r1=$(sysctl -n dev.atrium_gpu_amd_pci.0.si_protected_regs 2>/dev/null | awk '/^reinits/ {print $2}')
+			# si-client-test 14 spends 2 of the 3 re-inits per 600 s: let
+			# any window the fuzz opened run out first.
+			if [ "${r1:-0}" != "${r0:-0}" ]; then
+				echo "== re-inits during the fuzz (${r0:-0} -> ${r1:-0}): waiting 610 s"
+				sleep 610
+			fi
 			echo "== si-client-test after the fuzz"
 			timeout 600 "$TEST"; echo "si-client-test rc=$?"
 		fi
