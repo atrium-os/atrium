@@ -197,6 +197,54 @@ owns VMID slots (8–15); the driver owns page tables per context. The isolation
 from "a queue shared between VMs" to "a queue fd can only reach its own context", tested
 through fd passing, close and jail death.
 
+### 4.5.1 Step 5c-2b plan: queue fds on MES user queues
+
+5c-2a proved the client node on silicon over the kernel queue. 5c-2b replaces that path:
+every client queue is a MES user queue, and the kernel queue carries only the kernel's own
+work (self-test, scrub).
+
+- **Queue fd.** `QUEUE_CREATE` on the client node takes a VM fd, an engine (compute first,
+  gfx after), a priority class and flags, and returns a queue fd holding a reference on the
+  VM. The backend adds the MES user queue then (5c-1's ADD_QUEUE: MQD and process/gang
+  contexts in the GART, the VM's page-table base, VMID chosen by MES). The fd is the right to
+  submit; it passes over SCM_RIGHTS and is limited by Capsicum rights like any fd. Its last
+  close is REMOVE_QUEUE, after which its pages are freed. Per-uid (and per-jail) caps on live
+  queues, alongside the BO caps.
+- **Queue memory.** Ring, rptr/wptr writeback and EOP buffer are kernel-allocated system
+  pages mapped into the client's VM at a kernel-reserved VA range above the BO window (the
+  arena never hands it out). The ring and the wptr word are also mappable into the client's
+  CPU address space from the queue fd (user mode only).
+- **Kernel-mediated submit** (`QUEUE_SUBMIT` on the queue fd; ABI v2 §5.7). The kernel
+  appends IB + RELEASE_MEM (fence + EOP interrupt) to the queue's ring, writes wptr and rings
+  the queue's doorbell. The EOP IV of a MES user queue names its doorbell (src_data[0]), so
+  the IV is routed to exactly one queue; the fence decides how much retires. The fence lives
+  in the client's own VM, so a client can lie only about its own work: it can make its own
+  syncobjs signal early, never another queue's, and never a free (below).
+- **User-mode queue** (flag `USER_MODE`, client must be allowed user queues; ABI v2 §5.9).
+  `QUEUE_MAP` on the queue fd returns mmap offsets of the ring, the wptr page and the
+  doorbell page; mmap is on the queue fd itself (fo_mmap), so the capability is the fd, not
+  the client node. One queue per doorbell page (the userqueue range, one page apart). The
+  doorbell is a managed-pager object revoked (pages removed) on REMOVE_QUEUE, reset or close.
+- **Frees.** A BO unbind writes the invalid PTEs and flushes the VMID with ack. For a VM with
+  live user queues the backing is then held until MES has preempted that process's queues
+  once (SUSPEND then RESUME of its gang), so nothing translated before the flush is still in
+  flight; never on a fence value a client can write (ABI v2 §5.11).
+- **Faults and hangs.** A UTCL2 fault IV names the VMID; the kernel asks MES which queue runs
+  under it (or keeps the VMID-to-queue map from the HQD scan), kills that VMID's waves,
+  resets the queue through MES (per-queue reset), marks only that queue fd lost
+  (`ERR_FAULT`, its owed completions EIO, its doorbell revoked) and leaves every other queue
+  running. A hang is a fence or rptr behind wptr for hang_ms: the same, with `ERR_HANG`.
+- **Priorities.** The queue's class maps onto MES gang priority and quantum; the power/posture
+  federation sets the class ceiling per uid/jail (5c-2b: fixed NORMAL; the mapping later).
+- **Test.** si-client-test grows queue tests: two queues in two VMs at the same VAs; a queue
+  fd passed to a child over SCM_RIGHTS submits, and stops working after the parent's
+  REMOVE (close by all holders); a faulting queue loses its fd while the other keeps running;
+  user mode: ring + doorbell from userspace, then revoke (SIGBUS after close).
+- **Order of work.** (1) QUEUE_CREATE/QUEUE_SUBMIT/close on MES user queues with IV routing
+  by doorbell, kernel-mediated submit only; the old SUBMIT path on silicon goes to EOPNOTSUPP.
+  (2) faults/hangs per queue with MES queue reset. (3) user mode: fo_mmap of ring, wptr and
+  doorbell, revocation. (4) the free rule. Each step is one box run.
+
 ## 5. Log
 
 - **2026-11-12, stage 1 done.** First bare-metal boot: bundle `03715a5` booted via
