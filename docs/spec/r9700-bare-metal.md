@@ -1050,3 +1050,18 @@ work (self-test, scrub).
   On gpusim with these kmods, atrium_gpu_test and test_gpu_isolation are ALL OK, and
   test 14 skips (no silicon). Box artifacts: atrium_gpu_amd.ko 43c9d76a…,
   atrium_gpu_amd_pci.ko 5849b6c7…, si-client-test 7e0c21dc….
+- **2026-11-13 08:22, hostile-PM4 run on the box (4efb65df kmods, stage 5c2): isolation
+  holds, recovery does not.** si-client-test 69/70. Tests 1-13 pass.
+  - Test 14: the WRITE_DATA writes to VM context 0's page-table base on the GC hub and
+    on the MMHUB were both refused. Each raised a CP error IV (privileged register), the
+    register stayed unchanged, the marker never landed, and a bystander VM ran clean.
+  - The cost: the CP halts mid-packet on the error (rptr 0x4 of 0xc, CPC_STATUS
+    0xa0000051, CPF_STATUS 0xb8008001). That HQD will not dequeue even after its
+    reset, so each refusal became a mode 1 reset plus re-init. Both re-inits passed.
+  - The test stopped at 2 re-inits. ih_rb_base, cp_mes_cntl and the SMU read were not
+    run. The final check ("costs its queue, not a whole-GPU re-init") FAILs.
+  - Finding: any client can reset the whole GPU with one packet, and with 3 packets in
+    10 minutes it leaves the GPU lost until the driver is reloaded. That is a
+    denial-of-service hole.
+  - The card was proven idle at detach (9 W) and the vector was released.
+  Logs: branch claude/project-thread-33aauq, commit 03bb7450.
