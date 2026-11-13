@@ -794,6 +794,49 @@ the loader's, which atrium-tessera tests on its own. Gate
 alice reads its file, writes are refused, bob cannot list it, unmounted on
 unplug: **0 failed** 2026-11-14.
 
+### 6.10 As built: D6, the Devices list (2026-11-14)
+
+dispensatord now answers "what is in this machine, who has each device,
+and why does this one have nobody". `Planner::inventory` walks the device
+registry (every newbus device, and every child no kernel driver took) plus
+the disks GEOM made, and gives each one owner:
+
+| owner | meaning |
+|---|---|
+| `driver` | a jailed driver from a rule, with whether its jail is up now (a stick's server also waits for an unlocked session) |
+| `service` | nodes shown in a service's own devfs mount (Tactus, Lyra, Sigillum) |
+| `kernel` | FreeBSD's own driver has it and no rule asks (buses, bridges, disks); a note says why a rule that matches did not take it (`matches rule X, but the rule does not take it from ukbd0`) |
+| `nobody` | visible to no one (§8 decision 4), with why: `no driver and no rule`, `no rule matches`, `no collections reported` |
+
+Each entry carries the name (`ukbd0`, `ugenB.A:I`, `da0s1`, `parent:location`
+for an unclaimed child), the registry id (new per attach), bus, parent and
+the kernel's identifying fields (`vendor=… product=… intclass=…`). The
+reasons are the planner's own decisions, kept per device and dropped when it
+goes.
+
+It is served on Aqueduct class `devices` (17; crate `dispensator/devices`,
+`atrium-devices`): `LIST`, and `SUBSCRIBE`, whose events carry only a
+generation number (list again). The socket is
+`/atrium/sockets/device-list/device-list.sock`; root, the session's user and
+that user's session components may ask (as for `media`), checked on every
+request and change. A jailed app reaches it only with the new restricted
+capability `device-list`, meant for Curia's Devices page: hardware ids
+identify the machine, so no op sends the list anywhere. Until Curia exists,
+`atrium-dispensatord --devices` prints it (and `--plan … --devices` prints
+the planner's list for recorded events).
+
+Tests: `inventory` (owned, kernel, nobody, disks, a device that goes) and
+`atrium-devices` over a real socket (list, change events once per change, a
+session change drops the stream). Gate `vm-usb-check.sh` adds the list on
+FreeBSD: 74 devices; the reader with its driver and rule, running; `uhub0`
+FreeBSD's; a QEMU MTP device (class 06, no FreeBSD driver) `nobody: no
+driver and no rule`, gone from the list when unplugged; a user with no
+session refused: **0 failed** 2026-11-14. The run also showed one real
+unclaimed device, QEMU's fw_cfg (`acpi0:\_SB_.PCI0.FWCF`).
+
+Not yet: Curia itself (its Devices page reads this), and the Opifex
+catalog lookup for a `nobody` device (§4.7, point 2).
+
 ## 7. Not in scope
 
 - New kernel drivers or hardware coverage (Wi-Fi, laptop I²C/SPI sensors).

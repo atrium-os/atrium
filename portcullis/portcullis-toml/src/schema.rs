@@ -149,6 +149,12 @@ pub struct Capabilities {
     /// screen's alone. Restricted.
     #[serde(rename = "session-lock")]
     pub session_lock: Option<bool>,
+    /// Every device on the machine, who has it, and why one has none, over
+    /// dispensatord's `device-list/` socket (device-assignment.md §6.10):
+    /// Curia's Devices page. Hardware ids identify the machine, so it is
+    /// restricted.
+    #[serde(rename = "device-list")]
+    pub device_list: Option<bool>,
     /// A status item in Forum's bar (forum-status-items.md): an icon and a
     /// menu the bar draws for this app, over forum-wm's `forum-status/`
     /// socket. The app never draws in the bar.
@@ -367,6 +373,7 @@ pub fn merge_capabilities(base: &Capabilities, ovr: &Capabilities) -> Capabiliti
         media_control:    ovr.media_control.or(base.media_control),
         removable_media:  ovr.removable_media.or(base.removable_media),
         session_lock:     ovr.session_lock.or(base.session_lock),
+        device_list:      ovr.device_list.or(base.device_list),
         status_item:      ovr.status_item.or(base.status_item),
         audio_device:     ovr.audio_device.or(base.audio_device),
         net_fetch:        ovr.net_fetch.or(base.net_fetch),

@@ -193,6 +193,11 @@ fn validate_capabilities(c: &Capabilities, ctx: &str, r: &mut Report) {
             "{ctx}.session-lock = true: restricted to Forum's bar (the Lock button); \
              requires explicit policy approval"));
     }
+    if c.device_list == Some(true) {
+        r.warnings.push(format!(
+            "{ctx}.device-list = true: restricted to Curia's Devices page (every device \
+             and its hardware ids); requires explicit policy approval"));
+    }
     if c.media_control == Some(true) {
         r.warnings.push(format!(
             "{ctx}.media-control = true: restricted to now-playing and the media keys \

@@ -1,0 +1,16 @@
+[package]
+name        = "atrium-devices"
+version     = "0.1.0"
+edition     = "2021"
+license     = "MIT OR Apache-2.0"
+publish     = false
+description = "The device list on Aqueduct (CLASS_DEVICES, docs/spec/device-assignment.md §6.10): every device dispensatord knows, its owner, and why an unclaimed one has none. Wire types, the server half dispensatord runs, and the client Curia uses."
+
+[lib]
+name = "atrium_devices"
+path = "src/lib.rs"
+
+[dependencies]
+aqueduct = { path = "../../aqueduct" }
+serde    = { version = "1", features = ["derive"] }
+postcard = { version = "1", features = ["use-std"] }

@@ -193,6 +193,7 @@ pub struct CapabilityDelta {
     pub media_control:   bool,
     pub removable_media: bool,
     pub session_lock:    bool,
+    pub device_list:     bool,
     pub status_item:     bool,
     pub audio_device:    bool,
     pub net_fetch:       bool,
@@ -236,6 +237,7 @@ impl CapabilityDelta {
             && !self.media_control
             && !self.removable_media
             && !self.session_lock
+            && !self.device_list
             && !self.status_item
             && !self.audio_device
             && !self.net_fetch
@@ -275,6 +277,7 @@ impl CapabilityDelta {
         if self.media_control   { out.push("See what is playing and control it (now-playing and the media keys)".into()); }
         if self.removable_media { out.push("See the USB sticks plugged in and eject them".into()); }
         if self.session_lock    { out.push("Lock the screen".into()); }
+        if self.device_list     { out.push("See every device in this machine and its hardware ids".into()); }
         if self.status_item     { out.push("Put an icon with a menu in the bar".into()); }
         if self.audio_device    { out.push("Add a sound output and play the system's sound through it".into()); }
         if self.net_fetch       { out.push("Fetch from the internet through the system's fetcher (no direct network access)".into()); }
@@ -365,6 +368,7 @@ pub fn compute_delta(
     bool_cap!(media_control);
     bool_cap!(removable_media);
     bool_cap!(session_lock);
+    bool_cap!(device_list);
     bool_cap!(status_item);
     bool_cap!(audio_device);
     bool_cap!(net_fetch);
@@ -560,6 +564,7 @@ mod tests {
             media_control: None,
             removable_media: None,
             session_lock: None,
+            device_list: None,
             status_item: None,
             audio_device: None,
             net_fetch: None,

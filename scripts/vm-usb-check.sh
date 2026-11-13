@@ -181,7 +181,7 @@ gone() {
 
 RUN=$$
 # Leftovers of an earlier run that did not finish.
-mon "device_del usbgate-ccid" "device_del usbgate-aud" >/dev/null 2>&1; sleep 2
+mon "device_del usbgate-ccid" "device_del usbgate-aud" "device_del usbgate-mtp" >/dev/null 2>&1; sleep 2
 
 echo "== usb-audio (uaudio claims it; detach_kernel)"
 mon "device_add usb-audio,id=usbgate-aud$RUN" | tr -d '\r' | grep -iE "error|warn" | sed 's/^/  qemu: /'
@@ -202,6 +202,22 @@ else
     read J key < /tmp/usb-last
     V 'service atrium-dispensatord restart >/dev/null 2>&1'; sleep 8
     V "jls -n name | grep -qx 'name=$J'" && ok "after a restart the reader has its jail again ($J)" || bad "after a restart no jail for $key: $(V "tail -4 /var/log/atrium/dispensatord.log | tr '\n' ';'")"
+    echo "== the Devices list (§6.10)"
+    MTP=no
+    mon "device_add usb-mtp,id=usbgate-mtp$RUN,rootdir=/tmp,readonly=on" | tr -d '\r' | grep -qiE "error|not a valid" || MTP=yes
+    sleep 6
+    V '/usr/local/bin/atrium-dispensatord --devices' > /tmp/usbgate-devices 2>&1
+    head -1 /tmp/usbgate-devices | grep -q '^ok ' && ok "root lists $(head -1 /tmp/usbgate-devices | cut -d' ' -f2) devices" || bad "list: $(head -3 /tmp/usbgate-devices | tr '\n' ';')"
+    grep -q "^$key usb driver usbtest-ccid (rule usbtest-ccid) \[vendor=0x08e6" /tmp/usbgate-devices && ok "the reader: its driver and rule, running" || bad "reader line: '$(grep "^$key " /tmp/usbgate-devices)'"
+    grep -q '^uhub0 usbus kernel uhub' /tmp/usbgate-devices && ok "the root hub: FreeBSD's driver" || bad "uhub0 line: '$(grep '^uhub0 ' /tmp/usbgate-devices)'"
+    if [ $MTP = yes ]; then
+      grep -E '^ugen[0-9.]+:0 usb nobody: no driver and no rule \[.*intclass=0x06' /tmp/usbgate-devices >/dev/null && ok "an MTP device: nobody's, no driver and no rule" || bad "MTP line: '$(grep 'intclass=0x06' /tmp/usbgate-devices)'"
+      mon "device_del usbgate-mtp$RUN" >/dev/null; sleep 4
+      V '/usr/local/bin/atrium-dispensatord --devices' | grep -q 'intclass=0x06' && bad "MTP still listed after unplug" || ok "unplugged: off the list"
+    else
+      echo "  (no usb-mtp in this QEMU: the unclaimed line not checked)"
+    fi
+    V "su -m nobody -c '/usr/local/bin/atrium-dispensatord --devices'" | grep -q 'status 2' && ok "nobody (no session) may not list it" || bad "a non-session user listed devices"
     mon "device_del usbgate-ccid$RUN" >/dev/null; gone
   fi
 fi

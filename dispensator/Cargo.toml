@@ -20,6 +20,7 @@ serde = { version = "1", features = ["derive"] }
 toml  = "0.8"
 libc  = "0.2"
 atrium-media = { path = "media" }
+atrium-devices = { path = "devices" }
 
 # jaild's client needs kqueue (sockmux): only the FreeBSD runner uses it.
 [target.'cfg(target_os = "freebsd")'.dependencies]

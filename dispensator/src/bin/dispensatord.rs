@@ -29,11 +29,14 @@
 //! atrium-dispensatord --media [--media-socket PATH]  list the partitions served
 //! atrium-dispensatord --eject PART [--media-socket PATH]
 //! atrium-dispensatord --media-watch [--media-socket PATH]   print events
+//! atrium-dispensatord --devices [--devices-socket PATH]     the Devices list
 //! ```
 //!
 //! The media socket speaks Aqueduct class `media` (atrium-media, §6.6):
 //! list, eject and a subscription to added/removed events, for root or the
-//! active session's user.
+//! active session's user. The devices socket speaks class `devices`
+//! (atrium-devices, §6.10): every device, its owner, and why one has none,
+//! for the same callers.
 
 use std::path::PathBuf;
 use std::process::ExitCode;
@@ -45,6 +48,7 @@ const RULES_DIR: &str = "/usr/local/etc/atrium/devices.d";
 const JAILD_SOCKET: &str = "/var/run/atrium/jaild.sock";
 const STATE_FILE: &str = "/var/run/atrium/dispensator.state";
 const MEDIA_SOCKET: &str = "/atrium/sockets/removable-media/removable-media.sock";
+const DEVICES_SOCKET: &str = "/atrium/sockets/device-list/device-list.sock";
 
 struct Args {
     rules: PathBuf,
@@ -58,6 +62,8 @@ struct Args {
     strict: bool,
     seat: PathBuf,
     media_socket: PathBuf,
+    devices_socket: PathBuf,
+    devices_cmd: bool,
     /// Client: `list` or `eject PART`.
     media_cmd: Option<String>,
 }
@@ -73,6 +79,8 @@ fn args() -> Result<Args, String> {
         strict: true,
         seat: dispensator::media::SEAT_FILE.into(),
         media_socket: MEDIA_SOCKET.into(),
+        devices_socket: DEVICES_SOCKET.into(),
+        devices_cmd: false,
         media_cmd: None,
     };
     let mut it = std::env::args().skip(1);
@@ -90,6 +98,8 @@ fn args() -> Result<Args, String> {
             "--media" => a.media_cmd = Some("list".into()),
             "--media-watch" => a.media_cmd = Some("watch".into()),
             "--eject" => a.media_cmd = Some(format!("eject {}", val()?)),
+            "--devices-socket" => a.devices_socket = val()?.into(),
+            "--devices" => a.devices_cmd = true,
             "-h" | "--help" => return Err(String::new()),
             _ => return Err(format!("unknown argument {x}")),
         }
@@ -107,12 +117,25 @@ fn main() -> ExitCode {
             if !e.is_empty() {
                 eprintln!("atrium-dispensatord: {e}");
             }
-            eprintln!("usage: atrium-dispensatord [--rules DIR] [--jaild-socket PATH] [--state FILE] | --check [--rules DIR] | --plan FILE [--devinfo FILE] [--rules DIR]");
+            eprintln!("usage: atrium-dispensatord [--rules DIR] [--jaild-socket PATH] [--state FILE] | --check [--rules DIR] | --plan FILE [--devinfo FILE] [--rules DIR] [--devices] | --devices | --media | --eject PART");
             return ExitCode::from(2);
         }
     };
     if let Some(cmd) = &a.media_cmd {
         return media_client(&a.media_socket, cmd);
+    }
+    if a.devices_cmd && a.plan.is_none() {
+        return match atrium_devices::client::list(&a.devices_socket) {
+            Ok(ds) => {
+                println!("ok {} devices", ds.len());
+                print_devices(&ds);
+                ExitCode::SUCCESS
+            }
+            Err(e) => {
+                println!("error {e}");
+                ExitCode::FAILURE
+            }
+        };
     }
     let rules = match Rules::load_dir(&a.rules, a.strict) {
         Ok(r) => r,
@@ -160,9 +183,27 @@ fn main() -> ExitCode {
             println!("{o:?}");
         }
         print!("{}", pl.state());
+        if a.devices_cmd {
+            print_devices(&pl.inventory(|_, _| false));
+        }
         return ExitCode::SUCCESS;
     }
-    run::serve(rules, a.jaild, a.state, a.seat, a.media_socket)
+    run::serve(rules, a.jaild, a.state, a.seat, a.media_socket, a.devices_socket)
+}
+
+/// One line per device: name, bus, owner, then the details.
+fn print_devices(ds: &[atrium_devices::Device]) {
+    use atrium_devices::Owner;
+    for d in ds {
+        let o = match &d.owner {
+            Owner::Driver { rule, driver, running } => format!("driver {driver} (rule {rule}){}", if *running { "" } else { ", not running" }),
+            Owner::Service { rule, service, nodes } => format!("service {service} (rule {rule}) {}", nodes.join(",")),
+            Owner::Kernel { driver, note: None } => format!("kernel {driver}"),
+            Owner::Kernel { driver, note: Some(n) } => format!("kernel {driver}: {n}"),
+            Owner::Nobody { why } => format!("nobody: {why}"),
+        };
+        println!("{} {} {o}{}", d.name, d.bus, if d.ids.is_empty() { String::new() } else { format!(" [{}]", d.ids) });
+    }
 }
 
 /// One request to the daemon's media socket (Aqueduct `CLASS_MEDIA`);
@@ -220,7 +261,7 @@ fn media_client(sock: &std::path::Path, cmd: &str) -> ExitCode {
 #[cfg(not(target_os = "freebsd"))]
 mod run {
     use super::*;
-    pub fn serve(_: Rules, _: String, _: PathBuf, _: PathBuf, _: PathBuf) -> ExitCode {
+    pub fn serve(_: Rules, _: String, _: PathBuf, _: PathBuf, _: PathBuf, _: PathBuf) -> ExitCode {
         eprintln!("atrium-dispensatord: the daemon runs on FreeBSD only (--check and --plan work anywhere)");
         ExitCode::FAILURE
     }
@@ -241,6 +282,7 @@ mod run {
     use std::os::unix::net::{UnixListener, UnixStream};
     use std::sync::{mpsc, Arc, Mutex};
 
+    use atrium_devices::server as dserver;
     use atrium_media::{server as mserver, status as mstatus, Volume};
     use jaild::client::Client;
     use jaild::protocol::{CreateJailRequest, ExecSpec, FuseServe, MountKind, MountSpec, NetworkConfig, Request, Response};
@@ -267,6 +309,8 @@ mod run {
         ejected_now: Vec<String>,
         /// Whole disks waiting for GEOM to make their partitions, if any.
         settling: Vec<(Instant, String)>,
+        /// The Devices list service (§6.10).
+        devices: Option<Arc<dserver::Shared>>,
     }
 
     type EjectReq = (String, mpsc::Sender<(u8, String)>);
@@ -279,16 +323,31 @@ mod run {
         wake: Mutex<UnixStream>,
     }
 
-    impl mserver::Host for MediaHost {
-        /// Root, the session's user, or one of that user's session
-        /// components (Forum: the launch registry marks them).
+    /// Root, the session's user, or one of that user's session components
+    /// (Forum, Curia: the launch registry marks them).
+    fn session_allowed(session: &Mutex<Session>, registry: &str, uid: u32) -> bool {
+        let Session::Active { user, uid: su, .. } = session.lock().unwrap().clone() else { return uid == 0 };
+        if uid == 0 || uid == su {
+            return true;
+        }
+        let Ok(reg) = portcullis_peer::AppRegistry::load(registry) else { return false };
+        reg.is_session(uid) && reg.resolve(uid).is_some_and(|(owner, _)| owner == user)
+    }
+
+    struct DevicesHost {
+        session: Arc<Mutex<Session>>,
+        registry: String,
+    }
+
+    impl dserver::Host for DevicesHost {
         fn allowed(&self, uid: u32) -> bool {
-            let Session::Active { user, uid: su, .. } = self.session.lock().unwrap().clone() else { return uid == 0 };
-            if uid == 0 || uid == su {
-                return true;
-            }
-            let Ok(reg) = portcullis_peer::AppRegistry::load(&self.registry) else { return false };
-            reg.is_session(uid) && reg.resolve(uid).is_some_and(|(owner, _)| owner == user)
+            session_allowed(&self.session, &self.registry, uid)
+        }
+    }
+
+    impl mserver::Host for MediaHost {
+        fn allowed(&self, uid: u32) -> bool {
+            session_allowed(&self.session, &self.registry, uid)
         }
 
         fn eject(&self, part: &str) -> (u8, String) {
@@ -302,7 +361,7 @@ mod run {
         }
     }
 
-    pub fn serve(rules: Rules, jaild: String, state: PathBuf, seat: PathBuf, media_socket: PathBuf) -> ExitCode {
+    pub fn serve(rules: Rules, jaild: String, state: PathBuf, seat: PathBuf, media_socket: PathBuf, devices_socket: PathBuf) -> ExitCode {
         let reshow = rules.services.values().map(|s| s.reshow_secs).min().unwrap_or(2);
         let reshow = Duration::from_secs(reshow.into());
         eprintln!(
@@ -326,12 +385,14 @@ mod run {
             ejects: None,
             ejected_now: Vec::new(),
             settling: Vec::new(),
+            devices: None,
         };
         a.session = a.read_session();
         *a.session_shared.lock().unwrap() = a.session.clone();
         if wants_media {
             a.start_media_service(&media_socket);
         }
+        a.start_devices_service(&devices_socket);
         eprintln!("atrium-dispensatord: session {:?}", a.session);
         loop {
             // Listen first, then enumerate, so nothing falls between.
@@ -373,9 +434,9 @@ mod run {
             .collect()
     }
 
-    /// The media socket: in a directory of its own, so it can be mounted
+    /// A service socket: in a directory of its own, so it can be mounted
     /// into Forum's jail; any local user may connect, the service checks who.
-    fn media_listener(path: &Path) -> Option<UnixListener> {
+    fn socket_listener(path: &Path) -> Option<UnixListener> {
         use std::os::unix::fs::PermissionsExt;
         let dir = path.parent()?;
         let _ = std::fs::create_dir_all(dir);
@@ -387,7 +448,7 @@ mod run {
                 Some(l)
             }
             Err(e) => {
-                eprintln!("atrium-dispensatord: media socket {}: {e}", path.display());
+                eprintln!("atrium-dispensatord: socket {}: {e}", path.display());
                 None
             }
         }
@@ -454,7 +515,7 @@ mod run {
         }
 
         fn start_media_service(&mut self, sock: &Path) {
-            let Some(l) = media_listener(sock) else { return };
+            let Some(l) = socket_listener(sock) else { return };
             let Ok((wake_rd, wake_wr)) = UnixStream::pair() else { return };
             let _ = wake_rd.set_nonblocking(true);
             let (tx, rx) = mpsc::channel();
@@ -481,6 +542,34 @@ mod run {
             eprintln!("atrium-dispensatord: media service on {}", sock.display());
             self.shared = Some(shared);
             self.ejects = Some((rx, wake_rd));
+        }
+
+        fn start_devices_service(&mut self, sock: &Path) {
+            let Some(l) = socket_listener(sock) else { return };
+            let host = DevicesHost { session: self.session_shared.clone(), registry: portcullis_peer::DEFAULT_REGISTRY.into() };
+            let shared = dserver::Shared::new(Box::new(host));
+            let sh = shared.clone();
+            std::thread::spawn(move || {
+                for c in l.incoming() {
+                    let Ok(c) = c else { continue };
+                    let Ok((uid, _)) = portcullis_peer::uid_gid(c.as_raw_fd()) else { continue };
+                    let sh = sh.clone();
+                    std::thread::spawn(move || {
+                        if let Ok(conn) = aqueduct::Connection::wrap(c) {
+                            let _ = dserver::serve(conn, uid, sh);
+                        }
+                    });
+                }
+            });
+            eprintln!("atrium-dispensatord: device list on {}", sock.display());
+            self.devices = Some(shared);
+        }
+
+        /// Tell the device list what is present and who has it.
+        fn publish_devices(&self) {
+            let Some(shared) = &self.devices else { return };
+            let served: Vec<&str> = self.media.served().collect();
+            shared.update(self.planner.inventory(|driver, device| self.drivers.contains_key(&(driver.to_string(), device.to_string())) || served.contains(&device)));
         }
 
         /// Tell the media service what is served now.
@@ -581,6 +670,7 @@ mod run {
                     last = Instant::now();
                     self.follow_session();
                     self.publish();
+                    self.publish_devices();
                     let mut ops = Vec::new();
                     for s in self.planner.rules().services.keys() {
                         ops.extend(self.planner.service_nodes(s).map(|n| Op::Show { service: s.clone(), node: n.to_string() }));
@@ -615,6 +705,7 @@ mod run {
                 }
             }
             if changed {
+                self.publish_devices();
                 let tmp = self.state.with_extension("tmp");
                 if std::fs::write(&tmp, self.planner.state()).is_ok() {
                     let _ = std::fs::rename(&tmp, &self.state);

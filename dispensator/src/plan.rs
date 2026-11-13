@@ -62,6 +62,9 @@ pub struct Planner {
     /// disk with none is served whole once it settles.
     whole: std::collections::BTreeSet<String>,
     parts: std::collections::BTreeSet<String>,
+    /// Why a device present has no owner (or a rule that matches did not
+    /// take it), by the same key as `owned`: the Devices list's "why".
+    why: BTreeMap<String, String>,
 }
 
 /// A USB interface's attach or nomatch: `(ugen, bus, addr, interface, ids
@@ -81,6 +84,40 @@ fn usb_interface(d: &devctl::Device) -> Option<(String, u32, u32, u8, UsbInterfa
 }
 
 /// `ugenB.A` -> `(B, A)`.
+/// A registry device's key, as `owned` and `why` use it: `ugenB.A:I` for a
+/// USB interface, else its name, else `parent:location` for a child no
+/// kernel driver took.
+fn key_of(d: &devctl::Device) -> String {
+    if let Some((ugen, .., interface, _)) = usb_interface(d) {
+        return format!("{ugen}:{interface}");
+    }
+    if let Some(n) = &d.name {
+        return n.clone();
+    }
+    let loc: Vec<&str> = ["slot", "function", "handle", "port", "devaddr", "addr"].iter().filter_map(|k| d.fields.get(k)).collect();
+    format!("{}:{}", d.parent, if loc.is_empty() { "?".to_string() } else { loc.join(".") })
+}
+
+/// `ukbd0` -> `ukbd`.
+fn driver_name(n: &str) -> &str {
+    n.trim_end_matches(|c: char| c.is_ascii_digit() || c == '.')
+}
+
+fn bus_of(parent: &str) -> &str {
+    match driver_name(parent) {
+        "uhub" => "usb",
+        "hidbus" => "hid",
+        "" => "root",
+        p => p,
+    }
+}
+
+/// The identifying fields, in the kernel's order.
+fn ids_of(f: &devctl::Fields) -> String {
+    const IDS: &[&str] = &["vendor", "product", "device", "subvendor", "subdevice", "class", "subclass", "intclass", "intsubclass", "intprotocol", "devclass", "_HID", "_CID", "page", "usage", "compat"];
+    f.0.iter().filter(|(k, _)| IDS.contains(&k.as_str())).map(|(k, v)| format!("{k}={v}")).collect::<Vec<_>>().join(" ")
+}
+
 pub fn ugen_numbers(s: &str) -> Option<(u32, u32)> {
     let (b, a) = s.strip_prefix("ugen")?.split_once('.')?;
     let num = |x: &str| if !x.is_empty() && x.len() <= 3 && x.bytes().all(|c| c.is_ascii_digit()) { x.parse().ok() } else { None };
@@ -139,7 +176,7 @@ fn vars(pairs: &[(&str, Option<String>)]) -> Vars {
 
 impl Planner {
     pub fn new(rules: Rules) -> Self {
-        Self { rules, hid: Classifier::default(), owned: BTreeMap::new(), registry: Registry::default(), whole: Default::default(), parts: Default::default() }
+        Self { rules, hid: Classifier::default(), owned: BTreeMap::new(), registry: Registry::default(), whole: Default::default(), parts: Default::default(), why: BTreeMap::new() }
     }
 
     pub fn rules(&self) -> &Rules {
@@ -168,6 +205,7 @@ impl Planner {
                     match kind.as_str() {
                         "CREATE" => out.extend(self.disk_create(cdev)),
                         "DESTROY" => {
+                            self.why.remove(cdev);
                             self.whole.remove(cdev);
                             self.parts.remove(cdev);
                             out.extend(self.release(cdev));
@@ -186,6 +224,11 @@ impl Planner {
                         out.extend(self.release(&k));
                     }
                 }
+            }
+        }
+        for c in &changes {
+            if let Change::Removed(d) = c {
+                self.why.remove(&key_of(d));
             }
         }
         for c in changes {
@@ -217,9 +260,13 @@ impl Planner {
         let device = format!("{ugen}:{interface}");
         let label = format!("{:04x}:{:04x} class {:02x}/{:02x}/{:02x}", i.vendor, i.product, i.class, i.subclass, i.protocol);
         let Some((rule, owner)) = self.rules.match_usb(&i) else {
+            if kernel.is_none() {
+                self.why.insert(device.clone(), "no driver and no rule".into());
+            }
             return kernel.is_none().then(|| vec![Op::Log(format!("{device} ({label}): no driver and no rule; shown to nobody"))]);
         };
         if let (Some(k), false) = (kernel, rule.detach_kernel) {
+            self.why.insert(device.clone(), format!("matches rule {}, but the rule does not take it from {k}", rule.name));
             return Some(vec![Op::Log(format!("{device} ({label}) matches rule {} but kernel driver {k} has it (the rule has no detach_kernel)", rule.name))]);
         }
         let pairs = [
@@ -346,6 +393,7 @@ impl Planner {
             None => {
                 let mut out = self.release(&device);
                 let why = if pages.is_none() { "no collections reported" } else { "no rule matches" };
+                self.why.insert(device.clone(), why.into());
                 out.push(Op::Log(format!("{device} ({label}): {why}; shown to nobody")));
                 out
             }
@@ -355,6 +403,7 @@ impl Planner {
     /// Give `device` to `a`'s owner, ending a different earlier owner first.
     fn assign(&mut self, device: &str, a: Assignment, label: String, others: Vec<u16>) -> Vec<Op> {
         let mut out = Vec::new();
+        self.why.remove(device);
         if let Some(o) = self.owned.get(device) {
             if *o == a {
                 // Seen already (devinfo at start, then devd): idempotent.
@@ -445,6 +494,35 @@ impl Planner {
             .values()
             .filter(move |a| a.owner == Owner::Service(service.to_string()))
             .flat_map(|a| a.nodes.iter().map(String::as_str))
+    }
+
+    /// Every device present, its owner, and why one has none: the Devices
+    /// list (§6.10). `running(driver, device)`: is that driver's jail up?
+    pub fn inventory(&self, running: impl Fn(&str, &str) -> bool) -> Vec<atrium_devices::Device> {
+        use atrium_devices::{Device, Owner as O};
+        let owner = |key: &str, a: &Assignment| match &a.owner {
+            Owner::Driver(d) => O::Driver { rule: a.rule.clone(), driver: d.clone(), running: running(d, key) },
+            Owner::Service(s) => O::Service { rule: a.rule.clone(), service: s.clone(), nodes: a.nodes.clone() },
+        };
+        let mut out = Vec::new();
+        let mut seen = std::collections::BTreeSet::new();
+        for d in self.registry.devices() {
+            let key = key_of(d);
+            let o = match (self.owned.get(&key), &d.name) {
+                (Some(a), _) => owner(&key, a),
+                (None, Some(n)) if !n.starts_with("hidraw") => O::Kernel { driver: driver_name(n).to_string(), note: self.why.get(&key).cloned() },
+                (None, Some(_)) => O::Nobody { why: self.why.get(&key).map_or("no rule matches", String::as_str).to_string() },
+                (None, None) => O::Nobody { why: self.why.get(&key).map_or("no driver and no rule", String::as_str).to_string() },
+            };
+            seen.insert(key.clone());
+            out.push(Device { name: key, id: d.id, bus: bus_of(&d.parent).to_string(), parent: d.parent.clone(), ids: ids_of(&d.fields), owner: o });
+        }
+        // Disks: GEOM's, not newbus's.
+        for (key, a) in self.owned.iter().filter(|(k, _)| !seen.contains(*k)) {
+            let parent = crate::rules::parse_partition(key).map_or(key.as_str(), |(_, disk)| disk).to_string();
+            out.push(Device { name: key.clone(), id: 0, bus: "geom".into(), parent, ids: String::new(), owner: owner(key, a) });
+        }
+        out
     }
 
     /// One line per owned device, for the state file.
@@ -854,6 +932,33 @@ sysfil        = "device"
         assert_eq!(p.line(&usb_line("?", 8, "1050:0407", "0b/00/00").replace("ugen=ugen0.8", "ugen=ugenx")), vec![]);
         // A bare-ugen notify for a device never seen ends nothing.
         assert_eq!(p.line(&gone(9)), vec![]);
+    }
+
+    #[test]
+    fn inventory() {
+        use atrium_devices::Owner as O;
+        let mut r = shipped();
+        r.add_toml("u", USB_RULES).unwrap();
+        let mut p = Planner::new(r.finish().unwrap());
+        p.devinfo("nexus0\n  pci0\n    xhci0 <XHCI>\n      usbus0\n        uhub0 <Root hub>\n");
+        p.line(&usb_line("?", 3, "1050:0407", "0b/00/00"));
+        p.line(&usb_line("+ukbd0", 6, "0627:0001", "03/01/01"));
+        p.line(&usb_line("?", 7, "dead:beef", "ff/00/00"));
+        p.line("!system=GEOM subsystem=DEV type=CREATE cdev=da0s1");
+        let inv = p.inventory(|d, dev| d == "t-ccid" && dev == "ugen0.3:0");
+        let get = |n: &str| inv.iter().find(|d| d.name == n).unwrap_or_else(|| panic!("{n} not in {inv:#?}")).clone();
+        assert!(matches!(get("ugen0.3:0").owner, O::Driver { ref driver, running: true, .. } if driver == "t-ccid"));
+        let kb = get("ugen0.6:0");
+        assert_eq!((kb.bus.as_str(), kb.owner.clone()), ("usb", O::Kernel { driver: "ukbd".into(), note: None }));
+        assert!(kb.ids.contains("vendor=0x0627") && kb.ids.contains("intclass=0x03"), "{}", kb.ids);
+        assert_eq!(get("ugen0.7:0").owner, O::Nobody { why: "no driver and no rule".into() });
+        assert_eq!(get("pci0").owner, O::Kernel { driver: "pci".into(), note: None });
+        let disk = get("da0s1");
+        assert_eq!((disk.bus.as_str(), disk.parent.as_str(), disk.owner.kind()), ("geom", "da0", "driver"));
+        // Gone: off the list, reason and all.
+        p.line("!system=USB subsystem=DEVICE type=DETACH ugen=ugen0.7 cdev=ugen0.7 vendor=0xdead product=0xbeef devclass=0x00 devsubclass=0x00 sernum=\"\" release=0x0100 mode=host port=7 parent=uhub0");
+        assert!(p.inventory(|_, _| false).iter().all(|d| d.name != "ugen0.7:0"));
+        assert!(!p.why.contains_key("ugen0.7:0"));
     }
 
     #[test]
