@@ -1184,3 +1184,18 @@ work (self-test, scrub).
   - The CP/GRBM state is logged right after every wave kill.
   gpusim suites ALL OK. Box artifacts: pci f8adbc34…, gpu c167c776…, display
   3d9cea12…, si-client-test d59eb2d8…. Logs: claude/project-thread-33aauq 2a4171dd.
+- **2026-11-13 10:59, hostile-ISA diagnostic (a8840b9a): cause found, fixed in
+  664e9f08.** 70 passed, 2 failed. The first case, a store at 0x7ffffff00000, was lost
+  with EIO and the bystander was untouched and clean. The TCP fault showed
+  WALKER_ERROR 0x6 and MAPPING_ERROR 1, exactly as for VA 0. From then on, every
+  GFXHUB context flush got INV_ACK 0, and so no new VM could be set up. MMHUB was fine.
+  The SMU showed gfx busy at 100% until the mode 1 reset at detach. The endless-shader
+  case never ran this time; at 10:35 it was killed cleanly.
+  Cause: a store through an *empty directory entry*. Stores past a buffer hit an
+  invalid PTE in a populated PTB (WALKER_ERROR 0) and are fine. Our directories
+  filled unused entries with 0. amdgpu_vm_pt_clear writes them as invalid leaf PDEs,
+  value 0 with AMDGPU_PDE_PTE_GFX12 (bit 63), "handle leaf PDEs as PTEs". 664e9f08
+  does the same, so the walker stops at that level with an ordinary fault.
+  gpusim suites ALL OK. Box artifacts: pci b472c51e…, gpu 75a2d04a…, display
+  3d9cea12…, si-client-test unchanged (d59eb2d8…). Logs: claude/project-thread-33aauq
+  54635188.
