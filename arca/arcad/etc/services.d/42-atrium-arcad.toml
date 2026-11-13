@@ -58,9 +58,9 @@ source = "/atrium/sockets/arca"                   # rw: bind arcad.sock (dir own
 dest   = "atrium/sockets/arca"
 kind   = "rw_nullfs"
 [[mounts]]
-source = "/atrium/sockets/sigillum"                # rw: connect to sigillumd for verify-each-use
+source = "/atrium/sockets/sigillum"                # ro: connect to sigillumd for verify-each-use
 dest   = "atrium/sockets/sigillum"
-kind   = "rw_nullfs"
+kind   = "ro_nullfs"
 [[mounts]]
 source = "/var/db/arca"                           # rw: the per-user stores (0700 _arca)
 dest   = "var/db/arca"

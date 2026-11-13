@@ -69,6 +69,9 @@ ro_paths = [
     # Sigillum's driver socket directory, the one socket path a security
     # key's driver jail sees (sigillum.md §4).
     "/atrium/sockets/sigillum-dev",
+    # Sigillum's client socket directory, for arcad: verify-each-use items
+    # are asked of sigillumd first (arca.md §6.2, sigillum.md §8).
+    "/atrium/sockets/sigillum",
     # Arca's courier registry (courier uid -> user, persona, endpoint), one
     # file, written by the courier launcher; read by arcad (arca.md §4.1).
     "/var/run/atrium/courier-registry",

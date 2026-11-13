@@ -20,6 +20,7 @@ use p256::ecdsa::{signature::Verifier, DerSignature, VerifyingKey};
 use sha2::{Digest, Sha256};
 use sigillum_ctap::authdata::AuthData;
 use sigillum_proto::client::{self, Assert, Attestation, Register, Reply, Request, Uv};
+use sigillum_proto::driver::Pin;
 use sigillum_proto::ui::{self, Choice, FromUi, ToUi};
 use sigillum_proto::{read_msg, write_msg};
 
@@ -31,16 +32,37 @@ fn unhex(s: &str) -> Vec<u8> {
     (0..s.len() / 2).filter_map(|i| u8::from_str_radix(&s[2 * i..2 * i + 2], 16).ok()).collect()
 }
 
+/// The scripted trusted UI: presses the first device on every sheet, and on
+/// a verify sheet types the passcodes in `$SPROBE_PASSCODES` (comma
+/// separated), one per ask, then cancels.
 fn ui_loop(sock: &str) -> ExitCode {
+    let mut passcodes: std::collections::VecDeque<String> =
+        std::env::var("SPROBE_PASSCODES").unwrap_or_default().split(',').filter(|p| !p.is_empty()).map(String::from).collect();
+    let scripted = !passcodes.is_empty();
     let mut s = UnixStream::connect(sock).expect("ui socket");
     let mut w = s.try_clone().unwrap();
     println!("ui: connected");
     while let Ok(Some(m)) = read_msg::<ToUi>(&mut s, ui::MAX_MESSAGE) {
         println!("ui: {m:?}");
-        if let ToUi::Show { key, devices, .. } = &m {
-            if let Some(d) = devices.first() {
-                let _ = write_msg(&mut w, &FromUi::Press { key: *key, choice: Choice::Device(d.id), activation_ok: true }, ui::MAX_MESSAGE);
+        match &m {
+            // A verify sheet (Arca's verify-each-use): "use your passcode".
+            ToUi::Show { key, sheet: ui::Sheet::Verify { .. }, .. } if scripted => {
+                let _ = write_msg(&mut w, &FromUi::Press { key: *key, choice: Choice::Passcode, activation_ok: true }, ui::MAX_MESSAGE);
             }
+            ToUi::Show { key, devices, .. } => {
+                if let Some(d) = devices.first() {
+                    let _ = write_msg(&mut w, &FromUi::Press { key: *key, choice: Choice::Device(d.id), activation_ok: true }, ui::MAX_MESSAGE);
+                }
+            }
+            // Type the next scripted passcode; none left: cancel.
+            ToUi::AskPasscode { key, .. } => {
+                let msg = match passcodes.pop_front() {
+                    Some(p) => FromUi::Passcode { key: *key, passcode: Pin(p.into_bytes().into()) },
+                    None => FromUi::Press { key: *key, choice: Choice::Cancel, activation_ok: true },
+                };
+                let _ = write_msg(&mut w, &msg, ui::MAX_MESSAGE);
+            }
+            _ => {}
         }
     }
     println!("ui: closed");

@@ -110,6 +110,13 @@ fn main() -> ExitCode {
             w.str(arg(3));
             call(sock, op::MINT, &w.buf)
         }
+        // A verify-each-use key: each SIGN is asked of Sigillum first.
+        "mint-veu" => {
+            w.u16(0x100);
+            w.u8(3);
+            w.str(arg(3));
+            call(sock, op::MINT, &w.buf)
+        }
         "sign" => {
             w.raw(&unhex(arg(3)));
             w.bytes(arg(4).as_bytes());

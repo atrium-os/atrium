@@ -573,7 +573,7 @@ otherwise passes the blobs on without reading them.
 | **S1** *(built 2026-11-13, §16.1)* | `sigillum/` workspace: `sigillum-cbor` (bounded CTAP2 canonical CBOR), `sigillum-ctap` (CTAPHID framing, CTAP2 GetInfo/MakeCredential/GetAssertion/ClientPIN v2 client, authenticator-data and COSE parsing), `sigillum-softkey`, `sigillum-proto` (§14 wires), `sigillumd` policy core (labels, ceremonies, press gate, driver record checks, fingerprint policy) | host tests: a broker registers and asserts against the soft key with PIN; an app is refused another RP; a lying driver record is refused; fingerprint policy limits |
 | **S2** | `sigillum-fido` on hidraw; devevents classification; default-hidden hidraw (§5.1) with the input thread; ruleset 27; services.d manifests; `sigillum-ui` sheets on frescod with purpose `IDENTITY` | VM: a FIDO HID device reaches only its driver jail; tactusd gets `EACCES`/no node |
 | **S3** | the Navigator broker's WebAuthn client against Sigillum; Arca `P_CREATE`/`P_ASSERT`/`P_LIST` (with the Arca thread's A4) | e2e: webauthn.io-style local RP registers and logs in with the soft key and with an Arca passkey |
-| **S4** *(built 2026-11-13, §16.4)* | `VERIFY_USER` with the passcode through ostiarius; Arca verify-each-use served | arca-vm-test: a verify-each-use item is usable after the sheet, not before |
+| **S4** *(built 2026-11-13, §16.4)* | `VERIFY_USER` with the passcode through ostiarius; Arca verify-each-use served | vm-sigillum-check (passed 2026-11-13): a verify-each-use item is usable after the sheet, not before, with real PAM |
 | **S5** | `sigillum-ccid`: CCID, PIV, certificates; `TokenKeyRef` in Arca; courier `CertificateVerify` through Arca | VM: QEMU `usb-ccid` emulated card authenticates to a TLS server requiring a client certificate |
 | **S6** | `sigillum-bio` for one secure sensor; enrolment; lock screen unlock | needs the sensor |
 | **S7** | FIDO over BLE through Vinculum | with Vinculum's B-phases and a BLE key |
@@ -803,16 +803,28 @@ otherwise passes the blobs on without reading them.
   authenticator that can verify does); `discouraged` gets UP only.
 - **Arca verify-each-use** served (arca.md §6.2 as built): arcad asks `VERIFY_USER` with the
   state unlocked during the ceremony and reruns the request with one `UserVerified`.
-  arcad's jail mounts `/atrium/sockets/sigillum`.
+  arcad's jail mounts `/atrium/sockets/sigillum` read-only (connecting needs no more; the
+  jaild policy lists it in `ro_paths`).
 - Gates (host): ostiarius `verify` unit tests (lockout and doubling, the wire), run on the
   amd64 VM (16/16 with the rest of ostiarius); `sigillumd/tests/verify_each_use.rs` (arcad's
   real client and serve loop, the real sigillumd and sheet wire: an item is used after the
   passcode, not before; three wrong tries leave it unused); `sigillumd/tests/ceremonies.rs`
   and `sigillum-webauthn/tests/e2e.rs` (passcode UV for passkeys, wrong passcodes, through
   a stand-in on ostiarius's wire).
-- **Not yet:** the full chain on the VM with real PAM (portcullisd built with `pam`,
-  ostiarius jailed with `session_launch`, arcad and sigillumd jailed); couriers' `FILL` of
-  a verify-each-use item; a fingerprint or key-UV method on the verify sheet (S5, S6).
+- Gate (VM, `scripts/vm-sigillum-check.sh`, 0 failed on the amd64 VM 2026-11-13): the full
+  chain with real PAM. portcullisd (linked with libpam, not the stub) runs
+  `/etc/pam.d/atrium-login`; ostiarius runs jailed as `_ostiarius` with `session_launch`
+  (its login UI waits on a stand-in frescod socket, since the VM has no display); arcad and
+  sigillumd run jailed. A login user with a real password and an app of theirs: the app's
+  verify-each-use key signs nothing with no UI up, nothing after three wrong passcodes
+  (each refused by PAM), signs once the right one is typed, and the next use asks again.
+  Two bugs this found: the arcad manifest asked for the sigillum socket dir rw, which the
+  policy doesn't allow (now ro, and in `ro_paths`), and a gate whose broker socket is
+  missing would see every passcode as wrong. The gate now checks that the broker is up and
+  that PAM answered yes before it trusts a no.
+- **Not yet:** couriers' `FILL` of a verify-each-use item; a fingerprint or key-UV method on
+  the verify sheet (S5, S6); ostiarius telling "PAM said no" from "the broker is
+  unreachable" (both count as a failure toward the lockout today).
 
 ## 17. Decisions, with recommendations
 
