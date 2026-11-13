@@ -1700,6 +1700,20 @@ hostile_isa(void)
 		    "another VM runs clean", c[i].name);
 		if (!noby)
 			run_clean(&by, what);
+		/*
+		 * SI15_QFIRST=1 (wedge bisection, run 6849e284): the first
+		 * flush to time out is the one for freeing test 15's out BO
+		 * (job_close frees the BOs before it closes the queue), on a
+		 * VM whose queue is lost but still open. Test 7, which
+		 * recovers, closes its lost queue first. Do that here.
+		 */
+		if ((env = getenv("SI15_QFIRST")) != NULL && *env == '1') {
+			printf("15: lost queue closed before the BOs "
+			    "(SI15_QFIRST)\n");
+			close(h.q);
+			h.q = -1;
+			sleep(1);
+		}
 		job_close(&h);
 		/* A fresh VM: setting one up flushes its context. */
 		sleep(2);

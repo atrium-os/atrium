@@ -1327,3 +1327,16 @@ work (self-test, scrub).
   some with VRAM sources).
   Next: SI_SKIP=9,10,11,12 (1ff063ff+1) leaves all four out. If clean, bisect
   them. Logs: claude/project-thread-33aauq 0f855443.
+- **2026-11-13 13:18, SKIP 9-12 probe (si-client-test ebce4d4e, kmods fc54eb53,
+  SI_SKIP=9,10,11,12 SI_SKIP7=1 SI_SKIP13=1 SI_SKIPHANG=1 SI15_NOBY=1
+  SI15_VA=0x10003000): WEDGED with only tests 1-6 before it.** 23 passed, 2
+  failed. The after-kill snapshot this time was test 7's "recovering" one (CP_STAT
+  0x88400000, CPC 0x80000001, BUSY 0x500/0), so that snapshot does not predict
+  the wedge. The initial 32 GB VRAM scrub overlaps the first fault in every run
+  (recovering or not), so it is not the trigger either.
+  New reading of the logs: the timed-out flushes come in rounds of (kernel VMID,
+  8-15), and the first rounds come before "uq3 closed", i.e. from freeing test 15's
+  BOs (job_close frees out/IB/shader before it closes the queue) while the lost
+  queue's fd is still open. Test 7 closes its lost queue first (job_renew) and
+  only frees BOs much later. Next: SI15_QFIRST=1 (ebce4d4e+1) closes the lost
+  queue first. Logs: claude/project-thread-33aauq 6849e284.
