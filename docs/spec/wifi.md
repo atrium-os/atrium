@@ -1,6 +1,6 @@
 # Wi-Fi: Atrium's own drivers, MAC layer and supplicant
 
-**Status:** proposal 2026-11-13, decisions in §10 open.
+**Status:** accepted 2026-11-13 (Shankar: all §10 decisions as recommended, 1–17; decision 5 revised to MediaTek first after the hardware answer).
 **Scope:** Wi-Fi station support for Atrium: kernel drivers per chip family,
 the 802.11 MAC layer, the supplicant (WPA2/WPA3), regulatory, firmware, and
 how atrium-net, Arca, dispensatord and jaild fit around them.
