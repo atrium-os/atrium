@@ -271,6 +271,44 @@ any kernel mount of removable media, and it must **authenticate** metadata
 the kernel attacker-influenced bytes and allows rolling back to an old copy.
 Until Tessera encryption lands, every removable disk takes the jailed path.
 
+### 4.7 When nothing matches
+
+Proposed 2026-11-13 (Shankar asked: ignore it, or point the user at a driver
+the way Ubuntu points at NVIDIA's?).
+
+1. **Always listed, never exposed.** The device stays visible to nobody (§8
+   decision 4) and appears in Curia's Devices list as *no driver*, with its
+   class and IDs.
+2. **Look it up locally.** Opifex's catalog index carries every published
+   driver package's `devices.d` match entries, much like Ubuntu's modalias
+   lists or FreeBSD's `linker.hints`. `dispensatord` matches the device
+   against the *downloaded* index on the machine. Device IDs are never sent to
+   a server, because a list of hardware IDs is a fingerprint.
+3. **Tell the user only when it helps.** A Praeco notice appears only when a
+   catalog driver matches *and* the device is user-facing: a display, network,
+   audio, input, storage, camera or printer, or anything the user just
+   plugged in. Unmatched hubs, bridges and sensors at boot stay silent in the
+   list. The notice says "a driver for <device> is available", and installing
+   it goes through Opifex's trusted install sheet, because a driver package
+   gets device power. For v1, only system-signed packages can declare
+   matches (decision 3).
+4. **Activation.** A jailed driver starts at once. A kernel module loads
+   through devmatch on the next nomatch rescan. When a generic driver already
+   holds the device, the package's `claim` runs once (§4.3). A reboot is asked
+   for only when the module cannot detach what holds the device.
+5. **No driver anywhere.** The Devices list says *not supported*, with a
+   fallback where one exists. A GPU without a driver keeps the firmware
+   framebuffer (efifb) and the Tier-2 CPU renderer, and Atrium still boots
+   and runs. An opt-in "report this device" sends the IDs to the hardware
+   list only when the user presses it.
+6. **Closed kernel drivers are not offered.** An NVIDIA GPU is the case Ubuntu
+   solves with NVIDIA's own module. NVIDIA's FreeBSD driver is a closed kernel
+   module, and running it would put unreviewed closed code in ring 0, outside
+   every isolation boundary Atrium has. So it gets the fallback above until
+   there is a native driver behind the per-architecture GPU interface.
+   Closed *user-space* pieces, if ever needed, would go through Hospes in a
+   jail, never into the kernel.
+
 ## 5. How existing work maps onto it
 
 | Today | Becomes |
@@ -357,3 +395,12 @@ Until Tessera encryption lands, every removable disk takes the jailed path.
     Open.
 15. **Optical: ISO 9660 + UDF via a jailed read-only reader; audio CDs via
     jailed MMC reads; no kernel `cd9660`/`udf` for media.** *Recommend yes.* Open.
+
+**Unmatched devices (§4.7), proposed 2026-11-13:**
+
+16. **Driver lookup against the locally downloaded Opifex index; device IDs
+    never leave the machine.** *Recommend yes.* Open.
+17. **Notify only for user-facing or just-plugged devices with an available
+    driver; install through Opifex's trusted sheet.** *Recommend yes.* Open.
+18. **No closed-source kernel drivers (e.g. NVIDIA's); fallback to efifb +
+    Tier-2 CPU rendering.** *Recommend yes.* Open.
