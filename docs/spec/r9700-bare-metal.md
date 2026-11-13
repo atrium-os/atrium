@@ -1356,3 +1356,18 @@ work (self-test, scrub).
   pages and flushes as its close would (amd_mes12_uq_unmap), and marks the slot
   off MES, so the VM drops out of the MES-VMID flush and free-rule masks. Logs:
   claude/project-thread-33aauq 1d72542a.
+- **2026-11-13 13:53, full suite with the c8561e42 fix (si-client-test 553d5a34,
+  no SI_ switches): still WEDGED, and the log shows why.** 70 passed, 2 failed
+  (15's health VM, 14's bystander). The new eviction unmap ran for every lost
+  queue; for test 15's (uq4, VMID 12, high VA) its first flush (kernel VMID 5)
+  timed out right after REMOVE_QUEUE, and "evicted (lost) and unmapped" only
+  printed 2 s later. Interleaved in that first burst are 8 lines naming one
+  context with the NEXT context's INV_REQ ("context 5 ... 0xf80100", 8/0xf80200,
+  ...): two threads flushing on GFXHUB engine 17 at once (the eviction task and
+  the client's BO frees). amd_gmc12_vm_flush and amd_gmc12_flush had no lock;
+  GFXHUB has no semaphore; amdgpu holds gmc.invalidate_lock there. This also fits
+  QFIRST: a queue's close takes uq_sx, so it waited for the eviction task, while
+  BO frees do not.
+  Fix (kmods de56be23): one mutex across the HDP flush and both hubs' engine-17
+  invalidation. c8561e42's eviction unmap stays. Logs: claude/project-thread-33aauq
+  aea5d54a.
