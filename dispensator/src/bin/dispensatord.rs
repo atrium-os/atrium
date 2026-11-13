@@ -160,7 +160,7 @@ mod run {
     use dispensator::jail::{plan, stop_names, JailPlan};
     use dispensator::plan::{Op, Vars};
     use jaild::client::Client;
-    use jaild::protocol::{CreateJailRequest, ExecSpec, MountKind, MountSpec, NetworkConfig, Request, Response};
+    use jaild::protocol::{CreateJailRequest, ExecSpec, FuseServe, MountKind, MountSpec, NetworkConfig, Request, Response};
 
     use super::*;
 
@@ -203,6 +203,9 @@ mod run {
                 other => eprintln!("atrium-dispensatord: devinfo -v: {other:?}"),
             }
             let ops = a.planner.usb_present(&usb_dumps());
+            a.run(ops);
+            let dev: Vec<String> = std::fs::read_dir("/dev").map(|d| d.filter_map(|e| e.ok()?.file_name().into_string().ok()).collect()).unwrap_or_default();
+            let ops = a.planner.disks_present(dev.iter().map(String::as_str));
             a.run(ops);
             a.serve(&w, reshow);
             eprintln!("atrium-dispensatord: devd connection lost; reconnecting");
@@ -258,7 +261,7 @@ mod run {
                 match op {
                     Op::Show { service, node } => self.show(&service, &node),
                     Op::StartDriver { driver, device, vars, nodes, label } => {
-                        let inst: Vars = vars.iter().filter(|(k, _)| matches!(k.as_str(), "hidraw" | "unit" | "usb")).map(|(k, v)| (k.clone(), v.clone())).collect();
+                        let inst: Vars = vars.iter().filter(|(k, _)| dispensator::rules::INSTANCE_VARS.contains(&k.as_str())).map(|(k, v)| (k.clone(), v.clone())).collect();
                         self.stop(&driver, &device, &inst);
                         self.start(&driver, &device, &vars, &nodes, &label);
                     }
@@ -331,6 +334,11 @@ mod run {
                 syscall_profile: Some(p.sysfil.clone()),
                 devfs_grant: p.devfs_grants.first().cloned(),
                 devfs_grants: p.devfs_grants.iter().skip(1).cloned().collect(),
+                fuse: p.fuse.as_ref().map(|(device, mountpoint, read_only)| FuseServe {
+                    device: device.clone(),
+                    mountpoint: mountpoint.clone(),
+                    read_only: *read_only,
+                }),
             }
         }
 

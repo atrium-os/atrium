@@ -156,6 +156,15 @@ impl Planner {
         let mut out = Vec::new();
         let mut changes = self.registry.feed(ev);
         if let DevEvent::Notify { system, subsystem, kind, fields } = ev {
+            if (system.as_str(), subsystem.as_str()) == ("GEOM", "DEV") {
+                if let Some(cdev) = fields.get("cdev") {
+                    match kind.as_str() {
+                        "CREATE" => out.extend(self.disk_attach(cdev)),
+                        "DESTROY" => out.extend(self.release(cdev)),
+                        _ => {}
+                    }
+                }
+            }
             if (system.as_str(), subsystem.as_str(), kind.as_str()) == ("USB", "DEVICE", "DETACH") {
                 if let Some(ugen) = fields.get("ugen").filter(|u| ugen_numbers(u).is_some()) {
                     // Its unclaimed interfaces never get a detach line.
@@ -219,6 +228,28 @@ impl Planner {
         }
         out.extend(self.assign(&device, a, label, Vec::new()));
         Some(out)
+    }
+
+    /// A partition GEOM made (`da0p1`): the `disk` rule for its driver.
+    fn disk_attach(&mut self, part: &str) -> Vec<Op> {
+        let Some(((rule, owner), disk)) = self.rules.match_partition(part) else { return Vec::new() };
+        let pairs = [("part", Some(part.to_string())), ("disk", Some(disk.to_string()))];
+        let filled: Vec<String> = rule.nodes.iter().filter_map(|t| fill(t, &pairs)).collect();
+        let nodes = if rule.all_nodes { filled } else { filled.into_iter().take(1).collect() };
+        let a = Assignment { rule: rule.name.clone(), owner: owner.clone(), nodes, vars: vars(&pairs) };
+        self.assign(part, a, String::new(), Vec::new())
+    }
+
+    /// Partitions present at start (the names in `/dev`): GEOM sent their
+    /// CREATE before this daemon listened.
+    pub fn disks_present<'a>(&mut self, names: impl IntoIterator<Item = &'a str>) -> Vec<Op> {
+        let mut out = Vec::new();
+        for n in names {
+            if crate::rules::parse_partition(n).is_some() {
+                out.extend(self.line(&format!("!system=GEOM subsystem=DEV type=CREATE cdev={n}")));
+            }
+        }
+        out
     }
 
     fn driver_attach(&mut self, name: &str) -> Vec<Op> {
@@ -547,6 +578,71 @@ nexus0
         // Unknown drivers and look-alike names go to nobody.
         assert!(p.line("+pcmx at  on hdaa0").is_empty());
         assert!(p.line("+vgapci0 at slot=1 on pci0").is_empty());
+    }
+
+    const DISK_RULES: &str = r#"
+[[rule]]
+name  = "t-stick"
+class = "disk"
+disk  = ["da", "md"]
+nodes = ["{part}"]
+owner = "driver:t-capsa"
+
+[driver.t-capsa]
+exec           = "/usr/local/bin/atrium-capsa-fuse"
+argv           = ["atrium-capsa-fuse", "--dev-fd", "3", "--fuse-fd", "4"]
+uid            = 65070
+gid            = 65070
+jail           = "atrium-capsa-{part}"
+root           = "/var/lib/atrium/jails/capsa-{part}"
+devfs_ruleset  = 30
+sysfil         = "fuse-server"
+fuse_mount     = "/media/{part}"
+"#;
+
+    /// Partitions (device-assignment.md §4.6): GEOM's CREATE starts a FUSE
+    /// server per partition, DESTROY stops it; whole disks, other drivers
+    /// and look-alikes go to nobody; at start /dev's names are enough.
+    #[test]
+    fn disk_partitions() {
+        let mut r = Rules::default();
+        r.add_toml("t", DISK_RULES).unwrap();
+        let mut p = Planner::new(r.finish().unwrap());
+        let ev = |k: &str, n: &str| format!("!system=GEOM subsystem=DEV type={k} cdev={n}");
+        let ops = p.line(&ev("CREATE", "da0p1"));
+        let [Op::StartDriver { driver, device, vars, nodes, .. }] = ops.as_slice() else { panic!("{ops:?}") };
+        assert_eq!((driver.as_str(), device.as_str(), nodes.as_slice()), ("t-capsa", "da0p1", &["da0p1".to_string()][..]));
+        assert_eq!(vars.get("disk").map(String::as_str), Some("da0"));
+        let d = &p.rules().drivers["t-capsa"];
+        let j = crate::jail::plan(d, vars, nodes).unwrap();
+        assert_eq!(j.name, "atrium-capsa-da0p1");
+        assert!(j.devfs_grants.is_empty(), "the jail never sees the partition");
+        assert_eq!(j.fuse, Some(("da0p1".into(), "/media/da0p1".into(), false)));
+        assert!(matches!(p.line(&ev("CREATE", "da1s2")).as_slice(), [Op::StartDriver { .. }]));
+        for n in ["da0", "ada0p1", "da0p1.eli", "gpt/stick", "da0px", "nvd0p1", "da0p"] {
+            assert!(p.line(&ev("CREATE", n)).is_empty(), "{n}");
+        }
+        let ops = p.line(&ev("DESTROY", "da0p1"));
+        assert!(matches!(ops.as_slice(), [Op::StopDriver { device, vars, .. }] if device == "da0p1" && vars.keys().collect::<Vec<_>>() == ["part"]), "{ops:?}");
+        assert!(p.line(&ev("DESTROY", "da0p1")).is_empty());
+        let ops = p.disks_present(["null", "md99", "md99p1", "ada0p2", "da1s2"]);
+        assert_eq!(ops.len(), 1, "md99p1 is new, da1s2 already running: {ops:?}");
+    }
+
+    #[test]
+    fn disk_rule_checks() {
+        let bad = |from: &str, to: &str| {
+            let mut r = Rules::default();
+            r.add_toml("t", &DISK_RULES.replace(from, to)).and_then(|_| r.finish().map(|_| ())).is_err()
+        };
+        assert!(!bad("x", "x"));
+        assert!(bad("fuse_mount     = \"/media/{part}\"", ""), "a disk driver must serve over FUSE");
+        assert!(bad("/media/{part}", "/media/stick"), "one mount per partition");
+        assert!(bad("/media/{part}", "/media/{disk}"));
+        assert!(bad("disk  = [\"da\", \"md\"]", "disk = []"));
+        assert!(bad("disk  = [\"da\", \"md\"]", "disk = [\"da0\"]"));
+        assert!(bad("owner = \"driver:t-capsa\"", "owner = \"service:x\"\n[service.x]\ndevfs = \"/x/dev\""), "never shown to a service");
+        assert!(bad("atrium-capsa-{part}", "atrium-capsa-{disk}"));
     }
 
     const USB_RULES: &str = r#"

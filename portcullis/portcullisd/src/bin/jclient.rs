@@ -17,7 +17,7 @@ use std::process::ExitCode;
 
 use jaild::protocol::{
     AttachMountRequest, CreateJailRequest, DetachMountRequest, EnvPair,
-    ExecSpec, MountKind, NetworkConfig, Request, Response,
+    ExecSpec, FuseServe, MountKind, MountSpec, NetworkConfig, Request, Response,
 };
 use portcullisd::jaild_client::Client;
 
@@ -89,12 +89,13 @@ fn main() -> ExitCode {
             let path = rest[1].clone();
             let bin  = rest[2].clone();
             let argv: Vec<String> = rest[2..].to_vec();
+            let (uid, gid) = env_ids();
             Request::CreateJail(CreateJailRequest {
                 rctl: None,
                 name,
                 path,
                 children_max:  0,
-                mounts:        vec![],
+                mounts:        env_mounts_ro(),
                 devfs_ruleset: devfs_ruleset_env(),
                 network:       NetworkConfig::Disable,
                 exec: Some(ExecSpec {
@@ -104,18 +105,18 @@ fn main() -> ExitCode {
                         key:   "PATH".into(),
                         value: "/bin:/usr/bin".into(),
                     }],
-                    uid:  1001,
-                    gid:  1001,
+                    uid,
+                    gid,
                     stdio: false,
                 }),
                 hostname: None,
                 hostid: None,
                 hostuuid: None,
                 allow_mlock: false,
-                syscall_profile: None,
+                syscall_profile: std::env::var("ATRIUM_JCLIENT_SYSFIL").ok(),
                 devfs_grant: None,
                 devfs_grants: vec![],
-                fuse: None,
+                fuse: env_fuse(),
             })
         }
         "attach" => {
@@ -197,4 +198,30 @@ fn unsafe_close(fd: i32) -> std::io::Result<()> {
 /// host's.
 fn devfs_ruleset_env() -> u32 {
     std::env::var("ATRIUM_JCLIENT_DEVFS").ok().and_then(|v| v.parse().ok()).unwrap_or(0)
+}
+
+/// `ATRIUM_JCLIENT_UID=<uid>`/`ATRIUM_JCLIENT_GID=<gid>` for `exec` (default
+/// 1001/1001).
+fn env_ids() -> (u32, u32) {
+    let get = |k: &str| std::env::var(k).ok().and_then(|v| v.parse().ok()).unwrap_or(1001);
+    (get("ATRIUM_JCLIENT_UID"), get("ATRIUM_JCLIENT_GID"))
+}
+
+/// `ATRIUM_JCLIENT_MOUNTS_RO=/lib,/libexec`: read-only nullfs mounts at the
+/// same paths inside the jail, for `exec`.
+fn env_mounts_ro() -> Vec<MountSpec> {
+    std::env::var("ATRIUM_JCLIENT_MOUNTS_RO").ok().map(|v| v.split(',').filter(|s| !s.is_empty())
+        .map(|p| MountSpec { source: p.into(), dest: p.into(), kind: MountKind::RoNullfs, size_mb: None, owner: None })
+        .collect()).unwrap_or_default()
+}
+
+/// `ATRIUM_JCLIENT_FUSE=<device>:<mountpoint>[:ro]` for `exec`: jaild opens
+/// the device and /dev/fuse, mounts fusefs, and passes them as fd 3 and 4
+/// (device-assignment.md §6.4).
+fn env_fuse() -> Option<FuseServe> {
+    let v = std::env::var("ATRIUM_JCLIENT_FUSE").ok()?;
+    let mut it = v.split(':');
+    let device = it.next()?.to_string();
+    let mountpoint = it.next()?.to_string();
+    Some(FuseServe { device, mountpoint, read_only: it.next() == Some("ro") })
 }

@@ -7,7 +7,7 @@
 //! (`[service.NAME]`). All files of the directory are merged; a name defined
 //! twice is an error, so one package cannot redefine another's driver.
 //!
-//! Three device classes so far:
+//! Four device classes so far:
 //!
 //! - `hid`: a HID device (one `hidbus`) with its top-level collections'
 //!   usage pages, its `hidraw` unit and, when `u2f(4)` drives a FIDO
@@ -23,7 +23,12 @@
 //!   interface (jail names take no dots). Nodes are typically `ugen{bus}.{addr}`
 //!   and `usb/{bus}.{addr}.0`, with `all_nodes`: libusb opens both.
 //!
-//! Disks come with D5b.
+//! - `disk`: one partition of a disk (`da0p1`, `da0s1`), by the disk's
+//!   driver name (`disk = ["da"]`), as GEOM creates it. Placeholders
+//!   `{part}` (the partition, the instance) and `{disk}` (`da0`). A whole
+//!   disk without a partition table is not matched yet. A disk's owner is a
+//!   FUSE-serving driver (`fuse_mount`): jaild opens the partition and
+//!   `/dev/fuse` for it, so its jail sees no node (device-assignment.md §4.6).
 //!
 //! Templates use the class's placeholders and, in a driver's argv, `{node}`
 //! (the first node the rule granted). A driver's `jail` and `root` take only
@@ -63,6 +68,9 @@ pub struct Rule {
     /// Without it such an interface is left to the kernel.
     #[serde(default)]
     pub detach_kernel: bool,
+    /// `disk`: the disk drivers whose partitions match (`da`, `cd`).
+    #[serde(default)]
+    pub disk: Vec<String>,
     /// Nodes to grant, in order; the first whose placeholders are all
     /// known is used, or every one with `all_nodes`.
     pub nodes: Vec<String>,
@@ -88,6 +96,14 @@ pub struct Driver {
     pub sysfil: String,
     #[serde(default)]
     pub mounts_ro: Vec<String>,
+    /// Serve the device over FUSE instead of granting its node: jaild opens
+    /// the first node and `/dev/fuse`, mounts fusefs here (a template with
+    /// `{part}`), and the driver gets them as fd 3 and fd 4. Only for `disk`
+    /// rules; jaild's pin decides which devices and where.
+    #[serde(default)]
+    pub fuse_mount: Option<String>,
+    #[serde(default)]
+    pub fuse_read_only: bool,
 }
 
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
@@ -153,18 +169,23 @@ pub fn class_vars(class: &str) -> &'static [&'static str] {
         "hid" => &["hidraw", "hidbus", "u2f"],
         "driver" => &["unit"],
         "usb" => &["usb", "bus", "addr", "interface"],
+        "disk" => &["part", "disk"],
         _ => &[],
     }
 }
 
 /// Every placeholder of every class.
-pub const ALL_VARS: &[&str] = &["hidraw", "hidbus", "u2f", "unit", "usb", "bus", "addr", "interface"];
+pub const ALL_VARS: &[&str] = &["hidraw", "hidbus", "u2f", "unit", "usb", "bus", "addr", "interface", "part", "disk"];
+
+/// Every class's instance placeholder.
+pub const INSTANCE_VARS: &[&str] = &["hidraw", "unit", "usb", "part"];
 
 /// The placeholder naming one device of a class (jail names, stops).
 pub fn instance_var(class: &str) -> &'static str {
     match class {
         "hid" => "hidraw",
         "usb" => "usb",
+        "disk" => "part",
         _ => "unit",
     }
 }
@@ -176,6 +197,19 @@ pub fn parse_usb_id(s: &str) -> Option<(u16, u16)> {
         return None;
     }
     Some((u16::from_str_radix(v, 16).ok()?, u16::from_str_radix(p, 16).ok()?))
+}
+
+/// A partition's name, `da0p1` or `da0s1`: `(driver, disk)` = `("da",
+/// "da0")`. `None` for a whole disk or anything else (`da0p1.eli`, labels).
+pub fn parse_partition(name: &str) -> Option<(&str, &str)> {
+    let d = name.find(|c: char| c.is_ascii_digit())?;
+    let drv = &name[..d];
+    let rest = &name[d..];
+    let u = rest.find(|c: char| !c.is_ascii_digit())?;
+    let (unit, tail) = rest.split_at(u);
+    let num = tail.strip_prefix('p').or_else(|| tail.strip_prefix('s'))?;
+    let digits = |x: &str| !x.is_empty() && x.len() <= 4 && x.bytes().all(|b| b.is_ascii_digit());
+    (driver_name_ok(drv) && digits(unit) && digits(num)).then(|| (drv, &name[..d + unit.len()]))
 }
 
 /// One USB interface as devd reports it.
@@ -273,11 +307,17 @@ impl Rules {
             }
             // Which instance placeholder must appear is checked per rule
             // in finish(), once the rules naming this driver are known.
-            check_template("jail", &d.jail, &["hidraw", "unit", "usb"]).map_err(|e| w(e.0))?;
+            check_template("jail", &d.jail, INSTANCE_VARS).map_err(|e| w(e.0))?;
             if !d.jail.bytes().all(|b| b.is_ascii_alphanumeric() || b"-_{}".contains(&b)) {
                 return Err(w("jail name: letters, digits, '-', '_' only".into()));
             }
-            check_abs("root", &d.root, &["hidraw", "unit", "usb"]).map_err(|e| w(e.0))?;
+            check_abs("root", &d.root, INSTANCE_VARS).map_err(|e| w(e.0))?;
+            if let Some(m) = &d.fuse_mount {
+                check_abs("fuse_mount", m, &["part"]).map_err(|e| w(e.0))?;
+                if placeholders(m) != Some(vec!["part"]) {
+                    return Err(w("fuse_mount must hold {part}: one mount per partition".into()));
+                }
+            }
             if !ident_ok(&d.sysfil) {
                 return Err(w("sysfil: a profile name".into()));
             }
@@ -312,10 +352,16 @@ impl Rules {
                 return Err(w(format!("more than {MAX_RULES} rules")));
             }
             let usb_fields = !r.usb_interface.is_empty() || !r.usb_ids.is_empty() || r.detach_kernel;
+            let disk_fields = !r.disk.is_empty();
             match r.class.as_str() {
-                "hid" if r.driver.is_empty() && !usb_fields => {}
-                "driver" if r.any_page.is_empty() && !usb_fields && driver_name_ok(&r.driver) => {}
-                "usb" if r.any_page.is_empty() && r.driver.is_empty() => {
+                "hid" if r.driver.is_empty() && !usb_fields && !disk_fields => {}
+                "driver" if r.any_page.is_empty() && !usb_fields && !disk_fields && driver_name_ok(&r.driver) => {}
+                "disk" if r.any_page.is_empty() && r.driver.is_empty() && !usb_fields => {
+                    if r.disk.is_empty() || r.disk.len() > 8 || !r.disk.iter().all(|d| driver_name_ok(d)) {
+                        return Err(w("disk takes disk = [\"da\", ...]: 1 to 8 driver names".into()));
+                    }
+                }
+                "usb" if r.any_page.is_empty() && r.driver.is_empty() && !disk_fields => {
                     // Never "every USB device": a rule names what it drives.
                     if r.usb_interface.is_empty() && r.usb_ids.is_empty() {
                         return Err(w("usb takes usb_interface and/or usb_ids".into()));
@@ -324,8 +370,8 @@ impl Rules {
                         return Err(w("usb_interface: 1 to 3 bytes; usb_ids: up to 32 \"vvvv:pppp\"".into()));
                     }
                 }
-                "hid" | "driver" | "usb" => return Err(w("hid takes any_page, driver takes driver = \"NAME\", usb takes usb_interface/usb_ids/detach_kernel".into())),
-                c => return Err(w(format!("class {c:?}: \"hid\", \"driver\" or \"usb\""))),
+                "hid" | "driver" | "usb" | "disk" => return Err(w("hid takes any_page, driver takes driver = \"NAME\", usb takes usb_interface/usb_ids/detach_kernel, disk takes disk".into())),
+                c => return Err(w(format!("class {c:?}: \"hid\", \"driver\", \"usb\" or \"disk\""))),
             }
             if r.nodes.is_empty() || r.nodes.len() > 8 {
                 return Err(w("nodes: 1 to 8 entries".into()));
@@ -357,6 +403,9 @@ impl Rules {
             if !ok {
                 return err(format!("rule {}: owner {} is not defined in any file", r.name, r.owner));
             }
+            if r.class == "disk" && matches!(o, Owner::Service(_)) {
+                return err(format!("rule {}: a disk is never shown to a service, only served over FUSE by a driver", r.name));
+            }
             if let Owner::Driver(n) = o {
                 let d = &self.drivers[n];
                 let v = instance_var(&r.class);
@@ -364,6 +413,9 @@ impl Rules {
                     if placeholders(t) != Some(vec![v]) {
                         return err(format!("rule {}: driver {n}'s {k} must hold {{{v}}} and nothing else: one jail per device", r.name));
                     }
+                }
+                if d.fuse_mount.is_some() != (r.class == "disk") {
+                    return err(format!("rule {}: a disk goes to a driver with fuse_mount, and only a disk does", r.name));
                 }
             }
         }
@@ -405,6 +457,12 @@ impl Rules {
     /// highest priority, then name, among rules whose page filter matches.
     pub fn match_hid(&self, pages: &[u16]) -> Option<&(Rule, Owner)> {
         self.best(|r| r.class == "hid" && (r.any_page.is_empty() || pages.iter().any(|p| r.any_page.contains(p))))
+    }
+
+    /// The winning rule for partition `name` (`da0p1`), and its disk.
+    pub fn match_partition<'a>(&self, name: &'a str) -> Option<(&(Rule, Owner), &'a str)> {
+        let (drv, disk) = parse_partition(name)?;
+        Some((self.best(|r| r.class == "disk" && r.disk.iter().any(|d| d == drv))?, disk))
     }
 
     /// The winning rule for a device a kernel driver attached as `name`

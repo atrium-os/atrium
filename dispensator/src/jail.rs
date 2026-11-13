@@ -11,8 +11,12 @@ pub struct JailPlan {
     pub path: String,
     pub devfs_ruleset: u32,
     /// The nodes jaild unhides (owner = `uid`, mode 0600) before exec: one,
-    /// or a few for a device that is several (a USB device). Never empty.
+    /// or a few for a device that is several (a USB device). Empty for a
+    /// FUSE-serving driver, whose node goes to `fuse` instead.
     pub devfs_grants: Vec<String>,
+    /// `(device, mountpoint, read_only)`: jaild opens the device and
+    /// `/dev/fuse` and mounts fusefs (jaild's `CreateJailRequest::fuse`).
+    pub fuse: Option<(String, String, bool)>,
     pub mounts_ro: Vec<String>,
     pub exec: String,
     pub argv: Vec<String>,
@@ -36,7 +40,11 @@ pub fn plan(d: &Driver, vars: &BTreeMap<String, String>, nodes: &[String]) -> Op
         name: fill(&d.jail, &pairs)?,
         path: fill(&d.root, &pairs)?,
         devfs_ruleset: d.devfs_ruleset,
-        devfs_grants: nodes.to_vec(),
+        devfs_grants: if d.fuse_mount.is_some() { Vec::new() } else { nodes.to_vec() },
+        fuse: match &d.fuse_mount {
+            Some(m) => Some((nodes.first()?.clone(), fill(m, &pairs)?, d.fuse_read_only)),
+            None => None,
+        },
         mounts_ro: d.mounts_ro.clone(),
         exec: d.exec.clone(),
         argv: d.argv.iter().map(|a| fill(a, &pairs)).collect::<Option<_>>()?,

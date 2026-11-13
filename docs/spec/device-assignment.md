@@ -564,10 +564,44 @@ directories and replacing, rmdir refusal, bad name refused, case-insensitive
 lookups, statvfs), then `fsck.fat -n` clean and `mtype` agreeing; and
 `--ro` giving `EROFS`.
 
-Next: jaild opening `/dev/fuse` and the partition and mounting fusefs from
-outside (no `allow.mount.fusefs` in any jail), the server's sysfil
-profile, a FreeBSD VM gate on fusefs, dispensatord's rule for `daNpM`
-partitions to the storage service, then exFAT writes.
+**Mounting from outside the jail** (jaild, `CreateJailRequest::fuse`):
+the request names a block device (relative to `/dev`) and a mountpoint.
+jaild loads `fusefs.ko` if needed, opens the partition (read-only when
+asked) and `/dev/fuse` itself, creates the mountpoint, and calls `nmount`
+with `fstype=fusefs`, `fd=`, `allow_other`, `default_permissions`,
+`nosuid` (and `ro`), then pdforks; the child moves the two descriptors to
+fd 3 and fd 4 before `jail_attach`, so the server never sees either node
+and no jail has `allow.mount`. Only a pinned ruleset whose new
+`fuse_devices` patterns (`da#p#`, `#` = 1 to 4 digits) allow the device,
+with the mountpoint one plain name directly under the pin's
+`fuse_mount_prefix`. The mount is recorded with the jail and
+force-unmounted at RemoveJail; a stale mount from a server that died is
+cleared before the next one. The server enters Capsicum after reading the
+partition's geometry; its sysfil profile `fuse-server` is `base` plus
+`DIOCGSECTORSIZE`/`DIOCGMEDIASIZE`.
+
+**The `disk` rule class** (dispensatord): `disk = ["da"]` matches the
+partitions GEOM creates on those disks (`!system=GEOM subsystem=DEV
+type=CREATE cdev=da0p1`, `daNpM` or `daNsM`; `DESTROY` ends it), and at
+start the partition names already in `/dev`. Placeholders `{part}` (the
+instance) and `{disk}`. A disk goes only to a driver with `fuse_mount`
+(`/media/{part}`), never to a service, and such a driver serves only
+disks: its node becomes the request's `fuse`, not a devfs grant. A whole
+disk without a partition table (superfloppy) is not matched yet.
+
+No production rule ships yet: whose files they are (the session user),
+nothing mounted while the session is locked, and the nullfs view into the
+session are the removable-media service's job (storage.md §8.5); until it
+exists the mechanism runs only under the gate. `scripts/vm-fuse-check.sh`
+(FreeBSD VM): a FAT32 volume on md(4) served through jaild and jclient
+(reads, writes, renames, a 2 MiB file, the session uid, fds 3/4 only, no
+node in the jail, fsck_msdosfs clean, msdosfs reads it back), read-only
+gives EROFS, refusals for the VM's own disk and a mountpoint outside
+/media, then dispensatord serving a GPT partition on a fresh md at
+`/media/md98p1` and removing it when the md goes. Runs pending.
+
+Next: the VM gate's run, exFAT writes, a whole-disk (superfloppy) case,
+and the removable-media service (session owner, lock, eject).
 
 ## 7. Not in scope
 

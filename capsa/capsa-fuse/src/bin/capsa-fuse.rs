@@ -78,6 +78,14 @@ fn main() -> ExitCode {
     }
     let (Some(dev), Some(fuse)) = (dev, fuse) else { return usage() };
     let (sector, len) = geometry(&dev);
+    // Capability mode from here on (device-assignment.md §4.6): the two
+    // descriptors are all this process ever touches again.
+    #[cfg(target_os = "freebsd")]
+    // SAFETY: cap_enter takes no arguments and only restricts this process.
+    if unsafe { libc::cap_enter() } != 0 {
+        eprintln!("atrium-capsa-fuse: cap_enter: {}", std::io::Error::last_os_error());
+        return ExitCode::FAILURE;
+    }
     let Ok(mut dev) = Aligned::new(dev, sector, len) else { return usage() };
     let mut head = [0u8; 11];
     if let Err(e) = dev.read_at(0, &mut head) {

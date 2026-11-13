@@ -615,6 +615,16 @@ ioctls = [
     "0x41705570",   # USB_GET_DEVICEINFO (u2f(4): vendor, product, name)
 ]
 
+# The removable-storage FUSE server, atrium-capsa-fuse (device-assignment.md
+# §4.6): it holds the partition and /dev/fuse, both opened by jaild, asks the
+# partition's geometry, then enters Capsicum. No sockets are ever opened.
+[sysfil.profiles.fuse-server]
+include = ["base"]
+ioctls = [
+    "0x40046480",   # DIOCGSECTORSIZE
+    "0x40086481",   # DIOCGMEDIASIZE
+]
+
 # Ordinary apps.
 [sysfil.profiles.app]
 include = ["base"]
