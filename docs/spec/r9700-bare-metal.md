@@ -753,3 +753,12 @@ work (self-test, scrub).
   free or signal point; §5.9). RamPages follow-ups: a non-contiguous path for larger rings,
   a review of the managed-flag change against vm_page locking and invariants, a leak
   counter.
+- **2026-11-13, stage 5c-2b step 4 PASSED (47/47); 5c-2b done.** `58c1881e`, log
+  `20261113T032103Z`. BOs of VMs with live user queues are freed at their close: 21
+  preemptions (SUSPEND 70-200 us, RESUME 100-140 us, suspend fence landed at once), 0
+  failed, isolation `deferred 0 / reaped 0` (step 3: 19 / 19). A BO closed under a queue
+  stuck in WAIT_REG_MEM was freed at once too (MES suspends a CP wait); the queue was still
+  lost after hang_ms. Steps 1-3 passed again; SIGBUS children no longer dump core. Idle 7 W,
+  detach clean, card cold. Open: the unrouted EOP count rises with the preemptions (1 to
+  22) while only two are logged (rate limit); the SUSPEND/RESUME EOPs need identifying and
+  counting as MES's own. Next: 5d (VRAM).
