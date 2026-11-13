@@ -1465,3 +1465,17 @@ work (self-test, scrub).
   Next (kmods f4af2b81, includes b648c939): no GRBM select anywhere on the
   fault and eviction path, diagnostics included. Logs: claude/project-thread-33aauq
   0419a9f3.
+- **2026-11-13 15:16, full suite with f4af2b81 (no GRBM selects on the fault
+  and eviction path): CLEAN, 92 passed, 0 failed.** First clean full suite with
+  G5 included. All four test 15 cases (high VA, past its buffer, endless
+  shader, VA 0) recover, every "a new VM can be set up" check passes, 0 flush
+  timeouts, test 14 runs in full (its two expected mode 1 resets and re-inits
+  pass), card proven idle at detach, no lock warnings, no "found only by an
+  HQD scan". GCVM_L2_STATUS still reads 0x1 at one snapshot in 15a-c but clears
+  within 1 ms. Root cause (pending a confirming run): a driver write to
+  GRBM_GFX_CNTL (HQD scans, MES-pipe selects) while MES/CP is busy right after
+  a fault leaves CPF's GRBM path and the GFXHUB L2 stuck, so no invalidation
+  is acked again. amdgpu does not GRBM-select MES-owned queues while MES runs.
+  Still selecting at run time: CPC interrupt enables at the first queue create
+  and the last destroy (amd_mes12_uq_ints), CP-error IVs (si_uq_cperr), the HQD
+  reset of a queue that will not stop. Logs: claude/project-thread-33aauq 438a2af9.
