@@ -992,5 +992,6 @@ work (self-test, scrub).
   Suspect, found in review: `si_recover` took the kernel queue (set c->kq to NULL)
   before stopping the VRAM scrub engine, and `si_vram_clear` re-read c->kq at every
   step. A scrub running during the re-init could therefore use a NULL queue and panic,
-  and this kernel stops in the debugger on a panic. Fixed in 54939f76. The console (a
+  and if this kernel stops in the debugger on a panic, the box would sit there with
+  no ssh. Fixed in 54939f76. The console (a
   panic or a hard hang) and the run log on Atrium's disk will confirm or rule this out.
