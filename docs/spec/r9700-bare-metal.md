@@ -1148,3 +1148,17 @@ work (self-test, scrub).
   Conclusion: MES places user queues on pipe 0 and on shared pipes, so even a working
   pipe reset would cover only some refusals. Reset + per-uid lockout stays the
   defence. Logs: claude/project-thread-33aauq 5fd4e4ac.
+- **2026-11-13 10:45, hostile-ISA test (F6 G5) staged (5fb4238d).** Shankar accepted
+  reset + lockout for hostile PM4, so the gate moves to G5. si-client-test test 15,
+  which runs before 14, has four hostile cases:
+  1. A shader that runs `s_branch -1` forever.
+  2. write_42 aimed at VA 0.
+  3. write_42 aimed at a high VA (0x7ffffff00000).
+  4. write_42 aimed just past the app's own buffer.
+  Each must be lost with EIO and leave a bystander VM's page untouched (poisoned before,
+  read after). Its queue must then refuse new work, and the bystander must run clean.
+  The test prints the time to fail and checks that no GPU re-init was needed. On
+  gpusim the EIO and untouched-memory checks pass (spin lost at 5006 ms = hang_ms).
+  The rest fail there, as tests 1-8 do, because si-client-test is silicon only.
+  test_gpu_isolation already passed on silicon in stage 5f (07:30). Box artifacts:
+  si-client-test e7073da3…, kmods 4e443a80 unchanged, xfer 1b71cafd.
