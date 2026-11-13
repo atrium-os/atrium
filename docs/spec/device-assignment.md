@@ -233,6 +233,16 @@ The session sees the mount through nullfs, `nosuid,noexec`; nothing is mounted
 while the session is locked; eject syncs, unmounts, then lets the device go;
 a surprise removal only gives the FUSE jail I/O errors.
 
+**Optical discs.** Drives (USB or SATA) attach as `cdN` through CAM, and
+`dispensatord` hands the drive to the storage service like a USB disk. Data
+discs are ISO 9660 (with Joliet/Rock Ridge) or UDF: both are read-only,
+simple formats, so they get a jailed read-only Rust FUSE reader. The kernel's
+`cd9660` and `udf` are never used for media, and the `iso9660` label taster is
+off. Audio CDs have no filesystem: a jailed reader sends MMC commands (READ CD,
+TOC) through the drive's `pass` node and gives Lyra or the player PCM. Burning,
+if ever wanted, is the same jailed MMC path. Video DVD/Blu-ray (CSS, AACS) is
+out of scope.
+
 **Kernel tasting.** GEOM parses every new disk's partition table and labels
 before `dispensatord` sees it, and that cannot be routed to a jail per device.
 So the Atrium kernel keeps only `GEOM_PART_GPT` and `GEOM_PART_MBR` (with its
@@ -332,3 +342,5 @@ Until Tessera encryption lands, every removable disk takes the jailed path.
     *Recommend yes.* Open.
 14. **exFAT included under "FAT".** *Recommend yes* (most sticks over 32 GB).
     Open.
+15. **Optical: ISO 9660 + UDF via a jailed read-only reader; audio CDs via
+    jailed MMC reads; no kernel `cd9660`/`udf` for media.** *Recommend yes.* Open.
