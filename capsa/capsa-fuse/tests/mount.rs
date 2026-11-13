@@ -81,7 +81,7 @@ fn fat32_through_the_kernel() {
     let f = std::fs::OpenOptions::new().read(true).write(true).open(&img).unwrap();
     let v = Volume::open(f).unwrap();
     let m_dir = d.join("mnt");
-    let Some(m) = Mount::new(v, &m_dir, Options { uid: 1234, gid: 5678, ..Options::default() }) else { return };
+    let Some(m) = Mount::new(v, &m_dir, Options { uid: 1234, gid: 5678, umask: 0o027, ..Options::default() }) else { return };
     let p = |s: &str| m_dir.join(s);
     // Files, by std::fs, through the kernel.
     std::fs::write(p("hello.txt"), b"hello, world\n").unwrap();
@@ -96,8 +96,9 @@ fn fat32_through_the_kernel() {
     // Metadata: owner from the options, sizes, kinds.
     use std::os::unix::fs::MetadataExt;
     let md = std::fs::metadata(p("hello.txt")).unwrap();
-    assert_eq!((md.uid(), md.gid(), md.len(), md.mode() & 0o777), (1234, 5678, 13, 0o644));
+    assert_eq!((md.uid(), md.gid(), md.len(), md.mode() & 0o777), (1234, 5678, 13, 0o640));
     assert!(std::fs::metadata(p("Documents")).unwrap().is_dir());
+    assert_eq!(std::fs::metadata(p("Documents")).unwrap().mode() & 0o777, 0o750, "umask 027");
     // Listing.
     let mut names: Vec<String> = std::fs::read_dir(&m_dir).unwrap().map(|e| e.unwrap().file_name().into_string().unwrap()).collect();
     names.sort();

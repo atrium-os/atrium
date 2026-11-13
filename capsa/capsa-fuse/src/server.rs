@@ -22,11 +22,15 @@ pub struct Options {
     pub read_only: bool,
     /// How long the kernel may cache names and attributes, seconds.
     pub valid_secs: u64,
+    /// Permission bits cleared from every mode shown: `0o077` makes the
+    /// volume the owner's alone (with `default_permissions`, the kernel
+    /// enforces it).
+    pub umask: u32,
 }
 
 impl Default for Options {
     fn default() -> Self {
-        Self { uid: 0, gid: 0, read_only: false, valid_secs: 1 }
+        Self { uid: 0, gid: 0, read_only: false, valid_secs: 1, umask: 0 }
     }
 }
 
@@ -157,10 +161,11 @@ impl<B: Backend> State<B> {
 
     fn fattr(&self, id: u64, a: Attr) -> FAttr {
         let ro = self.opts.read_only || !self.fs.writable();
+        let keep = !self.opts.umask & 0o777;
         let mode = if a.dir {
-            libc::S_IFDIR as u32 | if ro { 0o555 } else { 0o755 }
+            libc::S_IFDIR as u32 | (if ro { 0o555 } else { 0o755 } & keep)
         } else {
-            libc::S_IFREG as u32 | if ro || a.read_only { 0o444 } else { 0o644 }
+            libc::S_IFREG as u32 | (if ro || a.read_only { 0o444 } else { 0o644 } & keep)
         };
         FAttr {
             ino: id,

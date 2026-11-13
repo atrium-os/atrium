@@ -1,0 +1,30 @@
+# Removable storage for dispensatord (docs/spec/device-assignment.md §4.6).
+# Installed to /usr/local/etc/atrium/devices.d/ by scripts/capsa-service.sh.
+#
+# Every partition on a USB (umass/CAM) disk is served by Capsa's FAT/exFAT
+# server in a jail of its own. jaild opens the partition and /dev/fuse and
+# mounts fusefs at /media/<partition> (pin 31 in jaild.policy.toml); the jail
+# sees neither node. dispensatord serves it only while a human session is
+# active and unlocked, as that human, private to them (umask 077), and stops
+# it on logout, user switch, lock and eject. A partition that is not FAT or
+# exFAT makes the server exit at once, and nothing is mounted for long.
+
+[[rule]]
+name  = "capsa-usb-disk"
+class = "disk"
+disk  = ["da"]
+nodes = ["{part}"]
+owner = "driver:capsa"
+
+[driver.capsa]
+exec          = "/usr/local/bin/atrium-capsa-fuse"
+argv          = ["atrium-capsa-fuse", "--dev-fd", "3", "--fuse-fd", "4",
+                 "--uid", "{session_uid}", "--gid", "{session_gid}", "--umask", "077"]
+uid           = 65031
+gid           = 65031
+jail          = "atrium-capsa-{part}"
+root          = "/var/lib/atrium/jails/capsa-{part}"
+devfs_ruleset = 31
+sysfil        = "fuse-server"
+mounts_ro     = ["/libexec", "/lib", "/usr/lib", "/usr/local/bin"]
+fuse_mount    = "/media/{part}"

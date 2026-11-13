@@ -177,6 +177,10 @@ pub fn class_vars(class: &str) -> &'static [&'static str] {
 /// Every placeholder of every class.
 pub const ALL_VARS: &[&str] = &["hidraw", "hidbus", "u2f", "unit", "usb", "bus", "addr", "interface", "part", "disk"];
 
+/// The active session's user, for a FUSE-serving driver's argv (media.rs):
+/// filled in only while a session is active and unlocked.
+pub const SESSION_VARS: &[&str] = &["session_uid", "session_gid"];
+
 /// Every class's instance placeholder.
 pub const INSTANCE_VARS: &[&str] = &["hidraw", "unit", "usb", "part"];
 
@@ -297,7 +301,7 @@ impl Rules {
                 return Err(w("argv must have 1 to 32 entries".into()));
             }
             for a in &d.argv {
-                check_template("argv", a, &[ALL_VARS, &["node"]].concat()).map_err(|e| w(e.0))?;
+                check_template("argv", a, &[ALL_VARS, SESSION_VARS, &["node"]].concat()).map_err(|e| w(e.0))?;
             }
             if d.uid == 0 || d.gid == 0 {
                 return Err(w("a driver never runs as root".into()));
@@ -312,6 +316,9 @@ impl Rules {
                 return Err(w("jail name: letters, digits, '-', '_' only".into()));
             }
             check_abs("root", &d.root, INSTANCE_VARS).map_err(|e| w(e.0))?;
+            if d.fuse_mount.is_none() && d.argv.iter().any(|a| SESSION_VARS.iter().any(|v| a.contains(&format!("{{{v}}}")))) {
+                return Err(w("{session_uid}/{session_gid}: only for a driver with fuse_mount".into()));
+            }
             if let Some(m) = &d.fuse_mount {
                 check_abs("fuse_mount", m, &["part"]).map_err(|e| w(e.0))?;
                 if placeholders(m) != Some(vec!["part"]) {

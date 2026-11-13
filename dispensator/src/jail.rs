@@ -3,7 +3,7 @@
 
 use std::collections::BTreeMap;
 
-use crate::rules::{fill, Driver, ALL_VARS};
+use crate::rules::{fill, Driver, ALL_VARS, SESSION_VARS};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct JailPlan {
@@ -31,7 +31,7 @@ pub struct JailPlan {
 pub fn plan(d: &Driver, vars: &BTreeMap<String, String>, nodes: &[String]) -> Option<JailPlan> {
     let mut pairs: Vec<(&str, Option<String>)> = vars.iter().map(|(k, v)| (k.as_str(), Some(v.clone()))).collect();
     pairs.push(("node", Some(nodes.first()?.clone())));
-    for &k in ALL_VARS {
+    for &k in ALL_VARS.iter().chain(SESSION_VARS) {
         if !vars.contains_key(k) {
             pairs.push((k, None));
         }

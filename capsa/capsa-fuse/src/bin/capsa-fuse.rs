@@ -20,7 +20,7 @@ use capsa_fat::{Aligned, BlockDev, Error, Volume};
 use capsa_fuse::{serve, Options};
 
 fn usage() -> ExitCode {
-    eprintln!("usage: atrium-capsa-fuse (--dev PATH | --dev-fd N) --fuse-fd N [--uid U] [--gid G] [--ro]");
+    eprintln!("usage: atrium-capsa-fuse (--dev PATH | --dev-fd N) --fuse-fd N [--uid U] [--gid G] [--ro] [--umask OCTAL]");
     ExitCode::from(2)
 }
 
@@ -73,6 +73,11 @@ fn main() -> ExitCode {
                 None => return usage(),
             },
             "--ro" => opts.read_only = true,
+            // Octal, e.g. 077: the volume is the owner's alone.
+            "--umask" => match val().and_then(|s| u32::from_str_radix(&s, 8).ok()).filter(|m| *m <= 0o777) {
+                Some(m) => opts.umask = m,
+                None => return usage(),
+            },
             _ => return usage(),
         }
     }

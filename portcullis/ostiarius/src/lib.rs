@@ -219,6 +219,7 @@ impl<L: Launcher> Ostiarius<L> {
     /// `login` does not tear the first session down — that is FUS.
     pub fn login(&mut self, human: &str, frontend: Frontend) -> Result<(), String> {
         seat::set_active_at(&self.seat_path, human).map_err(|e| format!("bind seat: {e}"))?;
+        let _ = seat::set_locked_at(&seat::locked_path(&self.seat_path), None);
         if !self.sessions.contains_key(human) {
             let mut ids = Vec::new();
             // Launch each session component; a single one failing (e.g. audio with
@@ -247,7 +248,19 @@ impl<L: Launcher> Ostiarius<L> {
             }
         }
         seat::set_active_at(&self.seat_path, "").map_err(|e| format!("unbind seat: {e}"))?;
+        let _ = seat::set_locked_at(&seat::locked_path(&self.seat_path), None);
         Ok(())
+    }
+
+    /// Lock the active session (the lock screen is up) or unlock it after
+    /// the human re-authenticated. Readers of the lock file act on it:
+    /// removable media is unmounted while locked (device-assignment.md §4.6).
+    pub fn set_locked(&self, locked: bool) -> Result<(), String> {
+        let who = if locked { self.active_human() } else { None };
+        if locked && who.is_none() {
+            return Err("no active session to lock".into());
+        }
+        seat::set_locked_at(&seat::locked_path(&self.seat_path), who.as_deref()).map_err(|e| format!("session lock: {e}"))
     }
 
     /// The humans with a live session right now (active + any detached).
@@ -279,6 +292,10 @@ pub mod control {
         Login { user: String, password: String, frontend: Frontend },
         /// End the active session.
         Logout,
+        /// The lock screen went up over the active session.
+        Lock,
+        /// The active session's human re-authenticated at the lock screen.
+        Unlock { password: String },
     }
 
     #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -300,6 +317,13 @@ pub mod control {
                     ost.login(&human, frontend)
                 }),
             Request::Logout => ost.logout(),
+            Request::Lock => ost.set_locked(true),
+            Request::Unlock { password } => match ost.active_human() {
+                None => Err("no active session".into()),
+                Some(active) => ost.authenticate(&active, &password).and_then(|human| {
+                    if human == active { ost.set_locked(false) } else { Err("not the session's user".into()) }
+                }),
+            },
         };
         match r {
             Ok(()) => Response::Ok { active: ost.active_human() },
@@ -494,9 +518,11 @@ mod tests {
     }
 
     fn seat_file(tag: &str) -> String {
-        let p = format!("/tmp/ostiarius-test-{}-{}", std::process::id(), tag);
-        let _ = std::fs::remove_file(&p);
-        p
+        // A directory each: the lock file sits beside the seat file.
+        let d = format!("/tmp/ostiarius-test-{}-{}", std::process::id(), tag);
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        format!("{d}/active-session")
     }
 
     #[test]
@@ -602,6 +628,26 @@ mod tests {
         assert_eq!(handle(&mut o, login), Response::Ok { active: Some("alice".into()) });
         assert!(o.launcher.launched.iter().any(|s| s.app_id == "org.atrium.forum-wm"));
         assert_eq!(handle(&mut o, Request::Logout), Response::Ok { active: None });
+    }
+
+    #[test]
+    fn control_lock_and_unlock() {
+        use crate::control::{handle, Request, Response};
+        let path = seat_file("lock");
+        let mut o = Ostiarius::new(MockLauncher::default()).with_seat_path(path.clone());
+        assert!(matches!(handle(&mut o, Request::Lock), Response::Err { .. }), "nothing to lock");
+        let login = Request::Login { user: "alice".into(), password: "pw".into(), frontend: Frontend::Gui };
+        handle(&mut o, login);
+        assert_eq!(handle(&mut o, Request::Lock), Response::Ok { active: Some("alice".into()) });
+        assert!(seat::is_locked_at(&path));
+        // The dev stub refuses an empty credential.
+        assert!(matches!(handle(&mut o, Request::Unlock { password: "".into() }), Response::Err { .. }));
+        assert!(seat::is_locked_at(&path), "still locked");
+        handle(&mut o, Request::Unlock { password: "pw".into() });
+        assert!(!seat::is_locked_at(&path));
+        handle(&mut o, Request::Lock);
+        handle(&mut o, Request::Logout);
+        assert!(!seat::is_locked_at(&path), "logout clears the lock");
     }
 
     #[test]

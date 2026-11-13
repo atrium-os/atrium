@@ -11,6 +11,9 @@
 //!   `devfs_grant` = that node, plus `devfs_grants` for a device that is
 //!   several, no network, the driver's sysfil profile), holding its
 //!   procdesc; stops it when the device goes;
+//! - serves a partition (a `disk` rule's FUSE driver) only while a human
+//!   session is active and unlocked, as that human (media.rs); the session
+//!   ejects one through the media socket;
 //! - takes a USB interface from a kernel driver when a `usb` rule with
 //!   `detach_kernel` names it (`usbconfig ... detach_kernel_driver`);
 //! - leaves everything else hidden.
@@ -23,7 +26,12 @@
 //! atrium-dispensatord [--rules DIR] [--jaild-socket PATH] [--state FILE]
 //! atrium-dispensatord --check [--rules DIR]          validate, print, exit
 //! atrium-dispensatord --plan FILE [--devinfo FILE]   print the ops for devd lines
+//! atrium-dispensatord --media [--media-socket PATH]  list the partitions served
+//! atrium-dispensatord --eject PART [--media-socket PATH]
 //! ```
+//!
+//! The media socket takes one line, `list` or `eject PART`, from root or the
+//! active session's user, and answers `ok ...` or `error ...`.
 
 use std::path::PathBuf;
 use std::process::ExitCode;
@@ -34,6 +42,7 @@ use dispensator::rules::Rules;
 const RULES_DIR: &str = "/usr/local/etc/atrium/devices.d";
 const JAILD_SOCKET: &str = "/var/run/atrium/jaild.sock";
 const STATE_FILE: &str = "/var/run/atrium/dispensator.state";
+const MEDIA_SOCKET: &str = "/atrium/sockets/dispensatord/media.sock";
 
 struct Args {
     rules: PathBuf,
@@ -45,6 +54,10 @@ struct Args {
     /// Refuse rule files not owned by root or writable by others. On by
     /// default for the daemon; `--check` and `--plan` take files as they are.
     strict: bool,
+    seat: PathBuf,
+    media_socket: PathBuf,
+    /// Client: `list` or `eject PART`.
+    media_cmd: Option<String>,
 }
 
 fn args() -> Result<Args, String> {
@@ -56,6 +69,9 @@ fn args() -> Result<Args, String> {
         plan: None,
         devinfo: None,
         strict: true,
+        seat: dispensator::media::SEAT_FILE.into(),
+        media_socket: MEDIA_SOCKET.into(),
+        media_cmd: None,
     };
     let mut it = std::env::args().skip(1);
     while let Some(x) = it.next() {
@@ -67,6 +83,10 @@ fn args() -> Result<Args, String> {
             "--check" => a.check = true,
             "--plan" => a.plan = Some(val()?.into()),
             "--devinfo" => a.devinfo = Some(val()?.into()),
+            "--seat" => a.seat = val()?.into(),
+            "--media-socket" => a.media_socket = val()?.into(),
+            "--media" => a.media_cmd = Some("list".into()),
+            "--eject" => a.media_cmd = Some(format!("eject {}", val()?)),
             "-h" | "--help" => return Err(String::new()),
             _ => return Err(format!("unknown argument {x}")),
         }
@@ -88,6 +108,9 @@ fn main() -> ExitCode {
             return ExitCode::from(2);
         }
     };
+    if let Some(cmd) = &a.media_cmd {
+        return media_client(&a.media_socket, cmd);
+    }
     let rules = match Rules::load_dir(&a.rules, a.strict) {
         Ok(r) => r,
         Err(e) => {
@@ -136,13 +159,34 @@ fn main() -> ExitCode {
         print!("{}", pl.state());
         return ExitCode::SUCCESS;
     }
-    run::serve(rules, a.jaild, a.state)
+    run::serve(rules, a.jaild, a.state, a.seat, a.media_socket)
 }
+
+/// One request to the daemon's media socket; prints its answer.
+fn media_client(sock: &std::path::Path, cmd: &str) -> ExitCode {
+    use std::io::Write;
+    let mut s = match std::os::unix::net::UnixStream::connect(sock) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("atrium-dispensatord: {}: {e}", sock.display());
+            return ExitCode::FAILURE;
+        }
+    };
+    let _ = s.set_read_timeout(Some(std::time::Duration::from_secs(30)));
+    if writeln!(s, "{cmd}").is_err() {
+        return ExitCode::FAILURE;
+    }
+    let mut out = String::new();
+    let _ = std::io::Read::read_to_string(&mut s, &mut out);
+    print!("{out}");
+    if out.starts_with("ok") { ExitCode::SUCCESS } else { ExitCode::FAILURE }
+}
+
 
 #[cfg(not(target_os = "freebsd"))]
 mod run {
     use super::*;
-    pub fn serve(_: Rules, _: String, _: PathBuf) -> ExitCode {
+    pub fn serve(_: Rules, _: String, _: PathBuf, _: PathBuf, _: PathBuf) -> ExitCode {
         eprintln!("atrium-dispensatord: the daemon runs on FreeBSD only (--check and --plan work anywhere)");
         ExitCode::FAILURE
     }
@@ -158,7 +202,9 @@ mod run {
 
     use atrium_devevents::DeviceWatcher;
     use dispensator::jail::{plan, stop_names, JailPlan};
+    use dispensator::media::{Act, Media, Session};
     use dispensator::plan::{Op, Vars};
+    use std::os::unix::net::UnixListener;
     use jaild::client::Client;
     use jaild::protocol::{CreateJailRequest, ExecSpec, FuseServe, MountKind, MountSpec, NetworkConfig, Request, Response};
 
@@ -173,9 +219,12 @@ mod run {
         /// The last failure showing each (service, node), so a service that
         /// is down is logged once, not every reshow.
         show_errors: BTreeMap<(String, String), String>,
+        media: Media,
+        session: Session,
+        seat: PathBuf,
     }
 
-    pub fn serve(rules: Rules, jaild: String, state: PathBuf) -> ExitCode {
+    pub fn serve(rules: Rules, jaild: String, state: PathBuf, seat: PathBuf, media_socket: PathBuf) -> ExitCode {
         let reshow = rules.services.values().map(|s| s.reshow_secs).min().unwrap_or(2);
         let reshow = Duration::from_secs(reshow.into());
         eprintln!(
@@ -184,7 +233,10 @@ mod run {
             rules.drivers.len(),
             rules.services.len()
         );
-        let mut a = Agent { jaild, state, planner: Planner::new(rules), drivers: BTreeMap::new(), show_errors: BTreeMap::new() };
+        let media = if rules.drivers.values().any(|d| d.fuse_mount.is_some()) { media_listener(&media_socket) } else { None };
+        let mut a = Agent { jaild, state, planner: Planner::new(rules), drivers: BTreeMap::new(), show_errors: BTreeMap::new(), media: Media::default(), session: Session::None, seat };
+        a.session = a.read_session();
+        eprintln!("atrium-dispensatord: session {:?}", a.session);
         loop {
             // Listen first, then enumerate, so nothing falls between.
             let w = match DeviceWatcher::open() {
@@ -207,7 +259,7 @@ mod run {
             let dev: Vec<String> = std::fs::read_dir("/dev").map(|d| d.filter_map(|e| e.ok()?.file_name().into_string().ok()).collect()).unwrap_or_default();
             let ops = a.planner.disks_present(dev.iter().map(String::as_str));
             a.run(ops);
-            a.serve(&w, reshow);
+            a.serve(&w, media.as_ref(), reshow);
             eprintln!("atrium-dispensatord: devd connection lost; reconnecting");
         }
     }
@@ -225,17 +277,150 @@ mod run {
             .collect()
     }
 
+    /// The media socket: in a directory of its own, so it can be mounted
+    /// into the session; any local user may connect, the daemon checks who.
+    fn media_listener(path: &Path) -> Option<UnixListener> {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = path.parent()?;
+        let _ = std::fs::create_dir_all(dir);
+        let _ = std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o755));
+        let _ = std::fs::remove_file(path);
+        match UnixListener::bind(path) {
+            Ok(l) => {
+                let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o666));
+                let _ = l.set_nonblocking(true);
+                Some(l)
+            }
+            Err(e) => {
+                eprintln!("atrium-dispensatord: media socket {}: {e}", path.display());
+                None
+            }
+        }
+    }
+
+    /// A user name to (uid, gid), from the password database.
+    fn lookup_user(name: &str) -> Option<(u32, u32)> {
+        let c = std::ffi::CString::new(name).ok()?;
+        // SAFETY: c is a valid NUL-terminated name; the result points into
+        // libc's static buffer and is read at once on this thread.
+        let pw = unsafe { libc::getpwnam(c.as_ptr()) };
+        if pw.is_null() {
+            return None;
+        }
+        // SAFETY: non-null, as checked.
+        unsafe { Some(((*pw).pw_uid, (*pw).pw_gid)) }
+    }
+
     impl Agent {
-        fn serve(&mut self, w: &DeviceWatcher, reshow: Duration) {
+        fn read_session(&self) -> Session {
+            dispensator::media::read_session(&self.seat, lookup_user)
+        }
+
+        /// Re-read the session; on a change, make the media servers follow.
+        fn follow_session(&mut self) {
+            let s = self.read_session();
+            if s != self.session {
+                eprintln!("atrium-dispensatord: session {:?} -> {:?}", self.session, s);
+                self.session = s;
+                let acts = self.media.sync(&self.session);
+                self.act(acts);
+            }
+        }
+
+        fn act(&mut self, acts: Vec<Act>) {
+            for a in acts {
+                match a {
+                    Act::Start { driver, device, vars, nodes, label } => {
+                        let inst: Vars = vars.iter().filter(|(k, _)| k.as_str() == "part").map(|(k, v)| (k.clone(), v.clone())).collect();
+                        self.stop(&driver, &device, &inst);
+                        self.start(&driver, &device, &vars, &nodes, &label);
+                    }
+                    Act::Stop { driver, device, vars } => self.stop(&driver, &device, &vars),
+                }
+            }
+        }
+
+        /// One request on the media socket.
+        fn media_request(&mut self, l: &UnixListener) {
+            use std::io::{BufRead, BufReader, Write};
+            let Ok((mut c, _)) = l.accept() else { return };
+            let _ = c.set_nonblocking(false);
+            let _ = c.set_read_timeout(Some(Duration::from_secs(2)));
+            let (mut uid, mut gid) = (u32::MAX, u32::MAX);
+            // SAFETY: a connected socket and two out-parameters.
+            if unsafe { libc::getpeereid(c.as_raw_fd(), &mut uid, &mut gid) } != 0 {
+                return;
+            }
+            let mut line = String::new();
+            if BufReader::new(std::io::Read::take(&c, 256)).read_line(&mut line).is_err() {
+                return;
+            }
+            let allowed = uid == 0 || matches!(&self.session, Session::Active { uid: u, .. } if *u == uid);
+            let reply = if !allowed {
+                "error only the active session's user may do that".to_string()
+            } else {
+                match line.trim().split_once(' ').unwrap_or((line.trim(), "")) {
+                    ("list", "") => {
+                        let mut r = String::from("ok");
+                        for d in self.media.served() {
+                            r.push_str(&format!("\n{d} {}", self.mountpoint(d).unwrap_or_default()));
+                        }
+                        r
+                    }
+                    ("eject", dev) => self.eject(dev),
+                    _ => "error list | eject PART".into(),
+                }
+            };
+            let _ = writeln!(c, "{reply}");
+        }
+
+        fn mountpoint(&self, device: &str) -> Option<String> {
+            let d = self.planner.rules().drivers.get(self.media.driver_of(device)?)?;
+            dispensator::rules::fill(d.fuse_mount.as_deref()?, &[("part", Some(device.to_string()))])
+        }
+
+        /// Unmount without force first: a file still open fails the eject
+        /// instead of losing what the program has not written yet. Then the
+        /// server stops (its final writes are done) and stays down until the
+        /// stick is unplugged.
+        fn eject(&mut self, device: &str) -> String {
+            let Some(mnt) = self.mountpoint(device) else { return format!("error {device} is not served") };
+            if let Ok(c) = std::ffi::CString::new(mnt.as_str()) {
+                // SAFETY: a valid NUL-terminated path.
+                if unsafe { libc::unmount(c.as_ptr(), 0) } != 0 {
+                    let e = std::io::Error::last_os_error();
+                    if e.raw_os_error() == Some(libc::EBUSY) {
+                        return format!("error {mnt} is busy: close the files open on it first");
+                    }
+                    if e.raw_os_error() != Some(libc::EINVAL) {
+                        return format!("error unmount {mnt}: {e}");
+                    }
+                }
+            }
+            let (_, acts) = self.media.eject(device, &self.session);
+            self.act(acts);
+            eprintln!("atrium-dispensatord: {device} ejected");
+            format!("ok {device} ejected; it can be unplugged")
+        }
+
+        fn serve(&mut self, w: &DeviceWatcher, media: Option<&UnixListener>, reshow: Duration) {
             let mut last = Instant::now();
             loop {
-                let mut p = libc::pollfd { fd: w.as_raw_fd(), events: libc::POLLIN, revents: 0 };
-                // SAFETY: one valid pollfd.
-                let r = unsafe { libc::poll(&mut p, 1, reshow.as_millis() as libc::c_int) };
+                let mut p = [
+                    libc::pollfd { fd: w.as_raw_fd(), events: libc::POLLIN, revents: 0 },
+                    libc::pollfd { fd: media.map_or(-1, |l| l.as_raw_fd()), events: libc::POLLIN, revents: 0 },
+                ];
+                // SAFETY: two valid pollfds (a negative fd is ignored).
+                let r = unsafe { libc::poll(p.as_mut_ptr(), 2, reshow.as_millis() as libc::c_int) };
                 if r < 0 && std::io::Error::last_os_error().kind() != std::io::ErrorKind::Interrupted {
                     return;
                 }
-                if r > 0 {
+                if r > 0 && p[1].revents != 0 {
+                    if let Some(l) = media {
+                        self.media_request(l);
+                    }
+                }
+                if r > 0 && p[0].revents != 0 {
                     match w.recv_line() {
                         Ok(line) => {
                             let ops = self.planner.line(&line);
@@ -246,6 +431,7 @@ mod run {
                 }
                 if last.elapsed() >= reshow {
                     last = Instant::now();
+                    self.follow_session();
                     let mut ops = Vec::new();
                     for s in self.planner.rules().services.keys() {
                         ops.extend(self.planner.service_nodes(s).map(|n| Op::Show { service: s.clone(), node: n.to_string() }));
@@ -260,6 +446,14 @@ mod run {
             for op in ops {
                 match op {
                     Op::Show { service, node } => self.show(&service, &node),
+                    Op::StartDriver { driver, device, vars, nodes, label } if self.is_media(&driver) => {
+                        let acts = self.media.add(&driver, &device, vars, nodes, label, &self.session);
+                        self.act(acts);
+                    }
+                    Op::StopDriver { driver, device, .. } if self.media.has(&driver, &device) => {
+                        let acts = self.media.remove(&driver, &device);
+                        self.act(acts);
+                    }
                     Op::StartDriver { driver, device, vars, nodes, label } => {
                         let inst: Vars = vars.iter().filter(|(k, _)| dispensator::rules::INSTANCE_VARS.contains(&k.as_str())).map(|(k, v)| (k.clone(), v.clone())).collect();
                         self.stop(&driver, &device, &inst);
@@ -276,6 +470,10 @@ mod run {
                     let _ = std::fs::rename(&tmp, &self.state);
                 }
             }
+        }
+
+        fn is_media(&self, driver: &str) -> bool {
+            self.planner.rules().drivers.get(driver).is_some_and(|d| d.fuse_mount.is_some())
         }
 
         fn show(&mut self, service: &str, node: &str) {

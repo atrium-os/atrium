@@ -593,10 +593,7 @@ instance) and `{disk}`. A disk goes only to a driver with `fuse_mount`
 disks: its node becomes the request's `fuse`, not a devfs grant. A whole
 disk without a partition table (superfloppy) is not matched yet.
 
-No production rule ships yet: whose files they are (the session user),
-nothing mounted while the session is locked, and the nullfs view into the
-session are the removable-media service's job (storage.md §8.5); until it
-exists the mechanism runs only under the gate. `scripts/vm-fuse-check.sh`
+Auto-mount (session owner, lock, eject) followed the same day: §6.5. `scripts/vm-fuse-check.sh`
 (FreeBSD VM): a FAT32 volume on md(4) served through jaild and jclient
 (reads, writes, renames, a 2 MiB file, the session uid, fds 3/4 only, no
 node in the jail, fsck_msdosfs clean, msdosfs reads it back), read-only
@@ -611,6 +608,59 @@ tests (87) and jaild-policy's (9) pass on FreeBSD.
 
 Next: exFAT writes, a whole-disk (superfloppy) case,
 and the removable-media service (session owner, lock, eject).
+
+### 6.5 As built: auto-mount for the session (2026-11-13)
+
+Shankar 2026-11-13: "do the auto-mount". dispensatord does the
+removable-media service's job itself (`dispensator::media`), since it
+already owns the partitions:
+
+- **Who.** A partition goes to a FUSE driver only while a human session is
+  active and unlocked, read from ostiarius's seat file
+  (`/atrium/sockets/ostiarius/active-session`) and the lock file beside it
+  (`session-locked`, naming the locked user; a lock naming someone else is
+  stale and ignored). The driver's argv takes `{session_uid}` and
+  `{session_gid}`, allowed only for FUSE drivers; root or an unknown name is
+  no session. Plugged in at the login screen: parked until login.
+- **Private.** The shipped server runs with `--umask 077`, so the volume is
+  0700/0600 and, with `default_permissions`, only the session's user (and
+  root) can open it.
+- **Follows the session.** The daemon re-reads the two files every tick
+  (2 s). Lock, logout and a user switch stop every server (jaild's forced
+  unmount); unlock and login start them again; a switch restarts them as
+  the new user.
+- **Eject.** `/atrium/sockets/dispensatord/media.sock` takes `list` or
+  `eject PART` from root or the active session's uid
+  (`getpeereid`); `atrium-dispensatord --media` / `--eject PART` is the
+  client. Eject unmounts without force first, so an open file answers
+  "busy" instead of losing data, then stops the server; the partition stays
+  down (across relogins) until it is unplugged.
+- **ostiarius.** `Lock` and `Unlock { password }` requests on its control
+  socket set the lock file; unlock re-authenticates the active user; login
+  and logout clear it. The lock screen itself is not built yet; it will
+  send these.
+- **Shipped.** `capsa/etc/devices.d/50-capsa.toml` (every `da` partition,
+  GPT or MBR, to driver `capsa`, mounted at `/media/<part>`), devfs ruleset
+  `atrium_capsa=31` (basics only), jaild pin 31 (`atrium-capsa-*`, uid
+  `_capsa` 65031, `fuse_devices = ["da#p#", "da#s#"]` under `/media`), and
+  `scripts/capsa-service.sh` (user, fusefs at boot, binary, rule). Internal
+  disks (`ada`, `nda`) never match.
+
+Gate `scripts/vm-automount-check.sh` (amd64 VM, a QEMU usb-storage stick
+with an MBR FAT32 partition, hot-plugged): **passed** 2026-11-13. Nothing
+mounted at the login screen; on login `/media/da0s1` is alice's alone
+(0700), reads the file on the stick, takes her write, and bob cannot list
+it; lock unmounts and ends the server's jail, unlock brings it back; bob may
+not eject, an open file makes the eject "busy", alice's eject works and
+holds across a relogin until a replug; a switch to bob serves it as bob;
+logout unmounts; afterwards fsck.fat finds the stick clean with alice's
+file on it. Host tests: dispensator 20 (session following, eject, the
+shipped rule); ostiarius 17 and portcullis-peer 9 on FreeBSD.
+
+Not yet: the session's apps see `/media` through their jails only where a
+manifest grants it (storage.md `removable_media`, not wired); a whole-disk
+(superfloppy) stick; exFAT writes; the lock screen and a Forum eject button
+as the callers.
 
 ## 7. Not in scope
 

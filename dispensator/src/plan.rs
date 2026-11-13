@@ -419,6 +419,7 @@ mod tests {
         r.add_toml("l", include_str!("../../lyra/etc/devices.d/35-lyra.toml")).unwrap();
         r.add_toml("t", include_str!("../../tactus/etc/devices.d/30-tactus.toml")).unwrap();
         r.add_toml("s", include_str!("../../sigillum/etc/devices.d/40-sigillum.toml")).unwrap();
+        r.add_toml("c", include_str!("../../capsa/etc/devices.d/50-capsa.toml")).unwrap();
         r.finish().unwrap()
     }
 
@@ -590,7 +591,7 @@ owner = "driver:t-capsa"
 
 [driver.t-capsa]
 exec           = "/usr/local/bin/atrium-capsa-fuse"
-argv           = ["atrium-capsa-fuse", "--dev-fd", "3", "--fuse-fd", "4"]
+argv           = ["atrium-capsa-fuse", "--dev-fd", "3", "--fuse-fd", "4", "--uid", "{session_uid}"]
 uid            = 65070
 gid            = 65070
 jail           = "atrium-capsa-{part}"
@@ -614,7 +615,11 @@ fuse_mount     = "/media/{part}"
         assert_eq!((driver.as_str(), device.as_str(), nodes.as_slice()), ("t-capsa", "da0p1", &["da0p1".to_string()][..]));
         assert_eq!(vars.get("disk").map(String::as_str), Some("da0"));
         let d = &p.rules().drivers["t-capsa"];
-        let j = crate::jail::plan(d, vars, nodes).unwrap();
+        assert!(crate::jail::plan(d, vars, nodes).is_none(), "no session, no server");
+        let mut vars = vars.clone();
+        vars.insert("session_uid".into(), "1001".into());
+        let j = crate::jail::plan(d, &vars, nodes).unwrap();
+        assert_eq!(j.argv.last().map(String::as_str), Some("1001"));
         assert_eq!(j.name, "atrium-capsa-da0p1");
         assert!(j.devfs_grants.is_empty(), "the jail never sees the partition");
         assert_eq!(j.fuse, Some(("da0p1".into(), "/media/da0p1".into(), false)));
@@ -627,6 +632,26 @@ fuse_mount     = "/media/{part}"
         assert!(p.line(&ev("DESTROY", "da0p1")).is_empty());
         let ops = p.disks_present(["null", "md99", "md99p1", "ada0p2", "da1s2"]);
         assert_eq!(ops.len(), 1, "md99p1 is new, da1s2 already running: {ops:?}");
+    }
+
+    /// The shipped rule: USB disk partitions only, never an md or ada.
+    #[test]
+    fn shipped_capsa_rule() {
+        let mut p = Planner::new(shipped());
+        let ev = |n: &str| format!("!system=GEOM subsystem=DEV type=CREATE cdev={n}");
+        let ops = p.line(&ev("da0s1"));
+        let [Op::StartDriver { driver, vars, nodes, .. }] = ops.as_slice() else { panic!("{ops:?}") };
+        assert_eq!(driver, "capsa");
+        let mut v = vars.clone();
+        v.insert("session_uid".into(), "1001".into());
+        v.insert("session_gid".into(), "1001".into());
+        let j = crate::jail::plan(&p.rules().drivers["capsa"], &v, nodes).unwrap();
+        assert_eq!((j.name.as_str(), j.devfs_ruleset, j.uid), ("atrium-capsa-da0s1", 31, 65031));
+        assert_eq!(j.fuse, Some(("da0s1".into(), "/media/da0s1".into(), false)));
+        assert!(j.argv.windows(2).any(|w| w == ["--umask", "077"]) && j.argv.windows(2).any(|w| w == ["--uid", "1001"]));
+        for n in ["md0p1", "ada0p1", "nda0p1", "da0"] {
+            assert!(p.line(&ev(n)).is_empty(), "{n}");
+        }
     }
 
     #[test]

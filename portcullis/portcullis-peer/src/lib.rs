@@ -355,11 +355,56 @@ pub mod seat {
             .map(|s| s.trim().to_string())
             .filter(|s| !s.is_empty())
     }
+
+    /// The active session's lock: the file names the locked human, and is
+    /// empty or absent while the session is in use. Beside the seat, for the
+    /// same reason. Readers act on it at once: removable media is unmounted
+    /// while it names the active user (device-assignment.md §4.6).
+    pub const LOCKED: &str = "/atrium/sockets/ostiarius/session-locked";
+
+    /// The lock file that goes with the seat file at `seat_path`.
+    pub fn locked_path(seat_path: &str) -> std::path::PathBuf {
+        std::path::Path::new(seat_path).with_file_name("session-locked")
+    }
+
+    /// Mark `user`'s session locked, or (`None`) in use.
+    pub fn set_locked_at(path: &std::path::Path, user: Option<&str>) -> io::Result<()> {
+        std::fs::write(path, format!("{}\n", user.unwrap_or("")))
+    }
+
+    /// Is the session at `seat_path` locked? Only a lock naming the seat's
+    /// own user counts, so a stale lock from an earlier session is ignored.
+    pub fn is_locked_at(seat_path: &str) -> bool {
+        match (active_at(seat_path), active_at(&locked_path(seat_path).to_string_lossy())) {
+            (Some(a), Some(l)) => a == l,
+            _ => false,
+        }
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn seat_lock_names_its_user() {
+        let d = std::env::temp_dir().join(format!("peer-seat-{}", std::process::id()));
+        std::fs::create_dir_all(&d).unwrap();
+        let seat_path = d.join("active-session");
+        let seat_s = seat_path.to_str().unwrap();
+        let lock = seat::locked_path(seat_s);
+        assert_eq!(lock, d.join("session-locked"));
+        assert!(!seat::is_locked_at(seat_s), "no seat, no lock");
+        seat::set_active_at(seat_s, "alice").unwrap();
+        assert!(!seat::is_locked_at(seat_s));
+        seat::set_locked_at(&lock, Some("alice")).unwrap();
+        assert!(seat::is_locked_at(seat_s));
+        seat::set_active_at(seat_s, "bob").unwrap();
+        assert!(!seat::is_locked_at(seat_s), "alice's lock is not bob's");
+        seat::set_locked_at(&lock, None).unwrap();
+        assert!(!seat::is_locked_at(seat_s));
+        let _ = std::fs::remove_dir_all(&d);
+    }
 
     #[test]
     fn allocation_skips_system_accounts_in_the_range() {
