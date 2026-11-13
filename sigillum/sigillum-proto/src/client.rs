@@ -29,6 +29,9 @@ pub enum Attestation {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Register {
     pub ceremony: CeremonyId,
+    /// The site's `timeout` (WebAuthn `options.timeout`), in ms; 0 when the
+    /// site gave none. sigillumd keeps it within 30 s to 10 min.
+    pub timeout_ms: u32,
     pub rp_id: String,
     pub rp_name: String,
     pub client_data_hash: [u8; 32],
@@ -44,6 +47,8 @@ pub struct Register {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Assert {
     pub ceremony: CeremonyId,
+    /// As [`Register::timeout_ms`].
+    pub timeout_ms: u32,
     pub rp_id: String,
     pub client_data_hash: [u8; 32],
     pub allow: Vec<Vec<u8>>,

@@ -297,8 +297,17 @@ each:
    `sigillumd` checks the result (§14.2) and answers.
 
 - One ceremony per seat at a time; a second waits or gets `BUSY`.
-- A ceremony ends after 120 s (WebAuthn's default upper bound), on the client closing its
-  connection, or on Cancel from the sheet. Ending sends `CANCEL` to every driver involved.
+- A ceremony ends at its limit, on the client closing its connection, or on Cancel from the
+  sheet. Ending sends `CANCEL` to every driver involved. The limit is the site's own
+  `timeout` (passed through as `timeout_ms`) kept within 30 s and 10 min, or 5 min when the
+  site names none (WebAuthn's suggested default and ceiling); `VerifyUser` uses 5 min.
+  (Amended 2026-11-13 from a fixed 120 s, after Shankar asked why sign-ins time out.)
+- Three clocks can end a sign-in, and only this one is ours: the site's (above, honoured),
+  the site's server, which accepts its one-time challenge only for a while (not ours to
+  change), and the key's own touch wait (about 30 s on a CTAP2 key; a U2F key answers "not
+  yet" until touched). The driver asks the key again when the key's wait runs out, while
+  the ceremony lasts, so the key's clock never ends a ceremony; the sheet stays up. PIN
+  entry happens before the request reaches the key, so it never counts against the key.
 - `sigillumd` keeps no history of ceremonies beyond Arca-style audit lines (who asked, RP,
   device class, result, time); values are never logged.
 

@@ -122,6 +122,7 @@ fn cdh(s: &str) -> [u8; 32] {
 fn register(rp: &str, uv: Uv) -> Request {
     Request::Register(Register {
         ceremony: 1,
+        timeout_ms: 0,
         rp_id: rp.into(),
         rp_name: "Example".into(),
         client_data_hash: cdh("create"),
@@ -136,7 +137,7 @@ fn register(rp: &str, uv: Uv) -> Request {
 }
 
 fn assert_req(rp: &str, allow: Vec<Vec<u8>>, uv: Uv) -> Request {
-    Request::Assert(Assert { ceremony: 2, rp_id: rp.into(), client_data_hash: cdh("get"), allow, uv })
+    Request::Assert(Assert { ceremony: 2, timeout_ms: 0, rp_id: rp.into(), client_data_hash: cdh("get"), allow, uv })
 }
 
 /// The relying party's side: what a server does with the reply.
@@ -242,6 +243,38 @@ fn nothing_reaches_the_key_without_a_valid_press() {
     r.run(a);
     assert_eq!(r.reply(), Reply::Refused { ceremony: 1, reason: Refusal::NotAllowed });
     assert_eq!(r.key.borrow().commands.len(), before);
+}
+
+#[test]
+fn a_key_whose_own_touch_wait_runs_out_is_asked_again() {
+    let mut r = Rig::new(SoftKey::new(None));
+    r.key.borrow_mut().slow_touch = 2;
+    r.request(&web_broker(), register("example.com", Uv::Discouraged));
+    r.press_last(Choice::Device(DEV));
+    assert!(matches!(r.reply(), Reply::Registered { .. }), "registered on the third ask");
+    assert_eq!(r.key.borrow().slow_touch, 0);
+}
+
+#[test]
+fn the_sites_timeout_sets_the_limit_within_bounds() {
+    use sigillumd::broker::{ceremony_limit, CEREMONY_MS, MAX_CEREMONY_MS, MIN_CEREMONY_MS};
+    assert_eq!(ceremony_limit(0, CEREMONY_MS), CEREMONY_MS, "none given: the default");
+    assert_eq!(ceremony_limit(5_000, CEREMONY_MS), MIN_CEREMONY_MS, "too short to find a key");
+    assert_eq!(ceremony_limit(90_000, CEREMONY_MS), 90_000);
+    assert_eq!(ceremony_limit(u32::MAX, CEREMONY_MS), MAX_CEREMONY_MS);
+    // A site that asks for 60 s gets 60 s, not the default.
+    let mut r = Rig::new(SoftKey::new(None));
+    let mut req = register("example.com", Uv::Discouraged);
+    if let Request::Register(x) = &mut req {
+        x.timeout_ms = 60_000;
+    }
+    r.request(&web_broker(), req);
+    let a = r.broker.tick(59_999);
+    r.run(a);
+    assert!(r.replies.is_empty(), "still open just before");
+    let a = r.broker.tick(60_000);
+    r.run(a);
+    assert_eq!(r.reply(), Reply::Refused { ceremony: 1, reason: Refusal::NotAllowed });
 }
 
 #[test]

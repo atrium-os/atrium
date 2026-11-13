@@ -60,6 +60,16 @@ impl Touch {
     }
 }
 
+/// How long the driver keeps asking a key for a touch: past any ceremony's
+/// limit (sigillumd's `MAX_CEREMONY_MS`, 10 min), which ends it first with a
+/// `Cancel`. A key gives up on its own after about 30 s (CTAP2
+/// `USER_ACTION_TIMEOUT`; a U2F key answers "not yet" until touched), so
+/// the driver asks again while the ceremony lasts: the sheet stays up and
+/// the user is not cut off by the key's clock. Time spent typing a PIN is
+/// before the request reaches the key, so it never counts against the key.
+const TOUCH_WAIT: std::time::Duration = std::time::Duration::from_secs(660);
+const U2F_POLLS: u32 = (TOUCH_WAIT.as_millis() / 200) as u32;
+
 /// CTAPHID keepalive status: waiting for the user's touch.
 const KEEPALIVE_UPNEEDED: u8 = 2;
 
@@ -108,7 +118,7 @@ impl<D: HidDevice> Driver<D> {
                     hmac_secret: false,
                 }),
             };
-            return Ok((Driver { client, info: None, u2f_poll: std::time::Duration::from_millis(200), u2f_polls: 150, touch }, hello));
+            return Ok((Driver { client, info: None, u2f_poll: std::time::Duration::from_millis(200), u2f_polls: U2F_POLLS, touch }, hello));
         }
         let info = client.get_info()?;
         let opt = |k| info.option(k).unwrap_or(false);
@@ -127,7 +137,7 @@ impl<D: HidDevice> Driver<D> {
                 hmac_secret: ext("hmac-secret"),
             }),
         };
-        Ok((Driver { client, info: Some(info), u2f_poll: std::time::Duration::from_millis(200), u2f_polls: 150, touch }, hello))
+        Ok((Driver { client, info: Some(info), u2f_poll: std::time::Duration::from_millis(200), u2f_polls: U2F_POLLS, touch }, hello))
     }
 
     /// Run one request to its record. Nothing here blocks on the user
@@ -240,7 +250,7 @@ impl<D: HidDevice> Driver<D> {
             eprintln!("sigillum-fido: refusing the authenticator's credential: {why}");
             FromDriver::Error { ceremony, error: DriverError::Device }
         };
-        let att = match self.client.make_credential(&req) {
+        let att = match self.until_touched(|c| c.make_credential(&req)) {
             Ok(a) => a,
             Err(e) => return FromDriver::Error { ceremony, error: map_err(e) },
         };
@@ -278,7 +288,7 @@ impl<D: HidDevice> Driver<D> {
         };
         let uv = pin_auth.is_some();
         let req = GetAssertion { rp_id: rp_id.clone(), client_data_hash: cdh, allow, up: true, pin_auth };
-        let a = match self.client.get_assertion(&req) {
+        let a = match self.until_touched(|c| c.get_assertion(&req)) {
             Ok(a) => a,
             // Parse failures include "a credential we did not allow".
             Err(e) => return FromDriver::Error { ceremony, error: map_err(e) },
@@ -297,6 +307,20 @@ impl<D: HidDevice> Driver<D> {
             auth_data: a.auth_data_raw,
             signature: a.signature,
             user_handle: a.user_id,
+        }
+    }
+}
+
+impl<D: HidDevice> Driver<D> {
+    /// Run a CTAP2 command that waits for a touch, asking again when the
+    /// key's own wait runs out (see [`TOUCH_WAIT`]).
+    fn until_touched<T>(&mut self, mut f: impl FnMut(&mut Client<D>) -> Result<T, Error>) -> Result<T, Error> {
+        let start = std::time::Instant::now();
+        loop {
+            match f(&mut self.client) {
+                Err(Error::Status(status::USER_ACTION_TIMEOUT)) if !self.client.cancelled() && start.elapsed() < TOUCH_WAIT => continue,
+                r => return r,
+            }
         }
     }
 }

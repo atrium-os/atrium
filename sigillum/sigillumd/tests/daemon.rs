@@ -120,6 +120,7 @@ fn cdh(s: &str) -> [u8; 32] {
 fn register(id: u64) -> Request {
     Request::Register(Register {
         ceremony: id,
+        timeout_ms: 0,
         rp_id: "example.com".into(),
         rp_name: "Example".into(),
         client_data_hash: cdh("create"),
@@ -151,7 +152,7 @@ fn register_then_assert_over_sockets() {
     let Reply::Registered { ceremony: 7, cred_id, auth_data, .. } = reply else { panic!("{reply:?}") };
     assert_eq!(auth_data[..32], cdh("example.com"));
 
-    let reply = ask(&mut c, &Request::Assert(Assert { ceremony: 8, rp_id: "example.com".into(), client_data_hash: cdh("get"), allow: vec![cred_id.clone()], uv: Uv::Required }));
+    let reply = ask(&mut c, &Request::Assert(Assert { ceremony: 8, timeout_ms: 0, rp_id: "example.com".into(), client_data_hash: cdh("get"), allow: vec![cred_id.clone()], uv: Uv::Required }));
     let Reply::Asserted { ceremony: 8, cred_id: used, auth_data, .. } = reply else { panic!("{reply:?}") };
     assert_eq!(used, cred_id);
     assert!(auth_data[32] & 0x04 != 0, "UV via the PIN typed on the sheet");

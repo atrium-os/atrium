@@ -35,7 +35,22 @@ pub type DeviceId = u64;
 /// client's id, so two clients' ids can't collide at a driver.
 pub type Key = u64;
 
-pub const CEREMONY_MS: u64 = 120_000;
+/// A ceremony's limit when the site names none, and for `VerifyUser`
+/// (WebAuthn's suggested default).
+pub const CEREMONY_MS: u64 = 300_000;
+/// What a site's own timeout is kept within: long enough to find the key
+/// and type a PIN, no longer than WebAuthn's suggested ceiling.
+pub const MIN_CEREMONY_MS: u64 = 30_000;
+pub const MAX_CEREMONY_MS: u64 = 600_000;
+
+/// How long a ceremony may last: the site's timeout kept within
+/// [`MIN_CEREMONY_MS`]..=[`MAX_CEREMONY_MS`], or `default` if it gave none.
+pub fn ceremony_limit(requested_ms: u32, default: u64) -> u64 {
+    match requested_ms {
+        0 => default,
+        t => (t as u64).clamp(MIN_CEREMONY_MS, MAX_CEREMONY_MS),
+    }
+}
 
 const UP: u8 = 0x01;
 const UV: u8 = 0x04;
@@ -90,7 +105,8 @@ struct Ceremony {
     rp_hash: [u8; 32],
     uv_required: bool,
     state: State,
-    started: u64,
+    /// When it ends with `NotAllowed` if still open (ms, the daemon's clock).
+    deadline: u64,
     device: Option<DeviceId>,
 }
 
@@ -153,7 +169,8 @@ impl Broker {
         }
     }
 
-    fn start(&mut self, conn: ConnId, id: CeremonyId, kind: Kind, rp_id: &str, uv_required: bool, now: u64, sheet: Sheet) -> Vec<Action> {
+    #[allow(clippy::too_many_arguments)]
+    fn start(&mut self, conn: ConnId, id: CeremonyId, kind: Kind, rp_id: &str, uv_required: bool, now: u64, limit_ms: u64, sheet: Sheet) -> Vec<Action> {
         let key = self.next_key;
         self.next_key += 1;
         let audit = Action::Audit(format!("start key={key} conn={conn} {:?}", sheet));
@@ -166,7 +183,7 @@ impl Broker {
                 rp_hash: Sha256::digest(rp_id.as_bytes()).into(),
                 uv_required,
                 state: State::AwaitingPress,
-                started: now,
+                deadline: now.saturating_add(limit_ms),
                 device: None,
             },
         );
@@ -208,7 +225,8 @@ impl Broker {
                 let sheet = Sheet::Register { requester: who, rp_id: r.rp_id.clone(), user_name: r.user_name.clone() };
                 let rp = r.rp_id.clone();
                 let uv = r.uv == Uv::Required;
-                self.start(conn, id, Kind::Register(r), &rp, uv, now, sheet)
+                let limit = ceremony_limit(r.timeout_ms, self.cfg.ceremony_ms);
+                self.start(conn, id, Kind::Register(r), &rp, uv, now, limit, sheet)
             }
             Request::Assert(a) => {
                 if let Err(e) = self.may_use_rp(label, &a.rp_id) {
@@ -220,7 +238,8 @@ impl Broker {
                 let sheet = Sheet::Assert { requester: who, rp_id: a.rp_id.clone() };
                 let rp = a.rp_id.clone();
                 let uv = a.uv == Uv::Required;
-                self.start(conn, id, Kind::Assert(a), &rp, uv, now, sheet)
+                let limit = ceremony_limit(a.timeout_ms, self.cfg.ceremony_ms);
+                self.start(conn, id, Kind::Assert(a), &rp, uv, now, limit, sheet)
             }
             Request::VerifyUser(v) => {
                 if !matches!(label, Label::Arca | Label::Ostiarius) {
@@ -233,7 +252,8 @@ impl Broker {
                     return vec![refused(conn, id, Refusal::Malformed)];
                 }
                 let sheet = Sheet::Verify { requester: who, user: v.user.clone(), purpose: v.purpose.clone() };
-                self.start(conn, id, Kind::Verify(v), "", false, now, sheet)
+                let limit = self.cfg.ceremony_ms;
+                self.start(conn, id, Kind::Verify(v), "", false, now, limit, sheet)
             }
             Request::Cancel { .. } => unreachable!(),
         }
@@ -445,7 +465,7 @@ impl Broker {
 
     pub fn tick(&mut self, now: u64) -> Vec<Action> {
         let expired: Vec<Key> =
-            self.ceremonies.iter().filter(|(_, c)| now.saturating_sub(c.started) >= self.cfg.ceremony_ms).map(|(k, _)| *k).collect();
+            self.ceremonies.iter().filter(|(_, c)| now >= c.deadline).map(|(k, _)| *k).collect();
         let mut out = Vec::new();
         for k in expired {
             let id = self.ceremonies[&k].id;

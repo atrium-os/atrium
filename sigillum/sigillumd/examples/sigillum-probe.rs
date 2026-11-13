@@ -63,6 +63,7 @@ fn main() -> ExitCode {
                 &sock(3, client::SOCKET),
                 &Request::Register(Register {
                     ceremony: 1,
+                    timeout_ms: 0,
                     rp_id: rp.clone(),
                     rp_name: rp.clone(),
                     client_data_hash: Sha256::digest(b"create").into(),
@@ -100,7 +101,7 @@ fn main() -> ExitCode {
             let cdh: [u8; 32] = Sha256::digest(b"get").into();
             let r = ask(
                 &sock(3, client::SOCKET),
-                &Request::Assert(Assert { ceremony: 2, rp_id: rp.clone(), client_data_hash: cdh, allow: vec![cred.clone()], uv: Uv::Discouraged }),
+                &Request::Assert(Assert { ceremony: 2, timeout_ms: 0, rp_id: rp.clone(), client_data_hash: cdh, allow: vec![cred.clone()], uv: Uv::Discouraged }),
             );
             let Reply::Asserted { cred_id, auth_data, signature, .. } = &r else {
                 println!("assert: {r:?}");

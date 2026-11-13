@@ -65,6 +65,9 @@ pub struct SoftKey {
     sign_count: u32,
     /// Whether the simulated user touches the key when asked.
     pub touch: bool,
+    /// How many touch waits run out first (CTAP2 `USER_ACTION_TIMEOUT`, as
+    /// a real key answers after about 30 s with no touch).
+    pub slow_touch: u32,
     /// Send a keepalive (`UP_NEEDED`) before each answer that needed a touch.
     pub keepalives: bool,
     pub lie: Option<Lie>,
@@ -108,6 +111,7 @@ impl SoftKey {
             creds: Vec::new(),
             sign_count: 0,
             touch: true,
+            slow_touch: 0,
             keepalives: true,
             lie: None,
             commands: Vec::new(),
@@ -315,6 +319,10 @@ impl SoftKey {
             // The spec asks for a touch first, so excluded-ness can't be probed.
             return Err(Error::Status(if self.touch { status::CREDENTIAL_EXCLUDED } else { status::OPERATION_DENIED }));
         }
+        if self.slow_touch > 0 {
+            self.slow_touch -= 1;
+            return Err(Error::Status(status::USER_ACTION_TIMEOUT));
+        }
         if !self.touch {
             return Err(Error::Status(status::OPERATION_DENIED));
         }
@@ -369,6 +377,10 @@ impl SoftKey {
         let Some(&first) = matching.first() else {
             return Err(Error::Status(status::NO_CREDENTIALS));
         };
+        if req.up && self.slow_touch > 0 {
+            self.slow_touch -= 1;
+            return Err(Error::Status(status::USER_ACTION_TIMEOUT));
+        }
         if req.up && !self.touch {
             return Err(Error::Status(status::OPERATION_DENIED));
         }
