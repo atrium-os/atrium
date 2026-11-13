@@ -40,6 +40,23 @@
  */
 static struct mtx gmc12_inv_mtx;
 MTX_SYSINIT(gmc12_inv, &gmc12_inv_mtx, "gmc12 inv", MTX_DEF);
+/*
+ * From a mode 1 reset until the next GART enable the card is cold: its hub
+ * registers read 0 and an invalidation never acks (box run 64f44616: 8
+ * timeouts from BO frees during a re-init). Nothing translated survives the
+ * reset and bus mastering is off, so a flush then has nothing to do.
+ * Guarded by gmc12_inv_mtx: a flush under way when the reset starts ends
+ * first.
+ */
+static bool gmc12_cold;
+
+void
+amd_gmc12_cold(void)
+{
+	mtx_lock(&gmc12_inv_mtx);
+	gmc12_cold = true;
+	mtx_unlock(&gmc12_inv_mtx);
+}
 
 /*
  * Wedge diagnosis (runs 8f3d4517, 8e13d8ce): GCVM_L2_STATUS L2_BUSY was
@@ -505,6 +522,10 @@ amd_gmc12_flush(struct amd_gart *gt)
 	int err = 0;
 
 	mtx_lock(&gmc12_inv_mtx);
+	if (gmc12_cold) {
+		mtx_unlock(&gmc12_inv_mtx);
+		return (0);
+	}
 	flush_mark(0, true);
 	amd_hdp_flush(gt->sc);
 	if (hub_open(gt->sc, false, &mm) && hub_flush(&mm, 0) != 0)
@@ -581,6 +602,9 @@ amd_gmc12_gart_enable(struct atrium_amd_softc *sc, struct resource *vram,
 
 	hub_report(&mm, "before");
 	hub_report(&gfx, "before");
+	mtx_lock(&gmc12_inv_mtx);
+	gmc12_cold = false;
+	mtx_unlock(&gmc12_inv_mtx);
 	hub_gart_enable(&mm, gt);
 	hub_gart_enable(&gfx, gt);
 	err = amd_gmc12_flush(gt);
@@ -1034,6 +1058,10 @@ amd_gmc12_vm_flush(struct amd_gart *gt, u_int vmid)
 	if (vmid >= NUM_CTX)
 		return (EINVAL);
 	mtx_lock(&gmc12_inv_mtx);
+	if (gmc12_cold) {
+		mtx_unlock(&gmc12_inv_mtx);
+		return (0);
+	}
 	flush_mark(vmid, true);
 	amd_hdp_flush(gt->sc);
 	if (hub_open(gt->sc, false, &mm) && hub_flush(&mm, vmid) != 0) {

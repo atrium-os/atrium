@@ -686,6 +686,8 @@ amd_smu_mode1_reset(struct atrium_amd_softc *sc)
 	if (memsize + 4 > lim)
 		return (ENOTSUP);
 
+	/* No TLB invalidation reaches the card until its GART is back. */
+	amd_gmc12_cold();
 	device_printf(sc->dev, "smu: mode 1 reset (card back to its "
 	    "post-POST state)\n");
 	pci_save_state(sc->dev);

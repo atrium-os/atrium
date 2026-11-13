@@ -58,6 +58,7 @@
 #include <sys/param.h>
 #include <pthread.h>
 #include <setjmp.h>
+#include <stdbool.h>
 #include <stdatomic.h>
 #include <sys/stat.h>
 #include <grp.h>
@@ -184,6 +185,25 @@ reinits(void)
 	if (n < 0)
 		return (-1);
 	return (ri < 0 ? -2 : ri);
+}
+
+/*
+ * A queue's work fails with EIO a moment before the driver shows the card
+ * lost (si_recover fails every queue's work, then resets): wait up to 20 s
+ * for the count to move before blaming the failure on the queue alone.
+ * True if no re-init came.
+ */
+static bool
+no_reinit_since(int ri0)
+{
+	int i;
+
+	for (i = 0; i < 100; i++) {
+		if (reinits() != ri0)
+			return (false);
+		usleep(200000);
+	}
+	return (true);
 }
 
 /* ---- target 1: ioctl structs ---- */
@@ -1236,7 +1256,7 @@ blob_worker(uint64_t seed, uid_t uid, int hang_wait)
 			atomic_fetch_add(&S->blob_clean, 1);
 			continue;
 		}
-		if (!nocheck && reinits() == ri0 && ri0 != -2)
+		if (!nocheck && ri0 != -2 && no_reinit_since(ri0))
 			finding("blob: the VM did not run clean on a new queue "
 			    "after a contained failure (%s; after: %s)",
 			    strerror(err), sl->last);
@@ -1538,8 +1558,18 @@ main(int argc, char **argv)
 		 * 7a1464ba misread it as the cap): only lost for 90 s is. */
 		ri = reinits();
 		if (ri == -2) {
-			if (lost_since == 0)
+			/* Stop the workers as soon as the card is lost, not
+			 * when the re-init is done: run 64f44616's blob worker
+			 * put its next hostile job on the fresh card before the
+			 * supervisor saw the count move, so every re-init came
+			 * with a second one ~17 s later. */
+			if (lost_since == 0) {
 				lost_since = now;
+				worker_stop(&wi);
+				worker_stop(&wb);
+				canary_close(&can);
+				can.bad = 0;
+			}
 			if (now - lost_since > 90000) {
 				finding("the driver reports the GPU lost for "
 				    "90 s (re-init cap or a failed re-init)");
@@ -1635,16 +1665,21 @@ main(int argc, char **argv)
 				if (canary_run(&can, hang_wait, why,
 				    sizeof(why)) == 0)
 					can.bad = 0;
-				else if (reinits() != r0) {
+				else if (!no_reinit_since(r0)) {
 					canary_close(&can);	/* re-init */
 				} else if (++can.bad >= 2) {
 					finding("canary: %s", why);
 					dump_last();
 					canary_close(&can);
 					can.bad = 0;
-				} else
+				} else {
+					/* Its queue may be lost now (the hang
+					 * check): the next run is on a new
+					 * one, so only two in a row count. */
 					printf("si-fuzz: canary slow once: "
 					    "%s\n", why);
+					canary_close(&can);
+				}
 			}
 		}
 
