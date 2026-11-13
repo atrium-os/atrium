@@ -211,12 +211,24 @@ until_trace 'url=https://atlas.example/wiki/Impluvium live=shown' && g "grep -q 
     && ok "after a restart the parked page came back from the store (no fetch)" || bad "store: $(last); $(g "tail -3 $S/navigatord2.log")"
 g "grep -q 'brought back from the store .* at y=$Y)' $S/ui6.log" && ok "still at y=$Y" || bad "restart scroll: $(g "grep -v trace $S/ui6.log | tail -3")"
 g "mv $D/fixtures.off $D/fixtures"
+echo "=== presence (step 5; no Arca in this run)"
+last() { g "grep 'trace' $S/ui7.log | tail -1"; }
+g "pkill -x navigator-ui; sleep 2; true"
+ui https://atlas.example/wiki/Atrium ui7
+until_trace 'url=https://atlas.example/wiki/Atrium live=shown' || bad "presence: first page: $(last)"
+press 1110 $((TOP + 20))     # the presence control: let the site remember you
+sleep "$GAP"
+g "grep -q 'opens again: its site knows you now' $S/ui7.log" && ok "letting the site remember you opens the page again" || bad "presence: $(g "grep -v trace $S/ui7.log | tail -4")"
+g "grep -q \"can't remember you: Arca isn't running\" $S/ui7.log" && ok "…and with no Arca here it says so, and the page stays anonymous" || bad "no note: $(g "grep -v trace $S/ui7.log | tail -4")"
+sleep 3
+g "grep -A2 '\"knows\"' $S/trails.json | grep -q atlas.example" && bad "a site that could not remember you was saved as knowing you" || ok "…and the control and the trail store say it doesn't know you"
+shot live-7-presence
 echo "--- park and restore times (TCG)"
 g "grep -hE 'showed live page|parked .* in [0-9]+ ms|page .* in [0-9]+ ms' $S/ui5.log $S/ui6.log"
 g "pkill -x navigator-ui; sleep 2; true"
 
 echo "=== logs"
-for l in navigatord limend ui ui4 ui5 ui6 navigatord2; do echo "--- $l"; g "grep -v trace $S/$l.log | tail -12"; done
+for l in navigatord limend ui ui4 ui5 ui6 ui7 navigatord2; do echo "--- $l"; g "grep -v trace $S/$l.log | tail -12"; done
 g "grep -iE 'chrome|slot|origin|panic' $S/frescod.log | tail -8; true"
 echo "navigator-live: $fails failed"
 [ "$fails" = 0 ]

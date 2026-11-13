@@ -46,9 +46,15 @@ pub enum Request {
     /// parked page, navigator-ui.md §4.4): navigatord reopens that version
     /// from its store if it holds it and it is the page at `url`, else it
     /// fetches as usual.
-    /// `unrecorded`: the page is in an Unrecorded trail (§2.4): its
-    /// version is kept in memory only, never written.
-    Open { id: u32, url: String, saved: Option<String>, unrecorded: bool },
+    /// `jar`: the persona's jar the page is in (§2.4); an Unrecorded
+    /// trail's pages are kept in memory only, never written. `knows`: the
+    /// person let this site remember them in that jar (§6.2), so its
+    /// requests carry the jar's cookies (through Arca) and its conversion
+    /// is private.
+    Open { id: u32, url: String, saved: Option<String>, jar: Jar, knows: bool },
+    /// Forget: with `url`, its site's cookies in the jar ("Forget this
+    /// site"); without, an Unrecorded trail's whole jar (the trail closed).
+    Forget { jar: Jar, url: Option<String> },
     /// The UI shows a page it already has live (a page child it kept):
     /// name its origin in the strip. Only a page navigatord opened for
     /// this UI is named; anything else blanks the strip.
@@ -77,9 +83,23 @@ pub enum Event {
     Chrome { fd: bool },
     /// `saved`: the store address of this version of the page, for the
     /// UI's trail record; `from`: where it came from.
-    Opened { id: u32, url: String, title: String, insecure: bool, ticket: Ticket, ms: u32, saved: String, from: Source },
+    /// `knows`: whether it was fetched with the site knowing you (false
+    /// if asked but Arca could not carry it; `note` says why).
+    Opened { id: u32, url: String, title: String, insecure: bool, ticket: Ticket, ms: u32, saved: String, from: Source, knows: bool, note: Option<String> },
     Failed { id: u32, url: String, why: String },
     Link { id: u32, action: LinkAction },
+}
+
+/// A persona's jar (navigator-ui.md §2.4): Personal, or one Unrecorded
+/// trail's own throwaway jar, named by a random id the UI picks.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum Jar {
+    Personal,
+    Unrecorded(u64),
+}
+
+impl Jar {
+    pub fn unrecorded(&self) -> bool { matches!(self, Jar::Unrecorded(_)) }
 }
 
 /// Where an opened page came from.
@@ -180,7 +200,7 @@ mod tests {
     #[test]
     fn frames_round_trip_and_bounds_hold() {
         let mut buf = Vec::new();
-        let m = Request::Open { id: 7, url: "https://atlas.example/".into(), saved: Some("ab".repeat(32)), unrecorded: false };
+        let m = Request::Open { id: 7, url: "https://atlas.example/".into(), saved: Some("ab".repeat(32)), jar: Jar::Unrecorded(7), knows: true };
         assert!(is_address(&"ab".repeat(32)) && !is_address("AB") && !is_address(&"g".repeat(64)));
         write_frame(&mut buf, &m).unwrap();
         write_frame(&mut buf, &Event::Link { id: 7, action: LinkAction::InDocument { fragment: "a".into() } }).unwrap();

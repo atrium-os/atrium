@@ -42,7 +42,8 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use navigator_backend::store::{DirStore, MemoryStore, Store};
-use navigator_control::{self as ctl, Event, LinkAction, PageHeader, Request, Source, Ticket};
+use navigator_control::{self as ctl, Event, Jar, LinkAction, PageHeader, Request, Source, Ticket};
+use navigator_cookies::{Arca as _, ArcadSocket, Broker, Fetch, Launcher, Why};
 use navigator_prerender::fetch::{FetchBudget, FetchdFetcher, Reply};
 use navigator_prerender::serve::{self, Ask, Job};
 
@@ -74,6 +75,9 @@ struct Config {
     deadline_s: u64,
     chrome: Option<PathBuf>,
     store: Option<PathBuf>,
+    /// arcad's socket and Arca's courier launcher's: with both, a page
+    /// whose site knows you is fetched through Arca's couriers.
+    arca: Option<(PathBuf, String)>,
 }
 
 impl Config {
@@ -88,6 +92,7 @@ impl Config {
             deadline_s: var("NAVIGATORD_DEADLINE").and_then(|v| v.parse().ok()).unwrap_or(30),
             chrome: var("FRESCOD_CHROME_SOCK").map(PathBuf::from),
             store: var("NAVIGATORD_STORE").map(PathBuf::from),
+            arca: var("NAVIGATORD_ARCA").zip(var("NAVIGATORD_COURIERD")).map(|(a, c)| (PathBuf::from(a), c)),
         };
         if !unconfined {
             if c.converter.is_none() {
@@ -104,6 +109,22 @@ impl Config {
     }
 }
 
+/// Whose a conversion is (navigator-ui.md §2.4, §6.2): the persona's
+/// jar it was opened in, and whether the site knew you (its requests
+/// carried the jar's cookies). Only an anonymous Personal page is shared
+/// and written; anything cookied or Unrecorded is that jar's alone and
+/// kept in memory.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+struct Ctx {
+    jar: Jar,
+    knows: bool,
+}
+
+impl Ctx {
+    const ANON: Ctx = Ctx { jar: Jar::Personal, knows: false };
+    fn written(&self) -> bool { *self == Ctx::ANON }
+}
+
 /// A converted page.
 struct Page {
     url: String,
@@ -112,6 +133,7 @@ struct Page {
     insecure: bool,
     /// Its page record's address in the store (empty: not stored).
     saved: String,
+    ctx: Ctx,
 }
 
 /// What the store holds for a page besides its recording: which address
@@ -128,30 +150,32 @@ struct State {
     cache: Vec<Arc<Page>>,
     tickets: HashMap<Ticket, (Arc<Page>, Instant)>,
     store: Box<dyn Store + Send>,
-    /// Unrecorded trails' pages: never written (navigator-ui.md §2.4).
-    memory: MemoryStore,
+    /// Pages never written: each Unrecorded jar's, and Personal pages
+    /// opened with the site knowing you (navigator-ui.md §2.4).
+    memory: HashMap<Jar, MemoryStore>,
     /// Page address → its latest record address.
     known: HashMap<String, String>,
 }
 
 impl Default for State {
     fn default() -> Self {
-        State { cache: vec![], tickets: HashMap::new(), store: Box::new(MemoryStore::default()), memory: MemoryStore::default(), known: HashMap::new() }
+        State { cache: vec![], tickets: HashMap::new(), store: Box::new(MemoryStore::default()), memory: HashMap::new(), known: HashMap::new() }
     }
 }
 
 impl State {
     /// Put a converted page in the store; returns it with its record's
     /// address (or as it was, if the store refused: it still shows).
-    fn stored(&mut self, mut p: Page, unrecorded: bool) -> Page {
-        let store: &mut dyn Store = if unrecorded { &mut self.memory } else { &mut *self.store };
+    fn stored(&mut self, mut p: Page) -> Page {
+        let written = p.ctx.written();
+        let store: &mut dyn Store = if written { &mut *self.store } else { self.memory.entry(p.ctx.jar).or_default() };
         let put = store.put(&p.recording).and_then(|rec| {
             let r = Record { format: RECORD.into(), url: p.url.clone(), recording: rec };
             store.put(&serde_json::to_vec(&r).expect("encodes"))
         });
         match put {
             Ok(a) => {
-                if !unrecorded {
+                if written {
                     if self.known.len() >= KNOWN {
                         self.known.clear();
                     }
@@ -165,11 +189,15 @@ impl State {
     }
 
     /// The page `saved` names, if it is the page at `url`.
-    fn reopen(&self, url: &str, saved: &str, unrecorded: bool) -> Result<Page, String> {
+    fn reopen(&self, url: &str, saved: &str, ctx: Ctx) -> Result<Page, String> {
         if !ctl::is_address(saved) {
             return Err("not a store address".into());
         }
-        let store: &dyn Store = if unrecorded { &self.memory } else { &*self.store };
+        let store: &dyn Store = if ctx.written() {
+            &*self.store
+        } else {
+            self.memory.get(&ctx.jar).ok_or("not in this jar")?
+        };
         let b = store.get(saved)?;
         let r: Record = serde_json::from_slice(&b).map_err(|e| format!("not a page record: {e}"))?;
         if r.format != RECORD {
@@ -179,36 +207,49 @@ impl State {
             return Err("the record is for another address".into());
         }
         let recording = store.get(&r.recording)?;
-        Ok(Page { title: title(&recording), insecure: url.starts_with("http:"), url: r.url, recording, saved: saved.into() })
+        Ok(Page { title: title(&recording), insecure: url.starts_with("http:"), url: r.url, recording, saved: saved.into(), ctx })
     }
 
     /// The page at `url` this UI may act on: the cache, else the store.
     fn page(&mut self, url: &str) -> Option<Arc<Page>> {
-        if let Some(p) = self.cached(url) {
+        if let Some(p) = self.cached(url, None) {
             return Some(p);
         }
         let saved = self.known.get(url)?.clone();
-        let p = Arc::new(self.reopen(url, &saved, false).ok()?);
+        let p = Arc::new(self.reopen(url, &saved, Ctx::ANON).ok()?);
         self.keep(p.clone(), url);
         Some(p)
     }
 
-    fn cached(&mut self, url: &str) -> Option<Arc<Page>> {
-        let i = self.cache.iter().position(|p| p.url == url)?;
+    /// The cached page at `url` converted in `ctx` (any, for `None`: the
+    /// most recent, for link checks and the strip).
+    fn cached(&mut self, url: &str, ctx: Option<Ctx>) -> Option<Arc<Page>> {
+        let i = self.cache.iter().rposition(|p| p.url == url && ctx.is_none_or(|c| c == p.ctx))?;
         let p = self.cache.remove(i);
         self.cache.push(p.clone());
         Some(p)
     }
 
     fn keep(&mut self, p: Arc<Page>, asked: &str) {
-        self.cache.retain(|q| q.url != p.url);
+        self.cache.retain(|q| !(q.url == p.url && q.ctx == p.ctx));
         self.cache.push(p.clone());
         if asked != p.url {
             // A redirect: the asked address finds it too.
-            self.cache.push(Arc::new(Page { url: asked.into(), recording: p.recording.clone(), title: p.title.clone(), insecure: p.insecure, saved: p.saved.clone() }));
+            self.cache.push(Arc::new(Page { url: asked.into(), recording: p.recording.clone(), title: p.title.clone(), insecure: p.insecure, saved: p.saved.clone(), ctx: p.ctx }));
         }
         while self.cache.len() > CACHE {
             self.cache.remove(0);
+        }
+    }
+
+    /// An Unrecorded jar closed, or a site was forgotten in a jar: its
+    /// private pages go (`site` `None`: all of the jar's).
+    fn forget(&mut self, jar: Jar, site: Option<&str>) {
+        let gone = |p: &Page| p.ctx.jar == jar && (p.ctx.knows || site.is_none()) && site.is_none_or(|s| site_of(&p.url).as_deref() == Some(s));
+        self.cache.retain(|p| !gone(p));
+        self.tickets.retain(|_, (p, _)| !gone(p));
+        if site.is_none() {
+            self.memory.remove(&jar);
         }
     }
 
@@ -226,14 +267,55 @@ impl State {
 // Fetching and converting.
 // ---------------------------------------------------------------------------
 
+/// The broker's cookie state and its clients (navigator-cookies), shared
+/// by every conversion.
+type Cookies = Arc<Mutex<Broker<ArcadSocket, Launcher>>>;
+
+/// The site (registrable domain) of a page, as Arca partitions go.
+fn site_of(url: &str) -> Option<String> {
+    navigator_cookies::partition_of(url)
+}
+
+fn jar_id(jar: Jar) -> Option<u64> {
+    match jar {
+        Jar::Personal => None,
+        Jar::Unrecorded(j) => Some(j),
+    }
+}
+
+static VIEWS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
 enum Upstream {
     Fetchd(FetchdFetcher),
     Fixtures(PathBuf),
+    /// A page whose site knows you: its https requests through Arca's
+    /// couriers with the broker's tickets; the rest the plain way.
+    Cookied { cookies: Cookies, view: u64, host: String, navigated: bool, plain: Box<Upstream> },
 }
 
 impl Upstream {
     fn reply(&mut self, ask: Ask) -> Reply {
+        if let Upstream::Cookied { cookies, view, host, navigated, plain } = self {
+            let url = ask.url().to_string();
+            // The first ask is the page itself (the reader's navigation);
+            // the converter's are its subresources.
+            let f = if *navigated { Fetch::subresource(&url, host) } else { Fetch::navigation(&url, None, true) };
+            *navigated = true;
+            let got = cookies.lock().unwrap().fetch(*view, &f);
+            return match got {
+                Ok(r) => {
+                    let body = match ask {
+                        Ask::Peek { start, len, .. } => r.body[start.min(r.body.len())..(start + len).min(r.body.len())].to_vec(),
+                        Ask::Fetch(_) => r.body,
+                    };
+                    Reply::Ok { status: r.status, rest: format!("0 {} {}", body.len(), r.url), body }
+                }
+                Err(e) if e.plain_instead() => plain.reply(ask),
+                Err(e) => Reply::Err(format!("through Arca: {e:?}")),
+            };
+        }
         match self {
+            Upstream::Cookied { .. } => unreachable!(),
             Upstream::Fetchd(f) => match ask {
                 Ask::Fetch(u) => f.exchange(u).unwrap_or_else(Reply::Err),
                 Ask::Peek { url, start, len } => f.exchange_peek(url, start, len).unwrap_or_else(Reply::Err),
@@ -292,10 +374,14 @@ fn upstream(cfg: &Config, inst: &str) -> Result<Upstream, String> {
     FetchdFetcher::spawn(p, &a).map(Upstream::Fetchd).map_err(|e| format!("fetcher: {e}"))
 }
 
-/// Fetch and convert `url`.
-fn convert(cfg: &Config, url: &str) -> Result<Page, String> {
+/// Fetch and convert `url`; through Arca as the jar's, with `cookies`.
+fn convert(cfg: &Config, url: &str, ctx: Ctx, cookies: Option<(Cookies, u64)>) -> Result<Page, String> {
     let inst = instance();
     let mut up = upstream(cfg, &inst)?;
+    if let Some((cookies, view)) = cookies {
+        let host = url::Url::parse(url).ok().and_then(|u| u.host_str().map(str::to_ascii_lowercase)).unwrap_or_default();
+        up = Upstream::Cookied { cookies, view, host, navigated: false, plain: Box::new(up) };
+    }
     let mut budget = FetchBudget::new(FetchBudget::DEFAULT);
     let (base, doc) = match budget.admit(url, |u| up.reply(Ask::Fetch(u))) {
         Reply::Ok { status, rest, body } if (200..300).contains(&status) => {
@@ -388,7 +474,7 @@ fn convert(cfg: &Config, url: &str) -> Result<Page, String> {
         return Err("the recording is over its bound".into());
     }
     let insecure = base.starts_with("http:");
-    Ok(Page { title: title(&recording), url: base, recording, insecure, saved: String::new() })
+    Ok(Page { title: title(&recording), url: base, recording, insecure, saved: String::new(), ctx })
 }
 
 /// The document's `<title>` from the recording's JSON text, bounded.
@@ -467,7 +553,7 @@ fn send(w: &Mutex<UnixStream>, e: &Event) {
     }
 }
 
-fn serve_ui(cfg: Arc<Config>, state: Arc<Mutex<State>>, s: UnixStream) {
+fn serve_ui(cfg: Arc<Config>, state: Arc<Mutex<State>>, cookies: Option<Cookies>, s: UnixStream) {
     let w = Arc::new(Mutex::new(s.try_clone().expect("clone")));
     let strip = Arc::new(Mutex::new(Strip::default()));
     let mut r = s;
@@ -517,20 +603,63 @@ fn serve_ui(cfg: Arc<Config>, state: Arc<Mutex<State>>, s: UnixStream) {
                 st.latest = 0;
                 st.set(&p.and_then(|p| origin(&p.url)).unwrap_or_default());
             }
-            Request::Open { id, url, saved, unrecorded } => {
+            Request::Forget { jar, url } => {
+                let site = url.as_deref().and_then(site_of);
+                if url.is_some() && site.is_none() {
+                    continue;
+                }
+                state.lock().unwrap().forget(jar, site.as_deref());
+                let Some(c) = &cookies else { continue };
+                // The jar's partition for that site, or the whole jar's prefix.
+                let (part, prefix) = match (jar, &url) {
+                    (_, Some(u)) => (navigator_cookies::partition_in(jar_id(jar), u), false),
+                    (Jar::Unrecorded(j), None) => (Some(navigator_cookies::jar_prefix(j)), true),
+                    (Jar::Personal, None) => (None, false),
+                };
+                if let Some(part) = part {
+                    match c.lock().unwrap().arca.forget(&part, prefix) {
+                        Ok(n) => eprintln!("navigatord: forgot {part}{} ({n} cookie groups)", if prefix { "*" } else { "" }),
+                        Err(e) => eprintln!("navigatord: forgetting {part}: {e}"),
+                    }
+                }
+            }
+            Request::Open { id, url, saved, jar, knows } => {
                 if !ctl::clean(&url, ctl::URL_MAX) {
                     send(&w, &Event::Failed { id, url: String::new(), why: "not an address".into() });
                     continue;
                 }
                 strip.lock().unwrap().latest = id;
-                let (cfg, state, w, strip) = (cfg.clone(), state.clone(), w.clone(), strip.clone());
+                let (cfg, state, w, strip, cookies) = (cfg.clone(), state.clone(), w.clone(), strip.clone(), cookies.clone());
                 std::thread::spawn(move || {
                     let t = Instant::now();
-                    let hit = state.lock().unwrap().cached(&url);
+                    // The site knowing you needs Arca; without it the page
+                    // opens anonymously, and the UI is told why.
+                    let mut note = None;
+                    let cookied = match (knows, &cookies) {
+                        (false, _) => None,
+                        (true, None) => {
+                            note = Some("this site can't remember you: Arca isn't running here".to_string());
+                            None
+                        }
+                        (true, Some(c)) => {
+                            let view = VIEWS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            let mut b = c.lock().unwrap();
+                            match b.show_in(view, &url, jar_id(jar)).and_then(|_| b.set_cookied(view, Why::Reader)) {
+                                Ok(()) => Some((c.clone(), view)),
+                                Err(e) => {
+                                    note = Some(format!("this site can't remember you here ({e:?})"));
+                                    None
+                                }
+                            }
+                        }
+                    };
+                    let ctx = Ctx { jar, knows: cookied.is_some() };
+                    let view = cookied.as_ref().map(|(_, v)| *v);
+                    let hit = state.lock().unwrap().cached(&url, Some(ctx));
                     let page = match hit {
                         Some(p) => Ok((p, Source::Cache)),
                         None => {
-                            let back = saved.as_deref().map(|a| state.lock().unwrap().reopen(&url, a, unrecorded));
+                            let back = saved.as_deref().map(|a| state.lock().unwrap().reopen(&url, a, ctx));
                             match back {
                                 Some(Ok(p)) => {
                                     let p = Arc::new(p);
@@ -541,9 +670,9 @@ fn serve_ui(cfg: Arc<Config>, state: Arc<Mutex<State>>, s: UnixStream) {
                                     if let Some(Err(e)) = other {
                                         eprintln!("navigatord: {url}: not reopened from the store ({e}); fetching");
                                     }
-                                    convert(&cfg, &url).map(|p| {
+                                    convert(&cfg, &url, ctx, cookied).map(|p| {
                                         let mut st = state.lock().unwrap();
-                                        let p = Arc::new(st.stored(p, unrecorded));
+                                        let p = Arc::new(st.stored(p));
                                         st.keep(p.clone(), &url);
                                         (p, Source::Fetched)
                                     })
@@ -551,10 +680,14 @@ fn serve_ui(cfg: Arc<Config>, state: Arc<Mutex<State>>, s: UnixStream) {
                             }
                         }
                     };
+                    if let (Some(v), Some(c)) = (view, &cookies) {
+                        c.lock().unwrap().close(v);
+                    }
                     let ms = t.elapsed().as_millis().min(u32::MAX as u128) as u32;
                     match page {
                         Ok((p, from)) => {
-                            eprintln!("navigatord: opened {} in {ms} ms ({} bytes, {from:?})", p.url, p.recording.len());
+                            eprintln!("navigatord: opened {} in {ms} ms ({} bytes, {from:?}{})", p.url, p.recording.len(),
+                                if ctx.knows { ", the site knowing you" } else { "" });
                             let ticket = state.lock().unwrap().ticket(p.clone());
                             {
                                 let st = strip.lock().unwrap();
@@ -562,7 +695,7 @@ fn serve_ui(cfg: Arc<Config>, state: Arc<Mutex<State>>, s: UnixStream) {
                                     st.set(&origin(&p.url).unwrap_or_default());
                                 }
                             }
-                            send(&w, &Event::Opened { id, url: p.url.clone(), title: p.title.clone(), insecure: p.insecure, ticket, ms, saved: p.saved.clone(), from });
+                            send(&w, &Event::Opened { id, url: p.url.clone(), title: p.title.clone(), insecure: p.insecure, ticket, ms, saved: p.saved.clone(), from, knows: ctx.knows, note });
                         }
                         Err(why) => {
                             eprintln!("navigatord: {url}: {why}");
@@ -664,6 +797,16 @@ fn main() {
         }
     }
     let state = Arc::new(Mutex::new(state));
+    // Arca, for sites that know you. An Unrecorded jar a crash left behind
+    // is forgotten now: none outlives the navigatord that made it.
+    let cookies: Option<Cookies> = cfg.arca.as_ref().map(|(a, c)| {
+        let mut b = Broker::new(ArcadSocket { path: a.clone() }, Launcher::new(c.clone()));
+        match b.arca.forget("u-", true) {
+            Ok(n) => eprintln!("navigatord: Arca at {}; {n} Unrecorded cookie groups left over, forgotten", a.display()),
+            Err(e) => eprintln!("navigatord: Arca at {}: could not forget Unrecorded jars: {e}", a.display()),
+        }
+        Arc::new(Mutex::new(b))
+    });
     let page_path = std::env::var("NAVIGATORD_PAGE_SOCKET").unwrap_or_else(|_| "/var/run/atrium/navigator-page.sock".into());
     let ctl_path = std::env::var("NAVIGATORD_SOCKET").unwrap_or_else(|_| "/var/run/atrium/navigatord.sock".into());
     let pages = listen(&page_path);
@@ -677,8 +820,8 @@ fn main() {
     let ui = listen(&ctl_path);
     eprintln!("navigatord: control on {ctl_path}, pages on {page_path}");
     for s in ui.incoming().flatten() {
-        let (cfg, state) = (cfg.clone(), state.clone());
-        std::thread::spawn(move || serve_ui(cfg, state, s));
+        let (cfg, state, cookies) = (cfg.clone(), state.clone(), cookies.clone());
+        std::thread::spawn(move || serve_ui(cfg, state, cookies, s));
     }
 }
 
@@ -688,7 +831,7 @@ mod tests {
 
     fn page(url: &str, doc: &str) -> Page {
         let rec = format!(r#"{{"format":"atrium-navigator-recording/3","url":"{url}","document":"{doc}"}}"#);
-        Page { url: url.into(), title: title(rec.as_bytes()), recording: rec.into_bytes(), insecure: false, saved: String::new() }
+        Page { url: url.into(), title: title(rec.as_bytes()), recording: rec.into_bytes(), insecure: false, saved: String::new(), ctx: Ctx::ANON }
     }
 
     #[test]
@@ -725,22 +868,36 @@ mod tests {
     #[test]
     fn a_parked_page_reopens_from_the_store_only_for_its_address() {
         let mut st = State::default();
-        let p = st.stored(page("https://a.example/", "x"), false);
+        let p = st.stored(page("https://a.example/", "x"));
         assert!(ctl::is_address(&p.saved));
-        let back = st.reopen("https://a.example/", &p.saved, false).unwrap();
+        let back = st.reopen("https://a.example/", &p.saved, Ctx::ANON).unwrap();
         assert_eq!(back.recording, p.recording);
         assert_eq!(back.saved, p.saved);
-        assert!(st.reopen("https://b.example/", &p.saved, false).is_err(), "a record names its address");
+        assert!(st.reopen("https://b.example/", &p.saved, Ctx::ANON).is_err(), "a record names its address");
         let rec = navigator_backend::session::digest(&p.recording);
-        assert!(st.reopen("https://a.example/", &rec, false).is_err(), "a recording is not a record");
-        assert!(st.reopen("https://a.example/", "../x", false).is_err());
-        // An Unrecorded trail's page is never in the written store.
-        let u = st.stored(page("https://u.example/", "y"), true);
-        assert!(st.reopen("https://u.example/", &u.saved, false).is_err());
-        assert!(st.reopen("https://u.example/", &u.saved, true).is_ok());
+        assert!(st.reopen("https://a.example/", &rec, Ctx::ANON).is_err(), "a recording is not a record");
+        assert!(st.reopen("https://a.example/", "../x", Ctx::ANON).is_err());
+        // An Unrecorded trail's page, or one the site knew you on, is
+        // never in the written store, and is its jar's alone.
+        let uj = Ctx { jar: Jar::Unrecorded(7), knows: false };
+        let mut up = page("https://u.example/", "y");
+        up.ctx = uj;
+        let u = st.stored(up);
+        assert!(st.reopen("https://u.example/", &u.saved, Ctx::ANON).is_err());
+        assert!(st.reopen("https://u.example/", &u.saved, Ctx { jar: Jar::Unrecorded(8), knows: false }).is_err(), "another trail's jar");
+        assert!(st.reopen("https://u.example/", &u.saved, uj).is_ok());
         assert!(st.page("https://u.example/").is_none(), "nor known for later");
+        let kj = Ctx { jar: Jar::Personal, knows: true };
+        let mut kp = page("https://k.example/", "mail");
+        kp.ctx = kj;
+        let k = st.stored(kp);
+        assert!(st.reopen("https://k.example/", &k.saved, Ctx::ANON).is_err(), "a cookied page is not the shared one");
+        assert!(st.reopen("https://k.example/", &k.saved, kj).is_ok());
+        // The Unrecorded trail closes: its pages go.
+        st.forget(Jar::Unrecorded(7), None);
+        assert!(st.reopen("https://u.example/", &u.saved, uj).is_err());
         // Once out of the cache, a known page is still one links are checked on.
-        assert!(st.cached("https://a.example/").is_none());
+        assert!(st.cached("https://a.example/", None).is_none());
         assert!(st.page("https://a.example/").is_some());
         assert!(st.page("https://c.example/").is_none());
     }
@@ -753,6 +910,7 @@ mod tests {
         let t = st.ticket(p);
         assert!(st.tickets.remove(&t).is_some());
         assert!(st.tickets.remove(&t).is_none());
-        assert!(st.cached("https://a.example/").is_some());
+        assert!(st.cached("https://a.example/", Some(Ctx::ANON)).is_some());
+        assert!(st.cached("https://a.example/", Some(Ctx { jar: Jar::Personal, knows: true })).is_none(), "the anonymous page is not the cookied one");
     }
 }

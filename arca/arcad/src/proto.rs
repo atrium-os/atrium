@@ -92,6 +92,29 @@ pub mod broker_op {
     /// `ticket[16]`. The ticket is for exactly that method, path and query
     /// (none if omitted).
     pub const W_TICKET: u16 = 0x70;
+    /// `str partition | u8 prefix` → `u32 groups`. Forget web cookie jars
+    /// (arca.md §8.6, navigator-ui.md §2.4): with `prefix` 0, the jar of
+    /// exactly that partition ("Forget this site" in a persona); with 1,
+    /// every partition beginning with it, where it must be an Unrecorded
+    /// jar's [`UNRECORDED`] prefix (`u-` and 16 hex digits, then `.`) or
+    /// [`UNRECORDED`] alone (every Unrecorded jar: the broker's start, so
+    /// a crash leaves none behind). Each jar's groups go with their data
+    /// keys. Needs the store unlocked.
+    pub const W_FORGET: u16 = 0x71;
+    /// The web couriers' persona (arca-courierd's `WEB_PERSONA`).
+    pub const WEB_PERSONA: &str = "web";
+    /// What an Unrecorded trail's partitions begin with (navigator-ui.md
+    /// §2.4): `u-<16 hex>.<site>`, one jar per trail.
+    pub const UNRECORDED: &str = "u-";
+
+    /// Whether `p` may be a `W_FORGET` prefix.
+    pub fn forget_prefix_ok(p: &str) -> bool {
+        p == UNRECORDED
+            || (p.len() == UNRECORDED.len() + 17
+                && p.starts_with(UNRECORDED)
+                && p.ends_with('.')
+                && p[UNRECORDED.len()..p.len() - 1].bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f')))
+    }
 }
 
 /// Sigillum's ops (0x90..): only `sigillumd` (the `ARCA_SERVICES` entry

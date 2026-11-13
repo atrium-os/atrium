@@ -156,6 +156,9 @@ pub struct Trail {
     pub current: Option<PageId>,
     /// Unrecorded (§2.4): its own throwaway jar, nothing written.
     pub unrecorded: bool,
+    /// That jar's id: random, so no two Unrecorded trails (in this run or
+    /// any other) share one; 0 for a recorded trail (the persona's jar).
+    pub jar: u64,
     /// Muted by the person (§8a): trail level × player level.
     pub muted: bool,
     /// Logical clock of the last navigation, for the rail's order.
@@ -173,9 +176,21 @@ pub struct PathRows {
     pub folded: usize,
 }
 
+fn random_jar() -> u64 {
+    use std::io::Read;
+    let mut b = [0u8; 8];
+    std::fs::File::open("/dev/urandom").and_then(|mut f| f.read_exact(&mut b)).expect("/dev/urandom");
+    u64::from_le_bytes(b).max(1)
+}
+
 impl Trail {
+    /// The jar its pages use (§2.4).
+    pub fn jar(&self) -> navigator_control::Jar {
+        if self.unrecorded { navigator_control::Jar::Unrecorded(self.jar) } else { navigator_control::Jar::Personal }
+    }
+
     pub fn new(id: u64, unrecorded: bool) -> Self {
-        Trail { id, pages: vec![], current: None, unrecorded, muted: false, active: 0 }
+        Trail { id, pages: vec![], current: None, unrecorded, jar: if unrecorded { random_jar() } else { 0 }, muted: false, active: 0 }
     }
 
     pub fn page(&self) -> Option<&Page> {
@@ -490,15 +505,22 @@ impl TrailStore {
     }
 
     fn jar_of(t: &Trail) -> String {
-        if t.unrecorded { format!("unrecorded-{}", t.id) } else { "personal".into() }
+        if t.unrecorded { format!("unrecorded-{:016x}", t.jar) } else { "personal".into() }
     }
 
-    /// Whether `site` knows you in the current trail's jar (§6.2).
     /// A page by its trail's id, in a trail or put away.
     pub fn page_by_key_mut(&mut self, trail: u64, page: PageId) -> Option<&mut Page> {
         self.trails.iter_mut().chain(self.earlier.iter_mut().map(|e| &mut e.trail)).find(|t| t.id == trail)?.pages.get_mut(page)
     }
 
+    /// The jar of the trail with id `trail`, and whether `url`'s site
+    /// knows you in it (§2.4, §6.2).
+    pub fn presence_of(&self, trail: u64, url: &str) -> Option<(navigator_control::Jar, bool)> {
+        let t = self.trails.iter().find(|t| t.id == trail)?;
+        Some((t.jar(), self.known.contains(&(Self::jar_of(t), site(url).to_string()))))
+    }
+
+    /// Whether `site` knows you in the current trail's jar (§6.2).
     pub fn knows(&self, site: &str) -> bool {
         self.known.contains(&(Self::jar_of(self.trail()), site.to_string()))
     }
@@ -510,6 +532,15 @@ impl TrailStore {
         if on {
             self.known.insert(key);
         } else {
+            self.known.remove(&key);
+        }
+    }
+
+    /// The site of `url` does not know you in trail `trail`'s jar after all
+    /// (navigatord could not carry it: no Arca), so the control says so.
+    pub fn unknow(&mut self, trail: u64, url: &str) {
+        if let Some(t) = self.trails.iter().find(|t| t.id == trail) {
+            let key = (Self::jar_of(t), site(url).to_string());
             self.known.remove(&key);
         }
     }

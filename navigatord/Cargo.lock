@@ -2247,6 +2247,7 @@ dependencies = [
  "libc",
  "navigator-backend",
  "navigator-control",
+ "navigator-cookies",
  "navigator-prerender",
  "serde",
  "serde_json",

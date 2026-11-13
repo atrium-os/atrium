@@ -21,7 +21,7 @@
 //! back to where it was.
 
 use std::cell::RefCell;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io;
 use std::os::fd::OwnedFd;
 use std::os::unix::net::UnixStream;
@@ -30,7 +30,7 @@ use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
 use limen::doc_viewer::{ToChild, ToParent};
-use navigator_control::{self as ctl, Event, LinkAction, Request, Source, Ticket};
+use navigator_control::{self as ctl, Event, Jar, LinkAction, Request, Source, Ticket};
 use pergola::embed::{EmbedId, Embeds, ParentEvent, WindowToken};
 
 use crate::shell::{LivePage, Out, Shell, PAGE_SLOT};
@@ -62,6 +62,10 @@ struct Child {
     since: Option<(Instant, Option<Source>)>,
     seen: Instant,
     parking: Option<Instant>,
+    /// Whether it was opened with its site knowing you (§6.2): when the
+    /// person changes that, the child no longer shows the page they asked
+    /// for, and is closed.
+    knows: bool,
 }
 
 pub struct Live {
@@ -79,6 +83,9 @@ pub struct Live {
     activations: HashMap<u32, bool>,
     pub dark: bool,
     pub budget: usize,
+    /// The Unrecorded jars of open trails: one that goes (its trail
+    /// closed) is forgotten in navigatord and Arca.
+    jars: HashSet<u64>,
 }
 
 fn send(w: &mut UnixStream, r: &Request) {
@@ -135,6 +142,7 @@ impl Live {
                 activations: HashMap::new(),
                 dark: false,
                 budget,
+                jars: HashSet::new(),
             },
             fd,
         ))
@@ -196,7 +204,7 @@ impl Live {
     fn start(&mut self, s: &mut Shell, key: Key) {
         let (Some(e), Some(w)) = (self.embeds.clone(), self.window) else { return };
         let Some((url, saved, scroll)) = s.store.page_by_key_mut(key.0, key.1).map(|p| (p.url.clone(), p.saved.clone(), p.scroll)) else { return };
-        let unrecorded = s.store.trail().unrecorded;
+        let (jar, knows) = s.store.presence_of(key.0, &url).unwrap_or((Jar::Personal, false));
         let embed = {
             let mut e = e.borrow_mut();
             if let Err(err) = e.hide(PAGE_SLOT) {
@@ -224,9 +232,10 @@ impl Live {
             since: Some((Instant::now(), None)),
             seen: Instant::now(),
             parking: None,
+            knows,
         });
         s.live = Some(LivePage::Loading(url.clone()));
-        send(&mut self.w, &Request::Open { id, url, saved, unrecorded });
+        send(&mut self.w, &Request::Open { id, url, saved, jar, knows });
     }
 
     /// Park the least recently seen pages past the budget.
@@ -262,9 +271,19 @@ impl Live {
         while let Ok(ev) = self.rx.try_recv() {
             changed = true;
             match ev {
-                Event::Opened { id, url, title, insecure, ticket, ms: took, saved, from } => {
+                Event::Opened { id, url, title, insecure, ticket, ms: took, saved, from, knows, note } => {
                     let Some(i) = self.children.iter().position(|c| c.asked == Some(id)) else { continue };
-                    eprintln!("navigator-ui: opened {url} in {took} ms ({from:?})");
+                    eprintln!("navigator-ui: opened {url} in {took} ms ({from:?}{})", if knows { ", the site knowing you" } else { "" });
+                    if let Some(n) = note {
+                        s.last_note = Some(n);
+                    }
+                    // Asked for, and not carried: the control shows what is
+                    // so (§6.2), and this child already matches it.
+                    if self.children[i].knows && !knows {
+                        let (t, u) = (self.children[i].key.0, self.children[i].url.clone());
+                        s.store.unknow(t, &u);
+                        self.children[i].knows = false;
+                    }
                     let c = &mut self.children[i];
                     c.asked = None;
                     if let Some((_, f)) = &mut c.since {
@@ -401,6 +420,26 @@ impl Live {
                     self.activations.insert(id, beside);
                     send(&mut self.w, &Request::Activate { id, page, href });
                 }
+                Out::Forget { jar, url } => send(&mut self.w, &Request::Forget { jar, url: Some(url) }),
+            }
+        }
+        // Unrecorded trails that closed: their jars are forgotten.
+        let jars: HashSet<u64> = s.store.trails.iter().filter(|t| t.unrecorded).map(|t| t.jar).collect();
+        for &j in self.jars.difference(&jars) {
+            eprintln!("navigator-ui: an Unrecorded trail closed; forgetting its jar");
+            send(&mut self.w, &Request::Forget { jar: Jar::Unrecorded(j), url: None });
+        }
+        self.jars = jars;
+        // Pages whose site the person let remember them, or forgot, since
+        // they opened: closed, to open again as asked.
+        while let Some(i) = self.children.iter().position(|c| {
+            c.parking.is_none() && s.store.presence_of(c.key.0, &c.url).is_some_and(|(_, k)| k != c.knows)
+        }) {
+            eprintln!("navigator-ui: {} opens again: its site {} you now", self.children[i].url, if self.children[i].knows { "forgot" } else { "knows" });
+            let on_screen = self.shown == Some(self.children[i].key);
+            self.close(i);
+            if on_screen {
+                self.started = false;
             }
         }
         // The page the current trail shows.

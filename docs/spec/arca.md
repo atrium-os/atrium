@@ -594,7 +594,12 @@ same-site context or a gesture, because it never holds a ticket.
   - Session cookies dying with the origin's last view (§8.6): the broker has to say when
     a view closes.
   - `document.cookie` for the converter.
-  - "Forget this site" in the trusted UI.
+  - "Forget this site" in the trusted UI. The broker's side is built (2026-11-13,
+    navigator-ui.md §14 step 5): `W_FORGET` (0x71, broker only) takes a partition, or a
+    prefix that must be an Unrecorded jar's (`u-<16 hex>.`, or `u-` for all of them), and
+    forgets every `web` group of the matching partitions with its data key
+    (`Store::forget`). `arcad/tests/cookies.rs` covers it; `scripts/arca-vm-test.sh` §8 runs
+    navigatord through it.
   - ~~The Navigator's broker issuing tickets.~~ Built 2026-11-06 in `navigator-cookies`:
     a ticket per request of a cookied view, sent through the courier for its
     (partition, origin), with redirects followed by the broker (legacy-web §5.4.1e,

@@ -128,6 +128,13 @@ impl Arca for InProcArca {
         self.issued.push((ask.clone(), id));
         Ok(id)
     }
+    fn forget(&mut self, partition: &str, prefix: bool) -> Result<u32, String> {
+        let mut w = Writer::new();
+        w.str(partition); w.u8(prefix as u8);
+        let r = self.s.borrow_mut().handle(&broker_label(), arcad::proto::broker_op::W_FORGET, &w.buf);
+        if r.status != status::OK { return Err(format!("status {}", r.status)) }
+        Ok(u32::from_le_bytes(r.body.bytes().try_into().unwrap()))
+    }
 }
 
 /// A courier's vault: arcad under that courier's own label.
@@ -276,6 +283,35 @@ fn partitions_are_separate_jars() {
     assert_eq!(w.b.partition(other), Some("other.example"));
     let r = w.b.fetch(other, &Fetch::navigation(&format!("{}/echo", w.cdn), None, true)).unwrap();
     assert_eq!(names(&r.body), "", "news.example's cdn cookies stay in news.example's partition");
+}
+
+#[test]
+fn each_unrecorded_trail_is_its_own_jar_and_closing_it_forgets_it() {
+    let mut w = world();
+    let top = format!("{}/", w.news);
+    let (personal, u1, u2): (ViewId, ViewId, ViewId) = (1, 2, 3);
+    w.b.show_in(personal, &top, None).unwrap();
+    w.b.show_in(u1, &top, Some(0xa1)).unwrap();
+    w.b.show_in(u2, &top, Some(0xb2)).unwrap();
+    assert_eq!(w.b.partition(u1), Some("u-00000000000000a1.news.example"));
+    for v in [personal, u1, u2] {
+        w.b.set_cookied(v, Why::Reader).unwrap();
+    }
+    // Signing in (cookies set) in one Unrecorded trail…
+    w.b.fetch(u1, &Fetch::navigation(&format!("{}/set", w.news), None, true)).unwrap();
+    let echo = |w: &mut World, v| names(&w.b.fetch(v, &Fetch::navigation(&format!("{}/echo", w.news), None, true)).unwrap().body);
+    assert_eq!(echo(&mut w, u1), "newslax,newsnone,newsstrict");
+    // …signs in nowhere else.
+    assert_eq!(echo(&mut w, u2), "", "another Unrecorded trail");
+    assert_eq!(echo(&mut w, personal), "", "the Personal persona");
+    w.b.fetch(personal, &Fetch::navigation(&format!("{}/set", w.news), None, true)).unwrap();
+    // The trail closes: its jar is forgotten, and only its.
+    assert!(w.b.arca.forget(&navigator_cookies::jar_prefix(0xa1), true).unwrap() > 0);
+    assert_eq!(echo(&mut w, u1), "");
+    assert_eq!(echo(&mut w, personal), "newslax,newsnone,newsstrict");
+    // "Forget this site" in Personal.
+    assert!(w.b.arca.forget("news.example", false).unwrap() > 0);
+    assert_eq!(echo(&mut w, personal), "");
 }
 
 #[test]

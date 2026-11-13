@@ -166,6 +166,7 @@ impl State {
                 Err(_) => reply(status::UNKNOWN_PEER),
             },
             Label::WebBroker { user, .. } if op == broker_op::W_TICKET => self.broker_ticket(user, body),
+            Label::WebBroker { user, .. } if op == broker_op::W_FORGET => self.broker_forget(user, body),
             Label::WebBroker { user, publisher, app_id } => match Recipient::app(*publisher, app_id) {
                 Ok(me) => self.app_op(user, &me, op, body, &mut item),
                 Err(_) => reply(status::UNKNOWN_PEER),
@@ -832,6 +833,43 @@ impl State {
             Ok(id) => ok(id.to_vec()),
             Err(_) => reply(status::FULL),
         }
+    }
+
+    /// Forget web cookie jars: one partition, or an Unrecorded trail's (or
+    /// every Unrecorded trail's) by prefix (`broker_op::W_FORGET`).
+    fn broker_forget(&mut self, user: &str, body: &[u8]) -> Reply {
+        let mut r = Reader::new(body);
+        let parsed = (|| {
+            let p = r.str(caps::HOST)?;
+            let prefix = r.u8()?;
+            r.end()?;
+            Ok::<_, Error>((p, prefix))
+        })();
+        let Ok((partition, prefix)) = parsed else { return malformed() };
+        let ok_ask = match prefix {
+            0 => Recipient::endpoint(Scheme::Https, partition, 443, Some(partition)).is_ok(),
+            1 => broker_op::forget_prefix_ok(partition),
+            _ => false,
+        };
+        if !ok_ask {
+            return malformed();
+        }
+        let Some(store) = self.stores.get_mut(user) else { return reply(status::LOCKED) };
+        let jars: Vec<Recipient> = tri!(store.recipients())
+            .into_iter()
+            .filter(|(persona, rec)| {
+                persona == broker_op::WEB_PERSONA
+                    && matches!(rec, Recipient::Endpoint { partition: Some(p), .. }
+                        if if prefix == 1 { p.starts_with(partition) } else { p == partition })
+            })
+            .map(|(_, rec)| rec)
+            .collect();
+        let mut n = 0u32;
+        for rec in &jars {
+            tri!(store.forget(&Access { persona: broker_op::WEB_PERSONA, recipient: rec }));
+            n += 1;
+        }
+        ok(n.to_le_bytes().to_vec())
     }
 
     /// The ticket a web courier names for this request, checked against

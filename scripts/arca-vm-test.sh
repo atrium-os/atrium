@@ -54,12 +54,20 @@ DREL="$ROOT/arca/arca-courierd/target/$TARGET/release"
 # The Navigator broker's side (§7): its real arcad and launcher clients.
 (cd "$ROOT/navigator-cookies" && RUSTFLAGS="$CROSS_RUSTFLAGS" cargo build -q --release --target "$TARGET" --example cookies-vm-probe)
 NREL="$ROOT/navigator-cookies/target/$TARGET/release"
+# §8: navigatord itself, with the converter, and a control client.
+if [ "${NAV:-1}" = 1 ]; then
+    for c in "navigatord --bin navigatord" "navigator-prerender --bin prerender" "navigator-control --example navctl"; do
+        set -- $c
+        (cd "$ROOT/$1" && RUSTFLAGS="$CROSS_RUSTFLAGS" cargo build -q --release --target "$TARGET" $2 $3)
+    done
+    NAVBINS="$ROOT/navigatord/target/$TARGET/release/navigatord $ROOT/navigator-prerender/target/$TARGET/release/prerender $ROOT/navigator-control/target/$TARGET/release/examples/navctl"
+fi
 # The jailed couriers' TLS server runs here, on the machine running the VM.
 (cd "$ROOT/arca/arca-courier" && cargo build -q --example courier-test-server)
 
 echo "=== deploy"
 g "mkdir -p /root/arca-test && rm -f /root/arca-test/*"
-for b in $BINS "$REL/arcad" "$REL/arca-probe" "$CREL/arca-courier" "$CREL/examples/courier-vm-probe" "$DREL/arca-courierd" "$DREL/examples/courierd-vm-probe" "$NREL/examples/cookies-vm-probe"; do
+for b in $BINS "$REL/arcad" "$REL/arca-probe" "$CREL/arca-courier" "$CREL/examples/courier-vm-probe" "$DREL/arca-courierd" "$DREL/examples/courierd-vm-probe" "$NREL/examples/cookies-vm-probe" ${NAVBINS:-}; do
     put "$b" /root/arca-test/
     h=$(sha256sum "$b" | cut -d' ' -f1)
     gh=$(g "sha256 -q /root/arca-test/$(basename "$b")")
@@ -299,6 +307,49 @@ i=0; while [ $i -lt 240 ] && [ "$(g "mount -p | grep -c '/jails/system-arca-cour
 check "every courier jail torn down: no mounts left" 0 "$(g "mount -p | grep -c '/jails/system-arca-courier-'" || true)"
 check "every courier jail torn down: no roots left" 0 "$(g "ls /var/lib/atrium/jails | grep -c '^system-arca-courier-'" || true)"
 check "nothing torn down late" 0 "$(g "grep -c 'not torn down' /tmp/courierd.log" || true)"
+if [ "${NAV:-1}" = 1 ]; then
+echo "=== 8. navigatord: presence and personas (navigator-ui.md §2.4, §6.2, step 5)"
+# navigatord as the web broker (uid 50803), converting with prerender; an
+# anonymous page comes from a fixture (the plain way), a page whose site
+# knows you through Arca's couriers to the test server, in its jar.
+N8=/tmp/nav-arca
+g "pkill -x navigatord; rm -rf $N8; mkdir -p $N8/fix/api.example && chmod 755 $N8 && printf '<html><head><title>Plain</title></head><body><p>plain</p></body></html>' > $N8/fix/api.example/a0 && chown -R arcabroker $N8"
+navd() { g "su -m arcabroker -c 'cd $N8 && env NAVIGATORD_SOCKET=$N8/nav.sock NAVIGATORD_PAGE_SOCKET=$N8/page.sock NAVIGATORD_FIXTURES=$N8/fix \
+    NAVIGATORD_STORE=$N8/store NAVIGATORD_PRERENDER=/root/arca-test/prerender NAVIGATORD_ARCA=$S NAVIGATORD_COURIERD=$D \
+    daemon -f -o $N8/$1.log /root/arca-test/navigatord --unconfined-for-testing' </dev/null"; i=0; while [ $i -lt 30 ] && ! g "test -S $N8/nav.sock"; do sleep 1; i=$((i+1)); done; }
+g "chmod 755 /root /root/arca-test"
+navd navd1
+U="https://api.example:$PORT"
+nav() { g "su -m arcabroker -c '/root/arca-test/navctl $N8/nav.sock $*'"; }
+N=$(wc -l < "$SRV/log")
+# §7 left a cookie in the Personal api.example jar: forget it first.
+r=$(nav forget p $U/ open 1 $U/a0 p 0  open 2 $U/n1 p 1  open 3 $U/n2 p 1  open 4 $U/u1 u:a1 1  open 5 $U/u2 u:a1 1  open 6 $U/v1 u:b2 1 \
+        forget u:a1  open 7 $U/u3 u:a1 1  open 8 $U/n3 p 1  forget p $U/n3  open 9 $U/n4 p 1)
+echo "$r" | sed 's/^/    /'
+tail -n +$((N+1)) "$SRV/log" | sed 's/^/    server: /'
+K() { tail -n +$((N+1)) "$SRV/log" | grep -F "GET $1 HTTP" | head -1 | sed 's/.*cookie=//'; }
+check "anonymous: opened the plain way" "opened 1 $U/a0 knows=false from=Fetched" "$(echo "$r" | grep '^opened 1 ')"
+check "…and nothing of it went through Arca" "" "$(K /a0)"
+check "the site knowing you: through Arca, the jar empty at first" - "$(K /n1)"
+check "…then its cookie, in the Personal jar" sid=vm-cookie "$(K /n2)"
+check "…and the page says the site knew you" "opened 3 $U/n2 knows=true from=Fetched" "$(echo "$r" | grep '^opened 3 ')"
+check "an Unrecorded trail: its own jar, empty" - "$(K /u1)"
+check "…its own cookie next" sid=vm-cookie "$(K /u2)"
+check "another Unrecorded trail shares nothing" - "$(K /v1)"
+check "the trail closed: its jar forgotten" - "$(K /u3)"
+check "Personal kept its cookie through that" sid=vm-cookie "$(K /n3)"
+check "Forget this site (Personal): gone" - "$(K /n4)"
+# A crash leaves an Unrecorded jar (b2 has a cookie): the next navigatord
+# forgets every Unrecorded jar before it serves.
+g "pkill -x navigatord; sleep 2; true"
+navd navd2
+check "the next navigatord forgot what was left" yes "$(g "grep -q 'Unrecorded cookie groups left over, forgotten' $N8/navd2.log && ! grep -q ' 0 Unrecorded cookie groups' $N8/navd2.log && echo yes || echo no")"
+N=$(wc -l < "$SRV/log")
+nav open 1 $U/v2 u:b2 1 >/dev/null
+check "…so that trail's cookie is gone" - "$(K /v2)"
+check "no page text in navigatord's store (pages the site knew you on stay in memory)" 0 "$(g "grep -rl 'no token' $N8 2>/dev/null | grep -vc '\.log$'" || true)"
+g "pkill -x navigatord; true"
+fi
 g "pkill -x arca-courierd; true"
 
 echo "=== $pass passed, $fail failed"

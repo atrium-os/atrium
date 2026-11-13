@@ -338,3 +338,53 @@ fn cookie_dates_and_attrs() {
     assert_eq!(sc.attrs.expires, Some(100 + cookie::MAX_AGE_CAP), "capped at 400 days");
     assert_eq!(cookie::parse("a", b"1", b"Domain=x.com", "x.example.com", "/", 0).unwrap_err(), Refused::Domain);
 }
+
+/// A cookie set for `host` in `partition` through the broker's ticket.
+fn jar_cookie(s: &mut State, host: &str, partition: &str, name: &str) {
+    let c = web(host, partition);
+    let t = ticket(s, host, partition, 1, "/", 1, "");
+    assert_eq!(get_t(s, &c, "/", Some(t)).0, status::OK);
+    assert_eq!(set_t(s, &c, name, "", "/", Some(t)), status::OK);
+}
+
+fn jar_has(s: &mut State, host: &str, partition: &str) -> String {
+    let t = ticket(s, host, partition, 1, "/", 1, "");
+    get_t(s, &web(host, partition), "/", Some(t)).1
+}
+
+fn forget(s: &mut State, who: &Label, partition: &str, prefix: u8) -> (u8, u32) {
+    let r = s.handle(who, arcad::proto::broker_op::W_FORGET, &body(|w| { w.str(partition); w.u8(prefix); }));
+    let n = r.body.bytes().try_into().map(u32::from_le_bytes).unwrap_or(0);
+    (r.status, n)
+}
+
+#[test]
+fn the_broker_forgets_a_jar_an_unrecorded_trails_or_all_of_them() {
+    let (_d, mut s) = setup();
+    let (u1, u2) = ("u-00000000000000a1.example.com", "u-00000000000000b2.example.com");
+    jar_cookie(&mut s, "www.example.com", "example.com", "home");
+    jar_cookie(&mut s, "www.example.com", u1, "one");
+    jar_cookie(&mut s, "www.example.com", u2, "two");
+    jar_cookie(&mut s, "news.example", "news.example", "news");
+    // One Unrecorded trail closes: its jar only.
+    assert_eq!(forget(&mut s, &broker(), "u-00000000000000a1.", 1), (status::OK, 1));
+    assert_eq!(jar_has(&mut s, "www.example.com", u1), "");
+    assert_eq!(jar_has(&mut s, "www.example.com", u2), "two=v");
+    assert_eq!(jar_has(&mut s, "www.example.com", "example.com"), "home=v");
+    // The broker starts: every Unrecorded jar a crash may have left.
+    assert_eq!(forget(&mut s, &broker(), "u-", 1), (status::OK, 1));
+    assert_eq!(jar_has(&mut s, "www.example.com", u2), "");
+    // "Forget this site" in the Personal persona: that partition exactly.
+    assert_eq!(forget(&mut s, &broker(), "example.com", 0), (status::OK, 1));
+    assert_eq!(jar_has(&mut s, "www.example.com", "example.com"), "");
+    assert_eq!(jar_has(&mut s, "news.example", "news.example"), "news=v");
+    // A prefix that is not an Unrecorded jar's, or junk, is refused; and
+    // only the broker may ask.
+    for (p, x) in [("e", 1), ("u-123.", 1), ("u-00000000000000A1.", 1), ("example.com", 2), ("", 0)] {
+        assert_eq!(forget(&mut s, &broker(), p, x).0, status::MALFORMED, "{p:?} {x}");
+    }
+    let app = Label::App { user: "alice".into(), publisher: [9; 32], app_id: "org.example.mail".into() };
+    assert_ne!(forget(&mut s, &app, "u-", 1).0, status::OK);
+    assert_ne!(forget(&mut s, &web("www.example.com", "example.com"), "u-", 1).0, status::OK);
+    assert_eq!(jar_has(&mut s, "news.example", "news.example"), "news=v");
+}

@@ -12,6 +12,7 @@ path = "src/main.rs"
 
 [dependencies]
 navigator-control = { path = "../navigator-control" }
+navigator-cookies = { path = "../navigator-cookies" }
 navigator-backend = { path = "../navigator-backend" }
 navigator-prerender = { path = "../navigator-prerender" }
 fresco-split = { path = "../fresco-split" }

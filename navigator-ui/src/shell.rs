@@ -78,6 +78,8 @@ pub enum LivePage {
 pub enum Out {
     /// A link pressed in the page (the href as the page spells it).
     Activate { page: String, href: String, beside: bool },
+    /// The person told a site to forget them in a jar (§6.2).
+    Forget { jar: navigator_control::Jar, url: String },
 }
 
 /// A page about to be opened by navigatord: its title is its host until
@@ -373,13 +375,21 @@ impl Shell {
         }
     }
 
-    /// Presence (§6.2). Step 5 makes this a menu and sends the broker
-    /// `Cookies { allow }`; here it switches the stand-in flag.
+    /// Presence (§6.2): let the page's site remember you in this trail's
+    /// jar, or forget it there. Either way the page opens again (live: the
+    /// page child that showed it no longer matches), with or without the
+    /// jar's cookies; forgetting also has navigatord tell Arca to destroy
+    /// that site's jar.
     pub fn toggle_presence(&mut self) {
         let Some(p) = self.store.trail().page() else { return };
-        let site = crate::trail::site(&p.url).to_string();
+        let url = p.url.clone();
+        let site = crate::trail::site(&url).to_string();
         let on = !self.store.knows(&site);
         self.store.set_knows(&site, on);
+        if !on && self.live.is_some() {
+            self.outbox.push(Out::Forget { jar: self.store.trail().jar(), url });
+        }
+        self.last_note = Some(if on { format!("{site} may remember you in this trail's jar") } else { format!("{site} forgotten in this trail's jar") });
     }
 
     pub fn toggle_mute(&mut self, trail: usize) {
@@ -534,6 +544,22 @@ mod tests {
         assert_eq!(s.shown_url().as_deref(), Some("https://atlas.example/wiki/Atrium"));
         s.apply(Action::Forward, 0.0);
         assert_eq!(s.shown_url().as_deref(), Some("https://atlas.example/wiki/Impluvium"));
+        // Presence: letting the site remember you asks nothing of
+        // navigatord until the page opens again; forgetting it does.
+        s.outbox.clear();
+        s.toggle_presence();
+        let key = s.shown_key().unwrap();
+        assert_eq!(s.store.presence_of(key.0, "https://atlas.example/x"), Some((navigator_control::Jar::Personal, true)));
+        assert!(s.outbox.is_empty());
+        s.toggle_presence();
+        assert_eq!(s.outbox, vec![Out::Forget { jar: navigator_control::Jar::Personal, url: "https://atlas.example/wiki/Impluvium".into() }]);
+        // An Unrecorded trail has its own jar, and the site doesn't know you there.
+        s.toggle_presence();
+        s.store.new_trail(true);
+        s.enter("https://atlas.example/wiki/Atrium");
+        let (t, _) = s.shown_key().unwrap();
+        let (jar, knows) = s.store.presence_of(t, "https://atlas.example/").unwrap();
+        assert!(matches!(jar, navigator_control::Jar::Unrecorded(j) if j != 0) && !knows);
     }
 
     #[test]

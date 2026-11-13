@@ -156,6 +156,12 @@ impl TicketAsk {
 /// Arca, as the broker sees it.
 pub trait Arca {
     fn ticket(&mut self, ask: &TicketAsk) -> Result<[u8; 16], String>;
+    /// Forget jars (arcad `W_FORGET`): one partition, or every partition
+    /// beginning with `partition` when `prefix` (an Unrecorded jar's, or
+    /// all of them). Returns how many cookie groups went.
+    fn forget(&mut self, _partition: &str, _prefix: bool) -> Result<u32, String> {
+        Err("this Arca cannot forget".into())
+    }
 }
 
 /// The couriers: one per (host, port, partition), from Arca's launcher.
@@ -183,6 +189,23 @@ pub fn partition_of(top_url: &str) -> Option<String> {
     Some(arcad::cookie::site(u.host_str()?))
 }
 
+/// An Unrecorded trail's jar prefix (navigator-ui.md §2.4): every partition
+/// of that trail begins with it, so closing the trail forgets them all.
+pub fn jar_prefix(jar: u64) -> String {
+    format!("{}{jar:016x}.", arcad::proto::broker_op::UNRECORDED)
+}
+
+/// The partition for `top_url` in a persona's jar: the site itself for
+/// Personal (`jar` `None`), else the site under the Unrecorded trail's
+/// prefix, so two Unrecorded trails, or one and Personal, share nothing.
+pub fn partition_in(jar: Option<u64>, top_url: &str) -> Option<String> {
+    let site = partition_of(top_url)?;
+    Some(match jar {
+        None => site,
+        Some(j) => format!("{}{site}", jar_prefix(j)),
+    })
+}
+
 impl<A: Arca, C: Couriers> Broker<A, C> {
     pub fn new(arca: A, couriers: C) -> Self { Broker { arca, couriers, views: HashMap::new(), tickets: 0 } }
 
@@ -191,7 +214,12 @@ impl<A: Arca, C: Couriers> Broker<A, C> {
     /// moves to another SITE starts uncookied again — consent given to one
     /// site is not consent given to the next.
     pub fn show(&mut self, view: ViewId, top_url: &str) -> Result<(), Refused> {
-        let p = partition_of(top_url).ok_or_else(|| Refused::Malformed(format!("no host in {top_url:?}")))?;
+        self.show_in(view, top_url, None)
+    }
+
+    /// [`Self::show`] in a persona's jar ([`partition_in`]).
+    pub fn show_in(&mut self, view: ViewId, top_url: &str, jar: Option<u64>) -> Result<(), Refused> {
+        let p = partition_in(jar, top_url).ok_or_else(|| Refused::Malformed(format!("no host in {top_url:?}")))?;
         match self.views.get_mut(&view) {
             Some(v) if v.partition == p => {}
             _ => { self.views.insert(view, View { partition: p, cookied: None }); }
@@ -325,6 +353,19 @@ impl Arca for ArcadSocket {
         let (st, body) = arcad::proto::read_reply(&mut s).map_err(|e| format!("arcad: {e}"))?;
         if st != arcad::proto::status::OK { return Err(format!("arcad refused the ticket (status {st})")) }
         body.as_ref().try_into().map_err(|_| "arcad: a ticket is 16 bytes".to_string())
+    }
+
+    fn forget(&mut self, partition: &str, prefix: bool) -> Result<u32, String> {
+        let mut s = UnixStream::connect(&self.path).map_err(|e| format!("arcad: {e}"))?;
+        s.set_read_timeout(Some(Duration::from_secs(10))).ok();
+        let mut w = Writer::new();
+        w.str(partition);
+        w.u8(prefix as u8);
+        arcad::proto::write_request(&mut s, arcad::proto::broker_op::W_FORGET, &w.buf).map_err(|e| format!("arcad: {e}"))?;
+        let (st, body) = arcad::proto::read_reply(&mut s).map_err(|e| format!("arcad: {e}"))?;
+        if st != arcad::proto::status::OK { return Err(format!("arcad refused to forget (status {st})")) }
+        let b: [u8; 4] = body.as_ref().try_into().map_err(|_| "arcad: a count is 4 bytes".to_string())?;
+        Ok(u32::from_le_bytes(b))
     }
 }
 

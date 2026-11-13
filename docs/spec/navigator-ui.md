@@ -1109,6 +1109,32 @@ Each step runs in the VM on headless frescod before the next.
      `Save`/`Restore`, which waits for navigatord to host sessions; idle expiry as a park; the rail
      saying why a page can't be parked; fading in a restore.
 5. **Presence and personas.** The cookie action, Arca partitions, Unrecorded.
+   *Built 2026-11-13:*
+   - **Jars.** Every open names its jar (`navigator_control::Jar`): Personal, or one Unrecorded
+     trail's own, a random 64-bit id the UI picks when the trail opens. Arca's partition is
+     (persona, site) as the partition string: the site for Personal, `u-<16 hex>.<site>` for an
+     Unrecorded trail (`navigator_cookies::partition_in`), so no two trails' jars meet.
+   - **Presence.** The toolbar control lets the page's site remember you in the trail's jar, or
+     forgets it there. The page opens again (its child no longer matches what was asked), with
+     `Open { knows }`. navigatord then fetches the page and everything it loads through Arca's
+     couriers with the broker's tickets (navigator-cookies), in that partition. Plain `http` still
+     goes the plain way. Without Arca, the page opens anonymously, the UI says why and the control
+     goes back to "doesn't know you". The
+     Personal persona's choices are kept in the trail store (`knows`); Unrecorded ones never.
+   - **Private conversions.** Only an anonymous Personal page is cached for everyone and written
+     to navigatord's store. A page the site knew you on, and every Unrecorded page, is cached
+     under its jar and kept in memory only.
+   - **Forgetting.** Turning presence off sends `Forget { jar, url }`; an Unrecorded trail that
+     closes sends `Forget { jar }`. navigatord drops that jar's pages and asks Arca to destroy the
+     jar's cookie groups and their keys (arcad `W_FORGET`, arca.md §8.7). At start navigatord
+     forgets every Unrecorded jar, so a crash leaves none. The table's "in memory" for Unrecorded
+     cookies is met by destroying the keys rather than by never writing: arcad keeps them like
+     any cookie until the trail closes or navigatord restarts.
+   - Checked against the real Arca in `scripts/arca-vm-test.sh` §8, and the control in
+     `scripts/navigator-live-vm.sh` (no Arca there: it says so). Not yet: the presence menu
+     (account, Sign out here), the site asking (consent buttons, `SiteNeedsIt`), named personas,
+     session cookies ending with the last view, and moving a branch into its own trail with its
+     jar.
 6. **Islands and prompts.** The `island` slot kind, the prompt row with its press rule, downloads,
    app hand-off.
 7. **Reading controls, find, history view, keyboard map, accessibility tree.**
