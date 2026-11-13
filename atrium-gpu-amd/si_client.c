@@ -377,6 +377,13 @@ si_recover(struct amd_si_client *c, const char *why)
 
 	sx_assert(&c->uq_sx, SA_XLOCKED);
 	amd_si_lose(sc, why);		/* the reset, bus mastering off */
+	/*
+	 * The scrub engine off first: it waits out a range in progress (which
+	 * fails at once now) that still uses the kernel queue. ce098609 took
+	 * the queue first, so a running scrub could use a NULL queue (the
+	 * suspect for that box run's hang).
+	 */
+	amd_vram_set_clear(sc, NULL);
 	mtx_lock(&sc->lock);
 	si_uq_lost_all(c);
 	for (i = 0; i < AMD_UQ_SLOTS; i++)
@@ -393,9 +400,7 @@ si_recover(struct amd_si_client *c, const char *why)
 	kq = c->kq;
 	c->kq = NULL;
 	mtx_unlock(&sc->lock);
-	/* Off the old card: the scrub engine (waits out a range in progress,
-	 * which fails at once now), the IV consumer, the kernel queue. */
-	amd_vram_set_clear(sc, NULL);
+	/* Off the old card: the IV consumer, the kernel queue. */
 	amd_ih7_set_consumer(c->ih, NULL, NULL);
 	c->ih = NULL;
 	amd_mes12_kq_free_lost(kq);
@@ -1428,12 +1433,15 @@ si_vram_clear(struct atrium_amd_softc *sc, uint64_t off, uint64_t len)
 {
 	struct amd_si_client *c = sc->si_client;
 	struct atrium_amd_vram *v = &sc->vram;
+	struct amd_kq *kq;
 	uint32_t seq, gen;
 	uint64_t n;
 	sbintime_t end;
 	int err = 0;
 
-	if (c == NULL || c->kq == NULL || !amd_si_usable(sc))
+	/* The queue as it is now: a GPU re-init (si_recover) swaps it, but
+	 * only after amd_vram_set_clear(NULL) has waited this call out. */
+	if (c == NULL || (kq = c->kq) == NULL || !amd_si_usable(sc))
 		return (ENXIO);
 	if ((off & PAGE_MASK) != 0 || (len & PAGE_MASK) != 0 || len == 0 ||
 	    off < v->lo || off + len > v->lo + v->total)
@@ -1446,7 +1454,7 @@ si_vram_clear(struct atrium_amd_softc *sc, uint64_t off, uint64_t len)
 		/* Wait for the queue to be idle between client submits. */
 		for (;;) {
 			mtx_lock(&sc->lock);
-			err = c->broken ? EIO : amd_mes12_kq_fill(c->kq,
+			err = c->broken ? EIO : amd_mes12_kq_fill(kq,
 			    c->gt->fb_start + off, n, &seq, &gen);
 			if (err == 0)
 				c->scrub_fills++;
@@ -1457,14 +1465,14 @@ si_vram_clear(struct atrium_amd_softc *sc, uint64_t off, uint64_t len)
 				break;
 			pause_sbt("vramidl", SBT_1MS, 0, 0);
 		}
-		while (err == 0 && !fence_passed(amd_mes12_kq_fence(c->kq),
-		    seq) && amd_mes12_kq_gen(c->kq) == gen) {
+		while (err == 0 && !fence_passed(amd_mes12_kq_fence(kq),
+		    seq) && amd_mes12_kq_gen(kq) == gen) {
 			if (sbinuptime() >= end || !amd_si_usable(sc))
 				err = ETIMEDOUT;
 			else
 				pause_sbt("vramscr", SBT_1MS, 0, 0);
 		}
-		if (err == 0 && amd_mes12_kq_gen(c->kq) != gen)
+		if (err == 0 && amd_mes12_kq_gen(kq) != gen)
 			err = EIO;	/* reset under it: not known done */
 		off += n;
 		len -= n;
@@ -1570,7 +1578,8 @@ amd_si_client_down(struct atrium_amd_softc *sc)
 	device_printf(sc->dev, "si: VRAM scrub: %ju fills, %ju waits for an "
 	    "idle queue\n", (uintmax_t)c->scrub_fills,
 	    (uintmax_t)c->scrub_busy_waits);
-	amd_ih7_set_consumer(c->ih, NULL, NULL);
+	if (c->ih != NULL)	/* NULL: a GPU re-init failed */
+		amd_ih7_set_consumer(c->ih, NULL, NULL);
 	callout_drain(&c->uq_poll);
 	taskqueue_drain(taskqueue_thread, &c->uq_task);
 	if (c->uq_live != 0)
