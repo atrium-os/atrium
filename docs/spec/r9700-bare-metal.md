@@ -1555,3 +1555,14 @@ work (self-test, scrub).
   out the re-init window before the last si-client-test; no TLB flushes while
   the card is lost or in reset; find what the type 0x04 EOP IV is. Logs:
   claude/project-thread-33aauq 1c503465.
+- **2026-11-13 19:44, 1 h fuzz diagnostic (2963f5db): PASS.** si-fuzz
+  RESULT: PASS (0 findings), health check clean; si-client-test 92/0 before
+  and 92/0 after (the runner waited 610 s after 9 fuzz-time re-inits); 0
+  flush timeouts; card proven idle at detach, both modules unloaded, no
+  reboot. Re-inits: 3 single and 3 pairs ~17 s apart, so stopping the
+  workers at "lost" did not remove every pair; each reset follows SUSPEND
+  refused, REMOVE_QUEUE refused ("still mapped ... leaked", freed after the
+  reset), a VMID 0 fault. Type 0x04 EOP IVs (doorbells 0x20, 0x28, 0x2c)
+  still unexplained. Depth caveat: the 610 s pauses after each re-init left
+  only 267085 ioctl calls and 14 blob jobs in the hour. Logs:
+  claude/project-thread-33aauq acb4634d.
