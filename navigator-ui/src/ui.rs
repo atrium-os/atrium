@@ -383,6 +383,7 @@ fn rail(ctx: &mut Ctx, s: &Shell, g: &Geo, st: &Mutable<Shell>) {
     }
 
     // Earlier: trails put away, by day (§4.5).
+    let now_s = crate::clock::now_s();
     if !s.store.earlier.is_empty() && y + 60.0 < bottom {
         y += 8.0;
         label(ctx, y, "EARLIER");
@@ -400,9 +401,10 @@ fn rail(ctx: &mut Ctx, s: &Shell, g: &Geo, st: &Mutable<Shell>) {
             let ts = sans(type_size::SM, Weight::Regular, t.text_secondary());
             text(ctx, 46.0, y + 16.0, &fit(e.trail.title(), &ts, 150.0), type_size::SM, Weight::Regular, t.text_secondary());
             let ds = sans(type_size::XXS, Weight::Regular, t.text_tertiary());
-            text(ctx, 228.0 - width(&e.day, &ds), y + 16.0, &e.day, type_size::XXS, Weight::Regular, t.text_tertiary());
+            let day = crate::clock::day_label(e.at_s, now_s);
+            text(ctx, 228.0 - width(&day, &ds), y + 16.0, &day, type_size::XXS, Weight::Regular, t.text_tertiary());
             ctx.pop();
-            ctx.tooltip(id, format!("Put away {} · click to bring it back", e.at));
+            ctx.tooltip(id, format!("Put away {} · click to bring it back", crate::clock::when_label(e.at_s, now_s)));
             y += 32.0;
         }
     }
@@ -1025,13 +1027,21 @@ fn start(ctx: &mut Ctx, s: &Shell, g: &Geo, st: &Mutable<Shell>) {
             area(ctx, Rect::new(x - 8.0, y, 420.0, 30.0), 6.0, Color::TRANSPARENT, t.state_hover(), move || with(&st2, |s| {
                 s.end_edit();
                 // Bring it back in place of this empty trail on Start.
-                s.store.put_away("now");
+                s.store.put_away(crate::clock::now_s());
                 s.store.bring_back(i);
             }));
             monogram(ctx, x, y + 5.0, e.trail.page().map_or("", |p| &p.url), false);
             text(ctx, x + 30.0, y + 15.0, e.trail.title(), type_size::SM, Weight::Regular, t.text_primary());
-            text(ctx, x + 320.0, y + 15.0, &e.at, type_size::XS, Weight::Regular, t.text_tertiary());
+            text(ctx, x + 320.0, y + 15.0, &crate::clock::when_label(e.at_s, crate::clock::now_s()), type_size::XS, Weight::Regular, t.text_tertiary());
             ctx.pop();
+            // Forget: its records go now (§4.5).
+            let st3 = st.clone();
+            let fid = area(ctx, Rect::new(x + 432.0, y + 3.0, 24.0, 24.0), 6.0, Color::TRANSPARENT, t.state_hover(), move || with(&st3, |s| {
+                s.store.forget(i);
+            }));
+            icon(ctx, x + 436.0, y + 7.0, ph::X, 16.0, t.text_tertiary());
+            ctx.pop();
+            ctx.tooltip(fid, "Forget this trail");
             y += 30.0;
         }
     }

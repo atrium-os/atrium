@@ -158,7 +158,7 @@ mod tests {
         s.kept.push(crate::trail::Kept { url: "https://atlas.example/wiki/Impluvium".into(), title: "Impluvium".into() });
         let mut old = Trail::new(0, false);
         old.follow(spec("https://blog.rust.example/impl-trait", "impl Trait"));
-        s.earlier.push(crate::trail::PutAway { trail: old, day: "Wed".into(), at: String::new() });
+        s.earlier.push(crate::trail::PutAway { trail: old, at_s: 0 });
         s.current = 0;
 
         let v = suggest(&s, "impl");

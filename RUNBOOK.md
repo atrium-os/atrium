@@ -5577,9 +5577,9 @@ Ctrl-B through frescod's injector and checks the `NAVIGATOR_UI_TRACE` lines. Coo
 forum-wm's placement (window top at y 62 with no bar running). By hand:
 `FRESCO_SOCKET=… navigator-ui --scene start --dark`; `NAVIGATOR_UI_SECS`, `NAVIGATOR_UI_SIZE=WxH`.
 
-### 13.6d Navigator: one live page (`scripts/navigator-live-vm.sh`)
+### 13.6d Navigator: one live page and trails on disk (`scripts/navigator-live-vm.sh`)
 
-Step 2 of docs/spec/navigator-ui.md §14. With the VM up:
+Steps 2 and 3 of docs/spec/navigator-ui.md §14. With the VM up:
 
     sh scripts/navigator-live-vm.sh [out-dir]       # ~20 min under TCG, BUILD=0 skips the cross-build
 
@@ -5592,6 +5592,14 @@ limend binds `navigator-page` into the page slot, the child redeems its ticket, 
 navigatord, Back / Alt-Right / Alt-Left, an http link (amber), a `javascript:` link refused. Frames in
 `scratch/navigator-live/`. Not the shipped confinement: no bundles or worker rules for the page child
 and converter yet.
+
+Step 3 (trails on disk) is checked in the same run: navigator-ui writes its trail store to
+`NAVIGATOR_TRAILS` (here `/tmp/nlive/trails.json`; by default `~/.local/share/atrium/navigator/trails.json`,
+mode 0600, written whole through a temporary file at most once a second). The script checks the file has
+the trail's addresses and no page text, restarts navigator-ui and finds the trail on its page, opens a
+second trail, puts it away with Ctrl-W, restarts, finds it in Earlier, and brings it back with
+Ctrl-Shift-T. A store navigator-ui cannot read is moved aside to `trails.json.unreadable` (never
+overwritten); a bad trail in it is dropped alone and logged as `trail store: dropped …`.
 
 Cross-building prerender and navigatord compiles ring's C: the script sets `CC_aarch64_unknown_freebsd`
 to clang with `--sysroot`, which needs FreeBSD's headers in the sysroot. If `assert.h` is missing:

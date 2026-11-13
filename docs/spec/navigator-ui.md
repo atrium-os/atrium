@@ -1065,6 +1065,24 @@ Each step runs in the VM on headless frescod before the next.
      converter are not yet jailed and pages come from fixtures. Open: their bundles and worker
      rules, the Navigator's keys while the page has the focus, images and anchors in the child.
 3. **Trails.** The tree, open beside, put away and Earlier, the trail store on disk.
+   *Built 2026-11-13:*
+   - The tree, open beside, put away and Earlier were built in step 1. Earlier now carries the
+     time a trail was put away (rows grouped Today, Yesterday, weekday, date), drops entries after
+     30 days, and has **Forget** on Start's list, which removes the records at once.
+   - The trail store on disk (`navigator_ui::disk`): one JSON file, format
+     `atrium-navigator-trails/1`, at `NAVIGATOR_TRAILS` or `~/.local/share/atrium/navigator/trails.json`
+     (in the Tessera home, so encrypted with the session). Per page: address, title, search, parent,
+     seen; per trail: current page, muted, last active; Earlier with its time; kept pages; the sites
+     the Personal persona lets know you. No page content and no children list (rebuilt from parents).
+     Unrecorded trails and their Earlier entries are never written.
+   - Writes are whole or nothing (a temporary file renamed over it), mode 0600 in a 0700 directory,
+     at most once a second and only when the records changed. Reading is bounded (64 MiB file, 512
+     trails, 4096 Earlier, 16 KiB addresses) and validated per trail: a trail that fails (a parent
+     after its child, a current page out of range, control characters) is dropped alone. A file that
+     cannot be read at all is moved aside, never overwritten.
+   - Checked in `scripts/navigator-live-vm.sh` (RUNBOOK §13.6d). Not yet: the broker's saved
+     address and version history per page (they come with step 4's parking), and the content
+     store collecting pages only a forgotten trail referred to.
 4. **Parking.** Save and restore under the broker's budget; measure restore time on the Mac
    (HVF) and the R9700 box, and set the live budget from it.
 5. **Presence and personas.** The cookie action, Arca partitions, Unrecorded.

@@ -1,5 +1,5 @@
 #!/bin/sh
-# navigator-ui step 2 (docs/spec/navigator-ui.md §14): one live page in the
+# navigator-ui steps 2 and 3 (docs/spec/navigator-ui.md §14): one live page in the
 # FreeBSD dev VM. Split-mode frescod with its chrome channel, forum-wm,
 # limend (limend-dev: providers started unconfined), navigatord (fixture
 # pages, the converter as an ordinary process) and navigator-ui, driven
@@ -15,7 +15,9 @@
 # What it does check is the wiring: navigatord opens a page, the child
 # redeems its ticket and draws it in the UI's page slot, links go through
 # navigatord, Back and Forward walk the trail, and frescod's strip names
-# the page's origin. TCG is slow: WAIT (default 90) seconds per step.
+# the page's origin. Step 3: the trail store is written as trails change,
+# holds no page content, and brings trails and Earlier back after a
+# restart. TCG is slow: WAIT (default 90) seconds per step.
 set -eu
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 OUT="${1:-$ROOT/scratch/navigator-live}"
@@ -101,8 +103,10 @@ last() { g "grep 'trace' $S/ui.log | tail -1"; }
 until_trace() { i=0; while [ $i -lt "$WAIT" ]; do last | grep -q "$1" && return 0; sleep 3; i=$((i+3)); done; return 1; }
 
 echo "=== drive"
-g "cd $S && env FRESCO_SOCKET=$S/fresco.sock NAVIGATORD_SOCKET=$S/nav.sock LIMEN_SOCKET=$S/limend.sock NAVIGATOR_UI_TRACE=1 \
-    NAVIGATOR_UI_OPEN=https://atlas.example/wiki/Atrium daemon -f -o $S/ui.log $D/navigator-ui --light </dev/null"
+# ui [open-url] [log]: start navigator-ui on the run's trail store.
+ui() { g "cd $S && env FRESCO_SOCKET=$S/fresco.sock NAVIGATORD_SOCKET=$S/nav.sock LIMEN_SOCKET=$S/limend.sock NAVIGATOR_UI_TRACE=1 \
+    NAVIGATOR_TRAILS=$S/trails.json ${1:+NAVIGATOR_UI_OPEN=$1} daemon -f -o $S/${2:-ui}.log $D/navigator-ui --light </dev/null"; }
+ui https://atlas.example/wiki/Atrium
 until_trace 'url=https://atlas.example/wiki/Atrium live=shown' && ok "the first page opened through navigatord" || bad "first page: $(last)"
 sleep "$GAP"
 g "grep -q 'page child attached' $S/ui.log" && ok "limend bound the page child into the slot" || bad "no page child: $(g "tail -5 $S/limend.log")"
@@ -136,8 +140,39 @@ press $((PX + 300)) $((TOP + PY + 260))
 shot live-4-page-focused
 g "pkill -x navigator-ui; sleep 2; true"
 
+echo "=== trails on disk (step 3)"
+# The trail store was written as it changed; it holds records, not pages.
+g "test -f $S/trails.json" && ok "the trail store was written" || bad "no $S/trails.json"
+g "stat -f %Lp $S/trails.json" | grep -qx 600 && ok "the store is the user's alone (0600)" || bad "mode $(g "stat -f %Lp $S/trails.json")"
+g "grep -q 'old-atlas.example' $S/trails.json && grep -q 'wiki/Impluvium' $S/trails.json" && ok "it has the trail's pages" || bad "store: $(g "head -c 400 $S/trails.json")"
+g "grep -q 'rooms of the house' $S/trails.json" && bad "page text in the trail store" || ok "no page text in it"
+# A restart comes back on the same trail and page.
+last() { g "grep 'trace' $S/ui2.log | tail -1"; }
+ui "" ui2
+until_trace 'url=https://atlas.example/wiki/Atrium live=shown' && ok "after a restart the trail came back on its page" || bad "restart: $(last)"
+last | grep -q 'pages=3 ' && ok "with its three pages" || bad "pages: $(last)"
+# A second trail, put away with Ctrl-W (a press on the toolbar first, so
+# the keys go to the Navigator and not the page).
+g "pkill -x navigator-ui; sleep 2; true"
+last() { g "grep 'trace' $S/ui3.log | tail -1"; }
+ui http://old-atlas.example/ ui3
+until_trace 'url=http://old-atlas.example/ live=shown' && last | grep -q 'trails=2 ' && ok "a second trail opened beside the restored one" || bad "second trail: $(last)"
+press 270 $((TOP + 20))     # the toolbar (Back is off here)
+key 0x1a 0x01               # Ctrl-W (HID modifier byte: ctrl 1, shift 2, alt 4)
+until_trace 'trails=1 earlier=1' && ok "Ctrl-W put it away" || bad "put away: $(last)"
+sleep 3
+g "pkill -x navigator-ui; sleep 2; true"
+last() { g "grep 'trace' $S/ui4.log | tail -1"; }
+ui "" ui4
+until_trace 'trails=1 earlier=1 .*url=https://atlas.example/wiki/Atrium live=shown' && ok "Earlier survived a restart" || bad "earlier: $(last)"
+press 270 $((TOP + 20))     # the toolbar (Back is off here)
+key 0x17 0x03               # Ctrl-Shift-T
+until_trace 'trails=2 earlier=0 .*url=http://old-atlas.example/ live=shown' && ok "Ctrl-Shift-T brought it back and opened its page" || bad "bring back: $(last)"
+shot live-5-restored
+g "pkill -x navigator-ui; sleep 2; true"
+
 echo "=== logs"
-for l in navigatord limend ui; do echo "--- $l"; g "grep -v trace $S/$l.log | tail -12"; done
+for l in navigatord limend ui ui4; do echo "--- $l"; g "grep -v trace $S/$l.log | tail -12"; done
 g "grep -iE 'chrome|slot|origin|panic' $S/frescod.log | tail -8; true"
 echo "navigator-live: $fails failed"
 [ "$fails" = 0 ]

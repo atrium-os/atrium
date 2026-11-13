@@ -14,13 +14,17 @@
 //! opens on a fresh trail on Start; pages come from navigatord and are
 //! drawn by a doc-viewer child that limend (`LIMEN_SOCKET`) binds into the
 //! page slot. `NAVIGATOR_UI_OPEN=url` opens one at start.
+//!
+//! Step 3 (`navigator_ui::disk`): in live mode the trail store is read at
+//! start and written back as it changes, at `NAVIGATOR_TRAILS` or
+//! ~/.local/share/atrium/navigator/trails.json (§4.5).
 
 use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use navigator_ui::fake::Scene;
-use navigator_ui::keys;
+use navigator_ui::{disk, keys};
 use navigator_ui::live::Live;
 use navigator_ui::shell::{Shell, PAGE_SLOT};
 use navigator_ui::trail::TrailStore;
@@ -112,16 +116,20 @@ fn main() -> std::io::Result<()> {
         None => Window::open(&desc)?,
     };
     window.follow_appearance(theme.is_none());
+    let trails_path = disk::path();
     let dirty = Arc::new(AtomicBool::new(true));
     let mut shell = match (scene, &live) {
         (Some(sc), _) => Shell::scene(sc, window.width, window.height),
         (None, Some(_)) => {
-            let mut s = Shell::new(TrailStore::empty(), window.width, window.height);
+            let store = restore(&trails_path);
+            let mut s = Shell::new(store, window.width, window.height);
             s.live = Some(navigator_ui::shell::LivePage::Loading(String::new()));
-            s.store.new_trail(false);
             if let Ok(u) = std::env::var("NAVIGATOR_UI_OPEN") {
+                if s.store.trail().page().is_some() {
+                    s.store.new_trail(false);
+                }
                 s.enter(&u);
-            } else {
+            } else if s.store.trail().page().is_none() {
                 s.begin_edit();
             }
             s
@@ -157,10 +165,18 @@ fn main() -> std::io::Result<()> {
         None => window.set_slot_binder(Box::new(LogBinder)),
     }
 
+    // The trail store goes to disk (§4.5) in live mode: at most once a
+    // second, and only when its records changed.
+    let mut saver = live.as_ref().map(|_| Saver::new(trails_path, &state.get_cloned().store));
     loop {
         match window.step(&mut app, Some(TICK))? {
             StepResult::Event(raw) => event(&raw, &state),
-            StepResult::Closed => return Ok(()),
+            StepResult::Closed => {
+                if let Some(sv) = &mut saver {
+                    sv.save(&state.get_cloned().store, true);
+                }
+                return Ok(());
+            }
             StepResult::Timeout => {}
         }
         if let Some(l) = &mut live {
@@ -169,6 +185,74 @@ fn main() -> std::io::Result<()> {
                 navigator_ui::ui::trace(&mut s);
                 state.set(s);
             }
+        }
+        if let Some(sv) = &mut saver {
+            sv.save(&state.get_cloned().store, false);
+        }
+    }
+}
+
+/// The store from disk, Earlier past its 30 days dropped; an empty one
+/// with a fresh trail when there is none (or it cannot be read).
+fn restore(p: &std::path::Path) -> TrailStore {
+    let mut store = match disk::load(p, &|u| navigator_ui::shell::live_spec(u).facts) {
+        Ok(Some((s, dropped))) => {
+            for d in dropped {
+                eprintln!("navigator-ui: trail store: dropped {d}");
+            }
+            eprintln!("navigator-ui: trail store: {} trails, {} put away, from {}", s.trails.len(), s.earlier.len(), p.display());
+            s
+        }
+        Ok(None) => {
+            let mut s = TrailStore::empty();
+            s.new_trail(false);
+            s
+        }
+        Err(e) => {
+            // Kept aside rather than overwritten, so nothing is lost to a bug.
+            let aside = p.with_extension("json.unreadable");
+            let _ = std::fs::rename(p, &aside);
+            eprintln!("navigator-ui: trail store: {e}; moved it to {} and started afresh", aside.display());
+            let mut s = TrailStore::empty();
+            s.new_trail(false);
+            s
+        }
+    };
+    let gone = store.expire(navigator_ui::clock::now_s());
+    if gone > 0 {
+        eprintln!("navigator-ui: trail store: {gone} put-away trails past 30 days forgotten");
+    }
+    store
+}
+
+struct Saver {
+    path: std::path::PathBuf,
+    last: String,
+    at: Instant,
+}
+
+impl Saver {
+    fn new(path: std::path::PathBuf, store: &TrailStore) -> Self {
+        // Unchanged from disk is not written, except that a store read
+        // with records dropped or expired is written back as it now is.
+        let last = std::fs::read_to_string(&path).unwrap_or_default();
+        let mut sv = Saver { path, last, at: Instant::now() - Duration::from_secs(2) };
+        sv.save(store, true);
+        sv
+    }
+
+    fn save(&mut self, store: &TrailStore, now: bool) {
+        if !now && self.at.elapsed() < Duration::from_secs(1) {
+            return;
+        }
+        let text = disk::encode(store);
+        if text == self.last {
+            return;
+        }
+        self.at = Instant::now();
+        match disk::save(&self.path, &text) {
+            Ok(()) => self.last = text,
+            Err(e) => eprintln!("navigator-ui: trail store: {}: {e}", self.path.display()),
         }
     }
 }

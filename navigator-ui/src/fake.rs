@@ -145,10 +145,11 @@ pub fn store() -> TrailStore {
     let mut s = TrailStore::empty();
 
     // Put away earlier, oldest first so the newest ends up on top.
-    for (u, day, at) in [
-        ("https://tessera.example/notes/cas", "Mon", "Mon 18:20"),
-        ("https://atlas.example/wiki/Pantheon_dome_concrete", "Wed", "Wed 21:05"),
-        ("https://bread.example/hydration-tables", "Wed", "Wed 22:40"),
+    let now = crate::clock::now_s();
+    for (u, ago_h) in [
+        ("https://tessera.example/notes/cas", 74),
+        ("https://atlas.example/wiki/Pantheon_dome_concrete", 27),
+        ("https://bread.example/hydration-tables", 25),
     ] {
         let mut t = trail(&[u]);
         if u.contains("bread") {
@@ -156,7 +157,7 @@ pub fn store() -> TrailStore {
         } else if u.contains("tessera") {
             t.pages[0].title = "Tessera CAS notes".into();
         }
-        s.earlier.insert(0, PutAway { trail: t, day: day.into(), at: at.into() });
+        s.earlier.insert(0, PutAway { trail: t, at_s: now - ago_h * 3600 });
     }
 
     // Open trails, oldest activity first.

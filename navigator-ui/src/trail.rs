@@ -305,10 +305,13 @@ impl Persona {
 #[derive(Clone, Debug, PartialEq)]
 pub struct PutAway {
     pub trail: Trail,
-    /// "Today", "Wed", …: the day group (a stand-in label in step 1).
-    pub day: String,
-    pub at: String,
+    /// When, in Unix seconds (the day group and the time are drawn from
+    /// it: [`crate::clock`]).
+    pub at_s: u64,
 }
+
+/// How long a trail put away is kept (§4.5).
+pub const EARLIER_KEEP_S: u64 = 30 * 24 * 3600;
 
 /// A page kept for good (§5.6).
 #[derive(Clone, Debug, PartialEq)]
@@ -330,9 +333,9 @@ pub struct TrailStore {
     pub kept: Vec<Kept>,
     /// Sites that know you, per jar: "personal" or the Unrecorded trail's
     /// own jar (§6.2; one throwaway jar per Unrecorded trail).
-    known: BTreeSet<(String, String)>,
-    clock: u64,
-    next_id: u64,
+    pub(crate) known: BTreeSet<(String, String)>,
+    pub(crate) clock: u64,
+    pub(crate) next_id: u64,
 }
 
 impl Default for TrailStore {
@@ -435,10 +438,10 @@ impl TrailStore {
     /// Ctrl-W: put the current trail away (§4.5). An Unrecorded trail is
     /// dropped with its jar; a trail still on Start is just closed. The
     /// last open trail is replaced by a fresh one on Start.
-    pub fn put_away(&mut self, at: &str) {
+    pub fn put_away(&mut self, at_s: u64) {
         let t = self.trails.remove(self.current);
         if !t.unrecorded && t.current.is_some() {
-            self.earlier.insert(0, PutAway { trail: t.clone(), day: "Today".into(), at: at.into() });
+            self.earlier.insert(0, PutAway { trail: t.clone(), at_s });
         }
         if t.unrecorded {
             let jar = Self::jar_of(&t);
@@ -461,6 +464,22 @@ impl TrailStore {
         self.current = self.trails.len() - 1;
         self.touch();
         true
+    }
+
+    /// Forget a trail put away: its records go now (§4.5).
+    pub fn forget(&mut self, index: usize) -> bool {
+        if index >= self.earlier.len() {
+            return false;
+        }
+        self.earlier.remove(index);
+        true
+    }
+
+    /// Drop what has been put away longer than `EARLIER_KEEP_S`.
+    pub fn expire(&mut self, now_s: u64) -> usize {
+        let n = self.earlier.len();
+        self.earlier.retain(|e| now_s.saturating_sub(e.at_s) < EARLIER_KEEP_S);
+        n - self.earlier.len()
     }
 
     fn jar_of(t: &Trail) -> String {
@@ -634,7 +653,7 @@ mod tests {
         assert_eq!(s.current, 0, "wraps to the last row");
         assert!(s.nth(1));
         assert_eq!(s.current, 2);
-        s.put_away("10:00");
+        s.put_away(1000);
         assert_eq!(s.trails.len(), 2);
         assert_eq!(s.earlier[0].trail.title(), "z");
         assert_eq!(s.current, 1, "the newest remaining trail is shown");
@@ -647,7 +666,7 @@ mod tests {
     fn put_away_last_trail_leaves_start() {
         let mut s = TrailStore::default();
         s.follow(spec("a"));
-        s.put_away("10:00");
+        s.put_away(1000);
         assert_eq!(s.trails.len(), 1);
         assert!(s.trail().current.is_none());
         assert_eq!(s.earlier.len(), 1);
@@ -664,11 +683,24 @@ mod tests {
         s.set_knows("atlas.example", true);
         s.new_trail(true);
         assert!(!s.knows("atlas.example"), "nor with another Unrecorded trail");
-        s.put_away("10:00"); // the empty one
+        s.put_away(1000); // the empty one
         let before = s.earlier.len();
-        s.put_away("10:00"); // the Unrecorded one with a page
+        s.put_away(1000); // the Unrecorded one with a page
         assert_eq!(s.earlier.len(), before, "Unrecorded trails are not put away");
         assert!(s.knows("atlas.example"), "back on the Personal trail");
+    }
+
+    #[test]
+    fn earlier_expires_after_30_days_and_can_be_forgotten() {
+        let mut s = TrailStore::default();
+        s.follow(spec("a"));
+        s.put_away(1000);
+        s.follow(spec("b"));
+        s.put_away(1000 + EARLIER_KEEP_S);
+        assert_eq!(s.expire(1000 + EARLIER_KEEP_S), 1, "the older one went");
+        assert_eq!(s.earlier[0].trail.title(), "b");
+        assert!(s.forget(0));
+        assert!(s.earlier.is_empty());
     }
 
     #[test]

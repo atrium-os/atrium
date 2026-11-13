@@ -473,9 +473,12 @@ name = "navigator-ui"
 version = "0.1.0"
 dependencies = [
  "fresco-client",
+ "libc",
  "limen",
  "navigator-control",
  "pergola",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]

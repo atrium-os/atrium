@@ -360,7 +360,7 @@ impl Shell {
     pub fn leave_stopped(&mut self) {
         let t = self.store.trail_mut();
         if t.page().is_some_and(|p| p.facts.light == Light::Red) && !t.back() {
-            self.store.put_away("now");
+            self.store.put_away(crate::clock::now_s());
         }
     }
 
@@ -393,7 +393,7 @@ impl Shell {
             Action::NewUnrecorded => self.new_trail(true),
             Action::PutAway => {
                 self.end_edit();
-                self.store.put_away("now");
+                self.store.put_away(crate::clock::now_s());
                 if self.store.trail().current.is_none() {
                     self.begin_edit();
                 }
