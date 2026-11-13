@@ -1522,17 +1522,35 @@ hostile_isa(void)
 	};
 	struct job hc;
 	uint32_t first;
-	u_int i;
+	u_int i, nc = sizeof(c) / sizeof(c[0]);
 	int r, n, ms, ri0 = -1, ri = -1;
-	char what[160];
+	char what[160], vaname[64];
+	const char *env;
 
+	/*
+	 * Box bisection (runs 6eca95c0, 40f28b9a): SI15_VA=<hex> runs just
+	 * one store at that VA (1 = VA 0); SI15_SPIN=1 just the endless
+	 * shader. The GPU wedge, once there, stays until a reset, so one
+	 * probe per load.
+	 */
+	if ((env = getenv("SI15_VA")) != NULL) {
+		c[0].va = strtoull(env, NULL, 16);
+		c[0].spin = 0;
+		snprintf(vaname, sizeof(vaname), "stores at VA %#jx",
+		    (uintmax_t)(c[0].va == 1 ? 0 : c[0].va));
+		c[0].name = vaname;
+		nc = 1;
+	} else if ((env = getenv("SI15_SPIN")) != NULL && *env == '1') {
+		c[0] = c[2];
+		nc = 1;
+	}
 	(void)preg_read(NULL, &ri0);
 	if (job_open(&by, "15 bystander") != 0) {
 		check(0, "15 hostile ISA", "bystander: %s", strerror(errno));
 		job_close(&by);
 		return;
 	}
-	for (i = 0; i < sizeof(c) / sizeof(c[0]); i++) {
+	for (i = 0; i < nc; i++) {
 		uint64_t va;
 
 		if (job_open(&h, "15 hostile") != 0) {
