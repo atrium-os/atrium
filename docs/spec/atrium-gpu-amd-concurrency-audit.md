@@ -46,7 +46,7 @@ not per IV.
 
 **F2. RLC safe mode is not reentrant.** `safe_mode_enter`/`exit`
 (gfx12_pm.c:148) are a raw handshake. Users: `amd_gfx12_sq_kill_vmid` (the
-eviction task, and the kernel-queue stop path in si_client.c:891 from an ioctl),
+eviction task, and `amd_si_q_stop`, si_client.c:891, from a client close),
 the MEC pipe reset, clock gating. If two overlap, the first `exit` drops safe
 mode under the second. amdgpu keeps a depth count under a lock.
 Fix: a mutex plus a depth count in gfx12_pm.c.
