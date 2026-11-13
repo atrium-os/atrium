@@ -1,10 +1,10 @@
 # Sigillum: identity verification
 
-**Status:** proposed 2026-11-13 at Shankar's request ("identity verification in Atrium.
+**Status:** accepted 2026-11-13 (Shankar: all eleven §17 decisions as recommended), proposed the same day at his request ("identity verification in Atrium.
 Fingerprint, FIDO2, USB stick certificate etc. The Navigator needs to be able to access these
-when needed. Apply the standard Atrium security, jails and protections"). §17 lists the
-decisions for Shankar, each with a recommendation. S1 (§16) is built and host-tested (`sigillum/`); the rest is not.
-**Owner:** the identity thread. The name is a proposal (Latin *sigillum*: a personal seal,
+when needed. Apply the standard Atrium security, jails and protections"). §17 records the
+decisions. S1 (§16) is built and host-tested (`sigillum/`); the rest is not.
+**Owner:** the identity thread. The name was accepted with §17 (Latin *sigillum*: a personal seal,
 the ring a Roman pressed into wax to prove a document was his).
 
 Atrium needs one place that answers two questions for the rest of the system:
@@ -591,6 +591,8 @@ otherwise passes the blobs on without reading them.
   so a spec misreading shared by both sides would not show; a real key in S2 is the check.
 
 ## 17. Decisions, with recommendations
+
+**Accepted by Shankar, 2026-11-13: all eleven, as recommended.**
 
 1. **One identity service, Sigillum, separate from Arca and Vestibulum.** *Recommend yes.*
    Arca is a store with no device and no parser of anything external (arca.md §6.3); putting
