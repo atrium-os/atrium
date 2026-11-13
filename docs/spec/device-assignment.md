@@ -27,7 +27,7 @@ typed device events, that starts device drivers through jaild.
 | Piece | Where | What it does | Gap |
 |---|---|---|---|
 | `atrium-devevents` | crate | reads devd's seqpacket socket; `Event::{Added, Removed, Other}` by devnode; `hidclass` classifies a hidbus by its collections' usage pages from pnpinfo; `hidowner` turns devd lines + `devinfo -v` into operations | events are devnode strings, not typed (bus, pnpinfo, location); HID-only classification |
-| portcullisd `identity_devices.rs` | `atrium-portcullisd-daemon` (rc.d never starts the multi-tenant portcullisd; sigillum.md §16.2) | unhides input hidraw nodes in tactusd's own devfs mount (re-checked every 2 s); starts and stops one `sigillum-fido` jail per FIDO key via jaild `devfs_grant` | hard-coded to HID; lives inside the app-launch broker |
+| portcullisd `identity_devices.rs` (until 2026-11-13; now `atrium-dispensatord`, §6.1) | `atrium-portcullisd-daemon` (rc.d never starts the multi-tenant portcullisd; sigillum.md §16.2) | unhides input hidraw nodes in tactusd's own devfs mount (re-checked every 2 s); starts and stops one `sigillum-fido` jail per FIDO key via jaild `devfs_grant` | hard-coded to HID; lives inside the app-launch broker |
 | jaild `devfs_grant` + pinned rulesets | `etc/jaild.policy.toml` | ruleset pinned to a jail name/exec/uid; a grant unhides one node, owner = pin uid, mode 0600, before exec; fails the create if it can't | the right primitive; reuse it everywhere |
 | devfs rulesets 20–27 | `etc/atrium.devfs.rules` | per-service static rulesets; 24 (Lyra) unhides `dsp*`/`mixer*` wholesale; 26 (Tactus) now mode-only for `hidraw*` | wildcards hand every matching device to one service |
 | sysfil profile `device` | `jaild.policy.toml` | base calls + the device's own ioctls | per-driver profiles needed (USB transfer ioctls for ugen, etc.) |
@@ -342,6 +342,52 @@ the way Ubuntu points at NVIDIA's?).
   Tessera mounts of removable media wait for Tessera encryption.
 - **D6** Curia "Devices" list: every device, its owner, unclaimed ones, and
   why.
+
+### 6.1 As built: D1 and D2 (2026-11-13)
+
+- **D1** `atrium-devevents/src/devctl.rs`: `parse_line` turns each devd line
+  into `Attach`/`Detach`/`Nomatch`/`Notify` with a bounded `Fields` list
+  (quoted values with escapes; line ≤ 8 KiB, ≤ 64 fields, keys ≤ 32, values
+  ≤ 512; anything else is dropped, never a panic). `devinfo_events` reads
+  `devinfo -v` (incl. FreeBSD 16's `<description>`) as parent-first events.
+  `Registry` gives every device an id that is never reused and removes a
+  whole subtree when its top detaches (the kernel reports only the top, and
+  never an unclaimed child leaving). `DeviceWatcher::recv_line` hands raw
+  lines out. Fuzz target `atrium-devevents/fuzz` (`devctl`: parser, registry
+  and the HID classifier): 913,380 runs in 3 min, no crash. Not yet: traces
+  recorded on the R9700.
+- **D2** `dispensator/` (lib + `atrium-dispensatord`):
+  - `rules.rs`: the `devices.d/*.toml` format: `[[rule]]` (class `hid` for
+    now, `priority`, `any_page`, ordered `nodes`, `owner = driver:X |
+    service:Y`), `[driver.X]` (exec, argv, uid/gid ≠ 0, `jail`/`root` with
+    `{hidraw}` only, devfs ruleset ≠ 0, sysfil profile, read-only mounts),
+    `[service.Y]` (its devfs mount, reshow period). Unknown keys, a name
+    defined twice (one package redefining another's driver), unknown
+    placeholders, `..`, relative paths and dangling owners are refused. The
+    daemon refuses rule files not owned by root or writable by group/other.
+  - `plan.rs`: devd lines and `devinfo -v` to ops (`Show`, `StartDriver`,
+    `StopDriver`, `Log`); highest priority wins; no rule, or no collections,
+    is nobody. Test `same_as_the_old_agent` runs portcullisd's old
+    `hidowner` traces (plus the u2f(4) ones) through both and gets the same
+    ops; `jail.rs`'s test checks the Sigillum jail request field by field
+    against the old `driver_request`.
+  - Shipped rules: `sigillum/etc/devices.d/40-sigillum.toml` (FIDO page,
+    priority 100, `u2f/{u2f}` then `hidraw{hidraw}`) and
+    `tactus/etc/devices.d/30-tactus.toml` (any other HID, priority 50,
+    service tactusd); installed by `sigillum-service.sh` /
+    `tactus-service.sh`.
+  - The daemon: the old agent's runner, generalised (devfs per-mount unhide
+    with reshow, jaild `CreateJail` with `devfs_grant`, unmount before start,
+    stop by `{hidraw}` alone, procdescs held), plus a state file
+    `/var/run/atrium/dispensator.state`; `--check` and `--plan` run anywhere.
+    rc.d `dispensator/etc/atrium-dispensatord` (after jaild; loads `hidraw`
+    and `nullfs`, refuses to start if the rules do not load);
+    `deploy-portcullis.sh` installs and starts it.
+  - portcullisd's agent (`identity_devices.rs`, the spawn in
+    `atrium-portcullisd-daemon`) is removed; `vm-sigillum-check.sh` now
+    commissions dispensatord.
+  - Tests: 8 host tests; FreeBSD (x86_64) type-check of dispensatord and
+    portcullisd clean. **Not yet run: the S2e VM gate against dispensatord.**
 
 ## 7. Not in scope
 

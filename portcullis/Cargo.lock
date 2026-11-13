@@ -131,14 +131,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "atrium-devevents"
-version = "0.1.0"
-dependencies = [
- "libc",
- "log",
-]
-
-[[package]]
 name = "atrium-session"
 version = "0.1.0"
 dependencies = [
@@ -977,7 +969,6 @@ name = "portcullisd"
 version = "0.1.0"
 dependencies = [
  "aqueduct",
- "atrium-devevents",
  "atrium-volumes",
  "env_logger",
  "jaild",

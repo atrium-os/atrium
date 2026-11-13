@@ -668,7 +668,8 @@ otherwise passes the blobs on without reading them.
   - `atrium-devevents::hidowner`: devd lines and `devinfo -v` (devices present at start)
     to operations: show input, start or stop an identity driver, log. A unit that changes
     kind without a detach stops its driver first.
-  - portcullisd `identity_devices.rs`: the agent thread carrying them out (devfs for
+  - *(Moved 2026-11-13 to `atrium-dispensatord`, driven by `sigillum/etc/devices.d/40-sigillum.toml`;
+    same behaviour, see [device-assignment.md](device-assignment.md) §6.)* portcullisd `identity_devices.rs`: the agent thread carrying them out (devfs for
     tactusd, jaild `CreateJail`/`RemoveJail` and mount cleanup for drivers), the 2 s
     re-show, and `PORTCULLIS_IDENTITY_DEVICES=off`.
   - `sigillum/etc/services.d/37-atrium-sigillumd.toml` and `scripts/sigillum-service.sh`

@@ -64,7 +64,6 @@ aqueduct            = { path = "../../aqueduct" }
 nuntius             = { path = "../../nuntius", default-features = false }
 sockmux             = { path = "../sockmux" }
 libc                = "0.2"
-atrium-devevents    = { path = "../../atrium-devevents" }
 serde               = { version = "1", features = ["derive"] }
 serde_json          = "1"
 toml                = "0.8"

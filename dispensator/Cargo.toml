@@ -1,0 +1,28 @@
+[package]
+name = "dispensator"
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+publish = false
+description = "Dispensator: gives each device to exactly one owner (a jailed driver or one node in a service's devfs), from devices.d rules. docs/spec/device-assignment.md."
+
+[lib]
+name = "dispensator"
+path = "src/lib.rs"
+
+[[bin]]
+name = "atrium-dispensatord"
+path = "src/bin/dispensatord.rs"
+
+[dependencies]
+atrium-devevents = { path = "../atrium-devevents" }
+serde = { version = "1", features = ["derive"] }
+toml  = "0.8"
+libc  = "0.2"
+
+# jaild's client needs kqueue (sockmux): only the FreeBSD runner uses it.
+[target.'cfg(target_os = "freebsd")'.dependencies]
+jaild = { path = "../portcullis/jaild" }
+
+# Standalone, like the other top-level crates.
+[workspace]

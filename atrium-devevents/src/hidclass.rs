@@ -131,6 +131,18 @@ pub const MAX_COLLECTIONS: usize = 32;
 pub const MAX_BUSES: usize = 256;
 
 impl Classifier {
+    /// The usage pages of `hidbus`'s top-level collections reported so far,
+    /// or `None` if none were or there were more than [`MAX_COLLECTIONS`]
+    /// (the bus then classifies `Unknown`). Read it before feeding the
+    /// bus's `hidraw` attach.
+    pub fn pages(&self, hidbus: u32) -> Option<Vec<u16>> {
+        let t = self.buses.get(&hidbus)?;
+        if t.is_empty() || t.len() > MAX_COLLECTIONS {
+            return None;
+        }
+        Some(t.iter().map(|c| c.0).collect())
+    }
+
     pub fn feed(&mut self, n: Notice) -> Option<Decision> {
         match n {
             Notice::Collection { hidbus, page, usage, vendor, product, u2f } => {

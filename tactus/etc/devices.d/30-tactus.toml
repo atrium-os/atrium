@@ -1,0 +1,21 @@
+# Tactus's devices for dispensatord (docs/spec/device-assignment.md §4.2,
+# docs/spec/atrium-input.md). Installed to /usr/local/etc/atrium/devices.d/
+# by scripts/tactus-service.sh.
+#
+# Every HID device with at least one top-level collection that no
+# higher-priority rule claims (Sigillum's FIDO rule outranks this one) is
+# shown to tactusd: its hidraw node is unhidden in tactusd's own devfs mount
+# (ruleset 26 hides hidraw*), and re-shown every 2 s because a restarted
+# tactusd gets a fresh mount. A device with no collections reported is shown
+# to nobody.
+
+[[rule]]
+name     = "tactus-input"
+class    = "hid"
+priority = 50
+nodes    = ["hidraw{hidraw}"]
+owner    = "service:tactusd"
+
+[service.tactusd]
+devfs       = "/var/lib/atrium/jails/tactusd/dev"
+reshow_secs = 2

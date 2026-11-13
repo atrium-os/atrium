@@ -1,0 +1,78 @@
+#!/bin/sh
+# PROVIDE: atrium_dispensatord
+# REQUIRE: FILESYSTEMS devd atrium_jaild
+# BEFORE: atrium_portcullisd_daemon
+# KEYWORD: shutdown
+#
+# atrium-dispensatord: gives each device to exactly one owner, from the
+# rules in /usr/local/etc/atrium/devices.d (a jailed driver per device, or
+# one node shown in a service's own devfs mount); everything else stays
+# hidden. Spec: docs/spec/device-assignment.md.
+#
+# Add to /etc/rc.conf:
+#   atrium_dispensatord_enable="YES"
+#
+# Optional:
+#   atrium_dispensatord_rules="/usr/local/etc/atrium/devices.d"
+#   atrium_dispensatord_jaild_socket="/var/run/atrium/jaild.sock"
+#   atrium_dispensatord_logfile="/var/log/atrium/dispensatord.log"
+
+. /etc/rc.subr
+
+name="atrium_dispensatord"
+desc="Atrium device assignment (Dispensator)"
+rcvar="${name}_enable"
+
+load_rc_config "$name"
+
+: ${atrium_dispensatord_enable:="NO"}
+: ${atrium_dispensatord_rules:="/usr/local/etc/atrium/devices.d"}
+: ${atrium_dispensatord_jaild_socket:="/var/run/atrium/jaild.sock"}
+: ${atrium_dispensatord_logfile:="/var/log/atrium/dispensatord.log"}
+
+command="/usr/local/bin/atrium-dispensatord"
+pidfile="/var/run/atrium/dispensatord.pid"
+
+start_cmd="atrium_dispensatord_start"
+stop_cmd="atrium_dispensatord_stop"
+status_cmd="atrium_dispensatord_status"
+
+atrium_dispensatord_start() {
+    install -d -m 0755 -o root -g wheel /var/run/atrium /var/log/atrium
+    install -d -m 0755 -o root -g wheel "${atrium_dispensatord_rules}"
+    # hidraw for HID rules; nullfs before the first driver jails, because two
+    # first nullfs mounts at once panicked 16-CURRENT (sigillum.md §16.2).
+    kldload -n hidraw nullfs
+    if ! "${command}" --check --rules "${atrium_dispensatord_rules}" >/dev/null; then
+        err 1 "rules in ${atrium_dispensatord_rules} do not load (run ${command} --check)"
+    fi
+    echo "Starting ${name}."
+    /usr/sbin/daemon -f -p "${pidfile}" -o "${atrium_dispensatord_logfile}" -t "${name}" \
+        "${command}" --rules "${atrium_dispensatord_rules}" \
+        --jaild-socket "${atrium_dispensatord_jaild_socket}"
+}
+
+atrium_dispensatord_stop() {
+    [ -s "${pidfile}" ] || { echo "${name} not running (no pidfile)."; return 0; }
+    pid=$(cat "${pidfile}")
+    echo "Stopping ${name}."
+    # Closing its procdescs ends the driver jails; the next start re-creates
+    # them from devinfo.
+    kill -TERM "${pid}" 2>/dev/null
+    for _ in 1 2 3 4 5; do
+        if kill -0 "${pid}" 2>/dev/null; then sleep 1; else break; fi
+    done
+    kill -0 "${pid}" 2>/dev/null && kill -KILL "${pid}" 2>/dev/null
+    rm -f "${pidfile}"
+}
+
+atrium_dispensatord_status() {
+    if [ -s "${pidfile}" ] && kill -0 "$(cat "${pidfile}")" 2>/dev/null; then
+        echo "${name} is running as pid $(cat "${pidfile}")."
+        return 0
+    fi
+    echo "${name} is not running."
+    return 1
+}
+
+run_rc_command "$1"

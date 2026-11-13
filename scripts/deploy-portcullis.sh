@@ -18,6 +18,7 @@
 # ORDER MATTERS. The rc.d REQUIRE lines encode it:
 #   atrium-jaild -> atrium-volumes -> atrium-portcullisd-daemon
 #                                  -> atrium-portcullisd-bootstrap
+#   atrium-jaild -> atrium-dispensatord (devices; docs/spec/device-assignment.md)
 #
 #   sh scripts/deploy-portcullis.sh              # deploy + enable + start
 #   START=0 sh scripts/deploy-portcullis.sh      # install only
@@ -25,12 +26,18 @@ set -u
 BSD="$(cd "$(dirname "$0")/.." && pwd)"
 TARGET="${TARGET:-aarch64-unknown-freebsd}"
 T="$BSD/portcullis/target/$TARGET/release"
+DT="$BSD/dispensator/target/$TARGET/release"
 KEY="$HOME/.ssh/fresco_bsd_ed25519"
 START=${START:-1}
 SSHOPT="-i $KEY -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR"
 g() { ssh $SSHOPT -p 2222 root@localhost "$@"; }
 
 # ── build anything missing ──────────────────────────────────────────
+if [ ! -x "$DT/atrium-dispensatord" ]; then
+    echo "=== building atrium-dispensatord (cross) ==="
+    ( cd "$BSD/dispensator" && cargo build --release --target "$TARGET" ) || {
+        echo "ABORT: dispensatord cross-build failed"; exit 1; }
+fi
 # ★ Cross-build on the HOST, never in the VM (feedback_always_cross_build).
 if [ ! -x "$T/atrium-jaild" ] || [ ! -x "$T/atrium-volumes" ]; then
     echo "=== building missing daemons (cross) ==="
@@ -48,7 +55,7 @@ fi
 # They are restarted below in dependency order; with START=0 the operator
 # restarts them.
 echo "=== stopping daemons (ETXTBSY guard) ==="
-for s in atrium-portcullisd-daemon atrium-volumes atrium-jaild; do
+for s in atrium-dispensatord atrium-portcullisd-daemon atrium-volumes atrium-jaild; do
     if g "pgrep -f $s >/dev/null 2>&1"; then
         g "service $s stop >/dev/null 2>&1"
         printf '  %-34s stopped\n' "$s"
@@ -81,11 +88,16 @@ for b in atrium-jaild atrium-volumes atrium-volumes-cli \
     fi
 done
 
+scp $SSHOPT -P 2222 "$DT/atrium-dispensatord" root@localhost:/usr/local/bin/ >/dev/null 2>&1 \
+    && printf '  %-34s ok\n' atrium-dispensatord || { printf '  %-34s COPY FAILED\n' atrium-dispensatord; rc=1; }
+g 'mkdir -p /usr/local/etc/atrium/devices.d' >/dev/null 2>&1
+
 echo "=== rc.d scripts -> /usr/local/etc/rc.d ==="
 for f in "$BSD/portcullis/jaild/etc/atrium-jaild" \
          "$BSD/portcullis/atrium-volumes/etc/atrium-volumes" \
          "$BSD/portcullis/portcullisd/etc/atrium-portcullisd-daemon" \
-         "$BSD/portcullis/portcullisd/etc/atrium-portcullisd-bootstrap"; do
+         "$BSD/portcullis/portcullisd/etc/atrium-portcullisd-bootstrap" \
+         "$BSD/dispensator/etc/atrium-dispensatord"; do
     [ -f "$f" ] || { echo "  MISSING in tree: $f"; rc=1; continue; }
     scp $SSHOPT -P 2222 "$f" root@localhost:/usr/local/etc/rc.d/ >/dev/null 2>&1 \
         && printf '  %-34s ok\n' "$(basename "$f")" || { printf '  %-34s COPY FAILED\n' "$(basename "$f")"; rc=1; }
@@ -171,9 +183,9 @@ g 'chmod 0755 /usr/local/etc/rc.d/atrium-* /usr/local/bin/atrium-* \
 [ "$START" = 1 ] || { echo "=== install only (START=0) ==="; exit $rc; }
 
 echo "=== enable + start (dependency order) ==="
-g 'for s in atrium_jaild atrium_volumes atrium_portcullisd_daemon; do
+g 'for s in atrium_jaild atrium_dispensatord atrium_volumes atrium_portcullisd_daemon; do
      sysrc ${s}_enable=YES >/dev/null 2>&1; done' >/dev/null 2>&1
-for s in atrium-jaild atrium-volumes atrium-portcullisd-daemon; do
+for s in atrium-jaild atrium-dispensatord atrium-volumes atrium-portcullisd-daemon; do
     printf '  %-32s ' "$s"
     # ★ "already running" is SUCCESS on a re-run, not failure. service(8)
     # exits non-zero for it, so checking the process first is what makes this

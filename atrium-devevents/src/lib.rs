@@ -22,6 +22,7 @@
 #[cfg(target_os = "freebsd")]
 mod freebsd;
 
+pub mod devctl;
 pub mod hidclass;
 pub mod hidowner;
 

@@ -146,12 +146,8 @@ fn main() -> ExitCode {
     { warn!("chmod {}: {e}", socket_path.display()); }
     info!("portcullisd-daemon: listening on {}", socket_path.display());
 
-    /* Who gets each hidraw node: tactusd (input) or a Sigillum driver jail
-     * of its own (security keys); nobody, if unclassified (sigillum.md
-     * §5.1). Its own thread: it waits on devd, not on clients, and talks
-     * to jaild on its own connections. This daemon, the root service rc.d
-     * always starts and the one jaild client, is where it belongs. */
-    portcullisd::identity_devices::spawn(Box::leak(jaild_path.to_string_lossy().into_owned().into_boxed_str()));
+    /* Devices (who gets each hidraw node, the Sigillum driver jails) are
+     * atrium-dispensatord's since 2026-11-13 (device-assignment.md §4.5). */
 
     let mut mux: Mux<AqClient> = match Mux::new(listener) {
         Ok(m) => m,

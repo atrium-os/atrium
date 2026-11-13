@@ -32,6 +32,9 @@ install -m 0755 "$BIN" /usr/local/bin/atrium-tactusd
 HERE=$(dirname "$0")/..
 install -d /etc/atrium/services.d
 install -m 0644 "$HERE/tactus/etc/services.d/38-atrium-tactusd.toml" /etc/atrium/services.d/
+# Which hidraw nodes tactusd is shown: dispensatord's rule (device-assignment.md).
+install -d -m 0755 /usr/local/etc/atrium/devices.d
+install -o root -g wheel -m 0644 "$HERE/tactus/etc/devices.d/30-tactus.toml" /usr/local/etc/atrium/devices.d/
 
 if [ -n "$CON" ]; then
   install -m 0755 "$CON" /usr/local/sbin/atrium-tactus-console

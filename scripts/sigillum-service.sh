@@ -7,9 +7,9 @@
 #
 # Creates the _sigillum, _sigillum-dev and _sigillum-ui users, the three socket
 # directories, installs atrium-sigillumd (with its services.d manifest) and
-# atrium-sigillum-fido, and prepares the jail roots. The driver jails
-# themselves are started by portcullisd's identity-device agent, one per
-# security key; the atrium_identity devfs ruleset (27) comes with
+# atrium-sigillum-fido, installs Sigillum's device rules for dispensatord
+# (sigillum/etc/devices.d/40-sigillum.toml), and prepares the jail roots. The
+# driver jails themselves are started by dispensatord, one per security key; the atrium_identity devfs ruleset (27) comes with
 # etc/atrium.devfs.rules (scripts/bootstrap-atrium.sh installs and loads it).
 set -e
 D=$1
@@ -21,7 +21,7 @@ user _sigillum     65028 "Sigillum broker"
 user _sigillum-dev 65029 "Sigillum device drivers"
 user _sigillum-ui  65030 "Sigillum trusted UI"
 kldload -n hidraw
-# Load nullfs at boot, not on first mount: portcullisd's agent starts the
+# Load nullfs at boot, not on first mount: dispensatord starts the
 # driver jails at boot while the bootstrap starts services, and two first
 # nullfs mounts at once paniced 16-CURRENT (getnewvnode: not registered
 # vector op, in null_nodeget) in the amd64 VM gate.
@@ -40,6 +40,8 @@ install -m 0755 "$F" /usr/local/bin/atrium-sigillum-fido
 HERE=$(dirname "$0")/..
 install -d /etc/atrium/services.d
 install -m 0644 "$HERE/sigillum/etc/services.d/37-atrium-sigillumd.toml" /etc/atrium/services.d/
+install -d -m 0755 /usr/local/etc/atrium/devices.d
+install -o root -g wheel -m 0644 "$HERE/sigillum/etc/devices.d/40-sigillum.toml" /usr/local/etc/atrium/devices.d/
 
 R=/var/lib/atrium/jails/sigillumd
 # (Skips dirs that exist: a running jail has its mounts over them.)

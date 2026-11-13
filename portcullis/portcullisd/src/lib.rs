@@ -11,7 +11,6 @@
 
 pub mod cdm;
 pub mod host_mount;
-pub mod identity_devices;
 pub mod init_phase;
 pub mod jaild_client;
 /// The manifest trust gate, re-exported so existing call sites keep working.

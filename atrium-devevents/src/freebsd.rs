@@ -68,6 +68,14 @@ impl DeviceWatcher {
         Ok(parse(&buf))
     }
 
+    /// The next devd line, unparsed (for [`crate::devctl::parse_line`]).
+    pub fn recv_line(&self) -> io::Result<String> {
+        let mut buf = vec![0u8; MAX_MSG];
+        let n = self.sock.recv(&mut buf)?;
+        buf.truncate(n);
+        Ok(String::from_utf8_lossy(&buf).trim_end_matches(['\0', '\n']).to_string())
+    }
+
     /// Non-blocking variant. Returns `Ok(None)` if no event is
     /// pending, mirroring `try_recv` semantics elsewhere in Atrium.
     pub fn try_recv(&self) -> io::Result<Option<Event>> {

@@ -1,0 +1,29 @@
+# Sigillum's devices for dispensatord (docs/spec/device-assignment.md §4.2,
+# docs/spec/sigillum.md §5.1). Installed to /usr/local/etc/atrium/devices.d/
+# by scripts/sigillum-service.sh.
+#
+# A HID device with any top-level collection on the FIDO usage page goes to a
+# driver jail of its own, outranking Tactus's rule, so a key's keyboard part
+# (if it shares the interface) does not type. With u2f(4) attached the key is
+# driven through /dev/u2f/N, since u2f turns off the bus's read-ahead and the
+# hidraw node would miss most of each answer; without it, through hidrawN.
+
+[[rule]]
+name     = "sigillum-fido"
+class    = "hid"
+priority = 100
+any_page = [0xF1D0]
+nodes    = ["u2f/{u2f}", "hidraw{hidraw}"]
+owner    = "driver:sigillum-fido"
+
+[driver.sigillum-fido]
+exec          = "/usr/local/bin/atrium-sigillum-fido"
+argv          = ["atrium-sigillum-fido", "--dev", "/dev/{node}", "--connect", "/atrium/sockets/sigillum-dev/drivers.sock"]
+uid           = 65029
+gid           = 65029
+# The jail is named for the hidraw unit: that is what devd's detach names.
+jail          = "atrium-sigillum-fido-{hidraw}"
+root          = "/var/lib/atrium/jails/sigillum-fido-{hidraw}"
+devfs_ruleset = 27
+sysfil        = "device"
+mounts_ro     = ["/libexec", "/lib", "/usr/lib", "/usr/local/bin", "/atrium/sockets/sigillum-dev"]

@@ -10,9 +10,10 @@
 #     sh scripts/cloud-vm.sh up
 #   sh scripts/vm-sigillum-check.sh [TACTUSD]
 #
-# It cross-builds sigillumd, sigillum-fido and the sigillum-probe example,
-# commissions them (scripts/sigillum-service.sh), restarts portcullisd so its
-# identity-device agent finds the key, and checks:
+# It cross-builds sigillumd, sigillum-fido, the sigillum-probe example and
+# atrium-dispensatord, commissions them (scripts/sigillum-service.sh, which
+# installs Sigillum's devices.d rule), restarts dispensatord so it finds the
+# key, and checks:
 #
 #   - the key gets a jail of its own, atrium-sigillum-fido-N, whose /dev
 #     holds that key's one node (u2f/M when FreeBSD's u2f(4) drives it,
@@ -54,15 +55,20 @@ CROSS_RUSTFLAGS=$(cd "$ROOT" && ARCH=amd64 sh -c '. ./scripts/cloud-vm.sh >/dev/
 ( cd "$ROOT/sigillum" && RUSTFLAGS="$CROSS_RUSTFLAGS" cargo build -q --release --target $TRIPLE \
     -p sigillumd -p sigillum-fido --bins --example sigillum-probe ) || { echo "build failed"; exit 1; }
 B=$ROOT/sigillum/target/$TRIPLE/release
+( cd "$ROOT/dispensator" && RUSTFLAGS="$CROSS_RUSTFLAGS" cargo build -q --release --target $TRIPLE ) || { echo "dispensatord build failed"; exit 1; }
 
 echo "== copy"
-V 'mkdir -p /root/s/scripts /root/s/sigillum/etc/services.d /root/s/tactus/etc/services.d'
+V 'mkdir -p /root/s/scripts /root/s/sigillum/etc/services.d /root/s/tactus/etc/services.d /root/s/sigillum/etc/devices.d /root/s/tactus/etc/devices.d'
 scp -q $K -P 2222 "$B/sigillumd" root@localhost:/root/s/sigillumd
 scp -q $K -P 2222 "$B/sigillum-fido" root@localhost:/root/s/sigillum-fido
 scp -q $K -P 2222 "$B/examples/sigillum-probe" root@localhost:/root/s/sigillum-probe
 scp -q $K -P 2222 "$ROOT/scripts/sigillum-service.sh" "$ROOT/scripts/tactus-service.sh" root@localhost:/root/s/scripts/
 scp -q $K -P 2222 "$ROOT/sigillum/etc/services.d/37-atrium-sigillumd.toml" root@localhost:/root/s/sigillum/etc/services.d/
 scp -q $K -P 2222 "$ROOT/tactus/etc/services.d/38-atrium-tactusd.toml" root@localhost:/root/s/tactus/etc/services.d/
+scp -q $K -P 2222 "$ROOT/sigillum/etc/devices.d/40-sigillum.toml" root@localhost:/root/s/sigillum/etc/devices.d/
+scp -q $K -P 2222 "$ROOT/tactus/etc/devices.d/30-tactus.toml" root@localhost:/root/s/tactus/etc/devices.d/
+scp -q $K -P 2222 "$ROOT/dispensator/target/$TRIPLE/release/atrium-dispensatord" root@localhost:/root/s/atrium-dispensatord
+scp -q $K -P 2222 "$ROOT/dispensator/etc/atrium-dispensatord" root@localhost:/root/s/atrium-dispensatord.rc
 [ -n "$TD" ] && scp -q $K -P 2222 "$TD" root@localhost:/root/s/tactusd
 
 echo "== HID, rulesets, policy"
@@ -101,9 +107,18 @@ jls -n name | grep -q "name=atrium-sigillumd$" && echo "  ok atrium-sigillumd ja
 [ -n "$TD" ] && { jls -n name | grep -q "name=atrium-tactusd$" && echo "  ok atrium-tactusd jail up" || echo "  FAIL no tactusd jail"; }
 ps -axo user,jid,command | grep "[a]trium-sigillumd" | head -2 | sed 's/^/  /'
 ls -l /atrium/sockets/sigillum /atrium/sockets/sigillum-dev /atrium/sockets/sigillum-ui | sed 's/^/  /'
-# portcullisd's identity-device agent reads devinfo at start: restart it.
+# dispensatord reads devinfo at start: (re)install and restart it. The old
+# agent in atrium-portcullisd-daemon is gone; restart that too so an old
+# binary cannot race dispensatord for the same jails.
+service atrium-dispensatord stop >/dev/null 2>&1
+install -m 0755 /root/s/atrium-dispensatord /usr/local/bin/atrium-dispensatord
+install -m 0555 /root/s/atrium-dispensatord.rc /usr/local/etc/rc.d/atrium-dispensatord
+sysrc atrium_dispensatord_enable=YES >/dev/null
+/usr/local/bin/atrium-dispensatord --check | sed 's/^/  rules: /'
 service atrium-portcullisd-daemon restart >/dev/null 2>&1
+service atrium-dispensatord start >/dev/null 2>&1
 sleep 10
+pgrep -qf atrium-dispensatord && echo "  ok dispensatord running" || { echo "  FAIL dispensatord not running"; tail -5 /var/log/atrium/dispensatord.log; }
 EOF
 
 echo "== the key's driver jail"
@@ -123,7 +138,7 @@ echo "vnet $(jls -j $J ip4 2>/dev/null)"
 EOF
 cat /tmp/sigillum-jail.log | sed 's/^/  /'
 J=$(sed -n 's/^jail //p' /tmp/sigillum-jail.log)
-[ -n "$J" ] && ok "key jail $J" || bad "no atrium-sigillum-fido jail (portcullisd log: $(V 'grep -i identity /var/log/atrium/*portcullisd*.log | tail -3'))"
+[ -n "$J" ] && ok "key jail $J" || bad "no atrium-sigillum-fido jail (dispensatord log: $(V 'tail -3 /var/log/atrium/dispensatord.log'))"
 N=${J##*-}
 D=$(sed -n 's/^drives //p' /tmp/sigillum-jail.log)
 # u2f(4) keys (FreeBSD 15+) are driven through u2f/M, others through hidrawN.
