@@ -22,6 +22,13 @@
 //!   through the daemon's `Passcode`).
 //! - **One ceremony per seat**, 120 s each; ending one cancels its driver
 //!   work and closes its sheet.
+//! - **Token certificates** (§10.1, S5): only the web broker and Arca may
+//!   ask, for TLS client authentication to a real domain. Listing reads the
+//!   tokens' public objects before any press; what they return stays here
+//!   until the user picks. Names on the sheet and the key come from the
+//!   certificate ([`crate::cert`]), never the driver's label for it, and a
+//!   token's signature is verified against the certificate's key before the
+//!   client gets it.
 
 use std::collections::BTreeMap;
 
@@ -29,8 +36,10 @@ use sha2::{Digest, Sha256};
 use sigillum_proto::client::{
     AuthenticatorClass, CeremonyId, Method, Purpose, Refusal, Reply, Request, Strength, Uv, VerifyUser,
 };
-use sigillum_proto::client::{Assert, Register};
-use sigillum_proto::driver::{cap, DeviceClass, DriverError, FidoCaps, FromDriver, Pin, ToDriver};
+use sigillum_proto::client::{Assert, CertPurpose, ChooseCertificate, Register, SignWithCertificate, MAX_SCHEMES};
+use sigillum_proto::driver::{cap, DeviceClass, DriverError, FidoCaps, FromDriver, Pin, SignScheme, ToDriver, TokenCert};
+
+use crate::cert;
 
 use crate::label::Label;
 use crate::rp::valid_domain;
@@ -73,14 +82,14 @@ pub struct Config {
 }
 
 pub use sigillum_proto::ui::{Choice, Sheet};
-use sigillum_proto::ui::{PasskeyView, MAX_PASSKEYS};
+use sigillum_proto::ui::{CertView, PasskeyView, MAX_CERTS, MAX_PASSKEYS};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Action {
     Reply { conn: ConnId, reply: Reply },
     Sheet { key: Key, sheet: Sheet },
-    /// Ask the user for the PIN of this device.
-    AskPin { key: Key, device: DeviceId, retries: u8 },
+    /// Ask the user for the PIN of this device (`wrong`: the last was).
+    AskPin { key: Key, device: DeviceId, retries: u8, wrong: bool },
     /// Tell the user to touch the key.
     Touch { key: Key, device: DeviceId },
     CloseSheet { key: Key },
@@ -104,6 +113,25 @@ enum Kind {
     Register(Register),
     Assert(Assert),
     Verify(VerifyUser),
+    Choose(ChooseCertificate),
+    Sign(SignWithCertificate),
+}
+
+impl Kind {
+    fn token(&self) -> bool {
+        matches!(self, Kind::Choose(_) | Kind::Sign(_))
+    }
+}
+
+/// A certificate a token reported, as the broker read it.
+#[derive(Debug, Clone)]
+struct Found {
+    device: DeviceId,
+    key_id: Vec<u8>,
+    der: Vec<u8>,
+    info: cert::Info,
+    /// The token's name for itself (its driver's `Hello`).
+    token: String,
 }
 
 /// One of the user's Arca passkeys, as `P_LIST` returns it.
@@ -165,6 +193,11 @@ struct Ceremony {
     /// The Arca choice made on the sheet.
     pick: Option<Pick>,
     passcode_failures: u32,
+    /// Token ceremonies: the tokens asked for certificates that haven't
+    /// answered, what they offered, and the one the user picked.
+    listing: Vec<DeviceId>,
+    certs: Vec<Found>,
+    chosen: Option<usize>,
 }
 
 #[derive(Debug, Clone)]
@@ -235,7 +268,7 @@ impl Broker {
         let uv_preferred = match &kind {
             Kind::Register(r) => r.uv == Uv::Preferred,
             Kind::Assert(a) => a.uv == Uv::Preferred,
-            Kind::Verify(_) => false,
+            Kind::Verify(_) | Kind::Choose(_) | Kind::Sign(_) => false,
         };
         let c = Ceremony {
             conn,
@@ -252,10 +285,27 @@ impl Broker {
             passkeys: None,
             pick: None,
             passcode_failures: 0,
+            listing: Vec::new(),
+            certs: Vec::new(),
+            chosen: None,
         };
         let sheet = sheet_for(&c);
         self.ceremonies.insert(key, c);
         let audit = Action::Audit(format!("start key={key} conn={conn} {:?}", sheet));
+        if self.ceremonies[&key].kind.token() {
+            let tokens: Vec<DeviceId> = self.devices.iter().filter(|(_, d)| d.class == DeviceClass::Ccid).map(|(id, _)| *id).collect();
+            let c = self.ceremonies.get_mut(&key).unwrap();
+            if tokens.is_empty() {
+                // "Plug in your token": the sheet fills when one attaches.
+                c.state = State::AwaitingPress;
+                return vec![audit, Action::Sheet { key, sheet }];
+            }
+            c.state = State::Listing;
+            c.listing = tokens.clone();
+            let mut out = vec![audit];
+            out.extend(tokens.into_iter().map(|device| Action::ToDriver { device, msg: ToDriver::ListCertificates { ceremony: key } }));
+            return out;
+        }
         match user {
             Some(user) => vec![audit, Action::ListPasskeys { key, user, rp_id: rp_id.to_string() }],
             None => vec![audit, Action::Sheet { key, sheet }],
@@ -410,7 +460,89 @@ impl Broker {
                 let limit = self.cfg.ceremony_ms;
                 self.start(conn, id, Kind::Verify(v), "", false, now, limit, who, None)
             }
+            Request::ChooseCertificate(r) => {
+                if let Err(e) = may_use_token(label, &self.cfg, &r.purpose) {
+                    return vec![refused(conn, id, e)];
+                }
+                if r.schemes.is_empty() || r.schemes.len() > MAX_SCHEMES {
+                    return vec![refused(conn, id, Refusal::Malformed)];
+                }
+                let limit = ceremony_limit(r.timeout_ms, self.cfg.ceremony_ms);
+                self.start(conn, id, Kind::Choose(r), "", false, now, limit, who, None)
+            }
+            Request::SignWithCertificate(r) => {
+                if let Err(e) = may_use_token(label, &self.cfg, &r.purpose) {
+                    return vec![refused(conn, id, e)];
+                }
+                let h = match r.scheme {
+                    SignScheme::RsaPkcs1(h) | SignScheme::RsaPss(h) | SignScheme::Ecdsa(h) => h,
+                };
+                if r.digest.len() != h.len() {
+                    return vec![refused(conn, id, Refusal::Malformed)];
+                }
+                let limit = ceremony_limit(r.timeout_ms, self.cfg.ceremony_ms);
+                self.start(conn, id, Kind::Sign(r), "", false, now, limit, who, None)
+            }
             Request::Cancel { .. } => unreachable!(),
+        }
+    }
+
+    /// A token's `Certificates` for a ceremony that is listing: keep what
+    /// the certificates themselves say fits, and show the sheet once every
+    /// token asked has answered.
+    fn certificates(&mut self, key: Key, device: DeviceId, certs: Vec<TokenCert>) -> Vec<Action> {
+        let token = self.devices.get(&device).map(|d| d.name.clone()).unwrap_or_default();
+        let c = self.ceremonies.get_mut(&key).expect("live");
+        c.listing.retain(|d| *d != device);
+        let mut out = Vec::new();
+        for t in certs {
+            let info = match cert::parse(&t.cert) {
+                Ok(i) => i,
+                Err(why) => {
+                    out.push(Action::Audit(format!("device {device}: a certificate skipped: {why}")));
+                    continue;
+                }
+            };
+            let keep = match &c.kind {
+                Kind::Choose(r) => r.schemes.iter().any(|s| cert::fits(&info.key, *s)),
+                Kind::Sign(r) => info.sha256 == r.cert_sha256 && cert::fits(&info.key, r.scheme),
+                _ => false,
+            };
+            let dup = c.certs.iter().any(|f| f.info.sha256 == info.sha256);
+            if keep && !dup && c.certs.len() < MAX_CERTS && !t.key_id.is_empty() {
+                c.certs.push(Found { device, key_id: t.key_id, der: t.cert, info, token: token.clone() });
+            }
+        }
+        if c.listing.is_empty() {
+            c.state = State::AwaitingPress;
+            out.push(Action::Sheet { key, sheet: sheet_for(c) });
+        }
+        out
+    }
+
+    /// The user picked a certificate on a token sheet.
+    fn press_certificate(&mut self, key: Key, i: u64) -> Vec<Action> {
+        let c = self.ceremonies.get_mut(&key).expect("live");
+        let Some(f) = c.certs.get(i as usize) else { return Vec::new() };
+        let id = c.id;
+        match &c.kind {
+            Kind::Choose(_) => {
+                let cert = f.der.clone();
+                self.end(key, Reply::CertificateChosen { ceremony: id, cert }, "certificate chosen")
+            }
+            Kind::Sign(_) => {
+                let device = f.device;
+                if !self.devices.contains_key(&device) {
+                    return Vec::new();
+                }
+                c.chosen = Some(i as usize);
+                c.device = Some(device);
+                c.state = State::Driving;
+                let c = &self.ceremonies[&key];
+                let msg = self.driver_msg(key, c, None).expect("a sign ceremony");
+                vec![Action::ToDriver { device, msg }]
+            }
+            _ => Vec::new(),
         }
     }
 
@@ -437,7 +569,11 @@ impl Broker {
                 uv_required: c.uv_required,
                 pin,
             },
-            Kind::Verify(_) => return None,
+            Kind::Sign(r) => {
+                let f = &c.certs[c.chosen?];
+                ToDriver::SignDigest { ceremony: key, key_id: f.key_id.clone(), scheme: r.scheme, digest: r.digest.clone(), pin }
+            }
+            Kind::Verify(_) | Kind::Choose(_) => return None,
         })
     }
 
@@ -478,6 +614,7 @@ impl Broker {
                 self.pick(key, Pick::Create)
             }
             (Choice::Passkey(p), Kind::Assert(_)) if c.passkeys.iter().flatten().any(|k| k.id == p) => self.pick(key, Pick::Assert(p)),
+            (Choice::Certificate(i), Kind::Choose(_) | Kind::Sign(_)) => self.press_certificate(key, i),
             (Choice::Passcode, Kind::Verify(v)) => {
                 let user = v.user.clone();
                 self.ceremonies.get_mut(&key).unwrap().state = State::AwaitingPasscode;
@@ -537,12 +674,34 @@ impl Broker {
         }
         if let FromDriver::Hello { class, name, fido, .. } = rec {
             self.devices.insert(device, Device { class, name, fido });
-            return vec![Action::Audit(format!("device {device} attached: {class:?}"))];
+            let mut out = vec![Action::Audit(format!("device {device} attached: {class:?}"))];
+            if class == DeviceClass::Ccid {
+                // A token plugged in while a token sheet is up: ask it too.
+                for (key, c) in self.ceremonies.iter_mut() {
+                    if c.kind.token() && matches!(c.state, State::Listing | State::AwaitingPress) && !c.listing.contains(&device) {
+                        c.listing.push(device);
+                        out.push(Action::ToDriver { device, msg: ToDriver::ListCertificates { ceremony: *key } });
+                    }
+                }
+            }
+            return out;
         }
         let key = rec.ceremony().expect("not Hello");
         let Some(c) = self.ceremonies.get(&key) else {
             return vec![Action::Audit(format!("stray record from device {device} for key={key}"))];
         };
+        if c.listing.contains(&device) {
+            return match rec {
+                FromDriver::Certificates { certs, .. } => self.certificates(key, device, certs),
+                // A token that can't list counts as one with nothing to offer.
+                FromDriver::Error { error, .. } => {
+                    let mut a = vec![Action::Audit(format!("device {device} could not list certificates: {error:?}"))];
+                    a.extend(self.certificates(key, device, Vec::new()));
+                    a
+                }
+                _ => self.device_fault(device, "unexpected record while listing"),
+            };
+        }
         if c.device != Some(device) || c.state != State::Driving {
             return vec![Action::Audit(format!("stray record from device {device} for key={key}"))];
         }
@@ -550,12 +709,12 @@ impl Broker {
         match rec {
             FromDriver::NeedPin { retries, .. } => {
                 self.ceremonies.get_mut(&key).unwrap().state = State::AwaitingPin;
-                vec![Action::AskPin { key, device, retries }]
+                vec![Action::AskPin { key, device, retries, wrong: false }]
             }
             FromDriver::NeedTouch { .. } => vec![Action::Touch { key, device }],
             FromDriver::Error { error: DriverError::PinInvalid { retries }, .. } => {
                 self.ceremonies.get_mut(&key).unwrap().state = State::AwaitingPin;
-                vec![Action::AskPin { key, device, retries }]
+                vec![Action::AskPin { key, device, retries, wrong: true }]
             }
             FromDriver::Error { error: DriverError::Excluded, .. } => {
                 self.end(key, Reply::Refused { ceremony: id, reason: Refusal::Excluded }, "excluded")
@@ -591,10 +750,21 @@ impl Broker {
                     a
                 }
             },
-            // Token records (S5) belong to token ceremonies, which this broker doesn't run yet.
+            FromDriver::Signed { signature, .. } if matches!(c.kind, Kind::Sign(_)) => {
+                let Kind::Sign(r) = &c.kind else { unreachable!() };
+                let f = &c.certs[c.chosen.expect("driving a sign ceremony")];
+                if cert::verify(&f.info.key, r.scheme, &r.digest, &signature) {
+                    self.end(key, Reply::CertificateSigned { ceremony: id, signature }, "signed with a token")
+                } else {
+                    let mut a = self.end(key, Reply::Refused { ceremony: id, reason: Refusal::NotAllowed }, "record refused: signature does not verify");
+                    a.push(Action::Audit(format!("device {device} returned a signature that does not verify")));
+                    a
+                }
+            }
+            // A token record outside a token ceremony, or a list while signing.
             FromDriver::Certificates { .. } | FromDriver::Signed { .. } => {
-                let mut a = self.end(key, Reply::Refused { ceremony: id, reason: Refusal::NotAllowed }, "token record in a FIDO ceremony");
-                a.push(Action::Audit(format!("device {device} sent a token record in a FIDO ceremony")));
+                let mut a = self.end(key, Reply::Refused { ceremony: id, reason: Refusal::NotAllowed }, "token record out of place");
+                a.push(Action::Audit(format!("device {device} sent a token record out of place")));
                 a
             }
             FromDriver::Hello { .. } => unreachable!(),
@@ -614,7 +784,23 @@ impl Broker {
     /// The driver's jail exited or the device was unplugged.
     pub fn device_gone(&mut self, device: DeviceId) -> Vec<Action> {
         self.devices.remove(&device);
-        let mut out = self.device_fault(device, "gone");
+        let mut out = Vec::new();
+        let keys: Vec<Key> = self
+            .ceremonies
+            .iter()
+            .filter(|(_, c)| c.kind.token() && c.device != Some(device) && (c.listing.contains(&device) || c.certs.iter().any(|f| f.device == device)))
+            .map(|(k, _)| *k)
+            .collect();
+        for k in keys {
+            let c = self.ceremonies.get_mut(&k).unwrap();
+            c.certs.retain(|f| f.device != device);
+            if c.listing.contains(&device) {
+                out.extend(self.certificates(k, device, Vec::new()));
+            } else if c.state == State::AwaitingPress {
+                out.push(Action::Sheet { key: k, sheet: sheet_for(c) });
+            }
+        }
+        out.extend(self.device_fault(device, "gone"));
         out.retain(|a| !matches!(a, Action::ToDriver { .. }));
         out
     }
@@ -733,6 +919,38 @@ fn sheet_for(c: &Ceremony) -> Sheet {
             passkeys: c.passkeys.iter().flatten().map(|p| PasskeyView { id: p.id, name: p.name.clone(), display_name: p.display_name.clone() }).collect(),
         },
         Kind::Verify(v) => Sheet::Verify { requester: c.requester.clone(), user: v.user.clone(), purpose: v.purpose.clone() },
+        Kind::Choose(ChooseCertificate { purpose, .. }) | Kind::Sign(SignWithCertificate { purpose, .. }) => Sheet::Certificates {
+            requester: c.requester.clone(),
+            purpose: purpose.clone(),
+            sign: matches!(c.kind, Kind::Sign(_)),
+            certs: c
+                .certs
+                .iter()
+                .enumerate()
+                .map(|(i, f)| CertView {
+                    id: i as u64,
+                    subject: f.info.subject.clone(),
+                    issuer: f.info.issuer.clone(),
+                    not_after: f.info.not_after.clone(),
+                    token: f.token.clone(),
+                })
+                .collect(),
+        },
+    }
+}
+
+/// Token certificates: the web broker and Arca, for TLS client
+/// authentication to a real domain (§10.1).
+fn may_use_token(label: &Label, cfg: &Config, purpose: &CertPurpose) -> Result<(), Refusal> {
+    match label {
+        Label::App { app, .. } if Some(app) == cfg.web_broker.as_ref() => {}
+        Label::Arca => {}
+        Label::Unknown => return Err(Refusal::UnknownPeer),
+        _ => return Err(Refusal::Denied),
+    }
+    match purpose {
+        CertPurpose::TlsClient { host, port } if valid_domain(host) && *port != 0 => Ok(()),
+        CertPurpose::TlsClient { .. } => Err(Refusal::Malformed),
     }
 }
 

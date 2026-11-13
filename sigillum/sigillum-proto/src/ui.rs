@@ -8,7 +8,7 @@
 use alloc::{boxed::Box, string::String, vec::Vec};
 use serde::{Deserialize, Serialize};
 
-use crate::client::Purpose;
+use crate::client::{CertPurpose, Purpose};
 use crate::driver::Pin;
 
 /// Room for a sheet with [`MAX_PASSKEYS`] passkeys and every device.
@@ -30,6 +30,26 @@ pub enum Sheet {
     /// allows, offered before security keys.
     Assert { requester: String, rp_id: String, passkeys: Vec<PasskeyView> },
     Verify { requester: String, user: String, purpose: Purpose },
+    /// Certificates on the attached tokens (§10.1). `sign`: this is the
+    /// signature itself (one certificate, a PIN follows); otherwise the user
+    /// picks which certificate the server gets.
+    Certificates { requester: String, purpose: CertPurpose, sign: bool, certs: Vec<CertView> },
+}
+
+/// Most certificates one sheet lists.
+pub const MAX_CERTS: usize = 16;
+
+/// A certificate as the sheet lists it: read by sigillumd from the
+/// certificate itself, never the token's label for it (except `token`, the
+/// token's own name for itself).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CertView {
+    pub id: u64,
+    pub subject: String,
+    pub issuer: String,
+    /// `YYYY-MM-DD`.
+    pub not_after: String,
+    pub token: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -40,6 +60,8 @@ pub enum Choice {
     /// Assert: this Arca passkey (its credential id).
     Passkey([u8; 16]),
     Passcode,
+    /// A certificate on the sheet (its [`CertView::id`]).
+    Certificate(u64),
     Cancel,
 }
 
@@ -61,7 +83,9 @@ pub struct PasskeyView {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ToUi {
     Show { key: SheetKey, sheet: Sheet, devices: Vec<DeviceView> },
-    AskPin { key: SheetKey, device: u64, retries: u8 },
+    /// `retries`: tries left, `255` when the device doesn't say; `wrong`:
+    /// the last PIN typed was wrong.
+    AskPin { key: SheetKey, device: u64, retries: u8, wrong: bool },
     Touch { key: SheetKey, device: u64 },
     /// The user chose "use passcode" on a verify sheet: take it in secure
     /// input and send it back as [`FromUi::Passcode`].

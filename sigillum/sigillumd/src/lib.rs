@@ -10,6 +10,7 @@
 
 pub mod bio;
 pub mod broker;
+pub mod cert;
 pub mod daemon;
 pub mod label;
 pub mod platform;

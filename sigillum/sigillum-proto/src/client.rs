@@ -6,6 +6,8 @@
 use alloc::{boxed::Box, string::String, vec::Vec};
 use serde::{Deserialize, Serialize};
 
+pub use crate::driver::{HashAlg, SignScheme};
+
 pub const MAX_MESSAGE: usize = 16 * 1024;
 pub const SOCKET: &str = "/atrium/sockets/sigillum/sigillumd.sock";
 
@@ -92,11 +94,50 @@ pub struct VerifyUser {
     pub min_strength: Strength,
 }
 
+/// What a certificate on a token is used for (sigillum.md §10): shown on
+/// the sheet. TLS client authentication is the one use so far; document
+/// signing for apps (§10.2) follows with `identity.certificate`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum CertPurpose {
+    /// Client authentication to this server (§10.1).
+    TlsClient { host: String, port: u16 },
+}
+
+/// §10.1 step 3: the user picks a certificate from the attached tokens, for
+/// a server that asked for one. Only certificates whose key can sign with
+/// one of `schemes` are offered. Nothing is signed and no PIN is asked.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ChooseCertificate {
+    pub ceremony: CeremonyId,
+    /// As [`Register::timeout_ms`].
+    pub timeout_ms: u32,
+    pub purpose: CertPurpose,
+    pub schemes: Vec<SignScheme>,
+}
+
+/// §10.1 step 4: sign `digest` (the TLS `CertificateVerify` content's
+/// digest) with the key of the certificate whose SHA-256 is `cert_sha256`,
+/// after the user confirms on the sheet and types the token's PIN.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SignWithCertificate {
+    pub ceremony: CeremonyId,
+    pub timeout_ms: u32,
+    pub purpose: CertPurpose,
+    pub cert_sha256: [u8; 32],
+    pub scheme: SignScheme,
+    pub digest: Vec<u8>,
+}
+
+/// Most schemes a [`ChooseCertificate`] names.
+pub const MAX_SCHEMES: usize = 8;
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Request {
     Register(Register),
     Assert(Assert),
     VerifyUser(VerifyUser),
+    ChooseCertificate(ChooseCertificate),
+    SignWithCertificate(SignWithCertificate),
     Cancel { ceremony: CeremonyId },
 }
 
@@ -106,6 +147,8 @@ impl Request {
             Request::Register(r) => r.ceremony,
             Request::Assert(a) => a.ceremony,
             Request::VerifyUser(v) => v.ceremony,
+            Request::ChooseCertificate(c) => c.ceremony,
+            Request::SignWithCertificate(s) => s.ceremony,
             Request::Cancel { ceremony } => *ceremony,
         }
     }
@@ -160,6 +203,17 @@ pub enum Reply {
         ceremony: CeremonyId,
         method: Method,
         strength: Strength,
+    },
+    /// The certificate the user picked (DER), as the token holds it.
+    CertificateChosen {
+        ceremony: CeremonyId,
+        cert: Vec<u8>,
+    },
+    /// The token's signature, checked by sigillumd against the
+    /// certificate's key. ECDSA is `r || s`.
+    CertificateSigned {
+        ceremony: CeremonyId,
+        signature: Vec<u8>,
     },
     Refused {
         ceremony: CeremonyId,

@@ -27,6 +27,8 @@ license = "BSD-2-Clause"
 [workspace.dependencies]
 p256     = { version = "0.13", features = ["ecdsa", "ecdh"] }
 sha2     = "0.10"
+p384     = { version = "0.13", default-features = false, features = ["ecdsa", "std"] }
+rsa      = { version = "0.9", default-features = false, features = ["std", "u64_digit"] }
 hmac     = "0.12"
 hkdf     = "0.12"
 aes      = "0.8"

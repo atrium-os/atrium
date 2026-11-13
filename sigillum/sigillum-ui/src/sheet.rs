@@ -9,7 +9,7 @@
 //! - A PIN or passcode is typed one byte at a time into locked-down memory
 //!   (never a `String`) and drawn as bullets; Enter sends it.
 
-use sigillum_proto::client::Purpose;
+use sigillum_proto::client::{CertPurpose, Purpose};
 use sigillum_proto::driver::Pin;
 use sigillum_proto::ui::{Choice, DeviceView, FromUi, Sheet, SheetKey, ToUi};
 use zeroize::Zeroizing;
@@ -77,8 +77,22 @@ impl State {
                 rows.extend(devices.iter().map(|d| Row { choice: Choice::Device(d.id), label: format!("Use {}", d.name) }));
             }
             Sheet::Verify { .. } => rows.push(Row { choice: Choice::Passcode, label: "Use your passcode".into() }),
+            // Read from each certificate by sigillumd; quoted, as a name is.
+            Sheet::Certificates { sign, certs, .. } => rows.extend(certs.iter().map(|c| Row {
+                choice: Choice::Certificate(c.id),
+                label: format!(
+                    "{}\u{201c}{}\u{201d}, issued by \u{201c}{}\u{201d}, valid until {}",
+                    if *sign { "Sign with " } else { "" },
+                    c.subject,
+                    c.issuer,
+                    c.not_after
+                ),
+            })),
         }
-        let notice = rows.is_empty().then_some("Plug in your security key");
+        let notice = rows.is_empty().then_some(match &sheet {
+            Sheet::Certificates { .. } => "Plug in your token",
+            _ => "Plug in your security key",
+        });
         rows.push(Row { choice: Choice::Cancel, label: "Cancel".into() });
         State { key, sheet, rows, focus: 0, stage: Stage::Choose, secret: Zeroizing::new(Vec::new()), notice }
     }
@@ -100,6 +114,20 @@ impl State {
                 };
                 ("Confirm it\u{2019}s you".into(), vec![format!("{requester} asks {why}"), format!("User: {user}")])
             }
+            Sheet::Certificates { requester, purpose, sign, certs } => {
+                let CertPurpose::TlsClient { host, port } = purpose;
+                let at = if *port == 443 { host.clone() } else { format!("{host}:{port}") };
+                let mut lines = if *sign {
+                    vec![format!("{requester} asks your token to sign you in to {at}")]
+                } else {
+                    vec![format!("{at} asks {requester} for a certificate")]
+                };
+                if let Some(t) = certs.first().map(|c| &c.token).filter(|t| !t.is_empty()) {
+                    lines.push(format!("Token: {t}"));
+                }
+                let title = if *sign { "Sign with your certificate" } else { "Choose a certificate" };
+                (title.into(), lines)
+            }
         }
     }
 
@@ -115,9 +143,13 @@ impl State {
     /// A message from `sigillumd` about this sheet.
     pub fn from_broker(&mut self, m: &ToUi) -> Vec<Do> {
         match *m {
-            ToUi::AskPin { device, retries, .. } => {
+            ToUi::AskPin { device, retries, wrong, .. } => {
                 self.secret.clear();
-                self.notice = (retries < 8).then_some("Wrong PIN. Try again.");
+                self.notice = match (wrong, retries) {
+                    (_, 1) => Some("Last try: one more wrong PIN locks the key."),
+                    (true, _) => Some("Wrong PIN. Try again."),
+                    (false, _) => None,
+                };
                 self.stage = Stage::Pin { device, retries };
             }
             ToUi::Touch { device, .. } => self.stage = Stage::Touch { device },
@@ -157,6 +189,8 @@ impl State {
         match choice {
             Choice::Device(device) => self.stage = Stage::Working { device },
             Choice::Platform | Choice::Passkey(_) => self.stage = Stage::Arca,
+            // The token's driver works; a PIN request may follow.
+            Choice::Certificate(_) => self.stage = Stage::Working { device: 0 },
             _ => {}
         }
         vec![Do::Send(FromUi::Press { key: self.key, choice, activation_ok: true }), Do::Redraw]
@@ -240,7 +274,7 @@ mod tests {
     #[test]
     fn pin_is_typed_as_bytes_and_sent_on_enter() {
         let mut s = assert_sheet();
-        s.from_broker(&ToUi::AskPin { key: 4, device: 9, retries: 8 });
+        s.from_broker(&ToUi::AskPin { key: 4, device: 9, retries: 8, wrong: false });
         assert!(s.notice.is_none());
         for c in b"4711" {
             s.key(Key::Char(*c), [0; 16]);
@@ -255,7 +289,7 @@ mod tests {
         }
         assert_eq!(s.bullets(), 0);
         // Wrong PIN: asked again, with a notice.
-        s.from_broker(&ToUi::AskPin { key: 4, device: 9, retries: 7 });
+        s.from_broker(&ToUi::AskPin { key: 4, device: 9, retries: 7, wrong: true });
         assert!(s.notice.is_some());
         assert!(s.key(Key::Enter, T).is_empty(), "nothing typed, nothing sent");
     }
@@ -263,7 +297,7 @@ mod tests {
     #[test]
     fn escape_cancels_without_a_token_and_wipes_the_pin() {
         let mut s = assert_sheet();
-        s.from_broker(&ToUi::AskPin { key: 4, device: 9, retries: 8 });
+        s.from_broker(&ToUi::AskPin { key: 4, device: 9, retries: 8, wrong: false });
         s.key(Key::Char(b'1'), [0; 16]);
         assert_eq!(s.key(Key::Escape, [0; 16]), vec![Do::Send(FromUi::Press { key: 4, choice: Choice::Cancel, activation_ok: true })]);
         assert_eq!(s.bullets(), 0);
@@ -307,6 +341,29 @@ mod tests {
         s.from_broker(&ToUi::AskPasscode { key: 2, wrong: false });
         s.key(Key::Char(b'p'), [0; 16]);
         assert!(matches!(&s.key(Key::Enter, T)[0], Do::Send(FromUi::Passcode { key: 2, .. })));
+    }
+
+    #[test]
+    fn certificates_are_listed_and_the_pin_says_when_it_is_the_last_try() {
+        use sigillum_proto::ui::CertView;
+        let cv = CertView { id: 0, subject: "Asha Rao".into(), issuer: "Capricorn CA".into(), not_after: "2027-03-01".into(), token: "InnaitKey DSC".into() };
+        let purpose = CertPurpose::TlsClient { host: "portal.example.in".into(), port: 443 };
+        let mut s = State::new(3, Sheet::Certificates { requester: "Navigator".into(), purpose: purpose.clone(), sign: true, certs: vec![cv] }, vec![]);
+        assert_eq!(s.text().0, "Sign with your certificate");
+        assert_eq!(s.text().1, ["Navigator asks your token to sign you in to portal.example.in", "Token: InnaitKey DSC"]);
+        assert_eq!(s.rows[0].label, "Sign with \u{201c}Asha Rao\u{201d}, issued by \u{201c}Capricorn CA\u{201d}, valid until 2027-03-01");
+        assert_eq!(s.click(0, T), vec![Do::Spend { choice: Choice::Certificate(0), token: T }]);
+        s.spent(Choice::Certificate(0), true);
+        s.from_broker(&ToUi::AskPin { key: 3, device: 5, retries: 255, wrong: false });
+        assert!(s.notice.is_none() && s.takes_secret());
+        s.from_broker(&ToUi::AskPin { key: 3, device: 5, retries: 255, wrong: true });
+        assert_eq!(s.notice, Some("Wrong PIN. Try again."));
+        s.from_broker(&ToUi::AskPin { key: 3, device: 5, retries: 1, wrong: true });
+        assert!(s.notice.unwrap().starts_with("Last try"));
+
+        let s = State::new(4, Sheet::Certificates { requester: "Navigator".into(), purpose, sign: false, certs: vec![] }, vec![]);
+        assert_eq!(s.notice, Some("Plug in your token"));
+        assert_eq!(s.text().1, ["portal.example.in asks Navigator for a certificate"]);
     }
 
     #[test]

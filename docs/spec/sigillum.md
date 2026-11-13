@@ -929,7 +929,22 @@ administrative calls (`C_InnaIT*`: zeroize, initialise, applet install and delet
    (`hospes/sigillum-p11-check`): certificates listed, every PIN outcome (needed, wrong,
    final try, blocked), an ECDSA P-256 signature that verifies, the RSA `DigestInfo` and
    PSS parameters, an unknown key, a short digest, exit on close, no forbidden call and no
-   PIN in the log: 17 of 17. Next: sigillumd's side (list, prompt for the PIN, sign).
+   PIN in the log: 17 of 17.
+   **sigillumd's side done 2026-11-13.** Two client requests, for the web broker and Arca
+   only, purpose TLS client authentication to a real domain: `ChooseCertificate` (the
+   schemes the server accepts; the reply is the picked certificate, DER) and
+   `SignWithCertificate` (the certificate's SHA-256, a scheme, the digest; the reply is the
+   signature). Two are needed because TLS 1.3's `CertificateVerify` covers the
+   `Certificate` message, so the courier needs the certificate before it has a digest.
+   The broker asks every attached token (class CCID) for its certificates, and any token
+   plugged in while the sheet is up; reading public objects is the one device work before
+   a press. It reads names, expiry and the key from each certificate itself
+   (`sigillumd/src/cert.rs`, a strict DER walk; never the driver's label or key kind),
+   offers only keys that fit the scheme (P-256, P-384, RSA 2048–4096), and checks the
+   token's signature against that key before the client gets it. The sheet shows the
+   certificates, then the PIN with the tries left, "wrong" and "last try" notices
+   (`ToUi::AskPin` gained `wrong`). Tests: `sigillumd/tests/tokens.rs` (8) and the sheet's.
+   Document signing for apps (§10.2) waits for `identity.certificate` in the label.
 4. **P4.** A gate on an amd64 guest with the real token passed through from the Mac, by
    QEMU `usb-host` or by APDU forwarding (`ccid-card-passthru`). It signs a digest, and
    the signature verifies against the token's certificate. Generic PIV over the same

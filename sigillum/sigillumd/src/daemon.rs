@@ -397,6 +397,10 @@ impl Daemon {
     }
 
     fn devices_for(&self, sheet: &Sheet) -> Vec<DeviceView> {
+        // A certificate sheet lists certificates, not devices.
+        if matches!(sheet, Sheet::Certificates { .. }) {
+            return Vec::new();
+        }
         let fido = matches!(sheet, Sheet::Register { .. } | Sheet::Assert { .. });
         self.broker
             .devices()
@@ -436,7 +440,7 @@ impl Daemon {
                         Vec::new()
                     }
                 }
-                Action::AskPin { key, device, retries } => self.ui_or_drop(ToUi::AskPin { key, device, retries }),
+                Action::AskPin { key, device, retries, wrong } => self.ui_or_drop(ToUi::AskPin { key, device, retries, wrong }),
                 Action::Touch { key, device } => self.ui_or_drop(ToUi::Touch { key, device }),
                 Action::CloseSheet { key } => {
                     if self.asked_passcode.as_ref().is_some_and(|(k, _)| *k == key) {
