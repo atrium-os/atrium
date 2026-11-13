@@ -7,6 +7,7 @@ resolver = "2"
 members = [
     "aura-proto",
     "aura-wlan-core",
+    "aura-sim-check",
 ]
 
 [workspace.package]

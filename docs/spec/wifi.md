@@ -269,7 +269,7 @@ in FreeBSD and that hardware is going away.
 
 | Step | What | Done when |
 |---|---|---|
-| W0 | `aura-proto`, `aura_wlan` skeleton, kpi bindings (bus_dma, MSI-X, firmware, mbuf, ifnet), `aura_sim` + hwsim bridge | `wlan0` appears in the VM and passes Ethernet frames to the sim |
+| W0 | `aura-proto`, `aura_wlan` skeleton, kpi bindings (bus_dma, MSI-X, firmware, mbuf, ifnet), `aura_sim` + hwsim bridge | `wlan0` appears in the VM and passes Ethernet frames to the sim. **Done 2026-11-13** (§7.1) |
 | W1 | `aurad`: scan, open + WPA2-PSK + PMF, Arca credentials, jail, atrium-net glue, DHCP | VM joins hwsim `hostapd` WPA2 and gets an address |
 | W2 | `aurad`: WPA3-SAE (H2E + hunting-and-pecking), transition mode, roaming, MAC randomization, regdb | sim gate (§6.2) green |
 | W3 | `aura_mt79` USB transport: MCU messages, patch + RAM firmware load, hardware scan | MT7921AU in the Mac VM scans and reports BSSs to `aurad` |
@@ -279,6 +279,31 @@ in FreeBSD and that hardware is going away.
 | W7 | Enterprise: EAP-TLS, PEAP-MSCHAPv2, EAP-TTLS; certificates through Arca | interop with hostapd's EAP server |
 
 W0–W2 need no Wi-Fi hardware at all.
+
+### 7.1 W0 as built (2026-11-13)
+
+- `aura/aura-proto`: the control-channel protocol, `no_std`, no `unsafe`, one
+  encoding per message (fuzzed). `aura/aura-wlan-core`: the data path rules
+  over a `Radio` trait (controlled port, A-MSDU with the FragAttacks check,
+  fragments dropped, KRACK no-reinstall, per-TID replay counters,
+  regulatory with world rules until a country is set). Host tests:
+  `cd aura && cargo test`.
+- `aura/kmod/wlan` (`aura_wlan.ko`): C for cdevs, ifnet (if_t API), mbufs,
+  locking and sysctls (`net.aura.wlanN.*`, drop counters by reason); the two
+  crates compiled in through kmod.rust.mk with a small Rust seam
+  (`aura_wlan_rs.rs`). The driver ABI (`aura/kmod/aura_wlan.h`) passes
+  control requests to drivers as validated aura-proto bytes, so there is one
+  versioned format and no C struct to keep in step beyond the caps table.
+- `aura/kmod/sim` (`aura_sim.ko`): test radio, a pipe to user space through
+  `/dev/aura/sim0`; parses nothing.
+- Kernel bindings: none were needed yet. The C glue does ifnet and mbufs, as
+  §3.3 allowed for; `bus_dma`, MSI-X and `firmware(9)` bindings arrive with
+  the first hardware driver (W3), where they can be tested.
+- Gate: `scripts/aura-vm-check.sh kernel|test` (RUNBOOK §13.6c), 24 checks
+  in the arm64 cloud VM on the fork's ATRIUM-NODEBUG kernel, modules unload
+  cleanly. The hwsim/hostapd bridge moves to W1, where the first handshake
+  needs it.
+
 
 ## 8. Threat model and what runs where
 

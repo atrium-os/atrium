@@ -5513,6 +5513,21 @@ timing, so run it on the Mac's HVF VM; check 3 (no device in app jails) is
 portcullis-jail's devfs test plus portcullisd's shipped_manifests test (VM only:
 portcullisd doesn't build on Linux).
 
+### 13.6c Aura Wi-Fi core in the cloud VM (`scripts/aura-vm-check.sh`)
+
+```sh
+OBJ=$HOME/obj ARCH=aarch64 sh scripts/aura-vm-check.sh kernel   # fork kernel as kernel.atrium (one-shot nextboot)
+OBJ=$HOME/obj ARCH=aarch64 sh scripts/aura-vm-check.sh test     # build aura_wlan.ko + aura_sim.ko + aura-sim-check, load, run
+```
+
+- Needs the fork kernel built for `KERNCONF` (§13.2) and kpi-rs prepared
+  (`scripts/rust-kmod-spike.sh prepare`). Modules alone: `TARGET=arm64 sh scripts/aura-kmod.sh`.
+- In a fresh container the kernel-toolchain step compiles LLVM's bootstrap tools for
+  ~40 min on 4 cores; the kernel itself then takes ~3 min, the modules ~20 s.
+- `aura_sim` is test only: it never goes in devices.d. `/dev/aura/sim0` is a pipe to user
+  space (`aura/kmod/sim/aura_sim.h`); the gate plays the AP through it.
+- Host tests: `cd aura && cargo test` (proto + core, incl. mutation fuzzing).
+
 ### 13.6b Bluetooth (Vinculum) harness: Rootcanal + Bumble, no radio
 
 `vinculum/` is its own cargo workspace ([spec/bluetooth.md](docs/spec/bluetooth.md)).

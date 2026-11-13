@@ -181,6 +181,17 @@ impl<'a, T: Item> List<'a, T> {
             T::read(&mut r).unwrap_or_else(|_| unreachable!())
         })
     }
+    /// A list over raw item bytes (no count prefix), if every item is valid.
+    pub fn from_raw(raw: &'a [u8]) -> Option<List<'a, T>> {
+        if raw.len() % T::SIZE != 0 {
+            return None;
+        }
+        let mut r = Rd::new(raw);
+        for _ in 0..raw.len() / T::SIZE {
+            T::read(&mut r).ok()?;
+        }
+        Some(List { raw, _t: core::marker::PhantomData })
+    }
     /// Encodes `items` as a list into `out` and returns it borrowed from
     /// `out`, for building messages.
     pub fn build(items: &[T], out: &'a mut [u8]) -> Result<List<'a, T>, Error> {
@@ -658,6 +669,7 @@ pub enum Msg<'a> {
     PortAuthorized(bool),
     TxEapol { dst: Mac, body: &'a [u8] },
     // kernel -> daemons
+    /// 0, or a negative errno.
     Ack { status: i32 },
     Caps(Caps<'a>),
     MgmtRx { freq: u16, rssi: i8, flags: u8, tsf_us: u64, frame: &'a [u8] },

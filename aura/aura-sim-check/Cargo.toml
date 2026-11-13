@@ -1,0 +1,10 @@
+[package]
+name = "aura-sim-check"
+version = "0.1.0"
+description = "W0 gate for the Aura kernel core: drives /dev/aura/ctl0, key0 and sim0 (aura_wlan.ko + aura_sim.ko) and checks the channel split, controlled port, data path and teardown (scripts/aura-vm-check.sh)."
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+aura-proto = { path = "../aura-proto" }
+libc = "0.2"

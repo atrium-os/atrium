@@ -2,8 +2,8 @@
 //! radio associated with keys installed and the port open. Must never panic.
 #![no_main]
 
-use aura_proto::{bss_flags, Bss, Cipher, Key, KeyKind, Mac, Msg, PowerSave, ScanReq, Width};
-use aura_wlan_core::{reg::Regulatory, Radio, RxInfo, Wlan};
+use aura_proto::{bss_flags, Bss, Cipher, Key, KeyKind, Mac, Msg, Width};
+use aura_wlan_core::{Radio, RxInfo, Wlan};
 use libfuzzer_sys::fuzz_target;
 
 const OWN: Mac = [2, 0, 0, 0, 0, 1];
@@ -12,14 +12,7 @@ const AP: Mac = [2, 0xaa, 0, 0, 0, 2];
 struct R;
 impl Radio for R {
     fn own_mac(&self) -> Mac { OWN }
-    fn scan(&mut self, _: &ScanReq<'_>, _: &Regulatory) -> Result<(), i32> { Ok(()) }
-    fn set_bss(&mut self, _: &Bss) -> Result<(), i32> { Ok(()) }
-    fn clear_bss(&mut self) {}
-    fn tx_mgmt(&mut self, _: u16, _: &[u8]) -> Result<(), i32> { Ok(()) }
-    fn set_key(&mut self, _: &Key) -> Result<(), i32> { Ok(()) }
-    fn del_key(&mut self, _: KeyKind, _: u8, _: &Mac) -> Result<(), i32> { Ok(()) }
-    fn set_power_save(&mut self, _: PowerSave) -> Result<(), i32> { Ok(()) }
-    fn set_mac(&mut self, _: &Mac) -> Result<(), i32> { Ok(()) }
+    fn request(&mut self, _: &Msg<'_>) -> Result<(), i32> { Ok(()) }
 }
 
 fuzz_target!(|data: &[u8]| {

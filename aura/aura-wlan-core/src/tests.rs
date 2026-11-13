@@ -1,5 +1,5 @@
 use super::*;
-use aura_proto::{bss_flags, Cipher, List, RegRule, Width};
+use aura_proto::{bss_flags, Cipher, Key, List, RegRule, ScanReq, Width};
 use frame::{BROADCAST, RFC1042};
 use std::vec::Vec;
 
@@ -17,33 +17,22 @@ impl Radio for Mock {
     fn own_mac(&self) -> Mac {
         OWN
     }
-    fn scan(&mut self, _: &ScanReq<'_>, _: &Regulatory) -> Result<(), i32> {
-        self.log.push("scan");
-        Ok(())
-    }
-    fn set_bss(&mut self, _: &Bss) -> Result<(), i32> {
-        self.log.push("set_bss");
-        Ok(())
-    }
-    fn clear_bss(&mut self) {
-        self.log.push("clear_bss");
-    }
-    fn tx_mgmt(&mut self, _: u16, _: &[u8]) -> Result<(), i32> {
-        self.log.push("tx_mgmt");
-        Ok(())
-    }
-    fn set_key(&mut self, _: &Key) -> Result<(), i32> {
-        self.keys_set += 1;
-        Ok(())
-    }
-    fn del_key(&mut self, _: KeyKind, _: u8, _: &Mac) -> Result<(), i32> {
-        Ok(())
-    }
-    fn set_power_save(&mut self, _: PowerSave) -> Result<(), i32> {
-        Ok(())
-    }
-    fn set_mac(&mut self, _: &Mac) -> Result<(), i32> {
-        self.log.push("set_mac");
+    fn request(&mut self, m: &Msg<'_>) -> Result<(), i32> {
+        self.log.push(match m {
+            Msg::Scan(_) => "scan",
+            Msg::SetBss(_) => "set_bss",
+            Msg::ClearBss => "clear_bss",
+            Msg::TxMgmt { .. } => "tx_mgmt",
+            Msg::SetMac(_) => "set_mac",
+            Msg::SetRegulatory { .. } => "set_regulatory",
+            Msg::SetKey(_) => {
+                self.keys_set += 1;
+                "set_key"
+            }
+            Msg::DelKey { .. } => "del_key",
+            Msg::SetPowerSave(_) => "set_power_save",
+            _ => panic!("core forwarded {m:?}"),
+        });
         Ok(())
     }
 }
@@ -392,7 +381,8 @@ fn control_requests() {
     .unwrap();
     assert_eq!(w.ctl(&Msg::SetRegulatory { alpha2: *b"XX", rules }), 0);
     assert!(w.bss().is_none() && !w.port_open());
-    assert_eq!(w.radio.log.last(), Some(&"clear_bss"));
+    let n = w.radio.log.len();
+    assert_eq!(&w.radio.log[n - 2..], ["set_regulatory", "clear_bss"]);
     // Wrong channel kinds.
     assert_eq!(w.ctl(&Msg::PortAuthorized(true)), EINVAL);
     w.ctl(&Msg::SetBss(bss(2412)));

@@ -25,7 +25,7 @@ pub mod keys;
 pub mod reg;
 
 use amsdu::Amsdu;
-use aura_proto::{Bss, Key, KeyKind, Mac, Msg, PowerSave, ScanReq};
+use aura_proto::{Bss, KeyKind, Mac, Msg};
 use frame::{decap, is_group, DataHdr, Drop, TxHdr, ETHERTYPE_EAPOL};
 use keys::{Install, Table};
 use reg::Regulatory;
@@ -40,19 +40,17 @@ pub mod errno {
 }
 
 /// What the hardware driver (`aura_mt79`, `aura_intel`, `aura_sim`) does
-/// for the core. Errors are errno values.
+/// for the core. Control operations reach the driver as the same
+/// [`aura_proto`] messages the daemons send, after the core has checked
+/// them: `Scan`, `SetBss`, `ClearBss`, `TxMgmt`, `SetPowerSave`,
+/// `SetRegulatory`, `SetMac`, `SetKey`, `DelKey`. Across kmods that is the
+/// C ABI too: one versioned, validated byte format, nothing else to keep in
+/// step. The driver keeps the last `SetRegulatory` (the world rules until
+/// one arrives) and scans channels that do not allow initiating radiation
+/// passively, whatever the scan request says. Errors are errno values.
 pub trait Radio {
     fn own_mac(&self) -> Mac;
-    /// Start a scan. Channels where `reg.may_initiate` is false must be
-    /// scanned passively, whatever the request says.
-    fn scan(&mut self, req: &ScanReq<'_>, reg: &Regulatory) -> Result<(), i32>;
-    fn set_bss(&mut self, bss: &Bss) -> Result<(), i32>;
-    fn clear_bss(&mut self);
-    fn tx_mgmt(&mut self, freq: u16, frame: &[u8]) -> Result<(), i32>;
-    fn set_key(&mut self, key: &Key) -> Result<(), i32>;
-    fn del_key(&mut self, kind: KeyKind, idx: u8, addr: &Mac) -> Result<(), i32>;
-    fn set_power_save(&mut self, ps: PowerSave) -> Result<(), i32>;
-    fn set_mac(&mut self, mac: &Mac) -> Result<(), i32>;
+    fn request(&mut self, m: &Msg<'_>) -> Result<(), i32>;
 }
 
 /// Per-frame receive information from the hardware.
@@ -186,7 +184,8 @@ impl<R: Radio> Wlan<R> {
     /// Leaves the BSS: keys gone (hardware and table), port closed.
     fn leave(&mut self) {
         if let State::Bss(_) = self.state {
-            self.radio.clear_bss();
+            // Leaving cannot fail; the driver resets the hardware if it must.
+            let _ = self.radio.request(&Msg::ClearBss);
         }
         self.state = State::Idle;
         self.port_open = false;
@@ -205,7 +204,7 @@ impl<R: Radio> Wlan<R> {
                 if s.freqs.iter().any(|f| !self.reg.allowed(f.0)) {
                     return EINVAL;
                 }
-                match self.radio.scan(s, &self.reg) {
+                match self.radio.request(m) {
                     Ok(()) => {
                         self.scanning = true;
                         0
@@ -220,7 +219,7 @@ impl<R: Radio> Wlan<R> {
                 if !self.reg.allowed(b.freq) {
                     return EINVAL;
                 }
-                match self.radio.set_bss(b) {
+                match self.radio.request(m) {
                     Ok(()) => {
                         self.state = State::Bss(*b);
                         0
@@ -246,11 +245,14 @@ impl<R: Radio> Wlan<R> {
                 if !ok {
                     return EPERM;
                 }
-                self.radio.tx_mgmt(*freq, frame).err().unwrap_or(0)
+                self.radio.request(m).err().unwrap_or(0)
             }
-            Msg::SetPowerSave(p) => self.radio.set_power_save(*p).err().unwrap_or(0),
+            Msg::SetPowerSave(_) => self.radio.request(m).err().unwrap_or(0),
             Msg::SetRegulatory { alpha2, rules } => {
                 self.reg.set(*alpha2, rules.iter());
+                if let Err(e) = self.radio.request(m) {
+                    return e;
+                }
                 if let Some(b) = self.bss() {
                     if !self.reg.allowed(b.freq) {
                         self.leave();
@@ -258,11 +260,11 @@ impl<R: Radio> Wlan<R> {
                 }
                 0
             }
-            Msg::SetMac(mac) => {
+            Msg::SetMac(_) => {
                 if !matches!(self.state, State::Idle) || self.scanning {
                     return EBUSY;
                 }
-                self.radio.set_mac(mac).err().unwrap_or(0)
+                self.radio.request(m).err().unwrap_or(0)
             }
             Msg::Disconnect { .. } => {
                 if matches!(self.state, State::Idle) {
@@ -293,7 +295,7 @@ impl<R: Radio> Wlan<R> {
                 }
                 match self.keys.install(k) {
                     Install::Unchanged => 0,
-                    Install::New => match self.radio.set_key(k) {
+                    Install::New => match self.radio.request(m) {
                         Ok(()) => 0,
                         Err(e) => {
                             self.keys.remove(k.kind, k.idx);
@@ -302,11 +304,11 @@ impl<R: Radio> Wlan<R> {
                     },
                 }
             }
-            Msg::DelKey { kind, idx, addr } => {
+            Msg::DelKey { kind, idx, .. } => {
                 if !self.keys.remove(*kind, *idx) {
                     return EINVAL;
                 }
-                self.radio.del_key(*kind, *idx, addr).err().unwrap_or(0)
+                self.radio.request(m).err().unwrap_or(0)
             }
             Msg::PortAuthorized(open) => {
                 self.port_open = *open;
