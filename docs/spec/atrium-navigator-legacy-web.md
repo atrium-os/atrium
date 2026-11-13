@@ -637,6 +637,42 @@ A2 jar (arca.md §8.7) is on main, so this follows its build order rather than w
 - *Session cookies dying with the view* (Arca §8.6).
 - *The EU-vantage measurement.*
 
+### 5.4.1f Applied: the converter's own script fetches are same-origin too (2026-11-13)
+
+§5.4.1c settled the network a page's scripts reach. It left a gap on the other side of the
+same rule: the scripts themselves. `navigator-prerender` downloaded every external
+`<script src>` the document declared, every module it imported, and hinted all of them to
+fetchd's prefetcher, from any origin. The ad-residue measurement (navigator-ui §6.6) found
+48 ad or tracker scripts on 29 of 119 corpus pages fetched as code at conversion. §5.4.1c
+then refused what they asked for, but the download had already told each host that a
+conversion happened.
+
+**Applied: script is fetched only from the document's own origin**, by the rule §5.4.1c's
+data settled for page requests, applied to code:
+
+1. **Everything that is code goes through one gate** (`fetch::SameOriginScripts`): declared
+   classic scripts, module scripts, every static `import` of a module or of an inline
+   module, and the prefetch hints for them. A URL whose scheme, host and port differ from
+   the document's is refused before any byte is asked for. A document with no URL has no
+   origin, and no script is fetched for it.
+2. **Counted, not silent.** Each refusal is a page-network refusal in every report
+   (`cross-origin script <host>` in `blocked_hosts`, and in `page_blocked`), and
+   `external_refused` counts the declared scripts refused. They are not counted as failures.
+3. **Script a page injects at run time** was already refused when it had a `src`
+   (`run_injected_scripts`), so the converter now fetches no third-party code by any path.
+4. **No blocklist**, as in §5.4.1c and §5.4.1d: the rule is computed from two URLs.
+
+**What it costs** is the same population §5.4.1c's measurement found: pages whose own code
+lives on a CDN of another origin (`githubassets`, `bbci`) now convert as their tier-1
+document, which §5.4.2's policy would have chosen for most of them anyway. The corpus
+re-run is recorded in navigator-ui §6.6.
+
+**Tier 3 is the way back, not a relaxation.** Where a refused script is a known artifact
+(a specific library build, a known analytics SDK), §5's tier 3 substitutes a native
+behaviour or a no-op by content hash, which needs no fetch: `integrity="sha384-…"` on the
+element names the bytes. No such table exists yet; it is added only where a measurement
+shows a page that loses content without it.
+
 ### 5.4.2 Never emit an artifact worse than the input
 
 Because tier 2 is tier 1's DOM plus whatever the scripts changed, both artifacts are in
@@ -2418,6 +2454,18 @@ document never runs the island's code.
 
 **Where islands recur** (from §11.8.3): video players, map widgets, payment fields (the
 processor's tokenisation iframe), embedded editors (Figma), and DRM playback.
+
+**Recognised embeds** (2026-11-13). An island starts only from a recognised embed, never
+from an arbitrary `<iframe>`. The normalizer (profile §3 excludes `<iframe>`) drops every
+iframe, `<frame>` and `<embed>`, and keeps an `<object>`'s fallback content. An iframe
+whose `src` is on a typed list (`navigator_dom::media::recognised_embed`: YouTube's and
+Vimeo's players) becomes a `<video>` box carrying `atrium-island` with the canonical
+player URL, rebuilt from the video id alone so the page's query (autoplay, `enablejsapi`,
+tracking) never reaches the island; YouTube's is the `youtube-nocookie.com` player. The
+renderer gives that box an embed slot of role `island` (navigator-ui §6.3), which the UI
+starts only on the reader's press. Only the normalizer writes the attribute: one the
+page wrote is removed, and the renderer reads it back through the same list. Before this,
+68 iframes survived normalization on the 119-page corpus (navigator-ui §6.6).
 
 **Nesting: a CDM is an island inside an island.** Where DRM applies (§11.8.3: Spotify,
 paid video), the decryption module is the only part that must be a closed binary. Settled

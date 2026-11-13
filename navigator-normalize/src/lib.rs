@@ -941,6 +941,12 @@ pub fn normalize(html: &str, inputs: &Inputs) -> (String, Report) {
     report.elements_styled = per_element.len();
 
     phases::lap("emit");
+    // ★ Embedded content, read before step 6 strips `width`/`height`: each
+    // `<iframe>` and whether it is a recognised embed (see `embedded`).
+    let frames: Vec<(Handle, Option<String>, Option<u32>, Option<u32>)> = dom.by_tag_anywhere("iframe").into_iter().map(|h| {
+        let dim = |a: &str| dom.attr(h, a).and_then(|v| v.trim().trim_end_matches("px").parse::<u32>().ok()).filter(|v| (1..=8192).contains(v));
+        (h, dom.attr(h, "src").and_then(navigator_dom::media::recognised_embed), dim("width"), dim("height"))
+    }).collect();
     // 6. Rewrite the document: generated classes on, `style=` off, `<link>`
     //    and the old `<style>` blocks gone, one new sheet in the head.
     for (h, names) in &per_element {
@@ -973,6 +979,7 @@ pub fn normalize(html: &str, inputs: &Inputs) -> (String, Report) {
     for h in links { detach(&mut dom, h) }
     // Scripts never reach the renderer: the converter has already run them.
     detach_all(&mut dom, "script");
+    embedded(&mut dom, &frames, &mut report);
 
     // 7. Declared intrinsic sizes (§3.13): an image the input measured gets
     //    `width`/`height` attributes; one it did not is DROPPED, because the
@@ -1328,6 +1335,70 @@ fn compile_floats(dom: &mut Dom, resolved: &mut collapse::Resolved, floats: &[(H
         beside += 1;
     }
     (beside, alone)
+}
+
+/// ★★ NO IFRAMES IN THE DOCUMENT (profile §3: `<iframe>`, `<object>` and
+/// `<embed>` are excluded; composition is Limen's). Measured 2026-11-13
+/// (navigator-ui §6.6): 68 iframes survived normalization on the 119-page
+/// corpus, 36 visible on 18 pages, and 7 pages kept an empty box for one.
+///
+/// - An `<iframe>` that is a RECOGNISED EMBED (`media::recognised_embed`:
+///   a YouTube or Vimeo player) becomes a `<video>` box carrying only its
+///   generated class, `id`, `title`, its declared size (or a 16/9 ratio)
+///   and `atrium-island` = the canonical player URL. The renderer gives it
+///   an `island` embed slot: a live part, started only by the reader.
+/// - Every other `<iframe>`, and every `<frame>`, `<frameset>` and
+///   `<embed>`, is dropped with its box, and counted.
+/// - An `<object>` is replaced by its children, HTML's fallback content.
+///
+/// Runs after the cascade, so a structural selector that counted the
+/// iframe as a sibling matched as it does in a browser. Any `atrium-island`
+/// the PAGE wrote is removed first: only this function marks an island.
+fn embedded(dom: &mut Dom, frames: &[(Handle, Option<String>, Option<u32>, Option<u32>)], report: &mut Report) {
+    use navigator_dom::media::ISLAND_ATTR;
+    for h in (0..dom.nodes.len() as Handle).filter(|h| dom.attr(*h, ISLAND_ATTR).is_some()).collect::<Vec<_>>() {
+        dom.remove_attr(h, ISLAND_ATTR);
+        report.drop(format!("`{ISLAND_ATTR}` written by the page"));
+    }
+    for (h, island, w, ht) in frames {
+        if !dom.connected(*h) { continue }
+        let Some(src) = island else {
+            detach(dom, *h);
+            report.drop("<iframe> (profile §3; not a recognised embed)");
+            continue
+        };
+        let keep: Vec<(String, String)> = ["class", "id", "title"].iter()
+            .filter_map(|a| dom.attr(*h, a).map(|v| (a.to_string(), v.to_string()))).collect();
+        for c in dom.children_of(*h) { detach(dom, c) }
+        if let Some(n) = dom.get_mut(*h) {
+            n.kind = Kind::Element("video".into());
+            n.attrs.clear();
+        }
+        for (a, v) in &keep { dom.set_attr(*h, a, v) }
+        dom.set_attr(*h, ISLAND_ATTR, src);
+        match (w, ht) {
+            (Some(w), Some(ht)) => { dom.set_attr(*h, "width", &w.to_string()); dom.set_attr(*h, "height", &ht.to_string()) }
+            _ => dom.set_attr(*h, "natural-ratio", "16/9"),
+        }
+        *report.dropped.entry("<iframe> recognised as an embed (now an island box)".into()).or_default() += 1;
+    }
+    for tag in ["frame", "frameset", "embed"] {
+        for h in dom.by_tag_anywhere(tag) {
+            if !dom.connected(h) { continue }
+            detach(dom, h);
+            report.drop(format!("<{tag}> (profile §3)"));
+        }
+    }
+    for h in dom.by_tag_anywhere("object") {
+        let Some(p) = dom.get(h).and_then(|n| n.parent) else { continue };
+        for c in dom.children_of(h) {
+            if dom.tag(c) == Some("param") { continue }
+            dom.detach_for_move(c);
+            dom.insert_before(p, c, Some(h));
+        }
+        detach(dom, h);
+        report.drop("<object> (profile §3; its fallback content kept)");
+    }
 }
 
 fn detach_all(dom: &mut Dom, tag: &str) {

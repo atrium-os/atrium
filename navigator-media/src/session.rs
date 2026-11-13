@@ -131,7 +131,7 @@ impl Sessions {
                 let mime: String = mime.chars().take(limen::media_player::MIME_MAX).collect();
                 (ToChild::Load { source: Source::Fd, mime, growing: false }, url)
             }
-            EmbedSource::Script => return Err(NotStarted::NeedsEngine),
+            EmbedSource::Script | EmbedSource::Island { .. } => return Err(NotStarted::NeedsEngine),
             EmbedSource::Unplayable => return Err(NotStarted::Unplayable),
         };
         if self.live.len() >= LIVE_MAX { return Err(NotStarted::TooMany) }

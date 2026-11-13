@@ -75,6 +75,9 @@ pub struct Conversion {
     pub external_total: usize,
     pub external_fetched: usize,
     pub external_failed: usize,
+    /// ★ External scripts the same-origin gate refused (§5.4.1f): declared
+    /// with another origin, so never fetched. Not counted as failed.
+    pub external_refused: usize,
     pub scripts_run: usize,
     pub scripts_failed: usize,
     pub script_mutations: u64,
@@ -244,6 +247,10 @@ struct Pre {
     scripts_total: usize,
     mse_scripts: usize,
     ext: (usize, usize, usize),
+    /// External scripts refused by the same-origin gate, and every refusal
+    /// (imports included) by `cross-origin script <host>`.
+    ext_refused: usize,
+    script_refusals: Vec<(String, u32)>,
 }
 
 /// Whether a script uses Media Source Extensions: it constructs or tests a
@@ -281,6 +288,7 @@ fn assemble(dom: &dom::Dom, rep: engine::RunReport, subresources: subresource::S
         external_total: pre.ext.0,
         external_fetched: pre.ext.1,
         external_failed: pre.ext.2,
+        external_refused: pre.ext_refused,
         scripts_run: rep.scripts_run,
         scripts_failed: rep.scripts_failed,
         script_mutations: dom.script_mutations,
@@ -303,8 +311,14 @@ fn assemble(dom: &dom::Dom, rep: engine::RunReport, subresources: subresource::S
         timers_dropped: rep.timers_dropped,
         page_fetches: rep.page_fetches,
         page_fetch_failures: rep.page_fetch_failures,
-        page_blocked: rep.page_blocked,
-        blocked_hosts: rep.blocked_hosts,
+        // ★ The script gate's refusals are page-network refusals in every
+        // report, so a measurement that counts one counts the other.
+        page_blocked: rep.page_blocked + pre.script_refusals.iter().map(|(_, n)| n).sum::<u32>(),
+        blocked_hosts: {
+            let mut b = pre.script_refusals.clone();
+            b.extend(rep.blocked_hosts);
+            b
+        },
         beacons_suppressed: rep.beacons_suppressed,
         verdict,
         missing: rep.missing,
@@ -393,6 +407,10 @@ fn convert_impl(
     let mut seen: HashSet<String> = HashSet::new();
     let mut scripts: Vec<ScriptSource> = vec![];
     let mut held = 0usize;
+    let mut ext_refused = 0usize;
+    // ★ Every script fetch goes through the same-origin gate (§5.4.1f):
+    // declared scripts, modules and what they import.
+    let mut gate = fetch::SameOriginScripts::new(&mut *fetcher, base);
     for s in dom::scripts_in_order(&dom) {
         if scripts_held { held += 1; continue }
         match s {
@@ -411,7 +429,7 @@ fn convert_impl(
                                     for spec in modmirror::scan_imports(&text) {
                                         if spec.starts_with('.') || spec.starts_with('/') {
                                             if let Ok(abs) = bu.join(&spec) {
-                                                let _ = modmirror::mirror(fetcher, abs.as_str(),
+                                                let _ = modmirror::mirror(&mut gate, abs.as_str(),
                                                     &mirror_root, &mut seen, 1, &mut fetch_errors);
                                             }
                                         }
@@ -438,12 +456,17 @@ fn convert_impl(
                 ext_total += 1;
                 match resolve(base, &href) {
                     None => { ext_fail += 1; fetch_errors.push(format!("unresolved src: {href}")); }
+                    Some(abs) if !gate.allows(&abs) => {
+                        // Refused before any byte is asked for, and counted.
+                        ext_refused += 1;
+                        let _ = gate.get(&abs);
+                    }
                     Some(abs) => {
                         if module {
                             let _s = timing::span("module");
                             // A module and everything it imports, mirrored so
                             // Boa's loader can resolve relative specifiers.
-                            match modmirror::mirror(fetcher, &abs, &mirror_root,
+                            match modmirror::mirror(&mut gate, &abs, &mirror_root,
                                                     &mut seen, 0, &mut fetch_errors) {
                                 Some(path) => {
                                     ext_ok += 1;
@@ -454,7 +477,7 @@ fn convert_impl(
                             }
                         } else {
                             let _s = timing::span("script");
-                            match fetcher.get(&abs) {
+                            match gate.get(&abs) {
                                 Ok(body) => { ext_ok += 1; scripts.push(ScriptSource { text: body, module, path: None, element: Some(element) }); }
                                 Err(e) => { ext_fail += 1; fetch_errors.push(e); }
                             }
@@ -465,8 +488,10 @@ fn convert_impl(
         }
     }
 
+    let script_refusals = std::mem::take(&mut gate.refused);
+    drop(gate);
     let pre = Pre {
-        html_tier1, scripts_held,
+        html_tier1, scripts_held, ext_refused, script_refusals,
         engine: engine.as_deref().map(|e| e.name()).unwrap_or("none"),
         before, text_before, origin_refusal, profile_violations,
         scripts_total: scripts.len() + held,
@@ -548,7 +573,11 @@ fn hints_in_order(dom: &dom::Dom, base: Option<&str>, tier1_first: bool, scripte
     let sheets = attr_urls("link", "href", &|h| dom.attr(h, "rel").is_some_and(|r| r.split_ascii_whitespace()
         .any(|x| x.eq_ignore_ascii_case("stylesheet"))));
     let images = attr_urls("img", "src", &|_| true);
-    let scripts = attr_urls("script", "src", &|_| true);
+    // ★ Only scripts the gate would fetch are hinted: a hint for a
+    // cross-origin script would have fetchd's prefetcher fetch it anyway.
+    let origin = base.and_then(|b| url::Url::parse(b).ok()).map(|u| u.origin());
+    let scripts: Vec<String> = attr_urls("script", "src", &|_| true).into_iter()
+        .filter(|u| fetch::script_allowed(origin.as_ref(), u)).collect();
     let order: Vec<Vec<String>> = match (tier1_first, scripted_follows) {
         (true, true) => vec![sheets, images, scripts],
         (true, false) => vec![sheets, images],

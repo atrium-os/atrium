@@ -208,6 +208,7 @@ pub fn media_block(document: &str, mse_scripts: usize) -> String {
             VideoSource::Url { src, mime } => ("plain", src, mime),
             VideoSource::Script => (if mse_scripts > 0 { "mse" } else { "script" }, String::new(), String::new()),
             VideoSource::Unplayable => ("unplayable", String::new(), String::new()),
+            VideoSource::Island { src } => ("island", src, String::new()),
         };
         let flag = |a: &str| dom.attr(*v, a).is_some();
         // Its <track>s: every one (any kind), and the subtitles and

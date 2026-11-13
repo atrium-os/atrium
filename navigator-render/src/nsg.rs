@@ -166,6 +166,7 @@ pub fn write(scene: &Scene, fonts: &FontSet) -> String {
                     crate::EmbedSource::Url { src, mime } => { let _ = write!(o, " url {} {}", quote(src), quote(mime)); }
                     crate::EmbedSource::Script => o.push_str(" script"),
                     crate::EmbedSource::Unplayable => o.push_str(" unplayable"),
+                    crate::EmbedSource::Island { src } => { let _ = write!(o, " island {}", quote(src)); }
                 }
                 attrs(&mut o, scene.embed_attrs.get(i));
                 o.push('\n');
@@ -225,6 +226,10 @@ pub fn embeds(nsg: &str) -> Vec<EmbedSlot> {
             crate::EmbedSource::Url { src, mime }
         } else if tail == "script" || tail.starts_with("script ") { crate::EmbedSource::Script }
         else if tail == "unplayable" || tail.starts_with("unplayable ") { crate::EmbedSource::Unplayable }
+        else if let Some(t) = tail.strip_prefix("island ") {
+            let Some((src, _)) = unquote(t) else { continue };
+            crate::EmbedSource::Island { src }
+        }
         else { continue };
         out.push(EmbedSlot { key, role: f[0].to_string(), rect: (x, y, w, h), flags: fl, source, tracks: vec![] });
     }

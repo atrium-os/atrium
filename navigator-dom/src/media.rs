@@ -16,6 +16,55 @@ pub enum VideoSource {
     Script,
     /// Sources, none of a type the player plays.
     Unplayable,
+    /// ★ A RECOGNISED EMBED (legacy-web §8.1): an `<iframe>` the normalizer
+    /// recognised as a known video player and turned into a `<video>` box
+    /// carrying `atrium-island`. Its `src` is the canonical player URL
+    /// ([`recognised_embed`]): it plays only as a live part, an
+    /// origin-scoped engine island, never in the document lane.
+    Island { src: String },
+}
+
+/// The attribute that marks a `<video>` box as a recognised embed. Only the
+/// normalizer writes it (it drops any the page wrote), and [`video_source`]
+/// reads it back through [`recognised_embed`] again, so even a forged one
+/// names nothing an `<iframe>` could not.
+pub const ISLAND_ATTR: &str = "atrium-island";
+
+/// ★ THE RECOGNISED EMBEDS: an iframe `src` that is one of these players
+/// becomes a live part; every other iframe is dropped (profile §3 excludes
+/// `<iframe>`). Returns the CANONICAL URL, rebuilt from the video id alone:
+/// the page's query (autoplay, tracking, `enablejsapi`, origin) never
+/// reaches the island. A typed list, not a pattern match on hosts:
+///
+/// - YouTube: `youtube.com/embed/<id>` or `youtube-nocookie.com/embed/<id>`
+///   (any `www.`/`m.`), `<id>` 11 of `[A-Za-z0-9_-]`. Canonical:
+///   `https://www.youtube-nocookie.com/embed/<id>`, the variant that sets
+///   no cookie until play.
+/// - Vimeo: `player.vimeo.com/video/<digits>`. Canonical:
+///   `https://player.vimeo.com/video/<digits>`.
+///
+/// `src` may be absolute (`https:`, `http:`) or scheme-relative (`//`).
+pub fn recognised_embed(src: &str) -> Option<String> {
+    let s = src.trim();
+    let rest = s.strip_prefix("https://").or_else(|| s.strip_prefix("http://")).or_else(|| s.strip_prefix("//"))?;
+    let end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
+    let host = rest[..end].to_ascii_lowercase();
+    let path = rest[end..].split(['?', '#']).next().unwrap_or("");
+    let host = host.strip_suffix(".").unwrap_or(&host);
+    let seg = |prefix: &str| path.strip_prefix(prefix).map(|r| r.trim_end_matches('/')).filter(|r| !r.contains('/'));
+    match host {
+        "youtube.com" | "www.youtube.com" | "m.youtube.com" | "youtube-nocookie.com" | "www.youtube-nocookie.com" => {
+            let id = seg("/embed/")?;
+            (id.len() == 11 && id.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-'))
+                .then(|| format!("https://www.youtube-nocookie.com/embed/{id}"))
+        }
+        "player.vimeo.com" => {
+            let id = seg("/video/")?;
+            (!id.is_empty() && id.len() <= 12 && id.bytes().all(|b| b.is_ascii_digit()))
+                .then(|| format!("https://player.vimeo.com/video/{id}"))
+        }
+        _ => None,
+    }
 }
 
 /// ★ What a `<video>` plays (fresco-video P3; limen.md §2.2): its `src`,
@@ -25,6 +74,9 @@ pub enum VideoSource {
 /// script-set `src`), and needs an engine island (legacy-web §8.1). One with
 /// sources of no playable type is `Unplayable`.
 pub fn video_source(dom: &Dom, h: Handle) -> VideoSource {
+    if let Some(v) = dom.attr(h, ISLAND_ATTR) {
+        return match recognised_embed(v) { Some(src) => VideoSource::Island { src }, None => VideoSource::Unplayable };
+    }
     let real = |v: &str| { let v = v.trim(); !v.is_empty() && !v.starts_with("blob:") };
     // A `src` attribute, even empty, is the element's source (HTML: the
     // `<source>` children are used only when there is no `src`).
@@ -135,6 +187,35 @@ pub fn text_tracks(dom: &Dom, h: Handle) -> Vec<TextTrack> {
                              srclang: clean_name(dom.attr(c, "srclang").unwrap_or("")), label: clean_name(dom.attr(c, "label").unwrap_or("")), default });
     }
     out
+}
+
+#[cfg(test)]
+mod embed_tests {
+    use super::*;
+
+    #[test]
+    fn recognised_embeds_are_canonical_and_nothing_else_is() {
+        let yt = Some("https://www.youtube-nocookie.com/embed/dQw4w9WgXcQ".to_string());
+        assert_eq!(recognised_embed("https://www.youtube.com/embed/dQw4w9WgXcQ?autoplay=1&origin=x"), yt);
+        assert_eq!(recognised_embed("//www.youtube-nocookie.com/embed/dQw4w9WgXcQ"), yt);
+        assert_eq!(recognised_embed("http://YouTube.com/embed/dQw4w9WgXcQ/#t=3"), yt);
+        assert_eq!(recognised_embed("https://player.vimeo.com/video/76979871?h=8272103f6e"),
+                   Some("https://player.vimeo.com/video/76979871".to_string()));
+        for no in ["https://www.youtube.com/watch?v=dQw4w9WgXcQ", "https://www.youtube.com/embed/short",
+                   "https://www.youtube.com/embed/dQw4w9WgXcQ/../x", "https://youtube.com.evil.example/embed/dQw4w9WgXcQ",
+                   "https://evil.example/www.youtube.com/embed/dQw4w9WgXcQ", "javascript:alert(1)//www.youtube.com/embed/dQw4w9WgXcQ",
+                   "https://player.vimeo.com/video/12ab", "https://ads.example/frame.html", "/embed/dQw4w9WgXcQ", ""] {
+            assert_eq!(recognised_embed(no), None, "{no}");
+        }
+    }
+
+    #[test]
+    fn an_island_attribute_is_read_back_through_the_list() {
+        let d = crate::parse(r#"<video atrium-island="https://www.youtube.com/embed/dQw4w9WgXcQ"></video><video atrium-island="https://evil.example/x"></video>"#);
+        let v = d.by_tag_anywhere("video");
+        assert_eq!(video_source(&d, v[0]), VideoSource::Island { src: "https://www.youtube-nocookie.com/embed/dQw4w9WgXcQ".into() });
+        assert_eq!(video_source(&d, v[1]), VideoSource::Unplayable, "a forged island names nothing");
+    }
 }
 
 #[cfg(test)]

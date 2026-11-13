@@ -39,6 +39,79 @@ pub trait Fetcher {
     }
 }
 
+/// ★★ THE CONVERTER'S SCRIPT FETCHES ARE SAME-ORIGIN (legacy-web §5.4.1c,
+/// applied to code as well as data; §5.4.1f). Every external script the
+/// document declares, every module it imports, and every hint for one goes
+/// through this, and only a URL with the DOCUMENT'S OWN ORIGIN reaches the
+/// fetcher. Anything else is refused before a byte leaves, and counted by
+/// host like every page-network refusal.
+///
+/// Measured 2026-11-13 (navigator-ui §6.6): with no rule here, 48 ad or
+/// tracker scripts on 29 corpus pages were downloaded as code at
+/// conversion. The page-network rule then refused what they asked for, but
+/// the download itself had already told each host that a conversion
+/// happened. Refusing at the source closes that. No blocklist: the rule is
+/// computable from the two URLs alone, like §5.4.1c's.
+pub struct SameOriginScripts<'a> {
+    inner: &'a mut dyn Fetcher,
+    origin: Option<url::Origin>,
+    /// "cross-origin script <host>" → refusals, in first-refused order.
+    pub refused: Vec<(String, u32)>,
+}
+
+impl<'a> SameOriginScripts<'a> {
+    /// `base` is the document's URL. With none, no script URL has the
+    /// document's origin, so every one is refused.
+    pub fn new(inner: &'a mut dyn Fetcher, base: Option<&str>) -> Self {
+        let origin = base.and_then(|b| url::Url::parse(b).ok()).map(|u| u.origin())
+            .filter(|o| o.is_tuple());
+        SameOriginScripts { inner, origin, refused: vec![] }
+    }
+
+    /// Whether `url` has the document's origin.
+    pub fn allows(&self, url: &str) -> bool {
+        script_allowed(self.origin.as_ref(), url)
+    }
+
+    fn refuse(&mut self, url: &str) -> String {
+        let host = url::Url::parse(url).ok().and_then(|u| u.host_str().map(str::to_string))
+            .unwrap_or_else(|| "?".into());
+        let key = format!("cross-origin script {host}");
+        match self.refused.iter_mut().find(|(k, _)| *k == key) {
+            Some((_, n)) => *n += 1,
+            None => self.refused.push((key, 1)),
+        }
+        format!("refused: cross-origin script {url}")
+    }
+}
+
+/// `url` is a script the converter may fetch for a document of `origin`:
+/// the same scheme, host and port. Opaque origins match nothing.
+pub fn script_allowed(origin: Option<&url::Origin>, url: &str) -> bool {
+    match (origin, url::Url::parse(url)) {
+        (Some(o), Ok(u)) => o.is_tuple() && u.origin() == *o,
+        _ => false,
+    }
+}
+
+impl Fetcher for SameOriginScripts<'_> {
+    fn get(&mut self, url: &str) -> Result<String, String> {
+        if !self.allows(url) { return Err(self.refuse(url)) }
+        self.inner.get(url)
+    }
+    fn get_bytes(&mut self, url: &str) -> Result<Vec<u8>, String> {
+        if !self.allows(url) { return Err(self.refuse(url)) }
+        self.inner.get_bytes(url)
+    }
+    fn bytes_fetched(&self) -> u64 { self.inner.bytes_fetched() }
+    fn hint(&mut self, url: &str) { if self.allows(url) { self.inner.hint(url) } }
+    fn hint_header(&mut self, _url: &str) {}
+    fn peek(&mut self, url: &str, start: usize, len: usize) -> Result<Vec<u8>, String> {
+        if !self.allows(url) { return Err(self.refuse(url)) }
+        self.inner.peek(url, start, len)
+    }
+}
+
 /// A fetcher that fetches nothing — the default for tests, so no test can
 /// silently depend on the network.
 pub struct NoNetwork;

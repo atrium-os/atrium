@@ -28,7 +28,7 @@ fn main() {
         for v in &vids {
             match video_source(&dom, *v) {
                 VideoSource::Url { mime, .. } => { p0 += 1; *types.entry(mime.split(';').next().unwrap_or("").to_string()).or_default() += 1 }
-                VideoSource::Script => s0 += 1,
+                VideoSource::Script | VideoSource::Island { .. } => s0 += 1,
                 VideoSource::Unplayable => u0 += 1,
             }
         }

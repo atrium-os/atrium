@@ -182,6 +182,9 @@ fn the_relay_enforces_a_per_conversion_byte_budget() {
     let mut page = String::from("<!doctype html><title>t</title><p>x</p>");
     for i in 0..5 { page.push_str(&format!("<script src=\"https://a.example/s{i}.js\"></script>")); }
     std::fs::write(docs.join("doc.html"), page).unwrap();
+    // The scripts are the document's own (legacy-web §5.4.1f: a converter
+    // fetches script only from the document's origin).
+    std::fs::write(docs.join("manifest.tsv"), "doc.html\thttps://a.example/doc.html\n").unwrap();
     let fetchd = format!("sh {}", fake.display());
     let (code, out, err) = driver(&docs, &[("PRERENDER_NET", "1"), ("PRERENDER_FETCHD", &fetchd),
                                           ("PRERENDER_FETCH_BUDGET", "250000")]);

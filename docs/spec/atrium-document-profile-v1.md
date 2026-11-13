@@ -127,6 +127,8 @@ position, never a silent recovery.
 `<embed>` (composition is Limen's job, at the jail boundary where it belongs), `<canvas>`
 (a scripting surface), event-handler attributes, `<style>` `@import` chains beyond a
 bounded depth, `<base>` (ambient rewriting of every link).
+The normalizer (§6) drops them, except that an `<object>` leaves its fallback content and
+an iframe that is a recognised video embed becomes an island box (legacy-web §8.1).
 
 **Structural and semantic elements** are the core of the subset, and they are what feeds
 G5: sectioning (`article`, `section`, `nav`, `aside`, `header`, `footer`, `main`),

@@ -1803,7 +1803,10 @@ impl<'a> Cx<'a> {
                 let flags = (flag("autoplay") as u8) * crate::embed_flags::AUTOPLAY | (flag("loop") as u8) * crate::embed_flags::LOOP
                     | (flag("muted") as u8) * crate::embed_flags::MUTED | (flag("controls") as u8) * crate::embed_flags::CONTROLS;
                 let source = video_source(self.dom, h);
-                self.scene.insert_embed(slot, crate::Embed { x: content.0, y: content.1, w: content.2, h: content.3, role: "media-player", key: h, source, flags,
+                // ★ A recognised embed is a live part: Limen's `island`
+                // slot kind (navigator-ui §6.3), never the media player.
+                let role = if matches!(source, crate::EmbedSource::Island { .. }) { "island" } else { "media-player" };
+                self.scene.insert_embed(slot, crate::Embed { x: content.0, y: content.1, w: content.2, h: content.3, role, key: h, source, flags,
                                                                  tracks: navigator_dom::media::text_tracks(self.dom, h) });
                 slot += 1;
             }
