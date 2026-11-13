@@ -696,3 +696,14 @@ work (self-test, scrub).
   (Shankar, 2026-11-13: reset first): if MES still keeps a queue, the card gets a mode 1
   reset and bus mastering goes off for good (`amd_si_lose`), every client queue fails with
   EIO, and the queue's memory is freed, so detach proceeds and the card never sits hot.
+- **2026-11-13, stage 5c-2b step 1 PASSED (21/21).** `483b4baf`, log `20261113T023850Z`.
+  Queue fds on MES user queues end to end: write_42 on a queue of its own (twice, out_seqno
+  from 1), two VMs with a queue each at the same VAs, two queues in one VM, a queue fd passed
+  over SCM_RIGHTS to a child that submits, a close in flight (cancelled; the VM then runs on a
+  new queue), and all refusals. Every ADD_QUEUE and REMOVE_QUEUE returned ok (a close with
+  work in flight: wave kill, fence, REMOVE ok); 0 VM faults; 12 BOs deferred behind user
+  queues and all 12 reaped; attached idle 13 W; detach proven idle, card cold after reset.
+  EOP routing by doorbell did not match: every user-queue EOP's src_data[0] named no queue
+  ("routed 0"), and completions were retired by the check-all fallback (IV-driven, poll 0).
+  Next: decode what a MES user-queue EOP carries (ring_id / me-pipe-queue) and key on it,
+  then step 2.
