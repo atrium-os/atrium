@@ -529,6 +529,13 @@ backend's capabilities; fails closed where unsupported.
 
 ### 8.5 Dynamic attach (USB drive plugged in, hypothetical)
 
+> **Amended 2026-11-13** by [device-assignment.md §4.6](device-assignment.md#46-removable-storage):
+> `dispensatord` (not atrium-devevents directly) assigns the partition; untrusted
+> media is never mounted by a kernel filesystem but by a jailed FUSE server
+> (FAT/exFAT, read-only Tessera, maybe UFS), and the session gets that mount
+> through nullfs. Only a disk that unlocks with a key in Arca is kernel-mounted.
+> The `rw_nullfs` of `/dev/da0p1` in step 5 below is superseded.
+
 1. atrium-devevents notices new `/dev/da0`.
 2. atrium-storage daemon (or future `atrium-removable`) decides
    ownership: "this drive is for user N's session."

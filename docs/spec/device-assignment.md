@@ -206,6 +206,49 @@ driver). Recommendation: lift portcullisd's `identity_devices.rs` into its own
 small daemon (accepted: `dispensatord`) so the app-launch broker does not also hold device power, and
 so its crash or restart does not cost app launches (decision 2).
 
+### 4.6 Removable storage
+
+Added 2026-11-13 after Shankar's questions on USB drives. A USB disk is a
+kernel-class device like `pcm`: `umass` attaches it, CAM makes `daN`, GEOM
+makes partitions, and `dispensatord` gives each partition to one owner, the
+storage service (storage.md §8.5, amended to match). What changes is who
+parses the bytes.
+
+**Filesystems.** Shankar 2026-11-13: Atrium supports **Tessera and FAT**
+(FAT12/16/32, and exFAT because most sticks over 32 GB ship with it), perhaps
+**UFS** later. ext4, ZFS and NTFS are not supported on removable media.
+
+| Filesystem | Untrusted disk | Trusted disk (§ below) |
+|---|---|---|
+| FAT / exFAT | jailed Rust FUSE server, read-write; only ever this way (no kernel `msdosfs` mount of removable media) | same |
+| Tessera | jailed FUSE server on the Tessera core (`tessera-decode` is already `no_std`, panic-free, differential-tested; the host tools link it), read-only | kernel `tessera_fs` mount |
+| UFS (maybe) | jailed read-only UFS2 FUSE reader in Rust | kernel mount |
+
+The FUSE server jail holds two fds, the partition and `/dev/fuse`; no network,
+a sysfil profile, Capsicum. jaild runs `mount_fusefs` from outside, so no jail
+gets `allow.mount.fusefs`. FreeBSD's `fusefs(5)` is native VFS code
+(rewritten and heavily tested in 2019); it now parses the server's replies,
+a far smaller and more regular surface than on-disk FAT or UFS structures.
+The session sees the mount through nullfs, `nosuid,noexec`; nothing is mounted
+while the session is locked; eject syncs, unmounts, then lets the device go;
+a surprise removal only gives the FUSE jail I/O errors.
+
+**Kernel tasting.** GEOM parses every new disk's partition table and labels
+before `dispensatord` sees it, and that cannot be routed to a jail per device.
+So the Atrium kernel keeps only `GEOM_PART_GPT` and `GEOM_PART_MBR` (with its
+EBR chain; gets a fuzz pass), drops BSD, BSD64, APM, VTOC8 and LDM, and turns
+off every label taster except `gpt`/`gptid` (`kern.geom.label.*.enable=0`).
+Partitions appear as `daNpM` (GPT) or `daNsM` (MBR) and are handled alike.
+
+**Trust is a key, never an ID.** GPT GUIDs, MBR signatures, pool or volume ids
+are bytes anyone can copy onto a stick. A disk is *trusted* only when it
+unlocks with a key this machine holds (in Arca). That makes Tessera at-rest
+encryption (tessera-fs.md flag `ENCRYPTED`, reserved for v2) a prerequisite for
+any kernel mount of removable media, and it must **authenticate** metadata
+(AEAD, e.g. the planned AES-GCM), not only encrypt it: XTS alone still feeds
+the kernel attacker-influenced bytes and allows rolling back to an old copy.
+Until Tessera encryption lands, every removable disk takes the jailed path.
+
 ## 5. How existing work maps onto it
 
 | Today | Becomes |
@@ -233,6 +276,9 @@ so its crash or restart does not cost app launches (decision 2).
 - **D4** Vinculum `bt-controller` (with B1), CCID (with Sigillum S3).
 - **D5** GPU claim on the R9700 after bring-up finishes; drop the manual
   `devctl set driver -f`.
+- **D5b** removable storage: GEOM trim; jailed FAT/exFAT FUSE server;
+  jailed read-only Tessera FUSE server; storage-service mount flow. Kernel
+  Tessera mounts of removable media wait for Tessera encryption.
 - **D6** Curia "Devices" list: every device, its owner, unclaimed ones, and
   why.
 
@@ -273,3 +319,16 @@ so its crash or restart does not cost app launches (decision 2).
 9. **Name.** If decision 2 is yes, the daemon needs a name; proposed
    **Dispensator** (`dispensatord`), the steward who handed out the household's
    stores. Goes into `docs/NAMING.md` if agreed.
+
+**Removable storage (§4.6), Shankar 2026-11-13:**
+
+10. **Filesystems: Tessera and FAT/exFAT; UFS maybe; no ext4, ZFS or NTFS.** Decided.
+11. **Untrusted media is parsed in a jailed FUSE server, never by a kernel
+    filesystem.** Decided (follows from 10 and the discussion).
+12. **Trusted = unlocks with a key this machine holds, never an on-disk id.**
+    Decided in discussion; Tessera at-rest encryption with authenticated
+    metadata moves up (Shankar: "needed sooner rather than later").
+13. **Kernel GEOM trimmed to GPT + MBR/EBR, label tasters off except GPT.**
+    *Recommend yes.* Open.
+14. **exFAT included under "FAT".** *Recommend yes* (most sticks over 32 GB).
+    Open.
