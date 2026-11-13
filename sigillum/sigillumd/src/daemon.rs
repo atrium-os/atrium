@@ -4,10 +4,8 @@
 //!   anyone may connect; the label comes from the kernel's peer uid through
 //!   the [`Registry`], once, at accept.
 //! - **Drivers** (`/atrium/sockets/sigillum-dev/drivers.sock`): only peer
-//!   uid `_sigillum-dev` (a driver started by hand with `--connect`) or the
-//!   launcher's uid (portcullisd connects as root and hands the connected
-//!   socket to the jailed driver as fd 3, so the jail needs no socket and
-//!   no path to this one). A driver's first record must be `Hello`, and only
+//!   uid `_sigillum-dev`. Each driver jail sees this one directory,
+//!   read-only, connects once and enters Capsicum. A driver's first record must be `Hello`, and only
 //!   one `Hello` per connection; anything else drops it.
 //! - **The trusted UI** (`/atrium/sockets/sigillum-ui/ui.sock`): only peer
 //!   uid `_sigillum-ui`, one connection at a time. With no UI connected a
@@ -66,8 +64,6 @@ pub struct Settings {
     pub ui_socket: PathBuf,
     /// `_sigillum-dev` (65029): the only uid served on the driver socket.
     pub dev_uid: u32,
-    /// portcullisd's uid (root): it connects on a driver's behalf.
-    pub launcher_uid: Option<u32>,
     /// `_sigillum-ui` (65030): the only uid served on the UI socket.
     pub ui_uid: u32,
     pub broker: Config,
@@ -80,7 +76,6 @@ impl Settings {
             driver_socket: driver::SOCKET.into(),
             ui_socket: ui::SOCKET.into(),
             dev_uid: 65029,
-            launcher_uid: Some(0),
             ui_uid: 65030,
             broker,
         }
@@ -254,7 +249,7 @@ impl Daemon {
             }
             Ev::ClientGone(conn) => self.drop_client(conn),
             Ev::Driver(s, uid) => {
-                if (uid != self.settings.dev_uid && Some(uid) != self.settings.launcher_uid) || self.drivers.len() >= MAX_DRIVERS {
+                if uid != self.settings.dev_uid || self.drivers.len() >= MAX_DRIVERS {
                     Self::audit(&format!("driver socket: refused uid={uid}"));
                     let _ = s.shutdown(Shutdown::Both);
                     return Vec::new();

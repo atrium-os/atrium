@@ -57,7 +57,6 @@ fn start(dev_uid: u32, ui_uid: u32) -> Paths {
         driver_socket: dir.join("d.sock"),
         ui_socket: dir.join("u.sock"),
         dev_uid,
-        launcher_uid: None,
         ui_uid,
         broker: Config { web_broker: Some(navigator()), ceremony_ms: 10_000 },
     };

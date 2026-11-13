@@ -109,7 +109,7 @@ a list of devices or a raw APDU channel.
           │ CTAPHID, CBOR │       │ CCID, APDU,   │       │ sensor proto, │ │               │
           │ PIN protocol  │       │ PIV, OpenPGP  │       │ match / enrol │ │               │
           └──────┬────────┘       └──────┬────────┘       └──────┬────────┘ └──────┬────────┘
-                 │ socketpair, fixed records (§14.2)                                 │
+                 │ driver socket, fixed records (§14.2)                              │
                  └───────────────┬───────────────────────┬─────────────────────────┘
                                  ▼                       ▼
                      ┌──────────────────────────────────────────┐     ┌───────────────────┐
@@ -142,18 +142,17 @@ a list of devices or a raw APDU channel.
 - **sysfil** (jail-sysfil.md): a new profile `device` = `base` plus `ioctl` limited to the
   node's own ioctls (`HIDIOCGRDESC`, `HIDIOCGRDESCSIZE`, `HIDIOCGRAWINFO`, `HIDIOCGRAWNAME`
   for hidraw; the `USB_*` transfer and interface ioctls for ugen), no `socket` except the
-  inherited driver connection, no `open` after start (Capsicum). `sigillumd` and `sigillum-ui` take
+  one `connect` to the driver socket before Capsicum, no `open` after start (Capsicum). `sigillumd` and `sigillum-ui` take
   the `base` profile.
 - **Who starts what.** `sigillumd` and `sigillum-ui` are services.d manifests started before
   the login screen (the lock screen and Vestibulum need them). Drivers are started per
-  device by portcullisd on a devevents classification (§5). portcullisd connects to
-  `sigillumd`'s driver socket itself (peer uid root, the launcher) and hands the connected
-  socket to the driver as fd 3, so the jail holds a socket but no socket path and no
-  `connect` (amended in S2c; the first draft had portcullisd pass `sigillumd` one end of a
-  socketpair, which needs an fd-passing link to `sigillumd` for no gain). A driver started
-  by hand for development connects with `--connect` and is served by its peer uid
-  `_sigillum-dev`. A driver that exits loses its device's state; its
-  ceremonies fail with `DEVICE_GONE` and the supervisor does not restart it until the device
+  device by portcullisd's identity-device agent on the kernel's classification (§5.1),
+  through jaild: jail `atrium-sigillum-fido-N` on ruleset 27, shown only `hidrawN`
+  (jaild's `devfs_grant`, owned `_sigillum-dev`, 0600), with `/atrium/sockets/sigillum-dev`
+  read-only as its one socket path. The driver connects to `sigillumd`'s driver socket
+  (peer uid `_sigillum-dev` checked), then enters Capsicum. (Amended in S2: the first
+  draft had portcullisd pass a socketpair, which jaild's exec path cannot carry.) A driver
+  that exits loses its device's state; its ceremonies fail with `DEVICE_GONE` and the supervisor does not restart it until the device
   is replugged or re-enumerated.
 
 ## 5. Owning the devices
@@ -166,11 +165,16 @@ a list of devices or a raw APDU channel.
    on usage page `0xF1D0` (FIDO Alliance) is **identity**; everything else is **input**.
    `hidrawN` belongs to `hidbusN` (same unit). No userspace process parses a report
    descriptor to make this decision.
-2. **Default hidden.** Ruleset 26 stops unhiding `hidraw*` wholesale. portcullisd adds a
-   per-node `unhide` to ruleset 26 when a device is classified *input*, and to ruleset 27
-   (one per driver jail mount) when it is *identity*, then re-applies the ruleset to that
-   jail's devfs mount. A node that appeared but is not yet classified is visible to nobody.
-   This fails closed: a missed event leaves a device unusable, never exposed.
+2. **Default hidden.** Ruleset 26 stops unhiding `hidraw*` wholesale. When a device is
+   classified *input*, portcullisd unhides its node in tactusd's own devfs mount
+   (`devfs -m ... rule apply`, no ruleset change), and re-checks every 2 s because a
+   restarted tactusd gets a fresh mount. When it is *identity*, jaild mounts the driver
+   jail's devfs on ruleset 27 and unhides that one node in it before the driver runs. A
+   node that appeared but is not yet classified is visible to nobody, and a unit number
+   reused by a different device starts hidden again. This fails closed: a missed event
+   leaves a device unusable, never exposed. (As built in S2d; the first draft added
+   per-node rules to the rulesets themselves, which a fast unplug and replug of a different
+   device under the same unit could race.)
 3. **Tactus refuses the class anyway.** tactusd's classifier (atrium-input.md §3.5) gains a
    row: usage page `0xF1D0` → `Identity`, never opened, never `Raw`. Belt and braces for
    a vanilla FreeBSD Tactus with a plain ruleset.
@@ -267,7 +271,7 @@ connection and resolves it:
 | arcad | fixed uid `_arca` (65020) | `VERIFY_USER`; it is the platform authenticator for §9.2 |
 | ostiarius | fixed uid (`_ostiarius`) | unlock and enrolment ops (§12) |
 | `sigillum-ui` | fixed uid `_sigillum-ui` | answers to prompts it was shown |
-| drivers | on the driver socket only: peer uid root (portcullisd connected for the jailed driver) or `_sigillum-dev`; first record `Hello`, exactly once | §14.2 records |
+| drivers | `_sigillum-dev`, on the driver socket only; first record `Hello`, exactly once | §14.2 records |
 
 A uid with no label gets `UNKNOWN_PEER` and the connection is closed.
 
@@ -607,7 +611,7 @@ otherwise passes the blobs on without reading them.
   `CTAPHID_CANCEL` within 100 ms.
 - **S2c, the daemon** (`sigillumd/src/daemon.rs`, `resolve.rs`, `bin/sigillumd.rs`):
   - Three sockets: clients (0666; label from the peer uid at accept, through the launch
-    registry, read fresh per connection), drivers (peer uid root or `_sigillum-dev`;
+    registry, read fresh per connection), drivers (peer uid `_sigillum-dev`;
     `Hello` first and once, or dropped; at most 8), the trusted UI (peer uid
     `_sigillum-ui`, one at a time). Reader thread per connection, one thread owns the
     broker and every write; writes time out at 2 s and drop the peer; a malformed or
@@ -634,9 +638,33 @@ otherwise passes the blobs on without reading them.
     closes. Refusals: no UI, UI leaving mid-ceremony, wrong uids on the driver and UI
     sockets, a driver that skips or repeats `Hello`, an oversized client message. 43 host
     tests in the workspace; the FreeBSD target type-checks.
-- **Not yet:** S2d (devfs, jails, uids, manifests), S2e (the VM gate), S2f (`sigillum-ui`
-  and frescod's `IDENTITY` purpose), Capsicum in `sigillumd` itself (it reads the launch
-  registry per connection; a pre-opened directory fd comes with S2d).
+- **S2d, devices and jails:**
+  - `etc/atrium.devfs.rules`: ruleset 26 no longer unhides `hidraw*` (mode only); new
+    ruleset 27 `atrium_identity` = basics only.
+  - jaild: `CreateJailRequest.devfs_grant` (one node) and, on a pin, `name_prefix` and
+    `grant_nodes` (`hidraw#`). A grant needs a pinned ruleset whose pattern matches; jaild
+    applies `unhide`, owner = the pin's uid and mode 0600 to that jail's mount after
+    mounting devfs and before exec, and fails the create if it can't. Ruleset 27 is pinned
+    to `atrium-sigillum-fido-*`, `/usr/local/bin/atrium-sigillum-fido`, uid 65029.
+  - `etc/jaild.policy.toml`: uids and gids 65028–65030, ruleset 27, the sysfil profile
+    `device` (base plus `HIDIOCGRAWINFO` and `HIDIOCGRAWNAME`), and
+    `/atrium/sockets/sigillum-dev` as a read-only mount source.
+  - `atrium-devevents::hidowner`: devd lines and `devinfo -v` (devices present at start)
+    to operations: show input, start or stop an identity driver, log. A unit that changes
+    kind without a detach stops its driver first.
+  - portcullisd `identity_devices.rs`: the agent thread carrying them out (devfs for
+    tactusd, jaild `CreateJail`/`RemoveJail` and mount cleanup for drivers), the 2 s
+    re-show, and `PORTCULLIS_IDENTITY_DEVICES=off`.
+  - `sigillum/etc/services.d/37-atrium-sigillumd.toml` and `scripts/sigillum-service.sh`
+    (users, socket directories 0755 / 0750 `_sigillum-dev` / 0750 `_sigillum-ui`, binaries,
+    jail roots).
+  - Tested on the host: the planner (4 tests) and the request shape; jaild's validator
+    tests (a per-device pin grants one matching node; the shipped policy pins 27) and the
+    portcullisd test type-check for FreeBSD but run only there (`sockmux` needs kqueue), so
+    they run in the VM gate.
+- **Not yet:** S2e (the VM gate), S2f (`sigillum-ui` and frescod's `IDENTITY` purpose),
+  Capsicum in `sigillumd` itself (it reads the launch registry per connection; a
+  pre-opened directory fd comes later), `allow.mlock` for `sigillumd`.
 
 ## 17. Decisions, with recommendations
 

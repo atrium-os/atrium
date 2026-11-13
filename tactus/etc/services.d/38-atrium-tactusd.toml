@@ -5,9 +5,13 @@
 # jaild to create the jail, and supervises tactusd inside it. Numbered 38:
 # before frescod (40), which connects to it.
 #
-# tactusd runs NON-ROOT (_tactus) with no network. It sees only the HID nodes,
+# tactusd runs NON-ROOT (_tactus) with no network. It sees only input nodes,
 # through the atrium_input devfs ruleset (26), which jaild pins to this
-# service; frescod's jail shows no input nodes. It parses every device's report
+# service; frescod's jail shows no input nodes. HID nodes are hidden by that
+# ruleset: portcullisd's identity-device agent shows tactusd each hidraw node
+# the kernel classified as input, in this jail's mount, and never a security
+# key's (docs/spec/sigillum.md §5.1). A node appears within 2 s of the device,
+# and again within 2 s of a tactusd restart. It parses every device's report
 # descriptor and reports, so that untrusted parsing stays out of the
 # compositor.
 #
@@ -29,7 +33,7 @@ enabled       = true
 name          = "atrium-tactusd"
 path          = "/var/lib/atrium/jails/tactusd"
 children_max  = 0
-devfs_ruleset = 26                               # atrium_input: basics + hidraw* (tactusd only)
+devfs_ruleset = 26                               # atrium_input: basics + PS/2 (+ input hidraw, per node)
 
 [[mounts]]
 source = "/libexec"

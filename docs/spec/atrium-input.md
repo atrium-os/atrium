@@ -84,8 +84,10 @@ decoders and the stages, all unit-testable on the host with recorded
 descriptors and reports, like `consumer.rs` is today. `tactusd` is
 the service: hotplug through `atrium-devevents`, the device fds, the
 socket. It runs as `_tactus` in a jail whose devfs ruleset shows only
-`hidraw*`, `psm*`, the PS/2 keyboard node (§3.2) and its socket
-directory, with no network. Compromise of tactusd means forged input,
+`psm*`, the PS/2 keyboard node (§3.2) and its socket directory, with
+no network; each `hidraw` node the kernel classified as input is
+shown to it in that jail's mount by portcullisd, and a security key's
+never is (amended 2026-11-13, sigillum.md §5.1). Compromise of tactusd means forged input,
 which a malicious device can do anyway, but not the compositor's
 memory or other apps.
 

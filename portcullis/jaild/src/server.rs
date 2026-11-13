@@ -939,6 +939,26 @@ fn handle_create(
         info!("jaild: mounted per-jail devfs at {devdir} ruleset {}",
             req.devfs_ruleset);
 
+        /* The one device a per-device driver jail owns (validated against
+         * the pin's grant_nodes): shown in THIS mount only, owned by the
+         * pin's uid, 0600, before anything runs. The ruleset itself shows
+         * no such node, so a grant that fails leaves the jail without its
+         * device, never with someone else's. */
+        if let (Some(node), Some(pin)) = (&req.devfs_grant, policy.devfs_rulesets.pin(req.devfs_ruleset)) {
+            if let Err(e) = ffi::devfs_grant(&devdir, node, pin.uid) {
+                if let Some(addr) = &lo0_alias {
+                    let _ = ffi::ifconfig_lo0_alias_del(addr);
+                }
+                ffi::unmount_quiet(&devdir);
+                return Err(JaildError::Syscall {
+                    name:  "devfs rule apply",
+                    errno: e.raw_os_error().unwrap_or(-1),
+                    msg:   format!("grant {node} in {devdir}: {e}"),
+                });
+            }
+            info!("jaild: granted {node} to uid {} in {devdir}", pin.uid);
+        }
+
         /* A pinned ruleset's device leases (the display lease): name this jail
          * and uid as the only opener BEFORE the service runs, so it never sees
          * EPERM at startup and nothing else can open the device meanwhile. The

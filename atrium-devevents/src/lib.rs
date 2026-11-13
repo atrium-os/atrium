@@ -23,6 +23,7 @@
 mod freebsd;
 
 pub mod hidclass;
+pub mod hidowner;
 
 #[cfg(target_os = "freebsd")]
 pub use freebsd::DeviceWatcher;

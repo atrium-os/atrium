@@ -106,6 +106,7 @@ pub fn run_init(
         hostuuid: None,
         allow_mlock: false,
         syscall_profile: None,
+        devfs_grant: None,
     });
 
     info!("{}: running init for volume {} (jail={})",

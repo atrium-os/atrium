@@ -69,6 +69,7 @@ fn main() -> ExitCode {
                 hostuuid: None,
                 allow_mlock: false,
                 syscall_profile: None,
+                devfs_grant: None,
             })
         }
         "remove" => {
@@ -110,6 +111,7 @@ fn main() -> ExitCode {
                 hostuuid: None,
                 allow_mlock: false,
                 syscall_profile: None,
+                devfs_grant: None,
             })
         }
         "attach" => {

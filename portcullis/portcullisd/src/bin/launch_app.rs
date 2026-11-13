@@ -91,6 +91,7 @@ fn main() {
         hostuuid: None,
         allow_mlock: false,
         syscall_profile: None,
+        devfs_grant: None,
     });
     let mut c = match Client::connect(JAILD_SOCK) {
         Ok(c) => c,

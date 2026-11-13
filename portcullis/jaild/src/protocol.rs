@@ -316,6 +316,14 @@ pub struct CreateJailRequest {
     /// `policy.sysfil.required` is set.
     #[serde(default)]
     pub syscall_profile: Option<String>,
+
+    /// ONE device node to show in this jail's devfs, e.g. `hidraw3`: a
+    /// per-device driver's own device (sigillum.md §4). Only with a pinned
+    /// ruleset whose `grant_nodes` allow the name; jaild applies `unhide`,
+    /// owner = the pin's uid and mode 0600 to this mount alone, after
+    /// mounting devfs and before anything runs.
+    #[serde(default)]
+    pub devfs_grant: Option<String>,
 }
 
 /// One mount applied inside a jail. `source` is a path on the host
@@ -652,6 +660,7 @@ mod tests {
             hostuuid: None,
             allow_mlock: false,
             syscall_profile: None,
+            devfs_grant: None,
         });
         let bytes = serde_json::to_vec(&req).unwrap();
         let back: Request = serde_json::from_slice(&bytes).unwrap();

@@ -274,6 +274,36 @@ pub struct PinnedRuleset {
     /// loaded) is logged, not fatal: the device then refuses the jail anyway.
     #[serde(default)]
     pub leases:    Vec<String>,
+    /// `jail_name` is a PREFIX: one jail per device (`atrium-sigillum-fido-`
+    /// + unit), all running `exec_path` as `uid`.
+    #[serde(default)]
+    pub name_prefix: bool,
+    /// Device nodes a request may name in `devfs_grant`, as patterns where
+    /// a trailing `#` stands for one or more digits (`hidraw#`). Empty: no
+    /// grants on this ruleset.
+    #[serde(default)]
+    pub grant_nodes: Vec<String>,
+}
+
+impl PinnedRuleset {
+    /// Does this pin allow `name` as a request's jail name?
+    pub fn matches_name(&self, name: &str) -> bool {
+        if self.name_prefix {
+            name.len() > self.jail_name.len() && name.starts_with(&self.jail_name)
+        } else {
+            name == self.jail_name
+        }
+    }
+
+    /// May a request on this ruleset show `node` (`hidraw3`)?
+    pub fn allows_grant(&self, node: &str) -> bool {
+        self.grant_nodes.iter().any(|pat| match pat.strip_suffix('#') {
+            Some(prefix) => node
+                .strip_prefix(prefix)
+                .is_some_and(|d| !d.is_empty() && d.len() <= 4 && d.bytes().all(|b| b.is_ascii_digit())),
+            None => node == pat,
+        })
+    }
 }
 
 impl DevfsRulesets {

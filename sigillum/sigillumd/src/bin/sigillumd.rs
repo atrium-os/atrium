@@ -9,9 +9,7 @@
 //! - `SIGILLUM_ARCA_UID`, `SIGILLUM_OSTIARIUS_UID`: the uids allowed
 //!   `VerifyUser`. Unset = nobody.
 //! - `SIGILLUM_DEV_UID` (default 65029), `SIGILLUM_UI_UID` (default 65030):
-//!   the only uids served on the driver and UI sockets; the driver socket
-//!   also serves `SIGILLUM_LAUNCHER_UID` (default 0, portcullisd), which
-//!   connects on a jailed driver's behalf.
+//!   the only uids served on the driver and UI sockets.
 //! - `SIGILLUM_SOCKET`, `SIGILLUM_DRIVER_SOCKET`, `SIGILLUM_UI_SOCKET`:
 //!   override the socket paths (tests).
 //!
@@ -66,9 +64,6 @@ fn main() -> ExitCode {
     let mut settings = Settings::standard(Config { web_broker, ceremony_ms: CEREMONY_MS });
     if let Some(u) = env_uid("SIGILLUM_DEV_UID") {
         settings.dev_uid = u;
-    }
-    if let Some(u) = env_uid("SIGILLUM_LAUNCHER_UID") {
-        settings.launcher_uid = Some(u);
     }
     if let Some(u) = env_uid("SIGILLUM_UI_UID") {
         settings.ui_uid = u;

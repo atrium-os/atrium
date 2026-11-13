@@ -751,6 +751,36 @@ pub fn devfs_ruleset_has_rules(id: u32) -> io::Result<bool> {
     Ok(out.status.success() && !out.stdout.iter().all(|b| b.is_ascii_whitespace()))
 }
 
+/// Show one node in one devfs mount (`devfs -m MNT rule apply ...`): unhide
+/// it, owned by `uid`, mode 0600. Applies to that mount alone, adds no rule
+/// to any ruleset. `node` was validated against a pin's `grant_nodes`
+/// (letters then digits), so it is never a pattern.
+pub fn devfs_grant(mount: &str, node: &str, uid: u32) -> io::Result<()> {
+    if node.is_empty() || !node.bytes().all(|b| b.is_ascii_alphanumeric()) {
+        return Err(io::Error::from(io::ErrorKind::InvalidInput));
+    }
+    let uid = uid.to_string();
+    for action in [&["unhide"][..], &["user", uid.as_str()][..], &["mode", "0600"][..]] {
+        let mut args: Vec<&str> = vec!["-m", mount, "rule", "apply", "path", node];
+        args.extend_from_slice(action);
+        let out = std::process::Command::new("devfs").args(&args).output()?;
+        if !out.status.success() {
+            return Err(io::Error::new(io::ErrorKind::Other,
+                format!("devfs {}: {}", args.join(" "), String::from_utf8_lossy(&out.stderr).trim())));
+        }
+    }
+    Ok(())
+}
+
+/// Unmount, ignoring errors (cleanup after a failed create).
+pub fn unmount_quiet(path: &str) {
+    if let Ok(c) = CString::new(path) {
+        // SAFETY: c is a valid NUL-terminated path.
+        #[allow(unsafe_code)]
+        let _ = unsafe { libc::unmount(c.as_ptr(), 0) };
+    }
+}
+
 /// Set a string sysctl (root only; jaild runs as root on the host).
 #[cfg(target_os = "freebsd")]
 pub fn sysctl_set_string(name: &str, value: &str) -> io::Result<()> {

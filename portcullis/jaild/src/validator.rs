@@ -277,14 +277,27 @@ fn validate_devfs_ruleset(id: u32, policy: &Policy) -> Result<(), JaildError> {
 /// IS that service may mount it: same jail name, same binary, same uid, and no
 /// child jails (a child would see the parent's devfs).
 fn validate_devfs_pin(req: &CreateJailRequest, policy: &Policy) -> Result<(), JaildError> {
-    let Some(pin) = policy.devfs_rulesets.pin(req.devfs_ruleset) else { return Ok(()) };
+    let Some(pin) = policy.devfs_rulesets.pin(req.devfs_ruleset) else {
+        if let Some(node) = &req.devfs_grant {
+            return Err(JaildError::PolicyViolation {
+                rule:   "devfs_grant.unpinned",
+                detail: format!("devfs_grant {node:?} needs a pinned ruleset; {} is not", req.devfs_ruleset),
+            });
+        }
+        return Ok(());
+    };
     let deny = |why: String| Err(JaildError::PolicyViolation {
         rule:   "devfs_ruleset.pinned",
         detail: format!("devfs_ruleset {} is pinned to jail {:?} ({} as uid {}): {why}",
             pin.id, pin.jail_name, pin.exec_path, pin.uid),
     });
-    if req.name != pin.jail_name {
+    if !pin.matches_name(&req.name) {
         return deny(format!("jail name is {:?}", req.name));
+    }
+    if let Some(node) = &req.devfs_grant {
+        if !pin.allows_grant(node) {
+            return deny(format!("devfs_grant {node:?} is not one of {:?}", pin.grant_nodes));
+        }
     }
     if req.children_max != 0 {
         return deny(format!("children_max is {}, must be 0", req.children_max));
@@ -741,6 +754,7 @@ mod tests {
             hostuuid: None,
             allow_mlock: false,
             syscall_profile: None,
+            devfs_grant: None,
         };
         validate_create(&req, &p).unwrap();
     }
@@ -767,6 +781,7 @@ mod tests {
             hostuuid: None,
             allow_mlock: false,
             syscall_profile: None,
+            devfs_grant: None,
         }
     }
 
@@ -959,6 +974,7 @@ mod tests {
             hostuuid: None,
             allow_mlock: false,
             syscall_profile: None,
+            devfs_grant: None,
         };
         let err = validate_create(&req, &p).unwrap_err();
         match err {
@@ -982,6 +998,7 @@ mod tests {
             hostuuid: None,
             allow_mlock: false,
             syscall_profile: None,
+            devfs_grant: None,
         }
     }
 
@@ -1325,6 +1342,8 @@ mod tests {
             exec_path: "/usr/local/bin/atrium-frescod".into(),
             uid: 65010,
             leases: vec!["dev.atrium_gpu_amd_display.0.lease".into()],
+            name_prefix: false,
+            grant_nodes: vec![],
         }];
         p
     }
@@ -1360,6 +1379,55 @@ mod tests {
         let mut r = frescod_req("anything", "/usr/local/bin/atrium-x", 1001);
         r.devfs_ruleset = 21;
         validate_devfs_pin(&r, &p).unwrap();
+    }
+
+    #[test]
+    fn per_device_pin_grants_one_matching_node() {
+        let mut p = pinned_policy();
+        p.devfs_rulesets.allowed_ids.push(27);
+        p.devfs_rulesets.pinned.push(jaild_policy::PinnedRuleset {
+            id: 27,
+            jail_name: "atrium-sigillum-fido-".into(),
+            exec_path: "/usr/local/bin/atrium-sigillum-fido".into(),
+            uid: 65029,
+            leases: vec![],
+            name_prefix: true,
+            grant_nodes: vec!["hidraw#".into()],
+        });
+        let bin = "/usr/local/bin/atrium-sigillum-fido";
+        let req = |name: &str, node: Option<&str>| {
+            let mut r = frescod_req(name, bin, 65029);
+            r.devfs_ruleset = 27;
+            r.devfs_grant = node.map(Into::into);
+            r
+        };
+        validate_devfs_pin(&req("atrium-sigillum-fido-3", Some("hidraw3")), &p).unwrap();
+        validate_devfs_pin(&req("atrium-sigillum-fido-3", None), &p).unwrap();
+        let refused = |r: CreateJailRequest| validate_devfs_pin(&r, &p).is_err();
+        assert!(refused(req("atrium-sigillum-fido-", Some("hidraw3"))), "bare prefix");
+        assert!(refused(req("atrium-sigillum-x", Some("hidraw3"))), "other name");
+        for bad in ["hidraw", "hidraw3a", "ugen0.2", "hidraw/../mem", "hidraw*", "hidraw99999", "kmem"] {
+            assert!(refused(req("atrium-sigillum-fido-3", Some(bad))), "{bad}");
+        }
+        // A grant on an unpinned ruleset, or on a pin with no grant_nodes.
+        let mut r = req("anything", Some("hidraw3"));
+        r.devfs_ruleset = 21;
+        assert!(matches!(validate_devfs_pin(&r, &p), Err(JaildError::PolicyViolation { rule: "devfs_grant.unpinned", .. })));
+        let mut r = frescod_req("atrium-frescod", "/usr/local/bin/atrium-frescod", 65010);
+        r.devfs_grant = Some("hidraw3".into());
+        assert!(refused(r), "frescod's pin grants nothing");
+    }
+
+    #[test]
+    fn shipped_policy_pins_the_identity_ruleset_to_sigillum_fido() {
+        let p = load_sample_policy();
+        let pin = p.devfs_rulesets.pin(27).expect("ruleset 27 (atrium_identity) is pinned");
+        assert!(pin.name_prefix);
+        assert_eq!(pin.jail_name, "atrium-sigillum-fido-");
+        assert_eq!(pin.exec_path, "/usr/local/bin/atrium-sigillum-fido");
+        assert_eq!(pin.uid, 65029);
+        assert!(pin.allows_grant("hidraw0") && !pin.allows_grant("ugen0.1"));
+        assert!(p.devfs_rulesets.allowed_ids.contains(&27));
     }
 
     #[test]

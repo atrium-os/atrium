@@ -66,6 +66,9 @@ ro_paths = [
     # The Portcullis launch registry (uid -> user, app id), one file, for
     # services that name their peers by uid: choragusd, arcad.
     "/var/run/atrium/app-registry",
+    # Sigillum's driver socket directory, the one socket path a security
+    # key's driver jail sees (sigillum.md §4).
+    "/atrium/sockets/sigillum-dev",
     # Arca's courier registry (courier uid -> user, persona, endpoint), one
     # file, written by the courier launcher; read by arcad (arca.md §4.1).
     "/var/run/atrium/courier-registry",
@@ -136,7 +139,8 @@ rw_subtrees = [
 allowed = [
     "atrium-baseline",   # null, zero, random, urandom, tty
     "atrium-display",    # atrium-gpu + atrium-display0; pinned to frescod
-    "atrium-input",      # baseline + hidraw*, atkbd*, bpsm*; pinned to tactusd
+    "atrium-input",      # baseline + atkbd*, bpsm* (+ input hidraw per node); pinned to tactusd
+    "atrium-identity",   # baseline (+ one hidraw per jail); pinned to sigillum-fido
     "atrium-tty",        # baseline + a specific allocated tty
 ]
 # Numeric ruleset ids jaild may mount a jail's devfs with. The rulesets
@@ -161,8 +165,12 @@ allowed = [
 #      with each capability's unhide rules applied to that jail's own mount.
 # 23 = atrium_display  — atrium_gpu + display0: frescod's alone (pinned below).
 # 24 = atrium_audio    — dsp*, mixer*, laminar: lyrad's alone (pinned below).
-# 26 = atrium_input    — hidraw*, atkbd*, bpsm*: tactusd's alone (pinned below).
-allowed_ids = [4, 20, 22, 23, 24, 26]
+# 26 = atrium_input    — atkbd*, bpsm*: tactusd's alone (pinned below). HID
+#      nodes are NOT in it: portcullisd shows tactusd each hidraw node the
+#      kernel classified as input, in that jail's mount (sigillum.md §5.1).
+# 27 = atrium_identity — basics only: one jail per security key, each shown
+#      its own hidraw node through the request's devfs_grant (pinned below).
+allowed_ids = [4, 20, 22, 23, 24, 26, 27]
 
 # The display belongs to frescod. Only the frescod service may mount the
 # ruleset that shows /dev/atrium-display0, and before it starts jaild writes
@@ -192,6 +200,17 @@ id        = 26
 jail_name = "atrium-tactusd"
 exec_path = "/usr/local/bin/atrium-tactusd"
 uid       = 65018
+
+# Security keys belong to Sigillum's FIDO driver (sigillum.md §4, §5.1): one
+# jail per key, named atrium-sigillum-fido-<hidraw unit>, each running the
+# driver as _sigillum-dev and shown exactly one hidraw node (devfs_grant).
+[[devfs_rulesets.pinned]]
+id          = 27
+jail_name   = "atrium-sigillum-fido-"
+name_prefix = true
+exec_path   = "/usr/local/bin/atrium-sigillum-fido"
+uid         = 65029
+grant_nodes = ["hidraw#"]
 
 
 # ---------------------------------------------------------------
@@ -292,6 +311,10 @@ allowed_system_uids = [
     # 65026 = _vinculum-audio  (reserved: Bluetooth audio profiles)
     65027,   # _hospes-cdm: content decryption module hosts, started per app by
              # portcullisd (OpenCdm) under the system worker rule (hospes-cdm-bundle.sh)
+    65028,   # _sigillum: Sigillum's broker, sigillumd (docs/spec/sigillum.md §4)
+    65029,   # _sigillum-dev: Sigillum's per-device drivers, one jail each,
+             # started by portcullisd's identity-device agent (sigillum-service.sh)
+    65030,   # _sigillum-ui: Sigillum's trusted sheets
 ]
 
 [gid]
@@ -308,6 +331,9 @@ allowed_system_gids = [
     65022,   # _limen
     65023,   # _nuntius
     65027,   # _hospes-cdm
+    65028,   # _sigillum
+    65029,   # _sigillum-dev
+    65030,   # _sigillum-ui
 ]
 
 
@@ -566,6 +592,16 @@ families = ["unix"]
 # Fresco renderers, decoders, the Tier-2 executor, Navigator workers.
 [sysfil.profiles.renderer]
 include = ["base"]
+
+# Per-device drivers (sigillum.md §4): Sigillum's FIDO driver. base plus the
+# read-only hidraw ioctls it uses; no network families beyond unix (it
+# connects once to sigillumd's driver socket, then enters Capsicum).
+[sysfil.profiles.device]
+include = ["base"]
+ioctls = [
+    "0x40085520",   # HIDIOCGRAWINFO
+    "0x40805521",   # HIDIOCGRAWNAME(128)
+]
 
 # Ordinary apps.
 [sysfil.profiles.app]

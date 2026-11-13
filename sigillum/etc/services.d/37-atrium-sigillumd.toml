@@ -1,0 +1,67 @@
+# /etc/atrium/services.d/37-atrium-sigillumd.toml
+#
+# The jailed launch of sigillumd, Sigillum's broker (docs/spec/sigillum.md §4,
+# §7). atrium-portcullisd-bootstrap reads this, asks jaild to create the jail
+# and supervises sigillumd inside it.
+#
+# sigillumd runs NON-ROOT (_sigillum) with no devices (ruleset 4) and no
+# network. It never opens a security key: per-key drivers do, each in its own
+# jail that portcullisd's identity-device agent starts when the kernel
+# classifies a HID device as FIDO (atrium-sigillum-fido-N, ruleset 27). It
+# reads only their capped records.
+#
+# Three sockets, each checked by peer uid on every connection:
+#   /atrium/sockets/sigillum/sigillumd.sock      clients (label via the launch registry)
+#   /atrium/sockets/sigillum-dev/drivers.sock    drivers (_sigillum-dev only)
+#   /atrium/sockets/sigillum-ui/ui.sock          the trusted UI (_sigillum-ui only)
+#
+# SIGILLUM_WEB_BROKER names Navigator's broker (`app_id publisher-hex`), the
+# one app that may run WebAuthn for any RP ID; set it here once Navigator's
+# publisher key is known. Unset, apps get only their private RP IDs.
+#
+# REQUIRES (scripts/sigillum-service.sh does all of it):
+#   1. The _sigillum (65028), _sigillum-dev (65029), _sigillum-ui (65030)
+#      system users, in jaild.policy's allowed_system_uids.
+#   2. The socket directories above, owned _sigillum.
+#   3. The rootfs mountpoint dirs: <path>/{dev,libexec,lib,usr/lib,usr/local/bin,atrium/sockets,var/run/atrium}.
+
+enabled       = true
+name          = "atrium-sigillumd"
+path          = "/var/lib/atrium/jails/sigillumd"
+children_max  = 0
+devfs_ruleset = 4                                # devfsrules_jail: no devices
+
+[[mounts]]
+source = "/libexec"
+dest   = "libexec"
+kind   = "ro_nullfs"
+[[mounts]]
+source = "/lib"
+dest   = "lib"
+kind   = "ro_nullfs"
+[[mounts]]
+source = "/usr/lib"
+dest   = "usr/lib"
+kind   = "ro_nullfs"
+[[mounts]]
+source = "/usr/local/bin"
+dest   = "usr/local/bin"
+kind   = "ro_nullfs"
+[[mounts]]
+source = "/atrium/sockets"                        # rw: binds sigillum*/ (dirs owned _sigillum)
+dest   = "atrium/sockets"
+kind   = "rw_nullfs"
+[[mounts]]
+source = "/var/run/atrium/app-registry"           # ro: who each app uid is (one file)
+dest   = "var/run/atrium/app-registry"
+kind   = "ro_nullfs"
+
+[exec]
+path = "/usr/local/bin/atrium-sigillumd"
+argv = ["atrium-sigillumd"]
+uid  = 65028   # _sigillum
+gid  = 65028
+
+[[exec.env]]
+key   = "SIGILLUM_ARCA_UID"
+value = "65020"                                   # _arca: may ask VerifyUser

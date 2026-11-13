@@ -420,6 +420,7 @@ pub fn run_with_stdio(spec: &Spec, stdio: Option<[std::os::fd::OwnedFd; 3]>) -> 
         allow_mlock: false,
         // jail-sysfil.md §5.2; jaild drops it on a kernel without sysfil.
         syscall_profile: Some(portcullis_jail::sysfil_class(&manifest.capabilities)),
+        devfs_grant: None,
     });
     let outcome = run_via_jaild(&req, stdio);
 

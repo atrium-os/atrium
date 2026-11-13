@@ -480,6 +480,7 @@ impl ServiceManifest {
             hostuuid: None,
             allow_mlock: self.allow_mlock,
             syscall_profile: None,
+            devfs_grant: None,
         }
     }
 }
