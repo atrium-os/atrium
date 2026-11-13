@@ -238,6 +238,9 @@ The gfx12 PTE has separate READABLE, WRITEABLE and EXECUTABLE bits (`gmc12.c:51`
 
 ## 9. Spec text that no longer matches the code
 
+*Fixed 2026-11-13 (§11): every row below has been corrected in its file except the
+`si_client.c` comment, which is driver code and goes with the driver changes.*
+
 The coordinator asked about an older Mesa plan. `GRAPHICS-STACK.md` §10 is now correct (no
 Mesa at runtime on the default path; lavapipe only as a test oracle and behind
 `FRESCOD_RENDERER=vulkan`; the `atrium-os/mesa` fork only ever carried venus). The stale
@@ -268,16 +271,14 @@ text is elsewhere:
    names VT-d (`hw.dmar.enable=1`). Nothing in the tree shows DMA remapping enabled on the
    bare-metal Atrium install. Confirm it, and what it covers (the driver already uses
    `bus_dma` addresses, so it is DMAR-ready).
-5. **Authority split per ABI §4.1**: `CLIENT_OPEN`, a non-passable control fd, per-jail
-   quotas including live queues, VMs and syncobjs. Until then frescod is the only client
-   in production and per-uid caps stand in.
+5. **Authority split** (decided, §11): node-based profile kept; the control node must
+   check `PRIV_DRIVER` per call; per-uid cap on live queues. `CLIENT_OPEN` only before a
+   second broker or a production direct grant.
 6. **User-mode queues and "the broker writes every packet".** A user-mode queue's holder
    writes its own ring. Fine for root and frescod's own trusted renderer later; never for
    an app or a per-client renderer without a decision. Today it is host root only. Write
    the rule into GRAPHICS-STACK and ABI §5.9 when the interim `PRIV_DRIVER` gate changes.
-7. **Devfs ruleset 21** (`atrium_gpu`: client node 0666, no display) is allowed but not
-   pinned to any service, and no service uses it now. Pin it or drop it from
-   `allowed_ids`, so only frescod's jail can ever see the GPU node.
+7. **Devfs ruleset 21**: done, dropped from jaild's `allowed_ids` (§11).
 8. **Firmware in the TCB** (§6): say so in the Navigator threat model's GPU rows.
 9. **RamPages review** (KPI patch 0012): the non-contiguous path, `VPO_UNMANAGED` on
    object-less pages against vm_page invariants, a leak counter.
@@ -286,4 +287,29 @@ text is elsewhere:
 11. **Display path** (gpu-isolation.md open question 1): frescod scans out app-derived
     pixels; the import and blit path must be memory-safe. Display ABI v2 already bounds
     scanout by the BO (break 4).
-12. **Stale spec text** in §9.
+12. **Stale spec text** in §9: done (§11).
+
+## 11. Decisions on the mismatches (2026-11-13)
+
+For each place where spec and code disagreed: which one moves, and why. Spec and config
+changes are on main with this revision; code changes are listed for the driver work
+(the R9700 thread owns `atrium-gpu-amd/`).
+
+| Mismatch | Decision | Why | Status |
+|---|---|---|---|
+| ABI §4.1 `CLIENT_OPEN` minting vs two device nodes | **Spec changes**: the node-based profile is a conforming profile for a single broker (ABI 2.3 principle 13, §4.1). Minting is required before a second GPU broker process or any production direct grant | In production frescod is the only client and holds every VM; minting fds to itself adds no boundary. A compromised frescod could mint anything anyway. Minting earns its keep only when a second, less trusted holder appears | spec done |
+| Control fd passable (ABI says non-passable) | **Code changes**: `amd_rs_ctl_ioctl` checks `PRIV_DRIVER` on every call | One line; makes the spec's property true and costs nothing | driver to do |
+| ABI §4.2 per-jail quota record vs per-uid caps | **Spec changes** to per-uid for the node-based profile (principle 14, §4.2) | Every Atrium app and service has its own uid, so a uid is a principal. Per-app limits inside frescod are frescod's, since it allocates for all apps | spec done |
+| No cap on live queues per uid (r9700 §4.5.1 plan, ABI §4.2) | **Code changes**: add it next to the BO caps | A uid opening queues without limit can exhaust MES's process and gang slots for everyone | driver to do |
+| User-mode queues need `ALLOW_USER_QUEUES`; code needs `PRIV_DRIVER` | **Spec changes**: host-root-only in the node-based profile; never for an app or per-client renderer (ABI 2.3 §5.9) | A user-mode queue's holder writes its own ring, giving up "the broker writes every packet". Keep it out of production until that is decided for frescod | spec done |
+| GPU data BOs mapped RWX | **Code changes**, with a spec rule first: ABI 2.3 §5.4 `BIND_EXEC` only with `BIND_READ_ONLY`; header gains `ATRIUM_GPU_BIND_EXEC` and `BIND_FEAT_EXEC` | W^X on the GPU costs one PTE bit; frescod's own kernels process untrusted data, so a kernel bug should not become code execution. Needs a box run to confirm which fetches need X (ring yes; IBs, EOP, writeback to check) | spec done; driver to do, plus a test: write code to a data BO, jump, must fault |
+| "Broker writes every packet" (GRAPHICS-STACK) vs queue-fd IBs | **Spec changes**: the claim is for the F6 app path; queue-fd holders supply IBs | Kernel-mediated submit with client IBs is the ABI's design (§5.7); the boundary is VMID plus unprivileged queue | spec done; hostile-PM4 test still owed (§10 item 1) |
+| `BO_MMAP_INFO` (CPU mapping of BOs) | **Spec stays**, code later | It is a performance feature, not a security gap; copies are safe meanwhile | listed in ABI §18 |
+| `BO_SEAL` | **Spec stays**, code when content-addressed sharing has a user | No consumer yet | listed in ABI §18 |
+| `gpu-isolation.md` Mesa wording, `atrium-amdgpu` row, `gpu-direct` class | **Spec changes** | Superseded by ABI 2.1 and the own-RDNA4 decision | done |
+| ABI intro (Mesa winsys as the plan), §18 status table | **Spec changes** | §13p already decided our own backend | done |
+| `aqueduct-gpu.md` §12.3 (apps open the GPU node) | **Spec changes**: marked superseded | Apps hold no GPU fd; Vulkan runs in per-app executor jails | done |
+| `GRAPHICS-STACK.md` §11 (no silicon, no queue fds) | **Spec changes** | Out of date since 2026-11-12/13 | done |
+| `atrium-virtio-gpu` stanza `production` with commit `0000000` | **Config changes**: `experimental`, not passed | Legacy, never attested; a `production` stanza invites a grant path to trust it | done (`jaild-policy` test updated) |
+| Devfs ruleset 21 allowed, unpinned | **Config changes**: removed from `allowed_ids` | No service uses it; the GPU node should be reachable only through frescod's pinned ruleset 23 | done (`jaild-policy` test asserts it) |
+| `si_client.c` header says user-mode queues are EOPNOTSUPP | **Code comment changes** | Stale since 5c-2b step 3 | driver to do |

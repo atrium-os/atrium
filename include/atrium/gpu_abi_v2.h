@@ -172,6 +172,7 @@ struct atrium_gpu_perf_counter_info {
 
 #define ATRIUM_GPU_BIND_FEAT_SPARSE	0x1u
 #define ATRIUM_GPU_BIND_FEAT_READ_ONLY	0x2u  /* mandatory in 2.1 */
+#define ATRIUM_GPU_BIND_FEAT_EXEC	0x4u  /* 2.3: BIND_EXEC honoured (GPU W^X, §5.4) */
 #define ATRIUM_GPU_SUBMIT_FEAT_USER_QUEUE 0x1u
 #define ATRIUM_GPU_SUBMIT_FEAT_GPU_WAIT	0x2u  /* same-device deps waited on the GPU */
 
@@ -286,6 +287,7 @@ struct atrium_gpu_bo_import_share {		/* on device_fd */
 
 #define ATRIUM_GPU_BIND_READ_ONLY	0x1u  /* GPU PTEs read-only; required for sealed BOs */
 #define ATRIUM_GPU_BIND_SPARSE		0x2u  /* needs BIND_FEAT_SPARSE */
+#define ATRIUM_GPU_BIND_EXEC		0x4u  /* 2.3: executable PTEs; only with READ_ONLY (§5.4) */
 
 struct atrium_gpu_vm_bind_op {
 	uint32_t op;			/* ATRIUM_GPU_BIND_* */

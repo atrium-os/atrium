@@ -4,8 +4,10 @@
 **Owner:** Atrium platform / atrium-kmod
 
 The `gpu` capability in `atrium.toml` is the most dangerous one Portcullis
-can grant. An app with the `gpu` capability has `/dev/atrium-gpu0`
-mounted into its jail and can talk directly to the GPU through Mesa.
+could grant. An app with the `gpu` capability would have `/dev/atrium-gpu0`
+in its jail and talk directly to the GPU (since 2.1: test and development
+only, see the amendment below; Atrium's GPU userspace is its own RDNA4
+compiler and command builders, no Mesa).
 Without proper isolation, the GPU can DMA to arbitrary host memory
 — escaping the jail, bypassing kernel page protections, reading other
 apps' BOs, and reading kernel-private data.
@@ -110,9 +112,8 @@ property of the driver + hardware.
 | Driver | Isolation provider | Status |
 |--------|-------------------|--------|
 | **`atrium-virtio-gpu`** (D0, current) | layered: kmod per-fd handle table + virtio-gpu spec context ownership + host venus per-VkInstance + Metal/Apple IOMMU on M4 Max | **Verified by smoke test** (see below) |
-| **`atrium-gpu-amd`** (RDNA4, from scratch, against gpusim; the ABI v2.1 reference) | per-VM page tables in the GPU MMU; per-queue locks and in-flight tracking; exclusive queue ownership with revocable doorbell grants; root-only control node; kernel-checked scanout bounds (`atrium-gpu-amd/ISOLATION.md`) | **Experimental.** The five breaks from 2026-11-03 (review §A3) are fixed and `atrium-gpu-amd/tests/test_gpu_isolation.c` passes on gpusim (amd64 VM, 2026-11-04). Not yet run on silicon, so `status = "experimental"` and the gate refuses `gpu`. |
+| **`atrium-gpu-amd`** (RDNA4, from scratch, against gpusim; the ABI v2.1 reference) | per-VM page tables in the GPU MMU; per-queue locks and in-flight tracking; exclusive queue ownership with revocable doorbell grants; root-only control node; kernel-checked scanout bounds (`atrium-gpu-amd/ISOLATION.md`) | **Experimental.** The five breaks from 2026-11-03 (review §A3) are fixed and `atrium-gpu-amd/tests/test_gpu_isolation.c` passes on gpusim (amd64 VM; on queue fds since 5f, 2026-11-13). On the R9700 (2026-11-13) per-VM page tables, cross-VM faults, per-queue loss, the free rule, revocable doorbells and VRAM scrub are proven by `si_client_test` on MES user queues; `test_gpu_isolation` itself has not run there, so `status = "experimental"` and the gate refuses `gpu`. Security picture: `gpu-security-model.md`. |
 | **`atrium-asahi`** (D5+ Apple Silicon native) | Apple GPU per-context page tables + AGX MMU; kernel driver manages page tables; user shaders go through the AGX user command ring | **Spec-only; gated on D5 driver landing** |
-| **`atrium-amdgpu`** (D5+ AMD discrete) | AMDGPU MMU per-VMID; kernel driver manages VMIDs and page tables; user shaders go through MEC (Micro Engine Compute) user queues | **Spec-only; gated on D5+ driver landing** |
 | **`atrium-i915`** (D5+ Intel) | Intel PPGTT (per-process graphics translation tables); kernel manages PPGTT; user shaders go through user-mode command rings | **Spec-only; gated on D5+ driver landing** |
 
 For each driver port, the team must:
@@ -246,6 +247,12 @@ notes = "Pending D5; isolation work in progress"
 ```
 
 ## Default capability classes
+
+> **Superseded for production (2026-11-03).** Only `render-only` (and the
+> F6 app GPU channel through frescod, `gpu-app-path-f6.md`) exists in
+> production. `gpu-direct` below is the test/development direct grant of
+> the amendment at the top: it needs `[gpu] direct_grant = "test"` or a
+> dev jail plus a `production` attestation.
 
 For developer convenience, `atrium.toml` capability schema includes
 two `gpu`-shaped capabilities, distinguished by trust level:

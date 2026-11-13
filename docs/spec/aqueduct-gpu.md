@@ -1836,6 +1836,17 @@ local IPC protocol on commodity OSes handle the question.
 
 ### 12.3. The aqueduct-gpu path through jails — concrete data flow
 
+> **Superseded (GPU ABI 2.1, 2026-11-03; Tier-2 executor jails, 2026-11-05).**
+> Apps never open `/dev/atrium-gpu0`. A Vulkan app's ICD talks to the
+> aqueduct-gpu broker over a socket the TCB mounts into its jail
+> (`graphics = "vulkan"`); the broker hands each connection to a one-shot
+> per-app executor jail (`_aqueduct-gpu-app`, no device node, no network),
+> which runs the app's shaders on the CPU through Tier-2 with the compiler in
+> Capsicum capability mode (`tier2-robust-access.md` §3–4). A native GPU
+> backend would run in a GPU broker holding the client node, never in the
+> app. The flow below is the pre-2.1 design, kept for its reasoning about
+> per-fd resource tables.
+
 For an app inside a Portcullis jail wanting GPU access:
 
 ```

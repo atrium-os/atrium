@@ -103,7 +103,7 @@ flowchart LR
 | Userspace driver | Mesa RADV (Vulkan), radeonsi (GL), inside every app | none in apps. frescod runs our compiler's output; third-party Vulkan goes through `atrium-vk-icd` → aqueduct-gpu → Tier-2/Tier-3 | no driver code in untrusted processes; one compiler we control |
 | Shader compiler | NIR → ACO (or LLVM), in the app process | frontend IR → GIR → RDNA4 machine layer, built from AMD's public ISA docs only | public-sources rule; layered for more GPU families; RADV kept only as the speed yardstick on the R9700 |
 | CPU fallback | lavapipe/llvmpipe (Mesa) | Tier-2: AOT SPIR-V → native code (bespoke ARM64 and x86_64, Cranelift fallback); it is frescod's default renderer | no Mesa at runtime; lavapipe survives only as a golden-test oracle and `FRESCOD_RENDERER=vulkan` |
-| Command submission | userspace builds IBs; kernel `amdgpu_cs` checks BOs, not packets | the broker (`atrium-gpu-app`, frescod) writes every packet; the ring is read-only to the GPU; app code is mapped read-only and confined by its VMID | packets come from one trusted writer |
+| Command submission | userspace builds IBs; kernel `amdgpu_cs` checks BOs, not packets | on the app path the broker (`atrium-gpu-app`, frescod) writes every packet; the ring is read-only to the GPU; app code is mapped read-only and confined by its VMID. A queue fd's holder (frescod in production) supplies the IB; the kernel writes the ring | packets come from one trusted writer |
 | Buffers | GEM handles, TTM placement, dmabuf export | BOs named by fd; sealed buffers for content-addressed sharing (GPU ABI v2.1 §5.13) | fds pass like any capability; no global GEM names |
 | Kernel driver | DRM `amdgpu.ko` (Linux), or drm-kmod via linuxkpi on FreeBSD | `atrium-gpu-amd`, written for FreeBSD from scratch (newbus, bus_dma, kqueue) | no DRM, no linuxkpi; per-VM isolation, watchdog and fault handling designed in |
 | Display | KMS atomic commit on the card node | display ABI v2: commit a BO fd with in/out syncobj fences, exclusive node, flip-done pacing | smaller surface; only frescod opens it |
@@ -358,9 +358,11 @@ Tier-2 or our RDNA4 compiler. Mesa appears in three places only:
 
 ## 11. Open gaps
 
-- **No silicon yet.** `atrium-gpu-amd` has run only on gpusim. Phase D of the
-  x86_64 port (VFIO passthrough of the R9700 into a FreeBSD VM) is the next
-  step; the driver stays experimental until `test_gpu_isolation` passes there.
+- **Silicon is partway.** Since 2026-11-12 Atrium boots bare-metal on the R9700:
+  PSP/SMU bring-up, GMC, IH, MES, client queue fds on MES user queues, VRAM
+  with scrub (stages 3 to 5e, `spec/r9700-bare-metal.md`). The driver stays
+  experimental until `test_gpu_isolation`, the F6 hostile-ISA run and the fuzz
+  gate pass there. Security picture: [spec/gpu-security-model.md](spec/gpu-security-model.md).
 - **Modeset is gpusim-shaped.** Since D4 the display module scans out and
   flips through the real DCN 4.0.1 HUBP/OTG registers and takes its
   interrupts by real IH source ids, and since 2.1 programs mode timing on the
@@ -374,8 +376,10 @@ Tier-2 or our RDNA4 compiler. Mesa appears in three places only:
   Tier-2 or the Mac host.
 - **Fresco security items left:** F4f (secure password input to frescod),
   F5 (deferred).
-- **`'A'` is not all of v2.1:** no `QUEUE_CREATE`/queue fds, cross-device
-  `share_fd` or `QUERY_TELEMETRY` yet (see the ABI spec's §18 list).
+- **`'A'` is not all of the ABI:** queue fds are in (MES user queues on silicon,
+  gpusim since 5f), but not `CLIENT_OPEN` minting (the node-based profile is used,
+  ABI 2.3 §4.1), `BIND_EXEC` (GPU W^X), sealed BOs, CPU mapping of BOs,
+  cross-device `share_fd` or `QUERY_TELEMETRY` (the ABI spec's §18 list).
 - **Legacy paths remain:** `frescod-aqueduct` on `'G'`, Carillon has no
   compositor on it, and both drivers create the same device names.
 - **Stale docs:** `docs/subsystems/graphics.md` (describes `/dev/fresco0` and a

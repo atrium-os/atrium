@@ -135,7 +135,6 @@ rw_subtrees = [
 [devfs_rulesets]
 allowed = [
     "atrium-baseline",   # null, zero, random, urandom, tty
-    "atrium-gpu",        # baseline + atrium-gpu0
     "atrium-display",    # atrium-gpu + atrium-display0; pinned to frescod
     "atrium-input",      # baseline + hidraw*, atkbd*, bpsm*; pinned to tactusd
     "atrium-tty",        # baseline + a specific allocated tty
@@ -154,13 +153,16 @@ allowed = [
 #  4 = devfsrules_jail (FreeBSD-standard, /etc/defaults/devfs.rules) — session
 #      apps' per-jail devfs (ostiarius SESSION_DEVFS_RULESET).
 # 20 = atrium_governor — basics + /dev/pressure (memoryd, memfed).
-# 21 = atrium_gpu      — basics + gpu0 (no display, no input).
+# 21 = atrium_gpu      — basics + gpu0 (no display, no input). NOT allowed: no
+#      service uses it, and the GPU client node must be reachable only through
+#      frescod's pinned ruleset 23 (gpu-security-model.md §2). Pin it to a
+#      service before adding it back.
 # 22 = atrium_app      — basics + pty/fd; portcullis apps and one-shot workers,
 #      with each capability's unhide rules applied to that jail's own mount.
 # 23 = atrium_display  — atrium_gpu + display0: frescod's alone (pinned below).
 # 24 = atrium_audio    — dsp*, mixer*, laminar: lyrad's alone (pinned below).
 # 26 = atrium_input    — hidraw*, atkbd*, bpsm*: tactusd's alone (pinned below).
-allowed_ids = [4, 20, 21, 22, 23, 24, 26]
+allowed_ids = [4, 20, 22, 23, 24, 26]
 
 # The display belongs to frescod. Only the frescod service may mount the
 # ruleset that shows /dev/atrium-display0, and before it starts jaild writes
@@ -350,11 +352,10 @@ allow_inherit_jails = [
 # `isolation_test_passed`.
 # ---------------------------------------------------------------
 [gpu_drivers.attested.atrium-virtio-gpu]
-status                  = "production"
-isolation_test_passed   = true
-isolation_test_date     = "2026-05-07"
-isolation_test_commit   = "0000000"          # fill at test-run time
+status                  = "experimental"     # legacy; never attested at a real commit
+isolation_test_passed   = false
 notes = """
+Legacy D0 path (superseded by atrium-gpu-amd), not grantable.
 D0 path. Isolation enforced by layered chain: kmod per-fd handle
 table → virtio-gpu spec context ownership → host venus
 per-VkInstance → MoltenVK MTLDevice context → Apple GPU IOMMU on

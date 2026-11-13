@@ -1,4 +1,4 @@
-# Atrium GPU ABI v2.1
+# Atrium GPU ABI v2.3
 
 > **CANONICAL.** This is the canonical GPU ABI. All backends
 > (`atrium-gpu-amd`, `atrium-virtio-gpu`, Carillon) and `atrium-gpu-rs` converge
@@ -24,6 +24,14 @@
 > work order (§17), and the implementation-status table (§18). Sections marked
 > *(unchanged in 2.1)* carry over from v2 as written.
 
+> **Revision 2.3 (2026-11-13).** Settles where the spec and `atrium-gpu-amd`
+> disagreed (`gpu-security-model.md` §9, §11): the node-based authority profile and
+> per-uid accounting become the conforming single-broker profile (principles 13 and 14,
+> §4.1, §4.2), `CLIENT_OPEN` minting is required only before a second broker or a
+> production direct grant; GPU W^X: executable PTEs only on read-only binds
+> (`BIND_EXEC`, §5.4); user-mode queues stay host-root-only until §5.9's open question is
+> decided; §18 is brought up to date.
+
 > **Normative header.** [`include/atrium/gpu_abi_v2.h`](../../include/atrium/gpu_abi_v2.h)
 > carries every struct, flag, error code, cap payload and ioctl number; §19
 > lists the calls. The header and this text are one specification.
@@ -31,15 +39,17 @@
 > **Status.** Specification. `atrium-gpu-amd` (developed against the gpusim
 > functional model) is the reference implementation and implements part of it;
 > §18 maps what exists against this text. Intended audience: Atrium kernel and
-> userspace authors first, then FreeBSD-CURRENT contributors, the other BSDs'
-> graphics maintainers, and Mesa winsys authors.
+> userspace authors first, then FreeBSD-CURRENT contributors and the other BSDs'
+> graphics maintainers. Atrium's own userspace (our RDNA4 compiler and command
+> builders, §11, §13p) is the consumer; a Mesa winsys port is a possible fallback, not
+> the plan.
 >
 > **Companion.** `drm-research-findings.md` (background),
 > `atrium-gpu-driver-architecture.md` (driver stance), `atrium-gpu-amd-design.md`
 > (the AMD module), `gpu-isolation.md` (the isolation invariants and the
 > attestation gate this ABI must satisfy).
 >
-> **One-line summary.** A small, BSD-native, vendor-per-cdev kernel ABI for GPU work, with Vulkan as the only userspace API it targets. POD-blob submits, timeline-only sync, VM_BIND from day one, per-queue fences with deferred frees, kernel-mediated *or* capability-scoped user-mode-queue submission, a brokered control/client authority split, per-jail resource accounting, Capsicum-friendly, optional read-only energy telemetry, no shared kernel framework, no Linux DRM concepts inherited.
+> **One-line summary.** A small, BSD-native, vendor-per-cdev kernel ABI for GPU work, with Vulkan as the only userspace API it targets. POD-blob submits, timeline-only sync, VM_BIND from day one, per-queue fences with deferred frees, kernel-mediated *or* capability-scoped user-mode-queue submission, a control/client authority split, per-principal resource accounting, GPU W^X, Capsicum-friendly, optional read-only energy telemetry, no shared kernel framework, no Linux DRM concepts inherited.
 
 ---
 
@@ -62,7 +72,7 @@ Three claims this design rests on, each derived from `drm-research-findings.md`:
 2. **The hard problems any GPU stack must solve are smaller than DRM's surface implies.** Five concerns are real (memory placement, sync semantics, VM_BIND, hang recovery, KMS atomic). The rest is policy or convention. (Findings §5b.)
 3. **The post-2020 design (Intel Xe, Asahi v2) already converged on the right shape**: VM_BIND, timeline-only sync, firmware scheduling, explicit-sync only, POD submit blobs. We do not have to invent a model — we adopt that consensus and translate its primitives into BSD idioms. (Findings §2.)
 
-What we explicitly do not do:
+What we explicitly do not do (as first written; since 2.1 Atrium's own userspace is the first consumer and Mesa a fallback, §11, §13p):
 
 - We do not invent a new userspace API. Mesa's `radv`, `anv`, `nvk`, `lavapipe` are unchanged. We replace `libdrm_<vendor>` (~50 KLoC of ioctl wrappers and helpers) with `libatrium_gpu` (target ~5 KLoC), and patch each Mesa backend's `winsys/` layer to call us instead of DRM.
 - We do not ship a kernel-side "framework" that vendor drivers must integrate with. The vendor cdev *is* the contract. There is no `atrium_drm_*` framework. Vendor modules share *headers* (ioctl numbers and struct definitions) and a *spec* (this document). They do not share kernel code.
@@ -130,9 +140,9 @@ These are non-negotiable. Every concrete decision below is a consequence of one 
 
 12. **The kernel validates everything it programs into hardware.** Every address, size, offset, engine id, mode and buffer reference that the kernel writes into a register, a page table, a queue descriptor or a firmware message is checked by the kernel first. A device model's referee (gpusim) or a firmware check is a second line, never the first: on silicon nothing else is checking. The opaque *contents* of a submit blob are the one deliberate exception (principle 5), and they are contained by the VM (I1–I3 of `gpu-isolation.md`), not by inspection.
 
-13. **Authority is brokered and split.** Opening the device node grants *control* authority (device reset, scheduler weights, power gating, quotas, minting clients). Running GPU work needs only *client* authority. Clients never open the node: a broker that holds the control fd mints restricted client fds (§4.1) and hands them over `SCM_RIGHTS`. The kernel enforces the split itself; Capsicum's `cap_ioctls_limit` narrows further but is not what makes it safe. **The default deployment gives no app a client fd at all**: apps reach the GPU through the aqueduct-gpu protocol to a trusted daemon (frescod, `aqueduct-gpu-host`), and jails plus devfs rulesets keep them off the device node. A direct client fd for an app exists only for testing and development, never in production (§4.1).
+13. **Authority is brokered and split.** *Control* authority (device reset, scheduler weights, power gating, quotas, minting clients) is separate from *client* authority (running GPU work), and the kernel enforces the split itself; Capsicum's `cap_ioctls_limit` narrows further but is not what makes it safe. Two conforming profiles (§4.1): **node-based** (2.3): a client node and a root-only control node whose ioctls check privilege on every call, so a passed control fd carries nothing; and **minted**: a broker holding the control fd mints restricted client fds with `CLIENT_OPEN` and hands them over `SCM_RIGHTS`. The minted profile is required before a second GPU broker exists or any app receives a client fd outside test and development. **The default deployment gives no app a client fd at all**: apps reach the GPU through the aqueduct-gpu protocol to a trusted daemon (frescod, `aqueduct-gpu-host`), and jails plus devfs rulesets keep them off the device node. A direct client fd for an app exists only for testing and development, never in production (§4.1).
 
-14. **A jail is the accounting unit; a VM is the isolation unit.** Isolation between GPU contexts is a property of the driver and the GPU MMU: jail boundaries do not apply to device DMA. What jails *are* good for is deciding who may hold a client fd and charging resource use. Every client context carries the jail id it was minted for, and the kernel enforces that jail's quotas (§4.2).
+14. **A principal is the accounting unit; a VM is the isolation unit.** Isolation between GPU contexts is a property of the driver and the GPU MMU: jail boundaries do not apply to device DMA. What jails *are* good for is deciding who may hold a client fd and charging resource use. In the node-based profile the principal is the allocating uid (Atrium gives every app and every service its own uid, so a uid is one app or one service); in the minted profile it is the jail id the client was minted for (§4.2).
 
 ---
 
@@ -165,6 +175,8 @@ All fds are inherited by `fork()` per POSIX. All fds except `control_fd` can be 
 
 ### 4.1 Access and authority
 
+*2.3: two profiles.* **Node-based** (what `atrium-gpu-amd` implements, conforming for a single broker): the client node (`/dev/atrium-gpu0`) carries client authority; the control node (`/dev/atrium-gpu0ctl`, root 0600 on the host, never unhidden in a jail) carries reset, scheduler and power gating, and checks privilege (`PRIV_DRIVER`) on every ioctl so that a control fd passed over `SCM_RIGHTS` grants nothing. Control ioctls on the client node fail with `EPERM`. Who may open the client node is decided by devfs rulesets and jaild's pins: in production only frescod's jail (`gpu-security-model.md` §2). Accounting is per uid (§4.2). **Minted** (the text below): required before a second broker process holds GPU fds, or before any app holds a client fd outside test and development; until then `CLIENT_OPEN`, `SET_QUOTA` and `QUERY_USAGE` may return `ENOTSUP`.
+
 Three levels of authority, enforced by the kernel on every ioctl:
 
 | Level | Holder | Can do |
@@ -195,6 +207,8 @@ Rules:
 - **Direct grant: test and development only.** A client `device_fd` handed to an app is for driver bring-up, conformance runs and Tier-3 experiments, never a production path. It exists only when the broker runs with an explicit test policy (`[gpu] direct_grant = "test"` in `jaild.policy.toml`, refused when the policy is `production`) or inside a dev jail (`atrium-devjail.md`), and Portcullis still refuses it unless the bound driver passes `gpu-isolation.md`'s attestation gate. Production images ship with no path that mints a client fd for an app.
 
 ### 4.2 Resource accounting per jail
+
+*2.3, node-based profile:* each allocation is charged to the real uid of the allocating thread before the backing is allocated, and given back when the backing is actually freed (after §5.11's deferred free). A uid over its cap gets `EDQUOT`. Caps are device-wide percentages (`atrium-gpu-amd`: 75 % of VRAM, 50 % of RAM, sysctl-tunable), plus a cap on live queues per uid. A BO fd passed to another process stays charged to the uid that allocated it. In production frescod allocates for every app, so the kernel bounds frescod as a whole (and keeps it apart from its renderers, a separate uid); per-app limits inside it are frescod's (≤ 4 GPU contexts per uid, its own memory budget). The record below applies to the minted profile.
 
 Every client context carries the `jail_id` it was minted for. All contexts with the same `jail_id` on a device share one accounting record.
 
@@ -369,6 +383,7 @@ A bind operation is async by default. The caller provides an output syncobj+valu
 - `MAP` does not overlap an existing mapping in this VM (`EEXIST`); replacing a mapping is `REMAP`, which is explicit.
 - `UNMAP`/`REMAP` cover exactly existing mappings (no partial unmaps in V1; `EINVAL`).
 - `va == 0` on `MAP` allocates from the VM's VA arena (§5.3 allocator rule) and returns the VA in the op.
+- *2.3, GPU W^X:* PTEs are executable only for a `MAP`/`REMAP` with `ATRIUM_GPU_BIND_EXEC`, and `BIND_EXEC` requires `BIND_READ_ONLY` (`EINVAL` otherwise). So no binding is both GPU-writable and GPU-executable, in any VM. Shader code, and command buffers the hardware fetches as instructions (on gfx12 the CP's ring fetch is an execute access), are bound `READ_ONLY | EXEC`; everything a dispatch may write is bound without `EXEC`. Kernel-owned pages in a client VM follow the same rule: the kernel-mediated ring is `READ | EXEC`; pages the CP writes (EOP buffer, writeback) are bound without `EXEC` unless silicon shows a fetch needs it, in which case the driver documents the exception at the mapping. `BIND_FEATURES` reports `BIND_FEAT_EXEC` once the driver honours this.
 
 Unmapped VA and the BO's binding reference are released only after the VM's in-flight work has retired (§5.11), so a running submission never sees its translation pulled away or reused.
 
@@ -518,6 +533,8 @@ The `share_fd` is what travels across processes via `SCM_RIGHTS`. The compositor
 ### 5.9 User-mode queues (direct doorbell submission)
 
 `SUBMIT` (§5.7) is the baseline: one ioctl per submission. On hardware with firmware-scheduled user-mode queues (AMD MES on GFX11/GFX12, Intel GuC, Apple ASC), userspace can instead ring a hardware doorbell directly and skip the syscall on the submit hot path. It is advertised by the `USER_QUEUE` bit of `SUBMIT_FEATURES` **and** requires the client context to have been minted with `ATRIUM_GPU_CLIENT_ALLOW_USER_QUEUES` (§4.1); otherwise the ioctls below return `ENOTSUP` or `EPERM` and userspace uses §5.7. Because apps hold no client fd in production (§4.1), in production this is a broker-internal fast path.
+
+*2.3:* in the node-based profile (§4.1) there is no minted flag, so `QUEUE_CREATE` with `USER_MODE` requires `PRIV_DRIVER` (host root; jailed root is refused). A user-mode queue's holder writes its own ring, which gives up the "broker writes every packet" property of the app path (`gpu-app-path-f6.md`). So a user-mode queue is never handed to an app or a per-client renderer, and frescod (non-root) gets one only after that is decided for its own trusted renderer. Kernel-mediated queue fds (§5.7) are the production path.
 
 A user-mode queue is requested at creation (`ATRIUM_GPU_QUEUE_CREATE` with `flags |= ATRIUM_GPU_QUEUE_FLAG_USER_MODE`) and then mapped:
 
@@ -1077,26 +1094,27 @@ External review (FreeBSD `freebsd-arch@`, other BSDs, Mesa winsys authors) is wo
 
 ---
 
-## 18. Implementation status against 2.1 (as of 2026-11-03)
+## 18. Implementation status (updated 2026-11-13, 2.3)
 
-`atrium-gpu-amd` implements the intermediate ABI described in the Status note. The gap to 2.1, with evidence, is in [`../reviews/2026-11-03-gpu-kernel-and-tier2-review.md`](../reviews/2026-11-03-gpu-kernel-and-tier2-review.md) §A. In order of what to do first:
+`atrium-gpu-amd` on gpusim and on the R9700 (stages 3 to 5f, `r9700-bare-metal.md` §5). The 2026-11-03 gap list ([`../reviews/2026-11-03-gpu-kernel-and-tier2-review.md`](../reviews/2026-11-03-gpu-kernel-and-tier2-review.md) §A) is closed except where noted; the mechanisms are in `atrium-gpu-amd/ISOLATION.md`, the security picture in [`gpu-security-model.md`](gpu-security-model.md).
 
-| 2.1 requirement | `atrium-gpu-amd` today | Section |
+| Requirement | `atrium-gpu-amd` | Section |
 |---|---|---|
-| Per-queue state, own ring, own lock | Every submit reprograms shared GFX queue 0 / compute queue 1, unlocked | §5.5 |
-| Deferred free | BO, VA and page tables freed while work may be in flight | §5.11 |
-| Doorbell mapped per queue, revocable | `mmap` of any doorbell-BAR offset from the device fd | §5.9 |
-| Scanout by object | Raw `{vram_offset, size}` written to scanout registers | §7 |
-| Control/client split | Reset, scheduler and power gating callable by any opener | §4.1, §5.10 |
-| Per-queue fence retirement | Global FIFO popped by completion count; drops beyond 16 pending | §5.7 |
-| Syncobj error state, interruptible 64-bit waits | Uninterruptible tick-based waits; reset clears pending without signalling | §5.6, §10 |
-| Validated `VM_BIND` | User VA unchecked, no overlap check | §5.4 |
-| Real allocators | VRAM bump allocator; 32 MiB VA per VM | §5.3 |
-| `struct_size`, `int32_t` fds | Missing / `uint32_t` | §8 |
-| Per-jail quota | None | §4.2 |
-| Watchdog, escalation ladder, reset budget, display hold-last-frame | No watchdog; reset clears pending work without signalling; no display reset handling | §10.1–10.3 |
-| Fuzz and isolation tests (§10.5) | None; `test_gpu_isolation.c` does not exist | §10.5 |
-| Real-silicon backend | Firmware load, MES, VM context and display programmed through gpusim-only registers | review §A5 |
+| Queue objects as fds, per-queue fences, kqueue completion | done: `QUEUE_CREATE` on a VM fd, `QUEUE_SUBMIT` on the queue fd; MES user queues on silicon, queue fds on gpusim; the v1 ring `SUBMIT` is retired | §5.5, §5.7 |
+| Deferred free / free rule | done: BO frees wait for queue drain (gpusim) or one MES preemption of the VM's queues (silicon), never a client-writable fence | §5.11 |
+| Revocable per-queue doorbells, user-mode queues | done; `USER_MODE` host-root-only (§5.9, 2.3) | §5.9 |
+| Scanout by BO fd, display lease | done | §7 |
+| Authority split | node-based profile (§4.1); **open:** per-call `PRIV_DRIVER` check on the control node (today a passed control fd keeps its authority). Minted profile (`CLIENT_OPEN`, `SET_QUOTA`, `QUERY_USAGE`) not implemented | §4.1 |
+| Accounting | per-uid VRAM and System caps (`EDQUOT`); **open:** cap on live queues per uid; VA, VM, syncobj and in-flight caps | §4.2 |
+| Validated `VM_BIND`, `vmem` VA arena, read-only binds | done (ABI rev 3) | §5.4 |
+| GPU W^X (`BIND_EXEC`) | **open:** client binds on silicon are always executable | §5.4 |
+| Syncobj error state, interruptible waits | done | §5.6 |
+| Watchdog, per-queue loss on fault or hang, reset | done; last rung mode 1 reset with bus mastering off | §10 |
+| VRAM allocator with scrub-before-reuse | done (gpusim and silicon) | §5.3 |
+| CPU mapping of BOs (`BO_MMAP_INFO`) | not implemented: BO contents move by `BO_READ`/`BO_WRITE` copies; queue-fd mappings (ring, writeback, doorbell) only | §5.3 |
+| Sealed BOs | not implemented | §5.13 |
+| Cross-device `share_fd`, telemetry ioctl, perf counters | not implemented | §5.8, §5.10, §5.15 |
+| Isolation test, fuzz gate | `test_gpu_isolation` and `atrium_gpu_test` pass on gpusim on queue fds (5f); not yet on silicon; the 24 h fuzz gate has not run at an attested commit, so the jaild stanza stays `experimental` | §10.5 |
 
 ---
 

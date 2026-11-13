@@ -568,7 +568,12 @@ mod tests {
 
         // Sanity-check a few fields that V7 / D2 directly depend on.
         assert!(!p.mount_sources.ro_paths.is_empty());
-        assert!(p.devfs_rulesets.allowed.contains(&"atrium-gpu".to_string()));
+        // The GPU client node is reachable only through frescod's pinned
+        // ruleset (gpu-security-model.md §2): the unpinned atrium-gpu ruleset
+        // is not on the allow-list.
+        assert!(!p.devfs_rulesets.allowed.contains(&"atrium-gpu".to_string()));
+        assert!(!p.devfs_rulesets.allowed_ids.contains(&21));
+        assert!(p.devfs_rulesets.pin(23).is_some());
         assert!(p.exec_paths.allowed_prefixes.iter()
             .any(|s| s.starts_with("/usr/local/bin/atrium-")));
 
@@ -588,8 +593,8 @@ mod tests {
 
         let virtio = p.gpu_drivers.attested.get("atrium-virtio-gpu")
             .expect("attested atrium-virtio-gpu missing");
-        assert_eq!(virtio.status, GpuDriverStatus::Production);
-        assert!(virtio.isolation_test_passed);
+        // Legacy D0 path, never attested at a real commit: not grantable.
+        assert_eq!(virtio.status, GpuDriverStatus::Experimental);
     }
 
     /// The resource-control broker ceiling is optional and defaults OFF: an
