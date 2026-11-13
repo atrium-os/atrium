@@ -61,12 +61,17 @@ impl Pending {
 /// Whether the first display would size `<img>` `h` with no fetch at all
 /// (both `width` and `height` given): the rule `collect_first` applies, and
 /// the one the converter's header hints follow.
-/// An `<img>` that declares both dimensions at most 1 px: a tracking
-/// pixel. Never fetched. (A HIDDEN image is still fetched: a carousel's
-/// later slides are hidden inline and shown by a recorded transition.)
+/// A tracking pixel: an `<img>` that declares both dimensions at most 1 px,
+/// or carries the `hidden` attribute itself (old.reddit's is
+/// `<img src="https://id.rlcdn.com/…gif" hidden>`). Never fetched.
+/// Subresources are collected from the document AFTER its scripts ran, so
+/// an image a script revealed has lost its `hidden` by then. An image
+/// hidden by CSS or inside a hidden container is still fetched: that is
+/// how a carousel's later slides are hidden until a transition shows them.
 pub fn invisible_img(dom: &Dom, h: navigator_dom::Handle) -> bool {
     let declared = |n: &str| dom.attr(h, n).and_then(|v| v.trim().trim_end_matches("px").parse::<u32>().ok());
-    matches!((declared("width"), declared("height")), (Some(w), Some(ht)) if w <= 1 && ht <= 1)
+    dom.attr(h, "hidden").is_some()
+        || matches!((declared("width"), declared("height")), (Some(w), Some(ht)) if w <= 1 && ht <= 1)
 }
 
 pub fn declares_size(dom: &Dom, h: navigator_dom::Handle) -> bool {
@@ -364,7 +369,7 @@ fn collect_inner(dom: &Dom, base: Option<&str>, fetcher: &mut dyn Fetcher, mode:
         let declared = |n: &str| dom.attr(h, n).and_then(|v| v.trim().parse::<u32>().ok());
         let Some(abs) = resolve(&src) else { out.failed.push((src, "cannot resolve".into())); continue };
         // ★ A PIXEL IS NEVER FETCHED (navigator-ui §6.6): an image that
-        // declares itself at most 1 × 1 shows nothing a reader could see, so
+        // declares itself at most 1 × 1, or is `hidden` itself, shows nothing a reader could see, so
         // its only effect would be telling its host a conversion happened.
         // It keeps its declared size, with no bytes. Structural, like
         // §5.4.1f's script rule: no host list.
