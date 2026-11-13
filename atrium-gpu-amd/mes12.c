@@ -2536,6 +2536,31 @@ amd_mes12_uq_hqd_vmid(struct amd_uq *q)
 	return (uq2_hqd_find(q->m, q->db, &vmid) ? vmid : 0);
 }
 
+/*
+ * Box runs fc80fbea, b4d6e8f9: a GRBM-selected scan of the compute HQDs
+ * while MES is busy scheduling left the GFXHUB L2 busy for good (CPF bit
+ * 28, no invalidation acked): the wedge after a hostile shader's fault.
+ * MES owns those HQDs; amdgpu does not read them by MMIO while MES runs.
+ * So on a fault, find the queue's VMID from the hub instead: the faulting
+ * VMIDs whose context page-table base MES set to this queue's VM.
+ * Returns 0 if none matches (the caller then falls back to the scan).
+ */
+u_int
+amd_mes12_uq_vmid_by_base(struct amd_uq *q, uint32_t vmids)
+{
+	uint64_t want = amd_gmc12_vm_pd_addr(q->vm) & ~0xfffull, have;
+	u_int vmid;
+
+	for (vmid = 8; vmid < 16; vmid++) {
+		if ((vmids & (1u << vmid)) == 0)
+			continue;
+		have = amd_gmc12_ctx_pt_base(q->m->gt, vmid);
+		if ((have & ~0xfffull) == want)
+			return (vmid);
+	}
+	return (0);
+}
+
 /* The IH found this queue on `vmid` at its fault (si_uq_faulted). */
 void
 amd_mes12_uq_note_fault(struct amd_uq *q, u_int vmid)
@@ -2856,19 +2881,27 @@ amd_mes12_uq_preempt(struct amd_uq *q)
 	return (err);
 }
 
-void
-amd_mes12_uq_report(struct amd_uq *q, const char *when)
+static void
+uq_report(struct amd_uq *q, const char *when, bool scan)
 {
 	volatile uint32_t *wb = (volatile uint32_t *)(q->pg + UQ2_WB);
 	u_int vmid = 0;
-	bool on;
+	bool on = false;
 
-	on = uq2_hqd_find(q->m, q->db, &vmid);
+	if (scan)
+		on = uq2_hqd_find(q->m, q->db, &vmid);
 	device_printf(q->m->sc->dev, "uq%u: %s: seq %u, fence %u, wptr %ju%s, "
 	    "rptr report %#x; HQD %s (VMID %u)\n", q->slot, when, q->seq,
 	    wb[4], q->user ? (uintmax_t)*(volatile uint64_t *)(wb + 2) :
 	    (uintmax_t)q->wptr, q->user ? " (client's)" : "", wb[0],
-	    on ? "active" : "not mapped", vmid);
+	    !scan ? "not looked up (MES owns it)" : on ? "active" :
+	    "not mapped", vmid);
+}
+
+void
+amd_mes12_uq_report(struct amd_uq *q, const char *when)
+{
+	uq_report(q, when, true);
 }
 
 /*
@@ -3104,7 +3137,7 @@ amd_mes12_uq_evict(struct amd_uq *q)
 	int err;
 
 	if (q->added && !uq2_done(q)) {
-		amd_mes12_uq_report(q, "destroy: work in flight");
+		uq_report(q, "destroy: work in flight", q->fault_vmid < 8);
 		amd_gmc12_l2_note(m->gt, "evict: after the queue report");
 		/*
 		 * Run fc80fbea: test 15's GFXHUB L2 went busy for good (and

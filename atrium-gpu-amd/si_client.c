@@ -232,7 +232,15 @@ si_uq_faulted(struct amd_si_client *c, uint32_t vmids, bool log)
 		u = &c->uq[i];
 		if (u->hw == NULL || u->dead)
 			continue;
-		vmid = amd_mes12_uq_hqd_vmid(u->hw);
+		/* By the hub's context base, not an HQD scan (that wedged
+		 * the GFXHUB with MES busy: amd_mes12_uq_vmid_by_base). */
+		vmid = amd_mes12_uq_vmid_by_base(u->hw, vmids);
+		if (vmid == 0) {
+			vmid = amd_mes12_uq_hqd_vmid(u->hw);
+			if (vmid >= 8 && (vmids & (1u << vmid)) != 0)
+				device_printf(c->sc->dev, "si: uq%u: VMID %u "
+				    "found only by an HQD scan\n", i, vmid);
+		}
 		if (vmid < 8 || (vmids & (1u << vmid)) == 0)
 			continue;
 		amd_mes12_uq_note_fault(u->hw, vmid);

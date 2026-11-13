@@ -847,6 +847,21 @@ amd_gmc12_vm_fini(struct amd_vm12 *vm)
 	vm->live = false;
 }
 
+/*
+ * The page-table base MES programmed for GFXHUB context `vmid` (plain
+ * hub registers, no GRBM select): which VM a faulting VMID belongs to.
+ */
+uint64_t
+amd_gmc12_ctx_pt_base(struct amd_gart *gt, u_int vmid)
+{
+	struct hub h;
+
+	if (vmid >= NUM_CTX || !hub_open(gt->sc, true, &h))
+		return (0);
+	return ((uint64_t)hr(&h, h.g->ctx0_pt_base_hi + 2 * vmid) << 32 |
+	    hr(&h, h.g->ctx0_pt_base_lo + 2 * vmid));
+}
+
 /* Context base for this VM: table 0's address and flags. */
 uint64_t
 amd_gmc12_vm_pd_addr(struct amd_vm12 *vm)

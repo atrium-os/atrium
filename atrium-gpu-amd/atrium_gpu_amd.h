@@ -884,6 +884,7 @@ struct amd_vm12 {
 int	amd_gmc12_vm_init(struct amd_gart *gt, struct amd_vm12 *vm, int mode,
 	    uint64_t flat_va);
 void	amd_gmc12_vm_fini(struct amd_vm12 *vm);
+uint64_t amd_gmc12_ctx_pt_base(struct amd_gart *gt, u_int vmid);
 uint64_t amd_gmc12_vm_pd_addr(struct amd_vm12 *vm);
 int	amd_gmc12_vm_map(struct amd_vm12 *vm, uint64_t va, vm_paddr_t pa,
 	    u_int prot);
@@ -967,6 +968,7 @@ int	amd_mes12_uq_submit(struct amd_uq *q, uint64_t ib, uint32_t ib_dw,
 uint32_t amd_mes12_uq_fence(struct amd_uq *q);
 uint32_t amd_mes12_uq_doorbell(struct amd_uq *q);
 uint32_t amd_mes12_uq_seq(struct amd_uq *q);
+u_int	amd_mes12_uq_vmid_by_base(struct amd_uq *q, uint32_t vmids);
 void	amd_mes12_uq_note_fault(struct amd_uq *q, u_int vmid);
 u_int	amd_mes12_uq_hqd_vmid(struct amd_uq *q);
 bool	amd_mes12_uq_hqd_where(struct amd_uq *q, u_int *pipe, u_int *queue);
