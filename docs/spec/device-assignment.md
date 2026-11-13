@@ -1,6 +1,6 @@
 # Device discovery, driver matching and driver start
 
-**Status:** proposal, 2026-11-13. Decisions in §8 are open.
+**Status:** accepted 2026-11-13 (Shankar: all §8 decisions as recommended, the agent a separate daemon, Dispensator).
 **Scope:** how Atrium finds hardware, decides who drives each device (a kernel
 module or a jailed user-space driver), starts and stops that driver, and loads
 firmware. It gathers what Sigillum, Tactus, Vinculum, Lyra and the GPU driver
@@ -203,7 +203,7 @@ apply` on other jails' mounts, and jaild requests with device grants. Its
 input is the kernel's own strings, parsed by `atrium-devevents`; it never
 reads device bytes (descriptors are parsed by the kernel or by the jailed
 driver). Recommendation: lift portcullisd's `identity_devices.rs` into its own
-small daemon so the app-launch broker does not also hold device power, and
+small daemon (accepted: `dispensatord`) so the app-launch broker does not also hold device power, and
 so its crash or restart does not cost app launches (decision 2).
 
 ## 5. How existing work maps onto it
@@ -248,6 +248,8 @@ so its crash or restart does not cost app launches (decision 2).
   agent), but devd is small, its input is the kernel's, and nothing needs it.
 
 ## 8. Decisions
+
+**Accepted by Shankar, 2026-11-13: all nine, as recommended.**
 
 1. **Keep FreeBSD's kernel matching (newbus, PNP_INFO, devmatch, devd) and
    add only the policy layer above it.** *Recommend yes.*
