@@ -45,8 +45,13 @@ pub enum ToChild {
     SetTheme { dark: bool },
     ScrollTo { anchor: String },
     /// The Navigator's page: redeem `ticket` on navigatord's page socket
-    /// for the recording and its address.
-    Open { ticket: [u8; 16], dark: bool },
+    /// for the recording and its address, and show it scrolled to `scroll`
+    /// px from the top (a parked page coming back where it was).
+    Open { ticket: [u8; 16], dark: bool, scroll: f32 },
+    /// The parent is about to close this child (the page is being parked,
+    /// navigator-ui.md §4.4): answer `Parked` with what it needs to bring
+    /// the page back as it was.
+    Park,
 }
 
 /// Child to parent.
@@ -62,6 +67,8 @@ pub enum ToParent {
     /// or none (advisory, for the status bar; navigator-ui.md §5.7).
     LinkHover { url: Option<String> },
     Error { code: u16 },
+    /// The answer to `Park`: how far down the page is scrolled, in px.
+    Parked { scroll: f32 },
 }
 
 /// `Error` codes.
@@ -78,6 +85,13 @@ fn clean_text(s: &str, max: usize) -> bool {
     s.len() <= max && !s.chars().any(char::is_control)
 }
 
+/// Largest scroll offset either side sends (px).
+pub const SCROLL_MAX: f32 = 1.0e7;
+
+fn scroll_ok(y: f32) -> bool {
+    y.is_finite() && (0.0..=SCROLL_MAX).contains(&y)
+}
+
 impl ToChild {
     pub fn decode(b: &[u8]) -> Option<Self> {
         let m: Self = postcard::from_bytes(b).ok()?;
@@ -85,7 +99,8 @@ impl ToChild {
             ToChild::Load { base, .. } => clean_text(base, URL_MAX),
             ToChild::SetTheme { .. } => true,
             ToChild::ScrollTo { anchor } => clean_text(anchor, ANCHOR_MAX),
-            ToChild::Open { .. } => true,
+            ToChild::Open { scroll, .. } => scroll_ok(*scroll),
+            ToChild::Park => true,
         };
         ok.then_some(m)
     }
@@ -105,6 +120,7 @@ impl ToParent {
             ToParent::LinkActivated { url } => !url.is_empty() && clean_text(url, URL_MAX),
             ToParent::LinkHover { url } => url.as_ref().is_none_or(|u| clean_text(u, URL_MAX)),
             ToParent::Error { .. } => true,
+            ToParent::Parked { scroll } => scroll_ok(*scroll),
         };
         ok.then_some(m)
     }
@@ -138,7 +154,8 @@ mod tests {
             ToChild::Load { kind: DocKind::Recording, base: "https://atlas.example/wiki/A".into(), dark: false },
             ToChild::SetTheme { dark: true },
             ToChild::ScrollTo { anchor: "plan".into() },
-            ToChild::Open { ticket: [7; 16], dark: true },
+            ToChild::Open { ticket: [7; 16], dark: true, scroll: 240.0 },
+            ToChild::Park,
         ] {
             assert_eq!(ToChild::decode(&m.encode()), Some(m));
         }
@@ -147,6 +164,7 @@ mod tests {
             ToParent::LinkActivated { url: "https://atlas.example/wiki/B".into() },
             ToParent::LinkHover { url: None },
             ToParent::Error { code: error::UNREADABLE },
+            ToParent::Parked { scroll: 0.0 },
         ] {
             assert_eq!(ToParent::decode(&m.encode()), Some(m));
         }
@@ -154,6 +172,10 @@ mod tests {
         assert_eq!(ToParent::decode(&ToParent::LinkActivated { url: String::new() }.encode()), None);
         assert_eq!(ToParent::decode(&ToParent::LinkActivated { url: "a\nb".into() }.encode()), None);
         assert_eq!(ToParent::decode(&[0xff, 0x00]), None);
+        for y in [f32::NAN, f32::INFINITY, -1.0, SCROLL_MAX * 2.0] {
+            assert_eq!(ToParent::decode(&ToParent::Parked { scroll: y }.encode()), None);
+            assert_eq!(ToChild::decode(&ToChild::Open { ticket: [0; 16], dark: false, scroll: y }.encode()), None);
+        }
         assert_eq!(cut("héllo", 2), "h");
     }
 }

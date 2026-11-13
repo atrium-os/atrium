@@ -132,9 +132,12 @@ window (pergola.md §10).
 | parent → child | `Load` | `doc: DocRef` (a Tabula-style blob the parent uploaded, or a URL the child fetches through its own jailed fetcher), `theme` |
 | parent → child | `SetTheme` | `theme` |
 | parent → child | `ScrollTo` | `anchor: String` |
+| parent → child | `Open` | the Navigator's page: `ticket: [u8; 16]` redeemed on navigatord's page socket, `dark`, `scroll: f32` (px from the top, at most 10⁷; a parked page coming back where it was) |
+| parent → child | `Park` | the parent will close the child (navigator-ui.md §4.4); answered by `Parked` |
 | child → parent | `Loaded` | `title: String` (at most 256 bytes), `anchors: Vec<String>` (at most 256 of them) |
 | child → parent | `LinkActivated` | `url: String`. Only after a press in the child; the parent decides whether to open it |
 | child → parent | `Error` | `code: u16` |
+| child → parent | `Parked` | `scroll: f32`, how far down the page is (finite, 0 to 10⁷). Only a number: the page's state that comes back is its address, kept by navigatord, and this offset |
 | child → parent | `Embeds` | `list: Vec<{ key: u64, rect: Option<[x, y, w, h]>, role: String, src: EmbedSrc }>`, every embed the child has in view, `rect` in the child's window px (`None`: scrolled partly or wholly out). At most 64. Sent when the list or a rect changes, after the frame that shows it |
 
 The child never sends the parent document text.
@@ -283,6 +286,7 @@ user choose a target app, which receives it.
 | child → parent | `Completed` | `receipt: { reference, method, at, signature }` |
 | child → parent | `Cancelled` | none |
 | child → parent | `Error` | `code: u16` |
+| child → parent | `Parked` | `scroll: f32`, how far down the page is (finite, 0 to 10⁷). Only a number: the page's state that comes back is its address, kept by navigatord, and this offset |
 
 Card numbers and account details stay between the user and the child. The parent gets a
 receipt. The slot is a `credential` kind, so the press that pays has the same visibility

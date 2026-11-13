@@ -116,7 +116,7 @@ struct Run {
 }
 
 impl Run {
-    fn load(&mut self, out: &mut dyn Out, kind: DocKind, base: String, dark: bool, bytes: Result<Vec<u8>, u16>) {
+    fn load(&mut self, out: &mut dyn Out, kind: DocKind, base: String, dark: bool, scroll: f32, bytes: Result<Vec<u8>, u16>) {
         let prepared = match bytes.and_then(|b| prepare(kind, &b)) {
             Ok(p) => Rc::new(p),
             Err(code) => return out.send(ToParent::Error { code }),
@@ -124,9 +124,14 @@ impl Run {
         let t = Instant::now();
         match lay_out(prepared.clone(), base, dark, self.view.size.get()) {
             Ok(p) => {
+                // A parked page comes back where it was; the scroll view
+                // clamps it to the page as laid out.
                 let mut st = ScrollState::default();
-                st.physics.y = 0.0;
+                st.physics.y = scroll as f64;
                 self.view.scroll.set(st);
+                if scroll > 0.0 {
+                    eprintln!("navigator-page: opened at y={scroll:.0}");
+                }
                 self.view.page.set(Some(Rc::new(p)));
                 eprintln!("navigator-page: laid out in {:.0} ms", t.elapsed().as_secs_f64() * 1e3);
                 out.send(ToParent::Loaded { title: prepared.title.clone(), anchors: prepared.anchors.clone() });
@@ -219,7 +224,7 @@ fn standalone(path: &str, kind: DocKind, dark: bool) {
     let mut run = Run { view, hover: None };
     let bytes = std::fs::File::open(path).map_err(|_| error::NO_DOCUMENT).and_then(read_bounded);
     let base = std::env::var("NAVIGATOR_PAGE_BASE").unwrap_or_else(|_| "https://a.test/".into());
-    run.load(&mut LogOut, kind, base, dark, bytes);
+    run.load(&mut LogOut, kind, base, dark, 0.0, bytes);
     loop {
         match window.step(&mut app, Some(TICK)) {
             Ok(StepResult::Event(ev)) => run.window_event(&mut LogOut, &ev),
@@ -275,10 +280,16 @@ fn embedded() {
                     Some(ToChild::SetTheme { dark }) => run.relayout(Some(dark)),
                     Some(ToChild::ScrollTo { .. }) => {} // anchors scroll in a later step
                     Some(ToChild::Load { .. }) => out.send(ToParent::Error { code: error::NO_DOCUMENT }),
-                    Some(ToChild::Open { ticket, dark }) => {
+                    Some(ToChild::Park) => {
+                        let y = run.view.scroll.get_cloned().physics.y as f32;
+                        let y = if y.is_finite() { y.clamp(0.0, limen::doc_viewer::SCROLL_MAX) } else { 0.0 };
+                        eprintln!("navigator-page: parked at y={y:.0}");
+                        out.send(ToParent::Parked { scroll: y });
+                    }
+                    Some(ToChild::Open { ticket, dark, scroll }) => {
                         let path = std::env::var("NAVIGATOR_PAGE_SOCKET").unwrap_or_else(|_| PAGE_SOCKET.into());
                         match navigator_control::redeem(&path, &ticket) {
-                            Ok((base, bytes)) => run.load(&mut out, DocKind::Recording, base, dark, Ok(bytes)),
+                            Ok((base, bytes)) => run.load(&mut out, DocKind::Recording, base, dark, scroll, Ok(bytes)),
                             Err(e) => {
                                 eprintln!("navigator-page: redeem: {e}");
                                 out.send(ToParent::Error { code: error::NO_DOCUMENT });
@@ -292,7 +303,7 @@ fn embedded() {
                     match ToChild::decode(&bytes) {
                         Some(ToChild::Load { kind, base, dark }) => {
                             let b = fd.map(std::fs::File::from).ok_or(error::NO_DOCUMENT).and_then(read_bounded);
-                            run.load(&mut out, kind, base, dark, b);
+                            run.load(&mut out, kind, base, dark, 0.0, b);
                         }
                         _ => eprintln!("navigator-page: dropped a descriptor"),
                     }

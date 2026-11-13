@@ -9,7 +9,7 @@ use pergola::{Key, Modifiers, Rect};
 
 use crate::fake::{self, Link};
 use crate::keys::Action;
-use crate::trail::{Asked, Facts, Light, Media, PageSpec, Prompt, TrailStore, PROMPT_STILL_MS};
+use crate::trail::{Asked, Facts, Light, Media, PageId, PageSpec, Prompt, TrailStore, PROMPT_STILL_MS};
 use crate::where_field::{self, Entry, Source, Suggestion};
 
 /// Rail width, wide and collapsed (§5.2; collapsed = Forum's dock rail).
@@ -124,8 +124,15 @@ impl Shell {
         self.store.trail().page().map(|p| p.url.clone())
     }
 
-    /// navigatord opened `asked` (as `url`, after any redirect).
-    pub fn opened(&mut self, asked: &str, url: &str, title: &str, insecure: bool) {
+    /// The page on screen as (its trail's id, its id in the trail).
+    pub fn shown_key(&self) -> Option<(u64, PageId)> {
+        let t = self.store.trail();
+        t.current.map(|c| (t.id, c))
+    }
+
+    /// navigatord opened `asked` (as `url`, after any redirect) for the
+    /// page `key`, as the version at `saved`.
+    pub fn opened(&mut self, key: (u64, PageId), asked: &str, url: &str, title: &str, insecure: bool, saved: &str) {
         for t in &mut self.store.trails {
             for p in t.pages.iter_mut().filter(|p| p.url == asked) {
                 p.url = url.to_string();
@@ -137,7 +144,9 @@ impl Shell {
                 p.facts = p.facts.clone().settle();
             }
         }
-        self.live = Some(LivePage::Shown(url.into()));
+        if let Some(p) = self.store.page_by_key_mut(key.0, key.1) {
+            p.saved = navigator_control::is_address(saved).then(|| saved.to_string());
+        }
     }
 
     /// A link pressed in the live page: navigatord decides what it does.
@@ -510,9 +519,12 @@ mod tests {
         assert_eq!(s.store.trail().page().unwrap().title, "atlas.example", "the host until navigatord names it");
         assert_eq!(s.store.trail().page().unwrap().facts.light, Light::Amber, "http is not private");
         // Redirected to https, and named.
-        s.opened("http://atlas.example/wiki/Atrium", "https://atlas.example/wiki/Atrium", "Atrium", false);
+        let key = s.shown_key().unwrap();
+        let saved = "0f".repeat(32);
+        s.opened(key, "http://atlas.example/wiki/Atrium", "https://atlas.example/wiki/Atrium", "Atrium", false, &saved);
         let p = s.store.trail().page().unwrap();
         assert_eq!((p.url.as_str(), p.title.as_str(), p.facts.light), ("https://atlas.example/wiki/Atrium", "Atrium", Light::Green));
+        assert_eq!(p.saved.as_deref(), Some(saved.as_str()), "the version navigatord keeps, for parking");
         // A press in the page goes to navigatord; its answer moves the trail.
         s.link_pressed("/wiki/Impluvium");
         assert_eq!(s.outbox, vec![Out::Activate { page: "https://atlas.example/wiki/Atrium".into(), href: "/wiki/Impluvium".into(), beside: false }]);

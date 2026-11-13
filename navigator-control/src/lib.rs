@@ -42,7 +42,17 @@ pub enum Request {
     Window { window: u32 },
     /// Fetch and convert the page at `url` (or take it from the cache) and
     /// show its origin. Answered by `Opened` or `Failed` with the same `id`.
-    Open { id: u32, url: String },
+    /// `saved`: the address an earlier `Opened` gave for this page (a
+    /// parked page, navigator-ui.md §4.4): navigatord reopens that version
+    /// from its store if it holds it and it is the page at `url`, else it
+    /// fetches as usual.
+    /// `unrecorded`: the page is in an Unrecorded trail (§2.4): its
+    /// version is kept in memory only, never written.
+    Open { id: u32, url: String, saved: Option<String>, unrecorded: bool },
+    /// The UI shows a page it already has live (a page child it kept):
+    /// name its origin in the strip. Only a page navigatord opened for
+    /// this UI is named; anything else blanks the strip.
+    Show { url: String },
     /// What activating `href` in the page at `page` does. Answered by
     /// `Link` with the same `id`.
     Activate { id: u32, page: String, href: String },
@@ -65,9 +75,28 @@ pub enum Event {
     /// The answer to `Hello`. With `fd`, a descriptor follows: the UI's
     /// frescod connection.
     Chrome { fd: bool },
-    Opened { id: u32, url: String, title: String, insecure: bool, ticket: Ticket, ms: u32 },
+    /// `saved`: the store address of this version of the page, for the
+    /// UI's trail record; `from`: where it came from.
+    Opened { id: u32, url: String, title: String, insecure: bool, ticket: Ticket, ms: u32, saved: String, from: Source },
     Failed { id: u32, url: String, why: String },
     Link { id: u32, action: LinkAction },
+}
+
+/// Where an opened page came from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Source {
+    /// Fetched and converted now.
+    Fetched,
+    /// navigatord's in-memory cache of recent pages.
+    Cache,
+    /// navigatord's store, by the saved address (a parked page).
+    Store,
+}
+
+/// A store address as navigatord gives them: 64 lowercase hex digits
+/// (BLAKE3).
+pub fn is_address(s: &str) -> bool {
+    s.len() == 64 && s.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
 }
 
 /// What a ticket redeems for on the page socket.
@@ -151,7 +180,8 @@ mod tests {
     #[test]
     fn frames_round_trip_and_bounds_hold() {
         let mut buf = Vec::new();
-        let m = Request::Open { id: 7, url: "https://atlas.example/".into() };
+        let m = Request::Open { id: 7, url: "https://atlas.example/".into(), saved: Some("ab".repeat(32)), unrecorded: false };
+        assert!(is_address(&"ab".repeat(32)) && !is_address("AB") && !is_address(&"g".repeat(64)));
         write_frame(&mut buf, &m).unwrap();
         write_frame(&mut buf, &Event::Link { id: 7, action: LinkAction::InDocument { fragment: "a".into() } }).unwrap();
         let mut r = &buf[..];

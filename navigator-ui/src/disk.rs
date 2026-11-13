@@ -68,7 +68,15 @@ struct PageRec {
     parent: Option<usize>,
     #[serde(default = "yes")]
     seen: bool,
+    /// navigatord's store address for the version last shown.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    saved: Option<String>,
+    /// Where it was scrolled to when parked (px).
+    #[serde(default, skip_serializing_if = "is_zero")]
+    scroll: f32,
 }
+
+fn is_zero(y: &f32) -> bool { *y == 0.0 }
 
 fn yes() -> bool { true }
 
@@ -110,7 +118,7 @@ fn cut(s: &str, max: usize) -> String {
 
 fn trail_rec(t: &Trail) -> TrailRec {
     TrailRec {
-        pages: t.pages.iter().map(|p| PageRec { url: p.url.clone(), title: cut(&p.title, MAX_TITLE), search: p.search.clone(), parent: p.parent, seen: p.seen }).collect(),
+        pages: t.pages.iter().map(|p| PageRec { url: p.url.clone(), title: cut(&p.title, MAX_TITLE), search: p.search.clone(), parent: p.parent, seen: p.seen, saved: p.saved.clone(), scroll: p.scroll }).collect(),
         current: t.current,
         muted: t.muted,
         active: t.active,
@@ -133,6 +141,10 @@ fn trail_of(r: TrailRec, facts: &dyn Fn(&str) -> Facts) -> Result<Trail, String>
         if p.search.as_ref().is_some_and(|q| !clean(q, MAX_URL)) {
             return Err(format!("page {i}: a bad search"));
         }
+        // A bad address or offset only loses the parked version: the page
+        // is fetched again, from the top.
+        let saved = p.saved.filter(|a| navigator_control::is_address(a));
+        let scroll = if p.scroll.is_finite() { p.scroll.clamp(0.0, 1.0e7) } else { 0.0 };
         t.pages.push(Page {
             facts: facts(&p.url),
             url: p.url,
@@ -143,6 +155,8 @@ fn trail_of(r: TrailRec, facts: &dyn Fn(&str) -> Facts) -> Result<Trail, String>
             seen: p.seen,
             media: Media::None,
             asked: None,
+            saved,
+            scroll,
         });
         if let Some(q) = p.parent {
             t.pages[q].children.push(i);
@@ -310,6 +324,25 @@ mod tests {
         b.select(b.trails.iter().position(|t| t.pages.len() == 3).unwrap());
         assert!(b.knows("atlas.example"));
         assert_eq!(encode(&back), text, "stable: a save after a load writes the same file");
+    }
+
+    #[test]
+    fn a_parked_page_keeps_its_version_and_place() {
+        let mut s = TrailStore::default();
+        s.follow(spec("https://a.example/"));
+        let a = "ab".repeat(32);
+        let p = s.trail_mut().page_mut().unwrap();
+        p.saved = Some(a.clone());
+        p.scroll = 240.0;
+        let (back, _) = decode(&encode(&s), &facts).unwrap();
+        let p = back.trail().page().unwrap();
+        assert_eq!((p.saved.as_deref(), p.scroll), (Some(a.as_str()), 240.0));
+        // A bad address or offset loses only the parked version.
+        let text = encode(&s).replace(&a, "../../etc/passwd").replace("240.0", "-5.0");
+        let (back, dropped) = decode(&text, &facts).unwrap();
+        assert!(dropped.is_empty());
+        let p = back.trail().page().unwrap();
+        assert_eq!((p.saved.as_deref(), p.scroll), (None, 0.0));
     }
 
     #[test]

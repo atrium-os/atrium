@@ -1,5 +1,5 @@
 #!/bin/sh
-# navigator-ui steps 2 and 3 (docs/spec/navigator-ui.md §14): one live page in the
+# navigator-ui steps 2 to 4 (docs/spec/navigator-ui.md §14): one live page in the
 # FreeBSD dev VM. Split-mode frescod with its chrome channel, forum-wm,
 # limend (limend-dev: providers started unconfined), navigatord (fixture
 # pages, the converter as an ordinary process) and navigator-ui, driven
@@ -17,7 +17,9 @@
 # navigatord, Back and Forward walk the trail, and frescod's strip names
 # the page's origin. Step 3: the trail store is written as trails change,
 # holds no page content, and brings trails and Earlier back after a
-# restart. TCG is slow: WAIT (default 90) seconds per step.
+# restart. Step 4: with a budget of one live page, a page left is parked
+# (its child closed, its scroll kept), comes back where it was, and after
+# a restart comes back from navigatord's store with no fetch. TCG is slow: WAIT (default 90) seconds per step.
 set -eu
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 OUT="${1:-$ROOT/scratch/navigator-live}"
@@ -88,8 +90,11 @@ g "pw usershow navpage >/dev/null 2>&1 || pw useradd navpage -u 50901 -d /nonexi
 g "cd $S && env LIMEN_SOCKET=$S/limend.sock LIMEN_DEV_UID=50901 LIMEN_DEFAULTS=doc-viewer=org.atrium.navigator.page \
     LIMEN_DEV_APPS=org.atrium.navigator.page=$D/navigator-page LIMEN_DEV_APP=org.atrium.navigator \
     NAVIGATOR_PAGE_SOCKET=$S/page.sock daemon -f -o $S/limend.log $D/limend-dev </dev/null"
-g "cd $S && env NAVIGATORD_SOCKET=$S/nav.sock NAVIGATORD_PAGE_SOCKET=$S/page.sock NAVIGATORD_FIXTURES=$D/fixtures \
-    NAVIGATORD_PRERENDER=$D/prerender FRESCOD_CHROME_SOCK=$S/chrome.sock daemon -f -o $S/navigatord.log $D/navigatord --unconfined-for-testing </dev/null"
+# nd [log]: navigatord, its store of opened pages in $S/store.
+nd() { g "cd $S && env NAVIGATORD_SOCKET=$S/nav.sock NAVIGATORD_PAGE_SOCKET=$S/page.sock NAVIGATORD_FIXTURES=$D/fixtures \
+    NAVIGATORD_STORE=$S/store NAVIGATORD_PRERENDER=$D/prerender FRESCOD_CHROME_SOCK=$S/chrome.sock \
+    daemon -f -o $S/${1:-navigatord}.log $D/navigatord --unconfined-for-testing </dev/null"; }
+nd
 sleep 10
 g "test -S $S/limend.sock && test -S $S/nav.sock" || { echo "ABORT: limend or navigatord did not start"; g "tail -5 $S/limend.log $S/navigatord.log"; exit 1; }
 mkdir -p "$OUT"
@@ -105,7 +110,7 @@ until_trace() { i=0; while [ $i -lt "$WAIT" ]; do last | grep -q "$1" && return 
 echo "=== drive"
 # ui [open-url] [log]: start navigator-ui on the run's trail store.
 ui() { g "cd $S && env FRESCO_SOCKET=$S/fresco.sock NAVIGATORD_SOCKET=$S/nav.sock LIMEN_SOCKET=$S/limend.sock NAVIGATOR_UI_TRACE=1 \
-    NAVIGATOR_TRAILS=$S/trails.json ${1:+NAVIGATOR_UI_OPEN=$1} daemon -f -o $S/${2:-ui}.log $D/navigator-ui --light </dev/null"; }
+    NAVIGATOR_TRAILS=$S/trails.json ${UIENV:-} ${1:+NAVIGATOR_UI_OPEN=$1} daemon -f -o $S/${2:-ui}.log $D/navigator-ui --light </dev/null"; }
 ui https://atlas.example/wiki/Atrium
 until_trace 'url=https://atlas.example/wiki/Atrium live=shown' && ok "the first page opened through navigatord" || bad "first page: $(last)"
 sleep "$GAP"
@@ -171,8 +176,47 @@ until_trace 'trails=2 earlier=0 .*url=http://old-atlas.example/ live=shown' && o
 shot live-5-restored
 g "pkill -x navigator-ui; sleep 2; true"
 
+echo "=== parking (step 4)"
+# One live page at most: every page off screen that is not the parent of
+# the page on screen is parked.
+last() { g "grep 'trace' $S/ui5.log | tail -1"; }
+UIENV=NAVIGATOR_UI_LIVE=1 ui https://atlas.example/wiki/Atrium ui5
+until_trace 'url=https://atlas.example/wiki/Atrium live=shown' || bad "parking: first page: $(last)"
+P=$(last | sed -n 's/.* page=\([0-9.]*\),\([0-9.]*\).*/\1 \2/p'); PX=${P% *}; PY=${P#* }; PX=${PX%.*}; PY=${PY%.*}
+press $((PX + 50)) $((TOP + PY + 64 + 20))
+until_trace 'url=https://atlas.example/wiki/Impluvium live=shown' || bad "parking: link: $(last)"
+g "grep -q 'parking https://atlas.example/wiki/Atrium' $S/ui5.log" && bad "the parent of the page on screen was parked" || ok "the parent of the page on screen stays live"
+# Scroll the page down, then leave it.
+inj "MOVE $((PX + 300)) $((TOP + PY + 300))"; for n in 1 2 3; do inj "SCROLL 120"; sleep 2; done; sleep "$GAP"
+press 270 $((TOP + 20))     # Back
+until_trace 'url=https://atlas.example/wiki/Atrium live=shown' || bad "parking: back: $(last)"
+g "grep -q 'showed live page https://atlas.example/wiki/Atrium' $S/ui5.log" && ok "Back to a live page swapped children (no open)" || bad "no swap: $(g "grep -v trace $S/ui5.log | tail -5")"
+sleep 5
+Y=$(g "sed -n 's|.*parked https://atlas.example/wiki/Impluvium at y=\([0-9]*\) .*|\1|p' $S/ui5.log | tail -1")
+[ -n "$Y" ] && [ "$Y" -gt 0 ] && ok "the page left was parked at y=$Y" || bad "not parked (y='$Y'): $(g "grep -v trace $S/ui5.log | tail -5")"
+key 0x4f 0x04               # Alt-Right
+until_trace 'url=https://atlas.example/wiki/Impluvium live=shown' || bad "parking: forward: $(last)"
+sleep 5
+g "grep -q 'page https://atlas.example/wiki/Impluvium .* at y=$Y)' $S/ui5.log" && g "grep -q 'navigator-page: opened at y=$Y' $S/limend.log" \
+    && ok "it came back scrolled to y=$Y" || bad "restore: $(g "grep -v trace $S/ui5.log | tail -4")"
+shot live-6-parked-and-back
+# After a restart of the UI and navigatord, with the pages' source gone:
+# the page on screen comes back from navigatord's store, not the network.
+g "pkill -x navigator-ui; pkill -x navigatord; sleep 2; mv $D/fixtures $D/fixtures.off"
+nd navigatord2
+sleep 5
+last() { g "grep 'trace' $S/ui6.log | tail -1"; }
+UIENV=NAVIGATOR_UI_LIVE=1 ui "" ui6
+until_trace 'url=https://atlas.example/wiki/Impluvium live=shown' && g "grep -q 'opened https://atlas.example/wiki/Impluvium .*Store)' $S/navigatord2.log" \
+    && ok "after a restart the parked page came back from the store (no fetch)" || bad "store: $(last); $(g "tail -3 $S/navigatord2.log")"
+g "grep -q 'brought back from the store .* at y=$Y)' $S/ui6.log" && ok "still at y=$Y" || bad "restart scroll: $(g "grep -v trace $S/ui6.log | tail -3")"
+g "mv $D/fixtures.off $D/fixtures"
+echo "--- park and restore times (TCG)"
+g "grep -hE 'showed live page|parked .* in [0-9]+ ms|page .* in [0-9]+ ms' $S/ui5.log $S/ui6.log"
+g "pkill -x navigator-ui; sleep 2; true"
+
 echo "=== logs"
-for l in navigatord limend ui ui4; do echo "--- $l"; g "grep -v trace $S/$l.log | tail -12"; done
+for l in navigatord limend ui ui4 ui5 ui6 navigatord2; do echo "--- $l"; g "grep -v trace $S/$l.log | tail -12"; done
 g "grep -iE 'chrome|slot|origin|panic' $S/frescod.log | tail -8; true"
 echo "navigator-live: $fails failed"
 [ "$fails" = 0 ]

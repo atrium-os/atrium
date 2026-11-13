@@ -5601,9 +5601,9 @@ Ctrl-B through frescod's injector and checks the `NAVIGATOR_UI_TRACE` lines. Coo
 forum-wm's placement (window top at y 62 with no bar running). By hand:
 `FRESCO_SOCKET=… navigator-ui --scene start --dark`; `NAVIGATOR_UI_SECS`, `NAVIGATOR_UI_SIZE=WxH`.
 
-### 13.6d Navigator: one live page and trails on disk (`scripts/navigator-live-vm.sh`)
+### 13.6d Navigator: live pages, trails on disk, parking (`scripts/navigator-live-vm.sh`)
 
-Steps 2 and 3 of docs/spec/navigator-ui.md §14. With the VM up:
+Steps 2 to 4 of docs/spec/navigator-ui.md §14. With the VM up:
 
     sh scripts/navigator-live-vm.sh [out-dir]       # ~20 min under TCG, BUILD=0 skips the cross-build
 
@@ -5624,6 +5624,14 @@ the trail's addresses and no page text, restarts navigator-ui and finds the trai
 second trail, puts it away with Ctrl-W, restarts, finds it in Earlier, and brings it back with
 Ctrl-Shift-T. A store navigator-ui cannot read is moved aside to `trails.json.unreadable` (never
 overwritten); a bad trail in it is dropped alone and logged as `trail store: dropped …`.
+
+Step 4 (parking) runs last, with `NAVIGATOR_UI_LIVE=1`: it follows a link, scrolls, goes Back (a swap:
+`showed live page` in ui5.log), checks the page left was parked with its offset (`parked … at y=N`),
+goes Forward and finds it at the same offset (`navigator-page: opened at y=N` in limend.log), then
+restarts the UI and navigatord with `$D/fixtures` moved away and finds the page brought back from
+navigatord's store (`NAVIGATORD_STORE`, here `/tmp/nlive/store`; `… Store)` in navigatord2.log). The
+script prints the park and restore times at the end. A `hash mismatch` ABORT is TCG's scp landing zeros:
+run it again with `BUILD=0`.
 
 Cross-building prerender and navigatord compiles ring's C: the script sets `CC_aarch64_unknown_freebsd`
 to clang with `--sysroot`, which needs FreeBSD's headers in the sysroot. If `assert.h` is missing:

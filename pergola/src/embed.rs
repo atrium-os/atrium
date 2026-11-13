@@ -52,6 +52,36 @@ impl Embeds {
 
     pub fn embed_of(&self, slot: SlotKey) -> Option<EmbedId> { self.by_slot.get(&slot).copied() }
 
+    /// Take the slot's embed out of view, keeping the child: it stays
+    /// attached and can be shown again with [`Self::show`] (a page kept
+    /// live off screen, navigator-ui.md §4.4).
+    pub fn hide(&mut self, slot: SlotKey) -> Result<(), Error> {
+        match self.by_slot.remove(&slot) {
+            Some(e) => self.parent.place(e, None),
+            None => Ok(()),
+        }
+    }
+
+    /// Put `embed` (one of this window's, hidden) in `slot`, hiding the
+    /// slot's current embed.
+    pub fn show(&mut self, slot: SlotKey, embed: EmbedId) -> Result<(), Error> {
+        if self.by_slot.get(&slot) == Some(&embed) {
+            return Ok(());
+        }
+        self.hide(slot)?;
+        self.by_slot.insert(slot, embed);
+        match self.rects.get(&slot).copied() {
+            Some(r) => self.parent.place(embed, Some(r)),
+            None => Ok(()),
+        }
+    }
+
+    /// Close one embed, shown or not.
+    pub fn detach_embed(&mut self, embed: EmbedId) -> Result<(), Error> {
+        self.by_slot.retain(|_, e| *e != embed);
+        self.parent.detach(embed)
+    }
+
     /// A role message to the child (encode it with the role's types).
     pub fn send(&mut self, embed: EmbedId, bytes: Vec<u8>) -> Result<(), Error> {
         self.parent.send(embed, bytes)

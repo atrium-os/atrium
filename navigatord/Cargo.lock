@@ -2248,6 +2248,8 @@ dependencies = [
  "navigator-backend",
  "navigator-control",
  "navigator-prerender",
+ "serde",
+ "serde_json",
  "url",
 ]
 

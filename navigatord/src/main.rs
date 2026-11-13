@@ -20,6 +20,13 @@
 //!   navigatord opens the UI's frescod connection there and hands it over,
 //!   so the UI's window is one navigatord may name.
 //!
+//! - **Parked pages** (navigator-ui.md §4.4): every page opened is kept in
+//!   a content-addressed store (`NAVIGATORD_STORE`, a directory; in memory
+//!   without it) as its recording and a small page record binding the
+//!   address it came from to that recording. `Opened` gives the UI the
+//!   record's address; an `Open` that brings it back reopens that version
+//!   from the store, with no fetch, if the record is for that address.
+//!
 //! `--unconfined-for-testing` allows what a shipped daemon refuses: the
 //! converter as an ordinary process (`NAVIGATORD_PRERENDER`, the prerender
 //! binary in serve mode) and pages from a fixture directory
@@ -34,12 +41,18 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use navigator_control::{self as ctl, Event, LinkAction, PageHeader, Request, Ticket};
+use navigator_backend::store::{DirStore, MemoryStore, Store};
+use navigator_control::{self as ctl, Event, LinkAction, PageHeader, Request, Source, Ticket};
 use navigator_prerender::fetch::{FetchBudget, FetchdFetcher, Reply};
 use navigator_prerender::serve::{self, Ask, Job};
 
 /// Pages kept converted, most recently used last (Back is instant).
 const CACHE: usize = 16;
+/// Addresses whose page record this run knows (for link checks and the
+/// strip once a page has left the cache).
+const KNOWN: usize = 4096;
+/// The page record's format.
+const RECORD: &str = "atrium-navigator-page/1";
 /// How long a ticket stays redeemable.
 const TICKET_LIFE: Duration = Duration::from_secs(60);
 /// How long a converter has past its own deadline before its input is
@@ -60,6 +73,7 @@ struct Config {
     unconfined: bool,
     deadline_s: u64,
     chrome: Option<PathBuf>,
+    store: Option<PathBuf>,
 }
 
 impl Config {
@@ -73,6 +87,7 @@ impl Config {
             unconfined,
             deadline_s: var("NAVIGATORD_DEADLINE").and_then(|v| v.parse().ok()).unwrap_or(30),
             chrome: var("FRESCOD_CHROME_SOCK").map(PathBuf::from),
+            store: var("NAVIGATORD_STORE").map(PathBuf::from),
         };
         if !unconfined {
             if c.converter.is_none() {
@@ -95,15 +110,89 @@ struct Page {
     recording: Vec<u8>,
     title: String,
     insecure: bool,
+    /// Its page record's address in the store (empty: not stored).
+    saved: String,
 }
 
-#[derive(Default)]
+/// What the store holds for a page besides its recording: which address
+/// that recording is the page at. A UI can only name records navigatord
+/// wrote, and a record is only taken for the address it names.
+#[derive(serde::Serialize, serde::Deserialize)]
+struct Record {
+    format: String,
+    url: String,
+    recording: String,
+}
+
 struct State {
     cache: Vec<Arc<Page>>,
     tickets: HashMap<Ticket, (Arc<Page>, Instant)>,
+    store: Box<dyn Store + Send>,
+    /// Unrecorded trails' pages: never written (navigator-ui.md §2.4).
+    memory: MemoryStore,
+    /// Page address → its latest record address.
+    known: HashMap<String, String>,
+}
+
+impl Default for State {
+    fn default() -> Self {
+        State { cache: vec![], tickets: HashMap::new(), store: Box::new(MemoryStore::default()), memory: MemoryStore::default(), known: HashMap::new() }
+    }
 }
 
 impl State {
+    /// Put a converted page in the store; returns it with its record's
+    /// address (or as it was, if the store refused: it still shows).
+    fn stored(&mut self, mut p: Page, unrecorded: bool) -> Page {
+        let store: &mut dyn Store = if unrecorded { &mut self.memory } else { &mut *self.store };
+        let put = store.put(&p.recording).and_then(|rec| {
+            let r = Record { format: RECORD.into(), url: p.url.clone(), recording: rec };
+            store.put(&serde_json::to_vec(&r).expect("encodes"))
+        });
+        match put {
+            Ok(a) => {
+                if !unrecorded {
+                    if self.known.len() >= KNOWN {
+                        self.known.clear();
+                    }
+                    self.known.insert(p.url.clone(), a.clone());
+                }
+                p.saved = a;
+            }
+            Err(e) => eprintln!("navigatord: store: {e}"),
+        }
+        p
+    }
+
+    /// The page `saved` names, if it is the page at `url`.
+    fn reopen(&self, url: &str, saved: &str, unrecorded: bool) -> Result<Page, String> {
+        if !ctl::is_address(saved) {
+            return Err("not a store address".into());
+        }
+        let store: &dyn Store = if unrecorded { &self.memory } else { &*self.store };
+        let b = store.get(saved)?;
+        let r: Record = serde_json::from_slice(&b).map_err(|e| format!("not a page record: {e}"))?;
+        if r.format != RECORD {
+            return Err(format!("a {:?} record", r.format));
+        }
+        if r.url != url {
+            return Err("the record is for another address".into());
+        }
+        let recording = store.get(&r.recording)?;
+        Ok(Page { title: title(&recording), insecure: url.starts_with("http:"), url: r.url, recording, saved: saved.into() })
+    }
+
+    /// The page at `url` this UI may act on: the cache, else the store.
+    fn page(&mut self, url: &str) -> Option<Arc<Page>> {
+        if let Some(p) = self.cached(url) {
+            return Some(p);
+        }
+        let saved = self.known.get(url)?.clone();
+        let p = Arc::new(self.reopen(url, &saved, false).ok()?);
+        self.keep(p.clone(), url);
+        Some(p)
+    }
+
     fn cached(&mut self, url: &str) -> Option<Arc<Page>> {
         let i = self.cache.iter().position(|p| p.url == url)?;
         let p = self.cache.remove(i);
@@ -116,7 +205,7 @@ impl State {
         self.cache.push(p.clone());
         if asked != p.url {
             // A redirect: the asked address finds it too.
-            self.cache.push(Arc::new(Page { url: asked.into(), recording: p.recording.clone(), title: p.title.clone(), insecure: p.insecure }));
+            self.cache.push(Arc::new(Page { url: asked.into(), recording: p.recording.clone(), title: p.title.clone(), insecure: p.insecure, saved: p.saved.clone() }));
         }
         while self.cache.len() > CACHE {
             self.cache.remove(0);
@@ -299,7 +388,7 @@ fn convert(cfg: &Config, url: &str) -> Result<Page, String> {
         return Err("the recording is over its bound".into());
     }
     let insecure = base.starts_with("http:");
-    Ok(Page { title: title(&recording), url: base, recording, insecure })
+    Ok(Page { title: title(&recording), url: base, recording, insecure, saved: String::new() })
 }
 
 /// The document's `<title>` from the recording's JSON text, bounded.
@@ -422,7 +511,13 @@ fn serve_ui(cfg: Arc<Config>, state: Arc<Mutex<State>>, s: UnixStream) {
                 st.latest = 0;
                 st.set("");
             }
-            Request::Open { id, url } => {
+            Request::Show { url } => {
+                let p = state.lock().unwrap().page(&url);
+                let mut st = strip.lock().unwrap();
+                st.latest = 0;
+                st.set(&p.and_then(|p| origin(&p.url)).unwrap_or_default());
+            }
+            Request::Open { id, url, saved, unrecorded } => {
                 if !ctl::clean(&url, ctl::URL_MAX) {
                     send(&w, &Event::Failed { id, url: String::new(), why: "not an address".into() });
                     continue;
@@ -433,17 +528,33 @@ fn serve_ui(cfg: Arc<Config>, state: Arc<Mutex<State>>, s: UnixStream) {
                     let t = Instant::now();
                     let hit = state.lock().unwrap().cached(&url);
                     let page = match hit {
-                        Some(p) => Ok(p),
-                        None => convert(&cfg, &url).map(|p| {
-                            let p = Arc::new(p);
-                            state.lock().unwrap().keep(p.clone(), &url);
-                            p
-                        }),
+                        Some(p) => Ok((p, Source::Cache)),
+                        None => {
+                            let back = saved.as_deref().map(|a| state.lock().unwrap().reopen(&url, a, unrecorded));
+                            match back {
+                                Some(Ok(p)) => {
+                                    let p = Arc::new(p);
+                                    state.lock().unwrap().keep(p.clone(), &url);
+                                    Ok((p, Source::Store))
+                                }
+                                other => {
+                                    if let Some(Err(e)) = other {
+                                        eprintln!("navigatord: {url}: not reopened from the store ({e}); fetching");
+                                    }
+                                    convert(&cfg, &url).map(|p| {
+                                        let mut st = state.lock().unwrap();
+                                        let p = Arc::new(st.stored(p, unrecorded));
+                                        st.keep(p.clone(), &url);
+                                        (p, Source::Fetched)
+                                    })
+                                }
+                            }
+                        }
                     };
                     let ms = t.elapsed().as_millis().min(u32::MAX as u128) as u32;
                     match page {
-                        Ok(p) => {
-                            eprintln!("navigatord: opened {} in {ms} ms ({} bytes)", p.url, p.recording.len());
+                        Ok((p, from)) => {
+                            eprintln!("navigatord: opened {} in {ms} ms ({} bytes, {from:?})", p.url, p.recording.len());
                             let ticket = state.lock().unwrap().ticket(p.clone());
                             {
                                 let st = strip.lock().unwrap();
@@ -451,7 +562,7 @@ fn serve_ui(cfg: Arc<Config>, state: Arc<Mutex<State>>, s: UnixStream) {
                                     st.set(&origin(&p.url).unwrap_or_default());
                                 }
                             }
-                            send(&w, &Event::Opened { id, url: p.url.clone(), title: p.title.clone(), insecure: p.insecure, ticket, ms });
+                            send(&w, &Event::Opened { id, url: p.url.clone(), title: p.title.clone(), insecure: p.insecure, ticket, ms, saved: p.saved.clone(), from });
                         }
                         Err(why) => {
                             eprintln!("navigatord: {url}: {why}");
@@ -461,7 +572,7 @@ fn serve_ui(cfg: Arc<Config>, state: Arc<Mutex<State>>, s: UnixStream) {
                 });
             }
             Request::Activate { id, page, href } => {
-                let p = state.lock().unwrap().cached(&page);
+                let p = state.lock().unwrap().page(&page);
                 let action = match p {
                     None => LinkAction::Blocked { why: "that page is not open".into() },
                     Some(p) => activate(&p, &href),
@@ -539,7 +650,20 @@ fn main() {
             if cfg.converter.is_none() { "the converter runs as an ordinary process; " } else { "" },
             if cfg.fixtures.is_some() { "pages come from fixtures" } else { "pages come from the fetcher" });
     }
-    let state = Arc::new(Mutex::new(State::default()));
+    let mut state = State::default();
+    if let Some(dir) = &cfg.store {
+        match DirStore::new(dir) {
+            Ok(d) => {
+                eprintln!("navigatord: pages kept in {}", dir.display());
+                state.store = Box::new(d);
+            }
+            Err(e) => {
+                eprintln!("navigatord: NAVIGATORD_STORE {}: {e}", dir.display());
+                std::process::exit(2)
+            }
+        }
+    }
+    let state = Arc::new(Mutex::new(state));
     let page_path = std::env::var("NAVIGATORD_PAGE_SOCKET").unwrap_or_else(|_| "/var/run/atrium/navigator-page.sock".into());
     let ctl_path = std::env::var("NAVIGATORD_SOCKET").unwrap_or_else(|_| "/var/run/atrium/navigatord.sock".into());
     let pages = listen(&page_path);
@@ -564,7 +688,7 @@ mod tests {
 
     fn page(url: &str, doc: &str) -> Page {
         let rec = format!(r#"{{"format":"atrium-navigator-recording/3","url":"{url}","document":"{doc}"}}"#);
-        Page { url: url.into(), title: title(rec.as_bytes()), recording: rec.into_bytes(), insecure: false }
+        Page { url: url.into(), title: title(rec.as_bytes()), recording: rec.into_bytes(), insecure: false, saved: String::new() }
     }
 
     #[test]
@@ -596,6 +720,29 @@ mod tests {
         assert_eq!(fixture(&d, "https://atlas.example/../etc/passwd"), None);
         assert_eq!(fixture(&d, "file:///etc/passwd"), None);
         let _ = std::fs::remove_dir_all(d);
+    }
+
+    #[test]
+    fn a_parked_page_reopens_from_the_store_only_for_its_address() {
+        let mut st = State::default();
+        let p = st.stored(page("https://a.example/", "x"), false);
+        assert!(ctl::is_address(&p.saved));
+        let back = st.reopen("https://a.example/", &p.saved, false).unwrap();
+        assert_eq!(back.recording, p.recording);
+        assert_eq!(back.saved, p.saved);
+        assert!(st.reopen("https://b.example/", &p.saved, false).is_err(), "a record names its address");
+        let rec = navigator_backend::session::digest(&p.recording);
+        assert!(st.reopen("https://a.example/", &rec, false).is_err(), "a recording is not a record");
+        assert!(st.reopen("https://a.example/", "../x", false).is_err());
+        // An Unrecorded trail's page is never in the written store.
+        let u = st.stored(page("https://u.example/", "y"), true);
+        assert!(st.reopen("https://u.example/", &u.saved, false).is_err());
+        assert!(st.reopen("https://u.example/", &u.saved, true).is_ok());
+        assert!(st.page("https://u.example/").is_none(), "nor known for later");
+        // Once out of the cache, a known page is still one links are checked on.
+        assert!(st.cached("https://a.example/").is_none());
+        assert!(st.page("https://a.example/").is_some());
+        assert!(st.page("https://c.example/").is_none());
     }
 
     #[test]

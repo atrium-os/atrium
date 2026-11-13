@@ -131,6 +131,11 @@ pub struct Page {
     pub facts: Facts,
     pub media: Media,
     pub asked: Option<Asked>,
+    /// navigatord's store address for the version shown (§4.4, §4.5): a
+    /// parked page comes back as this version, not fetched again.
+    pub saved: Option<String>,
+    /// How far down it was scrolled when it was parked (px).
+    pub scroll: f32,
 }
 
 /// What it takes to add a page (from the broker in step 2).
@@ -198,6 +203,8 @@ impl Trail {
             facts: spec.facts,
             media: spec.media,
             asked: None,
+            saved: None,
+            scroll: 0.0,
         });
         if let Some(p) = parent {
             self.pages[p].children.push(id);
@@ -487,6 +494,11 @@ impl TrailStore {
     }
 
     /// Whether `site` knows you in the current trail's jar (§6.2).
+    /// A page by its trail's id, in a trail or put away.
+    pub fn page_by_key_mut(&mut self, trail: u64, page: PageId) -> Option<&mut Page> {
+        self.trails.iter_mut().chain(self.earlier.iter_mut().map(|e| &mut e.trail)).find(|t| t.id == trail)?.pages.get_mut(page)
+    }
+
     pub fn knows(&self, site: &str) -> bool {
         self.known.contains(&(Self::jar_of(self.trail()), site.to_string()))
     }

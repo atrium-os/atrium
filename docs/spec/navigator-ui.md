@@ -1081,10 +1081,33 @@ Each step runs in the VM on headless frescod before the next.
      after its child, a current page out of range, control characters) is dropped alone. A file that
      cannot be read at all is moved aside, never overwritten.
    - Checked in `scripts/navigator-live-vm.sh` (RUNBOOK §13.6d). Not yet: the broker's saved
-     address and version history per page (they come with step 4's parking), and the content
+     address per page (step 4 added it as navigatord's store address; version history comes with
+     broker sessions), and the content
      store collecting pages only a forgotten trail referred to.
 4. **Parking.** Save and restore under the broker's budget; measure restore time on the Mac
    (HVF) and the R9700 box, and set the live budget from it.
+   *Built 2026-11-13 (static pages; measured under TCG only):*
+   - One doc-viewer child per live page. The page on screen has its child in the slot; other
+     live children stay attached and hidden (Pergola `Embeds::hide` / `show`), so Back, Forward
+     or a trail switch to a live page is a swap with no open (9 ms in the VM).
+   - The budget is `NAVIGATOR_UI_LIVE` children (default 6). Past it, the page seen least recently
+     that is neither on screen nor the parent of the page on screen is parked: `Park` to its child
+     (limen.md §2.1), which answers `Parked { scroll }`, then the child is closed (3 s at most).
+   - navigatord keeps every page it opens in a content-addressed store (`NAVIGATORD_STORE`;
+     backend `DirStore`) as the recording plus a page record binding the address to it. `Opened`
+     gives the UI the record's address; the page keeps it with its scroll offset, in memory and in
+     the trail store. Showing a parked page sends `Open { saved }`: navigatord takes it from its
+     cache, else reopens that version from the store if the record is for that address, else
+     fetches. Unrecorded trails' pages go to an in-memory store only, never written.
+   - `Show { url }` names a swapped-in page's origin in the strip; navigatord names only pages it
+     opened, and checks links on a page that has left its cache against the store.
+   - VM, TCG (`scripts/navigator-live-vm.sh`, 25/25): a swap 9 ms; a park 68 ms; a parked page back
+     to laid out, at its scroll offset, 2.7 s from the cache and 3.4 s from the store after a
+     restart of the UI and navigatord with the fixtures gone. Nearly all of that is a new child
+     under TCG; the Mac (HVF) and R9700 measurements, and the budget set from them, are open.
+   - Not yet: broker sessions (replayed and live-code pages) parked with the backend's
+     `Save`/`Restore`, which waits for navigatord to host sessions; idle expiry as a park; the rail
+     saying why a page can't be parked; fading in a restore.
 5. **Presence and personas.** The cookie action, Arca partitions, Unrecorded.
 6. **Islands and prompts.** The `island` slot kind, the prompt row with its press rule, downloads,
    app hand-off.
