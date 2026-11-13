@@ -141,6 +141,10 @@ link state.
 
 ### 3.4 aurad
 
+`aurad` below is one logical service; §8.3 splits it into two jails,
+`aura-mlme` (parsing, no secrets) and `aura-keys` (handshakes and secrets),
+decision 14.
+
 - One process per machine (not per radio), jailed through jaild: uid
   `_aura` (new reserved uid next to Vinculum's), devfs ruleset with only
   `/dev/aura/ctl*` grants, no network, sysfil profile `device`.
@@ -274,20 +278,84 @@ in FreeBSD and that hardware is going away.
 
 W0–W2 need no Wi-Fi hardware at all.
 
-## 8. Security notes
+## 8. Threat model and what runs where
 
-- Attack surface over the air ends in `aurad` (jailed, no network, Rust,
-  fuzzed) for management frames, and in `aura_wlan` (Rust) for data-frame
-  headers only. Nothing in kernel C parses radio input.
-- The firmware is a DMA master: IOMMU where available; ring indices and
-  lengths from the device are bounds-checked; a firmware error notification
-  resets the device, never trusts its contents beyond logging.
-- `aurad` compromise gives: the ability to join/leave networks and see
-  management frames and EAPOL; not the data path, not other jails' traffic,
-  not Arca secrets of networks it isn't joining (Arca releases one
-  credential per join request from atrium-net).
-- Downgrade: never fall back from SAE to PSK on a network remembered as
-  WPA3 (WPA3 transition-disable indication honoured).
+### 8.1 What we protect
+
+- The host: kernel, other jails, the user's data.
+- Network credentials (passwords, PMKs, later EAP certificates), kept in Arca.
+- Traffic confidentiality and integrity on the link, and that we join the
+  network the user meant.
+- Location and identity privacy: scans and probes must not track the user,
+  and apps must not learn where the machine is from nearby networks.
+- Availability, where the protocol allows (deauth floods cannot be fully
+  stopped on networks without PMF).
+
+### 8.2 Attackers
+
+| # | Attacker | Can do |
+|---|---|---|
+| A1 | Anyone in radio range, no credentials | send any frame: beacons, probe responses, auth/assoc, action frames, EAPOL msg 1, deauth, fragments, A-MSDUs; jam; watch our probes and MAC |
+| A2 | Rogue AP / evil twin | advertise a remembered SSID, offer weaker security, drive our handshake; with the password (shared PSK/SAE networks) it can impersonate the real AP fully, which no client can prevent |
+| A3 | The network after joining | DHCP, DNS, IPv6 RA, every LAN peer |
+| A4 | Compromised radio firmware | firmware parses raw radio frames itself; an over-the-air firmware exploit (Broadpwn-style) gives a DMA-capable bus master on PCIe |
+| A5 | Malicious USB device | claims to be a Wi-Fi dongle; hostile USB descriptors and responses |
+| A6 | Local app (jailed) | wants scan results (location), to change networks, or to read passwords |
+| A7 | Compromised `aura-mlme` or `aura-keys` (after a parser bug) | see §8.4 |
+
+### 8.3 Where each piece runs, and why
+
+| Piece | Hostile input it handles | Placement | Reason |
+|---|---|---|---|
+| Radio firmware | all raw radio input | on the card; treated as untrusted | we can't change it. PCIe: IOMMU (DMAR on Intel, AMD IOMMU on the AI X1 Pro: FreeBSD 15 has an AMD driver, to verify on that box); the driver bounds-checks every ring index and length the device gives. USB: no DMA, so the USB dongle is the safer path by design |
+| `aura_mt79` / `aura_intel` | firmware events, RX descriptors, USB/PCIe responses (A4, A5) | kernel, Rust | DMA rings and interrupts need the kernel (no IOMMU-backed user DMA in FreeBSD). Only fixed-format structures are parsed; no IE ever. A USB user-space driver over `ugen` is possible (as Vinculum does) but costs throughput; not proposed, kept as a fallback if the kernel parser count grows |
+| `aura_wlan` | data-frame headers, A-MSDU subframes, fragments (A1, A3) | kernel, Rust | per-packet path. KRACK, FragAttacks rules live here: no key reinstall with a reset replay counter, drop non-SPP A-MSDU with an LLC/SNAP-looking DA, no mixed-key fragment reassembly, fragment cache flushed on rekey, unencrypted data dropped once the port is authorized, EAPOL accepted only from the associated BSSID |
+| `aura-mlme` (`aurad`'s parsing half) | beacons, probe responses, all IEs, auth/assoc/action frames, SAE commit/confirm framing, scan results (A1, A2) | jailed user space, Rust, fuzzed; uid `_aura`, no network, no files but state dir, capability mode after opening the cdev | the largest hostile parser; holds **no secrets** |
+| `aura-keys` (new) | EAPOL-Key frames (MIC checked before key data is parsed), SAE crypto | separate jail, uid `_aura-keys`, no network, no device node: talks only to `aura-mlme` (frames in, keys out to the kernel through it) and Arca | holds the password/PMK. Its parser is small and fixed-format, so a parser bug in `aura-mlme` does not hand over the network password. Recommend this split (decision 14) |
+| `aura-eap` (W7) | EAP, TLS server certificate chains (A2) | third jail, per join | TLS is a large parser; wpa_supplicant's EAP code has had memory bugs. Client certificate keys stay in Arca/Sigillum and sign through them |
+| `atrium-net` | no radio input; requests from Forum/apps | root, narrow | applies results only (addresses, routes) |
+| DHCP client | DHCP replies (A3) | jailed, Rust (or FreeBSD `dhclient`'s privsep child until then) | an A3 parser; network.md currently has `atrium-net` run `dhclient`. Recommend a jailed client (decision 15; belongs to the network work, noted here) |
+| Forum Wi-Fi picker | SSID strings (A1, A2) | Forum | SSIDs are 32 arbitrary bytes: show non-UTF-8 as hex, strip bidi/control characters, flag lookalikes of remembered names |
+| Apps | — | through `atrium-net` only | scan results reveal location: `ListWifiNetworks` needs a capability and a user grant, BSSIDs are never given to apps, only "connected/SSID" with `network_read` (decision 16) |
+
+### 8.4 If a piece is compromised
+
+- **`aura-mlme`:** can join, leave and scan, see management frames and
+  EAPOL frames, and send management frames within the regulatory limits the
+  kernel enforces. Cannot read or inject data traffic (the data path is in
+  the kernel), cannot get passwords or PMKs (in `aura-keys`), cannot reach
+  the network or the filesystem. Worst case: steer the machine to a network
+  the user already saved, or cut it off.
+- **`aura-keys`:** gets the credentials of networks it is asked to join
+  (Arca releases one per join request from `atrium-net`, never the list).
+- **Kernel driver:** kernel compromise; that is why it parses fixed formats
+  only, is Rust, and its parsers are fuzzed against recorded firmware event
+  streams.
+- **Firmware:** without an IOMMU, host compromise over DMA; with one, it can
+  corrupt only its own rings and frames. USB dongles avoid this entirely.
+
+### 8.5 Known attack classes
+
+| Attack | Mitigation |
+|---|---|
+| KRACK (key reinstallation) | `aura_wlan` refuses installing a key already in use; replay counters never reset on retransmitted msg 3 |
+| FragAttacks | §8.3 `aura_wlan` rules; SPP A-MSDU negotiated where supported |
+| Dragonblood (SAE side channels, downgrade) | H2E preferred, hunting-and-pecking constant time; group 19 minimum, no group downgrade; anti-clogging tokens; transition-disable honoured |
+| Deauth/disassoc floods | PMF on by default; required on WPA3 |
+| Evil twin / security downgrade | remember each network's security level; never join a remembered WPA3 network as WPA2 or open; no auto-join of open networks by SSID alone (Karma), only when the user opted in per network (decision 17) |
+| Tracking | random MAC per network and per scan; no directed probes except networks marked hidden; randomized sequence numbers in probes |
+| Beacon/scan flooding | bounded scan table in `aura-mlme`, per-BSS rate limits; kernel queue limits on the management frame channel |
+| Firmware OTA exploit | IOMMU; driver never trusts firmware lengths or indices; firmware crash → full reset |
+| Malicious USB device | the driver matches by VID:PID only through dispensatord; descriptor checks in Rust before any transfer |
+
+### 8.6 Residual risks
+
+- Anyone with a shared password can impersonate the AP (WPA2-PSK and
+  WPA3-SAE both); only Enterprise with server certificate checks fixes that.
+- The kernel driver is still kernel code; Rust removes memory bugs, not
+  logic bugs.
+- PCIe cards on machines without a working IOMMU trust the firmware. Proposed:
+  Atrium warns in settings when Wi-Fi runs without IOMMU protection.
 
 ## 9. Not in scope
 
@@ -331,6 +399,17 @@ later addition; the split in §3.1 allows it (hostapd's role would move into
     traits.
 13. **Name Aura** (`aurad`, `aura_*` kmods). *Recommend yes*; alternative
     *Aether*.
+
+14. **Split the daemon in two jails:** `aura-mlme` (all frame and IE
+    parsing, no secrets) and `aura-keys` (handshakes, passwords/PMKs, tiny
+    parser); later `aura-eap` in a third. *Recommend yes* (§8.3).
+15. **Jailed DHCP client** instead of root `dhclient` under `atrium-net`.
+    *Recommend yes*; it is network-thread work, noted here (§8.3).
+16. **Scan results are location data:** apps need a capability and a user
+    grant for `ListWifiNetworks`, never see BSSIDs. *Recommend yes* (§8.3).
+17. **No auto-join of open networks** unless opted in per network; never
+    join a remembered network at a weaker security level. *Recommend yes*
+    (§8.5).
 
 ### Open question for Shankar
 
