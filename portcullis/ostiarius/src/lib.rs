@@ -135,6 +135,9 @@ pub struct Ostiarius<L: Launcher> {
     /// derived from the passcode at login, locked at sign-out. `None` = not
     /// configured (tests, CLI fallback).
     arca: Option<arcad::client::VestibulumLink>,
+    /// Sigillum (docs/spec/sigillum.md §12): the lock screen's security-key
+    /// unlock and adding a key. `None` = not configured.
+    sigillum: Option<Box<dyn sigillum::KeyCheck>>,
 }
 
 impl<L: Launcher> Ostiarius<L> {
@@ -144,7 +147,38 @@ impl<L: Launcher> Ostiarius<L> {
             seat_path: seat::ACTIVE_SESSION.to_string(),
             sessions: HashMap::new(),
             arca: None,
+            sigillum: None,
         }
+    }
+
+    /// Unlock the lock screen through Sigillum's sheet (an enrolled security
+    /// key, or the passcode there), and let the user add keys.
+    pub fn with_sigillum(mut self, check: Box<dyn sigillum::KeyCheck>) -> Self {
+        self.sigillum = Some(check);
+        self
+    }
+
+    /// The lock screen, unlocked through Sigillum: sigillumd shows its sheet
+    /// for the active user and answers verified or not.
+    pub fn unlock_with_sigillum(&self) -> Result<(), String> {
+        let check = self.sigillum.as_ref().ok_or("security keys are not set up")?;
+        let active = self.active_human().ok_or("no active session")?;
+        if !seat::is_locked_at(&self.seat_path) {
+            return Err("the session is not locked".into());
+        }
+        check.verify(&active)?;
+        self.set_locked(false)
+    }
+
+    /// Add a security key for the active user, from their unlocked session
+    /// (settings). sigillumd asks the passcode before the key registers.
+    pub fn enrol_key(&self, name: &str) -> Result<(), String> {
+        let check = self.sigillum.as_ref().ok_or("security keys are not set up")?;
+        let active = self.active_human().ok_or("no active session")?;
+        if seat::is_locked_at(&self.seat_path) {
+            return Err("the session is locked".into());
+        }
+        check.enrol(&active, name)
     }
 
     /// Unlock and lock the user's Arca store at login and sign-out.
@@ -278,6 +312,7 @@ impl<L: Launcher> Ostiarius<L> {
 /// asks for logout. Newline-delimited JSON over a Unix socket (the workspace IPC
 /// shape), peer-gated by `getpeereid` — only the trusted login UI may drive it.
 pub mod verify;
+pub mod sigillum;
 
 pub mod control {
     use super::{Frontend, Launcher, Ostiarius};
@@ -296,6 +331,11 @@ pub mod control {
         Lock,
         /// The active session's human re-authenticated at the lock screen.
         Unlock { password: String },
+        /// The lock screen's "use a security key": Sigillum's sheet for the
+        /// active user (an enrolled key, or the passcode there).
+        UnlockWithKey,
+        /// Settings' "Add a security key" for the active, unlocked session.
+        EnrolKey { name: String },
     }
 
     #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -324,6 +364,8 @@ pub mod control {
                     if human == active { ost.set_locked(false) } else { Err("not the session's user".into()) }
                 }),
             },
+            Request::UnlockWithKey => ost.unlock_with_sigillum(),
+            Request::EnrolKey { name } => ost.enrol_key(&name),
         };
         match r {
             Ok(()) => Response::Ok { active: ost.active_human() },
@@ -648,6 +690,61 @@ mod tests {
         handle(&mut o, Request::Lock);
         handle(&mut o, Request::Logout);
         assert!(!seat::is_locked_at(&path), "logout clears the lock");
+    }
+
+    /// Sigillum stand-in: answers verified when `ok`, and records the asks.
+    struct FakeSigillum {
+        ok: bool,
+        asked: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+    }
+    impl crate::sigillum::KeyCheck for FakeSigillum {
+        fn verify(&self, user: &str) -> Result<(), String> {
+            self.asked.lock().unwrap().push(format!("verify {user}"));
+            if self.ok { Ok(()) } else { Err("not verified (NotAllowed)".into()) }
+        }
+        fn enrol(&self, user: &str, name: &str) -> Result<(), String> {
+            self.asked.lock().unwrap().push(format!("enrol {user} {name}"));
+            if self.ok { Ok(()) } else { Err("not verified (NotAllowed)".into()) }
+        }
+    }
+
+    #[test]
+    fn control_unlock_with_a_key_and_enrol() {
+        use crate::control::{handle, Request, Response};
+        let asked = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let path = seat_file("key");
+        let mut o = Ostiarius::new(MockLauncher::default())
+            .with_seat_path(path.clone())
+            .with_sigillum(Box::new(FakeSigillum { ok: true, asked: asked.clone() }));
+        assert!(matches!(handle(&mut o, Request::UnlockWithKey), Response::Err { .. }), "no session");
+        handle(&mut o, Request::Login { user: "alice".into(), password: "pw".into(), frontend: Frontend::Gui });
+        assert!(matches!(handle(&mut o, Request::UnlockWithKey), Response::Err { .. }), "not locked: no sheet");
+        // Settings adds a key in the unlocked session.
+        assert_eq!(handle(&mut o, Request::EnrolKey { name: "YubiKey".into() }), Response::Ok { active: Some("alice".into()) });
+        handle(&mut o, Request::Lock);
+        assert!(matches!(handle(&mut o, Request::EnrolKey { name: "x".into() }), Response::Err { .. }), "no enrolling while locked");
+        assert_eq!(handle(&mut o, Request::UnlockWithKey), Response::Ok { active: Some("alice".into()) });
+        assert!(!seat::is_locked_at(&path));
+        assert_eq!(*asked.lock().unwrap(), vec!["enrol alice YubiKey", "verify alice"]);
+    }
+
+    #[test]
+    fn a_refused_key_leaves_the_screen_locked() {
+        use crate::control::{handle, Request, Response};
+        let path = seat_file("keyno");
+        let asked = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let mut o = Ostiarius::new(MockLauncher::default())
+            .with_seat_path(path.clone())
+            .with_sigillum(Box::new(FakeSigillum { ok: false, asked }));
+        handle(&mut o, Request::Login { user: "alice".into(), password: "pw".into(), frontend: Frontend::Gui });
+        handle(&mut o, Request::Lock);
+        assert!(matches!(handle(&mut o, Request::UnlockWithKey), Response::Err { .. }));
+        assert!(seat::is_locked_at(&path), "still locked");
+        // Without Sigillum configured there is no key unlock at all.
+        let mut bare = Ostiarius::new(MockLauncher::default()).with_seat_path(seat_file("keybare"));
+        handle(&mut bare, Request::Login { user: "bob".into(), password: "pw".into(), frontend: Frontend::Gui });
+        handle(&mut bare, Request::Lock);
+        assert!(matches!(handle(&mut bare, Request::UnlockWithKey), Response::Err { .. }));
     }
 
     #[test]

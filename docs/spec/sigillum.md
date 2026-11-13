@@ -1018,9 +1018,16 @@ administrative calls (`C_InnaIT*`: zeroize, initialise, applet install and delet
   `veutest.json` 0600 `_sigillum` (64-byte credential id, sign count 3); then `VERIFY_USER
   veutest` (unlock, `key-uv`, PIN, touch) answered `Verified { SecurityKey, KeyUv }` and
   the count was stored as 5.
-- **Not yet:** ostiarius's lock screen asking `sigillumd` (`VERIFY_USER` with `key-uv`) instead of
-  checking the passcode itself, and an "Add a security key" entry in its settings that
-  sends `EnrolKey`; removing a key (a user deletes its file entry
+- **ostiarius** (`portcullis/ostiarius/src/sigillum.rs`): two control ops beside `unlock`.
+  `unlock_with_key` (the session must be locked) asks `VERIFY_USER` for the active user with
+  `key-uv` and unlocks on `Verified`; Sigillum's sheet offers the enrolled key or the
+  passcode. `enrol_key { name }` (the session must be unlocked) sends `EnrolKey` for the
+  active user. A refusal leaves the lock as it was. `SIGILLUM_SOCKET` (default sigillumd's
+  client socket, `none` off). Unit tests in `ostiarius/src/lib.rs` with a stand-in broker.
+- **Not yet:** the lock screen UI itself (nothing sends ostiarius `lock`/`unlock` yet:
+  docs/STATUS.md) with a "Use a security key" button, and a settings page with "Add a
+  security key" (the control socket admits only vestibulum, so settings will reach it
+  through vestibulum or a gate of its own); removing a key (a user deletes its file entry
   through ostiarius, to be added with the settings page).
 
 ## 17. Decisions, with recommendations

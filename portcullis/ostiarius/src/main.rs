@@ -158,7 +158,7 @@ fn main() {
         spawn_verify(launcher.broker_sock.clone());
         let arca = std::env::var("ARCA_SOCKET")
             .unwrap_or_else(|_| "/atrium/sockets/arca/arcad.sock".into());
-        let mut o = Ostiarius::new(launcher).with_seat_path(seat).with_arca(arca); // stub auth (no with_pam)
+        let mut o = with_sigillum(Ostiarius::new(launcher).with_seat_path(seat).with_arca(arca)); // stub auth (no with_pam)
         // Gate on the display server being READY before booting the login UI: as
         // the supervisor, ostiarius sequences startup rather than launching a
         // doomed vestibulum into a not-yet-up frescod. If frescod never comes up
@@ -202,7 +202,7 @@ fn main() {
     let mut launcher = JaildLauncher::default();
     if let Ok(b) = std::env::var("BROKER_SOCK") { launcher.broker_sock = b; }
     spawn_verify(launcher.broker_sock.clone());
-    let mut o = Ostiarius::new(launcher);
+    let mut o = with_sigillum(Ostiarius::new(launcher));
     if let Err(e) = o.boot() {
         eprintln!("ostiarius: boot (launch vestibulum): {e}");
     }
@@ -210,5 +210,16 @@ fn main() {
     if let Err(e) = ostiarius::control::serve(&mut o, SOCK, ostiarius::control::vestibulum_gate) {
         eprintln!("ostiarius: serve {SOCK}: {e}");
         std::process::exit(1);
+    }
+}
+
+/// Sigillum's unlock sheet and key enrolment (sigillum.md §12, §16.6):
+/// `$SIGILLUM_SOCKET` (default sigillumd's client socket); `none` turns it off.
+fn with_sigillum<L: ostiarius::Launcher>(o: Ostiarius<L>) -> Ostiarius<L> {
+    match std::env::var("SIGILLUM_SOCKET") {
+        Ok(v) if v == "none" => o,
+        v => o.with_sigillum(Box::new(ostiarius::sigillum::SigillumLink::new(
+            v.unwrap_or_else(|_| sigillum_proto::client::SOCKET.into()),
+        ))),
     }
 }

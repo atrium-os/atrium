@@ -768,6 +768,7 @@ dependencies = [
  "portcullisd",
  "serde",
  "serde_json",
+ "sigillum-proto",
 ]
 
 [[package]]
