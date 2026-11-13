@@ -1,0 +1,233 @@
+== fuzz24h-start excerpt, taken Fri Nov 13 16:53:11 UTC 2026
+== head -80 /root/runs/fuzz24h.out
+== run Fri Nov 13 16:40:46 UTC 2026 stages: fz:86400:0x24f00d kenvs: psp_bootload psp_ipfw gc_up_ok attach client
+sha256 ok: 4e407525dbcaa162e8e137a2f2b7bf1a8f245752f2ec1a61fa131939ff828170
+sha256 ok: gpu module c86dd802c7813c9994b0110b0d964af2fbd97a5eee3540473f62e641b6d41585, test ef151d23900cac0cb87e876b865cb25e91d2817875eb0f598521d9db58062682
+sha256 ok: si-fuzz 9d3a389871c4879e4477e701e58998c57412f0a5e97b25301ffb80da68f15658
+== before
+hw.acpi.thermal.tz0.temperature: 27.9C dev.pchtherm.0.temperature: 29.0C 
+vgapci0@pci0:3:0:0:	class=0x030000 rev=0xc0 hdr=0x00 vendor=0x1002 device=0x7551 subvendor=0x1da2 subdevice=0xe499
+    vendor     = 'Advanced Micro Devices, Inc. [AMD/ATI]'
+    device     = 'Navi 48 [Radeon AI PRO R9700]'
+    class      = display
+    subclass   = VGA
+    bar   [10] = type Prefetchable Memory, range 64, base 0x80000000, size 268435456, enabled
+    bar   [18] = type Prefetchable Memory, range 64, base 0x90000000, size 2097152, enabled
+    bar   [20] = type I/O Port, range 32, base 0x6000, size 256, enabled
+    bar   [24] = type Memory, range 32, base 0x98100000, size 524288, enabled
+
+BAR5 mapped 524288 bytes
+RCC_CONFIG_MEMSIZE = 0x7f70 (32624 MiB VRAM)
+(pass --vram-top, with no driver bound, to read the discovery table)
+== kldload
+kldload rc=0
+kldload gpu module rc=0
+attach rc=0 (0 expected: stays attached)
+crw-------  1 root wheel 0x81 Nov 13 16:40 /dev/atrium-gpu0
+crw-------  1 root wheel 0x82 Nov 13 16:40 /dev/atrium-gpu0ctl
+== si-client-test
+1: VM fd 4, queue fd 9: shader 0x10000000, IB 0x10001000, out 0x10002000
+PASS: 1 queue: write_42 on its own MES user queue (completion ok after 0 ms, 64/64 words 42, out[0] 0x2a)
+PASS: 1 queue: out_seqno counts from 1 (1)
+PASS: 1 queue: a second job on the same queue (completion ok after 0 ms, 64/64 words 42, out[0] 0x2a)
+2b: VM fd 10, queue fd 15: shader 0x10000000, IB 0x10001000, out 0x10002000
+2c: VM fd 16, queue fd 21: shader 0x10000000, IB 0x10001000, out 0x10002000
+PASS: 2 same VAs in both VMs (out 0x10002000 / 0x10002000)
+PASS: 2 two VMs: each queue writes 64 x 42 on its own page (B No error: 0 64/64, C No error: 0 64/64)
+PASS: 3 two queues in one VM: the second runs (completion ok after 0 ms, 64/64 words 42, out[0] 0x2a)
+PASS: 3 two queues in one VM: the first still runs (completion ok after 0 ms, 64/64 words 42, out[0] 0x2a)
+4: VM fd 23, queue fd 28: shader 0x10000000, IB 0x10001000, out 0x10002000
+PASS: 4 queue fd over SCM_RIGHTS: the child's submit runs (child exit 0, completion ok, 64/64 words 42)
+PASS: 5 close in flight: the completion lands or is cancelled (Operation canceled after 0 ms)
+PASS: 5 close in flight: the VM runs clean on a new queue (completion ok after 0 ms, 64/64 words 42, out[0] 0x2a)
+PASS: 6 the retired ring SUBMIT ('A',4) is unknown (Inappropriate ioctl for device)
+PASS: 6 unknown queue family refused (Invalid argument)
+PASS: 6 priority other than 0 refused (Invalid argument)
+PASS: 6 QUEUE_CREATE on the client node refused (Inappropriate ioctl for device)
+PASS: 6 QUEUE_SUBMIT on a VM fd refused (Inappropriate ioctl for device)
+PASS: 6 in-dependencies refused (not yet) (Operation not supported)
+PASS: 6 a blob that is not whole dwords refused (Invalid argument)
+PASS: 6 an empty blob refused (Invalid argument)
+PASS: 6 the first queue still runs after the refusals (completion ok after 0 ms, 64/64 words 42, out[0] 0x2a)
+7: VM fd 22, queue fd 27: shader 0x10000000, IB 0x10001000, out 0x10002000
+PASS: 7 fault: the faulting queue's work fails with EIO (got Input/output error after 0 ms)
+PASS: 7 fault: the lost queue refuses new work (Input/output error)
+PASS: 7 fault: another VM's queue runs on (completion ok after 0 ms, 64/64 words 42, out[0] 0x2a)
+PASS: 7 fault: the faulting VM runs clean on a new queue (completion ok after 0 ms, 64/64 words 42, out[0] 0x2a)
+PASS: 8 hang: the hung queue's work fails with EIO after hang_ms (got Input/output error after 5021 ms)
+PASS: 8 hang: the lost queue refuses new work (Input/output error)
+PASS: 8 hang: another VM's queue runs on (completion ok after 0 ms, 64/64 words 42, out[0] 0x2a)
+PASS: 8 hang: the hung VM runs clean on a new queue (completion ok after 0 ms, 64/64 words 42, out[0] 0x2a)
+9: VM fd 22, queue fd 27: shader 0x10000000, IB 0x10001000, out 0x10002000
+PASS: 9 user mode: QUEUE_MAP2 layout (ring 0+0x1000, wptr 0x1008, doorbell 0x2000+0x1000, fence VA 0x200031010)
+PASS: 9 user mode: write_42 rung from user space (fence 1 (want 1) after 1 ms, 64/64 words 42, out[0] 0x2a, rptr report 12, wptr 12)
+PASS: 9 user mode: a second job on the same ring (fence 2 (want 2) after 1 ms, 64/64 words 42, out[0] 0x2a, rptr report 24, wptr 24)
+PASS: 9 user mode: QUEUE_SUBMIT on it refused (Operation not supported)
+PASS: 9 user mode: QUEUE_MAP2 of a kernel-mode queue refused (Invalid argument)
+PASS: 9 user mode: mmap of a kernel-mode queue refused (Operation not supported by device)
+PASS: 9 user mode: a private mapping refused (Permission denied)
+PASS: 9 user mode: an executable mapping refused (Permission denied)
+PASS: 9 user mode: a mapping past the queue's pages refused (Invalid argument)
+PASS: 9 user mode: after close, the ring is gone (SIGBUS) (child status 0xa)
+PASS: 9 user mode: after close, the doorbell is gone (SIGBUS) (child status 0xa)
+PASS: 9 hang: a stuck user ring is lost after hang_ms (QUEUE_MAP2: EIO) (Input/output error after 5251 ms, fence 0)
+PASS: 9 hang: another VM's queue runs on (completion ok after 0 ms, 64/64 words 42, out[0] 0x2a)
+PASS: 9 user mode: the VM runs clean on a kernel-mode queue after (completion ok after 0 ms, 64/64 words 42, out[0] 0x2a)
+PASS: 10 free rule: a BO of a VM with a live queue is freed at its close (preempted, not deferred) (deferred 0 -> 0, now 0)
+PASS: 10 free rule: the queue runs on after the preemption (completion ok after 0 ms, 64/64 words 42, out[0] 0x2a)
+10: VM fd 22, queue fd 27: shader 0x10000000, IB 0x10001000, out 0x10002000
+10: BO closed under a stuck queue: freed at once (deferred 0 -> 0)
+PASS: 10 free rule (stuck): the stuck queue is still lost after hang_ms (got Input/output error after 4842 ms)
+PASS: 10 free rule (stuck): nothing deferred is left once the queue is gone (deferred_now 0)
+PASS: 10 free rule (stuck): another VM's queue runs on (completion ok after 0 ms, 64/64 words 42, out[0] 0x2a)
+== /root/runs/fuzz24h.out lines 156-168 (si-client-test summary and si-fuzz start)
+si_client_test: 92 passed, 0 failed: PASS
+si-client-test rc=0
+== si-fuzz all 86400 0x24f00d
+si-fuzz: all for 86400 s, seed 0x24f00d, 6 ioctl threads, hang_ms 5000 (job wait 20000 ms), re-inits 2, pace 210 s, generations 60 s
+canary: VM fd 3, queue fd 8: shader 0x10000000, IB 0x10001000, out 0x10002000
+si-fuzz: ioctl generation 1: uid 61001, seed 0x24f00e
+si-fuzz: blob generation 2: uid 62002, seed 0x24f00f
+si-fuzz:    0 s: 0 calls, blob 0 jobs (0 ok, 0 failed, 0 clean after), canary 1, re-inits 2, cp_errors 2, vm_faults 7, hangs 4, findings 0
+blob: VM fd 3, queue fd 8: shader 0x10000000, IB 0x10001000, out 0x10002000
+blob: setup failed: Operation timed out
+blob: setup failed: No space left on device
+blob: setup failed: No space left on device
+blob: setup failed: No space left on device
+== si-fuzz status lines
+si-fuzz: all for 86400 s, seed 0x24f00d, 6 ioctl threads, hang_ms 5000 (job wait 20000 ms), re-inits 2, pace 210 s, generations 60 s
+si-fuzz: ioctl generation 1: uid 61001, seed 0x24f00e
+si-fuzz: blob generation 2: uid 62002, seed 0x24f00f
+si-fuzz:    0 s: 0 calls, blob 0 jobs (0 ok, 0 failed, 0 clean after), canary 1, re-inits 2, cp_errors 2, vm_faults 7, hangs 4, findings 0
+si-fuzz: ioctl generation 3: uid 61003, seed 0x24f010
+si-fuzz:   61 s: 68677 calls, blob 1 jobs (0 ok, 1 failed, 0 clean after), canary 13, re-inits 2, cp_errors 2, vm_faults 7, hangs 5, findings 0
+si-fuzz: ioctl generation 4: uid 61004, seed 0x24f011
+si-fuzz: blob generation 5: uid 62005, seed 0x24f012
+si-fuzz:  121 s: 75778 calls, blob 1 jobs (0 ok, 1 failed, 0 clean after), canary 25, re-inits 2, cp_errors 2, vm_faults 7, hangs 5, findings 0
+si-fuzz: ioctl generation 6: uid 61006, seed 0x24f013
+si-fuzz:  181 s: 85217 calls, blob 1 jobs (0 ok, 1 failed, 0 clean after), canary 37, re-inits 2, cp_errors 2, vm_faults 7, hangs 5, findings 0
+si-fuzz: ioctl generation 7: uid 61007, seed 0x24f014
+si-fuzz: blob generation 8: uid 62008, seed 0x24f015
+si-fuzz:  241 s: 92844 calls, blob 1 jobs (0 ok, 1 failed, 0 clean after), canary 49, re-inits 2, cp_errors 2, vm_faults 7, hangs 5, findings 0
+si-fuzz: ioctl generation 9: uid 61009, seed 0x24f016
+si-fuzz:  301 s: 118253 calls, blob 1 jobs (0 ok, 1 failed, 0 clean after), canary 61, re-inits 2, cp_errors 2, vm_faults 7, hangs 5, findings 0
+si-fuzz: ioctl generation 10: uid 61010, seed 0x24f017
+si-fuzz: blob generation 11: uid 62011, seed 0x24f018
+si-fuzz:  361 s: 131726 calls, blob 1 jobs (0 ok, 1 failed, 0 clean after), canary 73, re-inits 2, cp_errors 2, vm_faults 7, hangs 5, findings 0
+si-fuzz: ioctl generation 12: uid 61012, seed 0x24f019
+si-fuzz:  421 s: 140764 calls, blob 1 jobs (0 ok, 1 failed, 0 clean after), canary 85, re-inits 2, cp_errors 2, vm_faults 7, hangs 5, findings 0
+si-fuzz: ioctl generation 13: uid 61013, seed 0x24f01a
+si-fuzz: blob generation 14: uid 62014, seed 0x24f01b
+si-fuzz:  481 s: 148820 calls, blob 1 jobs (0 ok, 1 failed, 0 clean after), canary 97, re-inits 2, cp_errors 2, vm_faults 7, hangs 5, findings 0
+si-fuzz: ioctl generation 15: uid 61015, seed 0x24f01c
+si-fuzz:  541 s: 168313 calls, blob 1 jobs (0 ok, 1 failed, 0 clean after), canary 109, re-inits 2, cp_errors 2, vm_faults 7, hangs 5, findings 0
+si-fuzz: ioctl generation 16: uid 61016, seed 0x24f01d
+si-fuzz: blob generation 17: uid 62017, seed 0x24f01e
+si-fuzz:  601 s: 177736 calls, blob 1 jobs (0 ok, 1 failed, 0 clean after), canary 121, re-inits 2, cp_errors 2, vm_faults 7, hangs 5, findings 0
+si-fuzz: ioctl generation 18: uid 61018, seed 0x24f01f
+si-fuzz:  661 s: 195711 calls, blob 1 jobs (0 ok, 1 failed, 0 clean after), canary 133, re-inits 2, cp_errors 2, vm_faults 7, hangs 5, findings 0
+== blob setup failures
+610
+blob: setup failed: Operation timed out
+== pgrep -fl si-fuzz
+9631 /root/si-fuzz all 86400 0x24f00d
+9392 timeout 88200 /root/si-fuzz all 86400 0x24f00d
+9393 /root/si-fuzz all 86400 0x24f00d
+9712 /root/si-fuzz all 86400 0x24f00d
+== kernel lines 16:41:20-16:41:58 (re-inits, first flush timeout)
+Nov 13 16:41:21 atrium-r9700 kernel: atrium_gpu_amd_pci0: mes: pipe 0 ADD_QUEUE (user compute): ok in 200 us (status 0x1)
+Nov 13 16:41:21 atrium-r9700 kernel: atrium_gpu_amd_pci0: uq4: added: VM base 0x801c001, queue pages at VA 0x200040000 (pa 0x303c01000), MQD GART 0x90000, doorbell 0x28
+Nov 13 16:41:21 atrium-r9700 kernel: atrium_gpu_amd_pci0: mes: pipe 0 REMOVE_QUEUE (user compute): ok in 190 us (status 0x1)
+Nov 13 16:41:21 atrium-r9700 kernel: atrium_gpu_amd_pci0: uq4: removed (seq 1, fence 1)
+Nov 13 16:41:21 atrium-r9700 kernel: atrium_gpu_amd_pci0: mes: pipe 0 REMOVE_QUEUE (user compute): ok in 180 us (status 0x1)
+Nov 13 16:41:21 atrium-r9700 kernel: atrium_gpu_amd_pci0: uq3: removed (seq 4, fence 4)
+Nov 13 16:41:21 atrium-r9700 kernel: atrium_gpu_amd_pci0: mes: pipe 0 ADD_QUEUE (user compute): ok in 190 us (status 0x1)
+Nov 13 16:41:21 atrium-r9700 kernel: atrium_gpu_amd_pci0: uq3: added: VM base 0x801c001, queue pages at VA 0x200030000 (pa 0x2f61f2000), MQD GART 0x8c000, doorbell 0x26
+Nov 13 16:41:21 atrium-r9700 kernel: atrium_gpu_amd_pci0: mes: pipe 0 ADD_QUEUE (user compute): ok in 190 us (status 0x1)
+Nov 13 16:41:21 atrium-r9700 kernel: atrium_gpu_amd_pci0: uq4: added: VM base 0x8034001, queue pages at VA 0x200040000 (pa 0x303c01000), MQD GART 0x90000, doorbell 0x28
+Nov 13 16:41:22 atrium-r9700 kernel: atrium_gpu_amd_pci0: uq4: HQD me1 pipe 1 queue 2 (VMID 12) reset: STILL ACTIVE after 100000 us
+Nov 13 16:41:22 atrium-r9700 kernel: atrium_gpu_amd_pci0: uq4: per-queue recovery: suspend all, hang detect, MES reset, remove, resume all
+Nov 13 16:41:22 atrium-r9700 kernel: atrium_gpu_amd_pci0: mes: per-queue recovery: before: CP_MES_CNTL 0xc000000; pipe 0: instr 0x7ec4, GP3 0x1029097, HQD active 1, rptr 0x380, wptr 0x3f80; pipe 1: instr 0x7ec4, GP3 0x1029097, HQD active 1, rptr 0x180, wptr 0x180; GRBM_STATUS 0xa800382c, CP_STAT 0, RLC_STAT 0x35
+Nov 13 16:41:22 atrium-r9700 kernel: atrium_gpu_amd_pci0: mes: per-queue recovery: before: GRBM_STATUS2 0x34110000, GRBM_STATUS3 0x4000, CP_CPC_STATUS 0xa0000051, CP_CPC_BUSY_STAT 0x849/0, CP_CPF_STATUS 0xa8008001, CP_BUSY_STAT 0, RLC_GPM_STAT 0x1400b7
+Nov 13 16:41:30 atrium-r9700 kernel: atrium_gpu_amd_pci0: mes: pipe 0 REMOVE_QUEUE (user compute): no answer in 2.1 s (fence 0x81 of 0x83, status 0x8100080000000000, rptr 0)
+Nov 13 16:41:32 atrium-r9700 kernel: atrium_gpu_amd_pci0: mes: pipe 0 REMOVE_QUEUE (user compute, after reset): no answer in 2.1 s (fence 0x82 of 0x84, status 0x8100080000000000, rptr 0)
+Nov 13 16:41:34 atrium-r9700 kernel: atrium_gpu_amd_pci0: mes: per-queue recovery: after: CP_MES_CNTL 0xc000000; pipe 0: instr 0x17bb, GP3 0x1029097, HQD active 1, rptr 0x280, wptr 0x4280; pipe 1: instr 0x7ec4, GP3 0x1029097, HQD active 1, rptr 0x180, wptr 0x180; GRBM_STATUS 0xa800382c, CP_STAT 0, RLC_STAT 0x25
+Nov 13 16:41:34 atrium-r9700 kernel: atrium_gpu_amd_pci0: mes: per-queue recovery: after: GRBM_STATUS2 0x30110000, GRBM_STATUS3 0x4000, CP_CPC_STATUS 0xa0090451, CP_CPC_BUSY_STAT 0x849/0x4480, CP_CPF_STATUS 0xa8008001, CP_BUSY_STAT 0, RLC_GPM_STAT 0x1400b7
+Nov 13 16:41:34 atrium-r9700 kernel: atrium_gpu_amd_pci0: uq4: per-queue recovery: suspend 5 (fence missing), hang reset 60, MES reset 60, remove 60, HQD STILL ACTIVE, resume 0: failed
+Nov 13 16:41:37 atrium-r9700 kernel: atrium_gpu_amd_pci0: si: re-init: PSP load returned 60 (as at attach; the SMU start completes the RLC autoload)
+Nov 13 16:41:39 atrium-r9700 kernel: atrium_gpu_amd_pci0: mes: pipe 1 ADD_QUEUE (scheduler): ok in 110 us (status 0x1)
+Nov 13 16:41:39 atrium-r9700 kernel: atrium_gpu_amd_pci0: mes: pipe 0 ADD_QUEUE (compute): ok in 80 us (status 0x1)
+Nov 13 16:41:39 atrium-r9700 kernel: atrium_gpu_amd_pci0: mes: pipe 0 REMOVE_QUEUE (compute): ok in 240 us (status 0x1)
+Nov 13 16:41:40 atrium-r9700 kernel: atrium_gpu_amd_pci0: si: GPU re-init 1 of 3 in this window: PASS (MES up, kernel compute queue ready)
+Nov 13 16:41:40 atrium-r9700 kernel: atrium_gpu_amd_pci0: mes: pipe 0 ADD_QUEUE (compute): ok in 220 us (status 0x1)
+Nov 13 16:41:40 atrium-r9700 kernel: atrium_gpu_amd_pci0: si: GPU re-initialised (1 so far): old VMs (0x3e) and queues are lost (EIO) until closed; new ones run
+Nov 13 16:41:41 atrium-r9700 kernel: atrium_gpu_amd_pci0: mes: pipe 0 ADD_QUEUE (user compute): ok in 190 us (status 0x1)
+Nov 13 16:41:41 atrium-r9700 kernel: atrium_gpu_amd_pci0: uq3: added: VM base 0x8023001, queue pages at VA 0x200030000 (pa 0x2f61f2000), MQD GART 0x8c000, doorbell 0x26
+Nov 13 16:41:41 atrium-r9700 kernel: atrium_gpu_amd_pci0: mes: pipe 0 ADD_QUEUE (user compute): ok in 200 us (status 0x1)
+Nov 13 16:41:41 atrium-r9700 kernel: atrium_gpu_amd_pci0: uq4: added: VM base 0x8029001, queue pages at VA 0x200040000 (pa 0x303c01000), MQD GART 0x90000, doorbell 0x28
+Nov 13 16:41:41 atrium-r9700 kernel: atrium_gpu_amd_pci0: uq4: HQD me1 pipe 0 queue 1 (VMID 9) reset: STILL ACTIVE after 100000 us
+Nov 13 16:41:41 atrium-r9700 kernel: atrium_gpu_amd_pci0: uq4: per-queue recovery: suspend all, hang detect, MES reset, remove, resume all
+Nov 13 16:41:41 atrium-r9700 kernel: atrium_gpu_amd_pci0: mes: per-queue recovery: before: CP_MES_CNTL 0xc000000; pipe 0: instr 0x7ec4, GP3 0x1029097, HQD active 1, rptr 0, wptr 0x400; pipe 1: instr 0x7ec4, GP3 0x1029097, HQD active 1, rptr 0x180, wptr 0x180; GRBM_STATUS 0xa800382c, CP_STAT 0, RLC_STAT 0x35
+Nov 13 16:41:41 atrium-r9700 kernel: atrium_gpu_amd_pci0: mes: per-queue recovery: before: GRBM_STATUS2 0x34110000, GRBM_STATUS3 0x4000, CP_CPC_STATUS 0xa0000051, CP_CPC_BUSY_STAT 0x449/0, CP_CPF_STATUS 0xa8008001, CP_BUSY_STAT 0, RLC_GPM_STAT 0x140097
+Nov 13 16:41:49 atrium-r9700 kernel: atrium_gpu_amd_pci0: mes: pipe 0 REMOVE_QUEUE (user compute): refused (fence 0xc of 0xc, status 0x8100030100000000, rptr 0)
+Nov 13 16:41:49 atrium-r9700 kernel: atrium_gpu_amd_pci0: gmc: client fault: fault status 0xb3a: client CPC (0x5), VMID 0, MORE_FAULTS 0, WALKER_ERROR 0x5, PERMISSIatrium_gpu_amd_pci0: mes: pipe 0 REMOVE_QUEUE (user compute, after reset): refused (fence 0xd of 0xd, status 0x8100030300000000ON_FAULTS 0x3, MAPPING_ERROR 1, RW 0, ATOMIC 0, PRT 0, UCE 0
+Nov 13 16:41:49 atrium-r9700 kernel: atrium_gpu_amd_pci0: mes: per-queue recovery: after: CP_MES_CNTL 0xc000000; pipe 0: instr 0x1824, GP3 0x1029097, HQD active 1, rptr 0x300, wptr 0x700; pipe 1: instr 0x7ec4, GP3 0x1029097, HQD active 1, rptr 0x180, wptr 0x180; GRBM_STATUS 0xa800382c, CP_STAT 0, RLC_STAT 0x25
+Nov 13 16:41:49 atrium-r9700 kernel: atrium_gpu_amd_pci0: mes: per-queue recovery: after: GRBM_STATUS2 0x30110000, GRBM_STATUS3 0x4000, CP_CPC_STATUS 0xa0090451, CP_CPC_BUSY_STAT 0x449/0x4480, CP_CPF_STATUS 0xa8008001, CP_BUSY_STAT 0, RLC_GPM_STAT 0x140097
+Nov 13 16:41:49 atrium-r9700 kernel: atrium_gpu_amd_pci0: uq4: per-queue recovery: suspend 5 (fence missing), hang reset 5, MES reset 5, remove 5, HQD STILL ACTIVE, resume 0: failed
+Nov 13 16:41:53 atrium-r9700 kernel: atrium_gpu_amd_pci0: si: re-init: PSP load returned 60 (as at attach; the SMU start completes the RLC autoload)
+Nov 13 16:41:55 atrium-r9700 kernel: atrium_gpu_amd_pci0: mes: pipe 1 ADD_QUEUE (scheduler): ok in 110 us (status 0x1)
+Nov 13 16:41:55 atrium-r9700 kernel: atrium_gpu_amd_pci0: mes: pipe 0 ADD_QUEUE (compute): ok in 80 us (status 0x1)
+Nov 13 16:41:55 atrium-r9700 kernel: atrium_gpu_amd_pci0: mes: pipe 0 REMOVE_QUEUE (compute): ok in 170 us (status 0x1)
+Nov 13 16:41:56 atrium-r9700 kernel: atrium_gpu_amd_pci0: si: GPU re-init 2 of 3 in this window: PASS (MES up, kernel compute queue ready)
+Nov 13 16:41:56 atrium-r9700 kernel: atrium_gpu_amd_pci0: mes: pipe 0 ADD_QUEUE (compute): ok in 230 us (status 0x1)
+Nov 13 16:41:56 atrium-r9700 kernel: atrium_gpu_amd_pci0: si: GPU re-initialised (2 so far): old VMs (0x3e) and queues are lost (EIO) until closed; new ones run
+Nov 13 16:41:57 atrium-r9700 kernel: atrium_gpu_amd_pci0: mes: pipe 0 ADD_QUEUE (user compute): ok in 190 us (status 0x1)
+Nov 13 16:41:57 atrium-r9700 kernel: atrium_gpu_amd_pci0: uq3: added: VM base 0x8022001, queue pages at VA 0x200030000 (pa 0x2f61f2000), MQD GART 0x8c000, doorbell 0x26
+Nov 13 16:41:57 atrium-r9700 kernel: atrium_gpu_amd_pci0: mes: pipe 0 REMOVE_QUEUE (user compute): ok in 160 us (status 0x1)
+Nov 13 16:41:57 atrium-r9700 kernel: atrium_gpu_amd_pci0: uq3: removed (seq 1, fence 1)
+Nov 13 16:41:57 atrium-r9700 kernel: atrium_gpu_amd_pci0: mes: pipe 0 ADD_QUEUE (user compute): ok in 250 us (status 0x1)
+Nov 13 16:41:57 atrium-r9700 kernel: atrium_gpu_amd_pci0: uq0: added: VM base 0x801e001, queue pages at VA 0x200000000 (pa 0x35325c000), MQD GART 0x80000, doorbell 0x20
+Nov 13 16:41:57 atrium-r9700 kernel: atrium_gpu_amd_pci0: mes: pipe 0 ADD_QUEUE (user compute): ok in 180 us (status 0x1)
+Nov 13 16:41:57 atrium-r9700 kernel: atrium_gpu_amd_pci0: uq1: added: VM base 0x8021001, queue pages at VA 0x200010000 (pa 0x353254000), MQD GART 0x84000, doorbell 0x22
+Nov 13 16:41:57 atrium-r9700 kernel: atrium_gpu_amd_pci0: mes: pipe 0 ADD_QUEUE (user compute): ok in 190 us (status 0x1)
+Nov 13 16:41:57 atrium-r9700 kernel: atrium_gpu_amd_pci0: uq2: added: VM base 0x802f001, queue pages at VA 0x200020000 (pa 0x2a3720000), MQD GART 0x88000, doorbell 0x24
+Nov 13 16:41:57 atrium-r9700 kernel: atrium_gpu_amd_pci0: mes: pipe 0 ADD_QUEUE (user compute): ok in 230 us (status 0x1)
+Nov 13 16:41:57 atrium-r9700 kernel: atrium_gpu_amd_pci0: uq3: added: VM base 0x803d001, queue pages at VA 0x200030000 (pa 0x2f61f2000), MQD GART 0x8c000, doorbell 0x26
+Nov 13 16:41:57 atrium-r9700 kernel: atrium_gpu_amd_pci0: mes: pipe 0 ADD_QUEUE (user compute): ok in 220 us (status 0x1)
+Nov 13 16:41:57 atrium-r9700 kernel: atrium_gpu_amd_pci0: uq4: added: VM base 0x8047001, queue pages at VA 0x200040000 (pa 0x303c01000), MQD GART 0x90000, doorbell 0x28
+== flush timeouts since 16:40:46 by context
+1228 flush of context 2
+1096 flush of context 3
+ 996 flush of context 4
+1029 flush of context 5
+1036 flush of context 6
+1104 flush of context 7
+   6 flush of context 8
+   6 flush of context 9
+   6 flush of context 10
+   6 flush of context 11
+   6 flush of context 12
+   6 flush of context 13
+   6 flush of context 14
+   6 flush of context 15
+== tail -20 /var/log/messages
+Nov 13 16:53:10 atrium-r9700 kernel: atrium_gpu_amd_pci0: gmc: GFXHUB (GC 12.0) flush of context 4 timed out: INV_REQ 0xf80010, INV_ACK 0
+Nov 13 16:53:10 atrium-r9700 kernel: atrium_gpu_amd_pci0: gmc: GFXHUB (GC 12.0) after the timeout: CONTEXT0_CNTL 0x3fffc01, PT base 005800001, L1_TLB 0x1859, L2_CNTL 0x80e01, fault status 0 (addr 000000000)
+Nov 13 16:53:10 atrium-r9700 kernel: atrium_gpu_amd_pci0: gmc: GFXHUB (GC 12.0) flush of context 2 timed out: INV_REQ 0xf80004, INV_ACK 0
+Nov 13 16:53:10 atrium-r9700 kernel: atrium_gpu_amd_pci0: gmc: GFXHUB (GC 12.0) after the timeout: CONTEXT0_CNTL 0x3fffc01, PT base 005800001, L1_TLB 0x1859, L2_CNTL 0x80e01, fault status 0 (addr 000000000)
+Nov 13 16:53:11 atrium-r9700 kernel: atrium_gpu_amd_pci0: gmc: GFXHUB (GC 12.0) flush of context 4 timed out: INV_REQ 0xf80010, INV_ACK 0
+Nov 13 16:53:11 atrium-r9700 kernel: atrium_gpu_amd_pci0: gmc: GFXHUB (GC 12.0) after the timeout: CONTEXT0_CNTL 0x3fffc01, PT base 005800001, L1_TLB 0x1859, L2_CNTL 0x80e01, fault status 0 (addr 000000000)
+Nov 13 16:53:11 atrium-r9700 kernel: atrium_gpu_amd_pci0: gmc: GFXHUB (GC 12.0) flush of context 2 timed out: INV_REQ 0xf80004, INV_ACK 0
+Nov 13 16:53:11 atrium-r9700 kernel: atrium_gpu_amd_pci0: gmc: GFXHUB (GC 12.0) after the timeout: CONTEXT0_CNTL 0x3fffc01, PT base 005800001, L1_TLB 0x1859, L2_CNTL 0x80e01, fault status 0 (addr 000000000)
+Nov 13 16:53:11 atrium-r9700 kernel: atrium_gpu_amd_pci0: gmc: GFXHUB (GC 12.0) flush of context 4 timed out: INV_REQ 0xf80010, INV_ACK 0
+Nov 13 16:53:11 atrium-r9700 kernel: atrium_gpu_amd_pci0: gmc: GFXHUB (GC 12.0) after the timeout: CONTEXT0_CNTL 0x3fffc01, PT base 005800001, L1_TLB 0x1859, L2_CNTL 0x80e01, fault status 0 (addr 000000000)
+Nov 13 16:53:11 atrium-r9700 kernel: atrium_gpu_amd_pci0: gmc: GFXHUB (GC 12.0) flush of context 3 timed out: INV_REQ 0xf80008, INV_ACK 0
+Nov 13 16:53:11 atrium-r9700 kernel: atrium_gpu_amd_pci0: gmc: GFXHUB (GC 12.0) after the timeout: CONTEXT0_CNTL 0x3fffc01, PT base 005800001, L1_TLB 0x1859, L2_CNTL 0x80e01, fault status 0 (addr 000000000)
+Nov 13 16:53:11 atrium-r9700 kernel: atrium_gpu_amd_pci0: gmc: GFXHUB (GC 12.0) flush of context 3 timed out: INV_REQ 0xf80008, INV_ACK 0
+Nov 13 16:53:11 atrium-r9700 kernel: atrium_gpu_amd_pci0: gmc: GFXHUB (GC 12.0) after the timeout: CONTEXT0_CNTL 0x3fffc01, PT base 005800001, L1_TLB 0x1859, L2_CNTL 0x80e01, fault status 0 (addr 000000000)
+Nov 13 16:53:11 atrium-r9700 kernel: atrium_gpu_amd_pci0: gmc: GFXHUB (GC 12.0) flush of context 4 timed out: INV_REQ 0xf80010, INV_ACK 0
+Nov 13 16:53:11 atrium-r9700 kernel: atrium_gpu_amd_pci0: gmc: GFXHUB (GC 12.0) after the timeout: CONTEXT0_CNTL 0x3fffc01, PT base 005800001, L1_TLB 0x1859, L2_CNTL 0x80e01, fault status 0 (addr 000000000)
+Nov 13 16:53:11 atrium-r9700 kernel: atrium_gpu_amd_pci0: gmc: GFXHUB (GC 12.0) flush of context 4 timed out: INV_REQ 0xf80010, INV_ACK 0
+Nov 13 16:53:11 atrium-r9700 kernel: atrium_gpu_amd_pci0: gmc: GFXHUB (GC 12.0) after the timeout: CONTEXT0_CNTL 0x3fffc01, PT base 005800001, L1_TLB 0x1859, L2_CNTL 0x80e01, fault status 0 (addr 000000000)
+Nov 13 16:53:11 atrium-r9700 kernel: atrium_gpu_amd_pci0: gmc: GFXHUB (GC 12.0) flush of context 3 timed out: INV_REQ 0xf80008, INV_ACK 0
+Nov 13 16:53:11 atrium-r9700 kernel: atrium_gpu_amd_pci0: gmc: GFXHUB (GC 12.0) after the timeout: CONTEXT0_CNTL 0x3fffc01, PT base 005800001, L1_TLB 0x1859, L2_CNTL 0x80e01, fault status 0 (addr 000000000)
