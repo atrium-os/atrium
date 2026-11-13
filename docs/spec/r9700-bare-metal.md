@@ -799,3 +799,9 @@ work (self-test, scrub).
   use the old ring SUBMIT, SIM kernels, draws, display and reset, none of which exist on
   silicon; how they run there is an open choice (dual-mode recommended). Also: bare
   user-queue doorbells in an EOP's `src_data[0]` are counted as MES preemption EOPs.
+- **2026-11-13, stage 5e step 1 PASSED (60/60).** `1b62fe61`, log `20261113T035017Z`. COPY,
+  INC and FILL as real shaders, each from a System and a VRAM source: 0/64 wrong every
+  time. Preemption EOPs now counted as such (26 = the 26 free-rule preemptions); unrouted
+  stays at 1 (0x18000000 at attach). Tests 1-11 passed again; idle 7 W, detach clean, card
+  cold. Decided (Shankar): gpusim gets queue fds too, both acceptance suites move to queue
+  fds and the old ring SUBMIT retires.
