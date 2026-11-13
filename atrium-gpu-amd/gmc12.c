@@ -41,6 +41,8 @@
 #define VM_POOL_PAGES		64u
 #define VM_SLICE_PAGES		16u		/* tables per VM (test VMs) */
 #define VM_SLICES		(VM_POOL_PAGES / VM_SLICE_PAGES)
+/* The VRAM allocator (5d) starts above all of this. */
+CTASSERT(VM_POOL_VRAM_OFF + VM_POOL_PAGES * PAGE_SIZE <= AMD_SI_VRAM_DRIVER_END);
 
 /* PTE bits (amdgpu_vm.h), GFX12 layout. */
 #define PTE_VALID		(1ull << 0)
@@ -728,7 +730,11 @@ amd_gmc12_vm_map(struct amd_vm12 *vm, uint64_t va, vm_paddr_t pa,
 		return (EINVAL);
 	if ((err = vm_walk(vm, va, true, &t, &i)) != 0)
 		return (err);
-	pte = (uint64_t)pa | PTE_VALID | PTE_SYSTEM | PTE_SNOOPED;
+	/* Local VRAM: the physical FB address, neither SYSTEM nor SNOOPED
+	 * (amdgpu_vm_bo_update for a VRAM BO; 4L: MTYPE NC). */
+	pte = (uint64_t)pa | PTE_VALID;
+	if ((prot & AMD_VM_VRAM) == 0)
+		pte |= PTE_SYSTEM | PTE_SNOOPED;
 	if (prot & AMD_VM_READ)
 		pte |= PTE_READABLE;
 	if (prot & AMD_VM_WRITE)

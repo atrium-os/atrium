@@ -9,8 +9,12 @@
  *   VMs     each VM fd gets one of the kernel's VMIDs (1-7; MES owns 8-15)
  *           and its own four-level GPUVM table (gmc12.c, 5b), so a VM's
  *           work can reach only what is bound in it.
- *   BOs     System memory (bus_dma pages, bo.c). VRAM BOs wait for the
- *           silicon VRAM allocator (5d): EOPNOTSUPP.
+ *   BOs     System memory (bus_dma pages, bo.c), or VRAM (5d) from the
+ *           base's allocator (vram.c over the range amd_si_vram_init
+ *           chose), mapped with VRAM PTEs. Freed VRAM is scrubbed before
+ *           reuse by si_vram_clear: CP DMA zero-fills on the kernel queue,
+ *           under VMID 0, which reaches VRAM by MC address and which no
+ *           client VMID maps. The whole range starts dirty.
  *   SUBMIT  the compute engine only. The kernel compute queue (mes12.c,
  *           amd_kq: VMID 0, mapped by MES) runs the client's ring as an
  *           INDIRECT_BUFFER under the VM's VMID, then writes a sequence
@@ -56,6 +60,8 @@
 #define SI_KCQ_DOORBELL		(0x03u << 1)	/* mes12.c KCQ_DOORBELL */
 #define SI_UQ_VA		0x200000000ull	/* above the BO window */
 #define SI_UQ_VA_STRIDE		0x10000ull
+#define SI_SCRUB_TIMEOUT_MS	2000	/* one fill of AMD_KQ_FILL_MAX */
+#define SI_UNROUTED_KEEP	4	/* distinct unrouted EOP values kept */
 
 /* One client queue fd's MES user queue (5c-2b). */
 struct si_uq_owed {
@@ -120,6 +126,11 @@ struct amd_si_client {
 	uint32_t b_fault_vmids;		/* every VMID that faulted */
 	bool	 b_uq_scan;		/* an EOP named no queue: check all */
 	uint32_t b_unrouted_db;		/* ... and the doorbell it gave */
+	/* The first distinct unrouted src_data[0] values and their counts
+	 * (the IV thread writes, the close log reads; diagnostic). */
+	uint32_t unr_val[SI_UNROUTED_KEEP];
+	uint64_t unr_cnt[SI_UNROUTED_KEEP];
+	uint64_t scrub_fills, scrub_busy_waits;
 	uint16_t b_fault_vmid;
 	uint64_t b_fault_addr;
 	struct timeval log_last;
@@ -463,6 +474,13 @@ si_iv_eop_route(struct amd_si_client *c, uint32_t ctx)
 	c->uq_eop_unrouted++;
 	c->b_uq_scan = true;
 	c->b_unrouted_db = ctx;
+	for (slot = 0; slot < SI_UNROUTED_KEEP; slot++) {
+		if (c->unr_cnt[slot] != 0 && c->unr_val[slot] != ctx)
+			continue;
+		c->unr_val[slot] = ctx;
+		c->unr_cnt[slot]++;
+		break;
+	}
 }
 
 static void
@@ -830,6 +848,13 @@ amd_si_uq_destroy(struct atrium_amd_softc *sc, int slot)
 	    (uintmax_t)c->uq_retired_poll, (uintmax_t)c->uq_faults,
 	    (uintmax_t)c->uq_hangs, (uintmax_t)c->uq_preempts,
 	    (uintmax_t)c->uq_preempt_fails);
+	if (c->unr_cnt[0] != 0)
+		device_printf(sc->dev, "si: unrouted EOP src_data[0]: %#x x%ju, "
+		    "%#x x%ju, %#x x%ju, %#x x%ju\n",
+		    c->unr_val[0], (uintmax_t)c->unr_cnt[0],
+		    c->unr_val[1], (uintmax_t)c->unr_cnt[1],
+		    c->unr_val[2], (uintmax_t)c->unr_cnt[2],
+		    c->unr_val[3], (uintmax_t)c->unr_cnt[3]);
 	if (err == 0) {
 		mtx_lock(&sc->lock);
 		u->busy = false;
@@ -1082,8 +1107,10 @@ static int
 si_bo_alloc(struct atrium_amd_softc *sc, struct atrium_amd_bo *bo,
     uint64_t size, uint32_t flags)
 {
-	if ((flags & ATRIUM_GPU_BO_VRAM) != 0)
-		return (EOPNOTSUPP);	/* 5d: the silicon VRAM allocator */
+	/* VRAM only with the allocator up (caps say so; the front-end
+	 * refuses first) and a clear engine to scrub what is freed. */
+	if ((flags & ATRIUM_GPU_BO_VRAM) != 0 && !sc->vram.inited)
+		return (EOPNOTSUPP);
 	return (amd_bo_backing_alloc(sc, bo, size, flags));
 }
 
@@ -1092,14 +1119,24 @@ si_map_page(struct atrium_amd_vm *vm, uint64_t va, vm_paddr_t phys, int vram,
     int writable)
 {
 	struct amd_si_client *c = vm->sc->si_client;
+	struct atrium_amd_vram *v = &vm->sc->vram;
+	u_int prot = AMD_VM_READ | AMD_VM_EXEC | (writable ? AMD_VM_WRITE : 0);
 	int err;
 
-	if (vram || vm->hw12 == NULL)
+	if (vm->hw12 == NULL)
 		return (EINVAL);
 	if (!amd_si_usable(vm->sc))
 		return (ENXIO);
-	err = amd_gmc12_vm_map(vm->hw12, va, phys, AMD_VM_READ | AMD_VM_EXEC |
-	    (writable ? AMD_VM_WRITE : 0));
+	if (vram) {
+		/* A VRAM offset from the allocator: never outside its range
+		 * (the driver's own area, the PSP's). PTE = FB physical. */
+		if (!v->inited || phys < v->lo || phys >= v->lo + v->total ||
+		    (phys & PAGE_MASK) != 0)
+			return (EINVAL);
+		phys += c->gt->vram_base_offset;
+		prot |= AMD_VM_VRAM;
+	}
+	err = amd_gmc12_vm_map(vm->hw12, va, phys, prot);
 	/* A walk may have cached the invalid entry this replaces. */
 	if (err == 0)
 		err = si_vm_flush(c, vm->vmid);
@@ -1135,7 +1172,8 @@ si_get_caps(struct atrium_amd_softc *sc, struct atrium_gpu_backend_caps *c)
 	c->va_base = ATRIUM_AMD_BO_VA_BASE;
 	c->va_size = (uint64_t)ATRIUM_AMD_VM_MAX_BO * PAGE_SIZE;
 	c->va_align = PAGE_SIZE;
-	c->vram_bytes = 0;		/* no VRAM BOs before 5d */
+	/* The device heap: the allocator's range (5d), if it is up. */
+	c->vram_bytes = sc->vram.inited ? sc->vram.total : 0;
 	c->bind_features = ATRIUM_GPU_BIND_FEAT_READ_ONLY;
 	c->isa_family = sc->isa_family;
 	c->isa_revision = sc->isa_revision;
@@ -1162,6 +1200,104 @@ const struct atrium_gpu_backend_ops amd_si_backend = {
 	.get_caps = si_get_caps,
 	/* queue_map (5c-2b), gpu_reset, sched, powergate: not yet. */
 };
+
+/* ---- VRAM scrub (5d) ---- */
+
+/*
+ * The clear engine vram.c calls (its own thread; sleeps). Fills of at most
+ * AMD_KQ_FILL_MAX, each waited for: the fence must pass with the queue's
+ * generation unchanged, so a reset in between (which starts sequence
+ * numbers over) fails the range rather than passing it. A range that fails
+ * stays dirty and vram.c retries it later. Only the allocator's range.
+ */
+static int
+si_vram_clear(struct atrium_amd_softc *sc, uint64_t off, uint64_t len)
+{
+	struct amd_si_client *c = sc->si_client;
+	struct atrium_amd_vram *v = &sc->vram;
+	uint32_t seq, gen;
+	uint64_t n;
+	sbintime_t end;
+	int err = 0;
+
+	if (c == NULL || c->kq == NULL || !amd_si_usable(sc))
+		return (ENXIO);
+	if ((off & PAGE_MASK) != 0 || (len & PAGE_MASK) != 0 || len == 0 ||
+	    off < v->lo || off + len > v->lo + v->total)
+		return (EINVAL);
+	if ((err = amd_si_gfx_hold(sc)) != 0)
+		return (err);
+	while (err == 0 && len > 0) {
+		n = MIN(len, AMD_KQ_FILL_MAX);
+		end = sbinuptime() + SI_SCRUB_TIMEOUT_MS * SBT_1MS;
+		/* Wait for the queue to be idle between client submits. */
+		for (;;) {
+			mtx_lock(&sc->lock);
+			err = c->broken ? EIO : amd_mes12_kq_fill(c->kq,
+			    c->gt->fb_start + off, n, &seq, &gen);
+			if (err == 0)
+				c->scrub_fills++;
+			else if (err == EBUSY)
+				c->scrub_busy_waits++;
+			mtx_unlock(&sc->lock);
+			if (err != EBUSY || sbinuptime() >= end)
+				break;
+			pause_sbt("vramidl", SBT_1MS, 0, 0);
+		}
+		while (err == 0 && !fence_passed(amd_mes12_kq_fence(c->kq),
+		    seq) && amd_mes12_kq_gen(c->kq) == gen) {
+			if (sbinuptime() >= end || !amd_si_usable(sc))
+				err = ETIMEDOUT;
+			else
+				pause_sbt("vramscr", SBT_1MS, 0, 0);
+		}
+		if (err == 0 && amd_mes12_kq_gen(c->kq) != gen)
+			err = EIO;	/* reset under it: not known done */
+		off += n;
+		len -= n;
+	}
+	amd_si_gfx_release(sc);
+	return (err);
+}
+
+/*
+ * Before the engine is trusted with VRAM: the allocator's first two pages
+ * (dirty, not handed out yet) get a pattern through BAR0; a fill of the
+ * first must zero it and leave the second alone, which proves the MC
+ * address is the offset the allocator meant. Skipped (engine still
+ * registered) if BAR0 does not reach that far.
+ */
+static int
+si_vram_selftest(struct atrium_amd_softc *sc, struct amd_si_client *c)
+{
+	struct resource *bar = c->gt->vram;
+	uint64_t off = sc->vram.lo;
+	u_int i, zero = 0, kept = 0, words = PAGE_SIZE / 4;
+	int err;
+
+	if (bar == NULL || rman_get_size(bar) < off + 2 * PAGE_SIZE) {
+		device_printf(sc->dev, "si: VRAM scrub self-test skipped (BAR0 "
+		    "%#jx bytes)\n", bar == NULL ? 0 :
+		    (uintmax_t)rman_get_size(bar));
+		return (0);
+	}
+	bus_set_region_4(bar, off, 0xa5a5a5a5u, 2 * words);
+	amd_hdp_flush(sc);
+	if ((err = si_vram_clear(sc, off, PAGE_SIZE)) != 0) {
+		device_printf(sc->dev, "si: VRAM scrub self-test: fill failed "
+		    "(%d)\n", err);
+		return (err);
+	}
+	for (i = 0; i < words; i++) {
+		zero += bus_read_4(bar, off + i * 4) == 0;
+		kept += bus_read_4(bar, off + PAGE_SIZE + i * 4) == 0xa5a5a5a5u;
+	}
+	device_printf(sc->dev, "si: VRAM scrub self-test at %#jx (MC %#jx): "
+	    "%u/%u words zeroed, %u/%u of the next page kept: %s\n",
+	    (uintmax_t)off, (uintmax_t)(c->gt->fb_start + off), zero, words,
+	    kept, words, zero == words && kept == words ? "PASS" : "FAIL");
+	return (zero == words && kept == words ? 0 : EIO);
+}
 
 /* ---- attach / detach (module.c) ---- */
 
@@ -1196,6 +1332,15 @@ amd_si_client_up(struct atrium_amd_softc *sc)
 	amd_si_client_attached(sc, true);
 	sc->si_client = c;
 	amd_ih7_set_consumer(c->ih, si_iv, c);
+	/* 5d: the scrub engine, once it proved where it writes. Without it
+	 * freed VRAM (and the dirty start) is never handed out. */
+	if (sc->vram.inited) {
+		if (si_vram_selftest(sc, c) == 0)
+			amd_vram_set_clear(sc, si_vram_clear);
+		else
+			device_printf(sc->dev, "si: no VRAM scrub engine: VRAM "
+			    "stays dirty, VRAM BOs fail with ENOMEM\n");
+	}
 	return (0);
 }
 
@@ -1206,6 +1351,12 @@ amd_si_client_down(struct atrium_amd_softc *sc)
 
 	if (c == NULL)
 		return;
+	/* The scrub uses the kernel queue: stop it first (waits out a range
+	 * in progress). */
+	amd_vram_set_clear(sc, NULL);
+	device_printf(sc->dev, "si: VRAM scrub: %ju fills, %ju waits for an "
+	    "idle queue\n", (uintmax_t)c->scrub_fills,
+	    (uintmax_t)c->scrub_busy_waits);
 	amd_ih7_set_consumer(c->ih, NULL, NULL);
 	callout_drain(&c->uq_poll);
 	taskqueue_drain(taskqueue_thread, &c->uq_task);

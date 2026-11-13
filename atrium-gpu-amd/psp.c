@@ -371,6 +371,11 @@ psp_fw_reservation(struct atrium_amd_softc *sc, struct resource *vram,
 
 	memsize = (uint64_t)amd_mmio_read32(sc,
 	    ((bus_size_t)sc->ip.nbif.base[2] + NBIF6_RCC_CONFIG_MEMSIZE) * 4) << 20;
+	CTASSERT(nitems(q) <= nitems(sc->psp_resv_off));
+	for (i = 0; i < nitems(q); i++) {
+		sc->psp_resv_off[i] = 0;
+		sc->psp_resv_size[i] = 0;
+	}
 	for (i = 0; i < nitems(q); i++) {
 		if (psp_cmd(sc, vram, fb_base, q[i].id, NULL, 0, ++*fence,
 		    &status) != 0)
@@ -383,6 +388,10 @@ psp_fw_reservation(struct atrium_amd_softc *sc, struct resource *vram,
 		addr = (uint64_t)psp_resp(vram, GFX_RESP_OFF_URESP) << 32 |
 		    psp_resp(vram, GFX_RESP_OFF_URESP + 4);
 		size = psp_resp(vram, GFX_RESP_OFF_URESP + 8);
+		if (status == 0 && size != 0) {
+			sc->psp_resv_off[i] = addr;
+			sc->psp_resv_size[i] = size;
+		}
 		device_printf(sc->dev, "psp: %s: status %#x, VRAM %#jx + %#x "
 		    "(%u MiB)%s\n", q[i].name, status, (uintmax_t)addr, size,
 		    size >> 20, size != 0 && addr + size != memsize ?

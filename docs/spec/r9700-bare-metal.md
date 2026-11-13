@@ -762,3 +762,21 @@ work (self-test, scrub).
   detach clean, card cold. Open: the unrouted EOP count rises with the preemptions (1 to
   22) while only two are logged (rate limit); the SUSPEND/RESUME EOPs need identifying and
   counting as MES's own. Next: 5d (VRAM).
+- **2026-11-13, stage 5d built (box run pending): VRAM.** The base starts the VRAM
+  allocator (vram.c) on silicon after attach, over `[128 MiB, lowest PSP reservation)`
+  rounded to 2 MiB: below is the driver's own fixed area (PSP 64, IP fw 68, SMU 84, GART
+  88, page-table pool 92 MiB), above it the PSP's reservations (FB_FW_RESERV_ADDR[_EXT],
+  now kept in the softc) and the top-of-VRAM areas amdgpu also reserves; with no
+  reservation reported, the top 1 GiB stays out. Silicon need not wipe VRAM at a reset, so
+  the whole range starts dirty (1 GiB pieces) and is handed out only as the scrub clears
+  it. The scrub is CP DMA (DMA_DATA fill, SRC_SEL DATA, DST through the L2, CP_SYNC) on the
+  kernel compute queue's own ring, so under VMID 0 at MC `fb_start + offset` (system
+  aperture), 256 MiB per fence, only when the queue is idle between client submits, and
+  checked against the queue's reset generation so a reset never passes a range unscrubbed.
+  The engine registers only after a self-test (a BAR0 pattern on the range's first two
+  pages: the fill must zero the first and leave the second). VRAM BOs map with VRAM PTEs
+  (FB physical, no SYSTEM/SNOOPED), only inside the allocator's range; caps report the
+  range as the device heap. Test 11 (VRAM BO reads zero, a fill reads back through a CP
+  DMA copy, CPU read refused, freed BO scrubbed, the next BO reads zero); test 6's "VRAM
+  refused" check is gone. Also: the first four distinct unrouted EOP `src_data[0]` values
+  are counted and logged at queue close, to identify the SUSPEND/RESUME EOPs.

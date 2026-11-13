@@ -126,7 +126,14 @@ atrium_amd_pci_attach(device_t dev)
 		TUNABLE_INT_FETCH("hw.atrium_gpu.attach", &attach);
 		if (attach && psp_bootload) {
 			if (amd_si_attach(sc) == 0) {
-				int client = 0;
+				int client = 0, err;
+
+				/* 5d: the VRAM allocator over silicon VRAM. The
+				 * gpu child's clear engine scrubs it. Without
+				 * it, VRAM BOs are refused (no heap). */
+				if ((err = amd_si_vram_init(sc)) != 0)
+					device_printf(dev, "VRAM allocator not "
+					    "up (%d): no VRAM BOs\n", err);
 
 				/*
 				 * Stage 5c-2a (kenv hw.atrium_gpu.client=1):

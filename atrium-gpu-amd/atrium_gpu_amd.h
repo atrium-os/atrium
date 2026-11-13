@@ -372,6 +372,8 @@
 /* DMA_DATA fields (public layout, Mesa sid.h R_411/R_415; GFX9+). */
 #define DMA_DATA_SRC_SEL_DATA	(2u << 29)	/* DW1: source is the DW2 value */
 #define DMA_DATA_CP_SYNC	(1u << 31)	/* DW1: finish before the next packet */
+#define DMA_DATA_DST_SEL_L2	(3u << 20)	/* DW1: memory through the L2 (GFX9+) */
+#define DMA_DATA_SRC_SEL_L2	(3u << 29)	/* DW1: source is memory via the L2 */
 #define DMA_DATA_MAX_BYTES	((1u << 26) - 1)	/* DW6 BYTE_COUNT width */
 #define IT_DISPATCH_DIRECT	0x15u
 #define IT_DRAW_INDEX_AUTO	0x2du
@@ -754,8 +756,10 @@ struct atrium_amd_vram {
 	struct mtx	 lock;		/* everything below */
 	int		 inited;
 	vmem_t		*arena;		/* clean free VRAM (offsets + ARENA_BASE) */
-	uint64_t	 total;		/* device VRAM bytes */
-	uint64_t	 visible;	/* of which the CPU can reach via BAR0 */
+	uint64_t	 total;		/* VRAM the allocator hands out, bytes */
+	uint64_t	 lo;		/* ... starting at this device offset */
+	uint64_t	 device;	/* device VRAM bytes */
+	uint64_t	 visible;	/* CPU-reachable via BAR0: offsets below */
 	uint64_t	 used;		/* allocated now */
 	uint64_t	 dirty_bytes;	/* freed, not yet scrubbed (incl. in flight) */
 	TAILQ_HEAD(, amd_vram_dirty) dirty;
@@ -861,6 +865,7 @@ struct amd_vm12 {
 #define AMD_VM_READ	0x1u
 #define AMD_VM_WRITE	0x2u
 #define AMD_VM_EXEC	0x4u
+#define AMD_VM_VRAM	0x8u	/* pa is a physical FB address (local VRAM) */
 int	amd_gmc12_vm_init(struct amd_gart *gt, struct amd_vm12 *vm, int mode,
 	    uint64_t flat_va);
 void	amd_gmc12_vm_fini(struct amd_vm12 *vm);
@@ -910,6 +915,14 @@ void	amd_mes12_kq_close(struct amd_kq *kq);
 int	amd_mes12_kq_reset(struct amd_kq *kq);
 int	amd_mes12_kq_submit(struct amd_kq *kq, uint64_t ib, uint32_t ib_dw,
 	    u_int vmid, uint32_t *seq);
+/* 5d: zero-fill [mc, mc+bytes) (VMID 0 MC addresses, i.e. VRAM through the
+ * system aperture) on the kernel queue; EBUSY unless the queue is idle.
+ * The fill is done when the fence passes *seq and the generation is still
+ * *gen (a reset starts the sequence over). */
+#define AMD_KQ_FILL_MAX		(256ull << 20)
+int	amd_mes12_kq_fill(struct amd_kq *kq, uint64_t mc, uint64_t bytes,
+	    uint32_t *seq, uint32_t *gen);
+uint32_t amd_mes12_kq_gen(struct amd_kq *kq);
 uint32_t amd_mes12_kq_fence(struct amd_kq *kq);
 void	amd_mes12_kq_report(struct amd_kq *kq, const char *when);
 #define AMD_UQ_SLOTS	8	/* MES user queues for client queue fds */
@@ -950,6 +963,10 @@ void	amd_si_detach(struct atrium_amd_softc *sc);
 struct amd_gart *amd_si_gart(struct atrium_amd_softc *sc);
 struct mes *amd_si_mes(struct atrium_amd_softc *sc);
 struct amd_ih7 *amd_si_ih(struct atrium_amd_softc *sc);
+/* 5d: the VRAM allocator's range on silicon (smu.c), called by the base
+ * after amd_si_attach: above the driver's own area, below the PSP's. */
+#define AMD_SI_VRAM_DRIVER_END	(128ull << 20)
+int	amd_si_vram_init(struct atrium_amd_softc *sc);
 bool	amd_si_usable(struct atrium_amd_softc *sc);
 void	amd_si_client_attached(struct atrium_amd_softc *sc, bool on);
 int	amd_si_gfx_hold(struct atrium_amd_softc *sc);
@@ -989,6 +1006,9 @@ struct atrium_amd_softc {
 	uint32_t	 dcn_seg2_bytes; /* DMU segment 2 byte offset in BAR5 */
 	const struct atrium_gpu_backend_ops *backend; /* hardware seam (gpu module) */
 	struct amd_si *si;		/* silicon, attached (smu.c, stage 5a) */
+	/* The PSP's own VRAM (FB_FW_RESERV_ADDR[_EXT], psp.c): offsets and
+	 * sizes in bytes; size 0 = not reported. The allocator keeps out. */
+	uint64_t	 psp_resv_off[2], psp_resv_size[2];
 	struct resource	*regs;		/* BAR5 MMIO register file */
 	int		 regs_rid;
 	struct resource	*doorbell;	/* BAR2 doorbell page */
@@ -1193,6 +1213,11 @@ int	 amd_device_reset(struct atrium_amd_softc *sc);
  *          which waits out a running scrub).
  */
 int	 amd_vram_init(struct atrium_amd_softc *sc);
+/* Silicon: hand out [lo, hi) of `device` bytes. `dirty` = its contents are
+ * unknown (silicon need not wipe VRAM), so all of it is scrubbed before it
+ * is first allocated. */
+int	 amd_vram_init_range(struct atrium_amd_softc *sc, uint64_t device,
+	    uint64_t lo, uint64_t hi, bool dirty);
 void	 amd_vram_fini(struct atrium_amd_softc *sc);
 int	 amd_vram_alloc(struct atrium_amd_softc *sc, uint64_t size, int flags,
 	    uint64_t *out_off);

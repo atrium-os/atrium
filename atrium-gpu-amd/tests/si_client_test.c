@@ -22,7 +22,7 @@
  *                runs clean on a new queue.
  *   6 refusals   the 5c-2a SUBMIT on the client node, user-mode queues,
  *                other families and priorities, in-dependencies, bad blobs,
- *                the ioctls on the wrong fd, VRAM BOs.
+ *                the ioctls on the wrong fd.
  *   7 fault      (step 2) a queue whose job writes to a VA its VM does not
  *                map: its completion fails with EIO, the queue refuses more
  *                work, another VM's queue runs on, and the faulting VM runs
@@ -45,6 +45,10 @@
  *                until they close), then the queue runs on; the same while
  *                one of the VM's queues is stuck: freed at once or held, and
  *                nothing deferred is left once that queue is lost.
+ *  11 VRAM       (5d) the initial scrub finishes; a VRAM BO bound in a VM
+ *                reads zero (CP DMA copy into a System BO), takes a fill and
+ *                reads it back, refuses CPU reads; freed, it is scrubbed
+ *                (vram sysctls), and a new VRAM BO reads zero again.
  *
  * Prints one PASS/FAIL line per check and a summary; exit 0 only if all
  * passed.
@@ -890,6 +894,152 @@ free_rule(struct job *a)
 	job_close(&h);
 }
 
+/* ---- 11: VRAM (5d) ---- */
+
+#define VRAM_BO		(1u << 20)
+#define VRAM_FILL	0xc0de1234u
+
+static int64_t
+vram_stat(const char *name)
+{
+	char n[128];
+	uint64_t v = 0;
+	size_t len = sizeof(v);
+
+	snprintf(n, sizeof(n), "dev.atrium_gpu_amd_pci.0.vram.%s", name);
+	if (sysctlbyname(n, &v, &len, NULL, 0) != 0)
+		return (-1);
+	return ((int64_t)v);
+}
+
+/* Wait (up to `ms`) for no dirty VRAM; the ms it took, or -1. */
+static int
+vram_clean_wait(int ms)
+{
+	int t;
+
+	for (t = 0; t <= ms; t += 20) {
+		if (vram_stat("dirty") == 0)
+			return (t);
+		usleep(20000);
+	}
+	return (-1);
+}
+
+/* One CP DMA_DATA packet (GFX9+ layout): a fill of `bytes` at `dst` with
+ * `v` (fill) or a copy from `v` (an address). Through the L2 both ways. */
+static u_int
+dma_pkt(uint32_t *w, uint64_t dst, uint64_t v, uint32_t bytes, int fill)
+{
+	w[0] = 3u << 30 | 5u << 16 | 0x50u << 8;	/* DMA_DATA */
+	w[1] = 1u << 31 | (fill ? 2u : 3u) << 29 | 3u << 20;
+	w[2] = (uint32_t)v;
+	w[3] = fill ? 0 : (uint32_t)(v >> 32);
+	w[4] = (uint32_t)dst;
+	w[5] = (uint32_t)(dst >> 32);
+	w[6] = bytes;
+	return (7);
+}
+
+/* Run `dw` dwords of packets as the job's IB and wait. 0 or an errno. */
+static int
+dma_run(struct job *j, const uint32_t *w, u_int dw)
+{
+	int r, ms;
+
+	if (bo_xfer(j->ib, __DECONST(void *, w), dw * 4, 1) != 0)
+		return (errno);
+	if ((r = queue_submit(j->q, j->ib_va, dw, j->so, ++j->value,
+	    NULL)) != 0)
+		return (r);
+	return (job_wait(j, 5000, &ms));
+}
+
+/* Copy 4 KiB at `src` into the job's out page; how many words are `want`
+ * (-1 on failure, with *err). */
+static int
+vram_peek(struct job *j, uint64_t src, uint32_t want, int *err,
+    uint32_t *first)
+{
+	uint32_t w[7];
+
+	*first = 0;
+	if (poison(j->out, POISON_B) != 0) {
+		*err = errno;
+		return (-1);
+	}
+	(void)dma_pkt(w, j->out_va, src, SIW42_OUT_DW * 4, 0);
+	if ((*err = dma_run(j, w, 7)) != 0)
+		return (-1);
+	return (count(j->out, want, first));
+}
+
+static void
+vram(struct job *a)
+{
+	uint32_t w[16], first, buf[16];
+	uint64_t va, va2;
+	int64_t total, s0, s1;
+	int bo, bo2, n, r, t;
+
+	total = vram_stat("total");
+	t = vram_clean_wait(60000);
+	check(total > 0 && t >= 0, "11 VRAM: the allocator is up and its "
+	    "initial scrub finished", "total %jd MiB, base %#jx, clean after "
+	    "%d ms, scrubbed %jd MiB", (intmax_t)(total >> 20),
+	    (intmax_t)vram_stat("base"), t, (intmax_t)(vram_stat("scrubbed") >>
+	    20));
+	bo = bo_alloc(VRAM_BO, ATRIUM_GPU_BO_VRAM);
+	if (bo < 0 || vm_bind(a->vm, bo, 0, &va) != 0) {
+		check(0, "11 VRAM: a VRAM BO", "alloc/bind: %s",
+		    strerror(errno));
+		if (bo >= 0)
+			close(bo);
+		return;
+	}
+	printf("11: VRAM BO of %u KiB at VA %#jx\n", VRAM_BO >> 10,
+	    (uintmax_t)va);
+	r = bo_xfer(bo, buf, sizeof(buf), 0) == 0 ? 0 : errno;
+	check(r == EINVAL, "11 VRAM: CPU read of a VRAM BO refused", "%s",
+	    r == 0 ? "accepted" : strerror(r));
+	n = vram_peek(a, va + VRAM_BO - 4096, 0, &r, &first);
+	check(n == SIW42_OUT_DW, "11 VRAM: a new VRAM BO reads zero", "%d/64 "
+	    "words 0 (%s), first %#x", n, r == 0 ? "ok" : strerror(r), first);
+	(void)dma_pkt(w, va, VRAM_FILL, VRAM_BO, 1);
+	r = dma_run(a, w, 7);
+	n = r == 0 ? vram_peek(a, va + VRAM_BO / 2, VRAM_FILL, &r, &first) :
+	    -1;
+	check(n == SIW42_OUT_DW, "11 VRAM: a fill of the BO reads back", "%d/64 "
+	    "words %#x (%s), first %#x", n, VRAM_FILL, r == 0 ? "ok" :
+	    strerror(r), first);
+
+	s0 = vram_stat("scrubbed");
+	close(bo);
+	t = vram_clean_wait(5000);
+	s1 = vram_stat("scrubbed");
+	check(t >= 0 && s1 - s0 >= VRAM_BO, "11 VRAM: the freed BO is scrubbed",
+	    "clean after %d ms, scrubbed +%jd KiB", t, (intmax_t)((s1 - s0) >>
+	    10));
+	bo2 = bo_alloc(VRAM_BO, ATRIUM_GPU_BO_VRAM);
+	if (bo2 < 0 || vm_bind(a->vm, bo2, 0, &va2) != 0) {
+		check(0, "11 VRAM: a second VRAM BO", "alloc/bind: %s",
+		    strerror(errno));
+	} else {
+		n = vram_peek(a, va2 + VRAM_BO / 2, 0, &r, &first);
+		check(n == SIW42_OUT_DW, "11 VRAM: the next VRAM BO reads zero "
+		    "(no data from the freed one)", "%d/64 words 0 (%s), first "
+		    "%#x", n, r == 0 ? "ok" : strerror(r), first);
+	}
+	if (bo2 >= 0)
+		close(bo2);
+	printf("11: vram used %jd, dirty %jd, allocs %jd, frees %jd, scrub "
+	    "jobs %jd (failed %jd)\n", (intmax_t)vram_stat("used"),
+	    (intmax_t)vram_stat("dirty"), (intmax_t)vram_stat("allocs"),
+	    (intmax_t)vram_stat("frees"), (intmax_t)vram_stat("scrub_jobs"),
+	    (intmax_t)vram_stat("scrub_failed"));
+	run_clean(a, "11 VRAM: the queue runs on after the VRAM work");
+}
+
 static int
 ioerr(int f, unsigned long cmd, void *arg)
 {
@@ -905,7 +1055,7 @@ main(void)
 	struct atrium_gpu_queue_create qc;
 	uint64_t seq1 = 0, seq2 = 0;
 	uint32_t first;
-	int r, n, ms, bo, q2, sv[2], st;
+	int r, n, ms, q2, sv[2], st;
 	pid_t pid;
 
 	setvbuf(stdout, NULL, _IOLBF, 0);
@@ -1096,12 +1246,6 @@ main(void)
 	r = ioerr(a.q, ATRIUM_GPU_IOC_QUEUE_SUBMIT, &qs);
 	check(r == EINVAL, "6 an empty blob refused", "%s",
 	    r == 0 ? "accepted" : strerror(r));
-	bo = bo_alloc(4096, ATRIUM_GPU_BO_VRAM);
-	r = bo >= 0 ? 0 : errno;
-	if (bo >= 0)
-		close(bo);
-	check(r == EOPNOTSUPP, "6 VRAM BO refused (5d)", "%s",
-	    r == 0 ? "accepted" : strerror(r));
 	run_clean(&a, "6 the first queue still runs after the refusals");
 	(void)seq2;
 
@@ -1172,6 +1316,9 @@ main(void)
 
 	/* 10: the free rule. */
 	free_rule(&a);
+
+	/* 11: VRAM BOs (5d). */
+	vram(&a);
 
 out:
 	job_close(&a);

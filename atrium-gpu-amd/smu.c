@@ -950,6 +950,49 @@ amd_si_gart(struct atrium_amd_softc *sc)
 	return (sc->si != NULL ? &sc->si->gt : NULL);
 }
 
+/*
+ * 5d: the VRAM allocator's range. Below AMD_SI_VRAM_DRIVER_END is the
+ * driver's own fixed area (PSP staging at 64 MiB, IP firmware at 68, the
+ * SMU table at 84, the GART table at 88, the page-table pool at 92). From
+ * the lowest PSP reservation up is the PSP's, and the top of VRAM also
+ * holds what the VBIOS and memory training keep (amdgpu reserves those
+ * near the top too), so the range ends at the lowest reservation; with
+ * none reported, 1 GiB below the top. Silicon need not wipe VRAM at a
+ * reset, so the whole range is scrubbed before it is first handed out.
+ */
+int
+amd_si_vram_init(struct atrium_amd_softc *sc)
+{
+	struct amd_gart *gt = amd_si_gart(sc);
+	uint64_t device, lo = AMD_SI_VRAM_DRIVER_END, hi;
+	bool reported = false;
+	u_int i;
+
+	if (gt == NULL || gt->fb_end <= gt->fb_start)
+		return (ENXIO);
+	device = gt->fb_end - gt->fb_start + 1;
+	hi = device;
+	for (i = 0; i < nitems(sc->psp_resv_off); i++) {
+		if (sc->psp_resv_size[i] == 0)
+			continue;
+		reported = true;
+		hi = MIN(hi, sc->psp_resv_off[i]);
+	}
+	if (!reported)
+		hi = device > (1ull << 30) ? device - (1ull << 30) : 0;
+	hi &= ~((2ull << 20) - 1);
+	if (hi <= lo + (64ull << 20)) {
+		device_printf(sc->dev, "VRAM: no room for the allocator "
+		    "(device %ju MiB, end %#jx)\n", (uintmax_t)(device >> 20),
+		    (uintmax_t)hi);
+		return (ENOSPC);
+	}
+	if (!reported)
+		device_printf(sc->dev, "VRAM: the PSP reported no "
+		    "reservation; keeping the top 1 GiB out\n");
+	return (amd_vram_init_range(sc, device, lo, hi, true));
+}
+
 struct mes *
 amd_si_mes(struct atrium_amd_softc *sc)
 {

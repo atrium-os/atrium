@@ -1579,8 +1579,13 @@ struct amd_kq {
 	struct disp d;
 	uint64_t wptr;		/* dwords emitted since the queue was mapped */
 	uint32_t seq;		/* last sequence number emitted */
+	uint32_t gen;		/* bumped at each reset (seq starts over) */
 	bool mapped;
 };
+/* A fill: DMA_DATA packets of KQ_FILL_CHUNK, then the fence. */
+#define KQ_FILL_CHUNK		(32ull << 20)
+#define KQ_FILL_DW		((u_int)(AMD_KQ_FILL_MAX / KQ_FILL_CHUNK) * 7 + 8)
+CTASSERT(KQ_FILL_CHUNK <= DMA_DATA_MAX_BYTES);
 
 static void
 gart_unmap_blk(struct amd_gart *gt, uint64_t va, u_int size)
@@ -1693,6 +1698,7 @@ amd_mes12_kq_reset(struct amd_kq *kq)
 	struct mes *m = kq->m;
 	int err;
 
+	atomic_add_rel_32(&kq->gen, 1);	/* before the fence goes back to 0 */
 	if (kq->mapped) {
 		kq->mapped = false;
 		if (!vmt_qclose(m, &kq->d)) {
@@ -1730,7 +1736,9 @@ amd_mes12_kq_submit(struct amd_kq *kq, uint64_t ib, uint32_t ib_dw,
 	    (ib & 3) != 0)
 		return (EINVAL);
 	inflight = kq->seq - amd_mes12_kq_fence(kq);
-	if ((inflight + 1) * KQ_PKT_DW >= RING_DW)
+	/* Room for one fill too: a fill goes in only on an idle queue, so
+	 * at most one is ahead of these. */
+	if ((inflight + 1) * KQ_PKT_DW + KQ_FILL_DW >= RING_DW)
 		return (EBUSY);
 	s = kq->seq + 1;
 	pkt[n++] = PKT3(IT_INDIRECT_BUFFER, 2);
@@ -1755,6 +1763,71 @@ amd_mes12_kq_submit(struct amd_kq *kq, uint64_t ib, uint32_t ib_dw,
 	bus_write_8(kq->m->dbbar, (bus_size_t)KCQ_DOORBELL * 4, kq->wptr);
 	*seq = s;
 	return (0);
+}
+
+/*
+ * 5d: zero [mc, mc + bytes) with CP DMA (DMA_DATA, SRC_SEL DATA, through
+ * the L2) on the ring itself, so under VMID 0: `mc` is an MC address, VRAM
+ * at fb_start + offset through the system aperture, which no client VMID
+ * maps. CP_SYNC holds each fill until it is done; the RELEASE_MEM after
+ * them writes the L2 back and the fence (no interrupt: nothing waits on an
+ * IV for this). Only on an idle queue (EBUSY otherwise), so the ring
+ * accounting in amd_mes12_kq_submit stays one fill plus its packets.
+ */
+int
+amd_mes12_kq_fill(struct amd_kq *kq, uint64_t mc, uint64_t bytes,
+    uint32_t *seq, uint32_t *gen)
+{
+	volatile uint32_t *ring = (volatile uint32_t *)(kq->d.blk + DISP_RING);
+	uint64_t fence = kq->d.va + DISP_WB + 0x10, done, chunk;
+	uint32_t pkt[KQ_FILL_DW], s;
+	u_int i, n = 0;
+
+	/* The generation first: a reset from here on shows as a change. */
+	*gen = atomic_load_acq_32(&kq->gen);
+	if (!kq->mapped)
+		return (ENXIO);
+	if (bytes == 0 || bytes > AMD_KQ_FILL_MAX || (bytes & 3) != 0 ||
+	    (mc & 3) != 0)
+		return (EINVAL);
+	if (kq->seq != amd_mes12_kq_fence(kq))
+		return (EBUSY);
+	s = kq->seq + 1;
+	for (done = 0; done < bytes; done += chunk) {
+		chunk = MIN(bytes - done, KQ_FILL_CHUNK);
+		pkt[n++] = PKT3(IT_DMA_DATA, 5);
+		pkt[n++] = DMA_DATA_CP_SYNC | DMA_DATA_SRC_SEL_DATA |
+		    DMA_DATA_DST_SEL_L2;
+		pkt[n++] = 0;				/* the fill value */
+		pkt[n++] = 0;
+		pkt[n++] = (uint32_t)(mc + done);
+		pkt[n++] = (uint32_t)((mc + done) >> 32);
+		pkt[n++] = (uint32_t)chunk;		/* BYTE_COUNT */
+	}
+	pkt[n++] = PKT3(IT_RELEASE_MEM, 6);
+	pkt[n++] = RM_GCR_SEQ | RM_GCR_GL2_WB | RM_CACHE_POLICY(3) |
+	    RM_EVENT_TYPE(CACHE_FLUSH_AND_INV_TS_EVENT) | RM_EVENT_INDEX(5);
+	pkt[n++] = RM_DATA_SEL(1);			/* no interrupt */
+	pkt[n++] = (uint32_t)fence;
+	pkt[n++] = (uint32_t)(fence >> 32);
+	pkt[n++] = s;
+	pkt[n++] = 0;
+	pkt[n++] = 0;
+	for (i = 0; i < n; i++)
+		ring[(kq->wptr + i) & (RING_DW - 1)] = pkt[i];
+	kq->wptr += n;
+	kq->seq = s;
+	*(volatile uint64_t *)(kq->d.blk + DISP_WB + 8) = kq->wptr;
+	wmb();
+	bus_write_8(kq->m->dbbar, (bus_size_t)KCQ_DOORBELL * 4, kq->wptr);
+	*seq = s;
+	return (0);
+}
+
+uint32_t
+amd_mes12_kq_gen(struct amd_kq *kq)
+{
+	return (atomic_load_acq_32(&kq->gen));
 }
 
 uint32_t
